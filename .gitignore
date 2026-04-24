@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtualenvs / conda
+.venv/
+.env
+.envrc
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# pytest / coverage / ruff
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# mkdocs
+site/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Third-party installs (fetched by scripts/install-*.sh; never commit binaries)
+third_party/**
+!third_party/README.md

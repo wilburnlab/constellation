@@ -1,0 +1,51 @@
+name: constellation
+# Channel order matters under strict channel priority (the default):
+# conda-forge MUST come before bioconda, otherwise bioconda pulls in
+# stale libdeflate/libtiff/libgrpc/c-ares/python_abi pins that cascade
+# into unsatisfiable solves for matplotlib+pyarrow. This is the order
+# bioconda itself documents at https://bioconda.github.io/#usage.
+# `defaults` is intentionally omitted — it has terms-of-service prompts
+# and routinely conflicts with conda-forge.
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  # Scientific computing
+  - numpy>=1.24
+  - scipy>=1.11
+  - pyarrow>=18
+  # Visualization (notebook + docs)
+  - matplotlib>=3.9
+  # Sequencing / proteomics open-source tools (bioconda). Add tools here
+  # as modules are ported; workflows that need them gate via
+  # `constellation doctor --workflow <name>`.
+  - mmseqs2
+  - openjdk
+  # Structure / MD (conda-forge). Guarded by lazy imports in thirdparty/.
+  # Uncomment as structure module comes online:
+  # - openmm>=8.0
+  # - pdbfixer
+  # Thermo .raw support: .NET 8 runtime (open-source, MIT). Proprietary
+  # Thermo CommonCore DLLs are NOT installed here — fetch them separately
+  # with `bash scripts/install-thermo-dlls.sh` (one-time, prompts for
+  # license acknowledgement).
+  - dotnet-runtime=8.0.*
+  # Development tooling
+  - pytest>=8.0
+  - ruff>=0.9
+  - pre-commit>=4.0
+  # Package management
+  - pip
+  - pip:
+    # PyTorch via pip (not the conda pytorch:: channel). The default
+    # wheel on PyPI is CUDA-capable; it works on CPU-only machines too.
+    - torch>=2.2
+    # Koina API client (proteomics ML web service); caps the Python
+    # ceiling at <3.13 together with PyTorch 2.5.x.
+    - koinapy
+    # pythonnet 3.x — needed for .NET CLR interop from Python 3.12. The
+    # conda-forge feedstock caps at Python 3.9, so pip is authoritative.
+    - pythonnet>=3.0.3
+    # The package itself, installed editable for development.
+    - -e .[dev]

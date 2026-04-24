@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "constellation"
+version = "0.0.0"
+description = "Integrative bioinformatics platform for analysis of diverse omic and bioanalytical datasets"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+# Ceiling <3.13 driven by koinapy 0.0.10 + PyTorch 2.5.x (same as
+# Cartographer). pythonnet 3.0.3 itself supports 3.12 fine. Revisit
+# when koinapy ships a 3.13-compatible wheel.
+requires-python = ">=3.12, <3.13"
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "pyarrow>=18",
+]
+
+[project.optional-dependencies]
+# Modality extras: install the Python-wheel-available bits. Native
+# binaries (Thermo DLLs, EncyclopeDIA jar, mmseqs2, Dorado, ...) go
+# through `scripts/install-*.sh` and thirdparty/ adapters — not extras.
+ms         = ["pyteomics>=4.7", "requests", "koinapy"]
+sequencing = ["pod5>=0.3", "edlib", "parasail"]
+structure  = []  # OpenMM + PDBFixer are conda-only; guarded lazy-import in thirdparty/
+dynamics   = []  # same
+all        = ["constellation[ms,sequencing,structure,dynamics]"]
+dev        = ["pytest>=8.0", "ruff>=0.9", "pre-commit>=4.0"]
+
+[project.scripts]
+# Primary binary with subcommand dispatcher.
+constellation = "constellation.cli.__main__:main"
+# Thin legacy shims — muscle-memory compatibility with Cartographer.
+# Each forwards to the same constellation subcommand handler.
+mzpeak           = "constellation.cli.__main__:main_mzpeak"
+koina-library    = "constellation.cli.__main__:main_koina"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["constellation*"]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E401",  # multiple imports on one line
+    "E501",  # long lines — mass / modification tables are intentional
+    "E741",  # ambiguous variable name (e.g. 'l') in ion-ladder indexing
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F401"]  # allow unused imports in test files
+"**/__init__.py" = ["F401"]  # package re-exports

@@ -1,0 +1,15 @@
+name: constellation
+# Additive CUDA overlay: apply on top of environment.yml on machines
+# with CUDA GPUs (OSC nodes, local workstations with nvidia-smi).
+# Usage:
+#   conda env update -f environment.yml --prune
+#   conda env update -f environment-cuda.yml
+#
+# The default PyPI torch wheel is already CUDA-capable, so there is
+# no torch override here; this file exists to pin GPU-specific runtime
+# deps (e.g. dorado basecaller builds, CUDA-accelerated mmseqs) as
+# they're wired into modules. Stub for now.
+channels:
+  - conda-forge
+  - bioconda
+dependencies: []
