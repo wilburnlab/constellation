@@ -6,7 +6,7 @@ Integrative bioinformatics platform: a shared core of physically grounded primit
 
 Constellation is absorbing four existing lab packages as a **clean rewrite** (no vendored source): **Cartographer** (MS proteomics, first port target), **NanoporeAnalysis** (POD5 → protein), **CoLLAGE** (codon optimization), **Contour** (PDB → MD prep). Chronologer (RT prediction) has already been absorbed into Cartographer.
 
-Current state: **scaffold only.** Every subpackage exists with a docstring describing its contract; functional code lives in `constellation.thirdparty.registry` (tool discovery) and `constellation.cli.__main__` (the `constellation doctor` command). Core primitives and domain modules are staged for the 90-day roadmap (see `docs/roadmap.md` when written).
+Current state: **`core.chem` shipped; everything else scaffold.** Functional code lives in `constellation.core.chem` (full periodic table, Composition arithmetic, binned + isotopologue-resolved isotope distributions, UNIMOD vocabulary with subsetting), `constellation.thirdparty.registry` (tool discovery), and `constellation.cli.__main__` (the `constellation doctor` command). All other subpackages are scaffold-only. Core primitives and domain modules are staged for the 90-day roadmap (see `docs/roadmap.md` when written).
 
 ## Architecture invariants (load-bearing — design principles from the PI)
 
@@ -64,7 +64,7 @@ Adding a new module: confirm its place in this DAG before touching imports. Addi
 
 | Module | Role | Status |
 |---|---|---|
-| `constellation.core.chem` | Elements, compositions, isotopes, modifications (chemical-delta objects) | scaffold |
+| `constellation.core.chem` | Elements (full H–Og), Composition (int32 tensor wrapper, plain-Python — hashable, bool `==`), binned + isotopologue-resolved isotope APIs, UNIMOD ModVocab with first-class subsetting | **shipped** |
 | `constellation.core.sequence` | Alphabets (canonical + IUPAC), generic ops, nucleic (translate/ORF/rev-comp), protein (digest) | scaffold |
 | `constellation.core.structure` | Coords, geometry (Kabsch/RMSD), topology (Arrow-backed graph), ensemble (NMR/cryoEM/MD unified) | scaffold |
 | `constellation.core.io` | Schema registry, RawReader ABC, Bundle (primary + companions) | scaffold |
@@ -80,7 +80,7 @@ Adding a new module: confirm its place in this DAG before touching imports. Addi
 | `constellation.models` | NN architectures assembled from `core.nn` | scaffold |
 | `constellation.cli` | `constellation <subcommand>` dispatcher; `doctor` wired, others stubbed | partial (`doctor` works) |
 | `constellation.thirdparty` | Tool discovery (`registry.find`); EncyclopeDIA adapter registered | partial |
-| `constellation.data` | Small packaged data (PROCAL, UNIMOD subset) | empty |
+| `constellation.data` | Packaged data: `atoms.json` (NIST AME2020, full periodic table + per-isotope exact masses), `unimod.json` (1560 entries from upstream UNIMOD XML). Raw vendored sources under `data/_raw/` regenerable via `scripts/build-{atoms,unimod}-json.py` | partial |
 
 ## Environment
 
@@ -117,7 +117,11 @@ ruff check .                    # lint
 
 - **Functions:** `snake_case`.
 - **Classes:** `PascalCase` (always — no legacy carryover).
-- **Modification identifiers:** UNIMOD format (`UNIMOD:N`) is canonical; mass notation (`+N.NNN`) is a secondary representation.
+- **Modification identifiers:** UNIMOD format (`UNIMOD:N`) is canonical; mass notation (`+N.NNN`) is a secondary representation. The full UNIMOD XML ships built-in (`UNIMOD: ModVocab`); EncyclopeDIA-style `[+mass_delta]` translation goes through `UNIMOD.find_by_mass(mass, tolerance_da)` in a thirdparty adapter, not in `core.chem`.
+- **Vocabulary vs enablement.** `core.chem.modifications` defines the *universe* (built-in `UNIMOD`); each downstream tool declares its *enabled subset* via `UNIMOD.subset([...])` and ships that with its model checkpoint / pipeline config. The chemistry layer never knows what any specific tool accepts. `register_custom(...)` is the typed escape hatch for genuinely novel non-UNIMOD mods; the legacy `user_modifications.txt` text format from cartographer/Chronologer is **not** carried forward.
+- **Composition is plain-Python, not a torch.Tensor subclass.** Hashable, equality-as-bool, only chemistry-meaningful ops exposed. Batched / GPU work uses raw `(B, N_elements)` tensors via `stack()` / `batched_mass()` free functions — `Composition` objects are not in the hot path.
+- **Isotope data carries per-isotope exact masses (NIST AME2020), not just abundances.** `isotope_distribution` / `isotope_envelope` use the binned ¹³C-spacing approximation (cartographer-equivalent, fast); `isotopologue_distribution` / `isotope_envelope_exact` resolve ¹⁵N vs ¹³C as distinct peaks for high-res MS, ¹⁵N-labeled samples, and NMR-adjacent work.
+- **Composition tensor dtype is int32.** Counts are always whole; `.mass`/`.average_mass` cast to float64 internally for the dot-product. Averaged "compositions" (mixtures) are a downstream concept and are NOT a `Composition`.
 - **Tolerance:** default fragment tolerance 20 ppm; functions accept `tolerance_unit` as `'ppm'` or `'Da'` (same as Cartographer).
 - **Sentinel values:** `-1.0` = "not observed" / "not set" for float fields; `-1` in intensity tensors flags loss-masked positions.
 
@@ -127,7 +131,7 @@ Cartographer modules scheduled for rewrite into Constellation. Commit SHAs point
 
 | Source | Destination | Notes |
 |---|---|---|
-| `cartographer/masses.py` | `core.chem.{atoms,composition,isotopes,modifications}` + `core.sequence.alphabets` | Split apart; compositions become purely chemical, alphabets reference modifications by ID |
+| ~~`cartographer/masses.py`~~ | ~~`core.chem.{atoms,composition,isotopes,modifications}` + `core.sequence.alphabets`~~ | **Done** — `core.chem` shipped. The `core.sequence.alphabets` half (residue compositions, `RESIDUE_REGISTRY`, vocabulary) is the next ticket. |
 | `cartographer/core_layers.py`, `cartographer/models.py` | `core.nn.{layers,encoders}` + `constellation.models.*` | PascalCase rename |
 | `cartographer/error_model.py` | `core.stats.distributions` (Student-t subclass of `Parametric`) | `.fit()` via `core.optim`, no scipy |
 | `cartographer/data/readers/{__init__,_base}.py` | `core.io.readers` | Registry becomes modality-tagged; `.cif`/`.txt` disambiguation via optional `modality` hint |

@@ -1,0 +1,3434 @@
+{
+  "schema_version": "1",
+  "source": {
+    "isotopes": "NIST AME2020 (Atomic Weights and Isotopic Compositions)",
+    "isotopes_url": "https://physics.nist.gov/cgi-bin/Compositions/stand_alone.pl",
+    "electronegativity": "Pauling 1960; Allred-Rochow for heavy elements",
+    "covalent_radii": "Cordero et al., Dalton Trans., 2008, 2832-2838",
+    "vdw_radii": "Bondi 1964 (J. Phys. Chem. 68, 441); Alvarez 2013 (Dalton Trans., 8617-8636)"
+  },
+  "elements": [
+    {
+      "atomic_number": 1,
+      "symbol": "H",
+      "monoisotopic_mass": 1.00782503223,
+      "standard_atomic_weight": 1.007975,
+      "isotopes": [
+        {
+          "mass_number": 1,
+          "exact_mass": 1.00782503223,
+          "abundance": 0.999885
+        },
+        {
+          "mass_number": 2,
+          "exact_mass": 2.01410177812,
+          "abundance": 0.000115
+        },
+        {
+          "mass_number": 3,
+          "exact_mass": 3.0160492779,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 2.2,
+      "covalent_radius_pm": 31,
+      "vdw_radius_pm": 120,
+      "valence_electrons": 1,
+      "group": 1,
+      "period": 1
+    },
+    {
+      "atomic_number": 2,
+      "symbol": "He",
+      "monoisotopic_mass": 4.00260325413,
+      "standard_atomic_weight": 4.002602,
+      "isotopes": [
+        {
+          "mass_number": 3,
+          "exact_mass": 3.0160293201,
+          "abundance": 1.34e-06
+        },
+        {
+          "mass_number": 4,
+          "exact_mass": 4.00260325413,
+          "abundance": 0.99999866
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": 28,
+      "vdw_radius_pm": 140,
+      "valence_electrons": 8,
+      "group": 18,
+      "period": 1
+    },
+    {
+      "atomic_number": 3,
+      "symbol": "Li",
+      "monoisotopic_mass": 7.0160034366,
+      "standard_atomic_weight": 6.967499999999999,
+      "isotopes": [
+        {
+          "mass_number": 6,
+          "exact_mass": 6.0151228874,
+          "abundance": 0.0759
+        },
+        {
+          "mass_number": 7,
+          "exact_mass": 7.0160034366,
+          "abundance": 0.9241
+        }
+      ],
+      "pauling_electronegativity": 0.98,
+      "covalent_radius_pm": 128,
+      "vdw_radius_pm": 182,
+      "valence_electrons": 1,
+      "group": 1,
+      "period": 2
+    },
+    {
+      "atomic_number": 4,
+      "symbol": "Be",
+      "monoisotopic_mass": 9.012183065,
+      "standard_atomic_weight": 9.0121831,
+      "isotopes": [
+        {
+          "mass_number": 9,
+          "exact_mass": 9.012183065,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 1.57,
+      "covalent_radius_pm": 96,
+      "vdw_radius_pm": 153,
+      "valence_electrons": 2,
+      "group": 2,
+      "period": 2
+    },
+    {
+      "atomic_number": 5,
+      "symbol": "B",
+      "monoisotopic_mass": 11.00930536,
+      "standard_atomic_weight": 10.8135,
+      "isotopes": [
+        {
+          "mass_number": 10,
+          "exact_mass": 10.01293695,
+          "abundance": 0.199
+        },
+        {
+          "mass_number": 11,
+          "exact_mass": 11.00930536,
+          "abundance": 0.801
+        }
+      ],
+      "pauling_electronegativity": 2.04,
+      "covalent_radius_pm": 84,
+      "vdw_radius_pm": 192,
+      "valence_electrons": 3,
+      "group": 13,
+      "period": 2
+    },
+    {
+      "atomic_number": 6,
+      "symbol": "C",
+      "monoisotopic_mass": 12.0,
+      "standard_atomic_weight": 12.0106,
+      "isotopes": [
+        {
+          "mass_number": 12,
+          "exact_mass": 12.0,
+          "abundance": 0.9893
+        },
+        {
+          "mass_number": 13,
+          "exact_mass": 13.00335483507,
+          "abundance": 0.0107
+        },
+        {
+          "mass_number": 14,
+          "exact_mass": 14.0032419884,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 2.55,
+      "covalent_radius_pm": 76,
+      "vdw_radius_pm": 170,
+      "valence_electrons": 4,
+      "group": 14,
+      "period": 2
+    },
+    {
+      "atomic_number": 7,
+      "symbol": "N",
+      "monoisotopic_mass": 14.00307400443,
+      "standard_atomic_weight": 14.006855,
+      "isotopes": [
+        {
+          "mass_number": 14,
+          "exact_mass": 14.00307400443,
+          "abundance": 0.99636
+        },
+        {
+          "mass_number": 15,
+          "exact_mass": 15.00010889888,
+          "abundance": 0.00364
+        }
+      ],
+      "pauling_electronegativity": 3.04,
+      "covalent_radius_pm": 71,
+      "vdw_radius_pm": 155,
+      "valence_electrons": 5,
+      "group": 15,
+      "period": 2
+    },
+    {
+      "atomic_number": 8,
+      "symbol": "O",
+      "monoisotopic_mass": 15.99491461957,
+      "standard_atomic_weight": 15.9994,
+      "isotopes": [
+        {
+          "mass_number": 16,
+          "exact_mass": 15.99491461957,
+          "abundance": 0.99757
+        },
+        {
+          "mass_number": 17,
+          "exact_mass": 16.9991317565,
+          "abundance": 0.00038
+        },
+        {
+          "mass_number": 18,
+          "exact_mass": 17.99915961286,
+          "abundance": 0.00205
+        }
+      ],
+      "pauling_electronegativity": 3.44,
+      "covalent_radius_pm": 66,
+      "vdw_radius_pm": 152,
+      "valence_electrons": 6,
+      "group": 16,
+      "period": 2
+    },
+    {
+      "atomic_number": 9,
+      "symbol": "F",
+      "monoisotopic_mass": 18.99840316273,
+      "standard_atomic_weight": 18.998403163,
+      "isotopes": [
+        {
+          "mass_number": 19,
+          "exact_mass": 18.99840316273,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 3.98,
+      "covalent_radius_pm": 57,
+      "vdw_radius_pm": 147,
+      "valence_electrons": 7,
+      "group": 17,
+      "period": 2
+    },
+    {
+      "atomic_number": 10,
+      "symbol": "Ne",
+      "monoisotopic_mass": 19.9924401762,
+      "standard_atomic_weight": 20.1797,
+      "isotopes": [
+        {
+          "mass_number": 20,
+          "exact_mass": 19.9924401762,
+          "abundance": 0.9048
+        },
+        {
+          "mass_number": 21,
+          "exact_mass": 20.993846685,
+          "abundance": 0.0027
+        },
+        {
+          "mass_number": 22,
+          "exact_mass": 21.991385114,
+          "abundance": 0.0925
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": 58,
+      "vdw_radius_pm": 154,
+      "valence_electrons": 8,
+      "group": 18,
+      "period": 2
+    },
+    {
+      "atomic_number": 11,
+      "symbol": "Na",
+      "monoisotopic_mass": 22.989769282,
+      "standard_atomic_weight": 22.98976928,
+      "isotopes": [
+        {
+          "mass_number": 23,
+          "exact_mass": 22.989769282,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 0.93,
+      "covalent_radius_pm": 166,
+      "vdw_radius_pm": 227,
+      "valence_electrons": 1,
+      "group": 1,
+      "period": 3
+    },
+    {
+      "atomic_number": 12,
+      "symbol": "Mg",
+      "monoisotopic_mass": 23.985041697,
+      "standard_atomic_weight": 24.3055,
+      "isotopes": [
+        {
+          "mass_number": 24,
+          "exact_mass": 23.985041697,
+          "abundance": 0.7899
+        },
+        {
+          "mass_number": 25,
+          "exact_mass": 24.985836976,
+          "abundance": 0.1
+        },
+        {
+          "mass_number": 26,
+          "exact_mass": 25.982592968,
+          "abundance": 0.1101
+        }
+      ],
+      "pauling_electronegativity": 1.31,
+      "covalent_radius_pm": 141,
+      "vdw_radius_pm": 173,
+      "valence_electrons": 2,
+      "group": 2,
+      "period": 3
+    },
+    {
+      "atomic_number": 13,
+      "symbol": "Al",
+      "monoisotopic_mass": 26.98153853,
+      "standard_atomic_weight": 26.9815385,
+      "isotopes": [
+        {
+          "mass_number": 27,
+          "exact_mass": 26.98153853,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 1.61,
+      "covalent_radius_pm": 121,
+      "vdw_radius_pm": 184,
+      "valence_electrons": 3,
+      "group": 13,
+      "period": 3
+    },
+    {
+      "atomic_number": 14,
+      "symbol": "Si",
+      "monoisotopic_mass": 27.97692653465,
+      "standard_atomic_weight": 28.085,
+      "isotopes": [
+        {
+          "mass_number": 28,
+          "exact_mass": 27.97692653465,
+          "abundance": 0.92223
+        },
+        {
+          "mass_number": 29,
+          "exact_mass": 28.9764946649,
+          "abundance": 0.04685
+        },
+        {
+          "mass_number": 30,
+          "exact_mass": 29.973770136,
+          "abundance": 0.03092
+        }
+      ],
+      "pauling_electronegativity": 1.9,
+      "covalent_radius_pm": 111,
+      "vdw_radius_pm": 210,
+      "valence_electrons": 4,
+      "group": 14,
+      "period": 3
+    },
+    {
+      "atomic_number": 15,
+      "symbol": "P",
+      "monoisotopic_mass": 30.97376199842,
+      "standard_atomic_weight": 30.973761998,
+      "isotopes": [
+        {
+          "mass_number": 31,
+          "exact_mass": 30.97376199842,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 2.19,
+      "covalent_radius_pm": 107,
+      "vdw_radius_pm": 180,
+      "valence_electrons": 5,
+      "group": 15,
+      "period": 3
+    },
+    {
+      "atomic_number": 16,
+      "symbol": "S",
+      "monoisotopic_mass": 31.9720711744,
+      "standard_atomic_weight": 32.067499999999995,
+      "isotopes": [
+        {
+          "mass_number": 32,
+          "exact_mass": 31.9720711744,
+          "abundance": 0.9499
+        },
+        {
+          "mass_number": 33,
+          "exact_mass": 32.9714589098,
+          "abundance": 0.0075
+        },
+        {
+          "mass_number": 34,
+          "exact_mass": 33.967867004,
+          "abundance": 0.0425
+        },
+        {
+          "mass_number": 36,
+          "exact_mass": 35.96708071,
+          "abundance": 0.0001
+        }
+      ],
+      "pauling_electronegativity": 2.58,
+      "covalent_radius_pm": 105,
+      "vdw_radius_pm": 180,
+      "valence_electrons": 6,
+      "group": 16,
+      "period": 3
+    },
+    {
+      "atomic_number": 17,
+      "symbol": "Cl",
+      "monoisotopic_mass": 34.968852682,
+      "standard_atomic_weight": 35.451499999999996,
+      "isotopes": [
+        {
+          "mass_number": 35,
+          "exact_mass": 34.968852682,
+          "abundance": 0.7576
+        },
+        {
+          "mass_number": 37,
+          "exact_mass": 36.965902602,
+          "abundance": 0.2424
+        }
+      ],
+      "pauling_electronegativity": 3.16,
+      "covalent_radius_pm": 102,
+      "vdw_radius_pm": 175,
+      "valence_electrons": 7,
+      "group": 17,
+      "period": 3
+    },
+    {
+      "atomic_number": 18,
+      "symbol": "Ar",
+      "monoisotopic_mass": 39.9623831237,
+      "standard_atomic_weight": 39.948,
+      "isotopes": [
+        {
+          "mass_number": 36,
+          "exact_mass": 35.967545105,
+          "abundance": 0.003336
+        },
+        {
+          "mass_number": 38,
+          "exact_mass": 37.96273211,
+          "abundance": 0.000629
+        },
+        {
+          "mass_number": 40,
+          "exact_mass": 39.9623831237,
+          "abundance": 0.996035
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": 106,
+      "vdw_radius_pm": 188,
+      "valence_electrons": 8,
+      "group": 18,
+      "period": 3
+    },
+    {
+      "atomic_number": 19,
+      "symbol": "K",
+      "monoisotopic_mass": 38.9637064864,
+      "standard_atomic_weight": 39.0983,
+      "isotopes": [
+        {
+          "mass_number": 39,
+          "exact_mass": 38.9637064864,
+          "abundance": 0.932581
+        },
+        {
+          "mass_number": 40,
+          "exact_mass": 39.963998166,
+          "abundance": 0.000117
+        },
+        {
+          "mass_number": 41,
+          "exact_mass": 40.9618252579,
+          "abundance": 0.067302
+        }
+      ],
+      "pauling_electronegativity": 0.82,
+      "covalent_radius_pm": 203,
+      "vdw_radius_pm": 275,
+      "valence_electrons": 1,
+      "group": 1,
+      "period": 4
+    },
+    {
+      "atomic_number": 20,
+      "symbol": "Ca",
+      "monoisotopic_mass": 39.962590863,
+      "standard_atomic_weight": 40.078,
+      "isotopes": [
+        {
+          "mass_number": 40,
+          "exact_mass": 39.962590863,
+          "abundance": 0.96941
+        },
+        {
+          "mass_number": 42,
+          "exact_mass": 41.95861783,
+          "abundance": 0.00647
+        },
+        {
+          "mass_number": 43,
+          "exact_mass": 42.95876644,
+          "abundance": 0.00135
+        },
+        {
+          "mass_number": 44,
+          "exact_mass": 43.95548156,
+          "abundance": 0.02086
+        },
+        {
+          "mass_number": 46,
+          "exact_mass": 45.953689,
+          "abundance": 4e-05
+        },
+        {
+          "mass_number": 48,
+          "exact_mass": 47.95252276,
+          "abundance": 0.00187
+        }
+      ],
+      "pauling_electronegativity": 1.0,
+      "covalent_radius_pm": 176,
+      "vdw_radius_pm": 231,
+      "valence_electrons": 2,
+      "group": 2,
+      "period": 4
+    },
+    {
+      "atomic_number": 21,
+      "symbol": "Sc",
+      "monoisotopic_mass": 44.95590828,
+      "standard_atomic_weight": 44.955908,
+      "isotopes": [
+        {
+          "mass_number": 45,
+          "exact_mass": 44.95590828,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 1.36,
+      "covalent_radius_pm": 170,
+      "vdw_radius_pm": 211,
+      "valence_electrons": 3,
+      "group": 3,
+      "period": 4
+    },
+    {
+      "atomic_number": 22,
+      "symbol": "Ti",
+      "monoisotopic_mass": 47.94794198,
+      "standard_atomic_weight": 47.867,
+      "isotopes": [
+        {
+          "mass_number": 46,
+          "exact_mass": 45.95262772,
+          "abundance": 0.0825
+        },
+        {
+          "mass_number": 47,
+          "exact_mass": 46.95175879,
+          "abundance": 0.0744
+        },
+        {
+          "mass_number": 48,
+          "exact_mass": 47.94794198,
+          "abundance": 0.7372
+        },
+        {
+          "mass_number": 49,
+          "exact_mass": 48.94786568,
+          "abundance": 0.0541
+        },
+        {
+          "mass_number": 50,
+          "exact_mass": 49.94478689,
+          "abundance": 0.0518
+        }
+      ],
+      "pauling_electronegativity": 1.54,
+      "covalent_radius_pm": 160,
+      "vdw_radius_pm": 187,
+      "valence_electrons": 4,
+      "group": 4,
+      "period": 4
+    },
+    {
+      "atomic_number": 23,
+      "symbol": "V",
+      "monoisotopic_mass": 50.94395704,
+      "standard_atomic_weight": 50.9415,
+      "isotopes": [
+        {
+          "mass_number": 50,
+          "exact_mass": 49.94715601,
+          "abundance": 0.0025
+        },
+        {
+          "mass_number": 51,
+          "exact_mass": 50.94395704,
+          "abundance": 0.9975
+        }
+      ],
+      "pauling_electronegativity": 1.63,
+      "covalent_radius_pm": 153,
+      "vdw_radius_pm": 179,
+      "valence_electrons": 5,
+      "group": 5,
+      "period": 4
+    },
+    {
+      "atomic_number": 24,
+      "symbol": "Cr",
+      "monoisotopic_mass": 51.94050623,
+      "standard_atomic_weight": 51.9961,
+      "isotopes": [
+        {
+          "mass_number": 50,
+          "exact_mass": 49.94604183,
+          "abundance": 0.04345
+        },
+        {
+          "mass_number": 52,
+          "exact_mass": 51.94050623,
+          "abundance": 0.83789
+        },
+        {
+          "mass_number": 53,
+          "exact_mass": 52.94064815,
+          "abundance": 0.09501
+        },
+        {
+          "mass_number": 54,
+          "exact_mass": 53.93887916,
+          "abundance": 0.02365
+        }
+      ],
+      "pauling_electronegativity": 1.66,
+      "covalent_radius_pm": 139,
+      "vdw_radius_pm": 189,
+      "valence_electrons": 6,
+      "group": 6,
+      "period": 4
+    },
+    {
+      "atomic_number": 25,
+      "symbol": "Mn",
+      "monoisotopic_mass": 54.93804391,
+      "standard_atomic_weight": 54.938044,
+      "isotopes": [
+        {
+          "mass_number": 55,
+          "exact_mass": 54.93804391,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 1.55,
+      "covalent_radius_pm": 139,
+      "vdw_radius_pm": 197,
+      "valence_electrons": 7,
+      "group": 7,
+      "period": 4
+    },
+    {
+      "atomic_number": 26,
+      "symbol": "Fe",
+      "monoisotopic_mass": 55.93493633,
+      "standard_atomic_weight": 55.845,
+      "isotopes": [
+        {
+          "mass_number": 54,
+          "exact_mass": 53.93960899,
+          "abundance": 0.05845
+        },
+        {
+          "mass_number": 56,
+          "exact_mass": 55.93493633,
+          "abundance": 0.91754
+        },
+        {
+          "mass_number": 57,
+          "exact_mass": 56.93539284,
+          "abundance": 0.02119
+        },
+        {
+          "mass_number": 58,
+          "exact_mass": 57.93327443,
+          "abundance": 0.00282
+        }
+      ],
+      "pauling_electronegativity": 1.83,
+      "covalent_radius_pm": 132,
+      "vdw_radius_pm": 194,
+      "valence_electrons": 8,
+      "group": 8,
+      "period": 4
+    },
+    {
+      "atomic_number": 27,
+      "symbol": "Co",
+      "monoisotopic_mass": 58.93319429,
+      "standard_atomic_weight": 58.933194,
+      "isotopes": [
+        {
+          "mass_number": 59,
+          "exact_mass": 58.93319429,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 1.88,
+      "covalent_radius_pm": 126,
+      "vdw_radius_pm": 192,
+      "valence_electrons": 9,
+      "group": 9,
+      "period": 4
+    },
+    {
+      "atomic_number": 28,
+      "symbol": "Ni",
+      "monoisotopic_mass": 57.93534241,
+      "standard_atomic_weight": 58.6934,
+      "isotopes": [
+        {
+          "mass_number": 58,
+          "exact_mass": 57.93534241,
+          "abundance": 0.68077
+        },
+        {
+          "mass_number": 60,
+          "exact_mass": 59.93078588,
+          "abundance": 0.26223
+        },
+        {
+          "mass_number": 61,
+          "exact_mass": 60.93105557,
+          "abundance": 0.011399
+        },
+        {
+          "mass_number": 62,
+          "exact_mass": 61.92834537,
+          "abundance": 0.036346
+        },
+        {
+          "mass_number": 64,
+          "exact_mass": 63.92796682,
+          "abundance": 0.009255
+        }
+      ],
+      "pauling_electronegativity": 1.91,
+      "covalent_radius_pm": 124,
+      "vdw_radius_pm": 163,
+      "valence_electrons": 10,
+      "group": 10,
+      "period": 4
+    },
+    {
+      "atomic_number": 29,
+      "symbol": "Cu",
+      "monoisotopic_mass": 62.92959772,
+      "standard_atomic_weight": 63.546,
+      "isotopes": [
+        {
+          "mass_number": 63,
+          "exact_mass": 62.92959772,
+          "abundance": 0.6915
+        },
+        {
+          "mass_number": 65,
+          "exact_mass": 64.9277897,
+          "abundance": 0.3085
+        }
+      ],
+      "pauling_electronegativity": 1.9,
+      "covalent_radius_pm": 132,
+      "vdw_radius_pm": 140,
+      "valence_electrons": 11,
+      "group": 11,
+      "period": 4
+    },
+    {
+      "atomic_number": 30,
+      "symbol": "Zn",
+      "monoisotopic_mass": 63.92914201,
+      "standard_atomic_weight": 65.38,
+      "isotopes": [
+        {
+          "mass_number": 64,
+          "exact_mass": 63.92914201,
+          "abundance": 0.4917
+        },
+        {
+          "mass_number": 66,
+          "exact_mass": 65.92603381,
+          "abundance": 0.2773
+        },
+        {
+          "mass_number": 67,
+          "exact_mass": 66.92712775,
+          "abundance": 0.0404
+        },
+        {
+          "mass_number": 68,
+          "exact_mass": 67.92484455,
+          "abundance": 0.1845
+        },
+        {
+          "mass_number": 70,
+          "exact_mass": 69.9253192,
+          "abundance": 0.0061
+        }
+      ],
+      "pauling_electronegativity": 1.65,
+      "covalent_radius_pm": 122,
+      "vdw_radius_pm": 139,
+      "valence_electrons": 12,
+      "group": 12,
+      "period": 4
+    },
+    {
+      "atomic_number": 31,
+      "symbol": "Ga",
+      "monoisotopic_mass": 68.9255735,
+      "standard_atomic_weight": 69.723,
+      "isotopes": [
+        {
+          "mass_number": 69,
+          "exact_mass": 68.9255735,
+          "abundance": 0.60108
+        },
+        {
+          "mass_number": 71,
+          "exact_mass": 70.92470258,
+          "abundance": 0.39892
+        }
+      ],
+      "pauling_electronegativity": 1.81,
+      "covalent_radius_pm": 122,
+      "vdw_radius_pm": 187,
+      "valence_electrons": 3,
+      "group": 13,
+      "period": 4
+    },
+    {
+      "atomic_number": 32,
+      "symbol": "Ge",
+      "monoisotopic_mass": 73.921177761,
+      "standard_atomic_weight": 72.63,
+      "isotopes": [
+        {
+          "mass_number": 70,
+          "exact_mass": 69.92424875,
+          "abundance": 0.2057
+        },
+        {
+          "mass_number": 72,
+          "exact_mass": 71.922075826,
+          "abundance": 0.2745
+        },
+        {
+          "mass_number": 73,
+          "exact_mass": 72.923458956,
+          "abundance": 0.0775
+        },
+        {
+          "mass_number": 74,
+          "exact_mass": 73.921177761,
+          "abundance": 0.365
+        },
+        {
+          "mass_number": 76,
+          "exact_mass": 75.921402726,
+          "abundance": 0.0773
+        }
+      ],
+      "pauling_electronegativity": 2.01,
+      "covalent_radius_pm": 120,
+      "vdw_radius_pm": 211,
+      "valence_electrons": 4,
+      "group": 14,
+      "period": 4
+    },
+    {
+      "atomic_number": 33,
+      "symbol": "As",
+      "monoisotopic_mass": 74.92159457,
+      "standard_atomic_weight": 74.921595,
+      "isotopes": [
+        {
+          "mass_number": 75,
+          "exact_mass": 74.92159457,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 2.18,
+      "covalent_radius_pm": 119,
+      "vdw_radius_pm": 185,
+      "valence_electrons": 5,
+      "group": 15,
+      "period": 4
+    },
+    {
+      "atomic_number": 34,
+      "symbol": "Se",
+      "monoisotopic_mass": 79.9165218,
+      "standard_atomic_weight": 78.971,
+      "isotopes": [
+        {
+          "mass_number": 74,
+          "exact_mass": 73.922475934,
+          "abundance": 0.0089
+        },
+        {
+          "mass_number": 76,
+          "exact_mass": 75.919213704,
+          "abundance": 0.0937
+        },
+        {
+          "mass_number": 77,
+          "exact_mass": 76.919914154,
+          "abundance": 0.0763
+        },
+        {
+          "mass_number": 78,
+          "exact_mass": 77.91730928,
+          "abundance": 0.2377
+        },
+        {
+          "mass_number": 80,
+          "exact_mass": 79.9165218,
+          "abundance": 0.4961
+        },
+        {
+          "mass_number": 82,
+          "exact_mass": 81.9166995,
+          "abundance": 0.0873
+        }
+      ],
+      "pauling_electronegativity": 2.55,
+      "covalent_radius_pm": 120,
+      "vdw_radius_pm": 190,
+      "valence_electrons": 6,
+      "group": 16,
+      "period": 4
+    },
+    {
+      "atomic_number": 35,
+      "symbol": "Br",
+      "monoisotopic_mass": 78.9183376,
+      "standard_atomic_weight": 79.904,
+      "isotopes": [
+        {
+          "mass_number": 79,
+          "exact_mass": 78.9183376,
+          "abundance": 0.5069
+        },
+        {
+          "mass_number": 81,
+          "exact_mass": 80.9162897,
+          "abundance": 0.4931
+        }
+      ],
+      "pauling_electronegativity": 2.96,
+      "covalent_radius_pm": 120,
+      "vdw_radius_pm": 185,
+      "valence_electrons": 7,
+      "group": 17,
+      "period": 4
+    },
+    {
+      "atomic_number": 36,
+      "symbol": "Kr",
+      "monoisotopic_mass": 83.9114977282,
+      "standard_atomic_weight": 83.798,
+      "isotopes": [
+        {
+          "mass_number": 78,
+          "exact_mass": 77.92036494,
+          "abundance": 0.00355
+        },
+        {
+          "mass_number": 80,
+          "exact_mass": 79.91637808,
+          "abundance": 0.02286
+        },
+        {
+          "mass_number": 82,
+          "exact_mass": 81.91348273,
+          "abundance": 0.11593
+        },
+        {
+          "mass_number": 83,
+          "exact_mass": 82.91412716,
+          "abundance": 0.115
+        },
+        {
+          "mass_number": 84,
+          "exact_mass": 83.9114977282,
+          "abundance": 0.56987
+        },
+        {
+          "mass_number": 86,
+          "exact_mass": 85.9106106269,
+          "abundance": 0.17279
+        }
+      ],
+      "pauling_electronegativity": 3.0,
+      "covalent_radius_pm": 116,
+      "vdw_radius_pm": 202,
+      "valence_electrons": 8,
+      "group": 18,
+      "period": 4
+    },
+    {
+      "atomic_number": 37,
+      "symbol": "Rb",
+      "monoisotopic_mass": 84.9117897379,
+      "standard_atomic_weight": 85.4678,
+      "isotopes": [
+        {
+          "mass_number": 85,
+          "exact_mass": 84.9117897379,
+          "abundance": 0.7217
+        },
+        {
+          "mass_number": 87,
+          "exact_mass": 86.909180531,
+          "abundance": 0.2783
+        }
+      ],
+      "pauling_electronegativity": 0.82,
+      "covalent_radius_pm": 220,
+      "vdw_radius_pm": 303,
+      "valence_electrons": 1,
+      "group": 1,
+      "period": 5
+    },
+    {
+      "atomic_number": 38,
+      "symbol": "Sr",
+      "monoisotopic_mass": 87.9056125,
+      "standard_atomic_weight": 87.62,
+      "isotopes": [
+        {
+          "mass_number": 84,
+          "exact_mass": 83.9134191,
+          "abundance": 0.0056
+        },
+        {
+          "mass_number": 86,
+          "exact_mass": 85.9092606,
+          "abundance": 0.0986
+        },
+        {
+          "mass_number": 87,
+          "exact_mass": 86.9088775,
+          "abundance": 0.07
+        },
+        {
+          "mass_number": 88,
+          "exact_mass": 87.9056125,
+          "abundance": 0.8258
+        }
+      ],
+      "pauling_electronegativity": 0.95,
+      "covalent_radius_pm": 195,
+      "vdw_radius_pm": 249,
+      "valence_electrons": 2,
+      "group": 2,
+      "period": 5
+    },
+    {
+      "atomic_number": 39,
+      "symbol": "Y",
+      "monoisotopic_mass": 88.9058403,
+      "standard_atomic_weight": 88.90584,
+      "isotopes": [
+        {
+          "mass_number": 89,
+          "exact_mass": 88.9058403,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 1.22,
+      "covalent_radius_pm": 190,
+      "vdw_radius_pm": 219,
+      "valence_electrons": 3,
+      "group": 3,
+      "period": 5
+    },
+    {
+      "atomic_number": 40,
+      "symbol": "Zr",
+      "monoisotopic_mass": 89.9046977,
+      "standard_atomic_weight": 91.224,
+      "isotopes": [
+        {
+          "mass_number": 90,
+          "exact_mass": 89.9046977,
+          "abundance": 0.5145
+        },
+        {
+          "mass_number": 91,
+          "exact_mass": 90.9056396,
+          "abundance": 0.1122
+        },
+        {
+          "mass_number": 92,
+          "exact_mass": 91.9050347,
+          "abundance": 0.1715
+        },
+        {
+          "mass_number": 94,
+          "exact_mass": 93.9063108,
+          "abundance": 0.1738
+        },
+        {
+          "mass_number": 96,
+          "exact_mass": 95.9082714,
+          "abundance": 0.028
+        }
+      ],
+      "pauling_electronegativity": 1.33,
+      "covalent_radius_pm": 175,
+      "vdw_radius_pm": 186,
+      "valence_electrons": 4,
+      "group": 4,
+      "period": 5
+    },
+    {
+      "atomic_number": 41,
+      "symbol": "Nb",
+      "monoisotopic_mass": 92.906373,
+      "standard_atomic_weight": 92.90637,
+      "isotopes": [
+        {
+          "mass_number": 93,
+          "exact_mass": 92.906373,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 1.6,
+      "covalent_radius_pm": 164,
+      "vdw_radius_pm": 207,
+      "valence_electrons": 5,
+      "group": 5,
+      "period": 5
+    },
+    {
+      "atomic_number": 42,
+      "symbol": "Mo",
+      "monoisotopic_mass": 97.90540482,
+      "standard_atomic_weight": 95.95,
+      "isotopes": [
+        {
+          "mass_number": 92,
+          "exact_mass": 91.90680796,
+          "abundance": 0.1453
+        },
+        {
+          "mass_number": 94,
+          "exact_mass": 93.9050849,
+          "abundance": 0.0915
+        },
+        {
+          "mass_number": 95,
+          "exact_mass": 94.90583877,
+          "abundance": 0.1584
+        },
+        {
+          "mass_number": 96,
+          "exact_mass": 95.90467612,
+          "abundance": 0.1667
+        },
+        {
+          "mass_number": 97,
+          "exact_mass": 96.90601812,
+          "abundance": 0.096
+        },
+        {
+          "mass_number": 98,
+          "exact_mass": 97.90540482,
+          "abundance": 0.2439
+        },
+        {
+          "mass_number": 100,
+          "exact_mass": 99.9074718,
+          "abundance": 0.0982
+        }
+      ],
+      "pauling_electronegativity": 2.16,
+      "covalent_radius_pm": 154,
+      "vdw_radius_pm": 209,
+      "valence_electrons": 6,
+      "group": 6,
+      "period": 5
+    },
+    {
+      "atomic_number": 43,
+      "symbol": "Tc",
+      "monoisotopic_mass": 96.9063667,
+      "standard_atomic_weight": 98.0,
+      "isotopes": [
+        {
+          "mass_number": 97,
+          "exact_mass": 96.9063667,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 98,
+          "exact_mass": 97.9072124,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 99,
+          "exact_mass": 98.9062508,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 1.9,
+      "covalent_radius_pm": 147,
+      "vdw_radius_pm": 209,
+      "valence_electrons": 7,
+      "group": 7,
+      "period": 5
+    },
+    {
+      "atomic_number": 44,
+      "symbol": "Ru",
+      "monoisotopic_mass": 101.9043441,
+      "standard_atomic_weight": 101.07,
+      "isotopes": [
+        {
+          "mass_number": 96,
+          "exact_mass": 95.90759025,
+          "abundance": 0.0554
+        },
+        {
+          "mass_number": 98,
+          "exact_mass": 97.9052868,
+          "abundance": 0.0187
+        },
+        {
+          "mass_number": 99,
+          "exact_mass": 98.9059341,
+          "abundance": 0.1276
+        },
+        {
+          "mass_number": 100,
+          "exact_mass": 99.9042143,
+          "abundance": 0.126
+        },
+        {
+          "mass_number": 101,
+          "exact_mass": 100.9055769,
+          "abundance": 0.1706
+        },
+        {
+          "mass_number": 102,
+          "exact_mass": 101.9043441,
+          "abundance": 0.3155
+        },
+        {
+          "mass_number": 104,
+          "exact_mass": 103.9054275,
+          "abundance": 0.1862
+        }
+      ],
+      "pauling_electronegativity": 2.2,
+      "covalent_radius_pm": 146,
+      "vdw_radius_pm": 207,
+      "valence_electrons": 8,
+      "group": 8,
+      "period": 5
+    },
+    {
+      "atomic_number": 45,
+      "symbol": "Rh",
+      "monoisotopic_mass": 102.905498,
+      "standard_atomic_weight": 102.9055,
+      "isotopes": [
+        {
+          "mass_number": 103,
+          "exact_mass": 102.905498,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 2.28,
+      "covalent_radius_pm": 142,
+      "vdw_radius_pm": 195,
+      "valence_electrons": 9,
+      "group": 9,
+      "period": 5
+    },
+    {
+      "atomic_number": 46,
+      "symbol": "Pd",
+      "monoisotopic_mass": 105.9034804,
+      "standard_atomic_weight": 106.42,
+      "isotopes": [
+        {
+          "mass_number": 102,
+          "exact_mass": 101.9056022,
+          "abundance": 0.0102
+        },
+        {
+          "mass_number": 104,
+          "exact_mass": 103.9040305,
+          "abundance": 0.1114
+        },
+        {
+          "mass_number": 105,
+          "exact_mass": 104.9050796,
+          "abundance": 0.2233
+        },
+        {
+          "mass_number": 106,
+          "exact_mass": 105.9034804,
+          "abundance": 0.2733
+        },
+        {
+          "mass_number": 108,
+          "exact_mass": 107.9038916,
+          "abundance": 0.2646
+        },
+        {
+          "mass_number": 110,
+          "exact_mass": 109.9051722,
+          "abundance": 0.1172
+        }
+      ],
+      "pauling_electronegativity": 2.2,
+      "covalent_radius_pm": 139,
+      "vdw_radius_pm": 202,
+      "valence_electrons": 10,
+      "group": 10,
+      "period": 5
+    },
+    {
+      "atomic_number": 47,
+      "symbol": "Ag",
+      "monoisotopic_mass": 106.9050916,
+      "standard_atomic_weight": 107.8682,
+      "isotopes": [
+        {
+          "mass_number": 107,
+          "exact_mass": 106.9050916,
+          "abundance": 0.51839
+        },
+        {
+          "mass_number": 109,
+          "exact_mass": 108.9047553,
+          "abundance": 0.48161
+        }
+      ],
+      "pauling_electronegativity": 1.93,
+      "covalent_radius_pm": 145,
+      "vdw_radius_pm": 172,
+      "valence_electrons": 11,
+      "group": 11,
+      "period": 5
+    },
+    {
+      "atomic_number": 48,
+      "symbol": "Cd",
+      "monoisotopic_mass": 113.90336509,
+      "standard_atomic_weight": 112.414,
+      "isotopes": [
+        {
+          "mass_number": 106,
+          "exact_mass": 105.9064599,
+          "abundance": 0.0125
+        },
+        {
+          "mass_number": 108,
+          "exact_mass": 107.9041834,
+          "abundance": 0.0089
+        },
+        {
+          "mass_number": 110,
+          "exact_mass": 109.90300661,
+          "abundance": 0.1249
+        },
+        {
+          "mass_number": 111,
+          "exact_mass": 110.90418287,
+          "abundance": 0.128
+        },
+        {
+          "mass_number": 112,
+          "exact_mass": 111.90276287,
+          "abundance": 0.2413
+        },
+        {
+          "mass_number": 113,
+          "exact_mass": 112.90440813,
+          "abundance": 0.1222
+        },
+        {
+          "mass_number": 114,
+          "exact_mass": 113.90336509,
+          "abundance": 0.2873
+        },
+        {
+          "mass_number": 116,
+          "exact_mass": 115.90476315,
+          "abundance": 0.0749
+        }
+      ],
+      "pauling_electronegativity": 1.69,
+      "covalent_radius_pm": 144,
+      "vdw_radius_pm": 158,
+      "valence_electrons": 12,
+      "group": 12,
+      "period": 5
+    },
+    {
+      "atomic_number": 49,
+      "symbol": "In",
+      "monoisotopic_mass": 114.903878776,
+      "standard_atomic_weight": 114.818,
+      "isotopes": [
+        {
+          "mass_number": 113,
+          "exact_mass": 112.90406184,
+          "abundance": 0.0429
+        },
+        {
+          "mass_number": 115,
+          "exact_mass": 114.903878776,
+          "abundance": 0.9571
+        }
+      ],
+      "pauling_electronegativity": 1.78,
+      "covalent_radius_pm": 142,
+      "vdw_radius_pm": 193,
+      "valence_electrons": 3,
+      "group": 13,
+      "period": 5
+    },
+    {
+      "atomic_number": 50,
+      "symbol": "Sn",
+      "monoisotopic_mass": 119.90220163,
+      "standard_atomic_weight": 118.71,
+      "isotopes": [
+        {
+          "mass_number": 112,
+          "exact_mass": 111.90482387,
+          "abundance": 0.0097
+        },
+        {
+          "mass_number": 114,
+          "exact_mass": 113.9027827,
+          "abundance": 0.0066
+        },
+        {
+          "mass_number": 115,
+          "exact_mass": 114.903344699,
+          "abundance": 0.0034
+        },
+        {
+          "mass_number": 116,
+          "exact_mass": 115.9017428,
+          "abundance": 0.1454
+        },
+        {
+          "mass_number": 117,
+          "exact_mass": 116.90295398,
+          "abundance": 0.0768
+        },
+        {
+          "mass_number": 118,
+          "exact_mass": 117.90160657,
+          "abundance": 0.2422
+        },
+        {
+          "mass_number": 119,
+          "exact_mass": 118.90331117,
+          "abundance": 0.0859
+        },
+        {
+          "mass_number": 120,
+          "exact_mass": 119.90220163,
+          "abundance": 0.3258
+        },
+        {
+          "mass_number": 122,
+          "exact_mass": 121.9034438,
+          "abundance": 0.0463
+        },
+        {
+          "mass_number": 124,
+          "exact_mass": 123.9052766,
+          "abundance": 0.0579
+        }
+      ],
+      "pauling_electronegativity": 1.96,
+      "covalent_radius_pm": 139,
+      "vdw_radius_pm": 217,
+      "valence_electrons": 4,
+      "group": 14,
+      "period": 5
+    },
+    {
+      "atomic_number": 51,
+      "symbol": "Sb",
+      "monoisotopic_mass": 120.903812,
+      "standard_atomic_weight": 121.76,
+      "isotopes": [
+        {
+          "mass_number": 121,
+          "exact_mass": 120.903812,
+          "abundance": 0.5721
+        },
+        {
+          "mass_number": 123,
+          "exact_mass": 122.9042132,
+          "abundance": 0.4279
+        }
+      ],
+      "pauling_electronegativity": 2.05,
+      "covalent_radius_pm": 139,
+      "vdw_radius_pm": 206,
+      "valence_electrons": 5,
+      "group": 15,
+      "period": 5
+    },
+    {
+      "atomic_number": 52,
+      "symbol": "Te",
+      "monoisotopic_mass": 129.906222748,
+      "standard_atomic_weight": 127.6,
+      "isotopes": [
+        {
+          "mass_number": 120,
+          "exact_mass": 119.9040593,
+          "abundance": 0.0009
+        },
+        {
+          "mass_number": 122,
+          "exact_mass": 121.9030435,
+          "abundance": 0.0255
+        },
+        {
+          "mass_number": 123,
+          "exact_mass": 122.9042698,
+          "abundance": 0.0089
+        },
+        {
+          "mass_number": 124,
+          "exact_mass": 123.9028171,
+          "abundance": 0.0474
+        },
+        {
+          "mass_number": 125,
+          "exact_mass": 124.9044299,
+          "abundance": 0.0707
+        },
+        {
+          "mass_number": 126,
+          "exact_mass": 125.9033109,
+          "abundance": 0.1884
+        },
+        {
+          "mass_number": 128,
+          "exact_mass": 127.90446128,
+          "abundance": 0.3174
+        },
+        {
+          "mass_number": 130,
+          "exact_mass": 129.906222748,
+          "abundance": 0.3408
+        }
+      ],
+      "pauling_electronegativity": 2.1,
+      "covalent_radius_pm": 138,
+      "vdw_radius_pm": 206,
+      "valence_electrons": 6,
+      "group": 16,
+      "period": 5
+    },
+    {
+      "atomic_number": 53,
+      "symbol": "I",
+      "monoisotopic_mass": 126.9044719,
+      "standard_atomic_weight": 126.90447,
+      "isotopes": [
+        {
+          "mass_number": 127,
+          "exact_mass": 126.9044719,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 2.66,
+      "covalent_radius_pm": 139,
+      "vdw_radius_pm": 198,
+      "valence_electrons": 7,
+      "group": 17,
+      "period": 5
+    },
+    {
+      "atomic_number": 54,
+      "symbol": "Xe",
+      "monoisotopic_mass": 131.9041550856,
+      "standard_atomic_weight": 131.293,
+      "isotopes": [
+        {
+          "mass_number": 124,
+          "exact_mass": 123.905892,
+          "abundance": 0.000952
+        },
+        {
+          "mass_number": 126,
+          "exact_mass": 125.9042983,
+          "abundance": 0.00089
+        },
+        {
+          "mass_number": 128,
+          "exact_mass": 127.903531,
+          "abundance": 0.019102
+        },
+        {
+          "mass_number": 129,
+          "exact_mass": 128.9047808611,
+          "abundance": 0.264006
+        },
+        {
+          "mass_number": 130,
+          "exact_mass": 129.903509349,
+          "abundance": 0.04071
+        },
+        {
+          "mass_number": 131,
+          "exact_mass": 130.90508406,
+          "abundance": 0.212324
+        },
+        {
+          "mass_number": 132,
+          "exact_mass": 131.9041550856,
+          "abundance": 0.269086
+        },
+        {
+          "mass_number": 134,
+          "exact_mass": 133.90539466,
+          "abundance": 0.104357
+        },
+        {
+          "mass_number": 136,
+          "exact_mass": 135.907214484,
+          "abundance": 0.088573
+        }
+      ],
+      "pauling_electronegativity": 2.6,
+      "covalent_radius_pm": 140,
+      "vdw_radius_pm": 216,
+      "valence_electrons": 8,
+      "group": 18,
+      "period": 5
+    },
+    {
+      "atomic_number": 55,
+      "symbol": "Cs",
+      "monoisotopic_mass": 132.905451961,
+      "standard_atomic_weight": 132.90545196,
+      "isotopes": [
+        {
+          "mass_number": 133,
+          "exact_mass": 132.905451961,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 0.79,
+      "covalent_radius_pm": 244,
+      "vdw_radius_pm": 343,
+      "valence_electrons": 1,
+      "group": 1,
+      "period": 6
+    },
+    {
+      "atomic_number": 56,
+      "symbol": "Ba",
+      "monoisotopic_mass": 137.905247,
+      "standard_atomic_weight": 137.327,
+      "isotopes": [
+        {
+          "mass_number": 130,
+          "exact_mass": 129.9063207,
+          "abundance": 0.00106
+        },
+        {
+          "mass_number": 132,
+          "exact_mass": 131.9050611,
+          "abundance": 0.00101
+        },
+        {
+          "mass_number": 134,
+          "exact_mass": 133.90450818,
+          "abundance": 0.02417
+        },
+        {
+          "mass_number": 135,
+          "exact_mass": 134.90568838,
+          "abundance": 0.06592
+        },
+        {
+          "mass_number": 136,
+          "exact_mass": 135.90457573,
+          "abundance": 0.07854
+        },
+        {
+          "mass_number": 137,
+          "exact_mass": 136.90582714,
+          "abundance": 0.11232
+        },
+        {
+          "mass_number": 138,
+          "exact_mass": 137.905247,
+          "abundance": 0.71698
+        }
+      ],
+      "pauling_electronegativity": 0.89,
+      "covalent_radius_pm": 215,
+      "vdw_radius_pm": 268,
+      "valence_electrons": 2,
+      "group": 2,
+      "period": 6
+    },
+    {
+      "atomic_number": 57,
+      "symbol": "La",
+      "monoisotopic_mass": 138.9063563,
+      "standard_atomic_weight": 138.90547,
+      "isotopes": [
+        {
+          "mass_number": 138,
+          "exact_mass": 137.9071149,
+          "abundance": 0.0008881
+        },
+        {
+          "mass_number": 139,
+          "exact_mass": 138.9063563,
+          "abundance": 0.9991119
+        }
+      ],
+      "pauling_electronegativity": 1.1,
+      "covalent_radius_pm": 207,
+      "vdw_radius_pm": 240,
+      "valence_electrons": 3,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 58,
+      "symbol": "Ce",
+      "monoisotopic_mass": 139.9054431,
+      "standard_atomic_weight": 140.116,
+      "isotopes": [
+        {
+          "mass_number": 136,
+          "exact_mass": 135.90712921,
+          "abundance": 0.00185
+        },
+        {
+          "mass_number": 138,
+          "exact_mass": 137.905991,
+          "abundance": 0.00251
+        },
+        {
+          "mass_number": 140,
+          "exact_mass": 139.9054431,
+          "abundance": 0.8845
+        },
+        {
+          "mass_number": 142,
+          "exact_mass": 141.9092504,
+          "abundance": 0.11114
+        }
+      ],
+      "pauling_electronegativity": 1.12,
+      "covalent_radius_pm": 204,
+      "vdw_radius_pm": 235,
+      "valence_electrons": 4,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 59,
+      "symbol": "Pr",
+      "monoisotopic_mass": 140.9076576,
+      "standard_atomic_weight": 140.90766,
+      "isotopes": [
+        {
+          "mass_number": 141,
+          "exact_mass": 140.9076576,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 1.13,
+      "covalent_radius_pm": 203,
+      "vdw_radius_pm": 239,
+      "valence_electrons": 5,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 60,
+      "symbol": "Nd",
+      "monoisotopic_mass": 141.907729,
+      "standard_atomic_weight": 144.242,
+      "isotopes": [
+        {
+          "mass_number": 142,
+          "exact_mass": 141.907729,
+          "abundance": 0.27152
+        },
+        {
+          "mass_number": 143,
+          "exact_mass": 142.90982,
+          "abundance": 0.12174
+        },
+        {
+          "mass_number": 144,
+          "exact_mass": 143.910093,
+          "abundance": 0.23798
+        },
+        {
+          "mass_number": 145,
+          "exact_mass": 144.9125793,
+          "abundance": 0.08293
+        },
+        {
+          "mass_number": 146,
+          "exact_mass": 145.9131226,
+          "abundance": 0.17189
+        },
+        {
+          "mass_number": 148,
+          "exact_mass": 147.9168993,
+          "abundance": 0.05756
+        },
+        {
+          "mass_number": 150,
+          "exact_mass": 149.9209022,
+          "abundance": 0.05638
+        }
+      ],
+      "pauling_electronegativity": 1.14,
+      "covalent_radius_pm": 201,
+      "vdw_radius_pm": 229,
+      "valence_electrons": 6,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 61,
+      "symbol": "Pm",
+      "monoisotopic_mass": 144.9127559,
+      "standard_atomic_weight": 145.0,
+      "isotopes": [
+        {
+          "mass_number": 145,
+          "exact_mass": 144.9127559,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 147,
+          "exact_mass": 146.915145,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 1.13,
+      "covalent_radius_pm": 199,
+      "vdw_radius_pm": 236,
+      "valence_electrons": 7,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 62,
+      "symbol": "Sm",
+      "monoisotopic_mass": 151.9197397,
+      "standard_atomic_weight": 150.36,
+      "isotopes": [
+        {
+          "mass_number": 144,
+          "exact_mass": 143.9120065,
+          "abundance": 0.0307
+        },
+        {
+          "mass_number": 147,
+          "exact_mass": 146.9149044,
+          "abundance": 0.1499
+        },
+        {
+          "mass_number": 148,
+          "exact_mass": 147.9148292,
+          "abundance": 0.1124
+        },
+        {
+          "mass_number": 149,
+          "exact_mass": 148.9171921,
+          "abundance": 0.1382
+        },
+        {
+          "mass_number": 150,
+          "exact_mass": 149.9172829,
+          "abundance": 0.0738
+        },
+        {
+          "mass_number": 152,
+          "exact_mass": 151.9197397,
+          "abundance": 0.2675
+        },
+        {
+          "mass_number": 154,
+          "exact_mass": 153.9222169,
+          "abundance": 0.2275
+        }
+      ],
+      "pauling_electronegativity": 1.17,
+      "covalent_radius_pm": 198,
+      "vdw_radius_pm": 229,
+      "valence_electrons": 8,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 63,
+      "symbol": "Eu",
+      "monoisotopic_mass": 152.921238,
+      "standard_atomic_weight": 151.964,
+      "isotopes": [
+        {
+          "mass_number": 151,
+          "exact_mass": 150.9198578,
+          "abundance": 0.4781
+        },
+        {
+          "mass_number": 153,
+          "exact_mass": 152.921238,
+          "abundance": 0.5219
+        }
+      ],
+      "pauling_electronegativity": 1.2,
+      "covalent_radius_pm": 198,
+      "vdw_radius_pm": 233,
+      "valence_electrons": 9,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 64,
+      "symbol": "Gd",
+      "monoisotopic_mass": 157.9241123,
+      "standard_atomic_weight": 157.25,
+      "isotopes": [
+        {
+          "mass_number": 152,
+          "exact_mass": 151.9197995,
+          "abundance": 0.002
+        },
+        {
+          "mass_number": 154,
+          "exact_mass": 153.9208741,
+          "abundance": 0.0218
+        },
+        {
+          "mass_number": 155,
+          "exact_mass": 154.9226305,
+          "abundance": 0.148
+        },
+        {
+          "mass_number": 156,
+          "exact_mass": 155.9221312,
+          "abundance": 0.2047
+        },
+        {
+          "mass_number": 157,
+          "exact_mass": 156.9239686,
+          "abundance": 0.1565
+        },
+        {
+          "mass_number": 158,
+          "exact_mass": 157.9241123,
+          "abundance": 0.2484
+        },
+        {
+          "mass_number": 160,
+          "exact_mass": 159.9270624,
+          "abundance": 0.2186
+        }
+      ],
+      "pauling_electronegativity": 1.2,
+      "covalent_radius_pm": 196,
+      "vdw_radius_pm": 237,
+      "valence_electrons": 10,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 65,
+      "symbol": "Tb",
+      "monoisotopic_mass": 158.9253547,
+      "standard_atomic_weight": 158.92535,
+      "isotopes": [
+        {
+          "mass_number": 159,
+          "exact_mass": 158.9253547,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 1.2,
+      "covalent_radius_pm": 194,
+      "vdw_radius_pm": 221,
+      "valence_electrons": 11,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 66,
+      "symbol": "Dy",
+      "monoisotopic_mass": 163.9291819,
+      "standard_atomic_weight": 162.5,
+      "isotopes": [
+        {
+          "mass_number": 156,
+          "exact_mass": 155.9242847,
+          "abundance": 0.00056
+        },
+        {
+          "mass_number": 158,
+          "exact_mass": 157.9244159,
+          "abundance": 0.00095
+        },
+        {
+          "mass_number": 160,
+          "exact_mass": 159.9252046,
+          "abundance": 0.02329
+        },
+        {
+          "mass_number": 161,
+          "exact_mass": 160.9269405,
+          "abundance": 0.18889
+        },
+        {
+          "mass_number": 162,
+          "exact_mass": 161.9268056,
+          "abundance": 0.25475
+        },
+        {
+          "mass_number": 163,
+          "exact_mass": 162.9287383,
+          "abundance": 0.24896
+        },
+        {
+          "mass_number": 164,
+          "exact_mass": 163.9291819,
+          "abundance": 0.2826
+        }
+      ],
+      "pauling_electronegativity": 1.22,
+      "covalent_radius_pm": 192,
+      "vdw_radius_pm": 229,
+      "valence_electrons": 12,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 67,
+      "symbol": "Ho",
+      "monoisotopic_mass": 164.9303288,
+      "standard_atomic_weight": 164.93033,
+      "isotopes": [
+        {
+          "mass_number": 165,
+          "exact_mass": 164.9303288,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 1.23,
+      "covalent_radius_pm": 192,
+      "vdw_radius_pm": 216,
+      "valence_electrons": 13,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 68,
+      "symbol": "Er",
+      "monoisotopic_mass": 165.9302995,
+      "standard_atomic_weight": 167.259,
+      "isotopes": [
+        {
+          "mass_number": 162,
+          "exact_mass": 161.9287884,
+          "abundance": 0.00139
+        },
+        {
+          "mass_number": 164,
+          "exact_mass": 163.9292088,
+          "abundance": 0.01601
+        },
+        {
+          "mass_number": 166,
+          "exact_mass": 165.9302995,
+          "abundance": 0.33503
+        },
+        {
+          "mass_number": 167,
+          "exact_mass": 166.9320546,
+          "abundance": 0.22869
+        },
+        {
+          "mass_number": 168,
+          "exact_mass": 167.9323767,
+          "abundance": 0.26978
+        },
+        {
+          "mass_number": 170,
+          "exact_mass": 169.9354702,
+          "abundance": 0.1491
+        }
+      ],
+      "pauling_electronegativity": 1.24,
+      "covalent_radius_pm": 189,
+      "vdw_radius_pm": 235,
+      "valence_electrons": 14,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 69,
+      "symbol": "Tm",
+      "monoisotopic_mass": 168.9342179,
+      "standard_atomic_weight": 168.93422,
+      "isotopes": [
+        {
+          "mass_number": 169,
+          "exact_mass": 168.9342179,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 1.25,
+      "covalent_radius_pm": 190,
+      "vdw_radius_pm": 227,
+      "valence_electrons": 15,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 70,
+      "symbol": "Yb",
+      "monoisotopic_mass": 173.9388664,
+      "standard_atomic_weight": 173.054,
+      "isotopes": [
+        {
+          "mass_number": 168,
+          "exact_mass": 167.9338896,
+          "abundance": 0.00123
+        },
+        {
+          "mass_number": 170,
+          "exact_mass": 169.9347664,
+          "abundance": 0.02982
+        },
+        {
+          "mass_number": 171,
+          "exact_mass": 170.9363302,
+          "abundance": 0.1409
+        },
+        {
+          "mass_number": 172,
+          "exact_mass": 171.9363859,
+          "abundance": 0.2168
+        },
+        {
+          "mass_number": 173,
+          "exact_mass": 172.9382151,
+          "abundance": 0.16103
+        },
+        {
+          "mass_number": 174,
+          "exact_mass": 173.9388664,
+          "abundance": 0.32026
+        },
+        {
+          "mass_number": 176,
+          "exact_mass": 175.9425764,
+          "abundance": 0.12996
+        }
+      ],
+      "pauling_electronegativity": 1.1,
+      "covalent_radius_pm": 187,
+      "vdw_radius_pm": 242,
+      "valence_electrons": 16,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 71,
+      "symbol": "Lu",
+      "monoisotopic_mass": 174.9407752,
+      "standard_atomic_weight": 174.9668,
+      "isotopes": [
+        {
+          "mass_number": 175,
+          "exact_mass": 174.9407752,
+          "abundance": 0.97401
+        },
+        {
+          "mass_number": 176,
+          "exact_mass": 175.9426897,
+          "abundance": 0.02599
+        }
+      ],
+      "pauling_electronegativity": 1.27,
+      "covalent_radius_pm": 187,
+      "vdw_radius_pm": 221,
+      "valence_electrons": 17,
+      "group": -1,
+      "period": 6
+    },
+    {
+      "atomic_number": 72,
+      "symbol": "Hf",
+      "monoisotopic_mass": 179.946557,
+      "standard_atomic_weight": 178.49,
+      "isotopes": [
+        {
+          "mass_number": 174,
+          "exact_mass": 173.9400461,
+          "abundance": 0.0016
+        },
+        {
+          "mass_number": 176,
+          "exact_mass": 175.9414076,
+          "abundance": 0.0526
+        },
+        {
+          "mass_number": 177,
+          "exact_mass": 176.9432277,
+          "abundance": 0.186
+        },
+        {
+          "mass_number": 178,
+          "exact_mass": 177.9437058,
+          "abundance": 0.2728
+        },
+        {
+          "mass_number": 179,
+          "exact_mass": 178.9458232,
+          "abundance": 0.1362
+        },
+        {
+          "mass_number": 180,
+          "exact_mass": 179.946557,
+          "abundance": 0.3508
+        }
+      ],
+      "pauling_electronegativity": 1.3,
+      "covalent_radius_pm": 175,
+      "vdw_radius_pm": 212,
+      "valence_electrons": 4,
+      "group": 4,
+      "period": 6
+    },
+    {
+      "atomic_number": 73,
+      "symbol": "Ta",
+      "monoisotopic_mass": 180.9479958,
+      "standard_atomic_weight": 180.94788,
+      "isotopes": [
+        {
+          "mass_number": 180,
+          "exact_mass": 179.9474648,
+          "abundance": 0.0001201
+        },
+        {
+          "mass_number": 181,
+          "exact_mass": 180.9479958,
+          "abundance": 0.9998799
+        }
+      ],
+      "pauling_electronegativity": 1.5,
+      "covalent_radius_pm": 170,
+      "vdw_radius_pm": 217,
+      "valence_electrons": 5,
+      "group": 5,
+      "period": 6
+    },
+    {
+      "atomic_number": 74,
+      "symbol": "W",
+      "monoisotopic_mass": 183.95093092,
+      "standard_atomic_weight": 183.84,
+      "isotopes": [
+        {
+          "mass_number": 180,
+          "exact_mass": 179.9467108,
+          "abundance": 0.0012
+        },
+        {
+          "mass_number": 182,
+          "exact_mass": 181.94820394,
+          "abundance": 0.265
+        },
+        {
+          "mass_number": 183,
+          "exact_mass": 182.95022275,
+          "abundance": 0.1431
+        },
+        {
+          "mass_number": 184,
+          "exact_mass": 183.95093092,
+          "abundance": 0.3064
+        },
+        {
+          "mass_number": 186,
+          "exact_mass": 185.9543628,
+          "abundance": 0.2843
+        }
+      ],
+      "pauling_electronegativity": 2.36,
+      "covalent_radius_pm": 162,
+      "vdw_radius_pm": 210,
+      "valence_electrons": 6,
+      "group": 6,
+      "period": 6
+    },
+    {
+      "atomic_number": 75,
+      "symbol": "Re",
+      "monoisotopic_mass": 186.9557501,
+      "standard_atomic_weight": 186.207,
+      "isotopes": [
+        {
+          "mass_number": 185,
+          "exact_mass": 184.9529545,
+          "abundance": 0.374
+        },
+        {
+          "mass_number": 187,
+          "exact_mass": 186.9557501,
+          "abundance": 0.626
+        }
+      ],
+      "pauling_electronegativity": 1.9,
+      "covalent_radius_pm": 151,
+      "vdw_radius_pm": 217,
+      "valence_electrons": 7,
+      "group": 7,
+      "period": 6
+    },
+    {
+      "atomic_number": 76,
+      "symbol": "Os",
+      "monoisotopic_mass": 191.961477,
+      "standard_atomic_weight": 190.23,
+      "isotopes": [
+        {
+          "mass_number": 184,
+          "exact_mass": 183.9524885,
+          "abundance": 0.0002
+        },
+        {
+          "mass_number": 186,
+          "exact_mass": 185.953835,
+          "abundance": 0.0159
+        },
+        {
+          "mass_number": 187,
+          "exact_mass": 186.9557474,
+          "abundance": 0.0196
+        },
+        {
+          "mass_number": 188,
+          "exact_mass": 187.9558352,
+          "abundance": 0.1324
+        },
+        {
+          "mass_number": 189,
+          "exact_mass": 188.9581442,
+          "abundance": 0.1615
+        },
+        {
+          "mass_number": 190,
+          "exact_mass": 189.9584437,
+          "abundance": 0.2626
+        },
+        {
+          "mass_number": 192,
+          "exact_mass": 191.961477,
+          "abundance": 0.4078
+        }
+      ],
+      "pauling_electronegativity": 2.2,
+      "covalent_radius_pm": 144,
+      "vdw_radius_pm": 216,
+      "valence_electrons": 8,
+      "group": 8,
+      "period": 6
+    },
+    {
+      "atomic_number": 77,
+      "symbol": "Ir",
+      "monoisotopic_mass": 192.9629216,
+      "standard_atomic_weight": 192.217,
+      "isotopes": [
+        {
+          "mass_number": 191,
+          "exact_mass": 190.9605893,
+          "abundance": 0.373
+        },
+        {
+          "mass_number": 193,
+          "exact_mass": 192.9629216,
+          "abundance": 0.627
+        }
+      ],
+      "pauling_electronegativity": 2.2,
+      "covalent_radius_pm": 141,
+      "vdw_radius_pm": 202,
+      "valence_electrons": 9,
+      "group": 9,
+      "period": 6
+    },
+    {
+      "atomic_number": 78,
+      "symbol": "Pt",
+      "monoisotopic_mass": 194.9647917,
+      "standard_atomic_weight": 195.084,
+      "isotopes": [
+        {
+          "mass_number": 190,
+          "exact_mass": 189.9599297,
+          "abundance": 0.00012
+        },
+        {
+          "mass_number": 192,
+          "exact_mass": 191.9610387,
+          "abundance": 0.00782
+        },
+        {
+          "mass_number": 194,
+          "exact_mass": 193.9626809,
+          "abundance": 0.3286
+        },
+        {
+          "mass_number": 195,
+          "exact_mass": 194.9647917,
+          "abundance": 0.3378
+        },
+        {
+          "mass_number": 196,
+          "exact_mass": 195.96495209,
+          "abundance": 0.2521
+        },
+        {
+          "mass_number": 198,
+          "exact_mass": 197.9678949,
+          "abundance": 0.07356
+        }
+      ],
+      "pauling_electronegativity": 2.28,
+      "covalent_radius_pm": 136,
+      "vdw_radius_pm": 209,
+      "valence_electrons": 10,
+      "group": 10,
+      "period": 6
+    },
+    {
+      "atomic_number": 79,
+      "symbol": "Au",
+      "monoisotopic_mass": 196.96656879,
+      "standard_atomic_weight": 196.966569,
+      "isotopes": [
+        {
+          "mass_number": 197,
+          "exact_mass": 196.96656879,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 2.54,
+      "covalent_radius_pm": 136,
+      "vdw_radius_pm": 166,
+      "valence_electrons": 11,
+      "group": 11,
+      "period": 6
+    },
+    {
+      "atomic_number": 80,
+      "symbol": "Hg",
+      "monoisotopic_mass": 201.9706434,
+      "standard_atomic_weight": 200.592,
+      "isotopes": [
+        {
+          "mass_number": 196,
+          "exact_mass": 195.9658326,
+          "abundance": 0.0015
+        },
+        {
+          "mass_number": 198,
+          "exact_mass": 197.9667686,
+          "abundance": 0.0997
+        },
+        {
+          "mass_number": 199,
+          "exact_mass": 198.96828064,
+          "abundance": 0.1687
+        },
+        {
+          "mass_number": 200,
+          "exact_mass": 199.96832659,
+          "abundance": 0.231
+        },
+        {
+          "mass_number": 201,
+          "exact_mass": 200.97030284,
+          "abundance": 0.1318
+        },
+        {
+          "mass_number": 202,
+          "exact_mass": 201.9706434,
+          "abundance": 0.2986
+        },
+        {
+          "mass_number": 204,
+          "exact_mass": 203.97349398,
+          "abundance": 0.0687
+        }
+      ],
+      "pauling_electronegativity": 2.0,
+      "covalent_radius_pm": 132,
+      "vdw_radius_pm": 209,
+      "valence_electrons": 12,
+      "group": 12,
+      "period": 6
+    },
+    {
+      "atomic_number": 81,
+      "symbol": "Tl",
+      "monoisotopic_mass": 204.9744278,
+      "standard_atomic_weight": 204.3835,
+      "isotopes": [
+        {
+          "mass_number": 203,
+          "exact_mass": 202.9723446,
+          "abundance": 0.2952
+        },
+        {
+          "mass_number": 205,
+          "exact_mass": 204.9744278,
+          "abundance": 0.7048
+        }
+      ],
+      "pauling_electronegativity": 1.62,
+      "covalent_radius_pm": 145,
+      "vdw_radius_pm": 196,
+      "valence_electrons": 3,
+      "group": 13,
+      "period": 6
+    },
+    {
+      "atomic_number": 82,
+      "symbol": "Pb",
+      "monoisotopic_mass": 207.9766525,
+      "standard_atomic_weight": 207.2,
+      "isotopes": [
+        {
+          "mass_number": 204,
+          "exact_mass": 203.973044,
+          "abundance": 0.014
+        },
+        {
+          "mass_number": 206,
+          "exact_mass": 205.9744657,
+          "abundance": 0.241
+        },
+        {
+          "mass_number": 207,
+          "exact_mass": 206.9758973,
+          "abundance": 0.221
+        },
+        {
+          "mass_number": 208,
+          "exact_mass": 207.9766525,
+          "abundance": 0.524
+        }
+      ],
+      "pauling_electronegativity": 2.33,
+      "covalent_radius_pm": 146,
+      "vdw_radius_pm": 202,
+      "valence_electrons": 4,
+      "group": 14,
+      "period": 6
+    },
+    {
+      "atomic_number": 83,
+      "symbol": "Bi",
+      "monoisotopic_mass": 208.9803991,
+      "standard_atomic_weight": 208.9804,
+      "isotopes": [
+        {
+          "mass_number": 209,
+          "exact_mass": 208.9803991,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 2.02,
+      "covalent_radius_pm": 148,
+      "vdw_radius_pm": 207,
+      "valence_electrons": 5,
+      "group": 15,
+      "period": 6
+    },
+    {
+      "atomic_number": 84,
+      "symbol": "Po",
+      "monoisotopic_mass": 208.9824308,
+      "standard_atomic_weight": 209.0,
+      "isotopes": [
+        {
+          "mass_number": 209,
+          "exact_mass": 208.9824308,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 210,
+          "exact_mass": 209.9828741,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 2.0,
+      "covalent_radius_pm": 140,
+      "vdw_radius_pm": 197,
+      "valence_electrons": 6,
+      "group": 16,
+      "period": 6
+    },
+    {
+      "atomic_number": 85,
+      "symbol": "At",
+      "monoisotopic_mass": 209.9871479,
+      "standard_atomic_weight": 210.0,
+      "isotopes": [
+        {
+          "mass_number": 210,
+          "exact_mass": 209.9871479,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 211,
+          "exact_mass": 210.9874966,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 2.2,
+      "covalent_radius_pm": 150,
+      "vdw_radius_pm": 202,
+      "valence_electrons": 7,
+      "group": 17,
+      "period": 6
+    },
+    {
+      "atomic_number": 86,
+      "symbol": "Rn",
+      "monoisotopic_mass": 210.9906011,
+      "standard_atomic_weight": 222.0,
+      "isotopes": [
+        {
+          "mass_number": 211,
+          "exact_mass": 210.9906011,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 220,
+          "exact_mass": 220.0113941,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 222,
+          "exact_mass": 222.0175782,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 2.2,
+      "covalent_radius_pm": 150,
+      "vdw_radius_pm": 220,
+      "valence_electrons": 8,
+      "group": 18,
+      "period": 6
+    },
+    {
+      "atomic_number": 87,
+      "symbol": "Fr",
+      "monoisotopic_mass": 223.019736,
+      "standard_atomic_weight": 223.0,
+      "isotopes": [
+        {
+          "mass_number": 223,
+          "exact_mass": 223.019736,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 0.7,
+      "covalent_radius_pm": 260,
+      "vdw_radius_pm": 348,
+      "valence_electrons": 1,
+      "group": 1,
+      "period": 7
+    },
+    {
+      "atomic_number": 88,
+      "symbol": "Ra",
+      "monoisotopic_mass": 223.0185023,
+      "standard_atomic_weight": 226.0,
+      "isotopes": [
+        {
+          "mass_number": 223,
+          "exact_mass": 223.0185023,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 224,
+          "exact_mass": 224.020212,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 226,
+          "exact_mass": 226.0254103,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 228,
+          "exact_mass": 228.0310707,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 0.9,
+      "covalent_radius_pm": 221,
+      "vdw_radius_pm": 283,
+      "valence_electrons": 2,
+      "group": 2,
+      "period": 7
+    },
+    {
+      "atomic_number": 89,
+      "symbol": "Ac",
+      "monoisotopic_mass": 227.0277523,
+      "standard_atomic_weight": 227.0,
+      "isotopes": [
+        {
+          "mass_number": 227,
+          "exact_mass": 227.0277523,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 1.1,
+      "covalent_radius_pm": 215,
+      "vdw_radius_pm": 247,
+      "valence_electrons": 3,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 90,
+      "symbol": "Th",
+      "monoisotopic_mass": 232.0380558,
+      "standard_atomic_weight": 232.0377,
+      "isotopes": [
+        {
+          "mass_number": 230,
+          "exact_mass": 230.0331341,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 232,
+          "exact_mass": 232.0380558,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 1.3,
+      "covalent_radius_pm": 206,
+      "vdw_radius_pm": 245,
+      "valence_electrons": 4,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 91,
+      "symbol": "Pa",
+      "monoisotopic_mass": 231.0358842,
+      "standard_atomic_weight": 231.03588,
+      "isotopes": [
+        {
+          "mass_number": 231,
+          "exact_mass": 231.0358842,
+          "abundance": 1.0
+        }
+      ],
+      "pauling_electronegativity": 1.5,
+      "covalent_radius_pm": 200,
+      "vdw_radius_pm": 243,
+      "valence_electrons": 5,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 92,
+      "symbol": "U",
+      "monoisotopic_mass": 238.0507884,
+      "standard_atomic_weight": 238.02891,
+      "isotopes": [
+        {
+          "mass_number": 233,
+          "exact_mass": 233.0396355,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 234,
+          "exact_mass": 234.0409523,
+          "abundance": 5.4e-05
+        },
+        {
+          "mass_number": 235,
+          "exact_mass": 235.0439301,
+          "abundance": 0.007204
+        },
+        {
+          "mass_number": 236,
+          "exact_mass": 236.0455682,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 238,
+          "exact_mass": 238.0507884,
+          "abundance": 0.992742
+        }
+      ],
+      "pauling_electronegativity": 1.38,
+      "covalent_radius_pm": 196,
+      "vdw_radius_pm": 241,
+      "valence_electrons": 6,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 93,
+      "symbol": "Np",
+      "monoisotopic_mass": 236.04657,
+      "standard_atomic_weight": 237.0,
+      "isotopes": [
+        {
+          "mass_number": 236,
+          "exact_mass": 236.04657,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 237,
+          "exact_mass": 237.0481736,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 1.36,
+      "covalent_radius_pm": 190,
+      "vdw_radius_pm": 239,
+      "valence_electrons": 7,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 94,
+      "symbol": "Pu",
+      "monoisotopic_mass": 238.0495601,
+      "standard_atomic_weight": 244.0,
+      "isotopes": [
+        {
+          "mass_number": 238,
+          "exact_mass": 238.0495601,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 239,
+          "exact_mass": 239.0521636,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 240,
+          "exact_mass": 240.0538138,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 241,
+          "exact_mass": 241.0568517,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 242,
+          "exact_mass": 242.0587428,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 244,
+          "exact_mass": 244.0642053,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 1.28,
+      "covalent_radius_pm": 187,
+      "vdw_radius_pm": 243,
+      "valence_electrons": 8,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 95,
+      "symbol": "Am",
+      "monoisotopic_mass": 241.0568293,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 241,
+          "exact_mass": 241.0568293,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 243,
+          "exact_mass": 243.0613813,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 1.13,
+      "covalent_radius_pm": 180,
+      "vdw_radius_pm": 244,
+      "valence_electrons": 9,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 96,
+      "symbol": "Cm",
+      "monoisotopic_mass": 243.0613893,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 243,
+          "exact_mass": 243.0613893,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 244,
+          "exact_mass": 244.0627528,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 245,
+          "exact_mass": 245.0654915,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 246,
+          "exact_mass": 246.0672238,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 247,
+          "exact_mass": 247.0703541,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 248,
+          "exact_mass": 248.0723499,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 1.28,
+      "covalent_radius_pm": 169,
+      "vdw_radius_pm": 245,
+      "valence_electrons": 10,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 97,
+      "symbol": "Bk",
+      "monoisotopic_mass": 247.0703073,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 247,
+          "exact_mass": 247.0703073,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 249,
+          "exact_mass": 249.0749877,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 1.3,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": 244,
+      "valence_electrons": 11,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 98,
+      "symbol": "Cf",
+      "monoisotopic_mass": 249.0748539,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 249,
+          "exact_mass": 249.0748539,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 250,
+          "exact_mass": 250.0764062,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 251,
+          "exact_mass": 251.0795886,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 252,
+          "exact_mass": 252.0816272,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 1.3,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": 245,
+      "valence_electrons": 12,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 99,
+      "symbol": "Es",
+      "monoisotopic_mass": 252.08298,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 252,
+          "exact_mass": 252.08298,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 1.3,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": 245,
+      "valence_electrons": 13,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 100,
+      "symbol": "Fm",
+      "monoisotopic_mass": 257.0951061,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 257,
+          "exact_mass": 257.0951061,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 1.3,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 14,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 101,
+      "symbol": "Md",
+      "monoisotopic_mass": 258.0984315,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 258,
+          "exact_mass": 258.0984315,
+          "abundance": 0.0
+        },
+        {
+          "mass_number": 260,
+          "exact_mass": 260.10365,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 1.3,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 15,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 102,
+      "symbol": "No",
+      "monoisotopic_mass": 259.10103,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 259,
+          "exact_mass": 259.10103,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": 1.3,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 16,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 103,
+      "symbol": "Lr",
+      "monoisotopic_mass": 262.10961,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 262,
+          "exact_mass": 262.10961,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 17,
+      "group": -1,
+      "period": 7
+    },
+    {
+      "atomic_number": 104,
+      "symbol": "Rf",
+      "monoisotopic_mass": 267.12179,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 267,
+          "exact_mass": 267.12179,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 4,
+      "group": 4,
+      "period": 7
+    },
+    {
+      "atomic_number": 105,
+      "symbol": "Db",
+      "monoisotopic_mass": 268.12567,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 268,
+          "exact_mass": 268.12567,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 5,
+      "group": 5,
+      "period": 7
+    },
+    {
+      "atomic_number": 106,
+      "symbol": "Sg",
+      "monoisotopic_mass": 271.13393,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 271,
+          "exact_mass": 271.13393,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 6,
+      "group": 6,
+      "period": 7
+    },
+    {
+      "atomic_number": 107,
+      "symbol": "Bh",
+      "monoisotopic_mass": 272.13826,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 272,
+          "exact_mass": 272.13826,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 7,
+      "group": 7,
+      "period": 7
+    },
+    {
+      "atomic_number": 108,
+      "symbol": "Hs",
+      "monoisotopic_mass": 270.13429,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 270,
+          "exact_mass": 270.13429,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 8,
+      "group": 8,
+      "period": 7
+    },
+    {
+      "atomic_number": 109,
+      "symbol": "Mt",
+      "monoisotopic_mass": 276.15159,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 276,
+          "exact_mass": 276.15159,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 9,
+      "group": 9,
+      "period": 7
+    },
+    {
+      "atomic_number": 110,
+      "symbol": "Ds",
+      "monoisotopic_mass": 281.16451,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 281,
+          "exact_mass": 281.16451,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 10,
+      "group": 10,
+      "period": 7
+    },
+    {
+      "atomic_number": 111,
+      "symbol": "Rg",
+      "monoisotopic_mass": 280.16514,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 280,
+          "exact_mass": 280.16514,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 11,
+      "group": 11,
+      "period": 7
+    },
+    {
+      "atomic_number": 112,
+      "symbol": "Cn",
+      "monoisotopic_mass": 285.17712,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 285,
+          "exact_mass": 285.17712,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 12,
+      "group": 12,
+      "period": 7
+    },
+    {
+      "atomic_number": 113,
+      "symbol": "Nh",
+      "monoisotopic_mass": 284.17873,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 284,
+          "exact_mass": 284.17873,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 3,
+      "group": 13,
+      "period": 7
+    },
+    {
+      "atomic_number": 114,
+      "symbol": "Fl",
+      "monoisotopic_mass": 289.19042,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 289,
+          "exact_mass": 289.19042,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 4,
+      "group": 14,
+      "period": 7
+    },
+    {
+      "atomic_number": 115,
+      "symbol": "Mc",
+      "monoisotopic_mass": 288.19274,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 288,
+          "exact_mass": 288.19274,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 5,
+      "group": 15,
+      "period": 7
+    },
+    {
+      "atomic_number": 116,
+      "symbol": "Lv",
+      "monoisotopic_mass": 293.20449,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 293,
+          "exact_mass": 293.20449,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 6,
+      "group": 16,
+      "period": 7
+    },
+    {
+      "atomic_number": 117,
+      "symbol": "Ts",
+      "monoisotopic_mass": 292.20746,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 292,
+          "exact_mass": 292.20746,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 7,
+      "group": 17,
+      "period": 7
+    },
+    {
+      "atomic_number": 118,
+      "symbol": "Og",
+      "monoisotopic_mass": 294.21392,
+      "standard_atomic_weight": null,
+      "isotopes": [
+        {
+          "mass_number": 294,
+          "exact_mass": 294.21392,
+          "abundance": 0.0
+        }
+      ],
+      "pauling_electronegativity": null,
+      "covalent_radius_pm": null,
+      "vdw_radius_pm": null,
+      "valence_electrons": 8,
+      "group": 18,
+      "period": 7
+    }
+  ]
+}
