@@ -19,6 +19,10 @@ import constellation.core.io
 import constellation.core.nn
 import constellation.core.optim
 import constellation.core.sequence
+import constellation.core.sequence.alphabets
+import constellation.core.sequence.nucleic
+import constellation.core.sequence.ops
+import constellation.core.sequence.protein
 import constellation.core.stats
 import constellation.core.structure
 import constellation.massspec
