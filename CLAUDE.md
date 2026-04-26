@@ -6,7 +6,7 @@ Integrative bioinformatics platform: a shared core of physically grounded primit
 
 Constellation is absorbing four existing lab packages as a **clean rewrite** (no vendored source): **Cartographer** (MS proteomics, first port target), **NanoporeAnalysis** (POD5 → protein), **CoLLAGE** (codon optimization), **Contour** (PDB → MD prep). Chronologer (RT prediction) has already been absorbed into Cartographer.
 
-Current state: **`core.chem` shipped; everything else scaffold.** Functional code lives in `constellation.core.chem` (full periodic table, Composition arithmetic, binned + isotopologue-resolved isotope distributions, UNIMOD vocabulary with subsetting), `constellation.thirdparty.registry` (tool discovery), and `constellation.cli.__main__` (the `constellation doctor` command). All other subpackages are scaffold-only. Core primitives and domain modules are staged for the 90-day roadmap (see `docs/roadmap.md` when written).
+Current state: **`core.chem` and `core.sequence` shipped; everything else scaffold.** Functional code lives in `constellation.core.chem` (full periodic table, Composition arithmetic, binned + isotopologue-resolved isotope distributions, UNIMOD vocabulary with subsetting), `constellation.core.sequence` (canonical + IUPAC alphabets, generic ops, nucleic translation/ORF/rev-complement, protein cleavage / peptide composition), `constellation.thirdparty.registry` (tool discovery), and `constellation.cli.__main__` (the `constellation doctor` command). All other subpackages are scaffold-only. Core primitives and domain modules are staged for the 90-day roadmap (see `docs/roadmap.md` when written).
 
 ## Architecture invariants (load-bearing — design principles from the PI)
 
@@ -24,8 +24,9 @@ Current state: **`core.chem` shipped; everything else scaffold.** Functional cod
 
 - **PascalCase for all new classes.** Legacy `snake_case` class names from Cartographer (`resnet_block`, `resnet_unit`) do not come across.
 - **No pandas inside the package.** Arrow in, Arrow out.
-- **Degenerate-alphabet compatibility rule.** `core.sequence.alphabets` supports IUPAC degenerate codes (N, R, Y, B, Z, X, U, O, ...). Canonical alphabets expose chemical compositions; degenerate alphabets do not. Functions gate via `requires_canonical` / `degenerate_ok`; composition/mass/digest reject degenerate tokens, while kmerize/reverse-complement/ORF tolerate them. `translate()` resolves degenerate codons by enumerating canonical expansions and collapsing the residue set — wobble-position synonymy stays unambiguous, genuinely ambiguous triplets collapse to B/Z/J/X.
-- **Pluggable codon tables.** `translate(seq, codon_table=STANDARD)` accepts any entry from `CODON_TABLES` (keyed by NCBI transl_table number: standard, vertebrate mitochondrial, yeast mitochondrial, bacterial, ciliate, ...).
+- **Degenerate-alphabet compatibility rule.** `core.sequence.alphabets` supports IUPAC degenerate codes (N, R, Y, B, Z, X, U, O, ...). Canonical alphabets expose chemical compositions; degenerate alphabets do not. Functions gate via `requires_canonical` / `degenerate_ok`; composition/mass/cleavage reject degenerate tokens, while kmerize/reverse-complement/ORF tolerate them. `translate()` resolves degenerate codons by enumerating canonical expansions and collapsing the residue set — wobble-position synonymy stays unambiguous (`CTN → L`), two-residue ambiguities map to `B`/`Z`/`J`, anything else (including stop+coding mixes) collapses to `X`.
+- **Pluggable codon tables.** `translate(seq, codon_table=STANDARD)` accepts any entry from `CODON_TABLES` (keyed by NCBI transl_table number). Shipped: 1 (Standard), 2 (Vertebrate Mito), 3 (Yeast Mito), 4 (Mold/Protozoan/Coelenterate Mito + Mycoplasma), 5 (Invertebrate Mito), 6 (Ciliate), 11 (Bacterial/Archaeal/Plastid). Stored in `constellation/data/codon_tables.json` as overrides on top of table 1.
+- **Cleavage uses regex, not pyteomics.** `core.sequence.protein.cleave` is hand-rolled with the third-party `regex` module (overlap-aware). The 17 built-in protease patterns (Trypsin family, LysC/N, ArgC, Chymotrypsin, AspN, GluC, Pepsin, ProteinaseK, Thermolysin, No_enzyme) are lifted from ExPASy PeptideCutter and ship in `constellation/data/proteases.json`. Pyteomics still earns its place later in `massspec` for mzML I/O — but `core.sequence` does not import it.
 - **Third-party tool env-var convention:** `$CONSTELLATION_<TOOL>_HOME` (uniform across all tools — no `_JAR` / `_DIR` / `_HOME` mixing).
 
 ## Import order — project-wide DAG
@@ -65,7 +66,7 @@ Adding a new module: confirm its place in this DAG before touching imports. Addi
 | Module | Role | Status |
 |---|---|---|
 | `constellation.core.chem` | Elements (full H–Og), Composition (int32 tensor wrapper, plain-Python — hashable, bool `==`), binned + isotopologue-resolved isotope APIs, UNIMOD ModVocab with first-class subsetting | **shipped** |
-| `constellation.core.sequence` | Alphabets (canonical + IUPAC), generic ops, nucleic (translate/ORF/rev-comp), protein (digest) | scaffold |
+| `constellation.core.sequence` | Alphabet ABC + canonical/IUPAC instances, generic ops (kmerize, sliding_window, hamming, modified-sequence parse/format), nucleic (reverse_complement, 7 NCBI codon tables, degenerate-codon-aware translate, find_orfs / best_orf, gc_content), protein (17-protease registry, cleave with N→C ordering and missed-cleavage enumeration, peptide_composition / peptide_mass with UNIMOD lookup) | **shipped** |
 | `constellation.core.structure` | Coords, geometry (Kabsch/RMSD), topology (Arrow-backed graph), ensemble (NMR/cryoEM/MD unified) | scaffold |
 | `constellation.core.io` | Schema registry, RawReader ABC, Bundle (primary + companions) | scaffold |
 | `constellation.core.stats` | `Parametric` ABC (densities + peak shapes), losses, units | scaffold |
@@ -80,7 +81,7 @@ Adding a new module: confirm its place in this DAG before touching imports. Addi
 | `constellation.models` | NN architectures assembled from `core.nn` | scaffold |
 | `constellation.cli` | `constellation <subcommand>` dispatcher; `doctor` wired, others stubbed | partial (`doctor` works) |
 | `constellation.thirdparty` | Tool discovery (`registry.find`); EncyclopeDIA adapter registered | partial |
-| `constellation.data` | Packaged data: `atoms.json` (NIST AME2020, full periodic table + per-isotope exact masses), `unimod.json` (1560 entries from upstream UNIMOD XML). Raw vendored sources under `data/_raw/` regenerable via `scripts/build-{atoms,unimod}-json.py` | partial |
+| `constellation.data` | Packaged data: `atoms.json` (NIST AME2020, full periodic table + per-isotope exact masses), `unimod.json` (1560 entries from upstream UNIMOD XML), `codon_tables.json` (7 NCBI tables as overrides on table 1), `proteases.json` (17 enzymes from ExPASy PeptideCutter). Raw vendored sources under `data/_raw/` regenerable via `scripts/build-{atoms,unimod,codon-tables,proteases}-json.py` | partial |
 
 ## Environment
 
@@ -118,6 +119,9 @@ ruff check .                    # lint
 - **Functions:** `snake_case`.
 - **Classes:** `PascalCase` (always — no legacy carryover).
 - **Modification identifiers:** UNIMOD format (`UNIMOD:N`) is canonical; mass notation (`+N.NNN`) is a secondary representation. The full UNIMOD XML ships built-in (`UNIMOD: ModVocab`); EncyclopeDIA-style `[+mass_delta]` translation goes through `UNIMOD.find_by_mass(mass, tolerance_da)` in a thirdparty adapter, not in `core.chem`.
+- **Modified-sequence bracket syntax is alphabet-agnostic.** `core.sequence.ops.parse_modified_sequence("PEPC[UNIMOD:4]TIDE")` returns `("PEPCTIDE", {3: "UNIMOD:4"})` — index keys are 0-indexed positions in the stripped sequence. Mass-notation values stay as `float`; UNIMOD/alias strings stay as `str`. The legacy Cartographer `[nterm]` / `[cterm]` markers are NOT carried forward — N-terminal mods land at position 0; the distinction between "on residue 0" and "on the N-terminus itself" is intentionally collapsed.
+- **Cleavage output is N→C ordered, deduplicated.** `cleave()` returns peptides sorted by `(start, end)`, with sequence-level deduplication keeping first occurrence (pyteomics returns a `set` — random order). `return_spans=True` yields `Peptide(sequence, start, end, n_missed)` records with parent-protein coordinates intact, no dedup. `cleave_sites()` always anchors on `[0, ..., len(seq)]`.
+- **Peptide mass uses heavy-isotope correction.** `peptide_mass(seq, modifications=...)` adds `mod.delta_composition` to the peptide composition for all mods; for mods carrying `mass_override` (TMT10, SILAC ¹³C₆, ...) the difference `mod.mass_override - mod.delta_composition.mass` is added on top so the result matches the canonical UNIMOD value. Light-skeleton compositions remain in the returned `Composition`; the heavy-isotope correction lives in the mass calculation, not in the composition itself.
 - **Vocabulary vs enablement.** `core.chem.modifications` defines the *universe* (built-in `UNIMOD`); each downstream tool declares its *enabled subset* via `UNIMOD.subset([...])` and ships that with its model checkpoint / pipeline config. The chemistry layer never knows what any specific tool accepts. `register_custom(...)` is the typed escape hatch for genuinely novel non-UNIMOD mods; the legacy `user_modifications.txt` text format from cartographer/Chronologer is **not** carried forward.
 - **Composition is plain-Python, not a torch.Tensor subclass.** Hashable, equality-as-bool, only chemistry-meaningful ops exposed. Batched / GPU work uses raw `(B, N_elements)` tensors via `stack()` / `batched_mass()` free functions — `Composition` objects are not in the hot path.
 - **Isotope data carries per-isotope exact masses (NIST AME2020), not just abundances.** `isotope_distribution` / `isotope_envelope` use the binned ¹³C-spacing approximation (cartographer-equivalent, fast); `isotopologue_distribution` / `isotope_envelope_exact` resolve ¹⁵N vs ¹³C as distinct peaks for high-res MS, ¹⁵N-labeled samples, and NMR-adjacent work.
@@ -131,7 +135,7 @@ Cartographer modules scheduled for rewrite into Constellation. Commit SHAs point
 
 | Source | Destination | Notes |
 |---|---|---|
-| ~~`cartographer/masses.py`~~ | ~~`core.chem.{atoms,composition,isotopes,modifications}` + `core.sequence.alphabets`~~ | **Done** — `core.chem` shipped. The `core.sequence.alphabets` half (residue compositions, `RESIDUE_REGISTRY`, vocabulary) is the next ticket. |
+| ~~`cartographer/masses.py`~~ | ~~`core.chem.{atoms,composition,isotopes,modifications}` + `core.sequence.alphabets`~~ | **Done** — both `core.chem` and `core.sequence` shipped. Cartographer's `RESIDUE_REGISTRY` / `VOCABULARY` / integer-token-encoding (`TOKEN_TO_INDEX`) is **not** carried forward into `core.sequence` — that's a model-specific encoding decision and will land in `constellation.massspec.tokenize` (or `constellation.models.tokenize`) when the MS port begins. Same for fragment ladders, m/z, and neutral-loss masks (`peptide_ladder_generator`, `generate_neutral_loss_mask`) — MS-specific, slated for `constellation.massspec.peptides`. |
 | `cartographer/core_layers.py`, `cartographer/models.py` | `core.nn.{layers,encoders}` + `constellation.models.*` | PascalCase rename |
 | `cartographer/error_model.py` | `core.stats.distributions` (Student-t subclass of `Parametric`) | `.fit()` via `core.optim`, no scipy |
 | `cartographer/data/readers/{__init__,_base}.py` | `core.io.readers` | Registry becomes modality-tagged; `.cif`/`.txt` disambiguation via optional `modality` hint |
