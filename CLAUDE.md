@@ -6,7 +6,7 @@ Integrative bioinformatics platform: a shared core of physically grounded primit
 
 Constellation is absorbing four existing lab packages as a **clean rewrite** (no vendored source): **Cartographer** (MS proteomics, first port target), **NanoporeAnalysis** (POD5 → protein), **CoLLAGE** (codon optimization), **Contour** (PDB → MD prep). Chronologer (RT prediction) has already been absorbed into Cartographer.
 
-Current state: **`core.chem`, `core.sequence`, and `core.io` shipped; everything else scaffold.** Functional code lives in `constellation.core.chem` (full periodic table, Composition arithmetic, binned + isotopologue-resolved isotope distributions, UNIMOD vocabulary with subsetting), `constellation.core.sequence` (canonical + IUPAC alphabets, generic ops, nucleic translation/ORF/rev-complement, protein cleavage / peptide composition), `constellation.core.io` (`RawReader` ABC + suffix/modality registry, `Bundle`/`OpcBundle`/`DirBundle` for multi-file containers, canonical Arrow schemas `Trace1D` / `SpectraMatrix2D` / `PeakTable` with namespaced metadata extras, torch-tensor bridges), `constellation.thirdparty.registry` (tool discovery), and `constellation.cli.__main__` (the `constellation doctor` command). All other subpackages are scaffold-only. Core primitives and domain modules are staged for the 90-day roadmap (see `docs/roadmap.md` when written).
+Current state: **`core.chem`, `core.sequence`, `core.io`, `core.structure`, and a minimal `core.graph.Network` shipped; everything else scaffold.** Functional code lives in `constellation.core.chem` (full periodic table, Composition arithmetic, binned + isotopologue-resolved isotope distributions, UNIMOD vocabulary with subsetting), `constellation.core.sequence` (canonical + IUPAC alphabets, generic ops, nucleic translation/ORF/rev-complement, protein cleavage / peptide composition), `constellation.core.io` (`RawReader` ABC + suffix/modality registry, `Bundle`/`OpcBundle`/`DirBundle` for multi-file containers, canonical Arrow schemas `Trace1D` / `SpectraMatrix2D` / `PeakTable` with namespaced metadata extras, torch-tensor bridges), `constellation.core.graph` (Arrow-backed `Network[NodeT, EdgeT]` with neighbor lookup / induced subgraphs / connected components), `constellation.core.structure` (`StructureTable` Arrow schema for atom identity, separate `(F, N, 3)` torch coord tensor on `Ensemble`, `Topology` with bond/angle/dihedral graphs and `infer_bonds` from covalent radii, composable `pa.compute.Expression` selection helpers, tensor-native geometry — translate / rotate / centroid / mass_centroid / radius_of_gyration / principal_axes; Kabsch / RMSD / superposition deferred until `core.stats` + `core.optim` ship), `constellation.thirdparty.registry` (tool discovery), and `constellation.cli.__main__` (the `constellation doctor` command). All other subpackages are scaffold-only. Core primitives and domain modules are staged for the 90-day roadmap (see `docs/roadmap.md` when written).
 
 ## Architecture invariants (load-bearing — design principles from the PI)
 
@@ -38,20 +38,21 @@ Load-bearing invariant. Violating it creates circular imports or module-init ord
 ### Inside `core/`
 
 ```
-chem ─► sequence ─► structure ─► {stats, graph, nn, signal} ─► optim
-  │         │            │              │   │                   ▲
-  └─────────┴────────────┴──────────────┴───┴─► io ◄────────────┘
+chem ─► sequence ─► {graph, stats, nn, signal} ─► optim ─► structure
+                                                              │
+                          io ◄─── (leaf, consumed by all) ────┘
 ```
 
-Mirrors the biological hierarchy from building blocks → primary structure → tertiary structure.
+Tertiary structure / dynamics are *consequences* of chemistry + sequence + (graph) topology + thermodynamics + optimization, not building blocks for them — so `core.structure` sits at the bottom of the math chain. Bond graphs route through `core.graph`; non-trivial structural manipulation (alignment, fitting, constrained geometry) wants the objective-function + optimizer machinery in `core.stats` + `core.optim`.
 
 - `chem` — never imports from `sequence`, `structure`, or `io`.
 - `sequence` — imports `chem`; never imports `structure`.
-- `structure` — imports `chem` and `sequence` (tertiary structure sits on primary).
-- `stats`, `graph`, `nn` — downstream math; may import from `chem`, `sequence`, `structure`.
+- `graph` — generic over node/edge types, independent of `chem` and `sequence`.
+- `stats`, `nn` — downstream math; may import from `chem`, `sequence`. Do NOT import `structure`.
 - `signal` — heuristic 1D-trace operations (baseline, smoothing, peak picking, polynomial calibration). Imports `stats` for parametric peak-fitting helpers; otherwise leaf-style. Distinct from `stats` because the operations have imprecisely-specified priors and don't earn membership in the `Parametric` namespace.
-- `optim` — furthest downstream; `Parametric.fit()` drives through here.
-- `io` — leaf. Format/codec concerns only. Never imports other core.
+- `optim` — `Parametric.fit()` drives through here; imports `stats`.
+- `structure` — most-downstream core module. May import any of `chem`, `sequence`, `graph`, `stats`, `nn`, `optim` as features land. Currently imports just `chem`, `sequence`, `graph`, `io`; `stats` / `optim` enter when Kabsch / RMSD / refinement land in `core.structure.geometry`.
+- `io` — leaf. Format/codec concerns only. Never imports other core. The `StructureTable` schema self-registers with the `core.io` schema registry from `core.structure.coords`.
 
 ### Between layers
 
@@ -71,13 +72,13 @@ Adding a new module: confirm its place in this DAG before touching imports. Addi
 |---|---|---|
 | `constellation.core.chem` | Elements (full H–Og), Composition (int32 tensor wrapper, plain-Python — hashable, bool `==`), binned + isotopologue-resolved isotope APIs, UNIMOD ModVocab with first-class subsetting | **shipped** |
 | `constellation.core.sequence` | Alphabet ABC + canonical/IUPAC instances, generic ops (kmerize, sliding_window, hamming, modified-sequence parse/format), nucleic (reverse_complement, 7 NCBI codon tables, degenerate-codon-aware translate, find_orfs / best_orf, gc_content), protein (17-protease registry, cleave with N→C ordering and missed-cleavage enumeration, peptide_composition / peptide_mass with UNIMOD lookup) | **shipped** |
-| `constellation.core.structure` | Coords, geometry (Kabsch/RMSD), topology (Arrow-backed graph), ensemble (NMR/cryoEM/MD unified) | scaffold |
+| `constellation.core.structure` | `StructureTable` Arrow schema (atom identity, coords held separately as `(F, N, 3)` torch tensor), `CoordinateFrame` (units, PBC), `Topology` (atoms + bonds/angles/dihedrals; bond view via `core.graph.Network`), distance-based `infer_bonds` (covalent radii from `core.chem`), `Ensemble` (NMR / cryoEM / MD frames unified, `frame_metadata` Arrow table), composable `pa.compute.Expression` selection helpers, tensor-native `translate` / `rotate` / `centroid` / `mass_centroid` / `radius_of_gyration` / `principal_axes`. Kabsch / RMSD / superposition / alignment deferred until `core.stats` + `core.optim` ship. | **shipped** |
 | `constellation.core.io` | `RawReader` ABC + suffix/modality registry, `Bundle`/`OpcBundle`/`DirBundle` for multi-file containers, canonical Arrow schemas (`Trace1D`, `SpectraMatrix2D`, `PeakTable`) with namespaced `x.<domain>.<key>` metadata extras, torch-tensor bridges (`trace_to_tensor`, `spectra_to_tensor`, `tensor_to_spectra`), forward-compat `cast_to_schema` | **shipped** |
 | `constellation.core.stats` | `Parametric` ABC (densities + peak shapes + calibration models: Sigmoidal/Hill/LogLinear), losses, units | scaffold |
 | `constellation.core.signal` | Heuristic 1D-trace ops — baseline correction (AsLS/arPLS/SNIP), smoothing (Savitzky–Golay), prominence peak picking, polynomial / monotonic-spline calibration. Torch-native; imports `core.stats` for Parametric peak-fits | scaffold |
 | `constellation.core.optim` | `DifferentialEvolution` (with LBFGS polish), optimizer registry | scaffold |
 | `constellation.core.nn` | ResNet blocks, MonotonicMLP, transformer scaffolds (PascalCase) | scaffold |
-| `constellation.core.graph` | `Tree[T]`, `Network[NodeT, EdgeT]` | scaffold |
+| `constellation.core.graph` | `Network[NodeT, EdgeT]` (Arrow-backed nodes/edges, neighbor lookup, induced subgraphs, connected components) shipped; `Tree[T]` still scaffold (lands when phylogeny work needs it) | partial |
 | `constellation.massspec` | MS domain — mzpeak I/O, peptides, chromatograms, scoring ("Counter"), Koina, EncyclopeDIA | scaffold (first port target) |
 | `constellation.sequencing` | POD5 → protein pipeline; Phred codec lives here (not in `core.io`) | scaffold |
 | `constellation.codon` | CoLLAGE-style codon optimization | scaffold |
