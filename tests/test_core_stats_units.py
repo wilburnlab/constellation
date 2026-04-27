@@ -6,12 +6,12 @@ import math
 
 import pytest
 
-from constellation.core.chem import atoms as chem_atoms
+from constellation.core.chem import elements as chem_elements
 from constellation.core.stats import units
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Re-export identity (no shadowing of core.chem.atoms constants)
+# Re-export identity (no shadowing of core.chem.elements constants)
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -20,9 +20,9 @@ from constellation.core.stats import units
     ["AVOGADRO", "PROTON_MASS", "ELECTRON_MASS", "NEUTRON_MASS", "ISOTOPE_MASS_DIFF"],
 )
 def test_reexport_is_identity(name):
-    """Re-exports must be the same object as in core.chem.atoms — proves
+    """Re-exports must be the same object as in core.chem.elements — proves
     we don't have a shadow definition that could drift."""
-    assert getattr(units, name) is getattr(chem_atoms, name)
+    assert getattr(units, name) is getattr(chem_elements, name)
 
 
 # ──────────────────────────────────────────────────────────────────────

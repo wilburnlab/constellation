@@ -10,7 +10,7 @@ immediate signal if someone breaks the import DAG.
 import constellation
 import constellation.core
 import constellation.core.chem
-import constellation.core.chem.atoms
+import constellation.core.chem.elements
 import constellation.core.chem.composition
 import constellation.core.chem.isotopes
 import constellation.core.chem.modifications
@@ -35,7 +35,7 @@ import constellation.core.stats.parametric
 import constellation.core.stats.peaks
 import constellation.core.stats.units
 import constellation.core.structure
-import constellation.core.structure.coords
+import constellation.core.structure.atoms
 import constellation.core.structure.ensemble
 import constellation.core.structure.geometry
 import constellation.core.structure.selection

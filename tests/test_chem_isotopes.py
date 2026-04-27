@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from constellation.core.chem.atoms import ATOMS, ISOTOPE_MASS_DIFF
+from constellation.core.chem.elements import ELEMENTS, ISOTOPE_MASS_DIFF
 from constellation.core.chem.composition import Composition
 from constellation.core.chem.isotopes import (
     average_mass,
@@ -95,9 +95,9 @@ def test_chn_has_eight_isotopologues():
 def test_chn_isotopologue_abundances_match_analytical():
     """For independent isotope sampling, abundance of (¹³C, ¹H, ¹⁵N) is
     P(¹³C) * P(¹H) * P(¹⁵N) — the analytical product."""
-    p13c = next(i.abundance for i in ATOMS["C"].isotopes if i.mass_number == 13)
-    p1h = next(i.abundance for i in ATOMS["H"].isotopes if i.mass_number == 1)
-    p15n = next(i.abundance for i in ATOMS["N"].isotopes if i.mass_number == 15)
+    p13c = next(i.abundance for i in ELEMENTS["C"].isotopes if i.mass_number == 13)
+    p1h = next(i.abundance for i in ELEMENTS["H"].isotopes if i.mass_number == 1)
+    p15n = next(i.abundance for i in ELEMENTS["N"].isotopes if i.mass_number == 15)
     expected = p13c * p1h * p15n  # ¹³C¹H¹⁵N
 
     masses, abuns = isotopologue_distribution(
@@ -105,9 +105,9 @@ def test_chn_isotopologue_abundances_match_analytical():
         prune_below=0.0,
     )
     # Find the (13C, 1H, 15N) peak: 13C exact + 1H exact + 15N exact
-    c13_mass = next(i.exact_mass for i in ATOMS["C"].isotopes if i.mass_number == 13)
-    h1_mass = next(i.exact_mass for i in ATOMS["H"].isotopes if i.mass_number == 1)
-    n15_mass = next(i.exact_mass for i in ATOMS["N"].isotopes if i.mass_number == 15)
+    c13_mass = next(i.exact_mass for i in ELEMENTS["C"].isotopes if i.mass_number == 13)
+    h1_mass = next(i.exact_mass for i in ELEMENTS["H"].isotopes if i.mass_number == 1)
+    n15_mass = next(i.exact_mass for i in ELEMENTS["N"].isotopes if i.mass_number == 15)
     target = c13_mass + h1_mass + n15_mass
     diffs = (masses - target).abs()
     idx = int(diffs.argmin().item())

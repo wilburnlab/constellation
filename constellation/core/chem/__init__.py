@@ -1,13 +1,13 @@
-"""Elemental primitives — atoms, compositions, isotopes, modifications.
+"""Elemental primitives — elements, compositions, isotopes, modifications.
 
 Purely chemical; knows nothing about residues, sequences, or alphabets.
 Downstream `core.sequence` builds residue/peptide compositions *from*
 `Composition` primitives defined here.
 
 Modules:
-    atoms          — periodic-table data: Atom, Isotope, AtomTable, ATOMS,
-                     ATOM_SYMBOLS, ATOM_TYPES, MASSES, WEIGHTS, plus
-                     PROTON_MASS / ISOTOPE_MASS_DIFF / etc.
+    elements       — periodic-table data: Element, Isotope, ElementTable,
+                     ELEMENTS, ELEMENT_SYMBOLS, ELEMENT_TYPES, MASSES,
+                     WEIGHTS, plus PROTON_MASS / ISOTOPE_MASS_DIFF / etc.
     composition    — Composition class (1-D int32 tensor wrapper),
                      parse_formula (Hill notation in/out), batched helpers.
     isotopes       — isotope_distribution / isotope_envelope (binned, fast)
@@ -18,14 +18,14 @@ Modules:
                      populated from packaged JSON.
 """
 
-from constellation.core.chem.atoms import (
-    ATOM_SYMBOLS,
-    ATOM_TYPES,
-    ATOMS,
+from constellation.core.chem.elements import (
     AVOGADRO,
-    Atom,
-    AtomTable,
     ELECTRON_MASS,
+    ELEMENT_SYMBOLS,
+    ELEMENT_TYPES,
+    ELEMENTS,
+    Element,
+    ElementTable,
     FEATURE_COLUMNS,
     ISOTOPE_MASS_DIFF,
     Isotope,
@@ -56,13 +56,13 @@ from constellation.core.chem.modifications import (
 )
 
 __all__ = [
-    # atoms
-    "Atom",
-    "AtomTable",
+    # elements
+    "Element",
+    "ElementTable",
     "Isotope",
-    "ATOMS",
-    "ATOM_SYMBOLS",
-    "ATOM_TYPES",
+    "ELEMENTS",
+    "ELEMENT_SYMBOLS",
+    "ELEMENT_TYPES",
     "MASSES",
     "WEIGHTS",
     "FEATURE_COLUMNS",

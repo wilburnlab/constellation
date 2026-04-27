@@ -1,7 +1,7 @@
 """Topology — atoms + bonds / angles / dihedrals + connectivity views.
 
 A ``Topology`` wraps an Arrow ``atoms`` table (conforming to
-``STRUCTURE_TABLE``) plus optional Arrow tables for bonds, angles, and
+``ATOM_TABLE``) plus optional Arrow tables for bonds, angles, and
 dihedrals. Bond-graph operations route through a lazy ``Network`` view
 over the bond table.
 
@@ -28,7 +28,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import torch
 
-from constellation.core.chem.atoms import ATOMS
+from constellation.core.chem.elements import ELEMENTS
 from constellation.core.graph.network import Network
 
 
@@ -257,7 +257,7 @@ class Topology:
         """Evaluate a selection expression against ``atoms`` and return
         the matching row indices as a ``torch.int64`` tensor.
 
-        The expression must reference only ``STRUCTURE_TABLE`` columns
+        The expression must reference only ``ATOM_TABLE`` columns
         — see ``constellation.core.structure.selection`` for the
         canonical predicate helpers.
         """
@@ -411,14 +411,14 @@ def infer_bonds(
     For every atom pair ``(i, j)`` with ``i < j``, a bond is recorded
     iff ``d_ij <= r_i + r_j + tolerance``, where ``r_x`` is the
     covalent radius of element ``x`` from
-    ``constellation.core.chem.ATOMS`` (picometers, converted to
+    ``constellation.core.chem.ELEMENTS`` (picometers, converted to
     Ångströms). The default ``tolerance`` of 0.4 Å matches the
     OpenBabel / RDKit convention.
 
     Parameters
     ----------
     atoms : pa.Table
-        Conforming to ``STRUCTURE_TABLE``; must have ``element`` and
+        Conforming to ``ATOM_TABLE``; must have ``element`` and
         ``is_hetatm`` columns.
     coords : torch.Tensor
         Single-frame Cartesian coordinates in Ångströms, shape
@@ -453,7 +453,7 @@ def infer_bonds(
     radii = torch.empty(n, dtype=torch.float64)
     for k, sym in enumerate(elements):
         try:
-            r_pm = ATOMS[sym].covalent_radius_pm
+            r_pm = ELEMENTS[sym].covalent_radius_pm
         except KeyError:
             r_pm = None
         if r_pm is None:

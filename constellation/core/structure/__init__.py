@@ -1,14 +1,14 @@
 """Macromolecular-structure data structures and tensor-native geometry.
 
 Replaces the half-transitioned pandas/list-of-class atom tables in
-Contour with PyArrow ``StructureTable`` Arrow tables for atom identity
+Contour with PyArrow ``AtomTable`` Arrow tables for atom identity
 plus separate ``torch.float32`` coord tensors for numerical math
 (Principle 3). Ensembles (NMR / cryo-EM multi-model / MD frames) are
 first-class: a single static structure is the ``n_frames == 1``
 degenerate case.
 
 Modules:
-    coords       - ``STRUCTURE_TABLE`` Arrow schema, ``CoordinateFrame``
+    atoms        - ``ATOM_TABLE`` Arrow schema, ``CoordinateFrame``
                    (units, periodic boundaries), tensor bridge.
     topology     - ``Topology`` (atoms + bonds/angles/dihedrals,
                    ``Network``-backed bond view), ``infer_bonds``
@@ -25,10 +25,10 @@ Explicit non-goals this session: Kabsch / RMSD / superposition /
 alignment — deferred until ``core.stats`` + ``core.optim`` ship.
 """
 
-from constellation.core.structure.coords import (
-    STRUCTURE_TABLE,
+from constellation.core.structure.atoms import (
+    ATOM_TABLE,
     CoordinateFrame,
-    structure_table_to_tensors,
+    atom_table_to_tensors,
 )
 from constellation.core.structure.ensemble import (
     FRAME_METADATA,
@@ -62,10 +62,10 @@ from constellation.core.structure.topology import (
 )
 
 __all__ = [
-    # coords
-    "STRUCTURE_TABLE",
+    # atoms
+    "ATOM_TABLE",
     "CoordinateFrame",
-    "structure_table_to_tensors",
+    "atom_table_to_tensors",
     # topology
     "Topology",
     "infer_bonds",

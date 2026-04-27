@@ -1,4 +1,4 @@
-"""Generate constellation/data/atoms.json from authoritative sources.
+"""Generate constellation/data/elements.json from authoritative sources.
 
 Inputs (vendored under constellation/data/_raw/):
     nist_compositions.txt
@@ -16,11 +16,11 @@ Hardcoded supplementary tables (in this script):
                             transition metals and elements not in Bondi.
 
 Output:
-    constellation/data/atoms.json
-        Single JSON document; ATOMS = list of element records, schema version "1".
+    constellation/data/elements.json
+        Single JSON document; ELEMENTS = list of element records, schema version "1".
 
 Run from project root:
-    python3 scripts/build-atoms-json.py
+    python3 scripts/build-elements-json.py
 """
 
 from __future__ import annotations
@@ -355,7 +355,7 @@ def build(repo_root: Path) -> dict:
 def main() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     data = build(repo_root)
-    out_path = repo_root / "constellation" / "data" / "atoms.json"
+    out_path = repo_root / "constellation" / "data" / "elements.json"
     out_path.write_text(json.dumps(data, indent=2) + "\n")
     n = len(data["elements"])
     sym = {e["symbol"] for e in data["elements"]}

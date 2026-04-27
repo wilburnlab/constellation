@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import torch
 
-from constellation.core.chem.atoms import ATOM_SYMBOLS, ATOMS, ISOTOPE_MASS_DIFF
+from constellation.core.chem.elements import ELEMENT_SYMBOLS, ELEMENTS, ISOTOPE_MASS_DIFF
 from constellation.core.chem.composition import Composition
 
 # ──────────────────────────────────────────────────────────────────────
@@ -69,7 +69,7 @@ def _binned_abundances(symbol: str) -> torch.Tensor:
     Example: O has ¹⁶O (0.99757), ¹⁷O (0.00038), ¹⁸O (0.00205) →
     polynomial [0.99757, 0.00038, 0.00205] of length 3.
     """
-    isotopes = ATOMS[symbol].isotopes
+    isotopes = ELEMENTS[symbol].isotopes
     if not isotopes:
         return torch.tensor([1.0], dtype=torch.float32)
     # Filter to non-zero-abundance isotopes (radioactive-only entries are
@@ -92,14 +92,14 @@ def _coerce_counts_dict(
     if isinstance(composition, Composition):
         return composition.atoms
     counts = composition
-    if counts.dim() != 1 or counts.shape[0] != len(ATOM_SYMBOLS):
+    if counts.dim() != 1 or counts.shape[0] != len(ELEMENT_SYMBOLS):
         raise ValueError(
-            f"raw counts tensor must be 1-D length {len(ATOM_SYMBOLS)}; "
+            f"raw counts tensor must be 1-D length {len(ELEMENT_SYMBOLS)}; "
             f"got {tuple(counts.shape)}"
         )
     return {
-        ATOM_SYMBOLS[i]: int(counts[i])
-        for i in range(len(ATOM_SYMBOLS))
+        ELEMENT_SYMBOLS[i]: int(counts[i])
+        for i in range(len(ELEMENT_SYMBOLS))
         if int(counts[i]) > 0
     }
 
@@ -146,7 +146,7 @@ def isotope_envelope(
     normalized abundances from `isotope_distribution`.
     """
     counts = _coerce_counts_dict(composition)
-    mono = sum(n * ATOMS[s].monoisotopic_mass for s, n in counts.items())
+    mono = sum(n * ELEMENTS[s].monoisotopic_mass for s, n in counts.items())
     masses = torch.tensor(
         [mono + k * ISOTOPE_MASS_DIFF for k in range(n_peaks)],
         dtype=torch.float64,
@@ -217,7 +217,7 @@ def _element_isotopologues(
     (via repeated squaring) so that the per-step pruning keeps the
     distribution bounded.
     """
-    natural = [i for i in ATOMS[symbol].isotopes if i.abundance > 0]
+    natural = [i for i in ELEMENTS[symbol].isotopes if i.abundance > 0]
     if not natural:
         return torch.tensor([0.0], dtype=torch.float64), torch.tensor(
             [1.0], dtype=torch.float64

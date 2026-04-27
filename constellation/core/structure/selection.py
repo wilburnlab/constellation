@@ -1,7 +1,7 @@
-"""Selection-predicate helpers for ``STRUCTURE_TABLE`` Arrow tables.
+"""Selection-predicate helpers for ``ATOM_TABLE`` Arrow tables.
 
 Each helper returns a ``pa.compute.Expression`` over the column names
-declared in ``coords.STRUCTURE_TABLE``. Expressions compose with the
+declared in ``atoms.ATOM_TABLE``. Expressions compose with the
 standard Python operators ``&`` / ``|`` / ``~``, so callers build
 complex selections without a string DSL:
 

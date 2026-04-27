@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from constellation.core.structure import (
-    STRUCTURE_TABLE,
+    ATOM_TABLE,
     Topology,
     infer_bonds,
     select_chain,
@@ -21,13 +21,13 @@ from constellation.core.structure import (
 
 
 def _atoms_table(rows: list[dict]) -> pa.Table:
-    """Build a STRUCTURE_TABLE-conformant atoms table from row dicts."""
-    cols: dict = {f.name: [] for f in STRUCTURE_TABLE}
+    """Build a ATOM_TABLE-conformant atoms table from row dicts."""
+    cols: dict = {f.name: [] for f in ATOM_TABLE}
     for r in rows:
-        for f in STRUCTURE_TABLE:
+        for f in ATOM_TABLE:
             cols[f.name].append(r.get(f.name, None))
-    arrays = {f.name: pa.array(cols[f.name], type=f.type) for f in STRUCTURE_TABLE}
-    return pa.table(arrays, schema=STRUCTURE_TABLE)
+    arrays = {f.name: pa.array(cols[f.name], type=f.type) for f in ATOM_TABLE}
+    return pa.table(arrays, schema=ATOM_TABLE)
 
 
 def _water_atoms() -> pa.Table:

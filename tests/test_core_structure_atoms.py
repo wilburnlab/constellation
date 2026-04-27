@@ -1,4 +1,4 @@
-"""Unit tests for ``constellation.core.structure.coords``."""
+"""Unit tests for ``constellation.core.structure.atoms``."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ from constellation.core.io.schemas import (
     unpack_metadata,
 )
 from constellation.core.structure import (
-    STRUCTURE_TABLE,
+    ATOM_TABLE,
     CoordinateFrame,
-    structure_table_to_tensors,
+    atom_table_to_tensors,
 )
 
 
@@ -33,17 +33,17 @@ def test_schema_required_columns():
         "element",
         "is_hetatm",
     }
-    names = set(f.name for f in STRUCTURE_TABLE)
+    names = set(f.name for f in ATOM_TABLE)
     assert required <= names
 
 
 def test_schema_dtypes():
-    assert STRUCTURE_TABLE.field("serial").type == pa.int32()
-    assert STRUCTURE_TABLE.field("res_seq").type == pa.int32()
-    assert STRUCTURE_TABLE.field("occupancy").type == pa.float32()
-    assert STRUCTURE_TABLE.field("b_factor").type == pa.float32()
-    assert STRUCTURE_TABLE.field("formal_charge").type == pa.int8()
-    assert STRUCTURE_TABLE.field("is_hetatm").type == pa.bool_()
+    assert ATOM_TABLE.field("serial").type == pa.int32()
+    assert ATOM_TABLE.field("res_seq").type == pa.int32()
+    assert ATOM_TABLE.field("occupancy").type == pa.float32()
+    assert ATOM_TABLE.field("b_factor").type == pa.float32()
+    assert ATOM_TABLE.field("formal_charge").type == pa.int8()
+    assert ATOM_TABLE.field("is_hetatm").type == pa.bool_()
 
 
 def test_schema_nullability():
@@ -57,7 +57,7 @@ def test_schema_nullability():
         "element",
         "is_hetatm",
     ):
-        assert not STRUCTURE_TABLE.field(c).nullable, c
+        assert not ATOM_TABLE.field(c).nullable, c
     # Optional columns are nullable.
     for c in (
         "alt_loc",
@@ -68,16 +68,16 @@ def test_schema_nullability():
         "formal_charge",
         "model_id",
     ):
-        assert STRUCTURE_TABLE.field(c).nullable, c
+        assert ATOM_TABLE.field(c).nullable, c
 
 
 def test_schema_metadata_stamped():
-    meta = unpack_metadata(STRUCTURE_TABLE.metadata)
-    assert meta["schema_name"] == "StructureTable"
+    meta = unpack_metadata(ATOM_TABLE.metadata)
+    assert meta["schema_name"] == "AtomTable"
 
 
 def test_schema_self_registers_with_core_io_registry():
-    assert get_schema("StructureTable") is STRUCTURE_TABLE
+    assert get_schema("AtomTable") is ATOM_TABLE
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -158,13 +158,13 @@ def _mini_table():
             "is_hetatm": pa.array([False, False, False], type=pa.bool_()),
             "model_id": pa.array([1, 1, 1], type=pa.int32()),
         },
-        schema=STRUCTURE_TABLE,
+        schema=ATOM_TABLE,
     )
 
 
-def test_structure_table_to_tensors_keys():
+def test_atom_table_to_tensors_keys():
     t = _mini_table()
-    out = structure_table_to_tensors(t)
+    out = atom_table_to_tensors(t)
     assert "serial" in out and "res_seq" in out
     assert "occupancy" in out and "b_factor" in out
     assert "is_hetatm" in out
@@ -173,9 +173,9 @@ def test_structure_table_to_tensors_keys():
     assert out["is_hetatm"].dtype == torch.bool
 
 
-def test_structure_table_to_tensors_values():
+def test_atom_table_to_tensors_values():
     t = _mini_table()
-    out = structure_table_to_tensors(t)
+    out = atom_table_to_tensors(t)
     assert out["serial"].tolist() == [1, 2, 3]
     assert torch.allclose(out["b_factor"], torch.tensor([10.0, 12.5, 15.0]))
 
@@ -193,8 +193,8 @@ def test_cast_to_schema_fills_missing_optional_columns():
             "is_hetatm": pa.array([False, False], type=pa.bool_()),
         }
     )
-    casted = cast_to_schema(minimal, STRUCTURE_TABLE)
-    assert casted.schema == STRUCTURE_TABLE
+    casted = cast_to_schema(minimal, ATOM_TABLE)
+    assert casted.schema == ATOM_TABLE
     # Optional columns are filled with nulls.
     assert casted.column("occupancy").null_count == 2
     assert casted.column("b_factor").null_count == 2

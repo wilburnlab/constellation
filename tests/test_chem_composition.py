@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from constellation.core.chem.atoms import ATOM_SYMBOLS
+from constellation.core.chem.elements import ELEMENT_SYMBOLS
 from constellation.core.chem.composition import (
     Composition,
     batched_average_mass,
@@ -182,19 +182,19 @@ def test_hash_stable_across_construction_paths():
 def test_counts_tensor_int32():
     c = Composition.from_formula("H2O")
     assert c.counts.dtype == torch.int32
-    assert c.counts.shape == (len(ATOM_SYMBOLS),)
+    assert c.counts.shape == (len(ELEMENT_SYMBOLS),)
 
 
 def test_stack_returns_2d_tensor():
     comps = [Composition.from_formula(f) for f in ("H2O", "CO2", "CH4")]
     batch = stack(comps)
-    assert batch.shape == (3, len(ATOM_SYMBOLS))
+    assert batch.shape == (3, len(ELEMENT_SYMBOLS))
     assert batch.dtype == torch.int32
 
 
 def test_stack_empty_list():
     batch = stack([])
-    assert batch.shape == (0, len(ATOM_SYMBOLS))
+    assert batch.shape == (0, len(ELEMENT_SYMBOLS))
 
 
 def test_batched_mass_matches_per_composition():

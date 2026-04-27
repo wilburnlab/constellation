@@ -33,7 +33,7 @@ from typing import Iterable
 
 import torch
 
-from constellation.core.chem.atoms import ATOM_SYMBOLS, ATOMS
+from constellation.core.chem.elements import ELEMENT_SYMBOLS, ELEMENTS
 
 # ──────────────────────────────────────────────────────────────────────
 # Formula parsing
@@ -73,7 +73,7 @@ def parse_formula(formula: str) -> dict[str, int]:
     multipliers, and single- or multi-level parenthesized groups.
     Empty string and whitespace are tolerated. Unknown element symbols
     are passed through — call sites that care should validate against
-    `ATOMS`.
+    `ELEMENTS`.
 
     Examples:
         parse_formula("H2O")        → {"H": 2, "O": 1}
@@ -113,15 +113,15 @@ def _hill_order(symbols: Iterable[str]) -> list[str]:
 # ──────────────────────────────────────────────────────────────────────
 
 
-_N_ELEMENTS: int = len(ATOM_SYMBOLS)
+_N_ELEMENTS: int = len(ELEMENT_SYMBOLS)
 
 
 class Composition:
-    """Element-count vector over the full atom table.
+    """Element-count vector over the full element table.
 
     Counts are stored as a 1-D int32 torch tensor of length
-    `len(ATOM_SYMBOLS)`, indexed by composition-axis position
-    (`ATOMS.index(symbol)`). Subtraction may produce negative counts
+    `len(ELEMENT_SYMBOLS)`, indexed by composition-axis position
+    (`ELEMENTS.index(symbol)`). Subtraction may produce negative counts
     — useful for representing modification *deltas*; use
     `is_physical()` to check before treating a Composition as a real
     chemical formula.
@@ -152,7 +152,7 @@ class Composition:
         counts = torch.zeros(_N_ELEMENTS, dtype=torch.int32)
         for sym, n in mapping.items():
             try:
-                idx = ATOMS.index(sym)
+                idx = ELEMENTS.index(sym)
             except KeyError:
                 raise KeyError(
                     f"unknown element symbol in composition: {sym!r}"
@@ -172,7 +172,7 @@ class Composition:
     @property
     def mass(self) -> float:
         """Monoisotopic mass. Float64 dot-product internally for precision."""
-        return float((self.counts.to(torch.float64) * ATOMS.mass_tensor).sum().item())
+        return float((self.counts.to(torch.float64) * ELEMENTS.mass_tensor).sum().item())
 
     @property
     def average_mass(self) -> float:
@@ -184,7 +184,7 @@ class Composition:
         """
         total = 0.0
         for sym, n in self.atoms.items():
-            w = ATOMS[sym].standard_atomic_weight
+            w = ELEMENTS[sym].standard_atomic_weight
             if w is None:
                 return float("nan")
             total += w * n
@@ -193,11 +193,11 @@ class Composition:
     @property
     def formula(self) -> str:
         """Hill-notation formula string. Empty composition → ''."""
-        present = [s for s in ATOM_SYMBOLS if int(self.counts[ATOMS.index(s)]) != 0]
+        present = [s for s in ELEMENT_SYMBOLS if int(self.counts[ELEMENTS.index(s)]) != 0]
         ordered = _hill_order(present)
         parts: list[str] = []
         for s in ordered:
-            n = int(self.counts[ATOMS.index(s)])
+            n = int(self.counts[ELEMENTS.index(s)])
             parts.append(s if n == 1 else f"{s}{n}")
         return "".join(parts)
 
@@ -206,7 +206,7 @@ class Composition:
         """Sparse `{symbol: count}` view; zero-count elements dropped."""
         return {
             s: int(self.counts[i])
-            for i, s in enumerate(ATOM_SYMBOLS)
+            for i, s in enumerate(ELEMENT_SYMBOLS)
             if int(self.counts[i]) != 0
         }
 
@@ -278,7 +278,7 @@ def batched_mass(counts: torch.Tensor) -> torch.Tensor:
         raise ValueError(
             f"last dim must be N_elements={_N_ELEMENTS}; got {tuple(counts.shape)}"
         )
-    masses = ATOMS.mass_tensor.to(counts.device)
+    masses = ELEMENTS.mass_tensor.to(counts.device)
     return (counts.to(torch.float64) * masses).sum(dim=-1)
 
 
@@ -294,15 +294,15 @@ def batched_average_mass(counts: torch.Tensor) -> torch.Tensor:
     weights = torch.tensor(
         [
             0.0
-            if ATOMS[s].standard_atomic_weight is None
-            else ATOMS[s].standard_atomic_weight
-            for s in ATOM_SYMBOLS
+            if ELEMENTS[s].standard_atomic_weight is None
+            else ELEMENTS[s].standard_atomic_weight
+            for s in ELEMENT_SYMBOLS
         ],
         dtype=torch.float64,
         device=counts.device,
     )
     undefined_mask = torch.tensor(
-        [ATOMS[s].standard_atomic_weight is None for s in ATOM_SYMBOLS],
+        [ELEMENTS[s].standard_atomic_weight is None for s in ELEMENT_SYMBOLS],
         dtype=torch.bool,
         device=counts.device,
     )

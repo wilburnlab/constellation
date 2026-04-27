@@ -7,7 +7,7 @@ import pyarrow.compute as pc
 import pytest
 
 from constellation.core.structure import (
-    STRUCTURE_TABLE,
+    ATOM_TABLE,
     select_atom_names,
     select_backbone,
     select_chain,
@@ -44,7 +44,7 @@ def _ala_water_fixture() -> pa.Table:
             "is_hetatm": pa.array([False] * 5 + [True] * 2, type=pa.bool_()),
             "model_id": pa.array([1] * 7, type=pa.int32()),
         },
-        schema=STRUCTURE_TABLE,
+        schema=ATOM_TABLE,
     )
 
 

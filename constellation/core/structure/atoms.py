@@ -1,7 +1,7 @@
 """Atom-table schema, coordinate-frame metadata, tensor bridges.
 
-This module defines the universal Arrow column layout for an atom
-table — ``STRUCTURE_TABLE`` — and the ``CoordinateFrame`` dataclass
+This module defines the universal Arrow column layout for a per-atom
+identity table — ``ATOM_TABLE`` — and the ``CoordinateFrame`` dataclass
 holding coordinate-system metadata (units, periodic boundaries, origin)
 that rides alongside coord tensors.
 
@@ -13,8 +13,8 @@ Arrow (selection / filter / groupby), numerical math runs on torch
 tensors (Principle 3).
 
 The schema is registered with the ``core.io`` schema registry under
-the name ``"StructureTable"`` at import time, so domain-module code
-can ``get_schema("StructureTable")`` symmetrically with ``Trace1D`` /
+the name ``"AtomTable"`` at import time, so domain-module code
+can ``get_schema("AtomTable")`` symmetrically with ``Trace1D`` /
 ``PeakTable``.
 """
 
@@ -30,7 +30,7 @@ from constellation.core.io.schemas import register_schema, registered_schemas
 
 
 # ──────────────────────────────────────────────────────────────────────
-# StructureTable schema
+# AtomTable schema
 # ──────────────────────────────────────────────────────────────────────
 
 # Per-atom identity / metadata columns. PDB-derived but PyArrow-typed.
@@ -41,7 +41,7 @@ from constellation.core.io.schemas import register_schema, registered_schemas
 #   * geometry math (translate, rotate, principal axes) runs on torch
 #     tensors directly without an Arrow → numpy round-trip every call.
 #   * selection still drives an index list; geometry consumes the tensor.
-STRUCTURE_TABLE: pa.Schema = pa.schema(
+ATOM_TABLE: pa.Schema = pa.schema(
     [
         pa.field("serial", pa.int32(), nullable=False),
         pa.field("name", pa.string(), nullable=False),
@@ -58,15 +58,15 @@ STRUCTURE_TABLE: pa.Schema = pa.schema(
         pa.field("is_hetatm", pa.bool_(), nullable=False),
         pa.field("model_id", pa.int32(), nullable=True),
     ],
-    metadata={b"schema_name": b"StructureTable"},
+    metadata={b"schema_name": b"AtomTable"},
 )
 
 
 # Self-register with the core.io schema registry. Idempotent against
 # duplicate imports — ``register_schema`` raises on duplicates, so we
 # guard with the snapshot.
-if "StructureTable" not in registered_schemas():
-    register_schema("StructureTable", STRUCTURE_TABLE)
+if "AtomTable" not in registered_schemas():
+    register_schema("AtomTable", ATOM_TABLE)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -155,8 +155,8 @@ _NUMERIC_FIELDS: tuple[tuple[str, torch.dtype], ...] = (
 )
 
 
-def structure_table_to_tensors(table: pa.Table) -> dict[str, torch.Tensor]:
-    """Pull the numerical columns of a ``STRUCTURE_TABLE``-conforming
+def atom_table_to_tensors(table: pa.Table) -> dict[str, torch.Tensor]:
+    """Pull the numerical columns of an ``ATOM_TABLE``-conforming
     Arrow table into a flat dict of ``torch.Tensor``s.
 
     Only columns that are actually present in ``table`` are returned —
@@ -181,7 +181,7 @@ def structure_table_to_tensors(table: pa.Table) -> dict[str, torch.Tensor]:
 
 
 __all__ = [
-    "STRUCTURE_TABLE",
+    "ATOM_TABLE",
     "CoordinateFrame",
-    "structure_table_to_tensors",
+    "atom_table_to_tensors",
 ]

@@ -29,7 +29,7 @@ from typing import Any, Iterator
 import pyarrow as pa
 import torch
 
-from constellation.core.structure.coords import CoordinateFrame
+from constellation.core.structure.atoms import CoordinateFrame
 from constellation.core.structure.topology import Topology
 
 
@@ -252,7 +252,7 @@ class Ensemble:
 def frame_to_table(ensemble: Ensemble, i: int) -> pa.Table:
     """Materialize a single frame as a coord-augmented Arrow table.
 
-    Returns the ``STRUCTURE_TABLE`` columns from ``ensemble.topology.atoms``
+    Returns the ``ATOM_TABLE`` columns from ``ensemble.topology.atoms``
     plus three additional ``x`` / ``y`` / ``z`` ``float32`` columns
     holding the coords for frame ``i``. Useful for export / downstream
     consumers that want a flat tabular view.

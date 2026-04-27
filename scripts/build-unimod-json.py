@@ -138,16 +138,16 @@ _ALIAS_MAP: dict[str, tuple[str, ...]] = {
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Mass calculation for sanity comparison (atom-mass table, NOT a
-# replacement for core.chem.atoms — the build script is standalone)
+# Mass calculation for sanity comparison (element-mass table, NOT a
+# replacement for core.chem.elements — the build script is standalone)
 # ──────────────────────────────────────────────────────────────────────
 
 
 def _load_atom_masses(repo_root: Path) -> dict[str, float]:
-    """Read constellation/data/atoms.json so we can compute light-skeleton
+    """Read constellation/data/elements.json so we can compute light-skeleton
     monoisotopic masses without importing the constellation package
     (which would force torch as a build-time dep)."""
-    with (repo_root / "constellation" / "data" / "atoms.json").open() as f:
+    with (repo_root / "constellation" / "data" / "elements.json").open() as f:
         doc = json.load(f)
     return {e["symbol"]: e["monoisotopic_mass"] for e in doc["elements"]}
 

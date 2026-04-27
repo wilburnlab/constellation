@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from constellation.core.structure import (
-    STRUCTURE_TABLE,
+    ATOM_TABLE,
     Ensemble,
     Topology,
     centroid,
@@ -185,9 +185,9 @@ def _small_atoms() -> pa.Table:
     ]
     cols = {
         f.name: pa.array([r.get(f.name, None) for r in rows], type=f.type)
-        for f in STRUCTURE_TABLE
+        for f in ATOM_TABLE
     }
-    return pa.table(cols, schema=STRUCTURE_TABLE)
+    return pa.table(cols, schema=ATOM_TABLE)
 
 
 def test_mass_centroid_pulls_element_masses():

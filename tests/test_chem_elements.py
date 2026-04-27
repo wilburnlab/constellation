@@ -1,4 +1,4 @@
-"""Tests for constellation.core.chem.atoms — periodic-table data integrity."""
+"""Tests for constellation.core.chem.elements — periodic-table data integrity."""
 
 from __future__ import annotations
 
@@ -7,17 +7,17 @@ import math
 import pytest
 import torch
 
-from constellation.core.chem.atoms import (
-    ATOM_SYMBOLS,
-    ATOM_TYPES,
-    ATOMS,
+from constellation.core.chem.elements import (
+    ELEMENT_SYMBOLS,
+    ELEMENT_TYPES,
+    ELEMENTS,
     FEATURE_COLUMNS,
     ISOTOPE_MASS_DIFF,
     MASSES,
     PROTON_MASS,
     WEIGHTS,
-    Atom,
-    AtomTable,
+    Element,
+    ElementTable,
     Isotope,
 )
 
@@ -28,30 +28,30 @@ from constellation.core.chem.atoms import (
 
 
 def test_full_periodic_table_loaded():
-    assert len(ATOMS) == 118
-    assert len(ATOM_SYMBOLS) == 118
+    assert len(ELEMENTS) == 118
+    assert len(ELEMENT_SYMBOLS) == 118
     # Every atomic number 1..118 present.
-    zs = sorted(a.atomic_number for a in ATOMS)
+    zs = sorted(a.atomic_number for a in ELEMENTS)
     assert zs == list(range(1, 119))
 
 
 def test_dual_indexing():
-    """ATOMS supports both symbol and atomic-number lookup."""
-    assert ATOMS["C"].atomic_number == 6
-    assert ATOMS[6].symbol == "C"
-    assert ATOMS["U"].atomic_number == 92
+    """ELEMENTS supports both symbol and atomic-number lookup."""
+    assert ELEMENTS["C"].atomic_number == 6
+    assert ELEMENTS[6].symbol == "C"
+    assert ELEMENTS["U"].atomic_number == 92
 
 
 def test_symbols_ordered_by_atomic_number():
-    for i, sym in enumerate(ATOM_SYMBOLS):
-        assert ATOMS[sym].atomic_number == i + 1
+    for i, sym in enumerate(ELEMENT_SYMBOLS):
+        assert ELEMENTS[sym].atomic_number == i + 1
 
 
 def test_chnops_legacy_alias_present():
-    """ATOM_TYPES is the cartographer-equivalent CHNOPS-6 view."""
-    assert ATOM_TYPES == ("C", "H", "N", "O", "S", "P")
-    for s in ATOM_TYPES:
-        assert s in ATOMS
+    """ELEMENT_TYPES is the cartographer-equivalent CHNOPS-6 view."""
+    assert ELEMENT_TYPES == ("C", "H", "N", "O", "S", "P")
+    for s in ELEMENT_TYPES:
+        assert s in ELEMENTS
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -77,7 +77,7 @@ def test_chnops_legacy_alias_present():
     ],
 )
 def test_monoisotopic_masses_match_nist(symbol: str, expected: float, tol: float):
-    got = ATOMS[symbol].monoisotopic_mass
+    got = ELEMENTS[symbol].monoisotopic_mass
     assert abs(got - expected) <= tol, f"{symbol}: got {got}, expected {expected}"
 
 
@@ -88,8 +88,8 @@ def test_proton_mass_constant():
 
 def test_isotope_mass_diff_is_13c_minus_12c():
     """The conventional ¹³C-spacing constant should equal ¹³C exact mass - 12.0."""
-    c12 = next(i for i in ATOMS["C"].isotopes if i.mass_number == 12)
-    c13 = next(i for i in ATOMS["C"].isotopes if i.mass_number == 13)
+    c12 = next(i for i in ELEMENTS["C"].isotopes if i.mass_number == 12)
+    c13 = next(i for i in ELEMENTS["C"].isotopes if i.mass_number == 13)
     assert abs((c13.exact_mass - c12.exact_mass) - ISOTOPE_MASS_DIFF) < 1e-7
 
 
@@ -102,7 +102,7 @@ def test_natural_abundances_sum_to_one_for_natural_elements():
     """For elements with naturally-occurring isotopes, abundances should
     sum to 1.0 (within float tolerance). Radioactive-only elements
     (Tc, Pm, all transuranics) sum to 0."""
-    for atom in ATOMS:
+    for atom in ELEMENTS:
         total = sum(i.abundance for i in atom.isotopes)
         if atom.atomic_number in (43, 61) or atom.atomic_number >= 84:
             # Radioactive-only or trace — abundances sum to 0 or close to it.
@@ -113,7 +113,7 @@ def test_natural_abundances_sum_to_one_for_natural_elements():
 
 def test_carbon_isotopes_present():
     """¹²C and ¹³C must both be present and in correct abundance ratio."""
-    isotopes = {i.mass_number: i for i in ATOMS["C"].isotopes}
+    isotopes = {i.mass_number: i for i in ELEMENTS["C"].isotopes}
     assert 12 in isotopes and 13 in isotopes
     assert isotopes[12].exact_mass == 12.0  # ¹²C is the mass standard
     assert abs(isotopes[12].abundance - 0.9893) < 1e-4
@@ -124,10 +124,10 @@ def test_15n_distinct_from_13c_spacing():
     """Regression test for the isotope-resolution concern: ¹⁵N must NOT
     be coincident with ¹³C-spacing. The mass difference (¹⁵N-¹⁴N) -
     (¹³C-¹²C) should be ≈ -0.00633 Da."""
-    n14 = next(i for i in ATOMS["N"].isotopes if i.mass_number == 14)
-    n15 = next(i for i in ATOMS["N"].isotopes if i.mass_number == 15)
-    c12 = next(i for i in ATOMS["C"].isotopes if i.mass_number == 12)
-    c13 = next(i for i in ATOMS["C"].isotopes if i.mass_number == 13)
+    n14 = next(i for i in ELEMENTS["N"].isotopes if i.mass_number == 14)
+    n15 = next(i for i in ELEMENTS["N"].isotopes if i.mass_number == 15)
+    c12 = next(i for i in ELEMENTS["C"].isotopes if i.mass_number == 12)
+    c13 = next(i for i in ELEMENTS["C"].isotopes if i.mass_number == 13)
     n_diff = n15.exact_mass - n14.exact_mass
     c_diff = c13.exact_mass - c12.exact_mass
     assert abs((n_diff - c_diff) - (-0.00633)) < 1e-4
@@ -138,15 +138,15 @@ def test_15n_distinct_from_13c_spacing():
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_masses_pinned_to_atoms():
-    """MASSES is a view, never a parallel copy — must agree with ATOMS for every symbol."""
-    for s in ATOM_SYMBOLS:
-        assert MASSES[s] == ATOMS[s].monoisotopic_mass
+def test_masses_pinned_to_elements():
+    """MASSES is a view, never a parallel copy — must agree with ELEMENTS for every symbol."""
+    for s in ELEMENT_SYMBOLS:
+        assert MASSES[s] == ELEMENTS[s].monoisotopic_mass
 
 
-def test_weights_pinned_to_atoms():
-    for s in ATOM_SYMBOLS:
-        assert WEIGHTS[s] == ATOMS[s].standard_atomic_weight
+def test_weights_pinned_to_elements():
+    for s in ELEMENT_SYMBOLS:
+        assert WEIGHTS[s] == ELEMENTS[s].standard_atomic_weight
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -155,17 +155,17 @@ def test_weights_pinned_to_atoms():
 
 
 def test_mass_tensor_indexed_by_composition_axis():
-    """mass_tensor[ATOMS.index(s)] should equal ATOMS[s].monoisotopic_mass."""
-    mt = ATOMS.mass_tensor
-    assert mt.shape == (len(ATOM_SYMBOLS),)
+    """mass_tensor[ELEMENTS.index(s)] should equal ELEMENTS[s].monoisotopic_mass."""
+    mt = ELEMENTS.mass_tensor
+    assert mt.shape == (len(ELEMENT_SYMBOLS),)
     assert mt.dtype == torch.float64
-    for s in ATOM_SYMBOLS:
-        assert mt[ATOMS.index(s)].item() == ATOMS[s].monoisotopic_mass
+    for s in ELEMENT_SYMBOLS:
+        assert mt[ELEMENTS.index(s)].item() == ELEMENTS[s].monoisotopic_mass
 
 
 def test_feature_tensor_z_indexed():
     """feature_tensor row Z holds the features for atomic_number=Z. Row 0 is all-NaN padding."""
-    ft = ATOMS.feature_tensor
+    ft = ELEMENTS.feature_tensor
     assert ft.shape == (119, len(FEATURE_COLUMNS))  # 0..118
     assert ft.dtype == torch.float32
     # Padding row.
@@ -193,39 +193,39 @@ def test_feature_tensor_columns_in_documented_order():
 
 
 # ──────────────────────────────────────────────────────────────────────
-# AtomTable error semantics
+# ElementTable error semantics
 # ──────────────────────────────────────────────────────────────────────
 
 
 def test_unknown_symbol_raises_keyerror():
     with pytest.raises(KeyError):
-        ATOMS["Unobtainium"]
+        ELEMENTS["Unobtainium"]
     with pytest.raises(KeyError):
-        ATOMS[200]
+        ELEMENTS[200]
 
 
 def test_index_inverse_of_symbols():
-    for i, sym in enumerate(ATOM_SYMBOLS):
-        assert ATOMS.index(sym) == i
+    for i, sym in enumerate(ELEMENT_SYMBOLS):
+        assert ELEMENTS.index(sym) == i
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Atom dataclass behavior
+# Element dataclass behavior
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_atom_is_frozen():
-    c = ATOMS["C"]
+def test_element_is_frozen():
+    c = ELEMENTS["C"]
     with pytest.raises((AttributeError, TypeError)):
         c.symbol = "X"  # type: ignore[misc]
 
 
-def test_atom_average_mass_uses_standard_weight():
+def test_element_average_mass_uses_standard_weight():
     """For natural-abundance elements, .average_mass returns the IUPAC
     standard atomic weight."""
     for s in ("C", "H", "N", "O", "S", "P"):
-        atom = ATOMS[s]
-        assert atom.average_mass == atom.standard_atomic_weight
+        element = ELEMENTS[s]
+        assert element.average_mass == element.standard_atomic_weight
 
 
 def test_isotope_dataclass_immutable():
@@ -265,5 +265,5 @@ def test_isotope_dataclass_immutable():
     ],
 )
 def test_group_period(symbol: str, group: int, period: int):
-    a = ATOMS[symbol]
+    a = ELEMENTS[symbol]
     assert (a.group, a.period) == (group, period)

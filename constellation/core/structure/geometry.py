@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import torch
 
-from constellation.core.chem.atoms import ATOMS
+from constellation.core.chem.elements import ELEMENTS
 from constellation.core.structure.ensemble import Ensemble
 
 
@@ -144,7 +144,7 @@ def mass_centroid(ensemble: Ensemble) -> torch.Tensor:
     """Mass-weighted centroid of an ``Ensemble``, per frame.
 
     Pulls element symbols from ``ensemble.topology.atoms.element``
-    and resolves through ``core.chem.ATOMS[sym].monoisotopic_mass``.
+    and resolves through ``core.chem.ELEMENTS[sym].monoisotopic_mass``.
     Atoms whose element is unknown / has no mass data raise.
 
     Returns shape ``(F, 3)`` for an ``F``-frame ensemble (use
@@ -154,7 +154,7 @@ def mass_centroid(ensemble: Ensemble) -> torch.Tensor:
     masses_list: list[float] = []
     for sym in elements:
         try:
-            m = ATOMS[sym].monoisotopic_mass
+            m = ELEMENTS[sym].monoisotopic_mass
         except KeyError as exc:
             raise ValueError(
                 f"unknown element symbol {sym!r}; cannot compute mass centroid"

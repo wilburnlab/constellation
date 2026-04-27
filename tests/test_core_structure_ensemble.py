@@ -9,7 +9,7 @@ import torch
 from constellation.core.io.schemas import cast_to_schema
 from constellation.core.structure import (
     FRAME_METADATA,
-    STRUCTURE_TABLE,
+    ATOM_TABLE,
     CoordinateFrame,
     Ensemble,
     Topology,
@@ -49,9 +49,9 @@ def _two_chain_atoms() -> pa.Table:
             serial += 1
     cols = {
         f.name: pa.array([r[f.name] for r in rows], type=f.type)
-        for f in STRUCTURE_TABLE
+        for f in ATOM_TABLE
     }
-    return pa.table(cols, schema=STRUCTURE_TABLE)
+    return pa.table(cols, schema=ATOM_TABLE)
 
 
 def _topology() -> Topology:
@@ -206,12 +206,12 @@ def test_frame_to_table_appends_xyz():
 
 
 def test_frame_to_table_round_trips_through_cast():
-    """Coord-augmented projection still casts cleanly to STRUCTURE_TABLE
+    """Coord-augmented projection still casts cleanly to ATOM_TABLE
     (xyz columns get dropped on the way back)."""
     e = Ensemble(_topology(), _coords(1))
     t = frame_to_table(e, 0)
-    casted = cast_to_schema(t, STRUCTURE_TABLE)
-    assert casted.schema == STRUCTURE_TABLE
+    casted = cast_to_schema(t, ATOM_TABLE)
+    assert casted.schema == ATOM_TABLE
     assert casted.num_rows == 8
 
 

@@ -1,6 +1,6 @@
 """Physical-biochemistry constants and unit conversions.
 
-Re-exports the fundamental constants from `core.chem.atoms` (single
+Re-exports the fundamental constants from `core.chem.elements` (single
 source of truth — never redefined here) and adds the broader CODATA
 2018 set plus common biochemistry conversions. All values are plain
 Python floats; callers wrap in `torch.tensor(...)` at the call site
@@ -29,7 +29,7 @@ import torch
 # Re-exports (must NOT redefine — single source of truth in core.chem)
 # ──────────────────────────────────────────────────────────────────────
 
-from constellation.core.chem.atoms import (  # noqa: F401  (re-exports)
+from constellation.core.chem.elements import (  # noqa: F401  (re-exports)
     AVOGADRO,
     ELECTRON_MASS,
     ISOTOPE_MASS_DIFF,
