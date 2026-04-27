@@ -49,20 +49,24 @@ def _erfcx(x: torch.Tensor) -> torch.Tensor:
 
     Stable for all `x`. Direct computation where `x < 25`; for `x ≥ 25`
     a three-term asymptotic series (Abramowitz & Stegun 7.1.23). Torch
-    does not ship `erfcx` natively as of 2.5.x.
+    does not ship `erfcx` natively as of 2.11.
+
+    Uses `torch.where` rather than boolean indexing so the function is
+    `torch.func.vmap`-compatible (DE's population path vmaps the model;
+    boolean masking with dynamic shape is rejected by vmap). The
+    `clamp(max=25)` keeps `exp(x²)` from overflowing on the unused
+    branch — `torch.where` evaluates both branches before selecting.
     """
-    safe = x < 25.0
-    result = torch.empty_like(x)
-
-    x_safe = x[safe]
-    result[safe] = torch.exp(x_safe**2) * torch.erfc(x_safe)
-
-    x_big = x[~safe]
-    inv_x2 = 1.0 / (x_big**2)
-    result[~safe] = (1.0 / (x_big * math.sqrt(math.pi))) * (
+    x_clamped = x.clamp(max=25.0)
+    direct = torch.exp(x_clamped**2) * torch.erfc(x)
+    # asymptotic branch: divisions need a non-zero denominator on the
+    # unused (small-x) side, otherwise inf/nan can leak through autograd.
+    x_safe = torch.where(x > 1e-10, x, torch.full_like(x, 1.0))
+    inv_x2 = 1.0 / (x_safe**2)
+    asymp = (1.0 / (x_safe * math.sqrt(math.pi))) * (
         1.0 - 0.5 * inv_x2 + 0.75 * inv_x2**2
     )
-    return result
+    return torch.where(x < 25.0, direct, asymp)
 
 
 def emg_pdf(
@@ -282,8 +286,8 @@ class EMGPeak(PeakShape):
         }
 
 
-# Reserved for future sessions (need core.optim.DifferentialEvolution to
-# fit reliably; LBFGS gets stuck in the local minima these create):
+# Reserved for the next peak-numerics session. `core.optim.DifferentialEvolution`
+# is now shipped, so the LBFGS-fails-on-local-minima blocker is resolved:
 #   - HyperEMGPeak     weighted left+right EMG mixture
 #   - WarpedEMGPeak    piecewise cubic Hermite refinement
 #   - SplinePeak       B-spline knots

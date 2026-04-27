@@ -8,16 +8,23 @@ specializations sit underneath:
     PeakShape        adds .integrate(), .bounds(); default loss = MSE
                      log_prob/cdf optional (raise NotImplementedError)
 
-Optimizer policy: this module does not ship any optimizer implementation.
-`Parametric.fit(data, *, optimizer, ...)` accepts any object exposing
-``step(closure) -> Tensor`` (duck-typed; type hint is `object` in v1).
-The formal `Optimizer` Protocol lives in `core.optim` once that ships;
-the type hint upgrades then without code changes here.
+`Parametric.fit(data, *, optimizer, ...)` dispatches on the optimizer
+shape: an `Optimizer` (gradient-based; LBFGS, Adam, ...) gets a scalar
+closure that returns un-backed loss; a `PopulationOptimizer` (DE) gets
+a population closure that calls a vmap'd `model_view` and returns a
+`(pop_size,)` loss vector. Both Protocols live in `core.optim`.
+
+Vmap implication: every subclass's `forward` (and `log_prob` / `cdf`
+for `Distribution`) must be `torch.func.vmap`-compatible — basic
+broadcasting torch ops are fine; boolean indexing with dynamic shape
+breaks vmap and must be rewritten with `torch.where`.
 
 Convention (documented, not enforced): subclasses parameterize positive
 quantities in log-space (`log_sigma`, `log_tau`, `log_N_max`) and bounded
 quantities in logit-space (`logit_eta`, mixture weights). Default dtype
 is float64 — peak-shape and density numerics are precision-sensitive.
+DE bounds operate on the registered name (e.g. `log_sigma`); use
+`core.optim.bounds_in_natural_units` to convert from natural units.
 """
 
 from __future__ import annotations
@@ -29,6 +36,8 @@ from typing import Callable
 
 import torch
 from torch import nn
+
+from constellation.core.optim import Optimizer, PopulationOptimizer
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -97,46 +106,78 @@ class Parametric(nn.Module, abc.ABC):
         data: torch.Tensor,
         target: torch.Tensor | None = None,
         *,
-        optimizer: object,
+        optimizer: Optimizer | PopulationOptimizer,
         loss_fn: Callable[..., torch.Tensor] | None = None,
         max_iter: int = 200,
         tol: float = 1e-8,
+        polish_on_converge: bool = False,
         callback: Callable[[int, float], None] | None = None,
     ) -> FitResult:
         """Fit parameters to `data` (and optional `target`) via an external optimizer.
 
-        `optimizer` must expose ``step(closure) -> Tensor``. The closure
-        returns a scalar loss and is responsible for `zero_grad()` +
-        `backward()`. Convergence: ``|loss_{i} - loss_{i-1}| < tol``.
-        NaN loss aborts (`converged=False`).
+        Dispatches on optimizer type. For `Optimizer` (gradient-based)
+        the closure returns a scalar un-backed loss; the optimizer
+        manages `zero_grad` / `backward` internally. For
+        `PopulationOptimizer` (DE) the closure receives a vmap'd
+        `model_view` and returns a `(pop_size,)` loss vector.
+
+        Outer convergence: ``|loss_{i} - loss_{i-1}| < tol`` for the
+        scalar path; ``optimizer.is_converged`` short-circuits the
+        population path. NaN loss aborts (`converged=False`).
+
+        `polish_on_converge=True` triggers `optimizer.polish(scalar_closure)`
+        after the loop terminates if the optimizer exposes the method
+        (e.g. DifferentialEvolution).
         """
+        if isinstance(optimizer, PopulationOptimizer):
+            return self._fit_population(
+                data, target, optimizer, loss_fn, max_iter, tol,
+                polish_on_converge, callback,
+            )
+        return self._fit_scalar(
+            data, target, optimizer, loss_fn, max_iter, tol,
+            polish_on_converge, callback,
+        )
+
+    def _build_scalar_closure(
+        self,
+        data: torch.Tensor,
+        target: torch.Tensor | None,
+        loss_fn: Callable[..., torch.Tensor] | None,
+    ) -> Callable[[], torch.Tensor]:
+        """Returns a closure() -> loss tensor. The closure does NOT call
+        backward — that responsibility belongs to the optimizer."""
+
+        def closure() -> torch.Tensor:
+            pred = self.forward(data)
+            if loss_fn is not None:
+                return loss_fn(pred, target) if target is not None else loss_fn(pred)
+            if isinstance(self, Distribution):
+                return -self.log_prob(data).sum()
+            return self._default_loss(pred, target)
+
+        return closure
+
+    def _fit_scalar(
+        self,
+        data: torch.Tensor,
+        target: torch.Tensor | None,
+        optimizer: Optimizer,
+        loss_fn: Callable[..., torch.Tensor] | None,
+        max_iter: int,
+        tol: float,
+        polish_on_converge: bool,
+        callback: Callable[[int, float], None] | None,
+    ) -> FitResult:
         result = FitResult()
         prev_loss = math.inf
+        closure = self._build_scalar_closure(data, target, loss_fn)
 
         for i in range(max_iter):
-            def closure():
-                # `optimizer` is responsible for ordering; we just compute
-                # the loss + gradients on each call. Some optimizers (LBFGS)
-                # call this multiple times per outer step.
-                for p in self.parameters():
-                    if p.grad is not None:
-                        p.grad.zero_()
-                pred = self.forward(data)
-                if loss_fn is not None:
-                    loss = loss_fn(pred, target) if target is not None else loss_fn(pred)
-                elif isinstance(self, Distribution):
-                    # NLL on the data itself; `pred` ignored.
-                    loss = -self.log_prob(data).sum()
-                else:
-                    loss = self._default_loss(pred, target)
-                loss.backward()
-                return loss
-
             loss_t = optimizer.step(closure)
-            if torch.is_tensor(loss_t):
-                loss_val = float(loss_t.detach())
-            else:
-                loss_val = float(loss_t)
+            loss_val = (
+                float(loss_t.detach()) if torch.is_tensor(loss_t) else float(loss_t)
+            )
 
             if not math.isfinite(loss_val):
                 result.n_iter = i + 1
@@ -154,11 +195,96 @@ class Parametric(nn.Module, abc.ABC):
                 result.n_iter = i + 1
                 result.final_loss = loss_val
                 result.converged = True
+                if polish_on_converge and hasattr(optimizer, "polish"):
+                    optimizer.polish(closure)
                 return result
             prev_loss = loss_val
 
         result.n_iter = max_iter
         result.final_loss = prev_loss
+        result.converged = False
+        return result
+
+    def _fit_population(
+        self,
+        data: torch.Tensor,
+        target: torch.Tensor | None,
+        optimizer: PopulationOptimizer,
+        loss_fn: Callable[..., torch.Tensor] | None,
+        max_iter: int,
+        tol: float,
+        polish_on_converge: bool,
+        callback: Callable[[int, float], None] | None,
+    ) -> FitResult:
+        """Population-fit driver. Builds a vectorized closure that calls
+        the vmap'd `model_view` and reduces loss per individual."""
+        result = FitResult()
+        is_distribution = isinstance(self, Distribution)
+
+        def pop_closure(model_view) -> torch.Tensor:
+            if loss_fn is not None:
+                pred = model_view(data)   # (pop, *forward_shape)
+                if target is not None:
+                    return loss_fn(pred, target)
+                return loss_fn(pred)
+            if is_distribution:
+                # Distribution.forward defaults to log_prob (see Distribution
+                # ABC); the vmap'd model_view substitutes batched params and
+                # broadcasts log_prob over the leading population dim.
+                lp_per_individual = model_view(data)   # (pop, *data_shape)
+                if lp_per_individual.dim() == 1:
+                    return -lp_per_individual
+                reduce_dims = tuple(range(1, lp_per_individual.dim()))
+                return -lp_per_individual.sum(dim=reduce_dims)
+            # PeakShape / calibration: MSE per individual against target
+            pred = model_view(data)   # (pop, *data_shape)
+            if target is None:
+                raise ValueError(
+                    "default loss is MSE and requires `target`; "
+                    "pass `loss_fn=` for unsupervised population fits"
+                )
+            diff = pred - target
+            reduce_dims = tuple(range(1, diff.dim()))
+            return (diff * diff).mean(dim=reduce_dims)
+
+        for i in range(max_iter):
+            best_t = optimizer.step(pop_closure)
+            loss_val = (
+                float(best_t.detach()) if torch.is_tensor(best_t) else float(best_t)
+            )
+            if not math.isfinite(loss_val):
+                result.n_iter = i + 1
+                result.final_loss = loss_val
+                result.converged = False
+                if callback is not None:
+                    callback(i, loss_val)
+                return result
+
+            result.loss_history.append(loss_val)
+            if callback is not None:
+                callback(i, loss_val)
+
+            if optimizer.is_converged:
+                result.n_iter = i + 1
+                result.final_loss = loss_val
+                result.converged = True
+                if polish_on_converge and hasattr(optimizer, "polish"):
+                    scalar_closure = self._build_scalar_closure(
+                        data, target, loss_fn
+                    )
+                    optimizer.polish(scalar_closure)
+                    # Re-evaluate after polish
+                    with torch.no_grad():
+                        polished = scalar_closure()
+                    polished_val = float(polished.detach())
+                    result.loss_history.append(polished_val)
+                    result.final_loss = polished_val
+                return result
+
+        result.n_iter = max_iter
+        result.final_loss = (
+            result.loss_history[-1] if result.loss_history else math.inf
+        )
         result.converged = False
         return result
 

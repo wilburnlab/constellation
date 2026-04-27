@@ -16,17 +16,19 @@ Two-tier ABC structure under one umbrella:
                 Sigmoidal, Hill, LogLinear
 
 Fitting drives NLL minimization (for Distributions) or MSE (for
-PeakShapes / calibration) through an external optimizer. `core.stats`
-ships zero optimizer implementations — `Parametric.fit(data, *,
-optimizer, ...)` accepts any object exposing `step(closure)`. The
-real `LBFGSOptimizer` and `DifferentialEvolution` ship in
-`core.optim` next session.
+PeakShapes / calibration) through an external optimizer.
+`Parametric.fit(data, *, optimizer, ...)` dispatches on optimizer
+shape: an `Optimizer` (gradient-based) gets a scalar closure; a
+`PopulationOptimizer` (DE) gets a vmap'd closure that returns a
+`(pop_size,)` loss vector. Both Protocols live in `core.optim`.
+`core.stats` itself ships zero optimizer implementations.
 
 Submodules:
     parametric       ABC core
     distributions    9 density classes
     peaks            EMG / Gaussian peak shapes (HyperEMG / Warped /
-                     Spline deferred until DE optimizer ships)
+                     Spline land in the next peak-numerics session,
+                     now that DE is available)
     calibration      Sigmoidal / Hill / LogLinear standard curves
     losses           kld, spectral_angle, spectral_entropy_loss,
                      l1_normalize, l2_normalize
