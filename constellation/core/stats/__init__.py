@@ -1,13 +1,92 @@
-"""Parametric functional forms, losses, and measurement units.
+"""Parametric functional forms, losses, and physical units.
 
-`Parametric` ABC unifies probability densities (Student-t, Normal,
-GeneralizedNormal, Dirichlet, ...) and observable shapes (Gaussian,
-EMG, WarpedEMG, SplinePeak, HyperEMGPeak) — both are differentiable
-nn.Module subclasses with forward / log_prob / .fit(data). Fitting
-drives NLL minimization through `core.optim` — no scipy in the path.
+Two-tier ABC structure under one umbrella:
 
-Modules (TODO; scaffolded only):
-    distributions    - Parametric ABC + densities + peak shapes
-    losses           - kld, spectral_angle, spectral_entropy_loss
-    units            - Da/ppm/etc. constants + conversions
+    Parametric(nn.Module)              .forward, .fit, parameters_dict
+        |
+        +-- Distribution                .log_prob, .cdf  (required)
+        |       Normal, StudentT, GeneralizedNormal,
+        |       Beta, Gamma, LogNormal,
+        |       Poisson, Multinomial, Dirichlet
+        |
+        +-- PeakShape                   .integrate, .bounds  (required)
+        |       GaussianPeak, EMGPeak    (.log_prob/.cdf optional)
+        |
+        +-- (calibration models — leaf, no extra trait)
+                Sigmoidal, Hill, LogLinear
+
+Fitting drives NLL minimization (for Distributions) or MSE (for
+PeakShapes / calibration) through an external optimizer. `core.stats`
+ships zero optimizer implementations — `Parametric.fit(data, *,
+optimizer, ...)` accepts any object exposing `step(closure)`. The
+real `LBFGSOptimizer` and `DifferentialEvolution` ship in
+`core.optim` next session.
+
+Submodules:
+    parametric       ABC core
+    distributions    9 density classes
+    peaks            EMG / Gaussian peak shapes (HyperEMG / Warped /
+                     Spline deferred until DE optimizer ships)
+    calibration      Sigmoidal / Hill / LogLinear standard curves
+    losses           kld, spectral_angle, spectral_entropy_loss,
+                     l1_normalize, l2_normalize
+    units            CODATA constants + ppm/Da conversions
 """
+
+from .parametric import Distribution, FitResult, Parametric, PeakShape
+from .distributions import (
+    Beta,
+    Dirichlet,
+    Gamma,
+    GeneralizedNormal,
+    LogNormal,
+    Multinomial,
+    NormalDistribution,
+    Poisson,
+    StudentT,
+)
+from .peaks import EMGPeak, GaussianPeak, emg_log_pdf, emg_pdf
+from .calibration import Hill, LogLinear, Sigmoidal
+from .losses import (
+    kld,
+    l1_normalize,
+    l2_normalize,
+    spectral_angle,
+    spectral_entropy_loss,
+)
+from . import units
+
+__all__ = [
+    # ABCs + fit protocol
+    "Parametric",
+    "Distribution",
+    "PeakShape",
+    "FitResult",
+    # Densities
+    "NormalDistribution",
+    "StudentT",
+    "GeneralizedNormal",
+    "Beta",
+    "Gamma",
+    "LogNormal",
+    "Poisson",
+    "Multinomial",
+    "Dirichlet",
+    # Peak shapes
+    "GaussianPeak",
+    "EMGPeak",
+    "emg_pdf",
+    "emg_log_pdf",
+    # Calibration
+    "Sigmoidal",
+    "Hill",
+    "LogLinear",
+    # Losses
+    "kld",
+    "spectral_angle",
+    "spectral_entropy_loss",
+    "l1_normalize",
+    "l2_normalize",
+    # Submodules
+    "units",
+]

@@ -28,6 +28,12 @@ import constellation.core.sequence.nucleic
 import constellation.core.sequence.ops
 import constellation.core.sequence.protein
 import constellation.core.stats
+import constellation.core.stats.calibration
+import constellation.core.stats.distributions
+import constellation.core.stats.losses
+import constellation.core.stats.parametric
+import constellation.core.stats.peaks
+import constellation.core.stats.units
 import constellation.core.structure
 import constellation.core.structure.coords
 import constellation.core.structure.ensemble
