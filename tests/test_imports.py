@@ -16,6 +16,9 @@ import constellation.core.chem.isotopes
 import constellation.core.chem.modifications
 import constellation.core.graph
 import constellation.core.io
+import constellation.core.io.bundle
+import constellation.core.io.readers
+import constellation.core.io.schemas
 import constellation.core.nn
 import constellation.core.optim
 import constellation.core.sequence
@@ -25,6 +28,10 @@ import constellation.core.sequence.ops
 import constellation.core.sequence.protein
 import constellation.core.stats
 import constellation.core.structure
+import constellation.chromatography
+import constellation.chromatography.readers
+import constellation.electrophoresis
+import constellation.electrophoresis.readers
 import constellation.massspec
 import constellation.massspec.library
 import constellation.massspec.peptide

@@ -6,7 +6,7 @@ Integrative bioinformatics platform: a shared core of physically grounded primit
 
 Constellation is absorbing four existing lab packages as a **clean rewrite** (no vendored source): **Cartographer** (MS proteomics, first port target), **NanoporeAnalysis** (POD5 → protein), **CoLLAGE** (codon optimization), **Contour** (PDB → MD prep). Chronologer (RT prediction) has already been absorbed into Cartographer.
 
-Current state: **`core.chem` and `core.sequence` shipped; everything else scaffold.** Functional code lives in `constellation.core.chem` (full periodic table, Composition arithmetic, binned + isotopologue-resolved isotope distributions, UNIMOD vocabulary with subsetting), `constellation.core.sequence` (canonical + IUPAC alphabets, generic ops, nucleic translation/ORF/rev-complement, protein cleavage / peptide composition), `constellation.thirdparty.registry` (tool discovery), and `constellation.cli.__main__` (the `constellation doctor` command). All other subpackages are scaffold-only. Core primitives and domain modules are staged for the 90-day roadmap (see `docs/roadmap.md` when written).
+Current state: **`core.chem`, `core.sequence`, and `core.io` shipped; everything else scaffold.** Functional code lives in `constellation.core.chem` (full periodic table, Composition arithmetic, binned + isotopologue-resolved isotope distributions, UNIMOD vocabulary with subsetting), `constellation.core.sequence` (canonical + IUPAC alphabets, generic ops, nucleic translation/ORF/rev-complement, protein cleavage / peptide composition), `constellation.core.io` (`RawReader` ABC + suffix/modality registry, `Bundle`/`OpcBundle`/`DirBundle` for multi-file containers, canonical Arrow schemas `Trace1D` / `SpectraMatrix2D` / `PeakTable` with namespaced metadata extras, torch-tensor bridges), `constellation.thirdparty.registry` (tool discovery), and `constellation.cli.__main__` (the `constellation doctor` command). All other subpackages are scaffold-only. Core primitives and domain modules are staged for the 90-day roadmap (see `docs/roadmap.md` when written).
 
 ## Architecture invariants (load-bearing — design principles from the PI)
 
@@ -28,6 +28,8 @@ Current state: **`core.chem` and `core.sequence` shipped; everything else scaffo
 - **Pluggable codon tables.** `translate(seq, codon_table=STANDARD)` accepts any entry from `CODON_TABLES` (keyed by NCBI transl_table number). Shipped: 1 (Standard), 2 (Vertebrate Mito), 3 (Yeast Mito), 4 (Mold/Protozoan/Coelenterate Mito + Mycoplasma), 5 (Invertebrate Mito), 6 (Ciliate), 11 (Bacterial/Archaeal/Plastid). Stored in `constellation/data/codon_tables.json` as overrides on top of table 1.
 - **Cleavage uses regex, not pyteomics.** `core.sequence.protein.cleave` is hand-rolled with the third-party `regex` module (overlap-aware). The 17 built-in protease patterns (Trypsin family, LysC/N, ArgC, Chymotrypsin, AspN, GluC, Pepsin, ProteinaseK, Thermolysin, No_enzyme) are lifted from ExPASy PeptideCutter and ship in `constellation/data/proteases.json`. Pyteomics still earns its place later in `massspec` for mzML I/O — but `core.sequence` does not import it.
 - **Third-party tool env-var convention:** `$CONSTELLATION_<TOOL>_HOME` (uniform across all tools — no `_JAR` / `_DIR` / `_HOME` mixing).
+- **Generic-vs-modality split for schemas.** A schema earns a slot in `core.io.schemas` only if its column layout is genuinely universal across ≥2 modalities (`Trace1D`, `SpectraMatrix2D`, `PeakTable` qualify). Modality-specific information rides as **namespaced schema metadata** (`x.<domain>.<key>`), never as columns. So `Trace1D` is `(time_s, intensity)` everywhere; HPLC reads `x.hplc.wavelength_nm`, CE reads `x.ce.capillary_index`, POD5 reads `x.pod5.read_id`. Producers stamp the metadata; downstream math doesn't care which modality the bytes came from. Round-trip metadata through `pack_metadata` / `unpack_metadata` from `core.io.schemas` to keep the JSON encoding consistent.
+- **Torch-first numerics; numpy only at I/O boundaries.** Per Principle 3, `core.signal`, `core.stats`, and `core.optim` operate on `torch.Tensor` end-to-end. Numpy is permitted only at: (a) big-endian byte decode where torch lacks the dtype (FA `.raw` ``>u2``) — one boundary-crossing per file via `torch.from_numpy(arr.copy())`; (b) the Arrow ↔ torch bridge (`pa.Array.to_numpy(zero_copy_only=True)` + `torch.from_numpy(...)` is zero-copy in both legs). Little-endian dtypes decode straight through `torch.frombuffer` without numpy.
 
 ## Import order — project-wide DAG
 
@@ -36,9 +38,9 @@ Load-bearing invariant. Violating it creates circular imports or module-init ord
 ### Inside `core/`
 
 ```
-chem ─► sequence ─► structure ─► {stats, graph, nn} ─► optim
-  │         │            │              │               ▲
-  └─────────┴────────────┴──────────────┴─► io ◄────────┘
+chem ─► sequence ─► structure ─► {stats, graph, nn, signal} ─► optim
+  │         │            │              │   │                   ▲
+  └─────────┴────────────┴──────────────┴───┴─► io ◄────────────┘
 ```
 
 Mirrors the biological hierarchy from building blocks → primary structure → tertiary structure.
@@ -47,13 +49,15 @@ Mirrors the biological hierarchy from building blocks → primary structure → 
 - `sequence` — imports `chem`; never imports `structure`.
 - `structure` — imports `chem` and `sequence` (tertiary structure sits on primary).
 - `stats`, `graph`, `nn` — downstream math; may import from `chem`, `sequence`, `structure`.
+- `signal` — heuristic 1D-trace operations (baseline, smoothing, peak picking, polynomial calibration). Imports `stats` for parametric peak-fitting helpers; otherwise leaf-style. Distinct from `stats` because the operations have imprecisely-specified priors and don't earn membership in the `Parametric` namespace.
 - `optim` — furthest downstream; `Parametric.fit()` drives through here.
 - `io` — leaf. Format/codec concerns only. Never imports other core.
 
 ### Between layers
 
 ```
-core  ─►  {massspec, sequencing, structure, codon, nmr}  ─►  cli
+core  ─►  {massspec, sequencing, structure, codon, nmr,
+           chromatography, electrophoresis}  ─►  cli
            (domain modules — never cross-import)
 ```
 
@@ -68,8 +72,9 @@ Adding a new module: confirm its place in this DAG before touching imports. Addi
 | `constellation.core.chem` | Elements (full H–Og), Composition (int32 tensor wrapper, plain-Python — hashable, bool `==`), binned + isotopologue-resolved isotope APIs, UNIMOD ModVocab with first-class subsetting | **shipped** |
 | `constellation.core.sequence` | Alphabet ABC + canonical/IUPAC instances, generic ops (kmerize, sliding_window, hamming, modified-sequence parse/format), nucleic (reverse_complement, 7 NCBI codon tables, degenerate-codon-aware translate, find_orfs / best_orf, gc_content), protein (17-protease registry, cleave with N→C ordering and missed-cleavage enumeration, peptide_composition / peptide_mass with UNIMOD lookup) | **shipped** |
 | `constellation.core.structure` | Coords, geometry (Kabsch/RMSD), topology (Arrow-backed graph), ensemble (NMR/cryoEM/MD unified) | scaffold |
-| `constellation.core.io` | Schema registry, RawReader ABC, Bundle (primary + companions) | scaffold |
-| `constellation.core.stats` | `Parametric` ABC (densities + peak shapes), losses, units | scaffold |
+| `constellation.core.io` | `RawReader` ABC + suffix/modality registry, `Bundle`/`OpcBundle`/`DirBundle` for multi-file containers, canonical Arrow schemas (`Trace1D`, `SpectraMatrix2D`, `PeakTable`) with namespaced `x.<domain>.<key>` metadata extras, torch-tensor bridges (`trace_to_tensor`, `spectra_to_tensor`, `tensor_to_spectra`), forward-compat `cast_to_schema` | **shipped** |
+| `constellation.core.stats` | `Parametric` ABC (densities + peak shapes + calibration models: Sigmoidal/Hill/LogLinear), losses, units | scaffold |
+| `constellation.core.signal` | Heuristic 1D-trace ops — baseline correction (AsLS/arPLS/SNIP), smoothing (Savitzky–Golay), prominence peak picking, polynomial / monotonic-spline calibration. Torch-native; imports `core.stats` for Parametric peak-fits | scaffold |
 | `constellation.core.optim` | `DifferentialEvolution` (with LBFGS polish), optimizer registry | scaffold |
 | `constellation.core.nn` | ResNet blocks, MonotonicMLP, transformer scaffolds (PascalCase) | scaffold |
 | `constellation.core.graph` | `Tree[T]`, `Network[NodeT, EdgeT]` | scaffold |
@@ -78,6 +83,8 @@ Adding a new module: confirm its place in this DAG before touching imports. Addi
 | `constellation.codon` | CoLLAGE-style codon optimization | scaffold |
 | `constellation.structure` | Contour replacement; PDB/mmCIF + MD trajectories unified via `core.structure.Ensemble` | scaffold |
 | `constellation.nmr` | Placeholder | scaffold |
+| `constellation.chromatography` | HPLC-DAD (Agilent OpenLab `.dx` first; LC-MS hyphenation when MS lands). Reader subclass of `core.io.RawReader`; peak workflow via `core.signal` + `core.stats` EMG | scaffold |
+| `constellation.electrophoresis` | Capillary electrophoresis — Fragment Analyzer + ProteoAnalyzer (`.raw`, same LabVIEW-derived big-endian format). Ladder calibration via `LadderSpec` registry; physically-grounded models (Slater–Noolandi, reptation) reserved for `electrophoresis.physics` | scaffold |
 | `constellation.models` | NN architectures assembled from `core.nn` | scaffold |
 | `constellation.cli` | `constellation <subcommand>` dispatcher; `doctor` wired, others stubbed | partial (`doctor` works) |
 | `constellation.thirdparty` | Tool discovery (`registry.find`); EncyclopeDIA adapter registered | partial |
@@ -128,6 +135,18 @@ ruff check .                    # lint
 - **Composition tensor dtype is int32.** Counts are always whole; `.mass`/`.average_mass` cast to float64 internally for the dot-product. Averaged "compositions" (mixtures) are a downstream concept and are NOT a `Composition`.
 - **Tolerance:** default fragment tolerance 20 ppm; functions accept `tolerance_unit` as `'ppm'` or `'Da'` (same as Cartographer).
 - **Sentinel values:** `-1.0` = "not observed" / "not set" for float fields; `-1` in intensity tensors flags loss-masked positions.
+
+## Companion-instrument data formats
+
+Reverse-engineered formats for the lab's bench-side analytical instruments. Authoritative format specs live in their respective reverse-engineering repos; the in-Constellation readers are clean rewrites that produce `core.io` Arrow schemas.
+
+| Instrument | File(s) | Format spec | Domain module |
+|---|---|---|---|
+| Agilent 1260 HPLC + DAD (OpenLab) | `<run>.dx` (OPC zip: `injection.acmd` XML manifest, `<uuid>.CH` Signal179 chromatograms, `<uuid>.IT` InstrumentTrace179 telemetry, `<uuid>.UV` + `.UVD` Spectra131 2D DAD matrix) | `~/projects/hplc_analysis/FORMAT_NOTES.md` | `constellation.chromatography.readers.agilent_dx` |
+| Agilent Fragment Analyzer (nucleic acid CE) | `<run>.raw` (1992 B big-endian header, 12-uint16 capillary table at 0x3E8, 1 Hz frames of 751×uint16 BE pixels) + companion `*.txt` / `*.ANAI` / `*.current` / `method.mthd` | `~/projects/analyzer_analysis/REPORT.md` | `constellation.electrophoresis.readers.agilent_fa` |
+| Agilent ProteoAnalyzer (protein CE) | Same `.raw` family as FA; lab cartridges are 12-capillary so constants match. PA-specific test fixture pending. | `~/projects/analyzer_analysis/REPORT.md` (§7) | `constellation.electrophoresis.readers.agilent_fa` (shared) |
+
+Adding a new bench-instrument format follows the same recipe: decode bytes (torch-native if little-endian, numpy boundary if big-endian), stamp `Trace1D` / `SpectraMatrix2D` / `PeakTable` schemas with `x.<domain>.*` metadata, register a `RawReader` subclass in the appropriate domain.
 
 ## Ports in flight
 
