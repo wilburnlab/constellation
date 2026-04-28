@@ -1,0 +1,73 @@
+{
+  "schema_version": "1",
+  "source": "Curated for Constellation. Chemistry sourced from Cartographer's neutral_losses dict (cartographer/masses.py); ion-type-only and K-Ub remnant losses excluded \u2014 those route through the IonType enum or LossRegistry.register_custom respectively.",
+  "neutral_losses": [
+    {
+      "id": "H2O",
+      "name": "Water loss",
+      "delta_composition": {
+        "H": 2,
+        "O": 1
+      },
+      "triggering_residues": [
+        "S",
+        "T",
+        "D",
+        "E"
+      ],
+      "triggering_mods": [],
+      "applies_to_ion_types": [],
+      "description": "Hydroxyl side-chain water loss \u2014 common from S/T/D/E containing fragments. Standard 18.011 Da neutral loss."
+    },
+    {
+      "id": "NH3",
+      "name": "Ammonia loss",
+      "delta_composition": {
+        "N": 1,
+        "H": 3
+      },
+      "triggering_residues": [
+        "K",
+        "R",
+        "N",
+        "Q"
+      ],
+      "triggering_mods": [],
+      "applies_to_ion_types": [],
+      "description": "Amine side-chain ammonia loss \u2014 common from K/R/N/Q containing fragments. Standard 17.027 Da neutral loss."
+    },
+    {
+      "id": "HPO3",
+      "name": "Metaphosphate loss",
+      "delta_composition": {
+        "H": 1,
+        "P": 1,
+        "O": 3
+      },
+      "triggering_residues": [],
+      "triggering_mods": [
+        "UNIMOD:21"
+      ],
+      "applies_to_ion_types": [],
+      "description": "Metaphosphate (HPO3, ~79.97 Da) loss from any phosphorylated residue (S/T/Y). Licensed by the presence of UNIMOD:21 (Phospho) anywhere in the fragment."
+    },
+    {
+      "id": "H3PO4",
+      "name": "Phosphoric acid loss",
+      "delta_composition": {
+        "H": 3,
+        "P": 1,
+        "O": 4
+      },
+      "triggering_residues": [
+        "S",
+        "T"
+      ],
+      "triggering_mods": [
+        "UNIMOD:21"
+      ],
+      "applies_to_ion_types": [],
+      "description": "Phosphoric acid (H3PO4, ~97.98 Da) loss via \u03b2-elimination from phospho-S or phospho-T. Requires the phospho mod to sit on an S or T residue inside the fragment (Y phospho cannot \u03b2-eliminate)."
+    }
+  ]
+}
