@@ -91,6 +91,21 @@ class Element:
             return sum(i.exact_mass * i.abundance for i in self.isotopes) / total_abun
         return self.monoisotopic_mass
 
+    def isotope_mass(self, mass_number: int) -> float:
+        """Exact NIST AME2020 mass of the isotope with the given mass number.
+
+        Used by ProForma global isotope labeling (`<13C>`, `<15N>`, `<D>`,
+        ...) to substitute the natural-abundance monoisotopic mass with a
+        specific isotope's exact mass. Raises ``KeyError`` if the element
+        has no isotope at that mass number.
+        """
+        for iso in self.isotopes:
+            if iso.mass_number == mass_number:
+                return iso.exact_mass
+        raise KeyError(
+            f"element {self.symbol!r} has no isotope with mass number {mass_number}"
+        )
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Feature tensor column layout

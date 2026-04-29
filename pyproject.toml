@@ -18,13 +18,24 @@ dependencies = [
     "scipy>=1.11",
     "pyarrow>=18",
     "regex>=2024.0",
+    # ProForma 2.0 grammar parser (HUPO-PSI standard). Used by
+    # core.sequence.proforma; see scripts/build-proforma-grammar.py.
+    "lark>=1.1,<2",
+    # MS file-format I/O (mzML/MGF) and ProForma cross-validation. Earns
+    # a base-tier slot because both core.sequence (interop tests) and
+    # massspec (mzML reads) depend on it. Per CLAUDE.md, pyteomics is
+    # still BANNED from being imported by core.sequence.proforma itself
+    # — the parser is independently implemented via lark + the upstream
+    # EBNF; pyteomics is only used for cross-validation in tests and the
+    # future mzML reader.
+    "pyteomics>=4.7",
 ]
 
 [project.optional-dependencies]
 # Modality extras: install the Python-wheel-available bits. Native
 # binaries (Thermo DLLs, EncyclopeDIA jar, mmseqs2, Dorado, ...) go
 # through `scripts/install-*.sh` and thirdparty/ adapters — not extras.
-ms         = ["pyteomics>=4.7", "requests", "koinapy"]
+ms         = ["requests", "koinapy"]
 sequencing = ["pod5>=0.3", "edlib", "parasail"]
 structure  = []  # OpenMM + PDBFixer are conda-only; guarded lazy-import in thirdparty/
 dynamics   = []  # same

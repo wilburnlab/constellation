@@ -13,12 +13,10 @@ from constellation.core.sequence.alphabets import (
     RNA_IUPAC,
 )
 from constellation.core.sequence.ops import (
-    format_modified_sequence,
     hamming_distance,
     identify_alphabet,
     kmerize,
     normalize,
-    parse_modified_sequence,
     sliding_window,
     validate,
 )
@@ -188,64 +186,5 @@ def test_hamming_degenerate_counts_as_mismatch():
     assert hamming_distance("AANT", "AAAT") == 1
 
 
-# ──────────────────────────────────────────────────────────────────────
-# parse_modified_sequence / format_modified_sequence
-# ──────────────────────────────────────────────────────────────────────
-
-
-def test_parse_no_mods():
-    seq, mods = parse_modified_sequence("PEPTIDE")
-    assert seq == "PEPTIDE"
-    assert mods == {}
-
-
-def test_parse_unimod_mod():
-    seq, mods = parse_modified_sequence("PEPC[UNIMOD:4]TIDE")
-    assert seq == "PEPCTIDE"
-    assert mods == {3: "UNIMOD:4"}
-
-
-def test_parse_mass_notation():
-    seq, mods = parse_modified_sequence("PEPC[+57.021]TIDE")
-    assert seq == "PEPCTIDE"
-    assert mods == {3: 57.021}
-
-
-def test_parse_n_terminal_mod():
-    seq, mods = parse_modified_sequence("[+42.011]MASTERPROTEIN")
-    assert seq == "MASTERPROTEIN"
-    assert mods == {0: 42.011}
-
-
-def test_parse_multiple_mods():
-    seq, mods = parse_modified_sequence("M[UNIMOD:35]AC[UNIMOD:4]E")
-    assert seq == "MACE"
-    assert mods == {0: "UNIMOD:35", 2: "UNIMOD:4"}
-
-
-def test_parse_unterminated_bracket_raises():
-    with pytest.raises(ValueError):
-        parse_modified_sequence("PEP[UNIMOD:4")
-
-
-def test_parse_format_round_trip_unimod():
-    original = "PEPC[UNIMOD:4]TIDE"
-    seq, mods = parse_modified_sequence(original)
-    assert format_modified_sequence(seq, mods) == original
-
-
-def test_format_no_mods_passthrough():
-    assert format_modified_sequence("PEPTIDE", {}) == "PEPTIDE"
-
-
-def test_format_mass_notation_signed():
-    """Float values format with explicit sign for parser-disambiguation."""
-    out = format_modified_sequence("PEPTIDE", {3: 15.99})
-    assert out == "PEPT[+15.990000]IDE"
-
-
-def test_parse_mass_notation_round_trip():
-    seq, mods = parse_modified_sequence("PEPT[+15.990000]IDE")
-    assert seq == "PEPTIDE"
-    assert isinstance(mods[3], float)
-    assert abs(mods[3] - 15.99) < 1e-9
+# Modified-sequence parsing now lives in core.sequence.proforma — see
+# tests/test_proforma.py for the ProForma 2.0 parse + round-trip suite.

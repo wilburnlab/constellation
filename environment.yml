@@ -43,6 +43,13 @@ dependencies:
     # PyTorch via pip (not the conda pytorch:: channel). The default
     # wheel on PyPI is CUDA-capable; it works on CPU-only machines too.
     - torch>=2.2
+    # ProForma 2.0 grammar parser (HUPO-PSI standard for modified
+    # peptide sequences). Used by core.sequence.proforma.
+    - lark>=1.1,<2
+    # MS file-format I/O (mzML/MGF) plus ProForma cross-validation in
+    # tests. Promoted from the [ms] extra to base because both
+    # core.sequence interop tests and massspec readers depend on it.
+    - pyteomics>=4.7
     # Koina API client (proteomics ML web service); caps the Python
     # ceiling at <3.13 together with PyTorch 2.5.x.
     - koinapy

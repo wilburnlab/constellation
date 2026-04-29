@@ -11,9 +11,11 @@ The cleavage rule registry is loaded from `constellation/data/proteases.json`
 at import time. Patterns are zero-width regex assertions identical in
 shape to pyteomics' `expasy_rules`, but pyteomics is not imported.
 
-`peptide_composition` returns a `core.chem.Composition`, so the caller
-gets monoisotopic mass, average mass, isotope envelopes, and Hill-formula
-formatting for free.
+`peptide_composition` and `peptide_mass` accept a `Peptidoform`
+(``core.sequence.proforma``); bare-sequence callers wrap one explicitly
+(``Peptidoform(sequence="PEPTIDE")``). Both return a `core.chem.Composition`
+or a float, so the caller gets monoisotopic mass, average mass, isotope
+envelopes, and Hill-formula formatting for free.
 """
 
 from __future__ import annotations
@@ -28,9 +30,17 @@ from typing import Literal
 import regex
 
 from constellation.core.chem.composition import Composition
+from constellation.core.chem.elements import ELEMENTS
 from constellation.core.chem.modifications import UNIMOD, ModVocab
 from constellation.core.sequence.alphabets import AA, requires_canonical
 from constellation.core.sequence.ops import validate
+from constellation.core.sequence.proforma import (
+    ModRef,
+    MultiPeptidoform,
+    Peptidoform,
+    TaggedMod,
+    parse_isotope_label,
+)
 
 # ──────────────────────────────────────────────────────────────────────
 # Protease dataclass + registry
@@ -319,76 +329,283 @@ def _length_ok(peptide: str, min_length: int, max_length: int | None) -> bool:
 
 _H2O: Composition = Composition.from_dict({"H": 2, "O": 1})
 
+# CV-shorthand aliases per ProForma §4.2 — `U:35` is shorthand for
+# `UNIMOD:35`. Used to resolve a ModRef into a vocab-lookup key.
+_CV_ALIASES = {"U": "UNIMOD", "M": "MOD", "R": "RESID", "X": "XLMOD", "G": "GNO"}
+
+
+def _modref_lookup_key(modref: ModRef) -> str:
+    """Build a vocab-lookup key from a CV/name ModRef."""
+    if modref.accession is not None:
+        cv = modref.cv or "UNIMOD"  # bare accession assumed UNIMOD per spec
+        cv = _CV_ALIASES.get(cv, cv)
+        return f"{cv}:{modref.accession}"
+    if modref.name is not None:
+        return modref.name
+    raise ValueError(f"ModRef has neither accession nor name: {modref!r}")
+
+
+def _is_bare_mass_delta(modref: ModRef) -> bool:
+    """True for ModRefs that carry only a mass delta (no CV / name /
+    formula / glycan / INFO payload) — these can't be resolved to a
+    composition and only contribute mass."""
+    return (
+        modref.mass_delta is not None
+        and modref.accession is None
+        and modref.name is None
+        and modref.formula is None
+        and modref.glycan is None
+        and modref.cv != "INFO"
+    )
+
+
+def _modref_contribution(
+    modref: ModRef,
+    vocab: ModVocab,
+    *,
+    monoisotopic: bool,
+) -> tuple[Composition, float]:
+    """Resolve a ModRef into (composition_delta, extra_mass_from_override).
+
+    - CV/name refs → vocab lookup; composition is the light-atom skeleton
+      and any ``mass_override`` correction lands in ``extra_mass``.
+    - Formula refs parse into Composition directly.
+    - Bare mass-delta refs contribute mass only (zero composition delta).
+    - INFO refs contribute nothing.
+    - Glycan refs raise NotImplementedError.
+    """
+    if modref.cv == "INFO":
+        return Composition.zeros(), 0.0
+    if modref.formula is not None:
+        return Composition.from_formula(modref.formula), 0.0
+    if modref.accession is not None or modref.name is not None:
+        mod = vocab.get(_modref_lookup_key(modref))
+        extra = 0.0
+        if mod.mass_override is not None and monoisotopic:
+            extra = mod.mass_override - mod.delta_composition.mass
+        return mod.delta_composition, extra
+    if modref.glycan is not None:
+        raise NotImplementedError(
+            f"glycan-payload mods ({modref.glycan!r}) are not yet resolved "
+            "to compositions; glycan dictionary support lands when a "
+            "concrete consumer arrives"
+        )
+    if modref.mass_delta is not None:
+        return Composition.zeros(), modref.mass_delta
+    raise ValueError(f"empty ModRef: {modref!r}")
+
+
+def _walk_modrefs(p: Peptidoform) -> Iterator[ModRef]:
+    """Yield each ModRef contributing to composition/mass exactly once.
+
+    Deduplicates by ``group_id`` — XL / ambiguity / branch groups share
+    one chemical entity across all anchor positions, so the contribution
+    counts once. Bare label references (``mod=None``) are skipped.
+
+    Excludes ``fixed_mods`` because their location-rule expansion depends
+    on per-residue overrides (handled separately at the call site).
+    """
+    seen: set[str] = set()
+
+    def _maybe_yield(tm: TaggedMod) -> Iterator[ModRef]:
+        if tm.mod is None:
+            return
+        if tm.group_id is not None:
+            if tm.group_id in seen:
+                return
+            seen.add(tm.group_id)
+        yield tm.mod
+
+    for tms in p.residue_mods.values():
+        for tm in tms:
+            yield from _maybe_yield(tm)
+    for tm in p.n_term_mods:
+        yield from _maybe_yield(tm)
+    for tm in p.c_term_mods:
+        yield from _maybe_yield(tm)
+    for mref in p.labile_mods:
+        yield mref
+    for mref, count in p.unknown_pos_mods:
+        for _ in range(count):
+            yield mref
+    for rng in p.ranges:
+        yield from rng.mods
+
+
+def _count_fixed_mod_locations(seq: str, loc: str, p: Peptidoform) -> int:
+    """Number of residues matching a fixed-mod location rule, skipping
+    positions already carrying an explicit mod (manual override wins per
+    ProForma §4.6.2).
+
+    Recognized location rules:
+
+        ``"*"``     → every residue (subject to override-skip)
+        single AA   → every residue of that letter
+        ``"N-term"``/``"C-term"`` → terminal slot if not occupied
+    """
+    if loc == "*":
+        return sum(1 for i in range(len(seq)) if i not in p.residue_mods)
+    if loc == "N-term":
+        return 0 if p.n_term_mods else 1
+    if loc == "C-term":
+        return 0 if p.c_term_mods else 1
+    if len(loc) == 1:
+        return sum(
+            1 for i, r in enumerate(seq) if r == loc and i not in p.residue_mods
+        )
+    raise ValueError(f"unsupported fixed-mod location: {loc!r}")
+
+
+def _residue_index_check(p: Peptidoform) -> None:
+    n = len(p.sequence)
+    for pos in p.residue_mods:
+        if not 0 <= pos < n:
+            raise IndexError(
+                f"modification index {pos} out of range for length-{n} peptide"
+            )
+
 
 @requires_canonical
 def peptide_composition(
-    seq: str,
+    peptidoform: Peptidoform,
     *,
-    modifications: Mapping[int, str] | None = None,
     vocab: ModVocab = UNIMOD,
 ) -> Composition:
-    """Sum residue compositions + terminal H₂O (+ modification deltas).
+    """Sum residue compositions + terminal H₂O + every modification's
+    composition delta into a single ``Composition``.
 
-    `modifications` maps residue index → modification key (UNIMOD id or
-    alias). Each key is looked up in `vocab` (default: full UNIMOD)
-    and its `delta_composition` is added to the running sum. Heavy-isotope
-    mods (those with `mass_override` set) contribute the **light-atom
-    skeleton** here — `peptide_mass` resolves the canonical mass.
+    Modification handling:
 
-    Raises KeyError for residues outside the canonical AA alphabet or
-    modification ids not in `vocab`.
+    - Residue mods, terminal mods, labile mods, unknown-position mods
+      (multiplied by their count), range mods, and fixed mods all
+      contribute their ``delta_composition``.
+    - Cross-link / ambiguity / branch groups (TaggedMod ``group_id``)
+      contribute exactly once across all anchor positions — the chemistry
+      is shared between participants.
+    - Heavy-isotope modifications (``mass_override``) contribute the
+      *light-atom skeleton*; ``peptide_mass`` resolves the canonical mass.
+    - Global isotope labels (``<13C>``, ``<15N>``, ...) contribute zero
+      composition; they shift mass only and are handled in ``peptide_mass``.
+
+    Raises:
+
+    - ``KeyError`` for residues outside canonical AA or unknown vocab keys.
+    - ``ValueError`` for ModRefs that carry only a bare mass delta (no
+      composition info available — call ``peptide_mass`` instead).
+    - ``IndexError`` for residue-mod positions outside the sequence.
+    - ``NotImplementedError`` for ``MultiPeptidoform`` inputs (iterate
+      ``.chains`` for per-chain compositions) and for glycan-payload mods.
     """
+    if isinstance(peptidoform, MultiPeptidoform):
+        raise NotImplementedError(
+            "joint multi-chain composition is not yet supported; iterate "
+            "peptidoform.chains for per-chain compositions"
+        )
+
+    seq = peptidoform.sequence
     validate(seq, AA)
     assert AA.compositions is not None  # canonical alphabet always carries them
+    _residue_index_check(peptidoform)
+
     comp = Composition.zeros()
     for residue in seq:
         comp = comp + AA.compositions[residue]
     comp = comp + _H2O
-    if modifications:
-        for idx, mod_key in modifications.items():
-            if not 0 <= idx < len(seq):
-                raise IndexError(
-                    f"modification index {idx} out of range for length-{len(seq)} peptide"
-                )
-            mod = vocab.get(mod_key)
-            comp = comp + mod.delta_composition
+
+    for modref in _walk_modrefs(peptidoform):
+        if _is_bare_mass_delta(modref):
+            raise ValueError(
+                f"cannot derive composition from bare mass-delta ModRef "
+                f"({modref.mass_delta:+f}) — peptide_mass accepts mass-only "
+                "mods, but peptide_composition needs a UNIMOD/name/formula "
+                "payload to determine element counts"
+            )
+        d_comp, _ = _modref_contribution(modref, vocab, monoisotopic=True)
+        comp = comp + d_comp
+
+    for modref, locations in peptidoform.fixed_mods:
+        d_comp, _ = _modref_contribution(modref, vocab, monoisotopic=True)
+        for loc in locations:
+            count = _count_fixed_mod_locations(seq, loc, peptidoform)
+            if count:
+                comp = comp + d_comp * count
+
     return comp
 
 
 @requires_canonical
 def peptide_mass(
-    seq: str,
+    peptidoform: Peptidoform,
     *,
-    modifications: Mapping[int, str] | None = None,
     monoisotopic: bool = True,
     vocab: ModVocab = UNIMOD,
 ) -> float:
-    """Monoisotopic (default) or standard-weight mass of a peptide.
+    """Monoisotopic (default) or standard-weight mass of a peptidoform.
 
-    For heavy-isotope modifications the light-skeleton `delta_composition`
-    underestimates the canonical mass; this function adds the difference
-    (`mod.mass_override - mod.delta_composition.mass`) on top so the
-    result matches the conventional UNIMOD value.
+    Aggregates: residue + terminal-water masses + every modification's
+    canonical mass contribution + global-isotope label corrections.
+
+    Heavy-isotope modifications (``mass_override``) and global isotope
+    labels (``<13C>``) only adjust the result in ``monoisotopic=True``
+    mode — average-mass calculations operate on standard atomic weights,
+    where these distinctions are not meaningful.
     """
-    comp = peptide_composition(seq, modifications=modifications, vocab=vocab)
+    if isinstance(peptidoform, MultiPeptidoform):
+        raise NotImplementedError(
+            "joint multi-chain mass is not yet supported; iterate "
+            "peptidoform.chains for per-chain masses"
+        )
+
+    seq = peptidoform.sequence
+    validate(seq, AA)
+    assert AA.compositions is not None
+    _residue_index_check(peptidoform)
+
+    comp = Composition.zeros()
+    for residue in seq:
+        comp = comp + AA.compositions[residue]
+    comp = comp + _H2O
+
+    extra_mass = 0.0
+    for modref in _walk_modrefs(peptidoform):
+        d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=monoisotopic)
+        comp = comp + d_comp
+        extra_mass += d_mass
+
+    for modref, locations in peptidoform.fixed_mods:
+        d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=monoisotopic)
+        for loc in locations:
+            count = _count_fixed_mod_locations(seq, loc, peptidoform)
+            if count:
+                comp = comp + d_comp * count
+                extra_mass += d_mass * count
+
     base = comp.mass if monoisotopic else comp.average_mass
-    if not modifications:
-        return base
-    # Apply heavy-isotope corrections for any mod with a mass_override.
-    delta = 0.0
-    for mod_key in modifications.values():
-        mod = vocab.get(mod_key)
-        if mod.mass_override is not None and monoisotopic:
-            delta += mod.mass_override - mod.delta_composition.mass
-    return base + delta
+
+    if peptidoform.global_isotopes:
+        if not monoisotopic:
+            raise ValueError(
+                "global isotope labels are only meaningful in monoisotopic "
+                "mode — pass monoisotopic=True or strip global_isotopes"
+            )
+        atoms = comp.atoms
+        for label in peptidoform.global_isotopes:
+            mass_n, sym = parse_isotope_label(label)
+            atom_count = atoms.get(sym, 0)
+            if atom_count == 0:
+                continue
+            elem = ELEMENTS[sym]
+            extra_mass += (elem.isotope_mass(mass_n) - elem.monoisotopic_mass) * atom_count
+
+    return base + extra_mass
 
 
 @requires_canonical
 def protein_composition(seq: str) -> Composition:
     """Unmodified peptide composition — equivalent to
-    `peptide_composition(seq)` but documents intent for whole-protein
-    callers."""
-    return peptide_composition(seq)
+    ``peptide_composition(Peptidoform(sequence=seq))`` but documents
+    intent for whole-protein callers."""
+    return peptide_composition(Peptidoform(sequence=seq))
 
 
 __all__ = [

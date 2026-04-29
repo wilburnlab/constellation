@@ -26,6 +26,7 @@ import constellation.core.sequence
 import constellation.core.sequence.alphabets
 import constellation.core.sequence.nucleic
 import constellation.core.sequence.ops
+import constellation.core.sequence.proforma
 import constellation.core.sequence.protein
 import constellation.core.stats
 import constellation.core.stats.calibration

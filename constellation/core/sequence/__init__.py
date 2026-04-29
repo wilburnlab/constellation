@@ -14,8 +14,11 @@ Modules:
                   compositions, degeneracy expansion + complement tables,
                   `requires_canonical` / `degenerate_ok` decorators.
     ops         - identify_alphabet, validate, normalize, kmerize,
-                  sliding_window, hamming_distance,
-                  parse_modified_sequence / format_modified_sequence.
+                  sliding_window, hamming_distance.
+    proforma    - HUPO-PSI ProForma 2.0 modseq parser/formatter:
+                  parse_proforma / format_proforma + Peptidoform /
+                  MultiPeptidoform / ModRef / TaggedMod / Range
+                  dataclasses; covers all 6 spec compliance levels.
     nucleic     - reverse_complement, complement, CodonTable + 7 NCBI
                   tables, translate (degenerate-codon-aware, pluggable
                   table), find_orfs / best_orf, gc_content.
@@ -59,14 +62,28 @@ from constellation.core.sequence.nucleic import (
     translate,
 )
 from constellation.core.sequence.ops import (
-    format_modified_sequence,
     hamming_distance,
     identify_alphabet,
     kmerize,
     normalize,
-    parse_modified_sequence,
     sliding_window,
     validate,
+)
+from constellation.core.sequence.proforma import (
+    ModRef,
+    MultiPeptidoform,
+    Peptidoform,
+    ProFormaError,
+    ProFormaResult,
+    ProFormaSemanticError,
+    ProFormaSyntaxError,
+    Range,
+    TaggedMod,
+    _has_branches,
+    _has_crosslinks,
+    format_proforma,
+    parse_isotope_label,
+    parse_proforma,
 )
 from constellation.core.sequence.protein import (
     PROTEASES,
@@ -109,8 +126,21 @@ __all__ = [
     "kmerize",
     "sliding_window",
     "hamming_distance",
-    "parse_modified_sequence",
-    "format_modified_sequence",
+    # proforma
+    "ProFormaError",
+    "ProFormaSyntaxError",
+    "ProFormaSemanticError",
+    "ModRef",
+    "TaggedMod",
+    "Range",
+    "Peptidoform",
+    "MultiPeptidoform",
+    "ProFormaResult",
+    "parse_proforma",
+    "format_proforma",
+    "parse_isotope_label",
+    "_has_crosslinks",
+    "_has_branches",
     # nucleic
     "complement",
     "reverse_complement",

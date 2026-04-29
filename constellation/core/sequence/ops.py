@@ -2,15 +2,14 @@
 
 Functions here operate on `str` sequences against an `Alphabet` of any
 kind. Alphabet-specific math (translation, ORFs, cleavage) lives in
-`nucleic.py` and `protein.py`. Modified-sequence parsing lives here
-because the bracket syntax (``S[UNIMOD:21]``) is the same shape across
-alphabets — protein, nucleic, or hypothetical extension.
+`nucleic.py` and `protein.py`. ProForma 2.0 modseq parsing lives in
+``constellation.core.sequence.proforma`` (peptide-only by spec; nucleic
+modifications get a sibling module when nanopore detection lands).
 """
 
 from __future__ import annotations
 
-import re
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator
 
 from constellation.core.sequence.alphabets import (
     AA,
@@ -137,118 +136,6 @@ def hamming_distance(a: str, b: str) -> int:
     return sum(1 for x, y in zip(a, b) if x != y)
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Modified-sequence bracket notation (alphabet-agnostic)
-# ──────────────────────────────────────────────────────────────────────
-
-# Mass-notation form: "[+15.994]" or "[-17.027]". The leading sign is
-# required to disambiguate it from string keys like "UNIMOD:35" or "Ox".
-_MASS_NOTATION_RE = re.compile(r"^[+-][0-9]")
-
-
-@degenerate_ok
-def parse_modified_sequence(modseq: str) -> tuple[str, dict[int, str | float]]:
-    """Decompose a bracket-annotated sequence into `(sequence, mods)`.
-
-    Recognized bracket payloads:
-        ``UNIMOD:N``  → kept as ``"UNIMOD:N"`` (str)
-        ``+N.NNN`` / ``-N.NNN``  → kept as float (signed delta in Da)
-        anything else (e.g. ``Ox``, ``Phospho``)  → kept as the literal str;
-            the caller can resolve via UNIMOD aliases if needed.
-
-    The mod dict is keyed by **0-indexed position in the stripped
-    sequence** — the position of the residue the modification attaches
-    to. N-terminal mods (`[Acetyl]MASTERPROTEIN`) attach to position 0;
-    C-terminal mods attach to the last position.
-
-    Examples:
-        parse_modified_sequence("PEPC[UNIMOD:4]TIDE")
-            → ("PEPCTIDE", {3: "UNIMOD:4"})
-
-        parse_modified_sequence("[+42.011]MASTERPROTEIN")
-            → ("MASTERPROTEIN", {0: 42.011})
-
-        parse_modified_sequence("PEPTIDE")  # no mods
-            → ("PEPTIDE", {})
-    """
-    sequence_chars: list[str] = []
-    modifications: dict[int, str | float] = {}
-    i = 0
-    n = len(modseq)
-    while i < n:
-        c = modseq[i]
-        if c == "[":
-            end = modseq.find("]", i + 1)
-            if end == -1:
-                raise ValueError(
-                    f"unterminated '[' at position {i} in {modseq!r}"
-                )
-            payload = modseq[i + 1 : end]
-            # Position is the index of the residue this mod attaches to.
-            # If the bracket is at the very start, attach to position 0
-            # (the N-terminal residue, once it appears). If the bracket
-            # follows a residue, attach to that residue's stripped index.
-            attach = max(0, len(sequence_chars) - 1) if sequence_chars else 0
-            value: str | float
-            if _MASS_NOTATION_RE.match(payload):
-                value = float(payload)
-            else:
-                value = payload
-            # If multiple mods land on the same index, merge into a list.
-            existing = modifications.get(attach)
-            if existing is None:
-                modifications[attach] = value
-            elif isinstance(existing, list):
-                existing.append(value)  # type: ignore[arg-type]
-            else:
-                modifications[attach] = [existing, value]  # type: ignore[assignment]
-            i = end + 1
-        else:
-            sequence_chars.append(c)
-            i += 1
-    return "".join(sequence_chars), modifications
-
-
-@degenerate_ok
-def format_modified_sequence(
-    sequence: str,
-    modifications: Mapping[int, str | float],
-) -> str:
-    """Inverse of `parse_modified_sequence`. Mods on a given index are
-    inserted as ``[payload]`` *after* that residue. Position 0 is the
-    one exception — if a mod attaches to position 0 *and* the sequence
-    is non-empty, it still emits after the first residue (matching the
-    parse rule above)."""
-    if not modifications:
-        return sequence
-    parts: list[str] = []
-    for i, c in enumerate(sequence):
-        parts.append(c)
-        if i in modifications:
-            payload = modifications[i]
-            if isinstance(payload, list):
-                for item in payload:
-                    parts.append(f"[{_format_mod_payload(item)}]")
-            else:
-                parts.append(f"[{_format_mod_payload(payload)}]")
-    # Mods at indices past the sequence are tolerated by the parser
-    # (they attach to the last residue) but format-time we just append.
-    for i, payload in modifications.items():
-        if i >= len(sequence):
-            if isinstance(payload, list):
-                for item in payload:
-                    parts.append(f"[{_format_mod_payload(item)}]")
-            else:
-                parts.append(f"[{_format_mod_payload(payload)}]")
-    return "".join(parts)
-
-
-def _format_mod_payload(value: str | float) -> str:
-    if isinstance(value, str):
-        return value
-    return f"{value:+f}"
-
-
 __all__ = [
     "identify_alphabet",
     "validate",
@@ -256,6 +143,4 @@ __all__ = [
     "kmerize",
     "sliding_window",
     "hamming_distance",
-    "parse_modified_sequence",
-    "format_modified_sequence",
 ]

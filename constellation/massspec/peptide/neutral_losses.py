@@ -218,9 +218,12 @@ def loss_applies(
     `ion_type_name` is the canonical name of the IonType ("B", "Y", ...).
     `fragment_residues` is the bare-residue token sequence inside the
     fragment (e.g. ["P", "E", "P"] for b3 of PEPTIDE).
-    `fragment_mods` is `{fragment_relative_index: mod_key_or_list}` where
-    each value is the modification key (UNIMOD id, alias, or float delta)
-    `core.sequence.ops.parse_modified_sequence` produces.
+    `fragment_mods` is ``{fragment_relative_index: mod_id_or_list}`` where
+    each value is a canonical modification id (e.g. ``"UNIMOD:21"``) — the
+    ladder driver in ``massspec.peptide.ions`` builds this from
+    ``Peptidoform`` ``TaggedMod``s by resolving each to its UNIMOD id.
+    Mods that don't resolve (bare mass deltas, glycan payloads) are simply
+    omitted; they can't trigger UNIMOD-keyed losses by definition.
     """
     if loss.applies_to_ion_types and ion_type_name not in loss.applies_to_ion_types:
         return False

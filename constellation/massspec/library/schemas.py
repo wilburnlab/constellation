@@ -42,7 +42,10 @@ PROTEIN_TABLE: pa.Schema = pa.schema(
     [
         pa.field("protein_id", pa.int64(), nullable=False),
         pa.field("accession", pa.string(), nullable=False),
-        pa.field("sequence", pa.string(), nullable=False),
+        # Nullable: EncyclopeDIA dlib files don't always carry the
+        # parent-protein sequence. Constellation-side library construction
+        # populates it whenever available; downstream code must tolerate null.
+        pa.field("sequence", pa.string(), nullable=True),
         pa.field("description", pa.string(), nullable=True),
     ],
     metadata={b"schema_name": b"ProteinTable"},
@@ -54,8 +57,9 @@ PEPTIDE_TABLE: pa.Schema = pa.schema(
         pa.field("peptide_id", pa.int64(), nullable=False),
         # Canonical-stripped (e.g. "PEPTIDE")
         pa.field("sequence", pa.string(), nullable=False),
-        # Bracket form, parse_modified_sequence-compatible
-        # (e.g. "PEP[UNIMOD:4]TIDE"); equals sequence when unmodified.
+        # ProForma 2.0 string (HUPO-PSI Final draft 15, Feb 2022). Round-tripped
+        # via core.sequence.proforma.parse_proforma / format_proforma. Equals
+        # ``sequence`` when unmodified.
         pa.field("modified_sequence", pa.string(), nullable=False),
     ],
     metadata={b"schema_name": b"PeptideTable"},

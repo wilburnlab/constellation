@@ -38,6 +38,10 @@ import pyarrow.compute as pc
 
 from constellation.core.graph.network import Network
 from constellation.core.io.schemas import cast_to_schema
+from constellation.core.sequence.proforma import (
+    ProFormaSyntaxError,
+    parse_proforma,
+)
 from constellation.massspec.library.schemas import (
     LIBRARY_FRAGMENT_TABLE,
     PEPTIDE_TABLE,
@@ -327,12 +331,13 @@ def assign_ids(
 ) -> Library:
     """Build a ``Library`` from records keyed by symbolic identifiers.
 
-    ``proteins``    rows with at least ``accession``, ``sequence``;
-                    optional ``description``. ``protein_id`` is assigned
-                    sequentially in input order.
-    ``peptides``    rows with at least ``modified_sequence``; ``sequence``
-                    auto-derived as the bracket-stripped form when
-                    omitted. Symbolic key = ``modified_sequence``.
+    ``proteins``    rows with at least ``accession``; optional ``sequence``
+                    (nullable per PROTEIN_TABLE) and ``description``.
+                    ``protein_id`` is assigned sequentially in input order.
+    ``peptides``    rows with at least ``modified_sequence`` (a ProForma
+                    2.0 string); ``sequence`` auto-derived via
+                    ``parse_proforma(modseq).sequence`` when omitted.
+                    Symbolic key = ``modified_sequence``.
     ``precursors``  rows with ``modified_sequence`` (or ``peptide_key``),
                     ``charge``, ``precursor_mz``; optional
                     ``rt_predicted`` / ``ccs_predicted`` (default -1.0).
@@ -350,7 +355,7 @@ def assign_ids(
         {
             "protein_id": i,
             "accession": p["accession"],
-            "sequence": p["sequence"],
+            "sequence": p.get("sequence"),
             "description": p.get("description"),
         }
         for i, p in enumerate(proteins)
@@ -361,7 +366,14 @@ def assign_ids(
     modseq_to_id: dict[str, int] = {}
     for i, k in enumerate(peptides):
         modseq = k["modified_sequence"]
-        seq = k.get("sequence") or _strip_brackets(modseq)
+        seq = k.get("sequence")
+        if seq is None:
+            try:
+                seq = parse_proforma(modseq).sequence
+            except ProFormaSyntaxError as exc:
+                raise ValueError(
+                    f"modified_sequence {modseq!r} is not valid ProForma 2.0: {exc}"
+                ) from exc
         peptides_rows.append(
             {"peptide_id": i, "sequence": seq, "modified_sequence": modseq}
         )
@@ -423,27 +435,6 @@ def _to_table(rows: Sequence[dict[str, Any]], schema: pa.Schema) -> pa.Table:
     if not rows:
         return schema.empty_table()
     return pa.Table.from_pylist(list(rows), schema=schema)
-
-
-def _strip_brackets(modseq: str) -> str:
-    """Strip ``[...]`` modification annotations from a modified sequence.
-
-    Cheap implementation; ``parse_modified_sequence`` is the canonical
-    parser, but for ``assign_ids`` we only need the residue sequence,
-    not the position table.
-    """
-    out: list[str] = []
-    depth = 0
-    for ch in modseq:
-        if ch == "[":
-            depth += 1
-            continue
-        if ch == "]":
-            depth -= 1
-            continue
-        if depth == 0:
-            out.append(ch)
-    return "".join(out)
 
 
 __all__ = ["Library", "assign_ids"]

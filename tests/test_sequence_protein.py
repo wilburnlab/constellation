@@ -256,26 +256,33 @@ def test_cleave_semi_specific_emits_n_terminal_truncations():
 # ──────────────────────────────────────────────────────────────────────
 
 
+def _pf(modseq: str):
+    """Tiny shim: parse a ProForma string into a Peptidoform for tests."""
+    from constellation.core.sequence.proforma import parse_proforma
+
+    return parse_proforma(modseq)
+
+
 def test_peptide_composition_returns_composition():
-    comp = peptide_composition("PEPTIDE")
+    comp = peptide_composition(_pf("PEPTIDE"))
     assert isinstance(comp, Composition)
 
 
 def test_peptide_composition_includes_terminal_water():
     """Composition should equal sum(residues) + H2O. PEPTIDE with terminal
     H2O is C34H53N7O15."""
-    comp = peptide_composition("PEPTIDE")
+    comp = peptide_composition(_pf("PEPTIDE"))
     assert comp.atoms == {"C": 34, "H": 53, "N": 7, "O": 15}
 
 
 def test_peptide_mass_peptide_anchor():
     """PEPTIDE monoisotopic mass = 799.35996 (ExPASy reference)."""
-    assert abs(peptide_mass("PEPTIDE") - 799.35996) < 1e-3
+    assert abs(peptide_mass(_pf("PEPTIDE")) - 799.35996) < 1e-3
 
 
 def test_peptide_mass_glycine_alone():
     """Single G + H2O = 75.03203 (free glycine)."""
-    assert abs(peptide_mass("G") - 75.032028) < 1e-3
+    assert abs(peptide_mass(_pf("G")) - 75.032028) < 1e-3
 
 
 @pytest.mark.parametrize(
@@ -290,70 +297,80 @@ def test_peptide_mass_glycine_alone():
 )
 def test_peptide_mass_known_values(seq: str, expected_mass: float):
     """Cross-check against published peptide masses (ExPASy values)."""
-    assert abs(peptide_mass(seq) - expected_mass) < 1e-2
+    assert abs(peptide_mass(_pf(seq)) - expected_mass) < 1e-2
 
 
 def test_peptide_mass_modification_oxidation():
     """Adding UNIMOD:35 (oxidation) on M shifts mass by +15.994915."""
-    plain = peptide_mass("PEPTIDEM")
-    oxed = peptide_mass("PEPTIDEM", modifications={7: "UNIMOD:35"})
+    plain = peptide_mass(_pf("PEPTIDEM"))
+    oxed = peptide_mass(_pf("PEPTIDEM[UNIMOD:35]"))
     assert abs((oxed - plain) - 15.994915) < 1e-5
 
 
 def test_peptide_mass_modification_phospho():
-    plain = peptide_mass("PEPTIDES")
-    phos = peptide_mass("PEPTIDES", modifications={7: "UNIMOD:21"})
+    plain = peptide_mass(_pf("PEPTIDES"))
+    phos = peptide_mass(_pf("PEPTIDES[UNIMOD:21]"))
     assert abs((phos - plain) - 79.966331) < 1e-5
 
 
 def test_peptide_mass_tmt10_heavy_isotope():
     """TMT10 (UNIMOD:737) carries 4 13C + 1 15N — mass_override path
     must apply, giving the canonical 229.162932 delta."""
-    plain = peptide_mass("PEPTIDEK")
-    tmt = peptide_mass("PEPTIDEK", modifications={7: "UNIMOD:737"})
+    plain = peptide_mass(_pf("PEPTIDEK"))
+    tmt = peptide_mass(_pf("PEPTIDEK[UNIMOD:737]"))
     assert abs((tmt - plain) - 229.162932) < 1e-4
 
 
 def test_peptide_mass_multiple_modifications():
-    """Two mods apply independently."""
+    """Two mods apply independently — compare same-residue-letter peptidoforms."""
     delta_ox = 15.994915
     delta_ph = 79.966331
-    plain = peptide_mass("PEPTIMES")
-    both = peptide_mass(
-        "PEPTIMES",
-        modifications={4: "UNIMOD:35", 7: "UNIMOD:21"},
-    )
+    plain = peptide_mass(_pf("PEPTMES"))
+    both = peptide_mass(_pf("PEPTM[UNIMOD:35]ES[UNIMOD:21]"))
     assert abs((both - plain) - (delta_ox + delta_ph)) < 1e-5
 
 
 def test_peptide_mass_alias_resolves():
     """UNIMOD aliases ('Ox', 'Phospho') route through the vocab."""
-    by_id = peptide_mass("PEPTIDEM", modifications={7: "UNIMOD:35"})
-    by_alias = peptide_mass("PEPTIDEM", modifications={7: "Ox"})
+    by_id = peptide_mass(_pf("PEPTIDEM[UNIMOD:35]"))
+    by_alias = peptide_mass(_pf("PEPTIDEM[Oxidation]"))
     assert abs(by_id - by_alias) < 1e-9
 
 
 def test_peptide_mass_unknown_modification_raises():
     with pytest.raises(KeyError):
-        peptide_mass("PEPTIDEM", modifications={7: "UNIMOD:99999999"})
+        peptide_mass(_pf("PEPTIDEM[UNIMOD:99999999]"))
 
 
 def test_peptide_mass_modification_index_out_of_range_raises():
+    """Manual Peptidoform construction with an out-of-range mod index."""
+    from constellation.core.sequence.proforma import (
+        ModRef,
+        Peptidoform,
+        TaggedMod,
+    )
+
+    bad = Peptidoform(
+        sequence="PEPTIDE",
+        residue_mods={
+            99: (TaggedMod(mod=ModRef(cv="UNIMOD", accession="35")),),
+        },
+    )
     with pytest.raises(IndexError):
-        peptide_mass("PEPTIDE", modifications={99: "UNIMOD:35"})
+        peptide_mass(bad)
 
 
 def test_peptide_mass_average_mass_path():
     """Average-mass path uses Composition.average_mass; for PEPTIDE the
     expected average is 799.83 (1 sig dig past the decimal is enough
     given standard atomic weights)."""
-    avg = peptide_mass("PEPTIDE", monoisotopic=False)
+    avg = peptide_mass(_pf("PEPTIDE"), monoisotopic=False)
     assert abs(avg - 799.83) < 0.5
 
 
 def test_protein_composition_alias_of_peptide_composition():
     a = protein_composition("MASTER")
-    b = peptide_composition("MASTER")
+    b = peptide_composition(_pf("MASTER"))
     assert a == b
 
 
@@ -366,7 +383,7 @@ def test_peptide_composition_feeds_isotope_envelope():
     """peptide_composition → core.chem.isotope_envelope works end-to-end."""
     from constellation.core.chem.isotopes import isotope_envelope
 
-    comp = peptide_composition("PEPTIDE")
+    comp = peptide_composition(_pf("PEPTIDE"))
     masses, intens = isotope_envelope(comp, n_peaks=5)
     assert masses.shape == (5,)
     assert intens.shape == (5,)

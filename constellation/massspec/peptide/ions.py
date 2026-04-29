@@ -12,17 +12,23 @@ different convention is just a matter of writing the right Composition.
 The z-ion offset corresponds to the radical (z•) form. For z+1 (z•+H),
 add a hydrogen mass at the call site.
 
-Ladder generation (`fragment_ladder`) returns both an Arrow table
-(canonical, storage / round-trip / inspection) and a tensor of shape
-`(n_pos, n_ion_types, n_charges, n_losses+1)` (vmap-compatible hot path
-for scoring). Loss-validity rules from `peptide.neutral_losses` mask
-biochemically invalid ions with NaN in the tensor and omit them from
-the Arrow table.
+`fragment_ladder` is a dispatcher: linear peptides flow through
+`_linear_fragment_ladder`, while cross-linked, branched, and multi-chain
+peptidoforms route to dedicated backends (currently NotImplementedError
+stubs that document scope). The dispatcher keeps the public API stable
+across XL-MS / branch / multichain support landing in future PRs.
+
+Ladder generation returns both an Arrow table (canonical, storage /
+round-trip / inspection) and a tensor of shape
+``(n_pos, n_ion_types, n_charges, n_losses+1)`` (vmap-compatible hot
+path for scoring). Loss-validity rules from `peptide.neutral_losses`
+mask biochemically invalid ions with NaN in the tensor and omit them
+from the Arrow table.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 
@@ -30,9 +36,25 @@ import pyarrow as pa
 import torch
 
 from constellation.core.chem.composition import Composition
+from constellation.core.chem.elements import ELEMENTS
 from constellation.core.chem.modifications import UNIMOD, ModVocab
 from constellation.core.sequence.alphabets import AA, requires_canonical
 from constellation.core.sequence.ops import validate
+from constellation.core.sequence.proforma import (
+    ModRef,
+    MultiPeptidoform,
+    Peptidoform,
+    ProFormaResult,
+    _has_branches,
+    _has_crosslinks,
+    parse_isotope_label,
+)
+from constellation.core.sequence.protein import (
+    _CV_ALIASES,
+    _count_fixed_mod_locations,
+    _modref_contribution,
+    _modref_lookup_key,
+)
 from constellation.massspec.peptide.mz import PROTON_MASS
 from constellation.massspec.peptide.neutral_losses import LOSS_REGISTRY, loss_applies
 from constellation.massspec.schemas import FRAGMENT_ION_TABLE
@@ -131,49 +153,85 @@ def fragment_mz(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Helpers for modification handling
+# Helpers — global isotope / fixed-mod expansion / canonical mod ids
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _iter_mod_keys(value: object):
-    """Yield mod keys from a single value or a list-of-values
-    (`parse_modified_sequence` may return either)."""
-    if isinstance(value, list):
-        yield from value
-    else:
-        yield value
+def _isotope_shift_for_composition(
+    comp: Composition, isotopes: tuple[str, ...]
+) -> float:
+    """Total mass shift when applying global isotope labels to ``comp``.
 
-
-def _mod_delta_mass(value: object, vocab: ModVocab) -> float:
-    """Sum canonical delta masses across one or more mods at a position.
-
-    Strings resolve through the vocabulary (UNIMOD ids or aliases). Floats
-    are interpreted as direct mass deltas in Da (mass-notation form from
-    `parse_modified_sequence`). Anything else raises.
+    Each label substitutes the natural-abundance monoisotopic mass with
+    the requested isotope's exact mass for every atom of that element.
+    Stacked labels (``<13C><15N>``) are additive.
     """
+    if not isotopes:
+        return 0.0
+    atoms = comp.atoms
     total = 0.0
-    for k in _iter_mod_keys(value):
-        if isinstance(k, str):
-            total += vocab.get(k).delta_mass
-        elif isinstance(k, (int, float)):
-            total += float(k)
-        else:
-            raise TypeError(
-                f"unsupported modification value: {k!r} ({type(k).__name__})"
-            )
+    for label in isotopes:
+        mass_n, sym = parse_isotope_label(label)
+        n_atoms = atoms.get(sym, 0)
+        if n_atoms == 0:
+            continue
+        elem = ELEMENTS[sym]
+        total += n_atoms * (elem.isotope_mass(mass_n) - elem.monoisotopic_mass)
     return total
 
 
+def _modref_canonical_id(modref: ModRef, vocab: ModVocab) -> str | None:
+    """Canonical mod id used by ``loss_applies`` triggering checks.
+
+    Returns ``None`` for ModRefs that don't resolve through the vocab
+    (formula-only, glycan, mass-delta-only, INFO) — those mods simply
+    can't trigger UNIMOD-keyed losses, which is the correct behavior.
+    """
+    if modref.cv == "INFO":
+        return None
+    if modref.accession is not None:
+        cv = modref.cv or "UNIMOD"
+        cv = _CV_ALIASES.get(cv, cv)
+        return f"{cv}:{modref.accession}"
+    if modref.name is not None:
+        try:
+            return vocab.get(_modref_lookup_key(modref)).id
+        except KeyError:
+            return None
+    return None
+
+
+def _iter_fixed_mod_residue_indices(
+    seq: str, location: str, p: Peptidoform
+) -> list[int]:
+    """Residue indices a fixed-mod location rule expands to (excluding
+    positions with explicit residue mods, which override per spec §4.6.2).
+
+    Returns an empty list for terminal locations (those go through
+    ``n_term_extra`` / ``c_term_extra`` in the linear backend, not
+    per-residue arrays).
+    """
+    if location in ("N-term", "C-term"):
+        return []
+    if location == "*":
+        return [i for i in range(len(seq)) if i not in p.residue_mods]
+    if len(location) == 1:
+        return [
+            i
+            for i, r in enumerate(seq)
+            if r == location and i not in p.residue_mods
+        ]
+    raise ValueError(f"unsupported fixed-mod location: {location!r}")
+
+
 # ──────────────────────────────────────────────────────────────────────
-# Fragment-ladder driver
+# Fragment-ladder dispatcher + backends
 # ──────────────────────────────────────────────────────────────────────
 
 
-@requires_canonical
 def fragment_ladder(
-    seq: str,
+    peptidoform: ProFormaResult,
     *,
-    modifications: Mapping[int, object] | None = None,
     ion_types: Sequence[IonType] = (IonType.B, IonType.Y),
     max_fragment_charge: int = 1,
     neutral_losses: Sequence[str] | None = None,
@@ -182,34 +240,71 @@ def fragment_ladder(
     peptide_idx: int | None = None,
     include_peptide_seq: bool = True,
 ) -> tuple[pa.Table, torch.Tensor | None]:
-    """Generate the fragment-ion ladder for a (modified) peptide.
+    """Generate the fragment-ion ladder for a peptidoform.
 
-    Returns ``(table, tensor)``:
+    Routes by topology:
+
+      * ``MultiPeptidoform`` (//-separated chains) → ``_multichain_fragment_ladder``
+      * Cross-linked peptidoforms (``#XL`` groups) → ``_crosslink_fragment_ladder``
+      * Branched peptidoforms (``#BRANCH`` groups) → ``_branched_fragment_ladder``
+      * Linear peptides → ``_linear_fragment_ladder``
+
+    The non-linear backends are NotImplementedError stubs in this release;
+    they scaffold the dispatch architecture so the public API is stable
+    when XL-MS / branch / multichain support lands.
+
+    Returns ``(table, tensor)`` from the chosen backend:
 
       * ``table`` — Arrow `FragmentIonTable` (one row per biochemically valid ion).
       * ``tensor`` — float64, shape ``(n_pos, n_ion_types, n_charges, n_losses+1)``.
         Slot 0 along the loss axis is the no-loss baseline; subsequent slots
         follow the order of `neutral_losses`. Invalid ions (loss not licensed
         by fragment chemistry) are NaN-masked. ``None`` if ``return_tensor=False``.
-
-    Modifications:
-      * `modifications` is keyed by 0-indexed residue position in `seq`.
-      * Heavy-isotope mods (those carrying `mass_override`) are handled
-        automatically: `Modification.delta_mass` returns the canonical mass.
-
-    Conventions:
-      * Cleavage position `p` (0..L-2) splits between residue `p` and `p+1`.
-      * N-side fragments (a/b/c) at position `p` cover residues ``[0..p]``.
-      * C-side fragments (x/y/z) at position `p` cover residues ``[p+1..L-1]``.
-      * Position-0 mods always attach to the N-side fragment of every cleavage;
-        position-(L-1) mods always attach to the C-side fragment.
     """
+    kwargs = dict(
+        ion_types=ion_types,
+        max_fragment_charge=max_fragment_charge,
+        neutral_losses=neutral_losses,
+        return_tensor=return_tensor,
+        vocab=vocab,
+        peptide_idx=peptide_idx,
+        include_peptide_seq=include_peptide_seq,
+    )
+    if isinstance(peptidoform, MultiPeptidoform):
+        return _multichain_fragment_ladder(peptidoform, **kwargs)
+    if _has_crosslinks(peptidoform):
+        return _crosslink_fragment_ladder(peptidoform, **kwargs)
+    if _has_branches(peptidoform):
+        return _branched_fragment_ladder(peptidoform, **kwargs)
+    return _linear_fragment_ladder(peptidoform, **kwargs)
+
+
+@requires_canonical
+def _linear_fragment_ladder(
+    peptidoform: Peptidoform,
+    *,
+    ion_types: Sequence[IonType],
+    max_fragment_charge: int,
+    neutral_losses: Sequence[str] | None,
+    return_tensor: bool,
+    vocab: ModVocab,
+    peptide_idx: int | None,
+    include_peptide_seq: bool,
+) -> tuple[pa.Table, torch.Tensor | None]:
+    """Linear-peptide ladder. N-term / C-term mods fold into N-side / C-side
+    fragment masses uniformly; global isotope labels and global fixed mods
+    are expanded into per-residue / per-terminal contributions before the
+    cumsum.
+
+    Rejects ambiguity groups, ranges, and labile mods — those need to be
+    disambiguated or stripped before ladder generation. A future
+    ``Peptidoform.disambiguate()`` helper will do the rewriting.
+    """
+    seq = peptidoform.sequence
     validate(seq, AA)
     L = len(seq)
     if L < 2:
-        raise ValueError(
-            f"fragment_ladder requires sequence length ≥ 2; got {L}"
-        )
+        raise ValueError(f"fragment_ladder requires sequence length ≥ 2; got {L}")
     if max_fragment_charge < 1:
         raise ValueError(
             f"max_fragment_charge must be ≥ 1; got {max_fragment_charge}"
@@ -217,71 +312,165 @@ def fragment_ladder(
     if not ion_types:
         raise ValueError("ion_types must be non-empty")
 
+    if peptidoform.ranges:
+        raise ValueError(
+            "ranges (PRT(ESFRMS)[+19.0523]ISK syntax) are not supported by "
+            "the linear fragment-ladder backend; expand the range to a "
+            "concrete residue position before calling fragment_ladder"
+        )
+    if peptidoform.labile_mods:
+        raise ValueError(
+            "labile mods ({Glycan:Hex} syntax) are not supported by the "
+            "linear fragment-ladder backend; precursor-only mods don't "
+            "appear in fragments by definition"
+        )
+    if peptidoform.unknown_pos_mods:
+        raise ValueError(
+            "unknown-position mods ([Phospho]?PEPTIDE syntax) are not "
+            "supported by the linear fragment-ladder backend; "
+            "disambiguate to a concrete residue position first"
+        )
+    for tm in (
+        *peptidoform.n_term_mods,
+        *peptidoform.c_term_mods,
+        *(t for tms in peptidoform.residue_mods.values() for t in tms),
+    ):
+        if tm.group_id is not None:
+            raise ValueError(
+                f"ambiguity / cross-link / branch group {tm.group_id!r} "
+                "is unsupported by the linear fragment-ladder backend; "
+                "disambiguate or route through the crosslink/branch backends"
+            )
+
+    for pos in peptidoform.residue_mods:
+        if not 0 <= pos < L:
+            raise IndexError(
+                f"modification index {pos} out of range for length-{L} peptide"
+            )
+
     n_pos = L - 1
     n_types = len(ion_types)
     n_charges = max_fragment_charge
-
     loss_ids: tuple[str, ...] = tuple(neutral_losses) if neutral_losses else ()
-    n_losses = 1 + len(loss_ids)  # slot 0 is the no-loss baseline
+    n_losses = 1 + len(loss_ids)
+    isotopes = peptidoform.global_isotopes
 
-    mods: dict[int, object] = dict(modifications) if modifications else {}
-    for k in mods:
-        if not 0 <= k < L:
-            raise IndexError(
-                f"modification index {k} out of range for length-{L} peptide"
-            )
-
-    # ── per-position residue + mod mass ─────────────────────────────
+    # ── per-residue mass: residue + explicit mods + fixed-mod expansion +
+    #    global-isotope shift on the residue's element atoms.
     assert AA.compositions is not None
-    residue_masses = [AA.compositions[r].mass for r in seq]
-    mod_masses_per_pos = [0.0] * L
-    for pos, value in mods.items():
-        mod_masses_per_pos[pos] = _mod_delta_mass(value, vocab)
-    position_masses_t = torch.tensor(
-        [r + m for r, m in zip(residue_masses, mod_masses_per_pos)],
+    residue_comps = [AA.compositions[r] for r in seq]
+    pos_mass = [
+        c.mass + _isotope_shift_for_composition(c, isotopes) for c in residue_comps
+    ]
+    pos_mod_ids: list[list[str]] = [[] for _ in range(L)]
+
+    def _add_modref_at(pos: int, modref: ModRef) -> None:
+        d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=True)
+        pos_mass[pos] += d_comp.mass + d_mass + _isotope_shift_for_composition(
+            d_comp, isotopes
+        )
+        cid = _modref_canonical_id(modref, vocab)
+        if cid is not None:
+            pos_mod_ids[pos].append(cid)
+
+    for pos, taggedmods in peptidoform.residue_mods.items():
+        for tm in taggedmods:
+            if tm.mod is None:
+                continue
+            _add_modref_at(pos, tm.mod)
+
+    # ── N-term / C-term scalars: terminal mod masses + their iso shifts.
+    n_term_extra = 0.0
+    c_term_extra = 0.0
+    for tm in peptidoform.n_term_mods:
+        if tm.mod is None:
+            continue
+        d_comp, d_mass = _modref_contribution(tm.mod, vocab, monoisotopic=True)
+        n_term_extra += (
+            d_comp.mass + d_mass + _isotope_shift_for_composition(d_comp, isotopes)
+        )
+        cid = _modref_canonical_id(tm.mod, vocab)
+        # Fold N-term mod ids onto position 0 for loss-check compatibility
+        # with the prior representation.
+        if cid is not None:
+            pos_mod_ids[0].append(cid)
+    for tm in peptidoform.c_term_mods:
+        if tm.mod is None:
+            continue
+        d_comp, d_mass = _modref_contribution(tm.mod, vocab, monoisotopic=True)
+        c_term_extra += (
+            d_comp.mass + d_mass + _isotope_shift_for_composition(d_comp, isotopes)
+        )
+        cid = _modref_canonical_id(tm.mod, vocab)
+        if cid is not None:
+            pos_mod_ids[L - 1].append(cid)
+
+    # ── Global fixed mods: location-rule expansion. Per-residue rules
+    #    fold into pos_mass / pos_mod_ids; terminal rules fold into
+    #    n_term_extra / c_term_extra. Manual residue mods override at
+    #    that position (skipped by _iter_fixed_mod_residue_indices /
+    #    _count_fixed_mod_locations).
+    for modref, locations in peptidoform.fixed_mods:
+        d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=True)
+        single_extra = (
+            d_comp.mass + d_mass + _isotope_shift_for_composition(d_comp, isotopes)
+        )
+        cid = _modref_canonical_id(modref, vocab)
+        for loc in locations:
+            if loc == "N-term":
+                count = _count_fixed_mod_locations(seq, loc, peptidoform)
+                n_term_extra += single_extra * count
+                if cid is not None and count and L > 0:
+                    pos_mod_ids[0].append(cid)
+            elif loc == "C-term":
+                count = _count_fixed_mod_locations(seq, loc, peptidoform)
+                c_term_extra += single_extra * count
+                if cid is not None and count and L > 0:
+                    pos_mod_ids[L - 1].append(cid)
+            else:
+                for i in _iter_fixed_mod_residue_indices(seq, loc, peptidoform):
+                    pos_mass[i] += single_extra
+                    if cid is not None:
+                        pos_mod_ids[i].append(cid)
+
+    # ── Cumulative residue sums ─────────────────────────────────────
+    pos_mass_t = torch.tensor(pos_mass, dtype=torch.float64)
+    n_cumulative = torch.cumsum(pos_mass_t, dim=0)  # (L,)
+    total_residue_sum = n_cumulative[-1]
+    n_side_residues = n_cumulative[: L - 1]  # (L-1,) sum residues 0..p
+    c_side_residues = total_residue_sum - n_side_residues  # (L-1,) sum p+1..L-1
+    n_side = n_side_residues + n_term_extra  # add N-term mods uniformly
+    c_side = c_side_residues + c_term_extra  # add C-term mods uniformly
+
+    # ── Ion-type offsets, with isotope shift folded in ──────────────
+    type_offsets = torch.tensor(
+        [
+            ION_OFFSET_MASSES[t]
+            + _isotope_shift_for_composition(ION_OFFSETS[t], isotopes)
+            for t in ion_types
+        ],
         dtype=torch.float64,
     )
-
-    # ── cumulative sums for N/C side fragment masses ────────────────
-    n_cumulative = torch.cumsum(position_masses_t, dim=0)  # (L,) inclusive
-    total_residue_sum = n_cumulative[-1]
-    # n_side[p] = sum residues [0..p]; valid p in 0..L-2
-    n_side = n_cumulative[: L - 1]  # (L-1,)
-    # c_side[p] = sum residues [p+1..L-1]; valid p in 0..L-2
-    c_side = total_residue_sum - n_side  # (L-1,)
-
-    # ── ion-type offsets and side selectors ─────────────────────────
-    type_offsets = torch.tensor(
-        [ION_OFFSET_MASSES[t] for t in ion_types], dtype=torch.float64
-    )
-    type_is_n = torch.tensor(
-        [t in _N_SIDE for t in ion_types], dtype=torch.bool
-    )
-    # side_masses[p, t] = n_side[p] if type_is_n[t] else c_side[p]
+    type_is_n = torch.tensor([t in _N_SIDE for t in ion_types], dtype=torch.bool)
     side_masses = torch.where(
         type_is_n[None, :], n_side[:, None], c_side[:, None]
     )  # (n_pos, n_types)
     neutral_no_loss = side_masses + type_offsets[None, :]  # (n_pos, n_types)
 
-    # ── loss-delta table; slot 0 is baseline (0 Da) ─────────────────
+    # ── Loss deltas + biochemistry mask ─────────────────────────────
     loss_deltas = torch.zeros(n_losses, dtype=torch.float64)
     for i, lid in enumerate(loss_ids, start=1):
         loss_deltas[i] = LOSS_REGISTRY.get(lid).delta_mass
-
-    # neutral mass shape: (n_pos, n_types, n_losses)
     neutral_with_loss = (
         neutral_no_loss[:, :, None] - loss_deltas[None, None, :]
     )
-    # m/z shape: (n_pos, n_types, n_charges, n_losses)
+
     charges_t = torch.arange(1, n_charges + 1, dtype=torch.float64)
     mz_tensor = (
         neutral_with_loss[:, :, None, :]
         + charges_t[None, None, :, None] * PROTON_MASS
     ) / charges_t[None, None, :, None]
 
-    # ── loss-validity mask: per (pos, type, loss_id) ────────────────
-    # Baseline (slot 0) is always valid; only the actual-loss slots
-    # 1..n_losses-1 need biochemistry checks.
     loss_mask = torch.ones((n_pos, n_types, n_losses), dtype=torch.bool)
     if loss_ids:
         for p in range(n_pos):
@@ -289,13 +478,15 @@ def fragment_ladder(
                 if ion_type in _N_SIDE:
                     frag_residues = list(seq[: p + 1])
                     frag_mods = {
-                        k: v for k, v in mods.items() if k <= p
+                        i: pos_mod_ids[i] for i in range(p + 1) if pos_mod_ids[i]
                     }
                 else:
                     frag_residues = list(seq[p + 1 :])
                     offset = p + 1
                     frag_mods = {
-                        k - offset: v for k, v in mods.items() if k > p
+                        i - offset: pos_mod_ids[i]
+                        for i in range(p + 1, L)
+                        if pos_mod_ids[i]
                     }
                 for l_idx, lid in enumerate(loss_ids, start=1):
                     loss = LOSS_REGISTRY.get(lid)
@@ -306,26 +497,22 @@ def fragment_ladder(
                         fragment_mods=frag_mods,
                     )
 
-    # Apply mask: invalid → NaN
     nan = torch.tensor(float("nan"), dtype=torch.float64)
     mz_tensor = torch.where(loss_mask[:, :, None, :], mz_tensor, nan)
 
-    # ── build Arrow table from tensor ───────────────────────────────
-    # Iterate finite cells; emit one row per valid ion.
+    # ── Build Arrow table from tensor ───────────────────────────────
     finite = torch.isfinite(mz_tensor)
     idx_p, idx_t, idx_c, idx_l = torch.where(finite)
     mz_values = mz_tensor[finite].tolist()
 
     n_rows = idx_p.numel()
     pep_idx_col = (
-        [peptide_idx] * n_rows
-        if peptide_idx is not None
-        else [None] * n_rows
+        [peptide_idx] * n_rows if peptide_idx is not None else [None] * n_rows
     )
     pep_seq_col = [seq] * n_rows if include_peptide_seq else [None] * n_rows
     positions = idx_p.to(torch.int32).tolist()
     ion_type_codes = [int(ion_types[i]) for i in idx_t.tolist()]
-    charges = [c + 1 for c in idx_c.tolist()]  # 0-indexed → 1-indexed
+    charges = [c + 1 for c in idx_c.tolist()]
     loss_id_col = [
         None if li == 0 else loss_ids[li - 1] for li in idx_l.tolist()
     ]
@@ -344,6 +531,39 @@ def fragment_ladder(
     )
 
     return table, (mz_tensor if return_tensor else None)
+
+
+def _crosslink_fragment_ladder(
+    peptidoform: Peptidoform, **kwargs: object
+) -> tuple[pa.Table, torch.Tensor | None]:
+    raise NotImplementedError(
+        "Cross-linked peptide fragment generation is not yet implemented. "
+        "XL-MS produces multiple coupled fragment series (alpha-chain, "
+        "beta-chain, alpha+beta with linker, plus MS-cleavable linker "
+        "variants) that require workflow-specific assumptions about "
+        "linker chemistry and cleavage modes. Planned alongside the lab's "
+        "XL-MS workflow port."
+    )
+
+
+def _branched_fragment_ladder(
+    peptidoform: Peptidoform, **kwargs: object
+) -> tuple[pa.Table, torch.Tensor | None]:
+    raise NotImplementedError(
+        "Branched peptide fragment generation (#BRANCH groups) is not yet "
+        "implemented. Branch chemistry varies by tag (SUMO, ubiquitin, "
+        "ISG15) and merits a dedicated PR with concrete biology in scope."
+    )
+
+
+def _multichain_fragment_ladder(
+    peptidoform: MultiPeptidoform, **kwargs: object
+) -> tuple[pa.Table, torch.Tensor | None]:
+    raise NotImplementedError(
+        "Multi-chain peptidoform fragment generation (// separator) is not "
+        "yet implemented. Inter-chain cross-link fragmentation is a "
+        "specialization of the cross-link case; see _crosslink_fragment_ladder."
+    )
 
 
 __all__ = [
