@@ -47,6 +47,9 @@ import constellation.electrophoresis
 import constellation.electrophoresis.readers
 import constellation.massspec
 import constellation.massspec.acquisitions
+import constellation.massspec.annotation
+import constellation.massspec.annotation.mzpaf
+import constellation.massspec.annotation.usi
 import constellation.massspec.library
 import constellation.massspec.library.io
 import constellation.massspec.library.library

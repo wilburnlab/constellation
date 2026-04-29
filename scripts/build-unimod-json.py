@@ -27,8 +27,19 @@ Each modification record carries:
     aliases            (title,) plus any hand-curated short-codes.
     description        empty by default; filled where UNIMOD ships notes.
 
-Specificity blocks (<umod:specificity>) and xrefs are dropped — those are
-sequence-layer concerns and don't belong at the chemistry layer.
+Each modification also carries:
+    specificities      list of {position, site} pairs lifted from
+                       <umod:specificity>. Position is one of Anywhere,
+                       Any N-term, Any C-term, Protein N-term,
+                       Protein C-term. Site is a residue letter or one
+                       of "N-term" / "C-term". This drives N-terminal
+                       vs. side-chain mod localization in PSI / EncyclopeDIA
+                       readers (cf. K[Acetyl] vs [Acetyl]-K). Hidden
+                       specificities (hidden="1") are skipped — they're
+                       suppressed in the upstream UNIMOD UI and represent
+                       speculative or artefact placements.
+
+xrefs are dropped — those are out of scope for the chemistry layer.
 
 Run from project root:
     python3 scripts/build-unimod-json.py
@@ -208,6 +219,16 @@ def _parse_one(elem: ET.Element, atom_masses: dict[str, float]) -> dict | None:
     if title and title not in aliases:
         aliases = (title, *aliases)
 
+    specs: list[dict[str, str]] = []
+    for spec in elem.findall(f"{_NS}specificity"):
+        if spec.get("hidden") == "1":
+            continue
+        position = spec.get("position", "")
+        site = spec.get("site", "")
+        if not position or not site:
+            continue
+        specs.append({"position": position, "site": site})
+
     return {
         "id": f"UNIMOD:{record_id}",
         "title": title,
@@ -217,6 +238,7 @@ def _parse_one(elem: ET.Element, atom_masses: dict[str, float]) -> dict | None:
         "avge_mass": avge,
         "mass_override": mass_override,
         "aliases": list(aliases),
+        "specificities": specs,
         "description": "",
     }
 

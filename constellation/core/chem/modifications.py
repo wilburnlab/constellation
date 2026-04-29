@@ -34,6 +34,35 @@ from constellation.core.chem.composition import Composition
 
 
 @dataclass(frozen=True, slots=True)
+class Specificity:
+    """A (position, site) pair from UNIMOD's <umod:specificity> block.
+
+    `position` is one of: "Anywhere", "Any N-term", "Any C-term",
+    "Protein N-term", "Protein C-term".
+
+    `site` is a single residue letter ("K", "S", ...) or one of the
+    keywords "N-term" / "C-term" — the latter pair when the modification
+    targets the terminus itself rather than a residue side chain.
+
+    Together these distinguish chemically identical mass deltas at
+    different molecular positions. The K[Acetyl]VERPD vs [Acetyl]-KVERPD
+    case is exactly this distinction — both are 42.010565 Da, but one
+    is a side-chain modification at K (specificity site="K",
+    position="Anywhere") and the other is an N-terminal α-amine
+    modification (site="N-term", position="Any N-term"). The reader
+    boundary disambiguates by looking up which specificities the
+    modification carries.
+    """
+
+    position: str
+    site: str
+
+
+_N_TERM_POSITIONS = frozenset({"Any N-term", "Protein N-term"})
+_C_TERM_POSITIONS = frozenset({"Any C-term", "Protein C-term"})
+
+
+@dataclass(frozen=True, slots=True)
 class Modification:
     """A named composition delta — e.g. UNIMOD:35 (Oxidation).
 
@@ -42,6 +71,12 @@ class Modification:
     differs from the canonical mono mass by the heavy-isotope offset;
     `mass_override` then holds the canonical mass and
     `is_canonical_decomposition` returns False.
+
+    `specificities` is the set of (position, site) pairs UNIMOD declares
+    valid for this mod. Used by terminal-mod-aware readers (EncyclopeDIA,
+    mzSpecLib) to decide whether `[+42]X` should serialize as `[Mod]-X`
+    (N-terminal) or `X[Mod]` (residue side-chain). Empty tuple for
+    custom mods that don't declare specificities.
     """
 
     id: str  # canonical "UNIMOD:35"
@@ -49,6 +84,7 @@ class Modification:
     delta_composition: Composition
     aliases: tuple[str, ...] = ()
     mass_override: float | None = None
+    specificities: tuple[Specificity, ...] = ()
     description: str = ""
 
     @property
@@ -66,6 +102,37 @@ class Modification:
         """True iff the delta's mass equals the light-skeleton's mass —
         i.e. the modification carries no heavy isotopes."""
         return self.mass_override is None
+
+    @property
+    def has_n_term_specificity(self) -> bool:
+        """True iff this mod has at least one N-terminal specificity
+        (Any N-term or Protein N-term)."""
+        return any(s.position in _N_TERM_POSITIONS for s in self.specificities)
+
+    @property
+    def has_c_term_specificity(self) -> bool:
+        """True iff this mod has at least one C-terminal specificity."""
+        return any(s.position in _C_TERM_POSITIONS for s in self.specificities)
+
+    @property
+    def has_only_terminal_specificity(self) -> bool:
+        """True iff every declared specificity is terminal (N-term or
+        C-term) — i.e. the mod cannot legitimately attach to a side chain.
+        Returns False when `specificities` is empty (no claim either way)."""
+        if not self.specificities:
+            return False
+        return all(
+            s.position in _N_TERM_POSITIONS or s.position in _C_TERM_POSITIONS
+            for s in self.specificities
+        )
+
+    def has_residue_specificity(self, residue: str) -> bool:
+        """True iff this mod can attach to side-chain `residue` ("Anywhere"
+        position with matching site)."""
+        return any(
+            s.position == "Anywhere" and s.site == residue
+            for s in self.specificities
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -200,12 +267,17 @@ class ModVocab:
         out = cls()
         for rec in doc["modifications"]:
             comp = Composition.from_dict(rec["delta_composition"])
+            specs = tuple(
+                Specificity(position=s["position"], site=s["site"])
+                for s in rec.get("specificities", ())
+            )
             mod = Modification(
                 id=rec["id"],
                 name=rec.get("name", rec["id"]),
                 delta_composition=comp,
                 aliases=tuple(rec.get("aliases", ())),
                 mass_override=rec.get("mass_override"),
+                specificities=specs,
                 description=rec.get("description", ""),
             )
             out.add(mod)
@@ -223,6 +295,10 @@ class ModVocab:
                     "delta_composition": m.delta_composition.atoms,
                     "mass_override": m.mass_override,
                     "aliases": list(m.aliases),
+                    "specificities": [
+                        {"position": s.position, "site": s.site}
+                        for s in m.specificities
+                    ],
                     "description": m.description,
                 }
                 for m in self
@@ -245,4 +321,4 @@ def _load_unimod() -> ModVocab:
 UNIMOD: ModVocab = _load_unimod()
 
 
-__all__ = ["Modification", "ModVocab", "UNIMOD"]
+__all__ = ["Modification", "ModVocab", "Specificity", "UNIMOD"]

@@ -8,6 +8,7 @@ from constellation.core.chem.composition import Composition
 from constellation.core.chem.modifications import (
     Modification,
     ModVocab,
+    Specificity,
     UNIMOD,
 )
 
@@ -212,3 +213,61 @@ def test_save_load_round_trip(tmp_path):
         assert abs(reloaded[mid].delta_mass - sub[mid].delta_mass) < 1e-9
     # Heavy-isotope flag survives round-trip.
     assert reloaded["UNIMOD:737"].is_canonical_decomposition is False
+    # Specificities survive round-trip.
+    assert reloaded["UNIMOD:21"].specificities == sub["UNIMOD:21"].specificities
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Specificity blocks — drive PSI / EncyclopeDIA terminal-mod localization
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_acetyl_specificities_cover_n_term_and_lysine():
+    """Acetyl is the canonical case: distinguishable as side-chain
+    K[Acetyl] vs N-terminal [Acetyl]-K via specificity inspection."""
+    ac = UNIMOD["UNIMOD:1"]
+    sites = {(s.position, s.site) for s in ac.specificities}
+    assert ("Anywhere", "K") in sites
+    assert ("Any N-term", "N-term") in sites
+    assert ("Protein N-term", "N-term") in sites
+
+
+def test_acetyl_predicates():
+    ac = UNIMOD["UNIMOD:1"]
+    assert ac.has_n_term_specificity is True
+    assert ac.has_residue_specificity("K") is True
+    assert ac.has_residue_specificity("R") is False
+    # Acetyl is not *only* terminal — it has a K side-chain placement too.
+    assert ac.has_only_terminal_specificity is False
+
+
+def test_phospho_specificities_are_residue_only():
+    """Phospho targets S/T/Y side chains, never termini."""
+    ph = UNIMOD["UNIMOD:21"]
+    sites = {(s.position, s.site) for s in ph.specificities}
+    assert ("Anywhere", "S") in sites
+    assert ("Anywhere", "T") in sites
+    assert ("Anywhere", "Y") in sites
+    assert ph.has_n_term_specificity is False
+    assert ph.has_c_term_specificity is False
+
+
+def test_specificity_is_frozen():
+    s = Specificity(position="Anywhere", site="K")
+    with pytest.raises((AttributeError, TypeError)):
+        s.position = "Any N-term"  # type: ignore[misc]
+
+
+def test_modification_default_specificities_is_empty_tuple():
+    """Custom mods don't carry specificities by default."""
+    mod = Modification(
+        id="CUSTOM:test",
+        name="test",
+        delta_composition=Composition.from_formula("CH2"),
+    )
+    assert mod.specificities == ()
+    # Empty specificities → predicates report False, but
+    # has_only_terminal_specificity is False (empty isn't "all terminal").
+    assert mod.has_n_term_specificity is False
+    assert mod.has_c_term_specificity is False
+    assert mod.has_only_terminal_specificity is False
