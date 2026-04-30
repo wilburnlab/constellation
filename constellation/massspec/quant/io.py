@@ -180,41 +180,6 @@ register_writer(ParquetDirWriter())
 register_reader(ParquetDirReader())
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Elib — stubs (full implementation lands with EncyclopeDIA reader)
-# ──────────────────────────────────────────────────────────────────────
-
-
-_ELIB_DEFERRED = (
-    "EncyclopeDIA .elib quant writer/reader is deferred — schema "
-    "reverse-engineering tracks alongside the EncyclopeDIA reader port. "
-    "elib is conceptually (Library, Quant) — the .dlib portion goes through "
-    "massspec.library.io.DlibWriter; the per-acquisition peptide quants "
-    "land here."
-)
-
-
-class ElibQuantWriter:
-    extension: ClassVar[str] = ".elib"
-    format_name: ClassVar[str] = "elib"
-    lossy: ClassVar[bool] = True
-
-    def write(self, quant: Quant, path: Path, **opts: Any) -> None:
-        raise NotImplementedError(_ELIB_DEFERRED)
-
-
-class ElibQuantReader:
-    extension: ClassVar[str] = ".elib"
-    format_name: ClassVar[str] = "elib"
-
-    def read(self, path: Path, **opts: Any) -> Quant:
-        raise NotImplementedError(_ELIB_DEFERRED)
-
-
-register_writer(ElibQuantWriter())
-register_reader(ElibQuantReader())
-
-
 __all__ = [
     "QuantWriter",
     "QuantReader",
@@ -226,6 +191,4 @@ __all__ = [
     "load_quant",
     "ParquetDirWriter",
     "ParquetDirReader",
-    "ElibQuantWriter",
-    "ElibQuantReader",
 ]

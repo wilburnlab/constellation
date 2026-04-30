@@ -1,17 +1,27 @@
-"""Tests for normalize_encyclopedia_modseq — EncyclopeDIA → ProForma 2.0.
+"""Tests for parse_encyclopedia_modseq — EncyclopeDIA → Peptidoform → ProForma 2.0.
 
 The motivating case: EncyclopeDIA collapses ``[Mod]-X`` and ``X[Mod]``
 into one ``X[Mod]`` form, but they are chemically distinct molecules.
 This module's job is to disambiguate at the reader boundary by looking
 up the mass delta in UNIMOD and applying the modification's specificity
-constraints.
+constraints, returning a structured ``Peptidoform`` directly.
+
+Assertions go through ``format_proforma(parse_encyclopedia_modseq(s))``
+so we exercise both the parser and its ProForma 2.0 serialization
+contract in one shot.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from constellation.thirdparty.encyclopedia import normalize_encyclopedia_modseq
+from constellation.core.sequence.proforma import format_proforma, parse_proforma
+from constellation.massspec.io.encyclopedia import parse_encyclopedia_modseq
+
+
+def _round_trip(modseq: str) -> str:
+    """Convenience: parse encyclopedia modseq, format as ProForma 2.0."""
+    return format_proforma(parse_encyclopedia_modseq(modseq))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -20,11 +30,11 @@ from constellation.thirdparty.encyclopedia import normalize_encyclopedia_modseq
 
 
 def test_unmodified_passes_through():
-    assert normalize_encyclopedia_modseq("PEPTIDE") == "PEPTIDE"
+    assert _round_trip("PEPTIDE") == "PEPTIDE"
 
 
 def test_empty_input_returns_empty():
-    assert normalize_encyclopedia_modseq("") == ""
+    assert _round_trip("") == ""
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -50,7 +60,7 @@ def test_empty_input_returns_empty():
     ],
 )
 def test_side_chain_modifications(input: str, expected: str):
-    assert normalize_encyclopedia_modseq(input) == expected
+    assert _round_trip(input) == expected
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -65,22 +75,19 @@ def test_acetyl_on_k_at_residue_zero_defaults_to_side_chain():
     localization evidence to override that without explicit localization
     metadata. The downstream tooling can rewrite to the terminal form
     when localization scoring resolves it."""
-    got = normalize_encyclopedia_modseq("K[+42.01057]VERPD")
-    assert got == "K[UNIMOD:1]VERPD"
+    assert _round_trip("K[+42.01057]VERPD") == "K[UNIMOD:1]VERPD"
 
 
 def test_acetyl_on_a_at_residue_zero_promotes_to_n_terminus():
     """A residue's side chain cannot host Acetyl (Ac is K-side or N-term
     only). So at position 0, the only chemically valid placement is
     N-terminal — promote it."""
-    got = normalize_encyclopedia_modseq("A[+42.01057]ARK")
-    assert got == "[UNIMOD:1]-AARK"
+    assert _round_trip("A[+42.01057]ARK") == "[UNIMOD:1]-AARK"
 
 
 def test_methionine_oxidation_at_residue_zero_stays_side_chain():
     """M can host Oxidation on its side chain regardless of position."""
-    got = normalize_encyclopedia_modseq("M[+15.99492]PEPTIDE")
-    assert got == "M[UNIMOD:35]PEPTIDE"
+    assert _round_trip("M[+15.99492]PEPTIDE") == "M[UNIMOD:35]PEPTIDE"
 
 
 @pytest.mark.parametrize(
@@ -92,7 +99,7 @@ def test_acetyl_at_residue_zero_for_non_k_residues_promotes_to_terminal(
 ):
     inp = f"{n_term_residue}[+42.01057]PEP"
     expected = f"[UNIMOD:1]-{n_term_residue}PEP"
-    assert normalize_encyclopedia_modseq(inp) == expected
+    assert _round_trip(inp) == expected
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -101,17 +108,25 @@ def test_acetyl_at_residue_zero_for_non_k_residues_promotes_to_terminal(
 
 
 def test_unknown_mass_delta_passes_through():
-    """Mass not in UNIMOD → ProForma mass-delta form preserved."""
-    got = normalize_encyclopedia_modseq("PEPK[+999.999]TIDE")
-    assert got == "PEPK[+999.999]TIDE"
+    """Mass not in UNIMOD → ProForma mass-delta form preserved as a
+    ``ModRef(mass_delta=...)`` and re-emitted unchanged."""
+    pep = parse_encyclopedia_modseq("PEPK[+999.999]TIDE")
+    assert pep.sequence == "PEPKTIDE"
+    assert 3 in pep.residue_mods
+    (tagged,) = pep.residue_mods[3]
+    assert tagged.mod is not None
+    assert tagged.mod.mass_delta == pytest.approx(999.999)
 
 
 def test_proline_oxidation_not_in_unimod_specificity_passes_through():
     """Oxidation (UNIMOD:35) does not declare a P specificity. The
     chemistry layer can't validate this assignment, so leave as a
     mass-delta annotation rather than guess."""
-    got = normalize_encyclopedia_modseq("PEPP[+15.99492]TIDE")
-    assert got == "PEPP[+15.99492]TIDE"
+    pep = parse_encyclopedia_modseq("PEPP[+15.99492]TIDE")
+    (tagged,) = pep.residue_mods[3]
+    assert tagged.mod is not None
+    assert tagged.mod.accession is None
+    assert tagged.mod.mass_delta == pytest.approx(15.99492)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -121,15 +136,13 @@ def test_proline_oxidation_not_in_unimod_specificity_passes_through():
 
 def test_multiple_modifications_round_trip():
     inp = "C[+57.02146]EPM[+15.99492]TIS[+79.96633]K"
-    got = normalize_encyclopedia_modseq(inp)
-    assert got == "C[UNIMOD:4]EPM[UNIMOD:35]TIS[UNIMOD:21]K"
+    assert _round_trip(inp) == "C[UNIMOD:4]EPM[UNIMOD:35]TIS[UNIMOD:21]K"
 
 
 def test_n_term_acetyl_with_internal_mods():
     """N-term Ac on A + internal Cam on C — both should resolve correctly."""
     inp = "A[+42.01057]EPC[+57.02146]TIDE"
-    got = normalize_encyclopedia_modseq(inp)
-    assert got == "[UNIMOD:1]-AEPC[UNIMOD:4]TIDE"
+    assert _round_trip(inp) == "[UNIMOD:1]-AEPC[UNIMOD:4]TIDE"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -138,10 +151,8 @@ def test_n_term_acetyl_with_internal_mods():
 
 
 def test_output_is_valid_proforma():
-    """The whole point of the normalizer is to emit ProForma 2.0 strings
-    that the proforma parser accepts losslessly."""
-    from constellation.core.sequence.proforma import parse_proforma
-
+    """Round-tripping through format_proforma + parse_proforma must
+    succeed without raising and must be idempotent on the second pass."""
     cases = [
         "K[+42.01057]VERPD",
         "PEPK[+42.01057]TIDE",
@@ -150,9 +161,8 @@ def test_output_is_valid_proforma():
         "PEPK[+999.999]TIDE",  # unknown mass passthrough
     ]
     for inp in cases:
-        out = normalize_encyclopedia_modseq(inp)
-        parsed = parse_proforma(out)  # must not raise
-        assert parsed is not None
+        out = _round_trip(inp)
+        parse_proforma(out)  # must not raise
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -162,9 +172,9 @@ def test_output_is_valid_proforma():
 
 def test_lowercase_residue_rejected():
     with pytest.raises(ValueError, match="unexpected character"):
-        normalize_encyclopedia_modseq("pepK[+42]TIDE")
+        parse_encyclopedia_modseq("pepK[+42]TIDE")
 
 
 def test_unmatched_bracket_rejected():
     with pytest.raises(ValueError):
-        normalize_encyclopedia_modseq("K[+42")
+        parse_encyclopedia_modseq("K[+42")

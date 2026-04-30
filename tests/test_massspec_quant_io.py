@@ -10,8 +10,6 @@ from constellation.massspec.acquisitions import Acquisitions
 from constellation.massspec.quant import (
     QUANT_READERS,
     QUANT_WRITERS,
-    ElibQuantReader,
-    ElibQuantWriter,
     ParquetDirReader,
     ParquetDirWriter,
     Quant,
@@ -66,19 +64,24 @@ def test_readers_satisfy_protocol() -> None:
         assert isinstance(r, QuantReader)
 
 
-def test_parquet_and_elib_registered() -> None:
+def test_parquet_and_encyclopedia_registered() -> None:
+    """encyclopedia.dlib + encyclopedia.elib adapters self-register on
+    package import (via massspec/io/encyclopedia/adapters.py)."""
     assert "parquet_dir" in QUANT_WRITERS
     assert "parquet_dir" in QUANT_READERS
-    assert "elib" in QUANT_WRITERS
-    assert "elib" in QUANT_READERS
+    assert "encyclopedia.dlib" in QUANT_WRITERS
+    assert "encyclopedia.dlib" in QUANT_READERS
+    assert "encyclopedia.elib" in QUANT_WRITERS
+    assert "encyclopedia.elib" in QUANT_READERS
 
 
 def test_parquet_writer_lossless() -> None:
     assert ParquetDirWriter().lossy is False
 
 
-def test_elib_writer_marked_lossy() -> None:
-    assert ElibQuantWriter().lossy is True
+def test_encyclopedia_writers_marked_lossy() -> None:
+    assert QUANT_WRITERS["encyclopedia.dlib"].lossy is True
+    assert QUANT_WRITERS["encyclopedia.elib"].lossy is True
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -112,20 +115,22 @@ def test_parquet_round_trip_preserves_run_agnostic_null(tmp_path: Path) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Stubs
+# Dispatch
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_elib_writer_raises_with_pointer(tmp_path: Path) -> None:
-    with pytest.raises(NotImplementedError, match="EncyclopeDIA"):
-        save_quant(_quant(), tmp_path / "out.elib", format="elib")
+def test_elib_suffix_dispatch_resolves_to_encyclopedia(tmp_path: Path) -> None:
+    from constellation.massspec.quant.io import _resolve_writer
+
+    writer = _resolve_writer(None, tmp_path / "out.elib")
+    assert writer.format_name == "encyclopedia.elib"
 
 
-def test_elib_reader_raises_with_pointer(tmp_path: Path) -> None:
-    p = tmp_path / "out.elib"
-    p.touch()
-    with pytest.raises(NotImplementedError, match="EncyclopeDIA"):
-        load_quant(p, format="elib")
+def test_dlib_suffix_dispatch_resolves_to_encyclopedia(tmp_path: Path) -> None:
+    from constellation.massspec.quant.io import _resolve_writer
+
+    writer = _resolve_writer(None, tmp_path / "out.dlib")
+    assert writer.format_name == "encyclopedia.dlib"
 
 
 def test_save_unknown_format_raises(tmp_path: Path) -> None:

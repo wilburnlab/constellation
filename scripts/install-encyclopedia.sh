@@ -6,7 +6,7 @@
 #   third_party/encyclopedia/current  -> <version>/   (symlink)
 #
 # Override with $CONSTELLATION_ENCYCLOPEDIA_HOME if you keep a shared
-# install elsewhere (e.g. /opt/bioinfo/encyclopedia/3.0.4/); in that
+# install elsewhere (e.g. /opt/bioinfo/encyclopedia/2.12.30/); in that
 # case, don't run this script — the registry will find it via the env var.
 #
 # Usage:
@@ -16,9 +16,10 @@
 # Apache-2.0; no license-acknowledgement prompt required.
 set -euo pipefail
 
-VERSION="3.0.4"
+VERSION="2.12.30"
 JAR_FILENAME="encyclopedia-${VERSION}-executable.jar"
 JAR_URL="https://bitbucket.org/searleb/encyclopedia/downloads/${JAR_FILENAME}"
+# Verified 2026-04-29 by fetching the URL above and running sha256sum.
 JAR_SHA256="a21ef9248aa05c0e531d950af1201d6deefa5c2a2ef200f6a13102041d825071"
 
 # Repo root = directory containing pyproject.toml (this script lives in scripts/).
@@ -46,7 +47,7 @@ Usage:
   bash scripts/install-encyclopedia.sh --force   # overwrite existing install
 
 Override via $CONSTELLATION_ENCYCLOPEDIA_HOME to use a shared install
-elsewhere (e.g. /opt/bioinfo/encyclopedia/3.0.4/); in that case skip
+elsewhere (e.g. /opt/bioinfo/encyclopedia/2.12.30/); in that case skip
 this script — the registry will find it via the env var.
 
 Apache-2.0; no license-acknowledgement prompt required.

@@ -60,6 +60,9 @@ include = ["constellation*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
+markers = [
+    "slow: tests that read whole-file sample data (skip with `-m 'not slow'`)",
+]
 
 # ---------------------------------------------------------------------------
 # ruff

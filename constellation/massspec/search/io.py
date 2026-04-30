@@ -1,15 +1,10 @@
-"""``Library`` Reader/Writer Protocols + native Parquet round-trip.
+"""``Search`` Reader/Writer Protocols + native Parquet round-trip.
 
-The Reader/Writer pair is the extension point for new library formats
-(.dlib for EncyclopeDIA, BiblioSpec .blib, NIST .msp, ...). Each format
-adapter registers itself by name; ``Library.save(path, format=...)``
-dispatches by name (and falls back to suffix-matching when one writer
-owns the extension).
-
-This session ships only ``ParquetDirReader`` / ``ParquetDirWriter`` —
-the lossless native form. ``DlibReader`` / ``DlibWriter`` are stubbed
-with ``NotImplementedError`` so the registry slot exists; full
-implementation lands with the EncyclopeDIA reader.
+Mirrors :mod:`massspec.library.io` and :mod:`massspec.quant.io`. New
+search-engine adapters (encyclopedia .dlib/.elib via
+``massspec.io.encyclopedia``, MSFragger TSV, etc.) register themselves
+in ``SEARCH_READERS`` / ``SEARCH_WRITERS`` so ``load_search`` /
+``save_search`` resolve by suffix or by explicit ``format`` name.
 """
 
 from __future__ import annotations
@@ -21,7 +16,9 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from constellation.massspec.library.library import Library
+from constellation.massspec.acquisitions import ACQUISITION_TABLE, Acquisitions
+from constellation.massspec.search.search import Search
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Protocols + registries
@@ -29,89 +26,89 @@ from constellation.massspec.library.library import Library
 
 
 @runtime_checkable
-class LibraryWriter(Protocol):
+class SearchWriter(Protocol):
     extension: ClassVar[str]
     format_name: ClassVar[str]
     lossy: ClassVar[bool]
 
-    def write(self, library: Library, path: Path, **opts: Any) -> None: ...
+    def write(self, search: Search, path: Path, **opts: Any) -> None: ...
 
 
 @runtime_checkable
-class LibraryReader(Protocol):
+class SearchReader(Protocol):
     extension: ClassVar[str]
     format_name: ClassVar[str]
 
-    def read(self, path: Path, **opts: Any) -> Library: ...
+    def read(self, path: Path, **opts: Any) -> Search: ...
 
 
-LIBRARY_WRITERS: dict[str, LibraryWriter] = {}
-LIBRARY_READERS: dict[str, LibraryReader] = {}
+SEARCH_WRITERS: dict[str, SearchWriter] = {}
+SEARCH_READERS: dict[str, SearchReader] = {}
 
 
-def register_writer(writer: LibraryWriter) -> None:
-    if writer.format_name in LIBRARY_WRITERS:
+def register_writer(writer: SearchWriter) -> None:
+    if writer.format_name in SEARCH_WRITERS:
         raise ValueError(f"writer already registered: {writer.format_name!r}")
-    LIBRARY_WRITERS[writer.format_name] = writer
+    SEARCH_WRITERS[writer.format_name] = writer
 
 
-def register_reader(reader: LibraryReader) -> None:
-    if reader.format_name in LIBRARY_READERS:
+def register_reader(reader: SearchReader) -> None:
+    if reader.format_name in SEARCH_READERS:
         raise ValueError(f"reader already registered: {reader.format_name!r}")
-    LIBRARY_READERS[reader.format_name] = reader
+    SEARCH_READERS[reader.format_name] = reader
 
 
-def _resolve_writer(format: str | None, path: Path) -> LibraryWriter:
+def _resolve_writer(format: str | None, path: Path) -> SearchWriter:
     if format is not None:
-        if format not in LIBRARY_WRITERS:
+        if format not in SEARCH_WRITERS:
             raise KeyError(f"no writer registered for format {format!r}")
-        return LIBRARY_WRITERS[format]
+        return SEARCH_WRITERS[format]
     suffix = path.suffix.lower() or ("/" if path.is_dir() else "")
-    matches = [w for w in LIBRARY_WRITERS.values() if w.extension == suffix]
+    matches = [w for w in SEARCH_WRITERS.values() if w.extension == suffix]
     if not matches:
         raise KeyError(
-            f"no writer for path {path!s}; "
-            f"specify format= explicitly. registered: {sorted(LIBRARY_WRITERS)}"
+            f"no writer for path {path!s}; specify format=. "
+            f"registered: {sorted(SEARCH_WRITERS)}"
         )
     if len(matches) > 1:
         raise KeyError(
-            f"multiple writers claim suffix {suffix!r}; "
-            f"specify format= explicitly: {[w.format_name for w in matches]}"
+            f"multiple writers claim suffix {suffix!r}: "
+            f"{[w.format_name for w in matches]}"
         )
     return matches[0]
 
 
-def _resolve_reader(format: str | None, path: Path) -> LibraryReader:
+def _resolve_reader(format: str | None, path: Path) -> SearchReader:
     if format is not None:
-        if format not in LIBRARY_READERS:
+        if format not in SEARCH_READERS:
             raise KeyError(f"no reader registered for format {format!r}")
-        return LIBRARY_READERS[format]
+        return SEARCH_READERS[format]
     suffix = path.suffix.lower() or ("/" if path.is_dir() else "")
-    matches = [r for r in LIBRARY_READERS.values() if r.extension == suffix]
+    matches = [r for r in SEARCH_READERS.values() if r.extension == suffix]
     if not matches:
         raise KeyError(
-            f"no reader for path {path!s}; "
-            f"specify format= explicitly. registered: {sorted(LIBRARY_READERS)}"
+            f"no reader for path {path!s}; specify format=. "
+            f"registered: {sorted(SEARCH_READERS)}"
         )
     if len(matches) > 1:
         raise KeyError(
-            f"multiple readers claim suffix {suffix!r}; "
-            f"specify format= explicitly: {[r.format_name for r in matches]}"
+            f"multiple readers claim suffix {suffix!r}: "
+            f"{[r.format_name for r in matches]}"
         )
     return matches[0]
 
 
-def save_library(
-    library: Library, path: str | Path, *, format: str | None = None, **opts: Any
+def save_search(
+    search: Search, path: str | Path, *, format: str | None = None, **opts: Any
 ) -> None:
     p = Path(path)
     writer = _resolve_writer(format, p)
-    writer.write(library, p, **opts)
+    writer.write(search, p, **opts)
 
 
-def load_library(
+def load_search(
     path: str | Path, *, format: str | None = None, **opts: Any
-) -> Library:
+) -> Search:
     p = Path(path)
     reader = _resolve_reader(format, p)
     return reader.read(p, **opts)
@@ -122,33 +119,23 @@ def load_library(
 # ──────────────────────────────────────────────────────────────────────
 
 
-_PARQUET_TABLES = (
-    "proteins",
-    "peptides",
-    "precursors",
-    "fragments",
-    "protein_peptide",
-)
+_PARQUET_TABLES = ("peptide_scores", "protein_scores")
 
 
 class ParquetDirWriter:
-    """Write a ``Library`` to a directory of one Parquet file per table.
-
-    Library-level metadata round-trips through ``manifest.json``.
-    """
-
     extension: ClassVar[str] = "/"
     format_name: ClassVar[str] = "parquet_dir"
     lossy: ClassVar[bool] = False
 
-    def write(self, library: Library, path: Path, **opts: Any) -> None:
+    def write(self, search: Search, path: Path, **opts: Any) -> None:
         path.mkdir(parents=True, exist_ok=True)
+        pq.write_table(search.acquisitions.table, path / "acquisitions.parquet")
         for name in _PARQUET_TABLES:
-            pq.write_table(getattr(library, name), path / f"{name}.parquet")
+            pq.write_table(getattr(search, name), path / f"{name}.parquet")
         manifest = {
             "format": self.format_name,
-            "tables": list(_PARQUET_TABLES),
-            "metadata": library.metadata_extras,
+            "tables": ["acquisitions", *_PARQUET_TABLES],
+            "metadata": search.metadata_extras,
         }
         (path / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
@@ -157,21 +144,27 @@ class ParquetDirReader:
     extension: ClassVar[str] = "/"
     format_name: ClassVar[str] = "parquet_dir"
 
-    def read(self, path: Path, **opts: Any) -> Library:
+    def read(self, path: Path, **opts: Any) -> Search:
         manifest_path = path / "manifest.json"
         manifest: dict[str, Any] = {}
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text())
+
+        acq_table = pq.read_table(path / "acquisitions.parquet")
+        if acq_table.schema.metadata is None:
+            acq_table = acq_table.replace_schema_metadata(
+                ACQUISITION_TABLE.metadata
+            )
+        acquisitions = Acquisitions(acq_table)
+
         tables: dict[str, pa.Table] = {
             name: pq.read_table(path / f"{name}.parquet")
             for name in _PARQUET_TABLES
         }
-        return Library(
-            proteins=tables["proteins"],
-            peptides=tables["peptides"],
-            precursors=tables["precursors"],
-            fragments=tables["fragments"],
-            protein_peptide=tables["protein_peptide"],
+        return Search(
+            acquisitions=acquisitions,
+            peptide_scores=tables["peptide_scores"],
+            protein_scores=tables["protein_scores"],
             metadata_extras=dict(manifest.get("metadata", {})),
         )
 
@@ -181,14 +174,14 @@ register_reader(ParquetDirReader())
 
 
 __all__ = [
-    "LibraryWriter",
-    "LibraryReader",
-    "LIBRARY_WRITERS",
-    "LIBRARY_READERS",
+    "SearchWriter",
+    "SearchReader",
+    "SEARCH_WRITERS",
+    "SEARCH_READERS",
     "register_writer",
     "register_reader",
-    "save_library",
-    "load_library",
+    "save_search",
+    "load_search",
     "ParquetDirWriter",
     "ParquetDirReader",
 ]

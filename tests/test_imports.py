@@ -54,9 +54,12 @@ import constellation.massspec.library
 import constellation.massspec.library.io
 import constellation.massspec.library.library
 import constellation.massspec.library.schemas
+import constellation.massspec.io
+import constellation.massspec.io.encyclopedia
 import constellation.massspec.peptide
 import constellation.massspec.peptide.envelope
 import constellation.massspec.peptide.ions
+import constellation.massspec.peptide.match
 import constellation.massspec.peptide.mz
 import constellation.massspec.peptide.neutral_losses
 import constellation.massspec.quant
@@ -66,6 +69,9 @@ import constellation.massspec.quant.schemas
 import constellation.massspec.readers
 import constellation.massspec.schemas
 import constellation.massspec.search
+import constellation.massspec.search.io
+import constellation.massspec.search.schemas
+import constellation.massspec.search.search
 import constellation.massspec.tokenize
 import constellation.sequencing
 import constellation.sequencing.readers

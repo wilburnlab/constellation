@@ -22,6 +22,12 @@ from constellation.massspec.peptide.ions import (
     fragment_ladder,
     fragment_mz,
 )
+from constellation.massspec.peptide.match import (
+    IonAssignment,
+    MzMatch,
+    assign_fragments,
+    match_mz,
+)
 from constellation.massspec.peptide.mz import PROTON_MASS, precursor_mz
 from constellation.massspec.peptide.neutral_losses import (
     LOSS_REGISTRY,
@@ -44,4 +50,8 @@ __all__ = [
     "LossRegistry",
     "LOSS_REGISTRY",
     "loss_applies",
+    "MzMatch",
+    "IonAssignment",
+    "match_mz",
+    "assign_fragments",
 ]

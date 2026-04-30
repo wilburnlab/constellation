@@ -27,3 +27,8 @@ Modules (TODO; scaffolded only):
 """
 
 from constellation.massspec import schemas as schemas  # noqa: F401  (registers FragmentIonTable)
+
+# Importing `io` triggers registration of cross-tier file-format adapters
+# (encyclopedia .dlib/.elib reader+writer in LIBRARY_/QUANT_/SEARCH_ READERS,
+# DiaReader in core.io.readers).
+from constellation.massspec import io as io  # noqa: F401, E402

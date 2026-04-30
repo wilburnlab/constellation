@@ -9,8 +9,6 @@ import pytest
 from constellation.massspec.library import (
     LIBRARY_READERS,
     LIBRARY_WRITERS,
-    DlibReader,
-    DlibWriter,
     Library,
     LibraryReader,
     LibraryWriter,
@@ -67,11 +65,15 @@ def test_readers_satisfy_protocol() -> None:
         assert isinstance(reader, LibraryReader)
 
 
-def test_parquet_and_dlib_registered() -> None:
+def test_parquet_and_encyclopedia_registered() -> None:
+    """encyclopedia.dlib + encyclopedia.elib adapters self-register on
+    package import (via massspec/io/encyclopedia/adapters.py)."""
     assert "parquet_dir" in LIBRARY_WRITERS
     assert "parquet_dir" in LIBRARY_READERS
-    assert "dlib" in LIBRARY_WRITERS
-    assert "dlib" in LIBRARY_READERS
+    assert "encyclopedia.dlib" in LIBRARY_WRITERS
+    assert "encyclopedia.dlib" in LIBRARY_READERS
+    assert "encyclopedia.elib" in LIBRARY_WRITERS
+    assert "encyclopedia.elib" in LIBRARY_READERS
 
 
 def test_parquet_dir_writer_metadata() -> None:
@@ -80,9 +82,10 @@ def test_parquet_dir_writer_metadata() -> None:
     assert w.lossy is False
 
 
-def test_dlib_writer_marked_lossy() -> None:
-    w = DlibWriter()
-    assert w.lossy is True
+def test_encyclopedia_writers_marked_lossy() -> None:
+    """Terminal mods collapse onto residue 0 in EncyclopeDIA's grammar."""
+    assert LIBRARY_WRITERS["encyclopedia.dlib"].lossy is True
+    assert LIBRARY_WRITERS["encyclopedia.elib"].lossy is True
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -125,7 +128,7 @@ def test_parquet_dir_round_trip_preserves_predicted_sentinels(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Dispatch + dlib stub
+# Dispatch
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -135,22 +138,18 @@ def test_save_unknown_format_raises(tmp_path: Path) -> None:
         save_library(lib, tmp_path / "lib", format="not_a_format")
 
 
-def test_dlib_writer_raises_with_pointer(tmp_path: Path) -> None:
-    lib = _library()
-    with pytest.raises(NotImplementedError, match="EncyclopeDIA"):
-        save_library(lib, tmp_path / "out.dlib", format="dlib")
+def test_dlib_suffix_dispatch_resolves_to_encyclopedia(tmp_path: Path) -> None:
+    """A path ending in .dlib must dispatch to the encyclopedia adapter
+    when no explicit format= is given. Round-trip is exercised in
+    tests/test_encyclopedia_roundtrip.py."""
+    from constellation.massspec.library.io import _resolve_writer
+
+    writer = _resolve_writer(None, tmp_path / "out.dlib")
+    assert writer.format_name == "encyclopedia.dlib"
 
 
-def test_dlib_reader_raises_with_pointer(tmp_path: Path) -> None:
-    p = tmp_path / "out.dlib"
-    p.touch()
-    with pytest.raises(NotImplementedError, match="EncyclopeDIA"):
-        load_library(p, format="dlib")
+def test_elib_suffix_dispatch_resolves_to_encyclopedia(tmp_path: Path) -> None:
+    from constellation.massspec.library.io import _resolve_writer
 
-
-def test_format_dispatch_via_extension(tmp_path: Path) -> None:
-    """A path ending in .dlib should dispatch to the dlib stub
-    when no explicit format= is given."""
-    lib = _library()
-    with pytest.raises(NotImplementedError):
-        save_library(lib, tmp_path / "out.dlib")
+    writer = _resolve_writer(None, tmp_path / "out.elib")
+    assert writer.format_name == "encyclopedia.elib"

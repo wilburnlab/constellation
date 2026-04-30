@@ -10,16 +10,15 @@ composition layer that unifies all three is intentionally deferred.
                   LIBRARY_FRAGMENT_TABLE / PROTEIN_PEPTIDE_EDGE
     library       Library container + assign_ids builder
     io            LibraryReader / LibraryWriter Protocols + registry +
-                  native ParquetDirReader/Writer; DlibReader/Writer
-                  stubs raise NotImplementedError pending the
-                  EncyclopeDIA reader port.
+                  native ParquetDirReader/Writer. EncyclopeDIA
+                  ``.dlib`` / ``.elib`` adapters live in
+                  :mod:`massspec.io.encyclopedia` and self-register on
+                  package import.
 """
 
 from constellation.massspec.library.io import (
     LIBRARY_READERS,
     LIBRARY_WRITERS,
-    DlibReader,
-    DlibWriter,
     LibraryReader,
     LibraryWriter,
     ParquetDirReader,
@@ -56,6 +55,4 @@ __all__ = [
     "load_library",
     "ParquetDirReader",
     "ParquetDirWriter",
-    "DlibReader",
-    "DlibWriter",
 ]

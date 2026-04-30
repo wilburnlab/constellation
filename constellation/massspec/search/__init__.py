@@ -1,50 +1,28 @@
-"""Search-engine results — PSMs, scores, FDR / q-values.
+"""Search-engine results — peptide-level / protein-level scores.
 
-The detection-side sibling to ``massspec.library`` (theoretical) and
-``massspec.quant`` (abundance / transmission). A search engine consumes
-a ``Library`` and an acquisition's spectra, produces a ``Search``
-record (peptide-spectrum matches with confidence scores). Conventional
-proteomics keeps detection and quantification organisationally
-distinct; Constellation's Counter-philosophy unifies them at a future
-higher composition layer that has yet to land.
+Detection-side sibling to :mod:`massspec.library` (theoretical /
+sample-agnostic) and :mod:`massspec.quant` (empirical / per-acquisition
+abundances). A search engine consumes a ``Library`` plus an
+acquisition's spectra and produces a ``Search`` record carrying scores
+(percolator scores, q-values, posterior error probabilities) for the
+peptides and proteins it identified.
 
-Status: **scaffold only.** Schema design is held until the first
-concrete consumer arrives — either a wrapper around the bundled
-EncyclopeDIA jar (``thirdparty.encyclopedia``) or the Counter port —
-because PSM-table column choices vary materially across search
-engines and over-designing now would calcify the wrong contract.
-The container raises ``NotImplementedError`` on construction so
-import-only smoke tests remain green.
+This release ships peptide-level and protein-level score tables — the
+shape encyclopedia ``.dlib``/``.elib`` files aggregate to. PSM-level
+(one row per spectrum) is held until a real PSM-emitting reader
+(mzIdentML, Counter port) drives the schema design; manufacturing PSMs
+from peptide-level encyclopedia scores would invent data.
 
-Planned modules (this scaffold reserves the namespace):
+Modules:
 
-    schemas       PSM_TABLE, plus rollups (peptide-level, protein-level
-                  inference) once the first wrapper tells us what columns
-                  are universal vs. engine-specific
-    search        Search container (parallel to Library / Quant)
-    encyclopedia  jar subprocess via thirdparty registry
-    msfragger     TSV reader
-    counter       in-process Counter scoring (longer term)
+    schemas  -- PEPTIDE_SCORE_TABLE, PROTEIN_SCORE_TABLE
+    search   -- Search container (mirrors Library / Quant)
+    io       -- Reader/Writer Protocols + ParquetDirReader/Writer
 """
 
 from __future__ import annotations
 
-from typing import Any
+from constellation.massspec.search import schemas as schemas  # noqa: F401  (registers schemas)
+from constellation.massspec.search.search import Search, assemble_search
 
-_DEFERRED = (
-    "massspec.search is scaffold only — schema design is deferred until "
-    "the first concrete search-engine wrapper (EncyclopeDIA via "
-    "thirdparty.encyclopedia, or a Counter port) lands. The namespace is "
-    "reserved here so import-only smoke tests stay green; constructing "
-    "Search before the schemas are settled is intentionally blocked."
-)
-
-
-class Search:
-    """Container placeholder — see module docstring."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError(_DEFERRED)
-
-
-__all__ = ["Search"]
+__all__ = ["Search", "assemble_search"]

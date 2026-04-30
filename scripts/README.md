@@ -23,7 +23,7 @@ Run `constellation doctor` to see what's installed and what's missing.
 
 | Script | Tool | License | Notes |
 |---|---|---|---|
-| `install-encyclopedia.sh` | EncyclopeDIA 3.0.4 | Apache-2.0 | Bitbucket release; no license prompt |
+| `install-encyclopedia.sh` | EncyclopeDIA 2.12.30 | Apache-2.0 | Bitbucket release; no license prompt |
 
 More installers (Thermo DLLs, Dorado, IQ-TREE, …) land here as the
 corresponding domain modules are wired.

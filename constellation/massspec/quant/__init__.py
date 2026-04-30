@@ -16,16 +16,15 @@ not here.
     quant         Quant container (strict efficiency ∈ (0, 1] on
                   populated rows; -1.0 = uncalibrated)
     io            QuantReader / QuantWriter Protocols + registry +
-                  native ParquetDirReader/Writer; ElibQuantReader/Writer
-                  stubs raise NotImplementedError pending the
-                  EncyclopeDIA reader port.
+                  native ParquetDirReader/Writer. EncyclopeDIA
+                  ``.elib`` / ``.dlib`` adapters live in
+                  :mod:`massspec.io.encyclopedia` and self-register
+                  on package import.
 """
 
 from constellation.massspec.quant.io import (
     QUANT_READERS,
     QUANT_WRITERS,
-    ElibQuantReader,
-    ElibQuantWriter,
     ParquetDirReader,
     ParquetDirWriter,
     QuantReader,
@@ -62,6 +61,4 @@ __all__ = [
     "load_quant",
     "ParquetDirReader",
     "ParquetDirWriter",
-    "ElibQuantReader",
-    "ElibQuantWriter",
 ]
