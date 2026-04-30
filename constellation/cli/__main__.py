@@ -19,7 +19,16 @@ from typing import Callable
 # Import adapter modules for their side-effect of registering ToolSpecs.
 # Each adapter calls constellation.thirdparty.registry.register(...) at
 # import time so the `doctor` subcommand sees every known tool.
-from constellation.thirdparty import encyclopedia  # noqa: F401
+from constellation.thirdparty import (  # noqa: F401
+    busco,
+    dorado,
+    encyclopedia,
+    hifiasm,
+    minimap2,
+    mmseqs2,
+    ragtag,
+    samtools,
+)
 from constellation.thirdparty.registry import registered, try_find
 
 
@@ -82,6 +91,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ("koina", "Build spectral libraries via Koina (TODO)"),
         ("pod5", "Ingest POD5 signal to Parquet (TODO)"),
         ("structure", "Prepare structures for MD (TODO)"),
+        # Sequencing pipeline verbs — wire as Phases 3-11 land
+        ("basecall", "Run Dorado basecaller against POD5 inputs (TODO)"),
+        ("demux", "Segmented adapter / barcode demultiplex (TODO)"),
+        ("cluster", "kmer + abundance-weighted consensus clustering (TODO)"),
+        ("assemble", "Assemble reads with HiFiASM (TODO)"),
+        ("polish", "Polish a draft assembly with Dorado + minimap2 (TODO)"),
+        ("scaffold", "Reference-guided scaffolding via RagTag (TODO)"),
+        ("annotate", "BUSCO + repeat / telomere annotation (TODO)"),
+        ("project", "Initialize / inspect a Constellation project (TODO)"),
     ]:
         p = subs.add_parser(name, help=summary)
         p.set_defaults(func=_cmd_not_wired(name))

@@ -6,12 +6,16 @@ POD5 raw signal traces, ...). A schema earns a slot here only if its
 column structure is universal across ≥2 modalities; modality-specific
 information rides as **namespaced schema metadata**, not as columns.
 
-    Trace1D          — (time_s, intensity) with optional channel_id
+    Trace1D          — (time_s, intensity) with optional channel_id;
+                       row-per-sample, fine for short benchtop traces.
     SpectraMatrix2D  — (time_ms, spectrum: list<float64>[K])  for any
                        regular second axis (DAD wavelength, 2D NMR
-                       chemical shift). Irregular axes (MS m/z scans)
-                       belong in a sibling Spectra2DIrregular schema
-                       (deferred until the MS port).
+                       chemical shift); fixed inner dim.
+    RaggedTrace1D    — variable-length 1D blob per row, for POD5 raw
+                       signal (~10⁶ samples/read), MS scan blobs
+                       (~10⁵ peaks/scan), NMR FIDs, anywhere a row
+                       holds an irregular 1D array. Built via the
+                       ``ragged_trace_1d(value_dtype, ...)`` factory.
     PeakTable        — universal peak record across modalities.
 
 Metadata convention. Schema-level metadata is JSON-encoded UTF-8
@@ -32,6 +36,7 @@ form; consumers should always go through these.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from typing import Any
 
 import pyarrow as pa
@@ -77,6 +82,38 @@ def spectra_matrix_2d(n_axis: int) -> pa.Schema:
         ],
         metadata={b"schema_name": b"SpectraMatrix2D"},
     )
+
+
+def ragged_trace_1d(
+    value_dtype: pa.DataType,
+    *,
+    value_name: str = "y",
+    x_name: str | None = None,
+    extra_columns: Sequence[tuple[str, pa.DataType]] = (),
+) -> pa.Schema:
+    """Schema for variable-length 1D arrays per row.
+
+    Distinct from ``Trace1D`` (one row per sample — explodes for POD5)
+    and ``SpectraMatrix2D`` (fixed inner dim — only works on regular
+    grids like DAD wavelength bins). Used for:
+
+        POD5 raw signal     value_name='signal', value_dtype=int16,
+                            x implicit (t = start_sample / sampling_rate)
+        MS scan blob        value_name='intensity', value_dtype=float64,
+                            x_name='mz'  (when massspec scan readers ship)
+        NMR FID             value_name='fid', value_dtype=float64,
+                            x_name='time_us'
+
+    The bulk-array column comes last in the field order so per-row
+    metadata reads first. ``extra_columns`` carry whatever per-row
+    metadata the modality needs (read_id, channel, scale, sampling_rate
+    for POD5; rt, ms_level, polarity for MS scans).
+    """
+    cols = [pa.field(name, dtype, nullable=False) for name, dtype in extra_columns]
+    if x_name is not None:
+        cols.append(pa.field(x_name, pa.list_(pa.float64()), nullable=False))
+    cols.append(pa.field(value_name, pa.list_(value_dtype), nullable=False))
+    return pa.schema(cols, metadata={b"schema_name": b"RaggedTrace1D"})
 
 
 PEAK_TABLE = pa.schema(
@@ -221,6 +258,34 @@ def spectra_to_tensor(table: pa.Table) -> torch.Tensor:
 
         np_arr = np.stack(np_arr)
     return torch.from_numpy(np_arr)
+
+
+def ragged_to_tensors(
+    table: pa.Table,
+    *,
+    value_column: str = "y",
+    x_column: str | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor] | None]:
+    """Project ragged ``list<numeric>`` columns to per-row torch tensors.
+
+    Returns ``(values, xs)`` where ``values[i]`` is the 1D tensor from
+    row ``i``'s ``value_column``, and ``xs[i]`` is the 1D tensor from
+    ``x_column`` (or ``None`` when ``x_column`` is omitted). Each row
+    may have a different length — caller pads / batches as needed.
+    """
+    value_arr = table.column(value_column)
+    if hasattr(value_arr, "combine_chunks"):
+        value_arr = value_arr.combine_chunks()
+    values = [torch.from_numpy(value_arr[i].values.to_numpy(zero_copy_only=False).copy())
+              for i in range(len(value_arr))]
+    if x_column is None:
+        return values, None
+    x_arr = table.column(x_column)
+    if hasattr(x_arr, "combine_chunks"):
+        x_arr = x_arr.combine_chunks()
+    xs = [torch.from_numpy(x_arr[i].values.to_numpy(zero_copy_only=False).copy())
+          for i in range(len(x_arr))]
+    return values, xs
 
 
 def tensor_to_spectra(

@@ -11,6 +11,8 @@ from constellation.core.io.schemas import (
     TRACE_1D,
     cast_to_schema,
     pack_metadata,
+    ragged_to_tensors,
+    ragged_trace_1d,
     register_schema,
     registered_schemas,
     spectra_matrix_2d,
@@ -57,6 +59,84 @@ def test_spectra_matrix_2d_factory():
 def test_spectra_matrix_2d_rejects_zero():
     with pytest.raises(ValueError):
         spectra_matrix_2d(0)
+
+
+def test_ragged_trace_1d_minimal():
+    s = ragged_trace_1d(pa.int16(), value_name="signal")
+    names = [f.name for f in s]
+    assert names == ["signal"]
+    assert s.field("signal").type == pa.list_(pa.int16())
+    assert unpack_metadata(s.metadata)["schema_name"] == "RaggedTrace1D"
+
+
+def test_ragged_trace_1d_with_x_and_extras():
+    s = ragged_trace_1d(
+        pa.float64(),
+        value_name="intensity",
+        x_name="mz",
+        extra_columns=(
+            ("scan_id", pa.int64()),
+            ("rt_s", pa.float64()),
+        ),
+    )
+    names = [f.name for f in s]
+    # Per-row metadata first, then x, then bulk-array column.
+    assert names == ["scan_id", "rt_s", "mz", "intensity"]
+    assert s.field("mz").type == pa.list_(pa.float64())
+    assert s.field("intensity").type == pa.list_(pa.float64())
+
+
+def test_ragged_trace_1d_pod5_shape():
+    """The shape POD5 raw signal will instantiate."""
+    s = ragged_trace_1d(
+        pa.int16(),
+        value_name="signal",
+        x_name=None,
+        extra_columns=(
+            ("read_id", pa.string()),
+            ("channel", pa.int32()),
+            ("sampling_rate_hz", pa.float32()),
+        ),
+    )
+    assert s.field("signal").type == pa.list_(pa.int16())
+    assert "read_id" in [f.name for f in s]
+    # No implicit x column.
+    assert "x" not in [f.name for f in s]
+
+
+def test_ragged_to_tensors_no_x():
+    s = ragged_trace_1d(
+        pa.int16(), value_name="signal", extra_columns=(("read_id", pa.string()),)
+    )
+    table = pa.table(
+        {
+            "read_id": pa.array(["a", "b"]),
+            "signal": pa.array([[1, 2, 3], [10, 20]], type=pa.list_(pa.int16())),
+        },
+        schema=s,
+    )
+    values, xs = ragged_to_tensors(table, value_column="signal")
+    assert xs is None
+    assert len(values) == 2
+    assert values[0].dtype == torch.int16
+    assert torch.equal(values[0], torch.tensor([1, 2, 3], dtype=torch.int16))
+    assert torch.equal(values[1], torch.tensor([10, 20], dtype=torch.int16))
+
+
+def test_ragged_to_tensors_with_x():
+    s = ragged_trace_1d(pa.float64(), value_name="intensity", x_name="mz")
+    table = pa.table(
+        {
+            "mz": pa.array([[100.0, 200.0], [300.0]], type=pa.list_(pa.float64())),
+            "intensity": pa.array([[1.0, 2.0], [9.0]], type=pa.list_(pa.float64())),
+        },
+        schema=s,
+    )
+    values, xs = ragged_to_tensors(table, value_column="intensity", x_column="mz")
+    assert xs is not None
+    assert len(values) == 2 and len(xs) == 2
+    assert torch.equal(xs[0], torch.tensor([100.0, 200.0], dtype=torch.float64))
+    assert torch.equal(values[1], torch.tensor([9.0], dtype=torch.float64))
 
 
 # ----------------------------------------------------------------------
