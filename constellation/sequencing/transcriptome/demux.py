@@ -25,7 +25,7 @@ Within ``_annotate_strand`` the algorithm is:
     └─ score barcode panel against putative_umi  →  best match
 
 The orchestrator extracts slot parameters from the
-:class:`LibraryConstruct` and hands them to a :class:`Scorer`; the
+:class:`LibraryDesign` and hands them to a :class:`Scorer`; the
 scorer is the only seam where hard-threshold and probabilistic modes
 differ.
 """
@@ -45,7 +45,7 @@ from constellation.sequencing.schemas.transcriptome import (
 from constellation.sequencing.transcriptome.adapters import (
     AdapterSlot,
     BarcodeSlot,
-    LibraryConstruct,
+    LibraryDesign,
     PolyASlot,
     TranscriptSlot,
 )
@@ -105,18 +105,18 @@ def _slot_of_kind(layout: tuple, *kinds: str):
     return [s for s in layout if getattr(s, "kind", None) in kinds]
 
 
-def _extract_construct_params(construct: LibraryConstruct) -> dict[str, Any]:
+def _extract_design_params(design: LibraryDesign) -> dict[str, Any]:
     """Pull the slot params S1's hard-mode demux needs.
 
     Single SSP / single primer3 / single barcode panel — matches the
     cdna_wilburn_v1 layout. Multi-adapter slots (OR-of-targets) and
-    multi-panel constructs are deferred; raise clearly if encountered.
+    multi-panel designs are deferred; raise clearly if encountered.
     """
-    adapter_slots = _slot_of_kind(construct.layout, "adapter")
+    adapter_slots = _slot_of_kind(design.layout, "adapter")
     if len(adapter_slots) != 2:
         raise ValueError(
             f"S1 demux expects exactly 2 adapter slots (5' SSP + 3' primer); "
-            f"construct {construct.name!r} has {len(adapter_slots)}"
+            f"design {design.name!r} has {len(adapter_slots)}"
         )
     ssp_slot, primer3_slot = adapter_slots
     if not isinstance(ssp_slot, AdapterSlot) or not isinstance(primer3_slot, AdapterSlot):
@@ -127,28 +127,28 @@ def _extract_construct_params(construct: LibraryConstruct) -> dict[str, Any]:
             "OR-of-adapters lands when a real chemistry needs it)"
         )
 
-    polyA_slots = _slot_of_kind(construct.layout, "polyA")
+    polyA_slots = _slot_of_kind(design.layout, "polyA")
     if len(polyA_slots) != 1:
         raise ValueError(
-            f"construct {construct.name!r} must have exactly one PolyASlot"
+            f"design {design.name!r} must have exactly one PolyASlot"
         )
     polyA_slot = polyA_slots[0]
     if not isinstance(polyA_slot, PolyASlot):
         raise TypeError("polyA slot must be PolyASlot")
 
-    barcode_slots = _slot_of_kind(construct.layout, "barcode")
+    barcode_slots = _slot_of_kind(design.layout, "barcode")
     if len(barcode_slots) != 1:
         raise ValueError(
-            f"construct {construct.name!r} must have exactly one BarcodeSlot"
+            f"design {design.name!r} must have exactly one BarcodeSlot"
         )
     barcode_slot = barcode_slots[0]
     if not isinstance(barcode_slot, BarcodeSlot):
         raise TypeError("barcode slot must be BarcodeSlot")
 
-    transcript_slots = _slot_of_kind(construct.layout, "transcript")
+    transcript_slots = _slot_of_kind(design.layout, "transcript")
     if len(transcript_slots) != 1:
         raise ValueError(
-            f"construct {construct.name!r} must have exactly one TranscriptSlot"
+            f"design {design.name!r} must have exactly one TranscriptSlot"
         )
     transcript_slot = transcript_slots[0]
     if not isinstance(transcript_slot, TranscriptSlot):
@@ -382,22 +382,22 @@ def demux_one_read(
     read_id: str,
     sequence: str,
     quality: str | None,
-    construct: LibraryConstruct,
+    design: LibraryDesign,
     scorer: Scorer,
     *,
     _params: dict[str, Any] | None = None,
 ) -> ReadDemuxResult:
-    """Demux a single read against ``construct``.
+    """Demux a single read against ``design``.
 
     Public so unit tests / callers that already have a single read can
     skip the table-shaped path. The batch entry point
     :func:`locate_segments` precomputes ``_params`` once for the full
     table.
     """
-    params = _params or _extract_construct_params(construct)
+    params = _params or _extract_design_params(design)
 
     forward = _annotate_strand(sequence, "+", params, scorer)
-    if construct.allow_reverse_complement:
+    if design.allow_reverse_complement:
         rc_seq = _reverse_complement(sequence)
         rc_qual = quality[::-1] if quality is not None else None
         reverse = _annotate_strand(rc_seq, "-", params, scorer)
@@ -441,6 +441,7 @@ def _emit_segment_rows(
             "start": 0,
             "end": anno.ssp.boundary,
             "score": anno.ssp.edit_distance,
+            "score_delta": None,
             "barcode_id": None,
             "orientation": o,
         }
@@ -455,6 +456,7 @@ def _emit_segment_rows(
             "start": anno.transcript_start,
             "end": anno.transcript_end,
             "score": -1,  # transcripts aren't aligned against a target
+            "score_delta": None,
             "barcode_id": None,
             "orientation": o,
         }
@@ -469,6 +471,7 @@ def _emit_segment_rows(
             "start": anno.polyA.start,
             "end": anno.polyA.end_inclusive + 1,  # half-open
             "score": anno.polyA.length,
+            "score_delta": None,
             "barcode_id": None,
             "orientation": o,
         }
@@ -490,6 +493,7 @@ def _emit_segment_rows(
             "start": bc_start,
             "end": bc_end,
             "score": anno.barcode.edit_distance,
+            "score_delta": anno.barcode.delta_edit_distance,
             "barcode_id": anno.barcode.index,
             "orientation": o,
         }
@@ -515,6 +519,7 @@ def _emit_segment_rows(
             "start": p3_start,
             "end": p3_start,  # len-zero placeholder; refined post-S1
             "score": anno.primer3.edit_distance,
+            "score_delta": None,
             "barcode_id": None,
             "orientation": o,
         }
@@ -523,12 +528,12 @@ def _emit_segment_rows(
 
 def locate_segments(
     reads: pa.Table,
-    construct: LibraryConstruct,
+    design: LibraryDesign,
     *,
     scorer: Scorer | None = None,
     progress_cb=None,
 ) -> tuple[pa.Table, pa.Table, list[ReadDemuxResult]]:
-    """Apply the construct's segment layout to each read.
+    """Apply the design's segment layout to each read.
 
     Returns ``(segments_table, demux_table, results)`` where:
 
@@ -546,7 +551,7 @@ def locate_segments(
     """
     if scorer is None:
         scorer = HardThresholdScorer()
-    params = _extract_construct_params(construct)
+    params = _extract_design_params(design)
 
     read_ids = reads.column("read_id").to_pylist()
     sequences = reads.column("sequence").to_pylist()
@@ -562,7 +567,7 @@ def locate_segments(
 
     for read_id, seq, qual in zip(read_ids, sequences, qualities):
         result = demux_one_read(
-            read_id, seq, qual, construct, scorer, _params=params
+            read_id, seq, qual, design, scorer, _params=params
         )
         results.append(result)
         anno = result.annotation

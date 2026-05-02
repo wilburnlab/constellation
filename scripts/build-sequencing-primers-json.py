@@ -1,8 +1,8 @@
 """Generate constellation/data/sequencing/cdna_wilburn_v1.json — the lab's
-in-house TSO-based PCR-cDNA library construct (5' SSP + 3' adapter +
+in-house TSO-based PCR-cDNA library design (5' SSP + 3' adapter +
 24-barcode panel).
 
-Chemistry summary. The construct is a template-switching reverse
+Chemistry summary. The design is a template-switching reverse
 transcription + PCR amplification protocol — the "SMART" / IsoSeq family
 of cDNA preparations, generic name TSO-PCR-cDNA. cDNA is read 5' → 3' as:
 
@@ -27,7 +27,7 @@ import json
 from pathlib import Path
 
 
-# 5' strand-switch primer (constant across all reads in this construct).
+# 5' strand-switch primer (constant across all reads in this design).
 SSP = "AAGCAGTGGTATCAACGCAGAGTACGCGGG"
 
 # Common 25-nt prefix on every dT primer. The 3' adapter that demux
@@ -120,7 +120,7 @@ def main() -> None:
         "version": 1,
         "chemistry": "tso_pcr_cdna",
         "description": (
-            "In-house TSO-based PCR-cDNA construct used by the Wilburn "
+            "In-house TSO-based PCR-cDNA design used by the Wilburn "
             "lab for ONT long-read transcriptomics. Same chemistry "
             "family as IsoSeq (PacBio) and SMARTer (Takara) — generic "
             "term: template-switching reverse transcription + PCR. "
@@ -137,7 +137,7 @@ def main() -> None:
         "barcodes": barcodes,
     }
     out_path.write_text(json.dumps(doc, indent=2) + "\n")
-    print(f"wrote panel cdna_wilburn_v1 ({len(barcodes)} barcodes) → {out_path}")
+    print(f"wrote design cdna_wilburn_v1 ({len(barcodes)} barcodes) → {out_path}")
 
 
 if __name__ == "__main__":

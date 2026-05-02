@@ -44,7 +44,7 @@ from constellation.sequencing.transcriptome.demux import (
     resolve_demux,
 )
 from constellation.sequencing.transcriptome.orf import predict_orfs
-from constellation.sequencing.transcriptome.panels import CDNA_WILBURN_V1
+from constellation.sequencing.transcriptome.designs import CDNA_WILBURN_V1
 from constellation.sequencing.transcriptome.quant import (
     build_protein_count_matrix,
 )
@@ -134,8 +134,8 @@ def _mine_status_map(demux) -> dict[str, str]:
     return out
 
 
-def _mine_umi_map(segments, construct) -> dict[str, str | None]:
-    barcodes = construct.layout[3].barcodes
+def _mine_umi_map(segments, design) -> dict[str, str | None]:
+    barcodes = design.layout[3].barcodes
     out: dict[str, str | None] = {}
     for r in segments.to_pylist():
         if r["segment_kind"] == "barcode" and r["barcode_id"] is not None:

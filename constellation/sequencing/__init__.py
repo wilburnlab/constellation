@@ -21,7 +21,7 @@ in-our-development-of-fuzzy-quilt.md):
 
     Acquisitions, Samples, Reference, Assembly, Alignments, Project
     DoradoModel, DoradoRunner
-    LibraryConstruct, Adapter, Barcode (transcriptome demux primitives)
+    LibraryDesign, Adapter, Barcode (transcriptome demux primitives)
     locate_segments, resolve_demux, cluster_reads, build_consensus
     HiFiAsmRunner, PolishRunner, RagTagRunner, BuscoRunner
     pairwise_align, map_reads, locate_substring (alignment primitives)

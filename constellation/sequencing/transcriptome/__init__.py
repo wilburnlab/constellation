@@ -2,7 +2,7 @@
 
 Modules:
 
-    adapters     Adapter / Barcode / LibraryConstruct registry. Encodes
+    adapters     Adapter / Barcode / LibraryDesign registry. Encodes
                  the lab's in-house SMARTer-derived chemistry plus the
                  standard ONT kits (PCS111, PCB111, RCB114) as
                  composable Segment layouts.
@@ -28,7 +28,7 @@ from constellation.sequencing.transcriptome.adapters import (
     AdapterSlot,
     Barcode,
     BarcodeSlot,
-    LibraryConstruct,
+    LibraryDesign,
     PolyASlot,
     Segment,
     TranscriptSlot,
@@ -42,6 +42,14 @@ from constellation.sequencing.transcriptome.demux import (
 )
 from constellation.sequencing.transcriptome.network import build_read_network
 from constellation.sequencing.transcriptome.orf import predict_orfs
+from constellation.sequencing.transcriptome.simulator import (
+    GROUND_TRUTH_TABLE,
+    ReadSpec,
+    assemble_sequence,
+    generate_stress_test_specs,
+    mutate,
+    simulate_panel,
+)
 
 __all__ = [
     "Adapter",
@@ -52,11 +60,17 @@ __all__ = [
     "PolyASlot",
     "UMISlot",
     "TranscriptSlot",
-    "LibraryConstruct",
+    "LibraryDesign",
     "locate_segments",
     "resolve_demux",
     "predict_orfs",
     "cluster_reads",
     "build_consensus",
     "build_read_network",
+    "GROUND_TRUTH_TABLE",
+    "ReadSpec",
+    "assemble_sequence",
+    "generate_stress_test_specs",
+    "mutate",
+    "simulate_panel",
 ]

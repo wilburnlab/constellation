@@ -1,9 +1,9 @@
-"""Adapter / Barcode / LibraryConstruct — composable read-structure model.
+"""Adapter / Barcode / LibraryDesign — composable read-structure model.
 
 A nanopore cDNA read is a sequence of *segments*: 5' adapter, optional
 UMI, transcript, polyA tail, 3' adapter, barcode. Different chemistries
 arrange these segments in different orders with different sequences; a
-flexible ``LibraryConstruct`` lets demux work uniformly across:
+flexible ``LibraryDesign`` lets demux work uniformly across:
 
     - custom chemistries
     - standard ONT cDNA kits (SQK-PCS111, SQK-PCB111)
@@ -12,7 +12,7 @@ flexible ``LibraryConstruct`` lets demux work uniformly across:
 
 Segments are independent first-class objects so adapters and barcodes
 shared between kits aren't duplicated. Demux is then a function over
-``LibraryConstruct``; new kits add a construct rather than new code.
+``LibraryDesign``; new kits add a design rather than new code.
 
 Status: STUB. Concrete sequence registries (the lab's in-house adapter
 sequences, the ONT-published 96-barcode set, etc.) populate in Phase 5.
@@ -50,7 +50,7 @@ class Barcode:
 
     ``kit`` groups barcodes into the panel they belong to ('SQK-NBD114-24',
     'SQK-PCB111-96', 'lab-custom-v3'). Demux only considers barcodes
-    in the panel attached to the LibraryConstruct's BarcodeSlot.
+    in the panel attached to the LibraryDesign's BarcodeSlot.
     """
 
     name: str
@@ -59,17 +59,17 @@ class Barcode:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Segment ABCs (compose into LibraryConstruct.layout)
+# Segment ABCs (compose into LibraryDesign.layout)
 # ──────────────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True, slots=True)
 class Segment:
-    """Base for a slot in a LibraryConstruct's read-layout sequence.
+    """Base for a slot in a LibraryDesign's read-layout sequence.
 
     Concrete subclasses below — kept as discriminated dataclasses
     rather than a Protocol so Arrow / pickling can round-trip the
-    construct definitions.
+    design definitions.
     """
 
     kind: ClassVar[str] = "abstract"
@@ -137,19 +137,19 @@ class TranscriptSlot(Segment):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Composable construct
+# Composable design
 # ──────────────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True, slots=True)
-class LibraryConstruct:
+class LibraryDesign:
     """Composable description of a sequencing library's read structure.
 
     ``layout`` describes the segment order from 5' → 3' on the sense
     strand. ``allow_reverse_complement`` lets demux check both
     orientations (nanopore reads aren't strand-specific by default).
 
-    Phase 5 ships built-in constructs for:
+    Phase 5 ships built-in designs for:
 
         SMARTER_CDNA_INHOUSE   the lab's adapter chemistry
         ONT_PCS111             SQK-PCS111 cDNA-PCR sequencing
@@ -171,5 +171,5 @@ __all__ = [
     "PolyASlot",
     "UMISlot",
     "TranscriptSlot",
-    "LibraryConstruct",
+    "LibraryDesign",
 ]

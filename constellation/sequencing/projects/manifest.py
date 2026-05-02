@@ -10,7 +10,7 @@ the underlying bytes, and the manifest records the binding.
 verbs that delegate to the pure-functional core:
 
     proj.basecall(model)       → calls DoradoRunner.basecaller
-    proj.demux(construct)      → calls transcriptome.demux.locate_segments
+    proj.demux(design)         → calls transcriptome.demux.locate_segments
     proj.cluster()             → calls transcriptome.cluster.cluster_reads
     proj.assemble()            → calls assembly.hifiasm.HiFiAsmRunner.run
     proj.polish(rounds=2)      → calls assembly.polish.PolishRunner.run
@@ -119,7 +119,7 @@ class Project:
     def basecall(self, *, model, force: bool = False) -> "Project":
         raise NotImplementedError(f"Project.basecall pending {_PHASE}")
 
-    def demux(self, *, construct, force: bool = False) -> "Project":
+    def demux(self, *, design, force: bool = False) -> "Project":
         raise NotImplementedError(f"Project.demux pending {_PHASE}")
 
     def cluster(self, *, force: bool = False) -> "Project":

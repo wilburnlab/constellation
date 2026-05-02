@@ -1,26 +1,26 @@
 """SAM / BAM reader — produces READ_TABLE (and ALIGNMENT_TABLE when relevant).
 
 For the S1 transcriptomics pipeline, Dorado emits *unaligned* SAMs (FLAG=4,
-RNAME=*, no CIGAR), so the natural primary output is just READ_TABLE. The
-cross-tier `sequencing.io.sam_bam` adapter (which would split aligned BAMs
-into Reads + Alignments containers) stays stubbed until aligned-BAM workflows
-land.
+RNAME=*, no CIGAR) and aligned BAMs (post-minimap2), so the natural primary
+output is just READ_TABLE. The cross-tier `sequencing.io.sam_bam` adapter
+(which would split aligned BAMs into Reads + Alignments containers) stays
+stubbed until aligned-BAM workflows actually need the split.
 
-Two read paths:
+Two read paths, identical API on both readers:
 
-    SamReader.read(source, *, acquisition_id) -> ReadResult
-        Eager full-file read into a single READ_TABLE. Suitable for
-        small inputs and test fixtures.
+    {Sam,Bam}Reader.read(source, *, acquisition_id) -> ReadResult
+        Eager full-file read into a single READ_TABLE.
 
-    SamReader.iter_batches(path, batch_size, *, acquisition_id)
+    {Sam,Bam}Reader.iter_batches(path, batch_size, *, acquisition_id)
                                                 -> Iterator[pa.Table]
         Streaming batch read. Yields READ_TABLE chunks of up to
-        ``batch_size`` records via a single pass over the file. The
-        parallelization-feeding path; nothing materializes on disk
-        between SAM ingest and the worker shard.
+        ``batch_size`` records via a single pass.
 
-Pure-Python text scan — no pysam dep. ``BamReader`` (binary) lands
-later when the lab actually needs aligned BAM ingestion.
+``SamReader`` is pure-Python text scan (no pysam dep). ``BamReader`` is
+pysam-backed (``[sequencing]`` extra) and skips secondary (FLAG 0x100)
+and supplementary (FLAG 0x800) alignments — primary records only, so
+downstream READ_TABLE consumers see one row per read regardless of any
+alignment-stage chimera split.
 """
 
 from __future__ import annotations
@@ -225,26 +225,125 @@ class SamReader(RawReader):
         return Path(source)
 
 
+def _bam_record_to_row(rec: Any, acquisition_id: int) -> dict[str, Any]:
+    """Convert a pysam ``AlignedSegment`` to a READ_TABLE-shaped row.
+
+    Mirrors :func:`_parse_record`'s output exactly so SAM and BAM
+    ingest produce byte-identical READ_TABLE rows for the same
+    underlying record. Quality is rebuilt as offset-33 ASCII so the
+    on-disk parquet representation matches the SAM path.
+    """
+    seq = rec.query_sequence or ""
+    quals = rec.query_qualities  # numpy-like int array or None
+    if quals is not None and len(quals) > 0:
+        quality: str | None = "".join(chr(int(q) + 33) for q in quals)
+        mean_q: float | None = float(sum(int(q) for q in quals) / len(quals))
+    else:
+        quality = None
+        mean_q = None
+
+    channel: int | None = None
+    start_time_s: float | None = None
+    duration_s: float | None = None
+    try:
+        channel = int(rec.get_tag("ch"))
+    except KeyError:
+        pass
+    try:
+        st_value = rec.get_tag("st")
+        start_time_s = _parse_st_z_to_unix_seconds(str(st_value))
+    except KeyError:
+        pass
+    try:
+        duration_s = float(rec.get_tag("du"))
+    except KeyError:
+        pass
+
+    return {
+        "read_id": rec.query_name,
+        "acquisition_id": acquisition_id,
+        "sequence": seq,
+        "quality": quality,
+        "length": len(seq),
+        "mean_quality": mean_q,
+        "channel": channel,
+        "start_time_s": start_time_s,
+        "duration_s": duration_s,
+    }
+
+
 @register_reader
 class BamReader(RawReader):
-    """Decodes ``.bam`` (binary) into READ_TABLE + ALIGNMENT_TABLE.
+    """Decodes ``.bam`` (binary) into READ_TABLE.
 
-    Pending — S1 input is unaligned Dorado SAMs (handled by
-    :class:`SamReader`). When the lab actually needs aligned-BAM
-    ingestion (or duplex artifact validation in S3 forces the issue),
-    this implementation will use ``pysam.AlignmentFile`` and split
-    output into the per-tier companions for the cross-tier adapter
-    at :mod:`sequencing.io.sam_bam`.
+    Mirrors :class:`SamReader`'s API exactly. Skips secondary
+    (FLAG 0x100) and supplementary (FLAG 0x800) alignments — only
+    primary records contribute to READ_TABLE so cDNA pipelines see
+    one row per read regardless of any alignment-stage chimera split.
+
+    pysam is imported lazily (sequencing extra dep) so environments
+    without ``[sequencing]`` installed can still import the rest of
+    the package.
     """
 
     suffixes: ClassVar[tuple[str, ...]] = (".bam",)
     modality: ClassVar[str | None] = "nanopore"
 
-    def read(self, source: Path | Bundle | str) -> ReadResult:
-        raise NotImplementedError(
-            "BamReader is not yet implemented (S1 inputs are unaligned SAMs); "
-            "lands in S3 alongside the duplex artifact validation work."
+    def read(
+        self,
+        source: Path | Bundle | str,
+        *,
+        acquisition_id: int = 0,
+    ) -> ReadResult:
+        path = self._resolve_path(source)
+        records = list(self._iter_records(path, acquisition_id))
+        table = _records_to_table(records)
+        return ReadResult(
+            primary=table,
+            run_metadata={
+                "source_path": str(path),
+                "source_kind": "bam",
+            },
         )
+
+    def iter_batches(
+        self,
+        source: Path | Bundle | str,
+        batch_size: int,
+        *,
+        acquisition_id: int = 0,
+    ) -> Iterator[pa.Table]:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}")
+        path = self._resolve_path(source)
+        buffer: list[dict[str, Any]] = []
+        for row in self._iter_records(path, acquisition_id):
+            buffer.append(row)
+            if len(buffer) >= batch_size:
+                yield _records_to_table(buffer)
+                buffer = []
+        if buffer:
+            yield _records_to_table(buffer)
+
+    @staticmethod
+    def _resolve_path(source: Path | Bundle | str) -> Path:
+        if isinstance(source, Bundle):
+            return Path(source.path)
+        return Path(source)
+
+    @staticmethod
+    def _iter_records(path: Path, acquisition_id: int) -> Iterator[dict[str, Any]]:
+        # Local import keeps the rest of the package usable in
+        # environments that didn't install the [sequencing] extra.
+        import pysam  # type: ignore[import-not-found]
+
+        # check_sq=False: unaligned BAMs (Dorado direct output) have
+        # no @SQ headers; without the flag pysam errors on open.
+        with pysam.AlignmentFile(str(path), "rb", check_sq=False) as fh:
+            for rec in fh.fetch(until_eof=True):
+                if rec.is_secondary or rec.is_supplementary:
+                    continue
+                yield _bam_record_to_row(rec, acquisition_id)
 
 
 __all__ = ["BamReader", "SamReader"]

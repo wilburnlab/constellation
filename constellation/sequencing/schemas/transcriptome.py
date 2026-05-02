@@ -51,6 +51,13 @@ READ_SEGMENT_TABLE: pa.Schema = pa.schema(
         # (e.g. for transcript / umi segments that aren't aligned
         # against a reference)
         pa.field("score", pa.int32(), nullable=True),
+        # Best-vs-second-best score gap. Populated on barcode rows
+        # (barcode panel ranks ≥2 candidates by edit distance — the gap
+        # between best and second-best disambiguates close-tie matches);
+        # null on adapter / polyA / transcript rows that don't have a
+        # competing alternative. Calibration input for the future
+        # ProbabilisticScorer's barcode prior.
+        pa.field("score_delta", pa.int32(), nullable=True),
         # FK into the barcode registry; null when segment_kind != 'barcode'
         pa.field("barcode_id", pa.int64(), nullable=True),
         # '+' = read as-stored matched the construct; '-' = the read

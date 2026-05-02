@@ -301,29 +301,42 @@ class HardThresholdScorer:
         the no-match sentinel, NOT None, so the post-edlib filter must
         explicitly drop those before sorting; otherwise no-match reads
         get assigned to whichever barcode happens to be first in panel
-        order (the original-parquet bug). Concretely we use
-        ``locate_substring(..., max_distance)`` which already performs
-        the filter at edlib's level — a None return means "edlib found
-        nothing within budget", which we treat as no match.
+        order (the original-parquet bug).
+
+        ``delta_edit_distance`` is computed across the FULL panel — the
+        gap between the best match and the *true* second-best,
+        regardless of whether the second-best fits within
+        ``max_distance``. This matches the intuition the future
+        ProbabilisticScorer needs: a 0-vs-1 gap is much weaker
+        evidence than a 0-vs-6 gap, even if both look like a "Complete"
+        match under the hard threshold. Each barcode is scored with a
+        generous ``barcode_length``-budget so edlib returns the true
+        edit distance instead of a no-match sentinel.
         """
         if putative_umi is None or not putative_umi or not barcodes:
             return BarcodeVerdict(found=False)
-        results: list[tuple[int, Barcode, int]] = []
+        # Generous budget so we get the true edit distance for every
+        # barcode (not just those within `max_distance`). For 16-nt
+        # barcodes against a 16-17 nt region, max budget = 16 covers
+        # the worst case.
+        budget = max(len(bc.sequence) for bc in barcodes)
+        all_scores: list[tuple[int, Barcode, int]] = []
         for i, bc in enumerate(barcodes):
             rc = _reverse_complement(bc.sequence)
-            m = locate_substring(rc, putative_umi, max_distance=max_distance)
+            m = locate_substring(rc, putative_umi, max_distance=budget)
             if m is None:
                 continue
-            results.append((i, bc, m.edit_distance))
-        if not results:
+            all_scores.append((i, bc, m.edit_distance))
+        if not all_scores:
             return BarcodeVerdict(found=False)
-        # Smallest edit distance wins; ties broken by panel order
-        # (stable sort).
-        results.sort(key=lambda r: r[2])
-        best_i, best_bc, best_ed = results[0]
-        delta: int | None = None
-        if len(results) >= 2:
-            delta = results[1][2] - best_ed
+        all_scores.sort(key=lambda r: r[2])
+        best_i, best_bc, best_ed = all_scores[0]
+        delta: int | None = (
+            all_scores[1][2] - best_ed if len(all_scores) >= 2 else None
+        )
+        # Apply the user's threshold to the FOUND decision only.
+        if best_ed > max_distance:
+            return BarcodeVerdict(found=False)
         return BarcodeVerdict(
             found=True,
             index=best_i,

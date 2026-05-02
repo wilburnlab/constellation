@@ -36,7 +36,7 @@ dependencies = [
 # binaries (Thermo DLLs, EncyclopeDIA jar, mmseqs2, Dorado, ...) go
 # through `scripts/install-*.sh` and thirdparty/ adapters — not extras.
 ms         = ["requests", "koinapy"]
-sequencing = ["pod5>=0.3", "edlib", "parasail"]
+sequencing = ["pod5>=0.3", "edlib", "parasail", "pysam>=0.21"]
 structure  = []  # OpenMM + PDBFixer are conda-only; guarded lazy-import in thirdparty/
 dynamics   = []  # same
 all        = ["constellation[ms,sequencing,structure,dynamics]"]

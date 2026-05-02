@@ -3,7 +3,7 @@
   "name": "cdna_wilburn_v1",
   "version": 1,
   "chemistry": "tso_pcr_cdna",
-  "description": "In-house TSO-based PCR-cDNA construct used by the Wilburn lab for ONT long-read transcriptomics. Same chemistry family as IsoSeq (PacBio) and SMARTer (Takara) \u2014 generic term: template-switching reverse transcription + PCR. 24-barcode panel (BC01-BC24) embedded in oligo-dT primers.",
+  "description": "In-house TSO-based PCR-cDNA design used by the Wilburn lab for ONT long-read transcriptomics. Same chemistry family as IsoSeq (PacBio) and SMARTer (Takara) \u2014 generic term: template-switching reverse transcription + PCR. 24-barcode panel (BC01-BC24) embedded in oligo-dT primers.",
   "source": "Sequences from NanoporeAnalysis/transcriptome_nf/scripts/primers.txt; verbatim panel the lab has been running in production with NanoporeAnalysis.",
   "ssp": "AAGCAGTGGTATCAACGCAGAGTACGCGGG",
   "primer_3": "GTACTCTGCGTTGATACCACTGCTT",

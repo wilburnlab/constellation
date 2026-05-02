@@ -2,7 +2,7 @@
 
 The pipeline DAG:
 
-    sam_ingest        SAM → READ_TABLE   (single table, written once)
+    ingest_reads      SAM/BAM → READ_TABLE   (single table, written once)
     demux             per-batch worker:
                         locate_segments → READ_SEGMENT_TABLE
                         + READ_DEMUX_TABLE (sample_id unresolved)
@@ -13,7 +13,7 @@ The pipeline DAG:
                         build_protein_count_matrix → quant + FASTA + TSV
 
 Stages 1 and 3 run in the parent process (single-pass disk I/O for
-``sam_ingest``; small / sequential aggregation for ``resolve``).
+``ingest_reads``; small / sequential aggregation for ``resolve``).
 Stage 2 fans out via :func:`constellation.sequencing.parallel.run_batched`,
 so per-batch work scales with ``n_workers`` while writing
 deterministic ``part-NNNN.parquet`` shards under ``<output>/<key>/``.
@@ -52,8 +52,8 @@ from constellation.sequencing.transcriptome.demux import (
     locate_segments,
     resolve_demux,
 )
+from constellation.sequencing.transcriptome.designs import load_design
 from constellation.sequencing.transcriptome.orf import ORF_TABLE, predict_orfs
-from constellation.sequencing.transcriptome.panels import load_panel
 from constellation.sequencing.transcriptome.quant import (
     PROTEIN_COUNT_TABLE,
     FastaRecord,
@@ -82,13 +82,14 @@ KEY_PROTEIN_COUNTS_TSV = "protein_counts.tsv"
 def _demux_worker(
     batch: pa.Table,
     *,
-    construct_name: str,
+    library_design: str,
+    min_aa_length: int,
 ) -> dict[str, pa.Table]:
     """Run demux + ORF prediction on one batch of reads.
 
     Top-level function (not a closure) so ``ProcessPoolExecutor`` can
-    pickle it. Loads the construct by name inside the worker so we
-    don't pay for cross-process pickling of the panel object — the
+    pickle it. Loads the design by name inside the worker so we
+    don't pay for cross-process pickling of the design object — the
     JSON load is cheap and cached at the module level after first
     call.
 
@@ -96,9 +97,9 @@ def _demux_worker(
     sample assignment runs in the parent's ``resolve`` stage where
     the :class:`Samples` container is available.
     """
-    construct = load_panel(construct_name)
-    segments, demux, results = locate_segments(batch, construct)
-    orfs = predict_orfs(results)
+    design = load_design(library_design)
+    segments, demux, results = locate_segments(batch, design)
+    orfs = predict_orfs(results, min_aa_length=min_aa_length)
     return {
         KEY_READ_SEGMENTS: segments,
         KEY_READ_DEMUX: demux,
@@ -121,23 +122,30 @@ def _read_table_to_batches(
         yield table.slice(start, batch_size)
 
 
-def ingest_sam(
-    sam_path: Path,
+def ingest_reads(
+    input_path: Path,
     *,
     acquisition_id: int,
     output_dir: Path,
     progress_cb: ProgressCallback | None = None,
     resume: bool = False,
 ) -> pa.Table:
-    """Ingest a SAM file into ``output_dir/reads.parquet`` and return
-    the resulting :class:`READ_TABLE`-shaped :class:`pa.Table`.
+    """Ingest a SAM or BAM file into ``output_dir/reads.parquet`` and
+    return the resulting :class:`READ_TABLE`-shaped :class:`pa.Table`.
+
+    Reader selection is suffix-dispatched via
+    :func:`core.io.readers.find_reader` with ``modality="nanopore"`` —
+    so ``.sam`` resolves to :class:`SamReader` (pure-Python text scan)
+    and ``.bam`` resolves to :class:`BamReader` (pysam-backed). Both
+    yield the same :class:`READ_TABLE` shape; downstream stages don't
+    care which file format the bytes came from.
 
     Single file, single writer — no partitioned dataset (``READ_TABLE``
     is small enough to keep as one parquet). Resume: if the output
     file exists *and* a sentinel ``reads.parquet._SUCCESS`` marker
     sits next to it, the existing parquet is reused.
     """
-    from constellation.sequencing.readers.sam_bam import SamReader
+    from constellation.core.io.readers import find_reader
 
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / f"{KEY_READS}.parquet"
@@ -157,8 +165,9 @@ def ingest_sam(
         )
         return table
 
-    emit_start(progress_cb, KEY_READS, message=f"reading {sam_path}")
-    table = SamReader().read(sam_path, acquisition_id=acquisition_id).primary
+    emit_start(progress_cb, KEY_READS, message=f"reading {input_path}")
+    reader = find_reader(input_path, modality="nanopore")
+    table = reader.read(input_path, acquisition_id=acquisition_id).primary
     pq.write_table(table, target)
     success.touch()
     emit_done(
@@ -179,10 +188,11 @@ def ingest_sam(
 def run_demux_stage(
     reads: pa.Table,
     *,
-    construct_name: str,
+    library_design: str,
     output_dir: Path,
     batch_size: int,
     n_workers: int = 1,
+    min_aa_length: int = 60,
     progress_cb: ProgressCallback | None = None,
     resume: bool = False,
 ) -> dict[str, StageOutput]:
@@ -203,7 +213,10 @@ def run_demux_stage(
         output_dir=output_dir,
         output_keys=(KEY_READ_SEGMENTS, KEY_READ_DEMUX, KEY_ORFS),
         n_workers=n_workers,
-        worker_kwargs={"construct_name": construct_name},
+        worker_kwargs={
+            "library_design": library_design,
+            "min_aa_length": min_aa_length,
+        },
         progress_cb=progress_cb,
         resume=resume,
         stage_label="demux",
@@ -290,19 +303,20 @@ def resolve_and_quantify(
 
 
 def run_demux_pipeline(
-    sam_path: Path,
+    input_path: Path,
     *,
-    construct_name: str,
+    library_design: str,
     samples: Samples,
     acquisition_id: int,
     output_dir: Path,
     batch_size: int = 100_000,
     n_workers: int = 1,
+    min_aa_length: int = 60,
     min_protein_count: int = 2,
     progress_cb: ProgressCallback | None = None,
     resume: bool = False,
 ) -> dict[str, object]:
-    """End-to-end demux pipeline: SAM → counts.
+    """End-to-end demux pipeline: SAM/BAM → counts.
 
     Returns a dict of artefact tables / records / paths that the CLI
     handler renders into stdout / disk locations.
@@ -311,8 +325,8 @@ def run_demux_pipeline(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    reads = ingest_sam(
-        sam_path,
+    reads = ingest_reads(
+        input_path,
         acquisition_id=acquisition_id,
         output_dir=output_dir,
         progress_cb=cb,
@@ -321,10 +335,11 @@ def run_demux_pipeline(
 
     demux_outputs = run_demux_stage(
         reads,
-        construct_name=construct_name,
+        library_design=library_design,
         output_dir=output_dir,
         batch_size=batch_size,
         n_workers=n_workers,
+        min_aa_length=min_aa_length,
         progress_cb=cb,
         resume=resume,
     )
@@ -357,7 +372,7 @@ __all__ = [
     "KEY_READS",
     "KEY_READ_DEMUX",
     "KEY_READ_SEGMENTS",
-    "ingest_sam",
+    "ingest_reads",
     "resolve_and_quantify",
     "run_demux_pipeline",
     "run_demux_stage",

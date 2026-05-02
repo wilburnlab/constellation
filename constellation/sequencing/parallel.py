@@ -159,8 +159,8 @@ def run_batched(
         parent only coordinates indices and emits progress.
     worker_kwargs
         Extra kwargs passed to ``worker_fn`` per-batch. Must be
-        picklable; commonly the construct *name* (string) rather
-        than the construct instance, since name-loading is cheap.
+        picklable; commonly the design *name* (string) rather
+        than the design instance, since name-loading is cheap.
     progress_cb
         Optional :class:`ProgressCallback`. Receives ``stage_start``
         once, ``stage_progress`` after each batch, ``stage_done`` at

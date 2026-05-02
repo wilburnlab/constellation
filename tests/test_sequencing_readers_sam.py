@@ -206,10 +206,120 @@ def test_real_fixture_first_read_sanity() -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_bam_reader_stub_raises(tmp_path: Path) -> None:
-    """BamReader is not in S1; calling .read() should raise
-    NotImplementedError clearly."""
-    p = tmp_path / "fake.bam"
-    p.write_bytes(b"")
-    with pytest.raises(NotImplementedError, match="BamReader is not yet implemented"):
-        BamReader().read(p)
+def _write_synthetic_bam(path: Path, records: list[tuple[str, str, list[int], int | None, float | None, bool, bool]]) -> None:
+    """Write a synthetic unaligned BAM at ``path``.
+
+    Each record tuple: (read_id, sequence, qualities, ch_or_None,
+    du_or_None, is_secondary, is_supplementary). FLAG is computed from
+    the bool flags + the unmapped bit (4).
+    """
+    pysam = pytest.importorskip("pysam")
+    header = {"HD": {"VN": "1.6", "SO": "unknown"}}
+    with pysam.AlignmentFile(str(path), "wb", header=header) as fh:
+        for read_id, seq, quals, ch, du, is_sec, is_sup in records:
+            rec = pysam.AlignedSegment(fh.header)
+            rec.query_name = read_id
+            flag = 4  # unmapped
+            if is_sec:
+                flag |= 0x100
+            if is_sup:
+                flag |= 0x800
+            rec.flag = flag
+            rec.query_sequence = seq
+            rec.query_qualities = pysam.qualitystring_to_array(
+                "".join(chr(q + 33) for q in quals)
+            )
+            if ch is not None:
+                rec.set_tag("ch", ch, value_type="i")
+            if du is not None:
+                rec.set_tag("du", du, value_type="f")
+            fh.write(rec)
+
+
+def test_bam_reader_round_trip(tmp_path: Path) -> None:
+    """Synthetic BAM round-trips into a READ_TABLE-shaped pa.Table."""
+    pytest.importorskip("pysam")
+    bam_path = tmp_path / "synthetic.bam"
+    _write_synthetic_bam(
+        bam_path,
+        [
+            ("read-001", "ACGTACGTAC", [10] * 10, 14, 0.5, False, False),
+            ("read-002", "NNNNN", [2] * 5, 7, 0.25, False, False),
+        ],
+    )
+    table = BamReader().read(bam_path, acquisition_id=42).primary
+    assert table.schema.equals(READ_TABLE)
+    assert table.num_rows == 2
+    rows = table.to_pylist()
+    assert rows[0]["read_id"] == "read-001"
+    assert rows[0]["sequence"] == "ACGTACGTAC"
+    assert rows[0]["length"] == 10
+    assert rows[0]["quality"] == "+" * 10  # chr(10+33) == '+'
+    assert rows[0]["channel"] == 14
+    assert rows[0]["duration_s"] == pytest.approx(0.5)
+    assert rows[0]["acquisition_id"] == 42
+    assert rows[0]["mean_quality"] == pytest.approx(10.0)
+    assert rows[1]["read_id"] == "read-002"
+    assert rows[1]["channel"] == 7
+
+
+def test_bam_reader_skips_secondary_and_supplementary(tmp_path: Path) -> None:
+    """Secondary (0x100) and supplementary (0x800) records are filtered."""
+    pytest.importorskip("pysam")
+    bam_path = tmp_path / "with_aux.bam"
+    _write_synthetic_bam(
+        bam_path,
+        [
+            ("read-primary", "AAAAA", [10] * 5, 1, 0.1, False, False),
+            ("read-secondary", "CCCCC", [10] * 5, 1, 0.1, True, False),
+            ("read-supplementary", "GGGGG", [10] * 5, 1, 0.1, False, True),
+        ],
+    )
+    table = BamReader().read(bam_path).primary
+    assert table.num_rows == 1
+    assert table.column("read_id").to_pylist() == ["read-primary"]
+
+
+def test_bam_reader_iter_batches_chunk_boundary(tmp_path: Path) -> None:
+    """3 records, batch_size=2 → batches of [2, 1]."""
+    pytest.importorskip("pysam")
+    bam_path = tmp_path / "three.bam"
+    _write_synthetic_bam(
+        bam_path,
+        [(f"r{i}", "AC", [20, 20], i, 0.5, False, False) for i in range(3)],
+    )
+    batches = list(BamReader().iter_batches(bam_path, batch_size=2))
+    assert [b.num_rows for b in batches] == [2, 1]
+    assert all(b.schema.equals(READ_TABLE) for b in batches)
+
+
+def test_bam_reader_iter_batches_invalid_size(tmp_path: Path) -> None:
+    pytest.importorskip("pysam")
+    bam_path = tmp_path / "tiny.bam"
+    _write_synthetic_bam(
+        bam_path, [("r0", "A", [20], 1, 0.1, False, False)]
+    )
+    with pytest.raises(ValueError, match="batch_size must be > 0"):
+        list(BamReader().iter_batches(bam_path, batch_size=0))
+
+
+def test_bam_reader_run_metadata_populated(tmp_path: Path) -> None:
+    pytest.importorskip("pysam")
+    bam_path = tmp_path / "synthetic.bam"
+    _write_synthetic_bam(
+        bam_path, [("r0", "AC", [20, 20], 1, 0.1, False, False)]
+    )
+    result = BamReader().read(bam_path)
+    assert result.run_metadata["source_kind"] == "bam"
+    assert result.run_metadata["source_path"] == str(bam_path)
+
+
+def test_bam_reader_registered_for_suffix() -> None:
+    """``find_reader`` resolves ``.bam`` to BamReader under modality 'nanopore'."""
+    pytest.importorskip("pysam")
+    # Trigger reader-package import so the registry is populated.
+    import constellation.sequencing  # noqa: F401
+    from constellation.core.io.readers import find_reader
+
+    reader = find_reader(Path("x.bam"), modality="nanopore")
+    assert isinstance(reader, BamReader)

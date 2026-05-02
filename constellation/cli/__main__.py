@@ -129,18 +129,23 @@ def _build_transcriptome_parser(subs) -> None:
             "matrix; replaces NanoporeAnalysis transcriptome_nf"
         ),
     )
-    p_dem.add_argument("--sam", required=True, help="path to a Dorado-emitted SAM")
     p_dem.add_argument(
-        "--construct",
+        "--reads",
+        required=True,
+        help="path to a Dorado-emitted SAM or BAM (suffix-dispatched)",
+    )
+    p_dem.add_argument(
+        "--library-design",
         default="cdna_wilburn_v1",
-        help="LibraryConstruct panel name (see panels.available_panels())",
+        help="LibraryDesign name (see designs.available_designs())",
     )
     p_dem.add_argument(
         "--samples",
         required=True,
         help=(
             "TSV file: sample_id (int) + sample_name (str) + barcode_id "
-            "(int, 0-indexed into the panel) per line; header optional"
+            "(int, 0-indexed into the design's barcode panel) per line; "
+            "header optional"
         ),
     )
     p_dem.add_argument(
@@ -153,6 +158,15 @@ def _build_transcriptome_parser(subs) -> None:
         type=int,
         default=1,
         help="acquisition_id stamped onto every read (default 1)",
+    )
+    p_dem.add_argument(
+        "--min-aa-length",
+        type=int,
+        default=60,
+        help=(
+            "minimum protein length (in amino acids) for ORF prediction "
+            "(default 60 — matches NanoporeAnalysis _fixed1 baseline)"
+        ),
     )
     p_dem.add_argument(
         "--min-protein-count",
@@ -207,7 +221,7 @@ def _build_transcriptome_parser(subs) -> None:
 
 
 def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
-    """Run the full S1 demux + ORF + quant pipeline on a SAM."""
+    """Run the full S1 demux + ORF + quant pipeline on a SAM/BAM."""
     # Defer heavy imports until the subcommand actually fires so
     # `constellation --help` stays fast.
     import json
@@ -222,7 +236,7 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         run_demux_pipeline,
     )
 
-    sam_path = Path(args.sam)
+    input_path = Path(args.reads)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -261,13 +275,14 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
     cb = StreamProgress() if args.progress else NullProgress()
 
     artefacts = run_demux_pipeline(
-        sam_path,
-        construct_name=args.construct,
+        input_path,
+        library_design=args.library_design,
         samples=samples,
         acquisition_id=args.acquisition_id,
         output_dir=output_dir,
         batch_size=args.batch_size,
         n_workers=args.threads,
+        min_aa_length=args.min_aa_length,
         min_protein_count=args.min_protein_count,
         progress_cb=cb,
         resume=args.resume,
@@ -280,9 +295,10 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
 
     # Manifest for reproducibility audit.
     manifest = {
-        "input_sam": str(sam_path),
-        "construct": args.construct,
+        "input_path": str(input_path),
+        "library_design": args.library_design,
         "acquisition_id": args.acquisition_id,
+        "min_aa_length": args.min_aa_length,
         "min_protein_count": args.min_protein_count,
         "n_reads": reads.num_rows,
         "n_demux_rows": demux_table.num_rows,
