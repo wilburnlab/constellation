@@ -1,0 +1,133 @@
+{
+  "schema_version": "1",
+  "name": "cdna_wilburn_v1",
+  "version": 1,
+  "chemistry": "tso_pcr_cdna",
+  "description": "In-house TSO-based PCR-cDNA construct used by the Wilburn lab for ONT long-read transcriptomics. Same chemistry family as IsoSeq (PacBio) and SMARTer (Takara) \u2014 generic term: template-switching reverse transcription + PCR. 24-barcode panel (BC01-BC24) embedded in oligo-dT primers.",
+  "source": "Sequences from NanoporeAnalysis/transcriptome_nf/scripts/primers.txt; verbatim panel the lab has been running in production with NanoporeAnalysis.",
+  "ssp": "AAGCAGTGGTATCAACGCAGAGTACGCGGG",
+  "primer_3": "GTACTCTGCGTTGATACCACTGCTT",
+  "barcode_length": 16,
+  "barcodes": [
+    {
+      "name": "BC01",
+      "sequence": "CACATATCAGAGTGCG",
+      "source_primer": "dT_BC1001_PB"
+    },
+    {
+      "name": "BC02",
+      "sequence": "ACACACAGACTGTGAG",
+      "source_primer": "dT_BC1002_PB"
+    },
+    {
+      "name": "BC03",
+      "sequence": "ACACATCTCGTGAGAG",
+      "source_primer": "dT_BC1003_PB"
+    },
+    {
+      "name": "BC04",
+      "sequence": "CACGCACACACGCGCG",
+      "source_primer": "dT_BC1004_PB"
+    },
+    {
+      "name": "BC05",
+      "sequence": "CACTCGACTCTCGCGT",
+      "source_primer": "dT_BC1005_PB"
+    },
+    {
+      "name": "BC06",
+      "sequence": "CATATATATCAGCTGT",
+      "source_primer": "dT_BC1006_PB"
+    },
+    {
+      "name": "BC07",
+      "sequence": "TCTGTATCTCTATGTG",
+      "source_primer": "dT_BC1007_PB"
+    },
+    {
+      "name": "BC08",
+      "sequence": "ACAGTCGAGCGCTGCG",
+      "source_primer": "dT_BC1008_PB"
+    },
+    {
+      "name": "BC09",
+      "sequence": "ACACACGCGAGACAGA",
+      "source_primer": "dT_BC1009_PB"
+    },
+    {
+      "name": "BC10",
+      "sequence": "ACGCGCTATCTCAGAG",
+      "source_primer": "dT_BC1010_PB"
+    },
+    {
+      "name": "BC11",
+      "sequence": "CTATACGTATATCTAT",
+      "source_primer": "dT_BC1011_PB"
+    },
+    {
+      "name": "BC12",
+      "sequence": "ACACTAGATCGCGTGT",
+      "source_primer": "dT_BC1012_PB"
+    },
+    {
+      "name": "BC13",
+      "sequence": "CTCTCGCATACGCGAG",
+      "source_primer": "dT_BC1013_PB"
+    },
+    {
+      "name": "BC14",
+      "sequence": "CTCACTACGCGCGCGT",
+      "source_primer": "dT_BC1014_PB"
+    },
+    {
+      "name": "BC15",
+      "sequence": "CGCATGACACGTGTGT",
+      "source_primer": "dT_BC1015_PB"
+    },
+    {
+      "name": "BC16",
+      "sequence": "CATAGAGAGATAGTAT",
+      "source_primer": "dT_BC1016_PB"
+    },
+    {
+      "name": "BC17",
+      "sequence": "CACACGCGCGCTATAT",
+      "source_primer": "dT_BC1017_PB"
+    },
+    {
+      "name": "BC18",
+      "sequence": "TCACGTGCTCACTGTG",
+      "source_primer": "dT_BC1018_PB"
+    },
+    {
+      "name": "BC19",
+      "sequence": "ACACACTCTATCAGAT",
+      "source_primer": "dT_BC1019_PB"
+    },
+    {
+      "name": "BC20",
+      "sequence": "CACGACACGACGATGT",
+      "source_primer": "dT_BC1020_PB"
+    },
+    {
+      "name": "BC21",
+      "sequence": "CTATACATAGTGATGT",
+      "source_primer": "dT_BC1021_PB"
+    },
+    {
+      "name": "BC22",
+      "sequence": "CACTCACGTGTGATAT",
+      "source_primer": "dT_BC1022_PB"
+    },
+    {
+      "name": "BC23",
+      "sequence": "CAGAGAGATATCTCTG",
+      "source_primer": "dT_BC1023_PB"
+    },
+    {
+      "name": "BC24",
+      "sequence": "CATGTAGAGCAGAGAG",
+      "source_primer": "dT_BC1024_PB"
+    }
+  ]
+}

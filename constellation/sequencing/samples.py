@@ -18,18 +18,19 @@ The ``SAMPLE_ACQUISITION_EDGE`` table encodes the resolver as a tiny
 Arrow table; ``Samples`` wraps both with PK uniqueness + FK closure.
 ``barcode_id`` may be null (= "use all reads from this acquisition")
 to handle the genomic case without bifurcating the schema.
-
-Status: STUB. Schemas final; container methods raise
-``NotImplementedError`` pending Phase 1 (Foundation).
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import pyarrow as pa
 
-from constellation.core.io.schemas import register_schema
+from constellation.core.io.schemas import (
+    cast_to_schema,
+    register_schema,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -68,37 +69,78 @@ register_schema("SampleAcquisitionEdge", SAMPLE_ACQUISITION_EDGE)
 # ──────────────────────────────────────────────────────────────────────
 
 
-_PHASE = "Phase 1 (Foundation)"
-
-
 @dataclass(frozen=True, slots=True)
 class Samples:
     """Bundles a ``SAMPLE_TABLE`` with its ``SAMPLE_ACQUISITION_EDGE``.
 
     Validation on construction: ``sample_id`` PK uniqueness, edge-table
-    cast, and (when an ``Acquisitions`` is supplied) FK closure of
-    ``acquisition_id`` references via :func:`validate_acquisitions`.
+    cast, and edge-side FK closure (every ``edges.sample_id`` exists in
+    ``samples.sample_id``). ``acquisition_id`` FK closure across an
+    external :class:`Acquisitions` is left to ``validate_acquisitions``
+    at the call site so the container itself doesn't need an
+    ``Acquisitions`` reference.
     """
 
     samples: pa.Table
     edges: pa.Table
 
     def __post_init__(self) -> None:
-        raise NotImplementedError(
-            f"Samples PK uniqueness + edge cast pending {_PHASE}"
-        )
+        samples_cast = cast_to_schema(self.samples, SAMPLE_TABLE)
+        edges_cast = cast_to_schema(self.edges, SAMPLE_ACQUISITION_EDGE)
+        object.__setattr__(self, "samples", samples_cast)
+        object.__setattr__(self, "edges", edges_cast)
+
+        ids = samples_cast.column("sample_id").to_pylist()
+        if len(set(ids)) != len(ids):
+            duplicates = sorted({i for i in ids if ids.count(i) > 1})
+            raise ValueError(
+                f"sample_id contains duplicates: {duplicates[:5]}"
+                f"{'...' if len(duplicates) > 5 else ''}"
+            )
+
+        known = set(ids)
+        edge_sample_ids = edges_cast.column("sample_id").to_pylist()
+        unknown = {sid for sid in edge_sample_ids if sid not in known}
+        if unknown:
+            sample = sorted(unknown)[:5]
+            raise ValueError(
+                f"edges reference unknown sample_ids: "
+                f"{sample}{'...' if len(unknown) > 5 else ''}"
+            )
 
     @classmethod
-    def empty(cls) -> "Samples":
-        raise NotImplementedError(f"Samples.empty pending {_PHASE}")
+    def empty(cls) -> Samples:
+        return cls(SAMPLE_TABLE.empty_table(), SAMPLE_ACQUISITION_EDGE.empty_table())
+
+    @classmethod
+    def from_records(
+        cls,
+        samples: Iterable[dict[str, object]],
+        edges: Iterable[dict[str, object]],
+    ) -> Samples:
+        sample_rows = list(samples)
+        edge_rows = list(edges)
+        s_table = (
+            pa.Table.from_pylist(sample_rows, schema=SAMPLE_TABLE)
+            if sample_rows
+            else SAMPLE_TABLE.empty_table()
+        )
+        e_table = (
+            pa.Table.from_pylist(edge_rows, schema=SAMPLE_ACQUISITION_EDGE)
+            if edge_rows
+            else SAMPLE_ACQUISITION_EDGE.empty_table()
+        )
+        return cls(s_table, e_table)
 
     @property
     def ids(self) -> list[int]:
-        raise NotImplementedError(f"Samples.ids pending {_PHASE}")
+        return self.samples.column("sample_id").to_pylist()
 
     def acquisitions_for(self, sample_id: int) -> list[int]:
         """All acquisition_ids that contribute to ``sample_id``."""
-        raise NotImplementedError(f"Samples.acquisitions_for pending {_PHASE}")
+        mask = pa.compute.equal(self.edges.column("sample_id"), sample_id)
+        filtered = self.edges.filter(mask)
+        return filtered.column("acquisition_id").to_pylist()
 
     def samples_for(
         self,
@@ -111,10 +153,16 @@ class Samples:
         rows (genomic). If barcode_id is supplied, returns the sample
         for that specific barcode within the acquisition.
         """
-        raise NotImplementedError(f"Samples.samples_for pending {_PHASE}")
+        acq_match = pa.compute.equal(self.edges.column("acquisition_id"), acquisition_id)
+        if barcode_id is None:
+            bc_match = pa.compute.is_null(self.edges.column("barcode_id"))
+        else:
+            bc_match = pa.compute.equal(self.edges.column("barcode_id"), barcode_id)
+        mask = pa.compute.and_(acq_match, bc_match)
+        return self.edges.filter(mask).column("sample_id").to_pylist()
 
     def __len__(self) -> int:
-        raise NotImplementedError(f"Samples.__len__ pending {_PHASE}")
+        return self.samples.num_rows
 
 
 __all__ = [

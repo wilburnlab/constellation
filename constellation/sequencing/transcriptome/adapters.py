@@ -5,7 +5,7 @@ UMI, transcript, polyA tail, 3' adapter, barcode. Different chemistries
 arrange these segments in different orders with different sequences; a
 flexible ``LibraryConstruct`` lets demux work uniformly across:
 
-    - the lab's in-house SMARTer-derived chemistry
+    - custom chemistries
     - standard ONT cDNA kits (SQK-PCS111, SQK-PCB111)
     - direct-RNA chemistry (RCB114) — fewer segments, no PCR
     - future kits as ONT releases them
@@ -106,12 +106,15 @@ class PolyASlot(Segment):
     """PolyA / polyT tail slot — used as the demux anchor.
 
     ``min_length`` is the minimum number of consecutive A's (or T's
-    on antisense) required to call a polyA region. ``edge_distance``
-    permits this many edit operations at the boundaries (homopolymer
-    error tolerance).
+    on antisense) required to call a polyA region. ``max_length``
+    optionally caps how many A's are permitted before the run is
+    rejected as a homopolymer artifact rather than a polyA tail
+    (NanoporeAnalysis caps at 40). ``edge_distance`` permits this many
+    edit operations at the boundaries (homopolymer error tolerance).
     """
 
     min_length: int = 20
+    max_length: int | None = None
     edge_distance: int = 1
     kind: ClassVar[str] = "polyA"
 

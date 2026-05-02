@@ -72,7 +72,12 @@ READ_DEMUX_TABLE: pa.Schema = pa.schema(
         # Multiple rows for a single read_id when the read is a
         # concatemer; segment_index distinguishes them
         pa.field("transcript_segment_index", pa.int32(), nullable=False),
-        pa.field("sample_id", pa.int64(), nullable=False),
+        # Nullable: the read may have no resolvable sample assignment
+        # (no barcode found, or barcode below acceptance threshold).
+        # We still emit a row so downstream code can audit the un-
+        # assigned reads; null sample_id is the explicit "Source_None"
+        # case in NanoporeAnalysis's per-read output.
+        pa.field("sample_id", pa.int64(), nullable=True),
         # 0-based half-open offsets into the read for the transcript window
         pa.field("transcript_start", pa.int32(), nullable=False),
         pa.field("transcript_end", pa.int32(), nullable=False),
@@ -81,6 +86,24 @@ READ_DEMUX_TABLE: pa.Schema = pa.schema(
         # True if the parent read was a concatemer / chimera with ≥2
         # transcript segments
         pa.field("is_chimera", pa.bool_(), nullable=False),
+        # Read-level classification (NanoporeAnalysis parity values:
+        # 'Complete', "3' Only", "5' Only", 'Missing Barcode',
+        # 'Unknown', 'Complex'; later sessions add 'Palindromic',
+        # 'Truncated', 'TerminalDropout' as artifact detection lands).
+        # Stored as string for stable parquet round-trips and to mirror
+        # NanoporeAnalysis's `cDNA status` column literally; the Python-
+        # side `ReadStatus(StrEnum)` in transcriptome.classify gives type
+        # safety where it matters.
+        pa.field("status", pa.string(), nullable=False),
+        # True when the resolved transcript window is shorter than the
+        # min_transcript_len threshold — broken out as a separate column
+        # rather than munged onto status (NanoporeAnalysis appended a
+        # " Fragment" suffix to the string).
+        pa.field("is_fragment", pa.bool_(), nullable=False),
+        # Artifact tag (Session 3 fills with 'palindromic' / 'chimera' /
+        # 'terminal_dropout_5p' / 'terminal_dropout_3p'; populated 'none'
+        # in Session 1 so the column is real from day one).
+        pa.field("artifact", pa.string(), nullable=False),
     ],
     metadata={b"schema_name": b"ReadDemuxTable"},
 )

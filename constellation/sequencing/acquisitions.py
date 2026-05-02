@@ -13,19 +13,21 @@ The columns differ — sequencing carries flow-cell + chemistry kit +
 basecaller-model fields that don't exist in MS — but the container
 contract (PK uniqueness, ``validate_acquisitions`` cross-check) is
 identical.
-
-Status: STUB. Schema definition is final; container methods raise
-``NotImplementedError`` pending Phase 1 (Foundation). See plan file
-in-our-development-of-fuzzy-quilt.md.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import pyarrow as pa
 
-from constellation.core.io.schemas import register_schema
+from constellation.core.io.schemas import (
+    cast_to_schema,
+    pack_metadata,
+    register_schema,
+    unpack_metadata,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -37,7 +39,7 @@ SEQUENCING_ACQUISITION_TABLE: pa.Schema = pa.schema(
     [
         pa.field("acquisition_id", pa.int64(), nullable=False),
         pa.field("source_path", pa.string(), nullable=False),
-        # 'pod5_dir' | 'pod5_file' | 'bam' | 'fastq' | 'fasta'
+        # 'pod5_dir' | 'pod5_file' | 'bam' | 'fastq' | 'fasta' | 'sam'
         pa.field("source_kind", pa.string(), nullable=False),
         pa.field("acquisition_datetime", pa.string(), nullable=True),
         # PromethION / MinION / GridION host + position id
@@ -65,9 +67,6 @@ register_schema("SequencingAcquisitionTable", SEQUENCING_ACQUISITION_TABLE)
 # ──────────────────────────────────────────────────────────────────────
 
 
-_PHASE = "Phase 1 (Foundation)"
-
-
 @dataclass(frozen=True, slots=True)
 class Acquisitions:
     """Container around a ``SEQUENCING_ACQUISITION_TABLE``-shaped Arrow
@@ -81,24 +80,47 @@ class Acquisitions:
     table: pa.Table
 
     def __post_init__(self) -> None:
-        raise NotImplementedError(
-            f"Acquisitions PK uniqueness + cast pending {_PHASE}"
-        )
+        cast = cast_to_schema(self.table, SEQUENCING_ACQUISITION_TABLE)
+        object.__setattr__(self, "table", cast)
+        ids = cast.column("acquisition_id").to_pylist()
+        if len(set(ids)) != len(ids):
+            duplicates = sorted({i for i in ids if ids.count(i) > 1})
+            raise ValueError(
+                f"acquisition_id contains duplicates: {duplicates[:5]}"
+                f"{'...' if len(duplicates) > 5 else ''}"
+            )
 
     @classmethod
-    def empty(cls) -> "Acquisitions":
-        raise NotImplementedError(f"Acquisitions.empty pending {_PHASE}")
+    def empty(cls) -> Acquisitions:
+        return cls(SEQUENCING_ACQUISITION_TABLE.empty_table())
 
     @classmethod
-    def from_records(cls, records) -> "Acquisitions":
-        raise NotImplementedError(f"Acquisitions.from_records pending {_PHASE}")
+    def from_records(
+        cls,
+        records: Iterable[dict[str, object]],
+    ) -> Acquisitions:
+        rows = list(records)
+        if not rows:
+            return cls.empty()
+        table = pa.Table.from_pylist(rows, schema=SEQUENCING_ACQUISITION_TABLE)
+        return cls(table)
 
     @property
     def ids(self) -> list[int]:
-        raise NotImplementedError(f"Acquisitions.ids pending {_PHASE}")
+        return self.table.column("acquisition_id").to_pylist()
+
+    @property
+    def metadata(self) -> dict[str, object]:
+        return unpack_metadata(self.table.schema.metadata)
+
+    def with_metadata(self, extras: dict[str, object]) -> Acquisitions:
+        existing = unpack_metadata(self.table.schema.metadata)
+        existing.update(extras)
+        new_table = self.table.replace_schema_metadata(pack_metadata(existing))
+        return Acquisitions(new_table)
 
     def __len__(self) -> int:
-        raise NotImplementedError(f"Acquisitions.__len__ pending {_PHASE}")
+        return self.table.num_rows
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -122,7 +144,27 @@ def validate_acquisitions(
     permits a column where missing values mean "applies to all
     acquisitions" (e.g. run-agnostic reference annotations).
     """
-    raise NotImplementedError(f"validate_acquisitions pending {_PHASE}")
+    if column not in table.column_names:
+        raise ValueError(f"table missing FK column {column!r}")
+    col = table.column(column)
+    known = set(acquisitions.ids)
+    values = col.to_pylist()
+    unknown: set[int] = set()
+    for v in values:
+        if v is None:
+            if not nullable:
+                raise ValueError(
+                    f"column {column!r} contains nulls but nullable=False"
+                )
+            continue
+        if v not in known:
+            unknown.add(v)
+    if unknown:
+        sample = sorted(unknown)[:5]
+        raise ValueError(
+            f"{column} references unknown acquisition_ids: "
+            f"{sample}{'...' if len(unknown) > 5 else ''}"
+        )
 
 
 __all__ = [
