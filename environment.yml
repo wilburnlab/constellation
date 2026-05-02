@@ -24,6 +24,11 @@ dependencies:
   # `constellation doctor --workflow <name>`.
   - mmseqs2
   - openjdk
+  # BAM I/O for sequencing pipelines (htslib-backed). Bioconda ships a
+  # newer manylinux build than PyPI's wheel — keep here rather than in
+  # the [sequencing] extra so `pip install -e .[sequencing]` doesn't
+  # rebuild against system htslib.
+  - pysam>=0.21
   # Structure / MD (conda-forge). Guarded by lazy imports in thirdparty/.
   # Uncomment as structure module comes online:
   # - openmm>=8.0
