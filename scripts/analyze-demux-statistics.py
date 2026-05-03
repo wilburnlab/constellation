@@ -20,22 +20,27 @@ dominated by sequencing error rather than artifact.
 Architecture (per CLAUDE.md invariant #3)
 -----------------------------------------
 The full Pichia output has ~30M reads × 3-4 segments per read = 100M+
-segment rows. Materialising that as a single ``pa.Table`` and walking
-it via ``to_pylist()`` is single-threaded, RAM-unbounded, and slow.
+segment rows. We process this in three multithreaded Arrow steps —
+NO Python orchestration loop:
 
-Instead we:
+  - **One** ``pa.dataset.to_table(filter=..., columns=...)`` call
+    against ``read_segments/`` — Arrow does projection-pushdown
+    (reads only the 6 columns we need from parquet) and predicate-
+    pushdown (filters out non-interesting segment_kinds at scan
+    time). Multithreaded across all parquet shards via Arrow's I/O
+    thread pool.
+  - **One** Arrow hash-join onto the projected
+    ``(read_id, status, is_fragment)`` view of ``read_demux/`` —
+    multithreaded inside Arrow.
+  - **24** vectorised ``filter()`` calls (6 statuses × 4 kinds), each
+    one full-table scan with a SIMD boolean mask. The result of each
+    is converted directly to a numpy array via
+    ``column.to_numpy(zero_copy_only=False)`` — no Python row
+    materialisation.
 
-  - Project ``read_demux/`` once to ``(read_id, status, is_fragment)`` —
-    ~30M rows × ~30 bytes is bounded RAM, kept as the join-side
-    lookup table (never converted to Python).
-  - Stream ``read_segments/`` via ``dataset.to_batches(columns=...)``.
-    Per batch: Arrow-filter to the four interesting segment_kinds,
-    Arrow hash-join onto the demux projection, then **append numpy
-    chunks** (not Python rows) to per-``(status, kind)`` accumulators.
-  - After all batches, ``np.concatenate`` per (status, kind, metric)
-    into dense numpy arrays bounded by the sum of relevant rows.
-    Histograms via ``np.bincount``, percentiles via ``np.quantile`` —
-    both vectorised.
+Histograms come from ``np.bincount``; percentiles from
+``np.quantile``. The 24 final filters are one-shot, not per-batch:
+total Python orchestration is constant regardless of input size.
 
 Outputs (under <out-dir>, default = <demux_output_dir>/stats/):
     demux_statistics_summary.json  — per-status histograms + percentiles.
@@ -77,243 +82,50 @@ _KEEP_KINDS: tuple[str, ...] = ("adapter_5p", "adapter_3p", "polyA", "barcode")
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Streaming accumulator
+# Per-bucket numpy arrays
 # ──────────────────────────────────────────────────────────────────────
 
 
-class _Accumulator:
-    """Per-``(status, segment_kind)`` numpy buffer.
+def _extract_buckets(
+    joined: pa.Table,
+) -> dict[tuple[str, str], dict[str, np.ndarray]]:
+    """Split the joined table into per-(status, segment_kind) numpy
+    arrays for the three metric columns (score, score_delta, length).
 
-    Stores list-of-numpy-chunks per metric (score, score_delta, length).
-    ``finalize()`` concatenates each list into one dense array.
-    Memory peak per bucket ≈ sum of values seen for that bucket — for
-    the full Pichia BAM that's ~30M ints across all buckets, ~120 MB
-    total in dense numpy form.
+    24 vectorised ``filter()`` calls (6 statuses × 4 kinds), each
+    one full-table scan with a SIMD boolean mask. Each filtered
+    sub-table is converted directly to a numpy array via
+    ``to_numpy(zero_copy_only=False)`` — no Python row materialization.
     """
-
-    __slots__ = ("score_chunks", "delta_chunks", "length_chunks")
-
-    def __init__(self) -> None:
-        self.score_chunks: list[np.ndarray] = []
-        self.delta_chunks: list[np.ndarray] = []
-        self.length_chunks: list[np.ndarray] = []
-
-    def extend(
-        self,
-        scores: np.ndarray,
-        deltas: np.ndarray,
-        lengths: np.ndarray,
-    ) -> None:
-        if scores.size:
-            self.score_chunks.append(scores)
-        if deltas.size:
-            self.delta_chunks.append(deltas)
-        if lengths.size:
-            self.length_chunks.append(lengths)
-
-    def finalize(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        s = np.concatenate(self.score_chunks) if self.score_chunks else np.empty(0, dtype=np.int64)
-        d = np.concatenate(self.delta_chunks) if self.delta_chunks else np.empty(0, dtype=np.int64)
-        l_ = np.concatenate(self.length_chunks) if self.length_chunks else np.empty(0, dtype=np.int64)
-        return s, d, l_
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Streaming join + accumulate
-# ──────────────────────────────────────────────────────────────────────
-
-
-def _stream_into_accumulators(
-    demux_proj: pa.Table,
-    seg_dataset: ds.Dataset,
-    *,
-    batch_size: int,
-    progress: bool,
-) -> tuple[
-    dict[tuple[str, str], _Accumulator],
-    pa.Table | None,
-]:
-    """Walk segments dataset in batches, join + accumulate per
-    ``(status, segment_kind)``.
-
-    Returns the accumulators plus, optionally, a per-row table for
-    ``--emit-rows``. The per-row table is built incrementally as
-    ``pa.Table.from_pylist`` of small per-batch arrow tables, so it
-    doesn't itself drive RAM blow-up — but it does add a write-time
-    cost the user opts into deliberately.
-    """
-    keep_kinds_arr = pa.array(list(_KEEP_KINDS))
-    accumulators: dict[tuple[str, str], _Accumulator] = {}
-    rows_chunks: list[pa.Table] = []
-
-    n_seen = 0
-    n_kept = 0
-    for batch in seg_dataset.to_batches(
-        columns=[
-            "read_id", "segment_kind", "score", "score_delta", "start", "end"
-        ],
-        batch_size=batch_size,
-    ):
-        n_seen += batch.num_rows
-        if batch.num_rows == 0:
-            continue
-        batch_table = pa.Table.from_batches([batch])
-
-        # 1) Filter to interesting segment kinds — Arrow C-level.
-        kind_mask = pc.is_in(batch_table.column("segment_kind"), value_set=keep_kinds_arr)
-        filtered = batch_table.filter(kind_mask)
-        if filtered.num_rows == 0:
-            continue
-
-        # 2) Join (status, is_fragment) onto each segment row via
-        #    the small projected demux lookup. Arrow's hash join is
-        #    vectorised; right side is ~30M rows held once.
-        joined = filtered.join(demux_proj, keys="read_id", join_type="inner")
-        if joined.num_rows == 0:
-            continue
-
-        # 3) Compute length column (end - start).
-        length_col = pc.subtract(joined.column("end"), joined.column("start"))
-        joined = joined.append_column("length", length_col)
-        n_kept += joined.num_rows
-
-        # 4) For each (status, kind) bucket present in this batch,
-        #    extract the three metric columns as numpy and append.
-        statuses_arr = joined.column("status")
-        kinds_arr = joined.column("segment_kind")
-
-        # Distinct statuses seen in this batch — small set.
-        unique_statuses = pc.unique(statuses_arr).to_pylist()
-        for status in unique_statuses:
-            sm = pc.equal(statuses_arr, status)
-            for kind in _KEEP_KINDS:
-                km = pc.equal(kinds_arr, kind)
-                both = pc.and_(sm, km)
-                sub = joined.filter(both)
-                if sub.num_rows == 0:
-                    continue
-                acc = accumulators.setdefault((status, kind), _Accumulator())
-                # Numpy extracts: each call is one C-level copy, no
-                # Python row materialization.
-                scores = sub.column("score").to_numpy(zero_copy_only=False)
-                deltas = sub.column("score_delta").to_numpy(zero_copy_only=False)
-                lengths = sub.column("length").to_numpy(zero_copy_only=False)
-                # score_delta is nullable; null → -1 sentinel for the
-                # delta histogram's "<0" bucket. fill_null in Arrow
-                # would be more vectorised but the conversion already
-                # gave us a numpy array; null-mask via numpy.
-                if hasattr(deltas, "mask") or np.issubdtype(deltas.dtype, np.floating):
-                    # Pyarrow returns a masked / float64 array when
-                    # nulls are present; convert nulls → -1 sentinel.
-                    deltas_np = np.where(np.isnan(deltas), -1, deltas).astype(np.int64) \
-                        if np.issubdtype(deltas.dtype, np.floating) else \
-                        np.where(deltas.mask, -1, deltas.data).astype(np.int64)
-                else:
-                    deltas_np = deltas.astype(np.int64)
-                acc.extend(
-                    scores.astype(np.int64, copy=False),
-                    deltas_np,
-                    lengths.astype(np.int64, copy=False),
-                )
-
-        if progress:
-            print(
-                f"  ... {n_seen:>12,} segments scanned, {n_kept:>12,} kept",
-                file=sys.stderr,
-                flush=True,
-            )
-        # Don't accumulate per-row chunks unless caller asked
-        # (handled by emit_rows path in main).
-        del batch_table, filtered, joined
-
-    return accumulators, None
-
-
-def _stream_into_accumulators_with_rows(
-    demux_proj: pa.Table,
-    seg_dataset: ds.Dataset,
-    *,
-    batch_size: int,
-    progress: bool,
-    rows_writer: pq.ParquetWriter,
-) -> dict[tuple[str, str], _Accumulator]:
-    """Same streaming path but additionally writes per-row stats to a
-    ParquetWriter as it goes — opt-in via ``--emit-rows``.
-    """
-    keep_kinds_arr = pa.array(list(_KEEP_KINDS))
-    accumulators: dict[tuple[str, str], _Accumulator] = {}
-
-    n_seen = 0
-    n_kept = 0
-    for batch in seg_dataset.to_batches(
-        columns=[
-            "read_id", "segment_kind", "score", "score_delta", "start", "end"
-        ],
-        batch_size=batch_size,
-    ):
-        n_seen += batch.num_rows
-        if batch.num_rows == 0:
-            continue
-        batch_table = pa.Table.from_batches([batch])
-
-        kind_mask = pc.is_in(batch_table.column("segment_kind"), value_set=keep_kinds_arr)
-        filtered = batch_table.filter(kind_mask)
-        if filtered.num_rows == 0:
-            continue
-        joined = filtered.join(demux_proj, keys="read_id", join_type="inner")
-        if joined.num_rows == 0:
-            continue
-        length_col = pc.subtract(joined.column("end"), joined.column("start"))
-        joined = joined.append_column("length", length_col)
-        n_kept += joined.num_rows
-
-        # Per-row write: rename + project to canonical column order
-        # before writing each batch.
-        per_row = joined.select(
-            ["read_id", "status", "is_fragment", "segment_kind",
-             "score", "score_delta", "length"]
-        ).rename_columns(
-            ["read_id", "status", "is_fragment", "segment_kind",
-             "edit_distance", "score_delta", "length"]
-        )
-        rows_writer.write_table(per_row)
-
-        # Accumulate per-(status, kind) numpy chunks (same as the
-        # rows-less variant).
-        statuses_arr = joined.column("status")
-        kinds_arr = joined.column("segment_kind")
-        unique_statuses = pc.unique(statuses_arr).to_pylist()
-        for status in unique_statuses:
-            sm = pc.equal(statuses_arr, status)
-            for kind in _KEEP_KINDS:
-                km = pc.equal(kinds_arr, kind)
-                both = pc.and_(sm, km)
-                sub = joined.filter(both)
-                if sub.num_rows == 0:
-                    continue
-                acc = accumulators.setdefault((status, kind), _Accumulator())
-                scores = sub.column("score").to_numpy(zero_copy_only=False)
-                deltas = sub.column("score_delta").to_numpy(zero_copy_only=False)
-                lengths = sub.column("length").to_numpy(zero_copy_only=False)
-                if np.issubdtype(deltas.dtype, np.floating):
-                    deltas_np = np.where(np.isnan(deltas), -1, deltas).astype(np.int64)
-                else:
-                    deltas_np = deltas.astype(np.int64)
-                acc.extend(
-                    scores.astype(np.int64, copy=False),
-                    deltas_np,
-                    lengths.astype(np.int64, copy=False),
-                )
-
-        if progress:
-            print(
-                f"  ... {n_seen:>12,} segments scanned, {n_kept:>12,} kept",
-                file=sys.stderr,
-                flush=True,
-            )
-        del batch_table, filtered, joined, per_row
-
-    return accumulators
+    out: dict[tuple[str, str], dict[str, np.ndarray]] = {}
+    statuses_arr = joined.column("status")
+    kinds_arr = joined.column("segment_kind")
+    unique_statuses = pc.unique(statuses_arr).to_pylist()
+    for status in unique_statuses:
+        sm = pc.equal(statuses_arr, status)
+        for kind in _KEEP_KINDS:
+            km = pc.equal(kinds_arr, kind)
+            both = pc.and_(sm, km)
+            sub = joined.filter(both)
+            if sub.num_rows == 0:
+                continue
+            scores = sub.column("score").to_numpy(zero_copy_only=False)
+            deltas = sub.column("score_delta").to_numpy(zero_copy_only=False)
+            lengths = sub.column("length").to_numpy(zero_copy_only=False)
+            # score_delta is nullable; nulls come back as float64 NaN
+            # under pyarrow's default conversion. Convert NaN → -1
+            # sentinel so the "<0" bucket of the delta histogram
+            # captures unscored rows.
+            if np.issubdtype(deltas.dtype, np.floating):
+                deltas_np = np.where(np.isnan(deltas), -1, deltas).astype(np.int64)
+            else:
+                deltas_np = deltas.astype(np.int64)
+            out[(status, kind)] = {
+                "score": scores.astype(np.int64, copy=False),
+                "score_delta": deltas_np,
+                "length": lengths.astype(np.int64, copy=False),
+            }
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -387,82 +199,55 @@ def _delta_hist_np(arr: np.ndarray) -> dict[str, int]:
 
 
 def _build_summary(
-    accumulators: dict[tuple[str, str], _Accumulator],
+    buckets: dict[tuple[str, str], dict[str, np.ndarray]],
 ) -> dict:
-    """Convert per-(status, kind) accumulators into the summary dict.
+    """Convert per-(status, kind) numpy buckets into the summary dict.
 
-    Each accumulator's chunked numpy arrays are concatenated once,
-    then the histogram + percentiles are computed via numpy on the
-    dense arrays. No Python row iteration anywhere on the hot path.
+    Histograms via numpy (np.bincount); percentiles via np.quantile —
+    both vectorised. No Python row iteration anywhere on the hot path.
     """
-    statuses = sorted({status for status, _ in accumulators})
+    statuses = sorted({status for status, _ in buckets})
+    empty = np.empty(0, dtype=np.int64)
     out: dict[str, dict] = {}
     for status in statuses:
-        # Read-count for this status: derive from any kind's row count
-        # (every status-kind pair sees the same set of reads' segments,
-        # though not every read has every kind). We use barcode rows
-        # (one per read with a barcode found) as the canonical n_reads
-        # estimate, falling back to the largest bucket.
         n_reads = 0
         for kind in _KEEP_KINDS:
-            acc = accumulators.get((status, kind))
-            if acc is None:
+            data = buckets.get((status, kind))
+            if data is None:
                 continue
-            n = sum(c.size for c in acc.score_chunks)
-            n_reads = max(n_reads, n)
+            n_reads = max(n_reads, int(data["score"].size))
 
         per_kind: dict[str, dict] = {}
         for kind in ("adapter_5p", "adapter_3p"):
-            acc = accumulators.get((status, kind))
-            if acc is None:
-                per_kind[kind] = {
-                    "hist": _edit_dist_hist_np(np.empty(0, dtype=np.int64)),
-                    "percentiles": _percentiles_np(np.empty(0, dtype=np.int64)),
-                    "n": 0,
-                }
-                continue
-            scores, _, _ = acc.finalize()
+            data = buckets.get((status, kind))
+            scores = data["score"] if data is not None else empty
             valid = scores[scores >= 0]
             per_kind[kind] = {
                 "hist": _edit_dist_hist_np(scores),
                 "percentiles": _percentiles_np(valid),
                 "n": int(valid.size),
             }
-        # PolyA: use length, not score.
-        polyA_acc = accumulators.get((status, "polyA"))
-        if polyA_acc is None:
-            per_kind["polyA"] = {
-                "hist": _polya_len_hist_np(np.empty(0, dtype=np.int64)),
-                "percentiles": _percentiles_np(np.empty(0, dtype=np.int64)),
-                "n": 0,
-            }
+        polyA = buckets.get((status, "polyA"))
+        lengths = polyA["length"] if polyA is not None else empty
+        per_kind["polyA"] = {
+            "hist": _polya_len_hist_np(lengths),
+            "percentiles": _percentiles_np(lengths),
+            "n": int(lengths.size),
+        }
+        bc = buckets.get((status, "barcode"))
+        if bc is None:
+            scores, deltas = empty, empty
         else:
-            _, _, lengths = polyA_acc.finalize()
-            per_kind["polyA"] = {
-                "hist": _polya_len_hist_np(lengths),
-                "percentiles": _percentiles_np(lengths),
-                "n": int(lengths.size),
-            }
-        bc_acc = accumulators.get((status, "barcode"))
-        if bc_acc is None:
-            per_kind["barcode"] = {
-                "edit_hist": _edit_dist_hist_np(np.empty(0, dtype=np.int64)),
-                "edit_percentiles": _percentiles_np(np.empty(0, dtype=np.int64)),
-                "delta_hist": _delta_hist_np(np.empty(0, dtype=np.int64)),
-                "delta_percentiles": _percentiles_np(np.empty(0, dtype=np.int64)),
-                "n": 0,
-            }
-        else:
-            scores, deltas, _ = bc_acc.finalize()
-            valid_scores = scores[scores >= 0]
-            valid_deltas = deltas[deltas >= 0]
-            per_kind["barcode"] = {
-                "edit_hist": _edit_dist_hist_np(scores),
-                "edit_percentiles": _percentiles_np(valid_scores),
-                "delta_hist": _delta_hist_np(deltas),
-                "delta_percentiles": _percentiles_np(valid_deltas),
-                "n": int(valid_scores.size),
-            }
+            scores, deltas = bc["score"], bc["score_delta"]
+        valid_scores = scores[scores >= 0]
+        valid_deltas = deltas[deltas >= 0]
+        per_kind["barcode"] = {
+            "edit_hist": _edit_dist_hist_np(scores),
+            "edit_percentiles": _percentiles_np(valid_scores),
+            "delta_hist": _delta_hist_np(deltas),
+            "delta_percentiles": _percentiles_np(valid_deltas),
+            "n": int(valid_scores.size),
+        }
         out[status] = {"n_reads": n_reads, **per_kind}
     return out
 
@@ -473,7 +258,7 @@ def _build_summary(
 
 
 def _emit_pdf(
-    accumulators: dict[tuple[str, str], _Accumulator],
+    buckets: dict[tuple[str, str], dict[str, np.ndarray]],
     pdf_path: Path,
 ) -> None:
     """Render the four-panel distribution plot from numpy arrays."""
@@ -482,25 +267,22 @@ def _emit_pdf(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    statuses = sorted({status for status, _ in accumulators})
-    finalised: dict[tuple[str, str], tuple[np.ndarray, np.ndarray, np.ndarray]] = {
-        key: acc.finalize() for key, acc in accumulators.items()
-    }
+    statuses = sorted({status for status, _ in buckets})
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     axes_flat = axes.flatten()
     panels = [
-        ("adapter_5p", 0, "edit distance", "5' adapter edit distance", axes_flat[0]),
-        ("adapter_3p", 0, "edit distance", "3' adapter edit distance", axes_flat[1]),
-        ("polyA",      2, "length",        "polyA length",             axes_flat[2]),
-        ("barcode",    1, "score_delta",   "barcode score_delta",       axes_flat[3]),
+        ("adapter_5p", "score",       "edit distance", "5' adapter edit distance", axes_flat[0]),
+        ("adapter_3p", "score",       "edit distance", "3' adapter edit distance", axes_flat[1]),
+        ("polyA",      "length",      "length",        "polyA length",             axes_flat[2]),
+        ("barcode",    "score_delta", "score_delta",   "barcode score_delta",       axes_flat[3]),
     ]
-    for kind, metric_idx, xlabel, title, ax in panels:
+    for kind, metric, xlabel, title, ax in panels:
         for status in statuses:
-            arrs = finalised.get((status, kind))
-            if arrs is None:
+            data = buckets.get((status, kind))
+            if data is None:
                 continue
-            arr = arrs[metric_idx]
+            arr = data[metric]
             valid = arr[arr >= 0]
             if valid.size == 0:
                 continue
@@ -539,13 +321,6 @@ def main() -> int:
         help="directory for stats outputs (default: <output_dir>/stats)",
     )
     parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=500_000,
-        help="rows per segment-dataset batch (default 500000 — tune lower "
-        "if RAM-constrained, higher for fewer Arrow op invocations)",
-    )
-    parser.add_argument(
         "--emit-rows",
         action="store_true",
         help="also write the per-(read, segment) joined table as "
@@ -561,7 +336,7 @@ def main() -> int:
     parser.add_argument(
         "--progress",
         action="store_true",
-        help="print per-batch scan progress to stderr",
+        help="print per-stage timings to stderr",
     )
     args = parser.parse_args()
 
@@ -575,75 +350,110 @@ def main() -> int:
     if not demux_dir.is_dir():
         raise FileNotFoundError(f"missing read_demux directory: {demux_dir}")
 
-    # 1) Project demux to the join-side columns. ~30M rows × 3 small
+    import time
+
+    def _tick(label: str, t0: float) -> float:
+        if args.progress:
+            print(
+                f"  [{time.time() - t0:7.2f}s] {label}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return time.time()
+
+    t0 = time.time()
+
+    # 1) Project read_demux to join-side columns. ~30M rows × 3 small
     #    fields → ~1 GB pa.Table held throughout.
     if args.progress:
-        print("loading demux projection (read_id, status, is_fragment) ...",
-              file=sys.stderr, flush=True)
+        print("loading read_demux projection ...", file=sys.stderr, flush=True)
     demux_ds = ds.dataset(str(demux_dir), format="parquet")
     demux_proj = demux_ds.to_table(
         columns=["read_id", "status", "is_fragment"]
     )
-    if args.progress:
-        print(f"  loaded {demux_proj.num_rows:,} demux rows",
-              file=sys.stderr, flush=True)
+    t1 = _tick(f"demux projection: {demux_proj.num_rows:,} rows", t0)
 
-    # 2) Stream segments → accumulate.
-    seg_ds = ds.dataset(str(seg_dir), format="parquet")
+    # 2) Filter + project read_segments at dataset level. Arrow does
+    #    projection-pushdown into parquet (only reads our 6 columns)
+    #    AND predicate-pushdown for the segment_kind filter — entire
+    #    operation is multithreaded across all parquet shards via
+    #    Arrow's I/O thread pool, no Python in the loop.
+    keep_kinds_arr = pa.array(list(_KEEP_KINDS))
     if args.progress:
-        print(f"streaming segments dataset ({len(seg_ds.files)} shards) ...",
-              file=sys.stderr, flush=True)
+        seg_ds = ds.dataset(str(seg_dir), format="parquet")
+        print(
+            f"filtering+projecting read_segments ({len(seg_ds.files)} shards, "
+            f"keeping segment_kind in {list(_KEEP_KINDS)}) ...",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        seg_ds = ds.dataset(str(seg_dir), format="parquet")
+    filtered_segs = seg_ds.to_table(
+        columns=["read_id", "segment_kind", "score", "score_delta", "start", "end"],
+        filter=ds.field("segment_kind").isin(list(_KEEP_KINDS)),
+    )
+    t2 = _tick(f"filtered segments: {filtered_segs.num_rows:,} rows", t1)
 
+    # 3) Single Arrow hash-join — multithreaded inside Arrow.
+    joined = filtered_segs.join(demux_proj, keys="read_id", join_type="inner")
+    t3 = _tick(f"joined: {joined.num_rows:,} rows", t2)
+
+    # 4) Add length column (vectorised).
+    joined = joined.append_column(
+        "length", pc.subtract(joined.column("end"), joined.column("start"))
+    )
+
+    # Drop the pre-join projection — peak RAM goes through join
+    # output, no longer needs the source table.
+    del filtered_segs
+
+    # 5) Optional --emit-rows write (one-shot, no Python loop).
     if args.emit_rows:
         rows_path = out_dir / "demux_statistics.parquet"
-        rows_schema = pa.schema([
-            pa.field("read_id", pa.string()),
-            pa.field("status", pa.string()),
-            pa.field("is_fragment", pa.bool_()),
-            pa.field("segment_kind", pa.string()),
-            pa.field("edit_distance", pa.int32()),
-            pa.field("score_delta", pa.int32()),
-            pa.field("length", pa.int32()),
-        ])
-        with pq.ParquetWriter(rows_path, rows_schema) as rows_writer:
-            accumulators = _stream_into_accumulators_with_rows(
-                demux_proj,
-                seg_ds,
-                batch_size=args.batch_size,
-                progress=args.progress,
-                rows_writer=rows_writer,
-            )
-        rows_msg = f"wrote per-row table → {rows_path}"
-    else:
-        accumulators, _ = _stream_into_accumulators(
-            demux_proj,
-            seg_ds,
-            batch_size=args.batch_size,
-            progress=args.progress,
+        per_row = joined.select(
+            ["read_id", "status", "is_fragment", "segment_kind",
+             "score", "score_delta", "length"]
+        ).rename_columns(
+            ["read_id", "status", "is_fragment", "segment_kind",
+             "edit_distance", "score_delta", "length"]
         )
+        pq.write_table(per_row, rows_path)
+        del per_row
+        rows_msg = f"wrote per-row table → {rows_path}"
+        t3 = _tick(f"emitted rows parquet → {rows_path.name}", t3)
+    else:
         rows_msg = "skipped per-row table (use --emit-rows to opt in)"
 
-    # 3) Build summary + write JSON.
-    summary = _build_summary(accumulators)
+    # 6) Extract per-(status, kind) buckets (24 vectorised filters,
+    #    once each — total Python orchestration constant).
+    buckets = _extract_buckets(joined)
+    del joined
+    t4 = _tick(f"extracted {len(buckets)} (status, kind) buckets", t3)
+
+    # 7) Build summary + write JSON.
+    summary = _build_summary(buckets)
     (out_dir / "demux_statistics_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n"
     )
 
-    # 4) Optional PDF.
+    # 8) Optional PDF.
     pdf_path = out_dir / "demux_statistics.pdf"
     if args.no_pdf:
         pdf_status = "skipped PDF (--no-pdf)"
     else:
         try:
-            _emit_pdf(accumulators, pdf_path)
+            _emit_pdf(buckets, pdf_path)
             pdf_status = f"wrote PDF → {pdf_path}"
         except ImportError:
             pdf_status = "matplotlib not available; skipping PDF"
+    _tick("summary + outputs written", t4)
 
     print(f"wrote stats outputs → {out_dir}")
     print(f"  statuses summarized: {sorted(summary.keys())}")
     print(f"  {rows_msg}")
     print(f"  {pdf_status}")
+    print(f"  total: {time.time() - t0:.1f}s")
     return 0
 
 
