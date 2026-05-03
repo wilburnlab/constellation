@@ -390,7 +390,10 @@ def main() -> int:
     else:
         seg_ds = ds.dataset(str(seg_dir), format="parquet")
     filtered_segs = seg_ds.to_table(
-        columns=["read_id", "segment_kind", "score", "score_delta", "start", "end"],
+        columns=[
+            "read_id", "segment_kind", "score", "score_delta",
+            "start", "end", "barcode_id",
+        ],
         filter=ds.field("segment_kind").isin(list(_KEEP_KINDS)),
     )
     t2 = _tick(f"filtered segments: {filtered_segs.num_rows:,} rows", t1)
@@ -411,15 +414,30 @@ def main() -> int:
     # 5) Optional --emit-rows write (one-shot, no Python loop).
     if args.emit_rows:
         rows_path = out_dir / "demux_statistics.parquet"
-        per_row = joined.select(
+        # Broadcast each read's barcode_id (recorded only on its
+        # barcode segment row) onto its other segment rows, so polyA /
+        # adapter rows know which barcode was assigned to the read —
+        # required for stratifying the polyA distribution by leading-A
+        # vs non-leading-A barcode classes (the boundary-ambiguity
+        # mechanism described in designs.py).
+        bc_rows = joined.filter(
+            pc.equal(joined.column("segment_kind"), "barcode")
+        )
+        # Drop the segment-level barcode_id (mostly null) so the join
+        # below doesn't produce a duplicate column.
+        read_to_barcode = bc_rows.select(["read_id", "barcode_id"])
+        per_row_pre = joined.select(
             ["read_id", "status", "is_fragment", "segment_kind",
              "score", "score_delta", "length"]
+        )
+        per_row = per_row_pre.join(
+            read_to_barcode, keys="read_id", join_type="left outer"
         ).rename_columns(
             ["read_id", "status", "is_fragment", "segment_kind",
-             "edit_distance", "score_delta", "length"]
+             "edit_distance", "score_delta", "length", "barcode_id"]
         )
         pq.write_table(per_row, rows_path)
-        del per_row
+        del per_row, per_row_pre, bc_rows, read_to_barcode
         rows_msg = f"wrote per-row table → {rows_path}"
         t3 = _tick(f"emitted rows parquet → {rows_path.name}", t3)
     else:
