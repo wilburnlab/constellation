@@ -29,6 +29,14 @@ dependencies:
   # the [sequencing] extra so `pip install -e .[sequencing]` doesn't
   # rebuild against system htslib.
   - pysam>=0.21
+  # Edit-distance pairwise aligner — used by `transcriptome.demux` for
+  # polyA / adapter / barcode location scoring. Bioconda ships a
+  # prebuilt wheel; same rationale as pysam (avoid pip rebuild against
+  # system C++ toolchain on cluster nodes without one).
+  - edlib
+  # Smith-Waterman variant aligner — pulled in by the same `align/`
+  # subpackage as edlib (`pairwise_align(backend='parasail')`).
+  - parasail-python
   # Structure / MD (conda-forge). Guarded by lazy imports in thirdparty/.
   # Uncomment as structure module comes online:
   # - openmm>=8.0
