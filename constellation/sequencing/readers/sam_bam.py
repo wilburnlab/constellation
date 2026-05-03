@@ -100,10 +100,12 @@ def _parse_record(line: str, acquisition_id: int) -> dict[str, Any] | None:
     channel: int | None = None
     start_time_s: float | None = None
     duration_s: float | None = None
+    dorado_quality: float | None = None
+    read_group: str | None = None
+    duplex_class: int | None = None
     for tag in fields[11:]:
         # Tag format: TT:Y:VALUE where TT is 2-char tag name and Y is
-        # type-spec ('i'|'f'|'Z'|...). We only consume the three Dorado
-        # tags S1's READ_TABLE projects.
+        # type-spec ('i'|'f'|'Z'|...).
         if len(tag) < 5 or tag[2] != ":" or tag[4] != ":":
             continue
         name = tag[:2]
@@ -120,6 +122,18 @@ def _parse_record(line: str, acquisition_id: int) -> dict[str, Any] | None:
                 duration_s = float(value)
             except ValueError:
                 pass
+        elif name == "qs":
+            try:
+                dorado_quality = float(value)
+            except ValueError:
+                pass
+        elif name == "RG":
+            read_group = value
+        elif name == "dx":
+            try:
+                duplex_class = int(value)
+            except ValueError:
+                pass
 
     return {
         "read_id": fixed["QNAME"],
@@ -131,6 +145,9 @@ def _parse_record(line: str, acquisition_id: int) -> dict[str, Any] | None:
         "channel": channel,
         "start_time_s": start_time_s,
         "duration_s": duration_s,
+        "dorado_quality": dorado_quality,
+        "read_group": read_group,
+        "duplex_class": duplex_class,
     }
 
 
@@ -252,6 +269,9 @@ def _bam_record_to_row(rec: Any, acquisition_id: int) -> dict[str, Any]:
     channel: int | None = None
     start_time_s: float | None = None
     duration_s: float | None = None
+    dorado_quality: float | None = None
+    read_group: str | None = None
+    duplex_class: int | None = None
     try:
         channel = int(rec.get_tag("ch"))
     except KeyError:
@@ -265,6 +285,18 @@ def _bam_record_to_row(rec: Any, acquisition_id: int) -> dict[str, Any]:
         duration_s = float(rec.get_tag("du"))
     except KeyError:
         pass
+    try:
+        dorado_quality = float(rec.get_tag("qs"))
+    except KeyError:
+        pass
+    try:
+        read_group = str(rec.get_tag("RG"))
+    except KeyError:
+        pass
+    try:
+        duplex_class = int(rec.get_tag("dx"))
+    except KeyError:
+        pass
 
     return {
         "read_id": rec.query_name,
@@ -276,6 +308,9 @@ def _bam_record_to_row(rec: Any, acquisition_id: int) -> dict[str, Any]:
         "channel": channel,
         "start_time_s": start_time_s,
         "duration_s": duration_s,
+        "dorado_quality": dorado_quality,
+        "read_group": read_group,
+        "duplex_class": duplex_class,
     }
 
 
@@ -370,4 +405,179 @@ class BamReader(RawReader):
                 yield _bam_record_to_row(rec, acquisition_id)
 
 
-__all__ = ["BamReader", "SamReader"]
+# ──────────────────────────────────────────────────────────────────────
+# Parallel-ingest helpers
+# ──────────────────────────────────────────────────────────────────────
+#
+# The high-level pipeline parallelises ingest by handing each worker a
+# slice of the source file. The "what's a slice?" question has different
+# answers per format:
+#
+#   BAM: a (virtual_offset_start, n_primary_records) pair. We pre-scan
+#        the file once with bare pysam iteration (no field extraction)
+#        to record record-boundary virtual offsets every N records, then
+#        each worker seeks to its assigned vo_start and reads exactly
+#        n_primary_records primary records. virtual offsets pulled from
+#        ``pysam.AlignmentFile.tell()`` after a record read are always
+#        record boundaries by construction, sidestepping the BAM-record-
+#        spans-BGZF-block problem.
+#   SAM: a (byte_start, byte_end) byte range. SAM is line-oriented
+#        text, so workers seek to byte_start, skip a partial first line
+#        if the offset is mid-record, and read complete lines until
+#        byte_end. Each line goes through one worker exactly.
+
+
+def _bam_record_chunks(
+    path: Path,
+    *,
+    chunk_size: int = 100_000,
+    threads: int = 1,
+) -> list[tuple[int, int]]:
+    """Scan a BAM and return record-boundary chunks for parallel demux.
+
+    Each chunk is ``(virtual_offset_start, n_primary_records)``. Workers
+    take a chunk, seek to ``virtual_offset_start``, and read exactly
+    ``n_primary_records`` primary records (skipping any secondary /
+    supplementary records that fall inside the range). Secondary /
+    supplementary records are NOT counted toward chunk size — chunks
+    are sized to the records that actually become READ_TABLE rows.
+
+    The scan is intentionally minimal: bare ``for rec in fh.fetch()``
+    iteration with no field extraction. ``threads`` is the htslib BGZF
+    decompression thread pool — push higher for large BAMs.
+    """
+    import pysam  # type: ignore[import-not-found]
+
+    chunks: list[tuple[int, int]] = []
+    n_in_chunk = 0
+    chunk_start_vo: int | None = None
+
+    with pysam.AlignmentFile(
+        str(path), "rb", check_sq=False, threads=threads
+    ) as fh:
+        last_vo = fh.tell()
+        for rec in fh.fetch(until_eof=True):
+            rec_vo = last_vo
+            last_vo = fh.tell()
+            if rec.is_secondary or rec.is_supplementary:
+                continue
+            if chunk_start_vo is None:
+                chunk_start_vo = rec_vo
+            n_in_chunk += 1
+            if n_in_chunk >= chunk_size:
+                chunks.append((chunk_start_vo, n_in_chunk))
+                chunk_start_vo = None
+                n_in_chunk = 0
+        if n_in_chunk > 0 and chunk_start_vo is not None:
+            chunks.append((chunk_start_vo, n_in_chunk))
+    return chunks
+
+
+def read_bam_chunk(
+    path: Path,
+    *,
+    vo_start: int,
+    n_primary: int,
+    acquisition_id: int = 0,
+) -> list[dict[str, Any]]:
+    """Read exactly ``n_primary`` primary records starting at the
+    given virtual offset; return a list of READ_TABLE-shaped dicts.
+
+    Public so :func:`run_demux_pipeline`'s fused worker can call it
+    directly. Worker-side: opens its own pysam handle (no shared state
+    with the parent), seeks, reads, returns rows.
+    """
+    import pysam  # type: ignore[import-not-found]
+
+    rows: list[dict[str, Any]] = []
+    with pysam.AlignmentFile(
+        str(path), "rb", check_sq=False, threads=1
+    ) as fh:
+        if vo_start > 0:
+            fh.seek(vo_start)
+        n_emitted = 0
+        for rec in fh.fetch(until_eof=True):
+            if rec.is_secondary or rec.is_supplementary:
+                continue
+            rows.append(_bam_record_to_row(rec, acquisition_id))
+            n_emitted += 1
+            if n_emitted >= n_primary:
+                break
+    return rows
+
+
+def _sam_byte_chunks(
+    path: Path,
+    *,
+    n_chunks: int,
+) -> list[tuple[int, int]]:
+    """Partition a SAM file into N byte-range chunks aligned at newlines.
+
+    Each chunk is ``(byte_start, byte_end)``, byte_end exclusive. The
+    parent doesn't pre-scan — workers handle line boundaries themselves
+    via the protocol below. ``n_chunks`` is clamped to avoid microscopic
+    chunks on tiny inputs.
+
+    Boundary protocol (implemented in :func:`read_sam_chunk`):
+
+      - Each worker seeks to ``byte_start``.
+      - If ``byte_start > 0``, the worker skips the partial first line
+        — that line was consumed by the previous worker, whose
+        ``readline`` continued past its own ``byte_end``.
+      - The worker then reads complete lines until ``fh.tell() >= byte_end``.
+      - This guarantees every line is owned by exactly one worker.
+    """
+    file_size = path.stat().st_size
+    if file_size == 0 or n_chunks < 1:
+        return []
+    n_chunks = max(1, min(n_chunks, file_size // 1024 + 1))
+    chunks: list[tuple[int, int]] = []
+    for i in range(n_chunks):
+        byte_start = (file_size * i) // n_chunks
+        byte_end = (
+            (file_size * (i + 1)) // n_chunks if i < n_chunks - 1 else file_size
+        )
+        chunks.append((byte_start, byte_end))
+    return chunks
+
+
+def read_sam_chunk(
+    path: Path,
+    *,
+    byte_start: int,
+    byte_end: int,
+    acquisition_id: int = 0,
+) -> list[dict[str, Any]]:
+    """Read a SAM byte range; return READ_TABLE-shaped row dicts.
+
+    Skips ``@``-prefixed header lines (only encountered by chunk 0).
+    Skips a partial first line if ``byte_start > 0`` per the boundary
+    protocol in :func:`_sam_byte_chunks`.
+    """
+    rows: list[dict[str, Any]] = []
+    with open(path, "rb") as fh:
+        fh.seek(byte_start)
+        if byte_start > 0:
+            fh.readline()
+        while True:
+            pos = fh.tell()
+            if pos >= byte_end:
+                break
+            line = fh.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not text or text.startswith("@"):
+                continue
+            row = _parse_record(text, acquisition_id)
+            if row is not None:
+                rows.append(row)
+    return rows
+
+
+__all__ = [
+    "BamReader",
+    "SamReader",
+    "read_bam_chunk",
+    "read_sam_chunk",
+]

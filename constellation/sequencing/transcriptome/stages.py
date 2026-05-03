@@ -2,35 +2,44 @@
 
 The pipeline DAG:
 
-    ingest_reads      SAM/BAM → READ_TABLE   (single table, written once)
-    demux             per-batch worker:
-                        locate_segments → READ_SEGMENT_TABLE
-                        + READ_DEMUX_TABLE (sample_id unresolved)
-                        + predict_orfs → ORF_TABLE
+    plan_chunks       Compute per-worker file ranges (BAM record-boundary
+                      virtual offsets via a fast no-decode scan; SAM
+                      newline-aligned byte ranges via simple division)
+    fused_demux       per-chunk worker:
+                        ingest its assigned slice → READ_TABLE shard
+                        + locate_segments → READ_SEGMENT_TABLE shard
+                        + READ_DEMUX_TABLE shard (sample_id unresolved)
+                        + predict_orfs → ORF_TABLE shard
     resolve           sequential aggregation:
                         concat shards
                         resolve_demux → READ_DEMUX_TABLE w/ sample_id
                         build_protein_count_matrix → quant + FASTA + TSV
 
-Stages 1 and 3 run in the parent process (single-pass disk I/O for
-``ingest_reads``; small / sequential aggregation for ``resolve``).
-Stage 2 fans out via :func:`constellation.sequencing.parallel.run_batched`,
-so per-batch work scales with ``n_workers`` while writing
-deterministic ``part-NNNN.parquet`` shards under ``<output>/<key>/``.
+Stages 1 and 3 run in the parent process (the chunk planner and the
+small / sequential aggregation). Stage 2 fans out via
+:func:`constellation.sequencing.parallel.run_batched`, with each worker
+opening its own pysam handle on the source file (no parent-serial
+ingest bottleneck) and writing its own ``part-NNNNN.parquet`` shards
+under ``<output>/<key>/``.
+
+This is the "NanoporeAnalysis-style" parallelism — every worker does
+ingest + demux + write end-to-end, no shared parent reader. With 96
+workers on a single node, the source file is read 96 ways in parallel
+at the htslib layer (each worker gets its own BGZF decompression) AND
+the demux work parallelises 96-fold. The architecture eliminates the
+single-threaded ingest bottleneck that dominated the previous design.
 
 Resume semantics. Each stage's directory carries a ``_SUCCESS`` marker
 when it completes. With ``resume=True``, an already-complete stage is
 skipped and its shards are reused; a partially-written stage (shards
 present, no marker) re-runs only the missing shard indices. The
-parent stages (``sam_ingest``, ``resolve``) write their own markers
-on completion.
+parent ``resolve`` stage writes its own marker on completion.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -44,7 +53,6 @@ from constellation.sequencing.progress import (
     NullProgress,
     ProgressCallback,
     emit_done,
-    emit_progress,
     emit_start,
 )
 from constellation.sequencing.samples import Samples
@@ -76,32 +84,92 @@ KEY_PROTEIN_COUNTS_TSV = "protein_counts.tsv"
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Stage 2 worker — runs in subprocesses
+# Format detection
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _demux_worker(
-    batch: pa.Table,
+def _detect_format(input_path: Path) -> str:
+    """Return ``"bam"`` or ``"sam"`` from suffix; raise otherwise."""
+    suffix = input_path.suffix.lower()
+    if suffix == ".bam":
+        return "bam"
+    if suffix == ".sam":
+        return "sam"
+    raise ValueError(
+        f"unsupported input suffix {suffix!r} (expected .sam or .bam) "
+        f"for {input_path}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Fused per-chunk worker — ingest + demux + ORF in one process
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _fused_chunk_worker(
+    chunk_spec: tuple,
     *,
+    input_path: str,
+    fmt: str,
     library_design: str,
+    acquisition_id: int,
     min_aa_length: int,
 ) -> dict[str, pa.Table]:
-    """Run demux + ORF prediction on one batch of reads.
+    """Process one file chunk end-to-end: ingest → demux → ORF.
+
+    ``chunk_spec`` shape depends on ``fmt``:
+
+      bam: ``(virtual_offset_start, n_primary_records)`` — the worker
+           seeks to ``virtual_offset_start`` and reads exactly
+           ``n_primary_records`` primary records.
+      sam: ``(byte_start, byte_end)`` — the worker reads complete
+           lines from ``byte_start`` to ``byte_end``.
+
+    Each worker opens its own pysam / file handle, so ingest is fully
+    parallel across workers. Output: 4 tables (reads + segments +
+    demux + orfs); each is written as one shard by ``run_batched``.
 
     Top-level function (not a closure) so ``ProcessPoolExecutor`` can
-    pickle it. Loads the design by name inside the worker so we
-    don't pay for cross-process pickling of the design object — the
-    JSON load is cheap and cached at the module level after first
-    call.
-
-    The output ``read_demux`` table has ``sample_id`` left null;
-    sample assignment runs in the parent's ``resolve`` stage where
-    the :class:`Samples` container is available.
+    pickle it. The design is loaded by NAME inside the worker; the
+    cdna_wilburn_v1 JSON load is cheap and module-level cached.
     """
+    from constellation.sequencing.readers.sam_bam import (
+        read_bam_chunk,
+        read_sam_chunk,
+    )
+
+    path = Path(input_path)
+    if fmt == "bam":
+        vo_start, n_primary = chunk_spec
+        rows = read_bam_chunk(
+            path,
+            vo_start=vo_start,
+            n_primary=n_primary,
+            acquisition_id=acquisition_id,
+        )
+    elif fmt == "sam":
+        byte_start, byte_end = chunk_spec
+        rows = read_sam_chunk(
+            path,
+            byte_start=byte_start,
+            byte_end=byte_end,
+            acquisition_id=acquisition_id,
+        )
+    else:
+        raise ValueError(f"unknown format {fmt!r}")
+
+    reads_table = (
+        pa.Table.from_pylist(rows, schema=READ_TABLE)
+        if rows
+        else READ_TABLE.empty_table()
+    )
+
     design = load_design(library_design)
-    segments, demux, results = locate_segments(batch, design)
+    segments, demux, results = locate_segments(reads_table, design)
     orfs = predict_orfs(results, min_aa_length=min_aa_length)
+
     return {
+        KEY_READS: reads_table,
         KEY_READ_SEGMENTS: segments,
         KEY_READ_DEMUX: demux,
         KEY_ORFS: orfs,
@@ -109,202 +177,126 @@ def _demux_worker(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Stage 1 — SAM ingest
+# Chunk planner — runs in the parent process before fan-out
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _iter_reads_batches(
-    reads_path: Path, batch_size: int
-) -> Iterator[pa.Table]:
-    """Lazily iterate over a reads.parquet in row-batch slices.
-
-    Each yielded chunk is a :class:`pa.Table` of at most ``batch_size``
-    rows. RAM peak per iteration step = one batch (rows held by the
-    parquet reader's buffer), regardless of file size. ``ParquetFile``'s
-    streaming reader allocates per-row-group buffers lazily.
-
-    NOTE: ``batch_size`` controls the *yielded* chunk size; row groups
-    on disk may be larger or smaller. ``ParquetFile.iter_batches``
-    re-batches across row-group boundaries.
-    """
-    pf = pq.ParquetFile(reads_path)
-    pending: list[pa.RecordBatch] = []
-    pending_rows = 0
-    for rb in pf.iter_batches(batch_size=batch_size):
-        pending.append(rb)
-        pending_rows += rb.num_rows
-        if pending_rows >= batch_size:
-            yield pa.Table.from_batches(pending)
-            pending = []
-            pending_rows = 0
-    if pending:
-        yield pa.Table.from_batches(pending)
-
-
-def ingest_reads(
+def _plan_chunks(
     input_path: Path,
+    fmt: str,
     *,
-    acquisition_id: int,
-    output_dir: Path,
-    batch_size: int = 100_000,
-    threads: int = 1,
+    n_workers: int,
+    chunk_size: int,
     progress_cb: ProgressCallback | None = None,
-    resume: bool = False,
-) -> tuple[Path, int]:
-    """Stream-ingest a SAM/BAM into ``output_dir/reads.parquet``.
+) -> list[tuple]:
+    """Compute per-worker chunk specs for the source file.
 
-    Reader selection is suffix-dispatched via
-    :func:`core.io.readers.find_reader` with ``modality="nanopore"`` —
-    so ``.sam`` resolves to :class:`SamReader` (pure-Python text scan)
-    and ``.bam`` resolves to :class:`BamReader` (pysam-backed). Both
-    yield the same :class:`READ_TABLE` shape; downstream stages don't
-    care which file format the bytes came from.
+    For BAM, walks the file once via :func:`_bam_record_chunks` to record
+    record-boundary virtual offsets every ``chunk_size`` primary
+    records. The scan is bare iteration (no field decoding) and runs
+    with htslib's BGZF thread pool at ``threads=n_workers``, so it's
+    fast — ~200k records/sec on typical hardware.
 
-    The reader's :meth:`iter_batches` yields ``batch_size``-row chunks
-    one at a time; we feed each chunk into a :class:`pa.parquet.ParquetWriter`
-    so peak RAM = one batch (~hundreds of MB at batch_size=100k for
-    nanopore reads), independent of total file size. Each ``iter_batches``
-    chunk becomes one parquet row group, which makes downstream
-    streaming consumers (``ParquetFile.iter_batches``) see the same
-    natural batch shape on the disk side too.
+    For SAM, returns ``n_workers`` evenly-sized byte ranges aligned to
+    newlines via the worker-side handshake protocol. No pre-scan.
 
-    ``threads`` is the htslib BGZF decompression thread count for
-    BAM input (``pysam.AlignmentFile(threads=N)``). Has no effect on
-    SAM (text-format) ingest. Higher values trade CPU for wall time
-    on large bgzip'd inputs; ``threads=4-8`` is typical on a Dorado
-    BAM.
-
-    Resume: if ``reads.parquet`` exists *and* a sentinel
-    ``reads.parquet.__success__`` marker sits next to it, the existing
-    parquet is reused (file is not re-read).
-
-    Returns ``(reads_path, n_reads)``. The full reads table is *not*
-    returned — downstream stages stream from the parquet path.
+    The two return shapes are consumed uniformly by
+    :func:`_fused_chunk_worker` (which dispatches on ``fmt``).
     """
-    from constellation.core.io.readers import find_reader
+    from constellation.sequencing.readers.sam_bam import (
+        _bam_record_chunks,
+        _sam_byte_chunks,
+    )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    target = output_dir / f"{KEY_READS}.parquet"
-    success = target.with_suffix(target.suffix + ".__success__")
-
-    if resume and target.is_file() and success.is_file():
-        emit_start(
-            progress_cb, KEY_READS, message=f"resume: reusing {target}"
+    emit_start(
+        progress_cb,
+        "plan",
+        message=f"planning chunks for {input_path.name} (fmt={fmt})",
+    )
+    if fmt == "bam":
+        chunks = _bam_record_chunks(
+            input_path,
+            chunk_size=chunk_size,
+            threads=max(1, n_workers),
         )
-        n_reads = pq.ParquetFile(target).metadata.num_rows
-        emit_done(
-            progress_cb,
-            KEY_READS,
-            completed=n_reads,
-            total=n_reads,
-            message=f"resumed ({n_reads} reads)",
-        )
-        return target, n_reads
+    elif fmt == "sam":
+        # For SAM we shoot for ~chunk_size records per worker; with no
+        # record-count knowledge ahead of time we just split into
+        # max(n_workers, file_size / target_chunk_bytes) byte ranges.
+        # A SAM line averages ~5KB for nanopore; target chunk size in
+        # bytes ≈ chunk_size * 5KB.
+        target_bytes = chunk_size * 5 * 1024
+        file_size = input_path.stat().st_size
+        n = max(n_workers, max(1, file_size // target_bytes))
+        chunks = _sam_byte_chunks(input_path, n_chunks=n)
+    else:
+        raise ValueError(f"unknown format {fmt!r}")
 
-    emit_start(progress_cb, KEY_READS, message=f"streaming {input_path}")
-    reader = find_reader(input_path, modality="nanopore")
-
-    # Forward ``threads`` only to readers that accept it (BamReader);
-    # SamReader's pure-Python scan ignores it.
-    iter_kwargs: dict[str, Any] = {"acquisition_id": acquisition_id}
-    try:
-        import inspect
-
-        if "threads" in inspect.signature(reader.iter_batches).parameters:
-            iter_kwargs["threads"] = threads
-    except (TypeError, ValueError):
-        pass
-
-    n_reads = 0
-    writer: pq.ParquetWriter | None = None
-    try:
-        for batch in reader.iter_batches(input_path, batch_size, **iter_kwargs):
-            if writer is None:
-                # Open the writer with the first batch's schema (which
-                # equals READ_TABLE for both SAM and BAM readers).
-                writer = pq.ParquetWriter(target, batch.schema)
-            writer.write_table(batch)
-            n_reads += batch.num_rows
-            emit_progress(
-                progress_cb,
-                KEY_READS,
-                completed=n_reads,
-                total=None,
-                message=f"{n_reads} reads ingested",
-            )
-    finally:
-        if writer is not None:
-            writer.close()
-
-    if writer is None:
-        # Empty input — write an empty parquet so downstream stages
-        # have a real file to open.
-        from constellation.sequencing.schemas.reads import READ_TABLE
-
-        pq.write_table(READ_TABLE.empty_table(), target)
-
-    success.touch()
     emit_done(
         progress_cb,
-        KEY_READS,
-        completed=n_reads,
-        total=n_reads,
-        message=f"{n_reads} reads",
+        "plan",
+        completed=len(chunks),
+        total=len(chunks),
+        message=f"{len(chunks)} chunk(s)",
     )
-    return target, n_reads
+    return chunks
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Stage 2 — demux + ORF (parallelizable)
+# Fused stage — N workers, each does ingest + demux + ORF for one chunk
 # ──────────────────────────────────────────────────────────────────────
 
 
-def run_demux_stage(
-    reads_path: Path,
+def run_fused_demux_stage(
+    input_path: Path,
     *,
     library_design: str,
+    acquisition_id: int,
     output_dir: Path,
-    batch_size: int,
     n_workers: int = 1,
+    chunk_size: int = 100_000,
     min_aa_length: int = 60,
     progress_cb: ProgressCallback | None = None,
     resume: bool = False,
 ) -> dict[str, StageOutput]:
-    """Fan out demux + ORF over batches of reads, streaming.
+    """Plan chunks + fan out per-chunk workers.
 
-    Reads are pulled from ``reads_path`` in row-batches of ``batch_size``
-    rows via :func:`_iter_reads_batches`; each batch is dispatched to
-    a worker as it's yielded. Peak parent RAM = one batch (plus the
-    bounded in-flight queue inside ``run_batched``), regardless of
-    total read count. Each batch becomes one ``part-NNNN.parquet``
-    shard per output key.
-
-    The expected total batch count is computed from parquet metadata
-    (``num_rows / batch_size``, ceiling) for progress reporting.
+    Each worker writes 4 output shards (``reads``, ``read_segments``,
+    ``read_demux``, ``orfs``) under their respective ``<output>/<key>/``
+    directories. The reads dataset is partitioned by chunk, not a
+    single parquet — query it via ``pa.dataset.dataset(reads/)``.
     """
-    pf = pq.ParquetFile(reads_path)
-    n_rows = pf.metadata.num_rows
-    total_batches = max(1, (n_rows + batch_size - 1) // batch_size) if n_rows else 0
+    fmt = _detect_format(input_path)
+    chunks = _plan_chunks(
+        input_path,
+        fmt,
+        n_workers=n_workers,
+        chunk_size=chunk_size,
+        progress_cb=progress_cb,
+    )
 
     return run_batched(
-        worker_fn=_demux_worker,
-        batches=_iter_reads_batches(reads_path, batch_size),
+        worker_fn=_fused_chunk_worker,
+        batches=chunks,
         output_dir=output_dir,
-        output_keys=(KEY_READ_SEGMENTS, KEY_READ_DEMUX, KEY_ORFS),
+        output_keys=(KEY_READS, KEY_READ_SEGMENTS, KEY_READ_DEMUX, KEY_ORFS),
         n_workers=n_workers,
         worker_kwargs={
+            "input_path": str(input_path),
+            "fmt": fmt,
             "library_design": library_design,
+            "acquisition_id": acquisition_id,
             "min_aa_length": min_aa_length,
         },
         progress_cb=progress_cb,
         resume=resume,
-        stage_label="demux",
-        total=total_batches,
+        stage_label="fused_demux",
+        total=len(chunks),
     )
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Stage 3 — sample resolution + count matrix (sequential)
+# Resolve — sample assignment + count matrix (sequential)
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -323,8 +315,8 @@ def resolve_and_quantify(
 
     Returns ``(demux_table, quant_table, fasta_records, tsv_text)`` —
     the writer below persists each. Sequential by design: the
-    aggregation work is small (340 rows on test_simplex.sam) and
-    benefits from a single in-memory pass.
+    aggregation work is small (one row per read at S1) and benefits
+    from a single in-memory pass.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     success = output_dir / "_quant_success__"
@@ -389,45 +381,51 @@ def run_demux_pipeline(
     samples: Samples,
     acquisition_id: int,
     output_dir: Path,
-    batch_size: int = 100_000,
+    chunk_size: int = 100_000,
     n_workers: int = 1,
     min_aa_length: int = 60,
     min_protein_count: int = 2,
     progress_cb: ProgressCallback | None = None,
     resume: bool = False,
+    # Backwards-compat alias for the old ``batch_size`` kwarg — same
+    # semantic role (records-per-worker-chunk). Older callers pass it;
+    # accept and forward to ``chunk_size`` if the new kwarg is left
+    # at default.
+    batch_size: int | None = None,
 ) -> dict[str, object]:
     """End-to-end demux pipeline: SAM/BAM → counts.
 
-    Streaming end-to-end: ingest → demux → resolve. Peak parent RAM is
-    bounded by ``batch_size`` rows (plus the resolve stage's
-    aggregation, which is small in row count).
+    Per-worker chunked: each of ``n_workers`` workers opens its own
+    pysam handle on a slice of the source file, ingests its slice
+    directly into READ_TABLE rows, runs demux + ORF prediction, and
+    writes its own shards. There is no parent-serial ingest stage.
+
+    With ``n_workers`` matching the available cores on a node (e.g. 96
+    on a cluster node), ingest scales N-fold over the previous
+    streaming-but-single-threaded design — the BGZF decompression
+    happens N times in parallel inside N processes.
 
     Returns a dict of artefact tables / records / paths that the CLI
-    handler renders into stdout / disk locations. The ``reads`` slot
-    holds the ingested parquet path + row count rather than the full
-    Arrow table — callers that need the table should
-    ``pq.read_table(art["reads_path"])`` themselves.
+    handler renders into stdout / disk locations. ``n_reads`` is the
+    primary-record count summed across worker shards (== demux table
+    row count in S1, where every read produces exactly one demux row).
     """
     cb = progress_cb or NullProgress()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    reads_path, n_reads = ingest_reads(
+    # Backwards-compat: callers passing the old ``batch_size`` get it
+    # wired to the new kwarg name.
+    if batch_size is not None and chunk_size == 100_000:
+        chunk_size = batch_size
+
+    demux_outputs = run_fused_demux_stage(
         input_path,
+        library_design=library_design,
         acquisition_id=acquisition_id,
         output_dir=output_dir,
-        batch_size=batch_size,
-        threads=n_workers,
-        progress_cb=cb,
-        resume=resume,
-    )
-
-    demux_outputs = run_demux_stage(
-        reads_path,
-        library_design=library_design,
-        output_dir=output_dir,
-        batch_size=batch_size,
         n_workers=n_workers,
+        chunk_size=chunk_size,
         min_aa_length=min_aa_length,
         progress_cb=cb,
         resume=resume,
@@ -443,8 +441,9 @@ def run_demux_pipeline(
         resume=resume,
     )
 
+    n_reads = demux_table.num_rows  # one row per primary read in S1
+
     return {
-        "reads_path": reads_path,
         "n_reads": n_reads,
         "demux_outputs": demux_outputs,
         "demux_table": demux_table,
@@ -462,8 +461,7 @@ __all__ = [
     "KEY_READS",
     "KEY_READ_DEMUX",
     "KEY_READ_SEGMENTS",
-    "ingest_reads",
     "resolve_and_quantify",
     "run_demux_pipeline",
-    "run_demux_stage",
+    "run_fused_demux_stage",
 ]
