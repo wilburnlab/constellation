@@ -24,19 +24,11 @@ dependencies:
   # `constellation doctor --workflow <name>`.
   - mmseqs2
   - openjdk
-  # BAM I/O for sequencing pipelines (htslib-backed). Bioconda ships a
-  # newer manylinux build than PyPI's wheel — keep here rather than in
-  # the [sequencing] extra so `pip install -e .[sequencing]` doesn't
-  # rebuild against system htslib.
-  - pysam>=0.21
-  # Edit-distance pairwise aligner — used by `transcriptome.demux` for
-  # polyA / adapter / barcode location scoring. Bioconda ships a
-  # prebuilt wheel; same rationale as pysam (avoid pip rebuild against
-  # system C++ toolchain on cluster nodes without one).
-  - edlib
-  # Smith-Waterman variant aligner — pulled in by the same `align/`
-  # subpackage as edlib (`pairwise_align(backend='parasail')`).
-  - parasail-python
+  # NOTE: pysam, edlib, and parasail are installed via the
+  # `[sequencing]` extra in the pip block below — bioconda's edlib has
+  # no Python 3.12 build (last release 1.3.9 caps at cp310), and PyPI
+  # ships manylinux wheels for all three so the conda path isn't worth
+  # the version-skew risk.
   # Structure / MD (conda-forge). Guarded by lazy imports in thirdparty/.
   # Uncomment as structure module comes online:
   # - openmm>=8.0
@@ -69,5 +61,8 @@ dependencies:
     # pythonnet 3.x — needed for .NET CLR interop from Python 3.12. The
     # conda-forge feedstock caps at Python 3.9, so pip is authoritative.
     - pythonnet>=3.0.3
-    # The package itself, installed editable for development.
-    - -e .[dev]
+    # The package itself, installed editable for development. The
+    # `sequencing` extra pulls in pysam, edlib, parasail, pod5 (all
+    # PyPI manylinux wheels — no source build, fast on cluster nodes
+    # without a C++ toolchain).
+    - -e .[dev,sequencing]
