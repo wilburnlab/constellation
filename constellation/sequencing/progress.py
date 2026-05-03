@@ -78,13 +78,15 @@ class StreamProgress:
         if event.kind == "stage_start":
             line = f"[{event.stage}] start{(': ' + event.message) if event.message else ''}"
         elif event.kind == "stage_progress":
-            if event.total > 0:
+            if event.total is not None and event.total > 0:
                 pct = 100.0 * event.completed / event.total
                 line = (
                     f"[{event.stage}] {event.completed}/{event.total} "
                     f"({pct:5.1f}%){(' ' + event.message) if event.message else ''}"
                 )
             else:
+                # Streaming mode (no advance total) — report counter
+                # only. The message carries human context.
                 line = (
                     f"[{event.stage}] {event.completed}"
                     f"{(' ' + event.message) if event.message else ''}"

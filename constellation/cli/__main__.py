@@ -288,7 +288,7 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         resume=args.resume,
     )
 
-    reads = artefacts["reads"]
+    n_reads = artefacts["n_reads"]
     demux_table = artefacts["demux_table"]
     quant_table = artefacts["quant_table"]
     fasta_records = artefacts["fasta_records"]
@@ -300,7 +300,7 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         "acquisition_id": args.acquisition_id,
         "min_aa_length": args.min_aa_length,
         "min_protein_count": args.min_protein_count,
-        "n_reads": reads.num_rows,
+        "n_reads": n_reads,
         "n_demux_rows": demux_table.num_rows,
         "n_proteins_kept": len(fasta_records),
         "n_workers": args.threads,
@@ -312,7 +312,7 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
     if not args.progress:
         # Print a one-shot summary when --progress isn't on.
         print(
-            f"demultiplex done: {reads.num_rows} reads → "
+            f"demultiplex done: {n_reads} reads → "
             f"{len(fasta_records)} proteins, {quant_table.num_rows} quant rows",
             flush=True,
         )

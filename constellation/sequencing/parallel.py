@@ -25,7 +25,7 @@ function and calling ``run_batched``.
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -133,8 +133,15 @@ def run_batched(
     progress_cb: ProgressCallback | None = None,
     resume: bool = False,
     stage_label: str = "stage",
+    total: int | None = None,
+    in_flight_per_worker: int = 2,
 ) -> dict[str, StageOutput]:
-    """Apply ``worker_fn`` to each batch in parallel.
+    """Apply ``worker_fn`` to each batch in parallel — streaming.
+
+    Batches are consumed one at a time from the iterator and submitted
+    to the executor with a bounded in-flight window so memory peak
+    stays at ``n_workers * in_flight_per_worker`` batches regardless
+    of input size. Suitable for 30M+ read pipelines.
 
     Parameters
     ----------
@@ -144,8 +151,8 @@ def run_batched(
         ``{output_key: pa.Table}`` dict whose key set must match
         ``output_keys``.
     batches
-        Iterable of input batches. Materialised lazily; the executor
-        consumes them in order.
+        Iterable of input batches — consumed lazily, never
+        materialised in full.
     output_dir
         Top-level directory; per-key shard subdirectories
         (``output_dir / key /``) are created automatically.
@@ -155,23 +162,28 @@ def run_batched(
     n_workers
         ``1`` runs everything in the parent process (no
         ``ProcessPoolExecutor``); higher values fan out via
-        multiprocessing. Each worker writes its own shard files; the
-        parent only coordinates indices and emits progress.
+        multiprocessing.
     worker_kwargs
         Extra kwargs passed to ``worker_fn`` per-batch. Must be
         picklable; commonly the design *name* (string) rather
         than the design instance, since name-loading is cheap.
     progress_cb
-        Optional :class:`ProgressCallback`. Receives ``stage_start``
-        once, ``stage_progress`` after each batch, ``stage_done`` at
-        the end.
+        Optional :class:`ProgressCallback`.
     resume
         When True, batches whose ``part-NNNN.parquet`` files already
         exist (non-empty) are skipped. If the stage has a
-        ``_SUCCESS`` marker, the entire call short-circuits with no
-        worker dispatch.
+        ``_SUCCESS`` marker, the entire call short-circuits.
     stage_label
         Free-form name used in progress events (``"demux"``, etc.).
+    total
+        Optional advance count for progress reporting (e.g. parquet
+        row-group count). When ``None``, progress events emit
+        ``total=None`` and the stage_done event reports the actual
+        consumed count.
+    in_flight_per_worker
+        How many batches to keep queued per worker before backpressuring
+        the iterator. Default 2 = each worker has one running + one
+        queued. Bumping higher trades RAM for hiding worker stalls.
 
     Returns
     -------
@@ -181,6 +193,10 @@ def run_batched(
     """
     if n_workers < 1:
         raise ValueError(f"n_workers must be ≥ 1, got {n_workers}")
+    if in_flight_per_worker < 1:
+        raise ValueError(
+            f"in_flight_per_worker must be ≥ 1, got {in_flight_per_worker}"
+        )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -210,29 +226,27 @@ def run_batched(
         emit_done(progress_cb, stage_label, message="resumed")
         return result
 
-    # Per-key existing-shard set — used both for resume short-circuit
-    # *and* for partial recovery (rerun missing shards in a stage with
-    # no _SUCCESS marker).
+    # Per-key existing-shard set — used for partial recovery (rerun
+    # missing shards in a stage with no _SUCCESS marker).
     existing_per_key: dict[str, set[int]] = {
         key: _existing_shard_indices(output_dir / key) for key in output_keys
     }
     can_skip_idx: set[int] = set()
-    if resume:
+    if resume and existing_per_key:
         # A batch index is "already done" iff it has a non-empty shard
-        # in EVERY output key. (If any key is missing the shard, we
-        # need to re-run that batch to regenerate it consistently.)
-        if existing_per_key:
-            common = set.intersection(*existing_per_key.values())
-            can_skip_idx = common
+        # in EVERY output key.
+        can_skip_idx = set.intersection(*existing_per_key.values())
 
     worker_kwargs = worker_kwargs or {}
-    batch_list = list(batches)
-    n_batches = len(batch_list)
     emit_start(
         progress_cb,
         stage_label,
-        total=n_batches,
-        message=f"{n_batches} batches, {n_workers} worker(s)",
+        total=total,
+        message=(
+            f"{total} batches, {n_workers} worker(s)"
+            if total is not None
+            else f"streaming, {n_workers} worker(s)"
+        ),
         payload={"resume": resume, "skipped_idx_count": len(can_skip_idx)},
     )
 
@@ -249,22 +263,40 @@ def run_batched(
             if shard.is_file() and shard.stat().st_size > 0:
                 completed_paths[key].append((idx, shard))
 
-    work_items = [
-        (idx, batch) for idx, batch in enumerate(batch_list) if idx not in can_skip_idx
-    ]
     if can_skip_idx:
         emit_progress(
             progress_cb,
             stage_label,
             completed=len(can_skip_idx),
-            total=n_batches,
+            total=total,
             message=f"resumed {len(can_skip_idx)} batches",
         )
         n_done = len(can_skip_idx)
 
+    # Index-aware iterator: enumerate the input stream and skip resumed
+    # indices on the fly so we never materialise the full batch list.
+    enumerated = (
+        (idx, batch)
+        for idx, batch in enumerate(batches)
+        if idx not in can_skip_idx
+    )
+
+    def _record(bi: int, shard_map: dict[str, Path]) -> None:
+        nonlocal n_done
+        for key, path in shard_map.items():
+            completed_paths[key].append((bi, path))
+        n_done += 1
+        emit_progress(
+            progress_cb,
+            stage_label,
+            completed=n_done,
+            total=total,
+        )
+
     if n_workers == 1:
-        # Single-process path — simpler stack trace, no pickling cost.
-        for idx, batch in work_items:
+        # Single-process path — process each batch immediately and let
+        # it go out of scope before pulling the next one.
+        for idx, batch in enumerated:
             bi, shard_map = _worker_run(
                 worker_fn,
                 worker_kwargs,
@@ -273,40 +305,37 @@ def run_batched(
                 idx,
                 batch,
             )
-            for key, path in shard_map.items():
-                completed_paths[key].append((bi, path))
-            n_done += 1
-            emit_progress(
-                progress_cb,
-                stage_label,
-                completed=n_done,
-                total=n_batches,
-            )
+            _record(bi, shard_map)
     else:
+        max_in_flight = n_workers * in_flight_per_worker
         with ProcessPoolExecutor(max_workers=n_workers) as ex:
-            futures = [
-                ex.submit(
-                    _worker_run,
-                    worker_fn,
-                    worker_kwargs,
-                    output_dir,
-                    output_keys,
-                    idx,
-                    batch,
+            in_flight: set[Future] = set()
+            for idx, batch in enumerated:
+                if len(in_flight) >= max_in_flight:
+                    done, in_flight = wait(
+                        in_flight, return_when=FIRST_COMPLETED
+                    )
+                    for fut in done:
+                        bi, shard_map = fut.result()
+                        _record(bi, shard_map)
+                in_flight.add(
+                    ex.submit(
+                        _worker_run,
+                        worker_fn,
+                        worker_kwargs,
+                        output_dir,
+                        output_keys,
+                        idx,
+                        batch,
+                    )
                 )
-                for idx, batch in work_items
-            ]
-            for fut in futures:
+                # Drop the local reference so the parent's copy of the
+                # batch can be GC'd as soon as the child receives it.
+                del batch
+            # Drain remaining futures.
+            for fut in in_flight:
                 bi, shard_map = fut.result()
-                for key, path in shard_map.items():
-                    completed_paths[key].append((bi, path))
-                n_done += 1
-                emit_progress(
-                    progress_cb,
-                    stage_label,
-                    completed=n_done,
-                    total=n_batches,
-                )
+                _record(bi, shard_map)
 
     # Sort each key's shard list by batch index so callers reading the
     # dataset see deterministic row order.
@@ -324,9 +353,9 @@ def run_batched(
     emit_done(
         progress_cb,
         stage_label,
-        completed=n_batches,
-        total=n_batches,
-        message=f"wrote {n_batches} shard(s) per output key",
+        completed=n_done,
+        total=total if total is not None else n_done,
+        message=f"wrote {n_done} shard(s) per output key",
     )
     return result
 
