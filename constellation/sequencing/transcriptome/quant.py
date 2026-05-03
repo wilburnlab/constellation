@@ -6,28 +6,43 @@ NanoporeAnalysis's ``extract_proteins.py`` filter:
     cDNA status == 'Complete'  AND  Protein.is_valid()
 
 Reads passing both contribute one count per (Protein, Sample_ID) cell.
-We mirror that here, taking the demux + ORF tables as inputs and
-emitting:
+We mirror that here in two pieces:
 
-    - feature_quant Arrow table (FEATURE_QUANT-shaped — one row per
-      (protein, sample) pair with a non-zero count)
-    - protein FASTA records (unique protein sequences with P0/P1/...
-      labels in count-descending order — matches NA's labelling)
-    - count-matrix TSV bytes (Protein × Sample matrix, columns
-      ordered by sample-count descending)
+  - :func:`build_partial_quant` runs *inside each worker* on its local
+    demux + ORF tables. Pre-aggregates within the worker so each shard
+    is bounded by the unique ``(protein_sequence, sample_id)`` pairs
+    that worker saw — typically much smaller than the worker's read
+    count. Output is :data:`PARTIAL_QUANT_TABLE` shape.
+  - :func:`aggregate_partial_quants` runs *once* at the end, opens the
+    ``feature_quant/`` partitioned dataset, and produces the final
+    outputs with global ordering / P0..PN labels:
+
+        - :data:`PROTEIN_COUNT_TABLE` quant Arrow table (one row per
+          (protein, sample) pair with a non-zero count)
+        - protein FASTA records (P0..PN in count-descending order)
+        - count-matrix TSV bytes (Protein × Sample matrix, columns
+          ordered by sample-count descending)
 
 The output FASTA + TSV are designed to compare cleanly to NA's
 ``qJS00x_proteins.fasta`` / ``qJS00x_protein-counts.tab`` after
 canonicalising column / row order (sort by protein sequence for the
 TSV; FASTA set-equality on (label-free, sequence) pairs).
+
+Per the partitioned-parquet ethos in CLAUDE.md, the aggregator is the
+ONE place a `concat_tables` is OK — it produces human-facing FASTA +
+TSV outputs, and the global table it materialises is bounded by
+unique proteins × samples (small) rather than read count (huge).
 """
 
 from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
 
 from constellation.sequencing.samples import Samples
 
@@ -47,6 +62,21 @@ PROTEIN_COUNT_TABLE: pa.Schema = pa.schema(
 )
 
 
+# Per-worker partial quant — what each worker writes to
+# ``feature_quant/part-NNNNN.parquet``. No P0/P1 labels (those are
+# global-ordering-dependent), no sample_name (resolved at aggregation).
+# Just the contribution this worker makes to the (protein, sample)
+# count cell. The aggregator sums across workers + applies labels.
+PARTIAL_QUANT_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("protein_sequence", pa.string(), nullable=False),
+        pa.field("sample_id", pa.int64(), nullable=False),
+        pa.field("count", pa.int64(), nullable=False),
+    ],
+    metadata={b"schema_name": b"PartialQuantTable"},
+)
+
+
 @dataclass(frozen=True)
 class FastaRecord:
     """One entry in the proteins FASTA: ``>label`` then sequence."""
@@ -60,6 +90,202 @@ def _is_complete_non_fragment(status: str, is_fragment: bool) -> bool:
     suffix would break the literal-string match in NA, so we exclude
     is_fragment=True here too."""
     return status == "Complete" and not is_fragment
+
+
+def build_partial_quant(
+    demux_table: pa.Table,
+    orf_table: pa.Table,
+) -> pa.Table:
+    """Pre-aggregate (protein, sample) counts within one worker's tables.
+
+    Filters to ``status == 'Complete' AND is_fragment == False AND
+    sample_id IS NOT NULL`` reads that have a matching ORF. Returns a
+    :data:`PARTIAL_QUANT_TABLE`-shaped table whose row count is bounded
+    by ``len(unique (protein_sequence, sample_id) pairs in this shard)``
+    — typically much smaller than the worker's read count.
+
+    Designed to live in the demux worker, so each ``feature_quant/
+    part-NNNNN.parquet`` shard already carries pre-aggregated counts
+    that the aggregator just sums across shards via a partitioned-
+    dataset ``group_by``. No global ordering / labels at this stage —
+    those are global-only operations done in
+    :func:`aggregate_partial_quants`.
+    """
+    if demux_table.num_rows == 0:
+        return PARTIAL_QUANT_TABLE.empty_table()
+
+    # Build (read_id -> protein) map from this worker's ORF table.
+    orf_by_read: dict[str, str] = {
+        row["read_id"]: row["protein"]
+        for row in orf_table.to_pylist()
+    }
+    if not orf_by_read:
+        return PARTIAL_QUANT_TABLE.empty_table()
+
+    counts: Counter[tuple[str, int]] = Counter()
+    for row in demux_table.to_pylist():
+        if not _is_complete_non_fragment(row["status"], row["is_fragment"]):
+            continue
+        sample_id = row["sample_id"]
+        if sample_id is None:
+            continue
+        protein = orf_by_read.get(row["read_id"])
+        if protein is None:
+            continue
+        counts[(protein, sample_id)] += 1
+
+    if not counts:
+        return PARTIAL_QUANT_TABLE.empty_table()
+    rows = [
+        {"protein_sequence": p, "sample_id": s, "count": n}
+        for (p, s), n in counts.items()
+    ]
+    return pa.Table.from_pylist(rows, schema=PARTIAL_QUANT_TABLE)
+
+
+def aggregate_partial_quants(
+    feature_quant_dir: Path,
+    samples: Samples,
+    *,
+    min_protein_count: int = 2,
+) -> tuple[pa.Table, list[FastaRecord], str]:
+    """Stream ``feature_quant/`` shards, sum globally, apply ordering +
+    P0..PN labels, return the human-facing outputs.
+
+    Reads ``feature_quant_dir`` as a partitioned :class:`pa.dataset.dataset`
+    and runs a single Arrow ``group_by(["protein_sequence", "sample_id"])
+    .aggregate([("count", "sum")])`` to produce global per-cell totals.
+    The materialised table is bounded by ``unique proteins × samples`` —
+    small (millions of rows max) regardless of read count, so this
+    fits in RAM at any production scale.
+
+    Returns ``(quant_table, fasta_records, tsv_text)`` matching the
+    shape :func:`build_protein_count_matrix` historically returned.
+    """
+    feature_quant_dir = Path(feature_quant_dir)
+    sample_name_by_id: dict[int, str] = {
+        sid: sn
+        for sid, sn in zip(
+            samples.samples.column("sample_id").to_pylist(),
+            samples.samples.column("sample_name").to_pylist(),
+        )
+    }
+
+    if not feature_quant_dir.is_dir() or not any(feature_quant_dir.iterdir()):
+        return PROTEIN_COUNT_TABLE.empty_table(), [], _empty_tsv(sample_name_by_id, [])
+
+    dataset = ds.dataset(str(feature_quant_dir), format="parquet")
+    # Group + sum: bounded by unique (protein_sequence, sample_id) pairs
+    # across the whole dataset. Arrow's ``group_by`` runs on a single
+    # in-memory table — concat all shards (small in the partial-quant
+    # form) then aggregate.
+    summed = (
+        dataset.to_table()
+        .group_by(["protein_sequence", "sample_id"])
+        .aggregate([("count", "sum")])
+    )
+    if summed.num_rows == 0:
+        return PROTEIN_COUNT_TABLE.empty_table(), [], _empty_tsv(sample_name_by_id, [])
+
+    # Project / rename for clarity.
+    proteins = summed.column("protein_sequence").to_pylist()
+    sids = summed.column("sample_id").to_pylist()
+    counts_col = summed.column("count_sum").to_pylist()
+    pair_counts: Counter[tuple[str, int]] = Counter()
+    for p, s, c in zip(proteins, sids, counts_col):
+        pair_counts[(p, s)] = int(c)
+
+    # Per-protein and per-sample totals derived from pair_counts.
+    protein_counts: Counter[str] = Counter()
+    sample_counts: Counter[int] = Counter()
+    for (p, s), n in pair_counts.items():
+        protein_counts[p] += n
+        sample_counts[s] += n
+
+    # First-seen tracking: NA's behaviour breaks ties on insertion order
+    # (parquet row order). Approximate by using the dataset's row order
+    # — since shards are partitioned by worker chunk and chunks are
+    # 5'→3' along the source file, this matches NA's stable ordering.
+    protein_first_seen: dict[str, int] = {}
+    sample_first_seen: dict[int, int] = {}
+    for i, (p, s) in enumerate(zip(proteins, sids)):
+        protein_first_seen.setdefault(p, i)
+        sample_first_seen.setdefault(s, i)
+
+    samples_ordered_full = sorted(
+        sample_counts.keys(),
+        key=lambda s: (-sample_counts[s], sample_first_seen[s]),
+    )
+
+    # Singleton-protein filter (NA's _fixed1 enables this).
+    if min_protein_count > 0:
+        keep = {p for p, n in protein_counts.items() if n >= min_protein_count}
+        pair_counts = Counter(
+            {(p, s): n for (p, s), n in pair_counts.items() if p in keep}
+        )
+        protein_counts = Counter({p: n for p, n in protein_counts.items() if p in keep})
+
+    proteins_ordered = sorted(
+        protein_counts.keys(),
+        key=lambda p: (-protein_counts[p], protein_first_seen[p]),
+    )
+    samples_ordered = samples_ordered_full
+
+    protein_labels: dict[str, str] = {
+        p: f"P{idx}" for idx, p in enumerate(proteins_ordered)
+    }
+    fasta = [
+        FastaRecord(label=protein_labels[p], sequence=p)
+        for p in proteins_ordered
+    ]
+
+    quant_rows = [
+        {
+            "protein_label": protein_labels[protein],
+            "protein_sequence": protein,
+            "sample_id": sample_id,
+            "sample_name": sample_name_by_id.get(sample_id, f"sample_{sample_id}"),
+            "count": count,
+        }
+        for (protein, sample_id), count in pair_counts.items()
+    ]
+    if quant_rows:
+        quant_table = pa.Table.from_pylist(quant_rows, schema=PROTEIN_COUNT_TABLE)
+    else:
+        quant_table = PROTEIN_COUNT_TABLE.empty_table()
+
+    tsv_text = _render_tsv(
+        proteins_ordered, samples_ordered, pair_counts, protein_labels, sample_name_by_id
+    )
+    return quant_table, fasta, tsv_text
+
+
+def _empty_tsv(sample_name_by_id: dict[int, str], samples_ordered: list[int]) -> str:
+    sample_names_ordered = [sample_name_by_id[s] for s in samples_ordered]
+    header = "\t".join(["", "Protein", *sample_names_ordered, "Sequence"])
+    return header + "\n"
+
+
+def _render_tsv(
+    proteins_ordered: list[str],
+    samples_ordered: list[int],
+    pair_counts: Counter,
+    protein_labels: dict[str, str],
+    sample_name_by_id: dict[int, str],
+) -> str:
+    sample_names_ordered = [sample_name_by_id[s] for s in samples_ordered]
+    header = "\t".join(["", "Protein", *sample_names_ordered, "Sequence"])
+    lines = [header]
+    for idx, protein in enumerate(proteins_ordered):
+        row_cells = [str(idx), protein_labels[protein]]
+        for sample_id in samples_ordered:
+            n = pair_counts.get((protein, sample_id), 0)
+            # NA's pandas writes integer counts as floats ('0.0') —
+            # match for byte-equivalence.
+            row_cells.append(f"{float(n):.1f}")
+        row_cells.append(protein)
+        lines.append("\t".join(row_cells))
+    return "\n".join(lines) + "\n"
 
 
 def build_protein_count_matrix(
@@ -217,6 +443,17 @@ def fasta_records_to_text(records: list[FastaRecord]) -> str:
     via ``write_fastx``.
     """
     return "".join(f">{r.label}\n{r.sequence}\n" for r in records)
+
+
+__all__ = [
+    "FastaRecord",
+    "PARTIAL_QUANT_TABLE",
+    "PROTEIN_COUNT_TABLE",
+    "aggregate_partial_quants",
+    "build_partial_quant",
+    "build_protein_count_matrix",
+    "fasta_records_to_text",
+]
 
 
 __all__ = [

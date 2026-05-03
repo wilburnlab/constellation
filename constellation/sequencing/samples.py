@@ -26,6 +26,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from constellation.core.io.schemas import (
     cast_to_schema,
@@ -138,7 +139,7 @@ class Samples:
 
     def acquisitions_for(self, sample_id: int) -> list[int]:
         """All acquisition_ids that contribute to ``sample_id``."""
-        mask = pa.compute.equal(self.edges.column("sample_id"), sample_id)
+        mask = pc.equal(self.edges.column("sample_id"), sample_id)
         filtered = self.edges.filter(mask)
         return filtered.column("acquisition_id").to_pylist()
 
@@ -153,12 +154,12 @@ class Samples:
         rows (genomic). If barcode_id is supplied, returns the sample
         for that specific barcode within the acquisition.
         """
-        acq_match = pa.compute.equal(self.edges.column("acquisition_id"), acquisition_id)
+        acq_match = pc.equal(self.edges.column("acquisition_id"), acquisition_id)
         if barcode_id is None:
-            bc_match = pa.compute.is_null(self.edges.column("barcode_id"))
+            bc_match = pc.is_null(self.edges.column("barcode_id"))
         else:
-            bc_match = pa.compute.equal(self.edges.column("barcode_id"), barcode_id)
-        mask = pa.compute.and_(acq_match, bc_match)
+            bc_match = pc.equal(self.edges.column("barcode_id"), barcode_id)
+        mask = pc.and_(acq_match, bc_match)
         return self.edges.filter(mask).column("sample_id").to_pylist()
 
     def __len__(self) -> int:

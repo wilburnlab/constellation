@@ -46,7 +46,6 @@ import pyarrow.parquet as pq
 
 from constellation.sequencing.parallel import (
     StageOutput,
-    read_dataset,
     run_batched,
 )
 from constellation.sequencing.progress import (
@@ -64,9 +63,11 @@ from constellation.sequencing.transcriptome.demux import (
 from constellation.sequencing.transcriptome.designs import load_design
 from constellation.sequencing.transcriptome.orf import ORF_TABLE, predict_orfs
 from constellation.sequencing.transcriptome.quant import (
+    PARTIAL_QUANT_TABLE,
     PROTEIN_COUNT_TABLE,
     FastaRecord,
-    build_protein_count_matrix,
+    aggregate_partial_quants,
+    build_partial_quant,
     fasta_records_to_text,
 )
 
@@ -109,25 +110,38 @@ def _detect_format(input_path: Path) -> str:
 def _fused_chunk_worker(
     chunk_spec: tuple,
     *,
-    input_path: str,
-    fmt: str,
     library_design: str,
-    acquisition_id: int,
+    samples: Samples,
     min_aa_length: int,
 ) -> dict[str, pa.Table]:
-    """Process one file chunk end-to-end: ingest → demux → ORF.
+    """Process one file chunk end-to-end: ingest → demux → ORF →
+    sample-resolve → partial quant.
 
-    ``chunk_spec`` shape depends on ``fmt``:
+    ``chunk_spec`` carries everything needed to locate the worker's
+    slice — the input file path, format, acquisition_id, and the
+    range data:
 
-      bam: ``(virtual_offset_start, n_primary_records)`` — the worker
-           seeks to ``virtual_offset_start`` and reads exactly
-           ``n_primary_records`` primary records.
-      sam: ``(byte_start, byte_end)`` — the worker reads complete
-           lines from ``byte_start`` to ``byte_end``.
+      ``(file_path, fmt, acquisition_id, range_data)``
 
-    Each worker opens its own pysam / file handle, so ingest is fully
-    parallel across workers. Output: 4 tables (reads + segments +
-    demux + orfs); each is written as one shard by ``run_batched``.
+    where ``range_data`` is ``(vo_start, n_primary)`` for BAM or
+    ``(byte_start, byte_end)`` for SAM. The acquisition_id rides
+    inside the chunk_spec (rather than worker_kwargs) because
+    multi-file inputs may have different acquisitions per chunk.
+
+    Each worker opens its own pysam / file handle (no shared state
+    with other workers or the parent). Output: 5 tables that become
+    5 shards via :func:`run_batched`:
+
+      - reads          (READ_TABLE — full per-read fields)
+      - read_segments  (READ_SEGMENT_TABLE — one row per located segment)
+      - read_demux     (READ_DEMUX_TABLE — sample_id resolved here)
+      - orfs           (ORF_TABLE — predicted proteins per read)
+      - feature_quant  (PARTIAL_QUANT_TABLE — pre-aggregated counts)
+
+    Sample resolution + partial quant aggregation happen INSIDE the
+    worker on its own small tables, so the resolve stage only has to
+    sum tiny per-worker count contributions — no read-level cross-
+    shard joins.
 
     Top-level function (not a closure) so ``ProcessPoolExecutor`` can
     pickle it. The design is loaded by NAME inside the worker; the
@@ -138,9 +152,10 @@ def _fused_chunk_worker(
         read_sam_chunk,
     )
 
-    path = Path(input_path)
+    file_path, fmt, acquisition_id, range_data = chunk_spec
+    path = Path(file_path)
     if fmt == "bam":
-        vo_start, n_primary = chunk_spec
+        vo_start, n_primary = range_data
         rows = read_bam_chunk(
             path,
             vo_start=vo_start,
@@ -148,7 +163,7 @@ def _fused_chunk_worker(
             acquisition_id=acquisition_id,
         )
     elif fmt == "sam":
-        byte_start, byte_end = chunk_spec
+        byte_start, byte_end = range_data
         rows = read_sam_chunk(
             path,
             byte_start=byte_start,
@@ -167,12 +182,27 @@ def _fused_chunk_worker(
     design = load_design(library_design)
     segments, demux, results = locate_segments(reads_table, design)
     orfs = predict_orfs(results, min_aa_length=min_aa_length)
+    # Resolve sample_id locally — the worker's segments table tells it
+    # each read's barcode_id, and the (small, picklable) Samples
+    # container resolves (acquisition, barcode) → sample_id without
+    # crossing process boundaries again.
+    demux = resolve_demux(
+        demux,
+        segments,
+        samples=samples,
+        acquisition_id=acquisition_id,
+    )
+    # Pre-aggregate (protein_sequence, sample_id) counts for THIS
+    # worker's reads. Bounded by unique-pairs in the chunk — usually
+    # much smaller than the read count.
+    partial_quant = build_partial_quant(demux, orfs)
 
     return {
         KEY_READS: reads_table,
         KEY_READ_SEGMENTS: segments,
         KEY_READ_DEMUX: demux,
         KEY_ORFS: orfs,
+        KEY_FEATURE_QUANT: partial_quant,
     }
 
 
@@ -181,65 +211,107 @@ def _fused_chunk_worker(
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _plan_chunks(
+def _plan_chunks_for_file(
     input_path: Path,
     fmt: str,
     *,
-    n_workers: int,
+    acquisition_id: int,
     chunk_size: int,
-    progress_cb: ProgressCallback | None = None,
+    threads: int,
 ) -> list[tuple]:
-    """Compute per-worker chunk specs for the source file.
+    """Compute per-worker chunk specs for ONE source file.
 
     For BAM, walks the file once via :func:`_bam_record_chunks` to record
     record-boundary virtual offsets every ``chunk_size`` primary
     records. The scan is bare iteration (no field decoding) and runs
-    with htslib's BGZF thread pool at ``threads=n_workers``, so it's
+    with htslib's BGZF thread pool at ``threads``, so it's
     fast — ~200k records/sec on typical hardware.
 
-    For SAM, returns ``n_workers`` evenly-sized byte ranges aligned to
-    newlines via the worker-side handshake protocol. No pre-scan.
+    For SAM, returns evenly-sized byte ranges aligned to newlines via
+    the worker-side handshake protocol — no pre-scan needed.
 
-    The two return shapes are consumed uniformly by
-    :func:`_fused_chunk_worker` (which dispatches on ``fmt``).
+    Returns chunk specs of shape
+    ``(str(file_path), fmt, acquisition_id, range_data)`` where
+    ``range_data`` is ``(vo_start, n_primary)`` for BAM or
+    ``(byte_start, byte_end)`` for SAM. The acquisition_id is baked
+    into each spec so multi-file inputs can pool their chunks into a
+    single ``run_batched`` invocation while keeping per-file
+    provenance straight.
     """
     from constellation.sequencing.readers.sam_bam import (
         _bam_record_chunks,
         _sam_byte_chunks,
     )
 
-    emit_start(
-        progress_cb,
-        "plan",
-        message=f"planning chunks for {input_path.name} (fmt={fmt})",
-    )
     if fmt == "bam":
-        chunks = _bam_record_chunks(
+        ranges = _bam_record_chunks(
             input_path,
             chunk_size=chunk_size,
-            threads=max(1, n_workers),
+            threads=max(1, threads),
         )
     elif fmt == "sam":
         # For SAM we shoot for ~chunk_size records per worker; with no
         # record-count knowledge ahead of time we just split into
-        # max(n_workers, file_size / target_chunk_bytes) byte ranges.
+        # max(threads, file_size / target_chunk_bytes) byte ranges.
         # A SAM line averages ~5KB for nanopore; target chunk size in
         # bytes ≈ chunk_size * 5KB.
         target_bytes = chunk_size * 5 * 1024
         file_size = input_path.stat().st_size
-        n = max(n_workers, max(1, file_size // target_bytes))
-        chunks = _sam_byte_chunks(input_path, n_chunks=n)
+        n = max(max(1, threads), max(1, file_size // target_bytes))
+        ranges = _sam_byte_chunks(input_path, n_chunks=n)
     else:
         raise ValueError(f"unknown format {fmt!r}")
+
+    return [
+        (str(input_path), fmt, acquisition_id, range_data)
+        for range_data in ranges
+    ]
+
+
+def _plan_chunks(
+    inputs: list[tuple[Path, int]],
+    *,
+    n_workers: int,
+    chunk_size: int,
+    progress_cb: ProgressCallback | None = None,
+) -> list[tuple]:
+    """Plan chunk specs across one or more input files.
+
+    ``inputs`` is a list of ``(input_path, acquisition_id)`` pairs. The
+    planner runs per-file (each file's chunk planner is independent)
+    and concatenates the results. Workers receive the pooled list and
+    are dispatched in chunk-spec order across the worker pool — so
+    the bigger files get more chunks but the work itself fans out
+    evenly across all available workers regardless of which file the
+    chunk belongs to.
+    """
+    emit_start(
+        progress_cb,
+        "plan",
+        message=f"planning chunks for {len(inputs)} input file(s)",
+    )
+    all_chunks: list[tuple] = []
+    for path, acq_id in inputs:
+        fmt = _detect_format(path)
+        # Per-file thread budget: at most n_workers BGZF threads while
+        # planning — same as the demux stage will use.
+        per_file_chunks = _plan_chunks_for_file(
+            path,
+            fmt,
+            acquisition_id=acq_id,
+            chunk_size=chunk_size,
+            threads=n_workers,
+        )
+        all_chunks.extend(per_file_chunks)
 
     emit_done(
         progress_cb,
         "plan",
-        completed=len(chunks),
-        total=len(chunks),
-        message=f"{len(chunks)} chunk(s)",
+        completed=len(all_chunks),
+        total=len(all_chunks),
+        message=f"{len(all_chunks)} chunk(s) across {len(inputs)} file(s)",
     )
-    return chunks
+    return all_chunks
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -248,10 +320,10 @@ def _plan_chunks(
 
 
 def run_fused_demux_stage(
-    input_path: Path,
+    inputs: list[tuple[Path, int]],
     *,
     library_design: str,
-    acquisition_id: int,
+    samples: Samples,
     output_dir: Path,
     n_workers: int = 1,
     chunk_size: int = 100_000,
@@ -259,17 +331,17 @@ def run_fused_demux_stage(
     progress_cb: ProgressCallback | None = None,
     resume: bool = False,
 ) -> dict[str, StageOutput]:
-    """Plan chunks + fan out per-chunk workers.
+    """Plan chunks + fan out per-chunk workers across one or more files.
 
-    Each worker writes 4 output shards (``reads``, ``read_segments``,
-    ``read_demux``, ``orfs``) under their respective ``<output>/<key>/``
-    directories. The reads dataset is partitioned by chunk, not a
-    single parquet — query it via ``pa.dataset.dataset(reads/)``.
+    Each worker writes 5 shards under ``<output>/<key>/``:
+    ``reads``, ``read_segments``, ``read_demux``, ``orfs``,
+    ``feature_quant`` (partial — pre-aggregated per-worker counts).
+    All five datasets are partitioned by chunk; downstream consumers
+    open them as ``pa.dataset.dataset(...)`` directly — no single-file
+    aggregation between stages.
     """
-    fmt = _detect_format(input_path)
     chunks = _plan_chunks(
-        input_path,
-        fmt,
+        inputs,
         n_workers=n_workers,
         chunk_size=chunk_size,
         progress_cb=progress_cb,
@@ -279,13 +351,17 @@ def run_fused_demux_stage(
         worker_fn=_fused_chunk_worker,
         batches=chunks,
         output_dir=output_dir,
-        output_keys=(KEY_READS, KEY_READ_SEGMENTS, KEY_READ_DEMUX, KEY_ORFS),
+        output_keys=(
+            KEY_READS,
+            KEY_READ_SEGMENTS,
+            KEY_READ_DEMUX,
+            KEY_ORFS,
+            KEY_FEATURE_QUANT,
+        ),
         n_workers=n_workers,
         worker_kwargs={
-            "input_path": str(input_path),
-            "fmt": fmt,
             "library_design": library_design,
-            "acquisition_id": acquisition_id,
+            "samples": samples,
             "min_aa_length": min_aa_length,
         },
         progress_cb=progress_cb,
@@ -301,22 +377,29 @@ def run_fused_demux_stage(
 
 
 def resolve_and_quantify(
-    demux_outputs: dict[str, StageOutput],
+    output_dir: Path,
     *,
     samples: Samples,
-    acquisition_id: int,
-    output_dir: Path,
     min_protein_count: int,
     progress_cb: ProgressCallback | None = None,
     resume: bool = False,
-) -> tuple[pa.Table, pa.Table, list[FastaRecord], str]:
-    """Concatenate stage-2 shards, resolve sample assignments, and
-    build the count matrix.
+) -> tuple[pa.Table, list[FastaRecord], str]:
+    """Aggregate per-worker partial counts into the final count matrix.
 
-    Returns ``(demux_table, quant_table, fasta_records, tsv_text)`` —
-    the writer below persists each. Sequential by design: the
-    aggregation work is small (one row per read at S1) and benefits
-    from a single in-memory pass.
+    No single-file `read_demux.parquet` write — `read_demux/` stays a
+    partitioned dataset (consumers open it as
+    ``pa.dataset.dataset(read_demux/)`` and stream-iterate / filter
+    via Arrow's compute kernels). The only single-file outputs are
+    the human-facing terminal artifacts:
+
+      - ``feature_quant.parquet`` (small — bounded by unique proteins
+        × samples)
+      - ``proteins.fasta``
+      - ``protein_counts.tsv``
+
+    The actual aggregation is a single Arrow ``group_by`` + ``sum``
+    over the ``feature_quant/`` partitioned dataset, whose row count
+    is bounded by per-worker unique-pair counts (small at any scale).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     success = output_dir / "_quant_success__"
@@ -325,32 +408,26 @@ def resolve_and_quantify(
         emit_start(
             progress_cb, "resolve", message="resume: reusing existing outputs"
         )
-        demux_table = pq.read_table(output_dir / "read_demux.parquet")
         quant = pq.read_table(output_dir / "feature_quant.parquet")
         # FASTA / TSV are emitted-only; we don't need to round-trip
         # them on resume. Return empty stubs and let the caller
         # acknowledge resume.
         emit_done(progress_cb, "resolve", message="resumed")
-        return demux_table, quant, [], ""
+        return quant, [], ""
 
-    emit_start(progress_cb, "resolve", message="aggregating shards")
-
-    # Concatenate per-batch tables. order-stable because parallel.py
-    # sorted shards by batch index.
-    segments_table = read_dataset(demux_outputs[KEY_READ_SEGMENTS])
-    demux_table = read_dataset(demux_outputs[KEY_READ_DEMUX])
-    orf_table = read_dataset(demux_outputs[KEY_ORFS])
-
-    demux_table = resolve_demux(
-        demux_table,
-        segments_table,
-        samples=samples,
-        acquisition_id=acquisition_id,
+    emit_start(
+        progress_cb,
+        "resolve",
+        message="aggregating partial-quant shards",
     )
-    pq.write_table(demux_table, output_dir / "read_demux.parquet")
 
-    quant, fasta_records, tsv_text = build_protein_count_matrix(
-        demux_table, orf_table, samples, min_protein_count=min_protein_count
+    # Stream over the partitioned feature_quant dataset; the
+    # aggregator handles group_by + sum + ordering + labelling
+    # internally.
+    quant, fasta_records, tsv_text = aggregate_partial_quants(
+        output_dir / KEY_FEATURE_QUANT,
+        samples,
+        min_protein_count=min_protein_count,
     )
     pq.write_table(quant, output_dir / "feature_quant.parquet")
     (output_dir / "proteins.fasta").write_text(
@@ -366,7 +443,7 @@ def resolve_and_quantify(
         total=quant.num_rows,
         message=f"{len(fasta_records)} proteins",
     )
-    return demux_table, quant, fasta_records, tsv_text
+    return quant, fasta_records, tsv_text
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -375,40 +452,42 @@ def resolve_and_quantify(
 
 
 def run_demux_pipeline(
-    input_path: Path,
+    input_path: Path | list[tuple[Path, int]],
     *,
     library_design: str,
     samples: Samples,
-    acquisition_id: int,
     output_dir: Path,
+    acquisition_id: int = 1,
     chunk_size: int = 100_000,
     n_workers: int = 1,
     min_aa_length: int = 60,
     min_protein_count: int = 2,
     progress_cb: ProgressCallback | None = None,
     resume: bool = False,
-    # Backwards-compat alias for the old ``batch_size`` kwarg — same
-    # semantic role (records-per-worker-chunk). Older callers pass it;
-    # accept and forward to ``chunk_size`` if the new kwarg is left
-    # at default.
+    # Backwards-compat alias for the old ``batch_size`` kwarg.
     batch_size: int | None = None,
 ) -> dict[str, object]:
-    """End-to-end demux pipeline: SAM/BAM → counts.
+    """End-to-end demux pipeline: SAM/BAM(s) → counts.
 
-    Per-worker chunked: each of ``n_workers`` workers opens its own
-    pysam handle on a slice of the source file, ingests its slice
-    directly into READ_TABLE rows, runs demux + ORF prediction, and
-    writes its own shards. There is no parent-serial ingest stage.
+    ``input_path`` can be a single ``Path`` (single-acquisition mode —
+    the legacy shape; uses the ``acquisition_id`` kwarg for the
+    stamped acquisition_id) or a list of ``(path, acquisition_id)``
+    pairs (multi-acquisition mode — used when running multiple flow
+    cells / re-runs through one pipeline invocation).
 
-    With ``n_workers`` matching the available cores on a node (e.g. 96
-    on a cluster node), ingest scales N-fold over the previous
-    streaming-but-single-threaded design — the BGZF decompression
-    happens N times in parallel inside N processes.
+    Per-worker chunked: each chunk worker opens its own pysam handle
+    on a slice of one source file, ingests its slice directly into
+    READ_TABLE rows, runs demux + ORF prediction, resolves sample_id
+    locally against the (small, picklable) Samples object, and writes
+    its 5 shards (reads, read_segments, read_demux, orfs,
+    feature_quant). There is no parent-serial ingest stage and no
+    cross-shard read-level join in the resolver.
 
-    Returns a dict of artefact tables / records / paths that the CLI
-    handler renders into stdout / disk locations. ``n_reads`` is the
-    primary-record count summed across worker shards (== demux table
-    row count in S1, where every read produces exactly one demux row).
+    Returns a dict with ``n_reads`` (sum of records ingested across
+    all input files), ``demux_outputs`` (per-key StageOutput), the
+    final ``quant_table`` + ``fasta_records`` + ``tsv_text`` for the
+    CLI manifest. ``read_demux/`` is a partitioned dataset on disk —
+    consumers open it via ``pa.dataset.dataset(...)`` directly.
     """
     cb = progress_cb or NullProgress()
     output_dir = Path(output_dir)
@@ -419,10 +498,16 @@ def run_demux_pipeline(
     if batch_size is not None and chunk_size == 100_000:
         chunk_size = batch_size
 
+    # Normalise input: single Path → list of one (path, acquisition_id).
+    if isinstance(input_path, (str, Path)):
+        inputs = [(Path(input_path), acquisition_id)]
+    else:
+        inputs = [(Path(p), aid) for p, aid in input_path]
+
     demux_outputs = run_fused_demux_stage(
-        input_path,
+        inputs,
         library_design=library_design,
-        acquisition_id=acquisition_id,
+        samples=samples,
         output_dir=output_dir,
         n_workers=n_workers,
         chunk_size=chunk_size,
@@ -431,22 +516,28 @@ def run_demux_pipeline(
         resume=resume,
     )
 
-    demux_table, quant, fasta_records, tsv_text = resolve_and_quantify(
-        demux_outputs,
+    quant, fasta_records, tsv_text = resolve_and_quantify(
+        output_dir,
         samples=samples,
-        acquisition_id=acquisition_id,
-        output_dir=output_dir,
         min_protein_count=min_protein_count,
         progress_cb=cb,
         resume=resume,
     )
 
-    n_reads = demux_table.num_rows  # one row per primary read in S1
+    # n_reads from the partitioned read_demux dataset metadata — each
+    # shard contributes its row count, summed without materialising.
+    import pyarrow.dataset as ds
+
+    demux_dir = output_dir / KEY_READ_DEMUX
+    n_reads = (
+        ds.dataset(str(demux_dir), format="parquet").count_rows()
+        if demux_dir.is_dir()
+        else 0
+    )
 
     return {
         "n_reads": n_reads,
         "demux_outputs": demux_outputs,
-        "demux_table": demux_table,
         "quant_table": quant,
         "fasta_records": fasta_records,
         "tsv_text": tsv_text,

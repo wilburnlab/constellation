@@ -304,10 +304,11 @@ def test_demux_pipeline_threads_4_matches_threads_1(tmp_path: pathlib.Path) -> N
     )
 
     # Demux table row count + content match.
-    a_demux = pq.read_table(tmp_path / "single" / "read_demux.parquet").sort_by(
+    import pyarrow.dataset as ds
+    a_demux = ds.dataset(tmp_path / "single" / "read_demux", format="parquet").to_table().sort_by(
         "read_id"
     )
-    b_demux = pq.read_table(tmp_path / "parallel" / "read_demux.parquet").sort_by(
+    b_demux = ds.dataset(tmp_path / "parallel" / "read_demux", format="parquet").to_table().sort_by(
         "read_id"
     )
     assert a_demux.num_rows == b_demux.num_rows == 4009

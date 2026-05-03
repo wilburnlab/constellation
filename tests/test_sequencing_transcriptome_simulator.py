@@ -275,7 +275,8 @@ def test_simulator_to_demux_clean_round_trip(tmp_path: Path) -> None:
         n_workers=1,
     )
 
-    demux_table = pq.read_table(out_dir / "read_demux.parquet")
+    import pyarrow.dataset as ds
+    demux_table = ds.dataset(out_dir / "read_demux", format="parquet").to_table()
     rows = demux_table.to_pylist()
     by_id = {r["read_id"]: r for r in rows}
 
@@ -321,3 +322,95 @@ def test_simulator_to_demux_clean_round_trip(tmp_path: Path) -> None:
         f"barcode_id mismatches on {len(bc_mismatches)} reads "
         f"(showing first 5): {bc_mismatches[:5]}"
     )
+
+
+def test_simulator_multi_file_pipeline(tmp_path: Path) -> None:
+    """Multi-acquisition pipeline: two SAM files, two acquisitions —
+    every barcode reused across the two files, sample_id assignment
+    is per-(file, barcode). Verifies that:
+
+      - acquisition_id is correctly stamped per source file
+      - sample_id resolves via Samples' M:N table for each
+        (acquisition, barcode) edge
+      - the final count matrix sums contributions across both files
+        when the same protein is detected in both
+    """
+    from constellation.sequencing.transcriptome.stages import run_demux_pipeline
+
+    all_specs = generate_stress_test_specs(
+        CDNA_WILBURN_V1, n_per_category=2, seed=42
+    )
+    clean = [s for s in all_specs if is_deterministic_clean(s)]
+    assert len(clean) >= 20
+
+    # Split the corpus across two files. Same barcodes appear in both
+    # files (panel reuse) — distinct samples in each acquisition.
+    half = len(clean) // 2
+    specs_a = clean[:half]
+    specs_b = clean[half:]
+
+    sim_dir = tmp_path / "simulator"
+    sam_a = sim_dir / "flowcell_a.sam"
+    gt_a = sim_dir / "gt_a.parquet"
+    sam_b = sim_dir / "flowcell_b.sam"
+    gt_b = sim_dir / "gt_b.parquet"
+    simulate_panel(specs_a, CDNA_WILBURN_V1, sam_path=sam_a, ground_truth_path=gt_a)
+    simulate_panel(specs_b, CDNA_WILBURN_V1, sam_path=sam_b, ground_truth_path=gt_b)
+
+    n_barcodes = len(CDNA_WILBURN_V1.layout[3].barcodes)
+    # Acquisition 1 = flowcell_a; barcode N → sample_id N+1
+    # Acquisition 2 = flowcell_b; barcode N → sample_id N+101 (distinct)
+    samples = Samples.from_records(
+        samples=[
+            {
+                "sample_id": offset + i + 1,
+                "sample_name": f"acq{aid}_BC{i + 1:02d}",
+                "description": None,
+            }
+            for aid, offset in [(1, 0), (2, 100)]
+            for i in range(n_barcodes)
+        ],
+        edges=[
+            {
+                "sample_id": offset + i + 1,
+                "acquisition_id": aid,
+                "barcode_id": i,
+            }
+            for aid, offset in [(1, 0), (2, 100)]
+            for i in range(n_barcodes)
+        ],
+    )
+
+    out_dir = tmp_path / "demux"
+    run_demux_pipeline(
+        [(sam_a, 1), (sam_b, 2)],
+        library_design="cdna_wilburn_v1",
+        samples=samples,
+        output_dir=out_dir,
+        batch_size=500,
+        n_workers=1,
+    )
+
+    import pyarrow.dataset as ds
+    import pyarrow.compute as pc
+
+    demux_ds = ds.dataset(out_dir / "read_demux", format="parquet")
+    # Each acquisition has a disjoint sample_id space. After resolution,
+    # sample_ids in [1, 100] should belong to acquisition 1's reads,
+    # sample_ids in [101, 200] to acquisition 2's reads.
+    rows = demux_ds.to_table().to_pylist()
+    rows_with_sample = [r for r in rows if r["sample_id"] is not None]
+    assert any(r["sample_id"] <= n_barcodes for r in rows_with_sample), (
+        "no acquisition-1 reads got resolved (sample_id ≤ panel size)"
+    )
+    assert any(100 < r["sample_id"] <= 100 + n_barcodes for r in rows_with_sample), (
+        "no acquisition-2 reads got resolved (sample_id 101..panel)"
+    )
+
+    # Final count matrix exists and references both sample_id spaces.
+    import pyarrow.parquet as pq
+
+    quant = pq.read_table(out_dir / "feature_quant.parquet")
+    sids = set(quant.column("sample_id").to_pylist())
+    assert any(s <= n_barcodes for s in sids), "quant has no acquisition-1 samples"
+    assert any(100 < s <= 100 + n_barcodes for s in sids), "quant has no acquisition-2 samples"

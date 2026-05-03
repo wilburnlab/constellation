@@ -307,7 +307,7 @@ def main() -> int:
     parser.add_argument(
         "output_dir",
         type=Path,
-        help="path to a demux output directory (contains read_demux.parquet "
+        help="path to a demux output directory (contains read_demux/ "
         "+ read_segments/ shards)",
     )
     parser.add_argument(
@@ -321,7 +321,9 @@ def main() -> int:
     out_dir = args.out_dir or (args.output_dir / "stats")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    demux = pq.read_table(args.output_dir / "read_demux.parquet")
+    demux = ds.dataset(
+        args.output_dir / "read_demux", format="parquet"
+    ).to_table()
     segments = _read_segments_dataset(args.output_dir / "read_segments")
 
     stats_table = _build_stats_table(demux, segments)

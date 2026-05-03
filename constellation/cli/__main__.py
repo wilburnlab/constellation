@@ -132,7 +132,14 @@ def _build_transcriptome_parser(subs) -> None:
     p_dem.add_argument(
         "--reads",
         required=True,
-        help="path to a Dorado-emitted SAM or BAM (suffix-dispatched)",
+        nargs="+",
+        help=(
+            "path(s) to Dorado-emitted SAM or BAM. Accepts: a single "
+            "file, multiple files, or a directory (auto-globs *.bam "
+            "and *.sam). Multi-file mode requires the samples TSV to "
+            "include a 'file' column tying each (sample_id, barcode_id) "
+            "to its source file."
+        ),
     )
     p_dem.add_argument(
         "--library-design",
@@ -143,9 +150,16 @@ def _build_transcriptome_parser(subs) -> None:
         "--samples",
         required=True,
         help=(
-            "TSV file: sample_id (int) + sample_name (str) + barcode_id "
-            "(int, 0-indexed into the design's barcode panel) per line; "
-            "header optional"
+            "TSV file mapping reads → samples. Single-file mode: "
+            "columns are sample_id (int) + sample_name (str) + "
+            "barcode_id (int, 0-indexed into the design's barcode "
+            "panel). Multi-file mode: prepend a 'file' column whose "
+            "values match the basenames or paths under --reads — "
+            "each row asserts (file, sample_id, barcode_id) and the "
+            "same sample_id may appear with multiple (file, barcode) "
+            "combos (re-runs / multi-flowcell aggregation). Header "
+            "row is optional in single-file mode and required in "
+            "multi-file mode."
         ),
     )
     p_dem.add_argument(
@@ -220,8 +234,167 @@ def _build_transcriptome_parser(subs) -> None:
     p_cluster.set_defaults(func=_cmd_not_wired("transcriptome cluster"))
 
 
+def _resolve_input_paths(reads_args: list[str]) -> list[Path]:
+    """Expand --reads arguments into a deterministic list of files.
+
+    Accepts (a) one or more file paths, (b) a single directory (auto-
+    globs ``*.bam`` and ``*.sam``), or any mix. Sorts the result so
+    acquisition_id assignment is deterministic across runs.
+    """
+    from pathlib import Path
+
+    files: list[Path] = []
+    for raw in reads_args:
+        p = Path(raw)
+        if p.is_dir():
+            files.extend(sorted(p.glob("*.bam")))
+            files.extend(sorted(p.glob("*.sam")))
+        elif p.is_file():
+            files.append(p)
+        else:
+            raise FileNotFoundError(f"--reads target not found: {p}")
+    if not files:
+        raise ValueError(
+            f"no .sam or .bam files found under --reads {reads_args}"
+        )
+    # Deduplicate while preserving sort order.
+    seen: set[Path] = set()
+    deduped: list[Path] = []
+    for f in sorted(files):
+        if f not in seen:
+            seen.add(f)
+            deduped.append(f)
+    return deduped
+
+
+def _parse_samples_tsv(
+    tsv_path: str,
+    *,
+    input_files: list[Path],
+    default_acquisition_id: int,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[Path, int]]:
+    """Parse the samples TSV in single- or multi-file mode.
+
+    Single-file mode (TSV header lacks ``file`` column or is absent):
+    every row gets ``acquisition_id = default_acquisition_id``. All
+    rows must reference barcode_ids from a single panel.
+
+    Multi-file mode (TSV header includes a ``file`` column): each
+    row's ``file`` cell is matched against the supplied ``input_files``
+    by basename or full path. Each unique referenced file gets a
+    deterministic acquisition_id (1..N in sorted-path order).
+
+    Returns ``(sample_rows, edge_rows, file_to_acquisition_id)`` ready
+    for ``Samples.from_records`` and the chunk planner.
+    """
+    from pathlib import Path
+
+    by_basename = {f.name: f for f in input_files}
+    by_path = {str(f): f for f in input_files}
+
+    file_to_acq: dict[Path, int] = {
+        f: i + 1 for i, f in enumerate(sorted(input_files))
+    }
+
+    sample_rows: list[dict[str, object]] = []
+    edge_rows: list[dict[str, object]] = []
+    seen_sample_ids: dict[int, str] = {}
+
+    with open(tsv_path, encoding="utf-8") as fh:
+        lines = [
+            ln.rstrip("\r\n")
+            for ln in fh
+            if ln.strip() and not ln.lstrip().startswith("#")
+        ]
+    if not lines:
+        raise ValueError(f"samples TSV {tsv_path!r} has no rows")
+
+    # Header detection: first row's first cell == "file" or
+    # "sample_id" — we treat as header if any of the canonical column
+    # names appears as a literal cell value.
+    first_cells = [c.strip() for c in lines[0].split("\t")]
+    canonical_columns = {"file", "sample_id", "sample_name", "barcode_id"}
+    is_header = bool(set(first_cells) & canonical_columns)
+
+    if is_header:
+        header = first_cells
+        body = lines[1:]
+    else:
+        # No header — assume single-file 3-column format.
+        header = ["sample_id", "sample_name", "barcode_id"]
+        body = lines
+
+    multi_file_mode = "file" in header
+    if multi_file_mode and len(input_files) <= 1:
+        # User supplied a 'file' column but only one input file —
+        # require the column anyway, just verify it matches.
+        pass
+    if not multi_file_mode and len(input_files) > 1:
+        raise ValueError(
+            f"--reads passed {len(input_files)} files but the samples "
+            f"TSV has no 'file' column — multi-file inputs require a "
+            f"'file' column tying each (sample_id, barcode_id) row to "
+            f"its source file"
+        )
+
+    col_idx = {name: i for i, name in enumerate(header)}
+    required = {"sample_id", "sample_name", "barcode_id"}
+    missing = required - set(col_idx)
+    if missing:
+        raise ValueError(
+            f"samples TSV missing required columns: {sorted(missing)}"
+        )
+
+    for raw in body:
+        cells = [c.strip() for c in raw.split("\t")]
+        if len(cells) < len(header):
+            continue  # malformed row — skip
+        try:
+            sid = int(cells[col_idx["sample_id"]])
+            bid = int(cells[col_idx["barcode_id"]])
+        except ValueError:
+            continue
+        sname = cells[col_idx["sample_name"]]
+        if multi_file_mode:
+            file_cell = cells[col_idx["file"]]
+            file_path = by_basename.get(file_cell) or by_path.get(file_cell)
+            if file_path is None:
+                # Try resolving as a path relative to cwd.
+                p = Path(file_cell)
+                if p.is_file():
+                    file_path = p.resolve()
+                    by_path[str(file_path)] = file_path
+                    if file_path not in file_to_acq:
+                        file_to_acq[file_path] = len(file_to_acq) + 1
+                else:
+                    raise ValueError(
+                        f"samples TSV references file {file_cell!r} "
+                        f"which is not in --reads inputs (basenames: "
+                        f"{sorted(by_basename)})"
+                    )
+            acq_id = file_to_acq[file_path]
+        else:
+            acq_id = default_acquisition_id
+
+        # Sample table row — first time we see each sample_id only.
+        if sid not in seen_sample_ids:
+            sample_rows.append(
+                {"sample_id": sid, "sample_name": sname, "description": None}
+            )
+            seen_sample_ids[sid] = sname
+        edge_rows.append(
+            {
+                "sample_id": sid,
+                "acquisition_id": acq_id,
+                "barcode_id": bid,
+            }
+        )
+
+    return sample_rows, edge_rows, file_to_acq
+
+
 def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
-    """Run the full S1 demux + ORF + quant pipeline on a SAM/BAM."""
+    """Run the full S1 demux + ORF + quant pipeline on one or more SAM/BAMs."""
     # Defer heavy imports until the subcommand actually fires so
     # `constellation --help` stays fast.
     import json
@@ -236,49 +409,33 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         run_demux_pipeline,
     )
 
-    input_path = Path(args.reads)
+    input_files = _resolve_input_paths(args.reads)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Parse the samples TSV. Format: sample_id<TAB>sample_name<TAB>barcode_id.
-    # Lines starting with '#' or matching the header are skipped.
-    sample_rows: list[dict[str, object]] = []
-    edge_rows: list[dict[str, object]] = []
-    with open(args.samples, encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            cells = line.split("\t")
-            if len(cells) < 3:
-                continue
-            sid_str, name, bid_str = cells[0], cells[1], cells[2]
-            if sid_str == "sample_id":  # header line
-                continue
-            try:
-                sid = int(sid_str)
-                bid = int(bid_str)
-            except ValueError:
-                continue
-            sample_rows.append(
-                {"sample_id": sid, "sample_name": name, "description": None}
-            )
-            edge_rows.append(
-                {
-                    "sample_id": sid,
-                    "acquisition_id": args.acquisition_id,
-                    "barcode_id": bid,
-                }
-            )
+    sample_rows, edge_rows, file_to_acq = _parse_samples_tsv(
+        args.samples,
+        input_files=input_files,
+        default_acquisition_id=args.acquisition_id,
+    )
     samples = Samples.from_records(samples=sample_rows, edges=edge_rows)
+
+    # Build (file, acquisition_id) input list for the pipeline.
+    if len(input_files) == 1 and len(file_to_acq) <= 1:
+        # Single-file mode — keep using the user's --acquisition-id as
+        # the stamped value.
+        pipeline_inputs: list[tuple[Path, int]] = [
+            (input_files[0], args.acquisition_id)
+        ]
+    else:
+        pipeline_inputs = [(f, file_to_acq[f]) for f in input_files]
 
     cb = StreamProgress() if args.progress else NullProgress()
 
     artefacts = run_demux_pipeline(
-        input_path,
+        pipeline_inputs,
         library_design=args.library_design,
         samples=samples,
-        acquisition_id=args.acquisition_id,
         output_dir=output_dir,
         batch_size=args.batch_size,
         n_workers=args.threads,
@@ -289,19 +446,17 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
     )
 
     n_reads = artefacts["n_reads"]
-    demux_table = artefacts["demux_table"]
     quant_table = artefacts["quant_table"]
     fasta_records = artefacts["fasta_records"]
 
     # Manifest for reproducibility audit.
     manifest = {
-        "input_path": str(input_path),
+        "input_files": [str(f) for f in input_files],
+        "acquisition_map": {str(f): aid for f, aid in pipeline_inputs},
         "library_design": args.library_design,
-        "acquisition_id": args.acquisition_id,
         "min_aa_length": args.min_aa_length,
         "min_protein_count": args.min_protein_count,
         "n_reads": n_reads,
-        "n_demux_rows": demux_table.num_rows,
         "n_proteins_kept": len(fasta_records),
         "n_workers": args.threads,
         "batch_size": args.batch_size,
