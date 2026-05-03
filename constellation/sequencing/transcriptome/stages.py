@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -147,6 +147,7 @@ def ingest_reads(
     acquisition_id: int,
     output_dir: Path,
     batch_size: int = 100_000,
+    threads: int = 1,
     progress_cb: ProgressCallback | None = None,
     resume: bool = False,
 ) -> tuple[Path, int]:
@@ -166,6 +167,12 @@ def ingest_reads(
     chunk becomes one parquet row group, which makes downstream
     streaming consumers (``ParquetFile.iter_batches``) see the same
     natural batch shape on the disk side too.
+
+    ``threads`` is the htslib BGZF decompression thread count for
+    BAM input (``pysam.AlignmentFile(threads=N)``). Has no effect on
+    SAM (text-format) ingest. Higher values trade CPU for wall time
+    on large bgzip'd inputs; ``threads=4-8`` is typical on a Dorado
+    BAM.
 
     Resume: if ``reads.parquet`` exists *and* a sentinel
     ``reads.parquet.__success__`` marker sits next to it, the existing
@@ -197,12 +204,21 @@ def ingest_reads(
     emit_start(progress_cb, KEY_READS, message=f"streaming {input_path}")
     reader = find_reader(input_path, modality="nanopore")
 
+    # Forward ``threads`` only to readers that accept it (BamReader);
+    # SamReader's pure-Python scan ignores it.
+    iter_kwargs: dict[str, Any] = {"acquisition_id": acquisition_id}
+    try:
+        import inspect
+
+        if "threads" in inspect.signature(reader.iter_batches).parameters:
+            iter_kwargs["threads"] = threads
+    except (TypeError, ValueError):
+        pass
+
     n_reads = 0
     writer: pq.ParquetWriter | None = None
     try:
-        for batch in reader.iter_batches(
-            input_path, batch_size, acquisition_id=acquisition_id
-        ):
+        for batch in reader.iter_batches(input_path, batch_size, **iter_kwargs):
             if writer is None:
                 # Open the writer with the first batch's schema (which
                 # equals READ_TABLE for both SAM and BAM readers).
@@ -401,6 +417,7 @@ def run_demux_pipeline(
         acquisition_id=acquisition_id,
         output_dir=output_dir,
         batch_size=batch_size,
+        threads=n_workers,
         progress_cb=cb,
         resume=resume,
     )
