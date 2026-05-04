@@ -87,6 +87,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # Sequencing transcriptomics pipeline (S1 — demultiplex shipped).
     _build_transcriptome_parser(subs)
 
+    # Reference imports / fetch / summary / validate.
+    _build_reference_parser(subs)
+
     # Placeholders so `--help` advertises the intended surface. Wire as
     # the underlying modules are ported.
     for name, summary in [
@@ -471,6 +474,200 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
             f"{len(fasta_records)} proteins, {quant_table.num_rows} quant rows",
             flush=True,
         )
+    return 0
+
+
+def _build_reference_parser(subs) -> None:
+    """Wire the ``constellation reference ...`` sub-tree.
+
+    Verbs:
+        import        local-files in (FASTA + optional GFF3) →
+                      ParquetDir bundles
+        fetch         <source>:<id> → download via stdlib HTTP →
+                      same ParquetDir bundles as ``import``
+        summary       print contig/feature counts on a saved bundle
+        validate      load + run ``.validate()`` + cross-check
+    """
+    p_ref = subs.add_parser(
+        "reference",
+        help="Import / fetch / summarise / validate genome+annotation references",
+    )
+    ref_subs = p_ref.add_subparsers(dest="ref_subcommand", required=True)
+
+    p_imp = ref_subs.add_parser(
+        "import",
+        help="Import local FASTA (+ optional GFF3) into ParquetDir bundles",
+    )
+    p_imp.add_argument(
+        "--fasta",
+        required=True,
+        help="genome FASTA path (gzip-aware via .gz suffix)",
+    )
+    p_imp.add_argument(
+        "--gff3",
+        default=None,
+        help="optional GFF3 path; when omitted, only the GenomeReference is written",
+    )
+    p_imp.add_argument(
+        "--output-dir",
+        required=True,
+        help=(
+            "output directory; receives ``genome/`` and (when --gff3 is given) "
+            "``annotation/`` ParquetDir subdirectories"
+        ),
+    )
+    p_imp.set_defaults(func=_cmd_reference_import)
+
+    p_fetch = ref_subs.add_parser(
+        "fetch",
+        help=(
+            "Fetch a genome+GFF3 from Ensembl / Ensembl Genomes / RefSeq via "
+            "stdlib HTTP"
+        ),
+    )
+    p_fetch.add_argument(
+        "spec",
+        help=(
+            "<source>:<id> — e.g. 'ensembl_genomes:saccharomyces_cerevisiae', "
+            "'refseq:GCF_001708105.1', 'ensembl:human'"
+        ),
+    )
+    p_fetch.add_argument(
+        "--output-dir",
+        required=True,
+        help="output directory for the resulting ParquetDir bundles",
+    )
+    p_fetch.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        help="HTTP timeout in seconds (default 600)",
+    )
+    p_fetch.set_defaults(func=_cmd_reference_fetch)
+
+    p_sum = ref_subs.add_parser(
+        "summary",
+        help="Print contig + feature stats for a saved reference bundle",
+    )
+    p_sum.add_argument(
+        "ref_dir",
+        help=(
+            "directory containing ``genome/`` (and optionally ``annotation/``) "
+            "ParquetDir bundles, as written by ``import`` or ``fetch``"
+        ),
+    )
+    p_sum.set_defaults(func=_cmd_reference_summary)
+
+    p_val = ref_subs.add_parser(
+        "validate",
+        help="Load + validate (PK/FK closure + cross-check) a reference bundle",
+    )
+    p_val.add_argument("ref_dir")
+    p_val.set_defaults(func=_cmd_reference_validate)
+
+
+def _cmd_reference_import(args: argparse.Namespace) -> int:
+    """Local FASTA (+ optional GFF3) → ParquetDir bundles."""
+    from pathlib import Path
+
+    from constellation.sequencing.annotation.io import save_annotation
+    from constellation.sequencing.readers.fastx import read_fasta_genome
+    from constellation.sequencing.readers.gff import read_gff3
+    from constellation.sequencing.reference.io import save_genome_reference
+
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    genome = read_fasta_genome(args.fasta)
+    save_genome_reference(genome, out / "genome")
+
+    if args.gff3:
+        contig_name_to_id = {
+            row["name"]: row["contig_id"]
+            for row in genome.contigs.to_pylist()
+        }
+        annotation = read_gff3(args.gff3, contig_name_to_id=contig_name_to_id)
+        annotation.validate_against(genome)
+        save_annotation(annotation, out / "annotation")
+        print(
+            f"imported {genome.n_contigs} contigs ({genome.total_length} bp) + "
+            f"{annotation.n_features} features → {out}",
+            flush=True,
+        )
+    else:
+        print(
+            f"imported {genome.n_contigs} contigs ({genome.total_length} bp) → {out}",
+            flush=True,
+        )
+    return 0
+
+
+def _cmd_reference_fetch(args: argparse.Namespace) -> int:
+    """``<source>:<id>`` → ParquetDir bundles via stdlib HTTP."""
+    from constellation.sequencing.reference.fetch import fetch_reference
+
+    result = fetch_reference(args.spec, args.output_dir, timeout=args.timeout)
+    n_features = result.annotation.n_features if result.annotation else 0
+    print(
+        f"fetched {result.genome.n_contigs} contigs ({result.genome.total_length} bp) "
+        f"+ {n_features} features → {result.output_dir}",
+        flush=True,
+    )
+    print(f"  genome: {result.sources['genome']}")
+    print(f"  annotation: {result.sources['annotation']}")
+    return 0
+
+
+def _cmd_reference_summary(args: argparse.Namespace) -> int:
+    """Print stats for a saved reference bundle."""
+    from collections import Counter
+    from pathlib import Path
+
+    from constellation.sequencing.annotation.io import load_annotation
+    from constellation.sequencing.reference.io import load_genome_reference
+
+    root = Path(args.ref_dir)
+    genome_dir = root / "genome" if (root / "genome").is_dir() else root
+    genome = load_genome_reference(genome_dir)
+    print(
+        f"GenomeReference: {genome.n_contigs} contig(s), "
+        f"{genome.total_length} bp total"
+    )
+
+    annotation_dir = root / "annotation"
+    if annotation_dir.is_dir():
+        annotation = load_annotation(annotation_dir)
+        print(f"Annotation: {annotation.n_features} feature(s)")
+        type_counts = Counter(annotation.features.column("type").to_pylist())
+        for ftype, n in sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"  {ftype}: {n}")
+        # Are exons present? — informs whether TranscriptReference.from_annotation
+        # would yield non-empty output.
+        if "exon" in type_counts and ("mRNA" in type_counts or "transcript" in type_counts):
+            print("  → TranscriptReference.from_annotation is viable")
+    else:
+        print("Annotation: (none — only genome was imported/fetched)")
+    return 0
+
+
+def _cmd_reference_validate(args: argparse.Namespace) -> int:
+    """Load + run validate() + validate_against on a reference bundle."""
+    from pathlib import Path
+
+    from constellation.sequencing.annotation.io import load_annotation
+    from constellation.sequencing.reference.io import load_genome_reference
+
+    root = Path(args.ref_dir)
+    genome_dir = root / "genome" if (root / "genome").is_dir() else root
+    genome = load_genome_reference(genome_dir)
+    print(f"  genome: {genome.n_contigs} contigs ok")
+
+    annotation_dir = root / "annotation"
+    if annotation_dir.is_dir():
+        annotation = load_annotation(annotation_dir)
+        annotation.validate_against(genome)
+        print(f"  annotation: {annotation.n_features} features, FK closure ok")
+    print("validation passed", flush=True)
     return 0
 
 

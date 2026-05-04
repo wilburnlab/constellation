@@ -18,6 +18,11 @@ Notable instances:
     CONTIG_TABLE            reference / assembly contigs
     FEATURE_TABLE           GFF-shaped features (genes, exons, repeats)
     SEQUENCE_TABLE          per-contig sequence bytes
+    TRANSCRIPT_TABLE        spliced transcript records (id, gene_id?,
+                            sequence) — the TranscriptReference shape
+    GENETIC_TOOL_TABLE      common cloning/engineering parts (AbR,
+                            FPs, tags, promoters, vector backbones —
+                            the cRAP analog for genomics)
     ASSEMBLY_CONTIG_TABLE   de novo contigs with polishing history
     SCAFFOLD_TABLE          RagTag-style scaffolds over contigs
     ASSEMBLY_STATS          N50, BUSCO completeness, GC content
@@ -46,13 +51,18 @@ from constellation.sequencing.schemas.assembly import (
 )
 from constellation.sequencing.schemas.quant import (
     COVERAGE_TABLE,
+    FEATURE_ORIGIN_VOCAB,
     FEATURE_QUANT,
 )
 from constellation.sequencing.schemas.reads import READ_TABLE
 from constellation.sequencing.schemas.reference import (
     CONTIG_TABLE,
     FEATURE_TABLE,
+    GENETIC_TOOL_CATEGORIES,
+    GENETIC_TOOL_SEQUENCE_TYPES,
+    GENETIC_TOOL_TABLE,
     SEQUENCE_TABLE,
+    TRANSCRIPT_TABLE,
 )
 from constellation.sequencing.schemas.signal import RAW_SIGNAL_TABLE
 from constellation.sequencing.schemas.transcriptome import (
@@ -69,10 +79,15 @@ __all__ = [
     "CONTIG_TABLE",
     "FEATURE_TABLE",
     "SEQUENCE_TABLE",
+    "TRANSCRIPT_TABLE",
+    "GENETIC_TOOL_TABLE",
+    "GENETIC_TOOL_CATEGORIES",
+    "GENETIC_TOOL_SEQUENCE_TYPES",
     "ASSEMBLY_CONTIG_TABLE",
     "SCAFFOLD_TABLE",
     "ASSEMBLY_STATS",
     "FEATURE_QUANT",
+    "FEATURE_ORIGIN_VOCAB",
     "COVERAGE_TABLE",
     "READ_SEGMENT_TABLE",
     "READ_DEMUX_TABLE",

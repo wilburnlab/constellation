@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from constellation.sequencing.assembly.assembly import Assembly
-from constellation.sequencing.reference.reference import Reference
+from constellation.sequencing.reference.reference import GenomeReference
 
 
 _PHASE = "Phase 8 (assembly/ragtag + thirdparty/ragtag)"
@@ -32,7 +32,7 @@ class RagTagRunner:
     def run(
         self,
         assembly: Assembly,
-        reference: Reference,
+        reference: GenomeReference,
         output_dir: Path,
     ) -> Assembly:
         raise NotImplementedError(f"RagTagRunner.run pending {_PHASE}")

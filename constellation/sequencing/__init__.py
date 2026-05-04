@@ -19,7 +19,9 @@ Lab workflows the module serves:
 Public surface (most stubs this session — see plan
 in-our-development-of-fuzzy-quilt.md):
 
-    Acquisitions, Samples, Reference, Assembly, Alignments, Project
+    Acquisitions, Samples, Project
+    GenomeReference, Annotation, TranscriptReference, GeneticTools
+    Assembly, Alignments
     DoradoModel, DoradoRunner
     LibraryDesign, Adapter, Barcode (transcriptome demux primitives)
     locate_segments, resolve_demux, cluster_reads, build_consensus
@@ -49,15 +51,21 @@ from constellation.sequencing.acquisitions import (
     validate_acquisitions,
 )
 from constellation.sequencing.alignments import Alignments
+from constellation.sequencing.annotation import Annotation
 from constellation.sequencing.assembly import Assembly
 from constellation.sequencing.basecall import DoradoModel, DoradoRunner, RunHandle
+from constellation.sequencing.genetic_tools import (
+    GeneticTools,
+    load_default_genetic_tools,
+)
 from constellation.sequencing.projects import Project
-from constellation.sequencing.reference import Reference
+from constellation.sequencing.reference import GenomeReference
 from constellation.sequencing.samples import (
     SAMPLE_ACQUISITION_EDGE,
     SAMPLE_TABLE,
     Samples,
 )
+from constellation.sequencing.transcripts import TranscriptReference
 
 __all__ = [
     "Acquisitions",
@@ -66,7 +74,11 @@ __all__ = [
     "Samples",
     "SAMPLE_TABLE",
     "SAMPLE_ACQUISITION_EDGE",
-    "Reference",
+    "GenomeReference",
+    "Annotation",
+    "TranscriptReference",
+    "GeneticTools",
+    "load_default_genetic_tools",
     "Assembly",
     "Alignments",
     "Project",

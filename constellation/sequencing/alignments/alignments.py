@@ -6,7 +6,7 @@ supplied ``Acquisitions``; tag-table ``alignment_id`` references must
 exist in the parent table.
 
 ``validate_against(reference)`` cross-checks that every ``ref_name``
-appears in the supplied ``Reference.contigs.name`` set.
+appears in the supplied ``GenomeReference.contigs.name`` set.
 
 Status: STUB.
 """
@@ -19,7 +19,7 @@ from typing import Any
 import pyarrow as pa
 
 from constellation.sequencing.acquisitions import Acquisitions
-from constellation.sequencing.reference.reference import Reference
+from constellation.sequencing.reference.reference import GenomeReference
 
 
 _PHASE = "Phase 2 (Reader/Writer Protocols + readers/sam_bam)"
@@ -46,7 +46,7 @@ class Alignments:
         alignments, alignments → acquisitions if set)."""
         raise NotImplementedError(f"Alignments.validate pending {_PHASE}")
 
-    def validate_against(self, reference: Reference) -> None:
+    def validate_against(self, reference: GenomeReference) -> None:
         """Check that every ``ref_name`` appears in the reference's
         contig name list."""
         raise NotImplementedError(

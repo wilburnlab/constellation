@@ -18,7 +18,7 @@ from typing import Literal
 
 import pyarrow as pa
 
-from constellation.sequencing.reference.reference import Reference
+from constellation.sequencing.reference.reference import GenomeReference
 
 
 _PHASE = "Phase 9 (annotation/repeats)"
@@ -38,7 +38,7 @@ class RepeatsRunner:
 
     def run(
         self,
-        reference: Reference,
+        reference: GenomeReference,
         output_dir: Path,
     ) -> pa.Table:
         raise NotImplementedError(f"RepeatsRunner.run pending {_PHASE}")

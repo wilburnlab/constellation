@@ -1,0 +1,680 @@
+{
+  "meta": {
+    "build_date": "2026-05-03",
+    "version": "0.1.0",
+    "description": "Curated catalogue of common cloning / engineering parts that frequently appear in cell-culture sequencing data. The cRAP-equivalent for genomics/transcriptomics.",
+    "n_entries": 67
+  },
+  "tools": [
+    {
+      "tool_id": 0,
+      "name": "AmpR (bla TEM-1 \u03b2-lactamase)",
+      "category": "antibiotic_resistance",
+      "sequence_type": "protein",
+      "sequence": "MSIQHFRVALIPFFAAFCLPVFAHPETLVKVKDAEDQLGARVGYIELDLNSGKILESFRPEERFPMMSTFKVLLCGAVLSRIDAGQEQLGRRIHYSQNDLVEYSPVTEKHLTDGMTVRELCSAAITMSDNTAANLLLTTIGGPKELTAFLHNMGDHVTRLDRWEPELNEAIPNDERDTTMPVAMATTLRKLLTGELLTLASRQQLIDWMEADKVAGPLLRSALPAGWFIADKSGAGERGSRGIIAALGPDGKPSRIVVIYTTGSQATMDERNRQIAEIGASLIKHW",
+      "source": "ncbi",
+      "source_url": "https://www.ncbi.nlm.nih.gov/protein/AAB59737.1",
+      "references_json": null
+    },
+    {
+      "tool_id": 1,
+      "name": "KanR (aph(3')-Ia neomycin/kanamycin)",
+      "category": "antibiotic_resistance",
+      "sequence_type": "protein",
+      "sequence": "MSHIQRETSCSRPRLNSNMDADLYGYKWARDNVGQSGATIYRLYGKPDAPELFLKHGKGSVANDVTDEMVRLNWLTEFMPLPTIKHFIRTPDDAWLLTTAIPGKTAFQVLEEYPDSGENIVDALAVFLRRLHSIPVCNCPFNSDRVFRLAQAQSRMNNGLVDASDFDDERNGWPVEQVWKEMHKLLPFSPDSVVTHGDFSLDNLIFDEGKLIGCIDVGRVGIADRYQDLAILWNCLGEFSPSLQKRLFQKYGIDNPDMNKLQFHLMLDEFF",
+      "source": "ncbi",
+      "source_url": "https://www.ncbi.nlm.nih.gov/protein/CAA23656.1",
+      "references_json": null
+    },
+    {
+      "tool_id": 2,
+      "name": "CmR (chloramphenicol acetyltransferase, CAT)",
+      "category": "antibiotic_resistance",
+      "sequence_type": "protein",
+      "sequence": "MEKKITGYTTVDISQWHRKEHFEAFQSVAQCTYNQTVQLDITAFLKTVKKNKHKFYPAFIHILARLMNAHPEFRMAMKDGELVIWDSVHPCYTVFHEQTETFSSLWSEYHDDFRQFLHIYSQDVACYGENLAYFPKGFIENMFFVSANPWVSFTSFDLNVANMDNFFAPVFTMGKYYTQGDKVLMPLAIQVHHAVCDGFHVGRMLNELQQYCDEWQGGA",
+      "source": "ncbi",
+      "source_url": "https://www.ncbi.nlm.nih.gov/protein/AAA23230.1",
+      "references_json": null
+    },
+    {
+      "tool_id": 3,
+      "name": "TetR (tetracycline efflux pump TetA-controlling repressor)",
+      "category": "antibiotic_resistance",
+      "sequence_type": "protein",
+      "sequence": "MSRLDKSKVINSALELLNEVGIEGLTTRKLAQKLGVEQPTLYWHVKNKRALLDALAIEMLDRHHTHFCPLEGESWQDFLRNNAKSFRCALLSHRDGAKVHLGTRPTEKQYETLENQLAFLCQQGFSLENALYALSAVGHFTLGCVLEDQEHQVAKEERETPTTDSMPPLLRQAIELFDHQGAEPAFLFGLELIICGLEKQLKCESGS",
+      "source": "ncbi",
+      "source_url": "https://www.ncbi.nlm.nih.gov/protein/CAA00012.1",
+      "references_json": null
+    },
+    {
+      "tool_id": 4,
+      "name": "SpecR (aminoglycoside adenylyltransferase aadA)",
+      "category": "antibiotic_resistance",
+      "sequence_type": "protein",
+      "sequence": "MREAVIAEVSTQLSEVVGVIERHLEPTLLAVHLYGSAVDGGLKPHSDIDLLVTVTVRLDETTRRALINDLLETSASPGESEILRAVEVTIVVHDDIIPWRYPAKRELQFGEWQRNDILAGIFEPATIDIDLAILLTKAREHSVALVGPAAEELFDPVPEQDLFEALNETLTLWNSPPDWAGDERNVVLTLSRIWYSAVTGKIAPKDVAADWAMERLPAQYQPVILEARQAYLGQEEDRLASRADQLEEFVHYVKGEITKVVGK",
+      "source": "ncbi",
+      "source_url": "https://www.ncbi.nlm.nih.gov/protein/AAA22021.1",
+      "references_json": null
+    },
+    {
+      "tool_id": 5,
+      "name": "HygR (hygromycin phosphotransferase, hph)",
+      "category": "antibiotic_resistance",
+      "sequence_type": "protein",
+      "sequence": "MKKPELTATSVEKFLIEKFDSVSDLMQLSEGEESRAFSFDVGGRGYVLRVNSCADGFYKDRYVYRHFASAALPIPEVLDIGEFSESLTYCISRRAQGVTLQDLPETELPAVLQPVAEAMDAIAAADLSQTSGFGPFGPQGIGQYTTWRDFICAIADPHVYHWQTVMDDTVSASVAQALDELMLWAEDCPEVRHLVHADFGSNNVLTDNGRITAVIDWSEAMFGDSQYEVANIFFWRPWLACMEQQTRYFERRHPELAGSPRLRAYMLRIGLDQLYQSLVDGNFDDAAWAQGRCDAIVRSGAGTVGRTQIARRSAAVWTDGCVEVLADSGNRRPSTRPRAKE",
+      "source": "ncbi",
+      "source_url": "https://www.ncbi.nlm.nih.gov/protein/AAA17920.1",
+      "references_json": null
+    },
+    {
+      "tool_id": 6,
+      "name": "ZeoR (Sh ble bleomycin/zeocin resistance)",
+      "category": "antibiotic_resistance",
+      "sequence_type": "protein",
+      "sequence": "MAKLTSAVPVLTARDVAGAVEFWTDRLGFSREFVEDDFAGVVRDDVTLFISAVQDQVVPDNTLAWVWVRGLDELYAEWSEVVSTNFRDASGPAMTEIGEQPWGREFALRDPAGNCVHFVAEEQD",
+      "source": "ncbi",
+      "source_url": "https://www.ncbi.nlm.nih.gov/protein/CAA37050.1",
+      "references_json": null
+    },
+    {
+      "tool_id": 7,
+      "name": "PuroR (puromycin N-acetyltransferase, pac)",
+      "category": "antibiotic_resistance",
+      "sequence_type": "protein",
+      "sequence": "MTEYKPTVRLATRDDVPRAVRTLAAAFADYPATRHTVDPDRHIERVTELQELFLTRVGLDIGKVWVADDGAAVAVWTTPESVEAGAVFAEIGPRMAELSGSRLAAQQQMEGLLAPHRPKEPAWFLATVGVSPDHQGKGLGSAVVLPGVEAAERAGVPAFLETSAPRNLPFYERLGFTVTADVEVPEGPRTWCMTRKPGA",
+      "source": "ncbi",
+      "source_url": "https://www.ncbi.nlm.nih.gov/protein/CAA40811.1",
+      "references_json": null
+    },
+    {
+      "tool_id": 8,
+      "name": "EGFP",
+      "category": "fluorescent_protein",
+      "sequence_type": "protein",
+      "sequence": "MVSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTTGKLPVPWPTLVTTLTYGVQCFSRYPDHMKQHDFFKSAMPEGYVQERTIFFKDDGNYKTRAEVKFEGDTLVNRIELKGIDFKEDGNILGHKLEYNYNSHNVYIMADKQKNGIKVNFKIRHNIEDGSVQLADHYQQNTPIGDGPVLLPDNHYLSTQSALSKDPNEKRDHMVLLEFVTAAGITLGMDELYK",
+      "source": "fpbase",
+      "source_url": "https://www.fpbase.org/protein/egfp/",
+      "references_json": null
+    },
+    {
+      "tool_id": 9,
+      "name": "mCherry",
+      "category": "fluorescent_protein",
+      "sequence_type": "protein",
+      "sequence": "MVSKGEEDNMAIIKEFMRFKVHMEGSVNGHEFEIEGEGEGRPYEGTQTAKLKVTKGGPLPFAWDILSPQFMYGSKAYVKHPADIPDYLKLSFPEGFKWERVMNFEDGGVVTVTQDSSLQDGEFIYKVKLRGTNFPSDGPVMQKKTMGWEASSERMYPEDGALKGEIKQRLKLKDGGHYDAEVKTTYKAKKPVQLPGAYNVNIKLDITSHNEDYTIVEQYERAEGRHSTGGMDELYK",
+      "source": "fpbase",
+      "source_url": "https://www.fpbase.org/protein/mcherry/",
+      "references_json": null
+    },
+    {
+      "tool_id": 10,
+      "name": "mScarlet",
+      "category": "fluorescent_protein",
+      "sequence_type": "protein",
+      "sequence": "MVSKGEAVIKEFMRFKVHMEGSMNGHEFEIEGEGEGRPYEGTQTAKLKVTKGGPLPFSWDILSPQFMYGSRAFTKHPADIPDYYKQSFPEGFKWERVMNFEDGGAVTVTQDTSLEDGTLIYKVKLRGTNFPPDGPVMQKKTMGWEASTERLYPEDGVLKGDIKMALRLKDGGRYLADFKTTYKAKKPVQMPGAYNVDRKLDITSHNEDYTVVEQYERSEGRHSTGGMDELYK",
+      "source": "fpbase",
+      "source_url": "https://www.fpbase.org/protein/mscarlet/",
+      "references_json": null
+    },
+    {
+      "tool_id": 11,
+      "name": "mNeonGreen",
+      "category": "fluorescent_protein",
+      "sequence_type": "protein",
+      "sequence": "MVSKGEEDNMASLPATHELHIFGSINGVDFDMVGQGTGNPNDGYEELNLKSTKGDLQFSPWILVPHIGYGFHQYLPYPDGMSPFQAAMVDGSGYQVHRTMQFEDGASLTVNYRYTYEGSHIKGEAQVKGTGFPADGPVMTNSLTAADWCRSKKTYPNDKTIISTFKWSYTTGNGKRYRSTARTTYTFAKPMAANYLKNQPMYVFRKTELKHSKTELNFKEWQKAFTDVMGMDELYK",
+      "source": "fpbase",
+      "source_url": "https://www.fpbase.org/protein/mneongreen/",
+      "references_json": null
+    },
+    {
+      "tool_id": 12,
+      "name": "EBFP2",
+      "category": "fluorescent_protein",
+      "sequence_type": "protein",
+      "sequence": "MVSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTTGKLPVPWPTLVTTLSHGVQCFSRYPDHMKQHDFFKSAMPEGYVQERTIFFKDDGNYKTRAEVKFEGDTLVNRIELKGIDFKEDGNILGHKLEYNFNSHKVYITADKQKNGIKANFKIRHNVEDGSVQLADHYQQNTPIGDGPVLLPDNHYLSTQSVLSKDPNEKRDHMVLLEFVTAAGITLGMDELYK",
+      "source": "fpbase",
+      "source_url": "https://www.fpbase.org/protein/ebfp2/",
+      "references_json": null
+    },
+    {
+      "tool_id": 13,
+      "name": "mTagBFP2",
+      "category": "fluorescent_protein",
+      "sequence_type": "protein",
+      "sequence": "MSELIKENMHMKLYMEGTVNNHHFKCTSEGEGKPYEGTQTMRIKVVEGGPLPFAFDILATSFMYGSKTFINHTQGIPDFFKQSFPEGFTWERVTTYEDGGVLTATQDTSLQNGCLIYNVKIRGVNFPSNGPVMQKKTLGWEASTETLYPADGGLEGRADMALKLVGGGHLICNLKTTYRSKKPAKNLKMPGVYYVDRRLERIKEADKETYVEQHEVAVARYCDLPSKLGHKLN",
+      "source": "fpbase",
+      "source_url": "https://www.fpbase.org/protein/mtagbfp2/",
+      "references_json": null
+    },
+    {
+      "tool_id": 14,
+      "name": "mTurquoise2",
+      "category": "fluorescent_protein",
+      "sequence_type": "protein",
+      "sequence": "MVSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTTGKLPVPWPTLVTTLSWGVQCFARYPDHMKQHDFFKSAMPEGYVQERTIFFKDDGNYKTRAEVKFEGDTLVNRIELKGIDFKEDGNILGHKLEYNAISDNVYITADKQKNGIKANFKIRHNIEDGSVQLADHYQQNTPIGDGPVLLPDNHYLSTQSKLSKDPNEKRDHMVLLEFVTAAGITLGMDELYK",
+      "source": "fpbase",
+      "source_url": "https://www.fpbase.org/protein/mturquoise2/",
+      "references_json": null
+    },
+    {
+      "tool_id": 15,
+      "name": "mVenus",
+      "category": "fluorescent_protein",
+      "sequence_type": "protein",
+      "sequence": "MVSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKLICTTGKLPVPWPTLVTTLGYGLQCFARYPDHMKQHDFFKSAMPEGYVQERTIFFKDDGNYKTRAEVKFEGDTLVNRIELKGIDFKEDGNILGHKLEYNYNSHNVYIMADKQKNGIKVNFKIRHNIEDGSVQLADHYQQNTPIGDGPVLLPDNHYLSYQSALSKDPNEKRDHMVLLEFVTAAGITLGMDELYK",
+      "source": "fpbase",
+      "source_url": "https://www.fpbase.org/protein/mvenus/",
+      "references_json": null
+    },
+    {
+      "tool_id": 16,
+      "name": "YPet",
+      "category": "fluorescent_protein",
+      "sequence_type": "protein",
+      "sequence": "MVSKGEELFTGVVPILVELDGDVNGHKFSVRGEGEGDATNGKLTLKFICTTGKLPVPWPTLVTTLGYGLQCFARYPEHMKMNDFFKSAMPEGYVQERTISFKDDGTYKTRAEVKFEGDTLVNRIELKGIDFKEDGNILGHKLEYNFNSHNVYITADKQKNGIKANFKIRHNVEDGSVQLADHYQQNTPIGDGPVLLPDNHYLSYQSKLSKDPNEKRDHMVLLEFVTAAGITHGMDELYK",
+      "source": "fpbase",
+      "source_url": "https://www.fpbase.org/protein/ypet/",
+      "references_json": null
+    },
+    {
+      "tool_id": 17,
+      "name": "dTomato",
+      "category": "fluorescent_protein",
+      "sequence_type": "protein",
+      "sequence": "MVSKGEEVIKEFMRFKVRMEGSMNGHEFEIEGEGEGRPYEGTQTAKLKVTKGGPLPFAWDILSPQFMYGSKAYVKHPADIPDYKKLSFPEGFKWERVMNFEDGGVVTVTQDSSLQDGCFIYKVKFIGVNFPSDGPVMQKKTMGWEASTERLYPRDGVLKGEIHQALKLKDGGHYLVEFKTIYMAKKPVQLPGYYYVDTKLDITSHNEDYTIVEQYERTEGRHHLFL",
+      "source": "fpbase",
+      "source_url": "https://www.fpbase.org/protein/dtomato/",
+      "references_json": null
+    },
+    {
+      "tool_id": 18,
+      "name": "mRuby2",
+      "category": "fluorescent_protein",
+      "sequence_type": "protein",
+      "sequence": "MVSKGEELIKENMHMKLYMEGTVNNHHFKCTSEGEGKPYEGTQTMRIKVVEGGPLPFAFDILATSFMYGSRTFINHTQGIPDFFKQSFPEGFTWERVTTYEDGGVLTATQDTSLQDGCLIYNVKIRGVNFPSNGPVMQKKTLGWEANTEMLYPADSGLRGYTHMALKVDGGGHLSCSFVTTYRSKKTVGNIKMPGIHAVDHRLERLEESDNETYVEQHEVAVAKYCDLPSKLGHRLN",
+      "source": "fpbase",
+      "source_url": "https://www.fpbase.org/protein/mruby2/",
+      "references_json": null
+    },
+    {
+      "tool_id": 19,
+      "name": "mPlum",
+      "category": "fluorescent_protein",
+      "sequence_type": "protein",
+      "sequence": "MVSKGEEVIKEFMRFKVRMEGTVNGHEFEIEGEGEGRPYEGFQTAKLKVTKGGPLPFAWDILSPQFMYGSKAYVKHPADIPDYKKLSFPEGFKWERVMNFEDGGVVTVTQDSSLQDGCFIYHVKFIGVNFPSDGPVMQKKTMGWEASTERLYPRDGVLKGEIHQALKLKDGGHYLVEFKSIYMAKKPVQLPGYYYVDSKLDITSHNEDYTIVEQYERTEGRHHLFL",
+      "source": "fpbase",
+      "source_url": "https://www.fpbase.org/protein/mplum/",
+      "references_json": null
+    },
+    {
+      "tool_id": 20,
+      "name": "iRFP670",
+      "category": "fluorescent_protein",
+      "sequence_type": "protein",
+      "sequence": "MAEGSVARQPDLLTCDDEPIHIPGSIQPHGLLLALAADMTIVAGSDNLPELTGLAIGALIGRSAADVFDSETHNRLTIALAEPGAAVGAPITVGFTMRKDAGFIGSWHRHDQLIFLELEPPQRDVAEPQAFFRRTNSAIRRLQAAETLESACAAAAQEVRKITGFDRVMIYRFASDFSGEVIAEDRCAEVESKLGLHYPASTVPAQARRLYTINPVRIIPDINYRPVPVTPAVNPVTGRPIDLSFAILRSVSPVHLEFMRNIGMHGTMSISILRGERLWGLIVCHHRTPYYVDLDGRQACELVAQVLAWQIGVMEE",
+      "source": "fpbase",
+      "source_url": "https://www.fpbase.org/protein/irfp670/",
+      "references_json": null
+    },
+    {
+      "tool_id": 21,
+      "name": "6xHis tag",
+      "category": "epitope_tag",
+      "sequence_type": "protein",
+      "sequence": "HHHHHH",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 22,
+      "name": "FLAG tag",
+      "category": "epitope_tag",
+      "sequence_type": "protein",
+      "sequence": "DYKDDDDK",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 23,
+      "name": "3xFLAG tag",
+      "category": "epitope_tag",
+      "sequence_type": "protein",
+      "sequence": "DYKDHDGDYKDHDIDYKDDDDK",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 24,
+      "name": "HA tag",
+      "category": "epitope_tag",
+      "sequence_type": "protein",
+      "sequence": "YPYDVPDYA",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 25,
+      "name": "Myc tag",
+      "category": "epitope_tag",
+      "sequence_type": "protein",
+      "sequence": "EQKLISEEDL",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 26,
+      "name": "V5 tag",
+      "category": "epitope_tag",
+      "sequence_type": "protein",
+      "sequence": "GKPIPNPLLGLDST",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 27,
+      "name": "Strep-tag II",
+      "category": "epitope_tag",
+      "sequence_type": "protein",
+      "sequence": "WSHPQFEK",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 28,
+      "name": "SBP tag",
+      "category": "epitope_tag",
+      "sequence_type": "protein",
+      "sequence": "MDEKTTGWRGGHVVEGLAGELEQLRARLEHHPQGQREP",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 29,
+      "name": "AviTag",
+      "category": "epitope_tag",
+      "sequence_type": "protein",
+      "sequence": "GLNDIFEAQKIEWHE",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 30,
+      "name": "SUMO tag (yeast Smt3)",
+      "category": "epitope_tag",
+      "sequence_type": "protein",
+      "sequence": "MSDSEVNQEAKPEVKPEVKPETHINLKVSDGSSEIFFKIKKTTPLRRLMEAFAKRQGKEMDSLRFLYDGIRIQADQTPEDLDMEDNDIIEAHREQIGG",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 31,
+      "name": "MBP (maltose-binding protein)",
+      "category": "epitope_tag",
+      "sequence_type": "protein",
+      "sequence": "MKIEEGKLVIWINGDKGYNGLAEVGKKFEKDTGIKVTVEHPDKLEEKFPQVAATGDGPDIIFWAHDRFGGYAQSGLLAEITPDKAFQDKLYPFTWDAVRYNGKLIAYPIAVEALSLIYNKDLLPNPPKTWEEIPALDKELKAKGKSALMFNLQEPYFTWPLIAADGGYAFKYENGKYDIKDVGVDNAGAKAGLTFLVDLIKNKHMNADTDYSIAEAAFNKGETAMTINGPWAWSNIDTSKVNYGVTVLPTFKGQPSKPFVGVLSAGINAASPNKELAKEFLENYLLTDEGLEAVNKDKPLGAVALKSYEEELAKDPRIAATMENAQKGEIMPNIPQMSAFWYAVRTAVINAASGRQTVDEALKDAQTNS",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 32,
+      "name": "T7 promoter",
+      "category": "promoter",
+      "sequence_type": "nucleotide",
+      "sequence": "TAATACGACTCACTATAG",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 33,
+      "name": "SP6 promoter",
+      "category": "promoter",
+      "sequence_type": "nucleotide",
+      "sequence": "ATTTAGGTGACACTATAG",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 34,
+      "name": "T3 promoter",
+      "category": "promoter",
+      "sequence_type": "nucleotide",
+      "sequence": "AATTAACCCTCACTAAAG",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 35,
+      "name": "lac promoter (-10/-35)",
+      "category": "promoter",
+      "sequence_type": "nucleotide",
+      "sequence": "TTTACACTTTATGCTTCCGGCTCGTATGTTGTGTGGAATTGTGAGCGGATAACAATT",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 36,
+      "name": "tac promoter",
+      "category": "promoter",
+      "sequence_type": "nucleotide",
+      "sequence": "TTGACAATTAATCATCGGCTCGTATAATGTGTGGAATTGTGAGCGGATAACAATT",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 37,
+      "name": "CMV immediate-early promoter (core)",
+      "category": "promoter",
+      "sequence_type": "nucleotide",
+      "sequence": "GACATTGATTATTGACTAGTTATTAATAGTAATCAATTACGGGGTCATTAGTTCATAGCCCATATATGGAGTTCCGCGTTACATAACTTACGGTAAATGGCCCGCCTGGCTGACCGCCCAACGACCCCCGCCCATTGACGTCAATAATGACGTATGTTCCCATAGTAACGCCAATAGGGACTTTCCATTGACGTCAATGGGTGGAGTATTTACGGTAAACTGCCCACTTGGCAGTACATCAAGTGTATCATATGCCAAGTACGCCCCCTATTGACGTCAATGACGGTAAATGGCCCGCCTGGCATTATGCCCAGTACATGACCTTATGGGACTTTCCTACTTGGCAGTACATCTACGTATTAGTCATCGCTATTACCATGGTGATGCGGTTTTGGCAGTACATCAATGGGCGTGGATAGCGGTTTGACTCACGGGGATTTCCAAGTCTCCACCCCATTGACGTCAATGGGAGTTTGTTTTGGCACCAAAATCAACGGGACTTTCCAAAATGTCGTAACAACTCCGCCCCATTGACGCAAATGGGCGGTAGGCGTGTACGGTGGGAGGTCTATATAAGCAGAGCT",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 38,
+      "name": "EF1a promoter (human)",
+      "category": "promoter",
+      "sequence_type": "nucleotide",
+      "sequence": "GGCTCCGGTGCCCGTCAGTGGGCAGAGCGCACATCGCCCACAGTCCCCGAGAAGTTGGGGGGAGGGGTCGGCAATTGAACCGGTGCCTAGAGAAGGTGGCGCGGGGTAAACTGGGAAAGTGATGTCGTGTACTGGCTCCGCCTTTTTCCCGAGGGTGGGGGAGAACCGTATATAAGTGCAGTAGTCGCCGTGAACGTTCTTTTTCGCAACGGGTTTGCCGCCAGAACACAG",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 39,
+      "name": "SV40 early promoter",
+      "category": "promoter",
+      "sequence_type": "nucleotide",
+      "sequence": "CTGTGGAATGTGTGTCAGTTAGGGTGTGGAAAGTCCCCAGGCTCCCCAGCAGGCAGAAGTATGCAAAGCATGCATCTCAATTAGTCAGCAACCAGGTGTGGAAAGTCCCCAGGCTCCCCAGCAGGCAGAAGTATGCAAAGCATGCATCTCAATTAGTCAGCAACCATAGTCCCGCCCCTAACTCCGCCCATCCCGCCCCTAACTCCGCCCAGTTCCGCCCATTCTCCGCCCCATGGCTGACTAATTTTTTTTATTTATGCAGAGGCCGAGGCCGCCTCGGCCTCTGAGCTATTCCAGAAGTAGTGAGGAGGCTTTTTTGGAGGCCTAGGCTTTTGCAAA",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 40,
+      "name": "CAG promoter",
+      "category": "promoter",
+      "sequence_type": "nucleotide",
+      "sequence": "TCGACATTGATTATTGACTAGTTATTAATAGTAATCAATTACGGGGTCATTAGTTCATAGCCCATATATGGAGTTCCGCGTTACATAACTTACGGTAAATGGCCCGCCTGGCTGACCGCCCAACGACCCCCGCCCATTGACGTCAATAATGACGTATGTTCCCATAGTAACGCCAATAGGGACTTTCCATTGACGTCAATGGGTGGAGTATTTACGGTAAACTGCCCACTTGGCAG",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 41,
+      "name": "TEF1 promoter (S. cerevisiae)",
+      "category": "promoter",
+      "sequence_type": "nucleotide",
+      "sequence": "ATAGCTTCAAAATGTTTCTACTCCTTTTTTACTCTTCCAGATTTTCTCGGACTCCGCGCATCGCCGTACCACTTCAAAACACCCAAGCACAGCATACTAAATTTCCCCTCTTTCTTCCTCTAGGGTGTCGTTAATTACCCGTACTAAAGGTTTGGAAAAGAAAAAAGAGACCGCCTCGTTTCTTTTTCTTCGTCGAAAAAGGCAATAAAAATTTTTATCACGTTTCTTTTTCTTGAAAATTTTTTTTTTTGATTTTTTTCTCTTTCGATGACCTCCCATTGATATTTAAGTTAATAAACGGTCTTCAATTTCTCAAGTTTCAGTTTCATTTTTCTTGTTCTATTACAACTTTTTTTACTTCTTGCTCATTAGAAAGAAAGCATAGCAATCTAATCTAAGTTTTAATTACAAA",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 42,
+      "name": "GAL1 promoter (S. cerevisiae)",
+      "category": "promoter",
+      "sequence_type": "nucleotide",
+      "sequence": "GCGCGAGTAGTACTAACATACGCTCTCCATCAAAACAAAACGAAACAAAACAAACTAGCAAAATAGGCTGTCCCCAGTGCAAGTGCAGGTGCCAGAACATTTCTCT",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 43,
+      "name": "AOX1 promoter (P. pastoris)",
+      "category": "promoter",
+      "sequence_type": "nucleotide",
+      "sequence": "AACATCCAAAGACGAAAGGTTGAATGAAACCTTTTTGCCATCCGACATCCACAGGTCCATTCTCACACATAAGTGCCAAACGCAACAGGAGGGGATACACTAGCAGCAGACCGTTGCAAACGCAGGACCTCCACTCCTCTTCTCCTCAACACCCACTTTTGCCATCGAAAAACCAGCCCAGTTATTGGGCTTGATTGGAGCTCGCTCATTCCAATTCCTTCTATTAGGCTACTAACACCATGACTTTATTAGCCTGTCTATCCTGGCCCCCCTGGCGAGGTTCATGTTTGTTTATTTCCGAATGCAACAAGCTCCGCATTACACCCGAACATCACTCCAGATGAGGGCTTTCTGAGTGTGGGGTCAAATAGTTTCATGTTCCCCAAATGGCCCAAAACTGACAGTTTAAACGCTGTCTTGGAACCTAATATGACAAAAGCGTGATCTCATCCAAGATGAACTAAGTTTGGTTCGTTGAAATGCTAACGGCCAGTTGGTCAAAAAGAAACTTCCAAAAGTCGGCATACCGTTTGTCTTGTTTGGTATTGATTGACGAATGCTCAAAAATAATCTCATTAATGCTTAGCGCAGTCTCTCTATCGCTTCTGAACCCCGGTGCACCTGTGCCGAAACGCAAATGGGGAAACACCCGCTTTTTGGATGATTATGCATTGTCTCCACATTGTATGCTTCCAAGATTCTGGTGGGAATACTGCTGATAGCCTAACGTTCATGATCAAAATTTAACTGTTCTAACCCCTACTTGACAGCAATATATAAACAGAAGGAAGCTGCCCTGTCTTAAACCTTTTTTTTTATCATCATTATTAGCTTACTTTCATAATTGCGACTGGTTCCAATTGACAAGCTTTTGATTTTAACGACTTTTAACGACAACTTGAGAAGATCAAAAAACAACTAATTATTCGAAACG",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 44,
+      "name": "rrnB T1 terminator (E. coli)",
+      "category": "terminator",
+      "sequence_type": "nucleotide",
+      "sequence": "AACGCTCGGTTGCCGCCGGGCGTTTTTTATTGGTGAGAATCCAAGCT",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 45,
+      "name": "SV40 polyA terminator",
+      "category": "terminator",
+      "sequence_type": "nucleotide",
+      "sequence": "AACTTGTTTATTGCAGCTTATAATGGTTACAAATAAAGCAATAGCATCACAAATTTCACAAATAAAGCATTTTTTTCACTGCATTCTAGTTGTGGTTTGTCCAAACTCATCAATGTATCTTA",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 46,
+      "name": "bGH polyA terminator",
+      "category": "terminator",
+      "sequence_type": "nucleotide",
+      "sequence": "CTGTGCCTTCTAGTTGCCAGCCATCTGTTGTTTGCCCCTCCCCCGTGCCTTCCTTGACCCTGGAAGGTGCCACTCCCACTGTCCTTTCCTAATAAAATGAGGAAATTGCATCGCATTGTCTGAGTAGGTGTCATTCTATTCTGGGGGGTGGGGTGGGGCAGGACAGCAAGGGGGAGGATTGGGAAGACAATAGCAGGCATGCTGGGGA",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 47,
+      "name": "CYC1 terminator (S. cerevisiae)",
+      "category": "terminator",
+      "sequence_type": "nucleotide",
+      "sequence": "TCATGTAATTAGTTATGTCACGCTTACATTCACGCCCTCCCCCCACATCCGCTCTAACCGAAAAGGAAGGAGTTAGACAACCTGAAGTCTAGGTCCCTATTTATTTTTTTATAGTTATGTTAGTATTAAGAACGTTATTTATATTTCAAATTTTTCTTTTTTTTCTGTACAGACGCGTGTACGCATGTAACATTATACTGAAAACCTTGCTTGAGAAGGTTTTGGGACGCTCGAAGGCTTTAATTTGCAAGCT",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 48,
+      "name": "URA3 (S. cerevisiae)",
+      "category": "selection_marker",
+      "sequence_type": "protein",
+      "sequence": "MSKATYKERAATHPSPVAAKLFNIMHEKQTNLCASLDVRTTKELLELVEALGPKICLLKTHVDILTDFSMEGTVKPLKALSAKYNFLLFEDRKFADIGNTVKLQYSAGVYRIAEWADITNAHGVVGPGIVSGLKQAAEEVTKEPRGLLMLAELSCKGSLATGEYTKGTVDIAKSDKDFVIGFIAQRDMGGRDEGYDWLIMTPGVGLDDKGDALGQQYRTVDDVVSTGSDIIIVGRGLFAKGRDAKVEGERYRKAGWEAYLRRCGQQN",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 49,
+      "name": "LEU2 (S. cerevisiae)",
+      "category": "selection_marker",
+      "sequence_type": "protein",
+      "sequence": "MSAPKKIVVLPGDHVGQEITAEAIKVLKAISDVRSNVKFDFENHLIGGAAIDATGVPLPDETLDLAKKADAVLLGAVGGPKWGTGSVRPEQGLLKIRKELQLYANLRPCNFASDSLLDLSPIKPELLAGIDILIVRELTGGIYFGQRKEDDGDGVAYDTEAYTVPEVERIARMAAFMALQHEPPLPIWSLDKANVLASSRLWRKTVEEVIKSEYPNVELEHQLIDSAAMILVKSPSELNGIIITSNMFGDIISDEASVIPGSLGLLPSASLASLPDKNTAFGLYEPCHGSAPDLPKNKVDPIATILSVAMMLRYSLDADDAATAIERAINRALEEGIRTGDLARGAAAVSTDEMGDIIARYVAEGV",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 50,
+      "name": "HIS3 (S. cerevisiae)",
+      "category": "selection_marker",
+      "sequence_type": "protein",
+      "sequence": "MTEQKALVKRITNETKIQIAISLKGGPLAIEHSIFPEKEAEAVAEQATQSQVINVHTGIGFLDHMIHALAKHSGWSLIVECIGDLHIDDHHTTEDCGIALGQAFKEALGAVRGVKRFGSGFAPLDEALSRAVVDLSNRPYAVVELGLQREKVGDLSCEMIPHLLESFAQAARITLHVDCLRGKNDHHRSESAFKALAVAIREATSPNGTNDVPSTKGVLM",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 51,
+      "name": "TRP1 (S. cerevisiae)",
+      "category": "selection_marker",
+      "sequence_type": "protein",
+      "sequence": "MSVTNFRAAVTRRHIRRYSDFEMQVRYKQGLSLKEAANELGISRSRIYDVLQAGTVDSLPCGQLETSRGGQYEYGMHLEDLTDSKWLRIPVSDIPEFSEALYDQALVENGLLKMMRDLAVGEEKPKLSYYQGLLLVVVDREENYSKQLDHFAATEEHPAVDEATFLSPRNKVVDISDTEDDSIVDRFGEGVPSMRSILQIDIPETKYFLWPATWFTSEYAKKREFQGRFSDIRDLPRDIKDIPVSDDMKAFLDDFDPDFRKFKRYNAEDIGLPFASSFTSTPYETILRQAANHSKALETEVDDLVNQVADGLLRRETLPNLERGGAKRARIDEDEEDEETREVCRGNATEEHHVIEIIDEESVVEIDEELTCSAVERLLEAYKELQK",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 52,
+      "name": "HIS4 (P. pastoris)",
+      "category": "selection_marker",
+      "sequence_type": "protein",
+      "sequence": "MTEAVTTSIFYFHGGPLPQGQDVRESRQAEGEDIYATKLNGPPVAHQLLAYDIVGNATIQNRGAESALSFEFDPLAVARNHQNSRRGARKFNRLDPLELDEDPQAGTHSLTALDFEEIKAPNNPAVHLAFLKSTPGSGSCWFAGMRHLMVTALKHLCEALGTAINDISCEFLGRTAEGISDADLVKALAGFDEFRDGQAFFKDVYAPSSTQVLDLDIEPEAGASRDRDLKDRLEGGRDEQFKHVHWVSAAALKVQDGKQVMSVNMAAYVDENGEPVARHHVNSARVAQESINELQYYLAELLDDDVPGRTPDLDKLGLDLSEPLEQYPLRVFAGGDFDEKNVFRNLALAEMDAAVAAFLIEDAALLVSNTKGSPSAESISLREPYAFSRVNCGPVTPDITLSSGTGLVSPAFFKKDADKVTLEKHLREARKAAPNIDTMLVKAEKVVYAGGGVNGEEHKQAEYLKKLEGQLSVI",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 53,
+      "name": "Cre recombinase (P1 phage)",
+      "category": "common_enzyme",
+      "sequence_type": "protein",
+      "sequence": "MSNLLTVHQNLPALPVDATSDEVRKNLMDMFRDRQAFSEHTWKMLLSVCRSWAAWCKLNNRKWFPAEPEDVRDYLLYLQARGLAVKTIQQHLGQLNMLHRRSGLPRPSDSNAVSLVMRRIRKENVDAGERAKQALAFERTDFDQVRSLMENSDRCQDIRNLAFLGIAYNTLLRIAEIARIRVKDISRTDGGRMLIHIGRTKTLVSTAGVEKALSLGVTKLVERWISVSGVADDPNNYLFCRVRKNGVAAPSATSQLSTRALEGIFEATHRLIYGAKDDSGQRYLAWSGHSARVGAARDMARAGVSIPEIMQAGGWTNVNIVMNYIRNLDSETGAMVRLLEDGD",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 54,
+      "name": "FLP recombinase (S. cerevisiae 2\u00b5)",
+      "category": "common_enzyme",
+      "sequence_type": "protein",
+      "sequence": "MPQFGILCKTPPKVLVRQFVERFERPSGEKIASCAAELTYLCWMITHNGTAIKRATFMSYNTIISNSLSFDIVNKSLQFKYKTQKATILEASLKKLIPAWEFTIIPYNGQKHQSDITDIVSSLQLQFESSEEADKGNSHSKKMLKALLSEGESIWEITEKILNSFEYTSRFTKTKTLYQFLFLATFINCGRFSDIKNVDPKSFKLVQNKYLGVIIQCLVTETKTSVSRHIYFFSARGRIDPLVYLDEFLRNSEPVLKRVNRTGNSSSNKQEYQLLKDNLVRSYNKALKKNAPYSIFAIKNGPKSHIGRHLMTSFLSMKGLTELTNVVGNWSDKRASAVARTTYTHQITAIPDHYFALVSRYYAYDPISKEMIALKDETNPIEEWQHIEQLKGSAEGSIRYPAWNGIISQEVLDYLSSYINRRI",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 55,
+      "name": "SpCas9 (S. pyogenes)",
+      "category": "common_enzyme",
+      "sequence_type": "protein",
+      "sequence": "MDKKYSIGLDIGTNSVGWAVITDEYKVPSKKFKVLGNTDRHSIKKNLIGALLFDSGETAEATRLKRTARRRYTRRKNRICYLQEIFSNEMAKVDDSFFHRLEESFLVEEDKKHERHPIFGNIVDEVAYHEKYPTIYHLRKKLVDSTDKADLRLIYLALAHMIKFRGHFLIEGDLNPDNSDVDKLFIQLVQTYNQLFEENPINASGVDAKAILSARLSKSRRLENLIAQLPGEKKNGLFGNLIALSLGLTPNFKSNFDLAEDAKLQLSKDTYDDDLDNLLAQIGDQYADLFLAAKNLSDAILLSDILRVNTEITKAPLSASMIKRYDEHHQDLTLLKALVRQQLPEKYKEIFFDQSKNGYAGYIDGGASQEEFYKFIKPILEKMDGTEELLVKLNREDLLRKQRTFDNGSIPHQIHLGELHAILRRQEDFYPFLKDNREKIEKILTFRIPYYVGPLARGNSRFAWMTRKSEETITPWNFEEVVDKGASAQSFIERMTNFDKNLPNEKVLPKHSLLYEYFTVYNELTKVKYVTEGMRKPAFLSGEQKKAIVDLLFKTNRKVTVKQLKEDYFKKIECFDSVEISGVEDRFNASLGTYHDLLKIIKDKDFLDNEENEDILEDIVLTLTLFEDREMIEERLKTYAHLFDDKVMKQLKRRRYTGWGRLSRKLINGIRDKQSGKTILDFLKSDGFANRNFMQLIHDDSLTFKEDIQKAQVSGQGDSLHEHIANLAGSPAIKKGILQTVKVVDELVKVMGRHKPENIVIEMARENQTTQKGQKNSRERMKRIEEGIKELGSQILKEHPVENTQLQNEKLYLYYLQNGRDMYVDQELDINRLSDYDVDHIVPQSFLKDDSIDNKVLTRSDKNRGKSDNVPSEEVVKKMKNYWRQLLNAKLITQRKFDNLTKAERGGLSELDKAGFIKRQLVETRQITKHVAQILDSRMNTKYDENDKLIREVKVITLKSKLVSDFRKDFQFYKVREINNYHHAHDAYLNAVVGTALIKKYPKLESEFVYGDYKVYDVRKMIAKSEQEIGKATAKYFFYSNIMNFFKTEITLANGEIRKRPLIETNGETGEIVWDKGRDFATVRKVLSMPQVNIVKKTEVQTGGFSKESILPKRNSDKLIARKKDWDPKKYGGFDSPTVAYSVLVVAKVEKGKSKKLKSVKELLGITIMERSSFEKNPIDFLEAKGYKEVKKDLIIKLPKYSLFELENGRKRMLASAGELQKGNELALPSKYVNFLYLASHYEKLKGSPEDNEQKQLFVEQHKHYLDEIIEQISEFSKRVILADANLDKVLSAYNKHRDKPIREQAENIIHLFTLTNLGAPAAFKYFDTTIDRKRYTSTKEVLDATLIHQSITGLYETRIDLSQLGGD",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 56,
+      "name": "T7 RNA polymerase",
+      "category": "common_enzyme",
+      "sequence_type": "protein",
+      "sequence": "MNTINIAKNDFSDIELAAIPFNTLADHYGERLAREQLALEHESYEMGEARFRKMFERQLKAGEVADNAAAKPLITTLLPKMIARINDWFEEVKAKRGKRPTAFQFLQEIKPEAVAYITIKTTLACLTSADNTTVQAVASAIGRAIEDEARFGRIRDLEAKHFKKNVEEQLNKRVGHVYKKAFMQVVEADMLSKGLLGGEAWSSWHKEDSIHVGVRCIEMLIESTGMVSLHRQNAGVVGQDSETIELAPEYAEAIATRAGALAGISPMFQPCVVPPKPWTGITGGGYWANGRRPLALVRTHSKKALMRYEDVYMPEVYKAINIAQNTAWKINKKVLAVANVITKWKHCPVEDIPAIEREELPMKPEDIDMNPEALTAWKRAAAAVYRKDKARKSRRISLEFMLEQANKFANHKAIWFPYNMDWRGRVYAVSMFNPQGNDMTKGLLTLAKGKPIGKEGYYWLKIHGANCAGVDKVPFPERIKFIEENHENIMACAKSPLENTWWAEQDSPFCFLAFCFEYAGVQHHGLSYNCSLPLAFDGSCSGIQHFSAMLRDEVGGRAVNLLPSETVQDIYGIVAKKVNEILQADAINGTDNEVVTVTDENTGEISEKVKLGTKALAGQWLAYGVTRSVTKRSVMTLAYGSKEFGFRQQVLEDTIQPAIDSGKGLMFTQPNQAAGYMAKLIWESVSVTVVAAVEAMNWLKSAAKLLAAEVKDKKTGEILRKRCAVHWVTPDGFPVWQEYKKPIQTRLNLMFLGQFRLQPTINTNKDSEIDAHKQESGIAPNFVHSQDGSHLRKTVVWAHEKYGIESFALIHDSFGTIPADAANLFKAVRETMVDTYESCDVLADFYDQFADQLHESQLDKMPALPAKGNLNLRDILESDFAFA",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 57,
+      "name": "T4 DNA ligase",
+      "category": "common_enzyme",
+      "sequence_type": "protein",
+      "sequence": "MILKILNEIASIGSTKQKQAILEKNKDNELLKRVYRLTYSRGLQYYIKKWPKPGIATQSFGMLTLTDMLDFIEFTLATRKLTGNAAIEELTGYITDGKKDDVEVLRRVMMRDLECGASVSIANKVDGLSLRLEKLLSKTKQNHRPATIRQYMKAKGIEVPEEELQEFMNDYYNRKGRPLHAEISDETLKALYKGGFSKSEISYFKNETEAPELFEAGMEDSDLEDDIIGTSANLKEYILASGVSALAQARINSTPPARNTASAQDVEPLPDTLNGQVAHTLKAGGFVAVDLAEEHIPSWIEKPSGKRGTKKKISLNAKLIENEVLFDQELLRTGAYVQSHIPTPRKDFAIGEVLINQKTGQAAVNRSRDGKWGQVNVEPGELKDGTVQAAQVTSRQYRDLNAPTGSGTAAGDWIRVLQRVNGTEVLRDWFAKQLGKFAVDYAWIITIDGLGGLNSIRSEMAVEWDETLAITEAQ",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 58,
+      "name": "M-MLV reverse transcriptase",
+      "category": "common_enzyme",
+      "sequence_type": "protein",
+      "sequence": "MTLNIEDEYRLHETSKEPDVSLGSTWLSDFPQAWAETGGMGLAVRQAPLIIPLKATSTPVSIKQYPMSQEAREGIRPHIQRLLDQGILVPCQSPWNTPLLPVKKPGTNDYRPVQDLREVNKRVEDIHPTVPNPYNLLSGLPPSHQWYTVLDLKDAFFCLRLHPTSQPLFAFEWRDPEMGISGQLTWTRLPQGFKNSPTLFDEALHRDLADFRIQHPDLILLQYVDDLLLAATSELDCQQGTRALLQTLGNLGYRASAKKAQICQKQVKYLGYLLKEGQRWLTEARKETVMGQPTPKTPRQLREFLGTAGFCRLWIPGFAEMAAPLYPLTKTGTLFNWGPDQQKAYQEIKQALLTAPALGLPDLTKPFELFVDEKQGYAKGVLTQKLGPWRRPVAYLSKKLDPVAAGWPPCLRMVAAIAVLTKDAGKLTMGQPLVILAPHAVEALVKQPPDRWLSNARMTHYQALLLDTDRVQFGPVVALNPATLLPLPEEGLQHNCLDILAEAHGTRPDLTDQPLPDADHTWYTDGSSLLQEGQRKAGAAVTTETEVIWAKALPAGTSAQRAELIALTQALKMAEGKKLNVYTDSRYAFATAHIHGEIYRRRGWLTSEGKEIKNKDEILALLKALFLPKRLSIIHCPGHQKGHSAEARGNRMADQAARKAAITETPDTSTLLIENSSPYTSEHFHYTVTDIKDLTKLGAIYDKTKKYWVYQGKPVMPDQFTFELLDFLHQLTHLSFSKMKALLERSHSPYYMLNRDRTLKNITETCKACAQVNASKSAVKQGTRVRGHRPGTHWEIDFTEVKPGLYGYKYLLVFIDTFSGWIEAFPTKKETAKVVTKKLLEEIFPRFGMPQVLGTDNGPAFVSKVSQTVADLLGIDWKLHCAYRPQSSGQVERMNRTIKETLTKLTLATGSRDWVLLLPLALYRARNTPGPHGLTPYEILYGAPPPLVNFPDPDMTRVTNSPSLQAHLQALYLVQHEVWRPLAAAYQEQLDRPVVPHPFRVGDTVWVRRHQTKNLEPRWKGPYTVLLTTPTALKVDGIAAWIHAAHVKAATTPPAGTAWRVQRSQNPLKIRLTREAP",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 59,
+      "name": "\u03b1-factor secretion signal (S. cerevisiae)",
+      "category": "secretion_signal",
+      "sequence_type": "protein",
+      "sequence": "MRFPSIFTAVLFAASSALAAPVNTTTEDETAQIPAEAVIGYSDLEGDFDVAVLPFSNSTNNGLLFINTTIASIAAKEEGVSLEKR",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 60,
+      "name": "IgK signal peptide (mouse)",
+      "category": "secretion_signal",
+      "sequence_type": "protein",
+      "sequence": "METDTLLLWVLLLWVPGSTG",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 61,
+      "name": "HSA signal peptide (human)",
+      "category": "secretion_signal",
+      "sequence_type": "protein",
+      "sequence": "MKWVTFISLLFLFSSAYSRGVFR",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 62,
+      "name": "tPA signal peptide (human)",
+      "category": "secretion_signal",
+      "sequence_type": "protein",
+      "sequence": "MDAMKRGLCCVLLLCGAVFVSPS",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 63,
+      "name": "pUC origin of replication (pMB1-derived)",
+      "category": "cloning_vector_backbone",
+      "sequence_type": "nucleotide",
+      "sequence": "TTGAGATCCTTTTTTTCTGCGCGTAATCTGCTGCTTGCAAACAAAAAAACCACCGCTACCAGCGGTGGTTTGTTTGCCGGATCAAGAGCTACCAACTCTTTTTCCGAAGGTAACTGGCTTCAGCAGAGCGCAGATACCAAATACTGTCCTTCTAGTGTAGCCGTAGTTAGGCCACCACTTCAAGAACTCTGTAGCACCGCCTACATACCTCGCTCTGCTAATCCTGTTACCAGTGGCTGCTGCCAGTGGCGATAAGTCGTGTCTTACCGGGTTGGACTCAAGACGATAGTTACCGGATAAGGCGCAGCGGTCGGGCTGAACGGGGGGTTCGTGCACACAGCCCAGCTTGGAGCGAACGACCTACACCGAACTGAGATACCTACAGCGTGAGCTAT",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 64,
+      "name": "ColE1 origin (high-copy)",
+      "category": "cloning_vector_backbone",
+      "sequence_type": "nucleotide",
+      "sequence": "TGAGATCCTTTTTTTCTGCGCGTAATCTGCTGCTTGCAAACAAAAAAACCACCGCTACCAGCGGTGGTTTGTTTGCCGGATCAAGAGCTACCAACTCTTTTTCCGAAGGTAACTGGCTTCAGCAGAGCGCAGATACC",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 65,
+      "name": "f1 origin",
+      "category": "cloning_vector_backbone",
+      "sequence_type": "nucleotide",
+      "sequence": "ACGCGCCCTGTAGCGGCGCATTAAGCGCGGCGGGTGTGGTGGTTACGCGCAGCGTGACCGCTACACTTGCCAGCGCCCTAGCGCCCGCTCCTTTCGCTTTCTTCCCTTCCTTTCTCGCCACGTTCGCCGGCTTTCCCCGTCAAGCTCTAAATCGGGGG",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    },
+    {
+      "tool_id": 66,
+      "name": "pBR322 origin (low-copy)",
+      "category": "cloning_vector_backbone",
+      "sequence_type": "nucleotide",
+      "sequence": "TTGAGATCCTTTTTTTCTGCGCGTAATCTGCTGCTTGCAAACAAAAAAACCACCGCTACCAGCGGTGGTTTGTTTGCCGGATCAAGAGCTACCAACTCTTTTTCCGAAGGTAACTGGCTTCAGCAGAGCGCAGATAC",
+      "source": "manual_curation",
+      "source_url": null,
+      "references_json": null
+    }
+  ]
+}

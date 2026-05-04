@@ -41,7 +41,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
 from constellation.sequencing.samples import Samples
@@ -445,6 +444,63 @@ def fasta_records_to_text(records: list[FastaRecord]) -> str:
     return "".join(f">{r.label}\n{r.sequence}\n" for r in records)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Projection into the canonical FEATURE_QUANT schema
+# ──────────────────────────────────────────────────────────────────────
+
+
+def to_feature_quant(
+    quant_table: pa.Table,
+    *,
+    engine: str = "constellation_naive_orf",
+) -> pa.Table:
+    """Project a ``PROTEIN_COUNT_TABLE`` slice into the canonical
+    :data:`constellation.sequencing.schemas.quant.FEATURE_QUANT` schema
+    so naive-ORF counts can participate in the multi-tag
+    ``feature_quant`` ecosystem alongside future ``gene_id`` /
+    ``transcript_id`` / ``cluster_id`` partitions.
+
+    ``feature_id`` is derived from the protein label (``P0`` → 0,
+    ``P12`` → 12) — within a single demux run the labels are stable
+    rank-counts, so this is a deterministic surjection. ``feature_origin``
+    is set to ``'protein_hash'`` per the S1 schema vocabulary.
+
+    Cross-pipeline joins of these rows with ``feature_origin='gene_id'``
+    or ``'transcript_id'`` rows are nonsensical without an explicit
+    correspondence table — sum within a partition; never sum across.
+    """
+    # Late-import to avoid a circular when transcriptome/quant.py is
+    # imported during sequencing.schemas registration in some contexts.
+    from constellation.sequencing.schemas.quant import FEATURE_QUANT
+
+    if quant_table.num_rows == 0:
+        return FEATURE_QUANT.empty_table()
+
+    labels = quant_table.column("protein_label").to_pylist()
+    sample_ids = quant_table.column("sample_id").to_pylist()
+    counts = quant_table.column("count").to_pylist()
+
+    rows = [
+        {
+            # Strip the 'P' prefix; PROTEIN_COUNT_TABLE rank-labels are
+            # of the form 'P{int}' so this lookup is total.
+            "feature_id": int(label[1:]),
+            "sample_id": int(sid),
+            "engine": engine,
+            "feature_origin": "protein_hash",
+            "count": float(c),
+            "tpm": None,
+            "cpm": None,
+            "coverage_mean": None,
+            "coverage_median": None,
+            "coverage_fraction": None,
+            "multimap_fraction": None,
+        }
+        for label, sid, c in zip(labels, sample_ids, counts, strict=True)
+    ]
+    return pa.Table.from_pylist(rows, schema=FEATURE_QUANT)
+
+
 __all__ = [
     "FastaRecord",
     "PARTIAL_QUANT_TABLE",
@@ -453,12 +509,5 @@ __all__ = [
     "build_partial_quant",
     "build_protein_count_matrix",
     "fasta_records_to_text",
-]
-
-
-__all__ = [
-    "PROTEIN_COUNT_TABLE",
-    "FastaRecord",
-    "build_protein_count_matrix",
-    "fasta_records_to_text",
+    "to_feature_quant",
 ]

@@ -100,13 +100,95 @@ FEATURE_TABLE: pa.Schema = pa.schema(
 )
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Transcripts (TranscriptReference)
+# ──────────────────────────────────────────────────────────────────────
+
+
+TRANSCRIPT_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("transcript_id", pa.int64(), nullable=False),
+        # Display name as written in transcript FASTA / used as
+        # ref_name when minimap2 maps to transcriptome
+        pa.field("name", pa.string(), nullable=False),
+        # Optional FK to FEATURE_TABLE.feature_id of the parent gene
+        # (only populated when a TranscriptReference was materialised
+        # from a paired GenomeReference + Annotation; transcriptome-only
+        # references leave this null and resolve later if a genome
+        # arrives)
+        pa.field("gene_id", pa.int64(), nullable=True),
+        # Spliced transcript sequence (not the genomic span — exonic
+        # bases concatenated with strand respected)
+        pa.field("sequence", pa.string(), nullable=False),
+        pa.field("length", pa.int32(), nullable=False),
+        # Provenance: 'ensembl' | 'refseq' | 'fasta_import' |
+        # 'derived_from_annotation'
+        pa.field("source", pa.string(), nullable=True),
+    ],
+    metadata={b"schema_name": b"TranscriptTable"},
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Genetic tools (GeneticTools — common AbR / FPs / tags / promoters /
+# selection markers / common enzymes / vector backbones; the cRAP
+# analog for genomics/transcriptomics)
+# ──────────────────────────────────────────────────────────────────────
+
+
+# Allowed categories. Not enforced at the schema layer; consumed by
+# the GeneticTools container validator.
+GENETIC_TOOL_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "antibiotic_resistance",
+        "fluorescent_protein",
+        "epitope_tag",
+        "promoter",
+        "terminator",
+        "selection_marker",
+        "common_enzyme",
+        "secretion_signal",
+        "cloning_vector_backbone",
+    }
+)
+
+
+GENETIC_TOOL_SEQUENCE_TYPES: frozenset[str] = frozenset({"nucleotide", "protein"})
+
+
+GENETIC_TOOL_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("tool_id", pa.int64(), nullable=False),
+        pa.field("name", pa.string(), nullable=False),
+        # See GENETIC_TOOL_CATEGORIES
+        pa.field("category", pa.string(), nullable=False),
+        # 'nucleotide' | 'protein'
+        pa.field("sequence_type", pa.string(), nullable=False),
+        pa.field("sequence", pa.string(), nullable=False),
+        # Where the sequence came from: 'fpbase' | 'ncbi' | 'addgene' |
+        # 'univec' | 'manual_curation'
+        pa.field("source", pa.string(), nullable=False),
+        pa.field("source_url", pa.string(), nullable=True),
+        # JSON-encoded list of citations / DOIs / supporting refs
+        pa.field("references_json", pa.string(), nullable=True),
+    ],
+    metadata={b"schema_name": b"GeneticToolTable"},
+)
+
+
 register_schema("ContigTable", CONTIG_TABLE)
 register_schema("SequenceTable", SEQUENCE_TABLE)
 register_schema("FeatureTable", FEATURE_TABLE)
+register_schema("TranscriptTable", TRANSCRIPT_TABLE)
+register_schema("GeneticToolTable", GENETIC_TOOL_TABLE)
 
 
 __all__ = [
     "CONTIG_TABLE",
     "SEQUENCE_TABLE",
     "FEATURE_TABLE",
+    "TRANSCRIPT_TABLE",
+    "GENETIC_TOOL_TABLE",
+    "GENETIC_TOOL_CATEGORIES",
+    "GENETIC_TOOL_SEQUENCE_TYPES",
 ]

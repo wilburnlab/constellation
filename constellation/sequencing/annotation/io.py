@@ -1,9 +1,8 @@
-"""``GenomeReference`` Reader/Writer Protocols + native ParquetDir round-trip.
+"""``Annotation`` Reader/Writer Protocols + native ParquetDir round-trip.
 
-Mirrors the shape of :mod:`massspec.library.io` — Reader/Writer Protocols
-with ``extension`` / ``format_name`` / ``lossy`` ClassVars, suffix-or-format
-dispatch, ParquetDir as the native lossless form. External-format adapters
-(FASTA, .2bit, etc.) self-register when their reader modules are imported.
+Mirrors the shape of :mod:`sequencing.reference.io`. External-format
+adapters (GFF3, BED) self-register from their reader modules under
+:mod:`sequencing.readers`.
 """
 
 from __future__ import annotations
@@ -12,10 +11,9 @@ import json
 from pathlib import Path
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
-import pyarrow as pa
 import pyarrow.parquet as pq
 
-from constellation.sequencing.reference.reference import GenomeReference
+from constellation.sequencing.annotation.annotation import Annotation
 
 # ──────────────────────────────────────────────────────────────────────
 # Protocols + registries
@@ -23,53 +21,49 @@ from constellation.sequencing.reference.reference import GenomeReference
 
 
 @runtime_checkable
-class GenomeReferenceWriter(Protocol):
+class AnnotationWriter(Protocol):
     extension: ClassVar[str]
     format_name: ClassVar[str]
     lossy: ClassVar[bool]
 
-    def write(self, reference: GenomeReference, path: Path, **opts: Any) -> None: ...
+    def write(self, annotation: Annotation, path: Path, **opts: Any) -> None: ...
 
 
 @runtime_checkable
-class GenomeReferenceReader(Protocol):
+class AnnotationReader(Protocol):
     extension: ClassVar[str]
     format_name: ClassVar[str]
 
-    def read(self, path: Path, **opts: Any) -> GenomeReference: ...
+    def read(self, path: Path, **opts: Any) -> Annotation: ...
 
 
-GENOME_REFERENCE_WRITERS: dict[str, GenomeReferenceWriter] = {}
-GENOME_REFERENCE_READERS: dict[str, GenomeReferenceReader] = {}
+ANNOTATION_WRITERS: dict[str, AnnotationWriter] = {}
+ANNOTATION_READERS: dict[str, AnnotationReader] = {}
 
 
-def register_writer(writer: GenomeReferenceWriter) -> None:
-    if writer.format_name in GENOME_REFERENCE_WRITERS:
+def register_writer(writer: AnnotationWriter) -> None:
+    if writer.format_name in ANNOTATION_WRITERS:
         raise ValueError(f"writer already registered: {writer.format_name!r}")
-    GENOME_REFERENCE_WRITERS[writer.format_name] = writer
+    ANNOTATION_WRITERS[writer.format_name] = writer
 
 
-def register_reader(reader: GenomeReferenceReader) -> None:
-    if reader.format_name in GENOME_REFERENCE_READERS:
+def register_reader(reader: AnnotationReader) -> None:
+    if reader.format_name in ANNOTATION_READERS:
         raise ValueError(f"reader already registered: {reader.format_name!r}")
-    GENOME_REFERENCE_READERS[reader.format_name] = reader
+    ANNOTATION_READERS[reader.format_name] = reader
 
 
-def _resolve_writer(format: str | None, path: Path) -> GenomeReferenceWriter:
+def _resolve_writer(format: str | None, path: Path) -> AnnotationWriter:
     if format is not None:
-        if format not in GENOME_REFERENCE_WRITERS:
+        if format not in ANNOTATION_WRITERS:
             raise KeyError(f"no writer registered for format {format!r}")
-        return GENOME_REFERENCE_WRITERS[format]
-    # No file extension → treat as a directory destination (the most
-    # common case for this container, since the native form is
-    # ParquetDir). Only fall back to a literal extension match when the
-    # path actually has one.
+        return ANNOTATION_WRITERS[format]
     suffix = path.suffix.lower() or "/"
-    matches = [w for w in GENOME_REFERENCE_WRITERS.values() if w.extension == suffix]
+    matches = [w for w in ANNOTATION_WRITERS.values() if w.extension == suffix]
     if not matches:
         raise KeyError(
             f"no writer for path {path!s}; "
-            f"specify format= explicitly. registered: {sorted(GENOME_REFERENCE_WRITERS)}"
+            f"specify format= explicitly. registered: {sorted(ANNOTATION_WRITERS)}"
         )
     if len(matches) > 1:
         raise KeyError(
@@ -79,17 +73,17 @@ def _resolve_writer(format: str | None, path: Path) -> GenomeReferenceWriter:
     return matches[0]
 
 
-def _resolve_reader(format: str | None, path: Path) -> GenomeReferenceReader:
+def _resolve_reader(format: str | None, path: Path) -> AnnotationReader:
     if format is not None:
-        if format not in GENOME_REFERENCE_READERS:
+        if format not in ANNOTATION_READERS:
             raise KeyError(f"no reader registered for format {format!r}")
-        return GENOME_REFERENCE_READERS[format]
+        return ANNOTATION_READERS[format]
     suffix = path.suffix.lower() or "/"
-    matches = [r for r in GENOME_REFERENCE_READERS.values() if r.extension == suffix]
+    matches = [r for r in ANNOTATION_READERS.values() if r.extension == suffix]
     if not matches:
         raise KeyError(
             f"no reader for path {path!s}; "
-            f"specify format= explicitly. registered: {sorted(GENOME_REFERENCE_READERS)}"
+            f"specify format= explicitly. registered: {sorted(ANNOTATION_READERS)}"
         )
     if len(matches) > 1:
         raise KeyError(
@@ -99,8 +93,8 @@ def _resolve_reader(format: str | None, path: Path) -> GenomeReferenceReader:
     return matches[0]
 
 
-def save_genome_reference(
-    reference: GenomeReference,
+def save_annotation(
+    annotation: Annotation,
     path: str | Path,
     *,
     format: str | None = None,
@@ -108,15 +102,15 @@ def save_genome_reference(
 ) -> None:
     p = Path(path)
     writer = _resolve_writer(format, p)
-    writer.write(reference, p, **opts)
+    writer.write(annotation, p, **opts)
 
 
-def load_genome_reference(
+def load_annotation(
     path: str | Path,
     *,
     format: str | None = None,
     **opts: Any,
-) -> GenomeReference:
+) -> Annotation:
     p = Path(path)
     reader = _resolve_reader(format, p)
     return reader.read(p, **opts)
@@ -127,49 +121,40 @@ def load_genome_reference(
 # ──────────────────────────────────────────────────────────────────────
 
 
-_PARQUET_TABLES = ("contigs", "sequences")
-
-
 class ParquetDirWriter:
-    """Write a ``GenomeReference`` to a directory of one Parquet per table.
-
-    Container-level metadata round-trips through ``manifest.json``.
-    """
+    """Write an ``Annotation`` to a directory containing a single
+    Parquet file plus a ``manifest.json``."""
 
     extension: ClassVar[str] = "/"
     format_name: ClassVar[str] = "parquet_dir"
     lossy: ClassVar[bool] = False
 
-    def write(self, reference: GenomeReference, path: Path, **opts: Any) -> None:
+    def write(self, annotation: Annotation, path: Path, **opts: Any) -> None:
         path.mkdir(parents=True, exist_ok=True)
-        for name in _PARQUET_TABLES:
-            pq.write_table(getattr(reference, name), path / f"{name}.parquet")
+        pq.write_table(annotation.features, path / "features.parquet")
         manifest = {
             "format": self.format_name,
-            "tables": list(_PARQUET_TABLES),
-            "container": "GenomeReference",
-            "metadata": reference.metadata_extras,
+            "tables": ["features"],
+            "container": "Annotation",
+            "metadata": annotation.metadata_extras,
         }
         (path / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
 
 class ParquetDirReader:
-    """Read a ``GenomeReference`` from a ParquetDir bundle."""
+    """Read an ``Annotation`` from a ParquetDir bundle."""
 
     extension: ClassVar[str] = "/"
     format_name: ClassVar[str] = "parquet_dir"
 
-    def read(self, path: Path, **opts: Any) -> GenomeReference:
+    def read(self, path: Path, **opts: Any) -> Annotation:
         manifest_path = path / "manifest.json"
         manifest: dict[str, Any] = {}
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text())
-        tables: dict[str, pa.Table] = {
-            name: pq.read_table(path / f"{name}.parquet") for name in _PARQUET_TABLES
-        }
-        return GenomeReference(
-            contigs=tables["contigs"],
-            sequences=tables["sequences"],
+        features = pq.read_table(path / "features.parquet")
+        return Annotation(
+            features=features,
             metadata_extras=dict(manifest.get("metadata", {})),
         )
 
@@ -179,14 +164,14 @@ register_reader(ParquetDirReader())
 
 
 __all__ = [
-    "GenomeReferenceReader",
-    "GenomeReferenceWriter",
-    "GENOME_REFERENCE_READERS",
-    "GENOME_REFERENCE_WRITERS",
+    "AnnotationReader",
+    "AnnotationWriter",
+    "ANNOTATION_READERS",
+    "ANNOTATION_WRITERS",
     "register_reader",
     "register_writer",
-    "save_genome_reference",
-    "load_genome_reference",
+    "save_annotation",
+    "load_annotation",
     "ParquetDirReader",
     "ParquetDirWriter",
 ]

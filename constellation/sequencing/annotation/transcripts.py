@@ -2,11 +2,11 @@
 
 Splice-aware mapping with minimap2 (``-ax splice``) projects
 ``READ_DEMUX_TABLE`` consensus transcripts (or external transcript
-FASTAs) onto a ``Reference`` and emits ``FEATURE_TABLE`` rows for
+FASTAs) onto a ``GenomeReference`` and emits ``FEATURE_TABLE`` rows for
 genes / mRNAs / exons.
 
 This is the bridge between de novo transcriptome assembly and a
-genomic Reference — a key step for the lab's matched genome +
+``GenomeReference`` — a key step for the lab's matched genome +
 transcriptome workflow.
 
 Status: STUB. Pending Phase 9.
@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from constellation.sequencing.reference.reference import Reference
+from constellation.sequencing.reference.reference import GenomeReference
 
 
 _PHASE = "Phase 9 (annotation/transcripts)"
@@ -27,9 +27,10 @@ _PHASE = "Phase 9 (annotation/transcripts)"
 
 @dataclass(frozen=True)
 class TranscriptMapper:
-    """Splice-aware mapping of transcript sequences against a genome
-    Reference. Uses minimap2 ``-ax splice`` under the hood; emits
-    FEATURE_TABLE rows for the inferred gene / mRNA / exon hierarchy.
+    """Splice-aware mapping of transcript sequences against a
+    ``GenomeReference``. Uses minimap2 ``-ax splice`` under the hood;
+    emits FEATURE_TABLE rows for the inferred gene / mRNA / exon
+    hierarchy.
     """
 
     threads: int = 8
@@ -37,7 +38,7 @@ class TranscriptMapper:
 
     def run(
         self,
-        reference: Reference,
+        reference: GenomeReference,
         transcripts_fasta: Path,
         output_dir: Path,
     ) -> pa.Table:
@@ -45,7 +46,7 @@ class TranscriptMapper:
 
 
 def map_transcripts(
-    reference: Reference,
+    reference: GenomeReference,
     transcripts_fasta: Path,
     output_dir: Path,
     *,

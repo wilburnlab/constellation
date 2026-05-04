@@ -1,39 +1,45 @@
-"""Reference container — contigs + sequences + features.
+"""``GenomeReference`` container — contigs + sequences.
 
-A ``Reference`` is the sequencing analog to ``massspec.library.Library``:
-PK uniqueness, FK closure across contigs / sequences / features, and a
-ParquetDir lossless native form. Two origins flow into this shape:
+The genome-level reference is the sequencing analog to
+``massspec.library.Library``: PK uniqueness, FK closure across contigs
+and sequences, and a ParquetDir lossless native form. Two origins flow
+into this shape:
 
-    External reference   FASTA + GFF → Reference (e.g. an Ensembl
-                         genome download)
-    De novo assembly     ``sequencing.assembly.Assembly.to_reference()``
-                         lifts a finalized assembly into the same
-                         shape so downstream alignment / quant code is
-                         uniform across both workflows
+    External reference   FASTA → GenomeReference (paired with an
+                         Annotation built from companion GFF3)
+    De novo assembly     ``sequencing.assembly.Assembly.to_genome_reference()``
+                         lifts a finalized assembly into the same shape
+                         so downstream alignment / quant code is uniform
+                         across both workflows
+
+Annotation features (genes, exons, repeats) live in
+:class:`sequencing.annotation.Annotation`, which references this
+container's contigs by id. Spliced transcript records live in
+:class:`sequencing.transcripts.TranscriptReference`.
 """
 
 from __future__ import annotations
 
 from constellation.sequencing.reference.io import (
-    REFERENCE_READERS,
-    REFERENCE_WRITERS,
-    ReferenceReader,
-    ReferenceWriter,
-    load_reference,
+    GENOME_REFERENCE_READERS,
+    GENOME_REFERENCE_WRITERS,
+    GenomeReferenceReader,
+    GenomeReferenceWriter,
+    load_genome_reference,
     register_reader,
     register_writer,
-    save_reference,
+    save_genome_reference,
 )
-from constellation.sequencing.reference.reference import Reference
+from constellation.sequencing.reference.reference import GenomeReference
 
 __all__ = [
-    "Reference",
-    "ReferenceReader",
-    "ReferenceWriter",
-    "REFERENCE_READERS",
-    "REFERENCE_WRITERS",
+    "GenomeReference",
+    "GenomeReferenceReader",
+    "GenomeReferenceWriter",
+    "GENOME_REFERENCE_READERS",
+    "GENOME_REFERENCE_WRITERS",
     "register_reader",
     "register_writer",
-    "save_reference",
-    "load_reference",
+    "save_genome_reference",
+    "load_genome_reference",
 ]

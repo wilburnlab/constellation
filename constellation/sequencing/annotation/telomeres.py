@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 
-from constellation.sequencing.reference.reference import Reference
+from constellation.sequencing.reference.reference import GenomeReference
 
 
 _PHASE = "Phase 9 (annotation/telomeres)"
@@ -33,7 +33,7 @@ TELOMERE_MOTIFS: dict[str, str] = {
 
 
 def find_telomeres(
-    reference: Reference,
+    reference: GenomeReference,
     *,
     motif: str = "TTAGGG",
     min_repeat_count: int = 4,
@@ -50,7 +50,7 @@ def find_telomeres(
 
 
 def find_tandem_repeats(
-    reference: Reference,
+    reference: GenomeReference,
     *,
     min_period: int = 3,
     max_period: int = 200,
