@@ -575,9 +575,264 @@ def read_sam_chunk(
     return rows
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Alignment-mode decode — emits ALIGNMENT_TABLE + ALIGNMENT_TAG_TABLE.
+#
+# Distinct from the READ_TABLE iterators above because:
+#   - Cardinality differs: one BAM record per ALIGNMENT_TABLE row, but
+#     READ_TABLE collapses secondary / supplementary records onto the
+#     primary. Skipping secondaries here would miss real alignment data.
+#   - Tag handling differs: ALIGNMENT_TAG_TABLE is long-format
+#     (alignment_id, tag, type, value); the READ_TABLE path only pulls
+#     the handful of Dorado tags it cares about.
+#   - Unmapped records (FLAG 0x4) are skipped — ALIGNMENT_TABLE requires
+#     ref_name / ref_start / ref_end to be non-null.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _serialize_tag_value(value: Any) -> str:
+    """ALIGNMENT_TAG_TABLE.value is string-typed; cast on read.
+
+    pysam returns bytes for Z-type tags on some Python versions and
+    array.array for B-type arrays — handle both.
+    """
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(v) for v in value)
+    return str(value)
+
+
+def _bam_record_to_alignment_row(
+    rec: Any,
+    *,
+    alignment_id: int,
+    acquisition_id: int,
+    tags_to_keep: tuple[str, ...] = (),
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Convert a pysam ``AlignedSegment`` to ALIGNMENT_TABLE + tag rows.
+
+    Returns ``(None, [])`` for unmapped records (caller skips). Mapped
+    records produce one ALIGNMENT_TABLE row plus zero or more
+    ALIGNMENT_TAG_TABLE rows (one per tag listed in ``tags_to_keep``).
+
+    Promoted-column extraction: ``nm_tag`` from NM, ``as_tag`` from AS,
+    ``read_group`` from RG. ``tags_to_keep`` is the long-tail allowlist
+    for entries that go into the long-format tag table — promoted tags
+    don't need to be listed there but harmlessly may be.
+    """
+    if rec.is_unmapped:
+        return None, []
+
+    nm_tag: int | None = None
+    as_tag: float | None = None
+    read_group: str | None = None
+    try:
+        nm_tag = int(rec.get_tag("NM"))
+    except KeyError:
+        pass
+    try:
+        as_tag = float(rec.get_tag("AS"))
+    except KeyError:
+        pass
+    try:
+        read_group = str(rec.get_tag("RG"))
+    except KeyError:
+        pass
+
+    tag_rows: list[dict[str, Any]] = []
+    if tags_to_keep:
+        keep_set = frozenset(tags_to_keep)
+        for tag_name, value, type_code in rec.get_tags(with_value_type=True):
+            if tag_name not in keep_set:
+                continue
+            tag_rows.append(
+                {
+                    "alignment_id": alignment_id,
+                    "tag": tag_name,
+                    "type": type_code,
+                    "value": _serialize_tag_value(value),
+                }
+            )
+
+    return (
+        {
+            "alignment_id": alignment_id,
+            "read_id": rec.query_name,
+            "acquisition_id": acquisition_id,
+            "ref_name": rec.reference_name,
+            "ref_start": int(rec.reference_start),
+            "ref_end": int(rec.reference_end),
+            "strand": "-" if rec.is_reverse else "+",
+            "mapq": int(rec.mapping_quality),
+            "flag": int(rec.flag),
+            "cigar_string": rec.cigarstring or "",
+            "nm_tag": nm_tag,
+            "as_tag": as_tag,
+            "read_group": read_group,
+            "is_secondary": bool(rec.is_secondary),
+            "is_supplementary": bool(rec.is_supplementary),
+        },
+        tag_rows,
+    )
+
+
+def _alignment_records_to_tables(
+    alignment_rows: list[dict[str, Any]],
+    tag_rows: list[dict[str, Any]],
+) -> tuple[pa.Table, pa.Table]:
+    """Materialise lists of dicts into (ALIGNMENT_TABLE, ALIGNMENT_TAG_TABLE)."""
+    from constellation.sequencing.schemas.alignment import (
+        ALIGNMENT_TABLE,
+        ALIGNMENT_TAG_TABLE,
+    )
+
+    if alignment_rows:
+        alignments = pa.Table.from_pylist(alignment_rows, schema=ALIGNMENT_TABLE)
+    else:
+        alignments = ALIGNMENT_TABLE.empty_table()
+    if tag_rows:
+        tags = pa.Table.from_pylist(tag_rows, schema=ALIGNMENT_TAG_TABLE)
+    else:
+        tags = ALIGNMENT_TAG_TABLE.empty_table()
+    return alignments, tags
+
+
+def read_bam_alignments(
+    path: Path,
+    *,
+    acquisition_id: int = 0,
+    tags_to_keep: tuple[str, ...] = (),
+    threads: int = 1,
+) -> tuple[pa.Table, pa.Table]:
+    """Decode all mapped alignment records (incl. secondary /
+    supplementary) into ``(ALIGNMENT_TABLE, ALIGNMENT_TAG_TABLE)``.
+
+    For pipeline-scale parallel decode, use the chunked variant
+    :func:`read_bam_alignments_chunk` together with
+    :func:`_bam_alignment_chunks` and ``run_batched``. This entry point
+    materialises the full table into memory — fine for tests and small
+    Jupyter use, but at 30–200M alignments it OOMs.
+
+    ``tags_to_keep`` controls which long-tail BAM tags land in the
+    tag table; promoted columns (``nm_tag``, ``as_tag``, ``read_group``)
+    always populate. Unmapped records are skipped — ALIGNMENT_TABLE
+    requires ref_name / ref_start / ref_end to be non-null.
+    """
+    import pysam  # type: ignore[import-not-found]
+
+    alignment_rows: list[dict[str, Any]] = []
+    tag_rows: list[dict[str, Any]] = []
+    next_id = 0
+    with pysam.AlignmentFile(
+        str(path), "rb", check_sq=False, threads=threads
+    ) as fh:
+        for rec in fh.fetch(until_eof=True):
+            row, tags = _bam_record_to_alignment_row(
+                rec,
+                alignment_id=next_id,
+                acquisition_id=acquisition_id,
+                tags_to_keep=tags_to_keep,
+            )
+            if row is None:
+                continue
+            alignment_rows.append(row)
+            tag_rows.extend(tags)
+            next_id += 1
+    return _alignment_records_to_tables(alignment_rows, tag_rows)
+
+
+def _bam_alignment_chunks(
+    path: Path,
+    *,
+    chunk_size: int = 100_000,
+    threads: int = 1,
+) -> list[tuple[int, int]]:
+    """Like :func:`_bam_record_chunks` but counts ALL records (incl.
+    secondary / supplementary / unmapped) toward the chunk budget.
+
+    Returns ``(virtual_offset_start, n_records)`` pairs. Workers seek
+    to ``virtual_offset_start`` and read exactly ``n_records`` records
+    of any kind. Unmapped records are still emitted by the iterator;
+    the alignment-row converter drops them at row-build time. Counting
+    them in the chunk budget keeps the chunker itself decision-free.
+    """
+    import pysam  # type: ignore[import-not-found]
+
+    chunks: list[tuple[int, int]] = []
+    n_in_chunk = 0
+    chunk_start_vo: int | None = None
+
+    with pysam.AlignmentFile(
+        str(path), "rb", check_sq=False, threads=threads
+    ) as fh:
+        last_vo = fh.tell()
+        for _rec in fh.fetch(until_eof=True):
+            rec_vo = last_vo
+            last_vo = fh.tell()
+            if chunk_start_vo is None:
+                chunk_start_vo = rec_vo
+            n_in_chunk += 1
+            if n_in_chunk >= chunk_size:
+                chunks.append((chunk_start_vo, n_in_chunk))
+                chunk_start_vo = None
+                n_in_chunk = 0
+        if n_in_chunk > 0 and chunk_start_vo is not None:
+            chunks.append((chunk_start_vo, n_in_chunk))
+    return chunks
+
+
+def read_bam_alignments_chunk(
+    path: Path,
+    *,
+    vo_start: int,
+    n_records: int,
+    worker_idx: int,
+    acquisition_id: int = 0,
+    tags_to_keep: tuple[str, ...] = (),
+) -> tuple[pa.Table, pa.Table]:
+    """Read exactly ``n_records`` records starting at the given virtual
+    offset; return (ALIGNMENT_TABLE, ALIGNMENT_TAG_TABLE) for the chunk.
+
+    ``alignment_id`` is allocated as ``(worker_idx << 32) | local_idx``
+    so the partitioned shards can be concatenated without renumbering.
+    Caller is responsible for ensuring ``worker_idx`` is unique across
+    workers within a single ``run_batched`` invocation.
+    """
+    import pysam  # type: ignore[import-not-found]
+
+    base = (int(worker_idx) & 0xFFFFFFFF) << 32
+    alignment_rows: list[dict[str, Any]] = []
+    tag_rows: list[dict[str, Any]] = []
+    local_idx = 0
+    n_seen = 0
+    with pysam.AlignmentFile(
+        str(path), "rb", check_sq=False, threads=1
+    ) as fh:
+        if vo_start > 0:
+            fh.seek(vo_start)
+        for rec in fh.fetch(until_eof=True):
+            n_seen += 1
+            row, tags = _bam_record_to_alignment_row(
+                rec,
+                alignment_id=base | local_idx,
+                acquisition_id=acquisition_id,
+                tags_to_keep=tags_to_keep,
+            )
+            if row is not None:
+                alignment_rows.append(row)
+                tag_rows.extend(tags)
+                local_idx += 1
+            if n_seen >= n_records:
+                break
+    return _alignment_records_to_tables(alignment_rows, tag_rows)
+
+
 __all__ = [
     "BamReader",
     "SamReader",
     "read_bam_chunk",
     "read_sam_chunk",
+    "read_bam_alignments",
+    "read_bam_alignments_chunk",
 ]

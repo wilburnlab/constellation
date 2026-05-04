@@ -1,17 +1,13 @@
-"""BAM/SAM cross-tier adapter.
+"""BAM cross-tier adapter — single-shot decode into ``Alignments``.
 
-A BAM file is conceptually two tables glued together: a Reads table
-(sequence + quality + read_id) and an Alignments table (ref position +
-CIGAR + tags). The :class:`Pod5Reader`-style ``RawReader`` lives at
-:mod:`sequencing.readers.sam_bam` and produces the raw ``ReadResult``
-companions; this module produces ``(Reads, Alignments)`` containers
-ready for downstream code.
+The container-shaped entry point sits on top of the format-level
+decoder in :mod:`sequencing.readers.sam_bam`. ``read_bam`` materialises
+the full table in memory; appropriate for tests and small Jupyter use
+but not the pipeline at 30–200M alignments — production paths use the
+chunked decoder + fused worker in :mod:`sequencing.quant.genome_count`.
 
-Mirrors :mod:`massspec.io.encyclopedia.adapters` — one shared decode
-core, slot-specific adapters projecting it into each container's
-Reader registry. Self-registers with ``ALIGNMENTS_READERS`` on import.
-
-Status: STUB. Pending Phase 2.
+Self-registers ``_BamAlignmentsReader`` with ``ALIGNMENTS_READERS`` on
+import so ``load_alignments(path.bam)`` resolves cleanly.
 """
 
 from __future__ import annotations
@@ -23,31 +19,50 @@ from constellation.sequencing.alignments.alignments import Alignments
 from constellation.sequencing.alignments.io import (
     register_reader as register_alignments_reader,
 )
+from constellation.sequencing.readers.sam_bam import read_bam_alignments
+from constellation.sequencing.reference.reference import GenomeReference
 
 
-_PHASE = "Phase 2 (readers/sam_bam + io/sam_bam adapter)"
+def read_bam(
+    path: Path,
+    *,
+    genome: GenomeReference | None = None,
+    acquisition_id: int = 0,
+    tags_to_keep: tuple[str, ...] = (),
+    threads: int = 1,
+) -> Alignments:
+    """Decode a BAM file into an ``Alignments`` container.
 
+    When ``genome`` is provided, ``Alignments.validate_against`` is
+    invoked so any rogue ``ref_name`` (BAM produced against a different
+    reference) trips before downstream code sees the data. Without a
+    genome, validation is limited to PK/FK closure on the alignments
+    themselves.
 
-def read_bam(path: Path, **opts: Any) -> tuple[Any, Alignments]:
-    """Decode a BAM file into a ``(Reads, Alignments)`` tuple.
-
-    Single shared core that callers project into per-container readers
-    via the adapter classes below. Caller supplies an
-    ``acquisition_id`` (typically via the ``Project`` layer that knows
-    which acquisition the BAM belongs to).
-
-    Returns:
-        ``Reads`` container (TBD; not yet defined as a separate type
-        — Phase 2 will decide whether to introduce ``Reads`` as a thin
-        container around READ_TABLE or just pass the Arrow table)
-        and ``Alignments``.
+    In-memory decode — at 30–200M alignments this OOMs. Pipeline paths
+    use the chunked decoder in
+    :mod:`sequencing.readers.sam_bam.read_bam_alignments_chunk`.
     """
-    raise NotImplementedError(f"read_bam pending {_PHASE}")
+    alignments_table, tags_table = read_bam_alignments(
+        Path(path),
+        acquisition_id=acquisition_id,
+        tags_to_keep=tags_to_keep,
+        threads=threads,
+    )
+    container = Alignments(alignments=alignments_table, tags=tags_table)
+    if genome is not None:
+        container.validate_against(genome)
+    return container
 
 
 def write_bam(path: Path, alignments: Alignments, **opts: Any) -> None:
-    """Encode an Alignments container back to BAM."""
-    raise NotImplementedError(f"write_bam pending {_PHASE}")
+    """Encode an Alignments container back to BAM.
+
+    Deferred — no current consumer requires constellation-produced
+    BAMs (we always emit ParquetDir for cached forms; minimap2 produces
+    BAM directly). Lift when a use case appears.
+    """
+    raise NotImplementedError("write_bam not yet implemented")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -62,8 +77,7 @@ class _BamAlignmentsReader:
     format_name: ClassVar[str] = "bam"
 
     def read(self, path: Path, **opts: Any) -> Alignments:
-        _, alignments = read_bam(path, **opts)
-        return alignments
+        return read_bam(path, **opts)
 
 
 # Register on import so consumers see ``.bam`` resolution by default.

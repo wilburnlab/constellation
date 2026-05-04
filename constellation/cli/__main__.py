@@ -229,7 +229,91 @@ def _build_transcriptome_parser(subs) -> None:
     )
     p_dem.set_defaults(func=_cmd_transcriptome_demultiplex)
 
-    # Cluster reserved for S4
+    # ── transcriptome align — Mode A reference-guided gene counting ──
+    p_aln = tx_subs.add_parser(
+        "align",
+        help=(
+            "Align demuxed reads to a reference + filter + count reads "
+            "per gene (Mode A). Future: Mode B de novo clustering "
+            "shares the same verb (auto-dispatched on --reference presence)."
+        ),
+    )
+    p_aln.add_argument(
+        "--demux-dir",
+        required=True,
+        help=(
+            "directory written by `constellation transcriptome demultiplex` "
+            "— provides read_demux/, manifest.json (with input BAM paths), "
+            "and the implicit acquisition map"
+        ),
+    )
+    p_aln.add_argument(
+        "--reference",
+        default=None,
+        help=(
+            "reference root produced by `constellation reference import` / "
+            "`fetch` — must contain ``genome/`` + ``annotation/`` "
+            "ParquetDir bundles. Presence selects Mode A; absence "
+            "errors with the Mode B not-yet-implemented message."
+        ),
+    )
+    p_aln.add_argument(
+        "--samples",
+        required=True,
+        help=(
+            "samples TSV (same TSV used at demux time). Future: persist "
+            "Samples in the demux output to make this optional."
+        ),
+    )
+    p_aln.add_argument("--output-dir", required=True)
+    p_aln.add_argument("--threads", type=int, default=1)
+    p_aln.add_argument(
+        "--chunk-size",
+        type=int,
+        default=100_000,
+        help="records per BAM-decode worker chunk (default 100000)",
+    )
+    p_aln.add_argument(
+        "--min-length",
+        type=int,
+        default=300,
+        help="minimum reference span (bp); default 300",
+    )
+    p_aln.add_argument(
+        "--min-aligned-fraction",
+        type=float,
+        default=0.85,
+        help=(
+            "minimum aligned-bp / read-length per SAM v1 §1.4.6; "
+            "default 0.85 (tighter than ENCODE's 0.7 published floor — "
+            "appropriate for clean full-length cDNA libraries)"
+        ),
+    )
+    p_aln.add_argument(
+        "--min-mapq",
+        type=int,
+        default=0,
+        help="minimum minimap2 MAPQ (default 0 — no filter)",
+    )
+    p_aln.add_argument(
+        "--allow-antisense",
+        action="store_true",
+        help="keep antisense alignments at the gene-overlap step",
+    )
+    p_aln.add_argument(
+        "--min-overlap-fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "minimum overlap_bp / ref_span at the gene-overlap step "
+            "(default 0.5)"
+        ),
+    )
+    p_aln.add_argument("--resume", action="store_true")
+    p_aln.add_argument("--progress", action="store_true")
+    p_aln.set_defaults(func=_cmd_transcriptome_align)
+
+    # Cluster reserved for S4 (Mode B de novo)
     p_cluster = tx_subs.add_parser(
         "cluster",
         help="abundance-weighted clustering + consensus + ORF (S4 — TODO)",
@@ -472,6 +556,233 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         print(
             f"demultiplex done: {n_reads} reads → "
             f"{len(fasta_records)} proteins, {quant_table.num_rows} quant rows",
+            flush=True,
+        )
+    return 0
+
+
+def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
+    """Mode A — align demuxed reads to a reference + count reads per gene.
+
+    Three stages: align (minimap2 → sorted indexed BAM), decode_filter_overlap
+    (N-way fused worker → partitioned shards), count (resolve-stage hash-join
+    against read_demux + group_by-sum to FEATURE_QUANT). Memory budget at
+    200M-read scale: ~3 GB gene_assignments + ~10 GB read_demux at the
+    resolve stage; alignment table never materialised whole.
+    """
+    import json
+    import sys
+    from pathlib import Path
+
+    import pyarrow as pa
+    import pyarrow.dataset as pa_dataset
+    import pyarrow.parquet as pq
+
+    from constellation.sequencing.align.map import map_to_genome
+    from constellation.sequencing.annotation.io import load_annotation
+    from constellation.sequencing.parallel import run_batched
+    from constellation.sequencing.progress import (
+        NullProgress,
+        StreamProgress,
+    )
+    from constellation.sequencing.quant import (
+        count_reads_per_gene,
+        fused_decode_filter_overlap_worker,
+        gene_set_from_annotation,
+        serialise_gene_set,
+    )
+    from constellation.sequencing.readers.sam_bam import _bam_alignment_chunks
+    from constellation.sequencing.reference.io import load_genome_reference
+    from constellation.sequencing.samples import Samples
+
+    # ── Mode dispatch ────────────────────────────────────────────────
+    if args.reference is None:
+        print(
+            "Mode B (de novo clustering) not yet implemented in this "
+            "release; pass --reference <ref-root> for reference-guided "
+            "gene counting.",
+            file=sys.stderr,
+        )
+        return 2
+
+    demux_dir = Path(args.demux_dir)
+    if not demux_dir.is_dir():
+        raise FileNotFoundError(f"--demux-dir not found: {demux_dir}")
+    demux_manifest_path = demux_dir / "manifest.json"
+    if not demux_manifest_path.exists():
+        raise FileNotFoundError(
+            f"--demux-dir missing manifest.json: {demux_dir}"
+        )
+    if not (demux_dir / "read_demux").is_dir():
+        raise FileNotFoundError(
+            f"--demux-dir missing read_demux/: {demux_dir}"
+        )
+    demux_manifest = json.loads(demux_manifest_path.read_text())
+
+    reference = Path(args.reference)
+    genome_dir = reference / "genome"
+    annotation_dir = reference / "annotation"
+    if not genome_dir.is_dir() or not annotation_dir.is_dir():
+        raise FileNotFoundError(
+            f"--reference must contain genome/ + annotation/ subdirs: "
+            f"{reference}"
+        )
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if (output_dir / "_SUCCESS").exists() and not args.resume:
+        print(
+            f"output dir already complete: {output_dir} "
+            f"(pass --resume to short-circuit; refusing to overwrite)",
+            file=sys.stderr,
+        )
+        return 1
+
+    cb = StreamProgress() if args.progress else NullProgress()
+
+    genome = load_genome_reference(genome_dir)
+    annotation = load_annotation(annotation_dir)
+    annotation.validate_against(genome)
+
+    bam_inputs = [Path(p) for p in demux_manifest.get("input_files", [])]
+    missing = [p for p in bam_inputs if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"input BAMs from demux manifest no longer present: "
+            f"{[str(p) for p in missing[:3]]}"
+            f"{'...' if len(missing) > 3 else ''}; re-run demultiplex or "
+            f"symlink the originals back into place"
+        )
+
+    sample_rows, edge_rows, _ = _parse_samples_tsv(
+        args.samples,
+        input_files=bam_inputs,
+        default_acquisition_id=int(demux_manifest.get("acquisition_id", 1)),
+    )
+    samples = Samples.from_records(samples=sample_rows, edges=edge_rows)
+
+    # ── Stage 1: align ───────────────────────────────────────────────
+    bam_success = output_dir / "bam" / "_SUCCESS"
+    aligned_bam = output_dir / "bam" / "aligned.bam"
+    if args.resume and bam_success.exists() and aligned_bam.exists():
+        cb_path = aligned_bam
+    else:
+        cb_path = map_to_genome(
+            bam_inputs,
+            genome,
+            output_dir=output_dir,
+            threads=args.threads,
+            progress_cb=cb,
+        )
+        bam_success.parent.mkdir(parents=True, exist_ok=True)
+        bam_success.write_bytes(b"")
+
+    # ── Stage 2: decode_filter_overlap (N-way fused worker) ──────────
+    chunks = _bam_alignment_chunks(cb_path, chunk_size=args.chunk_size)
+    chunk_specs = [
+        (str(cb_path), int(vo), int(n), idx)
+        for idx, (vo, n) in enumerate(chunks)
+    ]
+    gene_set = gene_set_from_annotation(annotation, genome)
+    gene_set_bytes = serialise_gene_set(gene_set)
+    filter_kwargs = {
+        "min_length": args.min_length,
+        "min_aligned_fraction": args.min_aligned_fraction,
+        "min_mapq": args.min_mapq,
+    }
+    overlap_kwargs = {
+        "min_overlap_fraction": args.min_overlap_fraction,
+        "allow_antisense": args.allow_antisense,
+    }
+    stage_outputs = run_batched(
+        worker_fn=fused_decode_filter_overlap_worker,
+        batches=chunk_specs,
+        output_dir=output_dir,
+        output_keys=("alignments", "alignment_tags", "gene_assignments", "stats"),
+        n_workers=args.threads,
+        worker_kwargs={
+            "gene_set_bytes": gene_set_bytes,
+            "filter_kwargs": filter_kwargs,
+            "overlap_kwargs": overlap_kwargs,
+        },
+        progress_cb=cb,
+        resume=args.resume,
+        stage_label="decode_filter_overlap",
+        total=len(chunk_specs),
+    )
+
+    # ── Stage 3: count (resolve stage — hash-join + group_by-sum) ────
+    gene_assignments = pa_dataset.dataset(
+        stage_outputs["gene_assignments"].directory
+    ).to_table()
+    read_demux = pa_dataset.dataset(demux_dir / "read_demux").to_table()
+    feature_quant, count_stats = count_reads_per_gene(
+        gene_assignments, read_demux, samples
+    )
+
+    fq_dir = output_dir / "feature_quant" / "feature_origin=gene_id"
+    fq_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(feature_quant, fq_dir / "part-00000.parquet")
+    (output_dir / "feature_quant" / "_SUCCESS").write_bytes(b"")
+    pq.write_table(feature_quant, output_dir / "feature_quant.parquet")
+
+    # ── Aggregate per-worker stats for the manifest ──────────────────
+    if stage_outputs["stats"].shard_paths:
+        stats_table = pa_dataset.dataset(
+            stage_outputs["stats"].directory
+        ).to_table()
+        per_stage = {
+            "decoded": int(pa.compute.sum(stats_table.column("decoded")).as_py()),
+            "after_filter": int(
+                pa.compute.sum(stats_table.column("after_filter")).as_py()
+            ),
+            "after_overlap": int(
+                pa.compute.sum(stats_table.column("after_overlap")).as_py()
+            ),
+        }
+    else:
+        per_stage = {"decoded": 0, "after_filter": 0, "after_overlap": 0}
+    per_stage.update(
+        {
+            "reads_with_sample": count_stats["reads_with_sample"],
+            "reads_without_sample": count_stats["reads_without_sample"],
+            "unique_(gene,sample)_pairs": count_stats["unique_(gene,sample)_pairs"],
+            "total_count": count_stats["total_count"],
+        }
+    )
+
+    manifest = {
+        "demux_dir": str(demux_dir),
+        "reference": str(reference),
+        "input_files": [str(p) for p in bam_inputs],
+        "parameters": {
+            "threads": args.threads,
+            "chunk_size": args.chunk_size,
+            "min_length": args.min_length,
+            "min_aligned_fraction": args.min_aligned_fraction,
+            "min_mapq": args.min_mapq,
+            "allow_antisense": args.allow_antisense,
+            "min_overlap_fraction": args.min_overlap_fraction,
+        },
+        "stages": per_stage,
+        "outputs": {
+            "bam": str(aligned_bam),
+            "alignments": str(stage_outputs["alignments"].directory),
+            "alignment_tags": str(stage_outputs["alignment_tags"].directory),
+            "gene_assignments": str(stage_outputs["gene_assignments"].directory),
+            "feature_quant": str(output_dir / "feature_quant.parquet"),
+        },
+    }
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (output_dir / "_SUCCESS").write_bytes(b"")
+
+    if not args.progress:
+        print(
+            f"align done: {per_stage['decoded']} alignments decoded → "
+            f"{per_stage['after_filter']} kept → "
+            f"{per_stage['after_overlap']} overlapping a gene → "
+            f"{per_stage['unique_(gene,sample)_pairs']} (gene, sample) cells, "
+            f"total count {per_stage['total_count']}",
             flush=True,
         )
     return 0

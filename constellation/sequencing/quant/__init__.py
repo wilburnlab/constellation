@@ -1,0 +1,44 @@
+"""Genome-aligned quantification — Mode A (reference-guided gene counting).
+
+Sibling to :mod:`sequencing.transcriptome.quant` (which is the demux
+pipeline's protein-cluster quantifier). This package hosts genome-mode
+counting; future siblings (transcriptome-mode EM, multi-mapper
+resolution, ProBAM-derived peptide → gene reduction) live here.
+
+Three pieces, factored so the per-chunk fused worker and the
+resolve-stage aggregator share implementations:
+
+    apply_filter_predicates  — kernel: vectorised filter
+    compute_gene_overlap     — kernel: sort+searchsorted overlap-join
+    count_reads_per_gene     — aggregator: hash-join + group_by-sum to FEATURE_QUANT
+    fused_decode_filter_overlap_worker
+                             — pipeline worker (decode + filter + overlap, per chunk)
+
+In-memory ``count_reads_per_gene`` and the fused worker share the same
+``compute_gene_overlap`` kernel so the streaming and in-memory paths
+produce identical assignments on identical inputs.
+"""
+
+from __future__ import annotations
+
+from constellation.sequencing.quant._kernels import (
+    GENE_ASSIGNMENT_SCHEMA,
+    apply_filter_predicates,
+    compute_gene_overlap,
+    gene_set_from_annotation,
+)
+from constellation.sequencing.quant.genome_count import (
+    count_reads_per_gene,
+    fused_decode_filter_overlap_worker,
+    serialise_gene_set,
+)
+
+__all__ = [
+    "GENE_ASSIGNMENT_SCHEMA",
+    "apply_filter_predicates",
+    "compute_gene_overlap",
+    "gene_set_from_annotation",
+    "count_reads_per_gene",
+    "fused_decode_filter_overlap_worker",
+    "serialise_gene_set",
+]
