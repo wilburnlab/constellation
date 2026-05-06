@@ -644,15 +644,13 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     annotation = load_annotation(annotation_dir)
     annotation.validate_against(genome)
 
+    # Source BAM paths from the S1 demux manifest are kept solely for
+    # samples-TSV multi-file mapping (the `file` column matches against
+    # these basenames). We DO NOT open them — alignment streams trimmed
+    # transcript windows from the demux parquet partitions instead, so
+    # the raw BAMs may be moved/archived after demux without breaking
+    # the align stage.
     bam_inputs = [Path(p) for p in demux_manifest.get("input_files", [])]
-    missing = [p for p in bam_inputs if not p.exists()]
-    if missing:
-        raise FileNotFoundError(
-            f"input BAMs from demux manifest no longer present: "
-            f"{[str(p) for p in missing[:3]]}"
-            f"{'...' if len(missing) > 3 else ''}; re-run demultiplex or "
-            f"symlink the originals back into place"
-        )
 
     sample_rows, edge_rows, _ = _parse_samples_tsv(
         args.samples,
@@ -668,7 +666,7 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         cb_path = aligned_bam
     else:
         cb_path = map_to_genome(
-            bam_inputs,
+            demux_dir,
             genome,
             output_dir=output_dir,
             threads=args.threads,

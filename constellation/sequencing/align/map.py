@@ -1,17 +1,18 @@
 """Mapping verbs — use-case orchestrators on top of ``minimap2_run``.
 
 Each verb is a thin composition: materialise/locate the target,
-construct the use-case-specific minimap2 arg list, call
-:func:`constellation.sequencing.align.minimap2.minimap2_run`, sort+index
-via samtools when a BAM is requested. The minimap2 subprocess wrapper
-itself stays generic (see :mod:`.minimap2`).
+construct the use-case-specific minimap2 arg list, stream input through
+the minimap2 → samtools-sort pipeline, index. The minimap2 subprocess
+wrapper itself stays generic (see :mod:`.minimap2`).
 
 Shipped:
 
-    map_to_genome      splice-aware full-length cDNA → genome alignment
-                       (matches ``cdna_wilburn_v1`` forward-stranded
-                       library; flags hard-coded here, not in the
-                       runner)
+    map_to_genome      splice-aware full-length cDNA → genome alignment.
+                       Input is an S1 demux output dir; we stream the
+                       trimmed transcript window of each successfully-
+                       demuxed read directly into minimap2's stdin —
+                       NOT the raw Dorado BAMs (those still carry the
+                       library scaffold S1 already located).
 
 Pending:
 
@@ -24,13 +25,15 @@ from __future__ import annotations
 
 import json
 import subprocess
-from collections.abc import Sequence
+import threading
+from collections.abc import Iterator
 from pathlib import Path
 
-from constellation.sequencing.align.minimap2 import (
-    minimap2_build_index,
-    minimap2_run,
-)
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as pa_ds
+
+from constellation.sequencing.align.minimap2 import minimap2_build_index
 from constellation.sequencing.progress import ProgressCallback, ProgressEvent
 from constellation.sequencing.reference.reference import GenomeReference
 from constellation.thirdparty.registry import ToolNotFoundError, find
@@ -45,6 +48,16 @@ _GENOME_MODE_ARGS: tuple[str, ...] = (
     "--cs=long",
     "--secondary=no",
 )
+
+
+def _resolve_minimap2() -> Path:
+    try:
+        return find("minimap2").path
+    except ToolNotFoundError as exc:
+        raise FileNotFoundError(
+            "minimap2 not on $PATH; install via bioconda: "
+            "`conda install -c bioconda minimap2 samtools`"
+        ) from exc
 
 
 def _resolve_samtools() -> Path:
@@ -94,78 +107,147 @@ def _materialise_genome_fasta(
     return fasta_path
 
 
-def _samtools_sort_index(
-    inputs: Sequence[Path],
-    output_bam: Path,
+def _stream_demux_fastq(
+    demux_dir: Path,
     *,
-    threads: int = 8,
-) -> Path:
-    """Sort + index ``inputs`` into a single coordinate-sorted ``output_bam``.
+    only_complete: bool = True,
+    batch_size: int = 100_000,
+) -> Iterator[tuple[bytes, int]]:
+    """Stream FASTQ bytes from an S1 demux output directory.
 
-    Uses ``samtools cat | samtools sort`` for multi-input merge; sort
-    maintains coordinate order across the merge. Indexes via
-    ``samtools index``. Returns the indexed BAM path.
+    Joins the ``reads/`` partition (read_id, sequence, quality) against
+    the filtered ``read_demux/`` partition (read_id, transcript_start,
+    transcript_end), slices each sequence to its transcript window, and
+    yields per-batch FASTQ-encoded bytes.
+
+    Filter when ``only_complete=True`` (default for genome-guided
+    quantification — see the chimera-handling discussion in the S2 plan):
+
+        * ``status == 'Complete'``
+        * ``sample_id`` not null
+        * ``is_fragment == False``
+        * ``is_chimera == False``  (forward-compat; S1 always emits False
+          today, lights up when S3 enables multi-segment splitting)
+        * ``transcript_start >= 0`` AND ``transcript_end > transcript_start``
+
+    Yields ``(fastq_bytes, n_reads)`` per batch so callers can update
+    progress without re-decoding the bytes.
+
+    Memory at 200M-read scale: filtered demux index ~10 GB (50 B/row);
+    each yielded FASTQ batch ~200 MB (100k rows × ~2 KB seq+qual). The
+    demux index sits resident as the join's hash-build side; the reads
+    side streams via ``pa.dataset.to_batches``.
     """
-    samtools_bin = _resolve_samtools()
-    output_bam = Path(output_bam)
-    output_bam.parent.mkdir(parents=True, exist_ok=True)
+    demux_dir = Path(demux_dir)
+    reads_dir = demux_dir / "reads"
+    demux_part_dir = demux_dir / "read_demux"
+    if not reads_dir.is_dir():
+        raise FileNotFoundError(
+            f"demux output missing reads/: {demux_dir}"
+        )
+    if not demux_part_dir.is_dir():
+        raise FileNotFoundError(
+            f"demux output missing read_demux/: {demux_dir}"
+        )
 
-    if len(inputs) == 1:
-        sort_input = [str(samtools_bin), "view", "-b", str(inputs[0])]
+    if only_complete:
+        filt = (
+            (pc.field("status") == "Complete")
+            & pc.is_valid(pc.field("sample_id"))
+            & pc.invert(pc.field("is_fragment"))
+            & pc.invert(pc.field("is_chimera"))
+            & (pc.field("transcript_start") >= 0)
+            & (pc.field("transcript_end") > pc.field("transcript_start"))
+        )
     else:
-        sort_input = [str(samtools_bin), "cat", *(str(p) for p in inputs)]
-    sort_cmd = [
-        str(samtools_bin),
-        "sort",
-        "-@",
-        str(int(threads)),
-        "-o",
-        str(output_bam),
-    ]
+        filt = (pc.field("transcript_start") >= 0) & (
+            pc.field("transcript_end") > pc.field("transcript_start")
+        )
 
-    cat_proc = subprocess.Popen(sort_input, stdout=subprocess.PIPE)
-    try:
-        sort_proc = subprocess.Popen(sort_cmd, stdin=cat_proc.stdout)
-        if cat_proc.stdout is not None:
-            cat_proc.stdout.close()
-        sort_rc = sort_proc.wait()
-        cat_rc = cat_proc.wait()
-    finally:
-        if cat_proc.poll() is None:
-            cat_proc.kill()
-    if cat_rc != 0:
-        raise subprocess.CalledProcessError(cat_rc, sort_input)
-    if sort_rc != 0:
-        raise subprocess.CalledProcessError(sort_rc, sort_cmd)
-
-    subprocess.run(
-        [str(samtools_bin), "index", str(output_bam)],
-        check=True,
+    demux_table = pa_ds.dataset(demux_part_dir).to_table(
+        columns=["read_id", "transcript_start", "transcript_end"],
+        filter=filt,
     )
-    return output_bam
+    if demux_table.num_rows == 0:
+        return
+
+    reads_ds = pa_ds.dataset(reads_dir)
+    has_quality = "quality" in set(reads_ds.schema.names)
+    columns = ["read_id", "sequence"] + (["quality"] if has_quality else [])
+
+    for batch in reads_ds.to_batches(columns=columns, batch_size=batch_size):
+        if batch.num_rows == 0:
+            continue
+        reads_table = pa.Table.from_batches([batch])
+        joined = reads_table.join(
+            demux_table, keys="read_id", join_type="inner"
+        )
+        if joined.num_rows == 0:
+            continue
+
+        read_ids = joined.column("read_id").to_pylist()
+        sequences = joined.column("sequence").to_pylist()
+        if has_quality and "quality" in joined.column_names:
+            qualities = joined.column("quality").to_pylist()
+        else:
+            qualities = [None] * joined.num_rows
+        ts_list = joined.column("transcript_start").to_pylist()
+        te_list = joined.column("transcript_end").to_pylist()
+
+        parts: list[str] = []
+        for read_id, seq, qual, ts, te in zip(
+            read_ids, sequences, qualities, ts_list, te_list
+        ):
+            s = seq[ts:te]
+            if not s:
+                continue
+            if qual is not None and len(qual) == len(seq):
+                q = qual[ts:te]
+            else:
+                # No quality (FASTA-shaped reads) → synthetic Q40 = 'I'
+                q = "I" * len(s)
+            parts.append(f"@{read_id}\n{s}\n+\n{q}\n")
+        if parts:
+            yield "".join(parts).encode("ascii"), len(parts)
 
 
 def map_to_genome(
-    reads_paths: Sequence[Path],
+    demux_dir: Path,
     genome: GenomeReference,
     *,
     output_dir: Path,
     threads: int = 8,
+    only_complete: bool = True,
+    batch_size: int = 100_000,
     extra_minimap2_args: tuple[str, ...] = (),
     progress_cb: ProgressCallback | None = None,
 ) -> Path:
     """Splice-aware full-length cDNA → genome alignment via minimap2.
 
-    Materialises ``genome`` to a cached FASTA at ``output_dir/genome.fa``
-    and a ``.mmi`` at ``output_dir/genome.mmi``; both reuse on subsequent
-    calls. Each input file is mapped separately, then ``samtools cat |
-    samtools sort`` concatenates and coordinate-sorts the per-input BAMs
-    into ``output_dir/bam/aligned.bam`` (indexed via ``samtools index``).
+    Streams trimmed transcript-window FASTQ from the S1 demux output
+    directory directly into minimap2's stdin (no intermediate FASTQ
+    file, no raw-BAM input) — the S1 demux already located the library
+    scaffold (5'/3' adapter, polyA, barcode), so we map only the
+    transcript window of each Complete-status read. See
+    :func:`_stream_demux_fastq` for the filter set.
 
-    Returns the final sorted, indexed BAM path. The CLI handler then
-    feeds it into :func:`sequencing.io.sam_bam.read_bam` (or the
-    chunked decoder for the pipeline).
+    Pipeline shape:
+
+        [Python writer thread]    [minimap2 -t N]    [samtools sort]
+          pa.dataset batches ──FASTQ─> reads stdin ──SAM─> sorts ──BAM─> aligned.bam
+
+    minimap2 sees one continuous FASTQ stream — batch boundaries are a
+    Python-side memory knob, not a parallelism boundary. ``samtools
+    sort`` consumes minimap2's SAM stdout and writes a coordinate-
+    sorted BAM in one pass; ``samtools index`` follows.
+
+    Materialises ``genome`` to a cached FASTA at ``output_dir/genome.fa``
+    and a ``.mmi`` index at ``output_dir/genome.mmi``; both reuse on
+    subsequent calls (cache-busted by contig count).
+
+    Returns the final sorted, indexed BAM path.
     """
+    demux_dir = Path(demux_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     bam_dir = output_dir / "bam"
@@ -180,59 +262,115 @@ def map_to_genome(
         fasta, output_dir / "genome.mmi", threads=threads
     )
 
+    minimap2_bin = _resolve_minimap2()
+    samtools_bin = _resolve_samtools()
     args = _GENOME_MODE_ARGS + tuple(extra_minimap2_args)
+    final_bam = bam_dir / "aligned.bam"
 
-    per_input: list[Path] = []
-    n_inputs = len(reads_paths)
+    cmd_mm2 = [
+        str(minimap2_bin),
+        *args,
+        "-t",
+        str(int(threads)),
+        str(mmi),
+        "-",
+    ]
+    cmd_sort = [
+        str(samtools_bin),
+        "sort",
+        "-@",
+        str(int(threads)),
+        "-o",
+        str(final_bam),
+    ]
+
     if progress_cb is not None:
         progress_cb(
             ProgressEvent(
                 kind="stage_start",
                 stage="align",
-                total=n_inputs,
-                message=f"minimap2 splice-aware mapping of {n_inputs} input(s)",
+                message=(
+                    f"streaming demux FASTQ → minimap2 → samtools sort → {final_bam}"
+                ),
             )
         )
-    for idx, reads_path in enumerate(reads_paths):
-        per_input_bam = bam_dir / f"aligned.{idx:05d}.bam"
-        minimap2_run(
-            target=mmi,
-            queries=[Path(reads_path)],
-            output_path=per_input_bam,
-            args=args,
-            threads=threads,
-            progress_cb=None,  # don't double-emit at runner level
-        )
-        per_input.append(per_input_bam)
-        if progress_cb is not None:
-            progress_cb(
-                ProgressEvent(
-                    kind="stage_progress",
-                    stage="align",
-                    completed=idx + 1,
-                    total=n_inputs,
-                    message=str(per_input_bam),
-                )
-            )
 
-    final_bam = _samtools_sort_index(
-        per_input, bam_dir / "aligned.bam", threads=threads
+    writer_exc: list[BaseException] = []
+    reads_emitted = [0]
+
+    procs: list[tuple[subprocess.Popen, list[str]]] = []
+    try:
+        mm2 = subprocess.Popen(
+            cmd_mm2, stdin=subprocess.PIPE, stdout=subprocess.PIPE
+        )
+        procs.append((mm2, cmd_mm2))
+        sort = subprocess.Popen(cmd_sort, stdin=mm2.stdout)
+        procs.append((sort, cmd_sort))
+        # Let mm2 receive SIGPIPE if sort exits early
+        if mm2.stdout is not None:
+            mm2.stdout.close()
+
+        def _writer() -> None:
+            try:
+                assert mm2.stdin is not None
+                for chunk_bytes, n_reads in _stream_demux_fastq(
+                    demux_dir,
+                    only_complete=only_complete,
+                    batch_size=batch_size,
+                ):
+                    mm2.stdin.write(chunk_bytes)
+                    reads_emitted[0] += n_reads
+                    if progress_cb is not None:
+                        progress_cb(
+                            ProgressEvent(
+                                kind="stage_progress",
+                                stage="align",
+                                completed=reads_emitted[0],
+                                message=f"{reads_emitted[0]:,} reads streamed",
+                            )
+                        )
+            except BrokenPipeError:
+                # Downstream exited early — let the wait()s surface its rc
+                pass
+            except BaseException as e:
+                writer_exc.append(e)
+            finally:
+                try:
+                    if mm2.stdin is not None:
+                        mm2.stdin.close()
+                except OSError:
+                    pass
+
+        writer_thread = threading.Thread(target=_writer, daemon=True)
+        writer_thread.start()
+
+        # Wait downstream-first so SIGPIPE propagates upward cleanly
+        sort_rc = sort.wait()
+        mm2_rc = mm2.wait()
+        writer_thread.join()
+    finally:
+        for proc, _ in procs:
+            if proc.poll() is None:
+                proc.kill()
+
+    if writer_exc:
+        raise writer_exc[0]
+    if mm2_rc:
+        raise subprocess.CalledProcessError(mm2_rc, cmd_mm2)
+    if sort_rc:
+        raise subprocess.CalledProcessError(sort_rc, cmd_sort)
+
+    subprocess.run(
+        [str(samtools_bin), "index", str(final_bam)],
+        check=True,
     )
-
-    # Cleanup intermediates — single sorted BAM is the artefact
-    for p in per_input:
-        try:
-            p.unlink()
-        except OSError:
-            pass
 
     if progress_cb is not None:
         progress_cb(
             ProgressEvent(
                 kind="stage_done",
                 stage="align",
-                completed=n_inputs,
-                total=n_inputs,
+                completed=reads_emitted[0],
                 message=str(final_bam),
             )
         )
