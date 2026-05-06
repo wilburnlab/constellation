@@ -47,7 +47,7 @@ def count_reads_per_gene(
     engine: str = "constellation_overlap",
 ) -> tuple[pa.Table, dict[str, int]]:
     """Hash-join ``gene_assignments`` × ``read_demux`` on ``read_id``,
-    group_by-sum to FEATURE_QUANT.
+    group_by-sum to FEATURE_QUANT, and populate per-sample TPM.
 
     Both inputs are pa.Tables — caller materialises partitioned
     datasets via ``.to_table()`` before invocation. Memory budget at
@@ -57,6 +57,22 @@ def count_reads_per_gene(
 
     ``samples`` is consumed for FK-validation only — the FEATURE_QUANT
     output is keyed on ``sample_id`` integers.
+
+    **Long-read TPM convention.** Each emitted row has
+    ``tpm = count × 1e6 / sum_in_sample(count)`` — depth-normalised, no
+    length division. In long-read full-length cDNA, one read ≈ one
+    transcript, so ``count`` is already proportional to transcript
+    abundance with no length dependence; the short-read
+    ``count/length × 1e6 / sum(count/length)`` formula would actively
+    introduce error here. Mathematically this is identical to CPM, but
+    semantically it's TPM in the long-read sense (transcripts per
+    million transcripts in the sample). ``cpm`` is left null because
+    populating it with the same value would be redundant noise.
+
+    TODO(short_read): when short-read RNA-seq workflows arrive, add a
+    ``mode: Literal['long_read', 'short_read']`` parameter that routes
+    to the length-aware formula and pulls gene length from an
+    ``Annotation`` argument.
     """
     stats: dict[str, int] = {
         "gene_assignments_in": int(gene_assignments.num_rows),
@@ -64,6 +80,7 @@ def count_reads_per_gene(
         "reads_without_sample": 0,
         "unique_(gene,sample)_pairs": 0,
         "total_count": 0,
+        "samples_normalised": 0,
     }
     if gene_assignments.num_rows == 0 or read_demux.num_rows == 0:
         return FEATURE_QUANT.empty_table(), stats
@@ -119,6 +136,21 @@ def count_reads_per_gene(
     counts = counted.column("read_id_count").to_pylist()
     stats["total_count"] = int(sum(counts))
 
+    # Per-sample total-count for depth normalisation. Long-read TPM:
+    # count × 1e6 / sum_in_sample(count). See function docstring.
+    sample_totals = counted.group_by("sample_id").aggregate(
+        [("read_id_count", "sum")]
+    )
+    total_by_sid: dict[int, int] = {
+        int(sid): int(tot)
+        for sid, tot in zip(
+            sample_totals.column("sample_id").to_pylist(),
+            sample_totals.column("read_id_count_sum").to_pylist(),
+            strict=True,
+        )
+    }
+    stats["samples_normalised"] = len(total_by_sid)
+
     gene_ids = counted.column("gene_id").to_pylist()
     sample_ids_out = counted.column("sample_id").to_pylist()
     rows = [
@@ -128,7 +160,11 @@ def count_reads_per_gene(
             "engine": engine,
             "feature_origin": "gene_id",
             "count": float(c),
-            "tpm": None,
+            "tpm": (
+                float(c) * 1e6 / total_by_sid[int(sid)]
+                if total_by_sid.get(int(sid))
+                else 0.0
+            ),
             "cpm": None,
             "coverage_mean": None,
             "coverage_median": None,

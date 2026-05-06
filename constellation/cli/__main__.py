@@ -309,6 +309,27 @@ def _build_transcriptome_parser(subs) -> None:
             "(default 0.5)"
         ),
     )
+    p_aln.add_argument(
+        "--matrix-format",
+        choices=("count", "tpm", "both", "none"),
+        default="both",
+        help=(
+            "wide gene × sample TSV outputs to write alongside "
+            "feature_quant.parquet: 'count' → gene_counts.tsv only, "
+            "'tpm' → gene_tpm.tsv only, 'both' (default) → both, "
+            "'none' → skip the wide TSV writes (parquet still emitted)"
+        ),
+    )
+    p_aln.add_argument(
+        "--matrix-min-count",
+        type=int,
+        default=0,
+        help=(
+            "drop gene rows whose summed count across all samples is "
+            "below this threshold (default 0 — keep all annotated "
+            "genes including zero-observation rows for stable indexing)"
+        ),
+    )
     p_aln.add_argument("--resume", action="store_true")
     p_aln.add_argument("--progress", action="store_true")
     p_aln.set_defaults(func=_cmd_transcriptome_align)
@@ -586,9 +607,11 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         StreamProgress,
     )
     from constellation.sequencing.quant import (
+        build_gene_matrix,
         count_reads_per_gene,
         fused_decode_filter_overlap_worker,
         gene_set_from_annotation,
+        render_gene_matrix_tsv,
         serialise_gene_set,
     )
     from constellation.sequencing.readers.sam_bam import _bam_alignment_chunks
@@ -724,6 +747,26 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     (output_dir / "feature_quant" / "_SUCCESS").write_bytes(b"")
     pq.write_table(feature_quant, output_dir / "feature_quant.parquet")
 
+    # ── Wide gene × sample TSVs (human-facing) ───────────────────────
+    matrix_outputs: dict[str, str] = {}
+    if args.matrix_format != "none":
+        if args.matrix_format in ("count", "both"):
+            counts_matrix = build_gene_matrix(
+                feature_quant, annotation, genome, samples,
+                value="count", min_count=args.matrix_min_count,
+            )
+            counts_path = output_dir / "gene_counts.tsv"
+            counts_path.write_text(render_gene_matrix_tsv(counts_matrix))
+            matrix_outputs["gene_counts_tsv"] = str(counts_path)
+        if args.matrix_format in ("tpm", "both"):
+            tpm_matrix = build_gene_matrix(
+                feature_quant, annotation, genome, samples,
+                value="tpm", min_count=args.matrix_min_count,
+            )
+            tpm_path = output_dir / "gene_tpm.tsv"
+            tpm_path.write_text(render_gene_matrix_tsv(tpm_matrix))
+            matrix_outputs["gene_tpm_tsv"] = str(tpm_path)
+
     # ── Aggregate per-worker stats for the manifest ──────────────────
     if stage_outputs["stats"].shard_paths:
         stats_table = pa_dataset.dataset(
@@ -746,6 +789,7 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             "reads_without_sample": count_stats["reads_without_sample"],
             "unique_(gene,sample)_pairs": count_stats["unique_(gene,sample)_pairs"],
             "total_count": count_stats["total_count"],
+            "samples_normalised": count_stats.get("samples_normalised", 0),
         }
     )
 
@@ -761,6 +805,8 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             "min_mapq": args.min_mapq,
             "allow_antisense": args.allow_antisense,
             "min_overlap_fraction": args.min_overlap_fraction,
+            "matrix_format": args.matrix_format,
+            "matrix_min_count": args.matrix_min_count,
         },
         "stages": per_stage,
         "outputs": {
@@ -769,6 +815,7 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             "alignment_tags": str(stage_outputs["alignment_tags"].directory),
             "gene_assignments": str(stage_outputs["gene_assignments"].directory),
             "feature_quant": str(output_dir / "feature_quant.parquet"),
+            **matrix_outputs,
         },
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

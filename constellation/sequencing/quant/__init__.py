@@ -27,6 +27,10 @@ from constellation.sequencing.quant._kernels import (
     compute_gene_overlap,
     gene_set_from_annotation,
 )
+from constellation.sequencing.quant.gene_matrix import (
+    build_gene_matrix,
+    render_gene_matrix_tsv,
+)
 from constellation.sequencing.quant.genome_count import (
     count_reads_per_gene,
     fused_decode_filter_overlap_worker,
@@ -36,9 +40,11 @@ from constellation.sequencing.quant.genome_count import (
 __all__ = [
     "GENE_ASSIGNMENT_SCHEMA",
     "apply_filter_predicates",
+    "build_gene_matrix",
     "compute_gene_overlap",
-    "gene_set_from_annotation",
     "count_reads_per_gene",
     "fused_decode_filter_overlap_worker",
+    "gene_set_from_annotation",
+    "render_gene_matrix_tsv",
     "serialise_gene_set",
 ]

@@ -246,6 +246,68 @@ def test_count_reads_per_gene_rejects_unknown_sample_id() -> None:
         count_reads_per_gene(gene_assignments, read_demux, _samples())
 
 
+def test_count_reads_per_gene_populates_tpm_per_sample_sums_to_1e6() -> None:
+    """Each sample's TPM column sums to 1e6 (long-read depth-only formula)."""
+    gene_assignments = pa.Table.from_pylist(
+        [
+            {"alignment_id": i, "read_id": f"r{i}", "gene_id": gid, "overlap_fraction": 1.0}
+            for i, gid in enumerate(
+                # sample 1: 10 reads on gene 100, 30 reads on gene 200, 60 reads on gene 300
+                # sample 2: 70 reads on gene 100, 30 reads on gene 200
+                [100] * 10 + [200] * 30 + [300] * 60 + [100] * 70 + [200] * 30
+            )
+        ]
+    )
+    read_demux = pa.Table.from_pylist(
+        [{"read_id": f"r{i}", "sample_id": (1 if i < 100 else 2)} for i in range(200)]
+    )
+    quant, stats = count_reads_per_gene(gene_assignments, read_demux, _samples())
+
+    assert stats["samples_normalised"] == 2
+    by_sample: dict[int, float] = {}
+    for row in quant.to_pylist():
+        by_sample[row["sample_id"]] = by_sample.get(row["sample_id"], 0.0) + row["tpm"]
+    for sid, total in by_sample.items():
+        assert total == pytest.approx(1e6, rel=1e-6), (
+            f"sample {sid} TPMs sum to {total}, expected 1e6"
+        )
+
+    # Verify a specific TPM: gene 100 in sample 1 has 10/100 reads → 100_000 TPM
+    gene_100_sample_1 = next(
+        r for r in quant.to_pylist() if r["feature_id"] == 100 and r["sample_id"] == 1
+    )
+    assert gene_100_sample_1["tpm"] == pytest.approx(1e5)
+
+
+def test_count_reads_per_gene_tpm_no_length_dependence() -> None:
+    """Equal counts on different genes produce equal TPM regardless of any
+    notional gene length. Documents the long-read formula choice — the
+    function deliberately does not consult an Annotation for length."""
+    gene_assignments = pa.Table.from_pylist(
+        [
+            {"alignment_id": 0, "read_id": "r0", "gene_id": 100, "overlap_fraction": 1.0},
+            {"alignment_id": 1, "read_id": "r1", "gene_id": 200, "overlap_fraction": 1.0},
+        ]
+    )
+    read_demux = pa.Table.from_pylist(
+        [{"read_id": "r0", "sample_id": 1}, {"read_id": "r1", "sample_id": 1}]
+    )
+    quant, _ = count_reads_per_gene(gene_assignments, read_demux, _samples())
+    tpms = sorted(r["tpm"] for r in quant.to_pylist())
+    # Both genes have count=1, sample total=2 → TPM = 5e5 each
+    assert tpms == pytest.approx([5e5, 5e5])
+
+
+def test_count_reads_per_gene_cpm_left_null() -> None:
+    """`cpm` stays null per the long-read regime (CPM ≡ TPM here)."""
+    gene_assignments = pa.Table.from_pylist(
+        [{"alignment_id": 0, "read_id": "r0", "gene_id": 100, "overlap_fraction": 1.0}]
+    )
+    read_demux = pa.Table.from_pylist([{"read_id": "r0", "sample_id": 1}])
+    quant, _ = count_reads_per_gene(gene_assignments, read_demux, _samples())
+    assert quant.to_pylist()[0]["cpm"] is None
+
+
 def test_count_reads_per_gene_handles_empty_inputs() -> None:
     empty_assignments = pa.Table.from_pylist(
         [],
