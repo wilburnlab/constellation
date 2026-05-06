@@ -23,6 +23,8 @@ dependencies:
   # as modules are ported; workflows that need them gate via
   # `constellation doctor --workflow <name>`.
   - mmseqs2
+  - minimap2
+  - samtools
   - openjdk
   # NOTE: pysam, edlib, and parasail are installed via the
   # `[sequencing]` extra in the pip block below — bioconda's edlib has
