@@ -249,8 +249,30 @@ def test_build_gene_matrix_value_count_vs_tpm() -> None:
     tpms = build_gene_matrix(fq, annotation, genome, samples, value="tpm")
     counts_rows = {r["feature_id"]: r for r in counts.to_pylist()}
     tpms_rows = {r["feature_id"]: r for r in tpms.to_pylist()}
-    assert counts_rows[100]["alpha"] == 42.0
+    assert counts_rows[100]["alpha"] == 42
     assert tpms_rows[100]["alpha"] == 999.5
+
+
+def test_build_gene_matrix_count_sample_columns_are_int64() -> None:
+    """value='count' produces int64 sample columns (no spurious decimals)."""
+    genome = _make_genome()
+    annotation = _make_annotation()
+    samples = _make_samples()
+    fq = _make_feature_quant([{"feature_id": 100, "sample_id": 1, "count": 5, "tpm": 1e6}])
+    matrix = build_gene_matrix(fq, annotation, genome, samples, value="count")
+    assert matrix.schema.field("alpha").type == pa.int64()
+    assert matrix.schema.field("beta").type == pa.int64()
+
+
+def test_build_gene_matrix_tpm_sample_columns_are_float64() -> None:
+    """value='tpm' keeps float64 sample columns (TPM is genuinely fractional)."""
+    genome = _make_genome()
+    annotation = _make_annotation()
+    samples = _make_samples()
+    fq = _make_feature_quant([{"feature_id": 100, "sample_id": 1, "count": 5, "tpm": 1e6}])
+    matrix = build_gene_matrix(fq, annotation, genome, samples, value="tpm")
+    assert matrix.schema.field("alpha").type == pa.float64()
+    assert matrix.schema.field("beta").type == pa.float64()
 
 
 def test_build_gene_matrix_rejects_unknown_value() -> None:
@@ -307,18 +329,34 @@ def test_render_gene_matrix_tsv_header_row() -> None:
     assert cols[8:] == ["alpha", "beta"]
 
 
-def test_render_gene_matrix_tsv_float_format_applies_to_sample_cells() -> None:
-    """Sample columns use float_format; annotation columns use str()."""
+def test_render_gene_matrix_tsv_count_mode_renders_integers() -> None:
+    """Count-mode sample columns are int64 → renderer emits no decimal points."""
     genome = _make_genome()
     annotation = _make_annotation()
     samples = _make_samples()
     fq = _make_feature_quant([{"feature_id": 100, "sample_id": 1, "count": 7, "tpm": 1e6}])
-    matrix = build_gene_matrix(fq, annotation, genome, samples)
+    matrix = build_gene_matrix(fq, annotation, genome, samples, value="count")
     tsv = render_gene_matrix_tsv(matrix, float_format="%.2f")
     line_for_100 = next(ln for ln in tsv.splitlines() if ln.startswith("100\t"))
     cells = line_for_100.split("\t")
-    # cells[0..7] are annotation; cells[8] is alpha (count=7.00), cells[9] is beta (0.00)
-    assert cells[8] == "7.00"
+    # cells[0..7] are annotation; cells[8] is alpha (count=7), cells[9] is beta (0)
+    assert cells[8] == "7"
+    assert cells[9] == "0"
+
+
+def test_render_gene_matrix_tsv_tpm_mode_applies_float_format() -> None:
+    """TPM-mode sample columns are float64 → renderer uses float_format."""
+    genome = _make_genome()
+    annotation = _make_annotation()
+    samples = _make_samples()
+    fq = _make_feature_quant(
+        [{"feature_id": 100, "sample_id": 1, "count": 7, "tpm": 1234.5678}]
+    )
+    matrix = build_gene_matrix(fq, annotation, genome, samples, value="tpm")
+    tsv = render_gene_matrix_tsv(matrix, float_format="%.2f")
+    line_for_100 = next(ln for ln in tsv.splitlines() if ln.startswith("100\t"))
+    cells = line_for_100.split("\t")
+    assert cells[8] == "1234.57"
     assert cells[9] == "0.00"
 
 

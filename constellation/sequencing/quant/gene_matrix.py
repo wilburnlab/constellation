@@ -39,19 +39,6 @@ from constellation.sequencing.reference.reference import GenomeReference
 from constellation.sequencing.samples import Samples
 
 
-# Fixed annotation columns prepended to every gene row, in this order.
-_ANNOTATION_COLUMNS: tuple[str, ...] = (
-    "feature_id",
-    "gene_name",
-    "gene_biotype",
-    "contig",
-    "start",
-    "end",
-    "strand",
-    "length",
-)
-
-
 def _resolve_gene_name(name: str | None, attributes_json: str | None, feature_id: int) -> str:
     """Pick a display name: FEATURE_TABLE.name, then attributes_json's
     ``Name=`` (GFF3 standard), then ``f"gene_{feature_id}"`` fallback."""
@@ -184,19 +171,30 @@ def build_gene_matrix(
             f"count_reads_per_gene before building a {value!r} matrix"
         )
 
-    # Build (feature_id, sample_id) → value AND (feature_id) → total_count
+    # Build (feature_id, sample_id) → value AND (feature_id) → total_count.
+    # Counts are integer-valued by construction (group_by counts rows);
+    # cast to int so the wide matrix carries the right dtype and the TSV
+    # renderer doesn't print spurious decimal points.
+    is_count_mode = value == "count"
     fq_rows = fq.select(["feature_id", "sample_id", "count", value_col]).to_pylist()
-    cell_value: dict[tuple[int, int], float] = {}
+    cell_value: dict[tuple[int, int], int | float] = {}
     total_count: dict[int, float] = {}
     for row in fq_rows:
         fid_int = int(row["feature_id"])
         sid_int = int(row["sample_id"])
-        cell_value[(fid_int, sid_int)] = float(row[value_col]) if row[value_col] is not None else 0.0
+        v = row[value_col]
+        if v is None:
+            cell_value[(fid_int, sid_int)] = 0 if is_count_mode else 0.0
+        elif is_count_mode:
+            cell_value[(fid_int, sid_int)] = int(v)
+        else:
+            cell_value[(fid_int, sid_int)] = float(v)
         total_count[fid_int] = total_count.get(fid_int, 0.0) + (
             float(row["count"]) if row["count"] is not None else 0.0
         )
 
     # ── Compose wide rows in feature_id order, applying min_count filter
+    zero_cell: int | float = 0 if is_count_mode else 0.0
     out_rows: list[dict[str, object]] = []
     for fid_int in sorted(skeleton):
         if total_count.get(fid_int, 0.0) < min_count:
@@ -204,10 +202,12 @@ def build_gene_matrix(
         ann = skeleton[fid_int]
         row: dict[str, object] = dict(ann)
         for sid in sample_ids_sorted:
-            row[sid_to_name[sid]] = cell_value.get((fid_int, sid), 0.0)
+            row[sid_to_name[sid]] = cell_value.get((fid_int, sid), zero_cell)
         out_rows.append(row)
 
-    # ── Materialise as Arrow with explicit schema (deterministic dtypes)
+    # ── Materialise as Arrow with explicit schema (deterministic dtypes).
+    # Sample columns are int64 in count mode, float64 in TPM mode — the
+    # renderer dispatches on column dtype.
     fields: list[pa.Field] = [
         pa.field("feature_id", pa.int64(), nullable=False),
         pa.field("gene_name", pa.string(), nullable=False),
@@ -218,8 +218,9 @@ def build_gene_matrix(
         pa.field("strand", pa.string(), nullable=False),
         pa.field("length", pa.int64(), nullable=False),
     ]
+    sample_dtype = pa.int64() if is_count_mode else pa.float64()
     for col in sample_columns:
-        fields.append(pa.field(col, pa.float64(), nullable=False))
+        fields.append(pa.field(col, sample_dtype, nullable=False))
     schema = pa.schema(fields)
 
     if not out_rows:
@@ -234,14 +235,19 @@ def render_gene_matrix_tsv(
 ) -> str:
     """Render a wide gene matrix (output of :func:`build_gene_matrix`) to TSV.
 
-    Annotation columns (the leading non-numeric columns named in
-    :data:`_ANNOTATION_COLUMNS`) are rendered via ``str()``; trailing
-    numeric sample columns are rendered via ``float_format``. Empty
-    cells use the empty string. Header is the column names verbatim.
-    Includes a trailing newline.
+    Cell formatting dispatches on Arrow column dtype:
+
+      * integer columns (annotation ints + count-mode sample columns) →
+        ``str(int)`` — no spurious decimal points
+      * floating columns (tpm-mode sample columns) → ``float_format``
+      * string columns → unchanged
+      * null cells → empty string
+
+    Header is the column names verbatim. Includes a trailing newline.
     """
     columns = list(matrix.column_names)
-    annotation_set = set(_ANNOTATION_COLUMNS)
+    schema = matrix.schema
+    is_float_col = [pa.types.is_floating(schema.field(c).type) for c in columns]
 
     lines = ["\t".join(columns)]
     if matrix.num_rows == 0:
@@ -252,14 +258,14 @@ def render_gene_matrix_tsv(
     ]
     for i in range(matrix.num_rows):
         cells: list[str] = []
-        for c, col_values in zip(columns, column_data, strict=True):
+        for is_float, col_values in zip(is_float_col, column_data, strict=True):
             v = col_values[i]
             if v is None:
                 cells.append("")
-            elif c in annotation_set:
-                cells.append(str(v))
-            else:
+            elif is_float:
                 cells.append(float_format % float(v))
+            else:
+                cells.append(str(v))
         lines.append("\t".join(cells))
     return "\n".join(lines) + "\n"
 
