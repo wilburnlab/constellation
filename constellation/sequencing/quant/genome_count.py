@@ -46,6 +46,7 @@ from constellation.sequencing.readers.sam_bam import read_bam_alignments_chunk
 from constellation.sequencing.samples import Samples
 from constellation.sequencing.schemas.alignment import (
     ALIGNMENT_BLOCK_TABLE,
+    ALIGNMENT_CS_TABLE,
     ALIGNMENT_TABLE,
     ALIGNMENT_TAG_TABLE,
 )
@@ -299,6 +300,7 @@ def fused_decode_filter_overlap_worker(
     acquisition_id: int = 0,
     tags_to_keep: tuple[str, ...] = (),
     emit_blocks: bool = False,
+    emit_cs: bool = False,
     intron_min_bp: int = 25,
 ) -> dict[str, pa.Table]:
     """Per-chunk pipeline worker.
@@ -322,12 +324,20 @@ def fused_decode_filter_overlap_worker(
     ``alignment_blocks``. The transparently-added cs tag is stripped
     from the returned ``alignment_tags`` shard so the on-disk tag
     table stays the size the user asked for.
+
+    With ``emit_cs=True`` the worker additionally emits a sixth shard
+    ``alignment_cs`` (``ALIGNMENT_CS_TABLE``) preserving the per-alignment
+    cs:long string. Required by Phase 2 ``--build-consensus`` for
+    base-resolution PWM accumulation. Implies the cs tag will be
+    captured even when ``emit_blocks=False``; the user-visible
+    ``alignment_tags`` shard is still stripped of the worker-internal
+    cs row when the user did not explicitly request it via ``tags_to_keep``.
     """
     bam_path_str, vo_start, n_records, worker_idx = chunk_spec
     bam_path = Path(bam_path_str)
 
     user_tags = frozenset(tags_to_keep)
-    cs_added = emit_blocks and "cs" not in user_tags
+    cs_added = (emit_blocks or emit_cs) and "cs" not in user_tags
     effective_tags = (
         tags_to_keep + ("cs",) if cs_added else tags_to_keep
     )
@@ -352,12 +362,17 @@ def fused_decode_filter_overlap_worker(
         chunk_tags = chunk_tags.filter(tag_mask)
 
     # Block extraction reads cs out of the (possibly augmented) tag set
-    # before we drop the worker-internal cs rows.
+    # before we drop the worker-internal cs rows. Same source for the
+    # cs sidecar shard.
     blocks_table: pa.Table | None = None
     if emit_blocks:
         blocks_table = extract_alignment_blocks(
             filtered, chunk_tags, intron_min_bp=intron_min_bp
         )
+
+    cs_table: pa.Table | None = None
+    if emit_cs:
+        cs_table = extract_alignment_cs(filtered, chunk_tags)
 
     if cs_added and chunk_tags.num_rows > 0:
         # Strip the worker-internal cs rows from the user-visible shard.
@@ -378,6 +393,8 @@ def fused_decode_filter_overlap_worker(
     }
     if blocks_table is not None:
         stats_row["n_blocks"] = int(blocks_table.num_rows)
+    if cs_table is not None:
+        stats_row["n_cs"] = int(cs_table.num_rows)
     stats_table = pa.Table.from_pylist([stats_row])
 
     # Cast filtered shards to schema for partitioned-parquet uniformity.
@@ -394,7 +411,41 @@ def fused_decode_filter_overlap_worker(
     }
     if blocks_table is not None:
         out["alignment_blocks"] = blocks_table
+    if cs_table is not None:
+        out["alignment_cs"] = cs_table
     return out
+
+
+def extract_alignment_cs(
+    alignments: pa.Table, tags: pa.Table
+) -> pa.Table:
+    """Pull the cs tag rows out of a tag shard into ``ALIGNMENT_CS_TABLE``.
+
+    Only emits rows for alignments that survived filtering (i.e. appear
+    in ``alignments``). Returns an empty schema-shaped table when no cs
+    rows are present.
+    """
+    if tags.num_rows == 0 or alignments.num_rows == 0:
+        return ALIGNMENT_CS_TABLE.empty_table()
+    cs_mask = pc.equal(tags.column("tag"), "cs")
+    cs_rows = tags.filter(cs_mask)
+    if cs_rows.num_rows == 0:
+        return ALIGNMENT_CS_TABLE.empty_table()
+    # Restrict to alignment_ids present in the surviving set.
+    keep_mask = pc.is_in(
+        cs_rows.column("alignment_id"),
+        value_set=alignments.column("alignment_id"),
+    )
+    cs_rows = cs_rows.filter(keep_mask)
+    if cs_rows.num_rows == 0:
+        return ALIGNMENT_CS_TABLE.empty_table()
+    return pa.table(
+        {
+            "alignment_id": cs_rows.column("alignment_id"),
+            "cs_string": cs_rows.column("value"),
+        },
+        schema=ALIGNMENT_CS_TABLE,
+    )
 
 
 def serialise_gene_set(gene_set: pa.Table) -> bytes:
@@ -411,6 +462,7 @@ def serialise_gene_set(gene_set: pa.Table) -> bytes:
 __all__ = [
     "count_reads_per_gene",
     "extract_alignment_blocks",
+    "extract_alignment_cs",
     "fused_decode_filter_overlap_worker",
     "serialise_gene_set",
 ]

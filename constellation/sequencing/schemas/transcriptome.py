@@ -15,12 +15,22 @@ consensus transcripts:
         is what clustering / consensus / ORF prediction consumes.
 
     TRANSCRIPT_CLUSTER_TABLE
-        Output of mmseqs-style kmer clustering with abundance-weighted
-        consensus building. One row per cluster with the consensus
-        sequence and predicted ORF / protein.
+        Output of clustering — both Phase 2 genome-guided
+        (fingerprint-keyed, splicing-topology-resolved) and Phase 3
+        de novo (kmer-minimizer + abundance-weighted greedy
+        set-cover) populate the same row shape. The ``mode``
+        discriminator says which produced a row; mode-specific
+        columns are nullable on the other mode's rows.
+
+    CLUSTER_MEMBERSHIP_TABLE
+        Long-form (cluster_id, read_id, role, score-columns) — one
+        row per (cluster, member-read) edge. Role-tagged so callers
+        can distinguish the representative read, ordinary members,
+        Layer-0-deduplicated duplicates, and drift-filtered reads
+        retained for cross-validation.
 
 These schemas are sequencing-specific (no ≥2-modality bar to clear) so
-they live here rather than in core. All three self-register so cast /
+they live here rather than in core. All four self-register so cast /
 metadata helpers in core.io.schemas work uniformly.
 """
 
@@ -117,24 +127,36 @@ READ_DEMUX_TABLE: pa.Schema = pa.schema(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Consensus clusters (output of `transcriptome.cluster` + `consensus`)
+# Consensus clusters (output of `transcriptome.cluster_genome` (Phase 2)
+# and `transcriptome.cluster_denovo` (Phase 3))
 # ──────────────────────────────────────────────────────────────────────
 
 
+# Mode-agnostic cluster row. Phase 2 (genome-guided) populates the
+# splicing-topology columns (contig_id, strand, span_start/end,
+# fingerprint_hash) and leaves consensus / ORF columns null unless
+# `--build-consensus` is set. Phase 3 (de novo) populates
+# identity_threshold + consensus_sequence + ORF fields and leaves the
+# splicing-topology columns null. The ``mode`` enum is the row-level
+# discriminator; downstream consumers filter on it.
 TRANSCRIPT_CLUSTER_TABLE: pa.Schema = pa.schema(
     [
         pa.field("cluster_id", pa.int64(), nullable=False),
-        # Reference / centroid read for the cluster (highest-quality member)
+        # Reference read for the cluster — most-abundant unique trimmed
+        # transcript window (Layer-0 derep), tiebreak by mean
+        # dorado_quality. Always populated.
         pa.field("representative_read_id", pa.string(), nullable=False),
         pa.field("n_reads", pa.int32(), nullable=False),
         # mmseqs-style sequence identity threshold the cluster was
-        # formed at (e.g. 0.85)
+        # formed at (e.g. 0.85). Phase 3 only.
         pa.field("identity_threshold", pa.float32(), nullable=True),
-        # Consensus nucleotide sequence (post-error-correction)
-        pa.field("consensus_sequence", pa.string(), nullable=False),
+        # Consensus nucleotide sequence (post-error-correction). Phase 3
+        # always populates; Phase 2 populates only when
+        # `--build-consensus` is set.
+        pa.field("consensus_sequence", pa.string(), nullable=True),
         # Best ORF detected on the consensus; null if no ORF passes
-        # length / start-codon filters. Predicted protein in IUPAC
-        # one-letter
+        # length / start-codon filters, or when consensus_sequence is
+        # null. Predicted protein in IUPAC one-letter.
         pa.field("predicted_protein", pa.string(), nullable=True),
         pa.field("orf_start", pa.int32(), nullable=True),
         pa.field("orf_end", pa.int32(), nullable=True),
@@ -142,18 +164,76 @@ TRANSCRIPT_CLUSTER_TABLE: pa.Schema = pa.schema(
         pa.field("orf_strand", pa.string(), nullable=True),
         # 1 (Standard) | 2 (Vertebrate Mito) | ... — NCBI transl_table
         pa.field("codon_table", pa.int32(), nullable=True),
+        # 'genome-guided' | 'de-novo'
+        pa.field("mode", pa.string(), nullable=False),
+        # Splicing-topology columns — Phase 2 (genome-guided) only.
+        pa.field("contig_id", pa.int64(), nullable=True),
+        pa.field("strand", pa.string(), nullable=True),
+        # Span on the genome coord frame; first block.ref_start ..
+        # last block.ref_end across the cluster's representative read.
+        pa.field("span_start", pa.int64(), nullable=True),
+        pa.field("span_end", pa.int64(), nullable=True),
+        # The cluster key in genome-guided mode. FK→READ_FINGERPRINT_TABLE.
+        pa.field("fingerprint_hash", pa.uint64(), nullable=True),
+        # Layer-0 dedup depth — number of distinct trimmed transcript
+        # windows observed across the cluster's members. 1 means the
+        # cluster collapses to a single unique sequence; >1 reflects
+        # within-cluster substitution noise. Always populated.
+        pa.field("n_unique_sequences", pa.int32(), nullable=False),
+        # Populated only when `--per-sample-clusters` opts into
+        # per-sample cluster assignment. Null = cluster spans samples.
+        pa.field("sample_id", pa.int64(), nullable=True),
     ],
     metadata={b"schema_name": b"TranscriptClusterTable"},
+)
+
+
+# Long-form (cluster_id, read_id) edges with role + multi-parameter
+# fit-to-cluster diagnostics. Drift_5p_bp / drift_3p_bp are signed
+# bp distances from the cluster's median 5'/3' span (strand-aware:
+# on +, 5' = span_start; on -, 5' = span_end). match_rate / indel_rate
+# are derived from cs:long-populated n_match/n_mismatch/n_insert/
+# n_delete in ALIGNMENT_BLOCK_TABLE — null when cs:long was not
+# captured upstream. Combined, downstream consumers can build any
+# weighted goodness-of-fit function (e.g. score = 0.4*match_rate +
+# 0.3*(1 - drift_5p/max_5p) + 0.3*(1 - drift_3p/max_3p)) without
+# recomputing from raw alignments.
+CLUSTER_MEMBERSHIP_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("cluster_id", pa.int64(), nullable=False),
+        pa.field("read_id", pa.string(), nullable=False),
+        # 'representative' | 'member' | 'duplicate' | 'drift_filtered'
+        # 'duplicate' = Layer-0-deduplicated to the same trimmed window
+        # as another member; 'drift_filtered' = retained but dropped
+        # from cluster summary statistics by the 5'/3' drift filter.
+        pa.field("role", pa.string(), nullable=False),
+        # Signed bp distance from cluster median 5'/3' span; null on
+        # representative / duplicate / singleton rows where there's no
+        # comparison cohort.
+        pa.field("drift_5p_bp", pa.int32(), nullable=True),
+        pa.field("drift_3p_bp", pa.int32(), nullable=True),
+        # n_match / (n_match + n_mismatch); null when cs:long absent.
+        pa.field("match_rate", pa.float32(), nullable=True),
+        # (n_insert + n_delete) / (n_match + n_mismatch + n_insert +
+        # n_delete); null when cs:long absent.
+        pa.field("indel_rate", pa.float32(), nullable=True),
+        # n_match + n_mismatch + n_insert + n_delete summed across the
+        # primary alignment's blocks. Always populated (CIGAR-derived).
+        pa.field("n_aligned_bp", pa.int32(), nullable=False),
+    ],
+    metadata={b"schema_name": b"ClusterMembershipTable"},
 )
 
 
 register_schema("ReadSegmentTable", READ_SEGMENT_TABLE)
 register_schema("ReadDemuxTable", READ_DEMUX_TABLE)
 register_schema("TranscriptClusterTable", TRANSCRIPT_CLUSTER_TABLE)
+register_schema("ClusterMembershipTable", CLUSTER_MEMBERSHIP_TABLE)
 
 
 __all__ = [
     "READ_SEGMENT_TABLE",
     "READ_DEMUX_TABLE",
     "TRANSCRIPT_CLUSTER_TABLE",
+    "CLUSTER_MEMBERSHIP_TABLE",
 ]

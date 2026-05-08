@@ -175,11 +175,29 @@ READ_FINGERPRINT_TABLE: pa.Schema = pa.schema(
 )
 
 
+# Sidecar to ALIGNMENT_TABLE keyed on alignment_id. minimap2's cs:long
+# tag is the per-base substitution / indel record needed for downstream
+# weighted-PWM consensus building (Phase 2's `--build-consensus` and
+# Phase 3's de novo final stage). Phase 1's worker captures cs from the
+# BAM stream when computing ALIGNMENT_BLOCK_TABLE; without this sidecar
+# the cs string is consumed and dropped. Off by default behind the
+# `transcriptome align --emit-cs-tags` toggle — small additional shard
+# write, no change to the existing fast path.
+ALIGNMENT_CS_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("alignment_id", pa.int64(), nullable=False),
+        pa.field("cs_string", pa.string(), nullable=False),
+    ],
+    metadata={b"schema_name": b"AlignmentCsTable"},
+)
+
+
 register_schema("AlignmentTable", ALIGNMENT_TABLE)
 register_schema("AlignmentTagTable", ALIGNMENT_TAG_TABLE)
 register_schema("AlignmentBlockTable", ALIGNMENT_BLOCK_TABLE)
 register_schema("SpliceJunctionTable", SPLICE_JUNCTION_TABLE)
 register_schema("ReadFingerprintTable", READ_FINGERPRINT_TABLE)
+register_schema("AlignmentCsTable", ALIGNMENT_CS_TABLE)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -208,5 +226,6 @@ __all__ = [
     "ALIGNMENT_BLOCK_TABLE",
     "SPLICE_JUNCTION_TABLE",
     "READ_FINGERPRINT_TABLE",
+    "ALIGNMENT_CS_TABLE",
     "cigar_to_ops",
 ]

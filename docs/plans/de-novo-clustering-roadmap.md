@@ -1,5 +1,12 @@
 # De novo transcriptome clustering — sequencing the path through validation infrastructure
 
+## Status
+
+- **Phase 1** — SHIPPED at `4ed4638` ("S2 align: per-block + junction + fingerprint + pile-up emit-* toggles"). All three schemas, the CIGAR/cs:long parsers, the pile-up / junction / fingerprint producers, and the six `transcriptome align` CLI flags are live.
+- **Phase 2** — SHIPPED. Genome-guided fingerprint clustering (`transcriptome cluster --mode genome-guided`) is wired with strand-aware drift filtering, Layer-0 sequence dereplication for representative selection, multi-parameter per-membership fit-to-cluster scores (signed 5'/3' drift bp + cs:long-derived match_rate / indel_rate / n_aligned_bp), and an optional `--build-consensus` path through the new shared `align/consensus.py` torch-PWM kernel. Phase 1 retrofit: `--emit-cs-tags` toggle preserves cs:long sidecar (`alignment_cs/`). Architectural shift: fingerprints are derived fresh from `alignment_blocks/` at clustering time, so `--intron-quantum-bp` is a *clustering* parameter — sweeping it never requires re-running align.
+- **Phase 3** — pending. Torch-first Layer 0 + Layer 1 (dereplication + error-removal kmer-minimizer + abundance-weighted greedy set-cover). Reuses `align/consensus.py` for the centroid-anchored final consensus stage.
+- **Phase 4** — pending. Cross-validation harness comparing Phase 3 against Phase 2 ground truth.
+
 ## Context
 
 S2 Mode A (`transcriptome align`) ships gene-level counting via genome-guided alignment, and on real mouse-testis cDNA the top hits track expected sperm markers (PRM1/PRM2, ODF2, CRISP, SPACA17). The next major step is the de novo transcriptome clustering algorithm specified in `~/WilburnLab/Nanopore/NanoporeAnalysis/clustering_roadmap_C260316.md` — a kmer-minimizer + abundance-weighted greedy set-cover replacement for mmseqs2 `linclust` that scales to PromethION-size datasets and avoids the overclustering / opacity problems the roadmap calls out.
@@ -19,13 +26,13 @@ The same pile-up + alignment-block infrastructure also serves the Mode-B-adjacen
 
 ---
 
-## Phase 1 — Genome-guided alignment intermediates (power-user toggles)
+## Phase 1 — Genome-guided alignment intermediates (SHIPPED)
 
-Goal: lift the data already implicit in the sorted BAM into addressable Arrow tables, behind off-by-default CLI flags. None of these change the default `transcriptome align` cost path.
+Lifted the data already implicit in the sorted BAM into addressable Arrow tables, behind off-by-default CLI flags. None of these changed the default `transcriptome align` cost path. Shipped at `4ed4638`.
 
-### 1.1 New schema: `ALIGNMENT_BLOCK_TABLE`
+### 1.1 Schema: `ALIGNMENT_BLOCK_TABLE`
 
-One row per CIGAR-derived alignment block (a "block" = a contiguous M/=/X run between N or large I/D operations — i.e. one exon's worth of alignment).
+One row per CIGAR-derived alignment block (a "block" = a contiguous M/=/X run between N or large I/D operations — i.e. one exon's worth of alignment). Lives in [constellation/sequencing/schemas/alignment.py:112](constellation/sequencing/schemas/alignment.py#L112).
 
 ```
 alignment_id   int64   FK→ALIGNMENT_TABLE
@@ -41,11 +48,11 @@ n_insert       int32   query bases inserted relative to ref within this block
 n_delete       int32   short deletions consumed within this block
 ```
 
-Place in `constellation/sequencing/schemas/alignment.py` next to `ALIGNMENT_TABLE`. Self-register via `core.io.schemas.register_schema`.
+Self-registered alongside `ALIGNMENT_TABLE` via `core.io.schemas.register_schema`.
 
-### 1.2 New schema: `SPLICE_JUNCTION_TABLE`
+### 1.2 Schema: `SPLICE_JUNCTION_TABLE`
 
-Aggregated per (contig, donor, acceptor, strand). Produced by reduction over `ALIGNMENT_BLOCK_TABLE`.
+Aggregated per (contig, donor, acceptor, strand). Produced by reduction over `ALIGNMENT_BLOCK_TABLE`. Lives in [constellation/sequencing/schemas/alignment.py:137](constellation/sequencing/schemas/alignment.py#L137).
 
 **Why aggregate introns rather than exons.** Splice sites are *steep* — most reads spliced through the same intron produce near-identical (donor, acceptor) coordinates because the spliceosome is dinucleotide-anchored on canonical GT...AG. They're not strictly *discrete*: cryptic splice-site usage (the spliceosome picking a wrong-but-canonical GT/AG nearby) does happen and produces small excursions on otherwise-fixed coordinates, and that's a feature we want to preserve in the data — not collapse — so we can spot anomalous excursion rates as a basecaller / library-prep / spliceosome-fidelity diagnostic. Exons in long-read RNA-seq have one steep side (the splice-site end) and one genuinely fuzzy side on terminal exons (TSS / SSP-priming on the first exon, polyA on the last), so cross-read exon aggregation requires fuzzy matching on those terminal boundaries. Aggregating on the steeper primitive keeps the reduction exact and the table small (O(50k) rows for a mammalian genome). The Phase 2 fingerprint's `--intron-quantum-bp` knob (default 10) absorbs *small* cryptic excursions into the same fingerprint bucket while leaving larger excursions to surface as real cluster-discordance signal in Phase 4. The per-read exon view already lives in `ALIGNMENT_BLOCK_TABLE`; the cross-read junction view here provides the canonical key for "do these reads describe the same internal splicing topology" (Phase 2's fingerprint hash IS the canonicalised junction sequence). Junction aggregation also matches every existing long-read RNA-seq toolchain (minimap2 SJ, STAR SJ.out.tab, HISAT2/TopHat), so downstream interop is one-step. **Cross-read exon aggregation** (a `CANDIDATE_EXON_TABLE`) becomes useful for genuine exon discovery in un-annotated genomes — derived as the intron-complement of the junction table plus pile-up edge detection on terminal exons. That's Layer 3 / gene-structure inference, deferred per the plan; both Phase 1 inputs (junctions + pile-up) are already in hand when we get there.
 
@@ -63,15 +70,15 @@ annotated          bool    true iff matches a FEATURE_TABLE intron
 gene_id            int64   nullable; populated when intersect with annotation
 ```
 
-### 1.3 Pile-up — populate the existing `COVERAGE_TABLE`
+### 1.3 Pile-up — populates `COVERAGE_TABLE`
 
-Schema is already shipped (`/constellation/sequencing/schemas/quant.py`). It currently has no producer because S2 Mode A was scoped tight to "demux → align → gene counts" and pile-up landed in the schema layer (alongside the assembly schemas) in anticipation of downstream work that never wired through. The CIGAR string preserved in ALIGNMENT_TABLE has always made pile-up *derivable* from the shipped output — Phase 1.6 just builds the producer. RLE-compressed (one row per interval of constant depth) keeps the on-disk size manageable on mammalian-scale genomes with long-read data.
+The pre-existing `COVERAGE_TABLE` schema in `constellation/sequencing/schemas/quant.py` had no producer until Phase 1; it landed in the schema layer (alongside the assembly schemas) in anticipation of downstream work that never wired through. The CIGAR string preserved in ALIGNMENT_TABLE has always made pile-up *derivable* from the shipped output — Phase 1.6 built the producer. RLE-compressed (one row per interval of constant depth) keeps the on-disk size manageable on mammalian-scale genomes with long-read data.
 
-**Default-on vs default-off.** The plan currently defaults all `--emit-*` flags to off so existing `transcriptome align` invocations have unchanged wall-clock + output size. The argument for default-on: pile-up + junctions are cheap incremental cost over an already-running align stage, and surface high-value diagnostics (depth uniformity, basecaller-drift junction motifs, sex-det loci candidates) for free on every run. The argument for default-off: changing default cost / output footprint of a shipped command without explicit buy-in is wrong, especially for users on cluster nodes with disk quotas. Plan defaults off; flag polarity flips trivially if you prefer the other call.
+**Default-on vs default-off (shipped: off).** All `--emit-*` flags default to off so existing `transcriptome align` invocations have unchanged wall-clock + output size. The argument for default-on: pile-up + junctions are cheap incremental cost over an already-running align stage, and surface high-value diagnostics (depth uniformity, basecaller-drift junction motifs, sex-det loci candidates) for free on every run. The argument for default-off: changing default cost / output footprint of a shipped command without explicit buy-in is wrong, especially for users on cluster nodes with disk quotas. Defaults off; flag polarity flips trivially if you prefer the other call.
 
-### 1.4 New schema: `READ_FINGERPRINT_TABLE`
+### 1.4 Schema: `READ_FINGERPRINT_TABLE`
 
-Per-read, primary-alignment-only, derived from `ALIGNMENT_BLOCK_TABLE`. The cluster key for Phase 2.
+Per-read, primary-alignment-only, derived from `ALIGNMENT_BLOCK_TABLE`. The cluster key for Phase 2. Lives in [constellation/sequencing/schemas/alignment.py:163](constellation/sequencing/schemas/alignment.py#L163).
 
 ```
 read_id            string  FK
@@ -88,35 +95,35 @@ junction_signature string  human-readable form: 'chrN:donor1-acceptor1,...'
                             for diagnostics; not the cluster key
 ```
 
-### 1.5 New module: `constellation/sequencing/align/cigar.py`
+### 1.5 Module: `constellation/sequencing/align/cigar.py`
 
-Pure-Python parsers operating per-alignment (per-record cost is tiny; vectorisation buys nothing here). Returns Arrow tables, not pandas / numpy.
+Pure-Python parsers operating per-alignment (per-record cost is tiny; vectorisation buys nothing here). Returns Arrow tables, not pandas / numpy. Lives in [constellation/sequencing/align/cigar.py](constellation/sequencing/align/cigar.py).
 
-- `parse_cigar_blocks(cigar_string: str, ref_start: int, query_start: int = 0) -> list[Block]` — splits on N (and on I/D longer than `intron_min_bp`, default 25). Returns block records.
-- `parse_cs_long(cs: str) -> CsRunStream` — yields (op, length, ref_consumed, query_consumed, n_match, n_mismatch). Used to populate `n_match`/`n_mismatch` on each block.
-- `blocks_to_junctions(blocks)` — adjacent-block reduction into junction tuples.
+- `parse_cigar_blocks(cigar_string, ref_start, query_start=0)` at [cigar.py:86](constellation/sequencing/align/cigar.py#L86) — splits on N (and on I/D longer than `intron_min_bp`, default 25). Returns block records.
+- `parse_cs_long_blocks(cs, ...)` at [cigar.py:230](constellation/sequencing/align/cigar.py#L230) — state-machine parser for the `cs:long` grammar; populates `n_match`/`n_mismatch` per block. (Renamed from the planned `parse_cs_long` to reflect that it emits blocks directly rather than a run stream — naming converges with the CIGAR-side helper.)
+- Worker-layer block extraction lives at [constellation/sequencing/quant/genome_count.py:197](constellation/sequencing/quant/genome_count.py#L197) (`extract_alignment_blocks`), which transparently captures the cs tag when needed and strips it from the user-visible tag table.
 
-Pyarrow is the canonical output format; do not vendor numpy or pandas at this seam.
+Pyarrow is the canonical output format; numpy/pandas are not at this seam.
 
-### 1.6 New module: `constellation/sequencing/quant/coverage.py`
+### 1.6 Module: `constellation/sequencing/quant/coverage.py`
 
-`build_pileup(alignment_blocks: pa.Table, *, contigs: pa.Table, samples: Samples | None = None) -> pa.Table`
+`build_pileup(alignment_blocks: pa.Table, *, contigs: pa.Table, samples: Samples | None = None) -> pa.Table` at [coverage.py:49](constellation/sequencing/quant/coverage.py#L49).
 
 Sweep-line over sorted block intervals, RLE-encoded depth output matching `COVERAGE_TABLE`. Per-sample stratification optional via the `samples` arg (joins gene_assignments → sample_id like `count_reads_per_gene` already does). When stratification is on, emits one (contig, sample) panel per sample; when off, sums across samples.
 
 Memory budget at 200M reads ≈ 600M blocks × ~40 B ≈ ~25 GB if materialised; therefore `build_pileup` accepts a `pa.dataset.Dataset` and streams via `to_batches(...)` rather than `to_table()`. Output stays bounded (≤ contig-length rows per contig in the worst case).
 
-### 1.7 New module: `constellation/sequencing/quant/junctions.py`
+### 1.7 Module: `constellation/sequencing/quant/junctions.py`
 
-`aggregate_junctions(alignment_blocks: pa.Table, genome: GenomeReference, annotation: Annotation | None = None) -> pa.Table` — the SPLICE_JUNCTION_TABLE producer. Annotation arg is optional so the same code runs against assembled genomes without an annotation pass yet.
+`aggregate_junctions(alignment_blocks: pa.Table, genome: GenomeReference, annotation: Annotation | None = None) -> pa.Table` at [junctions.py:121](constellation/sequencing/quant/junctions.py#L121) — the SPLICE_JUNCTION_TABLE producer. Annotation arg is optional so the same code runs against assembled genomes without an annotation pass yet. Strand-naive +-strand motif lookup keys off `genome` at donor[0:2] / acceptor[-2:].
 
-### 1.8 New module: `constellation/sequencing/transcriptome/fingerprints.py`
+### 1.8 Module: `constellation/sequencing/transcriptome/fingerprints.py`
 
-`compute_read_fingerprints(alignment_blocks: pa.Table, *, intron_quantum_bp: int = 10) -> pa.Table` — produces `READ_FINGERPRINT_TABLE`. Fingerprint hash is `xxhash64` over the canonical tuple `(contig_id, strand, ((donor//q)*q, (acceptor//q)*q for each junction))` — Python's `hashlib.blake2b` is acceptable if we want to stay inside the stdlib. Primary alignments only; secondary/supplementary excluded by `is_secondary == False & is_supplementary == False`.
+`compute_read_fingerprints(alignment_blocks: pa.Table, *, intron_quantum_bp: int = 10) -> pa.Table` at [fingerprints.py:75](constellation/sequencing/transcriptome/fingerprints.py#L75) — produces `READ_FINGERPRINT_TABLE`. Fingerprint hash uses Python's stdlib `hashlib.blake2b` over the canonical tuple `(contig_id, strand, ((donor//q)*q, (acceptor//q)*q for each junction))`. Primary alignments only; secondary/supplementary excluded by `is_secondary == False & is_supplementary == False`.
 
 ### 1.9 CLI surface — `transcriptome align` flags
 
-All three intermediates are off by default. On a typical user's run, S2 stays exactly as fast as it is today.
+All three intermediates are off by default. Wired in [constellation/cli/__main__.py](constellation/cli/__main__.py). On a typical user's run, S2 stays exactly as fast as it is today.
 
 ```
 --emit-blocks       Write alignment_blocks/ partitioned dataset.
@@ -132,13 +139,33 @@ All three intermediates are off by default. On a typical user's run, S2 stays ex
 --intron-quantum-bp INT  Default 10; fingerprint quantisation.
 ```
 
-Wire the block extraction inside `fused_decode_filter_overlap_worker` (gated on `--emit-blocks`), so block-level data flows out of the same stream the gene-overlap pass walks. Aggregations (junctions, fingerprints, pile-up) run in the resolve stage as Arrow-dataset reductions over `alignment_blocks/`.
+Block extraction wired inside `fused_decode_filter_overlap_worker` (gated on `emit_blocks` kwarg), so block-level data flows out of the same stream the gene-overlap pass walks. Aggregations (junctions, fingerprints, pile-up) run in the resolve stage as Arrow-dataset reductions over `alignment_blocks/`. Each worker writes a fifth `alignment_blocks/` partitioned shard alongside the existing `alignments/`, `alignment_tags/`, `gene_assignments/`, `stats/`.
+
+### Phase 1 verification
+
+End-to-end exercise of the shipped flags (assumes an S1 demux output dir and a reference root):
+
+```
+constellation transcriptome align \
+    --demux-dir s1_out/ \
+    --reference ref/ \
+    --samples samples.tsv \
+    --output-dir s2_out/ \
+    --emit-blocks --emit-pileup --emit-junctions --emit-fingerprints \
+    --intron-min-bp 25 --intron-quantum-bp 10
+# Expected outputs alongside the existing feature_quant/:
+#   alignment_blocks/  coverage.parquet  junctions.parquet  read_fingerprints.parquet
+```
+
+Unit + integration tests covering the schemas, CIGAR/cs:long parsers, junction aggregation, and fingerprint stability live under [tests/test_align_cigar.py](tests/test_align_cigar.py), [tests/test_quant_coverage.py](tests/test_quant_coverage.py), [tests/test_quant_junctions.py](tests/test_quant_junctions.py), [tests/test_transcriptome_fingerprints.py](tests/test_transcriptome_fingerprints.py), and [tests/test_alignments_container.py](tests/test_alignments_container.py). `pytest tests/test_imports.py` exercises the new modules' import paths.
 
 ---
 
-## Phase 2 — Genome-guided clustering as a validation tool
+## Phase 2 — Genome-guided clustering as a validation tool (SHIPPED)
 
 Goal: ship a working `transcriptome cluster --mode genome-guided` that consumes Phase 1's outputs and emits a `TRANSCRIPT_CLUSTER_TABLE`. This is itself a useful end-user feature (people who have a genome already get cleanly clustered isoforms today), and it generates the ground-truth labels Phase 4 measures de novo against.
+
+**Shipped behaviour (vs the design below):** the architecture moved fingerprint *generation* from align to cluster — clustering reads `alignment_blocks/` directly and calls `compute_read_fingerprints` at startup with the user's `--intron-quantum-bp`. Phase 1's `read_fingerprints.parquet` (still emitted by `--emit-fingerprints`) is now an optional power-user diagnostic artifact, NOT a cluster input. The Phase 1 retrofit added `--emit-cs-tags` (writes a sixth `alignment_cs/` partitioned shard) which `--build-consensus` requires; the consensus kernel walks cs:long in lockstep with `alignment_blocks` to project base-resolution votes onto the genome window via `torch.scatter_add_`. The `score` field on `CLUSTER_MEMBERSHIP_TABLE` was unrolled into four explicit columns (signed `drift_5p_bp` / `drift_3p_bp` from cluster median + cs:long-derived `match_rate` / `indel_rate` + always-populated `n_aligned_bp`) so downstream consumers can build any weighted goodness-of-fit on top without recomputing from raw alignments. Cluster-pair merge for subset-junction-noise (§2.1 step 5) is deferred per the original plan; Phase 4 empirical signal will guide whether to wire it.
 
 ### 2.1 Algorithm
 

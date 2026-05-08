@@ -368,6 +368,16 @@ def _build_transcriptome_parser(subs) -> None:
         ),
     )
     p_aln.add_argument(
+        "--emit-cs-tags",
+        action="store_true",
+        help=(
+            "write alignment_cs/ partitioned dataset preserving "
+            "minimap2's cs:long string per alignment. Required by "
+            "Phase 2 'transcriptome cluster --build-consensus' for "
+            "base-resolution PWM accumulation. Implies --emit-blocks."
+        ),
+    )
+    p_aln.add_argument(
         "--intron-min-bp",
         type=int,
         default=25,
@@ -393,12 +403,142 @@ def _build_transcriptome_parser(subs) -> None:
     p_aln.add_argument("--progress", action="store_true")
     p_aln.set_defaults(func=_cmd_transcriptome_align)
 
-    # Cluster reserved for S4 (Mode B de novo)
+    # ── Cluster (Phase 2 genome-guided shipped; --mode de-novo TBD) ──
     p_cluster = tx_subs.add_parser(
         "cluster",
-        help="abundance-weighted clustering + consensus + ORF (S4 — TODO)",
+        help=(
+            "group reads into transcript / isoform clusters. "
+            "Phase 2 --mode genome-guided is wired; --mode de-novo "
+            "(Phase 3) and --mode validate (Phase 4) reserved."
+        ),
     )
-    p_cluster.set_defaults(func=_cmd_not_wired("transcriptome cluster"))
+    p_cluster.add_argument(
+        "--align-dir",
+        required=True,
+        help=(
+            "directory produced by `transcriptome align --emit-blocks` "
+            "(must contain alignments/ + alignment_blocks/)."
+        ),
+    )
+    p_cluster.add_argument(
+        "--demux-dir",
+        required=True,
+        help="S1 demux output dir; supplies reads/ + read_demux/.",
+    )
+    p_cluster.add_argument(
+        "--reference",
+        default=None,
+        help=(
+            "reference root with genome/ + annotation/ subdirs; "
+            "required when --build-consensus is set."
+        ),
+    )
+    p_cluster.add_argument(
+        "--samples",
+        required=True,
+        help="samples TSV (consistent with the upstream align run).",
+    )
+    p_cluster.add_argument(
+        "--output-dir",
+        required=True,
+        help="cluster output dir (clusters.parquet, cluster.fa, ...).",
+    )
+    p_cluster.add_argument(
+        "--mode",
+        choices=("genome-guided",),
+        default="genome-guided",
+        help=(
+            "clustering mode (Phase 2 ships only genome-guided; Phase 3 "
+            "adds de-novo; Phase 4 adds validate)."
+        ),
+    )
+    p_cluster.add_argument(
+        "--max-5p-drift",
+        type=int,
+        default=25,
+        help=(
+            "drop a read from a fingerprint cluster when its 5' end "
+            "(strand-aware) deviates from the cluster median by more "
+            "than this many bp. Default 25."
+        ),
+    )
+    p_cluster.add_argument(
+        "--max-3p-drift",
+        type=int,
+        default=75,
+        help=(
+            "as --max-5p-drift but on the 3' end (polyA scatter is wider). "
+            "Default 75."
+        ),
+    )
+    p_cluster.add_argument(
+        "--intron-quantum-bp",
+        type=int,
+        default=10,
+        help=(
+            "fingerprint quantisation tolerance for cryptic-splice "
+            "excursions. Derived fresh from alignment_blocks/ at every "
+            "cluster run, so sweeping this value never requires "
+            "re-running align. Default 10."
+        ),
+    )
+    p_cluster.add_argument(
+        "--min-cluster-size",
+        type=int,
+        default=1,
+        help=(
+            "drop clusters whose surviving (post-drift-filter) size is "
+            "below this. Default 1 keeps singletons."
+        ),
+    )
+    p_cluster.add_argument(
+        "--drop-drift-filtered",
+        action="store_true",
+        help=(
+            "drop drift-filtered reads from cluster_membership "
+            "entirely. Default keeps them with role='drift_filtered' "
+            "for Phase 4 cross-validation."
+        ),
+    )
+    p_cluster.add_argument(
+        "--build-consensus",
+        action="store_true",
+        help=(
+            "populate consensus_sequence per cluster via the shared "
+            "weighted-PWM kernel against the genome window. Requires "
+            "the upstream align run to have set --emit-cs-tags."
+        ),
+    )
+    p_cluster.add_argument(
+        "--per-sample-clusters",
+        action="store_true",
+        help=(
+            "partition by sample_id in addition to (contig, strand). "
+            "Default treats clusters as spanning samples."
+        ),
+    )
+    p_cluster.add_argument(
+        "--write-fasta",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "write cluster.fa with cluster representative sequences "
+            "(or consensus when --build-consensus is set). "
+            "Default on; pass --no-write-fasta to disable."
+        ),
+    )
+    p_cluster.add_argument(
+        "--write-summary",
+        action="store_true",
+        help=(
+            "write cluster_summary.tsv (cluster-size histogram + "
+            "n_singletons + fraction_clustered). Default off."
+        ),
+    )
+    p_cluster.add_argument("--threads", type=int, default=1)
+    p_cluster.add_argument("--resume", action="store_true")
+    p_cluster.add_argument("--progress", action="store_true")
+    p_cluster.set_defaults(func=_cmd_transcriptome_cluster)
 
 
 def _resolve_input_paths(reads_args: list[str]) -> list[Path]:
@@ -763,14 +903,16 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         bam_success.write_bytes(b"")
 
     # ── Stage 2: decode_filter_overlap (N-way fused worker) ──────────
-    # Phase 1 emit-* flags: any of pileup/junctions/fingerprints
+    # Phase 1 emit-* flags: any of pileup/junctions/fingerprints/cs-tags
     # implies emit-blocks (they all derive from alignment_blocks/).
     emit_blocks = (
         args.emit_blocks
         or args.emit_pileup
         or args.emit_junctions
         or args.emit_fingerprints
+        or args.emit_cs_tags
     )
+    emit_cs = bool(args.emit_cs_tags)
 
     chunks = _bam_alignment_chunks(cb_path, chunk_size=args.chunk_size)
     chunk_specs = [
@@ -793,6 +935,8 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     )
     if emit_blocks:
         output_keys = output_keys + ("alignment_blocks",)
+    if emit_cs:
+        output_keys = output_keys + ("alignment_cs",)
     worker_kwargs: dict = {
         "gene_set_bytes": gene_set_bytes,
         "filter_kwargs": filter_kwargs,
@@ -801,6 +945,8 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     if emit_blocks:
         worker_kwargs["emit_blocks"] = True
         worker_kwargs["intron_min_bp"] = int(args.intron_min_bp)
+    if emit_cs:
+        worker_kwargs["emit_cs"] = True
     stage_outputs = run_batched(
         worker_fn=fused_decode_filter_overlap_worker,
         batches=chunk_specs,
@@ -952,6 +1098,10 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         manifest_outputs["alignment_blocks"] = str(
             stage_outputs["alignment_blocks"].directory
         )
+    if emit_cs and "alignment_cs" in stage_outputs:
+        manifest_outputs["alignment_cs"] = str(
+            stage_outputs["alignment_cs"].directory
+        )
     manifest_outputs.update(emit_outputs)
     manifest_outputs.update(matrix_outputs)
 
@@ -973,6 +1123,7 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             "emit_pileup": bool(args.emit_pileup),
             "emit_junctions": bool(args.emit_junctions),
             "emit_fingerprints": bool(args.emit_fingerprints),
+            "emit_cs_tags": bool(emit_cs),
             "intron_min_bp": int(args.intron_min_bp),
             "intron_quantum_bp": int(args.intron_quantum_bp),
         },
@@ -989,6 +1140,402 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             f"{per_stage['after_overlap']} overlapping a gene → "
             f"{per_stage['unique_(gene,sample)_pairs']} (gene, sample) cells, "
             f"total count {per_stage['total_count']}",
+            flush=True,
+        )
+    return 0
+
+
+def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
+    """Phase 2 — group reads into transcript / isoform clusters.
+
+    Inputs: a `transcriptome align --emit-blocks` output dir + the S1
+    demux dir + samples.tsv. Outputs: clusters.parquet,
+    cluster_membership.parquet, optional cluster.fa + cluster_summary.tsv.
+
+    Fingerprints are derived fresh from `alignment_blocks/` at every
+    invocation so the `--intron-quantum-bp` knob is a clustering
+    parameter rather than an alignment parameter — sweeping it never
+    requires re-running align.
+    """
+    import json
+    from collections import Counter
+    from pathlib import Path
+
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.dataset as pa_dataset
+    import pyarrow.parquet as pq
+
+    from constellation.sequencing.progress import (
+        NullProgress,
+        StreamProgress,
+    )
+    from constellation.sequencing.reference.io import load_genome_reference
+    from constellation.sequencing.samples import Samples
+    from constellation.sequencing.transcriptome.cluster_genome import (
+        cluster_by_fingerprint,
+    )
+    from constellation.sequencing.transcriptome.fingerprints import (
+        compute_read_fingerprints,
+    )
+
+    if args.mode != "genome-guided":  # pragma: no cover — argparse-gated
+        print(
+            f"--mode {args.mode} not yet implemented; only "
+            "genome-guided is wired in this release.",
+            file=sys.stderr,
+        )
+        return 2
+
+    align_dir = Path(args.align_dir)
+    blocks_success = align_dir / "alignment_blocks" / "_SUCCESS"
+    if not blocks_success.exists():
+        print(
+            f"--align-dir missing alignment_blocks/_SUCCESS: {align_dir}\n"
+            "rerun `transcriptome align` with --emit-blocks (Phase 2 "
+            "derives fingerprints fresh; the read_fingerprints.parquet "
+            "single-file emit is informational and not required).",
+            file=sys.stderr,
+        )
+        return 2
+    if args.build_consensus:
+        cs_success = align_dir / "alignment_cs" / "_SUCCESS"
+        if not cs_success.exists():
+            print(
+                f"--build-consensus requires alignment_cs/_SUCCESS in "
+                f"{align_dir}; rerun `transcriptome align` with "
+                "--emit-cs-tags.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.reference is None:
+            print(
+                "--build-consensus requires --reference <ref-root> for "
+                "the genome window.",
+                file=sys.stderr,
+            )
+            return 2
+
+    demux_dir = Path(args.demux_dir)
+    if not demux_dir.is_dir():
+        raise FileNotFoundError(f"--demux-dir not found: {demux_dir}")
+    if not (demux_dir / "read_demux").is_dir():
+        raise FileNotFoundError(
+            f"--demux-dir missing read_demux/: {demux_dir}"
+        )
+    if not (demux_dir / "reads").is_dir():
+        raise FileNotFoundError(
+            f"--demux-dir missing reads/: {demux_dir}"
+        )
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if (output_dir / "_SUCCESS").exists() and not args.resume:
+        print(
+            f"output dir already complete: {output_dir} "
+            f"(pass --resume to short-circuit; refusing to overwrite)",
+            file=sys.stderr,
+        )
+        return 1
+    if (output_dir / "_SUCCESS").exists() and args.resume:
+        print(f"--resume: output already complete: {output_dir}", flush=True)
+        return 0
+
+    # Phase 2 v1 runs single-process; the progress callback is plumbed
+    # in when we lift cluster_by_fingerprint into run_batched (per-
+    # contig partition parallelism). Until then there are no
+    # well-defined inner stages to emit start/progress/done events on,
+    # so we leave NullProgress as a no-op placeholder.
+    _ = StreamProgress() if args.progress else NullProgress()
+
+    # ── Resolve align-dir manifest for downstream provenance ─────────
+    align_manifest_path = align_dir / "manifest.json"
+    align_manifest: dict = {}
+    if align_manifest_path.exists():
+        align_manifest = json.loads(align_manifest_path.read_text())
+
+    # ── Genome (only when --build-consensus) ─────────────────────────
+    genome = None
+    if args.reference is not None:
+        reference = Path(args.reference)
+        genome_dir = reference / "genome"
+        if not genome_dir.is_dir():
+            raise FileNotFoundError(
+                f"--reference must contain genome/: {reference}"
+            )
+        genome = load_genome_reference(genome_dir)
+
+    # ── Samples (consistent with the align run) ──────────────────────
+    bam_inputs = [
+        Path(p) for p in align_manifest.get("input_files", [])
+    ]
+    sample_rows, edge_rows, _ = _parse_samples_tsv(
+        args.samples,
+        input_files=bam_inputs,
+        default_acquisition_id=int(align_manifest.get("acquisition_id", 1)),
+    )
+    samples = Samples.from_records(samples=sample_rows, edges=edge_rows)
+
+    # ── Materialise alignments + alignment_blocks ────────────────────
+    # Memory budget at 200M reads: ~30 GB alignments + ~25 GB blocks.
+    # Workstation-friendly for single-flowcell-shaped runs; streaming
+    # variant lifts in when crossing 1B alignments — the cluster_by_
+    # fingerprint surface stays the same.
+    alignments_table = pa_dataset.dataset(align_dir / "alignments").to_table()
+    blocks_table = pa_dataset.dataset(
+        align_dir / "alignment_blocks"
+    ).to_table()
+    alignment_cs_table: pa.Table | None = None
+    if args.build_consensus:
+        alignment_cs_table = pa_dataset.dataset(
+            align_dir / "alignment_cs"
+        ).to_table()
+
+    # Genome contig table for fingerprint derivation. When --build-
+    # consensus is off we still need contig names → contig_ids, but
+    # we don't need full sequences. If no --reference, build the contig
+    # table inline from alignments.
+    if genome is not None:
+        contigs_table = genome.contigs
+    else:
+        unique_refs = pc.unique(alignments_table.column("ref_name"))
+        contigs_table = pa.table(
+            {
+                "contig_id": pa.array(
+                    list(range(len(unique_refs))), type=pa.int64()
+                ),
+                "name": unique_refs,
+                "length": pa.array(
+                    [0] * len(unique_refs), type=pa.int64()
+                ),
+            }
+        )
+
+    # ── Derive fingerprints fresh (clustering-time quantum) ──────────
+    fingerprints_table = compute_read_fingerprints(
+        blocks_table,
+        alignments_table,
+        contigs_table,
+        intron_quantum_bp=int(args.intron_quantum_bp),
+    )
+
+    # ── Pull trimmed transcript-window sequences for clustered reads ─
+    fp_read_ids = set(fingerprints_table.column("read_id").to_pylist())
+    fp_read_id_array = pa.array(sorted(fp_read_ids))
+
+    read_demux_columns = [
+        "read_id", "transcript_start", "transcript_end", "sample_id",
+        "transcript_segment_index",
+    ]
+    read_demux_filter = pc.is_in(
+        pa_dataset.field("read_id"), value_set=fp_read_id_array
+    )
+    read_demux = pa_dataset.dataset(demux_dir / "read_demux").to_table(
+        columns=read_demux_columns,
+        filter=read_demux_filter,
+    )
+    # One transcript window per read for clustering — pick the lowest
+    # transcript_segment_index per read_id (chimera resolution downstream
+    # is out of scope for genome-guided clustering v1).
+    if read_demux.num_rows > 0:
+        # Sort, then dedup by read_id keeping first (lowest index).
+        read_demux = read_demux.sort_by(
+            [("read_id", "ascending"), ("transcript_segment_index", "ascending")]
+        )
+        # Keep first occurrence per read_id.
+        seen: set[str] = set()
+        keep_rows: list[int] = []
+        rid_col = read_demux.column("read_id").to_pylist()
+        for i, rid in enumerate(rid_col):
+            if rid in seen:
+                continue
+            seen.add(rid)
+            keep_rows.append(i)
+        if len(keep_rows) < read_demux.num_rows:
+            read_demux = read_demux.take(pa.array(keep_rows))
+
+    reads_columns = ["read_id", "sequence"]
+    reads_dataset = pa_dataset.dataset(demux_dir / "reads")
+    reads_schema_names = reads_dataset.schema.names
+    if "dorado_quality" in reads_schema_names:
+        reads_columns.append("dorado_quality")
+    reads_filter = pc.is_in(
+        pa_dataset.field("read_id"), value_set=fp_read_id_array
+    )
+    raw_reads = reads_dataset.to_table(
+        columns=reads_columns, filter=reads_filter
+    )
+
+    # Join + slice trimmed windows into a flat (read_id, sequence,
+    # dorado_quality) table for cluster_by_fingerprint.
+    trimmed_table: pa.Table
+    if raw_reads.num_rows == 0 or read_demux.num_rows == 0:
+        trimmed_table = pa.table(
+            {
+                "read_id": pa.array([], type=pa.string()),
+                "sequence": pa.array([], type=pa.string()),
+                "dorado_quality": pa.array([], type=pa.float32()),
+            }
+        )
+    else:
+        joined = raw_reads.join(
+            read_demux.select(
+                ["read_id", "transcript_start", "transcript_end"]
+            ),
+            keys="read_id",
+            join_type="inner",
+        )
+        rid_list = joined.column("read_id").to_pylist()
+        seq_list = joined.column("sequence").to_pylist()
+        ts_list = joined.column("transcript_start").to_pylist()
+        te_list = joined.column("transcript_end").to_pylist()
+        trimmed_seqs: list[str] = []
+        for seq, ts, te in zip(seq_list, ts_list, te_list, strict=True):
+            if seq is None:
+                trimmed_seqs.append("")
+                continue
+            trimmed_seqs.append(seq[int(ts):int(te)])
+        if "dorado_quality" in joined.schema.names:
+            quality_list = joined.column("dorado_quality").to_pylist()
+        else:
+            quality_list = [None] * len(rid_list)
+        trimmed_table = pa.table(
+            {
+                "read_id": pa.array(rid_list, type=pa.string()),
+                "sequence": pa.array(trimmed_seqs, type=pa.string()),
+                "dorado_quality": pa.array(
+                    quality_list, type=pa.float32()
+                ),
+            }
+        )
+
+    # ── read_to_sample for --per-sample-clusters ─────────────────────
+    read_to_sample: dict[str, int] | None = None
+    if args.per_sample_clusters and read_demux.num_rows > 0:
+        rd_valid = read_demux.filter(
+            pc.is_valid(read_demux.column("sample_id"))
+        )
+        read_to_sample = {
+            str(rid): int(sid)
+            for rid, sid in zip(
+                rd_valid.column("read_id").to_pylist(),
+                rd_valid.column("sample_id").to_pylist(),
+                strict=True,
+            )
+        }
+
+    # ── Cluster ──────────────────────────────────────────────────────
+    clusters, membership = cluster_by_fingerprint(
+        fingerprints_table,
+        trimmed_table,
+        alignments=alignments_table,
+        alignment_blocks=blocks_table,
+        alignment_cs=alignment_cs_table,
+        genome=genome,
+        read_to_sample=read_to_sample,
+        max_5p_drift=int(args.max_5p_drift),
+        max_3p_drift=int(args.max_3p_drift),
+        min_cluster_size=int(args.min_cluster_size),
+        build_consensus_seq=bool(args.build_consensus),
+        drop_drift_filtered=bool(args.drop_drift_filtered),
+        per_sample_clusters=bool(args.per_sample_clusters),
+        cluster_id_seed=0,
+    )
+
+    # ── Write outputs ────────────────────────────────────────────────
+    pq.write_table(clusters, output_dir / "clusters.parquet")
+    pq.write_table(membership, output_dir / "cluster_membership.parquet")
+
+    cluster_outputs: dict[str, str] = {
+        "clusters": str(output_dir / "clusters.parquet"),
+        "cluster_membership": str(output_dir / "cluster_membership.parquet"),
+    }
+
+    # cluster.fa — representative sequence (or consensus when available).
+    if args.write_fasta:
+        rep_lookup: dict[str, str] = {
+            str(rid): str(seq)
+            for rid, seq in zip(
+                trimmed_table.column("read_id").to_pylist(),
+                trimmed_table.column("sequence").to_pylist(),
+                strict=True,
+            )
+        }
+        fasta_path = output_dir / "cluster.fa"
+        with fasta_path.open("w") as fh:
+            for row in clusters.to_pylist():
+                cid = row["cluster_id"]
+                rep = row["representative_read_id"]
+                consensus = row.get("consensus_sequence")
+                seq = consensus if consensus else rep_lookup.get(rep, "")
+                if not seq:
+                    continue
+                fh.write(f">cluster_{cid} representative={rep}\n{seq}\n")
+        cluster_outputs["cluster_fa"] = str(fasta_path)
+
+    # cluster_summary.tsv — size histogram + n_singletons + fraction.
+    if args.write_summary:
+        n_clusters = clusters.num_rows
+        sizes = clusters.column("n_reads").to_pylist() if n_clusters else []
+        size_hist = Counter(sizes)
+        n_singletons = sum(1 for s in sizes if s == 1)
+        n_input_reads = fingerprints_table.num_rows
+        n_clustered = sum(sizes)
+        fraction_clustered = (
+            float(n_clustered) / float(n_input_reads)
+            if n_input_reads > 0 else 0.0
+        )
+        summary_path = output_dir / "cluster_summary.tsv"
+        with summary_path.open("w") as fh:
+            fh.write("metric\tvalue\n")
+            fh.write(f"n_clusters\t{n_clusters}\n")
+            fh.write(f"n_singletons\t{n_singletons}\n")
+            fh.write(f"n_input_reads\t{n_input_reads}\n")
+            fh.write(f"n_clustered_reads\t{n_clustered}\n")
+            fh.write(f"fraction_clustered\t{fraction_clustered:.6f}\n")
+            fh.write("\n")
+            fh.write("cluster_size\tn_clusters\n")
+            for size in sorted(size_hist.keys()):
+                fh.write(f"{size}\t{size_hist[size]}\n")
+        cluster_outputs["cluster_summary_tsv"] = str(summary_path)
+
+    # ── Manifest + _SUCCESS ──────────────────────────────────────────
+    manifest = {
+        "align_dir": str(align_dir),
+        "demux_dir": str(demux_dir),
+        "reference": (str(args.reference) if args.reference else None),
+        "samples_path": str(args.samples),
+        "parameters": {
+            "mode": str(args.mode),
+            "max_5p_drift": int(args.max_5p_drift),
+            "max_3p_drift": int(args.max_3p_drift),
+            "intron_quantum_bp": int(args.intron_quantum_bp),
+            "min_cluster_size": int(args.min_cluster_size),
+            "drop_drift_filtered": bool(args.drop_drift_filtered),
+            "build_consensus": bool(args.build_consensus),
+            "per_sample_clusters": bool(args.per_sample_clusters),
+            "write_fasta": bool(args.write_fasta),
+            "write_summary": bool(args.write_summary),
+            "threads": int(args.threads),
+        },
+        "stages": {
+            "n_input_fingerprints": int(fingerprints_table.num_rows),
+            "n_clusters": int(clusters.num_rows),
+            "n_membership_rows": int(membership.num_rows),
+            "n_samples": int(len(list(samples.ids))),
+        },
+        "outputs": cluster_outputs,
+    }
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n"
+    )
+    (output_dir / "_SUCCESS").write_bytes(b"")
+
+    if not args.progress:
+        print(
+            f"cluster done: {fingerprints_table.num_rows} input fingerprints → "
+            f"{clusters.num_rows} clusters "
+            f"({membership.num_rows} membership rows)",
             flush=True,
         )
     return 0
