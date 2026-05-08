@@ -24,9 +24,9 @@ STAR's ``SJ.out.tab`` ``annotated`` column semantics). When no
 Annotation is passed (e.g. against a freshly-assembled genome), the
 column is left null.
 
-Why aggregate introns rather than exons: see the rationale in the
-plan file at ``~/.claude/plans/in-our-last-few-agile-nygaard.md`` §1.2,
-or in the docstring of ``SPLICE_JUNCTION_TABLE`` itself.
+Why aggregate introns rather than exons: see the rationale in
+``docs/plans/de-novo-clustering-roadmap.md`` §1.2, or in the docstring
+of ``SPLICE_JUNCTION_TABLE`` itself.
 """
 
 from __future__ import annotations
