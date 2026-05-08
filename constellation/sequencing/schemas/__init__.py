@@ -15,7 +15,9 @@ Notable instances:
     ALIGNMENT_TABLE         BAM-canonical alignment columns
     ALIGNMENT_TAG_TABLE     long-form for the rare-tag tail
     ALIGNMENT_BLOCK_TABLE   per-CIGAR-block exon view (Phase 1)
-    SPLICE_JUNCTION_TABLE   cross-read junction aggregate (Phase 1)
+    INTRON_TABLE            denormalised intron view: one row per
+                            observed (donor, acceptor) pair with
+                            cluster-membership info (Phase 1)
     READ_FINGERPRINT_TABLE  per-read canonical junction hash (Phase 1)
     RAW_SIGNAL_TABLE        POD5 raw signal — uses core.ragged_trace_1d
     CONTIG_TABLE            reference / assembly contigs
@@ -46,8 +48,8 @@ from constellation.sequencing.schemas.alignment import (
     ALIGNMENT_BLOCK_TABLE,
     ALIGNMENT_TABLE,
     ALIGNMENT_TAG_TABLE,
+    INTRON_TABLE,
     READ_FINGERPRINT_TABLE,
-    SPLICE_JUNCTION_TABLE,
     cigar_to_ops,
 )
 from constellation.sequencing.schemas.assembly import (
@@ -82,7 +84,7 @@ __all__ = [
     "ALIGNMENT_TABLE",
     "ALIGNMENT_TAG_TABLE",
     "ALIGNMENT_BLOCK_TABLE",
-    "SPLICE_JUNCTION_TABLE",
+    "INTRON_TABLE",
     "READ_FINGERPRINT_TABLE",
     "RAW_SIGNAL_TABLE",
     "CONTIG_TABLE",

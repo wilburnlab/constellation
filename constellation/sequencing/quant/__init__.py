@@ -38,19 +38,35 @@ from constellation.sequencing.quant.genome_count import (
     serialise_gene_set,
 )
 from constellation.sequencing.quant.coverage import build_pileup
-from constellation.sequencing.quant.junctions import aggregate_junctions
+from constellation.sequencing.quant.derived_annotation import (
+    assign_blocks_to_exons,
+    build_derived_annotation,
+    compute_exon_psi,
+    derive_exons,
+    roll_up_genes,
+)
+from constellation.sequencing.quant.junctions import (
+    aggregate_junctions,
+    cluster_junctions,
+)
 
 __all__ = [
     "GENE_ASSIGNMENT_SCHEMA",
     "aggregate_junctions",
-    "build_pileup",
     "apply_filter_predicates",
+    "assign_blocks_to_exons",
+    "build_derived_annotation",
     "build_gene_matrix",
+    "build_pileup",
+    "cluster_junctions",
+    "compute_exon_psi",
     "compute_gene_overlap",
     "count_reads_per_gene",
+    "derive_exons",
     "extract_alignment_blocks",
     "fused_decode_filter_overlap_worker",
     "gene_set_from_annotation",
     "render_gene_matrix_tsv",
+    "roll_up_genes",
     "serialise_gene_set",
 ]

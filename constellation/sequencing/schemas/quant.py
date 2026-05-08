@@ -90,12 +90,49 @@ COVERAGE_TABLE: pa.Schema = pa.schema(
 )
 
 
+# Per-derived-exon, per-sample inclusion / exclusion substrate. PSI =
+# "Percent Spliced In", the standard alt-splicing metric (SUPPA, MISO,
+# rMATS, IsoQuant, FLAIR). Range [0, 1]:
+#
+#     PSI = n_inclusion_reads / (n_inclusion_reads + n_exclusion_reads)
+#
+# 1.0  → constitutive exon (every gene-spanning read includes it)
+# 0.5  → genuinely alternative cassette
+# 0.0  → exon is skipped in every gene-spanning read
+# null → denominator is zero (no gene-spanning reads in this sample)
+#
+# Future v2 differential-exon estimator consumes this as the substrate
+# for negbin LRT (see ``core.stats.Parametric``).
+EXON_PSI_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("data_exon_id", pa.int64(), nullable=False),
+        # ``-1`` sentinel for unstratified, matching COVERAGE_TABLE.
+        pa.field("sample_id", pa.int64(), nullable=False),
+        # Reads fully spanning the exon's host gene with at least one
+        # block overlapping the exon.
+        pa.field("n_inclusion_reads", pa.int32(), nullable=False),
+        # Gene-spanning reads with blocks on both flanks but none in
+        # the exon (the read spliced past it).
+        pa.field("n_exclusion_reads", pa.int32(), nullable=False),
+        # Reads that overlap the gene but truncate before reaching one
+        # flank — diagnostic only; not in the PSI ratio.
+        pa.field("n_ambiguous_reads", pa.int32(), nullable=False),
+        # n_inclusion / (n_inclusion + n_exclusion). Null when the
+        # denominator is zero.
+        pa.field("psi", pa.float32(), nullable=True),
+    ],
+    metadata={b"schema_name": b"ExonPsiTable"},
+)
+
+
 register_schema("FeatureQuant", FEATURE_QUANT)
 register_schema("CoverageTable", COVERAGE_TABLE)
+register_schema("ExonPsiTable", EXON_PSI_TABLE)
 
 
 __all__ = [
     "FEATURE_QUANT",
     "FEATURE_ORIGIN_VOCAB",
     "COVERAGE_TABLE",
+    "EXON_PSI_TABLE",
 ]

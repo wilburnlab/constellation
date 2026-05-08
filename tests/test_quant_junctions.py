@@ -335,6 +335,6 @@ def test_empty_inputs_return_empty_schema() -> None:
         ALIGNMENT_TABLE.empty_table(),
         _genome(),
     )
-    from constellation.sequencing.schemas.alignment import SPLICE_JUNCTION_TABLE
-    assert out.schema.equals(SPLICE_JUNCTION_TABLE)
+    from constellation.sequencing.schemas.alignment import INTRON_TABLE
+    assert out.schema.equals(INTRON_TABLE)
     assert out.num_rows == 0

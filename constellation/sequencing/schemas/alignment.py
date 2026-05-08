@@ -20,23 +20,29 @@ PAF is a strict subset of BAM in column space, so a separate
 ``PAF_TABLE`` would be redundant. The ``readers/paf.py`` reader fills
 the BAM-only columns with nulls.
 
-Alignment-derived per-block / aggregated views (Phase 1 power-user
-toggles on ``transcriptome align``):
+Alignment-derived per-block / aggregated views (default-on at
+``transcriptome align`` after the intron-clustering retrofit):
 
     ALIGNMENT_BLOCK_TABLE   one row per CIGAR-derived alignment block
                             (M/=/X run between N or large I/D ops).
                             Per-record exon view; primary input to
-                            pile-up, junctions, and fingerprints.
-    SPLICE_JUNCTION_TABLE   cross-read aggregate keyed on
-                            ``(contig_id, donor_pos, acceptor_pos,
-                            strand)``. Junctions are aggregated rather
-                            than exons because splice sites are *steep*
-                            (canonical GT-AG dinucleotide-anchored)
-                            while exon termini are fuzzy on first/last
-                            blocks (TSS / SSP / polyA scatter).
-    READ_FINGERPRINT_TABLE  per-read canonical junction-sequence hash;
-                            primary alignments only. The Phase 2
-                            cluster key.
+                            pile-up, introns, and fingerprints.
+    INTRON_TABLE            single denormalised intron view. One row
+                            per *observed* ``(contig_id, donor_pos,
+                            acceptor_pos, strand)`` tuple, augmented
+                            with an ``intron_id`` (cluster ID; non-
+                            unique across rows) and ``is_intron_seed``
+                            (true on exactly one row per cluster — the
+                            highest-support member). Introns are
+                            clustered to absorb basecaller-driven
+                            single-bp jitter while preserving real
+                            alt-splicing topology; see
+                            ``quant.junctions.cluster_junctions``.
+    READ_FINGERPRINT_TABLE  per-read splicing-topology hash via
+                            blake2b over the canonical
+                            ``(contig_id, strand, [intron_id, ...])``
+                            tuple. Primary alignments only. The
+                            Phase 2 cluster key.
 """
 
 from __future__ import annotations
@@ -105,7 +111,7 @@ ALIGNMENT_TAG_TABLE: pa.Schema = pa.schema(
 #
 # Contig is NOT a column here — block rows join back to ``ALIGNMENT_TABLE``
 # via ``alignment_id`` for ``ref_name``; aggregations into
-# ``SPLICE_JUNCTION_TABLE`` / ``READ_FINGERPRINT_TABLE`` resolve
+# ``INTRON_TABLE`` / ``READ_FINGERPRINT_TABLE`` resolve
 # ``ref_name → contig_id`` at aggregation time (where the
 # GenomeReference is in scope). Saves one column × N_blocks rows
 # (~600M rows at PromethION scale).
@@ -128,36 +134,57 @@ ALIGNMENT_BLOCK_TABLE: pa.Schema = pa.schema(
 )
 
 
-# Cross-read aggregate. One row per distinct (contig, donor, acceptor,
-# strand) tuple observed across the alignment_blocks input. ``motif``
-# is derived from the genome at donor[0:2] / acceptor[-2:] when a
-# GenomeReference is available (e.g. 'GT-AG', 'GC-AG', 'AT-AC',
-# 'other'). ``annotated`` is True iff the (donor_pos, acceptor_pos)
-# pair matches an intron implied by an Annotation FEATURE_TABLE.
-SPLICE_JUNCTION_TABLE: pa.Schema = pa.schema(
+# Single denormalised intron view. One row per *observed* (contig,
+# donor, acceptor, strand) tuple — single-bp resolution, preserved
+# from the raw CIGAR/cs evidence. Augmented with cluster-membership
+# columns:
+#
+#   ``intron_id``        non-unique cluster ID. Rows sharing the same
+#                        intron_id describe the same biological splice
+#                        event (their positions clustered together
+#                        within ``canonical_window_bp``).
+#   ``is_intron_seed``   True on exactly one row per intron_id: the
+#                        cluster's highest-``read_count`` member with
+#                        GT-AG > GC-AG > AT-AC > other motif tiebreak.
+#                        The seed's (donor_pos, acceptor_pos) defines
+#                        the intron site's representative splice
+#                        positions.
+#
+# Common queries (idiomatic Arrow):
+#   - Total cluster support: ``group_by(intron_id).aggregate([
+#       ("read_count", "sum")])``
+#   - Distinct member positions per cluster: ``group_by(intron_id)
+#       .aggregate([("read_count", "count")])``
+#   - Seed positions only: ``filter(is_intron_seed == True)``
+#
+# ``motif`` is derived from the genome at donor[0:2] / acceptor[-2:]
+# when a GenomeReference is available (e.g. 'GT-AG', 'GC-AG',
+# 'AT-AC', 'other'). ``annotated`` is True iff this exact (donor_pos,
+# acceptor_pos) pair appears as an annotated intron.
+INTRON_TABLE: pa.Schema = pa.schema(
     [
-        pa.field("junction_id", pa.int64(), nullable=False),
+        pa.field("intron_id", pa.int64(), nullable=False),
         pa.field("contig_id", pa.int64(), nullable=False),
-        pa.field("donor_pos", pa.int64(), nullable=False),
-        pa.field("acceptor_pos", pa.int64(), nullable=False),
         # '+' | '-' | '?' (when not splice-motif-disambiguated)
         pa.field("strand", pa.string(), nullable=False),
-        pa.field("read_count", pa.int32(), nullable=False),
+        pa.field("donor_pos", pa.int64(), nullable=False),
+        pa.field("acceptor_pos", pa.int64(), nullable=False),
+        pa.field("read_count", pa.int64(), nullable=False),
         pa.field("motif", pa.string(), nullable=True),
+        pa.field("is_intron_seed", pa.bool_(), nullable=False),
         pa.field("annotated", pa.bool_(), nullable=True),
-        pa.field("gene_id", pa.int64(), nullable=True),
     ],
-    metadata={b"schema_name": b"SpliceJunctionTable"},
+    metadata={b"schema_name": b"IntronTable"},
 )
 
 
-# Per-read canonical splicing-topology hash. Primary alignments only
+# Per-read splicing-topology hash. Primary alignments only
 # (secondary/supplementary excluded). ``fingerprint_hash`` is computed
-# from the canonical tuple ``(contig_id, strand, [(donor//q)*q,
-# (acceptor//q)*q for each junction])`` where ``q`` is the
-# ``intron_quantum_bp`` knob (default 10) — quantisation absorbs small
-# cryptic-splice excursions so they share a fingerprint bucket while
-# leaving larger excursions to surface as cluster discordance.
+# from the canonical tuple ``(contig_id, strand, [intron_id, ...])``
+# — donor/acceptor positions don't enter the hash; the canonical
+# intron_id (assigned by ``cluster_junctions``) is the cluster
+# identifier. Two reads bucket together iff their per-read junctions
+# map to the same intron_id sequence in the same order.
 # ``junction_signature`` is a human-readable form for diagnostics, not
 # the cluster key.
 READ_FINGERPRINT_TABLE: pa.Schema = pa.schema(
@@ -192,12 +219,40 @@ ALIGNMENT_CS_TABLE: pa.Schema = pa.schema(
 )
 
 
+# Long-form M:N edge table between ALIGNMENT_BLOCK_TABLE and the
+# derived-annotation FEATURE_TABLE (filtered to type='exon'). One row
+# per (block × derived_exon) overlap edge — most rows are 1-to-1 (a
+# clean spliced block falls inside one exon), but boundary-straddling
+# blocks and intron-retention reads emit 2+ rows for the same
+# (alignment_id, block_index). PK: (alignment_id, block_index, data_exon_id).
+#
+# Cardinality: ~ALIGNMENT_BLOCK_TABLE plus a small overage (~5%) from
+# M:N edges. Used by ``compute_exon_psi`` to derive per-exon, per-sample
+# inclusion / exclusion read counts from the derived annotation.
+BLOCK_EXON_ASSIGNMENT_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("alignment_id", pa.int64(), nullable=False),
+        pa.field("block_index", pa.int32(), nullable=False),
+        pa.field("data_exon_id", pa.int64(), nullable=False),
+        # min(block.ref_end, exon.end) - max(block.ref_start, exon.start)
+        pa.field("overlap_bp", pa.int32(), nullable=False),
+        # overlap_bp / (block.ref_end - block.ref_start)
+        pa.field("block_fraction", pa.float32(), nullable=False),
+        # overlap_bp / (exon.end - exon.start) — used by compute_exon_psi
+        # to decide inclusion thresholds.
+        pa.field("exon_fraction", pa.float32(), nullable=False),
+    ],
+    metadata={b"schema_name": b"BlockExonAssignmentTable"},
+)
+
+
 register_schema("AlignmentTable", ALIGNMENT_TABLE)
 register_schema("AlignmentTagTable", ALIGNMENT_TAG_TABLE)
 register_schema("AlignmentBlockTable", ALIGNMENT_BLOCK_TABLE)
-register_schema("SpliceJunctionTable", SPLICE_JUNCTION_TABLE)
+register_schema("IntronTable", INTRON_TABLE)
 register_schema("ReadFingerprintTable", READ_FINGERPRINT_TABLE)
 register_schema("AlignmentCsTable", ALIGNMENT_CS_TABLE)
+register_schema("BlockExonAssignmentTable", BLOCK_EXON_ASSIGNMENT_TABLE)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -224,8 +279,9 @@ __all__ = [
     "ALIGNMENT_TABLE",
     "ALIGNMENT_TAG_TABLE",
     "ALIGNMENT_BLOCK_TABLE",
-    "SPLICE_JUNCTION_TABLE",
+    "INTRON_TABLE",
     "READ_FINGERPRINT_TABLE",
     "ALIGNMENT_CS_TABLE",
+    "BLOCK_EXON_ASSIGNMENT_TABLE",
     "cigar_to_ops",
 ]

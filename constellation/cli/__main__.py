@@ -330,41 +330,81 @@ def _build_transcriptome_parser(subs) -> None:
             "genes including zero-observation rows for stable indexing)"
         ),
     )
-    # Phase 1 power-user toggles — alignment-derived intermediates.
-    # Off by default so existing align invocations have unchanged
-    # wall-clock + output footprint.
+    # Alignment-derived intermediates. Block extraction + intron
+    # clustering run by default — they're a structural characteristic
+    # of mapping transcripts to a genome, not an opt-in. The --no-*
+    # flags exist for diagnostic / footprint-sensitive runs.
     p_aln.add_argument(
-        "--emit-blocks",
+        "--no-cluster-junctions",
         action="store_true",
         help=(
-            "write alignment_blocks/ partitioned dataset (per-CIGAR-block "
-            "exon view, with cs:long-derived n_match / n_mismatch when "
-            "available). Required prereq for the other --emit-* flags."
+            "skip the support-ranked intron-clustering pass. introns.parquet "
+            "still emits, but each row gets intron_id=row_index and "
+            "is_intron_seed=True (each observed position is its own "
+            "singleton cluster — equivalent to --intron-tolerance-bp 0). "
+            "Use for diagnostic comparisons against unclustered Dorado "
+            "output; not the recommended default."
         ),
     )
     p_aln.add_argument(
-        "--emit-pileup",
-        action="store_true",
+        "--intron-tolerance-bp",
+        type=int,
+        default=5,
         help=(
-            "write coverage.parquet — RLE-encoded depth tracks per "
-            "(contig, sample). Implies --emit-blocks."
+            "absorption window for the intron clustering pass — a raw "
+            "junction at (d, a) is absorbed into an existing seed at "
+            "(d_s, a_s) iff |d-d_s| <= W AND |a-a_s| <= W on both axes. "
+            "Default 5 absorbs basecaller jitter while preserving genuine "
+            "alt-5'SS / alt-3'SS events."
         ),
     )
     p_aln.add_argument(
-        "--emit-junctions",
-        action="store_true",
+        "--intron-motif-priority",
+        type=str,
+        default="GT-AG,GC-AG,AT-AC",
         help=(
-            "write junctions.parquet — cross-read aggregated splice "
-            "junctions with motif + annotation match. Implies --emit-blocks."
+            "comma-separated motif tiebreak order for intron clustering. "
+            "Earlier entries win on read_count ties. Default GT-AG,GC-AG,"
+            "AT-AC follows the canonical splice biology hierarchy."
         ),
     )
     p_aln.add_argument(
-        "--emit-fingerprints",
+        "--no-coverage",
         action="store_true",
         help=(
-            "write read_fingerprints.parquet — per-read canonical "
-            "junction-sequence hashes (the Phase 2 cluster key). "
-            "Implies --emit-blocks."
+            "skip writing coverage.parquet — the RLE-encoded per-(contig, "
+            "sample) depth track. When --no-derived-annotation is also "
+            "set, the in-memory pile-up isn't computed at all (saves "
+            "resolve-stage time); otherwise it's computed for the "
+            "derived-annotation pass but not persisted."
+        ),
+    )
+    p_aln.add_argument(
+        "--no-derived-annotation",
+        action="store_true",
+        help=(
+            "skip the derived-annotation pass. When set, "
+            "derived_annotation/ + block_exon_assignments.parquet + "
+            "exon_psi.parquet are NOT written."
+        ),
+    )
+    p_aln.add_argument(
+        "--min-exon-depth",
+        type=int,
+        default=5,
+        help=(
+            "derived-annotation: minimum per-position coverage depth "
+            "to seed an exon candidate. Default 5."
+        ),
+    )
+    p_aln.add_argument(
+        "--min-intron-read-count",
+        type=int,
+        default=3,
+        help=(
+            "derived-annotation: minimum reads supporting an intron "
+            "cluster (group_by(intron_id).sum(read_count)) to treat it "
+            "as a trusted boundary. Default 3."
         ),
     )
     p_aln.add_argument(
@@ -373,8 +413,8 @@ def _build_transcriptome_parser(subs) -> None:
         help=(
             "write alignment_cs/ partitioned dataset preserving "
             "minimap2's cs:long string per alignment. Required by "
-            "Phase 2 'transcriptome cluster --build-consensus' for "
-            "base-resolution PWM accumulation. Implies --emit-blocks."
+            "'transcriptome cluster --build-consensus' for base-resolution "
+            "PWM accumulation. Off by default."
         ),
     )
     p_aln.add_argument(
@@ -386,17 +426,6 @@ def _build_transcriptome_parser(subs) -> None:
             "intron proxy for assembly-vs-genome where minimap2 emits "
             "D rather than N). Default 25; ignored on the cs:long path "
             "which has its own splice operator."
-        ),
-    )
-    p_aln.add_argument(
-        "--intron-quantum-bp",
-        type=int,
-        default=10,
-        help=(
-            "fingerprint quantisation: donor / acceptor coordinates are "
-            "rounded to multiples of this value before hashing. "
-            "Default 10 — absorbs small cryptic-splice excursions "
-            "into the same fingerprint bucket."
         ),
     )
     p_aln.add_argument("--resume", action="store_true")
@@ -416,8 +445,8 @@ def _build_transcriptome_parser(subs) -> None:
         "--align-dir",
         required=True,
         help=(
-            "directory produced by `transcriptome align --emit-blocks` "
-            "(must contain alignments/ + alignment_blocks/)."
+            "directory produced by `transcriptome align` "
+            "(must contain alignments/ + alignment_blocks/ + introns.parquet)."
         ),
     )
     p_cluster.add_argument(
@@ -472,14 +501,17 @@ def _build_transcriptome_parser(subs) -> None:
         ),
     )
     p_cluster.add_argument(
-        "--intron-quantum-bp",
+        "--intron-tolerance-bp",
         type=int,
-        default=10,
+        default=None,
         help=(
-            "fingerprint quantisation tolerance for cryptic-splice "
-            "excursions. Derived fresh from alignment_blocks/ at every "
-            "cluster run, so sweeping this value never requires "
-            "re-running align. Default 10."
+            "intron-clustering tolerance (the +/- bp absorption window). "
+            "When omitted, the value baked into the upstream align run "
+            "(read from align_dir/manifest.json) is used as-is. When "
+            "set, cluster re-runs cluster_junctions on the raw per-"
+            "position rows in introns.parquet before fingerprinting — "
+            "no need to re-run align. Replaces the retired "
+            "--intron-quantum-bp."
         ),
     )
     p_cluster.add_argument(
@@ -809,6 +841,7 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         aggregate_junctions,
         build_gene_matrix,
         build_pileup,
+        cluster_junctions,
         count_reads_per_gene,
         fused_decode_filter_overlap_worker,
         gene_set_from_annotation,
@@ -818,9 +851,6 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     from constellation.sequencing.readers.sam_bam import _bam_alignment_chunks
     from constellation.sequencing.reference.io import load_genome_reference
     from constellation.sequencing.samples import Samples
-    from constellation.sequencing.transcriptome.fingerprints import (
-        compute_read_fingerprints,
-    )
 
     # ── Mode dispatch ────────────────────────────────────────────────
     if args.reference is None:
@@ -903,16 +933,18 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         bam_success.write_bytes(b"")
 
     # ── Stage 2: decode_filter_overlap (N-way fused worker) ──────────
-    # Phase 1 emit-* flags: any of pileup/junctions/fingerprints/cs-tags
-    # implies emit-blocks (they all derive from alignment_blocks/).
-    emit_blocks = (
-        args.emit_blocks
-        or args.emit_pileup
-        or args.emit_junctions
-        or args.emit_fingerprints
-        or args.emit_cs_tags
-    )
+    # Block extraction is unconditional now — it's the substrate for
+    # the always-on intron-clustering and (when not opted out)
+    # derived-annotation passes downstream.
+    emit_blocks = True
     emit_cs = bool(args.emit_cs_tags)
+    cluster_introns = not bool(args.no_cluster_junctions)
+    emit_coverage = not bool(args.no_coverage)
+    emit_derived_annotation = not bool(args.no_derived_annotation)
+    intron_motif_priority = tuple(
+        m.strip() for m in str(args.intron_motif_priority).split(",")
+        if m.strip()
+    )
 
     chunks = _bam_alignment_chunks(cb_path, chunk_size=args.chunk_size)
     chunk_specs = [
@@ -975,71 +1007,106 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     (output_dir / "feature_quant" / "_SUCCESS").write_bytes(b"")
     pq.write_table(feature_quant, output_dir / "feature_quant.parquet")
 
-    # ── Phase 1 resolve-stage aggregations (power-user toggles) ──────
+    # ── Resolve-stage aggregations ────────────────────────────────────
+    # alignments + alignment_blocks are materialised on demand here.
+    # Memory at 200M-read scale: ~25 GB blocks + ~30 GB alignments;
+    # cluster-node-friendly but a workstation-RAM stress test.
+    # Streaming variant lifts in when we cross 1B alignments.
     emit_outputs: dict[str, str] = {}
-    if emit_blocks and "alignment_blocks" in stage_outputs:
-        # alignments + alignment_blocks are materialised on demand here.
-        # Memory at 200M-read scale: ~25 GB blocks + ~30 GB alignments;
-        # cluster-node-friendly but a workstation-RAM stress test.
-        # Streaming variant lifts in when we cross 1B alignments.
-        alignments_table = pa_dataset.dataset(
-            stage_outputs["alignments"].directory
-        ).to_table()
-        blocks_table = pa_dataset.dataset(
-            stage_outputs["alignment_blocks"].directory
-        ).to_table()
+    alignments_table = pa_dataset.dataset(
+        stage_outputs["alignments"].directory
+    ).to_table()
+    blocks_table = pa_dataset.dataset(
+        stage_outputs["alignment_blocks"].directory
+    ).to_table()
 
-        if args.emit_pileup:
-            # Per-sample stratification via the read_demux mapping.
-            # read_demux is the same table the count stage already loaded.
-            rd = read_demux.select(["read_id", "sample_id"])
-            valid_mask = pa.compute.is_valid(rd.column("sample_id"))
-            rd_valid = rd.filter(valid_mask)
-            # If the same read appears in multiple demux rows (chimeras
-            # in S3), require all rows to agree on sample_id — match
-            # count_reads_per_gene's policy.
-            rd_unique = rd_valid.group_by("read_id").aggregate(
-                [("sample_id", "min"), ("sample_id", "max")]
+    # ── Intron clustering — always-on (introns.parquet) ──────────────
+    # The clustered INTRON_TABLE is the canonical splice-junction
+    # artifact downstream consumers (transcriptome cluster,
+    # derived-annotation pass) consume.
+    introns = aggregate_junctions(
+        blocks_table, alignments_table, genome, annotation=annotation,
+    )
+    if cluster_introns:
+        introns = cluster_junctions(
+            introns,
+            tolerance_bp=int(args.intron_tolerance_bp),
+            motif_priority=intron_motif_priority,
+        )
+    introns_path = output_dir / "introns.parquet"
+    pq.write_table(introns, introns_path)
+    emit_outputs["introns"] = str(introns_path)
+
+    # ── Coverage pile-up + derived annotation ─────────────────────────
+    # Both are default-on; the in-memory pile-up is consumed by the
+    # derived-annotation pass even when --no-coverage suppresses the
+    # on-disk write. Skipping both passes saves the resolve-stage
+    # pile-up compute entirely.
+    pileup_table: pa.Table | None = None
+    need_pileup = emit_coverage or emit_derived_annotation
+    if need_pileup:
+        rd = read_demux.select(["read_id", "sample_id"])
+        valid_mask = pa.compute.is_valid(rd.column("sample_id"))
+        rd_valid = rd.filter(valid_mask)
+        # If the same read appears in multiple demux rows (chimeras),
+        # require all rows to agree on sample_id — match the count
+        # stage's policy.
+        rd_unique = rd_valid.group_by("read_id").aggregate(
+            [("sample_id", "min"), ("sample_id", "max")]
+        )
+        rd_consistent = rd_unique.filter(
+            pa.compute.equal(
+                rd_unique.column("sample_id_min"),
+                rd_unique.column("sample_id_max"),
             )
-            rd_consistent = rd_unique.filter(
-                pa.compute.equal(
-                    rd_unique.column("sample_id_min"),
-                    rd_unique.column("sample_id_max"),
-                )
+        )
+        read_to_sample = {
+            str(rid): int(sid)
+            for rid, sid in zip(
+                rd_consistent.column("read_id").to_pylist(),
+                rd_consistent.column("sample_id_min").to_pylist(),
+                strict=True,
             )
-            read_to_sample = {
-                str(rid): int(sid)
-                for rid, sid in zip(
-                    rd_consistent.column("read_id").to_pylist(),
-                    rd_consistent.column("sample_id_min").to_pylist(),
-                    strict=True,
-                )
-            }
-            pileup = build_pileup(
-                blocks_table, alignments_table, genome.contigs,
+        }
+        pileup_table = build_pileup(
+            blocks_table, alignments_table, genome.contigs,
+            read_to_sample=read_to_sample,
+        )
+
+    if emit_coverage and pileup_table is not None:
+        pileup_path = output_dir / "coverage.parquet"
+        pq.write_table(pileup_table, pileup_path)
+        emit_outputs["coverage"] = str(pileup_path)
+
+    if emit_derived_annotation and pileup_table is not None:
+        # Local import: derived_annotation depends on Part B schemas
+        # registered when the module is imported.
+        from constellation.sequencing.quant.derived_annotation import (
+            build_derived_annotation,
+        )
+        from constellation.sequencing.annotation.io import save_annotation
+
+        derived_annotation, block_assignments, exon_psi = (
+            build_derived_annotation(
+                coverage=pileup_table,
+                introns=introns,
+                alignment_blocks=blocks_table,
+                alignments=alignments_table,
+                contigs=genome.contigs,
                 read_to_sample=read_to_sample,
+                min_exon_depth=int(args.min_exon_depth),
+                min_intron_read_count=int(args.min_intron_read_count),
             )
-            pileup_path = output_dir / "coverage.parquet"
-            pq.write_table(pileup, pileup_path)
-            emit_outputs["coverage"] = str(pileup_path)
-
-        if args.emit_junctions:
-            junctions = aggregate_junctions(
-                blocks_table, alignments_table, genome,
-                annotation=annotation,
-            )
-            junctions_path = output_dir / "junctions.parquet"
-            pq.write_table(junctions, junctions_path)
-            emit_outputs["junctions"] = str(junctions_path)
-
-        if args.emit_fingerprints:
-            fingerprints = compute_read_fingerprints(
-                blocks_table, alignments_table, genome.contigs,
-                intron_quantum_bp=int(args.intron_quantum_bp),
-            )
-            fingerprints_path = output_dir / "read_fingerprints.parquet"
-            pq.write_table(fingerprints, fingerprints_path)
-            emit_outputs["read_fingerprints"] = str(fingerprints_path)
+        )
+        derived_dir = output_dir / "derived_annotation"
+        save_annotation(derived_annotation, derived_dir, format="parquet_dir")
+        block_assignments_path = output_dir / "block_exon_assignments.parquet"
+        pq.write_table(block_assignments, block_assignments_path)
+        exon_psi_path = output_dir / "exon_psi.parquet"
+        pq.write_table(exon_psi, exon_psi_path)
+        emit_outputs["derived_annotation"] = str(derived_dir)
+        emit_outputs["block_exon_assignments"] = str(block_assignments_path)
+        emit_outputs["exon_psi"] = str(exon_psi_path)
 
     # ── Wide gene × sample TSVs (human-facing) ───────────────────────
     matrix_outputs: dict[str, str] = {}
@@ -1119,13 +1186,15 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             "min_overlap_fraction": args.min_overlap_fraction,
             "matrix_format": args.matrix_format,
             "matrix_min_count": args.matrix_min_count,
-            "emit_blocks": bool(emit_blocks),
-            "emit_pileup": bool(args.emit_pileup),
-            "emit_junctions": bool(args.emit_junctions),
-            "emit_fingerprints": bool(args.emit_fingerprints),
+            "no_cluster_junctions": bool(args.no_cluster_junctions),
+            "intron_tolerance_bp": int(args.intron_tolerance_bp),
+            "intron_motif_priority": str(args.intron_motif_priority),
+            "no_coverage": bool(args.no_coverage),
+            "no_derived_annotation": bool(args.no_derived_annotation),
+            "min_exon_depth": int(args.min_exon_depth),
+            "min_intron_read_count": int(args.min_intron_read_count),
             "emit_cs_tags": bool(emit_cs),
             "intron_min_bp": int(args.intron_min_bp),
-            "intron_quantum_bp": int(args.intron_quantum_bp),
         },
         "stages": per_stage,
         "outputs": manifest_outputs,
@@ -1148,14 +1217,16 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
 def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     """Phase 2 — group reads into transcript / isoform clusters.
 
-    Inputs: a `transcriptome align --emit-blocks` output dir + the S1
-    demux dir + samples.tsv. Outputs: clusters.parquet,
-    cluster_membership.parquet, optional cluster.fa + cluster_summary.tsv.
+    Inputs: a `transcriptome align` output dir (alignment_blocks/ +
+    introns.parquet) + the S1 demux dir + samples.tsv. Outputs:
+    clusters.parquet, cluster_membership.parquet, optional cluster.fa +
+    cluster_summary.tsv.
 
-    Fingerprints are derived fresh from `alignment_blocks/` at every
-    invocation so the `--intron-quantum-bp` knob is a clustering
-    parameter rather than an alignment parameter — sweeping it never
-    requires re-running align.
+    Fingerprints are derived fresh at every invocation against the
+    INTRON_TABLE in introns.parquet, so the ``--intron-tolerance-bp``
+    knob is a clustering parameter rather than an alignment parameter
+    — sweeping it never requires re-running align (we re-cluster the
+    raw per-position rows on the fly).
     """
     import json
     from collections import Counter
@@ -1170,6 +1241,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         NullProgress,
         StreamProgress,
     )
+    from constellation.sequencing.quant import cluster_junctions
     from constellation.sequencing.reference.io import load_genome_reference
     from constellation.sequencing.samples import Samples
     from constellation.sequencing.transcriptome.cluster_genome import (
@@ -1192,9 +1264,18 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     if not blocks_success.exists():
         print(
             f"--align-dir missing alignment_blocks/_SUCCESS: {align_dir}\n"
-            "rerun `transcriptome align` with --emit-blocks (Phase 2 "
-            "derives fingerprints fresh; the read_fingerprints.parquet "
-            "single-file emit is informational and not required).",
+            "rerun `transcriptome align` (block extraction is now "
+            "always-on; alignment_blocks/ should always be present in "
+            "a successful align output).",
+            file=sys.stderr,
+        )
+        return 2
+    introns_path = align_dir / "introns.parquet"
+    if not introns_path.exists():
+        print(
+            f"--align-dir missing introns.parquet: {align_dir}\n"
+            "rerun `transcriptome align` (intron emission is now "
+            "always-on; introns.parquet is the cluster-key substrate).",
             file=sys.stderr,
         )
         return 2
@@ -1311,12 +1392,46 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             }
         )
 
-    # ── Derive fingerprints fresh (clustering-time quantum) ──────────
+    # ── Load introns.parquet; optionally re-cluster ─────────────────
+    introns_table = pq.read_table(align_dir / "introns.parquet")
+
+    # When the user explicitly overrides --intron-tolerance-bp at
+    # cluster time, re-run cluster_junctions against the raw per-position
+    # rows (each row in introns.parquet is still a distinct observed
+    # (donor, acceptor) pair). The motif-priority list rides as a
+    # comma-separated align-manifest value.
+    align_params = align_manifest.get("parameters", {})
+    align_tolerance = align_params.get("intron_tolerance_bp")
+    align_motif_priority = str(
+        align_params.get("intron_motif_priority", "GT-AG,GC-AG,AT-AC")
+    )
+    intron_motif_priority = tuple(
+        m.strip() for m in align_motif_priority.split(",") if m.strip()
+    )
+    effective_tolerance: int | None = args.intron_tolerance_bp
+    if (
+        effective_tolerance is not None
+        and align_tolerance is not None
+        and int(effective_tolerance) != int(align_tolerance)
+    ):
+        # Override differs from align — re-cluster.
+        introns_table = cluster_junctions(
+            introns_table,
+            tolerance_bp=int(effective_tolerance),
+            motif_priority=intron_motif_priority,
+        )
+    if effective_tolerance is None:
+        effective_tolerance = (
+            int(align_tolerance) if align_tolerance is not None else 5
+        )
+
+    # ── Derive fingerprints fresh against the (possibly re-clustered)
+    # INTRON_TABLE ───────────────────────────────────────────────────
     fingerprints_table = compute_read_fingerprints(
         blocks_table,
         alignments_table,
         contigs_table,
-        intron_quantum_bp=int(args.intron_quantum_bp),
+        introns_table,
     )
 
     # ── Pull trimmed transcript-window sequences for clustered reads ─
@@ -1509,7 +1624,8 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             "mode": str(args.mode),
             "max_5p_drift": int(args.max_5p_drift),
             "max_3p_drift": int(args.max_3p_drift),
-            "intron_quantum_bp": int(args.intron_quantum_bp),
+            "intron_tolerance_bp": int(effective_tolerance),
+            "intron_motif_priority": ",".join(intron_motif_priority),
             "min_cluster_size": int(args.min_cluster_size),
             "drop_drift_filtered": bool(args.drop_drift_filtered),
             "build_consensus": bool(args.build_consensus),

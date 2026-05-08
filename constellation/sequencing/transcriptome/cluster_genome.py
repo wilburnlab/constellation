@@ -1,16 +1,18 @@
 """Phase 2 — genome-guided fingerprint clustering.
 
 Consumes ``READ_FINGERPRINT_TABLE`` (re-derived at runtime from
-``alignment_blocks/`` so the ``--intron-quantum-bp`` knob is a clustering
-parameter, not an alignment parameter), the trimmed transcript-window
-sequences from S1 demux, and per-alignment block summaries; produces
-the splicing-topology-resolved clusters that Phase 4 will measure
-de novo Phase 3 against.
+``alignment_blocks/`` + ``introns.parquet``, so the
+``--intron-tolerance-bp`` knob is a clustering parameter — sweeping it
+re-runs ``cluster_junctions`` against the raw per-position rows
+in ``introns.parquet`` and rebuilds fingerprints in one shot), the
+trimmed transcript-window sequences from S1 demux, and per-alignment
+block summaries; produces the splicing-topology-resolved clusters that
+Phase 4 will measure de novo Phase 3 against.
 
 Granularity is the **transcript / isoform** level — finer than gene,
 coarser than per-base variant. A gene with N isoforms produces ≥ N
 clusters (truncated reads, novel isoforms, and basecaller-junction-
-errors can yield more); reads agreeing on quantised splicing
+errors can yield more); reads agreeing on canonical-intron-id splicing
 topology collapse into one cluster regardless of substitution noise.
 
 Algorithm (roadmap §2.1):
@@ -259,7 +261,9 @@ def cluster_by_fingerprint(
     ----------
     fingerprints : pa.Table
         ``READ_FINGERPRINT_TABLE``-shaped. Already derived against the
-        clustering-time ``intron_quantum_bp``.
+        clustering-time ``INTRON_TABLE`` (which carries the per-row
+        ``intron_id`` cluster assignments computed at the chosen
+        ``intron_tolerance_bp``).
     reads : pa.Table
         Must carry columns ``read_id``, ``sequence`` (the **trimmed
         transcript window**, NOT the raw read), and optionally
