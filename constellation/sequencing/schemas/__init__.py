@@ -14,6 +14,9 @@ Notable instances:
     READ_TABLE              basecalled-read records (FASTA/FASTQ-shaped)
     ALIGNMENT_TABLE         BAM-canonical alignment columns
     ALIGNMENT_TAG_TABLE     long-form for the rare-tag tail
+    ALIGNMENT_BLOCK_TABLE   per-CIGAR-block exon view (Phase 1)
+    SPLICE_JUNCTION_TABLE   cross-read junction aggregate (Phase 1)
+    READ_FINGERPRINT_TABLE  per-read canonical junction hash (Phase 1)
     RAW_SIGNAL_TABLE        POD5 raw signal — uses core.ragged_trace_1d
     CONTIG_TABLE            reference / assembly contigs
     FEATURE_TABLE           GFF-shaped features (genes, exons, repeats)
@@ -40,8 +43,11 @@ Notable instances:
 from __future__ import annotations
 
 from constellation.sequencing.schemas.alignment import (
+    ALIGNMENT_BLOCK_TABLE,
     ALIGNMENT_TABLE,
     ALIGNMENT_TAG_TABLE,
+    READ_FINGERPRINT_TABLE,
+    SPLICE_JUNCTION_TABLE,
     cigar_to_ops,
 )
 from constellation.sequencing.schemas.assembly import (
@@ -75,6 +81,9 @@ __all__ = [
     "READ_TABLE",
     "ALIGNMENT_TABLE",
     "ALIGNMENT_TAG_TABLE",
+    "ALIGNMENT_BLOCK_TABLE",
+    "SPLICE_JUNCTION_TABLE",
+    "READ_FINGERPRINT_TABLE",
     "RAW_SIGNAL_TABLE",
     "CONTIG_TABLE",
     "FEATURE_TABLE",

@@ -33,16 +33,22 @@ from constellation.sequencing.quant.gene_matrix import (
 )
 from constellation.sequencing.quant.genome_count import (
     count_reads_per_gene,
+    extract_alignment_blocks,
     fused_decode_filter_overlap_worker,
     serialise_gene_set,
 )
+from constellation.sequencing.quant.coverage import build_pileup
+from constellation.sequencing.quant.junctions import aggregate_junctions
 
 __all__ = [
     "GENE_ASSIGNMENT_SCHEMA",
+    "aggregate_junctions",
+    "build_pileup",
     "apply_filter_predicates",
     "build_gene_matrix",
     "compute_gene_overlap",
     "count_reads_per_gene",
+    "extract_alignment_blocks",
     "fused_decode_filter_overlap_worker",
     "gene_set_from_annotation",
     "render_gene_matrix_tsv",

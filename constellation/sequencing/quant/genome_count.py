@@ -16,6 +16,13 @@ Two surfaces:
         partitioned-dataset outputs (alignments, alignment_tags,
         gene_assignments) plus a stats dict. Mirrors S1's
         ``transcriptome.stages._fused_chunk_worker`` placement.
+
+        With ``emit_blocks=True`` the worker also captures the cs:Z
+        tag, parses each surviving alignment into its CIGAR-derived
+        blocks (preferring cs:long for match/mismatch attribution,
+        falling back to CIGAR), and returns a fifth shard
+        ``alignment_blocks``. Phase 1 power-user toggle — off by
+        default leaves the existing fast path untouched.
 """
 
 from __future__ import annotations
@@ -26,6 +33,11 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from constellation.sequencing.align.cigar import (
+    parse_cigar_blocks,
+    parse_cs_long_blocks,
+    query_start_from_cigar,
+)
 from constellation.sequencing.quant._kernels import (
     apply_filter_predicates,
     compute_gene_overlap,
@@ -33,6 +45,7 @@ from constellation.sequencing.quant._kernels import (
 from constellation.sequencing.readers.sam_bam import read_bam_alignments_chunk
 from constellation.sequencing.samples import Samples
 from constellation.sequencing.schemas.alignment import (
+    ALIGNMENT_BLOCK_TABLE,
     ALIGNMENT_TABLE,
     ALIGNMENT_TAG_TABLE,
 )
@@ -177,6 +190,102 @@ def count_reads_per_gene(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Block extraction (Phase 1 power-user toggle)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def extract_alignment_blocks(
+    alignments: pa.Table,
+    tags: pa.Table,
+    *,
+    intron_min_bp: int = 25,
+) -> pa.Table:
+    """Lift CIGAR + cs:long into one ``ALIGNMENT_BLOCK_TABLE`` row per
+    aligned exon-block.
+
+    Per surviving alignment, prefer cs:long (populates n_match /
+    n_mismatch) and fall back to CIGAR (leaves them null). ``query_start``
+    accounts for leading soft clips; hard clips are invisible to SEQ
+    and don't affect query coords. Block-break rule: any ``N``, plus
+    any ``D >= intron_min_bp``. Long ``I`` never breaks a block.
+
+    Returns an empty ALIGNMENT_BLOCK_TABLE-shaped table when alignments
+    is empty.
+    """
+    if alignments.num_rows == 0:
+        return ALIGNMENT_BLOCK_TABLE.empty_table()
+
+    # Build alignment_id → cs lookup once. Worker layer feeds us only
+    # the tag rows whose ``tag == 'cs'`` if it filtered upstream;
+    # otherwise we filter here.
+    cs_by_aid: dict[int, str] = {}
+    if tags.num_rows > 0:
+        if "tag" in tags.schema.names:
+            cs_mask = pc.equal(tags.column("tag"), "cs")
+            cs_rows = tags.filter(cs_mask)
+        else:
+            cs_rows = tags
+        if cs_rows.num_rows > 0:
+            cs_by_aid = {
+                int(aid): str(val)
+                for aid, val in zip(
+                    cs_rows.column("alignment_id").to_pylist(),
+                    cs_rows.column("value").to_pylist(),
+                    strict=True,
+                )
+            }
+
+    aids = alignments.column("alignment_id").to_pylist()
+    ref_starts = alignments.column("ref_start").to_pylist()
+    cigars = alignments.column("cigar_string").to_pylist()
+
+    rows: list[dict[str, Any]] = []
+    for aid, ref_start, cigar in zip(aids, ref_starts, cigars, strict=True):
+        if not cigar or cigar == "*":
+            continue
+        cs = cs_by_aid.get(int(aid))
+        if cs:
+            # cs:long does not encode soft clips — the leading soft-clip
+            # count from CIGAR is the cs-side query offset.
+            blocks = parse_cs_long_blocks(
+                cs,
+                ref_start=int(ref_start),
+                query_start=query_start_from_cigar(cigar),
+            )
+        else:
+            # parse_cigar_blocks handles soft clips internally; do NOT
+            # pre-add the leading-S count here or it gets double-counted.
+            blocks = parse_cigar_blocks(
+                cigar,
+                ref_start=int(ref_start),
+                intron_min_bp=intron_min_bp,
+            )
+        for blk in blocks:
+            rows.append(
+                {
+                    "alignment_id": int(aid),
+                    "block_index": int(blk.block_index),
+                    "ref_start": int(blk.ref_start),
+                    "ref_end": int(blk.ref_end),
+                    "query_start": int(blk.query_start),
+                    "query_end": int(blk.query_end),
+                    "n_match": (
+                        None if blk.n_match is None else int(blk.n_match)
+                    ),
+                    "n_mismatch": (
+                        None if blk.n_mismatch is None else int(blk.n_mismatch)
+                    ),
+                    "n_insert": int(blk.n_insert),
+                    "n_delete": int(blk.n_delete),
+                }
+            )
+
+    if not rows:
+        return ALIGNMENT_BLOCK_TABLE.empty_table()
+    return pa.Table.from_pylist(rows, schema=ALIGNMENT_BLOCK_TABLE)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Fused per-chunk worker
 # ──────────────────────────────────────────────────────────────────────
 
@@ -189,6 +298,8 @@ def fused_decode_filter_overlap_worker(
     overlap_kwargs: dict[str, Any],
     acquisition_id: int = 0,
     tags_to_keep: tuple[str, ...] = (),
+    emit_blocks: bool = False,
+    intron_min_bp: int = 25,
 ) -> dict[str, pa.Table]:
     """Per-chunk pipeline worker.
 
@@ -203,9 +314,23 @@ def fused_decode_filter_overlap_worker(
     set produced by :func:`constellation.sequencing.quant._kernels.gene_set_from_annotation`.
     Workers deserialise locally; avoids per-chunk pickling of the full
     Annotation. Bounded-small (~5–50k rows) so the IPC blob is a few MB.
+
+    With ``emit_blocks=True`` the worker also captures the cs tag (added
+    transparently to ``tags_to_keep`` if not already present), parses
+    each surviving alignment into ``ALIGNMENT_BLOCK_TABLE`` rows via
+    :func:`extract_alignment_blocks`, and returns a fifth shard
+    ``alignment_blocks``. The transparently-added cs tag is stripped
+    from the returned ``alignment_tags`` shard so the on-disk tag
+    table stays the size the user asked for.
     """
     bam_path_str, vo_start, n_records, worker_idx = chunk_spec
     bam_path = Path(bam_path_str)
+
+    user_tags = frozenset(tags_to_keep)
+    cs_added = emit_blocks and "cs" not in user_tags
+    effective_tags = (
+        tags_to_keep + ("cs",) if cs_added else tags_to_keep
+    )
 
     chunk_alignments, chunk_tags = read_bam_alignments_chunk(
         bam_path,
@@ -213,7 +338,7 @@ def fused_decode_filter_overlap_worker(
         n_records=int(n_records),
         worker_idx=int(worker_idx),
         acquisition_id=int(acquisition_id),
-        tags_to_keep=tags_to_keep,
+        tags_to_keep=effective_tags,
     )
     decoded = chunk_alignments.num_rows
 
@@ -226,22 +351,34 @@ def fused_decode_filter_overlap_worker(
         tag_mask = pc.is_in(chunk_tags.column("alignment_id"), value_set=kept_ids)
         chunk_tags = chunk_tags.filter(tag_mask)
 
+    # Block extraction reads cs out of the (possibly augmented) tag set
+    # before we drop the worker-internal cs rows.
+    blocks_table: pa.Table | None = None
+    if emit_blocks:
+        blocks_table = extract_alignment_blocks(
+            filtered, chunk_tags, intron_min_bp=intron_min_bp
+        )
+
+    if cs_added and chunk_tags.num_rows > 0:
+        # Strip the worker-internal cs rows from the user-visible shard.
+        not_cs = pc.not_equal(chunk_tags.column("tag"), "cs")
+        chunk_tags = chunk_tags.filter(not_cs)
+
     with pa.ipc.open_stream(pa.py_buffer(gene_set_bytes)) as reader:
         gene_set = reader.read_all()
 
     assignments = compute_gene_overlap(filtered, gene_set, **overlap_kwargs)
     after_overlap = assignments.num_rows
 
-    stats_table = pa.Table.from_pylist(
-        [
-            {
-                "worker_idx": int(worker_idx),
-                "decoded": int(decoded),
-                "after_filter": int(after_filter),
-                "after_overlap": int(after_overlap),
-            }
-        ]
-    )
+    stats_row: dict[str, Any] = {
+        "worker_idx": int(worker_idx),
+        "decoded": int(decoded),
+        "after_filter": int(after_filter),
+        "after_overlap": int(after_overlap),
+    }
+    if blocks_table is not None:
+        stats_row["n_blocks"] = int(blocks_table.num_rows)
+    stats_table = pa.Table.from_pylist([stats_row])
 
     # Cast filtered shards to schema for partitioned-parquet uniformity.
     if filtered.num_rows == 0:
@@ -249,12 +386,15 @@ def fused_decode_filter_overlap_worker(
     if chunk_tags.num_rows == 0:
         chunk_tags = ALIGNMENT_TAG_TABLE.empty_table()
 
-    return {
+    out: dict[str, pa.Table] = {
         "alignments": filtered,
         "alignment_tags": chunk_tags,
         "gene_assignments": assignments,
         "stats": stats_table,
     }
+    if blocks_table is not None:
+        out["alignment_blocks"] = blocks_table
+    return out
 
 
 def serialise_gene_set(gene_set: pa.Table) -> bytes:
@@ -270,6 +410,7 @@ def serialise_gene_set(gene_set: pa.Table) -> bytes:
 
 __all__ = [
     "count_reads_per_gene",
+    "extract_alignment_blocks",
     "fused_decode_filter_overlap_worker",
     "serialise_gene_set",
 ]

@@ -19,6 +19,24 @@ PAF (minimap2's tab-separated output) lands in this same schema —
 PAF is a strict subset of BAM in column space, so a separate
 ``PAF_TABLE`` would be redundant. The ``readers/paf.py`` reader fills
 the BAM-only columns with nulls.
+
+Alignment-derived per-block / aggregated views (Phase 1 power-user
+toggles on ``transcriptome align``):
+
+    ALIGNMENT_BLOCK_TABLE   one row per CIGAR-derived alignment block
+                            (M/=/X run between N or large I/D ops).
+                            Per-record exon view; primary input to
+                            pile-up, junctions, and fingerprints.
+    SPLICE_JUNCTION_TABLE   cross-read aggregate keyed on
+                            ``(contig_id, donor_pos, acceptor_pos,
+                            strand)``. Junctions are aggregated rather
+                            than exons because splice sites are *steep*
+                            (canonical GT-AG dinucleotide-anchored)
+                            while exon termini are fuzzy on first/last
+                            blocks (TSS / SSP / polyA scatter).
+    READ_FINGERPRINT_TABLE  per-read canonical junction-sequence hash;
+                            primary alignments only. The Phase 2
+                            cluster key.
 """
 
 from __future__ import annotations
@@ -73,8 +91,95 @@ ALIGNMENT_TAG_TABLE: pa.Schema = pa.schema(
 )
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Alignment-derived views (Phase 1 power-user toggles)
+# ──────────────────────────────────────────────────────────────────────
+
+
+# One row per CIGAR-derived alignment block. A "block" is a contiguous
+# M/=/X run bounded by N (intron) or large D operations (long I never
+# breaks a block — insertions add bases to the query within the same
+# aligned region). ``n_match``/``n_mismatch`` are populated from
+# cs:long when present; nullable when only CIGAR is available.
+# Coordinates are 0-based half-open.
+#
+# Contig is NOT a column here — block rows join back to ``ALIGNMENT_TABLE``
+# via ``alignment_id`` for ``ref_name``; aggregations into
+# ``SPLICE_JUNCTION_TABLE`` / ``READ_FINGERPRINT_TABLE`` resolve
+# ``ref_name → contig_id`` at aggregation time (where the
+# GenomeReference is in scope). Saves one column × N_blocks rows
+# (~600M rows at PromethION scale).
+ALIGNMENT_BLOCK_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("alignment_id", pa.int64(), nullable=False),
+        pa.field("block_index", pa.int32(), nullable=False),
+        pa.field("ref_start", pa.int64(), nullable=False),
+        pa.field("ref_end", pa.int64(), nullable=False),
+        # Query coords are on the trimmed transcript window that S2
+        # streamed into minimap2 (NOT on the raw read).
+        pa.field("query_start", pa.int32(), nullable=False),
+        pa.field("query_end", pa.int32(), nullable=False),
+        pa.field("n_match", pa.int32(), nullable=True),
+        pa.field("n_mismatch", pa.int32(), nullable=True),
+        pa.field("n_insert", pa.int32(), nullable=False),
+        pa.field("n_delete", pa.int32(), nullable=False),
+    ],
+    metadata={b"schema_name": b"AlignmentBlockTable"},
+)
+
+
+# Cross-read aggregate. One row per distinct (contig, donor, acceptor,
+# strand) tuple observed across the alignment_blocks input. ``motif``
+# is derived from the genome at donor[0:2] / acceptor[-2:] when a
+# GenomeReference is available (e.g. 'GT-AG', 'GC-AG', 'AT-AC',
+# 'other'). ``annotated`` is True iff the (donor_pos, acceptor_pos)
+# pair matches an intron implied by an Annotation FEATURE_TABLE.
+SPLICE_JUNCTION_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("junction_id", pa.int64(), nullable=False),
+        pa.field("contig_id", pa.int64(), nullable=False),
+        pa.field("donor_pos", pa.int64(), nullable=False),
+        pa.field("acceptor_pos", pa.int64(), nullable=False),
+        # '+' | '-' | '?' (when not splice-motif-disambiguated)
+        pa.field("strand", pa.string(), nullable=False),
+        pa.field("read_count", pa.int32(), nullable=False),
+        pa.field("motif", pa.string(), nullable=True),
+        pa.field("annotated", pa.bool_(), nullable=True),
+        pa.field("gene_id", pa.int64(), nullable=True),
+    ],
+    metadata={b"schema_name": b"SpliceJunctionTable"},
+)
+
+
+# Per-read canonical splicing-topology hash. Primary alignments only
+# (secondary/supplementary excluded). ``fingerprint_hash`` is computed
+# from the canonical tuple ``(contig_id, strand, [(donor//q)*q,
+# (acceptor//q)*q for each junction])`` where ``q`` is the
+# ``intron_quantum_bp`` knob (default 10) — quantisation absorbs small
+# cryptic-splice excursions so they share a fingerprint bucket while
+# leaving larger excursions to surface as cluster discordance.
+# ``junction_signature`` is a human-readable form for diagnostics, not
+# the cluster key.
+READ_FINGERPRINT_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("read_id", pa.string(), nullable=False),
+        pa.field("contig_id", pa.int64(), nullable=False),
+        pa.field("strand", pa.string(), nullable=False),
+        pa.field("n_blocks", pa.int32(), nullable=False),
+        pa.field("span_start", pa.int64(), nullable=False),
+        pa.field("span_end", pa.int64(), nullable=False),
+        pa.field("fingerprint_hash", pa.uint64(), nullable=False),
+        pa.field("junction_signature", pa.string(), nullable=False),
+    ],
+    metadata={b"schema_name": b"ReadFingerprintTable"},
+)
+
+
 register_schema("AlignmentTable", ALIGNMENT_TABLE)
 register_schema("AlignmentTagTable", ALIGNMENT_TAG_TABLE)
+register_schema("AlignmentBlockTable", ALIGNMENT_BLOCK_TABLE)
+register_schema("SpliceJunctionTable", SPLICE_JUNCTION_TABLE)
+register_schema("ReadFingerprintTable", READ_FINGERPRINT_TABLE)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -100,5 +205,8 @@ def cigar_to_ops(cigar_string: str) -> pa.Array:
 __all__ = [
     "ALIGNMENT_TABLE",
     "ALIGNMENT_TAG_TABLE",
+    "ALIGNMENT_BLOCK_TABLE",
+    "SPLICE_JUNCTION_TABLE",
+    "READ_FINGERPRINT_TABLE",
     "cigar_to_ops",
 ]

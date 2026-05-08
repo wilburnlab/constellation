@@ -330,6 +330,65 @@ def _build_transcriptome_parser(subs) -> None:
             "genes including zero-observation rows for stable indexing)"
         ),
     )
+    # Phase 1 power-user toggles — alignment-derived intermediates.
+    # Off by default so existing align invocations have unchanged
+    # wall-clock + output footprint.
+    p_aln.add_argument(
+        "--emit-blocks",
+        action="store_true",
+        help=(
+            "write alignment_blocks/ partitioned dataset (per-CIGAR-block "
+            "exon view, with cs:long-derived n_match / n_mismatch when "
+            "available). Required prereq for the other --emit-* flags."
+        ),
+    )
+    p_aln.add_argument(
+        "--emit-pileup",
+        action="store_true",
+        help=(
+            "write coverage.parquet — RLE-encoded depth tracks per "
+            "(contig, sample). Implies --emit-blocks."
+        ),
+    )
+    p_aln.add_argument(
+        "--emit-junctions",
+        action="store_true",
+        help=(
+            "write junctions.parquet — cross-read aggregated splice "
+            "junctions with motif + annotation match. Implies --emit-blocks."
+        ),
+    )
+    p_aln.add_argument(
+        "--emit-fingerprints",
+        action="store_true",
+        help=(
+            "write read_fingerprints.parquet — per-read canonical "
+            "junction-sequence hashes (the Phase 2 cluster key). "
+            "Implies --emit-blocks."
+        ),
+    )
+    p_aln.add_argument(
+        "--intron-min-bp",
+        type=int,
+        default=25,
+        help=(
+            "CIGAR D operations >= this length break a block (used as "
+            "intron proxy for assembly-vs-genome where minimap2 emits "
+            "D rather than N). Default 25; ignored on the cs:long path "
+            "which has its own splice operator."
+        ),
+    )
+    p_aln.add_argument(
+        "--intron-quantum-bp",
+        type=int,
+        default=10,
+        help=(
+            "fingerprint quantisation: donor / acceptor coordinates are "
+            "rounded to multiples of this value before hashing. "
+            "Default 10 — absorbs small cryptic-splice excursions "
+            "into the same fingerprint bucket."
+        ),
+    )
     p_aln.add_argument("--resume", action="store_true")
     p_aln.add_argument("--progress", action="store_true")
     p_aln.set_defaults(func=_cmd_transcriptome_align)
@@ -607,7 +666,9 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         StreamProgress,
     )
     from constellation.sequencing.quant import (
+        aggregate_junctions,
         build_gene_matrix,
+        build_pileup,
         count_reads_per_gene,
         fused_decode_filter_overlap_worker,
         gene_set_from_annotation,
@@ -617,6 +678,9 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     from constellation.sequencing.readers.sam_bam import _bam_alignment_chunks
     from constellation.sequencing.reference.io import load_genome_reference
     from constellation.sequencing.samples import Samples
+    from constellation.sequencing.transcriptome.fingerprints import (
+        compute_read_fingerprints,
+    )
 
     # ── Mode dispatch ────────────────────────────────────────────────
     if args.reference is None:
@@ -699,6 +763,15 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         bam_success.write_bytes(b"")
 
     # ── Stage 2: decode_filter_overlap (N-way fused worker) ──────────
+    # Phase 1 emit-* flags: any of pileup/junctions/fingerprints
+    # implies emit-blocks (they all derive from alignment_blocks/).
+    emit_blocks = (
+        args.emit_blocks
+        or args.emit_pileup
+        or args.emit_junctions
+        or args.emit_fingerprints
+    )
+
     chunks = _bam_alignment_chunks(cb_path, chunk_size=args.chunk_size)
     chunk_specs = [
         (str(cb_path), int(vo), int(n), idx)
@@ -715,17 +788,26 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         "min_overlap_fraction": args.min_overlap_fraction,
         "allow_antisense": args.allow_antisense,
     }
+    output_keys: tuple[str, ...] = (
+        "alignments", "alignment_tags", "gene_assignments", "stats"
+    )
+    if emit_blocks:
+        output_keys = output_keys + ("alignment_blocks",)
+    worker_kwargs: dict = {
+        "gene_set_bytes": gene_set_bytes,
+        "filter_kwargs": filter_kwargs,
+        "overlap_kwargs": overlap_kwargs,
+    }
+    if emit_blocks:
+        worker_kwargs["emit_blocks"] = True
+        worker_kwargs["intron_min_bp"] = int(args.intron_min_bp)
     stage_outputs = run_batched(
         worker_fn=fused_decode_filter_overlap_worker,
         batches=chunk_specs,
         output_dir=output_dir,
-        output_keys=("alignments", "alignment_tags", "gene_assignments", "stats"),
+        output_keys=output_keys,
         n_workers=args.threads,
-        worker_kwargs={
-            "gene_set_bytes": gene_set_bytes,
-            "filter_kwargs": filter_kwargs,
-            "overlap_kwargs": overlap_kwargs,
-        },
+        worker_kwargs=worker_kwargs,
         progress_cb=cb,
         resume=args.resume,
         stage_label="decode_filter_overlap",
@@ -746,6 +828,72 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     pq.write_table(feature_quant, fq_dir / "part-00000.parquet")
     (output_dir / "feature_quant" / "_SUCCESS").write_bytes(b"")
     pq.write_table(feature_quant, output_dir / "feature_quant.parquet")
+
+    # ── Phase 1 resolve-stage aggregations (power-user toggles) ──────
+    emit_outputs: dict[str, str] = {}
+    if emit_blocks and "alignment_blocks" in stage_outputs:
+        # alignments + alignment_blocks are materialised on demand here.
+        # Memory at 200M-read scale: ~25 GB blocks + ~30 GB alignments;
+        # cluster-node-friendly but a workstation-RAM stress test.
+        # Streaming variant lifts in when we cross 1B alignments.
+        alignments_table = pa_dataset.dataset(
+            stage_outputs["alignments"].directory
+        ).to_table()
+        blocks_table = pa_dataset.dataset(
+            stage_outputs["alignment_blocks"].directory
+        ).to_table()
+
+        if args.emit_pileup:
+            # Per-sample stratification via the read_demux mapping.
+            # read_demux is the same table the count stage already loaded.
+            rd = read_demux.select(["read_id", "sample_id"])
+            valid_mask = pa.compute.is_valid(rd.column("sample_id"))
+            rd_valid = rd.filter(valid_mask)
+            # If the same read appears in multiple demux rows (chimeras
+            # in S3), require all rows to agree on sample_id — match
+            # count_reads_per_gene's policy.
+            rd_unique = rd_valid.group_by("read_id").aggregate(
+                [("sample_id", "min"), ("sample_id", "max")]
+            )
+            rd_consistent = rd_unique.filter(
+                pa.compute.equal(
+                    rd_unique.column("sample_id_min"),
+                    rd_unique.column("sample_id_max"),
+                )
+            )
+            read_to_sample = {
+                str(rid): int(sid)
+                for rid, sid in zip(
+                    rd_consistent.column("read_id").to_pylist(),
+                    rd_consistent.column("sample_id_min").to_pylist(),
+                    strict=True,
+                )
+            }
+            pileup = build_pileup(
+                blocks_table, alignments_table, genome.contigs,
+                read_to_sample=read_to_sample,
+            )
+            pileup_path = output_dir / "coverage.parquet"
+            pq.write_table(pileup, pileup_path)
+            emit_outputs["coverage"] = str(pileup_path)
+
+        if args.emit_junctions:
+            junctions = aggregate_junctions(
+                blocks_table, alignments_table, genome,
+                annotation=annotation,
+            )
+            junctions_path = output_dir / "junctions.parquet"
+            pq.write_table(junctions, junctions_path)
+            emit_outputs["junctions"] = str(junctions_path)
+
+        if args.emit_fingerprints:
+            fingerprints = compute_read_fingerprints(
+                blocks_table, alignments_table, genome.contigs,
+                intron_quantum_bp=int(args.intron_quantum_bp),
+            )
+            fingerprints_path = output_dir / "read_fingerprints.parquet"
+            pq.write_table(fingerprints, fingerprints_path)
+            emit_outputs["read_fingerprints"] = str(fingerprints_path)
 
     # ── Wide gene × sample TSVs (human-facing) ───────────────────────
     matrix_outputs: dict[str, str] = {}
@@ -793,6 +941,20 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         }
     )
 
+    manifest_outputs: dict[str, str] = {
+        "bam": str(aligned_bam),
+        "alignments": str(stage_outputs["alignments"].directory),
+        "alignment_tags": str(stage_outputs["alignment_tags"].directory),
+        "gene_assignments": str(stage_outputs["gene_assignments"].directory),
+        "feature_quant": str(output_dir / "feature_quant.parquet"),
+    }
+    if emit_blocks and "alignment_blocks" in stage_outputs:
+        manifest_outputs["alignment_blocks"] = str(
+            stage_outputs["alignment_blocks"].directory
+        )
+    manifest_outputs.update(emit_outputs)
+    manifest_outputs.update(matrix_outputs)
+
     manifest = {
         "demux_dir": str(demux_dir),
         "reference": str(reference),
@@ -807,16 +969,15 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             "min_overlap_fraction": args.min_overlap_fraction,
             "matrix_format": args.matrix_format,
             "matrix_min_count": args.matrix_min_count,
+            "emit_blocks": bool(emit_blocks),
+            "emit_pileup": bool(args.emit_pileup),
+            "emit_junctions": bool(args.emit_junctions),
+            "emit_fingerprints": bool(args.emit_fingerprints),
+            "intron_min_bp": int(args.intron_min_bp),
+            "intron_quantum_bp": int(args.intron_quantum_bp),
         },
         "stages": per_stage,
-        "outputs": {
-            "bam": str(aligned_bam),
-            "alignments": str(stage_outputs["alignments"].directory),
-            "alignment_tags": str(stage_outputs["alignment_tags"].directory),
-            "gene_assignments": str(stage_outputs["gene_assignments"].directory),
-            "feature_quant": str(output_dir / "feature_quant.parquet"),
-            **matrix_outputs,
-        },
+        "outputs": manifest_outputs,
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     (output_dir / "_SUCCESS").write_bytes(b"")
