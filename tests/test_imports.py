@@ -156,6 +156,24 @@ import constellation.models
 import constellation.cli
 import constellation.thirdparty
 import constellation.data
+import constellation.viz
+import constellation.viz.tracks
+import constellation.viz.tracks.base
+import constellation.viz.tracks.coverage_histogram
+import constellation.viz.tracks.gene_annotation
+import constellation.viz.tracks.reference_sequence
+import constellation.viz.tracks.splice_junctions
+import constellation.viz.tracks.read_pileup
+import constellation.viz.tracks.cluster_pileup
+import constellation.viz.server
+import constellation.viz.server.session
+import constellation.viz.frontend
+import constellation.viz.frontend.build
+# `viz.server.arrow_stream`, `viz.server.app`, `viz.server.endpoints.*`,
+# `viz.raster.*`, and `viz.cli` require fastapi/datashader (gated behind
+# the [viz] extras) — exercised in `tests/test_viz_server.py` and
+# `tests/test_viz_kernels_extended.py`, which use
+# `pytest.importorskip("fastapi")` / `pytest.importorskip("datashader")`.
 
 
 def test_version_exposed():

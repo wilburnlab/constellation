@@ -36,3 +36,13 @@ site/
 # Third-party installs (fetched by scripts/install-*.sh; never commit binaries)
 third_party/**
 !third_party/README.md
+
+# Viz frontend build artifacts. Source under constellation/viz/frontend/ is
+# committed; the built bundle under constellation/viz/static/ is produced by
+# `python -m constellation.viz.frontend.build` (or CI on tag push) and shipped
+# in release wheels.
+constellation/viz/static/**
+!constellation/viz/static/.gitkeep
+constellation/viz/frontend/node_modules/
+constellation/viz/frontend/dist/
+constellation/viz/frontend/.vite/

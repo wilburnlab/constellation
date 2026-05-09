@@ -90,6 +90,13 @@ def _build_parser() -> argparse.ArgumentParser:
     # Reference imports / fetch / summary / validate.
     _build_reference_parser(subs)
 
+    # Visualization subtree — `constellation viz genome --session DIR`.
+    # The full `[viz]` extras (fastapi / uvicorn / datashader) are
+    # only required when the user actually invokes a viz subcommand;
+    # the parser registration is cheap import-wise.
+    from constellation.viz.cli import build_parser as _build_viz_parser
+    _build_viz_parser(subs)
+
     # Placeholders so `--help` advertises the intended surface. Wire as
     # the underlying modules are ported.
     for name, summary in [

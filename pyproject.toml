@@ -39,7 +39,19 @@ ms         = ["requests", "koinapy"]
 sequencing = ["pod5>=0.3", "edlib", "parasail", "pysam>=0.21"]
 structure  = []  # OpenMM + PDBFixer are conda-only; guarded lazy-import in thirdparty/
 dynamics   = []  # same
-all        = ["constellation[ms,sequencing,structure,dynamics]"]
+# Visualization layer: FastAPI server + Datashader rasterization for the
+# `constellation viz <subcommand>` and `constellation dashboard` GUIs. The JS
+# frontend ships pre-built under constellation/viz/static/ (gitignored source,
+# built by python -m constellation.viz.frontend.build or by CI on tag push).
+viz        = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "datashader>=0.16",
+    "websockets>=12",
+    "httpx>=0.27",  # used by the FastAPI test client; keep with viz so the
+                    # viz test suite installs cleanly without dev extras.
+]
+all        = ["constellation[ms,sequencing,structure,dynamics,viz]"]
 dev        = ["pytest>=8.0", "ruff>=0.9", "pre-commit>=4.0"]
 
 [project.scripts]
@@ -53,6 +65,15 @@ koina-library    = "constellation.cli.__main__:main_koina"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["constellation*"]
+
+# Ship the pre-built JS bundle (under constellation/viz/static/<entry>/...) and
+# the bundled JSON data files alongside the Python source. The static/ tree is
+# git-ignored — wheels published from a release CI run will contain the built
+# bundle; source-tarball installs without it produce an actionable error at
+# `constellation viz` startup pointing at `python -m constellation.viz.frontend.build`.
+[tool.setuptools.package-data]
+"constellation.viz" = ["static/**/*"]
+"constellation.data" = ["*.json", "_raw/**/*"]
 
 # ---------------------------------------------------------------------------
 # pytest

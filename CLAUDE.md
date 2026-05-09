@@ -6,7 +6,7 @@ Integrative bioinformatics platform: a shared core of physically grounded primit
 
 Constellation is absorbing four existing lab packages as a **clean rewrite** (no vendored source): **Cartographer** (MS proteomics, first port target), **NanoporeAnalysis** (POD5 → protein), **CoLLAGE** (codon optimization), **Contour** (PDB → MD prep). Chronologer (RT prediction) has already been absorbed into Cartographer.
 
-Current state — `core` shipped (`chem`, `sequence`, `io`, `structure`, `stats`, `optim`, partial `graph`); `massspec.{peptide, library, quant, search, acquisitions, annotation, io}` shipped; `sequencing.transcriptome` S1 demux + S1 reference layer + S2 Mode A genome-guided gene counting + Phase 1 alignment-derived intermediates shipped. Domain-specific status detail lives in the per-module CLAUDE.md files (see Module index below).
+Current state — `core` shipped (`chem`, `sequence`, `io`, `structure`, `stats`, `optim`, partial `graph`); `massspec.{peptide, library, quant, search, acquisitions, annotation, io}` shipped; `sequencing.transcriptome` S1 demux + S1 reference layer + S2 Mode A genome-guided gene counting + Phase 1 alignment-derived intermediates shipped; `viz` PR 1 (IGV-style genome browser via `constellation viz genome`) shipped. Domain-specific status detail lives in the per-module CLAUDE.md files (see Module index below).
 
 ## Architecture invariants (load-bearing — design principles from the PI)
 
@@ -50,10 +50,15 @@ Tertiary structure / dynamics are *consequences* of chemistry + sequence + (grap
 ```
 core  ─►  {massspec, sequencing, structure, codon, nmr,
            chromatography, electrophoresis}  ─►  cli
-           (domain modules — never cross-import)
+           (domain modules — never cross-import)             ▲
+                                                             │
+                                       viz ─────────read parquet only,
+                                            never imports a domain module
 ```
 
 Domain modules import from `core` and from `thirdparty` adapters; they **never cross-import to another domain module**. If a workflow legitimately spans modalities (e.g. the transcriptomic → proteomic pipeline), it lives as a thin top-level script under `constellation/` that imports from the relevant domains — no dedicated `bridges/` or `pipelines/` folder until we have ≥2 such workflows to compare.
+
+`viz` is a peer to the domain modules with a stricter constraint: it consumes the parquet outputs the domain pipelines produce (via `pa.dataset.dataset(path)` + filter pushdown) but never imports a domain module's Python API at runtime. The cli dispatcher lazy-imports `viz.cli` so the `[viz]` extras (fastapi / uvicorn / datashader) only become required when the user actually invokes a viz subcommand. The viz layer is then imported by `cli` like any other domain wiring.
 
 Adding a new module: confirm its place in this DAG before touching imports. Adding a new reader (Bruker `.d`, Sciex `.wiff`, DCD trajectory, ...) follows the reader-subclasses-core.io.readers rule without special handling.
 
@@ -70,7 +75,8 @@ Adding a new module: confirm its place in this DAG before touching imports. Addi
 | `constellation.chromatography` | HPLC-DAD (Agilent OpenLab `.dx` first; LC-MS hyphenation when MS lands). Reader subclass of `core.io.RawReader`; peak workflow via `core.signal` + `core.stats` EMG | scaffold | [docs/plans/companion-instruments-integration.md](docs/plans/companion-instruments-integration.md) |
 | `constellation.electrophoresis` | Capillary electrophoresis — Fragment Analyzer + ProteoAnalyzer (`.raw`, same LabVIEW-derived big-endian format). Ladder calibration via `LadderSpec` registry; physically-grounded models (Slater–Noolandi, reptation) reserved for `electrophoresis.physics` | scaffold | [docs/plans/companion-instruments-integration.md](docs/plans/companion-instruments-integration.md) |
 | `constellation.models` | NN architectures assembled from `core.nn` | scaffold | — |
-| `constellation.cli` | `constellation <subcommand>` dispatcher; `doctor` wired, others stubbed | partial (`doctor` works) | — |
+| `constellation.viz` | First-party visualization layer. PR 1: `constellation viz genome --session DIR` (IGV-style focused tool) — FastAPI server, Apache Arrow IPC over HTTP, SVG-only client rendering with vector save, six track kernels (`reference_sequence`, `gene_annotation`, `coverage_histogram`, `read_pileup`, `cluster_pileup`, `splice_junctions`), Datashader-backed hybrid mode for dense layers. PR 2 (pending): bare `constellation` opens a dashboard wrapping every CLI subcommand as a soft GUI form + xterm.js terminal, with embedded IPython panel | partial (PR 1 shipped) | [constellation/viz/CLAUDE.md](constellation/viz/CLAUDE.md) |
+| `constellation.cli` | `constellation <subcommand>` dispatcher; `doctor`, `transcriptome {demultiplex, align, cluster}`, `reference {import, fetch, summary, validate}`, and `viz genome` wired; others stubbed | partial | — |
 | `constellation.thirdparty` | Tool discovery (`registry.find`); EncyclopeDIA adapter registered | partial | — |
 | `constellation.data` | Packaged data: `elements.json` (NIST AME2020, full periodic table + per-isotope exact masses), `unimod.json` (1560 entries from upstream UNIMOD XML), `codon_tables.json` (7 NCBI tables as overrides on table 1), `proteases.json` (17 enzymes from ExPASy PeptideCutter), `neutral_losses.json` (4 MS neutral-loss rules: H2O / NH3 / HPO3 / H3PO4 with residue + modification triggers). Raw vendored sources under `data/_raw/` regenerable via `scripts/build-{elements,unimod,codon-tables,proteases,neutral-losses}-json.py` | partial | — |
 
