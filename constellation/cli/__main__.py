@@ -35,10 +35,6 @@ from constellation.thirdparty.registry import registered, try_find
 def _cmd_doctor(_args: argparse.Namespace) -> int:
     """Print a tool-status table."""
     tools = registered()
-    if not tools:
-        print("no third-party tools registered")
-        return 0
-
     rows: list[tuple[str, str, str, str]] = []
     for spec in tools:
         handle = try_find(spec.name)
@@ -52,6 +48,15 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
             version = handle.version or "—"
         rows.append((spec.name, status, version, where))
 
+    # Frontend bundle row(s) — one per known entry. Doesn't depend on the
+    # [viz] extras (we just stat a directory + read JSON), so this runs
+    # even when fastapi / uvicorn / datashader aren't installed.
+    rows.extend(_doctor_frontend_rows())
+
+    if not rows:
+        print("no third-party tools or frontend bundles registered")
+        return 0
+
     name_w = max(len(r[0]) for r in rows + [("tool", "", "", "")])
     status_w = max(len(r[1]) for r in rows + [("", "status", "", "")])
     ver_w = max(len(r[2]) for r in rows + [("", "", "version", "")])
@@ -63,6 +68,47 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
         print(f"{name:<{name_w}}  {status:<{status_w}}  {version:<{ver_w}}  {where}")
     # exit nonzero if any tool is missing — lets CI gate on it
     return 0 if all(r[1] == "ok" for r in rows) else 1
+
+
+def _doctor_frontend_rows() -> list[tuple[str, str, str, str]]:
+    """Probe ``constellation/viz/static/<entry>/`` for installed bundles.
+
+    PR 1 ships only the ``genome`` entry. PR 2 will add ``dashboard``;
+    extend the ``_ENTRIES`` list when it lands. Reads `bundle.json` via
+    `constellation.viz.install.read_bundle_metadata` — a stdlib-only
+    helper, so this runs even without the `[viz]` extras installed.
+    """
+    from pathlib import Path
+
+    from constellation.viz.install import read_bundle_metadata
+
+    static_root = Path(__file__).resolve().parents[1] / "viz" / "static"
+    rows: list[tuple[str, str, str, str]] = []
+    for entry in ("genome",):
+        entry_dir = static_root / entry
+        metadata = read_bundle_metadata(entry_dir)
+        bundle_present = (
+            entry_dir.is_dir()
+            and (entry_dir / "index.genome.html").is_file()
+        )
+        name = f"viz frontend ({entry})"
+        if bundle_present:
+            version = (
+                str(metadata.get("constellation_version", "unknown"))
+                if metadata
+                else "unknown"
+            )
+            rows.append((name, "ok", version, str(entry_dir)))
+        else:
+            rows.append(
+                (
+                    name,
+                    "not installed",
+                    "—",
+                    "(run: constellation viz install-frontend --from <tarball>)",
+                )
+            )
+    return rows
 
 
 def _cmd_not_wired(name: str) -> Callable[[argparse.Namespace], int]:

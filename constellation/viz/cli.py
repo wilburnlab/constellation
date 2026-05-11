@@ -6,6 +6,11 @@ Subcommands:
   browser on the session's parquet outputs. Boots a local FastAPI server
   via uvicorn and (unless ``--no-browser``) opens the browser at the
   served URL.
+- ``constellation viz install-frontend --from <tarball>`` — extract a
+  prebuilt frontend bundle into the package's ``static/<entry>/`` dir.
+  Used by source-checkout / HPC installs where the JS toolchain isn't
+  available (or doesn't work — e.g. OSC's TLS proxy refuses npm). See
+  ``constellation.viz.install`` for the extraction implementation.
 
 The dashboard subcommand (``constellation dashboard``) lands in PR 2.
 PR 1 reserves the parser slot but does not wire it.
@@ -15,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import socket
+import sys
 from pathlib import Path
 
 
@@ -62,6 +68,50 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     )
     p_genome.set_defaults(func=cmd_viz_genome)
 
+    p_install = viz_subs.add_parser(
+        "install-frontend",
+        help=(
+            "Extract a prebuilt frontend bundle into the package's "
+            "static/ dir (for source-checkout / HPC installs that can't "
+            "run pnpm/npm). Produce the tarball via "
+            "`python -m constellation.viz.frontend.build --pack`."
+        ),
+    )
+    p_install.add_argument(
+        "--from",
+        dest="from_path",
+        required=True,
+        type=Path,
+        help=(
+            "path to a local `constellation-viz-frontend-<version>"
+            ".tar.gz` produced by the build helper's --pack flag. The "
+            "adjacent <tarball>.sha256 sidecar is read for integrity "
+            "verification (skip with --no-verify)."
+        ),
+    )
+    p_install.add_argument(
+        "--entry",
+        default="genome",
+        help="bundle entry to install (default: genome)",
+    )
+    p_install.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "replace any existing bundle at static/<entry>/. Without "
+            "this, install refuses to overwrite a non-empty target."
+        ),
+    )
+    p_install.add_argument(
+        "--no-verify",
+        action="store_true",
+        help=(
+            "skip sha256 verification against the sidecar (warning "
+            "printed to stderr)"
+        ),
+    )
+    p_install.set_defaults(func=cmd_viz_install_frontend)
+
 
 def cmd_viz_genome(args: argparse.Namespace) -> int:
     """Handler — lazy-imports uvicorn + the FastAPI app factory.
@@ -101,6 +151,38 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
     config = uvicorn.Config(app, host=args.host, port=port, log_level="info")
     server = uvicorn.Server(config)
     server.run()
+    return 0
+
+
+def cmd_viz_install_frontend(args: argparse.Namespace) -> int:
+    """Handler for ``constellation viz install-frontend --from <tarball>``.
+
+    Lazy-imports ``constellation.viz.install`` so the top-level CLI
+    doesn't pay for the import on unrelated subcommands. Surface
+    ``InstallError`` messages verbatim — they're already formatted for
+    the user.
+    """
+    from constellation.viz.install import (
+        InstallError,
+        install_frontend_from_tarball,
+    )
+
+    try:
+        result = install_frontend_from_tarball(
+            local_path=args.from_path,
+            entry=args.entry,
+            force=args.force,
+            verify=not args.no_verify,
+        )
+    except InstallError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    version = result.bundle_metadata.get("constellation_version") or "unknown"
+    print(
+        f"installed constellation viz frontend ({result.entry}, "
+        f"version {version}) at {result.dest_dir}"
+    )
     return 0
 
 

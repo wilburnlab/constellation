@@ -2,8 +2,10 @@
 
 ## Status
 
-- **PR 1** (`constellation viz genome` — focused IGV-style genome browser) — **SHIPPED**. Six track kernels (`reference_sequence`, `gene_annotation`, `coverage_histogram`, `read_pileup`, `cluster_pileup`, `splice_junctions`); FastAPI server with Apache Arrow IPC streaming; Datashader-backed hybrid mode; SVG-only client rendering with vector save. 46 unit tests + 1 slow uvicorn-boot e2e — all green; full repo suite remains 1348 passing, no regressions, no new ruff errors.
-- **PR 2** (dashboard shell wrapping the CLI as a soft GUI; no-arg `constellation` opens it) — pending. Includes the auto-introspected CLI tree + curated overlay, the subprocess runner with single-compute-job lock, an embedded IPython panel, and the `dockview-react` panel host. The IGV browser from PR 1 mounts as a panel inside the dashboard without changes to its kernel architecture.
+- **PR 1** (`constellation viz genome` — focused IGV-style genome browser) — **SHIPPED** at commit `bd505d6`. Six track kernels; FastAPI server with Apache Arrow IPC streaming; SVG-only client + Datashader hybrid mode. 46 unit tests + 1 slow uvicorn-boot e2e all green; full repo suite remains 1348 passing.
+- **PR 1.5** (build-helper `--pack` mode + `constellation viz install-frontend --from <local>`) — **SHIPPED**. 15 install tests + smoke imports + `constellation doctor` row; full repo suite 1363 passing (was 1348), no regressions, no new ruff errors. End-to-end CLI round-trip verified locally. Workstation-build-then-ship-to-cluster path that bypasses npm-on-HPC entirely.
+- **PR 1.6** (release CI + URL-fetch addition) — pending. Three things land together: a GitHub Actions workflow that runs `--pack` on tag push and publishes the tarball + sha256 sidecar to the GitHub release; a wheel-with-bundle published to PyPI (the load-bearing path for lab users); and a new URL-fetch operating mode added to `constellation viz install-frontend` (no flags = use `constellation.__version__` to derive the URL). All three become useful at the same instant.
+- **PR 2** (dashboard shell wrapping the CLI as soft GUI) — pending.
 
 ## Context
 
@@ -14,7 +16,30 @@ This work scaffolds a first-party visualization layer + GUI dashboard onto Const
 1. **Make the existing pipeline outputs explorable** via an IGV-style genome browser that reads the existing parquet datasets directly. This validates the core viz architecture (server, kernels, rendering, export) on the load-bearing modality.
 2. **Make the CLI accessible to mouse-driven users** via a dashboard that wraps every CLI subcommand as a soft-GUI form-and-terminal panel, preserving the CLI-primary invariant (the dashboard never duplicates compute logic — it constructs CLI invocations and shows their output).
 
-The deliverable lands in two PRs. PR 1 ships the IGV-style focused tool standalone. PR 2 wraps it in a dashboard shell with auto-introspected forms for every CLI subcommand and an embedded IPython terminal.
+The deliverable lands across four PRs (1, 1.5, 1.6, 2; see Status block above). PR 1 ships the IGV-style focused tool standalone. PR 1.5 + PR 1.6 together close the loop on distributing the prebuilt frontend bundle so HPC / source-checkout users never invoke a JS toolchain. PR 2 wraps the genome browser inside a dashboard shell with auto-introspected forms for every CLI subcommand and an embedded IPython terminal.
+
+## Frontend distribution model
+
+The viz layer is a Python package that also serves a small browser SPA. This crosses a language boundary — Python on one side, TypeScript on the other — so the artifact story has more moving parts than a pure-Python package. Key vocabulary, because the rest of this plan assumes it:
+
+- **Frontend source** — TypeScript files under `constellation/viz/frontend/src/` (`GenomeBrowser.ts`, the six `track_renderers/*.ts`, etc.). Committed to git. **Browsers cannot run this directly**: TS isn't browser-runnable, and library imports (`apache-arrow`, `d3-scale`) have to be resolved against `node_modules/`.
+- **Frontend bundle** — the compiled output of running Vite on the source: a few `.html` + `.js` + `.css` files emitted to `constellation/viz/static/<entry>/`. **This is what the FastAPI server mounts and what the browser actually loads.** Platform-independent; the same bundle runs on every OS and any modern browser.
+- **pnpm** — JS package manager. Role: fetch the libraries declared in `package.json` into `node_modules/`. Same role as `pip` for Python. Required only when building the frontend from source.
+- **Vite** — JS build tool. Role: transpile TS → JS, resolve imports, bundle, minify, emit to disk. Same role as a C compiler+linker for native code. Required only when building the frontend from source.
+
+The bundle is **derived state** — purely a function of `(TS source + lockfile)`. We gitignore it for three reasons: (1) keeping derived state in sync with source is a maintenance tax (every frontend PR would need to include a rebuilt bundle blob); (2) bundles are large + binary-ish (hundreds of KB minified) and pollute git history with diffs that aren't real code changes; (3) merge conflicts on minified JS are unmergeable. This matches every modern JS project and every Python tool that ships a frontend (Jupyter, Streamlit, Bokeh, Marimo, Plotly).
+
+**The bundle's runtime location is always the same:** `constellation/viz/static/<entry>/` inside the installed package. Only how it gets there differs by install path:
+
+| Install path | How the bundle arrives | Time | JS toolchain needed? |
+|---|---|---|---|
+| `pip install constellation[viz]` from PyPI (release wheel) | Baked into the `.whl` by CI; pip extracts it like any other package data | ~30s | **No** |
+| `git clone && pip install -e .[viz]` (developer, frontend work) | Built locally via `python -m constellation.viz.frontend.build` | a few minutes once | Yes |
+| `git clone && pip install -e .[viz]` (developer, Python only) | Fetched via `constellation viz install-frontend` (PR 1.6) | ~30s | **No** |
+| Source tarball / HPC offline | `constellation viz install-frontend --from <local-tarball>` (PR 1.5) | ~5s | **No** |
+| CI test runs | Not needed — Python tests skip viz endpoints on missing bundle | n/a | n/a |
+
+**The contract the user community gets:** `pip install constellation[viz]` is one command and works on laptops, workstations, and HPC nodes alike. No node, no npm, no TLS-with-registry fights on the cluster. PR 1.6 makes that real; PR 1.5 is the bridge that makes the same UX possible *today* (workstation build → scp → `--from <local>`) before any release exists.
 
 ## Design principles (firm)
 
@@ -30,13 +55,29 @@ The deliverable lands in two PRs. PR 1 ships the IGV-style focused tool standalo
 10. **anywidget contract** for kernel embedding so the same TS modules work in Marimo/Jupyter and in the SPA shell.
 11. **Frontend ships pre-built in the wheel** (`constellation/viz/static/<entry>/...`); source lives under `constellation/viz/frontend/` and is built via `python -m constellation.viz.frontend.build` (shells out to `pnpm install && pnpm build`). The `static/` tree is gitignored and produced in CI on tag push (or by the build helper for local dev).
 
-## Two-PR scope
+## Multi-PR scope
 
-**PR 1 — `constellation viz genome` (focused IGV-style tool)**
+**PR 1 — `constellation viz genome` (focused IGV-style tool)** — SHIPPED
 - FastAPI server, Arrow IPC streaming, session discovery, six track-type kernels, SVG-only frontend, vector/hybrid mode switching, vector export.
 - Standalone subcommand entry point. No dashboard.
 
-**PR 2 — `constellation` / `constellation dashboard` (dashboard shell)**
+**PR 1.5 — Pack helper + local-file install (this document)** — PLANNED
+- Build helper extension: `python -m constellation.viz.frontend.build --pack` produces `dist/constellation-viz-frontend-<X.Y.Z>.tar.gz` + `.sha256` sidecar in addition to the in-tree `static/<entry>/` build. Tarball contains the bundle plus a top-level `bundle.json` (version + sha256-of-contents + build timestamp).
+- New CLI subcommand: `constellation viz install-frontend --from <tarball>`. **Single operating mode in PR 1.5**: read a local tarball from disk, verify sha256 against an adjacent `.sha256` sidecar (or `--no-verify` escape hatch), extract to `constellation/viz/static/<entry>/`. URL-fetch is deliberately deferred to PR 1.6.
+- `constellation viz genome` startup behavior is **unchanged from PR 1** — server boots, `/api/...` works, `/` returns the JSON pointer suggesting the install command when bundle missing. No auto-fetch (predictable on restricted networks).
+- `constellation doctor`: extended with a `frontend bundle` row reporting present/absent + bundle version (read from `static/<entry>/bundle.json` after install).
+- Stdlib-only Python: `tarfile` for extract, `hashlib` for sha256. No `urllib.request` use in PR 1.5 (no fetch path yet).
+- **Immediate value:** developer builds bundle on a workstation, scps the tarball to OSC, runs `--from` on the cluster. Zero node / npm / pnpm calls anywhere in the install path. Solves the user's current OSC blocker without depending on PR 1.6.
+
+**PR 1.6 — Release CI + URL-fetch addition** — pending, separate PR
+Three things land together:
+1. GitHub Actions workflow on tag push: runs `python -m constellation.viz.frontend.build --pack`, attaches the tarball + sidecar to the GitHub release, builds + publishes a wheel-with-bundle to PyPI.
+2. URL-fetch operating mode added to `install-frontend`: no flags = use `constellation.__version__` to derive `https://github.com/wilburnlab/constellation/releases/download/v<X.Y.Z>/constellation-viz-frontend-<X.Y.Z>.tar.gz`; `--version X.Y.Z` overrides; download + verify + extract.
+3. Documentation: README + viz/CLAUDE.md updates capturing the now-self-serve flow.
+
+All three become useful at the same moment — no stretch of time with URL-fetch code that 404s in main.
+
+**PR 2 — `constellation` / `constellation dashboard` (dashboard shell)** — pending
 - Adds bare-`constellation` no-arg dispatch to dashboard.
 - Sidebar with curated + auto-introspected CLI tree.
 - Schema-driven form generator + xterm.js terminal panels for command runs.
@@ -217,6 +258,99 @@ When absent, `Session.discover` falls back to walking `<root>` one level deep, c
 - `tests/test_viz_server.py` — `httpx.AsyncClient(app=app)` against `/api/tracks/{kind}/data`; decode the Arrow IPC stream; assert row count and schema.
 - `tests/test_imports.py` — extend with `constellation.viz`, `constellation.viz.tracks`, `constellation.viz.server.app`.
 - `tests/test_viz_e2e.py` (`@pytest.mark.slow`) — boots a real uvicorn on a free port in a background thread, hits each endpoint end-to-end against a small fixture session, asserts non-empty Arrow streams.
+
+## PR 1.5 — detailed scope
+
+### Why this PR exists
+
+PR 1's frontend bundle is gitignored and produced by `python -m constellation.viz.frontend.build` (which runs `pnpm install && pnpm build`). On developer workstations with open networks this is fine. On HPC clusters — where users actually run omics workflows — it breaks for two unrelated reasons:
+
+- npm dependency resolution is slow / hangs on shared filesystems and restricted egress.
+- node's TLS stack against legacy registry mirrors / corporate proxies frequently fails (`ERR_SSL_NO_CIPHER_MATCH` observed on OSC, 2026-05-09).
+
+The standard answer across Python tools with JS frontends (Jupyter, Streamlit, Bokeh, Marimo, Plotly) is: end users get a prebuilt bundle inside the release wheel and never see a JS toolchain. PR 1.6 makes that real. PR 1.5 ships the workstation-build-then-ship path that works **today**, before any release exists. The CLI surface PR 1.5 introduces (`viz install-frontend`) is forward-compatible — PR 1.6 just adds a URL-fetch mode without breaking the `--from` shape.
+
+### Files to add or modify
+
+**New files**
+
+- `constellation/viz/install.py` — `install_frontend_from_tarball(*, local_path, entry, force, verify, dest_root)` core function. Single Python entry point used by both the CLI handler and tests. Verifies sha256 against an adjacent `.sha256` sidecar, extracts via `tarfile.open(..., "r:gz")` to `<dest_root>/<entry>/`, copies the embedded `bundle.json` next to the extracted tree so `doctor` can probe it. Stdlib-only: `tarfile`, `hashlib`, `shutil`, `pathlib`. ~80 LOC. The module is structured so PR 1.6 can drop in a sibling `install_frontend_from_url(...)` function without refactoring.
+- `tests/test_viz_install.py` — covers (a) `--from <local-tarball>` happy path against a fixture tarball built in tmp_path, (b) sha256 mismatch raises with a clear message, (c) missing local file raises, (d) target-directory-non-empty without `--force` raises with hint, (e) `--force` clears existing contents and re-extracts cleanly, (f) bundle.json metadata round-trips correctly into the on-disk install, (g) `--no-verify` skips checksum and emits a warning. No network mocking needed in PR 1.5.
+
+**Modified files**
+
+- `constellation/viz/cli.py` — add a nested subcommand `install-frontend` alongside the existing `genome` parser inside `build_parser(subs)`. Args (PR 1.5): `--from PATH` (**required** in PR 1.5; PR 1.6 makes it optional), `--entry NAME` (default `genome`), `--force`, `--no-verify`. Handler `cmd_viz_install_frontend` lazy-imports `constellation.viz.install.install_frontend_from_tarball` and dispatches.
+- `constellation/viz/frontend/build.py` — add `--pack` flag. When set, after the existing `pnpm build` call, the helper:
+  1. Reads `constellation.__version__` to determine the artifact name.
+  2. Generates `dist/constellation-viz-frontend-<version>.tar.gz` containing the `static/<entry>/` tree, plus a top-level `bundle.json` (`{"constellation_version": "...", "entry": "...", "built_at": "...", "contents_sha256": "..."}`).
+  3. Generates `dist/constellation-viz-frontend-<version>.tar.gz.sha256` sidecar (single line: `<hex>  <filename>` — GNU coreutils format, compatible with `sha256sum -c`).
+- `constellation/cli/__main__.py::_cmd_doctor` — add a `frontend bundle` row reading `constellation/viz/static/<entry>/bundle.json` if present (status: ok with version), else `not installed` with hint `run: constellation viz install-frontend --from <tarball>`. Default check is the `genome` entry; future entries (PR 2's `dashboard`) get rows added the same way.
+- `tests/test_imports.py` — add `import constellation.viz.install`.
+- `constellation/viz/CLAUDE.md` — extend the "Frontend distribution" section with the install paths matrix from the Context section above, plus the workstation-build-then-ship workflow concretely.
+
+### Reused existing utilities (do NOT reimplement)
+
+- `scripts/install-encyclopedia.sh` lines 19–101 — sha256-verification pattern; precedent for how third-party asset installs are scripted in this repo. PR 1.5 brings the same shape into Python.
+- `constellation/viz/cli.py::build_parser` (lines 21–64) — existing pattern for adding a nested subcommand under `viz`.
+- `constellation/viz/frontend/build.py::build` — existing build flow; `--pack` is an additive post-step that reuses the same path resolution (`_FRONTEND_DIR.parent / "static" / entry`).
+- `constellation/cli/__main__.py::_cmd_doctor` — existing tool-status table; new row follows the same `(name, status, version, location)` tuple shape used by `thirdparty/registry`.
+
+### Bundle layout
+
+Inside `constellation-viz-frontend-<X.Y.Z>.tar.gz`:
+
+```
+constellation-viz-frontend-<X.Y.Z>/
+├── bundle.json                    # {constellation_version, entry, built_at, contents_sha256}
+└── static/
+    └── genome/                    # (or whatever --entry was; usually 'genome')
+        ├── index.genome.html
+        ├── assets/
+        │   ├── main_genome-<hash>.js
+        │   └── main_genome-<hash>.css
+        └── ...
+```
+
+After `install_frontend_from_tarball` extracts, the on-disk layout under `constellation/viz/static/genome/` is the contents of the `static/genome/` subtree; `bundle.json` is copied alongside it (`constellation/viz/static/genome/bundle.json`) so `doctor` can probe what's installed without re-opening the tarball.
+
+The sidecar `<tarball>.sha256` lives next to the tarball on disk (same directory). When the user passes `--from /path/to/foo.tar.gz`, the installer also reads `/path/to/foo.tar.gz.sha256` and verifies the digest. `--no-verify` skips this check and prints a one-line warning to stderr.
+
+### CLI surface (PR 1.5)
+
+```
+constellation viz install-frontend --from /path/to/tarball.tar.gz
+constellation viz install-frontend --from /path/to/tarball.tar.gz --entry genome --force
+constellation viz install-frontend --from /path/to/tarball.tar.gz --no-verify   # warning to stderr
+```
+
+(PR 1.6 will add `--version X.Y.Z` and a no-flags default that fetches the matching release.)
+
+Failure modes the PR 1.5 handler must handle gracefully:
+
+- `--from` path doesn't exist → exit non-zero with the path printed.
+- sha256 mismatch → exit non-zero with expected vs actual digests + path to the downloaded file (left on disk for inspection).
+- sidecar `.sha256` missing → exit non-zero with hint about `--no-verify`.
+- target directory non-empty without `--force` → exit non-zero with the existing bundle's version + `--force` hint.
+
+### Verification plan
+
+1. `pip install -e ".[viz,dev]"` (no new extras needed for PR 1.5).
+2. `pytest tests/test_viz_install.py` — fully self-contained; uses tmpfile fixtures to build a tiny fake tarball + sha256 sidecar and round-trip them through the installer. No live network.
+3. Build a real bundle on a workstation: `python -m constellation.viz.frontend.build --pack` → verify `dist/constellation-viz-frontend-0.0.0.tar.gz` + `.sha256` exist; `tar -tzf dist/*.tar.gz | head` shows the expected layout including `bundle.json`.
+4. Local install round-trip on workstation: `rm -rf constellation/viz/static/genome && constellation viz install-frontend --from dist/constellation-viz-frontend-0.0.0.tar.gz` → verify `static/genome/index.genome.html` + `bundle.json` exist.
+5. `constellation doctor` — verify `frontend bundle` row reports `ok` + version after install, `not installed` before.
+6. `constellation viz genome --session <fixture> --no-browser` — verify `/` now serves the SPA (not the JSON pointer).
+7. **OSC validation:** scp `dist/*.tar.gz` + `.sha256` to OSC; run `constellation viz install-frontend --from <path>` on the cluster; confirm no node / npm / pnpm invocations anywhere; open the served URL and confirm the genome browser renders.
+8. Negative tests at the CLI: corrupt the tarball, verify sha256-mismatch error fires with both digests printed; delete the sidecar, verify the missing-sidecar error fires with the `--no-verify` hint; run with `--no-verify` on a corrupt tarball, verify warning to stderr + extraction proceeds.
+
+### Out of scope for PR 1.5
+
+- URL fetch (PR 1.6 — lands together with the release CI that makes URLs valid).
+- Release CI itself (PR 1.6).
+- Auto-fetch on `viz genome` startup — explicitly rejected; predictable behavior on restricted networks.
+- Conda-forge packaging.
+- Cryptographic signing of the bundle (only sha256 integrity check via the sidecar). If upstream supply-chain requirements emerge, sigstore / minisign verification lands as a later PR.
+- Partial / incremental bundle updates — full replace via `--force` is fine for a few-MB asset.
 
 ## PR 2 — detailed scope
 

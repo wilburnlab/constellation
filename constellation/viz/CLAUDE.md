@@ -13,8 +13,9 @@ The `[viz]` extras (`fastapi`, `uvicorn[standard]`, `datashader`, `websockets`, 
 | `viz.tracks` | Per-modality kernel registry. `TrackKernel` ABC + `@register_track` decorator + `HYBRID_SCHEMA`. Six kernels shipped: `reference_sequence`, `gene_annotation`, `coverage_histogram`, `read_pileup` (hybrid), `cluster_pileup` (hybrid), `splice_junctions`. | shipped |
 | `viz.server` | FastAPI app factory, Arrow IPC streaming helper (`arrow_stream`), `Session` discovery (`session.py`), `endpoints/{sessions, tracks}` routes. | shipped |
 | `viz.raster` | Datashader → PNG helper for hybrid-mode payloads + `greedy_row_assign` shared between vector and hybrid renderers. **Only sanctioned pandas boundary in the package** (datashader's aggregation requires a pd.DataFrame input). | shipped |
-| `viz.cli` | `_build_viz_parser(subs)` mounted from `constellation/cli/__main__.py`; `cmd_viz_genome` lazy-imports uvicorn + the app factory. | shipped |
-| `viz.frontend` | Committed TS/Vite source tree under `frontend/src/` plus the `python -m constellation.viz.frontend.build` helper that runs `pnpm install && pnpm build` and emits to `viz/static/<entry>/`. The `static/` tree is git-ignored; release wheels carry the prebuilt bundle. | shipped |
+| `viz.cli` | `build_parser(subs)` mounts the `viz` subtree from `constellation/cli/__main__.py`. Two subcommands shipped: `viz genome` (lazy-imports uvicorn + the app factory) and `viz install-frontend` (lazy-imports `viz.install`). | shipped |
+| `viz.install` | `install_frontend_from_tarball(local_path, entry, force, verify, dest_root)` + `read_bundle_metadata(dest_dir)`. Stdlib-only — `tarfile` / `hashlib` / `shutil`. PR 1.5 ships the local-tarball path; PR 1.6 will add a sibling `install_frontend_from_url` for release-asset fetch. | shipped |
+| `viz.frontend` | Committed TS/Vite source tree under `frontend/src/` plus the `python -m constellation.viz.frontend.build` helper. Default: runs `pnpm install && pnpm build` and emits to `viz/static/<entry>/`. With `--pack`: also produces `<repo>/dist/constellation-viz-frontend-<version>.tar.gz` + `.sha256` for shipping to machines without the JS toolchain. The `static/` and `dist/` trees are git-ignored. | shipped |
 | `viz.runner`, `viz.introspect` | PR 2: subprocess runner + lock + xterm.js streaming; argparse → JSON-schema introspection; sandboxed file picker. | scaffold (not yet present) |
 
 **Currently registered kinds** (the canonical list — `constellation.viz.registered_kinds()`):
@@ -115,6 +116,40 @@ The whole viz suite runs in <4s under default `pytest`; the slow e2e takes ~1.4s
 
 Fixture sessions are built in tmp_path: write a tiny CONTIG_TABLE + SEQUENCE_TABLE under `<root>/genome/`, optionally a `<root>/annotation/features.parquet`, and the per-stage parquet artifacts. `Session.from_root(<root>)` discovers everything.
 
+## Frontend distribution
+
+The viz layer crosses a language boundary — Python on one side, TypeScript on the other — so the artifact story has more moving parts than a pure-Python module. The full mental model is in [docs/plans/viz-and-dashboard.md](../../docs/plans/viz-and-dashboard.md) under "Frontend distribution model"; the on-disk consequences are:
+
+- **Frontend source** — committed under `frontend/src/`. TS files. Browsers cannot run these directly.
+- **Frontend bundle** — derived: the output of `vite build` against the source. Lives at `viz/static/<entry>/` after the build runs. **This is what the FastAPI server actually mounts** and what the browser loads. Platform-independent.
+- **Release artifact** — a single `.tar.gz` of `static/<entry>/` plus a `bundle.json` metadata header, produced by `python -m constellation.viz.frontend.build --pack`. Lands under `<repo>/dist/`. Used to ship the bundle to machines without the JS toolchain.
+
+Both `static/` and `dist/` are git-ignored. The bundle is derived state; gitignoring matches every modern JS project and every Python tool with an SPA frontend.
+
+**Install paths** — the bundle's runtime location is always `constellation/viz/static/<entry>/`; only how it gets there differs:
+
+| Install path | How the bundle arrives | JS toolchain needed? |
+|---|---|---|
+| `pip install constellation[viz]` from PyPI (release wheel — PR 1.6) | Baked into the `.whl` by CI | No |
+| `git clone && pip install -e .[viz]` (frontend dev) | `python -m constellation.viz.frontend.build` (runs pnpm) | Yes |
+| `git clone && pip install -e .[viz]` (Python-only dev) | `constellation viz install-frontend --from <local-tarball>` after the bundle is built elsewhere; PR 1.6 adds a URL-fetch default | No |
+| HPC / restricted-network install | Build bundle on a workstation via `--pack`, scp the tarball + `.sha256` to the cluster, run `install-frontend --from`. Solves the OSC-can't-run-npm case completely. | No |
+| CI test runs | Not needed — Python tests skip viz endpoints when the bundle is absent | n/a |
+
+**Install command surface (PR 1.5)**:
+
+```
+constellation viz install-frontend --from /path/to/tarball.tar.gz
+constellation viz install-frontend --from /path/to/tarball.tar.gz --entry genome --force
+constellation viz install-frontend --from /path/to/tarball.tar.gz --no-verify   # stderr warning
+```
+
+The handler reads the adjacent `.sha256` sidecar (GNU coreutils format: `<hex>  <filename>\n`), verifies the tarball's digest, then extracts `<prefix>/static/<entry>/` into `viz/static/<entry>/` and copies `bundle.json` alongside it so `constellation doctor` can report the installed version.
+
+`pack_bundle()` in `frontend/build.py` is the producer side — public so PR 1.6's release CI can call it directly without re-running `pnpm build`.
+
+`constellation doctor` adds a `viz frontend (<entry>)` row that reads `static/<entry>/bundle.json` and reports `ok` + version when present, `not installed` with a hint otherwise.
+
 ## Frontend layout
 
 ```
@@ -123,7 +158,7 @@ constellation/viz/frontend/
 ├── vite.config.ts                 multi-entry build, base="/static/<entry>/"
 ├── tsconfig.json                  ES2022 + strict
 ├── index.genome.html              shell HTML for the genome entry
-├── build.py                       `python -m constellation.viz.frontend.build`
+├── build.py                       `python -m constellation.viz.frontend.build` (+ `--pack` for release-style tarballs)
 └── src/
     ├── main_genome.ts             entry point (mounts GenomeBrowser)
     ├── engine/
