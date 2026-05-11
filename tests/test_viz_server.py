@@ -309,7 +309,7 @@ def test_root_with_no_static_bundle_returns_pointer(
     fixture_session: Session, tmp_path: Path
 ) -> None:
     """When the static bundle is absent, `/` returns a JSON pointer to
-    the build helper instead of a 404."""
+    the install helper instead of a 404."""
     empty = tmp_path / "no-static"
     empty.mkdir()
     app = create_app(fixture_session, static_root=empty)
@@ -317,4 +317,83 @@ def test_root_with_no_static_bundle_returns_pointer(
     response = client.get("/")
     assert response.status_code == 200
     body = response.json()
-    assert "frontend bundle not built" in body["message"]
+    assert "frontend bundle not installed" in body["message"]
+    assert "install-frontend" in body["message"]
+
+
+def test_root_with_entry_named_index_html_serves_spa(
+    fixture_session: Session, tmp_path: Path
+) -> None:
+    """Bundles whose HTML root is the vanilla `index.html` (or output
+    of a Vite rebuild with output rename) → `/` redirects to it."""
+    static_root = tmp_path / "vanilla-bundle"
+    (static_root / "genome").mkdir(parents=True)
+    (static_root / "genome" / "index.html").write_text(
+        "<html><body>SPA</body></html>", encoding="utf-8"
+    )
+    app = create_app(fixture_session, static_root=static_root)
+    client = TestClient(app, follow_redirects=False)
+    response = client.get("/")
+    assert response.status_code in (302, 307)
+    assert response.headers["location"] == "/static/genome/index.html"
+
+    followed = client.get(response.headers["location"])
+    assert followed.status_code == 200
+    assert "SPA" in followed.text
+
+
+def test_root_with_vite_named_index_serves_spa(
+    fixture_session: Session, tmp_path: Path
+) -> None:
+    """REGRESSION: Bundles produced by `vite build` with input
+    `index.genome.html` preserve that filename in the output. The
+    `/` redirect must point at the entry-specific filename so
+    StaticFiles serves it (StaticFiles' `html=True` would only match
+    a literal `index.html`)."""
+    static_root = tmp_path / "vite-bundle"
+    (static_root / "genome").mkdir(parents=True)
+    (static_root / "genome" / "index.genome.html").write_text(
+        "<!doctype html><html><body><div id='app'></div></body></html>",
+        encoding="utf-8",
+    )
+    (static_root / "genome" / "assets").mkdir()
+    (static_root / "genome" / "assets" / "main_genome-abc.js").write_text(
+        "console.log('hi')", encoding="utf-8"
+    )
+
+    app = create_app(fixture_session, static_root=static_root)
+    client = TestClient(app, follow_redirects=False)
+    response = client.get("/")
+    assert response.status_code in (302, 307)
+    # Critical: redirect points at the file Vite actually emitted, not
+    # at the directory root (which would 404 with the StaticFiles
+    # html=True default).
+    assert response.headers["location"] == "/static/genome/index.genome.html"
+
+    followed = client.get(response.headers["location"])
+    assert followed.status_code == 200
+    assert "<div id='app'>" in followed.text
+
+    # Assets next to the HTML resolve via the StaticFiles mount.
+    asset = client.get("/static/genome/assets/main_genome-abc.js")
+    assert asset.status_code == 200
+    assert asset.text == "console.log('hi')"
+
+
+def test_index_genome_html_preferred_over_index_html_if_both_present(
+    fixture_session: Session, tmp_path: Path
+) -> None:
+    """If a bundle ships BOTH names (unlikely but possible), the
+    entry-specific one wins so the redirect URL is predictable."""
+    static_root = tmp_path / "both"
+    (static_root / "genome").mkdir(parents=True)
+    (static_root / "genome" / "index.html").write_text(
+        "<html>vanilla</html>", encoding="utf-8"
+    )
+    (static_root / "genome" / "index.genome.html").write_text(
+        "<html>entry-specific</html>", encoding="utf-8"
+    )
+    app = create_app(fixture_session, static_root=static_root)
+    client = TestClient(app, follow_redirects=False)
+    response = client.get("/")
+    assert response.headers["location"] == "/static/genome/index.genome.html"

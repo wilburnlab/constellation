@@ -136,14 +136,12 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
     print(f"  url:  {url}")
 
     if not args.no_browser:
-        # webbrowser.open is best-effort across Linux / macOS / WSL —
-        # WSL falls through to wslview / cmd.exe /c start when present.
-        import webbrowser
-
-        try:
-            webbrowser.open(url)
-        except Exception:  # noqa: BLE001 — non-fatal; we still print the URL
-            pass
+        # Defer the browser open until uvicorn has actually bound the
+        # port — otherwise the auto-launched tab races the server and
+        # shows "unable to connect" on first load. We poll the bind
+        # state on a background thread and call `webbrowser.open` once
+        # the server is ready (or give up after a short window).
+        _open_browser_when_ready(args.host, port, url)
 
     import uvicorn
 
@@ -152,6 +150,38 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
     server = uvicorn.Server(config)
     server.run()
     return 0
+
+
+def _open_browser_when_ready(host: str, port: int, url: str) -> None:
+    """Open the URL in the user's browser once the server is listening.
+
+    Polls the bind state on a background thread (one TCP connect per
+    50ms, up to ~10s) and calls `webbrowser.open` exactly once when the
+    handshake succeeds. Non-fatal: any failure is swallowed and the
+    URL is left for the user to copy from the startup banner.
+    """
+    import socket
+    import threading
+    import time
+    import webbrowser
+
+    def _wait_then_open() -> None:
+        deadline = time.monotonic() + 10.0
+        connect_host = host if host != "0.0.0.0" else "127.0.0.1"
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection((connect_host, port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            return
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001 — non-fatal
+            pass
+
+    threading.Thread(target=_wait_then_open, daemon=True).start()
 
 
 def cmd_viz_install_frontend(args: argparse.Namespace) -> int:

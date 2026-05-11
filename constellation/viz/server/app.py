@@ -100,7 +100,14 @@ def create_app(
     # subdirectories are produced by `python -m constellation.viz.frontend.build`.
     root = (static_root or _BUILT_STATIC_ROOT).resolve()
     entry_dir = root / default_entry
-    if entry_dir.is_dir():
+    index_file = _resolve_index_file(entry_dir, default_entry)
+    if index_file is not None:
+        # Vite preserves the source filename in its output, so the bundle
+        # ships `index.<entry>.html` (chosen so multi-entry sources can sit
+        # flat in the source dir). StaticFiles' `html=True` would only
+        # implicitly serve `index.html`; we redirect `/` to the resolved
+        # file directly so both naming conventions work.
+        redirect_target = f"/static/{default_entry}/{index_file.name}"
         app.mount(
             f"/static/{default_entry}",
             StaticFiles(directory=str(entry_dir), html=True),
@@ -109,15 +116,15 @@ def create_app(
 
         @app.get("/", include_in_schema=False)
         def _root_redirect() -> RedirectResponse:
-            return RedirectResponse(url=f"/static/{default_entry}/")
+            return RedirectResponse(url=redirect_target)
     else:
         @app.get("/", include_in_schema=False)
         def _root_no_bundle() -> dict:
             return {
                 "ok": True,
                 "message": (
-                    "viz frontend bundle not built — run "
-                    "`python -m constellation.viz.frontend.build` "
+                    "viz frontend bundle not installed — run "
+                    "`constellation viz install-frontend --from <tarball>` "
                     "or install a release wheel that ships the static/ tree"
                 ),
                 "expected_path": str(entry_dir),
@@ -125,6 +132,28 @@ def create_app(
             }
 
     return app
+
+
+def _resolve_index_file(entry_dir: Path, entry: str) -> Path | None:
+    """Find the entry's HTML root file.
+
+    Vite preserves the source filename in its output. PR 1 ships the
+    source as ``index.genome.html`` so multi-entry sources can sit flat
+    in the source dir; we accept either that name or a vanilla
+    ``index.html`` (for cases where the build was configured to rename
+    the output, or for hand-rolled bundles). Returns ``None`` when no
+    candidate is on disk — the caller treats that as "bundle not
+    installed" and surfaces the install hint.
+    """
+    if not entry_dir.is_dir():
+        return None
+    for candidate in (
+        entry_dir / f"index.{entry}.html",
+        entry_dir / "index.html",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _normalize_sessions(

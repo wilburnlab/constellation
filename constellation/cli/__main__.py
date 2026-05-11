@@ -87,9 +87,13 @@ def _doctor_frontend_rows() -> list[tuple[str, str, str, str]]:
     for entry in ("genome",):
         entry_dir = static_root / entry
         metadata = read_bundle_metadata(entry_dir)
-        bundle_present = (
-            entry_dir.is_dir()
-            and (entry_dir / "index.genome.html").is_file()
+        # Vite's HTML output is named after the source file
+        # (`index.<entry>.html` in the current source layout); accept
+        # either that or a vanilla `index.html` for forward-compat with
+        # future builds that rename the output.
+        bundle_present = entry_dir.is_dir() and (
+            (entry_dir / f"index.{entry}.html").is_file()
+            or (entry_dir / "index.html").is_file()
         )
         name = f"viz frontend ({entry})"
         if bundle_present:
