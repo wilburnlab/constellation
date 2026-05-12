@@ -42,7 +42,12 @@ import constellation as _constellation
 
 _FRONTEND_DIR = Path(__file__).resolve().parent
 _VIZ_DIR = _FRONTEND_DIR.parent  # constellation/viz/
-_REPO_ROOT = _FRONTEND_DIR.parents[3]
+# parents[2] = repo root (parents[0]=viz, parents[1]=constellation, parents[2]=repo).
+# Latent bug from PR 1.5: this used parents[3], which silently put `dist/` one
+# directory above the repo root because every test overrode `dist_dir`
+# explicitly and never exercised the default. Surfaced when CI ran `--pack`
+# without overrides — the tarball landed outside the workspace.
+_REPO_ROOT = _FRONTEND_DIR.parents[2]
 _DIST_DIR = _REPO_ROOT / "dist"
 _BUNDLE_METADATA_NAME = "bundle.json"
 _PACK_NAME_PREFIX = "constellation-viz-frontend"
