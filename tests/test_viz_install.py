@@ -129,6 +129,27 @@ def test_pack_bundle_layout_matches_spec(tmp_path: Path) -> None:
     assert "built_at" in meta
 
 
+def test_pack_bundle_default_dist_dir_resolves_to_repo_root() -> None:
+    """Guard the parents[N] arithmetic in build.py.
+
+    `pack_bundle()` defaults `dist_dir` to ``<repo_root>/dist/`` via
+    ``_DIST_DIR = _FRONTEND_DIR.parents[2] / "dist"``. Every other test
+    in this file overrides ``dist_dir`` explicitly, so the default is
+    untested. PR 1.5 shipped with ``parents[3]`` (one dir above the
+    repo root) and CI's first ``--pack`` run failed to find the tarball
+    where the upload step expected it. This test pins the default to
+    the directory containing the in-tree ``pyproject.toml`` — any
+    future off-by-one in the parents[] count fails here.
+    """
+    from constellation.viz.frontend import build as build_mod
+
+    assert (build_mod._REPO_ROOT / "pyproject.toml").is_file(), (
+        f"_REPO_ROOT={build_mod._REPO_ROOT} does not contain pyproject.toml; "
+        f"the parents[N] count in constellation/viz/frontend/build.py is wrong"
+    )
+    assert build_mod._DIST_DIR == build_mod._REPO_ROOT / "dist"
+
+
 def test_pack_bundle_raises_when_source_missing(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         pack_bundle(
