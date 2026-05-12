@@ -158,6 +158,13 @@ import constellation.thirdparty
 import constellation.data
 import constellation.viz
 import constellation.viz.install
+import constellation.viz.introspect
+import constellation.viz.introspect.schema
+import constellation.viz.introspect.walk
+import constellation.viz.runner
+import constellation.viz.runner.lock
+import constellation.viz.runner.registry
+import constellation.viz.runner.runner
 import constellation.viz.tracks
 import constellation.viz.tracks.base
 import constellation.viz.tracks.coverage_histogram

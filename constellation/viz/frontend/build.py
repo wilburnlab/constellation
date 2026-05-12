@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tarfile
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import constellation as _constellation
@@ -117,13 +118,13 @@ def build(
 
 
 def pack_bundle(
-    entry: str = "genome",
+    entry: str | Sequence[str] = "genome",
     *,
     static_root: Path | None = None,
     dist_dir: Path | None = None,
     version: str | None = None,
 ) -> tuple[Path, Path]:
-    """Pack a built bundle into a release-style tarball + sha256 sidecar.
+    """Pack one or more built bundles into a single release tarball.
 
     The tarball has the layout documented in
     ``docs/plans/viz-and-dashboard.md``::
@@ -131,23 +132,36 @@ def pack_bundle(
         constellation-viz-frontend-<version>/
         ├── bundle.json
         └── static/
-            └── <entry>/
+            ├── <entry_a>/
+            │   └── ...
+            └── <entry_b>/   (when multiple entries are packed)
                 └── ...
+
+    Pass ``entry="genome"`` for the single-entry form (backwards-
+    compatible) or ``entry=["genome", "dashboard"]`` to ship both
+    bundles in one archive. The downstream installer's ``--entry``
+    flag picks which subtree to extract; URL-fetch + sha256 paths are
+    unchanged because there's still one tarball per release.
 
     ``version`` defaults to ``constellation.__version__``. Exposed as a
     public function so PR 1.6's release CI can call it directly without
-    re-running ``pnpm build`` (the CI workflow runs build once and packs
-    once).
+    re-running ``pnpm build`` (the CI workflow runs build per entry,
+    then packs once).
 
     Returns the (tarball, sidecar) Path pair. Raises ``FileNotFoundError``
-    when the source ``static/<entry>/`` is missing (i.e. build didn't run).
+    when any source ``static/<entry>/`` is missing (i.e. that entry's
+    build didn't run).
     """
+    entries: list[str] = [entry] if isinstance(entry, str) else list(entry)
+    if not entries:
+        raise ValueError("pack_bundle requires at least one entry")
     root = static_root or _VIZ_DIR / "static"
-    source_dir = root / entry
-    if not source_dir.is_dir() or not any(source_dir.iterdir()):
-        raise FileNotFoundError(
-            f"no built bundle at {source_dir} — run the build first"
-        )
+    for e in entries:
+        source_dir = root / e
+        if not source_dir.is_dir() or not any(source_dir.iterdir()):
+            raise FileNotFoundError(
+                f"no built bundle at {source_dir} — run the build first"
+            )
 
     pkg_version = version or _constellation.__version__
     artifact_name = f"{_PACK_NAME_PREFIX}-{pkg_version}"
@@ -158,7 +172,14 @@ def pack_bundle(
 
     metadata = {
         "constellation_version": pkg_version,
-        "entry": entry,
+        # Single-entry tarballs keep the historical scalar "entry" key
+        # for backwards compatibility with PR-1.5-era consumers. Multi-
+        # entry tarballs use the list form "entries".
+        **(
+            {"entry": entries[0]}
+            if len(entries) == 1
+            else {"entries": entries}
+        ),
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     metadata_bytes = (json.dumps(metadata, indent=2) + "\n").encode("utf-8")
@@ -169,12 +190,13 @@ def pack_bundle(
         meta_info.mtime = int(time.time())
         tar.addfile(meta_info, fileobj=_BytesReader(metadata_bytes))
 
-        # arcname rewrites <static_root>/<entry>/ → <artifact_name>/static/<entry>/
-        tar.add(
-            source_dir,
-            arcname=f"{artifact_name}/static/{entry}",
-            recursive=True,
-        )
+        for e in entries:
+            # arcname rewrites <static_root>/<entry>/ → <artifact_name>/static/<entry>/
+            tar.add(
+                root / e,
+                arcname=f"{artifact_name}/static/{e}",
+                recursive=True,
+            )
 
     digest = _sha256_of_file(tarball)
     sidecar.write_text(f"{digest}  {tarball.name}\n", encoding="utf-8")
@@ -213,8 +235,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="constellation.viz.frontend.build")
     parser.add_argument(
         "--entry",
-        default="genome",
-        help="entry point to build (default: genome)",
+        nargs="+",
+        default=["genome"],
+        metavar="NAME",
+        help=(
+            "entry point(s) to build. Default: 'genome'. Pass multiple "
+            "entries to build them all (`--entry genome dashboard`); "
+            "with --pack the result is a single tarball containing every "
+            "built entry."
+        ),
     )
     parser.add_argument(
         "--manager",
@@ -226,13 +255,28 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "after building, produce dist/constellation-viz-frontend-<version>"
-            ".tar.gz + .sha256 sidecar for use with "
-            "`constellation viz install-frontend --from <tarball>` "
-            "on machines without a JS toolchain"
+            ".tar.gz + .sha256 sidecar containing every built entry for use "
+            "with `constellation viz install-frontend --from <tarball>` on "
+            "machines without a JS toolchain"
         ),
     )
     args = parser.parse_args(argv)
-    return build(entry=args.entry, manager=args.manager, pack=args.pack)
+
+    # Build each requested entry; bail on first failure.
+    for entry in args.entry:
+        rc = build(entry=entry, manager=args.manager, pack=False)
+        if rc != 0:
+            return rc
+
+    if args.pack:
+        try:
+            tarball, sidecar = pack_bundle(entry=args.entry)
+        except FileNotFoundError as exc:
+            print(f"  pack failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"  packed tarball: {tarball}")
+        print(f"  sha256 sidecar: {sidecar}")
+    return 0
 
 
 if __name__ == "__main__":

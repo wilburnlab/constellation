@@ -13,8 +13,13 @@ Endpoints currently mounted in PR 1:
 - `GET /api/tracks, /api/tracks/{kind}/...`
 - `GET /static/genome/...                   → built SPA bundle (if present)`
 
-The dashboard PR adds `/api/commands`, `/api/cli/schema`, `/api/fs/list`
-and the `/static/dashboard/` mount. None of those exist yet.
+Dashboard PR 2 added:
+
+- `GET /api/cli/schema                      → introspected argparse tree`
+- `POST/WS/GET/DELETE /api/commands[...]    → subprocess runner`
+- `/static/dashboard/...                    → dashboard SPA bundle`
+
+`/api/fs/list` (sandboxed file picker) remains deferred to a follow-up.
 """
 
 from __future__ import annotations
@@ -30,6 +35,8 @@ from fastapi.staticfiles import StaticFiles
 # registration via @register_track. Without this the /api/tracks
 # endpoints would return an empty list.
 import constellation.viz  # noqa: F401
+from constellation.viz.server.endpoints import cli_schema as cli_schema_ep
+from constellation.viz.server.endpoints import commands as commands_ep
 from constellation.viz.server.endpoints import sessions as sessions_ep
 from constellation.viz.server.endpoints import tracks as tracks_ep
 from constellation.viz.server.session import Session
@@ -95,6 +102,8 @@ def create_app(
 
     app.include_router(sessions_ep.router)
     app.include_router(tracks_ep.router)
+    app.include_router(cli_schema_ep.router)
+    app.include_router(commands_ep.router)
 
     # Static bundle: mount when present. The `genome/` and `dashboard/`
     # subdirectories are produced by `python -m constellation.viz.frontend.build`.
