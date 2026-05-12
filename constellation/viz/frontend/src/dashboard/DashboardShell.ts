@@ -26,6 +26,7 @@ import { DashboardState, getStored, setStored } from './state';
 import type { CliSchema, CommandSchema } from './types';
 
 const LAYOUT_KEY = 'layout.v1';
+const LAST_SESSION_PATH_KEY = 'last_session_path';
 
 export interface DashboardShellOptions {
   schema: CliSchema;
@@ -34,10 +35,19 @@ export interface DashboardShellOptions {
 }
 
 interface PanelParams extends Record<string, unknown> {
-  kind: 'sidebar' | 'welcome' | 'form' | 'terminal';
+  kind: 'sidebar' | 'welcome' | 'form' | 'terminal' | 'genome';
   command?: CommandSchema;
   jobId?: string;
   argv?: string[];
+  sessionId?: string;
+  label?: string;
+}
+
+interface SessionSummary {
+  session_id: string;
+  label: string;
+  root: string;
+  stages_present: Record<string, boolean>;
 }
 
 // Renderer that delegates pane resizes to an inner TerminalPanel.
@@ -146,10 +156,67 @@ export class DashboardShell {
               then press Run. Each running job streams into its own
               terminal panel. Drag panels by their tab to split or
               stack them.</p>
-              <p style="margin-top:24px">Already have a session? Open
-              <a href="/static/genome/" target="_blank">the genome
-              browser</a> in a new tab.</p>
+              <div class="session-launcher">
+                <h2>Open a session</h2>
+                <p>Point at a pipeline run directory (the parent of
+                <code>genome/</code>, <code>S2_align/</code>, ...).</p>
+                <div class="session-launcher-row">
+                  <input class="session-launcher-input"
+                    type="text"
+                    placeholder="/path/to/run"
+                    spellcheck="false"
+                    autocomplete="off" />
+                  <button class="session-launcher-button"
+                    type="button">Open Genome Browser</button>
+                </div>
+                <div class="session-launcher-error" hidden></div>
+              </div>
             `;
+            const input = this.element.querySelector<HTMLInputElement>(
+              '.session-launcher-input',
+            )!;
+            const button = this.element.querySelector<HTMLButtonElement>(
+              '.session-launcher-button',
+            )!;
+            const error = this.element.querySelector<HTMLDivElement>(
+              '.session-launcher-error',
+            )!;
+            input.value = getStored<string>(LAST_SESSION_PATH_KEY, '');
+            const showError = (msg: string): void => {
+              error.textContent = msg;
+              error.hidden = false;
+            };
+            const clearError = (): void => {
+              error.textContent = '';
+              error.hidden = true;
+            };
+            const submit = async (): Promise<void> => {
+              const path = input.value.trim();
+              if (!path) {
+                showError('Enter a session directory path.');
+                return;
+              }
+              clearError();
+              button.disabled = true;
+              try {
+                const summary = await shell.registerSession(path);
+                setStored(LAST_SESSION_PATH_KEY, path);
+                shell.openGenomePanel(summary.session_id, summary.label);
+              } catch (err) {
+                showError(err instanceof Error ? err.message : String(err));
+              } finally {
+                button.disabled = false;
+              }
+            };
+            button.addEventListener('click', () => {
+              void submit();
+            });
+            input.addEventListener('keydown', (ev) => {
+              if (ev.key === 'Enter') {
+                ev.preventDefault();
+                void submit();
+              }
+            });
           }
         })();
 
@@ -203,6 +270,40 @@ export class DashboardShell {
           }
           onResize(): void {
             this.term?.resize();
+          }
+        })();
+
+      case 'genome':
+        return new (class implements IContentRenderer {
+          readonly element = (() => {
+            const e = document.createElement('div');
+            e.className = 'genome-panel';
+            return e;
+          })();
+          init(params: GroupPanelPartInitParameters): void {
+            const p = params.params as PanelParams | undefined;
+            const sessionId = p?.sessionId;
+            if (!sessionId) {
+              this.element.textContent =
+                '(genome panel unavailable — no session bound)';
+              return;
+            }
+            // Lazy-import keeps the d3 / apache-arrow / track-renderer
+            // chain out of the initial dashboard payload — only paid
+            // when a genome panel actually opens.
+            void import('../widgets/GenomeBrowser')
+              .then(async ({ GenomeBrowser }) => {
+                const browser = new GenomeBrowser({
+                  host: this.element,
+                  sessionId,
+                });
+                await browser.mount();
+              })
+              .catch((err: unknown) => {
+                this.element.textContent = `Failed to mount genome browser: ${
+                  err instanceof Error ? err.message : String(err)
+                }`;
+              });
           }
         })();
 
@@ -276,6 +377,46 @@ export class DashboardShell {
       component: 'terminal',
       title: `terminal · ${short}`,
       params: { kind: 'terminal', jobId, argv } satisfies PanelParams,
+    });
+  }
+
+  // -------------------------------------------------------------------
+  // Session registration + genome panel
+  // -------------------------------------------------------------------
+
+  async registerSession(path: string): Promise<SessionSummary> {
+    const response = await fetch('/api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    if (!response.ok) {
+      let detail = `HTTP ${response.status}`;
+      try {
+        const body = (await response.json()) as { detail?: unknown };
+        if (typeof body.detail === 'string') detail = body.detail;
+      } catch {
+        // fall through with the default message
+      }
+      throw new Error(detail);
+    }
+    return (await response.json()) as SessionSummary;
+  }
+
+  openGenomePanel(sessionId: string, label: string): void {
+    if (!this.dock) return;
+    const id = `genome:${sessionId}`;
+    const existing = this.dock.getGroupPanel(id);
+    if (existing) {
+      existing.api.setActive();
+      return;
+    }
+    this.dock.addPanel({
+      id,
+      component: 'genome',
+      title: `genome · ${label}`,
+      params: { kind: 'genome', sessionId, label } satisfies PanelParams,
+      position: { referencePanel: 'sidebar', direction: 'right' },
     });
   }
 

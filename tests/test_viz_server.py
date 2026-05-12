@@ -204,6 +204,62 @@ def test_unknown_session_returns_404(client: TestClient) -> None:
     assert response.status_code == 404
 
 
+def test_register_session_adds_session(
+    fixture_session: Session, tmp_path: Path
+) -> None:
+    app = create_app({})
+    client = TestClient(app)
+
+    assert client.get("/api/sessions").json() == []
+
+    response = client.post("/api/sessions", json={"path": str(fixture_session.root)})
+    assert response.status_code == 201
+    body = response.json()
+    assert body["session_id"] == fixture_session.session_id
+    assert body["root"] == str(fixture_session.root)
+    assert body["stages_present"]["reference_genome"] is True
+
+    listed = client.get("/api/sessions").json()
+    assert len(listed) == 1
+    assert listed[0]["session_id"] == fixture_session.session_id
+
+
+def test_register_session_is_idempotent_and_evicts_cache(
+    fixture_session: Session,
+) -> None:
+    app = create_app({})
+    client = TestClient(app)
+    payload = {"path": str(fixture_session.root)}
+
+    first = client.post("/api/sessions", json=payload)
+    assert first.status_code == 201
+    sid = first.json()["session_id"]
+
+    app.state.track_bindings_cache[(sid, "coverage_histogram")] = ["sentinel"]
+
+    second = client.post("/api/sessions", json=payload)
+    assert second.status_code == 201
+    assert second.json()["session_id"] == sid
+    assert len(client.get("/api/sessions").json()) == 1
+    assert (sid, "coverage_histogram") not in app.state.track_bindings_cache
+
+
+def test_register_session_missing_path_returns_404(tmp_path: Path) -> None:
+    app = create_app({})
+    client = TestClient(app)
+    response = client.post(
+        "/api/sessions", json={"path": str(tmp_path / "does-not-exist")}
+    )
+    assert response.status_code == 404
+
+
+def test_register_session_empty_path_returns_400() -> None:
+    app = create_app({})
+    client = TestClient(app)
+    response = client.post("/api/sessions", json={"path": "   "})
+    assert response.status_code == 400
+
+
 def test_list_tracks_includes_coverage_histogram(
     client: TestClient, fixture_session: Session
 ) -> None:
