@@ -51,3 +51,11 @@ constellation/viz/static/**
 constellation/viz/frontend/node_modules/
 constellation/viz/frontend/dist/
 constellation/viz/frontend/.vite/
+
+# Frontend lockfiles — ignored until we commit a canonical one. pnpm is the
+# preferred package manager (build.py::_resolve_manager + CI use it); a
+# pnpm-lock.yaml will be added in a follow-up. package-lock.json is npm's
+# competing lockfile and shouldn't be committed alongside (lockfile drift).
+constellation/viz/frontend/package-lock.json
+#constellation/viz/frontend/pnpm-lock.yaml
+constellation/viz/frontend/yarn.lock
