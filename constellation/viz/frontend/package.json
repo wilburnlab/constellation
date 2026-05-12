@@ -10,6 +10,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
     "apache-arrow": "^17.0.0",
     "d3-array": "^3.2.4",
     "d3-axis": "^3.0.0",
@@ -17,7 +19,8 @@
     "d3-format": "^3.1.0",
     "d3-scale": "^4.0.2",
     "d3-selection": "^3.0.0",
-    "d3-zoom": "^3.0.0"
+    "d3-zoom": "^3.0.0",
+    "dockview-core": "^3.0.0"
   },
   "devDependencies": {
     "@types/d3-array": "^3.2.1",

@@ -12,7 +12,7 @@ const ENTRY = process.env.CONSTELLATION_VIZ_ENTRY ?? 'genome';
 
 const inputs: Record<string, string> = {
   genome: resolve(__dirname, 'index.genome.html'),
-  // PR 2 will add: dashboard: resolve(__dirname, 'index.dashboard.html'),
+  dashboard: resolve(__dirname, 'index.dashboard.html'),
 };
 
 export default defineConfig({

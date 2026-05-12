@@ -73,8 +73,8 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 def _doctor_frontend_rows() -> list[tuple[str, str, str, str]]:
     """Probe ``constellation/viz/static/<entry>/`` for installed bundles.
 
-    PR 1 ships only the ``genome`` entry. PR 2 will add ``dashboard``;
-    extend the ``_ENTRIES`` list when it lands. Reads `bundle.json` via
+    Iterates over every known entry (``genome``, ``dashboard``) and
+    surfaces one row per entry. Reads `bundle.json` via
     `constellation.viz.install.read_bundle_metadata` — a stdlib-only
     helper, so this runs even without the `[viz]` extras installed.
     """
@@ -84,7 +84,7 @@ def _doctor_frontend_rows() -> list[tuple[str, str, str, str]]:
 
     static_root = Path(__file__).resolve().parents[1] / "viz" / "static"
     rows: list[tuple[str, str, str, str]] = []
-    for entry in ("genome",):
+    for entry in ("genome", "dashboard"):
         entry_dir = static_root / entry
         metadata = read_bundle_metadata(entry_dir)
         # Vite's HTML output is named after the source file
@@ -144,8 +144,13 @@ def _build_parser() -> argparse.ArgumentParser:
     # The full `[viz]` extras (fastapi / uvicorn / datashader) are
     # only required when the user actually invokes a viz subcommand;
     # the parser registration is cheap import-wise.
+    from constellation.viz.cli import (
+        build_dashboard_parser as _build_dashboard_parser,
+    )
     from constellation.viz.cli import build_parser as _build_viz_parser
     _build_viz_parser(subs)
+    # Top-level `constellation dashboard` (also the bare-argv default).
+    _build_dashboard_parser(subs)
 
     # Placeholders so `--help` advertises the intended surface. Wire as
     # the underlying modules are ported.
@@ -1909,8 +1914,14 @@ def _cmd_reference_validate(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # Bare `constellation` → open the dashboard. PR 2 wires the
+    # `dashboard` subcommand; until that ships the rewrite is a no-op
+    # (parser will emit "subcommand required" as before).
+    if not raw:
+        raw = ["dashboard"]
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw)
     return args.func(args)
 
 

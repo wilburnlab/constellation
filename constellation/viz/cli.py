@@ -1,4 +1,5 @@
-"""CLI parser + handler for ``constellation viz <subcommand>``.
+"""CLI parser + handler for ``constellation viz <subcommand>`` and
+``constellation dashboard``.
 
 Subcommands:
 
@@ -11,9 +12,10 @@ Subcommands:
   Used by source-checkout / HPC installs where the JS toolchain isn't
   available (or doesn't work — e.g. OSC's TLS proxy refuses npm). See
   ``constellation.viz.install`` for the extraction implementation.
-
-The dashboard subcommand (``constellation dashboard``) lands in PR 2.
-PR 1 reserves the parser slot but does not wire it.
+- ``constellation dashboard`` — JupyterLab-style soft GUI wrapping every
+  CLI subcommand as a form + xterm.js terminal. Bare ``constellation``
+  (no args) routes here. See [docs/plans/viz-and-dashboard.md] for the
+  PR 2 design.
 """
 
 from __future__ import annotations
@@ -144,6 +146,70 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         ),
     )
     p_install.set_defaults(func=cmd_viz_install_frontend)
+
+
+def build_dashboard_parser(subs: argparse._SubParsersAction) -> None:
+    """Mount the top-level ``dashboard`` subcommand.
+
+    Called from ``constellation/cli/__main__.py::_build_parser``. The
+    bare-argv path in ``main()`` rewrites ``[]`` to ``["dashboard"]``,
+    so users can type just ``constellation`` to launch the GUI.
+    """
+    p_dash = subs.add_parser(
+        "dashboard",
+        help=(
+            "Open the JupyterLab-style dashboard GUI wrapping every CLI "
+            "subcommand as a form + xterm.js terminal. Bare "
+            "`constellation` (no args) dispatches here."
+        ),
+    )
+    p_dash.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="bind host (default 127.0.0.1 — localhost only)",
+    )
+    p_dash.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help=(
+            "bind port (default 0 = pick a free ephemeral port). The "
+            "URL is printed to stdout on startup."
+        ),
+    )
+    p_dash.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="don't auto-open a browser (just print the URL)",
+    )
+    p_dash.set_defaults(func=cmd_dashboard)
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Handler for ``constellation dashboard`` (and bare ``constellation``).
+
+    Mirrors ``cmd_viz_genome`` but mounts the dashboard SPA entry and
+    starts with no sessions bound (the in-app session picker hits
+    ``/api/sessions`` to discover any added by completed pipeline runs).
+    Heavy imports stay lazy so unrelated subcommands don't pay for them.
+    """
+    from constellation.viz.server.app import create_app
+
+    port = args.port if args.port != 0 else _free_port(args.host)
+    url = f"http://{args.host}:{port}"
+    print("constellation dashboard")
+    print(f"  url:  {url}")
+
+    if not args.no_browser:
+        _open_browser_when_ready(args.host, port, url)
+
+    import uvicorn
+
+    app = create_app({}, default_entry="dashboard")
+    config = uvicorn.Config(app, host=args.host, port=port, log_level="info")
+    server = uvicorn.Server(config)
+    server.run()
+    return 0
 
 
 def cmd_viz_genome(args: argparse.Namespace) -> int:

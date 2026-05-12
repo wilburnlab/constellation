@@ -5,7 +5,7 @@
 - **PR 1** (`constellation viz genome` — focused IGV-style genome browser) — **SHIPPED** at commit `bd505d6`. Six track kernels; FastAPI server with Apache Arrow IPC streaming; SVG-only client + Datashader hybrid mode. 46 unit tests + 1 slow uvicorn-boot e2e all green; full repo suite remains 1348 passing.
 - **PR 1.5** (build-helper `--pack` mode + `constellation viz install-frontend --from <local>`) — **SHIPPED**. 15 install tests + smoke imports + `constellation doctor` row; full repo suite 1363 passing (was 1348), no regressions, no new ruff errors. End-to-end CLI round-trip verified locally. Workstation-build-then-ship-to-cluster path that bypasses npm-on-HPC entirely.
 - **PR 1.6** (release CI + URL-fetch addition) — **SHIPPED** (code; first tag push enables the publishing path). Three things landed together: `.github/workflows/release.yml` (tag-push → frontend pack → wheel + sdist build → GitHub Release attachment → OIDC publish to PyPI or TestPyPI based on tag pattern); `install_frontend_from_url(version, entry, force, verify, dest_root, cache_dir, github_owner_repo)` in `constellation/viz/install.py` with on-disk caching at `~/.cache/constellation/viz-frontend/` and a stdlib-only `urllib.request` fetcher; switch to setuptools-scm with PyPI distribution name `constellation-bio` (import path stays `constellation`). 5 new URL-fetch tests + 17 existing install/imports tests all green; full repo suite 1364 passing (was 1363), no regressions.
-- **PR 2** (dashboard shell wrapping the CLI as soft GUI) — pending.
+- **PR 2** (dashboard shell wrapping the CLI as soft GUI) — **SHIPPED** (lean v1). Bare `constellation` → JupyterLab-style dashboard via dockview-core (vanilla TS, no React; **revised from the original `dockview-react` choice** after confirming dockview-core is framework-agnostic). 5 dashboard frontend components (`DashboardShell`, `Sidebar`, `CommandForm`, `Terminal`, `StatusBar`); 2 new backend modules (`viz.introspect` walks argparse → JSON; `viz.runner` spawns subprocesses + holds the single-job lock); 2 new endpoints (`/api/cli/schema`, `/api/commands*` including WS stream). Release CI now packs both `genome` and `dashboard` entries into one tarball. 31 new backend tests; full suite 1401 passing. Out of scope for v1 (deferred to follow-up PRs): IPython panel, sandboxed FilePicker, embedded genome browser as dock panel, desktop shortcut generator. See the PR 2 section below for the locked-in scope rationale.
 
 ## Context
 
@@ -80,13 +80,29 @@ Tests: 5 new URL-fetch tests in `tests/test_viz_install_url.py` (happy path, cac
 
 Pre-release tags (`v0.0.1rc1`) test the full pipeline against TestPyPI before claiming a real PyPI version slot. Both flavors create a GitHub Release with the frontend tarball attached so `install_frontend_from_url` is testable end-to-end against the pre-release.
 
-**PR 2 — `constellation` / `constellation dashboard` (dashboard shell)** — pending
-- Adds bare-`constellation` no-arg dispatch to dashboard.
-- Sidebar with curated + auto-introspected CLI tree.
-- Schema-driven form generator + xterm.js terminal panels for command runs.
-- Subprocess runner with single-compute-job lock and WebSocket stdio streaming.
-- Embedded IPython panel (subprocess + xterm.js, reuses runner plumbing).
-- Mounts the genome browser from PR 1 as a panel; coordination event bus stub for future cross-modality panels.
+**PR 2 — `constellation` / `constellation dashboard` (dashboard shell)** — SHIPPED (lean v1)
+
+Locked decisions vs the original draft (after framework re-evaluation):
+
+- **Layout library**: `dockview-core` (vanilla TS, zero deps, MIT). The original draft said `dockview-react`; once we confirmed dockview's *core* package is framework-agnostic, we kept the vanilla-TS paradigm from PR 1 instead of introducing React. Lumino was a viable alternative (BSD-3, JupyterLab's framework) — slightly higher theoretical ceiling but less batteries-included theming and a larger v1 footprint.
+- **Layout scope**: full splittable docking from day one (`DockviewComponent` with the `createComponent` factory), not a tab strip. Avoids a state-model rewrite when a second terminal + viz panel co-exist.
+- **What ships in v1**: bare `constellation` no-arg dispatch + sidebar + form generator + xterm.js terminal + subprocess runner + lock + 2 endpoints (`/api/cli/schema`, `/api/commands*`).
+- **What's deferred**: IPython panel (would reuse runner plumbing with `python -m IPython --simple-prompt`), sandboxed FilePicker + `/api/fs/list`, embedded-genome-as-dock-panel (v1 deep-links to `/static/genome/`), desktop shortcut generator. None of these are blockers for the launch UX; each is a focused follow-up PR.
+- **Theming**: dockview-core's dark theme as v1 default; ~40 `--dv-*` CSS variables exposed for palette tweaks; corners softened via `--dv-tab-border-radius: 6px`.
+
+Concrete deliverables:
+
+- `viz.introspect` (walk.py / schema.py / curated.json) — argparse reflection emitting a stable JSON tree; curated overlay names the 7 v1 "Common" tasks.
+- `viz.runner` (lock.py / runner.py / registry.py) — `spawn_job(argv)` returns a `Job` with per-job history deque + subscriber queues; lock is a `threading.Lock` (not `asyncio.Lock` — held across many HTTP requests). Pump task's `finally` releases the lock; cancellation is SIGTERM with a 10s SIGKILL grace.
+- `viz.server.endpoints.{cli_schema,commands}` — REST + one WS, all REST-flat. POST/GET/DELETE/WS for jobs; lock conflict → HTTP 409.
+- CLI: `cmd_dashboard` lazy-imports the server stack; bare `constellation` rewrites argv to `["dashboard"]` in `main()`.
+- Frontend `dashboard/` tree (vanilla TS): 5 components + state event bus + types module mirroring the introspect TypedDicts.
+- Release CI: `python -m constellation.viz.frontend.build --entry genome dashboard --pack` produces one tarball containing both entries; `bundle.json` uses `entries: [...]` for the multi-entry form, preserving the scalar `entry` key for single-entry backwards compat.
+- 4 new test files (`test_viz_introspect.py`, `test_viz_runner.py`, `test_viz_runner_lock.py`, `test_viz_dashboard_endpoints.py`) + `test_imports.py` extension — 31 new tests, full suite 1401 passing.
+
+Dashboard endpoint use of httpx + `ASGITransport` rather than `TestClient` is intentional: `TestClient` tears down its event loop between requests, which kills the runner's subprocess pump task and prematurely releases the lock; a persistent `AsyncClient` loop is the only way to faithfully exercise the 409 path in unit tests.
+
+Coordination-event-bus stub is present (`engine/viewport_bus.ts` from PR 1) but not yet wired between the dashboard and a viz panel — that's part of the embedded-genome-as-dock-panel follow-up.
 
 ## PR 1 — detailed scope
 

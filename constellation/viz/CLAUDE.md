@@ -2,9 +2,9 @@
 
 This file extends the project-wide rules in [../../CLAUDE.md](../../CLAUDE.md). Read that first.
 
-`viz/` ships the first-party visualization layer. PR 1 delivers an IGV-style focused tool — `constellation viz genome --session DIR` boots a local FastAPI server backed by the existing pipeline parquet outputs and serves an SVG-rendered genome browser SPA. PR 2 will wrap this as one panel inside a `constellation`-launched dashboard (auto-introspected CLI form + xterm.js terminal + embedded IPython); see [docs/plans/viz-and-dashboard.md](../../docs/plans/viz-and-dashboard.md) for the multi-PR plan.
+`viz/` ships the first-party visualization layer. PR 1 delivered an IGV-style focused tool (`constellation viz genome --session DIR` boots a local FastAPI server backed by the pipeline parquet outputs and serves an SVG-rendered genome browser SPA). PR 2 ships the dashboard shell: bare `constellation` (or `constellation dashboard`) launches a JupyterLab-style soft GUI that wraps every CLI subcommand as a form + xterm.js terminal, splittable via dockview-core panes. Both SPAs share one FastAPI app. See [docs/plans/viz-and-dashboard.md](../../docs/plans/viz-and-dashboard.md) for the multi-PR plan.
 
-The `[viz]` extras (`fastapi`, `uvicorn[standard]`, `datashader`, `websockets`, `httpx`) gate the runtime; the package skeleton (`tracks/base.py`, `tracks/<kernel>.py`, `server/session.py`) imports cleanly under the base install and is exercised by `tests/test_imports.py`. Modules that need fastapi / datashader live behind `pytest.importorskip` in their own test files.
+The `[viz]` extras (`fastapi`, `uvicorn[standard]`, `datashader`, `websockets`, `httpx`) gate the runtime; the package skeleton (`tracks/base.py`, `tracks/<kernel>.py`, `server/session.py`, `introspect/`, `runner/`) imports cleanly under the base install and is exercised by `tests/test_imports.py`. Modules that need fastapi / datashader live behind `pytest.importorskip` in their own test files.
 
 ## Module index
 
@@ -15,8 +15,11 @@ The `[viz]` extras (`fastapi`, `uvicorn[standard]`, `datashader`, `websockets`, 
 | `viz.raster` | Datashader → PNG helper for hybrid-mode payloads + `greedy_row_assign` shared between vector and hybrid renderers. **Only sanctioned pandas boundary in the package** (datashader's aggregation requires a pd.DataFrame input). | shipped |
 | `viz.cli` | `build_parser(subs)` mounts the `viz` subtree from `constellation/cli/__main__.py`. Two subcommands shipped: `viz genome` (lazy-imports uvicorn + the app factory) and `viz install-frontend` (lazy-imports `viz.install`). | shipped |
 | `viz.install` | `install_frontend_from_tarball(local_path, entry, force, verify, dest_root)` + `install_frontend_from_url(version, entry, force, verify, dest_root, cache_dir, github_owner_repo)` + `read_bundle_metadata(dest_dir)`. Stdlib-only — `tarfile` / `hashlib` / `shutil` / `urllib.request`. PR 1.6 added URL-fetch (default path; cache at `~/.cache/constellation/viz-frontend/`); PR 1.5's local-tarball path remains as `--from PATH` and the HPC offline escape hatch. | shipped |
-| `viz.frontend` | Committed TS/Vite source tree under `frontend/src/` plus the `python -m constellation.viz.frontend.build` helper. Default: runs `pnpm install && pnpm build` and emits to `viz/static/<entry>/`. With `--pack`: also produces `<repo>/dist/constellation-viz-frontend-<version>.tar.gz` + `.sha256` for shipping to machines without the JS toolchain. The `static/` and `dist/` trees are git-ignored. | shipped |
-| `viz.runner`, `viz.introspect` | PR 2: subprocess runner + lock + xterm.js streaming; argparse → JSON-schema introspection; sandboxed file picker. | scaffold (not yet present) |
+| `viz.frontend` | Committed TS/Vite source tree under `frontend/src/` plus the `python -m constellation.viz.frontend.build` helper. Default: runs `pnpm install && pnpm build` and emits to `viz/static/<entry>/`. With `--pack`: produces `<repo>/dist/constellation-viz-frontend-<version>.tar.gz` + `.sha256`. PR 2 added the `dashboard` entry alongside `genome` — pass `--entry genome dashboard` to build both and pack them into a single tarball. The `static/` and `dist/` trees are git-ignored. | shipped |
+| `viz.introspect` | PR 2: walks the production argparse parser via `walk_parser(_build_parser())` and emits a JSON tree the dashboard renders into auto-generated forms. `curated.json` is the hand-edited "Common" overlay. Type mapping: `BooleanOptionalAction`/`store_true` → flag, `choices=` → enum, `nargs in ('+','*',N>1)` → multi, `dest` path-suffix heuristic → path. | shipped |
+| `viz.runner` | PR 2: spawns `python -m constellation.cli.__main__ <argv>` via `asyncio.create_subprocess_exec`, fans stdout/stderr into a per-job history deque + subscriber queues. `lock.py` holds a `threading.Lock` enforcing the single-compute-job rule; `acquire_or_409` is non-blocking and maps to HTTP 409 at the endpoint. Lock release happens in the pump task's `finally` so a stuck subscriber never wedges the dashboard. | shipped |
+| `viz.server.endpoints.{cli_schema,commands}` | PR 2: `GET /api/cli/schema` (cached for the process lifetime); `POST /api/commands` (acquires lock, spawns, returns job_id), `GET /api/commands/active`, `GET /api/commands/{id}`, `DELETE /api/commands/{id}` (SIGTERM with 10s grace), `WS /api/commands/{id}/stream` (replays history then live frames; sends `{stream:'exit',line:exit_code}` sentinel before closing). | shipped |
+| `viz.server.endpoints.fs` | Deferred: sandboxed file picker + WSL path normalization. | not yet present |
 
 **Currently registered kinds** (the canonical list — `constellation.viz.registered_kinds()`):
 `cluster_pileup`, `coverage_histogram`, `gene_annotation`, `read_pileup`, `reference_sequence`, `splice_junctions`.
@@ -165,13 +168,15 @@ The handler reads the adjacent `.sha256` sidecar (GNU coreutils format: `<hex>  
 ```
 constellation/viz/frontend/
 ├── package.json                   pnpm/npm dependency manifest
-├── vite.config.ts                 multi-entry build, base="/static/<entry>/"
+├── vite.config.ts                 multi-entry build (genome + dashboard), base="/static/<entry>/"
 ├── tsconfig.json                  ES2022 + strict
 ├── index.genome.html              shell HTML for the genome entry
-├── build.py                       `python -m constellation.viz.frontend.build` (+ `--pack` for release-style tarballs)
+├── index.dashboard.html           shell HTML for the dashboard entry (PR 2)
+├── build.py                       `python -m constellation.viz.frontend.build` (+ `--pack` for release-style tarballs); `--entry NAME [NAME ...]` builds multiple entries
 └── src/
-    ├── main_genome.ts             entry point (mounts GenomeBrowser)
-    ├── engine/
+    ├── main_genome.ts             genome entry point (mounts GenomeBrowser)
+    ├── main_dashboard.ts          dashboard entry point (PR 2; fetches /api/cli/schema, mounts DashboardShell)
+    ├── engine/                    shared with both entries
     │   ├── arrow_client.ts        apache-arrow IPC fetch + JSON helpers
     │   ├── scales.ts              d3-scale + d3-axis wrappers
     │   ├── viewport_bus.ts        ViewportBus (locus + selection events)
@@ -179,23 +184,47 @@ constellation/viz/frontend/
     │   ├── hybrid_layer.ts        decode HYBRID_SCHEMA + <image> mount
     │   ├── interactions.ts        wheel/drag pan-zoom into ViewportBus
     │   └── export.ts              composite-SVG serializer + download
-    ├── track_renderers/
+    ├── track_renderers/           genome-only
     │   ├── base.ts                TrackRenderer interface
     │   ├── index.ts               kind → renderer registry
     │   └── <kind>.ts              one renderer per Python kernel
-    └── widgets/
-        └── GenomeBrowser.ts       toolbar + ruler + track stack + export
+    ├── widgets/                   genome-only
+    │   └── GenomeBrowser.ts       toolbar + ruler + track stack + export
+    └── dashboard/                 dashboard-only (PR 2)
+        ├── DashboardShell.ts      DockviewComponent owner + panel orchestration
+        ├── Sidebar.ts             Common ↔ All toggle, search, command tree
+        ├── CommandForm.ts         schema-driven argv constructor
+        ├── Terminal.ts            xterm.js wrapping the /api/commands/{id}/stream WS
+        ├── StatusBar.ts           polls /api/commands/active; toast on lock rejection
+        ├── state.ts               DashboardState event bus + localStorage helpers
+        └── types.ts               TS mirror of introspect/schema.py TypedDicts
 ```
 
-## What's deferred (PR 2 + later)
+## Dashboard frontend (`frontend/src/dashboard/`, PR 2)
 
-- `viz.runner` (subprocess runner + asyncio.Lock for the single-compute-job rule)
-- `viz.introspect` (argparse → JSON schema for the auto-generated dashboard sidebar)
-- `viz.server.endpoints.{commands, cli_schema, fs}`
-- `frontend/src/dashboard/` (`Sidebar`, `CommandForm`, `Terminal`, `PanelHost`, `StatusBar`, `FilePicker`, `NotebookPanel`)
-- Cross-modality coordination types (Vitessce-style; lands once a non-genome modality kernel exists; the `viewport_bus` is already in place to receive selection events)
-- Spectrum / structure / phylogeny / NN-activation kernels (separate PRs)
-- proBAM / proBED emission (deferred per the project-wide note pending the genome→proteome bridge work)
+The dashboard SPA is vanilla TypeScript (no React) — same paradigm as the PR 1 genome browser. Layout uses dockview-core's `DockviewComponent` for splittable docking; xterm.js renders subprocess output.
+
+| File | Role |
+|---|---|
+| `types.ts` | TypeScript mirror of `introspect/schema.py` TypedDicts (`CliSchema`, `CommandSchema`, `ArgumentSchema`) + the `/api/commands` wire shapes. |
+| `state.ts` | `DashboardState` event bus (mirrors `engine/viewport_bus.ts` from PR 1) + `getStored`/`setStored` localStorage helpers namespaced under `constellation.dashboard.*`. |
+| `Sidebar.ts` | Mode-switch toggle (Common ↔ All — state persisted), search filter, tree of commands; clicking a leaf emits `command:open`. |
+| `CommandForm.ts` | JSON-schema-driven form generator. Buckets args into Required / Optional / Advanced (heuristic on dest); validates required-but-empty + numeric type mismatches; assembles `argv` and POSTs to `/api/commands`. On 409, surfaces the error inline. |
+| `Terminal.ts` | xterm.js + `@xterm/addon-fit` wrapping a WS to `/api/commands/{id}/stream`. Frames are newline-delimited JSON `{stream, line}`; stderr renders red; the final `{stream:'exit',line:N}` frame closes the timer. |
+| `StatusBar.ts` | Polls `/api/commands/active` every 2s; emits `job:active`. Toasts on `job:rejected`. |
+| `DashboardShell.ts` | Owns the `DockviewComponent`. dockview-core 3.x uses a `createComponent(opts)` factory (not a `components: {name: Class}` map); we switch on `opts.name` to instantiate the right renderer. Layout persisted to `localStorage["constellation.dashboard.layout.v1"]` via `onDidLayoutChange` + `toJSON`/`fromJSON`. |
+
+dockview-core theming uses ~40 `--dv-*` CSS variables; v1 ships the dark theme and softens corners via `--dv-tab-border-radius: 6px` etc. — full override surface lives in `index.dashboard.html`'s `<style>` block.
+
+## What's deferred (later)
+
+- `viz.server.endpoints.fs` — sandboxed file picker + WSL path normalization; in v1 path args are plain text inputs.
+- `frontend/src/dashboard/FilePicker.ts`, `NotebookPanel.ts` — IPython-in-dock and tree-based file picker; IPython would reuse the `viz.runner` plumbing.
+- Embedded genome browser as a dock panel — v1 deep-links to `/static/genome/` in a new tab.
+- Desktop shortcut generator (`constellation install-shortcut` writing `.desktop` / `.lnk` / `.app`).
+- Cross-modality coordination types (Vitessce-style; lands once a non-genome modality kernel exists; the `viewport_bus` from PR 1 is already in place to receive selection events).
+- Spectrum / structure / phylogeny / NN-activation kernels (separate PRs).
+- proBAM / proBED emission (deferred per the project-wide note pending the genome→proteome bridge work).
 
 ## Companion plan
 

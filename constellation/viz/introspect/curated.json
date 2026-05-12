@@ -1,0 +1,46 @@
+{
+  "curated": [
+    {
+      "path": ["doctor"],
+      "label": "Check installation",
+      "group": "Setup",
+      "hint": "Report third-party tool + frontend bundle status"
+    },
+    {
+      "path": ["reference", "fetch"],
+      "label": "Fetch reference genome",
+      "group": "Reference",
+      "hint": "Pull a genome + annotation from Ensembl / RefSeq / Ensembl Genomes"
+    },
+    {
+      "path": ["reference", "import"],
+      "label": "Import local reference",
+      "group": "Reference",
+      "hint": "Build a Constellation reference bundle from a local FASTA (+ optional GFF3)"
+    },
+    {
+      "path": ["transcriptome", "demultiplex"],
+      "label": "Demultiplex nanopore reads",
+      "group": "Sequencing",
+      "hint": "S1 — split per-sample reads, predict ORFs, write parquet"
+    },
+    {
+      "path": ["transcriptome", "align"],
+      "label": "Genome-guided alignment",
+      "group": "Sequencing",
+      "hint": "S2 Mode A — map reads to a reference and emit coverage / introns / annotations"
+    },
+    {
+      "path": ["transcriptome", "cluster"],
+      "label": "Cluster transcripts",
+      "group": "Sequencing",
+      "hint": "Genome-guided clustering with optional consensus build"
+    },
+    {
+      "path": ["viz", "genome"],
+      "label": "Open genome browser",
+      "group": "Visualize",
+      "hint": "IGV-style focused tool over a session's parquet outputs"
+    }
+  ]
+}
