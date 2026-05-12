@@ -105,8 +105,15 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     )
     p_install.add_argument(
         "--entry",
-        default="genome",
-        help="bundle entry to install (default: genome)",
+        nargs="+",
+        default=None,
+        metavar="NAME",
+        help=(
+            "bundle entry/entries to install. Default: install every "
+            "entry found in the tarball (genome + dashboard for a "
+            "release bundle). Pass a subset to narrow the install "
+            "(`--entry genome`)."
+        ),
     )
     p_install.add_argument(
         "--force",
@@ -288,48 +295,84 @@ def cmd_viz_install_frontend(args: argparse.Namespace) -> int:
 
     Dispatches between the local-tarball path (``--from PATH``) and the
     URL-fetch path (default — uses ``constellation.__version__``, or
-    ``--version X.Y.Z`` for an explicit pin). Lazy-imports
-    ``constellation.viz.install`` so the top-level CLI doesn't pay for
-    the import on unrelated subcommands. Surfaces ``InstallError``
-    messages verbatim — they're already formatted for the user.
+    ``--version X.Y.Z`` for an explicit pin). When ``--entry`` is omitted
+    the handler installs every entry present in the bundle (today: both
+    ``genome`` and ``dashboard``); explicit ``--entry NAME [NAME ...]``
+    narrows the install. Lazy-imports ``constellation.viz.install`` so
+    the top-level CLI doesn't pay for the import on unrelated
+    subcommands. Surfaces ``InstallError`` messages verbatim — they're
+    already formatted for the user.
     """
     from constellation.viz.install import (
         InstallError,
         install_frontend_from_tarball,
         install_frontend_from_url,
+        list_tarball_entries,
     )
+
+    # Resolve the entry list before dispatching. For --from we can
+    # introspect the tarball directly; for the URL path we trust the
+    # release contract (current tarballs ship genome + dashboard).
+    # Future-proof the URL fallback by deferring the discovery to the
+    # downloaded tarball: install_frontend_from_url caches the file
+    # under ~/.cache/, so the first call materializes it and a follow-
+    # up call from the same cache uses the local tarball discovery
+    # path. For v1 simplicity, fall back to a hardcoded list when --version
+    # is in play and the user didn't say otherwise.
+    requested_entries: list[str] | None = args.entry  # None when omitted
 
     try:
         if args.from_path is not None:
-            result = install_frontend_from_tarball(
-                local_path=args.from_path,
-                entry=args.entry,
-                force=args.force,
-                verify=not args.no_verify,
+            entries = (
+                requested_entries
+                if requested_entries is not None
+                else list_tarball_entries(args.from_path)
             )
+            results = [
+                install_frontend_from_tarball(
+                    local_path=args.from_path,
+                    entry=entry,
+                    force=args.force,
+                    verify=not args.no_verify,
+                )
+                for entry in entries
+            ]
         else:
             import constellation as _constellation
 
             version = args.version or _constellation.__version__
-            kwargs: dict[str, object] = {
-                "version": version,
-                "entry": args.entry,
-                "force": args.force,
-                "verify": not args.no_verify,
-                "cache_dir": args.cache_dir,
-            }
-            if args.repo is not None:
-                kwargs["github_owner_repo"] = args.repo
-            result = install_frontend_from_url(**kwargs)  # type: ignore[arg-type]
+            # No introspection available without downloading first; the
+            # release tarballs ship every entry the source tree knows
+            # about, so use that as the source of truth.
+            from constellation.viz.frontend.build import known_entries
+
+            entries = (
+                requested_entries
+                if requested_entries is not None
+                else known_entries()
+            )
+            results = []
+            for entry in entries:
+                kwargs: dict[str, object] = {
+                    "version": version,
+                    "entry": entry,
+                    "force": args.force,
+                    "verify": not args.no_verify,
+                    "cache_dir": args.cache_dir,
+                }
+                if args.repo is not None:
+                    kwargs["github_owner_repo"] = args.repo
+                results.append(install_frontend_from_url(**kwargs))  # type: ignore[arg-type]
     except InstallError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    version = result.bundle_metadata.get("constellation_version") or "unknown"
-    print(
-        f"installed constellation viz frontend ({result.entry}, "
-        f"version {version}) at {result.dest_dir}"
-    )
+    for result in results:
+        version = result.bundle_metadata.get("constellation_version") or "unknown"
+        print(
+            f"installed constellation viz frontend ({result.entry}, "
+            f"version {version}) at {result.dest_dir}"
+        )
     return 0
 
 

@@ -15,7 +15,7 @@ The `[viz]` extras (`fastapi`, `uvicorn[standard]`, `datashader`, `websockets`, 
 | `viz.raster` | Datashader → PNG helper for hybrid-mode payloads + `greedy_row_assign` shared between vector and hybrid renderers. **Only sanctioned pandas boundary in the package** (datashader's aggregation requires a pd.DataFrame input). | shipped |
 | `viz.cli` | `build_parser(subs)` mounts the `viz` subtree from `constellation/cli/__main__.py`. Two subcommands shipped: `viz genome` (lazy-imports uvicorn + the app factory) and `viz install-frontend` (lazy-imports `viz.install`). | shipped |
 | `viz.install` | `install_frontend_from_tarball(local_path, entry, force, verify, dest_root)` + `install_frontend_from_url(version, entry, force, verify, dest_root, cache_dir, github_owner_repo)` + `read_bundle_metadata(dest_dir)`. Stdlib-only — `tarfile` / `hashlib` / `shutil` / `urllib.request`. PR 1.6 added URL-fetch (default path; cache at `~/.cache/constellation/viz-frontend/`); PR 1.5's local-tarball path remains as `--from PATH` and the HPC offline escape hatch. | shipped |
-| `viz.frontend` | Committed TS/Vite source tree under `frontend/src/` plus the `python -m constellation.viz.frontend.build` helper. Default: runs `pnpm install && pnpm build` and emits to `viz/static/<entry>/`. With `--pack`: produces `<repo>/dist/constellation-viz-frontend-<version>.tar.gz` + `.sha256`. PR 2 added the `dashboard` entry alongside `genome` — pass `--entry genome dashboard` to build both and pack them into a single tarball. The `static/` and `dist/` trees are git-ignored. | shipped |
+| `viz.frontend` | Committed TS/Vite source tree under `frontend/src/` plus the `python -m constellation.viz.frontend.build` helper. Default: builds **every entry discovered under `frontend/index.*.html`** (currently `genome` + `dashboard`); pass `--entry NAME [NAME ...]` to narrow for fast iteration. `--pack` produces `<repo>/dist/constellation-viz-frontend-<version>.tar.gz` + `.sha256` containing every built entry. `known_entries()` is the discovery helper. The `static/` and `dist/` trees are git-ignored. | shipped |
 | `viz.introspect` | PR 2: walks the production argparse parser via `walk_parser(_build_parser())` and emits a JSON tree the dashboard renders into auto-generated forms. `curated.json` is the hand-edited "Common" overlay. Type mapping: `BooleanOptionalAction`/`store_true` → flag, `choices=` → enum, `nargs in ('+','*',N>1)` → multi, `dest` path-suffix heuristic → path. | shipped |
 | `viz.runner` | PR 2: spawns `python -m constellation.cli.__main__ <argv>` via `asyncio.create_subprocess_exec`, fans stdout/stderr into a per-job history deque + subscriber queues. `lock.py` holds a `threading.Lock` enforcing the single-compute-job rule; `acquire_or_409` is non-blocking and maps to HTTP 409 at the endpoint. Lock release happens in the pump task's `finally` so a stuck subscriber never wedges the dashboard. | shipped |
 | `viz.server.endpoints.{cli_schema,commands}` | PR 2: `GET /api/cli/schema` (cached for the process lifetime); `POST /api/commands` (acquires lock, spawns, returns job_id), `GET /api/commands/active`, `GET /api/commands/{id}`, `DELETE /api/commands/{id}` (SIGTERM with 10s grace), `WS /api/commands/{id}/stream` (replays history then live frames; sends `{stream:'exit',line:exit_code}` sentinel before closing). | shipped |
@@ -139,23 +139,24 @@ Both `static/` and `dist/` are git-ignored. The bundle is derived state; gitigno
 | HPC / restricted-network install | Build bundle on a workstation via `--pack`, scp the tarball + `.sha256` to the cluster, run `install-frontend --from`. Solves the OSC-can't-run-npm case completely. | No |
 | CI test runs | Not needed — Python tests skip viz endpoints when the bundle is absent | n/a |
 
-**Install command surface (PR 1.6)**:
+**Install command surface (PR 1.6 + PR 2)**:
 
 ```
 # URL-fetch (default — uses constellation.__version__)
-constellation viz install-frontend
+constellation viz install-frontend                              # installs every entry the release ships
 constellation viz install-frontend --version 0.0.1
 constellation viz install-frontend --version 0.0.1rc1
 constellation viz install-frontend --repo myfork/constellation
 constellation viz install-frontend --cache-dir /scratch/$USER/cache
 
-# Local tarball (PR 1.5 path — unchanged; HPC offline escape hatch)
-constellation viz install-frontend --from /path/to/tarball.tar.gz
-constellation viz install-frontend --from /path/to/tarball.tar.gz --entry genome --force
-constellation viz install-frontend --from /path/to/tarball.tar.gz --no-verify   # stderr warning
+# Local tarball (PR 1.5 path — HPC offline escape hatch)
+constellation viz install-frontend --from /path/to/tarball.tar.gz                     # installs every entry IN THE TARBALL (discovered)
+constellation viz install-frontend --from /path/to/tarball.tar.gz --entry genome      # narrow to just genome
+constellation viz install-frontend --from /path/to/tarball.tar.gz --entry genome dashboard   # explicit subset
+constellation viz install-frontend --from /path/to/tarball.tar.gz --no-verify         # stderr warning
 ```
 
-`--from` and `--version` are mutually exclusive. With neither, `--version` defaults to `constellation.__version__`. Dev versions (containing `.dev` or `+`) are refused before any HTTP call with a hint to pass `--version X.Y.Z` or `--from <local>`.
+`--from` and `--version` are mutually exclusive. With neither, `--version` defaults to `constellation.__version__`. With no `--entry`, install dispatches once per entry — discovered from the local tarball directly (`list_tarball_entries`), or from `frontend.build.known_entries()` for URL fetch (the release contract ships every known entry). Dev versions (containing `.dev` or `+`) are refused before any HTTP call with a hint to pass `--version X.Y.Z` or `--from <local>`.
 
 The handler reads the adjacent `.sha256` sidecar (GNU coreutils format: `<hex>  <filename>\n`), verifies the tarball's digest, then extracts `<prefix>/static/<entry>/` into `viz/static/<entry>/` and copies `bundle.json` alongside it so `constellation doctor` can report the installed version. The URL-fetch path additionally caches the downloaded tarball + sidecar under `~/.cache/constellation/viz-frontend/` (or `--cache-dir`); the sidecar is always re-fetched on subsequent invocations so a re-pushed release invalidates the cache automatically.
 
