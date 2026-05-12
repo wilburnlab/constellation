@@ -153,11 +153,11 @@ jobs:
     permissions:
       contents: write   # required to create / update the release
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: python-dist
           path: dist/
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: frontend-dist
           path: dist/
@@ -181,7 +181,7 @@ jobs:
     permissions:
       id-token: write   # OIDC trusted publishing — no API token required
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: python-dist
           path: dist/
