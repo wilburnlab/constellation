@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # GitHub Actions in .github/workflows/. Auto-PRs as new majors of
+  # checkout, setup-python, etc. ship — important runway for the
+  # Node 20 → Node 24 deprecation (Node 20 removed from runners
+  # 2026-09-16). Weekly is enough; the workflow only fires on tag push.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"

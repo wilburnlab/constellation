@@ -1,3 +1,8 @@
+# TODO(2026-09-16): bump action @v* pins to Node-24-compatible majors
+# before this date. Node 20 default flips 2026-06-02 (opt-out via env);
+# Node 20 removed from runners 2026-09-16 (no opt-out). Dependabot
+# (.github/dependabot.yml) opens auto-PRs as new majors ship.
+#
 # Release workflow — fires on `vX.Y.Z` (or `vX.Y.Z(rc|a|b)N`) tag pushes.
 #
 # Pipeline:
