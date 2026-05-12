@@ -14,7 +14,7 @@ The `[viz]` extras (`fastapi`, `uvicorn[standard]`, `datashader`, `websockets`, 
 | `viz.server` | FastAPI app factory, Arrow IPC streaming helper (`arrow_stream`), `Session` discovery (`session.py`), `endpoints/{sessions, tracks}` routes. | shipped |
 | `viz.raster` | Datashader → PNG helper for hybrid-mode payloads + `greedy_row_assign` shared between vector and hybrid renderers. **Only sanctioned pandas boundary in the package** (datashader's aggregation requires a pd.DataFrame input). | shipped |
 | `viz.cli` | `build_parser(subs)` mounts the `viz` subtree from `constellation/cli/__main__.py`. Two subcommands shipped: `viz genome` (lazy-imports uvicorn + the app factory) and `viz install-frontend` (lazy-imports `viz.install`). | shipped |
-| `viz.install` | `install_frontend_from_tarball(local_path, entry, force, verify, dest_root)` + `read_bundle_metadata(dest_dir)`. Stdlib-only — `tarfile` / `hashlib` / `shutil`. PR 1.5 ships the local-tarball path; PR 1.6 will add a sibling `install_frontend_from_url` for release-asset fetch. | shipped |
+| `viz.install` | `install_frontend_from_tarball(local_path, entry, force, verify, dest_root)` + `install_frontend_from_url(version, entry, force, verify, dest_root, cache_dir, github_owner_repo)` + `read_bundle_metadata(dest_dir)`. Stdlib-only — `tarfile` / `hashlib` / `shutil` / `urllib.request`. PR 1.6 added URL-fetch (default path; cache at `~/.cache/constellation/viz-frontend/`); PR 1.5's local-tarball path remains as `--from PATH` and the HPC offline escape hatch. | shipped |
 | `viz.frontend` | Committed TS/Vite source tree under `frontend/src/` plus the `python -m constellation.viz.frontend.build` helper. Default: runs `pnpm install && pnpm build` and emits to `viz/static/<entry>/`. With `--pack`: also produces `<repo>/dist/constellation-viz-frontend-<version>.tar.gz` + `.sha256` for shipping to machines without the JS toolchain. The `static/` and `dist/` trees are git-ignored. | shipped |
 | `viz.runner`, `viz.introspect` | PR 2: subprocess runner + lock + xterm.js streaming; argparse → JSON-schema introspection; sandboxed file picker. | scaffold (not yet present) |
 
@@ -130,23 +130,33 @@ Both `static/` and `dist/` are git-ignored. The bundle is derived state; gitigno
 
 | Install path | How the bundle arrives | JS toolchain needed? |
 |---|---|---|
-| `pip install constellation[viz]` from PyPI (release wheel — PR 1.6) | Baked into the `.whl` by CI | No |
+| `pip install constellation-bio[viz]` from PyPI (release wheel) | Baked into the `.whl` by CI on tag push | No |
 | `git clone && pip install -e .[viz]` (frontend dev) | `python -m constellation.viz.frontend.build` (runs pnpm) | Yes |
-| `git clone && pip install -e .[viz]` (Python-only dev) | `constellation viz install-frontend --from <local-tarball>` after the bundle is built elsewhere; PR 1.6 adds a URL-fetch default | No |
+| `git clone && pip install -e .[viz]` (Python-only dev) | `constellation viz install-frontend` — URL-fetches the matching GitHub release asset | No |
 | HPC / restricted-network install | Build bundle on a workstation via `--pack`, scp the tarball + `.sha256` to the cluster, run `install-frontend --from`. Solves the OSC-can't-run-npm case completely. | No |
 | CI test runs | Not needed — Python tests skip viz endpoints when the bundle is absent | n/a |
 
-**Install command surface (PR 1.5)**:
+**Install command surface (PR 1.6)**:
 
 ```
+# URL-fetch (default — uses constellation.__version__)
+constellation viz install-frontend
+constellation viz install-frontend --version 0.0.1
+constellation viz install-frontend --version 0.0.1rc1
+constellation viz install-frontend --repo myfork/constellation
+constellation viz install-frontend --cache-dir /scratch/$USER/cache
+
+# Local tarball (PR 1.5 path — unchanged; HPC offline escape hatch)
 constellation viz install-frontend --from /path/to/tarball.tar.gz
 constellation viz install-frontend --from /path/to/tarball.tar.gz --entry genome --force
 constellation viz install-frontend --from /path/to/tarball.tar.gz --no-verify   # stderr warning
 ```
 
-The handler reads the adjacent `.sha256` sidecar (GNU coreutils format: `<hex>  <filename>\n`), verifies the tarball's digest, then extracts `<prefix>/static/<entry>/` into `viz/static/<entry>/` and copies `bundle.json` alongside it so `constellation doctor` can report the installed version.
+`--from` and `--version` are mutually exclusive. With neither, `--version` defaults to `constellation.__version__`. Dev versions (containing `.dev` or `+`) are refused before any HTTP call with a hint to pass `--version X.Y.Z` or `--from <local>`.
 
-`pack_bundle()` in `frontend/build.py` is the producer side — public so PR 1.6's release CI can call it directly without re-running `pnpm build`.
+The handler reads the adjacent `.sha256` sidecar (GNU coreutils format: `<hex>  <filename>\n`), verifies the tarball's digest, then extracts `<prefix>/static/<entry>/` into `viz/static/<entry>/` and copies `bundle.json` alongside it so `constellation doctor` can report the installed version. The URL-fetch path additionally caches the downloaded tarball + sidecar under `~/.cache/constellation/viz-frontend/` (or `--cache-dir`); the sidecar is always re-fetched on subsequent invocations so a re-pushed release invalidates the cache automatically.
+
+`pack_bundle()` in `frontend/build.py` is the producer side — public so the release CI workflow (`.github/workflows/release.yml`) can call it directly without re-running `pnpm build` from scratch.
 
 `constellation doctor` adds a `viz frontend (<entry>)` row that reads `static/<entry>/bundle.json` and reports `ok` + version when present, `not installed` with a hint otherwise.
 

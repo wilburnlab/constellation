@@ -1,0 +1,21 @@
+# Extends the gitleaks default ruleset with path-scoped allowlists for
+# rules that structurally collide with biological-sequence data.
+# Protein and nucleic-acid one-letter codes alias AWS / GitHub / etc.
+# token prefixes by accident — every protein dump under
+# constellation/data/ and every generator under scripts/build-*-json.py
+# will keep producing aws-access-token false positives as more sequences
+# land. Allowlists are scoped to the AWS rule only — real credentials
+# accidentally committed under these paths would still fire under other
+# rules (generic-api-key, github-pat, etc.).
+[extend]
+useDefault = true
+
+[[rules]]
+id = "aws-access-token"
+[rules.allowlist]
+description = "Biological sequence data — protein/DNA strings collide with AWS IAM key prefixes (AIDA, AKIA, AGPA, AROA, ASIA, ANPA, ANVA, AIPA, A3T...)"
+paths = [
+    '''constellation/data/.+\.json$''',
+    '''scripts/build-.+-json\.py$''',
+    '''tests/data/.+\.(fasta|fa|json)$''',
+]
