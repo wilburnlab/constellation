@@ -161,7 +161,7 @@ jobs:
         with:
           name: frontend-dist
           path: dist/
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.ref || github.ref_name }}
           prerelease: ${{ needs.classify-tag.outputs.is_prerelease == 'true' }}
