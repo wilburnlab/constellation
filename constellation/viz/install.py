@@ -280,6 +280,43 @@ def read_bundle_metadata(dest_dir: Path | str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def list_tarball_entries(tarball_path: Path | str) -> list[str]:
+    """Inspect a release tarball and return every entry it contains.
+
+    Scans for ``<prefix>/static/<entry>/`` top-level directory members
+    and returns the discovered entry names sorted. This is the source
+    of truth for "install everything" — the CLI dispatches one
+    ``install_frontend_from_tarball`` call per discovered entry when
+    ``--entry`` is omitted. A single-entry tarball returns a 1-element
+    list; multi-entry tarballs return all of them.
+
+    Raises :class:`InstallError` when the tarball is unreadable or has
+    no ``static/<entry>/`` directories (legacy / hand-rolled tarballs).
+    """
+    path = Path(tarball_path).expanduser().resolve()
+    if not path.is_file():
+        raise InstallError(f"tarball not found: {path}")
+    try:
+        with tarfile.open(path, mode="r:gz") as tar:
+            members = tar.getmembers()
+    except (tarfile.TarError, OSError) as exc:
+        raise InstallError(f"failed to read tarball {path.name}: {exc}") from exc
+
+    # Members look like '<prefix>/static/<entry>/...'. Pick out the
+    # second-level segment after 'static/'.
+    entries: set[str] = set()
+    for member in members:
+        parts = member.name.split("/")
+        if len(parts) >= 3 and parts[1] == "static" and parts[2]:
+            entries.add(parts[2])
+    if not entries:
+        raise InstallError(
+            f"no static/<entry>/ directories found in {path.name}; "
+            "is this a valid constellation-viz-frontend bundle?"
+        )
+    return sorted(entries)
+
+
 # ----------------------------------------------------------------------
 # Internals
 # ----------------------------------------------------------------------

@@ -113,13 +113,15 @@ jobs:
         run: |
           python -m pip install -e .
 
-      - name: Build + pack frontend (genome + dashboard entries)
-        # PR 2: ship both entries in one release tarball. The wheel
-        # picks them up via the existing package-data rule; the
-        # downstream `--from <tarball>` and URL-fetch install paths
-        # use `--entry NAME` to pick which subtree to extract.
+      - name: Build + pack frontend (all known entries)
+        # The build helper's --entry default is "every entry discovered
+        # under frontend/index.*.html", so a new entry auto-joins the
+        # release tarball when its shell HTML lands. The wheel picks
+        # all entries up via the existing package-data rule; the
+        # downstream install paths default to "install every entry in
+        # the tarball" as well — `--entry NAME` narrows either side.
         run: |
-          python -m constellation.viz.frontend.build --entry genome dashboard --pack
+          python -m constellation.viz.frontend.build --pack
 
       - name: Build wheel + sdist
         # The wheel picks up constellation/viz/static/<entry>/ via the

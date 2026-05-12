@@ -55,6 +55,27 @@ _PACK_NAME_PREFIX = "constellation-viz-frontend"
 _CHUNK_BYTES = 65_536
 
 
+def known_entries() -> list[str]:
+    """Discover every entry the Vite config knows about.
+
+    Each entry corresponds to a top-level ``index.<entry>.html`` shell
+    file in ``constellation/viz/frontend/``; Vite's input map in
+    ``vite.config.ts`` reads from these. Returning a discovered list
+    rather than a hardcoded ``("genome", "dashboard")`` means a new
+    entry (e.g. an MS spectrum viewer) auto-joins the default build
+    set when its ``index.<name>.html`` lands.
+
+    Returns the entries sorted for deterministic builds. Falls back to
+    ``["genome"]`` when no shell files are present (defensive — should
+    never happen in a committed source tree).
+    """
+    shells = sorted(p.name for p in _FRONTEND_DIR.glob("index.*.html"))
+    entries = [
+        name.removeprefix("index.").removesuffix(".html") for name in shells
+    ]
+    return entries or ["genome"]
+
+
 def _resolve_manager(preference: str | None) -> str:
     """Pick the JS package manager. ``pnpm`` preferred (lockfile shipped
     upstream); falls back to ``npm`` when pnpm isn't on PATH."""
@@ -233,15 +254,18 @@ class _BytesReader:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="constellation.viz.frontend.build")
+    default_entries = known_entries()
     parser.add_argument(
         "--entry",
         nargs="+",
-        default=["genome"],
+        default=default_entries,
         metavar="NAME",
         help=(
-            "entry point(s) to build. Default: 'genome'. Pass multiple "
-            "entries to build them all (`--entry genome dashboard`); "
-            "with --pack the result is a single tarball containing every "
+            "entry point(s) to build. Default: every entry discovered "
+            f"under frontend/index.*.html (currently: "
+            f"{', '.join(default_entries)}). Pass a subset to narrow "
+            "the build for fast iteration (`--entry genome`); with "
+            "--pack the result is a single tarball containing every "
             "built entry."
         ),
     )
