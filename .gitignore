@@ -57,5 +57,5 @@ constellation/viz/frontend/.vite/
 # pnpm-lock.yaml will be added in a follow-up. package-lock.json is npm's
 # competing lockfile and shouldn't be committed alongside (lockfile drift).
 constellation/viz/frontend/package-lock.json
-constellation/viz/frontend/pnpm-lock.yaml
+#constellation/viz/frontend/pnpm-lock.yaml
 constellation/viz/frontend/yarn.lock
