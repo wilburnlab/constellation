@@ -1,26 +1,23 @@
-"""Install the prebuilt frontend bundle from a local tarball.
+"""Install the prebuilt frontend bundle from a local tarball or release URL.
 
 Companion to ``python -m constellation.viz.frontend.build --pack`` which
 produces a bundle tarball + ``.sha256`` sidecar suitable for shipping to a
 machine where the JS toolchain isn't available (HPC clusters, restricted
-networks). The realistic flow is:
+networks). Two install paths are supported:
 
-1. Developer runs ``--pack`` on their workstation → produces
-   ``dist/constellation-viz-frontend-<version>.tar.gz`` + sidecar.
-2. ``scp`` both files to the cluster (or any machine).
-3. On that machine: ``constellation viz install-frontend --from <tarball>``.
-4. The bundle is extracted into ``constellation/viz/static/<entry>/``; the
-   FastAPI server (``constellation viz genome``) now serves it at ``/``.
+* **Local tarball** (``install_frontend_from_tarball``) — the PR 1.5
+  workflow. Build on a workstation → ``scp`` to the target → install.
+* **GitHub Release URL** (``install_frontend_from_url`` — PR 1.6) — the
+  default for source-checkout users. Fetches the release asset matching
+  ``constellation.__version__`` (or an explicit ``--version``), caches
+  it under ``~/.cache/constellation/viz-frontend/``, then dispatches
+  into the same extract/verify pipeline as the local-tarball path.
 
-PR 1.5 ships only the local-file install path. PR 1.6 will add a sibling
-``install_frontend_from_url(...)`` that fetches the matching release
-asset from GitHub — same extract / verify pipeline, just sourced from
-HTTP instead of a local file.
-
-Stdlib-only: ``tarfile``, ``hashlib``, ``shutil``, ``pathlib``, ``json``.
-No third-party deps; runs under the base ``constellation`` install
-without the ``[viz]`` extras (the extras gate ``fastapi`` / ``uvicorn``
-/ ``datashader`` for the serve path, not the install path).
+Stdlib-only: ``tarfile``, ``hashlib``, ``shutil``, ``urllib.request``,
+``pathlib``, ``json``. No third-party deps; runs under the base
+``constellation`` install without the ``[viz]`` extras (the extras gate
+``fastapi`` / ``uvicorn`` / ``datashader`` for the serve path, not the
+install path).
 """
 
 from __future__ import annotations
@@ -30,6 +27,8 @@ import json
 import shutil
 import sys
 import tarfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +40,15 @@ _DEFAULT_STATIC_ROOT = _FRONTEND_PKG_DIR / "static"
 _BUNDLE_METADATA_NAME = "bundle.json"
 _SHA256_SUFFIX = ".sha256"
 _CHUNK_BYTES = 65_536
+
+_PACK_NAME_PREFIX = "constellation-viz-frontend"
+_DEFAULT_GITHUB_REPO = "wilburnlab/constellation"
+_DEFAULT_CACHE_DIR = Path.home() / ".cache" / "constellation" / "viz-frontend"
+_USER_AGENT = "constellation-viz-installer"
+# URL host/scheme are split into constants so tests can monkeypatch them
+# at a stdlib HTTP server (no live github.com round-trip in CI / dev).
+_RELEASE_BASE_SCHEME = "https"
+_RELEASE_BASE_HOST = "github.com"
 
 
 class InstallError(RuntimeError):
@@ -136,6 +144,125 @@ def install_frontend_from_tarball(
     )
 
 
+def install_frontend_from_url(
+    *,
+    version: str,
+    entry: str = "genome",
+    force: bool = False,
+    verify: bool = True,
+    dest_root: Path | str | None = None,
+    cache_dir: Path | str | None = None,
+    github_owner_repo: str = _DEFAULT_GITHUB_REPO,
+) -> InstallResult:
+    """Install a prebuilt frontend bundle from a GitHub Release asset.
+
+    Builds the URL ``https://github.com/<github_owner_repo>/releases
+    /download/v<version>/constellation-viz-frontend-<version>.tar.gz``
+    plus its ``.sha256`` sidecar. Both are downloaded to ``cache_dir``;
+    on a cache hit (file present + sidecar digest matches), the network
+    fetch of the tarball is skipped (the sidecar is always re-fetched —
+    cheap, and lets a re-published release invalidate the cache).
+    Then dispatches into ``install_frontend_from_tarball`` so the
+    extract / verify / bundle-metadata pipeline is identical between
+    install paths.
+
+    Parameters
+    ----------
+    version
+        PEP 440 version string matching a published release tag (the
+        leading ``v`` is added automatically). Dev/local versions
+        (containing ``.dev`` or ``+``) are refused before the network
+        call with an actionable message — the matching release won't
+        exist on GitHub.
+    entry
+        Vite entry name to install (default ``"genome"``). See
+        ``install_frontend_from_tarball``.
+    force
+        Replace any existing install at ``<dest_root>/<entry>/``.
+    verify
+        Verify the downloaded tarball's sha256 against the sidecar.
+        ``False`` skips the check and prints a warning to stderr —
+        almost never what you want over the network.
+    dest_root
+        Override for the static-root directory. Defaults to
+        ``constellation/viz/static/`` inside the installed package.
+    cache_dir
+        Override for the on-disk cache. Defaults to
+        ``~/.cache/constellation/viz-frontend/``.
+    github_owner_repo
+        ``owner/repo`` slug to fetch from. Defaults to
+        ``wilburnlab/constellation``; forks override here without a
+        code change.
+
+    Returns
+    -------
+    InstallResult
+        On success. Raises ``InstallError`` on download failure (404,
+        network error), sha mismatch, or any of the conditions
+        ``install_frontend_from_tarball`` raises for.
+    """
+    if "+" in version or ".dev" in version:
+        raise InstallError(
+            f"cannot fetch release for dev version {version}\n"
+            f"  pass --version X.Y.Z explicitly, or --from <local-tarball>\n"
+            f"  to install a locally-built bundle."
+        )
+
+    cache = (
+        Path(cache_dir).expanduser().resolve()
+        if cache_dir is not None
+        else _DEFAULT_CACHE_DIR
+    )
+    cache.mkdir(parents=True, exist_ok=True)
+
+    artifact_name = f"{_PACK_NAME_PREFIX}-{version}"
+    tarball_name = f"{artifact_name}.tar.gz"
+    sidecar_name = f"{tarball_name}{_SHA256_SUFFIX}"
+    cached_tarball = cache / tarball_name
+    cached_sidecar = cache / sidecar_name
+
+    base_url = (
+        f"{_RELEASE_BASE_SCHEME}://{_RELEASE_BASE_HOST}/{github_owner_repo}"
+        f"/releases/download/v{version}"
+    )
+    tarball_url = f"{base_url}/{tarball_name}"
+    sidecar_url = f"{base_url}/{sidecar_name}"
+
+    # Always re-fetch the sidecar — it's tiny, and lets a re-pushed
+    # release invalidate the cache without a manual --force.
+    print(f"fetching {sidecar_url}", file=sys.stderr)
+    _download_to(sidecar_url, cached_sidecar, version=version)
+
+    if cached_tarball.is_file():
+        try:
+            expected = _parse_sidecar(cached_sidecar, tarball_name)
+            actual = _sha256_of_file(cached_tarball)
+        except InstallError:
+            expected = actual = ""
+        if expected and expected.lower() == actual.lower():
+            print(
+                f"using cached {cached_tarball.name} ({len(cached_tarball.read_bytes()):,} bytes)",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"cached tarball stale, re-fetching {tarball_url}",
+                file=sys.stderr,
+            )
+            _download_to(tarball_url, cached_tarball, version=version)
+    else:
+        print(f"fetching {tarball_url}", file=sys.stderr)
+        _download_to(tarball_url, cached_tarball, version=version)
+
+    return install_frontend_from_tarball(
+        local_path=cached_tarball,
+        entry=entry,
+        force=force,
+        verify=verify,
+        dest_root=dest_root,
+    )
+
+
 def read_bundle_metadata(dest_dir: Path | str) -> dict[str, Any] | None:
     """Read the installed bundle's metadata, or return None.
 
@@ -216,6 +343,45 @@ def _sha256_of_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(_CHUNK_BYTES), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _download_to(url: str, dest: Path, *, version: str) -> None:
+    """Stream ``url`` to ``dest`` via stdlib ``urllib.request``.
+
+    Writes to a sibling ``.partial`` file and atomically renames on
+    success so a failed download never leaves a half-written file in
+    the cache. Maps HTTPError 404 to a release-not-found InstallError
+    pointing at the most likely fix (`--version` typo or pre-release
+    tag missing); other URLErrors fall through with a `--from` escape
+    hatch suggestion.
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    partial = dest.with_name(dest.name + ".partial")
+    try:
+        with urllib.request.urlopen(req) as resp, partial.open("wb") as out:
+            shutil.copyfileobj(resp, out, length=_CHUNK_BYTES)
+    except urllib.error.HTTPError as exc:
+        partial.unlink(missing_ok=True)
+        if exc.code == 404:
+            raise InstallError(
+                f"release asset not found (HTTP 404): {url}\n"
+                f"  the tag v{version} may not be published yet, or the\n"
+                f"  asset is missing from the release. Verify at\n"
+                f"  {_RELEASE_BASE_SCHEME}://{_RELEASE_BASE_HOST}/"
+                f"{_DEFAULT_GITHUB_REPO}/releases/tag/v{version}\n"
+                f"  or pass --from <local-tarball> for an offline install."
+            ) from exc
+        raise InstallError(
+            f"download failed (HTTP {exc.code}): {url}\n  {exc.reason}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        partial.unlink(missing_ok=True)
+        raise InstallError(
+            f"network error fetching {url}\n"
+            f"  {exc.reason}\n"
+            f"  pass --from <local-tarball> for an offline install."
+        ) from exc
+    partial.replace(dest)
 
 
 def _check_clean_or_force(dest_dir: Path, *, force: bool) -> None:

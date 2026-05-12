@@ -8,6 +8,11 @@ build/
 dist/
 .eggs/
 
+# setuptools-scm — version derived from git tags at build time, written to
+# constellation/_version.py. Source-tarball / wheel installs ship this file
+# baked in; in-tree it stays generated state.
+constellation/_version.py
+
 # Virtualenvs / conda
 .venv/
 .env

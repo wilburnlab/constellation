@@ -71,22 +71,34 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     p_install = viz_subs.add_parser(
         "install-frontend",
         help=(
-            "Extract a prebuilt frontend bundle into the package's "
+            "Install the prebuilt frontend bundle into the package's "
             "static/ dir (for source-checkout / HPC installs that can't "
-            "run pnpm/npm). Produce the tarball via "
-            "`python -m constellation.viz.frontend.build --pack`."
+            "run pnpm/npm). With no source flag, fetches the GitHub "
+            "Release matching `constellation.__version__`; pass "
+            "`--from PATH` for a local tarball or `--version X.Y.Z` to "
+            "fetch a specific release."
         ),
     )
-    p_install.add_argument(
+    source_group = p_install.add_mutually_exclusive_group()
+    source_group.add_argument(
         "--from",
         dest="from_path",
-        required=True,
         type=Path,
+        default=None,
         help=(
             "path to a local `constellation-viz-frontend-<version>"
             ".tar.gz` produced by the build helper's --pack flag. The "
             "adjacent <tarball>.sha256 sidecar is read for integrity "
             "verification (skip with --no-verify)."
+        ),
+    )
+    source_group.add_argument(
+        "--version",
+        dest="version",
+        default=None,
+        help=(
+            "explicit version to fetch from GitHub Releases (e.g. "
+            "0.0.1 or 0.0.1rc1). Default is `constellation.__version__`."
         ),
     )
     p_install.add_argument(
@@ -108,6 +120,27 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         help=(
             "skip sha256 verification against the sidecar (warning "
             "printed to stderr)"
+        ),
+    )
+    p_install.add_argument(
+        "--cache-dir",
+        dest="cache_dir",
+        type=Path,
+        default=None,
+        help=(
+            "cache directory for downloaded release assets (default: "
+            "~/.cache/constellation/viz-frontend/). Useful on HPC where "
+            "$HOME quotas are tight — point at /scratch or similar."
+        ),
+    )
+    p_install.add_argument(
+        "--repo",
+        dest="repo",
+        default=None,
+        help=(
+            "GitHub `owner/repo` slug to fetch from (default: "
+            "wilburnlab/constellation). Lets forks override the URL "
+            "target without a code change."
         ),
     )
     p_install.set_defaults(func=cmd_viz_install_frontend)
@@ -185,25 +218,43 @@ def _open_browser_when_ready(host: str, port: int, url: str) -> None:
 
 
 def cmd_viz_install_frontend(args: argparse.Namespace) -> int:
-    """Handler for ``constellation viz install-frontend --from <tarball>``.
+    """Handler for ``constellation viz install-frontend``.
 
-    Lazy-imports ``constellation.viz.install`` so the top-level CLI
-    doesn't pay for the import on unrelated subcommands. Surface
-    ``InstallError`` messages verbatim — they're already formatted for
-    the user.
+    Dispatches between the local-tarball path (``--from PATH``) and the
+    URL-fetch path (default — uses ``constellation.__version__``, or
+    ``--version X.Y.Z`` for an explicit pin). Lazy-imports
+    ``constellation.viz.install`` so the top-level CLI doesn't pay for
+    the import on unrelated subcommands. Surfaces ``InstallError``
+    messages verbatim — they're already formatted for the user.
     """
     from constellation.viz.install import (
         InstallError,
         install_frontend_from_tarball,
+        install_frontend_from_url,
     )
 
     try:
-        result = install_frontend_from_tarball(
-            local_path=args.from_path,
-            entry=args.entry,
-            force=args.force,
-            verify=not args.no_verify,
-        )
+        if args.from_path is not None:
+            result = install_frontend_from_tarball(
+                local_path=args.from_path,
+                entry=args.entry,
+                force=args.force,
+                verify=not args.no_verify,
+            )
+        else:
+            import constellation as _constellation
+
+            version = args.version or _constellation.__version__
+            kwargs: dict[str, object] = {
+                "version": version,
+                "entry": args.entry,
+                "force": args.force,
+                "verify": not args.no_verify,
+                "cache_dir": args.cache_dir,
+            }
+            if args.repo is not None:
+                kwargs["github_owner_repo"] = args.repo
+            result = install_frontend_from_url(**kwargs)  # type: ignore[arg-type]
     except InstallError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

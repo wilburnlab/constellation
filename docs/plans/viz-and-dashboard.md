@@ -4,7 +4,7 @@
 
 - **PR 1** (`constellation viz genome` — focused IGV-style genome browser) — **SHIPPED** at commit `bd505d6`. Six track kernels; FastAPI server with Apache Arrow IPC streaming; SVG-only client + Datashader hybrid mode. 46 unit tests + 1 slow uvicorn-boot e2e all green; full repo suite remains 1348 passing.
 - **PR 1.5** (build-helper `--pack` mode + `constellation viz install-frontend --from <local>`) — **SHIPPED**. 15 install tests + smoke imports + `constellation doctor` row; full repo suite 1363 passing (was 1348), no regressions, no new ruff errors. End-to-end CLI round-trip verified locally. Workstation-build-then-ship-to-cluster path that bypasses npm-on-HPC entirely.
-- **PR 1.6** (release CI + URL-fetch addition) — pending. Three things land together: a GitHub Actions workflow that runs `--pack` on tag push and publishes the tarball + sha256 sidecar to the GitHub release; a wheel-with-bundle published to PyPI (the load-bearing path for lab users); and a new URL-fetch operating mode added to `constellation viz install-frontend` (no flags = use `constellation.__version__` to derive the URL). All three become useful at the same instant.
+- **PR 1.6** (release CI + URL-fetch addition) — **SHIPPED** (code; first tag push enables the publishing path). Three things landed together: `.github/workflows/release.yml` (tag-push → frontend pack → wheel + sdist build → GitHub Release attachment → OIDC publish to PyPI or TestPyPI based on tag pattern); `install_frontend_from_url(version, entry, force, verify, dest_root, cache_dir, github_owner_repo)` in `constellation/viz/install.py` with on-disk caching at `~/.cache/constellation/viz-frontend/` and a stdlib-only `urllib.request` fetcher; switch to setuptools-scm with PyPI distribution name `constellation-bio` (import path stays `constellation`). 5 new URL-fetch tests + 17 existing install/imports tests all green; full repo suite 1364 passing (was 1363), no regressions.
 - **PR 2** (dashboard shell wrapping the CLI as soft GUI) — pending.
 
 ## Context
@@ -33,13 +33,13 @@ The bundle is **derived state** — purely a function of `(TS source + lockfile)
 
 | Install path | How the bundle arrives | Time | JS toolchain needed? |
 |---|---|---|---|
-| `pip install constellation[viz]` from PyPI (release wheel) | Baked into the `.whl` by CI; pip extracts it like any other package data | ~30s | **No** |
+| `pip install constellation-bio[viz]` from PyPI (release wheel) | Baked into the `.whl` by CI; pip extracts it like any other package data | ~30s | **No** |
 | `git clone && pip install -e .[viz]` (developer, frontend work) | Built locally via `python -m constellation.viz.frontend.build` | a few minutes once | Yes |
-| `git clone && pip install -e .[viz]` (developer, Python only) | Fetched via `constellation viz install-frontend` (PR 1.6) | ~30s | **No** |
-| Source tarball / HPC offline | `constellation viz install-frontend --from <local-tarball>` (PR 1.5) | ~5s | **No** |
+| `git clone && pip install -e .[viz]` (developer, Python only) | Fetched via `constellation viz install-frontend` | ~30s | **No** |
+| Source tarball / HPC offline | `constellation viz install-frontend --from <local-tarball>` | ~5s | **No** |
 | CI test runs | Not needed — Python tests skip viz endpoints on missing bundle | n/a | n/a |
 
-**The contract the user community gets:** `pip install constellation[viz]` is one command and works on laptops, workstations, and HPC nodes alike. No node, no npm, no TLS-with-registry fights on the cluster. PR 1.6 makes that real; PR 1.5 is the bridge that makes the same UX possible *today* (workstation build → scp → `--from <local>`) before any release exists.
+**The contract the user community gets:** `pip install constellation-bio[viz]` is one command and works on laptops, workstations, and HPC nodes alike. No node, no npm, no TLS-with-registry fights on the cluster. The PyPI distribution name is `constellation-bio` (the bare name was claimed by an unrelated package); the import path remains `import constellation`.
 
 ## Design principles (firm)
 
@@ -69,13 +69,16 @@ The bundle is **derived state** — purely a function of `(TS source + lockfile)
 - Stdlib-only Python: `tarfile` for extract, `hashlib` for sha256. No `urllib.request` use in PR 1.5 (no fetch path yet).
 - **Immediate value:** developer builds bundle on a workstation, scps the tarball to OSC, runs `--from` on the cluster. Zero node / npm / pnpm calls anywhere in the install path. Solves the user's current OSC blocker without depending on PR 1.6.
 
-**PR 1.6 — Release CI + URL-fetch addition** — pending, separate PR
-Three things land together:
-1. GitHub Actions workflow on tag push: runs `python -m constellation.viz.frontend.build --pack`, attaches the tarball + sidecar to the GitHub release, builds + publishes a wheel-with-bundle to PyPI.
-2. URL-fetch operating mode added to `install-frontend`: no flags = use `constellation.__version__` to derive `https://github.com/wilburnlab/constellation/releases/download/v<X.Y.Z>/constellation-viz-frontend-<X.Y.Z>.tar.gz`; `--version X.Y.Z` overrides; download + verify + extract.
-3. Documentation: README + viz/CLAUDE.md updates capturing the now-self-serve flow.
+**PR 1.6 — Release CI + URL-fetch addition** — SHIPPED
+As built (see plan-pr-1-6-unified-blossom.md for the full design):
+1. **`.github/workflows/release.yml`** — fires on `v*` tag push. `classify-tag` extracts the version and routes pre-release tags (`vX.Y.Z(rc|a|b)N`) to TestPyPI vs final tags (`vX.Y.Z`) to real PyPI. `build` runs Node 20 + pnpm + Python 3.12, executes `python -m constellation.viz.frontend.build --pack`, then `python -m build` to produce the wheel + sdist (the wheel embeds the prebuilt static via the existing `[tool.setuptools.package-data]` rule). `gh-release` attaches the frontend tarball + sidecar + wheel + sdist to the GitHub Release. `publish-pypi` uses `pypa/gh-action-pypi-publish@release/v1` with OIDC trusted publishing — no API token, just the `pypi`/`testpypi` GitHub environments matching the PyPI pending publishers.
+2. **`install_frontend_from_url`** in `constellation/viz/install.py`. URL constructed from `_RELEASE_BASE_SCHEME://{_RELEASE_BASE_HOST}/{owner_repo}/releases/download/v{version}/constellation-viz-frontend-{version}.tar.gz` (host/scheme split into module constants for testability). Caches at `~/.cache/constellation/viz-frontend/` with sidecar always re-fetched (so a re-pushed release invalidates the cache automatically). Dev/local versions (containing `.dev` or `+`) refused before the network call. Stdlib-only `urllib.request`. CLI: `--from PATH` and `--version X.Y.Z` are mutually exclusive; with neither, defaults to `constellation.__version__`. New flags: `--cache-dir`, `--repo OWNER/REPO`.
+3. **Packaging**: PyPI distribution name `constellation-bio`; import name unchanged. Version derived from git tags via setuptools-scm (`fallback_version = "0.0.0"` for source-tarball checkouts without git history). `[project.urls]` populated for PyPI.
+4. **`.gitleaks.toml`** allowlists the AWS access-token rule for bio-data paths (`constellation/data/*.json`, `scripts/build-*-json.py`, `tests/data/*.{fasta,fa,json}`) — protein and nucleic-acid one-letter codes alias AWS IAM key prefixes by accident.
 
-All three become useful at the same moment — no stretch of time with URL-fetch code that 404s in main.
+Tests: 5 new URL-fetch tests in `tests/test_viz_install_url.py` (happy path, cache reuse, 404, dev-version refusal, sha mismatch); 1364 total passing; no regressions.
+
+Pre-release tags (`v0.0.1rc1`) test the full pipeline against TestPyPI before claiming a real PyPI version slot. Both flavors create a GitHub Release with the frontend tarball attached so `install_frontend_from_url` is testable end-to-end against the pre-release.
 
 **PR 2 — `constellation` / `constellation dashboard` (dashboard shell)** — pending
 - Adds bare-`constellation` no-arg dispatch to dashboard.
