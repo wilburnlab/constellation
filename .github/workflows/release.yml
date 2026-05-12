@@ -130,7 +130,7 @@ jobs:
           python -m twine check dist/constellation_bio-*.whl dist/constellation_bio-*.tar.gz
 
       - name: Upload python artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-dist
           path: |
@@ -139,7 +139,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload frontend artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: frontend-dist
           path: |
