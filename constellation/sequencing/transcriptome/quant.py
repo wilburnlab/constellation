@@ -28,10 +28,11 @@ The output FASTA + TSV are designed to compare cleanly to NA's
 canonicalising column / row order (sort by protein sequence for the
 TSV; FASTA set-equality on (label-free, sequence) pairs).
 
-Per the partitioned-parquet ethos in CLAUDE.md, the aggregator is the
-ONE place a `concat_tables` is OK — it produces human-facing FASTA +
-TSV outputs, and the global table it materialises is bounded by
-unique proteins × samples (small) rather than read count (huge).
+Per the partitioned-parquet ethos in CLAUDE.md, the aggregator streams
+the ``feature_quant/`` shards one at a time rather than concatenating
+the whole dataset — it never holds more than one shard plus the
+running per-pair Counter, which is bounded by unique proteins ×
+samples (small) rather than read count (huge).
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pyarrow as pa
-import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 
 from constellation.sequencing.samples import Samples
 
@@ -151,12 +152,15 @@ def aggregate_partial_quants(
     """Stream ``feature_quant/`` shards, sum globally, apply ordering +
     P0..PN labels, return the human-facing outputs.
 
-    Reads ``feature_quant_dir`` as a partitioned :class:`pa.dataset.dataset`
-    and runs a single Arrow ``group_by(["protein_sequence", "sample_id"])
-    .aggregate([("count", "sum")])`` to produce global per-cell totals.
-    The materialised table is bounded by ``unique proteins × samples`` —
-    small (millions of rows max) regardless of read count, so this
-    fits in RAM at any production scale.
+    Iterates the ``feature_quant/`` shards in sorted-name order, reading
+    each as a standalone parquet file and folding its rows into a single
+    running ``(protein_sequence, sample_id) -> count`` Counter. This
+    avoids a whole-dataset ``ds.dataset(...).to_table()``: pyarrow 22.0.0
+    segfaults inside ``to_pylist()`` on a string column past a size
+    threshold, which a concatenated protein_sequence column hits at
+    production scale. Per-shard ``to_pylist`` stays well under it. Peak
+    RAM is bounded by ``unique proteins × samples`` — small (millions of
+    rows max) regardless of read count.
 
     Returns ``(quant_table, fasta_records, tsv_text)`` matching the
     shape :func:`build_protein_count_matrix` historically returned.
@@ -173,26 +177,40 @@ def aggregate_partial_quants(
     if not feature_quant_dir.is_dir() or not any(feature_quant_dir.iterdir()):
         return PROTEIN_COUNT_TABLE.empty_table(), [], _empty_tsv(sample_name_by_id, [])
 
-    dataset = ds.dataset(str(feature_quant_dir), format="parquet")
-    # Group + sum: bounded by unique (protein_sequence, sample_id) pairs
-    # across the whole dataset. Arrow's ``group_by`` runs on a single
-    # in-memory table — concat all shards (small in the partial-quant
-    # form) then aggregate.
-    summed = (
-        dataset.to_table()
-        .group_by(["protein_sequence", "sample_id"])
-        .aggregate([("count", "sum")])
-    )
-    if summed.num_rows == 0:
-        return PROTEIN_COUNT_TABLE.empty_table(), [], _empty_tsv(sample_name_by_id, [])
-
-    # Project / rename for clarity.
-    proteins = summed.column("protein_sequence").to_pylist()
-    sids = summed.column("sample_id").to_pylist()
-    counts_col = summed.column("count_sum").to_pylist()
+    # Stream the partitioned feature_quant/ dataset shard-by-shard. We
+    # deliberately avoid ds.dataset(...).to_table(): pyarrow 22.0.0
+    # segfaults inside to_pylist() on a string column past a size
+    # threshold, and a whole-dataset to_table() concatenates every
+    # shard's protein_sequence column into exactly such a column. Each
+    # shard is small (bounded by that worker's unique (protein, sample)
+    # pairs), so a per-shard to_pylist stays well under the threshold —
+    # and RAM stays bounded by unique pairs, not dataset size (CLAUDE.md
+    # invariant 3: no whole-dataset concat between pipeline stages).
     pair_counts: Counter[tuple[str, int]] = Counter()
-    for p, s, c in zip(proteins, sids, counts_col):
-        pair_counts[(p, s)] = int(c)
+    # First-seen tracking breaks NA's count-tie ordering on insertion
+    # order. Shards are partitioned by worker chunk and chunks run 5'→3'
+    # along the source file, so iterating shards in sorted-name order
+    # reproduces NA's stable parquet-row-order tiebreak.
+    protein_first_seen: dict[str, int] = {}
+    sample_first_seen: dict[int, int] = {}
+    global_idx = 0
+    for shard_path in sorted(feature_quant_dir.glob("*.parquet")):
+        shard = pq.read_table(
+            shard_path, columns=["protein_sequence", "sample_id", "count"]
+        )
+        proteins = shard.column("protein_sequence").to_pylist()
+        sids = shard.column("sample_id").to_pylist()
+        counts_col = shard.column("count").to_pylist()
+        for p, s, c in zip(proteins, sids, counts_col):
+            if p is None or s is None:
+                continue
+            pair_counts[(p, s)] += int(c)
+            protein_first_seen.setdefault(p, global_idx)
+            sample_first_seen.setdefault(s, global_idx)
+            global_idx += 1
+
+    if not pair_counts:
+        return PROTEIN_COUNT_TABLE.empty_table(), [], _empty_tsv(sample_name_by_id, [])
 
     # Per-protein and per-sample totals derived from pair_counts.
     protein_counts: Counter[str] = Counter()
@@ -200,16 +218,6 @@ def aggregate_partial_quants(
     for (p, s), n in pair_counts.items():
         protein_counts[p] += n
         sample_counts[s] += n
-
-    # First-seen tracking: NA's behaviour breaks ties on insertion order
-    # (parquet row order). Approximate by using the dataset's row order
-    # — since shards are partitioned by worker chunk and chunks are
-    # 5'→3' along the source file, this matches NA's stable ordering.
-    protein_first_seen: dict[str, int] = {}
-    sample_first_seen: dict[int, int] = {}
-    for i, (p, s) in enumerate(zip(proteins, sids)):
-        protein_first_seen.setdefault(p, i)
-        sample_first_seen.setdefault(s, i)
 
     samples_ordered_full = sorted(
         sample_counts.keys(),
