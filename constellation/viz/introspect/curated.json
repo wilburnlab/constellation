@@ -40,7 +40,7 @@
       "path": ["viz", "genome"],
       "label": "Open genome browser",
       "group": "Visualize",
-      "hint": "IGV-style focused tool over a session's parquet outputs"
+      "hint": "Embedded IGV-style browser over a pipeline session — opens in this tab"
     }
   ]
 }

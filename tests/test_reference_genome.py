@@ -100,6 +100,19 @@ def test_parquetdir_roundtrip(tmp_path: Path):
     assert g2.metadata_extras["organism"] == "test"
 
 
+def test_sequences_parquet_uses_one_row_group_per_contig(tmp_path: Path):
+    """A filter on `contig_id` must be able to skip whole-genome
+    decode — required so the viz layer's reference_sequence cache
+    miss path doesn't materialize every contig's bytes at first use.
+    """
+    import pyarrow.parquet as pq
+
+    g = _make_genome()
+    save_genome_reference(g, tmp_path / "genome")
+    pf = pq.ParquetFile(tmp_path / "genome" / "sequences.parquet")
+    assert pf.num_row_groups == g.n_contigs
+
+
 def test_read_fasta_genome(tmp_path: Path):
     fa = tmp_path / "g.fa"
     fa.write_text(">chr1 some desc\nACGTACGT\nACGT\n>chr2\nTTTT\n")

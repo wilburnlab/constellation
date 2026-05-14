@@ -21,7 +21,10 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from constellation.sequencing.schemas.quant import COVERAGE_TABLE  # noqa: E402
-from constellation.sequencing.schemas.reference import CONTIG_TABLE  # noqa: E402
+from constellation.sequencing.schemas.reference import (  # noqa: E402
+    CONTIG_TABLE,
+    FEATURE_TABLE,
+)
 from constellation.viz.server.app import create_app  # noqa: E402
 from constellation.viz.server.arrow_stream import (  # noqa: E402
     ARROW_IPC_MEDIA_TYPE,
@@ -434,6 +437,210 @@ def test_root_with_vite_named_index_serves_spa(
     asset = client.get("/static/genome/assets/main_genome-abc.js")
     assert asset.status_code == 200
     assert asset.text == "console.log('hi')"
+
+
+# ----------------------------------------------------------------------
+# /api/sessions/{id}/search
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def search_session(tmp_path: Path) -> Session:
+    """Session with reference + derived annotation parquets for the
+    search-endpoint tests. `BRCA1` lives in the curated reference set;
+    `derived_gene_42` only in the data-derived bundle; both contain a
+    common name fragment ('brc') so substring matches return hits from
+    both sources."""
+    root = tmp_path / "search_run"
+    genome = root / "genome"
+    genome.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "contig_id": 1,
+                    "name": "chr1",
+                    "length": 1_000_000,
+                    "topology": None,
+                    "circular": None,
+                },
+                {
+                    "contig_id": 2,
+                    "name": "chrX",
+                    "length": 250_000,
+                    "topology": None,
+                    "circular": None,
+                },
+            ],
+            schema=CONTIG_TABLE,
+        ),
+        genome / "contigs.parquet",
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "contig_id": pa.array([1, 2], pa.int64()),
+                "sequence": pa.array(["N" * 50, "N" * 50], pa.string()),
+            }
+        ),
+        genome / "sequences.parquet",
+    )
+
+    def _feature(
+        *,
+        feature_id: int,
+        contig_id: int,
+        start: int,
+        end: int,
+        name: str | None,
+        type_: str = "gene",
+        source: str | None = None,
+    ) -> dict:
+        return {
+            "feature_id": feature_id,
+            "contig_id": contig_id,
+            "start": start,
+            "end": end,
+            "strand": "+",
+            "type": type_,
+            "name": name,
+            "parent_id": None,
+            "source": source,
+            "score": None,
+            "phase": None,
+            "attributes_json": None,
+        }
+
+    annotation = root / "annotation"
+    annotation.mkdir()
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                _feature(feature_id=1, contig_id=1, start=100, end=400, name="BRCA1"),
+                _feature(feature_id=2, contig_id=2, start=500, end=900, name="MYC"),
+                _feature(
+                    feature_id=3,
+                    contig_id=1,
+                    start=1100,
+                    end=1500,
+                    name=None,
+                    type_="repeat_region",
+                ),
+            ],
+            schema=FEATURE_TABLE,
+        ),
+        annotation / "features.parquet",
+    )
+
+    align = root / "S2_align"
+    derived = align / "derived_annotation"
+    derived.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                _feature(
+                    feature_id=101,
+                    contig_id=1,
+                    start=2000,
+                    end=2400,
+                    name="derived_brc_42",
+                    source="constellation_derived",
+                ),
+                _feature(
+                    feature_id=102,
+                    contig_id=2,
+                    start=10_000,
+                    end=11_000,
+                    name="other_derived",
+                    source="constellation_derived",
+                ),
+            ],
+            schema=FEATURE_TABLE,
+        ),
+        derived / "features.parquet",
+    )
+    return Session.from_root(root)
+
+
+@pytest.fixture
+def search_client(search_session: Session) -> TestClient:
+    app = create_app(search_session)
+    return TestClient(app)
+
+
+def test_search_empty_query_returns_empty(
+    search_client: TestClient, search_session: Session
+) -> None:
+    response = search_client.get(
+        f"/api/sessions/{search_session.session_id}/search", params={"q": "   "}
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_search_substring_matches_across_bindings_reference_first(
+    search_client: TestClient, search_session: Session
+) -> None:
+    response = search_client.get(
+        f"/api/sessions/{search_session.session_id}/search", params={"q": "brc"}
+    )
+    assert response.status_code == 200
+    hits = response.json()
+    # BRCA1 (reference) + derived_brc_42 (derived); reference must lead.
+    names = [h["name"] for h in hits]
+    sources = [h["source"] for h in hits]
+    assert names == ["BRCA1", "derived_brc_42"]
+    assert sources == ["reference", "derived"]
+    assert hits[0]["contig_name"] == "chr1"
+    assert hits[0]["start"] == 100 and hits[0]["end"] == 400
+
+
+def test_search_is_case_insensitive(
+    search_client: TestClient, search_session: Session
+) -> None:
+    response = search_client.get(
+        f"/api/sessions/{search_session.session_id}/search", params={"q": "brca1"}
+    )
+    assert response.status_code == 200
+    names = [h["name"] for h in response.json()]
+    assert names == ["BRCA1"]
+
+
+def test_search_numeric_query_matches_feature_id(
+    search_client: TestClient, search_session: Session
+) -> None:
+    response = search_client.get(
+        f"/api/sessions/{search_session.session_id}/search", params={"q": "102"}
+    )
+    assert response.status_code == 200
+    hits = response.json()
+    # feature_id=102 lives in derived; name does not contain "102".
+    assert len(hits) == 1
+    assert hits[0]["feature_id"] == 102
+    assert hits[0]["source"] == "derived"
+
+
+def test_search_unknown_session_returns_404(search_client: TestClient) -> None:
+    response = search_client.get(
+        "/api/sessions/does-not-exist/search", params={"q": "brca"}
+    )
+    assert response.status_code == 404
+
+
+def test_search_respects_limit(
+    search_client: TestClient, search_session: Session
+) -> None:
+    response = search_client.get(
+        f"/api/sessions/{search_session.session_id}/search",
+        params={"q": "br", "limit": 1},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) == 1
+    # 'br' matches BRCA1 (reference) and derived_brc_42 (derived); with
+    # limit=1 the reference binding must win the ordering tiebreak.
+    assert body[0]["source"] == "reference"
+    assert body[0]["name"] == "BRCA1"
 
 
 def test_index_genome_html_preferred_over_index_html_if_both_present(

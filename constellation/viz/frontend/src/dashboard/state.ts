@@ -10,10 +10,8 @@ import type { CommandSchema, JobSnapshot } from './types';
 export type SidebarMode = 'common' | 'all';
 
 export interface DashboardEvents {
-  // The user picked a command from the sidebar — open / focus a form.
+  // The user picked a command from the sidebar — open / focus a task panel.
   'command:open': CommandSchema;
-  // A new job was started. The Terminal panel is added by the shell.
-  'job:started': { jobId: string; argv: string[] };
   // The currently-running job snapshot (or null). Polled by StatusBar.
   'job:active': JobSnapshot | null;
   // A POST /api/commands returned 409 — the form surfaces the message.

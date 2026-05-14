@@ -384,10 +384,86 @@
         margin-top: 8px;
       }
 
-      /* Genome panel (embedded GenomeBrowser) ---------------------- */
-      .genome-panel {
+      /* Task panel (hosts CommandForm/VizForm/Terminal/GenomeBrowser) */
+      .task-panel {
         height: 100%;
         background: var(--bg);
+      }
+      .task-error {
+        padding: 24px;
+        color: var(--danger);
+        font-size: 13px;
+      }
+
+      /* VizForm — mirrors CommandForm styling so phase-1 looks
+       * identical regardless of compute vs viz category. */
+      .viz-form {
+        padding: 12px 16px;
+        overflow-y: auto;
+        height: 100%;
+        background: var(--bg);
+      }
+      .viz-form h2 {
+        margin: 0 0 8px 0;
+        font-size: 14px;
+        font-weight: 500;
+      }
+      .viz-form .form-help {
+        color: var(--fg-dim);
+        font-size: 11px;
+        line-height: 1.4;
+        margin-bottom: 12px;
+      }
+      .viz-form .form-section { margin-bottom: 16px; }
+      .viz-form .form-row {
+        margin-bottom: 10px;
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 4px;
+      }
+      .viz-form label {
+        font-size: 12px;
+        color: var(--fg);
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .viz-form input[type='text'] {
+        background: var(--bg-elev);
+        color: var(--fg);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+        font-size: 12px;
+        width: 100%;
+      }
+      .viz-form .form-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 16px;
+        padding-top: 12px;
+        border-top: 1px solid var(--border);
+      }
+      .viz-form button.run {
+        background: var(--accent);
+        color: white;
+        border: 0;
+        border-radius: 4px;
+        padding: 6px 16px;
+        cursor: pointer;
+        font-size: 12px;
+      }
+      .viz-form button.run:disabled {
+        background: var(--border);
+        color: var(--fg-mute);
+        cursor: not-allowed;
+      }
+      .viz-form .form-error {
+        color: var(--danger);
+        font-size: 11px;
+        margin-left: 12px;
+        align-self: center;
       }
     </style>
   </head>

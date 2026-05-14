@@ -113,19 +113,15 @@ class GeneAnnotationKernel(TrackKernel):
         return out
 
     def metadata(self, binding: TrackBinding) -> dict[str, Any]:
-        path = binding.paths["features"]
-        # Read just the type column to enumerate available SO terms;
-        # used by the renderer to assign palette entries deterministically.
-        table = pq.read_table(path, columns=["type"])
-        types: list[str] = []
-        if table.num_rows > 0:
-            types = sorted({t for t in table.column("type").to_pylist() if t})
+        # No on-disk scan here: the renderer assigns colors from a
+        # hardcoded SO-term palette, and enumerating types_in_data
+        # would force a full read of the type column (tens of millions
+        # of rows on a mammalian annotation) at first-mount time.
         return {
             "kind": self.kind,
             "binding_id": binding.binding_id,
             "label": binding.label,
             "source": binding.config.get("source", "unknown"),
-            "types_in_data": types,
             "feature_limit": self.feature_limit,
             "default_height_px": 60,
         }

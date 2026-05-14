@@ -28,6 +28,8 @@ export interface RenderContext {
   xScale: GenomicScale;
   /** Decoded metadata payload. */
   meta: TrackMetadata;
+  /** Host-level UI toggles. Renderers free to ignore. */
+  showLabels?: boolean;
 }
 
 export interface TrackRenderer {

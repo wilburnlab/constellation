@@ -20,6 +20,7 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 
 from constellation.viz.server.session import Session
@@ -30,6 +31,23 @@ from constellation.viz.tracks.base import (
     TrackQuery,
     register_track,
 )
+
+
+# Process-local cache of full per-contig nucleotide strings, keyed by
+# (absolute sequences.parquet path, contig_id). Hit path skips all I/O
+# and string allocation; miss path materializes ONE contig row instead
+# of the whole `sequences.parquet`. Without this cache every pan/zoom
+# re-reads the entire genome (250 MB for a single mammalian chromosome,
+# multi-GB for a whole genome) — see also `_clear_sequence_cache` for
+# the test hook.
+_SEQUENCE_CACHE: dict[tuple[str, int], str] = {}
+
+
+def _clear_sequence_cache() -> None:
+    """Drop every cached sequence. Test-only hook; production callers
+    never need eviction because the cache is bounded by the size of the
+    on-disk genomes the process has ever opened."""
+    _SEQUENCE_CACHE.clear()
 
 
 REFERENCE_SEQUENCE_VECTOR_SCHEMA: pa.Schema = pa.schema(
@@ -178,27 +196,39 @@ def _resolve_contig_id(genome_dir: Any, contig_name: str) -> int | None:
 def _slice_sequence(
     sequences_path: Any, contig_id: int, start: int, end: int
 ) -> str | None:
-    """Return the slice `seq[start:end]` for the named contig, or
-    `None` when the contig is absent. The whole-contig string is read
-    once per call; sequence rows are large (a chromosome can be 10s of
-    MB) so production usage should cache, but the kernel keeps this
-    simple — caching lives in the server's per-session state if/when
-    profiling shows it matters."""
-    table = pq.read_table(
-        sequences_path,
-        columns=["contig_id", "sequence"],
-    )
-    matches = table.filter(pc.field("contig_id") == pa.scalar(contig_id, pa.int64()))
-    if matches.num_rows == 0:
-        return None
-    sequence = matches.column("sequence")[0].as_py()
-    if not isinstance(sequence, str):
-        return None
+    """Return the slice `seq[start:end]` for the requested contig.
+
+    The full contig string is loaded once and cached in
+    `_SEQUENCE_CACHE`; subsequent slices for the same contig hit
+    memory directly. Returns `None` when the contig is absent from the
+    on-disk `sequences.parquet`.
+    """
+    key = (str(sequences_path), int(contig_id))
+    sequence = _SEQUENCE_CACHE.get(key)
+    if sequence is None:
+        sequence = _load_contig_sequence(sequences_path, contig_id)
+        if sequence is None:
+            return None
+        _SEQUENCE_CACHE[key] = sequence
     s = max(0, int(start))
     e = min(len(sequence), int(end))
     if s >= e:
         return ""
     return sequence[s:e]
+
+
+def _load_contig_sequence(sequences_path: Any, contig_id: int) -> str | None:
+    """Read the single matching contig row via dataset filter
+    pushdown, so other contigs' sequences never enter memory on a cache
+    miss."""
+    dataset = pa_ds.dataset(str(sequences_path), format="parquet")
+    predicate = pc.field("contig_id") == pa.scalar(int(contig_id), pa.int64())
+    scanner = dataset.scanner(columns=["sequence"], filter=predicate)
+    table = scanner.to_table()
+    if table.num_rows == 0:
+        return None
+    sequence = table.column("sequence")[0].as_py()
+    return sequence if isinstance(sequence, str) else None
 
 
 def _consensus(chunk: str) -> str:

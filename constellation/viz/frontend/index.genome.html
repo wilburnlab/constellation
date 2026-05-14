@@ -32,10 +32,11 @@
         flex: 0 0 auto;
         display: flex;
         align-items: center;
-        gap: 12px;
+        gap: 10px;
         padding: 8px 12px;
         background: var(--bg-elev);
         border-bottom: 1px solid var(--border);
+        flex-wrap: wrap;
       }
       .toolbar input {
         background: var(--bg);
@@ -63,12 +64,126 @@
         border-radius: 4px;
         padding: 4px 8px;
       }
+      .labeled-control {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .btn-group {
+        display: inline-flex;
+        align-items: stretch;
+        border-radius: 4px;
+        overflow: hidden;
+        border: 1px solid var(--border);
+      }
+      .btn-group .icon-btn {
+        border: none;
+        border-radius: 0;
+        background: var(--bg);
+        color: var(--fg);
+        padding: 4px 10px;
+        min-width: 28px;
+        font-size: 13px;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .btn-group .icon-btn + .icon-btn {
+        border-left: 1px solid var(--border);
+      }
+      .btn-group .icon-btn:hover { background: var(--border); }
+      .toggle {
+        background: var(--bg);
+        color: var(--fg-dim);
+        border: 1px solid var(--border);
+      }
+      .toggle.on {
+        color: var(--fg);
+        background: rgba(79, 158, 251, 0.18);
+        border-color: rgba(79, 158, 251, 0.5);
+      }
+      .toolbar-right {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .search-wrap {
+        position: relative;
+      }
+      .search-input {
+        min-width: 180px;
+      }
+      .search-results {
+        position: absolute;
+        top: calc(100% + 4px);
+        left: 0;
+        right: 0;
+        min-width: 280px;
+        max-height: 320px;
+        overflow-y: auto;
+        background: var(--bg-elev);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+        z-index: 20;
+      }
+      .search-row {
+        display: grid;
+        grid-template-columns: 1fr auto auto;
+        column-gap: 8px;
+        row-gap: 2px;
+        padding: 6px 10px;
+        cursor: pointer;
+        border-bottom: 1px solid var(--border);
+        align-items: center;
+      }
+      .search-row:last-child { border-bottom: none; }
+      .search-row:hover { background: rgba(79, 158, 251, 0.12); }
+      .search-name {
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+        font-weight: 600;
+        color: var(--fg);
+      }
+      .search-badge {
+        font-size: 11px;
+        padding: 1px 6px;
+        border-radius: 10px;
+        background: var(--bg);
+        color: var(--fg-dim);
+        border: 1px solid var(--border);
+      }
+      .search-badge.src-reference {
+        color: var(--fg);
+        border-color: rgba(79, 158, 251, 0.6);
+      }
+      .search-badge.src-derived {
+        color: var(--fg);
+        border-color: rgba(155, 194, 58, 0.6);
+      }
+      .search-coord {
+        grid-column: 1 / span 3;
+        font-family: ui-monospace, SF Mono, Menlo, monospace;
+        font-size: 11px;
+        color: var(--fg-dim);
+      }
+      .search-empty {
+        padding: 8px 10px;
+        color: var(--fg-dim);
+        font-size: 12px;
+      }
       .label-dim { color: var(--fg-dim); }
       .browser {
         flex: 1 1 auto;
         overflow: auto;
         position: relative;
       }
+      .overview {
+        background: var(--bg-elev);
+        border-bottom: 1px solid var(--border);
+        cursor: pointer;
+      }
+      .overview svg.track-canvas { cursor: pointer; }
+      .overview-viewport { cursor: ew-resize; }
       .track {
         border-bottom: 1px solid var(--border);
       }
@@ -78,6 +193,18 @@
         font-size: 12px;
         color: var(--fg-dim);
         border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .track-header-label {
+        color: var(--fg);
+        font-weight: 500;
+      }
+      .track-header-status {
+        color: var(--fg-dim);
+        font-size: 11px;
       }
       .track-canvas {
         display: block;
