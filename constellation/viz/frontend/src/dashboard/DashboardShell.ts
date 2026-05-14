@@ -1,12 +1,10 @@
 // Top-level dashboard shell — wires dockview, sidebar, and status bar.
 //
 // Owns the DockviewComponent instance and the lifecycle of every panel.
-// On `command:open` from the sidebar: focus the matching form panel or
-// add a new one. On `job:started` from a CommandForm: open a Terminal
-// panel positioned right of the form.
-//
-// Layout persistence: serialize the dockview state to localStorage on
-// every layout change, deserialize on next boot.
+// Every command (compute or visualization) opens in the same panel
+// kind, a `'task'` panel, which transitions in-place from form → either
+// terminal or visualization widget. The tab the user invoked the
+// command from *becomes* the running tool — no side-spawned panels.
 
 import {
   DockviewComponent,
@@ -18,12 +16,12 @@ import {
 
 import 'dockview-core/dist/styles/dockview.css';
 
-import { CommandForm } from './CommandForm';
 import { Sidebar } from './Sidebar';
 import { StatusBar } from './StatusBar';
-import { TerminalPanel } from './Terminal';
+import { TaskPanel, taskInitForCommand, type TaskInit } from './TaskPanel';
 import { DashboardState, getStored, setStored } from './state';
 import type { CliSchema, CommandSchema } from './types';
+import { findVizDescriptor } from './viz_registry';
 
 const LAYOUT_KEY = 'layout.v1';
 const LAST_SESSION_PATH_KEY = 'last_session_path';
@@ -34,14 +32,22 @@ export interface DashboardShellOptions {
   statusRoot: HTMLElement;
 }
 
-interface PanelParams extends Record<string, unknown> {
-  kind: 'sidebar' | 'welcome' | 'form' | 'terminal' | 'genome';
-  command?: CommandSchema;
-  jobId?: string;
-  argv?: string[];
-  sessionId?: string;
-  label?: string;
+interface TaskPanelParams extends Record<string, unknown> {
+  kind: 'task';
+  // Persistable identity — the shell rebuilds the init on layout
+  // restore by walking `schema.subcommands` to find the command.
+  commandPath?: string[];
 }
+
+interface SidebarPanelParams extends Record<string, unknown> {
+  kind: 'sidebar';
+}
+
+interface WelcomePanelParams extends Record<string, unknown> {
+  kind: 'welcome';
+}
+
+type PanelParams = TaskPanelParams | SidebarPanelParams | WelcomePanelParams;
 
 interface SessionSummary {
   session_id: string;
@@ -50,10 +56,9 @@ interface SessionSummary {
   stages_present: Record<string, boolean>;
 }
 
-// Renderer that delegates pane resizes to an inner TerminalPanel.
-// Used by the active-panel-change handler to refit xterm.
-interface ResizeAware extends IContentRenderer {
-  onResize(): void;
+interface TaskAware extends IContentRenderer {
+  onResize?: () => void;
+  taskInit?: TaskInit;
 }
 
 export class DashboardShell {
@@ -62,8 +67,12 @@ export class DashboardShell {
   private readonly sidebar: Sidebar;
   private readonly statusBar: StatusBar;
   private dock: DockviewComponent | null = null;
-  // Form panels keyed by command path so reopens focus the same panel.
-  private readonly formPanels = new Map<string, string>();
+  // Pending task inits keyed by panel id — added via openTask before
+  // dockview asks for the renderer, consumed when createComponent
+  // instantiates the panel.
+  private readonly pendingInits = new Map<string, TaskInit>();
+  // Task panels keyed by command path so reopens focus the same panel.
+  private readonly taskPanels = new Map<string, string>();
 
   constructor(opts: DashboardShellOptions) {
     this.schema = opts.schema;
@@ -76,14 +85,8 @@ export class DashboardShell {
       createComponent: (opts) => this.createRenderer(opts),
     });
 
-    // Wire shell-level event handlers BEFORE the first panel is added
-    // so layout restoration triggers don't fire into a dead listener.
-    this.state.on('command:open', (cmd) => this.openCommandPanel(cmd));
-    this.state.on('job:started', ({ jobId, argv }) =>
-      this.openTerminalPanel(jobId, argv),
-    );
+    this.state.on('command:open', (cmd) => this.openTaskForCommand(cmd));
 
-    // Initial layout: try to restore, otherwise build defaults.
     const stored = getStored<SerializedDockview | null>(LAYOUT_KEY, null);
     let restored = false;
     if (stored !== null) {
@@ -91,7 +94,6 @@ export class DashboardShell {
         this.dock.fromJSON(stored);
         restored = true;
       } catch {
-        // Stale or incompatible layout — fall through to defaults.
         restored = false;
       }
     }
@@ -99,15 +101,12 @@ export class DashboardShell {
       this.buildDefaultLayout();
     }
 
-    // Persist on every layout change.
     this.dock.onDidLayoutChange(() => {
       if (this.dock) setStored(LAYOUT_KEY, this.dock.toJSON());
     });
 
-    // Refit terminals when their pane becomes active (sizes finalize
-    // after the dock layout settles).
     this.dock.onDidActivePanelChange((panel) => {
-      const renderer = panel?.view?.content as ResizeAware | undefined;
+      const renderer = panel?.view?.content as TaskAware | undefined;
       renderer?.onResize?.();
     });
 
@@ -122,10 +121,6 @@ export class DashboardShell {
 
   // -------------------------------------------------------------------
   // dockview-core renderer factory
-  //
-  // dockview-core 3.x asks for a single `createComponent(opts)` factory
-  // that returns an IContentRenderer per panel. We switch on the
-  // declared component name to instantiate the right inner widget.
   // -------------------------------------------------------------------
 
   private createRenderer(opts: CreateComponentOptions): IContentRenderer {
@@ -153,9 +148,10 @@ export class DashboardShell {
             this.element.innerHTML = `
               <h1>Constellation</h1>
               <p>Pick a command from the sidebar to fill in a form,
-              then press Run. Each running job streams into its own
-              terminal panel. Drag panels by their tab to split or
-              stack them.</p>
+              then press Run or Open. Each running task streams into
+              the tab it was launched from — compute commands show a
+              terminal, visualization commands swap to the embedded
+              viewer.</p>
               <div class="session-launcher">
                 <h2>Open a session</h2>
                 <p>Point at a pipeline run directory (the parent of
@@ -190,126 +186,69 @@ export class DashboardShell {
               error.textContent = '';
               error.hidden = true;
             };
-            const submit = async (): Promise<void> => {
+            const submit = (): void => {
               const path = input.value.trim();
               if (!path) {
                 showError('Enter a session directory path.');
                 return;
               }
               clearError();
-              button.disabled = true;
-              try {
-                const summary = await shell.registerSession(path);
-                setStored(LAST_SESSION_PATH_KEY, path);
-                shell.openGenomePanel(summary.session_id, summary.label);
-              } catch (err) {
-                showError(err instanceof Error ? err.message : String(err));
-              } finally {
-                button.disabled = false;
+              setStored(LAST_SESSION_PATH_KEY, path);
+              const descriptor = findVizDescriptor(['viz', 'genome']);
+              if (!descriptor) {
+                showError('Genome browser is not registered in this build.');
+                return;
               }
+              shell.openVizTaskPanel(descriptor, { session: path }, true);
             };
-            button.addEventListener('click', () => {
-              void submit();
-            });
+            button.addEventListener('click', () => submit());
             input.addEventListener('keydown', (ev) => {
               if (ev.key === 'Enter') {
                 ev.preventDefault();
-                void submit();
+                submit();
               }
             });
           }
         })();
 
-      case 'form':
-        return new (class implements IContentRenderer {
+      case 'task':
+        return new (class implements TaskAware {
           readonly element = (() => {
             const e = document.createElement('div');
             e.style.height = '100%';
             return e;
           })();
-          private form: CommandForm | null = null;
+          private panel: TaskPanel | null = null;
+          private panelKey: string | null = null;
           init(params: GroupPanelPartInitParameters): void {
-            const p = params.params as PanelParams | undefined;
-            let cmd = p?.command;
-            if (!cmd) {
-              const path = (params.api.id ?? '')
-                .replace(/^form:/, '')
-                .split(' ');
-              cmd = path[0] ? shell.findCommand(path) ?? undefined : undefined;
-            }
-            if (!cmd) {
+            const id = params.api.id;
+            const init = shell.consumeInit(id, params.params as TaskPanelParams);
+            if (!init) {
               this.element.textContent =
-                '(form unavailable — command no longer exists)';
+                '(task panel unavailable — command no longer exists)';
               return;
             }
-            this.form = new CommandForm({ command: cmd, state: stateRef });
-            this.form.mount(this.element);
-          }
-        })();
-
-      case 'terminal':
-        return new (class implements ResizeAware {
-          readonly element = (() => {
-            const e = document.createElement('div');
-            e.style.height = '100%';
-            return e;
-          })();
-          private term: TerminalPanel | null = null;
-          init(params: GroupPanelPartInitParameters): void {
-            const p = params.params as PanelParams | undefined;
-            if (!p?.jobId || !p?.argv) {
-              this.element.textContent =
-                '(terminal unavailable — job state was not restored)';
-              return;
-            }
-            this.term = new TerminalPanel({
-              jobId: p.jobId,
-              argv: p.argv,
+            this.panelKey = id.replace(/^task:/, '');
+            this.panel = new TaskPanel({
+              state: stateRef,
+              setTitle: (title: string) => params.api.setTitle(title),
             });
-            this.term.mount(this.element);
+            this.panel.mount(this.element, init);
           }
           onResize(): void {
-            this.term?.resize();
+            this.panel?.onResize();
           }
-        })();
-
-      case 'genome':
-        return new (class implements IContentRenderer {
-          readonly element = (() => {
-            const e = document.createElement('div');
-            e.className = 'genome-panel';
-            return e;
-          })();
-          init(params: GroupPanelPartInitParameters): void {
-            const p = params.params as PanelParams | undefined;
-            const sessionId = p?.sessionId;
-            if (!sessionId) {
-              this.element.textContent =
-                '(genome panel unavailable — no session bound)';
-              return;
+          dispose(): void {
+            this.panel?.destroy();
+            this.panel = null;
+            if (this.panelKey !== null) {
+              shell.releaseTaskPanel(this.panelKey);
+              this.panelKey = null;
             }
-            // Lazy-import keeps the d3 / apache-arrow / track-renderer
-            // chain out of the initial dashboard payload — only paid
-            // when a genome panel actually opens.
-            void import('../widgets/GenomeBrowser')
-              .then(async ({ GenomeBrowser }) => {
-                const browser = new GenomeBrowser({
-                  host: this.element,
-                  sessionId,
-                });
-                await browser.mount();
-              })
-              .catch((err: unknown) => {
-                this.element.textContent = `Failed to mount genome browser: ${
-                  err instanceof Error ? err.message : String(err)
-                }`;
-              });
           }
         })();
 
       default:
-        // Fallback for unknown panel names — show an error rather than
-        // crashing the whole shell.
         return new (class implements IContentRenderer {
           readonly element = (() => {
             const e = document.createElement('div');
@@ -324,7 +263,7 @@ export class DashboardShell {
   }
 
   // -------------------------------------------------------------------
-  // Default layout + panel management
+  // Default layout + task-panel management
   // -------------------------------------------------------------------
 
   private buildDefaultLayout(): void {
@@ -344,80 +283,88 @@ export class DashboardShell {
     });
   }
 
-  private openCommandPanel(cmd: CommandSchema): void {
+  private openTaskForCommand(cmd: CommandSchema): void {
     if (!this.dock) return;
-    const key = cmd.path.join(' ');
-    const existingId = this.formPanels.get(key);
+    const init = taskInitForCommand(cmd);
+    this.addTaskPanel(cmd.path, init);
+  }
+
+  /** Open a visualization task panel directly (welcome-quick-launch
+   *  path). When `autoSubmit` is true, the VizForm fires its submit
+   *  handler immediately so the user sees the widget without an
+   *  intermediate form click. */
+  private openVizTaskPanel(
+    descriptor: ReturnType<typeof findVizDescriptor> extends infer T
+      ? T extends null
+        ? never
+        : T
+      : never,
+    prefill: Record<string, string>,
+    autoSubmit: boolean,
+  ): void {
+    if (!this.dock || !descriptor) return;
+    const init: TaskInit = {
+      kind: 'viz',
+      descriptor,
+      prefill,
+      autoSubmit,
+    };
+    this.addTaskPanel(descriptor.path, init);
+  }
+
+  private addTaskPanel(commandPath: string[], init: TaskInit): void {
+    if (!this.dock) return;
+    const key = commandPath.join(' ');
+    const existingId = this.taskPanels.get(key);
     if (existingId) {
       const panel = this.dock.getGroupPanel(existingId);
       if (panel) {
         panel.api.setActive();
-        this.sidebar.setActivePath(cmd.path);
+        this.sidebar.setActivePath(commandPath);
         return;
       }
-      this.formPanels.delete(key);
+      this.taskPanels.delete(key);
     }
-    const id = `form:${key}`;
+    const id = `task:${key}`;
+    this.pendingInits.set(id, init);
     this.dock.addPanel({
       id,
-      component: 'form',
-      title: cmd.path.join(' '),
-      params: { kind: 'form', command: cmd } satisfies PanelParams,
+      component: 'task',
+      title: titleFor(init, commandPath),
+      params: {
+        kind: 'task',
+        commandPath,
+      } satisfies PanelParams,
       position: { referencePanel: 'sidebar', direction: 'right' },
     });
-    this.formPanels.set(key, id);
-    this.sidebar.setActivePath(cmd.path);
+    this.taskPanels.set(key, id);
+    this.sidebar.setActivePath(commandPath);
   }
 
-  private openTerminalPanel(jobId: string, argv: string[]): void {
-    if (!this.dock) return;
-    const short = argv.slice(0, 2).join(' ') || 'job';
-    this.dock.addPanel({
-      id: `terminal:${jobId}`,
-      component: 'terminal',
-      title: `terminal · ${short}`,
-      params: { kind: 'terminal', jobId, argv } satisfies PanelParams,
-    });
+  /** Called from a task panel renderer's `dispose` so reopens of the
+   *  same command get a fresh panel id instead of trying to focus a
+   *  panel that dockview has already torn down. */
+  releaseTaskPanel(key: string): void {
+    this.taskPanels.delete(key);
   }
 
-  // -------------------------------------------------------------------
-  // Session registration + genome panel
-  // -------------------------------------------------------------------
-
-  async registerSession(path: string): Promise<SessionSummary> {
-    const response = await fetch('/api/sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path }),
-    });
-    if (!response.ok) {
-      let detail = `HTTP ${response.status}`;
-      try {
-        const body = (await response.json()) as { detail?: unknown };
-        if (typeof body.detail === 'string') detail = body.detail;
-      } catch {
-        // fall through with the default message
-      }
-      throw new Error(detail);
+  private consumeInit(
+    panelId: string,
+    params: TaskPanelParams,
+  ): TaskInit | null {
+    const pending = this.pendingInits.get(panelId);
+    if (pending) {
+      this.pendingInits.delete(panelId);
+      return pending;
     }
-    return (await response.json()) as SessionSummary;
-  }
-
-  openGenomePanel(sessionId: string, label: string): void {
-    if (!this.dock) return;
-    const id = `genome:${sessionId}`;
-    const existing = this.dock.getGroupPanel(id);
-    if (existing) {
-      existing.api.setActive();
-      return;
-    }
-    this.dock.addPanel({
-      id,
-      component: 'genome',
-      title: `genome · ${label}`,
-      params: { kind: 'genome', sessionId, label } satisfies PanelParams,
-      position: { referencePanel: 'sidebar', direction: 'right' },
-    });
+    // Layout-restore path: dockview ran `fromJSON` and is asking us to
+    // recreate a panel whose init we never stashed. Rebuild from the
+    // serialized commandPath.
+    const path = params.commandPath;
+    if (!Array.isArray(path) || path.length === 0) return null;
+    const command = this.findCommand(path);
+    if (!command) return null;
+    return taskInitForCommand(command);
   }
 
   // -------------------------------------------------------------------
@@ -435,4 +382,9 @@ export class DashboardShell {
     }
     return match;
   }
+}
+
+function titleFor(init: TaskInit, commandPath: string[]): string {
+  if (init.kind === 'viz') return init.descriptor.label;
+  return commandPath.join(' ');
 }

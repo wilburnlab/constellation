@@ -143,7 +143,17 @@ class ParquetDirWriter:
     def write(self, reference: GenomeReference, path: Path, **opts: Any) -> None:
         path.mkdir(parents=True, exist_ok=True)
         for name in _PARQUET_TABLES:
-            pq.write_table(getattr(reference, name), path / f"{name}.parquet")
+            table = getattr(reference, name)
+            kwargs: dict[str, Any] = {}
+            if name == "sequences":
+                # One contig per row group. Lets the viz reader (and any
+                # other consumer) skip whole-genome materialization when
+                # only one contig's sequence is needed — at default
+                # row_group_size mouse/human references pack every
+                # contig's bytes into a single row group, so a
+                # `contig_id == X` filter still pays the full decode.
+                kwargs["row_group_size"] = 1
+            pq.write_table(table, path / f"{name}.parquet", **kwargs)
         manifest = {
             "format": self.format_name,
             "tables": list(_PARQUET_TABLES),

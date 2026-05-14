@@ -37,6 +37,8 @@ const renderer: TrackRenderer = {
 
     // Greedy row pack so child features don't visually merge.
     const rows = packRows(table);
+    const showLabels = ctx.showLabels !== false;
+    const nextStartOnRow = showLabels ? computeNextStartOnRow(table, rows) : null;
 
     const rowH = 14;
     for (let i = 0; i < table.numRows; i++) {
@@ -84,9 +86,72 @@ const renderer: TrackRenderer = {
         });
         ctx.svg.appendChild(chevron);
       }
+
+      if (showLabels && name && nextStartOnRow) {
+        const labelX = Math.max(0, x0) + 3;
+        const nextX =
+          nextStartOnRow[i] === Number.POSITIVE_INFINITY
+            ? ctx.widthPx
+            : Math.min(ctx.widthPx, ctx.xScale(nextStartOnRow[i]));
+        const maxLabelW = Math.floor(nextX - labelX - 4);
+        if (maxLabelW >= 24) {
+          // Approx glyph width at font-size 10 in our default UI font
+          // hovers around 5.6 px; round up so longer names get clipped
+          // rather than spilling across the gap.
+          const maxChars = Math.max(2, Math.floor(maxLabelW / 6));
+          const text =
+            name.length > maxChars ? `${name.slice(0, maxChars - 1)}…` : name;
+          const label = svgEl('text', {
+            x: labelX,
+            y: y + (rowH - 4) / 2 + 3,
+            'font-size': '10',
+            fill: '#e3e3e8',
+            'pointer-events': 'none',
+            'paint-order': 'stroke',
+            stroke: '#0f0f12',
+            'stroke-width': '2',
+            'stroke-linejoin': 'round',
+          });
+          label.textContent = text;
+          ctx.svg.appendChild(label);
+        }
+      }
     }
   },
 };
+
+/**
+ * For each feature index, find the start coordinate of the next feature
+ * on the SAME packed row. Used to clip per-feature labels so they never
+ * overlap a downstream neighbour. The last feature on each row gets
+ * `+Infinity` (no neighbour).
+ */
+function computeNextStartOnRow(table: Table, rows: number[]): number[] {
+  const n = table.numRows;
+  const startCol = table.getChild('start');
+  const result = new Array<number>(n).fill(Number.POSITIVE_INFINITY);
+  if (!startCol) return result;
+  // Group feature indices by row, sorted by start.
+  const byRow = new Map<number, number[]>();
+  for (let i = 0; i < n; i++) {
+    const r = rows[i];
+    let bucket = byRow.get(r);
+    if (!bucket) {
+      bucket = [];
+      byRow.set(r, bucket);
+    }
+    bucket.push(i);
+  }
+  for (const bucket of byRow.values()) {
+    bucket.sort(
+      (a, b) => Number(startCol.get(a)) - Number(startCol.get(b)),
+    );
+    for (let k = 0; k < bucket.length - 1; k++) {
+      result[bucket[k]] = Number(startCol.get(bucket[k + 1]));
+    }
+  }
+  return result;
+}
 
 function packRows(table: Table): number[] {
   const n = table.numRows;

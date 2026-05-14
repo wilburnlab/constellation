@@ -41,6 +41,7 @@ from constellation.viz.tracks.gene_annotation import (
     GENE_ANNOTATION_VECTOR_SCHEMA,
 )
 from constellation.viz.tracks.read_pileup import READ_PILEUP_VECTOR_SCHEMA
+from constellation.viz.tracks import reference_sequence as ref_seq_mod
 from constellation.viz.tracks.reference_sequence import (
     REFERENCE_SEQUENCE_VECTOR_SCHEMA,
 )
@@ -110,6 +111,113 @@ def test_reference_sequence_vector_returns_per_base(tmp_path: Path) -> None:
     assert table.column("step").to_pylist() == [1] * 10
     bases = table.column("base").to_pylist()
     assert bases == list("ACGTACGTAC")
+
+
+def test_reference_sequence_cache_reuses_string_across_calls(
+    tmp_path: Path,
+) -> None:
+    """A second `fetch` for the same contig must not re-read the
+    on-disk sequence — verified by intercepting the loader and counting
+    invocations. Without the cache, fast pan/zoom blew the server RAM
+    on real genomes (multi-MB sequences re-decoded per request)."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    session = Session.from_root(root)
+    kernel = get_kernel("reference_sequence")
+    [binding] = kernel.discover(session)
+
+    ref_seq_mod._clear_sequence_cache()
+    call_count = 0
+    original_loader = ref_seq_mod._load_contig_sequence
+
+    def _counting_loader(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original_loader(*args, **kwargs)
+
+    ref_seq_mod._load_contig_sequence = _counting_loader
+    try:
+        first = pa.Table.from_batches(
+            list(
+                kernel.fetch(
+                    binding,
+                    TrackQuery(contig="chr1", start=0, end=10, viewport_px=400),
+                    ThresholdDecision.VECTOR,
+                )
+            ),
+            schema=REFERENCE_SEQUENCE_VECTOR_SCHEMA,
+        )
+        second = pa.Table.from_batches(
+            list(
+                kernel.fetch(
+                    binding,
+                    TrackQuery(contig="chr1", start=20, end=30, viewport_px=400),
+                    ThresholdDecision.VECTOR,
+                )
+            ),
+            schema=REFERENCE_SEQUENCE_VECTOR_SCHEMA,
+        )
+    finally:
+        ref_seq_mod._load_contig_sequence = original_loader
+        ref_seq_mod._clear_sequence_cache()
+
+    assert call_count == 1
+    assert first.num_rows == 10
+    assert second.num_rows == 10
+    # Each slice is correct independent of which order they ran.
+    assert first.column("base").to_pylist() == list("ACGTACGTAC")
+
+
+def test_reference_sequence_loader_reads_only_matching_contig(
+    tmp_path: Path,
+) -> None:
+    """Cache miss path should pull just the requested contig's row,
+    not the whole `sequences.parquet`. This keeps the worst-case
+    allocation bounded by single-chromosome size rather than the full
+    genome."""
+    root = tmp_path / "run"
+    genome = root / "genome"
+    genome.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "contig_id": 1,
+                    "name": "chr1",
+                    "length": 100,
+                    "topology": None,
+                    "circular": None,
+                },
+                {
+                    "contig_id": 2,
+                    "name": "chr2",
+                    "length": 100,
+                    "topology": None,
+                    "circular": None,
+                },
+            ],
+            schema=CONTIG_TABLE,
+        ),
+        genome / "contigs.parquet",
+    )
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {"contig_id": 1, "sequence": "A" * 100},
+                {"contig_id": 2, "sequence": "T" * 100},
+            ],
+            schema=SEQUENCE_TABLE,
+        ),
+        genome / "sequences.parquet",
+    )
+    ref_seq_mod._clear_sequence_cache()
+    try:
+        loaded = ref_seq_mod._load_contig_sequence(
+            genome / "sequences.parquet", 1
+        )
+    finally:
+        ref_seq_mod._clear_sequence_cache()
+    assert loaded == "A" * 100
 
 
 def test_reference_sequence_decimates_when_window_exceeds_cap(

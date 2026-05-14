@@ -2,8 +2,9 @@
 //
 // Drives off the ArgumentSchema list emitted by the introspect walker.
 // Constructs an argv array from form state and POSTs to /api/commands.
-// On 200, emits `job:started` for the shell to open a Terminal panel.
-// On 409, surfaces the rejection message inline.
+// On 200, invokes the host-provided `onJobStarted` callback so the
+// TaskPanel can swap its content to a terminal in-place. On 409,
+// surfaces the rejection message inline.
 
 import type { ArgumentSchema, CommandResponse, CommandSchema } from './types';
 import { DashboardState } from './state';
@@ -11,6 +12,10 @@ import { DashboardState } from './state';
 export interface CommandFormOptions {
   command: CommandSchema;
   state: DashboardState;
+  /** Host callback fired once /api/commands returns 200 with a job_id.
+   *  The TaskPanel uses this to transition the panel into terminal
+   *  mode without spawning a separate dock panel. */
+  onJobStarted?: (event: { jobId: string; argv: string[] }) => void;
 }
 
 type ArgState = Map<string, string | boolean | string[]>;
@@ -37,6 +42,9 @@ const ADVANCED_DEST_PATTERNS = [
 export class CommandForm {
   private readonly command: CommandSchema;
   private readonly state: DashboardState;
+  private readonly onJobStarted?: (
+    event: { jobId: string; argv: string[] },
+  ) => void;
   private readonly values: ArgState = new Map();
   private element: HTMLElement | null = null;
   private runButton: HTMLButtonElement | null = null;
@@ -46,6 +54,7 @@ export class CommandForm {
   constructor(opts: CommandFormOptions) {
     this.command = opts.command;
     this.state = opts.state;
+    this.onJobStarted = opts.onJobStarted;
     for (const arg of opts.command.arguments) {
       this.values.set(arg.dest, defaultFormValue(arg));
     }
@@ -418,10 +427,7 @@ export class CommandForm {
         return;
       }
       const data = (await response.json()) as CommandResponse;
-      this.state.emit('job:started', {
-        jobId: data.job_id,
-        argv: data.argv,
-      });
+      this.onJobStarted?.({ jobId: data.job_id, argv: data.argv });
     } catch (err) {
       this.showError((err as Error).message);
     } finally {

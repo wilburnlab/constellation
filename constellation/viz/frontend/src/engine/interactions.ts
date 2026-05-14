@@ -8,8 +8,37 @@
 
 import { Locus, ViewportBus } from './viewport_bus';
 
-const ZOOM_STEP = 1.2;
-const MIN_WINDOW_BP = 20;
+export const ZOOM_STEP = 1.2;
+export const MIN_WINDOW_BP = 20;
+
+/**
+ * Apply a zoom factor to a locus around a fractional anchor.
+ *
+ * `factor > 1` zooms out (span grows); `factor < 1` zooms in (span
+ * shrinks). `anchorFraction` is the [0..1] position the user wants
+ * fixed under the cursor (0.5 = window center). Returned locus is
+ * already clamped to `[0, contigLength]` with span preserved.
+ */
+export function zoomLocus(
+  locus: Locus,
+  contigLength: number,
+  factor: number,
+  anchorFraction: number,
+): Locus {
+  const span = locus.end - locus.start;
+  const newSpan = Math.max(MIN_WINDOW_BP, Math.round(span * factor));
+  const frac = Math.min(1, Math.max(0, anchorFraction));
+  const anchorBp = locus.start + span * frac;
+  const newStart = Math.round(anchorBp - newSpan * frac);
+  return clamp(
+    {
+      contig: locus.contig,
+      start: newStart,
+      end: newStart + newSpan,
+    },
+    contigLength,
+  );
+}
 
 export interface PanZoomOptions {
   bus: ViewportBus;
@@ -43,21 +72,12 @@ export function attachPanZoom(opts: PanZoomOptions): () => void {
     }
     // Default: vertical scroll = zoom
     event.preventDefault();
-    const direction = event.deltaY > 0 ? ZOOM_STEP : 1 / ZOOM_STEP;
-    const locus = bus.locus;
+    const factor = event.deltaY > 0 ? ZOOM_STEP : 1 / ZOOM_STEP;
     const widthPx = Math.max(1, getWidthPx());
     const rect = surface.getBoundingClientRect();
     const cursorPx = event.clientX - rect.left;
-    const cursorFraction = Math.min(1, Math.max(0, cursorPx / widthPx));
-    const span = locus.end - locus.start;
-    const newSpan = Math.max(MIN_WINDOW_BP, Math.round(span * direction));
-    const cursorBp = locus.start + span * cursorFraction;
-    const newStart = Math.round(cursorBp - newSpan * cursorFraction);
-    bus.setLocus(clamp({
-      contig: locus.contig,
-      start: newStart,
-      end: newStart + newSpan,
-    }, getContigLength()));
+    const cursorFraction = widthPx > 0 ? cursorPx / widthPx : 0.5;
+    bus.setLocus(zoomLocus(bus.locus, getContigLength(), factor, cursorFraction));
   };
 
   const onMouseDown = (event: MouseEvent) => {
