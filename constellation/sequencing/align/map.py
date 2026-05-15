@@ -258,8 +258,11 @@ def map_to_genome(
         output_dir / "genome.fa",
         output_dir / ".genome_meta.json",
     )
+    # Build the index with the same preset the aligner uses below
+    # (_GENOME_MODE_ARGS -> -ax splice) so minimap2's -k/-w match and it
+    # doesn't fall back to a coarser default index at alignment time.
     mmi = minimap2_build_index(
-        fasta, output_dir / "genome.mmi", threads=threads
+        fasta, output_dir / "genome.mmi", preset="splice", threads=threads
     )
 
     minimap2_bin = _resolve_minimap2()

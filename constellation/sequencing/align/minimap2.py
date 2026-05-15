@@ -137,10 +137,18 @@ def minimap2_build_index(
     fasta: Path,
     mmi_path: Path,
     *,
+    preset: str | None = None,
     threads: int = 8,
     extra_args: tuple[str, ...] = (),
 ) -> Path:
     """Build a ``.mmi`` index via ``minimap2 -d``.
+
+    ``preset`` (e.g. ``"splice"``) sets the indexing ``-k``/``-w`` via
+    ``-x``. minimap2 bakes ``-k``/``-w`` into the index and warns at
+    alignment time if the alignment preset wants different values, so
+    callers must pass the same preset the aligner will use. ``None``
+    keeps minimap2's defaults — appropriate only for callers that align
+    without a preset.
 
     Skips rebuild if ``mmi_path`` exists and is newer than ``fasta``.
     Returns ``mmi_path``.
@@ -153,6 +161,7 @@ def minimap2_build_index(
     mmi_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         str(minimap2_bin),
+        *(("-x", preset) if preset else ()),
         *extra_args,
         "-t",
         str(int(threads)),
