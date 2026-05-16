@@ -21,10 +21,8 @@ import { StatusBar } from './StatusBar';
 import { TaskPanel, taskInitForCommand, type TaskInit } from './TaskPanel';
 import { DashboardState, getStored, setStored } from './state';
 import type { CliSchema, CommandSchema } from './types';
-import { findVizDescriptor } from './viz_registry';
 
 const LAYOUT_KEY = 'layout.v1';
-const LAST_SESSION_PATH_KEY = 'last_session_path';
 
 export interface DashboardShellOptions {
   schema: CliSchema;
@@ -147,66 +145,40 @@ export class DashboardShell {
           init(_params: GroupPanelPartInitParameters): void {
             this.element.innerHTML = `
               <h1>Constellation</h1>
-              <p>Pick a command from the sidebar to fill in a form,
-              then press Run or Open. Each running task streams into
-              the tab it was launched from — compute commands show a
-              terminal, visualization commands swap to the embedded
-              viewer.</p>
-              <div class="session-launcher">
-                <h2>Open a session</h2>
-                <p>Point at a pipeline run directory (the parent of
-                <code>genome/</code>, <code>S2_align/</code>, ...).</p>
-                <div class="session-launcher-row">
-                  <input class="session-launcher-input"
-                    type="text"
-                    placeholder="/path/to/run"
-                    spellcheck="false"
-                    autocomplete="off" />
-                  <button class="session-launcher-button"
-                    type="button">Open Genome Browser</button>
-                </div>
-                <div class="session-launcher-error" hidden></div>
+              <p class="welcome-tagline">Integrative bioinformatics
+              platform — pick a command from the sidebar to get
+              started.</p>
+              <div class="welcome-links">
+                <a class="welcome-link"
+                  href="https://github.com/wilburnlab/constellation"
+                  target="_blank" rel="noopener">
+                  <div class="welcome-link-title">GitHub</div>
+                  <div class="welcome-link-desc">Source repository</div>
+                </a>
+                <a class="welcome-link"
+                  href="https://github.com/wilburnlab/constellation/blob/main/README.md"
+                  target="_blank" rel="noopener">
+                  <div class="welcome-link-title">Documentation</div>
+                  <div class="welcome-link-desc">Project README</div>
+                </a>
+                <a class="welcome-link"
+                  href="https://github.com/wilburnlab/constellation/issues"
+                  target="_blank" rel="noopener">
+                  <div class="welcome-link-title">Issues</div>
+                  <div class="welcome-link-desc">Report a bug or request a feature</div>
+                </a>
+                <button class="welcome-link welcome-link-button" type="button"
+                  data-command="doctor">
+                  <div class="welcome-link-title">Doctor</div>
+                  <div class="welcome-link-desc">Check install status &amp; tool discovery</div>
+                </button>
               </div>
             `;
-            const input = this.element.querySelector<HTMLInputElement>(
-              '.session-launcher-input',
-            )!;
-            const button = this.element.querySelector<HTMLButtonElement>(
-              '.session-launcher-button',
-            )!;
-            const error = this.element.querySelector<HTMLDivElement>(
-              '.session-launcher-error',
-            )!;
-            input.value = getStored<string>(LAST_SESSION_PATH_KEY, '');
-            const showError = (msg: string): void => {
-              error.textContent = msg;
-              error.hidden = false;
-            };
-            const clearError = (): void => {
-              error.textContent = '';
-              error.hidden = true;
-            };
-            const submit = (): void => {
-              const path = input.value.trim();
-              if (!path) {
-                showError('Enter a session directory path.');
-                return;
-              }
-              clearError();
-              setStored(LAST_SESSION_PATH_KEY, path);
-              const descriptor = findVizDescriptor(['viz', 'genome']);
-              if (!descriptor) {
-                showError('Genome browser is not registered in this build.');
-                return;
-              }
-              shell.openVizTaskPanel(descriptor, { session: path }, true);
-            };
-            button.addEventListener('click', () => submit());
-            input.addEventListener('keydown', (ev) => {
-              if (ev.key === 'Enter') {
-                ev.preventDefault();
-                submit();
-              }
+            const doctorBtn = this.element.querySelector<HTMLButtonElement>(
+              '.welcome-link-button[data-command="doctor"]',
+            );
+            doctorBtn?.addEventListener('click', () => {
+              shell.openCommandByPath(['doctor']);
             });
           }
         })();
@@ -277,7 +249,7 @@ export class DashboardShell {
     this.dock.addPanel({
       id: 'welcome',
       component: 'welcome',
-      title: 'Welcome',
+      title: 'Home',
       params: { kind: 'welcome' } satisfies PanelParams,
       position: { referencePanel: 'sidebar', direction: 'right' },
     });
@@ -289,27 +261,12 @@ export class DashboardShell {
     this.addTaskPanel(cmd.path, init);
   }
 
-  /** Open a visualization task panel directly (welcome-quick-launch
-   *  path). When `autoSubmit` is true, the VizForm fires its submit
-   *  handler immediately so the user sees the widget without an
-   *  intermediate form click. */
-  private openVizTaskPanel(
-    descriptor: ReturnType<typeof findVizDescriptor> extends infer T
-      ? T extends null
-        ? never
-        : T
-      : never,
-    prefill: Record<string, string>,
-    autoSubmit: boolean,
-  ): void {
-    if (!this.dock || !descriptor) return;
-    const init: TaskInit = {
-      kind: 'viz',
-      descriptor,
-      prefill,
-      autoSubmit,
-    };
-    this.addTaskPanel(descriptor.path, init);
+  /** Open a sidebar command by its dotted path. Used by the home
+   *  page's in-app shortcuts (e.g. the Doctor tile) — reuses the
+   *  same code path the sidebar takes. */
+  openCommandByPath(path: string[]): void {
+    const cmd = this.findCommand(path);
+    if (cmd) this.openTaskForCommand(cmd);
   }
 
   private addTaskPanel(commandPath: string[], init: TaskInit): void {
@@ -327,6 +284,12 @@ export class DashboardShell {
     }
     const id = `task:${key}`;
     this.pendingInits.set(id, init);
+    // Anchor new tabs to whichever group currently holds the home
+    // panel so commands stack as tabs instead of slicing the
+    // workspace into thinner and thinner splits. If home has been
+    // closed, fall back to the legacy side-split next to the
+    // sidebar.
+    const home = this.dock.getGroupPanel('welcome');
     this.dock.addPanel({
       id,
       component: 'task',
@@ -335,7 +298,9 @@ export class DashboardShell {
         kind: 'task',
         commandPath,
       } satisfies PanelParams,
-      position: { referencePanel: 'sidebar', direction: 'right' },
+      position: home
+        ? { referenceGroup: home.group }
+        : { referencePanel: 'sidebar', direction: 'right' },
     });
     this.taskPanels.set(key, id);
     this.sidebar.setActivePath(commandPath);
