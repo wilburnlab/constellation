@@ -335,53 +335,39 @@
         font-size: 11px;
         color: var(--fg);
       }
-      .session-launcher {
+      .welcome-tagline {
+        margin: 0 0 8px 0;
+      }
+      .welcome-links {
         margin-top: 24px;
-        padding-top: 16px;
-        border-top: 1px solid var(--border);
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 12px;
       }
-      .session-launcher h2 {
-        margin: 0 0 6px 0;
-        font-size: 13px;
-        color: var(--fg);
-        font-weight: 500;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-      }
-      .session-launcher p { margin: 0 0 10px 0; }
-      .session-launcher-row {
-        display: flex;
-        gap: 8px;
-        align-items: stretch;
-      }
-      .session-launcher-input {
-        flex: 1;
+      .welcome-link {
+        display: block;
+        text-align: left;
+        text-decoration: none;
         background: var(--bg-elev);
         color: var(--fg);
         border: 1px solid var(--border);
         border-radius: 4px;
-        padding: 6px 8px;
-        font-family: ui-monospace, SF Mono, Menlo, monospace;
-        font-size: 12px;
-      }
-      .session-launcher-button {
-        background: var(--accent);
-        color: white;
-        border: 0;
-        border-radius: 4px;
-        padding: 6px 16px;
+        padding: 12px;
+        font: inherit;
         cursor: pointer;
-        font-size: 12px;
       }
-      .session-launcher-button:disabled {
-        background: var(--border);
-        color: var(--fg-mute);
-        cursor: not-allowed;
+      .welcome-link:hover {
+        border-color: var(--accent);
       }
-      .session-launcher-error {
-        color: var(--danger);
+      .welcome-link-title {
+        font-size: 13px;
+        font-weight: 500;
+        color: var(--fg);
+        margin-bottom: 4px;
+      }
+      .welcome-link-desc {
         font-size: 11px;
-        margin-top: 8px;
+        color: var(--fg-dim);
       }
 
       /* Task panel (hosts CommandForm/VizForm/Terminal/GenomeBrowser) */
