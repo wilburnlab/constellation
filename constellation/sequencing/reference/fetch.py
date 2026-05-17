@@ -42,7 +42,6 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -58,7 +57,6 @@ from constellation.sequencing.reference.handle import (
     clean_partial,
     partial_dir,
     promote_partial,
-    read_meta_toml,
     set_default,
     update_current_pointer,
     write_meta_toml,
@@ -493,7 +491,13 @@ def _verify_refseq_checksums(
 
 @dataclass(frozen=True, slots=True)
 class _ResolvedSpec:
-    """A handle + URLs + assembly metadata ready for fetch."""
+    """A handle + URLs + assembly metadata ready for fetch.
+
+    ``taxid`` / ``scientific_name`` are populated when the spec was
+    resolved through the taxonomy + catalog path (species-name dispatch).
+    They land in ``meta.toml`` so downstream consumers can join cached
+    references against the taxonomy tree.
+    """
 
     handle: Handle
     fasta_url: str
@@ -503,18 +507,33 @@ class _ResolvedSpec:
     assembly_name: str | None
     annotation_release: str | None
     assembly_accession: str | None
+    taxid: int | None = None
+    scientific_name: str | None = None
 
 
-def _resolve_spec(spec: str, *, release: int | None) -> _ResolvedSpec:
-    """Map a ``<source>:<id>`` string to a complete fetch spec."""
+def _resolve_spec(
+    spec: str,
+    *,
+    release: int | None,
+    source: str | None = None,
+) -> _ResolvedSpec:
+    """Map a fetch spec to URLs + handle.
+
+    Accepted spec shapes:
+
+      * ``<source>:<id>`` — legacy form. ``source`` arg ignored.
+      * ``<species_name>`` — bare species name or vernacular (e.g.
+        ``'Haliotis rufescens'``, ``'red abalone'``, ``'human'``).
+        Routes through ``TaxonomyResolver`` → ``CatalogResolver``;
+        ``source`` arg pins the catalog source (RefSeq-first by default).
+      * ``<taxid>`` — integer NCBI taxid. Same routing as species name.
+    """
     if ":" not in spec:
-        raise ValueError(
-            f"reference spec must be '<source>:<id>'; got {spec!r}. "
-            f"Examples: 'refseq:GCF_001708105.1', 'ensembl_genomes:saccharomyces_cerevisiae'"
-        )
-    source, ident = spec.split(":", 1)
-    source = source.strip().lower()
+        return _resolve_species_query(spec, source=source, release=release)
+    src, ident = spec.split(":", 1)
+    src = src.strip().lower()
     ident = ident.strip()
+    source = src  # backward compat for the legacy branches below
 
     if source == "ensembl":
         species_path = _ENSEMBL_VERTEBRATE_SPECIES.get(ident, ident)
@@ -593,6 +612,106 @@ def _resolve_spec(spec: str, *, release: int | None) -> _ResolvedSpec:
     )
 
 
+def _resolve_species_query(
+    query: str,
+    *,
+    source: str | None,
+    release: int | None,
+) -> _ResolvedSpec:
+    """Species-name / taxid dispatch through taxonomy + catalog.
+
+    Lookup chain: ``TaxonomyResolver.auto().lookup_strict(query)`` →
+    ``CatalogResolver.from_cache().best_for(taxid, source=source)`` →
+    convert the catalog row into a ``_ResolvedSpec`` that the existing
+    download pipeline can consume.
+
+    Raises ``ValueError`` with an actionable message when:
+      - the query doesn't resolve to a known taxon (taxonomy unknown)
+      - no catalog row matches the resolved taxid (catalog stale / missing)
+    """
+    from constellation.catalog import (
+        CatalogResolver,
+    )
+    from constellation.core.taxonomy import (
+        TaxonomyResolver,
+        UnknownTaxonError,
+    )
+
+    tax = TaxonomyResolver.auto()
+    try:
+        node = tax.lookup_strict(query)
+    except UnknownTaxonError as exc:
+        raise ValueError(
+            f"unknown species / taxid {query!r} — not in the taxonomy. "
+            "Run `constellation taxonomy update` if this is a species "
+            "outside the bundled starter set."
+        ) from exc
+
+    catalogs = CatalogResolver.from_cache()
+    if catalogs.is_empty():
+        raise ValueError(
+            f"no catalogs installed — cannot resolve URLs for {node.scientific_name!r}. "
+            "Run `constellation catalog update refseq` (and/or ensembl / "
+            "ensembl_genomes / uniprot) to populate them."
+        )
+    row = catalogs.best_for(node.taxid, source=source)
+    if row is None:
+        sources = sorted({s for s, _ in catalogs.installed_sources()})
+        raise ValueError(
+            f"no catalog hit for taxid {node.taxid} ({node.scientific_name!r}); "
+            f"installed sources: {sources}. Try `constellation catalog update <source>` "
+            "to refresh, or pass --source explicitly."
+        )
+    return _spec_from_catalog_row(row, taxid=node.taxid, scientific_name=node.scientific_name)
+
+
+def _spec_from_catalog_row(
+    row: "CatalogRow",  # noqa: F821 — imported lazily above
+    *,
+    taxid: int,
+    scientific_name: str,
+) -> _ResolvedSpec:
+    """Convert a catalog row into the ``_ResolvedSpec`` the fetch pipeline expects."""
+    # Map the catalog source into the handle source. RefSeq + GenBank
+    # both use the RefSeq cache convention (release_slug = accession);
+    # Ensembl + Ensembl Genomes carry the numeric release.
+    src = row.source
+    if src in {"refseq", "genbank"}:
+        release_slug = row.assembly_accession or row.release
+        if row.annotation_release:
+            release_slug = f"{row.assembly_accession}-ar{row.annotation_release}"
+        handle = Handle(
+            organism=row.organism_slug, source=src, release=release_slug
+        )
+    elif src in {"ensembl", "ensembl_genomes"}:
+        handle = Handle(
+            organism=row.organism_slug, source=src, release=row.release
+        )
+    elif src == "uniprot":
+        # UniProt rows are catalogued but not fetchable via this path —
+        # ``reference fetch`` is genome-focused in PR-B. PR-C wires
+        # ``reference fetch-proteome``.
+        raise ValueError(
+            f"UniProt proteome rows ({row.assembly_accession!r}) cannot be "
+            "materialised via `reference fetch` in this release; the "
+            "`reference fetch-proteome` verb lands in a follow-up PR."
+        )
+    else:
+        raise ValueError(f"catalog row has unknown source {src!r}")
+    return _ResolvedSpec(
+        handle=handle,
+        fasta_url=row.fasta_url,
+        gff_url=row.gff_url or "",
+        checksums_url=row.checksums_url,
+        checksums_kind=row.checksums_kind,
+        assembly_name=row.assembly_name,
+        annotation_release=row.annotation_release,
+        assembly_accession=row.assembly_accession,
+        taxid=taxid,
+        scientific_name=scientific_name,
+    )
+
+
 # Known-good organism slugs for the lab's likely RefSeq targets. Falls
 # back to the parsed assembly_name when not in this table — users can
 # always rename via `reference link` or by editing the cache directly.
@@ -623,6 +742,7 @@ def fetch_reference(
     output_dir: str | Path | None = None,
     *,
     release: int | None = None,
+    source: str | None = None,
     timeout: int = 600,
     use_cache: bool = True,
     verify_source_checksums: bool = True,
@@ -654,7 +774,7 @@ def fetch_reference(
     from constellation.sequencing.readers.fastx import read_fasta_genome
     from constellation.sequencing.readers.gff import read_gff3
 
-    resolved = _resolve_spec(spec, release=release)
+    resolved = _resolve_spec(spec, release=release, source=source)
     handle = handle_override or resolved.handle
     if not handle.is_qualified():
         raise RuntimeError(
@@ -870,6 +990,8 @@ def _write_into_cache(
         urls=urls_meta,
         sha256=sha256_map,
         source_checksum_verified=source_checksum_verified,
+        taxid=resolved.taxid,
+        scientific_name=resolved.scientific_name,
     )
 
     promote_partial(release_dir)

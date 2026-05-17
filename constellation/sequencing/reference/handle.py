@@ -233,6 +233,8 @@ def write_meta_toml(
     sha256: dict[str, str],
     source_checksum_verified: bool,
     fetched_at: str | None = None,
+    taxid: int | None = None,
+    scientific_name: str | None = None,
 ) -> None:
     """Write a ``meta.toml`` at the cache-release-dir layer.
 
@@ -259,6 +261,10 @@ def write_meta_toml(
         lines.append(f'assembly_name = "{assembly_name}"')
     if annotation_release is not None:
         lines.append(f'annotation_release = "{annotation_release}"')
+    if taxid is not None:
+        lines.append(f"taxid = {int(taxid)}")
+    if scientific_name is not None:
+        lines.append(f'scientific_name = "{_toml_escape(scientific_name)}"')
     lines.append(f'constellation_version = "{constellation_version}"')
     lines.append(f'fetched_at = "{fetched_at}"')
 
