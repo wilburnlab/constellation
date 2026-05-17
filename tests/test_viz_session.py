@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from constellation.sequencing.schemas.quant import COVERAGE_TABLE
 from constellation.sequencing.schemas.reference import CONTIG_TABLE
@@ -131,6 +132,103 @@ samples = ["sample_a", "sample_b"]
     assert session.reference_genome == (root / "refs" / "Pichia").resolve()
     assert session.coverage == (root / "outputs" / "coverage.parquet").resolve()
     assert session.samples == ("sample_a", "sample_b")
+
+
+def test_session_toml_handle_resolves_via_cache(tmp_path: Path, monkeypatch) -> None:
+    """``[reference] handle = "..."`` looks up the cache and resolves to it."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    # Populate the cache with a fake install.
+    release_dir = cache / "pichia_pastoris" / "ensembl_genomes-57"
+    _write_genome(release_dir / "genome")
+    (release_dir / "annotation").mkdir()
+    (release_dir / "annotation" / "manifest.json").write_text("{}")
+    # Write an empty features.parquet so Session._drop_missing keeps the slot.
+    pq.write_table(
+        pa.table({"feature_id": pa.array([], pa.int64())}),
+        release_dir / "annotation" / "features.parquet",
+    )
+
+    root = tmp_path / "analysis"
+    root.mkdir()
+    (root / "session.toml").write_text(
+        """
+schema_version = 1
+label = "handle-based"
+
+[reference]
+handle = "pichia_pastoris@ensembl_genomes-57"
+"""
+    )
+    session = Session.from_root(root)
+    assert session.reference_genome == (release_dir / "genome").resolve()
+    assert session.reference_annotation == (release_dir / "annotation").resolve()
+
+
+def test_session_toml_explicit_path_overrides_handle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When both ``[reference] genome`` and ``handle`` are set, the
+    explicit path wins (per the documented precedence)."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    cache_release = cache / "pichia_pastoris" / "ensembl_genomes-57"
+    _write_genome(cache_release / "genome")
+    (cache_release / "annotation").mkdir()
+
+    root = tmp_path / "analysis"
+    root.mkdir()
+    _write_genome(root / "local_refs" / "genome")
+    (root / "session.toml").write_text(
+        """
+schema_version = 1
+
+[reference]
+genome = "local_refs/genome"
+handle = "pichia_pastoris@ensembl_genomes-57"
+"""
+    )
+    session = Session.from_root(root)
+    # Explicit path won.
+    assert session.reference_genome == (root / "local_refs" / "genome").resolve()
+    # Annotation falls back to the handle since no explicit annotation path.
+    assert session.reference_annotation == (cache_release / "annotation").resolve()
+
+
+def test_session_toml_handle_missing_install_errors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    root = tmp_path / "analysis"
+    root.mkdir()
+    (root / "session.toml").write_text(
+        """
+schema_version = 1
+
+[reference]
+handle = "homo_sapiens@ensembl-111"
+"""
+    )
+    with pytest.raises(ValueError, match="no cached reference"):
+        Session.from_root(root)
+
+
+def test_session_toml_rejects_unknown_schema_version(tmp_path: Path) -> None:
+    root = tmp_path / "analysis"
+    root.mkdir()
+    (root / "session.toml").write_text("schema_version = 99\n")
+    with pytest.raises(ValueError, match="schema_version=99"):
+        Session.from_root(root)
 
 
 def test_to_manifest_round_trips(tmp_path: Path) -> None:
