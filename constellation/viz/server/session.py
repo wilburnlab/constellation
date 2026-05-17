@@ -230,8 +230,9 @@ def _load_session_toml(path: Path, *, root: Path, session_id: str) -> Session:
         label = "..."
 
         [reference]
-        genome = "<path>"
-        annotation = "<path>"
+        handle = "homo_sapiens@ensembl-111"  # resolves via reference cache
+        # genome = "<path>"                  # absolute or root-relative path
+        # annotation = "<path>"              # — wins over `handle` when set
 
         [stages.s2_align]
         path = "S2_align"            # base path for relative resolution
@@ -254,6 +255,11 @@ def _load_session_toml(path: Path, *, root: Path, session_id: str) -> Session:
     raw = tomllib.loads(path.read_text(encoding="utf-8"))
 
     schema_version = int(raw.get("schema_version", 1))
+    if schema_version != 1:
+        raise ValueError(
+            f"unsupported session.toml schema_version={schema_version} at {path}; "
+            "this constellation supports v1"
+        )
     label = str(raw.get("label") or root.name)
 
     def _resolve(rel: Any, *, base: Path = root) -> Path | None:
@@ -269,6 +275,16 @@ def _load_session_toml(path: Path, *, root: Path, session_id: str) -> Session:
     ref = raw.get("reference", {}) or {}
     reference_genome = _resolve(ref.get("genome"))
     reference_annotation = _resolve(ref.get("annotation"))
+
+    # Handle resolution — only applies when explicit genome/annotation
+    # paths are absent. Explicit paths always win.
+    handle_str = ref.get("handle")
+    if handle_str and (reference_genome is None or reference_annotation is None):
+        cache_genome, cache_annotation = _resolve_handle(str(handle_str), path=path)
+        if reference_genome is None:
+            reference_genome = cache_genome
+        if reference_annotation is None:
+            reference_annotation = cache_annotation
 
     stages = raw.get("stages", {}) or {}
     s2_align = stages.get("s2_align", {}) or {}
@@ -312,6 +328,36 @@ def _load_session_toml(path: Path, *, root: Path, session_id: str) -> Session:
             samples=samples,
             extras=extras,
         )
+    )
+
+
+def _resolve_handle(handle_str: str, *, path: Path) -> tuple[Path | None, Path | None]:
+    """Resolve a session.toml [reference] handle to (genome_dir, annotation_dir).
+
+    Looks up the handle in the per-user reference cache via
+    :mod:`constellation.sequencing.reference.handle`. Missing cache
+    entries surface as a ``ValueError`` referencing the session.toml so
+    the user knows where to look.
+    """
+    # Lazy import: keeps the viz dashboard cheap-to-load when no session
+    # uses a handle. The handle module itself is stdlib-only.
+    from constellation.sequencing.reference.handle import (
+        ReferenceNotInstalledError,
+        resolve as resolve_handle,
+    )
+
+    try:
+        release_dir = resolve_handle(handle_str)
+    except (ValueError, ReferenceNotInstalledError) as exc:
+        raise ValueError(
+            f"session.toml at {path} references handle {handle_str!r}, "
+            f"but: {exc}"
+        ) from exc
+    genome_dir = release_dir / "genome"
+    annotation_dir = release_dir / "annotation"
+    return (
+        genome_dir if genome_dir.is_dir() else None,
+        annotation_dir if annotation_dir.is_dir() else None,
     )
 
 

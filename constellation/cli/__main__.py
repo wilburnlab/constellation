@@ -53,6 +53,9 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     # even when fastapi / uvicorn / datashader aren't installed.
     rows.extend(_doctor_frontend_rows())
 
+    # Reference cache row — single line summarising the per-user cache.
+    rows.append(_doctor_reference_cache_row())
+
     if not rows:
         print("no third-party tools or frontend bundles registered")
         return 0
@@ -113,6 +116,86 @@ def _doctor_frontend_rows() -> list[tuple[str, str, str, str]]:
                 )
             )
     return rows
+
+
+def _doctor_reference_cache_row() -> tuple[str, str, str, str]:
+    """Report on the per-user reference cache.
+
+    Status: ``ok`` if at least one installed reference parses; ``empty``
+    if the cache root exists but has no entries; ``warn`` if any entry
+    has issues (dangling current symlink, missing meta.toml, leftover
+    ``.partial/`` scratch dirs).
+    """
+    from constellation.sequencing.reference.handle import (
+        cache_root,
+        format_size,
+        list_installed,
+    )
+
+    root = cache_root()
+    name = "reference cache"
+    # An empty/missing cache is expected on a fresh install — report "ok"
+    # so doctor doesn't fail CI for users who haven't fetched anything yet.
+    if not root.is_dir():
+        return (name, "ok", "0 refs", f"(not yet populated: {root})")
+    entries = list_installed()
+    warnings = _cache_integrity_warnings(root)
+    total_size = sum((e.size_bytes or 0) for e in entries)
+    if not entries and not warnings:
+        return (name, "ok", "0 refs", f"(no installs under {root})")
+    if warnings:
+        # Surface a one-line warning; full detail visible via `reference list`.
+        first = warnings[0]
+        suffix = f" (+{len(warnings) - 1} more)" if len(warnings) > 1 else ""
+        return (
+            name,
+            "warn",
+            f"{len(entries)} refs",
+            f"{root} — {first}{suffix}",
+        )
+    return (
+        name,
+        "ok",
+        f"{len(entries)} refs",
+        f"{format_size(total_size)} at {root}",
+    )
+
+
+def _cache_integrity_warnings(root) -> list[str]:
+    """Walk the cache and collect human-readable warning lines."""
+    from constellation.sequencing.reference.handle import (
+        CURRENT_SYMLINK,
+        CURRENT_TEXTFILE,
+        META_FILENAME,
+    )
+
+    warnings: list[str] = []
+    for organism_dir in sorted(root.iterdir()):
+        if not organism_dir.is_dir():
+            continue
+        # Dangling current symlink?
+        sym = organism_dir / CURRENT_SYMLINK
+        if sym.is_symlink() and not sym.exists():
+            warnings.append(f"dangling current symlink: {sym}")
+        # current.txt without matching dir?
+        txt = organism_dir / CURRENT_TEXTFILE
+        if txt.exists():
+            target = (organism_dir / txt.read_text(encoding="utf-8").strip())
+            if not target.is_dir():
+                warnings.append(f"stale current.txt: {txt} → {target}")
+        for entry in organism_dir.iterdir():
+            name = entry.name
+            if name in (CURRENT_SYMLINK, CURRENT_TEXTFILE):
+                continue
+            if name.endswith(".partial"):
+                warnings.append(f"leftover partial fetch: {entry}")
+                continue
+            if name.endswith(".lock"):
+                continue
+            if entry.is_dir() and not entry.is_symlink():
+                if not (entry / META_FILENAME).exists():
+                    warnings.append(f"missing meta.toml: {entry}")
+    return warnings
 
 
 def _cmd_not_wired(name: str) -> Callable[[argparse.Namespace], int]:
@@ -938,13 +1021,18 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         )
     demux_manifest = json.loads(demux_manifest_path.read_text())
 
-    reference = Path(args.reference)
+    try:
+        resolved_ref, ref_source = _resolve_reference_argument(args.reference)
+    except Exception as exc:  # ValueError / ReferenceNotInstalledError
+        print(f"error: --reference {args.reference!r}: {exc}", file=sys.stderr)
+        return 1
+    reference = Path(resolved_ref)
     genome_dir = reference / "genome"
     annotation_dir = reference / "annotation"
     if not genome_dir.is_dir() or not annotation_dir.is_dir():
         raise FileNotFoundError(
             f"--reference must contain genome/ + annotation/ subdirs: "
-            f"{reference}"
+            f"{reference} (source: {ref_source})"
         )
 
     output_dir = Path(args.output_dir)
@@ -1400,11 +1488,19 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     # ── Genome (only when --build-consensus) ─────────────────────────
     genome = None
     if args.reference is not None:
-        reference = Path(args.reference)
+        try:
+            resolved_ref, ref_source = _resolve_reference_argument(args.reference)
+        except Exception as exc:  # ValueError / ReferenceNotInstalledError
+            print(
+                f"error: --reference {args.reference!r}: {exc}", file=sys.stderr
+            )
+            return 1
+        reference = Path(resolved_ref)
         genome_dir = reference / "genome"
         if not genome_dir.is_dir():
             raise FileNotFoundError(
-                f"--reference must contain genome/: {reference}"
+                f"--reference must contain genome/: {reference} "
+                f"(source: {ref_source})"
             )
         genome = load_genome_reference(genome_dir)
 
@@ -1726,13 +1822,20 @@ def _build_reference_parser(subs) -> None:
         import        local-files in (FASTA + optional GFF3) →
                       ParquetDir bundles
         fetch         <source>:<id> → download via stdlib HTTP →
-                      same ParquetDir bundles as ``import``
+                      cache (default) and/or --output-dir
+        list          print every (organism, release) installed in the cache
+        where         print absolute cache path for a handle
+        link          symlink a cached reference into an analysis directory
+        default       inspect or pin per-organism default handles
         summary       print contig/feature counts on a saved bundle
         validate      load + run ``.validate()`` + cross-check
     """
     p_ref = subs.add_parser(
         "reference",
-        help="Import / fetch / summarise / validate genome+annotation references",
+        help=(
+            "Import / fetch / summarise / validate genome+annotation references; "
+            "manage the per-user reference cache"
+        ),
     )
     ref_subs = p_ref.add_subparsers(dest="ref_subcommand", required=True)
 
@@ -1752,10 +1855,26 @@ def _build_reference_parser(subs) -> None:
     )
     p_imp.add_argument(
         "--output-dir",
-        required=True,
+        default=None,
         help=(
             "output directory; receives ``genome/`` and (when --gff3 is given) "
-            "``annotation/`` ParquetDir subdirectories"
+            "``annotation/`` ParquetDir subdirectories. Required unless --to-cache."
+        ),
+    )
+    p_imp.add_argument(
+        "--to-cache",
+        action="store_true",
+        help=(
+            "write into the per-user reference cache; requires --handle "
+            "<organism_slug>@local-<YYYYMMDD>"
+        ),
+    )
+    p_imp.add_argument(
+        "--handle",
+        default=None,
+        help=(
+            "handle for cache writes; required when --to-cache. Example: "
+            "'pichia_pastoris@local-20260516'"
         ),
     )
     p_imp.set_defaults(func=_cmd_reference_import)
@@ -1764,7 +1883,7 @@ def _build_reference_parser(subs) -> None:
         "fetch",
         help=(
             "Fetch a genome+GFF3 from Ensembl / Ensembl Genomes / RefSeq via "
-            "stdlib HTTP"
+            "stdlib HTTP; writes to the reference cache by default"
         ),
     )
     p_fetch.add_argument(
@@ -1776,8 +1895,39 @@ def _build_reference_parser(subs) -> None:
     )
     p_fetch.add_argument(
         "--output-dir",
-        required=True,
-        help="output directory for the resulting ParquetDir bundles",
+        default=None,
+        help=(
+            "optional additional destination; when set alongside the cache, "
+            "a second copy is written here. Combine with --no-cache to "
+            "preserve the legacy scratch-fetch behaviour."
+        ),
+    )
+    p_fetch.add_argument(
+        "--release",
+        type=int,
+        default=None,
+        help=(
+            "pin an Ensembl / Ensembl Genomes release number (e.g. 111). "
+            "RefSeq/GenBank accessions already pin their assembly version."
+        ),
+    )
+    p_fetch.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="skip the reference cache write; --output-dir then becomes mandatory",
+    )
+    p_fetch.add_argument(
+        "--no-verify-checksums",
+        action="store_true",
+        help=(
+            "skip source-published checksum verification (sha256 of the "
+            "downloaded bytes is still computed and recorded locally)"
+        ),
+    )
+    p_fetch.add_argument(
+        "--force",
+        action="store_true",
+        help="re-download even if the cache already has a complete copy",
     )
     p_fetch.add_argument(
         "--timeout",
@@ -1787,6 +1937,76 @@ def _build_reference_parser(subs) -> None:
     )
     p_fetch.set_defaults(func=_cmd_reference_fetch)
 
+    p_list = ref_subs.add_parser(
+        "list",
+        help="List every (organism, release) installed in the reference cache",
+    )
+    p_list.set_defaults(func=_cmd_reference_list)
+
+    p_where = ref_subs.add_parser(
+        "where",
+        help="Print absolute cache path for a handle (exit 1 if not installed)",
+    )
+    p_where.add_argument(
+        "handle",
+        help="handle to resolve, e.g. 'homo_sapiens@ensembl-111' or 'homo_sapiens'",
+    )
+    p_where.set_defaults(func=_cmd_reference_where)
+
+    p_link = ref_subs.add_parser(
+        "link",
+        help=(
+            "Create <analysis>/genome and <analysis>/annotation symlinks "
+            "pointing into the reference cache"
+        ),
+    )
+    p_link.add_argument("handle", help="handle to link (e.g. 'homo_sapiens')")
+    p_link.add_argument(
+        "--into",
+        required=True,
+        help="analysis directory to receive the symlinks",
+    )
+    p_link.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite existing genome/annotation entries in --into",
+    )
+    p_link.set_defaults(func=_cmd_reference_link)
+
+    p_def = ref_subs.add_parser(
+        "default",
+        help="Inspect or pin the per-organism default release used for shorthand handles",
+    )
+    p_def.add_argument(
+        "organism",
+        nargs="?",
+        default=None,
+        help=(
+            "organism slug; omit to print all pinned defaults. With an "
+            "argument: print the resolution for that organism."
+        ),
+    )
+    p_def.add_argument(
+        "release",
+        nargs="?",
+        default=None,
+        help=(
+            "release portion (e.g. 'ensembl-111') or full handle "
+            "(e.g. 'homo_sapiens@ensembl-111') to pin"
+        ),
+    )
+    p_def.add_argument(
+        "--unset",
+        action="store_true",
+        help="remove the pinned default for <organism>",
+    )
+    p_def.add_argument(
+        "--use-current",
+        action="store_true",
+        help="snapshot the current-symlink target as the new default",
+    )
+    p_def.set_defaults(func=_cmd_reference_default)
+
     p_sum = ref_subs.add_parser(
         "summary",
         help="Print contig + feature stats for a saved reference bundle",
@@ -1795,7 +2015,8 @@ def _build_reference_parser(subs) -> None:
         "ref_dir",
         help=(
             "directory containing ``genome/`` (and optionally ``annotation/``) "
-            "ParquetDir bundles, as written by ``import`` or ``fetch``"
+            "ParquetDir bundles, as written by ``import`` or ``fetch``. "
+            "Accepts a cache handle too (e.g. 'homo_sapiens@ensembl-111')."
         ),
     )
     p_sum.set_defaults(func=_cmd_reference_summary)
@@ -1804,24 +2025,66 @@ def _build_reference_parser(subs) -> None:
         "validate",
         help="Load + validate (PK/FK closure + cross-check) a reference bundle",
     )
-    p_val.add_argument("ref_dir")
+    p_val.add_argument(
+        "ref_dir",
+        help=(
+            "directory containing ``genome/`` + ``annotation/`` ParquetDir "
+            "bundles. Accepts a cache handle too."
+        ),
+    )
     p_val.set_defaults(func=_cmd_reference_validate)
+
+
+def _resolve_reference_argument(arg: str) -> "tuple[object, str]":
+    """Resolve a CLI ``ref_dir`` / ``--reference`` argument to a Path.
+
+    Accepts either an on-disk path (current behaviour) or a reference-cache
+    handle (e.g. ``'homo_sapiens@ensembl-111'`` or ``'homo_sapiens'``).
+    Returns ``(path, source)`` where ``source`` is ``"path"`` or
+    ``"handle"`` for error-message attribution.
+    """
+    from pathlib import Path
+
+    candidate = Path(arg).expanduser()
+    if candidate.exists() and candidate.is_dir():
+        return candidate, "path"
+    # Treat as handle. Lazy-import to keep base CLI startup cheap.
+    from constellation.sequencing.reference.handle import resolve as resolve_handle
+
+    return resolve_handle(arg), "handle"
 
 
 def _cmd_reference_import(args: argparse.Namespace) -> int:
     """Local FASTA (+ optional GFF3) → ParquetDir bundles."""
+    import sys
     from pathlib import Path
 
     from constellation.sequencing.annotation.io import save_annotation
     from constellation.sequencing.readers.fastx import read_fasta_genome
     from constellation.sequencing.readers.gff import read_gff3
+    from constellation.sequencing.reference.handle import (
+        cache_root,
+        parse_handle,
+        update_current_pointer,
+        write_meta_toml,
+    )
     from constellation.sequencing.reference.io import save_genome_reference
 
-    out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    if not args.to_cache and not args.output_dir:
+        print(
+            "error: reference import requires either --output-dir or --to-cache",
+            file=sys.stderr,
+        )
+        return 2
+    if args.to_cache and not args.handle:
+        print(
+            "error: --to-cache requires --handle "
+            "<organism_slug>@local-<YYYYMMDD>",
+            file=sys.stderr,
+        )
+        return 2
 
     genome = read_fasta_genome(args.fasta)
-    save_genome_reference(genome, out / "genome")
 
     if args.gff3:
         contig_name_to_id = {
@@ -1830,33 +2093,327 @@ def _cmd_reference_import(args: argparse.Namespace) -> int:
         }
         annotation = read_gff3(args.gff3, contig_name_to_id=contig_name_to_id)
         annotation.validate_against(genome)
-        save_annotation(annotation, out / "annotation")
-        print(
-            f"imported {genome.n_contigs} contigs ({genome.total_length} bp) + "
-            f"{annotation.n_features} features → {out}",
-            flush=True,
-        )
     else:
-        print(
-            f"imported {genome.n_contigs} contigs ({genome.total_length} bp) → {out}",
-            flush=True,
+        annotation = None
+
+    if args.output_dir:
+        out = Path(args.output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        save_genome_reference(genome, out / "genome")
+        if annotation is not None:
+            save_annotation(annotation, out / "annotation")
+
+    if args.to_cache:
+        handle = parse_handle(args.handle)
+        if not handle.is_qualified():
+            print(
+                f"error: --handle must be fully qualified "
+                f"(<organism>@local-<YYYYMMDD>); got {args.handle!r}",
+                file=sys.stderr,
+            )
+            return 2
+        if handle.source != "local_import":
+            # Permit "local-<date>" as syntactic sugar for the user; the
+            # handle-parser still validates it.
+            pass
+        release_dir = cache_root() / handle.organism / handle.release_slug()
+        if release_dir.exists():
+            print(
+                f"error: cache entry already exists: {release_dir}. "
+                f"Pass a different --handle date or delete the existing entry.",
+                file=sys.stderr,
+            )
+            return 1
+        release_dir.mkdir(parents=True)
+        save_genome_reference(genome, release_dir / "genome")
+        if annotation is not None:
+            save_annotation(annotation, release_dir / "annotation")
+        write_meta_toml(
+            release_dir,
+            handle=handle,
+            assembly_accession=None,
+            assembly_name=None,
+            annotation_release=None,
+            constellation_version=__import__("constellation").__version__,
+            urls={
+                "fasta": {"url": f"file://{Path(args.fasta).resolve()}"},
+                **(
+                    {"gff3": {"url": f"file://{Path(args.gff3).resolve()}"}}
+                    if args.gff3
+                    else {}
+                ),
+            },
+            sha256={},
+            source_checksum_verified=False,
         )
+        update_current_pointer(release_dir.parent, handle.release_slug())
+
+    n_features = annotation.n_features if annotation else 0
+    destinations: list[str] = []
+    if args.output_dir:
+        destinations.append(str(Path(args.output_dir)))
+    if args.to_cache:
+        destinations.append(f"cache:{args.handle}")
+    print(
+        f"imported {genome.n_contigs} contigs ({genome.total_length} bp) + "
+        f"{n_features} features → {', '.join(destinations)}",
+        flush=True,
+    )
     return 0
 
 
 def _cmd_reference_fetch(args: argparse.Namespace) -> int:
     """``<source>:<id>`` → ParquetDir bundles via stdlib HTTP."""
+    import sys
+
     from constellation.sequencing.reference.fetch import fetch_reference
 
-    result = fetch_reference(args.spec, args.output_dir, timeout=args.timeout)
+    if args.no_cache and not args.output_dir:
+        print(
+            "error: --no-cache requires --output-dir (no destination otherwise)",
+            file=sys.stderr,
+        )
+        return 2
+
+    result = fetch_reference(
+        args.spec,
+        output_dir=args.output_dir,
+        release=args.release,
+        timeout=args.timeout,
+        use_cache=not args.no_cache,
+        verify_source_checksums=not args.no_verify_checksums,
+        force=args.force,
+    )
     n_features = result.annotation.n_features if result.annotation else 0
+    destinations: list[str] = []
+    if result.cache_path is not None:
+        prefix = "cache (cached)" if result.skipped_cache else "cache"
+        destinations.append(f"{prefix}: {result.cache_path}")
+    if result.output_path is not None:
+        destinations.append(str(result.output_path))
     print(
         f"fetched {result.genome.n_contigs} contigs ({result.genome.total_length} bp) "
-        f"+ {n_features} features → {result.output_dir}",
+        f"+ {n_features} features → handle {result.handle} → "
+        f"{'; '.join(destinations)}",
         flush=True,
     )
-    print(f"  genome: {result.sources['genome']}")
-    print(f"  annotation: {result.sources['annotation']}")
+    if not result.skipped_cache:
+        print(f"  genome: {result.sources['genome']}")
+        print(f"  annotation: {result.sources['annotation']}")
+    return 0
+
+
+def _cmd_reference_list(_args: argparse.Namespace) -> int:
+    """Print every (organism, release) entry in the reference cache."""
+    from constellation.sequencing.reference.handle import (
+        cache_root,
+        format_size,
+        list_installed,
+        read_defaults,
+    )
+
+    entries = list_installed()
+    if not entries:
+        print(f"reference cache empty: {cache_root()}")
+        print("  run: constellation reference fetch <source>:<id>")
+        return 0
+    defaults = read_defaults()
+    rows: list[tuple[str, str, str, str, str, str]] = []
+    for entry in entries:
+        marker = "*" if entry.is_default(defaults) else " "
+        fetched = (entry.fetched_at or "")[:10]
+        size = format_size(entry.size_bytes or 0)
+        rows.append(
+            (
+                entry.handle,
+                marker,
+                entry.organism,
+                entry.release_slug,
+                fetched,
+                size,
+            )
+        )
+    headers = ("handle", "*", "organism", "release", "fetched", "size")
+    widths = [
+        max(len(h), max(len(r[i]) for r in rows)) for i, h in enumerate(headers)
+    ]
+
+    def _fmt(row: tuple[str, ...]) -> str:
+        return "  ".join(c.ljust(w) for c, w in zip(row, widths))
+
+    print(_fmt(headers))
+    print("  ".join("-" * w for w in widths))
+    for row in rows:
+        print(_fmt(row))
+    print(f"\ncache root: {cache_root()}")
+    return 0
+
+
+def _cmd_reference_where(args: argparse.Namespace) -> int:
+    """Print absolute cache path for a handle (exit 1 if not installed)."""
+    import sys
+
+    from constellation.sequencing.reference.handle import (
+        ReferenceNotInstalledError,
+        resolve,
+    )
+
+    try:
+        path = resolve(args.handle)
+    except (ValueError, ReferenceNotInstalledError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(path)
+    return 0
+
+
+def _cmd_reference_link(args: argparse.Namespace) -> int:
+    """Symlink a cached reference into an analysis directory."""
+    import os
+    import sys
+    from pathlib import Path
+
+    from constellation.sequencing.reference.handle import (
+        ReferenceNotInstalledError,
+        resolve,
+    )
+
+    try:
+        release_dir = resolve(args.handle)
+    except (ValueError, ReferenceNotInstalledError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    target_root = Path(args.into).expanduser().resolve()
+    target_root.mkdir(parents=True, exist_ok=True)
+    sources = [release_dir / "genome", release_dir / "annotation"]
+    for src in sources:
+        if not src.is_dir():
+            continue
+        dst = target_root / src.name
+        if dst.exists() or dst.is_symlink():
+            if not args.force:
+                print(
+                    f"error: {dst} already exists; pass --force to overwrite",
+                    file=sys.stderr,
+                )
+                return 1
+            if dst.is_symlink() or dst.is_file():
+                dst.unlink()
+            else:
+                import shutil as _shutil
+
+                _shutil.rmtree(dst)
+        try:
+            os.symlink(src, dst)
+        except OSError as exc:
+            # WSL/Windows fallback: write a session.toml stub instead of
+            # symlinks. Users edit the toml to drop in handles.
+            session_toml = target_root / "session.toml"
+            session_toml.write_text(
+                f"schema_version = 1\n\n[reference]\nhandle = \"{args.handle}\"\n",
+                encoding="utf-8",
+            )
+            print(
+                f"warning: symlink creation failed ({exc}); wrote "
+                f"{session_toml} as a fallback. The viz Session.from_root "
+                f"resolves handles via session.toml the same way.",
+                file=sys.stderr,
+            )
+            return 0
+    print(f"linked {args.handle} → {target_root}")
+    return 0
+
+
+def _cmd_reference_default(args: argparse.Namespace) -> int:
+    """Inspect or pin per-organism default handles."""
+    import sys
+
+    from constellation.sequencing.reference.handle import (
+        ReferenceNotInstalledError,
+        list_installed,
+        parse_release_slug,
+        read_defaults,
+        resolve,
+        set_default,
+        unset_default,
+        _read_current,
+        cache_root,
+    )
+
+    if args.organism is None:
+        defaults = read_defaults()
+        if not defaults:
+            print("no defaults pinned. Use: constellation reference default <organism> <release>")
+            return 0
+        widths = (
+            max(len(o) for o in defaults),
+            max(len(v) for v in defaults.values()),
+        )
+        for organism in sorted(defaults):
+            print(f"{organism.ljust(widths[0])}  {defaults[organism]}")
+        return 0
+
+    organism = args.organism
+
+    if args.unset:
+        removed = unset_default(organism)
+        if removed:
+            print(f"unset default for {organism}")
+            return 0
+        print(f"no default to unset for {organism}", file=sys.stderr)
+        return 1
+
+    if args.use_current:
+        organism_dir = cache_root() / organism
+        current = _read_current(organism_dir)
+        if current is None:
+            print(f"error: no current pointer for {organism}", file=sys.stderr)
+            return 1
+        release_slug = current.name
+        set_default(organism, release_slug)
+        print(f"pinned default for {organism}: {release_slug}")
+        return 0
+
+    if args.release is None:
+        # Inspection: print where bare `<organism>` resolves and why.
+        defaults = read_defaults()
+        pinned = defaults.get(organism)
+        try:
+            resolved = resolve(organism)
+        except (ValueError, ReferenceNotInstalledError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        installed = [
+            e.release_slug for e in list_installed() if e.organism == organism
+        ]
+        if pinned:
+            reason = f"pinned in defaults.toml ({pinned})"
+        elif (cache_root() / organism / "current").exists() or (
+            cache_root() / organism / "current.txt"
+        ).exists():
+            reason = "current pointer"
+        elif len(installed) == 1:
+            reason = "single install"
+        else:
+            reason = "(ambiguous)"
+        print(f"{organism} → {resolved.name}  [{reason}]")
+        return 0
+
+    # Pin a default.
+    try:
+        handle = parse_release_slug(args.release, organism=organism)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    # Verify the cache slot actually exists before pinning.
+    try:
+        resolve(handle)
+    except ReferenceNotInstalledError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    set_default(organism, handle.release_slug())
+    print(f"pinned default for {organism}: {handle.release_slug()}")
     return 0
 
 
@@ -1868,7 +2425,8 @@ def _cmd_reference_summary(args: argparse.Namespace) -> int:
     from constellation.sequencing.annotation.io import load_annotation
     from constellation.sequencing.reference.io import load_genome_reference
 
-    root = Path(args.ref_dir)
+    root, _ = _resolve_reference_argument(args.ref_dir)
+    root = Path(root)
     genome_dir = root / "genome" if (root / "genome").is_dir() else root
     genome = load_genome_reference(genome_dir)
     print(
@@ -1899,7 +2457,8 @@ def _cmd_reference_validate(args: argparse.Namespace) -> int:
     from constellation.sequencing.annotation.io import load_annotation
     from constellation.sequencing.reference.io import load_genome_reference
 
-    root = Path(args.ref_dir)
+    root, _ = _resolve_reference_argument(args.ref_dir)
+    root = Path(root)
     genome_dir = root / "genome" if (root / "genome").is_dir() else root
     genome = load_genome_reference(genome_dir)
     print(f"  genome: {genome.n_contigs} contigs ok")
