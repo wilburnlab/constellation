@@ -77,7 +77,7 @@ def stub_network(monkeypatch):
         "download_calls": [],
     }
 
-    def _fake_resolve_spec(spec, *, release=None):
+    def _fake_resolve_spec(spec, *, release=None, source=None):
         h = parse_handle(state["spec_handle"])
         return _ResolvedSpec(
             handle=h,

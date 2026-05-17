@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from typing import Callable
 
 # Import adapter modules for their side-effect of registering ToolSpecs.
@@ -55,6 +56,10 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 
     # Reference cache row — single line summarising the per-user cache.
     rows.append(_doctor_reference_cache_row())
+
+    # Taxonomy + catalog rows — surface bundled vs fetched + per-source counts.
+    rows.append(_doctor_taxonomy_row())
+    rows.append(_doctor_catalogs_row())
 
     if not rows:
         print("no third-party tools or frontend bundles registered")
@@ -161,6 +166,63 @@ def _doctor_reference_cache_row() -> tuple[str, str, str, str]:
     )
 
 
+def _doctor_taxonomy_row() -> tuple[str, str, str, str]:
+    """Single-line summary of the active taxonomy source + count."""
+    name = "taxonomy"
+    try:
+        from constellation.core.taxonomy import (
+            TaxonomyResolver,
+            resolve_current,
+            taxonomy_root,
+        )
+    except Exception as exc:  # pragma: no cover — import error path
+        return (name, "warn", "—", f"import error: {exc}")
+
+    root = taxonomy_root()
+    try:
+        r = TaxonomyResolver.auto()
+    except Exception as exc:  # pragma: no cover — corrupt bundle
+        return (name, "warn", "—", f"resolver init failed: {exc}")
+
+    source = str(r.source_meta().get("source", "?"))
+    n_taxa = r.n_taxa()
+    if source.startswith("constellation-v1"):
+        suffix = f"bundled starter ({root} empty — run `taxonomy update`)"
+    else:
+        current = resolve_current(root)
+        suffix = f"{source} at {current or root}"
+    return (name, "ok", f"{n_taxa} taxa", suffix)
+
+
+def _doctor_catalogs_row() -> tuple[str, str, str, str]:
+    """Single-line summary of installed assembly catalogs."""
+    name = "catalogs"
+    try:
+        from constellation.catalog import catalogs_root, list_installed
+    except Exception as exc:  # pragma: no cover
+        return (name, "warn", "—", f"import error: {exc}")
+
+    root = catalogs_root()
+    if not root.exists():
+        return (
+            name,
+            "ok",
+            "0 sources",
+            f"(not yet populated: {root})",
+        )
+    bundles = list_installed(root=root)
+    if not bundles:
+        return (name, "ok", "0 sources", f"(empty: {root})")
+    total = sum(b.table.num_rows for b in bundles)
+    by_src = sorted({b.source for b in bundles})
+    return (
+        name,
+        "ok",
+        f"{len(bundles)} bundles",
+        f"{', '.join(by_src)} — {total} rows at {root}",
+    )
+
+
 def _cache_integrity_warnings(root) -> list[str]:
     """Walk the cache and collect human-readable warning lines."""
     from constellation.sequencing.reference.handle import (
@@ -222,6 +284,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # Reference imports / fetch / summary / validate.
     _build_reference_parser(subs)
+
+    # Taxonomy + catalog management.
+    _build_taxonomy_parser(subs)
+    _build_catalog_parser(subs)
 
     # Visualization subtree — `constellation viz genome --session DIR`.
     # The full `[viz]` extras (fastapi / uvicorn / datashader) are
@@ -1815,6 +1881,162 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_taxonomy_parser(subs) -> None:
+    """Wire ``constellation taxonomy ...`` — name lookup + tree queries.
+
+    Verbs:
+        resolve <query>       exact lookup; prints taxid + scientific name + rank
+        search <substring>    case-insensitive substring search across names
+        lineage <query>       root → taxon lineage
+        descendants <query>   all descendants (optionally filter by rank)
+        update                fetch NCBI taxdump.tar.gz → refold to parquet
+        where                 print active taxonomy source + counts
+    """
+    p_tax = subs.add_parser(
+        "taxonomy",
+        help=(
+            "Name / taxid lookup over NCBI taxonomy; manage the lazy-fetched "
+            "full taxonomy cache (bundled starter ships with the package)"
+        ),
+    )
+    tax_subs = p_tax.add_subparsers(dest="tax_subcommand", required=True)
+
+    p_resolve = tax_subs.add_parser(
+        "resolve",
+        help="Exact lookup of a species name or taxid",
+    )
+    p_resolve.add_argument(
+        "query", help="scientific / common name, or integer taxid"
+    )
+    p_resolve.add_argument("--json", action="store_true")
+    p_resolve.set_defaults(func=_cmd_taxonomy_resolve)
+
+    p_search = tax_subs.add_parser(
+        "search",
+        help="Substring search across scientific + common + synonym names",
+    )
+    p_search.add_argument("query", help="substring to match (case-insensitive)")
+    p_search.add_argument("--limit", type=int, default=25)
+    p_search.add_argument(
+        "--rank",
+        default=None,
+        help="restrict to taxa at a given rank (species / genus / family / ...)",
+    )
+    p_search.add_argument("--json", action="store_true")
+    p_search.set_defaults(func=_cmd_taxonomy_search)
+
+    p_lineage = tax_subs.add_parser(
+        "lineage",
+        help="Print the root → taxon lineage (one rank per line)",
+    )
+    p_lineage.add_argument("query", help="scientific / common name, or integer taxid")
+    p_lineage.add_argument(
+        "--ranks-only",
+        action="store_true",
+        help="emit only rank + name (drop taxid + division)",
+    )
+    p_lineage.add_argument("--json", action="store_true")
+    p_lineage.set_defaults(func=_cmd_taxonomy_lineage)
+
+    p_desc = tax_subs.add_parser(
+        "descendants",
+        help="Print every descendant taxon below a node",
+    )
+    p_desc.add_argument("query", help="scientific / common name, or integer taxid")
+    p_desc.add_argument(
+        "--rank",
+        default=None,
+        help="restrict to descendants at a given rank",
+    )
+    p_desc.add_argument(
+        "--max-depth",
+        type=int,
+        default=None,
+        help="cap depth below the queried node (1 → direct children only)",
+    )
+    p_desc.add_argument("--json", action="store_true")
+    p_desc.set_defaults(func=_cmd_taxonomy_descendants)
+
+    p_update = tax_subs.add_parser(
+        "update",
+        help="Fetch the latest NCBI taxdump.tar.gz and refold to local parquet",
+    )
+    p_update.add_argument(
+        "--force", action="store_true", help="re-fetch even if already installed today"
+    )
+    p_update.add_argument(
+        "--timeout", type=int, default=900, help="HTTP timeout in seconds"
+    )
+    p_update.set_defaults(func=_cmd_taxonomy_update)
+
+    p_where = tax_subs.add_parser(
+        "where",
+        help="Print active taxonomy source + taxon counts",
+    )
+    p_where.set_defaults(func=_cmd_taxonomy_where)
+
+
+def _build_catalog_parser(subs) -> None:
+    """Wire ``constellation catalog ...`` — assembly / proteome catalog management.
+
+    Verbs:
+        update <source>   fetch the source's species/assembly index
+        list              one line per installed (source, release)
+        show <source> <query>  print every catalog row matching <query>
+    """
+    p_cat = subs.add_parser(
+        "catalog",
+        help=(
+            "Fetch + browse genome / proteome catalogs from Ensembl / Ensembl "
+            "Genomes / RefSeq / UniProt"
+        ),
+    )
+    cat_subs = p_cat.add_subparsers(dest="cat_subcommand", required=True)
+
+    p_update = cat_subs.add_parser(
+        "update",
+        help="Fetch the source's species/assembly index into the local catalog cache",
+    )
+    p_update.add_argument(
+        "source",
+        choices=["ensembl", "ensembl_genomes", "refseq", "uniprot", "all"],
+    )
+    p_update.add_argument(
+        "--release",
+        default=None,
+        help=(
+            "Ensembl / Ensembl Genomes release number, or a UniProt release "
+            "tag (e.g. '2024_02'). Required for Ensembl; defaults to today "
+            "for RefSeq."
+        ),
+    )
+    p_update.add_argument(
+        "--force",
+        action="store_true",
+        help="re-fetch even if the requested release is already installed",
+    )
+    p_update.add_argument(
+        "--timeout", type=int, default=900, help="HTTP timeout in seconds"
+    )
+    p_update.set_defaults(func=_cmd_catalog_update)
+
+    p_list = cat_subs.add_parser(
+        "list",
+        help="List every installed catalog (one line per source/release)",
+    )
+    p_list.set_defaults(func=_cmd_catalog_list)
+
+    p_show = cat_subs.add_parser(
+        "show",
+        help="Print every catalog row matching a species name or taxid",
+    )
+    p_show.add_argument("source", help="source to search (or 'all')")
+    p_show.add_argument("query", help="species name, taxid, or substring")
+    p_show.add_argument("--limit", type=int, default=25)
+    p_show.add_argument("--json", action="store_true")
+    p_show.set_defaults(func=_cmd_catalog_show)
+
+
 def _build_reference_parser(subs) -> None:
     """Wire the ``constellation reference ...`` sub-tree.
 
@@ -1890,7 +2112,19 @@ def _build_reference_parser(subs) -> None:
         "spec",
         help=(
             "<source>:<id> — e.g. 'ensembl_genomes:saccharomyces_cerevisiae', "
-            "'refseq:GCF_001708105.1', 'ensembl:human'"
+            "'refseq:GCF_001708105.1', 'ensembl:human'. Also accepts a bare "
+            "species name (e.g. 'Haliotis rufescens', 'red abalone') or an "
+            "integer taxid (e.g. '9606'), routed through the taxonomy + "
+            "catalog layer."
+        ),
+    )
+    p_fetch.add_argument(
+        "--source",
+        choices=["refseq", "ensembl", "ensembl_genomes", "genbank", "uniprot"],
+        default=None,
+        help=(
+            "pin the catalog source when resolving a bare species name / "
+            "taxid (default: RefSeq-first precedence)"
         ),
     )
     p_fetch.add_argument(
@@ -1936,6 +2170,39 @@ def _build_reference_parser(subs) -> None:
         help="HTTP timeout in seconds (default 600)",
     )
     p_fetch.set_defaults(func=_cmd_reference_fetch)
+
+    p_search = ref_subs.add_parser(
+        "search",
+        help=(
+            "Search installed catalogs (Ensembl / RefSeq / UniProt / ...) "
+            "for assemblies matching a species name or taxid"
+        ),
+    )
+    p_search.add_argument(
+        "query",
+        help=(
+            "species name (scientific / common / vernacular) or substring; "
+            "or an integer taxid"
+        ),
+    )
+    p_search.add_argument(
+        "--source",
+        choices=["refseq", "ensembl", "ensembl_genomes", "genbank", "uniprot"],
+        default=None,
+        help="restrict to a single catalog source",
+    )
+    p_search.add_argument(
+        "--limit",
+        type=int,
+        default=25,
+        help="maximum rows to print (default 25)",
+    )
+    p_search.add_argument(
+        "--json",
+        action="store_true",
+        help="emit JSON lines instead of the human-readable table",
+    )
+    p_search.set_defaults(func=_cmd_reference_search)
 
     p_list = ref_subs.add_parser(
         "list",
@@ -2179,6 +2446,7 @@ def _cmd_reference_fetch(args: argparse.Namespace) -> int:
         args.spec,
         output_dir=args.output_dir,
         release=args.release,
+        source=args.source,
         timeout=args.timeout,
         use_cache=not args.no_cache,
         verify_source_checksums=not args.no_verify_checksums,
@@ -2200,6 +2468,355 @@ def _cmd_reference_fetch(args: argparse.Namespace) -> int:
     if not result.skipped_cache:
         print(f"  genome: {result.sources['genome']}")
         print(f"  annotation: {result.sources['annotation']}")
+    return 0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Taxonomy command handlers
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _cmd_taxonomy_resolve(args: argparse.Namespace) -> int:
+    import json
+    import sys
+
+    from constellation.core.taxonomy import TaxonomyResolver
+
+    node = TaxonomyResolver.auto().lookup(args.query)
+    if node is None:
+        print(f"no taxon matches {args.query!r}", file=sys.stderr)
+        return 1
+    if args.json:
+        import dataclasses
+
+        print(json.dumps(dataclasses.asdict(node)))
+        return 0
+    print(
+        f"taxid={node.taxid}  rank={node.rank}  name={node.scientific_name}  "
+        f"parent_taxid={node.parent_taxid}  division={node.division}"
+    )
+    return 0
+
+
+def _cmd_taxonomy_search(args: argparse.Namespace) -> int:
+    import json
+    import sys
+
+    from constellation.core.taxonomy import TaxonomyResolver
+
+    hits = TaxonomyResolver.auto().search(
+        args.query, limit=args.limit, rank=args.rank
+    )
+    if not hits:
+        print(f"no matches for {args.query!r}", file=sys.stderr)
+        return 1
+    if args.json:
+        import dataclasses
+
+        for node, matched in hits:
+            print(
+                json.dumps(
+                    {"matched_name": matched, **dataclasses.asdict(node)}
+                )
+            )
+        return 0
+    print(f"{'taxid':>8}  {'rank':<14}  matched_name")
+    for node, matched in hits:
+        print(
+            f"{node.taxid:>8}  {node.rank:<14}  {matched}  → {node.scientific_name}"
+        )
+    return 0
+
+
+def _cmd_taxonomy_lineage(args: argparse.Namespace) -> int:
+    import json
+    import sys
+
+    from constellation.core.taxonomy import TaxonomyResolver, UnknownTaxonError
+
+    r = TaxonomyResolver.auto()
+    try:
+        node = r.lookup_strict(args.query)
+    except UnknownTaxonError:
+        print(f"no taxon matches {args.query!r}", file=sys.stderr)
+        return 1
+    lineage = r.lineage(node.taxid)
+    if args.json:
+        import dataclasses
+
+        print(json.dumps([dataclasses.asdict(n) for n in lineage]))
+        return 0
+    if args.ranks_only:
+        for n in lineage:
+            print(f"{n.rank:<14}  {n.scientific_name}")
+    else:
+        for n in lineage:
+            print(
+                f"{n.rank:<14}  {n.scientific_name:<40}  taxid={n.taxid}"
+            )
+    return 0
+
+
+def _cmd_taxonomy_descendants(args: argparse.Namespace) -> int:
+    import json
+    import sys
+
+    from constellation.core.taxonomy import TaxonomyResolver, UnknownTaxonError
+
+    r = TaxonomyResolver.auto()
+    try:
+        node = r.lookup_strict(args.query)
+    except UnknownTaxonError:
+        print(f"no taxon matches {args.query!r}", file=sys.stderr)
+        return 1
+    desc = r.descendants(node.taxid, rank=args.rank, max_depth=args.max_depth)
+    if not desc:
+        print(f"no descendants for {args.query!r}", file=sys.stderr)
+        return 0
+    if args.json:
+        import dataclasses
+
+        for d in desc:
+            print(json.dumps(dataclasses.asdict(d)))
+        return 0
+    print(f"# {len(desc)} descendant(s) of {node.scientific_name} (taxid {node.taxid})")
+    for d in desc:
+        print(f"{d.taxid:>8}  {d.rank:<14}  {d.scientific_name}")
+    return 0
+
+
+def _cmd_taxonomy_update(args: argparse.Namespace) -> int:
+    import sys
+
+    from constellation.core.taxonomy import fetch_taxdump
+
+    print("fetching NCBI taxdump.tar.gz (this may take a minute)...", file=sys.stderr)
+
+    def _progress(seen: int, total: int) -> None:
+        pct = (seen / total) * 100 if total else 0
+        sys.stderr.write(
+            f"\r  downloaded {seen / (1 << 20):.1f} / {total / (1 << 20):.1f} "
+            f"MiB ({pct:.0f}%)"
+        )
+        sys.stderr.flush()
+
+    bundle_dir = fetch_taxdump(timeout=args.timeout, progress_cb=_progress)
+    sys.stderr.write("\n")
+    print(f"installed taxonomy bundle at {bundle_dir}")
+    return 0
+
+
+def _cmd_taxonomy_where(_args: argparse.Namespace) -> int:
+    from constellation.core.taxonomy import (
+        TaxonomyResolver,
+        list_installed,
+        resolve_current,
+        taxonomy_root,
+    )
+
+    root = taxonomy_root()
+    print(f"taxonomy_root: {root}")
+    current = resolve_current(root)
+    if current is not None:
+        print(f"current:       {current}")
+    installed = list_installed(root)
+    if installed:
+        print("installed:")
+        for p in installed:
+            print(f"  {p.name}")
+    else:
+        print("installed:     (none — using bundled starter)")
+    r = TaxonomyResolver.auto()
+    src = r.source_meta().get("source", "?")
+    print(f"active source: {src}  ({r.n_taxa()} taxa)")
+    return 0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Catalog command handlers
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _cmd_catalog_update(args: argparse.Namespace) -> int:
+    import sys
+    from datetime import datetime, timezone
+
+    from constellation.catalog import (
+        ensembl,
+        ensembl_genomes,
+        refseq,
+        release_dir,
+        uniprot,
+        write_catalog,
+    )
+
+    src = args.source
+
+    def _fetch_one(source_name: str) -> int:
+        if source_name == "ensembl":
+            if args.release is None:
+                print(
+                    "error: --release required for ensembl (e.g. --release 111)",
+                    file=sys.stderr,
+                )
+                return 2
+            table, meta = ensembl.fetch_catalog(int(args.release), timeout=args.timeout)
+            rel = str(args.release)
+        elif source_name == "ensembl_genomes":
+            if args.release is None:
+                print(
+                    "error: --release required for ensembl_genomes (e.g. --release 57)",
+                    file=sys.stderr,
+                )
+                return 2
+            table, meta = ensembl_genomes.fetch_catalog(
+                int(args.release), timeout=args.timeout
+            )
+            rel = str(args.release)
+        elif source_name == "refseq":
+            rel = args.release or datetime.now(timezone.utc).strftime("%Y%m%d")
+            table, meta = refseq.fetch_catalog(release_tag=rel, timeout=args.timeout)
+        elif source_name == "uniprot":
+            rel = args.release or datetime.now(timezone.utc).strftime("%Y%m%d")
+            table, meta = uniprot.fetch_catalog(release=rel, timeout=args.timeout)
+        else:
+            raise ValueError(f"unknown source {source_name!r}")
+        bundle = release_dir(source_name, rel)
+        if bundle.exists() and not args.force:
+            print(
+                f"  {source_name}/{rel} already installed (pass --force to refresh)"
+            )
+            return 0
+        write_catalog(bundle, table=table, meta=meta)
+        print(f"  {source_name}/{rel}: wrote {table.num_rows} rows to {bundle}")
+        return 0
+
+    if src == "all":
+        rc = 0
+        for s in ("ensembl", "ensembl_genomes", "refseq", "uniprot"):
+            print(f"updating {s}...", file=sys.stderr)
+            sub_rc = _fetch_one(s)
+            if sub_rc != 0:
+                rc = sub_rc
+        return rc
+    return _fetch_one(src)
+
+
+def _cmd_catalog_list(_args: argparse.Namespace) -> int:
+    from constellation.catalog import catalogs_root, list_installed
+
+    root = catalogs_root()
+    print(f"catalogs_root: {root}")
+    bundles = list_installed(root=root)
+    if not bundles:
+        print("installed:     (none — run `constellation catalog update <source>`)")
+        return 0
+    print("installed:")
+    for b in bundles:
+        n = b.table.num_rows
+        print(f"  {b.source:<16}  release={b.release:<16}  n_rows={n}")
+    return 0
+
+
+def _cmd_catalog_show(args: argparse.Namespace) -> int:
+    import json
+    import sys
+
+    from constellation.catalog import CatalogResolver
+    from constellation.core.taxonomy import TaxonomyResolver
+
+    catalogs = CatalogResolver.from_cache()
+    if catalogs.is_empty():
+        print("no catalogs installed", file=sys.stderr)
+        return 2
+    src = None if args.source == "all" else args.source
+
+    node = TaxonomyResolver.auto().lookup(args.query)
+    if node is not None:
+        rows = catalogs.all_for(node.taxid, source=src)
+    else:
+        rows = catalogs.search(args.query, source=src, limit=args.limit)
+    rows = rows[: args.limit]
+    if not rows:
+        print(f"no catalog hits for {args.query!r}", file=sys.stderr)
+        return 1
+    if args.json:
+        import dataclasses
+
+        for r in rows:
+            print(json.dumps(dataclasses.asdict(r)))
+        return 0
+    for r in rows:
+        print(
+            f"[{r.source}/{r.release}] taxid={r.taxid} "
+            f"{r.species_name} ({r.assembly_accession or r.assembly_name or '-'})"
+        )
+        print(f"    fasta:   {r.fasta_url}")
+        if r.gff_url:
+            print(f"    gff:     {r.gff_url}")
+        if r.protein_url:
+            print(f"    protein: {r.protein_url}")
+        if r.cdna_url:
+            print(f"    cdna:    {r.cdna_url}")
+        print()
+    return 0
+
+
+def _cmd_reference_search(args: argparse.Namespace) -> int:
+    """Search installed catalogs by species name / taxid / substring."""
+    import json
+    import sys
+
+    from constellation.catalog import CatalogResolver
+    from constellation.core.taxonomy import TaxonomyResolver
+
+    catalogs = CatalogResolver.from_cache()
+    if catalogs.is_empty():
+        print(
+            "no catalogs installed — run `constellation catalog update refseq` "
+            "(and/or ensembl / ensembl_genomes / uniprot)",
+            file=sys.stderr,
+        )
+        return 2
+
+    query = args.query.strip()
+    # Try taxonomy first; if it resolves, list every catalog hit for that taxid.
+    rows = []
+    tax = TaxonomyResolver.auto()
+    node = tax.lookup(query)
+    if node is not None:
+        rows = catalogs.all_for(node.taxid, source=args.source)
+        if rows:
+            print(
+                f"# resolved {query!r} -> taxid {node.taxid} "
+                f"({node.scientific_name})",
+                file=sys.stderr,
+            )
+    if not rows:
+        rows = catalogs.search(query, source=args.source, limit=args.limit)
+    rows = rows[: args.limit]
+    if not rows:
+        print(f"no catalog hits for {query!r}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        import dataclasses
+
+        for r in rows:
+            print(json.dumps(dataclasses.asdict(r)))
+        return 0
+
+    # Human-readable table.
+    print(
+        f"{'source':<16}  {'taxid':>8}  {'release':<24}  {'assembly':<28}  "
+        f"species_name"
+    )
+    for r in rows:
+        print(
+            f"{r.source:<16}  {(r.taxid or 0):>8}  {r.release[:24]:<24}  "
+            f"{(r.assembly_accession or r.assembly_name or '-')[:28]:<28}  "
+            f"{r.species_name}"
+        )
     return 0
 
 
