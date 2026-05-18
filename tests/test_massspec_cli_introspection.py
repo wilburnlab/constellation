@@ -181,6 +181,44 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
              "--output-dir", "/tmp/x"],
         ),
         (
+            "library-export",
+            ["--search-dir", "/tmp/sr", "--library", "x.dlib",
+             "--output-elib", "x.elib", "--output-dir", "/tmp/x"],
+        ),
+    ],
+)
+def test_stub_handlers_return_exit_2(
+    subcommand: str, minimal_args: list[str], capsys: pytest.CaptureFixture
+) -> None:
+    """Subcommands whose runner isn't wired yet print a helpful error +
+    return exit code 2. predict-library and process-dia are excluded —
+    both are wired."""
+    parser = _build_massspec_only_parser()
+    args = parser.parse_args(["massspec", subcommand, *minimal_args])
+    rc = args.func(args)
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert subcommand in captured.err
+    assert "not yet implemented" in captured.err
+
+
+# ── --jvm-heap suffix validation ──────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "subcommand,minimal_args",
+    [
+        (
+            "predict-library",
+            ["--fasta", "x.fa", "--output-dlib", "x.dlib",
+             "--output-dir", "/tmp/x"],
+        ),
+        (
+            "search",
+            ["--mzml", "x.mzML", "--library", "x.elib", "--fasta", "x.fa",
+             "--output-dir", "/tmp/x"],
+        ),
+        (
             "process-dia",
             ["--inputs", "a.mzML", "--output-dia", "x.dia",
              "--output-dir", "/tmp/x"],
@@ -192,18 +230,41 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
         ),
     ],
 )
-def test_stub_handlers_return_exit_2(
-    subcommand: str, minimal_args: list[str], capsys: pytest.CaptureFixture
+def test_jvm_heap_bare_number_rejected(
+    subcommand: str,
+    minimal_args: list[str],
+    capsys: pytest.CaptureFixture,
 ) -> None:
-    """Subcommands whose runner isn't wired yet print a helpful error +
-    return exit code 2. predict-library is excluded — it's wired."""
+    """``--jvm-heap 24`` (no suffix) used to be accepted and crash the
+    JVM with the cryptic 'Too small maximum heap' message — the bare
+    number was interpreted as 24 BYTES. The parser now rejects it at
+    parse time with a clear error pointing at the missing unit
+    suffix."""
     parser = _build_massspec_only_parser()
-    args = parser.parse_args(["massspec", subcommand, *minimal_args])
-    rc = args.func(args)
-    assert rc == 2
-    captured = capsys.readouterr()
-    assert subcommand in captured.err
-    assert "not yet implemented" in captured.err
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["massspec", subcommand, *minimal_args, "--jvm-heap", "24"]
+        )
+    err = capsys.readouterr().err
+    assert "invalid JVM heap value" in err or "must be" in err
+
+
+@pytest.mark.parametrize(
+    "valid_value",
+    ["24g", "8g", "2048m", "512m", "1024k", "1G", "2M"],
+)
+def test_jvm_heap_valid_suffixes_accepted(valid_value: str) -> None:
+    parser = _build_massspec_only_parser()
+    parsed = parser.parse_args(
+        [
+            "massspec", "predict-library",
+            "--fasta", "x.fa",
+            "--output-dlib", "x.dlib",
+            "--output-dir", "/tmp/x",
+            "--jvm-heap", valid_value,
+        ]
+    )
+    assert parsed.jvm_heap_max == valid_value
 
 
 # ── helpers ────────────────────────────────────────────────────────────

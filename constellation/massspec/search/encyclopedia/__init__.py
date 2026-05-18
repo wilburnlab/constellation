@@ -55,6 +55,7 @@ from constellation.massspec.search.encyclopedia.predict_library import (
     run_predict_library,
 )
 from constellation.massspec.search.encyclopedia.process_dia import (
+    build_process_dia_args,
     run_process_dia,
 )
 
@@ -63,6 +64,7 @@ __all__ = [
     "SUPPORTED_VERSIONS",
     "build_manifest_envelope",
     "build_predict_library_args",
+    "build_process_dia_args",
     "default_heap_for_input",
     "encyclopedia_passthrough_args",
     "ptm_toggle_args",

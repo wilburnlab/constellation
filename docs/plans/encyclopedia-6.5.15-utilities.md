@@ -127,7 +127,21 @@ Diff vs 2.12.30:
 
 ### `-convert -processDIA`
 
-*Pending PR 3.*
+Invocation: `java -jar encyclopedia-6.5.15.jar -convert -processDIA <flags>`
+
+Verified from `java -jar encyclopedia-6.5.15.jar -convert -processDIA -h` on 6.5.15.
+
+| Flag | Type | Required | Default (6.5.15) | Notes |
+|---|---|---|---|---|
+| `-i` | path(s) | yes | — | input `.mzML`, `.raw`, `.d`, or `.DIA` files; merge multiple by deliminating with `:` |
+| `-o` | path | yes (merge mode) | — | output merged `.DIA` file (only used when merging multiple inputs) |
+
+Single-input mode preprocesses one acquisition into its `.DIA` cache (the cache lands next to the input). Multi-input mode merges N acquisitions into one consolidated `.DIA` (`-o`) — this is the gas-phase-fractionation workflow: one `.raw` per GPF fraction → one merged `.DIA` covering the full m/z range.
+
+Window-metadata preservation: per-MS2 isolation-window info (target m/z + lower/upper offsets) is read from the input via MSRawJava for vendor formats or directly from mzML and propagated to the `.DIA` cache. Overlapping / staggered DIA window schemes are preserved intact; demultiplexing happens at the search stage, not the preprocess stage.
+
+Diff vs 2.12.30:
+- **Added**: direct vendor-raw support (`.raw`, `.d`) via the bundled MSRawJava. The v2.12.30 path required msconvert (ProteoWizard) to produce mzML first.
 
 ### `-libexport`
 

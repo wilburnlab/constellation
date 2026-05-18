@@ -335,6 +335,11 @@ def _build_process_dia_parser(subs: argparse._SubParsersAction) -> None:
         help="output merged .dia path (used in merge mode)",
     )
     _add_output_dir_arg(p)
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip the jar invocation if <output-dir>/_SUCCESS exists",
+    )
     _add_jvm_args(p)
     _add_encyclopedia_passthrough_arg(p)
     p.add_argument(
@@ -424,17 +429,40 @@ def _add_output_dir_arg(p: argparse.ArgumentParser) -> None:
     )
 
 
+_JVM_HEAP_RE = re.compile(r"^\d+[kKmMgGtT]$")
+
+
+def _jvm_heap_value(raw: str) -> str:
+    """argparse type validator for ``--jvm-heap`` / ``--jvm-heap-min``.
+
+    The JVM wants ``<integer><unit>`` (e.g. ``24g``, ``2048m``). A bare
+    integer like ``24`` parses as 24 BYTES and crashes with the
+    cryptic ``Too small maximum heap``. Reject up front with a clear
+    message.
+    """
+    if not _JVM_HEAP_RE.match(raw):
+        raise argparse.ArgumentTypeError(
+            f"invalid JVM heap value {raw!r}: must be <integer><unit>, "
+            f"e.g. '24g' (24 gigabytes), '2048m' (2048 megabytes). "
+            f"A bare number is interpreted as bytes by the JVM and will "
+            f"crash with 'Too small maximum heap'."
+        )
+    return raw
+
+
 def _add_jvm_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--jvm-heap",
         dest="jvm_heap_max",
+        type=_jvm_heap_value,
         default="12g",
-        help="max JVM heap (-Xmx); default 12g",
+        help="max JVM heap (-Xmx); default 12g. Suffix required (g/m/k).",
     )
     p.add_argument(
         "--jvm-heap-min",
+        type=_jvm_heap_value,
         default=None,
-        help="initial JVM heap (-Xms); default unset",
+        help="initial JVM heap (-Xms); default unset. Suffix required (g/m/k).",
     )
     p.add_argument(
         "--jvm-tmpdir",
@@ -731,8 +759,144 @@ def _write_manifest_for_predict_library(
     write_manifest(output_dir / "manifest.json", manifest)
 
 
-def _cmd_massspec_process_dia(_args: argparse.Namespace) -> int:
-    return _not_yet_wired("process-dia")
+def _cmd_massspec_process_dia(args: argparse.Namespace) -> int:
+    """Merge / preprocess one or more spectra files into a single .DIA cache.
+
+    Single-input mode preprocesses; multi-input mode merges gas-phase
+    fractions. Writes a ``manifest.json`` with input SHA256s + jar
+    version + JVM info + runtime, and touches ``_SUCCESS`` last. No
+    auto-ingest — the ``.DIA`` is meant for downstream EncyclopeDIA
+    consumption (search / library export), not Constellation-native
+    analysis.
+    """
+    import sys as _sys
+
+    from constellation import __version__ as constellation_version
+    from constellation.massspec.search.encyclopedia import (
+        SUPPORTED_VERSIONS,
+        build_manifest_envelope,
+        encyclopedia_passthrough_args,
+        run_process_dia,
+        write_manifest,
+    )
+    from constellation.thirdparty.jvm import JvmRunError
+    from constellation.thirdparty.registry import ToolNotFoundError, find
+
+    inputs = [Path(p).resolve() for p in args.inputs]
+    output_dia = Path(args.output_dia).resolve()
+    output_dir = Path(args.output_dir).resolve()
+
+    for p in inputs:
+        if not p.exists():
+            print(f"error: input not found: {p}", file=_sys.stderr)
+            return 1
+    if len(inputs) > 1 and output_dia is None:
+        print(
+            "error: multi-input merge mode requires --output-dia",
+            file=_sys.stderr,
+        )
+        return 1
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dia.parent.mkdir(parents=True, exist_ok=True)
+
+    success_path = output_dir / "_SUCCESS"
+    if success_path.exists() and not args.resume:
+        print(
+            f"error: --output-dir already complete (touch _SUCCESS exists). "
+            f"Pass --resume to re-use it, or delete {output_dir} to start "
+            f"fresh.",
+            file=_sys.stderr,
+        )
+        return 1
+    if success_path.exists() and args.resume:
+        print(f"already complete: {output_dir}")
+        return 0
+
+    try:
+        handle = find("encyclopedia")
+    except ToolNotFoundError as exc:
+        print(f"error: {exc}", file=_sys.stderr)
+        return 1
+    if handle.version is not None and handle.version not in SUPPORTED_VERSIONS:
+        print(
+            f"warning: running EncyclopeDIA {handle.version}; "
+            f"constellation has been validated against "
+            f"{sorted(SUPPORTED_VERSIONS)}",
+            file=_sys.stderr,
+        )
+
+    extra_args = encyclopedia_passthrough_args(args.encyclopedia_arg)
+
+    try:
+        result = run_process_dia(
+            inputs=inputs,
+            output_dia=output_dia,
+            output_dir=output_dir,
+            jvm_heap_max=args.jvm_heap_max,
+            jvm_heap_min=args.jvm_heap_min,
+            jvm_tmpdir=args.jvm_tmpdir,
+            extra_args=extra_args,
+            stream_to_stderr=not args.no_progress,
+        )
+    except JvmRunError as exc:
+        print(f"error: encyclopedia jar exited {exc.returncode}", file=_sys.stderr)
+        print(f"  see {exc.stderr_log} for the full log", file=_sys.stderr)
+        return exc.returncode
+
+    if not output_dia.is_file():
+        print(
+            f"error: encyclopedia exited 0 but the expected .DIA was not "
+            f"produced at {output_dia}; check {result.stderr_log}",
+            file=_sys.stderr,
+        )
+        return 2
+
+    # Manifest captures inputs (with SHA256s) + jar + JVM + runtime.
+    import os as _os
+
+    manifest = build_manifest_envelope(
+        subcommand="massspec process-dia",
+        constellation_version=constellation_version,
+        constellation_argv=_sys.argv,
+        java_argv=result.argv,
+        tool={
+            "name": "encyclopedia",
+            "version": handle.version,
+            "jar_path": str(handle.path),
+            "jar_sha256": result.jar_sha256,
+            "source": handle.source,
+            "env_var_set": "CONSTELLATION_ENCYCLOPEDIA_HOME" in _os.environ,
+            "java_version": result.java_version,
+            "java_source": result.java_source,
+            "java_path": str(result.java_path),
+        },
+        inputs={f"input_{i}": p for i, p in enumerate(inputs)},
+        outputs={
+            "dia": output_dia,
+            "stdout_log": result.stdout_log,
+            "stderr_log": result.stderr_log,
+        },
+        runtime={
+            "elapsed_seconds": result.elapsed_seconds,
+            "returncode": result.returncode,
+            "input_count": len(inputs),
+            "input_bytes_total": sum(p.stat().st_size for p in inputs),
+            "output_bytes": output_dia.stat().st_size,
+        },
+        encyclopedia_passthrough_args=extra_args,
+    )
+    write_manifest(output_dir / "manifest.json", manifest)
+    success_path.write_bytes(b"")
+
+    if not args.no_progress:
+        size_mb = output_dia.stat().st_size / (1024**2)
+        print(
+            f"process-dia done: {output_dia} "
+            f"({len(inputs)} input{'s' if len(inputs) != 1 else ''} → "
+            f"{size_mb:.1f} MiB cache)"
+        )
+    return 0
 
 
 def _cmd_massspec_library_export(_args: argparse.Namespace) -> int:
