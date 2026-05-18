@@ -289,6 +289,13 @@ def _build_parser() -> argparse.ArgumentParser:
     _build_taxonomy_parser(subs)
     _build_catalog_parser(subs)
 
+    # Mass-spectrometry workflows (EncyclopeDIA jar wrappers — PR 0 wires
+    # all four subcommands so the dashboard form-introspector sees them;
+    # handlers fill in one PR per utility per
+    # docs/plans/encyclopedia-6.5.15-utilities.md).
+    from constellation.massspec.cli import build_parser as _build_massspec_parser
+    _build_massspec_parser(subs)
+
     # Visualization subtree — `constellation viz genome --session DIR`.
     # The full `[viz]` extras (fastapi / uvicorn / datashader) are
     # only required when the user actually invokes a viz subcommand;
