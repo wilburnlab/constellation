@@ -169,7 +169,7 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
         assert sub["arguments"], f"{sub['name']}: no arguments surfaced"
 
 
-# ── stub handlers ──────────────────────────────────────────────────────
+# ── stub handlers (subcommands still pending implementation) ───────────
 
 
 @pytest.mark.parametrize(
@@ -178,11 +178,6 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
         (
             "search",
             ["--mzml", "x.mzML", "--library", "x.elib", "--fasta", "x.fa",
-             "--output-dir", "/tmp/x"],
-        ),
-        (
-            "predict-library",
-            ["--fasta", "x.fa", "--output-dlib", "x.dlib",
              "--output-dir", "/tmp/x"],
         ),
         (
@@ -197,17 +192,18 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
         ),
     ],
 )
-def test_handler_returns_exit_2_in_pr0(
+def test_stub_handlers_return_exit_2(
     subcommand: str, minimal_args: list[str], capsys: pytest.CaptureFixture
 ) -> None:
-    """PR 0 handlers print a helpful error + return exit code 2."""
+    """Subcommands whose runner isn't wired yet print a helpful error +
+    return exit code 2. predict-library is excluded — it's wired."""
     parser = _build_massspec_only_parser()
     args = parser.parse_args(["massspec", subcommand, *minimal_args])
     rc = args.func(args)
     assert rc == 2
     captured = capsys.readouterr()
     assert subcommand in captured.err
-    assert "PR" in captured.err  # "PR 1", "PR 2", etc.
+    assert "not yet implemented" in captured.err
 
 
 # ── helpers ────────────────────────────────────────────────────────────

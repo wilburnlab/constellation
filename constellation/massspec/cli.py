@@ -173,6 +173,19 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
     )
     _add_output_dir_arg(p)
     p.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip the jar invocation if <output-dir>/_SUCCESS exists",
+    )
+    p.add_argument(
+        "--no-ingest",
+        action="store_true",
+        help=(
+            "skip the read_encyclopedia(...) → ParquetDir auto-ingest "
+            "of the produced .dlib"
+        ),
+    )
+    p.add_argument(
         "--enzyme",
         default="Trypsin",
         help="enzyme name (default Trypsin)",
@@ -462,31 +475,268 @@ def _camel_to_kebab(name: str) -> str:
 # ── handlers (PR 0 stubs) ───────────────────────────────────────────────
 
 
-def _not_yet_wired(subcommand: str, pr_number: int) -> int:
+def _not_yet_wired(subcommand: str) -> int:
     print(
         f"error: `constellation massspec {subcommand}` is registered for "
-        f"dashboard introspection (PR 0) but the runner wiring lands in "
-        f"PR {pr_number}. See docs/plans/encyclopedia-6.5.15-utilities.md "
-        f"for the survey doc the PR consumes.",
+        f"dashboard introspection but the runner wiring is not yet "
+        f"implemented. See docs/plans/encyclopedia-6.5.15-utilities.md for "
+        f"the rollout order.",
         file=sys.stderr,
     )
     return 2
 
 
 def _cmd_massspec_search(_args: argparse.Namespace) -> int:
-    return _not_yet_wired("search", 1)
+    return _not_yet_wired("search")
 
 
-def _cmd_massspec_predict_library(_args: argparse.Namespace) -> int:
-    return _not_yet_wired("predict-library", 2)
+def _cmd_massspec_predict_library(args: argparse.Namespace) -> int:
+    """FASTA → predicted .dlib via EncyclopeDIA's JChronologer pipeline.
+
+    Runs the jar, optionally ingests the produced .dlib into a
+    ``library_pqdir/`` ParquetDir bundle, writes a ``manifest.json``
+    capturing input SHA256s + jar version + JVM + runtime, and touches
+    ``_SUCCESS`` last.
+    """
+    import sys as _sys
+
+    from constellation import __version__ as constellation_version
+    from constellation.massspec.io.encyclopedia import read_encyclopedia
+    from constellation.massspec.library import save_library
+    from constellation.massspec.search.encyclopedia import (
+        SUPPORTED_VERSIONS,
+        build_manifest_envelope,
+        encyclopedia_passthrough_args,
+        run_predict_library,
+        write_manifest,
+    )
+    from constellation.thirdparty.jvm import JvmRunError
+    from constellation.thirdparty.registry import ToolNotFoundError, find
+
+    fasta = Path(args.fasta).resolve()
+    output_dlib = Path(args.output_dlib).resolve()
+    output_dir = Path(args.output_dir).resolve()
+
+    if not fasta.is_file():
+        print(f"error: --fasta not found: {fasta}", file=_sys.stderr)
+        return 1
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dlib.parent.mkdir(parents=True, exist_ok=True)
+
+    success_path = output_dir / "_SUCCESS"
+    if success_path.exists() and not args.resume:
+        print(
+            f"error: --output-dir already complete (touch _SUCCESS exists). "
+            f"Pass --resume to re-use it, or delete {output_dir} to start "
+            f"fresh.",
+            file=_sys.stderr,
+        )
+        return 1
+    if success_path.exists() and args.resume:
+        print(f"already complete: {output_dir}")
+        return 0
+
+    # Tool version sanity-check (warn, don't error — wrappers stay
+    # forward-compatible with interim builds the user may have access
+    # to before a release).
+    try:
+        handle = find("encyclopedia")
+    except ToolNotFoundError as exc:
+        print(f"error: {exc}", file=_sys.stderr)
+        return 1
+    if handle.version is not None and handle.version not in SUPPORTED_VERSIONS:
+        print(
+            f"warning: running EncyclopeDIA {handle.version}; "
+            f"constellation has been validated against "
+            f"{sorted(SUPPORTED_VERSIONS)}",
+            file=_sys.stderr,
+        )
+
+    ptms = {
+        "Acetyl": args.ptm_acetyl,
+        "ProteinNTermAcetyl": args.ptm_protein_n_term_acetyl,
+        "Carbamidomethyl": args.ptm_carbamidomethyl,
+        "Deamidation": args.ptm_deamidation,
+        "Dimethyl": args.ptm_dimethyl,
+        "GlyGly": args.ptm_gly_gly,
+        "HexNAc": args.ptm_hex_n_ac,
+        "Methyl": args.ptm_methyl,
+        "Oxidation": args.ptm_oxidation,
+        "Phospho": args.ptm_phospho,
+        "PyroGluQ": args.ptm_pyro_glu_q,
+        "Succinyl": args.ptm_succinyl,
+        "Trimethyl": args.ptm_trimethyl,
+        "TMT": args.ptm_tmt,
+    }
+    extra_args = encyclopedia_passthrough_args(args.encyclopedia_arg)
+
+    try:
+        result = run_predict_library(
+            fasta=fasta,
+            output_dlib=output_dlib,
+            output_dir=output_dir,
+            ptms=ptms,
+            min_charge=args.min_charge,
+            max_charge=args.max_charge,
+            min_mz=args.min_mz,
+            max_mz=args.max_mz,
+            max_missed_cleavage=args.max_missed_cleavage,
+            enzyme=args.enzyme,
+            add_decoys=not args.no_decoys,
+            adjust_nce_for_dia=not args.no_adjust_nce_for_dia,
+            default_nce=args.default_nce,
+            default_charge=args.default_charge,
+            max_variable_mods=args.max_variable_mods,
+            max_variable_forms=args.max_variable_forms,
+            generate_protein_entrapments=args.generate_protein_entrapments,
+            entrapment_seed=args.entrapment_seed,
+            prediction_cache=args.prediction_cache,
+            ragged_n_term=args.ragged_n_term,
+            jvm_heap_max=args.jvm_heap_max,
+            jvm_heap_min=args.jvm_heap_min,
+            jvm_tmpdir=args.jvm_tmpdir,
+            extra_args=extra_args,
+            stream_to_stderr=not args.no_progress,
+        )
+    except JvmRunError as exc:
+        print(f"error: encyclopedia jar exited {exc.returncode}", file=_sys.stderr)
+        print(f"  see {exc.stderr_log} for the full log", file=_sys.stderr)
+        return exc.returncode
+
+    if not output_dlib.is_file():
+        print(
+            f"error: encyclopedia exited 0 but the expected .dlib was not "
+            f"produced at {output_dlib}; check {result.stderr_log}",
+            file=_sys.stderr,
+        )
+        return 2
+
+    # ── auto-ingest ─────────────────────────────────────────────────
+    ingest_info: dict[str, object] = {"skipped": bool(args.no_ingest)}
+    library_pqdir: Path | None = None
+    if not args.no_ingest:
+        try:
+            ingest_result = read_encyclopedia(output_dlib)
+        except Exception as exc:  # noqa: BLE001 — surface the ingest error in the manifest
+            ingest_info["error"] = f"{type(exc).__name__}: {exc}"
+            _write_manifest_for_predict_library(
+                args=args,
+                fasta=fasta,
+                output_dlib=output_dlib,
+                output_dir=output_dir,
+                result=result,
+                handle=handle,
+                ingest_info=ingest_info,
+                library_pqdir=None,
+                extra_args=extra_args,
+                build_manifest_envelope=build_manifest_envelope,
+                write_manifest=write_manifest,
+                constellation_version=constellation_version,
+            )
+            print(
+                f"error: predict-library produced {output_dlib} but "
+                f"auto-ingest failed: {exc}. Manifest written; pass "
+                f"--no-ingest to retry without ingest.",
+                file=_sys.stderr,
+            )
+            return 3
+        library_pqdir = output_dir / "library_pqdir"
+        save_library(ingest_result.library, library_pqdir, format="parquet_dir")
+        ingest_info["library_counts"] = {
+            "proteins": ingest_result.library.proteins.num_rows,
+            "peptides": ingest_result.library.peptides.num_rows,
+            "precursors": ingest_result.library.precursors.num_rows,
+            "fragments": ingest_result.library.fragments.num_rows,
+        }
+
+    # ── manifest + _SUCCESS ─────────────────────────────────────────
+    _write_manifest_for_predict_library(
+        args=args,
+        fasta=fasta,
+        output_dlib=output_dlib,
+        output_dir=output_dir,
+        result=result,
+        handle=handle,
+        ingest_info=ingest_info,
+        library_pqdir=library_pqdir,
+        extra_args=extra_args,
+        build_manifest_envelope=build_manifest_envelope,
+        write_manifest=write_manifest,
+        constellation_version=constellation_version,
+    )
+    success_path.write_bytes(b"")
+
+    if not args.no_progress:
+        counts = ingest_info.get("library_counts")
+        if isinstance(counts, dict):
+            print(
+                f"predict-library done: {output_dlib} "
+                f"({counts.get('peptides')} peptides, "
+                f"{counts.get('precursors')} precursors)"
+            )
+        else:
+            print(f"predict-library done: {output_dlib}")
+    return 0
+
+
+def _write_manifest_for_predict_library(
+    *,
+    args: argparse.Namespace,
+    fasta: Path,
+    output_dlib: Path,
+    output_dir: Path,
+    result,  # JvmResult
+    handle,  # ToolHandle
+    ingest_info: dict[str, object],
+    library_pqdir: Path | None,
+    extra_args: list[str],
+    build_manifest_envelope,
+    write_manifest,
+    constellation_version: str,
+) -> None:
+    import os as _os
+    import sys as _sys
+
+    manifest = build_manifest_envelope(
+        subcommand="massspec predict-library",
+        constellation_version=constellation_version,
+        constellation_argv=_sys.argv,
+        java_argv=result.argv,
+        tool={
+            "name": "encyclopedia",
+            "version": handle.version,
+            "jar_path": str(handle.path),
+            "jar_sha256": result.jar_sha256,
+            "source": handle.source,
+            "env_var_set": "CONSTELLATION_ENCYCLOPEDIA_HOME" in _os.environ,
+            "java_version": result.java_version,
+            "java_source": result.java_source,
+            "java_path": str(result.java_path),
+        },
+        inputs={"fasta": fasta},
+        outputs={
+            "dlib": output_dlib,
+            "library_pqdir": library_pqdir,
+            "stdout_log": result.stdout_log,
+            "stderr_log": result.stderr_log,
+        },
+        runtime={
+            "elapsed_seconds": result.elapsed_seconds,
+            "returncode": result.returncode,
+        },
+        ingest=ingest_info,
+        encyclopedia_passthrough_args=extra_args,
+    )
+    write_manifest(output_dir / "manifest.json", manifest)
 
 
 def _cmd_massspec_process_dia(_args: argparse.Namespace) -> int:
-    return _not_yet_wired("process-dia", 3)
+    return _not_yet_wired("process-dia")
 
 
 def _cmd_massspec_library_export(_args: argparse.Namespace) -> int:
-    return _not_yet_wired("library-export", 4)
+    return _not_yet_wired("library-export")
 
 
 __all__ = ["build_parser"]

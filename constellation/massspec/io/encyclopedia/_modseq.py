@@ -41,17 +41,26 @@ from constellation.core.sequence.proforma import (
 # ──────────────────────────────────────────────────────────────────────
 
 # EncyclopeDIA modseq grammar (informal):
+#   - Optional leading mass-delta block(s) ``[+N.NNN]`` — N-terminal mods
+#     (unambiguously terminal because they precede any residue; EncyclopeDIA
+#     6.5.15's JChronologer pipeline emits these for the default
+#     ProteinNTermAcetyl=var case).
 #   - Bare uppercase residues
 #   - Mass-delta blocks ``[+N.NNN]`` or ``[-N.NNN]`` (signed) immediately
-#     follow the residue they decorate
-#   - No N-term-prefix-style mod blocks; everything is residue-attached
+#     follow the residue they decorate (residue-attached / side-chain mods)
+#
+# The ``[+N.NNN]X...`` (leading) vs ``X[+N.NNN]...`` (residue-attached at
+# position 0) split is the disambiguation EncyclopeDIA uses to distinguish
+# N-terminal α-amine acetylation from lysine ε-amine acetylation on the
+# first residue — see CLAUDE.md K[Acetyl]VERPD discussion.
 #
 # Examples (right column shows format_proforma() of the returned Peptidoform):
 #   PEPTIDE                            → "PEPTIDE"
-#   PEPC[+57.02146]TIDE                 → "PEPC[UNIMOD:4]TIDE" (Cam on C)
-#   K[+42.01057]VERPD                   → "[UNIMOD:1]-KVERPD"  (N-term Acetyl on A — see below)
-#   PEPK[+42.01057]TIDE                 → "PEPK[UNIMOD:1]TIDE" (K side-chain Ac)
-#   PEPS[+79.96633]TIDE                 → "PEPS[UNIMOD:21]TIDE" (Phospho on S)
+#   PEPC[+57.02146]TIDE                → "PEPC[UNIMOD:4]TIDE" (Cam on C)
+#   K[+42.01057]VERPD                  → "[UNIMOD:1]-KVERPD"  (N-term Acetyl on K via specificity promotion when K cannot host side-chain Ac alone — historical fallback)
+#   [+42.01057]KVERPD                  → "[UNIMOD:1]-KVERPD"  (N-term Acetyl — explicit leading-bracket form, 6.5.15)
+#   PEPK[+42.01057]TIDE                → "PEPK[UNIMOD:1]TIDE" (K side-chain Ac)
+#   PEPS[+79.96633]TIDE                → "PEPS[UNIMOD:21]TIDE" (Phospho on S)
 
 _RE_MOD_BLOCK = re.compile(r"\[([+-]?\d+(?:\.\d+)?)\]")
 
@@ -89,9 +98,24 @@ def parse_encyclopedia_modseq(
     if not modseq:
         return Peptidoform(sequence="")
 
-    # Tokenize into (residue, mod_block_or_None) pairs.
-    tokens: list[tuple[str, str | None]] = []
+    n_term_mods: list[TaggedMod] = []
     i = 0
+
+    # ── Leading bracket(s): N-terminal modifications ───────────────────
+    # ``[+N.NNN]<residue>...`` — unambiguously N-terminal. Multiple
+    # leading brackets stack (rare but valid per the grammar).
+    while i < len(modseq) and modseq[i] == "[":
+        m = _RE_MOD_BLOCK.match(modseq, i)
+        if m is None:
+            raise ValueError(
+                f"malformed leading mod block at index {i} in {modseq!r}"
+            )
+        delta = float(m.group(1))
+        n_term_mods.append(_resolve_to_tagged_mod(delta, vocab, tolerance_da))
+        i = m.end()
+
+    # ── Residue-by-residue parse ───────────────────────────────────────
+    tokens: list[tuple[str, str | None]] = []
     while i < len(modseq):
         c = modseq[i]
         if c.isalpha() and c.isupper():
@@ -114,10 +138,12 @@ def parse_encyclopedia_modseq(
             )
 
     if not tokens:
-        return Peptidoform(sequence="")
+        # Only possible if the input was leading brackets with no residues
+        # after — that would be a malformed peptide. Treat as empty rather
+        # than raise; the writer/reader pipeline never produces this.
+        return Peptidoform(sequence="", n_term_mods=tuple(n_term_mods))
 
     sequence = "".join(r for r, _ in tokens)
-    n_term_mods: list[TaggedMod] = []
     residue_mods: dict[int, list[TaggedMod]] = {}
 
     for idx, (residue, mod_str) in enumerate(tokens):
@@ -146,6 +172,30 @@ def parse_encyclopedia_modseq(
         n_term_mods=tuple(n_term_mods),
         residue_mods={k: tuple(v) for k, v in residue_mods.items()},
     )
+
+
+def _resolve_to_tagged_mod(
+    delta: float, vocab: ModVocab, tolerance_da: float
+) -> TaggedMod:
+    """Resolve a mass delta to a ``TaggedMod`` for a known-terminal slot.
+
+    Leading-bracket N-term mods skip residue-side-chain disambiguation —
+    the bracket position itself establishes terminal placement. We still
+    consult the vocab to convert the mass to a UNIMOD accession when
+    unambiguous; unresolved deltas pass through as ProForma mass-deltas.
+    """
+    matches = vocab.find_by_mass(delta, tolerance_da=tolerance_da)
+    # Prefer matches that have any N-terminal specificity — these are the
+    # chemically plausible interpretations of a leading-bracket mod.
+    n_term_matches = [m for m in matches if m.has_n_term_specificity]
+    if len(n_term_matches) == 1:
+        chosen = n_term_matches[0]
+        _, _, accession = chosen.id.partition(":")
+        return TaggedMod(
+            mod=ModRef(cv="UNIMOD", accession=accession, name=chosen.name)
+        )
+    # Zero or multiple candidates → ProForma mass-delta passthrough.
+    return TaggedMod(mod=ModRef(mass_delta=delta))
 
 
 def _choose_modification(matches, residue: str, position: int):

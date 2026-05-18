@@ -178,3 +178,50 @@ def test_lowercase_residue_rejected():
 def test_unmatched_bracket_rejected():
     with pytest.raises(ValueError):
         parse_encyclopedia_modseq("K[+42")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Leading-bracket N-terminal modifications (EncyclopeDIA 6.5.15)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_leading_bracket_n_term_acetyl_on_k():
+    """``[+42.01057]KVERPD`` is unambiguously N-terminal Acetyl on K —
+    the leading-bracket form distinguishes it from ``K[+42.01057]VERPD``
+    (which is side-chain Acetyl on K's ε-amine)."""
+    assert _round_trip("[+42.01057]KVERPD") == "[UNIMOD:1]-KVERPD"
+
+
+def test_leading_bracket_n_term_acetyl_on_a():
+    """``[+42.01057]AVPENATPR`` — emitted by JChronologer for the
+    default -ptmProteinNTermAcetyl=var case."""
+    assert _round_trip("[+42.01057]AVPENATPR") == "[UNIMOD:1]-AVPENATPR"
+
+
+def test_leading_bracket_with_side_chain_mods():
+    """Leading N-term mod + internal side-chain Cam — both resolve."""
+    out = _round_trip("[+42.01057]AC[+57.02146]TLI")
+    # ProForma format: terminal goes before the dash, side-chain inline.
+    assert out == "[UNIMOD:1]-AC[UNIMOD:4]TLI"
+
+
+def test_leading_bracket_unknown_mass_passthrough():
+    """Unrecognised leading mass passes through as a ProForma mass-delta."""
+    out = _round_trip("[+999.999]PEPTIDE")
+    parse_proforma(out)  # must not raise
+    assert "999.999" in out
+    assert out.startswith("[")
+    assert "PEPTIDE" in out
+
+
+def test_n_term_distinguishable_from_side_chain_on_k():
+    """The two notations now produce different Peptidoforms:
+    leading-bracket → N-terminal α-amine Acetyl, residue-attached →
+    K side-chain ε-amine Acetyl. This distinction is the whole point
+    of EncyclopeDIA's leading-bracket notation (per CLAUDE.md's
+    chemistry-fidelity rule for K[Acetyl]VERPD vs [Acetyl]-KVERPD)."""
+    n_term = _round_trip("[+42.01057]KVERPD")
+    side_chain = _round_trip("K[+42.01057]VERPD")
+    assert n_term == "[UNIMOD:1]-KVERPD"
+    assert side_chain == "K[UNIMOD:1]VERPD"
+    assert n_term != side_chain

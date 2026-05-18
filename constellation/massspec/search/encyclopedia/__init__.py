@@ -27,6 +27,13 @@ The authoritative inventory lives in
 
 from __future__ import annotations
 
+# Importing the wrapper subpackage implies you'll be running the
+# encyclopedia jar — ensure the thirdparty adapter's ``register()`` has
+# fired so ``find("encyclopedia")`` resolves without the caller having
+# to import the adapter themselves. (``constellation.cli.__main__``
+# already does this transitively for CLI invocations; this line covers
+# direct-from-Python use of the wrappers, e.g. notebooks + tests.)
+from constellation.thirdparty import encyclopedia as _encyclopedia_adapter  # noqa: F401
 from constellation.massspec.search.encyclopedia._common import (
     SUPPORTED_VERSIONS,
     PtmToggle,
@@ -44,6 +51,7 @@ from constellation.massspec.search.encyclopedia.library_search import (
     run_library_search,
 )
 from constellation.massspec.search.encyclopedia.predict_library import (
+    build_predict_library_args,
     run_predict_library,
 )
 from constellation.massspec.search.encyclopedia.process_dia import (
@@ -54,6 +62,7 @@ __all__ = [
     "PtmToggle",
     "SUPPORTED_VERSIONS",
     "build_manifest_envelope",
+    "build_predict_library_args",
     "default_heap_for_input",
     "encyclopedia_passthrough_args",
     "ptm_toggle_args",

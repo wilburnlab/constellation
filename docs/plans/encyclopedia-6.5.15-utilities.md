@@ -78,7 +78,52 @@ Stubbed below — populated as the PRs land.
 
 ### `-convert -fastaToJChronologerLibrary`
 
-*Pending PR 2 — full flag table captured during the survey, including the per-PTM `-ptm<Name>` enum surface.*
+Invocation: `java -jar encyclopedia-6.5.15.jar -convert -fastaToJChronologerLibrary <flags>`
+
+Verified from `java -jar encyclopedia-6.5.15.jar -convert -fastaToJChronologerLibrary -h` on 6.5.15.
+
+| Flag | Type | Required | Default (6.5.15) | Notes |
+|---|---|---|---|---|
+| `-i` | path | yes | — | input `.FASTA` |
+| `-o` | path | no | — | output `.dlib` path |
+| `-addDecoys` | bool | no | `true` | predict reversed decoys + write to DLIB decoy table (roughly doubles prediction time) |
+| `-adjustNCEForDIA` | bool | no | `true` | DIA-mode NCE adjustment |
+| `-defaultCharge` | int | no | `3` | charge used for FASTA-prediction NCE adjustment |
+| `-defaultNCE` | int | no | `33` | normalized collision energy |
+| `-entrapmentSeed` | int | no | `1` | RNG seed for protein-entrapment generation |
+| `-enzyme` | string | no | `Trypsin` | enzyme name |
+| `-generateProteinEntrapments` | bool | no | `false` | one shuffled protein-level entrapment per target |
+| `-maxCharge` | int | no | `6` | max precursor charge filter |
+| `-maxMissedCleavage` | int | no | `1` | |
+| `-maxMz` | float | no | `1002.7` | max precursor m/z filter |
+| `-maxVariableForms` | int | no | `1000` | max number of variable-modification combinations per peptide |
+| `-maxVariableMods` | int | no | `1` | max number of variable mods per peptide |
+| `-minCharge` | int | no | `1` | |
+| `-minMz` | float | no | `396.4` | |
+| `-predictionCache` | path | no | OS user-data dir | shared FASTA-prediction cache dir |
+| `-raggedNTerm` | bool | no | `false` | enumerate N-terminal ragged variants |
+| `-ptmAcetyl` | enum | no | `off` | `off\|var\|fix` |
+| `-ptmProteinNTermAcetyl` | enum | no | `var` | `off\|var\|fix` |
+| `-ptmCarbamidomethyl` | enum | no | `fix` | `off\|var\|fix` |
+| `-ptmDeamidation` | enum | no | `off` | `off\|var\|fix` |
+| `-ptmDimethyl` | enum | no | `off` | `off\|var\|fix` |
+| `-ptmGlyGly` | enum | no | `off` | `off\|var\|fix` |
+| `-ptmHexNAc` | enum | no | `off` | `off\|var\|fix` |
+| `-ptmMethyl` | enum | no | `off` | `off\|var\|fix` |
+| `-ptmOxidation` | enum | no | `off` | `off\|var\|fix` |
+| `-ptmPhospho` | enum | no | `off` | `off\|var\|fix` |
+| `-ptmPyroGluQ` | enum | no | `var` | `off\|var\|fix` |
+| `-ptmSuccinyl` | enum | no | `off` | `off\|var\|fix` |
+| `-ptmTrimethyl` | enum | no | `off` | `off\|var\|fix` |
+| `-ptmTMT` | enum | no | `off` | `off\|var\|fix` |
+
+Constraints noted in `-h`:
+- Peptide length fixed at 7-31 residues for JChronologer prediction.
+- Charge states selected from Electrician probabilities (>1%), then filtered by charge range + m/z range.
+- JChronologer always runs Sculptor CCS/IMS prediction and stores it in the library `IonMobility` column.
+
+Diff vs 2.12.30:
+- **Added**: entire utility is new in 6.5.15 (the v2.12.30 family has no in-jar FASTA-prediction path — Prosit CSV via `-convert -fastaToPrositCSV` then Koina round-trip).
 
 ### `-convert -processDIA`
 
