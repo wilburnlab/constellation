@@ -184,29 +184,20 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
 # ── stub handlers (subcommands still pending implementation) ───────────
 
 
-@pytest.mark.parametrize(
-    "subcommand,minimal_args",
-    [
-        (
-            "library-export",
-            ["--search-dir", "/tmp/sr", "--library", "x.dlib",
-             "--output-elib", "x.elib", "--output-dir", "/tmp/x"],
-        ),
-    ],
-)
-def test_stub_handlers_return_exit_2(
-    subcommand: str, minimal_args: list[str], capsys: pytest.CaptureFixture
-) -> None:
-    """Subcommands whose runner isn't wired yet print a helpful error +
-    return exit code 2. predict-library, process-dia, and search are
-    excluded — all three are wired."""
+def test_no_stub_handlers_remain() -> None:
+    """All five massspec subcommands now have wired handlers — no stubs
+    left. This guards against regressions where a subcommand's handler
+    gets reverted to ``_not_yet_wired`` without updating the parser.
+    """
     parser = _build_massspec_only_parser()
-    args = parser.parse_args(["massspec", subcommand, *minimal_args])
-    rc = args.func(args)
-    assert rc == 2
-    captured = capsys.readouterr()
-    assert subcommand in captured.err
-    assert "not yet implemented" in captured.err
+    ms_subs = _subparsers_action(_massspec_subparser(parser))
+    for subcommand, sub in ms_subs.choices.items():
+        handler = sub.get_default("func")
+        assert handler is not None, f"{subcommand}: no func set"
+        # Stub handlers are named ``_not_yet_wired`` — fail if any survive.
+        assert handler.__name__ != "_not_yet_wired", (
+            f"{subcommand}: still wired to the _not_yet_wired stub"
+        )
 
 
 # ── --jvm-heap suffix validation ──────────────────────────────────────

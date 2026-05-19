@@ -45,6 +45,7 @@ from constellation.massspec.search.encyclopedia._common import (
     write_manifest,
 )
 from constellation.massspec.search.encyclopedia.library_export import (
+    build_library_export_args,
     run_library_export,
 )
 from constellation.massspec.search.encyclopedia.library_search import (
@@ -64,6 +65,7 @@ from constellation.massspec.search.encyclopedia.process_dia import (
 __all__ = [
     "PtmToggle",
     "SUPPORTED_VERSIONS",
+    "build_library_export_args",
     "build_library_search_args",
     "build_manifest_envelope",
     "build_predict_library_args",

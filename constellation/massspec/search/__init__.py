@@ -28,7 +28,10 @@ Modules:
 from __future__ import annotations
 
 from constellation.massspec.search import schemas as schemas  # noqa: F401  (registers schemas)
-from constellation.massspec.search.collision import apply_collision_filter
+from constellation.massspec.search.collision import (
+    apply_collision_filter,
+    filter_elib_by_losers,
+)
 from constellation.massspec.search.novel import (
     _CLASSIFICATION_PRIORITY,
     build_gene_map_from_fasta_headers,
@@ -37,6 +40,7 @@ from constellation.massspec.search.novel import (
     read_fasta_proteins,
     save_novel_peptides,
 )
+from constellation.massspec.search.io import save_search
 from constellation.massspec.search.search import Search, assemble_search
 
 __all__ = [
@@ -47,6 +51,8 @@ __all__ = [
     "build_gene_map_from_fasta_headers",
     "classify_novel_peptides",
     "classify_single_peptide",
+    "filter_elib_by_losers",
     "read_fasta_proteins",
     "save_novel_peptides",
+    "save_search",
 ]

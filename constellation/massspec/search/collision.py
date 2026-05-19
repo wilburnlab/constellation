@@ -247,4 +247,154 @@ def apply_collision_filter(
     return losers
 
 
-__all__ = ["apply_collision_filter"]
+# ──────────────────────────────────────────────────────────────────────
+# SQLite-level filtered-elib writer
+# ──────────────────────────────────────────────────────────────────────
+
+
+# Tables that may carry loser modseq rows. Some installs of
+# EncyclopeDIA write a subset of these; we only DELETE FROM tables
+# that actually exist + carry a recognised peptide-keyed column.
+_ELIB_TABLES_WITH_MODSEQ: tuple[tuple[str, str], ...] = (
+    ("entries", "PeptideModSeq"),
+    ("peptidescores", "PeptideModSeq"),
+    ("peptidequants", "PeptideModSeq"),
+    ("fragmentquants", "PeptideModSeq"),
+    ("retentiontimes", "PeptideModSeq"),
+)
+_ELIB_TABLES_WITH_PEPTIDE_SEQ: tuple[tuple[str, str], ...] = (
+    # peptidetoprotein is keyed on canonical PeptideSeq, not modseq.
+    # Filter via the modseq→peptide_seq projection we collect upfront.
+    ("peptidetoprotein", "PeptideSeq"),
+)
+
+
+def filter_elib_by_losers(
+    elib_path: str | Path,
+    losers: set[str],
+    output_path: str | Path,
+) -> dict:
+    """Write a copy of ``elib_path`` to ``output_path`` with all
+    collision-loser rows removed from the peptide-keyed tables.
+
+    Required upstream of ``-libexport`` so the jar consumes a
+    pre-filtered ``.elib`` — EncyclopeDIA's jar reads the SQLite
+    directly and has no awareness of Constellation's filtered
+    ParquetDir bundles, so the SQLite itself must carry the filter.
+
+    Tables touched (DELETE FROM ... WHERE PeptideModSeq IN losers):
+
+      * ``entries``           — observed-fragment + RT + score rows
+      * ``peptidescores``     — peptide-level scores
+      * ``peptidequants``     — peptide-level quantities
+      * ``fragmentquants``    — fragment-level quantities (when present)
+      * ``retentiontimes``    — per-acquisition RT records
+
+    Plus ``peptidetoprotein`` keyed on canonical ``PeptideSeq`` —
+    derived from the entries table's (PeptideModSeq → PeptideSeq)
+    projection before any deletes.
+
+    Tables left alone:
+
+      * ``proteinscores``     — derived view; not row-keyed on peptide.
+      * ``metadata``          — global pragma; unchanged.
+
+    Parameters
+    ----------
+    elib_path
+        Source ``.elib`` (or ``.dlib``) SQLite file.
+    losers
+        ``PeptideModSeq`` strings to drop. EncyclopeDIA notation
+        (``[+N.NNN]`` mass-delta form) — the same notation
+        ``apply_collision_filter`` returns.
+    output_path
+        Destination ``.elib`` path. Created (or overwritten) on
+        completion. Parent directory is created if absent.
+
+    Returns
+    -------
+    dict
+        Per-table row-deletion counts: ``{"entries": N, "peptidescores":
+        M, ...}``. Tables absent from the source elib have a count
+        of 0.
+    """
+    import shutil
+    import sqlite3
+
+    src = Path(elib_path)
+    dst = Path(output_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    if not losers:
+        # Nothing to filter — a plain copy preserves byte-equivalence.
+        # This keeps the orchestrator's filter-then-export plumbing
+        # simple (always-runs path).
+        shutil.copyfile(src, dst)
+        all_tables = [t for t, _ in _ELIB_TABLES_WITH_MODSEQ] + [
+            t for t, _ in _ELIB_TABLES_WITH_PEPTIDE_SEQ
+        ]
+        return dict.fromkeys(all_tables, 0)
+
+    shutil.copyfile(src, dst)
+    deleted: dict[str, int] = {}
+    loser_list = sorted(losers)
+    con = sqlite3.connect(str(dst))
+    try:
+        # Collect canonical PeptideSeq values for the loser modseqs so
+        # the peptidetoprotein delete can fire on the right key.
+        peptide_seqs: set[str] = set()
+        if _has_table(con, "entries"):
+            placeholders = ",".join("?" * len(loser_list))
+            cur = con.execute(
+                f"SELECT DISTINCT PeptideSeq FROM entries "
+                f"WHERE PeptideModSeq IN ({placeholders})",
+                loser_list,
+            )
+            peptide_seqs.update(row[0] for row in cur.fetchall())
+
+        for table, column in _ELIB_TABLES_WITH_MODSEQ:
+            if not _has_table(con, table):
+                deleted[table] = 0
+                continue
+            placeholders = ",".join("?" * len(loser_list))
+            cur = con.execute(
+                f"DELETE FROM {table} WHERE {column} IN ({placeholders})",
+                loser_list,
+            )
+            deleted[table] = cur.rowcount
+
+        for table, column in _ELIB_TABLES_WITH_PEPTIDE_SEQ:
+            if not _has_table(con, table):
+                deleted[table] = 0
+                continue
+            if not peptide_seqs:
+                # No entries row backed the loser modseqs — nothing to
+                # drop from the peptide-keyed tables.
+                deleted[table] = 0
+                continue
+            seq_list = sorted(peptide_seqs)
+            placeholders = ",".join("?" * len(seq_list))
+            cur = con.execute(
+                f"DELETE FROM {table} WHERE {column} IN ({placeholders})",
+                seq_list,
+            )
+            deleted[table] = cur.rowcount
+
+        con.commit()
+        # VACUUM to reclaim space (the deletes can be substantial on
+        # full-dataset elibs; users + downstream tooling expect the
+        # filtered .elib to be lean).
+        con.execute("VACUUM")
+    finally:
+        con.close()
+    return deleted
+
+
+def _has_table(con, name: str) -> bool:
+    cur = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    )
+    return cur.fetchone() is not None
+
+
+__all__ = ["apply_collision_filter", "filter_elib_by_losers"]
