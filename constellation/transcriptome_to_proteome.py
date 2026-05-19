@@ -632,11 +632,770 @@ def collect_protein_ids(fasta_path: Path | str) -> set[str]:
     return out
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Orchestrator entry point
+# ──────────────────────────────────────────────────────────────────────
+
+
+def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
+    """Chain every stage of the transcriptome→proteomics pipeline.
+
+    Stage layout under ``<args.output_dir>/``:
+
+      01_protein_counts        TPM-normalized counts (counts_tpm.parquet)
+      02_novel_fasta           TPM + dedup-filtered novel.fasta
+      03_alignment             mmseqs2 vs combined reference+swissprot
+      04_combined_fasta        annotated combined.fasta (gene/source tags)
+      05_predict_library       constellation massspec predict-library
+      06_process_dia           constellation massspec process-dia
+      07_gpf_search            search + (default) collision-filter
+      08_classify_novel_peptides
+                               constellation massspec classify-novel-peptides
+      09_per_injection         per-mzML search + (default) collision-filter
+      10_quant_report          constellation massspec library-export
+
+    Each stage owns its run dir + manifest.json + _SUCCESS. Top-level
+    manifest.json at ``<output-dir>/manifest.json`` collates per-stage
+    paths + SHA256s of external inputs. ``--resume`` honours per-stage
+    _SUCCESS short-circuits.
+    """
+    import json
+    import shutil
+    import socket
+    import sys
+    import time
+    from datetime import datetime, timezone
+
+    import pyarrow.parquet as pq
+
+    from constellation import __version__ as constellation_version
+    from constellation.catalog.uniprot import fetch_swissprot
+    from constellation.core.io.schemas import read_mmseqs_tab
+    from constellation.massspec.search import (
+        apply_collision_filter,
+        filter_elib_by_losers,
+    )
+    from constellation.massspec.search.encyclopedia import (
+        run_library_export,
+        run_library_search,
+        run_predict_library,
+        run_process_dia,
+    )
+    from constellation.massspec.search.encyclopedia.library_search import (
+        find_search_elib,
+    )
+    from constellation.sequencing.quant.protein_counts import (
+        read_protein_counts_tab,
+        tpm_normalize,
+    )
+    from constellation.thirdparty.mmseqs2_run import run_mmseqs_search
+
+    # ── Path resolution + env validation ───────────────────────────────
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    protein_counts = Path(args.protein_counts).resolve()
+    proteins_fasta = Path(args.proteins_fasta).resolve()
+    reference_fasta = Path(args.reference_fasta).resolve()
+    reference_annotation = Path(args.reference_annotation).resolve()
+    gpf_files = [Path(p).resolve() for p in args.gpf]
+    injection_files = [Path(p).resolve() for p in args.injections]
+
+    progress = not args.no_progress
+
+    def _log(msg: str) -> None:
+        if progress:
+            print(f"[pipeline] {msg}", file=sys.stderr)
+
+    success_top = output_dir / "_SUCCESS"
+    if success_top.exists() and not args.resume:
+        print(
+            f"error: --output-dir already complete (top-level _SUCCESS exists). "
+            f"Pass --resume to short-circuit, or delete {output_dir} to "
+            f"start fresh.",
+            file=sys.stderr,
+        )
+        return 1
+    if success_top.exists() and args.resume:
+        print(f"already complete: {output_dir}")
+        return 0
+
+    # ── Resolve SwissProt (lazy fetch if not supplied) ─────────────────
+    if args.swissprot_fasta is not None:
+        swissprot_fasta = Path(args.swissprot_fasta).resolve()
+        swissprot_release: str | None = args.swissprot_release
+    else:
+        _log("fetching SwissProt FASTA via catalog (~/.constellation/references/swissprot/)")
+        sp_handle = fetch_swissprot(release=args.swissprot_release)
+        swissprot_fasta = sp_handle.fasta_path
+        swissprot_release = sp_handle.release
+
+    t_start = time.monotonic()
+    stage_manifests: dict[str, dict] = {}
+
+    # ── Stage 1: read + TPM ────────────────────────────────────────────
+    stage_dir = output_dir / "01_protein_counts"
+    if not _stage_done(stage_dir, args.resume):
+        _log("Stage 1: reading protein counts + TPM-normalizing")
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        counts = read_protein_counts_tab(protein_counts)
+        counts_tpm = tpm_normalize(counts, min_sequence_length=args.min_sequence_length)
+        pq.write_table(counts_tpm, stage_dir / "counts_tpm.parquet")
+        _write_stage_manifest(
+            stage_dir,
+            subcommand="01_protein_counts",
+            params={
+                "min_sequence_length": args.min_sequence_length,
+            },
+            counts={"n_rows": counts_tpm.num_rows},
+        )
+        _touch_success(stage_dir)
+    stage_manifests["01_protein_counts"] = _read_stage_manifest(stage_dir)
+    counts_tpm = pq.read_table(stage_dir / "counts_tpm.parquet")
+
+    # ── Stage 2: novel FASTA ───────────────────────────────────────────
+    stage_dir = output_dir / "02_novel_fasta"
+    novel_path = stage_dir / "novel.fasta"
+    if not _stage_done(stage_dir, args.resume):
+        _log(f"Stage 2: filter avg_tpm >= {args.min_avg_tpm} + dedup vs reference → novel.fasta")
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        novel_table, n_novel = filter_and_write_novel_fasta(
+            counts_tpm=counts_tpm,
+            proteins_fasta=proteins_fasta,
+            reference_fasta=reference_fasta,
+            output_path=novel_path,
+            min_avg_tpm=args.min_avg_tpm,
+        )
+        pq.write_table(novel_table, stage_dir / "novel.parquet")
+        _write_stage_manifest(
+            stage_dir,
+            subcommand="02_novel_fasta",
+            params={"min_avg_tpm": args.min_avg_tpm},
+            counts={"n_novel": n_novel},
+        )
+        _touch_success(stage_dir)
+    stage_manifests["02_novel_fasta"] = _read_stage_manifest(stage_dir)
+    novel_table = pq.read_table(stage_dir / "novel.parquet")
+
+    # ── Stage 3: competitive mmseqs2 alignment ─────────────────────────
+    stage_dir = output_dir / "03_alignment"
+    alignments_tab = stage_dir / "alignments.tab"
+    if not _stage_done(stage_dir, args.resume):
+        _log(f"Stage 3: mmseqs2 easy-search ({args.mmseqs_threads} threads)")
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        scratch = stage_dir / ".scratch"
+        target_fasta = stage_dir / "_target.fasta"
+        write_competitive_target_fasta(
+            reference_fasta=reference_fasta,
+            swissprot_fasta=swissprot_fasta,
+            output_path=target_fasta,
+        )
+        mmseqs_result = run_mmseqs_search(
+            query_fasta=novel_path,
+            target_fasta=target_fasta,
+            output_tab=alignments_tab,
+            log_dir=stage_dir / "logs",
+            evalue=args.evalue_threshold,
+            threads=args.mmseqs_threads,
+            scratch_dir=scratch,
+            stream_to_stderr=progress,
+        )
+        # Materialise the parsed AlignmentHits as a ParquetDir bundle
+        # for downstream classifier consumption.
+        alignment_hits = read_mmseqs_tab(alignments_tab)
+        ah_dir = stage_dir / "alignment_hits"
+        ah_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(alignment_hits, ah_dir / "alignment_hits.parquet")
+        # Drop the combined target FASTA (recreatable from reference + swissprot).
+        target_fasta.unlink(missing_ok=True)
+        if scratch.exists():
+            shutil.rmtree(scratch, ignore_errors=True)
+        _write_stage_manifest(
+            stage_dir,
+            subcommand="03_alignment",
+            params={
+                "evalue": args.evalue_threshold,
+                "threads": args.mmseqs_threads,
+            },
+            counts={"n_hits": alignment_hits.num_rows},
+            runtime={
+                "elapsed_seconds": mmseqs_result.elapsed_seconds,
+                "returncode": mmseqs_result.returncode,
+                "mmseqs_version": mmseqs_result.mmseqs_version,
+            },
+        )
+        _touch_success(stage_dir)
+    stage_manifests["03_alignment"] = _read_stage_manifest(stage_dir)
+    alignment_hits = pq.read_table(
+        stage_dir / "alignment_hits" / "alignment_hits.parquet"
+    )
+
+    # ── Stage 4: combined FASTA ────────────────────────────────────────
+    stage_dir = output_dir / "04_combined_fasta"
+    combined_path = stage_dir / "combined.fasta"
+    if not _stage_done(stage_dir, args.resume):
+        _log("Stage 4: alignment filter + combined.fasta with annotated headers")
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        filtered_novel = apply_alignment_filter(
+            novel_table=novel_table,
+            alignment_hits=alignment_hits,
+            evalue_threshold=args.evalue_threshold,
+        )
+        gene_map = read_reference_gene_map(reference_annotation)
+        n_written, fasta_stats = build_combined_fasta(
+            reference_fasta=reference_fasta,
+            filtered_novel=filtered_novel,
+            alignment_hits=alignment_hits,
+            reference_gene_map=gene_map,
+            output_path=combined_path,
+        )
+        (stage_dir / "gene_map.json").write_text(
+            json.dumps(gene_map, indent=2, sort_keys=True) + "\n"
+        )
+        _write_stage_manifest(
+            stage_dir,
+            subcommand="04_combined_fasta",
+            params={
+                "evalue_threshold": args.evalue_threshold,
+                "gene_map_source": str(reference_annotation),
+                "gene_map_size": len(gene_map),
+            },
+            counts={"n_written": n_written, **fasta_stats},
+        )
+        _touch_success(stage_dir)
+    stage_manifests["04_combined_fasta"] = _read_stage_manifest(stage_dir)
+
+    # ── Stage 5: predict-library ───────────────────────────────────────
+    stage_dir = output_dir / "05_predict_library"
+    combined_dlib = stage_dir / "library.dlib"
+    if not _stage_done(stage_dir, args.resume):
+        _log("Stage 5: predict-library (FASTA → .dlib)")
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        ptms = _build_ptm_map(args)
+        result = run_predict_library(
+            fasta=combined_path,
+            output_dlib=combined_dlib,
+            output_dir=stage_dir,
+            ptms=ptms,
+            jvm_heap_max=args.jvm_heap_max,
+            jvm_heap_min=args.jvm_heap_min,
+            jvm_tmpdir=args.jvm_tmpdir,
+            extra_args=_passthrough_args(args.encyclopedia_arg),
+            stream_to_stderr=progress,
+        )
+        _write_stage_manifest(
+            stage_dir,
+            subcommand="05_predict_library",
+            params={"ptms": ptms},
+            runtime={
+                "elapsed_seconds": result.elapsed_seconds,
+                "returncode": result.returncode,
+                "java_version": result.java_version,
+            },
+        )
+        _touch_success(stage_dir)
+    stage_manifests["05_predict_library"] = _read_stage_manifest(stage_dir)
+
+    # ── Stage 6: process-dia ───────────────────────────────────────────
+    stage_dir = output_dir / "06_process_dia"
+    combined_dia = stage_dir / "combined.dia"
+    if not _stage_done(stage_dir, args.resume):
+        _log(f"Stage 6: process-dia ({len(gpf_files)} GPF input{'s' if len(gpf_files) != 1 else ''})")
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        result = run_process_dia(
+            inputs=gpf_files,
+            output_dia=combined_dia,
+            output_dir=stage_dir,
+            jvm_heap_max=args.jvm_heap_max,
+            jvm_heap_min=args.jvm_heap_min,
+            jvm_tmpdir=args.jvm_tmpdir,
+            extra_args=_passthrough_args(args.encyclopedia_arg),
+            stream_to_stderr=progress,
+        )
+        _write_stage_manifest(
+            stage_dir,
+            subcommand="06_process_dia",
+            params={"n_gpf_inputs": len(gpf_files)},
+            runtime={
+                "elapsed_seconds": result.elapsed_seconds,
+                "returncode": result.returncode,
+            },
+        )
+        _touch_success(stage_dir)
+    stage_manifests["06_process_dia"] = _read_stage_manifest(stage_dir)
+
+    # ── Stage 7: GPF search + collision filter ─────────────────────────
+    stage_dir = output_dir / "07_gpf_search"
+    gpf_elib_primary = stage_dir / "combined.elib"
+    if not _stage_done(stage_dir, args.resume):
+        _log("Stage 7: GPF library search + collision filter")
+        raw_dir = stage_dir / "_raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        result = run_library_search(
+            input_file=combined_dia,
+            library=combined_dlib,
+            output_dir=raw_dir,
+            jvm_heap_max=args.jvm_heap_max,
+            jvm_heap_min=args.jvm_heap_min,
+            jvm_tmpdir=args.jvm_tmpdir,
+            fragment_tolerance_ppm=args.fragment_tolerance_ppm,
+            precursor_tolerance_ppm=args.precursor_tolerance_ppm,
+            percolator_version=args.percolator_version,
+            percolator_threshold=args.percolator_threshold,
+            extra_args=_passthrough_args(args.encyclopedia_arg),
+            stream_to_stderr=progress,
+        )
+        actual_raw_elib = find_search_elib(combined_dia, cwd=raw_dir)
+        if actual_raw_elib is None:
+            raise FileNotFoundError(
+                f"GPF search returned 0 but no .elib found under {raw_dir}"
+            )
+        # Collision filter (default-on).
+        if not args.no_collision_filter:
+            losers, collision_meta = apply_collision_filter(
+                elib_path=actual_raw_elib,
+                dia_path=combined_dia,
+                rt_threshold_s=args.collision_rt_threshold_s,
+                frag_ppm_tol=args.collision_frag_ppm_tol,
+                min_shared_ions=args.collision_min_shared_ions,
+                return_metadata=True,
+            )
+            filter_elib_by_losers(actual_raw_elib, losers, gpf_elib_primary)
+            (stage_dir / "collision_metadata.json").write_text(
+                json.dumps(
+                    {**collision_meta, "n_losers": len(losers)},
+                    indent=2,
+                ) + "\n"
+            )
+        else:
+            shutil.copyfile(actual_raw_elib, gpf_elib_primary)
+            losers = set()
+            collision_meta = None
+        _maybe_auto_ingest_elib(
+            gpf_elib_primary, stage_dir, args.no_ingest,
+        )
+        if collision_meta is not None:
+            _maybe_auto_ingest_elib(
+                actual_raw_elib, raw_dir, args.no_ingest,
+            )
+        _write_stage_manifest(
+            stage_dir,
+            subcommand="07_gpf_search",
+            params={
+                "collision_filter": not args.no_collision_filter,
+                "fragment_tolerance_ppm": args.fragment_tolerance_ppm,
+                "precursor_tolerance_ppm": args.precursor_tolerance_ppm,
+            },
+            counts={"n_losers": len(losers)},
+            runtime={
+                "elapsed_seconds": result.elapsed_seconds,
+                "returncode": result.returncode,
+            },
+        )
+        _touch_success(stage_dir)
+    stage_manifests["07_gpf_search"] = _read_stage_manifest(stage_dir)
+
+    # ── Stage 8: classify novel peptides ───────────────────────────────
+    stage_dir = output_dir / "08_classify_novel_peptides"
+    if not _stage_done(stage_dir, args.resume):
+        _log("Stage 8: classify-novel-peptides")
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        from constellation.massspec.search import (
+            build_gene_map_from_fasta_headers,
+            classify_novel_peptides,
+            read_fasta_proteins,
+            save_novel_peptides,
+        )
+        # Detected peptides from the FILTERED GPF .elib.
+        import sqlite3
+        con = sqlite3.connect(str(gpf_elib_primary))
+        try:
+            rows = con.execute(
+                "SELECT DISTINCT PeptideSeq, PeptideModSeq "
+                "FROM entries WHERE PeptideSeq IS NOT NULL"
+            ).fetchall()
+        finally:
+            con.close()
+        import pyarrow as pa
+        detected_peptides = pa.table(
+            {
+                "peptide_sequence": pa.array(
+                    [r[0] for r in rows], type=pa.string()
+                ),
+                "modified_sequence": pa.array(
+                    [r[1] for r in rows], type=pa.string()
+                ),
+            }
+        )
+        ref_proteins = read_fasta_proteins(reference_fasta)
+        # Novel proteins = the combined.fasta minus reference. Simpler:
+        # the source proteins.fasta carries every novel protein candidate.
+        novel_proteins = read_fasta_proteins(proteins_fasta)
+        gene_map_from_fastas = build_gene_map_from_fasta_headers(
+            [reference_fasta, proteins_fasta]
+        )
+        result = classify_novel_peptides(
+            detected_peptides=detected_peptides,
+            alignments=alignment_hits,
+            reference_proteins=ref_proteins,
+            novel_proteins=novel_proteins,
+            gene_map=gene_map_from_fastas,
+        )
+        save_novel_peptides(
+            result,
+            stage_dir,
+            metadata={
+                "constellation_version": constellation_version,
+                "reference_fasta": str(reference_fasta),
+                "novel_fasta": str(proteins_fasta),
+            },
+        )
+        cls_counts: dict[str, int] = {}
+        for cls in result.column("classification").to_pylist():
+            cls_counts[cls] = cls_counts.get(cls, 0) + 1
+        _write_stage_manifest(
+            stage_dir,
+            subcommand="08_classify_novel_peptides",
+            counts={
+                "n_classified": result.num_rows,
+                "classifications": cls_counts,
+            },
+        )
+        _touch_success(stage_dir)
+    stage_manifests["08_classify_novel_peptides"] = _read_stage_manifest(stage_dir)
+
+    # ── Stage 9: per-injection search + collision filter ───────────────
+    stage_dir = output_dir / "09_per_injection"
+    if not _stage_done(stage_dir, args.resume):
+        _log(f"Stage 9: per-injection searches ({len(injection_files)} mzML, "
+             f"{args.injection_threads} thread{'s' if args.injection_threads != 1 else ''})")
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        _run_per_injection_searches(
+            injection_files=injection_files,
+            library_elib=gpf_elib_primary,
+            output_root=stage_dir,
+            args=args,
+            progress=progress,
+        )
+        _write_stage_manifest(
+            stage_dir,
+            subcommand="09_per_injection",
+            params={
+                "collision_filter": not args.no_collision_filter,
+                "injection_threads": args.injection_threads,
+                "n_injections": len(injection_files),
+            },
+        )
+        _touch_success(stage_dir)
+    stage_manifests["09_per_injection"] = _read_stage_manifest(stage_dir)
+
+    # ── Stage 10: library-export quant report ──────────────────────────
+    stage_dir = output_dir / "10_quant_report"
+    quant_report_elib = stage_dir / "quant_report.elib"
+    if not _stage_done(stage_dir, args.resume):
+        _log("Stage 10: library-export → quant_report.elib")
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        # Library-export consumes the FILTERED per-injection .elibs.
+        # Collect them under a flat dir for the jar's -i flag.
+        export_input_dir = stage_dir / "_per_injection_elibs"
+        export_input_dir.mkdir(parents=True, exist_ok=True)
+        for inj_dir in sorted(
+            (output_dir / "09_per_injection").rglob("*.elib")
+        ):
+            # Pick only the primary (filtered) elibs, not the _raw/ copies.
+            if "_raw" in inj_dir.parts:
+                continue
+            # Use the parent dir name so collisions on injection stems
+            # don't clobber.
+            target = export_input_dir / f"{inj_dir.parent.name}.elib"
+            if not target.exists():
+                target.symlink_to(inj_dir) if hasattr(target, "symlink_to") else shutil.copy(
+                    inj_dir, target
+                )
+        result = run_library_export(
+            search_dir=export_input_dir,
+            library=gpf_elib_primary,
+            output_elib=quant_report_elib,
+            output_dir=stage_dir,
+            align=True,
+            jvm_heap_max=args.jvm_heap_max,
+            jvm_heap_min=args.jvm_heap_min,
+            jvm_tmpdir=args.jvm_tmpdir,
+            extra_args=_passthrough_args(args.encyclopedia_arg),
+            stream_to_stderr=progress,
+        )
+        _maybe_auto_ingest_elib(
+            quant_report_elib, stage_dir, args.no_ingest,
+        )
+        _write_stage_manifest(
+            stage_dir,
+            subcommand="10_quant_report",
+            runtime={
+                "elapsed_seconds": result.elapsed_seconds,
+                "returncode": result.returncode,
+            },
+        )
+        _touch_success(stage_dir)
+    stage_manifests["10_quant_report"] = _read_stage_manifest(stage_dir)
+
+    # ── Top-level manifest + _SUCCESS ──────────────────────────────────
+    elapsed = time.monotonic() - t_start
+    top_manifest = {
+        "constellation_version": constellation_version,
+        "subcommand": "pipeline transcriptome-to-proteomics",
+        "argv": sys.argv,
+        "inputs": {
+            "protein_counts": _input_meta(protein_counts),
+            "proteins_fasta": _input_meta(proteins_fasta),
+            "reference_fasta": _input_meta(reference_fasta),
+            "reference_annotation": _input_meta(reference_annotation),
+            "gpf": [_input_meta(p) for p in gpf_files],
+            "injections": [_input_meta(p) for p in injection_files],
+            "swissprot_fasta": _input_meta(swissprot_fasta),
+            "swissprot_release": swissprot_release,
+        },
+        "stages": {
+            name: {
+                "path": str((output_dir / name).relative_to(output_dir)),
+                "manifest_relpath": f"{name}/manifest.json",
+            }
+            for name in stage_manifests
+        },
+        "runtime": {
+            "elapsed_seconds": elapsed,
+            "host": socket.gethostname(),
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    (output_dir / "manifest.json").write_text(
+        json.dumps(top_manifest, indent=2, default=str) + "\n"
+    )
+    success_top.write_bytes(b"")
+
+    _log(f"pipeline done: {elapsed:.1f}s total → {output_dir}")
+    return 0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Orchestrator helpers (file-private; not part of the public API)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _stage_done(stage_dir: Path, resume: bool) -> bool:
+    """True iff the stage's _SUCCESS already exists AND --resume is set."""
+    success = stage_dir / "_SUCCESS"
+    if success.exists() and not resume:
+        raise RuntimeError(
+            f"{stage_dir} is already complete (touch _SUCCESS exists). "
+            f"Pass --resume to skip it, or delete {stage_dir} to re-run."
+        )
+    return success.exists() and resume
+
+
+def _touch_success(stage_dir: Path) -> None:
+    (stage_dir / "_SUCCESS").write_bytes(b"")
+
+
+def _write_stage_manifest(
+    stage_dir: Path,
+    *,
+    subcommand: str,
+    params: dict | None = None,
+    counts: dict | None = None,
+    runtime: dict | None = None,
+) -> None:
+    import json
+    import sys as _sys
+    from datetime import datetime, timezone
+
+    from constellation import __version__ as constellation_version
+
+    manifest: dict = {
+        "constellation_version": constellation_version,
+        "subcommand": subcommand,
+        "wrote_at": datetime.now(timezone.utc).isoformat(),
+        "argv": _sys.argv,
+    }
+    if params is not None:
+        manifest["params"] = params
+    if counts is not None:
+        manifest["counts"] = counts
+    if runtime is not None:
+        manifest["runtime"] = runtime
+    (stage_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, default=str) + "\n"
+    )
+
+
+def _read_stage_manifest(stage_dir: Path) -> dict:
+    import json
+    p = stage_dir / "manifest.json"
+    if not p.is_file():
+        return {}
+    return json.loads(p.read_text())
+
+
+def _input_meta(path: Path) -> dict:
+    """Streaming SHA256 + path entry for top-level manifest input records."""
+    from constellation.massspec.search.encyclopedia import sha256_file
+
+    if not path.is_file():
+        # Directory inputs (e.g. protein_counts pointed at the demux
+        # output dir) — record path only.
+        return {"path": str(path), "is_dir": path.is_dir()}
+    return {"path": str(path), "sha256": sha256_file(path)}
+
+
+def _build_ptm_map(args) -> dict[str, str]:
+    return {
+        "Acetyl": args.ptm_acetyl,
+        "ProteinNTermAcetyl": args.ptm_protein_n_term_acetyl,
+        "Carbamidomethyl": args.ptm_carbamidomethyl,
+        "Deamidation": args.ptm_deamidation,
+        "Dimethyl": args.ptm_dimethyl,
+        "GlyGly": args.ptm_gly_gly,
+        "HexNAc": args.ptm_hex_n_ac,
+        "Methyl": args.ptm_methyl,
+        "Oxidation": args.ptm_oxidation,
+        "Phospho": args.ptm_phospho,
+        "PyroGluQ": args.ptm_pyro_glu_q,
+        "Succinyl": args.ptm_succinyl,
+        "Trimethyl": args.ptm_trimethyl,
+        "TMT": args.ptm_tmt,
+    }
+
+
+def _passthrough_args(arg_list: list[str]) -> list[str]:
+    """``--encyclopedia-arg FLAG=VALUE`` → flat argv. Mirrors the
+    massspec CLI's helper."""
+    from constellation.massspec.search.encyclopedia import (
+        encyclopedia_passthrough_args,
+    )
+    return encyclopedia_passthrough_args(arg_list)
+
+
+def _maybe_auto_ingest_elib(
+    elib_path: Path, run_dir: Path, no_ingest: bool
+) -> None:
+    """Auto-ingest a .elib into ParquetDir bundles next to it.
+
+    Mirrors the pattern in `_cmd_massspec_search` / `_cmd_massspec_library_export`.
+    """
+    if no_ingest:
+        return
+    from constellation.massspec.io.encyclopedia import read_encyclopedia
+    from constellation.massspec.library import save_library
+    from constellation.massspec.quant import save_quant
+    from constellation.massspec.search import save_search
+
+    ingest = read_encyclopedia(elib_path)
+    save_library(ingest.library, run_dir / "library_pqdir", format="parquet_dir")
+    if ingest.quant is not None:
+        save_quant(ingest.quant, run_dir / "quant_pqdir", format="parquet_dir")
+    if ingest.search is not None:
+        save_search(ingest.search, run_dir / "search_pqdir", format="parquet_dir")
+
+
+def _run_per_injection_searches(
+    *,
+    injection_files: list[Path],
+    library_elib: Path,
+    output_root: Path,
+    args,
+    progress: bool,
+) -> None:
+    """Drive one search + collision-filter per injection mzML.
+
+    Parallel via :class:`concurrent.futures.ThreadPoolExecutor` per the
+    plan's footgun #5 (process-level fan-out blows host RAM at
+    --jvm-heap 24g per worker).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _run_one(mzml: Path) -> None:
+        sample_dir = _sanitise_dirname(mzml.parent.name)
+        run_dir = output_root / sample_dir / mzml.stem
+        if (run_dir / "_SUCCESS").exists() and args.resume:
+            return
+        raw_dir = run_dir / "_raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        from constellation.massspec.search.encyclopedia import (
+            run_library_search,
+        )
+        from constellation.massspec.search.encyclopedia.library_search import (
+            find_search_elib,
+        )
+        elib_name = f"{mzml.stem}.elib"
+        run_library_search(
+            input_file=mzml,
+            library=library_elib,
+            output_dir=raw_dir,
+            jvm_heap_max=args.jvm_heap_max,
+            jvm_heap_min=args.jvm_heap_min,
+            jvm_tmpdir=args.jvm_tmpdir,
+            fragment_tolerance_ppm=args.fragment_tolerance_ppm,
+            precursor_tolerance_ppm=args.precursor_tolerance_ppm,
+            percolator_version=args.percolator_version,
+            percolator_threshold=args.percolator_threshold,
+            extra_args=_passthrough_args(args.encyclopedia_arg),
+            stream_to_stderr=progress,
+        )
+        raw_elib = find_search_elib(mzml, cwd=raw_dir)
+        if raw_elib is None:
+            raise FileNotFoundError(
+                f"per-injection search returned 0 but no .elib for {mzml}"
+            )
+        primary_elib = run_dir / elib_name
+        # The .dia cache lives in raw_dir/ (side-effect of search).
+        raw_dia = next(raw_dir.glob("*.dia"), None)
+        if not args.no_collision_filter and raw_dia is not None:
+            from constellation.massspec.search import (
+                apply_collision_filter,
+                filter_elib_by_losers,
+            )
+            losers, collision_meta = apply_collision_filter(
+                elib_path=raw_elib,
+                dia_path=raw_dia,
+                rt_threshold_s=args.collision_rt_threshold_s,
+                frag_ppm_tol=args.collision_frag_ppm_tol,
+                min_shared_ions=args.collision_min_shared_ions,
+                return_metadata=True,
+            )
+            filter_elib_by_losers(raw_elib, losers, primary_elib)
+            import json
+            (run_dir / "collision_metadata.json").write_text(
+                json.dumps(
+                    {**collision_meta, "n_losers": len(losers)},
+                    indent=2,
+                ) + "\n"
+            )
+        else:
+            import shutil as _shutil
+            _shutil.copyfile(raw_elib, primary_elib)
+        _maybe_auto_ingest_elib(primary_elib, run_dir, args.no_ingest)
+        if not args.no_collision_filter and raw_dia is not None:
+            _maybe_auto_ingest_elib(raw_elib, raw_dir, args.no_ingest)
+        _touch_success(run_dir)
+
+    if args.injection_threads <= 1:
+        for mzml in injection_files:
+            _run_one(mzml)
+    else:
+        with ThreadPoolExecutor(max_workers=args.injection_threads) as ex:
+            for _ in ex.map(_run_one, injection_files):
+                pass
+
+
+def _sanitise_dirname(name: str) -> str:
+    safe = "".join(c if c.isalnum() or c in {"_", "-", "."} else "_" for c in name)
+    return safe or "sample"
+
+
 __all__ = [
     "apply_alignment_filter",
     "build_combined_fasta",
     "collect_protein_ids",
     "filter_and_write_novel_fasta",
     "read_reference_gene_map",
+    "run_transcriptome_to_proteomics",
     "write_competitive_target_fasta",
 ]

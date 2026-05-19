@@ -296,6 +296,11 @@ def _build_parser() -> argparse.ArgumentParser:
     from constellation.massspec.cli import build_parser as _build_massspec_parser
     _build_massspec_parser(subs)
 
+    # Cross-modality pipeline orchestrators
+    # (`constellation pipeline transcriptome-to-proteomics ...` etc.).
+    from constellation.cli.pipeline import build_parser as _build_pipeline_parser
+    _build_pipeline_parser(subs)
+
     # Visualization subtree — `constellation viz genome --session DIR`.
     # The full `[viz]` extras (fastapi / uvicorn / datashader) are
     # only required when the user actually invokes a viz subcommand;
