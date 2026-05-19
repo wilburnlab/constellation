@@ -161,6 +161,157 @@ def aggregate_junctions(
     pa.Table conforming to ``INTRON_TABLE``. Rows are sorted by
     ``(contig_id, donor_pos, acceptor_pos, strand)`` for determinism;
     ``intron_id`` matches the row index.
+
+    Implementation note: this is the **vectorized** path. The earlier
+    Python-row-loop implementation hung for hours at PromethION scale
+    (tens of millions of `joined` rows + per-row dict.setdefault calls).
+    The vectorized path uses Arrow's ``sort_by`` + slice-shift +
+    ``group_by(...).aggregate([("read_id", "count_distinct")])`` to
+    compute the cross-read junction-support count in seconds. The
+    pre-vectorized implementation is kept as
+    :func:`_aggregate_junctions_legacy` for parity testing.
+    """
+    if alignment_blocks.num_rows == 0 or alignments.num_rows == 0:
+        return INTRON_TABLE.empty_table()
+
+    if primary_only:
+        primary_mask = pc.and_(
+            pc.invert(alignments.column("is_secondary")),
+            pc.invert(alignments.column("is_supplementary")),
+        )
+        alignments = alignments.filter(primary_mask)
+        if alignments.num_rows == 0:
+            return INTRON_TABLE.empty_table()
+
+    primary = alignments.select(
+        ["alignment_id", "read_id", "ref_name", "strand"]
+    )
+    joined = alignment_blocks.join(primary, keys="alignment_id", join_type="inner")
+    if joined.num_rows < 2:
+        return INTRON_TABLE.empty_table()
+
+    # Sort by (alignment_id, block_index) so adjacent rows within each
+    # alignment form a donor/acceptor candidate pair via a one-row shift.
+    joined = joined.sort_by(
+        [("alignment_id", "ascending"), ("block_index", "ascending")]
+    )
+
+    n = joined.num_rows
+    # Slice columns into "current" (rows 0..n-2) and "next" (rows 1..n-1).
+    # Pairs where current.alignment_id == next.alignment_id correspond to
+    # adjacent blocks within the same alignment — i.e. one observed
+    # splice junction. Pairs across alignment boundaries get masked out.
+    aid_curr = joined.column("alignment_id").slice(0, n - 1)
+    aid_next = joined.column("alignment_id").slice(1, n - 1)
+    same_alignment = pc.equal(aid_curr, aid_next)
+
+    obs = pa.table(
+        {
+            "alignment_id": aid_curr,
+            "read_id": joined.column("read_id").slice(0, n - 1),
+            "ref_name": joined.column("ref_name").slice(0, n - 1),
+            "strand": joined.column("strand").slice(0, n - 1),
+            "donor": joined.column("ref_end").slice(0, n - 1),
+            "acceptor": joined.column("ref_start").slice(1, n - 1),
+        }
+    ).filter(same_alignment)
+    if obs.num_rows == 0:
+        return INTRON_TABLE.empty_table()
+
+    # Map ref_name → contig_id. The lookup table is small; do it as a
+    # Python list-comprehension once across all rows, then drop the
+    # unknown-contig ones via an Arrow filter. (Vectorized via Arrow
+    # would need a join against contigs; the Python loop is fine since
+    # we iterate once across the post-mask junction observations.)
+    name_to_id = _contig_id_lookup(genome.contigs)
+    contig_id_list = [name_to_id.get(n) for n in obs.column("ref_name").to_pylist()]
+    contig_id_arr = pa.array(contig_id_list, type=pa.int64())
+    obs = obs.append_column("contig_id", contig_id_arr).filter(
+        pc.is_valid(contig_id_arr)
+    )
+    if obs.num_rows == 0:
+        return INTRON_TABLE.empty_table()
+
+    # Group by (contig_id, donor, acceptor, strand) and count distinct
+    # read_ids. This is the cross-read aggregation step — replaces the
+    # old `counts: dict[..., set[str]]` Python build.
+    grouped = obs.group_by(
+        ["contig_id", "donor", "acceptor", "strand"]
+    ).aggregate([("read_id", "count_distinct")])
+
+    # Sort for deterministic intron_id assignment (matches the legacy
+    # path, which sorted on (contig_id, donor, acceptor, strand) via
+    # ``sorted(counts.keys())``).
+    grouped = grouped.sort_by(
+        [
+            ("contig_id", "ascending"),
+            ("donor", "ascending"),
+            ("acceptor", "ascending"),
+            ("strand", "ascending"),
+        ]
+    )
+
+    n_unique = grouped.num_rows
+    contig_ids = grouped.column("contig_id").to_pylist()
+    donors = grouped.column("donor").to_pylist()
+    acceptors = grouped.column("acceptor").to_pylist()
+    strands = grouped.column("strand").to_pylist()
+    read_counts = grouped.column("read_id_count_distinct").to_pylist()
+
+    # Motif lookup + annotation flag — both per-unique-junction (small N
+    # after dedup), so Python loops here are fine. Avoids re-implementing
+    # 2 bp genome-sequence lookup in vectorized form.
+    motifs = [
+        _motif_at(genome, c, d, a)
+        for c, d, a in zip(contig_ids, donors, acceptors, strict=True)
+    ]
+
+    if annotation is not None:
+        annotated_donors, annotated_acceptors = _annotation_splice_sites(
+            annotation.features, exon_type=exon_type
+        )
+        annotated: list[bool | None] = []
+        for c, d, a in zip(contig_ids, donors, acceptors, strict=True):
+            d_set = annotated_donors.get(c, frozenset())
+            a_set = annotated_acceptors.get(c, frozenset())
+            annotated.append((d in d_set) and (a in a_set))
+    else:
+        annotated = [None] * n_unique
+
+    return pa.table(
+        {
+            "intron_id": pa.array(range(n_unique), type=pa.int64()),
+            "contig_id": pa.array(contig_ids, type=pa.int64()),
+            "strand": pa.array(strands, type=pa.string()),
+            "donor_pos": pa.array(donors, type=pa.int64()),
+            "acceptor_pos": pa.array(acceptors, type=pa.int64()),
+            "read_count": pa.array(read_counts, type=pa.int64()),
+            "motif": pa.array(motifs, type=pa.string()),
+            "is_intron_seed": pa.array([True] * n_unique, type=pa.bool_()),
+            "annotated": pa.array(annotated, type=pa.bool_()),
+        },
+        schema=INTRON_TABLE,
+    )
+
+
+def _aggregate_junctions_legacy(
+    alignment_blocks: pa.Table,
+    alignments: pa.Table,
+    genome,
+    *,
+    annotation=None,
+    exon_type: str = "exon",
+    primary_only: bool = True,
+) -> pa.Table:
+    """Pre-vectorisation implementation, kept for parity testing.
+
+    Iterates the post-join table row-by-row in Python: builds an
+    ``alignment_id → list[(block_index, ref_start, ref_end)]`` dict,
+    then a ``(contig, donor, acceptor, strand) → set[read_id]`` dict.
+    Correct but unusable at PromethION scale (tens of millions of
+    rows in the post-join table → multi-hour hangs). The current
+    :func:`aggregate_junctions` is the vectorised replacement; this
+    function exists so the parity test can directly compare outputs.
     """
     if alignment_blocks.num_rows == 0 or alignments.num_rows == 0:
         return INTRON_TABLE.empty_table()
@@ -183,9 +334,6 @@ def aggregate_junctions(
 
     name_to_id = _contig_id_lookup(genome.contigs)
 
-    # Group blocks by alignment_id; build per-alignment junction list
-    # ordered by block_index. Collect (donor, acceptor, read_id) per
-    # junction so cross-read aggregation can count distinct reads.
     by_aid: dict[int, list[tuple[int, int, int]]] = {}
     aid_meta: dict[int, dict[str, object]] = {}
     aids = joined.column("alignment_id").to_pylist()
@@ -208,7 +356,6 @@ def aggregate_junctions(
             },
         )
 
-    # Aggregate: (contig_id, donor, acceptor, strand) → set of read_ids.
     counts: dict[tuple[int, int, int, str], set[str]] = {}
     for aid, blocks in by_aid.items():
         blocks.sort(key=lambda t: t[0])

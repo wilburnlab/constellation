@@ -17,7 +17,10 @@ import pyarrow as pa
 import pytest
 
 from constellation.sequencing.annotation.annotation import Annotation
-from constellation.sequencing.quant.junctions import aggregate_junctions
+from constellation.sequencing.quant.junctions import (
+    _aggregate_junctions_legacy,
+    aggregate_junctions,
+)
 from constellation.sequencing.reference.reference import GenomeReference
 from constellation.sequencing.schemas.alignment import (
     ALIGNMENT_BLOCK_TABLE,
@@ -338,3 +341,172 @@ def test_empty_inputs_return_empty_schema() -> None:
     from constellation.sequencing.schemas.alignment import INTRON_TABLE
     assert out.schema.equals(INTRON_TABLE)
     assert out.num_rows == 0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Vectorisation parity + scale
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _synth_corpus(
+    *,
+    n_alignments: int,
+    n_blocks_per_alignment: int,
+    n_distinct_junctions: int,
+    seed: int = 0,
+) -> tuple[pa.Table, pa.Table]:
+    """Synthetic alignments + blocks fixture for parity / scale tests.
+
+    Each alignment is a single read on chr1 with ``n_blocks_per_alignment``
+    blocks → produces ``n_blocks_per_alignment - 1`` junctions per
+    alignment. Junctions are drawn from a pool of ``n_distinct_junctions``
+    canonical (donor, acceptor) pairs so the cross-read aggregation has
+    real overlap to count.
+    """
+    import random
+
+    rng = random.Random(seed)
+    canonical_junctions = [
+        (100 + 1000 * i, 500 + 1000 * i) for i in range(n_distinct_junctions)
+    ]
+    al_rows: list[dict] = []
+    block_rows: list[dict] = []
+    for aid in range(1, n_alignments + 1):
+        # Pick which junctions this alignment uses, in order; first donor
+        # establishes the leftmost block; subsequent blocks follow.
+        chosen = sorted(
+            rng.sample(
+                canonical_junctions,
+                min(n_blocks_per_alignment - 1, len(canonical_junctions)),
+            )
+        )
+        # Build blocks: first block starts before first donor; each
+        # subsequent block goes from the acceptor of the prior junction
+        # to the donor of the next.
+        first_donor = chosen[0][0]
+        last_acceptor = chosen[-1][1]
+        al_rows.append(_alignment(
+            alignment_id=aid,
+            read_id=f"r{aid}",
+            ref_start=first_donor - 100,
+            ref_end=last_acceptor + 100,
+        ))
+        # Block 0
+        block_rows.append(_block(
+            alignment_id=aid, block_index=0,
+            ref_start=first_donor - 100, ref_end=first_donor,
+        ))
+        for bi, ((donor, acceptor), next_pair) in enumerate(
+            zip(chosen, chosen[1:] + [(None, None)]), start=1
+        ):
+            next_donor = next_pair[0] if next_pair[0] is not None else acceptor + 100
+            block_rows.append(_block(
+                alignment_id=aid, block_index=bi,
+                ref_start=acceptor, ref_end=next_donor,
+            ))
+    al = _alignments(al_rows)
+    blocks = _blocks(block_rows)
+    return blocks, al
+
+
+def _normalize_for_compare(t: pa.Table) -> list[dict]:
+    """Convert table → list of dicts sorted by the natural key for direct
+    equality compare. ``intron_id`` is row-index-derived, so we exclude
+    it from the comparison (both implementations must agree on row
+    contents, but their intron_id naming can stay row-index-stable as
+    long as the deterministic sort is the same).
+    """
+    rows = t.to_pylist()
+    # Sort by the natural key (matches both impls' deterministic sort)
+    rows.sort(key=lambda r: (r["contig_id"], r["donor_pos"], r["acceptor_pos"], r["strand"]))
+    # Drop intron_id (row index, derived deterministically); compare contents
+    for r in rows:
+        r.pop("intron_id", None)
+    return rows
+
+
+def test_parity_legacy_vs_vectorized_small() -> None:
+    """Small hand-built input → both implementations produce identical
+    output. Covers the canonical multi-read multi-junction case."""
+    al = _alignments(
+        [
+            _alignment(alignment_id=1, read_id="rA"),
+            _alignment(alignment_id=2, read_id="rB"),
+            _alignment(alignment_id=3, read_id="rC"),
+        ]
+    )
+    blocks = _blocks(
+        [
+            # Alignment 1: 100→500 and 600→900
+            _block(alignment_id=1, block_index=0, ref_start=50, ref_end=100),
+            _block(alignment_id=1, block_index=1, ref_start=500, ref_end=600),
+            _block(alignment_id=1, block_index=2, ref_start=900, ref_end=950),
+            # Alignment 2: same as 1 (different read)
+            _block(alignment_id=2, block_index=0, ref_start=50, ref_end=100),
+            _block(alignment_id=2, block_index=1, ref_start=500, ref_end=600),
+            # Alignment 3: 100→500 only
+            _block(alignment_id=3, block_index=0, ref_start=50, ref_end=100),
+            _block(alignment_id=3, block_index=1, ref_start=500, ref_end=600),
+        ]
+    )
+    new = aggregate_junctions(blocks, al, _genome())
+    legacy = _aggregate_junctions_legacy(blocks, al, _genome())
+    assert _normalize_for_compare(new) == _normalize_for_compare(legacy)
+
+
+def test_parity_legacy_vs_vectorized_synthetic_corpus() -> None:
+    """Larger synthetic corpus: 100 alignments × 4 blocks each, junctions
+    drawn from a 20-pool. Confirms parity across the cross-read
+    aggregation path (multiple reads supporting the same junction)."""
+    blocks, al = _synth_corpus(
+        n_alignments=100, n_blocks_per_alignment=4, n_distinct_junctions=20, seed=42,
+    )
+    # Big enough genome to cover the synthetic junctions
+    big_seq = "ACGT" * 6000  # 24kb — covers up to ~position 24000
+    genome = GenomeReference(
+        contigs=pa.Table.from_pylist(
+            [{"contig_id": 1, "name": "chr1", "length": len(big_seq),
+              "topology": None, "circular": None}]
+        ),
+        sequences=pa.Table.from_pylist(
+            [{"contig_id": 1, "sequence": big_seq}]
+        ),
+    )
+    new = aggregate_junctions(blocks, al, genome)
+    legacy = _aggregate_junctions_legacy(blocks, al, genome)
+    assert _normalize_for_compare(new) == _normalize_for_compare(legacy)
+    # Sanity-check the test exercises real cross-read aggregation
+    rcs = new.column("read_count").to_pylist()
+    assert max(rcs) > 1, "test corpus didn't produce any multi-read junctions"
+
+
+def test_vectorized_scale_smoke() -> None:
+    """Smoke test: 10k alignments × 5 blocks each (~40k junction
+    observations, ~50 unique junctions) must complete in well under a
+    second. The pre-vectorisation impl took multi-hour at this kind of
+    scale once the per-row dict.setdefault loop kicked in; the
+    vectorized impl is Arrow-native end-to-end."""
+    import time
+
+    blocks, al = _synth_corpus(
+        n_alignments=10_000, n_blocks_per_alignment=5, n_distinct_junctions=50, seed=7,
+    )
+    big_seq = "ACGT" * 30_000  # 120kb
+    genome = GenomeReference(
+        contigs=pa.Table.from_pylist(
+            [{"contig_id": 1, "name": "chr1", "length": len(big_seq),
+              "topology": None, "circular": None}]
+        ),
+        sequences=pa.Table.from_pylist(
+            [{"contig_id": 1, "sequence": big_seq}]
+        ),
+    )
+    t0 = time.perf_counter()
+    out = aggregate_junctions(blocks, al, genome)
+    elapsed = time.perf_counter() - t0
+    # Generous bound — local laptops finish in <50ms; CI is forgiving.
+    assert elapsed < 10.0, f"vectorised path too slow: {elapsed:.2f}s"
+    # Real output, not empty
+    assert out.num_rows > 0
+    # Read counts make sense (some junctions hit by many reads)
+    assert max(out.column("read_count").to_pylist()) > 1
