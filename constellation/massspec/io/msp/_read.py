@@ -435,17 +435,12 @@ def read_msp_library(
     precursors_rows: list[dict[str, Any]] = []
     pkey_to_id: dict[tuple[str, int], int] = {}
 
-    # FOLLOW-UP: ``fragments_rows`` accumulates as a Python ``list[dict]``
-    # — at ~600 bytes per dict and ~30 fragments × N entries per spectrum,
-    # this grows to ~8 GB on the 469k-entry ProteomeTools library before
-    # being materialized as one Arrow table at the end. Should switch to
-    # per-chunk ``pa.Table`` emission inside ``_flush_chunk``, accumulate
-    # tables in a list, and ``pa.concat_tables`` at the end. Cuts peak
-    # RSS roughly in half. Same pattern applies to ``per_precursor_comments``
-    # if libraries scale further. Not done in this PR because the current
-    # peak is tractable for the lab's hardware; revisit when a larger
-    # MSP / spectral-library reader pushes it.
-    fragments_rows: list[dict[str, Any]] = []
+    # Fragment rows emit per-chunk as ``pa.Table`` instead of being held
+    # in a single ``list[dict]`` until EOF — the Python-dict footprint
+    # (~600 B/row × tens of millions of rows on a full ProteomeTools-class
+    # library) is the dominant accumulator and gets freed at chunk end
+    # by going through Arrow's columnar buffers.
+    fragment_chunk_tables: list[pa.Table] = []
     pp_pairs: set[tuple[str, str]] = set()
     per_precursor_comments: list[tuple[int, dict[str, str | bool]]] = []
 
@@ -479,6 +474,7 @@ def read_msp_library(
             )
         else:
             indices = [{} for _ in chunk]
+        chunk_fragments_rows: list[dict[str, Any]] = []
         for (
             (pep, charge, peaks, precursor_id),
             ladder_index,
@@ -498,7 +494,11 @@ def read_msp_library(
             counters.dropped_peaks += entry_counters.dropped_peaks
             for row in frag_rows:
                 row["precursor_id"] = precursor_id
-                fragments_rows.append(row)
+                chunk_fragments_rows.append(row)
+        if chunk_fragments_rows:
+            fragment_chunk_tables.append(
+                _to_table(chunk_fragments_rows, LIBRARY_FRAGMENT_TABLE)
+            )
         chunk.clear()
 
     for entry in _iter_entries(src):
@@ -608,7 +608,7 @@ def read_msp_library(
         proteins=_to_table(proteins_rows, PROTEIN_TABLE),
         peptides=_to_table(peptides_rows, PEPTIDE_TABLE),
         precursors=_to_table(precursors_rows, PRECURSOR_TABLE),
-        fragments=_to_table(fragments_rows, LIBRARY_FRAGMENT_TABLE),
+        fragments=_concat_fragments(fragment_chunk_tables),
         protein_peptide=_to_table(pp_rows, PROTEIN_PEPTIDE_EDGE),
         metadata_extras=metadata_extras,
     )
@@ -618,6 +618,12 @@ def _to_table(rows: list[dict[str, Any]], schema: pa.Schema) -> pa.Table:
     if not rows:
         return schema.empty_table()
     return pa.Table.from_pylist(rows, schema=schema)
+
+
+def _concat_fragments(tables: list[pa.Table]) -> pa.Table:
+    if not tables:
+        return LIBRARY_FRAGMENT_TABLE.empty_table()
+    return pa.concat_tables(tables)
 
 
 __all__ = ["read_msp_library"]

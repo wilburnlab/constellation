@@ -281,6 +281,25 @@ def test_raw_style_msp_raises_value_error() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Chunk-boundary invariance — per-chunk Arrow emission must produce a
+# byte-identical Library regardless of where the chunk borders fall.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_chunk_boundary_preserved() -> None:
+    default = read_msp_library(FIXTURE)
+    # 10 entries → forces 4 flushes (3+3+3+1) at chunk_size=3, which
+    # exercises every concat path: first chunk, middle chunks, partial
+    # final chunk.
+    chunked = read_msp_library(FIXTURE, chunk_size=3)
+    assert default.proteins.equals(chunked.proteins)
+    assert default.peptides.equals(chunked.peptides)
+    assert default.precursors.equals(chunked.precursors)
+    assert default.fragments.equals(chunked.fragments)
+    assert default.protein_peptide.equals(chunked.protein_peptide)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # ParquetDir round-trip preserves the side-table
 # ──────────────────────────────────────────────────────────────────────
 
