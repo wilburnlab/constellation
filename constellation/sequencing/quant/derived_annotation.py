@@ -472,7 +472,20 @@ def assign_blocks_to_exons(
     for c in exons_by_contig:
         exons_by_contig[c].sort()
 
-    rows: list[dict] = []
+    # Parallel column accumulators — avoids the per-row dict construction
+    # + per-call schema inference of pa.Table.from_pylist, which becomes
+    # the dominant cost at PromethION scale (tens of millions of blocks
+    # → tens of millions of edges → tens of GB of Python dict overhead +
+    # multi-hour stalls). Appending six scalars to six lists is roughly
+    # 10× faster than dict construction, and pa.array(list, type=...)
+    # at the end skips the schema-inference path entirely.
+    aid_col: list[int] = []
+    bidx_col: list[int] = []
+    exon_col: list[int] = []
+    ovl_col: list[int] = []
+    bfrac_col: list[float] = []
+    efrac_col: list[float] = []
+
     aids = alignment_blocks.column("alignment_id").to_pylist()
     bidxs = alignment_blocks.column("block_index").to_pylist()
     bstarts = alignment_blocks.column("ref_start").to_pylist()
@@ -503,24 +516,27 @@ def assign_blocks_to_exons(
             if ovl <= 0:
                 continue
             exon_len = e_end - e_start
-            rows.append(
-                {
-                    "alignment_id": int(aid),
-                    "block_index": int(bidx),
-                    "data_exon_id": int(e_id),
-                    "overlap_bp": int(ovl),
-                    "block_fraction": (
-                        float(ovl) / float(block_len) if block_len > 0 else 0.0
-                    ),
-                    "exon_fraction": (
-                        float(ovl) / float(exon_len) if exon_len > 0 else 0.0
-                    ),
-                }
-            )
+            aid_col.append(int(aid))
+            bidx_col.append(int(bidx))
+            exon_col.append(int(e_id))
+            ovl_col.append(int(ovl))
+            bfrac_col.append(float(ovl) / float(block_len))
+            bfrac_inv_exon = float(ovl) / float(exon_len) if exon_len > 0 else 0.0
+            efrac_col.append(bfrac_inv_exon)
 
-    if not rows:
+    if not aid_col:
         return _empty_block_assignments()
-    return pa.Table.from_pylist(rows, schema=BLOCK_EXON_ASSIGNMENT_TABLE)
+    return pa.table(
+        {
+            "alignment_id": pa.array(aid_col, type=pa.int64()),
+            "block_index": pa.array(bidx_col, type=pa.int32()),
+            "data_exon_id": pa.array(exon_col, type=pa.int64()),
+            "overlap_bp": pa.array(ovl_col, type=pa.int32()),
+            "block_fraction": pa.array(bfrac_col, type=pa.float32()),
+            "exon_fraction": pa.array(efrac_col, type=pa.float32()),
+        },
+        schema=BLOCK_EXON_ASSIGNMENT_TABLE,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────

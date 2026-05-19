@@ -1247,17 +1247,32 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     # The clustered INTRON_TABLE is the canonical splice-junction
     # artifact downstream consumers (transcriptome cluster,
     # derived-annotation pass) consume.
-    introns = aggregate_junctions(
-        blocks_table, alignments_table, genome, annotation=annotation,
-    )
-    if cluster_introns:
-        introns = cluster_junctions(
-            introns,
-            tolerance_bp=int(args.intron_tolerance_bp),
-            motif_priority=intron_motif_priority,
-        )
+    #
+    # Resume-skip: if introns.parquet already exists (left over from a
+    # prior run that died later), reload it instead of recomputing.
+    # The Phase 1 aggregators at PromethION scale can each take tens of
+    # minutes, so this lets a killed run pick up mid-resolve rather than
+    # restarting the whole resolve stage.
     introns_path = output_dir / "introns.parquet"
-    pq.write_table(introns, introns_path)
+    if args.resume and introns_path.is_file():
+        introns = pq.read_table(introns_path)
+        if args.progress:
+            print(
+                f"--resume: reusing existing {introns_path.name} "
+                f"({introns.num_rows:,} introns)",
+                file=sys.stderr,
+            )
+    else:
+        introns = aggregate_junctions(
+            blocks_table, alignments_table, genome, annotation=annotation,
+        )
+        if cluster_introns:
+            introns = cluster_junctions(
+                introns,
+                tolerance_bp=int(args.intron_tolerance_bp),
+                motif_priority=intron_motif_priority,
+            )
+        pq.write_table(introns, introns_path)
     emit_outputs["introns"] = str(introns_path)
 
     # ── Coverage pile-up + derived annotation ─────────────────────────
@@ -1265,9 +1280,47 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     # derived-annotation pass even when --no-coverage suppresses the
     # on-disk write. Skipping both passes saves the resolve-stage
     # pile-up compute entirely.
+    #
+    # Resume-skip for derived_annotation outputs: if all three already
+    # exist, skip both the pileup compute AND build_derived_annotation.
+    # If coverage.parquet alone exists on resume (and derived_annotation
+    # is needed downstream), we re-load it instead of recomputing.
+    derived_dir = output_dir / "derived_annotation"
+    block_assignments_path = output_dir / "block_exon_assignments.parquet"
+    exon_psi_path = output_dir / "exon_psi.parquet"
+    coverage_path = output_dir / "coverage.parquet"
+
+    derived_outputs_exist = (
+        derived_dir.is_dir()
+        and (derived_dir / "features.parquet").is_file()
+        and block_assignments_path.is_file()
+        and exon_psi_path.is_file()
+    )
+    coverage_exists = coverage_path.is_file()
+
     pileup_table: pa.Table | None = None
+    read_to_sample: dict[str, int] = {}
     need_pileup = emit_coverage or emit_derived_annotation
-    if need_pileup:
+    # Skip the entire pileup-and-derived-annotation block on resume when
+    # all of its persistent outputs already exist.
+    if (
+        args.resume
+        and need_pileup
+        and (not emit_coverage or coverage_exists)
+        and (not emit_derived_annotation or derived_outputs_exist)
+    ):
+        if args.progress:
+            print(
+                "--resume: reusing existing coverage / derived-annotation outputs",
+                file=sys.stderr,
+            )
+        if emit_coverage:
+            emit_outputs["coverage"] = str(coverage_path)
+        if emit_derived_annotation:
+            emit_outputs["derived_annotation"] = str(derived_dir)
+            emit_outputs["block_exon_assignments"] = str(block_assignments_path)
+            emit_outputs["exon_psi"] = str(exon_psi_path)
+    elif need_pileup:
         rd = read_demux.select(["read_id", "sample_id"])
         valid_mask = pa.compute.is_valid(rd.column("sample_id"))
         rd_valid = rd.filter(valid_mask)
@@ -1291,45 +1344,54 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
                 strict=True,
             )
         }
-        pileup_table = build_pileup(
-            blocks_table, alignments_table, genome.contigs,
-            read_to_sample=read_to_sample,
-        )
-
-    if emit_coverage and pileup_table is not None:
-        pileup_path = output_dir / "coverage.parquet"
-        pq.write_table(pileup_table, pileup_path)
-        emit_outputs["coverage"] = str(pileup_path)
-
-    if emit_derived_annotation and pileup_table is not None:
-        # Local import: derived_annotation depends on Part B schemas
-        # registered when the module is imported.
-        from constellation.sequencing.quant.derived_annotation import (
-            build_derived_annotation,
-        )
-        from constellation.sequencing.annotation.io import save_annotation
-
-        derived_annotation, block_assignments, exon_psi = (
-            build_derived_annotation(
-                coverage=pileup_table,
-                introns=introns,
-                alignment_blocks=blocks_table,
-                alignments=alignments_table,
-                contigs=genome.contigs,
+        # Reuse coverage from disk on resume if it's there — saves the
+        # sweep-line pile-up compute even when derived_annotation needs
+        # to re-run.
+        if args.resume and coverage_exists:
+            pileup_table = pq.read_table(coverage_path)
+            if args.progress:
+                print(
+                    f"--resume: reusing existing {coverage_path.name}",
+                    file=sys.stderr,
+                )
+        else:
+            pileup_table = build_pileup(
+                blocks_table, alignments_table, genome.contigs,
                 read_to_sample=read_to_sample,
-                min_exon_depth=int(args.min_exon_depth),
-                min_intron_read_count=int(args.min_intron_read_count),
             )
-        )
-        derived_dir = output_dir / "derived_annotation"
-        save_annotation(derived_annotation, derived_dir, format="parquet_dir")
-        block_assignments_path = output_dir / "block_exon_assignments.parquet"
-        pq.write_table(block_assignments, block_assignments_path)
-        exon_psi_path = output_dir / "exon_psi.parquet"
-        pq.write_table(exon_psi, exon_psi_path)
-        emit_outputs["derived_annotation"] = str(derived_dir)
-        emit_outputs["block_exon_assignments"] = str(block_assignments_path)
-        emit_outputs["exon_psi"] = str(exon_psi_path)
+
+        if emit_coverage and not coverage_exists and pileup_table is not None:
+            pq.write_table(pileup_table, coverage_path)
+        if emit_coverage:
+            emit_outputs["coverage"] = str(coverage_path)
+
+        if emit_derived_annotation and pileup_table is not None and not derived_outputs_exist:
+            # Local import: derived_annotation depends on Part B schemas
+            # registered when the module is imported.
+            from constellation.sequencing.quant.derived_annotation import (
+                build_derived_annotation,
+            )
+            from constellation.sequencing.annotation.io import save_annotation
+
+            derived_annotation, block_assignments, exon_psi = (
+                build_derived_annotation(
+                    coverage=pileup_table,
+                    introns=introns,
+                    alignment_blocks=blocks_table,
+                    alignments=alignments_table,
+                    contigs=genome.contigs,
+                    read_to_sample=read_to_sample,
+                    min_exon_depth=int(args.min_exon_depth),
+                    min_intron_read_count=int(args.min_intron_read_count),
+                )
+            )
+            save_annotation(derived_annotation, derived_dir, format="parquet_dir")
+            pq.write_table(block_assignments, block_assignments_path)
+            pq.write_table(exon_psi, exon_psi_path)
+        if emit_derived_annotation:
+            emit_outputs["derived_annotation"] = str(derived_dir)
+            emit_outputs["block_exon_assignments"] = str(block_assignments_path)
+            emit_outputs["exon_psi"] = str(exon_psi_path)
 
     # ── Wide gene × sample TSVs (human-facing) ───────────────────────
     matrix_outputs: dict[str, str] = {}
