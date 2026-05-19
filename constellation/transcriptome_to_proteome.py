@@ -1345,9 +1345,23 @@ def _run_per_injection_searches(
                 f"per-injection search returned 0 but no .elib for {mzml}"
             )
         primary_elib = run_dir / elib_name
-        # The .dia cache lives in raw_dir/ (side-effect of search).
-        raw_dia = next(raw_dir.glob("*.dia"), None)
-        if not args.no_collision_filter and raw_dia is not None:
+        if not args.no_collision_filter:
+            # The collision filter needs the .dia cache EncyclopeDIA
+            # produces from the input. For .raw / .mzML inputs the
+            # .dia write-location drifts by version (cwd vs. next to
+            # the input), so check both. Fail loud if requested but
+            # missing — never silently skip a filter the user asked for.
+            raw_dia = _find_dia_cache(mzml, cwd=raw_dir)
+            if raw_dia is None:
+                raise FileNotFoundError(
+                    f"--collision-filter is on but no .dia cache was found "
+                    f"for injection {mzml.name} (looked in {raw_dir} and "
+                    f"next to the input). The collision filter requires the "
+                    f".dia's isolation-window ranges. Pass "
+                    f"--no-collision-filter to skip, or pre-convert the "
+                    f"injection to .dia via `constellation massspec "
+                    f"process-dia`."
+                )
             from constellation.massspec.search import (
                 apply_collision_filter,
                 filter_elib_by_losers,
@@ -1368,12 +1382,12 @@ def _run_per_injection_searches(
                     indent=2,
                 ) + "\n"
             )
+            _maybe_auto_ingest_elib(primary_elib, run_dir, args.no_ingest)
+            _maybe_auto_ingest_elib(raw_elib, raw_dir, args.no_ingest)
         else:
             import shutil as _shutil
             _shutil.copyfile(raw_elib, primary_elib)
-        _maybe_auto_ingest_elib(primary_elib, run_dir, args.no_ingest)
-        if not args.no_collision_filter and raw_dia is not None:
-            _maybe_auto_ingest_elib(raw_elib, raw_dir, args.no_ingest)
+            _maybe_auto_ingest_elib(primary_elib, run_dir, args.no_ingest)
         _touch_success(run_dir)
 
     if args.injection_threads <= 1:
@@ -1383,6 +1397,36 @@ def _run_per_injection_searches(
         with ThreadPoolExecutor(max_workers=args.injection_threads) as ex:
             for _ in ex.map(_run_one, injection_files):
                 pass
+
+
+def _find_dia_cache(input_file: Path, *, cwd: Path | None = None) -> Path | None:
+    """Locate the ``.dia`` cache EncyclopeDIA materialises from a search
+    input (.raw / .mzML / .d).
+
+    Mirrors :func:`find_search_elib`'s dual-location fall-through —
+    EncyclopeDIA's .dia write-location drifts by version (the process
+    cwd in 6.5.15+, next to the input in older builds). Returns
+    ``None`` when neither candidate exists.
+    """
+    candidates: list[Path] = []
+    if cwd is not None:
+        cwd = Path(cwd)
+        candidates.extend(
+            [
+                cwd / f"{input_file.stem}.dia",
+                cwd / f"{input_file.name}.dia",
+            ]
+        )
+    candidates.extend(
+        [
+            input_file.parent / f"{input_file.stem}.dia",
+            input_file.parent / f"{input_file.name}.dia",
+        ]
+    )
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
 
 
 def _sanitise_dirname(name: str) -> str:

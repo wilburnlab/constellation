@@ -22,6 +22,7 @@ import pytest
 
 from constellation.cli.pipeline import build_parser
 from constellation.transcriptome_to_proteome import (
+    _find_dia_cache,
     _sanitise_dirname,
     _stage_done,
     _touch_success,
@@ -182,6 +183,57 @@ def test_sanitise_dirname_strips_unsafe_chars() -> None:
     assert _sanitise_dirname("sample 01/foo") == "sample_01_foo"
     assert _sanitise_dirname("") == "sample"
     assert _sanitise_dirname("safe-name_v1.0") == "safe-name_v1.0"
+
+
+def test_find_dia_cache_in_cwd(tmp_path) -> None:
+    """6.5.15 writes <stem>.dia to the run cwd."""
+    raw_input = tmp_path / "data" / "sample.raw"
+    raw_input.parent.mkdir(parents=True)
+    raw_input.write_text("")
+    cwd = tmp_path / "run"
+    cwd.mkdir()
+    (cwd / "sample.dia").write_text("")
+    found = _find_dia_cache(raw_input, cwd=cwd)
+    assert found == cwd / "sample.dia"
+
+
+def test_find_dia_cache_next_to_input(tmp_path) -> None:
+    """Older versions write <stem>.dia next to the input file."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    raw_input = data_dir / "sample.raw"
+    raw_input.write_text("")
+    (data_dir / "sample.dia").write_text("")
+    cwd = tmp_path / "run"
+    cwd.mkdir()
+    # Not in cwd → falls through to the input's parent.
+    found = _find_dia_cache(raw_input, cwd=cwd)
+    assert found == data_dir / "sample.dia"
+
+
+def test_find_dia_cache_missing_returns_none(tmp_path) -> None:
+    raw_input = tmp_path / "sample.raw"
+    raw_input.write_text("")
+    assert _find_dia_cache(raw_input, cwd=tmp_path) is None
+
+
+def test_orchestrator_collision_filter_fails_loud_without_dia(
+    stub_inputs, stub_external_calls, monkeypatch
+) -> None:
+    """If the per-injection search produces no .dia and the collision
+    filter is on, the orchestrator raises rather than silently skipping
+    — guards the user's collision-filter-by-default requirement."""
+    import constellation.transcriptome_to_proteome as t2p
+    from constellation.transcriptome_to_proteome import (
+        run_transcriptome_to_proteomics,
+    )
+
+    # Force _find_dia_cache to return None so the per-injection filter
+    # has no isolation-window source.
+    monkeypatch.setattr(t2p, "_find_dia_cache", lambda *a, **k: None)
+    args = _build_args(stub_inputs)
+    with pytest.raises(FileNotFoundError, match="no .dia cache was found"):
+        run_transcriptome_to_proteomics(args=args)
 
 
 # ──────────────────────────────────────────────────────────────────────
