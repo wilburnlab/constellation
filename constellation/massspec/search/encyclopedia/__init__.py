@@ -48,6 +48,8 @@ from constellation.massspec.search.encyclopedia.library_export import (
     run_library_export,
 )
 from constellation.massspec.search.encyclopedia.library_search import (
+    build_library_search_args,
+    find_search_elib,
     run_library_search,
 )
 from constellation.massspec.search.encyclopedia.predict_library import (
@@ -62,11 +64,13 @@ from constellation.massspec.search.encyclopedia.process_dia import (
 __all__ = [
     "PtmToggle",
     "SUPPORTED_VERSIONS",
+    "build_library_search_args",
     "build_manifest_envelope",
     "build_predict_library_args",
     "build_process_dia_args",
     "default_heap_for_input",
     "encyclopedia_passthrough_args",
+    "find_search_elib",
     "ptm_toggle_args",
     "run_library_export",
     "run_library_search",

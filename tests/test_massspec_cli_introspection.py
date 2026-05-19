@@ -47,7 +47,10 @@ def test_all_four_subcommands_register() -> None:
 @pytest.mark.parametrize(
     "subcommand, required_args",
     [
-        ("search", {"--mzml", "--library", "--fasta", "--output-dir"}),
+        # --fasta is optional for search per EncyclopeDIA 6.5.15 — the
+        # default-mode library search doesn't require it when the
+        # library already carries decoys (e.g. predict-library output).
+        ("search", {"--mzml", "--library", "--output-dir"}),
         ("predict-library", {"--fasta", "--output-dlib", "--output-dir"}),
         ("process-dia", {"--inputs", "--output-dia", "--output-dir"}),
         (
@@ -176,11 +179,6 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
     "subcommand,minimal_args",
     [
         (
-            "search",
-            ["--mzml", "x.mzML", "--library", "x.elib", "--fasta", "x.fa",
-             "--output-dir", "/tmp/x"],
-        ),
-        (
             "library-export",
             ["--search-dir", "/tmp/sr", "--library", "x.dlib",
              "--output-elib", "x.elib", "--output-dir", "/tmp/x"],
@@ -191,8 +189,8 @@ def test_stub_handlers_return_exit_2(
     subcommand: str, minimal_args: list[str], capsys: pytest.CaptureFixture
 ) -> None:
     """Subcommands whose runner isn't wired yet print a helpful error +
-    return exit code 2. predict-library and process-dia are excluded —
-    both are wired."""
+    return exit code 2. predict-library, process-dia, and search are
+    excluded — all three are wired."""
     parser = _build_massspec_only_parser()
     args = parser.parse_args(["massspec", subcommand, *minimal_args])
     rc = args.func(args)

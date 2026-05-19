@@ -74,7 +74,40 @@ Stubbed below — populated as the PRs land.
 
 ### (default) library search
 
-*Pending PR 1.*
+Invocation: `java -jar encyclopedia-6.5.15.jar -i <input> -l <library> [...]`
+
+Verified from `java -jar encyclopedia-6.5.15.jar --help` on 6.5.15.
+
+**Required flags:**
+
+| Flag | Type | Notes |
+|---|---|---|
+| `-i` | path | input `.DIA` or `.mzML` (or vendor `.raw`/`.d` via bundled MSRawJava) |
+| `-l` | path | library `.dlib` (chromatogram-free predicted) or `.elib` (chromatogram library) |
+
+**Common optional flags (wrapped as typed CLI args):**
+
+| Flag | Default | Constellation CLI flag |
+|---|---|---|
+| `-o` | `<input>.encyclopedia.txt` | always set by handler to `<output-dir>/<input-stem>.encyclopedia.txt` |
+| `-f` | — | `--fasta` (optional; required only for non-EncyclopeDIA-pathway scoring) |
+| `-ftol` / `-ftolunits` | `10 ppm` | `--fragment-tolerance-ppm` (assumed ppm) |
+| `-ptol` / `-ptolunits` | `10 ppm` | `--precursor-tolerance-ppm` (assumed ppm) |
+| `-acquisition` | `DIA` | `--acquisition` |
+| `-enzyme` | `trypsin` | `--enzyme` |
+| `-frag` | `CID` | `--fragmentation` |
+| `-percolatorVersion` | `v3-01` | `--percolator-version` |
+| `-percolatorThreshold` | `0.01` | `--percolator-threshold` |
+| `-percolatorProteinThreshold` | `0.01` | `--percolator-protein-threshold` |
+| `-numberOfThreadsUsed` | `20` | `--threads` |
+
+**Anything not wrapped** passes through via `--encyclopedia-arg FLAG=VALUE` (repeatable). The full flag surface (~50 options including `-adjustInferredRTBoundaries`, `-expectedPeakWidth`, `-filterPeaklists`, `-fixed C=57.0214635`, `-foffset`, `-integratePrecursors`, `-lftol`, `-localizationModification`, `-maskBadIntegrations`, `-maxWindowWidth`, `-minIntensity`, `-minIntensityNumIons`, `-minNumIntegratedRTPoints`, `-minNumOfQuantitativePeaks`, `-normalizeByTIC`, `-numberOfExtraDecoyLibrariesSearche`, `-numberOfQuantitativePeaks`, `-percolatorTrainingFDR`, `-percolatorTrainingSetSize`, `-poffset`, `-precursorIsolationMargin`, `-precursorWindowSize`, `-rtWindowInMin`, `-scoringBreadthType`, `-skipLibraryRetentionTime`, `-smoothIntegrations`, `-subtractBackground`, `-topNTargetsUsed`, `-usePercolator`, `-verifyModificationIons`) is documented in the jar's `--help`; expose typed flags here as lab use cases demand them.
+
+**Output convention quirk worth knowing:** the chromatogram `.elib` lands **next to the input file** as `<input>.elib` (EncyclopeDIA convention; not redirectable via `-o`, which controls only the `.encyclopedia.txt` report). The Constellation handler runs the jar with `cwd=output_dir` to keep incidental files in the run-dir, then locates the produced `.elib` via filename convention for the auto-ingest step.
+
+Diff vs 2.12.30:
+- **Default Percolator version changed**: was `v3-01` in 2.12.30 too; the `v3-05` Linux binary is also bundled in 6.5.15 for users who want to opt into newer Percolator.
+- **Vendor-raw input support**: 6.5.15 accepts `.raw`/`.d` directly via bundled MSRawJava (2.12.30 required msconvert).
 
 ### `-convert -fastaToJChronologerLibrary`
 
