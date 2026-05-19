@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
@@ -134,6 +135,34 @@ PEAK_TABLE = pa.schema(
 )
 
 
+# Generic pairwise-alignment record. Universal across modalities that
+# produce homology hits — mmseqs2 (protein-vs-protein), BLAST, DIAMOND.
+# Coordinates follow the mmseqs2 / BLAST convention: 1-indexed and
+# inclusive on both ends; this is preserved across the boundary so
+# downstream tools that consume the CIGAR don't have to re-convert.
+# (Sequencing-side BAM alignments use 0-based half-open and live under
+# the separate ``sequencing.schemas.alignment.ALIGNMENT_TABLE`` schema.)
+ALIGNMENT_HIT_TABLE = pa.schema(
+    [
+        pa.field("query", pa.string(), nullable=False),
+        pa.field("target", pa.string(), nullable=False),
+        pa.field("evalue", pa.float64(), nullable=False),
+        pa.field("qstart", pa.int64(), nullable=False),
+        pa.field("qend", pa.int64(), nullable=False),
+        pa.field("tstart", pa.int64(), nullable=False),
+        pa.field("tend", pa.int64(), nullable=False),
+        pa.field("cigar", pa.string(), nullable=False),
+        # OPTIONAL tier annotation — populated by the caller (e.g. the
+        # novel-peptide classifier infers tier from target membership in
+        # the reference proteome) or by an upstream pipeline that runs
+        # tiered alignment passes. May be NULL on rows that haven't been
+        # tier-tagged.
+        pa.field("alignment_tier", pa.string(), nullable=True),
+    ],
+    metadata={b"schema_name": b"AlignmentHitTable"},
+)
+
+
 # ----------------------------------------------------------------------
 # Schema registry
 # ----------------------------------------------------------------------
@@ -141,6 +170,7 @@ PEAK_TABLE = pa.schema(
 _REGISTRY: dict[str, pa.Schema] = {
     "Trace1D": TRACE_1D,
     "PeakTable": PEAK_TABLE,
+    "AlignmentHitTable": ALIGNMENT_HIT_TABLE,
     # SpectraMatrix2D is parametric (n_axis) — register the canonical
     # *factory* under a distinct key so consumers can ask "is this a
     # SpectraMatrix2D?" without committing to a specific axis size.
@@ -358,3 +388,77 @@ def cast_to_schema(table: pa.Table, target: pa.Schema) -> pa.Table:
     incoming_meta.update(target_meta)
     out_schema = pa.schema(new_fields, metadata=pack_metadata(incoming_meta))
     return pa.table(new_cols, schema=out_schema)
+
+
+# ----------------------------------------------------------------------
+# mmseqs2 .tab reader → AlignmentHitTable
+# ----------------------------------------------------------------------
+
+
+def read_mmseqs_tab(
+    path: Path | str,
+    *,
+    alignment_tier: str | None = None,
+) -> pa.Table:
+    """Parse a headerless mmseqs2 ``.tab`` TSV into ``ALIGNMENT_HIT_TABLE``.
+
+    Expects the 8-column ``--format-output`` cartographer's pipeline uses
+    (and which the cartographer reference parser ``parse_mmseqs_hits``
+    consumes):
+
+        query, target, evalue, qstart, qend, tstart, tend, cigar
+
+    Coordinate columns are 1-indexed inclusive on both ends — preserved
+    as-is so downstream CIGAR walkers don't have to re-convert.
+
+    Parameters
+    ----------
+    path
+        Path to the mmseqs2 ``.tab`` file (headerless, tab-delimited).
+    alignment_tier
+        Optional value to populate the ``alignment_tier`` column with.
+        When ``None``, the column is filled with nulls and downstream
+        consumers (e.g. ``classify_novel_peptides``) can infer it from
+        target membership in the reference proteome. Pass an explicit
+        value when ingesting a single-database run where the tier is
+        externally known.
+
+    Returns
+    -------
+    pa.Table
+        ``ALIGNMENT_HIT_TABLE``-shaped. Empty (with the right schema)
+        when the file is missing or empty.
+    """
+    import pyarrow.csv as pa_csv
+
+    p = Path(path)
+    if not p.exists() or p.stat().st_size == 0:
+        return ALIGNMENT_HIT_TABLE.empty_table()
+
+    field_names = ["query", "target", "evalue", "qstart", "qend", "tstart", "tend", "cigar"]
+    table = pa_csv.read_csv(
+        str(p),
+        read_options=pa_csv.ReadOptions(column_names=field_names),
+        parse_options=pa_csv.ParseOptions(delimiter="\t"),
+        convert_options=pa_csv.ConvertOptions(
+            column_types={
+                "query": pa.string(),
+                "target": pa.string(),
+                "evalue": pa.float64(),
+                "qstart": pa.int64(),
+                "qend": pa.int64(),
+                "tstart": pa.int64(),
+                "tend": pa.int64(),
+                "cigar": pa.string(),
+            },
+        ),
+    )
+
+    if alignment_tier is None:
+        tier_col = pa.nulls(table.num_rows, type=pa.string())
+    else:
+        tier_col = pa.array(
+            [alignment_tier] * table.num_rows, type=pa.string()
+        )
+    table = table.append_column("alignment_tier", tier_col)
+    return cast_to_schema(table, ALIGNMENT_HIT_TABLE)

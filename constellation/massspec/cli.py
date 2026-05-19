@@ -64,6 +64,7 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     _build_predict_library_parser(ms_subs)
     _build_process_dia_parser(ms_subs)
     _build_library_export_parser(ms_subs)
+    _build_classify_novel_peptides_parser(ms_subs)
 
 
 # ── search ──────────────────────────────────────────────────────────────
@@ -462,6 +463,111 @@ def _build_library_export_parser(subs: argparse._SubParsersAction) -> None:
         help="suppress live stderr streaming of the jar's stdout/stderr",
     )
     p.set_defaults(func=_cmd_massspec_library_export)
+
+
+# ── classify-novel-peptides ─────────────────────────────────────────────
+
+
+def _build_classify_novel_peptides_parser(
+    subs: argparse._SubParsersAction,
+) -> None:
+    p = subs.add_parser(
+        "classify-novel-peptides",
+        help=(
+            "Classify detected novel peptides against a reference-vs-novel "
+            "mmseqs2 alignment. Walks each per-hit CIGAR string and assigns "
+            "one of 11 deviation classes (snp / insertion / deletion / "
+            "complex / truncations / cutsite mutation / deviations / "
+            "unknown / non_reference). Ports the cartographer "
+            "nanopore.classify_novel_peptides workflow."
+        ),
+    )
+    p.add_argument(
+        "--search-results",
+        required=True,
+        type=Path,
+        help=(
+            "Path to a ParquetDir Search bundle, OR a .elib SQLite file. "
+            "Only the detected-peptide sequence set is consulted (column "
+            "PeptideSeq for .elib; peptide_id+modseq-joined-to-library for "
+            "ParquetDir)."
+        ),
+    )
+    p.add_argument(
+        "--library",
+        required=True,
+        type=Path,
+        help=(
+            "Path to a ParquetDir Library bundle. Used to resolve "
+            "peptide_id ↔ peptide_sequence when --search-results is a "
+            "ParquetDir Search."
+        ),
+    )
+    p.add_argument(
+        "--alignment-hits",
+        required=True,
+        type=Path,
+        help=(
+            "Path to an AlignmentHits ParquetDir bundle, OR a headerless "
+            "mmseqs2 .tab TSV with the canonical 8-column layout "
+            "(query, target, evalue, qstart, qend, tstart, tend, cigar). "
+            "May contain mixed reference + swissprot hits per query — "
+            "tier inference happens internally based on target membership "
+            "in the reference proteome."
+        ),
+    )
+    p.add_argument(
+        "--reference-fasta",
+        required=True,
+        type=Path,
+        help=(
+            "Reference proteome FASTA. Also serves as the tier-inference "
+            "source: any hit whose target accession is not in this FASTA "
+            "is treated as non_reference and short-circuits to that "
+            "classification."
+        ),
+    )
+    p.add_argument(
+        "--novel-fasta",
+        required=True,
+        type=Path,
+        help="Novel proteome FASTA (transcript-derived novel proteins).",
+    )
+    _add_output_dir_arg(p)
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip the classification if <output-dir>/_SUCCESS exists",
+    )
+    p.add_argument(
+        "--enzyme",
+        default="Trypsin",
+        help="enzyme for tryptic digestion (default Trypsin)",
+    )
+    p.add_argument(
+        "--max-missed-cleavages",
+        type=int,
+        default=1,
+        help="max missed cleavages in tryptic digest (default 1)",
+    )
+    p.add_argument(
+        "--min-peptide-length",
+        type=int,
+        default=7,
+        help="min peptide length kept in the digest (default 7)",
+    )
+    p.add_argument(
+        "--max-peptide-length",
+        type=int,
+        default=50,
+        help="max peptide length kept in the digest (default 50)",
+    )
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="suppress progress messages on stderr",
+    )
+    p.set_defaults(func=_cmd_massspec_classify_novel_peptides)
 
 
 # ── shared arg helpers ──────────────────────────────────────────────────
@@ -1234,6 +1340,276 @@ def _cmd_massspec_process_dia(args: argparse.Namespace) -> int:
 
 def _cmd_massspec_library_export(_args: argparse.Namespace) -> int:
     return _not_yet_wired("library-export")
+
+
+def _cmd_massspec_classify_novel_peptides(args: argparse.Namespace) -> int:
+    """Classify detected novel peptides against a reference-vs-novel
+    mmseqs2 alignment and write a NOVEL_PEPTIDE_TABLE-shaped bundle.
+    """
+    import json as _json
+    import sys as _sys
+
+    from constellation import __version__ as constellation_version
+    from constellation.core.io.schemas import (
+        ALIGNMENT_HIT_TABLE,
+        read_mmseqs_tab,
+    )
+    from constellation.massspec.search import (
+        build_gene_map_from_fasta_headers,
+        classify_novel_peptides,
+        read_fasta_proteins,
+        save_novel_peptides,
+    )
+
+    search_results = Path(args.search_results).resolve()
+    library_path = Path(args.library).resolve()
+    alignment_hits = Path(args.alignment_hits).resolve()
+    reference_fasta = Path(args.reference_fasta).resolve()
+    novel_fasta = Path(args.novel_fasta).resolve()
+    output_dir = Path(args.output_dir).resolve()
+
+    for label, p in [
+        ("--search-results", search_results),
+        ("--library", library_path),
+        ("--alignment-hits", alignment_hits),
+        ("--reference-fasta", reference_fasta),
+        ("--novel-fasta", novel_fasta),
+    ]:
+        if not p.exists():
+            print(f"error: {label} not found: {p}", file=_sys.stderr)
+            return 1
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    success_path = output_dir / "_SUCCESS"
+    if success_path.exists() and not args.resume:
+        print(
+            f"error: --output-dir already complete (touch _SUCCESS exists). "
+            f"Pass --resume to re-use it, or delete {output_dir} to start "
+            f"fresh.",
+            file=_sys.stderr,
+        )
+        return 1
+    if success_path.exists() and args.resume:
+        print(f"already complete: {output_dir}")
+        return 0
+
+    # 1. Load detected peptides
+    if not args.no_progress:
+        print(
+            f"[classify-novel-peptides] loading detected peptides from "
+            f"{search_results} ...",
+            file=_sys.stderr,
+        )
+    detected_peptides = _load_detected_peptides(search_results, library_path)
+
+    # 2. Load alignments
+    if not args.no_progress:
+        print(
+            f"[classify-novel-peptides] loading alignments from "
+            f"{alignment_hits} ...",
+            file=_sys.stderr,
+        )
+    if alignment_hits.is_dir():
+        # ParquetDir bundle
+        import pyarrow.parquet as pq
+        candidate = alignment_hits / "alignment_hits.parquet"
+        if not candidate.is_file():
+            candidate = alignment_hits / "alignments.parquet"
+        if not candidate.is_file():
+            print(
+                "error: --alignment-hits dir has no recognised parquet file "
+                "(looked for alignment_hits.parquet and alignments.parquet)",
+                file=_sys.stderr,
+            )
+            return 1
+        alignments = pq.read_table(candidate)
+    else:
+        alignments = read_mmseqs_tab(alignment_hits)
+    # Ensure schema match before passing to the classifier
+    from constellation.core.io.schemas import cast_to_schema
+    alignments = cast_to_schema(alignments, ALIGNMENT_HIT_TABLE)
+
+    # 3. Load proteomes
+    if not args.no_progress:
+        print(
+            "[classify-novel-peptides] loading reference + novel proteomes ...",
+            file=_sys.stderr,
+        )
+    reference_proteins = read_fasta_proteins(reference_fasta)
+    novel_proteins = read_fasta_proteins(novel_fasta)
+    gene_map = build_gene_map_from_fasta_headers(
+        [reference_fasta, novel_fasta]
+    )
+
+    # 4. Classify
+    if not args.no_progress:
+        print(
+            f"[classify-novel-peptides] classifying "
+            f"{detected_peptides.num_rows:,} detected peptides against "
+            f"{alignments.num_rows:,} alignment hits "
+            f"(novel proteins: {novel_proteins.num_rows:,}; "
+            f"reference proteins: {reference_proteins.num_rows:,}) ...",
+            file=_sys.stderr,
+        )
+    result = classify_novel_peptides(
+        detected_peptides=detected_peptides,
+        alignments=alignments,
+        reference_proteins=reference_proteins,
+        novel_proteins=novel_proteins,
+        gene_map=gene_map,
+        enzyme=args.enzyme,
+        max_missed_cleavages=args.max_missed_cleavages,
+        min_peptide_length=args.min_peptide_length,
+        max_peptide_length=args.max_peptide_length,
+    )
+
+    # 5. Write output
+    save_novel_peptides(
+        result,
+        output_dir,
+        metadata={
+            "constellation_version": constellation_version,
+            "search_results": str(search_results),
+            "library": str(library_path),
+            "alignment_hits": str(alignment_hits),
+            "reference_fasta": str(reference_fasta),
+            "novel_fasta": str(novel_fasta),
+            "enzyme": args.enzyme,
+            "max_missed_cleavages": args.max_missed_cleavages,
+            "min_peptide_length": args.min_peptide_length,
+            "max_peptide_length": args.max_peptide_length,
+        },
+    )
+
+    # 6. Run-level manifest
+    import os as _os
+    import socket
+    import platform
+
+    classification_counts: dict[str, int] = {}
+    for c in result.column("classification").to_pylist():
+        classification_counts[c] = classification_counts.get(c, 0) + 1
+    manifest = {
+        "constellation_version": constellation_version,
+        "subcommand": "massspec classify-novel-peptides",
+        "argv": _sys.argv,
+        "inputs": {
+            "search_results": str(search_results),
+            "library": str(library_path),
+            "alignment_hits": str(alignment_hits),
+            "reference_fasta": str(reference_fasta),
+            "novel_fasta": str(novel_fasta),
+        },
+        "outputs": {
+            "novel_peptides_pqdir": str(output_dir),
+        },
+        "params": {
+            "enzyme": args.enzyme,
+            "max_missed_cleavages": args.max_missed_cleavages,
+            "min_peptide_length": args.min_peptide_length,
+            "max_peptide_length": args.max_peptide_length,
+        },
+        "runtime": {
+            "host": socket.gethostname(),
+            "platform": platform.platform(),
+            "python": _sys.version.split()[0],
+            "user": _os.environ.get("USER", "unknown"),
+        },
+        "counts": {
+            "novel_peptides": result.num_rows,
+            "classifications": classification_counts,
+        },
+    }
+    (output_dir / "manifest.json").write_text(_json.dumps(manifest, indent=2) + "\n")
+    success_path.write_bytes(b"")
+
+    if not args.no_progress:
+        print(
+            f"classify-novel-peptides done: {result.num_rows:,} unique novel "
+            f"peptides classified → {output_dir}/novel_peptides.parquet",
+            file=_sys.stderr,
+        )
+        for cls in sorted(
+            classification_counts, key=lambda c: classification_counts[c],
+            reverse=True,
+        ):
+            print(f"  {cls:30s}  {classification_counts[cls]:>6,}", file=_sys.stderr)
+    return 0
+
+
+def _load_detected_peptides(
+    search_results: Path, library_path: Path
+) -> "pa.Table":  # noqa: F821 — pa import-on-demand below
+    """Load detected peptides as a (peptide_sequence, peptide_id?,
+    modified_sequence?) Arrow table.
+
+    Two supported inputs:
+      * ``.elib`` SQLite — pull the ``PeptideSeq`` column from the
+        ``entries`` table (the cartographer-compatible path).
+      * ParquetDir Search bundle — join ``peptide_scores.parquet`` to
+        ``<library>/peptides.parquet`` on ``peptide_id`` to recover the
+        canonical sequence.
+    """
+    import pyarrow as pa
+    import sqlite3
+
+    if search_results.suffix in (".elib", ".dlib"):
+        con = sqlite3.connect(str(search_results))
+        try:
+            rows = con.execute(
+                "SELECT DISTINCT PeptideSeq, PeptideModSeq "
+                "FROM entries WHERE PeptideSeq IS NOT NULL"
+            ).fetchall()
+        finally:
+            con.close()
+        return pa.table(
+            {
+                "peptide_sequence": pa.array(
+                    [r[0] for r in rows], type=pa.string()
+                ),
+                "modified_sequence": pa.array(
+                    [r[1] for r in rows], type=pa.string()
+                ),
+            }
+        )
+
+    # ParquetDir Search bundle: search-results dir + a library to join on
+    import pyarrow.parquet as pq
+
+    from constellation.massspec.library.io import load_library
+
+    library = load_library(library_path, format="parquet_dir")
+    peptide_id_to_seq = {
+        pid: (seq, modseq)
+        for pid, seq, modseq in zip(
+            library.peptides.column("peptide_id").to_pylist(),
+            library.peptides.column("sequence").to_pylist(),
+            library.peptides.column("modified_sequence").to_pylist(),
+            strict=True,
+        )
+    }
+    peptide_scores = pq.read_table(search_results / "peptide_scores.parquet")
+    seen: set[int] = set()
+    peptide_ids: list[int] = []
+    seqs: list[str] = []
+    modseqs: list[str | None] = []
+    for pid in peptide_scores.column("peptide_id").to_pylist():
+        if pid in seen:
+            continue
+        seen.add(pid)
+        entry = peptide_id_to_seq.get(pid)
+        if entry is None:
+            continue
+        seqs.append(entry[0])
+        modseqs.append(entry[1])
+        peptide_ids.append(pid)
+    return pa.table(
+        {
+            "peptide_id": pa.array(peptide_ids, type=pa.int64()),
+            "peptide_sequence": pa.array(seqs, type=pa.string()),
+            "modified_sequence": pa.array(modseqs, type=pa.string()),
+        }
+    )
 
 
 __all__ = ["build_parser"]

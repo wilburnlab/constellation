@@ -38,6 +38,7 @@ def test_all_four_subcommands_register() -> None:
         "predict-library",
         "process-dia",
         "library-export",
+        "classify-novel-peptides",
     }
 
 
@@ -56,6 +57,13 @@ def test_all_four_subcommands_register() -> None:
         (
             "library-export",
             {"--search-dir", "--library", "--output-elib", "--output-dir"},
+        ),
+        (
+            "classify-novel-peptides",
+            {
+                "--search-results", "--library", "--alignment-hits",
+                "--reference-fasta", "--novel-fasta", "--output-dir",
+            },
         ),
     ],
 )
@@ -147,7 +155,7 @@ def test_predict_library_carbamidomethyl_default_fix() -> None:
 
 def test_dashboard_introspector_sees_all_subcommands() -> None:
     """The viz dashboard auto-generates forms from the argparse tree.
-    Walking the parser must surface massspec → {4 subcommands} with
+    Walking the parser must surface massspec → all subcommands with
     arguments populated.
     """
     pytest.importorskip("constellation.viz.introspect.walk")
@@ -166,6 +174,7 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
         "predict-library",
         "process-dia",
         "library-export",
+        "classify-novel-peptides",
     }
     # Each subcommand has a non-empty argument list
     for sub in massspec_node["subcommands"]:

@@ -57,11 +57,71 @@ PROTEIN_SCORE_TABLE: pa.Schema = pa.schema(
 )
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Novel peptide classification output
+# ──────────────────────────────────────────────────────────────────────
+
+
+# Output of ``classify_novel_peptides`` — one row per unique detected
+# novel peptide sequence, classified against an mmseqs2 alignment of
+# the novel proteome vs the reference proteome (+ optionally
+# Swiss-Prot). Per-peptide deduplication keeps the most-canonical
+# classification (priority ordering from ``massspec.search.novel.
+# _CLASSIFICATION_PRIORITY``: snp < insertion < deletion < complex <
+# truncations < trypsin_cutsite_mutation < deviations < unknown <
+# non_reference).
+NOVEL_PEPTIDE_TABLE: pa.Schema = pa.schema(
+    [
+        # FK to Library.peptides.peptide_id when bound; null when the
+        # function is invoked on raw peptide-sequence input that hasn't
+        # been linked to a Library.
+        pa.field("peptide_id", pa.int64(), nullable=True),
+        # Canonical AA sequence (no modifications) — the cartographer
+        # algorithm operates on canonical sequences only.
+        pa.field("peptide_sequence", pa.string(), nullable=False),
+        # ProForma 2.0 string, when the peptide is bound to a Library
+        # row that carries modseq info. Null otherwise.
+        pa.field("modified_sequence", pa.string(), nullable=True),
+        # One of the 11 classes from _CLASSIFICATION_PRIORITY.
+        pa.field("classification", pa.string(), nullable=False),
+        # Aligned reference substring at the peptide's locus
+        # (CIGAR-walk derived). Empty string when not applicable
+        # (e.g. n_term_deviation, non_reference, unknown).
+        pa.field("ref_seq", pa.string(), nullable=True),
+        # Novel protein accession (from novel_proteins input).
+        pa.field("protein_id", pa.string(), nullable=False),
+        # Reference protein accession the alignment found (mmseqs2 hit
+        # target). Null when there's no hit for the novel protein.
+        pa.field("ref_protein_id", pa.string(), nullable=True),
+        # Gene symbol, populated from gene_map if provided.
+        pa.field("gene", pa.string(), nullable=True),
+        # Transcript ID, populated from transcript_map if provided.
+        pa.field("transcript", pa.string(), nullable=True),
+        # mmseqs2 CIGAR string for the hit (query-centric, 1-indexed
+        # inclusive coordinates). Empty when no hit.
+        pa.field("cigar", pa.string(), nullable=True),
+        # "reference" (target found in reference_proteins) vs whatever
+        # upstream tier-tag came in on the alignment row. Null when
+        # neither.
+        pa.field("alignment_tier", pa.string(), nullable=True),
+        # Full novel protein sequence — present for downstream
+        # validation / re-classification without needing the
+        # novel-proteins FASTA at hand.
+        pa.field("novel_protein_seq", pa.string(), nullable=True),
+        # Full reference protein sequence at the aligned target.
+        pa.field("ref_protein_seq", pa.string(), nullable=True),
+    ],
+    metadata={b"schema_name": b"NovelPeptideTable"},
+)
+
+
 register_schema("PeptideScoreTable", PEPTIDE_SCORE_TABLE)
 register_schema("ProteinScoreTable", PROTEIN_SCORE_TABLE)
+register_schema("NovelPeptideTable", NOVEL_PEPTIDE_TABLE)
 
 
 __all__ = [
+    "NOVEL_PEPTIDE_TABLE",
     "PEPTIDE_SCORE_TABLE",
     "PROTEIN_SCORE_TABLE",
 ]

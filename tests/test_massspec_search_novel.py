@@ -1,0 +1,482 @@
+"""Tier A tests for `constellation.massspec.search.novel`.
+
+Synthetic inputs (no real .elib / FASTA fixtures required). One test per
+classification class plus a couple of end-to-end coverage tests that
+exercise the full `classify_novel_peptides` workflow on a hand-built
+2-protein corpus.
+
+The classifier logic is a direct port of cartographer's CIGAR-walking
+algorithm — see `cartographer/data/nanopore.py` lines 685-850 for the
+reference implementation.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pyarrow as pa
+import pytest
+
+from constellation.core.io.schemas import (
+    ALIGNMENT_HIT_TABLE,
+    read_mmseqs_tab,
+)
+from constellation.massspec.search.novel import (
+    _CLASSIFICATION_PRIORITY,
+    classify_novel_peptides,
+    classify_single_peptide,
+    read_fasta_proteins,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# classify_single_peptide — one synthetic case per class
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _hit(query="N1", target="R1", qstart=1, qend=10, tstart=1, tend=10,
+         cigar="10M", tier="reference"):
+    """Build a hit dict shaped like one row of ALIGNMENT_HIT_TABLE."""
+    return {
+        "query": query, "target": target, "evalue": 1e-50,
+        "qstart": qstart, "qend": qend, "tstart": tstart, "tend": tend,
+        "cigar": cigar, "alignment_tier": tier,
+    }
+
+
+def test_classify_snp() -> None:
+    """Single mismatch in the peptide span → snp."""
+    # Novel protein has K at position 5 (1-indexed); reference has R.
+    # Peptide spans positions 3-7 (0-indexed 2-7) which is inside the
+    # 10-residue alignment.
+    novel    = "MAGCKLPPGR"  # peptide G[CKL]P → "GCKLP"
+    ref      = "MAGCRLPPGR"  # same positions but with R instead of K
+    hit = _hit(qstart=1, qend=10, tstart=1, tend=10, cigar="10M")
+    refs = {"R1": ref}
+    cls, ref_seq = classify_single_peptide("GCKLP", novel, hit, refs)
+    assert cls == "snp"
+    assert ref_seq == "GCRLP"  # reference at the peptide span
+
+
+def test_classify_insertion() -> None:
+    """Inserted residue in query within peptide span → insertion."""
+    # 3-residue insertion in the middle of the alignment.
+    # Novel: MAGCK AAA LPPGR (positions 1-13)
+    # Ref:   MAGCK     LPPGR (positions 1-10)
+    # CIGAR (query-centric): 5M 3I 5M
+    novel    = "MAGCKAAALPPGR"
+    ref      = "MAGCKLPPGR"
+    hit = _hit(qstart=1, qend=13, tstart=1, tend=10, cigar="5M3I5M")
+    refs = {"R1": ref}
+    # Peptide spans the inserted region: "CKAAAL"
+    cls, _ = classify_single_peptide("CKAAAL", novel, hit, refs)
+    assert cls == "insertion"
+
+
+def test_classify_deletion() -> None:
+    """Deleted residue in query (gap in novel) within peptide span → deletion."""
+    # Novel:        MAG CK     LPPGR  (query positions 1-10)
+    # Ref:          MAG CK AAA LPPGR  (target positions 1-13)
+    # CIGAR (query-centric): 5M 3D 5M
+    novel    = "MAGCKLPPGR"
+    ref      = "MAGCKAAALPPGR"
+    hit = _hit(qstart=1, qend=10, tstart=1, tend=13, cigar="5M3D5M")
+    refs = {"R1": ref}
+    cls, _ = classify_single_peptide("CKLPP", novel, hit, refs)
+    assert cls == "deletion"
+
+
+def test_classify_complex() -> None:
+    """Two or more event types within the peptide span → complex."""
+    # Mismatch + insertion within span
+    # Novel:  M A G C K A A A L P P G R   (13 residues, K mismatch at pos 5)
+    # Ref:    M A G C R           L P P G R  (10 residues, R at pos 5)
+    # CIGAR: 5M 3I 5M (the 5 at the start contains the mismatch)
+    novel    = "MAGCKAAALPPGR"
+    ref      = "MAGCRLPPGR"
+    hit = _hit(qstart=1, qend=13, tstart=1, tend=10, cigar="5M3I5M")
+    refs = {"R1": ref}
+    cls, _ = classify_single_peptide("CKAAAL", novel, hit, refs)
+    assert cls == "complex"
+
+
+def test_classify_n_terminal_truncation() -> None:
+    """Peptide flush at novel N-terminus; reference extends further upstream."""
+    # Novel:  MKPR             (4 residues; peptide MKPR matches full novel)
+    # Ref:    ...PRELUDEMKPR   (peptide MKPR is FOUND in ref but at offset > 0)
+    # CIGAR all-match, no deviations
+    novel = "MKPR"
+    ref = "PRELUDEMKPR"
+    hit = _hit(qstart=1, qend=4, tstart=8, tend=11, cigar="4M")
+    refs = {"R1": ref}
+    cls, _ = classify_single_peptide("MKPR", novel, hit, refs)
+    assert cls == "n_terminal_truncation"
+
+
+def test_classify_c_terminal_truncation() -> None:
+    """Peptide flush at novel C-terminus; reference extends further downstream."""
+    novel = "MKPR"
+    ref = "MKPRPOSTLUDE"
+    hit = _hit(qstart=1, qend=4, tstart=1, tend=4, cigar="4M")
+    refs = {"R1": ref}
+    cls, _ = classify_single_peptide("MKPR", novel, hit, refs)
+    assert cls == "c_terminal_truncation"
+
+
+def test_classify_trypsin_cutsite_mutation() -> None:
+    """Peptide is identical in novel and reference but a flanking AA
+    differs — i.e. a SNP outside the peptide span created (or removed)
+    a tryptic cut site. The cartographer rule: novel_left != ref_left
+    OR novel_right != ref_right (peptide_span all-match)."""
+    # Novel:  AAA K LIGHTPEPT R BBB    (position 3 = 'K' — cut site)
+    # Ref:    AAA P LIGHTPEPT R BBB    (position 3 = 'P' — NO cut site)
+    # Both proteins are 17 residues; CIGAR all-match across them.
+    # Position 3 is OUTSIDE the peptide span (4..13) so has_mismatch
+    # stays False inside the peptide → falls through to all-match
+    # branch → flank check detects the K vs P difference at pep_start-1.
+    novel = "AAAKLIGHTPEPTRBBB"
+    ref   = "AAAPLIGHTPEPTRBBB"
+    hit = _hit(qstart=1, qend=17, tstart=1, tend=17, cigar="17M")
+    refs = {"R1": ref}
+    cls, _ = classify_single_peptide("LIGHTPEPT", novel, hit, refs)
+    assert cls == "trypsin_cutsite_mutation"
+
+
+def test_classify_n_term_deviation() -> None:
+    """Peptide starts before the alignment range → n_term_deviation."""
+    # 20-residue novel; alignment covers positions 11-20 (qstart=11)
+    # Peptide is from positions 1-9 — entirely before the alignment.
+    novel = "MAGCKLAPLRDGGGQRSTAV"  # 20 residues — valid AAs only
+    ref = "DGGGQRSTAV"               # 10-residue reference, aligns to novel[10:20]
+    hit = _hit(qstart=11, qend=20, tstart=1, tend=10, cigar="10M")
+    refs = {"R1": ref}
+    cls, _ = classify_single_peptide("MAGCKLAPL", novel, hit, refs)
+    assert cls == "n_term_deviation"
+
+
+def test_classify_c_term_deviation() -> None:
+    """Peptide ends after the alignment range → c_term_deviation."""
+    novel = "MAGCKLAPLRDGGGQRSTAV"   # 20 residues — valid AAs only
+    ref = "MAGCKLAPLR"                # 10-residue ref, aligns to novel[0:10]
+    hit = _hit(qstart=1, qend=10, tstart=1, tend=10, cigar="10M")
+    refs = {"R1": ref}
+    cls, _ = classify_single_peptide("GGGQRSTAV", novel, hit, refs)
+    assert cls == "c_term_deviation"
+
+
+def test_classify_unknown_no_hit() -> None:
+    """No alignment hit for the protein → unknown via the batch path."""
+    # NOVEL_NO_HIT tryptic digest produces "LIGHTPEPTIDK" as the
+    # post-MAGCR cut peptide. Reference has no equivalent so the
+    # peptide is in theoretical_novel; with no hit in alignments,
+    # the batch path emits "unknown".
+    detected = pa.table({"peptide_sequence": pa.array(["LIGHTPEPTIDK"])})
+    novel = pa.table(
+        {
+            "protein_id": pa.array(["NOVEL_NO_HIT"]),
+            "sequence": pa.array(["MAGCRLIGHTPEPTIDKRAWN"]),
+        }
+    )
+    reference = pa.table(
+        {
+            "protein_id": pa.array(["REF1"]),
+            "sequence": pa.array(["MAGYRDIFFERENTREFPRTEIN"]),
+        }
+    )
+    alignments = ALIGNMENT_HIT_TABLE.empty_table()
+    result = classify_novel_peptides(
+        detected_peptides=detected,
+        alignments=alignments,
+        reference_proteins=reference,
+        novel_proteins=novel,
+    )
+    classifications = result.column("classification").to_pylist()
+    assert classifications == ["unknown"]
+
+
+def test_classify_non_reference() -> None:
+    """Hit target NOT in reference_proteins → non_reference."""
+    novel = "MAGCKLIGHTPEPTKRAW"
+    # Pass an alignment_tier explicitly set to anything other than
+    # "reference" — classify_single_peptide short-circuits to
+    # non_reference.
+    hit = _hit(target="SWISSPROT_HIT", qstart=1, qend=18, tstart=1,
+               tend=18, cigar="18M", tier="swissprot")
+    refs = {"SWISSPROT_HIT": novel}
+    cls, ref_seq = classify_single_peptide("CKLIGHTPEPTKR", novel, hit, refs)
+    assert cls == "non_reference"
+    assert ref_seq == ""
+
+
+# ──────────────────────────────────────────────────────────────────────
+# read_mmseqs_tab — schema + parsing
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_read_mmseqs_tab_basic(tmp_path: Path) -> None:
+    """Parse a 3-line synthetic mmseqs2 .tab into ALIGNMENT_HIT_TABLE."""
+    tab = tmp_path / "alignments.tab"
+    tab.write_text(
+        "NOVEL1\tREF1\t1.2e-30\t1\t100\t1\t100\t100M\n"
+        "NOVEL2\tREF2\t3.4e-25\t1\t80\t10\t89\t40M5I40M\n"
+        "NOVEL3\tSWISS_X\t9.9e-18\t5\t50\t1\t46\t46M\n"
+    )
+    table = read_mmseqs_tab(tab, alignment_tier="reference")
+    assert table.num_rows == 3
+    assert table.schema.equals(ALIGNMENT_HIT_TABLE)
+    assert table.column("query").to_pylist() == ["NOVEL1", "NOVEL2", "NOVEL3"]
+    assert table.column("target").to_pylist() == ["REF1", "REF2", "SWISS_X"]
+    assert table.column("cigar").to_pylist() == ["100M", "40M5I40M", "46M"]
+    assert table.column("alignment_tier").to_pylist() == ["reference"] * 3
+    # Coordinates are int64 (mmseqs2 1-indexed convention preserved)
+    assert table.column("qstart").to_pylist() == [1, 1, 5]
+
+
+def test_read_mmseqs_tab_no_tier(tmp_path: Path) -> None:
+    """alignment_tier left null when caller doesn't specify."""
+    tab = tmp_path / "alignments.tab"
+    tab.write_text("Q\tT\t1e-50\t1\t10\t1\t10\t10M\n")
+    table = read_mmseqs_tab(tab)
+    assert table.column("alignment_tier").to_pylist() == [None]
+
+
+def test_read_mmseqs_tab_empty(tmp_path: Path) -> None:
+    tab = tmp_path / "empty.tab"
+    tab.touch()
+    table = read_mmseqs_tab(tab)
+    assert table.num_rows == 0
+    assert table.schema.equals(ALIGNMENT_HIT_TABLE)
+
+
+def test_read_mmseqs_tab_missing_file(tmp_path: Path) -> None:
+    table = read_mmseqs_tab(tmp_path / "does_not_exist.tab")
+    assert table.num_rows == 0
+    assert table.schema.equals(ALIGNMENT_HIT_TABLE)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Tier inference (target ∈ reference_proteins → "reference")
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_tier_inference_marks_reference_targets_as_reference() -> None:
+    """When alignment_tier is null on input, the classifier infers
+    tier from target membership in reference_proteins. Tests that the
+    OUTPUT row carries forward the inferred tier."""
+    # snp within the peptide span: novel has L at position 9, ref has A.
+    # Both proteins yield a unique novel peptide post-K cut.
+    novel = pa.table(
+        {
+            "protein_id": pa.array(["NOVEL1"]),
+            "sequence": pa.array(["MAGCKLLLLLPPGR"]),  # 14 residues
+        }
+    )
+    reference = pa.table(
+        {
+            "protein_id": pa.array(["REF1"]),
+            # K→K kept (still cuts), L at pos 9 → A so the post-K peptide
+            # differs by 1 AA between novel and reference.
+            "sequence": pa.array(["MAGCKLLLLAPPGR"]),
+        }
+    )
+    alignments = pa.table(
+        {
+            "query": ["NOVEL1"],
+            "target": ["REF1"],
+            "evalue": [1e-50],
+            "qstart": [1],
+            "qend": [14],
+            "tstart": [1],
+            "tend": [14],
+            "cigar": ["14M"],
+            "alignment_tier": pa.array([None], type=pa.string()),
+        }
+    )
+    detected = pa.table(
+        {"peptide_sequence": pa.array(["LLLLLPPGR"])}
+    )
+    result = classify_novel_peptides(
+        detected, alignments, reference, novel,
+    )
+    # Should have one row classified as snp (single mismatch in peptide span)
+    assert result.num_rows == 1
+    assert result.column("classification").to_pylist() == ["snp"]
+    # alignment_tier should be the inferred "reference" (target REF1 ∈ ref proteome)
+    tier_vals = result.column("alignment_tier").to_pylist()
+    assert tier_vals[0] == "reference"
+
+
+def test_tier_inference_marks_non_reference_targets() -> None:
+    """When target ∉ reference_proteins, tier infers to 'non_reference'
+    and short-circuits to that classification."""
+    novel = pa.table(
+        {
+            "protein_id": pa.array(["NOVEL1"]),
+            "sequence": pa.array(["MAGCKWAVLPPGR"]),
+        }
+    )
+    reference = pa.table(
+        {
+            "protein_id": pa.array(["REF_TOTALLY_DIFFERENT"]),
+            "sequence": pa.array(["NREATEDSEQENCKLYDIF"]),  # canonical AAs only
+        }
+    )
+    alignments = pa.table(
+        {
+            "query": ["NOVEL1"],
+            "target": ["SWISSPROTHITNOTINREF"],
+            "evalue": [1e-30],
+            "qstart": [1],
+            "qend": [13],
+            "tstart": [1],
+            "tend": [13],
+            "cigar": ["13M"],
+            "alignment_tier": pa.array([None], type=pa.string()),
+        }
+    )
+    # WAVLPPGR is the post-K novel peptide (8 residues); not in reference's
+    # tryptic digest.
+    detected = pa.table(
+        {"peptide_sequence": pa.array(["WAVLPPGR"])}
+    )
+    result = classify_novel_peptides(
+        detected, alignments, reference, novel,
+    )
+    assert result.column("classification").to_pylist() == ["non_reference"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Deduplication by classification priority
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_deduplication_keeps_most_specific_class() -> None:
+    """If the same peptide appears in two novel proteins with different
+    classifications, the more-specific (lower priority value) class
+    survives. Priority: snp (0) < insertion (1).
+
+    Both novel proteins have an identical sequence — the same tryptic
+    peptide ``LIGHTPEPTR`` reaches the digest of both. The alignments
+    differ:
+      NOVEL_A → REF_A: same-length protein with a snp inside the
+                       peptide span (T6→A6) → "snp"
+      NOVEL_B → REF_B: ref is shorter by one residue (no I at pos 3)
+                       so query has an insertion at pos 3 within the
+                       peptide span → "insertion"
+    Same peptide, different classifications. snp wins per priority.
+    """
+    novel = pa.table(
+        {
+            "protein_id": pa.array(["NOVEL_A", "NOVEL_B"]),
+            "sequence": pa.array(
+                [
+                    "MKLIGHTPEPTRAAA",  # 15 residues
+                    "MKLIGHTPEPTRAAA",  # same sequence — both yield the same tryptic peptides
+                ]
+            ),
+        }
+    )
+    reference = pa.table(
+        {
+            "protein_id": pa.array(["REF_A", "REF_B"]),
+            "sequence": pa.array(
+                [
+                    # T at pos 6 of novel → A at pos 6 of REF_A (snp in peptide span)
+                    "MKLIGHAPEPTRAAA",   # 15 residues
+                    # REF_B missing the I at pos 3 — alignment shows
+                    # NOVEL_B has an insertion within the peptide span
+                    "MKLGHTPEPTRAAA",    # 14 residues
+                ]
+            ),
+        }
+    )
+    alignments = pa.table(
+        {
+            "query": ["NOVEL_A", "NOVEL_B"],
+            "target": ["REF_A", "REF_B"],
+            "evalue": [1e-50, 1e-50],
+            "qstart": [1, 1],
+            "qend": [15, 15],
+            "tstart": [1, 1],
+            "tend": [15, 14],
+            "cigar": ["15M", "3M1I11M"],
+            "alignment_tier": pa.array([None, None], type=pa.string()),
+        }
+    )
+    # NOVEL tryptic digest produces "LIGHTPEPTR" as the post-K peptide.
+    detected = pa.table({"peptide_sequence": pa.array(["LIGHTPEPTR"])})
+    result = classify_novel_peptides(
+        detected, alignments, reference, novel,
+        min_peptide_length=5,
+    )
+    # One row per unique peptide_sequence after dedup
+    assert result.num_rows == 1
+    # snp (0) < insertion (1) → snp wins
+    assert result.column("classification").to_pylist() == ["snp"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# read_fasta_proteins
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_read_fasta_proteins_basic(tmp_path: Path) -> None:
+    fasta = tmp_path / "tiny.fasta"
+    fasta.write_text(
+        ">protA description here\n"
+        "MAGCKL\nVERPDF\n"           # multi-line sequence joined
+        ">protB gene=BRCA1\n"
+        "SEMA\n"
+    )
+    table = read_fasta_proteins(fasta)
+    assert table.column("protein_id").to_pylist() == ["protA", "protB"]
+    assert table.column("sequence").to_pylist() == ["MAGCKLVERPDF", "SEMA"]
+
+
+def test_read_fasta_proteins_empty(tmp_path: Path) -> None:
+    fasta = tmp_path / "empty.fasta"
+    fasta.touch()
+    table = read_fasta_proteins(fasta)
+    assert table.num_rows == 0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Schema sanity
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_classification_priority_taxonomy_is_complete() -> None:
+    """The 11 classes plus a fallback are in the priority table."""
+    assert set(_CLASSIFICATION_PRIORITY) == {
+        "snp", "insertion", "deletion", "complex",
+        "n_terminal_truncation", "c_terminal_truncation",
+        "trypsin_cutsite_mutation",
+        "n_term_deviation", "c_term_deviation",
+        "unknown", "non_reference",
+    }
+    # snp wins over everything else; non_reference is the lowest priority
+    assert _CLASSIFICATION_PRIORITY["snp"] == 0
+    assert _CLASSIFICATION_PRIORITY["non_reference"] == 10
+
+
+def test_empty_input_returns_empty_schema() -> None:
+    """Empty detected_peptides → empty NOVEL_PEPTIDE_TABLE."""
+    from constellation.massspec.search.schemas import NOVEL_PEPTIDE_TABLE
+
+    detected = pa.table({"peptide_sequence": pa.array([], type=pa.string())})
+    alignments = ALIGNMENT_HIT_TABLE.empty_table()
+    reference = pa.table(
+        {
+            "protein_id": pa.array(["R1"]),
+            "sequence": pa.array(["MAGCKL"]),
+        }
+    )
+    novel = pa.table(
+        {
+            "protein_id": pa.array(["N1"]),
+            "sequence": pa.array(["MAGCKL"]),
+        }
+    )
+    result = classify_novel_peptides(detected, alignments, reference, novel)
+    assert result.num_rows == 0
+    assert result.schema.equals(NOVEL_PEPTIDE_TABLE)
