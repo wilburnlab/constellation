@@ -65,6 +65,58 @@ from constellation.core.sequence.proforma import (
 _RE_MOD_BLOCK = re.compile(r"\[([+-]?\d+(?:\.\d+)?)\]")
 
 
+# ──────────────────────────────────────────────────────────────────────
+# UNIMOD lookup cache
+# ──────────────────────────────────────────────────────────────────────
+#
+# ``ModVocab.find_by_mass`` is an O(N) linear scan of all ~1560 UNIMOD
+# entries on every call. The modseq parser calls it once per
+# modification on every peptide; for a 5M-precursor EncyclopeDIA library
+# with ~1-3 mods per peptide that's ~10M lookups × 1560 entries =
+# ~15 billion comparisons → 50+ minutes of hang time in
+# ``read_encyclopedia(...)``'s auto-ingest path.
+#
+# The fix: cache results keyed on ``(id(vocab), rounded_mass,
+# rounded_tolerance)``. Typical libraries see ~50-100 distinct
+# modification masses, so a 4096-entry cap gives 99%+ hit rate.
+#
+# Cache key uses integer micro-Daltons (1e-6 Da granularity) to dodge
+# float-comparison subtleties; mass deltas in EncyclopeDIA's modseq
+# strings are emitted with 5-7 decimal precision, well within 1e-6 Da
+# resolution.
+
+_FIND_BY_MASS_CACHE: dict[tuple[int, int, int], tuple] = {}
+_CACHE_MAXSIZE = 4096
+
+
+def _cached_find_by_mass(
+    vocab: ModVocab, mass: float, tolerance_da: float
+) -> tuple:
+    """Memoized wrapper around ``vocab.find_by_mass``.
+
+    Safe for the modseq-parser use case because the parser never mutates
+    the vocab. Custom vocabs (different object identities) get their own
+    cache slots transparently via ``id(vocab)``.
+    """
+    key = (
+        id(vocab),
+        round(mass * 1_000_000),
+        round(tolerance_da * 1_000_000),
+    )
+    cached = _FIND_BY_MASS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = vocab.find_by_mass(mass, tolerance_da=tolerance_da)
+    if len(_FIND_BY_MASS_CACHE) < _CACHE_MAXSIZE:
+        _FIND_BY_MASS_CACHE[key] = result
+    return result
+
+
+def _clear_find_by_mass_cache() -> None:
+    """For tests + diagnostic scripts; not used during normal operation."""
+    _FIND_BY_MASS_CACHE.clear()
+
+
 def parse_encyclopedia_modseq(
     modseq: str,
     *,
@@ -150,7 +202,7 @@ def parse_encyclopedia_modseq(
         if mod_str is None:
             continue
         delta = float(mod_str)
-        matches = vocab.find_by_mass(delta, tolerance_da=tolerance_da)
+        matches = _cached_find_by_mass(vocab, delta, tolerance_da)
         chosen, place_terminal = _choose_modification(matches, residue, idx)
         if chosen is None:
             # Ambiguous or no match → pass through as a ProForma mass-delta.
@@ -184,7 +236,7 @@ def _resolve_to_tagged_mod(
     consult the vocab to convert the mass to a UNIMOD accession when
     unambiguous; unresolved deltas pass through as ProForma mass-deltas.
     """
-    matches = vocab.find_by_mass(delta, tolerance_da=tolerance_da)
+    matches = _cached_find_by_mass(vocab, delta, tolerance_da)
     # Prefer matches that have any N-terminal specificity — these are the
     # chemically plausible interpretations of a leading-bracket mod.
     n_term_matches = [m for m in matches if m.has_n_term_specificity]
