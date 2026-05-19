@@ -563,6 +563,45 @@ def _build_classify_novel_peptides_parser(
         help="max peptide length kept in the digest (default 50)",
     )
     p.add_argument(
+        "--collision-filter",
+        action="store_true",
+        help=(
+            "Apply cartographer's DIA collision filter: drop detected "
+            "modseqs that lose co-elution clusters in the .elib's "
+            "entries table. Requires --dia and a .elib --search-results. "
+            "Opt-in pending v6.5.15-sweep validation of whether the "
+            "newer search internalises this filter."
+        ),
+    )
+    p.add_argument(
+        "--dia",
+        type=Path,
+        default=None,
+        help=(
+            "Path to combined.dia (the merged-fractions DIA file). "
+            "Required when --collision-filter is set; supplies the GPF "
+            "isolation windows."
+        ),
+    )
+    p.add_argument(
+        "--collision-rt-threshold-s",
+        type=float,
+        default=5.0,
+        help="--collision-filter: max |ΔRT| (s) for a pair (default 5.0)",
+    )
+    p.add_argument(
+        "--collision-frag-ppm-tol",
+        type=float,
+        default=20.0,
+        help="--collision-filter: fragment m/z tolerance ppm (default 20.0)",
+    )
+    p.add_argument(
+        "--collision-min-shared-ions",
+        type=int,
+        default=4,
+        help="--collision-filter: min shared ions to flag (default 4)",
+    )
+    p.add_argument(
         "--no-progress",
         action="store_true",
         help="suppress progress messages on stderr",
@@ -1355,6 +1394,7 @@ def _cmd_massspec_classify_novel_peptides(args: argparse.Namespace) -> int:
         read_mmseqs_tab,
     )
     from constellation.massspec.search import (
+        apply_collision_filter,
         build_gene_map_from_fasta_headers,
         classify_novel_peptides,
         read_fasta_proteins,
@@ -1367,6 +1407,24 @@ def _cmd_massspec_classify_novel_peptides(args: argparse.Namespace) -> int:
     reference_fasta = Path(args.reference_fasta).resolve()
     novel_fasta = Path(args.novel_fasta).resolve()
     output_dir = Path(args.output_dir).resolve()
+    dia_path: Path | None = (
+        Path(args.dia).resolve() if args.dia is not None else None
+    )
+
+    if args.collision_filter:
+        if dia_path is None:
+            print(
+                "error: --collision-filter requires --dia (path to combined.dia)",
+                file=_sys.stderr,
+            )
+            return 1
+        if search_results.suffix.lower() != ".elib":
+            print(
+                "error: --collision-filter requires a .elib --search-results "
+                "(observed fragment m/z lives in the elib entries table)",
+                file=_sys.stderr,
+            )
+            return 1
 
     for label, p in [
         ("--search-results", search_results),
@@ -1378,6 +1436,9 @@ def _cmd_massspec_classify_novel_peptides(args: argparse.Namespace) -> int:
         if not p.exists():
             print(f"error: {label} not found: {p}", file=_sys.stderr)
             return 1
+    if dia_path is not None and not dia_path.exists():
+        print(f"error: --dia not found: {dia_path}", file=_sys.stderr)
+        return 1
 
     output_dir.mkdir(parents=True, exist_ok=True)
     success_path = output_dir / "_SUCCESS"
@@ -1401,6 +1462,38 @@ def _cmd_massspec_classify_novel_peptides(args: argparse.Namespace) -> int:
             file=_sys.stderr,
         )
     detected_peptides = _load_detected_peptides(search_results, library_path)
+
+    # 1b. Optional: drop collision-loser modseqs before classification.
+    collision_metadata: dict | None = None
+    if args.collision_filter:
+        if not args.no_progress:
+            print(
+                f"[classify-novel-peptides] running collision filter "
+                f"(rt<{args.collision_rt_threshold_s}s, "
+                f"{args.collision_frag_ppm_tol} ppm, "
+                f">={args.collision_min_shared_ions} shared ions) "
+                f"on {search_results} + {dia_path} ...",
+                file=_sys.stderr,
+            )
+        losers, collision_metadata = apply_collision_filter(
+            elib_path=search_results,
+            dia_path=dia_path,
+            rt_threshold_s=args.collision_rt_threshold_s,
+            frag_ppm_tol=args.collision_frag_ppm_tol,
+            min_shared_ions=args.collision_min_shared_ions,
+            return_metadata=True,
+        )
+        if losers and detected_peptides.num_rows > 0:
+            detected_peptides = _drop_collision_losers(detected_peptides, losers)
+        collision_metadata["n_losers"] = len(losers)
+        if not args.no_progress:
+            print(
+                f"[classify-novel-peptides] collision filter dropped "
+                f"{len(losers):,} modseqs across "
+                f"{len(collision_metadata['clusters']):,} clusters; "
+                f"{detected_peptides.num_rows:,} detected peptides remain",
+                file=_sys.stderr,
+            )
 
     # 2. Load alignments
     if not args.no_progress:
@@ -1480,6 +1573,10 @@ def _cmd_massspec_classify_novel_peptides(args: argparse.Namespace) -> int:
             "max_peptide_length": args.max_peptide_length,
         },
     )
+    if collision_metadata is not None:
+        (output_dir / "collision_metadata.json").write_text(
+            _json.dumps(collision_metadata, indent=2) + "\n"
+        )
 
     # 6. Run-level manifest
     import os as _os
@@ -1508,6 +1605,11 @@ def _cmd_massspec_classify_novel_peptides(args: argparse.Namespace) -> int:
             "max_missed_cleavages": args.max_missed_cleavages,
             "min_peptide_length": args.min_peptide_length,
             "max_peptide_length": args.max_peptide_length,
+            "collision_filter": args.collision_filter,
+            "collision_rt_threshold_s": args.collision_rt_threshold_s,
+            "collision_frag_ppm_tol": args.collision_frag_ppm_tol,
+            "collision_min_shared_ions": args.collision_min_shared_ions,
+            "dia": (str(dia_path) if dia_path is not None else None),
         },
         "runtime": {
             "host": socket.gethostname(),
@@ -1518,6 +1620,16 @@ def _cmd_massspec_classify_novel_peptides(args: argparse.Namespace) -> int:
         "counts": {
             "novel_peptides": result.num_rows,
             "classifications": classification_counts,
+            "collision_losers": (
+                collision_metadata["n_losers"]
+                if collision_metadata is not None
+                else None
+            ),
+            "collision_clusters": (
+                len(collision_metadata["clusters"])
+                if collision_metadata is not None
+                else None
+            ),
         },
     }
     (output_dir / "manifest.json").write_text(_json.dumps(manifest, indent=2) + "\n")
@@ -1610,6 +1722,33 @@ def _load_detected_peptides(
             "modified_sequence": pa.array(modseqs, type=pa.string()),
         }
     )
+
+
+def _drop_collision_losers(
+    detected_peptides: "pa.Table",  # noqa: F821 — pa import-on-demand
+    losers: set[str],
+) -> "pa.Table":  # noqa: F821
+    """Filter ``detected_peptides`` to drop rows whose
+    ``modified_sequence`` is in the collision-loser set.
+
+    ``losers`` are PeptideModSeq strings in EncyclopeDIA notation
+    (``[+N.NNN]`` mass-delta form); ``_load_detected_peptides`` writes
+    the same notation into ``modified_sequence`` when the input is an
+    ``.elib`` — the only path on which ``--collision-filter`` is
+    permitted.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    if "modified_sequence" not in detected_peptides.column_names:
+        return detected_peptides
+    keep_mask = pc.invert(
+        pc.is_in(
+            detected_peptides.column("modified_sequence"),
+            value_set=pa.array(sorted(losers), type=pa.string()),
+        )
+    )
+    return detected_peptides.filter(keep_mask)
 
 
 __all__ = ["build_parser"]

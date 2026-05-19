@@ -21,11 +21,14 @@ Modules:
     novel    -- classify_novel_peptides + classify_single_peptide
                 (CIGAR-walking classifier; port of cartographer's
                  nanopore.classify_novel_peptides)
+    collision -- apply_collision_filter (opt-in DIA co-elution filter;
+                 port of cartographer's filter_elib_by_collision)
 """
 
 from __future__ import annotations
 
 from constellation.massspec.search import schemas as schemas  # noqa: F401  (registers schemas)
+from constellation.massspec.search.collision import apply_collision_filter
 from constellation.massspec.search.novel import (
     _CLASSIFICATION_PRIORITY,
     build_gene_map_from_fasta_headers,
@@ -39,6 +42,7 @@ from constellation.massspec.search.search import Search, assemble_search
 __all__ = [
     "Search",
     "_CLASSIFICATION_PRIORITY",
+    "apply_collision_filter",
     "assemble_search",
     "build_gene_map_from_fasta_headers",
     "classify_novel_peptides",
