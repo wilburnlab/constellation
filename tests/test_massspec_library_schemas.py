@@ -45,17 +45,28 @@ def test_precursor_table_fk_and_predicted_columns() -> None:
 def test_fragment_table_columns_align_with_fragment_ion_table() -> None:
     """Shared columns between LibraryFragmentTable and FragmentIonTable
     have identical names + types so a library fragment row projects
-    cleanly into a FragmentIonTable view via cast_to_schema."""
+    cleanly into a FragmentIonTable view via cast_to_schema.
+
+    LibraryFragmentTable is allowed to be MORE permissive on
+    nullability than FragmentIonTable — the library tier may carry
+    empirical observations with unparseable annotations (NULL
+    structured columns), whereas the theoretical-ladder table never
+    has those gaps. Projections into FragmentIonTable filter on
+    ``ion_type IS NOT NULL`` first.
+    """
     shared = ["ion_type", "position", "charge", "loss_id", "mz_theoretical"]
     for name in shared:
         lib_field = LIBRARY_FRAGMENT_TABLE.field(name)
         ion_field = FRAGMENT_ION_TABLE.field(name)
         assert lib_field.type == ion_field.type, name
-        assert lib_field.nullable == ion_field.nullable, name
+        # lib_field.nullable can be True where ion_field.nullable is False;
+        # the reverse would break cast_to_schema and is not allowed.
+        if not lib_field.nullable:
+            assert not ion_field.nullable, name
 
 
 def test_library_fragment_table_intensity_and_annotation() -> None:
-    assert LIBRARY_FRAGMENT_TABLE.field("intensity_predicted").type == pa.float32()
+    assert LIBRARY_FRAGMENT_TABLE.field("intensity_predicted").type == pa.float64()
     assert not LIBRARY_FRAGMENT_TABLE.field("intensity_predicted").nullable
     assert LIBRARY_FRAGMENT_TABLE.field("annotation").nullable
 

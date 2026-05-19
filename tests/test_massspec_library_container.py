@@ -114,7 +114,7 @@ def test_validate_rejects_orphan_fragment_fk() -> None:
             "charge": pa.array([1], type=pa.int32()),
             "loss_id": pa.array([None], type=pa.string()),
             "mz_theoretical": [100.0],
-            "intensity_predicted": pa.array([0.5], type=pa.float32()),
+            "intensity_predicted": pa.array([0.5], type=pa.float64()),
             "annotation": pa.array([None], type=pa.string()),
         },
         schema=LIBRARY_FRAGMENT_TABLE,

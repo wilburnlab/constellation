@@ -67,7 +67,7 @@ Adding a new module: confirm its place in this DAG before touching imports. Addi
 | Module | Role | Status | Detail |
 |---|---|---|---|
 | `constellation.core` | Physically-grounded primitives — chem / sequence / io / structure / stats / optim / signal / nn / graph | shipped + partial | [constellation/core/CLAUDE.md](constellation/core/CLAUDE.md) |
-| `constellation.massspec` | MS domain — peptide chemistry / library / quant / search / acquisitions / annotation (mzPAF + USI) / io (EncyclopeDIA) / tokenize | partial | [constellation/massspec/CLAUDE.md](constellation/massspec/CLAUDE.md) |
+| `constellation.massspec` | MS domain — peptide chemistry / library / quant / search / acquisitions / annotation (mzPAF + USI) / io (EncyclopeDIA, NIST `.msp` library view) / tokenize | partial | [constellation/massspec/CLAUDE.md](constellation/massspec/CLAUDE.md) |
 | `constellation.sequencing` | NanoporeAnalysis replacement — S1 demux + reference layer + S2 Mode A gene counting + Phase 1 alignment-derived intermediates + Phase 2 genome-guided fingerprint clustering shipped; Phase 3 de novo / Phase 4 cross-validation / annotation / polish remain | partial | [constellation/sequencing/CLAUDE.md](constellation/sequencing/CLAUDE.md) |
 | `constellation.codon` | CoLLAGE-style codon optimization | scaffold | — |
 | `constellation.structure` | Contour replacement; PDB/mmCIF + MD trajectories unified via `core.structure.Ensemble` | scaffold | — |

@@ -1,0 +1,14 @@
+Name: Unknown small molecule 42
+MW: 240.10
+Comment: Inst="QTOF" Spec="Consensus"
+Num peaks: 3
+67.05 200.0
+82.07 800.0
+156.10 1500.0
+
+Name: Mystery contaminant
+MW: 318.20
+Comment: Inst="HCD" Origfile="run42.raw"
+Num peaks: 2
+105.05 1100.0
+202.12 2400.0

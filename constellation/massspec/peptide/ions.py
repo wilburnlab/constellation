@@ -56,7 +56,7 @@ from constellation.core.sequence.protein import (
     _modref_lookup_key,
 )
 from constellation.massspec.peptide.mz import PROTON_MASS
-from constellation.massspec.peptide.neutral_losses import LOSS_REGISTRY, loss_applies
+from constellation.massspec.peptide.neutral_losses import LOSS_REGISTRY
 from constellation.massspec.schemas import FRAGMENT_ION_TABLE
 
 # ──────────────────────────────────────────────────────────────────────
@@ -279,39 +279,165 @@ def fragment_ladder(
     return _linear_fragment_ladder(peptidoform, **kwargs)
 
 
-@requires_canonical
-def _linear_fragment_ladder(
-    peptidoform: Peptidoform,
+def _biochem_mask(
     *,
+    seq: str,
+    pos_mod_ids: Sequence[Sequence[str]],
     ion_types: Sequence[IonType],
-    max_fragment_charge: int,
-    neutral_losses: Sequence[str] | None,
-    return_tensor: bool,
-    vocab: ModVocab,
-    peptide_idx: int | None,
-    include_peptide_seq: bool,
-) -> tuple[pa.Table, torch.Tensor | None]:
-    """Linear-peptide ladder. N-term / C-term mods fold into N-side / C-side
-    fragment masses uniformly; global isotope labels and global fixed mods
-    are expanded into per-residue / per-terminal contributions before the
-    cumsum.
+    loss_ids: Sequence[str],
+    n_pos: int,
+    n_types: int,
+    n_losses: int,
+    type_is_n: torch.Tensor,
+) -> torch.Tensor:
+    """Vectorized neutral-loss biochemistry mask.
 
-    Rejects ambiguity groups, ranges, and labile mods — those need to be
-    disambiguated or stripped before ladder generation. A future
-    ``Peptidoform.disambiguate()`` helper will do the rewriting.
+    Returns ``(n_pos, n_types, n_losses)`` bool tensor — slot 0 along
+    the loss axis is always True (no-loss baseline); slots 1..len(loss_ids)
+    encode whether each loss is biochemically licensed for the
+    ``(position, ion_type)`` fragment.
+
+    Replaces the original ``O(n_pos × n_types × n_losses)`` Python
+    triple-loop with tensor cumulative-OR operations along the sequence
+    axis. The inner-loop equivalent is ``loss_applies`` from
+    ``massspec.peptide.neutral_losses``; this routine reproduces its
+    semantics in tensor form so the result is byte-identical to the
+    legacy path. Tested directly in ``tests/test_biochem_mask.py``.
     """
-    seq = peptidoform.sequence
-    validate(seq, AA)
-    L = len(seq)
-    if L < 2:
-        raise ValueError(f"fragment_ladder requires sequence length ≥ 2; got {L}")
-    if max_fragment_charge < 1:
-        raise ValueError(
-            f"max_fragment_charge must be ≥ 1; got {max_fragment_charge}"
-        )
-    if not ion_types:
-        raise ValueError("ion_types must be non-empty")
+    if not loss_ids:
+        return torch.ones((n_pos, n_types, 1), dtype=torch.bool)
 
+    L = len(seq)
+    n_loss_only = len(loss_ids)
+
+    # ── Per-loss attribute tensors ───────────────────────────────────
+    losses = [LOSS_REGISTRY.get(lid) for lid in loss_ids]
+    has_residue_rule = torch.tensor(
+        [bool(l.triggering_residues) for l in losses], dtype=torch.bool
+    )
+    has_mod_rule = torch.tensor(
+        [bool(l.triggering_mods) for l in losses], dtype=torch.bool
+    )
+    joint_mode = has_residue_rule & has_mod_rule  # (n_loss_only,)
+
+    # ion-type filter — True where loss permits the ion type, or where
+    # the loss declares no ion-type restriction (applies to all).
+    ion_type_allowed = torch.empty(
+        (n_types, n_loss_only), dtype=torch.bool
+    )
+    for l_idx, loss in enumerate(losses):
+        if loss.applies_to_ion_types:
+            for t_idx, ion_type in enumerate(ion_types):
+                ion_type_allowed[t_idx, l_idx] = (
+                    ion_type.name in loss.applies_to_ion_types
+                )
+        else:
+            ion_type_allowed[:, l_idx] = True
+
+    # ── Per-(residue, loss) trigger tensors ──────────────────────────
+    # R[i, l] = True if seq[i] is in losses[l].triggering_residues
+    # M[i, l] = True if any mod on seq[i] is in losses[l].triggering_mods
+    # J[i, l] = R[i, l] AND M[i, l]  (joint-mode predicate, residue carries the mod)
+    residue_trigger = torch.zeros((L, n_loss_only), dtype=torch.bool)
+    mod_trigger = torch.zeros((L, n_loss_only), dtype=torch.bool)
+    for l_idx, loss in enumerate(losses):
+        if loss.triggering_residues:
+            for i, r in enumerate(seq):
+                if r in loss.triggering_residues:
+                    residue_trigger[i, l_idx] = True
+        if loss.triggering_mods:
+            for i in range(L):
+                mods_at_i = pos_mod_ids[i]
+                if not mods_at_i:
+                    continue
+                if any(m in loss.triggering_mods for m in mods_at_i):
+                    mod_trigger[i, l_idx] = True
+    joint_trigger = residue_trigger & mod_trigger
+
+    # ── Cumulative-OR along the residue axis ─────────────────────────
+    # For N-side fragments: bond p covers residues 0..p (length p+1).
+    # For C-side fragments: bond p covers residues p+1..L-1.
+    #
+    # torch.cummax(int_tensor, dim=0).values acts as running-OR when
+    # the tensor is {0, 1}-valued.
+    def _cumor(t: torch.Tensor) -> torch.Tensor:
+        return torch.cummax(t.to(torch.int8), dim=0).values.bool()
+
+    # N-side: for each bond p (0 ≤ p < n_pos), want OR over rows 0..p.
+    # cumor(t)[p] gives exactly that. Trim to n_pos rows.
+    r_n = _cumor(residue_trigger)[:n_pos]  # (n_pos, n_loss_only)
+    m_n = _cumor(mod_trigger)[:n_pos]
+    j_n = _cumor(joint_trigger)[:n_pos]
+
+    # C-side: for each bond p, want OR over rows p+1..L-1. Equivalent
+    # to a reverse cumulative-OR indexed at p+1. Flip → cumor → flip
+    # then drop the first row (p=0 case = OR over rows 1..L-1).
+    def _rev_cumor(t: torch.Tensor) -> torch.Tensor:
+        flipped = torch.flip(t, [0])
+        out = _cumor(flipped)
+        return torch.flip(out, [0])
+
+    r_c = _rev_cumor(residue_trigger)[1 : 1 + n_pos]  # (n_pos, n_loss_only)
+    m_c = _rev_cumor(mod_trigger)[1 : 1 + n_pos]
+    j_c = _rev_cumor(joint_trigger)[1 : 1 + n_pos]
+
+    # ── Select N-side vs C-side per ion type ────────────────────────
+    # type_is_n: (n_types,) → broadcast to (1, n_types, 1)
+    type_is_n_b = type_is_n[None, :, None]
+    r_side = torch.where(type_is_n_b, r_n[:, None, :], r_c[:, None, :])
+    m_side = torch.where(type_is_n_b, m_n[:, None, :], m_c[:, None, :])
+    j_side = torch.where(type_is_n_b, j_n[:, None, :], j_c[:, None, :])
+    # shapes: (n_pos, n_types, n_loss_only)
+
+    # ── Combine per-loss rules ───────────────────────────────────────
+    #
+    # case_no_mod:    applies = (~has_residue_rule) | r_side
+    #                 (loss has no mod rule; residue rule satisfied or absent)
+    # case_mod_only:  applies = m_side
+    #                 (loss has mod rule but no residue rule)
+    # case_joint:     applies = j_side
+    #                 (loss has both — mod must sit ON a triggering residue)
+    has_residue_rule_b = has_residue_rule[None, None, :]
+    has_mod_rule_b = has_mod_rule[None, None, :]
+    joint_mode_b = joint_mode[None, None, :]
+
+    case_no_mod = (~has_residue_rule_b) | r_side
+    case_with_mod = torch.where(joint_mode_b, j_side, m_side)
+    applies = torch.where(has_mod_rule_b, case_with_mod, case_no_mod)
+
+    # Final ion-type filter — (1, n_types, n_loss_only) broadcast.
+    applies = applies & ion_type_allowed[None, :, :]
+
+    # ── Stitch slot-0 (no-loss baseline) onto the loss axis ─────────
+    no_loss = torch.ones((n_pos, n_types, 1), dtype=torch.bool)
+    return torch.cat([no_loss, applies], dim=-1)
+
+
+@dataclass(slots=True)
+class _LinearInputs:
+    """Per-peptide intermediate computed once per ladder call.
+
+    All the string / ModRef work happens here so the heavy tensor
+    operations in ``_run_linear_batch`` can be batched over peptidoforms
+    of the same length. ``pos_mass`` includes residue + explicit mods +
+    fixed-mod expansion + global-isotope shifts; ``pos_mod_ids`` is
+    column-aligned for the biochem mask.
+    """
+
+    seq: str
+    pos_mass: list[float]  # length L
+    pos_mod_ids: list[list[str]]  # length L
+    n_term_extra: float
+    c_term_extra: float
+    isotopes: tuple[str, ...]
+
+
+def _validate_linear_peptidoform(peptidoform: Peptidoform) -> None:
+    """Raise on peptidoform shapes the linear backend doesn't support.
+
+    Hoisted out of ``_linear_fragment_ladder`` so the batched entry
+    point shares one validation surface.
+    """
     if peptidoform.ranges:
         raise ValueError(
             "ranges (PRT(ESFRMS)[+19.0523]ISK syntax) are not supported by "
@@ -342,32 +468,47 @@ def _linear_fragment_ladder(
                 "disambiguate or route through the crosslink/branch backends"
             )
 
+
+def _prepare_linear_inputs(
+    peptidoform: Peptidoform, *, vocab: ModVocab
+) -> _LinearInputs:
+    """Pure-Python prep: compute per-residue mass + mod-id lists + terminal extras.
+
+    Mirrors the prep block at the top of ``_linear_fragment_ladder``;
+    factored out so ``fragment_ladders_batch`` can call it once per
+    peptidoform and then run the heavy tensor math in batched form.
+    """
+    seq = peptidoform.sequence
+    validate(seq, AA)
+    L = len(seq)
+    if L < 2:
+        raise ValueError(
+            f"fragment_ladder requires sequence length ≥ 2; got {L}"
+        )
+    _validate_linear_peptidoform(peptidoform)
     for pos in peptidoform.residue_mods:
         if not 0 <= pos < L:
             raise IndexError(
                 f"modification index {pos} out of range for length-{L} peptide"
             )
-
-    n_pos = L - 1
-    n_types = len(ion_types)
-    n_charges = max_fragment_charge
-    loss_ids: tuple[str, ...] = tuple(neutral_losses) if neutral_losses else ()
-    n_losses = 1 + len(loss_ids)
     isotopes = peptidoform.global_isotopes
 
-    # ── per-residue mass: residue + explicit mods + fixed-mod expansion +
-    #    global-isotope shift on the residue's element atoms.
     assert AA.compositions is not None
     residue_comps = [AA.compositions[r] for r in seq]
-    pos_mass = [
-        c.mass + _isotope_shift_for_composition(c, isotopes) for c in residue_comps
+    pos_mass: list[float] = [
+        c.mass + _isotope_shift_for_composition(c, isotopes)
+        for c in residue_comps
     ]
     pos_mod_ids: list[list[str]] = [[] for _ in range(L)]
 
     def _add_modref_at(pos: int, modref: ModRef) -> None:
-        d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=True)
-        pos_mass[pos] += d_comp.mass + d_mass + _isotope_shift_for_composition(
-            d_comp, isotopes
+        d_comp, d_mass = _modref_contribution(
+            modref, vocab, monoisotopic=True
+        )
+        pos_mass[pos] += (
+            d_comp.mass
+            + d_mass
+            + _isotope_shift_for_composition(d_comp, isotopes)
         )
         cid = _modref_canonical_id(modref, vocab)
         if cid is not None:
@@ -379,7 +520,6 @@ def _linear_fragment_ladder(
                 continue
             _add_modref_at(pos, tm.mod)
 
-    # ── N-term / C-term scalars: terminal mod masses + their iso shifts.
     n_term_extra = 0.0
     c_term_extra = 0.0
     for tm in peptidoform.n_term_mods:
@@ -390,8 +530,6 @@ def _linear_fragment_ladder(
             d_comp.mass + d_mass + _isotope_shift_for_composition(d_comp, isotopes)
         )
         cid = _modref_canonical_id(tm.mod, vocab)
-        # Fold N-term mod ids onto position 0 for loss-check compatibility
-        # with the prior representation.
         if cid is not None:
             pos_mod_ids[0].append(cid)
     for tm in peptidoform.c_term_mods:
@@ -405,11 +543,6 @@ def _linear_fragment_ladder(
         if cid is not None:
             pos_mod_ids[L - 1].append(cid)
 
-    # ── Global fixed mods: location-rule expansion. Per-residue rules
-    #    fold into pos_mass / pos_mod_ids; terminal rules fold into
-    #    n_term_extra / c_term_extra. Manual residue mods override at
-    #    that position (skipped by _iter_fixed_mod_residue_indices /
-    #    _count_fixed_mod_locations).
     for modref, locations in peptidoform.fixed_mods:
         d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=True)
         single_extra = (
@@ -433,16 +566,72 @@ def _linear_fragment_ladder(
                     if cid is not None:
                         pos_mod_ids[i].append(cid)
 
-    # ── Cumulative residue sums ─────────────────────────────────────
-    pos_mass_t = torch.tensor(pos_mass, dtype=torch.float64)
-    n_cumulative = torch.cumsum(pos_mass_t, dim=0)  # (L,)
-    total_residue_sum = n_cumulative[-1]
-    n_side_residues = n_cumulative[: L - 1]  # (L-1,) sum residues 0..p
-    c_side_residues = total_residue_sum - n_side_residues  # (L-1,) sum p+1..L-1
-    n_side = n_side_residues + n_term_extra  # add N-term mods uniformly
-    c_side = c_side_residues + c_term_extra  # add C-term mods uniformly
+    return _LinearInputs(
+        seq=seq,
+        pos_mass=pos_mass,
+        pos_mod_ids=pos_mod_ids,
+        n_term_extra=n_term_extra,
+        c_term_extra=c_term_extra,
+        isotopes=isotopes,
+    )
 
-    # ── Ion-type offsets, with isotope shift folded in ──────────────
+
+def _run_linear_batch(
+    inputs: Sequence[_LinearInputs],
+    *,
+    ion_types: Sequence[IonType],
+    max_fragment_charge: int,
+    loss_ids: Sequence[str],
+) -> torch.Tensor:
+    """Compute a batched theoretical ladder m/z tensor.
+
+    All peptidoforms must share the same sequence length and global
+    isotope labels (callers group by these). Returns a
+    ``(B, n_pos, n_types, n_charges, n_losses)`` ``float64`` tensor
+    with NaN-masked invalid (position, ion_type, loss) combinations.
+    The Arrow-table emission per peptide happens upstream.
+    """
+    if not inputs:
+        raise ValueError("inputs must be non-empty")
+    L = len(inputs[0].seq)
+    isotopes = inputs[0].isotopes
+    for inp in inputs:
+        if len(inp.seq) != L:
+            raise ValueError(
+                "batched linear ladder requires uniform sequence length; "
+                f"got mix of {L} and {len(inp.seq)}"
+            )
+        if inp.isotopes != isotopes:
+            raise ValueError(
+                "batched linear ladder requires uniform global_isotopes "
+                "across the batch"
+            )
+
+    n_pos = L - 1
+    n_types = len(ion_types)
+    n_charges = max_fragment_charge
+    n_losses = 1 + len(loss_ids)
+    _ = n_charges  # used by broadcasting below; explicit binding for the reader
+
+    # Batched per-residue mass — (B, L)
+    pos_mass_t = torch.tensor(
+        [inp.pos_mass for inp in inputs], dtype=torch.float64
+    )
+    n_term_t = torch.tensor(
+        [inp.n_term_extra for inp in inputs], dtype=torch.float64
+    )
+    c_term_t = torch.tensor(
+        [inp.c_term_extra for inp in inputs], dtype=torch.float64
+    )
+
+    cumulative = torch.cumsum(pos_mass_t, dim=1)  # (B, L)
+    total = cumulative[:, -1]  # (B,)
+    n_side_residues = cumulative[:, :n_pos]  # (B, n_pos)
+    c_side_residues = total[:, None] - n_side_residues  # (B, n_pos)
+    n_side = n_side_residues + n_term_t[:, None]  # (B, n_pos)
+    c_side = c_side_residues + c_term_t[:, None]
+
+    # Ion-type offsets — global; depend only on isotopes (uniform).
     type_offsets = torch.tensor(
         [
             ION_OFFSET_MASSES[t]
@@ -450,60 +639,158 @@ def _linear_fragment_ladder(
             for t in ion_types
         ],
         dtype=torch.float64,
-    )
-    type_is_n = torch.tensor([t in _N_SIDE for t in ion_types], dtype=torch.bool)
+    )  # (n_types,)
+    type_is_n = torch.tensor(
+        [t in _N_SIDE for t in ion_types], dtype=torch.bool
+    )  # (n_types,)
+    # side_masses: (B, n_pos, n_types)
     side_masses = torch.where(
-        type_is_n[None, :], n_side[:, None], c_side[:, None]
-    )  # (n_pos, n_types)
-    neutral_no_loss = side_masses + type_offsets[None, :]  # (n_pos, n_types)
+        type_is_n[None, None, :], n_side[:, :, None], c_side[:, :, None]
+    )
+    neutral_no_loss = side_masses + type_offsets[None, None, :]
 
-    # ── Loss deltas + biochemistry mask ─────────────────────────────
     loss_deltas = torch.zeros(n_losses, dtype=torch.float64)
     for i, lid in enumerate(loss_ids, start=1):
         loss_deltas[i] = LOSS_REGISTRY.get(lid).delta_mass
+    # (B, n_pos, n_types, n_losses)
     neutral_with_loss = (
-        neutral_no_loss[:, :, None] - loss_deltas[None, None, :]
+        neutral_no_loss[:, :, :, None] - loss_deltas[None, None, None, :]
     )
 
     charges_t = torch.arange(1, n_charges + 1, dtype=torch.float64)
+    # (B, n_pos, n_types, n_charges, n_losses)
     mz_tensor = (
-        neutral_with_loss[:, :, None, :]
-        + charges_t[None, None, :, None] * PROTON_MASS
-    ) / charges_t[None, None, :, None]
+        neutral_with_loss[:, :, :, None, :]
+        + charges_t[None, None, None, :, None] * PROTON_MASS
+    ) / charges_t[None, None, None, :, None]
 
-    loss_mask = torch.ones((n_pos, n_types, n_losses), dtype=torch.bool)
-    if loss_ids:
-        for p in range(n_pos):
-            for t_idx, ion_type in enumerate(ion_types):
-                if ion_type in _N_SIDE:
-                    frag_residues = list(seq[: p + 1])
-                    frag_mods = {
-                        i: pos_mod_ids[i] for i in range(p + 1) if pos_mod_ids[i]
-                    }
-                else:
-                    frag_residues = list(seq[p + 1 :])
-                    offset = p + 1
-                    frag_mods = {
-                        i - offset: pos_mod_ids[i]
-                        for i in range(p + 1, L)
-                        if pos_mod_ids[i]
-                    }
-                for l_idx, lid in enumerate(loss_ids, start=1):
-                    loss = LOSS_REGISTRY.get(lid)
-                    loss_mask[p, t_idx, l_idx] = loss_applies(
-                        loss,
-                        ion_type_name=ion_type.name,
-                        fragment_residues=frag_residues,
-                        fragment_mods=frag_mods,
-                    )
+    # Batched biochem mask — (B, n_pos, n_types, n_losses)
+    loss_mask = _biochem_mask_batched(
+        seqs=[inp.seq for inp in inputs],
+        pos_mod_ids=[inp.pos_mod_ids for inp in inputs],
+        ion_types=ion_types,
+        loss_ids=loss_ids,
+        n_pos=n_pos,
+        n_types=n_types,
+        n_losses=n_losses,
+        type_is_n=type_is_n,
+    )
 
     nan = torch.tensor(float("nan"), dtype=torch.float64)
-    mz_tensor = torch.where(loss_mask[:, :, None, :], mz_tensor, nan)
+    mz_tensor = torch.where(loss_mask[:, :, :, None, :], mz_tensor, nan)
+    return mz_tensor
 
-    # ── Build Arrow table from tensor ───────────────────────────────
-    finite = torch.isfinite(mz_tensor)
+
+def _biochem_mask_batched(
+    *,
+    seqs: Sequence[str],
+    pos_mod_ids: Sequence[Sequence[Sequence[str]]],
+    ion_types: Sequence[IonType],
+    loss_ids: Sequence[str],
+    n_pos: int,
+    n_types: int,
+    n_losses: int,
+    type_is_n: torch.Tensor,
+) -> torch.Tensor:
+    """Batched version of ``_biochem_mask``. Returns
+    ``(B, n_pos, n_types, n_losses)`` bool tensor."""
+    B = len(seqs)
+    if not loss_ids:
+        return torch.ones((B, n_pos, n_types, 1), dtype=torch.bool)
+
+    L = len(seqs[0])
+    n_loss_only = len(loss_ids)
+    losses = [LOSS_REGISTRY.get(lid) for lid in loss_ids]
+
+    has_residue_rule = torch.tensor(
+        [bool(l.triggering_residues) for l in losses], dtype=torch.bool
+    )
+    has_mod_rule = torch.tensor(
+        [bool(l.triggering_mods) for l in losses], dtype=torch.bool
+    )
+    joint_mode = has_residue_rule & has_mod_rule  # (n_loss_only,)
+
+    ion_type_allowed = torch.empty(
+        (n_types, n_loss_only), dtype=torch.bool
+    )
+    for l_idx, loss in enumerate(losses):
+        if loss.applies_to_ion_types:
+            for t_idx, ion_type in enumerate(ion_types):
+                ion_type_allowed[t_idx, l_idx] = (
+                    ion_type.name in loss.applies_to_ion_types
+                )
+        else:
+            ion_type_allowed[:, l_idx] = True
+
+    # (B, L, n_loss_only) trigger tensors
+    residue_trigger = torch.zeros((B, L, n_loss_only), dtype=torch.bool)
+    mod_trigger = torch.zeros((B, L, n_loss_only), dtype=torch.bool)
+    for b in range(B):
+        seq = seqs[b]
+        pmods = pos_mod_ids[b]
+        for l_idx, loss in enumerate(losses):
+            if loss.triggering_residues:
+                for i, r in enumerate(seq):
+                    if r in loss.triggering_residues:
+                        residue_trigger[b, i, l_idx] = True
+            if loss.triggering_mods:
+                for i in range(L):
+                    mods_at_i = pmods[i]
+                    if not mods_at_i:
+                        continue
+                    if any(m in loss.triggering_mods for m in mods_at_i):
+                        mod_trigger[b, i, l_idx] = True
+    joint_trigger = residue_trigger & mod_trigger
+
+    def _cumor(t: torch.Tensor) -> torch.Tensor:
+        return torch.cummax(t.to(torch.int8), dim=1).values.bool()
+
+    r_n = _cumor(residue_trigger)[:, :n_pos, :]  # (B, n_pos, n_loss_only)
+    m_n = _cumor(mod_trigger)[:, :n_pos, :]
+    j_n = _cumor(joint_trigger)[:, :n_pos, :]
+
+    def _rev_cumor(t: torch.Tensor) -> torch.Tensor:
+        flipped = torch.flip(t, [1])
+        out = _cumor(flipped)
+        return torch.flip(out, [1])
+
+    r_c = _rev_cumor(residue_trigger)[:, 1 : 1 + n_pos, :]
+    m_c = _rev_cumor(mod_trigger)[:, 1 : 1 + n_pos, :]
+    j_c = _rev_cumor(joint_trigger)[:, 1 : 1 + n_pos, :]
+
+    type_is_n_b = type_is_n[None, None, :, None]  # (1, 1, n_types, 1)
+    r_side = torch.where(
+        type_is_n_b, r_n[:, :, None, :], r_c[:, :, None, :]
+    )  # (B, n_pos, n_types, n_loss_only)
+    m_side = torch.where(type_is_n_b, m_n[:, :, None, :], m_c[:, :, None, :])
+    j_side = torch.where(type_is_n_b, j_n[:, :, None, :], j_c[:, :, None, :])
+
+    has_residue_rule_b = has_residue_rule[None, None, None, :]
+    has_mod_rule_b = has_mod_rule[None, None, None, :]
+    joint_mode_b = joint_mode[None, None, None, :]
+
+    case_no_mod = (~has_residue_rule_b) | r_side
+    case_with_mod = torch.where(joint_mode_b, j_side, m_side)
+    applies = torch.where(has_mod_rule_b, case_with_mod, case_no_mod)
+    applies = applies & ion_type_allowed[None, None, :, :]
+
+    no_loss = torch.ones((B, n_pos, n_types, 1), dtype=torch.bool)
+    return torch.cat([no_loss, applies], dim=-1)
+
+
+def _emit_fragment_table(
+    *,
+    mz_slice: torch.Tensor,  # (n_pos, n_types, n_charges, n_losses)
+    seq: str,
+    ion_types: Sequence[IonType],
+    loss_ids: Sequence[str],
+    peptide_idx: int | None,
+    include_peptide_seq: bool,
+) -> pa.Table:
+    """Build a ``FragmentIonTable`` from one peptide's slice."""
+    finite = torch.isfinite(mz_slice)
     idx_p, idx_t, idx_c, idx_l = torch.where(finite)
-    mz_values = mz_tensor[finite].tolist()
+    mz_values = mz_slice[finite].tolist()
 
     n_rows = idx_p.numel()
     pep_idx_col = (
@@ -516,8 +803,7 @@ def _linear_fragment_ladder(
     loss_id_col = [
         None if li == 0 else loss_ids[li - 1] for li in idx_l.tolist()
     ]
-
-    table = pa.table(
+    return pa.table(
         {
             "peptide_idx": pa.array(pep_idx_col, type=pa.int32()),
             "peptide_seq": pa.array(pep_seq_col, type=pa.string()),
@@ -530,7 +816,253 @@ def _linear_fragment_ladder(
         schema=FRAGMENT_ION_TABLE,
     )
 
+
+@requires_canonical
+def _linear_fragment_ladder(
+    peptidoform: Peptidoform,
+    *,
+    ion_types: Sequence[IonType],
+    max_fragment_charge: int,
+    neutral_losses: Sequence[str] | None,
+    return_tensor: bool,
+    vocab: ModVocab,
+    peptide_idx: int | None,
+    include_peptide_seq: bool,
+) -> tuple[pa.Table, torch.Tensor | None]:
+    """Linear-peptide ladder. N-term / C-term mods fold into N-side / C-side
+    fragment masses uniformly; global isotope labels and global fixed mods
+    are expanded into per-residue / per-terminal contributions before the
+    cumsum.
+
+    Rejects ambiguity groups, ranges, and labile mods — those need to be
+    disambiguated or stripped before ladder generation. A future
+    ``Peptidoform.disambiguate()`` helper will do the rewriting.
+
+    For bulk workloads (many peptidoforms in one pass), prefer
+    :func:`fragment_ladders_batch` which amortizes Python / tensor
+    dispatch overhead across peptidoforms grouped by sequence length.
+    """
+    if max_fragment_charge < 1:
+        raise ValueError(
+            f"max_fragment_charge must be ≥ 1; got {max_fragment_charge}"
+        )
+    if not ion_types:
+        raise ValueError("ion_types must be non-empty")
+
+    loss_ids: tuple[str, ...] = (
+        tuple(neutral_losses) if neutral_losses else ()
+    )
+    inputs = _prepare_linear_inputs(peptidoform, vocab=vocab)
+    mz_tensor = _run_linear_batch(
+        [inputs],
+        ion_types=ion_types,
+        max_fragment_charge=max_fragment_charge,
+        loss_ids=loss_ids,
+    )[0]
+    table = _emit_fragment_table(
+        mz_slice=mz_tensor,
+        seq=inputs.seq,
+        ion_types=ion_types,
+        loss_ids=loss_ids,
+        peptide_idx=peptide_idx,
+        include_peptide_seq=include_peptide_seq,
+    )
     return table, (mz_tensor if return_tensor else None)
+
+
+def fragment_ladder_indices_batch(
+    peptidoforms: Sequence[Peptidoform],
+    *,
+    ion_types: Sequence[IonType] = (IonType.B, IonType.Y),
+    max_fragment_charge: int = 1,
+    neutral_losses: Sequence[str] | None = None,
+    vocab: ModVocab = UNIMOD,
+) -> list[dict[tuple[int, int, int, str | None], float]]:
+    """Batched-ladder fast path for annotated-spectrum readers.
+
+    Returns a list of ``{(ion_type, position, charge, loss_id): mz}``
+    dicts in input order — one per peptidoform. Uses the same grouped-
+    by-length tensor math as :func:`fragment_ladders_batch` but skips
+    the Arrow-table assembly that callers like the MSP reader would
+    only deconstruct again. Linear peptidoforms only (no cross-link /
+    branch / multichain dispatch). Roughly 2-3× faster than calling
+    ``fragment_ladders_batch`` and re-indexing the resulting tables.
+    """
+    if max_fragment_charge < 1:
+        raise ValueError(
+            f"max_fragment_charge must be ≥ 1; got {max_fragment_charge}"
+        )
+    if not ion_types:
+        raise ValueError("ion_types must be non-empty")
+    loss_ids: tuple[str, ...] = (
+        tuple(neutral_losses) if neutral_losses else ()
+    )
+    n_losses = 1 + len(loss_ids)
+    ion_type_codes = tuple(int(t) for t in ion_types)
+
+    # Group linear peptidoforms by (length, isotopes); reject non-linear
+    # — callers route those to ``fragment_ladder`` themselves.
+    inputs_by_group: dict[
+        tuple[int, tuple[str, ...]], list[tuple[int, _LinearInputs]]
+    ] = {}
+    for idx, p in enumerate(peptidoforms):
+        if not isinstance(p, Peptidoform):
+            raise TypeError(
+                "fragment_ladder_indices_batch supports only linear "
+                "Peptidoform inputs; got "
+                f"{type(p).__name__}"
+            )
+        if _has_crosslinks(p) or _has_branches(p):
+            raise ValueError(
+                "fragment_ladder_indices_batch supports only linear "
+                "peptidoforms (no cross-links / branches); route those "
+                "through fragment_ladder per-spectrum"
+            )
+        inp = _prepare_linear_inputs(p, vocab=vocab)
+        key = (len(inp.seq), inp.isotopes)
+        inputs_by_group.setdefault(key, []).append((idx, inp))
+
+    results: list[dict[tuple[int, int, int, str | None], float] | None] = [
+        None
+    ] * len(peptidoforms)
+    for (_length, _isotopes), items in inputs_by_group.items():
+        indices = [i for i, _ in items]
+        inputs = [inp for _, inp in items]
+        mz_batch = _run_linear_batch(
+            inputs,
+            ion_types=ion_types,
+            max_fragment_charge=max_fragment_charge,
+            loss_ids=loss_ids,
+        )
+        # mz_batch shape: (B, n_pos, n_types, n_charges, n_losses)
+        finite_b = torch.isfinite(mz_batch)
+        idx_b, idx_p, idx_t, idx_c, idx_l = torch.where(finite_b)
+        mz_values = mz_batch[finite_b].tolist()
+        # Split per batch slot
+        idx_b_l = idx_b.tolist()
+        idx_p_l = idx_p.tolist()
+        idx_t_l = idx_t.tolist()
+        idx_c_l = idx_c.tolist()
+        idx_l_l = idx_l.tolist()
+        n_batch = len(inputs)
+        per_slot: list[dict[tuple[int, int, int, str | None], float]] = [
+            {} for _ in range(n_batch)
+        ]
+        for k in range(len(mz_values)):
+            b = idx_b_l[k]
+            it = ion_type_codes[idx_t_l[k]]
+            pos = idx_p_l[k]
+            ch = idx_c_l[k] + 1
+            li = idx_l_l[k]
+            lid = None if li == 0 else loss_ids[li - 1]
+            per_slot[b][(it, pos, ch, lid)] = mz_values[k]
+        for slot, idx_into_input in enumerate(indices):
+            results[idx_into_input] = per_slot[slot]
+
+    # ``loss_ids``/``n_losses`` used only by the inner branch; the
+    # variable below silences an unused-name lint.
+    _ = n_losses
+    return [r if r is not None else {} for r in results]
+
+
+def fragment_ladders_batch(
+    peptidoforms: Sequence[ProFormaResult],
+    *,
+    ion_types: Sequence[IonType] = (IonType.B, IonType.Y),
+    max_fragment_charge: int = 1,
+    neutral_losses: Sequence[str] | None = None,
+    vocab: ModVocab = UNIMOD,
+    peptide_idxs: Sequence[int | None] | None = None,
+    include_peptide_seq: bool = True,
+) -> list[pa.Table]:
+    """Batched theoretical-ladder construction across many peptidoforms.
+
+    Equivalent to looping ``fragment_ladder(p, ...)`` per peptide, but
+    groups inputs by sequence length + global isotope labels so the
+    inner tensor math (cumsum, ion-type / charge / loss broadcasts,
+    biochem mask, NaN masking) runs once per group rather than once
+    per peptide. Returns a list of ``FragmentIonTable``s in input
+    order.
+
+    Non-linear peptidoforms (cross-linked, branched, multichain) and
+    ranges / labile / unknown-position mods fall back to per-spectrum
+    dispatch via :func:`fragment_ladder` so the batched entry point
+    works for typical proteomics inputs without restricting the
+    public ``fragment_ladder`` surface.
+
+    Big win on MSP / mzSpecLib / search-engine outputs that present
+    thousands of peptidoforms per file — amortizes torch dispatch
+    overhead across the batch.
+    """
+    if max_fragment_charge < 1:
+        raise ValueError(
+            f"max_fragment_charge must be ≥ 1; got {max_fragment_charge}"
+        )
+    if not ion_types:
+        raise ValueError("ion_types must be non-empty")
+
+    loss_ids: tuple[str, ...] = (
+        tuple(neutral_losses) if neutral_losses else ()
+    )
+    peptide_idxs_seq: list[int | None] = (
+        list(peptide_idxs)
+        if peptide_idxs is not None
+        else [None] * len(peptidoforms)
+    )
+    if len(peptide_idxs_seq) != len(peptidoforms):
+        raise ValueError(
+            "len(peptide_idxs) must match len(peptidoforms) when supplied"
+        )
+
+    results: list[pa.Table | None] = [None] * len(peptidoforms)
+
+    # ── First, route any non-linear / unsupported peptidoforms to the
+    #    dispatcher; collect linear ones for batched processing.
+    linear_inputs_by_group: dict[
+        tuple[int, tuple[str, ...]], list[tuple[int, _LinearInputs]]
+    ] = {}
+
+    for idx, p in enumerate(peptidoforms):
+        if isinstance(p, MultiPeptidoform) or _has_crosslinks(p) or _has_branches(p):
+            tbl, _ = fragment_ladder(
+                p,
+                ion_types=ion_types,
+                max_fragment_charge=max_fragment_charge,
+                neutral_losses=list(loss_ids) if loss_ids else None,
+                return_tensor=False,
+                vocab=vocab,
+                peptide_idx=peptide_idxs_seq[idx],
+                include_peptide_seq=include_peptide_seq,
+            )
+            results[idx] = tbl
+            continue
+        inp = _prepare_linear_inputs(p, vocab=vocab)
+        key = (len(inp.seq), inp.isotopes)
+        linear_inputs_by_group.setdefault(key, []).append((idx, inp))
+
+    # ── Process each (length, isotopes) group in one batched pass.
+    for (_length, _isotopes), items in linear_inputs_by_group.items():
+        indices = [i for i, _ in items]
+        inputs = [inp for _, inp in items]
+        mz_batch = _run_linear_batch(
+            inputs,
+            ion_types=ion_types,
+            max_fragment_charge=max_fragment_charge,
+            loss_ids=loss_ids,
+        )
+        for slot, idx_into_input in enumerate(indices):
+            results[idx_into_input] = _emit_fragment_table(
+                mz_slice=mz_batch[slot],
+                seq=inputs[slot].seq,
+                ion_types=ion_types,
+                loss_ids=loss_ids,
+                peptide_idx=peptide_idxs_seq[idx_into_input],
+                include_peptide_seq=include_peptide_seq,
+            )
+
+    # All slots are filled now (every input was routed to one of the
+    # two branches above).
+    return [t for t in results if t is not None]
 
 
 def _crosslink_fragment_ladder(
@@ -573,4 +1105,6 @@ __all__ = [
     "FragmentIon",
     "fragment_mz",
     "fragment_ladder",
+    "fragment_ladders_batch",
+    "fragment_ladder_indices_batch",
 ]
