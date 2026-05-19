@@ -297,7 +297,18 @@ def run_jar(
         f"{java_version or '(unknown)'}\nsource: {java_source}\npath: {java_path}\n"
     )
 
-    jvm_flags: list[str] = [f"-Xmx{jvm_heap_max}"]
+    jvm_flags: list[str] = [
+        f"-Xmx{jvm_heap_max}",
+        # Run AWT in headless mode so tools that draw plots (EncyclopeDIA's
+        # mass-error PDF reports via JFreeChart, etc.) work on compute
+        # nodes / containers / anywhere without an X11 display. The JVM
+        # uses a software renderer instead of trying to connect to an
+        # X server. Interactive Java apps that need a real display can
+        # override by passing ``-Djava.awt.headless=false`` via
+        # ``extra_jvm_args`` — later flags win in the JVM property
+        # resolution order.
+        "-Djava.awt.headless=true",
+    ]
     if jvm_heap_min is not None:
         jvm_flags.append(f"-Xms{jvm_heap_min}")
     if jvm_tmpdir is not None:

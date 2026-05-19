@@ -262,6 +262,43 @@ def test_run_jar_bundled_jre_fallback(
     assert result.java_path == bundled_java
 
 
+def test_run_jar_headless_default(register_hello_tool, tmp_path: Path) -> None:
+    """``-Djava.awt.headless=true`` is on every argv by default so AWT-using
+    libraries (JFreeChart, etc.) work on compute nodes without an X11
+    display. Regression test for the EncyclopeDIA `AWTError: Can't connect
+    to X11` failure observed in SLURM batch runs."""
+    result = run_jar(
+        register_hello_tool,
+        args=[],
+        log_dir=tmp_path / "logs",
+        stream_to_stderr=False,
+    )
+    assert "-Djava.awt.headless=true" in result.argv
+    # Flag must precede -jar so the JVM applies it before AWT init
+    headless_idx = result.argv.index("-Djava.awt.headless=true")
+    jar_idx = result.argv.index("-jar")
+    assert headless_idx < jar_idx
+
+
+def test_run_jar_headless_can_be_overridden(
+    register_hello_tool, tmp_path: Path
+) -> None:
+    """Caller passing ``-Djava.awt.headless=false`` via extra_jvm_args wins
+    over the default — later -D flags override earlier ones in the JVM's
+    system-property resolution."""
+    result = run_jar(
+        register_hello_tool,
+        args=[],
+        extra_jvm_args=["-Djava.awt.headless=false"],
+        log_dir=tmp_path / "logs",
+        stream_to_stderr=False,
+    )
+    # Both flags appear; the override comes after the default
+    default_idx = result.argv.index("-Djava.awt.headless=true")
+    override_idx = result.argv.index("-Djava.awt.headless=false")
+    assert default_idx < override_idx
+
+
 def test_run_jar_log_dir_created(
     register_hello_tool, tmp_path: Path
 ) -> None:
