@@ -24,12 +24,14 @@ set -euo pipefail
 VERSION="15-6f452"
 VARIANT="avx2"   # default; override via --variant {avx2|sse41|sse2|arm64}
 
-# SHA256s for each upstream tarball at this version. Verified
-# 2026-05-19 by fetching from https://github.com/soedinglab/MMseqs2/releases/tag/15-6f452
-# and running sha256sum locally. If upstream rebuilds the tag, these
-# need re-verification — open an issue if checksum mismatches.
+# SHA256s for each upstream tarball at this version. avx2 verified
+# 2026-05-19 against the actual GitHub release download
+# (https://github.com/soedinglab/MMseqs2/releases/tag/15-6f452).
+# The other variants' hashes are placeholders — pass --checksum <SHA>
+# (verified from the release page) until they're filled in. If upstream
+# rebuilds the tag, these need re-verification.
 declare -A SHA256_BY_VARIANT
-SHA256_BY_VARIANT[avx2]="20e1cc6ce2cca5c2db05a17ba6d10a1d3a3f7a7c93e6e30d676b73ace87a6c33"
+SHA256_BY_VARIANT[avx2]="8dc61321ebe00cfdce2773b63bce9d6a226bc2a9520ca6fee30957915eadd0a6"
 SHA256_BY_VARIANT[sse41]="REPLACE_WITH_VERIFIED_SHA256_FOR_SSE41"
 SHA256_BY_VARIANT[sse2]="REPLACE_WITH_VERIFIED_SHA256_FOR_SSE2"
 SHA256_BY_VARIANT[arm64]="REPLACE_WITH_VERIFIED_SHA256_FOR_ARM64"
