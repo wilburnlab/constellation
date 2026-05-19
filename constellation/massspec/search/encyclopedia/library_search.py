@@ -160,21 +160,50 @@ def run_library_search(
     )
 
 
-def find_search_elib(input_file: Path) -> Path | None:
+def find_search_elib(
+    input_file: Path,
+    *,
+    cwd: Path | None = None,
+) -> Path | None:
     """Locate the chromatogram ``.elib`` EncyclopeDIA's default search
     produces.
 
-    Convention: EncyclopeDIA writes ``<input>.elib`` next to the input
-    file. Returns the path if it exists, ``None`` otherwise so the
-    caller can report a clear error.
+    EncyclopeDIA's output-path behaviour for the chromatogram .elib has
+    drifted across versions:
+      * Older versions wrote ``<input>.elib`` next to the input file
+        (verified for v2.12.30 on .mzML inputs).
+      * 6.5.15 (and likely later) writes ``<input_stem>.elib`` to the
+        process's *current working directory* — verified empirically
+        against a real GPF search where the file landed at
+        ``<output_dir>/GPF_combined.elib`` after the runner set
+        ``cwd=output_dir``.
+
+    We check both conventions in fall-through order. ``cwd`` should be
+    the same path the runner passed to :func:`run_jar` so the cwd
+    candidates resolve correctly. Returns ``None`` when nothing
+    matches, so the caller can surface a clear error.
     """
-    candidate = input_file.parent / f"{input_file.name}.elib"
-    if candidate.is_file():
-        return candidate
-    # Fallback: try stripping any extension and tacking on `.elib`
-    stem_candidate = input_file.parent / f"{input_file.stem}.elib"
-    if stem_candidate.is_file():
-        return stem_candidate
+    candidates: list[Path] = [
+        # cwd-relative paths first — matches 6.5.15+ behaviour
+        # (validated against `cwd=output_dir` runs).
+    ]
+    if cwd is not None:
+        cwd = Path(cwd)
+        candidates.extend(
+            [
+                cwd / f"{input_file.stem}.elib",  # 6.5.15: <stem>.elib in cwd
+                cwd / f"{input_file.name}.elib",  # in case a future version preserves the extension
+            ]
+        )
+    candidates.extend(
+        [
+            input_file.parent / f"{input_file.name}.elib",  # <input>.elib next to input
+            input_file.parent / f"{input_file.stem}.elib",  # <input_stem>.elib next to input
+        ]
+    )
+    for c in candidates:
+        if c.is_file():
+            return c
     return None
 
 

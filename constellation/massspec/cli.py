@@ -672,12 +672,14 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
         print(f"  see {exc.stderr_log} for the full log", file=_sys.stderr)
         return exc.returncode
 
-    # Locate the .elib EncyclopeDIA dropped next to the input.
-    elib_path = find_search_elib(input_file)
+    # Locate the .elib. 6.5.15 writes <input_stem>.elib to the runner's
+    # cwd (i.e. output_dir); older versions wrote it next to the input.
+    elib_path = find_search_elib(input_file, cwd=output_dir)
     if elib_path is None:
         print(
-            f"error: encyclopedia exited 0 but no .elib was found beside "
-            f"the input ({input_file.parent}); check {result.stderr_log}",
+            f"error: encyclopedia exited 0 but no .elib was found in "
+            f"{output_dir} or next to the input at {input_file.parent}; "
+            f"check {result.stderr_log}",
             file=_sys.stderr,
         )
         return 2
