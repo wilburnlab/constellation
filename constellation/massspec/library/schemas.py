@@ -86,13 +86,27 @@ PRECURSOR_TABLE: pa.Schema = pa.schema(
 LIBRARY_FRAGMENT_TABLE: pa.Schema = pa.schema(
     [
         pa.field("precursor_id", pa.int64(), nullable=False),
-        pa.field("ion_type", pa.int8(), nullable=False),
-        pa.field("position", pa.int32(), nullable=False),
-        pa.field("charge", pa.int32(), nullable=False),
+        # ion_type / position / charge are NULL when the source carried
+        # a raw annotation string we couldn't structurally resolve —
+        # e.g. an internal-fragment / immonium / named-loss annotation
+        # that mzPAF Phase 1 doesn't decode, or a peak whose
+        # (type, position, charge, loss) tuple is biochemistry-masked
+        # by LOSS_REGISTRY. The raw ``annotation`` string is still
+        # preserved so downstream tools can re-parse with future
+        # grammar support without re-reading the source.
+        pa.field("ion_type", pa.int8(), nullable=True),
+        pa.field("position", pa.int32(), nullable=True),
+        pa.field("charge", pa.int32(), nullable=True),
         pa.field("loss_id", pa.string(), nullable=True),
         pa.field("mz_theoretical", pa.float64(), nullable=False),
-        # -1.0 sentinel = no prediction; otherwise normalised to [0, 1]
-        pa.field("intensity_predicted", pa.float32(), nullable=False),
+        # -1.0 sentinel = no prediction. Model-predicted libraries
+        # normalise to [0, 1]; empirical-source libraries (e.g. NIST
+        # .msp, .dlib) may carry raw observed counts and project to a
+        # normalised view downstream. float64 matches mzPeak's choice
+        # for intensity arrays — modern Orbitrap/Astral dynamic range
+        # exceeds float32's 2**24 exact-integer ceiling, so silent
+        # quantisation of large peaks is avoided.
+        pa.field("intensity_predicted", pa.float64(), nullable=False),
         pa.field("annotation", pa.string(), nullable=True),
     ],
     metadata={b"schema_name": b"LibraryFragmentTable"},

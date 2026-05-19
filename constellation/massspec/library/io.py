@@ -131,10 +131,58 @@ _PARQUET_TABLES = (
 )
 
 
+# Sentinel embedded into manifest.json in place of a pa.Table value —
+# the reader recognises this shape and rehydrates the table from the
+# sidecar parquet file referenced by ``__pa_table__``.
+_TABLE_REF_KEY = "__pa_table__"
+
+
+def _safe_sidecar_name(key: str) -> str:
+    """Map a metadata_extras key (e.g. ``x.msp.precursor_comments``)
+    to a filesystem-safe parquet filename stem."""
+    return "_metadata_" + "".join(c if c.isalnum() else "_" for c in key)
+
+
+def _encode_metadata_for_manifest(
+    metadata: dict[str, Any], path: Path
+) -> dict[str, Any]:
+    """Replace ``pa.Table`` values with a sidecar reference, writing
+    each table to ``path/_metadata_<key>.parquet``. All other values
+    must be JSON-serialisable as today.
+    """
+    encoded: dict[str, Any] = {}
+    for key, value in metadata.items():
+        if isinstance(value, pa.Table):
+            sidecar = _safe_sidecar_name(key) + ".parquet"
+            pq.write_table(value, path / sidecar)
+            encoded[key] = {_TABLE_REF_KEY: sidecar}
+        else:
+            encoded[key] = value
+    return encoded
+
+
+def _decode_metadata_from_manifest(
+    encoded: dict[str, Any], path: Path
+) -> dict[str, Any]:
+    """Inverse of ``_encode_metadata_for_manifest``."""
+    decoded: dict[str, Any] = {}
+    for key, value in encoded.items():
+        if isinstance(value, dict) and _TABLE_REF_KEY in value:
+            decoded[key] = pq.read_table(path / value[_TABLE_REF_KEY])
+        else:
+            decoded[key] = value
+    return decoded
+
+
 class ParquetDirWriter:
     """Write a ``Library`` to a directory of one Parquet file per table.
 
-    Library-level metadata round-trips through ``manifest.json``.
+    Library-level metadata round-trips through ``manifest.json``. Values
+    in ``metadata_extras`` that are ``pa.Table`` instances are written
+    out as sidecar parquet files (``_metadata_<key>.parquet``) and the
+    manifest carries a reference object in their place; this lets
+    readers (e.g. NIST .msp) attach per-precursor side-tables that
+    survive a ParquetDir round-trip.
     """
 
     extension: ClassVar[str] = "/"
@@ -148,7 +196,9 @@ class ParquetDirWriter:
         manifest = {
             "format": self.format_name,
             "tables": list(_PARQUET_TABLES),
-            "metadata": library.metadata_extras,
+            "metadata": _encode_metadata_for_manifest(
+                library.metadata_extras, path
+            ),
         }
         (path / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
@@ -172,7 +222,9 @@ class ParquetDirReader:
             precursors=tables["precursors"],
             fragments=tables["fragments"],
             protein_peptide=tables["protein_peptide"],
-            metadata_extras=dict(manifest.get("metadata", {})),
+            metadata_extras=_decode_metadata_from_manifest(
+                manifest.get("metadata", {}), path
+            ),
         )
 
 

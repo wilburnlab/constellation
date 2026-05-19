@@ -1,0 +1,77 @@
+Name: PEPTIDE/2
+MW: 799.36
+Comment: Parent=400.69 Mods=0 iRT=42.5
+Num peaks: 4
+98.06 1000.0 "b1"
+227.10 5000.0 "b2/0.2ppm"
+148.06 7500.0 "y1/-0.1ppm"
+574.27 9999.0 "y5/1.0ppm"
+
+Name: AAAAAAAAQMHAK/3
+MW: 1198.6
+Comment: Parent=399.87 Mods=1/9,M,Oxidation Modstring=AAAAAAAAQMHAK//3 iRT=-24.61
+Num peaks: 3
+143.08 500.0 "b2/1.0ppm"
+175.12 800.0 "y1/-0.5ppm"
+333.16 1200.0 "y3/0.0ppm"
+
+Name: ACSTPK/2
+MW: 660.30
+Comment: Parent=331.16 Mods=2/1,C,Carbamidomethyl/3,T,Phospho iRT=15.0
+Num peaks: 3
+72.04 200.0 "b1"
+233.09 1500.0 "b2/0.3ppm"
+147.11 4000.0 "y1/0.0ppm"
+
+Name: PEPTID/2
+MW: 670.32
+Comment: Parent=336.16 Mods=0 iRT=NA
+Num peaks: 2
+98.06 800.0 "b1/0.5ppm"
+261.16 4200.0 "y2/-0.4ppm"
+
+Name: ESPECTRA/2
+MW: 833.36
+Comment: Parent=417.69 Mods=0 iRT=55.0
+Num peaks: 3
+130.05 300.0 "b1/0.2ppm"
+175.12 9500.0 "y1/0.1ppm"
+346.69 800.0 "y6^2/1.5ppm"
+
+Name: STSPK/2
+MW: 533.27
+Comment: Parent=267.64 Mods=0 iRT=10.0
+Num peaks: 3
+189.05 700.0 "b2-H2O/0.0ppm"
+147.11 6000.0 "y1/-0.2ppm"
+244.13 3200.0 "y2/0.1ppm"
+
+Name: SAMPLED/2
+MW: 749.34
+Comment: Parent=375.67 Mods=0 iRT=20.0
+Num peaks: 3
+185.09 1100.0 "b2/0.3ppm"
+133.06 2000.0 "y1/-0.1ppm"
+9876.5 99.0 "IS-ATC/0.0ppm"
+
+Name: HCDREADY/2
+MW: 977.42
+Comment: Parent=489.71 Mods=0 iRT=88.0 Inst="HCD" Collision_energy=27 Scan=12345 RTInSeconds=3600.5
+Num peaks: 3
+138.07 400.0 "b1/0.5ppm"
+147.11 2500.0 "y1/0.0ppm"
+204.13 1900.0 "y2/-0.2ppm"
+
+Name: REGNANTA/2
+MW: 870.43
+Comment: Parent=436.22 Mods=0 iRT=33.0 Protein=ACC1;ACC2
+Num peaks: 2
+185.09 900.0 "b2/0.0ppm"
+90.05 3300.0 "y1/0.0ppm"
+
+Name: NAMEDPATH/2
+MW: 957.45
+Comment: Mods=0
+Num peaks: 2
+115.05 600.0 "b1/0.1ppm"
+175.12 2400.0 "y1/-0.1ppm"
