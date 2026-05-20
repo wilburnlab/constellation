@@ -563,10 +563,88 @@ def test_deduplication_keeps_most_specific_class() -> None:
         detected, alignments, reference, novel,
         min_peptide_length=5,
     )
-    # One row per unique peptide_sequence after dedup
+    # One row per unique peptide_sequence (no modforms recorded → single
+    # row via the (None, None) fallback)
     assert result.num_rows == 1
     # snp (0) < insertion (1) → snp wins
     assert result.column("classification").to_pylist() == ["snp"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Modform-level output (one row per detected modified_sequence)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_output_keyed_at_modform_level() -> None:
+    """A bare sequence detected as multiple modforms (e.g. N-terminal
+    acetylated + bare) yields one row per modform, all sharing the bare
+    sequence's classification — proteoforms stay distinct for per-
+    precursor quant instead of collapsing to the bare-sequence level."""
+    novel = pa.table(
+        {
+            "protein_id": pa.array(["NOVEL1"]),
+            "sequence": pa.array(["MAGCKLLLLLPPGR"]),
+        }
+    )
+    reference = pa.table(
+        {
+            "protein_id": pa.array(["REF1"]),
+            "sequence": pa.array(["MAGCKLLLLAPPGR"]),  # snp in the peptide span
+        }
+    )
+    alignments = pa.table(
+        {
+            "query": ["NOVEL1"],
+            "target": ["REF1"],
+            "evalue": [1e-50],
+            "qstart": [1], "qend": [14],
+            "tstart": [1], "tend": [14],
+            "cigar": ["14M"],
+            "alignment_tier": pa.array([None], type=pa.string()),
+        }
+    )
+    # The same bare peptide detected as two proteoforms: N-term acetyl
+    # and bare. Both must survive as separate output rows.
+    detected = pa.table(
+        {
+            "peptide_sequence": pa.array(["LLLLLPPGR", "LLLLLPPGR"]),
+            "modified_sequence": pa.array(
+                ["[Acetyl]-LLLLLPPGR", "LLLLLPPGR"]
+            ),
+        }
+    )
+    result = classify_novel_peptides(detected, alignments, reference, novel)
+    assert result.num_rows == 2
+    rows = result.to_pylist()
+    # Both rows share the bare sequence + classification...
+    assert {r["peptide_sequence"] for r in rows} == {"LLLLLPPGR"}
+    assert {r["classification"] for r in rows} == {"snp"}
+    # ...but carry the two distinct modforms.
+    assert {r["modified_sequence"] for r in rows} == {
+        "[Acetyl]-LLLLLPPGR", "LLLLLPPGR",
+    }
+
+
+def test_output_single_row_when_no_modforms() -> None:
+    """No modified_sequence column → one row per bare sequence (the
+    pre-change behaviour), with a null modified_sequence."""
+    novel = pa.table(
+        {"protein_id": pa.array(["NOVEL1"]), "sequence": pa.array(["MAGCKLLLLLPPGR"])}
+    )
+    reference = pa.table(
+        {"protein_id": pa.array(["REF1"]), "sequence": pa.array(["MAGCKLLLLAPPGR"])}
+    )
+    alignments = pa.table(
+        {
+            "query": ["NOVEL1"], "target": ["REF1"], "evalue": [1e-50],
+            "qstart": [1], "qend": [14], "tstart": [1], "tend": [14],
+            "cigar": ["14M"], "alignment_tier": pa.array([None], type=pa.string()),
+        }
+    )
+    detected = pa.table({"peptide_sequence": pa.array(["LLLLLPPGR"])})
+    result = classify_novel_peptides(detected, alignments, reference, novel)
+    assert result.num_rows == 1
+    assert result.column("modified_sequence").to_pylist() == [None]
 
 
 # ──────────────────────────────────────────────────────────────────────

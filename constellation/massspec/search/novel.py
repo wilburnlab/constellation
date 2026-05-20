@@ -506,8 +506,15 @@ def classify_novel_peptides(
         if isinstance(seq, str)
     }
 
-    # Optional peptide_id / modified_sequence pass-through
-    detected_seq_to_extra: dict[str, dict[str, object]] = {}
+    # Collect every distinct detected modform per bare sequence. The
+    # output is keyed at the modified-sequence level — one row per
+    # detected (peptide_sequence, modified_sequence) — so the separate
+    # proteoforms a variable mod produces (e.g. N-terminal-acetylated vs
+    # bare) stay distinct for downstream per-precursor quant. The
+    # classification itself is a property of the bare sequence and is
+    # shared across all its modforms.
+    detected_seq_to_modforms: dict[str, list[tuple[object, object]]] = {}
+    _seen_modforms: dict[str, set[tuple[object, object]]] = {}
     has_peptide_id = "peptide_id" in detected_peptides.column_names
     has_modseq = "modified_sequence" in detected_peptides.column_names
     if has_peptide_id or has_modseq:
@@ -518,32 +525,33 @@ def classify_novel_peptides(
             cols.append("modified_sequence")
         for row in detected_peptides.select(cols).to_pylist():
             seq = row["peptide_sequence"]
-            extra: dict[str, object] = {}
-            if has_peptide_id and row.get("peptide_id") is not None:
-                extra["peptide_id"] = row["peptide_id"]
-            if has_modseq and row.get("modified_sequence") is not None:
-                extra["modified_sequence"] = row["modified_sequence"]
-            # Keep the first encountered extras per peptide_sequence
-            detected_seq_to_extra.setdefault(seq, extra)
+            modseq = row.get("modified_sequence") if has_modseq else None
+            pid = row.get("peptide_id") if has_peptide_id else None
+            key = (modseq, pid)
+            seen = _seen_modforms.setdefault(seq, set())
+            if key not in seen:
+                seen.add(key)
+                detected_seq_to_modforms.setdefault(seq, []).append(key)
 
     _gene_map: Mapping[str, str] = gene_map or {}
     _transcript_map: Mapping[str, str] = transcript_map or {}
 
-    # 5. Classify each (peptide_seq, novel_protein_id) pair
+    # 5. Classify each (peptide_seq, novel_protein_id) pair. peptide_id /
+    # modified_sequence are left null here — they're filled when each
+    # surviving verdict is expanded across its detected modforms (step 7).
     rows: list[dict[str, object]] = []
     for pep_seq in detected_novel:
         novel_protein_ids = novel_digest[pep_seq]
         for protein_id in novel_protein_ids:
             protein_seq = novel_seq_map.get(protein_id)
             hit = hits_map.get(protein_id)
-            extras = detected_seq_to_extra.get(pep_seq, {})
 
             if hit is None or protein_seq is None:
                 rows.append(
                     {
-                        "peptide_id": extras.get("peptide_id"),
+                        "peptide_id": None,
                         "peptide_sequence": pep_seq,
-                        "modified_sequence": extras.get("modified_sequence"),
+                        "modified_sequence": None,
                         "classification": "unknown",
                         "ref_seq": None,
                         "protein_id": protein_id,
@@ -564,9 +572,9 @@ def classify_novel_peptides(
             target = str(hit["target"])
             rows.append(
                 {
-                    "peptide_id": extras.get("peptide_id"),
+                    "peptide_id": None,
                     "peptide_sequence": pep_seq,
-                    "modified_sequence": extras.get("modified_sequence"),
+                    "modified_sequence": None,
                     "classification": cls,
                     "ref_seq": ref_seq,
                     "protein_id": protein_id,
@@ -580,30 +588,39 @@ def classify_novel_peptides(
                 }
             )
 
-    # 6. Deduplicate per peptide_sequence, keeping the most-specific class
-    # (lowest priority value wins).
+    # 6. Pick the most-specific classification per bare sequence (lowest
+    # priority value wins across the proteins that produce it).
     rows.sort(
         key=lambda r: (
             r["peptide_sequence"],
             _CLASSIFICATION_PRIORITY.get(r["classification"], 99),
         )
     )
-    deduped: list[dict[str, object]] = []
-    seen_peptides: set[str] = set()
+    winning: dict[str, dict[str, object]] = {}
     for row in rows:
-        if row["peptide_sequence"] in seen_peptides:
-            continue
-        seen_peptides.add(row["peptide_sequence"])
-        # `novel_seq` column is the same value as `peptide_sequence` —
-        # add explicitly so the output is readable without
-        # cross-referencing.
-        row_with_novel = {"novel_seq": row["peptide_sequence"], **row}
-        deduped.append(row_with_novel)
+        seq = row["peptide_sequence"]
+        if seq not in winning:
+            winning[seq] = row
 
-    if not deduped:
+    # 7. Expand each bare-sequence verdict across its detected modforms,
+    # so the output carries one row per (peptide_sequence,
+    # modified_sequence). A bare sequence with no recorded modform (e.g.
+    # the input had no modified_sequence column) yields a single row with
+    # a null modified_sequence — preserving the prior behaviour.
+    expanded: list[dict[str, object]] = []
+    for seq, verdict in winning.items():
+        modforms = detected_seq_to_modforms.get(seq) or [(None, None)]
+        for modseq, pid in modforms:
+            row = dict(verdict)
+            row["modified_sequence"] = modseq
+            row["peptide_id"] = pid
+            # `novel_seq` mirrors `peptide_sequence` for readability.
+            expanded.append({"novel_seq": seq, **row})
+
+    if not expanded:
         return NOVEL_PEPTIDE_TABLE.empty_table()
 
-    table = pa.Table.from_pylist(deduped)
+    table = pa.Table.from_pylist(expanded)
     return cast_to_schema(table, NOVEL_PEPTIDE_TABLE)
 
 
