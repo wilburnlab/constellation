@@ -418,8 +418,8 @@ def classify_novel_peptides(
     ----------
     detected_peptides
         Arrow table with column ``peptide_sequence`` (string, canonical
-        AA). Optional columns ``peptide_id`` and ``modified_sequence``
-        are carried through to the output when present.
+        AA). An optional ``modified_sequence`` column is carried through
+        to the output when present.
     alignments
         :data:`ALIGNMENT_HIT_TABLE`-shaped (or compatible). Multiple
         hits per query are allowed; the function keeps the lowest-evalue
@@ -517,31 +517,25 @@ def classify_novel_peptides(
     # bare) stay distinct for downstream per-precursor quant. The
     # classification itself is a property of the bare sequence and is
     # shared across all its modforms.
-    detected_seq_to_modforms: dict[str, list[tuple[object, object]]] = {}
-    _seen_modforms: dict[str, set[tuple[object, object]]] = {}
-    has_peptide_id = "peptide_id" in detected_peptides.column_names
+    detected_seq_to_modforms: dict[str, list[object]] = {}
+    _seen_modforms: dict[str, set[object]] = {}
     has_modseq = "modified_sequence" in detected_peptides.column_names
-    if has_peptide_id or has_modseq:
-        cols = ["peptide_sequence"]
-        if has_peptide_id:
-            cols.append("peptide_id")
-        if has_modseq:
-            cols.append("modified_sequence")
-        for row in detected_peptides.select(cols).to_pylist():
+    if has_modseq:
+        for row in detected_peptides.select(
+            ["peptide_sequence", "modified_sequence"]
+        ).to_pylist():
             seq = row["peptide_sequence"]
-            modseq = row.get("modified_sequence") if has_modseq else None
-            pid = row.get("peptide_id") if has_peptide_id else None
-            key = (modseq, pid)
+            modseq = row.get("modified_sequence")
             seen = _seen_modforms.setdefault(seq, set())
-            if key not in seen:
-                seen.add(key)
-                detected_seq_to_modforms.setdefault(seq, []).append(key)
+            if modseq not in seen:
+                seen.add(modseq)
+                detected_seq_to_modforms.setdefault(seq, []).append(modseq)
 
     _gene_map: Mapping[str, str] = gene_map or {}
     _transcript_map: Mapping[str, str] = transcript_map or {}
 
-    # 5. Classify each (peptide_seq, novel_protein_id) pair. peptide_id /
-    # modified_sequence are left null here — they're filled when each
+    # 5. Classify each (peptide_seq, novel_protein_id) pair.
+    # modified_sequence is left null here — it's filled when each
     # surviving verdict is expanded across its detected modforms (step 7).
     rows: list[dict[str, object]] = []
     for pep_seq in detected_novel:
@@ -553,7 +547,6 @@ def classify_novel_peptides(
             if hit is None or protein_seq is None:
                 rows.append(
                     {
-                        "peptide_id": None,
                         "peptide_sequence": pep_seq,
                         "modified_sequence": None,
                         "classification": "unknown",
@@ -576,7 +569,6 @@ def classify_novel_peptides(
             target = str(hit["target"])
             rows.append(
                 {
-                    "peptide_id": None,
                     "peptide_sequence": pep_seq,
                     "modified_sequence": None,
                     "classification": cls,
@@ -613,11 +605,10 @@ def classify_novel_peptides(
     # a null modified_sequence — preserving the prior behaviour.
     expanded: list[dict[str, object]] = []
     for seq, verdict in winning.items():
-        modforms = detected_seq_to_modforms.get(seq) or [(None, None)]
-        for modseq, pid in modforms:
+        modforms = detected_seq_to_modforms.get(seq) or [None]
+        for modseq in modforms:
             row = dict(verdict)
             row["modified_sequence"] = modseq
-            row["peptide_id"] = pid
             # `novel_seq` mirrors `peptide_sequence` for readability.
             expanded.append({"novel_seq": seq, **row})
 

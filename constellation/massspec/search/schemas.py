@@ -72,10 +72,6 @@ PROTEIN_SCORE_TABLE: pa.Schema = pa.schema(
 # non_reference).
 NOVEL_PEPTIDE_TABLE: pa.Schema = pa.schema(
     [
-        # FK to Library.peptides.peptide_id when bound; null when the
-        # function is invoked on raw peptide-sequence input that hasn't
-        # been linked to a Library.
-        pa.field("peptide_id", pa.int64(), nullable=True),
         # Canonical AA sequence (no modifications) — the cartographer
         # algorithm operates on canonical sequences only.
         pa.field("peptide_sequence", pa.string(), nullable=False),
