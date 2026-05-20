@@ -115,10 +115,14 @@ def test_iter_demux_read_batches_filters_and_slices(tmp_path: Path) -> None:
     batches = list(_iter_demux_read_batches(demux_dir))
     assert len(batches) == 1
     batch = batches[0]
-    assert batch["read_id"] == ["r0"]
-    assert batch["sample_id"] == [1]
-    assert batch["sequence"] == [seq[10:50]]
-    assert batch["quality"] == [qual[10:50]]
+    # The batch carries the full sequence + the transcript_{start,end}
+    # offsets — slicing happens inside _format_fastq_bytes.
+    assert batch.column("read_id").to_pylist() == ["r0"]
+    assert batch.column("sample_id").to_pylist() == [1]
+    assert batch.column("sequence").to_pylist() == [seq]
+    assert batch.column("quality").to_pylist() == [qual]
+    assert batch.column("transcript_start").to_pylist() == [10]
+    assert batch.column("transcript_end").to_pylist() == [50]
 
     fastq_bytes, n_reads = _format_fastq_bytes(batch)
     assert n_reads == 1
