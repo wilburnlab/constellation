@@ -213,6 +213,9 @@ class InstalledReference:
     annotation_release: str | None = None
     fetched_at: str | None = None
     size_bytes: int | None = None
+    strain: str | None = None
+    scientific_name: str | None = None
+    taxid: int | None = None
 
     def is_default(self, defaults: dict[str, str]) -> bool:
         target = defaults.get(self.organism)
@@ -235,6 +238,7 @@ def write_meta_toml(
     fetched_at: str | None = None,
     taxid: int | None = None,
     scientific_name: str | None = None,
+    strain: str | None = None,
 ) -> None:
     """Write a ``meta.toml`` at the cache-release-dir layer.
 
@@ -265,6 +269,8 @@ def write_meta_toml(
         lines.append(f"taxid = {int(taxid)}")
     if scientific_name is not None:
         lines.append(f'scientific_name = "{_toml_escape(scientific_name)}"')
+    if strain is not None:
+        lines.append(f'strain = "{_toml_escape(strain)}"')
     lines.append(f'constellation_version = "{constellation_version}"')
     lines.append(f'fetched_at = "{fetched_at}"')
 
@@ -644,6 +650,11 @@ def list_installed(*, root: Path | None = None) -> list[InstalledReference]:
                     source, release = release_slug.split("-", 1)
                 else:
                     source, release = release_slug, ""
+            taxid_raw = meta.get("taxid") if meta else None
+            try:
+                taxid_int = int(taxid_raw) if taxid_raw is not None else None
+            except (TypeError, ValueError):
+                taxid_int = None
             entry = InstalledReference(
                 handle=f"{organism}@{release_slug}",
                 organism=organism,
@@ -656,6 +667,9 @@ def list_installed(*, root: Path | None = None) -> list[InstalledReference]:
                 annotation_release=_str_or_none(meta, "annotation_release"),
                 fetched_at=_str_or_none(meta, "fetched_at"),
                 size_bytes=_dir_size(release_dir),
+                strain=_str_or_none(meta, "strain"),
+                scientific_name=_str_or_none(meta, "scientific_name"),
+                taxid=taxid_int,
             )
             out.append(entry)
     return out

@@ -2027,8 +2027,10 @@ def _build_catalog_parser(subs) -> None:
         default=None,
         help=(
             "Ensembl / Ensembl Genomes release number, or a UniProt release "
-            "tag (e.g. '2024_02'). Required for Ensembl; defaults to today "
-            "for RefSeq."
+            "tag (e.g. '2024_02'). Defaults to the latest published release "
+            "for Ensembl / Ensembl Genomes (probed from the source's FTP "
+            "directory listing); defaults to today's date for RefSeq / "
+            "UniProt. Pass an older release to download a historical build."
         ),
     )
     p_update.add_argument(
@@ -2676,24 +2678,41 @@ def _cmd_catalog_update(args: argparse.Namespace) -> int:
     def _fetch_one(source_name: str) -> int:
         if source_name == "ensembl":
             if args.release is None:
-                print(
-                    "error: --release required for ensembl (e.g. --release 111)",
-                    file=sys.stderr,
-                )
-                return 2
-            table, meta = ensembl.fetch_catalog(int(args.release), timeout=args.timeout)
-            rel = str(args.release)
+                try:
+                    release_int = ensembl.latest_release(timeout=args.timeout)
+                except (RuntimeError, OSError) as exc:
+                    print(
+                        f"error: could not determine latest Ensembl release ({exc}); "
+                        "pass --release N explicitly",
+                        file=sys.stderr,
+                    )
+                    return 2
+                print(f"  ensembl: latest release detected as {release_int}", file=sys.stderr)
+            else:
+                release_int = int(args.release)
+            table, meta = ensembl.fetch_catalog(release_int, timeout=args.timeout)
+            rel = str(release_int)
         elif source_name == "ensembl_genomes":
             if args.release is None:
+                try:
+                    release_int = ensembl_genomes.latest_release(timeout=args.timeout)
+                except (RuntimeError, OSError) as exc:
+                    print(
+                        f"error: could not determine latest Ensembl Genomes release ({exc}); "
+                        "pass --release N explicitly",
+                        file=sys.stderr,
+                    )
+                    return 2
                 print(
-                    "error: --release required for ensembl_genomes (e.g. --release 57)",
+                    f"  ensembl_genomes: latest release detected as {release_int}",
                     file=sys.stderr,
                 )
-                return 2
+            else:
+                release_int = int(args.release)
             table, meta = ensembl_genomes.fetch_catalog(
-                int(args.release), timeout=args.timeout
+                release_int, timeout=args.timeout
             )
-            rel = str(args.release)
+            rel = str(release_int)
         elif source_name == "refseq":
             rel = args.release or datetime.now(timezone.utc).strftime("%Y%m%d")
             table, meta = refseq.fetch_catalog(release_tag=rel, timeout=args.timeout)
@@ -3061,10 +3080,30 @@ def _cmd_reference_summary(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from constellation.sequencing.annotation.io import load_annotation
+    from constellation.sequencing.reference.handle import read_meta_toml
     from constellation.sequencing.reference.io import load_genome_reference
 
     root, _ = _resolve_reference_argument(args.ref_dir)
     root = Path(root)
+    # Surface the meta.toml header (organism / strain / accession / fetched_at)
+    # so users can confirm what's on disk without poking at the file directly.
+    meta = read_meta_toml(root)
+    if meta:
+        for key in (
+            "handle",
+            "organism",
+            "scientific_name",
+            "strain",
+            "assembly_accession",
+            "assembly_name",
+            "annotation_release",
+            "taxid",
+            "fetched_at",
+        ):
+            value = meta.get(key)
+            if value is None or value == "":
+                continue
+            print(f"{key}: {value}")
     genome_dir = root / "genome" if (root / "genome").is_dir() else root
     genome = load_genome_reference(genome_dir)
     print(

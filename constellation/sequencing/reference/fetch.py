@@ -86,7 +86,11 @@ class FetchResult:
 _ENSEMBL_FTP_BASE = "https://ftp.ensembl.org/pub/current_fasta"
 _ENSEMBL_GFF3_BASE = "https://ftp.ensembl.org/pub/current_gff3"
 _ENSEMBL_PUB_BASE = "https://ftp.ensembl.org/pub"
-_ENSEMBL_GENOMES_FTP_BASE = "https://ftp.ensemblgenomes.org/pub"
+# Plain HTTP: ftp.ensemblgenomes.org serves a TLS certificate that does
+# not match its hostname (verified 2026-05). The data is public, so plain
+# HTTP is lower-risk than disabling cert verification. See the matching
+# comment in constellation/catalog/ensembl_genomes.py.
+_ENSEMBL_GENOMES_FTP_BASE = "http://ftp.ensemblgenomes.org/pub"
 
 # Optional override base for unit testing (set by tests, never by users).
 _TEST_HTTP_BASE_OVERRIDE: str | None = None
@@ -182,16 +186,21 @@ def _ensembl_genomes_release_for(division: str, *, release: int | None) -> tuple
             f"{_ENSEMBL_GENOMES_FTP_BASE}/{division}/{rel}/fasta",
             f"{_ENSEMBL_GENOMES_FTP_BASE}/{division}/{rel}/gff3",
         )
-    # Probe the division's current README — same shape as vertebrate Ensembl
+    # Probe Ensembl's REST API for the current EG release (rest.ensembl.org
+    # has valid TLS and a stable JSON contract). FTP-side discovery is
+    # broken: per-division ``current_README`` returns 404; the host's own
+    # TLS cert doesn't match its name. All divisions share the same release
+    # number so one call suffices for any division.
+    import json
     try:
         body = _http_get_text(
-            f"{_ENSEMBL_GENOMES_FTP_BASE}/{division}/current_README"
+            "https://rest.ensembl.org/info/eg_version?content-type=application/json"
         )
-    except (urllib.error.URLError, OSError):
-        body = ""
-    m = re.search(r"Release\s+(\d+)", body)
-    if m:
-        rel_id = m.group(1)
+        version = json.loads(body).get("version")
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        version = None
+    if version is not None:
+        rel_id = str(int(version))
         return (
             rel_id,
             f"{_ENSEMBL_GENOMES_FTP_BASE}/{division}/release-{rel_id}/fasta",
@@ -263,30 +272,64 @@ def _refseq_urls(
     fa_url = f"{asm_url_base}{asm_dir}_genomic.fna.gz"
     gff_url = f"{asm_url_base}{asm_dir}_genomic.gff.gz"
     asm_name = asm_dir.split("_", 2)[-1] if asm_dir.count("_") >= 2 else None
-    ann_release = _probe_refseq_annotation_release(asm_url_base, asm_dir)
+    metadata = _probe_refseq_assembly_metadata(asm_url_base, asm_dir)
+    ann_release = metadata.get("annotation_release")
     release_slug = accession if ann_release is None else f"{accession}-ar{ann_release}"
-    return fa_url, gff_url, release_slug, asm_name, ann_release
+    return fa_url, gff_url, release_slug, asm_name, ann_release, metadata
 
 
-def _probe_refseq_annotation_release(
+# Keys returned by ``_probe_refseq_assembly_metadata``. All values are
+# ``str | None``; missing fields are ``None``.
+_ASM_REPORT_FIELDS: tuple[str, ...] = (
+    "organism_name",       # "# Organism name:"   e.g. "Komagataella phaffii GS115 (budding yeasts)"
+    "infraspecific_name",  # "# Infraspecific name:" e.g. "strain=GS115" → captured raw
+    "strain",              # parsed out of infraspecific_name (drop "strain=" prefix when present)
+    "taxid",               # "# Taxid:"           e.g. "644223"
+    "annotation_release",  # "# Annotation release:" e.g. "103"
+)
+
+
+def _probe_refseq_assembly_metadata(
     asm_url_base: str, asm_dir: str
-) -> str | None:
-    """Best-effort: read ``<asm>_assembly_report.txt`` and extract
-    ``# Annotation release: <N>``. RefSeq assemblies expose this; pure
-    GenBank assemblies usually don't. Failure → ``None`` (caller falls
-    back to accession-only release slug)."""
+) -> dict[str, str | None]:
+    """Best-effort parse of ``<asm>_assembly_report.txt``.
+
+    Extracts organism name, infraspecific name (strain), taxid, and
+    annotation release in a single HTTP fetch. Missing fields → ``None``;
+    network failure → all fields ``None``. RefSeq assemblies expose the
+    full set; pure GenBank assemblies usually carry organism + taxid but
+    not annotation release.
+    """
+    out: dict[str, str | None] = {k: None for k in _ASM_REPORT_FIELDS}
     url = f"{asm_url_base}{asm_dir}_assembly_report.txt"
     try:
         body = _http_get_text(url)
     except (urllib.error.URLError, OSError):
-        return None
+        return out
     for line in body.splitlines():
-        if line.lower().startswith("# annotation release"):
-            _, _, value = line.partition(":")
-            value = value.strip()
-            if value:
-                return value
-    return None
+        if not line.startswith("#"):
+            continue
+        key_part, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key = key_part.lstrip("#").strip().lower()
+        value = value.strip()
+        if not value:
+            continue
+        if key == "organism name":
+            out["organism_name"] = value
+        elif key == "infraspecific name":
+            out["infraspecific_name"] = value
+            # "strain=GS115" → "GS115"; bare "GS115" passes through.
+            if value.lower().startswith("strain="):
+                out["strain"] = value.split("=", 1)[1].strip() or None
+            elif "=" not in value:
+                out["strain"] = value
+        elif key == "taxid":
+            out["taxid"] = value
+        elif key == "annotation release":
+            out["annotation_release"] = value
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -497,6 +540,11 @@ class _ResolvedSpec:
     resolved through the taxonomy + catalog path (species-name dispatch).
     They land in ``meta.toml`` so downstream consumers can join cached
     references against the taxonomy tree.
+
+    ``strain`` carries the infraspecific identifier parsed out of NCBI's
+    ``assembly_report.txt`` (``# Infraspecific name: strain=GS115`` →
+    ``"GS115"``). The organism slug is genus+species only by design, so
+    strain is preserved as a meta.toml field for ``reference summary``.
     """
 
     handle: Handle
@@ -509,6 +557,7 @@ class _ResolvedSpec:
     assembly_accession: str | None
     taxid: int | None = None
     scientific_name: str | None = None
+    strain: str | None = None
 
 
 def _resolve_spec(
@@ -583,17 +632,28 @@ def _resolve_spec(
                 f"--release is not applicable to {source!r}; the accession "
                 f"already pins the assembly version (e.g. GCF_000001635.27)"
             )
-        fa_url, gff_url, release_slug, asm_name, ann_release = _refseq_urls(ident)
+        fa_url, gff_url, release_slug, asm_name, ann_release, metadata = _refseq_urls(ident)
         # md5 file lives next to the GFF/FASTA in the assembly dir.
         md5_url = fa_url.rsplit("/", 1)[0] + "/md5checksums.txt"
-        # Organism slug: not knowable from the accession alone in v1 —
-        # fall back to the lowercased assembly_name (or accession if
-        # absent) until the taxonomy layer lands in PR-B.
-        organism = (asm_name or ident).lower().replace(".", "_").replace("-", "_")
-        # Strip GCF_/GCA_ prefix if it survived (e.g. asm_name was None).
-        organism = organism.lstrip("gcf_").lstrip("gca_") or ident.lower()
-        # Use a friendlier guess for the well-known accessions; otherwise
-        # the user can always re-import with --handle to rename.
+        # Organism slug precedence:
+        #   1. Curated override (_REFSEQ_ORGANISM_SLUGS) for canonical lab targets.
+        #   2. Parsed "# Organism name:" from assembly_report.txt — the principled path.
+        #   3. Sanitised assembly_name with proper prefix-strip (defense-in-depth
+        #      fallback for assemblies whose report can't be fetched).
+        #   4. Accession itself — last resort.
+        slug_from_report = _slugify_organism_name(metadata.get("organism_name"))
+        sanitised_asm = (asm_name or "").lower().replace(".", "_").replace("-", "_")
+        # NOTE: ``removeprefix`` (not ``lstrip``!) — ``lstrip(chars)`` strips any
+        # character in the argument's set from the left, which silently chewed
+        # the leading 'a' off "asm2700v1" via ``.lstrip("gca_")`` before this fix.
+        sanitised_asm = sanitised_asm.removeprefix("gcf_").removeprefix("gca_")
+        organism = (
+            slug_from_report
+            or sanitised_asm
+            or ident.lower()
+        )
+        # Curated override wins last so a hand-picked slug overrides any of
+        # the auto-derived choices above (matches prior behaviour).
         organism = _organism_for_accession(ident, fallback=organism)
         return _ResolvedSpec(
             handle=Handle(organism=organism, source=source, release=release_slug),
@@ -604,6 +664,7 @@ def _resolve_spec(
             assembly_name=asm_name,
             annotation_release=ann_release,
             assembly_accession=ident,
+            strain=metadata.get("strain"),
         )
 
     raise KeyError(
@@ -730,6 +791,34 @@ def _organism_for_accession(accession: str, *, fallback: str) -> str:
     """Map a GCF_/GCA_ accession to a stable organism slug."""
     base = accession.split(".")[0]  # drop version suffix
     return _REFSEQ_ORGANISM_SLUGS.get(base, fallback)
+
+
+def _slugify_organism_name(organism_name: str | None) -> str | None:
+    """Slugify an NCBI ``# Organism name`` line.
+
+    ``"Komagataella phaffii GS115 (budding yeasts)"`` → ``"komagataella_phaffii"``.
+    Strategy: drop parenthesised commentary, take the first two whitespace-
+    separated tokens (genus + species), lowercase, join with ``_``. Strain /
+    substrain tokens beyond position 2 are dropped — they're preserved
+    separately via ``# Infraspecific name`` and surface in ``meta.toml``.
+    Single-token names pass through. Empty / ``None`` input → ``None``.
+    """
+    if not organism_name:
+        return None
+    # Strip "(commentary)" segments such as "(budding yeasts)".
+    cleaned = re.sub(r"\([^)]*\)", " ", organism_name)
+    tokens = cleaned.split()
+    if not tokens:
+        return None
+    head = tokens[: min(2, len(tokens))]
+    slug = "_".join(t.lower() for t in head)
+    # Restrict to the [a-z0-9_] alphabet used by ``_ORGANISM_RE`` in
+    # handle.py — anything else would fail the validator downstream.
+    slug = re.sub(r"[^a-z0-9_]", "_", slug)
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    if not slug or not slug[0].isalpha():
+        return None
+    return slug
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -992,6 +1081,7 @@ def _write_into_cache(
         source_checksum_verified=source_checksum_verified,
         taxid=resolved.taxid,
         scientific_name=resolved.scientific_name,
+        strain=resolved.strain,
     )
 
     promote_partial(release_dir)

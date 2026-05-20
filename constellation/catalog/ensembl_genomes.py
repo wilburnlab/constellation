@@ -1,14 +1,24 @@
 """Ensembl Genomes catalog (fungi / plants / metazoa / protists).
 
-Source: ``https://ftp.ensemblgenomes.org/pub/<division>/release-<N>/
+Source: ``http://ftp.ensemblgenomes.org/pub/<division>/release-<N>/
 species_Ensembl<Division>.txt`` per division.
 
 Shares the parse path with the vertebrate catalog (same column layout)
 but maps to different FTP roots and a per-division ``division`` field.
+
+Plain HTTP (not HTTPS): the host serves a TLS certificate that does not
+match ``ftp.ensemblgenomes.org`` (verified 2026-05; CN belongs to EBI's
+mirror infrastructure). The data is public read-only, no auth or secrets
+in flight, so plain HTTP is the lower-risk choice over disabling TLS
+verification — matches the convention used by samtools / wget / the NCBI
+datasets CLI for these public FTP archives. Switch to a stable HTTPS
+mirror (e.g. ``https://ftp.ebi.ac.uk/ensemblgenomes/pub/``) when one is
+identified.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pyarrow as pa
@@ -18,7 +28,10 @@ from constellation.catalog.schemas import ASSEMBLY_CATALOG_TABLE
 from constellation.catalog.types import CatalogRow
 
 
-_EG_BASE = "https://ftp.ensemblgenomes.org/pub"
+_EG_BASE = "http://ftp.ensemblgenomes.org/pub"
+_EG_REST_VERSION = (
+    "https://rest.ensembl.org/info/eg_version?content-type=application/json"
+)
 DIVISIONS = ("fungi", "plants", "metazoa", "protists")
 _DIVISION_TAG = {
     "fungi": "Fungi",
@@ -31,6 +44,39 @@ _DIVISION_TAG = {
 def species_txt_url(division: str, release: int) -> str:
     tag = _DIVISION_TAG[division]
     return f"{_EG_BASE}/{division}/release-{release}/species_Ensembl{tag}.txt"
+
+
+def latest_release(*, timeout: int = 60) -> int:
+    """Probe Ensembl's REST API for the current Ensembl Genomes release.
+
+    Uses ``rest.ensembl.org/info/eg_version`` — Ensembl's canonical,
+    programmatically-stable endpoint for the currently published Ensembl
+    Genomes release. Preferred over scraping the FTP directory because:
+
+    - The FTP host (``ftp.ensemblgenomes.org``) serves a TLS cert that
+      doesn't match its hostname, so HTTPS probes fail verification.
+    - Per-division ``current_README`` files (``pub/<division>/current_README``)
+      return 404 — that layout no longer exists on the EG mirror.
+    - Scraping the listing for ``release-N`` directories picks up staged
+      next-release directories whose species manifests 403.
+
+    All four divisions (fungi/plants/metazoa/protists) ship from the same
+    release number, so a single REST call suffices.
+    """
+    body = http_get_text(_EG_REST_VERSION, timeout=timeout)
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"could not parse Ensembl Genomes release from {_EG_REST_VERSION}: "
+            f"non-JSON response ({exc})"
+        ) from exc
+    version = data.get("version")
+    if version is None:
+        raise RuntimeError(
+            f"Ensembl REST {_EG_REST_VERSION} returned no 'version' field"
+        )
+    return int(version)
 
 
 def fetch_species_txt(division: str, release: int, *, timeout: int = 120) -> str:
@@ -180,6 +226,7 @@ __all__ = [
     "DIVISIONS",
     "fetch_catalog",
     "fetch_species_txt",
+    "latest_release",
     "parse_species_txt",
     "species_txt_url",
 ]

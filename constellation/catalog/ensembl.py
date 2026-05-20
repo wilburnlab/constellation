@@ -19,6 +19,7 @@ construct the canonical name without per-row HTTP probes.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pyarrow as pa
@@ -29,10 +30,32 @@ from constellation.catalog.types import CatalogRow
 
 
 _ENSEMBL_PUB = "https://ftp.ensembl.org/pub"
+_README_RELEASE_RE = re.compile(r"Ensembl Release\s+(\d+)")
 
 
 def species_txt_url(release: int) -> str:
     return f"{_ENSEMBL_PUB}/release-{release}/species_EnsemblVertebrates.txt"
+
+
+def latest_release(*, timeout: int = 60) -> int:
+    """Probe ``ftp.ensembl.org/pub/current_README`` for the published release.
+
+    ``current_README`` is Ensembl's canonical "this is the live release"
+    pointer. It is preferable to scanning the directory listing because
+    Ensembl stages an in-flight ``release-N+1/`` directory before the data
+    is publicly accessible — picking the max from the listing therefore
+    returns a release whose species manifest 403s. Mirrors the existing
+    ``_probe_ensembl_release_number`` logic in
+    ``constellation.sequencing.reference.fetch``.
+    """
+    body = http_get_text(f"{_ENSEMBL_PUB}/current_README", timeout=timeout)
+    m = _README_RELEASE_RE.search(body)
+    if m is None:
+        raise RuntimeError(
+            f"could not determine latest Ensembl release from "
+            f"{_ENSEMBL_PUB}/current_README (no 'Ensembl Release N' line)"
+        )
+    return int(m.group(1))
 
 
 def fetch_species_txt(release: int, *, timeout: int = 120) -> str:
@@ -167,6 +190,7 @@ def _humanize(species_path: str) -> str:
 __all__ = [
     "fetch_catalog",
     "fetch_species_txt",
+    "latest_release",
     "parse_species_txt",
     "species_txt_url",
 ]
