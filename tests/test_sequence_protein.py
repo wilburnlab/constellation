@@ -275,6 +275,28 @@ def test_cleave_excise_applies_to_missed_cleavage_nterm():
     assert "MAAAKGGGR" in peps and "AAAKGGGR" in peps  # 1-missed N-term clipped too
 
 
+def test_cleave_validate_alphabet_rejects_by_default():
+    """Default behaviour: non-canonical residue raises."""
+    import pytest
+
+    with pytest.raises(ValueError, match="not in alphabet"):
+        cleave("AAAKUGGGR", "Trypsin", missed_cleavages=0, min_length=2)
+
+
+def test_cleave_validate_alphabet_false_tolerates_noncanonical():
+    """With validate_alphabet=False, a selenocysteine (U) doesn't abort
+    the digest — canonical peptides come out intact; only the peptide
+    spanning U carries it."""
+    # Cuts after the two Ks and the R: AAAK | UGGK | GGGR
+    peps = cleave(
+        "AAAKUGGKGGGR", "Trypsin", missed_cleavages=0, min_length=2,
+        max_length=None, validate_alphabet=False,
+    )
+    assert "AAAK" in peps      # canonical peptide before U — intact
+    assert "GGGR" in peps      # canonical peptide after U — intact
+    assert "UGGK" in peps      # the peptide spanning U keeps it
+
+
 def test_cleave_excise_spans_have_correct_coords():
     """The clipped span starts at protein position 1."""
     spans = cleave(

@@ -278,11 +278,19 @@ def _digest_proteins_into_index(
 
     Proteins whose sequence contains characters outside the canonical
     20-AA alphabet (Sec ``U``, Pyl ``O``, ambiguity codes ``B``/``Z``/``X``/``J``)
-    are **skipped** rather than aborting the digest. Real-world UniProt /
-    RefSeq FASTAs contain a small number of these residues — the
-    cartographer original used regex digestion which silently tolerated
-    them; we preserve that behaviour by skipping at the protein granularity
-    so a single bad accession doesn't kill the whole batch.
+    are digested **tolerantly** (``validate_alphabet=False``): the cut
+    sites depend only on K/R, so every peptide that doesn't contain the
+    odd residue comes out exactly as for a clean sequence, and only the
+    peptide spanning the odd residue carries it. This matches
+    cartographer's regex-digest tolerance.
+
+    The earlier implementation skipped the *whole* protein on the first
+    non-canonical residue, which silently dropped all of a selenoprotein's
+    (otherwise canonical) tryptic peptides from the digest. For the
+    reference digest that caused real reference peptides to look novel —
+    e.g. a peptide upstream of a C-terminal selenocysteine was never
+    subtracted and got mis-classified as ``unknown`` despite being
+    byte-identical to the reference.
     """
     out: dict[str, set[str]] = {}
     protein_ids = proteins.column("protein_id").to_pylist()
@@ -290,19 +298,15 @@ def _digest_proteins_into_index(
     for protein_id, seq in zip(protein_ids, sequences, strict=True):
         if not isinstance(seq, str) or not seq:
             continue
-        try:
-            peptides = cleave(
-                seq,
-                enzyme,
-                missed_cleavages=max_missed_cleavages,
-                min_length=min_peptide_length,
-                max_length=max_peptide_length,
-                excise_initiator_met=excise_initiator_met,
-            )
-        except ValueError:
-            # Sequence contains non-canonical residues (U / O / B / Z / X / J).
-            # Skip this protein — matches cartographer's tolerance.
-            continue
+        peptides = cleave(
+            seq,
+            enzyme,
+            missed_cleavages=max_missed_cleavages,
+            min_length=min_peptide_length,
+            max_length=max_peptide_length,
+            excise_initiator_met=excise_initiator_met,
+            validate_alphabet=False,
+        )
         for pep in peptides:
             out.setdefault(pep, set()).add(str(protein_id))
     return out

@@ -625,6 +625,47 @@ def test_output_keyed_at_modform_level() -> None:
     }
 
 
+def test_reference_selenoprotein_not_falsely_novel() -> None:
+    """A reference protein carrying a non-canonical residue (selenocysteine
+    U) must still contribute ALL its canonical tryptic peptides to the
+    reference digest. Otherwise a peptide upstream of the U is never
+    subtracted and looks 'novel' despite being byte-identical to the
+    reference. Regression for the OSC unknown-that-isn't-novel case."""
+    # Reference protein: a clean peptide (LIGHTPEPTK) then a C-terminal
+    # selenocysteine. Novel protein: the same but N-terminally truncated
+    # (missing the reference's leading MGGGR), and WITHOUT the U so it
+    # digests cleanly on its own.
+    shared = "LIGHTPEPTK"
+    reference = pa.table(
+        {
+            "protein_id": pa.array(["REF1"]),
+            "sequence": pa.array(["MGGGR" + shared + "AAAKU"]),  # U at the end
+        }
+    )
+    novel = pa.table(
+        {
+            "protein_id": pa.array(["NOVEL1"]),
+            "sequence": pa.array([shared + "AAAK"]),  # truncated, canonical
+        }
+    )
+    alignments = pa.table(
+        {
+            "query": ["NOVEL1"],
+            "target": ["REF1"],
+            "evalue": [1e-50],
+            "qstart": [1], "qend": [14],
+            "tstart": [6], "tend": [19],
+            "cigar": ["14M"],
+            "alignment_tier": pa.array([None], type=pa.string()),
+        }
+    )
+    detected = pa.table({"peptide_sequence": pa.array([shared])})
+    result = classify_novel_peptides(detected, alignments, reference, novel)
+    # LIGHTPEPTK is a clean tryptic peptide of the reference (MGGGR | ...);
+    # it must be subtracted as reference, NOT classified as novel.
+    assert result.num_rows == 0
+
+
 def test_output_single_row_when_no_modforms() -> None:
     """No modified_sequence column → one row per bare sequence (the
     pre-change behaviour), with a null modified_sequence."""
