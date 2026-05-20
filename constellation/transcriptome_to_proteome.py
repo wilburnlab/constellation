@@ -927,54 +927,83 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     stage_dir = output_dir / "07_gpf_search"
     gpf_elib_primary = stage_dir / "combined.elib"
     if not _stage_done(stage_dir, args.resume):
-        _log("Stage 7: GPF library search + collision filter")
         raw_dir = stage_dir / "_raw"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        result = run_library_search(
-            input_file=combined_dia,
-            library=combined_dlib,
-            fasta=combined_path,
-            output_dir=raw_dir,
-            jvm_heap_max=args.jvm_heap_max,
-            jvm_heap_min=args.jvm_heap_min,
-            jvm_tmpdir=args.jvm_tmpdir,
-            fragment_tolerance_ppm=args.fragment_tolerance_ppm,
-            precursor_tolerance_ppm=args.precursor_tolerance_ppm,
-            percolator_version=args.percolator_version,
-            percolator_threshold=args.percolator_threshold,
-            extra_args=_passthrough_args(args.encyclopedia_arg),
-            stream_to_stderr=progress,
-        )
-        actual_raw_elib = find_search_elib(combined_dia, cwd=raw_dir)
-        if actual_raw_elib is None:
-            raise FileNotFoundError(
-                f"GPF search returned 0 but no .elib found under {raw_dir}"
-            )
-        # Collision filter (default-on).
-        if not args.no_collision_filter:
-            losers, collision_meta = apply_collision_filter(
-                elib_path=actual_raw_elib,
-                dia_path=combined_dia,
-                rt_threshold_s=args.collision_rt_threshold_s,
-                frag_ppm_tol=args.collision_frag_ppm_tol,
-                min_shared_ions=args.collision_min_shared_ions,
-                return_metadata=True,
-            )
-            filter_elib_by_losers(actual_raw_elib, losers, gpf_elib_primary)
-            (stage_dir / "collision_metadata.json").write_text(
-                json.dumps(
-                    {**collision_meta, "n_losers": len(losers)},
-                    indent=2,
-                ) + "\n"
-            )
+        # Fine-grained resume: a prior run already produced the filtered
+        # combined.elib, so the (very slow) EncyclopeDIA search + the
+        # collision filter are done — only the optional auto-ingest or the
+        # manifest/_SUCCESS were left. Pick up from the existing elib
+        # instead of re-running the multi-hour search.
+        if args.resume and gpf_elib_primary.is_file():
+            _log("Stage 7: combined.elib present — skipping search + "
+                 "collision filter, resuming from existing elib")
+            actual_raw_elib = find_search_elib(combined_dia, cwd=raw_dir)
+            collision_ran = not args.no_collision_filter
+            meta_path = stage_dir / "collision_metadata.json"
+            n_losers = 0
+            if meta_path.is_file():
+                try:
+                    n_losers = int(
+                        json.loads(meta_path.read_text()).get("n_losers", 0)
+                    )
+                except (OSError, ValueError, json.JSONDecodeError):
+                    n_losers = 0
+            search_runtime: dict = {"resumed_from_elib": True}
         else:
-            shutil.copyfile(actual_raw_elib, gpf_elib_primary)
-            losers = set()
-            collision_meta = None
+            _log("Stage 7: GPF library search + collision filter")
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            result = run_library_search(
+                input_file=combined_dia,
+                library=combined_dlib,
+                fasta=combined_path,
+                output_dir=raw_dir,
+                jvm_heap_max=args.jvm_heap_max,
+                jvm_heap_min=args.jvm_heap_min,
+                jvm_tmpdir=args.jvm_tmpdir,
+                fragment_tolerance_ppm=args.fragment_tolerance_ppm,
+                precursor_tolerance_ppm=args.precursor_tolerance_ppm,
+                percolator_version=args.percolator_version,
+                percolator_threshold=args.percolator_threshold,
+                extra_args=_passthrough_args(args.encyclopedia_arg),
+                stream_to_stderr=progress,
+            )
+            actual_raw_elib = find_search_elib(combined_dia, cwd=raw_dir)
+            if actual_raw_elib is None:
+                raise FileNotFoundError(
+                    f"GPF search returned 0 but no .elib found under {raw_dir}"
+                )
+            # Collision filter (default-on).
+            if not args.no_collision_filter:
+                losers, collision_meta = apply_collision_filter(
+                    elib_path=actual_raw_elib,
+                    dia_path=combined_dia,
+                    rt_threshold_s=args.collision_rt_threshold_s,
+                    frag_ppm_tol=args.collision_frag_ppm_tol,
+                    min_shared_ions=args.collision_min_shared_ions,
+                    return_metadata=True,
+                )
+                filter_elib_by_losers(actual_raw_elib, losers, gpf_elib_primary)
+                (stage_dir / "collision_metadata.json").write_text(
+                    json.dumps(
+                        {**collision_meta, "n_losers": len(losers)},
+                        indent=2,
+                    ) + "\n"
+                )
+                collision_ran = True
+            else:
+                shutil.copyfile(actual_raw_elib, gpf_elib_primary)
+                losers = set()
+                collision_ran = False
+            n_losers = len(losers)
+            search_runtime = {
+                "elapsed_seconds": result.elapsed_seconds,
+                "returncode": result.returncode,
+            }
+
+        # Auto-ingest (no-op under --no-ingest).
         _maybe_auto_ingest_elib(
             gpf_elib_primary, stage_dir, args.no_ingest,
         )
-        if collision_meta is not None:
+        if collision_ran and actual_raw_elib is not None:
             _maybe_auto_ingest_elib(
                 actual_raw_elib, raw_dir, args.no_ingest,
             )
@@ -986,11 +1015,8 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
                 "fragment_tolerance_ppm": args.fragment_tolerance_ppm,
                 "precursor_tolerance_ppm": args.precursor_tolerance_ppm,
             },
-            counts={"n_losers": len(losers)},
-            runtime={
-                "elapsed_seconds": result.elapsed_seconds,
-                "returncode": result.returncode,
-            },
+            counts={"n_losers": n_losers},
+            runtime=search_runtime,
         )
         _touch_success(stage_dir)
     stage_manifests["07_gpf_search"] = _read_stage_manifest(stage_dir)

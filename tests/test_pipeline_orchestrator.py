@@ -579,6 +579,40 @@ def test_orchestrator_resume_short_circuit(
     assert stub_external_calls["calls"] == []
 
 
+def test_orchestrator_stage7_resumes_from_existing_elib(
+    stub_inputs, stub_external_calls
+) -> None:
+    """If a prior run produced 07_gpf_search/combined.elib but died before
+    _SUCCESS (e.g. mid auto-ingest), --resume must pick up from the
+    existing elib rather than re-running the multi-hour EncyclopeDIA
+    search."""
+    from constellation.transcriptome_to_proteome import (
+        run_transcriptome_to_proteomics,
+    )
+
+    args = _build_args(stub_inputs)
+    assert run_transcriptome_to_proteomics(args=args) == 0
+
+    stage7 = stub_inputs["output_dir"] / "07_gpf_search"
+    assert (stage7 / "combined.elib").is_file()
+    # Simulate a crash after the filtered elib was written but before the
+    # stage was marked complete — clear Stage 7's _SUCCESS and the
+    # top-level _SUCCESS (which would otherwise short-circuit the run).
+    (stage7 / "_SUCCESS").unlink()
+    (stub_inputs["output_dir"] / "_SUCCESS").unlink()
+
+    stub_external_calls["calls"].clear()
+    args2 = _build_args(stub_inputs, resume=True)
+    assert run_transcriptome_to_proteomics(args=args2) == 0
+
+    # No search re-run (neither the GPF search nor any injection search).
+    assert not any(
+        c[0] == "library_search" for c in stub_external_calls["calls"]
+    ), stub_external_calls["calls"]
+    # Stage 7 is now properly completed.
+    assert (stage7 / "_SUCCESS").is_file()
+
+
 def test_orchestrator_collision_filter_default_runs(
     stub_inputs, stub_external_calls
 ) -> None:
