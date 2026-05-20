@@ -203,6 +203,89 @@ def test_cleave_lysc():
     assert peps == ["AK", "GR"]
 
 
+# ── initiator-Met excision ──────────────────────────────────────────────
+
+
+def test_cleave_excise_initiator_met_emits_both_forms():
+    """N-terminal peptide gets both Met-intact and Met-clipped forms."""
+    seq = "MAAAKGGGGR"  # N-term tryptic peptide is MAAAK
+    peps = cleave(
+        seq, "Trypsin", missed_cleavages=0, min_length=3, max_length=None,
+        excise_initiator_met=True,
+    )
+    assert "MAAAK" in peps      # Met-intact
+    assert "AAAK" in peps       # Met-clipped
+    assert "GGGGR" in peps      # internal peptide untouched
+
+
+def test_cleave_excise_off_by_default():
+    """Without the flag, no Met clipping (backward compatible)."""
+    seq = "MAAAKGGGGR"
+    peps = cleave(seq, "Trypsin", missed_cleavages=0, min_length=3, max_length=None)
+    assert "MAAAK" in peps
+    assert "AAAK" not in peps
+
+
+def test_cleave_excise_only_n_terminal_M():
+    """Internal peptides starting with M (after K/R) are NOT clipped —
+    only the protein N-terminus (position 0)."""
+    seq = "AAAKMGGGR"  # internal peptide MGGGR starts with M but at position 4
+    peps = cleave(
+        seq, "Trypsin", missed_cleavages=0, min_length=3, max_length=None,
+        excise_initiator_met=True,
+    )
+    assert "MGGGR" in peps      # internal M-peptide kept intact
+    assert "GGGR" not in peps   # NOT clipped (not the N-terminus)
+
+
+def test_cleave_excise_unconditional_on_second_residue():
+    """Clipping is unconditional — applies even when residue 2 is not
+    MAP-eligible (matches EncyclopeDIA, which ignores the biological
+    Met-aminopeptidase rule)."""
+    seq = "MEEEKGGGGR"  # 2nd residue E is NOT MAP-eligible
+    peps = cleave(
+        seq, "Trypsin", missed_cleavages=0, min_length=3, max_length=None,
+        excise_initiator_met=True,
+    )
+    assert "MEEEK" in peps
+    assert "EEEK" in peps       # clipped despite non-eligible 2nd residue
+
+
+def test_cleave_excise_length_filter_independent():
+    """The clipped form is length-filtered independently — a clipped
+    form below min_length is dropped while its intact partner survives."""
+    seq = "MAAAKGGGGGGR"  # MAAAK is len 5; clipped AAAK is len 4
+    peps = cleave(
+        seq, "Trypsin", missed_cleavages=0, min_length=5, max_length=None,
+        excise_initiator_met=True,
+    )
+    assert "MAAAK" in peps      # len 5 ≥ min
+    assert "AAAK" not in peps   # len 4 < min → dropped
+
+
+def test_cleave_excise_applies_to_missed_cleavage_nterm():
+    """Both the 0-missed and missed-cleavage N-terminal spans get
+    clipped variants."""
+    seq = "MAAAKGGGRWWWWR"
+    peps = cleave(
+        seq, "Trypsin", missed_cleavages=1, min_length=3, max_length=None,
+        excise_initiator_met=True,
+    )
+    assert "MAAAK" in peps and "AAAK" in peps          # 0-missed N-term
+    assert "MAAAKGGGR" in peps and "AAAKGGGR" in peps  # 1-missed N-term clipped too
+
+
+def test_cleave_excise_spans_have_correct_coords():
+    """The clipped span starts at protein position 1."""
+    spans = cleave(
+        "MAAAKGGGGR", "Trypsin", missed_cleavages=0, min_length=3,
+        max_length=None, excise_initiator_met=True, return_spans=True,
+    )
+    clipped = next(s for s in spans if s.sequence == "AAAK")
+    assert clipped.start == 1
+    assert clipped.end == 5
+
+
 def test_cleave_aspn_cuts_before_d():
     """AspN: N-terminal to D — peptide ends at D-1, next starts at D."""
     spans = cleave(

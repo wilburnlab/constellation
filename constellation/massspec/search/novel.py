@@ -236,10 +236,20 @@ def _digest_proteins_into_index(
     max_missed_cleavages: int,
     min_peptide_length: int,
     max_peptide_length: int,
+    excise_initiator_met: bool = True,
 ) -> dict[str, set[str]]:
     """Return ``peptide_sequence → set(protein_id)`` for all tryptic
     peptides of ``proteins``. Driven by
     :func:`constellation.core.sequence.protein.cleave`.
+
+    ``excise_initiator_met`` defaults to ``True`` so the digest emits
+    both the Met-intact and Met-clipped N-terminal peptides, matching
+    the search engine (EncyclopeDIA) that produced the detected-peptide
+    set. Without it, an engine-detected Met-clipped peptide is in
+    neither the novel nor reference digest and gets silently dropped
+    (or — worse — a Met-clipped reference N-term that appears internally
+    in a novel protein is never subtracted and shows up as a false
+    novel).
 
     Proteins whose sequence contains characters outside the canonical
     20-AA alphabet (Sec ``U``, Pyl ``O``, ambiguity codes ``B``/``Z``/``X``/``J``)
@@ -262,6 +272,7 @@ def _digest_proteins_into_index(
                 missed_cleavages=max_missed_cleavages,
                 min_length=min_peptide_length,
                 max_length=max_peptide_length,
+                excise_initiator_met=excise_initiator_met,
             )
         except ValueError:
             # Sequence contains non-canonical residues (U / O / B / Z / X / J).
@@ -349,6 +360,7 @@ def classify_novel_peptides(
     max_missed_cleavages: int = 1,
     min_peptide_length: int = 7,
     max_peptide_length: int = 50,
+    excise_initiator_met: bool = True,
 ) -> pa.Table:
     """Classify detected novel peptides against a reference-vs-novel
     alignment.
@@ -399,6 +411,14 @@ def classify_novel_peptides(
     enzyme, max_missed_cleavages, min_peptide_length, max_peptide_length
         Tryptic-digest parameters forwarded to
         :func:`core.sequence.protein.cleave`.
+    excise_initiator_met
+        When ``True`` (default), both proteome digests emit the
+        Met-intact and Met-clipped N-terminal peptides, matching the
+        search engine's initiator-Met excision. Keep this aligned with
+        how the detected-peptide set was generated — EncyclopeDIA
+        clips unconditionally, so the default reproduces its peptide
+        space and prevents engine-detected Met-clipped peptides from
+        being silently dropped or mis-flagged as novel.
     """
     # 1. Digests
     novel_digest = _digest_proteins_into_index(
@@ -407,6 +427,7 @@ def classify_novel_peptides(
         max_missed_cleavages=max_missed_cleavages,
         min_peptide_length=min_peptide_length,
         max_peptide_length=max_peptide_length,
+        excise_initiator_met=excise_initiator_met,
     )
     reference_digest = _digest_proteins_into_index(
         reference_proteins,
@@ -414,6 +435,7 @@ def classify_novel_peptides(
         max_missed_cleavages=max_missed_cleavages,
         min_peptide_length=min_peptide_length,
         max_peptide_length=max_peptide_length,
+        excise_initiator_met=excise_initiator_met,
     )
     reference_peptide_set = set(reference_digest.keys())
 

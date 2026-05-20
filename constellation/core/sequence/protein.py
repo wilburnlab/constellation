@@ -241,6 +241,7 @@ def cleave(
     min_length: int = 6,
     max_length: int | None = 50,
     semi_specific: bool = False,
+    excise_initiator_met: bool = False,
     return_spans: bool = False,
 ) -> list[str] | list[Peptide]:
     """Enzymatically cleave `seq` into peptides.
@@ -250,6 +251,20 @@ def cleave(
     additionally emits all suffixes of each fully-specific peptide
     (the C-terminal cut is preserved; the N-terminus floats) — the
     standard "semi-tryptic" search-engine option.
+
+    With `excise_initiator_met=True`, for every N-terminal peptide
+    (a span starting at protein position 0) whose first residue is the
+    initiator methionine, ALSO emit the Met-clipped form (`peptide[1:]`)
+    — keeping both. This is the initiator-Met-excision behaviour search
+    engines apply (verified against EncyclopeDIA 6.5.15's predicted
+    library: ~87% of protein N-termini carry both the Met-intact and
+    Met-clipped precursor). The clipping is **unconditional** (not gated
+    on the second residue / biological Met-aminopeptidase rule — the
+    library shows clipped forms for every second residue), applies to
+    all N-terminal spans (0-missed and missed-cleavage variants), and
+    the clipped form is subject to the same length filter independently
+    (so a clipped form that drops below `min_length` is omitted while
+    its intact partner survives).
 
     Output ordering: peptides are sorted by `(start ASC, end ASC)`,
     so along the protein you read the 0-missed peptide first, then
@@ -296,6 +311,22 @@ def cleave(
                     continue
                 extras.append(Peptide(sub, new_start, sp.end, n_missed=sp.n_missed))
         spans.extend(extras)
+
+    if excise_initiator_met:
+        # For every N-terminal peptide (span at protein position 0)
+        # starting with the initiator Met, also emit the Met-clipped
+        # form. Only full spans start at 0 (semi suffixes start ≥ 1), so
+        # iterating `spans` after the semi block still picks exactly the
+        # N-terminal peptides.
+        met_clipped: list[Peptide] = []
+        for sp in spans:
+            if sp.start == 0 and sp.sequence.startswith("M"):
+                clipped = sp.sequence[1:]
+                if _length_ok(clipped, min_length, max_length):
+                    met_clipped.append(
+                        Peptide(clipped, 1, sp.end, n_missed=sp.n_missed)
+                    )
+        spans.extend(met_clipped)
 
     spans.sort(key=lambda p: (p.start, p.end))
 
