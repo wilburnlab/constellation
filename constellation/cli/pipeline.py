@@ -141,9 +141,11 @@ def _build_transcriptome_to_proteomics_parser(
         "--no-collision-filter",
         action="store_true",
         help=(
-            "skip the DIA collision filter at Stages 7 and 9 "
-            "(default: filter ON — v6.5.15 validation showed it's "
-            "still load-bearing)"
+            "skip the DIA collision filter on the GPF library (Stage 7). "
+            "Default: filter ON — v6.5.15 validation showed it's still "
+            "load-bearing. The filter is applied once to the library; "
+            "per-injection searches (Stage 9) inherit it transitively, "
+            "so they are not filtered separately."
         ),
     )
     p.add_argument(

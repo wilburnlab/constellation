@@ -686,7 +686,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
       07_gpf_search            search + (default) collision-filter
       08_classify_novel_peptides
                                constellation massspec classify-novel-peptides
-      09_per_injection         per-mzML search + (default) collision-filter
+      09_per_injection         per-mzML search against the filtered library
       10_quant_report          constellation massspec library-export
 
     Each stage owns its run dir + manifest.json + _SUCCESS. Top-level
@@ -1167,7 +1167,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         _touch_success(stage_dir)
     stage_manifests["08_classify_novel_peptides"] = _read_stage_manifest(stage_dir)
 
-    # ── Stage 9: per-injection search + collision filter ───────────────
+    # ── Stage 9: per-injection search (against the filtered library) ───
     stage_dir = output_dir / "09_per_injection"
     if not _stage_done(stage_dir, args.resume):
         _log(f"Stage 9: per-injection searches ({len(injection_files)} mzML, "
@@ -1185,7 +1185,10 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             stage_dir,
             subcommand="09_per_injection",
             params={
-                "collision_filter": not args.no_collision_filter,
+                # No per-injection collision filter — the searched library
+                # (gpf_elib_primary) is already collision-filtered, so the
+                # filtering propagates transitively.
+                "library_collision_filtered": not args.no_collision_filter,
                 "injection_threads": args.injection_threads,
                 "n_injections": len(injection_files),
             },
@@ -1199,16 +1202,14 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     if not _stage_done(stage_dir, args.resume):
         _log("Stage 10: library-export → quant_report.elib")
         stage_dir.mkdir(parents=True, exist_ok=True)
-        # Library-export consumes the FILTERED per-injection .elibs.
-        # Collect them under a flat dir for the jar's -i flag.
+        # Library-export consumes the per-injection .elibs (searched
+        # against the already-filtered library). Collect them under a
+        # flat dir for the jar's -i flag.
         export_input_dir = stage_dir / "_per_injection_elibs"
         export_input_dir.mkdir(parents=True, exist_ok=True)
         for inj_dir in sorted(
             (output_dir / "09_per_injection").rglob("*.elib")
         ):
-            # Pick only the primary (filtered) elibs, not the _raw/ copies.
-            if "_raw" in inj_dir.parts:
-                continue
             # Use the parent dir name so collisions on injection stems
             # don't clobber.
             target = export_input_dir / f"{inj_dir.parent.name}.elib"
@@ -1409,11 +1410,19 @@ def _run_per_injection_searches(
     args,
     progress: bool,
 ) -> None:
-    """Drive one search + collision-filter per injection mzML.
+    """Search each injection mzML/raw against the (already collision-
+    filtered) GPF library and emit one ``<stem>.elib`` per injection.
+
+    No per-injection collision filter: the search library is the
+    Stage-7 collision-filtered ``combined.filtered.elib``, so the
+    colliding identifications are already absent from the library and
+    cannot be reported in the injection searches. The filtering
+    propagates transitively to Stage 10's quant report. (Filtering only
+    the library also matches cartographer's validated workflow.)
 
     Parallel via :class:`concurrent.futures.ThreadPoolExecutor` per the
     plan's footgun #5 (process-level fan-out blows host RAM at
-    --jvm-heap 24g per worker).
+    --jvm-heap per worker).
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1422,27 +1431,19 @@ def _run_per_injection_searches(
         run_dir = output_root / sample_dir / mzml.stem
         if (run_dir / "_SUCCESS").exists() and args.resume:
             return
-        raw_dir = run_dir / "_raw"
-        raw_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.mkdir(parents=True, exist_ok=True)
         from constellation.massspec.search.encyclopedia import (
             run_library_search,
         )
         from constellation.massspec.search.encyclopedia.library_search import (
             find_search_elib,
         )
-        # Transparent naming: _raw/<stem>.raw.elib (raw search output) vs
-        # <stem>.filtered.elib (collision-filtered primary; <stem>.elib
-        # when --no-collision-filter).
-        raw_elib_canonical = raw_dir / f"{mzml.stem}.raw.elib"
-        primary_elib = run_dir / (
-            f"{mzml.stem}.elib" if args.no_collision_filter
-            else f"{mzml.stem}.filtered.elib"
-        )
+        primary_elib = run_dir / f"{mzml.stem}.elib"
         run_library_search(
             input_file=mzml,
             library=library_elib,
             fasta=fasta,
-            output_dir=raw_dir,
+            output_dir=run_dir,
             jvm_heap_max=args.jvm_heap_max,
             jvm_heap_min=args.jvm_heap_min,
             jvm_tmpdir=args.jvm_tmpdir,
@@ -1453,58 +1454,15 @@ def _run_per_injection_searches(
             extra_args=_passthrough_args(args.encyclopedia_arg),
             stream_to_stderr=progress,
         )
-        found_raw = find_search_elib(mzml, cwd=raw_dir)
-        if found_raw is None:
+        found = find_search_elib(mzml, cwd=run_dir)
+        if found is None:
             raise FileNotFoundError(
                 f"per-injection search returned 0 but no .elib for {mzml}"
             )
-        import shutil as _shutil
-        if found_raw.resolve() != raw_elib_canonical.resolve():
-            _shutil.move(str(found_raw), str(raw_elib_canonical))
-        raw_elib = raw_elib_canonical
-        if not args.no_collision_filter:
-            # The collision filter needs the .dia cache EncyclopeDIA
-            # produces from the input. For .raw / .mzML inputs the
-            # .dia write-location drifts by version (cwd vs. next to
-            # the input), so check both. Fail loud if requested but
-            # missing — never silently skip a filter the user asked for.
-            raw_dia = _find_dia_cache(mzml, cwd=raw_dir)
-            if raw_dia is None:
-                raise FileNotFoundError(
-                    f"--collision-filter is on but no .dia cache was found "
-                    f"for injection {mzml.name} (looked in {raw_dir} and "
-                    f"next to the input). The collision filter requires the "
-                    f".dia's isolation-window ranges. Pass "
-                    f"--no-collision-filter to skip, or pre-convert the "
-                    f"injection to .dia via `constellation massspec "
-                    f"process-dia`."
-                )
-            from constellation.massspec.search import (
-                apply_collision_filter,
-                filter_elib_by_losers,
-            )
-            losers, collision_meta = apply_collision_filter(
-                elib_path=raw_elib,
-                dia_path=raw_dia,
-                rt_threshold_s=args.collision_rt_threshold_s,
-                frag_ppm_tol=args.collision_frag_ppm_tol,
-                min_shared_ions=args.collision_min_shared_ions,
-                return_metadata=True,
-            )
-            filter_elib_by_losers(raw_elib, losers, primary_elib)
-            import json
-            (run_dir / "collision_metadata.json").write_text(
-                json.dumps(
-                    {**collision_meta, "n_losers": len(losers)},
-                    indent=2,
-                ) + "\n"
-            )
-            _maybe_auto_ingest_elib(primary_elib, run_dir, args.no_ingest)
-            _maybe_auto_ingest_elib(raw_elib, raw_dir, args.no_ingest)
-        else:
+        if found.resolve() != primary_elib.resolve():
             import shutil as _shutil
-            _shutil.copyfile(raw_elib, primary_elib)
-            _maybe_auto_ingest_elib(primary_elib, run_dir, args.no_ingest)
+            _shutil.move(str(found), str(primary_elib))
+        _maybe_auto_ingest_elib(primary_elib, run_dir, args.no_ingest)
         _touch_success(run_dir)
 
     if args.injection_threads <= 1:
@@ -1514,36 +1472,6 @@ def _run_per_injection_searches(
         with ThreadPoolExecutor(max_workers=args.injection_threads) as ex:
             for _ in ex.map(_run_one, injection_files):
                 pass
-
-
-def _find_dia_cache(input_file: Path, *, cwd: Path | None = None) -> Path | None:
-    """Locate the ``.dia`` cache EncyclopeDIA materialises from a search
-    input (.raw / .mzML / .d).
-
-    Mirrors :func:`find_search_elib`'s dual-location fall-through —
-    EncyclopeDIA's .dia write-location drifts by version (the process
-    cwd in 6.5.15+, next to the input in older builds). Returns
-    ``None`` when neither candidate exists.
-    """
-    candidates: list[Path] = []
-    if cwd is not None:
-        cwd = Path(cwd)
-        candidates.extend(
-            [
-                cwd / f"{input_file.stem}.dia",
-                cwd / f"{input_file.name}.dia",
-            ]
-        )
-    candidates.extend(
-        [
-            input_file.parent / f"{input_file.stem}.dia",
-            input_file.parent / f"{input_file.name}.dia",
-        ]
-    )
-    for c in candidates:
-        if c.is_file():
-            return c
-    return None
 
 
 def _sanitise_dirname(name: str) -> str:
