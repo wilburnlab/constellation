@@ -438,6 +438,18 @@ def _build_transcriptome_parser(subs) -> None:
         action="store_true",
         help="print one-line progress events to stderr",
     )
+    p_dem.add_argument(
+        "--emit-fastq",
+        action="store_true",
+        help=(
+            "after demux + resolve, write one gzipped FASTQ per sample to "
+            "<output-dir>/fastq/<sample_name>.fq.gz (transcript-trimmed, "
+            "Complete-status reads only; aggregates across all "
+            "(acquisition, barcode) edges sharing sample_id). Safe to add on "
+            "a re-run with --resume — the demux + resolve stages skip and "
+            "only the FASTQ emission stage executes."
+        ),
+    )
     p_dem.set_defaults(func=_cmd_transcriptome_demultiplex)
 
     # ── transcriptome align — Mode A reference-guided gene counting ──
@@ -993,14 +1005,16 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         min_protein_count=args.min_protein_count,
         progress_cb=cb,
         resume=args.resume,
+        emit_fastq=args.emit_fastq,
     )
 
     n_reads = artefacts["n_reads"]
     quant_table = artefacts["quant_table"]
     fasta_records = artefacts["fasta_records"]
+    fastq_dir = artefacts.get("fastq_dir")
 
     # Manifest for reproducibility audit.
-    manifest = {
+    manifest: dict[str, object] = {
         "input_files": [str(f) for f in input_files],
         "acquisition_map": {str(f): aid for f, aid in pipeline_inputs},
         "library_design": args.library_design,
@@ -1011,7 +1025,14 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         "n_workers": args.threads,
         "batch_size": args.batch_size,
         "resumed": args.resume,
+        "emit_fastq": args.emit_fastq,
     }
+    if fastq_dir is not None:
+        manifest["fastq_dir"] = str(fastq_dir)
+        manifest["fastq_files"] = {
+            p.name.removesuffix(".fq.gz"): str(p)
+            for p in sorted(Path(fastq_dir).glob("*.fq.gz"))
+        }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
     if not args.progress:
