@@ -720,7 +720,9 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         find_search_elib,
     )
     from constellation.sequencing.quant.protein_counts import (
+        build_tpm_matrix,
         read_protein_counts_tab,
+        render_tpm_matrix_tsv,
         tpm_normalize,
     )
     from constellation.thirdparty.mmseqs2_run import run_mmseqs_search
@@ -775,6 +777,11 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         counts = read_protein_counts_tab(protein_counts)
         counts_tpm = tpm_normalize(counts, min_sequence_length=args.min_sequence_length)
         pq.write_table(counts_tpm, stage_dir / "counts_tpm.parquet")
+        # Human-facing wide summary alongside the canonical long parquet:
+        # one row per (protein_id, sequence), per-sample counts + avg_tpm.
+        (stage_dir / "counts_tpm_wide.tsv").write_text(
+            render_tpm_matrix_tsv(build_tpm_matrix(counts_tpm))
+        )
         _write_stage_manifest(
             stage_dir,
             subcommand="01_protein_counts",

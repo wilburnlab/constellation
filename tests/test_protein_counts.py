@@ -22,7 +22,9 @@ import pytest
 
 from constellation.sequencing.quant.protein_counts import (
     PROTEIN_COUNTS_LONG_SCHEMA,
+    build_tpm_matrix,
     read_protein_counts_tab,
+    render_tpm_matrix_tsv,
     tpm_normalize,
 )
 
@@ -290,3 +292,63 @@ def test_read_wide_then_tpm(wide_tsv) -> None:
     assert rows["qJS001"] == pytest.approx(1e6)
     assert rows["qJS002"] == pytest.approx(1e6)
     assert rows["qJS003"] == pytest.approx(1e6)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# build_tpm_matrix / render_tpm_matrix_tsv — wide summary
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _long_with_tpm() -> pa.Table:
+    table = pa.table(
+        {
+            "protein_id": ["P0", "P0", "P1"],
+            "sequence": ["A" * 120, "A" * 120, "B" * 120],
+            "sample_name": ["s1", "s2", "s1"],
+            "count": [2, 8, 5],
+        },
+        schema=PROTEIN_COUNTS_LONG_SCHEMA,
+    )
+    return tpm_normalize(table, min_sequence_length=None)
+
+
+def test_build_tpm_matrix_shape_and_counts() -> None:
+    matrix = build_tpm_matrix(_long_with_tpm())
+    # One row per (protein_id, sequence); columns: protein_id, sequence,
+    # one per sample, avg_tpm.
+    assert matrix.column_names == ["protein_id", "sequence", "s1", "s2", "avg_tpm"]
+    rows = {r["protein_id"]: r for r in matrix.to_pylist()}
+    # P0 appears in both samples; P1 only in s1 (zero-filled for s2).
+    assert rows["P0"]["s1"] == 2
+    assert rows["P0"]["s2"] == 8
+    assert rows["P1"]["s1"] == 5
+    assert rows["P1"]["s2"] == 0
+
+
+def test_build_tpm_matrix_avg_tpm_matches_mean_over_present_samples() -> None:
+    matrix = build_tpm_matrix(_long_with_tpm())
+    rows = {r["protein_id"]: r for r in matrix.to_pylist()}
+    # s1 total = 2 + 5 = 7; s2 total = 8.
+    # P0: tpm s1 = 2e6/7, s2 = 8e6/8 = 1e6 → mean of the two.
+    p0_s1 = 2 * 1e6 / 7
+    p0_s2 = 8 * 1e6 / 8
+    assert rows["P0"]["avg_tpm"] == pytest.approx((p0_s1 + p0_s2) / 2)
+    # P1: only s1 present → avg over one sample.
+    assert rows["P1"]["avg_tpm"] == pytest.approx(5 * 1e6 / 7)
+
+
+def test_build_tpm_matrix_empty() -> None:
+    matrix = build_tpm_matrix(PROTEIN_COUNTS_LONG_SCHEMA.empty_table().append_column(
+        "tpm", pa.array([], type=pa.float64())
+    ))
+    assert matrix.num_rows == 0
+    assert "avg_tpm" in matrix.column_names
+
+
+def test_render_tpm_matrix_tsv_roundtrip() -> None:
+    tsv = render_tpm_matrix_tsv(build_tpm_matrix(_long_with_tpm()))
+    lines = tsv.strip("\n").split("\n")
+    assert lines[0] == "protein_id\tsequence\ts1\ts2\tavg_tpm"
+    assert len(lines) == 3  # header + P0 + P1
+    # avg_tpm rendered with 4 decimals.
+    assert all("." in line.split("\t")[-1] for line in lines[1:])

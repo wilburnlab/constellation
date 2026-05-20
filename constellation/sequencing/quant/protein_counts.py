@@ -261,8 +261,90 @@ def tpm_normalize(
     return joined.drop(["_sample_total"]).append_column("tpm", tpm)
 
 
+def build_tpm_matrix(long_tpm: pa.Table) -> pa.Table:
+    """Pivot a long counts+tpm table into a wide per-protein summary.
+
+    One row per ``(protein_id, sequence)`` with one integer count column
+    per sample, plus ``avg_tpm`` — the mean TPM across the samples in
+    which the protein appears (same denominator as the Stage-2 novelty
+    filter ``group_by(protein_id).mean(tpm)``). ``protein_id`` is the
+    transcript-derived ORF id in the long-read workflow.
+
+    Human-facing terminal summary — single-file aggregation is
+    intentional here (CLAUDE.md invariant #3 reserves it for exports),
+    not a between-stage handoff.
+    """
+    empty_cols = {
+        "protein_id": pa.array([], type=pa.string()),
+        "sequence": pa.array([], type=pa.string()),
+        "avg_tpm": pa.array([], type=pa.float64()),
+    }
+    if long_tpm.num_rows == 0:
+        return pa.table(empty_cols)
+
+    samples = sorted(set(long_tpm.column("sample_name").to_pylist()))
+    avg_by_id = {
+        r["protein_id"]: r["avg_tpm"]
+        for r in (
+            long_tpm.group_by(["protein_id"])
+            .aggregate([("tpm", "mean")])
+            .rename_columns(["protein_id", "avg_tpm"])
+            .to_pylist()
+        )
+    }
+
+    pid_c = long_tpm.column("protein_id").to_pylist()
+    seq_c = long_tpm.column("sequence").to_pylist()
+    smp_c = long_tpm.column("sample_name").to_pylist()
+    cnt_c = long_tpm.column("count").to_pylist()
+
+    per_sample: dict[str, dict[str, int]] = {}
+    seq_by_id: dict[str, str] = {}
+    order: list[str] = []
+    for pid, seq, smp, cnt in zip(pid_c, seq_c, smp_c, cnt_c, strict=True):
+        if pid not in per_sample:
+            per_sample[pid] = {}
+            seq_by_id[pid] = seq
+            order.append(pid)
+        per_sample[pid][smp] = cnt
+
+    cols: dict[str, pa.Array] = {
+        "protein_id": pa.array(order, type=pa.string()),
+        "sequence": pa.array([seq_by_id[p] for p in order], type=pa.string()),
+    }
+    for s in samples:
+        cols[s] = pa.array(
+            [per_sample[p].get(s, 0) for p in order], type=pa.int64()
+        )
+    cols["avg_tpm"] = pa.array(
+        [avg_by_id.get(p, 0.0) for p in order], type=pa.float64()
+    )
+    return pa.table(cols)
+
+
+def render_tpm_matrix_tsv(matrix: pa.Table) -> str:
+    """Render :func:`build_tpm_matrix` output as a TSV string.
+
+    Floats (``avg_tpm``) print with 4 decimals; everything else via
+    ``str``. Header row first, one protein per line.
+    """
+    names = matrix.column_names
+    cols = [matrix.column(n).to_pylist() for n in names]
+    lines = ["\t".join(names)]
+    for i in range(matrix.num_rows):
+        lines.append(
+            "\t".join(
+                f"{c[i]:.4f}" if isinstance(c[i], float) else str(c[i])
+                for c in cols
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
 __all__ = [
     "PROTEIN_COUNTS_LONG_SCHEMA",
+    "build_tpm_matrix",
     "read_protein_counts_tab",
+    "render_tpm_matrix_tsv",
     "tpm_normalize",
 ]
