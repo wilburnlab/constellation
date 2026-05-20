@@ -384,7 +384,6 @@ def classify_novel_peptides(
     novel_proteins: pa.Table,
     *,
     gene_map: Mapping[str, str] | None = None,
-    transcript_map: Mapping[str, str] | None = None,
     enzyme: str = "Trypsin",
     max_missed_cleavages: int = 1,
     min_peptide_length: int = 7,
@@ -434,13 +433,6 @@ def classify_novel_peptides(
     gene_map
         Optional ``protein_id → gene_symbol``. Looked up on the hit's
         ``target`` first, then on the novel ``protein_id``.
-    transcript_map
-        Optional ``protein_id → transcript_id`` override. When a novel
-        ``protein_id`` is absent from the map (the common case), the
-        ``transcript`` column falls back to the ``protein_id`` itself —
-        in the long-read workflow the novel protein accession *is* the
-        transcript-derived ORF id. Supply a map only when that 1:1
-        identity doesn't hold (e.g. multi-ORF transcripts).
     enzyme, max_missed_cleavages, min_peptide_length, max_peptide_length
         Tryptic-digest parameters forwarded to
         :func:`core.sequence.protein.cleave`.
@@ -536,7 +528,6 @@ def classify_novel_peptides(
                 detected_seq_to_modforms.setdefault(seq, []).append(modseq)
 
     _gene_map: Mapping[str, str] = gene_map or {}
-    _transcript_map: Mapping[str, str] = transcript_map or {}
 
     # 5. Classify each (peptide_seq, novel_protein_id) pair.
     # modified_sequence is left null here — it's filled when each
@@ -558,7 +549,6 @@ def classify_novel_peptides(
                         "protein_id": protein_id,
                         "ref_protein_id": None,
                         "gene": _gene_map.get(protein_id),
-                        "transcript": _transcript_map.get(protein_id) or protein_id,
                         "cigar": None,
                         "alignment_tier": None,
                         "novel_protein_seq": protein_seq,
@@ -580,7 +570,6 @@ def classify_novel_peptides(
                     "protein_id": protein_id,
                     "ref_protein_id": target,
                     "gene": _gene_map.get(target) or _gene_map.get(protein_id),
-                    "transcript": _transcript_map.get(protein_id) or protein_id,
                     "cigar": str(hit["cigar"]),
                     "alignment_tier": hit.get("alignment_tier"),
                     "novel_protein_seq": protein_seq,

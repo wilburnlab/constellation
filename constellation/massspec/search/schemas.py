@@ -91,11 +91,6 @@ NOVEL_PEPTIDE_TABLE: pa.Schema = pa.schema(
         pa.field("ref_protein_id", pa.string(), nullable=True),
         # Gene symbol, populated from gene_map if provided.
         pa.field("gene", pa.string(), nullable=True),
-        # Transcript ID. Defaults to the novel protein_id (which is the
-        # transcript-derived ORF identifier in the long-read workflow);
-        # an explicit transcript_map overrides it when protein_id is not
-        # 1:1 with the transcript (e.g. multi-ORF transcripts).
-        pa.field("transcript", pa.string(), nullable=True),
         # mmseqs2 CIGAR string for the hit (query-centric, 1-indexed
         # inclusive coordinates). Empty when no hit.
         pa.field("cigar", pa.string(), nullable=True),
