@@ -933,6 +933,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         result = run_library_search(
             input_file=combined_dia,
             library=combined_dlib,
+            fasta=combined_path,
             output_dir=raw_dir,
             jvm_heap_max=args.jvm_heap_max,
             jvm_heap_min=args.jvm_heap_min,
@@ -1072,6 +1073,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         _run_per_injection_searches(
             injection_files=injection_files,
             library_elib=gpf_elib_primary,
+            fasta=combined_path,
             output_root=stage_dir,
             args=args,
             progress=progress,
@@ -1299,6 +1301,7 @@ def _run_per_injection_searches(
     *,
     injection_files: list[Path],
     library_elib: Path,
+    fasta: Path,
     output_root: Path,
     args,
     progress: bool,
@@ -1328,6 +1331,7 @@ def _run_per_injection_searches(
         run_library_search(
             input_file=mzml,
             library=library_elib,
+            fasta=fasta,
             output_dir=raw_dir,
             jvm_heap_max=args.jvm_heap_max,
             jvm_heap_min=args.jvm_heap_min,

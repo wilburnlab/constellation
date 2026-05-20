@@ -379,7 +379,11 @@ def stub_external_calls(monkeypatch, tmp_path) -> dict:
 
         return _R()
 
-    def _fake_run_library_search(*, input_file, library, output_dir, **kw):
+    def _fake_run_library_search(*, input_file, library, output_dir, fasta=None, **kw):
+        # EncyclopeDIA 6.5.15's search REQUIRES -f <fasta>. Capture the
+        # fasta kwarg so the regression test can assert the orchestrator
+        # threads the combined FASTA through to every search call.
+        state.setdefault("search_fasta", []).append(fasta)
         # EncyclopeDIA 6.5.15 writes <input_stem>.elib to cwd=output_dir;
         # match that convention so the orchestrator's find_search_elib
         # (real, not stubbed) can locate it.
@@ -524,6 +528,31 @@ def test_orchestrator_end_to_end_mocked(
         "09_per_injection",
         "10_quant_report",
     }
+
+
+def test_orchestrator_threads_fasta_to_every_search(
+    stub_inputs, stub_external_calls
+) -> None:
+    """EncyclopeDIA 6.5.15 search REQUIRES -f <fasta>. Every
+    run_library_search call (GPF + the per-injection loop) must receive
+    the combined FASTA — regression guard for the missing-fasta bug
+    that surfaced on the first real OSC run."""
+    from constellation.transcriptome_to_proteome import (
+        run_transcriptome_to_proteomics,
+    )
+
+    args = _build_args(stub_inputs)
+    rc = run_transcriptome_to_proteomics(args=args)
+    assert rc == 0
+    combined_fasta = (
+        stub_inputs["output_dir"] / "04_combined_fasta" / "combined.fasta"
+    )
+    fastas = stub_external_calls["search_fasta"]
+    # 1 GPF search + 1 injection (stub has a single injection) = 2 calls.
+    assert len(fastas) >= 2
+    assert all(f == combined_fasta for f in fastas), (
+        f"some search calls missing the combined FASTA: {fastas}"
+    )
 
 
 def test_orchestrator_resume_short_circuit(
