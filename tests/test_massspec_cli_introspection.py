@@ -39,6 +39,7 @@ def test_all_four_subcommands_register() -> None:
         "process-dia",
         "library-export",
         "classify-novel-peptides",
+        "collision-filter",
     }
 
 
@@ -64,6 +65,10 @@ def test_all_four_subcommands_register() -> None:
                 "--search-results", "--library", "--alignment-hits",
                 "--reference-fasta", "--novel-fasta", "--output-dir",
             },
+        ),
+        (
+            "collision-filter",
+            {"--elib", "--dia", "--output-elib", "--output-dir"},
         ),
     ],
 )
@@ -175,6 +180,7 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
         "process-dia",
         "library-export",
         "classify-novel-peptides",
+        "collision-filter",
     }
     # Each subcommand has a non-empty argument list
     for sub in massspec_node["subcommands"]:
@@ -263,6 +269,166 @@ def test_jvm_heap_valid_suffixes_accepted(valid_value: str) -> None:
         ]
     )
     assert parsed.jvm_heap_max == valid_value
+
+
+# ── collision-filter handler (end-to-end against synthetic .elib/.dia) ──
+
+
+def _build_synthetic_elib(path, entries) -> None:
+    import sqlite3
+
+    import torch
+
+    from constellation.massspec.io.encyclopedia._codec import compress_mz
+
+    con = sqlite3.connect(str(path))
+    try:
+        # Full entries schema — apply_collision_filter reads every column
+        # in massspec.io.encyclopedia._sql._ENTRIES_COLS.
+        con.execute(
+            "CREATE TABLE entries ("
+            "PrecursorMz REAL, PrecursorCharge INTEGER, "
+            "PeptideModSeq TEXT, PeptideSeq TEXT, Copies INTEGER, "
+            "RTInSeconds REAL, Score REAL, "
+            "MassEncodedLength INTEGER, MassArray BLOB, "
+            "IntensityEncodedLength INTEGER, IntensityArray BLOB, "
+            "CorrelationEncodedLength INTEGER, CorrelationArray BLOB, "
+            "QuantifiedIonsArray BLOB, "
+            "RTInSecondsStart REAL, RTInSecondsStop REAL, "
+            "MedianChromatogramEncodedLength INTEGER, "
+            "MedianChromatogramArray BLOB, SourceFile TEXT)"
+        )
+        con.execute(
+            "CREATE TABLE peptidescores ("
+            "PrecursorCharge INTEGER, PeptideModSeq TEXT, PeptideSeq TEXT, "
+            "SourceFile TEXT, QValue REAL, "
+            "PosteriorErrorProbability REAL, IsDecoy INTEGER)"
+        )
+        for e in entries:
+            mz_arr = torch.tensor(e["mz"], dtype=torch.float64)
+            blob, n = compress_mz(mz_arr)
+            con.execute(
+                "INSERT INTO entries (PrecursorMz, PrecursorCharge, "
+                "PeptideModSeq, PeptideSeq, Copies, RTInSeconds, Score, "
+                "MassEncodedLength, MassArray, "
+                "IntensityEncodedLength, IntensityArray, "
+                "CorrelationEncodedLength, CorrelationArray, "
+                "QuantifiedIonsArray, RTInSecondsStart, RTInSecondsStop, "
+                "MedianChromatogramEncodedLength, MedianChromatogramArray, "
+                "SourceFile) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    e["precursor_mz"], 2, e["modseq"], e["modseq"], 1,
+                    e["rt"], e["score"], n, blob,
+                    0, b"", 0, b"", None,
+                    e["rt"] - 1.0, e["rt"] + 1.0, 0, b"", "run.mzML",
+                ),
+            )
+            con.execute(
+                "INSERT INTO peptidescores VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (2, e["modseq"], e["modseq"], "run.mzML", 0.01, 0.001, 0),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _build_synthetic_dia(path, windows) -> None:
+    import sqlite3
+
+    con = sqlite3.connect(str(path))
+    try:
+        con.execute(
+            "CREATE TABLE ranges ("
+            "Start REAL, Stop REAL, DutyCycle REAL, NumWindows INTEGER)"
+        )
+        for lo, hi in windows:
+            con.execute(
+                "INSERT INTO ranges VALUES (?, ?, ?, ?)",
+                (lo, hi, 1.0, len(windows)),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_collision_filter_handler_writes_filtered_elib(tmp_path) -> None:
+    """The collision-filter subcommand runs end-to-end: filters the
+    .elib, writes the filtered .elib + collision_metadata.json +
+    manifest.json + _SUCCESS."""
+    import sqlite3
+
+    elib = tmp_path / "search.elib"
+    dia = tmp_path / "combined.dia"
+    shared = [100.0, 200.0, 300.0, 400.0]
+    _build_synthetic_elib(
+        elib,
+        [
+            {"modseq": "AAAR", "precursor_mz": 500.0, "rt": 1000.0,
+             "score": 0.01, "mz": shared},   # better → winner
+            {"modseq": "BBBR", "precursor_mz": 500.0, "rt": 1002.0,
+             "score": 0.10, "mz": shared},   # worse → loser
+        ],
+    )
+    _build_synthetic_dia(dia, [(450.0, 550.0)])
+
+    parser = _build_massspec_only_parser()
+    out_elib = tmp_path / "filtered.elib"
+    out_dir = tmp_path / "run"
+    args = parser.parse_args(
+        [
+            "massspec", "collision-filter",
+            "--elib", str(elib),
+            "--dia", str(dia),
+            "--output-elib", str(out_elib),
+            "--output-dir", str(out_dir),
+            "--no-ingest",
+            "--no-progress",
+        ]
+    )
+    rc = args.func(args)
+    assert rc == 0
+    # Filtered .elib written, with the loser dropped.
+    assert out_elib.is_file()
+    con = sqlite3.connect(str(out_elib))
+    try:
+        modseqs = {
+            r[0] for r in con.execute("SELECT PeptideModSeq FROM entries")
+        }
+    finally:
+        con.close()
+    assert modseqs == {"AAAR"}   # BBBR dropped
+    # Sidecars.
+    assert (out_dir / "collision_metadata.json").is_file()
+    assert (out_dir / "manifest.json").is_file()
+    assert (out_dir / "_SUCCESS").is_file()
+
+
+def test_collision_filter_handler_resume_short_circuits(tmp_path) -> None:
+    elib = tmp_path / "search.elib"
+    dia = tmp_path / "combined.dia"
+    _build_synthetic_elib(
+        elib,
+        [{"modseq": "AAAR", "precursor_mz": 500.0, "rt": 1000.0,
+          "score": 0.01, "mz": [100.0, 200.0]}],
+    )
+    _build_synthetic_dia(dia, [(450.0, 550.0)])
+    out_dir = tmp_path / "run"
+    out_dir.mkdir()
+    (out_dir / "_SUCCESS").write_bytes(b"")
+
+    parser = _build_massspec_only_parser()
+    args = parser.parse_args(
+        [
+            "massspec", "collision-filter",
+            "--elib", str(elib), "--dia", str(dia),
+            "--output-elib", str(tmp_path / "filtered.elib"),
+            "--output-dir", str(out_dir),
+            "--resume", "--no-ingest", "--no-progress",
+        ]
+    )
+    rc = args.func(args)
+    assert rc == 0   # short-circuits on existing _SUCCESS
 
 
 # ── helpers ────────────────────────────────────────────────────────────
