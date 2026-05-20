@@ -317,6 +317,9 @@ def test_build_tpm_matrix_shape_and_counts() -> None:
     # One row per (protein_id, sequence); columns: protein_id, sequence,
     # one per sample, avg_tpm.
     assert matrix.column_names == ["protein_id", "sequence", "s1", "s2", "avg_tpm"]
+    # Sorted most-abundant-first by avg_tpm.
+    avg = matrix.column("avg_tpm").to_pylist()
+    assert avg == sorted(avg, reverse=True)
     rows = {r["protein_id"]: r for r in matrix.to_pylist()}
     # P0 appears in both samples; P1 only in s1 (zero-filled for s2).
     assert rows["P0"]["s1"] == 2

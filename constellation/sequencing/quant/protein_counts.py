@@ -268,7 +268,8 @@ def build_tpm_matrix(long_tpm: pa.Table) -> pa.Table:
     per sample, plus ``avg_tpm`` — the mean TPM across the samples in
     which the protein appears (same denominator as the Stage-2 novelty
     filter ``group_by(protein_id).mean(tpm)``). ``protein_id`` is the
-    transcript-derived ORF id in the long-read workflow.
+    transcript-derived ORF id in the long-read workflow. Rows are sorted
+    by ``avg_tpm`` descending (most-abundant transcript first).
 
     Human-facing terminal summary — single-file aggregation is
     intentional here (CLAUDE.md invariant #3 reserves it for exports),
@@ -319,7 +320,8 @@ def build_tpm_matrix(long_tpm: pa.Table) -> pa.Table:
     cols["avg_tpm"] = pa.array(
         [avg_by_id.get(p, 0.0) for p in order], type=pa.float64()
     )
-    return pa.table(cols)
+    # Most-abundant transcript first.
+    return pa.table(cols).sort_by([("avg_tpm", "descending")])
 
 
 def render_tpm_matrix_tsv(matrix: pa.Table) -> str:
