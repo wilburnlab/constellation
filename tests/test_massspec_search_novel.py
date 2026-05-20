@@ -231,6 +231,56 @@ def test_classify_unknown_no_hit() -> None:
     assert classifications == ["unknown"]
 
 
+def test_transcript_defaults_to_protein_id() -> None:
+    """With no transcript_map, the transcript column aliases protein_id —
+    the novel accession IS the transcript-derived ORF id."""
+    detected = pa.table({"peptide_sequence": pa.array(["LIGHTPEPTIDK"])})
+    novel = pa.table(
+        {
+            "protein_id": pa.array(["NOVEL_NO_HIT"]),
+            "sequence": pa.array(["MAGCRLIGHTPEPTIDKRAWN"]),
+        }
+    )
+    reference = pa.table(
+        {
+            "protein_id": pa.array(["REF1"]),
+            "sequence": pa.array(["MAGYRDIFFERENTREFPRTEIN"]),
+        }
+    )
+    result = classify_novel_peptides(
+        detected_peptides=detected,
+        alignments=ALIGNMENT_HIT_TABLE.empty_table(),
+        reference_proteins=reference,
+        novel_proteins=novel,
+    )
+    assert result.column("transcript").to_pylist() == ["NOVEL_NO_HIT"]
+
+
+def test_transcript_map_overrides_protein_id() -> None:
+    """An explicit transcript_map wins over the protein_id fallback."""
+    detected = pa.table({"peptide_sequence": pa.array(["LIGHTPEPTIDK"])})
+    novel = pa.table(
+        {
+            "protein_id": pa.array(["NOVEL_NO_HIT"]),
+            "sequence": pa.array(["MAGCRLIGHTPEPTIDKRAWN"]),
+        }
+    )
+    reference = pa.table(
+        {
+            "protein_id": pa.array(["REF1"]),
+            "sequence": pa.array(["MAGYRDIFFERENTREFPRTEIN"]),
+        }
+    )
+    result = classify_novel_peptides(
+        detected_peptides=detected,
+        alignments=ALIGNMENT_HIT_TABLE.empty_table(),
+        reference_proteins=reference,
+        novel_proteins=novel,
+        transcript_map={"NOVEL_NO_HIT": "ENST00000.1"},
+    )
+    assert result.column("transcript").to_pylist() == ["ENST00000.1"]
+
+
 def test_classify_non_reference() -> None:
     """Hit target NOT in reference_proteins → non_reference."""
     novel = "MAGCKLIGHTPEPTKRAW"
