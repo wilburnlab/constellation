@@ -107,18 +107,18 @@ def _materialise_genome_fasta(
     return fasta_path
 
 
-def _stream_demux_fastq(
+def _iter_demux_read_batches(
     demux_dir: Path,
     *,
     only_complete: bool = True,
     batch_size: int = 100_000,
-) -> Iterator[tuple[bytes, int]]:
-    """Stream FASTQ bytes from an S1 demux output directory.
+) -> Iterator[dict[str, list]]:
+    """Stream window-sliced demux records ready for FASTQ formatting.
 
     Joins the ``reads/`` partition (read_id, sequence, quality) against
-    the filtered ``read_demux/`` partition (read_id, transcript_start,
-    transcript_end), slices each sequence to its transcript window, and
-    yields per-batch FASTQ-encoded bytes.
+    the filtered ``read_demux/`` partition (read_id, sample_id,
+    transcript_start, transcript_end), slices each sequence + quality to
+    its transcript window, and yields per-batch column-lists.
 
     Filter when ``only_complete=True`` (default for genome-guided
     quantification — see the chimera-handling discussion in the S2 plan):
@@ -130,13 +130,15 @@ def _stream_demux_fastq(
           today, lights up when S3 enables multi-segment splitting)
         * ``transcript_start >= 0`` AND ``transcript_end > transcript_start``
 
-    Yields ``(fastq_bytes, n_reads)`` per batch so callers can update
-    progress without re-decoding the bytes.
+    Each yielded dict has equal-length lists under keys ``read_id``,
+    ``sample_id``, ``sequence`` (already window-sliced), ``quality``
+    (already window-sliced; ``'I' * len(seq)`` synthetic Q40 when the
+    source had no quality column).
 
     Memory at 200M-read scale: filtered demux index ~10 GB (50 B/row);
-    each yielded FASTQ batch ~200 MB (100k rows × ~2 KB seq+qual). The
-    demux index sits resident as the join's hash-build side; the reads
-    side streams via ``pa.dataset.to_batches``.
+    each yielded batch ~200 MB (100k rows × ~2 KB seq+qual). The demux
+    index sits resident as the join's hash-build side; the reads side
+    streams via ``pa.dataset.to_batches``.
     """
     demux_dir = Path(demux_dir)
     reads_dir = demux_dir / "reads"
@@ -165,7 +167,12 @@ def _stream_demux_fastq(
         )
 
     demux_table = pa_ds.dataset(demux_part_dir).to_table(
-        columns=["read_id", "transcript_start", "transcript_end"],
+        columns=[
+            "read_id",
+            "sample_id",
+            "transcript_start",
+            "transcript_end",
+        ],
         filter=filt,
     )
     if demux_table.num_rows == 0:
@@ -186,6 +193,7 @@ def _stream_demux_fastq(
             continue
 
         read_ids = joined.column("read_id").to_pylist()
+        sample_ids = joined.column("sample_id").to_pylist()
         sequences = joined.column("sequence").to_pylist()
         if has_quality and "quality" in joined.column_names:
             qualities = joined.column("quality").to_pylist()
@@ -194,9 +202,12 @@ def _stream_demux_fastq(
         ts_list = joined.column("transcript_start").to_pylist()
         te_list = joined.column("transcript_end").to_pylist()
 
-        parts: list[str] = []
-        for read_id, seq, qual, ts, te in zip(
-            read_ids, sequences, qualities, ts_list, te_list
+        out_ids: list[str] = []
+        out_samples: list[int] = []
+        out_seqs: list[str] = []
+        out_quals: list[str] = []
+        for read_id, sample_id, seq, qual, ts, te in zip(
+            read_ids, sample_ids, sequences, qualities, ts_list, te_list
         ):
             s = seq[ts:te]
             if not s:
@@ -206,9 +217,33 @@ def _stream_demux_fastq(
             else:
                 # No quality (FASTA-shaped reads) → synthetic Q40 = 'I'
                 q = "I" * len(s)
-            parts.append(f"@{read_id}\n{s}\n+\n{q}\n")
-        if parts:
-            yield "".join(parts).encode("ascii"), len(parts)
+            out_ids.append(read_id)
+            out_samples.append(sample_id)
+            out_seqs.append(s)
+            out_quals.append(q)
+        if out_ids:
+            yield {
+                "read_id": out_ids,
+                "sample_id": out_samples,
+                "sequence": out_seqs,
+                "quality": out_quals,
+            }
+
+
+def _format_fastq_bytes(batch: dict[str, list]) -> tuple[bytes, int]:
+    """Encode a batch from :func:`_iter_demux_read_batches` to FASTQ bytes.
+
+    Sample identity is dropped — the byte stream is suitable for piping
+    into a single alignment process (e.g. minimap2 stdin) where the
+    consumer does not care which sample each read came from.
+    """
+    parts = [
+        f"@{rid}\n{seq}\n+\n{qual}\n"
+        for rid, seq, qual in zip(
+            batch["read_id"], batch["sequence"], batch["quality"]
+        )
+    ]
+    return "".join(parts).encode("ascii"), len(parts)
 
 
 def map_to_genome(
@@ -229,7 +264,7 @@ def map_to_genome(
     file, no raw-BAM input) — the S1 demux already located the library
     scaffold (5'/3' adapter, polyA, barcode), so we map only the
     transcript window of each Complete-status read. See
-    :func:`_stream_demux_fastq` for the filter set.
+    :func:`_iter_demux_read_batches` for the filter set.
 
     Pipeline shape:
 
@@ -316,11 +351,12 @@ def map_to_genome(
         def _writer() -> None:
             try:
                 assert mm2.stdin is not None
-                for chunk_bytes, n_reads in _stream_demux_fastq(
+                for batch in _iter_demux_read_batches(
                     demux_dir,
                     only_complete=only_complete,
                     batch_size=batch_size,
                 ):
+                    chunk_bytes, n_reads = _format_fastq_bytes(batch)
                     mm2.stdin.write(chunk_bytes)
                     reads_emitted[0] += n_reads
                     if progress_cb is not None:

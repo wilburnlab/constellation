@@ -1,8 +1,8 @@
 """Tests for ``constellation.sequencing.align.map``.
 
 Two test groups:
-  * Pure-Python tests for ``_stream_demux_fastq`` — run anywhere with
-    pyarrow.
+  * Pure-Python tests for ``_iter_demux_read_batches`` +
+    ``_format_fastq_bytes`` — run anywhere with pyarrow.
   * minimap2 / samtools end-to-end tests — gated on tool availability.
 
 The full pipeline test exercises ``map_to_genome`` against a tiny
@@ -18,7 +18,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from constellation.sequencing.align.map import _stream_demux_fastq
+from constellation.sequencing.align.map import (
+    _format_fastq_bytes,
+    _iter_demux_read_batches,
+)
 from constellation.sequencing.reference.reference import GenomeReference
 from constellation.sequencing.schemas.reads import READ_TABLE
 from constellation.sequencing.schemas.transcriptome import READ_DEMUX_TABLE
@@ -68,7 +71,7 @@ def _make_demux_dir(
     return demux_dir
 
 
-def test_stream_demux_fastq_filters_and_slices(tmp_path: Path) -> None:
+def test_iter_demux_read_batches_filters_and_slices(tmp_path: Path) -> None:
     """Filter set + transcript-window slicing produce the right FASTQ.
 
     Synthetic dataset:
@@ -109,12 +112,17 @@ def test_stream_demux_fastq_filters_and_slices(tmp_path: Path) -> None:
     ]
     demux_dir = _make_demux_dir(tmp_path, reads=reads, demux=demux)
 
-    chunks = list(_stream_demux_fastq(demux_dir))
-    assert len(chunks) == 1
-    fastq_bytes, n_reads = chunks[0]
+    batches = list(_iter_demux_read_batches(demux_dir))
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch["read_id"] == ["r0"]
+    assert batch["sample_id"] == [1]
+    assert batch["sequence"] == [seq[10:50]]
+    assert batch["quality"] == [qual[10:50]]
+
+    fastq_bytes, n_reads = _format_fastq_bytes(batch)
     assert n_reads == 1
     text = fastq_bytes.decode("ascii")
-    # One @-prefixed record, the trimmed window only
     assert text.startswith("@r0\n")
     lines = text.strip().split("\n")
     assert len(lines) == 4
@@ -123,7 +131,7 @@ def test_stream_demux_fastq_filters_and_slices(tmp_path: Path) -> None:
     assert lines[3] == qual[10:50]
 
 
-def test_stream_demux_fastq_skips_invalid_window(tmp_path: Path) -> None:
+def test_iter_demux_read_batches_skips_invalid_window(tmp_path: Path) -> None:
     """transcript_start=-1 / transcript_end<=transcript_start are dropped."""
     seq = "ACGT" * 50
     reads = [
@@ -147,8 +155,8 @@ def test_stream_demux_fastq_skips_invalid_window(tmp_path: Path) -> None:
          "artifact": "none"},
     ]
     demux_dir = _make_demux_dir(tmp_path, reads=reads, demux=demux)
-    chunks = list(_stream_demux_fastq(demux_dir))
-    assert chunks == []
+    batches = list(_iter_demux_read_batches(demux_dir))
+    assert batches == []
 
 
 @_skip_no_tools

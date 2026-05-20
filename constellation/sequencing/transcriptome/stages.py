@@ -464,6 +464,7 @@ def run_demux_pipeline(
     min_protein_count: int = 2,
     progress_cb: ProgressCallback | None = None,
     resume: bool = False,
+    emit_fastq: bool = False,
     # Backwards-compat alias for the old ``batch_size`` kwarg.
     batch_size: int | None = None,
 ) -> dict[str, object]:
@@ -535,12 +536,26 @@ def run_demux_pipeline(
         else 0
     )
 
+    fastq_dir: Path | None = None
+    if emit_fastq:
+        from constellation.sequencing.transcriptome.fastq import (
+            emit_per_sample_fastq,
+        )
+
+        fastq_dir = emit_per_sample_fastq(
+            output_dir,
+            samples=samples,
+            progress_cb=cb,
+            resume=resume,
+        )
+
     return {
         "n_reads": n_reads,
         "demux_outputs": demux_outputs,
         "quant_table": quant,
         "fasta_records": fasta_records,
         "tsv_text": tsv_text,
+        "fastq_dir": fastq_dir,
     }
 
 
