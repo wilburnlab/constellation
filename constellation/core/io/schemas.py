@@ -435,10 +435,58 @@ def read_mmseqs_tab(
     if not p.exists() or p.stat().st_size == 0:
         return ALIGNMENT_HIT_TABLE.empty_table()
 
-    field_names = ["query", "target", "evalue", "qstart", "qend", "tstart", "tend", "cigar"]
+    base_names = [
+        "query", "target", "evalue", "qstart", "qend", "tstart", "tend", "cigar"
+    ]
+
+    # Sniff the first non-empty line: how many columns, and is it a
+    # header? Upstream pipelines vary — bare mmseqs2 writes headerless
+    # 8-column output, but pre-tiered files (cartographer's tiered
+    # alignment pass) carry a 9th ``alignment_tier`` column and may
+    # include a header row. Both must parse.
+    first = ""
+    with p.open() as fh:
+        for line in fh:
+            if line.strip():
+                first = line.rstrip("\n")
+                break
+    if not first:
+        return ALIGNMENT_HIT_TABLE.empty_table()
+    fields = first.split("\t")
+    n_cols = len(fields)
+    if n_cols < len(base_names):
+        raise ValueError(
+            f"mmseqs .tab at {p} has {n_cols} columns; expected at least "
+            f"{len(base_names)} ({','.join(base_names)})"
+        )
+    # Header iff the evalue field (index 2) isn't numeric. Strip quotes
+    # first — some writers (pandas QUOTE_ALL) wrap every field.
+    def _is_float(tok: str) -> bool:
+        try:
+            float(tok.strip().strip('"'))
+            return True
+        except ValueError:
+            return False
+
+    has_header = not _is_float(fields[2])
+
+    # Build column names matching the actual width: the 8 canonical
+    # fields, an ``alignment_tier`` 9th, and ``_extraN`` placeholders for
+    # anything beyond (dropped by the cast). The file's tier column, when
+    # present, wins over the ``alignment_tier`` kwarg.
+    column_names = list(base_names)
+    has_tier_col = n_cols >= 9
+    if has_tier_col:
+        column_names.append("alignment_tier")
+    column_names.extend(f"_extra{i}" for i in range(10, n_cols + 1))
+    include = list(base_names) + (["alignment_tier"] if has_tier_col else [])
+
     table = pa_csv.read_csv(
         str(p),
-        read_options=pa_csv.ReadOptions(column_names=field_names),
+        read_options=pa_csv.ReadOptions(
+            column_names=column_names,
+            skip_rows=1 if has_header else 0,
+        ),
         parse_options=pa_csv.ParseOptions(delimiter="\t"),
         convert_options=pa_csv.ConvertOptions(
             column_types={
@@ -450,15 +498,27 @@ def read_mmseqs_tab(
                 "tstart": pa.int64(),
                 "tend": pa.int64(),
                 "cigar": pa.string(),
+                "alignment_tier": pa.string(),
             },
+            include_columns=include,
         ),
     )
 
-    if alignment_tier is None:
-        tier_col = pa.nulls(table.num_rows, type=pa.string())
-    else:
-        tier_col = pa.array(
-            [alignment_tier] * table.num_rows, type=pa.string()
+    if not has_tier_col:
+        # No tier column in the file → fill from the kwarg or null.
+        if alignment_tier is None:
+            tier_col = pa.nulls(table.num_rows, type=pa.string())
+        else:
+            tier_col = pa.array(
+                [alignment_tier] * table.num_rows, type=pa.string()
+            )
+        table = table.append_column("alignment_tier", tier_col)
+    elif alignment_tier is not None:
+        # File carries a tier column AND the caller forced a value —
+        # the explicit kwarg overrides the file (rare; default is None
+        # so the file value normally wins).
+        table = table.drop(["alignment_tier"]).append_column(
+            "alignment_tier",
+            pa.array([alignment_tier] * table.num_rows, type=pa.string()),
         )
-    table = table.append_column("alignment_tier", tier_col)
     return cast_to_schema(table, ALIGNMENT_HIT_TABLE)

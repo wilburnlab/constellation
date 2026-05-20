@@ -254,6 +254,67 @@ def test_read_mmseqs_tab_missing_file(tmp_path: Path) -> None:
     assert table.schema.equals(ALIGNMENT_HIT_TABLE)
 
 
+def test_read_mmseqs_tab_with_header(tmp_path: Path) -> None:
+    """A header row is detected (evalue column non-numeric) + skipped."""
+    tab = tmp_path / "alignments.tab"
+    tab.write_text(
+        "query\ttarget\tevalue\tqstart\tqend\ttstart\ttend\tcigar\n"
+        "NOVEL1\tREF1\t1.2e-30\t1\t100\t1\t100\t100M\n"
+        "NOVEL2\tREF2\t3.4e-25\t1\t80\t10\t89\t80M\n"
+    )
+    table = read_mmseqs_tab(tab)
+    assert table.num_rows == 2
+    assert table.column("query").to_pylist() == ["NOVEL1", "NOVEL2"]
+    assert table.column("evalue").to_pylist()[0] == pytest.approx(1.2e-30)
+
+
+def test_read_mmseqs_tab_ninth_tier_column(tmp_path: Path) -> None:
+    """A 9th alignment_tier column (pre-tiered .tab) is read directly,
+    and the file value wins over the kwarg default."""
+    tab = tmp_path / "alignments.tab"
+    tab.write_text(
+        "NOVEL1\tREF1\t1.2e-30\t1\t100\t1\t100\t100M\treference\n"
+        "NOVEL2\tSWISS_X\t9.9e-18\t5\t50\t1\t46\t46M\tnon_reference\n"
+    )
+    table = read_mmseqs_tab(tab)
+    assert table.num_rows == 2
+    assert table.column("alignment_tier").to_pylist() == [
+        "reference", "non_reference",
+    ]
+
+
+def test_read_mmseqs_tab_header_and_tier(tmp_path: Path) -> None:
+    """Header + 9th alignment_tier column together — the exact shape the
+    lab's pre-tiered .tab files have (regression for the OSC failure)."""
+    tab = tmp_path / "alignments.tab"
+    tab.write_text(
+        "query\ttarget\tevalue\tqstart\tqend\ttstart\ttend\tcigar\talignment_tier\n"
+        "NOVEL1\tREF1\t1.2e-30\t1\t100\t1\t100\t100M\treference\n"
+        "NOVEL2\tSWISS_X\t9.9e-18\t5\t50\t1\t46\t46M\tnon_reference\n"
+    )
+    table = read_mmseqs_tab(tab)
+    assert table.num_rows == 2
+    assert table.schema.equals(ALIGNMENT_HIT_TABLE)
+    assert table.column("query").to_pylist() == ["NOVEL1", "NOVEL2"]
+    assert table.column("alignment_tier").to_pylist() == [
+        "reference", "non_reference",
+    ]
+
+
+def test_read_mmseqs_tab_quoted_header_and_fields(tmp_path: Path) -> None:
+    """Header + data quoted (pandas QUOTE_ALL style) still parses — the
+    evalue-numeric sniff strips quotes before the float check."""
+    tab = tmp_path / "alignments.tab"
+    tab.write_text(
+        '"query"\t"target"\t"evalue"\t"qstart"\t"qend"\t"tstart"\t"tend"\t"cigar"\t"alignment_tier"\n'
+        '"NOVEL1"\t"REF1"\t"1.2e-30"\t"1"\t"100"\t"1"\t"100"\t"100M"\t"reference"\n'
+    )
+    table = read_mmseqs_tab(tab)
+    assert table.num_rows == 1
+    assert table.column("query").to_pylist() == ["NOVEL1"]
+    assert table.column("alignment_tier").to_pylist() == ["reference"]
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Tier inference (target ∈ reference_proteins → "reference")
 # ──────────────────────────────────────────────────────────────────────
