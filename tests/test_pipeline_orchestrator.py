@@ -582,10 +582,10 @@ def test_orchestrator_resume_short_circuit(
 def test_orchestrator_stage7_resumes_from_existing_elib(
     stub_inputs, stub_external_calls
 ) -> None:
-    """If a prior run produced 07_gpf_search/combined.elib but died before
-    _SUCCESS (e.g. mid auto-ingest), --resume must pick up from the
-    existing elib rather than re-running the multi-hour EncyclopeDIA
-    search."""
+    """If a prior run produced 07_gpf_search/combined.filtered.elib but
+    died before _SUCCESS (e.g. mid auto-ingest), --resume must pick up
+    from the existing elib rather than re-running the multi-hour
+    EncyclopeDIA search."""
     from constellation.transcriptome_to_proteome import (
         run_transcriptome_to_proteomics,
     )
@@ -594,7 +594,7 @@ def test_orchestrator_stage7_resumes_from_existing_elib(
     assert run_transcriptome_to_proteomics(args=args) == 0
 
     stage7 = stub_inputs["output_dir"] / "07_gpf_search"
-    assert (stage7 / "combined.elib").is_file()
+    assert (stage7 / "combined.filtered.elib").is_file()
     # Simulate a crash after the filtered elib was written but before the
     # stage was marked complete — clear Stage 7's _SUCCESS and the
     # top-level _SUCCESS (which would otherwise short-circuit the run).
@@ -628,7 +628,9 @@ def test_orchestrator_collision_filter_default_runs(
     stage7 = stub_inputs["output_dir"] / "07_gpf_search"
     assert (stage7 / "collision_metadata.json").is_file()
     assert (stage7 / "_raw").is_dir()
-    assert (stage7 / "combined.elib").is_file()
+    assert (stage7 / "combined.filtered.elib").is_file()
+    # Raw search output consolidated under _raw/ with a transparent name.
+    assert (stage7 / "_raw" / "combined.raw.elib").is_file()
 
 
 def test_orchestrator_no_collision_filter_skips_raw(

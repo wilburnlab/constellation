@@ -21,6 +21,7 @@ from constellation.sequencing.quant.protein_counts import (
     PROTEIN_COUNTS_LONG_SCHEMA,
 )
 from constellation.transcriptome_to_proteome import (
+    _tag_alignment_tier,
     apply_alignment_filter,
     build_combined_fasta,
     collect_protein_ids,
@@ -28,6 +29,52 @@ from constellation.transcriptome_to_proteome import (
     read_reference_gene_map,
     write_competitive_target_fasta,
 )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# _tag_alignment_tier — source tagging from reference membership
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_tag_alignment_tier_by_membership(tmp_path: Path) -> None:
+    """Targets in the reference proteome → 'refseq'; everything else
+    (i.e. SwissProt) → 'swissprot'."""
+    import pyarrow as pa
+
+    ref = tmp_path / "ref.fasta"
+    ref.write_text(">NP_001\nMKAAA\n>NP_002\nMKBBB\n")
+    hits = pa.table(
+        {
+            "query": pa.array(["N1", "N2", "N3"]),
+            "target": pa.array(["NP_001", "SP_Q9Y6K9", "NP_002"]),
+            "evalue": pa.array([1e-50, 1e-30, 1e-40]),
+        }
+    )
+    tagged = _tag_alignment_tier(hits, ref)
+    assert tagged.column("alignment_tier").to_pylist() == [
+        "refseq",
+        "swissprot",
+        "refseq",
+    ]
+
+
+def test_tag_alignment_tier_replaces_existing(tmp_path: Path) -> None:
+    """Any pre-existing alignment_tier column is overwritten by the
+    membership-derived value."""
+    import pyarrow as pa
+
+    ref = tmp_path / "ref.fasta"
+    ref.write_text(">NP_001\nMKAAA\n")
+    hits = pa.table(
+        {
+            "query": pa.array(["N1"]),
+            "target": pa.array(["NP_001"]),
+            "evalue": pa.array([1e-50]),
+            "alignment_tier": pa.array(["stale"]),
+        }
+    )
+    tagged = _tag_alignment_tier(hits, ref)
+    assert tagged.column("alignment_tier").to_pylist() == ["refseq"]
 
 
 # ──────────────────────────────────────────────────────────────────────

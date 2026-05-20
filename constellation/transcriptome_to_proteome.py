@@ -632,6 +632,41 @@ def collect_protein_ids(fasta_path: Path | str) -> set[str]:
     return out
 
 
+def _tag_alignment_tier(
+    alignment_hits: "pa.Table", reference_fasta: Path | str
+) -> "pa.Table":
+    """Set ``alignment_tier`` per hit by target membership in the
+    reference proteome: ``target ∈ reference → "refseq"`` else
+    ``"swissprot"``. Replaces any existing column.
+
+    The single competitive mmseqs search can't distinguish which DB a
+    target came from; accession membership recovers it.
+    """
+    import pyarrow as pa
+
+    if alignment_hits.num_rows == 0:
+        if "alignment_tier" in alignment_hits.column_names:
+            return alignment_hits
+        return alignment_hits.append_column(
+            "alignment_tier", pa.array([], type=pa.string())
+        )
+    ref_ids = collect_protein_ids(reference_fasta)
+    tier = pa.array(
+        [
+            "refseq" if str(t) in ref_ids else "swissprot"
+            for t in alignment_hits.column("target").to_pylist()
+        ],
+        type=pa.string(),
+    )
+    if "alignment_tier" in alignment_hits.column_names:
+        return alignment_hits.set_column(
+            alignment_hits.column_names.index("alignment_tier"),
+            "alignment_tier",
+            tier,
+        )
+    return alignment_hits.append_column("alignment_tier", tier)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Orchestrator entry point
 # ──────────────────────────────────────────────────────────────────────
@@ -802,9 +837,25 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         # Materialise the parsed AlignmentHits as a ParquetDir bundle
         # for downstream classifier consumption.
         alignment_hits = read_mmseqs_tab(alignments_tab)
+        # Tag each hit's source tier. The single competitive mmseqs search
+        # against (reference ⊕ swissprot) doesn't distinguish which DB a
+        # target came from, so derive it from accession membership:
+        # target ∈ reference proteome → "refseq", else "swissprot". This
+        # restores the source column cartographer's two-tier search emitted
+        # (feeds the combined.fasta [aligned_to=...] header tag + the
+        # classifier's tier inference).
+        alignment_hits = _tag_alignment_tier(alignment_hits, reference_fasta)
         ah_dir = stage_dir / "alignment_hits"
         ah_dir.mkdir(parents=True, exist_ok=True)
         pq.write_table(alignment_hits, ah_dir / "alignment_hits.parquet")
+        # Re-write the .tab with the 9th source column so the human-facing
+        # alignment file carries the tier too (cartographer .tab parity).
+        import pyarrow.csv as _pa_csv
+        _pa_csv.write_csv(
+            alignment_hits,
+            alignments_tab,
+            write_options=_pa_csv.WriteOptions(delimiter="\t"),
+        )
         # Drop the combined target FASTA (recreatable from reference + swissprot).
         target_fasta.unlink(missing_ok=True)
         if scratch.exists():
@@ -924,19 +975,29 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     stage_manifests["06_process_dia"] = _read_stage_manifest(stage_dir)
 
     # ── Stage 7: GPF search + collision filter ─────────────────────────
+    # Transparent elib naming:
+    #   _raw/combined.raw.elib       the raw EncyclopeDIA search output
+    #   combined.filtered.elib       collision-filtered primary (default)
+    #   combined.elib                primary when --no-collision-filter
     stage_dir = output_dir / "07_gpf_search"
-    gpf_elib_primary = stage_dir / "combined.elib"
+    raw_dir = stage_dir / "_raw"
+    raw_elib_canonical = raw_dir / "combined.raw.elib"
+    gpf_elib_primary = stage_dir / (
+        "combined.elib" if args.no_collision_filter else "combined.filtered.elib"
+    )
     if not _stage_done(stage_dir, args.resume):
-        raw_dir = stage_dir / "_raw"
         # Fine-grained resume: a prior run already produced the filtered
-        # combined.elib, so the (very slow) EncyclopeDIA search + the
+        # primary elib, so the (very slow) EncyclopeDIA search + the
         # collision filter are done — only the optional auto-ingest or the
         # manifest/_SUCCESS were left. Pick up from the existing elib
         # instead of re-running the multi-hour search.
         if args.resume and gpf_elib_primary.is_file():
-            _log("Stage 7: combined.elib present — skipping search + "
-                 "collision filter, resuming from existing elib")
-            actual_raw_elib = find_search_elib(combined_dia, cwd=raw_dir)
+            _log(f"Stage 7: {gpf_elib_primary.name} present — skipping search "
+                 "+ collision filter, resuming from existing elib")
+            actual_raw_elib = (
+                raw_elib_canonical if raw_elib_canonical.is_file()
+                else find_search_elib(combined_dia, cwd=raw_dir)
+            )
             collision_ran = not args.no_collision_filter
             meta_path = stage_dir / "collision_metadata.json"
             n_losers = 0
@@ -966,11 +1027,18 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
                 extra_args=_passthrough_args(args.encyclopedia_arg),
                 stream_to_stderr=progress,
             )
-            actual_raw_elib = find_search_elib(combined_dia, cwd=raw_dir)
-            if actual_raw_elib is None:
+            found_raw = find_search_elib(combined_dia, cwd=raw_dir)
+            if found_raw is None:
                 raise FileNotFoundError(
                     f"GPF search returned 0 but no .elib found under {raw_dir}"
                 )
+            # EncyclopeDIA names its output <stem>.elib and may write it
+            # next to the input .dia (06_process_dia/) rather than into
+            # _raw/. Move it to the canonical raw path so the stage dirs
+            # stay clean and the raw vs. filtered distinction is explicit.
+            if found_raw.resolve() != raw_elib_canonical.resolve():
+                shutil.move(str(found_raw), str(raw_elib_canonical))
+            actual_raw_elib = raw_elib_canonical
             # Collision filter (default-on).
             if not args.no_collision_filter:
                 losers, collision_meta = apply_collision_filter(
@@ -1003,7 +1071,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         _maybe_auto_ingest_elib(
             gpf_elib_primary, stage_dir, args.no_ingest,
         )
-        if collision_ran and actual_raw_elib is not None:
+        if collision_ran and actual_raw_elib is not None and actual_raw_elib.is_file():
             _maybe_auto_ingest_elib(
                 actual_raw_elib, raw_dir, args.no_ingest,
             )
@@ -1057,9 +1125,11 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         # Novel proteins = the combined.fasta minus reference. Simpler:
         # the source proteins.fasta carries every novel protein candidate.
         novel_proteins = read_fasta_proteins(proteins_fasta)
-        gene_map_from_fastas = build_gene_map_from_fasta_headers(
-            [reference_fasta, proteins_fasta]
-        )
+        # Gene tags live on the Stage-4 combined.fasta headers (annotated
+        # from the reference GFF3/GBFF). The raw reference + demux FASTAs
+        # carry no gene= tags, so the map must come from combined.fasta —
+        # building it from the raw inputs yields an empty gene column.
+        gene_map_from_fastas = build_gene_map_from_fasta_headers([combined_path])
         result = classify_novel_peptides(
             detected_peptides=detected_peptides,
             alignments=alignment_hits,
@@ -1353,7 +1423,14 @@ def _run_per_injection_searches(
         from constellation.massspec.search.encyclopedia.library_search import (
             find_search_elib,
         )
-        elib_name = f"{mzml.stem}.elib"
+        # Transparent naming: _raw/<stem>.raw.elib (raw search output) vs
+        # <stem>.filtered.elib (collision-filtered primary; <stem>.elib
+        # when --no-collision-filter).
+        raw_elib_canonical = raw_dir / f"{mzml.stem}.raw.elib"
+        primary_elib = run_dir / (
+            f"{mzml.stem}.elib" if args.no_collision_filter
+            else f"{mzml.stem}.filtered.elib"
+        )
         run_library_search(
             input_file=mzml,
             library=library_elib,
@@ -1369,12 +1446,15 @@ def _run_per_injection_searches(
             extra_args=_passthrough_args(args.encyclopedia_arg),
             stream_to_stderr=progress,
         )
-        raw_elib = find_search_elib(mzml, cwd=raw_dir)
-        if raw_elib is None:
+        found_raw = find_search_elib(mzml, cwd=raw_dir)
+        if found_raw is None:
             raise FileNotFoundError(
                 f"per-injection search returned 0 but no .elib for {mzml}"
             )
-        primary_elib = run_dir / elib_name
+        import shutil as _shutil
+        if found_raw.resolve() != raw_elib_canonical.resolve():
+            _shutil.move(str(found_raw), str(raw_elib_canonical))
+        raw_elib = raw_elib_canonical
         if not args.no_collision_filter:
             # The collision filter needs the .dia cache EncyclopeDIA
             # produces from the input. For .raw / .mzML inputs the
