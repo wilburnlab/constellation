@@ -9,13 +9,19 @@ priority. Three meaningful differences from the cartographer original:
   1. **Tryptic digestion goes through ``core.sequence.protein.cleave``**
      instead of cartographer's ``digest_fasta``. Same enzyme registry +
      missed-cleavage enumeration, no functional drift.
-  2. **Alignment tier is inferred from target membership in the
-     reference proteome** when the input rows have a null
-     ``alignment_tier`` column. Cartographer required the user to tag
-     each hit explicitly; Constellation accepts a single combined
-     ``.tab`` with mixed reference + swissprot hits and infers tier
-     internally. Per-row tier annotations on input are still respected
-     when present.
+  2. **Alignment tier is always (re)computed from target membership in
+     the reference proteome.** A hit whose target is in the reference
+     proteome → ``"reference"`` (CIGAR-walked into snp/indel/…); a hit
+     whose target is not → ``"non_reference"`` (short-circuits to the
+     non_reference class). Constellation accepts a single combined
+     ``.tab`` with mixed reference + swissprot hits and decides the tier
+     internally from membership. Any ``alignment_tier`` column already
+     on the input is **replaced** — upstream taggers use their own
+     vocabulary (cartographer's two-tier pass writes ``"refseq"`` /
+     ``"swissprot"``), and trusting a foreign vocabulary mislabels every
+     hit as non_reference. Membership reproduces cartographer's
+     refseq→classify / swissprot→non_reference split exactly when the
+     reference proteome matches the tier-1 alignment DB.
   3. **Flexible tabular inputs** — the function takes plain Arrow tables
      for detected peptides, alignments, and proteomes rather than
      paths-on-disk. The disk-based wrapper that mirrors cartographer's
@@ -291,38 +297,44 @@ def _select_best_hit_per_query(alignments: pa.Table) -> pa.Table:
 def _infer_alignment_tier(
     alignments: pa.Table, reference_protein_ids: set[str]
 ) -> pa.Table:
-    """Fill null ``alignment_tier`` values by checking target membership
-    in ``reference_protein_ids``. Non-null tier values pass through
-    unchanged.
+    """Compute the canonical ``alignment_tier`` from target membership in
+    the reference proteome.
 
-    target ∈ reference → tier = ``"reference"``
-    target ∉ reference → tier = ``"non_reference"``
+    The classifier's notion of "reference" is *"the hit's target is in
+    the reference proteome I was handed"* — that membership is the
+    ground truth, so we ALWAYS recompute it here rather than trusting
+    any pre-existing tier column:
+
+        target ∈ reference → ``"reference"``      (CIGAR-walked → snp/indel/…)
+        target ∉ reference → ``"non_reference"``  (short-circuits to non_reference)
+
+    **Any incoming ``alignment_tier`` column is replaced.** Upstream
+    pipelines tag tiers with their own vocabulary — cartographer's
+    two-tier alignment writes ``"refseq"`` / ``"swissprot"``, not
+    ``"reference"`` / ``"non_reference"`` — and ``classify_single_peptide``
+    only recognises the literal string ``"reference"``. Passing a
+    foreign vocabulary straight through silently mislabels every hit as
+    non_reference (the bug that turned an all-SNP dataset into all
+    non_reference). Recomputing from membership reproduces the
+    refseq→classify / swissprot→non_reference split exactly when the
+    reference proteome is the same DB tier-1 aligned against, and is
+    robust to whatever strings the upstream tagger used.
     """
-    if "alignment_tier" not in alignments.column_names:
-        # Caller passed a table missing the optional column entirely —
-        # synthesise it from inference.
-        targets = alignments.column("target").to_pylist()
-        inferred = [
+    targets = alignments.column("target").to_pylist()
+    tier_arr = pa.array(
+        [
             "reference" if str(t) in reference_protein_ids else "non_reference"
             for t in targets
-        ]
-        return alignments.append_column(
-            "alignment_tier", pa.array(inferred, type=pa.string())
-        )
-    existing = alignments.column("alignment_tier").to_pylist()
-    targets = alignments.column("target").to_pylist()
-    filled = [
-        existing[i]
-        if existing[i] is not None
-        else ("reference" if str(targets[i]) in reference_protein_ids else "non_reference")
-        for i in range(len(existing))
-    ]
-    # Replace the column wholesale to ensure consistent typing
-    return alignments.set_column(
-        alignments.column_names.index("alignment_tier"),
-        "alignment_tier",
-        pa.array(filled, type=pa.string()),
+        ],
+        type=pa.string(),
     )
+    if "alignment_tier" in alignments.column_names:
+        return alignments.set_column(
+            alignments.column_names.index("alignment_tier"),
+            "alignment_tier",
+            tier_arr,
+        )
+    return alignments.append_column("alignment_tier", tier_arr)
 
 
 def classify_novel_peptides(

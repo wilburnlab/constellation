@@ -406,6 +406,62 @@ def test_tier_inference_marks_non_reference_targets() -> None:
     assert result.column("classification").to_pylist() == ["non_reference"]
 
 
+def test_foreign_tier_vocabulary_recomputed_from_membership() -> None:
+    """Regression for the OSC all-non_reference bug: the input .tab
+    carries cartographer's ``refseq`` / ``swissprot`` tier vocabulary
+    (not ``reference`` / ``non_reference``). The classifier must
+    recompute the tier from target membership — a refseq hit whose
+    target IS in the reference proteome must still CIGAR-walk to snp,
+    not short-circuit to non_reference just because the literal string
+    isn't ``"reference"``."""
+    novel = pa.table(
+        {
+            "protein_id": pa.array(["NOVEL_R", "NOVEL_S"]),
+            "sequence": pa.array(["MAGCKLLLLLPPGR", "MAGCKWAVLPPGR"]),
+        }
+    )
+    reference = pa.table(
+        {
+            # REF1 is in the reference proteome (refseq target);
+            # the swissprot target P00552 is NOT.
+            "protein_id": pa.array(["REF1"]),
+            "sequence": pa.array(["MAGCKLLLLAPPGR"]),
+        }
+    )
+    alignments = pa.table(
+        {
+            "query": ["NOVEL_R", "NOVEL_S"],
+            "target": ["REF1", "P00552"],   # refseq-in-ref, swissprot-not-in-ref
+            "evalue": [1e-50, 1e-30],
+            "qstart": [1, 1],
+            "qend": [14, 13],
+            "tstart": [1, 1],
+            "tend": [14, 13],
+            "cigar": ["14M", "13M"],
+            # The foreign vocabulary that broke the real run:
+            "alignment_tier": pa.array(["refseq", "swissprot"], type=pa.string()),
+        }
+    )
+    detected = pa.table(
+        {"peptide_sequence": pa.array(["LLLLLPPGR", "WAVLPPGR"])}
+    )
+    result = classify_novel_peptides(detected, alignments, reference, novel)
+    by_pep = {
+        r["peptide_sequence"]: r["classification"]
+        for r in result.to_pylist()
+    }
+    # refseq hit (target ∈ reference) → CIGAR-walked → snp.
+    assert by_pep["LLLLLPPGR"] == "snp"
+    # swissprot hit (target ∉ reference) → non_reference.
+    assert by_pep["WAVLPPGR"] == "non_reference"
+    # And the OUTPUT tier carries the canonical recomputed vocabulary.
+    tiers = {
+        r["peptide_sequence"]: r["alignment_tier"] for r in result.to_pylist()
+    }
+    assert tiers["LLLLLPPGR"] == "reference"
+    assert tiers["WAVLPPGR"] == "non_reference"
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Deduplication by classification priority
 # ──────────────────────────────────────────────────────────────────────
