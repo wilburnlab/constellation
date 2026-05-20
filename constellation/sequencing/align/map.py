@@ -29,7 +29,9 @@ import threading
 from collections.abc import Iterator
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
+import pyarrow.acero as pa_ac
 import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 
@@ -112,13 +114,15 @@ def _iter_demux_read_batches(
     *,
     only_complete: bool = True,
     batch_size: int = 100_000,
-) -> Iterator[dict[str, list]]:
-    """Stream window-sliced demux records ready for FASTQ formatting.
+) -> Iterator[pa.RecordBatch]:
+    """Stream joined reads ⨝ demux record batches.
 
-    Joins the ``reads/`` partition (read_id, sequence, quality) against
-    the filtered ``read_demux/`` partition (read_id, sample_id,
-    transcript_start, transcript_end), slices each sequence + quality to
-    its transcript window, and yields per-batch column-lists.
+    Builds a single acero ExecPlan: scan ``reads/`` as a dataset on the
+    probe side, hash-build over the filtered ``read_demux/`` table on
+    the build side, inner-join on ``read_id``.  The hash table is
+    constructed **once** and the reads stream through it — the
+    previous implementation rebuilt the join plan per batch, which is
+    catastrophic at 200M-read scale.
 
     Filter when ``only_complete=True`` (default for genome-guided
     quantification — see the chimera-handling discussion in the S2 plan):
@@ -130,16 +134,19 @@ def _iter_demux_read_batches(
           today, lights up when S3 enables multi-segment splitting)
         * ``transcript_start >= 0`` AND ``transcript_end > transcript_start``
 
-    Each yielded dict has equal-length lists under keys ``read_id``,
-    ``sample_id``, ``sequence`` (already window-sliced), ``quality``
-    (already window-sliced; ``'I' * len(seq)`` synthetic Q40 when the
-    source had no quality column).
+    Yields ``pa.RecordBatch`` instances with columns ``read_id``,
+    ``sequence``, ``quality`` (if present on the reads dataset),
+    ``sample_id``, ``transcript_start``, ``transcript_end``.  Window
+    slicing is left to the consumer — the byte buffers + value_offsets
+    are addressable directly without per-row Python string allocation.
 
-    Memory at 200M-read scale: filtered demux index ~10 GB (50 B/row);
-    each yielded batch ~200 MB (100k rows × ~2 KB seq+qual). The demux
-    index sits resident as the join's hash-build side; the reads side
-    streams via ``pa.dataset.to_batches``.
+    ``batch_size`` is unused (preserved for source compatibility with
+    the previous signature); acero chooses its own internal batch size.
+
+    Memory at 200M-read scale: filtered demux index ~10 GB (50 B/row),
+    resident as the hash side; reads streamed via the scan node.
     """
+    del batch_size  # acero handles its own batching
     demux_dir = Path(demux_dir)
     reads_dir = demux_dir / "reads"
     demux_part_dir = demux_dir / "read_demux"
@@ -180,70 +187,124 @@ def _iter_demux_read_batches(
 
     reads_ds = pa_ds.dataset(reads_dir)
     has_quality = "quality" in set(reads_ds.schema.names)
-    columns = ["read_id", "sequence"] + (["quality"] if has_quality else [])
+    reads_columns = ["read_id", "sequence"] + (["quality"] if has_quality else [])
 
-    for batch in reads_ds.to_batches(columns=columns, batch_size=batch_size):
-        if batch.num_rows == 0:
-            continue
-        reads_table = pa.Table.from_batches([batch])
-        joined = reads_table.join(
-            demux_table, keys="read_id", join_type="inner"
-        )
-        if joined.num_rows == 0:
-            continue
+    # Build the streaming plan: dataset scan -> hashjoin with the
+    # in-memory demux table on the right (build) side.
+    scan_node = pa_ac.Declaration(
+        "scan",
+        pa_ac.ScanNodeOptions(reads_ds, columns=reads_columns),
+    )
+    # ``scan`` emits internal __fragment_index / __batch_index /
+    # __last_in_fragment columns; project them away before joining so
+    # they don't end up in the output schema.
+    projection_fields = [pc.field(col) for col in reads_columns]
+    project_node = pa_ac.Declaration(
+        "project",
+        pa_ac.ProjectNodeOptions(projection_fields, reads_columns),
+    )
+    demux_node = pa_ac.Declaration(
+        "table_source",
+        pa_ac.TableSourceNodeOptions(demux_table),
+    )
+    right_output = ["sample_id", "transcript_start", "transcript_end"]
+    join_node = pa_ac.Declaration(
+        "hashjoin",
+        pa_ac.HashJoinNodeOptions(
+            "inner",
+            left_keys=["read_id"],
+            right_keys=["read_id"],
+            left_output=reads_columns,
+            right_output=right_output,
+        ),
+        inputs=[
+            pa_ac.Declaration.from_sequence([scan_node, project_node]),
+            demux_node,
+        ],
+    )
 
-        read_ids = joined.column("read_id").to_pylist()
-        sample_ids = joined.column("sample_id").to_pylist()
-        sequences = joined.column("sequence").to_pylist()
-        if has_quality and "quality" in joined.column_names:
-            qualities = joined.column("quality").to_pylist()
-        else:
-            qualities = [None] * joined.num_rows
-        ts_list = joined.column("transcript_start").to_pylist()
-        te_list = joined.column("transcript_end").to_pylist()
-
-        out_ids: list[str] = []
-        out_samples: list[int] = []
-        out_seqs: list[str] = []
-        out_quals: list[str] = []
-        for read_id, sample_id, seq, qual, ts, te in zip(
-            read_ids, sample_ids, sequences, qualities, ts_list, te_list
-        ):
-            s = seq[ts:te]
-            if not s:
+    reader = join_node.to_reader(use_threads=True)
+    try:
+        for batch in reader:
+            if batch.num_rows == 0:
                 continue
-            if qual is not None and len(qual) == len(seq):
-                q = qual[ts:te]
-            else:
-                # No quality (FASTA-shaped reads) → synthetic Q40 = 'I'
-                q = "I" * len(s)
-            out_ids.append(read_id)
-            out_samples.append(sample_id)
-            out_seqs.append(s)
-            out_quals.append(q)
-        if out_ids:
-            yield {
-                "read_id": out_ids,
-                "sample_id": out_samples,
-                "sequence": out_seqs,
-                "quality": out_quals,
-            }
+            yield batch
+    finally:
+        reader.close()
 
 
-def _format_fastq_bytes(batch: dict[str, list]) -> tuple[bytes, int]:
-    """Encode a batch from :func:`_iter_demux_read_batches` to FASTQ bytes.
+def _string_buf_and_offsets(
+    arr: pa.Array | pa.ChunkedArray,
+) -> tuple[bytes, np.ndarray]:
+    """Extract the raw byte buffer + value_offsets from a StringArray.
 
-    Sample identity is dropped — the byte stream is suitable for piping
-    into a single alignment process (e.g. minimap2 stdin) where the
-    consumer does not care which sample each read came from.
+    Acero's join output may be a ChunkedArray with a single chunk
+    (combine before slicing); the returned offsets are int32 with
+    ``len(arr) + 1`` entries, and ``arr[i] == data[offsets[i]:offsets[i+1]]``.
     """
-    parts = [
-        f"@{rid}\n{seq}\n+\n{qual}\n"
-        for rid, seq, qual in zip(
-            batch["read_id"], batch["sequence"], batch["quality"]
-        )
-    ]
-    return "".join(parts).encode("ascii"), len(parts)
+    if isinstance(arr, pa.ChunkedArray):
+        arr = arr.combine_chunks()
+    if arr.offset != 0:
+        # An Arrow slice keeps a non-zero offset; combine_chunks resets it
+        # for ChunkedArray, but for a single Array we'd need to copy.
+        # Easiest: round-trip through combine_chunks via a 1-chunk Chunked.
+        arr = pa.chunked_array([arr]).combine_chunks()
+    buffers = arr.buffers()
+    offsets = np.frombuffer(buffers[1], dtype=np.int32, count=len(arr) + 1)
+    data = bytes(buffers[2]) if buffers[2] is not None else b""
+    return data, offsets
+
+
+def _format_fastq_bytes(batch: pa.RecordBatch) -> tuple[bytes, int]:
+    """Encode a joined batch to FASTQ ASCII bytes (sample identity dropped).
+
+    Output: ``@read_id\\nsequence[ts:te]\\n+\\nquality[ts:te]\\n`` per row.
+    Suitable for piping into a single alignment process (e.g. minimap2
+    stdin).  Operates on Arrow buffer offsets directly — no per-row
+    Python string allocation.
+    """
+    rid_data, rid_off = _string_buf_and_offsets(batch.column("read_id"))
+    seq_data, seq_off = _string_buf_and_offsets(batch.column("sequence"))
+    has_quality = "quality" in batch.schema.names
+    if has_quality:
+        qual_data, qual_off = _string_buf_and_offsets(batch.column("quality"))
+    else:
+        qual_data, qual_off = b"", None
+    ts = batch.column("transcript_start").to_numpy()
+    te = batch.column("transcript_end").to_numpy()
+
+    out = bytearray()
+    n = 0
+    for i in range(batch.num_rows):
+        ts_i = int(ts[i])
+        te_i = int(te[i])
+        if te_i <= ts_i:
+            continue
+        seq_start = seq_off[i] + ts_i
+        seq_end = seq_off[i] + te_i
+        # Defend against malformed windows that walk past the row's data.
+        row_data_end = seq_off[i + 1]
+        if seq_end > row_data_end:
+            continue
+        out.append(0x40)  # '@'
+        out += rid_data[rid_off[i]:rid_off[i + 1]]
+        out.append(0x0A)  # '\n'
+        out += seq_data[seq_start:seq_end]
+        out += b"\n+\n"
+        if qual_off is not None:
+            q_start = qual_off[i] + ts_i
+            q_end = qual_off[i] + te_i
+            if q_end - q_start == te_i - ts_i:
+                out += qual_data[q_start:q_end]
+            else:
+                # Source had a quality column but this row's value was
+                # null or wrong-length — synthesise Q40 over the window.
+                out += b"I" * (te_i - ts_i)
+        else:
+            out += b"I" * (te_i - ts_i)
+        out.append(0x0A)  # '\n'
+        n += 1
+    return bytes(out), n
 
 
 def map_to_genome(
@@ -253,7 +314,6 @@ def map_to_genome(
     output_dir: Path,
     threads: int = 8,
     only_complete: bool = True,
-    batch_size: int = 100_000,
     extra_minimap2_args: tuple[str, ...] = (),
     progress_cb: ProgressCallback | None = None,
 ) -> Path:
@@ -354,9 +414,10 @@ def map_to_genome(
                 for batch in _iter_demux_read_batches(
                     demux_dir,
                     only_complete=only_complete,
-                    batch_size=batch_size,
                 ):
                     chunk_bytes, n_reads = _format_fastq_bytes(batch)
+                    if n_reads == 0:
+                        continue
                     mm2.stdin.write(chunk_bytes)
                     reads_emitted[0] += n_reads
                     if progress_cb is not None:
