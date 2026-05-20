@@ -202,7 +202,22 @@ def classify_single_peptide(
     # protein at all. If yes, it's a truncation or cutsite-mutation case.
     pep_start_ref = ref_seq_full.find(peptide_seq)
     if pep_start_ref != -1:
-        if pep_start == 0 and pep_start_ref > 0:
+        # Effective N-terminus accounts for initiator-Met excision: a
+        # peptide at protein position 1 whose position-0 residue is the
+        # initiator Met IS the mature N-terminus (search engines emit
+        # this Met-clipped form, so our digest does too). Without this,
+        # Met-clipped N-terminal peptides skip the truncation branch
+        # (pep_start == 1, not 0) and fall through to "unknown".
+        pep_is_nterm = pep_start == 0 or (
+            pep_start == 1 and protein_seq[:1] == "M"
+        )
+        # Truncation: the peptide sits at the novel N-terminus but
+        # appears further into the reference (reference has extra
+        # N-terminal residues the novel protein lacks). Comparing
+        # against pep_start (not literal 0) keeps the Met-clipped case
+        # honest — a peptide at the reference's own mature N-terminus
+        # is not a truncation.
+        if pep_is_nterm and pep_start_ref > pep_start:
             return ("n_terminal_truncation", ref_seq)
         if (
             pep_end == len(protein_seq)
@@ -210,8 +225,18 @@ def classify_single_peptide(
         ):
             return ("c_terminal_truncation", ref_seq)
 
-        novel_left = protein_seq[pep_start - 1] if pep_start > 0 else None
-        ref_left = ref_seq_full[pep_start_ref - 1] if pep_start_ref > 0 else None
+        # Cutsite-mutation: a flanking residue differs, so a SNP outside
+        # the peptide created/removed a tryptic boundary. For an
+        # N-terminal peptide there is no tryptic cut on the left — the
+        # left boundary is the protein start (after Met excision) — so
+        # only the right flank can carry a cutsite mutation. Treating
+        # the Met-clipped left flank ("M") as a tryptic boundary would
+        # spuriously fire this class.
+        if pep_is_nterm:
+            novel_left = ref_left = None
+        else:
+            novel_left = protein_seq[pep_start - 1] if pep_start > 0 else None
+            ref_left = ref_seq_full[pep_start_ref - 1] if pep_start_ref > 0 else None
         novel_right = protein_seq[pep_end] if pep_end < len(protein_seq) else None
         ref_right = (
             ref_seq_full[pep_start_ref + len(peptide_seq)]

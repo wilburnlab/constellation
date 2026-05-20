@@ -113,6 +113,43 @@ def test_classify_n_terminal_truncation() -> None:
     assert cls == "n_terminal_truncation"
 
 
+def test_classify_met_clipped_n_terminal_truncation() -> None:
+    """A Met-clipped N-terminal peptide (initiator Met excised) that the
+    reference extends upstream of must classify as n_terminal_truncation,
+    not unknown/cutsite. The peptide starts at protein position 1 (the M
+    sits at 0), so the effective-N-terminus rule must recognise it."""
+    # Novel:  M[AAAK]GGGGR  → Met-clipped N-term peptide "AAAK" at pos 1
+    # Ref:    PRELUDEAAAKGGGGR  → "AAAK" found at offset 7 (> pep_start 1)
+    novel = "MAAAKGGGGR"
+    ref = "PRELUDEAAAKGGGGR"
+    # Alignment maps novel AAAK (pos 1-4) → ref AAAK (pos 7-10), all-match.
+    hit = _hit(qstart=2, qend=5, tstart=8, tend=11, cigar="4M")
+    refs = {"R1": ref}
+    cls, _ = classify_single_peptide("AAAK", novel, hit, refs)
+    assert cls == "n_terminal_truncation"
+
+
+def test_classify_met_clipped_no_spurious_cutsite() -> None:
+    """A Met-clipped N-terminal peptide whose left 'flank' is the excised
+    Met must NOT fire trypsin_cutsite_mutation off that M — the left
+    boundary is the protein start, not a tryptic cut. Only a right-flank
+    difference is a real cutsite mutation."""
+    # Novel:  M[AAAK]GGGGR   peptide "AAAK" at pos 1; right flank novel = 'G'
+    # Ref:    Q[AAAK]GGGGR   "AAAK" at ref pos 1; right flank ref = 'G' (same)
+    # Left flanks differ (novel 'M' vs ref 'Q') but that's the N-terminus,
+    # so it must NOT be called a cutsite mutation. Peptide is at the
+    # reference's own N-terminus (pep_start_ref == pep_start == 1) so it's
+    # not a truncation either → falls through to unknown (no real event).
+    novel = "MAAAKGGGGR"
+    ref = "QAAAKGGGGR"
+    hit = _hit(qstart=2, qend=5, tstart=2, tend=5, cigar="4M")
+    refs = {"R1": ref}
+    cls, _ = classify_single_peptide("AAAK", novel, hit, refs)
+    # The left-flank M/Q difference is the N-terminus, not a cut site,
+    # so cutsite must NOT fire; right flanks match → no event → unknown.
+    assert cls != "trypsin_cutsite_mutation"
+
+
 def test_classify_c_terminal_truncation() -> None:
     """Peptide flush at novel C-terminus; reference extends further downstream."""
     novel = "MKPR"
