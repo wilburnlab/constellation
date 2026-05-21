@@ -176,79 +176,94 @@ def aggregate_junctions(
         if alignments.num_rows == 0:
             return INTRON_TABLE.empty_table()
 
-    # Arrow-native: join blocks × primary on alignment_id (multithreaded
-    # C++), attach contig_id via second join with the contigs table, then
-    # sort once on (alignment_id, block_index). Junction pairs fall out of
-    # a torch boolean mask on consecutive rows.
-    primary = alignments.select(
-        ["alignment_id", "read_id", "ref_name", "strand"]
-    )
-    joined = alignment_blocks.join(primary, keys="alignment_id", join_type="inner")
-    if joined.num_rows == 0:
+    # Arrow-native strategy — at mouse / PromethION scale the 1.6B-row
+    # alignment_blocks table is the dominant working set. We keep
+    # `read_id` (a ~30-byte string column) OUT of the heavy sort by
+    # deferring the primary-table enrichment until AFTER junction
+    # detection: sort blocks-numeric-only, find junctions in torch,
+    # then attach `read_id` / `ref_name` / `strand` to the much smaller
+    # junctions table via two small Arrow joins. Counting supporting
+    # reads per junction becomes `count(alignment_id)` since alignment_id
+    # is 1:1 with read_id for primary alignments.
+    primary_min = alignments.select(["alignment_id", "ref_name", "strand"])
+
+    # Filter blocks to those belonging to primary alignments. Using
+    # `pc.is_in` as a semi-join keeps the blocks table as a single
+    # input to the sort instead of carrying primary's columns along.
+    primary_aids = primary_min.column("alignment_id")
+    blocks_min = alignment_blocks.select(
+        ["alignment_id", "block_index", "ref_start", "ref_end"]
+    ).filter(pc.is_in(alignment_blocks.column("alignment_id"), primary_aids))
+    if blocks_min.num_rows < 2:
         return INTRON_TABLE.empty_table()
 
-    contig_lookup = genome.contigs.select(["contig_id", "name"]).rename_columns(
-        ["contig_id", "ref_name"]
-    )
-    joined = joined.join(contig_lookup, keys="ref_name", join_type="inner")
-    if joined.num_rows < 2:
-        return INTRON_TABLE.empty_table()
-
-    joined = joined.sort_by(
+    # Sort blocks-only (4 int64/int32 columns, no strings). This is the
+    # operation the wide-table predecessor pinned on at mouse scale —
+    # the prior version sorted 14 columns including a ~50 GB `read_id`
+    # string column and then `combine_chunks`'d the entire result,
+    # whose offsets-rewrite is partially single-threaded.
+    blocks_sorted = blocks_min.sort_by(
         [("alignment_id", "ascending"), ("block_index", "ascending")]
     ).combine_chunks()
 
-    # Bridge numeric columns to torch (zero-copy via numpy). After
-    # combine_chunks() each column has a single chunk so to_numpy()
-    # zero-copies the Arrow buffer into a numpy view; torch.from_numpy
-    # then borrows that view. String columns (strand, read_id) stay in
-    # Arrow — pc.take on the donor-row slice picks the per-junction
-    # values without a Python loop.
     def _col_to_torch(col_name: str) -> torch.Tensor:
         return torch.from_numpy(
-            joined.column(col_name).chunk(0).to_numpy(zero_copy_only=True)
+            blocks_sorted.column(col_name).chunk(0).to_numpy(zero_copy_only=True)
         )
 
     aid_t = _col_to_torch("alignment_id")
     rstart_t = _col_to_torch("ref_start")
     rend_t = _col_to_torch("ref_end")
-    contig_t = _col_to_torch("contig_id")
 
     same_aid = aid_t[1:] == aid_t[:-1]
-    n_junctions = int(same_aid.sum().item())
-    if n_junctions == 0:
+    if not bool(same_aid.any().item()):
         return INTRON_TABLE.empty_table()
 
+    # Per-junction: alignment_id from donor row (== acceptor row's
+    # alignment_id, by same_aid mask), donor_pos = donor row's ref_end,
+    # acceptor_pos = next row's ref_start.
+    junction_aid = aid_t[:-1][same_aid].numpy()
     donor_pos = rend_t[:-1][same_aid].numpy()
     acceptor_pos = rstart_t[1:][same_aid].numpy()
-    junction_contig = contig_t[:-1][same_aid].numpy()
-
-    donor_row_idx = torch.nonzero(same_aid, as_tuple=False).squeeze(1)
-    donor_row_idx_pa = pa.array(donor_row_idx.numpy())
-    n_rows = joined.num_rows
-    strand_donor_rows = pc.take(
-        joined.column("strand").slice(0, n_rows - 1), donor_row_idx_pa
-    )
-    read_id_donor_rows = pc.take(
-        joined.column("read_id").slice(0, n_rows - 1), donor_row_idx_pa
-    )
 
     junctions = pa.table(
         {
-            "contig_id": pa.array(junction_contig),
-            "donor_pos": pa.array(donor_pos),
-            "acceptor_pos": pa.array(acceptor_pos),
-            "strand": strand_donor_rows,
-            "read_id": read_id_donor_rows,
+            "alignment_id": pa.array(junction_aid, type=pa.int64()),
+            "donor_pos": pa.array(donor_pos, type=pa.int64()),
+            "acceptor_pos": pa.array(acceptor_pos, type=pa.int64()),
         }
     )
 
-    # group_by + count_distinct replaces today's per-junction set[str_read_id].
+    # Attach ref_name + strand from primary; contig_id from contigs.
+    # Both joins are now on the (smaller) junctions table — `ref_name`
+    # and `strand` strings land here, not on the 1.6B-row blocks table.
+    junctions = junctions.join(
+        primary_min, keys="alignment_id", join_type="inner"
+    )
+    contig_lookup = genome.contigs.select(["contig_id", "name"]).rename_columns(
+        ["contig_id", "ref_name"]
+    )
+    junctions = junctions.join(
+        contig_lookup, keys="ref_name", join_type="inner"
+    )
+    if junctions.num_rows == 0:
+        return INTRON_TABLE.empty_table()
+
+    # Each row of `junctions` is a unique (alignment_id, donor, acceptor)
+    # tuple by construction (one junction per consecutive same-aid block
+    # pair in the sorted table). For primary alignments alignment_id is
+    # 1:1 with read_id, so `count(alignment_id)` per (contig, donor,
+    # acceptor, strand) equals `count_distinct(read_id)` — a plain
+    # `count` aggregation is much cheaper than `count_distinct`.
     aggregated = junctions.group_by(
         ["contig_id", "donor_pos", "acceptor_pos", "strand"]
-    ).aggregate([("read_id", "count_distinct")])
+    ).aggregate([("alignment_id", "count")])
     if aggregated.num_rows == 0:
         return INTRON_TABLE.empty_table()
+    aggregated = aggregated.rename_columns(
+        [c if c != "alignment_id_count" else "read_id_count_distinct"
+         for c in aggregated.column_names]
+    )
 
     # Sort to match today's deterministic output order:
     # (contig_id, donor_pos, acceptor_pos, strand) ascending.
