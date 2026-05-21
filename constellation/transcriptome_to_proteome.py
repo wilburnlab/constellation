@@ -1218,6 +1218,22 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             if src.exists() and not target.exists():
                 target.symlink_to(src)
 
+        def _colocate_spectra(target: Path, src: Path) -> None:
+            # HARD-link the spectra file, not symlink: EncyclopeDIA's native
+            # Thermo reader (MSRawJava / ThermoFisher RawFileReader) fails to
+            # open a .raw through a symlink ("instrument index not available"),
+            # even though the search read the same file fine at its real path.
+            # A hard link is an ordinary directory entry on the same inode —
+            # indistinguishable from the original to the reader. Falls back to
+            # a symlink only if the link target is on another filesystem.
+            if not src.exists() or target.exists():
+                return
+            try:
+                import os
+                os.link(src, target)
+            except OSError:
+                target.symlink_to(src)
+
         n_export_inputs = 0
         for mzml in injection_files:
             sample_dir = _sanitise_dirname(mzml.parent.name)
@@ -1225,9 +1241,9 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             elibs = sorted(run_dir.glob("*.elib"))
             if not elibs:
                 continue
-            # spectra + the per-run chromatogram .elib, named <raw>.elib so
-            # libexport pairs it with the spectra file.
-            _link(export_input_dir / mzml.name, mzml)
+            # spectra (hard-linked) + the per-run chromatogram .elib, named
+            # <raw>.elib so libexport pairs it with the spectra file.
+            _colocate_spectra(export_input_dir / mzml.name, mzml)
             _link(export_input_dir / f"{mzml.name}.elib", elibs[0])
             # Percolator / feature sidecars EncyclopeDIA wrote next to the
             # source raw (<raw>.features.txt, <raw>.encyclopedia.txt, ...).
