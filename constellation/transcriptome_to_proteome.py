@@ -1202,28 +1202,40 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     if not _stage_done(stage_dir, args.resume):
         _log("Stage 10: library-export → quant_report.elib")
         stage_dir.mkdir(parents=True, exist_ok=True)
-        # EncyclopeDIA -libexport scans -i for the spectra files (.raw /
-        # .mzML) and pairs each with its sibling <stem>.elib search result
-        # — it is NOT a directory of bare .elib files. Mirror EncyclopeDIA's
-        # own search-output layout: symlink each injection's original
-        # spectra file next to its filtered <stem>.elib in one flat dir.
+        # EncyclopeDIA -libexport reconstructs each run's analysis from the
+        # files sitting next to its spectra file: <X.raw>, <X.raw>.elib
+        # (per-run chromatogram library), and the Percolator/feature
+        # sidecars <X.raw>.features.txt / <X.raw>.encyclopedia.txt. The
+        # Stage 9 search SPLIT these — the .elib landed in the run dir, but
+        # EncyclopeDIA wrote the feature/percolator sidecars next to the
+        # SOURCE raw — so co-locate the full native-named set in one flat
+        # dir. A dir of bare .elib files (or a renamed elib) fails with
+        # "Missing feature file" / "Can't find any representative jobs".
         export_input_dir = stage_dir / "_per_injection_elibs"
         export_input_dir.mkdir(parents=True, exist_ok=True)
+
+        def _link(target: Path, src: Path) -> None:
+            if src.exists() and not target.exists():
+                target.symlink_to(src)
+
         n_export_inputs = 0
         for mzml in injection_files:
             sample_dir = _sanitise_dirname(mzml.parent.name)
-            elib = (
-                output_dir / "09_per_injection" / sample_dir / mzml.stem
-                / f"{mzml.stem}.elib"
-            )
-            if not elib.is_file():
+            run_dir = output_dir / "09_per_injection" / sample_dir / mzml.stem
+            elibs = sorted(run_dir.glob("*.elib"))
+            if not elibs:
                 continue
-            raw_link = export_input_dir / mzml.name
-            elib_link = export_input_dir / f"{mzml.stem}.elib"
-            if not raw_link.exists():
-                raw_link.symlink_to(mzml)
-            if not elib_link.exists():
-                elib_link.symlink_to(elib)
+            # spectra + the per-run chromatogram .elib, named <raw>.elib so
+            # libexport pairs it with the spectra file.
+            _link(export_input_dir / mzml.name, mzml)
+            _link(export_input_dir / f"{mzml.name}.elib", elibs[0])
+            # Percolator / feature sidecars EncyclopeDIA wrote next to the
+            # source raw (<raw>.features.txt, <raw>.encyclopedia.txt, ...).
+            # Skip the diagnostic PDFs.
+            for sidecar in mzml.parent.glob(f"{mzml.name}.*"):
+                if sidecar.suffix.lower() == ".pdf":
+                    continue
+                _link(export_input_dir / sidecar.name, sidecar)
             n_export_inputs += 1
         if n_export_inputs == 0:
             raise FileNotFoundError(
@@ -1244,6 +1256,16 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             extra_args=_passthrough_args(args.encyclopedia_arg),
             stream_to_stderr=progress,
         )
+        # libexport can exit 0 without writing a report (e.g. it found no
+        # usable per-run analyses). Fail loudly instead of faking success.
+        if not quant_report_elib.is_file():
+            raise FileNotFoundError(
+                f"Stage 10: library-export exited {result.returncode} but did "
+                f"not write {quant_report_elib.name}. Check {stage_dir / 'logs'}"
+                " — 'Missing feature file' / 'Can't find any representative "
+                "jobs' means the per-injection analysis set (.elib + "
+                ".features.txt + .encyclopedia.txt) wasn't co-located."
+            )
         _maybe_auto_ingest_elib(
             quant_report_elib, stage_dir, args.no_ingest,
         )

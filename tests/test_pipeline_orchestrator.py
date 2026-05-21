@@ -224,6 +224,10 @@ def stub_inputs(tmp_path) -> dict:
     gpf.write_text("")
     inj = tmp_path / "sample01.mzML"
     inj.write_text("")
+    # EncyclopeDIA's search writes Percolator/feature sidecars next to the
+    # source spectra file; Stage 10 must co-locate them for -libexport.
+    (tmp_path / "sample01.mzML.features.txt").write_text("stub-features")
+    (tmp_path / "sample01.mzML.encyclopedia.txt").write_text("stub-perc")
     out = tmp_path / "out"
     return {
         "protein_counts": counts,
@@ -526,12 +530,14 @@ def test_orchestrator_threads_fasta_to_library_export(
     )
     assert stub_external_calls["export_fasta"] == combined_fasta
 
-    # -libexport scans -i for spectra files paired with <stem>.elib — the
-    # export dir must contain the injection's .mzML/.raw, not just .elibs.
+    # -libexport reconstructs each run's analysis from a co-located set:
+    # the spectra file, <raw>.elib, and the percolator/feature sidecars.
     export_dir = stub_external_calls["export_dir"]
     names = {p.name for p in export_dir.iterdir()}
-    assert any(n.endswith((".mzML", ".raw")) for n in names), names
-    assert any(n.endswith(".elib") for n in names), names
+    assert "sample01.mzML" in names, names                  # spectra
+    assert "sample01.mzML.elib" in names, names             # per-run chromatogram lib
+    assert "sample01.mzML.features.txt" in names, names     # percolator features
+    assert "sample01.mzML.encyclopedia.txt" in names, names # percolator PSMs
 
 
 def test_orchestrator_resume_short_circuit(
