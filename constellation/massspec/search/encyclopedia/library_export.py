@@ -45,7 +45,7 @@ def build_library_export_args(
         -o <output_elib>         # consolidated quant report
         -a true|false            # RT-align across input files (default true)
         [-blib]                  # write BLIB instead of ELIB
-        [-f <fasta>]             # required for Pecan / XCorDIA sub-modes only
+        [-f <fasta>]             # fasta database — REQUIRED by 6.5.15 -libexport
     """
     args: list[str] = [
         "-libexport",

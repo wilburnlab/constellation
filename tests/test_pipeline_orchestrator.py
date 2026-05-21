@@ -377,7 +377,10 @@ def stub_external_calls(monkeypatch, tmp_path) -> dict:
 
         return _R()
 
-    def _fake_run_library_export(*, output_elib, output_dir, **kw):
+    def _fake_run_library_export(*, output_elib, output_dir, fasta=None, **kw):
+        # EncyclopeDIA 6.5.15 -libexport REQUIRES -f <fasta>; capture it so
+        # the regression test can assert Stage 10 threads the combined FASTA.
+        state["export_fasta"] = fasta
         Path(output_elib).write_text("stub-quant-elib")
         state["calls"].append(("library_export", str(output_elib)))
 
@@ -501,6 +504,24 @@ def test_orchestrator_threads_fasta_to_every_search(
     assert all(f == combined_fasta for f in fastas), (
         f"some search calls missing the combined FASTA: {fastas}"
     )
+
+
+def test_orchestrator_threads_fasta_to_library_export(
+    stub_inputs, stub_external_calls
+) -> None:
+    """EncyclopeDIA 6.5.15 -libexport REQUIRES -f <fasta>. Stage 10 must
+    pass the combined FASTA — regression guard for the missing-fasta
+    failure on the first real OSC quant-report run."""
+    from constellation.transcriptome_to_proteome import (
+        run_transcriptome_to_proteomics,
+    )
+
+    args = _build_args(stub_inputs)
+    assert run_transcriptome_to_proteomics(args=args) == 0
+    combined_fasta = (
+        stub_inputs["output_dir"] / "04_combined_fasta" / "combined.fasta"
+    )
+    assert stub_external_calls["export_fasta"] == combined_fasta
 
 
 def test_orchestrator_resume_short_circuit(

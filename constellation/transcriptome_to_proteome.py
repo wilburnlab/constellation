@@ -1222,6 +1222,8 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             library=gpf_elib_primary,
             output_elib=quant_report_elib,
             output_dir=stage_dir,
+            # EncyclopeDIA 6.5.15 -libexport requires -f <fasta>.
+            fasta=combined_path,
             align=True,
             jvm_heap_max=args.jvm_heap_max,
             jvm_heap_min=args.jvm_heap_min,
