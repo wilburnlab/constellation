@@ -200,45 +200,50 @@ def aggregate_junctions(
         if alignments.num_rows == 0:
             return INTRON_TABLE.empty_table()
 
-    primary = alignments.select(
-        ["alignment_id", "read_id", "ref_name", "strand"]
+    # Pair adjacent blocks on the BLOCKS table alone (all-integer columns)
+    # before attaching any read_id/ref_name strings. The earlier approach
+    # joined read_id onto every block first and sorted that wide table —
+    # at PromethION scale the read_id column blew the 2 GiB int32 string
+    # offset (overflow in sort_by's take) and the large_string workaround
+    # then doubled transient memory and OOM-aborted. Sorting integers only,
+    # then attaching strings to the (smaller) junction set, sidesteps both.
+    blocks = alignment_blocks.select(
+        ["alignment_id", "block_index", "ref_start", "ref_end"]
     )
-    joined = alignment_blocks.join(primary, keys="alignment_id", join_type="inner")
-    if joined.num_rows < 2:
+    if blocks.num_rows < 2:
         return INTRON_TABLE.empty_table()
-
-    # At PromethION scale the read_id / ref_name string columns exceed the
-    # 2 GiB int32 offset budget; sort_by's internal `take` then raises
-    # "offset overflow while concatenating arrays". Cast string columns to
-    # large_string (64-bit offsets) before the sort. The output table is
-    # rebuilt with plain string types below, so this stays internal.
-    joined = _strings_to_large_string(joined)
-
-    # Sort by (alignment_id, block_index) so adjacent rows within each
-    # alignment form a donor/acceptor candidate pair via a one-row shift.
-    joined = joined.sort_by(
+    blocks = blocks.sort_by(
         [("alignment_id", "ascending"), ("block_index", "ascending")]
     )
 
-    n = joined.num_rows
-    # Slice columns into "current" (rows 0..n-2) and "next" (rows 1..n-1).
-    # Pairs where current.alignment_id == next.alignment_id correspond to
-    # adjacent blocks within the same alignment — i.e. one observed
-    # splice junction. Pairs across alignment boundaries get masked out.
-    aid_curr = joined.column("alignment_id").slice(0, n - 1)
-    aid_next = joined.column("alignment_id").slice(1, n - 1)
+    n = blocks.num_rows
+    # Slice into "current" (rows 0..n-2) and "next" (rows 1..n-1). Pairs
+    # where current.alignment_id == next.alignment_id are adjacent blocks
+    # within one alignment — i.e. one observed splice junction (donor =
+    # current.ref_end, acceptor = next.ref_start). Cross-alignment pairs
+    # are masked out.
+    aid_curr = blocks.column("alignment_id").slice(0, n - 1)
+    aid_next = blocks.column("alignment_id").slice(1, n - 1)
     same_alignment = pc.equal(aid_curr, aid_next)
 
-    obs = pa.table(
+    pairs = pa.table(
         {
             "alignment_id": aid_curr,
-            "read_id": joined.column("read_id").slice(0, n - 1),
-            "ref_name": joined.column("ref_name").slice(0, n - 1),
-            "strand": joined.column("strand").slice(0, n - 1),
-            "donor": joined.column("ref_end").slice(0, n - 1),
-            "acceptor": joined.column("ref_start").slice(1, n - 1),
+            "donor": blocks.column("ref_end").slice(0, n - 1),
+            "acceptor": blocks.column("ref_start").slice(1, n - 1),
         }
     ).filter(same_alignment)
+    if pairs.num_rows == 0:
+        return INTRON_TABLE.empty_table()
+
+    # Attach read_id / ref_name / strand to the (smaller) junction set via
+    # a per-alignment join. read_id can still exceed the 2 GiB string-offset
+    # budget at the group_by below, so cast strings to large_string here.
+    primary = alignments.select(
+        ["alignment_id", "read_id", "ref_name", "strand"]
+    )
+    obs = pairs.join(primary, keys="alignment_id", join_type="inner")
+    obs = _strings_to_large_string(obs)
     if obs.num_rows == 0:
         return INTRON_TABLE.empty_table()
 
