@@ -1226,10 +1226,18 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             # A hard link is an ordinary directory entry on the same inode —
             # indistinguishable from the original to the reader. Falls back to
             # a symlink only if the link target is on another filesystem.
-            if not src.exists() or target.exists():
+            #
+            # Self-healing: replace a stale symlink left by an earlier run so
+            # the hard link actually takes effect without a manual rm -rf.
+            import os
+            if not src.exists():
                 return
+            if target.is_symlink() or target.exists():
+                if target.is_symlink():
+                    target.unlink()  # upgrade stale symlink → hard link
+                else:
+                    return  # already a real file (hard link) — keep it
             try:
-                import os
                 os.link(src, target)
             except OSError:
                 target.symlink_to(src)

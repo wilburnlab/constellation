@@ -538,6 +538,9 @@ def test_orchestrator_threads_fasta_to_library_export(
     assert "sample01.mzML.elib" in names, names             # per-run chromatogram lib
     assert "sample01.mzML.features.txt" in names, names     # percolator features
     assert "sample01.mzML.encyclopedia.txt" in names, names # percolator PSMs
+    # The spectra file is HARD-linked, not symlinked — EncyclopeDIA's native
+    # Thermo reader can't open a .raw through a symlink.
+    assert not (export_dir / "sample01.mzML").is_symlink()
 
 
 def test_orchestrator_resume_short_circuit(
