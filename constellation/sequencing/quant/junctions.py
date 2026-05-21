@@ -55,6 +55,23 @@ from constellation.sequencing.schemas.alignment import INTRON_TABLE
 # ──────────────────────────────────────────────────────────────────────
 
 
+def _strings_to_large_string(table: pa.Table) -> pa.Table:
+    """Cast every ``string`` column to ``large_string``.
+
+    Arrow's ``string`` type uses 32-bit offsets, so a single column whose
+    total bytes exceed 2 GiB overflows during ``sort_by`` / ``take``
+    ("offset overflow while concatenating arrays"). At PromethION scale
+    the per-block ``read_id`` / ``ref_name`` columns cross that limit.
+    ``large_string`` uses 64-bit offsets.
+    """
+    for i, field in enumerate(table.schema):
+        if pa.types.is_string(field.type):
+            table = table.set_column(
+                i, field.name, pc.cast(table.column(i), pa.large_string())
+            )
+    return table
+
+
 def _contig_id_lookup(contigs: pa.Table) -> dict[str, int]:
     """``CONTIG_TABLE.name`` → ``contig_id``."""
     return {
@@ -189,6 +206,13 @@ def aggregate_junctions(
     joined = alignment_blocks.join(primary, keys="alignment_id", join_type="inner")
     if joined.num_rows < 2:
         return INTRON_TABLE.empty_table()
+
+    # At PromethION scale the read_id / ref_name string columns exceed the
+    # 2 GiB int32 offset budget; sort_by's internal `take` then raises
+    # "offset overflow while concatenating arrays". Cast string columns to
+    # large_string (64-bit offsets) before the sort. The output table is
+    # rebuilt with plain string types below, so this stays internal.
+    joined = _strings_to_large_string(joined)
 
     # Sort by (alignment_id, block_index) so adjacent rows within each
     # alignment form a donor/acceptor candidate pair via a one-row shift.
