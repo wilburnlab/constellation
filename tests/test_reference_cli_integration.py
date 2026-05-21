@@ -173,7 +173,7 @@ def test_reference_link_creates_symlinks(isolated_cache, tmp_path):
 
 
 def test_reference_link_force_overwrites(isolated_cache, tmp_path):
-    rel = _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
     target = tmp_path / "analysis"
     target.mkdir()
     (target / "genome").mkdir()  # pre-existing directory blocks symlink
@@ -294,3 +294,138 @@ def test_reference_where_missing_handle_exits_nonzero(isolated_cache, capsys):
     rc = main(["reference", "where", "nonexistent"])
     assert rc == 1
     assert "no cached reference" in capsys.readouterr().err
+
+
+# ──────────────────────────────────────────────────────────────────────
+# reference remove
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_cli_remove_qualified(isolated_cache, capsys):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    rc = main(["reference", "remove", "homo_sapiens@ensembl-111"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "removed homo_sapiens@ensembl-111" in out
+    assert not (isolated_cache / "homo_sapiens").exists()
+
+
+def test_cli_remove_bare_unambiguous(isolated_cache, capsys):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    rc = main(["reference", "remove", "homo_sapiens"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "removed homo_sapiens@ensembl-111" in out
+    assert "removed organism dir homo_sapiens" in out
+    assert not (isolated_cache / "homo_sapiens").exists()
+
+
+def test_cli_remove_bare_ambiguous_errors(isolated_cache, capsys):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    _populate(isolated_cache, "homo_sapiens", "ensembl-112")
+    rc = main(["reference", "remove", "homo_sapiens"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "ambiguous" in err
+    assert "ensembl-111" in err and "ensembl-112" in err
+    # Nothing was deleted.
+    assert (isolated_cache / "homo_sapiens" / "ensembl-111").is_dir()
+    assert (isolated_cache / "homo_sapiens" / "ensembl-112").is_dir()
+
+
+def test_cli_remove_unknown_organism_exits_1(isolated_cache, capsys):
+    rc = main(["reference", "remove", "nonexistent"])
+    assert rc == 1
+    assert "no cached releases" in capsys.readouterr().err
+
+
+def test_cli_remove_unknown_qualified_handle_exits_1(isolated_cache, capsys):
+    rc = main(["reference", "remove", "homo_sapiens@ensembl-111"])
+    assert rc == 1
+    assert "nothing to remove" in capsys.readouterr().err
+
+
+def test_cli_remove_retargets_defaults_and_current(isolated_cache, capsys):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    _populate(isolated_cache, "homo_sapiens", "ensembl-112")
+    ref_handle.set_default("homo_sapiens", "ensembl-111")
+    update_current_pointer(isolated_cache / "homo_sapiens", "ensembl-111")
+    rc = main(["reference", "remove", "homo_sapiens@ensembl-111"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "retargeted defaults.toml: homo_sapiens → ensembl-112" in out
+    assert "retargeted current pointer: homo_sapiens → ensembl-112" in out
+    assert ref_handle.read_defaults()["homo_sapiens"] == "ensembl-112"
+
+
+def test_cli_remove_all_releases_with_yes(isolated_cache, capsys):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    _populate(isolated_cache, "homo_sapiens", "ensembl-112")
+    ref_handle.set_default("homo_sapiens", "ensembl-111")
+    rc = main(["reference", "remove", "homo_sapiens", "--all-releases", "-y"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "removed homo_sapiens@ensembl-111" in out
+    assert "removed homo_sapiens@ensembl-112" in out
+    assert "no releases remaining" in out
+    assert not (isolated_cache / "homo_sapiens").exists()
+    assert "homo_sapiens" not in ref_handle.read_defaults()
+
+
+def test_cli_remove_all_releases_prompt_declined(isolated_cache, capsys, monkeypatch):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    _populate(isolated_cache, "homo_sapiens", "ensembl-112")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
+    rc = main(["reference", "remove", "homo_sapiens", "--all-releases"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "aborted" in err
+    # Nothing was deleted.
+    assert (isolated_cache / "homo_sapiens" / "ensembl-111").is_dir()
+    assert (isolated_cache / "homo_sapiens" / "ensembl-112").is_dir()
+
+
+def test_cli_remove_all_releases_prompt_accepted(isolated_cache, capsys, monkeypatch):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+    rc = main(["reference", "remove", "homo_sapiens", "--all-releases"])
+    assert rc == 0
+    assert not (isolated_cache / "homo_sapiens").exists()
+
+
+def test_cli_remove_dry_run_single(isolated_cache, capsys):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    ref_handle.set_default("homo_sapiens", "ensembl-111")
+    rc = main(["reference", "remove", "homo_sapiens@ensembl-111", "--dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "would remove homo_sapiens@ensembl-111" in out
+    assert "would unset defaults.toml" in out
+    assert "would remove organism dir" in out
+    # Dry-run didn't actually touch anything.
+    assert (isolated_cache / "homo_sapiens" / "ensembl-111").is_dir()
+    assert "homo_sapiens" in ref_handle.read_defaults()
+
+
+def test_cli_remove_dry_run_all(isolated_cache, capsys):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    _populate(isolated_cache, "homo_sapiens", "ensembl-112")
+    rc = main(["reference", "remove", "homo_sapiens", "--all-releases", "--dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "would remove 2 release(s)" in out
+    assert "would remove homo_sapiens@ensembl-111" in out
+    assert "would remove homo_sapiens@ensembl-112" in out
+    # Still on disk.
+    assert (isolated_cache / "homo_sapiens" / "ensembl-111").is_dir()
+    assert (isolated_cache / "homo_sapiens" / "ensembl-112").is_dir()
+
+
+def test_cli_remove_qualified_with_all_releases_is_usage_error(isolated_cache, capsys):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    rc = main(["reference", "remove", "homo_sapiens@ensembl-111", "--all-releases"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--all-releases requires a bare" in err
+    # Nothing was deleted.
+    assert (isolated_cache / "homo_sapiens" / "ensembl-111").is_dir()
