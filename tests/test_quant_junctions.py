@@ -19,7 +19,6 @@ import pytest
 from constellation.sequencing.annotation.annotation import Annotation
 from constellation.sequencing.quant.junctions import (
     _aggregate_junctions_legacy,
-    _strings_to_large_string,
     aggregate_junctions,
 )
 from constellation.sequencing.reference.reference import GenomeReference
@@ -106,28 +105,17 @@ def _blocks(rows: list[dict]) -> pa.Table:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_strings_to_large_string_casts_only_strings() -> None:
-    """String columns become large_string (64-bit offsets, avoids the
-    PromethION-scale offset-overflow in sort_by); other columns untouched."""
-    t = pa.table(
-        {
-            "alignment_id": pa.array([1, 2], type=pa.int64()),
-            "read_id": pa.array(["rA", "rB"], type=pa.string()),
-            "ref_name": pa.array(["chr1", "chr1"], type=pa.string()),
-        }
-    )
-    out = _strings_to_large_string(t)
-    assert out.schema.field("alignment_id").type == pa.int64()
-    assert out.schema.field("read_id").type == pa.large_string()
-    assert out.schema.field("ref_name").type == pa.large_string()
-    assert out.column("read_id").to_pylist() == ["rA", "rB"]
-
-
 def test_aggregate_junctions_accepts_large_string_columns() -> None:
-    """aggregate_junctions works when the block/alignment string columns
-    are already large_string (the post-cast state at scale)."""
-    al = _strings_to_large_string(
-        _alignments([_alignment(alignment_id=1, read_id="rA")])
+    """aggregate_junctions tolerates large_string alignment string columns
+    (which can arise upstream at scale) and still emits a plain-string
+    INTRON_TABLE."""
+    import pyarrow.compute as pc
+
+    al = _alignments([_alignment(alignment_id=1, read_id="rA")])
+    al = al.set_column(
+        al.schema.get_field_index("ref_name"),
+        "ref_name",
+        pc.cast(al.column("ref_name"), pa.large_string()),
     )
     blocks = _blocks(
         [
@@ -137,8 +125,8 @@ def test_aggregate_junctions_accepts_large_string_columns() -> None:
     )
     out = aggregate_junctions(blocks, al, _genome())
     assert out.num_rows == 1
-    assert out.schema == out.schema  # conforms to INTRON_TABLE (string strand)
     assert out.column("strand").type == pa.string()
+    assert out.column("read_count").to_pylist() == [1]
 
 
 def test_two_reads_same_junction_collapse_to_one_row() -> None:

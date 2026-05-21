@@ -55,23 +55,6 @@ from constellation.sequencing.schemas.alignment import INTRON_TABLE
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _strings_to_large_string(table: pa.Table) -> pa.Table:
-    """Cast every ``string`` column to ``large_string``.
-
-    Arrow's ``string`` type uses 32-bit offsets, so a single column whose
-    total bytes exceed 2 GiB overflows during ``sort_by`` / ``take``
-    ("offset overflow while concatenating arrays"). At PromethION scale
-    the per-block ``read_id`` / ``ref_name`` columns cross that limit.
-    ``large_string`` uses 64-bit offsets.
-    """
-    for i, field in enumerate(table.schema):
-        if pa.types.is_string(field.type):
-            table = table.set_column(
-                i, field.name, pc.cast(table.column(i), pa.large_string())
-            )
-    return table
-
-
 def _contig_id_lookup(contigs: pa.Table) -> dict[str, int]:
     """``CONTIG_TABLE.name`` → ``contig_id``."""
     return {
@@ -236,14 +219,14 @@ def aggregate_junctions(
     if pairs.num_rows == 0:
         return INTRON_TABLE.empty_table()
 
-    # Attach read_id / ref_name / strand to the (smaller) junction set via
-    # a per-alignment join. read_id can still exceed the 2 GiB string-offset
-    # budget at the group_by below, so cast strings to large_string here.
-    primary = alignments.select(
-        ["alignment_id", "read_id", "ref_name", "strand"]
-    )
+    # Attach ref_name / strand to the (smaller) junction set via a
+    # per-alignment join. read_id is deliberately NOT carried: under
+    # primary_only (one primary alignment per read) a given junction gets
+    # at most one row per read, so the distinct-read count equals a plain
+    # row count — and dropping read_id avoids both the large_string column
+    # and the Acero count_distinct that OOM-aborted at ~85M junction rows.
+    primary = alignments.select(["alignment_id", "ref_name", "strand"])
     obs = pairs.join(primary, keys="alignment_id", join_type="inner")
-    obs = _strings_to_large_string(obs)
     if obs.num_rows == 0:
         return INTRON_TABLE.empty_table()
 
@@ -261,12 +244,13 @@ def aggregate_junctions(
     if obs.num_rows == 0:
         return INTRON_TABLE.empty_table()
 
-    # Group by (contig_id, donor, acceptor, strand) and count distinct
-    # read_ids. This is the cross-read aggregation step — replaces the
-    # old `counts: dict[..., set[str]]` Python build.
+    # Group by (contig_id, donor, acceptor, strand); read_count is the
+    # per-junction row count (== distinct supporting reads under
+    # primary_only — see the join comment above). A plain `count` replaces
+    # the old `count_distinct(read_id)`, which Acero aborted on at scale.
     grouped = obs.group_by(
         ["contig_id", "donor", "acceptor", "strand"]
-    ).aggregate([("read_id", "count_distinct")])
+    ).aggregate([("donor", "count")])
 
     # Sort for deterministic intron_id assignment (matches the legacy
     # path, which sorted on (contig_id, donor, acceptor, strand) via
@@ -285,7 +269,7 @@ def aggregate_junctions(
     donors = grouped.column("donor").to_pylist()
     acceptors = grouped.column("acceptor").to_pylist()
     strands = grouped.column("strand").to_pylist()
-    read_counts = grouped.column("read_id_count_distinct").to_pylist()
+    read_counts = grouped.column("donor_count").to_pylist()
 
     # Motif lookup + annotation flag — both per-unique-junction (small N
     # after dedup), so Python loops here are fine. Avoids re-implementing
