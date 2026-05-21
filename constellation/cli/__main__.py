@@ -2297,6 +2297,40 @@ def _build_reference_parser(subs) -> None:
     )
     p_def.set_defaults(func=_cmd_reference_default)
 
+    p_rm = ref_subs.add_parser(
+        "remove",
+        help="Delete a cached reference; cleans up defaults + current pointers",
+    )
+    p_rm.add_argument(
+        "handle",
+        help=(
+            "fully-qualified handle ('homo_sapiens@ensembl-111') or bare "
+            "organism slug ('homo_sapiens'). Bare slug removes the single "
+            "installed release when unambiguous; with 2+ releases use a "
+            "qualified handle or --all-releases."
+        ),
+    )
+    p_rm.add_argument(
+        "--all-releases",
+        action="store_true",
+        help=(
+            "remove every installed release for the given organism (handle "
+            "must be a bare organism slug, not <organism>@<release>)"
+        ),
+    )
+    p_rm.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="skip the confirmation prompt (only consulted for --all-releases)",
+    )
+    p_rm.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the cleanup plan without deleting anything",
+    )
+    p_rm.set_defaults(func=_cmd_reference_remove)
+
     p_sum = ref_subs.add_parser(
         "summary",
         help="Print contig + feature stats for a saved reference bundle",
@@ -3072,6 +3106,232 @@ def _cmd_reference_default(args: argparse.Namespace) -> int:
     set_default(organism, handle.release_slug())
     print(f"pinned default for {organism}: {handle.release_slug()}")
     return 0
+
+
+def _cmd_reference_remove(args: argparse.Namespace) -> int:
+    """Delete a cached reference (one release, or all releases for an organism)."""
+    import sys
+
+    from constellation.sequencing.reference.handle import (
+        ReferenceNotInstalledError,
+        _installed_release_slugs,
+        _read_current,
+        cache_root,
+        format_size,
+        most_recent_release,
+        parse_handle,
+        parse_release_slug,
+        read_defaults,
+        remove_organism_all_releases,
+        remove_release,
+    )
+
+    try:
+        handle = parse_handle(args.handle)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    root = cache_root()
+    organism_dir = root / handle.organism
+
+    # ── --all-releases branch ─────────────────────────────────────────
+    if args.all_releases:
+        if handle.is_qualified():
+            print(
+                "error: --all-releases requires a bare <organism> handle "
+                f"(got qualified handle {args.handle!r})",
+                file=sys.stderr,
+            )
+            return 2
+        if not organism_dir.is_dir():
+            print(
+                f"error: no cached releases for organism {handle.organism!r}",
+                file=sys.stderr,
+            )
+            return 1
+        slugs = sorted(_installed_release_slugs(organism_dir))
+        if not slugs:
+            print(
+                f"error: no cached releases for organism {handle.organism!r}",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Show what we're about to do, both for dry-run and for the
+        # confirmation prompt.
+        sizes_bytes = {
+            slug: _dir_size_safe(organism_dir / slug) for slug in slugs
+        }
+        total_bytes = sum(sizes_bytes.values())
+
+        if args.dry_run:
+            print(
+                f"would remove {len(slugs)} release(s) "
+                f"({format_size(total_bytes)} total) for {handle.organism}:"
+            )
+            for slug in slugs:
+                print(
+                    f"  would remove {handle.organism}@{slug} "
+                    f"({format_size(sizes_bytes[slug])})"
+                )
+            if handle.organism in read_defaults(root):
+                print(f"  would unset defaults.toml entry for {handle.organism}")
+            if _read_current(organism_dir) is not None:
+                print(f"  would unlink current pointer for {handle.organism}")
+            print(f"  would remove organism dir {handle.organism}")
+            return 0
+
+        if not args.yes:
+            print(
+                f"This will remove {len(slugs)} release(s) "
+                f"({format_size(total_bytes)} total) for {handle.organism}:"
+            )
+            for slug in slugs:
+                print(
+                    f"  {handle.organism}@{slug}  ({format_size(sizes_bytes[slug])})"
+                )
+            try:
+                reply = input("Proceed? [y/N]: ").strip().lower()
+            except EOFError:
+                reply = ""
+            if reply not in {"y", "yes"}:
+                print("aborted", file=sys.stderr)
+                return 1
+
+        try:
+            results = remove_organism_all_releases(handle.organism)
+        except ReferenceNotInstalledError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        for r in results:
+            print(f"removed {r.handle} ({format_size(r.size_bytes)})")
+        last = results[-1]
+        if last.default_changed:
+            print(f"unset defaults.toml entry for {handle.organism}")
+        if last.current_changed:
+            print(f"unlinked current pointer for {handle.organism}")
+        if last.organism_dir_removed:
+            print(
+                f"removed organism dir {handle.organism} "
+                f"(no releases remaining)"
+            )
+        return 0
+
+    # ── Single-release branch ─────────────────────────────────────────
+    if not handle.is_qualified():
+        if not organism_dir.is_dir():
+            print(
+                f"error: no cached releases for organism {handle.organism!r}",
+                file=sys.stderr,
+            )
+            return 1
+        slugs = sorted(_installed_release_slugs(organism_dir))
+        if not slugs:
+            print(
+                f"error: no cached releases for organism {handle.organism!r}",
+                file=sys.stderr,
+            )
+            return 1
+        if len(slugs) > 1:
+            print(
+                f"error: ambiguous handle {handle.organism!r}: "
+                f"{len(slugs)} releases installed.",
+                file=sys.stderr,
+            )
+            print(f"Installed: {slugs}", file=sys.stderr)
+            print(
+                f"Qualify it (e.g. {handle.organism}@{slugs[0]}) "
+                f"or pass --all-releases to remove every release for "
+                f"{handle.organism}.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            handle = parse_release_slug(slugs[0], organism=handle.organism)
+        except ValueError as exc:
+            # Defensive — the slug came from the cache so it should parse.
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+    release_slug = handle.release_slug()
+    release_dir = organism_dir / release_slug
+    if not release_dir.is_dir():
+        print(
+            f"error: no cached release at {release_dir}; nothing to remove",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.dry_run:
+        defaults = read_defaults(root)
+        default_targeted = defaults.get(handle.organism) == release_slug
+        current_path = _read_current(organism_dir)
+        current_targeted = (
+            current_path is not None and current_path.name == release_slug
+        )
+        new_handle = (
+            most_recent_release(handle.organism, exclude={release_slug})
+            if (default_targeted or current_targeted)
+            else None
+        )
+        new_target = new_handle.release_slug() if new_handle is not None else None
+        size_bytes = _dir_size_safe(release_dir)
+        print(f"would remove {handle} ({format_size(size_bytes)})")
+        if default_targeted:
+            if new_target:
+                print(
+                    f"would retarget defaults.toml: {handle.organism} → {new_target}"
+                )
+            else:
+                print(f"would unset defaults.toml entry for {handle.organism}")
+        if current_targeted:
+            if new_target:
+                print(
+                    f"would retarget current pointer: {handle.organism} → {new_target}"
+                )
+            else:
+                print(f"would unlink current pointer for {handle.organism}")
+        remaining_after = _installed_release_slugs(organism_dir) - {release_slug}
+        if not remaining_after:
+            print(f"would remove organism dir {handle.organism} (last release)")
+        return 0
+
+    try:
+        removed = remove_release(handle)
+    except ReferenceNotInstalledError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"removed {removed.handle} ({format_size(removed.size_bytes)})")
+    if removed.default_changed:
+        if removed.default_retargeted_to:
+            print(
+                f"retargeted defaults.toml: {handle.organism} → "
+                f"{removed.default_retargeted_to}"
+            )
+        else:
+            print(f"unset defaults.toml entry for {handle.organism}")
+    if removed.current_changed:
+        if removed.current_retargeted_to:
+            print(
+                f"retargeted current pointer: {handle.organism} → "
+                f"{removed.current_retargeted_to}"
+            )
+        else:
+            print(f"unlinked current pointer for {handle.organism}")
+    if removed.organism_dir_removed:
+        print(f"removed organism dir {handle.organism} (last release)")
+    return 0
+
+
+def _dir_size_safe(path) -> int:
+    """Like ``handle._dir_size`` but tolerates a missing path (returns 0)."""
+    from constellation.sequencing.reference.handle import _dir_size
+    try:
+        return _dir_size(path)
+    except OSError:
+        return 0
 
 
 def _cmd_reference_summary(args: argparse.Namespace) -> int:

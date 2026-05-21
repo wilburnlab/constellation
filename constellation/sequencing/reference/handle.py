@@ -705,22 +705,287 @@ def format_size(n_bytes: int) -> str:
     return f"{n_bytes:.1f} PB"
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Removal
+# ──────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class RemovedRelease:
+    """Result of a successful ``remove_release`` call.
+
+    The four pointer fields read as a 2×2 grid:
+
+        _changed=False, _retargeted_to=None  → pointer untouched
+        _changed=True,  _retargeted_to="…"   → retargeted to the survivor
+        _changed=True,  _retargeted_to=None  → cleared (last-release removal)
+    """
+
+    handle: str
+    path: Path
+    size_bytes: int
+    organism_dir_removed: bool
+    default_changed: bool
+    default_retargeted_to: str | None
+    current_changed: bool
+    current_retargeted_to: str | None
+
+
+def most_recent_release(
+    organism: str,
+    *,
+    exclude: set[str] | None = None,
+    root: Path | None = None,
+) -> Handle | None:
+    """Return the Handle of the most-recently-fetched installed release
+    for ``organism``, or ``None`` when no releases are installed.
+
+    "Most recent" is determined by the ``meta.toml`` ``fetched_at`` field
+    (ISO 8601 string written at :func:`write_meta_toml`); when it's
+    missing or unparseable (legacy installs, ``local_import`` entries
+    without a timestamp) the release directory's ``st_mtime`` is used
+    instead. Final tiebreak is lexical sort of the release slug for
+    deterministic output.
+
+    ``exclude`` is a set of release slugs to skip — useful for previewing
+    the post-removal winner without mutating disk (consumed by the
+    ``reference remove --dry-run`` CLI path).
+    """
+    if root is None:
+        root = cache_root()
+    organism_dir = root / organism
+    if not organism_dir.is_dir():
+        return None
+    slugs = _installed_release_slugs(organism_dir)
+    if exclude:
+        slugs = slugs - exclude
+    if not slugs:
+        return None
+
+    def _sort_key(slug: str) -> tuple[float, str]:
+        release_dir = organism_dir / slug
+        ts: float | None = None
+        meta = read_meta_toml(release_dir)
+        if meta:
+            fetched_at = meta.get("fetched_at")
+            if isinstance(fetched_at, str) and fetched_at:
+                try:
+                    ts = datetime.strptime(
+                        fetched_at, "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=timezone.utc).timestamp()
+                except ValueError:
+                    pass
+        if ts is None:
+            try:
+                ts = release_dir.stat().st_mtime
+            except OSError:
+                ts = 0.0
+        # Sort key: most-recent first (negative ts), then lexically smaller slug.
+        return (-ts, slug)
+
+    winner = min(slugs, key=_sort_key)
+    return parse_release_slug(winner, organism=organism)
+
+
+def _remove_current_pointer(organism_dir: Path) -> None:
+    """Unlink both the ``current`` symlink and the ``current.txt`` fallback."""
+    for name in (CURRENT_SYMLINK, CURRENT_TEXTFILE):
+        path = organism_dir / name
+        if path.is_symlink() or path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def remove_release(
+    handle: Handle, *, root: Path | None = None
+) -> RemovedRelease:
+    """Delete one cached (organism, release) entry; clean up pointers.
+
+    See the module docstring + the auto-retarget rule documented at
+    `RemovedRelease` for behaviour. Raises ``ValueError`` if the handle
+    isn't fully qualified, and ``ReferenceNotInstalledError`` if the
+    release directory doesn't exist.
+
+    No fetch-lock is acquired — the race window between a concurrent
+    ``fetch`` and ``remove`` of the same handle is tiny, and if it does
+    collide, ``shutil.rmtree`` will surface the OS error directly. Don't
+    interleave the two on the same handle.
+    """
+    if not handle.is_qualified():
+        raise ValueError(
+            f"remove_release requires a qualified handle; got {handle!r}"
+        )
+    if root is None:
+        root = cache_root()
+    organism_dir = root / handle.organism
+    release_slug = handle.release_slug()
+    release_dir = organism_dir / release_slug
+    if not release_dir.is_dir():
+        raise ReferenceNotInstalledError(
+            f"no cached release at {release_dir}; nothing to remove"
+        )
+
+    size_bytes = _dir_size(release_dir)
+    defaults = read_defaults(root)
+    default_targeted = defaults.get(handle.organism) == release_slug
+    current_path = _read_current(organism_dir)
+    current_targeted = (
+        current_path is not None and current_path.name == release_slug
+    )
+
+    shutil.rmtree(release_dir)
+    # Sibling scratch artefacts from a previous crashed fetch (or a still-
+    # running one that we lost the race against). Best-effort cleanup.
+    clean_partial(release_dir)
+    lock_path = organism_dir / f"{release_slug}.lock"
+    if lock_path.exists():
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+    remaining = _installed_release_slugs(organism_dir)
+
+    default_changed = False
+    default_retargeted_to: str | None = None
+    current_changed = False
+    current_retargeted_to: str | None = None
+
+    if not remaining:
+        # Last release for this organism — clear pointers, rmdir the org dir.
+        if default_targeted:
+            unset_default(handle.organism, root=root)
+            default_changed = True
+        if current_targeted:
+            _remove_current_pointer(organism_dir)
+            current_changed = True
+        # _installed_release_slugs ignores the current pointer files; clean
+        # them up explicitly so the rmdir below succeeds even when current
+        # was untouched (e.g. it pointed at a slug that vanished earlier).
+        if organism_dir.is_dir():
+            _remove_current_pointer(organism_dir)
+            try:
+                organism_dir.rmdir()
+                organism_dir_removed = True
+            except OSError:
+                organism_dir_removed = False
+        else:
+            organism_dir_removed = True
+    else:
+        organism_dir_removed = False
+        new_handle = (
+            most_recent_release(handle.organism, root=root)
+            if (default_targeted or current_targeted)
+            else None
+        )
+        new_target = new_handle.release_slug() if new_handle is not None else None
+        if default_targeted:
+            if new_target is not None:
+                set_default(handle.organism, new_target, root=root)
+                default_changed = True
+                default_retargeted_to = new_target
+            else:
+                unset_default(handle.organism, root=root)
+                default_changed = True
+        if current_targeted:
+            if new_target is not None:
+                update_current_pointer(organism_dir, new_target)
+                current_changed = True
+                current_retargeted_to = new_target
+            else:
+                _remove_current_pointer(organism_dir)
+                current_changed = True
+
+    return RemovedRelease(
+        handle=str(handle),
+        path=release_dir,
+        size_bytes=size_bytes,
+        organism_dir_removed=organism_dir_removed,
+        default_changed=default_changed,
+        default_retargeted_to=default_retargeted_to,
+        current_changed=current_changed,
+        current_retargeted_to=current_retargeted_to,
+    )
+
+
+def remove_organism_all_releases(
+    organism: str, *, root: Path | None = None
+) -> list[RemovedRelease]:
+    """Delete every cached release for ``organism`` in a single sweep.
+
+    Faster + cleaner than iterating ``remove_release`` because (a) no
+    intermediate auto-retarget churn writes pointers we're about to
+    delete, and (b) one ``shutil.rmtree`` over the whole organism dir
+    beats N individual rmtree calls. The returned per-release entries
+    are snapshots — the final entry carries the ``organism_dir_removed``
+    + ``{default,current}_changed`` cleanup flags, the earlier ones do
+    not. Raises ``ReferenceNotInstalledError`` if the organism dir is
+    missing or empty.
+    """
+    if root is None:
+        root = cache_root()
+    organism_dir = root / organism
+    if not organism_dir.is_dir():
+        raise ReferenceNotInstalledError(
+            f"no cached organism dir at {organism_dir}; nothing to remove"
+        )
+    slugs = sorted(_installed_release_slugs(organism_dir))
+    if not slugs:
+        raise ReferenceNotInstalledError(
+            f"no cached releases for organism {organism!r} at {organism_dir}"
+        )
+
+    defaults = read_defaults(root)
+    had_default = organism in defaults
+    had_current = _read_current(organism_dir) is not None
+
+    snapshots = [
+        (slug, _dir_size(organism_dir / slug), organism_dir / slug)
+        for slug in slugs
+    ]
+
+    shutil.rmtree(organism_dir)
+    if had_default:
+        unset_default(organism, root=root)
+
+    last_idx = len(snapshots) - 1
+    return [
+        RemovedRelease(
+            handle=f"{organism}@{slug}",
+            path=release_dir,
+            size_bytes=size_bytes,
+            organism_dir_removed=(i == last_idx),
+            default_changed=(i == last_idx and had_default),
+            default_retargeted_to=None,
+            current_changed=(i == last_idx and had_current),
+            current_retargeted_to=None,
+        )
+        for i, (slug, size_bytes, release_dir) in enumerate(snapshots)
+    ]
+
+
 __all__ = [
     "Handle",
     "InstalledReference",
     "ReferenceNotInstalledError",
+    "RemovedRelease",
     "VALID_SOURCES",
     "acquire_fetch_lock",
     "cache_root",
     "clean_partial",
     "format_size",
     "list_installed",
+    "most_recent_release",
     "parse_handle",
     "parse_release_slug",
     "partial_dir",
     "promote_partial",
     "read_defaults",
     "read_meta_toml",
+    "remove_organism_all_releases",
+    "remove_release",
     "resolve",
     "set_default",
     "unset_default",

@@ -17,17 +17,21 @@ from constellation.sequencing.reference.handle import (
     Handle,
     InstalledReference,
     ReferenceNotInstalledError,
+    RemovedRelease,
     acquire_fetch_lock,
     cache_root,
     clean_partial,
     format_size,
     list_installed,
+    most_recent_release,
     parse_handle,
     parse_release_slug,
     partial_dir,
     promote_partial,
     read_defaults,
     read_meta_toml,
+    remove_organism_all_releases,
+    remove_release,
     resolve,
     set_default,
     unset_default,
@@ -536,3 +540,238 @@ def test_format_size():
     assert format_size(2048) == "2.0 KB"
     assert format_size(5 * 1024 * 1024) == "5.0 MB"
     assert format_size(3 * 1024 ** 3) == "3.0 GB"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# remove_release + most_recent_release
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _populate(
+    cache: Path, organism: str, slug: str, *, fetched_at: str | None = None
+) -> Path:
+    """Mint a fake cached release for the remove tests."""
+    rel = cache / organism / slug
+    rel.mkdir(parents=True)
+    (rel / "genome").mkdir()
+    (rel / "annotation").mkdir()
+    (rel / "genome" / "manifest.json").write_text("{}")
+    (rel / "annotation" / "manifest.json").write_text("{}")
+    handle = parse_handle(f"{organism}@{slug}")
+    write_meta_toml(
+        rel,
+        handle=handle,
+        assembly_accession=None,
+        assembly_name=None,
+        annotation_release=None,
+        constellation_version="0.0.2",
+        urls={},
+        sha256={},
+        source_checksum_verified=False,
+        fetched_at=fetched_at,
+    )
+    return rel
+
+
+def test_remove_release_basic(isolated_cache):
+    rel = _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    handle = parse_handle("homo_sapiens@ensembl-111")
+    result = remove_release(handle)
+    assert not rel.exists()
+    assert not (isolated_cache / "homo_sapiens").exists()
+    assert isinstance(result, RemovedRelease)
+    assert result.handle == "homo_sapiens@ensembl-111"
+    assert result.organism_dir_removed is True
+    assert result.size_bytes >= 4  # at minimum, "{}" × 2
+    assert result.default_changed is False  # we never set a default
+    assert result.current_changed is False  # ditto
+
+
+def test_remove_release_clears_defaults_on_last(isolated_cache):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    set_default("homo_sapiens", "ensembl-111")
+    handle = parse_handle("homo_sapiens@ensembl-111")
+    result = remove_release(handle)
+    assert "homo_sapiens" not in read_defaults()
+    assert result.default_changed is True
+    assert result.default_retargeted_to is None
+
+
+def test_remove_release_clears_current_symlink_on_last(isolated_cache):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    update_current_pointer(isolated_cache / "homo_sapiens", "ensembl-111")
+    handle = parse_handle("homo_sapiens@ensembl-111")
+    result = remove_release(handle)
+    assert not (isolated_cache / "homo_sapiens").exists()
+    assert result.current_changed is True
+    assert result.current_retargeted_to is None
+
+
+def test_remove_release_keeps_non_default_untouched(isolated_cache):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    _populate(isolated_cache, "homo_sapiens", "ensembl-112")
+    set_default("homo_sapiens", "ensembl-111")
+    update_current_pointer(isolated_cache / "homo_sapiens", "ensembl-111")
+    handle = parse_handle("homo_sapiens@ensembl-112")
+    result = remove_release(handle)
+    # The survivor + its pointers are untouched.
+    assert (isolated_cache / "homo_sapiens" / "ensembl-111").is_dir()
+    assert read_defaults()["homo_sapiens"] == "ensembl-111"
+    assert result.default_changed is False
+    assert result.current_changed is False
+    assert result.organism_dir_removed is False
+
+
+def test_remove_release_retargets_to_lone_survivor(isolated_cache):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    _populate(isolated_cache, "homo_sapiens", "ensembl-112")
+    set_default("homo_sapiens", "ensembl-111")
+    update_current_pointer(isolated_cache / "homo_sapiens", "ensembl-111")
+    handle = parse_handle("homo_sapiens@ensembl-111")
+    result = remove_release(handle)
+    # Defaults + current both retargeted to the survivor.
+    assert read_defaults()["homo_sapiens"] == "ensembl-112"
+    assert result.default_changed is True
+    assert result.default_retargeted_to == "ensembl-112"
+    assert result.current_changed is True
+    assert result.current_retargeted_to == "ensembl-112"
+    assert result.organism_dir_removed is False
+
+
+def test_remove_release_retargets_to_most_recent_when_3_to_2(isolated_cache):
+    # Three releases; 112 is the most-recently-fetched survivor; default=110.
+    _populate(
+        isolated_cache, "homo_sapiens", "ensembl-110",
+        fetched_at="2024-01-01T00:00:00Z",
+    )
+    _populate(
+        isolated_cache, "homo_sapiens", "ensembl-111",
+        fetched_at="2024-06-01T00:00:00Z",
+    )
+    _populate(
+        isolated_cache, "homo_sapiens", "ensembl-112",
+        fetched_at="2025-01-01T00:00:00Z",
+    )
+    set_default("homo_sapiens", "ensembl-110")
+    update_current_pointer(isolated_cache / "homo_sapiens", "ensembl-110")
+    handle = parse_handle("homo_sapiens@ensembl-110")
+    result = remove_release(handle)
+    assert result.default_retargeted_to == "ensembl-112"
+    assert result.current_retargeted_to == "ensembl-112"
+    assert read_defaults()["homo_sapiens"] == "ensembl-112"
+
+
+def test_most_recent_release_empty_returns_none(isolated_cache):
+    assert most_recent_release("homo_sapiens") is None
+
+
+def test_most_recent_release_single(isolated_cache):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    h = most_recent_release("homo_sapiens")
+    assert h is not None
+    assert h.release_slug() == "ensembl-111"
+
+
+def test_most_recent_release_picks_latest_fetched_at(isolated_cache):
+    _populate(
+        isolated_cache, "homo_sapiens", "ensembl-111",
+        fetched_at="2024-01-01T00:00:00Z",
+    )
+    _populate(
+        isolated_cache, "homo_sapiens", "ensembl-112",
+        fetched_at="2025-01-01T00:00:00Z",
+    )
+    _populate(
+        isolated_cache, "homo_sapiens", "ensembl-113",
+        fetched_at="2024-06-01T00:00:00Z",
+    )
+    h = most_recent_release("homo_sapiens")
+    assert h.release_slug() == "ensembl-112"
+
+
+def test_most_recent_release_falls_back_to_mtime(isolated_cache):
+    """When ``fetched_at`` is missing, mtime breaks the tie."""
+    rel111 = _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    rel112 = _populate(isolated_cache, "homo_sapiens", "ensembl-112")
+    # Strip ``fetched_at`` lines so the parser sees ``None`` for both.
+    for rel in (rel111, rel112):
+        meta = (rel / "meta.toml").read_text()
+        meta_no_ts = "\n".join(
+            ln for ln in meta.splitlines() if not ln.startswith("fetched_at")
+        )
+        (rel / "meta.toml").write_text(meta_no_ts + "\n")
+    # Force 112's mtime to be later than 111's.
+    os.utime(rel111, (1_700_000_000, 1_700_000_000))
+    os.utime(rel112, (1_800_000_000, 1_800_000_000))
+    h = most_recent_release("homo_sapiens")
+    assert h.release_slug() == "ensembl-112"
+
+
+def test_most_recent_release_excludes(isolated_cache):
+    _populate(
+        isolated_cache, "homo_sapiens", "ensembl-111",
+        fetched_at="2024-01-01T00:00:00Z",
+    )
+    _populate(
+        isolated_cache, "homo_sapiens", "ensembl-112",
+        fetched_at="2025-01-01T00:00:00Z",
+    )
+    # Without exclude: 112 wins.
+    assert most_recent_release("homo_sapiens").release_slug() == "ensembl-112"
+    # With 112 excluded: 111 wins.
+    h = most_recent_release("homo_sapiens", exclude={"ensembl-112"})
+    assert h is not None
+    assert h.release_slug() == "ensembl-111"
+
+
+def test_remove_release_cleans_partial_and_lock(isolated_cache):
+    rel = _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    organism_dir = isolated_cache / "homo_sapiens"
+    # Plant scratch siblings as if a prior fetch had crashed.
+    partial = organism_dir / "ensembl-111.partial"
+    partial.mkdir()
+    (partial / "junk").write_text("x")
+    lock = organism_dir / "ensembl-111.lock"
+    lock.touch()
+    handle = parse_handle("homo_sapiens@ensembl-111")
+    remove_release(handle)
+    assert not rel.exists()
+    assert not partial.exists()
+    assert not lock.exists()
+
+
+def test_remove_release_missing_raises(isolated_cache):
+    handle = parse_handle("homo_sapiens@ensembl-111")
+    with pytest.raises(ReferenceNotInstalledError):
+        remove_release(handle)
+
+
+def test_remove_release_requires_qualified_handle(isolated_cache):
+    bare = Handle(organism="homo_sapiens")
+    with pytest.raises(ValueError):
+        remove_release(bare)
+
+
+def test_remove_organism_all_releases(isolated_cache):
+    _populate(isolated_cache, "homo_sapiens", "ensembl-111")
+    _populate(isolated_cache, "homo_sapiens", "ensembl-112")
+    set_default("homo_sapiens", "ensembl-111")
+    update_current_pointer(isolated_cache / "homo_sapiens", "ensembl-111")
+    results = remove_organism_all_releases("homo_sapiens")
+    assert len(results) == 2
+    assert {r.handle for r in results} == {
+        "homo_sapiens@ensembl-111",
+        "homo_sapiens@ensembl-112",
+    }
+    # Only the last entry carries the cleanup flags.
+    assert sum(r.organism_dir_removed for r in results) == 1
+    assert results[-1].organism_dir_removed is True
+    assert results[-1].default_changed is True
+    assert results[-1].current_changed is True
+    assert not (isolated_cache / "homo_sapiens").exists()
+    assert "homo_sapiens" not in read_defaults()
+
+
+def test_remove_organism_all_releases_missing_raises(isolated_cache):
+    with pytest.raises(ReferenceNotInstalledError):
+        remove_organism_all_releases("homo_sapiens")
