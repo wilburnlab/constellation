@@ -1241,12 +1241,22 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     # cluster-node-friendly but a workstation-RAM stress test.
     # Streaming variant lifts in when we cross 1B alignments.
     emit_outputs: dict[str, str] = {}
+
+    def _ckpt(msg: str) -> None:
+        # Always-on, flushed checkpoint — so a native abort (SIGABRT, no
+        # Python traceback) leaves the last-reached step in the log.
+        print(f"[resolve] {msg}", file=sys.stderr, flush=True)
+
+    _ckpt("materialising alignments dataset → table ...")
     alignments_table = pa_dataset.dataset(
         stage_outputs["alignments"].directory
     ).to_table()
+    _ckpt(f"alignments table: {alignments_table.num_rows:,} rows")
+    _ckpt("materialising alignment_blocks dataset → table ...")
     blocks_table = pa_dataset.dataset(
         stage_outputs["alignment_blocks"].directory
     ).to_table()
+    _ckpt(f"alignment_blocks table: {blocks_table.num_rows:,} rows")
 
     # ── Intron clustering — always-on (introns.parquet) ──────────────
     # The clustered INTRON_TABLE is the canonical splice-junction
@@ -1268,16 +1278,21 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
     else:
+        _ckpt("aggregate_junctions ...")
         introns = aggregate_junctions(
             blocks_table, alignments_table, genome, annotation=annotation,
         )
+        _ckpt(f"aggregate_junctions done: {introns.num_rows:,} junctions")
         if cluster_introns:
+            _ckpt("cluster_junctions ...")
             introns = cluster_junctions(
                 introns,
                 tolerance_bp=int(args.intron_tolerance_bp),
                 motif_priority=intron_motif_priority,
             )
+            _ckpt(f"cluster_junctions done: {introns.num_rows:,} rows")
         pq.write_table(introns, introns_path)
+        _ckpt(f"wrote {introns_path.name}")
     emit_outputs["introns"] = str(introns_path)
 
     # ── Coverage pile-up + derived annotation ─────────────────────────
@@ -1360,10 +1375,12 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
         else:
+            _ckpt("build_pileup (coverage) ...")
             pileup_table = build_pileup(
                 blocks_table, alignments_table, genome.contigs,
                 read_to_sample=read_to_sample,
             )
+            _ckpt(f"build_pileup done: {pileup_table.num_rows:,} rows")
 
         if emit_coverage and not coverage_exists and pileup_table is not None:
             pq.write_table(pileup_table, coverage_path)
@@ -1378,6 +1395,7 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             )
             from constellation.sequencing.annotation.io import save_annotation
 
+            _ckpt("build_derived_annotation ...")
             derived_annotation, block_assignments, exon_psi = (
                 build_derived_annotation(
                     coverage=pileup_table,
@@ -3164,6 +3182,13 @@ def _cmd_reference_validate(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Dump a Python traceback on fatal native signals (SIGABRT/SIGSEGV) —
+    # e.g. an Arrow C++ abort() from an oversized allocation prints the
+    # Python line that triggered it, instead of a bare "Aborted (core
+    # dumped)" with no context. Cheap; always-on.
+    import faulthandler
+    faulthandler.enable()
+
     raw = list(sys.argv[1:] if argv is None else argv)
     # Bare `constellation` → open the dashboard. PR 2 wires the
     # `dashboard` subcommand; until that ships the rewrite is a no-op
