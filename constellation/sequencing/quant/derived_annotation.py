@@ -47,10 +47,15 @@ v1 limitations (deferred to v2):
 
 from __future__ import annotations
 
-from typing import Mapping
+from pathlib import Path
+from typing import Union
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.dataset as pa_dataset
+import pyarrow.parquet as pq
+import torch
 
 from constellation.core.graph.network import Network
 from constellation.sequencing.schemas.alignment import (
@@ -58,6 +63,13 @@ from constellation.sequencing.schemas.alignment import (
 )
 from constellation.sequencing.schemas.quant import EXON_PSI_TABLE
 from constellation.sequencing.schemas.reference import FEATURE_TABLE
+
+
+# Type alias for callers that pass either an in-memory table or a path
+# to a Parquet dataset (file or directory). Tests + Jupyter callers pass
+# a table; the CLI passes a path so the resolve stage never holds the
+# full BLOCK_EXON_ASSIGNMENT_TABLE in RAM.
+BlockAssignmentsLike = Union[pa.Table, Path, str]
 
 
 # Sentinel sample_id when no read_to_sample mapping is supplied or a
@@ -403,9 +415,19 @@ def assign_blocks_to_exons(
     alignments: pa.Table,
     derived_features: pa.Table,
     contigs: pa.Table,
-) -> pa.Table:
+    *,
+    output_path: Path | None = None,
+    batch_size: int = 10_000_000,
+) -> pa.Table | dict[str, int]:
     """Build ``BLOCK_EXON_ASSIGNMENT_TABLE`` — long-form M:N edge table
     between alignment blocks and derived exons.
+
+    Arrow joins resolve ``(alignment_id → ref_name → contig_id)``
+    once; per-contig the algorithm bridges to PyTorch CPU tensors and
+    uses ``torch.searchsorted`` + ``torch.repeat_interleave`` to
+    vectorise the interval-overlap expansion over millions of blocks.
+    Replaces the pre-refactor 1.6B-row ``to_pylist()`` + nested Python
+    loop that pinned a single thread for hours at mouse scale.
 
     Parameters
     ----------
@@ -421,21 +443,32 @@ def assign_blocks_to_exons(
     contigs : pa.Table
         ``CONTIG_TABLE``-shaped — supplies the ``ref_name → contig_id``
         resolution.
+    output_path : Path | None, default None
+        If provided, stream per-contig per-batch RecordBatches to this
+        Parquet file and return a summary stats dict. If omitted,
+        accumulate batches and return them as a single in-memory table
+        (tests + Jupyter path).
+    batch_size : int, default 10_000_000
+        Blocks per inner vectorisation batch. Per-batch intermediate
+        memory ≈ ``batch_size × avg_candidates_per_block × 7 columns
+        × 8 bytes`` (~1.7 GB at the default with 3 avg candidates).
 
     Returns
     -------
-    pa.Table conforming to ``BLOCK_EXON_ASSIGNMENT_TABLE``. One row
-    per (alignment_id, block_index, data_exon_id) overlap edge with
-    ``overlap_bp > 0``.
+    pa.Table conforming to ``BLOCK_EXON_ASSIGNMENT_TABLE`` (when
+    ``output_path`` is None), or ``dict[str, int]`` summary stats
+    ``{"n_rows_written": int, "n_contigs": int}`` (when streaming).
+    One row per ``(alignment_id, block_index, data_exon_id)`` overlap
+    edge with ``overlap_bp > 0``.
     """
     if alignment_blocks.num_rows == 0 or derived_features.num_rows == 0:
-        return _empty_block_assignments()
+        return _finalise_empty_block_assignments(output_path)
 
     exons = derived_features.filter(
         pc.equal(derived_features.column("type"), "exon")
-    )
+    ).select(["feature_id", "contig_id", "start", "end"])
     if exons.num_rows == 0:
-        return _empty_block_assignments()
+        return _finalise_empty_block_assignments(output_path)
 
     primary_mask = pc.and_(
         pc.invert(alignments.column("is_secondary")),
@@ -445,82 +478,206 @@ def assign_blocks_to_exons(
         ["alignment_id", "ref_name"]
     )
 
-    name_to_cid: dict[str, int] = {
-        str(n): int(c)
-        for n, c in zip(
-            contigs.column("name").to_pylist(),
-            contigs.column("contig_id").to_pylist(),
-            strict=True,
-        )
-    }
-    aid_to_cid: dict[int, int] = {}
-    for aid, ref_n in zip(
-        primary.column("alignment_id").to_pylist(),
-        primary.column("ref_name").to_pylist(),
-        strict=True,
-    ):
-        cid = name_to_cid.get(str(ref_n))
-        if cid is not None:
-            aid_to_cid[int(aid)] = cid
+    # Attach contig_id to every primary alignment, then propagate to
+    # every block via the join chain.
+    contig_lookup = contigs.select(["contig_id", "name"]).rename_columns(
+        ["contig_id", "ref_name"]
+    )
+    primary_with_contig = primary.join(
+        contig_lookup, keys="ref_name", join_type="inner"
+    ).select(["alignment_id", "contig_id"])
+    blocks_with_contig = alignment_blocks.join(
+        primary_with_contig, keys="alignment_id", join_type="inner"
+    )
+    if blocks_with_contig.num_rows == 0:
+        return _finalise_empty_block_assignments(output_path)
+    blocks_with_contig = blocks_with_contig.combine_chunks()
 
-    exons_by_contig: dict[int, list[tuple[int, int, int]]] = {}
-    for r in exons.to_pylist():
-        c = int(r["contig_id"])
-        exons_by_contig.setdefault(c, []).append(
-            (int(r["start"]), int(r["end"]), int(r["feature_id"]))
-        )
-    for c in exons_by_contig:
-        exons_by_contig[c].sort()
-
-    rows: list[dict] = []
-    aids = alignment_blocks.column("alignment_id").to_pylist()
-    bidxs = alignment_blocks.column("block_index").to_pylist()
-    bstarts = alignment_blocks.column("ref_start").to_pylist()
-    bends = alignment_blocks.column("ref_end").to_pylist()
-
-    for aid, bidx, bs, be in zip(aids, bidxs, bstarts, bends, strict=True):
-        contig_id = aid_to_cid.get(int(aid))
-        if contig_id is None:
-            continue
-        exon_list = exons_by_contig.get(contig_id, [])
-        if not exon_list:
-            continue
-        bs_int = int(bs)
-        be_int = int(be)
-        block_len = be_int - bs_int
-        if block_len <= 0:
-            continue
-        # Linear scan from leftmost candidate. Exons sorted by start;
-        # we early-exit when an exon's start >= block's end.
-        for e_start, e_end, e_id in exon_list:
-            if e_start >= be_int:
-                break
-            if e_end <= bs_int:
-                continue
-            ovl_start = max(e_start, bs_int)
-            ovl_end = min(e_end, be_int)
-            ovl = ovl_end - ovl_start
-            if ovl <= 0:
-                continue
-            exon_len = e_end - e_start
-            rows.append(
-                {
-                    "alignment_id": int(aid),
-                    "block_index": int(bidx),
-                    "data_exon_id": int(e_id),
-                    "overlap_bp": int(ovl),
-                    "block_fraction": (
-                        float(ovl) / float(block_len) if block_len > 0 else 0.0
-                    ),
-                    "exon_fraction": (
-                        float(ovl) / float(exon_len) if exon_len > 0 else 0.0
-                    ),
-                }
+    writer: pq.ParquetWriter | None = None
+    out_batches: list[pa.RecordBatch] = []
+    n_rows_written = 0
+    n_contigs = 0
+    try:
+        if output_path is not None:
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            writer = pq.ParquetWriter(
+                str(output_path), schema=BLOCK_EXON_ASSIGNMENT_TABLE
             )
 
-    if not rows:
+        unique_contigs = (
+            pc.unique(blocks_with_contig.column("contig_id")).to_pylist()
+        )
+        for contig_id in unique_contigs:
+            contig_filter = pc.equal(
+                blocks_with_contig.column("contig_id"), contig_id
+            )
+            c_blocks = blocks_with_contig.filter(contig_filter)
+            c_exons = exons.filter(pc.equal(exons.column("contig_id"), contig_id))
+            if c_blocks.num_rows == 0 or c_exons.num_rows == 0:
+                continue
+            c_blocks = c_blocks.combine_chunks()
+            c_exons = c_exons.combine_chunks()
+
+            blk_aid = torch.from_numpy(
+                c_blocks.column("alignment_id").chunk(0).to_numpy(
+                    zero_copy_only=True
+                )
+            )
+            blk_bidx = torch.from_numpy(
+                c_blocks.column("block_index").chunk(0).to_numpy(
+                    zero_copy_only=True
+                )
+            )
+            blk_bs = torch.from_numpy(
+                c_blocks.column("ref_start").chunk(0).to_numpy(
+                    zero_copy_only=True
+                )
+            )
+            blk_be = torch.from_numpy(
+                c_blocks.column("ref_end").chunk(0).to_numpy(
+                    zero_copy_only=True
+                )
+            )
+
+            exon_starts = torch.from_numpy(
+                c_exons.column("start").chunk(0).to_numpy(zero_copy_only=True)
+            )
+            exon_ends = torch.from_numpy(
+                c_exons.column("end").chunk(0).to_numpy(zero_copy_only=True)
+            )
+            exon_ids = torch.from_numpy(
+                c_exons.column("feature_id").chunk(0).to_numpy(
+                    zero_copy_only=True
+                )
+            )
+            sort_perm = torch.argsort(exon_starts, stable=True)
+            es = exon_starts[sort_perm].contiguous()
+            ee = exon_ends[sort_perm].contiguous()
+            eid = exon_ids[sort_perm].contiguous()
+
+            n_blocks = blk_aid.numel()
+            batch_emitted = 0
+            for chunk_start in range(0, n_blocks, batch_size):
+                chunk_end = min(chunk_start + batch_size, n_blocks)
+                b_aid = blk_aid[chunk_start:chunk_end]
+                b_bidx = blk_bidx[chunk_start:chunk_end]
+                b_bs = blk_bs[chunk_start:chunk_end]
+                b_be = blk_be[chunk_start:chunk_end]
+
+                batch_rb = _expand_block_exon_overlaps_batch(
+                    b_aid, b_bidx, b_bs, b_be, es, ee, eid
+                )
+                if batch_rb is None or batch_rb.num_rows == 0:
+                    continue
+                batch_emitted += batch_rb.num_rows
+                n_rows_written += batch_rb.num_rows
+                if writer is not None:
+                    writer.write_batch(batch_rb)
+                else:
+                    out_batches.append(batch_rb)
+            if batch_emitted > 0:
+                n_contigs += 1
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if output_path is not None:
+        return {"n_rows_written": n_rows_written, "n_contigs": n_contigs}
+    if not out_batches:
         return _empty_block_assignments()
-    return pa.Table.from_pylist(rows, schema=BLOCK_EXON_ASSIGNMENT_TABLE)
+    return pa.Table.from_batches(out_batches, schema=BLOCK_EXON_ASSIGNMENT_TABLE)
+
+
+def _finalise_empty_block_assignments(
+    output_path: Path | None,
+) -> pa.Table | dict[str, int]:
+    if output_path is not None:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(_empty_block_assignments(), str(output_path))
+        return {"n_rows_written": 0, "n_contigs": 0}
+    return _empty_block_assignments()
+
+
+def _expand_block_exon_overlaps_batch(
+    blk_aid: torch.Tensor,
+    blk_bidx: torch.Tensor,
+    blk_bs: torch.Tensor,
+    blk_be: torch.Tensor,
+    exon_starts_sorted: torch.Tensor,
+    exon_ends_sorted: torch.Tensor,
+    exon_ids_sorted: torch.Tensor,
+) -> pa.RecordBatch | None:
+    """Vectorised per-batch interval overlap.
+
+    ``torch.searchsorted`` over the sorted exon-starts gives an
+    inclusive-of-zero upper bound on candidate exons per block (exons
+    with ``start < block_end``); the post-filter ``exon_end > block_start``
+    completes the half-open overlap predicate. The expansion via
+    ``torch.repeat_interleave`` turns the (block, candidate-slice) shape
+    into a flat (block_repeat, exon_idx) pair list — all without a
+    Python-level loop over blocks.
+    """
+    n_batch = blk_bs.numel()
+    if n_batch == 0:
+        return None
+
+    hi = torch.searchsorted(exon_starts_sorted, blk_be, right=False)
+    # candidate count per block (lo is always 0 because we filter
+    # exon_end > block_start as a post-step).
+    counts = hi.to(torch.int64)
+    total = int(counts.sum().item())
+    if total == 0:
+        return None
+
+    cum = torch.cumsum(counts, dim=0)
+    starts_offset = cum - counts
+    block_repeats = torch.repeat_interleave(
+        torch.arange(n_batch, dtype=torch.int64), counts
+    )
+    within = torch.arange(total, dtype=torch.int64) - torch.repeat_interleave(
+        starts_offset, counts
+    )
+    exon_idx = within  # since lo == 0
+
+    cand_es = exon_starts_sorted[exon_idx]
+    cand_ee = exon_ends_sorted[exon_idx]
+    cand_eid = exon_ids_sorted[exon_idx]
+    cand_bs = blk_bs[block_repeats]
+    cand_be = blk_be[block_repeats]
+    cand_aid = blk_aid[block_repeats]
+    cand_bidx = blk_bidx[block_repeats]
+
+    overlap_mask = cand_ee > cand_bs
+    if not bool(overlap_mask.any()):
+        return None
+
+    cand_es = cand_es[overlap_mask]
+    cand_ee = cand_ee[overlap_mask]
+    cand_eid = cand_eid[overlap_mask]
+    cand_bs = cand_bs[overlap_mask]
+    cand_be = cand_be[overlap_mask]
+    cand_aid = cand_aid[overlap_mask]
+    cand_bidx = cand_bidx[overlap_mask]
+
+    ovl_starts = torch.maximum(cand_es, cand_bs)
+    ovl_ends = torch.minimum(cand_ee, cand_be)
+    ovl_bp = (ovl_ends - ovl_starts).to(torch.int32)
+    block_len = (cand_be - cand_bs).to(torch.float32)
+    exon_len = (cand_ee - cand_es).to(torch.float32)
+    block_fraction = ovl_bp.to(torch.float32) / block_len
+    exon_fraction = ovl_bp.to(torch.float32) / exon_len
+
+    return pa.RecordBatch.from_arrays(
+        [
+            pa.array(cand_aid.numpy(), type=pa.int64()),
+            pa.array(cand_bidx.numpy(), type=pa.int32()),
+            pa.array(cand_eid.numpy(), type=pa.int64()),
+            pa.array(ovl_bp.numpy(), type=pa.int32()),
+            pa.array(block_fraction.numpy(), type=pa.float32()),
+            pa.array(exon_fraction.numpy(), type=pa.float32()),
+        ],
+        schema=BLOCK_EXON_ASSIGNMENT_TABLE,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -529,11 +686,11 @@ def assign_blocks_to_exons(
 
 
 def compute_exon_psi(
-    block_assignments: pa.Table,
+    block_assignments: BlockAssignmentsLike,
     alignments: pa.Table,
     derived_features: pa.Table,
     contigs: pa.Table,
-    read_to_sample: Mapping[str, int] | None = None,
+    read_to_sample: pa.Table | None = None,
 ) -> pa.Table:
     """Per-(derived_exon, sample) inclusion / exclusion / PSI substrate.
 
@@ -555,9 +712,14 @@ def compute_exon_psi(
 
     Parameters
     ----------
-    block_assignments : pa.Table
-        ``BLOCK_EXON_ASSIGNMENT_TABLE``-shaped — output of
-        :func:`assign_blocks_to_exons`.
+    block_assignments : pa.Table | Path | str
+        Either an in-memory ``BLOCK_EXON_ASSIGNMENT_TABLE``-shaped table
+        (tests + Jupyter callers) or a path to a Parquet file / dataset
+        directory produced by :func:`assign_blocks_to_exons` in
+        streaming mode (production callers). Only distinct
+        ``(alignment_id, data_exon_id)`` pairs are needed downstream;
+        the path variant is stream-scanned in batches so the on-disk
+        50+ GB table at mouse scale never materialises in RAM.
     alignments : pa.Table
         ``ALIGNMENT_TABLE``-shaped.
     derived_features : pa.Table
@@ -566,10 +728,11 @@ def compute_exon_psi(
     contigs : pa.Table
         ``CONTIG_TABLE``-shaped — supplies the ``ref_name → contig_id``
         resolution.
-    read_to_sample : Mapping[str, int] | None
-        Optional ``read_id → sample_id``. When omitted, every alignment
-        contributes to a single ``sample_id = -1`` partition (matches
-        ``COVERAGE_TABLE``'s unstratified sentinel).
+    read_to_sample : pa.Table | None
+        Optional 2-column Arrow table with ``read_id`` (string) +
+        ``sample_id`` (int64). When omitted, every alignment maps to
+        ``sample_id = -1`` (matches ``COVERAGE_TABLE``'s unstratified
+        sentinel).
 
     Returns
     -------
@@ -577,148 +740,330 @@ def compute_exon_psi(
     ``(data_exon_id, sample_id)`` pair with at least one
     gene-spanning or partial-spanning alignment.
     """
-    exon_filter = pc.equal(derived_features.column("type"), "exon")
-    exons = derived_features.filter(exon_filter)
-    gene_filter = pc.equal(derived_features.column("type"), "gene")
-    genes = derived_features.filter(gene_filter)
+    exons = derived_features.filter(
+        pc.equal(derived_features.column("type"), "exon")
+    ).select(["feature_id", "contig_id", "start", "end", "parent_id"])
+    genes = derived_features.filter(
+        pc.equal(derived_features.column("type"), "gene")
+    ).select(["feature_id", "contig_id", "start", "end"])
     if exons.num_rows == 0 or genes.num_rows == 0:
         return _empty_exon_psi()
 
-    gene_meta: dict[int, dict] = {
-        int(r["feature_id"]): {
-            "contig_id": int(r["contig_id"]),
-            "start": int(r["start"]),
-            "end": int(r["end"]),
-        }
-        for r in genes.to_pylist()
-    }
-    exon_meta: dict[int, dict] = {
-        int(r["feature_id"]): {
-            "gene_id": (
-                int(r["parent_id"]) if r["parent_id"] is not None else None
-            ),
-            "contig_id": int(r["contig_id"]),
-            "start": int(r["start"]),
-            "end": int(r["end"]),
-        }
-        for r in exons.to_pylist()
-    }
-
-    exons_by_gene: dict[int, list[int]] = {}
-    for eid, m in exon_meta.items():
-        gid = m.get("gene_id")
-        if gid is not None:
-            exons_by_gene.setdefault(gid, []).append(eid)
-
-    name_to_cid: dict[str, int] = {
-        str(n): int(c)
-        for n, c in zip(
-            contigs.column("name").to_pylist(),
-            contigs.column("contig_id").to_pylist(),
-            strict=True,
-        )
-    }
-
+    # Filter to primary alignments; attach contig_id + sample_id via
+    # Arrow joins. The prior implementation built an alignment-id→metadata
+    # Python dict at this point — ~200M dicts of dicts at mouse scale.
     primary_mask = pc.and_(
         pc.invert(alignments.column("is_secondary")),
         pc.invert(alignments.column("is_supplementary")),
     )
-    primary = alignments.filter(primary_mask)
-
-    # alignment_id → metadata.
-    aid_meta: dict[int, dict] = {}
-    for r in primary.to_pylist():
-        cid = name_to_cid.get(str(r["ref_name"]))
-        if cid is None:
-            continue
-        aid_meta[int(r["alignment_id"])] = {
-            "contig_id": cid,
-            "ref_start": int(r["ref_start"]),
-            "ref_end": int(r["ref_end"]),
-            "read_id": str(r["read_id"]),
-        }
-
-    # alignment_id → set of exon_ids it overlaps (any block, any overlap_bp > 0).
-    aid_exon_set: dict[int, set[int]] = {}
-    if block_assignments.num_rows > 0:
-        ba_aids = block_assignments.column("alignment_id").to_pylist()
-        ba_eids = block_assignments.column("data_exon_id").to_pylist()
-        ba_ovls = block_assignments.column("overlap_bp").to_pylist()
-        for aid, eid, ovl in zip(ba_aids, ba_eids, ba_ovls, strict=True):
-            if int(ovl) > 0:
-                aid_exon_set.setdefault(int(aid), set()).add(int(eid))
-
-    # alignments grouped by contig for gene-spanning check.
-    aids_by_contig: dict[int, list[tuple[int, int, int]]] = {}
-    for aid, m in aid_meta.items():
-        aids_by_contig.setdefault(m["contig_id"], []).append(
-            (m["ref_start"], m["ref_end"], aid)
-        )
-
-    if read_to_sample is None:
-        read_to_sample = {}
-
-    counts: dict[tuple[int, int], dict[str, int]] = {}
-
-    for gene_id, exon_ids in exons_by_gene.items():
-        gene = gene_meta[gene_id]
-        gene_contig = gene["contig_id"]
-        gene_start = gene["start"]
-        gene_end = gene["end"]
-        contig_aids = aids_by_contig.get(gene_contig, [])
-        spanning_aids: list[int] = []
-        partial_aids: list[int] = []
-        for aref_start, aref_end, aid in contig_aids:
-            if aref_start <= gene_start and aref_end >= gene_end:
-                spanning_aids.append(aid)
-            elif aref_end > gene_start and aref_start < gene_end:
-                partial_aids.append(aid)
-
-        for aid in spanning_aids:
-            read_id = aid_meta[aid]["read_id"]
-            sample_id = int(
-                read_to_sample.get(read_id, _UNSTRATIFIED_SAMPLE_ID)
-            )
-            overlapping_exons = aid_exon_set.get(aid, set())
-            for eid in exon_ids:
-                key = (eid, sample_id)
-                rec = counts.setdefault(key, {"inc": 0, "exc": 0, "amb": 0})
-                if eid in overlapping_exons:
-                    rec["inc"] += 1
-                else:
-                    rec["exc"] += 1
-        for aid in partial_aids:
-            read_id = aid_meta[aid]["read_id"]
-            sample_id = int(
-                read_to_sample.get(read_id, _UNSTRATIFIED_SAMPLE_ID)
-            )
-            for eid in exon_ids:
-                key = (eid, sample_id)
-                rec = counts.setdefault(key, {"inc": 0, "exc": 0, "amb": 0})
-                rec["amb"] += 1
-
-    if not counts:
+    primary = alignments.filter(primary_mask).select(
+        ["alignment_id", "read_id", "ref_name", "ref_start", "ref_end"]
+    )
+    if primary.num_rows == 0:
         return _empty_exon_psi()
 
-    rows: list[dict] = []
-    for (eid, sid), rec in counts.items():
-        inc = rec["inc"]
-        exc = rec["exc"]
-        denom = inc + exc
-        psi = (float(inc) / float(denom)) if denom > 0 else None
-        rows.append(
-            {
-                "data_exon_id": int(eid),
-                "sample_id": int(sid),
-                "n_inclusion_reads": int(inc),
-                "n_exclusion_reads": int(exc),
-                "n_ambiguous_reads": int(rec["amb"]),
-                "psi": psi,
-            }
+    contig_lookup = contigs.select(["contig_id", "name"]).rename_columns(
+        ["contig_id", "ref_name"]
+    )
+    primary = primary.join(contig_lookup, keys="ref_name", join_type="inner")
+    if primary.num_rows == 0:
+        return _empty_exon_psi()
+
+    if read_to_sample is not None:
+        primary = primary.join(
+            read_to_sample, keys="read_id", join_type="left outer"
         )
-    # Sort for determinism: (data_exon_id asc, sample_id asc).
-    rows.sort(key=lambda r: (r["data_exon_id"], r["sample_id"]))
-    return pa.Table.from_pylist(rows, schema=EXON_PSI_TABLE)
+        primary = primary.set_column(
+            primary.column_names.index("sample_id"),
+            "sample_id",
+            pc.fill_null(
+                primary.column("sample_id"), _UNSTRATIFIED_SAMPLE_ID
+            ),
+        )
+    else:
+        primary = primary.append_column(
+            "sample_id",
+            pa.array(
+                np.full(primary.num_rows, _UNSTRATIFIED_SAMPLE_ID, dtype=np.int64),
+                type=pa.int64(),
+            ),
+        )
+
+    # ── Gene-spanning classification per contig ─────────────────────
+    aln_gene_role = _classify_alignments_per_gene(primary, genes)
+    if aln_gene_role.num_rows == 0:
+        return _empty_exon_psi()
+
+    # Cross-join with exons on parent_id → enumerate (alignment, exon, role)
+    # for each gene's exons.
+    exon_membership = exons.select(["feature_id", "parent_id"]).rename_columns(
+        ["data_exon_id", "gene_id"]
+    )
+    aln_exon_role = aln_gene_role.join(
+        exon_membership, keys="gene_id", join_type="inner"
+    )
+    if aln_exon_role.num_rows == 0:
+        return _empty_exon_psi()
+
+    # Extract distinct (alignment_id, data_exon_id) overlap pairs from
+    # block_assignments. Accepts either an in-memory table or a path
+    # (Parquet file / dataset dir) that we stream-scan in batches.
+    overlap_pairs = _extract_distinct_overlap_pairs(block_assignments)
+
+    # Left-join indicates "did this (alignment, exon) actually overlap
+    # at the block level". We use a sentinel-column trick: add a
+    # constant `_has_overlap` int8 to overlap_pairs; after the left
+    # join, that column is null iff there was no overlap.
+    overlap_pairs_marked = overlap_pairs.append_column(
+        "_has_overlap",
+        pa.array(np.ones(overlap_pairs.num_rows, dtype=np.int8), type=pa.int8()),
+    )
+    joined = aln_exon_role.join(
+        overlap_pairs_marked,
+        keys=["alignment_id", "data_exon_id"],
+        join_type="left outer",
+    )
+    has_overlap = pc.is_valid(joined.column("_has_overlap"))
+    is_spanning = pc.equal(joined.column("role"), "spanning")
+    is_partial = pc.equal(joined.column("role"), "partial")
+
+    inc_indicator = pc.cast(pc.and_(is_spanning, has_overlap), pa.int32())
+    exc_indicator = pc.cast(
+        pc.and_(is_spanning, pc.invert(has_overlap)), pa.int32()
+    )
+    amb_indicator = pc.cast(is_partial, pa.int32())
+
+    enriched = joined.append_column("inc_i", inc_indicator)
+    enriched = enriched.append_column("exc_i", exc_indicator)
+    enriched = enriched.append_column("amb_i", amb_indicator)
+
+    aggregated = enriched.group_by(["data_exon_id", "sample_id"]).aggregate(
+        [("inc_i", "sum"), ("exc_i", "sum"), ("amb_i", "sum")]
+    )
+    if aggregated.num_rows == 0:
+        return _empty_exon_psi()
+
+    aggregated = aggregated.sort_by(
+        [
+            ("data_exon_id", "ascending"),
+            ("sample_id", "ascending"),
+        ]
+    )
+
+    inc = pc.cast(aggregated.column("inc_i_sum"), pa.int32())
+    exc = pc.cast(aggregated.column("exc_i_sum"), pa.int32())
+    amb = pc.cast(aggregated.column("amb_i_sum"), pa.int32())
+    denom = pc.add(inc, exc)
+    denom_positive = pc.greater(denom, 0)
+    psi = pc.if_else(
+        denom_positive,
+        pc.divide(pc.cast(inc, pa.float32()), pc.cast(denom, pa.float32())),
+        pa.scalar(None, type=pa.float32()),
+    )
+
+    return pa.table(
+        {
+            "data_exon_id": aggregated.column("data_exon_id"),
+            "sample_id": aggregated.column("sample_id"),
+            "n_inclusion_reads": inc,
+            "n_exclusion_reads": exc,
+            "n_ambiguous_reads": amb,
+            "psi": psi,
+        },
+        schema=EXON_PSI_TABLE,
+    )
+
+
+def _classify_alignments_per_gene(
+    primary: pa.Table, genes: pa.Table
+) -> pa.Table:
+    """Build ``(alignment_id, gene_id, role, sample_id)`` rows.
+
+    ``role`` is ``'spanning'`` (alignment fully contains gene),
+    ``'partial'`` (alignment overlaps gene but doesn't span). Per-contig
+    chunked broadcast in torch: sort alignments by ref_start once per
+    contig; then for chunks of ~K genes, build a ``(K × M_alignments)``
+    boolean grid and emit non-zero entries via ``torch.nonzero``. K is
+    auto-tuned so peak intermediate bytes stay near 1 GB.
+    """
+    if primary.num_rows == 0 or genes.num_rows == 0:
+        return _empty_aln_gene_role()
+
+    # 1 GB target / (1 byte/bool × n_alignments_per_contig) → genes per chunk.
+    # Bounded between 1 and 256 to keep per-iteration overhead reasonable.
+    _GENE_CHUNK_TARGET_BYTES = 1_073_741_824
+
+    out_aid: list[torch.Tensor] = []
+    out_gid: list[torch.Tensor] = []
+    out_sid: list[torch.Tensor] = []
+    out_role: list[torch.Tensor] = []
+    role_spanning = 0
+    role_partial = 1
+
+    gene_contigs = pc.unique(genes.column("contig_id")).to_pylist()
+    for contig_id in gene_contigs:
+        c_genes = genes.filter(pc.equal(genes.column("contig_id"), contig_id))
+        c_primary = primary.filter(
+            pc.equal(primary.column("contig_id"), contig_id)
+        )
+        if c_genes.num_rows == 0 or c_primary.num_rows == 0:
+            continue
+        c_primary = c_primary.combine_chunks()
+        c_genes = c_genes.combine_chunks()
+
+        a_start = torch.from_numpy(
+            c_primary.column("ref_start").chunk(0).to_numpy(zero_copy_only=True)
+        )
+        a_end = torch.from_numpy(
+            c_primary.column("ref_end").chunk(0).to_numpy(zero_copy_only=True)
+        )
+        a_id = torch.from_numpy(
+            c_primary.column("alignment_id").chunk(0).to_numpy(
+                zero_copy_only=True
+            )
+        )
+        a_sid = torch.from_numpy(
+            c_primary.column("sample_id").chunk(0).to_numpy(
+                zero_copy_only=True
+            )
+        )
+        order = torch.argsort(a_start, stable=True)
+        a_start = a_start[order].contiguous()
+        a_end = a_end[order].contiguous()
+        a_id = a_id[order].contiguous()
+        a_sid = a_sid[order].contiguous()
+        M = a_start.numel()
+
+        g_start = torch.from_numpy(
+            c_genes.column("start").chunk(0).to_numpy(zero_copy_only=True)
+        )
+        g_end = torch.from_numpy(
+            c_genes.column("end").chunk(0).to_numpy(zero_copy_only=True)
+        )
+        g_id = torch.from_numpy(
+            c_genes.column("feature_id").chunk(0).to_numpy(zero_copy_only=True)
+        )
+        n_genes = g_start.numel()
+
+        chunk_size = max(1, min(256, _GENE_CHUNK_TARGET_BYTES // max(M, 1)))
+        for cs in range(0, n_genes, chunk_size):
+            ce = min(cs + chunk_size, n_genes)
+            cg_start = g_start[cs:ce]
+            cg_end = g_end[cs:ce]
+            cg_id = g_id[cs:ce]
+
+            # Broadcast: (K, M) boolean matrices for spanning + overlap.
+            spanning = (a_start.unsqueeze(0) <= cg_start.unsqueeze(1)) & (
+                a_end.unsqueeze(0) >= cg_end.unsqueeze(1)
+            )
+            overlapping = (a_start.unsqueeze(0) < cg_end.unsqueeze(1)) & (
+                a_end.unsqueeze(0) > cg_start.unsqueeze(1)
+            )
+            partials = overlapping & ~spanning
+
+            if bool(spanning.any()):
+                sp_idx = torch.nonzero(spanning, as_tuple=False)
+                k_idx = sp_idx[:, 0]
+                m_idx = sp_idx[:, 1]
+                out_aid.append(a_id[m_idx])
+                out_gid.append(cg_id[k_idx])
+                out_sid.append(a_sid[m_idx])
+                out_role.append(
+                    torch.full(
+                        (sp_idx.shape[0],), role_spanning, dtype=torch.int8
+                    )
+                )
+            if bool(partials.any()):
+                pt_idx = torch.nonzero(partials, as_tuple=False)
+                k_idx = pt_idx[:, 0]
+                m_idx = pt_idx[:, 1]
+                out_aid.append(a_id[m_idx])
+                out_gid.append(cg_id[k_idx])
+                out_sid.append(a_sid[m_idx])
+                out_role.append(
+                    torch.full(
+                        (pt_idx.shape[0],), role_partial, dtype=torch.int8
+                    )
+                )
+
+    if not out_aid:
+        return _empty_aln_gene_role()
+
+    aid_t = torch.cat(out_aid)
+    gid_t = torch.cat(out_gid)
+    sid_t = torch.cat(out_sid)
+    role_t = torch.cat(out_role)
+    role_strs = pc.if_else(
+        pc.equal(pa.array(role_t.numpy(), type=pa.int8()), role_spanning),
+        "spanning",
+        "partial",
+    )
+    return pa.table(
+        {
+            "alignment_id": pa.array(aid_t.numpy(), type=pa.int64()),
+            "gene_id": pa.array(gid_t.numpy(), type=pa.int64()),
+            "sample_id": pa.array(sid_t.numpy(), type=pa.int64()),
+            "role": role_strs,
+        }
+    )
+
+
+def _empty_aln_gene_role() -> pa.Table:
+    return pa.table(
+        {
+            "alignment_id": pa.array([], type=pa.int64()),
+            "gene_id": pa.array([], type=pa.int64()),
+            "sample_id": pa.array([], type=pa.int64()),
+            "role": pa.array([], type=pa.string()),
+        }
+    )
+
+
+def _extract_distinct_overlap_pairs(
+    block_assignments: BlockAssignmentsLike,
+) -> pa.Table:
+    """Return a 2-column distinct ``(alignment_id, data_exon_id)`` table.
+
+    Accepts an in-memory table or a Parquet path. The path variant
+    stream-scans the dataset in batches and group-by-deduplicates each
+    batch before the final cross-batch dedup — peak resident is bounded
+    by the per-batch row count + the cardinality of distinct pairs (~7
+    GB at mouse scale), not the full ~50 GB block_assignments file.
+    """
+    empty = pa.table(
+        {
+            "alignment_id": pa.array([], type=pa.int64()),
+            "data_exon_id": pa.array([], type=pa.int64()),
+        }
+    )
+    if isinstance(block_assignments, pa.Table):
+        if block_assignments.num_rows == 0:
+            return empty
+        return (
+            block_assignments.select(["alignment_id", "data_exon_id"])
+            .group_by(["alignment_id", "data_exon_id"])
+            .aggregate([])
+        )
+    if isinstance(block_assignments, (str, Path)):
+        ds = pa_dataset.dataset(str(block_assignments))
+        per_batch: list[pa.Table] = []
+        for batch in ds.to_batches(columns=["alignment_id", "data_exon_id"]):
+            if batch.num_rows == 0:
+                continue
+            tbl = pa.Table.from_batches([batch])
+            per_batch.append(
+                tbl.group_by(["alignment_id", "data_exon_id"]).aggregate([])
+            )
+        if not per_batch:
+            return empty
+        return (
+            pa.concat_tables(per_batch)
+            .group_by(["alignment_id", "data_exon_id"])
+            .aggregate([])
+        )
+    raise TypeError(
+        f"block_assignments must be pa.Table or path, got {type(block_assignments)!r}"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -727,13 +1072,14 @@ def compute_exon_psi(
 
 
 def build_derived_annotation(
-    coverage: pa.Table,
+    coverage: pa.Table | Path | str,
     introns: pa.Table,
     alignment_blocks: pa.Table,
     alignments: pa.Table,
     contigs: pa.Table,
     *,
-    read_to_sample: Mapping[str, int] | None = None,
+    read_to_sample: pa.Table | None = None,
+    block_assignments_output_path: Path | None = None,
     min_exon_depth: int = 5,
     min_intron_read_count: int = 3,
 ):
@@ -741,13 +1087,35 @@ def build_derived_annotation(
     :func:`roll_up_genes` → :func:`assign_blocks_to_exons` →
     :func:`compute_exon_psi`.
 
+    Parameters
+    ----------
+    coverage : pa.Table | Path | str
+        ``COVERAGE_TABLE`` data, either in-memory (tests + Jupyter) or
+        a path to the Parquet file written by :func:`build_pileup` in
+        streaming mode (production). Path variant is read once via
+        ``pq.read_table`` — coverage post-RLE is small enough that
+        in-memory consumption inside ``derive_exons`` is fine.
+    introns, alignment_blocks, alignments, contigs
+        Standard Arrow inputs.
+    read_to_sample : pa.Table | None
+        2-column ``(read_id, sample_id)`` Arrow table for per-sample
+        PSI stratification. None → unstratified (sample_id = -1).
+    block_assignments_output_path : Path | None
+        When provided, :func:`assign_blocks_to_exons` streams the M:N
+        block × exon edge table to this Parquet file and
+        :func:`compute_exon_psi` reads it back as a dataset. When
+        None, the edge table stays in memory and is returned in the
+        result tuple (tests + Jupyter ergonomic).
+
     Returns
     -------
     (annotation, block_assignments, exon_psi)
         - ``annotation`` : :class:`Annotation` with FEATURE_TABLE
           containing gene + exon rows. Empty when no trusted introns
           are present.
-        - ``block_assignments`` : ``BLOCK_EXON_ASSIGNMENT_TABLE``-shaped.
+        - ``block_assignments`` : ``BLOCK_EXON_ASSIGNMENT_TABLE``-shaped
+          table if ``block_assignments_output_path`` is None; otherwise
+          the same `Path` (production callers consume from disk).
         - ``exon_psi`` : ``EXON_PSI_TABLE``-shaped.
     """
     # Local import to avoid circular import at module load time.
@@ -759,8 +1127,13 @@ def build_derived_annotation(
         "source": "constellation_derived",
     }
 
+    if isinstance(coverage, (str, Path)):
+        coverage_table = pq.read_table(str(coverage))
+    else:
+        coverage_table = coverage
+
     exons = derive_exons(
-        coverage, introns, contigs,
+        coverage_table, introns, contigs,
         min_exon_depth=min_exon_depth,
         min_intron_read_count=min_intron_read_count,
     )
@@ -769,27 +1142,59 @@ def build_derived_annotation(
             features=_empty_features_table(),
             metadata_extras=metadata,
         )
+        empty_ba: pa.Table | Path
+        if block_assignments_output_path is not None:
+            # Still write an empty Parquet so the CLI manifest can
+            # reference the path uniformly.
+            Path(block_assignments_output_path).parent.mkdir(
+                parents=True, exist_ok=True
+            )
+            pq.write_table(
+                _empty_block_assignments(),
+                str(block_assignments_output_path),
+            )
+            empty_ba = Path(block_assignments_output_path)
+        else:
+            empty_ba = _empty_block_assignments()
         return (
             empty_annotation,
-            _empty_block_assignments(),
+            empty_ba,
             _empty_exon_psi(),
         )
 
     full_features = roll_up_genes(
         exons, introns, min_intron_read_count=min_intron_read_count
     )
-    block_assignments = assign_blocks_to_exons(
-        alignment_blocks, alignments, full_features, contigs
-    )
+
+    if block_assignments_output_path is not None:
+        # Streaming mode: write to disk; compute_exon_psi reads back
+        # as a dataset.
+        assign_blocks_to_exons(
+            alignment_blocks, alignments, full_features, contigs,
+            output_path=Path(block_assignments_output_path),
+        )
+        block_assignments_for_psi: BlockAssignmentsLike = Path(
+            block_assignments_output_path
+        )
+        block_assignments_return: pa.Table | Path = Path(
+            block_assignments_output_path
+        )
+    else:
+        block_assignments_table = assign_blocks_to_exons(
+            alignment_blocks, alignments, full_features, contigs,
+        )
+        block_assignments_for_psi = block_assignments_table
+        block_assignments_return = block_assignments_table
+
     exon_psi = compute_exon_psi(
-        block_assignments, alignments, full_features, contigs,
+        block_assignments_for_psi, alignments, full_features, contigs,
         read_to_sample=read_to_sample,
     )
     annotation = Annotation(
         features=full_features,
         metadata_extras=metadata,
     )
-    return annotation, block_assignments, exon_psi
+    return annotation, block_assignments_return, exon_psi
 
 
 __all__ = [

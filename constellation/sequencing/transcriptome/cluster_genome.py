@@ -39,11 +39,12 @@ from __future__ import annotations
 
 import hashlib
 import statistics
-from collections.abc import Mapping
 from typing import Any
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import torch
 
 from constellation.sequencing.align.consensus import build_consensus
 from constellation.sequencing.reference.reference import GenomeReference
@@ -51,6 +52,13 @@ from constellation.sequencing.schemas.transcriptome import (
     CLUSTER_MEMBERSHIP_TABLE,
     TRANSCRIPT_CLUSTER_TABLE,
 )
+
+
+# Sentinel used in place of null sample_id while sorting / walking
+# partition boundaries — torch can diff a plain int64 tensor but not
+# a nullable Arrow column directly. Output sample_id is converted
+# back to nullable on the cluster row.
+_SAMPLE_NULL_SENTINEL: int = -1 << 60
 
 
 _LAYER0_DIGEST_SIZE = 8
@@ -88,63 +96,101 @@ def _strand_signed_drift(
     return drift_5p, drift_3p
 
 
-def _build_alignment_metrics(
-    alignment_blocks: pa.Table,
-) -> dict[int, dict[str, int]]:
+def _build_alignment_metrics(alignment_blocks: pa.Table) -> pa.Table:
     """Sum n_match / n_mismatch / n_insert / n_delete per alignment_id.
 
-    Returns ``{alignment_id: {'n_match', 'n_mismatch', 'n_insert',
-    'n_delete'}}``. ``n_match`` / ``n_mismatch`` may be 0 when only
-    CIGAR-derived (cs:long absent) — caller flags ``match_rate`` /
-    ``indel_rate`` as null in that case.
+    Returns a 6-column Arrow table keyed on ``alignment_id``:
+    ``n_match_sum, n_mismatch_sum, n_insert_sum, n_delete_sum,
+    cs_aware``. The prior dict-returning version did 5 × to_pylist over
+    ~200M-row block tables and accumulated nested Python dicts —
+    catastrophic at scale. Now a single Arrow group_by aggregate replaces
+    the inner Python row loop with a multithreaded C++ kernel call.
+
+    ``n_match`` / ``n_mismatch`` are nullable on the input
+    (cs:long absent → CIGAR-only block). To preserve the prior
+    "cs_aware=False propagates if ANY contributing block is missing"
+    semantics, we coerce missing values to 0 for summation but track
+    cs-awareness via a per-block int8 indicator min-aggregated per
+    alignment (any 0 wins).
     """
+    out_schema = pa.schema(
+        [
+            pa.field("alignment_id", pa.int64(), nullable=False),
+            pa.field("n_match_sum", pa.int64(), nullable=False),
+            pa.field("n_mismatch_sum", pa.int64(), nullable=False),
+            pa.field("n_insert_sum", pa.int64(), nullable=False),
+            pa.field("n_delete_sum", pa.int64(), nullable=False),
+            pa.field("cs_aware", pa.bool_(), nullable=False),
+        ]
+    )
     if alignment_blocks.num_rows == 0:
-        return {}
-    aids = alignment_blocks.column("alignment_id").to_pylist()
-    nm = alignment_blocks.column("n_match").to_pylist()
-    nx = alignment_blocks.column("n_mismatch").to_pylist()
-    ni = alignment_blocks.column("n_insert").to_pylist()
-    nd = alignment_blocks.column("n_delete").to_pylist()
-    out: dict[int, dict[str, int]] = {}
-    for aid, m, x, i, d in zip(aids, nm, nx, ni, nd, strict=True):
-        rec = out.setdefault(
-            int(aid),
-            {"n_match": 0, "n_mismatch": 0, "n_insert": 0, "n_delete": 0,
-             "cs_aware": True},
-        )
-        if m is None or x is None:
-            rec["cs_aware"] = False
-        else:
-            rec["n_match"] += int(m)
-            rec["n_mismatch"] += int(x)
-        rec["n_insert"] += int(i)
-        rec["n_delete"] += int(d)
-    return out
+        return out_schema.empty_table()
+
+    cs_aware_per_block = pc.and_(
+        pc.is_valid(alignment_blocks.column("n_match")),
+        pc.is_valid(alignment_blocks.column("n_mismatch")),
+    )
+    aug = pa.table(
+        {
+            "alignment_id": alignment_blocks.column("alignment_id"),
+            "n_match": pc.fill_null(alignment_blocks.column("n_match"), 0),
+            "n_mismatch": pc.fill_null(
+                alignment_blocks.column("n_mismatch"), 0
+            ),
+            "n_insert": alignment_blocks.column("n_insert"),
+            "n_delete": alignment_blocks.column("n_delete"),
+            "cs_aware_int": pc.cast(cs_aware_per_block, pa.int8()),
+        }
+    )
+    aggregated = aug.group_by("alignment_id").aggregate(
+        [
+            ("n_match", "sum"),
+            ("n_mismatch", "sum"),
+            ("n_insert", "sum"),
+            ("n_delete", "sum"),
+            ("cs_aware_int", "min"),
+        ]
+    )
+    return pa.table(
+        {
+            "alignment_id": aggregated.column("alignment_id"),
+            "n_match_sum": pc.cast(
+                aggregated.column("n_match_sum"), pa.int64()
+            ),
+            "n_mismatch_sum": pc.cast(
+                aggregated.column("n_mismatch_sum"), pa.int64()
+            ),
+            "n_insert_sum": pc.cast(
+                aggregated.column("n_insert_sum"), pa.int64()
+            ),
+            "n_delete_sum": pc.cast(
+                aggregated.column("n_delete_sum"), pa.int64()
+            ),
+            "cs_aware": pc.equal(
+                aggregated.column("cs_aware_int_min"), pa.scalar(1, type=pa.int8())
+            ),
+        },
+        schema=out_schema,
+    )
 
 
-def _build_alignment_lookup(alignments: pa.Table) -> dict[str, dict[str, Any]]:
-    """``read_id → {alignment_id, ref_start}`` for primary alignments only.
+def _build_alignment_lookup(alignments: pa.Table) -> pa.Table:
+    """Primary-alignment metadata keyed on ``read_id``.
 
-    Phase 2's clustering operates per-read; the (read_id → primary
-    alignment_id) lookup keys cluster membership back into the
-    alignment_blocks / alignment_cs row space.
+    Returns a 3-column Arrow table: ``(read_id, alignment_id,
+    ref_start)``. The prior dict-of-dicts version cost 3 × to_pylist
+    over the ~200M-row alignments table and a 200M-iter dict-of-dicts
+    build. The replacement is a single Arrow filter + select that
+    plugs directly into the join in
+    :func:`cluster_by_fingerprint`'s prologue.
     """
     primary_mask = pc.and_(
         pc.invert(alignments.column("is_secondary")),
         pc.invert(alignments.column("is_supplementary")),
     )
-    primary = alignments.filter(primary_mask).select(
+    return alignments.filter(primary_mask).select(
         ["read_id", "alignment_id", "ref_start"]
     )
-    return {
-        str(rid): {"alignment_id": int(aid), "ref_start": int(rs)}
-        for rid, aid, rs in zip(
-            primary.column("read_id").to_pylist(),
-            primary.column("alignment_id").to_pylist(),
-            primary.column("ref_start").to_pylist(),
-            strict=True,
-        )
-    }
 
 
 def _layer0_derep(
@@ -246,7 +292,7 @@ def cluster_by_fingerprint(
     alignment_blocks: pa.Table | None = None,
     alignment_cs: pa.Table | None = None,
     genome: GenomeReference | None = None,
-    read_to_sample: Mapping[str, int] | None = None,
+    read_to_sample: pa.Table | None = None,
     max_5p_drift: int = 25,
     max_3p_drift: int = 75,
     min_cluster_size: int = 1,
@@ -283,10 +329,11 @@ def cluster_by_fingerprint(
     genome : GenomeReference, optional
         Required when ``build_consensus_seq=True``; supplies the
         reference window for PWM accumulation.
-    read_to_sample : Mapping[str, int], optional
-        ``read_id → sample_id`` for ``per_sample_clusters`` mode.
-        Reads without a sample mapping fall into the "unassigned"
-        partition (``sample_id`` column null in the output).
+    read_to_sample : pa.Table, optional
+        2-column Arrow table with ``read_id`` (string) + ``sample_id``
+        (int64) for ``per_sample_clusters`` mode. Reads without a sample
+        mapping fall into the "unassigned" partition (``sample_id``
+        column null in the output).
     max_5p_drift, max_3p_drift : int
         Strand-aware bp tolerance for the span-coherence filter.
         Defaults 25 / 75 mirror the lab observations on TSS / polyA
@@ -326,31 +373,45 @@ def cluster_by_fingerprint(
             CLUSTER_MEMBERSHIP_TABLE.empty_table(),
         )
 
-    # ── Precompute lookups ──────────────────────────────────────────
-    seq_lookup: dict[str, str] = {
-        str(rid): str(seq)
-        for rid, seq in zip(
-            reads.column("read_id").to_pylist(),
-            reads.column("sequence").to_pylist(),
-            strict=True,
-        )
-    }
-    quality_lookup: dict[str, float] = {}
-    if "dorado_quality" in reads.schema.names:
-        for rid, q in zip(
-            reads.column("read_id").to_pylist(),
-            reads.column("dorado_quality").to_pylist(),
-            strict=True,
-        ):
-            if q is not None:
-                quality_lookup[str(rid)] = float(q)
+    # ── Enrich fingerprints (Fix 10) ──────────────────────────────
+    # Single Arrow-join chain replaces the prior 5 × to_pylist + dict
+    # builds (seq_lookup, quality_lookup, primary_lookup, metrics_by_aid,
+    # contig_id_to_name) that each scaled with N_reads and pinned ~50+
+    # GB of nested Python dicts at mouse scale.
     primary_lookup = _build_alignment_lookup(alignments)
-    if alignment_blocks is not None:
-        metrics_by_aid = _build_alignment_metrics(alignment_blocks)
-    else:
-        metrics_by_aid = {}
+    metrics_table: pa.Table | None = (
+        _build_alignment_metrics(alignment_blocks)
+        if alignment_blocks is not None
+        else None
+    )
 
-    # Build (alignment_id → contig sequence) lazy cache for consensus.
+    reads_cols = ["read_id", "sequence"]
+    has_quality = "dorado_quality" in reads.schema.names
+    if has_quality:
+        reads_cols.append("dorado_quality")
+
+    enriched = fingerprints.join(
+        reads.select(reads_cols), keys="read_id", join_type="left outer"
+    )
+    enriched = enriched.join(
+        primary_lookup, keys="read_id", join_type="left outer"
+    )
+    if metrics_table is not None:
+        enriched = enriched.join(
+            metrics_table, keys="alignment_id", join_type="left outer"
+        )
+
+    if per_sample_clusters and read_to_sample is not None:
+        enriched = enriched.join(
+            read_to_sample, keys="read_id", join_type="left outer"
+        )
+    else:
+        enriched = enriched.append_column(
+            "sample_id",
+            pa.array([None] * enriched.num_rows, type=pa.int64()),
+        )
+
+    # contig_id → name lookup (small — keep as dict for consensus path).
     contig_id_to_name: dict[int, str] = {}
     if genome is not None:
         for cid, name in zip(
@@ -360,192 +421,48 @@ def cluster_by_fingerprint(
         ):
             contig_id_to_name[int(cid)] = str(name)
 
-    # ── Partition fingerprints ──────────────────────────────────────
-    # Iterate as Python rows once; partitioning logic is small enough
-    # not to need pa.compute group_by gymnastics, and the per-group
-    # work is row-shaped anyway.
-    rows = fingerprints.to_pylist()
-    partitions: dict[
-        tuple[int, str, int | None],
-        list[dict[str, Any]],
-    ] = {}
-    for r in rows:
-        sample_id = None
-        if per_sample_clusters and read_to_sample is not None:
-            sample_id = read_to_sample.get(str(r["read_id"]))
-        key = (int(r["contig_id"]), str(r["strand"]), sample_id)
-        partitions.setdefault(key, []).append(r)
+    # ── Sort + boundary walk (Fix 11) ─────────────────────────────
+    # The two-level dict-of-dicts partition build at 200M-fingerprint
+    # scale is replaced by one Arrow sort + a torch boundary scan over
+    # the 4-tuple cluster key. Output cluster slices are small (typical
+    # mean cluster size ~tens of reads), so the per-cluster iteration
+    # body stays Python — bounded by cluster count, not read count.
+    enriched_sorted = enriched.sort_by(
+        [
+            ("contig_id", "ascending"),
+            ("strand", "ascending"),
+            ("sample_id", "ascending"),
+            ("fingerprint_hash", "ascending"),
+        ]
+    ).combine_chunks()
+    boundaries = _cluster_boundaries(enriched_sorted)
 
-    # ── Cluster each partition ──────────────────────────────────────
     cluster_rows: list[dict[str, Any]] = []
     membership_rows: list[dict[str, Any]] = []
     next_cluster_id = int(cluster_id_seed)
 
-    for (contig_id, strand, sample_id), partition_rows in partitions.items():
-        # Group by fingerprint_hash inside the partition.
-        groups: dict[int, list[dict[str, Any]]] = {}
-        for r in partition_rows:
-            groups.setdefault(int(r["fingerprint_hash"]), []).append(r)
-
-        for fp_hash, members in groups.items():
-            n_total = len(members)
-            # Drift filter (singletons skip — no median to compare).
-            if n_total > 1:
-                med_start = statistics.median(
-                    int(m["span_start"]) for m in members
-                )
-                med_end = statistics.median(
-                    int(m["span_end"]) for m in members
-                )
-                kept: list[dict[str, Any]] = []
-                drifted: list[dict[str, Any]] = []
-                for m in members:
-                    drift_5p, drift_3p = _strand_signed_drift(
-                        int(m["span_start"]),
-                        int(m["span_end"]),
-                        med_start,
-                        med_end,
-                        strand,
-                    )
-                    m["_drift_5p"] = drift_5p
-                    m["_drift_3p"] = drift_3p
-                    if (abs(drift_5p) > max_5p_drift
-                            or abs(drift_3p) > max_3p_drift):
-                        drifted.append(m)
-                    else:
-                        kept.append(m)
-            else:
-                kept = members
-                drifted = []
-                for m in members:
-                    m["_drift_5p"] = None
-                    m["_drift_3p"] = None
-
-            if len(kept) < min_cluster_size:
-                # Whole cluster (including drift_filtered) drops out.
-                continue
-
-            # Layer-0 derep + representative selection.
-            kept_ids = [str(m["read_id"]) for m in kept]
-            rep_id, n_unique, hash_of_read, _counts = _layer0_derep(
-                kept_ids, seq_lookup, quality_lookup
-            )
-
-            cluster_id = next_cluster_id
-            next_cluster_id += 1
-
-            # Optional consensus.
-            consensus_seq: str | None = None
-            if build_consensus_seq:
-                # Use the cluster's median span window for the PWM.
-                kept_starts = [int(m["span_start"]) for m in kept]
-                kept_ends = [int(m["span_end"]) for m in kept]
-                window_start = min(kept_starts)
-                window_end = max(kept_ends)
-                contig_name = contig_id_to_name.get(int(contig_id))
-                if contig_name is not None and genome is not None:
-                    contig_seq = genome.sequence_of(int(contig_id))
-                    window_seq = contig_seq[window_start:window_end]
-                    member_aids: list[int] = []
-                    member_weights: list[float] = []
-                    member_ref_starts: list[int] = []
-                    for m in kept:
-                        rid = str(m["read_id"])
-                        info = primary_lookup.get(rid)
-                        if info is None:
-                            continue
-                        member_aids.append(int(info["alignment_id"]))
-                        # Weight = Layer-0 abundance = 1 per read for
-                        # genome-anchored consensus (consistent with the
-                        # most-abundant-unique-sequence representative
-                        # already chosen). Phase 3 plugs in de novo
-                        # abundance here.
-                        member_weights.append(1.0)
-                        member_ref_starts.append(int(info["ref_start"]))
-                    if member_aids and alignment_cs is not None:
-                        consensus_seq = build_consensus(
-                            member_alignment_ids=member_aids,
-                            member_weights=member_weights,
-                            member_ref_starts=member_ref_starts,
-                            alignment_cs=alignment_cs,
-                            reference_sequence=window_seq,
-                            reference_start=window_start,
-                        )
-
-            # Cluster row.
-            kept_starts = [int(m["span_start"]) for m in kept]
-            kept_ends = [int(m["span_end"]) for m in kept]
-            cluster_rows.append(
-                {
-                    "cluster_id": int(cluster_id),
-                    "representative_read_id": str(rep_id),
-                    "n_reads": int(len(kept)),
-                    "identity_threshold": None,
-                    "consensus_sequence": consensus_seq,
-                    "predicted_protein": None,
-                    "orf_start": None,
-                    "orf_end": None,
-                    "orf_strand": None,
-                    "codon_table": None,
-                    "mode": "genome-guided",
-                    "contig_id": int(contig_id),
-                    "strand": str(strand),
-                    "span_start": int(min(kept_starts)),
-                    "span_end": int(max(kept_ends)),
-                    "fingerprint_hash": int(fp_hash),
-                    "n_unique_sequences": int(n_unique) if n_unique > 0 else 1,
-                    "sample_id": (None if sample_id is None else int(sample_id)),
-                }
-            )
-
-            # Membership rows — kept members.
-            rep_seq_hash = hash_of_read.get(rep_id)
-            for m in kept:
-                rid = str(m["read_id"])
-                role = "member"
-                if rid == rep_id:
-                    role = "representative"
-                elif rep_seq_hash is not None and hash_of_read.get(rid) == rep_seq_hash:
-                    role = "duplicate"
-                info = primary_lookup.get(rid)
-                metrics = (
-                    metrics_by_aid.get(int(info["alignment_id"]))
-                    if info is not None
-                    else None
-                )
-                drift_5p = m.get("_drift_5p") if role == "member" else None
-                drift_3p = m.get("_drift_3p") if role == "member" else None
-                membership_rows.append(
-                    _make_membership_row(
-                        cluster_id=cluster_id,
-                        read_id=rid,
-                        role=role,
-                        drift_5p_bp=drift_5p,
-                        drift_3p_bp=drift_3p,
-                        metrics=metrics,
-                    )
-                )
-
-            # Membership rows — drift-filtered.
-            if not drop_drift_filtered:
-                for m in drifted:
-                    rid = str(m["read_id"])
-                    info = primary_lookup.get(rid)
-                    metrics = (
-                        metrics_by_aid.get(int(info["alignment_id"]))
-                        if info is not None
-                        else None
-                    )
-                    membership_rows.append(
-                        _make_membership_row(
-                            cluster_id=cluster_id,
-                            read_id=rid,
-                            role="drift_filtered",
-                            drift_5p_bp=m.get("_drift_5p"),
-                            drift_3p_bp=m.get("_drift_3p"),
-                            metrics=metrics,
-                        )
-                    )
+    for start, size in boundaries:
+        slice_table = enriched_sorted.slice(start, size)
+        emitted = _emit_cluster(
+            slice_table,
+            cluster_id=next_cluster_id,
+            max_5p_drift=max_5p_drift,
+            max_3p_drift=max_3p_drift,
+            min_cluster_size=min_cluster_size,
+            build_consensus_seq=build_consensus_seq,
+            drop_drift_filtered=drop_drift_filtered,
+            genome=genome,
+            alignment_cs=alignment_cs,
+            contig_id_to_name=contig_id_to_name,
+            has_metrics=metrics_table is not None,
+            has_quality=has_quality,
+        )
+        if emitted is None:
+            continue
+        cluster_row, members_rows = emitted
+        cluster_rows.append(cluster_row)
+        membership_rows.extend(members_rows)
+        next_cluster_id += 1
 
     if not cluster_rows:
         return (
@@ -557,6 +474,254 @@ def cluster_by_fingerprint(
         membership_rows, schema=CLUSTER_MEMBERSHIP_TABLE
     )
     return clusters, membership
+
+
+def _cluster_boundaries(enriched_sorted: pa.Table) -> list[tuple[int, int]]:
+    """Walk consecutive ``(contig_id, strand, sample_id, fingerprint_hash)``
+    runs in the already-sorted enriched table.
+
+    Each unique 4-tuple = one cluster. ``strand`` is dictionary-encoded
+    to an int32 indices array for the torch boundary diff; nulls in
+    ``sample_id`` are filled with a sentinel so the diff treats them
+    consistently.
+    """
+    n = enriched_sorted.num_rows
+    if n == 0:
+        return []
+
+    def _col_np(col: pa.ChunkedArray | pa.Array) -> np.ndarray:
+        if isinstance(col, pa.ChunkedArray):
+            col = col.combine_chunks()
+        return col.to_numpy(zero_copy_only=False)
+
+    contig = _col_np(enriched_sorted.column("contig_id"))
+    fp = _col_np(enriched_sorted.column("fingerprint_hash"))
+    sample_filled = pc.fill_null(
+        enriched_sorted.column("sample_id"), _SAMPLE_NULL_SENTINEL
+    )
+    sample = _col_np(sample_filled)
+    strand_dict = pc.dictionary_encode(enriched_sorted.column("strand"))
+    if isinstance(strand_dict, pa.ChunkedArray):
+        strand_dict = strand_dict.combine_chunks()
+    strand_idx = strand_dict.indices.to_numpy(zero_copy_only=False)
+
+    contig_t = torch.from_numpy(contig.astype(np.int64, copy=False))
+    fp_t = torch.from_numpy(fp.astype(np.int64, copy=False))
+    sample_t = torch.from_numpy(sample.astype(np.int64, copy=False))
+    strand_t = torch.from_numpy(strand_idx.astype(np.int64, copy=False))
+
+    change_mask = torch.zeros(n, dtype=torch.bool)
+    change_mask[0] = True
+    if n > 1:
+        change_mask[1:] = (
+            (contig_t[1:] != contig_t[:-1])
+            | (strand_t[1:] != strand_t[:-1])
+            | (sample_t[1:] != sample_t[:-1])
+            | (fp_t[1:] != fp_t[:-1])
+        )
+    starts = torch.nonzero(change_mask, as_tuple=False).squeeze(1).tolist()
+    starts.append(n)
+    return [(starts[i], starts[i + 1] - starts[i]) for i in range(len(starts) - 1)]
+
+
+def _emit_cluster(
+    slice_table: pa.Table,
+    *,
+    cluster_id: int,
+    max_5p_drift: int,
+    max_3p_drift: int,
+    min_cluster_size: int,
+    build_consensus_seq: bool,
+    drop_drift_filtered: bool,
+    genome: GenomeReference | None,
+    alignment_cs: pa.Table | None,
+    contig_id_to_name: dict[int, str],
+    has_metrics: bool,
+    has_quality: bool,
+) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    """Per-cluster work: drift filter + Layer-0 derep + optional
+    consensus + cluster row + membership rows.
+
+    ``slice_table`` is a small Arrow slice (typically tens of rows)
+    covering one ``(contig, strand, sample, fingerprint)`` cluster. We
+    ``to_pylist()`` it once — bounded by cluster size, not by total
+    read count — and the rest of the per-cluster work is row-shaped by
+    construction (median, hashing, representative selection).
+    """
+    members = slice_table.to_pylist()
+    n_total = len(members)
+    if n_total == 0:
+        return None
+    contig_id = int(members[0]["contig_id"])
+    strand = str(members[0]["strand"])
+    sample_id_raw = members[0]["sample_id"]
+    fp_hash = int(members[0]["fingerprint_hash"])
+
+    # Drift filter (singletons skip — no median to compare).
+    if n_total > 1:
+        med_start = statistics.median(int(m["span_start"]) for m in members)
+        med_end = statistics.median(int(m["span_end"]) for m in members)
+        kept: list[dict[str, Any]] = []
+        drifted: list[dict[str, Any]] = []
+        for m in members:
+            drift_5p, drift_3p = _strand_signed_drift(
+                int(m["span_start"]),
+                int(m["span_end"]),
+                med_start,
+                med_end,
+                strand,
+            )
+            m["_drift_5p"] = drift_5p
+            m["_drift_3p"] = drift_3p
+            if abs(drift_5p) > max_5p_drift or abs(drift_3p) > max_3p_drift:
+                drifted.append(m)
+            else:
+                kept.append(m)
+    else:
+        kept = members
+        drifted = []
+        for m in members:
+            m["_drift_5p"] = None
+            m["_drift_3p"] = None
+
+    if len(kept) < min_cluster_size:
+        return None
+
+    # Layer-0 derep — sequences and qualities are now columns on the
+    # enriched slice, not external dicts. Use _layer0_derep with
+    # adapter dicts built per-cluster (bounded by cluster size).
+    kept_ids = [str(m["read_id"]) for m in kept]
+    seq_lookup: dict[str, str] = {}
+    for m in kept:
+        seq = m.get("sequence")
+        if seq is not None:
+            seq_lookup[str(m["read_id"])] = str(seq)
+    quality_lookup: dict[str, float] = {}
+    if has_quality:
+        for m in kept:
+            q = m.get("dorado_quality")
+            if q is not None:
+                quality_lookup[str(m["read_id"])] = float(q)
+    rep_id, n_unique, hash_of_read, _counts = _layer0_derep(
+        kept_ids, seq_lookup, quality_lookup
+    )
+
+    consensus_seq: str | None = None
+    kept_starts_list = [int(m["span_start"]) for m in kept]
+    kept_ends_list = [int(m["span_end"]) for m in kept]
+    if build_consensus_seq and genome is not None and alignment_cs is not None:
+        window_start = min(kept_starts_list)
+        window_end = max(kept_ends_list)
+        contig_name = contig_id_to_name.get(contig_id)
+        if contig_name is not None:
+            contig_seq = genome.sequence_of(contig_id)
+            window_seq = contig_seq[window_start:window_end]
+            member_aids: list[int] = []
+            member_weights: list[float] = []
+            member_ref_starts: list[int] = []
+            for m in kept:
+                aid = m.get("alignment_id")
+                rs = m.get("ref_start")
+                if aid is None or rs is None:
+                    continue
+                member_aids.append(int(aid))
+                member_weights.append(1.0)
+                member_ref_starts.append(int(rs))
+            if member_aids:
+                consensus_seq = build_consensus(
+                    member_alignment_ids=member_aids,
+                    member_weights=member_weights,
+                    member_ref_starts=member_ref_starts,
+                    alignment_cs=alignment_cs,
+                    reference_sequence=window_seq,
+                    reference_start=window_start,
+                )
+
+    cluster_row = {
+        "cluster_id": int(cluster_id),
+        "representative_read_id": str(rep_id),
+        "n_reads": int(len(kept)),
+        "identity_threshold": None,
+        "consensus_sequence": consensus_seq,
+        "predicted_protein": None,
+        "orf_start": None,
+        "orf_end": None,
+        "orf_strand": None,
+        "codon_table": None,
+        "mode": "genome-guided",
+        "contig_id": contig_id,
+        "strand": strand,
+        "span_start": int(min(kept_starts_list)),
+        "span_end": int(max(kept_ends_list)),
+        "fingerprint_hash": int(fp_hash),
+        "n_unique_sequences": int(n_unique) if n_unique > 0 else 1,
+        "sample_id": (None if sample_id_raw is None else int(sample_id_raw)),
+    }
+
+    membership_rows: list[dict[str, Any]] = []
+    rep_seq_hash = hash_of_read.get(rep_id)
+    for m in kept:
+        rid = str(m["read_id"])
+        role = "member"
+        if rid == rep_id:
+            role = "representative"
+        elif (
+            rep_seq_hash is not None and hash_of_read.get(rid) == rep_seq_hash
+        ):
+            role = "duplicate"
+        metrics = _metrics_from_member_row(m) if has_metrics else None
+        drift_5p = m.get("_drift_5p") if role == "member" else None
+        drift_3p = m.get("_drift_3p") if role == "member" else None
+        membership_rows.append(
+            _make_membership_row(
+                cluster_id=cluster_id,
+                read_id=rid,
+                role=role,
+                drift_5p_bp=drift_5p,
+                drift_3p_bp=drift_3p,
+                metrics=metrics,
+            )
+        )
+
+    if not drop_drift_filtered:
+        for m in drifted:
+            rid = str(m["read_id"])
+            metrics = _metrics_from_member_row(m) if has_metrics else None
+            membership_rows.append(
+                _make_membership_row(
+                    cluster_id=cluster_id,
+                    read_id=rid,
+                    role="drift_filtered",
+                    drift_5p_bp=m.get("_drift_5p"),
+                    drift_3p_bp=m.get("_drift_3p"),
+                    metrics=metrics,
+                )
+            )
+
+    return cluster_row, membership_rows
+
+
+def _metrics_from_member_row(
+    member: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Repack the joined-in metric columns into the ``metrics`` dict
+    that :func:`_make_membership_row` expects. Returns ``None`` when
+    the alignment had no metric rows joined (e.g. unmapped read or
+    metrics_table not supplied).
+    """
+    aid = member.get("alignment_id")
+    if aid is None:
+        return None
+    cs_aware = member.get("cs_aware")
+    if cs_aware is None:
+        return None
+    return {
+        "n_match": int(member.get("n_match_sum") or 0),
+        "n_mismatch": int(member.get("n_mismatch_sum") or 0),
+        "n_insert": int(member.get("n_insert_sum") or 0),
+        "n_delete": int(member.get("n_delete_sum") or 0),
+        "cs_aware": bool(cs_aware),
+    }
 
 
 __all__ = ["cluster_by_fingerprint"]

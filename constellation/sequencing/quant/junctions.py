@@ -44,8 +44,10 @@ from __future__ import annotations
 import bisect
 from collections.abc import Sequence
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import torch
 
 from constellation.sequencing.schemas.alignment import INTRON_TABLE
 
@@ -174,6 +176,10 @@ def aggregate_junctions(
         if alignments.num_rows == 0:
             return INTRON_TABLE.empty_table()
 
+    # Arrow-native: join blocks × primary on alignment_id (multithreaded
+    # C++), attach contig_id via second join with the contigs table, then
+    # sort once on (alignment_id, block_index). Junction pairs fall out of
+    # a torch boolean mask on consecutive rows.
     primary = alignments.select(
         ["alignment_id", "read_id", "ref_name", "strand"]
     )
@@ -181,85 +187,122 @@ def aggregate_junctions(
     if joined.num_rows == 0:
         return INTRON_TABLE.empty_table()
 
-    name_to_id = _contig_id_lookup(genome.contigs)
-
-    # Group blocks by alignment_id; build per-alignment junction list
-    # ordered by block_index. Collect (donor, acceptor, read_id) per
-    # junction so cross-read aggregation can count distinct reads.
-    by_aid: dict[int, list[tuple[int, int, int]]] = {}
-    aid_meta: dict[int, dict[str, object]] = {}
-    aids = joined.column("alignment_id").to_pylist()
-    bidx = joined.column("block_index").to_pylist()
-    rstart = joined.column("ref_start").to_pylist()
-    rend = joined.column("ref_end").to_pylist()
-    rid = joined.column("read_id").to_pylist()
-    rname = joined.column("ref_name").to_pylist()
-    strand = joined.column("strand").to_pylist()
-    for a, bi, rs, re_, r_id, ref_n, st in zip(
-        aids, bidx, rstart, rend, rid, rname, strand, strict=True
-    ):
-        by_aid.setdefault(int(a), []).append((int(bi), int(rs), int(re_)))
-        aid_meta.setdefault(
-            int(a),
-            {
-                "read_id": str(r_id),
-                "ref_name": str(ref_n),
-                "strand": str(st),
-            },
-        )
-
-    # Aggregate: (contig_id, donor, acceptor, strand) → set of read_ids.
-    counts: dict[tuple[int, int, int, str], set[str]] = {}
-    for aid, blocks in by_aid.items():
-        blocks.sort(key=lambda t: t[0])
-        meta = aid_meta[aid]
-        contig_id = name_to_id.get(meta["ref_name"])
-        if contig_id is None:
-            continue
-        ends = [b[2] for b in blocks]
-        starts = [b[1] for b in blocks]
-        for donor, acceptor in zip(ends[:-1], starts[1:]):
-            key = (int(contig_id), int(donor), int(acceptor), str(meta["strand"]))
-            counts.setdefault(key, set()).add(str(meta["read_id"]))
-
-    if not counts:
+    contig_lookup = genome.contigs.select(["contig_id", "name"]).rename_columns(
+        ["contig_id", "ref_name"]
+    )
+    joined = joined.join(contig_lookup, keys="ref_name", join_type="inner")
+    if joined.num_rows < 2:
         return INTRON_TABLE.empty_table()
 
-    annotated_donors: dict[int, frozenset[int]] = {}
-    annotated_acceptors: dict[int, frozenset[int]] = {}
+    joined = joined.sort_by(
+        [("alignment_id", "ascending"), ("block_index", "ascending")]
+    ).combine_chunks()
+
+    # Bridge numeric columns to torch (zero-copy via numpy). After
+    # combine_chunks() each column has a single chunk so to_numpy()
+    # zero-copies the Arrow buffer into a numpy view; torch.from_numpy
+    # then borrows that view. String columns (strand, read_id) stay in
+    # Arrow — pc.take on the donor-row slice picks the per-junction
+    # values without a Python loop.
+    def _col_to_torch(col_name: str) -> torch.Tensor:
+        return torch.from_numpy(
+            joined.column(col_name).chunk(0).to_numpy(zero_copy_only=True)
+        )
+
+    aid_t = _col_to_torch("alignment_id")
+    rstart_t = _col_to_torch("ref_start")
+    rend_t = _col_to_torch("ref_end")
+    contig_t = _col_to_torch("contig_id")
+
+    same_aid = aid_t[1:] == aid_t[:-1]
+    n_junctions = int(same_aid.sum().item())
+    if n_junctions == 0:
+        return INTRON_TABLE.empty_table()
+
+    donor_pos = rend_t[:-1][same_aid].numpy()
+    acceptor_pos = rstart_t[1:][same_aid].numpy()
+    junction_contig = contig_t[:-1][same_aid].numpy()
+
+    donor_row_idx = torch.nonzero(same_aid, as_tuple=False).squeeze(1)
+    donor_row_idx_pa = pa.array(donor_row_idx.numpy())
+    n_rows = joined.num_rows
+    strand_donor_rows = pc.take(
+        joined.column("strand").slice(0, n_rows - 1), donor_row_idx_pa
+    )
+    read_id_donor_rows = pc.take(
+        joined.column("read_id").slice(0, n_rows - 1), donor_row_idx_pa
+    )
+
+    junctions = pa.table(
+        {
+            "contig_id": pa.array(junction_contig),
+            "donor_pos": pa.array(donor_pos),
+            "acceptor_pos": pa.array(acceptor_pos),
+            "strand": strand_donor_rows,
+            "read_id": read_id_donor_rows,
+        }
+    )
+
+    # group_by + count_distinct replaces today's per-junction set[str_read_id].
+    aggregated = junctions.group_by(
+        ["contig_id", "donor_pos", "acceptor_pos", "strand"]
+    ).aggregate([("read_id", "count_distinct")])
+    if aggregated.num_rows == 0:
+        return INTRON_TABLE.empty_table()
+
+    # Sort to match today's deterministic output order:
+    # (contig_id, donor_pos, acceptor_pos, strand) ascending.
+    aggregated = aggregated.sort_by(
+        [
+            ("contig_id", "ascending"),
+            ("donor_pos", "ascending"),
+            ("acceptor_pos", "ascending"),
+            ("strand", "ascending"),
+        ]
+    )
+
+    n_unique = aggregated.num_rows
+    contig_ids_out = aggregated.column("contig_id").to_pylist()
+    donors_out = aggregated.column("donor_pos").to_pylist()
+    acceptors_out = aggregated.column("acceptor_pos").to_pylist()
+
+    # motif lookup is bounded by unique-junction count, not by block count
+    # — a Python loop here is fine at mouse scale (tens of thousands of
+    # junctions max).
+    motifs = [
+        _motif_at(genome, int(cid), int(d), int(a))
+        for cid, d, a in zip(contig_ids_out, donors_out, acceptors_out, strict=True)
+    ]
+
     have_annotation = annotation is not None
     if have_annotation:
         annotated_donors, annotated_acceptors = _annotation_splice_sites(
             annotation.features, exon_type=exon_type
         )
+        annotateds: list[bool | None] = []
+        for cid, d, a in zip(contig_ids_out, donors_out, acceptors_out, strict=True):
+            d_set = annotated_donors.get(int(cid), frozenset())
+            a_set = annotated_acceptors.get(int(cid), frozenset())
+            annotateds.append((int(d) in d_set) and (int(a) in a_set))
+    else:
+        annotateds = [None] * n_unique
 
-    sorted_keys = sorted(counts.keys())
-    rows: list[dict[str, object]] = []
-    for iid, key in enumerate(sorted_keys):
-        contig_id, donor, acceptor, st = key
-        n_reads = len(counts[key])
-        motif = _motif_at(genome, contig_id, donor, acceptor)
-        if have_annotation:
-            d_set = annotated_donors.get(contig_id, frozenset())
-            a_set = annotated_acceptors.get(contig_id, frozenset())
-            ann = (donor in d_set) and (acceptor in a_set)
-        else:
-            ann = None
-        rows.append(
-            {
-                "intron_id": int(iid),
-                "contig_id": int(contig_id),
-                "strand": st,
-                "donor_pos": int(donor),
-                "acceptor_pos": int(acceptor),
-                "read_count": int(n_reads),
-                "motif": motif,
-                "is_intron_seed": True,
-                "annotated": ann,
-            }
-        )
-
-    return pa.Table.from_pylist(rows, schema=INTRON_TABLE)
+    return pa.table(
+        {
+            "intron_id": pa.array(np.arange(n_unique, dtype=np.int64)),
+            "contig_id": aggregated.column("contig_id"),
+            "strand": aggregated.column("strand"),
+            "donor_pos": aggregated.column("donor_pos"),
+            "acceptor_pos": aggregated.column("acceptor_pos"),
+            "read_count": aggregated.column("read_id_count_distinct").cast(
+                pa.int64()
+            ),
+            "motif": pa.array(motifs, type=pa.string()),
+            "is_intron_seed": pa.array([True] * n_unique, type=pa.bool_()),
+            "annotated": pa.array(annotateds, type=pa.bool_()),
+        },
+        schema=INTRON_TABLE,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
