@@ -377,10 +377,13 @@ def stub_external_calls(monkeypatch, tmp_path) -> dict:
 
         return _R()
 
-    def _fake_run_library_export(*, output_elib, output_dir, fasta=None, **kw):
-        # EncyclopeDIA 6.5.15 -libexport REQUIRES -f <fasta>; capture it so
-        # the regression test can assert Stage 10 threads the combined FASTA.
+    def _fake_run_library_export(*, output_elib, output_dir, search_dir=None,
+                                 fasta=None, **kw):
+        # EncyclopeDIA 6.5.15 -libexport REQUIRES -f <fasta> and scans -i
+        # for spectra files (not bare .elibs); capture both so the
+        # regression tests can assert Stage 10 sets them up correctly.
         state["export_fasta"] = fasta
+        state["export_dir"] = Path(search_dir) if search_dir is not None else None
         Path(output_elib).write_text("stub-quant-elib")
         state["calls"].append(("library_export", str(output_elib)))
 
@@ -522,6 +525,13 @@ def test_orchestrator_threads_fasta_to_library_export(
         stub_inputs["output_dir"] / "04_combined_fasta" / "combined.fasta"
     )
     assert stub_external_calls["export_fasta"] == combined_fasta
+
+    # -libexport scans -i for spectra files paired with <stem>.elib — the
+    # export dir must contain the injection's .mzML/.raw, not just .elibs.
+    export_dir = stub_external_calls["export_dir"]
+    names = {p.name for p in export_dir.iterdir()}
+    assert any(n.endswith((".mzML", ".raw")) for n in names), names
+    assert any(n.endswith(".elib") for n in names), names
 
 
 def test_orchestrator_resume_short_circuit(

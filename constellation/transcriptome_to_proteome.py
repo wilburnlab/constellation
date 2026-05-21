@@ -1202,21 +1202,34 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     if not _stage_done(stage_dir, args.resume):
         _log("Stage 10: library-export → quant_report.elib")
         stage_dir.mkdir(parents=True, exist_ok=True)
-        # Library-export consumes the per-injection .elibs (searched
-        # against the already-filtered library). Collect them under a
-        # flat dir for the jar's -i flag.
+        # EncyclopeDIA -libexport scans -i for the spectra files (.raw /
+        # .mzML) and pairs each with its sibling <stem>.elib search result
+        # — it is NOT a directory of bare .elib files. Mirror EncyclopeDIA's
+        # own search-output layout: symlink each injection's original
+        # spectra file next to its filtered <stem>.elib in one flat dir.
         export_input_dir = stage_dir / "_per_injection_elibs"
         export_input_dir.mkdir(parents=True, exist_ok=True)
-        for inj_dir in sorted(
-            (output_dir / "09_per_injection").rglob("*.elib")
-        ):
-            # Use the parent dir name so collisions on injection stems
-            # don't clobber.
-            target = export_input_dir / f"{inj_dir.parent.name}.elib"
-            if not target.exists():
-                target.symlink_to(inj_dir) if hasattr(target, "symlink_to") else shutil.copy(
-                    inj_dir, target
-                )
+        n_export_inputs = 0
+        for mzml in injection_files:
+            sample_dir = _sanitise_dirname(mzml.parent.name)
+            elib = (
+                output_dir / "09_per_injection" / sample_dir / mzml.stem
+                / f"{mzml.stem}.elib"
+            )
+            if not elib.is_file():
+                continue
+            raw_link = export_input_dir / mzml.name
+            elib_link = export_input_dir / f"{mzml.stem}.elib"
+            if not raw_link.exists():
+                raw_link.symlink_to(mzml)
+            if not elib_link.exists():
+                elib_link.symlink_to(elib)
+            n_export_inputs += 1
+        if n_export_inputs == 0:
+            raise FileNotFoundError(
+                "Stage 10: no per-injection .elib results found under "
+                f"{output_dir / '09_per_injection'} to export"
+            )
         result = run_library_export(
             search_dir=export_input_dir,
             library=gpf_elib_primary,
