@@ -47,6 +47,7 @@ v1 limitations (deferred to v2):
 
 from __future__ import annotations
 
+import bisect
 import resource
 import sys
 import time
@@ -221,22 +222,33 @@ def derive_exons(
     if introns.num_rows == 0 or coverage.num_rows == 0:
         return _empty_features_table()
 
+    _diag("    de: filtering to trusted intron seeds")
     trusted_seeds = _trusted_seed_rows(
         introns, min_intron_read_count=min_intron_read_count
     )
+    _diag(f"    de: trusted_seeds = {trusted_seeds.num_rows:,}")
     if trusted_seeds.num_rows == 0:
         # No trusted introns → no boundaries → no exons in v1.
         return _empty_features_table()
 
+    _diag("    de: coalescing covered intervals from coverage RLE")
     coalesced = _coalesce_covered_intervals(
         coverage, min_exon_depth=min_exon_depth
     )
+    _diag(f"    de: coalesced covered intervals across {len(coalesced)} contigs")
     if not coalesced:
         return _empty_features_table()
 
     # Group trusted introns by (contig_id, strand). Keep both the set
     # of (donor, acceptor) tuples (for the "drop pieces == intron"
-    # rule) and the set of cut positions (donors ∪ acceptors).
+    # rule) and a SORTED list of cut positions (donors ∪ acceptors) so
+    # we can bisect-slice each covered interval's interior cuts in
+    # O(log N + K) instead of the prior O(N) full-set scan per interval.
+    # At PromethION scale the prior set-comprehension `p for p in
+    # cut_positions if iv_start < p < iv_end` was the dominant
+    # single-thread bottleneck (~80K cuts × tens of thousands of
+    # intervals × 50 partitions).
+    _diag("    de: building per-partition cut tables")
     intron_pairs_by_partition: dict[tuple[int, str], set[tuple[int, int]]] = {}
     cuts_by_partition: dict[tuple[int, str], set[int]] = {}
     for r in trusted_seeds.to_pylist():
@@ -247,6 +259,14 @@ def derive_exons(
         cuts = cuts_by_partition.setdefault(key, set())
         cuts.add(d)
         cuts.add(a)
+    # Materialise each partition's cut set as a sorted list once.
+    sorted_cuts_by_partition: dict[tuple[int, str], list[int]] = {
+        key: sorted(cuts) for key, cuts in cuts_by_partition.items()
+    }
+    _diag(
+        f"    de: {len(intron_pairs_by_partition)} (contig, strand) partitions; "
+        f"total cuts = {sum(len(v) for v in sorted_cuts_by_partition.values()):,}"
+    )
 
     exon_records: list[dict] = []
     next_feature_id = 0
@@ -254,14 +274,24 @@ def derive_exons(
     # Iterate per (contig, strand). For each covered interval on the
     # contig, segment using cuts of that strand's intron set; drop
     # pieces whose [start, end) exactly matches a trusted intron's span.
-    for (contig_id, strand) in sorted(intron_pairs_by_partition.keys()):
+    _diag("    de: segmenting covered intervals against cut positions")
+    sorted_partitions = sorted(intron_pairs_by_partition.keys())
+    for part_idx, (contig_id, strand) in enumerate(sorted_partitions):
         intron_pairs = intron_pairs_by_partition[(contig_id, strand)]
-        cut_positions = cuts_by_partition[(contig_id, strand)]
+        cut_positions_sorted = sorted_cuts_by_partition[(contig_id, strand)]
         intervals = coalesced.get(contig_id, [])
-        for iv_start, iv_end in intervals:
-            interior_cuts = sorted(
-                p for p in cut_positions if iv_start < p < iv_end
+        if (part_idx + 1) % 5 == 0 or (part_idx + 1) == len(sorted_partitions):
+            _diag(
+                f"      de: partition {part_idx + 1}/{len(sorted_partitions)} "
+                f"(contig_id={contig_id}, strand={strand}): "
+                f"cuts={len(cut_positions_sorted):,} intervals={len(intervals):,}"
             )
+        for iv_start, iv_end in intervals:
+            # bisect_right(>iv_start) and bisect_left(<iv_end) give the
+            # slice of cuts strictly inside (iv_start, iv_end).
+            lo = bisect.bisect_right(cut_positions_sorted, iv_start)
+            hi = bisect.bisect_left(cut_positions_sorted, iv_end)
+            interior_cuts = cut_positions_sorted[lo:hi]
             edges = [iv_start] + interior_cuts + [iv_end]
             for i in range(len(edges) - 1):
                 p_start = edges[i]
@@ -292,6 +322,7 @@ def derive_exons(
                 )
                 next_feature_id += 1
 
+    _diag(f"    de: segmentation done — {len(exon_records):,} candidate exons")
     if not exon_records:
         return _empty_features_table()
     return pa.Table.from_pylist(exon_records, schema=FEATURE_TABLE)
