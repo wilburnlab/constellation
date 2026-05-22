@@ -322,14 +322,49 @@ def aggregate_junctions(
     donors_out = aggregated.column("donor_pos").to_pylist()
     acceptors_out = aggregated.column("acceptor_pos").to_pylist()
 
-    # motif lookup is bounded by unique-junction count, not by block count
-    # — a Python loop here is fine at mouse scale (tens of thousands of
-    # junctions max).
+    # Motif lookup. The CLAUDE.md assumption was "tens of thousands of
+    # junctions max" — at PromethION mouse scale we observed 1.05M unique
+    # junctions, and the prior `_motif_at(genome, cid, ...)`-per-junction
+    # call pattern was catastrophically slow because
+    # `GenomeReference.sequence_of` is uncached: each call does a
+    # ChunkedArray.to_pylist() over the contig column and then `.as_py()`
+    # to decode the entire chromosome sequence (~200 MB for mouse chr1)
+    # into a fresh Python str. At 1M junctions that's 1M × ~200 MB =
+    # ~200 TB of redundant allocation, single-threaded — measured 187s+
+    # and counting.
+    #
+    # Fix: prefetch each contig sequence ONCE (one sequence_of call per
+    # unique contig — typically 25-50 for vertebrate genomes), then
+    # slice from the cached strings. The 200 MB-per-call cost collapses
+    # to a one-time 3 GB at vertebrate-genome scale.
     _diag(f"starting motif lookup over {n_unique:,} unique junctions")
-    motifs = [
-        _motif_at(genome, int(cid), int(d), int(a))
-        for cid, d, a in zip(contig_ids_out, donors_out, acceptors_out, strict=True)
-    ]
+    unique_contigs = set(int(c) for c in contig_ids_out)
+    _diag(f"  prefetching sequences for {len(unique_contigs)} unique contigs")
+    contig_seq_cache: dict[int, str | None] = {}
+    for cid in unique_contigs:
+        try:
+            contig_seq_cache[cid] = genome.sequence_of(int(cid))
+        except (KeyError, ValueError, IndexError):
+            contig_seq_cache[cid] = None
+    _diag("  contig sequence cache built")
+    motifs: list[str] = []
+    for cid_raw, d_raw, a_raw in zip(
+        contig_ids_out, donors_out, acceptors_out, strict=True
+    ):
+        cid = int(cid_raw)
+        d = int(d_raw)
+        a = int(a_raw)
+        seq = contig_seq_cache.get(cid)
+        if seq is None:
+            motifs.append("other")
+            continue
+        seq_len = len(seq)
+        if d < 0 or d + 2 > seq_len or a - 2 < 0 or a > seq_len:
+            motifs.append("other")
+            continue
+        donor = seq[d : d + 2].upper()
+        acceptor = seq[a - 2 : a].upper()
+        motifs.append(f"{donor}-{acceptor}")
     _diag("motif lookup done")
 
     have_annotation = annotation is not None
