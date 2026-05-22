@@ -44,8 +44,10 @@ from __future__ import annotations
 import bisect
 from collections.abc import Sequence
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import torch
 
 from constellation.sequencing.schemas.alignment import INTRON_TABLE
 
@@ -174,92 +176,169 @@ def aggregate_junctions(
         if alignments.num_rows == 0:
             return INTRON_TABLE.empty_table()
 
-    primary = alignments.select(
-        ["alignment_id", "read_id", "ref_name", "strand"]
-    )
-    joined = alignment_blocks.join(primary, keys="alignment_id", join_type="inner")
-    if joined.num_rows == 0:
+    # Arrow-native strategy — at mouse / PromethION scale the 1.6B-row
+    # alignment_blocks table is the dominant working set. We keep
+    # `read_id` (a ~30-byte string column) OUT of the heavy sort by
+    # deferring the primary-table enrichment until AFTER junction
+    # detection: sort blocks-numeric-only, find junctions in torch,
+    # then attach `ref_name` / `strand` to the much smaller junctions
+    # table via two small Arrow joins. Counting supporting reads per
+    # junction becomes `count(alignment_id)` since alignment_id is
+    # 1:1 with read_id for primary alignments.
+    primary_min = alignments.select(["alignment_id", "ref_name", "strand"])
+
+    # Filter blocks to those belonging to primary alignments. Using
+    # `pc.is_in` as a semi-join keeps the blocks table as a single
+    # input to the sort instead of carrying primary's columns along.
+    primary_aids = primary_min.column("alignment_id")
+    blocks_min = alignment_blocks.select(
+        ["alignment_id", "block_index", "ref_start", "ref_end"]
+    ).filter(pc.is_in(alignment_blocks.column("alignment_id"), primary_aids))
+    if blocks_min.num_rows < 2:
         return INTRON_TABLE.empty_table()
 
-    name_to_id = _contig_id_lookup(genome.contigs)
+    # Sort blocks-only (4 int64/int32 columns, no strings). The wide-
+    # table predecessor sorted 14 columns including a ~50 GB `read_id`
+    # string column and then `combine_chunks`'d the entire result,
+    # whose offsets-rewrite is partially single-threaded.
+    blocks_sorted = blocks_min.sort_by(
+        [("alignment_id", "ascending"), ("block_index", "ascending")]
+    ).combine_chunks()
 
-    # Group blocks by alignment_id; build per-alignment junction list
-    # ordered by block_index. Collect (donor, acceptor, read_id) per
-    # junction so cross-read aggregation can count distinct reads.
-    by_aid: dict[int, list[tuple[int, int, int]]] = {}
-    aid_meta: dict[int, dict[str, object]] = {}
-    aids = joined.column("alignment_id").to_pylist()
-    bidx = joined.column("block_index").to_pylist()
-    rstart = joined.column("ref_start").to_pylist()
-    rend = joined.column("ref_end").to_pylist()
-    rid = joined.column("read_id").to_pylist()
-    rname = joined.column("ref_name").to_pylist()
-    strand = joined.column("strand").to_pylist()
-    for a, bi, rs, re_, r_id, ref_n, st in zip(
-        aids, bidx, rstart, rend, rid, rname, strand, strict=True
-    ):
-        by_aid.setdefault(int(a), []).append((int(bi), int(rs), int(re_)))
-        aid_meta.setdefault(
-            int(a),
-            {
-                "read_id": str(r_id),
-                "ref_name": str(ref_n),
-                "strand": str(st),
-            },
+    def _col_to_torch(col_name: str) -> torch.Tensor:
+        return torch.from_numpy(
+            blocks_sorted.column(col_name).chunk(0).to_numpy(zero_copy_only=True)
         )
 
-    # Aggregate: (contig_id, donor, acceptor, strand) → set of read_ids.
-    counts: dict[tuple[int, int, int, str], set[str]] = {}
-    for aid, blocks in by_aid.items():
-        blocks.sort(key=lambda t: t[0])
-        meta = aid_meta[aid]
-        contig_id = name_to_id.get(meta["ref_name"])
-        if contig_id is None:
-            continue
-        ends = [b[2] for b in blocks]
-        starts = [b[1] for b in blocks]
-        for donor, acceptor in zip(ends[:-1], starts[1:]):
-            key = (int(contig_id), int(donor), int(acceptor), str(meta["strand"]))
-            counts.setdefault(key, set()).add(str(meta["read_id"]))
+    aid_t = _col_to_torch("alignment_id")
+    rstart_t = _col_to_torch("ref_start")
+    rend_t = _col_to_torch("ref_end")
 
-    if not counts:
+    same_aid = aid_t[1:] == aid_t[:-1]
+    if not bool(same_aid.any().item()):
         return INTRON_TABLE.empty_table()
 
-    annotated_donors: dict[int, frozenset[int]] = {}
-    annotated_acceptors: dict[int, frozenset[int]] = {}
+    # Per-junction: alignment_id from donor row (== acceptor row's
+    # alignment_id, by same_aid mask), donor_pos = donor row's ref_end,
+    # acceptor_pos = next row's ref_start.
+    junction_aid = aid_t[:-1][same_aid].numpy()
+    donor_pos = rend_t[:-1][same_aid].numpy()
+    acceptor_pos = rstart_t[1:][same_aid].numpy()
+
+    junctions = pa.table(
+        {
+            "alignment_id": pa.array(junction_aid, type=pa.int64()),
+            "donor_pos": pa.array(donor_pos, type=pa.int64()),
+            "acceptor_pos": pa.array(acceptor_pos, type=pa.int64()),
+        }
+    )
+
+    # Attach ref_name + strand from primary; contig_id from contigs.
+    # Both joins are on the (smaller) junctions table — `ref_name` and
+    # `strand` strings land here, not on the 1.6B-row blocks table.
+    junctions = junctions.join(
+        primary_min, keys="alignment_id", join_type="inner"
+    )
+    contig_lookup = genome.contigs.select(["contig_id", "name"]).rename_columns(
+        ["contig_id", "ref_name"]
+    )
+    junctions = junctions.join(
+        contig_lookup, keys="ref_name", join_type="inner"
+    )
+    if junctions.num_rows == 0:
+        return INTRON_TABLE.empty_table()
+
+    # Each row of `junctions` is a unique (alignment_id, donor, acceptor)
+    # tuple by construction (one junction per consecutive same-aid block
+    # pair in the sorted table). For primary alignments alignment_id is
+    # 1:1 with read_id, so `count(alignment_id)` per (contig, donor,
+    # acceptor, strand) equals `count_distinct(read_id)` — a plain
+    # `count` aggregation is much cheaper than `count_distinct`.
+    aggregated = junctions.group_by(
+        ["contig_id", "donor_pos", "acceptor_pos", "strand"]
+    ).aggregate([("alignment_id", "count")])
+    if aggregated.num_rows == 0:
+        return INTRON_TABLE.empty_table()
+    aggregated = aggregated.rename_columns(
+        [c if c != "alignment_id_count" else "read_id_count_distinct"
+         for c in aggregated.column_names]
+    )
+
+    aggregated = aggregated.sort_by(
+        [
+            ("contig_id", "ascending"),
+            ("donor_pos", "ascending"),
+            ("acceptor_pos", "ascending"),
+            ("strand", "ascending"),
+        ]
+    )
+
+    n_unique = aggregated.num_rows
+    contig_ids_out = aggregated.column("contig_id").to_pylist()
+    donors_out = aggregated.column("donor_pos").to_pylist()
+    acceptors_out = aggregated.column("acceptor_pos").to_pylist()
+
+    # Motif lookup. `GenomeReference.sequence_of` is uncached — each
+    # call does a ChunkedArray.to_pylist() over the contig column and
+    # then `.as_py()` to decode the entire chromosome sequence into a
+    # fresh Python str (~200 MB for mouse chr1). At 1M unique
+    # junctions that's ~200 TB of redundant allocation single-threaded.
+    # Prefetch each contig once into a per-contig cache, then slice.
+    unique_contigs = set(int(c) for c in contig_ids_out)
+    contig_seq_cache: dict[int, str | None] = {}
+    for cid in unique_contigs:
+        try:
+            contig_seq_cache[cid] = genome.sequence_of(int(cid))
+        except (KeyError, ValueError, IndexError):
+            contig_seq_cache[cid] = None
+    motifs: list[str] = []
+    for cid_raw, d_raw, a_raw in zip(
+        contig_ids_out, donors_out, acceptors_out, strict=True
+    ):
+        cid = int(cid_raw)
+        d = int(d_raw)
+        a = int(a_raw)
+        seq = contig_seq_cache.get(cid)
+        if seq is None:
+            motifs.append("other")
+            continue
+        seq_len = len(seq)
+        if d < 0 or d + 2 > seq_len or a - 2 < 0 or a > seq_len:
+            motifs.append("other")
+            continue
+        donor = seq[d : d + 2].upper()
+        acceptor = seq[a - 2 : a].upper()
+        motifs.append(f"{donor}-{acceptor}")
+
     have_annotation = annotation is not None
     if have_annotation:
         annotated_donors, annotated_acceptors = _annotation_splice_sites(
             annotation.features, exon_type=exon_type
         )
+        annotateds: list[bool | None] = []
+        for cid, d, a in zip(contig_ids_out, donors_out, acceptors_out, strict=True):
+            d_set = annotated_donors.get(int(cid), frozenset())
+            a_set = annotated_acceptors.get(int(cid), frozenset())
+            annotateds.append((int(d) in d_set) and (int(a) in a_set))
+    else:
+        annotateds = [None] * n_unique
 
-    sorted_keys = sorted(counts.keys())
-    rows: list[dict[str, object]] = []
-    for iid, key in enumerate(sorted_keys):
-        contig_id, donor, acceptor, st = key
-        n_reads = len(counts[key])
-        motif = _motif_at(genome, contig_id, donor, acceptor)
-        if have_annotation:
-            d_set = annotated_donors.get(contig_id, frozenset())
-            a_set = annotated_acceptors.get(contig_id, frozenset())
-            ann = (donor in d_set) and (acceptor in a_set)
-        else:
-            ann = None
-        rows.append(
-            {
-                "intron_id": int(iid),
-                "contig_id": int(contig_id),
-                "strand": st,
-                "donor_pos": int(donor),
-                "acceptor_pos": int(acceptor),
-                "read_count": int(n_reads),
-                "motif": motif,
-                "is_intron_seed": True,
-                "annotated": ann,
-            }
-        )
-
-    return pa.Table.from_pylist(rows, schema=INTRON_TABLE)
+    return pa.table(
+        {
+            "intron_id": pa.array(np.arange(n_unique, dtype=np.int64)),
+            "contig_id": aggregated.column("contig_id"),
+            "strand": aggregated.column("strand"),
+            "donor_pos": aggregated.column("donor_pos"),
+            "acceptor_pos": aggregated.column("acceptor_pos"),
+            "read_count": aggregated.column("read_id_count_distinct").cast(
+                pa.int64()
+            ),
+            "motif": pa.array(motifs, type=pa.string()),
+            "is_intron_seed": pa.array([True] * n_unique, type=pa.bool_()),
+            "annotated": pa.array(annotateds, type=pa.bool_()),
+        },
+        schema=INTRON_TABLE,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────

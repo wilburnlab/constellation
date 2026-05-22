@@ -1250,9 +1250,17 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     # cluster-node-friendly but a workstation-RAM stress test.
     # Streaming variant lifts in when we cross 1B alignments.
     emit_outputs: dict[str, str] = {}
+    # Project only the columns the resolve stage actually consumes;
+    # skips ~10 GB of unused string + small columns (cigar_string,
+    # nm_tag, as_tag, read_group, acquisition_id, mapq, flag) at scan
+    # time. cigar_string alone is 5-20 GB at PromethION scale.
     alignments_table = pa_dataset.dataset(
         stage_outputs["alignments"].directory
-    ).to_table()
+    ).to_table(columns=[
+        "alignment_id", "read_id", "ref_name", "strand",
+        "ref_start", "ref_end",
+        "is_secondary", "is_supplementary",
+    ])
     blocks_table = pa_dataset.dataset(
         stage_outputs["alignment_blocks"].directory
     ).to_table()
@@ -1275,19 +1283,24 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     emit_outputs["introns"] = str(introns_path)
 
     # ── Coverage pile-up + derived annotation ─────────────────────────
-    # Both are default-on; the in-memory pile-up is consumed by the
-    # derived-annotation pass even when --no-coverage suppresses the
-    # on-disk write. Skipping both passes saves the resolve-stage
-    # pile-up compute entirely.
-    pileup_table: pa.Table | None = None
+    # The two functions are now siblings with path-based handoff:
+    # build_pileup streams COVERAGE_TABLE batches to coverage.parquet;
+    # build_derived_annotation re-reads that file (small post-RLE), and
+    # streams BLOCK_EXON_ASSIGNMENT_TABLE to block_exon_assignments.parquet
+    # which compute_exon_psi consumes as a dataset. No giant in-memory
+    # handoffs between these passes anymore.
     need_pileup = emit_coverage or emit_derived_annotation
+    read_to_sample_table: pa.Table | None = None
+    coverage_path: Path | None = None
     if need_pileup:
         rd = read_demux.select(["read_id", "sample_id"])
         valid_mask = pa.compute.is_valid(rd.column("sample_id"))
         rd_valid = rd.filter(valid_mask)
         # If the same read appears in multiple demux rows (chimeras),
         # require all rows to agree on sample_id — match the count
-        # stage's policy.
+        # stage's policy. The resulting 2-column table replaces the
+        # 200M-entry Python dict the prior version materialised at this
+        # point.
         rd_unique = rd_valid.group_by("read_id").aggregate(
             [("sample_id", "min"), ("sample_id", "max")]
         )
@@ -1296,26 +1309,19 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
                 rd_unique.column("sample_id_min"),
                 rd_unique.column("sample_id_max"),
             )
+        ).select(["read_id", "sample_id_min"]).rename_columns(
+            ["read_id", "sample_id"]
         )
-        read_to_sample = {
-            str(rid): int(sid)
-            for rid, sid in zip(
-                rd_consistent.column("read_id").to_pylist(),
-                rd_consistent.column("sample_id_min").to_pylist(),
-                strict=True,
-            )
-        }
-        pileup_table = build_pileup(
+        read_to_sample_table = rd_consistent
+
+        coverage_path = output_dir / "coverage.parquet"
+        build_pileup(
             blocks_table, alignments_table, genome.contigs,
-            read_to_sample=read_to_sample,
+            output_path=coverage_path,
+            read_to_sample=read_to_sample_table,
         )
 
-    if emit_coverage and pileup_table is not None:
-        pileup_path = output_dir / "coverage.parquet"
-        pq.write_table(pileup_table, pileup_path)
-        emit_outputs["coverage"] = str(pileup_path)
-
-    if emit_derived_annotation and pileup_table is not None:
+    if emit_derived_annotation and coverage_path is not None:
         # Local import: derived_annotation depends on Part B schemas
         # registered when the module is imported.
         from constellation.sequencing.quant.derived_annotation import (
@@ -1323,27 +1329,35 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         )
         from constellation.sequencing.annotation.io import save_annotation
 
-        derived_annotation, block_assignments, exon_psi = (
-            build_derived_annotation(
-                coverage=pileup_table,
-                introns=introns,
-                alignment_blocks=blocks_table,
-                alignments=alignments_table,
-                contigs=genome.contigs,
-                read_to_sample=read_to_sample,
-                min_exon_depth=int(args.min_exon_depth),
-                min_intron_read_count=int(args.min_intron_read_count),
-            )
+        block_assignments_path = output_dir / "block_exon_assignments.parquet"
+        derived_annotation, _ba_path, exon_psi = build_derived_annotation(
+            coverage=coverage_path,
+            introns=introns,
+            alignment_blocks=blocks_table,
+            alignments=alignments_table,
+            contigs=genome.contigs,
+            read_to_sample=read_to_sample_table,
+            block_assignments_output_path=block_assignments_path,
+            min_exon_depth=int(args.min_exon_depth),
+            min_intron_read_count=int(args.min_intron_read_count),
         )
         derived_dir = output_dir / "derived_annotation"
         save_annotation(derived_annotation, derived_dir, format="parquet_dir")
-        block_assignments_path = output_dir / "block_exon_assignments.parquet"
-        pq.write_table(block_assignments, block_assignments_path)
         exon_psi_path = output_dir / "exon_psi.parquet"
         pq.write_table(exon_psi, exon_psi_path)
         emit_outputs["derived_annotation"] = str(derived_dir)
         emit_outputs["block_exon_assignments"] = str(block_assignments_path)
         emit_outputs["exon_psi"] = str(exon_psi_path)
+
+    if emit_coverage and coverage_path is not None:
+        emit_outputs["coverage"] = str(coverage_path)
+    elif coverage_path is not None and not emit_coverage:
+        # Coverage was needed for derived_annotation but the user opted
+        # out of the final output — unlink the transient file.
+        try:
+            coverage_path.unlink()
+        except FileNotFoundError:
+            pass
 
     # ── Wide gene × sample TSVs (human-facing) ───────────────────────
     matrix_outputs: dict[str, str] = {}
@@ -1770,19 +1784,15 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         )
 
     # ── read_to_sample for --per-sample-clusters ─────────────────────
-    read_to_sample: dict[str, int] | None = None
+    # 2-column Arrow table replaces the prior ~200M-entry Python dict
+    # that materialised at this point at mouse scale. The downstream
+    # cluster_by_fingerprint consumer joins it via Arrow.
+    read_to_sample_table: pa.Table | None = None
     if args.per_sample_clusters and read_demux.num_rows > 0:
         rd_valid = read_demux.filter(
             pc.is_valid(read_demux.column("sample_id"))
         )
-        read_to_sample = {
-            str(rid): int(sid)
-            for rid, sid in zip(
-                rd_valid.column("read_id").to_pylist(),
-                rd_valid.column("sample_id").to_pylist(),
-                strict=True,
-            )
-        }
+        read_to_sample_table = rd_valid.select(["read_id", "sample_id"])
 
     # ── Cluster ──────────────────────────────────────────────────────
     clusters, membership = cluster_by_fingerprint(
@@ -1792,7 +1802,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         alignment_blocks=blocks_table,
         alignment_cs=alignment_cs_table,
         genome=genome,
-        read_to_sample=read_to_sample,
+        read_to_sample=read_to_sample_table,
         max_5p_drift=int(args.max_5p_drift),
         max_3p_drift=int(args.max_3p_drift),
         min_cluster_size=int(args.min_cluster_size),

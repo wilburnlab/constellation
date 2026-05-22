@@ -131,10 +131,14 @@ def count_reads_per_gene(
     if joined.num_rows == 0:
         return FEATURE_QUANT.empty_table(), stats
 
-    # FK-validate sample_ids against Samples (defensive)
+    # FK-validate sample_ids against Samples (defensive). pc.unique on the
+    # full join column is the multithreaded C++ kernel; the resulting set is
+    # bounded by |Samples| (handful), so the Python set-difference that
+    # follows is trivial. The previous .to_pylist()-then-Python-set version
+    # pinned a single thread for ~30 min at 200M-row scale.
     known_samples = set(samples.ids)
-    sids = joined.column("sample_id").to_pylist()
-    unknown = {sid for sid in sids if sid not in known_samples}
+    unique_sids = pc.unique(joined.column("sample_id")).to_pylist()
+    unknown = {int(sid) for sid in unique_sids if int(sid) not in known_samples}
     if unknown:
         sample = sorted(unknown)[:5]
         raise ValueError(

@@ -620,11 +620,13 @@ def test_per_sample_psi_stratification() -> None:
     # (skipping middle exon).
     al_rows = []
     blk_rows = []
-    read_to_sample = {}
+    read_id_list: list[str] = []
+    sample_id_list: list[int] = []
     next_aid = 1
     for i in range(3):
         rid = f"s0_r{i}"
-        read_to_sample[rid] = 0
+        read_id_list.append(rid)
+        sample_id_list.append(0)
         al_rows.append(_alignment(
             alignment_id=next_aid, read_id=rid,
             ref_start=0, ref_end=500,
@@ -637,7 +639,8 @@ def test_per_sample_psi_stratification() -> None:
         next_aid += 1
     for i in range(2):
         rid = f"s1_r{i}"
-        read_to_sample[rid] = 1
+        read_id_list.append(rid)
+        sample_id_list.append(1)
         al_rows.append(_alignment(
             alignment_id=next_aid, read_id=rid,
             ref_start=0, ref_end=500,
@@ -651,6 +654,9 @@ def test_per_sample_psi_stratification() -> None:
 
     al = pa.Table.from_pylist(al_rows, schema=ALIGNMENT_TABLE)
     blocks = pa.Table.from_pylist(blk_rows, schema=ALIGNMENT_BLOCK_TABLE)
+    read_to_sample = pa.table(
+        {"read_id": read_id_list, "sample_id": sample_id_list}
+    )
     ba = assign_blocks_to_exons(blocks, al, full, _contigs())
     psi = compute_exon_psi(ba, al, full, _contigs(),
                            read_to_sample=read_to_sample)
@@ -675,3 +681,87 @@ def test_per_sample_psi_stratification() -> None:
     assert psi_by_sample[1]["psi"] == 0.0
     assert psi_by_sample[1]["n_inclusion_reads"] == 0
     assert psi_by_sample[1]["n_exclusion_reads"] == 2
+
+
+def test_streaming_block_assignments_roundtrip_via_parquet(tmp_path: Path) -> None:
+    """Production path: ``assign_blocks_to_exons`` streams to Parquet
+    and ``compute_exon_psi`` reads the dataset back. End result must
+    match the in-memory path cell-for-cell.
+    """
+    import pyarrow.parquet as pq
+
+    introns = pa.Table.from_pylist(
+        [
+            _intron(intron_id=0, donor=100, acceptor=200, read_count=10),
+            _intron(intron_id=1, donor=300, acceptor=400, read_count=10),
+        ],
+        schema=INTRON_TABLE,
+    )
+    coverage = pa.Table.from_pylist(
+        _coverage_rows(intervals=[(0, 500, 10)]),
+        schema=COVERAGE_TABLE,
+    )
+    al = pa.Table.from_pylist(
+        [
+            _alignment(alignment_id=1, read_id="rA", ref_start=0, ref_end=500),
+            _alignment(alignment_id=2, read_id="rB", ref_start=0, ref_end=500),
+        ],
+        schema=ALIGNMENT_TABLE,
+    )
+    blocks = pa.Table.from_pylist(
+        [
+            _block(alignment_id=1, block_index=0, ref_start=0, ref_end=100),
+            _block(alignment_id=1, block_index=1, ref_start=200, ref_end=300),
+            _block(alignment_id=1, block_index=2, ref_start=400, ref_end=500),
+            _block(alignment_id=2, block_index=0, ref_start=0, ref_end=100),
+            _block(alignment_id=2, block_index=1, ref_start=400, ref_end=500),
+        ],
+        schema=ALIGNMENT_BLOCK_TABLE,
+    )
+
+    # In-memory reference output.
+    annotation_mem, ba_mem, psi_mem = build_derived_annotation(
+        coverage=coverage, introns=introns,
+        alignment_blocks=blocks, alignments=al, contigs=_contigs(),
+    )
+    assert isinstance(ba_mem, pa.Table)
+
+    # Streaming variant: block_assignments routed through a Parquet
+    # file; compute_exon_psi consumes it as a dataset.
+    ba_path = tmp_path / "block_exon_assignments.parquet"
+    annotation_disk, ba_disk_ret, psi_disk = build_derived_annotation(
+        coverage=coverage, introns=introns,
+        alignment_blocks=blocks, alignments=al, contigs=_contigs(),
+        block_assignments_output_path=ba_path,
+    )
+    assert ba_disk_ret == ba_path
+    assert ba_path.exists()
+    ba_disk = pq.read_table(ba_path)
+    assert ba_disk.schema.equals(BLOCK_EXON_ASSIGNMENT_TABLE)
+
+    # Same row set (sort-invariant comparison).
+    def _key_set(t: pa.Table) -> set:
+        return {
+            (
+                int(r["alignment_id"]), int(r["block_index"]),
+                int(r["data_exon_id"]),
+            )
+            for r in t.to_pylist()
+        }
+    assert _key_set(ba_mem) == _key_set(ba_disk)
+
+    # PSI tables must match.
+    def _psi_key_set(t: pa.Table) -> set:
+        return {
+            (
+                int(r["data_exon_id"]),
+                int(r["sample_id"]),
+                int(r["n_inclusion_reads"]),
+                int(r["n_exclusion_reads"]),
+                int(r["n_ambiguous_reads"]),
+            )
+            for r in t.to_pylist()
+        }
+    assert _psi_key_set(psi_mem) == _psi_key_set(psi_disk)
+    # Annotation features identical.
+    assert annotation_disk.features.num_rows == annotation_mem.features.num_rows

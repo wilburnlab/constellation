@@ -228,7 +228,9 @@ def test_per_sample_stratification() -> None:
     )
     out = build_pileup(
         blocks, al, _contigs(),
-        read_to_sample={"rA": 10, "rB": 11},
+        read_to_sample=pa.table(
+            {"read_id": ["rA", "rB"], "sample_id": [10, 11]}
+        ),
     )
     rows = out.to_pylist()
     # Two partitions, each one RLE row at depth 1.
@@ -256,7 +258,10 @@ def test_unmapped_sample_id_drops_read() -> None:
     )
     out = build_pileup(
         blocks, al, _contigs(),
-        read_to_sample={"rA": 10},  # rB_unknown deliberately absent
+        # rB_unknown deliberately absent from the read_to_sample table.
+        read_to_sample=pa.table(
+            {"read_id": ["rA"], "sample_id": [10]}
+        ),
     )
     rows = out.to_pylist()
     assert len(rows) == 1
@@ -378,3 +383,60 @@ def test_output_sorted_by_contig_sample_start() -> None:
     assert [(r["contig_id"], r["start"]) for r in rows] == [
         (1, 100), (1, 300), (2, 100),
     ]
+
+
+def test_streaming_output_path_writes_parquet(tmp_path) -> None:
+    """When ``output_path`` is given, build_pileup streams partitions
+    directly to Parquet and returns a summary dict instead of a table.
+    """
+    import pyarrow.parquet as pq
+
+    al = _alignments(
+        [
+            _alignment(alignment_id=1, read_id="rA"),
+            _alignment(alignment_id=2, read_id="rB", ref_name="chr2"),
+        ]
+    )
+    blocks = _blocks(
+        [
+            _block(alignment_id=1, ref_start=100, ref_end=200),
+            _block(alignment_id=2, ref_start=50, ref_end=150),
+        ]
+    )
+    out_path = tmp_path / "coverage.parquet"
+    stats = build_pileup(blocks, al, _contigs(), output_path=out_path)
+    assert isinstance(stats, dict)
+    assert stats["n_partitions"] == 2
+    assert stats["n_rows_written"] == 2
+    assert out_path.exists()
+
+    read_back = pq.read_table(out_path)
+    assert read_back.schema.equals(COVERAGE_TABLE)
+    rows = read_back.to_pylist()
+    # One partition per (contig, sample=-1), each one RLE row at depth 1.
+    by_contig = {r["contig_id"]: r for r in rows}
+    assert by_contig[1]["start"] == 100 and by_contig[1]["end"] == 200
+    assert by_contig[2]["start"] == 50 and by_contig[2]["end"] == 150
+    assert all(r["sample_id"] == _UNSTRATIFIED for r in rows)
+
+
+def test_streaming_output_empty_inputs_writes_empty_parquet(tmp_path) -> None:
+    """Empty inputs still produce a Parquet file with the right schema —
+    the CLI relies on `_SUCCESS`-style markers and needs the file to
+    exist even when no rows are emitted.
+    """
+    import pyarrow.parquet as pq
+
+    out_path = tmp_path / "coverage.parquet"
+    stats = build_pileup(
+        ALIGNMENT_BLOCK_TABLE.empty_table(),
+        ALIGNMENT_TABLE.empty_table(),
+        _contigs(),
+        output_path=out_path,
+    )
+    assert isinstance(stats, dict)
+    assert stats == {"n_partitions": 0, "n_rows_written": 0}
+    assert out_path.exists()
+    read_back = pq.read_table(out_path)
+    assert read_back.schema.equals(COVERAGE_TABLE)
+    assert read_back.num_rows == 0
