@@ -42,6 +42,9 @@ splice sites must match annotated exon ends/starts on the same contig
 from __future__ import annotations
 
 import bisect
+import resource
+import sys
+import time
 from collections.abc import Sequence
 
 import numpy as np
@@ -50,6 +53,23 @@ import pyarrow.compute as pc
 import torch
 
 from constellation.sequencing.schemas.alignment import INTRON_TABLE
+
+
+# ── DIAG: temporary stderr instrumentation for the resolve-stage perf
+# hunt. Always-on, tagged `[diag-aj]` so it's easy to grep + strip later.
+# Remove once the bottleneck is pinned.
+_DIAG_T0 = time.monotonic()
+
+
+def _diag(msg: str) -> None:
+    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_gb = rss_kb / (1024.0 * 1024.0)
+    dt = time.monotonic() - _DIAG_T0
+    print(
+        f"[diag-aj t={dt:7.1f}s rss_peak={rss_gb:6.2f}GB] {msg}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -164,6 +184,7 @@ def aggregate_junctions(
     ``(contig_id, donor_pos, acceptor_pos, strand)`` for determinism;
     ``intron_id`` matches the row index.
     """
+    _diag(f"enter: alignment_blocks={alignment_blocks.num_rows:,} alignments={alignments.num_rows:,}")
     if alignment_blocks.num_rows == 0 or alignments.num_rows == 0:
         return INTRON_TABLE.empty_table()
 
@@ -173,6 +194,7 @@ def aggregate_junctions(
             pc.invert(alignments.column("is_supplementary")),
         )
         alignments = alignments.filter(primary_mask)
+        _diag(f"after primary filter: alignments={alignments.num_rows:,}")
         if alignments.num_rows == 0:
             return INTRON_TABLE.empty_table()
 
@@ -186,14 +208,17 @@ def aggregate_junctions(
     # reads per junction becomes `count(alignment_id)` since alignment_id
     # is 1:1 with read_id for primary alignments.
     primary_min = alignments.select(["alignment_id", "ref_name", "strand"])
+    _diag("built primary_min view")
 
     # Filter blocks to those belonging to primary alignments. Using
     # `pc.is_in` as a semi-join keeps the blocks table as a single
     # input to the sort instead of carrying primary's columns along.
     primary_aids = primary_min.column("alignment_id")
+    _diag("starting pc.is_in semi-join filter on blocks")
     blocks_min = alignment_blocks.select(
         ["alignment_id", "block_index", "ref_start", "ref_end"]
     ).filter(pc.is_in(alignment_blocks.column("alignment_id"), primary_aids))
+    _diag(f"semi-join filter done: blocks_min={blocks_min.num_rows:,}")
     if blocks_min.num_rows < 2:
         return INTRON_TABLE.empty_table()
 
@@ -202,9 +227,13 @@ def aggregate_junctions(
     # the prior version sorted 14 columns including a ~50 GB `read_id`
     # string column and then `combine_chunks`'d the entire result,
     # whose offsets-rewrite is partially single-threaded.
-    blocks_sorted = blocks_min.sort_by(
+    _diag("starting blocks sort_by(alignment_id, block_index)")
+    blocks_sorted_raw = blocks_min.sort_by(
         [("alignment_id", "ascending"), ("block_index", "ascending")]
-    ).combine_chunks()
+    )
+    _diag("blocks sort done; starting combine_chunks")
+    blocks_sorted = blocks_sorted_raw.combine_chunks()
+    _diag("blocks combine_chunks done")
 
     def _col_to_torch(col_name: str) -> torch.Tensor:
         return torch.from_numpy(
@@ -214,10 +243,13 @@ def aggregate_junctions(
     aid_t = _col_to_torch("alignment_id")
     rstart_t = _col_to_torch("ref_start")
     rend_t = _col_to_torch("ref_end")
+    _diag("bridged 3 numeric cols to torch tensors")
 
     same_aid = aid_t[1:] == aid_t[:-1]
     if not bool(same_aid.any().item()):
         return INTRON_TABLE.empty_table()
+    n_junctions = int(same_aid.sum().item())
+    _diag(f"junction mask computed: n_junctions={n_junctions:,}")
 
     # Per-junction: alignment_id from donor row (== acceptor row's
     # alignment_id, by same_aid mask), donor_pos = donor row's ref_end,
@@ -225,6 +257,7 @@ def aggregate_junctions(
     junction_aid = aid_t[:-1][same_aid].numpy()
     donor_pos = rend_t[:-1][same_aid].numpy()
     acceptor_pos = rstart_t[1:][same_aid].numpy()
+    _diag("masked-select to numpy done")
 
     junctions = pa.table(
         {
@@ -233,19 +266,24 @@ def aggregate_junctions(
             "acceptor_pos": pa.array(acceptor_pos, type=pa.int64()),
         }
     )
+    _diag(f"built junctions table: {junctions.num_rows:,} rows")
 
     # Attach ref_name + strand from primary; contig_id from contigs.
     # Both joins are now on the (smaller) junctions table — `ref_name`
     # and `strand` strings land here, not on the 1.6B-row blocks table.
+    _diag("starting junctions × primary_min join (on alignment_id)")
     junctions = junctions.join(
         primary_min, keys="alignment_id", join_type="inner"
     )
+    _diag(f"junctions × primary_min join done: {junctions.num_rows:,} rows")
     contig_lookup = genome.contigs.select(["contig_id", "name"]).rename_columns(
         ["contig_id", "ref_name"]
     )
+    _diag("starting junctions × contig_lookup join (on ref_name)")
     junctions = junctions.join(
         contig_lookup, keys="ref_name", join_type="inner"
     )
+    _diag(f"junctions × contig_lookup join done: {junctions.num_rows:,} rows")
     if junctions.num_rows == 0:
         return INTRON_TABLE.empty_table()
 
@@ -255,9 +293,11 @@ def aggregate_junctions(
     # 1:1 with read_id, so `count(alignment_id)` per (contig, donor,
     # acceptor, strand) equals `count_distinct(read_id)` — a plain
     # `count` aggregation is much cheaper than `count_distinct`.
+    _diag("starting group_by([contig, donor, acceptor, strand]).count(alignment_id)")
     aggregated = junctions.group_by(
         ["contig_id", "donor_pos", "acceptor_pos", "strand"]
     ).aggregate([("alignment_id", "count")])
+    _diag(f"group_by done: {aggregated.num_rows:,} unique junctions")
     if aggregated.num_rows == 0:
         return INTRON_TABLE.empty_table()
     aggregated = aggregated.rename_columns(
@@ -275,6 +315,7 @@ def aggregate_junctions(
             ("strand", "ascending"),
         ]
     )
+    _diag("final sort_by on aggregated done")
 
     n_unique = aggregated.num_rows
     contig_ids_out = aggregated.column("contig_id").to_pylist()
@@ -284,10 +325,12 @@ def aggregate_junctions(
     # motif lookup is bounded by unique-junction count, not by block count
     # — a Python loop here is fine at mouse scale (tens of thousands of
     # junctions max).
+    _diag(f"starting motif lookup over {n_unique:,} unique junctions")
     motifs = [
         _motif_at(genome, int(cid), int(d), int(a))
         for cid, d, a in zip(contig_ids_out, donors_out, acceptors_out, strict=True)
     ]
+    _diag("motif lookup done")
 
     have_annotation = annotation is not None
     if have_annotation:
@@ -302,7 +345,8 @@ def aggregate_junctions(
     else:
         annotateds = [None] * n_unique
 
-    return pa.table(
+    _diag("annotation lookup done; building output table")
+    out = pa.table(
         {
             "intron_id": pa.array(np.arange(n_unique, dtype=np.int64)),
             "contig_id": aggregated.column("contig_id"),
@@ -318,6 +362,8 @@ def aggregate_junctions(
         },
         schema=INTRON_TABLE,
     )
+    _diag(f"aggregate_junctions exit: returning {out.num_rows:,} INTRON_TABLE rows")
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────
