@@ -614,19 +614,46 @@ def assign_blocks_to_exons(
             es = exon_starts[sort_perm].contiguous()
             ee = exon_ends[sort_perm].contiguous()
             eid = exon_ids[sort_perm].contiguous()
+            # Prefix-max over exon ends in start-sorted order. Used as a
+            # LOWER-bound searchsorted key so that, for each block, we
+            # can prune the candidate range to exons that could plausibly
+            # overlap on the LEFT side too. Without this, the only bound
+            # was `exon_start < block_end` (an upper bound), which at
+            # scattered-exon scale degenerates to "essentially all
+            # exons" per block and explodes intermediate memory by 10000×.
+            ee_prefix_max = torch.cummax(ee, dim=0).values.contiguous()
 
             n_blocks = blk_aid.numel()
+            # Adaptive batch size: target peak intermediate ~2 GB of
+            # int64 / int32 tensors. Worst-case `total = batch * n_exons`
+            # at no-prune (n_exons per block); the prefix-max usually
+            # shrinks this by orders of magnitude but we still cap for
+            # safety. ~250M int64 entries × ~10 ephemeral arrays ≈ 20 GB
+            # transient peak per batch, which fits with the rest of the
+            # resolve-stage tables (alignments + blocks ≈ 50 GB).
+            _PEAK_TARGET = 250_000_000
+            n_exons = es.numel()
+            adaptive_batch_size = max(
+                1, min(batch_size, _PEAK_TARGET // max(n_exons, 1))
+            )
+            n_batches = (n_blocks + adaptive_batch_size - 1) // adaptive_batch_size
+            _diag(
+                f"      abte: contig {contig_idx + 1}/{len(unique_contigs)} "
+                f"adaptive_batch_size={adaptive_batch_size:,} → {n_batches} batches "
+                f"(static={batch_size:,}, n_exons={n_exons:,})"
+            )
             batch_emitted = 0
-            n_batches = (n_blocks + batch_size - 1) // batch_size
-            for batch_idx, chunk_start in enumerate(range(0, n_blocks, batch_size)):
-                chunk_end = min(chunk_start + batch_size, n_blocks)
+            for batch_idx, chunk_start in enumerate(
+                range(0, n_blocks, adaptive_batch_size)
+            ):
+                chunk_end = min(chunk_start + adaptive_batch_size, n_blocks)
                 b_aid = blk_aid[chunk_start:chunk_end]
                 b_bidx = blk_bidx[chunk_start:chunk_end]
                 b_bs = blk_bs[chunk_start:chunk_end]
                 b_be = blk_be[chunk_start:chunk_end]
 
                 batch_rb = _expand_block_exon_overlaps_batch(
-                    b_aid, b_bidx, b_bs, b_be, es, ee, eid
+                    b_aid, b_bidx, b_bs, b_be, es, ee, eid, ee_prefix_max
                 )
                 if batch_rb is None or batch_rb.num_rows == 0:
                     continue
@@ -676,25 +703,39 @@ def _expand_block_exon_overlaps_batch(
     exon_starts_sorted: torch.Tensor,
     exon_ends_sorted: torch.Tensor,
     exon_ids_sorted: torch.Tensor,
+    exon_end_prefix_max: torch.Tensor,
 ) -> pa.RecordBatch | None:
     """Vectorised per-batch interval overlap.
 
-    ``torch.searchsorted`` over the sorted exon-starts gives an
-    inclusive-of-zero upper bound on candidate exons per block (exons
-    with ``start < block_end``); the post-filter ``exon_end > block_start``
-    completes the half-open overlap predicate. The expansion via
-    ``torch.repeat_interleave`` turns the (block, candidate-slice) shape
-    into a flat (block_repeat, exon_idx) pair list — all without a
-    Python-level loop over blocks.
+    Two-sided ``torch.searchsorted`` defines a per-block candidate slice
+    ``[lo[i], hi[i])`` of the sorted exon arrays. Both bounds are
+    necessary at scattered-exon scale; using only the upper bound
+    degenerates to "essentially all exons per block" because most
+    blocks have an exon-start preceding their `block_end`.
+
+    - ``hi[i]`` = first idx where ``exon_start >= block_end[i]`` — exons
+      strictly before block_end qualify.
+    - ``lo[i]`` = first idx where ``exon_end_prefix_max > block_start[i]``
+      — exons up to this point have all ended at or before block_start
+      and cannot overlap. (Because ``exon_end_prefix_max`` is monotonic
+      non-decreasing, ``searchsorted`` finds the boundary directly.
+      Pieces inside ``[lo, hi)`` *might* overlap; the post-filter
+      ``cand_ee > cand_bs`` finishes the half-open overlap predicate.)
+
+    The expansion via ``torch.repeat_interleave`` turns the (block,
+    candidate-slice) shape into a flat (block_repeat, exon_idx) pair
+    list — all without a Python-level loop over blocks.
     """
     n_batch = blk_bs.numel()
     if n_batch == 0:
         return None
 
     hi = torch.searchsorted(exon_starts_sorted, blk_be, right=False)
-    # candidate count per block (lo is always 0 because we filter
-    # exon_end > block_start as a post-step).
-    counts = hi.to(torch.int64)
+    lo = torch.searchsorted(exon_end_prefix_max, blk_bs, right=True)
+    # Clamp lo ≤ hi to avoid negative counts (degenerate cases where
+    # all exons have already ended before the block starts).
+    lo = torch.minimum(lo, hi)
+    counts = (hi - lo).to(torch.int64)
     total = int(counts.sum().item())
     if total == 0:
         return None
@@ -707,7 +748,7 @@ def _expand_block_exon_overlaps_batch(
     within = torch.arange(total, dtype=torch.int64) - torch.repeat_interleave(
         starts_offset, counts
     )
-    exon_idx = within  # since lo == 0
+    exon_idx = within + torch.repeat_interleave(lo.to(torch.int64), counts)
 
     cand_es = exon_starts_sorted[exon_idx]
     cand_ee = exon_ends_sorted[exon_idx]
@@ -717,6 +758,9 @@ def _expand_block_exon_overlaps_batch(
     cand_aid = blk_aid[block_repeats]
     cand_bidx = blk_bidx[block_repeats]
 
+    # Final overlap predicate: exon_end > block_start. The prefix-max
+    # lower-bound guaranteed SOME exon at or after `lo` has end > bs;
+    # not every exon in [lo, hi) does, so this mask is still required.
     overlap_mask = cand_ee > cand_bs
     if not bool(overlap_mask.any()):
         return None
