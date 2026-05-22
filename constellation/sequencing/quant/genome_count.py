@@ -96,28 +96,10 @@ def count_reads_per_gene(
         "total_count": 0,
         "samples_normalised": 0,
     }
-    # ── DIAG: temporary stderr instrumentation for the resolve-stage
-    # perf hunt. Always-on, tagged `[diag-crpg]` so it's easy to grep
-    # + strip later.
-    import resource as _res
-    import sys as _sys
-    import time as _time
-    _t0 = _time.monotonic()
-    def _diag(msg: str) -> None:
-        rss_kb = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
-        rss_gb = rss_kb / (1024.0 * 1024.0)
-        dt = _time.monotonic() - _t0
-        print(
-            f"[diag-crpg t={dt:7.1f}s rss_peak={rss_gb:6.2f}GB] {msg}",
-            file=_sys.stderr, flush=True,
-        )
-
-    _diag(f"enter: gene_assignments={gene_assignments.num_rows:,} read_demux={read_demux.num_rows:,}")
     if gene_assignments.num_rows == 0 or read_demux.num_rows == 0:
         return FEATURE_QUANT.empty_table(), stats
 
     # Collapse read_demux to (read_id, sample_id) — drop nulls + duplicates
-    _diag("collapsing read_demux → (read_id, sample_id) — filter + group_by")
     rd = read_demux.select(["read_id", "sample_id"])
     valid_mask = pc.is_valid(rd.column("sample_id"))
     rd_with = rd.filter(valid_mask)
@@ -136,14 +118,11 @@ def count_reads_per_gene(
         ["read_id", "sample_id_min"]
     )
     consistent_reads = consistent_reads.rename_columns(["read_id", "sample_id"])
-    _diag(f"consistent_reads: {consistent_reads.num_rows:,} (read_id, sample_id) pairs")
 
     # Hash-join on read_id (Arrow's default join strategy).
-    _diag("starting gene_assignments × consistent_reads join on read_id")
     joined = gene_assignments.join(
         consistent_reads, keys="read_id", join_type="inner"
     )
-    _diag(f"join done: {joined.num_rows:,} (gene_id, sample_id) rows")
     stats["reads_with_sample"] = int(joined.num_rows)
     stats["reads_without_sample"] = int(
         gene_assignments.num_rows - joined.num_rows
@@ -157,7 +136,6 @@ def count_reads_per_gene(
     # bounded by |Samples| (handful), so the Python set-difference that
     # follows is trivial. The previous .to_pylist()-then-Python-set version
     # pinned a single thread for ~30 min at 200M-row scale.
-    _diag("FK-validating sample_ids via pc.unique")
     known_samples = set(samples.ids)
     unique_sids = pc.unique(joined.column("sample_id")).to_pylist()
     unknown = {int(sid) for sid in unique_sids if int(sid) not in known_samples}
@@ -168,13 +146,10 @@ def count_reads_per_gene(
             f"absent from Samples: {sample}"
             f"{'...' if len(unknown) > 5 else ''}"
         )
-    _diag("FK validation done")
 
-    _diag("starting group_by([gene_id, sample_id]).count(read_id)")
     counted = joined.group_by(["gene_id", "sample_id"]).aggregate(
         [("read_id", "count")]
     )
-    _diag(f"group_by done: {counted.num_rows:,} (gene, sample) pairs")
     stats["unique_(gene,sample)_pairs"] = int(counted.num_rows)
     counts = counted.column("read_id_count").to_pylist()
     stats["total_count"] = int(sum(counts))
@@ -216,7 +191,6 @@ def count_reads_per_gene(
         }
         for gid, sid, c in zip(gene_ids, sample_ids_out, counts, strict=True)
     ]
-    _diag(f"row assembly done: {len(rows):,} FEATURE_QUANT rows; exit")
     return pa.Table.from_pylist(rows, schema=FEATURE_QUANT), stats
 
 

@@ -1055,9 +1055,7 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     resolve stage; alignment table never materialised whole.
     """
     import json
-    import resource
     import sys
-    import time
     from pathlib import Path
 
     import pyarrow as pa
@@ -1085,22 +1083,6 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     from constellation.sequencing.readers.sam_bam import _bam_alignment_chunks
     from constellation.sequencing.reference.io import load_genome_reference
     from constellation.sequencing.samples import Samples
-
-    # ── DIAG: temporary stderr instrumentation for the resolve-stage perf
-    # hunt. Always-on, tagged `[diag]` so it's easy to grep + strip later.
-    # See https://github.com/wilburnlab/constellation — the
-    # `transcriptome-resolve-stage-arrow-torch` branch carries the hunt
-    # context. Remove once the bottleneck is pinned.
-    _diag_t0 = time.monotonic()
-    def _diag(msg: str) -> None:
-        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        rss_gb = rss_kb / (1024.0 * 1024.0)
-        dt = time.monotonic() - _diag_t0
-        print(
-            f"[diag t={dt:7.1f}s rss_peak={rss_gb:6.2f}GB] {msg}",
-            file=sys.stderr,
-            flush=True,
-        )
 
     # ── Mode dispatch ────────────────────────────────────────────────
     if args.reference is None:
@@ -1248,26 +1230,19 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     )
 
     # ── Stage 3: count (resolve stage — hash-join + group_by-sum) ────
-    _diag("Stage 3 count: opening gene_assignments dataset")
     gene_assignments = pa_dataset.dataset(
         stage_outputs["gene_assignments"].directory
     ).to_table()
-    _diag(f"  gene_assignments materialised: {gene_assignments.num_rows:,} rows")
-    _diag("Stage 3 count: opening read_demux dataset")
     read_demux = pa_dataset.dataset(demux_dir / "read_demux").to_table()
-    _diag(f"  read_demux materialised: {read_demux.num_rows:,} rows")
-    _diag("Stage 3 count: count_reads_per_gene start")
     feature_quant, count_stats = count_reads_per_gene(
         gene_assignments, read_demux, samples
     )
-    _diag(f"Stage 3 count: count_reads_per_gene done — {feature_quant.num_rows:,} (gene,sample) rows")
 
     fq_dir = output_dir / "feature_quant" / "feature_origin=gene_id"
     fq_dir.mkdir(parents=True, exist_ok=True)
     pq.write_table(feature_quant, fq_dir / "part-00000.parquet")
     (output_dir / "feature_quant" / "_SUCCESS").write_bytes(b"")
     pq.write_table(feature_quant, output_dir / "feature_quant.parquet")
-    _diag("Stage 3 count: feature_quant.parquet written")
 
     # ── Resolve-stage aggregations ────────────────────────────────────
     # alignments + alignment_blocks are materialised on demand here.
@@ -1275,12 +1250,10 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     # cluster-node-friendly but a workstation-RAM stress test.
     # Streaming variant lifts in when we cross 1B alignments.
     emit_outputs: dict[str, str] = {}
-    # DIAG-optimisation: project only the columns the resolve stage
-    # actually consumes (alignment_id / read_id / ref_name / strand /
-    # ref_start / ref_end / is_secondary / is_supplementary). Skips
-    # ~10 GB of unused string + small columns (cigar_string, nm_tag,
-    # as_tag, read_group, acquisition_id, mapq, flag) at scan time.
-    _diag("Resolve: materialise alignments_table (column-projected)")
+    # Project only the columns the resolve stage actually consumes;
+    # skips ~10 GB of unused string + small columns (cigar_string,
+    # nm_tag, as_tag, read_group, acquisition_id, mapq, flag) at scan
+    # time. cigar_string alone is 5-20 GB at PromethION scale.
     alignments_table = pa_dataset.dataset(
         stage_outputs["alignments"].directory
     ).to_table(columns=[
@@ -1288,33 +1261,25 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         "ref_start", "ref_end",
         "is_secondary", "is_supplementary",
     ])
-    _diag(f"  alignments_table materialised: {alignments_table.num_rows:,} rows")
-    _diag("Resolve: materialise blocks_table")
     blocks_table = pa_dataset.dataset(
         stage_outputs["alignment_blocks"].directory
     ).to_table()
-    _diag(f"  blocks_table materialised: {blocks_table.num_rows:,} rows")
 
     # ── Intron clustering — always-on (introns.parquet) ──────────────
     # The clustered INTRON_TABLE is the canonical splice-junction
     # artifact downstream consumers (transcriptome cluster,
     # derived-annotation pass) consume.
-    _diag("Resolve: aggregate_junctions start")
     introns = aggregate_junctions(
         blocks_table, alignments_table, genome, annotation=annotation,
     )
-    _diag(f"Resolve: aggregate_junctions done — {introns.num_rows:,} junctions")
     if cluster_introns:
-        _diag("Resolve: cluster_junctions start")
         introns = cluster_junctions(
             introns,
             tolerance_bp=int(args.intron_tolerance_bp),
             motif_priority=intron_motif_priority,
         )
-        _diag(f"Resolve: cluster_junctions done — {introns.num_rows:,} rows")
     introns_path = output_dir / "introns.parquet"
     pq.write_table(introns, introns_path)
-    _diag("Resolve: introns.parquet written")
     emit_outputs["introns"] = str(introns_path)
 
     # ── Coverage pile-up + derived annotation ─────────────────────────
@@ -1328,7 +1293,6 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     read_to_sample_table: pa.Table | None = None
     coverage_path: Path | None = None
     if need_pileup:
-        _diag("Resolve: building read_to_sample_table from read_demux")
         rd = read_demux.select(["read_id", "sample_id"])
         valid_mask = pa.compute.is_valid(rd.column("sample_id"))
         rd_valid = rd.filter(valid_mask)
@@ -1349,16 +1313,13 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             ["read_id", "sample_id"]
         )
         read_to_sample_table = rd_consistent
-        _diag(f"  read_to_sample_table built: {rd_consistent.num_rows:,} rows")
 
         coverage_path = output_dir / "coverage.parquet"
-        _diag("Resolve: build_pileup start (streaming Parquet)")
         build_pileup(
             blocks_table, alignments_table, genome.contigs,
             output_path=coverage_path,
             read_to_sample=read_to_sample_table,
         )
-        _diag("Resolve: build_pileup done — coverage.parquet written")
 
     if emit_derived_annotation and coverage_path is not None:
         # Local import: derived_annotation depends on Part B schemas
@@ -1369,7 +1330,6 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         from constellation.sequencing.annotation.io import save_annotation
 
         block_assignments_path = output_dir / "block_exon_assignments.parquet"
-        _diag("Resolve: build_derived_annotation start")
         derived_annotation, _ba_path, exon_psi = build_derived_annotation(
             coverage=coverage_path,
             introns=introns,
@@ -1381,12 +1341,10 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             min_exon_depth=int(args.min_exon_depth),
             min_intron_read_count=int(args.min_intron_read_count),
         )
-        _diag(f"Resolve: build_derived_annotation done — {derived_annotation.features.num_rows:,} features, {exon_psi.num_rows:,} psi rows")
         derived_dir = output_dir / "derived_annotation"
         save_annotation(derived_annotation, derived_dir, format="parquet_dir")
         exon_psi_path = output_dir / "exon_psi.parquet"
         pq.write_table(exon_psi, exon_psi_path)
-        _diag("Resolve: derived_annotation/ + exon_psi.parquet written")
         emit_outputs["derived_annotation"] = str(derived_dir)
         emit_outputs["block_exon_assignments"] = str(block_assignments_path)
         emit_outputs["exon_psi"] = str(exon_psi_path)
