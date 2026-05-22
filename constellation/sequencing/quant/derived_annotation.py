@@ -917,18 +917,25 @@ def compute_exon_psi(
     if aln_gene_role.num_rows == 0:
         return _empty_exon_psi()
 
-    # Cross-join with exons on parent_id → enumerate (alignment, exon, role)
-    # for each gene's exons.
+    # Cross-join with exons on parent_id → enumerate (alignment, exon,
+    # role_id) for each gene's exons. After this join `gene_id` is no
+    # longer needed downstream — Arrow keeps the left-side key column
+    # by default; we explicitly project it out to drop ~3.4 GB at
+    # PromethION-scale 419M-row aln_exon_role.
     _diag("    cep: cross-join aln_gene_role × exon_membership")
     exon_membership = exons.select(["feature_id", "parent_id"]).rename_columns(
         ["data_exon_id", "gene_id"]
     )
     aln_exon_role = aln_gene_role.join(
         exon_membership, keys="gene_id", join_type="inner"
-    )
-    _diag(f"    cep: aln_exon_role = {aln_exon_role.num_rows:,} rows")
+    ).select(["alignment_id", "data_exon_id", "sample_id", "role_id"])
+    _diag(f"    cep: aln_exon_role = {aln_exon_role.num_rows:,} rows (gene_id dropped)")
     if aln_exon_role.num_rows == 0:
         return _empty_exon_psi()
+    # Release the intermediate. Arrow tables are immutable handles —
+    # explicit `del` allows the chunked sub-arrays produced by
+    # _classify_alignments_per_gene to GC once the cross-join is done.
+    del aln_gene_role
 
     # Extract distinct (alignment_id, data_exon_id) overlap pairs from
     # block_assignments. Accepts either an in-memory table or a path
@@ -937,40 +944,23 @@ def compute_exon_psi(
     overlap_pairs = _extract_distinct_overlap_pairs(block_assignments)
     _diag(f"    cep: overlap_pairs = {overlap_pairs.num_rows:,} distinct (alignment_id, data_exon_id)")
 
-    # Left-join indicates "did this (alignment, exon) actually overlap
-    # at the block level". We use a sentinel-column trick: add a
-    # constant `_has_overlap` int8 to overlap_pairs; after the left
-    # join, that column is null iff there was no overlap.
+    # Left-join + indicators + group_by, processed in CHUNKS over
+    # aln_exon_role. Materialising the full 419M-row left-join result
+    # before group_by-aggregating it down to ~5M rows cost +20 GB
+    # peak resident at mouse scale. Slicing aln_exon_role is zero-copy
+    # (Arrow buffer views), so the per-chunk overhead is bounded by
+    # the per-chunk join output (~2 GB at chunk_size=50M, n_cols=5)
+    # plus accumulated partials (~hundreds of MB).
     overlap_pairs_marked = overlap_pairs.append_column(
         "_has_overlap",
         pa.array(np.ones(overlap_pairs.num_rows, dtype=np.int8), type=pa.int8()),
     )
-    _diag("    cep: left-joining aln_exon_role × overlap_pairs_marked")
-    joined = aln_exon_role.join(
-        overlap_pairs_marked,
-        keys=["alignment_id", "data_exon_id"],
-        join_type="left outer",
+    del overlap_pairs
+    _diag("    cep: chunked left-join + per-chunk group_by + accumulate")
+    aggregated = _join_aggregate_streaming(
+        aln_exon_role, overlap_pairs_marked
     )
-    _diag(f"    cep: left-join done: {joined.num_rows:,} rows")
-    has_overlap = pc.is_valid(joined.column("_has_overlap"))
-    is_spanning = pc.equal(joined.column("role"), "spanning")
-    is_partial = pc.equal(joined.column("role"), "partial")
-
-    inc_indicator = pc.cast(pc.and_(is_spanning, has_overlap), pa.int32())
-    exc_indicator = pc.cast(
-        pc.and_(is_spanning, pc.invert(has_overlap)), pa.int32()
-    )
-    amb_indicator = pc.cast(is_partial, pa.int32())
-
-    enriched = joined.append_column("inc_i", inc_indicator)
-    enriched = enriched.append_column("exc_i", exc_indicator)
-    enriched = enriched.append_column("amb_i", amb_indicator)
-
-    _diag("    cep: group_by([data_exon_id, sample_id]).sum")
-    aggregated = enriched.group_by(["data_exon_id", "sample_id"]).aggregate(
-        [("inc_i", "sum"), ("exc_i", "sum"), ("amb_i", "sum")]
-    )
-    _diag(f"    cep: group_by done: {aggregated.num_rows:,} (exon, sample) rows")
+    _diag(f"    cep: streaming aggregate done: {aggregated.num_rows:,} (exon, sample) rows")
     if aggregated.num_rows == 0:
         return _empty_exon_psi()
 
@@ -1002,6 +992,107 @@ def compute_exon_psi(
             "psi": psi,
         },
         schema=EXON_PSI_TABLE,
+    )
+
+
+# Default chunk size for the streaming join + aggregate inside
+# compute_exon_psi. At ~5 cols × 8 bytes the per-chunk join output is
+# ~2 GB at 50M rows, well-bounded against the rest of the resolve-stage
+# working set. Tune downward for ≤32 GB nodes.
+_EXON_PSI_JOIN_CHUNK_SIZE: int = 50_000_000
+
+
+def _join_aggregate_streaming(
+    aln_exon_role: pa.Table,
+    overlap_pairs_marked: pa.Table,
+    *,
+    chunk_size: int = _EXON_PSI_JOIN_CHUNK_SIZE,
+) -> pa.Table:
+    """Stream the left-join + indicator + group_by chain on the
+    aln_exon_role × overlap_pairs cross.
+
+    The non-streaming variant (Table.join then group_by) materialised
+    the full ~419M-row joined table before aggregating it down to
+    ~5M (exon, sample) rows — ~20 GB of transient memory at
+    PromethION/mouse scale. Slicing aln_exon_role with
+    ``Table.slice`` is zero-copy (Arrow buffer views), so the per-
+    chunk join output is bounded by `chunk_size × n_output_cols × 8`
+    (~2 GB at chunk_size=50M). Accumulated partial group_by sums are
+    tiny (millions of (exon, sample) rows × 5 cols).
+
+    Output schema:
+        data_exon_id (int64), sample_id (int64),
+        inc_i_sum (int64), exc_i_sum (int64), amb_i_sum (int64)
+
+    Same column names the non-chunked group_by would emit, so the
+    caller's downstream cast/divide/cast chain doesn't need to change.
+    """
+    partial_aggregates: list[pa.Table] = []
+    n_rows = aln_exon_role.num_rows
+    n_chunks = (n_rows + chunk_size - 1) // chunk_size
+    for chunk_idx, chunk_start in enumerate(range(0, n_rows, chunk_size)):
+        chunk = aln_exon_role.slice(chunk_start, chunk_size)
+        chunk_joined = chunk.join(
+            overlap_pairs_marked,
+            keys=["alignment_id", "data_exon_id"],
+            join_type="left outer",
+        )
+        has_overlap = pc.is_valid(chunk_joined.column("_has_overlap"))
+        is_spanning = pc.equal(chunk_joined.column("role_id"), _ROLE_SPANNING)
+        is_partial = pc.equal(chunk_joined.column("role_id"), _ROLE_PARTIAL)
+        inc_i = pc.cast(pc.and_(is_spanning, has_overlap), pa.int32())
+        exc_i = pc.cast(
+            pc.and_(is_spanning, pc.invert(has_overlap)), pa.int32()
+        )
+        amb_i = pc.cast(is_partial, pa.int32())
+
+        chunk_enriched = (
+            chunk_joined
+            .append_column("inc_i", inc_i)
+            .append_column("exc_i", exc_i)
+            .append_column("amb_i", amb_i)
+        )
+        chunk_agg = chunk_enriched.group_by(
+            ["data_exon_id", "sample_id"]
+        ).aggregate(
+            [("inc_i", "sum"), ("exc_i", "sum"), ("amb_i", "sum")]
+        )
+        partial_aggregates.append(chunk_agg)
+        # Help GC release per-chunk intermediates before the next chunk
+        # allocates its own join output.
+        del chunk_enriched, chunk_joined, chunk
+        if (chunk_idx + 1) % 5 == 0 or (chunk_idx + 1) == n_chunks:
+            _diag(
+                f"      cep: streaming join chunk {chunk_idx + 1}/{n_chunks} "
+                f"(partial groups so far ≈ {sum(t.num_rows for t in partial_aggregates):,})"
+            )
+
+    if not partial_aggregates:
+        return pa.table(
+            {
+                "data_exon_id": pa.array([], type=pa.int64()),
+                "sample_id": pa.array([], type=pa.int64()),
+                "inc_i_sum": pa.array([], type=pa.int64()),
+                "exc_i_sum": pa.array([], type=pa.int64()),
+                "amb_i_sum": pa.array([], type=pa.int64()),
+            }
+        )
+
+    # Final pass: combine the per-chunk partials. Same (exon, sample)
+    # may appear in multiple chunks; sum the partial sums into a single
+    # row per (exon, sample). The double-sum produces column names like
+    # `inc_i_sum_sum`, so we rename back to the single-`_sum` form the
+    # non-streaming variant would have produced.
+    combined = pa.concat_tables(partial_aggregates)
+    del partial_aggregates
+    merged = combined.group_by(["data_exon_id", "sample_id"]).aggregate(
+        [("inc_i_sum", "sum"), ("exc_i_sum", "sum"), ("amb_i_sum", "sum")]
+    )
+    return merged.rename_columns(
+        [
+            c.replace("_sum_sum", "_sum")
+            for c in merged.column_names
+        ]
     )
 
 
@@ -1155,19 +1246,26 @@ def _classify_alignments_per_gene(
     gid_t = torch.cat(out_gid)
     sid_t = torch.cat(out_sid)
     role_t = torch.cat(out_role)
-    role_strs = pc.if_else(
-        pc.equal(pa.array(role_t.numpy(), type=pa.int8()), role_spanning),
-        "spanning",
-        "partial",
-    )
+    # Output `role_id` as int8 (0=spanning, 1=partial) — string ("spanning"/
+    # "partial") would cost ~10 bytes per row vs 1 byte. At PromethION scale
+    # (419M aln_exon_role rows after the exon cross-join) this saves ~4 GB
+    # of peak resident in compute_exon_psi. Downstream callers (only
+    # compute_exon_psi) check role_id == _ROLE_SPANNING / _ROLE_PARTIAL.
     return pa.table(
         {
             "alignment_id": pa.array(aid_t.numpy(), type=pa.int64()),
             "gene_id": pa.array(gid_t.numpy(), type=pa.int64()),
             "sample_id": pa.array(sid_t.numpy(), type=pa.int64()),
-            "role": role_strs,
+            "role_id": pa.array(role_t.numpy(), type=pa.int8()),
         }
     )
+
+
+# Role encoding for the int8 `role_id` column emitted by
+# _classify_alignments_per_gene. Matches the torch.full() fill values
+# used inside that function.
+_ROLE_SPANNING: int = 0
+_ROLE_PARTIAL: int = 1
 
 
 def _empty_aln_gene_role() -> pa.Table:
@@ -1176,7 +1274,7 @@ def _empty_aln_gene_role() -> pa.Table:
             "alignment_id": pa.array([], type=pa.int64()),
             "gene_id": pa.array([], type=pa.int64()),
             "sample_id": pa.array([], type=pa.int64()),
-            "role": pa.array([], type=pa.string()),
+            "role_id": pa.array([], type=pa.int8()),
         }
     )
 
