@@ -47,6 +47,9 @@ v1 limitations (deferred to v2):
 
 from __future__ import annotations
 
+import resource
+import sys
+import time
 from pathlib import Path
 from typing import Union
 
@@ -70,6 +73,23 @@ from constellation.sequencing.schemas.reference import FEATURE_TABLE
 # a table; the CLI passes a path so the resolve stage never holds the
 # full BLOCK_EXON_ASSIGNMENT_TABLE in RAM.
 BlockAssignmentsLike = Union[pa.Table, Path, str]
+
+
+# ── DIAG: temporary stderr instrumentation for the resolve-stage perf
+# hunt. Always-on, tagged `[diag-da ...]` so it's easy to grep + strip
+# later. Remove once the bottleneck is pinned.
+_DIAG_T0 = time.monotonic()
+
+
+def _diag(msg: str) -> None:
+    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_gb = rss_kb / (1024.0 * 1024.0)
+    dt = time.monotonic() - _DIAG_T0
+    print(
+        f"[diag-da t={dt:7.1f}s rss_peak={rss_gb:6.2f}GB] {msg}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 # Sentinel sample_id when no read_to_sample mapping is supplied or a
@@ -480,18 +500,22 @@ def assign_blocks_to_exons(
 
     # Attach contig_id to every primary alignment, then propagate to
     # every block via the join chain.
+    _diag("    abte: joining primary × contigs → primary_with_contig")
     contig_lookup = contigs.select(["contig_id", "name"]).rename_columns(
         ["contig_id", "ref_name"]
     )
     primary_with_contig = primary.join(
         contig_lookup, keys="ref_name", join_type="inner"
     ).select(["alignment_id", "contig_id"])
+    _diag("    abte: joining blocks × primary_with_contig → blocks_with_contig")
     blocks_with_contig = alignment_blocks.join(
         primary_with_contig, keys="alignment_id", join_type="inner"
     )
     if blocks_with_contig.num_rows == 0:
         return _finalise_empty_block_assignments(output_path)
+    _diag(f"    abte: blocks_with_contig={blocks_with_contig.num_rows:,}; combine_chunks start")
     blocks_with_contig = blocks_with_contig.combine_chunks()
+    _diag("    abte: combine_chunks done")
 
     writer: pq.ParquetWriter | None = None
     out_batches: list[pa.RecordBatch] = []
@@ -507,7 +531,8 @@ def assign_blocks_to_exons(
         unique_contigs = (
             pc.unique(blocks_with_contig.column("contig_id")).to_pylist()
         )
-        for contig_id in unique_contigs:
+        _diag(f"    abte: {len(unique_contigs)} unique contigs to process")
+        for contig_idx, contig_id in enumerate(unique_contigs):
             contig_filter = pc.equal(
                 blocks_with_contig.column("contig_id"), contig_id
             )
@@ -517,6 +542,10 @@ def assign_blocks_to_exons(
                 continue
             c_blocks = c_blocks.combine_chunks()
             c_exons = c_exons.combine_chunks()
+            _diag(
+                f"    abte: contig {contig_idx + 1}/{len(unique_contigs)} "
+                f"(contig_id={contig_id}): blocks={c_blocks.num_rows:,} exons={c_exons.num_rows:,}"
+            )
 
             blk_aid = torch.from_numpy(
                 c_blocks.column("alignment_id").chunk(0).to_numpy(
@@ -557,7 +586,8 @@ def assign_blocks_to_exons(
 
             n_blocks = blk_aid.numel()
             batch_emitted = 0
-            for chunk_start in range(0, n_blocks, batch_size):
+            n_batches = (n_blocks + batch_size - 1) // batch_size
+            for batch_idx, chunk_start in enumerate(range(0, n_blocks, batch_size)):
                 chunk_end = min(chunk_start + batch_size, n_blocks)
                 b_aid = blk_aid[chunk_start:chunk_end]
                 b_bidx = blk_bidx[chunk_start:chunk_end]
@@ -575,11 +605,20 @@ def assign_blocks_to_exons(
                     writer.write_batch(batch_rb)
                 else:
                     out_batches.append(batch_rb)
+                if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == n_batches:
+                    _diag(
+                        f"      abte: contig {contig_idx + 1}/{len(unique_contigs)} "
+                        f"batch {batch_idx + 1}/{n_batches}: "
+                        f"emitted {batch_rb.num_rows:,} rows "
+                        f"(total written this run: {n_rows_written:,})"
+                    )
             if batch_emitted > 0:
                 n_contigs += 1
     finally:
         if writer is not None:
+            _diag(f"    abte: closing writer ({n_rows_written:,} rows written total)")
             writer.close()
+            _diag("    abte: writer closed")
 
     if output_path is not None:
         return {"n_rows_written": n_rows_written, "n_contigs": n_contigs}
@@ -740,6 +779,7 @@ def compute_exon_psi(
     ``(data_exon_id, sample_id)`` pair with at least one
     gene-spanning or partial-spanning alignment.
     """
+    _diag("    cep: compute_exon_psi enter")
     exons = derived_features.filter(
         pc.equal(derived_features.column("type"), "exon")
     ).select(["feature_id", "contig_id", "start", "end", "parent_id"])
@@ -748,10 +788,12 @@ def compute_exon_psi(
     ).select(["feature_id", "contig_id", "start", "end"])
     if exons.num_rows == 0 or genes.num_rows == 0:
         return _empty_exon_psi()
+    _diag(f"    cep: {genes.num_rows:,} genes, {exons.num_rows:,} exons")
 
     # Filter to primary alignments; attach contig_id + sample_id via
     # Arrow joins. The prior implementation built an alignment-id→metadata
     # Python dict at this point — ~200M dicts of dicts at mouse scale.
+    _diag("    cep: filtering to primary alignments")
     primary_mask = pc.and_(
         pc.invert(alignments.column("is_secondary")),
         pc.invert(alignments.column("is_supplementary")),
@@ -761,7 +803,9 @@ def compute_exon_psi(
     )
     if primary.num_rows == 0:
         return _empty_exon_psi()
+    _diag(f"    cep: primary alignments = {primary.num_rows:,}")
 
+    _diag("    cep: attaching contig_id to primary")
     contig_lookup = contigs.select(["contig_id", "name"]).rename_columns(
         ["contig_id", "ref_name"]
     )
@@ -769,6 +813,7 @@ def compute_exon_psi(
     if primary.num_rows == 0:
         return _empty_exon_psi()
 
+    _diag("    cep: attaching sample_id via read_to_sample left join")
     if read_to_sample is not None:
         primary = primary.join(
             read_to_sample, keys="read_id", join_type="left outer"
@@ -788,27 +833,34 @@ def compute_exon_psi(
                 type=pa.int64(),
             ),
         )
+    _diag(f"    cep: primary enriched: {primary.num_rows:,} rows")
 
     # ── Gene-spanning classification per contig ─────────────────────
+    _diag("    cep: _classify_alignments_per_gene start")
     aln_gene_role = _classify_alignments_per_gene(primary, genes)
+    _diag(f"    cep: _classify_alignments_per_gene done: {aln_gene_role.num_rows:,} (alignment, gene, role) rows")
     if aln_gene_role.num_rows == 0:
         return _empty_exon_psi()
 
     # Cross-join with exons on parent_id → enumerate (alignment, exon, role)
     # for each gene's exons.
+    _diag("    cep: cross-join aln_gene_role × exon_membership")
     exon_membership = exons.select(["feature_id", "parent_id"]).rename_columns(
         ["data_exon_id", "gene_id"]
     )
     aln_exon_role = aln_gene_role.join(
         exon_membership, keys="gene_id", join_type="inner"
     )
+    _diag(f"    cep: aln_exon_role = {aln_exon_role.num_rows:,} rows")
     if aln_exon_role.num_rows == 0:
         return _empty_exon_psi()
 
     # Extract distinct (alignment_id, data_exon_id) overlap pairs from
     # block_assignments. Accepts either an in-memory table or a path
     # (Parquet file / dataset dir) that we stream-scan in batches.
+    _diag("    cep: extracting distinct overlap pairs from block_assignments")
     overlap_pairs = _extract_distinct_overlap_pairs(block_assignments)
+    _diag(f"    cep: overlap_pairs = {overlap_pairs.num_rows:,} distinct (alignment_id, data_exon_id)")
 
     # Left-join indicates "did this (alignment, exon) actually overlap
     # at the block level". We use a sentinel-column trick: add a
@@ -818,11 +870,13 @@ def compute_exon_psi(
         "_has_overlap",
         pa.array(np.ones(overlap_pairs.num_rows, dtype=np.int8), type=pa.int8()),
     )
+    _diag("    cep: left-joining aln_exon_role × overlap_pairs_marked")
     joined = aln_exon_role.join(
         overlap_pairs_marked,
         keys=["alignment_id", "data_exon_id"],
         join_type="left outer",
     )
+    _diag(f"    cep: left-join done: {joined.num_rows:,} rows")
     has_overlap = pc.is_valid(joined.column("_has_overlap"))
     is_spanning = pc.equal(joined.column("role"), "spanning")
     is_partial = pc.equal(joined.column("role"), "partial")
@@ -837,9 +891,11 @@ def compute_exon_psi(
     enriched = enriched.append_column("exc_i", exc_indicator)
     enriched = enriched.append_column("amb_i", amb_indicator)
 
+    _diag("    cep: group_by([data_exon_id, sample_id]).sum")
     aggregated = enriched.group_by(["data_exon_id", "sample_id"]).aggregate(
         [("inc_i", "sum"), ("exc_i", "sum"), ("amb_i", "sum")]
     )
+    _diag(f"    cep: group_by done: {aggregated.num_rows:,} (exon, sample) rows")
     if aggregated.num_rows == 0:
         return _empty_exon_psi()
 
@@ -901,7 +957,10 @@ def _classify_alignments_per_gene(
     role_partial = 1
 
     gene_contigs = pc.unique(genes.column("contig_id")).to_pylist()
-    for contig_id in gene_contigs:
+    _diag(f"      cag: {len(gene_contigs)} gene-bearing contigs to classify")
+    total_emitted_spanning = 0
+    total_emitted_partial = 0
+    for contig_idx, contig_id in enumerate(gene_contigs):
         c_genes = genes.filter(pc.equal(genes.column("contig_id"), contig_id))
         c_primary = primary.filter(
             pc.equal(primary.column("contig_id"), contig_id)
@@ -910,6 +969,11 @@ def _classify_alignments_per_gene(
             continue
         c_primary = c_primary.combine_chunks()
         c_genes = c_genes.combine_chunks()
+        _diag(
+            f"      cag: contig {contig_idx + 1}/{len(gene_contigs)} "
+            f"(contig_id={contig_id}): "
+            f"genes={c_genes.num_rows:,} primary={c_primary.num_rows:,}"
+        )
 
         a_start = torch.from_numpy(
             c_primary.column("ref_start").chunk(0).to_numpy(zero_copy_only=True)
@@ -946,7 +1010,14 @@ def _classify_alignments_per_gene(
         n_genes = g_start.numel()
 
         chunk_size = max(1, min(256, _GENE_CHUNK_TARGET_BYTES // max(M, 1)))
-        for cs in range(0, n_genes, chunk_size):
+        n_gene_chunks = (n_genes + chunk_size - 1) // chunk_size
+        _diag(
+            f"        cag: chunk_size={chunk_size} → {n_gene_chunks} gene chunks "
+            f"× {M:,} alignments per chunk = {chunk_size * M:,} bool ops/chunk"
+        )
+        contig_spanning_emitted = 0
+        contig_partial_emitted = 0
+        for cs_idx, cs in enumerate(range(0, n_genes, chunk_size)):
             ce = min(cs + chunk_size, n_genes)
             cg_start = g_start[cs:ce]
             cg_end = g_end[cs:ce]
@@ -973,6 +1044,7 @@ def _classify_alignments_per_gene(
                         (sp_idx.shape[0],), role_spanning, dtype=torch.int8
                     )
                 )
+                contig_spanning_emitted += sp_idx.shape[0]
             if bool(partials.any()):
                 pt_idx = torch.nonzero(partials, as_tuple=False)
                 k_idx = pt_idx[:, 0]
@@ -985,6 +1057,21 @@ def _classify_alignments_per_gene(
                         (pt_idx.shape[0],), role_partial, dtype=torch.int8
                     )
                 )
+                contig_partial_emitted += pt_idx.shape[0]
+            if (cs_idx + 1) % 10 == 0 or (cs_idx + 1) == n_gene_chunks:
+                _diag(
+                    f"        cag: contig {contig_idx + 1}/{len(gene_contigs)} "
+                    f"chunk {cs_idx + 1}/{n_gene_chunks}: "
+                    f"spanning+={contig_spanning_emitted - total_emitted_spanning:,} "
+                    f"partial+={contig_partial_emitted - total_emitted_partial:,}"
+                )
+        total_emitted_spanning += contig_spanning_emitted
+        total_emitted_partial += contig_partial_emitted
+
+    _diag(
+        f"      cag: classification done — "
+        f"spanning={total_emitted_spanning:,} partial={total_emitted_partial:,}"
+    )
 
     if not out_aid:
         return _empty_aln_gene_role()
@@ -1121,6 +1208,11 @@ def build_derived_annotation(
     # Local import to avoid circular import at module load time.
     from constellation.sequencing.annotation.annotation import Annotation
 
+    _diag(
+        f"build_derived_annotation enter: introns={introns.num_rows:,} "
+        f"blocks={alignment_blocks.num_rows:,} alignments={alignments.num_rows:,}"
+    )
+
     metadata = {
         "min_exon_depth": int(min_exon_depth),
         "min_intron_read_count": int(min_intron_read_count),
@@ -1128,15 +1220,19 @@ def build_derived_annotation(
     }
 
     if isinstance(coverage, (str, Path)):
+        _diag(f"  reading coverage parquet from {coverage}")
         coverage_table = pq.read_table(str(coverage))
+        _diag(f"  coverage loaded: {coverage_table.num_rows:,} RLE rows")
     else:
         coverage_table = coverage
 
+    _diag("  derive_exons start")
     exons = derive_exons(
         coverage_table, introns, contigs,
         min_exon_depth=min_exon_depth,
         min_intron_read_count=min_intron_read_count,
     )
+    _diag(f"  derive_exons done: {exons.num_rows:,} exons")
     if exons.num_rows == 0:
         empty_annotation = Annotation(
             features=_empty_features_table(),
@@ -1162,17 +1258,21 @@ def build_derived_annotation(
             _empty_exon_psi(),
         )
 
+    _diag("  roll_up_genes start")
     full_features = roll_up_genes(
         exons, introns, min_intron_read_count=min_intron_read_count
     )
+    _diag(f"  roll_up_genes done: {full_features.num_rows:,} features (gene+exon)")
 
     if block_assignments_output_path is not None:
         # Streaming mode: write to disk; compute_exon_psi reads back
         # as a dataset.
+        _diag(f"  assign_blocks_to_exons start (streaming to {block_assignments_output_path.name})")
         assign_blocks_to_exons(
             alignment_blocks, alignments, full_features, contigs,
             output_path=Path(block_assignments_output_path),
         )
+        _diag("  assign_blocks_to_exons done (streaming write)")
         block_assignments_for_psi: BlockAssignmentsLike = Path(
             block_assignments_output_path
         )
@@ -1180,20 +1280,25 @@ def build_derived_annotation(
             block_assignments_output_path
         )
     else:
+        _diag("  assign_blocks_to_exons start (in-memory)")
         block_assignments_table = assign_blocks_to_exons(
             alignment_blocks, alignments, full_features, contigs,
         )
+        _diag(f"  assign_blocks_to_exons done: {block_assignments_table.num_rows:,} edges")
         block_assignments_for_psi = block_assignments_table
         block_assignments_return = block_assignments_table
 
+    _diag("  compute_exon_psi start")
     exon_psi = compute_exon_psi(
         block_assignments_for_psi, alignments, full_features, contigs,
         read_to_sample=read_to_sample,
     )
+    _diag(f"  compute_exon_psi done: {exon_psi.num_rows:,} PSI rows")
     annotation = Annotation(
         features=full_features,
         metadata_extras=metadata,
     )
+    _diag("build_derived_annotation exit")
     return annotation, block_assignments_return, exon_psi
 
 
