@@ -107,6 +107,18 @@ class SessionSource:
 
     samples: tuple[str, ...] = ()
 
+    @property
+    def source_id(self) -> str:
+        """Stable client-side identifier derived from ``(path, kind)``.
+
+        Survives add/remove cycles so persisted per-binding layout state
+        (visibility, display order, height) keyed by ``source_id``
+        remains valid across session rebuilds.
+        """
+        payload = f"{self.path}|{self.kind}".encode("utf-8")
+        digest = hashlib.blake2b(payload, digest_size=4).hexdigest()
+        return f"src-{digest}"
+
     def slot_paths(self) -> dict[str, str | None]:
         """JSON-friendly slot view for the dashboard's session manifest."""
         return {
@@ -238,6 +250,29 @@ class Session:
             saved_as=saved_as,
         )
 
+    def with_sources(
+        self,
+        sources: Iterable[dict[str, Any]],
+        *,
+        cache_root: Path | None = None,
+    ) -> "Session":
+        """Rebuild this session with a new list of attached sources.
+
+        Used by the runtime add/remove-source endpoints. Reuses
+        ``reference_handle``, ``label``, and ``saved_as``; the returned
+        Session's ``session_id`` matches ``self.session_id`` by
+        construction (``_derive_session_id`` is deterministic over
+        ``(reference_path, label)``), so the registry entry can be
+        swapped in place without notifying the client.
+        """
+        return Session.open(
+            reference_handle=self.reference_handle,
+            sources=sources,
+            label=self.label,
+            saved_as=self.saved_as,
+            cache_root=cache_root,
+        )
+
     # ------------------------------------------------------------------
     # Inspection helpers (consumed by /api/sessions/{id}/manifest)
     # ------------------------------------------------------------------
@@ -274,6 +309,7 @@ class Session:
             },
             "sources": [
                 {
+                    "source_id": src.source_id,
                     "path": str(src.path),
                     "kind": src.kind,
                     "label": src.label,

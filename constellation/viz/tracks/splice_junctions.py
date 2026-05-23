@@ -78,7 +78,7 @@ class SpliceJunctionsKernel(TrackKernel):
                         "introns": src.introns,
                         "genome": session.reference_genome,
                     },
-                    config={},
+                    config={"source_id": src.source_id},
                 )
             )
         return bindings

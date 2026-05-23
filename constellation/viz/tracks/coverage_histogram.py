@@ -91,6 +91,7 @@ class CoverageHistogramKernel(TrackKernel):
                         # sensible default order so colors are stable across
                         # reloads of the same session.
                         "samples": list(src.samples),
+                        "source_id": src.source_id,
                     },
                 )
             )

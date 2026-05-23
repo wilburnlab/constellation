@@ -73,3 +73,33 @@ export async function fetchJson<T>(path: string, signal?: AbortSignal): Promise<
   }
   return (await response.json()) as T;
 }
+
+export async function fetchJsonMethod<T>(
+  path: string,
+  method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
+  const init: RequestInit = { method, signal };
+  if (body !== undefined) {
+    init.headers = { 'Content-Type': 'application/json' };
+    init.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, init);
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const data = await response.json();
+      if (data && typeof data === 'object' && 'detail' in data) {
+        detail = ` — ${(data as { detail: unknown }).detail}`;
+      }
+    } catch {
+      /* response wasn't JSON */
+    }
+    throw new Error(`${method} ${path} failed: ${response.status}${detail}`);
+  }
+  if (response.status === 204) {
+    return undefined as T;
+  }
+  return (await response.json()) as T;
+}

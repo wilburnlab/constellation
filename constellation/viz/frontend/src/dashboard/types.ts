@@ -118,6 +118,16 @@ export interface SavedSessionSummary {
   last_viewed_locus: { contig: string; start: number; end: number } | null;
 }
 
+export interface TrackLayoutEntry {
+  source_id: string;
+  kind: string;
+  visible: boolean;
+  display_order: number;
+  height_px: number;
+  collapsed: boolean;
+}
+
 export interface SavedSessionPayload extends SavedSessionSummary {
   sources: Array<{ path: string; kind: string; label: string }>;
+  track_layout?: TrackLayoutEntry[];
 }
