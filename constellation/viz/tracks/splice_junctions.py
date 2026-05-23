@@ -1,6 +1,6 @@
 """Splice-junction track — intron arcs from clustered INTRON_TABLE.
 
-Reads `<root>/S2_align/introns.parquet`. Each row is one observed
+Reads each align source's `introns.parquet`. Each row is one observed
 `(contig, donor, acceptor, strand)` tuple, augmented with cluster IDs
 (`intron_id`) and `read_count` evidence. The renderer draws one arc
 per emitted row with stroke-width scaled by `read_count` and color by
@@ -27,6 +27,7 @@ from constellation.viz.tracks.base import (
     TrackBinding,
     TrackKernel,
     TrackQuery,
+    iter_sources_with,
     register_track,
 )
 
@@ -58,21 +59,29 @@ class SpliceJunctionsKernel(TrackKernel):
     vector_glyph_limit = 1_500
 
     def discover(self, session: Session) -> list[TrackBinding]:
-        if session.introns is None or session.reference_genome is None:
+        if session.reference_genome is None:
             return []
-        return [
-            TrackBinding(
-                session_id=session.session_id,
-                kind=self.kind,
-                binding_id="splice_junctions",
-                label="Splice junctions",
-                paths={
-                    "introns": session.introns,
-                    "genome": session.reference_genome,
-                },
-                config={},
+        bindings: list[TrackBinding] = []
+        for idx, src in iter_sources_with(session, "introns"):
+            label = (
+                f"Splice junctions ({src.label})"
+                if len(session.sources) > 1
+                else "Splice junctions"
             )
-        ]
+            bindings.append(
+                TrackBinding(
+                    session_id=session.session_id,
+                    kind=self.kind,
+                    binding_id=f"splice_junctions-{idx}",
+                    label=label,
+                    paths={
+                        "introns": src.introns,
+                        "genome": session.reference_genome,
+                    },
+                    config={},
+                )
+            )
+        return bindings
 
     def metadata(self, binding: TrackBinding) -> dict[str, Any]:
         # Read the motif column to populate the renderer's palette.

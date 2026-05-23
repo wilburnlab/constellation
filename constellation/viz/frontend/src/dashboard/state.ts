@@ -16,6 +16,13 @@ export interface DashboardEvents {
   'job:active': JobSnapshot | null;
   // A POST /api/commands returned 409 — the form surfaces the message.
   'job:rejected': string;
+  // A new compute job was just started — components that should refresh
+  // their state on a start (e.g. StatusBar's poll cycle) listen here.
+  'job:started': { jobId: string; argv: string[] };
+  // A `reference fetch` job just finished successfully — refresh
+  // reference-dependent dropdowns. Emitted by StatusBar when it sees
+  // an active reference-fetch job transition to idle.
+  'reference:installed': void;
 }
 
 export class DashboardState {

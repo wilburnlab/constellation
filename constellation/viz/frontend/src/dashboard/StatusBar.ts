@@ -19,6 +19,7 @@ export class StatusBar {
   private toastTimer: number | null = null;
   private pollTimer: number | null = null;
   private unsubscribe: (() => void) | null = null;
+  private lastActiveArgv: string[] | null = null;
 
   constructor(element: HTMLElement, state: DashboardState) {
     this.element = element;
@@ -68,8 +69,23 @@ export class StatusBar {
       const data = (await response.json()) as JobSnapshot | null;
       this.state.emit('job:active', data);
       if (data === null) {
+        // Transition from active → idle. If the previous job was a
+        // `reference fetch`, hot-refresh reference-dependent dropdowns
+        // (e.g. the genome browser entry form's handle dropdown). We
+        // don't gate on exit_code — the dropdown reflects on-disk
+        // install state regardless of how the fetch terminated.
+        if (
+          this.lastActiveArgv &&
+          this.lastActiveArgv.length >= 2 &&
+          this.lastActiveArgv[0] === 'reference' &&
+          this.lastActiveArgv[1] === 'fetch'
+        ) {
+          this.state.emit('reference:installed', undefined);
+        }
+        this.lastActiveArgv = null;
         this.renderIdle();
       } else {
+        this.lastActiveArgv = data.argv;
         this.renderRunning(data);
       }
     } catch (err) {

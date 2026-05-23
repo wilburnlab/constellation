@@ -31,6 +31,7 @@ from constellation.viz.tracks.coverage_histogram import (
     CoverageHistogramKernel,
 )
 from constellation.viz.server.session import Session
+from _viz_fixtures import build_viz_session
 
 
 # ----------------------------------------------------------------------
@@ -110,76 +111,64 @@ def test_hybrid_schema_shape() -> None:
 
 def _build_session_with_coverage(
     tmp_path: Path,
+    monkeypatch,
     rows: list[dict],
     *,
     contig_name: str = "chr1",
     contig_id: int = 1,
 ) -> Session:
-    root = tmp_path / "run"
-    genome = root / "genome"
-    genome.mkdir(parents=True)
-    pq.write_table(
-        pa.Table.from_pylist(
-            [
-                {
-                    "contig_id": contig_id,
-                    "name": contig_name,
-                    "length": 10_000,
-                    "topology": None,
-                    "circular": None,
-                }
-            ],
-            schema=CONTIG_TABLE,
-        ),
-        genome / "contigs.parquet",
-    )
-    pq.write_table(
-        pa.table(
+    return build_viz_session(
+        tmp_path,
+        monkeypatch,
+        contigs=[
             {
-                "contig_id": pa.array([contig_id], pa.int64()),
-                "sequence": pa.array(["N" * 100], pa.string()),
+                "contig_id": contig_id,
+                "name": contig_name,
+                "length": 10_000,
+                "topology": None,
+                "circular": None,
             }
-        ),
-        genome / "sequences.parquet",
+        ],
+        sequences=[{"contig_id": contig_id, "sequence": "N" * 100}],
+        align_sources=[{"coverage": rows}],
     )
 
-    align_dir = root / "S2_align"
-    align_dir.mkdir(parents=True)
-    pq.write_table(
-        pa.Table.from_pylist(rows, schema=COVERAGE_TABLE),
-        align_dir / "coverage.parquet",
-    )
 
-    return Session.from_root(root)
-
-
-def test_coverage_kernel_discover_returns_one_binding(tmp_path: Path) -> None:
+def test_coverage_kernel_discover_returns_one_binding(
+    tmp_path: Path, monkeypatch
+) -> None:
     session = _build_session_with_coverage(
         tmp_path,
+        monkeypatch,
         [{"contig_id": 1, "sample_id": -1, "start": 0, "end": 100, "depth": 4}],
     )
     bindings = get_kernel("coverage_histogram").discover(session)
     assert len(bindings) == 1
     binding = bindings[0]
     assert binding.kind == "coverage_histogram"
-    assert binding.binding_id == "coverage"
+    assert binding.binding_id == "coverage-0"
     assert "coverage" in binding.paths
     assert "genome" in binding.paths
 
 
 def test_coverage_kernel_discover_empty_when_coverage_missing(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
-    root = tmp_path / "run"
-    (root / "genome").mkdir(parents=True)
-    # No coverage.parquet — kernel should produce zero bindings.
-    session = Session.from_root(root)
+    # No coverage in the source's manifest outputs — kernel produces zero bindings.
+    session = build_viz_session(
+        tmp_path,
+        monkeypatch,
+        align_sources=[{}],
+    )
     assert get_kernel("coverage_histogram").discover(session) == []
 
 
-def test_coverage_kernel_fetch_emits_wire_schema(tmp_path: Path) -> None:
+def test_coverage_kernel_fetch_emits_wire_schema(
+    tmp_path: Path, monkeypatch
+) -> None:
     session = _build_session_with_coverage(
         tmp_path,
+        monkeypatch,
         [
             {"contig_id": 1, "sample_id": -1, "start": 0, "end": 50, "depth": 3},
             {"contig_id": 1, "sample_id": -1, "start": 50, "end": 100, "depth": 7},
@@ -207,9 +196,12 @@ def test_coverage_kernel_fetch_emits_wire_schema(tmp_path: Path) -> None:
     assert all(c == 1 for c in (1, 1))  # smoke; contigs filtered by id
 
 
-def test_coverage_kernel_fetch_unknown_contig_is_empty(tmp_path: Path) -> None:
+def test_coverage_kernel_fetch_unknown_contig_is_empty(
+    tmp_path: Path, monkeypatch
+) -> None:
     session = _build_session_with_coverage(
         tmp_path,
+        monkeypatch,
         [{"contig_id": 1, "sample_id": -1, "start": 0, "end": 100, "depth": 5}],
     )
     kernel = get_kernel("coverage_histogram")
@@ -221,10 +213,11 @@ def test_coverage_kernel_fetch_unknown_contig_is_empty(tmp_path: Path) -> None:
 
 
 def test_coverage_kernel_metadata_reports_depth_max_and_samples(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     session = _build_session_with_coverage(
         tmp_path,
+        monkeypatch,
         [
             {"contig_id": 1, "sample_id": 0, "start": 0, "end": 50, "depth": 4},
             {"contig_id": 1, "sample_id": 1, "start": 50, "end": 100, "depth": 9},
@@ -239,10 +232,11 @@ def test_coverage_kernel_metadata_reports_depth_max_and_samples(
 
 
 def test_coverage_kernel_estimate_vector_cost_matches_row_count(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     session = _build_session_with_coverage(
         tmp_path,
+        monkeypatch,
         [
             {"contig_id": 1, "sample_id": -1, "start": 0, "end": 50, "depth": 1},
             {"contig_id": 1, "sample_id": -1, "start": 50, "end": 100, "depth": 2},

@@ -105,7 +105,7 @@ class TrackBinding:
     """A concrete renderable produced by `TrackKernel.discover`.
 
     `paths` is the resolved set of parquet locations this binding reads
-    (e.g. `{"alignments": .../S2_align/alignments, "blocks": .../alignment_blocks}`
+    (e.g. `{"alignments": <source>/alignments, "blocks": <source>/alignment_blocks}`
     for the read-pileup kernel). `config` carries per-track display state
     (palette, height, configured sample subset) — the dashboard is allowed
     to mutate this through the frontend; the server treats it as opaque.
@@ -229,3 +229,21 @@ def get_kernel(kind: str) -> TrackKernel:
 
 def registered_kinds() -> list[str]:
     return sorted(_REGISTRY)
+
+
+# ----------------------------------------------------------------------
+# Source iteration helper
+# ----------------------------------------------------------------------
+
+
+def iter_sources_with(session, *attrs):
+    """Yield ``(index, SessionSource)`` for sources where every attribute
+    in ``attrs`` resolves to a non-None Path.
+
+    The index is used by kernels to make binding_ids deterministic
+    (``f"{kind}-{i}"``) so the per-process binding cache key stays
+    stable across re-discovery.
+    """
+    for idx, src in enumerate(session.sources):
+        if all(getattr(src, a, None) is not None for a in attrs):
+            yield idx, src

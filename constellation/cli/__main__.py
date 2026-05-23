@@ -474,10 +474,26 @@ def _build_transcriptome_parser(subs) -> None:
         "--reference",
         default=None,
         help=(
-            "reference root produced by `constellation reference import` / "
-            "`fetch` — must contain ``genome/`` + ``annotation/`` "
-            "ParquetDir bundles. Presence selects Mode A; absence "
-            "errors with the Mode B not-yet-implemented message."
+            "reference cache handle, e.g. `homo_sapiens@ensembl-111` (or a "
+            "bare organism slug when defaults.toml resolves it). The handle "
+            "is resolved against the per-user reference cache populated by "
+            "`constellation reference fetch` / `import`. Presence selects "
+            "Mode A; absence errors with the Mode B not-yet-implemented "
+            "message. For an off-cache ad-hoc reference dir, use "
+            "`--reference-dir <PATH>` instead (escape hatch)."
+        ),
+    )
+    p_aln.add_argument(
+        "--reference-dir",
+        default=None,
+        help=(
+            "escape hatch — bare path to a `genome/` + `annotation/` "
+            "reference root, used for one-off runs against a reference "
+            "that hasn't been imported into the cache. Mutually exclusive "
+            "with `--reference`. Manifests written this way omit the "
+            "`reference_handle` field and cannot be opened in the genome "
+            "browser dashboard until the reference is imported via "
+            "`constellation reference import`."
         ),
     )
     p_aln.add_argument(
@@ -681,8 +697,20 @@ def _build_transcriptome_parser(subs) -> None:
         "--reference",
         default=None,
         help=(
-            "reference root with genome/ + annotation/ subdirs; "
-            "required when --build-consensus is set."
+            "reference cache handle (e.g. `homo_sapiens@ensembl-111`); "
+            "required when --build-consensus is set, and otherwise inherits "
+            "from the upstream align manifest. For an off-cache ad-hoc "
+            "reference dir, use `--reference-dir <PATH>` (escape hatch)."
+        ),
+    )
+    p_cluster.add_argument(
+        "--reference-dir",
+        default=None,
+        help=(
+            "escape hatch — bare path to a `genome/` + `annotation/` "
+            "reference root. Mutually exclusive with `--reference`. "
+            "Manifests written this way omit `reference_handle` and "
+            "cannot be opened in the genome browser dashboard."
         ),
     )
     p_cluster.add_argument(
@@ -1085,11 +1113,17 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     from constellation.sequencing.samples import Samples
 
     # ── Mode dispatch ────────────────────────────────────────────────
-    if args.reference is None:
+    if args.reference is None and args.reference_dir is None:
         print(
             "Mode B (de novo clustering) not yet implemented in this "
-            "release; pass --reference <ref-root> for reference-guided "
-            "gene counting.",
+            "release; pass --reference <handle> for reference-guided "
+            "gene counting (or --reference-dir <PATH> as an escape hatch).",
+            file=sys.stderr,
+        )
+        return 2
+    if args.reference is not None and args.reference_dir is not None:
+        print(
+            "error: --reference and --reference-dir are mutually exclusive",
             file=sys.stderr,
         )
         return 2
@@ -1108,18 +1142,16 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         )
     demux_manifest = json.loads(demux_manifest_path.read_text())
 
-    try:
-        resolved_ref, ref_source = _resolve_reference_argument(args.reference)
-    except Exception as exc:  # ValueError / ReferenceNotInstalledError
-        print(f"error: --reference {args.reference!r}: {exc}", file=sys.stderr)
-        return 1
-    reference = Path(resolved_ref)
+    reference, reference_handle, assembly_accession = _resolve_reference_args(
+        handle_arg=args.reference, dir_arg=args.reference_dir
+    )
+    if reference is None:
+        return 1  # error already printed
     genome_dir = reference / "genome"
     annotation_dir = reference / "annotation"
     if not genome_dir.is_dir() or not annotation_dir.is_dir():
         raise FileNotFoundError(
-            f"--reference must contain genome/ + annotation/ subdirs: "
-            f"{reference} (source: {ref_source})"
+            f"reference must contain genome/ + annotation/ subdirs: {reference}"
         )
 
     output_dir = Path(args.output_dir)
@@ -1423,11 +1455,20 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     manifest_outputs.update(emit_outputs)
     manifest_outputs.update(matrix_outputs)
 
-    manifest = {
-        "demux_dir": str(demux_dir),
-        "reference": str(reference),
-        "input_files": [str(p) for p in bam_inputs],
-        "parameters": {
+    from constellation.sequencing.transcriptome.manifest import write_align_manifest
+
+    sample_names = (
+        sorted(set(samples.samples.column("sample_name").to_pylist()))
+        if samples.samples.num_rows > 0 else None
+    )
+    write_align_manifest(
+        output_dir / "manifest.json",
+        reference_handle=reference_handle,
+        reference_path=str(reference),
+        assembly_accession=assembly_accession,
+        demux_dir=str(demux_dir),
+        input_files=[str(p) for p in bam_inputs],
+        parameters={
             "threads": args.threads,
             "chunk_size": args.chunk_size,
             "min_length": args.min_length,
@@ -1447,10 +1488,10 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             "emit_cs_tags": bool(emit_cs),
             "intron_min_bp": int(args.intron_min_bp),
         },
-        "stages": per_stage,
-        "outputs": manifest_outputs,
-    }
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        stages=per_stage,
+        outputs=manifest_outputs,
+        samples=sample_names,
+    )
     (output_dir / "_SUCCESS").write_bytes(b"")
 
     if not args.progress:
@@ -1530,6 +1571,12 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.reference is not None and args.reference_dir is not None:
+        print(
+            "error: --reference and --reference-dir are mutually exclusive",
+            file=sys.stderr,
+        )
+        return 2
     if args.build_consensus:
         cs_success = align_dir / "alignment_cs" / "_SUCCESS"
         if not cs_success.exists():
@@ -1540,10 +1587,10 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if args.reference is None:
+        if args.reference is None and args.reference_dir is None:
             print(
-                "--build-consensus requires --reference <ref-root> for "
-                "the genome window.",
+                "--build-consensus requires --reference <handle> (or "
+                "--reference-dir <PATH>) for the genome window.",
                 file=sys.stderr,
             )
             return 2
@@ -1586,22 +1633,56 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     if align_manifest_path.exists():
         align_manifest = json.loads(align_manifest_path.read_text())
 
+    # Reference identity: inherit from the upstream align manifest unless
+    # the user explicitly overrides via --reference / --reference-dir.
+    # The handle (when present) and assembly_accession ride forward into
+    # this stage's manifest so downstream consumers can match cluster
+    # outputs to the same reference axis as the align outputs.
+    inherited_handle: str | None = align_manifest.get("reference_handle")
+    inherited_ref_path: str | None = align_manifest.get("reference_path")
+    inherited_assembly: str | None = align_manifest.get("assembly_accession")
+
+    reference: Path | None = None
+    reference_handle: str | None = inherited_handle
+    reference_path_str: str | None = inherited_ref_path
+    assembly_accession: str | None = inherited_assembly
+
+    if args.reference is not None or args.reference_dir is not None:
+        ref_path, ref_handle, ref_assembly = _resolve_reference_args(
+            handle_arg=args.reference, dir_arg=args.reference_dir
+        )
+        if ref_path is None:
+            return 1
+        reference = Path(ref_path)
+        reference_handle = ref_handle
+        reference_path_str = str(ref_path)
+        assembly_accession = ref_assembly
+        if inherited_handle and ref_handle and inherited_handle != ref_handle:
+            print(
+                f"warning: --reference {ref_handle!r} overrides align "
+                f"manifest's {inherited_handle!r}",
+                file=sys.stderr,
+            )
+    elif inherited_ref_path is not None:
+        candidate = Path(inherited_ref_path)
+        if candidate.is_dir():
+            reference = candidate
+
     # ── Genome (only when --build-consensus) ─────────────────────────
     genome = None
-    if args.reference is not None:
-        try:
-            resolved_ref, ref_source = _resolve_reference_argument(args.reference)
-        except Exception as exc:  # ValueError / ReferenceNotInstalledError
+    if args.build_consensus:
+        if reference is None:
             print(
-                f"error: --reference {args.reference!r}: {exc}", file=sys.stderr
+                "--build-consensus requires a reference but none could be "
+                "resolved (align manifest carries no reference_path and no "
+                "--reference / --reference-dir was passed).",
+                file=sys.stderr,
             )
             return 1
-        reference = Path(resolved_ref)
         genome_dir = reference / "genome"
         if not genome_dir.is_dir():
             raise FileNotFoundError(
-                f"--reference must contain genome/: {reference} "
-                f"(source: {ref_source})"
+                f"reference must contain genome/: {reference}"
             )
         genome = load_genome_reference(genome_dir)
 
@@ -1870,12 +1951,23 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         cluster_outputs["cluster_summary_tsv"] = str(summary_path)
 
     # ── Manifest + _SUCCESS ──────────────────────────────────────────
-    manifest = {
-        "align_dir": str(align_dir),
-        "demux_dir": str(demux_dir),
-        "reference": (str(args.reference) if args.reference else None),
-        "samples_path": str(args.samples),
-        "parameters": {
+    from constellation.sequencing.transcriptome.manifest import (
+        write_cluster_manifest,
+    )
+
+    sample_names = (
+        sorted(set(samples.samples.column("sample_name").to_pylist()))
+        if samples.samples.num_rows > 0 else None
+    )
+    write_cluster_manifest(
+        output_dir / "manifest.json",
+        reference_handle=reference_handle,
+        reference_path=reference_path_str,
+        assembly_accession=assembly_accession,
+        align_dir=str(align_dir),
+        demux_dir=str(demux_dir),
+        samples_path=str(args.samples),
+        parameters={
             "mode": str(args.mode),
             "max_5p_drift": int(args.max_5p_drift),
             "max_3p_drift": int(args.max_3p_drift),
@@ -1889,16 +1981,14 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             "write_summary": bool(args.write_summary),
             "threads": int(args.threads),
         },
-        "stages": {
+        stages={
             "n_input_fingerprints": int(fingerprints_table.num_rows),
             "n_clusters": int(clusters.num_rows),
             "n_membership_rows": int(membership.num_rows),
             "n_samples": int(len(list(samples.ids))),
         },
-        "outputs": cluster_outputs,
-    }
-    (output_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2) + "\n"
+        outputs=cluster_outputs,
+        samples=sample_names,
     )
     (output_dir / "_SUCCESS").write_bytes(b"")
 
@@ -2386,6 +2476,64 @@ def _resolve_reference_argument(arg: str) -> "tuple[object, str]":
     from constellation.sequencing.reference.handle import resolve as resolve_handle
 
     return resolve_handle(arg), "handle"
+
+
+def _resolve_reference_args(
+    *,
+    handle_arg: str | None,
+    dir_arg: str | None,
+) -> "tuple[object | None, str | None, str | None]":
+    """Resolve the new dual --reference / --reference-dir CLI shape.
+
+    Returns ``(release_path, reference_handle, assembly_accession)``. When
+    the handle path is taken, the release dir is resolved via the
+    reference cache and ``assembly_accession`` is read from
+    ``meta.toml``. The escape-hatch path returns ``(path, None, None)`` —
+    no handle, no assembly_accession, which downstream consumers (the
+    dashboard) use to refuse opening the resulting outputs until the user
+    runs ``constellation reference import``.
+
+    On error, prints an actionable message to stderr and returns
+    ``(None, None, None)``.
+    """
+    from pathlib import Path
+    import sys
+
+    if handle_arg is not None:
+        from constellation.sequencing.reference.handle import (
+            ReferenceNotInstalledError,
+            read_meta_toml,
+            resolve as resolve_handle,
+        )
+
+        try:
+            release_path = resolve_handle(handle_arg)
+        except (ValueError, ReferenceNotInstalledError) as exc:
+            print(f"error: --reference {handle_arg!r}: {exc}", file=sys.stderr)
+            return None, None, None
+        meta = read_meta_toml(release_path) or {}
+        assembly_accession = meta.get("assembly_accession")
+        # Canonical handle string from meta.toml — preserves the qualified
+        # form even when the user passed a bare organism slug that the
+        # resolver expanded via defaults.toml / current.
+        canonical_handle = str(meta.get("handle") or handle_arg)
+        return (
+            release_path,
+            canonical_handle,
+            (str(assembly_accession) if assembly_accession is not None else None),
+        )
+
+    if dir_arg is not None:
+        path = Path(dir_arg).expanduser().resolve()
+        if not path.is_dir():
+            print(
+                f"error: --reference-dir {dir_arg!r}: not a directory",
+                file=sys.stderr,
+            )
+            return None, None, None
+        return path, None, None
+
+    return None, None, None
 
 
 def _cmd_reference_import(args: argparse.Namespace) -> int:

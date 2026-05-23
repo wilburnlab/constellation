@@ -1,7 +1,7 @@
 """Transcript-cluster pile-up track — isoform-resolution stacked bars.
 
-Reads `<root>/S2_cluster/clusters.parquet` (`TRANSCRIPT_CLUSTER_TABLE`)
-and `<root>/S2_cluster/cluster_membership.parquet` (latter referenced
+Reads each cluster source's `clusters.parquet` (`TRANSCRIPT_CLUSTER_TABLE`)
+and `cluster_membership.parquet` (latter referenced
 in metadata for a future "expand cluster to member reads" affordance;
 v1 ships cluster-level glyphs only).
 
@@ -27,6 +27,7 @@ from constellation.viz.tracks.base import (
     TrackBinding,
     TrackKernel,
     TrackQuery,
+    iter_sources_with,
     register_track,
 )
 
@@ -58,24 +59,33 @@ class ClusterPileupKernel(TrackKernel):
     vector_bp_per_pixel_limit = 50.0
 
     def discover(self, session: Session) -> list[TrackBinding]:
-        if session.clusters is None or session.reference_genome is None:
+        if session.reference_genome is None:
             return []
-        paths: dict[str, Any] = {
-            "clusters": session.clusters,
-            "genome": session.reference_genome,
-        }
-        if session.cluster_membership is not None:
-            paths["cluster_membership"] = session.cluster_membership
-        return [
-            TrackBinding(
-                session_id=session.session_id,
-                kind=self.kind,
-                binding_id="cluster_pileup",
-                label="Transcript clusters",
-                paths=paths,
-                config={},
+        bindings: list[TrackBinding] = []
+        for idx, src in iter_sources_with(
+            session, "clusters", "cluster_membership"
+        ):
+            paths: dict[str, Any] = {
+                "clusters": src.clusters,
+                "cluster_membership": src.cluster_membership,
+                "genome": session.reference_genome,
+            }
+            label = (
+                f"Transcript clusters ({src.label})"
+                if len(session.sources) > 1
+                else "Transcript clusters"
             )
-        ]
+            bindings.append(
+                TrackBinding(
+                    session_id=session.session_id,
+                    kind=self.kind,
+                    binding_id=f"cluster_pileup-{idx}",
+                    label=label,
+                    paths=paths,
+                    config={},
+                )
+            )
+        return bindings
 
     def metadata(self, binding: TrackBinding) -> dict[str, Any]:
         # Surface the unique cluster modes so the renderer can color

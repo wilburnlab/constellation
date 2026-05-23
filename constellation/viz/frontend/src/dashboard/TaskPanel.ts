@@ -13,6 +13,7 @@ import type { CommandSchema } from './types';
 import {
   findVizDescriptor,
   type VizDescriptor,
+  type VizMountResult,
 } from './viz_registry';
 
 export type TaskInit =
@@ -41,7 +42,7 @@ export class TaskPanel {
   private readonly setTitle: (title: string) => void;
   private host: HTMLElement | null = null;
   private active: PhaseHandle | null = null;
-  private vizDescriptor: VizDescriptor | null = null;
+  private widgetDisposer: (() => void) | null = null;
 
   constructor(opts: TaskPanelOptions) {
     this.state = opts.state;
@@ -62,14 +63,14 @@ export class TaskPanel {
   destroy(): void {
     this.active?.destroy();
     this.active = null;
-    if (this.vizDescriptor?.dispose) {
+    if (this.widgetDisposer) {
       try {
-        this.vizDescriptor.dispose();
+        this.widgetDisposer();
       } catch (err) {
         console.warn('viz dispose failed', err);
       }
+      this.widgetDisposer = null;
     }
-    this.vizDescriptor = null;
     if (this.host) this.host.innerHTML = '';
     this.host = null;
   }
@@ -103,12 +104,27 @@ export class TaskPanel {
     autoSubmit?: boolean,
   ): void {
     if (!this.host) return;
-    this.vizDescriptor = descriptor;
     this.setTitle(descriptor.label);
+    if (descriptor.customForm) {
+      this.mountCustomForm(descriptor);
+      return;
+    }
+    if (!descriptor.fields || !descriptor.open) {
+      throw new Error(
+        `viz descriptor at ${descriptor.path.join(' ')} is missing either ` +
+          'customForm or (fields + open)',
+      );
+    }
+    const open = descriptor.open;
     const form = new VizForm({
-      descriptor,
+      descriptor: {
+        ...descriptor,
+        // VizForm only consumes the simple-form fields/submitLabel
+        fields: descriptor.fields,
+        submitLabel: descriptor.submitLabel ?? 'Open',
+      },
       prefill,
-      onSubmit: (values) => this.transitionToViz(descriptor, values),
+      onSubmit: (values) => this.transitionToViz(descriptor, open, values),
     });
     form.mount(this.host);
     this.active = {
@@ -117,6 +133,83 @@ export class TaskPanel {
     if (autoSubmit) {
       void form.submit();
     }
+  }
+
+  private mountCustomForm(descriptor: VizDescriptor): void {
+    if (!this.host || !descriptor.customForm) return;
+    const host = this.host;
+    const handlePromise = Promise.resolve(
+      descriptor.customForm({
+        host,
+        state: this.state,
+        setTitle: this.setTitle,
+        transitionToWidget: async (mount) => {
+          if (!this.host) return;
+          this.active?.destroy();
+          this.host.innerHTML = '';
+          try {
+            const result = await mount(this.host);
+            this.setTitle(result.title);
+            if (result.dispose) this.widgetDisposer = result.dispose;
+          } catch (err) {
+            this.renderTaskError(descriptor, err);
+            throw err;
+          }
+          this.active = {
+            destroy: () => {
+              if (this.widgetDisposer) {
+                try {
+                  this.widgetDisposer();
+                } catch (e) {
+                  console.warn('viz dispose failed', e);
+                }
+                this.widgetDisposer = null;
+              }
+            },
+          };
+        },
+      }),
+    );
+    // Capture a destroyer that resolves the handle's destroy once it
+    // exists. If the user closes the panel before the customForm's
+    // async mount returns, the handle is destroyed as soon as it's
+    // available.
+    let destroyed = false;
+    let resolvedDestroy: (() => void) | null = null;
+    void handlePromise.then((h) => {
+      if (destroyed) {
+        try {
+          h.destroy();
+        } catch (err) {
+          console.warn('viz form dispose failed', err);
+        }
+      } else {
+        resolvedDestroy = () => h.destroy();
+      }
+    });
+    this.active = {
+      destroy: () => {
+        destroyed = true;
+        if (resolvedDestroy) {
+          try {
+            resolvedDestroy();
+          } catch (err) {
+            console.warn('viz form dispose failed', err);
+          }
+        }
+      },
+    };
+  }
+
+  private renderTaskError(descriptor: VizDescriptor, err: unknown): void {
+    if (!this.host) return;
+    this.host.innerHTML = '';
+    const msg = document.createElement('div');
+    msg.className = 'task-error';
+    msg.textContent = `Failed to open ${descriptor.label}: ${
+      err instanceof Error ? err.message : String(err)
+    }`;
+    this.host.appendChild(msg);
   }
 
   // -------------------------------------------------------------------
@@ -139,35 +232,32 @@ export class TaskPanel {
 
   private async transitionToViz(
     descriptor: VizDescriptor,
+    open: (
+      host: HTMLElement,
+      values: Record<string, string>,
+    ) => Promise<VizMountResult>,
     values: Record<string, string>,
   ): Promise<void> {
     if (!this.host) return;
     this.active?.destroy();
     this.host.innerHTML = '';
     try {
-      const result = await descriptor.open(this.host, values);
+      const result = await open(this.host, values);
       this.setTitle(result.title);
+      if (result.dispose) this.widgetDisposer = result.dispose;
     } catch (err) {
-      this.host.innerHTML = '';
-      const msg = document.createElement('div');
-      msg.className = 'task-error';
-      msg.textContent = `Failed to open ${descriptor.label}: ${
-        err instanceof Error ? err.message : String(err)
-      }`;
-      this.host.appendChild(msg);
+      this.renderTaskError(descriptor, err);
       throw err;
     }
-    // Viz widgets dispose themselves through `descriptor.dispose`,
-    // which the descriptor sets in its `open` body.
     this.active = {
       destroy: () => {
-        if (descriptor.dispose) {
+        if (this.widgetDisposer) {
           try {
-            descriptor.dispose();
+            this.widgetDisposer();
           } catch (err) {
             console.warn('viz dispose failed', err);
           }
-          descriptor.dispose = undefined;
+          this.widgetDisposer = null;
         }
       },
     };

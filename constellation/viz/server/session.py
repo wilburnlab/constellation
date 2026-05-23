@@ -1,88 +1,99 @@
-"""Session discovery for the viz layer.
+"""Session model for the viz layer.
 
-A `Session` is the GUI's entry point: a directory containing one or more
-pipeline-stage outputs the kernels can render. Discovery is layered:
+A ``Session`` binds one reference (resolved from the per-user reference
+cache) to a list of "result" directories the user wants to overlay onto
+that reference — outputs of ``constellation transcriptome align`` and/or
+``transcriptome cluster``. The reference cache (``handle.py``) is the
+canonical axis here; the genome browser dashboard always picks a
+reference first and then adds zero or more sources keyed to it.
 
-1. **Explicit** — `<root>/session.toml`, when present, names what's
-   available. This is the canonical, shareable artifact for a run.
-2. **Implicit** — `Session.discover` walks `<root>` one level deep when no
-   `session.toml` is present, classifying subdirs by directory-name
-   heuristics (`S2_align/`, `S2_cluster/`, `genome/`, `annotation/`, ...).
-3. **Ad-hoc** — `Session.from_paths` constructs a Session directly from
-   caller-supplied paths, for the `--reference DIR --align-dir DIR` CLI
-   shape that bypasses session-style layouts entirely.
-
-The shape is intentionally flat: a `Session` carries one `Path | None`
-per known artifact slot. Each kernel's `discover()` reads only the slots
-it needs and returns the bindings it can render.
+Sessions are constructed exclusively via :meth:`Session.open` (handle +
+list-of-sources) or :meth:`Session.from_saved` (load a saved-session
+TOML from ``~/.constellation/sessions/``). The legacy ``from_root`` /
+directory-walk discovery / ``session.toml`` v1 reader were removed in
+the reference-cache-first cutover — the dashboard's entry form is now
+the sole on-ramp.
 """
 
 from __future__ import annotations
 
 import hashlib
-import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Literal
 
 
 # ----------------------------------------------------------------------
-# Stage-directory name heuristics
-# ----------------------------------------------------------------------
-
-# Substrings (case-insensitive) we consider strong evidence of a stage
-# directory. Multiple matches are allowed — a real run typically has both
-# S2_align and S2_cluster, plus a sibling `genome/` and `annotation/`.
-_STAGE_S2_ALIGN = ("s2_align", "s2-align", "align")
-_STAGE_S2_CLUSTER = ("s2_cluster", "s2-cluster", "cluster")
-_STAGE_REFERENCE_GENOME = ("genome",)
-_STAGE_REFERENCE_ANNOTATION = ("annotation",)
-_STAGE_DERIVED_ANNOTATION = ("derived_annotation",)
-
-
-def _matches(name: str, needles: tuple[str, ...]) -> bool:
-    n = name.lower()
-    return any(needle in n for needle in needles)
-
-
-# ----------------------------------------------------------------------
-# Session record
+# Source artifact slot map — derived from the producing stage's manifest
 # ----------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class Session:
-    """Resolved entry point for a viz server.
+# Per-kind well-known filenames that map manifest ``outputs`` keys to the
+# slots ``SessionSource`` exposes. Kernel ``discover()`` methods read
+# these slots directly; missing slots resolve to ``None`` and kernels
+# skip the corresponding binding.
+_ALIGN_SLOT_KEYS: tuple[tuple[str, str, bool], ...] = (
+    # (manifest_key, slot, is_dir)
+    ("alignments", "alignments", True),
+    ("alignment_blocks", "alignment_blocks", True),
+    ("alignment_cs", "alignment_cs", True),
+    ("coverage", "coverage", False),
+    ("introns", "introns", False),
+    ("derived_annotation", "derived_annotation", True),
+    ("block_exon_assignments", "block_exon_assignments", False),
+    ("exon_psi", "exon_psi", False),
+)
 
-    `session_id` is short and stable for one root path (used as a URL
-    component). `label` is the human-readable name shown in the UI.
-    Path fields are absolute and `None` when the corresponding artifact
-    is absent — kernels gate their `discover()` results on whichever
-    slots they need.
+_CLUSTER_SLOT_KEYS: tuple[tuple[str, str, bool], ...] = (
+    ("clusters", "clusters", False),
+    ("cluster_membership", "cluster_membership", False),
+)
 
-    `samples` is the (possibly empty) list of sample identifiers
-    available across the resolved stages. Empty means "either we don't
-    know the sample partitioning, or the data is unlabeled" — kernels
-    fall back to a single all-samples binding when this is empty.
 
-    `extras` is the round-tripped `[extras]` table from `session.toml`,
-    used for kernel-specific overrides (palettes, configured heights,
-    etc.). The viz layer never mutates this; the dashboard later adds
-    a "save view" affordance that writes back through a separate path.
+# Per-kind well-known relative filenames (fallback when the manifest's
+# ``outputs`` dict doesn't carry the key — the current align/cluster CLI
+# does populate them, but the fallback is cheap and keeps the loader
+# robust against partial manifests).
+_ALIGN_DEFAULT_PATHS: dict[str, str] = {
+    "alignments": "alignments",
+    "alignment_blocks": "alignment_blocks",
+    "alignment_cs": "alignment_cs",
+    "coverage": "coverage.parquet",
+    "introns": "introns.parquet",
+    "derived_annotation": "derived_annotation",
+    "block_exon_assignments": "block_exon_assignments.parquet",
+    "exon_psi": "exon_psi.parquet",
+}
+
+_CLUSTER_DEFAULT_PATHS: dict[str, str] = {
+    "clusters": "clusters.parquet",
+    "cluster_membership": "cluster_membership.parquet",
+}
+
+
+# ----------------------------------------------------------------------
+# Dataclasses
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSource:
+    """One data source attached to a session.
+
+    A source is the output directory of one ``transcriptome align`` or
+    ``transcriptome cluster`` run. The per-stage artifact slots
+    (``alignments``, ``coverage``, ``introns``, …) are resolved at
+    construction time from the source's ``manifest.json`` and exposed as
+    optional ``Path`` fields — kernels skip the slot when ``None``.
     """
 
-    session_id: str
-    root: Path
+    path: Path
+    kind: Literal["align", "cluster"]
     label: str
-    schema_version: int = 1
+    assembly_accession: str | None
+    reference_handle: str | None
 
-    # Reference layer (one of these is required for the genome browser
-    # to do anything useful — the kernel discovery rejects the session
-    # otherwise).
-    reference_genome: Path | None = None
-    reference_annotation: Path | None = None
-
-    # Per-stage outputs.
+    # Per-kind resolved artifact paths. Kernels read these directly.
     alignments: Path | None = None
     alignment_blocks: Path | None = None
     alignment_cs: Path | None = None
@@ -95,6 +106,44 @@ class Session:
     cluster_membership: Path | None = None
 
     samples: tuple[str, ...] = ()
+
+    def slot_paths(self) -> dict[str, str | None]:
+        """JSON-friendly slot view for the dashboard's session manifest."""
+        return {
+            "alignments": _stringify(self.alignments),
+            "alignment_blocks": _stringify(self.alignment_blocks),
+            "alignment_cs": _stringify(self.alignment_cs),
+            "coverage": _stringify(self.coverage),
+            "introns": _stringify(self.introns),
+            "derived_annotation": _stringify(self.derived_annotation),
+            "block_exon_assignments": _stringify(self.block_exon_assignments),
+            "exon_psi": _stringify(self.exon_psi),
+            "clusters": _stringify(self.clusters),
+            "cluster_membership": _stringify(self.cluster_membership),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Session:
+    """Resolved entry point for a viz server.
+
+    A session is one reference plus zero-or-more attached sources. The
+    ``warnings`` tuple carries assembly-mismatch notices (when a
+    source's recorded ``assembly_accession`` differs from the chosen
+    reference's) — the dashboard surfaces them as inline yellow text but
+    does not block the open.
+    """
+
+    session_id: str
+    label: str
+    reference_handle: str
+    reference_path: Path
+    reference_genome: Path
+    reference_annotation: Path | None
+    assembly_accession: str | None
+    sources: tuple[SessionSource, ...]
+    warnings: tuple[str, ...] = ()
+    saved_as: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
@@ -102,65 +151,91 @@ class Session:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_root(cls, root: Path | str, *, session_id: str | None = None) -> "Session":
-        """Resolve a Session from a directory.
-
-        Tries `<root>/session.toml` first; falls back to directory-walk
-        discovery. Raises `FileNotFoundError` if `<root>` does not exist
-        and `ValueError` if neither path produces any usable artifacts.
-        """
-        root_path = Path(root).expanduser().resolve()
-        if not root_path.is_dir():
-            raise FileNotFoundError(f"session root not found or not a dir: {root_path}")
-
-        sid = session_id or _derive_session_id(root_path)
-        toml_path = root_path / "session.toml"
-        if toml_path.exists():
-            return _load_session_toml(toml_path, root=root_path, session_id=sid)
-        return _discover(root_path, session_id=sid)
-
-    @classmethod
-    def from_paths(
+    def open(
         cls,
         *,
-        session_id: str,
-        root: Path,
-        label: str,
-        reference_genome: Path | None = None,
-        reference_annotation: Path | None = None,
-        alignments: Path | None = None,
-        alignment_blocks: Path | None = None,
-        coverage: Path | None = None,
-        introns: Path | None = None,
-        derived_annotation: Path | None = None,
-        clusters: Path | None = None,
-        cluster_membership: Path | None = None,
-        samples: tuple[str, ...] = (),
+        reference_handle: str,
+        sources: Iterable[dict[str, Any]],
+        label: str | None = None,
+        saved_as: str | None = None,
+        cache_root: Path | None = None,
     ) -> "Session":
-        """Construct a Session directly from explicit paths.
+        """Build a Session from a reference handle and a list of sources.
 
-        Used by the `--reference DIR --align-dir DIR` CLI shape that
-        bypasses session-style layouts. Each path is converted to an
-        absolute path; `None` slots stay `None`.
+        ``sources`` is an iterable of dicts shaped::
+
+            {"path": str | Path, "kind": "align" | "cluster" | None,
+             "label": str | None}
+
+        ``kind`` is auto-detected from each source's ``manifest.json``
+        when omitted. ``label`` defaults to the directory basename. Each
+        source must have a schema-v2 manifest (``reference_handle``
+        optional, ``assembly_accession`` may be ``None`` for escape-hatch
+        runs); pre-v2 manifests raise ``ValueError`` with an actionable
+        message.
         """
+        from constellation.sequencing.reference.handle import (
+            ReferenceNotInstalledError,
+            parse_handle,
+            read_meta_toml,
+            resolve as resolve_handle,
+        )
 
-        def _abs(p: Path | None) -> Path | None:
-            return Path(p).expanduser().resolve() if p is not None else None
+        handle = parse_handle(reference_handle)
+        try:
+            release_path = resolve_handle(handle, root=cache_root)
+        except (ValueError, ReferenceNotInstalledError) as exc:
+            raise ValueError(
+                f"reference handle {reference_handle!r} could not be "
+                f"resolved against the cache: {exc}"
+            ) from exc
+        meta = read_meta_toml(release_path) or {}
+        # Canonical handle string from meta.toml when present — preserves
+        # the fully-qualified form even when a bare organism slug was
+        # passed and resolved via defaults.toml.
+        canonical_handle = str(meta.get("handle") or handle)
+        ref_assembly: str | None = (
+            str(meta["assembly_accession"])
+            if meta.get("assembly_accession") is not None
+            else None
+        )
+        genome_dir = release_path / "genome"
+        if not genome_dir.is_dir():
+            raise ValueError(
+                f"reference release at {release_path} is missing genome/ subdir"
+            )
+        annotation_dir = release_path / "annotation"
+        annotation_path: Path | None = annotation_dir if annotation_dir.is_dir() else None
 
+        built_sources: list[SessionSource] = []
+        warnings: list[str] = []
+        for entry in sources:
+            built = _load_source(entry)
+            built_sources.append(built)
+            if (
+                built.assembly_accession is not None
+                and ref_assembly is not None
+                and built.assembly_accession != ref_assembly
+            ):
+                warnings.append(
+                    f"source {built.label!r} was produced against assembly "
+                    f"{built.assembly_accession!r} but the chosen reference "
+                    f"is {ref_assembly!r} — coordinates may not align"
+                )
+
+        resolved_label = label or release_path.name
+        session_id = _derive_session_id(release_path, resolved_label)
         return cls(
             session_id=session_id,
-            root=Path(root).expanduser().resolve(),
-            label=label,
-            reference_genome=_abs(reference_genome),
-            reference_annotation=_abs(reference_annotation),
-            alignments=_abs(alignments),
-            alignment_blocks=_abs(alignment_blocks),
-            coverage=_abs(coverage),
-            introns=_abs(introns),
-            derived_annotation=_abs(derived_annotation),
-            clusters=_abs(clusters),
-            cluster_membership=_abs(cluster_membership),
-            samples=samples,
+            label=resolved_label,
+            reference_handle=canonical_handle,
+            reference_path=release_path,
+            reference_genome=genome_dir,
+            reference_annotation=annotation_path,
+            assembly_accession=ref_assembly,
+            sources=tuple(built_sources),
+            warnings=tuple(warnings),
+            saved_as=saved_as,
         )
 
     # ------------------------------------------------------------------
@@ -169,294 +244,150 @@ class Session:
 
     def stages_present(self) -> dict[str, bool]:
         """Return a small map of stage-name → present-bool for the UI."""
+        has_align = any(s.kind == "align" for s in self.sources)
+        has_cluster = any(s.kind == "cluster" for s in self.sources)
         return {
-            "reference_genome": self.reference_genome is not None,
+            "reference_genome": True,
             "reference_annotation": self.reference_annotation is not None,
-            "alignments": self.alignments is not None,
-            "coverage": self.coverage is not None,
-            "introns": self.introns is not None,
-            "derived_annotation": self.derived_annotation is not None,
-            "clusters": self.clusters is not None,
+            "alignments": any(s.alignments is not None for s in self.sources),
+            "coverage": any(s.coverage is not None for s in self.sources),
+            "introns": any(s.introns is not None for s in self.sources),
+            "derived_annotation": any(
+                s.derived_annotation is not None for s in self.sources
+            ),
+            "clusters": has_cluster,
+            "has_align_sources": has_align,
+            "has_cluster_sources": has_cluster,
         }
 
     def to_manifest(self) -> dict[str, Any]:
-        """Serialize the resolved Session to JSON-friendly form for
-        `GET /api/sessions/{id}/manifest`."""
-
-        def _rel(p: Path | None) -> str | None:
-            if p is None:
-                return None
-            try:
-                return str(p.relative_to(self.root))
-            except ValueError:
-                return str(p)
-
+        """Serialize to JSON-friendly form for the sessions endpoint."""
         return {
             "session_id": self.session_id,
-            "schema_version": self.schema_version,
-            "root": str(self.root),
             "label": self.label,
-            "samples": list(self.samples),
-            "stages_present": self.stages_present(),
-            "paths": {
-                "reference_genome": _rel(self.reference_genome),
-                "reference_annotation": _rel(self.reference_annotation),
-                "alignments": _rel(self.alignments),
-                "alignment_blocks": _rel(self.alignment_blocks),
-                "alignment_cs": _rel(self.alignment_cs),
-                "coverage": _rel(self.coverage),
-                "introns": _rel(self.introns),
-                "derived_annotation": _rel(self.derived_annotation),
-                "block_exon_assignments": _rel(self.block_exon_assignments),
-                "exon_psi": _rel(self.exon_psi),
-                "clusters": _rel(self.clusters),
-                "cluster_membership": _rel(self.cluster_membership),
+            "reference": {
+                "handle": self.reference_handle,
+                "path": str(self.reference_path),
+                "genome": str(self.reference_genome),
+                "annotation": _stringify(self.reference_annotation),
+                "assembly_accession": self.assembly_accession,
             },
+            "sources": [
+                {
+                    "path": str(src.path),
+                    "kind": src.kind,
+                    "label": src.label,
+                    "assembly_accession": src.assembly_accession,
+                    "reference_handle": src.reference_handle,
+                    "samples": list(src.samples),
+                    "slots": src.slot_paths(),
+                }
+                for src in self.sources
+            ],
+            "stages_present": self.stages_present(),
+            "warnings": list(self.warnings),
+            "saved_as": self.saved_as,
             "extras": dict(self.extras),
         }
 
 
 # ----------------------------------------------------------------------
-# session.toml loader
+# Source loading from manifest.json
 # ----------------------------------------------------------------------
 
 
-def _load_session_toml(path: Path, *, root: Path, session_id: str) -> Session:
-    """Parse a `session.toml` file into a Session.
+def _load_source(entry: dict[str, Any]) -> SessionSource:
+    """Build a SessionSource from a ``{path, kind?, label?}`` dict.
 
-    Schema (v1)::
-
-        schema_version = 1
-        label = "..."
-
-        [reference]
-        handle = "homo_sapiens@ensembl-111"  # resolves via reference cache
-        # genome = "<path>"                  # absolute or root-relative path
-        # annotation = "<path>"              # — wins over `handle` when set
-
-        [stages.s2_align]
-        path = "S2_align"            # base path for relative resolution
-        alignments = "alignments"    # all relative to `path`, optional
-        alignment_blocks = "alignment_blocks"
-        coverage = "coverage.parquet"
-        introns = "introns.parquet"
-        derived_annotation = "derived_annotation"
-        samples = ["sample_1", ...]
-
-        [stages.s2_cluster]
-        path = "S2_cluster"
-        clusters = "clusters.parquet"
-        cluster_membership = "cluster_membership.parquet"
-
-        [extras]
-        # arbitrary kernel-specific overrides; not interpreted by the
-        # session loader — pass through to kernels via `session.extras`.
+    Reads the source's ``manifest.json`` (schema v2 required), assembles
+    the per-kind slot map by joining the manifest's ``outputs`` against
+    the well-known relative paths, and returns a frozen dataclass.
     """
-    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    from constellation.sequencing.transcriptome.manifest import (
+        read_manifest_dir,
+    )
 
-    schema_version = int(raw.get("schema_version", 1))
-    if schema_version != 1:
+    raw_path = entry.get("path")
+    if not raw_path:
+        raise ValueError(f"source entry missing 'path': {entry!r}")
+    source_path = Path(str(raw_path)).expanduser().resolve()
+    if not source_path.is_dir():
+        raise ValueError(f"source path is not a directory: {source_path}")
+
+    manifest = read_manifest_dir(source_path)
+    kind_hint = entry.get("kind")
+    if kind_hint is not None and kind_hint != manifest.kind:
         raise ValueError(
-            f"unsupported session.toml schema_version={schema_version} at {path}; "
-            "this constellation supports v1"
+            f"source at {source_path} is kind={manifest.kind!r} but caller "
+            f"asserted kind={kind_hint!r}"
         )
-    label = str(raw.get("label") or root.name)
+    label = str(entry.get("label") or source_path.name)
+    samples = tuple(manifest.samples) if manifest.samples else ()
 
-    def _resolve(rel: Any, *, base: Path = root) -> Path | None:
-        if rel is None or rel == "":
-            return None
-        p = Path(str(rel)).expanduser()
-        if not p.is_absolute():
-            p = (base / p).resolve()
-        else:
-            p = p.resolve()
-        return p
-
-    ref = raw.get("reference", {}) or {}
-    reference_genome = _resolve(ref.get("genome"))
-    reference_annotation = _resolve(ref.get("annotation"))
-
-    # Handle resolution — only applies when explicit genome/annotation
-    # paths are absent. Explicit paths always win.
-    handle_str = ref.get("handle")
-    if handle_str and (reference_genome is None or reference_annotation is None):
-        cache_genome, cache_annotation = _resolve_handle(str(handle_str), path=path)
-        if reference_genome is None:
-            reference_genome = cache_genome
-        if reference_annotation is None:
-            reference_annotation = cache_annotation
-
-    stages = raw.get("stages", {}) or {}
-    s2_align = stages.get("s2_align", {}) or {}
-    s2_cluster = stages.get("s2_cluster", {}) or {}
-
-    align_base = _resolve(s2_align.get("path", "S2_align")) or root
-    alignments = _resolve(s2_align.get("alignments", "alignments"), base=align_base)
-    alignment_blocks = _resolve(s2_align.get("alignment_blocks", "alignment_blocks"), base=align_base)
-    alignment_cs = _resolve(s2_align.get("alignment_cs"), base=align_base)
-    coverage = _resolve(s2_align.get("coverage", "coverage.parquet"), base=align_base)
-    introns = _resolve(s2_align.get("introns", "introns.parquet"), base=align_base)
-    derived_annotation = _resolve(s2_align.get("derived_annotation", "derived_annotation"), base=align_base)
-    block_exon_assignments = _resolve(s2_align.get("block_exon_assignments", "block_exon_assignments.parquet"), base=align_base)
-    exon_psi = _resolve(s2_align.get("exon_psi", "exon_psi.parquet"), base=align_base)
-    samples = tuple(s2_align.get("samples", []))
-
-    cluster_base = _resolve(s2_cluster.get("path", "S2_cluster")) or root
-    clusters = _resolve(s2_cluster.get("clusters", "clusters.parquet"), base=cluster_base)
-    cluster_membership = _resolve(s2_cluster.get("cluster_membership", "cluster_membership.parquet"), base=cluster_base)
-
-    extras = dict(raw.get("extras", {}) or {})
-
-    return _drop_missing(
-        Session(
-            session_id=session_id,
-            root=root,
-            label=label,
-            schema_version=schema_version,
-            reference_genome=reference_genome,
-            reference_annotation=reference_annotation,
-            alignments=alignments,
-            alignment_blocks=alignment_blocks,
-            alignment_cs=alignment_cs,
-            coverage=coverage,
-            introns=introns,
-            derived_annotation=derived_annotation,
-            block_exon_assignments=block_exon_assignments,
-            exon_psi=exon_psi,
-            clusters=clusters,
-            cluster_membership=cluster_membership,
-            samples=samples,
-            extras=extras,
+    slots: dict[str, Path | None] = {
+        slot: None
+        for slot, *_ in (
+            *_ALIGN_SLOT_KEYS,
+            *_CLUSTER_SLOT_KEYS,
         )
-    )
-
-
-def _resolve_handle(handle_str: str, *, path: Path) -> tuple[Path | None, Path | None]:
-    """Resolve a session.toml [reference] handle to (genome_dir, annotation_dir).
-
-    Looks up the handle in the per-user reference cache via
-    :mod:`constellation.sequencing.reference.handle`. Missing cache
-    entries surface as a ``ValueError`` referencing the session.toml so
-    the user knows where to look.
-    """
-    # Lazy import: keeps the viz dashboard cheap-to-load when no session
-    # uses a handle. The handle module itself is stdlib-only.
-    from constellation.sequencing.reference.handle import (
-        ReferenceNotInstalledError,
-        resolve as resolve_handle,
-    )
-
-    try:
-        release_dir = resolve_handle(handle_str)
-    except (ValueError, ReferenceNotInstalledError) as exc:
-        raise ValueError(
-            f"session.toml at {path} references handle {handle_str!r}, "
-            f"but: {exc}"
-        ) from exc
-    genome_dir = release_dir / "genome"
-    annotation_dir = release_dir / "annotation"
-    return (
-        genome_dir if genome_dir.is_dir() else None,
-        annotation_dir if annotation_dir.is_dir() else None,
-    )
-
-
-# ----------------------------------------------------------------------
-# Implicit directory-walk discovery
-# ----------------------------------------------------------------------
-
-
-def _discover(root: Path, *, session_id: str) -> Session:
-    """Walk `root` one level deep, classifying directories as stages.
-
-    Recognized layouts:
-
-    - `<root>/genome/`          → reference_genome (ParquetDir)
-    - `<root>/annotation/`      → reference_annotation (ParquetDir)
-    - `<root>/<stage>/alignments/`
-    - `<root>/<stage>/alignment_blocks/`
-    - `<root>/<stage>/coverage.parquet`
-    - `<root>/<stage>/introns.parquet`
-    - `<root>/<stage>/derived_annotation/`
-    - `<root>/<stage>/clusters.parquet`
-    - `<root>/<stage>/cluster_membership.parquet`
-
-    Where `<stage>` is any subdir whose name matches the corresponding
-    heuristic (e.g. `S2_align`, `aligned`, `S2_cluster`). The first
-    match wins for each artifact slot — a session with two `S2_align/`
-    candidates will pick whichever the filesystem orders first. Use
-    `session.toml` for reproducible disambiguation.
-    """
-    align_dir: Path | None = None
-    cluster_dir: Path | None = None
-    reference_genome: Path | None = None
-    reference_annotation: Path | None = None
-
-    for entry in sorted(root.iterdir()):
-        if not entry.is_dir():
+    }
+    outputs = dict(manifest.outputs)
+    schema = _ALIGN_SLOT_KEYS if manifest.kind == "align" else _CLUSTER_SLOT_KEYS
+    defaults = _ALIGN_DEFAULT_PATHS if manifest.kind == "align" else _CLUSTER_DEFAULT_PATHS
+    for manifest_key, slot, _is_dir in schema:
+        rel = outputs.get(manifest_key) or defaults.get(manifest_key)
+        if rel is None:
             continue
-        name = entry.name
-        if reference_genome is None and _matches(name, _STAGE_REFERENCE_GENOME):
-            reference_genome = entry
-        elif reference_annotation is None and _matches(
-            name, _STAGE_REFERENCE_ANNOTATION
-        ) and not _matches(name, _STAGE_DERIVED_ANNOTATION):
-            reference_annotation = entry
-        elif align_dir is None and _matches(name, _STAGE_S2_ALIGN):
-            align_dir = entry
-        elif cluster_dir is None and _matches(name, _STAGE_S2_CLUSTER):
-            cluster_dir = entry
+        resolved = _resolve_slot(source_path, rel)
+        if resolved is not None:
+            slots[slot] = resolved
 
-    def _exists(base: Path | None, name: str) -> Path | None:
-        if base is None:
-            return None
-        candidate = base / name
-        return candidate if candidate.exists() else None
-
-    samples = _read_samples_from_align_manifest(align_dir)
-    label = root.name
-
-    return _drop_missing(
-        Session(
-            session_id=session_id,
-            root=root,
-            label=label,
-            reference_genome=reference_genome,
-            reference_annotation=reference_annotation,
-            alignments=_exists(align_dir, "alignments"),
-            alignment_blocks=_exists(align_dir, "alignment_blocks"),
-            alignment_cs=_exists(align_dir, "alignment_cs"),
-            coverage=_exists(align_dir, "coverage.parquet"),
-            introns=_exists(align_dir, "introns.parquet"),
-            derived_annotation=_exists(align_dir, "derived_annotation"),
-            block_exon_assignments=_exists(align_dir, "block_exon_assignments.parquet"),
-            exon_psi=_exists(align_dir, "exon_psi.parquet"),
-            clusters=_exists(cluster_dir, "clusters.parquet"),
-            cluster_membership=_exists(cluster_dir, "cluster_membership.parquet"),
-            samples=samples,
-        )
+    return SessionSource(
+        path=source_path,
+        kind=manifest.kind,
+        label=label,
+        assembly_accession=manifest.assembly_accession,
+        reference_handle=manifest.reference_handle,
+        samples=samples,
+        **slots,
     )
 
 
-def _read_samples_from_align_manifest(align_dir: Path | None) -> tuple[str, ...]:
-    """Best-effort: read `<align_dir>/manifest.json` and pull the
-    `samples` list. Missing or malformed → return empty tuple. Only
-    pulls strings; non-string entries silently dropped."""
-    if align_dir is None:
-        return ()
-    manifest_path = align_dir / "manifest.json"
-    if not manifest_path.exists():
-        return ()
-    try:
-        import json
+def _resolve_slot(base: Path, rel: str) -> Path | None:
+    """Resolve a manifest-recorded artifact path relative to the source dir.
 
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ()
-    samples = data.get("samples")
-    if not isinstance(samples, list):
-        return ()
-    return tuple(s for s in samples if isinstance(s, str))
+    Manifests may store either absolute paths (current align CLI does)
+    or relative paths. We accept both; the canonical in-memory form is
+    always absolute. Returns ``None`` if the path doesn't exist on disk.
+    """
+    candidate = Path(rel)
+    if not candidate.is_absolute():
+        candidate = (base / candidate).resolve()
+    return candidate if candidate.exists() else None
+
+
+# ----------------------------------------------------------------------
+# Saved-session shim
+# ----------------------------------------------------------------------
+
+
+def _from_saved_session(saved: Any, *, cache_root: Path | None = None) -> Session:
+    """Construct a Session from a SavedSession dataclass.
+
+    Centralized here so the saved-sessions endpoint, the standalone
+    ``constellation viz genome --saved-session`` CLI, and any future
+    callers all route through the same loader.
+    """
+    return Session.open(
+        reference_handle=saved.reference_handle,
+        sources=[
+            {"path": src["path"], "kind": src.get("kind"), "label": src.get("label")}
+            for src in saved.sources
+        ],
+        label=saved.label,
+        saved_as=saved.slug,
+        cache_root=cache_root,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -464,49 +395,28 @@ def _read_samples_from_align_manifest(align_dir: Path | None) -> tuple[str, ...]
 # ----------------------------------------------------------------------
 
 
-def _derive_session_id(root: Path) -> str:
-    """Stable short id for a path. Used as a URL component, so we keep
-    it filesystem-safe. blake2b for speed; first 8 hex chars are plenty
-    given the dashboard expects O(few) sessions per process."""
-    digest = hashlib.blake2b(str(root).encode("utf-8"), digest_size=4).hexdigest()
-    return f"{_slug(root.name)}-{digest}"
+def _stringify(p: Path | None) -> str | None:
+    return None if p is None else str(p)
+
+
+def _derive_session_id(release_path: Path, label: str) -> str:
+    """Stable short id for a (release_path, label) pair, URL-safe."""
+    payload = f"{release_path}|{label}".encode("utf-8")
+    digest = hashlib.blake2b(payload, digest_size=4).hexdigest()
+    return f"{_slug(label)}-{digest}"
 
 
 def _slug(s: str) -> str:
-    out = []
+    out: list[str] = []
     for ch in s.lower():
-        if ch.isalnum():
-            out.append(ch)
-        elif ch in "-_":
+        if ch.isalnum() or ch in "-_":
             out.append(ch)
         else:
             out.append("-")
     return "".join(out).strip("-") or "session"
 
 
-def _drop_missing(session: Session) -> Session:
-    """Replace path slots whose target doesn't exist on disk with
-    `None`. The discovery layer can't guarantee every slot it picked is
-    valid (e.g. the user pointed `--session` at a partial run); kernels
-    react to `None` by skipping their bindings. Idempotent."""
-    updates: dict[str, Path | None] = {}
-    for attr in (
-        "reference_genome",
-        "reference_annotation",
-        "alignments",
-        "alignment_blocks",
-        "alignment_cs",
-        "coverage",
-        "introns",
-        "derived_annotation",
-        "block_exon_assignments",
-        "exon_psi",
-        "clusters",
-        "cluster_membership",
-    ):
-        value: Path | None = getattr(session, attr)
-        if value is not None and not value.exists():
-            updates[attr] = None
-    if not updates:
-        return session
-    return replace(session, **updates)
+__all__ = [
+    "Session",
+    "SessionSource",
+]

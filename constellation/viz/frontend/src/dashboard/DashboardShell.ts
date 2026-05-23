@@ -47,13 +47,6 @@ interface WelcomePanelParams extends Record<string, unknown> {
 
 type PanelParams = TaskPanelParams | SidebarPanelParams | WelcomePanelParams;
 
-interface SessionSummary {
-  session_id: string;
-  label: string;
-  root: string;
-  stages_present: Record<string, boolean>;
-}
-
 interface TaskAware extends IContentRenderer {
   onResize?: () => void;
   taskInit?: TaskInit;

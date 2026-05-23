@@ -1,7 +1,7 @@
 """Read pile-up track — alignments rendered as stacked horizontal bars.
 
-Reads `<root>/S2_align/alignments/` (`ALIGNMENT_TABLE`, partitioned).
-Optionally consumes `<root>/S2_align/alignment_blocks/` for per-CIGAR-
+Reads each align source's `alignments/` (`ALIGNMENT_TABLE`, partitioned).
+Optionally consumes the source's `alignment_blocks/` for per-CIGAR-
 block detail at deep zoom; v1 ignores the blocks dataset and ships
 whole-alignment glyphs only.
 
@@ -35,6 +35,7 @@ from constellation.viz.tracks.base import (
     TrackBinding,
     TrackKernel,
     TrackQuery,
+    iter_sources_with,
     register_track,
 )
 
@@ -67,28 +68,32 @@ class ReadPileupKernel(TrackKernel):
     vector_bp_per_pixel_limit = 50.0
 
     def discover(self, session: Session) -> list[TrackBinding]:
-        if session.alignments is None or session.reference_genome is None:
+        if session.reference_genome is None:
             return []
-        paths: dict[str, Any] = {
-            "alignments": session.alignments,
-            "genome": session.reference_genome,
-        }
-        # `alignment_blocks/` is opt-in for v1 — kernels that want
-        # per-CIGAR-block visualization can read it via this slot. We
-        # surface it in `paths` even when None so future renderers
-        # (mismatch coloring, soft-clip triangles) can pick it up.
-        if session.alignment_blocks is not None:
-            paths["alignment_blocks"] = session.alignment_blocks
-        return [
-            TrackBinding(
-                session_id=session.session_id,
-                kind=self.kind,
-                binding_id="read_pileup",
-                label="Reads",
-                paths=paths,
-                config={},
+        bindings: list[TrackBinding] = []
+        for idx, src in iter_sources_with(session, "alignments"):
+            paths: dict[str, Any] = {
+                "alignments": src.alignments,
+                "genome": session.reference_genome,
+            }
+            # `alignment_blocks/` is opt-in for v1 — kernels that want
+            # per-CIGAR-block visualization can read it via this slot.
+            # Future renderers (mismatch coloring, soft-clip triangles)
+            # pick it up when present.
+            if src.alignment_blocks is not None:
+                paths["alignment_blocks"] = src.alignment_blocks
+            label = f"Reads ({src.label})" if len(session.sources) > 1 else "Reads"
+            bindings.append(
+                TrackBinding(
+                    session_id=session.session_id,
+                    kind=self.kind,
+                    binding_id=f"read_pileup-{idx}",
+                    label=label,
+                    paths=paths,
+                    config={},
+                )
             )
-        ]
+        return bindings
 
     def metadata(self, binding: TrackBinding) -> dict[str, Any]:
         return {
