@@ -205,7 +205,8 @@
 }
 .genome-browser-root .track-handle:active { cursor: grabbing; }
 .genome-browser-root .track-collapse-btn,
-.genome-browser-root .track-hide-btn {
+.genome-browser-root .track-hide-btn,
+.genome-browser-root .track-settings-btn {
   background: transparent;
   color: var(--fg-dim);
   border: none;
@@ -215,7 +216,8 @@
   line-height: 1;
 }
 .genome-browser-root .track-collapse-btn:hover,
-.genome-browser-root .track-hide-btn:hover {
+.genome-browser-root .track-hide-btn:hover,
+.genome-browser-root .track-settings-btn:hover {
   color: var(--fg);
 }
 .genome-browser-root .track-header-label {
@@ -233,6 +235,7 @@
 }
 .genome-browser-root .track-body {
   position: relative;
+  overflow: hidden;
 }
 .genome-browser-root .track-canvas {
   display: block;
@@ -408,3 +411,194 @@
 .genome-browser-root .browser svg text { fill: var(--fg); }
 .genome-browser-root .browser svg .axis-line { stroke: var(--fg-dim); }
 .genome-browser-root .browser svg .axis-tick { stroke: var(--fg-dim); }
+
+/* Options popover — shares chrome with .dataset-popover but its rows are
+ * full-width labeled checkboxes rather than nested binding lists. */
+.options-popover {
+  background: var(--bg-elev, #1c1c22);
+  color: var(--fg, #e3e3e8);
+  border: 1px solid var(--border, #3a3a44);
+  border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  min-width: 280px;
+  max-width: 380px;
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: 6px 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    Helvetica, Arial, sans-serif;
+  font-size: 13px;
+}
+.options-popover .options-section-title {
+  padding: 6px 12px 4px;
+  font-size: 11px;
+  color: var(--fg-dim, #8b8b94);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.options-popover .options-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.options-popover .options-row:hover {
+  background: rgba(79, 158, 251, 0.12);
+}
+.options-popover .options-row input[type='checkbox'] {
+  margin-top: 2px;
+}
+.options-popover .options-row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.options-popover .options-row-label {
+  color: var(--fg, #e3e3e8);
+  font-weight: 500;
+}
+.options-popover .options-row-hint {
+  color: var(--fg-dim, #8b8b94);
+  font-size: 11px;
+}
+.genome-browser-root .options-btn {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.genome-browser-root .options-btn:hover { background: var(--border); }
+
+/* Track settings popover (per-binding gear) */
+.track-settings-popover {
+  background: var(--bg-elev, #1c1c22);
+  color: var(--fg, #e3e3e8);
+  border: 1px solid var(--border, #3a3a44);
+  border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  min-width: 320px;
+  max-width: 420px;
+  max-height: 80vh;
+  overflow-y: auto;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    Helvetica, Arial, sans-serif;
+  font-size: 13px;
+}
+.track-settings-popover .settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border, #3a3a44);
+}
+.track-settings-popover .settings-title {
+  font-weight: 600;
+  color: var(--fg, #e3e3e8);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.track-settings-popover .settings-kind {
+  font-size: 11px;
+  color: var(--fg-dim, #8b8b94);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.track-settings-popover .settings-section {
+  border-bottom: 1px solid var(--border, #3a3a44);
+  padding: 8px 12px;
+}
+.track-settings-popover .settings-section:last-child {
+  border-bottom: none;
+}
+.track-settings-popover .settings-section-title {
+  font-size: 11px;
+  color: var(--fg-dim, #8b8b94);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+.track-settings-popover .settings-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.track-settings-popover .settings-row-label {
+  color: var(--fg, #e3e3e8);
+  font-size: 12px;
+}
+.track-settings-popover .settings-row input[type='text'],
+.track-settings-popover .settings-row input[type='number'],
+.track-settings-popover .settings-row select {
+  background: var(--bg, #0f0f12);
+  color: var(--fg, #e3e3e8);
+  border: 1px solid var(--border, #3a3a44);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 12px;
+  min-width: 120px;
+}
+.track-settings-popover .settings-row input[type='number'] {
+  min-width: 70px;
+}
+.track-settings-popover .settings-row input[type='range'] {
+  width: 140px;
+}
+.track-settings-popover .settings-row input[type='color'] {
+  width: 32px;
+  height: 22px;
+  border: 1px solid var(--border, #3a3a44);
+  border-radius: 4px;
+  background: var(--bg, #0f0f12);
+  padding: 0;
+}
+.track-settings-popover .settings-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  cursor: pointer;
+  font-size: 12px;
+}
+.track-settings-popover .settings-checkbox-row:hover {
+  color: var(--fg, #e3e3e8);
+}
+.track-settings-popover .settings-palette-grid {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+.track-settings-popover .settings-empty {
+  color: var(--fg-dim, #8b8b94);
+  font-size: 11px;
+  font-style: italic;
+}
+.track-settings-popover .settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border, #3a3a44);
+}
+.track-settings-popover .settings-reset-btn {
+  background: transparent;
+  color: var(--fg-dim, #8b8b94);
+  border: 1px solid var(--border, #3a3a44);
+  border-radius: 4px;
+  padding: 3px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.track-settings-popover .settings-reset-btn:hover {
+  color: var(--fg, #e3e3e8);
+  border-color: var(--fg-dim, #8b8b94);
+}

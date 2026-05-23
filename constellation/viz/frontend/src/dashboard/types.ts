@@ -125,9 +125,21 @@ export interface TrackLayoutEntry {
   display_order: number;
   height_px: number;
   collapsed: boolean;
+  /** Per-binding visual style overrides — opaque to the layout type,
+   *  interpreted by each kernel's renderer. */
+  style?: Record<string, unknown>;
+  /** Per-binding dataset-slice filters — opaque to the layout type,
+   *  interpreted by each kernel's renderer. */
+  filter?: Record<string, unknown>;
+}
+
+/** Browser-wide options persisted alongside per-track layout. */
+export interface BrowserOptions {
+  clip_svg: boolean;
 }
 
 export interface SavedSessionPayload extends SavedSessionSummary {
   sources: Array<{ path: string; kind: string; label: string }>;
   track_layout?: TrackLayoutEntry[];
+  options?: BrowserOptions;
 }

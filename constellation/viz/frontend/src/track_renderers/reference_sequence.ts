@@ -5,8 +5,9 @@ import { Table } from 'apache-arrow';
 import { svgEl, clear } from '../engine/svg_layer';
 import { TrackMode } from '../engine/arrow_client';
 import { TrackRenderer, RenderContext } from './base';
+import { pickNumber, pickPaletteColor, pickString } from './style';
 
-const BASE_COLOR: Record<string, string> = {
+const BASE_COLOR_DEFAULTS: Record<string, string> = {
   A: '#5cd66e',
   C: '#5e9cd6',
   G: '#d6c95e',
@@ -15,12 +16,25 @@ const BASE_COLOR: Record<string, string> = {
   N: '#666',
 };
 
+const DEFAULT_LETTER_FONT = 'ui-monospace, SF Mono, Menlo, monospace';
+
 const renderer: TrackRenderer = {
   kind: 'reference_sequence',
   render(table: Table, _mode: TrackMode, ctx: RenderContext): void {
     clear(ctx.svg);
+    const fontFamily = pickString(
+      ctx.style,
+      'letter_font_family',
+      DEFAULT_LETTER_FONT,
+    );
+    const fontSize = pickNumber(ctx.style, 'letter_font_size_px', 11);
+    const letterThreshold = pickNumber(
+      ctx.style,
+      'letter_threshold_px_per_bp',
+      6,
+    );
+
     if (table.numRows === 0) {
-      // Empty payload = no sequence (e.g. unknown contig)
       const text = svgEl('text', {
         x: ctx.widthPx / 2,
         y: ctx.heightPx / 2,
@@ -30,29 +44,35 @@ const renderer: TrackRenderer = {
       });
       text.textContent = 'reference unavailable';
       ctx.svg.appendChild(text);
+      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
       return;
     }
 
     const positionCol = table.getChild('position');
     const baseCol = table.getChild('base');
     const stepCol = table.getChild('step');
-    if (!positionCol || !baseCol || !stepCol) return;
+    if (!positionCol || !baseCol || !stepCol) {
+      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
+      return;
+    }
+
+    const colorFor = (base: string): string =>
+      pickPaletteColor(ctx.style, base, BASE_COLOR_DEFAULTS[base] ?? BASE_COLOR_DEFAULTS.N);
 
     const firstStep = Number(stepCol.get(0));
-    if (firstStep === 1 && pixelsPerBp(ctx) > 6) {
+    if (firstStep === 1 && pixelsPerBp(ctx) > letterThreshold) {
       // Per-base letters
       for (let i = 0; i < table.numRows; i++) {
         const pos = Number(positionCol.get(i));
         const base = String(baseCol.get(i)).toUpperCase();
         const x = ctx.xScale(pos + 0.5);
-        const fill = BASE_COLOR[base] ?? BASE_COLOR.N;
         const text = svgEl('text', {
           x,
           y: ctx.heightPx / 2 + 4,
-          'font-family': 'ui-monospace, SF Mono, Menlo, monospace',
-          'font-size': '11',
+          'font-family': fontFamily,
+          'font-size': String(fontSize),
           'text-anchor': 'middle',
-          fill,
+          fill: colorFor(base),
         });
         text.textContent = base;
         ctx.svg.appendChild(text);
@@ -69,7 +89,7 @@ const renderer: TrackRenderer = {
           y: 4,
           width: w,
           height: ctx.heightPx - 8,
-          fill: BASE_COLOR[base] ?? BASE_COLOR.N,
+          fill: colorFor(base),
         });
         ctx.svg.appendChild(rect);
       }
@@ -85,6 +105,7 @@ const renderer: TrackRenderer = {
       });
       ctx.svg.appendChild(line);
     }
+    ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
   },
 };
 

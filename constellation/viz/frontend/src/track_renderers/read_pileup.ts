@@ -6,8 +6,13 @@ import { svgEl, clear } from '../engine/svg_layer';
 import { TrackMode } from '../engine/arrow_client';
 import { decodeHybrid, appendHybridImage } from '../engine/hybrid_layer';
 import { TrackRenderer, RenderContext } from './base';
+import {
+  pickAllowList,
+  pickNumber,
+  pickPaletteColor,
+} from './style';
 
-const STRAND_COLOR: Record<string, string> = {
+const STRAND_COLOR_DEFAULTS: Record<string, string> = {
   '+': '#5e9cd6',
   '-': '#d6755e',
   default: '#888',
@@ -20,7 +25,10 @@ const renderer: TrackRenderer = {
 
     if (mode === 'hybrid') {
       const frame = decodeHybrid(table);
-      if (!frame) return;
+      if (!frame) {
+        ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
+        return;
+      }
       appendHybridImage(ctx.svg, frame);
       const label = svgEl('text', {
         x: ctx.widthPx - 4,
@@ -31,6 +39,7 @@ const renderer: TrackRenderer = {
       });
       label.textContent = `hybrid · ${frame.nItems.toLocaleString()} reads`;
       ctx.svg.appendChild(label);
+      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
       return;
     }
 
@@ -44,6 +53,7 @@ const renderer: TrackRenderer = {
       });
       text.textContent = 'no reads in window';
       ctx.svg.appendChild(text);
+      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
       return;
     }
 
@@ -52,29 +62,71 @@ const renderer: TrackRenderer = {
     const strandCol = table.getChild('strand');
     const rowCol = table.getChild('row');
     const idCol = table.getChild('alignment_id');
-    if (!startCol || !endCol || !strandCol || !rowCol) return;
+    if (!startCol || !endCol || !strandCol || !rowCol) {
+      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
+      return;
+    }
 
-    let maxRow = 0;
+    const minRowH = pickNumber(ctx.style, 'min_row_height_px', 2);
+    const maxRowH = pickNumber(ctx.style, 'max_row_height_px', 8);
+    const readOpacity = pickNumber(ctx.style, 'read_opacity', 1.0);
+    const allowedStrands = pickAllowList(ctx.filter, 'visible_strands');
+
+    const admit: boolean[] = new Array(table.numRows);
+    let maxRow = -1;
+    let admittedRows = 0;
     for (let i = 0; i < table.numRows; i++) {
+      const strand = String(strandCol.get(i));
+      if (allowedStrands && !allowedStrands.has(strand)) {
+        admit[i] = false;
+        continue;
+      }
+      admit[i] = true;
+      admittedRows++;
       const r = Number(rowCol.get(i));
       if (r > maxRow) maxRow = r;
     }
+
+    if (admittedRows === 0) {
+      const text = svgEl('text', {
+        x: ctx.widthPx / 2,
+        y: ctx.heightPx / 2,
+        'font-size': '11',
+        fill: '#5a5a63',
+        'text-anchor': 'middle',
+      });
+      text.textContent = 'no reads in window';
+      ctx.svg.appendChild(text);
+      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
+      return;
+    }
+
     const stackH = maxRow + 1;
-    const rowH = Math.max(2, Math.min(8, (ctx.heightPx - 4) / stackH));
+    const rowH = Math.max(
+      minRowH,
+      Math.min(maxRowH, (ctx.heightPx - 4) / Math.max(1, stackH)),
+    );
 
     for (let i = 0; i < table.numRows; i++) {
+      if (!admit[i]) continue;
       const start = Number(startCol.get(i));
       const end = Number(endCol.get(i));
       const strand = String(strandCol.get(i));
       const row = Number(rowCol.get(i));
       const x0 = ctx.xScale(start);
       const x1 = ctx.xScale(end);
+      const fill = pickPaletteColor(
+        ctx.style,
+        strand,
+        STRAND_COLOR_DEFAULTS[strand] ?? STRAND_COLOR_DEFAULTS.default,
+      );
       const rect = svgEl('rect', {
         x: x0,
         y: 4 + row * rowH,
         width: Math.max(1, x1 - x0),
         height: Math.max(1, rowH - 1),
-        fill: STRAND_COLOR[strand] ?? STRAND_COLOR.default,
+        fill,
+        opacity: String(readOpacity),
       });
       if (idCol) {
         rect.setAttribute('data-alignment-id', String(idCol.get(i)));
@@ -89,8 +141,11 @@ const renderer: TrackRenderer = {
       'text-anchor': 'end',
       fill: '#8a8a93',
     });
-    label.textContent = `vector · ${table.numRows.toLocaleString()} reads`;
+    label.textContent = `vector · ${admittedRows.toLocaleString()} reads`;
     ctx.svg.appendChild(label);
+
+    const naturalHeight = stackH > 0 ? 4 + stackH * rowH : ctx.heightPx;
+    ctx.svg.dataset.naturalHeight = String(naturalHeight);
   },
 };
 

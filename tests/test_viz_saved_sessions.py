@@ -160,3 +160,153 @@ def test_endpoint_get_missing_slug_404(tmp_path: Path, monkeypatch) -> None:
     client = TestClient(app)
     r = client.get("/api/saved-sessions/missing-slug-0000")
     assert r.status_code == 404
+
+
+# ----------------------------------------------------------------------
+# PR 6 — per-track style/filter + browser-wide options round-trip
+# ----------------------------------------------------------------------
+
+
+def test_style_filter_options_round_trip(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CONSTELLATION_SESSIONS_HOME", str(tmp_path))
+    saved = write_saved(
+        label="styled",
+        reference_handle="h@x-1",
+        sources=[{"path": "/p", "kind": "align"}],
+        track_layout=[
+            {
+                "source_id": "src-deadbeef",
+                "kind": "gene_annotation",
+                "visible": True,
+                "display_order": 0,
+                "height_px": 80,
+                "collapsed": False,
+                "style": {
+                    "palette.gene": "#112233",
+                    "row_height_px": 18,
+                    "feature_opacity": 0.6,
+                },
+                "filter": {
+                    "visible_types": ["gene", "exon"],
+                    "min_length_bp": 100,
+                },
+            },
+        ],
+        options={"clip_svg": True},
+    )
+    reloaded = read_saved(saved.slug)
+    assert reloaded.options == {"clip_svg": True}
+    layout = reloaded.track_layout or []
+    assert len(layout) == 1
+    entry = layout[0]
+    assert entry["style"]["palette.gene"] == "#112233"
+    assert entry["style"]["row_height_px"] == 18
+    assert entry["style"]["feature_opacity"] == 0.6
+    assert entry["filter"]["visible_types"] == ["gene", "exon"]
+    assert entry["filter"]["min_length_bp"] == 100
+
+
+def test_empty_style_filter_options_not_emitted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Empty per-entry style/filter dicts + empty options shouldn't show
+    up in the TOML — keeps v2-only readers clean."""
+    monkeypatch.setenv("CONSTELLATION_SESSIONS_HOME", str(tmp_path))
+    saved = write_saved(
+        label="plain",
+        reference_handle="h@x-1",
+        sources=[{"path": "/p", "kind": "align"}],
+        track_layout=[
+            {
+                "source_id": "src-x",
+                "kind": "coverage_histogram",
+                "visible": True,
+                "display_order": 0,
+                "height_px": 80,
+                "collapsed": False,
+                "style": {},
+                "filter": {},
+            },
+        ],
+        options={},
+    )
+    assert saved.path is not None
+    text = saved.path.read_text(encoding="utf-8")
+    assert "[track_layout.style]" not in text
+    assert "[track_layout.filter]" not in text
+    assert "[options]" not in text
+
+
+def test_patch_layout_accepts_style_filter_options(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """PATCH /api/saved-sessions/{slug}/layout extends the per-entry
+    layout block AND optional browser-wide options in one call."""
+    app = _make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    r = client.post(
+        "/api/saved-sessions",
+        json={
+            "label": "patchable",
+            "reference_handle": "h@x-1",
+            "sources": [{"path": "/p", "kind": "align"}],
+        },
+    )
+    assert r.status_code == 201
+    slug = r.json()["slug"]
+
+    r = client.patch(
+        f"/api/saved-sessions/{slug}/layout",
+        json={
+            "track_layout": [
+                {
+                    "source_id": "src-y",
+                    "kind": "coverage_histogram",
+                    "visible": True,
+                    "display_order": 0,
+                    "height_px": 60,
+                    "collapsed": False,
+                    "style": {"y_scale": "log"},
+                    "filter": {"visible_samples": [0, 2]},
+                },
+            ],
+            "options": {"clip_svg": True},
+        },
+    )
+    assert r.status_code == 200
+
+    r = client.get(f"/api/saved-sessions/{slug}")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["options"] == {"clip_svg": True}
+    layout = payload["track_layout"]
+    assert layout[0]["style"] == {"y_scale": "log"}
+    assert layout[0]["filter"] == {"visible_samples": [0, 2]}
+
+
+def test_patch_layout_preserves_existing_options_when_absent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When the PATCH payload omits ``options``, the existing options on
+    disk survive — only ``track_layout`` is overwritten."""
+    app = _make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    r = client.post(
+        "/api/saved-sessions",
+        json={
+            "label": "with-opts",
+            "reference_handle": "h@x-1",
+            "sources": [{"path": "/p", "kind": "align"}],
+            "options": {"clip_svg": True},
+        },
+    )
+    slug = r.json()["slug"]
+
+    r = client.patch(
+        f"/api/saved-sessions/{slug}/layout",
+        json={"track_layout": []},
+    )
+    assert r.status_code == 200
+
+    r = client.get(f"/api/saved-sessions/{slug}")
+    assert r.json()["options"] == {"clip_svg": True}

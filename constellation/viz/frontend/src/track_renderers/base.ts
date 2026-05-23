@@ -30,6 +30,10 @@ export interface RenderContext {
   meta: TrackMetadata;
   /** Host-level UI toggles. Renderers free to ignore. */
   showLabels?: boolean;
+  /** Per-binding visual style overrides. Renderers read with defaults. */
+  style?: Record<string, unknown>;
+  /** Per-binding dataset-slice filters. Renderers read with defaults. */
+  filter?: Record<string, unknown>;
 }
 
 export interface TrackRenderer {

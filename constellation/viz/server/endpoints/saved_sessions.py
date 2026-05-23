@@ -54,6 +54,7 @@ def get_saved(slug: str) -> dict[str, Any]:
     payload["track_layout"] = (
         list(saved.track_layout) if saved.track_layout else []
     )
+    payload["options"] = dict(saved.options) if saved.options else {}
     return payload
 
 
@@ -63,6 +64,7 @@ class SaveRequest(BaseModel):
     sources: list[dict[str, Any]]
     last_viewed_locus: dict[str, Any] | None = None
     track_layout: list[dict[str, Any]] | None = None
+    options: dict[str, Any] | None = None
     slug: str | None = None
 
 
@@ -79,6 +81,7 @@ def save_session_endpoint(body: SaveRequest) -> dict[str, Any]:
             sources=body.sources,
             last_viewed_locus=body.last_viewed_locus,
             track_layout=body.track_layout,
+            options=body.options,
             slug=body.slug,
         )
     except ValueError as exc:
@@ -88,6 +91,7 @@ def save_session_endpoint(body: SaveRequest) -> dict[str, Any]:
 
 class LayoutPatchRequest(BaseModel):
     track_layout: list[dict[str, Any]]
+    options: dict[str, Any] | None = None
 
 
 @router.patch("/{slug}/layout")
@@ -95,9 +99,10 @@ def patch_saved_layout(slug: str, body: LayoutPatchRequest) -> dict[str, Any]:
     """Rewrite the ``[[track_layout]]`` block on an existing saved
     session, preserving everything else.
 
-    Called by the client whenever the user changes per-binding
-    visibility / order / height / collapsed state on a session that
-    has a persisted slug. Returns the refreshed summary so the client
+    Called by the client whenever the user changes per-binding state
+    (visibility / order / height / collapsed / per-track style / per-track
+    filter) on a session that has a persisted slug, or toggles a
+    browser-wide option. Returns the refreshed summary so the client
     can verify the write.
     """
     from constellation.viz.sessions import read_saved, write_saved
@@ -108,6 +113,14 @@ def patch_saved_layout(slug: str, body: LayoutPatchRequest) -> dict[str, Any]:
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # Options absent in the patch means "keep what's there"; pass an
+    # empty dict explicitly to clear (the normalizer drops empty back
+    # to None).
+    options = (
+        body.options
+        if body.options is not None
+        else (dict(existing.options) if existing.options else None)
+    )
     try:
         saved = write_saved(
             label=existing.label,
@@ -115,6 +128,7 @@ def patch_saved_layout(slug: str, body: LayoutPatchRequest) -> dict[str, Any]:
             sources=existing.sources,
             last_viewed_locus=existing.last_viewed_locus,
             track_layout=body.track_layout,
+            options=options,
             saved_at=existing.saved_at,
             slug=existing.slug,
         )
