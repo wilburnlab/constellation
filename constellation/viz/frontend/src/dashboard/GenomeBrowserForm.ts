@@ -24,6 +24,7 @@ import type {
   SavedSessionPayload,
   SavedSessionSummary,
   SourceInspection,
+  TrackLayoutEntry,
 } from './types';
 import { DashboardState } from './state';
 
@@ -40,6 +41,7 @@ export interface GenomeBrowserFormOptions {
   onSubmit: (
     result: OpenSessionResult,
     saved: SavedSessionSummary | null,
+    initialLayout: TrackLayoutEntry[] | null,
   ) => Promise<void>;
 }
 
@@ -54,6 +56,7 @@ export class GenomeBrowserForm {
   private sources: SourceRow[] = [{ path: '', kind: '', label: '', warning: null, error: null }];
   private selectedReference: string = '';
   private saveAs: string = '';
+  private loadedTrackLayout: TrackLayoutEntry[] | null = null;
   private errorBanner: HTMLElement | null = null;
   private submitBtn: HTMLButtonElement | null = null;
   private referenceSelect: HTMLSelectElement | null = null;
@@ -363,6 +366,10 @@ export class GenomeBrowserForm {
         throw new Error(detail);
       }
       const payload = (await r.json()) as SavedSessionPayload;
+      this.loadedTrackLayout =
+        Array.isArray(payload.track_layout) && payload.track_layout.length > 0
+          ? payload.track_layout
+          : null;
       this.selectedReference = payload.reference_handle;
       if (this.referenceSelect) this.referenceSelect.value = payload.reference_handle;
       this.sources = payload.sources.map((s) => ({
@@ -710,7 +717,7 @@ export class GenomeBrowserForm {
           console.warn('saved-session write failed', err);
         }
       }
-      await this.onSubmit(result, saved);
+      await this.onSubmit(result, saved, this.loadedTrackLayout);
     } catch (err) {
       this.showError((err as Error).message);
       this.submitBtn.disabled = false;

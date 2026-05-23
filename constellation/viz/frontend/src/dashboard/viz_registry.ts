@@ -15,7 +15,12 @@
 
 import { GenomeBrowserForm } from './GenomeBrowserForm';
 import { DashboardState } from './state';
-import type { CommandSchema, OpenSessionResult, SavedSessionSummary } from './types';
+import type {
+  CommandSchema,
+  OpenSessionResult,
+  SavedSessionSummary,
+  TrackLayoutEntry,
+} from './types';
 
 export type VizFieldKind = 'path' | 'text';
 
@@ -80,13 +85,18 @@ const VIZ_DESCRIPTORS: VizDescriptor[] = [
     customForm: (ctx) => {
       const form = new GenomeBrowserForm({
         state: ctx.state,
-        async onSubmit(result: OpenSessionResult, _saved: SavedSessionSummary | null) {
+        async onSubmit(
+          result: OpenSessionResult,
+          _saved: SavedSessionSummary | null,
+          initialLayout: TrackLayoutEntry[] | null,
+        ) {
           await ctx.transitionToWidget(async (widgetHost) => {
             const { GenomeBrowser } = await import('../widgets/GenomeBrowser');
             widgetHost.innerHTML = '';
             const browser = new GenomeBrowser({
               host: widgetHost,
               sessionId: result.session_id,
+              initialLayout: initialLayout ?? undefined,
             });
             await browser.mount();
             return {

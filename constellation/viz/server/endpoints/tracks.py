@@ -59,6 +59,20 @@ def _find_binding(
     return None
 
 
+def invalidate_binding_cache(
+    cache: dict[tuple[str, str], list[TrackBinding]], session_id: str
+) -> None:
+    """Evict every ``(session_id, kind)`` entry for the given session.
+
+    Called whenever a session's source list mutates (open, add-source,
+    delete-source). The next /api/tracks request re-runs discovery
+    against the rebuilt session.
+    """
+    for key in list(cache):
+        if key[0] == session_id:
+            del cache[key]
+
+
 @router.get("")
 def list_tracks(session: str, request: Request) -> list[dict]:
     """List all bindings the registered kernels can produce against the
@@ -78,6 +92,7 @@ def list_tracks(session: str, request: Request) -> list[dict]:
                     "kind": kind,
                     "binding_id": binding.binding_id,
                     "label": binding.label,
+                    "source_id": binding.config.get("source_id"),
                 }
             )
     return out

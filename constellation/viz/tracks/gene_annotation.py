@@ -113,7 +113,7 @@ class GeneAnnotationKernel(TrackKernel):
                         "features": features,
                         "genome": session.reference_genome,
                     },
-                    config={"source": "derived"},
+                    config={"source": "derived", "source_id": src.source_id},
                 )
             )
         return out

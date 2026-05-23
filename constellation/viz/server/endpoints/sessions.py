@@ -28,6 +28,7 @@ import pyarrow.parquet as pq
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from constellation.viz.server.endpoints.tracks import invalidate_binding_cache
 from constellation.viz.server.session import Session
 
 
@@ -100,13 +101,94 @@ def open_session(body: OpenSessionRequest, request: Request) -> dict:
 
     sessions: dict = request.app.state.sessions
     sessions[session.session_id] = session
-
-    cache: dict = request.app.state.track_bindings_cache
-    for key in list(cache):
-        if key[0] == session.session_id:
-            del cache[key]
+    invalidate_binding_cache(
+        request.app.state.track_bindings_cache, session.session_id
+    )
 
     return _summarize(session)
+
+
+# ----------------------------------------------------------------------
+# Runtime source mutation — add / remove a source on a live session
+# ----------------------------------------------------------------------
+
+
+class AddSourceRequest(BaseModel):
+    path: str
+    kind: str | None = None
+    label: str | None = None
+
+
+def _sources_to_entries(sources: tuple) -> list[dict[str, Any]]:
+    """Turn a session's frozen source tuple back into a list of input
+    dicts suitable for :meth:`Session.with_sources`."""
+    return [
+        {"path": str(src.path), "kind": src.kind, "label": src.label}
+        for src in sources
+    ]
+
+
+def _replace_session(request: Request, session: Session) -> None:
+    """Atomically install a rebuilt Session in the registry and evict
+    the per-kind binding cache for that ``session_id``."""
+    request.app.state.sessions[session.session_id] = session
+    invalidate_binding_cache(
+        request.app.state.track_bindings_cache, session.session_id
+    )
+
+
+@router.post("/{session_id}/sources", status_code=201)
+def add_source(
+    session_id: str, body: AddSourceRequest, request: Request
+) -> dict:
+    """Append a data source to a live session.
+
+    The source path's ``manifest.json`` supplies the kind + assembly
+    automatically (mirrors ``POST /api/sessions/inspect-source``). The
+    session is rebuilt via :meth:`Session.with_sources`; the
+    ``session_id`` is preserved (deterministic over reference + label)
+    so clients don't need to re-bind. The next ``GET /api/tracks?...``
+    call returns the bindings for the new source.
+    """
+    sessions: dict = request.app.state.sessions
+    session = sessions.get(session_id)
+    if session is None:
+        raise HTTPException(404, f"unknown session_id: {session_id}")
+    entries = _sources_to_entries(session.sources)
+    entries.append(
+        {"path": body.path, "kind": body.kind, "label": body.label}
+    )
+    try:
+        rebuilt = session.with_sources(entries)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _replace_session(request, rebuilt)
+    return rebuilt.to_manifest()
+
+
+@router.delete("/{session_id}/sources/{source_id}")
+def delete_source(session_id: str, source_id: str, request: Request) -> dict:
+    """Remove the source with the given ``source_id`` from a live session.
+
+    Returns the rebuilt session manifest. 404 if either the session or
+    the source is unknown.
+    """
+    sessions: dict = request.app.state.sessions
+    session = sessions.get(session_id)
+    if session is None:
+        raise HTTPException(404, f"unknown session_id: {session_id}")
+    kept = [src for src in session.sources if src.source_id != source_id]
+    if len(kept) == len(session.sources):
+        raise HTTPException(
+            404, f"unknown source_id {source_id!r} on session {session_id}"
+        )
+    entries = _sources_to_entries(tuple(kept))
+    try:
+        rebuilt = session.with_sources(entries)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _replace_session(request, rebuilt)
+    return rebuilt.to_manifest()
 
 
 # ----------------------------------------------------------------------

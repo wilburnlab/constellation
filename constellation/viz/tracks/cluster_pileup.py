@@ -82,7 +82,7 @@ class ClusterPileupKernel(TrackKernel):
                     binding_id=f"cluster_pileup-{idx}",
                     label=label,
                     paths=paths,
-                    config={},
+                    config={"source_id": src.source_id},
                 )
             )
         return bindings

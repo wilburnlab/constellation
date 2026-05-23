@@ -10,9 +10,9 @@ Root resolution follows the same precedence as the reference and catalog
 caches (env override → XDG → home), so all three siblings under
 ``~/.constellation/`` move together.
 
-Schema v1::
+Schema v2 (current)::
 
-    schema_version = 1
+    schema_version = 2
     label = "..."
     reference_handle = "<organism>@<source>-<release>"
     saved_at = "2026-05-22T..."
@@ -26,6 +26,18 @@ Schema v1::
     contig = "chr1"
     start = 0
     end = 100000
+
+    [[track_layout]]
+    source_id = "src-1a2b3c4d"   # "" for reference-only bindings
+    kind = "coverage_histogram"
+    visible = true
+    display_order = 2
+    height_px = 80
+    collapsed = false
+
+v1 lacked ``[[track_layout]]``; v1 files are accepted transparently
+and treated as "all visible, default order, default heights" — they
+get rewritten as v2 on the next save.
 """
 
 from __future__ import annotations
@@ -39,7 +51,8 @@ from pathlib import Path
 from typing import Any
 
 
-SAVED_SESSION_SCHEMA_VERSION = 1
+SAVED_SESSION_SCHEMA_VERSION = 2
+_SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 _CACHE_ENV_VAR = "CONSTELLATION_SESSIONS_HOME"
 _XDG_ENV_VAR = "XDG_DATA_HOME"
 _HOME_FALLBACK = ".constellation/sessions"
@@ -84,6 +97,7 @@ class SavedSession:
     sources: list[dict[str, Any]] = field(default_factory=list)
     saved_at: str = ""
     last_viewed_locus: dict[str, Any] | None = None
+    track_layout: list[dict[str, Any]] | None = None
     path: Path | None = None  # populated by readers; absent on fresh constructs
 
     def to_dict(self) -> dict[str, Any]:
@@ -95,6 +109,9 @@ class SavedSession:
             "saved_at": self.saved_at,
             "last_viewed_locus": self.last_viewed_locus,
             "sources": list(self.sources),
+            "track_layout": (
+                list(self.track_layout) if self.track_layout else None
+            ),
         }
 
 
@@ -128,12 +145,39 @@ def _toml_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _normalize_track_layout(
+    entries: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Validate + coerce a track-layout list. Missing source_id maps to ""
+    (reference-only binding). Unknown extra keys are dropped silently
+    rather than raised — they're forward-compatibility room."""
+    if not entries:
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in entries:
+        kind = entry.get("kind")
+        if not kind:
+            continue
+        out.append(
+            {
+                "source_id": str(entry.get("source_id") or ""),
+                "kind": str(kind),
+                "visible": bool(entry.get("visible", True)),
+                "display_order": int(entry.get("display_order", 0)),
+                "height_px": int(entry.get("height_px", 0)),
+                "collapsed": bool(entry.get("collapsed", False)),
+            }
+        )
+    return out
+
+
 def write_saved(
     *,
     label: str,
     reference_handle: str,
     sources: list[dict[str, Any]],
     last_viewed_locus: dict[str, Any] | None = None,
+    track_layout: list[dict[str, Any]] | None = None,
     saved_at: str | None = None,
     slug: str | None = None,
     root: Path | None = None,
@@ -170,6 +214,8 @@ def write_saved(
             }
         )
 
+    normalized_layout = _normalize_track_layout(track_layout)
+
     lines: list[str] = [
         f"schema_version = {SAVED_SESSION_SCHEMA_VERSION}",
         f'label = "{_toml_escape(label)}"',
@@ -191,6 +237,15 @@ def write_saved(
         lines.append(f'contig = "{_toml_escape(contig)}"')
         lines.append(f"start = {start}")
         lines.append(f"end = {end}")
+    for entry in normalized_layout:
+        lines.append("")
+        lines.append("[[track_layout]]")
+        lines.append(f'source_id = "{_toml_escape(entry["source_id"])}"')
+        lines.append(f'kind = "{_toml_escape(entry["kind"])}"')
+        lines.append(f"visible = {'true' if entry['visible'] else 'false'}")
+        lines.append(f"display_order = {entry['display_order']}")
+        lines.append(f"height_px = {entry['height_px']}")
+        lines.append(f"collapsed = {'true' if entry['collapsed'] else 'false'}")
 
     path = root / f"{final_slug}.toml"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -201,6 +256,7 @@ def write_saved(
         sources=normalized_sources,
         saved_at=final_saved_at,
         last_viewed_locus=last_viewed_locus,
+        track_layout=normalized_layout or None,
         path=path,
     )
 
@@ -216,11 +272,11 @@ def read_saved(slug: str, *, root: Path | None = None) -> SavedSession:
         raise FileNotFoundError(f"no saved session at {path}")
     raw = tomllib.loads(path.read_text(encoding="utf-8"))
     schema_version = int(raw.get("schema_version", 1))
-    if schema_version != SAVED_SESSION_SCHEMA_VERSION:
+    if schema_version not in _SUPPORTED_SCHEMA_VERSIONS:
         raise ValueError(
             f"unsupported saved-session schema_version={schema_version} "
-            f"at {path}; this constellation supports "
-            f"v{SAVED_SESSION_SCHEMA_VERSION}"
+            f"at {path}; this constellation supports versions "
+            f"{list(_SUPPORTED_SCHEMA_VERSIONS)}"
         )
     label = str(raw.get("label") or slug)
     reference_handle = str(raw.get("reference_handle") or "")
@@ -253,6 +309,12 @@ def read_saved(slug: str, *, root: Path | None = None) -> SavedSession:
             "start": int(locus.get("start", 0)),
             "end": int(locus.get("end", 0)),
         }
+    layout_raw = raw.get("track_layout")
+    track_layout = (
+        _normalize_track_layout(layout_raw)
+        if isinstance(layout_raw, list)
+        else []
+    )
     return SavedSession(
         slug=slug,
         label=label,
@@ -260,6 +322,7 @@ def read_saved(slug: str, *, root: Path | None = None) -> SavedSession:
         sources=sources,
         saved_at=saved_at,
         last_viewed_locus=last_viewed,
+        track_layout=track_layout or None,
         path=path,
     )
 
