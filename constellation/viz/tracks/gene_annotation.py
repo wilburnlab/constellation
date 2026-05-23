@@ -1,7 +1,7 @@
 """Gene-annotation track — GFF3-shaped features as vector glyphs.
 
 Reads `FEATURE_TABLE` from either the reference's `annotation/` ParquetDir
-(`<root>/annotation/features.parquet` — preferred) or the
+(`session.reference_annotation / "features.parquet"` — preferred) plus one binding per align source's
 `derived_annotation/` ParquetDir produced by S2 (inferred exons; fallback
 when no reference annotation is attached).
 
@@ -34,6 +34,7 @@ from constellation.viz.tracks.base import (
     TrackBinding,
     TrackKernel,
     TrackQuery,
+    iter_sources_with,
     register_track,
 )
 
@@ -73,11 +74,10 @@ class GeneAnnotationKernel(TrackKernel):
         if session.reference_genome is None:
             return out
 
-        # Prefer the curated reference annotation; fall back to the
-        # constellation-derived annotation produced by S2 when no
-        # curated reference is attached. We surface BOTH when both
-        # exist so users can compare reference annotations against the
-        # data-derived call set.
+        # Curated reference annotation comes from the reference cache;
+        # data-derived annotations come from each align source. Both
+        # surface as separate bindings so users can compare them side by
+        # side.
         if session.reference_annotation is not None:
             features = _features_path(session.reference_annotation)
             if features is not None:
@@ -94,22 +94,28 @@ class GeneAnnotationKernel(TrackKernel):
                         config={"source": "reference"},
                     )
                 )
-        if session.derived_annotation is not None:
-            features = _features_path(session.derived_annotation)
-            if features is not None:
-                out.append(
-                    TrackBinding(
-                        session_id=session.session_id,
-                        kind=self.kind,
-                        binding_id="derived",
-                        label="Annotation (derived)",
-                        paths={
-                            "features": features,
-                            "genome": session.reference_genome,
-                        },
-                        config={"source": "derived"},
-                    )
+        for idx, src in iter_sources_with(session, "derived_annotation"):
+            features = _features_path(src.derived_annotation)
+            if features is None:
+                continue
+            label = (
+                f"Annotation (derived · {src.label})"
+                if len(session.sources) > 1
+                else "Annotation (derived)"
+            )
+            out.append(
+                TrackBinding(
+                    session_id=session.session_id,
+                    kind=self.kind,
+                    binding_id=f"derived-{idx}",
+                    label=label,
+                    paths={
+                        "features": features,
+                        "genome": session.reference_genome,
+                    },
+                    config={"source": "derived"},
                 )
+            )
         return out
 
     def metadata(self, binding: TrackBinding) -> dict[str, Any]:

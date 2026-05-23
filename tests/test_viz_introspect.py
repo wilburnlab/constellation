@@ -173,7 +173,7 @@ def test_path_heuristic_recognizes_dest_suffixes():
     demux = _commands_by_path(schema, ["transcriptome", "demultiplex"])
     output_dir = _arg_by_dest(demux, "output_dir")
     assert output_dir["type"] == "path"
-    # `--session` on viz genome maps via the exact-match set
+    # `--align-dir` on viz genome maps via the `_dir` suffix detection.
     genome = _commands_by_path(schema, ["viz", "genome"])
-    session = _arg_by_dest(genome, "session")
-    assert session["type"] == "path"
+    align_dir = _arg_by_dest(genome, "align_dir")
+    assert align_dir["type"] == "path"

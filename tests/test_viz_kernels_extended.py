@@ -30,12 +30,17 @@ from constellation.sequencing.schemas.transcriptome import (
     TRANSCRIPT_CLUSTER_TABLE,
 )
 from constellation.viz.server.session import Session
+from constellation.sequencing.transcriptome.manifest import (
+    write_align_manifest,
+    write_cluster_manifest,
+)
 from constellation.viz.tracks.base import (
     HYBRID_SCHEMA,
     ThresholdDecision,
     TrackQuery,
     get_kernel,
 )
+from _viz_fixtures import DEFAULT_ASSEMBLY, DEFAULT_HANDLE, install_fake_reference
 from constellation.viz.tracks.cluster_pileup import CLUSTER_PILEUP_VECTOR_SCHEMA
 from constellation.viz.tracks.gene_annotation import (
     GENE_ANNOTATION_VECTOR_SCHEMA,
@@ -56,36 +61,131 @@ from constellation.viz.tracks.splice_junctions import (
 
 
 def _write_genome(genome_dir: Path) -> None:
-    genome_dir.mkdir(parents=True, exist_ok=True)
-    pq.write_table(
-        pa.Table.from_pylist(
-            [
-                {
-                    "contig_id": 1,
-                    "name": "chr1",
-                    "length": 1_000_000,
-                    "topology": None,
-                    "circular": None,
-                }
-            ],
-            schema=CONTIG_TABLE,
-        ),
-        genome_dir / "contigs.parquet",
-    )
-    pq.write_table(
-        pa.Table.from_pylist(
-            [{"contig_id": 1, "sequence": "ACGTACGTACGTACGT" * 10}],
-            schema=SEQUENCE_TABLE,
-        ),
-        genome_dir / "sequences.parquet",
-    )
+    """No-op wrapper retained for test-body compatibility. The actual
+    reference is installed into the cache via `_install_ref` per-test."""
+    return None
 
 
 def _write_annotation(annotation_dir: Path, features: list[dict]) -> None:
+    """Stash the features list on the parent dir so `_make_session` can
+    later install them into the reference cache (or, when the dir name
+    is `derived_annotation`, into the align source)."""
     annotation_dir.mkdir(parents=True, exist_ok=True)
     pq.write_table(
         pa.Table.from_pylist(features, schema=FEATURE_TABLE),
         annotation_dir / "features.parquet",
+    )
+
+
+def _install_ref(monkeypatch, tmp_path: Path, *, with_annotation_features=None) -> Path:
+    """Install the standard 1M-bp chr1 reference into a fake cache and
+    point ``CONSTELLATION_REFERENCES_HOME`` at it. Returns the release
+    dir for callers that want to wire up annotation paths manually."""
+    cache_root = tmp_path / "refs"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache_root))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    return install_fake_reference(
+        cache_root,
+        handle=DEFAULT_HANDLE,
+        assembly_accession=DEFAULT_ASSEMBLY,
+        contigs=[
+            {
+                "contig_id": 1,
+                "name": "chr1",
+                "length": 1_000_000,
+                "topology": None,
+                "circular": None,
+            }
+        ],
+        sequences=[{"contig_id": 1, "sequence": "ACGTACGTACGTACGT" * 10}],
+        features=with_annotation_features,
+    )
+
+
+def _make_session(
+    monkeypatch,
+    tmp_path: Path,
+    root: Path,
+    *,
+    use_root_annotation: bool = False,
+) -> Session:
+    """Compose a Session from a test-written ``<root>/{genome,annotation,
+    S2_align,S2_cluster}/...`` layout — the legacy fixture shape — by
+    rerouting genome/annotation into the reference cache and packaging
+    S2_align/S2_cluster as schema-v2 source dirs.
+
+    ``use_root_annotation`` reads ``<root>/annotation/features.parquet``
+    (if present) and installs the rows into the reference cache's
+    annotation slot. The on-disk layout under ``<root>`` is preserved —
+    each source dir gets a fresh ``manifest.json`` written alongside the
+    existing artifact files.
+    """
+    features = None
+    if use_root_annotation:
+        ann_path = root / "annotation" / "features.parquet"
+        if ann_path.exists():
+            features = pq.read_table(ann_path).to_pylist()
+    release_dir = _install_ref(
+        monkeypatch, tmp_path, with_annotation_features=features
+    )
+
+    sources: list[dict[str, object]] = []
+    align_dir = root / "S2_align"
+    if align_dir.is_dir():
+        outputs: dict[str, str] = {}
+        for slot, rel in (
+            ("alignments", "alignments"),
+            ("alignment_blocks", "alignment_blocks"),
+            ("coverage", "coverage.parquet"),
+            ("introns", "introns.parquet"),
+            ("derived_annotation", "derived_annotation"),
+        ):
+            candidate = align_dir / rel
+            if candidate.exists():
+                outputs[slot] = str(candidate)
+        write_align_manifest(
+            align_dir / "manifest.json",
+            reference_handle=DEFAULT_HANDLE,
+            reference_path=str(release_dir),
+            assembly_accession=DEFAULT_ASSEMBLY,
+            demux_dir="",
+            input_files=[],
+            parameters={},
+            stages={},
+            outputs=outputs,
+        )
+        sources.append(
+            {"path": str(align_dir), "kind": "align", "label": "align"}
+        )
+    cluster_dir = root / "S2_cluster"
+    if cluster_dir.is_dir():
+        outputs = {}
+        for slot, rel in (
+            ("clusters", "clusters.parquet"),
+            ("cluster_membership", "cluster_membership.parquet"),
+        ):
+            candidate = cluster_dir / rel
+            if candidate.exists():
+                outputs[slot] = str(candidate)
+        write_cluster_manifest(
+            cluster_dir / "manifest.json",
+            reference_handle=DEFAULT_HANDLE,
+            reference_path=str(release_dir),
+            assembly_accession=DEFAULT_ASSEMBLY,
+            align_dir="",
+            demux_dir="",
+            samples_path="",
+            parameters={},
+            stages={},
+            outputs=outputs,
+        )
+        sources.append(
+            {"path": str(cluster_dir), "kind": "cluster", "label": "cluster"}
+        )
+    return Session.open(
+        reference_handle=DEFAULT_HANDLE,
+        sources=sources,
     )
 
 
@@ -94,10 +194,12 @@ def _write_annotation(annotation_dir: Path, features: list[dict]) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_reference_sequence_vector_returns_per_base(tmp_path: Path) -> None:
+def test_reference_sequence_vector_returns_per_base(
+    tmp_path: Path, monkeypatch
+) -> None:
     root = tmp_path / "run"
     _write_genome(root / "genome")
-    session = Session.from_root(root)
+    session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("reference_sequence")
     [binding] = kernel.discover(session)
     query = TrackQuery(contig="chr1", start=0, end=10, viewport_px=400)
@@ -114,7 +216,7 @@ def test_reference_sequence_vector_returns_per_base(tmp_path: Path) -> None:
 
 
 def test_reference_sequence_cache_reuses_string_across_calls(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """A second `fetch` for the same contig must not re-read the
     on-disk sequence — verified by intercepting the loader and counting
@@ -122,7 +224,7 @@ def test_reference_sequence_cache_reuses_string_across_calls(
     on real genomes (multi-MB sequences re-decoded per request)."""
     root = tmp_path / "run"
     _write_genome(root / "genome")
-    session = Session.from_root(root)
+    session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("reference_sequence")
     [binding] = kernel.discover(session)
 
@@ -221,34 +323,27 @@ def test_reference_sequence_loader_reads_only_matching_contig(
 
 
 def test_reference_sequence_decimates_when_window_exceeds_cap(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
-    root = tmp_path / "run"
-    genome = root / "genome"
-    genome.mkdir(parents=True)
-    pq.write_table(
-        pa.Table.from_pylist(
-            [
-                {
-                    "contig_id": 1,
-                    "name": "chr1",
-                    "length": 100_000,
-                    "topology": None,
-                    "circular": None,
-                }
-            ],
-            schema=CONTIG_TABLE,
-        ),
-        genome / "contigs.parquet",
+    cache_root = tmp_path / "refs"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache_root))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    install_fake_reference(
+        cache_root,
+        handle=DEFAULT_HANDLE,
+        contigs=[
+            {
+                "contig_id": 1,
+                "name": "chr1",
+                "length": 100_000,
+                "topology": None,
+                "circular": None,
+            }
+        ],
+        sequences=[{"contig_id": 1, "sequence": "A" * 50_000}],
     )
-    pq.write_table(
-        pa.Table.from_pylist(
-            [{"contig_id": 1, "sequence": "A" * 50_000}],
-            schema=SEQUENCE_TABLE,
-        ),
-        genome / "sequences.parquet",
-    )
-    session = Session.from_root(root)
+    session = Session.open(reference_handle=DEFAULT_HANDLE, sources=[])
     kernel = get_kernel("reference_sequence")
     [binding] = kernel.discover(session)
     query = TrackQuery(contig="chr1", start=0, end=50_000, viewport_px=1200)
@@ -287,19 +382,19 @@ def _feature(**kwargs) -> dict:
 
 
 def test_gene_annotation_discover_uses_reference_when_present(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     root = tmp_path / "run"
     _write_genome(root / "genome")
     _write_annotation(root / "annotation", [_feature()])
-    session = Session.from_root(root)
+    session = _make_session(monkeypatch, tmp_path, root, use_root_annotation=True)
     bindings = get_kernel("gene_annotation").discover(session)
     assert len(bindings) == 1
     assert bindings[0].binding_id == "reference"
 
 
 def test_gene_annotation_discover_returns_both_when_both_present(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     root = tmp_path / "run"
     _write_genome(root / "genome")
@@ -308,12 +403,14 @@ def test_gene_annotation_discover_returns_both_when_both_present(
         root / "S2_align" / "derived_annotation",
         [_feature(feature_id=10, source="constellation_derived")],
     )
-    session = Session.from_root(root)
+    session = _make_session(monkeypatch, tmp_path, root, use_root_annotation=True)
     bindings = get_kernel("gene_annotation").discover(session)
-    assert {b.binding_id for b in bindings} == {"reference", "derived"}
+    assert {b.binding_id for b in bindings} == {"reference", "derived-0"}
 
 
-def test_gene_annotation_fetch_filters_by_window(tmp_path: Path) -> None:
+def test_gene_annotation_fetch_filters_by_window(
+    tmp_path: Path, monkeypatch
+) -> None:
     root = tmp_path / "run"
     _write_genome(root / "genome")
     _write_annotation(
@@ -324,7 +421,7 @@ def test_gene_annotation_fetch_filters_by_window(tmp_path: Path) -> None:
             _feature(feature_id=3, start=500, end=600, name="C"),
         ],
     )
-    session = Session.from_root(root)
+    session = _make_session(monkeypatch, tmp_path, root, use_root_annotation=True)
     kernel = get_kernel("gene_annotation")
     [binding] = kernel.discover(session)
     query = TrackQuery(contig="chr1", start=50, end=400)
@@ -336,7 +433,9 @@ def test_gene_annotation_fetch_filters_by_window(tmp_path: Path) -> None:
     assert names == ["A", "B"]
 
 
-def test_gene_annotation_truncates_above_feature_limit(tmp_path: Path) -> None:
+def test_gene_annotation_truncates_above_feature_limit(
+    tmp_path: Path, monkeypatch
+) -> None:
     root = tmp_path / "run"
     _write_genome(root / "genome")
     # 10 short features + 5 long features in the same window. With a
@@ -354,7 +453,7 @@ def test_gene_annotation_truncates_above_feature_limit(tmp_path: Path) -> None:
             )
         )
     _write_annotation(root / "annotation", features)
-    session = Session.from_root(root)
+    session = _make_session(monkeypatch, tmp_path, root, use_root_annotation=True)
     kernel = get_kernel("gene_annotation")
     kernel.feature_limit = 8  # tune for this test only
     [binding] = kernel.discover(session)
@@ -374,7 +473,9 @@ def test_gene_annotation_truncates_above_feature_limit(tmp_path: Path) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_splice_junctions_emits_one_arc_per_cluster(tmp_path: Path) -> None:
+def test_splice_junctions_emits_one_arc_per_cluster(
+    tmp_path: Path, monkeypatch
+) -> None:
     root = tmp_path / "run"
     _write_genome(root / "genome")
     align_dir = root / "S2_align"
@@ -422,7 +523,7 @@ def test_splice_junctions_emits_one_arc_per_cluster(tmp_path: Path) -> None:
         ),
         align_dir / "introns.parquet",
     )
-    session = Session.from_root(root)
+    session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("splice_junctions")
     [binding] = kernel.discover(session)
     query = TrackQuery(contig="chr1", start=0, end=10_000)
@@ -475,7 +576,9 @@ def _alignment(**kwargs) -> dict:
     return base
 
 
-def test_read_pileup_vector_returns_packed_rows(tmp_path: Path) -> None:
+def test_read_pileup_vector_returns_packed_rows(
+    tmp_path: Path, monkeypatch
+) -> None:
     root = tmp_path / "run"
     _write_genome(root / "genome")
     _write_alignments(
@@ -486,7 +589,7 @@ def test_read_pileup_vector_returns_packed_rows(tmp_path: Path) -> None:
             _alignment(alignment_id=3, read_id="r3", ref_start=200, ref_end=300),
         ],
     )
-    session = Session.from_root(root)
+    session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("read_pileup")
     [binding] = kernel.discover(session)
     query = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)
@@ -504,7 +607,7 @@ def test_read_pileup_vector_returns_packed_rows(tmp_path: Path) -> None:
     assert rows[3] == 0
 
 
-def test_read_pileup_hybrid_emits_png(tmp_path: Path) -> None:
+def test_read_pileup_hybrid_emits_png(tmp_path: Path, monkeypatch) -> None:
     pytest.importorskip("datashader")
     pytest.importorskip("PIL")
     from PIL import Image
@@ -515,7 +618,7 @@ def test_read_pileup_hybrid_emits_png(tmp_path: Path) -> None:
         root / "S2_align",
         [_alignment(alignment_id=i, read_id=f"r{i}", ref_start=0, ref_end=100) for i in range(50)],
     )
-    session = Session.from_root(root)
+    session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("read_pileup")
     [binding] = kernel.discover(session)
     # Force hybrid via the explicit param so we don't depend on
@@ -539,11 +642,13 @@ def test_read_pileup_hybrid_emits_png(tmp_path: Path) -> None:
     assert img.size == (1200, row["height_px"])
 
 
-def test_read_pileup_threshold_force_override(tmp_path: Path) -> None:
+def test_read_pileup_threshold_force_override(
+    tmp_path: Path, monkeypatch
+) -> None:
     root = tmp_path / "run"
     _write_genome(root / "genome")
     _write_alignments(root / "S2_align", [_alignment()])
-    session = Session.from_root(root)
+    session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("read_pileup")
     [binding] = kernel.discover(session)
     q = TrackQuery(
@@ -586,7 +691,9 @@ def _cluster(**kwargs) -> dict:
     return base
 
 
-def test_cluster_pileup_vector_emits_packed_rows(tmp_path: Path) -> None:
+def test_cluster_pileup_vector_emits_packed_rows(
+    tmp_path: Path, monkeypatch
+) -> None:
     root = tmp_path / "run"
     _write_genome(root / "genome")
     cluster_dir = root / "S2_cluster"
@@ -609,7 +716,7 @@ def test_cluster_pileup_vector_emits_packed_rows(tmp_path: Path) -> None:
         ),
         cluster_dir / "cluster_membership.parquet",
     )
-    session = Session.from_root(root)
+    session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("cluster_pileup")
     [binding] = kernel.discover(session)
     query = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)

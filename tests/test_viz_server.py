@@ -43,74 +43,42 @@ from constellation.viz.tracks.coverage_histogram import (  # noqa: E402
 
 
 @pytest.fixture
-def fixture_session(tmp_path: Path) -> Session:
-    root = tmp_path / "run"
-    genome = root / "genome"
-    genome.mkdir(parents=True)
-    pq.write_table(
-        pa.Table.from_pylist(
-            [
-                {
-                    "contig_id": 1,
-                    "name": "chr1",
-                    "length": 1_000_000,
-                    "topology": None,
-                    "circular": None,
-                },
-                {
-                    "contig_id": 2,
-                    "name": "chr2",
-                    "length": 200_000,
-                    "topology": None,
-                    "circular": None,
-                },
-            ],
-            schema=CONTIG_TABLE,
-        ),
-        genome / "contigs.parquet",
-    )
-    pq.write_table(
-        pa.table(
-            {
-                "contig_id": pa.array([1, 2], pa.int64()),
-                "sequence": pa.array(["N" * 100, "N" * 100], pa.string()),
-            }
-        ),
-        genome / "sequences.parquet",
-    )
+def fixture_session(tmp_path: Path, monkeypatch) -> Session:
+    from _viz_fixtures import build_viz_session
 
-    align = root / "S2_align"
-    align.mkdir()
-    pq.write_table(
-        pa.Table.from_pylist(
-            [
-                {
-                    "contig_id": 1,
-                    "sample_id": -1,
-                    "start": 0,
-                    "end": 1000,
-                    "depth": 5,
-                },
-                {
-                    "contig_id": 1,
-                    "sample_id": -1,
-                    "start": 1000,
-                    "end": 2000,
-                    "depth": 12,
-                },
-                {
-                    "contig_id": 1,
-                    "sample_id": -1,
-                    "start": 5000,
-                    "end": 6000,
-                    "depth": 3,
-                },
-            ],
-            schema=COVERAGE_TABLE,
-        ),
-        align / "coverage.parquet",
+    return build_viz_session(
+        tmp_path,
+        monkeypatch,
+        contigs=[
+            {
+                "contig_id": 1,
+                "name": "chr1",
+                "length": 1_000_000,
+                "topology": None,
+                "circular": None,
+            },
+            {
+                "contig_id": 2,
+                "name": "chr2",
+                "length": 200_000,
+                "topology": None,
+                "circular": None,
+            },
+        ],
+        sequences=[
+            {"contig_id": 1, "sequence": "N" * 100},
+            {"contig_id": 2, "sequence": "N" * 100},
+        ],
+        align_sources=[
+            {
+                "coverage": [
+                    {"contig_id": 1, "sample_id": -1, "start": 0, "end": 1000, "depth": 5},
+                    {"contig_id": 1, "sample_id": -1, "start": 1000, "end": 2000, "depth": 12},
+                    {"contig_id": 1, "sample_id": -1, "start": 5000, "end": 6000, "depth": 3},
+                ],
+            }
+        ],
     )
-    return Session.from_root(root)
 
 
 @pytest.fixture
@@ -187,7 +155,8 @@ def test_session_manifest_round_trips(
     assert response.status_code == 200
     body = response.json()
     assert body["session_id"] == fixture_session.session_id
-    assert body["paths"]["coverage"] == "S2_align/coverage.parquet"
+    assert body["reference"]["handle"] == fixture_session.reference_handle
+    assert body["sources"][0]["slots"]["coverage"] is not None
 
 
 def test_session_contigs(
@@ -207,59 +176,90 @@ def test_unknown_session_returns_404(client: TestClient) -> None:
     assert response.status_code == 404
 
 
-def test_register_session_adds_session(
+def _open_payload(fixture_session: Session) -> dict:
+    sources = [
+        {"path": str(src.path), "kind": src.kind, "label": src.label}
+        for src in fixture_session.sources
+    ]
+    return {
+        "reference_handle": fixture_session.reference_handle,
+        "sources": sources,
+    }
+
+
+def test_open_session_adds_session(
     fixture_session: Session, tmp_path: Path
 ) -> None:
     app = create_app({})
     client = TestClient(app)
-
+    # The fixture's monkeypatched CONSTELLATION_REFERENCES_HOME stays
+    # active across this nested app since it's a process-wide env var.
     assert client.get("/api/sessions").json() == []
 
-    response = client.post("/api/sessions", json={"path": str(fixture_session.root)})
+    response = client.post("/api/sessions/open", json=_open_payload(fixture_session))
     assert response.status_code == 201
     body = response.json()
-    assert body["session_id"] == fixture_session.session_id
-    assert body["root"] == str(fixture_session.root)
+    assert body["reference_handle"] == fixture_session.reference_handle
     assert body["stages_present"]["reference_genome"] is True
+    assert body["n_sources"] == len(fixture_session.sources)
 
     listed = client.get("/api/sessions").json()
     assert len(listed) == 1
-    assert listed[0]["session_id"] == fixture_session.session_id
+    assert listed[0]["session_id"] == body["session_id"]
 
 
-def test_register_session_is_idempotent_and_evicts_cache(
+def test_open_session_is_idempotent_and_evicts_cache(
     fixture_session: Session,
 ) -> None:
     app = create_app({})
     client = TestClient(app)
-    payload = {"path": str(fixture_session.root)}
+    payload = _open_payload(fixture_session)
 
-    first = client.post("/api/sessions", json=payload)
+    first = client.post("/api/sessions/open", json=payload)
     assert first.status_code == 201
     sid = first.json()["session_id"]
 
     app.state.track_bindings_cache[(sid, "coverage_histogram")] = ["sentinel"]
 
-    second = client.post("/api/sessions", json=payload)
+    second = client.post("/api/sessions/open", json=payload)
     assert second.status_code == 201
     assert second.json()["session_id"] == sid
     assert len(client.get("/api/sessions").json()) == 1
     assert (sid, "coverage_histogram") not in app.state.track_bindings_cache
 
 
-def test_register_session_missing_path_returns_404(tmp_path: Path) -> None:
+def test_open_session_unknown_handle_returns_400(tmp_path: Path) -> None:
     app = create_app({})
     client = TestClient(app)
     response = client.post(
-        "/api/sessions", json={"path": str(tmp_path / "does-not-exist")}
+        "/api/sessions/open",
+        json={"reference_handle": "no_such@local_import-12345678", "sources": []},
     )
-    assert response.status_code == 404
+    assert response.status_code == 400
 
 
-def test_register_session_empty_path_returns_400() -> None:
+def test_inspect_source_reports_kind_and_handle(
+    fixture_session: Session,
+) -> None:
     app = create_app({})
     client = TestClient(app)
-    response = client.post("/api/sessions", json={"path": "   "})
+    src = fixture_session.sources[0]
+    response = client.post(
+        "/api/sessions/inspect-source", json={"path": str(src.path)}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["kind"] == "align"
+    assert body["reference_handle"] == fixture_session.reference_handle
+
+
+def test_inspect_source_missing_dir_returns_400(tmp_path: Path) -> None:
+    app = create_app({})
+    client = TestClient(app)
+    response = client.post(
+        "/api/sessions/inspect-source",
+        json={"path": str(tmp_path / "does-not-exist")},
+    )
     assert response.status_code == 400
 
 
@@ -280,7 +280,7 @@ def test_track_metadata_round_trips(
 ) -> None:
     response = client.get(
         "/api/tracks/coverage_histogram/metadata",
-        params={"session": fixture_session.session_id, "binding": "coverage"},
+        params={"session": fixture_session.session_id, "binding": "coverage-0"},
     )
     assert response.status_code == 200
     body = response.json()
@@ -295,7 +295,7 @@ def test_track_data_streams_arrow_ipc(
         "/api/tracks/coverage_histogram/data",
         params={
             "session": fixture_session.session_id,
-            "binding": "coverage",
+            "binding": "coverage-0",
             "contig": "chr1",
             "start": 0,
             "end": 3000,
@@ -321,7 +321,7 @@ def test_track_data_unknown_contig_returns_empty_stream(
         "/api/tracks/coverage_histogram/data",
         params={
             "session": fixture_session.session_id,
-            "binding": "coverage",
+            "binding": "coverage-0",
             "contig": "chrX_missing",
             "start": 0,
             "end": 1000,
@@ -339,7 +339,7 @@ def test_track_data_rejects_inverted_window(
         "/api/tracks/coverage_histogram/data",
         params={
             "session": fixture_session.session_id,
-            "binding": "coverage",
+            "binding": "coverage-0",
             "contig": "chr1",
             "start": 1000,
             "end": 500,
@@ -355,7 +355,7 @@ def test_track_data_unknown_kind_returns_404(
         "/api/tracks/no_such_kind/data",
         params={
             "session": fixture_session.session_id,
-            "binding": "coverage",
+            "binding": "coverage-0",
             "contig": "chr1",
             "start": 0,
             "end": 10,
@@ -445,46 +445,13 @@ def test_root_with_vite_named_index_serves_spa(
 
 
 @pytest.fixture
-def search_session(tmp_path: Path) -> Session:
+def search_session(tmp_path: Path, monkeypatch) -> Session:
     """Session with reference + derived annotation parquets for the
     search-endpoint tests. `BRCA1` lives in the curated reference set;
     `derived_gene_42` only in the data-derived bundle; both contain a
     common name fragment ('brc') so substring matches return hits from
     both sources."""
-    root = tmp_path / "search_run"
-    genome = root / "genome"
-    genome.mkdir(parents=True)
-    pq.write_table(
-        pa.Table.from_pylist(
-            [
-                {
-                    "contig_id": 1,
-                    "name": "chr1",
-                    "length": 1_000_000,
-                    "topology": None,
-                    "circular": None,
-                },
-                {
-                    "contig_id": 2,
-                    "name": "chrX",
-                    "length": 250_000,
-                    "topology": None,
-                    "circular": None,
-                },
-            ],
-            schema=CONTIG_TABLE,
-        ),
-        genome / "contigs.parquet",
-    )
-    pq.write_table(
-        pa.table(
-            {
-                "contig_id": pa.array([1, 2], pa.int64()),
-                "sequence": pa.array(["N" * 50, "N" * 50], pa.string()),
-            }
-        ),
-        genome / "sequences.parquet",
-    )
+    from _viz_fixtures import build_viz_session
 
     def _feature(
         *,
@@ -511,55 +478,64 @@ def search_session(tmp_path: Path) -> Session:
             "attributes_json": None,
         }
 
-    annotation = root / "annotation"
-    annotation.mkdir()
-    pq.write_table(
-        pa.Table.from_pylist(
-            [
-                _feature(feature_id=1, contig_id=1, start=100, end=400, name="BRCA1"),
-                _feature(feature_id=2, contig_id=2, start=500, end=900, name="MYC"),
-                _feature(
-                    feature_id=3,
-                    contig_id=1,
-                    start=1100,
-                    end=1500,
-                    name=None,
-                    type_="repeat_region",
-                ),
-            ],
-            schema=FEATURE_TABLE,
-        ),
-        annotation / "features.parquet",
+    return build_viz_session(
+        tmp_path,
+        monkeypatch,
+        contigs=[
+            {
+                "contig_id": 1,
+                "name": "chr1",
+                "length": 1_000_000,
+                "topology": None,
+                "circular": None,
+            },
+            {
+                "contig_id": 2,
+                "name": "chrX",
+                "length": 250_000,
+                "topology": None,
+                "circular": None,
+            },
+        ],
+        sequences=[
+            {"contig_id": 1, "sequence": "N" * 50},
+            {"contig_id": 2, "sequence": "N" * 50},
+        ],
+        features=[
+            _feature(feature_id=1, contig_id=1, start=100, end=400, name="BRCA1"),
+            _feature(feature_id=2, contig_id=2, start=500, end=900, name="MYC"),
+            _feature(
+                feature_id=3,
+                contig_id=1,
+                start=1100,
+                end=1500,
+                name=None,
+                type_="repeat_region",
+            ),
+        ],
+        align_sources=[
+            {
+                "derived_annotation_features": [
+                    _feature(
+                        feature_id=101,
+                        contig_id=1,
+                        start=2000,
+                        end=2400,
+                        name="derived_brc_42",
+                        source="constellation_derived",
+                    ),
+                    _feature(
+                        feature_id=102,
+                        contig_id=2,
+                        start=10_000,
+                        end=11_000,
+                        name="other_derived",
+                        source="constellation_derived",
+                    ),
+                ],
+            }
+        ],
     )
-
-    align = root / "S2_align"
-    derived = align / "derived_annotation"
-    derived.mkdir(parents=True)
-    pq.write_table(
-        pa.Table.from_pylist(
-            [
-                _feature(
-                    feature_id=101,
-                    contig_id=1,
-                    start=2000,
-                    end=2400,
-                    name="derived_brc_42",
-                    source="constellation_derived",
-                ),
-                _feature(
-                    feature_id=102,
-                    contig_id=2,
-                    start=10_000,
-                    end=11_000,
-                    name="other_derived",
-                    source="constellation_derived",
-                ),
-            ],
-            schema=FEATURE_TABLE,
-        ),
-        derived / "features.parquet",
-    )
-    return Session.from_root(root)
 
 
 @pytest.fixture
@@ -590,7 +566,8 @@ def test_search_substring_matches_across_bindings_reference_first(
     names = [h["name"] for h in hits]
     sources = [h["source"] for h in hits]
     assert names == ["BRCA1", "derived_brc_42"]
-    assert sources == ["reference", "derived"]
+    assert sources[0] == "reference"
+    assert sources[1].startswith("derived")
     assert hits[0]["contig_name"] == "chr1"
     assert hits[0]["start"] == 100 and hits[0]["end"] == 400
 
@@ -617,7 +594,7 @@ def test_search_numeric_query_matches_feature_id(
     # feature_id=102 lives in derived; name does not contain "102".
     assert len(hits) == 1
     assert hits[0]["feature_id"] == 102
-    assert hits[0]["source"] == "derived"
+    assert hits[0]["source"].startswith("derived")
 
 
 def test_search_unknown_session_returns_404(search_client: TestClient) -> None:

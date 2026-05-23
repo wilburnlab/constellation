@@ -43,64 +43,27 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _build_fixture_session(tmp_path: Path) -> Session:
-    root = tmp_path / "run"
-    genome = root / "genome"
-    genome.mkdir(parents=True)
-    pq.write_table(
-        pa.Table.from_pylist(
-            [
-                {
-                    "contig_id": 1,
-                    "name": "chr1",
-                    "length": 1_000_000,
-                    "topology": None,
-                    "circular": None,
-                }
-            ],
-            schema=CONTIG_TABLE,
-        ),
-        genome / "contigs.parquet",
-    )
-    pq.write_table(
-        pa.table(
+def _build_fixture_session(tmp_path: Path, monkeypatch) -> Session:
+    from _viz_fixtures import build_viz_session
+
+    return build_viz_session(
+        tmp_path,
+        monkeypatch,
+        align_sources=[
             {
-                "contig_id": pa.array([1], pa.int64()),
-                "sequence": pa.array(["N" * 100], pa.string()),
+                "coverage": [
+                    {"contig_id": 1, "sample_id": -1, "start": 0, "end": 1000, "depth": 5},
+                    {"contig_id": 1, "sample_id": -1, "start": 1000, "end": 2000, "depth": 12},
+                ],
             }
-        ),
-        genome / "sequences.parquet",
+        ],
     )
 
-    align = root / "S2_align"
-    align.mkdir()
-    pq.write_table(
-        pa.Table.from_pylist(
-            [
-                {
-                    "contig_id": 1,
-                    "sample_id": -1,
-                    "start": 0,
-                    "end": 1000,
-                    "depth": 5,
-                },
-                {
-                    "contig_id": 1,
-                    "sample_id": -1,
-                    "start": 1000,
-                    "end": 2000,
-                    "depth": 12,
-                },
-            ],
-            schema=COVERAGE_TABLE,
-        ),
-        align / "coverage.parquet",
-    )
-    return Session.from_root(root)
 
-
-def test_uvicorn_serves_arrow_ipc_end_to_end(tmp_path: Path) -> None:
-    session = _build_fixture_session(tmp_path)
+def test_uvicorn_serves_arrow_ipc_end_to_end(
+    tmp_path: Path, monkeypatch
+) -> None:
+    session = _build_fixture_session(tmp_path, monkeypatch)
     app = create_app(session)
     port = _free_port()
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
@@ -133,7 +96,7 @@ def test_uvicorn_serves_arrow_ipc_end_to_end(tmp_path: Path) -> None:
         manifest = httpx.get(
             f"{base}/api/sessions/{session.session_id}/manifest",
         ).json()
-        assert manifest["paths"]["coverage"] == "S2_align/coverage.parquet"
+        assert manifest["sources"][0]["slots"]["coverage"] is not None
 
         # Track list — coverage_histogram should be discoverable
         tracks = httpx.get(
@@ -147,7 +110,7 @@ def test_uvicorn_serves_arrow_ipc_end_to_end(tmp_path: Path) -> None:
             f"{base}/api/tracks/coverage_histogram/data",
             params={
                 "session": session.session_id,
-                "binding": "coverage",
+                "binding": "coverage-0",
                 "contig": "chr1",
                 "start": 0,
                 "end": 3000,

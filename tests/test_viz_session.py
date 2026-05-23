@@ -1,8 +1,11 @@
-"""Session discovery — `session.toml` + per-stage fallback walk.
+"""Session shape — Session.open against the reference cache.
 
-Builds a fixture run-directory layout in tmp_path and exercises both
-explicit (``session.toml``) and implicit (directory walk) entry points
-into ``constellation.viz.server.session.Session``.
+Exercises the reference-cache-first construction path:
+- builds a fake cache root via monkeypatch + ``CONSTELLATION_REFERENCES_HOME``
+- writes one-or-more `transcriptome align` / `cluster` source dirs with
+  schema-v2 manifests
+- calls ``Session.open(reference_handle, sources)`` and asserts the
+  resolved dataclass shape, slot resolution, and mismatch-warning logic.
 """
 
 from __future__ import annotations
@@ -14,233 +17,263 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from constellation.sequencing.schemas.quant import COVERAGE_TABLE
-from constellation.sequencing.schemas.reference import CONTIG_TABLE
 from constellation.viz.server.session import Session
+from _viz_fixtures import (
+    DEFAULT_ASSEMBLY,
+    DEFAULT_HANDLE,
+    build_viz_session,
+    install_fake_reference,
+    write_align_source,
+)
 
 
-def _write_genome(genome_dir: Path) -> None:
-    genome_dir.mkdir(parents=True, exist_ok=True)
-    contigs = pa.Table.from_pylist(
-        [
+def test_open_with_single_align_source(tmp_path: Path, monkeypatch) -> None:
+    session = build_viz_session(
+        tmp_path,
+        monkeypatch,
+        features=[
             {
+                "feature_id": 1,
                 "contig_id": 1,
-                "name": "chr1",
-                "length": 1_000_000,
-                "topology": None,
-                "circular": None,
+                "type": "gene",
+                "name": "gene1",
+                "start": 0,
+                "end": 1000,
+                "strand": "+",
+                "parent_id": None,
+                "biotype": None,
+                "source": "test",
+                "attributes": {},
             },
         ],
-        schema=CONTIG_TABLE,
-    )
-    pq.write_table(contigs, genome_dir / "contigs.parquet")
-    # Tiny stub for the SEQUENCE_TABLE (the reference_sequence kernel
-    # consumes this; coverage_histogram doesn't but Session.discover
-    # treats `genome/` as a ParquetDir bundle either way).
-    pq.write_table(
-        pa.table(
+        align_sources=[
             {
-                "contig_id": pa.array([1], pa.int64()),
-                "sequence": pa.array(["A" * 100], pa.string()),
+                "coverage": [
+                    {
+                        "contig_id": 1,
+                        "sample_id": -1,
+                        "start": 0,
+                        "end": 100,
+                        "depth": 5,
+                    }
+                ],
             }
-        ),
-        genome_dir / "sequences.parquet",
+        ],
     )
-    (genome_dir / "manifest.json").write_text(
-        json.dumps({"format": "parquet_dir", "container": "GenomeReference"})
+    assert session.reference_handle == DEFAULT_HANDLE
+    assert session.assembly_accession == DEFAULT_ASSEMBLY
+    assert session.reference_genome.name == "genome"
+    assert session.reference_annotation is not None
+    assert len(session.sources) == 1
+    src = session.sources[0]
+    assert src.kind == "align"
+    assert src.coverage is not None and src.coverage.name == "coverage.parquet"
+    assert session.warnings == ()
+
+
+def test_open_multi_source_emits_one_session_per_kind(
+    tmp_path: Path, monkeypatch
+) -> None:
+    session = build_viz_session(
+        tmp_path,
+        monkeypatch,
+        align_sources=[
+            {
+                "coverage": [
+                    {"contig_id": 1, "sample_id": -1, "start": 0, "end": 50, "depth": 3}
+                ],
+            },
+            {
+                "coverage": [
+                    {"contig_id": 1, "sample_id": -1, "start": 50, "end": 100, "depth": 7}
+                ],
+            },
+        ],
+        cluster_sources=[
+            {
+                "clusters": [],
+                "cluster_membership": [],
+            }
+        ],
     )
-
-
-def _write_coverage(parquet_path: Path, rows: list[dict]) -> None:
-    parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.Table.from_pylist(rows, schema=COVERAGE_TABLE)
-    pq.write_table(table, parquet_path)
-
-
-# ----------------------------------------------------------------------
-# Implicit discovery (no session.toml)
-# ----------------------------------------------------------------------
-
-
-def test_discover_walks_standard_layout(tmp_path: Path) -> None:
-    root = tmp_path / "run-2026-05-09"
-    _write_genome(root / "genome")
-    _write_coverage(
-        root / "S2_align" / "coverage.parquet",
-        [{"contig_id": 1, "sample_id": -1, "start": 0, "end": 100, "depth": 5}],
-    )
-
-    session = Session.from_root(root)
-    assert session.root == root.resolve()
-    assert session.reference_genome == (root / "genome").resolve()
-    assert session.coverage == (root / "S2_align" / "coverage.parquet").resolve()
-    # Slot we didn't populate stays None
-    assert session.clusters is None
-    # Stages-present is the small surface the dashboard reads
+    kinds = [src.kind for src in session.sources]
+    assert kinds == ["align", "align", "cluster"]
     assert session.stages_present()["coverage"] is True
-    assert session.stages_present()["clusters"] is False
+    assert session.stages_present()["has_align_sources"] is True
+    assert session.stages_present()["has_cluster_sources"] is True
 
 
-def test_discover_session_id_is_stable_across_calls(tmp_path: Path) -> None:
-    root = tmp_path / "myrun"
-    root.mkdir()
-    a = Session.from_root(root)
-    b = Session.from_root(root)
-    assert a.session_id == b.session_id
-    # The id encodes the root's basename for human readability
-    assert "myrun" in a.session_id
-
-
-def test_discover_drops_missing_paths(tmp_path: Path) -> None:
-    root = tmp_path / "run"
-    # Layout exists but the parquet file is missing
-    (root / "S2_align").mkdir(parents=True)
-    session = Session.from_root(root)
-    # _drop_missing should clear the stale slot
-    assert session.coverage is None
-
-
-# ----------------------------------------------------------------------
-# session.toml explicit form
-# ----------------------------------------------------------------------
-
-
-def test_session_toml_overrides_directory_walk(tmp_path: Path) -> None:
-    root = tmp_path / "run"
-    root.mkdir()
-    _write_genome(root / "refs" / "Pichia")
-    _write_coverage(
-        root / "outputs" / "coverage.parquet",
-        [{"contig_id": 1, "sample_id": -1, "start": 0, "end": 50, "depth": 3}],
+def test_open_mismatched_assembly_emits_warning(
+    tmp_path: Path, monkeypatch
+) -> None:
+    session = build_viz_session(
+        tmp_path,
+        monkeypatch,
+        assembly_accession="ChosenAssembly.X",
+        align_sources=[
+            {
+                "assembly_accession": "OtherAssembly.Y",
+                "coverage": [
+                    {"contig_id": 1, "sample_id": -1, "start": 0, "end": 10, "depth": 1}
+                ],
+            }
+        ],
     )
-    (root / "session.toml").write_text(
-        """
-schema_version = 1
-label = "explicit-layout"
-
-[reference]
-genome = "refs/Pichia"
-
-[stages.s2_align]
-path = "outputs"
-coverage = "coverage.parquet"
-samples = ["sample_a", "sample_b"]
-"""
+    assert any("OtherAssembly.Y" in w for w in session.warnings)
+    # Same-assembly source emits no warning even when handle differs.
+    session2 = build_viz_session(
+        tmp_path / "second",
+        monkeypatch,
+        assembly_accession="ChosenAssembly.X",
+        align_sources=[
+            {
+                "assembly_accession": "ChosenAssembly.X",
+                "coverage": [
+                    {"contig_id": 1, "sample_id": -1, "start": 0, "end": 10, "depth": 1}
+                ],
+            }
+        ],
     )
-    session = Session.from_root(root)
-    assert session.label == "explicit-layout"
-    assert session.reference_genome == (root / "refs" / "Pichia").resolve()
-    assert session.coverage == (root / "outputs" / "coverage.parquet").resolve()
-    assert session.samples == ("sample_a", "sample_b")
+    assert session2.warnings == ()
 
 
-def test_session_toml_handle_resolves_via_cache(tmp_path: Path, monkeypatch) -> None:
-    """``[reference] handle = "..."`` looks up the cache and resolves to it."""
-    cache = tmp_path / "cache"
-    cache.mkdir()
-    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache))
+def test_open_legacy_manifest_is_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cache_root = tmp_path / "refs"
+    cache_root.mkdir()
+    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache_root))
+    install_fake_reference(cache_root)
+    legacy = tmp_path / "legacy-align"
+    legacy.mkdir()
+    (legacy / "manifest.json").write_text(
+        json.dumps(
+            {
+                # Pre-v2 manifest shape — no schema_version=2, no kind.
+                "demux_dir": "/somewhere",
+                "reference": "/old/path",
+                "outputs": {},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="schema_version"):
+        Session.open(
+            reference_handle=DEFAULT_HANDLE,
+            sources=[{"path": str(legacy), "kind": "align"}],
+        )
+
+
+def test_open_handle_kind_mismatch_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Asserting kind='cluster' on an align source must fail loudly."""
+    session_dir = build_viz_session(
+        tmp_path,
+        monkeypatch,
+        align_sources=[{"coverage": []}],
+    )
+    # Build a fresh align source dir we can mis-tag.
+    cache_root = tmp_path / "refs"
+    align_dir = tmp_path / "rogue-align"
+    write_align_source(
+        align_dir,
+        reference_path=str(cache_root / "test_org" / "local_import-20260522"),
+    )
+    with pytest.raises(ValueError, match="kind"):
+        Session.open(
+            reference_handle=DEFAULT_HANDLE,
+            sources=[{"path": str(align_dir), "kind": "cluster"}],
+        )
+    # Sanity: session_dir was built ok and supports to_manifest().
+    payload = session_dir.to_manifest()
+    assert payload["session_id"] == session_dir.session_id
+
+
+def test_open_resolves_cwd_relative_outputs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Manifests written by the pre-fix CLI store ``outputs.*`` as paths
+    relative to the cwd the CLI was run from — they include the source
+    dir's own basename as a prefix (e.g. ``align_run/coverage.parquet``).
+    The session loader's fallback resolves those to the actual file on
+    disk, so slots populate and kernel bindings appear.
+    """
+    import json
+
+    from constellation.sequencing.schemas.quant import COVERAGE_TABLE
+    from constellation.sequencing.transcriptome.manifest import (
+        MANIFEST_SCHEMA_VERSION,
+    )
+
+    # Standard fake reference.
+    cache_root = tmp_path / "refs"
+    cache_root.mkdir()
+    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache_root))
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    install_fake_reference(cache_root)
 
-    # Populate the cache with a fake install.
-    release_dir = cache / "pichia_pastoris" / "ensembl_genomes-57"
-    _write_genome(release_dir / "genome")
-    (release_dir / "annotation").mkdir()
-    (release_dir / "annotation" / "manifest.json").write_text("{}")
-    # Write an empty features.parquet so Session._drop_missing keeps the slot.
+    # Build a source dir with a real coverage.parquet, and a manifest
+    # whose `outputs.coverage` carries the cwd-relative form
+    # ``<source-name>/coverage.parquet`` (matching the pre-fix CLI).
+    align_dir = tmp_path / "align_run"
+    align_dir.mkdir()
     pq.write_table(
-        pa.table({"feature_id": pa.array([], pa.int64())}),
-        release_dir / "annotation" / "features.parquet",
+        pa.Table.from_pylist(
+            [{"contig_id": 1, "sample_id": -1, "start": 0, "end": 50, "depth": 7}],
+            schema=COVERAGE_TABLE,
+        ),
+        align_dir / "coverage.parquet",
     )
+    manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "kind": "align",
+        "reference_handle": DEFAULT_HANDLE,
+        "reference_path": str(cache_root / "test_org" / "local_import-20260522"),
+        "assembly_accession": DEFAULT_ASSEMBLY,
+        "created_at": "2026-05-23T00:00:00Z",
+        "demux_dir": "",
+        "input_files": [],
+        "parameters": {},
+        "stages": {},
+        "outputs": {"coverage": "align_run/coverage.parquet"},
+        "samples": None,
+    }
+    (align_dir / "manifest.json").write_text(json.dumps(manifest))
 
-    root = tmp_path / "analysis"
-    root.mkdir()
-    (root / "session.toml").write_text(
-        """
-schema_version = 1
-label = "handle-based"
-
-[reference]
-handle = "pichia_pastoris@ensembl_genomes-57"
-"""
+    session = Session.open(
+        reference_handle=DEFAULT_HANDLE,
+        sources=[{"path": str(align_dir), "kind": "align"}],
     )
-    session = Session.from_root(root)
-    assert session.reference_genome == (release_dir / "genome").resolve()
-    assert session.reference_annotation == (release_dir / "annotation").resolve()
+    assert session.sources[0].coverage == (align_dir / "coverage.parquet").resolve()
 
 
-def test_session_toml_explicit_path_overrides_handle(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """When both ``[reference] genome`` and ``handle`` are set, the
-    explicit path wins (per the documented precedence)."""
-    cache = tmp_path / "cache"
-    cache.mkdir()
-    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache))
-    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-
-    cache_release = cache / "pichia_pastoris" / "ensembl_genomes-57"
-    _write_genome(cache_release / "genome")
-    (cache_release / "annotation").mkdir()
-
-    root = tmp_path / "analysis"
-    root.mkdir()
-    _write_genome(root / "local_refs" / "genome")
-    (root / "session.toml").write_text(
-        """
-schema_version = 1
-
-[reference]
-genome = "local_refs/genome"
-handle = "pichia_pastoris@ensembl_genomes-57"
-"""
+def test_to_manifest_round_trips(tmp_path: Path, monkeypatch) -> None:
+    session = build_viz_session(
+        tmp_path,
+        monkeypatch,
+        align_sources=[
+            {
+                "coverage": [
+                    {"contig_id": 1, "sample_id": -1, "start": 0, "end": 100, "depth": 5}
+                ],
+            }
+        ],
     )
-    session = Session.from_root(root)
-    # Explicit path won.
-    assert session.reference_genome == (root / "local_refs" / "genome").resolve()
-    # Annotation falls back to the handle since no explicit annotation path.
-    assert session.reference_annotation == (cache_release / "annotation").resolve()
-
-
-def test_session_toml_handle_missing_install_errors(
-    tmp_path: Path, monkeypatch
-) -> None:
-    cache = tmp_path / "cache"
-    cache.mkdir()
-    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache))
-    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-
-    root = tmp_path / "analysis"
-    root.mkdir()
-    (root / "session.toml").write_text(
-        """
-schema_version = 1
-
-[reference]
-handle = "homo_sapiens@ensembl-111"
-"""
-    )
-    with pytest.raises(ValueError, match="no cached reference"):
-        Session.from_root(root)
-
-
-def test_session_toml_rejects_unknown_schema_version(tmp_path: Path) -> None:
-    root = tmp_path / "analysis"
-    root.mkdir()
-    (root / "session.toml").write_text("schema_version = 99\n")
-    with pytest.raises(ValueError, match="schema_version=99"):
-        Session.from_root(root)
-
-
-def test_to_manifest_round_trips(tmp_path: Path) -> None:
-    root = tmp_path / "run"
-    _write_genome(root / "genome")
-    _write_coverage(
-        root / "S2_align" / "coverage.parquet",
-        [{"contig_id": 1, "sample_id": -1, "start": 0, "end": 100, "depth": 5}],
-    )
-    session = Session.from_root(root)
     manifest = session.to_manifest()
     assert manifest["session_id"] == session.session_id
-    assert manifest["paths"]["coverage"] == "S2_align/coverage.parquet"
-    assert manifest["paths"]["clusters"] is None
+    assert manifest["reference"]["handle"] == session.reference_handle
+    assert manifest["reference"]["assembly_accession"] == DEFAULT_ASSEMBLY
+    assert manifest["sources"][0]["kind"] == "align"
+    assert manifest["sources"][0]["slots"]["coverage"] is not None
     assert manifest["stages_present"]["coverage"] is True
+
+
+def test_open_unknown_handle_errors(tmp_path: Path, monkeypatch) -> None:
+    cache_root = tmp_path / "refs"
+    cache_root.mkdir()
+    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache_root))
+    with pytest.raises(ValueError, match="could not be resolved"):
+        Session.open(
+            reference_handle="missing_org@local_import-20260522",
+            sources=[],
+        )

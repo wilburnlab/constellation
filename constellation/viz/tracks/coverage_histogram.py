@@ -1,6 +1,6 @@
 """Coverage histogram track — per-sample read depth as RLE step series.
 
-Reads `<root>/S2_align/coverage.parquet` (`COVERAGE_TABLE` schema, RLE
+Reads each align source's `coverage.parquet` (`COVERAGE_TABLE` schema, RLE
 intervals: `contig_id`, `sample_id`, `start`, `end`, `depth`). Emits a
 single vector payload per query; the TS renderer draws one `<path>` per
 sample.
@@ -36,6 +36,7 @@ from constellation.viz.tracks.base import (
     TrackBinding,
     TrackKernel,
     TrackQuery,
+    iter_sources_with,
     register_track,
 )
 
@@ -66,26 +67,34 @@ class CoverageHistogramKernel(TrackKernel):
     vector_bp_per_pixel_limit = float("inf")
 
     def discover(self, session: Session) -> list[TrackBinding]:
-        if session.coverage is None or session.reference_genome is None:
+        if session.reference_genome is None:
             return []
-        return [
-            TrackBinding(
-                session_id=session.session_id,
-                kind=self.kind,
-                binding_id="coverage",
-                label="Coverage (depth)",
-                paths={
-                    "coverage": session.coverage,
-                    "genome": session.reference_genome,
-                },
-                config={
-                    # Renderer chooses palette per-sample; supply a
-                    # sensible default order so colors are stable across
-                    # reloads of the same session.
-                    "samples": list(session.samples),
-                },
+        bindings: list[TrackBinding] = []
+        for idx, src in iter_sources_with(session, "coverage"):
+            label = (
+                f"Coverage ({src.label})"
+                if len(session.sources) > 1
+                else "Coverage (depth)"
             )
-        ]
+            bindings.append(
+                TrackBinding(
+                    session_id=session.session_id,
+                    kind=self.kind,
+                    binding_id=f"coverage-{idx}",
+                    label=label,
+                    paths={
+                        "coverage": src.coverage,
+                        "genome": session.reference_genome,
+                    },
+                    config={
+                        # Renderer chooses palette per-sample; supply a
+                        # sensible default order so colors are stable across
+                        # reloads of the same session.
+                        "samples": list(src.samples),
+                    },
+                )
+            )
+        return bindings
 
     def metadata(self, binding: TrackBinding) -> dict[str, Any]:
         # Min/max depth is useful for the renderer's y-scale; we read

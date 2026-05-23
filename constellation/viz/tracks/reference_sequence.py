@@ -1,6 +1,6 @@
 """Reference-sequence track — per-base nucleotides at deep zoom.
 
-Reads `<root>/genome/sequences.parquet` (`SEQUENCE_TABLE`: one row per
+Reads `session.reference_genome / "sequences.parquet"` (`SEQUENCE_TABLE`: one row per
 contig with the full nucleotide string). The kernel slices the sequence
 for the visible window and ships per-base records — the renderer draws
 letters at deep zoom, dashes / colored stripes at moderate zoom, and a

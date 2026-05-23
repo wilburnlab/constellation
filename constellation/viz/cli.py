@@ -39,15 +39,60 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         help="IGV-style genome browser over a session's parquet outputs",
     )
     p_genome.add_argument(
-        "--session",
-        required=True,
+        "--saved-session",
+        default=None,
+        help=(
+            "open a saved session by slug (see "
+            "`~/.constellation/sessions/`). Mutually exclusive with the "
+            "`--reference + --align-dir + --cluster-dir` shape."
+        ),
+    )
+    p_genome.add_argument(
+        "--reference",
+        default=None,
+        help=(
+            "reference cache handle (e.g. `homo_sapiens@ensembl-111`). "
+            "Resolved against the per-user reference cache. For an "
+            "off-cache ad-hoc reference dir, use `--reference-dir` "
+            "(escape hatch)."
+        ),
+    )
+    p_genome.add_argument(
+        "--reference-dir",
+        default=None,
         type=Path,
         help=(
-            "Path to a session root containing reference + alignment "
-            "outputs. The directory may include `session.toml` for "
-            "explicit layout, or follow the standard `genome/`, "
-            "`annotation/`, `S2_align/`, `S2_cluster/` convention."
+            "escape hatch — bare path to a `genome/` + `annotation/` "
+            "reference root. Mutually exclusive with `--reference`."
         ),
+    )
+    p_genome.add_argument(
+        "--align-dir",
+        action="append",
+        default=None,
+        type=Path,
+        metavar="DIR",
+        help=(
+            "directory written by `constellation transcriptome align`. "
+            "Repeatable — pass multiple `--align-dir` flags to layer "
+            "additional align sources onto the same reference."
+        ),
+    )
+    p_genome.add_argument(
+        "--cluster-dir",
+        action="append",
+        default=None,
+        type=Path,
+        metavar="DIR",
+        help=(
+            "directory written by `constellation transcriptome cluster`. "
+            "Repeatable; layered alongside `--align-dir` sources."
+        ),
+    )
+    p_genome.add_argument(
+        "--label",
+        default=None,
+        help="human-readable label for the standalone session (default: reference name).",
     )
     p_genome.add_argument(
         "--host",
@@ -225,21 +270,98 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
     Heavy imports stay inside the handler so the top-level
     `constellation` CLI doesn't pay for them on unrelated subcommands
     (matches the `_cmd_doctor` pattern for thirdparty discovery).
+
+    Two mutually-exclusive entry shapes:
+      1. `--saved-session <slug>` — load a previously persisted session.
+      2. `--reference <handle> [--reference-dir <PATH>]` + at least one
+         `--align-dir` / `--cluster-dir` — ad-hoc one-shot session.
     """
     from constellation.viz.server.app import create_app
-    from constellation.viz.server.session import Session
+    from constellation.viz.server.session import Session, _from_saved_session
+    from constellation.viz.sessions import read_saved
 
-    try:
-        session = Session.from_root(args.session)
-    except FileNotFoundError as exc:
-        print(f"error: {exc}")
-        return 2
+    align_dirs = list(args.align_dir or [])
+    cluster_dirs = list(args.cluster_dir or [])
+
+    if args.saved_session is not None:
+        # Cannot mix the two entry shapes.
+        if (
+            args.reference is not None
+            or args.reference_dir is not None
+            or align_dirs
+            or cluster_dirs
+        ):
+            print(
+                "error: --saved-session is mutually exclusive with "
+                "--reference / --reference-dir / --align-dir / --cluster-dir",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            saved = read_saved(args.saved_session)
+        except FileNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        try:
+            session = _from_saved_session(saved)
+        except ValueError as exc:
+            print(f"error opening saved session: {exc}", file=sys.stderr)
+            return 1
+    else:
+        if args.reference is None and args.reference_dir is None:
+            print(
+                "error: pass either --saved-session <slug> or "
+                "--reference <handle> (+ at least one --align-dir or "
+                "--cluster-dir)",
+                file=sys.stderr,
+            )
+            return 2
+        if args.reference is not None and args.reference_dir is not None:
+            print(
+                "error: --reference and --reference-dir are mutually exclusive",
+                file=sys.stderr,
+            )
+            return 2
+        if not align_dirs and not cluster_dirs:
+            print(
+                "error: at least one --align-dir or --cluster-dir is required",
+                file=sys.stderr,
+            )
+            return 2
+        if args.reference_dir is not None:
+            print(
+                "error: --reference-dir is not supported for the genome "
+                "browser entry — import the reference into the cache via "
+                "`constellation reference import` and pass --reference "
+                "<handle> instead.",
+                file=sys.stderr,
+            )
+            return 2
+        sources = [
+            {"path": str(p), "kind": "align", "label": Path(p).name}
+            for p in align_dirs
+        ] + [
+            {"path": str(p), "kind": "cluster", "label": Path(p).name}
+            for p in cluster_dirs
+        ]
+        try:
+            session = Session.open(
+                reference_handle=args.reference,
+                sources=sources,
+                label=args.label,
+            )
+        except ValueError as exc:
+            print(f"error opening session: {exc}", file=sys.stderr)
+            return 1
 
     port = args.port if args.port != 0 else _free_port(args.host)
     url = f"http://{args.host}:{port}"
     print(f"constellation viz genome — session: {session.label}")
-    print(f"  root: {session.root}")
-    print(f"  url:  {url}")
+    print(f"  reference: {session.reference_handle}")
+    print(f"  sources:   {len(session.sources)}")
+    print(f"  url:       {url}")
+    for warning in session.warnings:
+        print(f"  warning:  {warning}")
 
     if not args.no_browser:
         # Defer the browser open until uvicorn has actually bound the

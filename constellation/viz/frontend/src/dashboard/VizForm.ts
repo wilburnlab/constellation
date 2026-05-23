@@ -52,7 +52,7 @@ export class VizForm {
     section.className = 'form-section';
     element.appendChild(section);
 
-    for (const field of this.descriptor.fields) {
+    for (const field of this.descriptor.fields ?? []) {
       const row = document.createElement('div');
       row.className = 'form-row';
 
@@ -97,7 +97,7 @@ export class VizForm {
     const submit = document.createElement('button');
     submit.type = 'button';
     submit.className = 'run';
-    submit.textContent = this.descriptor.submitLabel;
+    submit.textContent = this.descriptor.submitLabel ?? 'Open';
     submit.addEventListener('click', () => void this.submit());
     actions.appendChild(submit);
     const err = document.createElement('span');
@@ -123,7 +123,8 @@ export class VizForm {
   async submit(): Promise<void> {
     if (!this.submitBtn) return;
     const values: Record<string, string> = {};
-    for (const field of this.descriptor.fields) {
+    const fields = this.descriptor.fields ?? [];
+    for (const field of fields) {
       const input = this.inputs.get(field.name);
       const raw = (input?.value ?? '').trim();
       values[field.name] = raw;
@@ -133,7 +134,7 @@ export class VizForm {
         return;
       }
     }
-    for (const field of this.descriptor.fields) {
+    for (const field of fields) {
       if (field.remember) writeStored(field.name, values[field.name]);
     }
     this.showError('');
@@ -148,7 +149,7 @@ export class VizForm {
 
   private updateSubmitButton(): void {
     if (!this.submitBtn) return;
-    const ok = this.descriptor.fields.every((f) => {
+    const ok = (this.descriptor.fields ?? []).every((f) => {
       if (!f.required) return true;
       const input = this.inputs.get(f.name);
       return Boolean(input && input.value.trim());

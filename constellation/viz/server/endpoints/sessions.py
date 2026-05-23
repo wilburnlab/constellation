@@ -1,22 +1,25 @@
-"""Session-discovery endpoints.
+"""Session endpoints — register, inspect, and search.
 
-A viz server holds a small in-memory registry of `Session` objects keyed
-by `session_id`. The registry is populated at app startup from the CLI's
-`--session DIR` argument (PR 1 mounts exactly one); the dashboard boots
-empty and registers sessions on demand via `POST /api/sessions`.
+The dashboard registers a session via ``POST /api/sessions/open`` with a
+reference handle plus a list of data-source directories. The legacy
+``POST /api/sessions {path}`` endpoint (which assumed a session-root
+directory layout) was removed in the reference-cache-first cutover.
 
 Endpoints:
 
-- `GET /api/sessions`                          → list of session summaries
-- `POST /api/sessions {path}`                  → register a session by directory path
-- `GET /api/sessions/{session_id}/manifest`    → resolved manifest JSON
-- `GET /api/sessions/{session_id}/contigs`     → CONTIG_TABLE summary
-- `GET /api/sessions/{session_id}/search`      → annotation-feature search
+- ``GET /api/sessions``                            → list summaries
+- ``POST /api/sessions/open``                      → register a new session
+- ``POST /api/sessions/inspect-source``            → auto-detect kind + handle
+- ``GET /api/sessions/{session_id}/manifest``      → resolved manifest JSON
+- ``GET /api/sessions/{session_id}/contigs``       → contig list for the
+                                                     reference genome
+- ``GET /api/sessions/{session_id}/search``        → annotation-feature search
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -31,17 +34,22 @@ from constellation.viz.server.session import Session
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 
+# ----------------------------------------------------------------------
+# Summaries + manifest
+# ----------------------------------------------------------------------
+
+
 def _summarize(session: Session) -> dict:
     return {
         "session_id": session.session_id,
         "label": session.label,
-        "root": str(session.root),
+        "reference_handle": session.reference_handle,
+        "reference_path": str(session.reference_path),
+        "n_sources": len(session.sources),
         "stages_present": session.stages_present(),
+        "warnings": list(session.warnings),
+        "saved_as": session.saved_as,
     }
-
-
-class RegisterSessionRequest(BaseModel):
-    path: str
 
 
 @router.get("")
@@ -51,24 +59,42 @@ def list_sessions(request: Request) -> list[dict]:
     return [_summarize(s) for s in sessions.values()]
 
 
-@router.post("", status_code=201)
-def register_session(body: RegisterSessionRequest, request: Request) -> dict:
-    """Register (or re-register) a session by directory path.
+# ----------------------------------------------------------------------
+# Open (new reference-cache-first flow)
+# ----------------------------------------------------------------------
 
-    The path is resolved via `Session.from_root`, which prefers an
-    explicit `session.toml` and falls back to a directory-walk discovery.
-    Re-POSTing the same path is idempotent — `session_id` is derived from
-    the resolved root, so the registry entry is overwritten in place. Any
-    cached track bindings for that `session_id` are evicted so the next
-    discovery call reflects the freshly-registered session contents.
+
+class SourceEntry(BaseModel):
+    path: str
+    kind: str | None = None
+    label: str | None = None
+
+
+class OpenSessionRequest(BaseModel):
+    reference_handle: str
+    sources: list[SourceEntry] = []
+    label: str | None = None
+    saved_as: str | None = None
+
+
+@router.post("/open", status_code=201)
+def open_session(body: OpenSessionRequest, request: Request) -> dict:
+    """Construct a session from a reference handle + data-source list.
+
+    The reference handle is resolved against the per-user reference
+    cache; each source's ``manifest.json`` is read to populate the
+    per-stage artifact slots. Sources whose ``assembly_accession``
+    differs from the chosen reference emit an entry in the response's
+    ``warnings`` list — the dashboard surfaces those inline but does not
+    block the open.
     """
-    raw = (body.path or "").strip()
-    if not raw:
-        raise HTTPException(400, "path must be a non-empty string")
     try:
-        session = Session.from_root(Path(raw).expanduser())
-    except FileNotFoundError as exc:
-        raise HTTPException(404, str(exc)) from exc
+        session = Session.open(
+            reference_handle=body.reference_handle,
+            sources=[s.model_dump() for s in body.sources],
+            label=body.label,
+            saved_as=body.saved_as,
+        )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -83,6 +109,47 @@ def register_session(body: RegisterSessionRequest, request: Request) -> dict:
     return _summarize(session)
 
 
+# ----------------------------------------------------------------------
+# Inspect-source — autofill the multi-row form's kind/handle fields
+# ----------------------------------------------------------------------
+
+
+class InspectSourceRequest(BaseModel):
+    path: str
+
+
+@router.post("/inspect-source")
+def inspect_source(body: InspectSourceRequest) -> dict[str, Any]:
+    """Read a source dir's ``manifest.json`` and return key descriptive
+    fields. Used by the dashboard form to auto-detect kind and surface
+    reference-handle mismatch warnings before the user submits.
+    """
+    from constellation.sequencing.transcriptome.manifest import (
+        read_manifest_dir,
+    )
+
+    path = Path(body.path).expanduser()
+    if not path.is_dir():
+        raise HTTPException(400, f"not a directory: {path}")
+    try:
+        manifest = read_manifest_dir(path)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "path": str(path.resolve()),
+        "kind": manifest.kind,
+        "reference_handle": manifest.reference_handle,
+        "reference_path": getattr(manifest, "reference_path", None),
+        "assembly_accession": manifest.assembly_accession,
+        "samples": list(manifest.samples or ()),
+    }
+
+
+# ----------------------------------------------------------------------
+# Manifest + contigs (existing endpoints, repointed at new shape)
+# ----------------------------------------------------------------------
+
+
 @router.get("/{session_id}/manifest")
 def get_manifest(session_id: str, request: Request) -> dict:
     sessions: dict = request.app.state.sessions
@@ -94,7 +161,7 @@ def get_manifest(session_id: str, request: Request) -> dict:
 
 @router.get("/{session_id}/contigs")
 def get_contigs(session_id: str, request: Request) -> list[dict]:
-    """Return `[{contig, length}]` for the session's reference genome.
+    """Return ``[{contig, length}]`` for the session's reference genome.
 
     The frontend uses this to populate the locus picker. Returns 404 if
     the session has no reference attached.
@@ -124,15 +191,10 @@ def get_contigs(session_id: str, request: Request) -> list[dict]:
     return out
 
 
-# v1 hardcodes (table=annotation, column=name); v2 (next PR) will accept
-# `table` + `column` query params for an advanced column-picker mode.
-# Bindings the v1 endpoint scans, in display-priority order — reference
-# annotations land before constellation-derived ones because users
-# searching by gene name typically want the curated hit first.
-_ANNOTATION_BINDINGS: tuple[tuple[str, str], ...] = (
-    ("reference_annotation", "reference"),
-    ("derived_annotation", "derived"),
-)
+# ----------------------------------------------------------------------
+# Feature search (unchanged — uses the new Session shape's reference
+# slots and per-source derived annotations)
+# ----------------------------------------------------------------------
 
 
 @router.get("/{session_id}/search")
@@ -144,11 +206,12 @@ def search_features(
 ) -> list[dict]:
     """Case-insensitive substring match against annotation features.
 
-    Scans both `reference_annotation/features.parquet` and
-    `derived_annotation/features.parquet` when present; tags each hit
-    with a `source` field so the client can show which annotation
-    bundle produced it. A purely-numeric `q` also matches `feature_id`
-    exactly. Returns up to `limit` rows, reference hits first.
+    Scans the curated ``reference_annotation/features.parquet`` plus
+    each align source's ``derived_annotation/features.parquet`` when
+    present; tags each hit with a ``source`` field so the client can
+    show which annotation bundle produced it. A purely-numeric ``q``
+    also matches ``feature_id`` exactly. Returns up to ``limit`` rows,
+    reference hits first.
     """
     sessions: dict = request.app.state.sessions
     session = sessions.get(session_id)
@@ -172,16 +235,23 @@ def search_features(
         numeric_id = None
 
     out: list[dict] = []
-    for slot, source in _ANNOTATION_BINDINGS:
-        if len(out) >= limit:
-            break
-        annotation_dir = getattr(session, slot, None)
+    # Reference annotation first (curated wins display order), then each
+    # source's derived annotation in the order the user added them.
+    ordered: list[tuple[Path | None, str]] = [
+        (session.reference_annotation, "reference"),
+    ]
+    for src in session.sources:
+        if src.derived_annotation is not None:
+            ordered.append((src.derived_annotation, f"derived ({src.label})"))
+
+    for annotation_dir, source_tag in ordered:
         if annotation_dir is None:
             continue
+        if len(out) >= limit:
+            break
         features_path = annotation_dir / "features.parquet"
         if not features_path.exists():
             continue
-
         remaining = limit - len(out)
         rows = _search_features_in_parquet(
             features_path=features_path,
@@ -202,7 +272,7 @@ def search_features(
                     "contig_name": contig_name,
                     "start": int(row["start"]),
                     "end": int(row["end"]),
-                    "source": source,
+                    "source": source_tag,
                 }
             )
             if len(out) >= limit:
