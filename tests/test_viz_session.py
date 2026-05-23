@@ -189,6 +189,64 @@ def test_open_handle_kind_mismatch_raises(
     assert payload["session_id"] == session_dir.session_id
 
 
+def test_open_resolves_cwd_relative_outputs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Manifests written by the pre-fix CLI store ``outputs.*`` as paths
+    relative to the cwd the CLI was run from — they include the source
+    dir's own basename as a prefix (e.g. ``align_run/coverage.parquet``).
+    The session loader's fallback resolves those to the actual file on
+    disk, so slots populate and kernel bindings appear.
+    """
+    import json
+
+    from constellation.sequencing.schemas.quant import COVERAGE_TABLE
+    from constellation.sequencing.transcriptome.manifest import (
+        MANIFEST_SCHEMA_VERSION,
+    )
+
+    # Standard fake reference.
+    cache_root = tmp_path / "refs"
+    cache_root.mkdir()
+    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache_root))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    install_fake_reference(cache_root)
+
+    # Build a source dir with a real coverage.parquet, and a manifest
+    # whose `outputs.coverage` carries the cwd-relative form
+    # ``<source-name>/coverage.parquet`` (matching the pre-fix CLI).
+    align_dir = tmp_path / "align_run"
+    align_dir.mkdir()
+    pq.write_table(
+        pa.Table.from_pylist(
+            [{"contig_id": 1, "sample_id": -1, "start": 0, "end": 50, "depth": 7}],
+            schema=COVERAGE_TABLE,
+        ),
+        align_dir / "coverage.parquet",
+    )
+    manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "kind": "align",
+        "reference_handle": DEFAULT_HANDLE,
+        "reference_path": str(cache_root / "test_org" / "local_import-20260522"),
+        "assembly_accession": DEFAULT_ASSEMBLY,
+        "created_at": "2026-05-23T00:00:00Z",
+        "demux_dir": "",
+        "input_files": [],
+        "parameters": {},
+        "stages": {},
+        "outputs": {"coverage": "align_run/coverage.parquet"},
+        "samples": None,
+    }
+    (align_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    session = Session.open(
+        reference_handle=DEFAULT_HANDLE,
+        sources=[{"path": str(align_dir), "kind": "align"}],
+    )
+    assert session.sources[0].coverage == (align_dir / "coverage.parquet").resolve()
+
+
 def test_to_manifest_round_trips(tmp_path: Path, monkeypatch) -> None:
     session = build_viz_session(
         tmp_path,

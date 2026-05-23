@@ -354,16 +354,32 @@ def _load_source(entry: dict[str, Any]) -> SessionSource:
 
 
 def _resolve_slot(base: Path, rel: str) -> Path | None:
-    """Resolve a manifest-recorded artifact path relative to the source dir.
+    """Resolve a manifest-recorded artifact path against the source dir.
 
-    Manifests may store either absolute paths (current align CLI does)
-    or relative paths. We accept both; the canonical in-memory form is
-    always absolute. Returns ``None`` if the path doesn't exist on disk.
+    Manifests may record paths in any of three shapes:
+      1. absolute (post-fix CLI writes these)
+      2. relative to the source dir itself (``coverage.parquet``)
+      3. relative to the cwd the producing CLI was run from
+         (``<source-name>/coverage.parquet`` — the pre-fix shape, which
+         is what manifests written before this fix carry)
+
+    Try (1), then (2), then (3); return the first that resolves and
+    exists on disk. ``None`` when none do — the kernel then skips that
+    slot.
     """
     candidate = Path(rel)
-    if not candidate.is_absolute():
-        candidate = (base / candidate).resolve()
-    return candidate if candidate.exists() else None
+    if candidate.is_absolute():
+        return candidate if candidate.exists() else None
+    relative_to_source = (base / candidate).resolve()
+    if relative_to_source.exists():
+        return relative_to_source
+    # Fallback: the producing CLI wrote a path relative to its cwd, and
+    # the rel path therefore starts with the source dir's own basename.
+    # Resolving against the source dir's parent reproduces that cwd.
+    relative_to_parent = (base.parent / candidate).resolve()
+    if relative_to_parent.exists():
+        return relative_to_parent
+    return None
 
 
 # ----------------------------------------------------------------------

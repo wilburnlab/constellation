@@ -1154,7 +1154,13 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             f"reference must contain genome/ + annotation/ subdirs: {reference}"
         )
 
-    output_dir = Path(args.output_dir)
+    # Resolve --output-dir to an absolute path before any artifact paths
+    # are constructed: manifest.json writes record `outputs.*` as `str(
+    # output_dir / 'coverage.parquet')` etc., and downstream readers
+    # (the viz session loader, future cross-validation passes) require
+    # those paths to be unambiguous regardless of which directory the
+    # consumer is running from.
+    output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     if (output_dir / "_SUCCESS").exists() and not args.resume:
         print(
@@ -1607,7 +1613,11 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             f"--demux-dir missing reads/: {demux_dir}"
         )
 
-    output_dir = Path(args.output_dir)
+    # Resolve --output-dir to absolute so manifest.json's `outputs.*`
+    # paths are unambiguous to downstream readers (the viz session
+    # loader, future cross-validation passes). See the matching comment
+    # in `_cmd_transcriptome_align`.
+    output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     if (output_dir / "_SUCCESS").exists() and not args.resume:
         print(
