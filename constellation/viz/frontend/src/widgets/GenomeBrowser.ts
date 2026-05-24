@@ -16,6 +16,7 @@
 // consumes a (table, mode, ctx) tuple. Per-feature host UI state
 // (showLabels) rides on the RenderContext.
 
+import { Table } from 'apache-arrow';
 import { axisBottom } from 'd3-axis';
 import { select } from 'd3-selection';
 import {
@@ -36,6 +37,12 @@ import {
   DatasetManagerPopover,
   SourceRow,
 } from './DatasetManagerPopover';
+import {
+  BrowserOptions,
+  DEFAULT_BROWSER_OPTIONS,
+  OptionsPopover,
+} from './OptionsPopover';
+import { TrackSettingsPanel } from './TrackSettingsPanel';
 import './GenomeBrowser.css';
 
 interface ContigInfo {
@@ -59,11 +66,17 @@ interface MountedTrack {
   statusEl: HTMLElement;
   bodyHost: HTMLElement;
   collapseBtn: HTMLButtonElement;
+  settingsBtn: HTMLButtonElement;
   hideBtn: HTMLButtonElement;
   visible: boolean;
   collapsed: boolean;
   heightPx: number;
   displayOrder: number;
+  style: Record<string, unknown>;
+  filter: Record<string, unknown>;
+  /** Last successfully fetched Arrow data + locus. Reused by
+   *  restyleTrack() so style/filter changes don't trigger a refetch. */
+  lastFetched?: { table: Table; mode: TrackMode; locusKey: string };
   cancel?: AbortController;
 }
 
@@ -74,7 +87,10 @@ interface TrackLayoutEntry {
   display_order: number;
   height_px: number;
   collapsed: boolean;
+  style?: Record<string, unknown>;
+  filter?: Record<string, unknown>;
 }
+
 
 interface SessionManifest {
   session_id: string;
@@ -125,6 +141,8 @@ export interface GenomeBrowserOptions {
 const LABELS_KEY = 'constellation.genome.labels';
 const layoutStorageKey = (sessionId: string): string =>
   `constellation.genome.layout.${sessionId}`;
+const optionsStorageKey = (sessionId: string): string =>
+  `constellation.genome.options.${sessionId}`;
 const OVERVIEW_HEIGHT = 18;
 const RULER_HEIGHT = 28;
 const COLLAPSED_BODY_HEIGHT = 0;
@@ -169,10 +187,15 @@ export class GenomeBrowser {
   private searchTimer: number | null = null;
   private searchAbort: AbortController | null = null;
   private datasetBtn!: HTMLButtonElement;
+  private optionsBtn!: HTMLButtonElement;
   private trackCountStatus!: HTMLElement;
   private popover: DatasetManagerPopover | null = null;
+  private optionsPopover: OptionsPopover | null = null;
+  private settingsPopover: TrackSettingsPanel | null = null;
+  private settingsAnchor: MountedTrack | null = null;
   private persistTimer: number | null = null;
   private dragSourceTrack: MountedTrack | null = null;
+  private options: BrowserOptions = { ...DEFAULT_BROWSER_OPTIONS };
 
   constructor(opts: GenomeBrowserOptions) {
     this.host = opts.host;
@@ -265,6 +288,11 @@ export class GenomeBrowser {
     this.detachPanZoom = null;
     this.popover?.dispose();
     this.popover = null;
+    this.optionsPopover?.dispose();
+    this.optionsPopover = null;
+    this.settingsPopover?.dispose();
+    this.settingsPopover = null;
+    this.settingsAnchor = null;
     for (const track of this.tracks) track.cancel?.abort();
     this.host.classList.remove('genome-browser-root');
   }
@@ -308,6 +336,8 @@ export class GenomeBrowser {
           collapsed: false,
           heightPx: defaultHeight,
           displayOrder: order++,
+          style: {},
+          filter: {},
         });
         this.tracks.push(mounted);
       } catch (err) {
@@ -323,6 +353,8 @@ export class GenomeBrowser {
     collapsed: boolean;
     heightPx: number;
     displayOrder: number;
+    style: Record<string, unknown>;
+    filter: Record<string, unknown>;
   }): MountedTrack {
     const { entry, meta } = args;
     const panel = document.createElement('div');
@@ -353,6 +385,12 @@ export class GenomeBrowser {
     statusEl.className = 'track-header-status';
     statusEl.textContent = '—';
 
+    const settingsBtn = document.createElement('button');
+    settingsBtn.type = 'button';
+    settingsBtn.className = 'track-settings-btn';
+    settingsBtn.textContent = '⚙';
+    settingsBtn.title = 'Style and filter controls';
+
     const hideBtn = document.createElement('button');
     hideBtn.type = 'button';
     hideBtn.className = 'track-hide-btn';
@@ -363,6 +401,7 @@ export class GenomeBrowser {
     header.appendChild(collapseBtn);
     header.appendChild(labelEl);
     header.appendChild(statusEl);
+    header.appendChild(settingsBtn);
     header.appendChild(hideBtn);
 
     const body = document.createElement('div');
@@ -384,11 +423,14 @@ export class GenomeBrowser {
       statusEl,
       bodyHost: body,
       collapseBtn,
+      settingsBtn,
       hideBtn,
       visible: args.visible,
       collapsed: args.collapsed,
       heightPx: args.heightPx,
       displayOrder: args.displayOrder,
+      style: { ...args.style },
+      filter: { ...args.filter },
     };
 
     collapseBtn.addEventListener('click', () => {
@@ -396,6 +438,9 @@ export class GenomeBrowser {
     });
     hideBtn.addEventListener('click', () => {
       this.setVisible(mounted, false);
+    });
+    settingsBtn.addEventListener('click', () => {
+      this.toggleSettingsPanel(mounted);
     });
     this.attachReorderDrag(mounted);
     this.attachResize(mounted, resizeHandle);
@@ -408,17 +453,26 @@ export class GenomeBrowser {
   // --------------------------------------------------------------------
 
   private snapshotLayout(): TrackLayoutEntry[] {
-    return this.tracks.map((t) => ({
-      source_id: t.entry.source_id ?? '',
-      kind: t.entry.kind,
-      visible: t.visible,
-      display_order: t.displayOrder,
-      height_px: Math.round(t.heightPx),
-      collapsed: t.collapsed,
-    }));
+    return this.tracks.map((t) => {
+      const entry: TrackLayoutEntry = {
+        source_id: t.entry.source_id ?? '',
+        kind: t.entry.kind,
+        visible: t.visible,
+        display_order: t.displayOrder,
+        height_px: Math.round(t.heightPx),
+        collapsed: t.collapsed,
+      };
+      if (Object.keys(t.style).length > 0) entry.style = { ...t.style };
+      if (Object.keys(t.filter).length > 0) entry.filter = { ...t.filter };
+      return entry;
+    });
   }
 
   private applyPersistedLayout(): void {
+    // Browser-wide options are loaded independently of track layout.
+    const storedOptions = readOptionsFromStorage(this.sessionId);
+    if (storedOptions) this.options = { ...this.options, ...storedOptions };
+
     let entries: TrackLayoutEntry[] | null = this.initialLayout;
     if (!entries || entries.length === 0) {
       entries = readLayoutFromStorage(this.sessionId);
@@ -440,6 +494,8 @@ export class GenomeBrowser {
       ) {
         t.heightPx = Math.min(MAX_TRACK_HEIGHT, e.height_px);
       }
+      if (e.style && typeof e.style === 'object') t.style = { ...e.style };
+      if (e.filter && typeof e.filter === 'object') t.filter = { ...e.filter };
       t.collapseBtn.textContent = t.collapsed ? '▸' : '▾';
       t.collapseBtn.title = t.collapsed ? 'Expand track' : 'Collapse track';
     }
@@ -458,12 +514,17 @@ export class GenomeBrowser {
   private persistLayoutNow(): void {
     const entries = this.snapshotLayout();
     writeLayoutToStorage(this.sessionId, entries);
+    writeOptionsToStorage(this.sessionId, this.options);
     const slug = this.manifest?.saved_as ?? null;
     if (slug) {
+      const payload: Record<string, unknown> = {
+        track_layout: entries,
+        options: { ...this.options },
+      };
       fetchJsonMethod<unknown>(
         `/api/saved-sessions/${encodeURIComponent(slug)}/layout`,
         'PATCH',
-        { track_layout: entries },
+        payload,
       ).catch((err) => {
         console.warn('failed to PATCH saved-session layout', err);
       });
@@ -692,7 +753,14 @@ export class GenomeBrowser {
     // Feature search
     this.toolbar.appendChild(this.buildSearchControl());
 
-    // Right-side: Datasets popover, track count, Save SVG
+    // Right-side: Options, Datasets popovers, track count, Save SVG
+    this.optionsBtn = document.createElement('button');
+    this.optionsBtn.type = 'button';
+    this.optionsBtn.className = 'options-btn';
+    this.optionsBtn.textContent = 'Options ▾';
+    this.optionsBtn.title = 'Browser-wide settings';
+    this.optionsBtn.addEventListener('click', () => this.toggleOptionsPopover());
+
     this.datasetBtn = document.createElement('button');
     this.datasetBtn.type = 'button';
     this.datasetBtn.className = 'dataset-btn';
@@ -709,6 +777,7 @@ export class GenomeBrowser {
     right.className = 'toolbar-right';
     this.trackCountStatus = document.createElement('span');
     this.trackCountStatus.className = 'label-dim';
+    right.appendChild(this.optionsBtn);
     right.appendChild(this.datasetBtn);
     right.appendChild(this.trackCountStatus);
     right.appendChild(exportBtn);
@@ -804,6 +873,126 @@ export class GenomeBrowser {
   }
 
   // --------------------------------------------------------------------
+  // Options popover
+  // --------------------------------------------------------------------
+
+  private toggleOptionsPopover(): void {
+    if (this.optionsPopover) {
+      this.optionsPopover.dispose();
+      this.optionsPopover = null;
+      return;
+    }
+    this.optionsPopover = new OptionsPopover({
+      anchor: this.optionsBtn,
+      options: { ...this.options },
+      handlers: {
+        onChange: (key, value) => {
+          this.options = { ...this.options, [key]: value };
+          this.schedulePersistLayout();
+        },
+      },
+      onClose: () => {
+        this.optionsPopover?.dispose();
+        this.optionsPopover = null;
+      },
+    });
+    this.optionsPopover.mount(document.body);
+  }
+
+  // --------------------------------------------------------------------
+  // Per-track gear popover
+  // --------------------------------------------------------------------
+
+  private toggleSettingsPanel(track: MountedTrack): void {
+    if (this.settingsPopover && this.settingsAnchor === track) {
+      this.closeSettingsPanel();
+      return;
+    }
+    this.closeSettingsPanel();
+    this.openSettingsPanel(track);
+  }
+
+  private openSettingsPanel(track: MountedTrack): void {
+    this.settingsAnchor = track;
+    this.settingsPopover = new TrackSettingsPanel({
+      anchor: track.settingsBtn,
+      kind: track.entry.kind,
+      label: track.entry.label,
+      meta: track.meta,
+      style: { ...track.style },
+      filter: { ...track.filter },
+      onStyleChange: (style) => {
+        track.style = { ...style };
+        this.restyleTrack(track);
+        this.schedulePersistLayout();
+      },
+      onFilterChange: (filter) => {
+        track.filter = { ...filter };
+        this.restyleTrack(track);
+        this.schedulePersistLayout();
+      },
+      onReset: () => {
+        track.style = {};
+        track.filter = {};
+        this.restyleTrack(track);
+        this.schedulePersistLayout();
+      },
+      onClose: () => {
+        this.closeSettingsPanel();
+      },
+    });
+    this.settingsPopover.mount(document.body);
+  }
+
+  private closeSettingsPanel(): void {
+    this.settingsPopover?.dispose();
+    this.settingsPopover = null;
+    this.settingsAnchor = null;
+  }
+
+  /** Re-run the renderer against `track.lastFetched` so style/filter
+   *  changes apply without a server round-trip. Falls back to the
+   *  scheduler when the cache is empty (e.g. before first render). */
+  private restyleTrack(track: MountedTrack): void {
+    if (!track.visible || track.collapsed) return;
+    const cached = track.lastFetched;
+    if (!cached) {
+      this.scheduleRender();
+      return;
+    }
+    const locus = this.bus.locus;
+    const widthPx = Math.max(200, this.host.clientWidth - 40);
+    const expectedKey = `${locus.contig}|${locus.start}|${locus.end}|${widthPx}`;
+    if (cached.locusKey !== expectedKey) {
+      // Viewport moved since the last fetch — schedule a full render.
+      this.scheduleRender();
+      return;
+    }
+    const heightPx = Math.max(MIN_TRACK_HEIGHT, Math.round(track.heightPx));
+    const svg = ensureSvg(track.bodyHost, widthPx, heightPx);
+    const ctx = {
+      svg,
+      widthPx,
+      heightPx,
+      xScale: xScale([locus.start, locus.end], widthPx),
+      meta: track.meta,
+      showLabels: this.showLabels,
+      style: track.style,
+      filter: track.filter,
+    };
+    const renderer = getRenderer(track.entry.kind);
+    if (!renderer) return;
+    try {
+      renderer.render(cached.table, cached.mode, ctx);
+    } catch (err) {
+      console.warn(
+        `restyle failed for ${track.entry.kind}/${track.entry.binding_id}`,
+        err,
+      );
+    }
+  }
+
+  // --------------------------------------------------------------------
   // Runtime source mutation
   // --------------------------------------------------------------------
 
@@ -840,6 +1029,9 @@ export class GenomeBrowser {
     // Snapshot current layout BEFORE tearing down, then rebuild and
     // restore by (source_id, kind). New bindings inherit kind-grouped
     // defaults at the tail of their kind cluster.
+    // Any open per-track settings popover anchors a torn-down DOM node
+    // — close it before the rebuild.
+    this.closeSettingsPanel();
     const previous = this.snapshotLayout();
     for (const t of this.tracks) {
       t.cancel?.abort();
@@ -879,6 +1071,8 @@ export class GenomeBrowser {
         ) {
           t.heightPx = Math.min(MAX_TRACK_HEIGHT, e.height_px);
         }
+        if (e.style && typeof e.style === 'object') t.style = { ...e.style };
+        if (e.filter && typeof e.filter === 'object') t.filter = { ...e.filter };
         t.collapseBtn.textContent = t.collapsed ? '▸' : '▾';
         t.collapseBtn.title = t.collapsed
           ? 'Expand track'
@@ -1112,6 +1306,7 @@ export class GenomeBrowser {
     this.renderOverview(widthPx, locus);
     this.renderRuler(widthPx, locus);
 
+    const locusKey = `${locus.contig}|${locus.start}|${locus.end}|${widthPx}`;
     for (const track of this.visibleSortedTracks()) {
       if (track.collapsed) {
         // Collapsed tracks render the header only; clear any prior SVG
@@ -1134,6 +1329,8 @@ export class GenomeBrowser {
         xScale: xScale([locus.start, locus.end], widthPx),
         meta: track.meta,
         showLabels: this.showLabels,
+        style: track.style,
+        filter: track.filter,
       };
 
       try {
@@ -1152,6 +1349,7 @@ export class GenomeBrowser {
         const renderer = getRenderer(track.entry.kind);
         if (!renderer) continue;
         renderer.render(table, mode as TrackMode, ctx);
+        track.lastFetched = { table, mode: mode as TrackMode, locusKey };
         track.statusEl.textContent =
           table.numRows === 0
             ? '— no data in window'
@@ -1226,10 +1424,6 @@ export class GenomeBrowser {
 
   private exportSvg(): void {
     const visible = this.visibleSortedTracks().filter((t) => !t.collapsed);
-    const totalHeight =
-      OVERVIEW_HEIGHT +
-      RULER_HEIGHT +
-      visible.reduce((acc, t) => acc + Math.round(t.heightPx), 0);
     const widthPx = Math.max(200, this.host.clientWidth - 40);
     const panels = visible.map((t) => t.panel);
     const cost = estimateGlyphCount(panels);
@@ -1243,12 +1437,12 @@ export class GenomeBrowser {
     const ruler = this.rulerHost.querySelector(
       'svg.track-canvas',
     ) as SVGSVGElement | null;
-    const svgString = buildCompositeSvg({
+    const { svg: svgString } = buildCompositeSvg({
       title: `${this.bus.locus.contig}:${this.bus.locus.start}-${this.bus.locus.end}`,
       trackPanels: panels,
       rulerSvg: ruler,
       totalWidthPx: widthPx,
-      totalHeightPx: totalHeight,
+      clip: this.options.clip_svg,
     });
     const filename = `${this.bus.locus.contig}_${this.bus.locus.start}_${this.bus.locus.end}.svg`;
     downloadSvg(filename, svgString);
@@ -1299,6 +1493,34 @@ function writeLayoutToStorage(
     window.localStorage.setItem(
       layoutStorageKey(sessionId),
       JSON.stringify(entries),
+    );
+  } catch {
+    // ignored — storage may be disabled
+  }
+}
+
+function readOptionsFromStorage(sessionId: string): BrowserOptions | null {
+  try {
+    const raw = window.localStorage.getItem(optionsStorageKey(sessionId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const out: BrowserOptions = { ...DEFAULT_BROWSER_OPTIONS };
+    if (typeof parsed.clip_svg === 'boolean') out.clip_svg = parsed.clip_svg;
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+function writeOptionsToStorage(
+  sessionId: string,
+  options: BrowserOptions,
+): void {
+  try {
+    window.localStorage.setItem(
+      optionsStorageKey(sessionId),
+      JSON.stringify(options),
     );
   } catch {
     // ignored — storage may be disabled

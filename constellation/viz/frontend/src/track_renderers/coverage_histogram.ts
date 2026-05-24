@@ -11,6 +11,13 @@ import { Table } from 'apache-arrow';
 import { svgEl, clear } from '../engine/svg_layer';
 import { TrackMode } from '../engine/arrow_client';
 import { TrackRenderer, RenderContext } from './base';
+import {
+  pickAllowList,
+  pickBool,
+  pickCycledColor,
+  pickNumber,
+  pickString,
+} from './style';
 
 const PALETTE = ['#4f9efb', '#fb7c4f', '#a4d65e', '#d65eb6', '#5ed6cf'];
 
@@ -19,15 +26,28 @@ const renderer: TrackRenderer = {
   render(table: Table, _mode: TrackMode, ctx: RenderContext): void {
     clear(ctx.svg);
 
+    const fillOpacity = pickNumber(ctx.style, 'fill_opacity', 0.4);
+    const strokeWidth = pickNumber(ctx.style, 'stroke_width_px', 1);
+    const yScaleMode = pickString(ctx.style, 'y_scale', 'linear');
+    const showSampleLabels = pickBool(ctx.style, 'show_sample_labels', true);
+    const showMaxDepth = pickBool(ctx.style, 'show_max_depth', true);
+
+    const allowedSamples = pickAllowList(ctx.filter, 'visible_samples');
+    const minDepth = pickNumber(ctx.filter, 'min_depth', 0);
+
     const startCol = table.getChild('start');
     const endCol = table.getChild('end');
     const depthCol = table.getChild('depth');
     const sampleCol = table.getChild('sample_id');
-    if (!startCol || !endCol || !depthCol || !sampleCol) return;
+    if (!startCol || !endCol || !depthCol || !sampleCol) {
+      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
+      return;
+    }
 
     const n = table.numRows;
     if (n === 0) {
       drawEmpty(ctx, 'no coverage in window');
+      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
       return;
     }
 
@@ -37,9 +57,11 @@ const renderer: TrackRenderer = {
     let maxDepth = 0;
     for (let i = 0; i < n; i++) {
       const sample = Number(sampleCol.get(i));
+      if (allowedSamples && !allowedSamples.has(String(sample))) continue;
+      const d = Number(depthCol.get(i));
+      if (d < minDepth) continue;
       const s = Number(startCol.get(i));
       const e = Number(endCol.get(i));
-      const d = Number(depthCol.get(i));
       maxDepth = Math.max(maxDepth, d);
       let arr = bySample.get(sample);
       if (!arr) {
@@ -49,16 +71,28 @@ const renderer: TrackRenderer = {
       arr.push({ s, e, d });
     }
 
+    if (bySample.size === 0) {
+      drawEmpty(ctx, 'no coverage in window');
+      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
+      return;
+    }
+
     const headerH = 14;
     const drawableH = Math.max(10, ctx.heightPx - headerH - 4);
-    const yScale = (depth: number) =>
-      headerH +
-      drawableH -
-      (maxDepth > 0 ? (depth / maxDepth) * drawableH : 0);
+    const useLog = yScaleMode === 'log';
+    const logMax = useLog ? Math.log10(1 + maxDepth) : 0;
+    const yScale = (depth: number): number => {
+      if (maxDepth <= 0) return headerH + drawableH;
+      const fraction = useLog
+        ? Math.log10(1 + Math.max(0, depth)) / Math.max(logMax, 1e-9)
+        : depth / maxDepth;
+      return headerH + drawableH - fraction * drawableH;
+    };
 
     let paletteIdx = 0;
     for (const [sample, intervals] of bySample) {
-      const color = PALETTE[paletteIdx++ % PALETTE.length];
+      const color = pickCycledColor(ctx.style, sample, PALETTE, paletteIdx);
+      paletteIdx++;
       intervals.sort((a, b) => a.s - b.s);
       // Build a stepped <path>: one move + alternating H/V segments.
       const baseY = headerH + drawableH;
@@ -77,32 +111,37 @@ const renderer: TrackRenderer = {
       const path = svgEl('path', {
         d: cmds.join(' '),
         fill: color,
-        'fill-opacity': '0.4',
+        'fill-opacity': String(fillOpacity),
         stroke: color,
-        'stroke-width': '1',
+        'stroke-width': String(strokeWidth),
       });
       ctx.svg.appendChild(path);
       // Sample label
-      const label = svgEl('text', {
-        x: 4,
-        y: 10 + 12 * (paletteIdx - 1),
-        'font-size': '10',
-        fill: color,
-      });
-      label.textContent = sample === -1 ? `all` : `sample ${sample}`;
-      ctx.svg.appendChild(label);
+      if (showSampleLabels) {
+        const label = svgEl('text', {
+          x: 4,
+          y: 10 + 12 * (paletteIdx - 1),
+          'font-size': '10',
+          fill: color,
+        });
+        label.textContent = sample === -1 ? `all` : `sample ${sample}`;
+        ctx.svg.appendChild(label);
+      }
     }
 
     // Max-depth annotation
-    const maxLabel = svgEl('text', {
-      x: ctx.widthPx - 4,
-      y: 10,
-      'font-size': '10',
-      'text-anchor': 'end',
-      fill: '#8a8a93',
-    });
-    maxLabel.textContent = `max depth ${maxDepth.toFixed(0)}`;
-    ctx.svg.appendChild(maxLabel);
+    if (showMaxDepth) {
+      const maxLabel = svgEl('text', {
+        x: ctx.widthPx - 4,
+        y: 10,
+        'font-size': '10',
+        'text-anchor': 'end',
+        fill: '#8a8a93',
+      });
+      maxLabel.textContent = `max depth ${maxDepth.toFixed(0)}${useLog ? ' (log)' : ''}`;
+      ctx.svg.appendChild(maxLabel);
+    }
+    ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
   },
 };
 

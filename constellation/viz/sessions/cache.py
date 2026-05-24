@@ -27,6 +27,9 @@ Schema v2 (current)::
     start = 0
     end = 100000
 
+    [options]
+    clip_svg = false          # browser-wide preferences; optional
+
     [[track_layout]]
     source_id = "src-1a2b3c4d"   # "" for reference-only bindings
     kind = "coverage_histogram"
@@ -35,9 +38,23 @@ Schema v2 (current)::
     height_px = 80
     collapsed = false
 
+    [track_layout.style]      # optional — per-kernel palette/size overrides
+    "palette.gene" = "#5e8cd6"
+    feature_opacity = 0.85
+
+    [track_layout.filter]     # optional — per-kernel dataset-slice filters
+    visible_samples = [0, 1]
+
 v1 lacked ``[[track_layout]]``; v1 files are accepted transparently
 and treated as "all visible, default order, default heights" — they
 get rewritten as v2 on the next save.
+
+The ``[options]`` block, plus per-entry ``style`` / ``filter`` tables,
+landed after v2 was minted. They are forward-compatibility extensions
+to the v2 schema — older Constellations reading a file that includes
+them silently drop the unknown keys; newer Constellations reading an
+older v2 file see absent options + empty per-entry style/filter and
+fall back to defaults. No schema_version bump is required.
 """
 
 from __future__ import annotations
@@ -98,6 +115,7 @@ class SavedSession:
     saved_at: str = ""
     last_viewed_locus: dict[str, Any] | None = None
     track_layout: list[dict[str, Any]] | None = None
+    options: dict[str, Any] | None = None
     path: Path | None = None  # populated by readers; absent on fresh constructs
 
     def to_dict(self) -> dict[str, Any]:
@@ -112,6 +130,7 @@ class SavedSession:
             "track_layout": (
                 list(self.track_layout) if self.track_layout else None
             ),
+            "options": dict(self.options) if self.options else None,
         }
 
 
@@ -150,7 +169,12 @@ def _normalize_track_layout(
 ) -> list[dict[str, Any]]:
     """Validate + coerce a track-layout list. Missing source_id maps to ""
     (reference-only binding). Unknown extra keys are dropped silently
-    rather than raised — they're forward-compatibility room."""
+    rather than raised — they're forward-compatibility room.
+
+    Optional ``style`` / ``filter`` sub-tables are preserved as opaque
+    dicts (renderer-interpreted). Non-dict values are dropped silently
+    so a hand-edited TOML can't crash the loader.
+    """
     if not entries:
         return []
     out: list[dict[str, Any]] = []
@@ -158,16 +182,35 @@ def _normalize_track_layout(
         kind = entry.get("kind")
         if not kind:
             continue
-        out.append(
-            {
-                "source_id": str(entry.get("source_id") or ""),
-                "kind": str(kind),
-                "visible": bool(entry.get("visible", True)),
-                "display_order": int(entry.get("display_order", 0)),
-                "height_px": int(entry.get("height_px", 0)),
-                "collapsed": bool(entry.get("collapsed", False)),
-            }
-        )
+        normalized: dict[str, Any] = {
+            "source_id": str(entry.get("source_id") or ""),
+            "kind": str(kind),
+            "visible": bool(entry.get("visible", True)),
+            "display_order": int(entry.get("display_order", 0)),
+            "height_px": int(entry.get("height_px", 0)),
+            "collapsed": bool(entry.get("collapsed", False)),
+        }
+        style = entry.get("style")
+        if isinstance(style, dict) and style:
+            normalized["style"] = dict(style)
+        flt = entry.get("filter")
+        if isinstance(flt, dict) and flt:
+            normalized["filter"] = dict(flt)
+        out.append(normalized)
+    return out
+
+
+def _normalize_options(options: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate + coerce the browser-wide ``[options]`` block. Returns
+    an empty dict when no real values are present — callers can then
+    skip emitting the section. Defaults are *not* injected; an absent
+    key simply means "client falls back to its own default".
+    """
+    if not isinstance(options, dict):
+        return {}
+    out: dict[str, Any] = {}
+    if "clip_svg" in options:
+        out["clip_svg"] = bool(options.get("clip_svg"))
     return out
 
 
@@ -178,6 +221,7 @@ def write_saved(
     sources: list[dict[str, Any]],
     last_viewed_locus: dict[str, Any] | None = None,
     track_layout: list[dict[str, Any]] | None = None,
+    options: dict[str, Any] | None = None,
     saved_at: str | None = None,
     slug: str | None = None,
     root: Path | None = None,
@@ -215,6 +259,7 @@ def write_saved(
         )
 
     normalized_layout = _normalize_track_layout(track_layout)
+    normalized_options = _normalize_options(options)
 
     lines: list[str] = [
         f"schema_version = {SAVED_SESSION_SCHEMA_VERSION}",
@@ -237,6 +282,11 @@ def write_saved(
         lines.append(f'contig = "{_toml_escape(contig)}"')
         lines.append(f"start = {start}")
         lines.append(f"end = {end}")
+    if normalized_options:
+        lines.append("")
+        lines.append("[options]")
+        for key, value in normalized_options.items():
+            lines.append(_format_toml_kv(key, value))
     for entry in normalized_layout:
         lines.append("")
         lines.append("[[track_layout]]")
@@ -246,6 +296,18 @@ def write_saved(
         lines.append(f"display_order = {entry['display_order']}")
         lines.append(f"height_px = {entry['height_px']}")
         lines.append(f"collapsed = {'true' if entry['collapsed'] else 'false'}")
+        style = entry.get("style")
+        if isinstance(style, dict) and style:
+            lines.append("")
+            lines.append("[track_layout.style]")
+            for key, value in style.items():
+                lines.append(_format_toml_kv(str(key), value))
+        flt = entry.get("filter")
+        if isinstance(flt, dict) and flt:
+            lines.append("")
+            lines.append("[track_layout.filter]")
+            for key, value in flt.items():
+                lines.append(_format_toml_kv(str(key), value))
 
     path = root / f"{final_slug}.toml"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -257,8 +319,36 @@ def write_saved(
         saved_at=final_saved_at,
         last_viewed_locus=last_viewed_locus,
         track_layout=normalized_layout or None,
+        options=normalized_options or None,
         path=path,
     )
+
+
+def _format_toml_kv(key: str, value: Any) -> str:
+    """Emit a single ``key = <value>`` TOML line. Handles strings,
+    booleans, numbers, and one-level lists of those — enough to cover
+    the style/filter/options shapes we emit. The key is quoted when it
+    contains characters TOML's bare-key form forbids (e.g.
+    ``palette.gene`` becomes ``"palette.gene"``)."""
+    return f"{_format_toml_key(key)} = {_format_toml_value(value)}"
+
+
+def _format_toml_key(key: str) -> str:
+    bare = all(ch.isalnum() or ch in "-_" for ch in key) and key != ""
+    return key if bare else f'"{_toml_escape(key)}"'
+
+
+def _format_toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return f'"{_toml_escape(value)}"'
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_format_toml_value(v) for v in value) + "]"
+    # Fallback: stringify and quote — keeps the writer from ever raising.
+    return f'"{_toml_escape(str(value))}"'
 
 
 def read_saved(slug: str, *, root: Path | None = None) -> SavedSession:
@@ -315,6 +405,12 @@ def read_saved(slug: str, *, root: Path | None = None) -> SavedSession:
         if isinstance(layout_raw, list)
         else []
     )
+    options_raw = raw.get("options")
+    options = (
+        _normalize_options(options_raw)
+        if isinstance(options_raw, dict)
+        else {}
+    )
     return SavedSession(
         slug=slug,
         label=label,
@@ -323,6 +419,7 @@ def read_saved(slug: str, *, root: Path | None = None) -> SavedSession:
         saved_at=saved_at,
         last_viewed_locus=last_viewed,
         track_layout=track_layout or None,
+        options=options or None,
         path=path,
     )
 
