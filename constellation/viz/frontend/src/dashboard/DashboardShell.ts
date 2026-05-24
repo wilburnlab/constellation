@@ -1,10 +1,12 @@
-// Top-level dashboard shell — wires dockview, sidebar, and status bar.
+// Top-level dashboard shell — wires the persistent left rail (sidebar +
+// logo collapse toggle), the dockview workspace, and the status bar.
 //
-// Owns the DockviewComponent instance and the lifecycle of every panel.
-// Every command (compute or visualization) opens in the same panel
-// kind, a `'task'` panel, which transitions in-place from form → either
-// terminal or visualization widget. The tab the user invoked the
-// command from *becomes* the running tool — no side-spawned panels.
+// The sidebar is NOT a dockview panel — it lives in a fixed-width host
+// (`#shell-sidebar-body`) so it can't be accidentally closed. Dockview
+// owns only the right-hand workspace, where every command (compute or
+// visualization) opens in the same panel kind: a `'task'` panel that
+// transitions in-place from form → either terminal or visualization
+// widget.
 
 import {
   DockviewComponent,
@@ -19,15 +21,22 @@ import 'dockview-core/dist/styles/dockview.css';
 import { Sidebar } from './Sidebar';
 import { StatusBar } from './StatusBar';
 import { TaskPanel, taskInitForCommand, type TaskInit } from './TaskPanel';
-import { DashboardState, getStored, setStored } from './state';
+import { DashboardState, getStored, setStored, type SidebarMode } from './state';
 import type { CliSchema, CommandSchema } from './types';
 
-const LAYOUT_KEY = 'layout.v1';
+// Bumped from layout.v1 when the sidebar moved out of dockview — a stale
+// v1 blob that referenced a 'sidebar' panel would fail the factory.
+const LAYOUT_KEY = 'layout.v2';
+const SIDEBAR_COLLAPSED_KEY = 'sidebar.collapsed.v1';
 
 export interface DashboardShellOptions {
   schema: CliSchema;
   dockRoot: HTMLElement;
   statusRoot: HTMLElement;
+  sidebarBody: HTMLElement;
+  sidebarHeader: HTMLElement;
+  sidebarRoot: HTMLElement;
+  sidebarRail: HTMLElement;
 }
 
 interface TaskPanelParams extends Record<string, unknown> {
@@ -37,15 +46,11 @@ interface TaskPanelParams extends Record<string, unknown> {
   commandPath?: string[];
 }
 
-interface SidebarPanelParams extends Record<string, unknown> {
-  kind: 'sidebar';
-}
-
 interface WelcomePanelParams extends Record<string, unknown> {
   kind: 'welcome';
 }
 
-type PanelParams = TaskPanelParams | SidebarPanelParams | WelcomePanelParams;
+type PanelParams = TaskPanelParams | WelcomePanelParams;
 
 interface TaskAware extends IContentRenderer {
   onResize?: () => void;
@@ -57,6 +62,10 @@ export class DashboardShell {
   private readonly state = new DashboardState();
   private readonly sidebar: Sidebar;
   private readonly statusBar: StatusBar;
+  private readonly sidebarRoot: HTMLElement;
+  private readonly sidebarBody: HTMLElement;
+  private readonly sidebarHeader: HTMLElement;
+  private readonly sidebarRail: HTMLElement;
   private dock: DockviewComponent | null = null;
   // Pending task inits keyed by panel id — added via openTask before
   // dockview asks for the renderer, consumed when createComponent
@@ -69,9 +78,20 @@ export class DashboardShell {
     this.schema = opts.schema;
     this.sidebar = new Sidebar({ schema: opts.schema, state: this.state });
     this.statusBar = new StatusBar(opts.statusRoot, this.state);
+    this.sidebarRoot = opts.sidebarRoot;
+    this.sidebarBody = opts.sidebarBody;
+    this.sidebarHeader = opts.sidebarHeader;
+    this.sidebarRail = opts.sidebarRail;
   }
 
   mount(dockRoot: HTMLElement): void {
+    // Sidebar lives outside dockview now — mount once into the
+    // persistent shell host.
+    this.sidebar.mount(this.sidebarBody);
+    this.applyCollapsed(getStored<boolean>(SIDEBAR_COLLAPSED_KEY, false));
+    this.sidebarHeader.addEventListener('click', () => this.toggleCollapsed());
+    this.wireRailButtons();
+
     this.dock = new DockviewComponent(dockRoot, {
       createComponent: (opts) => this.createRenderer(opts),
     });
@@ -111,23 +131,48 @@ export class DashboardShell {
   }
 
   // -------------------------------------------------------------------
+  // Sidebar collapse + rail wiring
+  // -------------------------------------------------------------------
+
+  private toggleCollapsed(): void {
+    this.applyCollapsed(!this.sidebarRoot.classList.contains('collapsed'));
+  }
+
+  private applyCollapsed(collapsed: boolean): void {
+    this.sidebarRoot.classList.toggle('collapsed', collapsed);
+    setStored(SIDEBAR_COLLAPSED_KEY, collapsed);
+  }
+
+  private wireRailButtons(): void {
+    const buttons = this.sidebarRail.querySelectorAll<HTMLButtonElement>(
+      '.shell-rail-btn',
+    );
+    for (const btn of buttons) {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const rail = btn.dataset.rail;
+        // Expand the sidebar so the chosen mode / search is visible.
+        this.applyCollapsed(false);
+        if (rail === 'common' || rail === 'all') {
+          this.sidebar.setMode(rail as SidebarMode);
+        } else if (rail === 'search') {
+          // Defer focus until after the expand transition begins — the
+          // input is display:none while collapsed.
+          requestAnimationFrame(() => this.sidebar.focusSearch());
+        }
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------
   // dockview-core renderer factory
   // -------------------------------------------------------------------
 
   private createRenderer(opts: CreateComponentOptions): IContentRenderer {
-    const sidebarRef = this.sidebar;
     const stateRef = this.state;
     const shell = this;
 
     switch (opts.name) {
-      case 'sidebar':
-        return new (class implements IContentRenderer {
-          readonly element = document.createElement('div');
-          init(_params: GroupPanelPartInitParameters): void {
-            sidebarRef.mount(this.element);
-          }
-        })();
-
       case 'welcome':
         return new (class implements IContentRenderer {
           readonly element = (() => {
@@ -234,17 +279,10 @@ export class DashboardShell {
   private buildDefaultLayout(): void {
     if (!this.dock) return;
     this.dock.addPanel({
-      id: 'sidebar',
-      component: 'sidebar',
-      title: 'Commands',
-      params: { kind: 'sidebar' } satisfies PanelParams,
-    });
-    this.dock.addPanel({
       id: 'welcome',
       component: 'welcome',
       title: 'Home',
       params: { kind: 'welcome' } satisfies PanelParams,
-      position: { referencePanel: 'sidebar', direction: 'right' },
     });
   }
 
@@ -280,8 +318,9 @@ export class DashboardShell {
     // Anchor new tabs to whichever group currently holds the home
     // panel so commands stack as tabs instead of slicing the
     // workspace into thinner and thinner splits. If home has been
-    // closed, fall back to the legacy side-split next to the
-    // sidebar.
+    // closed, let dockview place the new panel in its active group
+    // (or create one) — there's no longer a sidebar panel to
+    // side-split against.
     const home = this.dock.getGroupPanel('welcome');
     this.dock.addPanel({
       id,
@@ -291,9 +330,7 @@ export class DashboardShell {
         kind: 'task',
         commandPath,
       } satisfies PanelParams,
-      position: home
-        ? { referenceGroup: home.group }
-        : { referencePanel: 'sidebar', direction: 'right' },
+      ...(home ? { position: { referenceGroup: home.group } } : {}),
     });
     this.taskPanels.set(key, id);
     this.sidebar.setActivePath(commandPath);

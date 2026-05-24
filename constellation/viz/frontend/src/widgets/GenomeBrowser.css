@@ -88,8 +88,8 @@
 }
 .genome-browser-root .toggle.on {
   color: var(--fg);
-  background: rgba(79, 158, 251, 0.18);
-  border-color: rgba(79, 158, 251, 0.5);
+  background: rgba(var(--accent-rgb), 0.18);
+  border-color: rgba(var(--accent-rgb), 0.5);
 }
 .genome-browser-root .toolbar-right {
   margin-left: auto;
@@ -125,7 +125,7 @@
   align-items: center;
 }
 .genome-browser-root .search-row:last-child { border-bottom: none; }
-.genome-browser-root .search-row:hover { background: rgba(79, 158, 251, 0.12); }
+.genome-browser-root .search-row:hover { background: rgba(var(--accent-rgb), 0.12); }
 .genome-browser-root .search-name {
   font-family: ui-monospace, SF Mono, Menlo, monospace;
   font-weight: 600;
@@ -141,11 +141,11 @@
 }
 .genome-browser-root .search-badge.src-reference {
   color: var(--fg);
-  border-color: rgba(79, 158, 251, 0.6);
+  border-color: rgba(var(--accent-rgb), 0.6);
 }
 .genome-browser-root .search-badge.src-derived {
   color: var(--fg);
-  border-color: rgba(155, 194, 58, 0.6);
+  border-color: rgba(var(--accent-alt-rgb), 0.6);
 }
 .genome-browser-root .search-coord {
   grid-column: 1 / span 3;
@@ -176,14 +176,19 @@
   border-bottom: 1px solid var(--border);
 }
 .genome-browser-root .track {
-  border-bottom: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin: 0 6px 6px;
   position: relative;
+  background: var(--bg);
 }
+.genome-browser-root .track:first-of-type { margin-top: 6px; }
 .genome-browser-root .track.track-dragging {
   opacity: 0.5;
 }
 .genome-browser-root .track.track-drop-target {
-  box-shadow: inset 0 2px 0 0 rgba(79, 158, 251, 0.9);
+  box-shadow: inset 0 2px 0 0 rgba(var(--accent-rgb), 0.9);
 }
 .genome-browser-root .track-header {
   padding: 4px 12px 4px 6px;
@@ -248,7 +253,7 @@
 }
 .genome-browser-root .track-resize-handle:hover,
 .genome-browser-root .track-resize-handle:active {
-  background: rgba(79, 158, 251, 0.4);
+  background: rgba(var(--accent-rgb), 0.4);
 }
 .genome-browser-root .track-stack-empty {
   padding: 16px;
@@ -268,9 +273,9 @@
 .genome-browser-root .dataset-btn:hover { background: var(--border); }
 
 .dataset-popover {
-  background: var(--bg-elev, #1c1c22);
-  color: var(--fg, #e3e3e8);
-  border: 1px solid var(--border, #3a3a44);
+  background: var(--bg-elev, #1c1a25);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
   border-radius: 6px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
   min-width: 320px;
@@ -288,7 +293,7 @@
   justify-content: space-between;
   gap: 8px;
   padding: 8px 12px 4px;
-  border-top: 1px solid var(--border, #3a3a44);
+  border-top: 1px solid var(--border, #2d2b3a);
 }
 .dataset-popover .dataset-source-header:first-child {
   border-top: none;
@@ -301,7 +306,7 @@
   min-width: 0;
 }
 .dataset-popover .dataset-source-label {
-  color: var(--fg, #e3e3e8);
+  color: var(--fg, #edecee);
   font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
@@ -311,30 +316,30 @@
   font-size: 10px;
   padding: 1px 6px;
   border-radius: 10px;
-  border: 1px solid rgba(79, 158, 251, 0.6);
-  color: var(--fg, #e3e3e8);
+  border: 1px solid rgba(var(--accent-rgb), 0.6);
+  color: var(--fg, #edecee);
   text-transform: uppercase;
 }
 .dataset-popover .dataset-kind-badge.dataset-kind-cluster {
-  border-color: rgba(155, 194, 58, 0.6);
+  border-color: rgba(var(--accent-alt-rgb), 0.6);
 }
 .dataset-popover .dataset-readonly-tag {
   font-size: 10px;
-  color: var(--fg-dim, #8b8b94);
+  color: var(--fg-dim, #adacae);
   font-style: italic;
 }
 .dataset-popover .dataset-remove-btn {
   background: transparent;
-  color: var(--fg-dim, #8b8b94);
-  border: 1px solid var(--border, #3a3a44);
+  color: var(--fg-dim, #adacae);
+  border: 1px solid var(--border, #2d2b3a);
   border-radius: 4px;
   padding: 1px 6px;
   cursor: pointer;
   font-size: 12px;
 }
 .dataset-popover .dataset-remove-btn:hover {
-  color: #ff8181;
-  border-color: #ff8181;
+  color: var(--danger, #ff6767);
+  border-color: var(--danger, #ff6767);
 }
 .dataset-popover .dataset-binding-row {
   display: flex;
@@ -344,7 +349,7 @@
   cursor: pointer;
 }
 .dataset-popover .dataset-binding-row:hover {
-  background: rgba(79, 158, 251, 0.12);
+  background: rgba(var(--accent-rgb), 0.12);
 }
 .dataset-popover .dataset-binding-label {
   flex: 1 1 auto;
@@ -354,24 +359,24 @@
 }
 .dataset-popover .dataset-empty-bindings {
   padding: 3px 16px 6px 28px;
-  color: var(--fg-dim, #8b8b94);
+  color: var(--fg-dim, #adacae);
   font-style: italic;
   font-size: 11px;
 }
 .dataset-popover .dataset-warning {
   padding: 4px 16px 4px 28px;
-  color: #f0c25e;
+  color: var(--warn, #ffca85);
   font-size: 11px;
 }
 .dataset-popover .dataset-add-wrap {
   padding: 10px 12px 8px;
-  border-top: 1px solid var(--border, #3a3a44);
+  border-top: 1px solid var(--border, #2d2b3a);
   margin-top: 4px;
 }
 .dataset-popover .dataset-add-label {
   display: block;
   font-size: 11px;
-  color: var(--fg-dim, #8b8b94);
+  color: var(--fg-dim, #adacae);
   margin-bottom: 4px;
 }
 .dataset-popover .dataset-add-row {
@@ -380,24 +385,24 @@
 }
 .dataset-popover .dataset-add-input {
   flex: 1 1 auto;
-  background: var(--bg, #0f0f12);
-  color: var(--fg, #e3e3e8);
-  border: 1px solid var(--border, #3a3a44);
+  background: var(--bg, #15141b);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
   border-radius: 4px;
   padding: 4px 8px;
   font-family: ui-monospace, SF Mono, Menlo, monospace;
   font-size: 12px;
 }
 .dataset-popover .dataset-add-btn {
-  background: var(--bg, #0f0f12);
-  color: var(--fg, #e3e3e8);
-  border: 1px solid var(--border, #3a3a44);
+  background: var(--bg, #15141b);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
   border-radius: 4px;
   padding: 4px 10px;
   cursor: pointer;
 }
 .dataset-popover .dataset-add-btn:hover:not(:disabled) {
-  background: var(--border, #3a3a44);
+  background: var(--border, #2d2b3a);
 }
 .dataset-popover .dataset-add-btn:disabled {
   opacity: 0.6;
@@ -405,7 +410,7 @@
 }
 .dataset-popover .dataset-add-error {
   margin-top: 6px;
-  color: #ff8181;
+  color: var(--danger, #ff6767);
   font-size: 11px;
 }
 .genome-browser-root .browser svg text { fill: var(--fg); }
@@ -415,9 +420,9 @@
 /* Options popover — shares chrome with .dataset-popover but its rows are
  * full-width labeled checkboxes rather than nested binding lists. */
 .options-popover {
-  background: var(--bg-elev, #1c1c22);
-  color: var(--fg, #e3e3e8);
-  border: 1px solid var(--border, #3a3a44);
+  background: var(--bg-elev, #1c1a25);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
   border-radius: 6px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
   min-width: 280px;
@@ -432,7 +437,7 @@
 .options-popover .options-section-title {
   padding: 6px 12px 4px;
   font-size: 11px;
-  color: var(--fg-dim, #8b8b94);
+  color: var(--fg-dim, #adacae);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -444,7 +449,7 @@
   cursor: pointer;
 }
 .options-popover .options-row:hover {
-  background: rgba(79, 158, 251, 0.12);
+  background: rgba(var(--accent-rgb), 0.12);
 }
 .options-popover .options-row input[type='checkbox'] {
   margin-top: 2px;
@@ -455,11 +460,11 @@
   gap: 2px;
 }
 .options-popover .options-row-label {
-  color: var(--fg, #e3e3e8);
+  color: var(--fg, #edecee);
   font-weight: 500;
 }
 .options-popover .options-row-hint {
-  color: var(--fg-dim, #8b8b94);
+  color: var(--fg-dim, #adacae);
   font-size: 11px;
 }
 .genome-browser-root .options-btn {
@@ -475,9 +480,9 @@
 
 /* Track settings popover (per-binding gear) */
 .track-settings-popover {
-  background: var(--bg-elev, #1c1c22);
-  color: var(--fg, #e3e3e8);
-  border: 1px solid var(--border, #3a3a44);
+  background: var(--bg-elev, #1c1a25);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
   border-radius: 6px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
   min-width: 320px;
@@ -495,23 +500,23 @@
   justify-content: space-between;
   gap: 8px;
   padding: 8px 12px;
-  border-bottom: 1px solid var(--border, #3a3a44);
+  border-bottom: 1px solid var(--border, #2d2b3a);
 }
 .track-settings-popover .settings-title {
   font-weight: 600;
-  color: var(--fg, #e3e3e8);
+  color: var(--fg, #edecee);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .track-settings-popover .settings-kind {
   font-size: 11px;
-  color: var(--fg-dim, #8b8b94);
+  color: var(--fg-dim, #adacae);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 .track-settings-popover .settings-section {
-  border-bottom: 1px solid var(--border, #3a3a44);
+  border-bottom: 1px solid var(--border, #2d2b3a);
   padding: 8px 12px;
 }
 .track-settings-popover .settings-section:last-child {
@@ -519,7 +524,7 @@
 }
 .track-settings-popover .settings-section-title {
   font-size: 11px;
-  color: var(--fg-dim, #8b8b94);
+  color: var(--fg-dim, #adacae);
   text-transform: uppercase;
   letter-spacing: 0.04em;
   margin-bottom: 6px;
@@ -532,15 +537,15 @@
   padding: 4px 0;
 }
 .track-settings-popover .settings-row-label {
-  color: var(--fg, #e3e3e8);
+  color: var(--fg, #edecee);
   font-size: 12px;
 }
 .track-settings-popover .settings-row input[type='text'],
 .track-settings-popover .settings-row input[type='number'],
 .track-settings-popover .settings-row select {
-  background: var(--bg, #0f0f12);
-  color: var(--fg, #e3e3e8);
-  border: 1px solid var(--border, #3a3a44);
+  background: var(--bg, #15141b);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
   border-radius: 4px;
   padding: 2px 6px;
   font-size: 12px;
@@ -555,9 +560,9 @@
 .track-settings-popover .settings-row input[type='color'] {
   width: 32px;
   height: 22px;
-  border: 1px solid var(--border, #3a3a44);
+  border: 1px solid var(--border, #2d2b3a);
   border-radius: 4px;
-  background: var(--bg, #0f0f12);
+  background: var(--bg, #15141b);
   padding: 0;
 }
 .track-settings-popover .settings-checkbox-row {
@@ -569,7 +574,7 @@
   font-size: 12px;
 }
 .track-settings-popover .settings-checkbox-row:hover {
-  color: var(--fg, #e3e3e8);
+  color: var(--fg, #edecee);
 }
 .track-settings-popover .settings-palette-grid {
   display: grid;
@@ -578,7 +583,7 @@
   align-items: center;
 }
 .track-settings-popover .settings-empty {
-  color: var(--fg-dim, #8b8b94);
+  color: var(--fg-dim, #adacae);
   font-size: 11px;
   font-style: italic;
 }
@@ -587,18 +592,18 @@
   justify-content: flex-end;
   gap: 6px;
   padding: 8px 12px;
-  border-top: 1px solid var(--border, #3a3a44);
+  border-top: 1px solid var(--border, #2d2b3a);
 }
 .track-settings-popover .settings-reset-btn {
   background: transparent;
-  color: var(--fg-dim, #8b8b94);
-  border: 1px solid var(--border, #3a3a44);
+  color: var(--fg-dim, #adacae);
+  border: 1px solid var(--border, #2d2b3a);
   border-radius: 4px;
   padding: 3px 10px;
   cursor: pointer;
   font-size: 12px;
 }
 .track-settings-popover .settings-reset-btn:hover {
-  color: var(--fg, #e3e3e8);
-  border-color: var(--fg-dim, #8b8b94);
+  color: var(--fg, #edecee);
+  border-color: var(--fg-dim, #adacae);
 }

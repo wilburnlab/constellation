@@ -76,9 +76,9 @@ export class TerminalPanel {
       fontFamily: 'ui-monospace, SF Mono, Menlo, monospace',
       fontSize: 12,
       theme: {
-        background: '#0a0a0d',
-        foreground: '#e3e3e8',
-        cursor: '#4f9efb',
+        background: '#110f18',
+        foreground: '#edecee',
+        cursor: '#a277ff',
       },
       cursorBlink: false,
       disableStdin: true,

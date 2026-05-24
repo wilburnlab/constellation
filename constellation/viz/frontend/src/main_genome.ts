@@ -21,20 +21,20 @@ async function main(): Promise<void> {
     throw new Error('expected #app root element');
   }
   root.innerHTML =
-    '<div style="padding:16px;color:#8a8a93">Loading session…</div>';
+    '<div style="padding:16px;color:#adacae">Loading session…</div>';
 
   let sessions: SessionSummary[] = [];
   try {
     sessions = await fetchJson<SessionSummary[]>('/api/sessions');
   } catch (err) {
-    root.innerHTML = `<div style="padding:16px;color:#d65e5e">
+    root.innerHTML = `<div style="padding:16px;color:#ff6767">
       Failed to reach /api/sessions: ${(err as Error).message}
     </div>`;
     return;
   }
 
   if (sessions.length === 0) {
-    root.innerHTML = `<div style="padding:16px;color:#d65e5e">
+    root.innerHTML = `<div style="padding:16px;color:#ff6767">
       No sessions registered with the server.
     </div>`;
     return;

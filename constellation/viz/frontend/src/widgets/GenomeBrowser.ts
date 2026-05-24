@@ -1384,7 +1384,7 @@ export class GenomeBrowser {
         y: 5,
         width: widthPx,
         height: OVERVIEW_HEIGHT - 10,
-        fill: '#2a2a33',
+        fill: '#2d2b3a',
       }),
     );
     if (contigLen <= 0) return;
@@ -1398,7 +1398,7 @@ export class GenomeBrowser {
         y: 2,
         width: wClamped,
         height: OVERVIEW_HEIGHT - 4,
-        fill: '#4f9efb',
+        fill: '#a277ff',
         opacity: '0.55',
         class: 'overview-viewport',
       }),
@@ -1407,10 +1407,10 @@ export class GenomeBrowser {
       x: 6,
       y: OVERVIEW_HEIGHT - 5,
       'font-size': '10',
-      fill: '#e3e3e8',
+      fill: '#edecee',
       'pointer-events': 'none',
       'paint-order': 'stroke',
-      stroke: '#0f0f12',
+      stroke: '#15141b',
       'stroke-width': '2',
       'stroke-linejoin': 'round',
     });

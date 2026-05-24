@@ -25,6 +25,7 @@ export class Sidebar {
   private searchTerm = '';
   private container: HTMLElement | null = null;
   private treeEl: HTMLElement | null = null;
+  private searchEl: HTMLInputElement | null = null;
   private activePath: string | null = null;
 
   constructor(opts: SidebarOptions) {
@@ -59,12 +60,13 @@ export class Sidebar {
     const search = document.createElement('input');
     search.className = 'sidebar-search';
     search.type = 'search';
-    search.placeholder = 'Search commands…';
+    search.placeholder = 'Search…';
     search.addEventListener('input', () => {
       this.searchTerm = search.value.trim().toLowerCase();
       this.renderTree();
     });
     toolbar.appendChild(search);
+    this.searchEl = search;
 
     element.appendChild(toolbar);
 
@@ -77,12 +79,20 @@ export class Sidebar {
     this.renderTree();
   }
 
-  private setMode(mode: SidebarMode): void {
+  setMode(mode: SidebarMode): void {
     if (mode === this.mode) return;
     this.mode = mode;
     setStored('sidebar_mode', mode);
     this.applyModeToButtons();
     this.renderTree();
+  }
+
+  getMode(): SidebarMode {
+    return this.mode;
+  }
+
+  focusSearch(): void {
+    this.searchEl?.focus();
   }
 
   private applyModeToButtons(): void {

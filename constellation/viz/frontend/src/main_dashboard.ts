@@ -12,8 +12,22 @@ import type { CliSchema } from './dashboard/types';
 async function main(): Promise<void> {
   const dockRoot = document.getElementById('dock');
   const statusRoot = document.getElementById('statusbar');
-  if (!dockRoot || !statusRoot) {
-    throw new Error('expected #dock and #statusbar root elements');
+  const sidebarRoot = document.getElementById('shell-sidebar');
+  const sidebarBody = document.getElementById('shell-sidebar-body');
+  const sidebarHeader = document.getElementById('shell-sidebar-header');
+  const sidebarRail = document.getElementById('shell-sidebar-rail');
+  if (
+    !dockRoot ||
+    !statusRoot ||
+    !sidebarRoot ||
+    !sidebarBody ||
+    !sidebarHeader ||
+    !sidebarRail
+  ) {
+    throw new Error(
+      'expected #dock, #statusbar, #shell-sidebar, #shell-sidebar-body, ' +
+        '#shell-sidebar-header, and #shell-sidebar-rail root elements',
+    );
   }
 
   let schema: CliSchema;
@@ -21,7 +35,7 @@ async function main(): Promise<void> {
     schema = await fetchJson<CliSchema>('/api/cli/schema');
   } catch (err) {
     dockRoot.innerHTML = `
-      <div style="padding:24px;color:#d65e5e">
+      <div style="padding:24px;color:#ff6767">
         Failed to load CLI schema: ${(err as Error).message}
       </div>`;
     return;
@@ -31,6 +45,10 @@ async function main(): Promise<void> {
     schema,
     dockRoot,
     statusRoot,
+    sidebarRoot,
+    sidebarBody,
+    sidebarHeader,
+    sidebarRail,
   });
   shell.mount(dockRoot);
 }
