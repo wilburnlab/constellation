@@ -5,20 +5,29 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Constellation Dashboard</title>
     <style>
+      /* Palette inspired by the Aura theme by Dalton Menezes (MIT,
+         https://github.com/daltonmenezes/aura-theme); accent selection
+         informed by the Raycast port by Shubh Porwal. Values adapted
+         for Constellation's elevation needs, not copied verbatim. See
+         NOTICE.md at the repo root. */
       :root {
-        --bg: #0f0f12;
-        --bg-elev: #18181d;
-        --bg-elev2: #1f1f26;
-        --fg: #e3e3e8;
-        --fg-dim: #8a8a93;
-        --fg-mute: #5a5a64;
-        --accent: #4f9efb;
-        --accent-soft: rgba(79, 158, 251, 0.15);
-        --border: #2a2a33;
-        --border-strong: #3a3a45;
-        --danger: #d65e5e;
-        --warn: #d6a05e;
-        --ok: #5ed687;
+        --bg: #15141b;
+        --bg-elev: #1c1a25;
+        --bg-elev2: #252231;
+        --bg-rail: #110f18;
+        --fg: #edecee;
+        --fg-dim: #adacae;
+        --fg-mute: #6d6d6d;
+        --accent: #a277ff;
+        --accent-rgb: 162, 119, 255;
+        --accent-soft: rgba(var(--accent-rgb), 0.15);
+        --accent-alt: #61ffca;
+        --accent-alt-rgb: 97, 255, 202;
+        --border: #2d2b3a;
+        --border-strong: #3b334b;
+        --danger: #ff6767;
+        --warn: #ffca85;
+        --ok: #61ffca;
 
         /* dockview-core variable overrides — soften the default look */
         --dv-tab-border-radius: 6px;
@@ -63,11 +72,128 @@
         flex-direction: column;
         height: 100vh;
       }
+      #main-row {
+        flex: 1 1 auto;
+        display: flex;
+        flex-direction: row;
+        min-height: 0;
+      }
       #dock {
         flex: 1 1 auto;
         position: relative;
         overflow: hidden;
       }
+
+      /* Shell sidebar — persistent collapsible rail outside dockview. */
+      #shell-sidebar {
+        flex: 0 0 auto;
+        width: 280px;
+        display: flex;
+        flex-direction: column;
+        background: var(--bg-rail);
+        border-right: 1px solid var(--border);
+        overflow: hidden;
+        transition: width 200ms ease;
+      }
+      #shell-sidebar.collapsed {
+        width: 48px;
+      }
+      #shell-sidebar-header {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 12px;
+        cursor: pointer;
+        user-select: none;
+        border-bottom: 1px solid var(--border);
+        color: var(--fg);
+      }
+      #shell-sidebar.collapsed #shell-sidebar-header {
+        justify-content: center;
+        padding: 10px 0;
+      }
+      #shell-sidebar-header:hover { background: var(--bg-elev); }
+      #shell-sidebar-logo {
+        flex: 0 0 auto;
+        width: 22px;
+        height: 22px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--accent);
+      }
+      #shell-sidebar-logo svg { width: 100%; height: 100%; }
+      #shell-sidebar-wordmark {
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #shell-sidebar.collapsed #shell-sidebar-wordmark { display: none; }
+      #shell-sidebar-body {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      #shell-sidebar.collapsed #shell-sidebar-body { display: none; }
+      #shell-sidebar-rail {
+        flex: 1 1 auto;
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        gap: 4px;
+        padding: 8px 0;
+      }
+      #shell-sidebar.collapsed #shell-sidebar-rail {
+        display: flex;
+      }
+      .shell-rail-btn {
+        background: transparent;
+        color: var(--fg-dim);
+        border: 0;
+        width: 32px;
+        height: 32px;
+        border-radius: 4px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        font-size: 16px;
+        line-height: 1;
+      }
+      .shell-rail-btn:hover { background: var(--bg-elev); color: var(--fg); }
+      .shell-rail-btn.active { color: var(--accent); }
+
+      /* Sidebar entries at the narrow width — allow text to wrap rather
+       * than truncate so verbose command labels stay readable. Compact
+       * paddings to keep the rail visually tight. */
+      #shell-sidebar-body .sidebar {
+        background: transparent;  /* host rail provides --bg-rail */
+      }
+      #shell-sidebar-body .sidebar-entry {
+        padding: 6px 10px;
+      }
+      #shell-sidebar-body .sidebar-entry-label {
+        white-space: normal;
+        word-break: break-word;
+      }
+      #shell-sidebar-body .sidebar-entry-path {
+        white-space: normal;
+        word-break: break-all;
+        line-height: 1.3;
+      }
+      #shell-sidebar-body .sidebar-entry-hint {
+        word-break: break-word;
+      }
+      #shell-sidebar-body .sidebar-group {
+        padding: 10px 10px 4px 10px;
+      }
+
       #statusbar {
         flex: 0 0 auto;
         height: 26px;
@@ -273,7 +399,7 @@
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: #0a0a0d;
+        background: var(--bg-rail);
       }
       .terminal-header {
         flex: 0 0 auto;
@@ -455,7 +581,37 @@
   </head>
   <body>
     <div id="app">
-      <div id="dock"></div>
+      <div id="main-row">
+        <div id="shell-sidebar">
+          <div id="shell-sidebar-header" title="Toggle commands">
+            <span id="shell-sidebar-logo" aria-hidden="true">
+              <!-- Placeholder constellation/sparkle glyph; final logo TBD. -->
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.6" stroke-linecap="round"
+                   stroke-linejoin="round">
+                <circle cx="6" cy="7" r="1.4" fill="currentColor"/>
+                <circle cx="18" cy="6" r="1.4" fill="currentColor"/>
+                <circle cx="12" cy="13" r="1.4" fill="currentColor"/>
+                <circle cx="7" cy="18" r="1.4" fill="currentColor"/>
+                <circle cx="17" cy="17" r="1.4" fill="currentColor"/>
+                <path d="M6 7 L12 13 L18 6 M12 13 L7 18 M12 13 L17 17"
+                      opacity="0.55"/>
+              </svg>
+            </span>
+            <span id="shell-sidebar-wordmark">Constellation</span>
+          </div>
+          <div id="shell-sidebar-body"></div>
+          <div id="shell-sidebar-rail">
+            <button type="button" class="shell-rail-btn"
+                    data-rail="common" title="Common commands">★</button>
+            <button type="button" class="shell-rail-btn"
+                    data-rail="all" title="All commands">☰</button>
+            <button type="button" class="shell-rail-btn"
+                    data-rail="search" title="Search commands">⌕</button>
+          </div>
+        </div>
+        <div id="dock"></div>
+      </div>
       <div id="statusbar">
         <span class="status-text status-idle">Idle</span>
       </div>

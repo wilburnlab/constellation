@@ -5,13 +5,28 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Constellation — Genome Browser</title>
     <style>
+      /* Palette inspired by the Aura theme by Dalton Menezes (MIT,
+         https://github.com/daltonmenezes/aura-theme); accent selection
+         informed by the Raycast port by Shubh Porwal. Values adapted
+         for Constellation's elevation needs, not copied verbatim. See
+         NOTICE.md at the repo root. */
       :root {
-        --bg: #0f0f12;
-        --bg-elev: #18181d;
-        --fg: #e3e3e8;
-        --fg-dim: #8a8a93;
-        --accent: #4f9efb;
-        --border: #2a2a33;
+        --bg: #15141b;
+        --bg-elev: #1c1a25;
+        --bg-elev2: #252231;
+        --fg: #edecee;
+        --fg-dim: #adacae;
+        --fg-mute: #6d6d6d;
+        --accent: #a277ff;
+        --accent-rgb: 162, 119, 255;
+        --accent-soft: rgba(var(--accent-rgb), 0.15);
+        --accent-alt: #61ffca;
+        --accent-alt-rgb: 97, 255, 202;
+        --border: #2d2b3a;
+        --border-strong: #3b334b;
+        --danger: #ff6767;
+        --warn: #ffca85;
+        --ok: #61ffca;
       }
       * { box-sizing: border-box; }
       html, body {
@@ -98,8 +113,8 @@
       }
       .toggle.on {
         color: var(--fg);
-        background: rgba(79, 158, 251, 0.18);
-        border-color: rgba(79, 158, 251, 0.5);
+        background: rgba(var(--accent-rgb), 0.18);
+        border-color: rgba(var(--accent-rgb), 0.5);
       }
       .toolbar-right {
         margin-left: auto;
@@ -138,7 +153,7 @@
         align-items: center;
       }
       .search-row:last-child { border-bottom: none; }
-      .search-row:hover { background: rgba(79, 158, 251, 0.12); }
+      .search-row:hover { background: rgba(var(--accent-rgb), 0.12); }
       .search-name {
         font-family: ui-monospace, SF Mono, Menlo, monospace;
         font-weight: 600;
@@ -154,11 +169,11 @@
       }
       .search-badge.src-reference {
         color: var(--fg);
-        border-color: rgba(79, 158, 251, 0.6);
+        border-color: rgba(var(--accent-rgb), 0.6);
       }
       .search-badge.src-derived {
         color: var(--fg);
-        border-color: rgba(155, 194, 58, 0.6);
+        border-color: rgba(var(--accent-alt-rgb), 0.6);
       }
       .search-coord {
         grid-column: 1 / span 3;

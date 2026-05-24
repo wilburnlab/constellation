@@ -121,7 +121,7 @@ export class StatusBar {
       this.element.appendChild(this.toastEl);
     }
     this.toastEl.style.background =
-      kind === 'warn' ? 'rgba(214, 160, 94, 0.2)' : 'rgba(214, 94, 94, 0.2)';
+      kind === 'warn' ? 'rgba(255, 202, 133, 0.2)' : 'rgba(255, 103, 103, 0.2)';
     this.toastEl.style.color =
       kind === 'warn' ? 'var(--warn)' : 'var(--danger)';
     this.toastEl.textContent = message;
