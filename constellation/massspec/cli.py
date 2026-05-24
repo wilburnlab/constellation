@@ -547,6 +547,33 @@ def _build_classify_novel_peptides_parser(
         type=Path,
         help="Novel proteome FASTA (transcript-derived novel proteins).",
     )
+    p.add_argument(
+        "--annotation-fasta",
+        type=Path,
+        default=None,
+        action="append",
+        help=(
+            "Optional additional FASTA(s) scanned for gene-symbol "
+            "annotations to populate the `gene` column. Recognises "
+            "bracketed `[gene=SYMBOL]` tokens (constellation "
+            "combined.fasta convention), bare `gene=SYMBOL` tokens "
+            "(cartographer convention), and `GN=SYMBOL` (UniProt / "
+            "SwissProt). Pass once per file; can be repeated."
+        ),
+    )
+    p.add_argument(
+        "--protein-counts",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to counts_tpm.parquet (PROTEIN_COUNT_TABLE "
+            "schema: protein_id, sample_name, tpm, ...). When supplied, "
+            "the classifier picks the most-abundant `protein_id` "
+            "(highest mean-total TPM across samples) as the "
+            "representative when multiple novel proteins produce the "
+            "same peptide with the same classification."
+        ),
+    )
     _add_output_dir_arg(p)
     p.add_argument(
         "--resume",
@@ -1883,9 +1910,53 @@ def _cmd_massspec_classify_novel_peptides(args: argparse.Namespace) -> int:
         )
     reference_proteins = read_fasta_proteins(reference_fasta)
     novel_proteins = read_fasta_proteins(novel_fasta)
-    gene_map = build_gene_map_from_fasta_headers(
-        [reference_fasta, novel_fasta]
-    )
+    # The bare reference/novel FASTAs typically don't carry gene tags.
+    # An optional --annotation-fasta (combined.fasta with [gene=...] tags
+    # or SwissProt with GN=...) is the actual source for the gene map.
+    annotation_fastas = args.annotation_fasta or []
+    gene_map_inputs = [reference_fasta, novel_fasta, *annotation_fastas]
+    gene_map = build_gene_map_from_fasta_headers(gene_map_inputs)
+    if not args.no_progress:
+        print(
+            f"[classify-novel-peptides] gene_map: "
+            f"{len(gene_map):,} accessions tagged "
+            f"from {len(gene_map_inputs)} FASTA(s)",
+            file=_sys.stderr,
+        )
+
+    # Optional per-protein abundance map (highest-abundance ORF wins
+    # the row when multiple novel proteins produce the same peptide).
+    protein_abundance: dict[str, float] | None = None
+    if args.protein_counts is not None:
+        if not args.no_progress:
+            print(
+                f"[classify-novel-peptides] loading protein abundance from "
+                f"{args.protein_counts}",
+                file=_sys.stderr,
+            )
+        import pyarrow.parquet as _pq
+        counts_tbl = _pq.read_table(args.protein_counts)
+        # PROTEIN_COUNT_TABLE has columns: protein_id, sample_name, count, tpm
+        # Aggregate to protein_id -> mean tpm across samples.
+        ids = counts_tbl.column("protein_id").to_pylist()
+        tpms = counts_tbl.column("tpm").to_pylist()
+        from collections import defaultdict as _dd
+        sums: dict[str, float] = _dd(float)
+        n_obs: dict[str, int] = _dd(int)
+        for pid, t in zip(ids, tpms):
+            if pid is None or t is None:
+                continue
+            sums[pid] += float(t)
+            n_obs[pid] += 1
+        protein_abundance = {
+            pid: sums[pid] / n_obs[pid] for pid in sums
+        }
+        if not args.no_progress:
+            print(
+                f"[classify-novel-peptides] protein_abundance: "
+                f"{len(protein_abundance):,} proteins with mean TPM",
+                file=_sys.stderr,
+            )
 
     # 4. Classify
     if not args.no_progress:
@@ -1903,6 +1974,7 @@ def _cmd_massspec_classify_novel_peptides(args: argparse.Namespace) -> int:
         reference_proteins=reference_proteins,
         novel_proteins=novel_proteins,
         gene_map=gene_map,
+        protein_abundance=protein_abundance,
         enzyme=args.enzyme,
         max_missed_cleavages=args.max_missed_cleavages,
         min_peptide_length=args.min_peptide_length,

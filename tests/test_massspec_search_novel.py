@@ -753,3 +753,79 @@ def test_empty_input_returns_empty_schema() -> None:
     result = classify_novel_peptides(detected, alignments, reference, novel)
     assert result.num_rows == 0
     assert result.schema.equals(NOVEL_PEPTIDE_TABLE)
+
+
+def test_build_gene_map_bracketed_and_gn(tmp_path: Path) -> None:
+    """Parser handles bare `gene=`, bracketed `[gene=]`, and SwissProt `GN=`."""
+    from constellation.massspec.search.novel import build_gene_map_from_fasta_headers
+
+    fasta = tmp_path / "mixed.fasta"
+    fasta.write_text(
+        ">P1 gene=BARE accession=A1 source=transcriptome\nMAGCKL\n"
+        ">P2 [gene=BRACK] [accession=A2] source=transcriptome\nMAGCKL\n"
+        ">sp|P3|PROT_HUMAN desc OS=Human GN=SWISS PE=1 SV=1\nMAGCKL\n"
+        ">P4 [other=X] source=transcriptome\nMAGCKL\n"
+    )
+    out = build_gene_map_from_fasta_headers([fasta])
+    assert out["P1"] == "BARE"
+    assert out["P2"] == "BRACK"
+    # SwissProt-style accession is "sp|P3|PROT_HUMAN" — first whitespace token
+    assert out["sp|P3|PROT_HUMAN"] == "SWISS"
+    # P4 has no gene tag → not in map
+    assert "P4" not in out
+
+
+def test_classify_picks_most_abundant_transcript() -> None:
+    """When multiple novel proteins produce the same peptide with the same
+    winning classification, the row chosen for `protein_id` should be the
+    one with the highest abundance in the supplied lookup."""
+    from constellation.massspec.search.novel import classify_novel_peptides
+
+    # Same peptide produced by two novel proteins (both whole-protein ORFs
+    # tryptic-digesting to one peptide of length >= 7). The novel has an
+    # insertion relative to the reference; higher-abundance protein should
+    # win the row.
+    pep = "PEPTIDEK"
+    detected = pa.table({"peptide_sequence": pa.array([pep])})
+    novel = pa.table(
+        {
+            "protein_id": pa.array(["N_HIGH", "N_LOW"]),
+            "sequence": pa.array([pep, pep]),
+        }
+    )
+    reference = pa.table(
+        {
+            "protein_id": pa.array(["R1"]),
+            "sequence": pa.array(["PEPTIDK"]),  # 7 aa, missing the 'E' at position 7
+        }
+    )
+    alignments = pa.table(
+        {
+            "query":  pa.array(["N_HIGH", "N_LOW"]),
+            "target": pa.array(["R1", "R1"]),
+            "evalue": pa.array([1e-30, 1e-30]),
+            "qstart": pa.array([1, 1]),
+            "qend":   pa.array([8, 8]),
+            "tstart": pa.array([1, 1]),
+            "tend":   pa.array([7, 7]),
+            "cigar":  pa.array(["6M1I1M", "6M1I1M"]),
+            "alignment_tier": pa.array(["reference", "reference"]),
+        }
+    )
+
+    # Abundance map — N_HIGH is 10x more abundant.
+    abundance = {"N_HIGH": 10.0, "N_LOW": 1.0}
+    result = classify_novel_peptides(
+        detected, alignments, reference, novel,
+        protein_abundance=abundance,
+    )
+    rows = result.to_pylist()
+    insertion_rows = [r for r in rows if r["classification"] == "insertion"]
+    assert len(insertion_rows) >= 1
+    # The chosen protein_id should be the high-abundance one
+    assert insertion_rows[0]["protein_id"] == "N_HIGH"
+
+    # Sanity: when no abundance map is supplied, falls back to the legacy
+    # first-encountered behaviour and still returns a valid row.
+    result_legacy = classify_novel_peptides(detected, alignments, reference, novel)
+    assert result_legacy.num_rows >= 1

@@ -384,6 +384,7 @@ def classify_novel_peptides(
     novel_proteins: pa.Table,
     *,
     gene_map: Mapping[str, str] | None = None,
+    protein_abundance: Mapping[str, float] | None = None,
     enzyme: str = "Trypsin",
     max_missed_cleavages: int = 1,
     min_peptide_length: int = 7,
@@ -433,6 +434,14 @@ def classify_novel_peptides(
     gene_map
         Optional ``protein_id → gene_symbol``. Looked up on the hit's
         ``target`` first, then on the novel ``protein_id``.
+    protein_abundance
+        Optional ``protein_id → abundance`` (e.g. mean TPM across runs).
+        When multiple novel proteins produce the same peptide with the
+        same winning classification, the row whose ``protein_id`` has
+        the highest abundance is chosen as the representative. Falls
+        back to ``0.0`` when a protein_id is missing from the map; when
+        the map itself is ``None``, ties resolve in iteration order
+        (the original behaviour).
     enzyme, max_missed_cleavages, min_peptide_length, max_peptide_length
         Tryptic-digest parameters forwarded to
         :func:`core.sequence.protein.cleave`.
@@ -578,13 +587,22 @@ def classify_novel_peptides(
             )
 
     # 6. Pick the most-specific classification per bare sequence (lowest
-    # priority value wins across the proteins that produce it).
-    rows.sort(
-        key=lambda r: (
+    # priority value wins across the proteins that produce it). Within
+    # the winning class, prefer the row whose `protein_id` has the
+    # highest abundance in `protein_abundance` — that ORF is the most
+    # plausible source transcript for the peptide. When no abundance map
+    # is supplied (or a protein_id is missing from it), abundance falls
+    # back to 0.0 and the original iteration order breaks ties.
+    _abundance: Mapping[str, float] = protein_abundance or {}
+    def _row_key(r: dict[str, object]) -> tuple:
+        pid = r.get("protein_id")
+        abu = float(_abundance.get(pid, 0.0)) if isinstance(pid, str) else 0.0
+        return (
             r["peptide_sequence"],
             _CLASSIFICATION_PRIORITY.get(r["classification"], 99),
+            -abu,  # negate so higher abundance sorts FIRST within ties
         )
-    )
+    rows.sort(key=_row_key)
     winning: dict[str, dict[str, object]] = {}
     for row in rows:
         seq = row["peptide_sequence"]
@@ -648,10 +666,17 @@ def build_gene_map_from_fasta_headers(
 ) -> dict[str, str]:
     """Extract ``protein_accession → gene_symbol`` from FASTA headers.
 
-    Looks for ``gene=<symbol>`` tokens — the convention cartographer's
-    pipeline uses for the combined FASTA. Pure helper; defined here so
-    the CLI handler can pre-build the map from one or more FASTAs and
-    pass the dict in to :func:`classify_novel_peptides`.
+    Recognises three common header conventions:
+
+    - ``gene=SYMBOL`` (bare token; cartographer's earlier convention)
+    - ``[gene=SYMBOL]`` (bracketed token; constellation
+      :func:`build_combined_fasta` writes this form)
+    - ``GN=SYMBOL`` (UniProt / SwissProt convention)
+
+    Pure helper; defined here so the CLI handler can pre-build the map
+    from one or more FASTAs (typically the per-tier
+    ``combined.fasta``) and pass the dict in to
+    :func:`classify_novel_peptides`.
     """
     out: dict[str, str] = {}
     for fasta_path in fasta_paths:
@@ -667,10 +692,19 @@ def build_gene_map_from_fasta_headers(
                 if not tokens:
                     continue
                 accession = tokens[0]
+                gene: str | None = None
                 for token in tokens[1:]:
-                    if token.startswith("gene="):
-                        out[accession] = token[len("gene="):]
+                    # Strip surrounding brackets so '[gene=SYMBOL]' and
+                    # 'gene=SYMBOL' both match.
+                    bare = token.strip("[]")
+                    if bare.startswith("gene="):
+                        gene = bare[len("gene="):]
                         break
+                    if bare.startswith("GN="):
+                        gene = bare[len("GN="):]
+                        break
+                if gene:
+                    out[accession] = gene
     return out
 
 
