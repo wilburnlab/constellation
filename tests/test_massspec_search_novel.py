@@ -443,6 +443,53 @@ def test_tier_inference_marks_non_reference_targets() -> None:
     assert result.column("classification").to_pylist() == ["non_reference"]
 
 
+def test_best_hit_tie_break_prefers_reference_over_non_reference() -> None:
+    """When a query has hits at *identical* e-value against both a
+    reference target and a non-reference (e.g. SwissProt) target — the
+    EEF1A1 case where NP_001393.1 + P68104 carry the same sequence —
+    the per-query best-hit selector must prefer the reference target so
+    the classifier CIGAR-walks against the reference proteome (emitting
+    snp / insertion / etc.) instead of short-circuiting to
+    ``non_reference``."""
+    novel = pa.table(
+        {
+            "protein_id": pa.array(["NOVEL1"]),
+            "sequence": pa.array(["MAGCKLLLLLPPGR"]),
+        }
+    )
+    reference = pa.table(
+        {
+            "protein_id": pa.array(["REF_NP"]),
+            # one mismatch in the peptide span: L → A at protein position 10
+            "sequence": pa.array(["MAGCKLLLLAPPGR"]),
+        }
+    )
+    # Both hits at IDENTICAL e-value. Without the tie-break the SwissProt
+    # row (sorts later alphabetically by target) might win and force
+    # non_reference; with the tie-break the REF_NP row wins and we get snp.
+    alignments = pa.table(
+        {
+            "query": ["NOVEL1", "NOVEL1"],
+            "target": ["SP_SWISS", "REF_NP"],
+            "evalue": [1e-50, 1e-50],
+            "qstart": [1, 1],
+            "qend": [14, 14],
+            "tstart": [1, 1],
+            "tend": [14, 14],
+            "cigar": ["14M", "14M"],
+            "alignment_tier": pa.array([None, None], type=pa.string()),
+        }
+    )
+    detected = pa.table({"peptide_sequence": pa.array(["LLLLLPPGR"])})
+    result = classify_novel_peptides(
+        detected, alignments, reference, novel,
+    )
+    assert result.num_rows == 1
+    assert result.column("classification").to_pylist() == ["snp"]
+    assert result.column("ref_protein_id").to_pylist() == ["REF_NP"]
+    assert result.column("alignment_tier").to_pylist() == ["reference"]
+
+
 def test_foreign_tier_vocabulary_recomputed_from_membership() -> None:
     """Regression for the OSC all-non_reference bug: the input .tab
     carries cartographer's ``refseq`` / ``swissprot`` tier vocabulary

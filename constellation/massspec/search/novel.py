@@ -57,6 +57,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from constellation.core.io.schemas import cast_to_schema
@@ -313,16 +314,40 @@ def _digest_proteins_into_index(
 
 
 def _select_best_hit_per_query(alignments: pa.Table) -> pa.Table:
-    """For each `query`, keep the single hit with the lowest e-value.
+    """For each `query`, keep the single best hit.
+
+    "Best" = lowest e-value, with **ties broken in favour of
+    ``alignment_tier == "reference"`` hits**. This matters when the
+    competitive target carries the same protein under both a RefSeq and
+    a SwissProt accession (e.g. EEF1A1: NP_001393.1 + P68104): mmseqs
+    emits both hits at identical e-values, and without the tie-break
+    half the queries get attributed to the SwissProt target, which
+    forces :func:`classify_single_peptide` to short-circuit to
+    ``"non_reference"`` instead of CIGAR-walking against the reference
+    and emitting ``snp`` / ``insertion`` / ``deletion`` / etc.
+
+    Falls back to e-value-only ordering when the ``alignment_tier``
+    column is absent (older callers, raw mmseqs output).
 
     Matches cartographer.parse_mmseqs_hits's per-query best-hit
     selection. Stable under ties (first occurrence wins).
     """
     if alignments.num_rows == 0:
         return alignments
-    sorted_t = alignments.sort_by(
-        [("query", "ascending"), ("evalue", "ascending")]
-    )
+    sort_keys: list[tuple[str, str]] = [
+        ("query", "ascending"),
+        ("evalue", "ascending"),
+    ]
+    if "alignment_tier" in alignments.column_names:
+        # tier_rank = 0 for reference, 1 otherwise → reference wins ties.
+        tier_rank = pc.if_else(
+            pc.equal(alignments.column("alignment_tier"), "reference"),
+            pa.scalar(0, type=pa.int8()),
+            pa.scalar(1, type=pa.int8()),
+        )
+        alignments = alignments.append_column("_tier_rank", tier_rank)
+        sort_keys.append(("_tier_rank", "ascending"))
+    sorted_t = alignments.sort_by(sort_keys)
     queries = sorted_t.column("query").to_pylist()
     keep: list[int] = []
     seen: set[str] = set()
@@ -331,7 +356,10 @@ def _select_best_hit_per_query(alignments: pa.Table) -> pa.Table:
             continue
         seen.add(q)
         keep.append(i)
-    return sorted_t.take(keep)
+    out = sorted_t.take(keep)
+    if "_tier_rank" in out.column_names:
+        out = out.drop(["_tier_rank"])
+    return out
 
 
 def _infer_alignment_tier(
