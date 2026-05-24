@@ -673,6 +673,12 @@ def build_gene_map_from_fasta_headers(
       :func:`build_combined_fasta` writes this form)
     - ``GN=SYMBOL`` (UniProt / SwissProt convention)
 
+    For UniProt-style pipe-delimited headers (``sp|P04483|TETR2_HUMAN``),
+    the bare UniProt accession (``P04483``) is registered as a SECONDARY
+    key alongside the full first-token identifier. This matches what
+    mmseqs2 reports in its ``target`` column for SwissProt databases
+    (the middle pipe field, not the whole ``sp|...|...`` string).
+
     Pure helper; defined here so the CLI handler can pre-build the map
     from one or more FASTAs (typically the per-tier
     ``combined.fasta``) and pass the dict in to
@@ -705,7 +711,65 @@ def build_gene_map_from_fasta_headers(
                         break
                 if gene:
                     out[accession] = gene
+                    # UniProt sp|ACC|NAME — register bare ACC as alias
+                    # so lookups by the bare accession (what mmseqs2
+                    # reports for SwissProt targets) succeed.
+                    if "|" in accession:
+                        parts = accession.split("|")
+                        if len(parts) >= 2 and parts[1]:
+                            out.setdefault(parts[1], gene)
     return out
+
+
+def protein_to_gene_from_swissprot(fasta_path: "Path | str") -> dict[str, str]:
+    """Return ``{bare_accession: gene_symbol}`` from a SwissProt / UniProt FASTA.
+
+    Parses ``GN=`` tags from UniProt-format FASTA headers. Keys are the
+    BARE accession extracted from the pipe-delimited header (``"P04483"``
+    from ``"sp|P04483|TETR2_HUMAN"``) — matching the identifiers mmseqs2
+    reports in its ``target`` column when searching against a SwissProt
+    database.
+
+    Non-pipe-delimited headers fall back to the first whitespace token
+    as the key. Entries without a ``GN=`` tag are omitted.
+
+    Mirrors :func:`cartographer.data.fasta.protein_to_gene_from_swissprot`
+    so downstream code can drop in the same gene-map shape.
+
+    Parameters
+    ----------
+    fasta_path
+        Path to a SwissProt or UniProt FASTA file.
+
+    Returns
+    -------
+    dict[str, str]
+        ``{bare_accession: gene_symbol}``. Suitable as input to
+        :func:`build_combined_fasta`'s ``reference_gene_map`` argument
+        (merged with the RefSeq ``.gbff`` map for full coverage).
+    """
+    import re as _re
+
+    mapping: dict[str, str] = {}
+    p = Path(fasta_path)
+    if not p.is_file():
+        return mapping
+    with p.open() as fh:
+        for line in fh:
+            if not line.startswith(">"):
+                continue
+            header = line[1:].rstrip("\n")
+            parts = header.split("|")
+            if len(parts) >= 2 and parts[1]:
+                key = parts[1]
+            else:
+                key = header.split()[0] if header.split() else ""
+            if not key:
+                continue
+            m = _re.search(r"\bGN=(\S+)", header)
+            if m:
+                mapping[key] = m.group(1)
+    return mapping
 
 
 def read_fasta_proteins(path: "Path | str") -> pa.Table:
@@ -750,6 +814,7 @@ __all__ = [
     "build_gene_map_from_fasta_headers",
     "classify_novel_peptides",
     "classify_single_peptide",
+    "protein_to_gene_from_swissprot",
     "read_fasta_proteins",
     "save_novel_peptides",
 ]

@@ -470,3 +470,91 @@ def test_collect_protein_ids_from_complex_headers(tmp_path: Path) -> None:
     p = tmp_path / "fasta_with_desc.fasta"
     p.write_text(">sp|P12345|TEST extra info\nMKLIGHT\n>NP_001 [organism=Homo sapiens]\nACDEFG\n")
     assert collect_protein_ids(p) == {"sp|P12345|TEST", "NP_001"}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# deduplicate_fasta + swissprot-aligned novel gene tagging
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_deduplicate_fasta_first_occurrence_wins(tmp_path: Path) -> None:
+    """deduplicate_fasta drops identical-sequence entries (case-insensitive),
+    keeps the first occurrence's header verbatim."""
+    from constellation.transcriptome_to_proteome import deduplicate_fasta
+
+    inp = tmp_path / "in.fasta"
+    out = tmp_path / "out.fasta"
+    inp.write_text(
+        ">NP_001.1 protein A\nMAGCKLPLS\n"
+        ">XP_001.1 predicted dup of A\nMAGCKLPLS\n"
+        ">NP_002.1 protein B\nMAGCKLPLT\n"
+        ">NP_003.1 same seq B lowercase\nmagcklplt\n"
+    )
+    n = deduplicate_fasta(inp, out)
+    assert n == 2
+    text = out.read_text()
+    # First occurrence preserved with its full header
+    assert ">NP_001.1 protein A" in text
+    assert ">NP_002.1 protein B" in text
+    # Duplicates dropped
+    assert ">XP_001.1" not in text
+    assert ">NP_003.1" not in text
+
+
+def test_build_combined_fasta_swissprot_aligned_novel_gets_gene(tmp_path: Path) -> None:
+    """When a novel ORF aligns to a SwissProt accession, build_combined_fasta
+    must tag its header with the SwissProt gene symbol — using the merged
+    gene_map (.gbff + GN= entries). This is the regression that drove the
+    cartographer-style architecture: previously the gene_map was refseq-only
+    and SwissProt-aligned novels had no [gene=X] tag."""
+    from constellation.transcriptome_to_proteome import build_combined_fasta
+
+    # One reference protein + two novel ORFs (one aligns to refseq, one to swissprot)
+    ref = tmp_path / "reference.fasta"
+    _make_proteins_fasta(ref, [("NP_REF1", "MAAAAA")])
+
+    novel_table = pa.table(
+        {
+            "protein_id": pa.array(["NOV_REFHIT", "NOV_SPHIT"]),
+            "sequence":   pa.array(["MBBBBB", "MCCCCC"]),
+        }
+    )
+
+    alignment_hits = pa.table(
+        {
+            "query":  pa.array(["NOV_REFHIT", "NOV_SPHIT"]),
+            "target": pa.array(["NP_REF1",   "P04483"]),  # bare UniProt acc
+            "evalue": pa.array([1e-30, 1e-30]),
+            "qstart": pa.array([1, 1]),
+            "qend":   pa.array([6, 6]),
+            "tstart": pa.array([1, 1]),
+            "tend":   pa.array([6, 6]),
+            "cigar":  pa.array(["6M", "6M"]),
+            "alignment_tier": pa.array(["reference", "swissprot"]),
+        }
+    )
+
+    # Merged gene_map: refseq + swissprot. Keys match what mmseqs2 reports.
+    gene_map = {"NP_REF1": "REFGENE", "P04483": "TETR2"}
+
+    out = tmp_path / "combined.fasta"
+    n_written, stats = build_combined_fasta(
+        reference_fasta=ref,
+        filtered_novel=novel_table,
+        alignment_hits=alignment_hits,
+        reference_gene_map=gene_map,
+        output_path=out,
+    )
+    text = out.read_text()
+    assert n_written == 3   # one ref + two novel
+    assert "[gene=REFGENE]" in text       # reference protein tagged
+    assert "[gene=TETR2]" in text         # SwissProt-aligned novel tagged
+    assert stats["no_gene"] == 0          # nothing missed
+
+    # Verify the SwissProt-aligned novel ORF specifically:
+    sp_novel_lines = [l for l in text.splitlines()
+                       if l.startswith(">NOV_SPHIT")]
+    assert len(sp_novel_lines) == 1
+    assert "[gene=TETR2]" in sp_novel_lines[0]
+    assert "[accession=P04483]" in sp_novel_lines[0]
+    assert "[aligned_to=swissprot]" in sp_novel_lines[0]

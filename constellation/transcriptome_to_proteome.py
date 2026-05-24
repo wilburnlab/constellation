@@ -97,6 +97,54 @@ def _header_id(header: str) -> str:
     return parts[0] if parts else ""
 
 
+def deduplicate_fasta(
+    input_fasta: Path | str,
+    output_fasta: Path | str,
+) -> int:
+    """Write a deduplicated copy of a FASTA file (first occurrence per
+    unique protein SEQUENCE wins).
+
+    Mirrors :func:`cartographer.data.fasta.deduplicate_fasta`. Sequences
+    that appear under multiple accessions (RefSeq has many isoform pairs
+    where ``NP_*`` and ``XP_*`` translate to identical strings) collapse
+    to the first accession encountered. Headers are preserved verbatim
+    for the winning accession.
+
+    This is the cartographer-style upstream dedup that ensures mmseqs2
+    alignment targets and :func:`build_combined_fasta` consume the same
+    accession set — alignment hits cannot reference an accession dropped
+    later in combined.fasta, which is what causes gene-map gaps in the
+    classifier.
+
+    Parameters
+    ----------
+    input_fasta
+        Source FASTA (may be gzipped).
+    output_fasta
+        Destination for the deduplicated FASTA.
+
+    Returns
+    -------
+    int
+        Number of records written (= unique-sequence count).
+    """
+    input_fasta = Path(input_fasta)
+    output_fasta = Path(output_fasta)
+    output_fasta.parent.mkdir(parents=True, exist_ok=True)
+    seen: set[str] = set()
+    n_written = 0
+    with output_fasta.open("w") as out:
+        for header, seq in _iter_fasta(input_fasta):
+            up = seq.upper()
+            if up in seen:
+                continue
+            seen.add(up)
+            out.write(f">{header}\n")
+            _write_seq(out, up)
+            n_written += 1
+    return n_written
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Stage 2 — filter novel proteins by avg TPM + dedup vs reference
 # ──────────────────────────────────────────────────────────────────────
@@ -709,6 +757,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     from constellation.massspec.search import (
         apply_collision_filter,
         filter_elib_by_losers,
+        protein_to_gene_from_swissprot,
     )
     from constellation.massspec.search.encyclopedia import (
         run_library_export,
@@ -769,6 +818,25 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     t_start = time.monotonic()
     stage_manifests: dict[str, dict] = {}
 
+    # ── Stage 0: dedupe reference FASTA on protein SEQUENCE ────────────
+    # Cartographer-style upstream dedup. Every subsequent stage that
+    # consumes the reference proteome (novel-vs-ref filter, alignment
+    # target, combined.fasta build) uses this deduped file so all three
+    # operate on the same accession set. Without this, the alignment can
+    # target XP_* accessions that combined.fasta drops as duplicates,
+    # leaving the classifier with no gene-map entry for them.
+    deduped_refseq = output_dir / "00_deduped_refseq" / "deduped_refseq.fasta"
+    if not deduped_refseq.exists():
+        deduped_refseq.parent.mkdir(parents=True, exist_ok=True)
+        n_unique = deduplicate_fasta(reference_fasta, deduped_refseq)
+        _log(f"Stage 0: deduplicate_fasta wrote {n_unique:,} unique sequences "
+             f"→ {deduped_refseq}")
+    else:
+        _log(f"Stage 0: deduped_refseq.fasta already exists; reusing")
+    # From here on, downstream stages MUST consume `deduped_refseq` rather
+    # than the raw `reference_fasta` argument.
+    reference_fasta_for_pipeline = deduped_refseq
+
     # ── Stage 1: read + TPM ────────────────────────────────────────────
     stage_dir = output_dir / "01_protein_counts"
     if not _stage_done(stage_dir, args.resume):
@@ -803,7 +871,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         novel_table, n_novel = filter_and_write_novel_fasta(
             counts_tpm=counts_tpm,
             proteins_fasta=proteins_fasta,
-            reference_fasta=reference_fasta,
+            reference_fasta=reference_fasta_for_pipeline,
             output_path=novel_path,
             min_avg_tpm=args.min_avg_tpm,
         )
@@ -827,7 +895,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         scratch = stage_dir / ".scratch"
         target_fasta = stage_dir / "_target.fasta"
         write_competitive_target_fasta(
-            reference_fasta=reference_fasta,
+            reference_fasta=reference_fasta_for_pipeline,
             swissprot_fasta=swissprot_fasta,
             output_path=target_fasta,
         )
@@ -851,7 +919,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         # restores the source column cartographer's two-tier search emitted
         # (feeds the combined.fasta [aligned_to=...] header tag + the
         # classifier's tier inference).
-        alignment_hits = _tag_alignment_tier(alignment_hits, reference_fasta)
+        alignment_hits = _tag_alignment_tier(alignment_hits, reference_fasta_for_pipeline)
         ah_dir = stage_dir / "alignment_hits"
         ah_dir.mkdir(parents=True, exist_ok=True)
         pq.write_table(alignment_hits, ah_dir / "alignment_hits.parquet")
@@ -898,9 +966,20 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             alignment_hits=alignment_hits,
             evalue_threshold=args.evalue_threshold,
         )
+        # Merged gene map: RefSeq .gbff (NP_/XP_ → gene) ∪ SwissProt GN= (bare
+        # UniProt accession → gene). Cartographer-style — combined.fasta gets
+        # [gene=X] tags for both refseq-aligned AND swissprot-aligned novel
+        # ORFs, so the classifier needs no other gene source downstream.
         gene_map = read_reference_gene_map(reference_annotation)
+        n_refseq_genes = len(gene_map)
+        sp_gene_map = protein_to_gene_from_swissprot(swissprot_fasta)
+        gene_map.update(sp_gene_map)
+        _log(
+            f"Stage 4: gene_map = {n_refseq_genes:,} RefSeq + "
+            f"{len(sp_gene_map):,} SwissProt = {len(gene_map):,} total entries"
+        )
         n_written, fasta_stats = build_combined_fasta(
-            reference_fasta=reference_fasta,
+            reference_fasta=reference_fasta_for_pipeline,
             filtered_novel=filtered_novel,
             alignment_hits=alignment_hits,
             reference_gene_map=gene_map,
@@ -914,8 +993,11 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             subcommand="04_combined_fasta",
             params={
                 "evalue_threshold": args.evalue_threshold,
-                "gene_map_source": str(reference_annotation),
+                "gene_map_refseq_source": str(reference_annotation),
+                "gene_map_swissprot_source": str(swissprot_fasta),
                 "gene_map_size": len(gene_map),
+                "gene_map_refseq_entries": n_refseq_genes,
+                "gene_map_swissprot_entries": len(sp_gene_map),
             },
             counts={"n_written": n_written, **fasta_stats},
         )

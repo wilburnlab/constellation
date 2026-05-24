@@ -37,6 +37,7 @@ from constellation.massspec.search.novel import (
     build_gene_map_from_fasta_headers,
     classify_novel_peptides,
     classify_single_peptide,
+    protein_to_gene_from_swissprot,
     read_fasta_proteins,
     save_novel_peptides,
 )
@@ -52,6 +53,7 @@ __all__ = [
     "classify_novel_peptides",
     "classify_single_peptide",
     "filter_elib_by_losers",
+    "protein_to_gene_from_swissprot",
     "read_fasta_proteins",
     "save_novel_peptides",
     "save_search",
