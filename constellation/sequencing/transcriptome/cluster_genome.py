@@ -481,7 +481,47 @@ def cluster_by_fingerprint(
     _p("sort done")
     boundaries = _cluster_boundaries(sorted_keys)
     n_boundaries = len(boundaries)
-    _p(f"boundary walk: {n_boundaries:,} clusters")
+    if n_boundaries > 0:
+        sizes_np = np.array([sz for _, sz in boundaries], dtype=np.int64)
+        _p(
+            f"boundary walk: {n_boundaries:,} clusters, "
+            f"size min={int(sizes_np.min())} median={int(np.median(sizes_np))} "
+            f"p99={int(np.percentile(sizes_np, 99))} "
+            f"max={int(sizes_np.max())}"
+        )
+        del sizes_np
+    else:
+        _p("boundary walk: 0 clusters")
+
+    # Hoist source-column references out of the loop. (combine_chunks
+    # is intentionally NOT called on `reads` or `fingerprints` — the
+    # sequence/read_id columns at PromethION scale would force a single
+    # contiguous buffer allocation of tens-to-hundreds of GB. Per-call
+    # ChunkedArray dispatch is cheap relative to the per-cluster work
+    # inside _emit_cluster, so the right tradeoff is to live with the
+    # chunked layout here.)
+    sk_row_idx = sorted_keys.column("row_idx")
+    sk_reads_idx = sorted_keys.column("reads_idx")
+    sk_primary_idx = sorted_keys.column("primary_idx")
+    sk_sample_id = sorted_keys.column("sample_id")
+    sk_metrics_idx = (
+        sorted_keys.column("metrics_idx") if metrics_table is not None else None
+    )
+    reads_seq = reads.column("sequence") if reads.num_rows > 0 else None
+    reads_qual = (
+        reads.column("dorado_quality")
+        if reads.num_rows > 0 and has_quality
+        else None
+    )
+    pri_aid = primary_lookup.column("alignment_id")
+    pri_rstart = primary_lookup.column("ref_start")
+    if metrics_table is not None:
+        m_match = metrics_table.column("n_match_sum")
+        m_mismatch = metrics_table.column("n_mismatch_sum")
+        m_insert = metrics_table.column("n_insert_sum")
+        m_delete = metrics_table.column("n_delete_sum")
+        m_csaware = metrics_table.column("cs_aware")
+    _p("source column refs hoisted — entering per-cluster loop")
 
     # ── Per-cluster assembly + emission ─────────────────────────
     cluster_rows: list[dict[str, Any]] = []
@@ -493,40 +533,54 @@ def cluster_by_fingerprint(
         _SAMPLE_NULL_SENTINEL, type=pa.int64()
     )
 
+    import time as _time
+    loop_t0 = _time.perf_counter()
+    last_progress_t = loop_t0
+    PROGRESS_INTERVAL_S = 30.0  # heartbeat between % milestones
+    SLOW_CLUSTER_WARN_S = 60.0  # per-cluster wall-time warning
+    DETAIL_FIRST_N = 5  # detailed per-cluster timing for the first N
+
     for i, (start, size) in enumerate(boundaries):
-        if progress is not None and i > 0 and i % log_every == 0:
-            _p(
-                f"  per-cluster loop: {i:,} / {n_boundaries:,} "
-                f"({100 * i / n_boundaries:.1f}%) — emitted={len(cluster_rows):,}"
-            )
+        # Heartbeat: % milestone OR ≥30 s since last progress line.
+        if progress is not None and i > 0:
+            now = _time.perf_counter()
+            since_progress = now - last_progress_t
+            if i % log_every == 0 or since_progress >= PROGRESS_INTERVAL_S:
+                elapsed = now - loop_t0
+                rate = i / elapsed if elapsed > 0 else 0.0
+                _p(
+                    f"  per-cluster loop: {i:,} / {n_boundaries:,} "
+                    f"({100 * i / n_boundaries:.1f}%) — "
+                    f"emitted={len(cluster_rows):,} membership={len(membership_rows):,} "
+                    f"rate={rate:.1f} clusters/s loop_elapsed={elapsed:.1f}s"
+                )
+                last_progress_t = now
+
+        cluster_t0 = _time.perf_counter()
+        if progress is not None and i < DETAIL_FIRST_N:
+            _p(f"  cluster {i}: start size={size}")
+
         # Per-cluster slice of sort keys + source-row indices.
-        row_indices = sorted_keys.column("row_idx").slice(start, size)
-        reads_indices = sorted_keys.column("reads_idx").slice(start, size)
-        primary_indices = sorted_keys.column("primary_idx").slice(start, size)
-        sample_filled_slice = sorted_keys.column("sample_id").slice(
-            start, size
-        )
+        row_indices = sk_row_idx.slice(start, size)
+        reads_indices = sk_reads_idx.slice(start, size)
+        primary_indices = sk_primary_idx.slice(start, size)
+        sample_filled_slice = sk_sample_id.slice(start, size)
 
         # Take from each source. ``pc.take`` propagates nulls.
         fp_slice = fingerprints.take(row_indices)
-        if reads.num_rows > 0:
-            seq_col = pc.take(reads.column("sequence"), reads_indices)
-            if has_quality:
-                quality_col = pc.take(
-                    reads.column("dorado_quality"), reads_indices
-                )
-            else:
-                quality_col = pa.nulls(size, type=pa.float32())
+        if reads_seq is not None:
+            seq_col = pc.take(reads_seq, reads_indices)
+            quality_col = (
+                pc.take(reads_qual, reads_indices)
+                if reads_qual is not None
+                else pa.nulls(size, type=pa.float32())
+            )
         else:
             seq_col = pa.nulls(size, type=pa.string())
             quality_col = pa.nulls(size, type=pa.float32())
 
-        aid_col = pc.take(
-            primary_lookup.column("alignment_id"), primary_indices
-        )
-        rstart_col = pc.take(
-            primary_lookup.column("ref_start"), primary_indices
-        )
+        aid_col = pc.take(pri_aid, primary_indices)
+        rstart_col = pc.take(pri_rstart, primary_indices)
 
         # Un-sentinel sample_id for the emitted slice.
         sample_col = pc.if_else(
@@ -550,27 +604,22 @@ def cluster_by_fingerprint(
             "ref_start": rstart_col,
             "sample_id": sample_col,
         }
-        if metrics_table is not None:
-            metrics_indices = sorted_keys.column("metrics_idx").slice(
-                start, size
-            )
-            slice_cols["n_match_sum"] = pc.take(
-                metrics_table.column("n_match_sum"), metrics_indices
-            )
-            slice_cols["n_mismatch_sum"] = pc.take(
-                metrics_table.column("n_mismatch_sum"), metrics_indices
-            )
-            slice_cols["n_insert_sum"] = pc.take(
-                metrics_table.column("n_insert_sum"), metrics_indices
-            )
-            slice_cols["n_delete_sum"] = pc.take(
-                metrics_table.column("n_delete_sum"), metrics_indices
-            )
-            slice_cols["cs_aware"] = pc.take(
-                metrics_table.column("cs_aware"), metrics_indices
-            )
+        if metrics_table is not None and sk_metrics_idx is not None:
+            metrics_indices = sk_metrics_idx.slice(start, size)
+            slice_cols["n_match_sum"] = pc.take(m_match, metrics_indices)
+            slice_cols["n_mismatch_sum"] = pc.take(m_mismatch, metrics_indices)
+            slice_cols["n_insert_sum"] = pc.take(m_insert, metrics_indices)
+            slice_cols["n_delete_sum"] = pc.take(m_delete, metrics_indices)
+            slice_cols["cs_aware"] = pc.take(m_csaware, metrics_indices)
         slice_table = pa.table(slice_cols)
 
+        if progress is not None and i < DETAIL_FIRST_N:
+            _p(
+                f"  cluster {i}: slice_table built "
+                f"({_time.perf_counter() - cluster_t0:.2f}s) — entering _emit_cluster"
+            )
+
+        emit_t0 = _time.perf_counter()
         emitted = _emit_cluster(
             slice_table,
             cluster_id=next_cluster_id,
@@ -585,6 +634,21 @@ def cluster_by_fingerprint(
             has_metrics=metrics_table is not None,
             has_quality=has_quality,
         )
+        cluster_dt = _time.perf_counter() - cluster_t0
+        emit_dt = _time.perf_counter() - emit_t0
+
+        if progress is not None and i < DETAIL_FIRST_N:
+            _p(
+                f"  cluster {i}: done in {cluster_dt:.2f}s "
+                f"(_emit_cluster={emit_dt:.2f}s)"
+            )
+        elif progress is not None and cluster_dt >= SLOW_CLUSTER_WARN_S:
+            _p(
+                f"  slow cluster {i}: size={size:,} "
+                f"took {cluster_dt:.1f}s (_emit_cluster={emit_dt:.1f}s)"
+            )
+            last_progress_t = _time.perf_counter()
+
         if emitted is None:
             continue
         cluster_row, members_rows = emitted
