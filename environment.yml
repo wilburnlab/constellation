@@ -63,6 +63,10 @@ dependencies:
     # pythonnet 3.x — needed for .NET CLR interop from Python 3.12. The
     # conda-forge feedstock caps at Python 3.9, so pip is authoritative.
     - pythonnet>=3.0.3
+    # xxhash — 64-bit non-cryptographic hash used by
+    # transcriptome.fingerprints. blake2b was ~µs/call in Python; xxh64
+    # is ~100ns and bounds the 200M-alignment fingerprint loop to seconds.
+    - xxhash>=3.4
     # The package itself, installed editable for development. The
     # `sequencing` extra pulls in pysam, edlib, parasail, pod5 (all
     # PyPI manylinux wheels — no source build, fast on cluster nodes

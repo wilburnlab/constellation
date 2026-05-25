@@ -4,7 +4,7 @@ The Phase-2 cluster key. For each primary alignment, project its
 ``ALIGNMENT_BLOCK_TABLE`` rows into a per-read junction sequence,
 look up each ``(donor, acceptor)`` against the supplied
 ``INTRON_TABLE`` to substitute its canonical ``intron_id``, hash via
-``blake2b`` over the resulting ``(contig_id, strand, [intron_id, ...])``
+``xxh64`` over the resulting ``(contig_id, strand, [intron_id, ...])``
 tuple, and emit ``READ_FINGERPRINT_TABLE``.
 
 Two reads with the same ``fingerprint_hash`` describe the same
@@ -29,85 +29,24 @@ policy used elsewhere in the resolve stage (e.g. unknown-contig drops);
 in normal pipeline use the introns table is built from the same
 ``alignment_blocks`` input so every junction has a match. Mismatched
 inputs surface as "fewer fingerprints than reads."
+
+Implementation: Arrow joins + group_by for the per-block work, numpy
+shift for vectorized junction derivation, hash-join for intron_id
+substitution, and a tight per-alignment xxh64 loop bounded by
+N_alignments (not N_blocks). String columns (``read_id``, ``ref_name``)
+stay out of the heavy block-cardinality sort — they re-attach via a
+small post-aggregation join. See ``sequencing/CLAUDE.md`` "Resolve-stage
+pitfalls" for the doctrine.
 """
 
 from __future__ import annotations
 
-import hashlib
-
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import xxhash
 
 from constellation.sequencing.schemas.alignment import READ_FINGERPRINT_TABLE
-
-
-def _build_contig_id_lookup(contigs: pa.Table) -> dict[str, int]:
-    """``CONTIG_TABLE.name`` → ``contig_id`` dict."""
-    return {
-        str(name): int(cid)
-        for name, cid in zip(
-            contigs.column("name").to_pylist(),
-            contigs.column("contig_id").to_pylist(),
-            strict=True,
-        )
-    }
-
-
-def _build_intron_lookup(
-    introns: pa.Table,
-) -> dict[tuple[int, str, int, int], int]:
-    """``(contig_id, strand, donor_pos, acceptor_pos)`` → ``intron_id``.
-
-    Multiple rows in INTRON_TABLE can share an ``intron_id`` (cluster
-    membership), but the four-tuple key is unique per row by construction
-    (``aggregate_junctions`` produces one row per distinct observed
-    position pair, and ``cluster_junctions`` preserves row count).
-    """
-    contig_ids = introns.column("contig_id").to_pylist()
-    strands = introns.column("strand").to_pylist()
-    donors = introns.column("donor_pos").to_pylist()
-    acceptors = introns.column("acceptor_pos").to_pylist()
-    intron_ids = introns.column("intron_id").to_pylist()
-    return {
-        (int(c), str(s), int(d), int(a)): int(iid)
-        for c, s, d, a, iid in zip(
-            contig_ids, strands, donors, acceptors, intron_ids,
-            strict=True,
-        )
-    }
-
-
-def _hash_intron_sequence(
-    contig_id: int,
-    strand: str,
-    intron_ids: list[int],
-) -> int:
-    """blake2b-8 over the canonical tuple. Stdlib only."""
-    h = hashlib.blake2b(digest_size=8)
-    h.update(contig_id.to_bytes(8, "little", signed=True))
-    h.update(strand.encode("ascii"))
-    h.update(len(intron_ids).to_bytes(4, "little", signed=False))
-    for iid in intron_ids:
-        h.update(iid.to_bytes(8, "little", signed=True))
-    return int.from_bytes(h.digest(), "little", signed=False)
-
-
-def _format_signature(
-    contig_name: str,
-    junctions: list[tuple[int, int]],
-) -> str:
-    """Human-readable signature: ``"chrN:donor1-acceptor1,donor2-acceptor2"``.
-
-    Uses raw observed donor / acceptor positions (not seed positions or
-    intron_ids) so per-read splicing variation stays visible in the
-    diagnostic output even when reads cluster together. Diagnostic-only;
-    not the cluster key. Empty intron-chain (single block) renders as
-    ``"chrN:."``.
-    """
-    if not junctions:
-        return f"{contig_name}:."
-    parts = ",".join(f"{d}-{a}" for d, a in junctions)
-    return f"{contig_name}:{parts}"
 
 
 def compute_read_fingerprints(
@@ -148,25 +87,10 @@ def compute_read_fingerprints(
     pa.Table conforming to ``READ_FINGERPRINT_TABLE``. Empty if no
     primary alignment has any aligned block.
     """
-    if (
-        alignment_blocks.num_rows == 0
-        or alignments.num_rows == 0
-        or introns.num_rows == 0
-    ):
-        # When the introns table is empty but blocks/alignments aren't,
-        # single-block alignments still produce zero-junction
-        # fingerprints — they don't need an introns lookup at all.
-        # Fall through to the main path so this case is handled below.
-        if introns.num_rows == 0 and (
-            alignment_blocks.num_rows == 0 or alignments.num_rows == 0
-        ):
-            return READ_FINGERPRINT_TABLE.empty_table()
-        if alignment_blocks.num_rows == 0 or alignments.num_rows == 0:
-            return READ_FINGERPRINT_TABLE.empty_table()
+    if alignment_blocks.num_rows == 0 or alignments.num_rows == 0:
+        return READ_FINGERPRINT_TABLE.empty_table()
 
-    # Filter to primary alignments — the cardinality contract is one
-    # fingerprint row per read, and primary alignments are how we
-    # disambiguate when minimap2 emits secondary/supplementary.
+    # ── Filter primaries + resolve contig_id (inner-join drops unknown contigs)
     primary_mask = pc.and_(
         pc.invert(alignments.column("is_secondary")),
         pc.invert(alignments.column("is_supplementary")),
@@ -177,89 +101,288 @@ def compute_read_fingerprints(
     if primary.num_rows == 0:
         return READ_FINGERPRINT_TABLE.empty_table()
 
-    # Hash-join blocks to primary on alignment_id; secondary/supplementary
-    # rows in alignment_blocks fall away naturally.
-    joined = alignment_blocks.join(primary, keys="alignment_id", join_type="inner")
+    contigs_min = contigs.select(["contig_id", "name"]).rename_columns(
+        ["contig_id", "ref_name"]
+    )
+    primary = primary.join(contigs_min, keys="ref_name", join_type="inner")
+    if primary.num_rows == 0:
+        return READ_FINGERPRINT_TABLE.empty_table()
+
+    # ── Join blocks ⨝ primary on numeric-only columns; strings stay out
+    # of the block-cardinality sort. read_id (~22 GB at PromethION scale,
+    # int32 offset-overflow risk) lives only on the alignment-cardinality
+    # `primary` table; we re-attach it via a small join at the end.
+    primary_numeric = primary.select(["alignment_id", "contig_id", "strand"])
+    blocks_proj = alignment_blocks.select(
+        ["alignment_id", "block_index", "ref_start", "ref_end"]
+    )
+    joined = blocks_proj.join(
+        primary_numeric, keys="alignment_id", join_type="inner"
+    )
     if joined.num_rows == 0:
         return READ_FINGERPRINT_TABLE.empty_table()
 
-    name_to_id = _build_contig_id_lookup(contigs)
-    intron_lookup = _build_intron_lookup(introns)
+    # ── Sort by (alignment_id, block_index). strand carries as a small
+    # string column (1-char values), well under int32 offset limit at
+    # block cardinality. Mirrors the aggregate_junctions blueprint at
+    # quant/junctions.py:188-206.
+    sorted_blocks = joined.sort_by(
+        [("alignment_id", "ascending"), ("block_index", "ascending")]
+    ).combine_chunks()
 
-    # Group blocks per alignment, ordered by block_index.
-    by_aid: dict[int, list[tuple[int, int, int]]] = {}
-    aid_meta: dict[int, dict[str, object]] = {}
-    aids = joined.column("alignment_id").to_pylist()
-    bidx = joined.column("block_index").to_pylist()
-    rstart = joined.column("ref_start").to_pylist()
-    rend = joined.column("ref_end").to_pylist()
-    rid = joined.column("read_id").to_pylist()
-    rname = joined.column("ref_name").to_pylist()
-    strand = joined.column("strand").to_pylist()
-
-    for a, bi, rs, re_, r_id, ref_n, st in zip(
-        aids, bidx, rstart, rend, rid, rname, strand, strict=True
-    ):
-        by_aid.setdefault(int(a), []).append((int(bi), int(rs), int(re_)))
-        if int(a) not in aid_meta:
-            aid_meta[int(a)] = {
-                "read_id": str(r_id),
-                "ref_name": str(ref_n),
-                "strand": str(st),
-            }
-
-    rows: list[dict[str, object]] = []
-    for aid, blocks in by_aid.items():
-        blocks.sort(key=lambda t: t[0])
-        meta = aid_meta[aid]
-        contig_id = name_to_id.get(meta["ref_name"])
-        if contig_id is None:
-            # Alignment to a contig the genome doesn't list — skip.
-            continue
-        ordered_starts = [b[1] for b in blocks]
-        ordered_ends = [b[2] for b in blocks]
-        # Per-read raw junction sequence: donor = prev block end,
-        # acceptor = next block start.
-        raw_junctions = list(zip(ordered_ends[:-1], ordered_starts[1:]))
-
-        # Substitute each (donor, acceptor) → intron_id via the lookup.
-        # Skip the read entirely if any junction has no exact match
-        # (mismatched inputs).
-        strand_str = str(meta["strand"])
-        intron_id_seq: list[int] = []
-        missing = False
-        for donor, acceptor in raw_junctions:
-            key = (int(contig_id), strand_str, int(donor), int(acceptor))
-            iid = intron_lookup.get(key)
-            if iid is None:
-                missing = True
-                break
-            intron_id_seq.append(iid)
-        if missing:
-            continue
-
-        h = _hash_intron_sequence(
-            contig_id=int(contig_id),
-            strand=strand_str,
-            intron_ids=intron_id_seq,
+    # ── Per-alignment span + n_blocks + contig_id + strand (group_by aggregate).
+    # contig_id and strand are constant within alignment; "min" is a cheap
+    # constant-value extractor.
+    span_agg = (
+        sorted_blocks.group_by("alignment_id")
+        .aggregate(
+            [
+                ("ref_start", "min"),
+                ("ref_end", "max"),
+                ("block_index", "count"),
+                ("contig_id", "min"),
+                ("strand", "min"),
+            ]
         )
-        sig = _format_signature(meta["ref_name"], raw_junctions)
-        rows.append(
-            {
-                "read_id": meta["read_id"],
-                "contig_id": int(contig_id),
-                "strand": strand_str,
-                "n_blocks": int(len(blocks)),
-                "span_start": int(ordered_starts[0]),
-                "span_end": int(ordered_ends[-1]),
-                "fingerprint_hash": int(h),
-                "junction_signature": sig,
-            }
+        .rename_columns(
+            [
+                "alignment_id",
+                "span_start",
+                "span_end",
+                "n_blocks",
+                "contig_id",
+                "strand",
+            ]
+        )
+    )
+
+    # ── Vectorized junction derivation via numpy shift.
+    # For each row except the first of its alignment, donor = prev row's
+    # ref_end, acceptor = this row's ref_start. The mask drops first-of-
+    # alignment rows (no prev row in the same alignment).
+    aids = sorted_blocks.column("alignment_id").to_numpy(zero_copy_only=False)
+    starts = sorted_blocks.column("ref_start").to_numpy(zero_copy_only=False)
+    ends = sorted_blocks.column("ref_end").to_numpy(zero_copy_only=False)
+    contig_arr = sorted_blocks.column("contig_id").to_numpy(zero_copy_only=False)
+
+    # Dictionary-encode strand to skip per-row string materialization at
+    # block cardinality. The dict has ~3 entries ({'+', '-', '?'}) so the
+    # round-trip back to strings at junction cardinality is cheap.
+    strand_da = pc.dictionary_encode(sorted_blocks.column("strand"))
+    if isinstance(strand_da, pa.ChunkedArray):
+        strand_da = strand_da.combine_chunks()
+    strand_values = strand_da.dictionary.to_pylist()
+    strand_idx_arr = strand_da.indices.to_numpy(zero_copy_only=False)
+
+    n_rows = len(aids)
+    if n_rows > 1:
+        same_alignment = aids[1:] == aids[:-1]
+        donor_arr = ends[:-1][same_alignment]
+        acceptor_arr = starts[1:][same_alignment]
+        j_aid = aids[1:][same_alignment]
+        j_contig = contig_arr[1:][same_alignment]
+        j_strand_idx = strand_idx_arr[1:][same_alignment]
+        # junction_order = global position, used to re-sort after the
+        # left-outer-join (which doesn't guarantee input order).
+        junction_order = np.arange(len(j_aid), dtype=np.int64)
+    else:
+        donor_arr = np.zeros(0, dtype=np.int64)
+        acceptor_arr = np.zeros(0, dtype=np.int64)
+        j_aid = np.zeros(0, dtype=np.int64)
+        j_contig = np.zeros(0, dtype=np.int64)
+        j_strand_idx = np.zeros(0, dtype=np.int32)
+        junction_order = np.zeros(0, dtype=np.int64)
+
+    # Project dict-encoded strand indices back to strings for the join
+    # with introns.strand (which is plain string). np.take is fast even at
+    # junction cardinality; the dictionary is ~3 entries.
+    strand_lookup = np.asarray(strand_values, dtype=object)
+    if len(j_strand_idx) > 0:
+        j_strand_str = strand_lookup[j_strand_idx.astype(np.intp, copy=False)]
+        j_strand_pa = pa.array(list(j_strand_str), type=pa.string())
+    else:
+        j_strand_pa = pa.array([], type=pa.string())
+
+    junctions_table = pa.table(
+        {
+            "alignment_id": pa.array(j_aid),
+            "contig_id": pa.array(j_contig),
+            "strand": j_strand_pa,
+            "donor_pos": pa.array(donor_arr),
+            "acceptor_pos": pa.array(acceptor_arr),
+            "junction_order": pa.array(junction_order),
+        }
+    )
+
+    # ── Lookup intron_id per junction via hash-join with introns.
+    # Drop alignments where any junction has no exact (contig_id, strand,
+    # donor_pos, acceptor_pos) match — silent-drop policy.
+    bad_aid_set: pa.Array | None = None
+    if junctions_table.num_rows > 0:
+        introns_min = introns.select(
+            [
+                "intron_id",
+                "contig_id",
+                "strand",
+                "donor_pos",
+                "acceptor_pos",
+            ]
+        )
+        j_with_iid = junctions_table.join(
+            introns_min,
+            keys=["contig_id", "strand", "donor_pos", "acceptor_pos"],
+            join_type="left outer",
+        )
+        missing_mask = pc.is_null(j_with_iid.column("intron_id"))
+        bad_aids_col = j_with_iid.filter(missing_mask).column("alignment_id")
+        if len(bad_aids_col) > 0:
+            bad_aid_set = pc.unique(bad_aids_col)
+            keep = pc.invert(
+                pc.is_in(
+                    j_with_iid.column("alignment_id"), value_set=bad_aid_set
+                )
+            )
+            j_with_iid = j_with_iid.filter(keep)
+        # Re-sort to restore (alignment_id, junction_order) order — the join
+        # is not order-preserving in general.
+        j_with_iid = j_with_iid.sort_by(
+            [
+                ("alignment_id", "ascending"),
+                ("junction_order", "ascending"),
+            ]
+        ).combine_chunks()
+        j_aids_sorted = j_with_iid.column("alignment_id").to_numpy(
+            zero_copy_only=False
+        )
+        j_iids_sorted = j_with_iid.column("intron_id").to_numpy(
+            zero_copy_only=False
+        )
+        j_donor_sorted = j_with_iid.column("donor_pos").to_numpy(
+            zero_copy_only=False
+        )
+        j_accept_sorted = j_with_iid.column("acceptor_pos").to_numpy(
+            zero_copy_only=False
+        )
+    else:
+        j_aids_sorted = np.zeros(0, dtype=np.int64)
+        j_iids_sorted = np.zeros(0, dtype=np.int64)
+        j_donor_sorted = np.zeros(0, dtype=np.int64)
+        j_accept_sorted = np.zeros(0, dtype=np.int64)
+
+    # Drop alignments with missing junctions from span_agg too — they'd
+    # otherwise emit a zero-junction fingerprint by the empty-slice path.
+    if bad_aid_set is not None and len(bad_aid_set) > 0:
+        span_agg = span_agg.filter(
+            pc.invert(
+                pc.is_in(span_agg.column("alignment_id"), value_set=bad_aid_set)
+            )
         )
 
-    if not rows:
+    if span_agg.num_rows == 0:
         return READ_FINGERPRINT_TABLE.empty_table()
-    return pa.Table.from_pylist(rows, schema=READ_FINGERPRINT_TABLE)
+
+    # ── Per-alignment hash + signature loop.
+    # Aligned ordering: span_sorted and j_aids_sorted are both sorted by
+    # alignment_id ascending. np.searchsorted gives per-alignment slice
+    # boundaries in O(N_alignments × log N_junctions).
+    span_sorted = span_agg.sort_by(
+        [("alignment_id", "ascending")]
+    ).combine_chunks()
+    sp_aids = span_sorted.column("alignment_id").to_numpy(zero_copy_only=False)
+    sp_span_start = span_sorted.column("span_start").to_numpy(
+        zero_copy_only=False
+    )
+    sp_span_end = span_sorted.column("span_end").to_numpy(zero_copy_only=False)
+    sp_n_blocks = span_sorted.column("n_blocks").to_numpy(zero_copy_only=False)
+    sp_contig = span_sorted.column("contig_id").to_numpy(zero_copy_only=False)
+    sp_strand = span_sorted.column("strand").to_pylist()
+
+    n_alignments = len(sp_aids)
+    if len(j_aids_sorted) > 0:
+        starts_idx = np.searchsorted(j_aids_sorted, sp_aids, side="left")
+        ends_idx = np.searchsorted(j_aids_sorted, sp_aids, side="right")
+    else:
+        starts_idx = np.zeros(n_alignments, dtype=np.int64)
+        ends_idx = np.zeros(n_alignments, dtype=np.int64)
+
+    # ref_name lookup from contig_id, used only for the diagnostic signature
+    # column. Alignment-cardinality — cheap.
+    contig_name_map = {
+        int(cid): str(name)
+        for cid, name in zip(
+            contigs.column("contig_id").to_pylist(),
+            contigs.column("name").to_pylist(),
+            strict=True,
+        )
+    }
+
+    out_hashes = np.empty(n_alignments, dtype=np.uint64)
+    out_sigs: list[str] = [""] * n_alignments
+
+    xxh = xxhash.xxh64_intdigest
+    for i in range(n_alignments):
+        s = int(starts_idx[i])
+        e = int(ends_idx[i])
+        contig_id_i = int(sp_contig[i])
+        strand_i = str(sp_strand[i])
+        contig_bytes = int(contig_id_i).to_bytes(8, "little", signed=True)
+        strand_bytes = strand_i.encode("ascii")
+        if e > s:
+            iid_slice = j_iids_sorted[s:e].astype(np.int64, copy=False)
+            len_bytes = int(e - s).to_bytes(4, "little", signed=False)
+            out_hashes[i] = xxh(
+                contig_bytes + strand_bytes + len_bytes + iid_slice.tobytes()
+            )
+            donor_slice = j_donor_sorted[s:e]
+            accept_slice = j_accept_sorted[s:e]
+            contig_name = contig_name_map.get(
+                contig_id_i, f"contig_{contig_id_i}"
+            )
+            parts = ",".join(
+                f"{int(d)}-{int(a)}"
+                for d, a in zip(donor_slice, accept_slice, strict=True)
+            )
+            out_sigs[i] = f"{contig_name}:{parts}"
+        else:
+            zero_len_bytes = (0).to_bytes(4, "little", signed=False)
+            out_hashes[i] = xxh(contig_bytes + strand_bytes + zero_len_bytes)
+            contig_name = contig_name_map.get(
+                contig_id_i, f"contig_{contig_id_i}"
+            )
+            out_sigs[i] = f"{contig_name}:."
+
+    # ── Attach read_id via small post-aggregation join (alignment-cardinality
+    # with the read_id string column — small).
+    summary = pa.table(
+        {
+            "alignment_id": pa.array(sp_aids, type=pa.int64()),
+            "contig_id": pa.array(sp_contig, type=pa.int64()),
+            "strand": pa.array(sp_strand, type=pa.string()),
+            "n_blocks": pa.array(
+                sp_n_blocks.astype(np.int32, copy=False), type=pa.int32()
+            ),
+            "span_start": pa.array(sp_span_start, type=pa.int64()),
+            "span_end": pa.array(sp_span_end, type=pa.int64()),
+            "fingerprint_hash": pa.array(out_hashes, type=pa.uint64()),
+            "junction_signature": pa.array(out_sigs, type=pa.string()),
+        }
+    )
+    primary_rid = primary.select(["alignment_id", "read_id"])
+    summary = summary.join(primary_rid, keys="alignment_id", join_type="inner")
+
+    return pa.table(
+        {
+            "read_id": summary.column("read_id"),
+            "contig_id": summary.column("contig_id"),
+            "strand": summary.column("strand"),
+            "n_blocks": summary.column("n_blocks"),
+            "span_start": summary.column("span_start"),
+            "span_end": summary.column("span_end"),
+            "fingerprint_hash": summary.column("fingerprint_hash"),
+            "junction_signature": summary.column("junction_signature"),
+        },
+        schema=READ_FINGERPRINT_TABLE,
+    )
 
 
 __all__ = ["compute_read_fingerprints"]

@@ -44,6 +44,7 @@ from typing import Any
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.dataset as pa_dataset
 import torch
 
 from constellation.sequencing.align.consensus import build_consensus
@@ -290,7 +291,7 @@ def cluster_by_fingerprint(
     *,
     alignments: pa.Table,
     alignment_blocks: pa.Table | None = None,
-    alignment_cs: pa.Table | None = None,
+    alignment_cs: pa.Table | pa_dataset.Dataset | None = None,
     genome: GenomeReference | None = None,
     read_to_sample: pa.Table | None = None,
     max_5p_drift: int = 25,
@@ -373,11 +374,20 @@ def cluster_by_fingerprint(
             CLUSTER_MEMBERSHIP_TABLE.empty_table(),
         )
 
-    # ── Enrich fingerprints (Fix 10) ──────────────────────────────
-    # Single Arrow-join chain replaces the prior 5 × to_pylist + dict
-    # builds (seq_lookup, quality_lookup, primary_lookup, metrics_by_aid,
-    # contig_id_to_name) that each scaled with N_reads and pinned ~50+
-    # GB of nested Python dicts at mouse scale.
+    # ── Pre-index each source table by fingerprint row ──────────
+    # The prior implementation chained left-outer joins to build a
+    # wide ``enriched`` table (~80 GB at PromethION scale with sequence
+    # strings) and then sorted it globally — that crashed with
+    # ``ArrowInvalid: offset overflow while concatenating arrays`` at
+    # 200M reads because ``sequence`` blew past Arrow's 2 GiB int32
+    # string-buffer limit during the post-sort ``take`` + ``combine_chunks``.
+    #
+    # Replacement: resolve per-fingerprint row indices into each source
+    # table once via ``pc.index_in`` (Arrow hash-join under the hood),
+    # sort only a narrow all-numeric keys table (~8 GB at 200M rows,
+    # offset-overflow-immune), and ``pc.take`` per cluster from each
+    # source. Source tables (notably ``reads.sequence``) never go through
+    # the heavy sort. See sequencing/CLAUDE.md "Resolve-stage pitfalls".
     primary_lookup = _build_alignment_lookup(alignments)
     metrics_table: pa.Table | None = (
         _build_alignment_metrics(alignment_blocks)
@@ -385,31 +395,32 @@ def cluster_by_fingerprint(
         else None
     )
 
-    reads_cols = ["read_id", "sequence"]
+    n = fingerprints.num_rows
+    fp_read_ids = fingerprints.column("read_id")
     has_quality = "dorado_quality" in reads.schema.names
-    if has_quality:
-        reads_cols.append("dorado_quality")
 
-    enriched = fingerprints.join(
-        reads.select(reads_cols), keys="read_id", join_type="left outer"
-    )
-    enriched = enriched.join(
-        primary_lookup, keys="read_id", join_type="left outer"
-    )
+    # Row indices into each source. Nulls propagate where there's no match.
+    reads_idx = pc.index_in(fp_read_ids, reads.column("read_id"))
+    primary_idx = pc.index_in(fp_read_ids, primary_lookup.column("read_id"))
     if metrics_table is not None:
-        enriched = enriched.join(
-            metrics_table, keys="alignment_id", join_type="left outer"
+        aid_per_fp = pc.take(
+            primary_lookup.column("alignment_id"), primary_idx
         )
-
-    if per_sample_clusters and read_to_sample is not None:
-        enriched = enriched.join(
-            read_to_sample, keys="read_id", join_type="left outer"
+        metrics_idx = pc.index_in(
+            aid_per_fp, metrics_table.column("alignment_id")
         )
     else:
-        enriched = enriched.append_column(
-            "sample_id",
-            pa.array([None] * enriched.num_rows, type=pa.int64()),
+        metrics_idx = None
+
+    # sample_id per fingerprint row.
+    if per_sample_clusters and read_to_sample is not None:
+        rts_idx = pc.index_in(fp_read_ids, read_to_sample.column("read_id"))
+        sample_id_col = pc.take(
+            read_to_sample.column("sample_id"), rts_idx
         )
+    else:
+        sample_id_col = pa.nulls(n, type=pa.int64())
+    sample_id_for_sort = pc.fill_null(sample_id_col, _SAMPLE_NULL_SENTINEL)
 
     # contig_id → name lookup (small — keep as dict for consensus path).
     contig_id_to_name: dict[int, str] = {}
@@ -421,13 +432,25 @@ def cluster_by_fingerprint(
         ):
             contig_id_to_name[int(cid)] = str(name)
 
-    # ── Sort + boundary walk (Fix 11) ─────────────────────────────
-    # The two-level dict-of-dicts partition build at 200M-fingerprint
-    # scale is replaced by one Arrow sort + a torch boundary scan over
-    # the 4-tuple cluster key. Output cluster slices are small (typical
-    # mean cluster size ~tens of reads), so the per-cluster iteration
-    # body stays Python — bounded by cluster count, not read count.
-    enriched_sorted = enriched.sort_by(
+    # ── Narrow keys table for sort ──────────────────────────────
+    # All-numeric except for ``strand`` (1-char strings: 200M × 1 byte
+    # is well under int32 offset limits). Carries the per-source row
+    # indices alongside the sort keys so per-cluster takes are O(cluster
+    # size).
+    narrow_cols: dict[str, pa.ChunkedArray | pa.Array] = {
+        "row_idx": pa.array(np.arange(n, dtype=np.int64)),
+        "contig_id": fingerprints.column("contig_id"),
+        "strand": fingerprints.column("strand"),
+        "sample_id": sample_id_for_sort,
+        "fingerprint_hash": fingerprints.column("fingerprint_hash"),
+        "reads_idx": reads_idx,
+        "primary_idx": primary_idx,
+    }
+    if metrics_idx is not None:
+        narrow_cols["metrics_idx"] = metrics_idx
+    narrow_keys = pa.table(narrow_cols)
+
+    sorted_keys = narrow_keys.sort_by(
         [
             ("contig_id", "ascending"),
             ("strand", "ascending"),
@@ -435,14 +458,90 @@ def cluster_by_fingerprint(
             ("fingerprint_hash", "ascending"),
         ]
     ).combine_chunks()
-    boundaries = _cluster_boundaries(enriched_sorted)
+    boundaries = _cluster_boundaries(sorted_keys)
 
+    # ── Per-cluster assembly + emission ─────────────────────────
     cluster_rows: list[dict[str, Any]] = []
     membership_rows: list[dict[str, Any]] = []
     next_cluster_id = int(cluster_id_seed)
 
+    sample_null_sentinel_scalar = pa.scalar(
+        _SAMPLE_NULL_SENTINEL, type=pa.int64()
+    )
+
     for start, size in boundaries:
-        slice_table = enriched_sorted.slice(start, size)
+        # Per-cluster slice of sort keys + source-row indices.
+        row_indices = sorted_keys.column("row_idx").slice(start, size)
+        reads_indices = sorted_keys.column("reads_idx").slice(start, size)
+        primary_indices = sorted_keys.column("primary_idx").slice(start, size)
+        sample_filled_slice = sorted_keys.column("sample_id").slice(
+            start, size
+        )
+
+        # Take from each source. ``pc.take`` propagates nulls.
+        fp_slice = fingerprints.take(row_indices)
+        if reads.num_rows > 0:
+            seq_col = pc.take(reads.column("sequence"), reads_indices)
+            if has_quality:
+                quality_col = pc.take(
+                    reads.column("dorado_quality"), reads_indices
+                )
+            else:
+                quality_col = pa.nulls(size, type=pa.float32())
+        else:
+            seq_col = pa.nulls(size, type=pa.string())
+            quality_col = pa.nulls(size, type=pa.float32())
+
+        aid_col = pc.take(
+            primary_lookup.column("alignment_id"), primary_indices
+        )
+        rstart_col = pc.take(
+            primary_lookup.column("ref_start"), primary_indices
+        )
+
+        # Un-sentinel sample_id for the emitted slice.
+        sample_col = pc.if_else(
+            pc.equal(sample_filled_slice, sample_null_sentinel_scalar),
+            pa.scalar(None, type=pa.int64()),
+            sample_filled_slice,
+        )
+
+        slice_cols: dict[str, pa.Array | pa.ChunkedArray] = {
+            "read_id": fp_slice.column("read_id"),
+            "contig_id": fp_slice.column("contig_id"),
+            "strand": fp_slice.column("strand"),
+            "n_blocks": fp_slice.column("n_blocks"),
+            "span_start": fp_slice.column("span_start"),
+            "span_end": fp_slice.column("span_end"),
+            "fingerprint_hash": fp_slice.column("fingerprint_hash"),
+            "junction_signature": fp_slice.column("junction_signature"),
+            "sequence": seq_col,
+            "dorado_quality": quality_col,
+            "alignment_id": aid_col,
+            "ref_start": rstart_col,
+            "sample_id": sample_col,
+        }
+        if metrics_table is not None:
+            metrics_indices = sorted_keys.column("metrics_idx").slice(
+                start, size
+            )
+            slice_cols["n_match_sum"] = pc.take(
+                metrics_table.column("n_match_sum"), metrics_indices
+            )
+            slice_cols["n_mismatch_sum"] = pc.take(
+                metrics_table.column("n_mismatch_sum"), metrics_indices
+            )
+            slice_cols["n_insert_sum"] = pc.take(
+                metrics_table.column("n_insert_sum"), metrics_indices
+            )
+            slice_cols["n_delete_sum"] = pc.take(
+                metrics_table.column("n_delete_sum"), metrics_indices
+            )
+            slice_cols["cs_aware"] = pc.take(
+                metrics_table.column("cs_aware"), metrics_indices
+            )
+        slice_table = pa.table(slice_cols)
+
         emitted = _emit_cluster(
             slice_table,
             cluster_id=next_cluster_id,
@@ -534,7 +633,7 @@ def _emit_cluster(
     build_consensus_seq: bool,
     drop_drift_filtered: bool,
     genome: GenomeReference | None,
-    alignment_cs: pa.Table | None,
+    alignment_cs: pa.Table | pa_dataset.Dataset | None,
     contig_id_to_name: dict[int, str],
     has_metrics: bool,
     has_quality: bool,
@@ -628,11 +727,29 @@ def _emit_cluster(
                 member_weights.append(1.0)
                 member_ref_starts.append(int(rs))
             if member_aids:
+                # Dataset handle → materialise only this cluster's rows
+                # via filter pushdown. ``alignment_cs`` at PromethION
+                # scale is ~50 GB; the per-cluster slice is KB. Keeping
+                # the dataset open instead of pre-materialising the
+                # whole table is what makes ``--build-consensus``
+                # tractable at full scale.
+                if isinstance(alignment_cs, pa_dataset.Dataset):
+                    cs_for_cluster = alignment_cs.to_table(
+                        columns=["alignment_id", "cs_string"],
+                        filter=pc.is_in(
+                            pa_dataset.field("alignment_id"),
+                            value_set=pa.array(
+                                member_aids, type=pa.int64()
+                            ),
+                        ),
+                    )
+                else:
+                    cs_for_cluster = alignment_cs
                 consensus_seq = build_consensus(
                     member_alignment_ids=member_aids,
                     member_weights=member_weights,
                     member_ref_starts=member_ref_starts,
-                    alignment_cs=alignment_cs,
+                    alignment_cs=cs_for_cluster,
                     reference_sequence=window_seq,
                     reference_start=window_start,
                 )

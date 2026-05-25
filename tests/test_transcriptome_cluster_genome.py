@@ -481,3 +481,234 @@ def test_mode_field_is_genome_guided() -> None:
     )
     clusters, _ = cluster_by_fingerprint(fps, rd, alignments=al)
     assert clusters.column("mode").to_pylist() == ["genome-guided"]
+
+
+def test_index_then_take_handles_reordered_sources() -> None:
+    """The narrow-sort refactor resolves per-fingerprint row indices via
+    ``pc.index_in`` so source tables (reads, primary_lookup, metrics) can
+    arrive in any row order — the per-cluster ``pc.take`` must pull the
+    right row from each source regardless of how it was sorted upstream.
+
+    Build inputs where reads is sorted by sequence content and the
+    alignments table is reverse-sorted relative to fingerprints; the
+    cluster outputs must still match what we'd get with everything in
+    the same order.
+    """
+    # 6 reads across 2 fingerprints (3 each).
+    fps = _fingerprints(
+        [
+            _fp(read_id="rA", fingerprint_hash=100,
+                contig_id=1, span_start=1000, span_end=2000),
+            _fp(read_id="rB", fingerprint_hash=100,
+                contig_id=1, span_start=1000, span_end=2000),
+            _fp(read_id="rC", fingerprint_hash=100,
+                contig_id=1, span_start=1000, span_end=2000),
+            _fp(read_id="rD", fingerprint_hash=200,
+                contig_id=2, span_start=500, span_end=1500),
+            _fp(read_id="rE", fingerprint_hash=200,
+                contig_id=2, span_start=500, span_end=1500),
+            _fp(read_id="rF", fingerprint_hash=200,
+                contig_id=2, span_start=500, span_end=1500),
+        ]
+    )
+    # alignments REVERSE-sorted relative to fingerprints to ensure the
+    # index_in path resolves the right alignment per fingerprint.
+    al = _alignments(
+        [
+            _alignment(alignment_id=6, read_id="rF", ref_name="chr2"),
+            _alignment(alignment_id=5, read_id="rE", ref_name="chr2"),
+            _alignment(alignment_id=4, read_id="rD", ref_name="chr2"),
+            _alignment(alignment_id=3, read_id="rC"),
+            _alignment(alignment_id=2, read_id="rB"),
+            _alignment(alignment_id=1, read_id="rA"),
+        ]
+    )
+    # reads sorted alphabetically by SEQUENCE content (forces a different
+    # ordering than fingerprints' read_id order).
+    rd = _reads(
+        [
+            {"read_id": "rE", "sequence": "AAAA", "dorado_quality": 20.0},
+            {"read_id": "rB", "sequence": "AAAC", "dorado_quality": 20.0},
+            {"read_id": "rF", "sequence": "CCCC", "dorado_quality": 20.0},
+            {"read_id": "rA", "sequence": "GGGA", "dorado_quality": 20.0},
+            {"read_id": "rC", "sequence": "GGGT", "dorado_quality": 20.0},
+            {"read_id": "rD", "sequence": "TTTT", "dorado_quality": 20.0},
+        ]
+    )
+    clusters, membership = cluster_by_fingerprint(fps, rd, alignments=al)
+    assert clusters.num_rows == 2
+    # Each cluster has 3 members regardless of source ordering.
+    n_reads_by_cluster = sorted(clusters.column("n_reads").to_pylist())
+    assert n_reads_by_cluster == [3, 3]
+    # Membership rows mention all 6 reads exactly once.
+    member_read_ids = sorted(
+        r["read_id"] for r in membership.to_pylist()
+    )
+    assert member_read_ids == ["rA", "rB", "rC", "rD", "rE", "rF"]
+    # contig_id per cluster matches: hash=100 → chr1 (contig_id 1);
+    # hash=200 → chr2 (contig_id 2). The hash→contig mapping must
+    # survive the narrow-sort path even though sources are scrambled.
+    by_hash = {
+        r["fingerprint_hash"]: r["contig_id"] for r in clusters.to_pylist()
+    }
+    assert by_hash[100] == 1
+    assert by_hash[200] == 2
+
+
+def test_alignment_cs_accepts_table_or_dataset() -> None:
+    """``alignment_cs`` accepts either ``pa.Table`` (eager — what tests
+    and small Jupyter use pass) or ``pa.dataset.Dataset`` (streaming —
+    what the CLI passes at PromethION scale, to avoid materialising
+    the ~50 GB cs:long table). Both code paths must produce the same
+    consensus sequence for the same inputs.
+    """
+    import tempfile
+    from pathlib import Path
+
+    import pyarrow.dataset as pa_dataset
+    import pyarrow.parquet as pq
+
+    from constellation.sequencing.reference.reference import GenomeReference
+    from constellation.sequencing.schemas.alignment import ALIGNMENT_CS_TABLE
+    from constellation.sequencing.schemas.reference import CONTIG_TABLE
+
+    # Genome: chr1 with the reference window all 'A' so any cs:long ":N"
+    # (identity) reproduces 'A' × N.
+    ref_seq = "A" * 200
+    contigs = pa.Table.from_pylist(
+        [{"contig_id": 1, "name": "chr1", "length": 200,
+          "topology": None, "circular": None}],
+        schema=CONTIG_TABLE,
+    )
+    sequences = pa.Table.from_pylist(
+        [{"contig_id": 1, "sequence": ref_seq}]
+    )
+    genome = GenomeReference(contigs=contigs, sequences=sequences)
+
+    # Three members of a cluster, all aligning identity to the reference.
+    fps = _fingerprints(
+        [
+            _fp(read_id="rA", fingerprint_hash=100,
+                contig_id=1, span_start=10, span_end=30),
+            _fp(read_id="rB", fingerprint_hash=100,
+                contig_id=1, span_start=10, span_end=30),
+            _fp(read_id="rC", fingerprint_hash=100,
+                contig_id=1, span_start=10, span_end=30),
+        ]
+    )
+    al = _alignments(
+        [
+            _alignment(alignment_id=1, read_id="rA",
+                       ref_start=10, ref_end=30),
+            _alignment(alignment_id=2, read_id="rB",
+                       ref_start=10, ref_end=30),
+            _alignment(alignment_id=3, read_id="rC",
+                       ref_start=10, ref_end=30),
+        ]
+    )
+    blocks = _blocks(
+        [
+            _block(alignment_id=1, ref_start=10, ref_end=30,
+                   n_match=20, n_mismatch=0, n_insert=0, n_delete=0),
+            _block(alignment_id=2, ref_start=10, ref_end=30,
+                   n_match=20, n_mismatch=0, n_insert=0, n_delete=0),
+            _block(alignment_id=3, ref_start=10, ref_end=30,
+                   n_match=20, n_mismatch=0, n_insert=0, n_delete=0),
+        ]
+    )
+    rd = _reads(
+        [
+            {"read_id": "rA", "sequence": "A" * 20, "dorado_quality": 20.0},
+            {"read_id": "rB", "sequence": "A" * 20, "dorado_quality": 20.0},
+            {"read_id": "rC", "sequence": "A" * 20, "dorado_quality": 20.0},
+        ]
+    )
+    cs_table = pa.Table.from_pylist(
+        [
+            {"alignment_id": 1, "cs_string": ":20"},
+            {"alignment_id": 2, "cs_string": ":20"},
+            {"alignment_id": 3, "cs_string": ":20"},
+        ],
+        schema=ALIGNMENT_CS_TABLE,
+    )
+
+    # Path 1: alignment_cs as pa.Table.
+    clusters_a, _ = cluster_by_fingerprint(
+        fps, rd,
+        alignments=al,
+        alignment_blocks=blocks,
+        alignment_cs=cs_table,
+        genome=genome,
+        build_consensus_seq=True,
+    )
+
+    # Path 2: alignment_cs as pa.dataset.Dataset (write to temp parquet,
+    # reopen as dataset, pass through).
+    with tempfile.TemporaryDirectory() as td:
+        cs_dir = Path(td) / "alignment_cs"
+        cs_dir.mkdir()
+        pq.write_table(cs_table, cs_dir / "part-00000.parquet")
+        cs_dataset = pa_dataset.dataset(cs_dir)
+        clusters_b, _ = cluster_by_fingerprint(
+            fps, rd,
+            alignments=al,
+            alignment_blocks=blocks,
+            alignment_cs=cs_dataset,
+            genome=genome,
+            build_consensus_seq=True,
+        )
+
+    consensus_a = clusters_a.column("consensus_sequence").to_pylist()
+    consensus_b = clusters_b.column("consensus_sequence").to_pylist()
+    assert consensus_a == consensus_b
+    # Non-trivial: consensus actually populated, not just both None.
+    assert consensus_a[0] is not None
+    assert len(consensus_a[0]) > 0
+
+
+def test_per_sample_clusters_partition_by_sample_id() -> None:
+    """``per_sample_clusters=True`` partitions clusters by sample_id;
+    the read_to_sample table is resolved via the pre-indexed lookup.
+    """
+    fps = _fingerprints(
+        [
+            _fp(read_id="rA", fingerprint_hash=100),
+            _fp(read_id="rB", fingerprint_hash=100),
+            _fp(read_id="rC", fingerprint_hash=100),
+        ]
+    )
+    al = _alignments(
+        [
+            _alignment(alignment_id=1, read_id="rA"),
+            _alignment(alignment_id=2, read_id="rB"),
+            _alignment(alignment_id=3, read_id="rC"),
+        ]
+    )
+    rd = _reads(
+        [
+            {"read_id": "rA", "sequence": "AAAA", "dorado_quality": 20.0},
+            {"read_id": "rB", "sequence": "AAAA", "dorado_quality": 20.0},
+            {"read_id": "rC", "sequence": "AAAA", "dorado_quality": 20.0},
+        ]
+    )
+    # rA + rB share sample 7, rC is in sample 13.
+    read_to_sample = pa.table(
+        {
+            "read_id": pa.array(["rA", "rB", "rC"]),
+            "sample_id": pa.array([7, 7, 13], type=pa.int64()),
+        }
+    )
+    clusters, _ = cluster_by_fingerprint(
+        fps, rd, alignments=al,
+        read_to_sample=read_to_sample,
+        per_sample_clusters=True,
+    )
+    # Same fingerprint but split across two samples → 2 clusters.
+    assert clusters.num_rows == 2
+    sids = sorted(clusters.column("sample_id").to_pylist())
+    assert sids == [7, 13]
+    sizes_by_sample = {
+        r["sample_id"]: r["n_reads"] for r in clusters.to_pylist()
+    }
+    assert sizes_by_sample[7] == 2
+    assert sizes_by_sample[13] == 1
