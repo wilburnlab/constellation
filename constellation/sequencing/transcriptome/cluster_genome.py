@@ -450,6 +450,66 @@ def cluster_by_fingerprint(
         ):
             contig_id_to_name[int(cid)] = str(name)
 
+    # ── Consensus prefetches (only when --build-consensus) ──────
+    # Two per-cluster fixed costs in the consensus path that we lift
+    # out of the loop entirely:
+    #   1. `genome.sequence_of(contig_id)` is uncached and decodes
+    #      the entire chromosome (~200 MB for mouse chr1) on each
+    #      call (see sequencing/CLAUDE.md pitfall #1). For ~46k
+    #      clusters across ~22 contigs, that's ~46k × 200 ms = ~2.5h
+    #      of pure chromosome-decoding overhead. Prefetched once per
+    #      unique contig that actually appears in any cluster.
+    #   2. `alignment_cs.to_table(filter=...)` with Dataset filter
+    #      pushdown scans the ~50 GB alignment_cs/ parquet dir for
+    #      1-N matching rows per cluster. Replaced with a single
+    #      up-front filter to the fingerprinted-aid set + per-cluster
+    #      Arrow `index_in` + `take` (sub-ms each).
+    contig_seq_cache: dict[int, str] = {}
+    alignment_cs_table: pa.Table | None = None
+    if build_consensus_seq and genome is not None and alignment_cs is not None:
+        needed_contig_ids = pc.unique(
+            fingerprints.column("contig_id")
+        ).to_pylist()
+        _p(
+            f"consensus prefetch: contig sequences for "
+            f"{len(needed_contig_ids)} contigs"
+        )
+        for cid in needed_contig_ids:
+            contig_seq_cache[int(cid)] = genome.sequence_of(int(cid))
+        _p("consensus prefetch: contig_seq_cache populated")
+
+        fp_aids = pc.take(
+            primary_lookup.column("alignment_id"), primary_idx
+        )
+        fp_aids_unique = pc.unique(fp_aids)
+        _p(
+            f"consensus prefetch: materializing alignment_cs filtered "
+            f"to {len(fp_aids_unique):,} fingerprinted alignment_ids"
+        )
+        if isinstance(alignment_cs, pa_dataset.Dataset):
+            alignment_cs_table = alignment_cs.to_table(
+                columns=["alignment_id", "cs_string"],
+                filter=pc.is_in(
+                    pa_dataset.field("alignment_id"),
+                    value_set=fp_aids_unique,
+                ),
+            )
+        else:
+            alignment_cs_table = alignment_cs.select(
+                ["alignment_id", "cs_string"]
+            ).filter(
+                pc.is_in(
+                    alignment_cs.column("alignment_id"),
+                    value_set=fp_aids_unique,
+                )
+            )
+        alignment_cs_table = alignment_cs_table.combine_chunks()
+        _p(
+            f"consensus prefetch: alignment_cs_table ready "
+            f"({alignment_cs_table.num_rows:,} rows, "
+            f"{alignment_cs_table.nbytes / 1e9:.2f} GB)"
+        )
+
     # ── Narrow keys table for sort ──────────────────────────────
     # All-numeric except for ``strand`` (1-char strings: 200M × 1 byte
     # is well under int32 offset limits). Carries the per-source row
@@ -688,6 +748,8 @@ def cluster_by_fingerprint(
             contig_id_to_name=contig_id_to_name,
             has_metrics=metrics_table is not None,
             has_quality=has_quality,
+            contig_seq_cache=contig_seq_cache or None,
+            alignment_cs_table=alignment_cs_table,
             verbose_progress=_p if detail else None,
         )
         cluster_dt = _time.perf_counter() - cluster_t0
@@ -793,6 +855,8 @@ def _emit_cluster(
     contig_id_to_name: dict[int, str],
     has_metrics: bool,
     has_quality: bool,
+    contig_seq_cache: dict[int, str] | None = None,
+    alignment_cs_table: pa.Table | None = None,
     verbose_progress: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
     """Per-cluster work: drift filter + Layer-0 derep + optional
@@ -968,7 +1032,13 @@ def _emit_cluster(
         window_end = max(kept_ends_list)
         contig_name = contig_id_to_name.get(contig_id)
         if contig_name is not None:
-            contig_seq = genome.sequence_of(contig_id)
+            # Prefer the prefetched contig_seq_cache; fall back to
+            # genome.sequence_of (uncached, ~200 ms/call at mouse scale)
+            # only when no cache was supplied (test fixtures).
+            if contig_seq_cache is not None and contig_id in contig_seq_cache:
+                contig_seq = contig_seq_cache[contig_id]
+            else:
+                contig_seq = genome.sequence_of(contig_id)
             window_seq = contig_seq[window_start:window_end]
             member_aids: list[int] = []
             member_weights: list[float] = []
@@ -982,20 +1052,38 @@ def _emit_cluster(
                 member_weights.append(1.0)
                 member_ref_starts.append(int(rs))
             if member_aids:
-                # Dataset handle → materialise only this cluster's rows
-                # via filter pushdown. ``alignment_cs`` at PromethION
-                # scale is ~50 GB; the per-cluster slice is KB. Keeping
-                # the dataset open instead of pre-materialising the
-                # whole table is what makes ``--build-consensus``
-                # tractable at full scale.
-                if isinstance(alignment_cs, pa_dataset.Dataset):
+                # Prefer the prefetched in-memory alignment_cs_table:
+                # per-cluster lookup is `pc.index_in` + `pc.take` on
+                # the small filtered table (~µs each). The fallback
+                # branches handle test fixtures + the legacy direct-
+                # pa.Table call path (small tables, no per-call cost).
+                member_aids_arr = pa.array(
+                    member_aids, type=pa.int64()
+                )
+                if alignment_cs_table is not None:
+                    cs_indices = pc.index_in(
+                        member_aids_arr,
+                        alignment_cs_table.column("alignment_id"),
+                    )
+                    cs_strings_col = pc.take(
+                        alignment_cs_table.column("cs_string"),
+                        cs_indices,
+                    )
+                    cs_for_cluster = pa.table(
+                        {
+                            "alignment_id": member_aids_arr,
+                            "cs_string": cs_strings_col,
+                        }
+                    )
+                elif isinstance(alignment_cs, pa_dataset.Dataset):
+                    # Legacy/test path: per-cluster dataset filter
+                    # pushdown. Slow at full scale; cluster_by_
+                    # fingerprint normally pre-materialises.
                     cs_for_cluster = alignment_cs.to_table(
                         columns=["alignment_id", "cs_string"],
                         filter=pc.is_in(
                             pa_dataset.field("alignment_id"),
-                            value_set=pa.array(
-                                member_aids, type=pa.int64()
-                            ),
+                            value_set=member_aids_arr,
                         ),
                     )
                 else:
