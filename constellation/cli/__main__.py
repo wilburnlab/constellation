@@ -364,16 +364,18 @@ def _build_transcriptome_parser(subs) -> None:
         "--samples",
         required=True,
         help=(
-            "TSV file mapping reads → samples. Single-file mode: "
-            "columns are sample_id (int) + sample_name (str) + "
-            "barcode_id (int, 0-indexed into the design's barcode "
-            "panel). Multi-file mode: prepend a 'file' column whose "
-            "values match the basenames or paths under --reads — "
-            "each row asserts (file, sample_id, barcode_id) and the "
-            "same sample_id may appear with multiple (file, barcode) "
-            "combos (re-runs / multi-flowcell aggregation). Header "
-            "row is optional in single-file mode and required in "
-            "multi-file mode."
+            "TSV mapping reads → samples. Required columns: "
+            "sample_name (str) + barcode_id (int, 0-indexed into the "
+            "design's barcode panel). Optional: 'file' (enables "
+            "multi-file mode — each row's file cell matches a basename "
+            "or path under --reads), 'description'. Header row is "
+            "required. sample_id is auto-assigned per unique "
+            "sample_name; rows sharing a sample_name aggregate into "
+            "one sample with multiple (file, barcode) edges, which is "
+            "how multi-barcode multiplexing and multi-flowcell "
+            "aggregation are expressed. The resolved Samples container "
+            "is persisted under <output-dir>/samples/ so downstream "
+            "stages (align, cluster) don't need --samples re-supplied."
         ),
     )
     p_dem.add_argument(
@@ -494,14 +496,6 @@ def _build_transcriptome_parser(subs) -> None:
             "`reference_handle` field and cannot be opened in the genome "
             "browser dashboard until the reference is imported via "
             "`constellation reference import`."
-        ),
-    )
-    p_aln.add_argument(
-        "--samples",
-        required=True,
-        help=(
-            "samples TSV (same TSV used at demux time). Future: persist "
-            "Samples in the demux output to make this optional."
         ),
     )
     p_aln.add_argument("--output-dir", required=True)
@@ -714,11 +708,6 @@ def _build_transcriptome_parser(subs) -> None:
         ),
     )
     p_cluster.add_argument(
-        "--samples",
-        required=True,
-        help="samples TSV (consistent with the upstream align run).",
-    )
-    p_cluster.add_argument(
         "--output-dir",
         required=True,
         help="cluster output dir (clusters.parquet, cluster.fa, ...).",
@@ -863,15 +852,25 @@ def _parse_samples_tsv(
     input_files: list[Path],
     default_acquisition_id: int,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[Path, int]]:
-    """Parse the samples TSV in single- or multi-file mode.
+    """Parse the samples TSV.
 
-    Single-file mode (TSV header lacks ``file`` column or is absent):
-    every row gets ``acquisition_id = default_acquisition_id``. All
-    rows must reference barcode_ids from a single panel.
+    Required columns: ``sample_name`` (str) + ``barcode_id`` (int).
+    Optional columns: ``file`` (enables multi-file mode), ``description``.
 
-    Multi-file mode (TSV header includes a ``file`` column): each
-    row's ``file`` cell is matched against the supplied ``input_files``
-    by basename or full path. Each unique referenced file gets a
+    The user-facing identity is ``sample_name``; ``sample_id`` is
+    auto-assigned internally as ``1..N`` over the *unique* sample_names
+    in sort order. Multiple rows sharing a ``sample_name`` resolve to the
+    same auto-assigned ``sample_id`` and contribute additional rows to
+    the SAMPLE_ACQUISITION_EDGE table — that's how multi-barcode
+    multiplexing and multi-flowcell aggregation are expressed.
+
+    Single-file mode (TSV header lacks ``file``): every row gets
+    ``acquisition_id = default_acquisition_id``. All rows must reference
+    barcode_ids from a single panel.
+
+    Multi-file mode (TSV header includes a ``file`` column): each row's
+    ``file`` cell is matched against the supplied ``input_files`` by
+    basename or full path. Each unique referenced file gets a
     deterministic acquisition_id (1..N in sorted-path order).
 
     Returns ``(sample_rows, edge_rows, file_to_acquisition_id)`` ready
@@ -886,10 +885,6 @@ def _parse_samples_tsv(
         f: i + 1 for i, f in enumerate(sorted(input_files))
     }
 
-    sample_rows: list[dict[str, object]] = []
-    edge_rows: list[dict[str, object]] = []
-    seen_sample_ids: dict[int, str] = {}
-
     with open(tsv_path, encoding="utf-8") as fh:
         lines = [
             ln.rstrip("\r\n")
@@ -899,57 +894,66 @@ def _parse_samples_tsv(
     if not lines:
         raise ValueError(f"samples TSV {tsv_path!r} has no rows")
 
-    # Header detection: first row's first cell == "file" or
-    # "sample_id" — we treat as header if any of the canonical column
-    # names appears as a literal cell value.
+    # Header is required (no headerless legacy mode). Reject the legacy
+    # `sample_id` column with a migration hint — it's now auto-assigned.
     first_cells = [c.strip() for c in lines[0].split("\t")]
-    canonical_columns = {"file", "sample_id", "sample_name", "barcode_id"}
-    is_header = bool(set(first_cells) & canonical_columns)
+    canonical_columns = {"file", "sample_name", "barcode_id", "description"}
+    if not (set(first_cells) & canonical_columns):
+        raise ValueError(
+            f"samples TSV {tsv_path!r} has no header row — header is "
+            f"required and must include at least 'sample_name' and "
+            f"'barcode_id' (plus optional 'file' / 'description')"
+        )
+    if "sample_id" in first_cells:
+        raise ValueError(
+            f"samples TSV {tsv_path!r} has a 'sample_id' column — "
+            f"sample_id is now auto-assigned from unique sample_name "
+            f"values, so the column is no longer accepted. Drop the "
+            f"column and rerun; rows sharing a sample_name aggregate "
+            f"into one sample with multiple (acquisition, barcode) edges"
+        )
 
-    if is_header:
-        header = first_cells
-        body = lines[1:]
-    else:
-        # No header — assume single-file 3-column format.
-        header = ["sample_id", "sample_name", "barcode_id"]
-        body = lines
+    header = first_cells
+    body = lines[1:]
 
     multi_file_mode = "file" in header
-    if multi_file_mode and len(input_files) <= 1:
-        # User supplied a 'file' column but only one input file —
-        # require the column anyway, just verify it matches.
-        pass
     if not multi_file_mode and len(input_files) > 1:
         raise ValueError(
             f"--reads passed {len(input_files)} files but the samples "
             f"TSV has no 'file' column — multi-file inputs require a "
-            f"'file' column tying each (sample_id, barcode_id) row to "
-            f"its source file"
+            f"'file' column tying each (sample_name, barcode_id) row "
+            f"to its source file"
         )
 
     col_idx = {name: i for i, name in enumerate(header)}
-    required = {"sample_id", "sample_name", "barcode_id"}
+    required = {"sample_name", "barcode_id"}
     missing = required - set(col_idx)
     if missing:
         raise ValueError(
             f"samples TSV missing required columns: {sorted(missing)}"
         )
 
+    # Pass 1: collect (sample_name, acquisition_id, barcode_id) edge
+    # triples + description-per-name, deferring sample_id assignment
+    # until all unique sample_names are known.
+    raw_edges: list[tuple[str, int, int]] = []
+    description_by_name: dict[str, str | None] = {}
+
     for raw in body:
         cells = [c.strip() for c in raw.split("\t")]
         if len(cells) < len(header):
             continue  # malformed row — skip
+        sname = cells[col_idx["sample_name"]]
+        if not sname:
+            continue
         try:
-            sid = int(cells[col_idx["sample_id"]])
             bid = int(cells[col_idx["barcode_id"]])
         except ValueError:
             continue
-        sname = cells[col_idx["sample_name"]]
         if multi_file_mode:
             file_cell = cells[col_idx["file"]]
             file_path = by_basename.get(file_cell) or by_path.get(file_cell)
             if file_path is None:
-                # Try resolving as a path relative to cwd.
                 p = Path(file_cell)
                 if p.is_file():
                     file_path = p.resolve()
@@ -966,18 +970,58 @@ def _parse_samples_tsv(
         else:
             acq_id = default_acquisition_id
 
-        # Sample table row — first time we see each sample_id only.
-        if sid not in seen_sample_ids:
-            sample_rows.append(
-                {"sample_id": sid, "sample_name": sname, "description": None}
-            )
-            seen_sample_ids[sid] = sname
+        if "description" in col_idx:
+            desc = cells[col_idx["description"]].strip() or None
+            if desc is not None:
+                # First non-empty description wins on collision.
+                description_by_name.setdefault(sname, desc)
+        description_by_name.setdefault(sname, None)
+        raw_edges.append((sname, acq_id, bid))
+
+    if not raw_edges:
+        raise ValueError(
+            f"samples TSV {tsv_path!r} parsed zero usable edge rows; "
+            f"check that sample_name / barcode_id columns are populated"
+        )
+
+    # Auto-assign sample_id: 1..N over unique sample_names in sort order.
+    unique_names = sorted(set(name for name, _, _ in raw_edges))
+    name_to_sid: dict[str, int] = {n: i + 1 for i, n in enumerate(unique_names)}
+
+    sample_rows: list[dict[str, object]] = [
+        {
+            "sample_id": name_to_sid[name],
+            "sample_name": name,
+            "description": description_by_name.get(name),
+        }
+        for name in unique_names
+    ]
+
+    # Dedup truly-identical (sample_name, acquisition_id, barcode_id)
+    # tuples; the user's TSV duplicating a row shouldn't blow up FK
+    # closure with two indistinguishable edges.
+    seen_edges: set[tuple[str, int, int]] = set()
+    edge_rows: list[dict[str, object]] = []
+    duplicate_edges: list[tuple[str, int, int]] = []
+    for name, acq_id, bid in raw_edges:
+        key = (name, acq_id, bid)
+        if key in seen_edges:
+            duplicate_edges.append(key)
+            continue
+        seen_edges.add(key)
         edge_rows.append(
             {
-                "sample_id": sid,
+                "sample_id": name_to_sid[name],
                 "acquisition_id": acq_id,
                 "barcode_id": bid,
             }
+        )
+    if duplicate_edges:
+        sys.stderr.write(
+            f"warning: dropped {len(duplicate_edges)} duplicate "
+            f"(sample_name, acquisition_id, barcode_id) row(s) from "
+            f"{tsv_path}: {duplicate_edges[:3]}"
+            f"{'...' if len(duplicate_edges) > 3 else ''}\n"
         )
 
     return sample_rows, edge_rows, file_to_acq
@@ -987,14 +1031,16 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
     """Run the full S1 demux + ORF + quant pipeline on one or more SAM/BAMs."""
     # Defer heavy imports until the subcommand actually fires so
     # `constellation --help` stays fast.
-    import json
     from pathlib import Path
 
     from constellation.sequencing.progress import (
         NullProgress,
         StreamProgress,
     )
-    from constellation.sequencing.samples import Samples
+    from constellation.sequencing.samples import Samples, save_samples
+    from constellation.sequencing.transcriptome.manifest import (
+        write_demux_manifest,
+    )
     from constellation.sequencing.transcriptome.stages import (
         run_demux_pipeline,
     )
@@ -1041,27 +1087,49 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
     fasta_records = artefacts["fasta_records"]
     fastq_dir = artefacts.get("fastq_dir")
 
-    # Manifest for reproducibility audit.
-    manifest: dict[str, object] = {
-        "input_files": [str(f) for f in input_files],
-        "acquisition_map": {str(f): aid for f, aid in pipeline_inputs},
-        "library_design": args.library_design,
+    # Persist the resolved Samples container so align + cluster can
+    # consume it without re-parsing the user's TSV.
+    samples_dir = output_dir / "samples"
+    save_samples(samples, samples_dir)
+
+    outputs: dict[str, str] = {
+        "feature_quant": str(output_dir / "feature_quant.parquet"),
+        "proteins_fasta": str(output_dir / "proteins.fasta"),
+        "protein_counts_tsv": str(output_dir / "protein_counts.tsv"),
+        "read_demux": str(output_dir / "read_demux"),
+        "samples": str(samples_dir),
+    }
+    if fastq_dir is not None:
+        outputs["fastq_dir"] = str(fastq_dir)
+
+    parameters: dict[str, object] = {
         "min_aa_length": args.min_aa_length,
         "min_protein_count": args.min_protein_count,
-        "n_reads": n_reads,
-        "n_proteins_kept": len(fasta_records),
         "n_workers": args.threads,
         "batch_size": args.batch_size,
         "resumed": args.resume,
         "emit_fastq": args.emit_fastq,
     }
+    stages: dict[str, object] = {
+        "n_reads": n_reads,
+        "n_proteins_kept": len(fasta_records),
+    }
     if fastq_dir is not None:
-        manifest["fastq_dir"] = str(fastq_dir)
-        manifest["fastq_files"] = {
+        fastq_files = {
             p.name.removesuffix(".fq.gz"): str(p)
             for p in sorted(Path(fastq_dir).glob("*.fq.gz"))
         }
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        stages["fastq_files"] = fastq_files
+
+    write_demux_manifest(
+        output_dir / "manifest.json",
+        input_files=[str(f) for f in input_files],
+        acquisition_map={str(f): aid for f, aid in pipeline_inputs},
+        library_design=args.library_design,
+        parameters=parameters,
+        stages=stages,
+        outputs=outputs,
+    )
 
     if not args.progress:
         # Print a one-shot summary when --progress isn't on.
@@ -1082,7 +1150,6 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     200M-read scale: ~3 GB gene_assignments + ~10 GB read_demux at the
     resolve stage; alignment table never materialised whole.
     """
-    import json
     import sys
     from pathlib import Path
 
@@ -1110,7 +1177,10 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     )
     from constellation.sequencing.readers.sam_bam import _bam_alignment_chunks
     from constellation.sequencing.reference.io import load_genome_reference
-    from constellation.sequencing.samples import Samples
+    from constellation.sequencing.samples import load_samples
+    from constellation.sequencing.transcriptome.manifest import (
+        read_manifest_dir,
+    )
 
     # ── Mode dispatch ────────────────────────────────────────────────
     if args.reference is None and args.reference_dir is None:
@@ -1128,19 +1198,28 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         )
         return 2
 
-    demux_dir = Path(args.demux_dir)
+    demux_dir = Path(args.demux_dir).expanduser().resolve()
     if not demux_dir.is_dir():
         raise FileNotFoundError(f"--demux-dir not found: {demux_dir}")
-    demux_manifest_path = demux_dir / "manifest.json"
-    if not demux_manifest_path.exists():
-        raise FileNotFoundError(
-            f"--demux-dir missing manifest.json: {demux_dir}"
-        )
     if not (demux_dir / "read_demux").is_dir():
         raise FileNotFoundError(
             f"--demux-dir missing read_demux/: {demux_dir}"
         )
-    demux_manifest = json.loads(demux_manifest_path.read_text())
+    demux_manifest = read_manifest_dir(demux_dir)
+    if demux_manifest.kind != "demux":
+        raise ValueError(
+            f"--demux-dir {demux_dir} has manifest kind="
+            f"{demux_manifest.kind!r}; expected 'demux'"
+        )
+    samples_dir = demux_dir / "samples"
+    if not samples_dir.is_dir():
+        sys.exit(
+            f"--demux-dir {demux_dir} does not contain a 'samples/' "
+            f"directory — it was produced by an older version of "
+            f"constellation; re-run `constellation transcriptome "
+            f"demultiplex` to upgrade its schema"
+        )
+    samples = load_samples(samples_dir)
 
     reference, reference_handle, assembly_accession = _resolve_reference_args(
         handle_arg=args.reference, dir_arg=args.reference_dir
@@ -1177,19 +1256,11 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     annotation.validate_against(genome)
 
     # Source BAM paths from the S1 demux manifest are kept solely for
-    # samples-TSV multi-file mapping (the `file` column matches against
-    # these basenames). We DO NOT open them — alignment streams trimmed
-    # transcript windows from the demux parquet partitions instead, so
-    # the raw BAMs may be moved/archived after demux without breaking
-    # the align stage.
-    bam_inputs = [Path(p) for p in demux_manifest.get("input_files", [])]
-
-    sample_rows, edge_rows, _ = _parse_samples_tsv(
-        args.samples,
-        input_files=bam_inputs,
-        default_acquisition_id=int(demux_manifest.get("acquisition_id", 1)),
-    )
-    samples = Samples.from_records(samples=sample_rows, edges=edge_rows)
+    # the align manifest's provenance record. We DO NOT open them —
+    # alignment streams trimmed transcript windows from the demux
+    # parquet partitions instead, so the raw BAMs may be moved /
+    # archived after demux without breaking the align stage.
+    bam_inputs = [Path(p) for p in demux_manifest.input_files]
 
     # ── Stage 1: align ───────────────────────────────────────────────
     bam_success = output_dir / "bam" / "_SUCCESS"
@@ -1516,9 +1587,10 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     """Phase 2 — group reads into transcript / isoform clusters.
 
     Inputs: a `transcriptome align` output dir (alignment_blocks/ +
-    introns.parquet) + the S1 demux dir + samples.tsv. Outputs:
-    clusters.parquet, cluster_membership.parquet, optional cluster.fa +
-    cluster_summary.tsv.
+    introns.parquet) + the S1 demux dir (whose ``samples/`` subdir
+    carries the resolved Samples container — no ``--samples`` TSV
+    needed). Outputs: clusters.parquet, cluster_membership.parquet,
+    optional cluster.fa + cluster_summary.tsv.
 
     Fingerprints are derived fresh at every invocation against the
     INTRON_TABLE in introns.parquet, so the ``--intron-tolerance-bp``
@@ -1526,7 +1598,6 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     — sweeping it never requires re-running align (we re-cluster the
     raw per-position rows on the fly).
     """
-    import json
     from collections import Counter
     from pathlib import Path
 
@@ -1541,12 +1612,15 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     )
     from constellation.sequencing.quant import cluster_junctions
     from constellation.sequencing.reference.io import load_genome_reference
-    from constellation.sequencing.samples import Samples
+    from constellation.sequencing.samples import load_samples
     from constellation.sequencing.transcriptome.cluster_genome import (
         cluster_by_fingerprint,
     )
     from constellation.sequencing.transcriptome.fingerprints import (
         compute_read_fingerprints,
+    )
+    from constellation.sequencing.transcriptome.manifest import (
+        read_manifest_dir,
     )
 
     if args.mode != "genome-guided":  # pragma: no cover — argparse-gated
@@ -1638,19 +1712,21 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     _ = StreamProgress() if args.progress else NullProgress()
 
     # ── Resolve align-dir manifest for downstream provenance ─────────
-    align_manifest_path = align_dir / "manifest.json"
-    align_manifest: dict = {}
-    if align_manifest_path.exists():
-        align_manifest = json.loads(align_manifest_path.read_text())
+    align_manifest = read_manifest_dir(align_dir)
+    if align_manifest.kind != "align":
+        raise ValueError(
+            f"--align-dir {align_dir} has manifest kind="
+            f"{align_manifest.kind!r}; expected 'align'"
+        )
 
     # Reference identity: inherit from the upstream align manifest unless
     # the user explicitly overrides via --reference / --reference-dir.
     # The handle (when present) and assembly_accession ride forward into
     # this stage's manifest so downstream consumers can match cluster
     # outputs to the same reference axis as the align outputs.
-    inherited_handle: str | None = align_manifest.get("reference_handle")
-    inherited_ref_path: str | None = align_manifest.get("reference_path")
-    inherited_assembly: str | None = align_manifest.get("assembly_accession")
+    inherited_handle: str | None = align_manifest.reference_handle
+    inherited_ref_path: str | None = align_manifest.reference_path
+    inherited_assembly: str | None = align_manifest.assembly_accession
 
     reference: Path | None = None
     reference_handle: str | None = inherited_handle
@@ -1696,16 +1772,16 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             )
         genome = load_genome_reference(genome_dir)
 
-    # ── Samples (consistent with the align run) ──────────────────────
-    bam_inputs = [
-        Path(p) for p in align_manifest.get("input_files", [])
-    ]
-    sample_rows, edge_rows, _ = _parse_samples_tsv(
-        args.samples,
-        input_files=bam_inputs,
-        default_acquisition_id=int(align_manifest.get("acquisition_id", 1)),
-    )
-    samples = Samples.from_records(samples=sample_rows, edges=edge_rows)
+    # ── Samples (loaded from the demux output's persisted bundle) ────
+    samples_dir = demux_dir / "samples"
+    if not samples_dir.is_dir():
+        sys.exit(
+            f"--demux-dir {demux_dir} does not contain a 'samples/' "
+            f"directory — it was produced by an older version of "
+            f"constellation; re-run `constellation transcriptome "
+            f"demultiplex` to upgrade its schema"
+        )
+    samples = load_samples(samples_dir)
 
     # ── Materialise alignments + alignment_blocks ────────────────────
     # Memory budget at 200M reads: ~30 GB alignments + ~25 GB blocks.
@@ -1750,7 +1826,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     # rows (each row in introns.parquet is still a distinct observed
     # (donor, acceptor) pair). The motif-priority list rides as a
     # comma-separated align-manifest value.
-    align_params = align_manifest.get("parameters", {})
+    align_params = align_manifest.parameters
     align_tolerance = align_params.get("intron_tolerance_bp")
     align_motif_priority = str(
         align_params.get("intron_motif_priority", "GT-AG,GC-AG,AT-AC")
@@ -1976,7 +2052,6 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         assembly_accession=assembly_accession,
         align_dir=str(align_dir),
         demux_dir=str(demux_dir),
-        samples_path=str(args.samples),
         parameters={
             "mode": str(args.mode),
             "max_5p_drift": int(args.max_5p_drift),

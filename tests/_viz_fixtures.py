@@ -222,7 +222,6 @@ def write_cluster_source(
         assembly_accession=assembly_accession,
         align_dir="",
         demux_dir="",
-        samples_path="",
         parameters={},
         stages={},
         outputs=outputs,

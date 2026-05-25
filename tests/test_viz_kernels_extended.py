@@ -175,7 +175,6 @@ def _make_session(
             assembly_accession=DEFAULT_ASSEMBLY,
             align_dir="",
             demux_dir="",
-            samples_path="",
             parameters={},
             stages={},
             outputs=outputs,

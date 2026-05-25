@@ -149,7 +149,7 @@ def test_open_legacy_manifest_is_rejected(
     (legacy / "manifest.json").write_text(
         json.dumps(
             {
-                # Pre-v2 manifest shape — no schema_version=2, no kind.
+                # Legacy manifest shape — no schema_version, no kind.
                 "demux_dir": "/somewhere",
                 "reference": "/old/path",
                 "outputs": {},

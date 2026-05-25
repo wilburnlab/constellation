@@ -335,7 +335,7 @@ class Session:
 def _load_source(entry: dict[str, Any]) -> SessionSource:
     """Build a SessionSource from a ``{path, kind?, label?}`` dict.
 
-    Reads the source's ``manifest.json`` (schema v2 required), assembles
+    Reads the source's ``manifest.json`` (schema v3 required), assembles
     the per-kind slot map by joining the manifest's ``outputs`` against
     the well-known relative paths, and returns a frozen dataclass.
     """
@@ -351,6 +351,12 @@ def _load_source(entry: dict[str, Any]) -> SessionSource:
         raise ValueError(f"source path is not a directory: {source_path}")
 
     manifest = read_manifest_dir(source_path)
+    if manifest.kind == "demux":
+        raise ValueError(
+            f"source at {source_path} is a demux output; the genome "
+            f"browser attaches `transcriptome align` or `transcriptome "
+            f"cluster` output dirs — pass one of those instead"
+        )
     kind_hint = entry.get("kind")
     if kind_hint is not None and kind_hint != manifest.kind:
         raise ValueError(
