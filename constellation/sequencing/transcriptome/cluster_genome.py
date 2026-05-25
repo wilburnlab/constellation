@@ -493,13 +493,44 @@ def cluster_by_fingerprint(
     else:
         _p("boundary walk: 0 clusters")
 
-    # Hoist source-column references out of the loop. (combine_chunks
-    # is intentionally NOT called on `reads` or `fingerprints` — the
-    # sequence/read_id columns at PromethION scale would force a single
-    # contiguous buffer allocation of tens-to-hundreds of GB. Per-call
-    # ChunkedArray dispatch is cheap relative to the per-cluster work
-    # inside _emit_cluster, so the right tradeoff is to live with the
-    # chunked layout here.)
+    # Combine_chunks the source tables once before the per-cluster
+    # loop. pyarrow's `pc.take` has per-call dispatch overhead roughly
+    # proportional to chunk count, even when the index array is 1
+    # element — and we'll call pc.take ~10×/cluster × N_clusters. With
+    # multi-shard parquet sources that each split into many chunks,
+    # this dispatch cost dominates the loop wall time (a 1-row cluster
+    # takes ~7s with chunked sources vs. ~10ms with single-chunk
+    # sources at mouse scale).
+    #
+    # Each combine is guarded by an .nbytes size check — at PromethION
+    # scale with poor fingerprint coverage, `reads.sequence` is a few
+    # GB and safely combinable; at full coverage it could exceed
+    # available RAM and the guard falls back to chunked + slow takes.
+    _COMBINE_BYTES_LIMIT = 64 * 1024 ** 3  # 64 GB hard cap per source
+
+    def _maybe_combine(t: pa.Table, name: str) -> pa.Table:
+        try:
+            nb = int(t.nbytes)
+        except Exception:
+            nb = -1
+        if 0 <= nb <= _COMBINE_BYTES_LIMIT:
+            _p(f"combine_chunks: {name} ({nb / 1e9:.2f} GB)")
+            return t.combine_chunks()
+        _p(
+            f"combine_chunks: SKIP {name} ({nb / 1e9:.2f} GB > "
+            f"{_COMBINE_BYTES_LIMIT / 1e9:.0f} GB cap) — falling back to "
+            f"per-call ChunkedArray dispatch (slow)"
+        )
+        return t
+
+    fingerprints = _maybe_combine(fingerprints, "fingerprints")
+    if reads.num_rows > 0:
+        reads = _maybe_combine(reads, "reads")
+    primary_lookup = _maybe_combine(primary_lookup, "primary_lookup")
+    if metrics_table is not None:
+        metrics_table = _maybe_combine(metrics_table, "metrics_table")
+
+    # Hoist source-column references out of the loop.
     sk_row_idx = sorted_keys.column("row_idx")
     sk_reads_idx = sorted_keys.column("reads_idx")
     sk_primary_idx = sorted_keys.column("primary_idx")
@@ -557,17 +588,24 @@ def cluster_by_fingerprint(
                 last_progress_t = now
 
         cluster_t0 = _time.perf_counter()
-        if progress is not None and i < DETAIL_FIRST_N:
+        detail = progress is not None and i < DETAIL_FIRST_N
+        if detail:
             _p(f"  cluster {i}: start size={size}")
 
         # Per-cluster slice of sort keys + source-row indices.
+        _ts = _time.perf_counter()
         row_indices = sk_row_idx.slice(start, size)
         reads_indices = sk_reads_idx.slice(start, size)
         primary_indices = sk_primary_idx.slice(start, size)
         sample_filled_slice = sk_sample_id.slice(start, size)
+        t_slice = _time.perf_counter() - _ts
 
         # Take from each source. ``pc.take`` propagates nulls.
+        _ts = _time.perf_counter()
         fp_slice = fingerprints.take(row_indices)
+        t_fp_take = _time.perf_counter() - _ts
+
+        _ts = _time.perf_counter()
         if reads_seq is not None:
             seq_col = pc.take(reads_seq, reads_indices)
             quality_col = (
@@ -578,16 +616,21 @@ def cluster_by_fingerprint(
         else:
             seq_col = pa.nulls(size, type=pa.string())
             quality_col = pa.nulls(size, type=pa.float32())
+        t_reads_take = _time.perf_counter() - _ts
 
+        _ts = _time.perf_counter()
         aid_col = pc.take(pri_aid, primary_indices)
         rstart_col = pc.take(pri_rstart, primary_indices)
+        t_primary_take = _time.perf_counter() - _ts
 
         # Un-sentinel sample_id for the emitted slice.
+        _ts = _time.perf_counter()
         sample_col = pc.if_else(
             pc.equal(sample_filled_slice, sample_null_sentinel_scalar),
             pa.scalar(None, type=pa.int64()),
             sample_filled_slice,
         )
+        t_sample = _time.perf_counter() - _ts
 
         slice_cols: dict[str, pa.Array | pa.ChunkedArray] = {
             "read_id": fp_slice.column("read_id"),
@@ -604,6 +647,7 @@ def cluster_by_fingerprint(
             "ref_start": rstart_col,
             "sample_id": sample_col,
         }
+        _ts = _time.perf_counter()
         if metrics_table is not None and sk_metrics_idx is not None:
             metrics_indices = sk_metrics_idx.slice(start, size)
             slice_cols["n_match_sum"] = pc.take(m_match, metrics_indices)
@@ -611,12 +655,23 @@ def cluster_by_fingerprint(
             slice_cols["n_insert_sum"] = pc.take(m_insert, metrics_indices)
             slice_cols["n_delete_sum"] = pc.take(m_delete, metrics_indices)
             slice_cols["cs_aware"] = pc.take(m_csaware, metrics_indices)
-        slice_table = pa.table(slice_cols)
+        t_metrics_take = _time.perf_counter() - _ts
 
-        if progress is not None and i < DETAIL_FIRST_N:
+        _ts = _time.perf_counter()
+        slice_table = pa.table(slice_cols)
+        t_table_build = _time.perf_counter() - _ts
+
+        if detail:
             _p(
                 f"  cluster {i}: slice_table built "
-                f"({_time.perf_counter() - cluster_t0:.2f}s) — entering _emit_cluster"
+                f"({_time.perf_counter() - cluster_t0:.2f}s) — "
+                f"slice={t_slice * 1000:.1f}ms "
+                f"fp_take={t_fp_take * 1000:.1f}ms "
+                f"reads_take={t_reads_take * 1000:.1f}ms "
+                f"primary_take={t_primary_take * 1000:.1f}ms "
+                f"sample={t_sample * 1000:.1f}ms "
+                f"metrics_take={t_metrics_take * 1000:.1f}ms "
+                f"table_build={t_table_build * 1000:.1f}ms"
             )
 
         emit_t0 = _time.perf_counter()
