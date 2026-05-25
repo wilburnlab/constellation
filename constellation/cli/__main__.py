@@ -1791,6 +1791,24 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     # so we leave NullProgress as a no-op placeholder.
     _ = StreamProgress() if args.progress else NullProgress()
 
+    # Stage-boundary timing logger. Under --progress we print
+    # `[cluster +Xs] msg` to stderr at every well-known checkpoint
+    # below + every K clusters inside cluster_by_fingerprint. Flushes
+    # immediately so a cluster job's stdout buffer doesn't hide
+    # progress when the wall time runs into hours. No-op when
+    # --progress is off.
+    import time as _time
+    _t0 = _time.perf_counter()
+    if args.progress:
+        def _log(msg: str) -> None:
+            elapsed = _time.perf_counter() - _t0
+            print(f"[cluster +{elapsed:8.1f}s] {msg}",
+                  file=sys.stderr, flush=True)
+    else:
+        def _log(msg: str) -> None:
+            return None
+    _log("start")
+
     # ── Resolve align-dir manifest for downstream provenance ─────────
     align_manifest = read_manifest_dir(align_dir)
     if align_manifest.kind != "align":
@@ -1862,6 +1880,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             f"demultiplex` to upgrade its schema"
         )
     samples = load_samples(samples_dir)
+    _log("resolved manifest + samples")
 
     # ── Materialise alignments + alignment_blocks ────────────────────
     # Project columns at scan time — cluster_by_fingerprint +
@@ -1881,9 +1900,11 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     alignments_table = pa_dataset.dataset(
         align_dir / "alignments"
     ).to_table(columns=_alignments_cols)
+    _log(f"loaded alignments_table ({alignments_table.num_rows:,} rows)")
     blocks_table = pa_dataset.dataset(
         align_dir / "alignment_blocks"
     ).to_table(columns=_blocks_cols)
+    _log(f"loaded blocks_table ({blocks_table.num_rows:,} rows)")
     # alignment_cs is opened as a dataset (not eagerly materialised) when
     # --build-consensus is on — the consensus path filters per-cluster
     # rather than carrying the full cs:long column (~50 GB at full scale)
@@ -1892,6 +1913,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     alignment_cs_dataset: pa_dataset.Dataset | None = None
     if args.build_consensus:
         alignment_cs_dataset = pa_dataset.dataset(align_dir / "alignment_cs")
+        _log("opened alignment_cs dataset (lazy)")
 
     # Genome contig table for fingerprint derivation. When --build-
     # consensus is off we still need contig names → contig_ids, but
@@ -1913,8 +1935,11 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             }
         )
 
+    _log("built contigs_table")
+
     # ── Load introns.parquet; optionally re-cluster ─────────────────
     introns_table = pq.read_table(align_dir / "introns.parquet")
+    _log(f"loaded introns_table ({introns_table.num_rows:,} rows)")
 
     # When the user explicitly overrides --intron-tolerance-bp at
     # cluster time, re-run cluster_junctions against the raw per-position
@@ -1941,6 +1966,10 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             tolerance_bp=int(effective_tolerance),
             motif_priority=intron_motif_priority,
         )
+        _log(
+            f"re-clustered introns at tolerance_bp={effective_tolerance} "
+            f"({introns_table.num_rows:,} rows)"
+        )
     if effective_tolerance is None:
         effective_tolerance = (
             int(align_tolerance) if align_tolerance is not None else 5
@@ -1948,11 +1977,16 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
 
     # ── Derive fingerprints fresh against the (possibly re-clustered)
     # INTRON_TABLE ───────────────────────────────────────────────────
+    _log("compute_read_fingerprints: start")
     fingerprints_table = compute_read_fingerprints(
         blocks_table,
         alignments_table,
         contigs_table,
         introns_table,
+    )
+    _log(
+        f"compute_read_fingerprints: done "
+        f"({fingerprints_table.num_rows:,} fingerprints)"
     )
 
     # ── Pull trimmed transcript-window sequences for clustered reads ─
@@ -1968,10 +2002,12 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     read_demux_filter = pc.is_in(
         pa_dataset.field("read_id"), value_set=fp_read_id_chunked
     )
+    _log("read_demux: scan start")
     read_demux = pa_dataset.dataset(demux_dir / "read_demux").to_table(
         columns=read_demux_columns,
         filter=read_demux_filter,
     )
+    _log(f"read_demux: scan done ({read_demux.num_rows:,} rows before dedup)")
     # One transcript window per read for clustering — pick the lowest
     # transcript_segment_index per read_id (chimera resolution downstream
     # is out of scope for genome-guided clustering v1). The dedup replaces
@@ -1998,6 +2034,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             is_first[1:] = rid_idx[1:] != rid_idx[:-1]
         if not bool(np.all(is_first)):
             read_demux = read_demux.filter(pa.array(is_first))
+    _log(f"read_demux: dedup done ({read_demux.num_rows:,} rows after dedup)")
 
     reads_columns = ["read_id", "sequence"]
     reads_dataset = pa_dataset.dataset(demux_dir / "reads")
@@ -2007,9 +2044,11 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     reads_filter = pc.is_in(
         pa_dataset.field("read_id"), value_set=fp_read_id_chunked
     )
+    _log("raw_reads: scan start")
     raw_reads = reads_dataset.to_table(
         columns=reads_columns, filter=reads_filter
     )
+    _log(f"raw_reads: scan done ({raw_reads.num_rows:,} rows)")
     # Cast sequence to large_string defensively — at PromethION scale
     # (~200M reads × ~500 bytes/window ≈ 100 GB) the column blows past
     # Arrow's 2 GiB int32 string-offset limit when carried through
@@ -2023,6 +2062,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             "sequence",
             pc.cast(raw_reads.column("sequence"), pa.large_string()),
         )
+        _log("raw_reads: sequence cast string → large_string")
 
     # Join + slice trimmed windows into a flat (read_id, sequence,
     # dorado_quality) table for cluster_by_fingerprint. The trim itself
@@ -2039,6 +2079,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             }
         )
     else:
+        _log("raw_reads ⨝ read_demux: join start")
         joined = raw_reads.join(
             read_demux.select(
                 ["read_id", "transcript_start", "transcript_end"]
@@ -2046,11 +2087,14 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             keys="read_id",
             join_type="inner",
         )
+        _log(f"raw_reads ⨝ read_demux: join done ({joined.num_rows:,} rows)")
+        _log("trim: vectorized buffer construction start")
         trimmed_seq = _trim_sequences_to_large_string(
             joined.column("sequence"),
             joined.column("transcript_start"),
             joined.column("transcript_end"),
         )
+        _log("trim: done")
         cols: dict[str, pa.Array | pa.ChunkedArray] = {
             "read_id": joined.column("read_id"),
             "sequence": trimmed_seq,
@@ -2064,6 +2108,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
                 joined.num_rows, type=pa.float32()
             )
         trimmed_table = pa.table(cols)
+    _log(f"trimmed_table built ({trimmed_table.num_rows:,} rows)")
 
     # ── read_to_sample for --per-sample-clusters ─────────────────────
     # 2-column Arrow table replaces the prior ~200M-entry Python dict
@@ -2075,8 +2120,12 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             pc.is_valid(read_demux.column("sample_id"))
         )
         read_to_sample_table = rd_valid.select(["read_id", "sample_id"])
+        _log(
+            f"read_to_sample built ({read_to_sample_table.num_rows:,} rows)"
+        )
 
     # ── Cluster ──────────────────────────────────────────────────────
+    _log("cluster_by_fingerprint: enter")
     clusters, membership = cluster_by_fingerprint(
         fingerprints_table,
         trimmed_table,
@@ -2092,11 +2141,17 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         drop_drift_filtered=bool(args.drop_drift_filtered),
         per_sample_clusters=bool(args.per_sample_clusters),
         cluster_id_seed=0,
+        progress=_log if args.progress else None,
+    )
+    _log(
+        f"cluster_by_fingerprint: done "
+        f"({clusters.num_rows:,} clusters, {membership.num_rows:,} membership rows)"
     )
 
     # ── Write outputs ────────────────────────────────────────────────
     pq.write_table(clusters, output_dir / "clusters.parquet")
     pq.write_table(membership, output_dir / "cluster_membership.parquet")
+    _log("wrote clusters.parquet + cluster_membership.parquet")
 
     cluster_outputs: dict[str, str] = {
         "clusters": str(output_dir / "clusters.parquet"),
@@ -2124,6 +2179,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
                     continue
                 fh.write(f">cluster_{cid} representative={rep}\n{seq}\n")
         cluster_outputs["cluster_fa"] = str(fasta_path)
+        _log("wrote cluster.fa")
 
     # cluster_summary.tsv — size histogram + n_singletons + fraction.
     if args.write_summary:
@@ -2150,6 +2206,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             for size in sorted(size_hist.keys()):
                 fh.write(f"{size}\t{size_hist[size]}\n")
         cluster_outputs["cluster_summary_tsv"] = str(summary_path)
+        _log("wrote cluster_summary.tsv")
 
     # ── Manifest + _SUCCESS ──────────────────────────────────────────
     from constellation.sequencing.transcriptome.manifest import (

@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import statistics
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pyarrow as pa
@@ -301,6 +301,7 @@ def cluster_by_fingerprint(
     drop_drift_filtered: bool = False,
     per_sample_clusters: bool = False,
     cluster_id_seed: int = 0,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[pa.Table, pa.Table]:
     """Group reads into clusters by quantised splicing-topology fingerprint.
 
@@ -356,6 +357,12 @@ def cluster_by_fingerprint(
     cluster_id_seed : int, default 0
         Starting cluster_id. Caller packs ``(worker_idx << 32)`` here
         when running parallel partitions.
+    progress : Callable[[str], None] | None, default None
+        Optional one-arg callable that the function calls at each
+        internal stage boundary + every K clusters inside the per-
+        cluster loop. The CLI wires it up under ``--progress``; tests
+        pass ``None``. Each message is a short free-form string; the
+        callable is responsible for prefixing / flushing.
 
     Returns
     -------
@@ -388,21 +395,30 @@ def cluster_by_fingerprint(
     # offset-overflow-immune), and ``pc.take`` per cluster from each
     # source. Source tables (notably ``reads.sequence``) never go through
     # the heavy sort. See sequencing/CLAUDE.md "Resolve-stage pitfalls".
+    def _p(msg: str) -> None:
+        if progress is not None:
+            progress(f"  cluster_by_fingerprint: {msg}")
+
+    _p("build primary_lookup")
     primary_lookup = _build_alignment_lookup(alignments)
-    metrics_table: pa.Table | None = (
-        _build_alignment_metrics(alignment_blocks)
-        if alignment_blocks is not None
-        else None
-    )
+    _p(f"primary_lookup: {primary_lookup.num_rows:,} rows")
+    metrics_table: pa.Table | None = None
+    if alignment_blocks is not None:
+        _p("build alignment_metrics")
+        metrics_table = _build_alignment_metrics(alignment_blocks)
+        _p(f"alignment_metrics: {metrics_table.num_rows:,} rows")
 
     n = fingerprints.num_rows
     fp_read_ids = fingerprints.column("read_id")
     has_quality = "dorado_quality" in reads.schema.names
 
     # Row indices into each source. Nulls propagate where there's no match.
+    _p("pc.index_in: reads")
     reads_idx = pc.index_in(fp_read_ids, reads.column("read_id"))
+    _p("pc.index_in: primary_lookup")
     primary_idx = pc.index_in(fp_read_ids, primary_lookup.column("read_id"))
     if metrics_table is not None:
+        _p("pc.index_in: metrics (via primary alignment_id)")
         aid_per_fp = pc.take(
             primary_lookup.column("alignment_id"), primary_idx
         )
@@ -414,6 +430,7 @@ def cluster_by_fingerprint(
 
     # sample_id per fingerprint row.
     if per_sample_clusters and read_to_sample is not None:
+        _p("pc.index_in: read_to_sample")
         rts_idx = pc.index_in(fp_read_ids, read_to_sample.column("read_id"))
         sample_id_col = pc.take(
             read_to_sample.column("sample_id"), rts_idx
@@ -421,6 +438,7 @@ def cluster_by_fingerprint(
     else:
         sample_id_col = pa.nulls(n, type=pa.int64())
     sample_id_for_sort = pc.fill_null(sample_id_col, _SAMPLE_NULL_SENTINEL)
+    _p("source indices resolved")
 
     # contig_id → name lookup (small — keep as dict for consensus path).
     contig_id_to_name: dict[int, str] = {}
@@ -449,7 +467,9 @@ def cluster_by_fingerprint(
     if metrics_idx is not None:
         narrow_cols["metrics_idx"] = metrics_idx
     narrow_keys = pa.table(narrow_cols)
+    _p(f"narrow_keys built ({narrow_keys.num_rows:,} rows)")
 
+    _p("sort_by + combine_chunks")
     sorted_keys = narrow_keys.sort_by(
         [
             ("contig_id", "ascending"),
@@ -458,18 +478,27 @@ def cluster_by_fingerprint(
             ("fingerprint_hash", "ascending"),
         ]
     ).combine_chunks()
+    _p("sort done")
     boundaries = _cluster_boundaries(sorted_keys)
+    n_boundaries = len(boundaries)
+    _p(f"boundary walk: {n_boundaries:,} clusters")
 
     # ── Per-cluster assembly + emission ─────────────────────────
     cluster_rows: list[dict[str, Any]] = []
     membership_rows: list[dict[str, Any]] = []
     next_cluster_id = int(cluster_id_seed)
+    log_every = max(1, n_boundaries // 100)  # ~1% increments
 
     sample_null_sentinel_scalar = pa.scalar(
         _SAMPLE_NULL_SENTINEL, type=pa.int64()
     )
 
-    for start, size in boundaries:
+    for i, (start, size) in enumerate(boundaries):
+        if progress is not None and i > 0 and i % log_every == 0:
+            _p(
+                f"  per-cluster loop: {i:,} / {n_boundaries:,} "
+                f"({100 * i / n_boundaries:.1f}%) — emitted={len(cluster_rows):,}"
+            )
         # Per-cluster slice of sort keys + source-row indices.
         row_indices = sorted_keys.column("row_idx").slice(start, size)
         reads_indices = sorted_keys.column("reads_idx").slice(start, size)
@@ -563,15 +592,22 @@ def cluster_by_fingerprint(
         membership_rows.extend(members_rows)
         next_cluster_id += 1
 
+    _p(
+        f"per-cluster loop done — emitted {len(cluster_rows):,} clusters / "
+        f"{len(membership_rows):,} membership rows"
+    )
+
     if not cluster_rows:
         return (
             TRANSCRIPT_CLUSTER_TABLE.empty_table(),
             CLUSTER_MEMBERSHIP_TABLE.empty_table(),
         )
+    _p("from_pylist: clusters + membership")
     clusters = pa.Table.from_pylist(cluster_rows, schema=TRANSCRIPT_CLUSTER_TABLE)
     membership = pa.Table.from_pylist(
         membership_rows, schema=CLUSTER_MEMBERSHIP_TABLE
     )
+    _p("output tables built")
     return clusters, membership
 
 
