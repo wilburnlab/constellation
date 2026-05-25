@@ -1,21 +1,35 @@
 """Stage-output manifest readers/writers for transcriptome pipeline stages.
 
 Replaces the ad-hoc ``json.dumps({...})`` blocks that ``constellation
-transcriptome align`` and ``constellation transcriptome cluster`` used to
-emit. Schema v2 records the reference cache handle directly so downstream
-consumers (the genome browser dashboard, future cross-validation passes,
-session-cache resume) can match a stage output to its reference without
-re-walking the cache by path.
+transcriptome demultiplex``, ``... align`` and ``... cluster`` emit.
 
-Schema v2 fields (top level)::
+Schema v3 promotes the demux stage to a formal manifest alongside align
++ cluster (it was previously an ad-hoc JSON dict with no
+``schema_version`` field) and removes the ``samples_path`` field from
+cluster manifests — sample state is now persisted into the demux
+output dir as a ParquetDir bundle (``<demux-dir>/samples/``) and read
+forward by align + cluster, so the path to the original TSV is no
+longer load-bearing.
 
-    schema_version = 2
-    kind            "align" | "cluster"
+Schema v3 fields (top level)::
+
+    schema_version  = 3
+    kind            "demux" | "align" | "cluster"
+    created_at      ISO 8601 UTC timestamp
+
+    # demux-specific
+    input_files        list[str]
+    acquisition_map    dict[str, int]   file path → acquisition_id
+    library_design     str
+    parameters         dict[str, Any]
+    stages             dict[str, Any]
+    outputs            dict[str, str]   includes ``samples`` -> samples/
+
+    # align + cluster:
     reference_handle   "<organism>@<source>-<release>"  or None (escape hatch)
     reference_path     absolute path to the resolved release dir, or to the
                        user-supplied --reference-dir when handle is None
     assembly_accession copied from <release>/meta.toml when available
-    created_at         ISO 8601 UTC timestamp
     input_files        list[str]
     parameters         dict[str, Any]  (verb-specific knob snapshot)
     stages             dict[str, Any]  (verb-specific counters)
@@ -24,7 +38,8 @@ Schema v2 fields (top level)::
     # align-specific
     demux_dir          str
     # cluster-specific
-    align_dir, demux_dir, samples_path
+    align_dir          str
+    demux_dir          str
 
 ``reference_handle is None`` flags an escape-hatch run made via
 ``--reference-dir <PATH>`` — the dashboard's source picker treats those
@@ -36,19 +51,40 @@ upstream align manifest unless the cluster CLI overrides it.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 
-MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 3
 MANIFEST_FILENAME = "manifest.json"
 
 
 @dataclass(frozen=True, slots=True)
+class DemuxManifest:
+    """Schema v3 manifest for ``transcriptome demultiplex`` outputs.
+
+    The demux stage produces ``read_demux/`` (resolved sample_ids per
+    read), ``feature_quant.parquet`` + downstream protein artifacts, and
+    a ``samples/`` ParquetDir bundle that downstream stages load
+    instead of re-parsing the user's TSV.
+    """
+
+    schema_version: int
+    kind: Literal["demux"]
+    created_at: str
+    input_files: list[str]
+    acquisition_map: dict[str, int]
+    library_design: str
+    parameters: dict[str, Any]
+    stages: dict[str, Any]
+    outputs: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
 class AlignManifest:
-    """Schema v2 manifest for ``transcriptome align`` outputs."""
+    """Schema v3 manifest for ``transcriptome align`` outputs."""
 
     schema_version: int
     kind: Literal["align"]
@@ -66,7 +102,7 @@ class AlignManifest:
 
 @dataclass(frozen=True, slots=True)
 class ClusterManifest:
-    """Schema v2 manifest for ``transcriptome cluster`` outputs."""
+    """Schema v3 manifest for ``transcriptome cluster`` outputs."""
 
     schema_version: int
     kind: Literal["cluster"]
@@ -76,7 +112,6 @@ class ClusterManifest:
     created_at: str
     align_dir: str
     demux_dir: str
-    samples_path: str
     parameters: dict[str, Any]
     stages: dict[str, Any]
     outputs: dict[str, str]
@@ -85,6 +120,33 @@ class ClusterManifest:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def write_demux_manifest(
+    path: Path,
+    *,
+    input_files: list[str],
+    acquisition_map: dict[str, int],
+    library_design: str,
+    parameters: dict[str, Any],
+    stages: dict[str, Any],
+    outputs: dict[str, str],
+    created_at: str | None = None,
+) -> DemuxManifest:
+    """Write a demux-stage manifest to ``path`` and return the dataclass."""
+    manifest = DemuxManifest(
+        schema_version=MANIFEST_SCHEMA_VERSION,
+        kind="demux",
+        created_at=created_at or _now_iso(),
+        input_files=input_files,
+        acquisition_map=acquisition_map,
+        library_design=library_design,
+        parameters=parameters,
+        stages=stages,
+        outputs=outputs,
+    )
+    path.write_text(json.dumps(asdict(manifest), indent=2) + "\n", encoding="utf-8")
+    return manifest
 
 
 def write_align_manifest(
@@ -128,7 +190,6 @@ def write_cluster_manifest(
     assembly_accession: str | None,
     align_dir: str,
     demux_dir: str,
-    samples_path: str,
     parameters: dict[str, Any],
     stages: dict[str, Any],
     outputs: dict[str, str],
@@ -145,7 +206,6 @@ def write_cluster_manifest(
         created_at=created_at or _now_iso(),
         align_dir=align_dir,
         demux_dir=demux_dir,
-        samples_path=samples_path,
         parameters=parameters,
         stages=stages,
         outputs=outputs,
@@ -155,11 +215,11 @@ def write_cluster_manifest(
     return manifest
 
 
-def read_manifest(path: Path) -> AlignManifest | ClusterManifest:
+def read_manifest(path: Path) -> DemuxManifest | AlignManifest | ClusterManifest:
     """Read ``<dir>/manifest.json`` and return the typed dataclass.
 
     Raises ``ValueError`` with an actionable message for missing-kind
-    files, unsupported schema versions, or pre-v2 manifests (the clean
+    files, unsupported schema versions, or pre-v3 manifests (the clean
     cutover refuses to interpret legacy stage outputs).
     """
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -171,6 +231,18 @@ def read_manifest(path: Path) -> AlignManifest | ClusterManifest:
             "Rerun the producing stage to refresh the manifest."
         )
     kind = raw.get("kind")
+    if kind == "demux":
+        return DemuxManifest(
+            schema_version=schema_version,
+            kind="demux",
+            created_at=str(raw.get("created_at", "")),
+            input_files=list(raw.get("input_files", [])),
+            acquisition_map=dict(raw.get("acquisition_map", {})),
+            library_design=str(raw.get("library_design", "")),
+            parameters=dict(raw.get("parameters", {})),
+            stages=dict(raw.get("stages", {})),
+            outputs=dict(raw.get("outputs", {})),
+        )
     if kind == "align":
         return AlignManifest(
             schema_version=schema_version,
@@ -198,30 +270,32 @@ def read_manifest(path: Path) -> AlignManifest | ClusterManifest:
             created_at=str(raw.get("created_at", "")),
             align_dir=str(raw.get("align_dir", "")),
             demux_dir=str(raw.get("demux_dir", "")),
-            samples_path=str(raw.get("samples_path", "")),
             parameters=dict(raw.get("parameters", {})),
             stages=dict(raw.get("stages", {})),
             outputs=dict(raw.get("outputs", {})),
             samples=raw.get("samples"),
         )
     raise ValueError(
-        f"manifest at {path} has unknown kind={kind!r}; expected 'align' or 'cluster'"
+        f"manifest at {path} has unknown kind={kind!r}; "
+        f"expected 'demux', 'align', or 'cluster'"
     )
 
 
-def read_manifest_dir(source_dir: Path) -> AlignManifest | ClusterManifest:
+def read_manifest_dir(
+    source_dir: Path,
+) -> DemuxManifest | AlignManifest | ClusterManifest:
     """Read ``<source_dir>/manifest.json``; raise if the dir lacks one."""
     manifest_path = source_dir / MANIFEST_FILENAME
     if not manifest_path.exists():
         raise ValueError(
             f"no manifest.json at {manifest_path}; "
-            f"{source_dir} does not look like a `transcriptome align` or "
-            f"`transcriptome cluster` output dir"
+            f"{source_dir} does not look like a `transcriptome "
+            f"demultiplex`, `... align`, or `... cluster` output dir"
         )
     return read_manifest(manifest_path)
 
 
-def detect_source_kind(source_dir: Path) -> Literal["align", "cluster"]:
+def detect_source_kind(source_dir: Path) -> Literal["demux", "align", "cluster"]:
     """Probe a directory's manifest to identify its producing stage."""
     return read_manifest_dir(source_dir).kind
 
@@ -229,6 +303,7 @@ def detect_source_kind(source_dir: Path) -> Literal["align", "cluster"]:
 __all__ = [
     "AlignManifest",
     "ClusterManifest",
+    "DemuxManifest",
     "MANIFEST_FILENAME",
     "MANIFEST_SCHEMA_VERSION",
     "detect_source_kind",
@@ -236,4 +311,5 @@ __all__ = [
     "read_manifest_dir",
     "write_align_manifest",
     "write_cluster_manifest",
+    "write_demux_manifest",
 ]

@@ -217,6 +217,13 @@ def inspect_source(body: InspectSourceRequest) -> dict[str, Any]:
         manifest = read_manifest_dir(path)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    if manifest.kind == "demux":
+        raise HTTPException(
+            400,
+            f"{path} is a `transcriptome demultiplex` output; the "
+            "genome browser attaches `transcriptome align` or "
+            "`transcriptome cluster` output dirs",
+        )
     return {
         "path": str(path.resolve()),
         "kind": manifest.kind,
