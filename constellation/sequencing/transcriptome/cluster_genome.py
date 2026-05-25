@@ -688,6 +688,7 @@ def cluster_by_fingerprint(
             contig_id_to_name=contig_id_to_name,
             has_metrics=metrics_table is not None,
             has_quality=has_quality,
+            verbose_progress=_p if detail else None,
         )
         cluster_dt = _time.perf_counter() - cluster_t0
         emit_dt = _time.perf_counter() - emit_t0
@@ -792,6 +793,7 @@ def _emit_cluster(
     contig_id_to_name: dict[int, str],
     has_metrics: bool,
     has_quality: bool,
+    verbose_progress: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
     """Per-cluster work: drift filter + Layer-0 derep + optional
     consensus + cluster row + membership rows.
@@ -802,10 +804,94 @@ def _emit_cluster(
     read count — and the rest of the per-cluster work is row-shaped by
     construction (median, hashing, representative selection).
     """
+    import time as _t
+
+    _vp = verbose_progress  # local alias for terser checks below
+    _t0 = _t.perf_counter() if _vp is not None else 0.0
+
+    # ── Singleton fast path ────────────────────────────────────
+    # 50% of clusters at PromethION scale are size=1 (per the
+    # boundary-walk distribution log). For those, the single read IS
+    # the representative — no drift to compute, no duplicates possible,
+    # no Layer-0 derep needed. Bypassing `slice_table.to_pylist()`
+    # (~150-250 ms fixed Python overhead per call) and the derep dict
+    # gymnastics cuts per-cluster wall time by an order of magnitude.
+    # Gated off when build_consensus_seq is on — the consensus path
+    # still needs the slow-path machinery to gather member_aids etc.
+    if (
+        slice_table.num_rows == 1
+        and not build_consensus_seq
+        and min_cluster_size <= 1
+    ):
+        c = slice_table.column
+        contig_id_s = int(c("contig_id")[0].as_py())
+        strand_s = str(c("strand")[0].as_py())
+        sample_id_raw_s = c("sample_id")[0].as_py()
+        fp_hash_s = int(c("fingerprint_hash")[0].as_py())
+        read_id_s = str(c("read_id")[0].as_py())
+        span_start_s = int(c("span_start")[0].as_py())
+        span_end_s = int(c("span_end")[0].as_py())
+        metrics_dict: dict[str, Any] | None = None
+        if has_metrics:
+            aid_s = c("alignment_id")[0].as_py()
+            cs_aware_s = (
+                c("cs_aware")[0].as_py() if aid_s is not None else None
+            )
+            if aid_s is not None and cs_aware_s is not None:
+                metrics_dict = {
+                    "n_match": int(c("n_match_sum")[0].as_py() or 0),
+                    "n_mismatch": int(c("n_mismatch_sum")[0].as_py() or 0),
+                    "n_insert": int(c("n_insert_sum")[0].as_py() or 0),
+                    "n_delete": int(c("n_delete_sum")[0].as_py() or 0),
+                    "cs_aware": bool(cs_aware_s),
+                }
+        cluster_row_s = {
+            "cluster_id": int(cluster_id),
+            "representative_read_id": read_id_s,
+            "n_reads": 1,
+            "identity_threshold": None,
+            "consensus_sequence": None,
+            "predicted_protein": None,
+            "orf_start": None,
+            "orf_end": None,
+            "orf_strand": None,
+            "codon_table": None,
+            "mode": "genome-guided",
+            "contig_id": contig_id_s,
+            "strand": strand_s,
+            "span_start": span_start_s,
+            "span_end": span_end_s,
+            "fingerprint_hash": fp_hash_s,
+            "n_unique_sequences": 1,
+            "sample_id": (
+                None if sample_id_raw_s is None else int(sample_id_raw_s)
+            ),
+        }
+        membership_row_s = _make_membership_row(
+            cluster_id=cluster_id,
+            read_id=read_id_s,
+            role="representative",
+            drift_5p_bp=None,
+            drift_3p_bp=None,
+            metrics=metrics_dict,
+        )
+        if _vp is not None:
+            _vp(
+                f"    _emit_cluster: SINGLETON FAST PATH "
+                f"({(_t.perf_counter() - _t0) * 1000:.2f}ms)"
+            )
+        return cluster_row_s, [membership_row_s]
+
     members = slice_table.to_pylist()
     n_total = len(members)
     if n_total == 0:
         return None
+    if _vp is not None:
+        _vp(
+            f"    _emit_cluster: to_pylist size={n_total} "
+            f"({(_t.perf_counter() - _t0) * 1000:.2f}ms)"
+        )
+        _t0 = _t.perf_counter()
     contig_id = int(members[0]["contig_id"])
     strand = str(members[0]["strand"])
     sample_id_raw = members[0]["sample_id"]
@@ -837,6 +923,13 @@ def _emit_cluster(
         for m in members:
             m["_drift_5p"] = None
             m["_drift_3p"] = None
+    if _vp is not None:
+        _vp(
+            f"    _emit_cluster: drift filter "
+            f"({(_t.perf_counter() - _t0) * 1000:.2f}ms) "
+            f"kept={len(kept)} drifted={len(drifted)}"
+        )
+        _t0 = _t.perf_counter()
 
     if len(kept) < min_cluster_size:
         return None
@@ -859,6 +952,13 @@ def _emit_cluster(
     rep_id, n_unique, hash_of_read, _counts = _layer0_derep(
         kept_ids, seq_lookup, quality_lookup
     )
+    if _vp is not None:
+        _vp(
+            f"    _emit_cluster: layer0_derep "
+            f"({(_t.perf_counter() - _t0) * 1000:.2f}ms) "
+            f"n_unique={n_unique}"
+        )
+        _t0 = _t.perf_counter()
 
     consensus_seq: str | None = None
     kept_starts_list = [int(m["span_start"]) for m in kept]
@@ -908,6 +1008,14 @@ def _emit_cluster(
                     reference_sequence=window_seq,
                     reference_start=window_start,
                 )
+
+    if _vp is not None:
+        _vp(
+            f"    _emit_cluster: consensus "
+            f"({(_t.perf_counter() - _t0) * 1000:.2f}ms) "
+            f"build={build_consensus_seq}"
+        )
+        _t0 = _t.perf_counter()
 
     cluster_row = {
         "cluster_id": int(cluster_id),
@@ -969,6 +1077,13 @@ def _emit_cluster(
                     metrics=metrics,
                 )
             )
+
+    if _vp is not None:
+        _vp(
+            f"    _emit_cluster: membership rows "
+            f"({(_t.perf_counter() - _t0) * 1000:.2f}ms) "
+            f"n_members={len(membership_rows)}"
+        )
 
     return cluster_row, membership_rows
 
