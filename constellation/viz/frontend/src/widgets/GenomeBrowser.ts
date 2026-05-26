@@ -45,6 +45,15 @@ import {
 import { TrackSettingsPanel } from './TrackSettingsPanel';
 import './GenomeBrowser.css';
 
+/** Filter keys whose values are pushed down to the kernel — changing
+ *  any of these requires a server refetch, not a client-side restyle.
+ *  Everything else (palette overrides, visible-strands allowlist, etc.)
+ *  is satisfied off the cached Arrow table via restyleTrack().
+ *
+ *  Currently: `min_mapq` only. Future additions land here (e.g. PR 5
+ *  will add `cluster_view`). */
+const PUSHDOWN_FILTER_KEYS: ReadonlySet<string> = new Set(['min_mapq']);
+
 interface ContigInfo {
   contig_id: number;
   name: string;
@@ -927,14 +936,29 @@ export class GenomeBrowser {
         this.schedulePersistLayout();
       },
       onFilterChange: (filter) => {
+        const before = track.filter;
         track.filter = { ...filter };
-        this.restyleTrack(track);
+        if (pushdownFiltersChanged(before, track.filter)) {
+          // Server-side filter — invalidate the cache so the next
+          // render fetches fresh data, then schedule. The 60ms render
+          // debounce absorbs slider drag.
+          track.lastFetched = undefined;
+          this.scheduleRender();
+        } else {
+          this.restyleTrack(track);
+        }
         this.schedulePersistLayout();
       },
       onReset: () => {
+        const before = track.filter;
         track.style = {};
         track.filter = {};
-        this.restyleTrack(track);
+        if (pushdownFiltersChanged(before, track.filter)) {
+          track.lastFetched = undefined;
+          this.scheduleRender();
+        } else {
+          this.restyleTrack(track);
+        }
         this.schedulePersistLayout();
       },
       onClose: () => {
@@ -1334,6 +1358,7 @@ export class GenomeBrowser {
       };
 
       try {
+        const minMapq = readNumberFilter(track.filter, 'min_mapq');
         const { table, mode } = await fetchTrackData(
           track.entry.kind,
           {
@@ -1343,6 +1368,7 @@ export class GenomeBrowser {
             start: locus.start,
             end: locus.end,
             viewport_px: widthPx,
+            min_mapq: minMapq > 0 ? minMapq : undefined,
           },
           track.cancel.signal,
         );
@@ -1590,4 +1616,43 @@ function writeLabelsPref(value: boolean): void {
   } catch {
     // ignored — storage may be disabled in private modes
   }
+}
+
+
+/** True when any pushdown-routed filter key differs between the two
+ *  filter dicts (including a transition between present-and-absent).
+ *  The route between restyle vs refetch on filter change depends on
+ *  this signal — non-pushdown changes (palettes, allowlists already in
+ *  the cached payload) get the cheap client-side restyle. */
+function pushdownFiltersChanged(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+): boolean {
+  for (const key of PUSHDOWN_FILTER_KEYS) {
+    if (!shallowEqual(before[key], after[key])) return true;
+  }
+  return false;
+}
+
+
+function shallowEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === undefined || b === undefined) return false;
+  if (a === null || b === null) return false;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+
+/** Coerce a filter dict value to a finite number, defaulting to 0. */
+function readNumberFilter(
+  filter: Record<string, unknown>,
+  key: string,
+): number {
+  const v = filter[key];
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string') {
+    const parsed = Number(v);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
 }

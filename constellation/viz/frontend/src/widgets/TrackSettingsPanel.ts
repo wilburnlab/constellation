@@ -608,6 +608,18 @@ export class TrackSettingsPanel {
           (selected) => this.setFilterArray('visible_strands', selected),
         ),
       );
+      // MAPQ is a kernel-pushdown filter — changing it invalidates the
+      // client's cached Arrow table and triggers a refetch (debounced
+      // by the genome browser's render loop), unlike the allowlists
+      // above which apply client-side off the cached payload. The hint
+      // text spells that out for the user.
+      const mapqRow = this.numberFilterRow('Min MAPQ', 'min_mapq', 0, {
+        min: 0,
+        max: 60,
+        step: 1,
+      });
+      mapqRow.appendChild(filterHint('changing this triggers a refetch'));
+      section.appendChild(mapqRow);
     } else if (kind === 'cluster_pileup') {
       const modes = stringList(this.opts.meta.modes);
       if (modes.length === 0) modes.push('genome-guided', 'de-novo');
@@ -1041,6 +1053,18 @@ function allowListRow(
 function emptyHint(text: string): HTMLElement {
   const el = document.createElement('div');
   el.className = 'settings-empty';
+  el.textContent = text;
+  return el;
+}
+
+
+/** Inline italic note for filter rows that have side effects beyond
+ *  the cached-payload restyle path (i.e. they round-trip to the
+ *  server). Appended as a sibling under the row so it sits directly
+ *  beneath the input without breaking the row's flex layout. */
+function filterHint(text: string): HTMLElement {
+  const el = document.createElement('div');
+  el.className = 'settings-row-hint';
   el.textContent = text;
   return el;
 }

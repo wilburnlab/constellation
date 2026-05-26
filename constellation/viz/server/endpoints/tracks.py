@@ -131,6 +131,7 @@ def get_data(
     samples: list[str] | None = Query(None),
     viewport_px: int = Query(1200, ge=1, le=8192),
     max_glyphs: int = Query(50_000, ge=100),
+    min_mapq: int = Query(0, ge=0, le=60),
     force: str | None = Query(None, pattern="^(vector|hybrid)$"),
     request: Request = None,  # type: ignore[assignment]
 ) -> StreamingResponse:
@@ -160,6 +161,7 @@ def get_data(
         viewport_px=int(viewport_px),
         max_glyphs=int(max_glyphs),
         force=forced,
+        min_mapq=int(min_mapq),
     )
 
     mode = kernel.threshold(track_binding, query)

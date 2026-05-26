@@ -271,14 +271,18 @@ class ReadPileupKernel(TrackKernel):
         self, binding: TrackBinding, query: TrackQuery
     ) -> int:
         dataset = pa_ds.dataset(str(binding.paths["alignments"]), format="parquet")
-        predicate = self._predicate(query.contig, query.start, query.end)
+        predicate = self._predicate(
+            query.contig, query.start, query.end, query.min_mapq
+        )
         return int(dataset.count_rows(filter=predicate))
 
     def _scan_window(
         self, binding: TrackBinding, contig_name: str, query: TrackQuery
     ) -> pa.Table:
         dataset = pa_ds.dataset(str(binding.paths["alignments"]), format="parquet")
-        predicate = self._predicate(contig_name, query.start, query.end)
+        predicate = self._predicate(
+            contig_name, query.start, query.end, query.min_mapq
+        )
         scanner = dataset.scanner(
             columns=[
                 "alignment_id",
@@ -326,16 +330,25 @@ class ReadPileupKernel(TrackKernel):
 
     @staticmethod
     def _predicate(
-        contig: str, start: int, end: int
+        contig: str, start: int, end: int, min_mapq: int = 0
     ) -> Any:
         ref_name = pc.field("ref_name")
         ref_start = pc.field("ref_start")
         ref_end = pc.field("ref_end")
-        return (
+        predicate = (
             (ref_name == pa.scalar(contig, pa.string()))
             & (ref_end > pa.scalar(int(start), pa.int64()))
             & (ref_start < pa.scalar(int(end), pa.int64()))
         )
+        if min_mapq > 0:
+            # Pushed down to the parquet scan — alignments below the
+            # threshold are dropped before they're materialized, so the
+            # row-pack height matches what the user asked for and the
+            # threshold-mode count reflects the visible subset.
+            predicate = predicate & (
+                pc.field("mapq") >= pa.scalar(int(min_mapq), pa.int32())
+            )
+        return predicate
 
     def _emit_vector(
         self, rows: pa.Table, assigned: list[int]

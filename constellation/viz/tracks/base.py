@@ -89,6 +89,11 @@ class TrackQuery:
     kernel must honor it (or, in the case of `force=vector` with a too-
     expensive payload, return vector with a truncated flag in the response
     metadata — handled at the server layer, not the kernel).
+
+    `min_mapq` is a kernel-pushdown filter (read_pileup only at present)
+    — alignments with ``mapq < min_mapq`` are dropped at scan time. The
+    default of 0 admits every primary alignment and matches pre-PR-4
+    behavior. Other kernels ignore it.
     """
 
     contig: str
@@ -98,6 +103,7 @@ class TrackQuery:
     viewport_px: int = 1200
     max_glyphs: int = 50_000
     force: ThresholdDecision | None = None
+    min_mapq: int = 0
 
 
 @dataclass(frozen=True)

@@ -19,8 +19,10 @@ import pyarrow.parquet as pq
 
 from constellation.sequencing.schemas.alignment import (
     ALIGNMENT_BLOCK_TABLE,
+    ALIGNMENT_CS_TABLE,
     ALIGNMENT_TABLE,
     INTRON_TABLE,
+    READ_SAMPLE_TABLE,
 )
 from constellation.sequencing.schemas.quant import COVERAGE_TABLE
 from constellation.sequencing.schemas.reference import (
@@ -121,12 +123,14 @@ def write_align_source(
     assembly_accession: str | None = DEFAULT_ASSEMBLY,
     alignments: list[dict[str, Any]] | None = None,
     alignment_blocks: list[dict[str, Any]] | None = None,
+    alignment_cs: list[dict[str, Any]] | None = None,
+    read_samples: list[dict[str, Any]] | None = None,
     coverage: list[dict[str, Any]] | None = None,
     introns: list[dict[str, Any]] | None = None,
     derived_annotation_features: list[dict[str, Any]] | None = None,
     samples: list[str] | None = None,
 ) -> Path:
-    """Write a `transcriptome align` source dir with a v2 manifest.
+    """Write a `transcriptome align` source dir with a v4 manifest.
 
     Each ``*`` kwarg, when non-None, writes the corresponding artifact
     and records it in the manifest's ``outputs`` map. Missing artifacts
@@ -151,6 +155,21 @@ def write_align_source(
             path / "part-00000.parquet",
         )
         outputs["alignment_blocks"] = str(path)
+    if alignment_cs is not None:
+        path = source_dir / "alignment_cs"
+        path.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.Table.from_pylist(alignment_cs, schema=ALIGNMENT_CS_TABLE),
+            path / "part-00000.parquet",
+        )
+        outputs["alignment_cs"] = str(path)
+    if read_samples is not None:
+        path = source_dir / "read_samples.parquet"
+        pq.write_table(
+            pa.Table.from_pylist(read_samples, schema=READ_SAMPLE_TABLE),
+            path,
+        )
+        outputs["read_samples"] = str(path)
     if coverage is not None:
         path = source_dir / "coverage.parquet"
         pq.write_table(

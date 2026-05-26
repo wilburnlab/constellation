@@ -965,6 +965,113 @@ def test_read_pileup_filter_by_sample_id(
     assert row["alignment_id"] == 2
 
 
+def test_read_pileup_min_mapq_drops_low_quality_alignments(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """query.min_mapq pushes down to the parquet scan — alignments
+    below the threshold disappear from the row count, not just the
+    rendered output. Verifies the predicate is applied at the scanner
+    level (not post-scan)."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_read_pileup_inputs(
+        root / "S2_align",
+        [
+            _alignment(alignment_id=1, read_id="r1", ref_start=0, ref_end=100, mapq=60),
+            _alignment(alignment_id=2, read_id="r2", ref_start=50, ref_end=150, mapq=10),
+            _alignment(alignment_id=3, read_id="r3", ref_start=200, ref_end=300, mapq=30),
+        ],
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    [binding] = kernel.discover(session)
+    query = TrackQuery(
+        contig="chr1",
+        start=0,
+        end=400,
+        viewport_px=1200,
+        min_mapq=20,
+    )
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
+        schema=READ_PILEUP_VECTOR_SCHEMA,
+    )
+    kept_ids = sorted(row["alignment_id"] for row in table.to_pylist())
+    assert kept_ids == [1, 3]
+
+
+def test_read_pileup_min_mapq_zero_admits_all(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Default min_mapq=0 admits every primary alignment — matches
+    pre-PR-4 behavior, so existing callers don't see a regression."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_read_pileup_inputs(
+        root / "S2_align",
+        [
+            _alignment(alignment_id=1, read_id="r1", ref_start=0, ref_end=100, mapq=60),
+            _alignment(alignment_id=2, read_id="r2", ref_start=50, ref_end=150, mapq=0),
+        ],
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    [binding] = kernel.discover(session)
+    query = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
+        schema=READ_PILEUP_VECTOR_SCHEMA,
+    )
+    assert table.num_rows == 2
+
+
+def test_read_pileup_min_mapq_affects_threshold_count(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The threshold's `_count_in_window` reflects the MAPQ filter —
+    so a min_mapq high enough to drop the population below
+    vector_glyph_limit keeps the renderer in vector mode even when the
+    unfiltered count would tip to hybrid. Verifies the predicate is
+    threaded through both _scan_window AND _count_in_window."""
+    from constellation.viz.tracks.read_pileup import ReadPileupKernel
+
+    # Fixture: more rows than the default vector_glyph_limit when
+    # unfiltered; few rows above the MAPQ threshold.
+    rows = []
+    for i in range(20):
+        rows.append(
+            _alignment(
+                alignment_id=i + 1,
+                read_id=f"r{i}",
+                ref_start=i * 5,
+                ref_end=i * 5 + 100,
+                mapq=60 if i < 3 else 5,
+            )
+        )
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_read_pileup_inputs(root / "S2_align", rows)
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    [binding] = kernel.discover(session)
+
+    # Stress the count path with a tiny vector_glyph_limit so the
+    # threshold would otherwise pick hybrid; the MAPQ filter trims
+    # the population down to 3 < 5.
+    monkeypatch_limit = 5
+    original_limit = ReadPileupKernel.vector_glyph_limit
+    ReadPileupKernel.vector_glyph_limit = monkeypatch_limit
+    try:
+        q_unfiltered = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)
+        q_filtered = TrackQuery(
+            contig="chr1", start=0, end=400, viewport_px=1200, min_mapq=20
+        )
+        assert kernel.threshold(binding, q_unfiltered) is ThresholdDecision.HYBRID
+        assert kernel.threshold(binding, q_filtered) is ThresholdDecision.VECTOR
+    finally:
+        ReadPileupKernel.vector_glyph_limit = original_limit
+
+
 def test_read_pileup_discover_skips_source_without_read_samples(
     tmp_path: Path, monkeypatch
 ) -> None:
