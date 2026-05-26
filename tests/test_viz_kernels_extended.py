@@ -17,6 +17,7 @@ import pytest
 
 from constellation.sequencing.schemas.alignment import (
     ALIGNMENT_BLOCK_TABLE,
+    ALIGNMENT_CS_TABLE,
     ALIGNMENT_TABLE,
     INTRON_TABLE,
 )
@@ -137,6 +138,7 @@ def _make_session(
         for slot, rel in (
             ("alignments", "alignments"),
             ("alignment_blocks", "alignment_blocks"),
+            ("alignment_cs", "alignment_cs"),
             ("coverage", "coverage.parquet"),
             ("introns", "introns.parquet"),
             ("derived_annotation", "derived_annotation"),
@@ -553,6 +555,63 @@ def _write_alignments(align_dir: Path, rows: list[dict]) -> None:
     )
 
 
+def _write_alignment_blocks(align_dir: Path, rows: list[dict]) -> None:
+    """Companion to ``_write_alignments`` — writes the per-CIGAR block
+    rows the read_pileup kernel hard-requires after PR 2."""
+    blocks_dir = align_dir / "alignment_blocks"
+    blocks_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=ALIGNMENT_BLOCK_TABLE),
+        blocks_dir / "part-00000.parquet",
+    )
+
+
+def _write_alignment_cs(align_dir: Path, rows: list[dict]) -> None:
+    """Companion to ``_write_alignments`` — writes the cs:long sidecar
+    the read_pileup kernel hard-requires after PR 2."""
+    cs_dir = align_dir / "alignment_cs"
+    cs_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=ALIGNMENT_CS_TABLE),
+        cs_dir / "part-00000.parquet",
+    )
+
+
+def _write_read_pileup_inputs(
+    align_dir: Path,
+    alignments: list[dict],
+    *,
+    blocks: list[dict] | None = None,
+    cs_rows: list[dict] | None = None,
+) -> None:
+    """Write the three parquet artifacts the read_pileup kernel needs.
+
+    When ``blocks`` is None, one synthetic block per alignment is
+    written (one block spanning the alignment's full ref range). When
+    ``cs_rows`` is None, one row per alignment with an empty cs string
+    is written. These defaults keep PR 2's hard-require gate happy for
+    tests that don't care about block / cs detail.
+    """
+    _write_alignments(align_dir, alignments)
+    if blocks is None:
+        blocks = [
+            _block(
+                alignment_id=row["alignment_id"],
+                block_index=0,
+                ref_start=row["ref_start"],
+                ref_end=row["ref_end"],
+            )
+            for row in alignments
+        ]
+    _write_alignment_blocks(align_dir, blocks)
+    if cs_rows is None:
+        cs_rows = [
+            {"alignment_id": row["alignment_id"], "cs_string": ""}
+            for row in alignments
+        ]
+    _write_alignment_cs(align_dir, cs_rows)
+
+
 def _alignment(**kwargs) -> dict:
     base = {
         "alignment_id": 0,
@@ -575,12 +634,29 @@ def _alignment(**kwargs) -> dict:
     return base
 
 
+def _block(**kwargs) -> dict:
+    base = {
+        "alignment_id": 0,
+        "block_index": 0,
+        "ref_start": 0,
+        "ref_end": 100,
+        "query_start": 0,
+        "query_end": 100,
+        "n_match": None,
+        "n_mismatch": None,
+        "n_insert": 0,
+        "n_delete": 0,
+    }
+    base.update(kwargs)
+    return base
+
+
 def test_read_pileup_vector_returns_packed_rows(
     tmp_path: Path, monkeypatch
 ) -> None:
     root = tmp_path / "run"
     _write_genome(root / "genome")
-    _write_alignments(
+    _write_read_pileup_inputs(
         root / "S2_align",
         [
             _alignment(alignment_id=1, read_id="r1", ref_start=0, ref_end=100),
@@ -606,6 +682,141 @@ def test_read_pileup_vector_returns_packed_rows(
     assert rows[3] == 0
 
 
+def test_read_pileup_vector_emits_blocks_column(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The vector wire payload carries one nested-list `blocks` cell
+    per alignment with the per-CIGAR M/=/X spans from alignment_blocks/.
+    """
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_read_pileup_inputs(
+        root / "S2_align",
+        [_alignment(alignment_id=1, read_id="r1", ref_start=0, ref_end=300)],
+        blocks=[
+            _block(alignment_id=1, block_index=0, ref_start=0, ref_end=100),
+            _block(alignment_id=1, block_index=1, ref_start=200, ref_end=300),
+        ],
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    [binding] = kernel.discover(session)
+    query = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
+        schema=READ_PILEUP_VECTOR_SCHEMA,
+    )
+    [row] = table.to_pylist()
+    blocks = row["blocks"]
+    assert len(blocks) == 2
+    assert (blocks[0]["ref_start"], blocks[0]["ref_end"]) == (0, 100)
+    assert (blocks[1]["ref_start"], blocks[1]["ref_end"]) == (200, 300)
+
+
+def test_read_pileup_vector_emits_mismatch_positions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When alignment_cs/ ships a cs:long string with a substitution,
+    the renderer-facing `mismatch_positions` list carries the absolute
+    ref position of each `*ab` token."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    # cs:long: 10 matches, A→C substitution at ref_start+10, then 4
+    # more matches. The single mismatch lands at ref position 10.
+    _write_read_pileup_inputs(
+        root / "S2_align",
+        [_alignment(alignment_id=1, read_id="r1", ref_start=0, ref_end=15)],
+        cs_rows=[{"alignment_id": 1, "cs_string": ":10*ac:4"}],
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    [binding] = kernel.discover(session)
+    # viewport_px chosen so bp/pixel < mismatch_glyph_bp_per_pixel_limit
+    # (default 5.0); cs parse runs.
+    query = TrackQuery(contig="chr1", start=0, end=15, viewport_px=1200)
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
+        schema=READ_PILEUP_VECTOR_SCHEMA,
+    )
+    [row] = table.to_pylist()
+    assert row["mismatch_positions"] == [10]
+
+
+def test_read_pileup_skips_mismatch_parse_at_coarse_zoom(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Above mismatch_glyph_bp_per_pixel_limit the cs parse is skipped
+    entirely — mismatch_positions emits as empty lists. Saves the
+    cs:long walk at zoom levels where the glyphs wouldn't resolve."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_read_pileup_inputs(
+        root / "S2_align",
+        [_alignment(alignment_id=1, read_id="r1", ref_start=0, ref_end=15)],
+        cs_rows=[{"alignment_id": 1, "cs_string": ":10*ac:4"}],
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    [binding] = kernel.discover(session)
+    # 100_000 bp window at 1200 px → ~83 bp/pixel, well above the 5.0
+    # threshold → kernel skips the cs:long parse.
+    query = TrackQuery(
+        contig="chr1",
+        start=0,
+        end=100_000,
+        viewport_px=1200,
+        force=ThresholdDecision.VECTOR,
+    )
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
+        schema=READ_PILEUP_VECTOR_SCHEMA,
+    )
+    [row] = table.to_pylist()
+    assert row["mismatch_positions"] == []
+
+
+def test_read_pileup_discover_skips_source_without_alignment_cs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Hard-require: a source that's missing alignment_cs/ produces no
+    binding. Surfaces in the UI as an absent read_pileup track; users
+    re-run align without --no-emit-cs-tags to restore visualization."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_alignments(
+        root / "S2_align",
+        [_alignment(alignment_id=1, read_id="r1", ref_start=0, ref_end=100)],
+    )
+    _write_alignment_blocks(
+        root / "S2_align",
+        [_block(alignment_id=1, ref_start=0, ref_end=100)],
+    )
+    # Deliberately omit alignment_cs/.
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    assert kernel.discover(session) == []
+
+
+def test_read_pileup_discover_skips_source_without_alignment_blocks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Hard-require: a source that's missing alignment_blocks/ also
+    produces no binding (the schema's `blocks` column is non-null)."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_alignments(
+        root / "S2_align",
+        [_alignment(alignment_id=1, read_id="r1", ref_start=0, ref_end=100)],
+    )
+    _write_alignment_cs(
+        root / "S2_align", [{"alignment_id": 1, "cs_string": ""}]
+    )
+    # Deliberately omit alignment_blocks/.
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    assert kernel.discover(session) == []
+
+
 def test_read_pileup_hybrid_emits_png(tmp_path: Path, monkeypatch) -> None:
     pytest.importorskip("datashader")
     pytest.importorskip("PIL")
@@ -613,7 +824,7 @@ def test_read_pileup_hybrid_emits_png(tmp_path: Path, monkeypatch) -> None:
 
     root = tmp_path / "run"
     _write_genome(root / "genome")
-    _write_alignments(
+    _write_read_pileup_inputs(
         root / "S2_align",
         [_alignment(alignment_id=i, read_id=f"r{i}", ref_start=0, ref_end=100) for i in range(50)],
     )
@@ -646,7 +857,7 @@ def test_read_pileup_threshold_force_override(
 ) -> None:
     root = tmp_path / "run"
     _write_genome(root / "genome")
-    _write_alignments(root / "S2_align", [_alignment()])
+    _write_read_pileup_inputs(root / "S2_align", [_alignment()])
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("read_pileup")
     [binding] = kernel.discover(session)

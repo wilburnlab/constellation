@@ -1,17 +1,32 @@
-"""Read pile-up track — alignments rendered as stacked horizontal bars.
+"""Read pile-up track — alignments rendered as block-aware stacked bars.
 
-Reads each align source's `alignments/` (`ALIGNMENT_TABLE`, partitioned).
-Optionally consumes the source's `alignment_blocks/` for per-CIGAR-
-block detail at deep zoom; v1 ignores the blocks dataset and ships
-whole-alignment glyphs only.
+Reads each align source's `alignments/` + `alignment_blocks/` +
+`alignment_cs/`. Block geometry (per-CIGAR M/=/X spans) draws solid
+exon segments; intron gaps between adjacent blocks draw as dotted
+connectors; per-base substitutions from cs:long draw as X glyphs.
+
+**Hard-require.** `alignment_blocks/` AND `alignment_cs/` must both be
+present on the source. When either is missing, `discover()` returns no
+binding for that source — the upstream align run was invoked with
+`--no-emit-cs-tags` (the only path that suppresses `alignment_cs/`),
+which the v4 CLI default flipped to "on" specifically to support this
+track. Users with legacy v3 outputs see no read_pileup binding until
+they re-run align.
 
 Two render modes:
 
 - **Vector** (default at high zoom). Per-glyph: each read becomes one
-  rectangle in `READ_PILEUP_VECTOR_SCHEMA` with greedy-packed `row`
-  and `strand` for arrow direction.
+  row in `READ_PILEUP_VECTOR_SCHEMA` with greedy-packed `row`, a nested
+  `blocks` list-of-struct that the renderer iterates for solid
+  exon-segment rectangles + dotted intron connectors, and a
+  `mismatch_positions` int64 list for the per-base X glyphs. Above the
+  `mismatch_glyph_bp_per_pixel_limit` zoom threshold the mismatch
+  positions are emitted empty (cs:long parse skipped) — at coarser
+  zoom the glyphs wouldn't be readable anyway.
 - **Hybrid** (zoom-out / dense). Datashader rasterizes the same
-  greedy-packed layout into a PNG embedded via `HYBRID_SCHEMA`.
+  greedy-packed layout into a PNG embedded via `HYBRID_SCHEMA`. Block
+  detail is not surfaced in hybrid mode (deferred to PR E in the
+  pile-up overhaul plan).
 
 The `row` column is computed server-side via
 `raster.datashader_png.greedy_row_assign` so vector and hybrid agree on
@@ -29,6 +44,12 @@ import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 
 from constellation.viz.server.session import Session
+from constellation.viz.tracks._alignment_view import (
+    BLOCKS_LIST_TYPE,
+    MISMATCH_POSITIONS_TYPE,
+    attach_blocks,
+    attach_mismatch_positions,
+)
 from constellation.viz.tracks.base import (
     HYBRID_SCHEMA,
     ThresholdDecision,
@@ -49,6 +70,8 @@ READ_PILEUP_VECTOR_SCHEMA: pa.Schema = pa.schema(
         pa.field("strand", pa.string(), nullable=False),
         pa.field("mapq", pa.int32(), nullable=False),
         pa.field("row", pa.int32(), nullable=False),
+        pa.field("blocks", BLOCKS_LIST_TYPE, nullable=False),
+        pa.field("mismatch_positions", MISMATCH_POSITIONS_TYPE, nullable=False),
     ],
     metadata={b"schema_name": b"VizReadPileup"},
 )
@@ -56,7 +79,7 @@ READ_PILEUP_VECTOR_SCHEMA: pa.Schema = pa.schema(
 
 @register_track
 class ReadPileupKernel(TrackKernel):
-    """Per-read pileup track (hybrid)."""
+    """Per-read pileup track with CIGAR-aware block geometry."""
 
     kind = "read_pileup"
     schema = READ_PILEUP_VECTOR_SCHEMA
@@ -67,21 +90,33 @@ class ReadPileupKernel(TrackKernel):
     vector_glyph_limit = 4_000
     vector_bp_per_pixel_limit = 50.0
 
+    # Above this bp/pixel ratio the per-base mismatch X glyphs wouldn't
+    # be visually resolvable, so we skip the cs:long parse entirely and
+    # emit `mismatch_positions` as empty lists. The per-block exonic
+    # rectangles still render at any zoom.
+    mismatch_glyph_bp_per_pixel_limit = 5.0
+
     def discover(self, session: Session) -> list[TrackBinding]:
         if session.reference_genome is None:
             return []
         bindings: list[TrackBinding] = []
-        for idx, src in iter_sources_with(session, "alignments"):
+        for idx, src in iter_sources_with(
+            session, "alignments", "alignment_blocks", "alignment_cs"
+        ):
+            # Hard-require: alignment_blocks/ + alignment_cs/ must both
+            # be present. The PR 2 schema includes nested `blocks` and
+            # `mismatch_positions` columns that are populated from these
+            # two parquet datasets; without them the renderer would
+            # show flat empty boxes. Sources missing either are skipped
+            # at discovery time so the Datasets popover surfaces no
+            # read_pileup binding for legacy outputs — re-running align
+            # without --no-emit-cs-tags restores it.
             paths: dict[str, Any] = {
                 "alignments": src.alignments,
+                "alignment_blocks": src.alignment_blocks,
+                "alignment_cs": src.alignment_cs,
                 "genome": session.reference_genome,
             }
-            # `alignment_blocks/` is opt-in for v1 — kernels that want
-            # per-CIGAR-block visualization can read it via this slot.
-            # Future renderers (mismatch coloring, soft-clip triangles)
-            # pick it up when present.
-            if src.alignment_blocks is not None:
-                paths["alignment_blocks"] = src.alignment_blocks
             label = f"Reads ({src.label})" if len(session.sources) > 1 else "Reads"
             bindings.append(
                 TrackBinding(
@@ -102,6 +137,9 @@ class ReadPileupKernel(TrackKernel):
             "label": binding.label,
             "vector_glyph_limit": self.vector_glyph_limit,
             "vector_bp_per_pixel_limit": self.vector_bp_per_pixel_limit,
+            "mismatch_glyph_bp_per_pixel_limit": (
+                self.mismatch_glyph_bp_per_pixel_limit
+            ),
             "default_height_px": 240,
         }
 
@@ -147,6 +185,20 @@ class ReadPileupKernel(TrackKernel):
         assigned = greedy_row_assign(starts, ends)
 
         if mode is ThresholdDecision.VECTOR:
+            # Attach per-CIGAR block geometry + per-base mismatch
+            # positions; both columns are part of the vector wire
+            # schema. Hybrid mode skips both — the rasterized PNG
+            # doesn't surface per-row detail.
+            blocks_path = binding.paths["alignment_blocks"]
+            blocks_table = self._scan_blocks(blocks_path, rows)
+            rows = attach_blocks(rows, blocks_table)
+            bp_per_pixel = (query.end - query.start) / max(1, query.viewport_px)
+            skip_mismatch = bp_per_pixel > self.mismatch_glyph_bp_per_pixel_limit
+            rows = attach_mismatch_positions(
+                rows,
+                binding.paths["alignment_cs"],
+                skip=skip_mismatch,
+            )
             return self._emit_vector(rows, assigned)
         return self._emit_hybrid(rows, assigned, query)
 
@@ -198,6 +250,25 @@ class ReadPileupKernel(TrackKernel):
         return table.drop_columns(["is_secondary", "is_supplementary"])
 
     @staticmethod
+    def _scan_blocks(blocks_path: Any, alignments: pa.Table) -> pa.Table:
+        """Read just the block rows whose alignment_id matches the
+        in-window alignments. Predicate pushdown bounds the I/O by the
+        glyph cap, not the full `alignment_blocks/` cardinality."""
+        ids = pc.unique(alignments.column("alignment_id"))
+        dataset = pa_ds.dataset(str(blocks_path), format="parquet")
+        return dataset.to_table(
+            columns=[
+                "alignment_id",
+                "block_index",
+                "ref_start",
+                "ref_end",
+                "n_match",
+                "n_mismatch",
+            ],
+            filter=pc.field("alignment_id").isin(ids),
+        )
+
+    @staticmethod
     def _predicate(
         contig: str, start: int, end: int
     ) -> Any:
@@ -222,6 +293,8 @@ class ReadPileupKernel(TrackKernel):
                 rows.column("strand"),
                 rows.column("mapq"),
                 pa.array(assigned, pa.int32()),
+                rows.column("blocks"),
+                rows.column("mismatch_positions"),
             ],
             schema=READ_PILEUP_VECTOR_SCHEMA,
         )

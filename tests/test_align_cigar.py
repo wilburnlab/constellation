@@ -17,6 +17,7 @@ from constellation.sequencing.align.cigar import (
     blocks_to_junctions,
     parse_cigar_blocks,
     parse_cs_long_blocks,
+    parse_cs_long_mismatch_positions,
     query_start_from_cigar,
 )
 
@@ -241,6 +242,70 @@ def test_cs_empty_string_returns_empty() -> None:
 def test_cs_malformed_raises() -> None:
     with pytest.raises(ValueError):
         parse_cs_long_blocks("@AAAA", ref_start=0)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# parse_cs_long_mismatch_positions
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_cs_mismatch_positions_no_substitution() -> None:
+    """A clean cs:long with only matches yields no positions."""
+    assert parse_cs_long_mismatch_positions("=ACGTACGT", ref_start=0) == []
+    assert parse_cs_long_mismatch_positions(":42", ref_start=100) == []
+
+
+def test_cs_mismatch_position_single_sub() -> None:
+    """`*ag` at ref_start + 10 (after `=` of 10 matches) lands at 10."""
+    assert parse_cs_long_mismatch_positions(":10*ag:4", ref_start=0) == [10]
+
+
+def test_cs_mismatch_positions_offset_by_ref_start() -> None:
+    """Positions are absolute on the reference frame; ref_start
+    biases every entry."""
+    assert parse_cs_long_mismatch_positions(":10*ag:4", ref_start=1000) == [1010]
+
+
+def test_cs_mismatch_positions_multiple_substitutions() -> None:
+    """Each `*ab` contributes one entry; insertions and deletions
+    don't, but they do advance the ref cursor when applicable."""
+    # 5 matches, sub, 5 matches, sub, 5 matches → positions at 5 and 11
+    cs = ":5*ac:5*tg:5"
+    assert parse_cs_long_mismatch_positions(cs, ref_start=0) == [5, 11]
+
+
+def test_cs_mismatch_positions_insertion_does_not_advance_ref() -> None:
+    """`+xxx` advances query but not ref; subsequent substitution
+    keeps its ref position."""
+    # 5 matches, insertion (no ref advance), sub at position 5
+    cs = ":5+ggg*ac:4"
+    assert parse_cs_long_mismatch_positions(cs, ref_start=0) == [5]
+
+
+def test_cs_mismatch_positions_deletion_advances_ref() -> None:
+    """`-xxx` advances ref by the deletion length; a sub after a
+    3-bp deletion lands at the post-deletion position."""
+    # 5 matches, 3-bp deletion, then sub → ref cursor at 5 + 3 = 8
+    cs = ":5-tac*ag:4"
+    assert parse_cs_long_mismatch_positions(cs, ref_start=0) == [8]
+
+
+def test_cs_mismatch_positions_splice_advances_ref() -> None:
+    """`~aa<N>bb` advances ref by N; sub after a 500-bp intron lands
+    at the post-intron position."""
+    cs = "=AAAA~gt500ag=AA*ac=AA"
+    # 4 matches → ref=4; +500 intron → ref=504; 2 matches → ref=506;
+    # sub → recorded at 506.
+    assert parse_cs_long_mismatch_positions(cs, ref_start=0) == [506]
+
+
+def test_cs_mismatch_positions_empty_string() -> None:
+    assert parse_cs_long_mismatch_positions("", ref_start=42) == []
+
+
+def test_cs_mismatch_positions_malformed_raises() -> None:
+    with pytest.raises(ValueError):
+        parse_cs_long_mismatch_positions("@AAAA", ref_start=0)
 
 
 # ──────────────────────────────────────────────────────────────────────

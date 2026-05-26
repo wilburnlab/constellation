@@ -287,6 +287,9 @@ export class TrackSettingsPanel {
         this.checkboxStyleRow('Show max depth', 'show_max_depth', true),
       );
     } else if (kind === 'read_pileup') {
+      // Per-strand exon palette — strand-aware default until PR 3
+      // lands per-sample coloring. Users can override `palette.exon`
+      // for a uniform color across strands.
       ['+', '-', 'default'].forEach((strand) => {
         const fallback = strand === '+' ? '#5e9cd6' : strand === '-' ? '#d6755e' : '#888888';
         const label =
@@ -299,6 +302,46 @@ export class TrackSettingsPanel {
           ),
         );
       });
+      // Intron-connector + mismatch-glyph palettes. Both shared
+      // across every read; mismatch color stays one consistent value
+      // across samples per the UX brief (sample identity lives in
+      // the exon fill).
+      section.appendChild(
+        paletteRow(
+          'Intron connector',
+          this.getPalette('intron') ?? '#5a5a63',
+          (hex) => this.setPalette('intron', hex),
+        ),
+      );
+      section.appendChild(
+        paletteRow(
+          'Mismatch glyph',
+          this.getPalette('mismatch') ?? '#e3493a',
+          (hex) => this.setPalette('mismatch', hex),
+        ),
+      );
+      section.appendChild(
+        this.textRow(
+          'Intron dasharray',
+          'intron_stroke_dasharray',
+          '2,2',
+        ),
+      );
+      section.appendChild(
+        this.numberRow(
+          'Intron stroke (px)',
+          'intron_stroke_width_px',
+          1,
+          { min: 0.5, max: 4, step: 0.5 },
+        ),
+      );
+      section.appendChild(
+        this.numberRow('Mismatch glyph size (px)', 'mismatch_glyph_size_px', 6, {
+          min: 2,
+          max: 20,
+          step: 1,
+        }),
+      );
       section.appendChild(
         this.numberRow('Min row height (px)', 'min_row_height_px', 2, {
           min: 1,

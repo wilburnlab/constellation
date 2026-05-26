@@ -1,5 +1,19 @@
-// read_pileup renderer — vector mode draws per-glyph rectangles;
-// hybrid mode paints the server-rendered datashader PNG.
+// read_pileup renderer — vector mode draws per-block exon segments
+// (solid rects) with dotted intron connectors between adjacent blocks
+// and X glyphs at per-base substitution sites; hybrid mode paints the
+// server-rendered datashader PNG.
+//
+// Wire columns consumed in vector mode:
+//   alignment_id, ref_start, ref_end, strand, row,
+//   blocks: list<struct{ref_start, ref_end, n_match, n_mismatch}>,
+//   mismatch_positions: list<int64>
+//
+// `blocks` is always populated by the kernel (synthetic single-block
+// fallback when alignment_blocks/ has no rows for an alignment), so
+// the renderer's per-row loop never branches on its absence.
+// `mismatch_positions` is empty when the viewport is too coarse to
+// resolve per-base glyphs (the kernel decides via
+// mismatch_glyph_bp_per_pixel_limit).
 
 import { Table } from 'apache-arrow';
 import { svgEl, clear } from '../engine/svg_layer';
@@ -10,13 +24,22 @@ import {
   pickAllowList,
   pickNumber,
   pickPaletteColor,
+  pickString,
 } from './style';
 
 const STRAND_COLOR_DEFAULTS: Record<string, string> = {
   '+': '#5e9cd6',
   '-': '#d6755e',
-  default: '#888',
+  default: '#888888',
 };
+
+const INTRON_DEFAULT = '#5a5a63';
+const MISMATCH_DEFAULT = '#e3493a';
+
+interface Block {
+  refStart: number;
+  refEnd: number;
+}
 
 const renderer: TrackRenderer = {
   kind: 'read_pileup',
@@ -44,16 +67,7 @@ const renderer: TrackRenderer = {
     }
 
     if (table.numRows === 0) {
-      const text = svgEl('text', {
-        x: ctx.widthPx / 2,
-        y: ctx.heightPx / 2,
-        'font-size': '11',
-        fill: '#5a5a63',
-        'text-anchor': 'middle',
-      });
-      text.textContent = 'no reads in window';
-      ctx.svg.appendChild(text);
-      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
+      emitEmpty(ctx);
       return;
     }
 
@@ -62,7 +76,9 @@ const renderer: TrackRenderer = {
     const strandCol = table.getChild('strand');
     const rowCol = table.getChild('row');
     const idCol = table.getChild('alignment_id');
-    if (!startCol || !endCol || !strandCol || !rowCol) {
+    const blocksCol = table.getChild('blocks');
+    const mmCol = table.getChild('mismatch_positions');
+    if (!startCol || !endCol || !strandCol || !rowCol || !blocksCol) {
       ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
       return;
     }
@@ -70,6 +86,19 @@ const renderer: TrackRenderer = {
     const minRowH = pickNumber(ctx.style, 'min_row_height_px', 2);
     const maxRowH = pickNumber(ctx.style, 'max_row_height_px', 8);
     const readOpacity = pickNumber(ctx.style, 'read_opacity', 1.0);
+    const intronDasharray = pickString(
+      ctx.style,
+      'intron_stroke_dasharray',
+      '2,2',
+    );
+    const intronStrokeWidth = pickNumber(ctx.style, 'intron_stroke_width_px', 1);
+    const mismatchSize = pickNumber(ctx.style, 'mismatch_glyph_size_px', 6);
+    const mismatchColor = pickPaletteColor(
+      ctx.style,
+      'mismatch',
+      MISMATCH_DEFAULT,
+    );
+    const intronColor = pickPaletteColor(ctx.style, 'intron', INTRON_DEFAULT);
     const allowedStrands = pickAllowList(ctx.filter, 'visible_strands');
 
     const admit: boolean[] = new Array(table.numRows);
@@ -88,16 +117,7 @@ const renderer: TrackRenderer = {
     }
 
     if (admittedRows === 0) {
-      const text = svgEl('text', {
-        x: ctx.widthPx / 2,
-        y: ctx.heightPx / 2,
-        'font-size': '11',
-        fill: '#5a5a63',
-        'text-anchor': 'middle',
-      });
-      text.textContent = 'no reads in window';
-      ctx.svg.appendChild(text);
-      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
+      emitEmpty(ctx);
       return;
     }
 
@@ -109,29 +129,82 @@ const renderer: TrackRenderer = {
 
     for (let i = 0; i < table.numRows; i++) {
       if (!admit[i]) continue;
-      const start = Number(startCol.get(i));
-      const end = Number(endCol.get(i));
       const strand = String(strandCol.get(i));
       const row = Number(rowCol.get(i));
-      const x0 = ctx.xScale(start);
-      const x1 = ctx.xScale(end);
-      const fill = pickPaletteColor(
+      const yMid = 4 + row * rowH + rowH / 2;
+      const rectH = Math.max(1, rowH - 1);
+
+      // Per-strand exon palette default; users can override the
+      // `palette.exon` style key for a uniform color across strands
+      // (PR 3 will replace this with per-sample palette pickup).
+      const exonFallback =
+        STRAND_COLOR_DEFAULTS[strand] ?? STRAND_COLOR_DEFAULTS.default;
+      const exonFill = pickPaletteColor(
         ctx.style,
         strand,
-        STRAND_COLOR_DEFAULTS[strand] ?? STRAND_COLOR_DEFAULTS.default,
+        pickPaletteColor(ctx.style, 'exon', exonFallback),
       );
-      const rect = svgEl('rect', {
-        x: x0,
-        y: 4 + row * rowH,
-        width: Math.max(1, x1 - x0),
-        height: Math.max(1, rowH - 1),
-        fill,
-        opacity: String(readOpacity),
-      });
-      if (idCol) {
-        rect.setAttribute('data-alignment-id', String(idCol.get(i)));
+
+      const blocks = readBlocks(blocksCol, i);
+      // Sort blocks ascending — kernel emits in block_index order, but
+      // the fallback single-block path uses the alignment's own
+      // (start, end); defensive sort is cheap at viewport scale.
+      blocks.sort((a, b) => a.refStart - b.refStart);
+
+      // Exon rectangles per block.
+      const alignmentId = idCol ? String(idCol.get(i)) : null;
+      for (const block of blocks) {
+        const x0 = ctx.xScale(block.refStart);
+        const x1 = ctx.xScale(block.refEnd);
+        const rect = svgEl('rect', {
+          x: x0,
+          y: 4 + row * rowH,
+          width: Math.max(1, x1 - x0),
+          height: rectH,
+          fill: exonFill,
+          opacity: String(readOpacity),
+        });
+        if (alignmentId !== null) {
+          rect.setAttribute('data-alignment-id', alignmentId);
+        }
+        ctx.svg.appendChild(rect);
       }
-      ctx.svg.appendChild(rect);
+
+      // Intron connector between each adjacent pair of blocks.
+      for (let j = 0; j < blocks.length - 1; j++) {
+        const intronX0 = ctx.xScale(blocks[j].refEnd);
+        const intronX1 = ctx.xScale(blocks[j + 1].refStart);
+        if (intronX1 <= intronX0) continue;
+        const line = svgEl('line', {
+          x1: intronX0,
+          y1: yMid,
+          x2: intronX1,
+          y2: yMid,
+          stroke: intronColor,
+          'stroke-width': String(intronStrokeWidth),
+          'stroke-dasharray': intronDasharray,
+          opacity: String(readOpacity),
+        });
+        ctx.svg.appendChild(line);
+      }
+
+      // Per-position mismatch X glyphs (only populated at zooms where
+      // the kernel decided per-base detail is resolvable). Drawn last
+      // so they sit on top of the exon rectangles.
+      if (mmCol) {
+        const mmList = readNumberList(mmCol, i);
+        if (mmList.length > 0) {
+          drawMismatchGlyphs(
+            ctx.svg,
+            mmList,
+            ctx.xScale,
+            yMid,
+            rectH,
+            mismatchSize,
+            mismatchColor,
+          );
+        }
+      }
     }
 
     const label = svgEl('text', {
@@ -150,3 +223,95 @@ const renderer: TrackRenderer = {
 };
 
 export default renderer;
+
+
+function emitEmpty(ctx: RenderContext): void {
+  const text = svgEl('text', {
+    x: ctx.widthPx / 2,
+    y: ctx.heightPx / 2,
+    'font-size': '11',
+    fill: '#5a5a63',
+    'text-anchor': 'middle',
+  });
+  text.textContent = 'no reads in window';
+  ctx.svg.appendChild(text);
+  ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
+}
+
+
+/** Pull the i-th alignment's block list out of the `blocks`
+ *  `List<Struct>` column. Returns native JS numbers; Arrow int64s come
+ *  back as BigInt and we narrow to Number for SVG math (read pile-up
+ *  coordinates are well within Number.MAX_SAFE_INTEGER). */
+function readBlocks(col: unknown, i: number): Block[] {
+  const list = (col as { get: (i: number) => unknown }).get(i);
+  if (!list) return [];
+  const out: Block[] = [];
+  // apache-arrow's List<Struct> element is a Vector you can iterate.
+  // Each element is a row-proxy with `.toJSON()` returning an object.
+  const iter = list as Iterable<unknown>;
+  for (const elem of iter) {
+    if (!elem) continue;
+    const e = elem as { ref_start?: unknown; ref_end?: unknown };
+    out.push({
+      refStart: Number(e.ref_start ?? 0),
+      refEnd: Number(e.ref_end ?? 0),
+    });
+  }
+  return out;
+}
+
+
+/** Pull the i-th row's int64 list as a number[]. Empty list returns []. */
+function readNumberList(col: unknown, i: number): number[] {
+  const list = (col as { get: (i: number) => unknown }).get(i);
+  if (!list) return [];
+  const out: number[] = [];
+  const iter = list as Iterable<unknown>;
+  for (const v of iter) {
+    if (v === null || v === undefined) continue;
+    out.push(Number(v));
+  }
+  return out;
+}
+
+
+function drawMismatchGlyphs(
+  svg: SVGSVGElement,
+  positions: number[],
+  xScale: (g: number) => number,
+  yMid: number,
+  rectH: number,
+  glyphSize: number,
+  color: string,
+): void {
+  // X glyph as two crossed line segments. Cheaper to render than a
+  // <text>X</text> and scales cleanly under SVG zoom.
+  const half = Math.max(2, Math.min(glyphSize, rectH + 2)) / 2;
+  const stroke = '1.2';
+  for (const pos of positions) {
+    const x = xScale(pos);
+    const ne = svgEl('line', {
+      x1: x - half,
+      y1: yMid - half,
+      x2: x + half,
+      y2: yMid + half,
+      stroke: color,
+      'stroke-width': stroke,
+      'stroke-linecap': 'round',
+    });
+    const nw = svgEl('line', {
+      x1: x - half,
+      y1: yMid + half,
+      x2: x + half,
+      y2: yMid - half,
+      stroke: color,
+      'stroke-width': stroke,
+      'stroke-linecap': 'round',
+    });
+    svg.appendChild(ne);
+    svg.appendChild(nw);
+  }
+}
+
+
