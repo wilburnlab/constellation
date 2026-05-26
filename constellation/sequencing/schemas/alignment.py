@@ -219,6 +219,27 @@ ALIGNMENT_CS_TABLE: pa.Schema = pa.schema(
 )
 
 
+# Per-read sample assignment materialised once at align resolve time
+# (from the upstream demux dir's `read_demux/` ⨝ `samples/` join) so
+# downstream consumers — especially the genome browser's read pile-up
+# track — never have to chase a back-reference into the demux dir.
+# One row per primary-resolved read; `sample_id == null` reads are
+# already filtered upstream (the count stage's "agreement" policy
+# applies — chimeric reads with conflicting demux assignments are
+# dropped). `sample_name` is left-joined from SAMPLE_TABLE at write
+# time so a single lookup feeds both the viz palette UI (numeric
+# `sample_id` is the stable cycled-color key) and any human-facing
+# label / FASTA header (`sample_name` from the demux TSV).
+READ_SAMPLE_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("read_id", pa.string(), nullable=False),
+        pa.field("sample_id", pa.int64(), nullable=False),
+        pa.field("sample_name", pa.string(), nullable=True),
+    ],
+    metadata={b"schema_name": b"ReadSampleTable"},
+)
+
+
 # Long-form M:N edge table between ALIGNMENT_BLOCK_TABLE and the
 # derived-annotation FEATURE_TABLE (filtered to type='exon'). One row
 # per (block × derived_exon) overlap edge — most rows are 1-to-1 (a
@@ -252,6 +273,7 @@ register_schema("AlignmentBlockTable", ALIGNMENT_BLOCK_TABLE)
 register_schema("IntronTable", INTRON_TABLE)
 register_schema("ReadFingerprintTable", READ_FINGERPRINT_TABLE)
 register_schema("AlignmentCsTable", ALIGNMENT_CS_TABLE)
+register_schema("ReadSampleTable", READ_SAMPLE_TABLE)
 register_schema("BlockExonAssignmentTable", BLOCK_EXON_ASSIGNMENT_TABLE)
 
 

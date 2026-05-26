@@ -335,7 +335,7 @@ class Session:
 def _load_source(entry: dict[str, Any]) -> SessionSource:
     """Build a SessionSource from a ``{path, kind?, label?}`` dict.
 
-    Reads the source's ``manifest.json`` (schema v3 required), assembles
+    Reads the source's ``manifest.json`` (schema v4 required), assembles
     the per-kind slot map by joining the manifest's ``outputs`` against
     the well-known relative paths, and returns a frozen dataclass.
     """
