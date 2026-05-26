@@ -339,6 +339,7 @@ def cluster_by_fingerprint(
     #      Arrow `index_in` + `take` (sub-ms each).
     contig_seq_cache: dict[int, str] = {}
     alignment_cs_table: pa.Table | None = None
+    cs_idx_per_fp: pa.Array | pa.ChunkedArray | None = None
     if build_consensus_seq and genome is not None and alignment_cs is not None:
         needed_contig_ids = pc.unique(
             fingerprints.column("contig_id")
@@ -403,6 +404,24 @@ def cluster_by_fingerprint(
             f"({alignment_cs_table.num_rows:,} rows, "
             f"{alignment_cs_table.nbytes / 1e9:.2f} GB)"
         )
+        # cs row-index per fingerprint, computed once. Avoids the prior
+        # per-cluster `pc.index_in(member_aids, alignment_cs_table
+        # .column("alignment_id"))` call — pyarrow rebuilds the
+        # value-set hash table on every call, which at PromethION
+        # scale meant ~1 sec per cluster × 46k clusters ≈ 13 hours of
+        # pure hash-table-build wall time. One up-front pc.index_in
+        # over fp_aids builds the hash once and probes N_fingerprints
+        # times; the result rides through narrow_keys → sorted_keys so
+        # the per-cluster work becomes a free slice + a small pc.take
+        # from alignment_cs_table.cs_string.
+        _p(
+            "consensus prefetch: pc.index_in fp_aids → "
+            "alignment_cs_table rows"
+        )
+        cs_idx_per_fp = pc.index_in(
+            fp_aids, alignment_cs_table.column("alignment_id")
+        )
+        _p("consensus prefetch: cs_idx_per_fp ready")
 
     # ── Narrow keys table for sort ──────────────────────────────
     # All-numeric except for ``strand`` (1-char strings: 200M × 1 byte
@@ -420,6 +439,8 @@ def cluster_by_fingerprint(
     }
     if metrics_idx is not None:
         narrow_cols["metrics_idx"] = metrics_idx
+    if cs_idx_per_fp is not None:
+        narrow_cols["cs_idx"] = cs_idx_per_fp
     narrow_keys = pa.table(narrow_cols)
     _p(f"narrow_keys built ({narrow_keys.num_rows:,} rows)")
 
@@ -491,6 +512,9 @@ def cluster_by_fingerprint(
     sk_sample_id = sorted_keys.column("sample_id")
     sk_metrics_idx = (
         sorted_keys.column("metrics_idx") if metrics_table is not None else None
+    )
+    sk_cs_idx = (
+        sorted_keys.column("cs_idx") if cs_idx_per_fp is not None else None
     )
     reads_seq = reads.column("sequence") if reads.num_rows > 0 else None
     reads_qual = (
@@ -614,6 +638,12 @@ def cluster_by_fingerprint(
             slice_cols["n_delete_sum"] = pc.take(m_delete, metrics_indices)
             slice_cols["cs_aware"] = pc.take(m_csaware, metrics_indices)
         t_metrics_take = _time.perf_counter() - _ts
+
+        # Pre-computed cs row index per fingerprint rides through into
+        # _emit_cluster as a slice_table column so the per-cluster
+        # consensus path doesn't have to call pc.index_in itself.
+        if sk_cs_idx is not None:
+            slice_cols["cs_idx"] = sk_cs_idx.slice(start, size)
 
         _ts = _time.perf_counter()
         slice_table = pa.table(slice_cols)
@@ -1045,7 +1075,32 @@ def _emit_cluster(
                 member_aids_arr = pa.array(
                     member_aids, type=pa.int64()
                 )
-                if alignment_cs_table is not None:
+                if (
+                    alignment_cs_table is not None
+                    and "cs_idx" in slice_table.column_names
+                ):
+                    # Pre-computed path: cs_idx column carries the row
+                    # index into alignment_cs_table for each fingerprint.
+                    # Per-cluster work is a small filter + take, NOT a
+                    # 14M-row hash-table rebuild via pc.index_in. This
+                    # single change drops consensus per cluster from
+                    # ~1 sec → ~ms at PromethION scale.
+                    cs_idx_col = kept_table.column("cs_idx")
+                    cs_idx_valid = cs_idx_col.filter(both_valid_mask)
+                    cs_strings_col = pc.take(
+                        alignment_cs_table.column("cs_string"),
+                        cs_idx_valid,
+                    )
+                    cs_for_cluster = pa.table(
+                        {
+                            "alignment_id": member_aids_arr,
+                            "cs_string": cs_strings_col,
+                        }
+                    )
+                elif alignment_cs_table is not None:
+                    # Fallback when caller didn't pre-compute cs_idx
+                    # (test fixtures, Jupyter usage). Pays the per-call
+                    # index_in cost.
                     cs_indices = pc.index_in(
                         member_aids_arr,
                         alignment_cs_table.column("alignment_id"),
