@@ -503,6 +503,27 @@ def cluster_by_fingerprint(
                     value_set=fp_aids_unique,
                 )
             )
+        # cs_string is `string` (int32 offsets) in the on-disk schema.
+        # At PromethION scale, cs:long across millions of alignments
+        # totals 10s of GB and overflows int32 string-buffer offsets
+        # during the downstream combine_chunks + per-cluster pc.take
+        # (the same offset-overflow class that bit reads.sequence in
+        # the CLI). Cast to large_string per-chunk *before* combine_
+        # chunks — the cast is offset-arithmetic only (no data copy)
+        # and each input chunk individually fits under the 2 GiB
+        # string cap, so the cast itself doesn't overflow.
+        if pa.types.is_string(
+            alignment_cs_table.schema.field("cs_string").type
+        ):
+            alignment_cs_table = alignment_cs_table.set_column(
+                alignment_cs_table.schema.get_field_index("cs_string"),
+                "cs_string",
+                pc.cast(
+                    alignment_cs_table.column("cs_string"),
+                    pa.large_string(),
+                ),
+            )
+            _p("consensus prefetch: cs_string cast string → large_string")
         alignment_cs_table = alignment_cs_table.combine_chunks()
         _p(
             f"consensus prefetch: alignment_cs_table ready "
