@@ -20,6 +20,7 @@ from constellation.sequencing.schemas.alignment import (
     ALIGNMENT_CS_TABLE,
     ALIGNMENT_TABLE,
     INTRON_TABLE,
+    READ_SAMPLE_TABLE,
 )
 from constellation.sequencing.schemas.reference import (
     CONTIG_TABLE,
@@ -139,6 +140,7 @@ def _make_session(
             ("alignments", "alignments"),
             ("alignment_blocks", "alignment_blocks"),
             ("alignment_cs", "alignment_cs"),
+            ("read_samples", "read_samples.parquet"),
             ("coverage", "coverage.parquet"),
             ("introns", "introns.parquet"),
             ("derived_annotation", "derived_annotation"),
@@ -577,20 +579,32 @@ def _write_alignment_cs(align_dir: Path, rows: list[dict]) -> None:
     )
 
 
+def _write_read_samples(align_dir: Path, rows: list[dict]) -> None:
+    """Companion to ``_write_alignments`` — writes the per-read sample
+    map the read_pileup kernel hard-requires after PR 3."""
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=READ_SAMPLE_TABLE),
+        align_dir / "read_samples.parquet",
+    )
+
+
 def _write_read_pileup_inputs(
     align_dir: Path,
     alignments: list[dict],
     *,
     blocks: list[dict] | None = None,
     cs_rows: list[dict] | None = None,
+    read_samples: list[dict] | None = None,
 ) -> None:
-    """Write the three parquet artifacts the read_pileup kernel needs.
+    """Write the four parquet artifacts the read_pileup kernel needs.
 
     When ``blocks`` is None, one synthetic block per alignment is
     written (one block spanning the alignment's full ref range). When
     ``cs_rows`` is None, one row per alignment with an empty cs string
-    is written. These defaults keep PR 2's hard-require gate happy for
-    tests that don't care about block / cs detail.
+    is written. When ``read_samples`` is None, one row per alignment
+    is written under a single ``sample_a`` (sample_id=1). These
+    defaults keep the post-PR-3 hard-require gate happy for tests that
+    don't care about block / cs / sample detail.
     """
     _write_alignments(align_dir, alignments)
     if blocks is None:
@@ -610,6 +624,16 @@ def _write_read_pileup_inputs(
             for row in alignments
         ]
     _write_alignment_cs(align_dir, cs_rows)
+    if read_samples is None:
+        read_samples = [
+            {
+                "read_id": row["read_id"],
+                "sample_id": 1,
+                "sample_name": "sample_a",
+            }
+            for row in alignments
+        ]
+    _write_read_samples(align_dir, read_samples)
 
 
 def _alignment(**kwargs) -> dict:
@@ -775,6 +799,197 @@ def test_read_pileup_skips_mismatch_parse_at_coarse_zoom(
     assert row["mismatch_positions"] == []
 
 
+def test_read_pileup_vector_emits_sample_id_and_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The vector wire payload carries the alignment's sample_id +
+    sample_name resolved via the read_id join against
+    read_samples.parquet."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_read_pileup_inputs(
+        root / "S2_align",
+        [
+            _alignment(alignment_id=1, read_id="r1", ref_start=0, ref_end=100),
+            _alignment(alignment_id=2, read_id="r2", ref_start=200, ref_end=300),
+        ],
+        read_samples=[
+            {"read_id": "r1", "sample_id": 1, "sample_name": "sample_a"},
+            {"read_id": "r2", "sample_id": 2, "sample_name": "sample_b"},
+        ],
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    [binding] = kernel.discover(session)
+    query = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
+        schema=READ_PILEUP_VECTOR_SCHEMA,
+    )
+    by_id = {row["alignment_id"]: row for row in table.to_pylist()}
+    assert by_id[1]["sample_id"] == 1
+    assert by_id[1]["sample_name"] == "sample_a"
+    assert by_id[2]["sample_id"] == 2
+    assert by_id[2]["sample_name"] == "sample_b"
+
+
+def test_read_pileup_vector_handles_missing_sample_row(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An alignment whose read_id has no row in read_samples.parquet
+    emits null sample_id / sample_name — the renderer falls back to
+    the strand-based palette default rather than dropping the read."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_read_pileup_inputs(
+        root / "S2_align",
+        [
+            _alignment(alignment_id=1, read_id="r_known", ref_start=0, ref_end=100),
+            _alignment(alignment_id=2, read_id="r_orphan", ref_start=200, ref_end=300),
+        ],
+        read_samples=[
+            {"read_id": "r_known", "sample_id": 1, "sample_name": "sample_a"},
+        ],
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    [binding] = kernel.discover(session)
+    query = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
+        schema=READ_PILEUP_VECTOR_SCHEMA,
+    )
+    by_id = {row["alignment_id"]: row for row in table.to_pylist()}
+    assert by_id[2]["sample_id"] is None
+    assert by_id[2]["sample_name"] is None
+
+
+def test_read_pileup_metadata_surfaces_samples_in_data(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """metadata() pre-scans read_samples.parquet so the per-sample
+    palette UI can render before the first data fetch arrives. Output
+    matches coverage_histogram's `samples_in_data` shape (sorted int
+    list) plus a parallel `sample_names` array."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_read_pileup_inputs(
+        root / "S2_align",
+        [
+            _alignment(alignment_id=1, read_id="r1", ref_start=0, ref_end=100),
+            _alignment(alignment_id=2, read_id="r2", ref_start=0, ref_end=100),
+        ],
+        read_samples=[
+            {"read_id": "r1", "sample_id": 7, "sample_name": "sample_g"},
+            {"read_id": "r2", "sample_id": 3, "sample_name": "sample_c"},
+        ],
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    [binding] = kernel.discover(session)
+    meta = kernel.metadata(binding)
+    assert meta["samples_in_data"] == [3, 7]
+    assert meta["sample_names"] == ["sample_c", "sample_g"]
+
+
+def test_read_pileup_filter_by_sample_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """query.samples filtering accepts sample_name strings; only
+    matching rows are admitted to row-packing."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_read_pileup_inputs(
+        root / "S2_align",
+        [
+            _alignment(alignment_id=1, read_id="r1", ref_start=0, ref_end=100),
+            _alignment(alignment_id=2, read_id="r2", ref_start=200, ref_end=300),
+        ],
+        read_samples=[
+            {"read_id": "r1", "sample_id": 1, "sample_name": "sample_a"},
+            {"read_id": "r2", "sample_id": 2, "sample_name": "sample_b"},
+        ],
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    [binding] = kernel.discover(session)
+    query = TrackQuery(
+        contig="chr1",
+        start=0,
+        end=400,
+        viewport_px=1200,
+        samples=("sample_a",),
+    )
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
+        schema=READ_PILEUP_VECTOR_SCHEMA,
+    )
+    [row] = table.to_pylist()
+    assert row["alignment_id"] == 1
+
+
+def test_read_pileup_filter_by_sample_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """query.samples filtering also accepts stringified numeric ids
+    — matches coverage_histogram's contract so the same param feeds
+    both kernels."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_read_pileup_inputs(
+        root / "S2_align",
+        [
+            _alignment(alignment_id=1, read_id="r1", ref_start=0, ref_end=100),
+            _alignment(alignment_id=2, read_id="r2", ref_start=200, ref_end=300),
+        ],
+        read_samples=[
+            {"read_id": "r1", "sample_id": 1, "sample_name": "sample_a"},
+            {"read_id": "r2", "sample_id": 2, "sample_name": "sample_b"},
+        ],
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    [binding] = kernel.discover(session)
+    query = TrackQuery(
+        contig="chr1",
+        start=0,
+        end=400,
+        viewport_px=1200,
+        samples=("2",),
+    )
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
+        schema=READ_PILEUP_VECTOR_SCHEMA,
+    )
+    [row] = table.to_pylist()
+    assert row["alignment_id"] == 2
+
+
+def test_read_pileup_discover_skips_source_without_read_samples(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Hard-require: a source that's missing read_samples.parquet
+    produces no binding. Forces users on pre-PR-1 align outputs to
+    re-run align before read_pileup viz becomes available."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_alignments(
+        root / "S2_align",
+        [_alignment(alignment_id=1, read_id="r1", ref_start=0, ref_end=100)],
+    )
+    _write_alignment_blocks(
+        root / "S2_align",
+        [_block(alignment_id=1, ref_start=0, ref_end=100)],
+    )
+    _write_alignment_cs(
+        root / "S2_align", [{"alignment_id": 1, "cs_string": ""}]
+    )
+    # Deliberately omit read_samples.parquet.
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("read_pileup")
+    assert kernel.discover(session) == []
+
+
 def test_read_pileup_discover_skips_source_without_alignment_cs(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -790,6 +1005,10 @@ def test_read_pileup_discover_skips_source_without_alignment_cs(
     _write_alignment_blocks(
         root / "S2_align",
         [_block(alignment_id=1, ref_start=0, ref_end=100)],
+    )
+    _write_read_samples(
+        root / "S2_align",
+        [{"read_id": "r1", "sample_id": 1, "sample_name": "sample_a"}],
     )
     # Deliberately omit alignment_cs/.
     session = _make_session(monkeypatch, tmp_path, root)
@@ -810,6 +1029,10 @@ def test_read_pileup_discover_skips_source_without_alignment_blocks(
     )
     _write_alignment_cs(
         root / "S2_align", [{"alignment_id": 1, "cs_string": ""}]
+    )
+    _write_read_samples(
+        root / "S2_align",
+        [{"read_id": "r1", "sample_id": 1, "sample_name": "sample_a"}],
     )
     # Deliberately omit alignment_blocks/.
     session = _make_session(monkeypatch, tmp_path, root)

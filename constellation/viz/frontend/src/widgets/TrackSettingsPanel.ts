@@ -232,7 +232,11 @@ export class TrackSettingsPanel {
         this.checkboxStyleRow('Show labels', 'show_labels', true),
       );
     } else if (kind === 'coverage_histogram') {
-      const samples = numericList(this.opts.meta.samples);
+      // `samples_in_data` is the Python kernel's metadata field name
+      // (matches read_pileup); the picker also reads sibling
+      // `sample_names` when present so labels stay human-readable.
+      const samples = numericList(this.opts.meta.samples_in_data);
+      const sampleNames = stringOrNullList(this.opts.meta.sample_names);
       const paletteCycle = [
         '#4f9efb',
         '#fb7c4f',
@@ -245,8 +249,11 @@ export class TrackSettingsPanel {
       } else {
         samples.forEach((sampleId, idx) => {
           const fallback = paletteCycle[idx % paletteCycle.length];
+          const name = sampleNames[idx] ?? null;
           const label =
-            sampleId === -1 ? 'all (unstratified)' : `sample ${sampleId}`;
+            sampleId === -1 ? 'all (unstratified)'
+            : name ? `${name} (${sampleId})`
+            : `sample ${sampleId}`;
           section.appendChild(
             paletteRow(
               label,
@@ -287,14 +294,44 @@ export class TrackSettingsPanel {
         this.checkboxStyleRow('Show max depth', 'show_max_depth', true),
       );
     } else if (kind === 'read_pileup') {
-      // Per-strand exon palette — strand-aware default until PR 3
-      // lands per-sample coloring. Users can override `palette.exon`
-      // for a uniform color across strands.
+      // Per-sample exon palette — primary color key for the pile-up
+      // after PR 3. One row per sample_id surfaced in `samples_in_data`;
+      // the renderer falls back to the strand-based palette below for
+      // reads whose sample_id is null (escape-hatch demux configs).
+      const samples = numericList(this.opts.meta.samples_in_data);
+      const sampleNames = stringOrNullList(this.opts.meta.sample_names);
+      const samplePaletteCycle = [
+        '#4f9efb',
+        '#fb7c4f',
+        '#a4d65e',
+        '#d65eb6',
+        '#5ed6cf',
+      ];
+      if (samples.length === 0) {
+        section.appendChild(emptyHint('no samples in this source'));
+      } else {
+        samples.forEach((sampleId, idx) => {
+          const fallback = samplePaletteCycle[idx % samplePaletteCycle.length];
+          const name = sampleNames[idx] ?? null;
+          const label = name ? `${name} (${sampleId})` : `sample ${sampleId}`;
+          section.appendChild(
+            paletteRow(
+              label,
+              this.getPalette(String(sampleId)) ?? fallback,
+              (hex) => this.setPalette(String(sampleId), hex),
+            ),
+          );
+        });
+      }
+      // Per-strand exon palette — fallback for null sample_id reads
+      // and an escape hatch for users who want a non-sample-based
+      // coloring. Users can also override `palette.exon` for a
+      // uniform color across strands.
       ['+', '-', 'default'].forEach((strand) => {
         const fallback = strand === '+' ? '#5e9cd6' : strand === '-' ? '#d6755e' : '#888888';
         const label =
-          strand === '+' ? 'Forward strand'
-          : strand === '-' ? 'Reverse strand'
+          strand === '+' ? 'Forward strand (fallback)'
+          : strand === '-' ? 'Reverse strand (fallback)'
           : 'Unstranded / default';
         section.appendChild(
           paletteRow(label, this.getPalette(strand) ?? fallback, (hex) =>
@@ -506,10 +543,17 @@ export class TrackSettingsPanel {
         }),
       );
     } else if (kind === 'coverage_histogram') {
-      const samples = numericList(this.opts.meta.samples);
+      const samples = numericList(this.opts.meta.samples_in_data);
+      const sampleNames = stringOrNullList(this.opts.meta.sample_names);
       if (samples.length === 0) {
         section.appendChild(emptyHint('no samples in window yet'));
       } else {
+        const labelFor = (key: string): string => {
+          if (key === '-1') return 'all';
+          const idx = samples.indexOf(Number(key));
+          const name = idx >= 0 ? sampleNames[idx] ?? null : null;
+          return name ? `${name} (${key})` : `sample ${key}`;
+        };
         section.appendChild(
           allowListRow(
             'Visible samples',
@@ -521,7 +565,7 @@ export class TrackSettingsPanel {
                 .filter((n) => Number.isFinite(n));
               this.setFilterArray('visible_samples', asNums);
             },
-            (key) => (key === '-1' ? 'all' : `sample ${key}`),
+            labelFor,
           ),
         );
       }
@@ -533,6 +577,29 @@ export class TrackSettingsPanel {
         }),
       );
     } else if (kind === 'read_pileup') {
+      const samples = numericList(this.opts.meta.samples_in_data);
+      const sampleNames = stringOrNullList(this.opts.meta.sample_names);
+      if (samples.length > 0) {
+        const labelFor = (key: string): string => {
+          const idx = samples.indexOf(Number(key));
+          const name = idx >= 0 ? sampleNames[idx] ?? null : null;
+          return name ? `${name} (${key})` : `sample ${key}`;
+        };
+        section.appendChild(
+          allowListRow(
+            'Visible samples',
+            samples.map(String),
+            this.getFilterArray('visible_samples'),
+            (selected) => {
+              const asNums = selected
+                .map((s) => Number(s))
+                .filter((n) => Number.isFinite(n));
+              this.setFilterArray('visible_samples', asNums);
+            },
+            labelFor,
+          ),
+        );
+      }
       section.appendChild(
         allowListRow(
           'Visible strands',
@@ -994,6 +1061,23 @@ function stringList(source: unknown): string[] {
   for (const v of source as unknown[]) {
     if (v === null || v === undefined) continue;
     out.push(String(v));
+  }
+  return out;
+}
+
+
+/** Parallel-array companion to `numericList`: preserves explicit
+ *  null/undefined slots so the caller can pair indices against another
+ *  array (e.g. `samples_in_data[i]` <-> `sample_names[i]`). */
+function stringOrNullList(source: unknown): Array<string | null> {
+  if (!Array.isArray(source)) return [];
+  const out: Array<string | null> = [];
+  for (const v of source as unknown[]) {
+    if (v === null || v === undefined) {
+      out.push(null);
+    } else {
+      out.push(String(v));
+    }
   }
   return out;
 }

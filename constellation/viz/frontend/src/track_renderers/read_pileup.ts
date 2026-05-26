@@ -1,19 +1,23 @@
 // read_pileup renderer — vector mode draws per-block exon segments
-// (solid rects) with dotted intron connectors between adjacent blocks
-// and X glyphs at per-base substitution sites; hybrid mode paints the
-// server-rendered datashader PNG.
+// (solid rects, color keyed by sample_id) with dotted intron
+// connectors between adjacent blocks and X glyphs at per-base
+// substitution sites; hybrid mode paints the server-rendered
+// datashader PNG.
 //
 // Wire columns consumed in vector mode:
-//   alignment_id, ref_start, ref_end, strand, row,
+//   alignment_id, ref_start, ref_end, strand, mapq, row,
 //   blocks: list<struct{ref_start, ref_end, n_match, n_mismatch}>,
-//   mismatch_positions: list<int64>
+//   mismatch_positions: list<int64>,
+//   sample_id: int64?, sample_name: string?
 //
 // `blocks` is always populated by the kernel (synthetic single-block
 // fallback when alignment_blocks/ has no rows for an alignment), so
 // the renderer's per-row loop never branches on its absence.
 // `mismatch_positions` is empty when the viewport is too coarse to
 // resolve per-base glyphs (the kernel decides via
-// mismatch_glyph_bp_per_pixel_limit).
+// mismatch_glyph_bp_per_pixel_limit). `sample_id` keys a cycled
+// palette so the user can compare coverage across samples at a glance;
+// null sample_ids fall back to the strand-colored default.
 
 import { Table } from 'apache-arrow';
 import { svgEl, clear } from '../engine/svg_layer';
@@ -22,6 +26,7 @@ import { decodeHybrid, appendHybridImage } from '../engine/hybrid_layer';
 import { TrackRenderer, RenderContext } from './base';
 import {
   pickAllowList,
+  pickCycledColor,
   pickNumber,
   pickPaletteColor,
   pickString,
@@ -32,6 +37,16 @@ const STRAND_COLOR_DEFAULTS: Record<string, string> = {
   '-': '#d6755e',
   default: '#888888',
 };
+
+// Mirror of the coverage_histogram per-sample palette so multi-track
+// views (coverage + pileup of the same sample) share a color identity.
+const SAMPLE_PALETTE_CYCLE = [
+  '#4f9efb',
+  '#fb7c4f',
+  '#a4d65e',
+  '#d65eb6',
+  '#5ed6cf',
+];
 
 const INTRON_DEFAULT = '#5a5a63';
 const MISMATCH_DEFAULT = '#e3493a';
@@ -78,6 +93,7 @@ const renderer: TrackRenderer = {
     const idCol = table.getChild('alignment_id');
     const blocksCol = table.getChild('blocks');
     const mmCol = table.getChild('mismatch_positions');
+    const sampleIdCol = table.getChild('sample_id');
     if (!startCol || !endCol || !strandCol || !rowCol || !blocksCol) {
       ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
       return;
@@ -100,6 +116,14 @@ const renderer: TrackRenderer = {
     );
     const intronColor = pickPaletteColor(ctx.style, 'intron', INTRON_DEFAULT);
     const allowedStrands = pickAllowList(ctx.filter, 'visible_strands');
+    const allowedSamples = pickAllowList(ctx.filter, 'visible_samples');
+
+    // Stable per-sample palette index — assign in encounter order so a
+    // user dragging the viewport keeps the same color for the same
+    // sample even as the visible alignments change. The metadata-side
+    // `samples_in_data` is sorted, so colors are also stable across
+    // sessions when the user hasn't overridden anything.
+    const samplePaletteIdx = new Map<number, number>();
 
     const admit: boolean[] = new Array(table.numRows);
     let maxRow = -1;
@@ -110,10 +134,26 @@ const renderer: TrackRenderer = {
         admit[i] = false;
         continue;
       }
+      const sampleVal = sampleIdCol ? sampleIdCol.get(i) : null;
+      if (allowedSamples) {
+        const key = sampleVal === null || sampleVal === undefined
+          ? 'null'
+          : String(sampleVal);
+        if (!allowedSamples.has(key)) {
+          admit[i] = false;
+          continue;
+        }
+      }
       admit[i] = true;
       admittedRows++;
       const r = Number(rowCol.get(i));
       if (r > maxRow) maxRow = r;
+      if (sampleVal !== null && sampleVal !== undefined) {
+        const sid = Number(sampleVal);
+        if (Number.isFinite(sid) && !samplePaletteIdx.has(sid)) {
+          samplePaletteIdx.set(sid, samplePaletteIdx.size);
+        }
+      }
     }
 
     if (admittedRows === 0) {
@@ -134,16 +174,34 @@ const renderer: TrackRenderer = {
       const yMid = 4 + row * rowH + rowH / 2;
       const rectH = Math.max(1, rowH - 1);
 
-      // Per-strand exon palette default; users can override the
-      // `palette.exon` style key for a uniform color across strands
-      // (PR 3 will replace this with per-sample palette pickup).
-      const exonFallback =
+      // Resolve exon fill in priority order:
+      //  1. user palette override keyed by sample_id (numeric)
+      //  2. cycled palette default for this sample's index
+      //  3. user palette override keyed by `exon`
+      //  4. user palette override keyed by strand
+      //  5. strand-based default
+      // Null sample_id falls back to (3)/(4)/(5).
+      const sampleVal = sampleIdCol ? sampleIdCol.get(i) : null;
+      const strandFallback =
         STRAND_COLOR_DEFAULTS[strand] ?? STRAND_COLOR_DEFAULTS.default;
-      const exonFill = pickPaletteColor(
+      const exonStyleFallback = pickPaletteColor(
         ctx.style,
         strand,
-        pickPaletteColor(ctx.style, 'exon', exonFallback),
+        pickPaletteColor(ctx.style, 'exon', strandFallback),
       );
+      let exonFill = exonStyleFallback;
+      if (sampleVal !== null && sampleVal !== undefined) {
+        const sid = Number(sampleVal);
+        if (Number.isFinite(sid)) {
+          const idx = samplePaletteIdx.get(sid) ?? 0;
+          exonFill = pickCycledColor(
+            ctx.style,
+            sid,
+            SAMPLE_PALETTE_CYCLE,
+            idx,
+          );
+        }
+      }
 
       const blocks = readBlocks(blocksCol, i);
       // Sort blocks ascending — kernel emits in block_index order, but

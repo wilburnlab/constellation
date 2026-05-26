@@ -37,6 +37,7 @@ _ALIGN_SLOT_KEYS: tuple[tuple[str, str, bool], ...] = (
     ("alignments", "alignments", True),
     ("alignment_blocks", "alignment_blocks", True),
     ("alignment_cs", "alignment_cs", True),
+    ("read_samples", "read_samples", False),
     ("coverage", "coverage", False),
     ("introns", "introns", False),
     ("derived_annotation", "derived_annotation", True),
@@ -58,6 +59,7 @@ _ALIGN_DEFAULT_PATHS: dict[str, str] = {
     "alignments": "alignments",
     "alignment_blocks": "alignment_blocks",
     "alignment_cs": "alignment_cs",
+    "read_samples": "read_samples.parquet",
     "coverage": "coverage.parquet",
     "introns": "introns.parquet",
     "derived_annotation": "derived_annotation",
@@ -97,6 +99,7 @@ class SessionSource:
     alignments: Path | None = None
     alignment_blocks: Path | None = None
     alignment_cs: Path | None = None
+    read_samples: Path | None = None
     coverage: Path | None = None
     introns: Path | None = None
     derived_annotation: Path | None = None
@@ -125,6 +128,7 @@ class SessionSource:
             "alignments": _stringify(self.alignments),
             "alignment_blocks": _stringify(self.alignment_blocks),
             "alignment_cs": _stringify(self.alignment_cs),
+            "read_samples": _stringify(self.read_samples),
             "coverage": _stringify(self.coverage),
             "introns": _stringify(self.introns),
             "derived_annotation": _stringify(self.derived_annotation),

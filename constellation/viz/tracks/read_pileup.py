@@ -1,17 +1,21 @@
 """Read pile-up track — alignments rendered as block-aware stacked bars.
 
 Reads each align source's `alignments/` + `alignment_blocks/` +
-`alignment_cs/`. Block geometry (per-CIGAR M/=/X spans) draws solid
-exon segments; intron gaps between adjacent blocks draw as dotted
-connectors; per-base substitutions from cs:long draw as X glyphs.
+`alignment_cs/` + `read_samples.parquet`. Block geometry (per-CIGAR
+M/=/X spans) draws solid exon segments; intron gaps between adjacent
+blocks draw as dotted connectors; per-base substitutions from cs:long
+draw as X glyphs; the alignment's resolved sample id keys a per-sample
+palette so users can visually compare coverage across samples and
+toggle samples on / off via the gear popover.
 
-**Hard-require.** `alignment_blocks/` AND `alignment_cs/` must both be
-present on the source. When either is missing, `discover()` returns no
-binding for that source — the upstream align run was invoked with
-`--no-emit-cs-tags` (the only path that suppresses `alignment_cs/`),
-which the v4 CLI default flipped to "on" specifically to support this
-track. Users with legacy v3 outputs see no read_pileup binding until
-they re-run align.
+**Hard-require.** `alignment_blocks/`, `alignment_cs/`, AND
+`read_samples.parquet` must all be present on the source. When any is
+missing, `discover()` returns no binding for that source — the upstream
+align run was invoked with `--no-emit-cs-tags` (which the v4 CLI
+default flipped to "on"), or the source is a legacy v3 output (which
+the manifest reader already refuses earlier in the load path). The PR
+3 sample-attach assumes the join target is on disk; falling back to
+per-strand coloring would split visual conventions.
 
 Two render modes:
 
@@ -72,6 +76,12 @@ READ_PILEUP_VECTOR_SCHEMA: pa.Schema = pa.schema(
         pa.field("row", pa.int32(), nullable=False),
         pa.field("blocks", BLOCKS_LIST_TYPE, nullable=False),
         pa.field("mismatch_positions", MISMATCH_POSITIONS_TYPE, nullable=False),
+        # Nullable so reads in escape-hatch demux setups (no sample
+        # bundle, never expected for production runs but defensive
+        # against half-populated read_samples.parquet) render under the
+        # palette's default color instead of disappearing.
+        pa.field("sample_id", pa.int64(), nullable=True),
+        pa.field("sample_name", pa.string(), nullable=True),
     ],
     metadata={b"schema_name": b"VizReadPileup"},
 )
@@ -101,20 +111,25 @@ class ReadPileupKernel(TrackKernel):
             return []
         bindings: list[TrackBinding] = []
         for idx, src in iter_sources_with(
-            session, "alignments", "alignment_blocks", "alignment_cs"
+            session,
+            "alignments",
+            "alignment_blocks",
+            "alignment_cs",
+            "read_samples",
         ):
-            # Hard-require: alignment_blocks/ + alignment_cs/ must both
-            # be present. The PR 2 schema includes nested `blocks` and
-            # `mismatch_positions` columns that are populated from these
-            # two parquet datasets; without them the renderer would
-            # show flat empty boxes. Sources missing either are skipped
+            # Hard-require: alignment_blocks/ + alignment_cs/ +
+            # read_samples.parquet must all be present. PR 2's schema
+            # added `blocks` + `mismatch_positions`; PR 3 adds
+            # `sample_id` + `sample_name`. Each derives from one of the
+            # four required artifacts. Sources missing any are skipped
             # at discovery time so the Datasets popover surfaces no
             # read_pileup binding for legacy outputs — re-running align
-            # without --no-emit-cs-tags restores it.
+            # (the v4 default emits all four) restores it.
             paths: dict[str, Any] = {
                 "alignments": src.alignments,
                 "alignment_blocks": src.alignment_blocks,
                 "alignment_cs": src.alignment_cs,
+                "read_samples": src.read_samples,
                 "genome": session.reference_genome,
             }
             label = f"Reads ({src.label})" if len(session.sources) > 1 else "Reads"
@@ -131,6 +146,34 @@ class ReadPileupKernel(TrackKernel):
         return bindings
 
     def metadata(self, binding: TrackBinding) -> dict[str, Any]:
+        # Pre-scan the source's read_samples.parquet so the
+        # per-sample palette UI knows what to render before the first
+        # data fetch. Two parallel lists keep the wire shape numeric
+        # (matches coverage_histogram's `samples_in_data` convention
+        # for the TrackSettingsPanel.numericList() reader) while still
+        # surfacing the human-readable names for the picker labels.
+        sample_ids: list[int] = []
+        sample_names: list[str | None] = []
+        rs_path = binding.paths.get("read_samples")
+        if rs_path is not None and rs_path.exists():
+            table = pq.read_table(
+                rs_path, columns=["sample_id", "sample_name"]
+            )
+            if table.num_rows > 0:
+                # Dedup on sample_id; pick first non-null name per id.
+                seen: dict[int, str | None] = {}
+                for sid, name in zip(
+                    table.column("sample_id").to_pylist(),
+                    table.column("sample_name").to_pylist(),
+                    strict=True,
+                ):
+                    if sid is None:
+                        continue
+                    key = int(sid)
+                    if key not in seen or seen[key] is None:
+                        seen[key] = name
+                sample_ids = sorted(seen.keys())
+                sample_names = [seen[sid] for sid in sample_ids]
         return {
             "kind": self.kind,
             "binding_id": binding.binding_id,
@@ -140,6 +183,8 @@ class ReadPileupKernel(TrackKernel):
             "mismatch_glyph_bp_per_pixel_limit": (
                 self.mismatch_glyph_bp_per_pixel_limit
             ),
+            "samples_in_data": sample_ids,
+            "sample_names": sample_names,
             "default_height_px": 240,
         }
 
@@ -177,6 +222,17 @@ class ReadPileupKernel(TrackKernel):
         rows = self._scan_window(binding, contig_name, query)
         if rows.num_rows == 0:
             return iter(())
+
+        # Attach sample_id / sample_name from read_samples.parquet
+        # before the row-packing step. The sample-filter pushdown then
+        # drops disallowed rows before greedy_row_assign so the visible
+        # stack height matches what the user asked for; assigning rows
+        # first and filtering after would leave empty packing slots.
+        rows = _attach_read_samples(rows, binding.paths["read_samples"])
+        if query.samples:
+            rows = _apply_sample_filter(rows, query.samples)
+            if rows.num_rows == 0:
+                return iter(())
 
         starts = rows.column("ref_start").to_pylist()
         ends = rows.column("ref_end").to_pylist()
@@ -295,6 +351,8 @@ class ReadPileupKernel(TrackKernel):
                 pa.array(assigned, pa.int32()),
                 rows.column("blocks"),
                 rows.column("mismatch_positions"),
+                rows.column("sample_id"),
+                rows.column("sample_name"),
             ],
             schema=READ_PILEUP_VECTOR_SCHEMA,
         )
@@ -363,3 +421,70 @@ def _resolve_contig_id_or_name(
     if matches.num_rows == 0:
         return None
     return contig_name, int(matches.column("contig_id")[0].as_py())
+
+
+def _attach_read_samples(rows: pa.Table, read_samples_path: Any) -> pa.Table:
+    """Left-join the visible-window alignments against
+    ``read_samples.parquet`` on ``read_id``. Cardinality of the right
+    side is bounded by the unique read count in the file (~10s of M at
+    PromethION scale) but the kernel's vector_glyph_limit bounds the
+    left side to a few thousand rows at most — the hash-join cost is
+    bounded by the left, and we read read_samples once with predicate
+    pushdown on ``read_id`` so we don't materialise the whole table.
+
+    Reads with no matching row (which the PR 1 reduction shouldn't
+    produce in practice — chimera-disagreement rows are dropped at
+    write time) keep ``sample_id=null``, ``sample_name=null`` so the
+    renderer falls back to the palette default rather than crashing.
+    """
+    if rows.num_rows == 0:
+        return rows.append_column(
+            "sample_id", pa.array([], type=pa.int64())
+        ).append_column("sample_name", pa.array([], type=pa.string()))
+    read_ids = pc.unique(rows.column("read_id"))
+    rs_table = pa_ds.dataset(
+        str(read_samples_path), format="parquet"
+    ).to_table(
+        columns=["read_id", "sample_id", "sample_name"],
+        filter=pc.field("read_id").isin(read_ids),
+    )
+    return rows.join(rs_table, keys="read_id", join_type="left outer")
+
+
+def _apply_sample_filter(
+    rows: pa.Table, samples: tuple[str, ...]
+) -> pa.Table:
+    """Drop rows whose ``sample_id`` / ``sample_name`` doesn't match
+    any entry in ``samples``. Accepts either string sample names or
+    stringified numeric ids (matches
+    :meth:`coverage_histogram._resolve_sample_ids`'s contract), so the
+    same query param feeds both kernels uniformly.
+    """
+    if not samples:
+        return rows
+    wanted_names: set[str] = set()
+    wanted_ids: set[int] = set()
+    for raw in samples:
+        s = str(raw)
+        wanted_names.add(s)
+        try:
+            wanted_ids.add(int(s))
+        except (TypeError, ValueError):
+            continue
+    name_col = rows.column("sample_name")
+    id_col = rows.column("sample_id")
+    name_match = (
+        pc.is_in(name_col, pa.array(list(wanted_names), pa.string()))
+        if wanted_names
+        else pa.array([False] * rows.num_rows)
+    )
+    id_match = (
+        pc.is_in(id_col, pa.array(list(wanted_ids), pa.int64()))
+        if wanted_ids
+        else pa.array([False] * rows.num_rows)
+    )
+    # Treat nulls in either match column as False (a null sample_name
+    # shouldn't be admitted just because the user passed a name filter).
+    name_match = pc.fill_null(name_match, False)
+    id_match = pc.fill_null(id_match, False)
+    return rows.filter(pc.or_(name_match, id_match))
