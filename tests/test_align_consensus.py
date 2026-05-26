@@ -206,3 +206,83 @@ def test_long_match_form_equivalent_to_short() -> None:
         reference_start=0,
     )
     assert out_short == out_long == ref
+
+
+def test_parallel_matches_sequential() -> None:
+    """`threads=N` must produce byte-identical output to `threads=1` for
+    the same input — torch ``index_add_`` is commutative across members
+    so parallel parsing + batched scatter is semantics-preserving.
+    """
+    ref = "ACGTACGTACGTACGT"  # 16 bp window
+    # 50 members with a mix of identity + substitution + deletion.
+    cs_rows = []
+    aids = []
+    starts = []
+    for i in range(50):
+        if i % 5 == 0:
+            cs_rows.append((i, ":16"))  # identity
+        elif i % 5 == 1:
+            cs_rows.append((i, ":4*ct:11"))  # substitute C→T at pos 4
+        elif i % 5 == 2:
+            cs_rows.append((i, ":4-c:11"))  # delete pos 4
+        else:
+            cs_rows.append((i, "=ACGTACGTACGTACGT"))  # long-match form
+        aids.append(i)
+        starts.append(0)
+    cs_table = _cs(cs_rows)
+    out_serial = build_consensus(
+        member_alignment_ids=aids,
+        member_weights=[1.0] * len(aids),
+        member_ref_starts=starts,
+        alignment_cs=cs_table,
+        reference_sequence=ref,
+        reference_start=0,
+        threads=1,
+    )
+    for n_threads in (2, 4, 8):
+        out_parallel = build_consensus(
+            member_alignment_ids=aids,
+            member_weights=[1.0] * len(aids),
+            member_ref_starts=starts,
+            alignment_cs=cs_table,
+            reference_sequence=ref,
+            reference_start=0,
+            threads=n_threads,
+        )
+        assert out_parallel == out_serial, (
+            f"threads={n_threads} diverged from threads=1"
+        )
+
+
+def test_batched_scatter_chunk_boundary() -> None:
+    """The batched index_add_ accumulation must produce the same PWM
+    regardless of how members are partitioned into scatter chunks.
+    """
+    ref = "AAAACCCC"
+    # 250 members, all identity at weight 1.0 — winner per position
+    # is the reference base. Vary chunk_size across the member count
+    # to exercise different chunking boundaries.
+    cs_rows = [(i, ":8") for i in range(250)]
+    cs_table = _cs(cs_rows)
+    aids = list(range(250))
+    weights = [1.0] * 250
+    starts = [0] * 250
+    out_default = build_consensus(
+        member_alignment_ids=aids,
+        member_weights=weights,
+        member_ref_starts=starts,
+        alignment_cs=cs_table,
+        reference_sequence=ref,
+        reference_start=0,
+    )
+    for chunk in (1, 7, 100, 250, 1000):
+        out_chunked = build_consensus(
+            member_alignment_ids=aids,
+            member_weights=weights,
+            member_ref_starts=starts,
+            alignment_cs=cs_table,
+            reference_sequence=ref,
+            reference_start=0,
+            scatter_chunk_size=chunk,
+        )
+        assert out_chunked == out_default == ref

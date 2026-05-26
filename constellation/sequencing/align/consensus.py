@@ -32,6 +32,7 @@ edlib NW alignment of the member to the centroid.
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
 import torch
@@ -159,6 +160,8 @@ def build_consensus(
     reference_sequence: str,
     reference_start: int,
     min_depth: float = 1.0,
+    threads: int = 1,
+    scatter_chunk_size: int = 100_000,
 ) -> str:
     """Build a per-position weighted-majority-vote consensus.
 
@@ -192,6 +195,21 @@ def build_consensus(
         consensus emits the reference base at those positions as a
         fallback (preserves window length when the cluster doesn't
         cover certain positions). Default 1.0.
+    threads
+        Number of worker threads for parallel cs:long parsing. ``1``
+        (default) runs the parser inline on the calling thread, which
+        is what every existing call site + every test exercises.
+        ``threads>1`` dispatches ``_cs_votes`` calls across a
+        ``ThreadPoolExecutor`` — Python's regex module releases the
+        GIL during match execution, so this scales near-linearly on
+        cs:long-bound clusters (mega-clusters with millions of members).
+        Output is deterministic regardless of ``threads`` because
+        ``index_add_`` is commutative.
+    scatter_chunk_size
+        Per-chunk member count for the batched torch ``index_add_``
+        accumulation. Bounds peak intermediate tensor size to roughly
+        ``chunk_size × avg_votes_per_member × 16 bytes``. Default
+        100K members ≈ ~200 MB intermediate at typical cs:long density.
 
     Returns
     -------
@@ -235,29 +253,72 @@ def build_consensus(
     pwm = torch.zeros((L, 5), dtype=torch.float64)
     flat_pwm = pwm.view(-1)
 
-    for aid, weight, aln_ref_start in zip(
-        member_alignment_ids, member_weights, member_ref_starts, strict=True
-    ):
+    # Per-member worker — closes over the per-call window_start /
+    # window_end / reference_sequence so the parser doesn't re-read
+    # them from outer scope. Returns the parallel (indices, bases,
+    # weight) triple; main thread does the flat-tensor accumulation
+    # so the actual torch scatter stays serial (cheap once batched).
+    def _parse_one(triple: tuple[int, float, int]) -> tuple[list[int], list[int], float] | None:
+        aid, w, aln_ref_start = triple
         cs = cs_by_aid.get(int(aid))
         if cs is None:
-            continue
-        indices, bases = _cs_votes(
+            return None
+        idx, b = _cs_votes(
             cs,
             alignment_ref_start=int(aln_ref_start),
             window_start=window_start,
             window_end=window_end,
             reference_sequence=reference_sequence,
         )
-        if not indices:
-            continue
-        flat_idx = torch.tensor(
-            [i * 5 + b for i, b in zip(indices, bases, strict=True)],
-            dtype=torch.long,
+        if not idx:
+            return None
+        return idx, b, float(w)
+
+    triples = list(
+        zip(
+            member_alignment_ids,
+            member_weights,
+            member_ref_starts,
+            strict=True,
         )
-        weights = torch.full(
-            (len(flat_idx),), float(weight), dtype=torch.float64
+    )
+
+    # Chunked batched scatter — replaces the prior 1-scatter-per-member
+    # loop. Per-chunk Python list accumulation + 1 index_add_ per chunk
+    # cuts torch kernel launch overhead from O(N_members) to
+    # O(N_members / chunk_size). At chunk_size=100K that's ~22 scatter
+    # calls for a 2.15M-member mega-cluster instead of 2.15M.
+    executor: ThreadPoolExecutor | None = None
+    if threads > 1 and n_members > 1:
+        executor = ThreadPoolExecutor(
+            max_workers=min(int(threads), n_members)
         )
-        flat_pwm.index_add_(0, flat_idx, weights)
+
+    try:
+        for chunk_start in range(0, n_members, scatter_chunk_size):
+            chunk_end = min(chunk_start + scatter_chunk_size, n_members)
+            chunk = triples[chunk_start:chunk_end]
+            if executor is not None:
+                results = list(executor.map(_parse_one, chunk))
+            else:
+                results = [_parse_one(t) for t in chunk]
+            chunk_flat_idx: list[int] = []
+            chunk_weights: list[float] = []
+            for r in results:
+                if r is None:
+                    continue
+                idx, b, w = r
+                chunk_flat_idx.extend(
+                    i * 5 + bb for i, bb in zip(idx, b, strict=True)
+                )
+                chunk_weights.extend([w] * len(idx))
+            if chunk_flat_idx:
+                idx_t = torch.tensor(chunk_flat_idx, dtype=torch.long)
+                w_t = torch.tensor(chunk_weights, dtype=torch.float64)
+                flat_pwm.index_add_(0, idx_t, w_t)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     # Per-position winner. Positions with no votes ('row_max == 0') fall
     # back to the reference base (preserves window length when the

@@ -2141,6 +2141,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         drop_drift_filtered=bool(args.drop_drift_filtered),
         per_sample_clusters=bool(args.per_sample_clusters),
         cluster_id_seed=0,
+        consensus_threads=int(args.threads),
         progress=_log if args.progress else None,
     )
     _log(
