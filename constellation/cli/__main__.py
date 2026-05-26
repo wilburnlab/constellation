@@ -1583,6 +1583,85 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     return 0
 
 
+def _trim_sequences_to_large_string(
+    seq_col,  # pa.Array | pa.ChunkedArray, string or large_string
+    starts,  # pa.Array | pa.ChunkedArray, integer
+    ends,  # pa.Array | pa.ChunkedArray, integer
+    *,
+    chunk_size: int = 5_000_000,
+):
+    """Per-row slice of a string/large_string column → LargeStringArray.
+
+    pyarrow's ``pc.utf8_slice_codeunits`` accepts scalar start/stop only,
+    so a per-row trim (transcript-window extraction at PromethION scale)
+    has to drop to numpy. The buffer-construction approach copies bytes
+    directly between the input values buffer and a new output values
+    buffer (no Python-string round-trip), bounding intermediate memory
+    to ``chunk_size`` rows' worth of output. Replaces the prior
+    ``4 × to_pylist + Python loop`` that materialised tens of GB of
+    Python strings on a single thread.
+
+    Null sequences in the input become **empty strings** in the output
+    (matches the prior CLI semantics — not nulls, so the output array
+    has ``null_count=0``).
+    """
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    if isinstance(seq_col, pa.ChunkedArray):
+        seq_col = seq_col.combine_chunks()
+    if isinstance(starts, pa.ChunkedArray):
+        starts = starts.combine_chunks()
+    if isinstance(ends, pa.ChunkedArray):
+        ends = ends.combine_chunks()
+    if pa.types.is_string(seq_col.type):
+        seq_col = pc.cast(seq_col, pa.large_string())
+
+    n = len(seq_col)
+    if n == 0:
+        return pa.chunked_array([], type=pa.large_string())
+
+    seq_offsets = np.frombuffer(seq_col.buffers()[1], dtype=np.int64)
+    seq_buf = np.frombuffer(seq_col.buffers()[2], dtype=np.uint8)
+    ts_arr = np.asarray(starts).astype(np.int64, copy=False)
+    te_arr = np.asarray(ends).astype(np.int64, copy=False)
+
+    # Null sequences → length 0 (empty string in output).
+    seq_valid = pc.is_valid(seq_col).to_numpy(zero_copy_only=False)
+    ts_eff = np.where(seq_valid, ts_arr, 0).astype(np.int64, copy=False)
+    te_eff = np.where(seq_valid, te_arr, 0).astype(np.int64, copy=False)
+
+    chunks: list = []
+    for chunk_start in range(0, n, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, n)
+        chunk_n = chunk_end - chunk_start
+        chunk_row_offsets = seq_offsets[chunk_start:chunk_end]
+        abs_starts_c = chunk_row_offsets + ts_eff[chunk_start:chunk_end]
+        abs_ends_c = chunk_row_offsets + te_eff[chunk_start:chunk_end]
+        new_lens = (abs_ends_c - abs_starts_c).astype(np.int64, copy=False)
+        new_offsets = np.empty(chunk_n + 1, dtype=np.int64)
+        new_offsets[0] = 0
+        np.cumsum(new_lens, out=new_offsets[1:])
+        total_out = int(new_offsets[-1])
+        new_buf = np.empty(total_out, dtype=np.uint8)
+        for i in range(chunk_n):
+            a = int(abs_starts_c[i])
+            b = int(abs_ends_c[i])
+            if b > a:
+                new_buf[new_offsets[i] : new_offsets[i + 1]] = seq_buf[a:b]
+        chunks.append(
+            pa.LargeStringArray.from_buffers(
+                length=chunk_n,
+                value_offsets=pa.py_buffer(new_offsets.tobytes()),
+                data=pa.py_buffer(new_buf.tobytes()),
+                null_bitmap=None,
+                null_count=0,
+            )
+        )
+    return pa.chunked_array(chunks, type=pa.large_string())
+
+
 def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     """Phase 2 — group reads into transcript / isoform clusters.
 
@@ -1601,6 +1680,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     from collections import Counter
     from pathlib import Path
 
+    import numpy as np
     import pyarrow as pa
     import pyarrow.compute as pc
     import pyarrow.dataset as pa_dataset
@@ -1711,6 +1791,24 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     # so we leave NullProgress as a no-op placeholder.
     _ = StreamProgress() if args.progress else NullProgress()
 
+    # Stage-boundary timing logger. Under --progress we print
+    # `[cluster +Xs] msg` to stderr at every well-known checkpoint
+    # below + every K clusters inside cluster_by_fingerprint. Flushes
+    # immediately so a cluster job's stdout buffer doesn't hide
+    # progress when the wall time runs into hours. No-op when
+    # --progress is off.
+    import time as _time
+    _t0 = _time.perf_counter()
+    if args.progress:
+        def _log(msg: str) -> None:
+            elapsed = _time.perf_counter() - _t0
+            print(f"[cluster +{elapsed:8.1f}s] {msg}",
+                  file=sys.stderr, flush=True)
+    else:
+        def _log(msg: str) -> None:
+            return None
+    _log("start")
+
     # ── Resolve align-dir manifest for downstream provenance ─────────
     align_manifest = read_manifest_dir(align_dir)
     if align_manifest.kind != "align":
@@ -1782,21 +1880,40 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             f"demultiplex` to upgrade its schema"
         )
     samples = load_samples(samples_dir)
+    _log("resolved manifest + samples")
 
     # ── Materialise alignments + alignment_blocks ────────────────────
-    # Memory budget at 200M reads: ~30 GB alignments + ~25 GB blocks.
-    # Workstation-friendly for single-flowcell-shaped runs; streaming
-    # variant lifts in when crossing 1B alignments — the cluster_by_
-    # fingerprint surface stays the same.
-    alignments_table = pa_dataset.dataset(align_dir / "alignments").to_table()
+    # Project columns at scan time — cluster_by_fingerprint +
+    # compute_read_fingerprints don't need cigar_string / read_group /
+    # nm_tag / as_tag / mapq / flag / acquisition_id / ref_end /
+    # query_start / query_end. At PromethION scale dropping the wide
+    # string columns (cigar_string in particular) cuts the alignments
+    # load from ~30 GB to ~8 GB.
+    _alignments_cols = [
+        "alignment_id", "read_id", "ref_name", "ref_start", "strand",
+        "is_secondary", "is_supplementary",
+    ]
+    _blocks_cols = [
+        "alignment_id", "block_index", "ref_start", "ref_end",
+        "n_match", "n_mismatch", "n_insert", "n_delete",
+    ]
+    alignments_table = pa_dataset.dataset(
+        align_dir / "alignments"
+    ).to_table(columns=_alignments_cols)
+    _log(f"loaded alignments_table ({alignments_table.num_rows:,} rows)")
     blocks_table = pa_dataset.dataset(
         align_dir / "alignment_blocks"
-    ).to_table()
-    alignment_cs_table: pa.Table | None = None
+    ).to_table(columns=_blocks_cols)
+    _log(f"loaded blocks_table ({blocks_table.num_rows:,} rows)")
+    # alignment_cs is opened as a dataset (not eagerly materialised) when
+    # --build-consensus is on — the consensus path filters per-cluster
+    # rather than carrying the full cs:long column (~50 GB at full scale)
+    # through to every _emit_cluster call. See Fix 5 in the cluster
+    # refactor plan.
+    alignment_cs_dataset: pa_dataset.Dataset | None = None
     if args.build_consensus:
-        alignment_cs_table = pa_dataset.dataset(
-            align_dir / "alignment_cs"
-        ).to_table()
+        alignment_cs_dataset = pa_dataset.dataset(align_dir / "alignment_cs")
+        _log("opened alignment_cs dataset (lazy)")
 
     # Genome contig table for fingerprint derivation. When --build-
     # consensus is off we still need contig names → contig_ids, but
@@ -1818,8 +1935,11 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             }
         )
 
+    _log("built contigs_table")
+
     # ── Load introns.parquet; optionally re-cluster ─────────────────
     introns_table = pq.read_table(align_dir / "introns.parquet")
+    _log(f"loaded introns_table ({introns_table.num_rows:,} rows)")
 
     # When the user explicitly overrides --intron-tolerance-bp at
     # cluster time, re-run cluster_junctions against the raw per-position
@@ -1846,6 +1966,10 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             tolerance_bp=int(effective_tolerance),
             motif_priority=intron_motif_priority,
         )
+        _log(
+            f"re-clustered introns at tolerance_bp={effective_tolerance} "
+            f"({introns_table.num_rows:,} rows)"
+        )
     if effective_tolerance is None:
         effective_tolerance = (
             int(align_tolerance) if align_tolerance is not None else 5
@@ -1853,47 +1977,64 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
 
     # ── Derive fingerprints fresh against the (possibly re-clustered)
     # INTRON_TABLE ───────────────────────────────────────────────────
+    _log("compute_read_fingerprints: start")
     fingerprints_table = compute_read_fingerprints(
         blocks_table,
         alignments_table,
         contigs_table,
         introns_table,
     )
+    _log(
+        f"compute_read_fingerprints: done "
+        f"({fingerprints_table.num_rows:,} fingerprints)"
+    )
 
     # ── Pull trimmed transcript-window sequences for clustered reads ─
-    fp_read_ids = set(fingerprints_table.column("read_id").to_pylist())
-    fp_read_id_array = pa.array(sorted(fp_read_ids))
+    # The fingerprints_table.column("read_id") ChunkedArray rides
+    # directly into the dataset filter — no to_pylist + set round-trip
+    # (which materialised ~7 GB of Python strings at PromethION scale).
+    fp_read_id_chunked = fingerprints_table.column("read_id")
 
     read_demux_columns = [
         "read_id", "transcript_start", "transcript_end", "sample_id",
         "transcript_segment_index",
     ]
     read_demux_filter = pc.is_in(
-        pa_dataset.field("read_id"), value_set=fp_read_id_array
+        pa_dataset.field("read_id"), value_set=fp_read_id_chunked
     )
+    _log("read_demux: scan start")
     read_demux = pa_dataset.dataset(demux_dir / "read_demux").to_table(
         columns=read_demux_columns,
         filter=read_demux_filter,
     )
+    _log(f"read_demux: scan done ({read_demux.num_rows:,} rows before dedup)")
     # One transcript window per read for clustering — pick the lowest
     # transcript_segment_index per read_id (chimera resolution downstream
-    # is out of scope for genome-guided clustering v1).
+    # is out of scope for genome-guided clustering v1). The dedup replaces
+    # the prior to_pylist + Python-set loop with a sort + numpy boundary
+    # scan on dict-encoded read_id indices: comparing int32 codes instead
+    # of strings cuts the dedup from a 30 GB Python-string Set to a
+    # ~1.6 GB int32 numpy array at PromethION scale.
     if read_demux.num_rows > 0:
-        # Sort, then dedup by read_id keeping first (lowest index).
         read_demux = read_demux.sort_by(
-            [("read_id", "ascending"), ("transcript_segment_index", "ascending")]
+            [
+                ("read_id", "ascending"),
+                ("transcript_segment_index", "ascending"),
+            ]
         )
-        # Keep first occurrence per read_id.
-        seen: set[str] = set()
-        keep_rows: list[int] = []
-        rid_col = read_demux.column("read_id").to_pylist()
-        for i, rid in enumerate(rid_col):
-            if rid in seen:
-                continue
-            seen.add(rid)
-            keep_rows.append(i)
-        if len(keep_rows) < read_demux.num_rows:
-            read_demux = read_demux.take(pa.array(keep_rows))
+        rid_col = read_demux.column("read_id")
+        rid_da = pc.dictionary_encode(rid_col)
+        if isinstance(rid_da, pa.ChunkedArray):
+            rid_da = rid_da.combine_chunks()
+        rid_idx = rid_da.indices.to_numpy(zero_copy_only=False)
+        n_rd = len(rid_idx)
+        is_first = np.empty(n_rd, dtype=bool)
+        is_first[0] = True
+        if n_rd > 1:
+            is_first[1:] = rid_idx[1:] != rid_idx[:-1]
+        if not bool(np.all(is_first)):
+            read_demux = read_demux.filter(pa.array(is_first))
+    _log(f"read_demux: dedup done ({read_demux.num_rows:,} rows after dedup)")
 
     reads_columns = ["read_id", "sequence"]
     reads_dataset = pa_dataset.dataset(demux_dir / "reads")
@@ -1901,24 +2042,44 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     if "dorado_quality" in reads_schema_names:
         reads_columns.append("dorado_quality")
     reads_filter = pc.is_in(
-        pa_dataset.field("read_id"), value_set=fp_read_id_array
+        pa_dataset.field("read_id"), value_set=fp_read_id_chunked
     )
+    _log("raw_reads: scan start")
     raw_reads = reads_dataset.to_table(
         columns=reads_columns, filter=reads_filter
     )
+    _log(f"raw_reads: scan done ({raw_reads.num_rows:,} rows)")
+    # Cast sequence to large_string defensively — at PromethION scale
+    # (~200M reads × ~500 bytes/window ≈ 100 GB) the column blows past
+    # Arrow's 2 GiB int32 string-offset limit when carried through
+    # joins / takes / combine_chunks downstream.
+    if (
+        raw_reads.num_rows > 0
+        and pa.types.is_string(raw_reads.schema.field("sequence").type)
+    ):
+        raw_reads = raw_reads.set_column(
+            raw_reads.schema.get_field_index("sequence"),
+            "sequence",
+            pc.cast(raw_reads.column("sequence"), pa.large_string()),
+        )
+        _log("raw_reads: sequence cast string → large_string")
 
     # Join + slice trimmed windows into a flat (read_id, sequence,
-    # dorado_quality) table for cluster_by_fingerprint.
+    # dorado_quality) table for cluster_by_fingerprint. The trim itself
+    # uses _trim_sequences_to_large_string (numpy buffer construction)
+    # to avoid the prior 4 × to_pylist + Python loop that materialised
+    # tens of GB of Python strings at PromethION scale.
     trimmed_table: pa.Table
     if raw_reads.num_rows == 0 or read_demux.num_rows == 0:
         trimmed_table = pa.table(
             {
                 "read_id": pa.array([], type=pa.string()),
-                "sequence": pa.array([], type=pa.string()),
+                "sequence": pa.array([], type=pa.large_string()),
                 "dorado_quality": pa.array([], type=pa.float32()),
             }
         )
     else:
+        _log("raw_reads ⨝ read_demux: join start")
         joined = raw_reads.join(
             read_demux.select(
                 ["read_id", "transcript_start", "transcript_end"]
@@ -1926,29 +2087,28 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             keys="read_id",
             join_type="inner",
         )
-        rid_list = joined.column("read_id").to_pylist()
-        seq_list = joined.column("sequence").to_pylist()
-        ts_list = joined.column("transcript_start").to_pylist()
-        te_list = joined.column("transcript_end").to_pylist()
-        trimmed_seqs: list[str] = []
-        for seq, ts, te in zip(seq_list, ts_list, te_list, strict=True):
-            if seq is None:
-                trimmed_seqs.append("")
-                continue
-            trimmed_seqs.append(seq[int(ts):int(te)])
-        if "dorado_quality" in joined.schema.names:
-            quality_list = joined.column("dorado_quality").to_pylist()
-        else:
-            quality_list = [None] * len(rid_list)
-        trimmed_table = pa.table(
-            {
-                "read_id": pa.array(rid_list, type=pa.string()),
-                "sequence": pa.array(trimmed_seqs, type=pa.string()),
-                "dorado_quality": pa.array(
-                    quality_list, type=pa.float32()
-                ),
-            }
+        _log(f"raw_reads ⨝ read_demux: join done ({joined.num_rows:,} rows)")
+        _log("trim: vectorized buffer construction start")
+        trimmed_seq = _trim_sequences_to_large_string(
+            joined.column("sequence"),
+            joined.column("transcript_start"),
+            joined.column("transcript_end"),
         )
+        _log("trim: done")
+        cols: dict[str, pa.Array | pa.ChunkedArray] = {
+            "read_id": joined.column("read_id"),
+            "sequence": trimmed_seq,
+        }
+        if "dorado_quality" in joined.schema.names:
+            cols["dorado_quality"] = pc.cast(
+                joined.column("dorado_quality"), pa.float32()
+            )
+        else:
+            cols["dorado_quality"] = pa.nulls(
+                joined.num_rows, type=pa.float32()
+            )
+        trimmed_table = pa.table(cols)
+    _log(f"trimmed_table built ({trimmed_table.num_rows:,} rows)")
 
     # ── read_to_sample for --per-sample-clusters ─────────────────────
     # 2-column Arrow table replaces the prior ~200M-entry Python dict
@@ -1960,14 +2120,18 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             pc.is_valid(read_demux.column("sample_id"))
         )
         read_to_sample_table = rd_valid.select(["read_id", "sample_id"])
+        _log(
+            f"read_to_sample built ({read_to_sample_table.num_rows:,} rows)"
+        )
 
     # ── Cluster ──────────────────────────────────────────────────────
+    _log("cluster_by_fingerprint: enter")
     clusters, membership = cluster_by_fingerprint(
         fingerprints_table,
         trimmed_table,
         alignments=alignments_table,
         alignment_blocks=blocks_table,
-        alignment_cs=alignment_cs_table,
+        alignment_cs=alignment_cs_dataset,
         genome=genome,
         read_to_sample=read_to_sample_table,
         max_5p_drift=int(args.max_5p_drift),
@@ -1977,11 +2141,18 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         drop_drift_filtered=bool(args.drop_drift_filtered),
         per_sample_clusters=bool(args.per_sample_clusters),
         cluster_id_seed=0,
+        consensus_threads=int(args.threads),
+        progress=_log if args.progress else None,
+    )
+    _log(
+        f"cluster_by_fingerprint: done "
+        f"({clusters.num_rows:,} clusters, {membership.num_rows:,} membership rows)"
     )
 
     # ── Write outputs ────────────────────────────────────────────────
     pq.write_table(clusters, output_dir / "clusters.parquet")
     pq.write_table(membership, output_dir / "cluster_membership.parquet")
+    _log("wrote clusters.parquet + cluster_membership.parquet")
 
     cluster_outputs: dict[str, str] = {
         "clusters": str(output_dir / "clusters.parquet"),
@@ -2009,6 +2180,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
                     continue
                 fh.write(f">cluster_{cid} representative={rep}\n{seq}\n")
         cluster_outputs["cluster_fa"] = str(fasta_path)
+        _log("wrote cluster.fa")
 
     # cluster_summary.tsv — size histogram + n_singletons + fraction.
     if args.write_summary:
@@ -2035,6 +2207,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             for size in sorted(size_hist.keys()):
                 fh.write(f"{size}\t{size_hist[size]}\n")
         cluster_outputs["cluster_summary_tsv"] = str(summary_path)
+        _log("wrote cluster_summary.tsv")
 
     # ── Manifest + _SUCCESS ──────────────────────────────────────────
     from constellation.sequencing.transcriptome.manifest import (

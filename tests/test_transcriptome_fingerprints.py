@@ -399,3 +399,83 @@ def test_read_with_unknown_junction_is_dropped() -> None:
     # Only rA emits a fingerprint; rB is dropped because its (5000, 6000)
     # junction has no INTRON_TABLE entry.
     assert out.column("read_id").to_pylist() == ["rA"]
+
+
+def test_mixed_single_and_multi_block_alignments() -> None:
+    """Vectorized junction derivation must handle the boundary where one
+    alignment's last block is followed by the next alignment's first block.
+
+    The numpy-shift logic in compute_read_fingerprints uses
+    ``same_alignment = aids[1:] == aids[:-1]`` to mask out junctions that
+    would otherwise span alignment boundaries. This test exercises that
+    mask by interleaving single-block + multi-block alignments.
+    """
+    al = _alignments(
+        [
+            _alignment(alignment_id=1, read_id="rSingle1"),
+            _alignment(alignment_id=2, read_id="rMulti"),
+            _alignment(alignment_id=3, read_id="rSingle2"),
+        ]
+    )
+    blocks = _blocks(
+        [
+            _block(alignment_id=1, block_index=0, ref_start=1000, ref_end=1500),
+            _block(alignment_id=2, block_index=0, ref_start=2000, ref_end=2100),
+            _block(alignment_id=2, block_index=1, ref_start=2300, ref_end=2400),
+            _block(alignment_id=3, block_index=0, ref_start=3000, ref_end=3500),
+        ]
+    )
+    introns = _introns_for(blocks, al)
+    out = compute_read_fingerprints(blocks, al, _contigs(), introns)
+    by_id = {r["read_id"]: r for r in out.to_pylist()}
+    # All three alignments emit fingerprints.
+    assert set(by_id.keys()) == {"rSingle1", "rMulti", "rSingle2"}
+    # Single-block alignments hash to the same value (same contig+strand,
+    # zero junctions) but the multi-block one differs.
+    assert by_id["rSingle1"]["fingerprint_hash"] == by_id["rSingle2"]["fingerprint_hash"]
+    assert by_id["rSingle1"]["fingerprint_hash"] != by_id["rMulti"]["fingerprint_hash"]
+    # Block counts honor each alignment's blocks (no cross-alignment leakage).
+    assert by_id["rSingle1"]["n_blocks"] == 1
+    assert by_id["rMulti"]["n_blocks"] == 2
+    assert by_id["rSingle2"]["n_blocks"] == 1
+    # Junction signatures: singles render as ".", multi as "donor-acceptor".
+    assert by_id["rSingle1"]["junction_signature"] == "chr1:."
+    assert by_id["rSingle2"]["junction_signature"] == "chr1:."
+    assert by_id["rMulti"]["junction_signature"] == "chr1:2100-2300"
+
+
+def test_hash_is_xxh64_of_canonical_bytes() -> None:
+    """Pin the hash construction to the documented byte layout:
+    ``contig_id (int64 LE) || strand (utf-8) || n_introns (uint32 LE) ||
+    intron_id_1 (int64 LE) || intron_id_2 (int64 LE) || ...``
+
+    Computed via xxh64 over that exact buffer. Locking the byte layout
+    means changes to the canonical representation are caught by this
+    regression rather than silently producing different cluster
+    assignments across versions.
+    """
+    import xxhash
+
+    al = _alignments(
+        [_alignment(alignment_id=1, read_id="rA", ref_start=1000, ref_end=1800)]
+    )
+    blocks = _blocks(
+        [
+            _block(alignment_id=1, block_index=0, ref_start=1000, ref_end=1100),
+            _block(alignment_id=1, block_index=1, ref_start=1600, ref_end=1800),
+        ]
+    )
+    introns = _introns_for(blocks, al)
+    # Find the single intron_id assigned by the tolerance=0 helper.
+    iid = int(introns.column("intron_id").to_pylist()[0])
+    out = compute_read_fingerprints(blocks, al, _contigs(), introns)
+    actual = int(out.column("fingerprint_hash").to_pylist()[0])
+    # Recompute the expected hash from the canonical byte layout.
+    contig_id = 1  # "chr1" → contig_id 1 per _contigs()
+    expected = xxhash.xxh64_intdigest(
+        contig_id.to_bytes(8, "little", signed=True)
+        + b"+"
+        + (1).to_bytes(4, "little", signed=False)
+        + iid.to_bytes(8, "little", signed=True)
+    )
+    assert actual == expected

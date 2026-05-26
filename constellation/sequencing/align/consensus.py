@@ -32,7 +32,9 @@ edlib NW alignment of the member to the centroid.
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import pyarrow as pa
 import torch
 
@@ -51,6 +53,13 @@ _BASE_TO_IDX = {
 _GAP = 4
 _AMB = 5
 _IDX_TO_BASE = "ACGT-"
+# Numpy-friendly base-code lookup: index → ASCII byte. Used by the
+# vectorized consensus_chars assembly. Position 5 (_AMB) maps to a
+# sentinel that we filter out before joining.
+_IDX_TO_BASE_NP = np.array(
+    [ord("A"), ord("C"), ord("G"), ord("T"), ord("-"), ord("?")],
+    dtype=np.uint8,
+)
 
 
 # Reuse the cs grammar from align/cigar.py — kept as a private module-
@@ -159,6 +168,8 @@ def build_consensus(
     reference_sequence: str,
     reference_start: int,
     min_depth: float = 1.0,
+    threads: int = 1,
+    scatter_chunk_size: int = 100_000,
 ) -> str:
     """Build a per-position weighted-majority-vote consensus.
 
@@ -192,6 +203,21 @@ def build_consensus(
         consensus emits the reference base at those positions as a
         fallback (preserves window length when the cluster doesn't
         cover certain positions). Default 1.0.
+    threads
+        Number of worker threads for parallel cs:long parsing. ``1``
+        (default) runs the parser inline on the calling thread, which
+        is what every existing call site + every test exercises.
+        ``threads>1`` dispatches ``_cs_votes`` calls across a
+        ``ThreadPoolExecutor`` — Python's regex module releases the
+        GIL during match execution, so this scales near-linearly on
+        cs:long-bound clusters (mega-clusters with millions of members).
+        Output is deterministic regardless of ``threads`` because
+        ``index_add_`` is commutative.
+    scatter_chunk_size
+        Per-chunk member count for the batched torch ``index_add_``
+        accumulation. Bounds peak intermediate tensor size to roughly
+        ``chunk_size × avg_votes_per_member × 16 bytes``. Default
+        100K members ≈ ~200 MB intermediate at typical cs:long density.
 
     Returns
     -------
@@ -232,51 +258,147 @@ def build_consensus(
     window_start = int(reference_start)
     window_end = window_start + L
 
+    # ── Singleton-consensus fast path ────────────────────────
+    # With a single member there's no PWM voting — only one vote per
+    # position. The per-position loop that argmax-derives the winner
+    # from an (L, 5) tensor is pure overhead at this cardinality.
+    # We can apply the member's cs:long edits directly to the
+    # reference window (mismatches → query base, deletions → drop) in
+    # a single numpy pass, which eats the L × .item() torch element-
+    # access cost that dominated the slow path for tiny clusters.
+    # The contract still respects min_depth: with a single member of
+    # weight w, positions with no vote stay at the reference base when
+    # w < min_depth (default 1.0 ⇒ no fallback for weight 1.0).
+    if n_members == 1:
+        aid = int(member_alignment_ids[0])
+        weight = float(member_weights[0])
+        cs = cs_by_aid.get(aid)
+        ref_idx_np = np.frombuffer(
+            reference_sequence.encode("ascii"), dtype=np.uint8
+        ).copy()
+        # Map ascii → base index via a 256-entry lookup table.
+        ascii_to_idx = np.full(256, _AMB, dtype=np.int8)
+        for ch, code in _BASE_TO_IDX.items():
+            ascii_to_idx[ord(ch)] = code
+        winner_np = ascii_to_idx[ref_idx_np].astype(np.int64)
+        # Drop positions with ambiguous reference bases (matches the
+        # old loop which `continue`d on _AMB before appending).
+        keep_mask_np = winner_np != _AMB
+        if cs is not None and cs:
+            idx_list, base_list = _cs_votes(
+                cs,
+                alignment_ref_start=int(member_ref_starts[0]),
+                window_start=window_start,
+                window_end=window_end,
+                reference_sequence=reference_sequence,
+            )
+            if idx_list and weight >= float(min_depth):
+                idx_np = np.asarray(idx_list, dtype=np.int64)
+                base_np = np.asarray(base_list, dtype=np.int64)
+                # Overwrite the winner at each voted position.
+                winner_np[idx_np] = base_np
+                # Re-evaluate keep_mask: drop _GAP and _AMB winners.
+                keep_mask_np = (winner_np != _GAP) & (winner_np != _AMB)
+        # Vectorized base-char assembly.
+        winner_kept = winner_np[keep_mask_np]
+        out_bytes = _IDX_TO_BASE_NP[winner_kept]
+        return out_bytes.tobytes().decode("ascii")
+
     pwm = torch.zeros((L, 5), dtype=torch.float64)
     flat_pwm = pwm.view(-1)
 
-    for aid, weight, aln_ref_start in zip(
-        member_alignment_ids, member_weights, member_ref_starts, strict=True
-    ):
+    # Per-member worker — closes over the per-call window_start /
+    # window_end / reference_sequence so the parser doesn't re-read
+    # them from outer scope. Returns the parallel (indices, bases,
+    # weight) triple; main thread does the flat-tensor accumulation
+    # so the actual torch scatter stays serial (cheap once batched).
+    def _parse_one(triple: tuple[int, float, int]) -> tuple[list[int], list[int], float] | None:
+        aid, w, aln_ref_start = triple
         cs = cs_by_aid.get(int(aid))
         if cs is None:
-            continue
-        indices, bases = _cs_votes(
+            return None
+        idx, b = _cs_votes(
             cs,
             alignment_ref_start=int(aln_ref_start),
             window_start=window_start,
             window_end=window_end,
             reference_sequence=reference_sequence,
         )
-        if not indices:
-            continue
-        flat_idx = torch.tensor(
-            [i * 5 + b for i, b in zip(indices, bases, strict=True)],
-            dtype=torch.long,
+        if not idx:
+            return None
+        return idx, b, float(w)
+
+    triples = list(
+        zip(
+            member_alignment_ids,
+            member_weights,
+            member_ref_starts,
+            strict=True,
         )
-        weights = torch.full(
-            (len(flat_idx),), float(weight), dtype=torch.float64
+    )
+
+    # Chunked batched scatter — replaces the prior 1-scatter-per-member
+    # loop. Per-chunk Python list accumulation + 1 index_add_ per chunk
+    # cuts torch kernel launch overhead from O(N_members) to
+    # O(N_members / chunk_size). At chunk_size=100K that's ~22 scatter
+    # calls for a 2.15M-member mega-cluster instead of 2.15M.
+    executor: ThreadPoolExecutor | None = None
+    if threads > 1 and n_members > 1:
+        executor = ThreadPoolExecutor(
+            max_workers=min(int(threads), n_members)
         )
-        flat_pwm.index_add_(0, flat_idx, weights)
+
+    try:
+        for chunk_start in range(0, n_members, scatter_chunk_size):
+            chunk_end = min(chunk_start + scatter_chunk_size, n_members)
+            chunk = triples[chunk_start:chunk_end]
+            if executor is not None:
+                results = list(executor.map(_parse_one, chunk))
+            else:
+                results = [_parse_one(t) for t in chunk]
+            chunk_flat_idx: list[int] = []
+            chunk_weights: list[float] = []
+            for r in results:
+                if r is None:
+                    continue
+                idx, b, w = r
+                chunk_flat_idx.extend(
+                    i * 5 + bb for i, bb in zip(idx, b, strict=True)
+                )
+                chunk_weights.extend([w] * len(idx))
+            if chunk_flat_idx:
+                idx_t = torch.tensor(chunk_flat_idx, dtype=torch.long)
+                w_t = torch.tensor(chunk_weights, dtype=torch.float64)
+                flat_pwm.index_add_(0, idx_t, w_t)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     # Per-position winner. Positions with no votes ('row_max == 0') fall
     # back to the reference base (preserves window length when the
-    # cluster doesn't cover a region).
+    # cluster doesn't cover a region). Vectorized to avoid the O(L)
+    # `.item()` + Python list-append loop that dominated wall time for
+    # long-gene windows — at L=1 Mbp the prior Python loop was ~1 sec
+    # per cluster vs ~ms here.
     row_max, best = pwm.max(dim=1)
-    consensus_chars: list[str] = []
-    for p in range(L):
-        if float(row_max[p].item()) < float(min_depth):
-            ref_base = reference_sequence[p]
-            ref_base_idx = _BASE_TO_IDX.get(ref_base, _AMB)
-            if ref_base_idx == _AMB:
-                continue
-            consensus_chars.append(_IDX_TO_BASE[ref_base_idx])
-            continue
-        winner = int(best[p].item())
-        if winner == _GAP:
-            continue
-        consensus_chars.append(_IDX_TO_BASE[winner])
-    return "".join(consensus_chars)
+    row_max_np = row_max.numpy()
+    best_np = best.numpy().astype(np.int64, copy=False)
+    # Reference base codes per position via a 256-entry ASCII lookup.
+    ref_idx_np = np.frombuffer(
+        reference_sequence.encode("ascii"), dtype=np.uint8
+    ).copy()
+    ascii_to_idx = np.full(256, _AMB, dtype=np.int8)
+    for ch, code in _BASE_TO_IDX.items():
+        ascii_to_idx[ord(ch)] = code
+    ref_base_idx_np = ascii_to_idx[ref_idx_np].astype(np.int64)
+    # Winner = ref base when row_max < min_depth, else PWM argmax.
+    below_depth = row_max_np < float(min_depth)
+    winner_np = np.where(below_depth, ref_base_idx_np, best_np)
+    # Drop positions with _GAP (consensus omits gap-winning columns)
+    # or _AMB (ambiguous reference base on a fallback position).
+    keep_mask_np = (winner_np != _GAP) & (winner_np != _AMB)
+    out_bytes = _IDX_TO_BASE_NP[winner_np[keep_mask_np]]
+    return out_bytes.tobytes().decode("ascii")
 
 
 __all__ = [
