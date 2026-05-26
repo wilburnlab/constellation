@@ -621,6 +621,26 @@ export class TrackSettingsPanel {
       mapqRow.appendChild(filterHint('changing this triggers a refetch'));
       section.appendChild(mapqRow);
     } else if (kind === 'cluster_pileup') {
+      // Cluster view: only surfaced when the upstream align dir is
+      // resolvable from the cluster source's manifest (kernel reports
+      // `cluster_view_supported`). When unavailable (legacy outputs,
+      // de-novo clusters without genome alignments), the toggle is
+      // hidden and the track stays in cluster-rectangle view.
+      if (this.opts.meta.cluster_view_supported === true) {
+        const clusterViewRow = this.selectFilterRow(
+          'Cluster view',
+          'cluster_view',
+          'clusters',
+          [
+            { value: 'clusters', label: 'Clusters' },
+            { value: 'members', label: 'Member reads' },
+          ],
+        );
+        clusterViewRow.appendChild(
+          filterHint('changing this triggers a refetch'),
+        );
+        section.appendChild(clusterViewRow);
+      }
       const modes = stringList(this.opts.meta.modes);
       if (modes.length === 0) modes.push('genome-guided', 'de-novo');
       section.appendChild(
@@ -739,6 +759,23 @@ export class TrackSettingsPanel {
       (value) => {
         this.style[key] = value;
         this.opts.onStyleChange(this.style);
+      },
+    );
+  }
+
+  private selectFilterRow(
+    label: string,
+    key: string,
+    fallback: string,
+    options: Array<{ value: string; label: string }>,
+  ): HTMLElement {
+    return selectRow(
+      label,
+      this.getString(this.filter, key, fallback),
+      options,
+      (value) => {
+        this.filter[key] = value;
+        this.opts.onFilterChange(this.filter);
       },
     );
   }

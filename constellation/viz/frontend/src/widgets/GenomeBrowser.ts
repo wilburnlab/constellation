@@ -50,9 +50,14 @@ import './GenomeBrowser.css';
  *  Everything else (palette overrides, visible-strands allowlist, etc.)
  *  is satisfied off the cached Arrow table via restyleTrack().
  *
- *  Currently: `min_mapq` only. Future additions land here (e.g. PR 5
- *  will add `cluster_view`). */
-const PUSHDOWN_FILTER_KEYS: ReadonlySet<string> = new Set(['min_mapq']);
+ *  - `min_mapq` (PR 4) — read_pileup MAPQ filter.
+ *  - `cluster_view` (PR 5) — cluster_pileup switch between cluster
+ *    rectangles and per-member-read expansion; the schema actually
+ *    differs between views so a refetch is mandatory. */
+const PUSHDOWN_FILTER_KEYS: ReadonlySet<string> = new Set([
+  'min_mapq',
+  'cluster_view',
+]);
 
 interface ContigInfo {
   contig_id: number;
@@ -1359,6 +1364,7 @@ export class GenomeBrowser {
 
       try {
         const minMapq = readNumberFilter(track.filter, 'min_mapq');
+        const clusterView = readStringFilter(track.filter, 'cluster_view');
         const { table, mode } = await fetchTrackData(
           track.entry.kind,
           {
@@ -1369,6 +1375,10 @@ export class GenomeBrowser {
             end: locus.end,
             viewport_px: widthPx,
             min_mapq: minMapq > 0 ? minMapq : undefined,
+            cluster_view:
+              clusterView === 'clusters' || clusterView === 'members'
+                ? clusterView
+                : undefined,
           },
           track.cancel.signal,
         );
@@ -1655,4 +1665,14 @@ function readNumberFilter(
     if (Number.isFinite(parsed)) return parsed;
   }
   return 0;
+}
+
+
+/** Coerce a filter dict value to a string, defaulting to ''. */
+function readStringFilter(
+  filter: Record<string, unknown>,
+  key: string,
+): string {
+  const v = filter[key];
+  return typeof v === 'string' ? v : '';
 }

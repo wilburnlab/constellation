@@ -43,7 +43,10 @@ from constellation.viz.tracks.base import (
     get_kernel,
 )
 from _viz_fixtures import DEFAULT_ASSEMBLY, DEFAULT_HANDLE, install_fake_reference
-from constellation.viz.tracks.cluster_pileup import CLUSTER_PILEUP_VECTOR_SCHEMA
+from constellation.viz.tracks.cluster_pileup import (
+    CLUSTER_MEMBER_VECTOR_SCHEMA,
+    CLUSTER_PILEUP_VECTOR_SCHEMA,
+)
 from constellation.viz.tracks.gene_annotation import (
     GENE_ANNOTATION_VECTOR_SCHEMA,
 )
@@ -172,12 +175,20 @@ def _make_session(
             candidate = cluster_dir / rel
             if candidate.exists():
                 outputs[slot] = str(candidate)
+        # Point align_dir at the sibling S2_align dir when it exists —
+        # the cluster source resolves its alignment-related slots
+        # (alignments / alignment_blocks / alignment_cs / read_samples)
+        # from there at Session load time, which is what the
+        # cluster_pileup `members` view needs.
+        align_dir_for_cluster = (
+            str(align_dir) if align_dir.is_dir() else ""
+        )
         write_cluster_manifest(
             cluster_dir / "manifest.json",
             reference_handle=DEFAULT_HANDLE,
             reference_path=str(release_dir),
             assembly_accession=DEFAULT_ASSEMBLY,
-            align_dir="",
+            align_dir=align_dir_for_cluster,
             demux_dir="",
             parameters={},
             stages={},
@@ -1271,6 +1282,247 @@ def test_cluster_pileup_vector_emits_packed_rows(
     assert rows[1]["row"] == 0
     assert rows[2]["row"] == 1
     assert rows[3]["row"] == 0
+
+
+# ----------------------------------------------------------------------
+# Cluster pileup — members view (PR 5)
+# ----------------------------------------------------------------------
+
+
+def _membership(**kwargs) -> dict:
+    """Row builder for CLUSTER_MEMBERSHIP_TABLE."""
+    base = {
+        "cluster_id": 1,
+        "read_id": "r0",
+        "role": "representative",
+        "drift_5p_bp": None,
+        "drift_3p_bp": None,
+        "match_rate": None,
+        "indel_rate": None,
+        "n_aligned_bp": 100,
+    }
+    base.update(kwargs)
+    return base
+
+
+def _write_cluster_membership(cluster_dir: Path, rows: list[dict]) -> None:
+    cluster_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=CLUSTER_MEMBERSHIP_TABLE),
+        cluster_dir / "cluster_membership.parquet",
+    )
+
+
+def _write_cluster_table(cluster_dir: Path, rows: list[dict]) -> None:
+    cluster_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=TRANSCRIPT_CLUSTER_TABLE),
+        cluster_dir / "clusters.parquet",
+    )
+
+
+def _setup_cluster_members_session(
+    tmp_path: Path, monkeypatch
+):
+    """Build an S2_align + S2_cluster pair where the cluster source's
+    align_dir points at S2_align, enabling the members-view code path."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    # Two clusters spanning the same window, with three member reads
+    # each — six alignments total.
+    align_alignments = [
+        _alignment(alignment_id=1, read_id="rA", ref_start=0, ref_end=100),
+        _alignment(alignment_id=2, read_id="rB", ref_start=20, ref_end=120),
+        _alignment(alignment_id=3, read_id="rC", ref_start=40, ref_end=140),
+        _alignment(alignment_id=4, read_id="rD", ref_start=200, ref_end=300),
+        _alignment(alignment_id=5, read_id="rE", ref_start=220, ref_end=320),
+        _alignment(alignment_id=6, read_id="rF", ref_start=240, ref_end=340),
+    ]
+    _write_read_pileup_inputs(root / "S2_align", align_alignments)
+
+    _write_cluster_table(
+        root / "S2_cluster",
+        [
+            _cluster(cluster_id=1, span_start=0, span_end=140, n_reads=3),
+            _cluster(cluster_id=2, span_start=200, span_end=340, n_reads=3),
+        ],
+    )
+    _write_cluster_membership(
+        root / "S2_cluster",
+        [
+            _membership(cluster_id=1, read_id="rA", role="representative"),
+            _membership(cluster_id=1, read_id="rB", role="member"),
+            _membership(cluster_id=1, read_id="rC", role="member"),
+            _membership(cluster_id=2, read_id="rD", role="representative"),
+            _membership(cluster_id=2, read_id="rE", role="member"),
+            _membership(cluster_id=2, read_id="rF", role="drift_filtered"),
+        ],
+    )
+    return _make_session(monkeypatch, tmp_path, root)
+
+
+def test_cluster_pileup_members_emits_per_alignment_rows(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`cluster_view=members` expands each cluster into its member
+    alignments, joined via cluster_membership. One row per member;
+    cluster_id rides with each row so the renderer can color by it."""
+    session = _setup_cluster_members_session(tmp_path, monkeypatch)
+    kernel = get_kernel("cluster_pileup")
+    [binding] = kernel.discover(session)
+    query = TrackQuery(
+        contig="chr1",
+        start=0,
+        end=400,
+        viewport_px=1200,
+        mode_extra={"cluster_view": "members"},
+    )
+    mode = kernel.threshold(binding, query)
+    assert mode is ThresholdDecision.VECTOR
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, mode)),
+        schema=CLUSTER_MEMBER_VECTOR_SCHEMA,
+    )
+    rows = table.to_pylist()
+    # 3 alignments per cluster, 2 clusters → 6 member rows.
+    assert table.num_rows == 6
+    by_alignment = {row["alignment_id"]: row for row in rows}
+    # Member-to-cluster mapping is intact.
+    assert by_alignment[1]["cluster_id"] == 1
+    assert by_alignment[4]["cluster_id"] == 2
+    # Role column travels through unchanged.
+    assert by_alignment[1]["role"] == "representative"
+    assert by_alignment[6]["role"] == "drift_filtered"
+    # Blocks list is populated (synthetic single-block fallback per
+    # PR 2's defaults — every alignment has at least one block row).
+    assert len(by_alignment[1]["blocks"]) >= 1
+
+
+def test_cluster_pileup_members_uses_member_schema(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The kernel's `schema_for` returns CLUSTER_MEMBER_VECTOR_SCHEMA
+    when cluster_view is 'members' — the endpoint passes this to the
+    IPC writer so the wire shape matches the emitted batches."""
+    session = _setup_cluster_members_session(tmp_path, monkeypatch)
+    kernel = get_kernel("cluster_pileup")
+    [binding] = kernel.discover(session)
+    members_query = TrackQuery(
+        contig="chr1",
+        start=0,
+        end=400,
+        viewport_px=1200,
+        mode_extra={"cluster_view": "members"},
+    )
+    clusters_query = TrackQuery(
+        contig="chr1", start=0, end=400, viewport_px=1200
+    )
+    assert (
+        kernel.schema_for(members_query, ThresholdDecision.VECTOR)
+        == CLUSTER_MEMBER_VECTOR_SCHEMA
+    )
+    assert (
+        kernel.schema_for(clusters_query, ThresholdDecision.VECTOR)
+        == CLUSTER_PILEUP_VECTOR_SCHEMA
+    )
+
+
+def test_cluster_pileup_metadata_reports_member_view_supported(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When the cluster source resolves alignment slots from its
+    align_dir, metadata's `cluster_view_supported` is True. The
+    dashboard uses this flag to decide whether to show the toggle."""
+    session = _setup_cluster_members_session(tmp_path, monkeypatch)
+    kernel = get_kernel("cluster_pileup")
+    [binding] = kernel.discover(session)
+    meta = kernel.metadata(binding)
+    assert meta["cluster_view_supported"] is True
+
+
+def test_cluster_pileup_members_view_unsupported_without_align_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When the cluster source has no align_dir back-pointer (or one
+    that doesn't resolve), the alignment slots stay None;
+    cluster_view_supported is False and a members-view fetch returns
+    no rows (defense in depth — the dashboard would already have hid
+    the toggle)."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    # No S2_align — only a cluster source.
+    _write_cluster_table(
+        root / "S2_cluster",
+        [_cluster(cluster_id=1, span_start=0, span_end=100, n_reads=1)],
+    )
+    _write_cluster_membership(
+        root / "S2_cluster",
+        [_membership(cluster_id=1, read_id="rA", role="representative")],
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("cluster_pileup")
+    [binding] = kernel.discover(session)
+    meta = kernel.metadata(binding)
+    assert meta["cluster_view_supported"] is False
+    # A members-view fetch defends against an unsupported call.
+    query = TrackQuery(
+        contig="chr1",
+        start=0,
+        end=400,
+        viewport_px=1200,
+        mode_extra={"cluster_view": "members"},
+    )
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
+        schema=CLUSTER_MEMBER_VECTOR_SCHEMA,
+    )
+    assert table.num_rows == 0
+
+
+def test_cluster_pileup_members_min_mapq_pushdown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The MAPQ pushdown from PR 4 applies in members view too — same
+    contract as read_pileup, so users can dial out low-quality member
+    alignments when assessing cluster quality."""
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    _write_read_pileup_inputs(
+        root / "S2_align",
+        [
+            _alignment(alignment_id=1, read_id="rA", ref_start=0, ref_end=100, mapq=60),
+            _alignment(alignment_id=2, read_id="rB", ref_start=10, ref_end=110, mapq=5),
+        ],
+    )
+    _write_cluster_table(
+        root / "S2_cluster",
+        [_cluster(cluster_id=1, span_start=0, span_end=110, n_reads=2)],
+    )
+    _write_cluster_membership(
+        root / "S2_cluster",
+        [
+            _membership(cluster_id=1, read_id="rA", role="representative"),
+            _membership(cluster_id=1, read_id="rB", role="member"),
+        ],
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("cluster_pileup")
+    [binding] = kernel.discover(session)
+    query = TrackQuery(
+        contig="chr1",
+        start=0,
+        end=200,
+        viewport_px=1200,
+        min_mapq=20,
+        mode_extra={"cluster_view": "members"},
+    )
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
+        schema=CLUSTER_MEMBER_VECTOR_SCHEMA,
+    )
+    assert table.num_rows == 1
+    [row] = table.to_pylist()
+    assert row["alignment_id"] == 1
 
 
 # ----------------------------------------------------------------------
