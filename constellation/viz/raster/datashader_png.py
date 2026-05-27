@@ -80,12 +80,23 @@ def rasterize_segments(
     #
     #   x: [s1, e1, NaN, s2, e2, NaN, ...]
     #   y: [r1, r1, NaN, r2, r2, NaN, ...]
+    #
+    # Y-axis orientation: datashader uses mathematical convention (y
+    # increases upward, so y_range[0] is at the *bottom* of the image)
+    # but the genome-browser SVG renderer draws row 0 at the *top*
+    # (y=4) and the host mounts the PNG with normal top-left origin.
+    # We flip each row index here (`n_rows - 1 - r`) so that row 0
+    # lands at the top of the PNG too — same vertical layout in vector
+    # and hybrid modes. Without this flip, transitioning between the
+    # two modes visually mirrored the stack and the ordering looked
+    # like it was changing.
     n = len(starts)
     if not (n == len(ends) == len(rows)):
         raise ValueError("starts/ends/rows must have equal length")
+    flipped_rows = [int(n_rows) - 1 - int(r) for r in rows]
     xs: list[float] = []
     ys: list[float] = []
-    for s, e, r in zip(starts, ends, rows):
+    for s, e, r in zip(starts, ends, flipped_rows):
         xs.extend([float(s), float(e), float("nan")])
         ys.extend([float(r), float(r), float("nan")])
     df = pd.DataFrame({"x": xs, "y": ys})

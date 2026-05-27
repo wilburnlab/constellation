@@ -1572,3 +1572,46 @@ def test_rasterize_segments_empty_input_returns_blank_png() -> None:
         height_px=20,
     )
     assert png.startswith(b"\x89PNG")
+
+
+def test_rasterize_segments_row_0_lands_at_top() -> None:
+    """Datashader's mathematical Y convention (y_range[0] at the
+    bottom) clashes with SVG's top-origin convention. The rasterizer
+    flips row indices on input so row 0 ends up at the top of the
+    PNG, matching the vector renderer. Without that flip, vector and
+    hybrid views appear vertically mirrored."""
+    pytest.importorskip("datashader")
+    pytest.importorskip("PIL")
+    import io as _io
+    from PIL import Image
+    from constellation.viz.raster.datashader_png import rasterize_segments
+
+    # One segment at row 0, one at row 9 — two rows out of a ten-row
+    # stack. Use a tall, narrow image so each row is several pixels.
+    png = rasterize_segments(
+        starts=[0, 0],
+        ends=[100, 100],
+        rows=[0, 9],
+        x_range=(0, 100),
+        n_rows=10,
+        width_px=20,
+        height_px=200,
+    )
+    img = Image.open(_io.BytesIO(png)).convert("RGBA")
+    width, height = img.size
+    # Sample the alpha channel down a column at the image's center —
+    # which y offsets have ink? With the flip, row 0 lands at the top
+    # of the PNG (small y) and row 9 at the bottom (large y).
+    cx = width // 2
+    inked_ys = [
+        y for y in range(height) if img.getpixel((cx, y))[3] > 0
+    ]
+    assert inked_ys, "expected some pixels to be inked"
+    # Inked pixels split into two bands at top + bottom.
+    top_band = [y for y in inked_ys if y < height // 2]
+    bottom_band = [y for y in inked_ys if y >= height // 2]
+    assert top_band, (
+        "row 0 should land at the top half of the PNG (matching SVG "
+        "orientation); none found — Y-axis flip regressed"
+    )
+    assert bottom_band, "row 9 should land at the bottom half of the PNG"
