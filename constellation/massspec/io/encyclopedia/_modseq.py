@@ -41,19 +41,80 @@ from constellation.core.sequence.proforma import (
 # ──────────────────────────────────────────────────────────────────────
 
 # EncyclopeDIA modseq grammar (informal):
+#   - Optional leading mass-delta block(s) ``[+N.NNN]`` — N-terminal mods
+#     (unambiguously terminal because they precede any residue; EncyclopeDIA
+#     6.5.15's JChronologer pipeline emits these for the default
+#     ProteinNTermAcetyl=var case).
 #   - Bare uppercase residues
 #   - Mass-delta blocks ``[+N.NNN]`` or ``[-N.NNN]`` (signed) immediately
-#     follow the residue they decorate
-#   - No N-term-prefix-style mod blocks; everything is residue-attached
+#     follow the residue they decorate (residue-attached / side-chain mods)
+#
+# The ``[+N.NNN]X...`` (leading) vs ``X[+N.NNN]...`` (residue-attached at
+# position 0) split is the disambiguation EncyclopeDIA uses to distinguish
+# N-terminal α-amine acetylation from lysine ε-amine acetylation on the
+# first residue — see CLAUDE.md K[Acetyl]VERPD discussion.
 #
 # Examples (right column shows format_proforma() of the returned Peptidoform):
 #   PEPTIDE                            → "PEPTIDE"
-#   PEPC[+57.02146]TIDE                 → "PEPC[UNIMOD:4]TIDE" (Cam on C)
-#   K[+42.01057]VERPD                   → "[UNIMOD:1]-KVERPD"  (N-term Acetyl on A — see below)
-#   PEPK[+42.01057]TIDE                 → "PEPK[UNIMOD:1]TIDE" (K side-chain Ac)
-#   PEPS[+79.96633]TIDE                 → "PEPS[UNIMOD:21]TIDE" (Phospho on S)
+#   PEPC[+57.02146]TIDE                → "PEPC[UNIMOD:4]TIDE" (Cam on C)
+#   K[+42.01057]VERPD                  → "[UNIMOD:1]-KVERPD"  (N-term Acetyl on K via specificity promotion when K cannot host side-chain Ac alone — historical fallback)
+#   [+42.01057]KVERPD                  → "[UNIMOD:1]-KVERPD"  (N-term Acetyl — explicit leading-bracket form, 6.5.15)
+#   PEPK[+42.01057]TIDE                → "PEPK[UNIMOD:1]TIDE" (K side-chain Ac)
+#   PEPS[+79.96633]TIDE                → "PEPS[UNIMOD:21]TIDE" (Phospho on S)
 
 _RE_MOD_BLOCK = re.compile(r"\[([+-]?\d+(?:\.\d+)?)\]")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# UNIMOD lookup cache
+# ──────────────────────────────────────────────────────────────────────
+#
+# ``ModVocab.find_by_mass`` is an O(N) linear scan of all ~1560 UNIMOD
+# entries on every call. The modseq parser calls it once per
+# modification on every peptide; for a 5M-precursor EncyclopeDIA library
+# with ~1-3 mods per peptide that's ~10M lookups × 1560 entries =
+# ~15 billion comparisons → 50+ minutes of hang time in
+# ``read_encyclopedia(...)``'s auto-ingest path.
+#
+# The fix: cache results keyed on ``(id(vocab), rounded_mass,
+# rounded_tolerance)``. Typical libraries see ~50-100 distinct
+# modification masses, so a 4096-entry cap gives 99%+ hit rate.
+#
+# Cache key uses integer micro-Daltons (1e-6 Da granularity) to dodge
+# float-comparison subtleties; mass deltas in EncyclopeDIA's modseq
+# strings are emitted with 5-7 decimal precision, well within 1e-6 Da
+# resolution.
+
+_FIND_BY_MASS_CACHE: dict[tuple[int, int, int], tuple] = {}
+_CACHE_MAXSIZE = 4096
+
+
+def _cached_find_by_mass(
+    vocab: ModVocab, mass: float, tolerance_da: float
+) -> tuple:
+    """Memoized wrapper around ``vocab.find_by_mass``.
+
+    Safe for the modseq-parser use case because the parser never mutates
+    the vocab. Custom vocabs (different object identities) get their own
+    cache slots transparently via ``id(vocab)``.
+    """
+    key = (
+        id(vocab),
+        round(mass * 1_000_000),
+        round(tolerance_da * 1_000_000),
+    )
+    cached = _FIND_BY_MASS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = vocab.find_by_mass(mass, tolerance_da=tolerance_da)
+    if len(_FIND_BY_MASS_CACHE) < _CACHE_MAXSIZE:
+        _FIND_BY_MASS_CACHE[key] = result
+    return result
+
+
+def _clear_find_by_mass_cache() -> None:
+    """For tests + diagnostic scripts; not used during normal operation."""
+    _FIND_BY_MASS_CACHE.clear()
 
 
 def parse_encyclopedia_modseq(
@@ -89,9 +150,24 @@ def parse_encyclopedia_modseq(
     if not modseq:
         return Peptidoform(sequence="")
 
-    # Tokenize into (residue, mod_block_or_None) pairs.
-    tokens: list[tuple[str, str | None]] = []
+    n_term_mods: list[TaggedMod] = []
     i = 0
+
+    # ── Leading bracket(s): N-terminal modifications ───────────────────
+    # ``[+N.NNN]<residue>...`` — unambiguously N-terminal. Multiple
+    # leading brackets stack (rare but valid per the grammar).
+    while i < len(modseq) and modseq[i] == "[":
+        m = _RE_MOD_BLOCK.match(modseq, i)
+        if m is None:
+            raise ValueError(
+                f"malformed leading mod block at index {i} in {modseq!r}"
+            )
+        delta = float(m.group(1))
+        n_term_mods.append(_resolve_to_tagged_mod(delta, vocab, tolerance_da))
+        i = m.end()
+
+    # ── Residue-by-residue parse ───────────────────────────────────────
+    tokens: list[tuple[str, str | None]] = []
     while i < len(modseq):
         c = modseq[i]
         if c.isalpha() and c.isupper():
@@ -114,17 +190,19 @@ def parse_encyclopedia_modseq(
             )
 
     if not tokens:
-        return Peptidoform(sequence="")
+        # Only possible if the input was leading brackets with no residues
+        # after — that would be a malformed peptide. Treat as empty rather
+        # than raise; the writer/reader pipeline never produces this.
+        return Peptidoform(sequence="", n_term_mods=tuple(n_term_mods))
 
     sequence = "".join(r for r, _ in tokens)
-    n_term_mods: list[TaggedMod] = []
     residue_mods: dict[int, list[TaggedMod]] = {}
 
     for idx, (residue, mod_str) in enumerate(tokens):
         if mod_str is None:
             continue
         delta = float(mod_str)
-        matches = vocab.find_by_mass(delta, tolerance_da=tolerance_da)
+        matches = _cached_find_by_mass(vocab, delta, tolerance_da)
         chosen, place_terminal = _choose_modification(matches, residue, idx)
         if chosen is None:
             # Ambiguous or no match → pass through as a ProForma mass-delta.
@@ -146,6 +224,30 @@ def parse_encyclopedia_modseq(
         n_term_mods=tuple(n_term_mods),
         residue_mods={k: tuple(v) for k, v in residue_mods.items()},
     )
+
+
+def _resolve_to_tagged_mod(
+    delta: float, vocab: ModVocab, tolerance_da: float
+) -> TaggedMod:
+    """Resolve a mass delta to a ``TaggedMod`` for a known-terminal slot.
+
+    Leading-bracket N-term mods skip residue-side-chain disambiguation —
+    the bracket position itself establishes terminal placement. We still
+    consult the vocab to convert the mass to a UNIMOD accession when
+    unambiguous; unresolved deltas pass through as ProForma mass-deltas.
+    """
+    matches = _cached_find_by_mass(vocab, delta, tolerance_da)
+    # Prefer matches that have any N-terminal specificity — these are the
+    # chemically plausible interpretations of a leading-bracket mod.
+    n_term_matches = [m for m in matches if m.has_n_term_specificity]
+    if len(n_term_matches) == 1:
+        chosen = n_term_matches[0]
+        _, _, accession = chosen.id.partition(":")
+        return TaggedMod(
+            mod=ModRef(cv="UNIMOD", accession=accession, name=chosen.name)
+        )
+    # Zero or multiple candidates → ProForma mass-delta passthrough.
+    return TaggedMod(mod=ModRef(mass_delta=delta))
 
 
 def _choose_modification(matches, residue: str, position: int):
