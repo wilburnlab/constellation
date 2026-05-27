@@ -345,7 +345,7 @@ def test_read_reference_gene_map_gbff(tmp_path: Path) -> None:
 def test_read_reference_gene_map_unsupported_ext(tmp_path: Path) -> None:
     p = tmp_path / "bogus.txt"
     p.write_text("")
-    with pytest.raises(ValueError, match="unsupported annotation extension"):
+    with pytest.raises(ValueError, match="unsupported annotation path"):
         read_reference_gene_map(p)
 
 
@@ -558,3 +558,65 @@ def test_build_combined_fasta_swissprot_aligned_novel_gets_gene(tmp_path: Path) 
     assert "[gene=TETR2]" in sp_novel_lines[0]
     assert "[accession=P04483]" in sp_novel_lines[0]
     assert "[aligned_to=swissprot]" in sp_novel_lines[0]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# read_reference_gene_map — Constellation parquet bundle dispatch
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_read_reference_gene_map_dispatches_to_parquet(tmp_path: Path) -> None:
+    """A directory containing ``features.parquet`` + ``manifest.json``
+    is read via the Arrow path; the gene map matches what the GFF3
+    parser would produce against the same source."""
+    from constellation.sequencing.annotation.io import save_annotation
+    from constellation.sequencing.readers.gff import read_gff3
+
+    # Hand-built GFF3 with two protein-coding CDS records — one with a
+    # ``gene=`` tag, one without (skipped by the parser).
+    gff3 = tmp_path / "src.gff3"
+    gff3.write_text(
+        "##gff-version 3\n"
+        "chr1\trefseq\tgene\t1\t300\t.\t+\t.\tID=g1;Name=ACTB\n"
+        "chr1\trefseq\tmRNA\t1\t300\t.\t+\t.\tID=m1;Parent=g1\n"
+        "chr1\trefseq\tCDS\t1\t300\t.\t+\t0\tID=c1;Parent=m1;protein_id=NP_0001;gene=ACTB\n"
+        "chr2\trefseq\tgene\t1\t300\t.\t+\t.\tID=g2;Name=ORPHAN\n"
+        "chr2\trefseq\tmRNA\t1\t300\t.\t+\t.\tID=m2;Parent=g2\n"
+        "chr2\trefseq\tCDS\t1\t300\t.\t+\t0\tID=c2;Parent=m2;protein_id=NP_0002\n"
+    )
+    # GFF3 reader needs a contig-name → contig_id mapping (chr1/chr2 → 0/1)
+    # to build a valid Annotation; we supply a fake one since the gene-map
+    # extractor doesn't care about contig assignments.
+    annotation = read_gff3(gff3, contig_name_to_id={"chr1": 0, "chr2": 1})
+
+    annot_dir = tmp_path / "annotation"
+    save_annotation(annotation, annot_dir)
+    assert (annot_dir / "features.parquet").is_file()
+    assert (annot_dir / "manifest.json").is_file()
+
+    # Parquet-path gene map.
+    parquet_map = read_reference_gene_map(annot_dir)
+    assert parquet_map == {"NP_0001": "ACTB"}
+
+    # GFF3-path gene map for cross-check — same source, same result.
+    gff3_map = read_reference_gene_map(gff3)
+    assert gff3_map == parquet_map
+
+
+def test_read_reference_gene_map_rejects_unknown_path(tmp_path: Path) -> None:
+    """Bare file with no recognised suffix and not a parquet bundle → ValueError."""
+    weird = tmp_path / "annotation.dat"
+    weird.write_text("not a real annotation")
+    with pytest.raises(ValueError, match="unsupported annotation path"):
+        read_reference_gene_map(weird)
+
+
+def test_read_reference_gene_map_rejects_directory_without_features(
+    tmp_path: Path,
+) -> None:
+    """A directory without features.parquet is not a Constellation bundle;
+    falls through to the suffix dispatch which then fails."""
+    empty_dir = tmp_path / "no-bundle"
+    empty_dir.mkdir()
+    with pytest.raises(ValueError, match="unsupported annotation path"):
+        read_reference_gene_map(empty_dir)
