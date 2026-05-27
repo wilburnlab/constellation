@@ -1,11 +1,16 @@
 """mmseqs2 (k-mer clustering & search) — ToolSpec registration.
 
-Already conda-installed in the base environment (`environment.yml`).
-Used by :mod:`sequencing.transcriptome.cluster` for k-mer prefiltering
-ahead of consensus building. Future: also for protein-database search
-on the predicted-protein output that bridges to massspec.
+Primary install path is conda (bioconda — already in
+:file:`environment.yml`). The static-binary fallback at
+:file:`scripts/install-mmseqs2.sh` writes to
+``third_party/mmseqs2/<version>/bin/mmseqs`` for nodes without conda.
 
-Status: STUB.
+Consumed by:
+  * :mod:`sequencing.transcriptome.cluster` — k-mer prefiltering ahead
+    of consensus building (existing).
+  * :mod:`thirdparty.mmseqs2_run` — generic ``mmseqs easy-search``
+    subprocess runner used by the transcriptome-to-proteomics pipeline
+    for novel-vs-reference+swissprot alignment.
 """
 
 from __future__ import annotations
@@ -44,7 +49,7 @@ register(
         env_var="CONSTELLATION_MMSEQS2_HOME",
         artifact="bin/mmseqs",
         path_bin="mmseqs",
-        install_script=None,            # bioconda-provided
+        install_script="scripts/install-mmseqs2.sh",
         version_probe=_probe_version,
     )
 )

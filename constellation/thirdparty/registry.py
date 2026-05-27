@@ -38,7 +38,10 @@ class ToolSpec:
 
     - ``name``           — short tool identifier (``"encyclopedia"``, ``"thermo"``, ``"mmseqs2"``).
     - ``env_var``        — primary env-var override (``$CONSTELLATION_<NAME>_HOME``).
-    - ``artifact``       — path (relative to HOME) of the file/dir that "proves" a valid install.
+    - ``artifact``       — path(s) relative to HOME of the file/dir that "proves" a valid install.
+                           Accept a single string for the common case; pass a tuple of strings
+                           to declare multiple candidate filenames (e.g. across tool versions
+                           that renamed the jar — first existing candidate wins).
                            ``None`` means the HOME directory itself is the artifact.
     - ``path_bin``       — optional binary name to look up on ``$PATH`` if HOME resolution fails
                            (e.g. ``"mmseqs"`` for conda-installed mmseqs2).
@@ -50,7 +53,7 @@ class ToolSpec:
 
     name: str
     env_var: str
-    artifact: str | None = None
+    artifact: str | tuple[str, ...] | None = None
     path_bin: str | None = None
     install_script: str | None = None
     version_probe: Callable[[Path], str | None] | None = field(default=None, repr=False)
@@ -97,8 +100,18 @@ def _versioned_home(spec: ToolSpec) -> Path | None:
     return candidate.resolve()
 
 
-def _artifact_path(home: Path, spec: ToolSpec) -> Path:
-    return home / spec.artifact if spec.artifact else home
+def _artifact_paths(home: Path, spec: ToolSpec) -> list[Path]:
+    """Candidate artifact paths under ``home``.
+
+    Single-string ``artifact`` → one candidate; tuple → one candidate
+    per entry in declaration order (first existing wins). ``None``
+    means the HOME directory itself is the artifact.
+    """
+    if spec.artifact is None:
+        return [home]
+    if isinstance(spec.artifact, str):
+        return [home / spec.artifact]
+    return [home / a for a in spec.artifact]
 
 
 def _probe_version(spec: ToolSpec, path: Path) -> str | None:
@@ -119,16 +132,16 @@ def find(name: str) -> ToolHandle:
     # 1. env var
     home = _env_home(spec)
     if home is not None:
-        artifact = _artifact_path(home, spec)
-        if artifact.exists():
-            return ToolHandle(spec, artifact, "env", _probe_version(spec, artifact))
+        for artifact in _artifact_paths(home, spec):
+            if artifact.exists():
+                return ToolHandle(spec, artifact, "env", _probe_version(spec, artifact))
 
     # 2. versioned on-disk layout
     home = _versioned_home(spec)
     if home is not None:
-        artifact = _artifact_path(home, spec)
-        if artifact.exists():
-            return ToolHandle(spec, artifact, "versioned", _probe_version(spec, artifact))
+        for artifact in _artifact_paths(home, spec):
+            if artifact.exists():
+                return ToolHandle(spec, artifact, "versioned", _probe_version(spec, artifact))
 
     # 3. $PATH lookup (conda / system binaries)
     if spec.path_bin:
