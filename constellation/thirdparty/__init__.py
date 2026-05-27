@@ -18,4 +18,20 @@ from constellation.thirdparty.registry import (
     register,
 )
 
+# Eagerly import per-tool adapter modules so their ToolSpec
+# registrations fire on package import — otherwise the registry stays
+# empty until some downstream module happens to import a specific
+# adapter first, and `registered()` / `constellation doctor` see a
+# partial set depending on call-site ordering.
+from constellation.thirdparty import (  # noqa: F401  (import-for-side-effect)
+    busco,
+    dorado,
+    encyclopedia,
+    hifiasm,
+    minimap2,
+    mmseqs2,
+    ragtag,
+    samtools,
+)
+
 __all__ = ["ToolHandle", "ToolNotFoundError", "find", "register"]
