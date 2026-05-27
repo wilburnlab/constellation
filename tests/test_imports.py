@@ -133,6 +133,7 @@ import constellation.sequencing.align.locate
 import constellation.sequencing.align.map
 import constellation.sequencing.align.minimap2
 import constellation.sequencing.align.pairwise
+import constellation.sequencing.align.presets
 import constellation.sequencing.quant
 import constellation.sequencing.quant.genome_count
 import constellation.sequencing.transcriptome
