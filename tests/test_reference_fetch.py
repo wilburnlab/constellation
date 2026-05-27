@@ -48,6 +48,13 @@ chr2\ttest\texon\t1\t8\t.\t-\t.\tID=exon2;Parent=gene2
 """
 
 
+PROTEIN_FIXTURE = b""">NP_000001.1 protein gene1
+MKLVTLALCAVSLA
+>NP_000002.1 protein gene2
+ATCDEFGHIK
+"""
+
+
 @pytest.fixture
 def isolated_cache(tmp_path, monkeypatch):
     cache = tmp_path / "refs"
@@ -75,6 +82,12 @@ def stub_network(monkeypatch):
         "checksums_kind": "ensembl",
         "checksum_passes": True,
         "download_calls": [],
+        # When non-None, _ResolvedSpec carries this string as
+        # ``protein_url`` and _fake_download_to serves PROTEIN_FIXTURE
+        # for it. Set ``protein_returns_404`` to True to simulate a
+        # missing-protein-FASTA assembly via a raised HTTPError.
+        "protein_url": None,
+        "protein_returns_404": False,
     }
 
     def _fake_resolve_spec(spec, *, release=None, source=None):
@@ -88,11 +101,23 @@ def stub_network(monkeypatch):
             assembly_name=state["assembly_name"],
             annotation_release=state["annotation_release"],
             assembly_accession=state["assembly_accession"],
+            protein_url=state["protein_url"],
         )
 
     def _fake_download_to(url, dest, *, timeout=60):
         state["download_calls"].append(url)
-        if "gff" in url:
+        is_protein = (
+            state.get("protein_url") is not None and url == state["protein_url"]
+        )
+        if is_protein and state.get("protein_returns_404"):
+            import urllib.error
+
+            raise urllib.error.HTTPError(
+                url, 404, "Not Found", hdrs=None, fp=None
+            )
+        if is_protein:
+            payload = PROTEIN_FIXTURE
+        elif "gff" in url:
             payload = GFF3_FIXTURE
         else:
             payload = FASTA_FIXTURE
@@ -270,6 +295,115 @@ def test_crash_during_write_leaves_partial_that_next_fetch_cleans(
     assert result.cache_path is not None
     assert (organism_dir / "ensembl-111" / "meta.toml").exists()
     assert not partial.exists()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Protein FASTA fetching (Phase 2.5 — RefSeq protein.faa materialisation)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_fetch_omits_protein_when_url_absent(isolated_cache, stub_network):
+    """Backward-compat: when the resolver returns no protein_url, the
+    fetch result has no protein FASTA and the cache contains no
+    `protein.faa`. Mirrors today's Ensembl / unannotated-GenBank
+    behaviour."""
+    stub_network["protein_url"] = None
+    result = fetch_reference("ensembl:human")
+
+    assert result.protein_fasta_path is None
+    assert result.cache_path is not None
+    assert not (result.cache_path / "protein.faa").exists()
+    assert "protein" not in result.sources
+    # No protein URL was hit.
+    assert not any(
+        "protein" in url for url in stub_network["download_calls"]
+    )
+
+
+def test_fetch_writes_protein_fasta_when_url_present(isolated_cache, stub_network):
+    """When the resolver returns a protein_url, the protein FASTA is
+    downloaded, gunzipped, copied into the cache, recorded in meta.toml
+    (urls.protein + sha256.protein), and exposed via
+    FetchResult.protein_fasta_path."""
+    stub_network["protein_url"] = (
+        "https://test/foo_protein.faa.gz"
+    )
+    result = fetch_reference("refseq:GCF_000001405.40")
+
+    assert result.protein_fasta_path is not None
+    assert result.protein_fasta_path.is_file()
+    assert result.protein_fasta_path.name == "protein.faa"
+    assert result.protein_fasta_path == result.cache_path / "protein.faa"
+    # Bytes match the fixture (gunzipped).
+    assert result.protein_fasta_path.read_bytes() == PROTEIN_FIXTURE
+    assert result.sources["protein"] == "https://test/foo_protein.faa.gz"
+
+    # meta.toml provenance:
+    meta = tomllib.loads((result.cache_path / "meta.toml").read_text())
+    assert "protein" in meta["urls"]
+    assert meta["urls"]["protein"]["url"] == "https://test/foo_protein.faa.gz"
+    assert "protein" in meta["sha256"]
+    # sha256 is a 64-hex digest.
+    assert len(meta["sha256"]["protein"]) == 64
+    assert set(meta["sha256"]["protein"]).issubset("0123456789abcdef")
+
+
+def test_fetch_tolerates_protein_fasta_404(isolated_cache, stub_network, capsys):
+    """When the protein URL 404s, the genome + annotation fetch still
+    succeeds; protein_fasta_path is None and a warning is printed to
+    stderr. Covers the GenBank-only assembly without a published
+    protein FASTA path."""
+    stub_network["protein_url"] = "https://test/foo_protein.faa.gz"
+    stub_network["protein_returns_404"] = True
+    result = fetch_reference("refseq:GCF_000999999.1")
+
+    assert result.protein_fasta_path is None
+    assert result.cache_path is not None
+    assert not (result.cache_path / "protein.faa").exists()
+    # Genome + annotation still materialised.
+    assert result.genome is not None
+    assert result.annotation is not None
+
+    err = capsys.readouterr().err
+    assert "protein FASTA fetch failed" in err
+
+
+def test_fetch_cache_hit_exposes_protein_fasta_path(isolated_cache, stub_network):
+    """Second fetch hits the cache; protein_fasta_path is still
+    populated from the on-disk protein.faa."""
+    stub_network["protein_url"] = "https://test/foo_protein.faa.gz"
+    first = fetch_reference("refseq:GCF_000001405.40")
+    assert first.protein_fasta_path is not None
+    assert not first.skipped_cache
+
+    # Second call — no force, cache should short-circuit.
+    second = fetch_reference("refseq:GCF_000001405.40")
+    assert second.skipped_cache
+    assert second.protein_fasta_path == first.protein_fasta_path
+    assert second.protein_fasta_path.is_file()
+
+
+def test_fetch_cache_hit_without_protein_fasta_returns_none(
+    isolated_cache, stub_network
+):
+    """Backward-compat: when an existing cache slot was written before
+    protein FASTA fetching landed (no protein.faa on disk),
+    FetchResult.protein_fasta_path is None on cache-hit even if the
+    resolver now reports a protein_url. The cache stays valid; users
+    can re-fetch with force=True to supplement it."""
+    # First fetch with no protein URL → no protein.faa in cache.
+    stub_network["protein_url"] = None
+    first = fetch_reference("refseq:GCF_000001405.40")
+    assert first.protein_fasta_path is None
+    assert not first.skipped_cache
+
+    # Second call now claims a protein URL — but the cache is already
+    # "complete" by the genome+annotation criterion, so we short-circuit.
+    stub_network["protein_url"] = "https://test/foo_protein.faa.gz"
+    second = fetch_reference("refseq:GCF_000001405.40")
+    assert second.skipped_cache
+    assert second.protein_fasta_path is None
+    assert second.sources["protein"] == "https://test/foo_protein.faa.gz"
 
 
 # ──────────────────────────────────────────────────────────────────────
