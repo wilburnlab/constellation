@@ -289,6 +289,14 @@ def _build_parser() -> argparse.ArgumentParser:
     _build_taxonomy_parser(subs)
     _build_catalog_parser(subs)
 
+    # Mass-spectrometry workflows (EncyclopeDIA jar wrappers + the novel
+    # peptide classifier + DIA collision filter). Lazy import so the
+    # massspec parser dependencies (which currently are pure-stdlib +
+    # already-merged Constellation modules) don't slow `--help` for
+    # unrelated subcommands.
+    from constellation.massspec.cli import build_parser as _build_massspec_parser
+    _build_massspec_parser(subs)
+
     # Visualization subtree — `constellation viz genome --session DIR`.
     # The full `[viz]` extras (fastapi / uvicorn / datashader) are
     # only required when the user actually invokes a viz subcommand;

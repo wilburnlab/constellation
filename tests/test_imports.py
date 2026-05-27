@@ -68,6 +68,7 @@ import constellation.massspec.quant.quant
 import constellation.massspec.quant.schemas
 import constellation.massspec.readers
 import constellation.massspec.schemas
+import constellation.massspec.cli
 import constellation.massspec.search
 import constellation.massspec.search.collision
 import constellation.massspec.search.encyclopedia
