@@ -665,6 +665,73 @@ def _build_transcriptome_parser(subs) -> None:
             "which has its own splice operator."
         ),
     )
+    # minimap2 splice-mode tuning. The base splice flags (-ax splice -uf
+    # --cs=long --secondary=no) always apply; these add organism-aware
+    # caps + escape hatches on top. See
+    # constellation/sequencing/align/presets.py for the resolver.
+    p_aln.add_argument(
+        "--organism-profile",
+        choices=("compact_eukaryote", "intermediate_eukaryote", "animal"),
+        default=None,
+        help=(
+            "minimap2 splice-mode preset bundle. compact_eukaryote "
+            "(Pichia / yeast / fungi: -G 5000 -C 5), intermediate_eukaryote "
+            "(Drosophila / C. elegans / Arabidopsis: -G 50000 -C 5), "
+            "animal (mouse / human: -G 200000 -C 5). Default None leaves "
+            "minimap2's stock splice defaults in place — usually wrong "
+            "for anything but vertebrates."
+        ),
+    )
+    p_aln.add_argument(
+        "--max-intron-length",
+        type=int,
+        default=None,
+        help=(
+            "minimap2 -G override. Caps the maximum intron length the "
+            "splice DP will insert. Overrides the preset value when both "
+            "are supplied. Pichia: ~5000; yeast: ~3000; mammals: ~200000."
+        ),
+    )
+    p_aln.add_argument(
+        "--non-canonical-cost",
+        type=int,
+        default=None,
+        help=(
+            "minimap2 -C override. Score penalty for non-canonical splice "
+            "motifs. Default (preset) is 5; raise to disfavor cryptic "
+            "junctions more aggressively. 0 = no penalty (minimap2 stock)."
+        ),
+    )
+    p_aln.add_argument(
+        "--junc-bed",
+        type=str,
+        default=None,
+        help=(
+            "Path to a BED file of annotated junctions to hint minimap2. "
+            "Emits --junc-bed PATH; pairs with --junc-bonus to weight "
+            "annotated junctions over de novo discoveries."
+        ),
+    )
+    p_aln.add_argument(
+        "--junc-bonus",
+        type=int,
+        default=None,
+        help=(
+            "minimap2 --junc-bonus N. Score bonus for junctions matching "
+            "the --junc-bed file. Only meaningful with --junc-bed."
+        ),
+    )
+    p_aln.add_argument(
+        "--minimap2-extra",
+        type=str,
+        default=None,
+        help=(
+            "Raw minimap2 extra-args escape hatch (shlex-split). Use for "
+            "flags not exposed as kwargs (e.g. --splice-flank=no, -k 14). "
+            "Conflicts with the explicit kwarg-managed flags (-G, -C, "
+            "--junc-bed, --junc-bonus) raise an error."
+        ),
+    )
     p_aln.add_argument("--resume", action="store_true")
     p_aln.add_argument("--progress", action="store_true")
     p_aln.set_defaults(func=_cmd_transcriptome_align)
@@ -1162,7 +1229,10 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     import pyarrow.dataset as pa_dataset
     import pyarrow.parquet as pq
 
-    from constellation.sequencing.align.map import map_to_genome
+    import shlex
+
+    from constellation.sequencing.align.map import _GENOME_MODE_ARGS, map_to_genome
+    from constellation.sequencing.align.presets import resolve_minimap2_args
     from constellation.sequencing.annotation.io import load_annotation
     from constellation.sequencing.parallel import run_batched
     from constellation.sequencing.progress import (
@@ -1268,6 +1338,38 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     # archived after demux without breaking the align stage.
     bam_inputs = [Path(p) for p in demux_manifest.input_files]
 
+    # ── Resolve minimap2 arg list (preset + overrides + escape hatch) ──
+    # Always computed even on --resume so the manifest reflects the
+    # parameters the user requested *this* invocation. The resolved tuple
+    # is also written into the manifest for downstream reproducibility.
+    try:
+        minimap2_resolved_args = resolve_minimap2_args(
+            base_args=_GENOME_MODE_ARGS,
+            profile=args.organism_profile,
+            max_intron_length=args.max_intron_length,
+            non_canonical_cost=args.non_canonical_cost,
+            junc_bed=Path(args.junc_bed) if args.junc_bed else None,
+            junc_bonus=args.junc_bonus,
+            extra_args=(
+                tuple(shlex.split(args.minimap2_extra))
+                if args.minimap2_extra else ()
+            ),
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.organism_profile is None and args.max_intron_length is None:
+        print(
+            "WARNING: no --organism-profile or --max-intron-length set; "
+            "minimap2 will use its stock -G 200000 intron-length cap. "
+            "For compact genomes (e.g. Pichia, yeast, fungi) this lets "
+            "the splice DP collapse adjacent genes into one read with a "
+            "fictional 50-200 kb 'intron'. Pass `--organism-profile "
+            "compact_eukaryote` for sane defaults.",
+            file=sys.stderr,
+            flush=True,
+        )
+
     # ── Stage 1: align ───────────────────────────────────────────────
     bam_success = output_dir / "bam" / "_SUCCESS"
     aligned_bam = output_dir / "bam" / "aligned.bam"
@@ -1279,6 +1381,7 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             genome,
             output_dir=output_dir,
             threads=args.threads,
+            minimap2_args=minimap2_resolved_args,
             progress_cb=cb,
         )
         bam_success.parent.mkdir(parents=True, exist_ok=True)
@@ -1572,10 +1675,17 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             "min_intron_read_count": int(args.min_intron_read_count),
             "emit_cs_tags": bool(emit_cs),
             "intron_min_bp": int(args.intron_min_bp),
+            "organism_profile": args.organism_profile,
+            "max_intron_length": args.max_intron_length,
+            "non_canonical_cost": args.non_canonical_cost,
+            "junc_bed": args.junc_bed,
+            "junc_bonus": args.junc_bonus,
+            "minimap2_extra": args.minimap2_extra,
         },
         stages=per_stage,
         outputs=manifest_outputs,
         samples=sample_names,
+        minimap2_resolved_args=list(minimap2_resolved_args),
     )
     (output_dir / "_SUCCESS").write_bytes(b"")
 

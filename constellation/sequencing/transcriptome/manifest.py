@@ -117,6 +117,12 @@ class AlignManifest:
     stages: dict[str, Any]
     outputs: dict[str, str]
     samples: list[str] | None = None
+    # Final minimap2 argument tuple actually invoked, after preset +
+    # explicit-override + extra-args resolution. Captured so a manifest
+    # round-trips the exact command line a downstream consumer would
+    # need to reproduce the alignment. Backward-compatible default (None)
+    # — pre-existing manifests load as None without a schema bump.
+    minimap2_resolved_args: list[str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +186,7 @@ def write_align_manifest(
     stages: dict[str, Any],
     outputs: dict[str, str],
     samples: list[str] | None = None,
+    minimap2_resolved_args: list[str] | None = None,
     created_at: str | None = None,
 ) -> AlignManifest:
     """Write an align-stage manifest to ``path`` and return the dataclass."""
@@ -196,6 +203,7 @@ def write_align_manifest(
         stages=stages,
         outputs=outputs,
         samples=samples,
+        minimap2_resolved_args=minimap2_resolved_args,
     )
     path.write_text(json.dumps(asdict(manifest), indent=2) + "\n", encoding="utf-8")
     return manifest
@@ -264,6 +272,7 @@ def read_manifest(path: Path) -> DemuxManifest | AlignManifest | ClusterManifest
             outputs=dict(raw.get("outputs", {})),
         )
     if kind == "align":
+        resolved_args_raw = raw.get("minimap2_resolved_args")
         return AlignManifest(
             schema_version=schema_version,
             kind="align",
@@ -277,6 +286,11 @@ def read_manifest(path: Path) -> DemuxManifest | AlignManifest | ClusterManifest
             stages=dict(raw.get("stages", {})),
             outputs=dict(raw.get("outputs", {})),
             samples=raw.get("samples"),
+            minimap2_resolved_args=(
+                [str(a) for a in resolved_args_raw]
+                if resolved_args_raw is not None
+                else None
+            ),
         )
     if kind == "cluster":
         return ClusterManifest(
