@@ -891,6 +891,17 @@ def _build_transcriptome_parser(subs) -> None:
         ),
     )
     p_cluster.add_argument("--threads", type=int, default=1)
+    p_cluster.add_argument(
+        "--report",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "auto-emit a diagnostic report (report.md + figures/*.svg) "
+            "under <output-dir>/diagnostics/ after clustering. Pass "
+            "--no-report to skip. Report failures are logged but never "
+            "break a successful cluster run."
+        ),
+    )
     p_cluster.add_argument("--resume", action="store_true")
     p_cluster.add_argument("--progress", action="store_true")
     p_cluster.set_defaults(func=_cmd_transcriptome_cluster)
@@ -2408,6 +2419,33 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         samples=sample_names,
     )
     (output_dir / "_SUCCESS").write_bytes(b"")
+
+    # ── Diagnostic report ──────────────────────────────────────────────
+    # Failures don't break the pipeline; they log a re-run hint pointing
+    # at the standalone `transcriptome diagnose` verb.
+    if getattr(args, "report", True):
+        try:
+            from constellation.sequencing.transcriptome.cluster.diagnostics import (
+                build_cluster_diagnostics_report,
+            )
+            report_path = build_cluster_diagnostics_report(
+                output_dir,
+                reference=genome,
+            )
+            if not args.progress:
+                print(
+                    f"diagnostic report: {report_path}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"WARNING: diagnostic report generation failed: "
+                f"{type(exc).__name__}: {exc}. The cluster outputs are "
+                f"complete; re-run with `constellation transcriptome "
+                f"diagnose --cluster-dir {output_dir}` to retry.",
+                file=sys.stderr,
+                flush=True,
+            )
 
     if not args.progress:
         print(

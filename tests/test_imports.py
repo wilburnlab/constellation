@@ -141,6 +141,7 @@ import constellation.sequencing.transcriptome.align
 import constellation.sequencing.transcriptome.align.diagnostics
 import constellation.sequencing.transcriptome.cluster
 import constellation.sequencing.transcriptome.cluster.cluster
+import constellation.sequencing.transcriptome.cluster.diagnostics
 import constellation.sequencing.transcriptome.cluster.cluster_genome
 import constellation.sequencing.transcriptome.cluster.consensus
 import constellation.sequencing.transcriptome.cluster.fingerprints
