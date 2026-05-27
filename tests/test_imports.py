@@ -71,6 +71,7 @@ import constellation.massspec.schemas
 import constellation.massspec.search
 import constellation.massspec.search.collision
 import constellation.massspec.search.encyclopedia
+import constellation.massspec.search.novel
 import constellation.massspec.search.encyclopedia.library_export
 import constellation.massspec.search.encyclopedia.library_search
 import constellation.massspec.search.encyclopedia.predict_library
