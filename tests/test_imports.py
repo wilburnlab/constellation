@@ -156,6 +156,7 @@ import constellation.sequencing.transcriptome.demux.scoring
 import constellation.sequencing.transcriptome.demux.simulator
 import constellation.sequencing.transcriptome.manifest
 import constellation.sequencing.transcriptome.stages
+import constellation.sequencing.transcriptome._render
 import constellation.sequencing.modifications
 import constellation.sequencing.modifications.basemod
 import constellation.sequencing.projects
