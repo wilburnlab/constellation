@@ -138,6 +138,7 @@ import constellation.sequencing.quant
 import constellation.sequencing.quant.genome_count
 import constellation.sequencing.transcriptome
 import constellation.sequencing.transcriptome.align
+import constellation.sequencing.transcriptome.align.diagnostics
 import constellation.sequencing.transcriptome.cluster
 import constellation.sequencing.transcriptome.cluster.cluster
 import constellation.sequencing.transcriptome.cluster.cluster_genome

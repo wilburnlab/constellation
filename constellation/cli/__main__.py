@@ -732,6 +732,17 @@ def _build_transcriptome_parser(subs) -> None:
             "--junc-bed, --junc-bonus) raise an error."
         ),
     )
+    p_aln.add_argument(
+        "--report",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "auto-emit a diagnostic report (report.md + figures/*.svg) "
+            "under <output-dir>/diagnostics/ after the resolve stage. "
+            "Pass --no-report to skip. Report generation failures are "
+            "logged but never break a successful align run."
+        ),
+    )
     p_aln.add_argument("--resume", action="store_true")
     p_aln.add_argument("--progress", action="store_true")
     p_aln.set_defaults(func=_cmd_transcriptome_align)
@@ -1688,6 +1699,35 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         minimap2_resolved_args=list(minimap2_resolved_args),
     )
     (output_dir / "_SUCCESS").write_bytes(b"")
+
+    # ── Diagnostic report ──────────────────────────────────────────────
+    # Always attempt unless the user opts out. Failures are logged but
+    # never break a successful pipeline run.
+    if getattr(args, "report", True):
+        try:
+            from constellation.sequencing.transcriptome.align.diagnostics import (
+                build_align_diagnostics_report,
+            )
+            report_path = build_align_diagnostics_report(
+                output_dir,
+                reference=genome,
+                annotation=annotation,
+                organism_profile=args.organism_profile,
+            )
+            if not args.progress:
+                print(
+                    f"diagnostic report: {report_path}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"WARNING: diagnostic report generation failed: "
+                f"{type(exc).__name__}: {exc}. The align outputs are "
+                f"complete; re-run with `constellation transcriptome "
+                f"diagnose --align-dir {output_dir}` to retry.",
+                file=sys.stderr,
+                flush=True,
+            )
 
     if not args.progress:
         print(
