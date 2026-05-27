@@ -178,3 +178,149 @@ def test_lowercase_residue_rejected():
 def test_unmatched_bracket_rejected():
     with pytest.raises(ValueError):
         parse_encyclopedia_modseq("K[+42")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Leading-bracket N-terminal modifications (EncyclopeDIA 6.5.15)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_leading_bracket_n_term_acetyl_on_k():
+    """``[+42.01057]KVERPD`` is unambiguously N-terminal Acetyl on K —
+    the leading-bracket form distinguishes it from ``K[+42.01057]VERPD``
+    (which is side-chain Acetyl on K's ε-amine)."""
+    assert _round_trip("[+42.01057]KVERPD") == "[UNIMOD:1]-KVERPD"
+
+
+def test_leading_bracket_n_term_acetyl_on_a():
+    """``[+42.01057]AVPENATPR`` — emitted by JChronologer for the
+    default -ptmProteinNTermAcetyl=var case."""
+    assert _round_trip("[+42.01057]AVPENATPR") == "[UNIMOD:1]-AVPENATPR"
+
+
+def test_leading_bracket_with_side_chain_mods():
+    """Leading N-term mod + internal side-chain Cam — both resolve."""
+    out = _round_trip("[+42.01057]AC[+57.02146]TLI")
+    # ProForma format: terminal goes before the dash, side-chain inline.
+    assert out == "[UNIMOD:1]-AC[UNIMOD:4]TLI"
+
+
+def test_leading_bracket_unknown_mass_passthrough():
+    """Unrecognised leading mass passes through as a ProForma mass-delta."""
+    out = _round_trip("[+999.999]PEPTIDE")
+    parse_proforma(out)  # must not raise
+    assert "999.999" in out
+    assert out.startswith("[")
+    assert "PEPTIDE" in out
+
+
+# ──────────────────────────────────────────────────────────────────────
+# UNIMOD lookup cache — perf fix for large libraries
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_cache_returns_same_result_as_uncached():
+    """Cached vs uncached find_by_mass must produce identical results
+    on the same input — the cache is a transparent perf optimization,
+    not a behavioral change."""
+    from constellation.core.chem.modifications import UNIMOD
+    from constellation.massspec.io.encyclopedia._modseq import (
+        _cached_find_by_mass,
+        _clear_find_by_mass_cache,
+    )
+
+    _clear_find_by_mass_cache()
+    masses = [42.01057, 57.02146, 79.96633, 15.99492, 0.984016]
+    for mass in masses:
+        uncached = UNIMOD.find_by_mass(mass, tolerance_da=1e-3)
+        cached = _cached_find_by_mass(UNIMOD, mass, 1e-3)
+        assert cached == uncached, f"mismatch at mass {mass}"
+
+
+def test_cache_hit_is_actually_faster():
+    """Smoke test: repeat lookups of the same masses should be much
+    faster than the uncached path. We don't pin a numeric threshold
+    (CI noise), but assert at least 5x — the real-world speedup on
+    5M-precursor libraries is 100-1000x."""
+    import time
+
+    from constellation.core.chem.modifications import UNIMOD
+    from constellation.massspec.io.encyclopedia._modseq import (
+        _cached_find_by_mass,
+        _clear_find_by_mass_cache,
+    )
+
+    masses = [42.01057, 57.02146, 79.96633, 15.99492]
+    n_repeats = 5000
+
+    # Uncached baseline: linear scan ~1560 entries per call.
+    t0 = time.perf_counter()
+    for _ in range(n_repeats):
+        for m in masses:
+            UNIMOD.find_by_mass(m, tolerance_da=1e-3)
+    uncached_secs = time.perf_counter() - t0
+
+    # Cached: first hit per (mass, tol) is full scan, then dict lookup.
+    _clear_find_by_mass_cache()
+    t0 = time.perf_counter()
+    for _ in range(n_repeats):
+        for m in masses:
+            _cached_find_by_mass(UNIMOD, m, 1e-3)
+    cached_secs = time.perf_counter() - t0
+
+    assert cached_secs * 5 < uncached_secs, (
+        f"cache failed to deliver 5x speedup: uncached={uncached_secs:.3f}s, "
+        f"cached={cached_secs:.3f}s ({uncached_secs / cached_secs:.1f}x speedup)"
+    )
+
+
+def test_cache_handles_unknown_masses():
+    """Unresolvable mass deltas (no UNIMOD match) cache the empty result
+    correctly — not a None / sentinel that the .get() check confuses
+    with cache-miss."""
+    from constellation.core.chem.modifications import UNIMOD
+    from constellation.massspec.io.encyclopedia._modseq import (
+        _cached_find_by_mass,
+        _FIND_BY_MASS_CACHE,
+        _clear_find_by_mass_cache,
+    )
+
+    _clear_find_by_mass_cache()
+    weird_mass = 12345.6789
+    result_1 = _cached_find_by_mass(UNIMOD, weird_mass, 1e-3)
+    assert result_1 == ()  # nothing in UNIMOD matches this mass
+    # Second call should also return empty AND be a cache hit
+    assert len(_FIND_BY_MASS_CACHE) == 1
+    result_2 = _cached_find_by_mass(UNIMOD, weird_mass, 1e-3)
+    assert result_2 == ()
+    assert len(_FIND_BY_MASS_CACHE) == 1  # no growth on hit
+
+
+def test_cache_distinguishes_different_tolerances():
+    """Different tolerances on the same mass are separate cache entries."""
+    from constellation.core.chem.modifications import UNIMOD
+    from constellation.massspec.io.encyclopedia._modseq import (
+        _cached_find_by_mass,
+        _FIND_BY_MASS_CACHE,
+        _clear_find_by_mass_cache,
+    )
+
+    _clear_find_by_mass_cache()
+    mass = 42.01057
+    _cached_find_by_mass(UNIMOD, mass, 1e-3)
+    _cached_find_by_mass(UNIMOD, mass, 1e-2)
+    _cached_find_by_mass(UNIMOD, mass, 1e-1)
+    assert len(_FIND_BY_MASS_CACHE) == 3
+
+
+def test_n_term_distinguishable_from_side_chain_on_k():
+    """The two notations now produce different Peptidoforms:
+    leading-bracket → N-terminal α-amine Acetyl, residue-attached →
+    K side-chain ε-amine Acetyl. This distinction is the whole point
+    of EncyclopeDIA's leading-bracket notation (per CLAUDE.md's
+    chemistry-fidelity rule for K[Acetyl]VERPD vs [Acetyl]-KVERPD)."""
+    n_term = _round_trip("[+42.01057]KVERPD")
+    side_chain = _round_trip("K[+42.01057]VERPD")
+    assert n_term == "[UNIMOD:1]-KVERPD"
+    assert side_chain == "K[UNIMOD:1]VERPD"
+    assert n_term != side_chain

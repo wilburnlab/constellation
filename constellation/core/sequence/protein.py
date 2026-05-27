@@ -210,15 +210,25 @@ def _resolve_protease(key: str | Protease) -> Protease:
 
 
 @requires_canonical
-def cleave_sites(seq: str, protease: str | Protease = "Trypsin") -> list[int]:
+def cleave_sites(
+    seq: str,
+    protease: str | Protease = "Trypsin",
+    *,
+    validate_alphabet: bool = True,
+) -> list[int]:
     """Cut-site indices (ascending). Each index `i` means a cut between
     `seq[i-1]` and `seq[i]` — i.e. the peptide starting at `i` is the
     one immediately after a cut.
 
     Always includes 0 (sequence start) and `len(seq)` (sequence end);
     these aren't actual cuts but anchor the peptide enumeration.
+
+    ``validate_alphabet=False`` skips the canonical-AA check so sequences
+    with non-canonical residues digest normally — the protease regex only
+    matches K/R, so cut sites are unaffected by the odd residue.
     """
-    validate(seq, AA)
+    if validate_alphabet:
+        validate(seq, AA)
     p = _resolve_protease(protease)
     pat = (
         PROTEASES.pattern(p.id)
@@ -241,6 +251,8 @@ def cleave(
     min_length: int = 6,
     max_length: int | None = 50,
     semi_specific: bool = False,
+    excise_initiator_met: bool = False,
+    validate_alphabet: bool = True,
     return_spans: bool = False,
 ) -> list[str] | list[Peptide]:
     """Enzymatically cleave `seq` into peptides.
@@ -251,6 +263,20 @@ def cleave(
     (the C-terminal cut is preserved; the N-terminus floats) — the
     standard "semi-tryptic" search-engine option.
 
+    With `excise_initiator_met=True`, for every N-terminal peptide
+    (a span starting at protein position 0) whose first residue is the
+    initiator methionine, ALSO emit the Met-clipped form (`peptide[1:]`)
+    — keeping both. This is the initiator-Met-excision behaviour search
+    engines apply (verified against EncyclopeDIA 6.5.15's predicted
+    library: ~87% of protein N-termini carry both the Met-intact and
+    Met-clipped precursor). The clipping is **unconditional** (not gated
+    on the second residue / biological Met-aminopeptidase rule — the
+    library shows clipped forms for every second residue), applies to
+    all N-terminal spans (0-missed and missed-cleavage variants), and
+    the clipped form is subject to the same length filter independently
+    (so a clipped form that drops below `min_length` is omitted while
+    its intact partner survives).
+
     Output ordering: peptides are sorted by `(start ASC, end ASC)`,
     so along the protein you read the 0-missed peptide first, then
     the 1-missed, then 2-missed at each starting cut. Pyteomics
@@ -260,14 +286,24 @@ def cleave(
     are de-duplicated by keeping the first occurrence under the
     `(start, end)` ordering.
 
+    With `validate_alphabet=False`, the canonical-AA check is skipped so
+    sequences carrying non-canonical residues (selenocysteine ``U``,
+    pyrrolysine ``O``, ambiguity codes ``B``/``Z``/``X``/``J``) digest
+    normally instead of raising. The cut sites only depend on K/R, so
+    peptides not containing the odd residue come out exactly as they
+    would for a clean sequence — important when digesting whole
+    proteomes, where one selenoprotein must not cost you all of its
+    (otherwise canonical) tryptic peptides.
+
     With `return_spans=True`, returns `list[Peptide]` with the
     parent-protein coordinates intact (no de-duplication on sequence).
     """
-    validate(seq, AA)
+    if validate_alphabet:
+        validate(seq, AA)
     if missed_cleavages < 0:
         raise ValueError(f"missed_cleavages must be ≥ 0; got {missed_cleavages}")
 
-    sites = cleave_sites(seq, protease)
+    sites = cleave_sites(seq, protease, validate_alphabet=validate_alphabet)
     # `sites` includes 0 and len(seq); spans are between consecutive
     # cuts plus extensions across `missed_cleavages` interior cuts.
     spans: list[Peptide] = []
@@ -296,6 +332,22 @@ def cleave(
                     continue
                 extras.append(Peptide(sub, new_start, sp.end, n_missed=sp.n_missed))
         spans.extend(extras)
+
+    if excise_initiator_met:
+        # For every N-terminal peptide (span at protein position 0)
+        # starting with the initiator Met, also emit the Met-clipped
+        # form. Only full spans start at 0 (semi suffixes start ≥ 1), so
+        # iterating `spans` after the semi block still picks exactly the
+        # N-terminal peptides.
+        met_clipped: list[Peptide] = []
+        for sp in spans:
+            if sp.start == 0 and sp.sequence.startswith("M"):
+                clipped = sp.sequence[1:]
+                if _length_ok(clipped, min_length, max_length):
+                    met_clipped.append(
+                        Peptide(clipped, 1, sp.end, n_missed=sp.n_missed)
+                    )
+        spans.extend(met_clipped)
 
     spans.sort(key=lambda p: (p.start, p.end))
 

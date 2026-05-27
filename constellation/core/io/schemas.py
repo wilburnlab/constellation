@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
@@ -134,6 +135,36 @@ PEAK_TABLE = pa.schema(
 )
 
 
+# Generic pairwise-alignment record. Universal across modalities that
+# produce homology hits — mmseqs2 (protein-vs-protein), BLAST, DIAMOND.
+# Coordinates follow the mmseqs2 / BLAST convention: 1-indexed and
+# inclusive on both ends; this is preserved across the boundary so
+# downstream tools that consume the CIGAR don't have to re-convert.
+# (Sequencing-side BAM alignments use 0-based half-open and live under
+# the separate ``sequencing.schemas.alignment.ALIGNMENT_TABLE`` schema.)
+ALIGNMENT_HIT_TABLE = pa.schema(
+    [
+        pa.field("query", pa.string(), nullable=False),
+        pa.field("target", pa.string(), nullable=False),
+        pa.field("evalue", pa.float64(), nullable=False),
+        pa.field("qstart", pa.int64(), nullable=False),
+        pa.field("qend", pa.int64(), nullable=False),
+        pa.field("tstart", pa.int64(), nullable=False),
+        pa.field("tend", pa.int64(), nullable=False),
+        pa.field("cigar", pa.string(), nullable=False),
+        # OPTIONAL target-database annotation — typically populated by
+        # the caller (e.g. the novel-peptide classifier infers this from
+        # target membership in the reference proteome: target ∈ refseq
+        # → ``"refseq"``, else ``"swissprot"``) or by an upstream pipeline
+        # that runs tiered alignment passes. May be NULL on rows that
+        # haven't been annotated. Matches the ``[aligned_to=...]`` tag
+        # in the transcriptome→proteome combined.fasta header.
+        pa.field("aligned_to", pa.string(), nullable=True),
+    ],
+    metadata={b"schema_name": b"AlignmentHitTable"},
+)
+
+
 # ----------------------------------------------------------------------
 # Schema registry
 # ----------------------------------------------------------------------
@@ -141,6 +172,7 @@ PEAK_TABLE = pa.schema(
 _REGISTRY: dict[str, pa.Schema] = {
     "Trace1D": TRACE_1D,
     "PeakTable": PEAK_TABLE,
+    "AlignmentHitTable": ALIGNMENT_HIT_TABLE,
     # SpectraMatrix2D is parametric (n_axis) — register the canonical
     # *factory* under a distinct key so consumers can ask "is this a
     # SpectraMatrix2D?" without committing to a specific axis size.
@@ -358,3 +390,137 @@ def cast_to_schema(table: pa.Table, target: pa.Schema) -> pa.Table:
     incoming_meta.update(target_meta)
     out_schema = pa.schema(new_fields, metadata=pack_metadata(incoming_meta))
     return pa.table(new_cols, schema=out_schema)
+
+
+# ----------------------------------------------------------------------
+# mmseqs2 .tab reader → AlignmentHitTable
+# ----------------------------------------------------------------------
+
+
+def read_mmseqs_tab(
+    path: Path | str,
+    *,
+    aligned_to: str | None = None,
+) -> pa.Table:
+    """Parse a headerless mmseqs2 ``.tab`` TSV into ``ALIGNMENT_HIT_TABLE``.
+
+    Expects the 8-column ``--format-output`` cartographer's pipeline uses
+    (and which the cartographer reference parser ``parse_mmseqs_hits``
+    consumes):
+
+        query, target, evalue, qstart, qend, tstart, tend, cigar
+
+    Coordinate columns are 1-indexed inclusive on both ends — preserved
+    as-is so downstream CIGAR walkers don't have to re-convert.
+
+    Parameters
+    ----------
+    path
+        Path to the mmseqs2 ``.tab`` file (headerless, tab-delimited).
+    aligned_to
+        Optional value to populate the ``aligned_to`` column with.
+        When ``None``, the column is filled with nulls and downstream
+        consumers (e.g. ``classify_novel_peptides``) can infer it from
+        target membership in the reference proteome. Pass an explicit
+        value when ingesting a single-database run where the tier is
+        externally known.
+
+    Returns
+    -------
+    pa.Table
+        ``ALIGNMENT_HIT_TABLE``-shaped. Empty (with the right schema)
+        when the file is missing or empty.
+    """
+    import pyarrow.csv as pa_csv
+
+    p = Path(path)
+    if not p.exists() or p.stat().st_size == 0:
+        return ALIGNMENT_HIT_TABLE.empty_table()
+
+    base_names = [
+        "query", "target", "evalue", "qstart", "qend", "tstart", "tend", "cigar"
+    ]
+
+    # Sniff the first non-empty line: how many columns, and is it a
+    # header? Upstream pipelines vary — bare mmseqs2 writes headerless
+    # 8-column output, but pre-tiered files (cartographer's tiered
+    # alignment pass) carry a 9th ``aligned_to`` column and may
+    # include a header row. Both must parse.
+    first = ""
+    with p.open() as fh:
+        for line in fh:
+            if line.strip():
+                first = line.rstrip("\n")
+                break
+    if not first:
+        return ALIGNMENT_HIT_TABLE.empty_table()
+    fields = first.split("\t")
+    n_cols = len(fields)
+    if n_cols < len(base_names):
+        raise ValueError(
+            f"mmseqs .tab at {p} has {n_cols} columns; expected at least "
+            f"{len(base_names)} ({','.join(base_names)})"
+        )
+    # Header iff the evalue field (index 2) isn't numeric. Strip quotes
+    # first — some writers (pandas QUOTE_ALL) wrap every field.
+    def _is_float(tok: str) -> bool:
+        try:
+            float(tok.strip().strip('"'))
+            return True
+        except ValueError:
+            return False
+
+    has_header = not _is_float(fields[2])
+
+    # Build column names matching the actual width: the 8 canonical
+    # fields, an ``aligned_to`` 9th, and ``_extraN`` placeholders for
+    # anything beyond (dropped by the cast). The file's tier column, when
+    # present, wins over the ``aligned_to`` kwarg.
+    column_names = list(base_names)
+    has_tier_col = n_cols >= 9
+    if has_tier_col:
+        column_names.append("aligned_to")
+    column_names.extend(f"_extra{i}" for i in range(10, n_cols + 1))
+    include = list(base_names) + (["aligned_to"] if has_tier_col else [])
+
+    table = pa_csv.read_csv(
+        str(p),
+        read_options=pa_csv.ReadOptions(
+            column_names=column_names,
+            skip_rows=1 if has_header else 0,
+        ),
+        parse_options=pa_csv.ParseOptions(delimiter="\t"),
+        convert_options=pa_csv.ConvertOptions(
+            column_types={
+                "query": pa.string(),
+                "target": pa.string(),
+                "evalue": pa.float64(),
+                "qstart": pa.int64(),
+                "qend": pa.int64(),
+                "tstart": pa.int64(),
+                "tend": pa.int64(),
+                "cigar": pa.string(),
+                "aligned_to": pa.string(),
+            },
+            include_columns=include,
+        ),
+    )
+
+    if not has_tier_col:
+        # No tier column in the file → fill from the kwarg or null.
+        if aligned_to is None:
+            tier_col = pa.nulls(table.num_rows, type=pa.string())
+        else:
+            tier_col = pa.array(
+                [aligned_to] * table.num_rows, type=pa.string()
+            )
+        table = table.append_column("aligned_to", tier_col)
+    elif aligned_to is not None:
+        # File carries a tier column AND the caller forced a value —
+        # the explicit kwarg overrides the file (rare; default is None
+        # so the file value normally wins).
+        table = table.drop(["aligned_to"]).append_column(
+            "aligned_to",
+            pa.array([aligned_to] * table.num_rows, type=pa.string()),
+        )
+    return cast_to_schema(table, ALIGNMENT_HIT_TABLE)
