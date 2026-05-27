@@ -18,9 +18,9 @@ import pyarrow.parquet as pq
 import pytest
 
 from constellation.sequencing.samples import Samples
-from constellation.sequencing.transcriptome.classify import ReadStatus
-from constellation.sequencing.transcriptome.designs import CDNA_WILBURN_V1
-from constellation.sequencing.transcriptome.simulator import (
+from constellation.sequencing.transcriptome.demux.classify import ReadStatus
+from constellation.sequencing.transcriptome.demux.designs import CDNA_WILBURN_V1
+from constellation.sequencing.transcriptome.demux.simulator import (
     GROUND_TRUTH_TABLE,
     ReadSpec,
     assemble_sequence,

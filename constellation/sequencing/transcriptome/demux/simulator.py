@@ -28,7 +28,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from constellation.sequencing.transcriptome.adapters import (
+from constellation.sequencing.transcriptome.demux.adapters import (
     AdapterSlot,
     BarcodeSlot,
     LibraryDesign,
@@ -36,7 +36,7 @@ from constellation.sequencing.transcriptome.adapters import (
     Segment,
     TranscriptSlot,
 )
-from constellation.sequencing.transcriptome.classify import ReadStatus
+from constellation.sequencing.transcriptome.demux.classify import ReadStatus
 
 
 # ──────────────────────────────────────────────────────────────────────

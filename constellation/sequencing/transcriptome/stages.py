@@ -56,13 +56,13 @@ from constellation.sequencing.progress import (
 )
 from constellation.sequencing.samples import Samples
 from constellation.sequencing.schemas.reads import READ_TABLE
-from constellation.sequencing.transcriptome.demux import (
+from constellation.sequencing.transcriptome.demux.demux import (
     locate_segments,
     resolve_demux,
 )
-from constellation.sequencing.transcriptome.designs import load_design
-from constellation.sequencing.transcriptome.orf import ORF_TABLE, predict_orfs
-from constellation.sequencing.transcriptome.quant import (
+from constellation.sequencing.transcriptome.demux.designs import load_design
+from constellation.sequencing.transcriptome.demux.orf import ORF_TABLE, predict_orfs
+from constellation.sequencing.transcriptome.demux.quant import (
     PARTIAL_QUANT_TABLE,
     PROTEIN_COUNT_TABLE,
     FastaRecord,
@@ -538,7 +538,7 @@ def run_demux_pipeline(
 
     fastq_dir: Path | None = None
     if emit_fastq:
-        from constellation.sequencing.transcriptome.fastq import (
+        from constellation.sequencing.transcriptome.demux.fastq import (
             emit_per_sample_fastq,
         )
 

@@ -42,19 +42,19 @@ from constellation.sequencing.schemas.transcriptome import (
     READ_DEMUX_TABLE,
     READ_SEGMENT_TABLE,
 )
-from constellation.sequencing.transcriptome.adapters import (
+from constellation.sequencing.transcriptome.demux.adapters import (
     AdapterSlot,
     BarcodeSlot,
     LibraryDesign,
     PolyASlot,
     TranscriptSlot,
 )
-from constellation.sequencing.transcriptome.classify import (
+from constellation.sequencing.transcriptome.demux.classify import (
     Classification,
     ReadStatus,
     classify_read,
 )
-from constellation.sequencing.transcriptome.scoring import (
+from constellation.sequencing.transcriptome.demux.scoring import (
     AdapterVerdict,
     BarcodeVerdict,
     HardThresholdScorer,

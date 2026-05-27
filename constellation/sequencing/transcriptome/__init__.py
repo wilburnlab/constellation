@@ -1,29 +1,33 @@
 """Transcriptome pipeline — cDNA / direct-RNA from reads to consensus.
 
-Modules:
+Subpackages (per pipeline stage):
 
-    adapters     Adapter / Barcode / LibraryDesign registry. Encodes
-                 the lab's in-house SMARTer-derived chemistry plus the
-                 standard ONT kits (PCS111, PCB111, RCB114) as
-                 composable Segment layouts.
-    demux        Segmented edlib-based deconvolution → READ_SEGMENT_TABLE
-                 → READ_DEMUX_TABLE. Beats Dorado's full-primer
-                 Smith-Waterman because high homopolymer error in
-                 oligo-dT distorts SW scores (empirical mean A≈26
-                 against expected A=20).
-    orf          Thin wrapper over core.sequence.nucleic.find_orfs;
-                 emits ORF_TABLE rows.
-    cluster      mmseqs-style kmer clustering with abundance-weighted
-                 consensus building. Goal: lift the ~1-3% per-read
-                 clustering rate of the current naive ORF-based approach.
-    consensus    Read-network → consensus transcript construction.
-    network      Read-similarity graph (uses core.graph.Network) →
-                 reference-free transcript / gene / allele structure.
+    demux       S1 demultiplex — segmented edlib-based deconvolution
+                (adapters, classify, demux, designs, fastq, orf, quant,
+                scoring, simulator).
+    align       S2 align — transcriptome-specific align-stage logic
+                (currently a placeholder for diagnostic reports; the
+                minimap2 orchestrator lives at
+                :mod:`constellation.sequencing.align`).
+    cluster     Phase 2+ cluster — fingerprint computation, genome-guided
+                clustering, weighted-PWM consensus building, de novo
+                clustering stubs.
+
+Shared at this level:
+
+    manifest    Demux/Align/Cluster manifest readers/writers.
+    stages      Orchestrator wiring demux subpackage modules into the
+                ``constellation transcriptome demultiplex`` CLI command.
+
+The public re-exports below preserve the prior flat-namespace API for
+callers that ``from constellation.sequencing.transcriptome import X``.
+Callers using sub-module paths must reference the new locations under
+``demux/`` / ``align/`` / ``cluster/``.
 """
 
 from __future__ import annotations
 
-from constellation.sequencing.transcriptome.adapters import (
+from constellation.sequencing.transcriptome.demux.adapters import (
     Adapter,
     AdapterSlot,
     Barcode,
@@ -34,15 +38,15 @@ from constellation.sequencing.transcriptome.adapters import (
     TranscriptSlot,
     UMISlot,
 )
-from constellation.sequencing.transcriptome.cluster import cluster_reads
-from constellation.sequencing.transcriptome.consensus import build_consensus
-from constellation.sequencing.transcriptome.demux import (
+from constellation.sequencing.transcriptome.cluster.cluster import cluster_reads
+from constellation.sequencing.transcriptome.cluster.consensus import build_consensus
+from constellation.sequencing.transcriptome.demux.demux import (
     locate_segments,
     resolve_demux,
 )
-from constellation.sequencing.transcriptome.network import build_read_network
-from constellation.sequencing.transcriptome.orf import predict_orfs
-from constellation.sequencing.transcriptome.simulator import (
+from constellation.sequencing.transcriptome.cluster.network import build_read_network
+from constellation.sequencing.transcriptome.demux.orf import predict_orfs
+from constellation.sequencing.transcriptome.demux.simulator import (
     GROUND_TRUTH_TABLE,
     ReadSpec,
     assemble_sequence,

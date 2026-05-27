@@ -39,13 +39,13 @@ import pytest
 
 from constellation.sequencing.readers.sam_bam import SamReader
 from constellation.sequencing.samples import Samples
-from constellation.sequencing.transcriptome.demux import (
+from constellation.sequencing.transcriptome.demux.demux import (
     locate_segments,
     resolve_demux,
 )
-from constellation.sequencing.transcriptome.orf import predict_orfs
-from constellation.sequencing.transcriptome.designs import CDNA_WILBURN_V1
-from constellation.sequencing.transcriptome.quant import (
+from constellation.sequencing.transcriptome.demux.orf import predict_orfs
+from constellation.sequencing.transcriptome.demux.designs import CDNA_WILBURN_V1
+from constellation.sequencing.transcriptome.demux.quant import (
     build_protein_count_matrix,
 )
 

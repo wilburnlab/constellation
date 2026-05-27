@@ -1701,10 +1701,10 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     from constellation.sequencing.quant import cluster_junctions
     from constellation.sequencing.reference.io import load_genome_reference
     from constellation.sequencing.samples import load_samples
-    from constellation.sequencing.transcriptome.cluster_genome import (
+    from constellation.sequencing.transcriptome.cluster.cluster_genome import (
         cluster_by_fingerprint,
     )
-    from constellation.sequencing.transcriptome.fingerprints import (
+    from constellation.sequencing.transcriptome.cluster.fingerprints import (
         compute_read_fingerprints,
     )
     from constellation.sequencing.transcriptome.manifest import (

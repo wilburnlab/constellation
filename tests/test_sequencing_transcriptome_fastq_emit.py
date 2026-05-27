@@ -21,13 +21,13 @@ import pyarrow.dataset as ds
 import pytest
 
 from constellation.sequencing.samples import Samples
-from constellation.sequencing.transcriptome.designs import CDNA_WILBURN_V1
-from constellation.sequencing.transcriptome.fastq import (
+from constellation.sequencing.transcriptome.demux.designs import CDNA_WILBURN_V1
+from constellation.sequencing.transcriptome.demux.fastq import (
     _build_sample_filename_map,
     _sanitize_name,
     emit_per_sample_fastq,
 )
-from constellation.sequencing.transcriptome.simulator import (
+from constellation.sequencing.transcriptome.demux.simulator import (
     generate_stress_test_specs,
     is_deterministic_clean,
     simulate_panel,
