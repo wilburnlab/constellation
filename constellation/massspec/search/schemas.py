@@ -100,12 +100,21 @@ NOVEL_PEPTIDE_TABLE: pa.Schema = pa.schema(
         # mmseqs2 CIGAR string for the hit (query-centric, 1-indexed
         # inclusive coordinates). Empty when no hit.
         pa.field("cigar", pa.string(), nullable=True),
-        # Which target database the hit belongs to: ``"refseq"`` (target
-        # in the reference proteome) vs ``"swissprot"`` (rescued by
-        # the Swiss-Prot competitive target). Null when the upstream
-        # alignment carried no tier annotation. Matches the
-        # ``[aligned_to=...]`` tag in the transcriptome→proteome
-        # combined.fasta header.
+        # Result of the classifier's membership check: ``"reference"``
+        # when the alignment target is in the reference proteome the
+        # classifier was handed (CIGAR-walked into snp/indel/...);
+        # ``"non_reference"`` when it isn't (the peptide's
+        # ``classification`` short-circuits to ``"non_reference"``).
+        # Null only on rows assembled outside the classifier. NOTE:
+        # the values intentionally use cartographer's vocabulary
+        # rather than ``ALIGNMENT_HIT_TABLE``'s upstream
+        # ``"refseq"`` / ``"swissprot"`` — the classifier always
+        # recomputes from membership, so foreign tier labels are
+        # replaced. The ``[aligned_to=...]`` tag in the
+        # transcriptome→proteome combined.fasta header is computed
+        # separately at the orchestrator level using
+        # ``refseq``/``swissprot`` membership; the two columns are
+        # complementary, not identical.
         pa.field("aligned_to", pa.string(), nullable=True),
         # Full novel protein sequence — present for downstream
         # validation / re-classification without needing the

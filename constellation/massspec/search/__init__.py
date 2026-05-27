@@ -18,6 +18,9 @@ Modules:
     schemas  -- PEPTIDE_SCORE_TABLE, PROTEIN_SCORE_TABLE, NOVEL_PEPTIDE_TABLE
     search   -- Search container (mirrors Library / Quant)
     io       -- Reader/Writer Protocols + ParquetDirReader/Writer
+    novel    -- classify_novel_peptides + classify_single_peptide
+                (CIGAR-walking classifier; port of cartographer's
+                 nanopore.classify_novel_peptides)
     collision -- apply_collision_filter (opt-in DIA co-elution filter;
                  port of cartographer's filter_elib_by_collision)
 """
@@ -30,12 +33,28 @@ from constellation.massspec.search.collision import (
     filter_elib_by_losers,
 )
 from constellation.massspec.search.io import save_search
+from constellation.massspec.search.novel import (
+    _CLASSIFICATION_PRIORITY,
+    build_gene_map_from_fasta_headers,
+    classify_novel_peptides,
+    classify_single_peptide,
+    protein_to_gene_from_swissprot,
+    read_fasta_proteins,
+    save_novel_peptides,
+)
 from constellation.massspec.search.search import Search, assemble_search
 
 __all__ = [
     "Search",
+    "_CLASSIFICATION_PRIORITY",
     "apply_collision_filter",
     "assemble_search",
+    "build_gene_map_from_fasta_headers",
+    "classify_novel_peptides",
+    "classify_single_peptide",
     "filter_elib_by_losers",
+    "protein_to_gene_from_swissprot",
+    "read_fasta_proteins",
+    "save_novel_peptides",
     "save_search",
 ]
