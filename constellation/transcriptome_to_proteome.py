@@ -335,15 +335,23 @@ _GFF_GENE_RE = re.compile(r"\bgene=([^;]+)")
 
 
 def read_reference_gene_map(annotation_path: Path | str) -> dict[str, str]:
-    """Parse a GFF3 or GBFF reference annotation → protein_id → gene_symbol.
+    """Parse a reference annotation → ``protein_id → gene_symbol``.
 
-    Routes by file extension:
+    Accepts three input shapes — pick whichever your upstream provides:
 
-      * ``.gff`` / ``.gff3`` (+ ``.gz``) → GFF3 parser. Iterates CDS
-        records, extracts ``protein_id=`` and ``gene=`` attributes.
-      * ``.gbff`` / ``.gb`` / ``.genbank`` (+ ``.gz``) → GBFF parser.
-        Walks LOCUS records, scans CDS feature qualifier blocks for
-        ``/protein_id="..."`` + ``/gene="..."`` pairs.
+      * **Constellation parquet bundle** (preferred): a directory
+        containing ``features.parquet`` + ``manifest.json`` — the
+        canonical form produced by ``constellation reference fetch``
+        and any code that consumes the parsed
+        :class:`~constellation.sequencing.annotation.annotation.Annotation`.
+        Read via :func:`load_annotation` and queried with Arrow
+        compute kernels (no per-line text parse).
+      * ``.gff`` / ``.gff3`` (+ ``.gz``) → legacy GFF3 parser.
+        Iterates CDS records, extracts ``protein_id=`` and ``gene=``
+        attributes.
+      * ``.gbff`` / ``.gb`` / ``.genbank`` (+ ``.gz``) → legacy GBFF
+        parser. Walks LOCUS records, scans CDS feature qualifier
+        blocks for ``/protein_id="..."`` + ``/gene="..."`` pairs.
 
     Used by :func:`build_combined_fasta` to annotate reference protein
     headers with their gene symbol. Unmatched proteins (no ``gene=``
@@ -354,7 +362,8 @@ def read_reference_gene_map(annotation_path: Path | str) -> dict[str, str]:
     Parameters
     ----------
     annotation_path
-        Path to a GFF3 or GBFF file (optionally gzipped).
+        Path to a Constellation annotation ParquetDir bundle, a GFF3
+        file, or a GBFF file (the latter two optionally gzipped).
 
     Returns
     -------
@@ -364,15 +373,67 @@ def read_reference_gene_map(annotation_path: Path | str) -> dict[str, str]:
         values are the gene symbol (e.g. ``ACTB``).
     """
     p = Path(annotation_path)
+    # Constellation parquet bundle — directory with the canonical
+    # ParquetDir layout. Preferred form; matches what ``constellation
+    # reference fetch`` writes to ``~/.constellation/references/.../
+    # annotation/``.
+    if p.is_dir() and (p / "features.parquet").is_file():
+        return _read_parquet_gene_map(p)
     suffixes = [s.lower() for s in p.suffixes]
     if any(s in {".gff", ".gff3"} for s in suffixes):
         return _read_gff3_gene_map(p)
     if any(s in {".gbff", ".gb", ".genbank"} for s in suffixes):
         return _read_gbff_gene_map(p)
     raise ValueError(
-        f"unsupported annotation extension {p.suffixes!r}: expected "
-        f".gff / .gff3 / .gbff / .gb / .genbank (optionally .gz)"
+        f"unsupported annotation path {p!r}: expected a Constellation "
+        f"parquet bundle (directory with features.parquet + manifest.json), "
+        f"a .gff / .gff3 file, or a .gbff / .gb / .genbank file "
+        f"(optionally .gz)"
     )
+
+
+def _read_parquet_gene_map(annotation_dir: Path) -> dict[str, str]:
+    """Extract ``protein_id → gene_symbol`` from a Constellation
+    annotation ParquetDir bundle.
+
+    Loads via :func:`load_annotation` (validates against
+    ``FEATURE_TABLE``), filters to CDS rows with Arrow compute, and
+    decodes the per-row ``attributes_json`` blob to pull out the
+    ``protein_id`` + ``gene`` keys. CDS attributes land in the JSON
+    blob (not promoted to dedicated columns — see
+    ``constellation.sequencing.readers.gff._RESERVED_ATTRS``, which
+    promotes only ``ID``/``Name``/``Parent``).
+    """
+    import json as _json
+
+    import pyarrow.compute as pc
+    from constellation.sequencing.annotation.io import load_annotation
+
+    annotation = load_annotation(annotation_dir)
+    cds_mask = pc.equal(annotation.features.column("type"), "CDS")
+    cds = annotation.features.filter(cds_mask)
+    attrs_col = cds.column("attributes_json").to_pylist()
+
+    out: dict[str, str] = {}
+    for blob in attrs_col:
+        if not blob:
+            continue
+        try:
+            attrs = _json.loads(blob)
+        except (TypeError, ValueError):
+            continue
+        protein_id = attrs.get("protein_id")
+        # RefSeq stores the gene symbol under the ``gene`` attribute.
+        # Some GFF3 producers use ``gene_name``; check both, gene
+        # first.
+        gene = attrs.get("gene") or attrs.get("gene_name")
+        if protein_id and gene:
+            # First occurrence wins — matches the GFF3 / GBFF parsers'
+            # behaviour. CDS records for the same protein at multiple
+            # genomic loci (rare, mostly chrY pseudoautosomal) keep
+            # the first locus's gene symbol.
+            out.setdefault(str(protein_id), str(gene))
+    return out
 
 
 def _read_gff3_gene_map(path: Path) -> dict[str, str]:

@@ -56,19 +56,41 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         help="proteins.fasta from `constellation transcriptome demultiplex`",
     )
     p.add_argument(
-        "--reference-fasta",
-        required=True,
+        "--reference-dir",
         type=Path,
-        help="background reference proteome (e.g. RefSeq for the organism)",
+        default=None,
+        help=(
+            "Constellation reference-cache directory, e.g. "
+            "``~/.constellation/references/homo_sapiens/refseq-GCF_000001405.40/``. "
+            "When provided, auto-resolves ``--reference-fasta`` to "
+            "``<dir>/protein.faa`` and ``--reference-annotation`` to "
+            "``<dir>/annotation/`` (the Constellation ParquetDir form). "
+            "Explicit ``--reference-fasta`` / ``--reference-annotation`` "
+            "flags override the auto-resolved defaults. If "
+            "``--reference-dir`` is NOT supplied, both other flags are "
+            "required."
+        ),
+    )
+    p.add_argument(
+        "--reference-fasta",
+        type=Path,
+        default=None,
+        help=(
+            "background reference proteome (e.g. RefSeq protein FASTA "
+            "for the organism). Required unless ``--reference-dir`` is "
+            "supplied."
+        ),
     )
     p.add_argument(
         "--reference-annotation",
-        required=True,
         type=Path,
+        default=None,
         help=(
-            "GFF3 or GBFF reference annotation — provides the "
-            "protein_id → gene_symbol mapping for combined-FASTA "
-            "header annotation"
+            "Reference annotation — accepts the Constellation parquet "
+            "bundle (directory with features.parquet + manifest.json, "
+            "as written by ``constellation reference fetch``), a GFF3 "
+            "file, or a GBFF file. Required unless ``--reference-dir`` "
+            "is supplied."
         ),
     )
     p.add_argument(
@@ -282,9 +304,47 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
 
 
 def _cmd_transcriptome_to_proteome(args: argparse.Namespace) -> int:
-    """Handler — delegates to the orchestrator function in the top-level
-    module so notebook / library callers can invoke the same workflow
-    without going through argparse."""
+    """Handler — resolves the reference-cache shorthand then delegates
+    to the orchestrator function in the top-level module so notebook /
+    library callers can invoke the same workflow without going through
+    argparse.
+
+    When the user supplies ``--reference-dir`` instead of (or alongside)
+    ``--reference-fasta`` and ``--reference-annotation``, we resolve
+    the implicit defaults here so the orchestrator's path-resolution
+    block can stay simple. Explicit flags override the dir-derived
+    defaults.
+    """
+    import sys
+
+    if args.reference_dir is not None:
+        ref_dir = Path(args.reference_dir).expanduser().resolve()
+        if not ref_dir.is_dir():
+            print(
+                f"error: --reference-dir {ref_dir} is not a directory",
+                file=sys.stderr,
+            )
+            return 2
+        # Fill in defaults from the cache layout. Explicit flags win.
+        if args.reference_fasta is None:
+            args.reference_fasta = ref_dir / "protein.faa"
+        if args.reference_annotation is None:
+            args.reference_annotation = ref_dir / "annotation"
+
+    # After dir-resolution both must be populated.
+    missing = []
+    if args.reference_fasta is None:
+        missing.append("--reference-fasta")
+    if args.reference_annotation is None:
+        missing.append("--reference-annotation")
+    if missing:
+        print(
+            f"error: {', '.join(missing)} required (or pass --reference-dir "
+            f"to auto-resolve from the Constellation reference cache).",
+            file=sys.stderr,
+        )
+        return 2
+
     from constellation.transcriptome_to_proteome import (
         run_transcriptome_to_proteomics,
     )

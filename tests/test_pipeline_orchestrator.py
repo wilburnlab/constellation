@@ -53,6 +53,12 @@ def test_t2p_subcommand_registers() -> None:
 
 
 def test_t2p_required_args() -> None:
+    """The base set of required argparse flags. Note that
+    ``--reference-fasta`` and ``--reference-annotation`` are NOT
+    argparse-level required — when ``--reference-dir`` is supplied
+    they're auto-resolved from the Constellation cache layout. The
+    handler enforces the "at least one of the three" rule
+    post-parse."""
     parser = _make_parser()
     t2p = _subparsers_action(parser).choices["transcriptome-to-proteome"]
     required = {
@@ -64,8 +70,6 @@ def test_t2p_required_args() -> None:
     expected = {
         "--protein-counts",
         "--proteins-fasta",
-        "--reference-fasta",
-        "--reference-annotation",
         "--gpf",
         "--injections",
         "--output-dir",
@@ -73,6 +77,128 @@ def test_t2p_required_args() -> None:
     assert expected.issubset(required), (
         f"missing required args: {expected - required}"
     )
+    # --reference-fasta / --reference-annotation / --reference-dir
+    # are all optional at parse-time; the handler validates that
+    # enough information is present to resolve them.
+    optional = {
+        opt
+        for action in t2p._actions
+        if not getattr(action, "required", False)
+        for opt in action.option_strings
+    }
+    assert "--reference-fasta" in optional
+    assert "--reference-annotation" in optional
+    assert "--reference-dir" in optional
+
+
+def test_t2p_reference_dir_auto_resolves_fasta_and_annotation(
+    tmp_path: Path, capsys
+) -> None:
+    """When ``--reference-dir`` is supplied, the handler fills in
+    ``--reference-fasta`` and ``--reference-annotation`` from the
+    Constellation reference-cache layout
+    (``<dir>/protein.faa`` + ``<dir>/annotation/``)."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _cmd_transcriptome_to_proteome,
+    )
+
+    # Fake reference cache layout — only the path existence matters
+    # for the handler's resolution step (it doesn't open the files).
+    ref_dir = tmp_path / "homo_sapiens" / "refseq-GCF_000001405.40"
+    (ref_dir / "annotation").mkdir(parents=True)
+    (ref_dir / "protein.faa").write_text(">stub\nMAGCKL\n")
+
+    args = argparse.Namespace(
+        reference_dir=ref_dir,
+        reference_fasta=None,
+        reference_annotation=None,
+    )
+    # Patch the orchestrator entry-point so we observe the resolved
+    # args without running the pipeline.
+    import constellation.cli.transcriptome_to_proteome as cli_mod
+    observed: dict = {}
+
+    def _fake_run(*, args):
+        observed["fasta"] = args.reference_fasta
+        observed["annotation"] = args.reference_annotation
+        return 0
+
+    import constellation.transcriptome_to_proteome as orch_mod
+    orig = orch_mod.run_transcriptome_to_proteomics
+    orch_mod.run_transcriptome_to_proteomics = _fake_run
+    try:
+        rc = _cmd_transcriptome_to_proteome(args)
+    finally:
+        orch_mod.run_transcriptome_to_proteomics = orig
+
+    assert rc == 0
+    assert observed["fasta"] == ref_dir / "protein.faa"
+    assert observed["annotation"] == ref_dir / "annotation"
+
+
+def test_t2p_reference_dir_explicit_flags_override(tmp_path: Path) -> None:
+    """Explicit ``--reference-fasta`` / ``--reference-annotation``
+    flags override the dir-derived defaults — caller can pull the
+    FASTA from the cache but point the annotation somewhere else
+    (e.g. when running against an experimental annotation release)."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _cmd_transcriptome_to_proteome,
+    )
+
+    ref_dir = tmp_path / "cache_release"
+    (ref_dir / "annotation").mkdir(parents=True)
+    (ref_dir / "protein.faa").write_text(">stub\nMAGCKL\n")
+
+    override_fasta = tmp_path / "override.fa"
+    override_fasta.write_text(">override\nKVERPD\n")
+
+    args = argparse.Namespace(
+        reference_dir=ref_dir,
+        reference_fasta=override_fasta,  # explicit, should win
+        reference_annotation=None,        # falls through to dir default
+    )
+
+    import constellation.transcriptome_to_proteome as orch_mod
+    observed: dict = {}
+
+    def _fake_run(*, args):
+        observed["fasta"] = args.reference_fasta
+        observed["annotation"] = args.reference_annotation
+        return 0
+
+    orig = orch_mod.run_transcriptome_to_proteomics
+    orch_mod.run_transcriptome_to_proteomics = _fake_run
+    try:
+        rc = _cmd_transcriptome_to_proteome(args)
+    finally:
+        orch_mod.run_transcriptome_to_proteomics = orig
+
+    assert rc == 0
+    # Explicit override wins for FASTA.
+    assert observed["fasta"] == override_fasta
+    # Default fallback for annotation.
+    assert observed["annotation"] == ref_dir / "annotation"
+
+
+def test_t2p_missing_reference_args_errors(tmp_path: Path, capsys) -> None:
+    """Without --reference-dir AND without both --reference-fasta and
+    --reference-annotation, the handler errors out before invoking the
+    orchestrator."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _cmd_transcriptome_to_proteome,
+    )
+
+    args = argparse.Namespace(
+        reference_dir=None,
+        reference_fasta=None,
+        reference_annotation=None,
+    )
+    rc = _cmd_transcriptome_to_proteome(args)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--reference-fasta" in err
+    assert "--reference-annotation" in err
+    assert "--reference-dir" in err
 
 
 def test_t2p_collision_filter_default_on() -> None:
