@@ -297,6 +297,17 @@ def _build_parser() -> argparse.ArgumentParser:
     from constellation.massspec.cli import build_parser as _build_massspec_parser
     _build_massspec_parser(subs)
 
+    # Cross-modality orchestrator: protein counts → predicted .dlib →
+    # GPF library → per-injection searches → quant report → novel
+    # peptide classifications. Single-purpose top-level verb (no
+    # ``pipeline`` umbrella) per the project's "≥2 workflows before
+    # an umbrella" rule — when a second cross-modality workflow lands,
+    # this and that can collapse under a shared umbrella.
+    from constellation.cli.transcriptome_to_proteome import (
+        build_parser as _build_t2p_parser,
+    )
+    _build_t2p_parser(subs)
+
     # Visualization subtree — `constellation viz genome --session DIR`.
     # The full `[viz]` extras (fastapi / uvicorn / datashader) are
     # only required when the user actually invokes a viz subcommand;

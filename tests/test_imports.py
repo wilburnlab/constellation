@@ -163,6 +163,7 @@ import constellation.structure.readers
 import constellation.nmr
 import constellation.models
 import constellation.cli
+import constellation.cli.transcriptome_to_proteome
 import constellation.thirdparty
 import constellation.data
 import constellation.viz
