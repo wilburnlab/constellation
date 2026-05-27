@@ -142,6 +142,7 @@ import constellation.sequencing.align.minimap2
 import constellation.sequencing.align.pairwise
 import constellation.sequencing.quant
 import constellation.sequencing.quant.genome_count
+import constellation.sequencing.quant.protein_counts
 import constellation.sequencing.transcriptome
 import constellation.sequencing.transcriptome.adapters
 import constellation.sequencing.transcriptome.cluster
