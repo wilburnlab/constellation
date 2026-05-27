@@ -35,6 +35,13 @@ from constellation.viz.server.session import Session  # noqa: E402
 from constellation.viz.tracks.coverage_histogram import (  # noqa: E402
     COVERAGE_VECTOR_SCHEMA,
 )
+from constellation.viz.tracks.cluster_pileup import (  # noqa: E402
+    CLUSTER_MEMBER_VECTOR_SCHEMA,
+    CLUSTER_PILEUP_VECTOR_SCHEMA,
+)
+from constellation.viz.tracks.read_pileup import (  # noqa: E402
+    READ_PILEUP_VECTOR_SCHEMA,
+)
 
 
 # ----------------------------------------------------------------------
@@ -362,6 +369,398 @@ def test_track_data_unknown_kind_returns_404(
         },
     )
     assert response.status_code == 404
+
+
+@pytest.fixture
+def read_pileup_client(tmp_path: Path, monkeypatch) -> TestClient:
+    """A second client with a read_pileup-shaped source — alignments
+    plus blocks plus cs plus read_samples. Used by the MAPQ-pushdown
+    test below."""
+    from _viz_fixtures import build_viz_session
+
+    session = build_viz_session(
+        tmp_path,
+        monkeypatch,
+        contigs=[
+            {
+                "contig_id": 1,
+                "name": "chr1",
+                "length": 1_000_000,
+                "topology": None,
+                "circular": None,
+            }
+        ],
+        sequences=[{"contig_id": 1, "sequence": "N" * 100}],
+        align_sources=[
+            {
+                "alignments": [
+                    _alignment_row(1, "r1", 0, 100, mapq=60),
+                    _alignment_row(2, "r2", 50, 150, mapq=10),
+                    _alignment_row(3, "r3", 200, 300, mapq=30),
+                ],
+                "alignment_blocks": [
+                    _block_row(1, 0, 0, 100),
+                    _block_row(2, 0, 50, 150),
+                    _block_row(3, 0, 200, 300),
+                ],
+                "alignment_cs": [
+                    {"alignment_id": 1, "cs_string": ""},
+                    {"alignment_id": 2, "cs_string": ""},
+                    {"alignment_id": 3, "cs_string": ""},
+                ],
+                "read_samples": [
+                    {"read_id": "r1", "sample_id": 1, "sample_name": "a"},
+                    {"read_id": "r2", "sample_id": 1, "sample_name": "a"},
+                    {"read_id": "r3", "sample_id": 1, "sample_name": "a"},
+                ],
+            }
+        ],
+    )
+    app = create_app(session)
+    client = TestClient(app)
+    client.session_id = session.session_id  # type: ignore[attr-defined]
+    return client
+
+
+def _alignment_row(
+    alignment_id: int, read_id: str, ref_start: int, ref_end: int, *, mapq: int = 60
+) -> dict:
+    return {
+        "alignment_id": alignment_id,
+        "read_id": read_id,
+        "acquisition_id": 1,
+        "ref_name": "chr1",
+        "ref_start": ref_start,
+        "ref_end": ref_end,
+        "strand": "+",
+        "mapq": mapq,
+        "flag": 0,
+        "cigar_string": f"{ref_end - ref_start}M",
+        "nm_tag": None,
+        "as_tag": None,
+        "read_group": None,
+        "is_secondary": False,
+        "is_supplementary": False,
+    }
+
+
+def _block_row(
+    alignment_id: int, block_index: int, ref_start: int, ref_end: int
+) -> dict:
+    return {
+        "alignment_id": alignment_id,
+        "block_index": block_index,
+        "ref_start": ref_start,
+        "ref_end": ref_end,
+        "query_start": 0,
+        "query_end": ref_end - ref_start,
+        "n_match": None,
+        "n_mismatch": None,
+        "n_insert": 0,
+        "n_delete": 0,
+    }
+
+
+def test_track_data_min_mapq_pushdown_via_endpoint(
+    read_pileup_client: TestClient,
+) -> None:
+    """GET /api/tracks/read_pileup/data?...&min_mapq=20 round-trips
+    the new kernel-pushdown filter — the response row count reflects
+    the MAPQ predicate applied at scan time."""
+    session_id = read_pileup_client.session_id  # type: ignore[attr-defined]
+
+    # Baseline: no MAPQ filter — all three alignments survive.
+    baseline = read_pileup_client.get(
+        "/api/tracks/read_pileup/data",
+        params={
+            "session": session_id,
+            "binding": "read_pileup-0",
+            "contig": "chr1",
+            "start": 0,
+            "end": 400,
+        },
+    )
+    assert baseline.status_code == 200
+    baseline_table = pa.ipc.RecordBatchStreamReader(
+        io.BytesIO(baseline.content)
+    ).read_all()
+    assert baseline_table.schema == READ_PILEUP_VECTOR_SCHEMA
+    assert baseline_table.num_rows == 3
+
+    # min_mapq=20 drops the mapq=10 alignment.
+    filtered = read_pileup_client.get(
+        "/api/tracks/read_pileup/data",
+        params={
+            "session": session_id,
+            "binding": "read_pileup-0",
+            "contig": "chr1",
+            "start": 0,
+            "end": 400,
+            "min_mapq": 20,
+        },
+    )
+    assert filtered.status_code == 200
+    filtered_table = pa.ipc.RecordBatchStreamReader(
+        io.BytesIO(filtered.content)
+    ).read_all()
+    kept_ids = sorted(filtered_table.column("alignment_id").to_pylist())
+    assert kept_ids == [1, 3]
+
+
+def test_track_data_min_mapq_rejects_negative(
+    read_pileup_client: TestClient,
+) -> None:
+    """FastAPI's ``ge=0`` validation refuses negative MAPQ values
+    before reaching the kernel."""
+    session_id = read_pileup_client.session_id  # type: ignore[attr-defined]
+    response = read_pileup_client.get(
+        "/api/tracks/read_pileup/data",
+        params={
+            "session": session_id,
+            "binding": "read_pileup-0",
+            "contig": "chr1",
+            "start": 0,
+            "end": 400,
+            "min_mapq": -1,
+        },
+    )
+    assert response.status_code == 422
+
+
+@pytest.fixture
+def cluster_pileup_client(tmp_path: Path, monkeypatch) -> TestClient:
+    """A client over a session with both an align source and a cluster
+    source — the cluster manifest's align_dir back-pointer makes the
+    members view available."""
+    from _viz_fixtures import (
+        build_viz_session,
+        write_align_source,
+        DEFAULT_ASSEMBLY,
+        DEFAULT_HANDLE,
+        install_fake_reference,
+    )
+    from constellation.sequencing.schemas.transcriptome import (
+        CLUSTER_MEMBERSHIP_TABLE,
+        TRANSCRIPT_CLUSTER_TABLE,
+    )
+
+    # Install reference at a pinned cache root via monkeypatch + a
+    # bare write_align_source helper so we can wire align_dir on the
+    # cluster manifest at the right path.
+    cache_root = tmp_path / "refs"
+    cache_root.mkdir()
+    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache_root))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    install_fake_reference(
+        cache_root,
+        contigs=[
+            {
+                "contig_id": 1,
+                "name": "chr1",
+                "length": 1_000_000,
+                "topology": None,
+                "circular": None,
+            }
+        ],
+        sequences=[{"contig_id": 1, "sequence": "N" * 100}],
+    )
+
+    align_dir = tmp_path / "align_src"
+    write_align_source(
+        align_dir,
+        alignments=[
+            _alignment_row(1, "rA", 0, 100, mapq=60),
+            _alignment_row(2, "rB", 50, 150, mapq=60),
+        ],
+        alignment_blocks=[
+            _block_row(1, 0, 0, 100),
+            _block_row(2, 0, 50, 150),
+        ],
+        alignment_cs=[
+            {"alignment_id": 1, "cs_string": ""},
+            {"alignment_id": 2, "cs_string": ""},
+        ],
+        read_samples=[
+            {"read_id": "rA", "sample_id": 1, "sample_name": "a"},
+            {"read_id": "rB", "sample_id": 1, "sample_name": "a"},
+        ],
+    )
+
+    cluster_dir = tmp_path / "cluster_src"
+    cluster_dir.mkdir()
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "cluster_id": 1,
+                    "representative_read_id": "rA",
+                    "n_reads": 2,
+                    "identity_threshold": None,
+                    "consensus_sequence": None,
+                    "predicted_protein": None,
+                    "orf_start": None,
+                    "orf_end": None,
+                    "orf_strand": None,
+                    "codon_table": None,
+                    "mode": "genome-guided",
+                    "contig_id": 1,
+                    "strand": "+",
+                    "span_start": 0,
+                    "span_end": 150,
+                    "fingerprint_hash": 0,
+                    "n_unique_sequences": 1,
+                    "sample_id": -1,
+                }
+            ],
+            schema=TRANSCRIPT_CLUSTER_TABLE,
+        ),
+        cluster_dir / "clusters.parquet",
+    )
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "cluster_id": 1,
+                    "read_id": "rA",
+                    "role": "representative",
+                    "drift_5p_bp": None,
+                    "drift_3p_bp": None,
+                    "match_rate": None,
+                    "indel_rate": None,
+                    "n_aligned_bp": 100,
+                },
+                {
+                    "cluster_id": 1,
+                    "read_id": "rB",
+                    "role": "member",
+                    "drift_5p_bp": None,
+                    "drift_3p_bp": None,
+                    "match_rate": None,
+                    "indel_rate": None,
+                    "n_aligned_bp": 100,
+                },
+            ],
+            schema=CLUSTER_MEMBERSHIP_TABLE,
+        ),
+        cluster_dir / "cluster_membership.parquet",
+    )
+    from constellation.sequencing.transcriptome.manifest import (
+        write_cluster_manifest,
+    )
+
+    write_cluster_manifest(
+        cluster_dir / "manifest.json",
+        reference_handle=DEFAULT_HANDLE,
+        reference_path=str(cache_root / "test_org" / "local_import-20260522"),
+        assembly_accession=DEFAULT_ASSEMBLY,
+        align_dir=str(align_dir),
+        demux_dir="",
+        parameters={},
+        stages={},
+        outputs={
+            "clusters": str(cluster_dir / "clusters.parquet"),
+            "cluster_membership": str(cluster_dir / "cluster_membership.parquet"),
+        },
+    )
+
+    session = build_viz_session(
+        tmp_path,
+        monkeypatch,
+        contigs=[
+            {
+                "contig_id": 1,
+                "name": "chr1",
+                "length": 1_000_000,
+                "topology": None,
+                "circular": None,
+            }
+        ],
+        sequences=[{"contig_id": 1, "sequence": "N" * 100}],
+    )
+    # Re-open with the explicit (align + cluster) source pair.
+    from constellation.viz.server.session import Session
+
+    session = Session.open(
+        reference_handle=DEFAULT_HANDLE,
+        sources=[
+            {"path": str(align_dir), "kind": "align"},
+            {"path": str(cluster_dir), "kind": "cluster"},
+        ],
+    )
+    app = create_app(session)
+    client = TestClient(app)
+    client.session_id = session.session_id  # type: ignore[attr-defined]
+    return client
+
+
+def test_track_data_cluster_view_members_via_endpoint(
+    cluster_pileup_client: TestClient,
+) -> None:
+    """GET /api/tracks/cluster_pileup/data?...&cluster_view=members
+    streams the expanded member-read schema rather than the cluster
+    rectangles. Default (no cluster_view param) keeps the existing
+    rectangle behavior."""
+    session_id = cluster_pileup_client.session_id  # type: ignore[attr-defined]
+
+    # Default view → CLUSTER_PILEUP_VECTOR_SCHEMA.
+    default = cluster_pileup_client.get(
+        "/api/tracks/cluster_pileup/data",
+        params={
+            "session": session_id,
+            "binding": "cluster_pileup-1",
+            "contig": "chr1",
+            "start": 0,
+            "end": 200,
+        },
+    )
+    assert default.status_code == 200
+    assert default.headers.get("x-track-view") == ""
+    default_table = pa.ipc.RecordBatchStreamReader(
+        io.BytesIO(default.content)
+    ).read_all()
+    assert default_table.schema == CLUSTER_PILEUP_VECTOR_SCHEMA
+
+    # Members view → CLUSTER_MEMBER_VECTOR_SCHEMA + per-alignment rows.
+    members = cluster_pileup_client.get(
+        "/api/tracks/cluster_pileup/data",
+        params={
+            "session": session_id,
+            "binding": "cluster_pileup-1",
+            "contig": "chr1",
+            "start": 0,
+            "end": 200,
+            "cluster_view": "members",
+        },
+    )
+    assert members.status_code == 200
+    assert members.headers.get("x-track-view") == "members"
+    members_table = pa.ipc.RecordBatchStreamReader(
+        io.BytesIO(members.content)
+    ).read_all()
+    assert members_table.schema == CLUSTER_MEMBER_VECTOR_SCHEMA
+    # Both reads survive the join.
+    assert members_table.num_rows == 2
+
+
+def test_track_data_cluster_view_rejects_unknown_value(
+    cluster_pileup_client: TestClient,
+) -> None:
+    """The pattern guard refuses cluster_view values outside the
+    {clusters, members} set so typos surface as a 422 rather than
+    silently rendering an empty stream."""
+    session_id = cluster_pileup_client.session_id  # type: ignore[attr-defined]
+    response = cluster_pileup_client.get(
+        "/api/tracks/cluster_pileup/data",
+        params={
+            "session": session_id,
+            "binding": "cluster_pileup-1",
+            "contig": "chr1",
+            "start": 0,
+            "end": 200,
+            "cluster_view": "no_such_view",
+        },
+    )
+    assert response.status_code == 422
 
 
 def test_root_with_no_static_bundle_returns_pointer(

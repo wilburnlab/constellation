@@ -587,6 +587,13 @@
   font-size: 11px;
   font-style: italic;
 }
+.track-settings-popover .settings-row-hint {
+  grid-column: 1 / -1;
+  margin-top: 2px;
+  color: var(--fg-dim, #adacae);
+  font-size: 10px;
+  font-style: italic;
+}
 .track-settings-popover .settings-actions {
   display: flex;
   justify-content: flex-end;

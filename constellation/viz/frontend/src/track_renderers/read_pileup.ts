@@ -1,21 +1,35 @@
-// read_pileup renderer — vector mode draws per-glyph rectangles;
+// read_pileup renderer — vector mode delegates to the shared
+// _alignment_view helper (per-block exon segments + dotted intron
+// connectors + crossed-line mismatch glyphs, colored by sample_id);
 // hybrid mode paints the server-rendered datashader PNG.
+//
+// Wire columns consumed in vector mode:
+//   alignment_id, ref_start, ref_end, strand, mapq, row,
+//   blocks: list<struct{ref_start, ref_end, n_match, n_mismatch}>,
+//   mismatch_positions: list<int64>,
+//   sample_id: int64?, sample_name: string?
 
 import { Table } from 'apache-arrow';
 import { svgEl, clear } from '../engine/svg_layer';
 import { TrackMode } from '../engine/arrow_client';
 import { decodeHybrid, appendHybridImage } from '../engine/hybrid_layer';
 import { TrackRenderer, RenderContext } from './base';
-import {
-  pickAllowList,
-  pickNumber,
-  pickPaletteColor,
-} from './style';
+import { renderAlignmentRows } from './_alignment_view';
 
-const STRAND_COLOR_DEFAULTS: Record<string, string> = {
+// Mirror of the coverage_histogram per-sample palette so multi-track
+// views (coverage + pileup of the same sample) share a color identity.
+const SAMPLE_PALETTE_CYCLE = [
+  '#4f9efb',
+  '#fb7c4f',
+  '#a4d65e',
+  '#d65eb6',
+  '#5ed6cf',
+];
+
+const STRAND_FALLBACK: Record<string, string> = {
   '+': '#5e9cd6',
   '-': '#d6755e',
-  default: '#888',
+  default: '#888888',
 };
 
 const renderer: TrackRenderer = {
@@ -43,95 +57,18 @@ const renderer: TrackRenderer = {
       return;
     }
 
-    if (table.numRows === 0) {
-      const text = svgEl('text', {
-        x: ctx.widthPx / 2,
-        y: ctx.heightPx / 2,
-        'font-size': '11',
-        fill: '#5a5a63',
-        'text-anchor': 'middle',
-      });
-      text.textContent = 'no reads in window';
-      ctx.svg.appendChild(text);
-      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
+    const result = renderAlignmentRows(table, ctx, {
+      colorKey: 'sample_id',
+      paletteCycle: SAMPLE_PALETTE_CYCLE,
+      strandFallback: STRAND_FALLBACK,
+      glyphDataAttrs: [
+        { attr: 'data-alignment-id', column: 'alignment_id' },
+      ],
+    });
+
+    if (result.admittedRows === 0) {
+      emitEmpty(ctx);
       return;
-    }
-
-    const startCol = table.getChild('ref_start');
-    const endCol = table.getChild('ref_end');
-    const strandCol = table.getChild('strand');
-    const rowCol = table.getChild('row');
-    const idCol = table.getChild('alignment_id');
-    if (!startCol || !endCol || !strandCol || !rowCol) {
-      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
-      return;
-    }
-
-    const minRowH = pickNumber(ctx.style, 'min_row_height_px', 2);
-    const maxRowH = pickNumber(ctx.style, 'max_row_height_px', 8);
-    const readOpacity = pickNumber(ctx.style, 'read_opacity', 1.0);
-    const allowedStrands = pickAllowList(ctx.filter, 'visible_strands');
-
-    const admit: boolean[] = new Array(table.numRows);
-    let maxRow = -1;
-    let admittedRows = 0;
-    for (let i = 0; i < table.numRows; i++) {
-      const strand = String(strandCol.get(i));
-      if (allowedStrands && !allowedStrands.has(strand)) {
-        admit[i] = false;
-        continue;
-      }
-      admit[i] = true;
-      admittedRows++;
-      const r = Number(rowCol.get(i));
-      if (r > maxRow) maxRow = r;
-    }
-
-    if (admittedRows === 0) {
-      const text = svgEl('text', {
-        x: ctx.widthPx / 2,
-        y: ctx.heightPx / 2,
-        'font-size': '11',
-        fill: '#5a5a63',
-        'text-anchor': 'middle',
-      });
-      text.textContent = 'no reads in window';
-      ctx.svg.appendChild(text);
-      ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
-      return;
-    }
-
-    const stackH = maxRow + 1;
-    const rowH = Math.max(
-      minRowH,
-      Math.min(maxRowH, (ctx.heightPx - 4) / Math.max(1, stackH)),
-    );
-
-    for (let i = 0; i < table.numRows; i++) {
-      if (!admit[i]) continue;
-      const start = Number(startCol.get(i));
-      const end = Number(endCol.get(i));
-      const strand = String(strandCol.get(i));
-      const row = Number(rowCol.get(i));
-      const x0 = ctx.xScale(start);
-      const x1 = ctx.xScale(end);
-      const fill = pickPaletteColor(
-        ctx.style,
-        strand,
-        STRAND_COLOR_DEFAULTS[strand] ?? STRAND_COLOR_DEFAULTS.default,
-      );
-      const rect = svgEl('rect', {
-        x: x0,
-        y: 4 + row * rowH,
-        width: Math.max(1, x1 - x0),
-        height: Math.max(1, rowH - 1),
-        fill,
-        opacity: String(readOpacity),
-      });
-      if (idCol) {
-        rect.setAttribute('data-alignment-id', String(idCol.get(i)));
-      }
-      ctx.svg.appendChild(rect);
     }
 
     const label = svgEl('text', {
@@ -141,12 +78,24 @@ const renderer: TrackRenderer = {
       'text-anchor': 'end',
       fill: '#8a8a93',
     });
-    label.textContent = `vector · ${admittedRows.toLocaleString()} reads`;
+    label.textContent = `vector · ${result.admittedRows.toLocaleString()} reads`;
     ctx.svg.appendChild(label);
-
-    const naturalHeight = stackH > 0 ? 4 + stackH * rowH : ctx.heightPx;
-    ctx.svg.dataset.naturalHeight = String(naturalHeight);
+    ctx.svg.dataset.naturalHeight = String(result.naturalHeight);
   },
 };
 
 export default renderer;
+
+
+function emitEmpty(ctx: RenderContext): void {
+  const text = svgEl('text', {
+    x: ctx.widthPx / 2,
+    y: ctx.heightPx / 2,
+    'font-size': '11',
+    fill: '#5a5a63',
+    'text-anchor': 'middle',
+  });
+  text.textContent = 'no reads in window';
+  ctx.svg.appendChild(text);
+  ctx.svg.dataset.naturalHeight = String(ctx.heightPx);
+}

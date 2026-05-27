@@ -37,6 +37,7 @@ _ALIGN_SLOT_KEYS: tuple[tuple[str, str, bool], ...] = (
     ("alignments", "alignments", True),
     ("alignment_blocks", "alignment_blocks", True),
     ("alignment_cs", "alignment_cs", True),
+    ("read_samples", "read_samples", False),
     ("coverage", "coverage", False),
     ("introns", "introns", False),
     ("derived_annotation", "derived_annotation", True),
@@ -58,6 +59,7 @@ _ALIGN_DEFAULT_PATHS: dict[str, str] = {
     "alignments": "alignments",
     "alignment_blocks": "alignment_blocks",
     "alignment_cs": "alignment_cs",
+    "read_samples": "read_samples.parquet",
     "coverage": "coverage.parquet",
     "introns": "introns.parquet",
     "derived_annotation": "derived_annotation",
@@ -97,6 +99,7 @@ class SessionSource:
     alignments: Path | None = None
     alignment_blocks: Path | None = None
     alignment_cs: Path | None = None
+    read_samples: Path | None = None
     coverage: Path | None = None
     introns: Path | None = None
     derived_annotation: Path | None = None
@@ -125,6 +128,7 @@ class SessionSource:
             "alignments": _stringify(self.alignments),
             "alignment_blocks": _stringify(self.alignment_blocks),
             "alignment_cs": _stringify(self.alignment_cs),
+            "read_samples": _stringify(self.read_samples),
             "coverage": _stringify(self.coverage),
             "introns": _stringify(self.introns),
             "derived_annotation": _stringify(self.derived_annotation),
@@ -335,7 +339,7 @@ class Session:
 def _load_source(entry: dict[str, Any]) -> SessionSource:
     """Build a SessionSource from a ``{path, kind?, label?}`` dict.
 
-    Reads the source's ``manifest.json`` (schema v3 required), assembles
+    Reads the source's ``manifest.json`` (schema v4 required), assembles
     the per-kind slot map by joining the manifest's ``outputs`` against
     the well-known relative paths, and returns a frozen dataclass.
     """
@@ -384,6 +388,20 @@ def _load_source(entry: dict[str, Any]) -> SessionSource:
         if resolved is not None:
             slots[slot] = resolved
 
+    # Cluster sources reach back into their upstream align dir for
+    # alignments / alignment_blocks / alignment_cs / read_samples so the
+    # genome browser's cluster_pileup track can expand a cluster into
+    # its constituent member reads (PR 5). The cluster manifest records
+    # the align_dir as a back-reference; we resolve align slots from
+    # there without scanning sibling SessionSources in the session —
+    # preserves the per-source isolation rule.
+    if manifest.kind == "cluster" and getattr(manifest, "align_dir", ""):
+        _attach_align_slots_from_cluster(
+            source_path,
+            str(manifest.align_dir),
+            slots,
+        )
+
     return SessionSource(
         path=source_path,
         kind=manifest.kind,
@@ -393,6 +411,55 @@ def _load_source(entry: dict[str, Any]) -> SessionSource:
         samples=samples,
         **slots,
     )
+
+
+def _attach_align_slots_from_cluster(
+    cluster_source_path: Path,
+    align_dir_str: str,
+    slots: dict[str, Path | None],
+) -> None:
+    """Populate the alignment-related slots on a cluster ``SessionSource``
+    from the upstream align dir recorded in the cluster's manifest.
+
+    Cluster outputs reference their align_dir as a back-pointer; we
+    treat that back-pointer as the source of truth for
+    ``alignments`` / ``alignment_blocks`` / ``alignment_cs`` /
+    ``read_samples`` on the cluster source. The cluster source is then
+    self-sufficient for the cluster_pileup kernel's member-view
+    expansion (no sibling-source lookup required).
+
+    Silently skips when align_dir is empty, missing, or doesn't carry a
+    readable v4 align manifest — the cluster source still loads, just
+    without the alignment slots populated (the kernel surfaces that
+    state via ``cluster_view_supported = False`` in its metadata).
+    """
+    from constellation.sequencing.transcriptome.manifest import (
+        read_manifest_dir,
+    )
+
+    align_dir = Path(align_dir_str)
+    if not align_dir.is_absolute():
+        align_dir = (cluster_source_path / align_dir).resolve()
+    if not align_dir.is_dir():
+        return
+    try:
+        align_manifest = read_manifest_dir(align_dir)
+    except (ValueError, FileNotFoundError):
+        return
+    if align_manifest.kind != "align":
+        return
+    align_outputs = dict(align_manifest.outputs)
+    for manifest_key, slot, _is_dir in _ALIGN_SLOT_KEYS:
+        if slots.get(slot) is not None:
+            continue
+        rel = align_outputs.get(manifest_key) or _ALIGN_DEFAULT_PATHS.get(
+            manifest_key
+        )
+        if rel is None:
+            continue
+        resolved = _resolve_slot(align_dir, rel)
+        if resolved is not None:
+            slots[slot] = resolved
 
 
 def _resolve_slot(base: Path, rel: str) -> Path | None:

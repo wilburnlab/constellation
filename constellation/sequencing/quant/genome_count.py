@@ -49,8 +49,53 @@ from constellation.sequencing.schemas.alignment import (
     ALIGNMENT_CS_TABLE,
     ALIGNMENT_TABLE,
     ALIGNMENT_TAG_TABLE,
+    READ_SAMPLE_TABLE,
 )
 from constellation.sequencing.schemas.quant import FEATURE_QUANT
+
+
+def build_read_samples(
+    read_demux: pa.Table,
+    samples: Samples,
+) -> pa.Table:
+    """Materialise the viz-facing per-read sample assignment table.
+
+    Reduces ``read_demux`` to one ``(read_id, sample_id)`` row per read
+    under the same chimera-agreement policy as :func:`count_reads_per_gene`
+    (reads whose demux rows disagree on sample_id are dropped), then
+    left-joins against ``samples.samples`` for the human-facing
+    ``sample_name``. Output conforms to
+    :data:`~constellation.sequencing.schemas.alignment.READ_SAMPLE_TABLE`
+    and is written to ``<align-output-dir>/read_samples.parquet`` by the
+    align resolve stage so the genome browser's read pile-up track can
+    join alignments to sample identities without chasing the demux dir
+    at query time.
+
+    ``samples.samples`` cardinality is bounded by the number of
+    biological samples in the run (tens at most), so the hash-join is
+    cheap regardless of ``read_demux`` size.
+    """
+    rd = read_demux.select(["read_id", "sample_id"])
+    valid_mask = pc.is_valid(rd.column("sample_id"))
+    rd_valid = rd.filter(valid_mask)
+    rd_unique = rd_valid.group_by("read_id").aggregate(
+        [("sample_id", "min"), ("sample_id", "max")]
+    )
+    rd_consistent = rd_unique.filter(
+        pc.equal(
+            rd_unique.column("sample_id_min"),
+            rd_unique.column("sample_id_max"),
+        )
+    ).select(["read_id", "sample_id_min"]).rename_columns(
+        ["read_id", "sample_id"]
+    )
+    sample_lookup = samples.samples.select(["sample_id", "sample_name"])
+    joined = rd_consistent.join(
+        sample_lookup,
+        keys="sample_id",
+        join_type="left outer",
+    ).select(["read_id", "sample_id", "sample_name"])
+    return joined.cast(READ_SAMPLE_TABLE)
 
 
 def count_reads_per_gene(

@@ -23,6 +23,15 @@ export interface TrackQueryParams {
   samples?: string[];
   viewport_px?: number;
   max_glyphs?: number;
+  /** Kernel-pushdown filter (read_pileup only at present): drop
+   *  alignments with mapq below this threshold at scan time. 0 admits
+   *  every primary alignment (the default). */
+  min_mapq?: number;
+  /** Cluster_pileup view selector (PR 5): 'clusters' renders the
+   *  default rectangle-per-cluster view; 'members' expands clusters
+   *  into their member-read alignments with the read_pileup visual
+   *  vocabulary. Undefined defaults to 'clusters' server-side. */
+  cluster_view?: 'clusters' | 'members';
   force?: TrackMode;
 }
 
@@ -45,6 +54,12 @@ export async function fetchTrackData(
   }
   if (params.max_glyphs !== undefined) {
     url.searchParams.set('max_glyphs', String(params.max_glyphs));
+  }
+  if (params.min_mapq !== undefined && params.min_mapq > 0) {
+    url.searchParams.set('min_mapq', String(params.min_mapq));
+  }
+  if (params.cluster_view) {
+    url.searchParams.set('cluster_view', params.cluster_view);
   }
   if (params.force) {
     url.searchParams.set('force', params.force);

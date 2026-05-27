@@ -642,12 +642,16 @@ def _build_transcriptome_parser(subs) -> None:
     )
     p_aln.add_argument(
         "--emit-cs-tags",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "write alignment_cs/ partitioned dataset preserving "
             "minimap2's cs:long string per alignment. Required by "
             "'transcriptome cluster --build-consensus' for base-resolution "
-            "PWM accumulation. Off by default."
+            "PWM accumulation AND by the genome browser's read pile-up "
+            "track for per-base mismatch glyphs. On by default; "
+            "--no-emit-cs-tags opts out and emits a stderr warning that "
+            "read pile-up visualization is disabled for this run."
         ),
     )
     p_aln.add_argument(
@@ -778,7 +782,8 @@ def _build_transcriptome_parser(subs) -> None:
         help=(
             "populate consensus_sequence per cluster via the shared "
             "weighted-PWM kernel against the genome window. Requires "
-            "the upstream align run to have set --emit-cs-tags."
+            "the upstream align run to have alignment_cs/ (default; "
+            "absent only when align was invoked with --no-emit-cs-tags)."
         ),
     )
     p_cluster.add_argument(
@@ -1168,6 +1173,7 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
         aggregate_junctions,
         build_gene_matrix,
         build_pileup,
+        build_read_samples,
         cluster_junctions,
         count_reads_per_gene,
         fused_decode_filter_overlap_worker,
@@ -1284,6 +1290,16 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     # derived-annotation passes downstream.
     emit_blocks = True
     emit_cs = bool(args.emit_cs_tags)
+    if not emit_cs:
+        print(
+            "WARNING: --no-emit-cs-tags disables read pile-up "
+            "visualization in the genome browser (the read_pileup "
+            "track requires per-alignment cs:long strings to render "
+            "exonic geometry + per-base mismatch glyphs). Re-run without "
+            "--no-emit-cs-tags to restore viz support.",
+            file=sys.stderr,
+            flush=True,
+        )
     cluster_introns = not bool(args.no_cluster_junctions)
     emit_coverage = not bool(args.no_coverage)
     emit_derived_annotation = not bool(args.no_derived_annotation)
@@ -1391,6 +1407,20 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     pq.write_table(introns, introns_path)
     emit_outputs["introns"] = str(introns_path)
 
+    # ── Per-read sample resolution (always emitted) ──────────────────
+    # read_samples.parquet is the viz-facing per-read sample assignment
+    # the genome browser's read pile-up track joins against to color
+    # alignments by sample. Also used downstream as `read_to_sample` for
+    # the coverage + derived-annotation passes' per-sample
+    # stratification, so the reduction runs once and feeds both
+    # consumers. Chimera policy lives inside `build_read_samples` — the
+    # same agreement rule the count stage uses.
+    read_samples_table = build_read_samples(read_demux, samples)
+    read_samples_path = output_dir / "read_samples.parquet"
+    pq.write_table(read_samples_table, read_samples_path)
+    emit_outputs["read_samples"] = str(read_samples_path)
+    read_to_sample_table = read_samples_table.select(["read_id", "sample_id"])
+
     # ── Coverage pile-up + derived annotation ─────────────────────────
     # The two functions are now siblings with path-based handoff:
     # build_pileup streams COVERAGE_TABLE batches to coverage.parquet;
@@ -1399,30 +1429,8 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     # which compute_exon_psi consumes as a dataset. No giant in-memory
     # handoffs between these passes anymore.
     need_pileup = emit_coverage or emit_derived_annotation
-    read_to_sample_table: pa.Table | None = None
     coverage_path: Path | None = None
     if need_pileup:
-        rd = read_demux.select(["read_id", "sample_id"])
-        valid_mask = pa.compute.is_valid(rd.column("sample_id"))
-        rd_valid = rd.filter(valid_mask)
-        # If the same read appears in multiple demux rows (chimeras),
-        # require all rows to agree on sample_id — match the count
-        # stage's policy. The resulting 2-column table replaces the
-        # 200M-entry Python dict the prior version materialised at this
-        # point.
-        rd_unique = rd_valid.group_by("read_id").aggregate(
-            [("sample_id", "min"), ("sample_id", "max")]
-        )
-        rd_consistent = rd_unique.filter(
-            pa.compute.equal(
-                rd_unique.column("sample_id_min"),
-                rd_unique.column("sample_id_max"),
-            )
-        ).select(["read_id", "sample_id_min"]).rename_columns(
-            ["read_id", "sample_id"]
-        )
-        read_to_sample_table = rd_consistent
-
         coverage_path = output_dir / "coverage.parquet"
         build_pileup(
             blocks_table, alignments_table, genome.contigs,
@@ -1742,8 +1750,9 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         if not cs_success.exists():
             print(
                 f"--build-consensus requires alignment_cs/_SUCCESS in "
-                f"{align_dir}; rerun `transcriptome align` with "
-                "--emit-cs-tags.",
+                f"{align_dir}; the upstream align run was invoked with "
+                "--no-emit-cs-tags. Rerun `transcriptome align` without "
+                "that flag (cs:long is on by default).",
                 file=sys.stderr,
             )
             return 2

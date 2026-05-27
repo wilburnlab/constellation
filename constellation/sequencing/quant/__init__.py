@@ -32,6 +32,7 @@ from constellation.sequencing.quant.gene_matrix import (
     render_gene_matrix_tsv,
 )
 from constellation.sequencing.quant.genome_count import (
+    build_read_samples,
     count_reads_per_gene,
     extract_alignment_blocks,
     fused_decode_filter_overlap_worker,
@@ -58,6 +59,7 @@ __all__ = [
     "build_derived_annotation",
     "build_gene_matrix",
     "build_pileup",
+    "build_read_samples",
     "cluster_junctions",
     "compute_exon_psi",
     "compute_gene_overlap",

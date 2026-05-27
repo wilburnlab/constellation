@@ -22,7 +22,6 @@ from fastapi.responses import StreamingResponse
 from constellation.viz.server.arrow_stream import batches_to_response
 from constellation.viz.server.session import Session
 from constellation.viz.tracks.base import (
-    HYBRID_SCHEMA,
     ThresholdDecision,
     TrackBinding,
     TrackQuery,
@@ -131,6 +130,10 @@ def get_data(
     samples: list[str] | None = Query(None),
     viewport_px: int = Query(1200, ge=1, le=8192),
     max_glyphs: int = Query(50_000, ge=100),
+    min_mapq: int = Query(0, ge=0, le=60),
+    cluster_view: str | None = Query(
+        None, pattern="^(clusters|members)$"
+    ),
     force: str | None = Query(None, pattern="^(vector|hybrid)$"),
     request: Request = None,  # type: ignore[assignment]
 ) -> StreamingResponse:
@@ -152,6 +155,9 @@ def get_data(
         raise HTTPException(404, f"binding {binding!r} not found for kind {kind!r}")
 
     forced = ThresholdDecision(force) if force else None
+    mode_extra: dict[str, str] = {}
+    if cluster_view is not None:
+        mode_extra["cluster_view"] = cluster_view
     query = TrackQuery(
         contig=contig,
         start=int(start),
@@ -160,10 +166,12 @@ def get_data(
         viewport_px=int(viewport_px),
         max_glyphs=int(max_glyphs),
         force=forced,
+        min_mapq=int(min_mapq),
+        mode_extra=mode_extra,
     )
 
     mode = kernel.threshold(track_binding, query)
-    schema = kernel.schema if mode is ThresholdDecision.VECTOR else HYBRID_SCHEMA
+    schema = kernel.schema_for(query, mode)
     batches = kernel.fetch(track_binding, query, mode)
     return batches_to_response(
         schema,
@@ -171,5 +179,9 @@ def get_data(
         headers={
             "X-Track-Mode": mode.value,
             "X-Track-Kind": kind,
+            # When the kernel has multi-view vector schemas (cluster_pileup)
+            # the chosen view rides on the response so the TS layer can
+            # branch even before inspecting column presence.
+            "X-Track-View": mode_extra.get("cluster_view", ""),
         },
     )

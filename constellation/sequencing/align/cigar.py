@@ -343,6 +343,59 @@ def parse_cs_long_blocks(
     return blocks
 
 
+def parse_cs_long_mismatch_positions(
+    cs_string: str,
+    ref_start: int,
+) -> list[int]:
+    """Walk a cs:long string and return reference positions of each
+    single-base substitution (``*ab`` token).
+
+    Sibling to :func:`parse_cs_long_blocks` — same regex grammar, but
+    accumulates per-position mismatch coordinates instead of per-block
+    summary counts. Used by the genome browser's read pile-up renderer
+    to place per-base X glyphs at mismatch sites. Positions are
+    0-based, on the reference frame, half-open (the substitution
+    occupies ``[pos, pos + 1)``).
+
+    Insertions (``+xxx``), deletions (``-xxx``), splice operators
+    (``~aa<N>bb``), and matches contribute to the running reference
+    cursor but not to the returned list. Empty cs string returns ``[]``.
+
+    Raises ``ValueError`` on malformed cs (matches
+    :func:`parse_cs_long_blocks` behavior).
+    """
+    if not cs_string:
+        return []
+
+    positions: list[int] = []
+    ref_pos = ref_start
+    pos = 0
+    for m in _CS_TOKEN_RE.finditer(cs_string):
+        if m.start() != pos:
+            raise ValueError(f"malformed cs string at offset {pos}: {cs_string!r}")
+        pos = m.end()
+        if (g := m.group("match_short")) is not None:
+            ref_pos += int(g)
+        elif (g := m.group("match_long")) is not None:
+            ref_pos += len(g)
+        elif m.group("sub_ref") is not None:
+            positions.append(ref_pos)
+            ref_pos += 1
+        elif m.group("insert") is not None:
+            # Insertion in query advances query_pos only; ref_pos unchanged.
+            pass
+        elif (g := m.group("delete")) is not None:
+            ref_pos += len(g)
+        elif (g := m.group("splice_len")) is not None:
+            ref_pos += int(g)
+        else:  # pragma: no cover — covered by the regex alternation
+            raise ValueError(f"unrecognised cs token at offset {m.start()}")
+
+    if pos != len(cs_string):
+        raise ValueError(f"trailing bytes in cs string: {cs_string!r}")
+    return positions
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Junction extraction
 # ──────────────────────────────────────────────────────────────────────
@@ -409,6 +462,7 @@ __all__ = [
     "Junction",
     "parse_cigar_blocks",
     "parse_cs_long_blocks",
+    "parse_cs_long_mismatch_positions",
     "blocks_to_junctions",
     "query_start_from_cigar",
 ]

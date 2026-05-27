@@ -3,17 +3,27 @@
 Replaces the ad-hoc ``json.dumps({...})`` blocks that ``constellation
 transcriptome demultiplex``, ``... align`` and ``... cluster`` emit.
 
-Schema v3 promotes the demux stage to a formal manifest alongside align
+Schema v4 (current) adds two align-side outputs that the read pile-up
+visualization treats as first-class: ``read_samples`` (a small parquet
+join read_id → sample_id/sample_name materialized at align resolve time
+from the upstream demux dir, so the viz layer never chases a
+back-reference) and an always-emitted ``alignment_cs`` (the
+``--emit-cs-tags`` flag flipped to default-on, with ``--no-emit-cs-tags``
+the opt-out — opting out disables read pile-up viz). v3 manifests must
+be regenerated via ``transcriptome align`` (no real-world users yet, so
+the reader is a clean cut, not a back-compat shim).
+
+Schema v3 promoted the demux stage to a formal manifest alongside align
 + cluster (it was previously an ad-hoc JSON dict with no
-``schema_version`` field) and removes the ``samples_path`` field from
+``schema_version`` field) and removed the ``samples_path`` field from
 cluster manifests — sample state is now persisted into the demux
 output dir as a ParquetDir bundle (``<demux-dir>/samples/``) and read
 forward by align + cluster, so the path to the original TSV is no
 longer load-bearing.
 
-Schema v3 fields (top level)::
+Schema v4 fields (top level)::
 
-    schema_version  = 3
+    schema_version  = 4
     kind            "demux" | "align" | "cluster"
     created_at      ISO 8601 UTC timestamp
 
@@ -33,7 +43,9 @@ Schema v3 fields (top level)::
     input_files        list[str]
     parameters         dict[str, Any]  (verb-specific knob snapshot)
     stages             dict[str, Any]  (verb-specific counters)
-    outputs            dict[str, str]  (relative or absolute paths)
+    outputs            dict[str, str]  (relative or absolute paths;
+                                        align v4 includes ``read_samples``
+                                        and (default) ``alignment_cs``)
     samples            list[str] | None
     # align-specific
     demux_dir          str
@@ -57,13 +69,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 
-MANIFEST_SCHEMA_VERSION = 3
+MANIFEST_SCHEMA_VERSION = 4
 MANIFEST_FILENAME = "manifest.json"
 
 
 @dataclass(frozen=True, slots=True)
 class DemuxManifest:
-    """Schema v3 manifest for ``transcriptome demultiplex`` outputs.
+    """Schema v4 manifest for ``transcriptome demultiplex`` outputs.
 
     The demux stage produces ``read_demux/`` (resolved sample_ids per
     read), ``feature_quant.parquet`` + downstream protein artifacts, and
@@ -84,7 +96,14 @@ class DemuxManifest:
 
 @dataclass(frozen=True, slots=True)
 class AlignManifest:
-    """Schema v3 manifest for ``transcriptome align`` outputs."""
+    """Schema v4 manifest for ``transcriptome align`` outputs.
+
+    v4 adds two ``outputs`` keys consumed by the read pile-up viz:
+    ``read_samples`` (per-read sample assignment, materialized from the
+    upstream demux dir at align resolve time) and the now-default-on
+    ``alignment_cs`` (cs:long strings per primary alignment; suppressed
+    only when the user passes ``--no-emit-cs-tags``).
+    """
 
     schema_version: int
     kind: Literal["align"]
@@ -102,7 +121,7 @@ class AlignManifest:
 
 @dataclass(frozen=True, slots=True)
 class ClusterManifest:
-    """Schema v3 manifest for ``transcriptome cluster`` outputs."""
+    """Schema v4 manifest for ``transcriptome cluster`` outputs."""
 
     schema_version: int
     kind: Literal["cluster"]
@@ -219,8 +238,9 @@ def read_manifest(path: Path) -> DemuxManifest | AlignManifest | ClusterManifest
     """Read ``<dir>/manifest.json`` and return the typed dataclass.
 
     Raises ``ValueError`` with an actionable message for missing-kind
-    files, unsupported schema versions, or pre-v3 manifests (the clean
-    cutover refuses to interpret legacy stage outputs).
+    files, unsupported schema versions, or pre-v4 manifests (the clean
+    cutover refuses to interpret legacy stage outputs — re-run the
+    producing stage to upgrade).
     """
     raw = json.loads(path.read_text(encoding="utf-8"))
     schema_version = raw.get("schema_version")

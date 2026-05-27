@@ -232,7 +232,11 @@ export class TrackSettingsPanel {
         this.checkboxStyleRow('Show labels', 'show_labels', true),
       );
     } else if (kind === 'coverage_histogram') {
-      const samples = numericList(this.opts.meta.samples);
+      // `samples_in_data` is the Python kernel's metadata field name
+      // (matches read_pileup); the picker also reads sibling
+      // `sample_names` when present so labels stay human-readable.
+      const samples = numericList(this.opts.meta.samples_in_data);
+      const sampleNames = stringOrNullList(this.opts.meta.sample_names);
       const paletteCycle = [
         '#4f9efb',
         '#fb7c4f',
@@ -245,8 +249,11 @@ export class TrackSettingsPanel {
       } else {
         samples.forEach((sampleId, idx) => {
           const fallback = paletteCycle[idx % paletteCycle.length];
+          const name = sampleNames[idx] ?? null;
           const label =
-            sampleId === -1 ? 'all (unstratified)' : `sample ${sampleId}`;
+            sampleId === -1 ? 'all (unstratified)'
+            : name ? `${name} (${sampleId})`
+            : `sample ${sampleId}`;
           section.appendChild(
             paletteRow(
               label,
@@ -287,11 +294,44 @@ export class TrackSettingsPanel {
         this.checkboxStyleRow('Show max depth', 'show_max_depth', true),
       );
     } else if (kind === 'read_pileup') {
+      // Per-sample exon palette — primary color key for the pile-up
+      // after PR 3. One row per sample_id surfaced in `samples_in_data`;
+      // the renderer falls back to the strand-based palette below for
+      // reads whose sample_id is null (escape-hatch demux configs).
+      const samples = numericList(this.opts.meta.samples_in_data);
+      const sampleNames = stringOrNullList(this.opts.meta.sample_names);
+      const samplePaletteCycle = [
+        '#4f9efb',
+        '#fb7c4f',
+        '#a4d65e',
+        '#d65eb6',
+        '#5ed6cf',
+      ];
+      if (samples.length === 0) {
+        section.appendChild(emptyHint('no samples in this source'));
+      } else {
+        samples.forEach((sampleId, idx) => {
+          const fallback = samplePaletteCycle[idx % samplePaletteCycle.length];
+          const name = sampleNames[idx] ?? null;
+          const label = name ? `${name} (${sampleId})` : `sample ${sampleId}`;
+          section.appendChild(
+            paletteRow(
+              label,
+              this.getPalette(String(sampleId)) ?? fallback,
+              (hex) => this.setPalette(String(sampleId), hex),
+            ),
+          );
+        });
+      }
+      // Per-strand exon palette — fallback for null sample_id reads
+      // and an escape hatch for users who want a non-sample-based
+      // coloring. Users can also override `palette.exon` for a
+      // uniform color across strands.
       ['+', '-', 'default'].forEach((strand) => {
         const fallback = strand === '+' ? '#5e9cd6' : strand === '-' ? '#d6755e' : '#888888';
         const label =
-          strand === '+' ? 'Forward strand'
-          : strand === '-' ? 'Reverse strand'
+          strand === '+' ? 'Forward strand (fallback)'
+          : strand === '-' ? 'Reverse strand (fallback)'
           : 'Unstranded / default';
         section.appendChild(
           paletteRow(label, this.getPalette(strand) ?? fallback, (hex) =>
@@ -299,6 +339,46 @@ export class TrackSettingsPanel {
           ),
         );
       });
+      // Intron-connector + mismatch-glyph palettes. Both shared
+      // across every read; mismatch color stays one consistent value
+      // across samples per the UX brief (sample identity lives in
+      // the exon fill).
+      section.appendChild(
+        paletteRow(
+          'Intron connector',
+          this.getPalette('intron') ?? '#5a5a63',
+          (hex) => this.setPalette('intron', hex),
+        ),
+      );
+      section.appendChild(
+        paletteRow(
+          'Mismatch glyph',
+          this.getPalette('mismatch') ?? '#e3493a',
+          (hex) => this.setPalette('mismatch', hex),
+        ),
+      );
+      section.appendChild(
+        this.textRow(
+          'Intron dasharray',
+          'intron_stroke_dasharray',
+          '2,2',
+        ),
+      );
+      section.appendChild(
+        this.numberRow(
+          'Intron stroke (px)',
+          'intron_stroke_width_px',
+          1,
+          { min: 0.5, max: 4, step: 0.5 },
+        ),
+      );
+      section.appendChild(
+        this.numberRow('Mismatch glyph size (px)', 'mismatch_glyph_size_px', 6, {
+          min: 2,
+          max: 20,
+          step: 1,
+        }),
+      );
       section.appendChild(
         this.numberRow('Min row height (px)', 'min_row_height_px', 2, {
           min: 1,
@@ -463,10 +543,17 @@ export class TrackSettingsPanel {
         }),
       );
     } else if (kind === 'coverage_histogram') {
-      const samples = numericList(this.opts.meta.samples);
+      const samples = numericList(this.opts.meta.samples_in_data);
+      const sampleNames = stringOrNullList(this.opts.meta.sample_names);
       if (samples.length === 0) {
         section.appendChild(emptyHint('no samples in window yet'));
       } else {
+        const labelFor = (key: string): string => {
+          if (key === '-1') return 'all';
+          const idx = samples.indexOf(Number(key));
+          const name = idx >= 0 ? sampleNames[idx] ?? null : null;
+          return name ? `${name} (${key})` : `sample ${key}`;
+        };
         section.appendChild(
           allowListRow(
             'Visible samples',
@@ -478,7 +565,7 @@ export class TrackSettingsPanel {
                 .filter((n) => Number.isFinite(n));
               this.setFilterArray('visible_samples', asNums);
             },
-            (key) => (key === '-1' ? 'all' : `sample ${key}`),
+            labelFor,
           ),
         );
       }
@@ -490,6 +577,29 @@ export class TrackSettingsPanel {
         }),
       );
     } else if (kind === 'read_pileup') {
+      const samples = numericList(this.opts.meta.samples_in_data);
+      const sampleNames = stringOrNullList(this.opts.meta.sample_names);
+      if (samples.length > 0) {
+        const labelFor = (key: string): string => {
+          const idx = samples.indexOf(Number(key));
+          const name = idx >= 0 ? sampleNames[idx] ?? null : null;
+          return name ? `${name} (${key})` : `sample ${key}`;
+        };
+        section.appendChild(
+          allowListRow(
+            'Visible samples',
+            samples.map(String),
+            this.getFilterArray('visible_samples'),
+            (selected) => {
+              const asNums = selected
+                .map((s) => Number(s))
+                .filter((n) => Number.isFinite(n));
+              this.setFilterArray('visible_samples', asNums);
+            },
+            labelFor,
+          ),
+        );
+      }
       section.appendChild(
         allowListRow(
           'Visible strands',
@@ -498,7 +608,39 @@ export class TrackSettingsPanel {
           (selected) => this.setFilterArray('visible_strands', selected),
         ),
       );
+      // MAPQ is a kernel-pushdown filter — changing it invalidates the
+      // client's cached Arrow table and triggers a refetch (debounced
+      // by the genome browser's render loop), unlike the allowlists
+      // above which apply client-side off the cached payload. The hint
+      // text spells that out for the user.
+      const mapqRow = this.numberFilterRow('Min MAPQ', 'min_mapq', 0, {
+        min: 0,
+        max: 60,
+        step: 1,
+      });
+      mapqRow.appendChild(filterHint('changing this triggers a refetch'));
+      section.appendChild(mapqRow);
     } else if (kind === 'cluster_pileup') {
+      // Cluster view: only surfaced when the upstream align dir is
+      // resolvable from the cluster source's manifest (kernel reports
+      // `cluster_view_supported`). When unavailable (legacy outputs,
+      // de-novo clusters without genome alignments), the toggle is
+      // hidden and the track stays in cluster-rectangle view.
+      if (this.opts.meta.cluster_view_supported === true) {
+        const clusterViewRow = this.selectFilterRow(
+          'Cluster view',
+          'cluster_view',
+          'clusters',
+          [
+            { value: 'clusters', label: 'Clusters' },
+            { value: 'members', label: 'Member reads' },
+          ],
+        );
+        clusterViewRow.appendChild(
+          filterHint('changing this triggers a refetch'),
+        );
+        section.appendChild(clusterViewRow);
+      }
       const modes = stringList(this.opts.meta.modes);
       if (modes.length === 0) modes.push('genome-guided', 'de-novo');
       section.appendChild(
@@ -617,6 +759,23 @@ export class TrackSettingsPanel {
       (value) => {
         this.style[key] = value;
         this.opts.onStyleChange(this.style);
+      },
+    );
+  }
+
+  private selectFilterRow(
+    label: string,
+    key: string,
+    fallback: string,
+    options: Array<{ value: string; label: string }>,
+  ): HTMLElement {
+    return selectRow(
+      label,
+      this.getString(this.filter, key, fallback),
+      options,
+      (value) => {
+        this.filter[key] = value;
+        this.opts.onFilterChange(this.filter);
       },
     );
   }
@@ -935,6 +1094,18 @@ function emptyHint(text: string): HTMLElement {
   return el;
 }
 
+
+/** Inline italic note for filter rows that have side effects beyond
+ *  the cached-payload restyle path (i.e. they round-trip to the
+ *  server). Appended as a sibling under the row so it sits directly
+ *  beneath the input without breaking the row's flex layout. */
+function filterHint(text: string): HTMLElement {
+  const el = document.createElement('div');
+  el.className = 'settings-row-hint';
+  el.textContent = text;
+  return el;
+}
+
 function numericList(source: unknown): number[] {
   if (!Array.isArray(source)) return [];
   const out: number[] = [];
@@ -951,6 +1122,23 @@ function stringList(source: unknown): string[] {
   for (const v of source as unknown[]) {
     if (v === null || v === undefined) continue;
     out.push(String(v));
+  }
+  return out;
+}
+
+
+/** Parallel-array companion to `numericList`: preserves explicit
+ *  null/undefined slots so the caller can pair indices against another
+ *  array (e.g. `samples_in_data[i]` <-> `sample_names[i]`). */
+function stringOrNullList(source: unknown): Array<string | null> {
+  if (!Array.isArray(source)) return [];
+  const out: Array<string | null> = [];
+  for (const v of source as unknown[]) {
+    if (v === null || v === undefined) {
+      out.push(null);
+    } else {
+      out.push(String(v));
+    }
   }
   return out;
 }

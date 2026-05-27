@@ -89,6 +89,18 @@ class TrackQuery:
     kernel must honor it (or, in the case of `force=vector` with a too-
     expensive payload, return vector with a truncated flag in the response
     metadata — handled at the server layer, not the kernel).
+
+    `min_mapq` is a kernel-pushdown filter (read_pileup only at present)
+    — alignments with ``mapq < min_mapq`` are dropped at scan time. The
+    default of 0 admits every primary alignment and matches pre-PR-4
+    behavior. Other kernels ignore it.
+
+    `mode_extra` is a generic per-kernel kwargs bag. First use:
+    ``cluster_view: 'clusters' | 'members'`` on cluster_pileup
+    (cluster-rectangle view vs per-member read view). Future kernels
+    add their own keys without bloating the TrackQuery surface. Empty
+    dict by default — kernels that don't read a key see no behavior
+    change.
     """
 
     contig: str
@@ -98,6 +110,8 @@ class TrackQuery:
     viewport_px: int = 1200
     max_glyphs: int = 50_000
     force: ThresholdDecision | None = None
+    min_mapq: int = 0
+    mode_extra: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -171,9 +185,26 @@ class TrackKernel(ABC):
         query: TrackQuery,
         mode: ThresholdDecision,
     ) -> Iterator[pa.RecordBatch]:
-        """Yield record batches matching either `self.schema` (vector) or
-        `HYBRID_SCHEMA` (hybrid). The server wraps the iterator with
-        `pa.ipc.new_stream(...)` and ships it as a `StreamingResponse`."""
+        """Yield record batches matching `schema_for(query, mode)`. The
+        server wraps the iterator with `pa.ipc.new_stream(...)` and ships
+        it as a `StreamingResponse`."""
+
+    def schema_for(
+        self, query: TrackQuery, mode: ThresholdDecision
+    ) -> pa.Schema:
+        """Return the wire schema for this query + mode.
+
+        Default: ``HYBRID_SCHEMA`` when ``mode`` is hybrid, otherwise
+        ``self.schema``. Kernels that emit more than one vector-mode
+        schema (cluster_pileup branches between cluster-rectangle and
+        per-member-read views via ``query.mode_extra['cluster_view']``)
+        override this. The endpoint passes the returned schema to the
+        Arrow IPC writer, so it must match the batches yielded by
+        ``fetch`` exactly.
+        """
+        if mode is ThresholdDecision.HYBRID:
+            return HYBRID_SCHEMA
+        return self.schema
 
     # ------------------------------------------------------------------
     # Helpers shared by kernel implementations
