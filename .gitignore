@@ -59,3 +59,7 @@ constellation/viz/frontend/.vite/
 constellation/viz/frontend/package-lock.json
 #constellation/viz/frontend/pnpm-lock.yaml
 constellation/viz/frontend/yarn.lock
+
+# Personal session notes and explainer drafts. Local-only working area;
+# explainers graduate to docs/explainers/<domain>/ when ready.
+context/

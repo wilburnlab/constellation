@@ -28,6 +28,11 @@ import constellation.core.sequence.nucleic
 import constellation.core.sequence.ops
 import constellation.core.sequence.proforma
 import constellation.core.sequence.protein
+import constellation.core.signal
+import constellation.core.signal.baseline
+import constellation.core.signal.calibration
+import constellation.core.signal.phase
+import constellation.core.signal.windows
 import constellation.core.stats
 import constellation.core.stats.calibration
 import constellation.core.stats.distributions
@@ -158,6 +163,15 @@ import constellation.codon
 import constellation.structure
 import constellation.structure.readers
 import constellation.nmr
+import constellation.nmr.io
+import constellation.nmr.io.bruker
+import constellation.nmr.io.schemas
+import constellation.nmr.processing
+import constellation.nmr.processing.apodization
+import constellation.nmr.processing.fourier
+import constellation.nmr.processing.phase
+import constellation.nmr.processing.reference
+import constellation.nmr.processing.zerofill
 import constellation.models
 import constellation.cli
 import constellation.thirdparty
