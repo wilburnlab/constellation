@@ -906,6 +906,63 @@ def _build_transcriptome_parser(subs) -> None:
     p_cluster.add_argument("--progress", action="store_true")
     p_cluster.set_defaults(func=_cmd_transcriptome_cluster)
 
+    # ── Diagnose (standalone report regenerator) ────────────────────
+    p_diag = tx_subs.add_parser(
+        "diagnose",
+        help=(
+            "Regenerate diagnostic report(s) for an existing "
+            "transcriptome align and/or cluster output dir. "
+            "Read-only: never re-runs any pipeline stages, only "
+            "rebuilds report.md + figures/*.svg from the parquet "
+            "outputs already present."
+        ),
+    )
+    p_diag.add_argument(
+        "--align-dir",
+        default=None,
+        help=(
+            "generate <align-dir>/diagnostics/report.md for this "
+            "transcriptome-align output dir. Optional; at least one of "
+            "--align-dir / --cluster-dir is required."
+        ),
+    )
+    p_diag.add_argument(
+        "--cluster-dir",
+        default=None,
+        help=(
+            "generate <cluster-dir>/diagnostics/report.md for this "
+            "transcriptome-cluster output dir. Optional; at least one "
+            "of --align-dir / --cluster-dir is required."
+        ),
+    )
+    p_diag.add_argument(
+        "--reference",
+        default=None,
+        help=(
+            "reference cache handle override. Defaults to the value in "
+            "the input dir's manifest.json."
+        ),
+    )
+    p_diag.add_argument(
+        "--reference-dir",
+        default=None,
+        help=(
+            "escape-hatch reference dir override. Mutually exclusive "
+            "with --reference."
+        ),
+    )
+    p_diag.add_argument(
+        "--organism-profile",
+        choices=("compact_eukaryote", "intermediate_eukaryote", "animal"),
+        default=None,
+        help=(
+            "override the organism-profile recorded in the manifest. "
+            "Affects only the flag thresholds (e.g. biological-"
+            "plausibility intron-length cap)."
+        ),
+    )
+    p_diag.set_defaults(func=_cmd_transcriptome_diagnose)
+
 
 def _resolve_input_paths(reads_args: list[str]) -> list[Path]:
     """Expand --reads arguments into a deterministic list of files.
@@ -2455,6 +2512,101 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             flush=True,
         )
     return 0
+
+
+def _cmd_transcriptome_diagnose(args: argparse.Namespace) -> int:
+    """Regenerate diagnostic report(s) for an existing align / cluster dir.
+
+    Read-only — never re-runs pipeline stages. Loads each input dir's
+    manifest, resolves a reference (from --reference / --reference-dir
+    override or the manifest), and calls the corresponding
+    build_*_diagnostics_report orchestrator. Output paths default to
+    ``<input-dir>/diagnostics/`` per stage.
+    """
+    import sys
+    from pathlib import Path
+
+    if args.reference is not None and args.reference_dir is not None:
+        print(
+            "error: --reference and --reference-dir are mutually exclusive",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.align_dir and not args.cluster_dir:
+        print(
+            "error: at least one of --align-dir / --cluster-dir is required",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Reference resolution — try the override first; if no override and
+    # both stages share the same reference (via manifest), the orchestrators
+    # auto-load it themselves. We only resolve here if an override was given.
+    reference = None
+    annotation = None
+    if args.reference is not None or args.reference_dir is not None:
+        from constellation.sequencing.annotation.io import load_annotation
+        from constellation.sequencing.reference.io import load_genome_reference
+
+        ref_path, _ref_handle, _ref_assembly = _resolve_reference_args(
+            handle_arg=args.reference, dir_arg=args.reference_dir
+        )
+        if ref_path is None:
+            return 1
+        if (ref_path / "genome").is_dir():
+            reference = load_genome_reference(ref_path / "genome")
+        if (ref_path / "annotation").is_dir():
+            annotation = load_annotation(ref_path / "annotation")
+
+    rc = 0
+    if args.align_dir:
+        from constellation.sequencing.transcriptome.align.diagnostics import (
+            build_align_diagnostics_report,
+        )
+        align_dir = Path(args.align_dir).expanduser().resolve()
+        if not align_dir.is_dir():
+            print(f"error: --align-dir not found: {align_dir}", file=sys.stderr)
+            return 1
+        try:
+            report_path = build_align_diagnostics_report(
+                align_dir,
+                reference=reference,
+                annotation=annotation,
+                organism_profile=args.organism_profile,
+            )
+            print(f"align report: {report_path}", flush=True)
+        except Exception as exc:
+            print(
+                f"error: align report generation failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            rc = 1
+
+    if args.cluster_dir:
+        from constellation.sequencing.transcriptome.cluster.diagnostics import (
+            build_cluster_diagnostics_report,
+        )
+        cluster_dir = Path(args.cluster_dir).expanduser().resolve()
+        if not cluster_dir.is_dir():
+            print(f"error: --cluster-dir not found: {cluster_dir}", file=sys.stderr)
+            return 1
+        try:
+            report_path = build_cluster_diagnostics_report(
+                cluster_dir,
+                reference=reference,
+                annotation=annotation,
+            )
+            print(f"cluster report: {report_path}", flush=True)
+        except Exception as exc:
+            print(
+                f"error: cluster report generation failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            rc = 1
+
+    return rc
 
 
 def _build_taxonomy_parser(subs) -> None:
