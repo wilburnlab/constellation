@@ -57,11 +57,88 @@ PROTEIN_SCORE_TABLE: pa.Schema = pa.schema(
 )
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Novel peptide classification output
+# ──────────────────────────────────────────────────────────────────────
+
+
+# Output of ``classify_novel_peptides`` — one row per unique detected
+# novel peptide sequence, classified against an mmseqs2 alignment of
+# the novel proteome vs the reference proteome (+ optionally
+# Swiss-Prot). Per-peptide deduplication keeps the most-canonical
+# classification (priority ordering from ``massspec.search.novel.
+# _CLASSIFICATION_PRIORITY``: snp < insertion < deletion < complex <
+# truncations < trypsin_cutsite_mutation < deviations < unknown <
+# non_reference).
+#
+# Within the winning class, the row whose source ORF has the highest
+# abundance (``protein_abundance`` map, typically mean TPM) is chosen
+# as the representative — see ``transcript_id`` and the supporting-
+# transcripts pair below for the full multi-mapping context.
+NOVEL_PEPTIDE_TABLE: pa.Schema = pa.schema(
+    [
+        # Canonical AA sequence (no modifications) — the cartographer
+        # algorithm operates on canonical sequences only.
+        pa.field("peptide_sequence", pa.string(), nullable=False),
+        # ProForma 2.0 string, when the peptide is bound to a Library
+        # row that carries modseq info. Null otherwise.
+        pa.field("modified_sequence", pa.string(), nullable=True),
+        # One of the 11 classes from _CLASSIFICATION_PRIORITY.
+        pa.field("classification", pa.string(), nullable=False),
+        # Aligned reference substring at the peptide's locus
+        # (CIGAR-walk derived). Empty string when not applicable
+        # (e.g. n_term_deviation, non_reference, unknown).
+        pa.field("ref_seq", pa.string(), nullable=True),
+        # Novel protein accession (from novel_proteins input) — the
+        # ORF identifier emitted by the upstream sequencing module.
+        pa.field("protein_id", pa.string(), nullable=False),
+        # Reference protein accession the alignment found (mmseqs2 hit
+        # target). Null when there's no hit for the novel protein.
+        pa.field("ref_protein_id", pa.string(), nullable=True),
+        # Gene symbol, populated from gene_map if provided.
+        pa.field("gene", pa.string(), nullable=True),
+        # mmseqs2 CIGAR string for the hit (query-centric, 1-indexed
+        # inclusive coordinates). Empty when no hit.
+        pa.field("cigar", pa.string(), nullable=True),
+        # Which target database the hit belongs to: ``"refseq"`` (target
+        # in the reference proteome) vs ``"swissprot"`` (rescued by
+        # the Swiss-Prot competitive target). Null when the upstream
+        # alignment carried no tier annotation. Matches the
+        # ``[aligned_to=...]`` tag in the transcriptome→proteome
+        # combined.fasta header.
+        pa.field("aligned_to", pa.string(), nullable=True),
+        # Full novel protein sequence — present for downstream
+        # validation / re-classification without needing the
+        # novel-proteins FASTA at hand.
+        pa.field("novel_protein_seq", pa.string(), nullable=True),
+        # Full reference protein sequence at the aligned target.
+        pa.field("ref_protein_seq", pa.string(), nullable=True),
+        # The ORF / transcript whose representative was kept after
+        # the most-abundant tie-break across all ORFs that produce
+        # this peptide. Typically equal to ``protein_id``; differs
+        # when the long-read workflow renames per-cluster ORFs.
+        pa.field("transcript_id", pa.string(), nullable=True),
+        # Number of distinct source ORFs / transcripts the peptide
+        # could have come from (rows considered before the most-
+        # abundant pick). Always >= 1.
+        pa.field("n_transcripts_supporting", pa.int64(), nullable=True),
+        # Semicolon-delimited list of all source ORFs the peptide
+        # could have come from, e.g. ``"P213;P788"``. Includes the
+        # winning ``transcript_id``. Consumers `.split(";")` to
+        # recover the set. Preserves the full multi-mapping info.
+        pa.field("supporting_transcripts", pa.string(), nullable=True),
+    ],
+    metadata={b"schema_name": b"NovelPeptideTable"},
+)
+
+
 register_schema("PeptideScoreTable", PEPTIDE_SCORE_TABLE)
 register_schema("ProteinScoreTable", PROTEIN_SCORE_TABLE)
+register_schema("NovelPeptideTable", NOVEL_PEPTIDE_TABLE)
 
 
 __all__ = [
+    "NOVEL_PEPTIDE_TABLE",
     "PEPTIDE_SCORE_TABLE",
     "PROTEIN_SCORE_TABLE",
 ]
