@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import os
 import platform
 import socket
 import sys
@@ -97,6 +98,68 @@ def default_heap_for_input(size_bytes: int) -> str:
     if gib < 20:
         return "24g"
     return "48g"
+
+
+def available_memory_gib() -> float | None:
+    """Available system memory in GiB, or ``None`` when we can't tell.
+
+    Linux / WSL: parses ``/proc/meminfo`` for the ``MemAvailable`` field
+    (kernel's reclaim-aware estimate of what a new process can actually
+    use, accounting for page cache that can be evicted). Falls back to
+    POSIX ``sysconf("SC_AVPHYS_PAGES") * sysconf("SC_PAGE_SIZE")``
+    (gives raw free pages, less accurate than MemAvailable but works
+    on macOS too). Returns ``None`` on Windows or any failure — callers
+    should fall back to a static default in that case.
+    """
+    # Linux / WSL — preferred path: MemAvailable accounts for page
+    # cache that's reclaimable. Available since kernel 3.14 (2014).
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    kib = int(line.split()[1])
+                    return kib / (1024**2)
+    except (FileNotFoundError, PermissionError, ValueError, IndexError):
+        pass
+
+    # POSIX fallback (macOS, BSD): raw free physical pages. Less
+    # accurate than MemAvailable but better than total memory.
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        avail_pages = os.sysconf("SC_AVPHYS_PAGES")
+        return (page_size * avail_pages) / (1024**3)
+    except (ValueError, AttributeError, OSError):
+        pass
+
+    return None
+
+
+def default_heap_for_system(
+    *,
+    fraction: float = 0.75,
+    min_gib: int = 4,
+    max_gib: int = 96,
+) -> str:
+    """Pick a ``-Xmx`` from the current system's available memory.
+
+    Returns ``int(available_gib * fraction)`` clamped to
+    ``[min_gib, max_gib]``, formatted as ``"<N>g"``. Defaults aim for a
+    headless workstation / cluster node: leave 25% for the OS + other
+    processes, never go below 4g (smaller JVMs can OOM on EncyclopeDIA's
+    library indexing), never go above 96g (heaps larger than that
+    burn time in major GC for negligible throughput on the EncyclopeDIA
+    workloads we run).
+
+    Falls back to ``"12g"`` (matches the wrappers' static default) when
+    :func:`available_memory_gib` can't determine system memory — e.g.
+    on Windows or a hardened container without ``/proc``.
+    """
+    avail = available_memory_gib()
+    if avail is None:
+        return "12g"
+    target = int(avail * fraction)
+    target = max(min_gib, min(max_gib, target))
+    return f"{target}g"
 
 
 def _utc_now_iso() -> str:
@@ -202,8 +265,10 @@ def write_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
 __all__ = [
     "PtmToggle",
     "SUPPORTED_VERSIONS",
+    "available_memory_gib",
     "build_manifest_envelope",
     "default_heap_for_input",
+    "default_heap_for_system",
     "encyclopedia_passthrough_args",
     "ptm_toggle_args",
     "sha256_file",
