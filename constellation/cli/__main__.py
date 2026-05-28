@@ -33,7 +33,7 @@ from constellation.thirdparty import (  # noqa: F401
 from constellation.thirdparty.registry import registered, try_find
 
 
-def _preload_matplotlib_for_reports() -> None:
+def _preload_matplotlib_for_reports(*, verbose: bool = False) -> None:
     """Pre-import matplotlib so its libstdc++ wins the dynamic linker's
     resolution over later-loaded C extensions.
 
@@ -46,18 +46,42 @@ def _preload_matplotlib_for_reports() -> None:
     something incompatible.
 
     Called at the very top of CLI handlers that auto-emit or regenerate
-    diagnostic reports. Silent no-op when matplotlib isn't installed —
-    the report generator will fall through to its own graceful-skip
-    path. Kept in this module (not under ``constellation.sequencing.*``)
-    so calling it doesn't side-effect import pyarrow first, defeating
-    the purpose.
+    diagnostic reports. Kept in this module (not under
+    ``constellation.sequencing.*``) so calling it doesn't side-effect
+    import pyarrow first, defeating the purpose.
+
+    Failures are logged to stderr but never raise — the per-section
+    safe-plot wrapper still degrades gracefully.
+
+    ``verbose=True`` (set via the ``CONSTELLATION_DIAGNOSE_DEBUG``
+    env var) prints each stage's success/failure to stderr so we can
+    tell whether the preload itself works in a given shell context vs
+    whether something later breaks matplotlib.
     """
+    import os
+    debug = verbose or bool(os.environ.get("CONSTELLATION_DIAGNOSE_DEBUG"))
+
+    def _log(msg: str) -> None:
+        if debug:
+            sys.stderr.write(f"[preload-matplotlib] {msg}\n")
+            sys.stderr.flush()
+
+    _log("entering")
     try:
         import matplotlib
+        _log(f"  matplotlib {matplotlib.__version__} from {matplotlib.__file__}")
         matplotlib.use("Agg")
+        _log("  backend set to Agg")
         import matplotlib.pyplot  # noqa: F401
-    except ImportError:
-        pass
+        _log("  matplotlib.pyplot imported successfully")
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(
+            f"WARNING: matplotlib preload failed "
+            f"({type(exc).__name__}: {exc}). Diagnostic figures will be "
+            f"unavailable for this run. Set CONSTELLATION_DIAGNOSE_DEBUG=1 "
+            f"to get a verbose trace.\n"
+        )
+        sys.stderr.flush()
 
 
 def _cmd_doctor(_args: argparse.Namespace) -> int:
