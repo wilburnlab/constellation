@@ -33,17 +33,53 @@ from constellation.thirdparty import (  # noqa: F401
 from constellation.thirdparty.registry import registered, try_find
 
 
+def _pin_env_libstdcxx(debug_log) -> None:
+    """Force-load the conda env's ``libstdc++.so.6`` so subsequent
+    C-extension loads (matplotlib, pyarrow, torch) bind against IT
+    rather than whatever older copy ``LD_LIBRARY_PATH`` happens to
+    point at.
+
+    HPC clusters routinely have ``module load`` state that prepends a
+    system / spack miniconda lib dir to ``LD_LIBRARY_PATH``. The
+    dynamic linker resolves ``libstdc++.so.6`` to that older copy and
+    later loads of e.g. matplotlib's ``_c_internal_utils.so`` fail
+    with ``CXXABI_1.3.15`` not found. Once we explicitly dlopen the
+    env's copy by absolute path with ``RTLD_GLOBAL``, glibc's loader
+    registers it by SONAME; subsequent NEEDED-entry resolution finds
+    the already-loaded copy and skips the ``LD_LIBRARY_PATH`` search.
+
+    Silent no-op when the env doesn't ship its own libstdc++ (rare —
+    conda-forge envs always do).
+    """
+    import ctypes
+    import os
+
+    conda_prefix = os.environ.get("CONDA_PREFIX") or str(
+        Path(sys.executable).parent.parent
+    )
+    candidate = Path(conda_prefix) / "lib" / "libstdc++.so.6"
+    debug_log(f"  env libstdc++ candidate: {candidate}")
+    if not candidate.is_file():
+        debug_log("  candidate not present; skipping")
+        return
+    try:
+        ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
+        debug_log(f"  dlopened {candidate} (RTLD_GLOBAL)")
+    except OSError as exc:
+        debug_log(f"  dlopen FAILED: {exc}")
+
+
 def _preload_matplotlib_for_reports(*, verbose: bool = False) -> None:
     """Pre-import matplotlib so its libstdc++ wins the dynamic linker's
     resolution over later-loaded C extensions.
 
-    pyarrow's bundled compiled extensions dlopen libstdc++ on import; on
-    HPC clusters where ``LD_LIBRARY_PATH`` (or ``RUNPATH``) doesn't
-    prepend the conda env's lib dir, the loader can pin an older system
-    libstdc++ that matplotlib's ``c_internal_utils.so`` can't bind
-    against (``CXXABI_1.3.15`` not found). Importing matplotlib FIRST
-    gets its libstdc++ requirement satisfied before pyarrow pins
-    something incompatible.
+    Two-step:
+      1. Force-load the conda env's libstdc++ by explicit path (see
+         :func:`_pin_env_libstdcxx`).  Defends against HPC shells where
+         ``LD_LIBRARY_PATH`` has a system / spack libstdc++ ahead of
+         the env's.
+      2. Import ``matplotlib.pyplot`` so its compiled extensions dlopen
+         while the pinned libstdc++ is the SONAME-registered copy.
 
     Called at the very top of CLI handlers that auto-emit or regenerate
     diagnostic reports. Kept in this module (not under
@@ -54,9 +90,7 @@ def _preload_matplotlib_for_reports(*, verbose: bool = False) -> None:
     safe-plot wrapper still degrades gracefully.
 
     ``verbose=True`` (set via the ``CONSTELLATION_DIAGNOSE_DEBUG``
-    env var) prints each stage's success/failure to stderr so we can
-    tell whether the preload itself works in a given shell context vs
-    whether something later breaks matplotlib.
+    env var) prints each stage's success/failure to stderr.
     """
     import os
     debug = verbose or bool(os.environ.get("CONSTELLATION_DIAGNOSE_DEBUG"))
@@ -67,6 +101,7 @@ def _preload_matplotlib_for_reports(*, verbose: bool = False) -> None:
             sys.stderr.flush()
 
     _log("entering")
+    _pin_env_libstdcxx(_log)
     try:
         import matplotlib
         _log(f"  matplotlib {matplotlib.__version__} from {matplotlib.__file__}")
