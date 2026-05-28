@@ -69,7 +69,6 @@ def test_t2p_required_args() -> None:
     }
     expected = {
         "--protein-counts",
-        "--proteins-fasta",
         "--gpf",
         "--injections",
         "--output-dir",
@@ -77,9 +76,11 @@ def test_t2p_required_args() -> None:
     assert expected.issubset(required), (
         f"missing required args: {expected - required}"
     )
-    # --reference-fasta / --reference-annotation / --reference-dir
-    # are all optional at parse-time; the handler validates that
-    # enough information is present to resolve them.
+    # --reference-fasta / --reference-annotation / --reference-dir are
+    # all optional at parse-time (handler validates post-parse).
+    # --proteins-fasta is optional — the pipeline derives novel ORF
+    # sequences from --protein-counts (the demux table's `sequence`
+    # column) by default.
     optional = {
         opt
         for action in t2p._actions
@@ -89,6 +90,7 @@ def test_t2p_required_args() -> None:
     assert "--reference-fasta" in optional
     assert "--reference-annotation" in optional
     assert "--reference-dir" in optional
+    assert "--proteins-fasta" in optional
 
 
 def test_t2p_reference_dir_auto_resolves_fasta_and_annotation(
@@ -601,6 +603,61 @@ def test_orchestrator_end_to_end_mocked(
         "09_per_injection",
         "10_quant_report",
     }
+    # Stage 6 cache name: <run-stem>_combined_GPF.dia. <run-stem>
+    # defaults to the output-dir basename when no --run-name override.
+    process_dia_calls = [
+        c[1] for c in stub_external_calls["calls"] if c[0] == "process_dia"
+    ]
+    assert len(process_dia_calls) == 1
+    expected_stem = out.name
+    assert process_dia_calls[0].endswith(
+        f"06_process_dia/{expected_stem}_combined_GPF.dia"
+    ), f"unexpected Stage 6 path: {process_dia_calls[0]}"
+
+
+def test_orchestrator_tpm_cutoff_in_filenames(
+    stub_inputs, stub_external_calls
+) -> None:
+    """Every TPM-dependent output (Stages 4, 5, 7, 8, 10) carries the
+    TPM cutoff in its filename so parallel sweeps at different cutoffs
+    under one --output-dir don't collide. Stages 0, 1, 2, 3, 6, 9 are
+    TPM-independent and keep their plain names. Default cutoff is 1.0
+    → suffix '_1TPM' (integer form, not '_1.0TPM')."""
+    from constellation.transcriptome_to_proteome import (
+        run_transcriptome_to_proteomics,
+    )
+
+    args = _build_args(stub_inputs)
+    rc = run_transcriptome_to_proteomics(args=args)
+    assert rc == 0
+    out = stub_inputs["output_dir"]
+
+    # TPM-dependent outputs.
+    assert (out / "04_combined_fasta" / "combined_1TPM.fasta").is_file()
+    assert (out / "05_predict_library" / "combined_1TPM.dlib").is_file()
+    # Stage 7 — collision filter on by default → .filtered.elib variant.
+    assert (out / "07_gpf_search" / "combined_1TPM.filtered.elib").is_file()
+    assert (
+        out / "08_classify_novel_peptides" / "novel_peptides_1TPM.parquet"
+    ).is_file()
+    assert (out / "10_quant_report" / "quant_report_1TPM.elib").is_file()
+
+
+def test_orchestrator_tpm_cutoff_fractional_filename(
+    stub_inputs, stub_external_calls
+) -> None:
+    """Fractional cutoffs preserve the decimal with `.` → `_` so the
+    filename stays POSIX-safe: e.g. 0.5 → '_0_5TPM'."""
+    from constellation.transcriptome_to_proteome import (
+        run_transcriptome_to_proteomics,
+    )
+
+    args = _build_args(stub_inputs, min_avg_tpm=0.5)
+    rc = run_transcriptome_to_proteomics(args=args)
+    assert rc == 0
+    out = stub_inputs["output_dir"]
+    assert (out / "04_combined_fasta" / "combined_0_5TPM.fasta").is_file()
+    assert (out / "10_quant_report" / "quant_report_0_5TPM.elib").is_file()
 
 
 def test_orchestrator_threads_fasta_to_every_search(
@@ -618,7 +675,7 @@ def test_orchestrator_threads_fasta_to_every_search(
     rc = run_transcriptome_to_proteomics(args=args)
     assert rc == 0
     combined_fasta = (
-        stub_inputs["output_dir"] / "04_combined_fasta" / "combined.fasta"
+        stub_inputs["output_dir"] / "04_combined_fasta" / "combined_1TPM.fasta"
     )
     fastas = stub_external_calls["search_fasta"]
     # 1 GPF search + 1 injection (stub has a single injection) = 2 calls.
@@ -641,7 +698,7 @@ def test_orchestrator_threads_fasta_to_library_export(
     args = _build_args(stub_inputs)
     assert run_transcriptome_to_proteomics(args=args) == 0
     combined_fasta = (
-        stub_inputs["output_dir"] / "04_combined_fasta" / "combined.fasta"
+        stub_inputs["output_dir"] / "04_combined_fasta" / "combined_1TPM.fasta"
     )
     assert stub_external_calls["export_fasta"] == combined_fasta
 
@@ -697,7 +754,7 @@ def test_orchestrator_stage7_resumes_from_existing_elib(
     assert run_transcriptome_to_proteomics(args=args) == 0
 
     stage7 = stub_inputs["output_dir"] / "07_gpf_search"
-    assert (stage7 / "combined.filtered.elib").is_file()
+    assert (stage7 / "combined_1TPM.filtered.elib").is_file()
     # Simulate a crash after the filtered elib was written but before the
     # stage was marked complete — clear Stage 7's _SUCCESS and the
     # top-level _SUCCESS (which would otherwise short-circuit the run).
@@ -731,7 +788,7 @@ def test_orchestrator_collision_filter_default_runs(
     stage7 = stub_inputs["output_dir"] / "07_gpf_search"
     assert (stage7 / "collision_metadata.json").is_file()
     assert (stage7 / "_raw").is_dir()
-    assert (stage7 / "combined.filtered.elib").is_file()
+    assert (stage7 / "combined_1TPM.filtered.elib").is_file()
     # Raw search output consolidated under _raw/ with a transparent name.
     assert (stage7 / "_raw" / "combined.raw.elib").is_file()
 
@@ -751,4 +808,4 @@ def test_orchestrator_no_collision_filter_skips_raw(
     assert not (stage7 / "collision_metadata.json").is_file()
     # _raw/ still exists because the jar's raw output lands there, but
     # no extra files were created since filter was skipped.
-    assert (stage7 / "combined.elib").is_file()
+    assert (stage7 / "combined_1TPM.elib").is_file()
