@@ -30,21 +30,9 @@ import re
 import sys
 from pathlib import Path
 
-_PTM_NAMES = (
-    "Acetyl",
-    "ProteinNTermAcetyl",
-    "Carbamidomethyl",
-    "Deamidation",
-    "Dimethyl",
-    "GlyGly",
-    "HexNAc",
-    "Methyl",
-    "Oxidation",
-    "Phospho",
-    "PyroGluQ",
-    "Succinyl",
-    "Trimethyl",
-    "TMT",
+from constellation.massspec.search.encyclopedia.ptm_defaults import (
+    PTM_NAMES as _PTM_NAMES,
+    default_for as _ptm_default_for,
 )
 
 
@@ -329,23 +317,18 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
         action="store_true",
         help="enumerate N-terminal ragged variants",
     )
-    # Per-PTM toggles — one --ptm-<name> for each EncyclopeDIA-recognised PTM.
+    # Per-PTM toggles — one --ptm-<name> for each EncyclopeDIA-recognised
+    # PTM. Defaults imported from
+    # ``massspec.search.encyclopedia.ptm_defaults`` so the standalone CLI
+    # and ``transcriptome-to-proteome`` cannot drift.
     for name in _PTM_NAMES:
         flag = f"--ptm-{_camel_to_kebab(name)}"
-        # Distinct defaults per the jar's `-h` output:
-        # ProteinNTermAcetyl and PyroGluQ default to "var",
-        # Carbamidomethyl defaults to "fix", everything else "off".
-        if name == "Carbamidomethyl":
-            default = "fix"
-        elif name in ("ProteinNTermAcetyl", "PyroGluQ"):
-            default = "var"
-        else:
-            default = "off"
+        default = _ptm_default_for(name)
         p.add_argument(
             flag,
             choices=["off", "var", "fix"],
             default=default,
-            help=f"{name} PTM mode",
+            help=f"{name} PTM mode (off|var|fix; default {default})",
         )
     _add_jvm_args(p)
     _add_encyclopedia_passthrough_arg(p)

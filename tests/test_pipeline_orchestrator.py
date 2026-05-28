@@ -93,6 +93,35 @@ def test_t2p_required_args() -> None:
     assert "--proteins-fasta" in optional
 
 
+def test_t2p_ptm_defaults_match_lab_convention() -> None:
+    """Pins the orchestrator's PTM defaults so a future refactor cannot
+    silently flip a variable mod off. Defaults come from
+    ``massspec.search.encyclopedia.ptm_defaults`` — see that module's
+    docstring for the rationale (Carb-C fix + N-term-Acetyl/PyroGluQ/M-ox
+    variable, everything else off)."""
+    parser = _make_parser()
+    t2p = _subparsers_action(parser).choices["transcriptome-to-proteome"]
+    # Synthesise a minimal valid argv so parse_args succeeds without
+    # touching the filesystem — every PTM flag defaults to the value
+    # we want to verify.
+    args = t2p.parse_args([
+        "--protein-counts", "/tmp/x",
+        "--reference-fasta", "/tmp/x",
+        "--reference-annotation", "/tmp/x",
+        "--gpf", "/tmp/x",
+        "--injections", "/tmp/x",
+        "--output-dir", "/tmp/x",
+    ])
+    assert args.ptm_carbamidomethyl == "fix"
+    assert args.ptm_protein_n_term_acetyl == "var"
+    assert args.ptm_pyro_glu_q == "var"
+    assert args.ptm_oxidation == "var"
+    # Negative-case sanity — these stay off by default.
+    assert args.ptm_acetyl == "off"
+    assert args.ptm_phospho == "off"
+    assert args.ptm_tmt == "off"
+
+
 def test_t2p_reference_dir_auto_resolves_fasta_and_annotation(
     tmp_path: Path, capsys
 ) -> None:

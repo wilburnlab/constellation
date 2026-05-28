@@ -21,6 +21,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from constellation.massspec.search.encyclopedia.ptm_defaults import (
+    default_for as _ptm_default_for,
+)
+
 
 _VALID_PTM_TOGGLES = ("off", "var", "fix")
 
@@ -259,7 +263,10 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         default=0.01,
         help="Percolator q-value threshold (default 0.01)",
     )
-    # PTM passthroughs — mirror the predict-library subcommand's flags.
+    # PTM passthroughs — flag set + defaults imported from
+    # ``massspec.search.encyclopedia.ptm_defaults`` so the orchestrator
+    # and ``massspec predict-library`` cannot drift on which mods land
+    # in the predicted library.
     for ptm_name, flag in (
         ("Acetyl", "--ptm-acetyl"),
         ("ProteinNTermAcetyl", "--ptm-protein-n-term-acetyl"),
@@ -276,7 +283,7 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         ("Trimethyl", "--ptm-trimethyl"),
         ("TMT", "--ptm-tmt"),
     ):
-        default = "fix" if ptm_name == "Carbamidomethyl" else "off"
+        default = _ptm_default_for(ptm_name)
         p.add_argument(
             flag,
             choices=list(_VALID_PTM_TOGGLES),
