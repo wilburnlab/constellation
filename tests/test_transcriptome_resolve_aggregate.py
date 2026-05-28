@@ -20,7 +20,7 @@ from constellation.sequencing.samples import (
     SAMPLE_TABLE,
     Samples,
 )
-from constellation.sequencing.transcriptome.quant import (
+from constellation.sequencing.transcriptome.demux.quant import (
     PARTIAL_QUANT_TABLE,
     aggregate_partial_quants,
 )

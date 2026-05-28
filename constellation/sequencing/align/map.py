@@ -314,6 +314,7 @@ def map_to_genome(
     output_dir: Path,
     threads: int = 8,
     only_complete: bool = True,
+    minimap2_args: tuple[str, ...] | None = None,
     extra_minimap2_args: tuple[str, ...] = (),
     progress_cb: ProgressCallback | None = None,
 ) -> Path:
@@ -340,6 +341,23 @@ def map_to_genome(
     and a ``.mmi`` index at ``output_dir/genome.mmi``; both reuse on
     subsequent calls (cache-busted by contig count).
 
+    Parameters
+    ----------
+    minimap2_args
+        Full minimap2 argument tuple. When provided, this is used
+        verbatim (and ``extra_minimap2_args`` is ignored). Typically
+        constructed by
+        :func:`constellation.sequencing.align.presets.resolve_minimap2_args`
+        at the CLI layer so the splice-mode base flags + preset +
+        explicit overrides + escape-hatch extra args compose
+        consistently. When ``None``, the function falls back to
+        ``_GENOME_MODE_ARGS + extra_minimap2_args`` for backward
+        compatibility with callers that don't use the resolver.
+    extra_minimap2_args
+        Back-compat path. Only consulted when ``minimap2_args`` is
+        ``None``. New callers should construct the full arg list via
+        the resolver and pass it through ``minimap2_args`` instead.
+
     Returns the final sorted, indexed BAM path.
     """
     demux_dir = Path(demux_dir)
@@ -362,7 +380,10 @@ def map_to_genome(
 
     minimap2_bin = _resolve_minimap2()
     samtools_bin = _resolve_samtools()
-    args = _GENOME_MODE_ARGS + tuple(extra_minimap2_args)
+    if minimap2_args is None:
+        args = _GENOME_MODE_ARGS + tuple(extra_minimap2_args)
+    else:
+        args = tuple(minimap2_args)
     final_bam = bam_dir / "aligned.bam"
 
     cmd_mm2 = [

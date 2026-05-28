@@ -33,7 +33,7 @@ from constellation.sequencing.schemas.transcriptome import (
     CLUSTER_MEMBERSHIP_TABLE,
     TRANSCRIPT_CLUSTER_TABLE,
 )
-from constellation.sequencing.transcriptome.cluster_genome import (
+from constellation.sequencing.transcriptome.cluster.cluster_genome import (
     cluster_by_fingerprint,
 )
 

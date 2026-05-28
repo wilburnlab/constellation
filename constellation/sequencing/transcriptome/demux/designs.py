@@ -25,7 +25,7 @@ import json
 from importlib import resources
 from typing import Final
 
-from constellation.sequencing.transcriptome.adapters import (
+from constellation.sequencing.transcriptome.demux.adapters import (
     Adapter,
     AdapterSlot,
     Barcode,

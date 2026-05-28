@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from constellation.sequencing.transcriptome.scoring import (
+from constellation.sequencing.transcriptome.demux.scoring import (
     AdapterVerdict,
     BarcodeVerdict,
 )

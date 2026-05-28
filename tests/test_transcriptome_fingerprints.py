@@ -33,7 +33,7 @@ from constellation.sequencing.schemas.alignment import (
     INTRON_TABLE,
 )
 from constellation.sequencing.schemas.reference import CONTIG_TABLE
-from constellation.sequencing.transcriptome.fingerprints import (
+from constellation.sequencing.transcriptome.cluster.fingerprints import (
     compute_read_fingerprints,
 )
 

@@ -25,8 +25,8 @@ from typing import Iterable
 import pyarrow as pa
 
 from constellation.core.sequence.nucleic import STANDARD, CodonTable, find_orfs
-from constellation.sequencing.transcriptome.classify import ReadStatus
-from constellation.sequencing.transcriptome.demux import ReadDemuxResult
+from constellation.sequencing.transcriptome.demux.classify import ReadStatus
+from constellation.sequencing.transcriptome.demux.demux import ReadDemuxResult
 
 
 # NanoporeAnalysis's ORF regex hardcodes ATG as the only start codon.

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from constellation.sequencing.align.locate import locate_substring
-from constellation.sequencing.transcriptome.adapters import Barcode
+from constellation.sequencing.transcriptome.demux.adapters import Barcode
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -33,6 +33,181 @@ from constellation.thirdparty import (  # noqa: F401
 from constellation.thirdparty.registry import registered, try_find
 
 
+_LIBSTDCXX_REEXEC_SENTINEL = "_CONSTELLATION_LIBSTDCXX_REEXECED"
+
+
+def _reexec_with_env_libstdcxx_first(debug_log) -> None:
+    """If ``$CONDA_PREFIX/lib`` isn't first on ``LD_LIBRARY_PATH``,
+    re-exec this Python process with it prepended.
+
+    The dynamic linker reads ``LD_LIBRARY_PATH`` once at process
+    startup; modifying it via ``os.environ`` in a running process has
+    no effect on subsequent ``dlopen`` calls. The only way to actually
+    fix the load order from inside Python is to start a new process
+    with the corrected environment.
+
+    The sentinel env var :data:`_LIBSTDCXX_REEXEC_SENTINEL` prevents
+    infinite re-exec loops if the path manipulation somehow doesn't
+    stick.
+
+    Silent no-op when the env doesn't ship its own libstdc++ (rare —
+    conda-forge envs always do), when it's already first on
+    LD_LIBRARY_PATH, or when re-exec fails (in which case we fall
+    through to the ctypes-based defensive pin below).
+    """
+    import os
+
+    if os.environ.get(_LIBSTDCXX_REEXEC_SENTINEL):
+        debug_log("  already re-exec'd this run; skipping")
+        return
+
+    conda_prefix = os.environ.get("CONDA_PREFIX") or str(
+        Path(sys.executable).parent.parent
+    )
+    env_lib = str(Path(conda_prefix) / "lib")
+    if not (Path(env_lib) / "libstdc++.so.6").is_file():
+        debug_log(f"  no libstdc++.so.6 under {env_lib}; skipping re-exec")
+        return
+
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = current.split(":") if current else []
+    if parts and parts[0] == env_lib:
+        debug_log(f"  {env_lib} already first on LD_LIBRARY_PATH")
+        return
+
+    new_env = os.environ.copy()
+    new_env["LD_LIBRARY_PATH"] = (
+        env_lib + ":" + current if current else env_lib
+    )
+    new_env[_LIBSTDCXX_REEXEC_SENTINEL] = "1"
+
+    debug_log(
+        f"  re-execing python with LD_LIBRARY_PATH={env_lib}:<prev>"
+    )
+    try:
+        os.execve(sys.executable, [sys.executable, *sys.argv], new_env)
+        # os.execve does not return on success
+    except OSError as exc:
+        debug_log(f"  re-exec FAILED: {exc}; falling through to ctypes pin")
+
+
+def _pin_env_libstdcxx(debug_log) -> None:
+    """Defensive secondary: ctypes-dlopen the env's libstdc++ with
+    ``RTLD_GLOBAL``.
+
+    Only relevant when :func:`_reexec_with_env_libstdcxx_first` was
+    skipped (env doesn't ship libstdc++, or path was already correct,
+    or sentinel is set after re-exec). Pinning by SONAME via ctypes
+    helps in some configurations but is NOT sufficient on its own
+    when glibc resolves NEEDED entries by absolute path (the spack
+    libstdc++ at one path and the env's at another are independent
+    objects to the loader even with matching SONAME). The re-exec
+    above is the load-bearing fix.
+    """
+    import ctypes
+    import os
+
+    conda_prefix = os.environ.get("CONDA_PREFIX") or str(
+        Path(sys.executable).parent.parent
+    )
+    candidate = Path(conda_prefix) / "lib" / "libstdc++.so.6"
+    debug_log(f"  env libstdc++ candidate: {candidate}")
+    if not candidate.is_file():
+        debug_log("  candidate not present; skipping")
+        return
+    try:
+        ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
+        debug_log(f"  dlopened {candidate} (RTLD_GLOBAL)")
+    except OSError as exc:
+        debug_log(f"  dlopen FAILED: {exc}")
+
+
+def _preload_matplotlib_for_reports(*, verbose: bool = False) -> None:
+    """Pre-import matplotlib so its libstdc++ wins the dynamic linker's
+    resolution over later-loaded C extensions.
+
+    Two-step:
+      1. Force-load the conda env's libstdc++ by explicit path (see
+         :func:`_pin_env_libstdcxx`).  Defends against HPC shells where
+         ``LD_LIBRARY_PATH`` has a system / spack libstdc++ ahead of
+         the env's.
+      2. Import ``matplotlib.pyplot`` so its compiled extensions dlopen
+         while the pinned libstdc++ is the SONAME-registered copy.
+
+    Called at the very top of CLI handlers that auto-emit or regenerate
+    diagnostic reports. Kept in this module (not under
+    ``constellation.sequencing.*``) so calling it doesn't side-effect
+    import pyarrow first, defeating the purpose.
+
+    Failures are logged to stderr but never raise — the per-section
+    safe-plot wrapper still degrades gracefully.
+
+    ``verbose=True`` (set via the ``CONSTELLATION_DIAGNOSE_DEBUG``
+    env var) prints each stage's success/failure to stderr.
+    """
+    import os
+    debug = verbose or bool(os.environ.get("CONSTELLATION_DIAGNOSE_DEBUG"))
+
+    def _log(msg: str) -> None:
+        if debug:
+            sys.stderr.write(f"[preload-matplotlib] {msg}\n")
+            sys.stderr.flush()
+
+    _log("entering")
+    # Try matplotlib as-is first. Most environments load fine on the
+    # first attempt; the re-exec workaround below only fires when
+    # there's an actual libstdc++ skew to fix.
+    try:
+        import matplotlib
+        _log(f"  matplotlib {matplotlib.__version__} from {matplotlib.__file__}")
+        matplotlib.use("Agg")
+        _log("  backend set to Agg")
+        import matplotlib.pyplot  # noqa: F401
+        _log("  matplotlib.pyplot imported on first attempt")
+        return
+    except Exception as exc:  # noqa: BLE001
+        _log(f"  first attempt FAILED: {type(exc).__name__}: {exc}")
+        first_error = exc
+
+    # First attempt failed. If the error is the well-known libstdc++
+    # / CXXABI skew, try the load-bearing fix: re-exec python with
+    # $CONDA_PREFIX/lib prepended to LD_LIBRARY_PATH. Other ImportError
+    # causes (e.g. matplotlib not installed) skip the re-exec and fall
+    # through to the warning below.
+    err_text = str(first_error)
+    looks_like_libstdcxx_skew = (
+        "libstdc++" in err_text or "CXXABI" in err_text or "GLIBCXX" in err_text
+    )
+    if looks_like_libstdcxx_skew:
+        sys.stderr.write(
+            "NOTE: detected libstdc++ ABI skew (env's libstdc++ not "
+            "first on LD_LIBRARY_PATH); re-launching python with the "
+            "load order fixed.\n"
+        )
+        sys.stderr.flush()
+        _reexec_with_env_libstdcxx_first(_log)
+        # If we got here, re-exec was skipped or failed. Try the
+        # ctypes pin as a last-resort defensive measure.
+        _pin_env_libstdcxx(_log)
+        # Re-attempt matplotlib once (only reached when re-exec didn't fire).
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot  # noqa: F401
+            _log("  matplotlib.pyplot imported on second attempt")
+            return
+        except Exception as exc:  # noqa: BLE001
+            first_error = exc
+
+    sys.stderr.write(
+        f"WARNING: matplotlib preload failed "
+        f"({type(first_error).__name__}: {first_error}). Diagnostic "
+        f"figures will be unavailable for this run. Set "
+        f"CONSTELLATION_DIAGNOSE_DEBUG=1 to get a verbose trace.\n"
+    )
+    sys.stderr.flush()
+
+
 def _cmd_doctor(_args: argparse.Namespace) -> int:
     """Print a tool-status table."""
     tools = registered()
@@ -684,6 +859,84 @@ def _build_transcriptome_parser(subs) -> None:
             "which has its own splice operator."
         ),
     )
+    # minimap2 splice-mode tuning. The base splice flags (-ax splice -uf
+    # --cs=long --secondary=no) always apply; these add organism-aware
+    # caps + escape hatches on top. See
+    # constellation/sequencing/align/presets.py for the resolver.
+    p_aln.add_argument(
+        "--organism-profile",
+        choices=("compact_eukaryote", "intermediate_eukaryote", "animal"),
+        default=None,
+        help=(
+            "minimap2 splice-mode preset bundle. compact_eukaryote "
+            "(Pichia / yeast / fungi: -G 5000 -C 5), intermediate_eukaryote "
+            "(Drosophila / C. elegans / Arabidopsis: -G 50000 -C 5), "
+            "animal (mouse / human: -G 200000 -C 5). Default None leaves "
+            "minimap2's stock splice defaults in place — usually wrong "
+            "for anything but vertebrates."
+        ),
+    )
+    p_aln.add_argument(
+        "--max-intron-length",
+        type=int,
+        default=None,
+        help=(
+            "minimap2 -G override. Caps the maximum intron length the "
+            "splice DP will insert. Overrides the preset value when both "
+            "are supplied. Pichia: ~5000; yeast: ~3000; mammals: ~200000."
+        ),
+    )
+    p_aln.add_argument(
+        "--non-canonical-cost",
+        type=int,
+        default=None,
+        help=(
+            "minimap2 -C override. Score penalty for non-canonical splice "
+            "motifs. Default (preset) is 5; raise to disfavor cryptic "
+            "junctions more aggressively. 0 = no penalty (minimap2 stock)."
+        ),
+    )
+    p_aln.add_argument(
+        "--junc-bed",
+        type=str,
+        default=None,
+        help=(
+            "Path to a BED file of annotated junctions to hint minimap2. "
+            "Emits --junc-bed PATH; pairs with --junc-bonus to weight "
+            "annotated junctions over de novo discoveries."
+        ),
+    )
+    p_aln.add_argument(
+        "--junc-bonus",
+        type=int,
+        default=None,
+        help=(
+            "minimap2 --junc-bonus N. Score bonus for junctions matching "
+            "the --junc-bed file. Only meaningful with --junc-bed."
+        ),
+    )
+    p_aln.add_argument(
+        "--minimap2-extra",
+        type=str,
+        default=None,
+        help=(
+            "Raw minimap2 extra-args escape hatch (shlex-split). Use for "
+            "flags not exposed as kwargs (e.g. --splice-flank=no, -k 14). "
+            "Conflicts with the explicit kwarg-managed flags (-G, -C, "
+            "--junc-bed, --junc-bonus) raise an error."
+        ),
+    )
+    p_aln.add_argument(
+        "--report",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "auto-emit a diagnostic report (report.md + figures/*.svg) "
+            "under <output-dir>/diagnostics/ after the resolve stage. "
+            "Pass --no-report to skip. Report generation failures are "
+            "logged but never break a successful align run."
+        ),
+    )
     p_aln.add_argument("--resume", action="store_true")
     p_aln.add_argument("--progress", action="store_true")
     p_aln.set_defaults(func=_cmd_transcriptome_align)
@@ -832,9 +1085,77 @@ def _build_transcriptome_parser(subs) -> None:
         ),
     )
     p_cluster.add_argument("--threads", type=int, default=1)
+    p_cluster.add_argument(
+        "--report",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "auto-emit a diagnostic report (report.md + figures/*.svg) "
+            "under <output-dir>/diagnostics/ after clustering. Pass "
+            "--no-report to skip. Report failures are logged but never "
+            "break a successful cluster run."
+        ),
+    )
     p_cluster.add_argument("--resume", action="store_true")
     p_cluster.add_argument("--progress", action="store_true")
     p_cluster.set_defaults(func=_cmd_transcriptome_cluster)
+
+    # ── Diagnose (standalone report regenerator) ────────────────────
+    p_diag = tx_subs.add_parser(
+        "diagnose",
+        help=(
+            "Regenerate diagnostic report(s) for an existing "
+            "transcriptome align and/or cluster output dir. "
+            "Read-only: never re-runs any pipeline stages, only "
+            "rebuilds report.md + figures/*.svg from the parquet "
+            "outputs already present."
+        ),
+    )
+    p_diag.add_argument(
+        "--align-dir",
+        default=None,
+        help=(
+            "generate <align-dir>/diagnostics/report.md for this "
+            "transcriptome-align output dir. Optional; at least one of "
+            "--align-dir / --cluster-dir is required."
+        ),
+    )
+    p_diag.add_argument(
+        "--cluster-dir",
+        default=None,
+        help=(
+            "generate <cluster-dir>/diagnostics/report.md for this "
+            "transcriptome-cluster output dir. Optional; at least one "
+            "of --align-dir / --cluster-dir is required."
+        ),
+    )
+    p_diag.add_argument(
+        "--reference",
+        default=None,
+        help=(
+            "reference cache handle override. Defaults to the value in "
+            "the input dir's manifest.json."
+        ),
+    )
+    p_diag.add_argument(
+        "--reference-dir",
+        default=None,
+        help=(
+            "escape-hatch reference dir override. Mutually exclusive "
+            "with --reference."
+        ),
+    )
+    p_diag.add_argument(
+        "--organism-profile",
+        choices=("compact_eukaryote", "intermediate_eukaryote", "animal"),
+        default=None,
+        help=(
+            "override the organism-profile recorded in the manifest. "
+            "Affects only the flag thresholds (e.g. biological-"
+            "plausibility intron-length cap)."
+        ),
+    )
+    p_diag.set_defaults(func=_cmd_transcriptome_diagnose)
 
 
 def _resolve_input_paths(reads_args: list[str]) -> list[Path]:
@@ -1174,6 +1495,11 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     200M-read scale: ~3 GB gene_assignments + ~10 GB read_demux at the
     resolve stage; alignment table never materialised whole.
     """
+    # Must precede any pyarrow / torch / sequencing import — see
+    # _preload_matplotlib_for_reports docstring for the libstdc++
+    # ordering rationale.
+    _preload_matplotlib_for_reports()
+
     import sys
     from pathlib import Path
 
@@ -1181,7 +1507,10 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     import pyarrow.dataset as pa_dataset
     import pyarrow.parquet as pq
 
-    from constellation.sequencing.align.map import map_to_genome
+    import shlex
+
+    from constellation.sequencing.align.map import _GENOME_MODE_ARGS, map_to_genome
+    from constellation.sequencing.align.presets import resolve_minimap2_args
     from constellation.sequencing.annotation.io import load_annotation
     from constellation.sequencing.parallel import run_batched
     from constellation.sequencing.progress import (
@@ -1287,6 +1616,38 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     # archived after demux without breaking the align stage.
     bam_inputs = [Path(p) for p in demux_manifest.input_files]
 
+    # ── Resolve minimap2 arg list (preset + overrides + escape hatch) ──
+    # Always computed even on --resume so the manifest reflects the
+    # parameters the user requested *this* invocation. The resolved tuple
+    # is also written into the manifest for downstream reproducibility.
+    try:
+        minimap2_resolved_args = resolve_minimap2_args(
+            base_args=_GENOME_MODE_ARGS,
+            profile=args.organism_profile,
+            max_intron_length=args.max_intron_length,
+            non_canonical_cost=args.non_canonical_cost,
+            junc_bed=Path(args.junc_bed) if args.junc_bed else None,
+            junc_bonus=args.junc_bonus,
+            extra_args=(
+                tuple(shlex.split(args.minimap2_extra))
+                if args.minimap2_extra else ()
+            ),
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.organism_profile is None and args.max_intron_length is None:
+        print(
+            "WARNING: no --organism-profile or --max-intron-length set; "
+            "minimap2 will use its stock -G 200000 intron-length cap. "
+            "For compact genomes (e.g. Pichia, yeast, fungi) this lets "
+            "the splice DP collapse adjacent genes into one read with a "
+            "fictional 50-200 kb 'intron'. Pass `--organism-profile "
+            "compact_eukaryote` for sane defaults.",
+            file=sys.stderr,
+            flush=True,
+        )
+
     # ── Stage 1: align ───────────────────────────────────────────────
     bam_success = output_dir / "bam" / "_SUCCESS"
     aligned_bam = output_dir / "bam" / "aligned.bam"
@@ -1298,6 +1659,7 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             genome,
             output_dir=output_dir,
             threads=args.threads,
+            minimap2_args=minimap2_resolved_args,
             progress_cb=cb,
         )
         bam_success.parent.mkdir(parents=True, exist_ok=True)
@@ -1591,12 +1953,48 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
             "min_intron_read_count": int(args.min_intron_read_count),
             "emit_cs_tags": bool(emit_cs),
             "intron_min_bp": int(args.intron_min_bp),
+            "organism_profile": args.organism_profile,
+            "max_intron_length": args.max_intron_length,
+            "non_canonical_cost": args.non_canonical_cost,
+            "junc_bed": args.junc_bed,
+            "junc_bonus": args.junc_bonus,
+            "minimap2_extra": args.minimap2_extra,
         },
         stages=per_stage,
         outputs=manifest_outputs,
         samples=sample_names,
+        minimap2_resolved_args=list(minimap2_resolved_args),
     )
     (output_dir / "_SUCCESS").write_bytes(b"")
+
+    # ── Diagnostic report ──────────────────────────────────────────────
+    # Always attempt unless the user opts out. Failures are logged but
+    # never break a successful pipeline run.
+    if getattr(args, "report", True):
+        try:
+            from constellation.sequencing.transcriptome.align.diagnostics import (
+                build_align_diagnostics_report,
+            )
+            report_path = build_align_diagnostics_report(
+                output_dir,
+                reference=genome,
+                annotation=annotation,
+                organism_profile=args.organism_profile,
+            )
+            if not args.progress:
+                print(
+                    f"diagnostic report: {report_path}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"WARNING: diagnostic report generation failed: "
+                f"{type(exc).__name__}: {exc}. The align outputs are "
+                f"complete; re-run with `constellation transcriptome "
+                f"diagnose --align-dir {output_dir}` to retry.",
+                file=sys.stderr,
+                flush=True,
+            )
 
     if not args.progress:
         print(
@@ -1704,6 +2102,11 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     — sweeping it never requires re-running align (we re-cluster the
     raw per-position rows on the fly).
     """
+    # Must precede any pyarrow / torch / sequencing import — see
+    # _preload_matplotlib_for_reports docstring for the libstdc++
+    # ordering rationale.
+    _preload_matplotlib_for_reports()
+
     from collections import Counter
     from pathlib import Path
 
@@ -1720,10 +2123,10 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     from constellation.sequencing.quant import cluster_junctions
     from constellation.sequencing.reference.io import load_genome_reference
     from constellation.sequencing.samples import load_samples
-    from constellation.sequencing.transcriptome.cluster_genome import (
+    from constellation.sequencing.transcriptome.cluster.cluster_genome import (
         cluster_by_fingerprint,
     )
-    from constellation.sequencing.transcriptome.fingerprints import (
+    from constellation.sequencing.transcriptome.cluster.fingerprints import (
         compute_read_fingerprints,
     )
     from constellation.sequencing.transcriptome.manifest import (
@@ -2278,6 +2681,33 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     )
     (output_dir / "_SUCCESS").write_bytes(b"")
 
+    # ── Diagnostic report ──────────────────────────────────────────────
+    # Failures don't break the pipeline; they log a re-run hint pointing
+    # at the standalone `transcriptome diagnose` verb.
+    if getattr(args, "report", True):
+        try:
+            from constellation.sequencing.transcriptome.cluster.diagnostics import (
+                build_cluster_diagnostics_report,
+            )
+            report_path = build_cluster_diagnostics_report(
+                output_dir,
+                reference=genome,
+            )
+            if not args.progress:
+                print(
+                    f"diagnostic report: {report_path}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"WARNING: diagnostic report generation failed: "
+                f"{type(exc).__name__}: {exc}. The cluster outputs are "
+                f"complete; re-run with `constellation transcriptome "
+                f"diagnose --cluster-dir {output_dir}` to retry.",
+                file=sys.stderr,
+                flush=True,
+            )
+
     if not args.progress:
         print(
             f"cluster done: {fingerprints_table.num_rows} input fingerprints → "
@@ -2286,6 +2716,106 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             flush=True,
         )
     return 0
+
+
+def _cmd_transcriptome_diagnose(args: argparse.Namespace) -> int:
+    """Regenerate diagnostic report(s) for an existing align / cluster dir.
+
+    Read-only — never re-runs pipeline stages. Loads each input dir's
+    manifest, resolves a reference (from --reference / --reference-dir
+    override or the manifest), and calls the corresponding
+    build_*_diagnostics_report orchestrator. Output paths default to
+    ``<input-dir>/diagnostics/`` per stage.
+    """
+    # Must precede any pyarrow / sequencing import — see
+    # _preload_matplotlib_for_reports docstring for the libstdc++
+    # ordering rationale.
+    _preload_matplotlib_for_reports()
+
+    import sys
+    from pathlib import Path
+
+    if args.reference is not None and args.reference_dir is not None:
+        print(
+            "error: --reference and --reference-dir are mutually exclusive",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.align_dir and not args.cluster_dir:
+        print(
+            "error: at least one of --align-dir / --cluster-dir is required",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Reference resolution — try the override first; if no override and
+    # both stages share the same reference (via manifest), the orchestrators
+    # auto-load it themselves. We only resolve here if an override was given.
+    reference = None
+    annotation = None
+    if args.reference is not None or args.reference_dir is not None:
+        from constellation.sequencing.annotation.io import load_annotation
+        from constellation.sequencing.reference.io import load_genome_reference
+
+        ref_path, _ref_handle, _ref_assembly = _resolve_reference_args(
+            handle_arg=args.reference, dir_arg=args.reference_dir
+        )
+        if ref_path is None:
+            return 1
+        if (ref_path / "genome").is_dir():
+            reference = load_genome_reference(ref_path / "genome")
+        if (ref_path / "annotation").is_dir():
+            annotation = load_annotation(ref_path / "annotation")
+
+    rc = 0
+    if args.align_dir:
+        from constellation.sequencing.transcriptome.align.diagnostics import (
+            build_align_diagnostics_report,
+        )
+        align_dir = Path(args.align_dir).expanduser().resolve()
+        if not align_dir.is_dir():
+            print(f"error: --align-dir not found: {align_dir}", file=sys.stderr)
+            return 1
+        try:
+            report_path = build_align_diagnostics_report(
+                align_dir,
+                reference=reference,
+                annotation=annotation,
+                organism_profile=args.organism_profile,
+            )
+            print(f"align report: {report_path}", flush=True)
+        except Exception as exc:
+            print(
+                f"error: align report generation failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            rc = 1
+
+    if args.cluster_dir:
+        from constellation.sequencing.transcriptome.cluster.diagnostics import (
+            build_cluster_diagnostics_report,
+        )
+        cluster_dir = Path(args.cluster_dir).expanduser().resolve()
+        if not cluster_dir.is_dir():
+            print(f"error: --cluster-dir not found: {cluster_dir}", file=sys.stderr)
+            return 1
+        try:
+            report_path = build_cluster_diagnostics_report(
+                cluster_dir,
+                reference=reference,
+                annotation=annotation,
+            )
+            print(f"cluster report: {report_path}", flush=True)
+        except Exception as exc:
+            print(
+                f"error: cluster report generation failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            rc = 1
+
+    return rc
 
 
 def _build_taxonomy_parser(subs) -> None:

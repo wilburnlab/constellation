@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import pytest
 
-from constellation.sequencing.transcriptome.classify import (
+from constellation.sequencing.transcriptome.demux.classify import (
     Classification,
     ReadStatus,
     classify_read,
     status_string,
 )
-from constellation.sequencing.transcriptome.scoring import (
+from constellation.sequencing.transcriptome.demux.scoring import (
     AdapterVerdict,
     BarcodeVerdict,
 )
