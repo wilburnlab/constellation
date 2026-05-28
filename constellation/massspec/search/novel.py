@@ -763,7 +763,12 @@ def build_gene_map_from_fasta_headers(
                     if bare.startswith("GN="):
                         gene = bare[len("GN="):]
                         break
-                if gene:
+                # Skip the literal "unknown" sentinel — Constellation's
+                # ``build_combined_fasta`` emits ``[gene=unknown]`` for
+                # every entry without a known gene so the tag structure
+                # stays uniform; trusting that as a real gene symbol
+                # would corrupt the map.
+                if gene and gene.lower() != "unknown":
                     out[accession] = gene
                     # UniProt sp|ACC|NAME — register bare ACC as alias
                     # so lookups by the bare accession (what mmseqs2

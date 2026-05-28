@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import re as _re
 from pathlib import Path
 
 import pyarrow as pa
@@ -355,8 +356,9 @@ def test_read_reference_gene_map_unsupported_ext(tmp_path: Path) -> None:
 
 
 def test_build_combined_fasta_headers(tmp_path: Path) -> None:
-    """Every emitted record carries [gene=...]/[accession=...] tags
-    (when available) + source=refseq|transcriptome."""
+    """Every emitted record carries the uniform 4-bracket-tag header
+    structure (gene / accession / aligned_to + source=…),
+    regardless of which upstream values were populated."""
     ref = tmp_path / "reference.fasta"
     _make_proteins_fasta(
         ref,
@@ -367,7 +369,7 @@ def test_build_combined_fasta_headers(tmp_path: Path) -> None:
         [
             {"query": "N1", "target": "REF_A", "evalue": 1e-30,
              "qstart": 1, "qend": 10, "tstart": 1, "tend": 10,
-             "cigar": "10M", "aligned_to": "reference"},
+             "cigar": "10M", "aligned_to": "refseq"},
         ]
     )
     gene_map = {"REF_A": "ACTB", "REF_B": "GAPDH"}
@@ -383,12 +385,12 @@ def test_build_combined_fasta_headers(tmp_path: Path) -> None:
     assert stats["reference"] == 2
     assert stats["novel"] == 1
     text = out.read_text()
-    # Reference records.
-    assert ">REF_A [gene=ACTB] [accession=REF_A] source=refseq" in text
-    assert ">REF_B [gene=GAPDH] [accession=REF_B] source=refseq" in text
+    # Reference records carry [aligned_to=none] alongside the others.
+    assert ">REF_A [gene=ACTB] [accession=REF_A] [aligned_to=none] source=refseq" in text
+    assert ">REF_B [gene=GAPDH] [accession=REF_B] [aligned_to=none] source=refseq" in text
     # Novel record inherits ACTB from its REF_A target.
     assert (
-        ">N1 [gene=ACTB] [accession=REF_A] [aligned_to=reference] "
+        ">N1 [gene=ACTB] [accession=REF_A] [aligned_to=refseq] "
         "source=transcriptome"
     ) in text
 
@@ -424,8 +426,10 @@ def test_build_combined_fasta_dedup_against_self(tmp_path: Path) -> None:
 
 
 def test_build_combined_fasta_no_gene_count(tmp_path: Path) -> None:
-    """Reference records without a gene mapping get counted as
-    no_gene + emitted without the [gene=...] tag."""
+    """Reference records without a gene mapping get counted under
+    ``no_gene_refseq`` and emit ``[gene=unknown]`` as the placeholder
+    (vs the old behaviour of omitting the tag) so downstream parsers
+    see a uniform 4-bracket-tag structure across all records."""
     ref = tmp_path / "reference.fasta"
     _make_proteins_fasta(ref, [("REF_A", "AAA")])
     novel = _make_novel_table([])
@@ -438,10 +442,11 @@ def test_build_combined_fasta_no_gene_count(tmp_path: Path) -> None:
         reference_gene_map={},   # empty map
         output_path=out,
     )
-    assert stats["no_gene"] == 1
+    assert stats["no_gene_refseq"] == 1
     text = out.read_text()
+    assert "[gene=unknown]" in text
     assert "[accession=REF_A]" in text
-    assert "[gene=" not in text
+    assert "[aligned_to=none]" in text
     assert "source=refseq" in text
 
 
@@ -530,7 +535,7 @@ def test_build_combined_fasta_swissprot_aligned_novel_gets_gene(tmp_path: Path) 
             "tstart": pa.array([1, 1]),
             "tend":   pa.array([6, 6]),
             "cigar":  pa.array(["6M", "6M"]),
-            "aligned_to": pa.array(["reference", "swissprot"]),
+            "aligned_to": pa.array(["refseq", "swissprot"]),
         }
     )
 
@@ -549,7 +554,11 @@ def test_build_combined_fasta_swissprot_aligned_novel_gets_gene(tmp_path: Path) 
     assert n_written == 3   # one ref + two novel
     assert "[gene=REFGENE]" in text       # reference protein tagged
     assert "[gene=TETR2]" in text         # SwissProt-aligned novel tagged
-    assert stats["no_gene"] == 0          # nothing missed
+    # No tier ever reports a no-gene miss when the merged map covers
+    # every alignment target.
+    assert stats["no_gene_refseq"] == 0
+    assert stats["no_gene_novel_refseq_aligned"] == 0
+    assert stats["no_gene_novel_swissprot_aligned"] == 0
 
     # Verify the SwissProt-aligned novel ORF specifically:
     sp_novel_lines = [l for l in text.splitlines()
@@ -558,6 +567,200 @@ def test_build_combined_fasta_swissprot_aligned_novel_gets_gene(tmp_path: Path) 
     assert "[gene=TETR2]" in sp_novel_lines[0]
     assert "[accession=P04483]" in sp_novel_lines[0]
     assert "[aligned_to=swissprot]" in sp_novel_lines[0]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 8 (2/2) Part A — uniform 4-bracket-tag header (gene / accession
+# / aligned_to + source) with `unknown` / `none` placeholders so every
+# record exposes the same parseable structure.
+# ──────────────────────────────────────────────────────────────────────
+
+
+_HEADER_RE = _re.compile(
+    r"^>(\S+) "
+    r"\[gene=([^\]]+)\] "
+    r"\[accession=([^\]]+)\] "
+    r"\[aligned_to=(refseq|swissprot|none)\] "
+    r"source=(refseq|transcriptome)$"
+)
+
+
+def test_combined_fasta_refseq_emits_aligned_to_none(tmp_path: Path) -> None:
+    """Refseq records now carry the [aligned_to=none] tag explicitly
+    so the bracketed tag set matches the novel tier's (gene + accession
+    + aligned_to)."""
+    ref = tmp_path / "reference.fasta"
+    _make_proteins_fasta(ref, [("NP_A", "MAAAA")])
+    novel = _make_novel_table([])
+    hits = ALIGNMENT_HIT_TABLE.empty_table()
+    out = tmp_path / "combined.fasta"
+    build_combined_fasta(
+        reference_fasta=ref,
+        filtered_novel=novel,
+        alignment_hits=hits,
+        reference_gene_map={"NP_A": "GENE_A"},
+        output_path=out,
+    )
+    text = out.read_text()
+    assert ">NP_A [gene=GENE_A] [accession=NP_A] [aligned_to=none] source=refseq" in text
+
+
+def test_combined_fasta_refseq_unknown_gene_emits_placeholder(tmp_path: Path) -> None:
+    """When the gene map has no entry for a refseq accession, the
+    writer emits [gene=unknown] (not "" and not the tag-omitted form)
+    so the bracket-tag positions stay aligned across records."""
+    ref = tmp_path / "reference.fasta"
+    _make_proteins_fasta(ref, [("NP_A", "MAAAA")])
+    novel = _make_novel_table([])
+    hits = ALIGNMENT_HIT_TABLE.empty_table()
+    out = tmp_path / "combined.fasta"
+    _, stats = build_combined_fasta(
+        reference_fasta=ref,
+        filtered_novel=novel,
+        alignment_hits=hits,
+        reference_gene_map={},   # empty
+        output_path=out,
+    )
+    text = out.read_text()
+    assert ">NP_A [gene=unknown] [accession=NP_A] [aligned_to=none] source=refseq" in text
+    assert stats["no_gene_refseq"] == 1
+    assert stats["no_gene_novel_swissprot_aligned"] == 0
+
+
+def test_combined_fasta_novel_swissprot_unknown_gene_emits_placeholder(
+    tmp_path: Path,
+) -> None:
+    """**Regression for the user-flagged bug**: a novel ORF that aligns
+    to a SwissProt entry whose UniProt FASTA lacked a ``GN=`` tag must
+    NOT silently drop the gene tag. The writer now emits
+    ``[gene=unknown]`` so all swissprot-aligned headers share the same
+    bracket-tag structure, and the per-tier counter surfaces the
+    population that landed in the placeholder branch."""
+    ref = tmp_path / "reference.fasta"
+    _make_proteins_fasta(ref, [("NP_REF1", "MAAAAA")])
+
+    novel_table = pa.table(
+        {
+            "protein_id": pa.array(["NOV_SPHIT_NO_GENE"]),
+            "sequence":   pa.array(["MBBBBB"]),
+        }
+    )
+    alignment_hits = pa.table(
+        {
+            "query":  pa.array(["NOV_SPHIT_NO_GENE"]),
+            "target": pa.array(["O00370"]),       # bare UniProt acc
+            "evalue": pa.array([1e-30]),
+            "qstart": pa.array([1]),
+            "qend":   pa.array([6]),
+            "tstart": pa.array([1]),
+            "tend":   pa.array([6]),
+            "cigar":  pa.array(["6M"]),
+            "aligned_to": pa.array(["swissprot"]),
+        }
+    )
+    # gene_map covers NP_REF1 but NOT O00370 — mirrors the
+    # protein_to_gene_from_swissprot output for SwissProt entries
+    # without a ``GN=`` tag.
+    gene_map = {"NP_REF1": "REFGENE"}
+    out = tmp_path / "combined.fasta"
+    _, stats = build_combined_fasta(
+        reference_fasta=ref,
+        filtered_novel=novel_table,
+        alignment_hits=alignment_hits,
+        reference_gene_map=gene_map,
+        output_path=out,
+    )
+    text = out.read_text()
+    assert (
+        ">NOV_SPHIT_NO_GENE [gene=unknown] [accession=O00370] "
+        "[aligned_to=swissprot] source=transcriptome"
+    ) in text
+    # The per-tier counter pins WHICH population missed the gene
+    # lookup — the test would have caught a regression that lands
+    # the entry under a different tier counter.
+    assert stats["no_gene_novel_swissprot_aligned"] == 1
+    assert stats["no_gene_novel_refseq_aligned"] == 0
+    assert stats["no_gene_refseq"] == 0
+
+
+def test_combined_fasta_novel_unaligned_emits_all_placeholders(tmp_path: Path) -> None:
+    """A novel ORF with NO mmseqs hit at all (e.g. dropped before the
+    classifier sees it but somehow still in filtered_novel) gets all
+    three values as placeholders: ``[gene=unknown] [accession=unknown]
+    [aligned_to=none]``. Header shape stays identical to every other
+    record."""
+    ref = tmp_path / "reference.fasta"
+    _make_proteins_fasta(ref, [])
+    novel = _make_novel_table([("NOV_ORPHAN", "MCCCCC")])
+    hits = ALIGNMENT_HIT_TABLE.empty_table()
+    out = tmp_path / "combined.fasta"
+    _, stats = build_combined_fasta(
+        reference_fasta=ref,
+        filtered_novel=novel,
+        alignment_hits=hits,
+        reference_gene_map={},
+        output_path=out,
+    )
+    text = out.read_text()
+    assert (
+        ">NOV_ORPHAN [gene=unknown] [accession=unknown] "
+        "[aligned_to=none] source=transcriptome"
+    ) in text
+    assert stats["no_gene_novel_unaligned"] == 1
+
+
+def test_combined_fasta_uniform_tag_order(tmp_path: Path) -> None:
+    """Every header line must match the uniform 4-bracket-tag regex,
+    regardless of tier — refseq, novel→refseq, novel→swissprot,
+    novel-unaligned all flow through the same writer code path."""
+    ref = tmp_path / "reference.fasta"
+    _make_proteins_fasta(
+        ref,
+        [
+            ("NP_KNOWN", "MAAAAA"),       # has a gene
+            ("NP_ORPHAN", "MBBBBB"),      # no gene → [gene=unknown]
+        ],
+    )
+    novel_table = pa.table(
+        {
+            "protein_id": pa.array(["NOV_R", "NOV_S", "NOV_SU", "NOV_X"]),
+            "sequence":   pa.array(["MCCCCC", "MDDDDD", "MEEEEE", "MFFFFF"]),
+        }
+    )
+    alignment_hits = pa.table(
+        {
+            "query":  pa.array(["NOV_R", "NOV_S", "NOV_SU"]),
+            "target": pa.array(["NP_KNOWN", "P12345", "Q99999"]),
+            "evalue": pa.array([1e-30, 1e-30, 1e-30]),
+            "qstart": pa.array([1, 1, 1]),
+            "qend":   pa.array([6, 6, 6]),
+            "tstart": pa.array([1, 1, 1]),
+            "tend":   pa.array([6, 6, 6]),
+            "cigar":  pa.array(["6M", "6M", "6M"]),
+            "aligned_to": pa.array(["refseq", "swissprot", "swissprot"]),
+        }
+    )
+    # P12345 has a gene; Q99999 doesn't (mirrors the SwissProt-without-GN= case).
+    # NOV_X has no hit at all → falls through to the all-placeholder branch.
+    gene_map = {"NP_KNOWN": "KGENE", "P12345": "SGENE"}
+    out = tmp_path / "combined.fasta"
+    build_combined_fasta(
+        reference_fasta=ref,
+        filtered_novel=novel_table,
+        alignment_hits=alignment_hits,
+        reference_gene_map=gene_map,
+        output_path=out,
+    )
+    headers = [l for l in out.read_text().splitlines() if l.startswith(">")]
+    # Every header must match the canonical regex — no exceptions, no
+    # missing tags, no reordering. Catches any future drift.
+    nonconforming = [h for h in headers if not _HEADER_RE.match(h)]
+    assert nonconforming == [], (
+        f"Non-conforming headers (must match {_HEADER_RE.pattern!r}): "
+        f"{nonconforming}"
+    )
+    # And there must be 6 records emitted (2 refseq + 4 novel).
+    assert len(headers) == 6
 
 
 # ──────────────────────────────────────────────────────────────────────
