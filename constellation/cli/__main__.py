@@ -33,6 +33,33 @@ from constellation.thirdparty import (  # noqa: F401
 from constellation.thirdparty.registry import registered, try_find
 
 
+def _preload_matplotlib_for_reports() -> None:
+    """Pre-import matplotlib so its libstdc++ wins the dynamic linker's
+    resolution over later-loaded C extensions.
+
+    pyarrow's bundled compiled extensions dlopen libstdc++ on import; on
+    HPC clusters where ``LD_LIBRARY_PATH`` (or ``RUNPATH``) doesn't
+    prepend the conda env's lib dir, the loader can pin an older system
+    libstdc++ that matplotlib's ``c_internal_utils.so`` can't bind
+    against (``CXXABI_1.3.15`` not found). Importing matplotlib FIRST
+    gets its libstdc++ requirement satisfied before pyarrow pins
+    something incompatible.
+
+    Called at the very top of CLI handlers that auto-emit or regenerate
+    diagnostic reports. Silent no-op when matplotlib isn't installed —
+    the report generator will fall through to its own graceful-skip
+    path. Kept in this module (not under ``constellation.sequencing.*``)
+    so calling it doesn't side-effect import pyarrow first, defeating
+    the purpose.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot  # noqa: F401
+    except ImportError:
+        pass
+
+
 def _cmd_doctor(_args: argparse.Namespace) -> int:
     """Print a tool-status table."""
     tools = registered()
@@ -1301,6 +1328,11 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     200M-read scale: ~3 GB gene_assignments + ~10 GB read_demux at the
     resolve stage; alignment table never materialised whole.
     """
+    # Must precede any pyarrow / torch / sequencing import — see
+    # _preload_matplotlib_for_reports docstring for the libstdc++
+    # ordering rationale.
+    _preload_matplotlib_for_reports()
+
     import sys
     from pathlib import Path
 
@@ -1903,6 +1935,11 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     — sweeping it never requires re-running align (we re-cluster the
     raw per-position rows on the fly).
     """
+    # Must precede any pyarrow / torch / sequencing import — see
+    # _preload_matplotlib_for_reports docstring for the libstdc++
+    # ordering rationale.
+    _preload_matplotlib_for_reports()
+
     from collections import Counter
     from pathlib import Path
 
@@ -2523,6 +2560,11 @@ def _cmd_transcriptome_diagnose(args: argparse.Namespace) -> int:
     build_*_diagnostics_report orchestrator. Output paths default to
     ``<input-dir>/diagnostics/`` per stage.
     """
+    # Must precede any pyarrow / sequencing import — see
+    # _preload_matplotlib_for_reports docstring for the libstdc++
+    # ordering rationale.
+    _preload_matplotlib_for_reports()
+
     import sys
     from pathlib import Path
 
