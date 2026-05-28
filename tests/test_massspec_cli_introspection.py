@@ -155,6 +155,32 @@ def test_predict_library_carbamidomethyl_default_fix() -> None:
     pytest.fail("--ptm-carbamidomethyl not registered")
 
 
+def test_predict_library_ptm_defaults_match_lab_convention() -> None:
+    """Pins the standalone ``predict-library`` CLI's PTM defaults so the
+    standalone and orchestrator surfaces cannot drift. Defaults come
+    from ``massspec.search.encyclopedia.ptm_defaults`` — see that
+    module's docstring."""
+    parser = _build_massspec_only_parser()
+    pl = _subparsers_action(_massspec_subparser(parser)).choices[
+        "predict-library"
+    ]
+    # Synthesise a minimal valid argv covering predict-library's
+    # required args. Every PTM flag falls through to its default.
+    args = pl.parse_args([
+        "--fasta", "/tmp/x",
+        "--output-dlib", "/tmp/x.dlib",
+        "--output-dir", "/tmp",
+    ])
+    assert args.ptm_carbamidomethyl == "fix"
+    assert args.ptm_protein_n_term_acetyl == "var"
+    assert args.ptm_pyro_glu_q == "var"
+    assert args.ptm_oxidation == "var"
+    # Negative-case sanity — these stay off by default.
+    assert args.ptm_acetyl == "off"
+    assert args.ptm_phospho == "off"
+    assert args.ptm_tmt == "off"
+
+
 # ── dashboard introspection ────────────────────────────────────────────
 
 
