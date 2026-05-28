@@ -33,23 +33,76 @@ from constellation.thirdparty import (  # noqa: F401
 from constellation.thirdparty.registry import registered, try_find
 
 
-def _pin_env_libstdcxx(debug_log) -> None:
-    """Force-load the conda env's ``libstdc++.so.6`` so subsequent
-    C-extension loads (matplotlib, pyarrow, torch) bind against IT
-    rather than whatever older copy ``LD_LIBRARY_PATH`` happens to
-    point at.
+_LIBSTDCXX_REEXEC_SENTINEL = "_CONSTELLATION_LIBSTDCXX_REEXECED"
 
-    HPC clusters routinely have ``module load`` state that prepends a
-    system / spack miniconda lib dir to ``LD_LIBRARY_PATH``. The
-    dynamic linker resolves ``libstdc++.so.6`` to that older copy and
-    later loads of e.g. matplotlib's ``_c_internal_utils.so`` fail
-    with ``CXXABI_1.3.15`` not found. Once we explicitly dlopen the
-    env's copy by absolute path with ``RTLD_GLOBAL``, glibc's loader
-    registers it by SONAME; subsequent NEEDED-entry resolution finds
-    the already-loaded copy and skips the ``LD_LIBRARY_PATH`` search.
+
+def _reexec_with_env_libstdcxx_first(debug_log) -> None:
+    """If ``$CONDA_PREFIX/lib`` isn't first on ``LD_LIBRARY_PATH``,
+    re-exec this Python process with it prepended.
+
+    The dynamic linker reads ``LD_LIBRARY_PATH`` once at process
+    startup; modifying it via ``os.environ`` in a running process has
+    no effect on subsequent ``dlopen`` calls. The only way to actually
+    fix the load order from inside Python is to start a new process
+    with the corrected environment.
+
+    The sentinel env var :data:`_LIBSTDCXX_REEXEC_SENTINEL` prevents
+    infinite re-exec loops if the path manipulation somehow doesn't
+    stick.
 
     Silent no-op when the env doesn't ship its own libstdc++ (rare —
-    conda-forge envs always do).
+    conda-forge envs always do), when it's already first on
+    LD_LIBRARY_PATH, or when re-exec fails (in which case we fall
+    through to the ctypes-based defensive pin below).
+    """
+    import os
+
+    if os.environ.get(_LIBSTDCXX_REEXEC_SENTINEL):
+        debug_log("  already re-exec'd this run; skipping")
+        return
+
+    conda_prefix = os.environ.get("CONDA_PREFIX") or str(
+        Path(sys.executable).parent.parent
+    )
+    env_lib = str(Path(conda_prefix) / "lib")
+    if not (Path(env_lib) / "libstdc++.so.6").is_file():
+        debug_log(f"  no libstdc++.so.6 under {env_lib}; skipping re-exec")
+        return
+
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = current.split(":") if current else []
+    if parts and parts[0] == env_lib:
+        debug_log(f"  {env_lib} already first on LD_LIBRARY_PATH")
+        return
+
+    new_env = os.environ.copy()
+    new_env["LD_LIBRARY_PATH"] = (
+        env_lib + ":" + current if current else env_lib
+    )
+    new_env[_LIBSTDCXX_REEXEC_SENTINEL] = "1"
+
+    debug_log(
+        f"  re-execing python with LD_LIBRARY_PATH={env_lib}:<prev>"
+    )
+    try:
+        os.execve(sys.executable, [sys.executable, *sys.argv], new_env)
+        # os.execve does not return on success
+    except OSError as exc:
+        debug_log(f"  re-exec FAILED: {exc}; falling through to ctypes pin")
+
+
+def _pin_env_libstdcxx(debug_log) -> None:
+    """Defensive secondary: ctypes-dlopen the env's libstdc++ with
+    ``RTLD_GLOBAL``.
+
+    Only relevant when :func:`_reexec_with_env_libstdcxx_first` was
+    skipped (env doesn't ship libstdc++, or path was already correct,
+    or sentinel is set after re-exec). Pinning by SONAME via ctypes
+    helps in some configurations but is NOT sufficient on its own
+    when glibc resolves NEEDED entries by absolute path (the spack
+    libstdc++ at one path and the env's at another are independent
+    objects to the loader even with matching SONAME). The re-exec
+    above is the load-bearing fix.
     """
     import ctypes
     import os
@@ -101,22 +154,58 @@ def _preload_matplotlib_for_reports(*, verbose: bool = False) -> None:
             sys.stderr.flush()
 
     _log("entering")
-    _pin_env_libstdcxx(_log)
+    # Try matplotlib as-is first. Most environments load fine on the
+    # first attempt; the re-exec workaround below only fires when
+    # there's an actual libstdc++ skew to fix.
     try:
         import matplotlib
         _log(f"  matplotlib {matplotlib.__version__} from {matplotlib.__file__}")
         matplotlib.use("Agg")
         _log("  backend set to Agg")
         import matplotlib.pyplot  # noqa: F401
-        _log("  matplotlib.pyplot imported successfully")
+        _log("  matplotlib.pyplot imported on first attempt")
+        return
     except Exception as exc:  # noqa: BLE001
+        _log(f"  first attempt FAILED: {type(exc).__name__}: {exc}")
+        first_error = exc
+
+    # First attempt failed. If the error is the well-known libstdc++
+    # / CXXABI skew, try the load-bearing fix: re-exec python with
+    # $CONDA_PREFIX/lib prepended to LD_LIBRARY_PATH. Other ImportError
+    # causes (e.g. matplotlib not installed) skip the re-exec and fall
+    # through to the warning below.
+    err_text = str(first_error)
+    looks_like_libstdcxx_skew = (
+        "libstdc++" in err_text or "CXXABI" in err_text or "GLIBCXX" in err_text
+    )
+    if looks_like_libstdcxx_skew:
         sys.stderr.write(
-            f"WARNING: matplotlib preload failed "
-            f"({type(exc).__name__}: {exc}). Diagnostic figures will be "
-            f"unavailable for this run. Set CONSTELLATION_DIAGNOSE_DEBUG=1 "
-            f"to get a verbose trace.\n"
+            "NOTE: detected libstdc++ ABI skew (env's libstdc++ not "
+            "first on LD_LIBRARY_PATH); re-launching python with the "
+            "load order fixed.\n"
         )
         sys.stderr.flush()
+        _reexec_with_env_libstdcxx_first(_log)
+        # If we got here, re-exec was skipped or failed. Try the
+        # ctypes pin as a last-resort defensive measure.
+        _pin_env_libstdcxx(_log)
+        # Re-attempt matplotlib once (only reached when re-exec didn't fire).
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot  # noqa: F401
+            _log("  matplotlib.pyplot imported on second attempt")
+            return
+        except Exception as exc:  # noqa: BLE001
+            first_error = exc
+
+    sys.stderr.write(
+        f"WARNING: matplotlib preload failed "
+        f"({type(first_error).__name__}: {first_error}). Diagnostic "
+        f"figures will be unavailable for this run. Set "
+        f"CONSTELLATION_DIAGNOSE_DEBUG=1 to get a verbose trace.\n"
+    )
+    sys.stderr.flush()
 
 
 def _cmd_doctor(_args: argparse.Namespace) -> int:
