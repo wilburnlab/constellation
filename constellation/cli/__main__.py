@@ -36,6 +36,70 @@ from constellation.thirdparty.registry import registered, try_find
 _LIBSTDCXX_REEXEC_SENTINEL = "_CONSTELLATION_LIBSTDCXX_REEXECED"
 
 
+def _ensure_env_libstdcxx_priority() -> None:
+    """Detect a libstdc++ ABI skew at process startup and re-exec python
+    with ``$CONDA_PREFIX/lib`` first on ``LD_LIBRARY_PATH`` so all
+    subsequent C-extension imports resolve their NEEDED entries
+    against the env's libstdc++ rather than a stale system copy.
+
+    Called at the top of :func:`main` — *before* :func:`_build_parser`
+    fires, because parser construction transitively imports
+    ``massspec.cli`` → ``massspec.io.encyclopedia._sql`` → ``sqlite3``
+    → ``libicui18n`` → ``libstdc++`` and dies at that chain on HPC
+    clusters where the spack / system libstdc++ is ahead of the env's
+    on ``LD_LIBRARY_PATH``.
+
+    Reactive canary: try to import ``sqlite3`` (a stdlib module whose
+    ``libicui18n`` dependency is a known trigger of the libstdc++ /
+    CXXABI skew). If it succeeds, no problem — fast no-op. If it fails
+    with the libstdc++ / CXXABI / GLIBCXX signature, re-exec with the
+    env's lib dir prepended to ``LD_LIBRARY_PATH``. Other ImportError
+    causes (genuinely broken sqlite3) get re-raised to the caller.
+
+    Defense-in-depth complement to :func:`_preload_matplotlib_for_reports`,
+    which kept the same re-exec logic gated on a matplotlib failure
+    inside the report-emitting handlers. The startup-level check here
+    catches problems that surface BEFORE any handler runs (sqlite3
+    via massspec.cli at parser-construction time being the original
+    motivating case).
+    """
+    import os
+
+    debug = bool(os.environ.get("CONSTELLATION_DIAGNOSE_DEBUG"))
+
+    def _log(msg: str) -> None:
+        if debug:
+            sys.stderr.write(f"[libstdcxx-pin] {msg}\n")
+            sys.stderr.flush()
+
+    if os.environ.get(_LIBSTDCXX_REEXEC_SENTINEL):
+        _log("sentinel set; skipping canary (already re-exec'd this run)")
+        return
+
+    _log("canary: importing sqlite3")
+    try:
+        import sqlite3  # noqa: F401
+        _log("canary: sqlite3 imported OK; no re-exec needed")
+        return
+    except Exception as exc:  # noqa: BLE001
+        err_text = str(exc)
+        if not (
+            "libstdc++" in err_text
+            or "CXXABI" in err_text
+            or "GLIBCXX" in err_text
+        ):
+            _log(f"canary failed but not libstdc++-related: {exc}")
+            return
+        _log(f"canary failed with libstdc++ skew: {exc}")
+
+    sys.stderr.write(
+        "NOTE: detected libstdc++ ABI skew at startup; re-launching "
+        "python with $CONDA_PREFIX/lib first on LD_LIBRARY_PATH.\n"
+    )
+    sys.stderr.flush()
+    _reexec_with_env_libstdcxx_first(_log)
+
+
 def _reexec_with_env_libstdcxx_first(debug_log) -> None:
     """If ``$CONDA_PREFIX/lib`` isn't first on ``LD_LIBRARY_PATH``,
     re-exec this Python process with it prepended.
@@ -4384,6 +4448,13 @@ def _cmd_reference_validate(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Must run before _build_parser() — parser construction triggers
+    # massspec.cli → sqlite3 → libicui18n → libstdc++ which dies on
+    # HPC clusters where LD_LIBRARY_PATH has a stale libstdc++ ahead
+    # of the env's. The canary is reactive — no-op when sqlite3
+    # imports cleanly (normal envs).
+    _ensure_env_libstdcxx_priority()
+
     raw = list(sys.argv[1:] if argv is None else argv)
     # Bare `constellation` → open the dashboard. PR 2 wires the
     # `dashboard` subcommand; until that ships the rewrite is a no-op
