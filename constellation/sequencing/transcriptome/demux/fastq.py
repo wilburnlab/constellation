@@ -54,7 +54,7 @@ from constellation.sequencing.align.map import (
     _iter_demux_read_batches,
     _string_buf_and_offsets,
 )
-from constellation.sequencing.progress import (
+from constellation.core.progress import (
     ProgressCallback,
     emit_done,
     emit_progress,

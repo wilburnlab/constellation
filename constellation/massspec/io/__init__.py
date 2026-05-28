@@ -17,5 +17,6 @@ from __future__ import annotations
 
 from constellation.massspec.io import encyclopedia as encyclopedia  # noqa: F401
 from constellation.massspec.io import msp as msp  # noqa: F401
+from constellation.massspec.io import thermo as thermo  # noqa: F401
 
-__all__ = ["encyclopedia", "msp"]
+__all__ = ["encyclopedia", "msp", "thermo"]

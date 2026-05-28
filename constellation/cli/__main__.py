@@ -29,6 +29,7 @@ from constellation.thirdparty import (  # noqa: F401
     mmseqs2,
     ragtag,
     samtools,
+    thermo,
 )
 from constellation.thirdparty.registry import registered, try_find
 
@@ -1442,7 +1443,7 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
     # `constellation --help` stays fast.
     from pathlib import Path
 
-    from constellation.sequencing.progress import (
+    from constellation.core.progress import (
         NullProgress,
         StreamProgress,
     )
@@ -1577,7 +1578,7 @@ def _cmd_transcriptome_align(args: argparse.Namespace) -> int:
     from constellation.sequencing.align.presets import resolve_minimap2_args
     from constellation.sequencing.annotation.io import load_annotation
     from constellation.sequencing.parallel import run_batched
-    from constellation.sequencing.progress import (
+    from constellation.core.progress import (
         NullProgress,
         StreamProgress,
     )
@@ -2180,7 +2181,7 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     import pyarrow.dataset as pa_dataset
     import pyarrow.parquet as pq
 
-    from constellation.sequencing.progress import (
+    from constellation.core.progress import (
         NullProgress,
         StreamProgress,
     )

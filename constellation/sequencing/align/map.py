@@ -36,7 +36,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 
 from constellation.sequencing.align.minimap2 import minimap2_build_index
-from constellation.sequencing.progress import ProgressCallback, ProgressEvent
+from constellation.core.progress import ProgressCallback, ProgressEvent
 from constellation.sequencing.reference.reference import GenomeReference
 from constellation.thirdparty.registry import ToolNotFoundError, find
 

@@ -48,7 +48,7 @@ from constellation.sequencing.parallel import (
     StageOutput,
     run_batched,
 )
-from constellation.sequencing.progress import (
+from constellation.core.progress import (
     NullProgress,
     ProgressCallback,
     emit_done,

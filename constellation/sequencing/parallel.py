@@ -33,7 +33,7 @@ from typing import Any, Callable, Iterable
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from constellation.sequencing.progress import (
+from constellation.core.progress import (
     ProgressCallback,
     emit_done,
     emit_progress,

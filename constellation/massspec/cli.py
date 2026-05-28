@@ -48,12 +48,178 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     )
     ms_subs = p_ms.add_subparsers(dest="ms_subcommand", required=True)
 
+    _build_convert_parser(ms_subs)
     _build_search_parser(ms_subs)
     _build_predict_library_parser(ms_subs)
     _build_process_dia_parser(ms_subs)
     _build_library_export_parser(ms_subs)
     _build_classify_novel_peptides_parser(ms_subs)
     _build_collision_filter_parser(ms_subs)
+
+
+# ── convert ─────────────────────────────────────────────────────────────
+
+
+def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
+    p = subs.add_parser(
+        "convert",
+        help=(
+            "Convert one Thermo .raw file into a directory bundle "
+            "(manifest.json + peaks.parquet + scan_metadata.parquet + "
+            "acquisition_metadata.parquet). Dispatches on the input "
+            "suffix; .raw routes to constellation.massspec.io.thermo.convert. "
+            "Future mzML / Bruker / Sciex converters slot in transparently."
+        ),
+    )
+    p.add_argument(
+        "input",
+        type=Path,
+        help="Path to the input mass-spec file (currently .raw only).",
+    )
+    p.add_argument(
+        "-o",
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Parent directory for the output bundle. Bundle dir is "
+            "<output-dir>/<input-stem>/. Defaults to the input file's "
+            "parent directory."
+        ),
+    )
+    p.add_argument(
+        "--rt-bin-width",
+        dest="rt_bin_width_s",
+        type=float,
+        default=60.0,
+        help=(
+            "PyArrow row-group RT chunking (seconds). The peak-table "
+            "ParquetWriter flushes a new row group every N seconds of "
+            "retention time, so downstream RT-window readers get "
+            "row-group-level filter pushdown. Purely a write-time "
+            "knob — no biological binning happens. Default: 60.0"
+        ),
+    )
+    p.add_argument(
+        "--profile",
+        action="store_true",
+        help=(
+            "Force GetSegmentedScanFromScanNumber unconditionally — "
+            "preserves Thermo's raw FT profile grid. Default is centroid "
+            "(GetCentroidStream when available, with per-peak "
+            "resolution/noise/baseline)."
+        ),
+    )
+    p.add_argument(
+        "--no-trailer-extras",
+        dest="capture_trailer_extras",
+        action="store_false",
+        help=(
+            "Skip capturing the verbatim trailer-extras map. Typed "
+            "trailer columns remain populated; only the catch-all "
+            "string map is dropped."
+        ),
+    )
+    p.add_argument(
+        "--no-sha256",
+        dest="compute_sha256",
+        action="store_false",
+        help=(
+            "Skip computing the SHA-256 of the input .raw. Saves I/O on "
+            "large files; manifest.source_sha256 is null in that case."
+        ),
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Overwrite an existing non-empty bundle directory. Without "
+            "this, the convert refuses to clobber and exits with an error."
+        ),
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+        help="Scans per internal ScanBatch (default 64).",
+    )
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Suppress progress messages on stderr.",
+    )
+    p.set_defaults(func=_cmd_massspec_convert)
+
+
+def _cmd_massspec_convert(args: argparse.Namespace) -> int:
+    """``constellation massspec convert <input>`` dispatcher."""
+    input_path: Path = args.input
+    if not input_path.exists():
+        print(f"error: input not found: {input_path}", file=sys.stderr)
+        return 2
+
+    suffix = input_path.suffix.lower()
+    parent = args.output_dir if args.output_dir is not None else input_path.parent
+    bundle_dir = parent / input_path.stem
+
+    progress_cb = None
+    if not args.no_progress:
+        from constellation.core.progress import StreamProgress
+
+        progress_cb = StreamProgress()
+
+    if suffix == ".raw":
+        from constellation.massspec.io.thermo import convert as thermo_convert
+        from constellation.massspec.io.thermo._netruntime import require_thermo
+
+        try:
+            require_thermo()
+        except ImportError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 3
+
+        try:
+            manifest = thermo_convert(
+                input_path,
+                bundle_dir,
+                rt_bin_width_s=args.rt_bin_width_s,
+                profile=args.profile,
+                capture_trailer_extras=args.capture_trailer_extras,
+                batch_size=args.batch_size,
+                compute_sha256=args.compute_sha256,
+                force=args.force,
+                progress_cb=progress_cb,
+            )
+        except FileExistsError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 4
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"error: thermo conversion failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 5
+
+        print(f"wrote bundle: {bundle_dir}")
+        print(f"  manifest:                {bundle_dir / 'manifest.json'}")
+        print(f"  peaks:                   {bundle_dir / manifest.outputs['peaks']}")
+        print(
+            f"  scan_metadata:           "
+            f"{bundle_dir / manifest.outputs['scan_metadata']}"
+        )
+        print(
+            f"  acquisition_metadata:    "
+            f"{bundle_dir / manifest.outputs['acquisition_metadata']}"
+        )
+        return 0
+
+    print(
+        f"error: no MS converter registered for suffix {suffix!r}\n"
+        f"  v1 supports .raw (Thermo). mzML / Bruker .d / Sciex .wiff land "
+        f"as separate readers when their converters ship.",
+        file=sys.stderr,
+    )
+    return 2
 
 
 # ── search ──────────────────────────────────────────────────────────────

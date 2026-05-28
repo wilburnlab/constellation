@@ -18,7 +18,7 @@ import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
-from constellation.sequencing.progress import ProgressCallback, ProgressEvent
+from constellation.core.progress import ProgressCallback, ProgressEvent
 from constellation.thirdparty.registry import ToolNotFoundError, find
 
 

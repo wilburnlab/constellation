@@ -1,14 +1,18 @@
-"""Pluggable progress reporting for long-running sequencing pipelines.
+"""Pluggable progress reporting for long-running pipelines.
 
-The CLI binds a callback that prints to stdout (or wraps tqdm); a
-future GUI binds the same callback to a Qt signal or a websocket. The
-core verbs in :mod:`sequencing.parallel` and :mod:`sequencing.transcriptome`
-take ``progress_cb: ProgressCallback | None`` and emit at well-known
-points without caring how the host renders them.
+The CLI binds a callback that prints to stderr (or wraps tqdm); a
+future GUI binds the same callback to a Qt signal or a websocket. Core
+verbs and domain-module pipelines take ``progress_cb: ProgressCallback
+| None`` and emit at well-known points without caring how the host
+renders them.
 
-Three event types cover S1's needs; future event types (sub-stage
+Three event types cover today's needs; future event types (sub-stage
 metrics, per-shard timing) can be added without breaking the Protocol
 because each event carries an extras-dict.
+
+Lives in :mod:`constellation.core` so every domain module (sequencing,
+massspec, ...) can share it without violating the project-wide
+"domain modules never cross-import" rule.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 
-# Event kinds. Kept small in S1; expand only when callers need finer
+# Event kinds. Kept small in v1; expand only when callers need finer
 # granularity. The host renders each kind however it likes — the
 # default :class:`StreamProgress` prints them as one line each.
 ProgressEventKind = Literal["stage_start", "stage_progress", "stage_done"]
@@ -28,12 +32,12 @@ class ProgressEvent:
     """One progress notification from a running pipeline stage.
 
     ``stage`` is a short identifier (``"sam_ingest"``, ``"demux"``,
-    ``"orf"``, ``"quant"``); the host treats it as opaque. ``completed``
-    and ``total`` are integers in arbitrary units (rows, batches,
-    reads); a stage may emit multiple ``stage_progress`` events with
-    increasing ``completed`` values culminating in ``stage_done``.
-    ``payload`` carries free-form extras (timing, shard counts,
-    diagnostic metrics).
+    ``"orf"``, ``"quant"``, ``"thermo_convert"``, ...); the host treats
+    it as opaque. ``completed`` and ``total`` are integers in arbitrary
+    units (rows, batches, reads, scans); a stage may emit multiple
+    ``stage_progress`` events with increasing ``completed`` values
+    culminating in ``stage_done``. ``payload`` carries free-form extras
+    (timing, shard counts, diagnostic metrics).
     """
 
     kind: ProgressEventKind

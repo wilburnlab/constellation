@@ -34,6 +34,7 @@ def test_all_four_subcommands_register() -> None:
     ms_parser = _massspec_subparser(parser)
     ms_subs = _subparsers_action(ms_parser)
     assert set(ms_subs.choices) == {
+        "convert",
         "search",
         "predict-library",
         "process-dia",
@@ -201,6 +202,7 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
     assert massspec_node is not None, "massspec not in top-level subcommands"
     sub_names = {s["name"] for s in massspec_node["subcommands"]}
     assert sub_names == {
+        "convert",
         "search",
         "predict-library",
         "process-dia",
