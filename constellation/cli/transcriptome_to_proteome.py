@@ -51,9 +51,17 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "--proteins-fasta",
-        required=True,
         type=Path,
-        help="proteins.fasta from `constellation transcriptome demultiplex`",
+        default=None,
+        help=(
+            "Optional override. `proteins.fasta` from "
+            "`constellation transcriptome demultiplex`. NO LONGER "
+            "REQUIRED — the pipeline derives novel ORF sequences "
+            "directly from `--protein-counts` (the same demux output "
+            "carries them in its `sequence` column). Supply this only "
+            "if you want to use an ORF FASTA produced by a different "
+            "upstream pipeline."
+        ),
     )
     p.add_argument(
         "--reference-dir",

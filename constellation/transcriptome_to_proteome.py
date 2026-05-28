@@ -153,14 +153,24 @@ def deduplicate_fasta(
 def filter_and_write_novel_fasta(
     *,
     counts_tpm: pa.Table,
-    proteins_fasta: Path | str,
     reference_fasta: Path | str,
     output_path: Path | str,
     min_avg_tpm: float = 1.0,
+    proteins_fasta: Path | str | None = None,
 ) -> tuple[pa.Table, int]:
-    """Filter the protein FASTA emitted by ``transcriptome demultiplex``
-    to the proteins worth searching: those above the TPM threshold AND
-    not in the reference proteome.
+    """Filter the transcriptome ORFs to the proteins worth searching:
+    those above the TPM threshold AND not in the reference proteome.
+
+    Sequences come from ``counts_tpm.column("sequence")`` by default —
+    the long-form counts table emitted by Phase 6's
+    :func:`~constellation.sequencing.quant.protein_counts.read_protein_counts_tab`
+    carries the per-protein sequence alongside the count/tpm columns,
+    so a separate ``proteins.fasta`` input is no longer required.
+    Callers that want to keep passing a FASTA explicitly (e.g. the
+    legacy ``build_tpm_sweep_fastas.py`` harness, or any external
+    script that produced an ORF FASTA outside the demux pipeline) can
+    still do so via the optional ``proteins_fasta`` argument; when
+    supplied, it overrides the counts-derived sequences.
 
     Parameters
     ----------
@@ -168,10 +178,8 @@ def filter_and_write_novel_fasta(
         :data:`PROTEIN_COUNTS_LONG_SCHEMA`-shaped (with the ``tpm``
         column added by :func:`tpm_normalize`). Average TPM across
         samples is computed per ``protein_id``; rows below
-        ``min_avg_tpm`` drop.
-    proteins_fasta
-        Source FASTA from demux (``proteins.fasta``). One record per
-        unique protein discovered in the transcriptome.
+        ``min_avg_tpm`` drop. The ``sequence`` column provides the
+        ORF sequences when ``proteins_fasta`` is None.
     reference_fasta
         Background proteome (e.g. RefSeq). Used for sequence-set dedup
         — any novel sequence whose blake2b hash matches a reference
@@ -183,16 +191,20 @@ def filter_and_write_novel_fasta(
     min_avg_tpm
         Average-TPM threshold (default 1.0 — cartographer's default).
         Set per the user's CLI ``--min-avg-tpm`` flag.
+    proteins_fasta
+        Optional override. When supplied, sequences come from this
+        FASTA instead of ``counts_tpm.column("sequence")``; the file
+        is read on every call so external callers using their own
+        ORF caller still work without reshuffling their inputs.
+        Default ``None`` — derive from ``counts_tpm``.
 
     Returns
     -------
     (novel_table, n_written)
         ``novel_table`` is a 3-column Arrow table:
         ``(protein_id, sequence, avg_tpm)``. ``n_written`` is the
-        number of FASTA records emitted (matches ``novel_table.num_rows``
-        when the demux FASTA covers every passing protein_id).
+        number of FASTA records emitted.
     """
-    proteins_fasta = Path(proteins_fasta)
     reference_fasta = Path(reference_fasta)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -220,12 +232,25 @@ def filter_and_write_novel_fasta(
         r["protein_id"]: r["avg_tpm"] for r in avg.to_pylist()
     }
 
-    # Load the source FASTA — keep only passing protein_ids.
+    # Source sequences: from ``counts_tpm`` (default, drops the
+    # redundant FASTA input) OR from ``proteins_fasta`` (legacy /
+    # external override). Either way, restrict to ``passing_ids``.
     source_records: dict[str, str] = {}
-    for header, seq in _iter_fasta(proteins_fasta):
-        protein_id = _header_id(header)
-        if protein_id in passing_ids:
-            source_records[protein_id] = seq.upper()
+    if proteins_fasta is None:
+        # Long-table form: one row per (protein, sample). Sequences
+        # repeat across samples for the same protein — take the first
+        # non-null occurrence per passing protein_id.
+        pid_col = counts_tpm.column("protein_id").to_pylist()
+        seq_col = counts_tpm.column("sequence").to_pylist()
+        for pid, seq in zip(pid_col, seq_col):
+            if pid in passing_ids and pid not in source_records and seq:
+                source_records[pid] = seq.upper()
+    else:
+        proteins_fasta = Path(proteins_fasta)
+        for header, seq in _iter_fasta(proteins_fasta):
+            protein_id = _header_id(header)
+            if protein_id in passing_ids:
+                source_records[protein_id] = seq.upper()
 
     # Reference dedup via sequence hash.
     ref_hashes: set[str] = set()
@@ -549,17 +574,18 @@ def build_combined_fasta(
     reference_gene_map: Mapping[str, str],
     output_path: Path | str,
     dedup_reference_against_self: bool = True,
+    transcriptome_seq_hashes: set[str] | None = None,
 ) -> tuple[int, dict[str, int]]:
     """Concatenate reference + filtered-novel into a single search FASTA
     with annotated headers.
 
     Every record — reference AND novel, with or without complete
-    annotation — emits the same 4-bracket-tag shape, so downstream
+    annotation — emits the same 5-bracket-tag shape, so downstream
     consumers (EncyclopeDIA, mass-spec search engines, parsers) can
     rely on a stable positional/token structure regardless of which
     upstream values were populated::
 
-        >protein_id [gene=X|unknown] [accession=X|unknown] [aligned_to=refseq|swissprot|none] source=refseq|transcriptome
+        >protein_id [gene=X|unknown] [accession=X|unknown] [aligned_to=refseq|swissprot|none] [in_transcriptome=true|false|unknown] source=refseq|transcriptome
 
     Where:
 
@@ -573,6 +599,14 @@ def build_combined_fasta(
       novel records, the tier of the best alignment hit
       (``refseq`` / ``swissprot``); ``none`` when the alignment row
       carried no tier annotation OR there was no hit.
+    - ``in_transcriptome`` — for novel records, always ``true`` (they
+      came from the transcriptome by construction). For reference
+      records, ``true`` iff the protein's sequence SHA (uppercase,
+      via :func:`_seq_hash`) appears in
+      ``transcriptome_seq_hashes``; ``false`` otherwise. When the
+      caller doesn't supply ``transcriptome_seq_hashes`` (i.e.
+      passes ``None``), reference records emit ``unknown`` so
+      external callers without the set still see a uniform tag.
     - ``source`` — ``refseq`` for reference records, ``transcriptome``
       for novel records.
 
@@ -599,6 +633,15 @@ def build_combined_fasta(
         When True (default), drop duplicate sequences within the
         reference FASTA. Cartographer's pipeline does this — RefSeq
         contains many isoforms with identical translated sequences.
+    transcriptome_seq_hashes
+        Optional ``set[str]`` of SHA hashes (via :func:`_seq_hash`,
+        uppercase) of every protein sequence the upstream
+        transcriptome quant table observed. When supplied, each
+        reference record's sequence hash is checked against this set
+        to populate the ``[in_transcriptome=true|false]`` header tag.
+        When ``None`` (default), reference records emit
+        ``[in_transcriptome=unknown]``. Novel records ignore this
+        parameter — they always emit ``[in_transcriptome=true]``.
 
     Returns
     -------
@@ -616,8 +659,15 @@ def build_combined_fasta(
                 "no_gene_novel_swissprot_aligned": K3,
                 "no_gene_novel_other": K4,         # tier neither refseq nor swissprot
                 "no_gene_novel_unaligned": K5,     # novel with no mmseqs hit
+                "in_transcriptome_refseq_true":  T1,  # refseq seqs found in transcriptome
+                "in_transcriptome_refseq_false": T2,  # refseq seqs NOT found in transcriptome
                 "duplicate_dropped": D,
             }
+
+        The ``in_transcriptome_refseq_*`` counters are populated only
+        when ``transcriptome_seq_hashes`` was supplied; otherwise refseq
+        records emit ``[in_transcriptome=unknown]`` and neither counter
+        increments.
     """
     reference_fasta = Path(reference_fasta)
     output_path = Path(output_path)
@@ -648,16 +698,18 @@ def build_combined_fasta(
         "no_gene_novel_other": 0,
         "no_gene_novel_unaligned": 0,
         "duplicate_dropped": 0,
+        "in_transcriptome_refseq_true": 0,
+        "in_transcriptome_refseq_false": 0,
     }
     seen_hashes: set[str] = set()
 
     with output_path.open("w") as out:
         # Reference records first. Every refseq entry emits the same
-        # 4-bracket-tag header (gene / accession / aligned_to / source);
-        # missing values use the literal placeholder "unknown" (gene)
-        # or "none" (aligned_to) so downstream parsers see a stable
-        # token shape regardless of which gene_map entries were
-        # populated.
+        # 5-bracket-tag header (gene / accession / aligned_to /
+        # in_transcriptome / source); missing values use the literal
+        # placeholders ``unknown`` (gene), ``none`` (aligned_to), and
+        # ``unknown`` (in_transcriptome when no
+        # transcriptome_seq_hashes was supplied).
         for header, seq in _iter_fasta(reference_fasta):
             seq = seq.upper()
             protein_id = _header_id(header)
@@ -670,10 +722,24 @@ def build_combined_fasta(
             gene = reference_gene_map.get(protein_id) or "unknown"
             if gene == "unknown":
                 stats["no_gene_refseq"] += 1
+            if transcriptome_seq_hashes is None:
+                in_tx = "unknown"
+            else:
+                # Match the same sequence-hash key Stage 0 uses to dedup
+                # refseq against itself, so a refseq entry whose
+                # sequence is byte-identical to a novel ORF the
+                # transcriptome called registers as in_transcriptome=true.
+                if _seq_hash(seq) in transcriptome_seq_hashes:
+                    in_tx = "true"
+                    stats["in_transcriptome_refseq_true"] += 1
+                else:
+                    in_tx = "false"
+                    stats["in_transcriptome_refseq_false"] += 1
             bracket_tags = [
                 f"[gene={gene}]",
                 f"[accession={protein_id}]",
                 "[aligned_to=none]",
+                f"[in_transcriptome={in_tx}]",
             ]
             header_line = (
                 f">{protein_id} {' '.join(bracket_tags)} source=refseq\n"
@@ -682,13 +748,15 @@ def build_combined_fasta(
             _write_seq(out, seq)
             stats["reference"] += 1
 
-        # Novel records — same 4-bracket-tag shape as refseq.
+        # Novel records — same 5-bracket-tag shape as refseq.
         # Placeholders flow through identically: gene falls back to
         # "unknown" when gene_map.get(target) returns None (the
         # SwissProt-without-GN= case), accession falls back to
         # "unknown" when the novel ORF has no alignment hit at all,
         # and aligned_to falls back to "none" when the alignment hit
         # carried no tier annotation OR there was no hit.
+        # ``in_transcriptome`` is always ``true`` for novel records
+        # because they came from the transcriptome by construction.
         for row in filtered_novel.to_pylist():
             protein_id = row["protein_id"]
             seq = row["sequence"].upper()
@@ -719,6 +787,7 @@ def build_combined_fasta(
                 f"[gene={gene}]",
                 f"[accession={accession}]",
                 f"[aligned_to={aligned_to}]",
+                "[in_transcriptome=true]",
             ]
             out.write(
                 f">{protein_id} {' '.join(bracket_tags)} source=transcriptome\n"
@@ -891,8 +960,31 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     # ── Path resolution + env validation ───────────────────────────────
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    # TPM-cutoff suffix encoded into every TPM-dependent output filename
+    # so parallel sweeps at different cutoffs under the same --output-dir
+    # don't collide. Integer cutoffs format compactly ("1TPM" not "1.0TPM");
+    # non-integer cutoffs (e.g. 0.5) preserve their decimal but with `.`
+    # → `_` so the filename stays POSIX-safe ("0_5TPM"). Stages 0, 1, 2,
+    # 3, 6, 9 are TPM-independent (Stage 0 dedupes refseq, Stage 1
+    # normalises counts, Stage 2's input IS the TPM filter, Stage 3
+    # aligns the same query set, Stage 6 builds a cache from the GPF
+    # spectra alone, Stage 9 names per-injection); the suffix applies
+    # to Stages 4, 5, 7, 8, 10.
+    _tpm_val = args.min_avg_tpm
+    if _tpm_val == int(_tpm_val):
+        tpm_suffix = f"_{int(_tpm_val)}TPM"
+    else:
+        tpm_suffix = f"_{str(_tpm_val).replace('.', '_')}TPM"
     protein_counts = Path(args.protein_counts).resolve()
-    proteins_fasta = Path(args.proteins_fasta).resolve()
+    # ``proteins.fasta`` is no longer a required input — Stage 2 derives
+    # novel ORF sequences directly from ``counts_tpm.column("sequence")``.
+    # The CLI keeps ``--proteins-fasta`` as an optional override for
+    # legacy callers; resolve when supplied, else None.
+    proteins_fasta = (
+        Path(args.proteins_fasta).resolve()
+        if getattr(args, "proteins_fasta", None) is not None
+        else None
+    )
     reference_fasta = Path(args.reference_fasta).resolve()
     reference_annotation = Path(args.reference_annotation).resolve()
     gpf_files = [Path(p).resolve() for p in args.gpf]
@@ -1069,9 +1161,9 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
 
     # ── Stage 4: combined FASTA ────────────────────────────────────────
     stage_dir = output_dir / "04_combined_fasta"
-    combined_path = stage_dir / "combined.fasta"
+    combined_path = stage_dir / f"combined{tpm_suffix}.fasta"
     if not _stage_done(stage_dir, args.resume):
-        _log("Stage 4: alignment filter + combined.fasta with annotated headers")
+        _log(f"Stage 4: alignment filter + {combined_path.name} with annotated headers")
         stage_dir.mkdir(parents=True, exist_ok=True)
         filtered_novel = apply_alignment_filter(
             novel_table=novel_table,
@@ -1090,12 +1182,24 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             f"Stage 4: gene_map = {n_refseq_genes:,} RefSeq + "
             f"{len(sp_gene_map):,} SwissProt = {len(gene_map):,} total entries"
         )
+        # Build the in_transcriptome SHA-membership set: every distinct
+        # protein sequence the upstream transcriptome quant saw,
+        # hashed via the same _seq_hash helper Stage 0 uses for refseq
+        # dedup. A refseq entry whose sequence is byte-identical to a
+        # transcriptome-called ORF lands as in_transcriptome=true in
+        # the combined FASTA header.
+        transcriptome_seq_hashes = {
+            _seq_hash(s.upper())
+            for s in counts_tpm.column("sequence").to_pylist()
+            if s is not None
+        }
         n_written, fasta_stats = build_combined_fasta(
             reference_fasta=reference_fasta_for_pipeline,
             filtered_novel=filtered_novel,
             alignment_hits=alignment_hits,
             reference_gene_map=gene_map,
             output_path=combined_path,
+            transcriptome_seq_hashes=transcriptome_seq_hashes,
         )
         _log(
             f"Stage 4: no_gene breakdown — "
@@ -1103,6 +1207,12 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             f"novel→refseq={fasta_stats['no_gene_novel_refseq_aligned']:,}, "
             f"novel→swissprot={fasta_stats['no_gene_novel_swissprot_aligned']:,}, "
             f"novel-unaligned={fasta_stats['no_gene_novel_unaligned']:,}"
+        )
+        _log(
+            f"Stage 4: in_transcriptome breakdown — "
+            f"refseq=true:{fasta_stats['in_transcriptome_refseq_true']:,}, "
+            f"refseq=false:{fasta_stats['in_transcriptome_refseq_false']:,} "
+            f"(transcriptome-derived novels are always true)"
         )
         (stage_dir / "gene_map.json").write_text(
             json.dumps(gene_map, indent=2, sort_keys=True) + "\n"
@@ -1125,7 +1235,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
 
     # ── Stage 5: predict-library ───────────────────────────────────────
     stage_dir = output_dir / "05_predict_library"
-    combined_dlib = stage_dir / "library.dlib"
+    combined_dlib = stage_dir / f"combined{tpm_suffix}.dlib"
     if not _stage_done(stage_dir, args.resume):
         _log("Stage 5: predict-library (FASTA → .dlib)")
         stage_dir.mkdir(parents=True, exist_ok=True)
@@ -1155,8 +1265,15 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     stage_manifests["05_predict_library"] = _read_stage_manifest(stage_dir)
 
     # ── Stage 6: process-dia ───────────────────────────────────────────
+    # Output cache name: <run-stem>_combined_GPF.dia. The "combined"
+    # element reflects that EncyclopeDIA's -processDIA merges every
+    # input file into one cache; the <run-stem> (basename of
+    # --output-dir or the --run-name override) ties the cache to the
+    # run that produced it so a directory listing makes the
+    # provenance obvious even when stripped of context.
     stage_dir = output_dir / "06_process_dia"
-    combined_dia = stage_dir / "combined.dia"
+    run_stem = args.run_name or output_dir.name
+    combined_dia = stage_dir / f"{run_stem}_combined_GPF.dia"
     if not _stage_done(stage_dir, args.resume):
         _log(f"Stage 6: process-dia ({len(gpf_files)} GPF input{'s' if len(gpf_files) != 1 else ''})")
         stage_dir.mkdir(parents=True, exist_ok=True)
@@ -1191,7 +1308,9 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     raw_dir = stage_dir / "_raw"
     raw_elib_canonical = raw_dir / "combined.raw.elib"
     gpf_elib_primary = stage_dir / (
-        "combined.elib" if args.no_collision_filter else "combined.filtered.elib"
+        f"combined{tpm_suffix}.elib"
+        if args.no_collision_filter
+        else f"combined{tpm_suffix}.filtered.elib"
     )
     if not _stage_done(stage_dir, args.resume):
         # Fine-grained resume: a prior run already produced the filtered
@@ -1330,9 +1449,31 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             }
         )
         ref_proteins = read_fasta_proteins(reference_fasta)
-        # Novel proteins = the combined.fasta minus reference. Simpler:
-        # the source proteins.fasta carries every novel protein candidate.
-        novel_proteins = read_fasta_proteins(proteins_fasta)
+        # Novel proteins = every transcriptome-derived ORF. Source:
+        # ``counts_tpm`` carries the full per-ORF set with sequences,
+        # so we derive the 2-column ``(protein_id, sequence)`` table
+        # directly. Legacy callers that supplied --proteins-fasta still
+        # get that path; counts-derivation is the default.
+        if proteins_fasta is not None:
+            novel_proteins = read_fasta_proteins(proteins_fasta)
+        else:
+            # Long-form counts_tpm has one row per (protein, sample);
+            # collapse to unique (protein_id, sequence) pairs. ``set``
+            # comprehension would drop the order; use a dict to
+            # preserve first-occurrence.
+            seen_pid: dict[str, str] = {}
+            for pid, seq in zip(
+                counts_tpm.column("protein_id").to_pylist(),
+                counts_tpm.column("sequence").to_pylist(),
+            ):
+                if pid is not None and seq is not None and pid not in seen_pid:
+                    seen_pid[pid] = seq.upper()
+            novel_proteins = pa.table(
+                {
+                    "protein_id": pa.array(list(seen_pid), type=pa.string()),
+                    "sequence": pa.array(list(seen_pid.values()), type=pa.string()),
+                }
+            )
         # Gene tags live on the Stage-4 combined.fasta headers (annotated
         # from the reference GFF3/GBFF). The raw reference + demux FASTAs
         # carry no gene= tags, so the map must come from combined.fasta —
@@ -1351,8 +1492,12 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             metadata={
                 "constellation_version": constellation_version,
                 "reference_fasta": str(reference_fasta),
-                "novel_fasta": str(proteins_fasta),
+                "novel_fasta": (
+                    str(proteins_fasta) if proteins_fasta is not None
+                    else "derived from counts_tpm.parquet"
+                ),
             },
+            filename=f"novel_peptides{tpm_suffix}.parquet",
         )
         cls_counts: dict[str, int] = {}
         for cls in result.column("classification").to_pylist():
@@ -1399,9 +1544,9 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
 
     # ── Stage 10: library-export quant report ──────────────────────────
     stage_dir = output_dir / "10_quant_report"
-    quant_report_elib = stage_dir / "quant_report.elib"
+    quant_report_elib = stage_dir / f"quant_report{tpm_suffix}.elib"
     if not _stage_done(stage_dir, args.resume):
-        _log("Stage 10: library-export → quant_report.elib")
+        _log(f"Stage 10: library-export → {quant_report_elib.name}")
         stage_dir.mkdir(parents=True, exist_ok=True)
         # EncyclopeDIA -libexport reconstructs each run's analysis from the
         # files sitting next to its spectra file: <X.raw>, <X.raw>.elib

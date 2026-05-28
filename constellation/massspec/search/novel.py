@@ -694,21 +694,26 @@ def save_novel_peptides(
     path: "Path | str",
     *,
     metadata: dict[str, object] | None = None,
+    filename: str = "novel_peptides.parquet",
 ) -> Path:
     """Write a ``NOVEL_PEPTIDE_TABLE`` to a ParquetDir-style bundle.
 
     Mirrors the existing ``save_library`` / ``save_search`` pattern:
-    one parquet file (``novel_peptides.parquet``) + a ``manifest.json``
-    describing the format and carrying optional metadata (e.g. the
-    alignment source, the reference proteome id, the search engine
-    that produced the upstream peptide table).
+    one parquet file + a ``manifest.json`` describing the format and
+    carrying optional metadata (e.g. the alignment source, the
+    reference proteome id, the search engine that produced the
+    upstream peptide table). The parquet filename defaults to
+    ``novel_peptides.parquet``; pass ``filename`` to embed an external
+    identifier (e.g. the orchestrator passes
+    ``novel_peptides_<N>TPM.parquet`` so per-cutoff sweep outputs land
+    next to each other under one parent without colliding).
     """
     out_dir = Path(path)
     out_dir.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, out_dir / "novel_peptides.parquet")
+    pq.write_table(table, out_dir / filename)
     manifest = {
         "format": "parquet_dir",
-        "tables": ["novel_peptides"],
+        "tables": [Path(filename).stem],
         "metadata": dict(metadata) if metadata else {},
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

@@ -138,6 +138,60 @@ def test_filter_and_write_novel_fasta_basic(tmp_path: Path) -> None:
     assert content.count(">") == 2
 
 
+def test_filter_and_write_novel_fasta_derives_sequences_from_counts(
+    tmp_path: Path,
+) -> None:
+    """When ``proteins_fasta`` is not supplied, sequences come from
+    ``counts_tpm.column("sequence")`` directly. Phase 6's demux output
+    carries the sequence column alongside the counts, so the legacy
+    ``proteins.fasta`` input is redundant.
+
+    Same fixture as ``test_filter_and_write_novel_fasta_basic`` minus
+    the proteins_fasta argument — the output must be byte-identical
+    to the fasta-supplied variant."""
+    counts = pa.table(
+        {
+            "protein_id": ["P0", "P0", "P1", "P1", "P2"],
+            "sequence": [
+                "AAAAAAAAAA",
+                "AAAAAAAAAA",
+                "BBBBBBBBBB",
+                "BBBBBBBBBB",
+                "CCCCCCCCCC",
+            ],
+            "sample_name": ["s1", "s2", "s1", "s2", "s1"],
+            "count": [10, 10, 5, 5, 100],
+            "tpm": [500000.0, 500000.0, 250000.0, 250000.0, 500000.0],
+        }
+    )
+    # NO --proteins-fasta supplied; sequences derived from counts_tpm.
+    reference = tmp_path / "reference.fasta"
+    _make_proteins_fasta(reference, [("REF_A", "AAAAAAAAAA")])
+    out = tmp_path / "novel.fasta"
+
+    novel_table, n_written = filter_and_write_novel_fasta(
+        counts_tpm=counts,
+        reference_fasta=reference,
+        output_path=out,
+        min_avg_tpm=1.0,
+    )
+    # Same outcome as the fasta-supplied variant: P0 dedups,
+    # P1 + P2 survive.
+    assert n_written == 2
+    ids = set(novel_table.column("protein_id").to_pylist())
+    assert ids == {"P1", "P2"}
+    # Sequences match what the counts table carried (the same column
+    # downstream Stage 4 uses for in_transcriptome SHA membership).
+    out_sequences = dict(
+        zip(
+            novel_table.column("protein_id").to_pylist(),
+            novel_table.column("sequence").to_pylist(),
+        )
+    )
+    assert out_sequences["P1"] == "BBBBBBBBBB"
+    assert out_sequences["P2"] == "CCCCCCCCCC"
+
+
 def test_filter_and_write_novel_fasta_tpm_threshold(tmp_path: Path) -> None:
     """min_avg_tpm above one protein's value → that protein drops."""
     counts = pa.table(
@@ -385,13 +439,21 @@ def test_build_combined_fasta_headers(tmp_path: Path) -> None:
     assert stats["reference"] == 2
     assert stats["novel"] == 1
     text = out.read_text()
-    # Reference records carry [aligned_to=none] alongside the others.
-    assert ">REF_A [gene=ACTB] [accession=REF_A] [aligned_to=none] source=refseq" in text
-    assert ">REF_B [gene=GAPDH] [accession=REF_B] [aligned_to=none] source=refseq" in text
-    # Novel record inherits ACTB from its REF_A target.
+    # Reference records carry the full 5-tag set; in_transcriptome is
+    # `unknown` here because no transcriptome_seq_hashes was supplied.
+    assert (
+        ">REF_A [gene=ACTB] [accession=REF_A] [aligned_to=none] "
+        "[in_transcriptome=unknown] source=refseq"
+    ) in text
+    assert (
+        ">REF_B [gene=GAPDH] [accession=REF_B] [aligned_to=none] "
+        "[in_transcriptome=unknown] source=refseq"
+    ) in text
+    # Novel record inherits ACTB from its REF_A target; novels are
+    # always in_transcriptome=true by construction.
     assert (
         ">N1 [gene=ACTB] [accession=REF_A] [aligned_to=refseq] "
-        "source=transcriptome"
+        "[in_transcriptome=true] source=transcriptome"
     ) in text
 
 
@@ -447,6 +509,7 @@ def test_build_combined_fasta_no_gene_count(tmp_path: Path) -> None:
     assert "[gene=unknown]" in text
     assert "[accession=REF_A]" in text
     assert "[aligned_to=none]" in text
+    assert "[in_transcriptome=unknown]" in text
     assert "source=refseq" in text
 
 
@@ -581,6 +644,7 @@ _HEADER_RE = _re.compile(
     r"\[gene=([^\]]+)\] "
     r"\[accession=([^\]]+)\] "
     r"\[aligned_to=(refseq|swissprot|none)\] "
+    r"\[in_transcriptome=(true|false|unknown)\] "
     r"source=(refseq|transcriptome)$"
 )
 
@@ -602,7 +666,11 @@ def test_combined_fasta_refseq_emits_aligned_to_none(tmp_path: Path) -> None:
         output_path=out,
     )
     text = out.read_text()
-    assert ">NP_A [gene=GENE_A] [accession=NP_A] [aligned_to=none] source=refseq" in text
+    # No transcriptome_seq_hashes supplied → in_transcriptome=unknown.
+    assert (
+        ">NP_A [gene=GENE_A] [accession=NP_A] [aligned_to=none] "
+        "[in_transcriptome=unknown] source=refseq"
+    ) in text
 
 
 def test_combined_fasta_refseq_unknown_gene_emits_placeholder(tmp_path: Path) -> None:
@@ -622,7 +690,10 @@ def test_combined_fasta_refseq_unknown_gene_emits_placeholder(tmp_path: Path) ->
         output_path=out,
     )
     text = out.read_text()
-    assert ">NP_A [gene=unknown] [accession=NP_A] [aligned_to=none] source=refseq" in text
+    assert (
+        ">NP_A [gene=unknown] [accession=NP_A] [aligned_to=none] "
+        "[in_transcriptome=unknown] source=refseq"
+    ) in text
     assert stats["no_gene_refseq"] == 1
     assert stats["no_gene_novel_swissprot_aligned"] == 0
 
@@ -673,7 +744,7 @@ def test_combined_fasta_novel_swissprot_unknown_gene_emits_placeholder(
     text = out.read_text()
     assert (
         ">NOV_SPHIT_NO_GENE [gene=unknown] [accession=O00370] "
-        "[aligned_to=swissprot] source=transcriptome"
+        "[aligned_to=swissprot] [in_transcriptome=true] source=transcriptome"
     ) in text
     # The per-tier counter pins WHICH population missed the gene
     # lookup — the test would have caught a regression that lands
@@ -704,9 +775,62 @@ def test_combined_fasta_novel_unaligned_emits_all_placeholders(tmp_path: Path) -
     text = out.read_text()
     assert (
         ">NOV_ORPHAN [gene=unknown] [accession=unknown] "
-        "[aligned_to=none] source=transcriptome"
+        "[aligned_to=none] [in_transcriptome=true] source=transcriptome"
     ) in text
     assert stats["no_gene_novel_unaligned"] == 1
+
+
+def test_combined_fasta_in_transcriptome_discriminates_refseq(
+    tmp_path: Path,
+) -> None:
+    """When ``transcriptome_seq_hashes`` is supplied, refseq records
+    whose sequence SHA appears in the set emit
+    ``[in_transcriptome=true]``; the rest emit
+    ``[in_transcriptome=false]``. Novel records are always ``true``
+    by construction (they came from the transcriptome)."""
+    from constellation.transcriptome_to_proteome import _seq_hash
+
+    ref = tmp_path / "reference.fasta"
+    # Two refseq entries with DIFFERENT sequences. The transcriptome
+    # SHA set contains the first sequence's hash but not the second's.
+    _make_proteins_fasta(
+        ref,
+        [
+            ("NP_IN_TX",  "MAAAAA"),
+            ("NP_OUT_TX", "MBBBBB"),
+        ],
+    )
+    novel = _make_novel_table([("NOV_X", "MCCCCC")])
+    hits = ALIGNMENT_HIT_TABLE.empty_table()
+    transcriptome_hashes = {_seq_hash("MAAAAA")}
+    out = tmp_path / "combined.fasta"
+    _, stats = build_combined_fasta(
+        reference_fasta=ref,
+        filtered_novel=novel,
+        alignment_hits=hits,
+        reference_gene_map={"NP_IN_TX": "GENEA", "NP_OUT_TX": "GENEB"},
+        output_path=out,
+        transcriptome_seq_hashes=transcriptome_hashes,
+    )
+    text = out.read_text()
+
+    # Refseq entry whose sequence IS in the transcriptome → true.
+    assert (
+        ">NP_IN_TX [gene=GENEA] [accession=NP_IN_TX] [aligned_to=none] "
+        "[in_transcriptome=true] source=refseq"
+    ) in text
+    # Refseq entry whose sequence is NOT in the transcriptome → false.
+    assert (
+        ">NP_OUT_TX [gene=GENEB] [accession=NP_OUT_TX] [aligned_to=none] "
+        "[in_transcriptome=false] source=refseq"
+    ) in text
+    # Novel record always carries in_transcriptome=true regardless of
+    # what's in transcriptome_seq_hashes.
+    assert "[in_transcriptome=true] source=transcriptome" in text
+
+    # Per-tier stats counters surface WHICH population landed where.
+    assert stats["in_transcriptome_refseq_true"] == 1
+    assert stats["in_transcriptome_refseq_false"] == 1
 
 
 def test_combined_fasta_uniform_tag_order(tmp_path: Path) -> None:
