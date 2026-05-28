@@ -553,15 +553,28 @@ def build_combined_fasta(
     """Concatenate reference + filtered-novel into a single search FASTA
     with annotated headers.
 
-    Header format::
+    Every record — reference AND novel, with or without complete
+    annotation — emits the same 4-bracket-tag shape, so downstream
+    consumers (EncyclopeDIA, mass-spec search engines, parsers) can
+    rely on a stable positional/token structure regardless of which
+    upstream values were populated::
 
-        >protein_id [gene=SYMBOL] [accession=ACC] [aligned_to=refseq|swissprot] source=transcriptome|refseq
+        >protein_id [gene=X|unknown] [accession=X|unknown] [aligned_to=refseq|swissprot|none] source=refseq|transcriptome
 
-    Both reference and novel records always carry ``source=`` (load-
-    bearing per the user's "header annotation is not optional" rule)
-    and ``[gene=...]`` when the gene-mapping is available (``gene=``
-    is omitted for records without a known gene rather than emitting
-    an empty value — emit a build-time warning + count instead).
+    Where:
+
+    - ``gene`` — gene symbol when ``gene_map.get(...)`` resolves;
+      literal ``unknown`` otherwise. SwissProt entries that ship
+      without a ``GN=`` tag land in this branch.
+    - ``accession`` — for reference records, the protein's own
+      first-token accession; for novel records, the alignment target's
+      accession. Literal ``unknown`` for novel ORFs with no mmseqs hit.
+    - ``aligned_to`` — for reference records, always ``none``. For
+      novel records, the tier of the best alignment hit
+      (``refseq`` / ``swissprot``); ``none`` when the alignment row
+      carried no tier annotation OR there was no hit.
+    - ``source`` — ``refseq`` for reference records, ``transcriptome``
+      for novel records.
 
     Parameters
     ----------
@@ -573,9 +586,8 @@ def build_combined_fasta(
         ``(protein_id, sequence)`` columns required.
     alignment_hits
         :data:`ALIGNMENT_HIT_TABLE` — used to look up each novel
-        protein's ``aligned_to`` (reference / non_reference)
-        and target accession for the ``aligned_to`` + ``accession``
-        header tags.
+        protein's ``aligned_to`` (refseq / swissprot) and target
+        accession for the ``aligned_to`` + ``accession`` header tags.
     reference_gene_map
         ``protein_id → gene_symbol`` from
         :func:`read_reference_gene_map`. Used for both reference and
@@ -592,8 +604,20 @@ def build_combined_fasta(
     -------
     (n_written, stats)
         ``n_written`` is the total record count emitted. ``stats`` is
-        a per-source breakdown: ``{"reference": N, "novel": M,
-        "no_gene": K, "duplicate_dropped": D}``.
+        a per-source breakdown, with the no-gene counter split per
+        tier so a build can validate which population is missing the
+        ``[gene=...]`` lookup::
+
+            {
+                "reference": N,
+                "novel": M,
+                "no_gene_refseq": K1,
+                "no_gene_novel_refseq_aligned": K2,
+                "no_gene_novel_swissprot_aligned": K3,
+                "no_gene_novel_other": K4,         # tier neither refseq nor swissprot
+                "no_gene_novel_unaligned": K5,     # novel with no mmseqs hit
+                "duplicate_dropped": D,
+            }
     """
     reference_fasta = Path(reference_fasta)
     output_path = Path(output_path)
@@ -618,13 +642,22 @@ def build_combined_fasta(
     stats = {
         "reference": 0,
         "novel": 0,
-        "no_gene": 0,
+        "no_gene_refseq": 0,
+        "no_gene_novel_refseq_aligned": 0,
+        "no_gene_novel_swissprot_aligned": 0,
+        "no_gene_novel_other": 0,
+        "no_gene_novel_unaligned": 0,
         "duplicate_dropped": 0,
     }
     seen_hashes: set[str] = set()
 
     with output_path.open("w") as out:
-        # Reference records first.
+        # Reference records first. Every refseq entry emits the same
+        # 4-bracket-tag header (gene / accession / aligned_to / source);
+        # missing values use the literal placeholder "unknown" (gene)
+        # or "none" (aligned_to) so downstream parsers see a stable
+        # token shape regardless of which gene_map entries were
+        # populated.
         for header, seq in _iter_fasta(reference_fasta):
             seq = seq.upper()
             protein_id = _header_id(header)
@@ -634,12 +667,14 @@ def build_combined_fasta(
                     stats["duplicate_dropped"] += 1
                     continue
                 seen_hashes.add(h)
-            gene = reference_gene_map.get(protein_id)
-            bracket_tags = [f"[accession={protein_id}]"]
-            if gene:
-                bracket_tags.insert(0, f"[gene={gene}]")
-            else:
-                stats["no_gene"] += 1
+            gene = reference_gene_map.get(protein_id) or "unknown"
+            if gene == "unknown":
+                stats["no_gene_refseq"] += 1
+            bracket_tags = [
+                f"[gene={gene}]",
+                f"[accession={protein_id}]",
+                "[aligned_to=none]",
+            ]
             header_line = (
                 f">{protein_id} {' '.join(bracket_tags)} source=refseq\n"
             )
@@ -647,7 +682,13 @@ def build_combined_fasta(
             _write_seq(out, seq)
             stats["reference"] += 1
 
-        # Novel records, alignment-annotated.
+        # Novel records — same 4-bracket-tag shape as refseq.
+        # Placeholders flow through identically: gene falls back to
+        # "unknown" when gene_map.get(target) returns None (the
+        # SwissProt-without-GN= case), accession falls back to
+        # "unknown" when the novel ORF has no alignment hit at all,
+        # and aligned_to falls back to "none" when the alignment hit
+        # carried no tier annotation OR there was no hit.
         for row in filtered_novel.to_pylist():
             protein_id = row["protein_id"]
             seq = row["sequence"].upper()
@@ -658,20 +699,30 @@ def build_combined_fasta(
                     continue
                 seen_hashes.add(h)
             target, tier = novel_target.get(protein_id, (None, None))
-            bracket_tags: list[str] = []
             if target is not None:
-                gene = reference_gene_map.get(target)
-                if gene:
-                    bracket_tags.append(f"[gene={gene}]")
-                else:
-                    stats["no_gene"] += 1
-                bracket_tags.append(f"[accession={target}]")
-                if tier:
-                    bracket_tags.append(f"[aligned_to={tier}]")
+                gene = reference_gene_map.get(target) or "unknown"
+                accession = str(target)
+                aligned_to = str(tier) if tier else "none"
+                if gene == "unknown":
+                    if aligned_to == "swissprot":
+                        stats["no_gene_novel_swissprot_aligned"] += 1
+                    elif aligned_to == "refseq":
+                        stats["no_gene_novel_refseq_aligned"] += 1
+                    else:
+                        stats["no_gene_novel_other"] += 1
             else:
-                stats["no_gene"] += 1
-            tag_str = (" " + " ".join(bracket_tags)) if bracket_tags else ""
-            out.write(f">{protein_id}{tag_str} source=transcriptome\n")
+                gene = "unknown"
+                accession = "unknown"
+                aligned_to = "none"
+                stats["no_gene_novel_unaligned"] += 1
+            bracket_tags = [
+                f"[gene={gene}]",
+                f"[accession={accession}]",
+                f"[aligned_to={aligned_to}]",
+            ]
+            out.write(
+                f">{protein_id} {' '.join(bracket_tags)} source=transcriptome\n"
+            )
             _write_seq(out, seq)
             stats["novel"] += 1
 
@@ -1045,6 +1096,13 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             alignment_hits=alignment_hits,
             reference_gene_map=gene_map,
             output_path=combined_path,
+        )
+        _log(
+            f"Stage 4: no_gene breakdown — "
+            f"refseq={fasta_stats['no_gene_refseq']:,}, "
+            f"novel→refseq={fasta_stats['no_gene_novel_refseq_aligned']:,}, "
+            f"novel→swissprot={fasta_stats['no_gene_novel_swissprot_aligned']:,}, "
+            f"novel-unaligned={fasta_stats['no_gene_novel_unaligned']:,}"
         )
         (stage_dir / "gene_map.json").write_text(
             json.dumps(gene_map, indent=2, sort_keys=True) + "\n"

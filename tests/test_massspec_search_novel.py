@@ -822,6 +822,33 @@ def test_build_gene_map_bracketed_and_gn(tmp_path: Path) -> None:
     assert "P4" not in out
 
 
+def test_build_gene_map_skips_unknown_placeholder(tmp_path: Path) -> None:
+    """Constellation's ``build_combined_fasta`` writes
+    ``[gene=unknown]`` as the placeholder when the merged gene_map has
+    no entry for an accession (so every record exposes the same
+    bracket-tag structure). The downstream parser must treat that
+    literal as the no-gene sentinel — registering ``"unknown"`` as a
+    real gene symbol would corrupt every classifier lookup against
+    these entries."""
+    from constellation.massspec.search.novel import build_gene_map_from_fasta_headers
+
+    fasta = tmp_path / "combined.fasta"
+    fasta.write_text(
+        ">P1 [gene=REALGENE] [accession=A1] [aligned_to=swissprot] source=transcriptome\nMAGCKL\n"
+        ">P2 [gene=unknown] [accession=A2] [aligned_to=swissprot] source=transcriptome\nMAGCKL\n"
+        # case-insensitive: 'Unknown' / 'UNKNOWN' must also be skipped
+        ">P3 [gene=Unknown] [accession=A3] [aligned_to=swissprot] source=transcriptome\nMAGCKL\n"
+    )
+    out = build_gene_map_from_fasta_headers([fasta])
+    assert out["P1"] == "REALGENE"
+    # The placeholder MUST NOT land in the map.
+    assert "P2" not in out
+    assert "P3" not in out
+    # ... and "unknown" must never appear as a value.
+    assert "unknown" not in out.values()
+    assert "Unknown" not in out.values()
+
+
 def test_classify_picks_most_abundant_transcript() -> None:
     """When multiple novel proteins produce the same peptide with the same
     winning classification, the row chosen for `protein_id` should be the
