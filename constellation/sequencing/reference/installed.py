@@ -216,42 +216,21 @@ class Reference:
     ) -> None:
         """Assert the requested artifacts are installed; raise with a hint if not.
 
-        The error message names the missing artifact and includes the
-        concrete CLI command the user should run.
+        The error message names the missing artifact and includes a
+        concrete CLI command the user should run. The exact spec form
+        (e.g. ``'Homo sapiens'`` vs ``uniprot:swissprot``) depends on
+        which artifact is missing — SwissProt has its own bareword spec,
+        per-species artifacts route through the taxonomy + catalog path.
         """
         missing: list[tuple[str, str]] = []
         if genome and not self.has_genome:
-            missing.append(
-                (
-                    "genome",
-                    f"constellation reference fetch "
-                    f"--organism {self.organism} --source {self.source}",
-                )
-            )
+            missing.append(("genome", self._fetch_hint(kind="genome")))
         if annotation and not self.has_annotation:
-            missing.append(
-                (
-                    "annotation",
-                    f"constellation reference fetch "
-                    f"--organism {self.organism} --source {self.source}",
-                )
-            )
+            missing.append(("annotation", self._fetch_hint(kind="annotation")))
         if proteome and not self.has_proteome:
-            missing.append(
-                (
-                    "proteome",
-                    f"constellation reference fetch "
-                    f"--organism {self.organism} --source uniprot",
-                )
-            )
+            missing.append(("proteome", self._fetch_hint(kind="proteome")))
         if cdna and not self.has_cdna:
-            missing.append(
-                (
-                    "cdna",
-                    f"constellation reference fetch "
-                    f"--organism {self.organism} --source {self.source}",
-                )
-            )
+            missing.append(("cdna", self._fetch_hint(kind="cdna")))
         if not missing:
             return
         kinds = ", ".join(k for k, _ in missing)
@@ -259,6 +238,31 @@ class Reference:
         raise ReferenceNotInstalledError(
             f"reference {self.handle} is missing required artifact(s): {kinds}. "
             f"Run:\n  {hints}"
+        )
+
+    def _fetch_hint(self, *, kind: str) -> str:
+        """Concrete CLI invocation that would install the missing artifact.
+
+        Three cases:
+          * Cross-organism SwissProt (``organism == 'swissprot'``) →
+            ``constellation reference fetch uniprot:swissprot``.
+          * Per-species proteome → bare species/taxid spec with
+            ``--source uniprot``.
+          * Genome / annotation / cDNA → bare species/taxid spec with
+            ``--source <self.source>``.
+
+        For per-species hints the user must supply the actual species
+        name or taxid — the organism slug stored in the handle isn't
+        usually a valid taxonomy query (``homo_sapiens`` vs
+        ``'Homo sapiens'``). The hint includes the slug as a worked
+        example so the user knows what to substitute.
+        """
+        if self.organism == "swissprot" and kind == "proteome":
+            return "constellation reference fetch uniprot:swissprot"
+        src = "uniprot" if kind == "proteome" else self.source
+        return (
+            f"constellation reference fetch <species-or-taxid> --source {src}  "
+            f"# this handle is {self.organism!r}"
         )
 
 

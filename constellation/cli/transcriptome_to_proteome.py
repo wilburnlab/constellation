@@ -138,9 +138,9 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
             "(e.g. ``swissprot@uniprot-2026_02``). Default: the bare "
             "``swissprot`` handle, resolved via defaults.toml / current "
             "to whatever is installed. If no SwissProt is installed, "
-            "run: ``constellation catalog update`` then "
-            "``constellation reference fetch --organism swissprot "
-            "--source uniprot``."
+            "run ``constellation reference fetch uniprot:swissprot`` "
+            "(optionally with ``--release 2026_02`` to pin a specific "
+            "release)."
         ),
     )
 
@@ -405,8 +405,7 @@ def _resolve_swissprot_from_args(args: argparse.Namespace):
     except ReferenceNotInstalledError as exc:
         raise _ResolutionError(
             f"{exc}\nNo SwissProt reference installed. Run:\n"
-            "  constellation catalog update\n"
-            "  constellation reference fetch --organism swissprot --source uniprot\n"
+            "  constellation reference fetch uniprot:swissprot\n"
             "or pin a specific release with "
             "--swissprot-reference swissprot@uniprot-<release>."
         ) from exc

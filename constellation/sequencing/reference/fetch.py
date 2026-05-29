@@ -625,7 +625,7 @@ class _ResolvedSpec:
 def _resolve_spec(
     spec: str,
     *,
-    release: int | None,
+    release: int | str | None,
     source: str | None = None,
 ) -> _ResolvedSpec:
     """Map a fetch spec to URLs + handle.
@@ -633,11 +633,19 @@ def _resolve_spec(
     Accepted spec shapes:
 
       * ``<source>:<id>`` — legacy form. ``source`` arg ignored.
+        Supported sources: ``ensembl``, ``ensembl_genomes``, ``refseq``,
+        ``genbank``, and ``uniprot`` (currently only
+        ``uniprot:swissprot`` for the full Swiss-Prot knowledgebase).
       * ``<species_name>`` — bare species name or vernacular (e.g.
         ``'Haliotis rufescens'``, ``'red abalone'``, ``'human'``).
         Routes through ``TaxonomyResolver`` → ``CatalogResolver``;
         ``source`` arg pins the catalog source (RefSeq-first by default).
       * ``<taxid>`` — integer NCBI taxid. Same routing as species name.
+
+    ``release`` is typed as ``int | str | None`` so the CLI can pass
+    either an Ensembl-shaped integer release number or a UniProt-shaped
+    ``YYYY_NN`` string without an upstream coercion. Each source-branch
+    formats it according to its own URL convention.
     """
     if ":" not in spec:
         return _resolve_species_query(spec, source=source, release=release)
@@ -690,6 +698,39 @@ def _resolve_spec(
             cdna_url=cdna_url,
         )
 
+    if source == "uniprot":
+        # Currently the only supported ``uniprot:<id>`` form is
+        # ``uniprot:swissprot`` (the full Swiss-Prot knowledgebase).
+        # Per-species UniProt proteomes (UP-IDs) route via the
+        # bare-species-name path: ``constellation reference fetch
+        # 'Mus musculus' --source uniprot``.
+        if ident.lower() == "swissprot":
+            # Late-import to avoid cycles: catalog/uniprot.py imports
+            # _ResolvedSpec from this module via fetch_swissprot.
+            from constellation.catalog.uniprot import (
+                _probe_swissprot_release,
+                swissprot_fasta_url,
+            )
+            rel = str(release) if release is not None else _probe_swissprot_release()
+            return _ResolvedSpec(
+                handle=Handle(organism="swissprot", source="uniprot", release=rel),
+                fasta_url="",  # proteome-only dispatch signal
+                gff_url="",
+                checksums_url=None,
+                checksums_kind=None,
+                assembly_name=None,
+                annotation_release=None,
+                assembly_accession=None,
+                protein_url=swissprot_fasta_url(),
+                cdna_url=None,
+            )
+        raise KeyError(
+            f"unknown uniprot identifier {ident!r}; supported: 'swissprot'. "
+            f"For a per-species UniProt proteome, use the bare species/taxid "
+            f"form instead, e.g. "
+            f"`constellation reference fetch 'Mus musculus' --source uniprot`."
+        )
+
     if source in {"refseq", "genbank"}:
         if release is not None:
             raise ValueError(
@@ -735,7 +776,7 @@ def _resolve_spec(
 
     raise KeyError(
         f"unknown source {source!r}; supported: 'ensembl', 'ensembl_genomes', "
-        f"'refseq', 'genbank'"
+        f"'refseq', 'genbank', 'uniprot' (currently only 'uniprot:swissprot')"
     )
 
 
@@ -743,7 +784,7 @@ def _resolve_species_query(
     query: str,
     *,
     source: str | None,
-    release: int | None,
+    release: int | str | None,
 ) -> _ResolvedSpec:
     """Species-name / taxid dispatch through taxonomy + catalog.
 
@@ -776,18 +817,31 @@ def _resolve_species_query(
 
     catalogs = CatalogResolver.from_cache()
     if catalogs.is_empty():
+        # Name the requested source in the hint when one was supplied —
+        # `--source uniprot` against an empty cache should not suggest
+        # `catalog update refseq`.
+        cat_hint = source or "refseq"
         raise ValueError(
-            f"no catalogs installed — cannot resolve URLs for {node.scientific_name!r}. "
-            "Run `constellation catalog update refseq` (and/or ensembl / "
-            "ensembl_genomes / uniprot) to populate them."
+            f"no catalogs installed — cannot resolve URLs for "
+            f"{node.scientific_name!r}. Run "
+            f"`constellation catalog update {cat_hint}` to populate them."
         )
     row = catalogs.best_for(node.taxid, source=source)
     if row is None:
         sources = sorted({s for s, _ in catalogs.installed_sources()})
+        cat_hint = (
+            f"constellation catalog update {source}"
+            if source
+            else "constellation catalog update <source>"
+        )
+        source_clause = (
+            f" in source {source!r}" if source else ""
+        )
         raise ValueError(
-            f"no catalog hit for taxid {node.taxid} ({node.scientific_name!r}); "
-            f"installed sources: {sources}. Try `constellation catalog update <source>` "
-            "to refresh, or pass --source explicitly."
+            f"no catalog hit for taxid {node.taxid} "
+            f"({node.scientific_name!r}){source_clause}; "
+            f"installed sources: {sources}. Try `{cat_hint}` to refresh, "
+            "or pass --source explicitly."
         )
     return _spec_from_catalog_row(row, taxid=node.taxid, scientific_name=node.scientific_name)
 
@@ -919,7 +973,7 @@ def fetch_reference(
     spec: str,
     output_dir: str | Path | None = None,
     *,
-    release: int | None = None,
+    release: int | str | None = None,
     source: str | None = None,
     timeout: int = 600,
     use_cache: bool = True,

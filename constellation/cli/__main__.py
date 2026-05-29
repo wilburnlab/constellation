@@ -3278,10 +3278,10 @@ def _build_reference_parser(subs) -> None:
         "spec",
         help=(
             "<source>:<id> — e.g. 'ensembl_genomes:saccharomyces_cerevisiae', "
-            "'refseq:GCF_001708105.1', 'ensembl:human'. Also accepts a bare "
-            "species name (e.g. 'Haliotis rufescens', 'red abalone') or an "
-            "integer taxid (e.g. '9606'), routed through the taxonomy + "
-            "catalog layer."
+            "'refseq:GCF_001708105.1', 'ensembl:human', 'uniprot:swissprot'. "
+            "Also accepts a bare species name (e.g. 'Haliotis rufescens', "
+            "'red abalone') or an integer taxid (e.g. '9606'), routed through "
+            "the taxonomy + catalog layer."
         ),
     )
     p_fetch.add_argument(
@@ -3304,11 +3304,13 @@ def _build_reference_parser(subs) -> None:
     )
     p_fetch.add_argument(
         "--release",
-        type=int,
         default=None,
         help=(
-            "pin an Ensembl / Ensembl Genomes release number (e.g. 111). "
-            "RefSeq/GenBank accessions already pin their assembly version."
+            "pin a release identifier: an Ensembl / Ensembl Genomes release "
+            "number (e.g. '111') or a UniProt release tag (e.g. '2026_02'). "
+            "RefSeq/GenBank accessions already pin their assembly version. "
+            "UniProt accepts a release tag for ``uniprot:swissprot``; omit "
+            "to auto-detect the current release."
         ),
     )
     p_fetch.add_argument(
@@ -4129,7 +4131,13 @@ def _cmd_reference_list(_args: argparse.Namespace) -> int:
     entries = list_installed()
     if not entries:
         print(f"reference cache empty: {cache_root()}")
-        print("  run: constellation reference fetch <source>:<id>")
+        print(
+            "  run: constellation reference fetch <spec> [--source SOURCE]"
+        )
+        print(
+            "       (e.g. `'Homo sapiens'`, `9606`, `ensembl:human`, "
+            "`uniprot:swissprot`)"
+        )
         return 0
     defaults = read_defaults()
     rows: list[tuple[str, str, str, str, str, str, str]] = []

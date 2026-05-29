@@ -222,3 +222,64 @@ def test_fetch_swissprot_resolves_via_bare_handle(
     assert ref.protein_fasta_path.read_bytes() == _FASTA_FIXTURE
     assert ref.handle.source == "uniprot"
     assert ref.handle.release == "2026_02"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# `uniprot:swissprot` legacy spec form via _resolve_spec / fetch_reference
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_resolve_spec_uniprot_swissprot_with_explicit_release(
+    stub_uniprot_http,
+) -> None:
+    """The ``uniprot:swissprot`` spec form returns a proteome-only
+    ``_ResolvedSpec`` with the SwissProt URL populated and the standard
+    portal handle stamped."""
+    from constellation.sequencing.reference.fetch import _resolve_spec
+
+    spec = _resolve_spec("uniprot:swissprot", release="2026_02", source=None)
+    assert spec.handle.organism == "swissprot"
+    assert spec.handle.source == "uniprot"
+    assert spec.handle.release == "2026_02"
+    # Proteome-only signal: empty fasta_url + gff_url, populated protein_url.
+    assert spec.fasta_url == ""
+    assert spec.gff_url == ""
+    assert spec.protein_url
+    assert spec.protein_url.endswith("/uniprot_sprot.fasta.gz")
+    assert spec.cdna_url is None
+    assert spec.annotation_release is None
+
+
+def test_resolve_spec_uniprot_swissprot_autodetects_release(
+    stub_uniprot_http,
+) -> None:
+    """Omitting --release routes through ``_probe_swissprot_release``."""
+    from constellation.sequencing.reference.fetch import _resolve_spec
+
+    spec = _resolve_spec("uniprot:swissprot", release=None, source=None)
+    assert spec.handle.release == "2026_02"  # from the stubbed reldate fixture
+
+
+def test_resolve_spec_uniprot_unknown_identifier_raises(stub_uniprot_http) -> None:
+    """``uniprot:<not-swissprot>`` raises a KeyError that points the user
+    at the bare-species-name path for per-species proteomes."""
+    from constellation.sequencing.reference.fetch import _resolve_spec
+
+    with pytest.raises(KeyError, match="unknown uniprot identifier"):
+        _resolve_spec("uniprot:UP000005640", release=None, source=None)
+
+
+def test_fetch_reference_uniprot_swissprot_end_to_end(
+    stub_uniprot_http, cache_root
+) -> None:
+    """``fetch_reference('uniprot:swissprot', release='2026_02')`` writes
+    the same portal layout as the back-compat ``fetch_swissprot()`` shim."""
+    from constellation.sequencing.reference.fetch import fetch_reference
+
+    result = fetch_reference("uniprot:swissprot", release="2026_02")
+    assert result.genome is None
+    assert result.annotation is None
+    assert result.protein_fasta_path is not None
+    assert result.protein_fasta_path.read_bytes() == _FASTA_FIXTURE
+    expected = cache_root / "swissprot" / "uniprot-2026_02" / "protein.faa"
+    assert result.protein_fasta_path == expected.resolve()

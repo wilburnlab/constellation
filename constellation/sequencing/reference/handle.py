@@ -450,7 +450,7 @@ def resolve(handle: Handle | str, *, root: Path | None = None) -> Path:
     if not organism_dir.is_dir():
         raise ReferenceNotInstalledError(
             f"no cached reference for organism {handle.organism!r} under {root}; "
-            f"run: constellation reference fetch <source>:<id>"
+            f"run: constellation reference fetch <spec> [--source SOURCE]"
         )
 
     if handle.is_qualified():
@@ -492,7 +492,7 @@ def resolve(handle: Handle | str, *, root: Path | None = None) -> Path:
     if not installed:
         msg = (
             f"no cache entry for {handle.organism!r}; run: "
-            f"constellation reference fetch <source>:<id>"
+            f"constellation reference fetch <spec> [--source SOURCE]"
         )
     raise ReferenceNotInstalledError(msg)
 

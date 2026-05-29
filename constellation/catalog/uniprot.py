@@ -10,8 +10,8 @@ Two surfaces:
     (``swissprot@uniprot-<release>`` handle). The orchestrator + viz
     layer no longer call this directly — they go through
     ``Reference.open("swissprot")`` after a ``constellation reference
-    fetch --organism swissprot --source uniprot`` install. The shim
-    stays so any external scripts that imported it keep working.
+    fetch uniprot:swissprot`` install. The shim stays so any external
+    scripts that imported it keep working.
 
 The catalog source: ``https://ftp.uniprot.org/pub/databases/uniprot/
 current_release/knowledgebase/reference_proteomes/README``.
@@ -289,8 +289,8 @@ def fetch_swissprot(
 
     New code should prefer ``Reference.open("swissprot")`` directly
     against an installed cache (set up once via ``constellation
-    reference fetch --organism swissprot --source uniprot``). This shim
-    is retained solely for back-compat with external scripts.
+    reference fetch uniprot:swissprot``). This shim is retained solely
+    for back-compat with external scripts.
 
     Parameters
     ----------
