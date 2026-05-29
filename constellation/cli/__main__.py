@@ -50,19 +50,35 @@ def _ensure_env_libstdcxx_priority() -> None:
     clusters where the spack / system libstdc++ is ahead of the env's
     on ``LD_LIBRARY_PATH``.
 
-    Reactive canary: try to import ``sqlite3`` (a stdlib module whose
-    ``libicui18n`` dependency is a known trigger of the libstdc++ /
-    CXXABI skew). If it succeeds, no problem — fast no-op. If it fails
-    with the libstdc++ / CXXABI / GLIBCXX signature, re-exec with the
-    env's lib dir prepended to ``LD_LIBRARY_PATH``. Other ImportError
-    causes (genuinely broken sqlite3) get re-raised to the caller.
+    Two-stage detection:
+
+    1. **sqlite3 import probe** — catches the broken-startup case where
+       importing a stdlib module that NEEDs libstdc++ raises immediately
+       (the original motivating failure: sqlite3 via massspec.cli at
+       parser-construction time on HPC clusters with old system libs).
+
+    2. **Path-resolution probe** — catches the more common case where
+       Python startup *succeeds* but the libstdc++ that got mapped into
+       the process is from outside ``$CONDA_PREFIX/lib``. The dynamic
+       linker registers a libstdc++.so.6 SONAME the first time anything
+       in the NEEDED chain pulls one in; any later runtime ``dlopen``
+       (pythonnet → CoreCLR, matplotlib's compiled extensions, ...)
+       reuses the already-loaded copy. When that copy is the system's
+       and it's older than what the just-dlopen'd native code expects,
+       you get a ``CXXABI_1.3.15`` / ``GLIBCXX_3.4.30`` / ... runtime
+       error. The probe forces a CDLL load (idempotent — no effect if
+       already loaded) and scans ``/proc/self/maps`` to find which file
+       backs the live SONAME. If that path is outside the env, we
+       re-exec to fix ``LD_LIBRARY_PATH`` before any heavier C extension
+       (and any spawn-mode child process) inherits the wrong copy.
+
+    Linux-specific (the path probe degrades to a no-op on systems
+    without ``/proc/self/maps``); other platforms keep the legacy
+    sqlite3-only behaviour.
 
     Defense-in-depth complement to :func:`_preload_matplotlib_for_reports`,
-    which kept the same re-exec logic gated on a matplotlib failure
-    inside the report-emitting handlers. The startup-level check here
-    catches problems that surface BEFORE any handler runs (sqlite3
-    via massspec.cli at parser-construction time being the original
-    motivating case).
+    which keeps the same re-exec logic gated on a matplotlib failure
+    inside the report-emitting handlers.
     """
     import os
 
@@ -77,28 +93,103 @@ def _ensure_env_libstdcxx_priority() -> None:
         _log("sentinel set; skipping canary (already re-exec'd this run)")
         return
 
-    _log("canary: importing sqlite3")
-    try:
-        import sqlite3  # noqa: F401
-        _log("canary: sqlite3 imported OK; no re-exec needed")
+    skew_reason = _detect_libstdcxx_skew(_log)
+    if skew_reason is None:
         return
-    except Exception as exc:  # noqa: BLE001
-        err_text = str(exc)
-        if not (
-            "libstdc++" in err_text
-            or "CXXABI" in err_text
-            or "GLIBCXX" in err_text
-        ):
-            _log(f"canary failed but not libstdc++-related: {exc}")
-            return
-        _log(f"canary failed with libstdc++ skew: {exc}")
 
     sys.stderr.write(
-        "NOTE: detected libstdc++ ABI skew at startup; re-launching "
-        "python with $CONDA_PREFIX/lib first on LD_LIBRARY_PATH.\n"
+        f"NOTE: detected libstdc++ ABI skew ({skew_reason}); re-launching "
+        f"python with $CONDA_PREFIX/lib first on LD_LIBRARY_PATH.\n"
     )
     sys.stderr.flush()
     _reexec_with_env_libstdcxx_first(_log)
+
+
+def _detect_libstdcxx_skew(log: Callable[[str], None]) -> str | None:
+    """Two-stage libstdc++ skew detection. Returns a short reason string
+    when a skew is detected (re-exec is warranted) or ``None`` when the
+    environment looks healthy. Helper for
+    :func:`_ensure_env_libstdcxx_priority`."""
+    # Stage 1: sqlite3 import probe. Bails out early ONLY when the import
+    # surfaces a libstdc++-signature error; non-libstdc++ failures
+    # (genuinely broken sqlite3) fall through so the path probe can still
+    # run — they're not what we're trying to fix here.
+    log("stage 1: importing sqlite3 as a NEEDED-chain probe")
+    try:
+        import sqlite3  # noqa: F401
+        log("  sqlite3 imported OK")
+    except Exception as exc:  # noqa: BLE001
+        err_text = str(exc)
+        if any(s in err_text for s in ("libstdc++", "CXXABI", "GLIBCXX")):
+            log(f"  sqlite3 raised libstdc++-signature error: {exc}")
+            return f"sqlite3 import failed: {type(exc).__name__}: {exc}"
+        log(f"  sqlite3 raised non-libstdc++ error (continuing): {exc}")
+
+    # Stage 2: path-resolution probe. Catches the parent-loads-clean case
+    # where a later dlopen (CoreCLR, matplotlib, ...) will reuse a
+    # mis-resolved SONAME.
+    log("stage 2: checking libstdc++ resolution path")
+    out_of_env_path = _libstdcxx_loaded_outside_env(log)
+    if out_of_env_path is not None:
+        return f"libstdc++.so.6 mapped from {out_of_env_path}"
+    return None
+
+
+def _libstdcxx_loaded_outside_env(log: Callable[[str], None]) -> str | None:
+    """Return the on-disk path of the currently-loaded ``libstdc++.so.6``
+    when that path is outside ``$CONDA_PREFIX/lib``; ``None`` otherwise.
+
+    Triggers a ``ctypes.CDLL("libstdc++.so.6")`` to ensure the SONAME is
+    resolved (idempotent if already loaded — the kernel just bumps the
+    refcount on the existing mapping), then scans ``/proc/self/maps``
+    to find the backing file. Silent no-op on non-Linux hosts where
+    ``/proc/self/maps`` is absent, on envs without ``CONDA_PREFIX``, and
+    when ``libstdc++.so.6`` isn't installed system-wide.
+    """
+    import ctypes
+    import os
+
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if not conda_prefix:
+        log("  no CONDA_PREFIX; path probe skipped")
+        return None
+    env_lib_prefix = str(Path(conda_prefix) / "lib")
+
+    try:
+        ctypes.CDLL("libstdc++.so.6")
+    except OSError as exc:
+        log(f"  libstdc++.so.6 not loadable via SONAME ({exc}); skipping")
+        return None
+
+    proc_maps = Path("/proc/self/maps")
+    if not proc_maps.is_file():
+        log("  /proc/self/maps absent; path probe skipped")
+        return None
+
+    try:
+        maps_text = proc_maps.read_text()
+    except OSError as exc:
+        log(f"  reading /proc/self/maps failed ({exc}); skipping")
+        return None
+
+    for line in maps_text.splitlines():
+        # Lines look like:
+        #   7f.. r-xp 00000000 00:00 12345 /usr/lib/.../libstdc++.so.6.0.32
+        # Pseudo-entries ([vdso], [stack], anonymous) don't match the
+        # absolute-path prefix check.
+        if "libstdc++.so" not in line:
+            continue
+        path = line.rsplit(maxsplit=1)[-1]
+        if not path.startswith("/"):
+            continue
+        if path.startswith(env_lib_prefix):
+            log(f"  libstdc++ loaded from {path} (inside env)")
+            return None
+        log(f"  libstdc++ loaded from {path} (OUTSIDE env)")
+        return path
+
+    log("  no libstdc++ entry in /proc/self/maps; skipping")
+    return None
 
 
 def _reexec_with_env_libstdcxx_first(debug_log) -> None:
