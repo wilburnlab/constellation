@@ -6,19 +6,23 @@ Status: **stub** — populated by PR 1 (which surveys the jar end-to-end) and ex
 
 ## How to (re)survey
 
-Local dev install at `~/.constellation/encyclopedia/6.5.15-dev/` (the install4j installer was run with `-q -dir`).
+`scripts/install-encyclopedia.sh --installer <install4j.sh>` installs into the per-user home cache `~/.constellation/encyclopedia/<version>/`, and `constellation.thirdparty.registry.find("encyclopedia")` discovers it there (env var → home cache → `third_party/`). `$CONSTELLATION_ENCYCLOPEDIA_HOME` overrides the location — point it at any install dir containing `encyclopedia-<version>.jar`.
+
+> The earlier dev build was placed at an **in-repo `constellation/encyclopedia/` path** with `$CONSTELLATION_ENCYCLOPEDIA_HOME` pointed at it — *not* `~/.constellation/encyclopedia/6.5.15-dev/` (a stale assumption that previously appeared here). `~/.constellation/encyclopedia/` is the canonical home the installer now establishes.
+
+The commands below resolve the jar through the env var (or the home-cache `current` symlink) so they work regardless of where the build lives:
 
 ```bash
-# Top-level help — lists all -<program> entry points
-~/.constellation/encyclopedia/6.5.15-dev/jre/bin/java \
-  -jar ~/.constellation/encyclopedia/6.5.15-dev/encyclopedia-6.5.15.jar --help
+ENC="${CONSTELLATION_ENCYCLOPEDIA_HOME:-$HOME/.constellation/encyclopedia/current}"
 
-# Per-program help
-~/.../jre/bin/java -jar ~/.../encyclopedia-6.5.15.jar <program> -h
-# e.g. -walnut, -convert, -libexport, -scribetwodda, ...
+# Top-level help — lists all -<program> entry points
+"$ENC"/jre/bin/java -jar "$ENC"/encyclopedia-*.jar --help
+
+# Per-program help (e.g. -walnut, -convert, -libexport, -scribetwodda)
+"$ENC"/jre/bin/java -jar "$ENC"/encyclopedia-*.jar <program> -h
 
 # Nested -convert subcommands
-~/.../jre/bin/java -jar ~/.../encyclopedia-6.5.15.jar -convert -<subprogram> -h
+"$ENC"/jre/bin/java -jar "$ENC"/encyclopedia-*.jar -convert -<subprogram> -h
 ```
 
 When system Java is available, the runner picks `shutil.which("java")`; the bundled JRE in the install dir is the fallback for boxes without one.
@@ -180,10 +184,10 @@ Diff vs 2.12.30:
 
 *Pending PR 4 — default mode only; `-libexport -pecan` / `-xcordia` / `-phospho` deferred unless a use case appears.*
 
-## v2.12.30 compatibility notes
+## v2.12.30 is no longer supported
 
-The publicly-available release (`scripts/install-encyclopedia.sh` pins this) is hand-rolled CLI (not picocli), with a different default-CLI shape — single-program-per-invocation, no `-program` selector mode. The wrappers warn (not error) when `find("encyclopedia").version` falls outside `SUPPORTED_VERSIONS = {"2.12.30", "6.5.15"}`. For v2.12.30 calls, drop the `-convert` prefix (sub-utilities became their own top-level flags in 6.5.15 only) and expect a smaller flag surface; the `--encyclopedia-arg FLAG=VALUE` CLI escape hatch is the path of least resistance until per-version dispatch lands.
+Constellation pins EncyclopeDIA to **>= 6.5.15** (`MINIMUM_ENCYCLOPEDIA_VERSION` in `massspec.search.encyclopedia._common`). The old public 2.12.30 release is hand-rolled CLI (not picocli), single-program-per-invocation, and — fatally for the transcriptome→proteome pipeline — has no `-convert -fastaToJChronologerLibrary` predict-library utility (new in 6.5.15). Resolving a sub-6.5.15 jar now **hard-errors** (was: warn-and-proceed) via `require_min_encyclopedia`, naming the offending version and pointing at `scripts/install-encyclopedia.sh --installer`. The install script no longer fetches 2.12.30.
 
-## When 6.5.15 ships publicly
+## When a public >= 6.5.15 release ships
 
-Bump `ENCYCLOPEDIA_VERSION` in [constellation/thirdparty/encyclopedia.py](../../constellation/thirdparty/encyclopedia.py) to `6.5.15`, set `artifact` to `"encyclopedia-6.5.15.jar"`, and extend [scripts/install-encyclopedia.sh](../../scripts/install-encyclopedia.sh) with a v6.5.15 install path (download the install4j `.sh`, run `-q -dir third_party/encyclopedia/6.5.15/`, repoint the `current` symlink). Wrapper code is unaffected — the runner is artifact-shape-agnostic.
+No adapter code edit is needed — [constellation/thirdparty/encyclopedia.py](../../constellation/thirdparty/encyclopedia.py) globs `encyclopedia-*.jar` and picks the highest version (`pick="highest"`), so 6.5.15 / 6.6.0 / 7.0 all resolve as-is. Just fill in the `RELEASE_URL` + `RELEASE_SHA256` `__UNSET__` sentinels in [scripts/install-encyclopedia.sh](../../scripts/install-encyclopedia.sh); the default (no-`--installer`) mode then downloads + verifies + installs to `~/.constellation/encyclopedia/<version>/`, auto-detecting whether the artifact is a bare `.jar` or an install4j `.sh`. Until then, `--installer <install4j.sh>` is the working path. Wrapper code is unaffected — `run_jar` is artifact-shape-agnostic.

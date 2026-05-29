@@ -16,7 +16,6 @@ The Tier B test takes ~30-60 seconds on first invocation per machine
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -102,13 +101,18 @@ def test_build_args_with_ptms_and_overrides(tmp_path: Path) -> None:
 
 
 def _have_encyclopedia_install() -> bool:
-    home = os.environ.get("CONSTELLATION_ENCYCLOPEDIA_HOME")
-    if home is None:
-        return False
-    home_path = Path(home).expanduser()
-    return any(
-        (home_path / cand).is_file()
-        for cand in ("encyclopedia-6.5.15.jar", "encyclopedia-2.12.30-executable.jar")
+    # Tier B runs the real jar — gate on a registry-resolved install (env
+    # var -> ~/.constellation/encyclopedia/current -> third_party) that
+    # meets the >= 6.5.15 floor, so we never try predict-library against a
+    # jar the CLI would now hard-error on.
+    from constellation.massspec.search.encyclopedia import is_supported_version
+    from constellation.thirdparty.registry import try_find
+
+    handle = try_find("encyclopedia")
+    return (
+        handle is not None
+        and handle.path.is_file()
+        and is_supported_version(handle.version)
     )
 
 
@@ -191,7 +195,9 @@ def test_predict_library_cli_handler_end_to_end(tmp_path: Path) -> None:
     assert (output_dir / "library_pqdir" / "peptides.parquet").is_file()
     manifest = json.loads((output_dir / "manifest.json").read_text())
     assert manifest["subcommand"] == "massspec predict-library"
-    assert manifest["tool"]["version"] in ("2.12.30", "6.5.15")
+    from constellation.massspec.search.encyclopedia import is_supported_version
+
+    assert is_supported_version(manifest["tool"]["version"])  # >= 6.5.15
     assert manifest["runtime"]["returncode"] == 0
     assert manifest["ingest"]["skipped"] is False
     assert isinstance(manifest["ingest"]["library_counts"]["peptides"], int)

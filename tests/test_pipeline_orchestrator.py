@@ -551,11 +551,26 @@ def stub_external_calls(monkeypatch, tmp_path) -> dict:
         (Path(run_dir) / "library_pqdir").mkdir(parents=True, exist_ok=True)
         state["calls"].append(("auto_ingest", str(elib_path)))
 
+    def _fake_find(name):
+        # The orchestrator's pre-Stage-0 preflight resolves the encyclopedia
+        # jar and version-checks it. No real jar in the test env, so hand
+        # back a fake >= 6.5.15 handle.
+        from constellation.thirdparty.registry import ToolHandle, ToolSpec
+
+        assert name == "encyclopedia"
+        spec = ToolSpec(
+            name="encyclopedia", env_var="CONSTELLATION_ENCYCLOPEDIA_HOME"
+        )
+        return ToolHandle(
+            spec, tmp_path / "encyclopedia-6.5.15.jar", "env", "6.5.15"
+        )
+
     import constellation.transcriptome_to_proteome as t2p
 
     monkeypatch.setattr(
         "constellation.catalog.uniprot.fetch_swissprot", _fake_fetch_swissprot
     )
+    monkeypatch.setattr("constellation.thirdparty.registry.find", _fake_find)
     # The orchestrator imports these lazily inside the function — patch
     # at the *origin* modules so the lookup picks up the stubs.
     monkeypatch.setattr(
@@ -838,3 +853,35 @@ def test_orchestrator_no_collision_filter_skips_raw(
     # _raw/ still exists because the jar's raw output lands there, but
     # no extra files were created since filter was skipped.
     assert (stage7 / "combined_1TPM.elib").is_file()
+
+
+def test_orchestrator_preflight_rejects_old_encyclopedia(
+    stub_inputs, monkeypatch, capsys
+) -> None:
+    """A sub-6.5.15 jar hard-errors at the preflight, before Stage 0 runs."""
+    from constellation.thirdparty.registry import ToolHandle, ToolSpec
+    from constellation.transcriptome_to_proteome import (
+        run_transcriptome_to_proteomics,
+    )
+
+    def _old_find(name):
+        assert name == "encyclopedia"
+        spec = ToolSpec(
+            name="encyclopedia", env_var="CONSTELLATION_ENCYCLOPEDIA_HOME"
+        )
+        return ToolHandle(
+            spec,
+            Path("/nonexistent/encyclopedia-2.12.30-executable.jar"),
+            "env",
+            "2.12.30",
+        )
+
+    monkeypatch.setattr("constellation.thirdparty.registry.find", _old_find)
+
+    args = _build_args(stub_inputs)
+    rc = run_transcriptome_to_proteomics(args=args)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "2.12.30" in err and "6.5.15" in err
+    # Failed at preflight — Stage 0 never created its output dir.
+    assert not (stub_inputs["output_dir"] / "00_deduped_refseq").exists()

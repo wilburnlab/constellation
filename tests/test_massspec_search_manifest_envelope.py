@@ -13,11 +13,13 @@ from pathlib import Path
 import pytest
 
 from constellation.massspec.search.encyclopedia._common import (
-    SUPPORTED_VERSIONS,
+    MINIMUM_ENCYCLOPEDIA_VERSION,
     build_manifest_envelope,
     default_heap_for_input,
     encyclopedia_passthrough_args,
+    is_supported_version,
     ptm_toggle_args,
+    require_min_encyclopedia,
     sha256_file,
     write_manifest,
 )
@@ -243,9 +245,47 @@ def test_write_manifest_round_trip(tmp_path: Path) -> None:
     assert parsed["tool"]["version"] == "6.5.15"
 
 
-# ── supported versions ────────────────────────────────────────────────
+# ── minimum-version pin (>= 6.5.15) ────────────────────────────────────
 
 
-def test_supported_versions_contains_both_release_lines() -> None:
-    assert "2.12.30" in SUPPORTED_VERSIONS
-    assert "6.5.15" in SUPPORTED_VERSIONS
+def test_minimum_encyclopedia_version_is_pinned() -> None:
+    assert MINIMUM_ENCYCLOPEDIA_VERSION == "6.5.15"
+
+
+@pytest.mark.parametrize(
+    ("version", "supported"),
+    [
+        ("6.5.15", True),    # the floor
+        ("6.5.16", True),
+        ("6.6.0", True),     # newer minor — forward-compatible
+        ("7.0.0", True),     # much newer
+        ("2.12.30", False),  # legacy public release — string-compare TRAP
+        ("6.5.14", False),   # just below the floor
+        (None, True),        # unparseable build: can't prove it's old -> allowed
+    ],
+)
+def test_is_supported_version(version, supported) -> None:
+    assert is_supported_version(version) is supported
+
+
+def _encyclopedia_handle(version):
+    """A ToolHandle with the given probed version, for guard tests."""
+    from constellation.thirdparty.registry import ToolHandle, ToolSpec
+
+    spec = ToolSpec(name="encyclopedia", env_var="CONSTELLATION_ENCYCLOPEDIA_HOME")
+    return ToolHandle(spec, Path("/nonexistent/encyclopedia.jar"), "env", version)
+
+
+def test_require_min_encyclopedia_rejects_old(capsys) -> None:
+    rc = require_min_encyclopedia(_encyclopedia_handle("2.12.30"))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "2.12.30" in err          # names the offending version
+    assert "6.5.15" in err           # and the floor
+
+
+def test_require_min_encyclopedia_accepts_current_and_unparseable(capsys) -> None:
+    assert require_min_encyclopedia(_encyclopedia_handle("6.5.15")) == 0
+    assert require_min_encyclopedia(_encyclopedia_handle("6.6.0")) == 0
+    assert require_min_encyclopedia(_encyclopedia_handle(None)) == 0
+    assert capsys.readouterr().err == ""
