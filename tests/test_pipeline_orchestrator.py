@@ -74,9 +74,8 @@ def test_t2p_required_args() -> None:
     assert expected.issubset(required), (
         f"missing required args: {expected - required}"
     )
-    # --proteins-fasta is optional — the pipeline derives novel ORF
-    # sequences from --protein-counts (the demux table's `sequence`
-    # column) by default.
+    # --protein-fasta is optional — only needed when overriding the
+    # ORF sequences the orchestrator derives from --demux-dir.
     optional = {
         opt
         for action in t2p._actions
@@ -86,7 +85,7 @@ def test_t2p_required_args() -> None:
     assert "--reference" in optional
     assert "--reference-from" in optional
     assert "--swissprot-reference" in optional
-    assert "--proteins-fasta" in optional
+    assert "--protein-fasta" in optional
 
 
 def test_t2p_ptm_defaults_match_lab_convention() -> None:
@@ -239,6 +238,150 @@ def test_t2p_reference_and_reference_from_disagreement_rejected(
     )
     with pytest.raises(_ResolutionError, match="disagrees"):
         _resolve_reference_from_args(args)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Spectra input expansion (--gpf / --injections)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_expand_spectra_passes_files_through(tmp_path: Path) -> None:
+    """Plain file inputs are resolved and returned in sorted order."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+    )
+
+    a = tmp_path / "a.raw"
+    b = tmp_path / "b.raw"
+    a.write_bytes(b"")
+    b.write_bytes(b"")
+
+    result = _expand_spectra_inputs([b, a], flag="--gpf")
+    assert result == [a.resolve(), b.resolve()]
+
+
+def test_expand_spectra_scans_directories(tmp_path: Path) -> None:
+    """A directory is scanned non-recursively for spectra files."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+    )
+
+    d = tmp_path / "runs"
+    d.mkdir()
+    (d / "sample01.raw").write_bytes(b"")
+    (d / "sample02.raw").write_bytes(b"")
+    (d / "notes.txt").write_text("ignored")
+    # Nested directory should NOT be descended into.
+    nested = d / "old_runs"
+    nested.mkdir()
+    (nested / "sample99.raw").write_bytes(b"")
+
+    result = _expand_spectra_inputs([d], flag="--gpf")
+    stems = sorted(p.stem for p in result)
+    assert stems == ["sample01", "sample02"]
+
+
+def test_expand_spectra_mixed_files_and_dirs(tmp_path: Path) -> None:
+    """Mixing dir + explicit file inputs collects both."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+    )
+
+    d = tmp_path / "runs"
+    d.mkdir()
+    (d / "sample01.raw").write_bytes(b"")
+    standalone = tmp_path / "standalone.raw"
+    standalone.write_bytes(b"")
+
+    result = _expand_spectra_inputs([d, standalone], flag="--gpf")
+    stems = sorted(p.stem for p in result)
+    assert stems == ["sample01", "standalone"]
+
+
+def test_expand_spectra_dia_wins_over_raw(
+    tmp_path: Path, capsys
+) -> None:
+    """When the same stem has both .dia and .raw, .dia wins (cache
+    already preprocessed; Stage 6 won't re-convert)."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+    )
+
+    d = tmp_path / "runs"
+    d.mkdir()
+    raw = d / "sample01.raw"
+    dia = d / "sample01.dia"
+    raw.write_bytes(b"")
+    dia.write_bytes(b"")
+
+    result = _expand_spectra_inputs([d], flag="--gpf")
+    assert result == [dia.resolve()]
+    err = capsys.readouterr().err
+    assert "sample01" in err
+    assert "sample01.raw" in err
+
+
+def test_expand_spectra_raw_wins_over_mzml(tmp_path: Path) -> None:
+    """When the same stem has both .raw and .mzML, .raw wins (canonical
+    Thermo input; mzML is the legacy intermediate)."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+    )
+
+    d = tmp_path / "runs"
+    d.mkdir()
+    raw = d / "sample01.raw"
+    mzml = d / "sample01.mzML"
+    raw.write_bytes(b"")
+    mzml.write_bytes(b"")
+
+    result = _expand_spectra_inputs([d], flag="--gpf")
+    assert result == [raw.resolve()]
+
+
+def test_expand_spectra_accepts_bruker_d_directory(tmp_path: Path) -> None:
+    """A ``.d`` directory bundle is passed through verbatim (not scanned
+    for inner spectra files)."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+    )
+
+    bundle = tmp_path / "sample01.d"
+    bundle.mkdir()
+    (bundle / "analysis.tdf").write_bytes(b"stub")
+
+    result = _expand_spectra_inputs([bundle], flag="--gpf")
+    assert result == [bundle.resolve()]
+
+
+def test_expand_spectra_errors_on_empty_directory(tmp_path: Path) -> None:
+    """A directory with no spectra files raises with the actionable
+    error message the CLI surfaces as exit 2."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+        _ResolutionError,
+    )
+
+    d = tmp_path / "empty"
+    d.mkdir()
+    (d / "notes.txt").write_text("nothing to see")
+
+    with pytest.raises(_ResolutionError, match="matched no spectra files"):
+        _expand_spectra_inputs([d], flag="--gpf")
+
+
+def test_expand_spectra_errors_on_unknown_extension(tmp_path: Path) -> None:
+    """A bare path with an unsupported extension errors out instead of
+    silently passing through."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+        _ResolutionError,
+    )
+
+    p = tmp_path / "sample01.txt"
+    p.write_text("")
+    with pytest.raises(_ResolutionError, match="not a recognised spectra"):
+        _expand_spectra_inputs([p], flag="--gpf")
 
 
 def test_t2p_collision_filter_default_on() -> None:
@@ -411,7 +554,7 @@ def stub_inputs(tmp_path) -> dict:
         "0\tN1\t10.0\t" + "M" * 120 + "\n"
         "1\tN2\t5.0\t" + "K" * 120 + "\n"
     )
-    # Proteins FASTA (legacy --proteins-fasta escape hatch).
+    # ORF FASTA override (the --protein-fasta input).
     proteins = tmp_path / "proteins.fasta"
     proteins.write_text(
         ">N1 source=demux\n" + "M" * 120 + "\n"
@@ -429,7 +572,7 @@ def stub_inputs(tmp_path) -> dict:
     out = tmp_path / "out"
     return {
         "demux_dir": counts,
-        "proteins_fasta": proteins,
+        "protein_fasta": proteins,
         "reference": reference,
         "swissprot_reference": swissprot_reference,
         "gpf": [gpf],
@@ -450,7 +593,7 @@ def _build_args(stub: dict, **overrides) -> argparse.Namespace:
         [
             "transcriptome-to-proteome",
             "--demux-dir", str(stub["demux_dir"]),
-            "--proteins-fasta", str(stub["proteins_fasta"]),
+            "--protein-fasta", str(stub["protein_fasta"]),
             "--reference", str(stub["reference"].handle),
             "--gpf", *[str(p) for p in stub["gpf"]],
             "--injections", *[str(p) for p in stub["injections"]],

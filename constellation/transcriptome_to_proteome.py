@@ -155,21 +155,16 @@ def filter_and_write_novel_fasta(
     reference_fasta: Path | str,
     output_path: Path | str,
     min_avg_tpm: float = 1.0,
-    proteins_fasta: Path | str | None = None,
+    protein_fasta: Path | str | None = None,
 ) -> tuple[pa.Table, int]:
     """Filter the transcriptome ORFs to the proteins worth searching:
     those above the TPM threshold AND not in the reference proteome.
 
-    Sequences come from ``counts_tpm.column("sequence")`` by default —
-    the long-form counts table emitted by Phase 6's
-    :func:`~constellation.sequencing.quant.protein_counts.read_protein_counts_tab`
-    carries the per-protein sequence alongside the count/tpm columns,
-    so a separate ``proteins.fasta`` input is no longer required.
-    Callers that want to keep passing a FASTA explicitly (e.g. the
-    legacy ``build_tpm_sweep_fastas.py`` harness, or any external
-    script that produced an ORF FASTA outside the demux pipeline) can
-    still do so via the optional ``proteins_fasta`` argument; when
-    supplied, it overrides the counts-derived sequences.
+    Sequences come from ``counts_tpm.column("sequence")`` by default.
+    The optional ``protein_fasta`` argument overrides this with an ORF
+    FASTA produced by a different upstream pipeline (any path-based
+    external caller that doesn't fan its sequences through the demux
+    counts table).
 
     Parameters
     ----------
@@ -178,7 +173,7 @@ def filter_and_write_novel_fasta(
         column added by :func:`tpm_normalize`). Average TPM across
         samples is computed per ``protein_id``; rows below
         ``min_avg_tpm`` drop. The ``sequence`` column provides the
-        ORF sequences when ``proteins_fasta`` is None.
+        ORF sequences when ``protein_fasta`` is None.
     reference_fasta
         Background proteome (e.g. RefSeq). Used for sequence-set dedup
         — any novel sequence whose blake2b hash matches a reference
@@ -190,12 +185,11 @@ def filter_and_write_novel_fasta(
     min_avg_tpm
         Average-TPM threshold (default 1.0 — cartographer's default).
         Set per the user's CLI ``--min-avg-tpm`` flag.
-    proteins_fasta
-        Optional override. When supplied, sequences come from this
-        FASTA instead of ``counts_tpm.column("sequence")``; the file
-        is read on every call so external callers using their own
-        ORF caller still work without reshuffling their inputs.
-        Default ``None`` — derive from ``counts_tpm``.
+    protein_fasta
+        Optional override produced by a different upstream pipeline.
+        When supplied, sequences come from this FASTA instead of
+        ``counts_tpm.column("sequence")``. Default ``None`` — derive
+        from ``counts_tpm``.
 
     Returns
     -------
@@ -231,11 +225,11 @@ def filter_and_write_novel_fasta(
         r["protein_id"]: r["avg_tpm"] for r in avg.to_pylist()
     }
 
-    # Source sequences: from ``counts_tpm`` (default, drops the
-    # redundant FASTA input) OR from ``proteins_fasta`` (legacy /
-    # external override). Either way, restrict to ``passing_ids``.
+    # Source sequences: from ``counts_tpm`` (default) OR from the
+    # ``protein_fasta`` external override. Either way, restrict to
+    # ``passing_ids``.
     source_records: dict[str, str] = {}
-    if proteins_fasta is None:
+    if protein_fasta is None:
         # Long-table form: one row per (protein, sample). Sequences
         # repeat across samples for the same protein — take the first
         # non-null occurrence per passing protein_id.
@@ -245,8 +239,8 @@ def filter_and_write_novel_fasta(
             if pid in passing_ids and pid not in source_records and seq:
                 source_records[pid] = seq.upper()
     else:
-        proteins_fasta = Path(proteins_fasta)
-        for header, seq in _iter_fasta(proteins_fasta):
+        protein_fasta = Path(protein_fasta)
+        for header, seq in _iter_fasta(protein_fasta):
             protein_id = _header_id(header)
             if protein_id in passing_ids:
                 source_records[protein_id] = seq.upper()
@@ -830,13 +824,12 @@ def run_transcriptome_to_proteomics(
     else:
         tpm_suffix = f"_{str(_tpm_val).replace('.', '_')}TPM"
     demux_dir = Path(args.demux_dir).resolve()
-    # ``proteins.fasta`` is no longer a required input — Stage 2 derives
-    # novel ORF sequences directly from ``counts_tpm.column("sequence")``.
-    # The CLI keeps ``--proteins-fasta`` as an optional override for
-    # legacy callers; resolve when supplied, else None.
-    proteins_fasta = (
-        Path(args.proteins_fasta).resolve()
-        if getattr(args, "proteins_fasta", None) is not None
+    # Optional override: an ORF FASTA produced by a different upstream
+    # pipeline. When None, Stage 2 derives sequences from
+    # ``counts_tpm.column("sequence")``.
+    protein_fasta = (
+        Path(args.protein_fasta).resolve()
+        if getattr(args, "protein_fasta", None) is not None
         else None
     )
     # Reference artifacts come from the resolved Reference objects —
@@ -944,7 +937,7 @@ def run_transcriptome_to_proteomics(
         stage_dir.mkdir(parents=True, exist_ok=True)
         novel_table, n_novel = filter_and_write_novel_fasta(
             counts_tpm=counts_tpm,
-            proteins_fasta=proteins_fasta,
+            protein_fasta=protein_fasta,
             reference_fasta=reference_fasta_for_pipeline,
             output_path=novel_path,
             min_avg_tpm=args.min_avg_tpm,
@@ -1322,10 +1315,10 @@ def run_transcriptome_to_proteomics(
         # Novel proteins = every transcriptome-derived ORF. Source:
         # ``counts_tpm`` carries the full per-ORF set with sequences,
         # so we derive the 2-column ``(protein_id, sequence)`` table
-        # directly. Legacy callers that supplied --proteins-fasta still
-        # get that path; counts-derivation is the default.
-        if proteins_fasta is not None:
-            novel_proteins = read_fasta_proteins(proteins_fasta)
+        # directly. The optional --protein-fasta override (external
+        # upstream pipelines that supply their own ORFs) takes precedence.
+        if protein_fasta is not None:
+            novel_proteins = read_fasta_proteins(protein_fasta)
         else:
             # Long-form counts_tpm has one row per (protein, sample);
             # collapse to unique (protein_id, sequence) pairs. ``set``
@@ -1363,7 +1356,7 @@ def run_transcriptome_to_proteomics(
                 "constellation_version": constellation_version,
                 "reference_fasta": str(reference_fasta),
                 "novel_fasta": (
-                    str(proteins_fasta) if proteins_fasta is not None
+                    str(protein_fasta) if protein_fasta is not None
                     else "derived from counts_tpm.parquet"
                 ),
             },
@@ -1528,7 +1521,7 @@ def run_transcriptome_to_proteomics(
         "argv": sys.argv,
         "inputs": {
             "demux_dir": _input_meta(demux_dir),
-            "proteins_fasta": _input_meta(proteins_fasta),
+            "protein_fasta": _input_meta(protein_fasta),
             "reference_fasta": _input_meta(reference_fasta),
             "reference_annotation": _input_meta(reference_annotation),
             "gpf": [_input_meta(p) for p in gpf_files],

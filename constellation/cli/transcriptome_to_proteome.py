@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 from constellation.massspec.search.encyclopedia.ptm_defaults import (
@@ -64,16 +65,13 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         ),
     )
     p.add_argument(
-        "--proteins-fasta",
+        "--protein-fasta",
         type=Path,
         default=None,
         help=(
-            "Optional override. `proteins.fasta` from "
-            "`constellation transcriptome demultiplex`. NO LONGER "
-            "REQUIRED — the pipeline derives novel ORF sequences "
-            "directly from `--demux-dir` (the demux output carries them "
-            "in its `sequence` column). Supply this only if you want to "
-            "use an ORF FASTA produced by a different upstream pipeline."
+            "ORF FASTA from a different upstream pipeline; overrides the "
+            "novel ORF sequences the orchestrator otherwise derives from "
+            "the `--demux-dir` `sequence` column."
         ),
     )
     p.add_argument(
@@ -104,10 +102,13 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         nargs="+",
         type=Path,
         help=(
-            "one or more GPF spectra files (gas-phase fractions). "
-            "Thermo `.raw` is the canonical lab input; `.mzML` and "
-            "preprocessed `.dia` caches are also accepted — Stage 6 "
-            "(`process-dia`) handles all three transparently."
+            "one or more GPF spectra inputs (gas-phase fractions). "
+            "Each path may be a file (Thermo `.raw`, `.mzML`, `.dia`, "
+            "or Bruker `.d`) or a directory; directories are scanned "
+            "for spectra files. When the same stem appears in multiple "
+            "formats, the orchestrator picks one in this preference "
+            "order: `.dia` (preprocessed cache, skip Stage 6) > "
+            "`.raw` > `.mzML` > `.d`."
         ),
     )
     p.add_argument(
@@ -117,8 +118,9 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         type=Path,
         help=(
             "one or more per-sample individual-injection spectra "
-            "files. Same format flexibility as --gpf: `.raw` is the "
-            "canonical lab input; `.mzML` and `.dia` accepted."
+            "inputs. Same path semantics as --gpf: files or "
+            "directories accepted, same `.dia` > `.raw` > `.mzML` > "
+            "`.d` per-stem preference."
         ),
     )
     p.add_argument(
@@ -338,6 +340,19 @@ def _cmd_transcriptome_to_proteome(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    # Expand directories + dedup by stem before handing off to the
+    # orchestrator so Stage 6 + Stage 9 see one canonical file per
+    # acquisition (avoids re-converting .raw → .dia when a cache is
+    # already on disk).
+    try:
+        args.gpf = _expand_spectra_inputs(args.gpf, flag="--gpf")
+        args.injections = _expand_spectra_inputs(
+            args.injections, flag="--injections"
+        )
+    except _ResolutionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     from constellation.transcriptome_to_proteome import (
         run_transcriptome_to_proteomics,
     )
@@ -351,6 +366,122 @@ def _cmd_transcriptome_to_proteome(args: argparse.Namespace) -> int:
 class _ResolutionError(Exception):
     """CLI-handler-local exception so the resolvers can raise concise
     messages that the handler surfaces as ``error: ...`` + exit 2."""
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Spectra-input expansion (--gpf / --injections)
+# ──────────────────────────────────────────────────────────────────────
+
+
+# Format preference table for per-stem deduplication. Lower rank wins.
+# ``.dia`` is preferred over ``.raw`` so Stage 6 picks up an already-
+# preprocessed cache and doesn't re-decode the raw bytes. ``.raw`` is
+# the canonical Thermo lab input. ``.mzML`` is the legacy intermediate
+# (EncyclopeDIA 6.5.15 added native ``.raw`` support so mzML is
+# unlikely going forward). ``.d`` is the Bruker timsTOF directory.
+_SPECTRA_RANK: dict[str, int] = {
+    ".dia": 0,
+    ".raw": 1,
+    ".mzml": 2,
+    ".d": 3,
+}
+
+
+def _is_spectra_path(p: Path) -> bool:
+    """True iff ``p`` is a spectra file or a Bruker ``.d`` directory."""
+    suffix = p.suffix.lower()
+    if suffix not in _SPECTRA_RANK:
+        return False
+    if suffix == ".d":
+        # `.d` is a directory bundle; reject lone files with that suffix.
+        return p.is_dir()
+    return p.is_file()
+
+
+def _collect_spectra_files(paths: Sequence[Path]) -> list[Path]:
+    """Walk every input path (file or directory) and return spectra files.
+
+    Bruker ``.d`` paths are passed through verbatim (they're directory
+    bundles). All other directories are scanned non-recursively for
+    spectra files at the top level — nested scans would silently glob
+    archived runs that the user didn't intend to process.
+    """
+    out: list[Path] = []
+    for p in paths:
+        resolved = Path(p).expanduser().resolve()
+        suffix = resolved.suffix.lower()
+        if suffix == ".d" and resolved.is_dir():
+            # Bruker bundle — pass through.
+            out.append(resolved)
+            continue
+        if resolved.is_dir():
+            for entry in sorted(resolved.iterdir()):
+                if _is_spectra_path(entry):
+                    out.append(entry.resolve())
+            continue
+        if not resolved.exists():
+            raise _ResolutionError(
+                f"input path {resolved} does not exist"
+            )
+        if not _is_spectra_path(resolved):
+            raise _ResolutionError(
+                f"input path {resolved} is not a recognised spectra file "
+                f"(supported: {sorted(_SPECTRA_RANK)})"
+            )
+        out.append(resolved)
+    return out
+
+
+def _expand_spectra_inputs(
+    paths: Sequence[Path], *, flag: str
+) -> list[Path]:
+    """Expand a list of file/directory paths into a deduplicated
+    spectra-file list ready for Stage 6 (process-dia) / Stage 9
+    (per-injection search).
+
+    Per-stem dedup: when ``sample01.raw`` and ``sample01.dia`` are both
+    present, the ``.dia`` cache wins so Stage 6 doesn't redo the raw
+    decode. Dropped entries are logged to stderr so the user can audit
+    the choices.
+
+    Raises :class:`_ResolutionError` (handler-surfaced as ``error: ...``)
+    if no spectra files are found.
+    """
+    candidates = _collect_spectra_files(paths)
+    if not candidates:
+        raise _ResolutionError(
+            f"{flag} matched no spectra files; expected one or more "
+            f"file or directory paths to "
+            f"{sorted(_SPECTRA_RANK)} inputs."
+        )
+
+    # Per-stem dedup. Group by stem; keep the highest-preference
+    # (lowest rank) entry; log every drop so the user sees the picking.
+    by_stem: dict[str, Path] = {}
+    drops: list[tuple[Path, Path]] = []
+    for cand in candidates:
+        stem = cand.stem
+        rank_new = _SPECTRA_RANK[cand.suffix.lower()]
+        existing = by_stem.get(stem)
+        if existing is None:
+            by_stem[stem] = cand
+            continue
+        rank_existing = _SPECTRA_RANK[existing.suffix.lower()]
+        if rank_new < rank_existing:
+            drops.append((existing, cand))
+            by_stem[stem] = cand
+        else:
+            drops.append((cand, existing))
+
+    for dropped, kept in drops:
+        print(
+            f"{flag}: stem {kept.stem!r} appears in both "
+            f"{dropped.suffix} and {kept.suffix}; using {kept.name}, "
+            f"skipping {dropped.name}",
+            file=sys.stderr,
+        )
+
+    return sorted(by_stem.values())
 
 
 def _resolve_reference_from_args(args: argparse.Namespace):

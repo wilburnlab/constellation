@@ -121,7 +121,7 @@ def test_filter_and_write_novel_fasta_basic(tmp_path: Path) -> None:
 
     novel_table, n_written = filter_and_write_novel_fasta(
         counts_tpm=counts,
-        proteins_fasta=proteins,
+        protein_fasta=proteins,
         reference_fasta=reference,
         output_path=out,
         min_avg_tpm=1.0,
@@ -210,7 +210,7 @@ def test_filter_and_write_novel_fasta_tpm_threshold(tmp_path: Path) -> None:
     out = tmp_path / "novel.fasta"
     novel_table, n_written = filter_and_write_novel_fasta(
         counts_tpm=counts,
-        proteins_fasta=proteins,
+        protein_fasta=proteins,
         reference_fasta=reference,
         output_path=out,
         min_avg_tpm=500000.0,
@@ -236,7 +236,7 @@ def test_filter_and_write_novel_fasta_all_filtered_empty(tmp_path: Path) -> None
     out = tmp_path / "novel.fasta"
     novel_table, n_written = filter_and_write_novel_fasta(
         counts_tpm=counts,
-        proteins_fasta=proteins,
+        protein_fasta=proteins,
         reference_fasta=reference,
         output_path=out,
         min_avg_tpm=1.0,
