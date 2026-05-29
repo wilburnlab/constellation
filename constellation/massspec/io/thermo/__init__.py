@@ -25,6 +25,7 @@ guidance otherwise.
 
 from __future__ import annotations
 
+from ._batch import BatchResult, BatchStatus, convert_batch
 from ._filter import parse_filter_string
 from ._netruntime import is_thermo_available, load_clr, require_thermo
 from ._read import (
@@ -50,9 +51,12 @@ __all__ = [
     "MANIFEST_FILENAME",
     "MANIFEST_SCHEMA_VERSION",
     "SOURCE_FORMAT",
+    "BatchResult",
+    "BatchStatus",
     "ThermoAcquisitionManifest",
     "ThermoReader",
     "convert",
+    "convert_batch",
     "is_thermo_available",
     "load_clr",
     "parse_filter_string",
