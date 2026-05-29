@@ -64,9 +64,11 @@ def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
     p = subs.add_parser(
         "convert",
         help=(
-            "Convert one Thermo .raw file into a directory bundle "
+            "Convert Thermo .raw file(s) into directory bundles "
             "(manifest.json + peaks.parquet + scan_metadata.parquet + "
-            "acquisition_metadata.parquet). Dispatches on the input "
+            "acquisition_metadata.parquet). Accepts a single .raw file "
+            "OR a directory of .raw files; --threads fans the directory "
+            "out across worker subprocesses. Dispatches on the input "
             "suffix; .raw routes to constellation.massspec.io.thermo.convert. "
             "Future mzML / Bruker / Sciex converters slot in transparently."
         ),
@@ -74,7 +76,10 @@ def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
     p.add_argument(
         "input",
         type=Path,
-        help="Path to the input mass-spec file (currently .raw only).",
+        help=(
+            "Path to a .raw file OR a directory containing .raw files "
+            "(non-recursive glob, case-insensitive)."
+        ),
     )
     p.add_argument(
         "-o",
@@ -82,9 +87,22 @@ def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
         type=Path,
         default=None,
         help=(
-            "Parent directory for the output bundle. Bundle dir is "
-            "<output-dir>/<input-stem>/. Defaults to the input file's "
-            "parent directory."
+            "Parent directory for the output bundle(s). Each bundle dir "
+            "is <output-dir>/<input-stem>/. Defaults to the input file's "
+            "parent directory (single-file mode) or the input directory "
+            "itself (directory mode)."
+        ),
+    )
+    p.add_argument(
+        "--threads",
+        type=int,
+        default=1,
+        help=(
+            "Number of parallel converter workers (default 1). Each "
+            "worker bootstraps its own .NET CLR; useful when converting "
+            "a directory of .raw files. Spawn-mode subprocesses, not "
+            "threads — fork-after-CLR-load is a documented pythonnet "
+            "deadlock class."
         ),
     )
     p.add_argument(
@@ -134,7 +152,9 @@ def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
         action="store_true",
         help=(
             "Overwrite an existing non-empty bundle directory. Without "
-            "this, the convert refuses to clobber and exits with an error."
+            "this, single-file mode refuses to clobber and exits with "
+            "an error; batch mode (directory input or --threads > 1) "
+            "treats existing bundles as skipped instead."
         ),
     )
     p.add_argument(
@@ -152,12 +172,30 @@ def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
 
 
 def _cmd_massspec_convert(args: argparse.Namespace) -> int:
-    """``constellation massspec convert <input>`` dispatcher."""
+    """``constellation massspec convert <input>`` dispatcher.
+
+    Routes to:
+
+    - Legacy single-file path (byte-identical to pre-batch behavior)
+      when ``input`` is a file AND ``--threads <= 1``.
+    - Batch path (directory glob + spawn-mode ProcessPoolExecutor)
+      when ``input`` is a directory OR ``--threads > 1``.
+    """
     input_path: Path = args.input
     if not input_path.exists():
         print(f"error: input not found: {input_path}", file=sys.stderr)
         return 2
 
+    if input_path.is_file() and args.threads <= 1:
+        return _cmd_massspec_convert_single(args, input_path)
+    return _cmd_massspec_convert_batch(args, input_path)
+
+
+def _cmd_massspec_convert_single(
+    args: argparse.Namespace,
+    input_path: Path,
+) -> int:
+    """Legacy single-file convert path. Behavior unchanged from pre-batch."""
     suffix = input_path.suffix.lower()
     parent = args.output_dir if args.output_dir is not None else input_path.parent
     bundle_dir = parent / input_path.stem
@@ -220,6 +258,105 @@ def _cmd_massspec_convert(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     return 2
+
+
+def _collect_raw_files(input_dir: Path) -> list[Path]:
+    """Top-level non-recursive glob for ``*.raw`` + ``*.RAW``.
+
+    Deduplicates by resolved path (handles case-insensitive filesystems
+    where a single file matches both globs) and sorts by name for
+    deterministic order across runs.
+    """
+    matches: dict[Path, Path] = {}
+    for pattern in ("*.raw", "*.RAW"):
+        for p in input_dir.glob(pattern):
+            if p.is_file():
+                matches.setdefault(p.resolve(), p)
+    return sorted(matches.values(), key=lambda p: p.name)
+
+
+def _cmd_massspec_convert_batch(
+    args: argparse.Namespace,
+    input_path: Path,
+) -> int:
+    """Batch convert path: directory glob OR --threads > 1.
+
+    Exits:
+      0 — all results ``ok`` or ``skipped``
+      2 — input directory contains no ``.raw`` files
+      3 — pythonnet / DLLs missing (parent fails fast)
+      5 — at least one per-file result is ``error``
+    """
+    from constellation.massspec.io.thermo import convert_batch
+    from constellation.massspec.io.thermo._netruntime import require_thermo
+
+    try:
+        require_thermo()
+    except ImportError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+
+    if input_path.is_dir():
+        paths = _collect_raw_files(input_path)
+        if not paths:
+            print(
+                f"error: no .raw files in {input_path}",
+                file=sys.stderr,
+            )
+            return 2
+        default_parent = input_path
+    else:
+        # Single file routed through batch because --threads > 1.
+        if input_path.suffix.lower() != ".raw":
+            print(
+                f"error: no MS converter registered for suffix "
+                f"{input_path.suffix.lower()!r}\n"
+                f"  v1 supports .raw (Thermo). mzML / Bruker .d / Sciex "
+                f".wiff land as separate readers when their converters "
+                f"ship.",
+                file=sys.stderr,
+            )
+            return 2
+        paths = [input_path]
+        default_parent = input_path.parent
+
+    output_parent = (
+        args.output_dir if args.output_dir is not None else default_parent
+    )
+
+    progress_cb = None
+    if not args.no_progress:
+        from constellation.core.progress import StreamProgress
+
+        progress_cb = StreamProgress()
+
+    results = convert_batch(
+        paths,
+        output_parent,
+        n_workers=args.threads,
+        force=args.force,
+        rt_bin_width_s=args.rt_bin_width_s,
+        profile=args.profile,
+        capture_trailer_extras=args.capture_trailer_extras,
+        batch_size=args.batch_size,
+        compute_sha256=args.compute_sha256,
+        progress_cb=progress_cb,
+    )
+
+    n_ok = sum(1 for r in results if r.status == "ok")
+    n_skip = sum(1 for r in results if r.status == "skipped")
+    n_err = sum(1 for r in results if r.status == "error")
+    print(
+        f"batch convert: {n_ok} succeeded, {n_skip} skipped, {n_err} failed",
+        file=sys.stderr,
+    )
+    if n_err:
+        print("  failed:", file=sys.stderr)
+        for r in results:
+            if r.status == "error":
+                print(f"    {r.input_path}: {r.detail}", file=sys.stderr)
+        return 5
+    return 0
 
 
 # ── search ──────────────────────────────────────────────────────────────
