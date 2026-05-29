@@ -31,6 +31,7 @@ import pytest
 
 from constellation.cli.__main__ import (
     _detect_libstdcxx_skew,
+    _ensure_env_lib_on_ld_library_path,
     _libstdcxx_loaded_outside_env,
 )
 
@@ -264,17 +265,101 @@ class TestDetectLibstdcxxSkew:
 # ──────────────────────────────────────────────────────────────────────
 
 
+class TestEnsureEnvLibOnLdLibraryPath:
+    """The LD_LIBRARY_PATH prep helper — mutates os.environ in the
+    parent so spawn children inherit the corrected search order."""
+
+    def test_no_conda_prefix_no_mutation(self, monkeypatch):
+        monkeypatch.delenv("CONDA_PREFIX", raising=False)
+        monkeypatch.setenv("LD_LIBRARY_PATH", "/sentinel/value")
+        _ensure_env_lib_on_ld_library_path(_null_log)
+        assert os.environ["LD_LIBRARY_PATH"] == "/sentinel/value"
+
+    def test_no_env_libstdcxx_no_mutation(self, monkeypatch, tmp_path):
+        """When the conda env doesn't ship its own libstdc++ (rare), the
+        prep is a no-op."""
+        monkeypatch.setenv("CONDA_PREFIX", str(tmp_path))
+        (tmp_path / "lib").mkdir()
+        # No libstdc++.so.6 in tmp_path/lib.
+        monkeypatch.setenv("LD_LIBRARY_PATH", "/sentinel/value")
+        _ensure_env_lib_on_ld_library_path(_null_log)
+        assert os.environ["LD_LIBRARY_PATH"] == "/sentinel/value"
+
+    def test_prepends_env_lib_when_path_empty(self, monkeypatch, tmp_path):
+        env_lib = tmp_path / "lib"
+        env_lib.mkdir()
+        (env_lib / "libstdc++.so.6").write_bytes(b"")  # marker only
+        monkeypatch.setenv("CONDA_PREFIX", str(tmp_path))
+        monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+
+        _ensure_env_lib_on_ld_library_path(_null_log)
+
+        assert os.environ["LD_LIBRARY_PATH"] == str(env_lib)
+
+    def test_prepends_env_lib_when_other_first(self, monkeypatch, tmp_path):
+        """Simulates the HPC case: Spack lib is first on LD_LIBRARY_PATH,
+        env's lib is not present. After prep, env's lib is first."""
+        env_lib = tmp_path / "lib"
+        env_lib.mkdir()
+        (env_lib / "libstdc++.so.6").write_bytes(b"")
+        monkeypatch.setenv("CONDA_PREFIX", str(tmp_path))
+        monkeypatch.setenv(
+            "LD_LIBRARY_PATH", "/apps/spack/.../lib:/opt/somewhere/lib"
+        )
+
+        _ensure_env_lib_on_ld_library_path(_null_log)
+
+        assert os.environ["LD_LIBRARY_PATH"] == (
+            f"{env_lib}:/apps/spack/.../lib:/opt/somewhere/lib"
+        )
+
+    def test_already_first_is_noop(self, monkeypatch, tmp_path):
+        env_lib = tmp_path / "lib"
+        env_lib.mkdir()
+        (env_lib / "libstdc++.so.6").write_bytes(b"")
+        monkeypatch.setenv("CONDA_PREFIX", str(tmp_path))
+        existing = f"{env_lib}:/apps/spack/.../lib"
+        monkeypatch.setenv("LD_LIBRARY_PATH", existing)
+
+        _ensure_env_lib_on_ld_library_path(_null_log)
+
+        assert os.environ["LD_LIBRARY_PATH"] == existing
+
+    def test_dedupes_when_env_lib_present_but_not_first(
+        self, monkeypatch, tmp_path
+    ):
+        """Existing env-lib entry later on the path gets moved to front,
+        not duplicated."""
+        env_lib = tmp_path / "lib"
+        env_lib.mkdir()
+        (env_lib / "libstdc++.so.6").write_bytes(b"")
+        monkeypatch.setenv("CONDA_PREFIX", str(tmp_path))
+        monkeypatch.setenv(
+            "LD_LIBRARY_PATH", f"/apps/spack/.../lib:{env_lib}:/opt/other/lib"
+        )
+
+        _ensure_env_lib_on_ld_library_path(_null_log)
+
+        result = os.environ["LD_LIBRARY_PATH"]
+        # env_lib appears at the start exactly once.
+        assert result == f"{env_lib}:/apps/spack/.../lib:/opt/other/lib"
+        assert result.count(str(env_lib)) == 1
+
+
 class TestEnsureEnvLibstdcxxPriority:
-    def test_sentinel_set_skips_canary(self, monkeypatch):
-        """When _LIBSTDCXX_REEXEC_SENTINEL is set, skip the canary
-        entirely (we've already re-exec'd this run)."""
+    def test_sentinel_set_skips_skew_detection_but_still_preps_path(
+        self, monkeypatch
+    ):
+        """Sentinel skips ONLY the skew probes (re-exec already happened).
+        LD_LIBRARY_PATH prep still runs so children inherit correct env
+        even after re-exec."""
         from constellation.cli.__main__ import (
             _LIBSTDCXX_REEXEC_SENTINEL,
             _ensure_env_libstdcxx_priority,
         )
 
         monkeypatch.setenv(_LIBSTDCXX_REEXEC_SENTINEL, "1")
-        called = {"reexec": False, "detect": False}
+        called = {"reexec": False, "detect": False, "prep": False}
         monkeypatch.setattr(
             "constellation.cli.__main__._detect_libstdcxx_skew",
             lambda log: called.__setitem__("detect", True) or None,
@@ -283,17 +368,21 @@ class TestEnsureEnvLibstdcxxPriority:
             "constellation.cli.__main__._reexec_with_env_libstdcxx_first",
             lambda log: called.__setitem__("reexec", True),
         )
+        monkeypatch.setattr(
+            "constellation.cli.__main__._ensure_env_lib_on_ld_library_path",
+            lambda log: called.__setitem__("prep", True),
+        )
         _ensure_env_libstdcxx_priority()
-        assert called == {"reexec": False, "detect": False}
+        assert called == {"reexec": False, "detect": False, "prep": True}
 
-    def test_no_skew_no_reexec(self, monkeypatch):
+    def test_no_skew_no_reexec_but_still_preps_path(self, monkeypatch):
         from constellation.cli.__main__ import (
             _LIBSTDCXX_REEXEC_SENTINEL,
             _ensure_env_libstdcxx_priority,
         )
 
         monkeypatch.delenv(_LIBSTDCXX_REEXEC_SENTINEL, raising=False)
-        called = {"reexec": False}
+        called = {"reexec": False, "prep": False}
         monkeypatch.setattr(
             "constellation.cli.__main__._detect_libstdcxx_skew",
             lambda log: None,
@@ -302,8 +391,13 @@ class TestEnsureEnvLibstdcxxPriority:
             "constellation.cli.__main__._reexec_with_env_libstdcxx_first",
             lambda log: called.__setitem__("reexec", True),
         )
+        monkeypatch.setattr(
+            "constellation.cli.__main__._ensure_env_lib_on_ld_library_path",
+            lambda log: called.__setitem__("prep", True),
+        )
         _ensure_env_libstdcxx_priority()
         assert called["reexec"] is False
+        assert called["prep"] is True
 
     def test_skew_triggers_reexec(self, monkeypatch, capsys):
         from constellation.cli.__main__ import (
@@ -312,7 +406,7 @@ class TestEnsureEnvLibstdcxxPriority:
         )
 
         monkeypatch.delenv(_LIBSTDCXX_REEXEC_SENTINEL, raising=False)
-        called = {"reexec": False}
+        called = {"reexec": False, "prep": False}
         monkeypatch.setattr(
             "constellation.cli.__main__._detect_libstdcxx_skew",
             lambda log: "libstdc++.so.6 mapped from /usr/lib/.../libstdc++.so.6",
@@ -321,9 +415,14 @@ class TestEnsureEnvLibstdcxxPriority:
             "constellation.cli.__main__._reexec_with_env_libstdcxx_first",
             lambda log: called.__setitem__("reexec", True),
         )
+        monkeypatch.setattr(
+            "constellation.cli.__main__._ensure_env_lib_on_ld_library_path",
+            lambda log: called.__setitem__("prep", True),
+        )
         _ensure_env_libstdcxx_priority()
         captured = capsys.readouterr()
         assert called["reexec"] is True
+        assert called["prep"] is True
         assert "libstdc++ ABI skew" in captured.err
         assert "mapped from /usr/lib" in captured.err
 
