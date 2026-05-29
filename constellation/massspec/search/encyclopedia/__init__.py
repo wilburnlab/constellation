@@ -35,14 +35,16 @@ from __future__ import annotations
 # direct-from-Python use of the wrappers, e.g. notebooks + tests.)
 from constellation.thirdparty import encyclopedia as _encyclopedia_adapter  # noqa: F401
 from constellation.massspec.search.encyclopedia._common import (
-    SUPPORTED_VERSIONS,
+    MINIMUM_ENCYCLOPEDIA_VERSION,
     PtmToggle,
     available_memory_gib,
     build_manifest_envelope,
     default_heap_for_input,
     default_heap_for_system,
     encyclopedia_passthrough_args,
+    is_supported_version,
     ptm_toggle_args,
+    require_min_encyclopedia,
     sha256_file,
     write_manifest,
 )
@@ -65,8 +67,8 @@ from constellation.massspec.search.encyclopedia.process_dia import (
 )
 
 __all__ = [
+    "MINIMUM_ENCYCLOPEDIA_VERSION",
     "PtmToggle",
-    "SUPPORTED_VERSIONS",
     "available_memory_gib",
     "build_library_export_args",
     "build_library_search_args",
@@ -77,7 +79,9 @@ __all__ = [
     "default_heap_for_system",
     "encyclopedia_passthrough_args",
     "find_search_elib",
+    "is_supported_version",
     "ptm_toggle_args",
+    "require_min_encyclopedia",
     "run_library_export",
     "run_library_search",
     "run_predict_library",

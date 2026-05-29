@@ -941,6 +941,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         protein_to_gene_from_swissprot,
     )
     from constellation.massspec.search.encyclopedia import (
+        require_min_encyclopedia,
         run_library_export,
         run_library_search,
         run_predict_library,
@@ -956,6 +957,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         tpm_normalize,
     )
     from constellation.thirdparty.mmseqs2_run import run_mmseqs_search
+    from constellation.thirdparty.registry import ToolNotFoundError, find
 
     # ── Path resolution + env validation ───────────────────────────────
     output_dir = Path(args.output_dir).resolve()
@@ -1008,6 +1010,22 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     if success_top.exists() and args.resume:
         print(f"already complete: {output_dir}")
         return 0
+
+    # ── Preflight: require EncyclopeDIA >= 6.5.15 before any work ───────
+    # Stages 5/6/7/9/10 invoke the jar, and Stage 5 (predict-library)
+    # needs the 6.5.15-only ``-convert -fastaToJChronologerLibrary``
+    # utility specifically. Resolve + version-check the jar HERE so a
+    # too-old / missing install fails immediately, instead of after
+    # Stage 0's refseq dedup, the mmseqs2 alignment, and the SwissProt
+    # fetch below have already burned minutes. Stages 5/9 keep their own
+    # in-wrapper checks (defense in depth + the standalone CLI paths).
+    try:
+        _enc_handle = find("encyclopedia")
+    except ToolNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if require_min_encyclopedia(_enc_handle):
+        return 1
 
     # ── Resolve SwissProt (lazy fetch if not supplied) ─────────────────
     if args.swissprot_fasta is not None:

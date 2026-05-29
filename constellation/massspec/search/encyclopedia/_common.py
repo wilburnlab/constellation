@@ -18,12 +18,56 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
+from constellation.thirdparty.registry import ToolHandle, version_ge
+
 PtmToggle = Literal["off", "var", "fix"]
 
-# EncyclopeDIA versions the wrappers have been authored against. Each
-# wrapper warns (not errors) when a different version is resolved, so a
-# user with an interim build can still try things.
-SUPPORTED_VERSIONS = frozenset({"2.12.30", "6.5.15"})
+# Constellation pins EncyclopeDIA to >= this version. 6.5.15 is the build
+# available at public release and the floor the transcriptome→proteome
+# pipeline needs — older builds (e.g. the public 2.12.30) lack the
+# ``-convert -fastaToJChronologerLibrary`` predict-library utility. The
+# registry resolves the highest installed jar; this is where we hard-error
+# if that's still below the floor.
+MINIMUM_ENCYCLOPEDIA_VERSION = "6.5.15"
+
+
+def is_supported_version(version: str | None) -> bool:
+    """``True`` when ``version`` meets the >= 6.5.15 floor.
+
+    ``None`` (the filename version probe couldn't parse the jar — an
+    interim / oddly-named build the user deliberately pointed at)
+    returns ``True``: we can't prove it's too old, and the registry has
+    already picked the highest installed jar, so let it through rather
+    than block a deliberate experiment.
+    """
+    if version is None:
+        return True
+    return version_ge(version, MINIMUM_ENCYCLOPEDIA_VERSION)
+
+
+def require_min_encyclopedia(handle: ToolHandle, *, stream=None) -> int:
+    """Hard-error guard: returns ``1`` (and prints a message) when
+    ``handle`` resolves below the >= 6.5.15 floor, else ``0``.
+
+    Centralises the version check shared by the four EncyclopeDIA CLI
+    handlers and the transcriptome→proteome orchestrator so they can't
+    drift. The caller surfaces it as an exit code::
+
+        if require_min_encyclopedia(handle):
+            return 1
+    """
+    if stream is None:
+        stream = sys.stderr
+    if is_supported_version(handle.version):
+        return 0
+    print(
+        f"error: EncyclopeDIA {handle.version} resolved at {handle.path}, "
+        f"but Constellation requires >= {MINIMUM_ENCYCLOPEDIA_VERSION}. "
+        f"Install a current build: "
+        f"bash scripts/install-encyclopedia.sh --installer <path-to-6.5.15+.sh>",
+        file=stream,
+    )
+    return 1
 
 
 def sha256_file(path: Path) -> str:
@@ -263,14 +307,16 @@ def write_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
 
 
 __all__ = [
+    "MINIMUM_ENCYCLOPEDIA_VERSION",
     "PtmToggle",
-    "SUPPORTED_VERSIONS",
     "available_memory_gib",
     "build_manifest_envelope",
     "default_heap_for_input",
     "default_heap_for_system",
     "encyclopedia_passthrough_args",
+    "is_supported_version",
     "ptm_toggle_args",
+    "require_min_encyclopedia",
     "sha256_file",
     "write_manifest",
 ]

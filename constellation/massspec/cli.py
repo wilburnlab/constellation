@@ -1133,10 +1133,10 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
     from constellation.massspec.library import save_library
     from constellation.massspec.quant.io import save_quant
     from constellation.massspec.search.encyclopedia import (
-        SUPPORTED_VERSIONS,
         build_manifest_envelope,
         encyclopedia_passthrough_args,
         find_search_elib,
+        require_min_encyclopedia,
         run_library_search,
         write_manifest,
     )
@@ -1179,13 +1179,8 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
     except ToolNotFoundError as exc:
         print(f"error: {exc}", file=_sys.stderr)
         return 1
-    if handle.version is not None and handle.version not in SUPPORTED_VERSIONS:
-        print(
-            f"warning: running EncyclopeDIA {handle.version}; "
-            f"constellation has been validated against "
-            f"{sorted(SUPPORTED_VERSIONS)}",
-            file=_sys.stderr,
-        )
+    if require_min_encyclopedia(handle):
+        return 1
 
     extra_args = encyclopedia_passthrough_args(args.encyclopedia_arg)
 
@@ -1413,9 +1408,9 @@ def _cmd_massspec_predict_library(args: argparse.Namespace) -> int:
     from constellation.massspec.io.encyclopedia import read_encyclopedia
     from constellation.massspec.library import save_library
     from constellation.massspec.search.encyclopedia import (
-        SUPPORTED_VERSIONS,
         build_manifest_envelope,
         encyclopedia_passthrough_args,
+        require_min_encyclopedia,
         run_predict_library,
         write_manifest,
     )
@@ -1454,13 +1449,8 @@ def _cmd_massspec_predict_library(args: argparse.Namespace) -> int:
     except ToolNotFoundError as exc:
         print(f"error: {exc}", file=_sys.stderr)
         return 1
-    if handle.version is not None and handle.version not in SUPPORTED_VERSIONS:
-        print(
-            f"warning: running EncyclopeDIA {handle.version}; "
-            f"constellation has been validated against "
-            f"{sorted(SUPPORTED_VERSIONS)}",
-            file=_sys.stderr,
-        )
+    if require_min_encyclopedia(handle):
+        return 1
 
     ptms = {
         "Acetyl": args.ptm_acetyl,
@@ -1654,9 +1644,9 @@ def _cmd_massspec_process_dia(args: argparse.Namespace) -> int:
 
     from constellation import __version__ as constellation_version
     from constellation.massspec.search.encyclopedia import (
-        SUPPORTED_VERSIONS,
         build_manifest_envelope,
         encyclopedia_passthrough_args,
+        require_min_encyclopedia,
         run_process_dia,
         write_manifest,
     )
@@ -1699,13 +1689,8 @@ def _cmd_massspec_process_dia(args: argparse.Namespace) -> int:
     except ToolNotFoundError as exc:
         print(f"error: {exc}", file=_sys.stderr)
         return 1
-    if handle.version is not None and handle.version not in SUPPORTED_VERSIONS:
-        print(
-            f"warning: running EncyclopeDIA {handle.version}; "
-            f"constellation has been validated against "
-            f"{sorted(SUPPORTED_VERSIONS)}",
-            file=_sys.stderr,
-        )
+    if require_min_encyclopedia(handle):
+        return 1
 
     extra_args = encyclopedia_passthrough_args(args.encyclopedia_arg)
 
@@ -1795,9 +1780,9 @@ def _cmd_massspec_library_export(args: argparse.Namespace) -> int:
     from constellation.massspec.quant import save_quant
     from constellation.massspec.search import save_search
     from constellation.massspec.search.encyclopedia import (
-        SUPPORTED_VERSIONS,
         build_manifest_envelope,
         encyclopedia_passthrough_args,
+        require_min_encyclopedia,
         run_library_export,
         write_manifest,
     )
@@ -1841,13 +1826,8 @@ def _cmd_massspec_library_export(args: argparse.Namespace) -> int:
     except ToolNotFoundError as exc:
         print(f"error: {exc}", file=_sys.stderr)
         return 1
-    if handle.version is not None and handle.version not in SUPPORTED_VERSIONS:
-        print(
-            f"warning: running EncyclopeDIA {handle.version}; "
-            f"constellation has been validated against "
-            f"{sorted(SUPPORTED_VERSIONS)}",
-            file=_sys.stderr,
-        )
+    if require_min_encyclopedia(handle):
+        return 1
 
     extra_args = encyclopedia_passthrough_args(args.encyclopedia_arg)
 
