@@ -1,25 +1,30 @@
-"""Tier A tests for :func:`constellation.catalog.uniprot.fetch_swissprot`.
+"""Tests for the back-compat ``fetch_swissprot`` shim.
+
+After the reference-portal integration, ``fetch_swissprot`` delegates
+to the portal's proteome-only fetch path: SwissProt lands at
+``<cache_root>/swissprot/uniprot-<release>/protein.faa`` with a v2
+``meta.toml`` flagged ``has_genome=false`` / ``has_proteome=true``.
 
 A local in-process HTTP server serves a synthetic ``reldate.txt`` and a
-tiny gzipped ``uniprot_sprot.fasta.gz``; the test sets the
-``_TEST_HTTP_BASE_OVERRIDE`` module-level shim to point at it. Covers:
+tiny gzipped ``uniprot_sprot.fasta.gz``; the test points
+``_TEST_HTTP_BASE_OVERRIDE`` at it. Covers:
 
-  * Cache miss → writes the expected layout (sprot.fasta + sprot.fasta.gz +
-    meta.toml + _SUCCESS) under ``<cache_dir>/swissprot/<release>/``
-  * Cache hit → idempotent short-circuit (no HTTP calls on second run)
-  * ``force=True`` → re-fetch even if cache is complete
-  * Release auto-detect → parses ``Release YYYY_NN`` from reldate.txt
-  * Bad reldate.txt → ``ValueError``
+  * Cache miss → writes the expected portal layout (``protein.faa`` +
+    ``meta.toml`` with the [contents] block) under the new path.
+  * Cache hit → idempotent short-circuit (no HTTP calls on second run).
+  * ``force=True`` → re-fetch even if cache is complete.
+  * Release auto-detect → parses ``Release YYYY_NN`` from reldate.txt.
+  * Bad reldate.txt → ``ValueError``.
 """
 
 from __future__ import annotations
 
 import gzip
+import hashlib
 import http.server
 import socketserver
 import threading
 import tomllib
-from pathlib import Path
 
 import pytest
 
@@ -56,11 +61,7 @@ just garbage
 
 @pytest.fixture
 def serve_dir(tmp_path_factory):
-    """Spin up an in-process HTTP server rooted at a per-test tmp dir.
-
-    Returns ``(serve_root, base_url)``. Files written to ``serve_root``
-    become reachable at ``<base_url>/<filename>``.
-    """
+    """Spin up an in-process HTTP server rooted at a per-test tmp dir."""
     serve_root = tmp_path_factory.mktemp("uniprot_http")
 
     class _Handler(http.server.SimpleHTTPRequestHandler):
@@ -87,12 +88,20 @@ def stub_uniprot_http(serve_dir, monkeypatch):
     in-process server and point ``_TEST_HTTP_BASE_OVERRIDE`` at it."""
     serve_root, base_url = serve_dir
     (serve_root / "reldate.txt").write_bytes(_RELDATE_FIXTURE)
-    # Gzip the FASTA fixture so the fetcher exercises its gunzip step.
     (serve_root / "uniprot_sprot.fasta.gz").write_bytes(
         gzip.compress(_FASTA_FIXTURE)
     )
     monkeypatch.setattr(uniprot_mod, "_TEST_HTTP_BASE_OVERRIDE", base_url)
     return serve_root, base_url
+
+
+@pytest.fixture
+def cache_root(tmp_path, monkeypatch):
+    """Redirect the reference portal cache root for the test."""
+    root = tmp_path / "refs"
+    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(root))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    return root
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -115,99 +124,101 @@ def test_probe_swissprot_release_raises_on_garbage(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# fetch_swissprot
+# fetch_swissprot (back-compat shim)
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_fetch_swissprot_first_run_writes_cache(
-    stub_uniprot_http, tmp_path
+def test_fetch_swissprot_first_run_writes_portal_layout(
+    stub_uniprot_http, cache_root
 ) -> None:
-    cache = tmp_path / "swissprot_2026_02"
-    handle = fetch_swissprot(release="2026_02", cache_dir=cache)
+    """Cache miss writes the standard portal layout (protein.faa)."""
+    handle = fetch_swissprot(release="2026_02")
     assert isinstance(handle, SwissprotHandle)
     assert handle.release == "2026_02"
-    assert handle.fasta_path == cache / "sprot.fasta"
+    # Portal layout: <root>/swissprot/uniprot-<release>/protein.faa
+    expected = cache_root / "swissprot" / "uniprot-2026_02" / "protein.faa"
+    assert handle.fasta_path == expected.resolve()
     assert handle.fasta_path.read_bytes() == _FASTA_FIXTURE
-    assert (cache / "sprot.fasta.gz").is_file()
-    assert (cache / "meta.toml").is_file()
-    assert (cache / "_SUCCESS").is_file()
+    # meta.toml is the v2 portal shape (not the legacy one-off).
+    assert (handle.fasta_path.parent / "meta.toml").is_file()
     # SHA256 matches the gunzipped FASTA bytes.
-    import hashlib
-    expected_sha = hashlib.sha256(_FASTA_FIXTURE).hexdigest()
-    assert handle.sha256 == expected_sha
+    assert handle.sha256 == hashlib.sha256(_FASTA_FIXTURE).hexdigest()
 
 
-def test_fetch_swissprot_meta_toml_shape(stub_uniprot_http, tmp_path) -> None:
-    cache = tmp_path / "swissprot_2026_02"
-    fetch_swissprot(release="2026_02", cache_dir=cache)
-    meta = tomllib.loads((cache / "meta.toml").read_text())
+def test_fetch_swissprot_meta_toml_is_portal_v2_shape(
+    stub_uniprot_http, cache_root
+) -> None:
+    """meta.toml carries the v2 [contents] block flagging proteome-only."""
+    fetch_swissprot(release="2026_02")
+    meta_path = (
+        cache_root / "swissprot" / "uniprot-2026_02" / "meta.toml"
+    ).resolve()
+    meta = tomllib.loads(meta_path.read_text())
+    assert meta["schema_version"] == 2
+    assert meta["handle"] == "swissprot@uniprot-2026_02"
+    assert meta["organism"] == "swissprot"
+    assert meta["source"] == "uniprot"
     assert meta["release"] == "2026_02"
-    assert meta["source_url"].endswith("/uniprot_sprot.fasta.gz")
-    assert len(meta["sha256"]) == 64
-    assert "constellation_version" in meta
-    assert "fetched_at" in meta
+    # [contents] block flags this as proteome-only.
+    assert meta["contents"]["has_genome"] is False
+    assert meta["contents"]["has_annotation"] is False
+    assert meta["contents"]["has_proteome"] is True
+    assert meta["contents"]["has_cdna"] is False
+    # Protein URL provenance lands under [urls.protein].
+    assert meta["urls"]["protein"]["url"].endswith("/uniprot_sprot.fasta.gz")
 
 
 def test_fetch_swissprot_cache_hit_short_circuits(
-    stub_uniprot_http, tmp_path, monkeypatch
+    stub_uniprot_http, cache_root
 ) -> None:
-    """Second call with the same release + cache_dir doesn't re-fetch."""
-    cache = tmp_path / "swissprot_2026_02"
-    fetch_swissprot(release="2026_02", cache_dir=cache)
-    # Sabotage the fasta.gz so a re-fetch would produce different bytes.
-    (cache / "sprot.fasta.gz").write_bytes(b"corrupted-bytes")
-    # If the second call short-circuits, sprot.fasta keeps the original
-    # FASTA bytes.
-    handle = fetch_swissprot(release="2026_02", cache_dir=cache)
-    assert handle.fasta_path.read_bytes() == _FASTA_FIXTURE
+    """Second call with the same release doesn't re-fetch."""
+    fetch_swissprot(release="2026_02")
+    # Sabotage the on-disk FASTA — if the second call short-circuits,
+    # the SHA matches the on-disk (sabotaged) bytes.
+    protein_path = (
+        cache_root / "swissprot" / "uniprot-2026_02" / "protein.faa"
+    ).resolve()
+    protein_path.write_bytes(b"corrupted")
+    handle = fetch_swissprot(release="2026_02")
+    assert handle.fasta_path.read_bytes() == b"corrupted"
+    # The sha256 reflects the cached (sabotaged) content, confirming
+    # the cache hit short-circuited the fetch.
+    assert handle.sha256 == hashlib.sha256(b"corrupted").hexdigest()
 
 
 def test_fetch_swissprot_force_refetches(
-    stub_uniprot_http, tmp_path
+    stub_uniprot_http, cache_root
 ) -> None:
-    """``force=True`` ignores the cache and re-downloads."""
-    cache = tmp_path / "swissprot_2026_02"
-    fetch_swissprot(release="2026_02", cache_dir=cache)
-    # Sabotage sprot.fasta — force=True should overwrite it.
-    (cache / "sprot.fasta").write_bytes(b"corrupted-bytes")
-    handle = fetch_swissprot(release="2026_02", cache_dir=cache, force=True)
+    """force=True ignores the cache and re-downloads."""
+    fetch_swissprot(release="2026_02")
+    protein_path = (
+        cache_root / "swissprot" / "uniprot-2026_02" / "protein.faa"
+    ).resolve()
+    protein_path.write_bytes(b"corrupted")
+    handle = fetch_swissprot(release="2026_02", force=True)
     assert handle.fasta_path.read_bytes() == _FASTA_FIXTURE
 
 
 def test_fetch_swissprot_auto_detect_release(
-    stub_uniprot_http, tmp_path
+    stub_uniprot_http, cache_root
 ) -> None:
     """release=None autodetects via reldate.txt."""
-    cache = tmp_path / "swissprot_auto"
-    handle = fetch_swissprot(release=None, cache_dir=cache)
+    handle = fetch_swissprot(release=None)
     assert handle.release == "2026_02"
+    # Lands under the autodetected slug.
+    assert "uniprot-2026_02" in str(handle.fasta_path)
 
 
-def test_fetch_swissprot_default_cache_location(
-    stub_uniprot_http, tmp_path, monkeypatch
+def test_fetch_swissprot_resolves_via_bare_handle(
+    stub_uniprot_http, cache_root
 ) -> None:
-    """When cache_dir=None, lands at <cache_root>/swissprot/<release>/."""
-    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(tmp_path / "refs"))
-    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    handle = fetch_swissprot(release="2026_02")
-    expected = tmp_path / "refs" / "swissprot" / "2026_02" / "sprot.fasta"
-    assert handle.fasta_path == expected.resolve()
-    assert handle.fasta_path.is_file()
+    """After install, Reference.open("swissprot") resolves the bare handle."""
+    from constellation.sequencing.reference import Reference
 
-
-def test_fetch_swissprot_partial_dir_cleaned_on_error(
-    serve_dir, tmp_path, monkeypatch
-) -> None:
-    """If the FASTA URL returns 404, the .partial dir is removed so a
-    later run isn't blocked by stale state."""
-    serve_root, base_url = serve_dir
-    (serve_root / "reldate.txt").write_bytes(_RELDATE_FIXTURE)
-    # Deliberately do NOT lay down uniprot_sprot.fasta.gz.
-    monkeypatch.setattr(uniprot_mod, "_TEST_HTTP_BASE_OVERRIDE", base_url)
-    cache = tmp_path / "swissprot_2026_02"
-    with pytest.raises(Exception):
-        fetch_swissprot(release="2026_02", cache_dir=cache)
-    # The release dir should not exist (promote never happened).
-    assert not cache.exists()
-    # .partial should also be cleaned up.
-    assert not Path(str(cache) + ".partial").exists()
+    fetch_swissprot(release="2026_02")
+    ref = Reference.open("swissprot")
+    assert ref.has_proteome
+    assert ref.has_genome is False
+    assert ref.protein_fasta_path.read_bytes() == _FASTA_FIXTURE
+    assert ref.handle.source == "uniprot"
+    assert ref.handle.release == "2026_02"

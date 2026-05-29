@@ -9,16 +9,27 @@ classifications). Defaults match the cartographer pipeline; the
 collision filter is on by default (the v6.5.15 sweep validation showed
 it's still load-bearing) and applied at the GPF library stage.
 
+Reference handling is portal-native: ``--reference`` accepts a handle
+(``<organism>@<source>-<release>`` or a bare organism slug that
+resolves via ``defaults.toml`` / ``current/``), ``--reference-from``
+inherits the handle from an upstream ``transcriptome align`` /
+``transcriptome cluster`` output manifest. SwissProt defaults to
+whatever ``Reference.open("swissprot")`` resolves; pin a specific
+release with ``--swissprot-reference``. Users with one-off local
+FASTA/GFF pairs should register them first via ``constellation
+reference import <dir> --organism <slug>`` and then use the handle.
+
 Top-level CLI verb per the project rule "single-purpose verbs go at
-the top level; umbrellas (`pipeline`, `bridges`) get introduced only
-when ≥2 siblings exist." When a second cross-modality workflow lands,
-this and that workflow can be collapsed under a shared umbrella —
-defer until two workflows exist to compare.
+the top level; umbrellas get introduced only when ≥2 siblings exist."
+When a second cross-modality workflow lands, this and that workflow
+can be collapsed under a shared umbrella — defer until two workflows
+exist to compare.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from constellation.massspec.search.encyclopedia.ptm_defaults import (
@@ -42,15 +53,14 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     )
     # ── Required inputs ────────────────────────────────────────────────
     p.add_argument(
-        "--protein-counts",
+        "--demux-dir",
         required=True,
         type=Path,
         help=(
-            "Per-sample protein counts. Accepts the wide TSV from "
-            "`constellation transcriptome demultiplex` "
-            "(protein_counts.tsv), the long parquet "
-            "(feature_quant.parquet), or the demultiplex output "
-            "directory."
+            "path to a Constellation demux output directory (preferred); "
+            "also accepts a TSV or parquet count table for external "
+            "inputs. Demux is reference-free by design — the reference "
+            "is supplied separately via --reference or --reference-from."
         ),
     )
     p.add_argument(
@@ -61,48 +71,31 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
             "Optional override. `proteins.fasta` from "
             "`constellation transcriptome demultiplex`. NO LONGER "
             "REQUIRED — the pipeline derives novel ORF sequences "
-            "directly from `--protein-counts` (the same demux output "
-            "carries them in its `sequence` column). Supply this only "
-            "if you want to use an ORF FASTA produced by a different "
-            "upstream pipeline."
+            "directly from `--demux-dir` (the demux output carries them "
+            "in its `sequence` column). Supply this only if you want to "
+            "use an ORF FASTA produced by a different upstream pipeline."
         ),
     )
     p.add_argument(
-        "--reference-dir",
-        type=Path,
+        "--reference",
+        type=str,
         default=None,
         help=(
-            "Constellation reference-cache directory, e.g. "
-            "``~/.constellation/references/homo_sapiens/refseq-GCF_000001405.40/``. "
-            "When provided, auto-resolves ``--reference-fasta`` to "
-            "``<dir>/protein.faa`` and ``--reference-annotation`` to "
-            "``<dir>/annotation/`` (the Constellation ParquetDir form). "
-            "Explicit ``--reference-fasta`` / ``--reference-annotation`` "
-            "flags override the auto-resolved defaults. If "
-            "``--reference-dir`` is NOT supplied, both other flags are "
-            "required."
+            "reference handle — qualified (``<organism>@<source>-<release>``, "
+            "e.g. ``mus_musculus@refseq-GCF_000001635.27-ar109``) or a bare "
+            "organism slug that resolves via defaults.toml / current. "
+            "Required unless --reference-from is supplied."
         ),
     )
     p.add_argument(
-        "--reference-fasta",
+        "--reference-from",
         type=Path,
         default=None,
         help=(
-            "background reference proteome (e.g. RefSeq protein FASTA "
-            "for the organism). Required unless ``--reference-dir`` is "
-            "supplied."
-        ),
-    )
-    p.add_argument(
-        "--reference-annotation",
-        type=Path,
-        default=None,
-        help=(
-            "Reference annotation — accepts the Constellation parquet "
-            "bundle (directory with features.parquet + manifest.json, "
-            "as written by ``constellation reference fetch``), a GFF3 "
-            "file, or a GBFF file. Required unless ``--reference-dir`` "
-            "is supplied."
+            "inherit the reference handle from an upstream "
+            "``transcriptome align`` or ``transcriptome cluster`` output "
+            "directory's manifest. Mutually consistent with --reference; "
+            "disagreements exit 2."
         ),
     )
     p.add_argument(
@@ -135,20 +128,20 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         help="run directory (per-stage subdirs created here)",
     )
 
-    # ── SwissProt — lazy-fetched by default ────────────────────────────
+    # ── SwissProt — handle-based selection ─────────────────────────────
     p.add_argument(
-        "--swissprot-fasta",
-        type=Path,
+        "--swissprot-reference",
+        type=str,
         default=None,
         help=(
-            "explicit SwissProt FASTA path; defaults to the lazy-fetched "
-            "release at ~/.constellation/references/swissprot/<release>/"
+            "pin a specific SwissProt release as a portal handle "
+            "(e.g. ``swissprot@uniprot-2026_02``). Default: the bare "
+            "``swissprot`` handle, resolved via defaults.toml / current "
+            "to whatever is installed. If no SwissProt is installed, "
+            "run: ``constellation catalog update`` then "
+            "``constellation reference fetch --organism swissprot "
+            "--source uniprot``."
         ),
-    )
-    p.add_argument(
-        "--swissprot-release",
-        default=None,
-        help="pin a specific UniProt release (e.g. 2026_02); default = current",
     )
 
     # ── Run identification ─────────────────────────────────────────────
@@ -319,51 +312,144 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
 
 
 def _cmd_transcriptome_to_proteome(args: argparse.Namespace) -> int:
-    """Handler — resolves the reference-cache shorthand then delegates
-    to the orchestrator function in the top-level module so notebook /
-    library callers can invoke the same workflow without going through
-    argparse.
+    """Handler — resolves the reference + swissprot_reference handles
+    then delegates to the orchestrator function.
 
-    When the user supplies ``--reference-dir`` instead of (or alongside)
-    ``--reference-fasta`` and ``--reference-annotation``, we resolve
-    the implicit defaults here so the orchestrator's path-resolution
-    block can stay simple. Explicit flags override the dir-derived
-    defaults.
+    Reference resolution precedence (see plan):
+      1. Explicit ``--reference`` always wins.
+      2. ``--reference-from DIR`` reads ``reference_handle`` from the
+         upstream ``align`` / ``cluster`` manifest. Rejects ``demux``.
+      3. Both supplied with disagreeing handles → exit 2.
+      4. Neither given → exit 2 with the actionable hint.
+
+    SwissProt: pin via ``--swissprot-reference``, or default to
+    ``Reference.open("swissprot")`` which resolves via defaults.toml /
+    current. No lazy fetch — missing SwissProt → exit 2 with a hint.
     """
-    import sys
+    try:
+        reference = _resolve_reference_from_args(args)
+    except _ResolutionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
-    if args.reference_dir is not None:
-        ref_dir = Path(args.reference_dir).expanduser().resolve()
-        if not ref_dir.is_dir():
-            print(
-                f"error: --reference-dir {ref_dir} is not a directory",
-                file=sys.stderr,
-            )
-            return 2
-        # Fill in defaults from the cache layout. Explicit flags win.
-        if args.reference_fasta is None:
-            args.reference_fasta = ref_dir / "protein.faa"
-        if args.reference_annotation is None:
-            args.reference_annotation = ref_dir / "annotation"
-
-    # After dir-resolution both must be populated.
-    missing = []
-    if args.reference_fasta is None:
-        missing.append("--reference-fasta")
-    if args.reference_annotation is None:
-        missing.append("--reference-annotation")
-    if missing:
-        print(
-            f"error: {', '.join(missing)} required (or pass --reference-dir "
-            f"to auto-resolve from the Constellation reference cache).",
-            file=sys.stderr,
-        )
+    try:
+        swissprot_reference = _resolve_swissprot_from_args(args)
+    except _ResolutionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
 
     from constellation.transcriptome_to_proteome import (
         run_transcriptome_to_proteomics,
     )
-    return run_transcriptome_to_proteomics(args=args)
+    return run_transcriptome_to_proteomics(
+        args=args,
+        reference=reference,
+        swissprot_reference=swissprot_reference,
+    )
+
+
+class _ResolutionError(Exception):
+    """CLI-handler-local exception so the resolvers can raise concise
+    messages that the handler surfaces as ``error: ...`` + exit 2."""
+
+
+def _resolve_reference_from_args(args: argparse.Namespace):
+    """Return a Reference for the primary (genome/proteome+annotation) input."""
+    from constellation.sequencing.reference import Reference
+    from constellation.sequencing.reference.handle import (
+        ReferenceNotInstalledError,
+    )
+
+    handle_explicit: str | None = args.reference
+    handle_from_manifest: str | None = None
+    if args.reference_from is not None:
+        handle_from_manifest = _handle_from_manifest_dir(Path(args.reference_from))
+
+    if handle_explicit is None and handle_from_manifest is None:
+        raise _ResolutionError(
+            "no reference supplied; pass --reference <handle> or "
+            "--reference-from <align-or-cluster-dir>. To use a local "
+            "FASTA/GFF pair, register it first with: constellation "
+            "reference import <dir> --organism <slug>"
+        )
+
+    if (
+        handle_explicit is not None
+        and handle_from_manifest is not None
+        and handle_explicit != handle_from_manifest
+    ):
+        raise _ResolutionError(
+            f"--reference {handle_explicit!r} disagrees with "
+            f"--reference-from manifest handle {handle_from_manifest!r}; "
+            "re-run with one or the other (or update the upstream "
+            "align/cluster run if the organism changed)."
+        )
+
+    handle = handle_explicit or handle_from_manifest
+    try:
+        return Reference.open(handle)
+    except ReferenceNotInstalledError as exc:
+        raise _ResolutionError(str(exc)) from exc
+
+
+def _resolve_swissprot_from_args(args: argparse.Namespace):
+    """Return a Reference for the SwissProt FASTA used by Stage 3 + Stage 4."""
+    from constellation.sequencing.reference import Reference
+    from constellation.sequencing.reference.handle import (
+        ReferenceNotInstalledError,
+    )
+
+    handle = args.swissprot_reference or "swissprot"
+    try:
+        return Reference.open(handle)
+    except ReferenceNotInstalledError as exc:
+        raise _ResolutionError(
+            f"{exc}\nNo SwissProt reference installed. Run:\n"
+            "  constellation catalog update\n"
+            "  constellation reference fetch --organism swissprot --source uniprot\n"
+            "or pin a specific release with "
+            "--swissprot-reference swissprot@uniprot-<release>."
+        ) from exc
+
+
+def _handle_from_manifest_dir(manifest_dir: Path) -> str:
+    """Extract a ``reference_handle`` from an upstream align/cluster manifest.
+
+    Demux outputs are rejected — demux is reference-free by design.
+    Escape-hatch align/cluster runs (raw-path inputs, no
+    ``reference_handle`` stamped) are rejected with a hint pointing at
+    explicit ``--reference``.
+    """
+    from constellation.sequencing.transcriptome.manifest import (
+        AlignManifest,
+        ClusterManifest,
+        read_manifest_dir,
+    )
+
+    if not manifest_dir.is_dir():
+        raise _ResolutionError(
+            f"--reference-from {manifest_dir} is not a directory"
+        )
+    try:
+        manifest = read_manifest_dir(manifest_dir)
+    except (FileNotFoundError, ValueError) as exc:
+        raise _ResolutionError(
+            f"--reference-from {manifest_dir} could not be read as a "
+            f"transcriptome manifest dir: {exc}"
+        ) from exc
+    if not isinstance(manifest, (AlignManifest, ClusterManifest)):
+        raise _ResolutionError(
+            f"--reference-from points at a {manifest.kind} directory; "
+            "demux is reference-free by design — point at an align or "
+            "cluster output instead"
+        )
+    if not manifest.reference_handle:
+        raise _ResolutionError(
+            f"--reference-from manifest at {manifest_dir} has no "
+            "reference_handle (escape-hatch upstream run that used raw "
+            "paths); supply --reference explicitly"
+        )
+    return manifest.reference_handle
 
 
 __all__ = ["build_parser"]

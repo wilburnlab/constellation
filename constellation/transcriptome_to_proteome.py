@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-import re
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -355,210 +354,49 @@ def apply_alignment_filter(
 # ──────────────────────────────────────────────────────────────────────
 
 
-_GFF_PROTEIN_ID_RE = re.compile(r"protein_id=([^;]+)")
-_GFF_GENE_RE = re.compile(r"\bgene=([^;]+)")
-
-
 def read_reference_gene_map(annotation_path: Path | str) -> dict[str, str]:
     """Parse a reference annotation → ``protein_id → gene_symbol``.
+
+    Thin path-based dispatcher for callers that have a raw annotation
+    path on disk and don't want to construct a
+    :class:`~constellation.sequencing.reference.Reference` object. The
+    orchestrator itself uses ``Reference.gene_map()`` directly; this
+    function is retained for external / notebook callers.
 
     Accepts three input shapes — pick whichever your upstream provides:
 
       * **Constellation parquet bundle** (preferred): a directory
         containing ``features.parquet`` + ``manifest.json`` — the
-        canonical form produced by ``constellation reference fetch``
-        and any code that consumes the parsed
-        :class:`~constellation.sequencing.annotation.annotation.Annotation`.
-        Read via :func:`load_annotation` and queried with Arrow
-        compute kernels (no per-line text parse).
+        canonical form produced by ``constellation reference fetch``.
       * ``.gff`` / ``.gff3`` (+ ``.gz``) → legacy GFF3 parser.
-        Iterates CDS records, extracts ``protein_id=`` and ``gene=``
-        attributes.
       * ``.gbff`` / ``.gb`` / ``.genbank`` (+ ``.gz``) → legacy GBFF
-        parser. Walks LOCUS records, scans CDS feature qualifier
-        blocks for ``/protein_id="..."`` + ``/gene="..."`` pairs.
-
-    Used by :func:`build_combined_fasta` to annotate reference protein
-    headers with their gene symbol. Unmatched proteins (no ``gene=``
-    or ``/gene="..."`` in the annotation) are not included in the
-    returned mapping; the caller decides whether to emit them with
-    ``[gene=]`` empty or skip the tag entirely.
-
-    Parameters
-    ----------
-    annotation_path
-        Path to a Constellation annotation ParquetDir bundle, a GFF3
-        file, or a GBFF file (the latter two optionally gzipped).
+        parser.
 
     Returns
     -------
     dict[str, str]
-        ``protein_id → gene_symbol`` mapping. Keys are the CDS
-        record's ``protein_id`` attribute (RefSeq's NP_/XP_ accession);
-        values are the gene symbol (e.g. ``ACTB``).
+        ``protein_id → gene_symbol`` mapping.
     """
+    from constellation.sequencing.reference.installed import (
+        _gene_map_from_gbff,
+        _gene_map_from_gff3,
+        _gene_map_from_parquet,
+    )
+
     p = Path(annotation_path)
-    # Constellation parquet bundle — directory with the canonical
-    # ParquetDir layout. Preferred form; matches what ``constellation
-    # reference fetch`` writes to ``~/.constellation/references/.../
-    # annotation/``.
     if p.is_dir() and (p / "features.parquet").is_file():
-        return _read_parquet_gene_map(p)
+        return _gene_map_from_parquet(p)
     suffixes = [s.lower() for s in p.suffixes]
     if any(s in {".gff", ".gff3"} for s in suffixes):
-        return _read_gff3_gene_map(p)
+        return _gene_map_from_gff3(p)
     if any(s in {".gbff", ".gb", ".genbank"} for s in suffixes):
-        return _read_gbff_gene_map(p)
+        return _gene_map_from_gbff(p)
     raise ValueError(
         f"unsupported annotation path {p!r}: expected a Constellation "
         f"parquet bundle (directory with features.parquet + manifest.json), "
         f"a .gff / .gff3 file, or a .gbff / .gb / .genbank file "
         f"(optionally .gz)"
     )
-
-
-def _read_parquet_gene_map(annotation_dir: Path) -> dict[str, str]:
-    """Extract ``protein_id → gene_symbol`` from a Constellation
-    annotation ParquetDir bundle.
-
-    Loads via :func:`load_annotation` (validates against
-    ``FEATURE_TABLE``), filters to CDS rows with Arrow compute, and
-    decodes the per-row ``attributes_json`` blob to pull out the
-    ``protein_id`` + ``gene`` keys. CDS attributes land in the JSON
-    blob (not promoted to dedicated columns — see
-    ``constellation.sequencing.readers.gff._RESERVED_ATTRS``, which
-    promotes only ``ID``/``Name``/``Parent``).
-    """
-    import json as _json
-
-    import pyarrow.compute as pc
-    from constellation.sequencing.annotation.io import load_annotation
-
-    annotation = load_annotation(annotation_dir)
-    cds_mask = pc.equal(annotation.features.column("type"), "CDS")
-    cds = annotation.features.filter(cds_mask)
-    attrs_col = cds.column("attributes_json").to_pylist()
-
-    out: dict[str, str] = {}
-    for blob in attrs_col:
-        if not blob:
-            continue
-        try:
-            attrs = _json.loads(blob)
-        except (TypeError, ValueError):
-            continue
-        protein_id = attrs.get("protein_id")
-        # RefSeq stores the gene symbol under the ``gene`` attribute.
-        # Some GFF3 producers use ``gene_name``; check both, gene
-        # first.
-        gene = attrs.get("gene") or attrs.get("gene_name")
-        if protein_id and gene:
-            # First occurrence wins — matches the GFF3 / GBFF parsers'
-            # behaviour. CDS records for the same protein at multiple
-            # genomic loci (rare, mostly chrY pseudoautosomal) keep
-            # the first locus's gene symbol.
-            out.setdefault(str(protein_id), str(gene))
-    return out
-
-
-def _read_gff3_gene_map(path: Path) -> dict[str, str]:
-    """Scan GFF3 CDS records for protein_id + gene attributes."""
-    out: dict[str, str] = {}
-    with _open_text(path) as fh:
-        for line in fh:
-            if not line or line.startswith("#"):
-                continue
-            cols = line.rstrip("\n").split("\t")
-            if len(cols) < 9:
-                continue
-            feature_type = cols[2]
-            if feature_type != "CDS":
-                continue
-            attrs = cols[8]
-            m_pid = _GFF_PROTEIN_ID_RE.search(attrs)
-            m_gene = _GFF_GENE_RE.search(attrs)
-            if m_pid is None or m_gene is None:
-                continue
-            protein_id = m_pid.group(1).strip()
-            gene = m_gene.group(1).strip()
-            if protein_id and gene:
-                out[protein_id] = gene
-    return out
-
-
-_GBFF_QUALIFIER_RE = re.compile(r'^\s+/(\w+)=(.*)$')
-
-
-def _read_gbff_gene_map(path: Path) -> dict[str, str]:
-    """Scan GBFF CDS qualifier blocks for /protein_id="..." + /gene="..."
-    pairs.
-
-    Format reference (GenBank Flat File):
-
-        FEATURES             Location/Qualifiers
-             ...
-             CDS             1..345
-                             /gene="ACTB"
-                             /protein_id="NP_001185763.1"
-                             ...
-
-    Multi-line qualifier values (continuation lines indented but
-    without ``/key=`` prefix) are concatenated. We only need the
-    single-line case for protein_id + gene, but the parser tolerates
-    continuations gracefully.
-    """
-    out: dict[str, str] = {}
-    in_features = False
-    in_cds = False
-    current: dict[str, str] = {}
-
-    def _flush():
-        nonlocal current
-        pid = current.get("protein_id")
-        gene = current.get("gene")
-        if pid and gene:
-            out[pid] = gene
-        current = {}
-
-    with _open_text(path) as fh:
-        for raw in fh:
-            line = raw.rstrip("\n")
-            if line.startswith("FEATURES"):
-                in_features = True
-                continue
-            if line.startswith("ORIGIN") or line.startswith("//"):
-                # End of features block → flush current CDS if open.
-                if in_cds:
-                    _flush()
-                    in_cds = False
-                in_features = False
-                continue
-            if not in_features:
-                continue
-            # Feature header line: starts at col 5 with the feature
-            # type, e.g. ``     CDS             1..345``.
-            if line[:5] == "     " and line[5:6].strip():
-                # New feature begins — flush any open CDS first.
-                if in_cds:
-                    _flush()
-                head = line[5:21].strip()
-                in_cds = head == "CDS"
-                continue
-            if not in_cds:
-                continue
-            m = _GBFF_QUALIFIER_RE.match(line)
-            if m is None:
-                continue
-            key = m.group(1)
-            val = m.group(2)
-            if val.startswith('"') and val.endswith('"'):
-                val = val[1:-1]
-            if key in {"protein_id", "gene"}:
-                current[key] = val.strip()
-    # End-of-file: flush any open CDS.
-    if in_cds:
-        _flush()
-    return out
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -901,7 +739,12 @@ def _tag_aligned_to(
 # ──────────────────────────────────────────────────────────────────────
 
 
-def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
+def run_transcriptome_to_proteomics(
+    *,
+    args,  # args: argparse.Namespace
+    reference,  # constellation.sequencing.reference.Reference
+    swissprot_reference,  # constellation.sequencing.reference.Reference
+) -> int:
     """Chain every stage of the transcriptome→proteomics pipeline.
 
     Stage layout under ``<args.output_dir>/``:
@@ -922,6 +765,12 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     manifest.json at ``<output-dir>/manifest.json`` collates per-stage
     paths + SHA256s of external inputs. ``--resume`` honours per-stage
     _SUCCESS short-circuits.
+
+    Reference resolution is handled by the CLI handler before this
+    function is called — both ``reference`` and ``swissprot_reference``
+    are :class:`Reference` objects pointing at installed cache slots
+    with their required artifacts (genome+annotation for ``reference``,
+    proteome for ``swissprot_reference``).
     """
     import json
     import shutil
@@ -933,7 +782,6 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     import pyarrow.parquet as pq
 
     from constellation import __version__ as constellation_version
-    from constellation.catalog.uniprot import fetch_swissprot
     from constellation.core.io.schemas import read_mmseqs_tab
     from constellation.massspec.search import (
         apply_collision_filter,
@@ -959,6 +807,10 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     from constellation.thirdparty.mmseqs2_run import run_mmseqs_search
     from constellation.thirdparty.registry import ToolNotFoundError, find
 
+    # Fail-fast: both references must have their required artifacts installed.
+    reference.require(proteome=True, annotation=True)
+    swissprot_reference.require(proteome=True)
+
     # ── Path resolution + env validation ───────────────────────────────
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -977,7 +829,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         tpm_suffix = f"_{int(_tpm_val)}TPM"
     else:
         tpm_suffix = f"_{str(_tpm_val).replace('.', '_')}TPM"
-    protein_counts = Path(args.protein_counts).resolve()
+    demux_dir = Path(args.demux_dir).resolve()
     # ``proteins.fasta`` is no longer a required input — Stage 2 derives
     # novel ORF sequences directly from ``counts_tpm.column("sequence")``.
     # The CLI keeps ``--proteins-fasta`` as an optional override for
@@ -987,8 +839,11 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         if getattr(args, "proteins_fasta", None) is not None
         else None
     )
-    reference_fasta = Path(args.reference_fasta).resolve()
-    reference_annotation = Path(args.reference_annotation).resolve()
+    # Reference artifacts come from the resolved Reference objects —
+    # never raw paths. The CLI resolver guarantees both objects have
+    # the required artifacts installed (see require() above).
+    reference_fasta = reference.protein_fasta_path
+    reference_annotation = reference.annotation_dir
     gpf_files = [Path(p).resolve() for p in args.gpf]
     injection_files = [Path(p).resolve() for p in args.injections]
 
@@ -1027,15 +882,12 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     if require_min_encyclopedia(_enc_handle):
         return 1
 
-    # ── Resolve SwissProt (lazy fetch if not supplied) ─────────────────
-    if args.swissprot_fasta is not None:
-        swissprot_fasta = Path(args.swissprot_fasta).resolve()
-        swissprot_release: str | None = args.swissprot_release
-    else:
-        _log("fetching SwissProt FASTA via catalog (~/.constellation/references/swissprot/)")
-        sp_handle = fetch_swissprot(release=args.swissprot_release)
-        swissprot_fasta = sp_handle.fasta_path
-        swissprot_release = sp_handle.release
+    # ── Resolve SwissProt from the swissprot_reference Reference ──────
+    # No lazy fetch — the CLI resolver guarantees an installed SwissProt
+    # release (resolved via --swissprot-reference or the default
+    # ``swissprot`` bare-handle install).
+    swissprot_fasta = swissprot_reference.protein_fasta_path
+    swissprot_release: str | None = swissprot_reference.release
 
     t_start = time.monotonic()
     stage_manifests: dict[str, dict] = {}
@@ -1064,7 +916,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
     if not _stage_done(stage_dir, args.resume):
         _log("Stage 1: reading protein counts + TPM-normalizing")
         stage_dir.mkdir(parents=True, exist_ok=True)
-        counts = read_protein_counts_tab(protein_counts)
+        counts = read_protein_counts_tab(demux_dir)
         counts_tpm = tpm_normalize(counts, min_sequence_length=args.min_sequence_length)
         pq.write_table(counts_tpm, stage_dir / "counts_tpm.parquet")
         # Human-facing wide summary alongside the canonical long parquet:
@@ -1192,7 +1044,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         # UniProt accession → gene). Cartographer-style — combined.fasta gets
         # [gene=X] tags for both refseq-aligned AND swissprot-aligned novel
         # ORFs, so the classifier needs no other gene source downstream.
-        gene_map = read_reference_gene_map(reference_annotation)
+        gene_map = reference.gene_map()
         n_refseq_genes = len(gene_map)
         sp_gene_map = protein_to_gene_from_swissprot(swissprot_fasta)
         gene_map.update(sp_gene_map)
@@ -1675,7 +1527,7 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
         "subcommand": "transcriptome-to-proteome",
         "argv": sys.argv,
         "inputs": {
-            "protein_counts": _input_meta(protein_counts),
+            "demux_dir": _input_meta(demux_dir),
             "proteins_fasta": _input_meta(proteins_fasta),
             "reference_fasta": _input_meta(reference_fasta),
             "reference_annotation": _input_meta(reference_annotation),
@@ -1683,6 +1535,17 @@ def run_transcriptome_to_proteomics(*, args) -> int:  # args: argparse.Namespace
             "injections": [_input_meta(p) for p in injection_files],
             "swissprot_fasta": _input_meta(swissprot_fasta),
             "swissprot_release": swissprot_release,
+        },
+        "reference": {
+            "handle": str(reference.handle),
+            "release_dir": str(reference.release_dir),
+            "source": reference.source,
+            "assembly_accession": reference.assembly_accession,
+        },
+        "swissprot_reference": {
+            "handle": str(swissprot_reference.handle),
+            "release_dir": str(swissprot_reference.release_dir),
+            "source": swissprot_reference.source,
         },
         "stages": {
             name: {

@@ -74,9 +74,17 @@ class FetchResult:
     for this assembly. ``None`` when the source doesn't ship a protein
     FASTA, the URL 404'd, or the cache hit was an older entry written
     before protein FASTA fetching was wired in.
+
+    ``cdna_fasta_path`` mirrors ``protein_fasta_path`` for the
+    ``_rna_from_genomic.fna.gz`` (RefSeq) / ``cdna.all.fa.gz`` (Ensembl)
+    sibling fetch. Both are opportunistic: a failed fetch yields ``None``
+    without failing the overall call.
+
+    ``genome`` is ``None`` for proteome-only installs (UniProt source);
+    callers must tolerate this when surfacing fetch results to the user.
     """
 
-    genome: GenomeReference
+    genome: GenomeReference | None
     annotation: Annotation | None
     handle: Handle
     cache_path: Path | None
@@ -84,6 +92,7 @@ class FetchResult:
     sources: dict[str, str]  # name → URL
     skipped_cache: bool = False  # idempotency short-circuit?
     protein_fasta_path: Path | None = None
+    cdna_fasta_path: Path | None = None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -174,15 +183,27 @@ def _probe_ensembl_release_number() -> int | None:
 
 def _ensembl_urls(
     species_path: str, *, release: int | None
-) -> tuple[str, str, str, str | None]:
-    """Vertebrate Ensembl FASTA + GFF3 URLs + resolved release + assembly name."""
+) -> tuple[str, str, str | None, str, str | None]:
+    """Vertebrate Ensembl FASTA + GFF3 + cDNA URLs + resolved release + assembly name.
+
+    ``cdna_url`` is ``None`` when the species' ``cdna/`` directory
+    listing doesn't expose a ``.cdna.all.fa.gz`` (unusual for vertebrate
+    species but tolerated — cDNA is opportunistic, not required).
+    """
     rel_id, fa_base, gff_base = _ensembl_release_for(release=release)
     fa_dir = f"{fa_base}/{species_path}/dna"
     gff_dir = f"{gff_base}/{species_path}"
     fa_url = _resolve_pattern_url(fa_dir, suffix=".dna.toplevel.fa.gz")
     gff_url = _resolve_pattern_url(gff_dir, suffix=".gff3.gz", exclude="abinitio")
+    cdna_url: str | None
+    try:
+        cdna_url = _resolve_pattern_url(
+            f"{fa_base}/{species_path}/cdna", suffix=".cdna.all.fa.gz"
+        )
+    except (FileNotFoundError, urllib.error.URLError, urllib.error.HTTPError, OSError):
+        cdna_url = None
     asm = _parse_ensembl_assembly_name(fa_url, species_path)
-    return fa_url, gff_url, rel_id, asm
+    return fa_url, gff_url, cdna_url, rel_id, asm
 
 
 def _ensembl_genomes_release_for(division: str, *, release: int | None) -> tuple[str, str, str]:
@@ -222,14 +243,21 @@ def _ensembl_genomes_release_for(division: str, *, release: int | None) -> tuple
 
 def _ensembl_genomes_urls(
     division: str, species_path: str, *, release: int | None
-) -> tuple[str, str, str, str | None]:
+) -> tuple[str, str, str | None, str, str | None]:
     rel_id, fa_base, gff_base = _ensembl_genomes_release_for(division, release=release)
     fa_dir = f"{fa_base}/{species_path}/dna"
     gff_dir = f"{gff_base}/{species_path}"
     fa_url = _resolve_pattern_url(fa_dir, suffix=".dna.toplevel.fa.gz")
     gff_url = _resolve_pattern_url(gff_dir, suffix=".gff3.gz", exclude="abinitio")
+    cdna_url: str | None
+    try:
+        cdna_url = _resolve_pattern_url(
+            f"{fa_base}/{species_path}/cdna", suffix=".cdna.all.fa.gz"
+        )
+    except (FileNotFoundError, urllib.error.URLError, urllib.error.HTTPError, OSError):
+        cdna_url = None
     asm = _parse_ensembl_assembly_name(fa_url, species_path)
-    return fa_url, gff_url, rel_id, asm
+    return fa_url, gff_url, cdna_url, rel_id, asm
 
 
 def _parse_ensembl_assembly_name(fa_url: str, species_path: str) -> str | None:
@@ -250,11 +278,11 @@ def _parse_ensembl_assembly_name(fa_url: str, species_path: str) -> str | None:
 
 def _refseq_urls(
     accession: str,
-) -> tuple[str, str, str, str, str | None, str | None, dict[str, str | None]]:
-    """RefSeq/GenBank FASTA + GFF + protein FASTA + release_slug + ... .
+) -> tuple[str, str, str, str, str, str | None, str | None, dict[str, str | None]]:
+    """RefSeq/GenBank FASTA + GFF + protein FASTA + cDNA FASTA + release_slug + ... .
 
-    Returns a tuple ``(fa_url, gff_url, protein_url, release_slug,
-    asm_name, ann_release, metadata)``. The release slug is
+    Returns a tuple ``(fa_url, gff_url, protein_url, cdna_url,
+    release_slug, asm_name, ann_release, metadata)``. The release slug is
     ``<accession>`` when an annotation release is unknown, or
     ``<accession>-ar<N>`` when the assembly's ``assembly_report.txt``
     declares one. This is the canonical handle release portion for NCBI
@@ -262,12 +290,13 @@ def _refseq_urls(
     (RefSeq's annotation pipeline versions independently of the
     assembly).
 
-    The ``protein_url`` is the standard ``_protein.faa.gz`` sibling of
-    the genomic FASTA. Always derived from the URL pattern; assemblies
-    that don't ship a protein FASTA (rare, mostly GenBank-only
-    unannotated draft assemblies) will 404 on download and the fetch
-    will treat that as "no protein FASTA available" rather than failing
-    the whole fetch.
+    Both ``protein_url`` and ``cdna_url`` are the standard
+    ``_protein.faa.gz`` / ``_rna_from_genomic.fna.gz`` siblings of the
+    genomic FASTA. Always derived from the URL pattern; assemblies that
+    don't ship one (rare, mostly GenBank-only unannotated draft
+    assemblies) will 404 on download and the fetch will treat that as
+    "no protein/cDNA FASTA available" rather than failing the whole
+    fetch.
     """
     if not (accession.startswith("GCF_") or accession.startswith("GCA_")):
         raise ValueError(f"refseq accession must start with GCF_ or GCA_: {accession!r}")
@@ -289,11 +318,12 @@ def _refseq_urls(
     fa_url = f"{asm_url_base}{asm_dir}_genomic.fna.gz"
     gff_url = f"{asm_url_base}{asm_dir}_genomic.gff.gz"
     protein_url = f"{asm_url_base}{asm_dir}_protein.faa.gz"
+    cdna_url = f"{asm_url_base}{asm_dir}_rna_from_genomic.fna.gz"
     asm_name = asm_dir.split("_", 2)[-1] if asm_dir.count("_") >= 2 else None
     metadata = _probe_refseq_assembly_metadata(asm_url_base, asm_dir)
     ann_release = metadata.get("annotation_release")
     release_slug = accession if ann_release is None else f"{accession}-ar{ann_release}"
-    return fa_url, gff_url, protein_url, release_slug, asm_name, ann_release, metadata
+    return fa_url, gff_url, protein_url, cdna_url, release_slug, asm_name, ann_release, metadata
 
 
 # Keys returned by ``_probe_refseq_assembly_metadata``. All values are
@@ -583,6 +613,13 @@ class _ResolvedSpec:
     # standard location, in which case ``fetch_reference`` skips the
     # protein FASTA materialisation step.
     protein_url: str | None = None
+    # Optional cDNA FASTA URL. Mirrors ``protein_url`` semantics — RefSeq
+    # ``_rna_from_genomic.fna.gz`` sibling, or Ensembl/Ensembl Genomes
+    # ``cdna.all.fa.gz`` under the species ``cdna/`` directory. Catalog
+    # rows for all genome-bearing sources populate this; UniProt rows
+    # leave it ``None``. Opportunistic fetch — 404 leaves the cache slot
+    # without a ``cdna.fna`` and the overall fetch still succeeds.
+    cdna_url: str | None = None
 
 
 def _resolve_spec(
@@ -611,7 +648,7 @@ def _resolve_spec(
 
     if source == "ensembl":
         species_path = _ENSEMBL_VERTEBRATE_SPECIES.get(ident, ident)
-        fa_url, gff_url, rel_id, asm_name = _ensembl_urls(
+        fa_url, gff_url, cdna_url, rel_id, asm_name = _ensembl_urls(
             species_path, release=release
         )
         # The CHECKSUMS file always lives in the FASTA directory.
@@ -626,6 +663,7 @@ def _resolve_spec(
             assembly_name=asm_name,
             annotation_release=rel_id,  # Ensembl annotation rides with release
             assembly_accession=None,
+            cdna_url=cdna_url,
         )
 
     if source == "ensembl_genomes":
@@ -636,7 +674,7 @@ def _resolve_spec(
                 f"reference import' for organisms outside this list."
             )
         division, species_path = _ENSEMBL_GENOMES_SPECIES[ident]
-        fa_url, gff_url, rel_id, asm_name = _ensembl_genomes_urls(
+        fa_url, gff_url, cdna_url, rel_id, asm_name = _ensembl_genomes_urls(
             division, species_path, release=release
         )
         checksums_url = fa_url.rsplit("/", 1)[0] + "/CHECKSUMS"
@@ -649,6 +687,7 @@ def _resolve_spec(
             assembly_name=asm_name,
             annotation_release=rel_id,
             assembly_accession=None,
+            cdna_url=cdna_url,
         )
 
     if source in {"refseq", "genbank"}:
@@ -657,7 +696,7 @@ def _resolve_spec(
                 f"--release is not applicable to {source!r}; the accession "
                 f"already pins the assembly version (e.g. GCF_000001635.27)"
             )
-        fa_url, gff_url, protein_url, release_slug, asm_name, ann_release, metadata = _refseq_urls(ident)
+        fa_url, gff_url, protein_url, cdna_url, release_slug, asm_name, ann_release, metadata = _refseq_urls(ident)
         # md5 file lives next to the GFF/FASTA in the assembly dir.
         md5_url = fa_url.rsplit("/", 1)[0] + "/md5checksums.txt"
         # Organism slug precedence:
@@ -691,6 +730,7 @@ def _resolve_spec(
             assembly_accession=ident,
             strain=metadata.get("strain"),
             protein_url=protein_url,
+            cdna_url=cdna_url,
         )
 
     raise KeyError(
@@ -758,12 +798,16 @@ def _spec_from_catalog_row(
     taxid: int,
     scientific_name: str,
 ) -> _ResolvedSpec:
-    """Convert a catalog row into the ``_ResolvedSpec`` the fetch pipeline expects."""
-    # Map the catalog source into the handle source. RefSeq + GenBank
-    # both use the RefSeq cache convention (release_slug = accession);
-    # Ensembl + Ensembl Genomes carry the numeric release.
+    """Convert a catalog row into the ``_ResolvedSpec`` the fetch pipeline expects.
+
+    UniProt rows are proteome-only — ``fasta_url`` and ``gff_url`` come
+    back as empty strings (the proteome-only-dispatch signal in
+    ``fetch_reference``) and ``protein_url`` carries the FASTA URL.
+    """
     src = row.source
     if src in {"refseq", "genbank"}:
+        # RefSeq + GenBank use the RefSeq cache convention
+        # (release_slug = accession); annotation_release pins the GFF.
         release_slug = row.assembly_accession or row.release
         if row.annotation_release:
             release_slug = f"{row.assembly_accession}-ar{row.annotation_release}"
@@ -775,13 +819,30 @@ def _spec_from_catalog_row(
             organism=row.organism_slug, source=src, release=row.release
         )
     elif src == "uniprot":
-        # UniProt rows are catalogued but not fetchable via this path —
-        # ``reference fetch`` is genome-focused in PR-B. PR-C wires
-        # ``reference fetch-proteome``.
-        raise ValueError(
-            f"UniProt proteome rows ({row.assembly_accession!r}) cannot be "
-            "materialised via `reference fetch` in this release; the "
-            "`reference fetch-proteome` verb lands in a follow-up PR."
+        # Proteome-only install — handle uses the UniProt release as the
+        # cache release slug (e.g. "2026_02" for SwissProt, or a
+        # proteome ID for taxid-specific UP rows).
+        handle = Handle(
+            organism=row.organism_slug, source="uniprot", release=row.release
+        )
+        if not row.protein_url:
+            raise ValueError(
+                f"UniProt catalog row for {row.organism_slug!r} has no "
+                "protein_url; cannot materialise a proteome-only install"
+            )
+        return _ResolvedSpec(
+            handle=handle,
+            fasta_url="",  # proteome-only dispatch signal
+            gff_url="",
+            checksums_url=row.checksums_url,
+            checksums_kind=row.checksums_kind,
+            assembly_name=row.assembly_name,
+            annotation_release=None,
+            assembly_accession=row.assembly_accession,
+            taxid=taxid,
+            scientific_name=scientific_name,
+            protein_url=row.protein_url,
+            cdna_url=None,
         )
     else:
         raise ValueError(f"catalog row has unknown source {src!r}")
@@ -797,6 +858,7 @@ def _spec_from_catalog_row(
         taxid=taxid,
         scientific_name=scientific_name,
         protein_url=row.protein_url,
+        cdna_url=row.cdna_url,
     )
 
 
@@ -898,6 +960,20 @@ def fetch_reference(
             "should not happen — source resolver returns a release id"
         )
 
+    # Proteome-only path (UniProt rows): empty fasta_url + gff_url and a
+    # populated protein_url is the signal. Bypasses the
+    # genome+annotation parse pipeline entirely.
+    if not resolved.fasta_url and not resolved.gff_url and resolved.protein_url:
+        return _fetch_proteome_only(
+            resolved,
+            handle,
+            spec=spec,
+            output_dir=output_dir,
+            timeout=timeout,
+            use_cache=use_cache,
+            force=force,
+        )
+
     # ── Idempotency check (cache only) ──────────────────────────────
     root = cache_root() if use_cache else None
     cache_release_dir: Path | None = None
@@ -912,9 +988,12 @@ def fetch_reference(
     ):
         genome, annotation = _load_from_cache(cache_release_dir)
         cached_protein = cache_release_dir / "protein.faa"
+        cached_cdna = cache_release_dir / "cdna.fna"
         sources = {"genome": resolved.fasta_url, "annotation": resolved.gff_url}
         if resolved.protein_url:
             sources["protein"] = resolved.protein_url
+        if resolved.cdna_url:
+            sources["cdna"] = resolved.cdna_url
         return FetchResult(
             genome=genome,
             annotation=annotation,
@@ -924,6 +1003,7 @@ def fetch_reference(
             sources=sources,
             skipped_cache=True,
             protein_fasta_path=cached_protein if cached_protein.is_file() else None,
+            cdna_fasta_path=cached_cdna if cached_cdna.is_file() else None,
         )
 
     # ── Download + parse (writes happen under fetch lock) ────────────
@@ -935,6 +1015,8 @@ def fetch_reference(
         gff_decoded = scratch_path / "annotation.gff3"
         protein_gz = scratch_path / "protein.faa.gz"
         protein_decoded = scratch_path / "protein.faa"
+        cdna_gz = scratch_path / "cdna.fna.gz"
+        cdna_decoded = scratch_path / "cdna.fna"
 
         fa_etag, fa_lm = _download_to(resolved.fasta_url, fa_gz, timeout=timeout)
         gff_etag, gff_lm = _download_to(resolved.gff_url, gff_gz, timeout=timeout)
@@ -960,6 +1042,27 @@ def fetch_reference(
                     file=sys.stderr,
                 )
 
+        # Optional cDNA FASTA — same non-fatal try/except shape as the
+        # protein block above. RefSeq's ``_rna_from_genomic.fna.gz`` /
+        # Ensembl's ``cdna.all.fa.gz`` sibling lands at ``cdna.fna`` in
+        # the cache when present.
+        cdna_etag: str | None = None
+        cdna_lm: str | None = None
+        cdna_fetched = False
+        if resolved.cdna_url:
+            try:
+                cdna_etag, cdna_lm = _download_to(
+                    resolved.cdna_url, cdna_gz, timeout=timeout
+                )
+                cdna_fetched = True
+            except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+                print(
+                    f"warning: cDNA FASTA fetch failed for "
+                    f"{resolved.cdna_url}: {exc}. Continuing without a "
+                    f"cached cdna.fna for this assembly.",
+                    file=sys.stderr,
+                )
+
         # Local sha256 — always.
         sha256_map = {
             "fasta": _sha256_of(fa_gz),
@@ -967,6 +1070,8 @@ def fetch_reference(
         }
         if protein_fetched:
             sha256_map["protein"] = _sha256_of(protein_gz)
+        if cdna_fetched:
+            sha256_map["cdna"] = _sha256_of(cdna_gz)
 
         # Source-checksum verification — best-effort warn-not-fail.
         source_checksum_verified = False
@@ -995,6 +1100,8 @@ def fetch_reference(
         _gunzip_to(gff_gz, gff_decoded)
         if protein_fetched:
             _gunzip_to(protein_gz, protein_decoded)
+        if cdna_fetched:
+            _gunzip_to(cdna_gz, cdna_decoded)
 
         genome = read_fasta_genome(fa_decoded)
         contig_name_to_id = {
@@ -1044,9 +1151,16 @@ def fetch_reference(
                 "etag": protein_etag,
                 "last_modified": protein_lm,
             }
+        if cdna_fetched:
+            urls_meta["cdna"] = {
+                "url": resolved.cdna_url,
+                "etag": cdna_etag,
+                "last_modified": cdna_lm,
+            }
 
         # ── Cache write under lock ──────────────────────────────────
         cached_protein_path: Path | None = None
+        cached_cdna_path: Path | None = None
         if use_cache and cache_release_dir is not None:
             with acquire_fetch_lock(handle):
                 # Re-check idempotency inside the lock — another worker
@@ -1055,6 +1169,9 @@ def fetch_reference(
                     cached_existing = cache_release_dir / "protein.faa"
                     if cached_existing.is_file():
                         cached_protein_path = cached_existing
+                    cached_existing_cdna = cache_release_dir / "cdna.fna"
+                    if cached_existing_cdna.is_file():
+                        cached_cdna_path = cached_existing_cdna
                 else:
                     _write_into_cache(
                         cache_release_dir,
@@ -1069,9 +1186,16 @@ def fetch_reference(
                         protein_fasta_src=(
                             protein_decoded if protein_fetched else None
                         ),
+                        cdna_fasta_src=(
+                            cdna_decoded if cdna_fetched else None
+                        ),
+                        has_proteome=protein_fetched,
+                        has_cdna=cdna_fetched,
                     )
                     if protein_fetched:
                         cached_protein_path = cache_release_dir / "protein.faa"
+                    if cdna_fetched:
+                        cached_cdna_path = cache_release_dir / "cdna.fna"
 
         # ── Optional --output-dir write ─────────────────────────────
         if output_dir is not None:
@@ -1081,12 +1205,16 @@ def fetch_reference(
             save_annotation(annotation, out_path / "annotation")
             if protein_fetched:
                 shutil.copy2(protein_decoded, out_path / "protein.faa")
+            if cdna_fetched:
+                shutil.copy2(cdna_decoded, out_path / "cdna.fna")
         else:
             out_path = None
 
     sources = {"genome": resolved.fasta_url, "annotation": resolved.gff_url}
     if resolved.protein_url:
         sources["protein"] = resolved.protein_url
+    if resolved.cdna_url:
+        sources["cdna"] = resolved.cdna_url
     return FetchResult(
         genome=genome,
         annotation=annotation,
@@ -1096,15 +1224,31 @@ def fetch_reference(
         sources=sources,
         skipped_cache=False,
         protein_fasta_path=cached_protein_path,
+        cdna_fasta_path=cached_cdna_path,
     )
 
 
 def _cache_is_complete(release_dir: Path) -> bool:
-    """Lightweight check that a cache slot looks fully populated."""
+    """Lightweight check that a cache slot looks fully populated.
+
+    Accepts both the genome-bearing layout (``genome/`` + ``annotation/``
+    + ``meta.toml``) and the proteome-only layout (``protein.faa`` +
+    ``meta.toml`` with ``has_genome=false``). The disambiguating signal
+    is the ``[contents]`` block in ``meta.toml`` (v2) — when absent (v1
+    caches) the genome-bearing layout is assumed for back-compat.
+    """
     if not release_dir.is_dir():
         return False
     if not (release_dir / "meta.toml").exists():
         return False
+    meta = ref_handle.read_meta_toml(release_dir)
+    if meta is None:
+        return False
+    contents = meta.get("contents") or {}
+    has_genome = bool(contents.get("has_genome", True))
+    if not has_genome:
+        # Proteome-only slot: protein.faa is the only mandatory artifact.
+        return (release_dir / "protein.faa").is_file()
     if not (release_dir / "genome" / "manifest.json").exists():
         return False
     if not (release_dir / "annotation" / "manifest.json").exists():
@@ -1125,8 +1269,8 @@ def _load_from_cache(release_dir: Path) -> tuple[GenomeReference, Annotation]:
 def _write_into_cache(
     release_dir: Path,
     *,
-    genome: GenomeReference,
-    annotation: Annotation,
+    genome: GenomeReference | None,
+    annotation: Annotation | None,
     handle: Handle,
     urls_meta: dict[str, dict[str, Any]],
     sha256_map: dict[str, str],
@@ -1134,13 +1278,26 @@ def _write_into_cache(
     resolved: _ResolvedSpec,
     force: bool,
     protein_fasta_src: Path | None = None,
+    cdna_fasta_src: Path | None = None,
+    has_proteome: bool | None = None,
+    has_cdna: bool | None = None,
 ) -> None:
     """Atomic cache write: stage into ``.partial/`` then rename.
 
-    When ``protein_fasta_src`` is provided (a gunzipped ``.faa`` in
-    scratch), copies it into the staged cache as ``protein.faa`` so it
-    lands atomically alongside the genome + annotation.
+    When ``protein_fasta_src`` / ``cdna_fasta_src`` are provided
+    (gunzipped files in scratch), copies them into the staged cache as
+    ``protein.faa`` / ``cdna.fna`` so they land atomically alongside the
+    genome + annotation.
+
+    Proteome-only installs pass ``genome=None`` + ``annotation=None`` +
+    ``protein_fasta_src=<path>`` and set ``has_proteome=True``; the
+    ``[contents]`` block in ``meta.toml`` records the resulting layout.
     """
+    if has_proteome is None:
+        has_proteome = protein_fasta_src is not None
+    if has_cdna is None:
+        has_cdna = cdna_fasta_src is not None
+
     # Force overwrite: remove the live dir first; the .partial atomic
     # rename below replaces it cleanly.
     if force and release_dir.exists():
@@ -1152,10 +1309,14 @@ def _write_into_cache(
     stage = partial_dir(release_dir)
     stage.mkdir(parents=True, exist_ok=False)
 
-    save_genome_reference(genome, stage / "genome")
-    save_annotation(annotation, stage / "annotation")
+    if genome is not None:
+        save_genome_reference(genome, stage / "genome")
+    if annotation is not None:
+        save_annotation(annotation, stage / "annotation")
     if protein_fasta_src is not None:
         shutil.copy2(protein_fasta_src, stage / "protein.faa")
+    if cdna_fasta_src is not None:
+        shutil.copy2(cdna_fasta_src, stage / "cdna.fna")
     write_meta_toml(
         stage,
         handle=handle,
@@ -1169,6 +1330,10 @@ def _write_into_cache(
         taxid=resolved.taxid,
         scientific_name=resolved.scientific_name,
         strain=resolved.strain,
+        has_genome=genome is not None,
+        has_annotation=annotation is not None,
+        has_proteome=has_proteome,
+        has_cdna=has_cdna,
     )
 
     promote_partial(release_dir)
@@ -1182,6 +1347,125 @@ def _write_into_cache(
     defaults_map = ref_handle.read_defaults()
     if handle.organism not in defaults_map and len(existing) == 1:
         set_default(handle.organism, handle.release_slug())
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Proteome-only fetch (UniProt sources)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _fetch_proteome_only(
+    resolved: _ResolvedSpec,
+    handle: Handle,
+    *,
+    spec: str,
+    output_dir: str | Path | None,
+    timeout: int,
+    use_cache: bool,
+    force: bool,
+) -> FetchResult:
+    """Fetch a proteome-only install (UniProt source).
+
+    Downloads ``protein.faa`` only — no genome, no GFF, no cDNA. Writes
+    a v2 ``meta.toml`` flagged ``has_genome=false`` + ``has_annotation=false``
+    + ``has_proteome=true``. The ``[contents]`` block is what
+    ``_cache_is_complete`` keys off to recognise the proteome-only
+    layout on subsequent fetches.
+    """
+    # ── Idempotency check (cache only) ──────────────────────────────
+    root = cache_root() if use_cache else None
+    cache_release_dir: Path | None = None
+    if use_cache and root is not None:
+        cache_release_dir = root / handle.organism / handle.release_slug()
+
+    if (
+        use_cache
+        and cache_release_dir is not None
+        and not force
+        and _cache_is_complete(cache_release_dir)
+    ):
+        cached_protein = cache_release_dir / "protein.faa"
+        return FetchResult(
+            genome=None,
+            annotation=None,
+            handle=handle,
+            cache_path=cache_release_dir,
+            output_path=Path(output_dir).resolve() if output_dir else None,
+            sources={"protein": resolved.protein_url} if resolved.protein_url else {},
+            skipped_cache=True,
+            protein_fasta_path=cached_protein if cached_protein.is_file() else None,
+        )
+
+    if not resolved.protein_url:
+        raise ValueError(
+            f"proteome-only fetch requires resolved.protein_url; got None "
+            f"for handle {handle!r}"
+        )
+
+    # ── Download + cache write ──────────────────────────────────────
+    with tempfile.TemporaryDirectory(prefix="constellation_fetch_proteome_") as scratch:
+        scratch_path = Path(scratch)
+        # UniProt FTP serves SwissProt as ``uniprot_sprot.fasta.gz`` — we
+        # accept any gz-suffixed protein file via ``_gunzip_to``.
+        protein_gz = scratch_path / "protein.faa.gz"
+        protein_decoded = scratch_path / "protein.faa"
+
+        protein_etag, protein_lm = _download_to(
+            resolved.protein_url, protein_gz, timeout=timeout
+        )
+        sha256_map = {"protein": _sha256_of(protein_gz)}
+        _gunzip_to(protein_gz, protein_decoded)
+
+        urls_meta = {
+            "protein": {
+                "url": resolved.protein_url,
+                "etag": protein_etag,
+                "last_modified": protein_lm,
+            }
+        }
+
+        cached_protein_path: Path | None = None
+        if use_cache and cache_release_dir is not None:
+            with acquire_fetch_lock(handle):
+                if not force and _cache_is_complete(cache_release_dir):
+                    cached_existing = cache_release_dir / "protein.faa"
+                    if cached_existing.is_file():
+                        cached_protein_path = cached_existing
+                else:
+                    _write_into_cache(
+                        cache_release_dir,
+                        genome=None,
+                        annotation=None,
+                        handle=handle,
+                        urls_meta=urls_meta,
+                        sha256_map=sha256_map,
+                        source_checksum_verified=False,
+                        resolved=resolved,
+                        force=force,
+                        protein_fasta_src=protein_decoded,
+                        cdna_fasta_src=None,
+                        has_proteome=True,
+                        has_cdna=False,
+                    )
+                    cached_protein_path = cache_release_dir / "protein.faa"
+
+        if output_dir is not None:
+            out_path = Path(output_dir).expanduser().resolve()
+            out_path.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(protein_decoded, out_path / "protein.faa")
+        else:
+            out_path = None
+
+    return FetchResult(
+        genome=None,
+        annotation=None,
+        handle=handle,
+        cache_path=cache_release_dir if use_cache else None,
+        output_path=out_path,
+        sources={"protein": resolved.protein_url},
+        skipped_cache=False,
+        protein_fasta_path=cached_protein_path,
+    )
 
 
 __all__ = [

@@ -20,6 +20,7 @@ container's contigs by id. Spliced transcript records live in
 
 from __future__ import annotations
 
+from constellation.sequencing.reference.installed import Reference
 from constellation.sequencing.reference.io import (
     GENOME_REFERENCE_READERS,
     GENOME_REFERENCE_WRITERS,
@@ -38,6 +39,7 @@ __all__ = [
     "GenomeReferenceWriter",
     "GENOME_REFERENCE_READERS",
     "GENOME_REFERENCE_WRITERS",
+    "Reference",
     "register_reader",
     "register_writer",
     "save_genome_reference",
