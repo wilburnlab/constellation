@@ -211,8 +211,17 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
 
     # ── Threads + memory ───────────────────────────────────────────────
     p.add_argument(
-        "--mmseqs-threads", type=int, default=4,
-        help="mmseqs2 worker threads (default 4)",
+        "--threads", type=int, default=8,
+        help=(
+            "worker threads for both mmseqs2 and EncyclopeDIA (default 8). "
+            "In Stage 9 the per-injection EncyclopeDIA searches divide this "
+            "across the parallel JVMs (each gets threads // --injection-threads, "
+            "min 1), so total core use stays ~--threads."
+        ),
+    )
+    p.add_argument(
+        "--mmseqs-threads", type=int, default=None,
+        help="override mmseqs2 thread count (default: --threads)",
     )
     p.add_argument(
         "--injection-threads", type=int, default=1,

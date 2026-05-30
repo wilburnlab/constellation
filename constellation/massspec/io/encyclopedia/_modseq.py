@@ -47,7 +47,11 @@ from constellation.core.sequence.proforma import (
 #     ProteinNTermAcetyl=var case).
 #   - Bare uppercase residues
 #   - Mass-delta blocks ``[+N.NNN]`` or ``[-N.NNN]`` (signed) immediately
-#     follow the residue they decorate (residue-attached / side-chain mods)
+#     follow the residue they decorate (residue-attached / side-chain mods).
+#     Multiple blocks may stack on one residue — EncyclopeDIA folds an
+#     N-terminal mod and a side-chain mod on residue 0 into consecutive
+#     ``X[+a][+b]`` brackets (e.g. ``C[+42.01057][+57.02146]``); each is
+#     resolved independently and routed to the terminus or the side chain.
 #
 # The ``[+N.NNN]X...`` (leading) vs ``X[+N.NNN]...`` (residue-attached at
 # position 0) split is the disambiguation EncyclopeDIA uses to distinguish
@@ -61,6 +65,7 @@ from constellation.core.sequence.proforma import (
 #   [+42.01057]KVERPD                  → "[UNIMOD:1]-KVERPD"  (N-term Acetyl — explicit leading-bracket form, 6.5.15)
 #   PEPK[+42.01057]TIDE                → "PEPK[UNIMOD:1]TIDE" (K side-chain Ac)
 #   PEPS[+79.96633]TIDE                → "PEPS[UNIMOD:21]TIDE" (Phospho on S)
+#   C[+42.01057][+57.02146]LK          → "[UNIMOD:1]-C[UNIMOD:4]LK" (stacked N-term Ac + Cys Cam on residue 0)
 
 _RE_MOD_BLOCK = re.compile(r"\[([+-]?\d+(?:\.\d+)?)\]")
 
@@ -167,22 +172,27 @@ def parse_encyclopedia_modseq(
         i = m.end()
 
     # ── Residue-by-residue parse ───────────────────────────────────────
-    tokens: list[tuple[str, str | None]] = []
+    # A residue may carry multiple stacked mod blocks. EncyclopeDIA folds an
+    # N-terminal mod and a side-chain mod on residue 0 into consecutive
+    # ``X[+a][+b]`` brackets (e.g. ``C[+42.01057][+57.02146]`` = N-term
+    # Acetyl + Cys Carbamidomethyl), and ``format_encyclopedia_modseq`` emits
+    # the same stacked form — so the reader must consume every bracket.
+    tokens: list[tuple[str, list[str]]] = []
     while i < len(modseq):
         c = modseq[i]
         if c.isalpha() and c.isupper():
             residue = c
             i += 1
-            mod_str: str | None = None
-            if i < len(modseq) and modseq[i] == "[":
+            mods: list[str] = []
+            while i < len(modseq) and modseq[i] == "[":
                 m = _RE_MOD_BLOCK.match(modseq, i)
                 if m is None:
                     raise ValueError(
                         f"malformed mod block at index {i} in {modseq!r}"
                     )
-                mod_str = m.group(1)
+                mods.append(m.group(1))
                 i = m.end()
-            tokens.append((residue, mod_str))
+            tokens.append((residue, mods))
         else:
             raise ValueError(
                 f"unexpected character {c!r} at index {i} in {modseq!r}; "
@@ -198,26 +208,25 @@ def parse_encyclopedia_modseq(
     sequence = "".join(r for r, _ in tokens)
     residue_mods: dict[int, list[TaggedMod]] = {}
 
-    for idx, (residue, mod_str) in enumerate(tokens):
-        if mod_str is None:
-            continue
-        delta = float(mod_str)
-        matches = _cached_find_by_mass(vocab, delta, tolerance_da)
-        chosen, place_terminal = _choose_modification(matches, residue, idx)
-        if chosen is None:
-            # Ambiguous or no match → pass through as a ProForma mass-delta.
-            modref = ModRef(mass_delta=delta)
-        else:
-            # ``chosen.id`` is the full canonical id ("UNIMOD:35"); split to
-            # populate ``accession`` separately so format_proforma re-emits the
-            # canonical form.
-            _, _, accession = chosen.id.partition(":")
-            modref = ModRef(cv="UNIMOD", accession=accession, name=chosen.name)
-        tagged = TaggedMod(mod=modref)
-        if place_terminal:
-            n_term_mods.append(tagged)
-        else:
-            residue_mods.setdefault(idx, []).append(tagged)
+    for idx, (residue, mod_strs) in enumerate(tokens):
+        for mod_str in mod_strs:
+            delta = float(mod_str)
+            matches = _cached_find_by_mass(vocab, delta, tolerance_da)
+            chosen, place_terminal = _choose_modification(matches, residue, idx)
+            if chosen is None:
+                # Ambiguous or no match → pass through as a ProForma mass-delta.
+                modref = ModRef(mass_delta=delta)
+            else:
+                # ``chosen.id`` is the full canonical id ("UNIMOD:35"); split to
+                # populate ``accession`` separately so format_proforma re-emits
+                # the canonical form.
+                _, _, accession = chosen.id.partition(":")
+                modref = ModRef(cv="UNIMOD", accession=accession, name=chosen.name)
+            tagged = TaggedMod(mod=modref)
+            if place_terminal:
+                n_term_mods.append(tagged)
+            else:
+                residue_mods.setdefault(idx, []).append(tagged)
 
     return Peptidoform(
         sequence=sequence,
