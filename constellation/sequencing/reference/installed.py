@@ -243,25 +243,61 @@ class Reference:
     def _fetch_hint(self, *, kind: str) -> str:
         """Concrete CLI invocation that would install the missing artifact.
 
-        Three cases:
+        Four cases:
           * Cross-organism SwissProt (``organism == 'swissprot'``) →
             ``constellation reference fetch uniprot:swissprot``.
-          * Per-species proteome → bare species/taxid spec with
-            ``--source uniprot``.
-          * Genome / annotation / cDNA → bare species/taxid spec with
-            ``--source <self.source>``.
+          * Missing proteome on a source that bundles one
+            (``refseq`` / ``ensembl`` / ``ensembl_genomes``) → re-fetch
+            with ``--force``; the protein FASTA ships alongside the
+            genome and the original fetch's optional protein-download
+            block most likely 404'd or was interrupted. UniProt is the
+            fallback when --force doesn't pick it up (assembly doesn't
+            publish a protein FASTA at all).
+          * Missing proteome on a source that doesn't bundle one
+            (``genbank`` / ``local_import``) → UniProt directly.
+          * Genome / annotation / cDNA → re-fetch from the same source
+            that originally produced this reference.
 
         For per-species hints the user must supply the actual species
-        name or taxid — the organism slug stored in the handle isn't
-        usually a valid taxonomy query (``homo_sapiens`` vs
-        ``'Homo sapiens'``). The hint includes the slug as a worked
-        example so the user knows what to substitute.
+        name or taxid — the organism slug stored in the handle isn't a
+        valid taxonomy query (``homo_sapiens`` vs ``'Homo sapiens'``).
+        The hint includes the slug as a worked example so the user
+        knows what to substitute.
         """
         if self.organism == "swissprot" and kind == "proteome":
             return "constellation reference fetch uniprot:swissprot"
-        src = "uniprot" if kind == "proteome" else self.source
+
+        if kind == "proteome":
+            # RefSeq / Ensembl / Ensembl Genomes all bundle a protein
+            # FASTA alongside the genome. The original ``reference
+            # fetch`` opportunistically downloads it; failures are
+            # non-fatal (404 or network glitch leaves the cache without
+            # a ``protein.faa``). A ``--force`` re-fetch is the right
+            # first step before reaching for UniProt.
+            if self.source in {"refseq", "ensembl", "ensembl_genomes"}:
+                return (
+                    f"constellation reference fetch <species-or-taxid> "
+                    f"--source {self.source} --force  "
+                    f"# {self.source} bundles a protein FASTA alongside "
+                    f"the genome; the original fetch most likely 404'd "
+                    f"on it. If --force still doesn't pick it up, the "
+                    f"assembly genuinely has no protein FASTA — fall "
+                    f"back to UniProt: "
+                    f"`constellation reference fetch <species-or-taxid> "
+                    f"--source uniprot`"
+                )
+            # Sources that don't bundle a proteome (genbank,
+            # local_import, ...) → UniProt is the only general fallback.
+            return (
+                f"constellation reference fetch <species-or-taxid> "
+                f"--source uniprot  "
+                f"# source {self.source!r} does not bundle a protein FASTA"
+            )
+
+        # Genome / annotation / cDNA — re-fetch from the same source.
         return (
-            f"constellation reference fetch <species-or-taxid> --source {src}  "
+            f"constellation reference fetch <species-or-taxid> "
+            f"--source {self.source}  "
             f"# this handle is {self.organism!r}"
         )
 
