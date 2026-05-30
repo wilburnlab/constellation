@@ -953,6 +953,14 @@ def run_transcriptome_to_proteomics(
     stage_manifests["02_novel_fasta"] = _read_stage_manifest(stage_dir)
     novel_table = pq.read_table(stage_dir / "novel.parquet")
 
+    # Unified thread budget: --threads drives both mmseqs2 and EncyclopeDIA;
+    # --mmseqs-threads (default None) optionally overrides mmseqs2 only. The
+    # Stage 9 per-injection JVMs divide --threads across the parallel workers.
+    threads = getattr(args, "threads", None) or 8
+    args.threads = threads
+    if getattr(args, "mmseqs_threads", None) is None:
+        args.mmseqs_threads = threads
+
     # ── Stage 3: competitive mmseqs2 alignment ─────────────────────────
     stage_dir = output_dir / "03_alignment"
     alignments_tab = stage_dir / "alignments.tab"
@@ -1214,6 +1222,7 @@ def run_transcriptome_to_proteomics(
                 precursor_tolerance_ppm=args.precursor_tolerance_ppm,
                 percolator_version=args.percolator_version,
                 percolator_threshold=args.percolator_threshold,
+                threads=args.threads,
                 extra_args=_passthrough_args(args.encyclopedia_arg),
                 stream_to_stderr=progress,
             )
@@ -1379,8 +1388,11 @@ def run_transcriptome_to_proteomics(
     # ── Stage 9: per-injection search (against the filtered library) ───
     stage_dir = output_dir / "09_per_injection"
     if not _stage_done(stage_dir, args.resume):
+        _per_jvm_threads = max(1, args.threads // max(1, args.injection_threads))
         _log(f"Stage 9: per-injection searches ({len(injection_files)} mzML, "
-             f"{args.injection_threads} thread{'s' if args.injection_threads != 1 else ''})")
+             f"{args.injection_threads} JVM{'s' if args.injection_threads != 1 else ''} "
+             f"× {_per_jvm_threads} EncyclopeDIA thread"
+             f"{'s' if _per_jvm_threads != 1 else ''})")
         stage_dir.mkdir(parents=True, exist_ok=True)
         _run_per_injection_searches(
             injection_files=injection_files,
@@ -1399,6 +1411,9 @@ def run_transcriptome_to_proteomics(
                 # filtering propagates transitively.
                 "library_collision_filtered": not args.no_collision_filter,
                 "injection_threads": args.injection_threads,
+                "encyclopedia_threads_per_jvm": max(
+                    1, args.threads // max(1, args.injection_threads)
+                ),
                 "n_injections": len(injection_files),
             },
         )
@@ -1732,6 +1747,7 @@ def _run_per_injection_searches(
             precursor_tolerance_ppm=args.precursor_tolerance_ppm,
             percolator_version=args.percolator_version,
             percolator_threshold=args.percolator_threshold,
+            threads=max(1, args.threads // max(1, args.injection_threads)),
             extra_args=_passthrough_args(args.encyclopedia_arg),
             stream_to_stderr=progress,
         )
