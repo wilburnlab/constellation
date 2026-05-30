@@ -3278,10 +3278,10 @@ def _build_reference_parser(subs) -> None:
         "spec",
         help=(
             "<source>:<id> — e.g. 'ensembl_genomes:saccharomyces_cerevisiae', "
-            "'refseq:GCF_001708105.1', 'ensembl:human'. Also accepts a bare "
-            "species name (e.g. 'Haliotis rufescens', 'red abalone') or an "
-            "integer taxid (e.g. '9606'), routed through the taxonomy + "
-            "catalog layer."
+            "'refseq:GCF_001708105.1', 'ensembl:human', 'uniprot:swissprot'. "
+            "Also accepts a bare species name (e.g. 'Haliotis rufescens', "
+            "'red abalone') or an integer taxid (e.g. '9606'), routed through "
+            "the taxonomy + catalog layer."
         ),
     )
     p_fetch.add_argument(
@@ -3304,11 +3304,13 @@ def _build_reference_parser(subs) -> None:
     )
     p_fetch.add_argument(
         "--release",
-        type=int,
         default=None,
         help=(
-            "pin an Ensembl / Ensembl Genomes release number (e.g. 111). "
-            "RefSeq/GenBank accessions already pin their assembly version."
+            "pin a release identifier: an Ensembl / Ensembl Genomes release "
+            "number (e.g. '111') or a UniProt release tag (e.g. '2026_02'). "
+            "RefSeq/GenBank accessions already pin their assembly version. "
+            "UniProt accepts a release tag for ``uniprot:swissprot``; omit "
+            "to auto-detect the current release."
         ),
     )
     p_fetch.add_argument(
@@ -3710,23 +3712,45 @@ def _cmd_reference_fetch(args: argparse.Namespace) -> int:
         verify_source_checksums=not args.no_verify_checksums,
         force=args.force,
     )
-    n_features = result.annotation.n_features if result.annotation else 0
     destinations: list[str] = []
     if result.cache_path is not None:
         prefix = "cache (cached)" if result.skipped_cache else "cache"
         destinations.append(f"{prefix}: {result.cache_path}")
     if result.output_path is not None:
         destinations.append(str(result.output_path))
-    print(
-        f"fetched {result.genome.n_contigs} contigs ({result.genome.total_length} bp) "
-        f"+ {n_features} features → handle {result.handle} → "
-        f"{'; '.join(destinations)}",
-        flush=True,
-    )
+    if result.genome is None:
+        # Proteome-only install (UniProt source).
+        n_proteins = _count_fasta_records(result.protein_fasta_path)
+        suffix = f"{n_proteins:,} sequences" if n_proteins else "proteome FASTA"
+        print(
+            f"fetched proteome only: {suffix} → handle {result.handle} → "
+            f"{'; '.join(destinations)}",
+            flush=True,
+        )
+    else:
+        n_features = result.annotation.n_features if result.annotation else 0
+        print(
+            f"fetched {result.genome.n_contigs} contigs "
+            f"({result.genome.total_length} bp) + {n_features} features → "
+            f"handle {result.handle} → {'; '.join(destinations)}",
+            flush=True,
+        )
     if not result.skipped_cache:
-        print(f"  genome: {result.sources['genome']}")
-        print(f"  annotation: {result.sources['annotation']}")
+        for kind in ("genome", "annotation", "protein", "cdna"):
+            if kind in result.sources:
+                print(f"  {kind}: {result.sources[kind]}")
     return 0
+
+
+def _count_fasta_records(path: Path | None) -> int:
+    """Count FASTA records by ``>`` header lines; 0 if unreadable."""
+    if path is None or not path.is_file():
+        return 0
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return sum(1 for line in fh if line.startswith(">"))
+    except OSError:
+        return 0
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -4107,10 +4131,16 @@ def _cmd_reference_list(_args: argparse.Namespace) -> int:
     entries = list_installed()
     if not entries:
         print(f"reference cache empty: {cache_root()}")
-        print("  run: constellation reference fetch <source>:<id>")
+        print(
+            "  run: constellation reference fetch <spec> [--source SOURCE]"
+        )
+        print(
+            "       (e.g. `'Homo sapiens'`, `9606`, `ensembl:human`, "
+            "`uniprot:swissprot`)"
+        )
         return 0
     defaults = read_defaults()
-    rows: list[tuple[str, str, str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
     for entry in entries:
         marker = "*" if entry.is_default(defaults) else " "
         fetched = (entry.fetched_at or "")[:10]
@@ -4123,9 +4153,10 @@ def _cmd_reference_list(_args: argparse.Namespace) -> int:
                 entry.release_slug,
                 fetched,
                 size,
+                _presence_badges(entry),
             )
         )
-    headers = ("handle", "*", "organism", "release", "fetched", "size")
+    headers = ("handle", "*", "organism", "release", "fetched", "size", "contents")
     widths = [
         max(len(h), max(len(r[i]) for r in rows)) for i, h in enumerate(headers)
     ]
@@ -4139,6 +4170,23 @@ def _cmd_reference_list(_args: argparse.Namespace) -> int:
         print(_fmt(row))
     print(f"\ncache root: {cache_root()}")
     return 0
+
+
+def _presence_badges(entry) -> str:
+    """Compact presence indicator: ``[genome,annotation,proteome,cdna]``
+    badges flagged with ``+`` (present), ``-`` (absent), or ``?``
+    (unknown / legacy v1 cache without the [contents] block).
+    """
+    def _flag(value: bool | None) -> str:
+        if value is None:
+            return "?"
+        return "+" if value else "-"
+    return (
+        f"{_flag(entry.has_genome)}g"
+        f"{_flag(entry.has_annotation)}a"
+        f"{_flag(entry.has_proteome)}p"
+        f"{_flag(entry.has_cdna)}c"
+    )
 
 
 def _cmd_reference_where(args: argparse.Namespace) -> int:

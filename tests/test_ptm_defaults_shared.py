@@ -35,9 +35,8 @@ def _orchestrator_args() -> argparse.Namespace:
     build_orchestrator_parser(subs)
     return root.parse_args([
         "transcriptome-to-proteome",
-        "--protein-counts", "/tmp/x",
-        "--reference-fasta", "/tmp/x",
-        "--reference-annotation", "/tmp/x",
+        "--demux-dir", "/tmp/x",
+        "--reference", "homo_sapiens",
         "--gpf", "/tmp/x",
         "--injections", "/tmp/x",
         "--output-dir", "/tmp/x",

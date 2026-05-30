@@ -60,7 +60,7 @@ _XDG_ENV_VAR = "XDG_DATA_HOME"
 _HOME_FALLBACK = ".constellation/references"
 
 VALID_SOURCES: frozenset[str] = frozenset(
-    {"ensembl", "ensembl_genomes", "refseq", "genbank", "local_import"}
+    {"ensembl", "ensembl_genomes", "refseq", "genbank", "local_import", "uniprot"}
 )
 
 
@@ -194,7 +194,7 @@ META_FILENAME = "meta.toml"
 DEFAULTS_FILENAME = "defaults.toml"
 CURRENT_SYMLINK = "current"
 CURRENT_TEXTFILE = "current.txt"  # WSL/Windows fallback when symlinks unavailable
-META_SCHEMA_VERSION = 1
+META_SCHEMA_VERSION = 2  # v2 adds [contents] booleans + cdna/protein URL provenance
 DEFAULTS_SCHEMA_VERSION = 1
 
 
@@ -216,6 +216,12 @@ class InstalledReference:
     strain: str | None = None
     scientific_name: str | None = None
     taxid: int | None = None
+    # Presence booleans (meta.toml v2 [contents]); None if unknown for legacy v1
+    # caches that didn't record them — callers fall back to on-disk existence.
+    has_genome: bool | None = None
+    has_annotation: bool | None = None
+    has_proteome: bool | None = None
+    has_cdna: bool | None = None
 
     def is_default(self, defaults: dict[str, str]) -> bool:
         target = defaults.get(self.organism)
@@ -239,6 +245,10 @@ def write_meta_toml(
     taxid: int | None = None,
     scientific_name: str | None = None,
     strain: str | None = None,
+    has_genome: bool = True,
+    has_annotation: bool = True,
+    has_proteome: bool = False,
+    has_cdna: bool = False,
 ) -> None:
     """Write a ``meta.toml`` at the cache-release-dir layer.
 
@@ -246,6 +256,11 @@ def write_meta_toml(
     ship a TOML writer (only a reader in ``tomllib``), and the schema is
     static enough that a serialization library would be overkill. Stays
     valid against ``tomllib``'s parser.
+
+    v2 adds a ``[contents]`` section recording which artifacts are
+    installed under this release dir — ``has_genome`` / ``has_annotation``
+    / ``has_proteome`` / ``has_cdna``. Proteome-only installs (UniProt)
+    write ``has_genome=false`` + ``has_annotation=false`` + ``has_proteome=true``.
     """
     if not handle.is_qualified():
         raise ValueError(f"meta.toml requires a qualified handle; got {handle!r}")
@@ -273,6 +288,13 @@ def write_meta_toml(
         lines.append(f'strain = "{_toml_escape(strain)}"')
     lines.append(f'constellation_version = "{constellation_version}"')
     lines.append(f'fetched_at = "{fetched_at}"')
+
+    lines.append("")
+    lines.append("[contents]")
+    lines.append(f"has_genome = {'true' if has_genome else 'false'}")
+    lines.append(f"has_annotation = {'true' if has_annotation else 'false'}")
+    lines.append(f"has_proteome = {'true' if has_proteome else 'false'}")
+    lines.append(f"has_cdna = {'true' if has_cdna else 'false'}")
 
     for url_kind, url_info in urls.items():
         lines.append("")
@@ -304,17 +326,33 @@ def _toml_escape(s: str) -> str:
 
 
 def read_meta_toml(release_dir: Path) -> dict[str, Any] | None:
-    """Read ``<release_dir>/meta.toml``; return ``None`` if missing."""
+    """Read ``<release_dir>/meta.toml``; return ``None`` if missing.
+
+    Accepts both v1 (no ``[contents]`` block) and v2 (with ``[contents]``).
+    For v1 caches the returned dict is augmented with a synthesised
+    ``contents`` mapping derived from on-disk file existence so callers
+    can treat both versions uniformly.
+    """
     path = release_dir / META_FILENAME
     if not path.exists():
         return None
     raw = tomllib.loads(path.read_text(encoding="utf-8"))
     schema_version = int(raw.get("schema_version", 1))
-    if schema_version != META_SCHEMA_VERSION:
+    if schema_version < 1 or schema_version > META_SCHEMA_VERSION:
         raise ValueError(
             f"unsupported meta.toml schema_version={schema_version} at {path}; "
-            f"this constellation supports v{META_SCHEMA_VERSION}"
+            f"this constellation supports v1..v{META_SCHEMA_VERSION}"
         )
+    contents = raw.get("contents")
+    if not isinstance(contents, dict):
+        # v1 cache (or v2 with the section dropped) — synthesise from disk.
+        contents = {
+            "has_genome": (release_dir / "genome").is_dir(),
+            "has_annotation": (release_dir / "annotation").is_dir(),
+            "has_proteome": (release_dir / "protein.faa").is_file(),
+            "has_cdna": (release_dir / "cdna.fna").is_file(),
+        }
+        raw["contents"] = contents
     return raw
 
 
@@ -412,7 +450,7 @@ def resolve(handle: Handle | str, *, root: Path | None = None) -> Path:
     if not organism_dir.is_dir():
         raise ReferenceNotInstalledError(
             f"no cached reference for organism {handle.organism!r} under {root}; "
-            f"run: constellation reference fetch <source>:<id>"
+            f"run: constellation reference fetch <spec> [--source SOURCE]"
         )
 
     if handle.is_qualified():
@@ -454,7 +492,7 @@ def resolve(handle: Handle | str, *, root: Path | None = None) -> Path:
     if not installed:
         msg = (
             f"no cache entry for {handle.organism!r}; run: "
-            f"constellation reference fetch <source>:<id>"
+            f"constellation reference fetch <spec> [--source SOURCE]"
         )
     raise ReferenceNotInstalledError(msg)
 
@@ -655,6 +693,7 @@ def list_installed(*, root: Path | None = None) -> list[InstalledReference]:
                 taxid_int = int(taxid_raw) if taxid_raw is not None else None
             except (TypeError, ValueError):
                 taxid_int = None
+            contents = meta.get("contents") if meta else None
             entry = InstalledReference(
                 handle=f"{organism}@{release_slug}",
                 organism=organism,
@@ -670,9 +709,20 @@ def list_installed(*, root: Path | None = None) -> list[InstalledReference]:
                 strain=_str_or_none(meta, "strain"),
                 scientific_name=_str_or_none(meta, "scientific_name"),
                 taxid=taxid_int,
+                has_genome=_bool_or_none(contents, "has_genome"),
+                has_annotation=_bool_or_none(contents, "has_annotation"),
+                has_proteome=_bool_or_none(contents, "has_proteome"),
+                has_cdna=_bool_or_none(contents, "has_cdna"),
             )
             out.append(entry)
     return out
+
+
+def _bool_or_none(d: dict[str, Any] | None, key: str) -> bool | None:
+    if not d:
+        return None
+    value = d.get(key)
+    return bool(value) if value is not None else None
 
 
 def _str_or_none(meta: dict[str, Any] | None, key: str) -> str | None:

@@ -9,16 +9,28 @@ classifications). Defaults match the cartographer pipeline; the
 collision filter is on by default (the v6.5.15 sweep validation showed
 it's still load-bearing) and applied at the GPF library stage.
 
+Reference handling is portal-native: ``--reference`` accepts a handle
+(``<organism>@<source>-<release>`` or a bare organism slug that
+resolves via ``defaults.toml`` / ``current/``), ``--reference-from``
+inherits the handle from an upstream ``transcriptome align`` /
+``transcriptome cluster`` output manifest. SwissProt defaults to
+whatever ``Reference.open("swissprot")`` resolves; pin a specific
+release with ``--swissprot-reference``. Users with one-off local
+FASTA/GFF pairs should register them first via ``constellation
+reference import <dir> --organism <slug>`` and then use the handle.
+
 Top-level CLI verb per the project rule "single-purpose verbs go at
-the top level; umbrellas (`pipeline`, `bridges`) get introduced only
-when ≥2 siblings exist." When a second cross-modality workflow lands,
-this and that workflow can be collapsed under a shared umbrella —
-defer until two workflows exist to compare.
+the top level; umbrellas get introduced only when ≥2 siblings exist."
+When a second cross-modality workflow lands, this and that workflow
+can be collapsed under a shared umbrella — defer until two workflows
+exist to compare.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 from constellation.massspec.search.encyclopedia.ptm_defaults import (
@@ -42,67 +54,46 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     )
     # ── Required inputs ────────────────────────────────────────────────
     p.add_argument(
-        "--protein-counts",
+        "--demux-dir",
         required=True,
         type=Path,
         help=(
-            "Per-sample protein counts. Accepts the wide TSV from "
-            "`constellation transcriptome demultiplex` "
-            "(protein_counts.tsv), the long parquet "
-            "(feature_quant.parquet), or the demultiplex output "
-            "directory."
+            "path to a Constellation demux output directory (preferred); "
+            "also accepts a TSV or parquet count table for external "
+            "inputs. Demux is reference-free by design — the reference "
+            "is supplied separately via --reference or --reference-from."
         ),
     )
     p.add_argument(
-        "--proteins-fasta",
+        "--protein-fasta",
         type=Path,
         default=None,
         help=(
-            "Optional override. `proteins.fasta` from "
-            "`constellation transcriptome demultiplex`. NO LONGER "
-            "REQUIRED — the pipeline derives novel ORF sequences "
-            "directly from `--protein-counts` (the same demux output "
-            "carries them in its `sequence` column). Supply this only "
-            "if you want to use an ORF FASTA produced by a different "
-            "upstream pipeline."
+            "ORF FASTA from a different upstream pipeline; overrides the "
+            "novel ORF sequences the orchestrator otherwise derives from "
+            "the `--demux-dir` `sequence` column."
         ),
     )
     p.add_argument(
-        "--reference-dir",
-        type=Path,
+        "--reference",
+        type=str,
         default=None,
         help=(
-            "Constellation reference-cache directory, e.g. "
-            "``~/.constellation/references/homo_sapiens/refseq-GCF_000001405.40/``. "
-            "When provided, auto-resolves ``--reference-fasta`` to "
-            "``<dir>/protein.faa`` and ``--reference-annotation`` to "
-            "``<dir>/annotation/`` (the Constellation ParquetDir form). "
-            "Explicit ``--reference-fasta`` / ``--reference-annotation`` "
-            "flags override the auto-resolved defaults. If "
-            "``--reference-dir`` is NOT supplied, both other flags are "
-            "required."
+            "reference handle — qualified (``<organism>@<source>-<release>``, "
+            "e.g. ``mus_musculus@refseq-GCF_000001635.27-ar109``) or a bare "
+            "organism slug that resolves via defaults.toml / current. "
+            "Required unless --reference-from is supplied."
         ),
     )
     p.add_argument(
-        "--reference-fasta",
+        "--reference-from",
         type=Path,
         default=None,
         help=(
-            "background reference proteome (e.g. RefSeq protein FASTA "
-            "for the organism). Required unless ``--reference-dir`` is "
-            "supplied."
-        ),
-    )
-    p.add_argument(
-        "--reference-annotation",
-        type=Path,
-        default=None,
-        help=(
-            "Reference annotation — accepts the Constellation parquet "
-            "bundle (directory with features.parquet + manifest.json, "
-            "as written by ``constellation reference fetch``), a GFF3 "
-            "file, or a GBFF file. Required unless ``--reference-dir`` "
-            "is supplied."
+            "inherit the reference handle from an upstream "
+            "``transcriptome align`` or ``transcriptome cluster`` output "
+            "directory's manifest. Mutually consistent with --reference; "
+            "disagreements exit 2."
         ),
     )
     p.add_argument(
@@ -111,10 +102,13 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         nargs="+",
         type=Path,
         help=(
-            "one or more GPF spectra files (gas-phase fractions). "
-            "Thermo `.raw` is the canonical lab input; `.mzML` and "
-            "preprocessed `.dia` caches are also accepted — Stage 6 "
-            "(`process-dia`) handles all three transparently."
+            "one or more GPF spectra inputs (gas-phase fractions). "
+            "Each path may be a file (Thermo `.raw`, `.mzML`, `.dia`, "
+            "or Bruker `.d`) or a directory; directories are scanned "
+            "for spectra files. When the same stem appears in multiple "
+            "formats, the orchestrator picks one in this preference "
+            "order: `.dia` (preprocessed cache, skip Stage 6) > "
+            "`.raw` > `.mzML` > `.d`."
         ),
     )
     p.add_argument(
@@ -124,8 +118,9 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         type=Path,
         help=(
             "one or more per-sample individual-injection spectra "
-            "files. Same format flexibility as --gpf: `.raw` is the "
-            "canonical lab input; `.mzML` and `.dia` accepted."
+            "inputs. Same path semantics as --gpf: files or "
+            "directories accepted, same `.dia` > `.raw` > `.mzML` > "
+            "`.d` per-stem preference."
         ),
     )
     p.add_argument(
@@ -135,20 +130,20 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         help="run directory (per-stage subdirs created here)",
     )
 
-    # ── SwissProt — lazy-fetched by default ────────────────────────────
+    # ── SwissProt — handle-based selection ─────────────────────────────
     p.add_argument(
-        "--swissprot-fasta",
-        type=Path,
+        "--swissprot-reference",
+        type=str,
         default=None,
         help=(
-            "explicit SwissProt FASTA path; defaults to the lazy-fetched "
-            "release at ~/.constellation/references/swissprot/<release>/"
+            "pin a specific SwissProt release as a portal handle "
+            "(e.g. ``swissprot@uniprot-2026_02``). Default: the bare "
+            "``swissprot`` handle, resolved via defaults.toml / current "
+            "to whatever is installed. If no SwissProt is installed, "
+            "run ``constellation reference fetch uniprot:swissprot`` "
+            "(optionally with ``--release 2026_02`` to pin a specific "
+            "release)."
         ),
-    )
-    p.add_argument(
-        "--swissprot-release",
-        default=None,
-        help="pin a specific UniProt release (e.g. 2026_02); default = current",
     )
 
     # ── Run identification ─────────────────────────────────────────────
@@ -319,51 +314,272 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
 
 
 def _cmd_transcriptome_to_proteome(args: argparse.Namespace) -> int:
-    """Handler — resolves the reference-cache shorthand then delegates
-    to the orchestrator function in the top-level module so notebook /
-    library callers can invoke the same workflow without going through
-    argparse.
+    """Handler — resolves the reference + swissprot_reference handles
+    then delegates to the orchestrator function.
 
-    When the user supplies ``--reference-dir`` instead of (or alongside)
-    ``--reference-fasta`` and ``--reference-annotation``, we resolve
-    the implicit defaults here so the orchestrator's path-resolution
-    block can stay simple. Explicit flags override the dir-derived
-    defaults.
+    Reference resolution precedence (see plan):
+      1. Explicit ``--reference`` always wins.
+      2. ``--reference-from DIR`` reads ``reference_handle`` from the
+         upstream ``align`` / ``cluster`` manifest. Rejects ``demux``.
+      3. Both supplied with disagreeing handles → exit 2.
+      4. Neither given → exit 2 with the actionable hint.
+
+    SwissProt: pin via ``--swissprot-reference``, or default to
+    ``Reference.open("swissprot")`` which resolves via defaults.toml /
+    current. No lazy fetch — missing SwissProt → exit 2 with a hint.
     """
-    import sys
+    try:
+        reference = _resolve_reference_from_args(args)
+    except _ResolutionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
-    if args.reference_dir is not None:
-        ref_dir = Path(args.reference_dir).expanduser().resolve()
-        if not ref_dir.is_dir():
-            print(
-                f"error: --reference-dir {ref_dir} is not a directory",
-                file=sys.stderr,
-            )
-            return 2
-        # Fill in defaults from the cache layout. Explicit flags win.
-        if args.reference_fasta is None:
-            args.reference_fasta = ref_dir / "protein.faa"
-        if args.reference_annotation is None:
-            args.reference_annotation = ref_dir / "annotation"
+    try:
+        swissprot_reference = _resolve_swissprot_from_args(args)
+    except _ResolutionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
-    # After dir-resolution both must be populated.
-    missing = []
-    if args.reference_fasta is None:
-        missing.append("--reference-fasta")
-    if args.reference_annotation is None:
-        missing.append("--reference-annotation")
-    if missing:
-        print(
-            f"error: {', '.join(missing)} required (or pass --reference-dir "
-            f"to auto-resolve from the Constellation reference cache).",
-            file=sys.stderr,
+    # Expand directories + dedup by stem before handing off to the
+    # orchestrator so Stage 6 + Stage 9 see one canonical file per
+    # acquisition (avoids re-converting .raw → .dia when a cache is
+    # already on disk).
+    try:
+        args.gpf = _expand_spectra_inputs(args.gpf, flag="--gpf")
+        args.injections = _expand_spectra_inputs(
+            args.injections, flag="--injections"
         )
+    except _ResolutionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
 
     from constellation.transcriptome_to_proteome import (
         run_transcriptome_to_proteomics,
     )
-    return run_transcriptome_to_proteomics(args=args)
+    return run_transcriptome_to_proteomics(
+        args=args,
+        reference=reference,
+        swissprot_reference=swissprot_reference,
+    )
+
+
+class _ResolutionError(Exception):
+    """CLI-handler-local exception so the resolvers can raise concise
+    messages that the handler surfaces as ``error: ...`` + exit 2."""
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Spectra-input expansion (--gpf / --injections)
+# ──────────────────────────────────────────────────────────────────────
+
+
+# Format preference table for per-stem deduplication. Lower rank wins.
+# ``.dia`` is preferred over ``.raw`` so Stage 6 picks up an already-
+# preprocessed cache and doesn't re-decode the raw bytes. ``.raw`` is
+# the canonical Thermo lab input. ``.mzML`` is the legacy intermediate
+# (EncyclopeDIA 6.5.15 added native ``.raw`` support so mzML is
+# unlikely going forward). ``.d`` is the Bruker timsTOF directory.
+_SPECTRA_RANK: dict[str, int] = {
+    ".dia": 0,
+    ".raw": 1,
+    ".mzml": 2,
+    ".d": 3,
+}
+
+
+def _is_spectra_path(p: Path) -> bool:
+    """True iff ``p`` is a spectra file or a Bruker ``.d`` directory."""
+    suffix = p.suffix.lower()
+    if suffix not in _SPECTRA_RANK:
+        return False
+    if suffix == ".d":
+        # `.d` is a directory bundle; reject lone files with that suffix.
+        return p.is_dir()
+    return p.is_file()
+
+
+def _collect_spectra_files(paths: Sequence[Path]) -> list[Path]:
+    """Walk every input path (file or directory) and return spectra files.
+
+    Bruker ``.d`` paths are passed through verbatim (they're directory
+    bundles). All other directories are scanned non-recursively for
+    spectra files at the top level — nested scans would silently glob
+    archived runs that the user didn't intend to process.
+    """
+    out: list[Path] = []
+    for p in paths:
+        resolved = Path(p).expanduser().resolve()
+        suffix = resolved.suffix.lower()
+        if suffix == ".d" and resolved.is_dir():
+            # Bruker bundle — pass through.
+            out.append(resolved)
+            continue
+        if resolved.is_dir():
+            for entry in sorted(resolved.iterdir()):
+                if _is_spectra_path(entry):
+                    out.append(entry.resolve())
+            continue
+        if not resolved.exists():
+            raise _ResolutionError(
+                f"input path {resolved} does not exist"
+            )
+        if not _is_spectra_path(resolved):
+            raise _ResolutionError(
+                f"input path {resolved} is not a recognised spectra file "
+                f"(supported: {sorted(_SPECTRA_RANK)})"
+            )
+        out.append(resolved)
+    return out
+
+
+def _expand_spectra_inputs(
+    paths: Sequence[Path], *, flag: str
+) -> list[Path]:
+    """Expand a list of file/directory paths into a deduplicated
+    spectra-file list ready for Stage 6 (process-dia) / Stage 9
+    (per-injection search).
+
+    Per-stem dedup: when ``sample01.raw`` and ``sample01.dia`` are both
+    present, the ``.dia`` cache wins so Stage 6 doesn't redo the raw
+    decode. Dropped entries are logged to stderr so the user can audit
+    the choices.
+
+    Raises :class:`_ResolutionError` (handler-surfaced as ``error: ...``)
+    if no spectra files are found.
+    """
+    candidates = _collect_spectra_files(paths)
+    if not candidates:
+        raise _ResolutionError(
+            f"{flag} matched no spectra files; expected one or more "
+            f"file or directory paths to "
+            f"{sorted(_SPECTRA_RANK)} inputs."
+        )
+
+    # Per-stem dedup. Group by stem; keep the highest-preference
+    # (lowest rank) entry; log every drop so the user sees the picking.
+    by_stem: dict[str, Path] = {}
+    drops: list[tuple[Path, Path]] = []
+    for cand in candidates:
+        stem = cand.stem
+        rank_new = _SPECTRA_RANK[cand.suffix.lower()]
+        existing = by_stem.get(stem)
+        if existing is None:
+            by_stem[stem] = cand
+            continue
+        rank_existing = _SPECTRA_RANK[existing.suffix.lower()]
+        if rank_new < rank_existing:
+            drops.append((existing, cand))
+            by_stem[stem] = cand
+        else:
+            drops.append((cand, existing))
+
+    for dropped, kept in drops:
+        print(
+            f"{flag}: stem {kept.stem!r} appears in both "
+            f"{dropped.suffix} and {kept.suffix}; using {kept.name}, "
+            f"skipping {dropped.name}",
+            file=sys.stderr,
+        )
+
+    return sorted(by_stem.values())
+
+
+def _resolve_reference_from_args(args: argparse.Namespace):
+    """Return a Reference for the primary (genome/proteome+annotation) input."""
+    from constellation.sequencing.reference import Reference
+    from constellation.sequencing.reference.handle import (
+        ReferenceNotInstalledError,
+    )
+
+    handle_explicit: str | None = args.reference
+    handle_from_manifest: str | None = None
+    if args.reference_from is not None:
+        handle_from_manifest = _handle_from_manifest_dir(Path(args.reference_from))
+
+    if handle_explicit is None and handle_from_manifest is None:
+        raise _ResolutionError(
+            "no reference supplied; pass --reference <handle> or "
+            "--reference-from <align-or-cluster-dir>. To use a local "
+            "FASTA/GFF pair, register it first with: constellation "
+            "reference import <dir> --organism <slug>"
+        )
+
+    if (
+        handle_explicit is not None
+        and handle_from_manifest is not None
+        and handle_explicit != handle_from_manifest
+    ):
+        raise _ResolutionError(
+            f"--reference {handle_explicit!r} disagrees with "
+            f"--reference-from manifest handle {handle_from_manifest!r}; "
+            "re-run with one or the other (or update the upstream "
+            "align/cluster run if the organism changed)."
+        )
+
+    handle = handle_explicit or handle_from_manifest
+    try:
+        return Reference.open(handle)
+    except ReferenceNotInstalledError as exc:
+        raise _ResolutionError(str(exc)) from exc
+
+
+def _resolve_swissprot_from_args(args: argparse.Namespace):
+    """Return a Reference for the SwissProt FASTA used by Stage 3 + Stage 4."""
+    from constellation.sequencing.reference import Reference
+    from constellation.sequencing.reference.handle import (
+        ReferenceNotInstalledError,
+    )
+
+    handle = args.swissprot_reference or "swissprot"
+    try:
+        return Reference.open(handle)
+    except ReferenceNotInstalledError as exc:
+        raise _ResolutionError(
+            f"{exc}\nNo SwissProt reference installed. Run:\n"
+            "  constellation reference fetch uniprot:swissprot\n"
+            "or pin a specific release with "
+            "--swissprot-reference swissprot@uniprot-<release>."
+        ) from exc
+
+
+def _handle_from_manifest_dir(manifest_dir: Path) -> str:
+    """Extract a ``reference_handle`` from an upstream align/cluster manifest.
+
+    Demux outputs are rejected — demux is reference-free by design.
+    Escape-hatch align/cluster runs (raw-path inputs, no
+    ``reference_handle`` stamped) are rejected with a hint pointing at
+    explicit ``--reference``.
+    """
+    from constellation.sequencing.transcriptome.manifest import (
+        AlignManifest,
+        ClusterManifest,
+        read_manifest_dir,
+    )
+
+    if not manifest_dir.is_dir():
+        raise _ResolutionError(
+            f"--reference-from {manifest_dir} is not a directory"
+        )
+    try:
+        manifest = read_manifest_dir(manifest_dir)
+    except (FileNotFoundError, ValueError) as exc:
+        raise _ResolutionError(
+            f"--reference-from {manifest_dir} could not be read as a "
+            f"transcriptome manifest dir: {exc}"
+        ) from exc
+    if not isinstance(manifest, (AlignManifest, ClusterManifest)):
+        raise _ResolutionError(
+            f"--reference-from points at a {manifest.kind} directory; "
+            "demux is reference-free by design — point at an align or "
+            "cluster output instead"
+        )
+    if not manifest.reference_handle:
+        raise _ResolutionError(
+            f"--reference-from manifest at {manifest_dir} has no "
+            "reference_handle (escape-hatch upstream run that used raw "
+            "paths); supply --reference explicitly"
+        )
+    return manifest.reference_handle
 
 
 __all__ = ["build_parser"]

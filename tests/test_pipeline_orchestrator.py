@@ -53,12 +53,10 @@ def test_t2p_subcommand_registers() -> None:
 
 
 def test_t2p_required_args() -> None:
-    """The base set of required argparse flags. Note that
-    ``--reference-fasta`` and ``--reference-annotation`` are NOT
-    argparse-level required — when ``--reference-dir`` is supplied
-    they're auto-resolved from the Constellation cache layout. The
-    handler enforces the "at least one of the three" rule
-    post-parse."""
+    """The base set of required argparse flags. ``--reference`` and
+    ``--reference-from`` are NOT argparse-level required — the handler
+    enforces the "exactly one of them" rule post-parse so the
+    actionable error message includes the recommended action."""
     parser = _make_parser()
     t2p = _subparsers_action(parser).choices["transcriptome-to-proteome"]
     required = {
@@ -68,7 +66,7 @@ def test_t2p_required_args() -> None:
         for opt in action.option_strings
     }
     expected = {
-        "--protein-counts",
+        "--demux-dir",
         "--gpf",
         "--injections",
         "--output-dir",
@@ -76,21 +74,18 @@ def test_t2p_required_args() -> None:
     assert expected.issubset(required), (
         f"missing required args: {expected - required}"
     )
-    # --reference-fasta / --reference-annotation / --reference-dir are
-    # all optional at parse-time (handler validates post-parse).
-    # --proteins-fasta is optional — the pipeline derives novel ORF
-    # sequences from --protein-counts (the demux table's `sequence`
-    # column) by default.
+    # --protein-fasta is optional — only needed when overriding the
+    # ORF sequences the orchestrator derives from --demux-dir.
     optional = {
         opt
         for action in t2p._actions
         if not getattr(action, "required", False)
         for opt in action.option_strings
     }
-    assert "--reference-fasta" in optional
-    assert "--reference-annotation" in optional
-    assert "--reference-dir" in optional
-    assert "--proteins-fasta" in optional
+    assert "--reference" in optional
+    assert "--reference-from" in optional
+    assert "--swissprot-reference" in optional
+    assert "--protein-fasta" in optional
 
 
 def test_t2p_ptm_defaults_match_lab_convention() -> None:
@@ -105,9 +100,8 @@ def test_t2p_ptm_defaults_match_lab_convention() -> None:
     # touching the filesystem — every PTM flag defaults to the value
     # we want to verify.
     args = t2p.parse_args([
-        "--protein-counts", "/tmp/x",
-        "--reference-fasta", "/tmp/x",
-        "--reference-annotation", "/tmp/x",
+        "--demux-dir", "/tmp/x",
+        "--reference", "homo_sapiens",
         "--gpf", "/tmp/x",
         "--injections", "/tmp/x",
         "--output-dir", "/tmp/x",
@@ -122,114 +116,272 @@ def test_t2p_ptm_defaults_match_lab_convention() -> None:
     assert args.ptm_tmt == "off"
 
 
-def test_t2p_reference_dir_auto_resolves_fasta_and_annotation(
-    tmp_path: Path, capsys
+def _write_fake_reference(root: Path, organism: str, release_slug: str) -> Path:
+    """Build a minimal portal-layout reference dir for handler tests.
+
+    Creates the directory + a meta.toml v2 with the [contents] block so
+    ``Reference.open()`` resolves it without needing real parquet
+    bundles. Returns the release dir Path.
+    """
+    from constellation.sequencing.reference.handle import Handle, write_meta_toml
+
+    release_dir = root / organism / release_slug
+    (release_dir / "annotation").mkdir(parents=True)
+    (release_dir / "annotation" / "features.parquet").write_text("stub")
+    (release_dir / "annotation" / "manifest.json").write_text("{}")
+    (release_dir / "protein.faa").write_text(">stub\nMAGCKL\n")
+    handle = Handle(
+        organism=organism,
+        source=release_slug.split("-", 1)[0],
+        release=release_slug.split("-", 1)[1],
+    )
+    write_meta_toml(
+        release_dir,
+        handle=handle,
+        assembly_accession=None,
+        assembly_name=None,
+        annotation_release=None,
+        constellation_version="test",
+        urls={},
+        sha256={},
+        source_checksum_verified=False,
+        has_genome=False,  # tests don't need a real genome bundle
+        has_annotation=True,
+        has_proteome=True,
+    )
+    return release_dir
+
+
+def test_t2p_reference_handle_resolves_to_reference_object(
+    tmp_path: Path, monkeypatch
 ) -> None:
-    """When ``--reference-dir`` is supplied, the handler fills in
-    ``--reference-fasta`` and ``--reference-annotation`` from the
-    Constellation reference-cache layout
-    (``<dir>/protein.faa`` + ``<dir>/annotation/``)."""
-    from constellation.cli.transcriptome_to_proteome import (
-        _cmd_transcriptome_to_proteome,
-    )
-
-    # Fake reference cache layout — only the path existence matters
-    # for the handler's resolution step (it doesn't open the files).
-    ref_dir = tmp_path / "homo_sapiens" / "refseq-GCF_000001405.40"
-    (ref_dir / "annotation").mkdir(parents=True)
-    (ref_dir / "protein.faa").write_text(">stub\nMAGCKL\n")
-
-    args = argparse.Namespace(
-        reference_dir=ref_dir,
-        reference_fasta=None,
-        reference_annotation=None,
-    )
-    # Patch the orchestrator entry-point so we observe the resolved
-    # args without running the pipeline.
-    import constellation.cli.transcriptome_to_proteome as cli_mod
-    observed: dict = {}
-
-    def _fake_run(*, args):
-        observed["fasta"] = args.reference_fasta
-        observed["annotation"] = args.reference_annotation
-        return 0
-
-    import constellation.transcriptome_to_proteome as orch_mod
-    orig = orch_mod.run_transcriptome_to_proteomics
-    orch_mod.run_transcriptome_to_proteomics = _fake_run
-    try:
-        rc = _cmd_transcriptome_to_proteome(args)
-    finally:
-        orch_mod.run_transcriptome_to_proteomics = orig
-
-    assert rc == 0
-    assert observed["fasta"] == ref_dir / "protein.faa"
-    assert observed["annotation"] == ref_dir / "annotation"
-
-
-def test_t2p_reference_dir_explicit_flags_override(tmp_path: Path) -> None:
-    """Explicit ``--reference-fasta`` / ``--reference-annotation``
-    flags override the dir-derived defaults — caller can pull the
-    FASTA from the cache but point the annotation somewhere else
-    (e.g. when running against an experimental annotation release)."""
-    from constellation.cli.transcriptome_to_proteome import (
-        _cmd_transcriptome_to_proteome,
-    )
-
-    ref_dir = tmp_path / "cache_release"
-    (ref_dir / "annotation").mkdir(parents=True)
-    (ref_dir / "protein.faa").write_text(">stub\nMAGCKL\n")
-
-    override_fasta = tmp_path / "override.fa"
-    override_fasta.write_text(">override\nKVERPD\n")
-
-    args = argparse.Namespace(
-        reference_dir=ref_dir,
-        reference_fasta=override_fasta,  # explicit, should win
-        reference_annotation=None,        # falls through to dir default
-    )
-
-    import constellation.transcriptome_to_proteome as orch_mod
-    observed: dict = {}
-
-    def _fake_run(*, args):
-        observed["fasta"] = args.reference_fasta
-        observed["annotation"] = args.reference_annotation
-        return 0
-
-    orig = orch_mod.run_transcriptome_to_proteomics
-    orch_mod.run_transcriptome_to_proteomics = _fake_run
-    try:
-        rc = _cmd_transcriptome_to_proteome(args)
-    finally:
-        orch_mod.run_transcriptome_to_proteomics = orig
-
-    assert rc == 0
-    # Explicit override wins for FASTA.
-    assert observed["fasta"] == override_fasta
-    # Default fallback for annotation.
-    assert observed["annotation"] == ref_dir / "annotation"
-
-
-def test_t2p_missing_reference_args_errors(tmp_path: Path, capsys) -> None:
-    """Without --reference-dir AND without both --reference-fasta and
-    --reference-annotation, the handler errors out before invoking the
+    """``--reference <handle>`` opens a ``Reference`` whose
+    ``protein_fasta_path`` + ``annotation_dir`` flow into the
     orchestrator."""
     from constellation.cli.transcriptome_to_proteome import (
+        _resolve_reference_from_args,
+    )
+
+    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    release_dir = _write_fake_reference(tmp_path, "homo_sapiens", "refseq-test")
+
+    args = argparse.Namespace(
+        reference="homo_sapiens@refseq-test",
+        reference_from=None,
+    )
+    ref = _resolve_reference_from_args(args)
+    assert ref.protein_fasta_path == release_dir / "protein.faa"
+    assert ref.annotation_dir == release_dir / "annotation"
+    assert ref.has_proteome
+    assert ref.has_annotation
+
+
+def test_t2p_reference_missing_errors(tmp_path: Path, monkeypatch) -> None:
+    """Neither --reference nor --reference-from supplied → exit 2 with
+    the actionable hint."""
+    from constellation.cli.transcriptome_to_proteome import (
         _cmd_transcriptome_to_proteome,
     )
 
-    args = argparse.Namespace(
-        reference_dir=None,
-        reference_fasta=None,
-        reference_annotation=None,
-    )
+    monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    args = argparse.Namespace(reference=None, reference_from=None)
     rc = _cmd_transcriptome_to_proteome(args)
     assert rc == 2
+
+
+def test_t2p_reference_from_demux_dir_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """--reference-from pointing at a demux dir errors with a clear
+    "demux is reference-free" message."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _resolve_reference_from_args,
+        _ResolutionError,
+    )
+
+    demux_dir = tmp_path / "demux"
+    demux_dir.mkdir()
+    (demux_dir / "manifest.json").write_text(
+        '{"schema_version": 4, "kind": "demux", "output_dir": "."}'
+    )
+
+    args = argparse.Namespace(reference=None, reference_from=demux_dir)
+    with pytest.raises(_ResolutionError, match="demux is reference-free"):
+        _resolve_reference_from_args(args)
+
+
+def test_t2p_reference_and_reference_from_disagreement_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Explicit --reference plus --reference-from with disagreeing
+    handles → ResolutionError."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _resolve_reference_from_args,
+        _ResolutionError,
+    )
+
+    align_dir = tmp_path / "align"
+    align_dir.mkdir()
+    (align_dir / "manifest.json").write_text(
+        '{"schema_version": 4, "kind": "align", "output_dir": ".", '
+        '"input_demux_dir": "x", "input_bam_paths": [], "samples": [], '
+        '"reference_handle": "mus_musculus@refseq-other", '
+        '"reference_path": "/tmp/x", "assembly_accession": null}'
+    )
+
+    args = argparse.Namespace(
+        reference="homo_sapiens@refseq-X",
+        reference_from=align_dir,
+    )
+    with pytest.raises(_ResolutionError, match="disagrees"):
+        _resolve_reference_from_args(args)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Spectra input expansion (--gpf / --injections)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_expand_spectra_passes_files_through(tmp_path: Path) -> None:
+    """Plain file inputs are resolved and returned in sorted order."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+    )
+
+    a = tmp_path / "a.raw"
+    b = tmp_path / "b.raw"
+    a.write_bytes(b"")
+    b.write_bytes(b"")
+
+    result = _expand_spectra_inputs([b, a], flag="--gpf")
+    assert result == [a.resolve(), b.resolve()]
+
+
+def test_expand_spectra_scans_directories(tmp_path: Path) -> None:
+    """A directory is scanned non-recursively for spectra files."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+    )
+
+    d = tmp_path / "runs"
+    d.mkdir()
+    (d / "sample01.raw").write_bytes(b"")
+    (d / "sample02.raw").write_bytes(b"")
+    (d / "notes.txt").write_text("ignored")
+    # Nested directory should NOT be descended into.
+    nested = d / "old_runs"
+    nested.mkdir()
+    (nested / "sample99.raw").write_bytes(b"")
+
+    result = _expand_spectra_inputs([d], flag="--gpf")
+    stems = sorted(p.stem for p in result)
+    assert stems == ["sample01", "sample02"]
+
+
+def test_expand_spectra_mixed_files_and_dirs(tmp_path: Path) -> None:
+    """Mixing dir + explicit file inputs collects both."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+    )
+
+    d = tmp_path / "runs"
+    d.mkdir()
+    (d / "sample01.raw").write_bytes(b"")
+    standalone = tmp_path / "standalone.raw"
+    standalone.write_bytes(b"")
+
+    result = _expand_spectra_inputs([d, standalone], flag="--gpf")
+    stems = sorted(p.stem for p in result)
+    assert stems == ["sample01", "standalone"]
+
+
+def test_expand_spectra_dia_wins_over_raw(
+    tmp_path: Path, capsys
+) -> None:
+    """When the same stem has both .dia and .raw, .dia wins (cache
+    already preprocessed; Stage 6 won't re-convert)."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+    )
+
+    d = tmp_path / "runs"
+    d.mkdir()
+    raw = d / "sample01.raw"
+    dia = d / "sample01.dia"
+    raw.write_bytes(b"")
+    dia.write_bytes(b"")
+
+    result = _expand_spectra_inputs([d], flag="--gpf")
+    assert result == [dia.resolve()]
     err = capsys.readouterr().err
-    assert "--reference-fasta" in err
-    assert "--reference-annotation" in err
-    assert "--reference-dir" in err
+    assert "sample01" in err
+    assert "sample01.raw" in err
+
+
+def test_expand_spectra_raw_wins_over_mzml(tmp_path: Path) -> None:
+    """When the same stem has both .raw and .mzML, .raw wins (canonical
+    Thermo input; mzML is the legacy intermediate)."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+    )
+
+    d = tmp_path / "runs"
+    d.mkdir()
+    raw = d / "sample01.raw"
+    mzml = d / "sample01.mzML"
+    raw.write_bytes(b"")
+    mzml.write_bytes(b"")
+
+    result = _expand_spectra_inputs([d], flag="--gpf")
+    assert result == [raw.resolve()]
+
+
+def test_expand_spectra_accepts_bruker_d_directory(tmp_path: Path) -> None:
+    """A ``.d`` directory bundle is passed through verbatim (not scanned
+    for inner spectra files)."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+    )
+
+    bundle = tmp_path / "sample01.d"
+    bundle.mkdir()
+    (bundle / "analysis.tdf").write_bytes(b"stub")
+
+    result = _expand_spectra_inputs([bundle], flag="--gpf")
+    assert result == [bundle.resolve()]
+
+
+def test_expand_spectra_errors_on_empty_directory(tmp_path: Path) -> None:
+    """A directory with no spectra files raises with the actionable
+    error message the CLI surfaces as exit 2."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+        _ResolutionError,
+    )
+
+    d = tmp_path / "empty"
+    d.mkdir()
+    (d / "notes.txt").write_text("nothing to see")
+
+    with pytest.raises(_ResolutionError, match="matched no spectra files"):
+        _expand_spectra_inputs([d], flag="--gpf")
+
+
+def test_expand_spectra_errors_on_unknown_extension(tmp_path: Path) -> None:
+    """A bare path with an unsupported extension errors out instead of
+    silently passing through."""
+    from constellation.cli.transcriptome_to_proteome import (
+        _expand_spectra_inputs,
+        _ResolutionError,
+    )
+
+    p = tmp_path / "sample01.txt"
+    p.write_text("")
+    with pytest.raises(_ResolutionError, match="not a recognised spectra"):
+        _expand_spectra_inputs([p], flag="--gpf")
 
 
 def test_t2p_collision_filter_default_on() -> None:
@@ -237,10 +389,8 @@ def test_t2p_collision_filter_default_on() -> None:
     parsed = parser.parse_args(
         [
             "transcriptome-to-proteome",
-            "--protein-counts", "/x/c.tsv",
-            "--proteins-fasta", "/x/p.fa",
-            "--reference-fasta", "/x/r.fa",
-            "--reference-annotation", "/x/r.gff3",
+            "--demux-dir", "/x/c",
+            "--reference", "homo_sapiens",
             "--gpf", "/x/g.mzML",
             "--injections", "/x/i.mzML",
             "--output-dir", "/x/out",
@@ -255,10 +405,8 @@ def test_t2p_can_opt_out_collision_filter() -> None:
     parsed = parser.parse_args(
         [
             "transcriptome-to-proteome",
-            "--protein-counts", "/x/c.tsv",
-            "--proteins-fasta", "/x/p.fa",
-            "--reference-fasta", "/x/r.fa",
-            "--reference-annotation", "/x/r.gff3",
+            "--demux-dir", "/x/c",
+            "--reference", "homo_sapiens",
             "--gpf", "/x/g.mzML",
             "--injections", "/x/i.mzML",
             "--output-dir", "/x/out",
@@ -341,29 +489,76 @@ _NOVEL_FASTA = ">N1\nMKCCC\n>N2\nMKDDD\n"
 
 @pytest.fixture
 def stub_inputs(tmp_path) -> dict:
-    """Lay down minimal input fixtures that the orchestrator's
-    helpers can read without throwing."""
-    # Protein counts TSV.
+    """Lay down minimal input fixtures + a portal-layout fake reference
+    cache that the orchestrator's helpers can read without throwing."""
+    from constellation.sequencing.reference import Reference
+    from constellation.sequencing.reference.handle import Handle, write_meta_toml
+
+    # Reference cache root.
+    cache_root = tmp_path / "refs"
+
+    # Reference release dir with a real GFF3 annotation file
+    # (Reference.gene_map() resolves it via _gene_map_from_dir → GFF3
+    # path when no parquet bundle is present).
+    ref_release = cache_root / "test_org" / "refseq-stub"
+    (ref_release / "annotation").mkdir(parents=True)
+    (ref_release / "annotation" / "annotation.gff3").write_text(
+        "##gff-version 3\n"
+        "chr1\tt\tCDS\t1\t10\t.\t+\t0\tID=c1;protein_id=REF_A;gene=GENE_A\n"
+        "chr1\tt\tCDS\t20\t30\t.\t+\t0\tID=c2;protein_id=REF_B;gene=GENE_B\n"
+    )
+    (ref_release / "protein.faa").write_text(_REF_FASTA)
+    write_meta_toml(
+        ref_release,
+        handle=Handle(organism="test_org", source="refseq", release="stub"),
+        assembly_accession=None,
+        assembly_name=None,
+        annotation_release=None,
+        constellation_version="test",
+        urls={},
+        sha256={},
+        source_checksum_verified=False,
+        has_genome=False,
+        has_annotation=True,
+        has_proteome=True,
+    )
+
+    # Fake SwissProt install in the same cache.
+    sp_release = cache_root / "swissprot" / "uniprot-2026_02"
+    sp_release.mkdir(parents=True)
+    (sp_release / "protein.faa").write_text(">SP_X\nMKAAA\n")
+    write_meta_toml(
+        sp_release,
+        handle=Handle(organism="swissprot", source="uniprot", release="2026_02"),
+        assembly_accession=None,
+        assembly_name=None,
+        annotation_release=None,
+        constellation_version="test",
+        urls={},
+        sha256={},
+        source_checksum_verified=False,
+        has_genome=False,
+        has_annotation=False,
+        has_proteome=True,
+    )
+
+    reference = Reference.open("test_org@refseq-stub", root=cache_root)
+    swissprot_reference = Reference.open(
+        "swissprot@uniprot-2026_02", root=cache_root
+    )
+
+    # Protein counts TSV (still the orchestrator's --demux-dir input).
     counts = tmp_path / "protein_counts.tsv"
     counts.write_text(
         "\tProtein\tqJS001\tSequence\n"
         "0\tN1\t10.0\t" + "M" * 120 + "\n"
         "1\tN2\t5.0\t" + "K" * 120 + "\n"
     )
-    # Proteins FASTA.
+    # ORF FASTA override (the --protein-fasta input).
     proteins = tmp_path / "proteins.fasta"
     proteins.write_text(
         ">N1 source=demux\n" + "M" * 120 + "\n"
         ">N2 source=demux\n" + "K" * 120 + "\n"
-    )
-    # Reference FASTA + annotation.
-    ref = tmp_path / "reference.fasta"
-    ref.write_text(_REF_FASTA)
-    ann = tmp_path / "reference.gff3"
-    ann.write_text(
-        "##gff-version 3\n"
-        "chr1\tt\tCDS\t1\t10\t.\t+\t0\tID=c1;protein_id=REF_A;gene=GENE_A\n"
-        "chr1\tt\tCDS\t20\t30\t.\t+\t0\tID=c2;protein_id=REF_B;gene=GENE_B\n"
     )
     # GPF + injection paths can be empty (mocked at the runner layer).
     gpf = tmp_path / "gpf.mzML"
@@ -376,10 +571,10 @@ def stub_inputs(tmp_path) -> dict:
     (tmp_path / "sample01.mzML.encyclopedia.txt").write_text("stub-perc")
     out = tmp_path / "out"
     return {
-        "protein_counts": counts,
-        "proteins_fasta": proteins,
-        "reference_fasta": ref,
-        "reference_annotation": ann,
+        "demux_dir": counts,
+        "protein_fasta": proteins,
+        "reference": reference,
+        "swissprot_reference": swissprot_reference,
         "gpf": [gpf],
         "injections": [inj],
         "output_dir": out,
@@ -390,16 +585,16 @@ def _build_args(stub: dict, **overrides) -> argparse.Namespace:
     """Build the namespace the orchestrator expects.
 
     Mirrors the CLI parser defaults — kept in sync by parsing through
-    argparse and overriding by attribute.
+    argparse and overriding by attribute. Does NOT carry the resolved
+    Reference objects; the orchestrator takes those as separate kwargs.
     """
     parser = _make_parser()
     parsed = parser.parse_args(
         [
             "transcriptome-to-proteome",
-            "--protein-counts", str(stub["protein_counts"]),
-            "--proteins-fasta", str(stub["proteins_fasta"]),
-            "--reference-fasta", str(stub["reference_fasta"]),
-            "--reference-annotation", str(stub["reference_annotation"]),
+            "--demux-dir", str(stub["demux_dir"]),
+            "--protein-fasta", str(stub["protein_fasta"]),
+            "--reference", str(stub["reference"].handle),
             "--gpf", *[str(p) for p in stub["gpf"]],
             "--injections", *[str(p) for p in stub["injections"]],
             "--output-dir", str(stub["output_dir"]),
@@ -417,16 +612,6 @@ def stub_external_calls(monkeypatch, tmp_path) -> dict:
     can read to assert call ordering / arguments.
     """
     state = {"calls": []}
-
-    def _fake_fetch_swissprot(*, release=None, **_):
-        class _SH:
-            fasta_path = tmp_path / "stub_sprot.fasta"
-            release = "2026_02"
-            sha256 = "stub"
-            source_url = "stub"
-        (tmp_path / "stub_sprot.fasta").write_text(">SP_X\nMKAAA\n")
-        state["calls"].append(("fetch_swissprot", release))
-        return _SH()
 
     def _fake_run_mmseqs_search(*, output_tab, **kw):
         # Emit a synthetic .tab that classify_novel_peptides can read.
@@ -567,9 +752,6 @@ def stub_external_calls(monkeypatch, tmp_path) -> dict:
 
     import constellation.transcriptome_to_proteome as t2p
 
-    monkeypatch.setattr(
-        "constellation.catalog.uniprot.fetch_swissprot", _fake_fetch_swissprot
-    )
     monkeypatch.setattr("constellation.thirdparty.registry.find", _fake_find)
     # The orchestrator imports these lazily inside the function — patch
     # at the *origin* modules so the lookup picks up the stubs.
@@ -608,7 +790,7 @@ def test_orchestrator_end_to_end_mocked(
     )
 
     args = _build_args(stub_inputs)
-    rc = run_transcriptome_to_proteomics(args=args)
+    rc = run_transcriptome_to_proteomics(args=args, reference=stub_inputs["reference"], swissprot_reference=stub_inputs["swissprot_reference"])
     assert rc == 0
     out = stub_inputs["output_dir"]
     # Per-stage _SUCCESS markers.
@@ -672,7 +854,7 @@ def test_orchestrator_tpm_cutoff_in_filenames(
     )
 
     args = _build_args(stub_inputs)
-    rc = run_transcriptome_to_proteomics(args=args)
+    rc = run_transcriptome_to_proteomics(args=args, reference=stub_inputs["reference"], swissprot_reference=stub_inputs["swissprot_reference"])
     assert rc == 0
     out = stub_inputs["output_dir"]
 
@@ -697,7 +879,7 @@ def test_orchestrator_tpm_cutoff_fractional_filename(
     )
 
     args = _build_args(stub_inputs, min_avg_tpm=0.5)
-    rc = run_transcriptome_to_proteomics(args=args)
+    rc = run_transcriptome_to_proteomics(args=args, reference=stub_inputs["reference"], swissprot_reference=stub_inputs["swissprot_reference"])
     assert rc == 0
     out = stub_inputs["output_dir"]
     assert (out / "04_combined_fasta" / "combined_0_5TPM.fasta").is_file()
@@ -716,7 +898,7 @@ def test_orchestrator_threads_fasta_to_every_search(
     )
 
     args = _build_args(stub_inputs)
-    rc = run_transcriptome_to_proteomics(args=args)
+    rc = run_transcriptome_to_proteomics(args=args, reference=stub_inputs["reference"], swissprot_reference=stub_inputs["swissprot_reference"])
     assert rc == 0
     combined_fasta = (
         stub_inputs["output_dir"] / "04_combined_fasta" / "combined_1TPM.fasta"
@@ -740,7 +922,7 @@ def test_orchestrator_threads_fasta_to_library_export(
     )
 
     args = _build_args(stub_inputs)
-    assert run_transcriptome_to_proteomics(args=args) == 0
+    assert run_transcriptome_to_proteomics(args=args, reference=stub_inputs["reference"], swissprot_reference=stub_inputs["swissprot_reference"]) == 0
     combined_fasta = (
         stub_inputs["output_dir"] / "04_combined_fasta" / "combined_1TPM.fasta"
     )
@@ -769,7 +951,7 @@ def test_orchestrator_resume_short_circuit(
     )
 
     args = _build_args(stub_inputs)
-    rc = run_transcriptome_to_proteomics(args=args)
+    rc = run_transcriptome_to_proteomics(args=args, reference=stub_inputs["reference"], swissprot_reference=stub_inputs["swissprot_reference"])
     assert rc == 0
     first_calls = list(stub_external_calls["calls"])
     assert first_calls, "first run made some external calls"
@@ -777,7 +959,7 @@ def test_orchestrator_resume_short_circuit(
     # Reset call tracking; re-run with --resume.
     stub_external_calls["calls"].clear()
     args2 = _build_args(stub_inputs, resume=True)
-    rc = run_transcriptome_to_proteomics(args=args2)
+    rc = run_transcriptome_to_proteomics(args=args2, reference=stub_inputs["reference"], swissprot_reference=stub_inputs["swissprot_reference"])
     assert rc == 0
     # Top-level _SUCCESS short-circuits before any per-stage call.
     assert stub_external_calls["calls"] == []
@@ -795,7 +977,7 @@ def test_orchestrator_stage7_resumes_from_existing_elib(
     )
 
     args = _build_args(stub_inputs)
-    assert run_transcriptome_to_proteomics(args=args) == 0
+    assert run_transcriptome_to_proteomics(args=args, reference=stub_inputs["reference"], swissprot_reference=stub_inputs["swissprot_reference"]) == 0
 
     stage7 = stub_inputs["output_dir"] / "07_gpf_search"
     assert (stage7 / "combined_1TPM.filtered.elib").is_file()
@@ -807,7 +989,7 @@ def test_orchestrator_stage7_resumes_from_existing_elib(
 
     stub_external_calls["calls"].clear()
     args2 = _build_args(stub_inputs, resume=True)
-    assert run_transcriptome_to_proteomics(args=args2) == 0
+    assert run_transcriptome_to_proteomics(args=args2, reference=stub_inputs["reference"], swissprot_reference=stub_inputs["swissprot_reference"]) == 0
 
     # No search re-run (neither the GPF search nor any injection search).
     assert not any(
@@ -827,7 +1009,7 @@ def test_orchestrator_collision_filter_default_runs(
     )
 
     args = _build_args(stub_inputs)
-    rc = run_transcriptome_to_proteomics(args=args)
+    rc = run_transcriptome_to_proteomics(args=args, reference=stub_inputs["reference"], swissprot_reference=stub_inputs["swissprot_reference"])
     assert rc == 0
     stage7 = stub_inputs["output_dir"] / "07_gpf_search"
     assert (stage7 / "collision_metadata.json").is_file()
@@ -846,7 +1028,7 @@ def test_orchestrator_no_collision_filter_skips_raw(
     )
 
     args = _build_args(stub_inputs, no_collision_filter=True)
-    rc = run_transcriptome_to_proteomics(args=args)
+    rc = run_transcriptome_to_proteomics(args=args, reference=stub_inputs["reference"], swissprot_reference=stub_inputs["swissprot_reference"])
     assert rc == 0
     stage7 = stub_inputs["output_dir"] / "07_gpf_search"
     assert not (stage7 / "collision_metadata.json").is_file()
@@ -879,7 +1061,7 @@ def test_orchestrator_preflight_rejects_old_encyclopedia(
     monkeypatch.setattr("constellation.thirdparty.registry.find", _old_find)
 
     args = _build_args(stub_inputs)
-    rc = run_transcriptome_to_proteomics(args=args)
+    rc = run_transcriptome_to_proteomics(args=args, reference=stub_inputs["reference"], swissprot_reference=stub_inputs["swissprot_reference"])
     assert rc == 1
     err = capsys.readouterr().err
     assert "2.12.30" in err and "6.5.15" in err

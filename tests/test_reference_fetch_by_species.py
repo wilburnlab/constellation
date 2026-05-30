@@ -111,11 +111,18 @@ def test_resolve_red_abalone_routes_through_refseq(catalogs_installed):
     assert spec.scientific_name == "Haliotis rufescens"
 
 
-def test_resolve_uniprot_explicit_source_rejected_for_fetch(catalogs_installed):
-    """UniProt rows are catalogued but ``reference fetch`` doesn't materialise
-    them in this PR — the route raises ValueError pointing at PR-C."""
-    with pytest.raises(ValueError, match="UniProt"):
-        _resolve_species_query("human", source="uniprot", release=None)
+def test_resolve_uniprot_explicit_source_routes_to_proteome_only(catalogs_installed):
+    """UniProt rows resolve to proteome-only specs: empty fasta_url + gff_url,
+    populated protein_url. The proteome-only dispatch in ``fetch_reference``
+    keys off this shape."""
+    spec = _resolve_species_query("human", source="uniprot", release=None)
+    assert spec.handle.source == "uniprot"
+    assert spec.handle.organism == "homo_sapiens"
+    assert spec.fasta_url == ""
+    assert spec.gff_url == ""
+    assert spec.protein_url  # populated
+    assert spec.cdna_url is None
+    assert spec.annotation_release is None
 
 
 def test_resolve_unknown_species_raises(catalogs_installed):
