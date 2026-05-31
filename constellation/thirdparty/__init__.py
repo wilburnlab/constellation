@@ -32,6 +32,7 @@ from constellation.thirdparty import (  # noqa: F401  (import-for-side-effect)
     mmseqs2,
     ragtag,
     samtools,
+    thermo,
 )
 
 __all__ = ["ToolHandle", "ToolNotFoundError", "find", "register"]
