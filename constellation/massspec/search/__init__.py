@@ -8,16 +8,20 @@ acquisition's spectra and produces a ``Search`` record carrying scores
 peptides and proteins it identified.
 
 This release ships peptide-level and protein-level score tables — the
-shape encyclopedia ``.dlib``/``.elib`` files aggregate to. PSM-level
-(one row per spectrum) is held until a real PSM-emitting reader
-(mzIdentML, Counter port) drives the schema design; manufacturing PSMs
-from peptide-level encyclopedia scores would invent data.
+shape encyclopedia ``.dlib``/``.elib`` files aggregate to — plus a
+per-spectrum ``PSM_TABLE``, populated by readers whose source genuinely
+emits per-spectrum matches (MaxQuant ``msms.txt`` via
+``massspec.io.maxquant`` is the first driver). Aggregating-only formats
+leave ``Search.psms`` empty rather than manufacture PSM rows.
 
 Modules:
 
-    schemas  -- PEPTIDE_SCORE_TABLE, PROTEIN_SCORE_TABLE, NOVEL_PEPTIDE_TABLE
+    schemas  -- PEPTIDE_SCORE_TABLE, PROTEIN_SCORE_TABLE, PSM_TABLE,
+                NOVEL_PEPTIDE_TABLE
     search   -- Search container (mirrors Library / Quant)
     io       -- Reader/Writer Protocols + ParquetDirReader/Writer
+    crosscheck -- cross_validate_against_scan_metadata (PSM analyzer /
+                fragmentation vs converted scan_metadata)
     novel    -- classify_novel_peptides + classify_single_peptide
                 (CIGAR-walking classifier; port of cartographer's
                  nanopore.classify_novel_peptides)
@@ -31,6 +35,9 @@ from constellation.massspec.search import schemas as schemas  # noqa: F401  (reg
 from constellation.massspec.search.collision import (
     apply_collision_filter,
     filter_elib_by_losers,
+)
+from constellation.massspec.search.crosscheck import (
+    cross_validate_against_scan_metadata,
 )
 from constellation.massspec.search.io import save_search
 from constellation.massspec.search.novel import (
@@ -49,6 +56,7 @@ __all__ = [
     "_CLASSIFICATION_PRIORITY",
     "apply_collision_filter",
     "assemble_search",
+    "cross_validate_against_scan_metadata",
     "build_gene_map_from_fasta_headers",
     "classify_novel_peptides",
     "classify_single_peptide",

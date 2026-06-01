@@ -9,12 +9,15 @@ given acquisition. Constellation models that with two Arrow tables:
 
     PEPTIDE_SCORE_TABLE   one row per (peptide, acquisition, engine)
     PROTEIN_SCORE_TABLE   one row per (protein, acquisition, engine)
+    PSM_TABLE             one row per peptide-spectrum match
 
-PSM-level (one row per spectrum) is **deliberately deferred** — the
-encyclopedia file format aggregates at the peptide/protein level, not
-per spectrum, so manufacturing PSM rows from it would invent data.
-``PSM_TABLE`` lands when an actual PSM-emitting reader (mzIdentML,
-the Counter port) drives the schema design.
+PSM-level scores (one row per spectrum) live in ``PSM_TABLE``. It is
+populated by readers whose source genuinely emits per-spectrum matches —
+MaxQuant ``msms.txt`` (via ``massspec.io.maxquant``) is the first such
+driver. Aggregating-only formats — e.g. the encyclopedia file format,
+which records peptide/protein-level scores rather than per-spectrum
+matches — leave ``Search.psms`` empty rather than manufacture PSM rows
+that would invent data.
 
 ``acquisition_id`` is nullable to support run-agnostic scores
 (e.g. inference-time peptide priors that don't tie to a specific
@@ -54,6 +57,78 @@ PROTEIN_SCORE_TABLE: pa.Schema = pa.schema(
         pa.field("engine", pa.string(), nullable=False),
     ],
     metadata={b"schema_name": b"ProteinScoreTable"},
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Per-spectrum matches (PSMs)
+# ──────────────────────────────────────────────────────────────────────
+
+
+# One row per peptide-spectrum match, as emitted by a search engine that
+# reports per-spectrum results (MaxQuant ``msms.txt`` is the first
+# driver). The primary key is ``(raw_file, psm_id)``: ``psm_id`` is the
+# engine's per-export row id (MaxQuant's ``id`` is contiguous 0..N-1
+# *within one export*, so it collides across the one-export-per-run
+# merges), and ``(raw_file, scan)`` is NOT unique because a single MS/MS
+# scan can yield more than one match (MaxQuant ``Type=MULTI-SECPEP``).
+#
+# The table is built to enable **scan-level join-back** to a converted
+# acquisition bundle: ``(raw_file, scan)`` joins ``SCAN_METADATA_TABLE``
+# (same int32 ``scan``), and the ``mass_analyzer`` / ``fragmentation``
+# columns cross-validate ``SCAN_METADATA_TABLE.analyzer`` /
+# ``activation_type``.
+#
+# NOTE on ``peptide_id``: this is the *engine's internal* peptide index
+# (e.g. MaxQuant's ``Peptide ID`` joining its own ``peptides.txt``). It
+# is NOT a Constellation ``Library.peptides.peptide_id`` and must NEVER
+# be fed into ``Search.validate_against(library)`` as a library FK.
+PSM_TABLE: pa.Schema = pa.schema(
+    [
+        # identity / acquisition join-back
+        pa.field("psm_id", pa.int64(), nullable=False),
+        pa.field("raw_file", pa.string(), nullable=False),
+        # nullable pre-link: resolved against the Acquisitions table.
+        pa.field("acquisition_id", pa.int64(), nullable=True),
+        pa.field("scan", pa.int32(), nullable=False),
+        pa.field("precursor_scan", pa.int32(), nullable=True),
+        # peptide identity
+        pa.field("sequence", pa.string(), nullable=False),
+        # ProForma 2.0 (incl. any reconstructed fixed mods); null when the
+        # source modseq couldn't be resolved.
+        pa.field("modified_sequence", pa.string(), nullable=True),
+        # engine-internal peptide index — see NOTE above (NOT a library FK).
+        pa.field("peptide_id", pa.int64(), nullable=True),
+        pa.field("mod_peptide_id", pa.int64(), nullable=True),
+        pa.field("evidence_id", pa.int64(), nullable=True),
+        # ";"-delimited protein accessions, verbatim from the source.
+        pa.field("proteins", pa.string(), nullable=True),
+        pa.field("charge", pa.int8(), nullable=False),
+        # measured vs theoretical
+        pa.field("mz", pa.float64(), nullable=True),
+        pa.field("mass", pa.float64(), nullable=True),
+        pa.field("mass_error_ppm", pa.float64(), nullable=True),
+        # SECONDS (normalized from MaxQuant's minutes) to match
+        # SCAN_METADATA_TABLE.rt / MS_PEAK_TABLE.rt.
+        pa.field("retention_time_s", pa.float64(), nullable=True),
+        # acquisition context (cross-check vs SCAN_METADATA_TABLE)
+        # stored verbatim: fragmentation is UPPER (HCD/CID/ETD), whereas
+        # SCAN_METADATA_TABLE.activation_type is lowercase.
+        pa.field("fragmentation", pa.string(), nullable=True),
+        pa.field("mass_analyzer", pa.string(), nullable=True),
+        pa.field("psm_type", pa.string(), nullable=True),
+        # scores / confidence
+        pa.field("score", pa.float64(), nullable=True),
+        pa.field("delta_score", pa.float64(), nullable=True),
+        pa.field("pep", pa.float64(), nullable=True),  # posterior error probability
+        pa.field("is_decoy", pa.bool_(), nullable=False),
+        # derived: any "CON__" accession in ``proteins`` (MaxQuant's
+        # contaminant convention; there is no dedicated msms.txt column).
+        pa.field("is_contaminant", pa.bool_(), nullable=False),
+        # engine name: "maxquant", ... (matches PEPTIDE_SCORE_TABLE.engine).
+        pa.field("engine", pa.string(), nullable=False),
+    ],
+    metadata={b"schema_name": b"PsmTable", b"schema_version": b"1"},
 )
 
 
@@ -143,6 +218,7 @@ NOVEL_PEPTIDE_TABLE: pa.Schema = pa.schema(
 
 register_schema("PeptideScoreTable", PEPTIDE_SCORE_TABLE)
 register_schema("ProteinScoreTable", PROTEIN_SCORE_TABLE)
+register_schema("PsmTable", PSM_TABLE)
 register_schema("NovelPeptideTable", NOVEL_PEPTIDE_TABLE)
 
 
@@ -150,4 +226,5 @@ __all__ = [
     "NOVEL_PEPTIDE_TABLE",
     "PEPTIDE_SCORE_TABLE",
     "PROTEIN_SCORE_TABLE",
+    "PSM_TABLE",
 ]

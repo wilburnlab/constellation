@@ -1,17 +1,23 @@
 """``Search`` container — peptide-level and protein-level detection scores.
 
-Holds two Arrow tables (``peptide_scores``, ``protein_scores``) plus an
-``Acquisitions`` table for run provenance. References a ``Library`` by
-``library_id`` metadata so downstream tooling can reach the peptide /
-protein identities the score rows refer to.
+Holds the peptide/protein score tables (``peptide_scores``,
+``protein_scores``) and an optional per-spectrum match table (``psms``,
+default empty) plus an ``Acquisitions`` table for run provenance.
+References a ``Library`` by ``library_id`` metadata so downstream tooling
+can reach the peptide / protein identities the score rows refer to.
 
 Validation:
-    PK uniqueness on ``(entity_id, acquisition_id, engine)`` — one
-        score row per entity per run per engine.
+    PK uniqueness on ``(entity_id, acquisition_id, engine)`` for the
+        score tables — one score row per entity per run per engine.
+    PK uniqueness on ``(raw_file, psm_id)`` for ``psms`` — a single
+        MS/MS scan may yield more than one match, so ``(raw_file, scan)``
+        is not a key.
     FK closure for ``acquisition_id`` values into the held
-        ``Acquisitions`` (when non-null).
+        ``Acquisitions`` (when non-null) — applies to all three tables.
     FK closure for entity ids into a provided ``Library`` (optional —
-        callers do this when they have the library at hand).
+        callers do this when they have the library at hand). Does NOT
+        cover ``psms.peptide_id``, which is an engine-internal index,
+        not a library FK.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from constellation.massspec.library.library import Library
 from constellation.massspec.search.schemas import (
     PEPTIDE_SCORE_TABLE,
     PROTEIN_SCORE_TABLE,
+    PSM_TABLE,
 )
 
 
@@ -40,6 +47,10 @@ class Search:
     peptide_scores: pa.Table
     protein_scores: pa.Table
     metadata_extras: dict[str, Any] = field(default_factory=dict)
+    # Appended last so the existing positional signature
+    # ``Search(acquisitions, peptide_scores, protein_scores, metadata_extras)``
+    # is unchanged. Default empty: aggregating-only readers leave it be.
+    psms: pa.Table = field(default_factory=PSM_TABLE.empty_table)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -52,6 +63,7 @@ class Search:
             "protein_scores",
             cast_to_schema(self.protein_scores, PROTEIN_SCORE_TABLE),
         )
+        object.__setattr__(self, "psms", cast_to_schema(self.psms, PSM_TABLE))
         self.validate()
 
     @classmethod
@@ -60,6 +72,7 @@ class Search:
             acquisitions=acquisitions or Acquisitions.empty(),
             peptide_scores=PEPTIDE_SCORE_TABLE.empty_table(),
             protein_scores=PROTEIN_SCORE_TABLE.empty_table(),
+            psms=PSM_TABLE.empty_table(),
         )
 
     # ── intra-Search validation ─────────────────────────────────────
@@ -67,11 +80,13 @@ class Search:
         for table, name in (
             (self.peptide_scores, "peptide_scores"),
             (self.protein_scores, "protein_scores"),
+            (self.psms, "psms"),
         ):
-            # acquisition_id is nullable for run-agnostic scores.
+            # acquisition_id is nullable for run-agnostic / pre-link rows.
             validate_acquisitions(table, self.acquisitions, nullable=True)
         _check_no_duplicates(self.peptide_scores, "peptide_scores", "peptide_id")
         _check_no_duplicates(self.protein_scores, "protein_scores", "protein_id")
+        _check_no_psm_duplicates(self.psms)
 
     # ── cross-validation against a Library ──────────────────────────
     def validate_against(self, library: Library) -> None:
@@ -126,6 +141,34 @@ def _check_no_duplicates(table: pa.Table, name: str, entity_col: str) -> None:
         )
 
 
+def _check_no_psm_duplicates(table: pa.Table) -> None:
+    """PK uniqueness on ``(raw_file, psm_id)`` for the ``psms`` table.
+
+    A single MS/MS scan can produce more than one match (e.g. MaxQuant
+    ``Type=MULTI-SECPEP``), so ``(raw_file, scan)`` is NOT a key; the
+    engine's per-export row id paired with ``raw_file`` is.
+    """
+    pairs = list(
+        zip(
+            table.column("raw_file").to_pylist(),
+            table.column("psm_id").to_pylist(),
+            strict=True,
+        )
+    )
+    if len(set(pairs)) != len(pairs):
+        seen: set[tuple[Any, ...]] = set()
+        dups: list[tuple[Any, ...]] = []
+        for p in pairs:
+            if p in seen:
+                dups.append(p)
+            else:
+                seen.add(p)
+        raise ValueError(
+            f"psms has duplicate (raw_file, psm_id) pairs: "
+            f"{dups[:5]}{'...' if len(dups) > 5 else ''}"
+        )
+
+
 def _check_fk_in(
     table: pa.Table,
     column: str,
@@ -147,6 +190,7 @@ def assemble_search(
     acquisitions: Acquisitions,
     peptide_scores: Iterable[dict[str, Any]] = (),
     protein_scores: Iterable[dict[str, Any]] = (),
+    psms: Iterable[dict[str, Any]] = (),
     metadata: dict[str, Any] | None = None,
 ) -> Search:
     """Build a ``Search`` from record lists. Convenience for tests / readers."""
@@ -161,6 +205,7 @@ def assemble_search(
         acquisitions=acquisitions,
         peptide_scores=_table(peptide_scores, PEPTIDE_SCORE_TABLE),
         protein_scores=_table(protein_scores, PROTEIN_SCORE_TABLE),
+        psms=_table(psms, PSM_TABLE),
         metadata_extras=dict(metadata or {}),
     )
 
