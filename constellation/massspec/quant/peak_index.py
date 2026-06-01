@@ -23,9 +23,13 @@ Precision is a per-axis, function-driven knob. By default the index is a
 lossless f64 mirror; ``downcast`` (a subset of ``{"mz", "rt",
 "intensity"}``) casts the listed axes to f32 after the sort
 (``isolation_lower`` / ``isolation_upper`` follow ``mz``). Because the
-canonical MS_PEAK_TABLE stays f64, any downcast is recoverable. The
-realized per-axis dtypes are recorded in the manifest's
-``x.massspec.precision``.
+canonical MS_PEAK_TABLE stays f64, downcast *values* are recoverable (the
+extractor's ``exact_error`` path re-derives f64 m/z error from the canonical
+table for matched rows). One caveat: downcasting ``mz`` can shift a peak
+across the match-tolerance edge (~0.06 ppm), changing row *presence* — that is
+NOT recoverable by ``exact_error``, so keep ``mz`` at f64 (the default) when
+exact scan-major parity matters. The realized per-axis dtypes are recorded in
+the manifest's ``x.massspec.precision``.
 
 The build reads the projected (all-numeric) peak columns once and does a
 single global ``sort_by`` — no string columns enter the sort, so the
@@ -105,6 +109,11 @@ class PeakIndexManifest:
     # bounds stay as columns for exact query-time gating). Keyed by level
     # (str, JSON-friendly).
     window_scheme: dict[str, str]
+    # Per-binned-level maximum real isolation half-width (m/z), keyed by level
+    # (str). The query layer sizes its bin-neighbor search from this so a wide
+    # window covering a precursor several bins from its own center is never
+    # pruned. Empty when no level is binned.
+    dda_max_halfwidth_mz: dict[str, float]
     # One entry per emitted partition: level, isolation_window_id, the
     # window bounds (the real window for "native"; the synthetic bin range
     # for "binned"; null for MS1), n_rows.
@@ -234,13 +243,24 @@ def _assign_window_ids(
     is_binned = np.isin(levels.astype(np.int64), binned_levels)
     window_id = np.where(is_binned, binned, combo).astype(np.int32)
 
+    # Per-binned-level max real isolation half-width — the query layer needs
+    # it to size the bin-neighbor search so a wide window (whose narrow bounds
+    # cover a precursor several bins away) is never pruned away.
+    halfwidth = (hi - lo) / 2.0  # NaN where bounds null (MS1)
+    levels_i = levels.astype(np.int64)
+    max_halfwidth: dict[int, float] = {}
+    for lvl in binned_levels:
+        hw = halfwidth[levels_i == lvl]
+        hw = hw[~np.isnan(hw)]
+        max_halfwidth[int(lvl)] = float(hw.max()) if hw.size else 0.0
+
     drop = ["lo_f", "hi_f", "combo_id"]
     if _BIN_COLUMN in joined.column_names:
         drop.append(_BIN_COLUMN)
     out = joined.drop_columns(drop).append_column(
         "isolation_window_id", pa.array(window_id, pa.int32())
     )
-    return out, scheme
+    return out, scheme, max_halfwidth
 
 
 def _partition_boundaries(
@@ -321,13 +341,14 @@ def build_peak_index(
             parameters=parameters,
             precision=_precision_dict(downcast_set),
             window_scheme={},
+            dda_max_halfwidth_mz={},
             partitions=[],
             n_windows=0,
         )
         _write_manifest(index_root, manifest)
         return manifest
 
-    keyed, scheme = _assign_window_ids(
+    keyed, scheme, max_halfwidth = _assign_window_ids(
         peaks, max_isolation_windows, dda_window_width_mz
     )
     ordered = keyed.sort_by(
@@ -390,6 +411,7 @@ def build_peak_index(
         parameters=parameters,
         precision=_precision_dict(downcast_set),
         window_scheme={str(lvl): s for lvl, s in scheme.items()},
+        dda_max_halfwidth_mz={str(lvl): hw for lvl, hw in max_halfwidth.items()},
         partitions=partitions,
         n_windows=len(partitions),
     )

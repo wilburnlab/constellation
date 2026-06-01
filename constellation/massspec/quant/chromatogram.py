@@ -16,7 +16,13 @@ same target contract / output schema:
   independent → the path that scales to proteome / search query counts.
   Over an f32-m/z index the reported mass error is f32 unless
   ``exact_error=True`` re-derives it from the canonical table for matched
-  survivors.
+  survivors. NOTE the f32-m/z store also affects row *presence*: a peak
+  sitting within ~0.06 ppm of the tolerance edge can round across it, so an
+  f32-m/z index can match a hair more or fewer peaks than f64 Mode A.
+  ``exact_error`` re-derives values for matched rows, not presence, so it does
+  NOT recover such a boundary miss. Keep ``mz`` at f64 (the default) when exact
+  Mode A parity matters; f32-m/z is an opt-in for ML / size where sub-ppm exact
+  matching is not required.
 
 Both consume the normalized ``XIC_TARGET_TABLE`` (see
 ``massspec.quant.targets``) and emit ``XIC_TRACE_TABLE`` (the deliberate
@@ -42,6 +48,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -655,8 +662,21 @@ def _emit_all_scan_major(
 def _select_partitions(
     manifest, level: int, precursor_mz: float | None, dda_width: float
 ):
-    """Partition dirs (level, wid) whose window could cover the precursor."""
+    """Partition dirs (level, wid) whose window could cover the precursor.
+
+    For binned (DDA) levels the bin id is ``floor(bin_value / dda_width)``
+    where ``bin_value`` is the scan's own precursor m/z (or its window center
+    when absent). A covering scan's narrow window can straddle the target
+    precursor from several bins away, so the neighbor span must cover the
+    worst-case bin distance: the scan's ``bin_value`` and the target precursor
+    both lie inside that scan's window (≤ ``2 * max_halfwidth`` apart), so
+    ``span = ceil(2 * max_halfwidth / dda_width) + 1`` (the +1 absorbs the
+    floor boundary) guarantees every scan Mode A would gate in is loaded. The
+    per-row ``_scan_gate`` then filters on the real bounds, so over-selecting
+    bins only costs I/O, never correctness.
+    """
     chosen = []
+    binned_span = _binned_span(manifest, level, dda_width)
     for p in manifest.partitions:
         if p["level"] != level:
             continue
@@ -666,13 +686,22 @@ def _select_partitions(
         scheme = manifest.window_scheme.get(str(level), "native")
         if scheme == "binned":
             target_bin = int(precursor_mz // dda_width)
-            if abs(p["isolation_window_id"] - target_bin) <= 1:  # bin + neighbors
+            if abs(p["isolation_window_id"] - target_bin) <= binned_span:
                 chosen.append((p["level"], p["isolation_window_id"]))
         else:
             lo, hi = p["isolation_lower"], p["isolation_upper"]
             if lo is None or hi is None or (lo <= precursor_mz <= hi):
                 chosen.append((p["level"], p["isolation_window_id"]))
     return chosen
+
+
+def _binned_span(manifest, level: int, dda_width: float) -> int:
+    """Bin-neighbor radius for a binned level (see :func:`_select_partitions`)."""
+    halfwidths = getattr(manifest, "dda_max_halfwidth_mz", {}) or {}
+    max_hw = float(halfwidths.get(str(level), 0.0))
+    if max_hw <= 0.0 or dda_width <= 0.0:
+        return 1
+    return int(math.ceil(2.0 * max_hw / dda_width)) + 1
 
 
 def extract_xic_indexed(
@@ -699,6 +728,11 @@ def extract_xic_indexed(
     """Mode B mass-index XIC extraction. See module docstring."""
     index_root = Path(index_root)
     manifest = read_index_manifest(index_root)
+    if exact_error and _index_mz_is_f32(manifest) and peaks_dir is None:
+        raise ValueError(
+            "exact_error=True needs peaks_dir to re-derive f64 m/z error from the "
+            "canonical peak table on an f32-downcast index"
+        )
     dda_width = float(manifest.parameters.get("dda_window_width_mz", 10.0))
     records = _targets_to_records(targets)
     builder = _TraceBuilder()
