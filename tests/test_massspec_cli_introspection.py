@@ -41,7 +41,11 @@ def test_all_four_subcommands_register() -> None:
         "library-export",
         "classify-novel-peptides",
         "collision-filter",
+        "chromatogram",
     }
+    # chromatogram is a nested group with its own sub-subcommands.
+    chrom_subs = _subparsers_action(ms_subs.choices["chromatogram"])
+    assert set(chrom_subs.choices) == {"build-index", "extract"}
 
 
 # ── per-subcommand arg surface ─────────────────────────────────────────
@@ -209,10 +213,18 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
         "library-export",
         "classify-novel-peptides",
         "collision-filter",
+        "chromatogram",
     }
-    # Each subcommand has a non-empty argument list
+    # Each subcommand surfaces either direct arguments (leaf) or nested
+    # subcommands (group). chromatogram is the nested group.
     for sub in massspec_node["subcommands"]:
-        assert sub["arguments"], f"{sub['name']}: no arguments surfaced"
+        assert sub["arguments"] or sub["subcommands"], (
+            f"{sub['name']}: neither arguments nor subcommands surfaced"
+        )
+    chrom = next(s for s in massspec_node["subcommands"] if s["name"] == "chromatogram")
+    assert {s["name"] for s in chrom["subcommands"]} == {"build-index", "extract"}
+    for leaf in chrom["subcommands"]:
+        assert leaf["arguments"], f"chromatogram {leaf['name']}: no arguments surfaced"
 
 
 # ── stub handlers (subcommands still pending implementation) ───────────
@@ -225,13 +237,26 @@ def test_no_stub_handlers_remain() -> None:
     """
     parser = _build_massspec_only_parser()
     ms_subs = _subparsers_action(_massspec_subparser(parser))
-    for subcommand, sub in ms_subs.choices.items():
-        handler = sub.get_default("func")
-        assert handler is not None, f"{subcommand}: no func set"
-        # Stub handlers are named ``_not_yet_wired`` — fail if any survive.
-        assert handler.__name__ != "_not_yet_wired", (
-            f"{subcommand}: still wired to the _not_yet_wired stub"
+
+    def _check(name: str, sub: argparse.ArgumentParser) -> None:
+        # A group parser (nested subparsers) carries no func of its own —
+        # descend and check its leaves instead.
+        nested = next(
+            (a for a in sub._actions if isinstance(a, argparse._SubParsersAction)),
+            None,
         )
+        if nested is not None:
+            for child_name, child in nested.choices.items():
+                _check(f"{name} {child_name}", child)
+            return
+        handler = sub.get_default("func")
+        assert handler is not None, f"{name}: no func set"
+        assert handler.__name__ != "_not_yet_wired", (
+            f"{name}: still wired to the _not_yet_wired stub"
+        )
+
+    for subcommand, sub in ms_subs.choices.items():
+        _check(subcommand, sub)
 
 
 # ── --jvm-heap suffix validation ──────────────────────────────────────
