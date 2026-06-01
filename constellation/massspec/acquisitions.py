@@ -30,14 +30,32 @@ from constellation.core.io.schemas import (
 # ──────────────────────────────────────────────────────────────────────
 
 
+# Bumps on any additive column change. v1 = first versioned form (adds
+# per-instrument identity + chronological order to the original 4 columns).
+# Additive + nullable, so older 1-version-behind parquet still loads:
+# ``cast_to_schema`` fills the missing columns with nulls and merges this
+# (newer) metadata in, so a file read by newer code is treated as v1-shaped.
+ACQUISITION_SCHEMA_VERSION: int = 1
+
+
 ACQUISITION_TABLE: pa.Schema = pa.schema(
     [
         pa.field("acquisition_id", pa.int64(), nullable=False),
         pa.field("source_file", pa.string(), nullable=False),
         pa.field("source_kind", pa.string(), nullable=False),
         pa.field("acquisition_datetime", pa.string(), nullable=True),
+        # Per-instrument grouping + chronological position. All nullable:
+        # non-Thermo / older sources may lack instrument identity, and
+        # ``acquisition_order`` is a derived rank (see with_acquisition_order)
+        # left null until computed.
+        pa.field("instrument_serial", pa.string(), nullable=True),
+        pa.field("instrument_model", pa.string(), nullable=True),
+        pa.field("acquisition_order", pa.int32(), nullable=True),
     ],
-    metadata={b"schema_name": b"AcquisitionTable"},
+    metadata={
+        b"schema_name": b"AcquisitionTable",
+        b"schema_version": str(ACQUISITION_SCHEMA_VERSION).encode("utf-8"),
+    },
 )
 
 
@@ -99,6 +117,62 @@ class Acquisitions:
         new_table = self.table.replace_schema_metadata(pack_metadata(existing))
         return Acquisitions(new_table)
 
+    def with_acquisition_order(self) -> Acquisitions:
+        """Return a new ``Acquisitions`` with ``acquisition_order`` filled.
+
+        Chronological rank **within each instrument**: group by
+        ``instrument_serial``, order by ``acquisition_datetime`` ascending,
+        and assign a **1-based** ``acquisition_order`` (rank 1 = earliest run
+        on that instrument). ``acquisition_datetime`` is compared as a string —
+        correct for ISO-8601 (``YYYY-MM-DDT…``), which sorts lexicographically.
+
+        Semantics:
+
+        - Ties on ``(instrument_serial, acquisition_datetime)`` break by
+          ``acquisition_id`` ascending (the unique PK) → total, deterministic.
+        - ``instrument_serial`` null → ``acquisition_order`` null (not part of
+          any instrument's chronology).
+        - ``instrument_serial`` present but ``acquisition_datetime`` null →
+          sorts **last** within its instrument but still receives a rank
+          (invariant: serial present ⇒ order present).
+        - Empty table → returned unchanged. Idempotent (overwrites any existing
+          ``acquisition_order``).
+
+        The returned table's rows are in **sorted order** (by the keys above),
+        not the input order; downstream ``acquisition_id`` joins are
+        order-insensitive.
+        """
+        if self.table.num_rows == 0:
+            return self
+        # nulls sort last on ascending — desired for both null serial and null
+        # datetime; acquisition_id (unique, non-null) makes the order total.
+        sorted_t = self.table.sort_by(
+            [
+                ("instrument_serial", "ascending"),
+                ("acquisition_datetime", "ascending"),
+                ("acquisition_id", "ascending"),
+            ]
+        )
+        serials = sorted_t.column("instrument_serial").to_pylist()
+        order: list[int | None] = []
+        current: object = object()  # sentinel distinct from any serial incl. None
+        rank = 0
+        for serial in serials:
+            if serial is None:
+                order.append(None)
+                continue
+            if serial != current:
+                current = serial
+                rank = 1
+            else:
+                rank += 1
+            order.append(rank)
+        idx = sorted_t.schema.get_field_index("acquisition_order")
+        out = sorted_t.set_column(
+            idx, "acquisition_order", pa.array(order, type=pa.int32())
+        )
+        return Acquisitions(out)
+
     def __len__(self) -> int:
         return self.table.num_rows
 
@@ -146,6 +220,7 @@ def validate_acquisitions(
 
 
 __all__ = [
+    "ACQUISITION_SCHEMA_VERSION",
     "ACQUISITION_TABLE",
     "Acquisitions",
     "validate_acquisitions",
