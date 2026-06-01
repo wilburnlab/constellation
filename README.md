@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/constellation_logo.png" alt="Constellation" width="320">
+</p>
+
 # Constellation
 
 An integrative bioinformatics platform for analysis of diverse omic and
