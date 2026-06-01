@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import pyarrow as pa
 
@@ -65,6 +66,42 @@ register_schema("AcquisitionTable", ACQUISITION_TABLE)
 # ──────────────────────────────────────────────────────────────────────
 # Container
 # ──────────────────────────────────────────────────────────────────────
+
+
+def _chrono_key(value: str | None) -> str | None:
+    """Map an ``acquisition_datetime`` string to a chronological sort key.
+
+    Returns a key whose lexicographic order matches true chronological order.
+    A raw-string sort is wrong for ISO-8601 values that carry differing UTC
+    offsets (e.g. ``2026-01-01T00:30:00+01:00`` is earlier than
+    ``2025-12-31T23:45:00Z`` but sorts after it as text). So we parse and, when
+    the value is timezone-aware, normalize to UTC before formatting.
+
+    - ``None`` → ``None`` (sorts last; "undated").
+    - tz-aware → converted to UTC, formatted ``YYYY-MM-DDTHH:MM:SS.ffffff`` (no
+      offset), so all aware values share one comparable reference.
+    - naive (no offset) → formatted to the same fixed width. Naive values are
+      compared as written (no timezone is assumed — inventing one would be
+      wrong); a corpus that mixes naive and offset-aware datetimes is
+      inherently ambiguous and the naive values are ordered by their literal
+      wall-clock time relative to the UTC-normalized aware ones.
+
+    Raises ``ValueError`` on a non-ISO-8601 value — the field is contractually
+    ISO-8601, so a mismatch is a real signal, not something to silently misrank.
+    """
+    if value is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"acquisition_datetime {value!r} is not ISO-8601; cannot order "
+            "chronologically"
+        ) from exc
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    # Fixed-width microsecond format → lexicographic order == chronological order.
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,12 +160,13 @@ class Acquisitions:
         Chronological rank **within each instrument**: group by
         ``instrument_serial``, order by ``acquisition_datetime`` ascending,
         and assign a **1-based** ``acquisition_order`` (rank 1 = earliest run
-        on that instrument). ``acquisition_datetime`` is compared as a string —
-        correct for ISO-8601 (``YYYY-MM-DDT…``), which sorts lexicographically.
+        on that instrument). Ordering is by a **parsed** UTC-normalized key
+        (see :func:`_chrono_key`), not the raw string — so ISO-8601 values
+        with differing UTC offsets rank by true instant, not text.
 
         Semantics:
 
-        - Ties on ``(instrument_serial, acquisition_datetime)`` break by
+        - Ties on ``(instrument_serial, chronological time)`` break by
           ``acquisition_id`` ascending (the unique PK) → total, deterministic.
         - ``instrument_serial`` null → ``acquisition_order`` null (not part of
           any instrument's chronology).
@@ -137,6 +175,7 @@ class Acquisitions:
           (invariant: serial present ⇒ order present).
         - Empty table → returned unchanged. Idempotent (overwrites any existing
           ``acquisition_order``).
+        - A non-ISO-8601 ``acquisition_datetime`` raises ``ValueError``.
 
         The returned table's rows are in **sorted order** (by the keys above),
         not the input order; downstream ``acquisition_id`` joins are
@@ -144,15 +183,25 @@ class Acquisitions:
         """
         if self.table.num_rows == 0:
             return self
+        # Sort on a parsed, UTC-normalized key rather than the raw datetime
+        # string: lexicographic order of mixed-offset ISO-8601 text is NOT
+        # chronological. Carry the key as a transient column, sort, then drop it.
+        keyed = self.table.append_column(
+            "_chrono_key",
+            pa.array(
+                [_chrono_key(v) for v in self.table.column("acquisition_datetime").to_pylist()],
+                type=pa.string(),
+            ),
+        )
         # nulls sort last on ascending — desired for both null serial and null
         # datetime; acquisition_id (unique, non-null) makes the order total.
-        sorted_t = self.table.sort_by(
+        sorted_t = keyed.sort_by(
             [
                 ("instrument_serial", "ascending"),
-                ("acquisition_datetime", "ascending"),
+                ("_chrono_key", "ascending"),
                 ("acquisition_id", "ascending"),
             ]
-        )
+        ).drop_columns(["_chrono_key"])
         serials = sorted_t.column("instrument_serial").to_pylist()
         order: list[int | None] = []
         current: object = object()  # sentinel distinct from any serial incl. None

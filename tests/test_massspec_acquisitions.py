@@ -212,3 +212,52 @@ def test_with_acquisition_order_empty() -> None:
 def test_with_acquisition_order_preserves_uniqueness() -> None:
     acq = Acquisitions.from_records(_instrument_records()).with_acquisition_order()
     assert len(set(acq.ids)) == len(acq.ids)
+
+
+def test_with_acquisition_order_ranks_by_utc_instant_not_string() -> None:
+    # Same instrument, ISO-8601 with differing offsets: +01:00 row is 23:30 UTC
+    # (earlier) and the Z row is 23:45 UTC (later), but raw-string sort would
+    # place the 2025…Z row first. The parsed UTC key must rank the +01:00 first.
+    recs = [
+        {"acquisition_id": 1, "source_file": "later.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "2025-12-31T23:45:00Z",
+         "instrument_serial": "A", "instrument_model": "M"},
+        {"acquisition_id": 2, "source_file": "earlier.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "2026-01-01T00:30:00+01:00",
+         "instrument_serial": "A", "instrument_model": "M"},
+    ]
+    by_file = {
+        r["source_file"]: r["acquisition_order"]
+        for r in Acquisitions.from_records(recs).with_acquisition_order().table.to_pylist()
+    }
+    assert by_file["earlier.raw"] == 1
+    assert by_file["later.raw"] == 2
+
+
+def test_with_acquisition_order_offset_tie_broken_by_id() -> None:
+    # Same UTC instant via different representations (23:45Z == 00:45+01:00) →
+    # a true tie, broken by acquisition_id ascending.
+    recs = [
+        {"acquisition_id": 5, "source_file": "z.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "2025-12-31T23:45:00Z",
+         "instrument_serial": "A", "instrument_model": "M"},
+        {"acquisition_id": 4, "source_file": "off.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "2026-01-01T00:45:00+01:00",
+         "instrument_serial": "A", "instrument_model": "M"},
+    ]
+    by_file = {
+        r["source_file"]: r["acquisition_order"]
+        for r in Acquisitions.from_records(recs).with_acquisition_order().table.to_pylist()
+    }
+    assert by_file["off.raw"] == 1  # id 4 < 5
+    assert by_file["z.raw"] == 2
+
+
+def test_with_acquisition_order_rejects_non_iso_datetime() -> None:
+    recs = [
+        {"acquisition_id": 1, "source_file": "x.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "not-a-date",
+         "instrument_serial": "A", "instrument_model": "M"},
+    ]
+    with pytest.raises(ValueError, match="not ISO-8601"):
+        Acquisitions.from_records(recs).with_acquisition_order()
