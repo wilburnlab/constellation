@@ -98,7 +98,7 @@ register_schema("MSPeakTable", MS_PEAK_TABLE)
 # ScanMetadataTable — one row per scan. Ports cartographer SCAN_METADATA_SCHEMA.
 # ──────────────────────────────────────────────────────────────────────
 
-SCAN_METADATA_SCHEMA_VERSION: int = 1
+SCAN_METADATA_SCHEMA_VERSION: int = 2
 
 
 # Mirrors Cartographer's SCAN_METADATA_SCHEMA v5 column-for-column with
@@ -118,7 +118,15 @@ SCAN_METADATA_TABLE: pa.Schema = pa.schema(
         pa.field("base_peak_intensity", pa.float64(), nullable=True),
         pa.field("peak_count", pa.uint32(), nullable=True),
         pa.field("filter_string", pa.string(), nullable=True),
+        # Mass analyzer (FTMS, ITMS, ...) parsed from the filter string. Set on
+        # every scan including MS1; the discriminator that separates, e.g., a
+        # CID35 ion-trap MS2 from an HCD35 Orbitrap MS2 at identical NCE.
+        pa.field("analyzer", pa.string(), nullable=True),
         pa.field("collision_energy", pa.float32(), nullable=True),
+        # Primary dissociation method (hcd, cid, etd, ...) parsed from the filter
+        # string; null for MS1. Supplemental activations (EThcD/ETciD) keep their
+        # full sequence in filter_string — only the leading method lands here.
+        pa.field("activation_type", pa.string(), nullable=True),
         pa.field("faims_cv", pa.float32(), nullable=True),
         pa.field("isolation_lower", pa.float64(), nullable=True),
         pa.field("isolation_upper", pa.float64(), nullable=True),
