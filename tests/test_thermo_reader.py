@@ -89,6 +89,21 @@ class TestFilterStringParser:
         assert out["point_type"] == "C"
         assert out["activations"] == [(458.7660, "hcd", 28.0)]
 
+    def test_cid_vs_hcd_same_energy_distinguished_by_token(self):
+        # ProteomeTools acquires both CID35 (ion trap) and HCD35 (Orbitrap) at
+        # identical NCE 35 — collision_energy alone cannot separate them; the
+        # activation token + analyzer are required.
+        cid = parse_filter_string(
+            "ITMS + c NSI r d Full ms2 530.7766@cid35.00 [141.0-1072.0]"
+        )
+        hcd = parse_filter_string(
+            "FTMS + c NSI d Full ms2 530.7766@hcd35.00 [100.0-1072.0]"
+        )
+        assert cid["analyzer"] == "ITMS" and cid["activations"][0][1] == "cid"
+        assert hcd["analyzer"] == "FTMS" and hcd["activations"][0][1] == "hcd"
+        # identical energy — proof that energy is not a discriminator
+        assert cid["activations"][0][2] == hcd["activations"][0][2] == 35.0
+
     def test_ethcd_multi_activation_shares_isolation_mz(self):
         out = parse_filter_string(
             "FTMS + c NSI d Full ms2 458.7660@etd50.00@hcd25.00 [110.0-1000.0]"
@@ -301,6 +316,9 @@ class TestBuildScanMeta:
         assert meta["precursor_mz"] is None
         assert meta["precursor_charge"] is None
         assert meta["agc_enabled"] is True
+        # MS1: analyzer set from the filter string, no activation.
+        assert meta["analyzer"] == "FTMS"
+        assert meta["activation_type"] is None
 
     def test_ms2_row_with_precursor_and_charge(self):
         from constellation.massspec.io.thermo._read import _build_scan_meta
@@ -332,6 +350,9 @@ class TestBuildScanMeta:
         assert meta["precursor_mz"] == 458.766
         assert meta["precursor_charge"] == 2
         assert meta["collision_energy"] == 28.0
+        # MS2: analyzer + activation_type are persisted per-scan columns now.
+        assert meta["analyzer"] == "FTMS"
+        assert meta["activation_type"] == "hcd"
         assert meta["isolation_lower"] == pytest.approx(458.766 - 0.8, rel=1e-6)
         assert meta["isolation_upper"] == pytest.approx(458.766 + 0.8, rel=1e-6)
         # Master scan promoted to float64 in PEAK_TABLE shape.
@@ -381,6 +402,14 @@ class TestSchemaRegistration:
     def test_scan_metadata_table_has_trailer_extras_map(self):
         f = SCAN_METADATA_TABLE.field("trailer_extras")
         assert pa.types.is_map(f.type)
+
+    def test_scan_metadata_has_analyzer_and_activation_type(self):
+        # Schema v2: analyzer + activation_type promoted to per-scan columns.
+        names = set(SCAN_METADATA_TABLE.names)
+        assert {"analyzer", "activation_type"} <= names
+        assert SCAN_METADATA_TABLE.field("analyzer").type == pa.string()
+        assert SCAN_METADATA_TABLE.field("activation_type").type == pa.string()
+        assert SCAN_METADATA_TABLE.metadata[b"schema_version"] == b"2"
 
     def test_acquisition_metadata_table_has_tune_data_map(self):
         f = ACQUISITION_METADATA_TABLE.field("tune_data")

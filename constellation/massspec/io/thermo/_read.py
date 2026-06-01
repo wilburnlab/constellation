@@ -262,6 +262,7 @@ def _build_scan_meta(
     peak_count = safe_int(getattr(stats, "PacketCount", None))
 
     ce: float | None = None
+    activation_type: str | None = None
     iso_lower: float | None = None
     iso_upper: float | None = None
     precursor_mz: float | None = None
@@ -270,7 +271,7 @@ def _build_scan_meta(
     if ms_level >= 2:
         activations = parsed.get("activations", [])
         if activations:
-            _, _, energy = activations[0]
+            _, activation_type, energy = activations[0]
             if energy is not None:
                 ce = float(energy)
 
@@ -336,6 +337,7 @@ def _build_scan_meta(
         "peak_count": peak_count,
         "filter_string": filter_str or None,
         "collision_energy": ce,
+        "activation_type": activation_type,
         "faims_cv": faims_cv,
         "isolation_lower": iso_lower,
         "isolation_upper": iso_upper,
@@ -346,7 +348,10 @@ def _build_scan_meta(
         "master_scan": master_scan_f,
         "monoisotopic_mz_override": monoisotopic_mz_override,
         "trailer_extras": trailer_map,
-        # Virtual keys, consumed by _AcquisitionStats then dropped.
+        # ``analyzer`` is consumed by _AcquisitionStats (for the acquisition
+        # ``analyzers`` list) and is also a persisted per-scan column now.
+        # ``profile_mode`` stays virtual — consumed then dropped (it is
+        # acquisition-level, in ACQUISITION_METADATA_TABLE).
         "profile_mode": profile_mode,
         "analyzer": parsed.get("analyzer"),
     }
