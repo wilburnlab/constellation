@@ -413,6 +413,44 @@ def test_mode_a_vs_mode_b_parity_ms1(tmp_path):
     assert _sortkey(a) == _sortkey(b)
 
 
+def test_mode_a_vs_mode_b_parity_drop_unmatched_false(tmp_path):
+    """Mode B must honour drop_unmatched=False: the rectangular grid of
+    unmatched (charge × isotope × scan) zero rows that Mode A emits."""
+    peaks, mz2 = _ms1_dataset(signal_scans=(1, 2, 3))
+    tgt = _target(prec_mz=mz2[0], rt_center=102.0)
+    kw = dict(
+        acquisition_id=0, level=1, n_isotopes=3, charge_range=(1, 4),
+        rt_window=2.0, tolerance=_TOL_PPM, drop_unmatched=False,
+    )
+    a = extract_xic_scan_major(peaks, tgt, **kw)
+    src = tmp_path / "bundle"
+    src.mkdir()
+    pq.write_table(peaks, src / "peaks.parquet")
+    build_peak_index(src, tmp_path / "idx")
+    b = extract_xic_indexed(tmp_path / "idx", tgt, **kw)
+    # rt window [100,104] gates all 5 scans (each carries a noise peak):
+    # 4 charges × 3 isotopes × 5 candidate scans = 60 rectangular cells.
+    assert a.num_rows == b.num_rows == 60
+
+    def _full_key(t):
+        d = t.sort_by([
+            ("precursor_charge", "ascending"), ("isotope", "ascending"),
+            ("scan", "ascending"),
+        ])
+        obs = d["mz_observed"].to_pylist()
+        return list(zip(
+            d["precursor_charge"].to_pylist(), d["isotope"].to_pylist(),
+            d["scan"].to_pylist(),
+            [round(x, 6) for x in d["intensity"].to_pylist()],
+            [None if o is None or o != o else round(o, 6) for o in obs],
+        ))
+
+    assert _full_key(a) == _full_key(b)
+    # 9 matched cells (charge 2 × 3 isotopes × 3 signal scans); the rest zero.
+    assert pc.sum(pc.equal(a["intensity"], 0.0)).as_py() == 51
+    assert pc.sum(pc.equal(b["intensity"], 0.0)).as_py() == 51
+
+
 def test_use_index_exact_error_restores_f64(tmp_path):
     peaks, mz2 = _ms1_dataset()
     tgt = _target(prec_mz=mz2[0], rt_center=102.0)

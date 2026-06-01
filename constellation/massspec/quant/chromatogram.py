@@ -818,6 +818,21 @@ def _extract_target_indexed(
     p_lo = np.concatenate(lo_parts)[order]
     p_hi = np.concatenate(hi_parts)[order]
 
+    # Scan-level gate (rt window + isolation coverage + assigned scan) over
+    # ALL loaded partition rows. rt / iso / scan are per-scan properties, so a
+    # scan is a *candidate* iff any of its peaks pass — this reconstructs the
+    # exact gated scan set Mode A's `_candidate_scans` produces, independent of
+    # query m/z, so `drop_unmatched=False` can zero-fill unmatched cells.
+    scan_gate = _scan_gate(
+        p_rt, p_lo, p_hi, p_scan, t, level, rt_lo, rt_hi, assigned_scans_only
+    )
+    if not scan_gate.any():
+        return
+    uscan, ui = np.unique(p_scan[scan_gate], return_index=True)
+    g_rt, g_lo, g_hi = p_rt[scan_gate], p_lo[scan_gate], p_hi[scan_gate]
+    cand_rt, cand_lo, cand_hi = g_rt[ui], g_lo[ui], g_hi[ui]
+    scan_pos = {int(s): i for i, s in enumerate(uscan)}
+
     axis = torch.from_numpy(p_mz)
     query_mz = np.array([ion.mz for ion in ions], dtype=np.float64)
     lo_idx, hi_idx = bounds_within_tolerance(
@@ -826,47 +841,178 @@ def _extract_target_indexed(
     lo_idx = lo_idx.numpy()
     hi_idx = hi_idx.numpy()
 
-    # Per query, gather window candidates, gate, pick nearest per scan.
-    out_scan, out_rt, out_lo, out_hi, out_obs, out_int, out_qi = ([] for _ in range(7))
+    if all_in_window:
+        _emit_all_in_window_indexed(
+            builder,
+            t,
+            level,
+            ions,
+            query_mz,
+            lo_idx,
+            hi_idx,
+            p_mz,
+            p_rt,
+            p_scan,
+            p_int,
+            p_lo,
+            p_hi,
+            scan_pos,
+            rt_lo,
+            rt_hi,
+            assigned_scans_only,
+            acquisition_id,
+        )
+        return
+
+    # Nearest per scan: matched_by_qi[qi] = {scan: (observed_mz, intensity)}.
+    matched_by_qi: dict[int, dict[int, tuple[float, float]]] = {}
     for qi, ion in enumerate(ions):
         a, b = int(lo_idx[qi]), int(hi_idx[qi])
         if b <= a:
             continue
-        c_mz, c_rt, c_scan = p_mz[a:b], p_rt[a:b], p_scan[a:b]
-        c_int, c_lo, c_hi = p_int[a:b], p_lo[a:b], p_hi[a:b]
-        gate = (c_rt >= rt_lo) & (c_rt <= rt_hi)
-        if level != 1 and t.precursor_mz is not None:
-            covers = (
-                ~(np.isnan(c_lo) | np.isnan(c_hi))
-                & (c_lo <= t.precursor_mz)
-                & (t.precursor_mz <= c_hi)
-            )
-            passall = np.isnan(c_lo) | np.isnan(c_hi)
-            gate = gate & (covers | passall)
-        if assigned_scans_only and t.scan is not None:
-            gate = gate & (c_scan == t.scan)
-        if not gate.any():
+        sl = slice(a, b)
+        rgate = _scan_gate(
+            p_rt[sl],
+            p_lo[sl],
+            p_hi[sl],
+            p_scan[sl],
+            t,
+            level,
+            rt_lo,
+            rt_hi,
+            assigned_scans_only,
+        )
+        if not rgate.any():
             continue
-        c_mz, c_rt, c_scan, c_int = c_mz[gate], c_rt[gate], c_scan[gate], c_int[gate]
-        c_lo, c_hi = c_lo[gate], c_hi[gate]
-        if all_in_window:
-            sgather = np.arange(c_scan.shape[0])
-        else:
-            # Nearest per scan: argmin |mz - query| within each scan.
-            dist = np.abs(c_mz - ion.mz)
-            sgather = _argmin_per_group(c_scan, dist)
-        out_scan.append(c_scan[sgather])
-        out_rt.append(c_rt[sgather])
-        out_lo.append(c_lo[sgather])
-        out_hi.append(c_hi[sgather])
-        out_obs.append(c_mz[sgather])
-        out_int.append(c_int[sgather])
-        out_qi.append(np.full(sgather.shape[0], qi, dtype=np.int64))
+        w_mz, w_scan, w_int = p_mz[sl][rgate], p_scan[sl][rgate], p_int[sl][rgate]
+        sgather = _argmin_per_group(w_scan, np.abs(w_mz - ion.mz))
+        per_scan = matched_by_qi.setdefault(qi, {})
+        for k in sgather:
+            per_scan[int(w_scan[k])] = (float(w_mz[k]), float(w_int[k]))
+
+    if drop_unmatched and not matched_by_qi:
+        return
+
+    out_qi, out_scan, out_obs, out_int = [], [], [], []
+    out_rt, out_lo, out_hi = [], [], []
+    for qi in range(len(ions)):
+        per_scan = matched_by_qi.get(qi, {})
+        scans = per_scan.keys() if drop_unmatched else (int(s) for s in uscan)
+        for s in scans:
+            obs, inten = per_scan.get(s, (np.nan, 0.0))
+            pos = scan_pos[s]
+            out_qi.append(qi)
+            out_scan.append(s)
+            out_rt.append(cand_rt[pos])
+            out_lo.append(cand_lo[pos])
+            out_hi.append(cand_hi[pos])
+            out_obs.append(obs)
+            out_int.append(inten)
+    if not out_qi:
+        return
+    qi_arr = np.array(out_qi, dtype=np.int64)
+    obs = np.array(out_obs, dtype=np.float64)
+    theo = query_mz[qi_arr]
+    matched = ~np.isnan(obs)
+    err_da = np.where(matched, obs - theo, np.nan)
+    builder.add(
+        acquisition_id=acquisition_id,
+        target_id=t.target_id,
+        modified_sequence=t.modified_sequence,
+        precursor_charge=np.array(
+            [ions[q].precursor_charge for q in qi_arr], dtype=np.int64
+        ),
+        level=level,
+        scan=np.array(out_scan, dtype=np.int64),
+        rt=np.array(out_rt, dtype=np.float64),
+        isolation_lower=np.array(out_lo, dtype=np.float64),
+        isolation_upper=np.array(out_hi, dtype=np.float64),
+        isotope=[ions[q].isotope for q in qi_arr],
+        ion_type=[ions[q].ion_type for q in qi_arr],
+        position=[ions[q].position for q in qi_arr],
+        fragment_charge=[ions[q].fragment_charge for q in qi_arr],
+        loss_id=[ions[q].loss_id for q in qi_arr],
+        mz_theoretical=theo,
+        mz_observed=obs,
+        intensity=np.array(out_int, dtype=np.float64),
+        mz_error_da=err_da,
+        mz_error_ppm=np.where(matched, err_da / theo * 1e6, np.nan),
+    )
+
+
+def _scan_gate(
+    rt, iso_lo, iso_hi, scan, t, level, rt_lo, rt_hi, assigned_scans_only
+) -> np.ndarray:
+    """Per-row mask for the scan-level gate (rt window + MS2 isolation
+    coverage + assigned scan). Shared by Mode B candidate-scan discovery and
+    per-window-slice filtering so both apply identical semantics."""
+    gate = (rt >= rt_lo) & (rt <= rt_hi)
+    if level != 1 and t.precursor_mz is not None:
+        covers = (
+            ~(np.isnan(iso_lo) | np.isnan(iso_hi))
+            & (iso_lo <= t.precursor_mz)
+            & (t.precursor_mz <= iso_hi)
+        )
+        passall = np.isnan(iso_lo) | np.isnan(iso_hi)
+        gate = gate & (covers | passall)
+    if assigned_scans_only and t.scan is not None:
+        gate = gate & (scan == t.scan)
+    return gate
+
+
+def _emit_all_in_window_indexed(
+    builder,
+    t,
+    level,
+    ions,
+    query_mz,
+    lo_idx,
+    hi_idx,
+    p_mz,
+    p_rt,
+    p_scan,
+    p_int,
+    p_lo,
+    p_hi,
+    scan_pos,
+    rt_lo,
+    rt_hi,
+    assigned_scans_only,
+    acquisition_id,
+) -> None:
+    """All-peaks-in-window emit for Mode B (no zero-fill — mirrors Mode A's
+    `_emit_all_scan_major`, where `drop_unmatched` does not apply)."""
+    out_qi, out_scan, out_rt, out_lo, out_hi, out_obs, out_int = ([] for _ in range(7))
+    for qi, ion in enumerate(ions):
+        a, b = int(lo_idx[qi]), int(hi_idx[qi])
+        if b <= a:
+            continue
+        sl = slice(a, b)
+        rgate = _scan_gate(
+            p_rt[sl],
+            p_lo[sl],
+            p_hi[sl],
+            p_scan[sl],
+            t,
+            level,
+            rt_lo,
+            rt_hi,
+            assigned_scans_only,
+        )
+        if not rgate.any():
+            continue
+        out_qi.append(np.full(int(rgate.sum()), qi, dtype=np.int64))
+        out_scan.append(p_scan[sl][rgate])
+        out_rt.append(p_rt[sl][rgate])
+        out_lo.append(p_lo[sl][rgate])
+        out_hi.append(p_hi[sl][rgate])
+        out_obs.append(p_mz[sl][rgate])
+        out_int.append(p_int[sl][rgate])
     if not out_qi:
         return
     qi_arr = np.concatenate(out_qi)
     obs = np.concatenate(out_obs)
-    theo = np.array([ions[q].mz for q in qi_arr], dtype=np.float64)
+    theo = query_mz[qi_arr]
     err_da = obs - theo
     builder.add(
         acquisition_id=acquisition_id,
