@@ -29,6 +29,8 @@ import constellation.core.sequence.nucleic
 import constellation.core.sequence.ops
 import constellation.core.sequence.proforma
 import constellation.core.sequence.protein
+import constellation.core.signal
+import constellation.core.signal.matching
 import constellation.core.stats
 import constellation.core.stats.calibration
 import constellation.core.stats.distributions
@@ -71,9 +73,12 @@ import constellation.massspec.peptide.match
 import constellation.massspec.peptide.mz
 import constellation.massspec.peptide.neutral_losses
 import constellation.massspec.quant
+import constellation.massspec.quant.chromatogram
 import constellation.massspec.quant.io
+import constellation.massspec.quant.peak_index
 import constellation.massspec.quant.quant
 import constellation.massspec.quant.schemas
+import constellation.massspec.quant.targets
 import constellation.massspec.readers
 import constellation.massspec.schemas
 import constellation.massspec.cli

@@ -315,10 +315,56 @@ ACQUISITION_METADATA_TABLE: pa.Schema = pa.schema(
 register_schema("AcquisitionMetadataTable", ACQUISITION_METADATA_TABLE)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# MSPeakIndex — derived, rebuildable mass-sorted projection of MS_PEAK_TABLE
+# ──────────────────────────────────────────────────────────────────────
+
+MS_PEAK_INDEX_SCHEMA_VERSION: int = 1
+
+
+# A derived peak index: MS_PEAK_TABLE re-laid-out as a dataset
+# partitioned by `(ms_level, isolation_window)` (the partition keys ride
+# in the hive directory path) and sorted by `mz` then `rt` *within* each
+# partition, so a query m/z resolves to a contiguous slice of (rt, scan,
+# intensity). This is the structure that makes XIC-at-scale (and a future
+# spectrum-centric search) cost scale with query count, not n_scans.
+#
+# Precision is a per-axis, function-driven knob; the index defaults to a
+# lossless f64 mirror of the canonical table. `mz`, `rt`, `intensity` are
+# each independently downcastable to f32 (`isolation_lower/upper` follow
+# `mz`). f32 worst-case ≈ 0.06 ppm relative — far under any matching
+# tolerance — and any downcast is recoverable, because MS_PEAK_TABLE
+# stays f64. The realized per-axis dtypes are recorded in the build
+# manifest's `x.massspec.precision`. The schema declares the lossless f64
+# form; the builder casts the selected axes after the sort.
+MS_PEAK_INDEX_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("mz", pa.float64(), nullable=False),  # within-partition sort key
+        pa.field("rt", pa.float64(), nullable=False),  # seconds
+        pa.field("scan", pa.int32(), nullable=False),
+        pa.field("intensity", pa.float64(), nullable=False),
+        # Partition key, carried as a column so a single-file read is
+        # self-describing even outside the hive directory layout.
+        pa.field("isolation_window_id", pa.int32(), nullable=False),
+        pa.field("isolation_lower", pa.float64(), nullable=True),
+        pa.field("isolation_upper", pa.float64(), nullable=True),
+    ],
+    metadata={
+        b"schema_name": b"MSPeakIndex",
+        b"schema_version": str(MS_PEAK_INDEX_SCHEMA_VERSION).encode("utf-8"),
+    },
+)
+
+
+register_schema("MSPeakIndex", MS_PEAK_INDEX_TABLE)
+
+
 __all__ = [
     "ACQUISITION_METADATA_SCHEMA_VERSION",
     "ACQUISITION_METADATA_TABLE",
     "FRAGMENT_ION_TABLE",
+    "MS_PEAK_INDEX_SCHEMA_VERSION",
+    "MS_PEAK_INDEX_TABLE",
     "MS_PEAK_SCHEMA_VERSION",
     "MS_PEAK_TABLE",
     "SCAN_METADATA_SCHEMA_VERSION",
