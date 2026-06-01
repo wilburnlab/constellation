@@ -7,6 +7,7 @@ import pytest
 
 from constellation.core.io.schemas import get_schema
 from constellation.massspec.acquisitions import (
+    ACQUISITION_SCHEMA_VERSION,
     ACQUISITION_TABLE,
     Acquisitions,
     validate_acquisitions,
@@ -98,3 +99,165 @@ def test_validate_acquisitions_missing_column_raises() -> None:
     table = pa.table({"other_column": [0, 1]})
     with pytest.raises(ValueError, match="missing FK column"):
         validate_acquisitions(table, acq)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Schema v1: instrument identity + per-instrument chronological order
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _instrument_records():
+    """Two instruments interleaved in input order; a tie; a null datetime;
+    a null-serial row. ``acquisition_id`` is the stable key for assertions."""
+    return [
+        # instrument A, later run (input first to prove ordering, not input pos)
+        {"acquisition_id": 10, "source_file": "b.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "2016-06-02T00:00:00",
+         "instrument_serial": "A", "instrument_model": "Lumos"},
+        # instrument A, earlier run
+        {"acquisition_id": 11, "source_file": "a.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "2016-06-01T00:00:00",
+         "instrument_serial": "A", "instrument_model": "Lumos"},
+        # instrument B, tie on datetime with id 13 → id breaks (12 < 13)
+        {"acquisition_id": 12, "source_file": "c.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "2016-06-01T00:00:00",
+         "instrument_serial": "B", "instrument_model": "Lumos"},
+        {"acquisition_id": 13, "source_file": "d.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "2016-06-01T00:00:00",
+         "instrument_serial": "B", "instrument_model": "Lumos"},
+        # instrument A, null datetime → sorts last in A but still ranked
+        {"acquisition_id": 14, "source_file": "e.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": None,
+         "instrument_serial": "A", "instrument_model": "Lumos"},
+        # null instrument_serial → null order
+        {"acquisition_id": 15, "source_file": "f.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "2016-06-01T00:00:00",
+         "instrument_serial": None, "instrument_model": None},
+    ]
+
+
+def _order_by_id(acq: Acquisitions) -> dict[int, int | None]:
+    rows = acq.table.to_pylist()
+    return {r["acquisition_id"]: r["acquisition_order"] for r in rows}
+
+
+def test_schema_has_version_and_instrument_fields() -> None:
+    assert ACQUISITION_TABLE.metadata[b"schema_version"] == b"1"
+    assert ACQUISITION_SCHEMA_VERSION == 1
+    names = set(ACQUISITION_TABLE.names)
+    assert {"instrument_serial", "instrument_model", "acquisition_order"} <= names
+    assert ACQUISITION_TABLE.field("instrument_serial").type == pa.string()
+    assert ACQUISITION_TABLE.field("acquisition_order").type == pa.int32()
+
+
+def test_instrument_fields_round_trip() -> None:
+    acq = Acquisitions.from_records(_instrument_records())
+    by_id = {r["acquisition_id"]: r for r in acq.table.to_pylist()}
+    assert by_id[10]["instrument_serial"] == "A"
+    assert by_id[10]["instrument_model"] == "Lumos"
+
+
+def test_backward_compat_four_column_table() -> None:
+    # The literal old-parquet shape: only the original 4 columns, no metadata.
+    old = pa.table(
+        {
+            "acquisition_id": pa.array([0, 1], type=pa.int64()),
+            "source_file": ["run_01.raw", "run_02.mzML"],
+            "source_kind": ["thermo_raw", "mzml"],
+            "acquisition_datetime": ["2016-01-01T00:00:00", None],
+        }
+    )
+    acq = Acquisitions(old)
+    assert acq.table.column("instrument_serial").to_pylist() == [None, None]
+    assert acq.table.column("instrument_model").to_pylist() == [None, None]
+    assert acq.table.column("acquisition_order").to_pylist() == [None, None]
+
+
+def test_with_acquisition_order_basic() -> None:
+    by_id = _order_by_id(Acquisitions.from_records(_instrument_records()).with_acquisition_order())
+    # instrument A: id 11 earliest → 1, id 10 → 2
+    assert by_id[11] == 1
+    assert by_id[10] == 2
+
+
+def test_with_acquisition_order_tie_break_by_id() -> None:
+    by_id = _order_by_id(Acquisitions.from_records(_instrument_records()).with_acquisition_order())
+    # instrument B: 12 and 13 share a datetime → lower id ranks first
+    assert by_id[12] == 1
+    assert by_id[13] == 2
+
+
+def test_with_acquisition_order_null_datetime_sorts_last_but_ranked() -> None:
+    by_id = _order_by_id(Acquisitions.from_records(_instrument_records()).with_acquisition_order())
+    # instrument A has 3 rows (11, 10, 14-null-dt) → null-dt gets the last rank
+    assert by_id[14] == 3
+
+
+def test_with_acquisition_order_null_serial_gets_null_order() -> None:
+    by_id = _order_by_id(Acquisitions.from_records(_instrument_records()).with_acquisition_order())
+    assert by_id[15] is None
+
+
+def test_with_acquisition_order_idempotent() -> None:
+    once = Acquisitions.from_records(_instrument_records()).with_acquisition_order()
+    twice = once.with_acquisition_order()
+    assert _order_by_id(once) == _order_by_id(twice)
+
+
+def test_with_acquisition_order_empty() -> None:
+    acq = Acquisitions.empty().with_acquisition_order()
+    assert len(acq) == 0
+
+
+def test_with_acquisition_order_preserves_uniqueness() -> None:
+    acq = Acquisitions.from_records(_instrument_records()).with_acquisition_order()
+    assert len(set(acq.ids)) == len(acq.ids)
+
+
+def test_with_acquisition_order_ranks_by_utc_instant_not_string() -> None:
+    # Same instrument, ISO-8601 with differing offsets: +01:00 row is 23:30 UTC
+    # (earlier) and the Z row is 23:45 UTC (later), but raw-string sort would
+    # place the 2025…Z row first. The parsed UTC key must rank the +01:00 first.
+    recs = [
+        {"acquisition_id": 1, "source_file": "later.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "2025-12-31T23:45:00Z",
+         "instrument_serial": "A", "instrument_model": "M"},
+        {"acquisition_id": 2, "source_file": "earlier.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "2026-01-01T00:30:00+01:00",
+         "instrument_serial": "A", "instrument_model": "M"},
+    ]
+    by_file = {
+        r["source_file"]: r["acquisition_order"]
+        for r in Acquisitions.from_records(recs).with_acquisition_order().table.to_pylist()
+    }
+    assert by_file["earlier.raw"] == 1
+    assert by_file["later.raw"] == 2
+
+
+def test_with_acquisition_order_offset_tie_broken_by_id() -> None:
+    # Same UTC instant via different representations (23:45Z == 00:45+01:00) →
+    # a true tie, broken by acquisition_id ascending.
+    recs = [
+        {"acquisition_id": 5, "source_file": "z.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "2025-12-31T23:45:00Z",
+         "instrument_serial": "A", "instrument_model": "M"},
+        {"acquisition_id": 4, "source_file": "off.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "2026-01-01T00:45:00+01:00",
+         "instrument_serial": "A", "instrument_model": "M"},
+    ]
+    by_file = {
+        r["source_file"]: r["acquisition_order"]
+        for r in Acquisitions.from_records(recs).with_acquisition_order().table.to_pylist()
+    }
+    assert by_file["off.raw"] == 1  # id 4 < 5
+    assert by_file["z.raw"] == 2
+
+
+def test_with_acquisition_order_rejects_non_iso_datetime() -> None:
+    recs = [
+        {"acquisition_id": 1, "source_file": "x.raw", "source_kind": "thermo_raw",
+         "acquisition_datetime": "not-a-date",
+         "instrument_serial": "A", "instrument_model": "M"},
+    ]
+    with pytest.raises(ValueError, match="not ISO-8601"):
+        Acquisitions.from_records(recs).with_acquisition_order()
