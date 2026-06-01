@@ -95,6 +95,54 @@ def test_activation_casing_handled():
     assert result.column("status").to_pylist() == ["matched"]
 
 
+def test_et_supplemental_is_consistent_not_mismatch():
+    # MaxQuant compound ETHCD/ETCID vs converter primary "etd" — same scan.
+    search = _search(
+        [
+            _psm(psm_id=0, scan=10, mass_analyzer="FTMS", fragmentation="ETHCD"),
+            _psm(psm_id=1, scan=11, mass_analyzer="FTMS", fragmentation="ETCID"),
+            _psm(psm_id=2, scan=12, mass_analyzer="FTMS", fragmentation="ETD"),  # strict
+        ]
+    )
+    scan_meta = _scan_metadata(
+        [
+            {"scan": 10, "analyzer": "FTMS", "activation_type": "etd"},
+            {"scan": 11, "analyzer": "FTMS", "activation_type": "etd"},
+            {"scan": 12, "analyzer": "FTMS", "activation_type": "etd"},
+        ]
+    )
+    result = cross_validate_against_scan_metadata(search, scan_meta)
+    status = dict(
+        zip(
+            result.column("psm_id").to_pylist(),
+            result.column("status").to_pylist(),
+            strict=True,
+        )
+    )
+    assert status == {
+        0: "activation_supplemental",
+        1: "activation_supplemental",
+        2: "matched",
+    }
+
+
+def test_et_supplemental_with_analyzer_disagreement_is_analyzer_mismatch():
+    # Activation is consistent (ET-supplemental) but the analyzer genuinely
+    # disagrees → analyzer_mismatch, not activation_supplemental.
+    search = _search([_psm(psm_id=0, scan=10, mass_analyzer="ITMS", fragmentation="ETHCD")])
+    scan_meta = _scan_metadata([{"scan": 10, "analyzer": "FTMS", "activation_type": "etd"}])
+    result = cross_validate_against_scan_metadata(search, scan_meta)
+    assert result.column("status").to_pylist() == ["analyzer_mismatch"]
+
+
+def test_genuine_activation_mismatch_still_flagged():
+    # A real disagreement (HCD scan reported as ETD) must NOT be excused.
+    search = _search([_psm(psm_id=0, scan=10, mass_analyzer="FTMS", fragmentation="ETD")])
+    scan_meta = _scan_metadata([{"scan": 10, "analyzer": "FTMS", "activation_type": "hcd"}])
+    result = cross_validate_against_scan_metadata(search, scan_meta)
+    assert result.column("status").to_pylist() == ["activation_mismatch"]
+
+
 def test_raw_file_scoping():
     search = _search(
         [

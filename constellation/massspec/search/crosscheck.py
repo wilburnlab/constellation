@@ -17,6 +17,13 @@ Casing note: ``SCAN_METADATA_TABLE.activation_type`` is lowercase while
 ``PSM_TABLE.fragmentation`` is upper (``HCD``/``CID``/``ETD``); the
 comparator lowercases the PSM value. A comparison where either side is
 null (unconfirmable) counts as a mismatch, conservatively.
+
+ET-supplemental note: for electron-transfer scans with a supplemental
+beam-type activation, MaxQuant reports the *compound* method
+(``ETHCD`` / ``ETCID``) while the converter's filter parser records only
+the *primary* activation token (``etd``). These name the same physical
+scan, so they are reported as ``activation_supplemental`` (consistent),
+not ``activation_mismatch``.
 """
 
 from __future__ import annotations
@@ -25,6 +32,12 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from constellation.massspec.search.search import Search
+
+# MaxQuant's compound ET-supplemental labels (lowercased) and the primary
+# activation token the converter records for them. The mapping is small and
+# closed; extend the value set if other compound labels surface.
+_ET_SUPPLEMENTAL_LABELS = pa.array(["ethcd", "etcid"], type=pa.string())
+_ET_SUPPLEMENTAL_PRIMARY = "etd"
 
 
 def cross_validate_against_scan_metadata(
@@ -57,8 +70,12 @@ def cross_validate_against_scan_metadata(
             psm_id, raw_file, scan, psm_analyzer, scan_analyzer,
             psm_fragmentation, scan_activation, status
 
-        ``status`` ∈ ``{matched, analyzer_mismatch, activation_mismatch,
-        both_mismatch, scan_absent}``.
+        ``status`` ∈ ``{matched, activation_supplemental,
+        analyzer_mismatch, activation_mismatch, both_mismatch,
+        scan_absent}``. ``activation_supplemental`` marks an
+        ET-supplemental row (MaxQuant ``ETHCD``/``ETCID`` vs converter
+        ``etd``) — consistent, not a disagreement; downstream QC can
+        treat ``matched`` + ``activation_supplemental`` as "consistent".
     """
     psms = source.psms if isinstance(source, Search) else source
 
@@ -91,23 +108,38 @@ def cross_validate_against_scan_metadata(
     scan_activation = joined.column("scan_activation")
 
     analyzer_ok = pc.fill_null(pc.equal(psm_analyzer, scan_analyzer), False)
-    activation_ok = pc.fill_null(
-        pc.equal(pc.utf8_lower(psm_frag), scan_activation), False
+    psm_activation = pc.utf8_lower(psm_frag)
+    activation_strict = pc.fill_null(pc.equal(psm_activation, scan_activation), False)
+    # MaxQuant's compound ET-supplemental label (ETHCD/ETCID) vs the
+    # converter's primary token (etd): same scan, reported distinctly.
+    activation_supplemental = pc.fill_null(
+        pc.and_(
+            pc.is_in(psm_activation, value_set=_ET_SUPPLEMENTAL_LABELS),
+            pc.equal(scan_activation, _ET_SUPPLEMENTAL_PRIMARY),
+        ),
+        False,
     )
+    activation_consistent = pc.or_(activation_strict, activation_supplemental)
 
     status = pc.if_else(
         pc.invert(present),
         "scan_absent",
         pc.if_else(
-            pc.and_(analyzer_ok, activation_ok),
+            pc.and_(analyzer_ok, activation_strict),
             "matched",
             pc.if_else(
-                activation_ok,  # analyzer bad, activation ok
-                "analyzer_mismatch",
+                pc.and_(analyzer_ok, activation_supplemental),
+                "activation_supplemental",
                 pc.if_else(
-                    analyzer_ok,  # activation bad, analyzer ok
+                    pc.invert(analyzer_ok),
+                    # analyzer disagrees: activation consistency decides the rest
+                    pc.if_else(
+                        activation_consistent,
+                        "analyzer_mismatch",
+                        "both_mismatch",
+                    ),
+                    # analyzer agrees, activation neither strict nor supplemental
                     "activation_mismatch",
-                    "both_mismatch",
                 ),
             ),
         ),
