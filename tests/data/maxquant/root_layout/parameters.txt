@@ -1,0 +1,8 @@
+Parameter	Value
+Version	1.5.3.30
+Fixed modifications	Carbamidomethyl (C)
+Variable modifications	Oxidation (M);Acetyl (Protein N-term)
+Decoy mode	revert
+PSM FDR	0.01
+Protein FDR	0.01
+Min. peptide Length	7

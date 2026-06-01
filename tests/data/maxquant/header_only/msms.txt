@@ -1,0 +1,1 @@
+Raw file	Scan number	Sequence	Modifications	Modified sequence	Proteins	Charge	Fragmentation	Mass analyzer	Type	m/z	Mass	Mass Error [ppm]	Retention time	PEP	Score	Delta score	Matches	Masses	Reverse	Precursor Full ScanNumber	id	Peptide ID	Mod. peptide ID	Evidence ID

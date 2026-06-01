@@ -57,6 +57,7 @@ import constellation.massspec.library.library
 import constellation.massspec.library.schemas
 import constellation.massspec.io
 import constellation.massspec.io.encyclopedia
+import constellation.massspec.io.maxquant
 import constellation.massspec.io.thermo
 import constellation.massspec.io.thermo._filter
 import constellation.massspec.io.thermo._trailer
@@ -78,6 +79,7 @@ import constellation.massspec.schemas
 import constellation.massspec.cli
 import constellation.massspec.search
 import constellation.massspec.search.collision
+import constellation.massspec.search.crosscheck
 import constellation.massspec.search.encyclopedia
 import constellation.massspec.search.novel
 import constellation.massspec.search.encyclopedia.library_export
