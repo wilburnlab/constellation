@@ -31,7 +31,9 @@ Submodules:
                      now that DE is available)
     calibration      Sigmoidal / Hill / LogLinear standard curves
     losses           kld, spectral_angle, spectral_entropy_loss,
-                     l1_normalize, l2_normalize
+                     l1_normalize, l2_normalize, cosine_similarity,
+                     normalized_dot, pearson_correlation,
+                     spectral_entropy_similarity
     units            CODATA constants + ppm/Da conversions
 """
 
@@ -50,11 +52,15 @@ from .distributions import (
 from .peaks import EMGPeak, GaussianPeak, emg_log_pdf, emg_pdf
 from .calibration import Hill, LogLinear, Sigmoidal
 from .losses import (
+    cosine_similarity,
     kld,
     l1_normalize,
     l2_normalize,
+    normalized_dot,
+    pearson_correlation,
     spectral_angle,
     spectral_entropy_loss,
+    spectral_entropy_similarity,
 )
 from . import units
 
@@ -89,6 +95,10 @@ __all__ = [
     "spectral_entropy_loss",
     "l1_normalize",
     "l2_normalize",
+    "cosine_similarity",
+    "normalized_dot",
+    "pearson_correlation",
+    "spectral_entropy_similarity",
     # Submodules
     "units",
 ]
