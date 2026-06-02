@@ -1,0 +1,104 @@
+# CI — runs on every push and PR to main. Two required gates:
+#   Lint (ruff)    ruff check (E/F/W per pyproject; not ruff format)
+#   Tests (pytest) full pytest suite in the canonical conda env
+#
+# The job `name:` values below are load-bearing: they become the check-run
+# "context" strings that branch protection requires. Renaming a job means
+# re-running the `gh api .../protection` PUT with new contexts.
+#
+# Install mirrors environment.yml (the canonical dev setup) via micromamba,
+# then adds the viz+ms extras that environment.yml's `-e .[dev,sequencing]`
+# line omits, so viz/ms tests run instead of skipping.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel an in-flight run when a newer commit lands on the same ref / PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only token is sufficient; CI never writes to the repo.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # setuptools-scm derives the version from git tags; full history
+          # avoids a 0.0.0 fallback when the editable install imports the pkg.
+          fetch-depth: 0
+
+      - name: Set up conda env (micromamba)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          cache-environment: true   # re-solves only when environment.yml changes
+          cache-downloads: true
+          environment-name: constellation
+
+      - name: Ruff version
+        shell: micromamba-shell {0}
+        run: ruff --version
+
+      - name: Ruff check (lint)
+        shell: micromamba-shell {0}
+        run: ruff check .
+
+  tests:
+    name: Tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Restore pip's wheel cache so the large torch CPU wheel and other
+      # pip-block deps aren't re-downloaded every run.
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('environment.yml', 'pyproject.toml') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Set up conda env (micromamba)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          cache-environment: true
+          cache-downloads: true
+          environment-name: constellation
+
+      # environment.yml installs `-e .[dev,sequencing]`; viz+ms extras are NOT
+      # in that line, so viz/ms tests would importorskip. Add them so the suite
+      # exercises those paths.
+      - name: Install viz + ms extras
+        shell: micromamba-shell {0}
+        run: python -m pip install -e .[viz,ms]
+
+      - name: Tool sanity check (informational)
+        shell: micromamba-shell {0}
+        run: |
+          echo "python: $(python --version)"
+          for t in minimap2 samtools mmseqs java javac; do
+            if command -v "$t" >/dev/null 2>&1; then
+              echo "found: $t -> $(command -v "$t")"
+            else
+              echo "MISSING (its tests will skip): $t"
+            fi
+          done
+
+      - name: Run pytest (full suite, incl. slow)
+        shell: micromamba-shell {0}
+        # pyproject addopts already supplies -v.
+        run: pytest
