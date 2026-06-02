@@ -32,9 +32,7 @@ from constellation.sequencing.transcriptome.demux.adapters import (
     AdapterSlot,
     BarcodeSlot,
     LibraryDesign,
-    PolyASlot,
     Segment,
-    TranscriptSlot,
 )
 from constellation.sequencing.transcriptome.demux.classify import ReadStatus
 

@@ -284,7 +284,7 @@ def test_demux_pipeline_threads_4_matches_threads_1(tmp_path: pathlib.Path) -> N
         ],
     )
 
-    art_a = run_demux_pipeline(
+    run_demux_pipeline(
         _FIXTURE_SAM,
         library_design="cdna_wilburn_v1",
         samples=samples,
@@ -293,7 +293,7 @@ def test_demux_pipeline_threads_4_matches_threads_1(tmp_path: pathlib.Path) -> N
         batch_size=1000,
         n_workers=1,
     )
-    art_b = run_demux_pipeline(
+    run_demux_pipeline(
         _FIXTURE_SAM,
         library_design="cdna_wilburn_v1",
         samples=samples,

@@ -39,7 +39,6 @@ parent ``resolve`` stage writes its own marker on completion.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -61,10 +60,8 @@ from constellation.sequencing.transcriptome.demux.demux import (
     resolve_demux,
 )
 from constellation.sequencing.transcriptome.demux.designs import load_design
-from constellation.sequencing.transcriptome.demux.orf import ORF_TABLE, predict_orfs
+from constellation.sequencing.transcriptome.demux.orf import predict_orfs
 from constellation.sequencing.transcriptome.demux.quant import (
-    PARTIAL_QUANT_TABLE,
-    PROTEIN_COUNT_TABLE,
     FastaRecord,
     aggregate_partial_quants,
     build_partial_quant,

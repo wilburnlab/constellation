@@ -119,5 +119,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["F401"]  # allow unused imports in test files
+# E402: tests gate optional deps with `pytest.importorskip(...)` then import
+# modules that need them — those imports are intentionally below the guard.
+"tests/*" = ["F401", "E402"]  # allow unused imports + post-importorskip imports
 "**/__init__.py" = ["F401"]  # package re-exports
