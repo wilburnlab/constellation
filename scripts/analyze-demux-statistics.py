@@ -378,7 +378,6 @@ def main() -> int:
     #    AND predicate-pushdown for the segment_kind filter — entire
     #    operation is multithreaded across all parquet shards via
     #    Arrow's I/O thread pool, no Python in the loop.
-    keep_kinds_arr = pa.array(list(_KEEP_KINDS))
     if args.progress:
         seg_ds = ds.dataset(str(seg_dir), format="parquet")
         print(

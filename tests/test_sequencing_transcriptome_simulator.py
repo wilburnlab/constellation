@@ -160,14 +160,8 @@ def test_assemble_polyA_artifact_expanded_runs_long() -> None:
         **{**spec.__dict__, "polyA_artifact": "expanded"}
     )
     seq, _ = assemble_sequence(spec_expanded, CDNA_WILBURN_V1, rng=rng)
-    # Find the longest A-run.
-    longest = max(
-        (run for run in seq.split("A") if run == ""),
-        default="",
-        key=len,
-    )
-    # Longest A-run = transcript may have stretches; check that we have
-    # at least nominal+8 = 30 consecutive A's somewhere.
+    # Transcript may have stretches; check we have at least nominal+8 = 30
+    # consecutive A's somewhere.
     assert "A" * 30 in seq
 
 

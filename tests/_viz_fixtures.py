@@ -103,8 +103,8 @@ def install_fake_reference(
         f'organism = "{organism}"',
         f'source = "{source}"',
         f'release = "{release}"',
-        f'constellation_version = "0.0.0+test"',
-        f'fetched_at = "2026-05-22T00:00:00Z"',
+        'constellation_version = "0.0.0+test"',
+        'fetched_at = "2026-05-22T00:00:00Z"',
     ]
     if assembly_accession is not None:
         meta_lines.append(f'assembly_accession = "{assembly_accession}"')

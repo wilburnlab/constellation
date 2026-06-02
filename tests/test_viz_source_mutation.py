@@ -20,7 +20,7 @@ import pytest
 fastapi_testclient = pytest.importorskip("fastapi.testclient")
 TestClient = fastapi_testclient.TestClient
 
-from tests._viz_fixtures import (
+from _viz_fixtures import (
     DEFAULT_HANDLE,
     build_viz_session,
     install_fake_reference,
