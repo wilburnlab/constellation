@@ -2,13 +2,44 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
-from constellation.core.signal import bounds_within_tolerance, nearest_within_tolerance
+from constellation.core.signal import (
+    bounds_within_tolerance,
+    nearest_within_tolerance,
+    tolerance_window,
+)
+from constellation.core.stats.units import ppm_to_da
 
 
 def _f64(*xs):
     return torch.tensor(list(xs), dtype=torch.float64)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# tolerance_window — shared ppm/Da half-width
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_tolerance_window_ppm_matches_ppm_to_da():
+    q = _f64(100.0, 500.0, 1000.0)
+    assert torch.equal(tolerance_window(q, 20.0, "ppm"), ppm_to_da(20.0, q))
+
+
+def test_tolerance_window_ppm_is_default_unit():
+    q = _f64(100.0, 500.0, 1000.0)
+    assert torch.equal(tolerance_window(q, 20.0), tolerance_window(q, 20.0, "ppm"))
+
+
+def test_tolerance_window_da_is_constant():
+    q = _f64(100.0, 500.0, 1000.0)
+    assert torch.equal(tolerance_window(q, 0.01, "Da"), torch.full_like(q, 0.01))
+
+
+def test_tolerance_window_rejects_bad_unit():
+    with pytest.raises(ValueError, match="unit"):
+        tolerance_window(_f64(100.0), 1.0, "foo")  # type: ignore[arg-type]
 
 
 def test_nearest_ppm_match_and_reject():

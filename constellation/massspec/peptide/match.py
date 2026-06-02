@@ -17,9 +17,11 @@ Two layers:
   Spectronaut, mzPAF all use "ion assignment" for "say what fragment
   identity an observed peak corresponds to").
 
-The matcher uses ``torch.searchsorted`` against the sorted reference
-list — O((n_query + n_ref) log n_ref) — rather than the
-O(n_query × n_ref) broadcast-grid version cartographer prototyped.
+The matcher re-bases on the shared ``core.signal`` kernel
+(``tolerance_window`` for the ppm/Da window math and
+``bounds_within_tolerance`` for the candidate slice via
+``torch.searchsorted``) — O((n_query + n_ref) log n_ref) — rather than
+the O(n_query × n_ref) broadcast-grid version cartographer prototyped.
 The grid version is fine on dlib-scale spectra (~200 peaks × ~50
 theoretical) but scales catastrophically on full mzML scans
 (thousands of peaks).
@@ -43,6 +45,7 @@ import torch
 
 from constellation.core.chem.modifications import UNIMOD, ModVocab
 from constellation.core.sequence.proforma import ProFormaResult
+from constellation.core.signal import bounds_within_tolerance, tolerance_window
 from constellation.massspec.peptide.ions import IonType, fragment_ladder
 
 # ──────────────────────────────────────────────────────────────────────
@@ -155,15 +158,11 @@ def match_mz(
     rmz_sorted, ref_sort_idx = torch.sort(rmz)
     ref_sort_idx_list = ref_sort_idx.tolist()
 
-    # Per-query tolerance vector.
-    if tolerance_unit == "ppm":
-        tol = qmz * (tolerance * 1e-6)
-    else:  # Da
-        tol = torch.full_like(qmz, float(tolerance))
+    # Per-query tolerance half-width (shared ppm/Da window math).
+    tol = tolerance_window(qmz, tolerance, tolerance_unit)
 
-    # Candidate slice [left[i], right[i]) for each query i.
-    left = torch.searchsorted(rmz_sorted, qmz - tol, side="left")
-    right = torch.searchsorted(rmz_sorted, qmz + tol, side="right")
+    # Candidate slice [left[i], right[i]) for each query i — shared kernel.
+    left, right = bounds_within_tolerance(rmz_sorted, qmz, tolerance, tolerance_unit)
 
     qmz_list = qmz.tolist()
     rmz_sorted_list = rmz_sorted.tolist()

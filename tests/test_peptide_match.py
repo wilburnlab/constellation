@@ -259,3 +259,107 @@ def assign_fragments_helper(pep):
     from constellation.massspec.peptide.ions import fragment_ladder
 
     return fragment_ladder(pep, return_tensor=False)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Equivalence: match_mz vs a from-scratch reference of the three-branch
+# policy — locks the core.signal re-base against behavioral drift.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _reference_matches(query_mz, ref_mz, tolerance, unit):
+    """Pure-Python reference for match_mz's 0/1/2+ degenerate/closest policy.
+
+    Builds the window via the same ``tolerance_window`` helper so this
+    isolates the loop/branch logic from the (separately pinned) window
+    arithmetic. Returns the set of ``(query_idx, ref_idx)`` pairs.
+    """
+    import bisect
+
+    from constellation.core.signal import tolerance_window
+
+    qmz = query_mz.to(torch.float64).tolist()
+    rmz = ref_mz.to(torch.float64).tolist()
+    if not qmz or not rmz:
+        return set()
+
+    order = sorted(range(len(rmz)), key=lambda j: rmz[j])  # stable; refs distinct
+    rmz_sorted = [rmz[j] for j in order]
+    tol = tolerance_window(query_mz.to(torch.float64), tolerance, unit).tolist()
+
+    pairs = set()
+    for i, q in enumerate(qmz):
+        lo = bisect.bisect_left(rmz_sorted, q - tol[i])  # searchsorted side="left"
+        hi = bisect.bisect_right(rmz_sorted, q + tol[i])  # searchsorted side="right"
+        n = hi - lo
+        if n == 0:
+            continue
+        if n == 1:
+            pairs.add((i, order[lo]))
+            continue
+        span = rmz_sorted[hi - 1] - rmz_sorted[lo]
+        if span <= tol[i]:  # mutually degenerate → emit all
+            for sj in range(lo, hi):
+                pairs.add((i, order[sj]))
+        else:  # pick closest (strict <, first-encountered wins ties)
+            best, best_d = lo, abs(rmz_sorted[lo] - q)
+            for sj in range(lo + 1, hi):
+                d = abs(rmz_sorted[sj] - q)
+                if d < best_d:
+                    best, best_d = sj, d
+            pairs.add((i, order[best]))
+    return pairs
+
+
+def test_match_mz_matches_reference_policy_over_random_inputs():
+    """match_mz agrees pair-for-pair with the reference across random
+    spectra spanning ppm/Da, clustered (degenerate) refs, and orphans."""
+    import random
+
+    rng = random.Random(20260601)
+    for trial in range(200):
+        n_ref = rng.randint(1, 25)
+        # Distinct refs (avoid exact ties so the sort permutation is
+        # unambiguous between torch.sort and Python sorted).
+        refs: list[float] = []
+        seen: set[float] = set()
+        while len(refs) < n_ref:
+            base = rng.uniform(100.0, 2000.0)
+            # Half the time, cluster near an existing ref to provoke the
+            # degenerate / closest-pick branches.
+            if refs and rng.random() < 0.5:
+                base = refs[rng.randrange(len(refs))] + rng.uniform(-0.02, 0.02)
+            val = round(base, 6)
+            if val in seen or val <= 0:
+                continue
+            seen.add(val)
+            refs.append(val)
+
+        n_query = rng.randint(0, 20)
+        queries: list[float] = []
+        for _ in range(n_query):
+            if refs and rng.random() < 0.7:  # near a ref
+                q = refs[rng.randrange(len(refs))] + rng.uniform(-0.03, 0.03)
+            else:  # orphan
+                q = rng.uniform(100.0, 2000.0)
+            queries.append(q)
+
+        if rng.random() < 0.5:
+            tolerance, unit = rng.choice([5.0, 20.0, 100.0]), "ppm"
+        else:
+            tolerance, unit = rng.choice([0.005, 0.01, 0.05]), "Da"
+
+        query_mz = torch.tensor(queries, dtype=torch.float64)
+        ref_mz = torch.tensor(refs, dtype=torch.float64)
+
+        got = {
+            (m.query_idx, m.ref_idx)
+            for m in match_mz(
+                query_mz, ref_mz, tolerance=tolerance, tolerance_unit=unit
+            )
+        }
+        want = _reference_matches(query_mz, ref_mz, tolerance, unit)
+        assert got == want, (
+            f"trial {trial}: tol={tolerance}{unit} "
+            f"refs={refs} queries={queries}\n got={sorted(got)}\nwant={sorted(want)}"
+        )
