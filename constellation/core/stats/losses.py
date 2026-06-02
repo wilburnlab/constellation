@@ -172,3 +172,113 @@ def spectral_entropy_loss(
 
     obs_frac = (signal.sum(dim=-1) + eps) / (target.sum(dim=-1) + eps)
     return obs_frac * signal_kl + (1.0 - obs_frac) * interference_entropy
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Cosine-family similarities (raw, un-angularized)
+# ──────────────────────────────────────────────────────────────────────
+#
+# Reduction is over the LAST axis: inputs are ``(..., K)`` with the K
+# spectral channels on the trailing axis, and the result has shape
+# ``input.shape[:-1]`` (a 0-d scalar for a single ``(K,)`` spectrum,
+# ``(B,)`` for a ``(B, K)`` batch). This is the idiomatic complement to
+# ``spectral_angle``'s ``batch_dim`` flatten convention; for 1-D and 2-D
+# inputs the two agree element-for-element, so the identity
+# ``spectral_angle = 1 - 2·arccos(cosine_similarity)/π`` holds exactly.
+# ``target == -1`` positions are masked with the same soft sentinel mask
+# ``spectral_angle`` uses, so a metric and its angular form stay aligned.
+
+
+def _sentinel_mask(target: torch.Tensor, eps: float) -> torch.Tensor:
+    """Soft sentinel mask matching ``spectral_angle`` — ~0 where
+    ``target == -1``, ~1 elsewhere; vmap-safe (no boolean indexing)."""
+    return (target + 1.0) / (target + 1.0 + eps)
+
+
+def _l2_normalize_lastaxis(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """L2-normalize over the last axis only (clean ``(..., K) → (..., K)``)."""
+    denom = x.square().sum(dim=-1, keepdim=True).clamp(min=eps).sqrt()
+    return x / denom
+
+
+def cosine_similarity(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """Cosine similarity over the last axis. ``1.0`` for parallel vectors;
+    non-negative intensity vectors give ``[0, 1]``.
+
+    The raw dot product of the L2-normalized vectors — the quantity
+    ``spectral_angle`` feeds to ``arccos``. ``target == -1`` positions are
+    masked. Returns ``input.shape[:-1]``."""
+    mask = _sentinel_mask(target, eps)
+    pn = _l2_normalize_lastaxis(pred * mask, eps)
+    tn = _l2_normalize_lastaxis(target * mask, eps)
+    return (pn * tn).sum(dim=-1).clamp(min=-1.0, max=1.0)
+
+
+def normalized_dot(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """The "normalized dot product" library-search score — identical to
+    :func:`cosine_similarity` (dot product of L2-normalized intensity
+    vectors). Exposed under its spectral-library name for the scoring
+    comparison; its L2 geometry over-weights intense-ion shot noise (the
+    Part-I point)."""
+    return cosine_similarity(pred, target, eps=eps)
+
+
+def pearson_correlation(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """Pearson correlation over the last axis = cosine of the mean-centered
+    vectors. ``+1`` for ``pred = a·target + b`` (a > 0), ``-1`` for
+    anti-correlation. ``target == -1`` positions are masked (the mean is
+    taken over unmasked channels). Returns ``input.shape[:-1]``."""
+    mask = _sentinel_mask(target, eps)
+    n = mask.sum(dim=-1, keepdim=True).clamp(min=eps)
+    pred_mean = (pred * mask).sum(dim=-1, keepdim=True) / n
+    target_mean = (target * mask).sum(dim=-1, keepdim=True) / n
+    pc = (pred - pred_mean) * mask
+    tc = (target - target_mean) * mask
+    pn = _l2_normalize_lastaxis(pc, eps)
+    tn = _l2_normalize_lastaxis(tc, eps)
+    return (pn * tn).sum(dim=-1).clamp(min=-1.0, max=1.0)
+
+
+def spectral_entropy_similarity(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    pseudocount: float = 1e-3,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """Spectral-entropy similarity in ``[0, 1]`` (Li et al., Nat. Methods
+    2021) over the last axis. ``1.0`` for identical spectra, ``0.0`` for
+    disjoint support.
+
+    Equals ``1 - JSD(A, B)/ln 2`` where ``A``, ``B`` are the L1-normalized
+    intensity vectors and ``JSD`` is the Jensen–Shannon divergence; written
+    in Li's entropy form as
+    ``1 - (2·S_AB - S_A - S_B)/ln 4`` with ``S`` the Shannon entropy and
+    ``S_AB`` the entropy of ``(A + B)/2``. (The optional low-entropy
+    intensity reweighting from the paper is omitted — this is the core
+    similarity.) ``target == -1`` positions are masked. Returns
+    ``input.shape[:-1]``."""
+    keep = (pred >= 0) & (target >= 0)
+    a = l1_normalize(pred, mask=keep, pseudocount=pseudocount, eps=eps)
+    b = l1_normalize(target, mask=keep, pseudocount=pseudocount, eps=eps)
+    m = 0.5 * (a + b)
+
+    def _entropy(p: torch.Tensor) -> torch.Tensor:
+        return -(p * p.clamp(min=eps).log()).sum(dim=-1)
+
+    return 1.0 - (2.0 * _entropy(m) - _entropy(a) - _entropy(b)) / math.log(4.0)

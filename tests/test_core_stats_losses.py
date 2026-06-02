@@ -161,3 +161,109 @@ def test_spectral_entropy_loss_high_signal_approaches_kld():
     kl = losses.kld(pred, target, pseudocount=0.0, reduce="sum").item()
     # Loose tolerance — exact equivalence requires sigmoid → 1 exactly.
     assert math.isclose(out, kl, abs_tol=1e-3)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# cosine_similarity / normalized_dot
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_cosine_identical_returns_one():
+    x = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64)
+    assert math.isclose(losses.cosine_similarity(x, x).item(), 1.0, abs_tol=1e-9)
+
+
+def test_cosine_orthogonal_returns_zero():
+    p = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64)
+    q = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float64)
+    assert math.isclose(losses.cosine_similarity(p, q).item(), 0.0, abs_tol=1e-9)
+
+
+def test_cosine_matches_spectral_angle_relation():
+    """spectral_angle = 1 - 2·arccos(cosine)/π, exactly, on a 1-D pair."""
+    p = torch.tensor([1.0, 2.0, 3.0, 0.5], dtype=torch.float64)
+    t = torch.tensor([2.0, 1.0, 4.0, 1.5], dtype=torch.float64)
+    cos = losses.cosine_similarity(p, t).item()
+    sa = losses.spectral_angle(p, t).item()
+    assert math.isclose(sa, 1.0 - 2.0 * math.acos(cos) / math.pi, abs_tol=1e-9)
+
+
+def test_normalized_dot_is_cosine_alias():
+    p = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)
+    t = torch.tensor([3.0, 2.0, 1.0], dtype=torch.float64)
+    assert torch.allclose(
+        losses.normalized_dot(p, t), losses.cosine_similarity(p, t)
+    )
+
+
+def test_cosine_batched_shape_and_values():
+    p = torch.tensor([[1.0, 0.0], [0.5, 0.5]], dtype=torch.float64)
+    t = torch.tensor([[1.0, 0.0], [0.5, 0.5]], dtype=torch.float64)
+    out = losses.cosine_similarity(p, t)
+    assert out.shape == (2,)
+    assert torch.allclose(out, torch.ones(2, dtype=torch.float64), atol=1e-9)
+
+
+def test_cosine_mask_sentinel():
+    """target == -1 positions excluded — padding both with a (999, -1)
+    channel must not move the score."""
+    p = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)
+    t = torch.tensor([2.0, 1.0, 4.0], dtype=torch.float64)
+    p_pad = torch.tensor([1.0, 2.0, 3.0, 999.0], dtype=torch.float64)
+    t_pad = torch.tensor([2.0, 1.0, 4.0, -1.0], dtype=torch.float64)
+    a = losses.cosine_similarity(p, t).item()
+    b = losses.cosine_similarity(p_pad, t_pad).item()
+    assert math.isclose(a, b, abs_tol=1e-9)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# pearson_correlation
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_pearson_positive_linear_returns_one():
+    x = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64)
+    y = 2.0 * x + 5.0  # all positive, no -1 sentinel
+    assert math.isclose(losses.pearson_correlation(x, y).item(), 1.0, abs_tol=1e-9)
+
+
+def test_pearson_anticorrelation_returns_minus_one():
+    x = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64)
+    y = -2.0 * x + 20.0  # [18,16,14,12] — all positive
+    assert math.isclose(losses.pearson_correlation(x, y).item(), -1.0, abs_tol=1e-9)
+
+
+def test_pearson_batched_shape():
+    p = torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]], dtype=torch.float64)
+    t = torch.tensor([[2.0, 4.0, 6.0], [6.0, 4.0, 2.0]], dtype=torch.float64)
+    out = losses.pearson_correlation(p, t)
+    assert out.shape == (2,)
+    assert torch.allclose(out, torch.ones(2, dtype=torch.float64), atol=1e-9)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# spectral_entropy_similarity
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_spectral_entropy_similarity_identical_returns_one():
+    p = torch.tensor([0.4, 0.3, 0.2, 0.1], dtype=torch.float64)
+    assert math.isclose(
+        losses.spectral_entropy_similarity(p, p).item(), 1.0, abs_tol=1e-9
+    )
+
+
+def test_spectral_entropy_similarity_disjoint_returns_zero():
+    p = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    q = torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=torch.float64)
+    out = losses.spectral_entropy_similarity(p, q, pseudocount=0.0).item()
+    assert math.isclose(out, 0.0, abs_tol=1e-9)
+
+
+def test_spectral_entropy_similarity_symmetric():
+    p = torch.tensor([0.5, 0.3, 0.2], dtype=torch.float64)
+    q = torch.tensor([0.2, 0.3, 0.5], dtype=torch.float64)
+    a = losses.spectral_entropy_similarity(p, q).item()
+    b = losses.spectral_entropy_similarity(q, p).item()
+    assert math.isclose(a, b, abs_tol=1e-12)
+    assert 0.0 <= a <= 1.0
