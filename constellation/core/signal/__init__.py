@@ -12,9 +12,11 @@ from __future__ import annotations
 from constellation.core.signal.matching import (
     bounds_within_tolerance,
     nearest_within_tolerance,
+    tolerance_window,
 )
 
 __all__ = [
     "nearest_within_tolerance",
     "bounds_within_tolerance",
+    "tolerance_window",
 ]

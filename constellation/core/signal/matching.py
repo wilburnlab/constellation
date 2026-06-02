@@ -45,10 +45,19 @@ from constellation.core.stats.units import ppm_to_da
 ToleranceUnit = Literal["ppm", "Da"]
 
 
-def _window(
-    queries: torch.Tensor, tolerance: float, unit: ToleranceUnit
+def tolerance_window(
+    queries: torch.Tensor, tolerance: float, unit: ToleranceUnit = "ppm"
 ) -> torch.Tensor:
-    """Half-width of the tolerance window at each query value (float64)."""
+    """Half-width of the ppm/Da tolerance window at each query value.
+
+    Returns a float64 tensor shaped like ``queries``. ppm is computed at
+    the query value via :func:`core.stats.units.ppm_to_da`
+    (``half = tolerance * query * 1e-6``); Da is a constant ``tolerance``
+    broadcast to the query shape. The single source of the window math
+    shared by :func:`nearest_within_tolerance`,
+    :func:`bounds_within_tolerance`, and
+    :func:`massspec.peptide.match.match_mz`.
+    """
     if unit == "ppm":
         return ppm_to_da(tolerance, queries)
     if unit == "Da":
@@ -118,7 +127,7 @@ def nearest_within_tolerance(
     best_axis = torch.where(use_left, axis_left, axis_right)
 
     signed_delta = queries - best_axis
-    within_mask = signed_delta.abs() <= _window(queries, tolerance, unit)
+    within_mask = signed_delta.abs() <= tolerance_window(queries, tolerance, unit)
     return best_idx, within_mask, signed_delta
 
 
@@ -141,7 +150,7 @@ def bounds_within_tolerance(
     """
     queries = queries.to(torch.float64)
     sorted_axis = sorted_axis.to(torch.float64)
-    half = _window(queries, tolerance, unit)
+    half = tolerance_window(queries, tolerance, unit)
     lo = torch.searchsorted(sorted_axis, (queries - half).contiguous(), side="left")
     hi = torch.searchsorted(sorted_axis, (queries + half).contiguous(), side="right")
     return lo, hi
