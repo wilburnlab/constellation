@@ -30,8 +30,10 @@ dependencies = [
     # still BANNED from being imported by core.sequence.proforma itself
     # — the parser is independently implemented via lark + the upstream
     # EBNF; pyteomics is only used for cross-validation in tests and the
-    # future mzML reader.
-    "pyteomics>=4.7",
+    # future mzML reader. The [XML] extra pulls lxml, which pyteomics
+    # lazily imports for its UNIMOD/mzML XML readers (exercised by the
+    # ProForma↔pyteomics interop tests).
+    "pyteomics[XML]>=4.7",
 ]
 
 [project.optional-dependencies]
