@@ -103,9 +103,7 @@ def test_compare_spectra_dispatch_parity():
     assert torch.allclose(
         compare_spectra(q, r, method="cosine"), cosine_similarity(q, r)
     )
-    assert torch.allclose(
-        compare_spectra(q, r, method="dot"), cosine_similarity(q, r)
-    )
+    assert torch.allclose(compare_spectra(q, r, method="dot"), cosine_similarity(q, r))
     assert torch.allclose(
         compare_spectra(q, r, method="kld"),
         kld(r, q, pseudocount=1e-3, reduce="none"),
@@ -135,3 +133,40 @@ def test_compare_spectra_spectral_angle_batched():
     out = compare_spectra(q, r, method="spectral_angle")
     assert out.shape == (2,)
     assert math.isclose(out[0].item(), 1.0, abs_tol=1e-6)
+
+
+def test_compare_spectra_broadcasts_single_reference():
+    """Replicate-vs-consensus: a (B, K) query against a single (K,) reference
+    must work for every method (the common case). Regression for the
+    spectral_angle batch_dim path that broke on a 1-D reference."""
+    torch.manual_seed(0)
+    B, K = 4, 6
+    ref = torch.rand(K, dtype=torch.float64) + 0.1  # a single (K,) consensus
+    counts = torch.randint(1, 50, (B, K)).to(torch.float64)
+    for method in [
+        "cosine",
+        "dot",
+        "pearson",
+        "spectral_angle",
+        "spectral_entropy",
+        "kld",
+    ]:
+        out = compare_spectra(counts, ref, method=method)
+        assert out.shape == (B,), f"{method} did not broadcast (K,) reference"
+        assert torch.isfinite(out).all(), method
+    md = compare_spectra(counts, ref, method="multinomial_deviance", as_counts=True)
+    assert md.shape == (B,)
+
+
+def test_compare_spectra_spectral_angle_matches_losses_on_1d():
+    """The cosine-derived spectral_angle path equals losses.spectral_angle on
+    1-D inputs (the identity it relies on)."""
+    from constellation.core.stats.losses import spectral_angle
+
+    q = torch.tensor([5.0, 3.0, 2.0, 1.0], dtype=torch.float64)
+    r = torch.tensor([4.0, 4.0, 1.0, 2.0], dtype=torch.float64)
+    assert math.isclose(
+        compare_spectra(q, r, method="spectral_angle").item(),
+        spectral_angle(q, r).item(),
+        abs_tol=1e-9,
+    )

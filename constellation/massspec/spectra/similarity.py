@@ -19,6 +19,7 @@ disagreement with N (shot noise), over-penalizing intense ions. See
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 import torch
@@ -28,7 +29,6 @@ from constellation.core.stats.losses import (
     kld,
     normalized_dot,
     pearson_correlation,
-    spectral_angle,
     spectral_entropy_similarity,
 )
 
@@ -101,7 +101,9 @@ def compare_spectra(
 
     Inputs are aligned intensity / count vectors ``(K,)`` or a batch
     ``(B, K)`` (channels on the last axis); the result is
-    ``query.shape[:-1]``.
+    ``query.shape[:-1]``. ``reference`` broadcasts over the last axis, so a
+    single ``(K,)`` reference scored against a ``(B, K)`` query (the
+    replicate-vs-consensus case) returns ``(B,)`` for every method.
 
     Similarities (**higher = more similar**): ``cosine``, ``dot`` (=
     normalized dot product, identical to ``cosine``), ``pearson``,
@@ -120,9 +122,14 @@ def compare_spectra(
     if method == "pearson":
         return pearson_correlation(query, reference, eps=eps)
     if method == "spectral_angle":
-        # ``spectral_angle`` uses the legacy ``batch_dim`` flatten convention;
-        # adapt so a ``(B, K)`` batch reduces per-row like the others.
-        return spectral_angle(query, reference, eps=eps, batch_dim=query.ndim >= 2)
+        # Derive from the broadcast-safe last-axis cosine via the exact identity
+        # ``spectral_angle = 1 - 2·arccos(cosine)/π``. Calling
+        # ``losses.spectral_angle`` directly would force its legacy ``batch_dim``
+        # flatten path, which raises when a ``(B, K)`` query is scored against a
+        # single ``(K,)`` reference (the replicate-vs-consensus case) — whereas
+        # every other metric here broadcasts a ``(K,)`` reference cleanly.
+        cos = cosine_similarity(query, reference, eps=eps)
+        return 1.0 - 2.0 * cos.arccos() / math.pi
     if method == "spectral_entropy":
         return spectral_entropy_similarity(
             query, reference, pseudocount=pseudocount, eps=eps
