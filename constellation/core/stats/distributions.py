@@ -3,7 +3,7 @@
 Continuous: NormalDistribution, StudentT, GeneralizedNormal, Beta,
 Gamma, LogNormal.
 Discrete: Poisson, Multinomial.
-Vector / simplex: Dirichlet.
+Vector / simplex: Dirichlet, DirichletMultinomial.
 
 All carry `.log_prob(x)` and `.cdf(x)` (where closed-form). Multinomial
 and Dirichlet `.cdf` raise — no closed form for K ≥ 3. Parameters are
@@ -83,9 +83,7 @@ class StudentT(Distribution):
 
     _LOG_NU_MIN: float = math.log(0.5)
 
-    def __init__(
-        self, mu: float = 0.0, sigma: float = 1.0, nu: float = 4.0
-    ) -> None:
+    def __init__(self, mu: float = 0.0, sigma: float = 1.0, nu: float = 4.0) -> None:
         super().__init__()
         self.mu = nn.Parameter(torch.tensor(mu, dtype=torch.float64))
         self.log_sigma = nn.Parameter(
@@ -147,17 +145,13 @@ class GeneralizedNormal(Distribution):
     _LOG_BETA_MIN: float = math.log(0.1)
     _LOG_BETA_MAX: float = math.log(20.0)
 
-    def __init__(
-        self, mu: float = 0.0, alpha: float = 1.0, beta: float = 2.0
-    ) -> None:
+    def __init__(self, mu: float = 0.0, alpha: float = 1.0, beta: float = 2.0) -> None:
         super().__init__()
         self.mu = nn.Parameter(torch.tensor(mu, dtype=torch.float64))
         self.log_alpha = nn.Parameter(
             torch.tensor(math.log(alpha), dtype=torch.float64)
         )
-        self.log_beta = nn.Parameter(
-            torch.tensor(math.log(beta), dtype=torch.float64)
-        )
+        self.log_beta = nn.Parameter(torch.tensor(math.log(beta), dtype=torch.float64))
 
     @property
     def alpha(self) -> torch.Tensor:
@@ -165,9 +159,7 @@ class GeneralizedNormal(Distribution):
 
     @property
     def beta(self) -> torch.Tensor:
-        return self.log_beta.clamp(
-            min=self._LOG_BETA_MIN, max=self._LOG_BETA_MAX
-        ).exp()
+        return self.log_beta.clamp(min=self._LOG_BETA_MIN, max=self._LOG_BETA_MAX).exp()
 
     def log_prob(self, x: torch.Tensor) -> torch.Tensor:
         alpha = self.alpha
@@ -211,9 +203,7 @@ class Beta(Distribution):
         self.log_alpha = nn.Parameter(
             torch.tensor(math.log(alpha), dtype=torch.float64)
         )
-        self.log_beta = nn.Parameter(
-            torch.tensor(math.log(beta), dtype=torch.float64)
-        )
+        self.log_beta = nn.Parameter(torch.tensor(math.log(beta), dtype=torch.float64))
 
     @property
     def alpha(self) -> torch.Tensor:
@@ -257,9 +247,7 @@ class Gamma(Distribution):
         self.log_alpha = nn.Parameter(
             torch.tensor(math.log(alpha), dtype=torch.float64)
         )
-        self.log_beta = nn.Parameter(
-            torch.tensor(math.log(beta), dtype=torch.float64)
-        )
+        self.log_beta = nn.Parameter(torch.tensor(math.log(beta), dtype=torch.float64))
 
     @property
     def alpha(self) -> torch.Tensor:
@@ -330,9 +318,7 @@ class Poisson(Distribution):
 
     def __init__(self, rate: float = 1.0) -> None:
         super().__init__()
-        self.log_rate = nn.Parameter(
-            torch.tensor(math.log(rate), dtype=torch.float64)
-        )
+        self.log_rate = nn.Parameter(torch.tensor(math.log(rate), dtype=torch.float64))
 
     @property
     def rate(self) -> torch.Tensor:
@@ -409,9 +395,7 @@ class Dirichlet(Distribution):
     shape `(K,)`. `log_prob(x)` accepts simplex inputs (or pre-softmax
     logits via `from_logits=True`). `cdf` raises (no closed form)."""
 
-    def __init__(
-        self, alpha: torch.Tensor | None = None, K: int = 3
-    ) -> None:
+    def __init__(self, alpha: torch.Tensor | None = None, K: int = 3) -> None:
         super().__init__()
         if alpha is None:
             init = torch.zeros(K, dtype=torch.float64)  # alpha=1 (uniform)
@@ -430,9 +414,7 @@ class Dirichlet(Distribution):
     def alpha(self) -> torch.Tensor:
         return self.log_alpha.exp()
 
-    def log_prob(
-        self, x: torch.Tensor, *, from_logits: bool = False
-    ) -> torch.Tensor:
+    def log_prob(self, x: torch.Tensor, *, from_logits: bool = False) -> torch.Tensor:
         if from_logits:
             log_x = torch.log_softmax(x, dim=-1)
         else:
@@ -449,3 +431,79 @@ class Dirichlet(Distribution):
 
     def parameters_dict(self) -> dict[str, torch.Tensor]:
         return {"alpha": self.alpha.detach()}
+
+
+def dirichlet_multinomial_log_prob(
+    x: torch.Tensor, concentration: torch.Tensor
+) -> torch.Tensor:
+    """Log-PMF of the Dirichlet-multinomial at counts `x` with Dirichlet
+    `concentration` `a` (shape `(..., K)`, broadcast over `x`).
+
+    ``log P(x|a) = log Γ(n+1) − Σ log Γ(x_k+1) + log Γ(A) − log Γ(n+A)
+                    + Σ_k [log Γ(x_k+a_k) − log Γ(a_k)]``
+    with ``n = Σx_k`` and ``A = Σa_k = α₀``. Counts may be non-integer
+    (lgamma is continuous) — used by the fragmentation fit where observed
+    intensities are scaled into effective counts. Reduces to the multinomial
+    log-PMF as ``A → ∞`` at fixed ``p = a/A``."""
+    x_f = x.to(torch.float64)
+    a = concentration.to(torch.float64)
+    n = x_f.sum(dim=-1)
+    big_a = a.sum(dim=-1)
+    term_n = torch.lgamma(n + 1.0) - torch.lgamma(x_f + 1.0).sum(dim=-1)
+    term_beta = torch.lgamma(big_a) - torch.lgamma(n + big_a)
+    term_k = (torch.lgamma(x_f + a) - torch.lgamma(a)).sum(dim=-1)
+    return term_n + term_beta + term_k
+
+
+class DirichletMultinomial(Distribution):
+    """Dirichlet-multinomial (overdispersed multinomial). Param:
+    `log_concentration` shape `(K,)` = ``log`` of the Dirichlet concentration
+    ``a_k = α₀·p_k``, so ``α₀ = Σa`` (the concentration; ``α₀ → ∞`` is the pure
+    multinomial limit) and ``p = a/α₀`` is the mean.
+
+    `log_prob(x)` accepts counts of shape `(..., K)`; ``n`` is inferred from
+    ``x.sum(-1)``. The per-category variance interpolates
+    ``Var[x_k] = n·p_k(1−p_k)·(n+α₀)/(1+α₀)`` — shot-noise (``∝1/n`` in
+    proportion space) at ``n ≪ α₀``, an overdispersion floor at ``n ≫ α₀``.
+    `cdf` raises (no closed form for K ≥ 3)."""
+
+    def __init__(self, concentration: torch.Tensor | None = None, K: int = 2) -> None:
+        super().__init__()
+        if concentration is None:
+            init = torch.zeros(K, dtype=torch.float64)  # a_k = 1
+        else:
+            c = torch.as_tensor(concentration, dtype=torch.float64)
+            if c.ndim != 1:
+                raise ValueError(
+                    f"concentration must be 1-D; got shape {tuple(c.shape)}"
+                )
+            init = torch.log(c.clamp(min=_EPS))
+        self.log_concentration = nn.Parameter(init)
+
+    @property
+    def K(self) -> int:
+        return int(self.log_concentration.shape[0])
+
+    @property
+    def concentration(self) -> torch.Tensor:
+        return self.log_concentration.exp()
+
+    @property
+    def alpha0(self) -> torch.Tensor:
+        return self.concentration.sum()
+
+    @property
+    def probs(self) -> torch.Tensor:
+        c = self.concentration
+        return c / c.sum()
+
+    def log_prob(self, x: torch.Tensor) -> torch.Tensor:
+        return dirichlet_multinomial_log_prob(x, self.concentration)
+
+    def cdf(self, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError(
+            "Dirichlet-multinomial CDF has no closed form for K>=3."
+        )
+
+    def parameters_dict(self) -> dict[str, torch.Tensor]:
+        return {"probs": self.probs.detach(), "alpha0": self.alpha0.detach()}
