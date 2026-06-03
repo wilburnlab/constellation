@@ -41,6 +41,7 @@ from .parametric import Distribution, FitResult, Parametric, PeakShape
 from .distributions import (
     Beta,
     Dirichlet,
+    DirichletMultinomial,
     Gamma,
     GeneralizedNormal,
     LogNormal,
@@ -48,6 +49,7 @@ from .distributions import (
     NormalDistribution,
     Poisson,
     StudentT,
+    dirichlet_multinomial_log_prob,
 )
 from .peaks import EMGPeak, GaussianPeak, emg_log_pdf, emg_pdf
 from .calibration import Hill, LogLinear, Sigmoidal
@@ -80,6 +82,8 @@ __all__ = [
     "Poisson",
     "Multinomial",
     "Dirichlet",
+    "DirichletMultinomial",
+    "dirichlet_multinomial_log_prob",
     # Peak shapes
     "GaussianPeak",
     "EMGPeak",

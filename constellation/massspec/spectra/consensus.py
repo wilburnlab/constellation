@@ -122,7 +122,8 @@ def align_to_basis(
     *,
     tolerance: float = 20.0,
     tolerance_unit: Literal["ppm", "Da"] = "ppm",
-) -> torch.Tensor:
+    return_mz_error: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Project an observed peak list onto ``basis`` → a length-K intensity
     vector (``0.0`` where a basis channel is unmatched).
 
@@ -130,11 +131,22 @@ def align_to_basis(
     tolerance (``match_mz``); observed intensity is scatter-**added** into
     that channel (peaks matching no channel are dropped — the b/y-only
     conditioning). Use analyzer-appropriate tolerance (FTMS ~20 ppm; ITMS
-    ~0.5 Da)."""
+    ~0.5 Da).
+
+    With ``return_mz_error=True`` also returns the per-channel
+    **intensity-weighted signed m/z error** in ppm (``match_mz``'s
+    ``error_ppm``; ``NaN`` where a channel is unmatched). The matching
+    already computes this error — it is simply retained here. It is the
+    orthogonal interference discriminant: a genuine fragment sits near
+    0 ppm, whereas a contaminant peak that merely falls inside the
+    tolerance window sits systematically off-center."""
     obs_mz = torch.as_tensor(obs_mz, dtype=torch.float64).reshape(-1)
     obs_intensity = torch.as_tensor(obs_intensity, dtype=torch.float64).reshape(-1)
     out = torch.zeros(basis.K, dtype=torch.float64)
+    werr = torch.zeros(basis.K, dtype=torch.float64) if return_mz_error else None
     if obs_mz.numel() == 0 or basis.K == 0:
+        if return_mz_error:
+            return out, torch.full((basis.K,), float("nan"), dtype=torch.float64)
         return out
     matches = match_mz(
         obs_mz,
@@ -144,7 +156,13 @@ def align_to_basis(
         query_intensity=obs_intensity,
     )
     for m in matches:
-        out[m.ref_idx] += obs_intensity[m.query_idx]
+        w = obs_intensity[m.query_idx]
+        out[m.ref_idx] += w
+        if return_mz_error:
+            werr[m.ref_idx] += w * m.error_ppm
+    if return_mz_error:
+        err = torch.where(out > 0, werr / out, torch.full_like(out, float("nan")))
+        return out, err
     return out
 
 
