@@ -24,6 +24,7 @@ from constellation.massspec.spectra.consensus import (
     build_consensus,
     fragment_basis,
 )
+from constellation.massspec.spectra.noise import FragmentationNoiseModel
 from constellation.massspec.spectra.similarity import (
     compare_spectra,
     multinomial_deviance,
@@ -37,4 +38,5 @@ __all__ = [
     "fragment_basis",
     "align_to_basis",
     "build_consensus",
+    "FragmentationNoiseModel",
 ]
