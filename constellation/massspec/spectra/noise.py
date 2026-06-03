@@ -75,9 +75,20 @@ class FragmentationNoiseModel(Distribution):
         return c / c.sum()
 
     def log_prob(self, v: torch.Tensor) -> torch.Tensor:
-        """Per-spectrum log-likelihood of intensity vectors ``v`` (B, K).
-        Counts are ``v/g``; the gain enters the count total ``N = Σv/g``."""
-        return dirichlet_multinomial_log_prob(v / self.g, self.concentration)
+        """Per-spectrum log-density of intensity vectors ``v`` (B, K).
+
+        With counts ``x = v/g`` and ``v = g·x``, this is the Dirichlet-multinomial
+        log-density of ``x`` **plus the change-of-variables Jacobian** ``-K·log g``
+        (one per spectrum). The Jacobian is essential: without it the likelihood
+        rises without bound as ``g → ∞`` (``v/g → 0`` and ``DM_log_prob(0) = 0``),
+        so a trainable gain diverges instead of being identified by how the
+        per-proportion variance shrinks with intensity. ``g`` is still only weakly
+        identified from MS2 alone (it trades off against ``α₀`` through the effective
+        N) — constrain it with the MS1 gain when precision matters."""
+        return (
+            dirichlet_multinomial_log_prob(v / self.g, self.concentration)
+            - self.K * self.log_g
+        )
 
     def cdf(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError("FragmentationNoiseModel has no closed-form CDF.")
