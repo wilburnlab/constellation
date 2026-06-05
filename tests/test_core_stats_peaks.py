@@ -18,7 +18,7 @@ from constellation.core.stats import (
     emg_left_pdf,
     emg_pdf,
 )
-from constellation.core.stats.peaks import _erfcx
+from constellation.core.stats.peaks import _erfcx, _log_erfcx, emg_left_log_pdf
 
 from conftest import LBFGSAdapter
 
@@ -214,6 +214,53 @@ def test_emg_left_pdf_reduces_to_normal_at_small_tau():
     emg = emg_left_pdf(xs, mu, sigma, tau).numpy()
     normal = (1.0 / math.sqrt(2.0 * math.pi)) * np.exp(-0.5 * xs.numpy() ** 2)
     np.testing.assert_allclose(emg, normal, atol=5e-3)
+
+
+def test_log_erfcx_matches_scipy_and_stays_finite_when_erfcx_overflows():
+    """`_log_erfcx` matches `log(scipy.erfcx)` where the latter is finite, and
+    stays finite where `erfcx` itself overflows (large negative x)."""
+    x = torch.linspace(-60.0, 30.0, 400, dtype=torch.float64)
+    got = _log_erfcx(x).numpy()
+    ref = np.log(sp.erfcx(x.numpy()))  # +inf for very negative x
+    finite = np.isfinite(ref)
+    # rtol matches _erfcx's own asymptotic-branch accuracy (1e-6 at x ≥ 25).
+    np.testing.assert_allclose(got[finite], ref[finite], rtol=1e-6, atol=1e-7)
+    assert np.isfinite(got).all()  # ours is finite even where scipy overflows
+
+
+def test_emg_densities_finite_in_far_tails():
+    """Wide tail (σ ≪ τ) evaluated far out must stay finite — not 0·inf = NaN (the
+    erfcx-overflow × Gaussian-underflow trap; Codex review on PR #67). Covers both
+    the fronting (emg_left_pdf) and trailing (emg_pdf) sides."""
+    mu = torch.tensor(0.0, dtype=torch.float64)
+    sigma = torch.tensor(0.1, dtype=torch.float64)
+    tau = torch.tensor(10.0, dtype=torch.float64)
+    t_left = torch.linspace(-40.0, 2.0, 500, dtype=torch.float64)  # reaches mu − 4·τ
+    t_right = torch.linspace(-2.0, 40.0, 500, dtype=torch.float64)
+    left = emg_left_pdf(t_left, mu, sigma, tau)
+    right = emg_pdf(t_right, mu, sigma, tau)
+    assert torch.isfinite(left).all() and (left >= 0).all()
+    assert torch.isfinite(right).all() and (right >= 0).all()
+    assert left.max() > 0 and right.max() > 0  # real density, not collapsed to 0
+    # the log form agrees with the density where the latter is representable
+    pos = left > 1e-300
+    np.testing.assert_allclose(
+        emg_left_log_pdf(t_left, mu, sigma, tau)[pos].numpy(),
+        torch.log(left[pos]).numpy(), atol=1e-9,
+    )
+
+
+def test_hyper_emg_wide_left_tail_integrate_finite():
+    """The Codex regime: σ=0.1, τ_l=10 → bounds() reaches the far left tail.
+    forward() over bounds() and a bounded integrate() must be finite for these
+    otherwise-valid HyperEMG parameters (DE losses were going non-finite)."""
+    p = HyperEMGPeak(N_total=1.0e5, mu=0.0, sigma=0.1, tau_r=1.0, tau_l=10.0, eta=0.5)
+    lo, hi = p.bounds(n_sigma=4.0)
+    grid = torch.linspace(lo.item(), hi.item(), 3000, dtype=torch.float64)
+    vals = p.forward(grid)
+    assert torch.isfinite(vals).all() and (vals >= 0).all()
+    area = p.integrate(t_lo=lo.item(), t_hi=hi.item(), n_points=6000)
+    assert math.isfinite(area.item()) and area.item() > 0
 
 
 # ──────────────────────────────────────────────────────────────────────

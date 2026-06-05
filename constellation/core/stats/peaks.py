@@ -82,6 +82,27 @@ def _erfcx(x: torch.Tensor) -> torch.Tensor:
     return torch.where(x < 25.0, direct, asymp)
 
 
+def _log_erfcx(x: torch.Tensor) -> torch.Tensor:
+    """Log of the scaled complementary error function, `log(erfcx(x))`, stable for
+    ALL `x` — including large negative `x`, where `erfcx` itself overflows.
+
+    For `x ≥ 0` `erfcx(x)` is bounded, so `log(_erfcx(x))` is taken directly. For
+    `x < 0`, `erfcx(x) = exp(x²)·erfc(x)` overflows to `inf`, but
+    `log(erfcx(x)) = x² + log(erfc(x))` with `erfc(x) ∈ (1, 2]` is finite. Using
+    this branch (rather than `log` of an overflowed `_erfcx`) is what lets the EMG
+    tail avoid the `0·inf` trap — an underflowed Gaussian times an overflowed
+    `erfcx` — so the densities stay finite into the far tails (e.g. a HyperEMG with
+    `σ ≪ τ` evaluated over its own `bounds()`). `torch.where` with substituted-safe
+    inputs keeps both branches NaN-free under autograd / vmap (the `_erfcx`
+    convention).
+    """
+    x_pos = torch.where(x >= 0.0, x, torch.ones_like(x))
+    x_neg = torch.where(x < 0.0, x, -torch.ones_like(x))
+    log_pos = torch.log(_erfcx(x_pos).clamp(min=1e-300))
+    log_neg = x_neg * x_neg + torch.log(torch.erfc(x_neg))
+    return torch.where(x >= 0.0, log_pos, log_neg)
+
+
 def emg_pdf(
     t: torch.Tensor,
     mu: torch.Tensor,
@@ -92,12 +113,11 @@ def emg_pdf(
     by `core.signal` parametric peak fits and by `EMGPeak`.
 
     `f(t) = (1/2τ)·exp(-(t-μ)²/(2σ²))·erfcx(σ/(τ√2) - z/√2)`
-    where `z = (t-μ)/σ`.
+    where `z = (t-μ)/σ`. Evaluated in log-space (`_log_erfcx`) so the far tail
+    stays finite instead of forming `0·inf` (underflowed Gaussian × overflowed
+    `erfcx`).
     """
-    z = (t - mu) / sigma
-    b = sigma / (tau * _SQRT2) - z / _SQRT2
-    gauss = torch.exp(-0.5 * z * z)
-    return (1.0 / (2.0 * tau)) * gauss * _erfcx(b)
+    return torch.exp(emg_log_pdf(t, mu, sigma, tau))
 
 
 def emg_log_pdf(
@@ -106,12 +126,12 @@ def emg_log_pdf(
     sigma: torch.Tensor,
     tau: torch.Tensor,
 ) -> torch.Tensor:
-    """Log of `emg_pdf`, numerically stable for fitting under NLL."""
+    """Log of `emg_pdf`, numerically stable for fitting under NLL — and into the
+    tails: `_log_erfcx` keeps `-z²/2 + log erfcx(b)` finite where `erfcx`
+    overflows."""
     z = (t - mu) / sigma
     b = sigma / (tau * _SQRT2) - z / _SQRT2
-    log_gauss = -0.5 * z * z
-    log_erfcx = torch.log(_erfcx(b).clamp(min=1e-30))
-    return -math.log(2.0) - torch.log(tau) + log_gauss + log_erfcx
+    return -math.log(2.0) - torch.log(tau) - 0.5 * z * z + _log_erfcx(b)
 
 
 def emg_left_pdf(
@@ -125,12 +145,10 @@ def emg_left_pdf(
 
     `f(t) = (1/2τ)·exp(-z²/2)·erfcx(σ/(τ√2) + z/√2)`, `z = (t-μ)/σ`. The only
     change from `emg_pdf` is the `+ z/√2` (vs `- z/√2`), which reflects the
-    tail about μ; like `emg_pdf` it integrates to 1.
+    tail about μ; like `emg_pdf` it integrates to 1. Evaluated in log-space so a
+    wide left tail (`σ ≪ τ`) stays finite far out.
     """
-    z = (t - mu) / sigma
-    b = sigma / (tau * _SQRT2) + z / _SQRT2  # sign flip vs emg_pdf
-    gauss = torch.exp(-0.5 * z * z)
-    return (1.0 / (2.0 * tau)) * gauss * _erfcx(b)
+    return torch.exp(emg_left_log_pdf(t, mu, sigma, tau))
 
 
 def emg_left_log_pdf(
@@ -139,12 +157,11 @@ def emg_left_log_pdf(
     sigma: torch.Tensor,
     tau: torch.Tensor,
 ) -> torch.Tensor:
-    """Log of `emg_left_pdf`, numerically stable for fitting under NLL."""
+    """Log of `emg_left_pdf`, numerically stable for fitting under NLL — and into
+    the tails (see `_log_erfcx`)."""
     z = (t - mu) / sigma
     b = sigma / (tau * _SQRT2) + z / _SQRT2
-    log_gauss = -0.5 * z * z
-    log_erfcx = torch.log(_erfcx(b).clamp(min=1e-30))
-    return -math.log(2.0) - torch.log(tau) + log_gauss + log_erfcx
+    return -math.log(2.0) - torch.log(tau) - 0.5 * z * z + _log_erfcx(b)
 
 
 # ──────────────────────────────────────────────────────────────────────
