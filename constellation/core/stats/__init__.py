@@ -10,7 +10,8 @@ Two-tier ABC structure under one umbrella:
         |       Poisson, Multinomial, Dirichlet
         |
         +-- PeakShape                   .integrate, .bounds  (required)
-        |       GaussianPeak, EMGPeak    (.log_prob/.cdf optional)
+        |       GaussianPeak, EMGPeak, HyperEMGPeak
+        |       (.log_prob/.cdf optional)
         |
         +-- (calibration models — leaf, no extra trait)
                 Sigmoidal, Hill, LogLinear
@@ -26,7 +27,7 @@ shape: an `Optimizer` (gradient-based) gets a scalar closure; a
 Submodules:
     parametric       ABC core
     distributions    9 density classes
-    peaks            EMG / Gaussian peak shapes (HyperEMG / Warped /
+    peaks            Gaussian / EMG / HyperEMG peak shapes (Warped /
                      Spline land in the next peak-numerics session,
                      now that DE is available)
     calibration      Sigmoidal / Hill / LogLinear standard curves
@@ -51,7 +52,15 @@ from .distributions import (
     StudentT,
     dirichlet_multinomial_log_prob,
 )
-from .peaks import EMGPeak, GaussianPeak, emg_log_pdf, emg_pdf
+from .peaks import (
+    EMGPeak,
+    GaussianPeak,
+    HyperEMGPeak,
+    emg_left_log_pdf,
+    emg_left_pdf,
+    emg_log_pdf,
+    emg_pdf,
+)
 from .calibration import Hill, LogLinear, Sigmoidal
 from .losses import (
     cosine_similarity,
@@ -87,8 +96,11 @@ __all__ = [
     # Peak shapes
     "GaussianPeak",
     "EMGPeak",
+    "HyperEMGPeak",
     "emg_pdf",
     "emg_log_pdf",
+    "emg_left_pdf",
+    "emg_left_log_pdf",
     # Calibration
     "Sigmoidal",
     "Hill",
