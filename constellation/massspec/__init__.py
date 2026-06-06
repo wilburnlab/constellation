@@ -12,9 +12,12 @@ Modules:
     tokenize/        - scaffold: per-model peptide tokenizers (Prosit-style,
                        Chronologer-style, ...) — defined per checkpoint.
 
+    readers/         - format-level ``RawReader`` subclasses (raw-instrument
+                       ingestion). Shipped: thermo (Thermo ``.raw``). TODO:
+                       mzml, bruker_d, mzpeak. Cross-tier container adapters
+                       (.msp / .dlib / maxquant) live in ``io/`` instead.
+
 Modules (TODO; scaffolded only):
-    readers/         - mzml, thermo_raw, bruker_d, mzpeak subclasses of
-                       core.io.RawReader (next session)
     library/         - Koina REST client, spectral-library wrapper (session
                        after readers)
     calibration      - MzCalibration(nn.Module) via core.optim.de
@@ -32,3 +35,7 @@ from constellation.massspec import schemas as schemas  # noqa: F401  (registers 
 # (encyclopedia .dlib/.elib reader+writer in LIBRARY_/QUANT_/SEARCH_ READERS,
 # DiaReader in core.io.readers).
 from constellation.massspec import io as io  # noqa: F401, E402
+
+# Importing `readers` triggers registration of format-level RawReader
+# subclasses (ThermoReader for `.raw` in core.io.readers.READER_REGISTRY).
+from constellation.massspec import readers as readers  # noqa: F401, E402

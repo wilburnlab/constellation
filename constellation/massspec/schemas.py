@@ -150,7 +150,7 @@ SCAN_METADATA_TABLE: pa.Schema = pa.schema(
         ),
         # ─── Thermo trailer — promoted columns ────────────────────────
         # Ordered to match the `_TRAILER_FIELDS` table in
-        # `massspec.io.thermo._trailer` so the schema reads top to
+        # `massspec.readers.thermo._trailer` so the schema reads top to
         # bottom in the same order the trailer sections appear on the
         # instrument.
         #

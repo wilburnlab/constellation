@@ -1,4 +1,4 @@
-"""Tests for ``constellation.massspec.io.thermo``.
+"""Tests for ``constellation.massspec.readers.thermo``.
 
 Three tiers:
 
@@ -29,8 +29,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from constellation.massspec.io.thermo._filter import parse_filter_string
-from constellation.massspec.io.thermo._trailer import (
+from constellation.massspec.readers.thermo._filter import parse_filter_string
+from constellation.massspec.readers.thermo._trailer import (
     _TRAILER_FIELDS,
     TRAILER_KEY_CHARGE,
     TRAILER_KEY_IIT,
@@ -45,8 +45,8 @@ from constellation.massspec.io.thermo._trailer import (
     trailer_to_dict,
     try_number,
 )
-from constellation.massspec.io.thermo._netruntime import is_thermo_available
-from constellation.massspec.io.thermo.manifest import (
+from constellation.massspec.readers.thermo._netruntime import is_thermo_available
+from constellation.massspec.readers.thermo.manifest import (
     BUNDLE_KIND,
     MANIFEST_FILENAME,
     MANIFEST_SCHEMA_VERSION,
@@ -207,7 +207,7 @@ class TestTrailerPromotion:
         assert promote_trailer(modern)["ft_conversion_a"] == 9.9
 
     def test_resolve_trailer_field_returns_first_nonnull(self):
-        from constellation.massspec.io.thermo._trailer import TrailerField
+        from constellation.massspec.readers.thermo._trailer import TrailerField
 
         f = TrailerField(("Primary Key:", "Fallback Key:"), "test_col", safe_float)
         assert resolve_trailer_field({"Primary Key:": "1.0"}, f) == 1.0
@@ -289,7 +289,7 @@ class _FakeFilter:
 
 class TestBuildScanMeta:
     def test_ms1_row_minimal(self):
-        from constellation.massspec.io.thermo._read import _build_scan_meta
+        from constellation.massspec.readers.thermo._read import _build_scan_meta
 
         meta = _build_scan_meta(
             scan_num=1,
@@ -321,7 +321,7 @@ class TestBuildScanMeta:
         assert meta["activation_type"] is None
 
     def test_ms2_row_with_precursor_and_charge(self):
-        from constellation.massspec.io.thermo._read import _build_scan_meta
+        from constellation.massspec.readers.thermo._read import _build_scan_meta
 
         meta = _build_scan_meta(
             scan_num=42,
@@ -364,7 +364,7 @@ class TestBuildScanMeta:
 
     def test_master_scan_zero_collapses_to_none(self):
         """Thermo uses ``Master Scan Number: 0`` to mean 'no parent'."""
-        from constellation.massspec.io.thermo._read import _build_scan_meta
+        from constellation.massspec.readers.thermo._read import _build_scan_meta
 
         meta = _build_scan_meta(
             scan_num=1,
@@ -494,7 +494,7 @@ class TestManifestRoundTrip:
 class TestPeakBuffer:
     def test_rt_binned_row_groups(self, tmp_path: Path):
         """Verify _PeakBuffer flushes a row group at every RT-bin boundary."""
-        from constellation.massspec.io.thermo._read import _PeakBuffer, _ScanBatch
+        from constellation.massspec.readers.thermo._read import _PeakBuffer, _ScanBatch
 
         # Two scans in bin 0, two in bin 1 → 2 row groups when
         # rt_bin_width=60s. (RT in seconds: 30 + 45 in bin 0; 70 + 90 in bin 1.)
@@ -551,7 +551,7 @@ class TestRealRawConvert:
         return Path(os.environ[_REAL_RAW_PATH_ENV])
 
     def test_convert_writes_full_bundle(self, raw_path: Path, tmp_path: Path):
-        from constellation.massspec.io.thermo import convert
+        from constellation.massspec.readers.thermo import convert
 
         bundle_dir = tmp_path / raw_path.stem
         m = convert(raw_path, bundle_dir, compute_sha256=False)

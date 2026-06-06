@@ -70,7 +70,7 @@ def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
             "acquisition_metadata.parquet). Accepts a single .raw file "
             "OR a directory of .raw files; --threads fans the directory "
             "out across worker subprocesses. Dispatches on the input "
-            "suffix; .raw routes to constellation.massspec.io.thermo.convert. "
+            "suffix; .raw routes to constellation.massspec.readers.thermo.convert. "
             "Future mzML / Bruker / Sciex converters slot in transparently."
         ),
     )
@@ -208,8 +208,8 @@ def _cmd_massspec_convert_single(
         progress_cb = StreamProgress()
 
     if suffix == ".raw":
-        from constellation.massspec.io.thermo import convert as thermo_convert
-        from constellation.massspec.io.thermo._netruntime import require_thermo
+        from constellation.massspec.readers.thermo import convert as thermo_convert
+        from constellation.massspec.readers.thermo._netruntime import require_thermo
 
         try:
             require_thermo()
@@ -288,8 +288,8 @@ def _cmd_massspec_convert_batch(
       3 — pythonnet / DLLs missing (parent fails fast)
       5 — at least one per-file result is ``error``
     """
-    from constellation.massspec.io.thermo import convert_batch
-    from constellation.massspec.io.thermo._netruntime import require_thermo
+    from constellation.massspec.readers.thermo import convert_batch
+    from constellation.massspec.readers.thermo._netruntime import require_thermo
 
     try:
         require_thermo()

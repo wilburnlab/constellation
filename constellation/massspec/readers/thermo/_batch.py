@@ -2,7 +2,7 @@
 
 Owns parent-process fan-out + aggregation for converting N ``.raw``
 files into N independent bundle directories. Stays out of
-:mod:`constellation.massspec.io.thermo._read` (the CLR-aware streaming
+:mod:`constellation.massspec.readers.thermo._read` (the CLR-aware streaming
 converter) so the split between "what happens inside one .raw" and
 "how many .raws run in parallel" stays clean.
 

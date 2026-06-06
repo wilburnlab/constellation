@@ -4,7 +4,7 @@ Responsibility is *tool discovery*: tell ``constellation doctor`` and
 the Thermo reader how to find the CommonCore DLL pack on disk.
 File-format work (scan iteration, trailer promotion, manifest writing)
 lives with the rest of the Thermo reader at
-:mod:`constellation.massspec.io.thermo` — that's where the
+:mod:`constellation.massspec.readers.thermo` — that's where the
 ``ThermoReader`` / ``convert`` entry points come from.
 
 Pins: ``scripts/install-thermo-dlls.sh`` hash-pins the **ThermoRawFileParser**
@@ -19,7 +19,7 @@ lookup finds them.
 A note on the artifact field: the ToolSpec declares the RawFileReader
 DLL as the canonical "this install is present" file. The deeper
 "all three DLLs are present and loadable" validation happens inside
-:func:`constellation.massspec.io.thermo._netruntime.require_thermo`.
+:func:`constellation.massspec.readers.thermo._netruntime.require_thermo`.
 This split keeps the doctor's discovery cheap while letting the
 reader fail fast with a useful message at first ``.raw`` open.
 """
