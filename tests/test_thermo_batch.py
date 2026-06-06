@@ -1,4 +1,4 @@
-"""Tests for ``constellation.massspec.io.thermo._batch``.
+"""Tests for ``constellation.massspec.readers.thermo._batch``.
 
 Two tiers:
 
@@ -28,11 +28,11 @@ from pathlib import Path
 
 import pytest
 
-from constellation.massspec.io.thermo import (
+from constellation.massspec.readers.thermo import (
     BatchResult,
     convert_batch,
 )
-from constellation.massspec.io.thermo.manifest import MANIFEST_FILENAME
+from constellation.massspec.readers.thermo.manifest import MANIFEST_FILENAME
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -81,7 +81,7 @@ class TestConvertBatchInline:
             return None
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch._convert_one_file",
+            "constellation.massspec.readers.thermo._batch._convert_one_file",
             fake_convert,
         )
 
@@ -112,7 +112,7 @@ class TestConvertBatchInline:
             return None
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch._convert_one_file",
+            "constellation.massspec.readers.thermo._batch._convert_one_file",
             fake_convert,
         )
 
@@ -135,7 +135,7 @@ class TestConvertBatchInline:
             return None
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch._convert_one_file",
+            "constellation.massspec.readers.thermo._batch._convert_one_file",
             fake_convert,
         )
 
@@ -154,7 +154,7 @@ class TestConvertBatchInline:
             return None
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch._convert_one_file",
+            "constellation.massspec.readers.thermo._batch._convert_one_file",
             fake_convert,
         )
 
@@ -179,7 +179,7 @@ class TestConvertBatchInline:
             return None
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch._convert_one_file",
+            "constellation.massspec.readers.thermo._batch._convert_one_file",
             fake_convert,
         )
 
@@ -224,7 +224,7 @@ class TestConvertBatchInline:
             return None
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch._convert_one_file",
+            "constellation.massspec.readers.thermo._batch._convert_one_file",
             fake_convert,
         )
 
@@ -273,16 +273,16 @@ class TestConvertBatchSpawn:
             return list(futures)
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch.ProcessPoolExecutor",
+            "constellation.massspec.readers.thermo._batch.ProcessPoolExecutor",
             _FakeExecutor,
         )
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch.as_completed",
+            "constellation.massspec.readers.thermo._batch.as_completed",
             fake_as_completed,
         )
         # The inline worker still needs the underlying convert stubbed.
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch._convert_one_file",
+            "constellation.massspec.readers.thermo._batch._convert_one_file",
             lambda *a, **kw: None,
         )
 
@@ -320,15 +320,15 @@ class TestConvertBatchSpawn:
                 return _F()
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch.ProcessPoolExecutor",
+            "constellation.massspec.readers.thermo._batch.ProcessPoolExecutor",
             _FakeExecutor,
         )
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch.as_completed",
+            "constellation.massspec.readers.thermo._batch.as_completed",
             lambda fs: list(fs),
         )
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch._convert_one_file",
+            "constellation.massspec.readers.thermo._batch._convert_one_file",
             lambda *a, **kw: None,
         )
 
@@ -368,15 +368,15 @@ class TestConvertBatchSpawn:
                 return _F()
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch.ProcessPoolExecutor",
+            "constellation.massspec.readers.thermo._batch.ProcessPoolExecutor",
             _FakeExecutor,
         )
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch.as_completed",
+            "constellation.massspec.readers.thermo._batch.as_completed",
             lambda fs: list(fs),
         )
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._batch._convert_one_file",
+            "constellation.massspec.readers.thermo._batch._convert_one_file",
             lambda *a, **kw: None,
         )
 
@@ -435,11 +435,11 @@ class TestCliRouter:
             return _Manifest()
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._netruntime.require_thermo",
+            "constellation.massspec.readers.thermo._netruntime.require_thermo",
             lambda: None,
         )
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo.convert",
+            "constellation.massspec.readers.thermo.convert",
             fake_thermo_convert,
         )
 
@@ -472,11 +472,11 @@ class TestCliRouter:
             ]
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._netruntime.require_thermo",
+            "constellation.massspec.readers.thermo._netruntime.require_thermo",
             lambda: None,
         )
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo.convert_batch",
+            "constellation.massspec.readers.thermo.convert_batch",
             fake_convert_batch,
         )
 
@@ -511,11 +511,11 @@ class TestCliRouter:
             ]
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._netruntime.require_thermo",
+            "constellation.massspec.readers.thermo._netruntime.require_thermo",
             lambda: None,
         )
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo.convert_batch",
+            "constellation.massspec.readers.thermo.convert_batch",
             fake_convert_batch,
         )
 
@@ -536,7 +536,7 @@ class TestCliRouter:
         in_dir.mkdir()
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._netruntime.require_thermo",
+            "constellation.massspec.readers.thermo._netruntime.require_thermo",
             lambda: None,
         )
 
@@ -579,11 +579,11 @@ class TestCliRouter:
             ]
 
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo._netruntime.require_thermo",
+            "constellation.massspec.readers.thermo._netruntime.require_thermo",
             lambda: None,
         )
         monkeypatch.setattr(
-            "constellation.massspec.io.thermo.convert_batch",
+            "constellation.massspec.readers.thermo.convert_batch",
             fake_convert_batch,
         )
 
