@@ -15,7 +15,9 @@ pytest.importorskip("matplotlib")
 _DORADO = r"""#!/usr/bin/env bash
 case "${1:-}" in
   --version) echo "dorado 0.8.3+mock"; exit 0 ;;
-  basecaller|duplex) printf 'MOCKBAM'; echo "[info] 50%% done" >&2; exit 0 ;;
+  basecaller|duplex)
+    [[ -n "${MOCK_ARGV_FILE:-}" ]] && printf '%s\n' "$*" > "${MOCK_ARGV_FILE}"
+    printf 'MOCKBAM'; echo "[info] 50%% done" >&2; exit 0 ;;
   aligner) printf 'MOCKALN'; exit 0 ;;
   polish) draft="${@: -1}"; cat "$draft"; exit 0 ;;
   *) exit 0 ;;
@@ -133,3 +135,25 @@ def test_cli_genome_diagnose(tmp_path: Path, mocks):
     rc = main(["genome", "diagnose", "--assembly-dir", str(out)])
     assert rc == 0
     assert (out / "diagnostics" / "report.md").exists()
+
+
+def test_cli_basecall_emit_moves_on_by_default(tmp_path: Path, mocks, monkeypatch):
+    argv_file = tmp_path / "argv.txt"
+    monkeypatch.setenv("MOCK_ARGV_FILE", str(argv_file))
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup@v5.0.0",
+        "--output-dir", str(tmp_path / "bc"), "--device", "cpu",
+    ])
+    assert rc == 0
+    assert "--emit-moves" in argv_file.read_text()
+
+
+def test_cli_basecall_no_emit_moves_opts_out(tmp_path: Path, mocks, monkeypatch):
+    argv_file = tmp_path / "argv.txt"
+    monkeypatch.setenv("MOCK_ARGV_FILE", str(argv_file))
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup@v5.0.0",
+        "--output-dir", str(tmp_path / "bc"), "--device", "cpu", "--no-emit-moves",
+    ])
+    assert rc == 0
+    assert "--emit-moves" not in argv_file.read_text()

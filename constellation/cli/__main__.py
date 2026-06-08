@@ -3538,6 +3538,8 @@ def _build_basecall_parser(subs) -> None:
     p.add_argument("--modified-bases", default=None, help="Comma list overriding the model's mods")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--duplex", action="store_true")
+    p.add_argument("--emit-moves", action=argparse.BooleanOptionalAction, default=True,
+                   help="Emit the `mv` move-table tag (required for move-aware `dorado polish`; on by default)")
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--detach", action="store_true", help="Fork dorado + write a PID file, return immediately")
     p.add_argument("--follow", action="store_true", help="Attach to a detached run in --output-dir and stream progress")
@@ -3568,6 +3570,9 @@ def _build_genome_parser(subs) -> None:
     pa_.add_argument("--modified-bases", default=None)
     pa_.add_argument("--device", default="cuda:0")
     pa_.add_argument("--duplex", action="store_true")
+    pa_.add_argument("--emit-moves", action=argparse.BooleanOptionalAction, default=True,
+                     help="Emit the `mv` move-table tag during inline basecalling "
+                          "(required for move-aware `dorado polish`; on by default)")
     pa_.add_argument("--dorado-extra", default=None)
     pa_.add_argument("--threads", type=int, default=1)
     pa_.add_argument("--resume", action="store_true")
@@ -3673,6 +3678,7 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
             handle = runner.basecaller(
                 model, pod5, output,
                 modified_bases=mods, device=args.device,
+                emit_moves=args.emit_moves,
                 resume=args.resume, detach=args.detach,
             )
     except FileNotFoundError as exc:
@@ -3749,6 +3755,7 @@ def _cmd_genome_assemble(args: argparse.Namespace) -> int:
             modified_bases=mods,
             device=args.device,
             duplex=args.duplex,
+            emit_moves=args.emit_moves,
             read_group=args.read_group,
             allow_multi_model=args.allow_multi_model,
             hifiasm_mode=args.hifiasm_mode,

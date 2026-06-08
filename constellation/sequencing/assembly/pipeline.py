@@ -130,6 +130,7 @@ def run_assembly_pipeline(
     modified_bases: tuple[str, ...] = (),
     device: str = "cuda:0",
     duplex: bool = False,
+    emit_moves: bool = True,
     read_group: str = DEFAULT_UNIFIED_RG,
     allow_multi_model: bool = False,
     hifiasm_mode: str = "ont",
@@ -181,6 +182,7 @@ def run_assembly_pipeline(
                 handle = runner.basecaller(
                     model, [source], out_bam,
                     modified_bases=modified_bases, device=device,
+                    emit_moves=emit_moves,
                 )
             rc = handle.wait()
             if rc != 0:
@@ -307,6 +309,7 @@ def run_assembly_pipeline(
             "hifiasm_mode": hifiasm_mode,
             "device": device if input_mode == "pod5" else None,
             "duplex": duplex,
+            "emit_moves": emit_moves if input_mode == "pod5" else None,
         },
         stages=stages,
         outputs=outputs,
