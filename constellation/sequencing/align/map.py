@@ -23,7 +23,6 @@ Pending:
 
 from __future__ import annotations
 
-import json
 import subprocess
 import threading
 from collections.abc import Iterator
@@ -37,6 +36,7 @@ import pyarrow.dataset as pa_ds
 
 from constellation.sequencing.align.minimap2 import minimap2_build_index
 from constellation.core.progress import ProgressCallback, ProgressEvent
+from constellation.sequencing.reference.materialize import materialise_genome_fasta
 from constellation.sequencing.reference.reference import GenomeReference
 from constellation.thirdparty.registry import ToolNotFoundError, find
 
@@ -72,41 +72,9 @@ def _resolve_samtools() -> Path:
         ) from exc
 
 
-def _materialise_genome_fasta(
-    genome: GenomeReference,
-    fasta_path: Path,
-    meta_path: Path,
-) -> Path:
-    """Write a GenomeReference's contigs to FASTA, caching by contig count.
-
-    Skips rewrite if ``fasta_path`` exists and ``meta_path`` records a
-    matching contig count. Coarse cache key — adequate for the lab's
-    "import once, align many" workflow; if a future caller mutates a
-    GenomeReference between align invocations, drop the meta file.
-    """
-    fasta_path = Path(fasta_path)
-    meta_path = Path(meta_path)
-    expected_n = int(genome.contigs.num_rows)
-    if fasta_path.exists() and meta_path.exists():
-        try:
-            stamp = json.loads(meta_path.read_text())
-            if int(stamp.get("n_contigs", -1)) == expected_n:
-                return fasta_path
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    fasta_path.parent.mkdir(parents=True, exist_ok=True)
-    contig_ids = genome.contigs.column("contig_id").to_pylist()
-    names = genome.contigs.column("name").to_pylist()
-    with fasta_path.open("w", encoding="utf-8") as fh:
-        for contig_id, name in zip(contig_ids, names):
-            fh.write(f">{name}\n")
-            fh.write(genome.sequence_of(int(contig_id)))
-            fh.write("\n")
-    meta_path.write_text(
-        json.dumps({"n_contigs": expected_n, "fasta": fasta_path.name}, indent=2)
-    )
-    return fasta_path
+# Promoted to a shared helper so align / scaffold / polish share one
+# implementation; kept as a private alias for the call site below.
+_materialise_genome_fasta = materialise_genome_fasta
 
 
 def _iter_demux_read_batches(
