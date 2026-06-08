@@ -4,6 +4,9 @@
     Optimizer            scalar closure -> Tensor (Protocol)
     PopulationOptimizer  population closure -> (pop_size,) loss (Protocol)
     LBFGSOptimizer       torch.optim.LBFGS wrapper with optional bounds clamping
+    AdamOptimizer        torch.optim.Adam wrapper (same closure-inversion +
+                         bounds-clamping path); the stochastic-gradient
+                         optimizer for the ELBO objective
     DifferentialEvolution generic over nn.Module; vectorized via vmap +
                          functional_call; 6 mutation strategies; Sobol/LHS/
                          uniform init; binomial/exponential crossover; F/CR
@@ -17,6 +20,7 @@ imports the Protocols here; `Parametric.fit()` dispatches on optimizer
 shape via `isinstance(opt, PopulationOptimizer)`.
 """
 
+from ._adam import AdamOptimizer
 from ._bounds import bounds_in_natural_units
 from ._de import DifferentialEvolution
 from ._lbfgs import LBFGSOptimizer
@@ -39,6 +43,7 @@ __all__ = [
     "PopulationClosure",
     "ModelView",
     "LBFGSOptimizer",
+    "AdamOptimizer",
     "DifferentialEvolution",
     "OPTIMIZER_REGISTRY",
     "make_optimizer",
