@@ -31,6 +31,8 @@ Submodules:
                      Spline land in the next peak-numerics session,
                      now that DE is available)
     calibration      Sigmoidal / Hill / LogLinear standard curves
+    variational      pure-PyTorch VI — Gaussian guides + MC-ELBO + fit_vb
+    intervals        credible_interval / laplace_cov / profile_interval
     losses           kld, spectral_angle, spectral_entropy_loss,
                      l1_normalize, l2_normalize, cosine_similarity,
                      normalized_dot, pearson_correlation,
@@ -62,6 +64,14 @@ from .peaks import (
     emg_pdf,
 )
 from .calibration import Hill, LogLinear, Sigmoidal
+from .variational import (
+    LowRankGuide,
+    MeanFieldGuide,
+    VariationalGuide,
+    elbo,
+    fit_vb,
+)
+from .intervals import credible_interval, laplace_cov, profile_interval
 from .losses import (
     cosine_similarity,
     kld,
@@ -105,6 +115,15 @@ __all__ = [
     "Sigmoidal",
     "Hill",
     "LogLinear",
+    # Variational inference + uncertainty
+    "VariationalGuide",
+    "MeanFieldGuide",
+    "LowRankGuide",
+    "elbo",
+    "fit_vb",
+    "credible_interval",
+    "laplace_cov",
+    "profile_interval",
     # Losses
     "kld",
     "spectral_angle",
