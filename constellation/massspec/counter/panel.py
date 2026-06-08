@@ -1,20 +1,31 @@
-"""`Panel` — the additive joint score over co-eluting progenitors.
+"""`Panel` -- the additive joint score over co-eluting progenitors.
 
-A panel models a `(scan × channel)` observation as an **additive** sum over
-its progenitors' predicted intensities plus a background term, with soft
-intensity-weighted attribution for the m/z channel and a proper censored
-term for non-observations. It is the fittable unit: `Panel.log_prob(obs)`
+A panel models a `(scan x channel)` observation as an **additive** sum over
+its progenitors' predicted counts plus a background, with soft
+intensity-weighted attribution for the m/z channel and a proper detection
+model for every channel. It is the fittable unit: `Panel.log_prob(obs)`
 returns the total joint log-likelihood (a 0-d tensor), so it drops into
 `Parametric.fit`, the DE population path, and the VI ELBO unchanged.
 
 PR-1 runs a fixed small candidate set (the seed progenitor + an optional
 background channel [+ library neighbours]); spike-and-slab *discovery* of
 new candidates is deferred. The likelihood combines:
-  * intensity (Eq. 16/18) — observed vs the additive total, Student-t with
-    multinomial shot-noise variance (τ + resolution in the variance);
-  * m/z (Eq. 23/25) — soft-γ mixture marginal over progenitors (Eq. 26/27
+  * intensity -- a **Poisson PMF** on the recovered count `N_obs =
+    I_obs*tau/alpha` of each OBSERVED channel: `log Poisson(N_obs | lambda)`,
+    `lambda = N_count`. Count-native (Var = lambda); the exact PMF fixes the
+    discrete low-count regime the continuous Student-t mis-modelled.
+    (`channels.poisson_count_log_prob`.)
+  * m/z (Eq. 23/25) -- soft-gamma mixture marginal over progenitors (Eq. 26/27
     conditional independence given the latent count);
-  * censored (zero-observation) — Poisson tail on the total predicted count.
+  * censored (non-detection) -- Poisson tail `P(count < floor | lambda)` on
+    UNOBSERVED channels. Together with the observed PMF this is the **complete
+    left-censored-Poisson likelihood**: detected channels score the
+    unconditional PMF, undetected the complementary tail mass, partitioning the
+    Poisson over disjoint events (`>= floor` vs `< floor`) -- no double-counting
+    and the correct, bias-free treatment of the detection edge. (Do NOT also
+    divide the observed term by P(count >= floor): that conditional/truncated
+    framing, combined with this censored term, double-models detection and
+    biases N -- it is the construction that collapsed N in an earlier attempt.)
 """
 
 from __future__ import annotations
@@ -46,12 +57,13 @@ def panel_log_prob(
 ) -> torch.Tensor:
     """Total additive joint log-likelihood (0-d tensor) for a panel.
 
-    `progenitors` share `obs`'s channel grid. The intensity-variance `p_k`
-    and `ν_I` use the first (target) progenitor's values (the dominant
-    species; multi-progenitor blending is a refinement). vmap-safe: only
-    broadcasting ops + `torch.where` over a static progenitor list."""
+    `progenitors` share `obs`'s channel grid. The latent per-channel rate is
+    the additive sum of progenitor counts (+ background as a count rate); the
+    observed-channel intensity is scored count-natively (detection-conditioned
+    Poisson), so there is no per-charge total / `(1-p)` variance to assemble.
+    vmap-safe: only broadcasting ops + `torch.where` over a static progenitor
+    list."""
     iit = obs.iit  # (S,)
-    target = progenitors[0]
 
     # Per-progenitor predictions + m/z scales.
     i_preds: list[torch.Tensor] = []
@@ -67,37 +79,29 @@ def panel_log_prob(
         ).clamp(min=1e-12).sqrt()
         mz_scales.append(scale_q)
 
-    i_pred_stack = torch.stack(i_preds, dim=0)  # (Q, S, C)
-    n_count_stack = torch.stack(n_counts, dim=0)
-    i_pred_total = i_pred_stack.sum(dim=0) + background_intensity  # (S, C)
-    n_count_total = n_count_stack.sum(dim=0)  # (S, C)
-
-    # ΣI_pred per (scan, charge): sum predicted intensity over same-charge channels.
-    same_charge = (
-        obs.channel_z[:, None] == obs.channel_z[None, :]
-    ).to(i_pred_total.dtype)  # (C, C)
-    sum_i_pred = i_pred_total @ same_charge.transpose(0, 1)  # (S, C)
+    i_pred_stack = torch.stack(i_preds, dim=0)  # (Q, S, C) -- m/z responsibilities
+    n_count_stack = torch.stack(n_counts, dim=0)  # (Q, S, C)
+    n_count_total = n_count_stack.sum(dim=0)  # (S, C) latent Poisson rate lambda
 
     gain_ch = calibration.gain(obs.channel_z.to(iit.dtype))  # (C,)
-    p_ch = target.p_k.index_select(0, obs.channel_isotope)  # (C,)
-    rho_r = calibration.rho_R(obs.channel_mz)  # (C,)
-    nu_i = target.nu_intensity
+    # Background as an additive count rate (unmonitored density at the channel):
+    # convert the intensity-units background to counts via N = I*tau/alpha.
+    if not isinstance(background_intensity, float) or background_intensity != 0.0:
+        n_count_total = n_count_total + (
+            background_intensity * iit[:, None] / gain_ch[None, :]
+        )
 
-    # Intensity term (observed channels).
-    int_lp = ch.intensity_log_prob(
-        obs.intensity,
-        i_pred_total,
-        sum_i_pred,
-        gain_ch[None, :],
-        p_ch[None, :],
-        iit[:, None],
-        rho_r[None, :],
-        nu_i,
-    )
+    # Intensity term (observed channels): Poisson PMF on the recovered count
+    # N_obs = I_obs * tau / alpha(z). With the censored tail below this is the
+    # complete left-censored-Poisson likelihood (no detection normalizer here).
+    n_obs = obs.intensity * iit[:, None] / gain_ch[None, :]  # (S, C)
+    int_lp = ch.poisson_count_log_prob(n_obs, n_count_total)
     zeros = torch.zeros_like(int_lp)
     int_term = torch.where(obs.mask, int_lp, zeros).sum()
 
-    # m/z term (observed channels): soft-γ mixture marginal.
+    # m/z term (observed channels): soft-gamma mixture marginal. The intensity
+    # responsibilities are equivalent whether built from i_pred or n_count (they
+    # differ only by the per-channel constant alpha/tau, which cancels).
     center = calibration.mz_center_ppm(
         obs.channel_mz, obs.channel_z.to(iit.dtype), obs.channel_isotope
     )  # (C,)
@@ -114,7 +118,9 @@ def panel_log_prob(
     mz_lp = mz_mixture_log_prob(gamma, component_lp)  # (S, C)
     mz_term = torch.where(obs.mask, mz_lp, zeros).sum()
 
-    # Censored term (unobserved channels): Poisson tail on the total count.
+    # Censored term (unobserved channels): Poisson non-detection tail
+    # P(count < floor) -- the complement that completes the left-censored
+    # Poisson likelihood over the same floor.
     cens_lp = ch.censored_log_prob(n_count_total, floor_ions)  # (S, C)
     cens_term = torch.where(obs.mask, zeros, cens_lp).sum()
 

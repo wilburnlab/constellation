@@ -71,6 +71,24 @@ def test_round_trip_recovery(truth_n: float) -> None:
     assert 1.0 < res["peak_sigma"] < 30.0  # seconds; physically sane width
 
 
+def test_low_n_detection_bias_corrected() -> None:
+    """The complete left-censored-Poisson likelihood removes the detection-edge
+    upward bias. At 1e4 ions (where the legacy unconditioned Student-t was
+    +30-44% high) the count-native term recovers within ~15% and covers the
+    truth -- without collapsing N toward the floor."""
+    cal = _cal()
+    truth = _prog(cal, n_total=1e4, nu_intensity=6.0, c_mz_init=200.0)
+    obs = simulate_observation(
+        truth, n_scans=60, half_window_ms=30000.0, iit_ms=20.0,
+        generator=torch.Generator().manual_seed(300),
+    )
+    prog = _prog(cal, n_total=1.0, nu_intensity=5.0, c_mz_init=150.0)
+    res = estimate_n(prog, obs, inference="map", optimizer="de", seed=0)
+    assert res["n_total"] > 100.0  # no collapse to the lower bound
+    assert abs(res["n_total"] - 1e4) / 1e4 < 0.15
+    assert res["n_total_lo"] <= 1e4 <= res["n_total_hi"]
+
+
 def test_isotope_fraction_correction_recovered() -> None:
     """The learnable isotope-fraction correction recovers a real M+1/M+2 shift
     (the high-resolution ¹⁵N/¹³C convolution effect) without biasing N."""
@@ -115,10 +133,12 @@ def test_vb_credible_interval_recovery() -> None:
     assert res["n_total_hi"] > res["n_total_lo"]  # a non-degenerate interval
 
 
-def test_vb_runs_robustly_at_low_signal() -> None:
+def test_vb_low_signal_recovers_and_stays_finite() -> None:
     """At the detection edge the η degeneracy + extreme MC draws would NaN a
-    naive VB; the optimizer NaN-guard + η prior keep it finite. (The point
-    estimate carries the known upward detection-censoring bias — not asserted.)"""
+    naive VB; the optimizer NaN-guard + η prior keep it finite. With the
+    count-native likelihood the low-N detection bias is gone, so VB also
+    recovers a 1e4-ion peptide (within a generous bound for the wider low-count
+    posterior) and brackets the truth."""
     cal = _cal()
     truth = _prog(cal, n_total=1e4, nu_intensity=6.0, c_mz_init=200.0)
     obs = simulate_observation(
@@ -127,9 +147,10 @@ def test_vb_runs_robustly_at_low_signal() -> None:
     torch.manual_seed(0)
     prog = _prog(cal, n_total=1.0, nu_intensity=5.0, c_mz_init=150.0)
     res = estimate_n(prog, obs, inference="vb", optimizer="de", seed=0)
-    assert math.isfinite(res["n_total"]) and res["n_total"] > 1.0
+    assert math.isfinite(res["n_total"]) and res["n_total"] > 100.0
     assert math.isfinite(res["n_total_lo"]) and math.isfinite(res["n_total_hi"])
-    assert res["n_total_lo"] <= res["n_total_hi"]
+    assert abs(res["n_total"] - 1e4) / 1e4 < 0.30
+    assert res["n_total_lo"] <= 1e4 <= res["n_total_hi"]
 
 
 def test_estimate_n_rejects_unknown_inference() -> None:

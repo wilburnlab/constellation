@@ -38,6 +38,36 @@ def test_censored_term_direction_and_grad() -> None:
     assert lam.grad is not None and torch.isfinite(lam.grad).all()
 
 
+def test_poisson_count_log_prob_matches_scipy() -> None:
+    ss = pytest.importorskip("scipy.stats")
+    n = torch.tensor([1.0, 2.0, 5.0, 12.0], dtype=torch.float64)
+    lam = torch.tensor([0.5, 3.0, 5.0, 10.0], dtype=torch.float64)
+    val = ch.poisson_count_log_prob(n, lam)
+    ref = ss.poisson.logpmf(n.numpy(), mu=lam.numpy())
+    assert float((val - torch.tensor(ref)).abs().max()) < 1e-9
+    # A log-PMF is <= 0, and lam->0 is heavily penalised for an observed count
+    # (n>=1) -- so the detected-channel term cannot reward N->0 (no collapse).
+    assert float(val.max()) <= 0.0
+    spike = ch.poisson_count_log_prob(torch.tensor([1.0]), torch.tensor([1e-8]))
+    assert float(spike) < -10.0
+
+
+def test_detect_censor_partition_complementary() -> None:
+    """`censored_log_prob` (count < floor) and the detection mass (count >=
+    floor) must partition the SAME Poisson over the SAME floor and sum to 1 --
+    the off-by-one regression guard (old code used floor+1)."""
+    lam = torch.tensor([0.3, 1.0, 4.0, 20.0], dtype=torch.float64)
+    # floor=1: P(count < 1) = P(count = 0) = e^{-lam} (NOT e^{-lam}(1+lam)).
+    p_below_1 = ch.censored_log_prob(lam, floor_count=1.0).exp()
+    assert torch.allclose(p_below_1, torch.exp(-lam), atol=1e-9)
+    for floor in (1.0, 4.0):
+        below = ch.censored_log_prob(lam, floor_count=floor).exp()
+        above = 1.0 - torch.special.gammaincc(
+            torch.tensor(floor, dtype=torch.float64), lam
+        )
+        assert torch.allclose(below + above, torch.ones_like(lam), atol=1e-9)
+
+
 def test_intensity_variance_scales_with_iit_and_resolution() -> None:
     # Var ∝ 1/(τ·ρ_R): doubling τ halves the variance (wider τ → less shot noise).
     args = dict(
