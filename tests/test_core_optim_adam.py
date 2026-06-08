@@ -169,6 +169,30 @@ def test_satisfies_optimizer_protocol_not_population() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Non-finite-gradient guard (robustness for noisy MC objectives, e.g. ELBO)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_skips_nonfinite_gradient_then_resumes() -> None:
+    """A NaN gradient (e.g. an extreme Monte-Carlo ELBO draw) must NOT move the
+    parameters — stepping would poison both the params and Adam's moments."""
+    p = nn.Parameter(torch.tensor(1.0, dtype=torch.float64))
+    opt = AdamOptimizer([p], lr=0.1)
+    bad = [True]
+
+    def closure() -> torch.Tensor:
+        return p * float("nan") if bad[0] else p**2
+
+    before = float(p.detach())
+    opt.step(closure)  # NaN gradient → skipped
+    assert float(p.detach()) == before
+    bad[0] = False
+    opt.step(closure)  # finite gradient → moves
+    assert float(p.detach()) != before
+    assert math.isfinite(float(p.detach()))
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Recovers an Affine through Parametric.fit
 # ──────────────────────────────────────────────────────────────────────
 

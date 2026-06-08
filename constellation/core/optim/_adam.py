@@ -65,6 +65,7 @@ class AdamOptimizer:
         weight_decay: float = 0.0,
         amsgrad: bool = False,
         bounds: dict[str, tuple[float, float]] | None = None,
+        skip_nonfinite: bool = True,
     ) -> None:
         if isinstance(params, nn.Module):
             self._model: nn.Module | None = params
@@ -85,6 +86,7 @@ class AdamOptimizer:
             weight_decay=weight_decay,
             amsgrad=amsgrad,
         )
+        self._skip_nonfinite = skip_nonfinite
         self._bounds_dict = bounds
         if bounds is not None and self._model is not None:
             self._layout = build_layout(self._model)
@@ -105,12 +107,26 @@ class AdamOptimizer:
         self._inner.zero_grad(set_to_none=False)
         loss = closure()
         loss.backward()
+        # Skip the update on a non-finite gradient (e.g. an extreme Monte-Carlo
+        # ELBO sample): stepping would poison both the parameters AND Adam's
+        # moment buffers, turning one bad draw into a permanently-NaN run. The
+        # caller re-draws on the next step. Cheap (only on the bad-grad path)
+        # and a no-op for well-behaved problems.
+        if self._skip_nonfinite and not self._grads_finite():
+            return loss if torch.is_tensor(loss) else torch.as_tensor(loss)
         self._inner.step()
         if self._lower is not None:
             self._clamp()
         if not torch.is_tensor(loss):
             loss = torch.as_tensor(loss)
         return loss
+
+    def _grads_finite(self) -> bool:
+        for group in self._inner.param_groups:
+            for p in group["params"]:
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    return False
+        return True
 
     def _clamp(self) -> None:
         assert self._model is not None and self._layout is not None

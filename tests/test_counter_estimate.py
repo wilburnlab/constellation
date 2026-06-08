@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import tempfile
 
 import pytest
@@ -93,12 +94,66 @@ def test_isotope_fraction_correction_recovered() -> None:
     assert abs(res["n_total"] - 2e5) / 2e5 < 0.12
 
 
-def test_estimate_n_rejects_vb_for_now() -> None:
+def test_vb_credible_interval_recovery() -> None:
+    """VB recovers N_total with a credible interval at a practical ion count."""
+    cal = _cal()
+    truth = _prog(cal, n_total=1e5, nu_intensity=6.0, c_mz_init=200.0)
+    obs = simulate_observation(
+        truth, n_scans=60, half_window_ms=30000.0, iit_ms=20.0,
+        generator=torch.Generator().manual_seed(200),
+    )
+    torch.manual_seed(0)
+    prog = _prog(cal, n_total=1.0, nu_intensity=5.0, c_mz_init=150.0)
+    res = estimate_n(prog, obs, inference="vb", optimizer="de", seed=0)
+
+    assert res["inference_method"] == "vb"
+    assert res["final_elbo"] is not None and math.isfinite(res["final_elbo"])
+    n = res["n_total"]
+    assert math.isfinite(n) and n > 1.0
+    assert abs(n - 1e5) / 1e5 < 0.12
+    assert res["n_total_lo"] < n < res["n_total_hi"]
+    assert res["n_total_hi"] > res["n_total_lo"]  # a non-degenerate interval
+
+
+def test_vb_runs_robustly_at_low_signal() -> None:
+    """At the detection edge the η degeneracy + extreme MC draws would NaN a
+    naive VB; the optimizer NaN-guard + η prior keep it finite. (The point
+    estimate carries the known upward detection-censoring bias — not asserted.)"""
+    cal = _cal()
+    truth = _prog(cal, n_total=1e4, nu_intensity=6.0, c_mz_init=200.0)
+    obs = simulate_observation(
+        truth, n_scans=60, generator=torch.Generator().manual_seed(200)
+    )
+    torch.manual_seed(0)
+    prog = _prog(cal, n_total=1.0, nu_intensity=5.0, c_mz_init=150.0)
+    res = estimate_n(prog, obs, inference="vb", optimizer="de", seed=0)
+    assert math.isfinite(res["n_total"]) and res["n_total"] > 1.0
+    assert math.isfinite(res["n_total_lo"]) and math.isfinite(res["n_total_hi"])
+    assert res["n_total_lo"] <= res["n_total_hi"]
+
+
+def test_estimate_n_rejects_unknown_inference() -> None:
     cal = _cal()
     prog = _prog(cal)
     obs = simulate_observation(prog, n_scans=20, generator=torch.Generator().manual_seed(0))
-    with pytest.raises(NotImplementedError):
-        estimate_n(prog, obs, inference="vb")
+    with pytest.raises(ValueError):
+        estimate_n(prog, obs, inference="mcmc")
+
+
+def test_make_log_prior_terms() -> None:
+    from constellation.massspec.counter import make_log_prior
+
+    assert make_log_prior() is None  # nothing active
+    lp = make_log_prior(rt_prior_ms=1.8e6, rt_sigma_ms=5000.0, eta_center=1.0, eta_sigma=1.0)
+    params = {
+        "peak.mu": torch.tensor([1.8e6, 1.8e6 + 5000.0], dtype=torch.float64),
+        "peak.logit_eta": torch.tensor([1.0, 1.0], dtype=torch.float64),
+    }
+    out = lp(params)
+    assert out.shape == (2,)
+    # at the prior centers the penalty is 0; one σ off → −0.5
+    assert float(out[0]) == pytest.approx(0.0, abs=1e-9)
+    assert float(out[1]) == pytest.approx(-0.5, abs=1e-9)
 
 
 # ──────────────────────────────────────────────────────────────────────

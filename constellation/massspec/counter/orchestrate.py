@@ -12,6 +12,7 @@ Table builders serialize results / model state into the `schemas.py` tables.
 
 from __future__ import annotations
 
+import fnmatch
 import math
 from typing import Any, Sequence
 
@@ -23,6 +24,7 @@ from constellation.core.stats.intervals import laplace_cov
 
 from .calibration import GlobalCalibration
 from .model import CounterObservation, Progenitor
+from .priors import make_log_prior
 from .schemas import (
     COUNTER_GLOBAL_CALIBRATION_TABLE,
     COUNTER_N_TABLE,
@@ -123,10 +125,18 @@ def estimate_n(
     progenitor: Progenitor,
     obs: CounterObservation,
     *,
-    inference: str = "map",
+    inference: str = "vb",
     optimizer: str = "de",
     credible_level: float = 0.95,
     rt_prior_ms: float | None = None,
+    rt_sigma_ms: float = 5000.0,
+    guide_params: Sequence[str] = ("peak.*",),
+    isotope_offset_sigma: float = 0.5,
+    eta_sigma: float = 1.0,
+    n_elbo_samples: int = 16,
+    n_ci_samples: int = 4096,
+    vb_lr: float = 0.02,
+    vb_max_iter: int = 1500,
     reseed: bool = True,
     bounds: dict[str, tuple[float, float]] | None = None,
     pop_size: int = 24,
@@ -135,39 +145,41 @@ def estimate_n(
     lr: float = 0.05,
     seed: int | None = None,
 ) -> dict[str, Any]:
-    """MAP-fit `progenitor` to `obs` and return the numeric result fields of
+    """Fit `progenitor` to `obs` and return the numeric result fields of
     `COUNTER_N_TABLE` (the caller adds `acquisition_id` / `target_id` /
-    identity). The progenitor is left at its fitted (MAP) parameters.
+    identity).
 
-    `reseed` (default) initializes the peak from the data via
-    `seed_peak_from_observation` (with optional `rt_prior_ms`) — a near-truth
-    `N_total` seed that makes the fit robust. `optimizer`: ``"de"`` (default —
-    DE warm-started at the seed within bounds + LBFGS polish; handles the
-    multimodal HyperEMG η/τ) or ``"adam"`` (gradient descent from the seed).
-    Bounded-LBFGS is intentionally not offered as the driver here: its
-    after-step clamp breaks the line search on this surface.
+    Both paths first MAP-fit the progenitor (data-seeded via
+    `seed_peak_from_observation`; `optimizer` ``"de"`` (default — DE warm-start
+    within bounds + LBFGS polish, robust to the multimodal HyperEMG η/τ) or
+    ``"adam"``). Then:
 
-    NOTE: the MAP point estimate carries a mild upward bias at very low ion
-    counts (detection-floor censoring) — proper credible intervals via VB +
-    informative priors land in the next PR; the Laplace interval here is an
-    approximation over the N + peak-shape block."""
-    if inference != "map":
-        raise NotImplementedError(
-            f"inference={inference!r} not yet supported; PR-1 ships 'map' "
-            "(VB credible intervals land in the next PR)"
-        )
+    - **``inference="vb"``** (default): a `MeanFieldGuide` over `guide_params`
+      (default ``("peak.*",)`` = `N_total` + peak shape) is warm-started at the
+      MAP point and refined by `fit_vb`; the credible interval on `N_total`
+      comes from the posterior samples (decoded to natural units). The RT seed
+      enters as a Gaussian *prior* on `peak.mu` (not a hard window) when
+      `rt_prior_ms` is given; the toward-theoretical isotope prior activates
+      only when the offset is in `guide_params`. This is the calibrated-coverage
+      path (the MAP point estimate carries a mild upward bias at very low ion
+      counts from detection-floor censoring).
+    - **``inference="map"``**: the MAP point estimate with a Laplace credible
+      interval over the N + peak-shape block.
+
+    The progenitor is left at the fitted point (VB writes the posterior mean
+    back via `guide.to_model`). Bounded-LBFGS is intentionally not a driver: its
+    after-step clamp breaks the line search on this surface."""
+    if inference not in ("map", "vb"):
+        raise ValueError(f"inference must be 'map' or 'vb'; got {inference!r}")
     if reseed:
         seed_peak_from_observation(progenitor, obs, rt_prior_ms=rt_prior_ms)
     if bounds is None:
         bounds = _default_bounds(progenitor, obs)
 
+    # MAP fit (point estimate / VB warm-start).
     if optimizer == "de":
         de = DifferentialEvolution(
-            progenitor,
-            bounds=bounds,
-            pop_size=pop_size,
-            max_evals=max_evals,
-            seed=seed,
+            progenitor, bounds=bounds, pop_size=pop_size, max_evals=max_evals, seed=seed
         )
         result = progenitor.fit(
             obs, optimizer=de, max_iter=max_iter, polish_on_converge=True
@@ -178,28 +190,109 @@ def estimate_n(
     else:
         raise ValueError(f"optimizer must be 'de' or 'adam'; got {optimizer!r}")
 
-    std = _log_n_total_std(progenitor, obs)
-    log_n = float(progenitor.peak.log_N_total.detach())
-    z = float(torch.special.ndtri(torch.tensor((1.0 + credible_level) / 2.0)))
+    if inference == "map":
+        std = _log_n_total_std(progenitor, obs)
+        log_n = float(progenitor.peak.log_N_total.detach())
+        z = float(torch.special.ndtri(torch.tensor((1.0 + credible_level) / 2.0)))
+        n_total = math.exp(log_n)
+        n_lo, n_hi = math.exp(log_n - z * std), math.exp(log_n + z * std)
+        converged, final_elbo = bool(result.converged), None
+    else:  # vb
+        n_total, n_lo, n_hi, converged, final_elbo = _fit_vb(
+            progenitor,
+            obs,
+            guide_params=guide_params,
+            credible_level=credible_level,
+            rt_prior_ms=rt_prior_ms,
+            rt_sigma_ms=rt_sigma_ms,
+            isotope_offset_sigma=isotope_offset_sigma,
+            eta_sigma=eta_sigma,
+            n_elbo_samples=n_elbo_samples,
+            n_ci_samples=n_ci_samples,
+            vb_lr=vb_lr,
+            vb_max_iter=vb_max_iter,
+        )
 
-    n_scans_used = int(obs.mask.any(dim=1).sum())
     return {
-        "n_total": math.exp(log_n),
-        "n_total_lo": math.exp(log_n - z * std),
-        "n_total_hi": math.exp(log_n + z * std),
+        "n_total": n_total,
+        "n_total_lo": n_lo,
+        "n_total_hi": n_hi,
         "credible_level": float(credible_level),
         "rt_apex": float(progenitor.peak.mu.detach()) / 1000.0,  # ms → s
         "peak_sigma": float(progenitor.peak.sigma.detach()) / 1000.0,
         "peak_tau_r": float(progenitor.peak.tau_r.detach()) / 1000.0,
         "peak_tau_l": float(progenitor.peak.tau_l.detach()) / 1000.0,
         "peak_eta": float(progenitor.peak.eta.detach()),
-        "inference_method": "map",
-        "converged": bool(result.converged),
-        "final_elbo": None,
-        "n_scans_used": n_scans_used,
+        "inference_method": inference,
+        "converged": converged,
+        "final_elbo": final_elbo,
+        "n_scans_used": int(obs.mask.any(dim=1).sum()),
         "iit_corrected": True,
         "interference_flag": None,
     }
+
+
+def _fit_vb(
+    progenitor: Progenitor,
+    obs: CounterObservation,
+    *,
+    guide_params: Sequence[str],
+    credible_level: float,
+    rt_prior_ms: float | None,
+    rt_sigma_ms: float,
+    isotope_offset_sigma: float,
+    eta_sigma: float,
+    n_elbo_samples: int,
+    n_ci_samples: int,
+    vb_lr: float,
+    vb_max_iter: int,
+) -> tuple[float, float, float, bool, float | None]:
+    """Variational refinement of a MAP-warm-started progenitor. Returns
+    `(n_total, lo, hi, converged, final_elbo)` — the posterior-mean `N_total`
+    and its credible interval from decoded posterior samples. Mutates
+    `progenitor` to the posterior mean of the guided params."""
+    from constellation.core.optim import AdamOptimizer as _Adam
+    from constellation.core.stats import MeanFieldGuide, credible_interval, fit_vb
+
+    guide = MeanFieldGuide(progenitor, subset=list(guide_params))
+    in_guide = lambda name: any(  # noqa: E731
+        fnmatch.fnmatchcase(name, pat) for pat in guide_params
+    )
+    # η prior toward its MAP value, but only when η is actually a guide param.
+    eta_center = (
+        float(progenitor.peak.logit_eta.detach())
+        if in_guide("peak.logit_eta")
+        else None
+    )
+    log_prior = make_log_prior(
+        rt_prior_ms=rt_prior_ms,
+        rt_sigma_ms=rt_sigma_ms,
+        isotope_offset_sigma=(
+            isotope_offset_sigma if in_guide("isotope_energy_offset") else None
+        ),
+        eta_center=eta_center,
+        eta_sigma=eta_sigma,
+    )
+    vb = fit_vb(
+        progenitor,
+        guide,
+        obs,
+        optimizer=_Adam(guide, lr=vb_lr),
+        log_prior=log_prior,
+        n_samples=n_elbo_samples,
+        max_iter=vb_max_iter,
+    )
+    n_samples = guide.named_samples(progenitor, n_ci_samples)["peak.log_N_total"].exp()
+    lo, hi = credible_interval(n_samples, level=credible_level)
+    guide.to_model(progenitor)  # posterior mean → model (for shape reporting)
+    final_elbo = -vb.final_loss if math.isfinite(vb.final_loss) else None
+    return (
+        float(n_samples.mean()),
+        float(lo),
+        float(hi),
+        bool(vb.converged),
+        final_elbo,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
