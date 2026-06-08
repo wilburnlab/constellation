@@ -21,6 +21,7 @@ import torch
 __all__ = [
     "student_t_log_prob",
     "intensity_log_prob",
+    "poisson_count_log_prob",
     "mz_error_log_prob",
     "censored_log_prob",
 ]
@@ -67,9 +68,55 @@ def intensity_log_prob(
     per-channel predicted intensity (the additive total over progenitors +
     background, supplied by the Panel); `sum_intensity_pred` is `ΣI_pred`
     over isotopes for that (scan, charge)."""
+    # NOTE: legacy / high-N Gaussian-shot-noise term. The active observed-
+    # channel likelihood is the count-native `poisson_count_log_prob` (below):
+    # this multinomial-conditional variance under-estimates the marginal Poisson
+    # variance by (1-p_k) and mis-models the discrete low-count + detection-edge
+    # regime. Retained for high-N ablation / comparison.
     var = gain_z * sum_intensity_pred * p_k * (1.0 - p_k) / (iit * rho_r)
     scale = var.clamp(min=var_floor).sqrt()
     return student_t_log_prob(intensity_obs, intensity_pred, scale, nu_intensity)
+
+
+def poisson_count_log_prob(
+    n_obs: torch.Tensor,
+    lam: torch.Tensor,
+    *,
+    lam_floor: float = 1e-12,
+) -> torch.Tensor:
+    """Poisson log-PMF of an OBSERVED (detected) channel's recovered count
+    ``n_obs = I_obs*tau/alpha`` given the predicted rate ``lam = N_count`` --
+    the active intensity term:
+
+        log P(count = n_obs | lam) = n_obs*log(lam) - lam - lgamma(n_obs+1)
+
+    Paired with `censored_log_prob` (``log P(count < floor)``) on UNOBSERVED
+    channels, this is the **complete left-censored-Poisson likelihood**:
+    ``Sum_detected log P(count=n_obs) + Sum_undetected log P(count < floor)`` --
+    the exact, consistent (unbiased) likelihood for counts left-censored at the
+    detection floor. The detection event is modelled *once*, jointly, by this
+    partition: detected channels contribute the unconditional PMF, undetected
+    the complementary tail mass.
+
+    This is count-native, so Var = lam automatically (retires the Eq.16
+    multinomial-conditional ``p(1-p)`` variance), and the exact PMF fixes the
+    discrete low-count regime where the continuous Student-t over-/under-shoots.
+    Do NOT additionally divide by ``P(count >= floor)`` (a *conditional* /
+    truncated framing): combined with the censored term that double-counts the
+    detection event and biases ``N`` -- the complete-likelihood partition above
+    is the correct, bias-free construction.
+
+    Bounded above by 0 (a log-PMF), so it cannot reward ``lam -> 0`` (the
+    ``n_obs*log lam`` penalty -> -inf there, ``n_obs >= floor >= 1``). High-N
+    equivalent: ``Poisson(lam) -> Gaussian(lam, lam)``, matching the legacy
+    Student-t term up to a constant for ``lam >> 1``.
+
+    ``n_obs`` is continuous (real ``I*tau/alpha``); ``lgamma`` admits
+    non-integer counts so the term is differentiable w.r.t. ``lam`` with no
+    rounding. The ``I<->count`` Jacobian ``tau/alpha`` is ``N``-independent
+    (alpha frozen) and drops out -- re-add it if alpha is ever co-fit."""
+    lam = lam.clamp(min=lam_floor)
+    return n_obs * torch.log(lam) - lam - torch.lgamma(n_obs + 1.0)
 
 
 def mz_error_log_prob(
@@ -97,16 +144,26 @@ def censored_log_prob(
     n_pred_count: torch.Tensor,
     floor_count: torch.Tensor | float,
 ) -> torch.Tensor:
-    """Log-probability of *no* detection given a predicted count — the proper
-    zero-observation term (replaces nb42c's `cens_weight` fudge).
+    """Log-probability of *non-detection* (``count < floor``) given a predicted
+    count -- the proper zero-observation term (replaces nb42c's ``cens_weight``
+    fudge), and the complement of `poisson_count_log_prob`'s detection
+    normalizer over the same threshold.
 
-    The count process is Poisson, so `P(no detection) = P(X ≤ floor | λ =
-    N_pred) = Q(floor+1, λ)` via the regularized upper incomplete gamma
-    (`torch.special.gammaincc`), differentiable w.r.t. the latent `λ`. This is
-    the count-native CDF — it deliberately avoids the pinned `StudentT.cdf`
-    gap. As `N_pred → 0` the probability → 1 (no penalty); as `N_pred` grows
-    past the floor it → 0 (penalizes predicting ions where none were seen)."""
-    a = torch.as_tensor(floor_count, dtype=n_pred_count.dtype) + 1.0
-    a = torch.broadcast_to(a, n_pred_count.shape)
+    The count is Poisson, so ``P(count < floor | lam=N_pred) = P(count <=
+    floor-1) = gammaincc(floor, lam)`` via the regularized upper incomplete
+    gamma (count-native, differentiable w.r.t. ``lam``, sidesteps the pinned
+    ``StudentT.cdf`` gap). As ``N_pred -> 0`` -> 1 (no penalty); as ``N_pred``
+    grows past the floor -> 0 (penalizes predicting ions where none were
+    seen)."""
+    # P(count < floor) = P(count <= floor-1) = gammaincc(floor, lam) (the
+    # regularized UPPER incomplete gamma; verified gammaincc(1,lam)=e^-lam=P(X=0)).
+    # NOT gammaincc(floor+1, ...) = P(count <= floor), which would double-assign
+    # count==floor to both detection and censoring. This complements
+    # poisson_count_log_prob's detection normalizer P(count >= floor) over the
+    # same threshold.
+    a = torch.broadcast_to(
+        torch.as_tensor(float(floor_count), dtype=n_pred_count.dtype),
+        n_pred_count.shape,
+    )
     p = torch.special.gammaincc(a, n_pred_count).clamp(min=1e-30)
     return torch.log(p)
