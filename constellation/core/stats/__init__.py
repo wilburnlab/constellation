@@ -33,6 +33,7 @@ Submodules:
     calibration      Sigmoidal / Hill / LogLinear standard curves
     variational      pure-PyTorch VI — Gaussian guides + MC-ELBO + fit_vb
     intervals        credible_interval / laplace_cov / profile_interval
+    hierarchical     ParameterTier (global + per-entity) + ParameterProvider
     losses           kld, spectral_angle, spectral_entropy_loss,
                      l1_normalize, l2_normalize, cosine_similarity,
                      normalized_dot, pearson_correlation,
@@ -72,6 +73,12 @@ from .variational import (
     fit_vb,
 )
 from .intervals import credible_interval, laplace_cov, profile_interval
+from .hierarchical import (
+    EmbeddingParameterProvider,
+    FreeParameterProvider,
+    ParameterProvider,
+    ParameterTier,
+)
 from .losses import (
     cosine_similarity,
     kld,
@@ -124,6 +131,11 @@ __all__ = [
     "credible_interval",
     "laplace_cov",
     "profile_interval",
+    # Hierarchical parameters
+    "ParameterTier",
+    "ParameterProvider",
+    "FreeParameterProvider",
+    "EmbeddingParameterProvider",
     # Losses
     "kld",
     "spectral_angle",
