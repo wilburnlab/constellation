@@ -330,14 +330,22 @@ def fit_vb(
     n_samples: int = 8,
     max_iter: int = 300,
     tol: float = 1e-6,
+    max_nonfinite: int = 200,
     callback: Callable[[int, float], None] | None = None,
 ) -> FitResult:
     """Optimize a guide's parameters to maximize the ELBO via a gradient
     `Optimizer` (use `AdamOptimizer(guide)`). Returns a `FitResult` whose
     `loss_history` is the `-ELBO` trajectory. Outer convergence: `|Δloss| <
-    tol`. NaN loss aborts (`converged=False`)."""
+    tol`.
+
+    A non-finite ELBO from an extreme Monte-Carlo draw is *tolerated*: the step
+    is skipped (`AdamOptimizer(skip_nonfinite=True)` leaves the parameters
+    untouched on a NaN gradient) and the loop continues with a fresh draw. Only
+    after `max_nonfinite` consecutive non-finite losses does it abort
+    (`converged=False`) — a genuine breakdown rather than rare-draw noise."""
     result = FitResult()
     prev_loss = math.inf
+    consecutive_nonfinite = 0
 
     def closure() -> torch.Tensor:
         return -elbo(
@@ -348,12 +356,16 @@ def fit_vb(
         loss_t = optimizer.step(closure)
         loss_val = float(loss_t.detach()) if torch.is_tensor(loss_t) else float(loss_t)
         if not math.isfinite(loss_val):
-            result.n_iter = i + 1
-            result.final_loss = loss_val
-            result.converged = False
+            consecutive_nonfinite += 1
             if callback is not None:
                 callback(i, loss_val)
-            return result
+            if consecutive_nonfinite >= max_nonfinite:
+                result.n_iter = i + 1
+                result.final_loss = loss_val
+                result.converged = False
+                return result
+            continue
+        consecutive_nonfinite = 0
         result.loss_history.append(loss_val)
         if callback is not None:
             callback(i, loss_val)

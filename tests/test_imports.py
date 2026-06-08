@@ -81,6 +81,7 @@ import constellation.massspec.counter.io
 import constellation.massspec.counter.model
 import constellation.massspec.counter.orchestrate
 import constellation.massspec.counter.panel
+import constellation.massspec.counter.priors
 import constellation.massspec.counter.schemas
 import constellation.massspec.counter.simulate
 import constellation.massspec.quant

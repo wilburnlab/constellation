@@ -38,6 +38,7 @@ from .orchestrate import (
     seed_peak_from_observation,
 )
 from .panel import Panel, panel_log_prob
+from .priors import make_log_prior
 from .schemas import (
     COUNTER_GLOBAL_CALIBRATION_TABLE,
     COUNTER_N_TABLE,
@@ -58,6 +59,7 @@ __all__ = [
     "AlphaModel",
     "panel_log_prob",
     "accumulated_count",
+    "make_log_prior",
     # simulate + estimate
     "simulate_observation",
     "simulate_panel_observation",
