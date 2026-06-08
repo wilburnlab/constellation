@@ -32,6 +32,8 @@ def make_log_prior(
     isotope_offset_sigma: float | None = None,
     eta_center: float | None = None,
     eta_sigma: float = 1.0,
+    shape_centers: dict[str, float] | None = None,
+    shape_sigmas: dict[str, float] | None = None,
     mu_key: str = "peak.mu",
     offset_key: str = "isotope_energy_offset",
     eta_key: str = "peak.logit_eta",
@@ -46,8 +48,27 @@ def make_log_prior(
       `eta_center` (σ = `eta_sigma`). This tames the η degeneracy: as η → 0/1 a
       tail weight vanishes and its `τ` becomes unconstrained and drifts to NaN
       under gradient VB; a mild prior toward the MAP η keeps both tails
-      identified while still quantifying η's uncertainty."""
+      identified while still quantifying η's uncertainty.
+    - `shape_centers` (`{full_param_name: mean}`, e.g. a `StagedCalibration`
+      peak-shape hyperprior) → a Gaussian on each named log/logit shape param
+      toward `mean` (σ from `shape_sigmas[name]`, default 1.0). This is how the
+      promoted population shape distribution regularizes a per-peptide fit — the
+      principled replacement for a hard `τ`-bound / RT window."""
     terms: list[LogPrior] = []
+
+    if shape_centers:
+        centers = {k: float(v) for k, v in shape_centers.items()}
+        sigmas = {k: float((shape_sigmas or {}).get(k, 1.0)) for k in centers}
+
+        def _shape(params: dict[str, torch.Tensor]):
+            total: torch.Tensor | float = 0.0
+            for key, ctr in centers.items():
+                val = params.get(key)
+                if val is not None:
+                    total = total - 0.5 * ((val - ctr) / sigmas[key]) ** 2
+            return total
+
+        terms.append(_shape)
 
     if eta_center is not None:
         e0, es = float(eta_center), float(eta_sigma)

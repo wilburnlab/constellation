@@ -101,6 +101,23 @@ class GlobalCalibration(nn.Module):
         self.r_ref = float(r_ref) if r_ref is not None else None
         self.mz_ref = float(mz_ref) if mz_ref is not None else None
 
+        # -- promoted peak-shape hyperprior -----------------------------
+        # Set by StagedCalibration (stage 3) from the calibrant population's
+        # fitted HyperEMG shapes; consumed by estimate_n's VB priors. A
+        # {full_param_name: (mean, std)} map over log/logit shape params
+        # (e.g. "peak.log_sigma" -> (mean, std)) or None until promoted. Not a
+        # buffer — it carries no gradient and is persisted via the Arrow table.
+        self.peak_shape_prior: dict[str, tuple[float, float]] | None = None
+
+    def set_peak_shape_prior(
+        self, prior: dict[str, tuple[float, float]] | None
+    ) -> None:
+        """Install (or clear) the promoted peak-shape hyperprior. Keys are full
+        progenitor parameter names (`peak.log_sigma`, `peak.log_tau_r`,
+        `peak.log_tau_l`, `peak.logit_eta`); values are `(mean, std)` Gaussians
+        in the parameter's log/logit space."""
+        self.peak_shape_prior = prior
+
     # -- gain -----------------------------------------------------------
 
     def gain(self, z: torch.Tensor) -> torch.Tensor:
@@ -141,7 +158,13 @@ class GlobalCalibration(nn.Module):
         the monoisotopic reference and contributes only `mz_offset`.
         """
         iso = torch.as_tensor(isotope, dtype=torch.long)
-        d_da = self.d_mz_da.index_select(0, iso.reshape(-1)).reshape(iso.shape)
+        # The monoisotopic (k=0) d_mz is the reference and is pinned to 0: its
+        # absolute m/z position is `mz_offset`, so a free d_mz_0 would be
+        # degenerate with `mz_offset` (the calibrator cannot separate them). Only
+        # the k≥1 isotope-spacing corrections are free; the pin is gradient-safe
+        # (index 0 is a constant zero, so no gradient reaches d_mz_da[0]).
+        d_pinned = torch.cat([self.d_mz_da.new_zeros(1), self.d_mz_da[1:]])
+        d_da = d_pinned.index_select(0, iso.reshape(-1)).reshape(iso.shape)
         mz_offset_da = d_da / torch.as_tensor(z, dtype=self._dtype)
         return self.mz_offset_ppm + da_to_ppm(mz_offset_da, channel_mz)
 

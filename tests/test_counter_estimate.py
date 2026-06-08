@@ -176,6 +176,16 @@ def test_make_log_prior_terms() -> None:
     assert float(out[0]) == pytest.approx(0.0, abs=1e-9)
     assert float(out[1]) == pytest.approx(-0.5, abs=1e-9)
 
+    # peak-shape hyperprior term (StagedCalibration → VB)
+    lp2 = make_log_prior(
+        shape_centers={"peak.log_sigma": 8.0},
+        shape_sigmas={"peak.log_sigma": 0.5},
+    )
+    p2 = {"peak.log_sigma": torch.tensor([8.0, 8.5], dtype=torch.float64)}
+    o2 = lp2(p2)
+    assert float(o2[0]) == pytest.approx(0.0, abs=1e-9)
+    assert float(o2[1]) == pytest.approx(-0.5, abs=1e-9)  # 1 σ off
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Additive interference + attribution (two co-eluting progenitors)

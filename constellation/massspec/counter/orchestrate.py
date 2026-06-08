@@ -1,11 +1,17 @@
-"""Estimation driver — fit a progenitor's `N(t)` and emit the deliverable.
+"""Estimation + calibration drivers; result-table builders.
 
-`estimate_n` is the per-target driver: it MAP-fits a `Progenitor` (DE global
-search over the multimodal HyperEMG + LBFGS polish, calibration frozen since
-it is not a progenitor parameter) and reports the integrated ion count
-`N_total` with a Laplace credible interval on `log N_total`. The richer
-variational path (`inference="vb"`, true posterior credible intervals) lands
-in the next PR; PR-1 ships `inference="map"`.
+`estimate_n` is the per-target driver: a data-seeded DE+LBFGS-polish MAP
+warm-start of a `Progenitor` (calibration frozen — it is not a progenitor
+parameter), then either variational credible intervals (`inference="vb"`,
+default) or a Laplace interval (`inference="map"`) on the integrated ion count
+`N_total`.
+
+`StagedCalibration` is the multi-calibrant driver: it fits a shared
+`GlobalCalibration` + per-peptide params across a set of calibrant peptides by
+freeze/thaw stages (per-peptide DE → global Adam → joint) and promotes a
+peak-shape hyperprior onto the calibration, which `estimate_n`'s VB priors then
+consume. (Stage-0, the peptide-agnostic m/z calibrator over raw peaks, lands
+with the real-data pivot.)
 
 Table builders serialize results / model state into the `schemas.py` tables.
 """
@@ -14,6 +20,7 @@ from __future__ import annotations
 
 import fnmatch
 import math
+from dataclasses import dataclass
 from typing import Any, Sequence
 
 import pyarrow as pa
@@ -34,6 +41,8 @@ from .schemas import (
 __all__ = [
     "estimate_n",
     "seed_peak_from_observation",
+    "StagedCalibration",
+    "StagedCalibrationResult",
     "counter_n_table",
     "calibration_to_table",
     "peptide_params_to_table",
@@ -258,10 +267,21 @@ def _fit_vb(
     in_guide = lambda name: any(  # noqa: E731
         fnmatch.fnmatchcase(name, pat) for pat in guide_params
     )
-    # η prior toward its MAP value, but only when η is actually a guide param.
+    # Promoted peak-shape hyperprior (StagedCalibration) regularizes the guided
+    # shape params toward the calibrant-population distribution.
+    shape_prior = progenitor.calibration.peak_shape_prior
+    shape_centers = shape_sigmas = None
+    if shape_prior:
+        shape_centers = {k: m for k, (m, _s) in shape_prior.items() if in_guide(k)}
+        shape_sigmas = {k: s for k, (_m, s) in shape_prior.items() if in_guide(k)}
+        if not shape_centers:
+            shape_centers = shape_sigmas = None
+    # η prior toward its MAP value, but only when η is guided AND the population
+    # hyperprior does not already cover it (the hyperprior is the stronger form).
     eta_center = (
         float(progenitor.peak.logit_eta.detach())
         if in_guide("peak.logit_eta")
+        and not (shape_centers and "peak.logit_eta" in shape_centers)
         else None
     )
     log_prior = make_log_prior(
@@ -272,6 +292,8 @@ def _fit_vb(
         ),
         eta_center=eta_center,
         eta_sigma=eta_sigma,
+        shape_centers=shape_centers,
+        shape_sigmas=shape_sigmas,
     )
     vb = fit_vb(
         progenitor,
@@ -293,6 +315,267 @@ def _fit_vb(
         bool(vb.converged),
         final_elbo,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Staged calibration
+# ──────────────────────────────────────────────────────────────────────
+
+_SHAPE_PARAM_NAMES = (
+    "peak.log_sigma",
+    "peak.log_tau_r",
+    "peak.log_tau_l",
+    "peak.logit_eta",
+)
+
+_STAGE_CONFIG = {
+    # stage -> (thaw_global, thaw_peptide)
+    "per_peptide": (False, True),
+    "global": (True, False),
+    "joint": (True, True),
+}
+
+# Gain α(z) params (confounded with N — calibrate only on known-abundance
+# spike-ins) and the identifiable global default that excludes them.
+_GAIN_PARAM_NAMES = ("alpha0", "alpha1", "log_alpha_z")
+_DEFAULT_GLOBAL_PARAMS = (
+    "mz_offset_ppm",
+    "d_mz_da",
+    "log_alpha_mz",
+    "log_nu_mz",
+    "rho",
+)
+
+
+@dataclass
+class StagedCalibrationResult:
+    """Outcome of a `StagedCalibration.run`: one report per stage, the promoted
+    peak-shape hyperprior (also installed on the calibration), and the calibrant
+    count."""
+
+    stage_reports: list[dict[str, Any]]
+    peak_shape_prior: dict[str, tuple[float, float]] | None
+    n_calibrants: int
+
+
+class StagedCalibration:
+    """Fit a shared `GlobalCalibration` + per-peptide params across a set of
+    calibrant peptides by freeze/thaw stages, then promote a peak-shape
+    hyperprior.
+
+    The objective is the summed joint log-likelihood over the calibrants (each a
+    one-progenitor `Panel` against its own observation; all progenitors share
+    the single `calibration`). Stages toggle `requires_grad`:
+
+      * ``"per_peptide"`` — calibration frozen, per-peptide thawed: fit each
+        peptide's `N` + shape under the current calibration.
+      * ``"global"`` — per-peptide frozen, calibration thawed: fit the shared
+        gain / m/z offset / `d_mz` / `α_mz` / `ν_mz` / `ρ` given those fits.
+      * ``"joint"`` — both thawed: refine together.
+
+    After the stages, `promote_peak_shape_hyperprior` summarizes the calibrant
+    population's fitted HyperEMG shapes (`log σ`, `log τ_r`, `log τ_l`,
+    `logit η`) as per-parameter Gaussians and installs them on the calibration —
+    where `estimate_n`'s VB path reads them to regularize per-peptide shape fits
+    (the principled replacement for a hard `τ`-bound / RT window). The m/z scale
+    params (`mz_offset`, `d_mz`) are the cleanly-identifiable target; absolute
+    gain is confounded with `N` unless calibrant amounts are known (the m/z
+    channel is the only in-model `N` anchor) — calibrate gain on confident
+    spike-ins with known abundance.
+    """
+
+    def __init__(
+        self,
+        progenitors: Sequence[Progenitor],
+        observations: Sequence[CounterObservation],
+        calibration: GlobalCalibration,
+        *,
+        floor_ions: float = 1.0,
+    ) -> None:
+        if len(progenitors) != len(observations):
+            raise ValueError(
+                f"{len(progenitors)} progenitors != {len(observations)} observations"
+            )
+        if len(progenitors) == 0:
+            raise ValueError("StagedCalibration needs at least one calibrant")
+        if any(q.calibration is not calibration for q in progenitors):
+            raise ValueError(
+                "every calibrant progenitor must share the passed `calibration` "
+                "(it is fit globally)"
+            )
+        self.progenitors = list(progenitors)
+        self.observations = list(observations)
+        self.calibration = calibration
+        self.floor_ions = float(floor_ions)
+
+    # -- objective ------------------------------------------------------
+
+    def joint_neg_log_prob(self) -> torch.Tensor:
+        """`−Σ_i panel_log_prob([prog_i], obs_i, calibration)` (a 0-d tensor)."""
+        from .panel import panel_log_prob
+
+        total = self.observations[0].rt.new_zeros(())
+        for q, obs in zip(self.progenitors, self.observations):
+            total = total - panel_log_prob(
+                [q], obs, self.calibration, floor_ions=self.floor_ions
+            )
+        return total
+
+    def _peptide_params(self) -> list[torch.nn.Parameter]:
+        return [p for q in self.progenitors for p in q.parameters()]
+
+    @staticmethod
+    def _set_grad(params: Sequence[torch.nn.Parameter], flag: bool) -> None:
+        for p in params:
+            p.requires_grad_(flag)
+
+    def _fit_stage(
+        self,
+        stage: str,
+        *,
+        global_params: Sequence[str],
+        max_iter: int,
+        lr: float,
+        tol: float,
+    ) -> dict[str, Any]:
+        thaw_global, thaw_peptide = _STAGE_CONFIG[stage]
+        cal_named = list(self.calibration.named_parameters())
+        for name, p in cal_named:
+            thaw = thaw_global and any(
+                fnmatch.fnmatchcase(name, pat) for pat in global_params
+            )
+            p.requires_grad_(thaw)
+        pep_params = self._peptide_params()
+        self._set_grad(pep_params, thaw_peptide)
+        trainable = [
+            p
+            for p in (*(p for _n, p in cal_named), *pep_params)
+            if p.requires_grad
+        ]
+        if not trainable:
+            return {"stage": stage, "final_loss": None, "n_iter": 0, "converged": False}
+        opt = AdamOptimizer(trainable, lr=lr)
+        prev, last = math.inf, math.nan
+        n_iter = 0
+        for i in range(max_iter):
+            last = float(opt.step(self.joint_neg_log_prob).detach())
+            n_iter = i + 1
+            if math.isfinite(last) and abs(prev - last) < tol:
+                break
+            prev = last
+        return {
+            "stage": stage,
+            "final_loss": last,
+            "n_iter": n_iter,
+            "converged": math.isfinite(last) and abs(prev - last) < tol,
+        }
+
+    # -- driver ---------------------------------------------------------
+
+    def _fit_peptide_de(
+        self, *, generations: int, pop_size: int, max_evals: int, seed: int
+    ) -> dict[str, Any]:
+        """Per-peptide stage via DE — calibration frozen, so the calibrants are
+        independent MAP fits. DE (global search + LBFGS polish) is required for
+        the multimodal HyperEMG η/τ that gradient-only Adam mis-fits (it lands a
+        wrong η, corrupting the promoted shape hyperprior)."""
+        for _n, p in self.calibration.named_parameters():
+            p.requires_grad_(False)
+        total, converged = 0.0, True
+        for q, obs in zip(self.progenitors, self.observations):
+            self._set_grad(list(q.parameters()), True)
+            de = DifferentialEvolution(
+                q, bounds=_default_bounds(q, obs), pop_size=pop_size,
+                max_evals=max_evals, seed=seed,
+            )
+            result = q.fit(obs, optimizer=de, max_iter=generations, polish_on_converge=True)
+            total += float(-q.log_prob(obs).detach())
+            converged = converged and bool(result.converged)
+        return {
+            "stage": "per_peptide",
+            "final_loss": total,
+            "n_iter": generations,
+            "converged": converged,
+        }
+
+    def run(
+        self,
+        *,
+        seed: bool = True,
+        stages: Sequence[str] = ("per_peptide", "global", "joint"),
+        global_params: Sequence[str] = _DEFAULT_GLOBAL_PARAMS,
+        de_generations: int = 100,
+        de_pop_size: int = 24,
+        de_max_evals: int = 4000,
+        de_seed: int = 0,
+        global_iter: int = 400,
+        joint_iter: int = 400,
+        lr: float = 0.02,
+        tol: float = 1e-4,
+        promote: bool = True,
+    ) -> StagedCalibrationResult:
+        """Run the freeze/thaw stages (default per_peptide → global → joint),
+        optionally seeding each calibrant's peak from its observation first, then
+        promote the peak-shape hyperprior. Leaves all parameters thawed.
+
+        `global_params` selects which calibration params the global/joint stages
+        thaw — default the identifiable set (`mz_offset_ppm`, `d_mz_da`,
+        `α_mz`, `ν_mz`, `ρ`), **excluding the gain** (`alpha0`/`alpha1`/
+        `log_alpha_z`), which is confounded with `N` and must be calibrated on
+        known-abundance spike-ins. Pass an explicit list including the gain names
+        only when calibrant amounts are fixed."""
+        unknown = set(stages) - set(_STAGE_CONFIG)
+        if unknown:
+            raise ValueError(f"unknown stage(s) {sorted(unknown)}; have {list(_STAGE_CONFIG)}")
+        if seed:
+            for q, obs in zip(self.progenitors, self.observations):
+                seed_peak_from_observation(q, obs)
+        iters = {"global": global_iter, "joint": joint_iter}
+        reports: list[dict[str, Any]] = []
+        for stage in stages:
+            if stage == "per_peptide":
+                reports.append(
+                    self._fit_peptide_de(
+                        generations=de_generations,
+                        pop_size=de_pop_size,
+                        max_evals=de_max_evals,
+                        seed=de_seed,
+                    )
+                )
+            else:
+                reports.append(
+                    self._fit_stage(
+                        stage,
+                        global_params=global_params,
+                        max_iter=iters[stage],
+                        lr=lr,
+                        tol=tol,
+                    )
+                )
+        prior = self.promote_peak_shape_hyperprior() if promote else None
+        # Leave everything thawed so the calibration / progenitors are usable.
+        self._set_grad(list(self.calibration.parameters()), True)
+        self._set_grad(self._peptide_params(), True)
+        return StagedCalibrationResult(reports, prior, len(self.progenitors))
+
+    def promote_peak_shape_hyperprior(self) -> dict[str, tuple[float, float]]:
+        """Summarize the calibrant population's fitted HyperEMG shape params as
+        per-parameter `(mean, std)` Gaussians (in log/logit space) and install
+        them on the calibration. `std` is the unbiased sample std, floored at
+        1e-3 (and 1.0 for a single calibrant — an uninformative width)."""
+        prior: dict[str, tuple[float, float]] = {}
+        single = len(self.progenitors) < 2
+        for name in _SHAPE_PARAM_NAMES:
+            leaf = name.split(".", 1)[1]
+            xs = torch.tensor(
+                [float(getattr(q.peak, leaf).detach()) for q in self.progenitors],
+                dtype=torch.float64,
+            )
+            mean = float(xs.mean())
+            std = 1.0 if single else max(float(xs.std(unbiased=True)), 1e-3)
+            prior[name] = (mean, std)
+        self.calibration.set_peak_shape_prior(prior)
+        return prior
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -332,6 +615,20 @@ def calibration_to_table(
         "prior_log_tau_mean": None,
         "prior_log_tau_std": None,
     }
+    # Promoted peak-shape hyperprior (StagedCalibration): persist σ + τ_r (the
+    # schema's two shape slots; τ_l / η priors stay in-memory only).
+    prior = cal.peak_shape_prior
+    if prior:
+        if "peak.log_sigma" in prior:
+            row["prior_log_sigma_mean"], row["prior_log_sigma_std"] = (
+                float(prior["peak.log_sigma"][0]),
+                float(prior["peak.log_sigma"][1]),
+            )
+        if "peak.log_tau_r" in prior:
+            row["prior_log_tau_mean"], row["prior_log_tau_std"] = (
+                float(prior["peak.log_tau_r"][0]),
+                float(prior["peak.log_tau_r"][1]),
+            )
     return pa.table({k: [v] for k, v in row.items()}).cast(
         COUNTER_GLOBAL_CALIBRATION_TABLE
     )

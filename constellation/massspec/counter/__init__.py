@@ -31,6 +31,8 @@ from .iit import accumulated_count
 from .io import CounterResult, load_counter, save_counter
 from .model import CounterObservation, Progenitor
 from .orchestrate import (
+    StagedCalibration,
+    StagedCalibrationResult,
     calibration_to_table,
     counter_n_table,
     estimate_n,
@@ -66,6 +68,8 @@ __all__ = [
     "observation_to_trace",
     "estimate_n",
     "seed_peak_from_observation",
+    "StagedCalibration",
+    "StagedCalibrationResult",
     "counter_n_table",
     "calibration_to_table",
     "peptide_params_to_table",
