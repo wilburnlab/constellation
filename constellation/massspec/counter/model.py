@@ -85,10 +85,10 @@ class Progenitor(Distribution):
 
     Learnable per-peptide parameters: the `HyperEMGPeak` (`log_N_total`, `mu`,
     `log_sigma`, `log_tau_r`, `log_tau_l`, `logit_eta`), `charge_energy` (Zc,)
-    (charge free-energies → `f_z = softmax(−E)`), `log_nu_intensity`, and
-    `log_c_mz` (K,). The isotope fractions `p_k` are fixed-theoretical
-    (intrinsic abundance). `calibration` is shared and frozen during
-    per-peptide fits.
+    (charge free-energies → `f_z = softmax(−E)`), `log_nu_intensity`,
+    `log_c_mz` (K,), and `isotope_energy_offset` (K−1,) — a learnable correction
+    on the theoretical isotope log-weights (M+0 reference; see the `p_k`
+    property). `calibration` is shared and frozen during per-peptide fits.
     """
 
     def __init__(
@@ -116,7 +116,9 @@ class Progenitor(Distribution):
         self.register_buffer("channel_z", z)
         self.register_buffer("channel_isotope", k)
         self.register_buffer("channel_mz", channel_mz.to(dtype))
-        self.register_buffer("p_k", p_k / p_k.sum())
+        # Theoretical isotope log-weights (fixed), with a learnable per-isotope
+        # correction for k≥1 (M+0 is the reference) — see the `p_k` property.
+        self.register_buffer("log_p_theo", (p_k / p_k.sum()).log())
         uniq = torch.tensor(list(charges), dtype=torch.long)
         self.register_buffer("charges", uniq)
         # channel → index into `charges`
@@ -134,6 +136,11 @@ class Progenitor(Distribution):
         )
         self.log_c_mz = nn.Parameter(
             torch.full((n_isotopes,), float(c_mz_init), dtype=dtype).log()
+        )
+        # Learnable isotope-fraction correction (free energy on the log-weights)
+        # for k≥1; M+0 is the fixed reference. Init 0 → effective p_k = theoretical.
+        self.isotope_energy_offset = nn.Parameter(
+            torch.zeros(max(0, n_isotopes - 1), dtype=dtype)
         )
 
     @classmethod
@@ -182,6 +189,21 @@ class Progenitor(Distribution):
     def nu_intensity(self) -> torch.Tensor:
         return self.log_nu_intensity.exp()
 
+    @property
+    def p_k(self) -> torch.Tensor:
+        """Effective isotope fractions `(K,)` — `softmax` over the theoretical
+        log-weights plus the learnable per-isotope correction (M+0 fixed as the
+        reference). At init the correction is 0, so `p_k` = the theoretical
+        binned envelope. The correction is *required* at high resolution: ¹⁵N/¹³C
+        partial separation changes how isotopic species convolve into each binned
+        channel — a real, peptide-specific shift of the M+1 (and M+2) relative
+        signal that scales with the N/C ratio, which a fixed envelope mis-models
+        and which otherwise biases the likelihood."""
+        if self.isotope_energy_offset.numel() == 0:
+            return torch.softmax(self.log_p_theo, dim=0)
+        offset = torch.cat([self.log_p_theo.new_zeros(1), self.isotope_energy_offset])
+        return torch.softmax(self.log_p_theo + offset, dim=0)
+
     def charge_fractions(self) -> torch.Tensor:
         """`f_z = softmax(−E_z)` over the progenitor's charges, `(Zc,)`."""
         return torch.softmax(-self.charge_energy, dim=0)
@@ -225,6 +247,7 @@ class Progenitor(Distribution):
         return {
             "N_total": self.peak.N_total.detach(),
             "charge_fractions": self.charge_fractions().detach(),
+            "isotope_fractions": self.p_k.detach(),
             "nu_intensity": self.nu_intensity.detach(),
             "c_mz": self.log_c_mz.exp().detach(),
         }

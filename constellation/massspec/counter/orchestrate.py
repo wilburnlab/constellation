@@ -113,6 +113,7 @@ def _default_bounds(
         "peak.log_tau_l": (math.log(100.0), math.log(120_000.0)),
         "peak.logit_eta": (_logit(0.02), _logit(0.98)),
         "charge_energy": (-12.0, 12.0),
+        "isotope_energy_offset": (-1.5, 1.5),  # ≲4.5× fraction deviation; toward-0 prior in VB
         "log_nu_intensity": (math.log(2.0), math.log(200.0)),
         "log_c_mz": (math.log(1.0), math.log(1e6)),
     }

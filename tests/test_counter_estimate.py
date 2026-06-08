@@ -70,6 +70,29 @@ def test_round_trip_recovery(truth_n: float) -> None:
     assert 1.0 < res["peak_sigma"] < 30.0  # seconds; physically sane width
 
 
+def test_isotope_fraction_correction_recovered() -> None:
+    """The learnable isotope-fraction correction recovers a real M+1/M+2 shift
+    (the high-resolution ¹⁵N/¹³C convolution effect) without biasing N."""
+    cal = _cal()
+    truth = _prog(cal, n_total=2e5, nu_intensity=6.0, c_mz_init=200.0)
+    with torch.no_grad():
+        truth.isotope_energy_offset.copy_(
+            torch.tensor([0.6, -0.3], dtype=torch.float64)
+        )  # inflate M+1, deflate M+2
+    truth_pk = truth.p_k.detach().clone()
+    # the perturbation must actually move the fractions off theoretical
+    theo = torch.softmax(truth.log_p_theo, dim=0)
+    assert float((truth_pk - theo).abs().max()) > 0.1
+
+    obs = simulate_observation(
+        truth, n_scans=80, generator=torch.Generator().manual_seed(21)
+    )
+    prog = _prog(cal, n_total=1.0, nu_intensity=5.0, c_mz_init=150.0)
+    res = estimate_n(prog, obs, inference="map", optimizer="de", seed=0)
+    assert torch.allclose(prog.p_k.detach(), truth_pk, atol=0.03)
+    assert abs(res["n_total"] - 2e5) / 2e5 < 0.12
+
+
 def test_estimate_n_rejects_vb_for_now() -> None:
     cal = _cal()
     prog = _prog(cal)
@@ -89,33 +112,35 @@ def test_two_coeluting_progenitors_recovered() -> None:
     from constellation.massspec.counter.panel import Panel
 
     cal = _cal()
-    # Two species, shared m/z grid, resolved by distinct elution apexes.
-    a = _prog(cal, n_total=2e5, mu=1.80e6, nu_intensity=6.0, c_mz_init=200.0)
-    b = _prog(cal, n_total=1e5, mu=1.815e6, nu_intensity=6.0, c_mz_init=200.0)
-    rt = torch.linspace(1.78e6, 1.84e6, 120, dtype=torch.float64)
+    # Two species sharing the m/z grid, co-eluting with overlapping tails but
+    # resolvable apexes (~7σ apart) so attribution can recover the split.
+    mu_a, mu_b = 1.80e6, 1.842e6
+    a = _prog(cal, n_total=2e5, mu=mu_a, nu_intensity=6.0, c_mz_init=200.0)
+    b = _prog(cal, n_total=1e5, mu=mu_b, nu_intensity=6.0, c_mz_init=200.0)
+    rt = torch.linspace(1.784e6, 1.866e6, 140, dtype=torch.float64)
     obs = simulate_panel_observation(
         [a, b], rt=rt, iit_ms=20.0, generator=torch.Generator().manual_seed(7)
     )
 
     # Fit a fixed two-candidate panel (calibration frozen — not a progenitor param).
-    ea = _prog(cal, n_total=1.0, mu=1.80e6, nu_intensity=5.0, c_mz_init=150.0)
-    eb = _prog(cal, n_total=1.0, mu=1.815e6, nu_intensity=5.0, c_mz_init=150.0)
-    seed_peak_from_observation(ea, obs, rt_prior_ms=1.80e6)
-    seed_peak_from_observation(eb, obs, rt_prior_ms=1.815e6)
+    ea = _prog(cal, n_total=1.0, mu=mu_a, nu_intensity=5.0, c_mz_init=150.0)
+    eb = _prog(cal, n_total=1.0, mu=mu_b, nu_intensity=5.0, c_mz_init=150.0)
+    seed_peak_from_observation(ea, obs, rt_prior_ms=mu_a)
+    seed_peak_from_observation(eb, obs, rt_prior_ms=mu_b)
     panel = Panel([ea, eb], cal)
     params = [p for q in (ea, eb) for p in q.parameters()]
     opt = AdamOptimizer(params, lr=0.03)
     closure = lambda: -panel.log_prob(obs)  # noqa: E731
-    for _ in range(1500):
+    for _ in range(1800):
         opt.step(closure)
 
     na = float(ea.peak.N_total.detach())
     nb = float(eb.peak.N_total.detach())
-    total = na + nb
-    # The summed ion count is well constrained; the split is harder but should
-    # land the dominant species above the minor one and the total near truth.
-    assert abs(total - 3e5) / 3e5 < 0.20
+    # Both species recovered, and the additive total is well constrained.
+    assert abs(na - 2e5) / 2e5 < 0.15
+    assert abs(nb - 1e5) / 1e5 < 0.20
     assert na > nb
+    assert abs((na + nb) - 3e5) / 3e5 < 0.10
 
 
 # ──────────────────────────────────────────────────────────────────────

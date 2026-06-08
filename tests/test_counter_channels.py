@@ -107,14 +107,14 @@ def test_mz_center_da_to_ppm() -> None:
 
 def test_alpha_mz_nu_mz_and_rho_defaults() -> None:
     cal = GlobalCalibration(alpha_mz=0.6, nu_mz=7.8)
-    assert float(cal.alpha_mz) == pytest.approx(0.6, rel=1e-6)
-    assert float(cal.nu_mz) == pytest.approx(7.8, rel=1e-6)
+    assert float(cal.alpha_mz.detach()) == pytest.approx(0.6, rel=1e-6)
+    assert float(cal.nu_mz.detach()) == pytest.approx(7.8, rel=1e-6)
     # No R_ref/mz_ref → ρ_R = 1 (no resolution scaling).
     assert float(cal.rho_R(torch.tensor([700.0]))) == pytest.approx(1.0)
     # With R(m/z) set, ρ_R = (mz_ref/mz)^(ρ/2).
     cal2 = GlobalCalibration(rho=0.5, r_ref=60000.0, mz_ref=200.0)
     rr = cal2.rho_R(torch.tensor([800.0]))
-    assert float(rr) == pytest.approx((200.0 / 800.0) ** 0.25, rel=1e-6)
+    assert float(rr.detach()) == pytest.approx((200.0 / 800.0) ** 0.25, rel=1e-6)
 
 
 def test_unknown_alpha_model_raises() -> None:

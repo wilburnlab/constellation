@@ -76,14 +76,24 @@ def test_predict_dimensional_relation() -> None:
     assert torch.allclose(i_pred * obs.iit[:, None] / gain[None, :], n_count)
 
 
-def test_charge_fractions_and_fixed_isotopes() -> None:
+def test_charge_fractions_and_isotope_correction() -> None:
     prog = _progenitor(_cal())
     f = prog.charge_fractions()
-    assert float(f.sum()) == pytest.approx(1.0)
-    # isotope fractions are a fixed buffer (not a trainable parameter)
+    assert float(f.detach().sum()) == pytest.approx(1.0)
+    # p_k is a normalized property over fixed theoretical log-weights + a
+    # learnable per-isotope correction (M+0 reference); init correction = 0,
+    # so p_k starts at the theoretical envelope.
     param_names = {n for n, _ in prog.named_parameters()}
-    assert "p_k" not in param_names
-    assert float(prog.p_k.sum()) == pytest.approx(1.0)
+    assert "p_k" not in param_names and "log_p_theo" not in param_names
+    assert "isotope_energy_offset" in param_names
+    assert float(prog.p_k.detach().sum()) == pytest.approx(1.0)
+    assert torch.allclose(prog.p_k.detach(), torch.softmax(prog.log_p_theo, dim=0))
+    # the correction has K-1 free entries (M+0 fixed)
+    assert prog.isotope_energy_offset.numel() == 2  # K=3
+    # perturbing M+1 raises p_1 relative to theoretical
+    with torch.no_grad():
+        prog.isotope_energy_offset[0] += 0.5
+    assert float(prog.p_k[1].detach()) > float(torch.softmax(prog.log_p_theo, dim=0)[1])
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -166,7 +176,7 @@ def test_panel_background_parameter() -> None:
     prog = _progenitor(cal)
     panel = Panel([prog], cal, background=True)
     assert panel.log_background is not None
-    assert float(panel.background_intensity()) > 0.0
+    assert float(panel.background_intensity().detach()) > 0.0
     no_bg = Panel([prog], cal, background=False)
     assert no_bg.background_intensity() == 0.0
 
