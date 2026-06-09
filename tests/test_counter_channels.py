@@ -135,6 +135,23 @@ def test_mz_center_da_to_ppm() -> None:
     assert float(c0.detach()) == pytest.approx(0.5, abs=1e-9)
 
 
+def test_mz_center_pins_monoisotopic_dmz() -> None:
+    # d_mz_0 is the reference, pinned to 0: the isotope-0 center is `mz_offset`
+    # only, regardless of a nonzero d_mz_da[0] (which would otherwise be
+    # degenerate with mz_offset). Isotope-1 still uses its d_mz_da[1].
+    cal = GlobalCalibration(
+        n_isotopes=3, mz_offset_ppm=0.5, d_mz_da=[0.7, 0.001, 0.0]
+    )
+    c0 = cal.mz_center_ppm(
+        torch.tensor([500.0]), torch.tensor([2.0]), torch.tensor([0])
+    )
+    assert float(c0.detach()) == pytest.approx(0.5, abs=1e-9)  # d_mz_0 ignored
+    c1 = cal.mz_center_ppm(
+        torch.tensor([500.0]), torch.tensor([2.0]), torch.tensor([1])
+    )
+    assert float(c1.detach()) == pytest.approx(0.5 + 1.0, abs=1e-6)  # +1 ppm
+
+
 def test_alpha_mz_nu_mz_and_rho_defaults() -> None:
     cal = GlobalCalibration(alpha_mz=0.6, nu_mz=7.8)
     assert float(cal.alpha_mz.detach()) == pytest.approx(0.6, rel=1e-6)
