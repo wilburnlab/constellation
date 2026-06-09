@@ -83,8 +83,9 @@ def test_staged_calibration_recovers_mz_offset_and_n() -> None:
 
 
 def test_staged_calibration_freezes_gain_by_default() -> None:
-    """The default global_params excludes the gain (confounded with N), so a
-    run leaves α(z) untouched while still moving the identifiable m/z offset."""
+    """The default global_params excludes the gain (identifiable only via the
+    weak shot-noise curvature), so a run leaves α(z) untouched while still
+    moving the cleanly-identifiable m/z offset."""
     seqs = ["PEPTIDEKR", "ELVISLIVEK"]
     ns = [1e5, 1.5e5]
     true_cal = _cal(mz_offset_ppm=2.0)
@@ -100,6 +101,37 @@ def test_staged_calibration_freezes_gain_by_default() -> None:
         g_before, abs=1e-9
     )
     assert float(fit_cal.mz_offset_ppm.detach()) > 0.5  # identifiable, moved
+
+
+def test_gain_calibration_converges_with_jacobian() -> None:
+    """The log(τ/α) change-of-variables Jacobian makes the likelihood proper in
+    α: co-fitting the gain from a mis-set start now converges TOWARD the truth
+    (and N stays bounded) instead of diverging (α↑, N→0) as it would without
+    the Jacobian. Recovery is partial — the shot-noise curvature is weak."""
+    seqs = ["PEPTIDEKR", "ELVISLIVEK", "ANALYTICR", "GHISTIDINEK"]
+    ns = [8e4, 1.5e5, 2e5, 1.2e5]
+    true_cal = _cal(alpha1=15.0)  # true gain slope
+    obs = _calibrants(true_cal, seqs, ns, seed0=500)
+
+    fit_cal = _cal(alpha1=22.0)  # mis-set high
+    progs = _fresh_progs(fit_cal, seqs)
+    res = StagedCalibration(progs, obs, fit_cal).run(
+        global_params=(
+            "mz_offset_ppm", "d_mz_da", "log_alpha_mz", "log_nu_mz", "rho",
+            "alpha0", "alpha1",
+        ),
+        global_iter=500,
+        joint_iter=300,
+    )
+    a1 = float(fit_cal.alpha1.detach())
+    # moved down from 22 toward 15 (not diverging upward), and well bounded.
+    assert 13.0 < a1 < 21.0
+    assert a1 < 22.0
+    for n, q in zip(ns, progs):
+        nf = float(q.peak.N_total.detach())
+        assert 1e3 < nf < 1e6  # no collapse / blow-up
+        assert abs(nf - n) / n < 0.30
+    assert res.peak_shape_prior is not None
 
 
 def test_staged_calibration_validates_inputs() -> None:
