@@ -335,8 +335,14 @@ _STAGE_CONFIG = {
     "joint": (True, True),
 }
 
-# Gain α(z) params (confounded with N — calibrate only on known-abundance
-# spike-ins) and the identifiable global default that excludes them.
+# Gain α(z) params and the global default that excludes them. The gain is
+# identifiable from the shot-noise (Var ∝ α²·N vs Mean ∝ α·N) once the
+# `log(τ/α)` Jacobian is in the likelihood (it is — see `panel_log_prob`), so
+# co-fitting it no longer diverges. But the curvature is WEAK (a second-moment
+# signal), so recovery from a mis-set start is imperfect and init-sensitive —
+# excluded from the default for robustness. Calibrate the gain by adding these
+# names to `global_params`, ideally with many calibrants / known-abundance
+# spike-ins anchoring the absolute count.
 _GAIN_PARAM_NAMES = ("alpha0", "alpha1", "log_alpha_z")
 _DEFAULT_GLOBAL_PARAMS = (
     "mz_offset_ppm",
@@ -378,10 +384,12 @@ class StagedCalibration:
     `logit η`) as per-parameter Gaussians and installs them on the calibration —
     where `estimate_n`'s VB path reads them to regularize per-peptide shape fits
     (the principled replacement for a hard `τ`-bound / RT window). The m/z scale
-    params (`mz_offset`, `d_mz`) are the cleanly-identifiable target; absolute
-    gain is confounded with `N` unless calibrant amounts are known (the m/z
-    channel is the only in-model `N` anchor) — calibrate gain on confident
-    spike-ins with known abundance.
+    params (`mz_offset`, `d_mz`) are the cleanly-identifiable target; the
+    absolute gain is identifiable only through the shot-noise (`Var ~ a^2 N` vs
+    `Mean ~ a N`, via the `log(tau/a)` likelihood Jacobian) — a weak
+    second-moment signal — so it is excluded from the default `global_params`
+    for robustness; add the gain names to `global_params` (ideally with
+    known-abundance spike-ins) to calibrate it.
     """
 
     def __init__(
@@ -519,11 +527,12 @@ class StagedCalibration:
         promote the peak-shape hyperprior. Leaves all parameters thawed.
 
         `global_params` selects which calibration params the global/joint stages
-        thaw — default the identifiable set (`mz_offset_ppm`, `d_mz_da`,
+        thaw — default the cleanly-identifiable set (`mz_offset_ppm`, `d_mz_da`,
         `α_mz`, `ν_mz`, `ρ`), **excluding the gain** (`alpha0`/`alpha1`/
-        `log_alpha_z`), which is confounded with `N` and must be calibrated on
-        known-abundance spike-ins. Pass an explicit list including the gain names
-        only when calibrant amounts are fixed."""
+        `log_alpha_z`): the gain is identifiable only through the weak shot-noise
+        curvature (`Var ∝ α²N` vs `Mean ∝ αN`), so co-fitting it is well-posed
+        but init-sensitive and imperfect from a mis-set start. Add the gain names
+        to calibrate it (ideally with known-abundance spike-ins)."""
         unknown = set(stages) - set(_STAGE_CONFIG)
         if unknown:
             raise ValueError(f"unknown stage(s) {sorted(unknown)}; have {list(_STAGE_CONFIG)}")

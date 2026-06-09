@@ -14,7 +14,11 @@ new candidates is deferred. The likelihood combines:
     I_obs*tau/alpha` of each OBSERVED channel: `log Poisson(N_obs | lambda)`,
     `lambda = N_count`. Count-native (Var = lambda); the exact PMF fixes the
     discrete low-count regime the continuous Student-t mis-modelled.
-    (`channels.poisson_count_log_prob`.)
+    (`channels.poisson_count_log_prob`.) Plus the change-of-variables Jacobian
+    `log(tau/alpha)` per observed channel (the data are intensities, not
+    counts): constant when alpha is frozen, but required to make the likelihood
+    proper in alpha when the gain is co-fit (else the PMF's preference for
+    smaller counts pulls alpha up without bound).
   * m/z (Eq. 23/25) -- soft-gamma mixture marginal over progenitors (Eq. 26/27
     conditional independence given the latent count);
   * censored (non-detection) -- Poisson tail `P(count < floor | lambda)` on
@@ -124,7 +128,20 @@ def panel_log_prob(
     cens_lp = ch.censored_log_prob(n_count_total, floor_ions)  # (S, C)
     cens_term = torch.where(obs.mask, zeros, cens_lp).sum()
 
-    return int_term + mz_term + cens_term
+    # Change-of-variables Jacobian: the DATA are intensities I, but the
+    # observed-channel term scores the recovered count N_obs = I*tau/alpha, so
+    # the proper data log-density adds log|dN_obs/dI| = log(tau / alpha(z)) per
+    # observed channel. This is N-INDEPENDENT, so it is a constant that drops
+    # out of the per-peptide N / shape fit when alpha is frozen (estimate_n).
+    # It is REQUIRED when alpha is co-fit (calibration): without the -log(alpha)
+    # the Poisson PMF's preference for smaller counts pulls the gain up (and N
+    # down) without bound; with it, the shot-noise structure (Var ~ alpha^2 * N
+    # vs Mean ~ alpha * N) identifies alpha. (mz_error, in ppm, carries no
+    # alpha-dependent Jacobian.)
+    log_jac = torch.log(iit[:, None]) - torch.log(gain_ch[None, :])  # (S, C)
+    jac_term = torch.where(obs.mask, log_jac, zeros).sum()
+
+    return int_term + mz_term + cens_term + jac_term
 
 
 class Panel(Distribution):
