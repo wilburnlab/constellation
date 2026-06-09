@@ -79,6 +79,7 @@ import constellation.massspec.counter.channels
 import constellation.massspec.counter.iit
 import constellation.massspec.counter.io
 import constellation.massspec.counter.model
+import constellation.massspec.counter.observe
 import constellation.massspec.counter.orchestrate
 import constellation.massspec.counter.panel
 import constellation.massspec.counter.priors
