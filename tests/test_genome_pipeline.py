@@ -36,7 +36,7 @@ done
 
 _DORADO_STUB = r"""#!/usr/bin/env bash
 case "${1:-}" in
-  --version) echo "dorado 0.8.3+mock"; exit 0 ;;
+  --version) echo "dorado 2.0.0+mock"; exit 0 ;;
   aligner) printf 'MOCKALN'; exit 0 ;;
   polish) draft="${@: -1}"; cat "$draft"; exit 0 ;;
   *) exit 0 ;;

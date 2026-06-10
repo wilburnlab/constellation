@@ -14,7 +14,7 @@ pytest.importorskip("matplotlib")
 
 _DORADO = r"""#!/usr/bin/env bash
 case "${1:-}" in
-  --version) echo "dorado 0.8.3+mock"; exit 0 ;;
+  --version) echo "dorado 2.0.0+mock"; exit 0 ;;
   basecaller|duplex)
     [[ -n "${MOCK_ARGV_FILE:-}" ]] && printf '%s\n' "$*" > "${MOCK_ARGV_FILE}"
     printf 'MOCKBAM'; echo "[info] 50%% done" >&2; exit 0 ;;

@@ -26,7 +26,7 @@ def test_manifest_roundtrip(tmp_path: Path):
         scaffold_reference_handle="homo_sapiens@ensembl-111",
         scaffold_reference_path="/refs/homo_sapiens/ensembl-111",
         assembly_accession="GCF_000001405.40",
-        tool_versions={"hifiasm": "0.25.0", "dorado": "0.8.3"},
+        tool_versions={"hifiasm": "0.25.0", "dorado": "2.0.0"},
         tool_args={"hifiasm": ["--ont"]},
         busco_lineage="eukaryota_odb10",
     )

@@ -17,22 +17,22 @@
 # Usage:
 #   bash scripts/install-dorado.sh
 #   bash scripts/install-dorado.sh --force
-#   bash scripts/install-dorado.sh --version 0.8.3
+#   bash scripts/install-dorado.sh --version 1.4.0   # pin a different version
 #   bash scripts/install-dorado.sh --checksum <SHA256>
 #   CONSTELLATION_ACCEPT_DORADO_LICENSE=1 bash scripts/install-dorado.sh  # non-interactive
 #
 # Wrapper code is Apache-2.0 (Constellation); Dorado itself is ONT's.
 set -euo pipefail
 
-VERSION="0.8.3"
-PINNED_VERSION="0.8.3"
+VERSION="2.0.0"   # latest stable (May 2026); v6.0 models + mature `dorado polish`
+PINNED_VERSION="2.0.0"
 # Per-platform SHA256 of the ONT CDN tarballs for PINNED_VERSION. The ONT CDN
 # artifacts are byte-stable, so these are reliable integrity pins. linux-x64
 # verified 2026-06-09; arm64 / osx-arm64 are placeholders — pass --checksum
 # to verify those (or fill them in once verified). For any other --version,
 # pass --checksum.
 declare -A PINNED_SHA
-PINNED_SHA[linux-x64]="8b679ed7faa61299af2df591322b2737d61106a53f3175cc2d4efe0a31242ec2"
+PINNED_SHA[linux-x64]="311c4be8fe5177ee2ffe08e2b6ae08bd7f4f1c11caf273e6161562bd9ba48b49"
 PINNED_SHA[linux-arm64]="REPLACE_WITH_VERIFIED_SHA256"
 PINNED_SHA[osx-arm64]="REPLACE_WITH_VERIFIED_SHA256"
 

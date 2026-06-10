@@ -17,11 +17,12 @@ License: Dorado is distributed under the Oxford Nanopore Technologies
 PLC. Public License Version 1.0 — Research Purposes only. The
 Constellation wrapper itself is Apache 2.0; users invoking it
 independently accept ONT's terms. See the upstream LICENCE.txt:
-https://github.com/nanoporetech/dorado/blob/release-v1.4/LICENCE.txt
+https://github.com/nanoporetech/dorado/blob/master/LICENCE.txt
 
-Status: STUB. Pinned ``DORADO_VERSION`` is provisional — bump as ONT
-releases new model-supporting versions; only requirement is "supports
-the latest released models".
+Pinned at the latest stable Dorado (``DORADO_VERSION``); bump as ONT
+releases new model-supporting versions (the lab's only constraint is
+"supports the latest released models"). The genome pipeline's polish step
+needs a 1.x+ Dorado (``dorado polish`` is a secondary-analysis feature).
 """
 
 from __future__ import annotations
@@ -35,13 +36,13 @@ from constellation.thirdparty.registry import ToolSpec, register
 
 # Pinned version. Update as needed; the lab's only constraint is that
 # the installed Dorado supports the latest released models.
-DORADO_VERSION = "0.8.3"
+DORADO_VERSION = "2.0.0"
 
 
 def _probe_version(path: Path) -> str | None:
     """Probe Dorado's version via ``dorado --version``.
 
-    The binary prints something like ``"0.8.3+abc1234"`` on stderr.
+    The binary prints something like ``"2.0.0+abc1234"`` on stderr.
     Returns the pre-``+`` segment or None on failure.
     """
     try:

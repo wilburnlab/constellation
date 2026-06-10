@@ -24,7 +24,7 @@ License: Dorado is the Oxford Nanopore Technologies PLC. Public
 License Version 1.0 — Research Purposes only. The wrapper itself is
 Apache 2.0 (Constellation), but anyone *invoking* this code accepts
 ONT's terms. See the upstream LICENCE.txt:
-https://github.com/nanoporetech/dorado/blob/release-v1.4/LICENCE.txt
+https://github.com/nanoporetech/dorado/blob/master/LICENCE.txt
 """
 
 from __future__ import annotations

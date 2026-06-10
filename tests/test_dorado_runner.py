@@ -20,7 +20,7 @@ from constellation.sequencing.basecall.models import DoradoModel
 _STUB = r"""#!/usr/bin/env bash
 verb="${1:-}"
 case "$verb" in
-  --version) echo "dorado 0.8.3+mock"; exit 0 ;;
+  --version) echo "dorado 2.0.0+mock"; exit 0 ;;
   download) exit 0 ;;
 esac
 if [[ -n "${MOCK_ARGV_FILE:-}" ]]; then
