@@ -13,7 +13,7 @@ import subprocess
 from pathlib import Path
 
 from constellation.core.progress import ProgressCallback, ProgressEvent
-from constellation.thirdparty.registry import ToolNotFoundError, find
+from constellation.thirdparty.registry import ToolNotFoundError, find, venv_safe_env
 
 
 _INSTALL_HINT = (
@@ -78,7 +78,11 @@ def ragtag_run(
         ProgressEvent(kind="stage_start", stage="ragtag", message=" ".join(cmd)),
     )
     with log_path.open("wb") as log:
-        result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
+        # ragtag.py runs under its own venv interpreter — strip PYTHONPATH so
+        # an HPC-exported path can't shadow the venv's pinned deps.
+        result = subprocess.run(
+            cmd, stdout=log, stderr=subprocess.STDOUT, env=venv_safe_env()
+        )
     if result.returncode != 0:
         raise subprocess.CalledProcessError(
             result.returncode, cmd, stderr=_tail(log_path)

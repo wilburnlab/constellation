@@ -32,7 +32,7 @@ import pyarrow as pa
 from constellation.sequencing.assembly.assembly import Assembly
 from constellation.sequencing.reference.materialize import materialise_genome_fasta
 from constellation.sequencing.schemas.reference import FEATURE_TABLE
-from constellation.thirdparty.registry import ToolNotFoundError, find
+from constellation.thirdparty.registry import ToolNotFoundError, find, venv_safe_env
 
 
 _INSTALL_HINT = (
@@ -214,7 +214,11 @@ class BuscoRunner:
 
         log = output_dir / "busco.log"
         with log.open("wb") as fh:
-            result = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT)
+            # busco runs under its own venv interpreter — strip PYTHONPATH so
+            # an HPC-exported path can't shadow the venv's pinned deps.
+            result = subprocess.run(
+                cmd, stdout=fh, stderr=subprocess.STDOUT, env=venv_safe_env()
+            )
         if result.returncode != 0:
             raise subprocess.CalledProcessError(
                 result.returncode, cmd, stderr=_tail(log)

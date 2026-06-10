@@ -21,6 +21,12 @@
 # MIT (matches upstream RagTag license — installs freely).
 set -euo pipefail
 
+# Build the venv in isolation: an exported PYTHONPATH (common on HPC login
+# shells) leaks the parent environment into the venv, so pip would see its
+# packages as "already satisfied" and skip installing RagTag's own deps —
+# leaving a venv that breaks when run without that leak.
+unset PYTHONPATH
+
 VERSION="2.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"

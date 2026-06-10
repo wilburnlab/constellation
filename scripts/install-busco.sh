@@ -26,6 +26,11 @@
 # BUSCO is MIT-licensed.
 set -euo pipefail
 
+# Build the venv in isolation: an exported PYTHONPATH (common on HPC login
+# shells) leaks the parent environment into the venv, so pip would see its
+# packages as "already satisfied" and skip installing BUSCO's own deps.
+unset PYTHONPATH
+
 VERSION="5.7.1"
 LINEAGE=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
