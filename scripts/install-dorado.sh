@@ -25,7 +25,16 @@
 set -euo pipefail
 
 VERSION="0.8.3"
-EXPECTED_SHA="REPLACE_WITH_VERIFIED_SHA256"
+PINNED_VERSION="0.8.3"
+# Per-platform SHA256 of the ONT CDN tarballs for PINNED_VERSION. The ONT CDN
+# artifacts are byte-stable, so these are reliable integrity pins. linux-x64
+# verified 2026-06-09; arm64 / osx-arm64 are placeholders — pass --checksum
+# to verify those (or fill them in once verified). For any other --version,
+# pass --checksum.
+declare -A PINNED_SHA
+PINNED_SHA[linux-x64]="8b679ed7faa61299af2df591322b2737d61106a53f3175cc2d4efe0a31242ec2"
+PINNED_SHA[linux-arm64]="REPLACE_WITH_VERIFIED_SHA256"
+PINNED_SHA[osx-arm64]="REPLACE_WITH_VERIFIED_SHA256"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -123,9 +132,15 @@ else
         exit 1
     fi
 
-    EXPECTED_SHA="${override_sha:-${EXPECTED_SHA}}"
-    if [[ "${EXPECTED_SHA}" == REPLACE_WITH_VERIFIED_SHA256 ]]; then
-        echo "warning: no verified SHA256 pinned for ${VERSION}/${PLATFORM}; skipping checksum." >&2
+    if [[ -n "${override_sha}" ]]; then
+        EXPECTED_SHA="${override_sha}"
+    elif [[ "${VERSION}" == "${PINNED_VERSION}" ]]; then
+        EXPECTED_SHA="${PINNED_SHA[${PLATFORM}]:-}"
+    else
+        EXPECTED_SHA=""
+    fi
+    if [[ -z "${EXPECTED_SHA}" || "${EXPECTED_SHA}" == REPLACE_WITH_VERIFIED_SHA256 ]]; then
+        echo "warning: no verified SHA256 pinned for dorado ${VERSION}/${PLATFORM}; skipping checksum." >&2
         echo "  pass --checksum <SHA> (from ONT) to enable verification." >&2
     else
         echo "verifying sha256..."

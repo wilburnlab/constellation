@@ -24,10 +24,13 @@
 set -euo pipefail
 
 VERSION="0.25.0"
-# SHA256 of the GitHub source tarball for the pinned version. Left as a
-# placeholder — pass --checksum <SHA> (verified from the release page) to
-# enable verification. Without it the script warns and proceeds.
-EXPECTED_SHA="REPLACE_WITH_VERIFIED_SHA256"
+# Pinned SHA256 of the GitHub source tarball, valid only for PINNED_VERSION
+# (verified 2026-06-09 against the live download). NOTE: GitHub auto-generated
+# `/archive/` tarballs are not guaranteed byte-stable across re-compression;
+# if a future fetch mismatches, re-verify and update PINNED_SHA (or pass
+# --checksum). For any other --version, pass --checksum to enable verification.
+PINNED_VERSION="0.25.0"
+PINNED_SHA="51633138865207a9d41630da9377d46e4921ad4fc5facaa1740ceccae8611f1f"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -97,9 +100,15 @@ else
         exit 1
     fi
 
-    EXPECTED_SHA="${override_sha:-${EXPECTED_SHA}}"
-    if [[ "${EXPECTED_SHA}" == REPLACE_WITH_VERIFIED_SHA256 ]]; then
-        echo "warning: no verified SHA256 pinned for ${VERSION}; skipping checksum." >&2
+    if [[ -n "${override_sha}" ]]; then
+        EXPECTED_SHA="${override_sha}"
+    elif [[ "${VERSION}" == "${PINNED_VERSION}" ]]; then
+        EXPECTED_SHA="${PINNED_SHA}"
+    else
+        EXPECTED_SHA=""
+    fi
+    if [[ -z "${EXPECTED_SHA}" ]]; then
+        echo "warning: no verified SHA256 pinned for hifiasm ${VERSION}; skipping checksum." >&2
         echo "  pass --checksum <SHA> (from the release page) to enable verification." >&2
     else
         echo "verifying sha256..."
