@@ -20,9 +20,10 @@ independently accept ONT's terms. See the upstream LICENCE.txt:
 https://github.com/nanoporetech/dorado/blob/master/LICENCE.txt
 
 Pinned at the latest stable Dorado (``DORADO_VERSION``); bump as ONT
-releases new model-supporting versions (the lab's only constraint is
-"supports the latest released models"). The genome pipeline's polish step
-needs a 1.x+ Dorado (``dorado polish`` is a secondary-analysis feature).
+releases new model-supporting versions. The genome pipeline requires
+Dorado **>= 2.0.0** — its CLI was runtime-validated against 2.0.0 and the
+resolver (``basecall.dorado_run.resolve_dorado``) refuses anything older;
+there is deliberately no pre-2.0 compatibility shim.
 """
 
 from __future__ import annotations

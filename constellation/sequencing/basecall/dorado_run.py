@@ -21,7 +21,19 @@ import shlex
 import subprocess
 from pathlib import Path
 
-from constellation.thirdparty.registry import ToolNotFoundError, find
+from constellation.thirdparty.registry import ToolNotFoundError, find, version_ge
+
+
+# Constellation's genome pipeline targets Dorado 2.0.0+ exclusively: the
+# `dorado polish` secondary-analysis CLI and the 26.01 output spec the
+# pipeline is built against landed in the 1.x→2.0 line, and we deliberately
+# carry NO compatibility shims for older Dorado — an older binary is refused
+# rather than allowed to silently produce wrong results.
+DORADO_MIN_VERSION = "2.0.0"
+
+
+class DoradoVersionError(RuntimeError):
+    """Raised when the resolved Dorado is older than ``DORADO_MIN_VERSION``."""
 
 
 _INSTALL_HINT = (
@@ -32,10 +44,23 @@ _INSTALL_HINT = (
 
 
 def resolve_dorado() -> Path:
+    """Resolve the dorado binary, enforcing ``DORADO_MIN_VERSION``.
+
+    Raises ``FileNotFoundError`` if dorado isn't installed, or
+    ``DoradoVersionError`` if the resolved binary is older than 2.0.0
+    (when its version can be probed).
+    """
     try:
-        return find("dorado").path
+        handle = find("dorado")
     except ToolNotFoundError as exc:
         raise FileNotFoundError(_INSTALL_HINT) from exc
+    if handle.version is not None and not version_ge(handle.version, DORADO_MIN_VERSION):
+        raise DoradoVersionError(
+            f"dorado {handle.version} is too old — constellation requires "
+            f">= {DORADO_MIN_VERSION}. Upgrade with `bash scripts/install-dorado.sh` "
+            f"or point $CONSTELLATION_DORADO_HOME at a {DORADO_MIN_VERSION}+ install."
+        )
+    return handle.path
 
 
 def dorado_version() -> str | None:
@@ -143,6 +168,8 @@ def read_exit_code(exit_file: Path | None) -> int | None:
 
 
 __all__ = [
+    "DORADO_MIN_VERSION",
+    "DoradoVersionError",
     "resolve_dorado",
     "dorado_version",
     "spawn_dorado",

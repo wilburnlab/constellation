@@ -17,7 +17,7 @@
 # Usage:
 #   bash scripts/install-dorado.sh
 #   bash scripts/install-dorado.sh --force
-#   bash scripts/install-dorado.sh --version 1.4.0   # pin a different version
+#   bash scripts/install-dorado.sh --version 2.1.0   # a newer 2.x (>= 2.0.0 required)
 #   bash scripts/install-dorado.sh --checksum <SHA256>
 #   CONSTELLATION_ACCEPT_DORADO_LICENSE=1 bash scripts/install-dorado.sh  # non-interactive
 #
@@ -69,6 +69,14 @@ USAGE
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
+
+# Hard floor: constellation targets Dorado 2.0.0+ exclusively — the pipeline
+# is built against the 2.x `polish`/`aligner` CLI + 26.01 output spec and
+# carries NO pre-2.0 backwards compatibility. Refuse anything older.
+if [[ "$(printf '%s\n%s\n' "2.0.0" "${VERSION}" | sort -V | head -n1)" != "2.0.0" ]]; then
+    echo "error: dorado ${VERSION} < 2.0.0 — constellation requires >= 2.0.0." >&2
+    exit 2
+fi
 
 # Platform → ONT CDN artifact suffix.
 os="$(uname -s)"

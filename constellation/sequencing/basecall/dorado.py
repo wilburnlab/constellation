@@ -377,18 +377,27 @@ class DoradoRunner:
         draft_fasta: Path,
         output: Path,
         *,
+        device: str | None = None,
         rg: str | None = None,
         extra: tuple[str, ...] = (),
     ) -> RunHandle:
         """Run ``dorado polish <aligned_bam> <draft_fasta>`` → consensus FASTA.
 
+        Validated against dorado 2.0.0: positional order is
+        ``in_aln_bam in_draft_fastx``, consensus goes to stdout when no
+        ``-o`` is given, and ``-x/--device`` selects the compute device.
         ``aligned_bam`` must be reads aligned to ``draft_fasta`` with
         ``dorado aligner`` (sorted + indexed) carrying a single
         basecaller-model ``@RG`` (see
-        :func:`sequencing.basecall.readgroup.harmonize_read_group`).
-        ``rg`` pins ``--RG`` when a BAM still carries multiple read groups.
+        :func:`sequencing.basecall.readgroup.harmonize_read_group`); polish
+        resolves its model from that read group. ``rg`` pins ``--RG`` when a
+        BAM still carries multiple read groups.
         """
-        argv = ["polish", *extra]
+        dev = device if device is not None else self.device
+        argv: list[str] = ["polish"]
+        if dev:
+            argv += ["--device", dev]
+        argv += [*extra]
         if rg:
             argv += ["--RG", rg]
         argv += [str(aligned_bam), str(draft_fasta)]
