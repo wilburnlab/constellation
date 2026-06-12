@@ -114,10 +114,20 @@ def _default_bounds(
     progenitor: Progenitor, obs: CounterObservation
 ) -> dict[str, tuple[float, float]]:
     """DE bounds (registered-name space) for a progenitor's per-peptide params.
-    Times are in ms (the Counter time base): σ/τ span 0.1 s … 120 s."""
+    Times are in ms (the Counter time base): σ/τ span 0.1 s … 120 s.
+
+    The `log_N_total` upper bound is **seed-scaled** (1000× the data seed,
+    floored at 1e10): a fixed 1e10 ceiling silently clips genuinely abundant
+    species (e.g. spiked calibrants integrate to ~1e10–1e11 ions), pinning the
+    MAP at the bound. `seed_peak_from_observation` sets `N_total` ≈ the answer
+    before this is called (in both `estimate_n` and `StagedCalibration`), so
+    `1000×` is generous headroom while keeping the DE search bounded; faint
+    peptides keep the legacy 1e10 (the floor)."""
     rt_lo, rt_hi = float(obs.rt.min()), float(obs.rt.max())
+    n_seed = float(progenitor.peak.N_total.detach())
+    n_hi = max(1e10, n_seed * 1e3) if math.isfinite(n_seed) and n_seed > 0.0 else 1e10
     return {
-        "peak.log_N_total": (math.log(1.0), math.log(1e10)),
+        "peak.log_N_total": (math.log(1.0), math.log(n_hi)),
         "peak.mu": (rt_lo, rt_hi),
         "peak.log_sigma": (math.log(100.0), math.log(120_000.0)),
         "peak.log_tau_r": (math.log(100.0), math.log(120_000.0)),

@@ -15,7 +15,8 @@ Layout:
     model            Progenitor (one species) + CounterObservation
     panel            Panel — additive joint score over progenitors
     simulate         forward simulation → observations / XIC traces
-    orchestrate      estimate_n (MAP) + result-table builders
+    observe          real-data pivot: XIC_TRACE + scan metadata → observation
+    orchestrate      estimate_n (MAP/VB) + StagedCalibration + table builders
     schemas          COUNTER_N / GLOBAL_CALIBRATION / PEPTIDE_PARAMS tables
     io               CounterResult + ParquetDir round-trip
 
@@ -30,6 +31,7 @@ from .calibration import AlphaModel, GlobalCalibration
 from .iit import accumulated_count
 from .io import CounterResult, load_counter, save_counter
 from .model import CounterObservation, Progenitor
+from .observe import observation_for_progenitor, observation_from_trace
 from .orchestrate import (
     StagedCalibration,
     StagedCalibrationResult,
@@ -66,6 +68,8 @@ __all__ = [
     "simulate_observation",
     "simulate_panel_observation",
     "observation_to_trace",
+    "observation_from_trace",
+    "observation_for_progenitor",
     "estimate_n",
     "seed_peak_from_observation",
     "StagedCalibration",
