@@ -44,7 +44,6 @@ def observation_from_trace(
     level: int | None = 1,
     rt_unit: str = "s",
     iit_unit: str = "ms",
-    intensity_unit: str = "rate",
     intensity_floor: float = 0.0,
     dtype: torch.dtype = torch.float64,
 ) -> CounterObservation:
@@ -62,13 +61,9 @@ def observation_from_trace(
     `(charge, isotope)` is off-grid, or whose intensity is `≤ intensity_floor`
     are dropped.
 
-    `intensity_unit` declares the trace intensity convention. The model scores
-    intensity as a per-time **rate** `α·flux` (its simulator emits
-    `α·counts/iit`, so `observation_to_trace` produces `"rate"` — the default,
-    round-trip-safe). A vendor centroid intensity is typically **per-scan
-    accumulated** (∝ ions integrated over the injection time); pass
-    `"per_scan"` to divide each cell by its scan's `iit`, recovering the rate
-    `n_obs = I·iit/α` the likelihood expects (otherwise `N` inflates ~`iit×`)."""
+    Intensity is taken in the model's per-time **rate** convention (`α·flux`,
+    what the Thermo reader emits as AU/ms and what `observation_to_trace`
+    produces) — no per-injection-time rescaling is applied here."""
     if scan_metadata.num_rows == 0:
         raise ValueError("scan_metadata is empty — cannot build a scan axis")
     rt_scale = {"s": 1000.0, "ms": 1.0}
@@ -77,10 +72,6 @@ def observation_from_trace(
         raise ValueError(f"rt_unit must be 's' or 'ms'; got {rt_unit!r}")
     if iit_unit not in iit_scale:
         raise ValueError(f"iit_unit must be 's' or 'ms'; got {iit_unit!r}")
-    if intensity_unit not in ("rate", "per_scan"):
-        raise ValueError(
-            f"intensity_unit must be 'rate' or 'per_scan'; got {intensity_unit!r}"
-        )
 
     # -- scan axis (sorted by scan; the full extraction window) -------------
     sm_scan = scan_metadata.column("scan").to_numpy(zero_copy_only=False)
@@ -136,11 +127,6 @@ def observation_from_trace(
             intensity.view(-1)[fk] = torch.as_tensor(iv_s[last], dtype=dtype)
             mz_error.view(-1)[fk] = torch.as_tensor(ev_s[last], dtype=dtype)
             mask.view(-1)[fk] = True
-
-    # Convert per-scan accumulated intensity → the per-time rate the model scores.
-    # (Non-detection cells are 0, so 0/iit stays 0; the mask is unchanged.)
-    if intensity_unit == "per_scan":
-        intensity = intensity / iit.clamp(min=1e-9)[:, None]
 
     return CounterObservation(
         rt=rt,
