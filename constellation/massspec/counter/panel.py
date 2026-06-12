@@ -147,9 +147,14 @@ def panel_log_prob(
 class Panel(Distribution):
     """Additive joint score over a fixed candidate set + optional background.
 
-    Registers the shared `calibration` once and the progenitors as a
-    `ModuleList`; the progenitors reference the same calibration object, so
-    `functional_call` patches it correctly without duplicating its params.
+    The progenitors are a `ModuleList`; the shared `calibration` is held **by
+    reference** (a 1-tuple + property, like `Progenitor`), NOT a registered
+    submodule. This is load-bearing: the per-peptide fit (`fit_panel`'s DE /
+    `functional_call`) optimizes only the panel's *registered* parameters, so a
+    by-reference calibration is frozen during the fit — as intended (its
+    per-acquisition params are fit once by `StagedCalibration`, never re-fit per
+    target). Registering it instead leaks `calibration.*` into `parameters()`,
+    and the optimizer silently mutates the shared object across targets.
     """
 
     def __init__(
@@ -166,7 +171,7 @@ class Panel(Distribution):
         if len(progenitors) == 0:
             raise ValueError("a Panel needs at least one progenitor")
         self.progenitors = nn.ModuleList(progenitors)
-        self.calibration = calibration
+        self._calibration_ref = (calibration,)  # by reference — frozen during fits
         self.floor_ions = float(floor_ions)
         if background:
             self.log_background = nn.Parameter(
@@ -174,6 +179,12 @@ class Panel(Distribution):
             )
         else:
             self.log_background = None
+
+    @property
+    def calibration(self) -> GlobalCalibration:
+        """The shared per-acquisition calibration (by reference, not a submodule
+        — see the class docstring; frozen during per-peptide fits)."""
+        return self._calibration_ref[0]
 
     # -- candidate-set mutation (fit-plus-discover) ---------------------
 

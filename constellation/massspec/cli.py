@@ -2876,7 +2876,9 @@ def _build_counter_estimate_parser(subs: argparse._SubParsersAction) -> None:
     p.add_argument("--neighborhood-ppm", type=float, default=100.0,
                    help="Per-channel m/z neighborhood retained as discovery candidate nodes.")
     p.add_argument("--detect-threshold", type=float, default=8.0)
-    p.add_argument("--max-candidates", type=int, default=4)
+    p.add_argument("--max-candidates", type=int, default=1,
+                   help="Max same-grid interferers per panel (default 1; >1 is "
+                        "weakly identifiable and overfits until the parsimony pass lands).")
     p.add_argument("--no-background", dest="background", action="store_false",
                    help="Disable the additive background channel.")
     p.set_defaults(func=_cmd_counter_estimate)
