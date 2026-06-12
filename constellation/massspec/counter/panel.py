@@ -175,6 +175,34 @@ class Panel(Distribution):
         else:
             self.log_background = None
 
+    # -- candidate-set mutation (fit-plus-discover) ---------------------
+
+    def add_progenitor(self, progenitor: Progenitor) -> int:
+        """Append a discovered progenitor to the candidate set; return its index.
+
+        The candidate set is mutable so the fit-plus-discover loop can introduce
+        interferer progenitors from residual evidence. The caller MUST build a
+        FRESH optimizer / VI guide after any mutation — the parameter set has
+        changed, so an optimizer bound to the old `parameters()` is stale (the
+        loop already constructs a new optimizer per refit, so this holds by
+        construction). The progenitor must share this panel's `calibration` (the
+        per-acquisition params are fit once and held by reference)."""
+        if progenitor.calibration is not self.calibration:
+            raise ValueError(
+                "a discovered progenitor must share the panel's calibration"
+            )
+        self.progenitors.append(progenitor)
+        return len(self.progenitors) - 1
+
+    def remove_progenitor(self, index: int) -> None:
+        """Drop a candidate (e.g. one that refit below the detection floor).
+        Later progenitors shift down by one, so the loop only removes at the end
+        and keeps the locked target at index 0 (so `progenitor_{i}.` parameter
+        names stay stable while candidates are appended mid-loop)."""
+        if not 0 <= index < len(self.progenitors):
+            raise IndexError(f"progenitor index {index} out of range")
+        del self.progenitors[index]
+
     def background_intensity(self) -> torch.Tensor | float:
         if self.log_background is None:
             return 0.0

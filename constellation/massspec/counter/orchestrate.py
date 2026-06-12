@@ -45,6 +45,7 @@ __all__ = [
     "StagedCalibrationResult",
     "counter_n_table",
     "calibration_to_table",
+    "calibration_from_table",
     "peptide_params_to_table",
 ]
 
@@ -651,6 +652,56 @@ def calibration_to_table(
     return pa.table({k: [v] for k, v in row.items()}).cast(
         COUNTER_GLOBAL_CALIBRATION_TABLE
     )
+
+
+def calibration_from_table(
+    table: pa.Table,
+    *,
+    charges: Sequence[int] = (1, 2, 3, 4),
+    dtype: torch.dtype = torch.float64,
+) -> GlobalCalibration:
+    """Reconstruct a `GlobalCalibration` from a (one-row)
+    `COUNTER_GLOBAL_CALIBRATION_TABLE` — the inverse of `calibration_to_table`,
+    so a persisted per-acquisition calibration is loadable for `estimate_panel`.
+    `charges` only matter for the `per_z` gain (linear gains are closed-form);
+    they default to a 1..4 superset."""
+    row = table.to_pylist()[0]
+    d_mz = list(row["d_mz_da"])
+    cal = GlobalCalibration(
+        n_isotopes=len(d_mz),
+        charges=tuple(charges),
+        alpha_model=row["alpha_model"],
+        alpha0=float(row["alpha0"]) if row["alpha0"] is not None else 1.0,
+        alpha1=float(row["alpha1"]) if row["alpha1"] is not None else 15.0,
+        alpha_mz=float(row["mz_precision_exponent"]),
+        nu_mz=float(row["nu_mz"]),
+        mz_offset_ppm=float(row["mz_offset_ppm"]),
+        d_mz_da=d_mz,
+        rho=float(row["rho_resolution"]),
+        r_ref=row["r_ref"],
+        mz_ref=row["mz_ref"],
+        analyzer=row["analyzer"],
+        dtype=dtype,
+    )
+    if row["alpha_model"] == "per_z" and row["alpha_z"] is not None:
+        with torch.no_grad():
+            cal.log_alpha_z.copy_(
+                torch.tensor(list(row["alpha_z"]), dtype=dtype).clamp(min=1e-6).log()
+            )
+    if row["prior_log_sigma_mean"] is not None:
+        prior: dict[str, tuple[float, float]] = {
+            "peak.log_sigma": (
+                float(row["prior_log_sigma_mean"]),
+                float(row["prior_log_sigma_std"]),
+            )
+        }
+        if row["prior_log_tau_mean"] is not None:
+            prior["peak.log_tau_r"] = (
+                float(row["prior_log_tau_mean"]),
+                float(row["prior_log_tau_std"]),
+            )
+        cal.set_peak_shape_prior(prior)
+    return cal
 
 
 def peptide_params_to_table(
