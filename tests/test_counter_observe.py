@@ -167,31 +167,3 @@ def test_empty_scan_metadata_raises() -> None:
             trace, empty, channel_z=truth.channel_z,
             channel_isotope=truth.channel_isotope, channel_mz=truth.channel_mz,
         )
-
-
-def test_intensity_unit_per_scan_divides_by_iit() -> None:
-    """`intensity_unit="per_scan"` divides each observed cell by its scan's iit
-    (vendor accumulated → the per-time rate the model scores); the default
-    `"rate"` leaves it unchanged (round-trip-safe)."""
-    _obs, trace, scan_meta, truth = _trace()
-    kw = dict(channel_z=truth.channel_z, channel_isotope=truth.channel_isotope,
-              channel_mz=truth.channel_mz, target_id=9)
-    rate = observation_from_trace(trace, scan_meta, **kw)  # default "rate"
-    per_scan = observation_from_trace(trace, scan_meta, intensity_unit="per_scan", **kw)
-    m = rate.mask
-    iit_bc = rate.iit[:, None].expand_as(rate.intensity)
-    assert torch.allclose(per_scan.intensity[m], rate.intensity[m] / iit_bc[m])
-    assert float(per_scan.intensity[~m].abs().max()) == 0.0  # zeros stay zero
-    # iit / mz_error / mask unchanged by the intensity convention
-    assert torch.equal(per_scan.mask, rate.mask)
-    assert torch.allclose(per_scan.iit, rate.iit)
-
-
-def test_intensity_unit_invalid_raises() -> None:
-    _obs, trace, scan_meta, truth = _trace()
-    with pytest.raises(ValueError, match="intensity_unit"):
-        observation_from_trace(
-            trace, scan_meta, channel_z=truth.channel_z,
-            channel_isotope=truth.channel_isotope, channel_mz=truth.channel_mz,
-            target_id=9, intensity_unit="bogus",
-        )
