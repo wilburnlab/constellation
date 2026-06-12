@@ -67,9 +67,23 @@ case "${1:-}" in
       case "$1" in -@) shift 2 ;; -o) out="$2"; shift 2 ;; *) inp="$1"; shift ;; esac
     done
     cp "$inp" "$out" ;;
-  fastq) printf '@r1\nACGTACGT\n+\nIIIIIIII\n' ;;
+  fastq)
+    shift; out=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in -@) shift 2 ;; -o) out="$2"; shift 2 ;; *) shift ;; esac
+    done
+    if [[ -n "$out" ]]; then printf '@r1\nACGTACGT\n+\nIIIIIIII\n' > "$out";
+    else printf '@r1\nACGTACGT\n+\nIIIIIIII\n'; fi ;;
   *) exit 0 ;;
 esac
+"""
+
+# bgzip ships beside samtools in the same htslib bin/; the stub delegates to
+# the always-present `gzip` CLI so the fastq stage exercises the bgzip-pipe
+# path rather than the stdlib-gzip fallback.
+_BGZIP_STUB = r"""#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then echo "bgzip (htslib) 1.21"; exit 0; fi
+exec gzip -c
 """
 
 
@@ -105,6 +119,10 @@ def mocks(tmp_path: Path, monkeypatch):
     _stub(tmp_path / "hf", "hifiasm", _HIFIASM_STUB, monkeypatch, "CONSTELLATION_HIFIASM_HOME")
     _stub(tmp_path / "dr", "bin/dorado", _DORADO_STUB, monkeypatch, "CONSTELLATION_DORADO_HOME")
     _stub(tmp_path / "st", "bin/samtools", _SAMTOOLS_STUB, monkeypatch, "CONSTELLATION_SAMTOOLS_HOME")
+    # bgzip as a samtools sibling so compress.resolve_bgzip() finds it.
+    bgz = tmp_path / "st" / "bin" / "bgzip"
+    bgz.write_text(_BGZIP_STUB)
+    bgz.chmod(0o755)
 
 
 def test_pipeline_bam_assemble_and_polish(tmp_path: Path, mocks):
@@ -163,3 +181,44 @@ def test_pipeline_rejects_both_inputs(tmp_path: Path, mocks):
         run_assembly_pipeline(
             output_dir=tmp_path / "o", reads=[b1], pod5=[tmp_path / "x.pod5"]
         )
+
+
+def test_pipeline_reads_compression_none_writes_plain_fastq(tmp_path: Path, mocks):
+    b1 = tmp_path / "fc1.bam"
+    _write_bam(b1, "RGA", "sup@v5.0.0")
+    out = tmp_path / "asm_out"
+    run_assembly_pipeline(
+        output_dir=out, reads=[b1], device="cpu", threads=1, reads_compression="none"
+    )
+    assert (out / "reads" / "reads.fastq").exists()  # plain, no .gz
+    assert not (out / "reads" / "reads.fastq.gz").exists()
+    assert (out / "assembly" / "assembly").is_dir()
+
+
+def test_pipeline_scratch_dir_routes_fastq_off_tree(tmp_path: Path, mocks, monkeypatch):
+    monkeypatch.setenv("SLURM_JOB_ID", "4242")
+    b1 = tmp_path / "fc1.bam"
+    _write_bam(b1, "RGA", "sup@v5.0.0")
+    out = tmp_path / "asm_out"
+    scratch = tmp_path / "node_local"
+    run_assembly_pipeline(
+        output_dir=out, reads=[b1], device="cpu", threads=1, scratch_dir=scratch
+    )
+    fastq = scratch / "constellation_asm_4242" / "reads" / "reads.fastq.gz"
+    assert fastq.exists()
+    assert not (out / "reads" / "reads.fastq.gz").exists()  # not in the output tree
+    assert (out / "assembly" / "assembly").is_dir()
+    # manifest records the off-tree FASTQ as an absolute path (no relative_to raise)
+    m = read_manifest_dir(out)
+    assert m.outputs["reads_fastq"] == str(fastq)
+
+
+def test_pipeline_no_keep_intermediates_deletes_fastq(tmp_path: Path, mocks):
+    b1 = tmp_path / "fc1.bam"
+    _write_bam(b1, "RGA", "sup@v5.0.0")
+    out = tmp_path / "asm_out"
+    run_assembly_pipeline(
+        output_dir=out, reads=[b1], device="cpu", threads=1, keep_intermediates=False
+    )
+    assert not (out / "reads" / "reads.fastq.gz").exists()  # cleaned up
+    assert (out / "assembly" / "assembly").is_dir()  # but assembly survived

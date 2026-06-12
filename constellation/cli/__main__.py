@@ -3574,7 +3574,22 @@ def _build_genome_parser(subs) -> None:
                      help="Emit the `mv` move-table tag during inline basecalling "
                           "(required for move-aware `dorado polish`; on by default)")
     pa_.add_argument("--dorado-extra", default=None)
-    pa_.add_argument("--threads", type=int, default=1)
+    pa_.add_argument("--threads", type=int, default=None,
+                     help="Worker threads per stage (default: $SLURM_CPUS_PER_TASK "
+                          "or all detected cores)")
+    pa_.add_argument("--reads-compression", choices=("auto", "bgzf", "gzip", "none"),
+                     default="auto",
+                     help="Compression of the intermediate reads FASTQ: auto/bgzf "
+                          "(multithreaded bgzip pipe), gzip (single-threaded), or none "
+                          "(plain FASTQ — fastest, ~3x disk; pair with --scratch-dir)")
+    pa_.add_argument("--scratch-dir", default=None,
+                     help="Route the throwaway reads FASTQ to node-local storage: a "
+                          "path, or 'auto' for $SLURM_TMPDIR/$TMPDIR (default: in the "
+                          "output dir)")
+    pa_.add_argument("--keep-intermediates", action=argparse.BooleanOptionalAction,
+                     default=True,
+                     help="Keep the reads FASTQ after assembly (on by default; "
+                          "--no-keep-intermediates deletes it once hifiasm succeeds)")
     pa_.add_argument("--resume", action="store_true")
     pa_.add_argument("--progress", action="store_true")
     pa_.add_argument("--no-report", action="store_true")
@@ -3634,6 +3649,26 @@ def _shlex_tuple(value: str | None) -> tuple[str, ...]:
     import shlex
 
     return tuple(shlex.split(value)) if value else ()
+
+
+def _resolve_threads(requested: int | None) -> int:
+    """Resolve the per-stage thread budget.
+
+    Explicit ``--threads`` wins; otherwise auto-detect from the SLURM
+    allocation (``$SLURM_CPUS_PER_TASK`` / ``$SLURM_CPUS_ON_NODE``) and fall
+    back to all detected cores. The previous default of ``1`` silently left
+    every stage single-threaded on multi-core nodes — a real footgun for the
+    bgzip / hifiasm stages.
+    """
+    import os
+
+    if requested is not None:
+        return max(1, int(requested))
+    for var in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
+        val = os.environ.get(var)
+        if val and val.isdigit():
+            return max(1, int(val))
+    return os.cpu_count() or 1
 
 
 def _cmd_basecall(args: argparse.Namespace) -> int:
@@ -3745,6 +3780,14 @@ def _cmd_genome_assemble(args: argparse.Namespace) -> int:
         _preload_matplotlib_for_reports()
     cb = StreamProgress() if args.progress else NullProgress()
 
+    threads = _resolve_threads(args.threads)
+    if args.reads_compression == "none" and args.scratch_dir is None:
+        print(
+            "warning: --reads-compression none writes a plain (uncompressed) FASTQ "
+            "into the output dir; pass --scratch-dir to keep ~100 GB off shared storage",
+            file=sys.stderr,
+        )
+
     mods = tuple(m for m in args.modified_bases.split(",") if m) if args.modified_bases else ()
     try:
         run_assembly_pipeline(
@@ -3768,7 +3811,10 @@ def _cmd_genome_assemble(args: argparse.Namespace) -> int:
             polish_rounds=args.polish_rounds,
             dorado_polish_extra=_shlex_tuple(args.dorado_polish_extra),
             busco_lineage=args.busco_lineage,
-            threads=args.threads,
+            threads=threads,
+            reads_compression=args.reads_compression,
+            scratch_dir=args.scratch_dir,
+            keep_intermediates=args.keep_intermediates,
             resume=args.resume,
             emit_report=not args.no_report,
             progress_cb=cb,

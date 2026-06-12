@@ -18,6 +18,7 @@ the per-stage ``Assembly`` bundles + the manifest this writes.
 from __future__ import annotations
 
 import dataclasses
+import os
 from pathlib import Path
 
 import pyarrow as pa
@@ -74,6 +75,44 @@ def _done(stage_dir: Path) -> bool:
 def _mark_done(stage_dir: Path) -> None:
     stage_dir.mkdir(parents=True, exist_ok=True)
     (stage_dir / "_SUCCESS").touch()
+
+
+# Map the user-facing --reads-compression vocabulary to the codec understood
+# by ``samtools_fastq`` ("auto" picks the multithreaded BGZF path).
+_FASTQ_CODEC = {"auto": "bgzf", "bgzf": "bgzf", "gzip": "gzip", "none": "none"}
+
+
+def _resolve_scratch_root(scratch_dir: str | Path | None, output_dir: Path) -> Path:
+    """Where the (throwaway) reads FASTQ lives.
+
+    Scratch routing is opt-in so the default keeps the legacy in-tree layout
+    (``<output_dir>/reads/``). ``--scratch-dir auto`` consults
+    ``$SLURM_TMPDIR`` then ``$TMPDIR``; an explicit path is used as-is. When a
+    node-local scratch is used, the FASTQ goes in a job-unique subdir so
+    concurrent jobs sharing the mount don't collide.
+    """
+    if scratch_dir is None:
+        return output_dir
+    if str(scratch_dir) == "auto":
+        raw = os.environ.get("SLURM_TMPDIR") or os.environ.get("TMPDIR")
+        if not raw:
+            return output_dir
+        root = Path(raw)
+    else:
+        root = Path(scratch_dir)
+    root = root.expanduser()
+    if root == output_dir:
+        return output_dir
+    job = os.environ.get("SLURM_JOB_ID") or str(os.getpid())
+    return root / f"constellation_asm_{job}"
+
+
+def _rel_or_abs(path: Path, base: Path) -> str:
+    """Path relative to ``base`` when possible, else absolute (off-tree scratch)."""
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        return str(path)
 
 
 def _tool_version(name: str) -> str | None:
@@ -144,11 +183,22 @@ def run_assembly_pipeline(
     dorado_polish_extra: tuple[str, ...] = (),
     busco_lineage: str | None = None,
     threads: int = 1,
+    reads_compression: str = "auto",
+    scratch_dir: str | Path | None = None,
+    keep_intermediates: bool = True,
     resume: bool = False,
     emit_report: bool = True,
     progress_cb: ProgressCallback | None = None,
 ) -> Path:
-    """Run the genome-assembly pipeline; return ``output_dir``."""
+    """Run the genome-assembly pipeline; return ``output_dir``.
+
+    ``reads_compression`` (``auto``/``bgzf``/``gzip``/``none``) controls how the
+    intermediate reads FASTQ is written: ``auto``/``bgzf`` use the multithreaded
+    ``bgzip`` pipe, ``none`` writes plain uncompressed FASTQ (fastest, ~3x the
+    disk). ``scratch_dir`` (a path, or ``"auto"`` for ``$SLURM_TMPDIR``/``$TMPDIR``)
+    routes that throwaway FASTQ to node-local storage instead of the output tree.
+    ``keep_intermediates=False`` unlinks the reads FASTQ once assembly succeeds.
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -215,19 +265,30 @@ def run_assembly_pipeline(
         _emit(progress_cb, "stage_done", "harmonize", str(harmonized))
 
     # ── 3. fastq ────────────────────────────────────────────────────
-    reads_dir = output_dir / "reads"
-    fastq = reads_dir / "reads.fastq.gz"
-    if resume and fastq.exists() and _done(reads_dir):
+    # The reads FASTQ is a throwaway hifiasm input; once assembly is done it's
+    # never read again (polish reuses the harmonized BAM). Skip regeneration on
+    # a post-assembly resume so a vanished node-local-scratch FASTQ doesn't
+    # force needless rework.
+    assembly_dir = output_dir / "assembly"
+    assembly_done = (
+        resume and _done(assembly_dir) and (assembly_dir / "assembly").exists()
+    )
+    reads_dir = _resolve_scratch_root(scratch_dir, output_dir) / "reads"
+    fastq_name = "reads.fastq" if reads_compression == "none" else "reads.fastq.gz"
+    fastq = reads_dir / fastq_name
+    if assembly_done or (resume and fastq.exists() and _done(reads_dir)):
         pass
     else:
         _emit(progress_cb, "stage_start", "fastq", str(fastq))
-        samtools_fastq(harmonized, fastq, threads=threads)
+        samtools_fastq(
+            harmonized, fastq, threads=threads,
+            codec=_FASTQ_CODEC.get(reads_compression, "bgzf"),
+        )
         _mark_done(reads_dir)
         _emit(progress_cb, "stage_done", "fastq", str(fastq))
 
     # ── 4. assemble ─────────────────────────────────────────────────
-    assembly_dir = output_dir / "assembly"
-    if resume and _done(assembly_dir) and (assembly_dir / "assembly").exists():
+    if assembly_done:
         draft = load_assembly(assembly_dir / "assembly")
     else:
         _emit(progress_cb, "stage_start", "assemble", "hifiasm")
@@ -240,12 +301,15 @@ def run_assembly_pipeline(
         )
         _mark_done(assembly_dir)
         _emit(progress_cb, "stage_done", "assemble", f"{draft.n_contigs} contigs")
+    # Throwaway FASTQ cleanup once assembly is complete.
+    if not keep_intermediates:
+        Path(fastq).unlink(missing_ok=True)
     stage_stats["draft"] = draft.stats
     stages["assemble"] = _stage_stats_dict(draft)
     working = draft
     outputs: dict[str, str] = {
-        "harmonized_bam": str(harmonized.relative_to(output_dir)),
-        "reads_fastq": str(fastq.relative_to(output_dir)),
+        "harmonized_bam": _rel_or_abs(harmonized, output_dir),
+        "reads_fastq": _rel_or_abs(fastq, output_dir),
         "assembly_bundle": "assembly/assembly",
         "primary_gfa": "assembly/primary.bp.p_ctg.gfa",
     }
@@ -307,6 +371,7 @@ def run_assembly_pipeline(
         parameters={
             "threads": threads,
             "hifiasm_mode": hifiasm_mode,
+            "reads_compression": reads_compression,
             "device": device if input_mode == "pod5" else None,
             "duplex": duplex,
             "emit_moves": emit_moves if input_mode == "pod5" else None,
