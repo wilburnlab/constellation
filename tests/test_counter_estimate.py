@@ -89,6 +89,23 @@ def test_low_n_detection_bias_corrected() -> None:
     assert res["n_total_lo"] <= 1e4 <= res["n_total_hi"]
 
 
+def test_high_n_not_clipped_by_default_bound() -> None:
+    """A genuinely abundant species (N ≫ 1e10, e.g. a spiked calibrant) is
+    recovered, not pinned at the legacy fixed 1e10 DE ceiling. The seed-scaled
+    upper bound (1000× the data seed) gives headroom; without it the MAP clamps
+    at exactly 1e10 for every bright peptide."""
+    cal = _cal()
+    truth = _prog(cal, n_total=5e10, nu_intensity=6.0, c_mz_init=200.0)
+    obs = simulate_observation(
+        truth, n_scans=60, half_window_ms=30000.0, iit_ms=20.0,
+        generator=torch.Generator().manual_seed(13),
+    )
+    prog = _prog(cal, n_total=1.0, nu_intensity=5.0, c_mz_init=150.0)
+    res = estimate_n(prog, obs, inference="map", optimizer="de", seed=0)
+    assert res["n_total"] > 1.5e10  # off the old ceiling, not clamped at 1e10
+    assert abs(res["n_total"] - 5e10) / 5e10 < 0.25  # recovers the abundant truth
+
+
 def test_isotope_fraction_correction_recovered() -> None:
     """The learnable isotope-fraction correction recovers a real M+1/M+2 shift
     (the high-resolution ¹⁵N/¹³C convolution effect) without biasing N."""
