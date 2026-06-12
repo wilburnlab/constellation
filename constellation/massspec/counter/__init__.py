@@ -30,11 +30,18 @@ from __future__ import annotations
 from .calibration import AlphaModel, GlobalCalibration
 from .iit import accumulated_count
 from .io import CounterResult, load_counter, save_counter
+from .discover import DiscoverConfig, discover_candidates, estimate_panel, fit_panel
 from .model import CounterObservation, Progenitor
-from .observe import observation_for_progenitor, observation_from_trace
+from .observe import (
+    RegionPeaks,
+    observation_for_progenitor,
+    observation_for_region,
+    observation_from_trace,
+)
 from .orchestrate import (
     StagedCalibration,
     StagedCalibrationResult,
+    calibration_from_table,
     calibration_to_table,
     counter_n_table,
     estimate_n,
@@ -43,6 +50,7 @@ from .orchestrate import (
 )
 from .panel import Panel, panel_log_prob
 from .priors import make_log_prior
+from .residual import panel_predicted_intensity, panel_residual
 from .schemas import (
     COUNTER_GLOBAL_CALIBRATION_TABLE,
     COUNTER_N_TABLE,
@@ -72,10 +80,20 @@ __all__ = [
     "observation_for_progenitor",
     "estimate_n",
     "seed_peak_from_observation",
+    # panel-shaped estimate + discovery seam
+    "observation_for_region",
+    "RegionPeaks",
+    "panel_residual",
+    "panel_predicted_intensity",
+    "fit_panel",
+    "estimate_panel",
+    "discover_candidates",
+    "DiscoverConfig",
     "StagedCalibration",
     "StagedCalibrationResult",
     "counter_n_table",
     "calibration_to_table",
+    "calibration_from_table",
     "peptide_params_to_table",
     # io + schemas
     "CounterResult",

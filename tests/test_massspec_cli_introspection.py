@@ -42,10 +42,13 @@ def test_all_four_subcommands_register() -> None:
         "classify-novel-peptides",
         "collision-filter",
         "chromatogram",
+        "counter",
     }
-    # chromatogram is a nested group with its own sub-subcommands.
+    # chromatogram + counter are nested groups with their own sub-subcommands.
     chrom_subs = _subparsers_action(ms_subs.choices["chromatogram"])
     assert set(chrom_subs.choices) == {"build-index", "extract"}
+    counter_subs = _subparsers_action(ms_subs.choices["counter"])
+    assert set(counter_subs.choices) == {"calibrate", "estimate"}
 
 
 # ── per-subcommand arg surface ─────────────────────────────────────────
@@ -214,6 +217,7 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
         "classify-novel-peptides",
         "collision-filter",
         "chromatogram",
+        "counter",
     }
     # Each subcommand surfaces either direct arguments (leaf) or nested
     # subcommands (group). chromatogram is the nested group.

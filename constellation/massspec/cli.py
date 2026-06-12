@@ -56,6 +56,7 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     _build_classify_novel_peptides_parser(ms_subs)
     _build_collision_filter_parser(ms_subs)
     _build_chromatogram_parser(ms_subs)
+    _build_counter_parser(ms_subs)
 
 
 # ── convert ─────────────────────────────────────────────────────────────
@@ -2810,6 +2811,257 @@ def _warn_level_flag_mismatch(args: argparse.Namespace) -> None:
     elif args.level == 2:
         if args.n_isotopes != _DEFAULT_N_ISOTOPES or tuple(args.charge_range) != _DEFAULT_CHARGE_RANGE:
             print("warning: MS1 isotope options ignored with --level 2", file=sys.stderr)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# counter — panel-shaped ion-count estimation + per-acquisition calibration
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _build_counter_parser(subs: argparse._SubParsersAction) -> None:
+    p = subs.add_parser(
+        "counter",
+        help=(
+            "Counter ion-count estimation. `calibrate` fits a per-acquisition "
+            "GlobalCalibration from spiked calibrants; `estimate` runs the "
+            "panel-shaped per-seed estimate (one panel per target, parallel "
+            "across seeds) producing N_total + credible intervals."
+        ),
+    )
+    csubs = p.add_subparsers(dest="counter_subcommand", required=True)
+    _build_counter_calibrate_parser(csubs)
+    _build_counter_estimate_parser(csubs)
+
+
+def _add_counter_common_inputs(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--trace", type=Path, required=True,
+                   help="XIC_TRACE_TABLE .parquet (MS1, ideally an all_in_window extraction).")
+    p.add_argument("--scan-metadata", type=Path, required=True,
+                   help="SCAN_METADATA_TABLE .parquet (the scan axis; level-1 rows are used).")
+    p.add_argument("--rt-window", type=float, default=60.0,
+                   help="Half-width (s) of the scan-axis window around each target's rt_center.")
+    p.add_argument("--n-isotopes", type=int, default=_DEFAULT_N_ISOTOPES)
+    p.add_argument("--acquisition-id", type=int, default=0)
+    p.add_argument("--no-progress", action="store_true")
+
+
+def _build_counter_calibrate_parser(subs: argparse._SubParsersAction) -> None:
+    p = subs.add_parser(
+        "calibrate",
+        help="Fit a per-acquisition GlobalCalibration (+ peptide params) from calibrants.",
+    )
+    _add_counter_common_inputs(p)
+    p.add_argument("--calibrants", type=Path, required=True,
+                   help="XIC_TARGET_TABLE .parquet of calibrant peptides (target_id, "
+                        "modified_sequence, precursor_charge, rt_center).")
+    p.add_argument("-o", "--output-dir", type=Path, required=True)
+    p.add_argument("--gain", action="store_true",
+                   help="Co-fit the gain alpha(z) (weakly identified; off by default).")
+    p.set_defaults(func=_cmd_counter_calibrate)
+
+
+def _build_counter_estimate_parser(subs: argparse._SubParsersAction) -> None:
+    p = subs.add_parser(
+        "estimate",
+        help="Panel-shaped per-seed ion-count estimate (parallel across seeds).",
+    )
+    _add_counter_common_inputs(p)
+    p.add_argument("--targets", type=Path, required=True,
+                   help="XIC_TARGET_TABLE .parquet of seed peptides to quantify.")
+    p.add_argument("--calibration", type=Path, required=True,
+                   help="COUNTER_GLOBAL_CALIBRATION_TABLE .parquet (from `counter calibrate`).")
+    p.add_argument("-o", "--output-dir", type=Path, required=True)
+    p.add_argument("--workers", type=int, default=1,
+                   help="Process-pool size over seeds (each seed is an independent panel).")
+    p.add_argument("--neighborhood-ppm", type=float, default=100.0,
+                   help="Per-channel m/z neighborhood retained as discovery candidate nodes.")
+    p.add_argument("--detect-threshold", type=float, default=8.0)
+    p.add_argument("--max-candidates", type=int, default=4)
+    p.add_argument("--no-background", dest="background", action="store_false",
+                   help="Disable the additive background channel.")
+    p.set_defaults(func=_cmd_counter_estimate)
+
+
+def _counter_targets(path: Path) -> list[dict]:
+    import pyarrow.parquet as pq
+
+    t = pq.read_table(path)
+    need = ("target_id", "modified_sequence", "precursor_charge", "rt_center")
+    missing = [c for c in need if c not in t.column_names]
+    if missing:
+        raise SystemExit(f"error: targets missing columns {missing}")
+    return t.select(list(need)).to_pylist()
+
+
+# -- estimate: spawn worker pool over seeds (each an independent panel) --
+
+_COUNTER_CTX: dict = {}
+
+
+def _counter_worker_init(trace_path: str, scan_meta_path: str, calibration_path: str, opts: dict) -> None:
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    from constellation.massspec.counter import calibration_from_table
+
+    trace = pq.read_table(trace_path)
+    sm = pq.read_table(scan_meta_path)
+    if "level" in sm.column_names:
+        sm = sm.filter(pc.equal(sm.column("level"), 1))
+    _COUNTER_CTX.update(
+        trace=trace,
+        ms1=sm.select(["scan", "rt", "iit"]),
+        cal=calibration_from_table(pq.read_table(calibration_path)),
+        opts=opts,
+    )
+
+
+def _counter_worker_estimate(target: dict) -> dict:
+
+    import pyarrow.compute as pc
+
+    from constellation.core.sequence.proforma import Peptidoform
+    from constellation.massspec.counter import (
+        DiscoverConfig,
+        Panel,
+        Progenitor,
+        estimate_panel,
+        observation_for_region,
+    )
+
+    opts, cal, trace, ms1 = (_COUNTER_CTX[k] for k in ("opts", "cal", "trace", "ms1"))
+    tid = int(target["target_id"])
+    modseq = target["modified_sequence"]
+    z = int(target["precursor_charge"])
+    rtc = float(target["rt_center"])
+    base = {"acquisition_id": opts["acquisition_id"], "target_id": tid,
+            "modified_sequence": modseq, "precursor_charge": z}
+    try:
+        prog = Progenitor.for_peptide(Peptidoform(sequence=modseq), [z], cal,
+                                      n_isotopes=opts["n_isotopes"])
+        rt = ms1.column("rt")
+        win = ms1.filter(pc.less_equal(pc.abs(pc.subtract(rt, rtc)), opts["rt_window"]))
+        obs, region = observation_for_region(trace, win, prog, target_id=tid,
+                                             neighborhood_ppm=opts["neighborhood_ppm"])
+        if int(obs.mask.sum()) == 0:
+            return {**base, "status": "no_signal"}
+        panel = Panel([prog], cal, background=opts["background"])
+        cfg = DiscoverConfig(detect_threshold=opts["detect_threshold"],
+                             max_candidates=opts["max_candidates"])
+        res = estimate_panel(panel, obs, region, config=cfg, rt_prior_ms=rtc * 1000.0,
+                             inference="map")
+        return {**base, **res, "status": "ok"}
+    except Exception as exc:  # noqa: BLE001 — one bad seed shouldn't kill the run
+        return {**base, "status": f"error:{type(exc).__name__}"}
+
+
+def _cmd_counter_estimate(args: argparse.Namespace) -> int:
+    import multiprocessing as mp
+
+
+    from constellation.massspec.counter import CounterResult, counter_n_table, save_counter
+
+    for path in (args.trace, args.scan_metadata, args.calibration, args.targets):
+        if not path.exists():
+            print(f"error: not found: {path}", file=sys.stderr)
+            return 2
+    success = args.output_dir / "_SUCCESS"
+    if success.exists():
+        print(f"error: --output-dir already complete ({success} exists)", file=sys.stderr)
+        return 1
+
+    targets = _counter_targets(args.targets)
+    opts = dict(
+        acquisition_id=args.acquisition_id, n_isotopes=args.n_isotopes,
+        rt_window=args.rt_window, neighborhood_ppm=args.neighborhood_ppm,
+        detect_threshold=args.detect_threshold, max_candidates=args.max_candidates,
+        background=args.background,
+    )
+    initargs = (str(args.trace), str(args.scan_metadata), str(args.calibration), opts)
+    if args.workers > 1:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(args.workers, initializer=_counter_worker_init, initargs=initargs) as pool:
+            records = pool.map(_counter_worker_estimate, targets)
+    else:
+        _counter_worker_init(*initargs)
+        records = [_counter_worker_estimate(t) for t in targets]
+
+    ok = [r for r in records if r.get("status") == "ok"]
+    skipped = len(records) - len(ok)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    save_counter(CounterResult(counter_n=counter_n_table(ok)), args.output_dir)
+    success.touch()
+    if not args.no_progress:
+        print(f"counter estimate: {len(ok)} estimated, {skipped} skipped → {args.output_dir}",
+              file=sys.stderr)
+    return 0
+
+
+def _cmd_counter_calibrate(args: argparse.Namespace) -> int:
+
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    from constellation.core.sequence.proforma import Peptidoform
+    from constellation.massspec.counter import (
+        GlobalCalibration,
+        Progenitor,
+        StagedCalibration,
+        calibration_to_table,
+        observation_for_progenitor,
+        peptide_params_to_table,
+    )
+
+    for path in (args.trace, args.scan_metadata, args.calibrants):
+        if not path.exists():
+            print(f"error: not found: {path}", file=sys.stderr)
+            return 2
+    success = args.output_dir / "_SUCCESS"
+    if success.exists():
+        print(f"error: --output-dir already complete ({success} exists)", file=sys.stderr)
+        return 1
+
+    trace = pq.read_table(args.trace)
+    sm = pq.read_table(args.scan_metadata)
+    if "level" in sm.column_names:
+        sm = sm.filter(pc.equal(sm.column("level"), 1))
+    ms1 = sm.select(["scan", "rt", "iit"])
+    calibrants = _counter_targets(args.calibrants)
+
+    cal = GlobalCalibration(n_isotopes=args.n_isotopes, charges=(1, 2, 3, 4))
+    progs, obss, tids, mods = [], [], [], []
+    rt = ms1.column("rt")
+    for c in calibrants:
+        tid, modseq, z, rtc = (int(c["target_id"]), c["modified_sequence"],
+                               int(c["precursor_charge"]), float(c["rt_center"]))
+        prog = Progenitor.for_peptide(Peptidoform(sequence=modseq), [z], cal, n_isotopes=args.n_isotopes)
+        win = ms1.filter(pc.less_equal(pc.abs(pc.subtract(rt, rtc)), args.rt_window))
+        obs = observation_for_progenitor(prog, trace, win, target_id=tid)
+        if int(obs.mask.sum()) == 0:
+            continue
+        progs.append(prog)
+        obss.append(obs)
+        tids.append(tid)
+        mods.append(modseq)
+    if not progs:
+        print("error: no calibrant yielded signal", file=sys.stderr)
+        return 1
+
+    from constellation.massspec.counter.orchestrate import _DEFAULT_GLOBAL_PARAMS, _GAIN_PARAM_NAMES
+
+    gp = tuple(_DEFAULT_GLOBAL_PARAMS) + (_GAIN_PARAM_NAMES if args.gain else ())
+    StagedCalibration(progs, obss, cal).run(global_params=gp)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(calibration_to_table(cal, acquisition_id=args.acquisition_id),
+                   args.output_dir / "global_calibration.parquet")
+    pq.write_table(peptide_params_to_table(progs, acquisition_id=args.acquisition_id,
+                                           target_ids=tids, modified_sequences=mods),
+                   args.output_dir / "peptide_params.parquet")
+    success.touch()
+    if not args.no_progress:
+        print(f"counter calibrate: {len(progs)} calibrants → {args.output_dir}", file=sys.stderr)
+    return 0
 
 
 __all__ = ["build_parser"]
