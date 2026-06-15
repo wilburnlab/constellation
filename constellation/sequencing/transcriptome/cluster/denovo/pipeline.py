@@ -1,0 +1,659 @@
+"""De novo first-round assembly orchestrator.
+
+``assemble_clusters`` is the pure in-memory core (dereplicate → minimizers
+→ candidates → verify → connected-components → consensus → ORF → quant);
+it takes a reads table and returns Arrow tables, so it's testable without
+a demux dir. ``cluster_transcripts`` wraps it with demux-window loading +
+output writing + the cluster manifest.
+
+Each component member is aligned to the component centroid for both the
+consensus PWM and the membership metrics — reusing the cached verify
+CIGAR for directly-verified edges and re-aligning only the members that
+reach the centroid through the component (so edlib still never runs twice
+on the same edge).
+"""
+
+from __future__ import annotations
+
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+import numpy as np
+import pyarrow as pa
+
+from constellation.core.sequence.nucleic import STANDARD, CodonTable, find_orfs
+from constellation.sequencing.schemas.quant import FEATURE_QUANT
+from constellation.sequencing.schemas.transcriptome import (
+    CLUSTER_MEMBERSHIP_TABLE,
+    TRANSCRIPT_CLUSTER_TABLE,
+)
+from constellation.sequencing.transcriptome.cluster.denovo._cigar import cigar_stats
+from constellation.sequencing.transcriptome.cluster.denovo.candidates import (
+    generate_candidates,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.cluster_graph import (
+    connected_components,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
+    MemberSpec,
+    centroid_consensus,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.dereplicate import (
+    dereplicate,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.haplotypes import (
+    build_haplotypes,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.minimizers import (
+    extract_minimizers,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.quant import (
+    cluster_feature_quant,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.schemas import (
+    CLUSTER_HAPLOTYPE_TABLE,
+    CLUSTER_VARIANT_TABLE,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.variants import (
+    ErrorModel,
+    call_variants,
+    disagreement_stats,
+    estimate_error_rates,
+    merge_disagreements,
+    reclassify_variants,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.verify import (
+    verify_candidates,
+)
+
+
+_ORF_CODON_TABLE: CodonTable = CodonTable(
+    transl_table=STANDARD.transl_table,
+    name=f"{STANDARD.name} (ATG-only starts)",
+    forward=STANDARD.forward,
+    starts=frozenset({"ATG"}),
+    stops=STANDARD.stops,
+)
+
+
+@dataclass(slots=True)
+class AssembledClusters:
+    clusters: pa.Table  # TRANSCRIPT_CLUSTER_TABLE
+    membership: pa.Table  # CLUSTER_MEMBERSHIP_TABLE
+    feature_quant: pa.Table  # FEATURE_QUANT(feature_origin='cluster_id')
+    variants: pa.Table  # CLUSTER_VARIANT_TABLE
+    haplotypes: pa.Table  # CLUSTER_HAPLOTYPE_TABLE
+    n_input_reads: int
+    n_unique: int
+
+
+def _best_clean_orf(seq: str, *, min_aa_length: int):
+    if len(seq) < min_aa_length * 3:
+        return None
+    orfs = find_orfs(
+        seq,
+        codon_table=_ORF_CODON_TABLE,
+        min_aa_length=min_aa_length,
+        both_strands=False,
+        longest_per_stop=False,
+    )
+    clean = [o for o in orfs if "*" not in o.protein]
+    if not clean:
+        return None
+    per_stop: dict[tuple[str, int], Any] = {}
+    for o in clean:
+        key = (o.strand, o.end)
+        prior = per_stop.get(key)
+        if prior is None or o.length > prior.length:
+            per_stop[key] = o
+    return max(per_stop.values(), key=lambda o: o.length)
+
+
+# ── Per-cluster consensus + ORF + member metrics (fork-shared globals) ──
+_W: dict[str, Any] = {}
+
+
+def _member_alignment(c: int, m: int):
+    """Aligned (short, long, ref_start, cigar) for the (centroid, member)
+    edge — cache hit when directly verified, else a fresh edlib re-align."""
+    seqs = _W["seqs"]
+    seqlen = _W["seqlen"]
+    aln = _W["aln"]
+    lc, lm = int(seqlen[c]), int(seqlen[m])
+    if lm < lc or (lm == lc and m < c):
+        s, lng = m, c
+    else:
+        s, lng = c, m
+    hit = aln.get((s << 32) | lng)
+    if hit is not None:
+        return s, lng, int(hit[0]), hit[1]
+    import edlib
+
+    res = edlib.align(seqs[s], seqs[lng], mode="HW", task="path")
+    if res["editDistance"] < 0 or not res["locations"]:
+        return None
+    return s, lng, int(res["locations"][0][0]), (res["cigar"] or "")
+
+
+def _cluster_chunk(
+    bounds: tuple[int, int],
+    *,
+    predict_orfs: bool,
+    min_aa_length: int,
+    identity: float,
+    overdispersion: float,
+) -> tuple[list[tuple], list[tuple], list[tuple]]:
+    seqs = _W["seqs"]
+    abund = _W["abund"]
+    seqlen = _W["seqlen"]
+    ptr = _W["ptr"]
+    members = _W["members"]
+    centroid = _W["centroid"]
+    model = _W["error_model"]
+    # Members beyond this identity to the centroid still belong to the
+    # component but don't vote in the consensus (protects against chain-end
+    # divergence corrupting the centroid frame).
+    consensus_gate = 2.0 * (1.0 - identity)
+    lo, hi = bounds
+    cluster_out: list[tuple] = []
+    metric_out: list[tuple] = []
+    variant_out: list[tuple] = []
+    haplotype_out: list[tuple] = []
+    disagree: dict[tuple[int, int], tuple[float, float]] = {}
+    for cid in range(lo, hi):
+        c = int(centroid[cid])
+        mem = members[ptr[cid] : ptr[cid + 1]]
+        specs: list[MemberSpec] = []
+        for m in mem:
+            m = int(m)
+            if m == c:
+                continue
+            al = _member_alignment(c, m)
+            if al is None:
+                metric_out.append((m, int(seqlen[m]), 0, 0, 0, 0, 0, 0))
+                continue
+            s, lng, ref_start, cigar = al
+            nm, nx, ni, nd = cigar_stats(cigar)
+            ref_end = ref_start + nm + nx + nd
+            oh5 = ref_start
+            oh3 = int(seqlen[lng]) - ref_end
+            m_is_long = 1 if m == lng else 0
+            metric_out.append((m, nm, nx, ni, nd, oh5, oh3, m_is_long))
+            len_short = int(seqlen[s])
+            edit = nx + ni + nd
+            if len_short > 0 and (edit / len_short) <= consensus_gate:
+                specs.append(
+                    MemberSpec(
+                        member_seq=seqs[m],
+                        weight=float(abund[m]),
+                        cigar=cigar,
+                        centroid_is_query=(s == c),
+                        ref_start=ref_start,
+                    )
+                )
+        if specs:
+            cres = centroid_consensus(seqs[c], float(abund[c]), specs)
+            consensus = cres.consensus
+            merge_disagreements(disagree, disagreement_stats(cres))
+            vrows = call_variants(cres, model=model, overdispersion=overdispersion)
+            if vrows:
+                keep = cres.winner < 4
+                centroid_of_cons = np.flatnonzero(keep)
+                var_cons = np.array([r[0] for r in vrows], dtype=np.int64)
+                var_centroid = centroid_of_cons[var_cons]
+                member_weights = np.array(
+                    [float(abund[c])] + [s.weight for s in specs], dtype=np.float64
+                )
+                hres = build_haplotypes(
+                    cres,
+                    var_centroid,
+                    var_cons,
+                    [r[2] for r in vrows],
+                    [r[1] for r in vrows],
+                    member_weights,
+                )
+                for i, vr in enumerate(vrows):
+                    variant_out.append((cid, *vr, float(hres.max_r2[i])))
+                for hid, (astr, ab, nu, comp) in enumerate(hres.haplotypes):
+                    haplotype_out.append(
+                        (cid, hid, astr, hres.variant_positions, ab, nu, comp)
+                    )
+        else:
+            consensus = seqs[c]
+        protein = orf_start = orf_end = orf_strand = codon_tbl = None
+        if predict_orfs:
+            orf = _best_clean_orf(consensus, min_aa_length=min_aa_length)
+            if orf is not None:
+                protein = orf.protein
+                orf_start = int(orf.start)
+                orf_end = int(orf.end)
+                orf_strand = orf.strand
+                codon_tbl = int(orf.transl_table)
+        cluster_out.append(
+            (cid, consensus, protein, orf_start, orf_end, orf_strand, codon_tbl)
+        )
+    return cluster_out, metric_out, variant_out, haplotype_out, disagree
+
+
+def assemble_clusters(
+    reads: pa.Table,
+    *,
+    identity: float = 0.98,
+    max_5p_overhang: int = 30,
+    max_3p_overhang: int = 30,
+    kmer: int = 15,
+    window: int = 10,
+    min_cluster_size: int = 1,
+    min_abundance: int = 1,
+    predict_orfs: bool = True,
+    min_aa_length: int = 60,
+    overdispersion: float = 0.0,
+    error_model: ErrorModel | None = None,
+    fit_empirical: bool = False,
+    threads: int = 1,
+) -> AssembledClusters:
+    """Pure in-memory de novo first-round assembly over a reads table.
+
+    ``reads`` carries ``(read_id, sequence, sample_id)`` — the trimmed
+    transcript windows of Complete, non-fragment reads.
+    """
+    n_input = reads.num_rows
+    uniq_table, read_map = dereplicate(reads)
+    n_uniq = uniq_table.num_rows
+    empty = AssembledClusters(
+        TRANSCRIPT_CLUSTER_TABLE.empty_table(),
+        CLUSTER_MEMBERSHIP_TABLE.empty_table(),
+        FEATURE_QUANT.empty_table(),
+        CLUSTER_VARIANT_TABLE.empty_table(),
+        CLUSTER_HAPLOTYPE_TABLE.empty_table(),
+        n_input,
+        n_uniq,
+    )
+    if n_uniq == 0:
+        return empty
+
+    seqs = uniq_table.column("sequence").to_pylist()
+    abundance = (
+        uniq_table.column("abundance").to_numpy(zero_copy_only=False).astype(np.int64)
+    )
+    seqlen = (
+        uniq_table.column("seq_len").to_numpy(zero_copy_only=False).astype(np.int64)
+    )
+
+    index = extract_minimizers(uniq_table.column("sequence"), k=kmer, w=window)
+    candidates = generate_candidates(index, abundance)
+    accepted = verify_candidates(
+        candidates,
+        seqs,
+        identity=identity,
+        max_5p=max_5p_overhang,
+        max_3p=max_3p_overhang,
+        threads=threads,
+    )
+    comp = connected_components(
+        n_uniq,
+        abundance,
+        seqlen,
+        accepted.column("uniq_short").to_numpy(zero_copy_only=False),
+        accepted.column("uniq_long").to_numpy(zero_copy_only=False),
+    )
+    cluster_of = comp.cluster_of
+    centroid_uniq = comp.centroid_uniq
+    n_clusters_raw = centroid_uniq.shape[0]
+
+    # ── size filter (total reads; lone sub-min_abundance singletons) + remap ─
+    n_reads_raw = np.zeros(n_clusters_raw, dtype=np.int64)
+    np.add.at(n_reads_raw, cluster_of, abundance)
+    n_uniq_raw = np.bincount(cluster_of, minlength=n_clusters_raw)
+    survive = (n_reads_raw >= int(min_cluster_size)) & ~(
+        (n_uniq_raw == 1) & (n_reads_raw < int(min_abundance))
+    )
+    new_id = np.full(n_clusters_raw, -1, dtype=np.int64)
+    new_id[survive] = np.arange(int(survive.sum()), dtype=np.int64)
+    cluster_of = new_id[cluster_of]
+    surviving_centroids = centroid_uniq[survive]
+    n_clusters = surviving_centroids.shape[0]
+    if n_clusters == 0:
+        return empty
+
+    # ── CSR members per surviving cluster ──
+    uniq_ids = np.arange(n_uniq, dtype=np.int64)
+    valid = cluster_of >= 0
+    cu = cluster_of[valid]
+    uu = uniq_ids[valid]
+    order = np.argsort(cu, kind="stable")
+    cu_s = cu[order]
+    uu_s = uu[order]
+    ptr = np.zeros(n_clusters + 1, dtype=np.int64)
+    np.cumsum(np.bincount(cu_s, minlength=n_clusters), out=ptr[1:])
+
+    aln_lookup = _build_alignment_lookup(accepted)
+    _W.clear()
+    _W.update(
+        seqs=seqs,
+        abund=abundance,
+        seqlen=seqlen,
+        aln=aln_lookup,
+        ptr=ptr,
+        members=uu_s,
+        centroid=surviving_centroids,
+        error_model=error_model or ErrorModel(),
+    )
+    worker_kw = dict(
+        predict_orfs=predict_orfs,
+        min_aa_length=min_aa_length,
+        identity=identity,
+        overdispersion=overdispersion,
+    )
+    disagree: dict = {}
+    try:
+        if threads <= 1 or n_clusters < 256:
+            cluster_res, metric_res, variant_res, hap_res, disagree = _cluster_chunk(
+                (0, n_clusters), **worker_kw
+            )
+        else:
+            step = max(1, (n_clusters + threads * 4 - 1) // (threads * 4))
+            bounds = [
+                (lo, min(lo + step, n_clusters)) for lo in range(0, n_clusters, step)
+            ]
+            ctx = mp.get_context("fork")
+            cluster_res, metric_res, variant_res, hap_res = [], [], [], []
+            with ProcessPoolExecutor(max_workers=threads, mp_context=ctx) as ex:
+                futs = [ex.submit(_cluster_chunk, b, **worker_kw) for b in bounds]
+                for fut in futs:
+                    cr, mr, vr, hr, dg = fut.result()
+                    cluster_res.extend(cr)
+                    metric_res.extend(mr)
+                    variant_res.extend(vr)
+                    hap_res.extend(hr)
+                    merge_disagreements(disagree, dg)
+    finally:
+        _W.clear()
+    cluster_res.sort(key=lambda r: r[0])
+
+    # Empirical error model: re-fit ε from the cluster-wide high-confidence
+    # disagreements and re-test every variant position (no second consensus).
+    if fit_empirical and variant_res:
+        fitted = estimate_error_rates(disagree, base=error_model or ErrorModel())
+        variant_res = reclassify_variants(
+            variant_res, fitted, overdispersion=overdispersion
+        )
+
+    clusters = _build_cluster_table(
+        cluster_res,
+        surviving_centroids=surviving_centroids,
+        uniq_table=uniq_table,
+        abundance=abundance,
+        cluster_of=cluster_of,
+        n_clusters=n_clusters,
+        identity=identity,
+    )
+    membership = _build_membership_table(
+        read_map=read_map,
+        uniq_table=uniq_table,
+        cluster_of=cluster_of,
+        centroid_set=set(int(c) for c in surviving_centroids),
+        seqlen=seqlen,
+        metric_res=metric_res,
+    )
+    feature_quant = cluster_feature_quant(read_map, cluster_of)
+    variants = _build_variant_table(variant_res)
+    haplotypes = _build_haplotype_table(hap_res)
+    return AssembledClusters(
+        clusters, membership, feature_quant, variants, haplotypes, n_input, n_uniq
+    )
+
+
+def _build_variant_table(variant_res: list[tuple]) -> pa.Table:
+    if not variant_res:
+        return CLUSTER_VARIANT_TABLE.empty_table()
+    cols = list(zip(*variant_res))
+    return pa.table(
+        {
+            "cluster_id": pa.array(cols[0], pa.int64()),
+            "consensus_pos": pa.array(cols[1], pa.int32()),
+            "consensus_allele": pa.array(cols[2], pa.string()),
+            "minor_allele": pa.array(cols[3], pa.string()),
+            "variant_class": pa.array(cols[4], pa.string()),
+            "homopolymer_run": pa.array(cols[5], pa.int32()),
+            "depth_total": pa.array(cols[6], pa.int32()),
+            "depth_minor": pa.array(cols[7], pa.int32()),
+            "minor_fraction": pa.array(cols[8], pa.float32()),
+            "p_error": pa.array(cols[9], pa.float64()),
+            "epsilon_class": pa.array(cols[10], pa.float32()),
+            "call": pa.array(cols[11], pa.string()),
+            "max_linkage_r2": pa.array(cols[12], pa.float32()),
+        },
+        schema=CLUSTER_VARIANT_TABLE,
+    )
+
+
+def _build_haplotype_table(hap_res: list[tuple]) -> pa.Table:
+    if not hap_res:
+        return CLUSTER_HAPLOTYPE_TABLE.empty_table()
+    cols = list(zip(*hap_res))
+    n = len(hap_res)
+    return pa.table(
+        {
+            "cluster_id": pa.array(cols[0], pa.int64()),
+            "haplotype_id": pa.array(cols[1], pa.int32()),
+            "allele_string": pa.array(cols[2], pa.string()),
+            "variant_positions": pa.array(cols[3], pa.list_(pa.int32())),
+            "abundance": pa.array(cols[4], pa.int64()),
+            "n_unique_sequences": pa.array(cols[5], pa.int32()),
+            "per_sample_abundance": pa.nulls(n, pa.list_(pa.int64())),
+            "is_complete": pa.array(cols[6], pa.bool_()),
+        },
+        schema=CLUSTER_HAPLOTYPE_TABLE,
+    )
+
+
+def _build_alignment_lookup(accepted: pa.Table) -> dict[int, tuple[int, str]]:
+    short = accepted.column("uniq_short").to_numpy(zero_copy_only=False)
+    long = accepted.column("uniq_long").to_numpy(zero_copy_only=False)
+    ref_start = accepted.column("ref_start").to_numpy(zero_copy_only=False)
+    cigar = accepted.column("cigar").to_pylist()
+    keys = (short.astype(np.int64) << 32) | long.astype(np.int64)
+    return {int(k): (int(rs), cg) for k, rs, cg in zip(keys, ref_start, cigar)}
+
+
+def _build_cluster_table(
+    results: list[tuple],
+    *,
+    surviving_centroids: np.ndarray,
+    uniq_table: pa.Table,
+    abundance: np.ndarray,
+    cluster_of: np.ndarray,
+    n_clusters: int,
+    identity: float,
+) -> pa.Table:
+    rep_per_uniq = uniq_table.column("representative_read_id").to_pylist()
+    valid = cluster_of >= 0
+    n_unique = np.bincount(cluster_of[valid], minlength=n_clusters)
+    n_reads = np.zeros(n_clusters, dtype=np.int64)
+    np.add.at(n_reads, cluster_of[valid], abundance[valid])
+
+    cid = [r[0] for r in results]
+    rep = [rep_per_uniq[int(surviving_centroids[c])] for c in cid]
+    return pa.table(
+        {
+            "cluster_id": pa.array(cid, pa.int64()),
+            "representative_read_id": pa.array(rep, pa.string()),
+            "n_reads": pa.array([int(n_reads[c]) for c in cid], pa.int32()),
+            "identity_threshold": pa.array([float(identity)] * len(cid), pa.float32()),
+            "consensus_sequence": pa.array([r[1] for r in results], pa.string()),
+            "predicted_protein": pa.array([r[2] for r in results], pa.string()),
+            "orf_start": pa.array([r[3] for r in results], pa.int32()),
+            "orf_end": pa.array([r[4] for r in results], pa.int32()),
+            "orf_strand": pa.array([r[5] for r in results], pa.string()),
+            "codon_table": pa.array([r[6] for r in results], pa.int32()),
+            "mode": pa.array(["de-novo"] * len(cid), pa.string()),
+            "contig_id": pa.nulls(len(cid), pa.int64()),
+            "strand": pa.nulls(len(cid), pa.string()),
+            "span_start": pa.nulls(len(cid), pa.int64()),
+            "span_end": pa.nulls(len(cid), pa.int64()),
+            "fingerprint_hash": pa.nulls(len(cid), pa.uint64()),
+            "n_unique_sequences": pa.array([int(n_unique[c]) for c in cid], pa.int32()),
+            "sample_id": pa.nulls(len(cid), pa.int64()),
+        },
+        schema=TRANSCRIPT_CLUSTER_TABLE,
+    )
+
+
+def _build_membership_table(
+    *,
+    read_map: pa.Table,
+    uniq_table: pa.Table,
+    cluster_of: np.ndarray,
+    centroid_set: set[int],
+    seqlen: np.ndarray,
+    metric_res: list[tuple],
+) -> pa.Table:
+    n_uniq = uniq_table.num_rows
+    uniq_ids = np.arange(n_uniq, dtype=np.int64)
+    is_centroid = np.array([int(u) in centroid_set for u in uniq_ids], dtype=bool)
+
+    # Per-uniq metrics — centroid self-values by default.
+    match_rate = np.ones(n_uniq, dtype=np.float64)
+    indel_rate = np.zeros(n_uniq, dtype=np.float64)
+    n_aligned = seqlen.astype(np.int64).copy()
+    drift5 = np.zeros(n_uniq, dtype=np.int64)
+    drift3 = np.zeros(n_uniq, dtype=np.int64)
+
+    if metric_res:
+        arr = np.asarray(metric_res, dtype=np.int64)
+        mu = arr[:, 0]
+        nm, nx, ni, nd = arr[:, 1], arr[:, 2], arr[:, 3], arr[:, 4]
+        oh5, oh3, m_is_long = arr[:, 5], arr[:, 6], arr[:, 7].astype(bool)
+        aligned = nm + nx + ni + nd
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mr = np.where((nm + nx) > 0, nm / (nm + nx), 1.0)
+            ir = np.where(aligned > 0, (ni + nd) / aligned, 0.0)
+        d5 = np.where(m_is_long, oh5, -oh5)
+        d3 = np.where(m_is_long, oh3, -oh3)
+        match_rate[mu] = mr
+        indel_rate[mu] = ir
+        n_aligned[mu] = np.where(aligned > 0, aligned, seqlen[mu])
+        drift5[mu] = d5
+        drift3[mu] = d3
+
+    r_uniq = read_map.column("uniq_id").to_numpy(zero_copy_only=False)
+    r_cluster = cluster_of[r_uniq]
+    keep = r_cluster >= 0
+    rep_per_uniq = np.array(uniq_table.column("representative_read_id").to_pylist())
+    read_ids = np.array(read_map.column("read_id").to_pylist())
+    is_uniq_rep = read_ids == rep_per_uniq[r_uniq]
+    uniq_is_centroid = is_centroid[r_uniq]
+    role = np.where(
+        ~is_uniq_rep,
+        "duplicate",
+        np.where(uniq_is_centroid, "representative", "member"),
+    )
+
+    return pa.table(
+        {
+            "cluster_id": pa.array(r_cluster[keep].astype(np.int64)),
+            "read_id": pa.array(read_ids[keep]),
+            "role": pa.array(role[keep]),
+            "drift_5p_bp": pa.array(drift5[r_uniq][keep].astype(np.int32)),
+            "drift_3p_bp": pa.array(drift3[r_uniq][keep].astype(np.int32)),
+            "match_rate": pa.array(match_rate[r_uniq][keep].astype(np.float32)),
+            "indel_rate": pa.array(indel_rate[r_uniq][keep].astype(np.float32)),
+            "n_aligned_bp": pa.array(n_aligned[r_uniq][keep].astype(np.int32)),
+        },
+        schema=CLUSTER_MEMBERSHIP_TABLE,
+    )
+
+
+def cluster_transcripts(
+    demux_dir: Path,
+    *,
+    output_dir: Path,
+    identity: float = 0.98,
+    max_5p_overhang: int = 30,
+    max_3p_overhang: int = 30,
+    kmer: int = 15,
+    window: int = 10,
+    min_cluster_size: int = 1,
+    min_abundance: int = 1,
+    max_cluster_rounds: int = 1,
+    error_model: Literal["default", "empirical"] = "default",
+    overdispersion: float = 0.0,
+    predict_orfs: bool = True,
+    min_aa_length: int = 60,
+    emit_cluster_detail: bool = False,
+    detail_top_n: int = 50,
+    threads: int = 1,
+    samples: Any | None = None,
+    write_fasta: bool = True,
+    report: bool = True,
+    progress_cb: Any | None = None,
+    resume: bool = False,
+) -> dict[str, Path]:
+    """Run de novo first-round assembly over an S1 demux output dir."""
+    from constellation.sequencing.transcriptome.cluster.denovo._io import (
+        load_demux_windows,
+        write_outputs,
+    )
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    reads = load_demux_windows(Path(demux_dir))
+    result = assemble_clusters(
+        reads,
+        identity=identity,
+        max_5p_overhang=max_5p_overhang,
+        max_3p_overhang=max_3p_overhang,
+        kmer=kmer,
+        window=window,
+        min_cluster_size=min_cluster_size,
+        min_abundance=min_abundance,
+        predict_orfs=predict_orfs,
+        min_aa_length=min_aa_length,
+        overdispersion=overdispersion,
+        fit_empirical=(error_model == "empirical"),
+        threads=threads,
+    )
+    paths = write_outputs(
+        result,
+        output_dir=output_dir,
+        demux_dir=Path(demux_dir),
+        samples=samples,
+        write_fasta=write_fasta,
+        predict_orfs=predict_orfs,
+        emit_cluster_detail=emit_cluster_detail,
+        detail_top_n=detail_top_n,
+        parameters={
+            "mode": "de-novo",
+            "identity": float(identity),
+            "max_5p_overhang": int(max_5p_overhang),
+            "max_3p_overhang": int(max_3p_overhang),
+            "kmer": int(kmer),
+            "window": int(window),
+            "min_cluster_size": int(min_cluster_size),
+            "min_abundance": int(min_abundance),
+            "max_cluster_rounds": int(max_cluster_rounds),
+            "error_model": str(error_model),
+            "overdispersion": float(overdispersion),
+            "predict_orfs": bool(predict_orfs),
+            "min_aa_length": int(min_aa_length),
+            "threads": int(threads),
+        },
+    )
+    if report:
+        try:
+            from constellation.sequencing.transcriptome.cluster.denovo.diagnostics import (  # noqa: E501
+                build_denovo_diagnostics_report,
+            )
+
+            paths["report"] = build_denovo_diagnostics_report(output_dir)
+        except Exception:  # noqa: BLE001 — report never breaks a successful run
+            pass
+    return paths
+
+
+__all__ = ["cluster_transcripts", "assemble_clusters", "AssembledClusters"]

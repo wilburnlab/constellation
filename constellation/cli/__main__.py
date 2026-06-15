@@ -1179,10 +1179,12 @@ def _build_transcriptome_parser(subs) -> None:
     )
     p_cluster.add_argument(
         "--align-dir",
-        required=True,
+        required=False,
+        default=None,
         help=(
             "directory produced by `transcriptome align` "
-            "(must contain alignments/ + alignment_blocks/ + introns.parquet)."
+            "(must contain alignments/ + alignment_blocks/ + introns.parquet). "
+            "Required for --mode genome-guided; ignored for --mode de-novo."
         ),
     )
     p_cluster.add_argument(
@@ -1217,12 +1219,98 @@ def _build_transcriptome_parser(subs) -> None:
     )
     p_cluster.add_argument(
         "--mode",
-        choices=("genome-guided",),
+        choices=("genome-guided", "de-novo"),
         default="genome-guided",
         help=(
-            "clustering mode (Phase 2 ships only genome-guided; Phase 3 "
-            "adds de-novo; Phase 4 adds validate)."
+            "clustering mode. genome-guided (Phase 2) keys on splicing "
+            "topology against a reference; de-novo (Phase 3) is reference-"
+            "free minimizer + edit-distance assembly of the demux windows."
         ),
+    )
+    # ── de-novo (--mode de-novo) flags ──────────────────────────────
+    p_cluster.add_argument(
+        "--identity",
+        type=float,
+        default=0.98,
+        help=(
+            "de-novo: minimum pairwise sequence identity for two reads to "
+            "share a cluster edge (edit_distance / shorter_len ≤ 1-identity). "
+            "Note this is read-to-read: two reads each ~1%% from the true "
+            "transcript are ~2%% apart, so ~0.96-0.97 reduces tail "
+            "fragmentation for ~1%% error reads. Default 0.98."
+        ),
+    )
+    p_cluster.add_argument(
+        "--max-5p-overhang",
+        type=int,
+        default=30,
+        help="de-novo: max 5' length overhang (bp) to still collapse. Default 30.",
+    )
+    p_cluster.add_argument(
+        "--max-3p-overhang",
+        type=int,
+        default=30,
+        help="de-novo: max 3' length overhang (bp) to still collapse. Default 30.",
+    )
+    p_cluster.add_argument(
+        "--kmer", type=int, default=15, help="de-novo: minimizer k-mer length."
+    )
+    p_cluster.add_argument(
+        "--window", type=int, default=10, help="de-novo: minimizer window size."
+    )
+    p_cluster.add_argument(
+        "--min-abundance",
+        type=int,
+        default=1,
+        help=(
+            "de-novo: drop a lone singleton cluster whose total read count is "
+            "below this (multi-read clusters always kept). Default 1."
+        ),
+    )
+    p_cluster.add_argument(
+        "--max-cluster-rounds",
+        type=int,
+        default=1,
+        help="de-novo: iterative-refinement rounds (v1 ships round 1). Default 1.",
+    )
+    p_cluster.add_argument(
+        "--error-model",
+        choices=("default", "empirical"),
+        default="default",
+        help="de-novo: variant-confidence error model (Cut 2+). Default 'default'.",
+    )
+    p_cluster.add_argument(
+        "--overdispersion",
+        type=float,
+        default=0.0,
+        help="de-novo: beta-binomial overdispersion ρ for variant SF (Cut 4).",
+    )
+    p_cluster.add_argument(
+        "--predict-orfs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="de-novo: predict ORFs on each consensus (populates proteins.fasta).",
+    )
+    p_cluster.add_argument(
+        "--min-aa-length",
+        type=int,
+        default=60,
+        help="de-novo: minimum predicted-protein length (AA). Default 60.",
+    )
+    p_cluster.add_argument(
+        "--emit-cluster-detail",
+        action="store_true",
+        help=(
+            "de-novo: write per-cluster haplotype-map SVGs + variant TSVs "
+            "(Cut 3; off by default — these are the verbose per-cluster "
+            "printouts)."
+        ),
+    )
+    p_cluster.add_argument(
+        "--detail-top-n",
+        type=int,
+        default=50,
+        help="de-novo: limit --emit-cluster-detail to the top-N clusters by reads.",
     )
     p_cluster.add_argument(
         "--max-5p-drift",
@@ -2360,14 +2448,16 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         read_manifest_dir,
     )
 
-    if args.mode != "genome-guided":  # pragma: no cover — argparse-gated
+    if args.mode == "de-novo":
+        return _cmd_transcriptome_cluster_denovo(args)
+
+    if args.align_dir is None:
         print(
-            f"--mode {args.mode} not yet implemented; only "
-            "genome-guided is wired in this release.",
+            "--mode genome-guided requires --align-dir "
+            "(a `transcriptome align` output dir).",
             file=sys.stderr,
         )
         return 2
-
     align_dir = Path(args.align_dir)
     blocks_success = align_dir / "alignment_blocks" / "_SUCCESS"
     if not blocks_success.exists():
@@ -2940,6 +3030,103 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             f"cluster done: {fingerprints_table.num_rows} input fingerprints → "
             f"{clusters.num_rows} clusters "
             f"({membership.num_rows} membership rows)",
+            flush=True,
+        )
+    return 0
+
+
+def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
+    """Phase 3 — reference-free de novo first-round assembly.
+
+    Collapses the Complete, non-fragment transcript windows from an S1
+    demux dir into clusters via minimizer sketching + edit-distance
+    verification + connected-components grouping, emitting a consensus +
+    per-sample quant + (optional) predicted protein per cluster.
+    """
+    import sys
+    from pathlib import Path
+
+    from constellation.core.progress import NullProgress, StreamProgress
+    from constellation.sequencing.transcriptome.cluster.denovo import (
+        cluster_transcripts,
+    )
+
+    demux_dir = Path(args.demux_dir)
+    if not demux_dir.is_dir():
+        raise FileNotFoundError(f"--demux-dir not found: {demux_dir}")
+    for sub in ("read_demux", "reads"):
+        if not (demux_dir / sub).is_dir():
+            print(
+                f"--demux-dir missing {sub}/: {demux_dir}",
+                file=sys.stderr,
+            )
+            return 2
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    success = output_dir / "_SUCCESS"
+    if success.exists() and not args.resume:
+        print(
+            f"output dir already complete: {output_dir} "
+            "(pass --resume to short-circuit; refusing to overwrite)",
+            file=sys.stderr,
+        )
+        return 1
+    if success.exists() and args.resume:
+        print(f"--resume: output already complete: {output_dir}", flush=True)
+        return 0
+
+    # Optional Samples container (for sample-named count columns).
+    samples = None
+    samples_dir = demux_dir / "samples"
+    if samples_dir.is_dir():
+        try:
+            from constellation.sequencing.samples import load_samples
+
+            samples = load_samples(samples_dir)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"WARNING: could not load samples from {samples_dir}: {exc}; "
+                "count columns will use numeric sample ids.",
+                file=sys.stderr,
+            )
+
+    progress = StreamProgress() if args.progress else NullProgress()
+
+    paths = cluster_transcripts(
+        demux_dir,
+        output_dir=output_dir,
+        identity=float(args.identity),
+        max_5p_overhang=int(args.max_5p_overhang),
+        max_3p_overhang=int(args.max_3p_overhang),
+        kmer=int(args.kmer),
+        window=int(args.window),
+        min_cluster_size=int(args.min_cluster_size),
+        min_abundance=int(args.min_abundance),
+        max_cluster_rounds=int(args.max_cluster_rounds),
+        error_model=str(args.error_model),
+        overdispersion=float(args.overdispersion),
+        predict_orfs=bool(args.predict_orfs),
+        min_aa_length=int(args.min_aa_length),
+        emit_cluster_detail=bool(args.emit_cluster_detail),
+        detail_top_n=int(args.detail_top_n),
+        threads=int(args.threads),
+        samples=samples,
+        write_fasta=bool(args.write_fasta),
+        report=bool(getattr(args, "report", True)),
+        progress_cb=progress,
+        resume=bool(args.resume),
+    )
+
+    if not args.progress and "report" in paths:
+        print(f"diagnostic report: {paths['report']}", flush=True)
+
+    if not args.progress:
+        import pyarrow.parquet as pq
+
+        n_clusters = pq.read_metadata(paths["clusters"]).num_rows
+        print(
+            f"de-novo cluster done: {n_clusters} clusters → {output_dir}",
             flush=True,
         )
     return 0
