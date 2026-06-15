@@ -22,11 +22,14 @@ from typing import Callable
 # import time so the `doctor` subcommand sees every known tool.
 from constellation.thirdparty import (  # noqa: F401
     busco,
+    cactus,
     dorado,
     encyclopedia,
     hifiasm,
+    iqtree,
     minimap2,
     mmseqs2,
+    ragout,
     ragtag,
     samtools,
     thermo,

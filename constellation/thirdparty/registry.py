@@ -289,13 +289,14 @@ def try_find(name: str) -> ToolHandle | None:
 def venv_safe_env() -> dict[str, str]:
     """Process env with ``PYTHONPATH`` stripped, for invoking venv-based tools.
 
-    The Python tools installed into a dedicated venv (``ragtag.py``,
-    ``busco``) run under their own interpreter. An exported ``PYTHONPATH``
-    (common on HPC login shells) is prepended to ``sys.path`` *ahead* of the
-    venv's own site-packages, so it can shadow / break the tool's pinned
-    dependencies with the parent environment's packages. Native binaries
-    (minimap2 / samtools / hifiasm / dorado) are unaffected, so call sites
-    opt in rather than this being global.
+    The Python tools that run under their own interpreter — ``ragtag.py``
+    (a dedicated venv) and ``busco`` (a conda-env wrapper) — are sensitive
+    to a leaked ``PYTHONPATH`` (common on HPC login shells): it is prepended
+    to ``sys.path`` *ahead* of the tool's own site-packages, so it can
+    shadow / break the tool's pinned dependencies with the parent
+    environment's packages. Native binaries (minimap2 / samtools / hifiasm /
+    dorado) are unaffected, so call sites opt in rather than this being
+    global.
     """
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)

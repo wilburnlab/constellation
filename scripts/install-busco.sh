@@ -1,37 +1,39 @@
 #!/usr/bin/env bash
 # Install BUSCO into Constellation's third_party/ layout.
 #
-# Primary install path is conda (bioconda — in environment.yml), which
-# also pulls BUSCO's external dependencies (metaeuk / hmmer / sepp ...).
-# This script is the no-conda FALLBACK: a venv pip-install of BUSCO *from
-# its GitLab source* (BUSCO is not published on PyPI). Note that pip does
-# NOT install BUSCO's external aligners — those must already be on PATH for
-# a real run. Lineage datasets download separately.
+# BUSCO is fundamentally a conda tool: bioconda bundles its 8 external
+# aligners (metaeuk / hmmer / prodigal / sepp / bbmap / augustus / blast /
+# miniprot), which a bare pip install does NOT provide — so a pip-only
+# BUSCO cannot actually run. This installer therefore creates a *dedicated
+# conda environment* (a prefix env under third_party/) so BUSCO and its
+# aligners are fully isolated from the main `constellation` env. That
+# isolation is also why BUSCO is no longer listed in environment.yml: it
+# pins numpy<2.4, which would otherwise downgrade the core env's numpy>=2
+# (needed by torch 2.5.x + pyarrow>=18).
 #
 # Layout (matches the thirdparty.registry contract — artifact 'busco'):
-#   third_party/busco/<version>/busco -> venv/bin/busco
-#   third_party/busco/current -> <version>/   (symlink)
+#   third_party/busco/<version>/env/         (the conda prefix env)
+#   third_party/busco/<version>/busco        (wrapper -> runs busco in env)
+#   third_party/busco/current -> <version>/  (symlink)
 #
-# Requires curl/wget + a C/Python build toolchain (BUSCO builds from source).
+# The 'busco' wrapper invokes `conda run -p <env>` so the env's activate.d
+# hooks (e.g. AUGUSTUS_CONFIG_PATH) and bundled aligners resolve at
+# runtime — not just PATH. Requires conda or mamba on PATH.
+#
 # Lineage data: set $BUSCO_DOWNLOADS_PATH (the runner passes it through as
-# `--download_path --offline`), or let BUSCO auto-download online. Override
-# the tool location with $CONSTELLATION_BUSCO_HOME.
+# `--download_path --offline`), or pre-stage with --lineage. Override the
+# tool location with $CONSTELLATION_BUSCO_HOME.
 #
 # Usage:
 #   bash scripts/install-busco.sh
 #   bash scripts/install-busco.sh --force
-#   bash scripts/install-busco.sh --version 5.7.1
-#   bash scripts/install-busco.sh --lineage eukaryota_odb10   # pre-stage a dataset
+#   bash scripts/install-busco.sh --version 6.1.0
+#   bash scripts/install-busco.sh --lineage eukaryota_odb12   # pre-stage a dataset
 #
 # BUSCO is MIT-licensed.
 set -euo pipefail
 
-# Build the venv in isolation: an exported PYTHONPATH (common on HPC login
-# shells) leaks the parent environment into the venv, so pip would see its
-# packages as "already satisfied" and skip installing BUSCO's own deps.
-unset PYTHONPATH
-
-VERSION="5.7.1"
+VERSION="6.1.0"
 LINEAGE=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -44,15 +46,16 @@ while [[ $# -gt 0 ]]; do
         --lineage) LINEAGE="$2"; shift 2 ;;
         -h|--help)
             cat <<'USAGE'
-install-busco.sh — install BUSCO from GitLab source into a venv (no-conda fallback).
+install-busco.sh — install BUSCO into a dedicated conda env.
 
-Primary install path is conda (bioconda — in environment.yml), which also
-installs BUSCO's external aligners. BUSCO is not on PyPI, so this fallback
-pip-installs it from its GitLab source tarball; pip does NOT install the
-external aligners (metaeuk/hmmer/...) — they must be on PATH.
+BUSCO needs its 8 bioconda-bundled aligners (metaeuk/hmmer/...) to run, so
+this installer creates an isolated conda prefix env rather than a pip venv.
+BUSCO is intentionally NOT in environment.yml (it pins numpy<2.4, which
+would downgrade the core env). Requires conda or mamba on PATH.
 
 Writes to:
-  third_party/busco/<version>/busco  (-> venv/bin/busco)
+  third_party/busco/<version>/env/         (conda prefix env)
+  third_party/busco/<version>/busco        (wrapper)
   third_party/busco/current -> <version>/   (symlink)
 
 Lineage data: set $BUSCO_DOWNLOADS_PATH, or pre-stage with --lineage NAME.
@@ -66,53 +69,62 @@ USAGE
     esac
 done
 
+# BUSCO requires conda/mamba (bioconda bundles its aligners). Prefer mamba
+# for faster solves; fall back to conda.
+CONDA_BIN="$(command -v mamba || command -v conda || true)"
+if [[ -z "${CONDA_BIN}" ]]; then
+    echo "error: neither mamba nor conda is on PATH" >&2
+    echo "  BUSCO + its aligners are only distributed via bioconda; install a" >&2
+    echo "  conda/mamba (e.g. miniforge) first, then re-run this script." >&2
+    exit 1
+fi
+
 TARGET_DIR="${REPO_ROOT}/third_party/busco/${VERSION}"
+ENV_PREFIX="${TARGET_DIR}/env"
 CURRENT_LINK="${REPO_ROOT}/third_party/busco/current"
 ENTRY="${TARGET_DIR}/busco"
 
 if [[ -e "${ENTRY}" && ${force} -eq 0 ]]; then
     echo "busco ${VERSION} already installed at ${ENTRY}"
 else
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo "error: python3 not on PATH" >&2
-        exit 1
-    fi
     rm -rf "${TARGET_DIR}"
     mkdir -p "${TARGET_DIR}"
-    echo "creating venv + installing BUSCO ${VERSION} from GitLab source..."
-    python3 -m venv "${TARGET_DIR}/venv"
-    "${TARGET_DIR}/venv/bin/pip" install --quiet --upgrade pip
+    echo "creating dedicated conda env for BUSCO ${VERSION} (this can take a few minutes)..."
+    # conda-forge before bioconda + strict priority — same rationale as
+    # environment.yml's channel order. The env carries its own numpy<2.4,
+    # isolated from the core constellation env.
+    "${CONDA_BIN}" create -y --strict-channel-priority -p "${ENV_PREFIX}" \
+        -c conda-forge -c bioconda "busco=${VERSION}"
 
-    # BUSCO is not on PyPI — fetch the source archive for the version tag
-    # from GitLab and pip-install the extracted tree. --strip-components=1
-    # normalizes the top-level dir name so we don't depend on its exact form.
-    URL="https://gitlab.com/ezlab/busco/-/archive/${VERSION}/busco-${VERSION}.tar.gz"
-    work_tar="${TARGET_DIR}/busco-${VERSION}.tar.gz.part"
-    src_dir="${TARGET_DIR}/src"
-    echo "downloading ${URL}"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fL --retry 3 -o "${work_tar}" "${URL}"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -O "${work_tar}" "${URL}"
+    if [[ ! -x "${ENV_PREFIX}/bin/busco" ]]; then
+        echo "error: busco not found in the conda env after install (${ENV_PREFIX}/bin/busco)" >&2
+        exit 1
+    fi
+
+    # Emit a wrapper so the registry artifact 'busco' runs the tool inside
+    # its env. `conda run` sources the env's activate.d hooks (e.g.
+    # AUGUSTUS_CONFIG_PATH) and puts the bundled aligners on PATH. If this
+    # conda lacks --no-capture-output (very old, or micromamba), fall back
+    # to a PATH-export wrapper (covers the default metaeuk mode; skips
+    # activate.d hooks). Absolute paths are baked in so the `current`
+    # symlink swap stays transparent.
+    if "${CONDA_BIN}" run --help 2>/dev/null | grep -q -- '--no-capture-output'; then
+        cat > "${ENTRY}" <<EOF
+#!/usr/bin/env bash
+# Auto-generated by scripts/install-busco.sh — runs BUSCO inside its
+# dedicated conda env (bundled aligners + activate.d hooks resolve).
+exec "${CONDA_BIN}" run --no-capture-output -p "${ENV_PREFIX}" busco "\$@"
+EOF
     else
-        echo "error: neither curl nor wget is available on PATH" >&2
-        exit 1
+        cat > "${ENTRY}" <<EOF
+#!/usr/bin/env bash
+# Auto-generated by scripts/install-busco.sh — PATH-export fallback
+# (this conda lacks 'conda run --no-capture-output').
+export PATH="${ENV_PREFIX}/bin:\$PATH"
+exec "${ENV_PREFIX}/bin/busco" "\$@"
+EOF
     fi
-    mkdir -p "${src_dir}"
-    tar -xzf "${work_tar}" -C "${src_dir}" --strip-components=1
-    rm -f "${work_tar}"
-    "${TARGET_DIR}/venv/bin/pip" install --quiet "${src_dir}"
-    rm -rf "${src_dir}"
-
-    if [[ ! -x "${TARGET_DIR}/venv/bin/busco" ]]; then
-        echo "error: busco entry point not found in the venv after install" >&2
-        echo "  (BUSCO source install can fail without build deps; conda is the" >&2
-        echo "   supported path: conda install -c bioconda busco)" >&2
-        exit 1
-    fi
-    ln -sfn "venv/bin/busco" "${ENTRY}"
-    echo "note: pip did not install BUSCO's external aligners (metaeuk/hmmer/...)." >&2
-    echo "      ensure they are on PATH, or use the conda install instead." >&2
+    chmod +x "${ENTRY}"
 fi
 
 tmp_link="${CURRENT_LINK}.tmp.$$"

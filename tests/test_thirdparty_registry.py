@@ -21,6 +21,18 @@ def test_encyclopedia_is_registered():
     assert "encyclopedia" in names
 
 
+def test_genome_tools_are_registered():
+    # The genome-assembly + comparative-genomics tools each declare an
+    # adapter so they show up in `constellation doctor`. busco is here too:
+    # it moved out of environment.yml into a dedicated-conda-env installer.
+    by_name = {s.name: s for s in registered()}
+    for name in ("busco", "iqtree", "ragout", "cactus"):
+        assert name in by_name, f"{name} adapter not registered"
+        spec = by_name[name]
+        assert spec.install_script and spec.install_script.startswith("scripts/")
+        assert spec.env_var.startswith("CONSTELLATION_")
+
+
 def test_missing_tool_raises_with_hint(tmp_path, monkeypatch):
     spec = ToolSpec(
         name="fake-tool-for-testing",
