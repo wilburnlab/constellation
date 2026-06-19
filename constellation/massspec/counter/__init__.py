@@ -51,7 +51,11 @@ from .orchestrate import (
 from .panel import Panel, PanelCellTerms, panel_cell_log_prob, panel_log_prob
 from .priors import make_log_prior
 from .residual import panel_predicted_intensity, panel_residual
-from .candidates import CandidateEntry, TheoreticalCandidateIndex
+from .candidates import (
+    CandidateEntry,
+    TheoreticalCandidateIndex,
+    channel_overlap_components,
+)
 from .emit import panel_attribution_table
 from .schemas import (
     COUNTER_GLOBAL_CALIBRATION_TABLE,
@@ -103,6 +107,7 @@ __all__ = [
     "panel_attribution_table",
     "TheoreticalCandidateIndex",
     "CandidateEntry",
+    "channel_overlap_components",
     # io + schemas
     "CounterResult",
     "save_counter",
