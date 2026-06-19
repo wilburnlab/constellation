@@ -29,7 +29,11 @@ import torch
 from constellation.core.sequence.proforma import Peptidoform
 from constellation.massspec.peptide.envelope import EnvelopeMode, peptide_envelope
 
-__all__ = ["CandidateEntry", "TheoreticalCandidateIndex"]
+__all__ = [
+    "CandidateEntry",
+    "TheoreticalCandidateIndex",
+    "channel_overlap_components",
+]
 
 
 @dataclass(frozen=True)
@@ -117,3 +121,55 @@ class TheoreticalCandidateIndex:
             isotope=self.isotope[sl],
             mz=self.mz[sl],
         )
+
+
+def channel_overlap_components(
+    index: TheoreticalCandidateIndex, *, collide_ppm: float = 20.0
+) -> list[frozenset[int]]:
+    """Partition the index's targets into channel-overlap **connected components**:
+    two targets share a component when ANY of their theoretical channels fall within
+    `collide_ppm` of each other (transitively). Each component is the unit a panel
+    co-fits so a shared peak is soft-attributed once across the blend (cross-panel
+    reconciliation) instead of double-claimed by independent per-target fits.
+
+    Every target appears in exactly one component; a target that collides with nobody
+    is its own size-1 component (so the caller can keep singletons on the
+    embarrassingly-parallel path). Returned sorted by each component's smallest
+    `target_id` for determinism.
+
+    This is the keep-and-attribute inverse of `search.collision`'s drop semantics
+    (which keeps one peptide per cluster); here every co-isobaric candidate is
+    retained. `collide_ppm` is static; a calibration-aware widening (loose-then-tight
+    as step 7 refines the offset) is a future opt-in, not wired here."""
+    # Mass-sorted sweep → collision edges between DISTINCT targets. Sort defensively
+    # (from_peptides already sorts, but a hand-built index may not).
+    order = torch.argsort(index.mz)
+    mz = index.mz[order].numpy()
+    tid = index.target_id[order].numpy()
+    n = int(mz.shape[0])
+
+    parent: dict[int, int] = {int(t): int(t) for t in tid.tolist()}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        hi = mz[i] * (1.0 + collide_ppm * 1e-6)
+        j = i + 1
+        while j < n and mz[j] <= hi:
+            if tid[j] != tid[i]:
+                union(int(tid[i]), int(tid[j]))
+            j += 1
+
+    comps: dict[int, set[int]] = {}
+    for t in parent:
+        comps.setdefault(find(t), set()).add(t)
+    return sorted((frozenset(c) for c in comps.values()), key=min)

@@ -10,6 +10,7 @@ from constellation.massspec.counter import (
     GlobalCalibration,
     Progenitor,
     TheoreticalCandidateIndex,
+    channel_overlap_components,
 )
 
 _PEP_A = Peptidoform(sequence="PEPTIDEKR")
@@ -62,3 +63,45 @@ def test_index_mz_matches_progenitor_grid() -> None:
     prog = Progenitor.for_peptide(_PEP_A, [2], cal, n_isotopes=3)
     idx = TheoreticalCandidateIndex.from_peptides([(0, _PEP_A, [2])], n_isotopes=3)
     assert torch.allclose(idx.mz.sort().values, prog.channel_mz.sort().values)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# PR-E — channel-overlap connected components
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _chain_index() -> TheoreticalCandidateIndex:
+    # three targets at 1-ppm m/z steps: A–B and B–C collide at ≥1 ppm
+    long = torch.long
+    return TheoreticalCandidateIndex(
+        mz=torch.tensor([500.0, 500.0005, 500.0010], dtype=torch.float64),
+        target_id=torch.tensor([0, 1, 2], dtype=long),
+        charge=torch.tensor([2, 2, 2], dtype=long),
+        isotope=torch.tensor([0, 0, 0], dtype=long),
+    )
+
+
+def test_components_partition_all_targets() -> None:
+    comps = channel_overlap_components(_index(), collide_ppm=20.0)
+    union = set().union(*comps)
+    assert union == {0, 1}  # every target present
+    assert sum(len(c) for c in comps) == len(union)  # disjoint partition
+
+
+def test_collide_ppm_sensitivity_singletons_vs_merged() -> None:
+    idx = _index()
+    singletons = channel_overlap_components(idx, collide_ppm=1e-6)
+    assert singletons == [frozenset({0}), frozenset({1})]  # tiny tol → all alone
+    merged = channel_overlap_components(idx, collide_ppm=1e7)
+    assert merged == [frozenset({0, 1})]  # huge tol → one component
+
+
+def test_components_transitive_chain() -> None:
+    # A–B (1 ppm) and B–C (1 ppm) → {A,B,C} one component even at <2 ppm tol
+    assert channel_overlap_components(_chain_index(), collide_ppm=5.0) == [frozenset({0, 1, 2})]
+    # tighter than the 1-ppm steps → all singletons
+    assert channel_overlap_components(_chain_index(), collide_ppm=0.5) == [
+        frozenset({0}),
+        frozenset({1}),
+        frozenset({2}),
+    ]

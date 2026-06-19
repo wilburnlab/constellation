@@ -281,8 +281,8 @@ extraction. So the loop re-fits parameters on the fixed, wide-extracted observat
 ### Ship order (10 sub-PRs, 3 phases)
 
 **Status:** PR-A + PR-B **shipped** (PR #80, "step 5 foundations"); PR-C + PR-D **shipped**
-(the calibration 4-slot round-trip + the theoretical candidate index — independent foundations
-for steps 6/7). A key finding (2026-06-18)
+(PR #81 — calibration 4-slot round-trip + theoretical candidate index); PR-E **shipped**
+(channel-overlap connected components). A key finding (2026-06-18)
 re-scoped step 5: a **post-DE gradient polish to apply the prior to the panel POINT estimate
 is unsafe** on the same-grid-blend surface — Adam drifts off DE's basin along the flat
 target↔interferer N-split direction (a 2× over-count in testing), unbounded L-BFGS escapes to a
@@ -312,10 +312,11 @@ superseded by VB-on-panel.
   channel-overlap connected components (PR-E) build on it next.
 
 **Phase 2 — step 5 deliverable + step 6 components:**
-- **PR-E** — channel-overlap connected components (union-find over collision edges from a
-  mass-sorted sweep). Reuse `search/collision.py`'s `_connected_components` core (id-generic) but
-  **keep-and-attribute**, not its drop semantics. `collide_ppm` static with a calibration-aware
-  kwarg *hook* (unwired) so step 7 can opt into loose-then-tight later.
+- ✓ **PR-E** — `channel_overlap_components(index, collide_ppm)`: union-find over collision edges
+  from a mass-sorted sweep → a partition of targets (singletons stay size-1 frozensets; sorted by
+  min target_id for determinism). `search/collision.py`'s union-find core was **copied** (not
+  imported — avoids `counter`→`search` coupling) with **keep-and-attribute** semantics. `collide_ppm`
+  static; the calibration-aware loose-then-tight widening is a future step-7 opt-in.
 - **PR-F** — ~~posterior-MAP gradient polish on the panel path~~ **SUPERSEDED** (see Status above):
   a post-DE polish is unsafe on the same-grid-blend surface (Adam drifts, unbounded L-BFGS NaNs,
   bounded L-BFGS collapses). The panel prior-bearing POINT estimate moves to VB-on-panel. The
