@@ -56,6 +56,7 @@ from .candidates import (
     TheoreticalCandidateIndex,
     channel_overlap_components,
 )
+from .component import estimate_component
 from .emit import panel_attribution_table
 from .schemas import (
     COUNTER_GLOBAL_CALIBRATION_TABLE,
@@ -108,6 +109,7 @@ __all__ = [
     "TheoreticalCandidateIndex",
     "CandidateEntry",
     "channel_overlap_components",
+    "estimate_component",
     # io + schemas
     "CounterResult",
     "save_counter",

@@ -282,7 +282,8 @@ extraction. So the loop re-fits parameters on the fixed, wide-extracted observat
 
 **Status:** PR-A + PR-B **shipped** (PR #80, "step 5 foundations"); PR-C + PR-D **shipped**
 (PR #81 — calibration 4-slot round-trip + theoretical candidate index); PR-E **shipped**
-(channel-overlap connected components). A key finding (2026-06-18)
+(channel-overlap connected components, PR #82); PR-G **shipped** (component co-fit +
+μ-anchoring). A key finding (2026-06-18)
 re-scoped step 5: a **post-DE gradient polish to apply the prior to the panel POINT estimate
 is unsafe** on the same-grid-blend surface — Adam drifts off DE's basin along the flat
 target↔interferer N-split direction (a 2× over-count in testing), unbounded L-BFGS escapes to a
@@ -322,12 +323,14 @@ superseded by VB-on-panel.
   bounded L-BFGS collapses). The panel prior-bearing POINT estimate moves to VB-on-panel. The
   `laplace_cov` already accepts a `log_prior`; wiring it stays a clean follow-up once a *consistent*
   posterior mode exists (i.e. under VB). Step-5 foundations (PR-A + PR-B) shipped instead.
-- **PR-G** — `counter/component.py` component co-fit (near-isobaric blend, approach B): each member
-  added via `Panel.add_progenitor` keeps its own `channel_mz`; #79's per-progenitor centers score
-  it at its true mass defect on the reference member's grid — **zero new likelihood code**. No
-  union grid (off-reference unique channels under-scored — documented v1 limit). Deterministic
-  per-component seed (e.g. min `target_id`). Assert byte-identical to current `estimate_panel` for
-  a 1-member component.
+- ✓ **PR-G** — `counter/component.py` `estimate_component(members, obs, rt_priors_ms=…)`: co-fits a
+  component as one `Panel`, reporting each member's N + Laplace CI. Members keep their own
+  `channel_mz`; #79's per-progenitor centers score each at its mass defect on `members[0]`'s grid —
+  **zero new likelihood code**. No union grid (off-reference channels under-scored — v1 limit). A
+  1-member component matches `estimate_panel` (no discovery loop). **Added:** same-grid co-eluting
+  members are *exchangeable* (one would absorb the whole blend), so each member's `μ` is anchored to
+  a `± mu_window_ms` **search bound** around its PSM RT (not the unsafe prior-polish); `fit_panel`
+  gained a `bounds` override for it. Verified: a 2e5/1e5 same-grid blend recovers both (≈2.5%/5%).
 - **PR-H** — CLI `_cmd_counter_estimate`: build index + components in the parent; `pool.map` over
   mixed work-items (singleton → today's worker unchanged; multi-member → component worker). Widen
   the worker return to also carry fitted `parameters_dict()` + `target_id` (for step 7's

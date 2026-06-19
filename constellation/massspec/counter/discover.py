@@ -247,12 +247,16 @@ def fit_panel(
     max_evals: int = 4000,
     max_iter: int = 100,
     lr: float = 0.05,
+    bounds: dict[str, tuple[float, float]] | None = None,
 ) -> Any:
     """MAP-fit the whole panel with a **fresh** optimizer (the clean reset after a
     candidate is added — never reuse an optimizer across a mutation). Reuses
-    `Panel.log_prob → panel_log_prob` via `Distribution.fit`. Bounds are the
-    per-progenitor `_default_bounds` namespaced to the panel (+ background)."""
-    bounds = _panel_bounds(panel, obs)
+    `Panel.log_prob → panel_log_prob` via `Distribution.fit`. Bounds default to the
+    per-progenitor `_default_bounds` namespaced to the panel (+ background); pass
+    `bounds` to override (e.g. component co-fit narrows each member's `peak.mu` to a
+    window around its PSM RT so co-eluting same-grid members stay distinguishable)."""
+    if bounds is None:
+        bounds = _panel_bounds(panel, obs)
     if optimizer == "de":
         # DE draws its population from the *global* torch RNG (its `seed` arg alone
         # leaves a residual dependence on the ambient RNG state). Pin the global RNG
