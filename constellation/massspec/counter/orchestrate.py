@@ -358,6 +358,15 @@ _SHAPE_PARAM_NAMES = (
     "peak.logit_eta",
 )
 
+# Peak-shape hyperprior param → its COUNTER_GLOBAL_CALIBRATION_TABLE column prefix
+# (`<prefix>_mean` / `<prefix>_std`). `prior_log_tau` is τ_r for back-compat.
+_SHAPE_PRIOR_COLUMNS = (
+    ("peak.log_sigma", "prior_log_sigma"),
+    ("peak.log_tau_r", "prior_log_tau"),
+    ("peak.log_tau_l", "prior_log_tau_l"),
+    ("peak.logit_eta", "prior_logit_eta"),
+)
+
 _STAGE_CONFIG = {
     # stage -> (thaw_global, thaw_peptide)
     "per_peptide": (False, True),
@@ -653,21 +662,21 @@ def calibration_to_table(
         "prior_log_sigma_std": None,
         "prior_log_tau_mean": None,
         "prior_log_tau_std": None,
+        "prior_log_tau_l_mean": None,
+        "prior_log_tau_l_std": None,
+        "prior_logit_eta_mean": None,
+        "prior_logit_eta_std": None,
     }
-    # Promoted peak-shape hyperprior (StagedCalibration): persist σ + τ_r (the
-    # schema's two shape slots; τ_l / η priors stay in-memory only).
+    # Promoted peak-shape hyperprior (StagedCalibration): persist ALL FOUR shape
+    # params (σ, τ_r, τ_l, η) so a prior-run warm-start round-trips the full
+    # hyperprior — step 7 re-broadcasts the calibration each round, and dropping
+    # τ_l / η (the pre-v2 behavior) silently corrupted the promoted prior.
     prior = cal.peak_shape_prior
     if prior:
-        if "peak.log_sigma" in prior:
-            row["prior_log_sigma_mean"], row["prior_log_sigma_std"] = (
-                float(prior["peak.log_sigma"][0]),
-                float(prior["peak.log_sigma"][1]),
-            )
-        if "peak.log_tau_r" in prior:
-            row["prior_log_tau_mean"], row["prior_log_tau_std"] = (
-                float(prior["peak.log_tau_r"][0]),
-                float(prior["peak.log_tau_r"][1]),
-            )
+        for leaf, col in _SHAPE_PRIOR_COLUMNS:
+            if leaf in prior:
+                row[f"{col}_mean"] = float(prior[leaf][0])
+                row[f"{col}_std"] = float(prior[leaf][1])
     return pa.table({k: [v] for k, v in row.items()}).cast(
         COUNTER_GLOBAL_CALIBRATION_TABLE
     )
@@ -707,18 +716,14 @@ def calibration_from_table(
             cal.log_alpha_z.copy_(
                 torch.tensor(list(row["alpha_z"]), dtype=dtype).clamp(min=1e-6).log()
             )
-    if row["prior_log_sigma_mean"] is not None:
-        prior: dict[str, tuple[float, float]] = {
-            "peak.log_sigma": (
-                float(row["prior_log_sigma_mean"]),
-                float(row["prior_log_sigma_std"]),
-            )
-        }
-        if row["prior_log_tau_mean"] is not None:
-            prior["peak.log_tau_r"] = (
-                float(row["prior_log_tau_mean"]),
-                float(row["prior_log_tau_std"]),
-            )
+    # Restore whichever shape-prior slots are present. `.get` tolerates a v1
+    # parquet (no τ_l / η columns) — those simply stay unset.
+    prior: dict[str, tuple[float, float]] = {}
+    for leaf, col in _SHAPE_PRIOR_COLUMNS:
+        mean, std = row.get(f"{col}_mean"), row.get(f"{col}_std")
+        if mean is not None and std is not None:
+            prior[leaf] = (float(mean), float(std))
+    if prior:
         cal.set_peak_shape_prior(prior)
     return cal
 
