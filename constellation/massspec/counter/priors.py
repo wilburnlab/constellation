@@ -29,19 +29,30 @@ def make_log_prior(
     *,
     rt_prior_ms: float | None = None,
     rt_sigma_ms: float = 5000.0,
+    n_total_center: float | None = None,
+    n_total_sigma: float = 2.0,
     isotope_offset_sigma: float | None = None,
     eta_center: float | None = None,
     eta_sigma: float = 1.0,
     shape_centers: dict[str, float] | None = None,
     shape_sigmas: dict[str, float] | None = None,
     mu_key: str = "peak.mu",
+    n_total_key: str = "peak.log_N_total",
     offset_key: str = "isotope_energy_offset",
     eta_key: str = "peak.logit_eta",
 ) -> LogPrior | None:
     """Compose the active prior terms into one `log_prior(params) → Tensor`, or
     return `None` if no term is active.
 
-    - `rt_prior_ms` → RT-seed Gaussian on `peak.mu` (σ = `rt_sigma_ms`).
+    - `rt_prior_ms` → RT-seed Gaussian on `peak.mu` (σ = `rt_sigma_ms`). For the
+      panel path pass the N-weighted-μ centroid; for a PSM pass its RT.
+    - `n_total_center` (not `None`, in **log space**) → Gaussian on
+      `peak.log_N_total` toward `n_total_center` (σ = `n_total_sigma`, log space).
+      This is the L6 `N_total → log(sum(N_guess))` bias: a *soft* anti-collapse /
+      anti-runaway regularizer (default σ = 2.0 ≈ a 7× band, so the likelihood
+      dominates wherever it is informative and it does NOT fight the discovery
+      loop's interference correction — it only matters when the likelihood is flat
+      at very low N). Pass the seed's integrated-count estimate as the center.
     - `isotope_offset_sigma` (not `None`) → toward-theoretical isotope-offset
       Gaussian (toward 0).
     - `eta_center` (not `None`) → Gaussian on the HyperEMG `logit_eta` toward
@@ -53,7 +64,12 @@ def make_log_prior(
       peak-shape hyperprior) → a Gaussian on each named log/logit shape param
       toward `mean` (σ from `shape_sigmas[name]`, default 1.0). This is how the
       promoted population shape distribution regularizes a per-peptide fit — the
-      principled replacement for a hard `τ`-bound / RT window."""
+      principled replacement for a hard `τ`-bound / RT window.
+
+    Keys (`mu_key`, `n_total_key`, …) are constructor args so a multi-progenitor
+    panel caller passes the namespaced names (`progenitors.{i}.peak.mu`). The
+    active terms index those keys directly, so a name that is absent raises (a
+    namespace typo is loud, not a silent no-op)."""
     terms: list[LogPrior] = []
 
     if shape_centers:
@@ -85,6 +101,14 @@ def make_log_prior(
             return -0.5 * ((params[mu_key] - mu0) / sig) ** 2
 
         terms.append(_rt)
+
+    if n_total_center is not None:
+        ln0, lns = float(n_total_center), float(n_total_sigma)
+
+        def _n_total(params: dict[str, torch.Tensor]) -> torch.Tensor:
+            return -0.5 * ((params[n_total_key] - ln0) / lns) ** 2
+
+        terms.append(_n_total)
 
     if isotope_offset_sigma is not None:
         sig = float(isotope_offset_sigma)

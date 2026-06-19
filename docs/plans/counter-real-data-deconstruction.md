@@ -249,10 +249,12 @@ is touched.
   3) is what preserves the raw contenders for the index.
 - **Per-ion logL is abundance-confounded** — selection must normalize (N-share + m/z fit),
   never raw magnitude.
-- **Re-extraction changes the observed-ion set between rounds** (a peak crosses tolerance),
-  so the censored mask shifts and N can move non-monotonically — the L7 loop needs explicit
-  convergence discipline (Δ-param tol + iteration cap), not naive fixed-point on N.
-- **Component fit cost/memory** for large dense overlap clusters is the open cost of D2.
+- **L7 convergence discipline.** The loop re-fits global params on fixed observations
+  (no re-extraction — see §9), so the observed-ion set is *stable* across rounds; but a
+  refined offset still moves N, so converge on Δ-global-param with a hard iteration cap, never
+  a naive fixed-point on N.
+- **Component fit cost/memory** for large dense overlap clusters is the open cost of D2 —
+  a mandatory size cap → singleton fallback keeps the pool from stalling on one mega-panel.
 
 ## 8. Open questions
 
@@ -263,3 +265,91 @@ is touched.
   [`profile-vs-centroid-research.md`](profile-vs-centroid-research.md).
 - Whether the per-iteration γ map (D7) should also drive a convergence diagnostic
   (attribution stability across rounds) in addition to Δ-global-param.
+
+## 9. Steps 5–7 — detailed sub-PR plan (decisions locked 2026-06-18)
+
+Decisions: **step 5** ships posterior-MAP-with-prior (VB-on-panel deferred to a later opt-in
+`inference='vb'`); **step 7** round-0 uses explicit `--calibrants` first (auto-selection a
+separate PR); and — the load-bearing simplification, per the PI — **step 7 does NOT
+re-extract.** The candidate↔peak *linkage* is fixed by the index binning; a refined global m/z
+offset enters at *scoring* time (`mz_center_ppm` already consumes `cal.mz_offset_ppm`), not
+extraction. So the loop re-fits parameters on the fixed, wide-extracted observations and
+`MS_PEAK_TABLE` never enters the loop contract. **Constraint:** the round-0 extraction window
++ the index bins (PR-D) must carry enough m/z margin (`all_in_window`, tolerance ≫ true error
++ plausible offset) that an offset refinement never moves a peak across a candidate boundary.
+
+### Ship order (10 sub-PRs, 3 phases)
+
+**Status (2026-06-18):** PR-A + PR-B **shipped** as "step 5 foundations". A key finding
+re-scoped step 5: a **post-DE gradient polish to apply the prior to the panel POINT estimate
+is unsafe** on the same-grid-blend surface — Adam drifts off DE's basin along the flat
+target↔interferer N-split direction (a 2× over-count in testing), unbounded L-BFGS escapes to a
+NaN η/τ region, and bounded L-BFGS collapses the target to the N=1 bound. So **the "MAP-with-prior
+via polish" path (decision-1 approach A) does not work**; the prior-bearing panel POINT estimate
+moves to the **VB-on-panel** PR (it optimizes the ELBO globally with the η-taming priors already in
+place — the right tool, and the reason the single-progenitor path is VB). PR-B's `N_total` term is
+therefore wired into the **single-progenitor `estimate_n` VB path** (opt-in `n_total_prior=False`,
+the safe home: no blend to contaminate the seed center, no post-hoc polish). PR-F below is
+superseded by VB-on-panel.
+
+**Phase 1 — foundations (independent, low-risk, parallelizable):**
+- **PR-A** — `seed_peak_from_observation` weights the μ-centroid by `recovered_count` (not raw
+  intensity); the N-weighted-μ fix in isolation. Improves every caller (`estimate_n` +
+  `StagedCalibration`). Tests: constant-IIT no-regression + varying-IIT divergence.
+- **PR-B** — `make_log_prior` gains an `N_total → log(sum(N_guess))` Gaussian + an `n_total_key`
+  arg (parameterized like `mu_key`, so a panel caller passes `progenitors.{i}.peak.log_N_total`).
+  Pure additive; returns `None` when inactive. The bare-key-vs-panel-namespace mismatch is the
+  #1 silent-no-op dragon — test the namespaced key resolves.
+- **PR-C** — **D8**: `calibration_to_table` round-trips all four shape-prior slots (`log_tau_l`
+  + `logit_eta` are dropped today); schema v1→v2 with a back-compat read. Lands before step 7
+  makes calibration round-tripping load-bearing.
+- **PR-D** — `counter/candidates.py` `TheoreticalCandidateIndex`: peptide list → mass-sorted
+  `(target_id, charge, isotope, m/z)` via `peptide_envelope` (same `mode='binned'`/`n_isotopes`
+  the fit uses). Bins carry offset margin (above). Named precursor-scoped but not precursor-*only*
+  (MS2 analogue later).
+
+**Phase 2 — step 5 deliverable + step 6 components:**
+- **PR-E** — channel-overlap connected components (union-find over collision edges from a
+  mass-sorted sweep). Reuse `search/collision.py`'s `_connected_components` core (id-generic) but
+  **keep-and-attribute**, not its drop semantics. `collide_ppm` static with a calibration-aware
+  kwarg *hook* (unwired) so step 7 can opt into loose-then-tight later.
+- **PR-F** — ~~posterior-MAP gradient polish on the panel path~~ **SUPERSEDED** (see Status above):
+  a post-DE polish is unsafe on the same-grid-blend surface (Adam drifts, unbounded L-BFGS NaNs,
+  bounded L-BFGS collapses). The panel prior-bearing POINT estimate moves to VB-on-panel. The
+  `laplace_cov` already accepts a `log_prior`; wiring it stays a clean follow-up once a *consistent*
+  posterior mode exists (i.e. under VB). Step-5 foundations (PR-A + PR-B) shipped instead.
+- **PR-G** — `counter/component.py` component co-fit (near-isobaric blend, approach B): each member
+  added via `Panel.add_progenitor` keeps its own `channel_mz`; #79's per-progenitor centers score
+  it at its true mass defect on the reference member's grid — **zero new likelihood code**. No
+  union grid (off-reference unique channels under-scored — documented v1 limit). Deterministic
+  per-component seed (e.g. min `target_id`). Assert byte-identical to current `estimate_panel` for
+  a 1-member component.
+- **PR-H** — CLI `_cmd_counter_estimate`: build index + components in the parent; `pool.map` over
+  mixed work-items (singleton → today's worker unchanged; multi-member → component worker). Widen
+  the worker return to also carry fitted `parameters_dict()` + `target_id` (for step 7's
+  `StagedCalibration` rebuild). Wire `emit.panel_attribution_table` into the bundle at iteration 0
+  (the deferred step-3 follow-up; a hard prereq for step-7 reconciliation). **Mandatory**
+  `--collide-ppm` + component-size cap → singleton fallback + WARN (mega-component pool-stall
+  guard). Seed per component deterministically (preserve #79's order-independent determinism).
+
+**Phase 3 — step 7 (no re-extraction):**
+- **PR-I** — `counter/run.py` + `massspec counter run`, calibrant-anchored: loop over the explicit
+  calibrant set = {`StagedCalibration` re-fit globals on the calibrant panels} ↔ {re-broadcast a
+  **fresh frozen** calibration parquet} ↔ {re-fit calibrant panels} until Δ-global-param < tol (+
+  hard `max_rounds`). Then a single final parallel all-targets estimate (PR-H) under the converged
+  calibration. **No trace re-extraction.** Re-broadcast keeps the live mutated calibration off the
+  process boundary (#79). Convergence on Δ-global-param, never a fixed-point on N.
+- **PR-J** — `counter/select.py` auto-selection of high-scoring progenitors: rank by N-share
+  (`N_target/N_panel`) **and** a normalized m/z-fit score (median `|mz_error|/σ` from
+  `panel_cell_log_prob`), the abundance-de-confounded criterion — **never raw logL**. Selection
+  scalars extracted under `@torch.no_grad` (never in the DE objective). Cross-panel γ reconciliation
+  = Arrow `group_by` on the attribution `peak_id`. Default when `--calibrants` omitted. Riskiest /
+  untuned — **hand-labeled clean/blend/interfered fixtures first** (per
+  [[feedback-synthetic-test-fixtures]]); the test must include a bright *interfered* peptide that
+  raw-logL would wrongly select, asserting it is rejected.
+
+### Cross-cutting
+- **Fixture strategy** (per the synthetic-fixture practice): hand-curate clean/blend/interfered
+  cases *before* the PR-J selector, not after.
+- **Identity back-match:** a component interferer's panel-local `progenitor_index` → real peptide
+  identity is a step-6/7 follow-up (the attribution table should carry enough to resolve it later).
