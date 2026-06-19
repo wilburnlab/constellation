@@ -14,6 +14,10 @@ self-registered with `core.io.schemas`):
                                    power-law α_mz / ν_mz, resolution).
     COUNTER_PEPTIDE_PARAMS         the persisted per-peptide tier — charge
                                    free-energies, ν_I, per-isotope c_mz.
+    COUNTER_PEAK_ATTRIBUTION       the sparse ion→progenitor soft-attribution
+                                   map — one row per (observed peak, claiming
+                                   progenitor), the foundation for "what's left"
+                                   after targets are searched.
 
 Units (the ms convention — see the model docstrings): `n_total` in ions,
 `d_mz` in Da, `mz_offset`/m/z errors in ppm, peak σ/τ in seconds.
@@ -28,6 +32,7 @@ from constellation.core.io.schemas import register_schema
 COUNTER_N_SCHEMA_VERSION: int = 1
 COUNTER_CALIBRATION_SCHEMA_VERSION: int = 1
 COUNTER_PEPTIDE_PARAMS_SCHEMA_VERSION: int = 1
+COUNTER_PEAK_ATTRIBUTION_SCHEMA_VERSION: int = 1
 
 
 COUNTER_N_TABLE: pa.Schema = pa.schema(
@@ -119,16 +124,53 @@ COUNTER_PEPTIDE_PARAMS_TABLE: pa.Schema = pa.schema(
 )
 
 
+COUNTER_PEAK_ATTRIBUTION_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("acquisition_id", pa.int64(), nullable=False),
+        pa.field("target_id", pa.int64(), nullable=False),
+        # Panel-local progenitor index (0 = the target; ≥1 = a discovered
+        # interferer; -1 = unattributed residual — an observed peak no progenitor
+        # owns at ≥ weight_floor, the "what's left" signal) + a convenience flag. A
+        # discovered interferer has no peptide identity yet (same-grid clone), so
+        # `progenitor_index` is the stable key within one panel fit.
+        pa.field("progenitor_index", pa.int32(), nullable=False),
+        pa.field("is_target", pa.bool_(), nullable=False),
+        # Source XIC_TRACE row id of the attributed peak (-1 if the observation
+        # carried no raw-peak identity, e.g. simulated). The join key for the
+        # "what's left" anti-join against the full peak set.
+        pa.field("peak_id", pa.int64(), nullable=False),
+        pa.field("channel_z", pa.int8(), nullable=False),
+        pa.field("channel_isotope", pa.int8(), nullable=False),
+        # γ_q ∈ (0, 1]: this progenitor's soft (intensity-weighted) share of the
+        # peak. A peak interfered by several species has >1 row, Σ γ over its rows
+        # = the modeled species' share (background excluded).
+        pa.field("responsibility", pa.float64(), nullable=False),
+        # Recovered ion count N_obs = I·τ/α at the cell (shared across a cell's
+        # rows; the per-progenitor share is responsibility × this).
+        pa.field("n_obs_count", pa.float64(), nullable=False),
+        # Refinement round the attribution was recorded at (track γ migration).
+        pa.field("iteration", pa.int32(), nullable=False),
+    ],
+    metadata={
+        b"schema_name": b"CounterPeakAttribution",
+        b"schema_version": str(COUNTER_PEAK_ATTRIBUTION_SCHEMA_VERSION).encode("utf-8"),
+    },
+)
+
+
 register_schema("CounterN", COUNTER_N_TABLE)
 register_schema("CounterGlobalCalibration", COUNTER_GLOBAL_CALIBRATION_TABLE)
 register_schema("CounterPeptideParams", COUNTER_PEPTIDE_PARAMS_TABLE)
+register_schema("CounterPeakAttribution", COUNTER_PEAK_ATTRIBUTION_TABLE)
 
 
 __all__ = [
     "COUNTER_N_TABLE",
     "COUNTER_GLOBAL_CALIBRATION_TABLE",
     "COUNTER_PEPTIDE_PARAMS_TABLE",
+    "COUNTER_PEAK_ATTRIBUTION_TABLE",
     "COUNTER_N_SCHEMA_VERSION",
     "COUNTER_CALIBRATION_SCHEMA_VERSION",
     "COUNTER_PEPTIDE_PARAMS_SCHEMA_VERSION",
+    "COUNTER_PEAK_ATTRIBUTION_SCHEMA_VERSION",
 ]

@@ -24,15 +24,18 @@ __all__ = ["CounterResult", "save_counter", "load_counter"]
 @dataclass(frozen=True)
 class CounterResult:
     """Counter output bundle. `counter_n` is the deliverable; the calibration
-    and per-peptide-params tables capture the fitted model state."""
+    and per-peptide-params tables capture the fitted model state;
+    `peak_attribution` is the optional sparse ion→progenitor soft-attribution map
+    (`COUNTER_PEAK_ATTRIBUTION_TABLE`) — the "what's left" foundation."""
 
     counter_n: pa.Table
     global_calibration: pa.Table | None = None
     peptide_params: pa.Table | None = None
+    peak_attribution: pa.Table | None = None
     metadata_extras: dict[str, Any] = field(default_factory=dict)
 
 
-_OPTIONAL = ("global_calibration", "peptide_params")
+_OPTIONAL = ("global_calibration", "peptide_params", "peak_attribution")
 
 
 def save_counter(result: CounterResult, path: str | Path) -> None:
@@ -69,5 +72,6 @@ def load_counter(path: str | Path) -> CounterResult:
         counter_n=counter_n,
         global_calibration=optional["global_calibration"],
         peptide_params=optional["peptide_params"],
+        peak_attribution=optional["peak_attribution"],
         metadata_extras=dict(manifest.get("metadata", {})),
     )

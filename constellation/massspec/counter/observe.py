@@ -106,9 +106,19 @@ def observation_from_trace(
     intensity = torch.zeros((n_scans, n_chan), dtype=dtype)
     mz_error = torch.zeros((n_scans, n_chan), dtype=dtype)
     mask = torch.zeros((n_scans, n_chan), dtype=torch.bool)
+    # Source-row id per filled cell (-1 elsewhere): the input `trace`'s own row
+    # index, so a fitted panel's soft attribution maps back to raw peaks. Stamped
+    # BEFORE any filtering so the id survives the target/level subset.
+    peak_id = torch.full((n_scans, n_chan), -1, dtype=torch.long)
 
     # -- filter + scatter the trace -----------------------------------------
+    # Stamp a fresh row index over the UNFILTERED trace (dropping any stale internal
+    # column of the same name) so peak_id is always the input trace's own row, never
+    # a value a caller happened to carry in.
     t = trace
+    if "__source_row" in t.column_names:
+        t = t.drop_columns(["__source_row"])
+    t = t.append_column("__source_row", pa.array(np.arange(t.num_rows, dtype=np.int64)))
     if target_id is not None and "target_id" in t.column_names:
         t = t.filter(pc.equal(t.column("target_id"), target_id))
     if level is not None and "level" in t.column_names:
@@ -120,6 +130,7 @@ def observation_from_trace(
         iso = t.column("isotope").to_numpy(zero_copy_only=False).astype(np.int64)
         inten = t.column("intensity").to_numpy(zero_copy_only=False).astype("float64")
         merr = t.column("mz_error_ppm").to_numpy(zero_copy_only=False).astype("float64")
+        src = t.column("__source_row").to_numpy(zero_copy_only=False).astype(np.int64)
 
         # scan → row index (only rows whose scan is in the window)
         s_idx = np.searchsorted(sm_scan, scan)
@@ -133,17 +144,18 @@ def observation_from_trace(
         valid = in_range & (c_idx >= 0) & np.isfinite(inten) & (inten > intensity_floor)
         if valid.any():
             flat = s_idx[valid] * n_chan + c_idx[valid]
-            iv, ev = inten[valid], merr[valid]
+            iv, ev, sv = inten[valid], merr[valid], src[valid]
             # de-duplicate (scan, channel): keep the most intense peak. Sort by
             # (flat, intensity asc) so the last row of each flat group is the max.
             srt = np.lexsort((iv, flat))
-            flat_s, iv_s, ev_s = flat[srt], iv[srt], ev[srt]
+            flat_s, iv_s, ev_s, sv_s = flat[srt], iv[srt], ev[srt], sv[srt]
             last = np.ones(flat_s.shape[0], dtype=bool)
             last[:-1] = flat_s[1:] != flat_s[:-1]
             fk = torch.as_tensor(flat_s[last], dtype=torch.long)
             intensity.view(-1)[fk] = torch.as_tensor(iv_s[last], dtype=dtype)
             mz_error.view(-1)[fk] = torch.as_tensor(ev_s[last], dtype=dtype)
             mask.view(-1)[fk] = True
+            peak_id.view(-1)[fk] = torch.as_tensor(sv_s[last], dtype=torch.long)
 
     return CounterObservation(
         rt=rt,
@@ -154,6 +166,7 @@ def observation_from_trace(
         channel_z=cz,
         channel_isotope=ck,
         channel_mz=channel_mz.to(dtype),
+        peak_id=peak_id,
     )
 
 
