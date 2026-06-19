@@ -34,6 +34,7 @@ from constellation.core.stats.peaks import HyperEMGPeak
 from constellation.massspec.peptide.envelope import EnvelopeMode, peptide_envelope
 
 from .calibration import GlobalCalibration
+from .iit import accumulated_count
 
 __all__ = ["CounterObservation", "Progenitor"]
 
@@ -56,6 +57,11 @@ class CounterObservation:
     channel_z: torch.Tensor  # (C,) charge (long)
     channel_isotope: torch.Tensor  # (C,) isotope index (long)
     channel_mz: torch.Tensor  # (C,) theoretical m/z (float, Th)
+    # Source XIC_TRACE row id per filled `(scan, channel)` cell (-1 elsewhere),
+    # so a fitted panel's soft attribution can be mapped back to raw peaks
+    # ("what's left" after targets are searched). Optional — None for simulated /
+    # legacy observations that carry no raw-peak identity.
+    peak_id: torch.Tensor | None = None  # (S, C) long
 
     @property
     def n_scans(self) -> int:
@@ -64,6 +70,21 @@ class CounterObservation:
     @property
     def n_channels(self) -> int:
         return int(self.channel_z.shape[0])
+
+    def recovered_count(self, calibration: GlobalCalibration) -> torch.Tensor:
+        """Per-channel recovered ion count `N_obs = I·τ/α(z)` `(S, C)` on observed
+        cells, 0 on non-detections — the per-ion count substrate for logL-based ion
+        selection (L4) and N-weighted seeding (L6). Uses the canonical
+        `iit.accumulated_count` (`I·τ/α`); a *derived projection* given a
+        calibration, so the observation itself stays raw (the count is not stored).
+
+        The count is floored at `accumulated_count`'s `1e-9` (so it can safely feed
+        `log` / `N^{−α_mz}` terms); below that floor it diverges from the likelihood's
+        unclamped `n_obs` in `panel_log_prob` — irrelevant at real ion counts (≫1),
+        but do not treat the two as identical at the sub-1e-9 boundary."""
+        gain_ch = calibration.gain(self.channel_z.to(self.intensity.dtype))  # (C,)
+        count = accumulated_count(self.intensity, self.iit[:, None], gain_ch[None, :])
+        return torch.where(self.mask, count, torch.zeros_like(count))
 
 
 def _channel_grid(

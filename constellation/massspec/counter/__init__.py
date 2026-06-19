@@ -48,12 +48,14 @@ from .orchestrate import (
     peptide_params_to_table,
     seed_peak_from_observation,
 )
-from .panel import Panel, panel_log_prob
+from .panel import Panel, PanelCellTerms, panel_cell_log_prob, panel_log_prob
 from .priors import make_log_prior
 from .residual import panel_predicted_intensity, panel_residual
+from .emit import panel_attribution_table
 from .schemas import (
     COUNTER_GLOBAL_CALIBRATION_TABLE,
     COUNTER_N_TABLE,
+    COUNTER_PEAK_ATTRIBUTION_TABLE,
     COUNTER_PEPTIDE_PARAMS_TABLE,
 )
 from .simulate import (
@@ -70,6 +72,8 @@ __all__ = [
     "GlobalCalibration",
     "AlphaModel",
     "panel_log_prob",
+    "panel_cell_log_prob",
+    "PanelCellTerms",
     "accumulated_count",
     "make_log_prior",
     # simulate + estimate
@@ -95,6 +99,7 @@ __all__ = [
     "calibration_to_table",
     "calibration_from_table",
     "peptide_params_to_table",
+    "panel_attribution_table",
     # io + schemas
     "CounterResult",
     "save_counter",
@@ -102,4 +107,5 @@ __all__ = [
     "COUNTER_N_TABLE",
     "COUNTER_GLOBAL_CALIBRATION_TABLE",
     "COUNTER_PEPTIDE_PARAMS_TABLE",
+    "COUNTER_PEAK_ATTRIBUTION_TABLE",
 ]

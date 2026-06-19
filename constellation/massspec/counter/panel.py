@@ -34,7 +34,7 @@ new candidates is deferred. The likelihood combines:
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import NamedTuple, Sequence
 
 import torch
 from torch import nn
@@ -46,33 +46,64 @@ from .attribution import mz_mixture_log_prob, responsibilities
 from .calibration import GlobalCalibration
 from .model import CounterObservation, Progenitor
 
-__all__ = ["Panel", "panel_log_prob"]
+__all__ = ["Panel", "panel_log_prob", "panel_cell_log_prob", "PanelCellTerms"]
 
 _DEFAULT_FLOOR_IONS = 1.0
 
 
-def panel_log_prob(
+class PanelCellTerms(NamedTuple):
+    """Per-cell decomposition of the panel likelihood — the unreduced `(S, C)`
+    pieces `panel_log_prob` sums to a scalar.
+
+    The four additive likelihood terms are dense `(S, C)` log-densities; the soft
+    attribution and its inputs are `(Q, S, C)`. Per-ion scores (L3), logL-based
+    ion selection (L4), and the ion→progenitor attribution map (L8) all read
+    these. `observed` / `censored` are the *effective* per-cell masks after any
+    exclusion (`exclude_mask` / `gamma_loss_threshold`): excluded cells appear in
+    neither, so they are still *inferred* (predicted) but do not contribute to the
+    loss. A NamedTuple (hence a vmap-safe pytree) so it can flow through the DE
+    population path unchanged.
+    """
+
+    intensity: torch.Tensor  # (S, C) Poisson-PMF log-density (observed cells)
+    mz: torch.Tensor  # (S, C) soft-γ mixture-marginal m/z log-density
+    censored: torch.Tensor  # (S, C) non-detection tail log-prob
+    jacobian: torch.Tensor  # (S, C) log(τ/α) change-of-variables
+    gamma: torch.Tensor  # (Q, S, C) responsibilities, Σ_q γ_q = 1
+    component_mz: torch.Tensor  # (Q, S, C) per-progenitor m/z log-density (pre-mixture)
+    n_count: torch.Tensor  # (Q, S, C) per-progenitor latent count
+    i_pred: torch.Tensor  # (Q, S, C) per-progenitor predicted intensity
+    observed: torch.Tensor  # (S, C) bool — cells scored by intensity + mz + jac
+    censored_mask: torch.Tensor  # (S, C) bool — cells scored by the censored tail
+
+
+def _panel_terms(
     progenitors: Sequence[Progenitor],
     obs: CounterObservation,
     calibration: GlobalCalibration,
     *,
     background_intensity: torch.Tensor | float = 0.0,
     floor_ions: float = _DEFAULT_FLOOR_IONS,
-) -> torch.Tensor:
-    """Total additive joint log-likelihood (0-d tensor) for a panel.
-
-    `progenitors` share `obs`'s channel grid. The latent per-channel rate is
-    the additive sum of progenitor counts (+ background as a count rate); the
-    observed-channel intensity is scored count-natively (detection-conditioned
-    Poisson), so there is no per-charge total / `(1-p)` variance to assemble.
-    vmap-safe: only broadcasting ops + `torch.where` over a static progenitor
-    list."""
+    exclude_mask: torch.Tensor | None = None,
+    gamma_loss_threshold: float | None = None,
+) -> PanelCellTerms:
+    """Compute every per-cell likelihood piece (no scan/channel reduction). The
+    single source of truth for both `panel_log_prob` (the scalar) and
+    `panel_cell_log_prob` (the structured per-cell view). vmap-safe: only
+    broadcasting ops + `torch.where` over a static progenitor list."""
     iit = obs.iit  # (S,)
 
-    # Per-progenitor predictions + m/z scales.
+    # Per-progenitor predictions, m/z scales, and per-progenitor m/z centers. The
+    # center is a GENERAL (observed, expected) quantity: each candidate is scored
+    # at ITS OWN theoretical m/z relative to the observed grid (mz_center_ppm's
+    # reference_mz = obs.channel_mz), so a near-isobaric blend resolves by the
+    # candidates' distinct mass defects. For the species that defines the grid
+    # (the target, and same-grid clones) the theoretical Δ is 0, so the center is
+    # exactly the single-species center — backward-compatible.
     i_preds: list[torch.Tensor] = []
     n_counts: list[torch.Tensor] = []
     mz_scales: list[torch.Tensor] = []
+    centers: list[torch.Tensor] = []
     for q in progenitors:
         i_pred_q, n_count_q = q.predict(obs)
         i_preds.append(i_pred_q)
@@ -82,6 +113,14 @@ def panel_log_prob(
             c_mz_ch[None, :] / n_count_q.clamp(min=1.0) ** calibration.alpha_mz
         ).clamp(min=1e-12).sqrt()
         mz_scales.append(scale_q)
+        centers.append(
+            calibration.mz_center_ppm(
+                q.channel_mz,
+                q.channel_z.to(iit.dtype),
+                q.channel_isotope,
+                reference_mz=obs.channel_mz,
+            )
+        )
 
     i_pred_stack = torch.stack(i_preds, dim=0)  # (Q, S, C) -- m/z responsibilities
     n_count_stack = torch.stack(n_counts, dim=0)  # (Q, S, C)
@@ -100,33 +139,26 @@ def panel_log_prob(
     # complete left-censored-Poisson likelihood (no detection normalizer here).
     n_obs = obs.intensity * iit[:, None] / gain_ch[None, :]  # (S, C)
     int_lp = ch.poisson_count_log_prob(n_obs, n_count_total)
-    zeros = torch.zeros_like(int_lp)
-    int_term = torch.where(obs.mask, int_lp, zeros).sum()
 
     # m/z term (observed channels): soft-gamma mixture marginal. The intensity
     # responsibilities are equivalent whether built from i_pred or n_count (they
     # differ only by the per-channel constant alpha/tau, which cancels).
-    center = calibration.mz_center_ppm(
-        obs.channel_mz, obs.channel_z.to(iit.dtype), obs.channel_isotope
-    )  # (C,)
     gamma = responsibilities(i_pred_stack)  # (Q, S, C)
     component_lp = torch.stack(
         [
             ch.student_t_log_prob(
-                obs.mz_error, center[None, :], mz_scales[q], calibration.nu_mz
+                obs.mz_error, centers[q][None, :], mz_scales[q], calibration.nu_mz
             )
             for q in range(len(progenitors))
         ],
         dim=0,
     )  # (Q, S, C)
     mz_lp = mz_mixture_log_prob(gamma, component_lp)  # (S, C)
-    mz_term = torch.where(obs.mask, mz_lp, zeros).sum()
 
     # Censored term (unobserved channels): Poisson non-detection tail
     # P(count < floor) -- the complement that completes the left-censored
     # Poisson likelihood over the same floor.
     cens_lp = ch.censored_log_prob(n_count_total, floor_ions)  # (S, C)
-    cens_term = torch.where(obs.mask, zeros, cens_lp).sum()
 
     # Change-of-variables Jacobian: the DATA are intensities I, but the
     # observed-channel term scores the recovered count N_obs = I*tau/alpha, so
@@ -139,8 +171,96 @@ def panel_log_prob(
     # vs Mean ~ alpha * N) identifies alpha. (mz_error, in ppm, carries no
     # alpha-dependent Jacobian.)
     log_jac = torch.log(iit[:, None]) - torch.log(gain_ch[None, :])  # (S, C)
-    jac_term = torch.where(obs.mask, log_jac, zeros).sum()
 
+    # Effective per-cell masks. A cell can be excluded from the loss (but still
+    # inferred) by an explicit per-cell `exclude_mask` (L4 outlier/blend hold-out)
+    # and/or a γ-purity threshold (D9 benchmark: drop observed cells no single
+    # progenitor owns at γ ≥ threshold). Default (neither set) → observed = mask,
+    # censored = ~mask, i.e. exactly the pre-refactor likelihood.
+    if exclude_mask is not None:
+        ex = exclude_mask.to(torch.bool)
+    else:
+        ex = torch.zeros_like(obs.mask)
+    if gamma_loss_threshold is not None:
+        ex = ex | ((gamma.amax(dim=0) < gamma_loss_threshold) & obs.mask)
+    observed = obs.mask & ~ex
+    censored_mask = (~obs.mask) & ~ex
+
+    return PanelCellTerms(
+        intensity=int_lp,
+        mz=mz_lp,
+        censored=cens_lp,
+        jacobian=log_jac,
+        gamma=gamma,
+        component_mz=component_lp,
+        n_count=n_count_stack,
+        i_pred=i_pred_stack,
+        observed=observed,
+        censored_mask=censored_mask,
+    )
+
+
+def panel_cell_log_prob(
+    progenitors: Sequence[Progenitor],
+    obs: CounterObservation,
+    calibration: GlobalCalibration,
+    *,
+    background_intensity: torch.Tensor | float = 0.0,
+    floor_ions: float = _DEFAULT_FLOOR_IONS,
+    exclude_mask: torch.Tensor | None = None,
+    gamma_loss_threshold: float | None = None,
+) -> PanelCellTerms:
+    """Per-cell decomposition of the panel likelihood (see `PanelCellTerms`).
+
+    The same physics as `panel_log_prob` without the final scan/channel reduction
+    — so callers can extract per-ion scores (sum a term over scans within a
+    channel), select/exclude ions by their fit (L4), or read the soft `gamma`
+    attribution that links each observed cell to its progenitor(s) (L8)."""
+    return _panel_terms(
+        progenitors,
+        obs,
+        calibration,
+        background_intensity=background_intensity,
+        floor_ions=floor_ions,
+        exclude_mask=exclude_mask,
+        gamma_loss_threshold=gamma_loss_threshold,
+    )
+
+
+def panel_log_prob(
+    progenitors: Sequence[Progenitor],
+    obs: CounterObservation,
+    calibration: GlobalCalibration,
+    *,
+    background_intensity: torch.Tensor | float = 0.0,
+    floor_ions: float = _DEFAULT_FLOOR_IONS,
+    exclude_mask: torch.Tensor | None = None,
+    gamma_loss_threshold: float | None = None,
+) -> torch.Tensor:
+    """Total additive joint log-likelihood (0-d tensor) for a panel.
+
+    `progenitors` share `obs`'s channel grid. The latent per-channel rate is
+    the additive sum of progenitor counts (+ background as a count rate); the
+    observed-channel intensity is scored count-natively (detection-conditioned
+    Poisson), so there is no per-charge total / `(1-p)` variance to assemble.
+    vmap-safe: only broadcasting ops + `torch.where` over a static progenitor
+    list. With no exclusion set this is byte-identical to the pre-decomposition
+    likelihood; `exclude_mask` / `gamma_loss_threshold` drop the named cells from
+    the loss (still inferred) — see `PanelCellTerms`."""
+    t = _panel_terms(
+        progenitors,
+        obs,
+        calibration,
+        background_intensity=background_intensity,
+        floor_ions=floor_ions,
+        exclude_mask=exclude_mask,
+        gamma_loss_threshold=gamma_loss_threshold,
+    )
+    zeros = torch.zeros_like(t.intensity)
+    int_term = torch.where(t.observed, t.intensity, zeros).sum()
+    mz_term = torch.where(t.observed, t.mz, zeros).sum()
+    cens_term = torch.where(t.censored_mask, t.censored, zeros).sum()
+    jac_term = torch.where(t.observed, t.jacobian, zeros).sum()
     return int_term + mz_term + cens_term + jac_term
 
 
@@ -165,6 +285,8 @@ class Panel(Distribution):
         background: bool = False,
         floor_ions: float = _DEFAULT_FLOOR_IONS,
         background_init: float = 1e-3,
+        exclude_mask: torch.Tensor | None = None,
+        gamma_loss_threshold: float | None = None,
         dtype: torch.dtype = torch.float64,
     ) -> None:
         super().__init__()
@@ -173,6 +295,14 @@ class Panel(Distribution):
         self.progenitors = nn.ModuleList(progenitors)
         self._calibration_ref = (calibration,)  # by reference — frozen during fits
         self.floor_ions = float(floor_ions)
+        # Loss exclusion (still inferred): a per-(scan, channel) `exclude_mask`
+        # (L4 outlier/blend hold-out, matched to the obs this panel scores) and/or
+        # a `gamma_loss_threshold` (D9 benchmark — drop observed cells no single
+        # progenitor owns at γ ≥ threshold). Both default off → unchanged loss.
+        self.exclude_mask = exclude_mask
+        self.gamma_loss_threshold = (
+            None if gamma_loss_threshold is None else float(gamma_loss_threshold)
+        )
         if background:
             self.log_background = nn.Parameter(
                 torch.tensor(float(background_init), dtype=dtype).log()
@@ -226,6 +356,22 @@ class Panel(Distribution):
             self.calibration,
             background_intensity=self.background_intensity(),
             floor_ions=self.floor_ions,
+            exclude_mask=self.exclude_mask,
+            gamma_loss_threshold=self.gamma_loss_threshold,
+        )
+
+    def cell_terms(self, obs: CounterObservation) -> "PanelCellTerms":
+        """The per-cell likelihood decomposition for this panel (see
+        `PanelCellTerms` / `panel_cell_log_prob`) — the substrate for per-ion
+        scores, ion selection, and the soft attribution map."""
+        return panel_cell_log_prob(
+            list(self.progenitors),
+            obs,
+            self.calibration,
+            background_intensity=self.background_intensity(),
+            floor_ions=self.floor_ions,
+            exclude_mask=self.exclude_mask,
+            gamma_loss_threshold=self.gamma_loss_threshold,
         )
 
     def cdf(self, x: torch.Tensor) -> torch.Tensor:
