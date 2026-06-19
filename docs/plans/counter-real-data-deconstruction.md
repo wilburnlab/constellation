@@ -280,7 +280,9 @@ extraction. So the loop re-fits parameters on the fixed, wide-extracted observat
 
 ### Ship order (10 sub-PRs, 3 phases)
 
-**Status (2026-06-18):** PR-A + PR-B **shipped** as "step 5 foundations". A key finding
+**Status:** PR-A + PR-B **shipped** (PR #80, "step 5 foundations"); PR-C + PR-D **shipped**
+(the calibration 4-slot round-trip + the theoretical candidate index — independent foundations
+for steps 6/7). A key finding (2026-06-18)
 re-scoped step 5: a **post-DE gradient polish to apply the prior to the panel POINT estimate
 is unsafe** on the same-grid-blend surface — Adam drifts off DE's basin along the flat
 target↔interferer N-split direction (a 2× over-count in testing), unbounded L-BFGS escapes to a
@@ -300,13 +302,14 @@ superseded by VB-on-panel.
   arg (parameterized like `mu_key`, so a panel caller passes `progenitors.{i}.peak.log_N_total`).
   Pure additive; returns `None` when inactive. The bare-key-vs-panel-namespace mismatch is the
   #1 silent-no-op dragon — test the namespaced key resolves.
-- **PR-C** — **D8**: `calibration_to_table` round-trips all four shape-prior slots (`log_tau_l`
-  + `logit_eta` are dropped today); schema v1→v2 with a back-compat read. Lands before step 7
-  makes calibration round-tripping load-bearing.
-- **PR-D** — `counter/candidates.py` `TheoreticalCandidateIndex`: peptide list → mass-sorted
+- ✓ **PR-C** — **D8**: `calibration_to_table` round-trips all four shape-prior slots (`log_tau_l`
+  + `logit_eta` were dropped); schema v1→v2 with a `.get` back-compat read (v1 parquet still loads).
+- ✓ **PR-D** — `counter/candidates.py` `TheoreticalCandidateIndex`: peptide list → mass-sorted
   `(target_id, charge, isotope, m/z)` via `peptide_envelope` (same `mode='binned'`/`n_isotopes`
-  the fit uses). Bins carry offset margin (above). Named precursor-scoped but not precursor-*only*
-  (MS2 analogue later).
+  the fit uses — verified index m/z == `Progenitor.for_peptide` channel grid). `candidates(mz,
+  tolerance_ppm)` binary-search query; tolerance ≫ true-error + offset → linkage stable under
+  calibration refinement. Precursor-scoped but not precursor-*only* (MS2 analogue later). The
+  channel-overlap connected components (PR-E) build on it next.
 
 **Phase 2 — step 5 deliverable + step 6 components:**
 - **PR-E** — channel-overlap connected components (union-find over collision edges from a

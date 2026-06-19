@@ -30,7 +30,10 @@ import pyarrow as pa
 from constellation.core.io.schemas import register_schema
 
 COUNTER_N_SCHEMA_VERSION: int = 1
-COUNTER_CALIBRATION_SCHEMA_VERSION: int = 1
+# v2: the promoted peak-shape hyperprior round-trips all FOUR shape params
+# (added log_tau_l + logit_eta; v1 carried only log_sigma + log_tau_r). v1 parquet
+# still loads — `calibration_from_table` reads the new slots with `.get`.
+COUNTER_CALIBRATION_SCHEMA_VERSION: int = 2
 COUNTER_PEPTIDE_PARAMS_SCHEMA_VERSION: int = 1
 COUNTER_PEAK_ATTRIBUTION_SCHEMA_VERSION: int = 1
 
@@ -89,10 +92,15 @@ COUNTER_GLOBAL_CALIBRATION_TABLE: pa.Schema = pa.schema(
         pa.field("r_ref", pa.float64(), nullable=True),
         pa.field("mz_ref", pa.float64(), nullable=True),
         # Promoted peak-shape hyperpriors (stage-3 calibration; nullable until set).
+        # All four HyperEMG shape params round-trip (v2): `prior_log_tau` is τ_r.
         pa.field("prior_log_sigma_mean", pa.float64(), nullable=True),
         pa.field("prior_log_sigma_std", pa.float64(), nullable=True),
-        pa.field("prior_log_tau_mean", pa.float64(), nullable=True),
+        pa.field("prior_log_tau_mean", pa.float64(), nullable=True),  # τ_r
         pa.field("prior_log_tau_std", pa.float64(), nullable=True),
+        pa.field("prior_log_tau_l_mean", pa.float64(), nullable=True),
+        pa.field("prior_log_tau_l_std", pa.float64(), nullable=True),
+        pa.field("prior_logit_eta_mean", pa.float64(), nullable=True),
+        pa.field("prior_logit_eta_std", pa.float64(), nullable=True),
     ],
     metadata={
         b"schema_name": b"CounterGlobalCalibration",
