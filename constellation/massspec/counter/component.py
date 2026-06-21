@@ -51,6 +51,13 @@ def estimate_component(
     likelihood-only (the panel point-estimate prior is routed to VB-on-panel)."""
     if len(members) == 0:
         raise ValueError("a component needs at least one member")
+    n_ch = int(members[0].channel_z.numel())
+    if any(int(q.channel_z.numel()) != n_ch for q in members):
+        raise ValueError(
+            "component members must share the channel count (charges × isotopes) so the "
+            "additive panel stacks; got "
+            f"{[int(q.channel_z.numel()) for q in members]}"
+        )
     config = config or DiscoverConfig()
     panel = Panel(list(members), members[0].calibration, background=background)
     priors = list(rt_priors_ms) if rt_priors_ms is not None else [None] * len(members)

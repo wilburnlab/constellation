@@ -283,7 +283,8 @@ extraction. So the loop re-fits parameters on the fixed, wide-extracted observat
 **Status:** PR-A + PR-B **shipped** (PR #80, "step 5 foundations"); PR-C + PR-D **shipped**
 (PR #81 — calibration 4-slot round-trip + theoretical candidate index); PR-E **shipped**
 (channel-overlap connected components, PR #82); PR-G **shipped** (component co-fit +
-μ-anchoring). A key finding (2026-06-18)
+μ-anchoring, PR #83); PR-H **shipped** (CLI component worker-model + size cap; attribution
+emission + fitted-param return deferred to PR-H2). A key finding (2026-06-18)
 re-scoped step 5: a **post-DE gradient polish to apply the prior to the panel POINT estimate
 is unsafe** on the same-grid-blend surface — Adam drifts off DE's basin along the flat
 target↔interferer N-split direction (a 2× over-count in testing), unbounded L-BFGS escapes to a
@@ -331,13 +332,17 @@ superseded by VB-on-panel.
   members are *exchangeable* (one would absorb the whole blend), so each member's `μ` is anchored to
   a `± mu_window_ms` **search bound** around its PSM RT (not the unsafe prior-polish); `fit_panel`
   gained a `bounds` override for it. Verified: a 2e5/1e5 same-grid blend recovers both (≈2.5%/5%).
-- **PR-H** — CLI `_cmd_counter_estimate`: build index + components in the parent; `pool.map` over
-  mixed work-items (singleton → today's worker unchanged; multi-member → component worker). Widen
-  the worker return to also carry fitted `parameters_dict()` + `target_id` (for step 7's
-  `StagedCalibration` rebuild). Wire `emit.panel_attribution_table` into the bundle at iteration 0
-  (the deferred step-3 follow-up; a hard prereq for step-7 reconciliation). **Mandatory**
-  `--collide-ppm` + component-size cap → singleton fallback + WARN (mega-component pool-stall
-  guard). Seed per component deterministically (preserve #79's order-independent determinism).
+- ✓ **PR-H (worker-model + size cap)** — CLI `_cmd_counter_estimate` builds **co-fit units** in the
+  parent (`_counter_cofit_units`: candidate index → m/z-overlap components → RT co-elution refinement
+  → size cap) and `pool.map`s `_counter_worker_unit` over **units**: a singleton routes to today's
+  per-target discovery worker (unchanged); a multi-member unit is one joint `estimate_component`
+  panel. New args `--collide-ppm`, `--rt-overlap-s` (default `--rt-window`), `--max-component-size`
+  (oversized → singleton fallback). **RT-refinement is an *efficiency* split, not correctness** — the
+  N(t)-weighted soft γ + μ-anchoring separate RT-different members within one window fine; we just
+  don't waste a panel on non-overlapping RT. The component obs is the reference member's
+  pre-extracted `all_in_window` trace over its `rt_window` (no re-extraction; edge members partial —
+  a v1 limit). **Deferred to PR-H2:** widen the worker return to carry fitted `parameters_dict()`
+  (for step 7's `StagedCalibration` rebuild) + emit `panel_attribution_table` at iteration 0.
 
 **Phase 3 — step 7 (no re-extraction):**
 - **PR-I** — `counter/run.py` + `massspec counter run`, calibrant-anchored: loop over the explicit

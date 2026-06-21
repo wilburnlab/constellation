@@ -11,6 +11,7 @@ from constellation.massspec.counter import (
     Progenitor,
     TheoreticalCandidateIndex,
     channel_overlap_components,
+    refine_components_by_rt,
 )
 
 _PEP_A = Peptidoform(sequence="PEPTIDEKR")
@@ -105,3 +106,33 @@ def test_components_transitive_chain() -> None:
         frozenset({1}),
         frozenset({2}),
     ]
+
+
+def test_refine_components_by_rt_splits_non_coeluting() -> None:
+    comp = [frozenset({0, 1, 2})]  # one m/z-overlap component of three targets
+    rts = {0: 100.0, 1: 105.0, 2: 600.0}  # 0,1 co-elute; 2 is 8 min away
+    units = refine_components_by_rt(comp, rts, rt_overlap_s=30.0)
+    assert units == [frozenset({0, 1}), frozenset({2})]
+    # a wide overlap window keeps the whole component together (transitive)
+    assert refine_components_by_rt(comp, rts, rt_overlap_s=600.0) == [frozenset({0, 1, 2})]
+    # a tight window splits every member off
+    assert refine_components_by_rt(comp, rts, rt_overlap_s=1.0) == [
+        frozenset({0}), frozenset({1}), frozenset({2})
+    ]
+
+
+def test_refine_components_keeps_rt_less_members_as_singletons() -> None:
+    units = refine_components_by_rt([frozenset({0, 1})], {0: 100.0}, rt_overlap_s=30.0)
+    assert units == [frozenset({0}), frozenset({1})]  # target 1 has no rt_center
+
+
+def test_refine_components_span_bounded_not_transitive() -> None:
+    # 0–50 and 50–100 are each ≤60 apart, but the 0..100 SPAN exceeds 60: span-bounded
+    # grouping must NOT chain them into one unit (it would spread past a co-fit window).
+    comp = [frozenset({0, 1, 2})]
+    rts = {0: 0.0, 1: 50.0, 2: 100.0}
+    units = refine_components_by_rt(comp, rts, rt_overlap_s=60.0)
+    assert frozenset({0, 1, 2}) not in units
+    for u in units:  # every unit's rt span stays within the window
+        spans = [rts[m] for m in u]
+        assert max(spans) - min(spans) <= 60.0

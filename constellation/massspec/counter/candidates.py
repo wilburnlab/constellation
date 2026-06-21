@@ -33,6 +33,7 @@ __all__ = [
     "CandidateEntry",
     "TheoreticalCandidateIndex",
     "channel_overlap_components",
+    "refine_components_by_rt",
 ]
 
 
@@ -173,3 +174,40 @@ def channel_overlap_components(
     for t in parent:
         comps.setdefault(find(t), set()).add(t)
     return sorted((frozenset(c) for c in comps.values()), key=min)
+
+
+def refine_components_by_rt(
+    components: list[frozenset[int]],
+    rt_centers: dict[int, float],
+    *,
+    rt_overlap_s: float,
+) -> list[frozenset[int]]:
+    """Split each m/z-overlap component into co-**eluting** sub-clusters whose
+    `rt_center` **span ≤ rt_overlap_s** (a greedy sweep of RT-sorted members, NOT
+    transitive chaining — a chain of pairwise-close members could otherwise spread a
+    unit past a single co-fit window, leaving a far member with no signal in the
+    reference-grid obs). The units are the panels that actually get co-fit.
+
+    This is an **efficiency** refinement, not a correctness one for the members it
+    keeps together: the additive flux + N(t)-weighted soft attribution + per-member
+    μ-anchoring separate RT-different members within one window fine — but co-fitting
+    m/z-colliding peptides that elute far apart just stretches a panel over dead RT
+    span (they do not actually interfere). A member with no `rt_center` (key absent)
+    can't be overlap-assessed and is kept as its own singleton. Returned sorted by
+    min `target_id`."""
+    units: list[frozenset[int]] = []
+    for comp in components:
+        with_rt = sorted((rt_centers[m], m) for m in comp if m in rt_centers)
+        units += [frozenset({m}) for m in comp if m not in rt_centers]  # rt-less → singletons
+        if not with_rt:
+            continue
+        group = [with_rt[0][1]]
+        start = with_rt[0][0]
+        for rtc, m in with_rt[1:]:
+            if rtc - start <= rt_overlap_s:  # span from the group's earliest member
+                group.append(m)
+            else:
+                units.append(frozenset(group))
+                group, start = [m], rtc
+        units.append(frozenset(group))
+    return sorted(units, key=min)
