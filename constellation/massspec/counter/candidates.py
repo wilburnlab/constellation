@@ -34,6 +34,7 @@ __all__ = [
     "TheoreticalCandidateIndex",
     "channel_overlap_components",
     "refine_components_by_rt",
+    "restrict_to_reference_star",
 ]
 
 
@@ -211,3 +212,56 @@ def refine_components_by_rt(
                 group, start = [m], rtc
         units.append(frozenset(group))
     return sorted(units, key=min)
+
+
+def _channels_overlap(a_mz: list[float], b_mz: list[float], collide_ppm: float) -> bool:
+    """True if any channel of `a` is within `collide_ppm` of any channel of `b`
+    (ppm relative to the smaller m/z, matching `channel_overlap_components`' edge)."""
+    for x in a_mz:
+        for y in b_mz:
+            if abs(x - y) / min(x, y) * 1e6 <= collide_ppm:
+                return True
+    return False
+
+
+def restrict_to_reference_star(
+    units: list[frozenset[int]],
+    index: TheoreticalCandidateIndex,
+    *,
+    collide_ppm: float,
+) -> list[frozenset[int]]:
+    """Re-cluster each (transitive) unit into **reference stars**: a star is a
+    reference + the members whose channels DIRECTLY overlap the reference's (within
+    `collide_ppm`). Greedy by min `target_id` — emit the first member's star, remove
+    it, repeat on the rest.
+
+    This is the correctness fix for the reference-grid co-fit (`estimate_component`):
+    the obs is built on the reference member's grid (and its pre-extracted trace), so
+    a member is only scorable if its channels lie within the reference's extraction
+    tolerance — i.e. it DIRECTLY overlaps the reference, not transitively (A–B, B–C
+    with A–C apart would otherwise leave C scored against A's grid where its peaks
+    were never extracted → silent ~0 N). A transitively-but-not-directly connected
+    member falls into its own star (a singleton if it overlaps no kept reference).
+    `collide_ppm` should be ≤ the upstream XIC extraction tolerance, else a member
+    within `collide_ppm` of the reference but beyond the extraction tolerance still
+    has no extracted signal on the reference grid (the union grid is the full fix)."""
+    mz_by_tid: dict[int, list[float]] = {}
+    for tid, mz in zip(index.target_id.tolist(), index.mz.tolist()):
+        mz_by_tid.setdefault(int(tid), []).append(float(mz))
+
+    out: list[frozenset[int]] = []
+    for unit in units:
+        remaining = sorted(unit)
+        while remaining:
+            ref = remaining[0]
+            ref_mz = mz_by_tid.get(ref, [])
+            star = [ref]
+            rest: list[int] = []
+            for m in remaining[1:]:
+                if _channels_overlap(mz_by_tid.get(m, []), ref_mz, collide_ppm):
+                    star.append(m)
+                else:
+                    rest.append(m)
+            out.append(frozenset(star))
+            remaining = rest
+    return sorted(out, key=min)

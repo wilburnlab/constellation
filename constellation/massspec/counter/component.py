@@ -67,14 +67,17 @@ def estimate_component(
         )
     for q, rt_prior in zip(members, priors):
         seed_peak_from_observation(q, obs, rt_prior_ms=rt_prior)
-    # Anchor each member's μ near its PSM RT (clamped to the obs window) so a
-    # co-eluting same-grid member can't drift/swap and absorb the whole blend.
+    # Anchor each member's μ near its PSM RT (within the obs window) so a co-eluting
+    # same-grid member can't drift/swap and absorb the whole blend.
     bounds = None
     if any(p is not None for p in priors):
         bounds = _panel_bounds(panel, obs)
         rt_lo, rt_hi = float(obs.rt.min()), float(obs.rt.max())
         for i, rt_prior in enumerate(priors):
-            if rt_prior is not None:
+            # Only narrow when the prior is INSIDE the obs window: a prior beyond the
+            # window would clamp to an inverted (lo > hi) interval and break the fit;
+            # leave such a member the full default μ bound (it fits where it can).
+            if rt_prior is not None and rt_lo <= float(rt_prior) <= rt_hi:
                 lo = max(rt_lo, float(rt_prior) - mu_window_ms)
                 hi = min(rt_hi, float(rt_prior) + mu_window_ms)
                 bounds[f"progenitors.{i}.peak.mu"] = (lo, hi)

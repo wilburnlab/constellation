@@ -56,6 +56,7 @@ from .candidates import (
     TheoreticalCandidateIndex,
     channel_overlap_components,
     refine_components_by_rt,
+    restrict_to_reference_star,
 )
 from .component import estimate_component
 from .emit import panel_attribution_table
@@ -111,6 +112,7 @@ __all__ = [
     "CandidateEntry",
     "channel_overlap_components",
     "refine_components_by_rt",
+    "restrict_to_reference_star",
     "estimate_component",
     # io + schemas
     "CounterResult",

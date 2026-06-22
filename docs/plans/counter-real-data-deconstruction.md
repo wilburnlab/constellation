@@ -341,8 +341,17 @@ superseded by VB-on-panel.
   N(t)-weighted soft γ + μ-anchoring separate RT-different members within one window fine; we just
   don't waste a panel on non-overlapping RT. The component obs is the reference member's
   pre-extracted `all_in_window` trace over its `rt_window` (no re-extraction; edge members partial —
-  a v1 limit). **Deferred to PR-H2:** widen the worker return to carry fitted `parameters_dict()`
-  (for step 7's `StagedCalibration` rebuild) + emit `panel_attribution_table` at iteration 0.
+  a v1 limit). **Codex review fixes (correctness):** (i) `restrict_to_reference_star` re-cliques each
+  transitive m/z unit into reference *stars* — a member only co-fits when it DIRECTLY overlaps the
+  reference (else its peaks were never extracted onto the reference grid → silent ~0 N); transitive
+  members split off. (ii) `--rt-overlap-s` is clamped to `--rt-window` (a unit can't span beyond the
+  obs window) + a defensive μ-bound guard in `estimate_component` (skip narrowing for a prior outside
+  the obs window — no `lo>hi` inversion crash). (iii) an empty reference grid falls back to per-member
+  singleton fits, not a blanket `no_signal`. Known follow-ups (documented): `collide_ppm` should be
+  ≤ the extraction tolerance; the reference is min-`target_id` (best-signal choice deferred); the
+  union grid recovers blends the star-restriction conservatively drops. **Deferred to PR-H2:** widen
+  the worker return to carry fitted `parameters_dict()` (for step 7's `StagedCalibration` rebuild) +
+  emit `panel_attribution_table` at iteration 0.
 
 **Phase 3 — step 7 (no re-extraction):**
 - **PR-I** — `counter/run.py` + `massspec counter run`, calibrant-anchored: loop over the explicit

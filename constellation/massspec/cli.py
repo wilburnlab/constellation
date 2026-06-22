@@ -2883,11 +2883,13 @@ def _build_counter_estimate_parser(subs: argparse._SubParsersAction) -> None:
                    help="Disable the additive background channel.")
     p.add_argument("--collide-ppm", type=float, default=20.0,
                    help="m/z tolerance for grouping targets into channel-overlap "
-                        "components that are co-fit jointly (default 20).")
+                        "components that are co-fit jointly (default 20). Should be ≤ the "
+                        "upstream XIC extraction tolerance — a member beyond that tolerance "
+                        "has no extracted signal on the reference grid.")
     p.add_argument("--rt-overlap-s", type=float, default=None,
-                   help="RT-center proximity (s) for treating component members as "
-                        "co-eluting (default: --rt-window). Members farther apart are "
-                        "fit independently — an efficiency split, not a correctness one.")
+                   help="RT-center span (s) within which component members are co-fit as "
+                        "one unit (default + max: --rt-window; larger values are clamped, "
+                        "since a unit can't span beyond the reference observation window).")
     p.add_argument("--max-component-size", type=int, default=8,
                    help="Co-fit units larger than this fall back to independent "
                         "single-target fits (guards against a dense isobaric region "
@@ -2990,6 +2992,7 @@ def _counter_cofit_units(targets: list[dict], opts: dict) -> tuple[list[list[dic
         TheoreticalCandidateIndex,
         channel_overlap_components,
         refine_components_by_rt,
+        restrict_to_reference_star,
     )
 
     by_tid = {int(t["target_id"]): t for t in targets}
@@ -3018,6 +3021,12 @@ def _counter_cofit_units(targets: list[dict], opts: dict) -> tuple[list[list[dic
         index = TheoreticalCandidateIndex.from_peptides(entries, n_isotopes=opts["n_isotopes"])
         comps = channel_overlap_components(index, collide_ppm=opts["collide_ppm"])
         unit_tids = refine_components_by_rt(comps, rt_centers, rt_overlap_s=opts["rt_overlap_s"])
+        # Reference-star restriction: a transitive m/z component co-fit on the
+        # reference grid would under-score members that only indirectly overlap (their
+        # peaks were never extracted onto the reference grid). Keep only members
+        # DIRECTLY overlapping each star's reference; the rest fall into their own
+        # stars (singletons if they overlap nobody).
+        unit_tids = restrict_to_reference_star(unit_tids, index, collide_ppm=opts["collide_ppm"])
     unit_tids += [frozenset({tid}) for tid in no_envelope]
 
     cap = int(opts["max_component_size"])
@@ -3077,7 +3086,10 @@ def _counter_worker_component(unit: list[dict]) -> list[dict]:
             neighborhood_ppm=opts["neighborhood_ppm"],
         )
         if int(obs.mask.sum()) == 0:
-            return [{**b, "status": "no_signal"} for b in bases]
+            # faint/absent reference grid → don't blanket-no_signal the co-members
+            # (the reference is min target_id, arbitrary w.r.t. abundance); fit each
+            # member on its OWN grid as an independent singleton.
+            return [_counter_worker_estimate(t) for t in members]
         cfg = DiscoverConfig(
             detect_threshold=opts["detect_threshold"], max_candidates=opts["max_candidates"]
         )
@@ -3115,6 +3127,16 @@ def _cmd_counter_estimate(args: argparse.Namespace) -> int:
 
     targets = _counter_targets(args.targets)
     rt_overlap_s = args.rt_overlap_s if args.rt_overlap_s is not None else args.rt_window
+    if rt_overlap_s > args.rt_window:
+        # a unit's RT span can't exceed the reference's ± rt_window obs window, or a
+        # co-member's elution falls outside the observation entirely.
+        if not args.no_progress:
+            print(
+                f"warning: --rt-overlap-s {rt_overlap_s} > --rt-window {args.rt_window}; "
+                f"clamping to {args.rt_window}",
+                file=sys.stderr,
+            )
+        rt_overlap_s = args.rt_window
     opts = dict(
         acquisition_id=args.acquisition_id, n_isotopes=args.n_isotopes,
         rt_window=args.rt_window, neighborhood_ppm=args.neighborhood_ppm,
