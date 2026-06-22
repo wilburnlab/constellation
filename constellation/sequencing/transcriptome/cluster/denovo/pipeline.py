@@ -293,6 +293,7 @@ def assemble_clusters(
     max_3p_overhang: int = 30,
     kmer: int = 15,
     window: int = 10,
+    minimizers_per_seq: int | None = 50,
     min_cluster_size: int = 1,
     min_abundance: int = 1,
     predict_orfs: bool = True,
@@ -338,9 +339,15 @@ def assemble_clusters(
     )
 
     log(f"{n_uniq:,} unique sequences — extracting minimizers (k={kmer}, w={window})…")
-    index = extract_minimizers(uniq_table.column("sequence"), k=kmer, w=window)
+    index = extract_minimizers(
+        uniq_table.column("sequence"),
+        k=kmer,
+        w=window,
+        max_per_seq=minimizers_per_seq,
+    )
     log(f"{index.mini_hash.shape[0]:,} minimizers — generating candidate pairs…")
     candidates = generate_candidates(index, abundance)
+    del index  # free the minimizer index (~tens of GB) before verify
     log(
         f"{candidates.num_rows:,} candidate pairs — verifying (edlib, identity≥{identity})…"
     )
@@ -352,6 +359,7 @@ def assemble_clusters(
         max_3p=max_3p_overhang,
         threads=threads,
     )
+    del candidates  # free the candidate table before grouping
     log(f"{accepted.num_rows:,} accepted edges — grouping (connected components)…")
     comp = connected_components(
         n_uniq,
@@ -665,6 +673,7 @@ def cluster_transcripts(
     max_3p_overhang: int = 30,
     kmer: int = 15,
     window: int = 10,
+    minimizers_per_seq: int | None = 50,
     min_cluster_size: int = 1,
     min_abundance: int = 1,
     max_cluster_rounds: int = 1,
@@ -728,6 +737,7 @@ def cluster_transcripts(
         max_3p_overhang=max_3p_overhang,
         kmer=kmer,
         window=window,
+        minimizers_per_seq=minimizers_per_seq,
         min_cluster_size=min_cluster_size,
         min_abundance=min_abundance,
         predict_orfs=predict_orfs,
@@ -753,6 +763,9 @@ def cluster_transcripts(
             "max_3p_overhang": int(max_3p_overhang),
             "kmer": int(kmer),
             "window": int(window),
+            "minimizers_per_seq": (
+                int(minimizers_per_seq) if minimizers_per_seq is not None else None
+            ),
             "min_cluster_size": int(min_cluster_size),
             "min_abundance": int(min_abundance),
             "max_cluster_rounds": int(max_cluster_rounds),

@@ -38,22 +38,68 @@ class MinimizerIndex:
     """
 
     mini_hash: torch.Tensor  # int64 (K,) ascending
-    uniq_id: torch.Tensor  # int64 (K,)
+    uniq_id: torch.Tensor  # int32 (K,)
     pos: torch.Tensor  # int32 (K,)
 
 
-def _large_string_buffers(col: pa.Array | pa.ChunkedArray) -> tuple[bytes, np.ndarray]:
-    """Raw data bytes + int64 value-offsets from a (large_)string column."""
-    if isinstance(col, pa.ChunkedArray):
-        col = col.combine_chunks()
-    if not pa.types.is_large_string(col.type):
-        col = pc.cast(col, pa.large_string())
-    if col.offset != 0:
-        col = pa.chunked_array([col]).combine_chunks()
-    bufs = col.buffers()
-    offsets = np.frombuffer(bufs[1], dtype=np.int64, count=len(col) + 1).copy()
-    data = bytes(bufs[2]) if bufs[2] is not None else b""
-    return data, offsets
+def _iter_seq_blocks(seq_col, chunk_bases: int):
+    """Yield ``(data_bytes, rel_offsets, row0)`` boundary-aligned blocks.
+
+    Walks the Arrow chunks directly via zero-copy ``memoryview`` and only
+    materialises one ~``chunk_bases`` sub-block at a time — avoids the
+    ``combine_chunks()`` + ``bytes()`` copy of the whole (tens-of-GB)
+    sequence buffer that a single-buffer extraction would force.
+    """
+    chunks = seq_col.chunks if isinstance(seq_col, pa.ChunkedArray) else [seq_col]
+    row0 = 0
+    for ch in chunks:
+        nch = len(ch)
+        if nch == 0:
+            continue
+        if not pa.types.is_large_string(ch.type):
+            ch = pc.cast(ch, pa.large_string())
+        bufs = ch.buffers()
+        off = np.frombuffer(bufs[1], dtype=np.int64)
+        base = ch.offset
+        data = memoryview(bufs[2]) if bufs[2] is not None else memoryview(b"")
+        i = 0
+        while i < nch:
+            byte0 = int(off[base + i])
+            j = i + 1
+            while j < nch and int(off[base + j]) - byte0 < chunk_bases:
+                j += 1
+            byte1 = int(off[base + j])
+            sub_data = bytes(data[byte0:byte1])  # bounded ~chunk_bases copy
+            sub_off = (off[base + i : base + j + 1] - byte0).astype(np.int64)
+            yield sub_data, sub_off, row0 + i
+            i = j
+        row0 += nch
+
+
+def _cap_per_seq(
+    h: torch.Tensor, u: torch.Tensor, p: torch.Tensor, m: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Keep the ``m`` smallest-hash minimizers per sequence (bottom-m sketch).
+
+    Bounds the index to ``n_seq × m`` entries — at ~1 kb reads the uncapped
+    density is ~180/kb, so capping is the dominant memory lever. Two
+    near-identical reads still share most of their bottom-m set, so
+    candidate sensitivity stays high at the identity targets we cluster at.
+    Applied per block (sequences are boundary-aligned within a block, so this
+    is exactly per-sequence) to avoid a global sort.
+    """
+    hn = h.numpy()
+    un = u.numpy()
+    order = np.lexsort((hn, un))  # primary uniq asc, secondary hash asc
+    us = un[order]
+    n = us.shape[0]
+    change = np.empty(n, dtype=bool)
+    change[0] = True
+    change[1:] = us[1:] != us[:-1]
+    grp_start = np.maximum.accumulate(np.where(change, np.arange(n), 0))
+    keep = (np.arange(n) - grp_start) < m
+    sel = torch.from_numpy(np.ascontiguousarray(order[keep]))
+    return h[sel], u[sel], p[sel]
 
 
 def _block_minimizers(
@@ -106,18 +152,19 @@ def extract_minimizers(
     *,
     k: int = 15,
     w: int = 10,
+    max_per_seq: int | None = 50,
     chunk_bases: int = 50_000_000,
 ) -> MinimizerIndex:
     """Extract canonical minimizers for every sequence, return a sorted index.
 
-    ``seq_col`` is the unique-sequence column; ``uniq_id`` is the row
-    index. Sequences are processed in boundary-aligned chunks of
-    ~``chunk_bases`` bases so the per-position hash intermediate never
-    exceeds one chunk.
+    ``seq_col`` is the unique-sequence column; ``uniq_id`` is the row index.
+    Sequences are processed in boundary-aligned blocks of ~``chunk_bases``
+    bases (zero-copy from the Arrow buffers) so the per-position hash
+    intermediate stays bounded. ``max_per_seq`` caps each sequence's sketch
+    to its ``m`` smallest-hash minimizers (``None`` = uncapped) — the
+    dominant memory lever at scale.
     """
-    data, offsets = _large_string_buffers(seq_col)
-    n_seq = len(offsets) - 1
-    if n_seq == 0:
+    if len(seq_col) == 0:
         empty_i = torch.empty(0, dtype=torch.int64)
         return MinimizerIndex(empty_i, empty_i, torch.empty(0, dtype=torch.int32))
 
@@ -125,32 +172,27 @@ def extract_minimizers(
     uniqs: list[torch.Tensor] = []
     poss: list[torch.Tensor] = []
 
-    r0 = 0
-    while r0 < n_seq:
-        # Grow the chunk until it spans ~chunk_bases (always ≥ 1 sequence).
-        base0 = int(offsets[r0])
-        r1 = r0 + 1
-        while r1 < n_seq and int(offsets[r1]) - base0 < chunk_bases:
-            r1 += 1
-        sub_data = data[base0 : int(offsets[r1])]
-        sub_offsets = offsets[r0 : r1 + 1] - base0
+    for sub_data, sub_offsets, row0 in _iter_seq_blocks(seq_col, chunk_bases):
         kh = encode_block(sub_data, sub_offsets, k=k)
-        if kh is not None:
-            h, u, p = _block_minimizers(
-                kh.canon_hash, kh.valid, kh.seq_id, kh.pos_in_seq, w=w, uniq_offset=r0
-            )
-            if h.shape[0] > 0:
-                hashes.append(h)
-                uniqs.append(u)
-                poss.append(p)
-        r0 = r1
+        if kh is None:
+            continue
+        h, u, p = _block_minimizers(
+            kh.canon_hash, kh.valid, kh.seq_id, kh.pos_in_seq, w=w, uniq_offset=row0
+        )
+        if h.shape[0] == 0:
+            continue
+        if max_per_seq is not None:
+            h, u, p = _cap_per_seq(h, u, p, int(max_per_seq))
+        hashes.append(h)
+        uniqs.append(u)
+        poss.append(p)
 
     if not hashes:
         empty_i = torch.empty(0, dtype=torch.int64)
         return MinimizerIndex(empty_i, empty_i, torch.empty(0, dtype=torch.int32))
 
     all_hash = torch.cat(hashes)
-    all_uniq = torch.cat(uniqs)
+    all_uniq = torch.cat(uniqs).to(torch.int32)  # uniq_id < 2**31
     all_pos = torch.cat(poss)
     order = torch.argsort(all_hash)
     return MinimizerIndex(

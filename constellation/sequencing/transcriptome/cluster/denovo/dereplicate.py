@@ -64,9 +64,7 @@ def _hash_sequences(seq_col: pa.Array | pa.ChunkedArray) -> pa.Array:
     digest = xxhash.xxh3_128_digest
     n_total = len(seq_col)
     out = bytearray(16 * n_total)
-    chunks = (
-        seq_col.chunks if isinstance(seq_col, pa.ChunkedArray) else [seq_col]
-    )
+    chunks = seq_col.chunks if isinstance(seq_col, pa.ChunkedArray) else [seq_col]
     pos = 0
     for ch in chunks:
         nch = len(ch)
@@ -103,9 +101,7 @@ def dereplicate(reads: pa.Table) -> tuple[pa.Table, pa.Table]:
     n = reads.num_rows
 
     seq_hash = _hash_sequences(seq)
-    work = pa.table(
-        {"h": seq_hash, "row_idx": pa.array(np.arange(n, dtype=np.int64))}
-    )
+    work = pa.table({"h": seq_hash, "row_idx": pa.array(np.arange(n, dtype=np.int64))})
     grouped = work.group_by("h").aggregate([("row_idx", "min"), ("row_idx", "count")])
     group_hash = grouped.column("h")
     rep_row = grouped.column("row_idx_min")
@@ -128,9 +124,7 @@ def dereplicate(reads: pa.Table) -> tuple[pa.Table, pa.Table]:
 
     # uniq_id per read = position of each read's hash in the distinct-hash
     # set (group_by output order, which is the uniq_id order).
-    uid_per_read = pc.cast(
-        pc.index_in(seq_hash, value_set=group_hash), pa.int64()
-    )
+    uid_per_read = pc.cast(pc.index_in(seq_hash, value_set=group_hash), pa.int64())
     read_map = pa.table(
         {
             "read_id": pc.cast(reads.column("read_id"), pa.string()),

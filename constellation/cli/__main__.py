@@ -1259,6 +1259,17 @@ def _build_transcriptome_parser(subs) -> None:
         "--window", type=int, default=10, help="de-novo: minimizer window size."
     )
     p_cluster.add_argument(
+        "--minimizers-per-seq",
+        type=int,
+        default=50,
+        help=(
+            "de-novo: cap each sequence's sketch to its N smallest-hash "
+            "minimizers (bottom-N MinHash). The dominant memory lever at "
+            "scale — lower it (or raise --window) if RAM is tight; 0 = "
+            "uncapped. Default 50."
+        ),
+    )
+    p_cluster.add_argument(
         "--min-abundance",
         type=int,
         default=1,
@@ -3098,6 +3109,9 @@ def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
         max_3p_overhang=int(args.max_3p_overhang),
         kmer=int(args.kmer),
         window=int(args.window),
+        minimizers_per_seq=(
+            int(args.minimizers_per_seq) if int(args.minimizers_per_seq) > 0 else None
+        ),
         min_cluster_size=int(args.min_cluster_size),
         min_abundance=int(args.min_abundance),
         max_cluster_rounds=int(args.max_cluster_rounds),
