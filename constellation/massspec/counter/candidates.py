@@ -33,6 +33,8 @@ __all__ = [
     "CandidateEntry",
     "TheoreticalCandidateIndex",
     "channel_overlap_components",
+    "refine_components_by_rt",
+    "restrict_to_reference_star",
 ]
 
 
@@ -173,3 +175,93 @@ def channel_overlap_components(
     for t in parent:
         comps.setdefault(find(t), set()).add(t)
     return sorted((frozenset(c) for c in comps.values()), key=min)
+
+
+def refine_components_by_rt(
+    components: list[frozenset[int]],
+    rt_centers: dict[int, float],
+    *,
+    rt_overlap_s: float,
+) -> list[frozenset[int]]:
+    """Split each m/z-overlap component into co-**eluting** sub-clusters whose
+    `rt_center` **span ≤ rt_overlap_s** (a greedy sweep of RT-sorted members, NOT
+    transitive chaining — a chain of pairwise-close members could otherwise spread a
+    unit past a single co-fit window, leaving a far member with no signal in the
+    reference-grid obs). The units are the panels that actually get co-fit.
+
+    This is an **efficiency** refinement, not a correctness one for the members it
+    keeps together: the additive flux + N(t)-weighted soft attribution + per-member
+    μ-anchoring separate RT-different members within one window fine — but co-fitting
+    m/z-colliding peptides that elute far apart just stretches a panel over dead RT
+    span (they do not actually interfere). A member with no `rt_center` (key absent)
+    can't be overlap-assessed and is kept as its own singleton. Returned sorted by
+    min `target_id`."""
+    units: list[frozenset[int]] = []
+    for comp in components:
+        with_rt = sorted((rt_centers[m], m) for m in comp if m in rt_centers)
+        units += [frozenset({m}) for m in comp if m not in rt_centers]  # rt-less → singletons
+        if not with_rt:
+            continue
+        group = [with_rt[0][1]]
+        start = with_rt[0][0]
+        for rtc, m in with_rt[1:]:
+            if rtc - start <= rt_overlap_s:  # span from the group's earliest member
+                group.append(m)
+            else:
+                units.append(frozenset(group))
+                group, start = [m], rtc
+        units.append(frozenset(group))
+    return sorted(units, key=min)
+
+
+def _channels_overlap(a_mz: list[float], b_mz: list[float], collide_ppm: float) -> bool:
+    """True if any channel of `a` is within `collide_ppm` of any channel of `b`
+    (ppm relative to the smaller m/z, matching `channel_overlap_components`' edge)."""
+    for x in a_mz:
+        for y in b_mz:
+            if abs(x - y) / min(x, y) * 1e6 <= collide_ppm:
+                return True
+    return False
+
+
+def restrict_to_reference_star(
+    units: list[frozenset[int]],
+    index: TheoreticalCandidateIndex,
+    *,
+    collide_ppm: float,
+) -> list[frozenset[int]]:
+    """Re-cluster each (transitive) unit into **reference stars**: a star is a
+    reference + the members whose channels DIRECTLY overlap the reference's (within
+    `collide_ppm`). Greedy by min `target_id` — emit the first member's star, remove
+    it, repeat on the rest.
+
+    This is the correctness fix for the reference-grid co-fit (`estimate_component`):
+    the obs is built on the reference member's grid (and its pre-extracted trace), so
+    a member is only scorable if its channels lie within the reference's extraction
+    tolerance — i.e. it DIRECTLY overlaps the reference, not transitively (A–B, B–C
+    with A–C apart would otherwise leave C scored against A's grid where its peaks
+    were never extracted → silent ~0 N). A transitively-but-not-directly connected
+    member falls into its own star (a singleton if it overlaps no kept reference).
+    `collide_ppm` should be ≤ the upstream XIC extraction tolerance, else a member
+    within `collide_ppm` of the reference but beyond the extraction tolerance still
+    has no extracted signal on the reference grid (the union grid is the full fix)."""
+    mz_by_tid: dict[int, list[float]] = {}
+    for tid, mz in zip(index.target_id.tolist(), index.mz.tolist()):
+        mz_by_tid.setdefault(int(tid), []).append(float(mz))
+
+    out: list[frozenset[int]] = []
+    for unit in units:
+        remaining = sorted(unit)
+        while remaining:
+            ref = remaining[0]
+            ref_mz = mz_by_tid.get(ref, [])
+            star = [ref]
+            rest: list[int] = []
+            for m in remaining[1:]:
+                if _channels_overlap(mz_by_tid.get(m, []), ref_mz, collide_ppm):
+                    star.append(m)
+                else:
+                    rest.append(m)
+            out.append(frozenset(star))
+            remaining = rest
+    return sorted(out, key=min)

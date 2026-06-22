@@ -83,6 +83,27 @@ def test_two_member_blend_recovers_both() -> None:
     assert res[0]["n_discovered_interferers"] == 1 and res[0]["interference_flag"] is True
 
 
+def test_estimate_component_rt_prior_outside_window_does_not_crash() -> None:
+    # a member whose PSM RT is outside the obs window must not invert its μ bound
+    # (lo > hi would break the DE fit); it gets the default bound and fits where it can.
+    cal = _cal()
+    obs = simulate_observation(
+        _prog(cal, 2e5, 1.8e6), n_scans=40, generator=torch.Generator().manual_seed(0)
+    )
+    rt_hi = float(obs.rt.max())
+    res = estimate_component(
+        [_prog(cal, 1.0, 1.8e6), _prog(cal, 1.0, 1.8e6)],
+        obs,
+        config=DiscoverConfig(),
+        rt_priors_ms=[1.8e6, rt_hi + 5.0e5],  # second prior far outside the obs window
+    )
+    assert len(res) == 2
+    assert all(r["n_total"] > 0 or r["n_total"] == 0 for r in res)  # ran, no inverted-bound crash
+    import math
+
+    assert all(math.isfinite(r["n_total"]) for r in res)
+
+
 def test_estimate_component_validates_rt_priors_length() -> None:
     cal = _cal()
     obs = simulate_observation(

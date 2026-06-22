@@ -2881,6 +2881,19 @@ def _build_counter_estimate_parser(subs: argparse._SubParsersAction) -> None:
                         "weakly identifiable and overfits until the parsimony pass lands).")
     p.add_argument("--no-background", dest="background", action="store_false",
                    help="Disable the additive background channel.")
+    p.add_argument("--collide-ppm", type=float, default=20.0,
+                   help="m/z tolerance for grouping targets into channel-overlap "
+                        "components that are co-fit jointly (default 20). Should be ≤ the "
+                        "upstream XIC extraction tolerance — a member beyond that tolerance "
+                        "has no extracted signal on the reference grid.")
+    p.add_argument("--rt-overlap-s", type=float, default=None,
+                   help="RT-center span (s) within which component members are co-fit as "
+                        "one unit (default + max: --rt-window; larger values are clamped, "
+                        "since a unit can't span beyond the reference observation window).")
+    p.add_argument("--max-component-size", type=int, default=8,
+                   help="Co-fit units larger than this fall back to independent "
+                        "single-target fits (guards against a dense isobaric region "
+                        "chaining into one pool-stalling mega-panel).")
     p.set_defaults(func=_cmd_counter_estimate)
 
 
@@ -2892,7 +2905,16 @@ def _counter_targets(path: Path) -> list[dict]:
     missing = [c for c in need if c not in t.column_names]
     if missing:
         raise SystemExit(f"error: targets missing columns {missing}")
-    return t.select(list(need)).to_pylist()
+    rows = t.select(list(need)).to_pylist()
+    tids = [r["target_id"] for r in rows]
+    if len(set(tids)) != len(tids):
+        from collections import Counter
+
+        dups = sorted(tid for tid, n in Counter(tids).items() if n > 1)
+        raise SystemExit(
+            f"error: targets has duplicate target_id(s) (must be unique): {dups[:10]}"
+        )
+    return rows
 
 
 # -- estimate: spawn worker pool over seeds (each an independent panel) --
@@ -2934,11 +2956,13 @@ def _counter_worker_estimate(target: dict) -> dict:
     opts, cal, trace, ms1 = (_COUNTER_CTX[k] for k in ("opts", "cal", "trace", "ms1"))
     tid = int(target["target_id"])
     modseq = target["modified_sequence"]
-    z = int(target["precursor_charge"])
-    rtc = float(target["rt_center"])
     base = {"acquisition_id": opts["acquisition_id"], "target_id": tid,
-            "modified_sequence": modseq, "precursor_charge": z}
+            "modified_sequence": modseq, "precursor_charge": target["precursor_charge"]}
     try:
+        # Coerce inside the try: a null charge / rt_center / modseq is one bad seed,
+        # not a run-aborting crash.
+        z = int(target["precursor_charge"])
+        rtc = float(target["rt_center"])
         prog = Progenitor.for_peptide(Peptidoform(sequence=modseq), [z], cal,
                                       n_isotopes=opts["n_isotopes"])
         rt = ms1.column("rt")
@@ -2957,6 +2981,135 @@ def _counter_worker_estimate(target: dict) -> dict:
         return {**base, "status": f"error:{type(exc).__name__}"}
 
 
+def _counter_cofit_units(targets: list[dict], opts: dict) -> tuple[list[list[dict]], int]:
+    """Partition targets into co-fit units: channel-overlap components (shared m/z)
+    refined to co-eluting sub-clusters (shared RT), with oversized units split back
+    to singletons (the mega-component pool-stall guard). Each unit is a list of
+    target dicts sorted by `target_id` ([0] is the reference grid). Targets without a
+    `modified_sequence` (no envelope) stay singletons. Returns (units, n_capped)."""
+    from constellation.core.sequence.proforma import Peptidoform
+    from constellation.massspec.counter import (
+        TheoreticalCandidateIndex,
+        channel_overlap_components,
+        refine_components_by_rt,
+        restrict_to_reference_star,
+    )
+
+    by_tid = {int(t["target_id"]): t for t in targets}
+    entries: list[tuple] = []
+    rt_centers: dict[int, float] = {}
+    no_envelope: list[int] = []
+    for t in targets:
+        tid = int(t["target_id"])
+        if t.get("rt_center") is not None:
+            rt_centers[tid] = float(t["rt_center"])
+        # A target needs a modseq AND a charge to form a theoretical envelope; any
+        # missing/malformed field → keep it a singleton (the worker reports the error,
+        # rather than the parent partitioner crashing the whole run).
+        try:
+            if t["modified_sequence"] and t.get("precursor_charge") is not None:
+                entries.append(
+                    (tid, Peptidoform(sequence=t["modified_sequence"]), [int(t["precursor_charge"])])
+                )
+            else:
+                no_envelope.append(tid)
+        except Exception:  # noqa: BLE001 — malformed modseq/charge → singleton fallback
+            no_envelope.append(tid)
+
+    unit_tids: list = []
+    if entries:
+        index = TheoreticalCandidateIndex.from_peptides(entries, n_isotopes=opts["n_isotopes"])
+        comps = channel_overlap_components(index, collide_ppm=opts["collide_ppm"])
+        unit_tids = refine_components_by_rt(comps, rt_centers, rt_overlap_s=opts["rt_overlap_s"])
+        # Reference-star restriction: a transitive m/z component co-fit on the
+        # reference grid would under-score members that only indirectly overlap (their
+        # peaks were never extracted onto the reference grid). Keep only members
+        # DIRECTLY overlapping each star's reference; the rest fall into their own
+        # stars (singletons if they overlap nobody).
+        unit_tids = restrict_to_reference_star(unit_tids, index, collide_ppm=opts["collide_ppm"])
+    unit_tids += [frozenset({tid}) for tid in no_envelope]
+
+    cap = int(opts["max_component_size"])
+    units: list[list[dict]] = []
+    n_capped = 0
+    for u in unit_tids:
+        members = sorted(u)
+        if len(members) > cap:
+            n_capped += 1
+            units.extend([[by_tid[tid]] for tid in members])  # fall back to singletons
+        else:
+            units.append([by_tid[tid] for tid in members])
+    units.sort(key=lambda u: int(u[0]["target_id"]))  # deterministic work-item order
+    return units, n_capped
+
+
+def _counter_worker_component(unit: list[dict]) -> list[dict]:
+    """Joint co-fit of a multi-member unit — one panel over the reference member's
+    grid (`unit[0]`), each member scored at its own mass defect. Returns one record
+    per member."""
+    import pyarrow.compute as pc
+
+    from constellation.core.sequence.proforma import Peptidoform
+    from constellation.massspec.counter import (
+        DiscoverConfig,
+        Progenitor,
+        estimate_component,
+        observation_for_region,
+    )
+
+    opts, cal, trace, ms1 = (_COUNTER_CTX[k] for k in ("opts", "cal", "trace", "ms1"))
+    members = sorted(unit, key=lambda t: int(t["target_id"]))  # reference = min target_id
+    bases = [
+        {
+            "acquisition_id": opts["acquisition_id"],
+            "target_id": int(t["target_id"]),
+            "modified_sequence": t["modified_sequence"],
+            "precursor_charge": int(t["precursor_charge"]),
+        }
+        for t in members
+    ]
+    try:
+        progs = [
+            Progenitor.for_peptide(
+                Peptidoform(sequence=t["modified_sequence"]),
+                [int(t["precursor_charge"])],
+                cal,
+                n_isotopes=opts["n_isotopes"],
+            )
+            for t in members
+        ]
+        rtc_ref = float(members[0]["rt_center"])
+        rt = ms1.column("rt")
+        win = ms1.filter(pc.less_equal(pc.abs(pc.subtract(rt, rtc_ref)), opts["rt_window"]))
+        obs, _region = observation_for_region(
+            trace, win, progs[0], target_id=int(members[0]["target_id"]),
+            neighborhood_ppm=opts["neighborhood_ppm"],
+        )
+        if int(obs.mask.sum()) == 0:
+            # faint/absent reference grid → don't blanket-no_signal the co-members
+            # (the reference is min target_id, arbitrary w.r.t. abundance); fit each
+            # member on its OWN grid as an independent singleton.
+            return [_counter_worker_estimate(t) for t in members]
+        cfg = DiscoverConfig(
+            detect_threshold=opts["detect_threshold"], max_candidates=opts["max_candidates"]
+        )
+        results = estimate_component(
+            progs, obs, config=cfg, background=opts["background"],
+            rt_priors_ms=[float(t["rt_center"]) * 1000.0 for t in members],
+        )
+        return [{**b, **r, "status": "ok"} for b, r in zip(bases, results)]
+    except Exception as exc:  # noqa: BLE001 — one bad component shouldn't kill the run
+        return [{**b, "status": f"error:{type(exc).__name__}"} for b in bases]
+
+
+def _counter_worker_unit(unit: list[dict]) -> list[dict]:
+    """Dispatch a co-fit unit: a singleton → the per-target discovery path; a
+    multi-member unit → the joint component co-fit."""
+    if len(unit) == 1:
+        return [_counter_worker_estimate(unit[0])]
+    return _counter_worker_component(unit)
+
+
 def _cmd_counter_estimate(args: argparse.Namespace) -> int:
     import multiprocessing as mp
 
@@ -2973,28 +3126,51 @@ def _cmd_counter_estimate(args: argparse.Namespace) -> int:
         return 1
 
     targets = _counter_targets(args.targets)
+    rt_overlap_s = args.rt_overlap_s if args.rt_overlap_s is not None else args.rt_window
+    if rt_overlap_s > args.rt_window:
+        # a unit's RT span can't exceed the reference's ± rt_window obs window, or a
+        # co-member's elution falls outside the observation entirely.
+        if not args.no_progress:
+            print(
+                f"warning: --rt-overlap-s {rt_overlap_s} > --rt-window {args.rt_window}; "
+                f"clamping to {args.rt_window}",
+                file=sys.stderr,
+            )
+        rt_overlap_s = args.rt_window
     opts = dict(
         acquisition_id=args.acquisition_id, n_isotopes=args.n_isotopes,
         rt_window=args.rt_window, neighborhood_ppm=args.neighborhood_ppm,
         detect_threshold=args.detect_threshold, max_candidates=args.max_candidates,
-        background=args.background,
+        background=args.background, collide_ppm=args.collide_ppm,
+        rt_overlap_s=rt_overlap_s, max_component_size=args.max_component_size,
     )
+    # Partition into co-fit units in the parent (cheap, data-independent): m/z-overlap
+    # components × RT co-elution. Singletons stay on the per-target discovery path; a
+    # multi-member unit is one joint panel. The worker maps over UNITS, not targets.
+    units, n_capped = _counter_cofit_units(targets, opts)
     initargs = (str(args.trace), str(args.scan_metadata), str(args.calibration), opts)
     if args.workers > 1:
         ctx = mp.get_context("spawn")
         with ctx.Pool(args.workers, initializer=_counter_worker_init, initargs=initargs) as pool:
-            records = pool.map(_counter_worker_estimate, targets)
+            grouped = pool.map(_counter_worker_unit, units)
     else:
         _counter_worker_init(*initargs)
-        records = [_counter_worker_estimate(t) for t in targets]
+        try:
+            grouped = [_counter_worker_unit(u) for u in units]
+        finally:
+            _COUNTER_CTX.clear()  # don't leak this run's trace/cal into a later in-process call
+    records = [r for group in grouped for r in group]
 
     ok = [r for r in records if r.get("status") == "ok"]
     skipped = len(records) - len(ok)
+    n_multi = sum(1 for u in units if len(u) > 1)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     save_counter(CounterResult(counter_n=counter_n_table(ok)), args.output_dir)
     success.touch()
     if not args.no_progress:
-        print(f"counter estimate: {len(ok)} estimated, {skipped} skipped → {args.output_dir}",
+        extra = f", {n_multi} co-fit components" if n_multi else ""
+        extra += f", {n_capped} oversized split" if n_capped else ""
+        print(f"counter estimate: {len(ok)} estimated, {skipped} skipped{extra} → {args.output_dir}",
               file=sys.stderr)
     return 0
 

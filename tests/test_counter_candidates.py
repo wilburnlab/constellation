@@ -11,7 +11,19 @@ from constellation.massspec.counter import (
     Progenitor,
     TheoreticalCandidateIndex,
     channel_overlap_components,
+    refine_components_by_rt,
+    restrict_to_reference_star,
 )
+
+
+def _single_channel_index(mzs: list[float]) -> TheoreticalCandidateIndex:
+    long = torch.long
+    return TheoreticalCandidateIndex(
+        mz=torch.tensor(mzs, dtype=torch.float64),
+        target_id=torch.tensor(list(range(len(mzs))), dtype=long),
+        charge=torch.tensor([2] * len(mzs), dtype=long),
+        isotope=torch.tensor([0] * len(mzs), dtype=long),
+    )
 
 _PEP_A = Peptidoform(sequence="PEPTIDEKR")
 _PEP_B = Peptidoform(sequence="SAMPLERMKL")
@@ -105,3 +117,50 @@ def test_components_transitive_chain() -> None:
         frozenset({1}),
         frozenset({2}),
     ]
+
+
+def test_refine_components_by_rt_splits_non_coeluting() -> None:
+    comp = [frozenset({0, 1, 2})]  # one m/z-overlap component of three targets
+    rts = {0: 100.0, 1: 105.0, 2: 600.0}  # 0,1 co-elute; 2 is 8 min away
+    units = refine_components_by_rt(comp, rts, rt_overlap_s=30.0)
+    assert units == [frozenset({0, 1}), frozenset({2})]
+    # a wide overlap window keeps the whole component together (transitive)
+    assert refine_components_by_rt(comp, rts, rt_overlap_s=600.0) == [frozenset({0, 1, 2})]
+    # a tight window splits every member off
+    assert refine_components_by_rt(comp, rts, rt_overlap_s=1.0) == [
+        frozenset({0}), frozenset({1}), frozenset({2})
+    ]
+
+
+def test_refine_components_keeps_rt_less_members_as_singletons() -> None:
+    units = refine_components_by_rt([frozenset({0, 1})], {0: 100.0}, rt_overlap_s=30.0)
+    assert units == [frozenset({0}), frozenset({1})]  # target 1 has no rt_center
+
+
+def test_restrict_to_reference_star_splits_transitive_mz() -> None:
+    # A–B (10 ppm) and B–C (10 ppm) overlap, but A–C (20 ppm) do NOT: the transitive
+    # m/z component must NOT be co-fit on A's grid (C's peaks are off A's grid).
+    idx = _single_channel_index([500.000, 500.005, 500.010])
+    comps = channel_overlap_components(idx, collide_ppm=12.0)
+    assert comps == [frozenset({0, 1, 2})]  # transitive m/z component
+    stars = restrict_to_reference_star(comps, idx, collide_ppm=12.0)
+    assert stars == [frozenset({0, 1}), frozenset({2})]  # C splits off (only B-adjacent)
+
+
+def test_restrict_to_reference_star_keeps_a_clique() -> None:
+    # when all three DIRECTLY overlap (A–C ≤ tol), the star keeps them together
+    idx = _single_channel_index([500.000, 500.005, 500.010])
+    stars = restrict_to_reference_star([frozenset({0, 1, 2})], idx, collide_ppm=25.0)
+    assert stars == [frozenset({0, 1, 2})]
+
+
+def test_refine_components_span_bounded_not_transitive() -> None:
+    # 0–50 and 50–100 are each ≤60 apart, but the 0..100 SPAN exceeds 60: span-bounded
+    # grouping must NOT chain them into one unit (it would spread past a co-fit window).
+    comp = [frozenset({0, 1, 2})]
+    rts = {0: 0.0, 1: 50.0, 2: 100.0}
+    units = refine_components_by_rt(comp, rts, rt_overlap_s=60.0)
+    assert frozenset({0, 1, 2}) not in units
+    for u in units:  # every unit's rt span stays within the window
+        spans = [rts[m] for m in u]
+        assert max(spans) - min(spans) <= 60.0
