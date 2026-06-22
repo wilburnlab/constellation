@@ -152,6 +152,30 @@ def test_cli_counter_rejects_duplicate_target_ids(tmp_path):
         ])
 
 
+def test_resolve_collide_ppm_clamps_to_extraction_tolerance(tmp_path):
+    from constellation.massspec.cli import _resolve_collide_ppm
+    from constellation.massspec.quant.chromatogram import _stamp_extraction_tolerance
+
+    p = _inputs(tmp_path)
+    trace = pq.read_table(p / "trace.parquet")
+    pq.write_table(_stamp_extraction_tolerance(trace, 10.0, "ppm"), p / "trace10.parquet")
+
+    def _args(trace_path, collide, override=None):
+        return argparse.Namespace(
+            trace=trace_path, collide_ppm=collide,
+            extraction_tolerance_ppm=override, no_progress=True,
+        )
+
+    # collide above the recorded tolerance → clamped to it
+    assert _resolve_collide_ppm(_args(p / "trace10.parquet", 20.0)) == 10.0
+    # collide already within tolerance → unchanged
+    assert _resolve_collide_ppm(_args(p / "trace10.parquet", 5.0)) == 5.0
+    # explicit override wins over the recorded value
+    assert _resolve_collide_ppm(_args(p / "trace10.parquet", 20.0, override=8.0)) == 8.0
+    # trace without recorded tolerance (observation_to_trace) → left as-is
+    assert _resolve_collide_ppm(_args(p / "trace.parquet", 20.0)) == 20.0
+
+
 def test_counter_cofit_units_partition_and_size_cap():
     # the parent-side partitioner: two co-isobaric, co-eluting targets group into one
     # component; the size cap splits an oversized component back to singletons.

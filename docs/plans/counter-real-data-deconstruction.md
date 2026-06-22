@@ -347,11 +347,20 @@ superseded by VB-on-panel.
   members split off. (ii) `--rt-overlap-s` is clamped to `--rt-window` (a unit can't span beyond the
   obs window) + a defensive μ-bound guard in `estimate_component` (skip narrowing for a prior outside
   the obs window — no `lo>hi` inversion crash). (iii) an empty reference grid falls back to per-member
-  singleton fits, not a blanket `no_signal`. Known follow-ups (documented): `collide_ppm` should be
-  ≤ the extraction tolerance; the reference is min-`target_id` (best-signal choice deferred); the
-  union grid recovers blends the star-restriction conservatively drops. **Deferred to PR-H2:** widen
-  the worker return to carry fitted `parameters_dict()` (for step 7's `StagedCalibration` rebuild) +
-  emit `panel_attribution_table` at iteration 0.
+  singleton fits, not a blanket `no_signal`. **Deferred to PR-H2:** widen the worker return to carry
+  fitted `parameters_dict()` (for step 7's `StagedCalibration` rebuild) + emit
+  `panel_attribution_table` at iteration 0.
+- ✓ **Hardening (follow-up 1 of 3):** `collide_ppm` is now auto-clamped to the trace's **recorded XIC
+  extraction tolerance** — `chromatogram extract` stamps `x.massspec.extraction_tolerance` into the
+  trace schema metadata; `counter estimate` reads it (overridable via `--extraction-tolerance-ppm`)
+  and clamps + warns, since a member beyond the extraction tolerance has no signal on the reference
+  grid (silent under-scoring otherwise). **Remaining hardening:** (2) best-signal reference vs
+  min-`target_id` — minor (the empty-reference singleton-fallback + star-restriction cover the
+  correctness case; a faint-but-present reference's theoretical grid is still valid); (3) the **union
+  grid** — the substantial fidelity fix that *recovers* the (transitive / off-reference) blends the
+  reference-star restriction conservatively drops, by merging members' own traces onto a superset
+  grid with shared co-isobaric cells (an architectural Panel change — the next major effort, not a
+  quick hardening).
 
 **Phase 3 — step 7 (no re-extraction):**
 - **PR-I** — `counter/run.py` + `massspec counter run`, calibrant-anchored: loop over the explicit

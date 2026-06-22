@@ -2883,9 +2883,12 @@ def _build_counter_estimate_parser(subs: argparse._SubParsersAction) -> None:
                    help="Disable the additive background channel.")
     p.add_argument("--collide-ppm", type=float, default=20.0,
                    help="m/z tolerance for grouping targets into channel-overlap "
-                        "components that are co-fit jointly (default 20). Should be ≤ the "
-                        "upstream XIC extraction tolerance — a member beyond that tolerance "
-                        "has no extracted signal on the reference grid.")
+                        "components that are co-fit jointly (default 20). Auto-clamped to "
+                        "the trace's recorded XIC extraction tolerance — a member beyond "
+                        "that tolerance has no extracted signal on the reference grid.")
+    p.add_argument("--extraction-tolerance-ppm", type=float, default=None,
+                   help="Override the trace's recorded XIC extraction tolerance (ppm) used "
+                        "to clamp --collide-ppm. Default: read from the trace metadata.")
     p.add_argument("--rt-overlap-s", type=float, default=None,
                    help="RT-center span (s) within which component members are co-fit as "
                         "one unit (default + max: --rt-window; larger values are clamped, "
@@ -3110,6 +3113,43 @@ def _counter_worker_unit(unit: list[dict]) -> list[dict]:
     return _counter_worker_component(unit)
 
 
+def _resolve_collide_ppm(args: argparse.Namespace) -> float:
+    """Clamp --collide-ppm to the XIC extraction tolerance: a member beyond the
+    tolerance the trace was extracted at has NO signal on the reference grid, so
+    grouping it would silently under-score it. The tolerance is read from the trace's
+    schema metadata (stamped by `chromatogram extract`); --extraction-tolerance-ppm
+    overrides; absent + no override → warn and leave --collide-ppm as-is."""
+    import pyarrow.parquet as pq
+
+    extraction_tol = args.extraction_tolerance_ppm
+    if extraction_tol is None:
+        try:
+            meta = pq.read_schema(args.trace).metadata or {}
+        except Exception:  # noqa: BLE001 — unreadable footer → treat as unrecorded
+            meta = {}
+        tol_b = meta.get(b"x.massspec.extraction_tolerance")
+        if tol_b is not None and meta.get(b"x.massspec.extraction_tolerance_unit") == b"ppm":
+            extraction_tol = float(tol_b.decode("utf-8"))
+    if extraction_tol is None:
+        if not args.no_progress:
+            print(
+                f"warning: trace records no ppm extraction tolerance; --collide-ppm "
+                f"{args.collide_ppm} not validated (pass --extraction-tolerance-ppm)",
+                file=sys.stderr,
+            )
+        return float(args.collide_ppm)
+    if args.collide_ppm > extraction_tol:
+        if not args.no_progress:
+            print(
+                f"warning: --collide-ppm {args.collide_ppm} > extraction tolerance "
+                f"{extraction_tol} ppm; clamping (a member beyond it has no extracted "
+                "signal on the reference grid)",
+                file=sys.stderr,
+            )
+        return float(extraction_tol)
+    return float(args.collide_ppm)
+
+
 def _cmd_counter_estimate(args: argparse.Namespace) -> int:
     import multiprocessing as mp
 
@@ -3137,11 +3177,12 @@ def _cmd_counter_estimate(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         rt_overlap_s = args.rt_window
+    collide_ppm = _resolve_collide_ppm(args)
     opts = dict(
         acquisition_id=args.acquisition_id, n_isotopes=args.n_isotopes,
         rt_window=args.rt_window, neighborhood_ppm=args.neighborhood_ppm,
         detect_threshold=args.detect_threshold, max_candidates=args.max_candidates,
-        background=args.background, collide_ppm=args.collide_ppm,
+        background=args.background, collide_ppm=collide_ppm,
         rt_overlap_s=rt_overlap_s, max_component_size=args.max_component_size,
     )
     # Partition into co-fit units in the parent (cheap, data-independent): m/z-overlap
