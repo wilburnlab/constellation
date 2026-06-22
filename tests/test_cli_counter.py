@@ -210,6 +210,99 @@ def test_cli_counter_estimate_on_bundle_directory(tmp_path):
     assert pq.read_table(out / "counter_n.parquet").num_rows == 1
 
 
+def test_cli_counter_estimate_emit_attribution(tmp_path):
+    p = _inputs(tmp_path)
+    out = p / "est_attr"
+    rc = _run([
+        "massspec", "counter", "estimate",
+        "--trace", str(p / "trace.parquet"),
+        "--scan-metadata", str(p / "scan_meta.parquet"),
+        "--calibration", str(p / "cal.parquet"),
+        "--targets", str(p / "targets.parquet"),
+        # --workers 2: the attribution pa.Table must round-trip through the spawn Pool
+        "-o", str(out), "--workers", "2", "--emit-attribution", "--no-progress",
+    ])
+    assert rc == 0
+    attr = pq.read_table(out / "peak_attribution.parquet")
+    assert attr.num_rows > 0
+    assert {"scan", "mz_observed", "progenitor_index", "responsibility", "target_id"} <= set(
+        attr.column_names
+    )
+    assert set(attr.column("target_id").to_pylist()) == {0}
+    # the stable physical-peak key is populated for a real (round-tripped) extraction
+    import pyarrow.compute as pc
+
+    assert pc.min(attr.column("scan")).as_py() >= 0
+    assert pc.all(pc.is_finite(attr.column("mz_observed"))).as_py()
+
+    # default (no flag) → no attribution file written
+    out2 = p / "est_noattr"
+    _run([
+        "massspec", "counter", "estimate",
+        "--trace", str(p / "trace.parquet"),
+        "--scan-metadata", str(p / "scan_meta.parquet"),
+        "--calibration", str(p / "cal.parquet"),
+        "--targets", str(p / "targets.parquet"),
+        "-o", str(out2), "--workers", "1", "--no-progress",
+    ])
+    assert not (out2 / "peak_attribution.parquet").exists()
+
+
+def test_cli_counter_emit_attribution_empty_still_writes_file(tmp_path):
+    # P2 #3: --emit-attribution must always write a schema-correct file, even when no
+    # target produces a row (here: an RT-center far from any scan → all no_signal).
+    p = _inputs(tmp_path)
+    tgt = cast_to_schema(
+        pa.table({"target_id": [0], "modified_sequence": [_SEQ],
+                  "precursor_charge": [2], "rt_center": [9.0e6]}),  # nowhere near the trace
+        XIC_TARGET_TABLE,
+    )
+    pq.write_table(tgt, p / "targets_far.parquet")
+    out = p / "est_empty_attr"
+    rc = _run([
+        "massspec", "counter", "estimate",
+        "--trace", str(p / "trace.parquet"),
+        "--scan-metadata", str(p / "scan_meta.parquet"),
+        "--calibration", str(p / "cal.parquet"),
+        "--targets", str(p / "targets_far.parquet"),
+        "-o", str(out), "--workers", "1", "--emit-attribution", "--no-progress",
+    ])
+    assert rc == 0
+    from constellation.massspec.counter import COUNTER_PEAK_ATTRIBUTION_TABLE
+
+    assert (out / "peak_attribution.parquet").exists()  # requested → present, not omitted
+    attr = pq.read_table(out / "peak_attribution.parquet")
+    assert attr.num_rows == 0
+    assert attr.schema.equals(COUNTER_PEAK_ATTRIBUTION_TABLE)
+
+
+def test_cli_counter_component_attribution_member_identities(tmp_path):
+    # P1 #2 end-to-end: a two-member co-fit component's attribution rows carry BOTH
+    # members' target_ids (each is_target=True), not just the reference's.
+    p = _inputs(tmp_path)
+    tgt = cast_to_schema(
+        pa.table({"target_id": [0, 1], "modified_sequence": [_SEQ, _SEQ],
+                  "precursor_charge": [2, 2], "rt_center": [1800.0, 1800.0]}),
+        XIC_TARGET_TABLE,
+    )
+    pq.write_table(tgt, p / "targets2.parquet")
+    out = p / "est_comp_attr"
+    rc = _run([
+        "massspec", "counter", "estimate",
+        "--trace", str(p / "trace.parquet"),
+        "--scan-metadata", str(p / "scan_meta.parquet"),
+        "--calibration", str(p / "cal.parquet"),
+        "--targets", str(p / "targets2.parquet"),
+        "-o", str(out), "--workers", "1", "--emit-attribution", "--no-progress",
+    ])
+    assert rc == 0
+    attr = pq.read_table(out / "peak_attribution.parquet")
+    rows = attr.to_pylist()
+    # both members appear as real targets (the reference 0 AND the co-member 1)
+    targets_flagged = {r["target_id"] for r in rows if r["is_target"]}
+    assert {0, 1} <= targets_flagged
+
+
 def test_counter_cofit_units_partition_and_size_cap():
     # the parent-side partitioner: two co-isobaric, co-eluting targets group into one
     # component; the size cap splits an oversized component back to singletons.

@@ -57,11 +57,16 @@ class CounterObservation:
     channel_z: torch.Tensor  # (C,) charge (long)
     channel_isotope: torch.Tensor  # (C,) isotope index (long)
     channel_mz: torch.Tensor  # (C,) theoretical m/z (float, Th)
-    # Source XIC_TRACE row id per filled `(scan, channel)` cell (-1 elsewhere),
-    # so a fitted panel's soft attribution can be mapped back to raw peaks
-    # ("what's left" after targets are searched). Optional — None for simulated /
-    # legacy observations that carry no raw-peak identity.
-    peak_id: torch.Tensor | None = None  # (S, C) long
+    # Stable physical-peak identity for mapping a fitted panel's soft attribution
+    # back to raw peaks ("what's left" after targets are searched, AND cross-panel
+    # reconciliation): `scan` is the (S,) scan-number axis; `source_mz` the (S, C)
+    # measured m/z [Th] of the peak in each filled cell (NaN elsewhere). The pair
+    # `(scan, source_mz)` is IDENTICAL for a peak extracted under different targets
+    # — a per-(target,scan,ion) trace row index is not — so it survives as the
+    # anti-join / cross-panel key. Optional — None for simulated / legacy
+    # observations built without a raw-peak source.
+    scan: torch.Tensor | None = None  # (S,) long — scan numbers
+    source_mz: torch.Tensor | None = None  # (S, C) float — observed m/z, NaN where unobserved
 
     @property
     def n_scans(self) -> int:

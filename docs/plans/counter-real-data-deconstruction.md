@@ -200,17 +200,21 @@ suite — incl. the DE/vmap fit path — stays green).
    scored at `global_offset + (channel_mz − reference_mz) + d_mz_k/z`; multi-progenitor panels
    re-resolve centers + responsibilities together each call (E-step). `PanelCellTerms` is a
    NamedTuple, so the decomposition flows through the DE/vmap path unchanged.
-3. ✓ **Persist γ (D7):** `peak_id` threaded from the input trace through `observe.py`
-   (stamped before the target/level filter, so it survives the subset) onto
-   `CounterObservation`; `emit.panel_attribution_table` re-derives γ from a fitted panel and
-   emits the sparse `(peak_id, progenitor_index, is_target, responsibility, n_obs_count,
-   iteration)` rows (`COUNTER_PEAK_ATTRIBUTION_TABLE`); `CounterResult` gains an optional
-   `peak_attribution` slot. Observed cells **no progenitor owns** (≈0 predicted flux — the
-   high-value unexplained/interferer peak) surface as `progenitor_index = -1` **residual rows**
-   (responsibility = the unmodeled share), so the anti-join never loses a raw peak.
-   "What's left" = anti-join the full peak set on the owned (`progenitor_index ≥ 0`) `peak_id`s.
-   *Follow-up:* emit it from the CLI `estimate` path by default, and back-match discovered
-   interferers to peptide identity (today `progenitor_index` is the panel-local key).
+3. ✓ **Persist γ (D7):** a stable `(scan, mz_observed)` physical-peak key threaded from the
+   input trace through `observe.py` onto `CounterObservation` (`scan` axis + `(S,C) source_mz`);
+   `emit.panel_attribution_table` re-derives γ from a fitted panel and emits the sparse
+   `(scan, mz_observed, progenitor_index, is_target, responsibility, n_obs_count, iteration)`
+   rows (`COUNTER_PEAK_ATTRIBUTION_TABLE`); `CounterResult` gains an optional `peak_attribution`
+   slot. Observed cells **no progenitor owns** (≈0 predicted flux — the high-value
+   unexplained/interferer peak) surface as `progenitor_index = -1` **residual rows**
+   (responsibility = the unmodeled share), so the anti-join never loses a raw peak. The key is
+   `(scan, mz_observed)` — NOT a per-`(target,scan,ion)` trace-row index — precisely so the SAME
+   physical peak extracted under different targets reconciles: "what's left" = anti-join the full
+   peak set on the owned (`progenitor_index ≥ 0`) `(scan, mz_observed)` keys, and a peak two
+   panels both claim shares one key. Component co-fits stamp each member's real `target_id` via
+   `panel_attribution_table(progenitor_target_ids=…)`. *Follow-up:* the CLI `estimate --emit-
+   attribution` path is wired; still to do — back-match discovered interferers to peptide identity
+   (today `progenitor_index` is the panel-local key for an anonymous same-grid clone).
 4. ✓ **Cell-level loss exclusion (L4 filter + D9 benchmark knob):** `panel_log_prob` /
    `Panel` accept `exclude_mask` (per-`(S,C)`) + `gamma_loss_threshold`. Excluded cells leave
    **both** the observed and censored sets — *inferred, not scored* — so they cannot leak into
@@ -245,8 +249,8 @@ is touched.
   global offset + loose-then-tight filtering.
 - **Dense-grid one-peak-per-cell limit.** The `(S,C)` observation holds one value per
   `(scan, channel)`; near-isobaric candidates are expressed via *separate progenitors with
-  per-progenitor centers* (D6), not multiple peaks in one cell. The peak_id side-table (step
-  3) is what preserves the raw contenders for the index.
+  per-progenitor centers* (D6), not multiple peaks in one cell. The `(scan, mz_observed)`
+  attribution side-table (step 3) is what preserves the raw contenders for the index.
 - **Per-ion logL is abundance-confounded** — selection must normalize (N-share + m/z fit),
   never raw magnitude.
 - **L7 convergence discipline.** The loop re-fits global params on fixed observations
@@ -347,9 +351,14 @@ superseded by VB-on-panel.
   members split off. (ii) `--rt-overlap-s` is clamped to `--rt-window` (a unit can't span beyond the
   obs window) + a defensive μ-bound guard in `estimate_component` (skip narrowing for a prior outside
   the obs window — no `lo>hi` inversion crash). (iii) an empty reference grid falls back to per-member
-  singleton fits, not a blanket `no_signal`. **Deferred to PR-H2:** widen the worker return to carry
-  fitted `parameters_dict()` (for step 7's `StagedCalibration` rebuild) + emit
-  `panel_attribution_table` at iteration 0.
+  singleton fits, not a blanket `no_signal`.
+- ✓ **PR-H2 (attribution emission):** `counter estimate --emit-attribution` writes the sparse
+  ion→progenitor soft-attribution map (`COUNTER_PEAK_ATTRIBUTION_TABLE`, the "what's left" /
+  interference bookkeeping) alongside the count table. The worker contract is now uniform —
+  `(records, attribution)` per unit; the singleton path has its panel in hand, the component path
+  gets it via `estimate_component(return_panel=True)`; the parent concatenates + saves it in the
+  `CounterResult` bundle. Opt-in (default off → byte-identical count output). The fitted-`parameters_dict`
+  return for step 7's `StagedCalibration` rebuild stays deferred to step 7 (its needs are clearer there).
 - ✓ **Hardening (follow-up 1 of 3):** `collide_ppm` is now auto-clamped to the trace's **recorded XIC
   extraction tolerance** — `chromatogram extract` stamps `x.massspec.extraction_tolerance` into the
   trace schema metadata; `counter estimate` reads it (overridable via `--extraction-tolerance-ppm`)
@@ -373,7 +382,8 @@ superseded by VB-on-panel.
   (`N_target/N_panel`) **and** a normalized m/z-fit score (median `|mz_error|/σ` from
   `panel_cell_log_prob`), the abundance-de-confounded criterion — **never raw logL**. Selection
   scalars extracted under `@torch.no_grad` (never in the DE objective). Cross-panel γ reconciliation
-  = Arrow `group_by` on the attribution `peak_id`. Default when `--calibrants` omitted. Riskiest /
+  = Arrow `group_by` on the attribution `(scan, mz_observed)` key (stable across targets, unlike a
+  trace-row index). Default when `--calibrants` omitted. Riskiest /
   untuned — **hand-labeled clean/blend/interfered fixtures first** (per
   [[feedback-synthetic-test-fixtures]]); the test must include a bright *interfered* peptide that
   raw-logL would wrongly select, asserting it is rejected.

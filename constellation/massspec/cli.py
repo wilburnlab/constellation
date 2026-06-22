@@ -29,6 +29,7 @@ import argparse
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 from constellation.massspec.search.encyclopedia.ptm_defaults import (
     PTM_NAMES as _PTM_NAMES,
@@ -2897,6 +2898,10 @@ def _build_counter_estimate_parser(subs: argparse._SubParsersAction) -> None:
                    help="Co-fit units larger than this fall back to independent "
                         "single-target fits (guards against a dense isobaric region "
                         "chaining into one pool-stalling mega-panel).")
+    p.add_argument("--emit-attribution", action="store_true",
+                   help="Also write the sparse ion→progenitor soft-attribution map "
+                        "(COUNTER_PEAK_ATTRIBUTION_TABLE) — the 'what's left' / interference "
+                        "bookkeeping — alongside the count table.")
     p.set_defaults(func=_cmd_counter_estimate)
 
 
@@ -2945,8 +2950,10 @@ def _counter_worker_init(trace_path: str, scan_meta_path: str, calibration_path:
     )
 
 
-def _counter_worker_estimate(target: dict) -> dict:
-
+def _counter_worker_estimate(target: dict) -> tuple[list[dict], Any]:
+    """Singleton per-target fit. Returns (records, attribution) — the uniform worker
+    contract; `attribution` is a COUNTER_PEAK_ATTRIBUTION_TABLE (or None unless
+    `--emit-attribution`)."""
     import pyarrow.compute as pc
 
     from constellation.core.sequence.proforma import Peptidoform
@@ -2956,6 +2963,7 @@ def _counter_worker_estimate(target: dict) -> dict:
         Progenitor,
         estimate_panel,
         observation_for_region,
+        panel_attribution_table,
     )
 
     opts, cal, trace, ms1 = (_COUNTER_CTX[k] for k in ("opts", "cal", "trace", "ms1"))
@@ -2975,15 +2983,19 @@ def _counter_worker_estimate(target: dict) -> dict:
         obs, region = observation_for_region(trace, win, prog, target_id=tid,
                                              neighborhood_ppm=opts["neighborhood_ppm"])
         if int(obs.mask.sum()) == 0:
-            return {**base, "status": "no_signal"}
+            return [{**base, "status": "no_signal"}], None
         panel = Panel([prog], cal, background=opts["background"])
         cfg = DiscoverConfig(detect_threshold=opts["detect_threshold"],
                              max_candidates=opts["max_candidates"])
         res = estimate_panel(panel, obs, region, config=cfg, rt_prior_ms=rtc * 1000.0,
                              inference="map")
-        return {**base, **res, "status": "ok"}
+        attr = (
+            panel_attribution_table(panel, obs, acquisition_id=opts["acquisition_id"], target_id=tid)
+            if opts.get("emit_attribution") else None
+        )
+        return [{**base, **res, "status": "ok"}], attr
     except Exception as exc:  # noqa: BLE001 — one bad seed shouldn't kill the run
-        return {**base, "status": f"error:{type(exc).__name__}"}
+        return [{**base, "status": f"error:{type(exc).__name__}"}], None
 
 
 def _counter_cofit_units(targets: list[dict], opts: dict) -> tuple[list[list[dict]], int]:
@@ -3048,10 +3060,11 @@ def _counter_cofit_units(targets: list[dict], opts: dict) -> tuple[list[list[dic
     return units, n_capped
 
 
-def _counter_worker_component(unit: list[dict]) -> list[dict]:
+def _counter_worker_component(unit: list[dict]) -> tuple[list[dict], Any]:
     """Joint co-fit of a multi-member unit — one panel over the reference member's
-    grid (`unit[0]`), each member scored at its own mass defect. Returns one record
-    per member."""
+    grid (`unit[0]`), each member scored at its own mass defect. Returns (records,
+    attribution) per the uniform worker contract (one record per member)."""
+    import pyarrow as pa
     import pyarrow.compute as pc
 
     from constellation.core.sequence.proforma import Peptidoform
@@ -3060,9 +3073,11 @@ def _counter_worker_component(unit: list[dict]) -> list[dict]:
         Progenitor,
         estimate_component,
         observation_for_region,
+        panel_attribution_table,
     )
 
     opts, cal, trace, ms1 = (_COUNTER_CTX[k] for k in ("opts", "cal", "trace", "ms1"))
+    emit = bool(opts.get("emit_attribution"))
     members = sorted(unit, key=lambda t: int(t["target_id"]))  # reference = min target_id
     bases = [
         {
@@ -3094,24 +3109,41 @@ def _counter_worker_component(unit: list[dict]) -> list[dict]:
             # faint/absent reference grid → don't blanket-no_signal the co-members
             # (the reference is min target_id, arbitrary w.r.t. abundance); fit each
             # member on its OWN grid as an independent singleton.
-            return [_counter_worker_estimate(t) for t in members]
+            subs = [_counter_worker_estimate(t) for t in members]
+            records = [r for s in subs for r in s[0]]
+            attrs = [s[1] for s in subs if s[1] is not None]
+            return records, (pa.concat_tables(attrs) if attrs else None)
         cfg = DiscoverConfig(
             detect_threshold=opts["detect_threshold"], max_candidates=opts["max_candidates"]
         )
-        results = estimate_component(
+        out = estimate_component(
             progs, obs, config=cfg, background=opts["background"],
             rt_priors_ms=[float(t["rt_center"]) * 1000.0 for t in members],
+            return_panel=emit,
         )
-        return [{**b, **r, "status": "ok"} for b, r in zip(bases, results)]
+        if emit:
+            results, panel = out
+            attr = panel_attribution_table(
+                panel, obs, acquisition_id=opts["acquisition_id"],
+                target_id=int(members[0]["target_id"]),
+                # the panel's progenitors ARE the members in order (a component
+                # does no discovery), so stamp each row with its member's real
+                # target_id rather than flattening co-members into anonymous
+                # interferers under the reference's id.
+                progenitor_target_ids=[int(m["target_id"]) for m in members],
+            )
+        else:
+            results, attr = out, None
+        return [{**b, **r, "status": "ok"} for b, r in zip(bases, results)], attr
     except Exception as exc:  # noqa: BLE001 — one bad component shouldn't kill the run
-        return [{**b, "status": f"error:{type(exc).__name__}"} for b in bases]
+        return [{**b, "status": f"error:{type(exc).__name__}"} for b in bases], None
 
 
-def _counter_worker_unit(unit: list[dict]) -> list[dict]:
+def _counter_worker_unit(unit: list[dict]) -> tuple[list[dict], Any]:
     """Dispatch a co-fit unit: a singleton → the per-target discovery path; a
-    multi-member unit → the joint component co-fit."""
+    multi-member unit → the joint component co-fit. Both return (records, attribution)."""
     if len(unit) == 1:
-        return [_counter_worker_estimate(unit[0])]
+        return _counter_worker_estimate(unit[0])
     return _counter_worker_component(unit)
 
 
@@ -3191,6 +3223,7 @@ def _cmd_counter_estimate(args: argparse.Namespace) -> int:
         detect_threshold=args.detect_threshold, max_candidates=args.max_candidates,
         background=args.background, collide_ppm=collide_ppm,
         rt_overlap_s=rt_overlap_s, max_component_size=args.max_component_size,
+        emit_attribution=args.emit_attribution,
     )
     # Partition into co-fit units in the parent (cheap, data-independent): m/z-overlap
     # components × RT co-elution. Singletons stay on the per-target discovery path; a
@@ -3207,17 +3240,35 @@ def _cmd_counter_estimate(args: argparse.Namespace) -> int:
             grouped = [_counter_worker_unit(u) for u in units]
         finally:
             _COUNTER_CTX.clear()  # don't leak this run's trace/cal into a later in-process call
-    records = [r for group in grouped for r in group]
+    records = [r for group, _attr in grouped for r in group]
+    attr_tables = [attr for _group, attr in grouped if attr is not None]
 
     ok = [r for r in records if r.get("status") == "ok"]
     skipped = len(records) - len(ok)
     n_multi = sum(1 for u in units if len(u) > 1)
+    peak_attribution = None
+    if attr_tables:
+        import pyarrow as pa
+
+        peak_attribution = pa.concat_tables(attr_tables)
+    elif args.emit_attribution:
+        # --emit-attribution was requested but no unit produced rows (every target
+        # no_signal / errored). Write the schema-correct EMPTY table so the requested
+        # output file always exists rather than being silently omitted.
+        from constellation.massspec.counter import COUNTER_PEAK_ATTRIBUTION_TABLE
+
+        peak_attribution = COUNTER_PEAK_ATTRIBUTION_TABLE.empty_table()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    save_counter(CounterResult(counter_n=counter_n_table(ok)), args.output_dir)
+    save_counter(
+        CounterResult(counter_n=counter_n_table(ok), peak_attribution=peak_attribution),
+        args.output_dir,
+    )
     success.touch()
     if not args.no_progress:
         extra = f", {n_multi} co-fit components" if n_multi else ""
         extra += f", {n_capped} oversized split" if n_capped else ""
+        if peak_attribution is not None:
+            extra += f", {peak_attribution.num_rows} attribution rows"
         print(f"counter estimate: {len(ok)} estimated, {skipped} skipped{extra} → {args.output_dir}",
               file=sys.stderr)
     return 0

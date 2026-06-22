@@ -187,18 +187,20 @@ def _round_trip_obs(prog: Progenitor) -> tuple[CounterObservation, pa.Table]:
     ), trace
 
 
-def test_peak_id_threaded_through_observe() -> None:
+def test_source_identity_threaded_through_observe() -> None:
     cal = _cal()
     prog = _progenitor(cal)
-    obs2, trace = _round_trip_obs(prog)
-    assert obs2.peak_id is not None
-    assert obs2.peak_id.shape == obs2.intensity.shape
-    # filled cells carry a non-negative source row; empties stay -1
-    assert torch.equal(obs2.peak_id >= 0, obs2.mask)
-    # each source row is used at most once (no dedup collision in a clean round-trip)
-    used = obs2.peak_id[obs2.mask].tolist()
-    assert len(used) == len(set(used))
-    assert max(used) < trace.num_rows
+    obs2, _trace = _round_trip_obs(prog)
+    # scan axis (S,) + observed m/z (S, C) — the stable (scan, mz_observed) key
+    assert obs2.scan is not None and obs2.scan.shape == obs2.rt.shape
+    assert obs2.source_mz is not None and obs2.source_mz.shape == obs2.intensity.shape
+    # source_mz is finite exactly at the observed cells; NaN elsewhere
+    assert torch.equal(torch.isfinite(obs2.source_mz), obs2.mask)
+    # the observed m/z is a real measured m/z near its channel (not a row index /
+    # zero / NaN) — within 0.1% even after the simulator's fat-tailed m/z noise
+    s_i, c_i = obs2.mask.nonzero(as_tuple=True)
+    rel = (obs2.source_mz[s_i, c_i] - obs2.channel_mz[c_i]).abs() / obs2.channel_mz[c_i]
+    assert torch.all(rel < 1e-3)
 
 
 def test_panel_attribution_table_single_progenitor() -> None:
@@ -213,8 +215,9 @@ def test_panel_attribution_table_single_progenitor() -> None:
     resp = tbl.column("responsibility").to_numpy()
     assert np.allclose(resp, 1.0)
     assert pc.all(tbl.column("is_target")).as_py()
-    # every emitted peak_id is a real observed source row
-    assert pc.min(tbl.column("peak_id")).as_py() >= 0
+    # every emitted row carries a real observed peak identity (scan + finite m/z)
+    assert pc.min(tbl.column("scan")).as_py() >= 0
+    assert pc.all(pc.is_finite(tbl.column("mz_observed"))).as_py()
 
 
 def test_panel_attribution_table_two_progenitors_split() -> None:
@@ -256,35 +259,75 @@ def test_attribution_emits_residual_row_for_unowned_cell() -> None:
     tbl = panel_attribution_table(Panel([prog], cal), obs2, acquisition_id=0, target_id=5)
     assert -1 in tbl.column("progenitor_index").to_pylist()
     resid = tbl.filter(pc.equal(tbl.column("progenitor_index"), -1))
-    # the residual rows preserve the raw peak_id (so the "what's left" anti-join
-    # never loses an unexplained peak) and are not flagged as the target
-    assert pc.min(resid.column("peak_id")).as_py() >= 0
+    # the residual rows preserve the raw (scan, mz_observed) identity (so the
+    # "what's left" anti-join never loses an unexplained peak) and are not the target
+    assert pc.min(resid.column("scan")).as_py() >= 0
+    assert pc.all(pc.is_finite(resid.column("mz_observed"))).as_py()
     assert not pc.any(resid.column("is_target")).as_py()
 
 
-def test_observe_overwrites_stale_source_row() -> None:
+def test_source_identity_stable_across_targets() -> None:
+    # The whole point of (scan, mz_observed) over a trace row index: the SAME physical
+    # peak extracted under two different targets gets the SAME key, so a cross-panel
+    # anti-join can tell two panels claimed one peak. A per-(target,scan,ion) row index
+    # cannot — the same peak occupies distinct rows under different targets.
     cal = _cal()
     prog = _progenitor(cal)
-    obs = _obs(prog, seed=7)
-    trace, scan_meta = observation_to_trace(
-        obs, acquisition_id=0, target_id=5, modified_sequence="PEPTIDEKR"
+    z, k = int(prog.channel_z[0]), int(prog.channel_isotope[0])
+    mz = float(prog.channel_mz[0])  # one shared physical peak at the M+0 z-channel
+    trace = pa.table(
+        {
+            "target_id": pa.array([5, 6], pa.int64()),  # two targets, distinct rows
+            "scan": pa.array([10, 10], pa.int32()),  # same scan
+            "precursor_charge": pa.array([z, z], pa.int32()),
+            "isotope": pa.array([k, k], pa.int32()),
+            "intensity": pa.array([1.0e4, 1.0e4], pa.float64()),
+            "mz_observed": pa.array([mz, mz], pa.float64()),  # same measured m/z
+            "mz_error_ppm": pa.array([0.0, 0.0], pa.float64()),
+            "level": pa.array([1, 1], pa.int32()),
+        }
     )
-    # a caller that collides with the internal column must NOT corrupt peak_id
-    poisoned = trace.append_column(
-        "__source_row", pa.array([999] * trace.num_rows, pa.int64())
+    scan_meta = pa.table(
+        {
+            "scan": pa.array([10], pa.int32()),
+            "rt": pa.array([100.0], pa.float64()),
+            "iit": pa.array([20.0], pa.float64()),
+        }
     )
-    obs2 = observation_from_trace(
-        poisoned,
-        scan_meta,
-        channel_z=prog.channel_z,
-        channel_isotope=prog.channel_isotope,
-        channel_mz=prog.channel_mz,
-        target_id=5,
-        level=1,
+    kw = dict(
+        channel_z=prog.channel_z, channel_isotope=prog.channel_isotope,
+        channel_mz=prog.channel_mz, level=1,
     )
-    used = obs2.peak_id[obs2.mask].tolist()
-    assert len(used) > 1 and len(set(used)) == len(used)  # fresh, unique — not all 999
-    assert max(used) < poisoned.num_rows
+    o5 = observation_from_trace(trace, scan_meta, target_id=5, **kw)
+    o6 = observation_from_trace(trace, scan_meta, target_id=6, **kw)
+    # the shared peak lands at the same cell with a byte-identical stable key
+    s, c = (int(i) for i in o5.mask.nonzero(as_tuple=False)[0])
+    assert int(o5.scan[s]) == int(o6.scan[s]) == 10
+    assert float(o5.source_mz[s, c]) == float(o6.source_mz[s, c]) == mz
+
+
+def test_component_attribution_carries_member_identities() -> None:
+    # P1 #2: a component co-fit's known members must each keep their own target_id +
+    # is_target, not all inherit the reference member's id as anonymous interferers.
+    cal = _cal()
+    p1, p2 = _progenitor(cal), _progenitor(cal)
+    obs2, _ = _round_trip_obs(p1)
+    panel = Panel([p1, p2], cal)
+    tbl = panel_attribution_table(
+        panel, obs2, acquisition_id=0, target_id=5, progenitor_target_ids=[5, 7]
+    )
+    rows = tbl.to_pylist()
+    # progenitor 0 → target 5, progenitor 1 → target 7; both flagged as real targets
+    by_prog = {(r["progenitor_index"], r["target_id"], r["is_target"]) for r in rows}
+    assert (0, 5, True) in by_prog
+    assert (1, 7, True) in by_prog
+    # no row mislabels member 1's peaks as belonging to the reference target 5
+    assert not any(r["progenitor_index"] == 1 and r["target_id"] == 5 for r in rows)
+    # a length mismatch is rejected rather than silently mis-mapping
+    with pytest.raises(ValueError, match="progenitor_target_ids"):
+        panel_attribution_table(
+            panel, obs2, acquisition_id=0, target_id=5, progenitor_target_ids=[5]
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────

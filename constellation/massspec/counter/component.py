@@ -35,11 +35,13 @@ def estimate_component(
     background: bool = False,
     rt_priors_ms: Sequence[float | None] | None = None,
     mu_window_ms: float = 30000.0,
+    return_panel: bool = False,
     **fit_kw: Any,
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], Panel]:
     """Co-fit a component's `members` as one panel; return one `COUNTER_N_TABLE`
     numeric-field dict per member (in `members` order — the caller maps the index
-    back to its `target_id`).
+    back to its `target_id`). With `return_panel=True` returns `(records, panel)` so
+    the caller can read the fitted panel (e.g. to emit the attribution map).
 
     `members` must share the calibration AND the channel structure (same
     charges × isotopes count, so the additive panel stacks); `members[0]` is the
@@ -88,7 +90,7 @@ def estimate_component(
     converged = bool(getattr(result, "converged", True))
     # Each member reports its own N + Laplace CI on its peak block; the "discovered
     # interferers" for member i are the other len-1 co-isobaric members.
-    return [
+    records = [
         _target_n_from_panel(
             panel,
             obs,
@@ -99,3 +101,4 @@ def estimate_component(
         )
         for i in range(len(members))
     ]
+    return (records, panel) if return_panel else records

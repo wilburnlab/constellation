@@ -35,7 +35,7 @@ COUNTER_N_SCHEMA_VERSION: int = 1
 # still loads — `calibration_from_table` reads the new slots with `.get`.
 COUNTER_CALIBRATION_SCHEMA_VERSION: int = 2
 COUNTER_PEPTIDE_PARAMS_SCHEMA_VERSION: int = 1
-COUNTER_PEAK_ATTRIBUTION_SCHEMA_VERSION: int = 1
+COUNTER_PEAK_ATTRIBUTION_SCHEMA_VERSION: int = 2
 
 
 COUNTER_N_TABLE: pa.Schema = pa.schema(
@@ -136,17 +136,27 @@ COUNTER_PEAK_ATTRIBUTION_TABLE: pa.Schema = pa.schema(
     [
         pa.field("acquisition_id", pa.int64(), nullable=False),
         pa.field("target_id", pa.int64(), nullable=False),
-        # Panel-local progenitor index (0 = the target; ≥1 = a discovered
-        # interferer; -1 = unattributed residual — an observed peak no progenitor
-        # owns at ≥ weight_floor, the "what's left" signal) + a convenience flag. A
-        # discovered interferer has no peptide identity yet (same-grid clone), so
-        # `progenitor_index` is the stable key within one panel fit.
+        # Panel-local progenitor index (0..Q-1) + a convenience flag. In a SINGLETON
+        # fit: 0 = the target, ≥1 = a discovered interferer (no peptide identity yet
+        # — a same-grid clone), -1 = unattributed residual (an observed peak no
+        # progenitor owns at ≥ weight_floor — the "what's left" signal). In a
+        # COMPONENT co-fit every index 0..Q-1 is a KNOWN member: each row then
+        # carries that member's own `target_id` with `is_target = True`, so
+        # co-members are never flattened into anonymous interferers. Residual /
+        # anonymous-interferer rows carry the reference panel's `target_id` with
+        # `is_target = False`.
         pa.field("progenitor_index", pa.int32(), nullable=False),
         pa.field("is_target", pa.bool_(), nullable=False),
-        # Source XIC_TRACE row id of the attributed peak (-1 if the observation
-        # carried no raw-peak identity, e.g. simulated). The join key for the
-        # "what's left" anti-join against the full peak set.
-        pa.field("peak_id", pa.int64(), nullable=False),
+        # Stable physical-peak identity (`scan` = scan number, `mz_observed` =
+        # measured m/z [Th]) of the attributed peak. Unlike a per-(target,scan,ion)
+        # XIC_TRACE row index, this pair is IDENTICAL for a peak extracted under
+        # different targets — so it is the join key for BOTH the "what's left"
+        # anti-join against the full peak set AND cross-panel reconciliation (two
+        # panels that claim one peak share its (scan, mz_observed)). `scan = -1` /
+        # `mz_observed = NaN` when the observation carried no raw-peak identity
+        # (e.g. simulated, or a trace lacking `mz_observed`).
+        pa.field("scan", pa.int64(), nullable=False),
+        pa.field("mz_observed", pa.float64(), nullable=False),
         pa.field("channel_z", pa.int8(), nullable=False),
         pa.field("channel_isotope", pa.int8(), nullable=False),
         # γ_q ∈ (0, 1]: this progenitor's soft (intensity-weighted) share of the
