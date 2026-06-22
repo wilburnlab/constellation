@@ -2930,8 +2930,10 @@ def _counter_worker_init(trace_path: str, scan_meta_path: str, calibration_path:
     import pyarrow.parquet as pq
 
     from constellation.massspec.counter import calibration_from_table
+    from constellation.massspec.quant.chromatogram import load_xic
 
-    trace = pq.read_table(trace_path)
+    # load_xic handles both a `chromatogram extract` bundle directory and a bare parquet.
+    trace = load_xic(trace_path)
     sm = pq.read_table(scan_meta_path)
     if "level" in sm.column_names:
         sm = sm.filter(pc.equal(sm.column("level"), 1))
@@ -3123,8 +3125,13 @@ def _resolve_collide_ppm(args: argparse.Namespace) -> float:
 
     extraction_tol = args.extraction_tolerance_ppm
     if extraction_tol is None:
+        # --trace may be a `chromatogram extract` BUNDLE DIRECTORY (xic_trace.parquet +
+        # manifest.json) or a bare parquet; read the schema from the right place.
+        schema_path = (
+            args.trace / "xic_trace.parquet" if args.trace.is_dir() else args.trace
+        )
         try:
-            meta = pq.read_schema(args.trace).metadata or {}
+            meta = pq.read_schema(schema_path).metadata or {}
         except Exception:  # noqa: BLE001 — unreadable footer → treat as unrecorded
             meta = {}
         tol_b = meta.get(b"x.massspec.extraction_tolerance")

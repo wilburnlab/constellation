@@ -176,6 +176,40 @@ def test_resolve_collide_ppm_clamps_to_extraction_tolerance(tmp_path):
     assert _resolve_collide_ppm(_args(p / "trace.parquet", 20.0)) == 20.0
 
 
+def test_resolve_collide_ppm_reads_bundle_directory(tmp_path):
+    # the canonical `chromatogram extract` output is a BUNDLE DIR (xic_trace.parquet +
+    # manifest.json) — the clamp must read the parquet inside it, not fail on the dir.
+    from constellation.massspec.cli import _resolve_collide_ppm
+    from constellation.massspec.quant.chromatogram import _stamp_extraction_tolerance, save_xic
+
+    p = _inputs(tmp_path)
+    bundle = p / "trace_bundle"
+    save_xic(_stamp_extraction_tolerance(pq.read_table(p / "trace.parquet"), 10.0, "ppm"), bundle)
+    args = argparse.Namespace(
+        trace=bundle, collide_ppm=20.0, extraction_tolerance_ppm=None, no_progress=True
+    )
+    assert _resolve_collide_ppm(args) == 10.0
+
+
+def test_cli_counter_estimate_on_bundle_directory(tmp_path):
+    # end-to-end on a bundle dir: the worker's load_xic must read it too.
+    from constellation.massspec.quant.chromatogram import save_xic
+
+    p = _inputs(tmp_path)
+    save_xic(pq.read_table(p / "trace.parquet"), p / "trace_bundle")
+    out = p / "est_bundle"
+    rc = _run([
+        "massspec", "counter", "estimate",
+        "--trace", str(p / "trace_bundle"),
+        "--scan-metadata", str(p / "scan_meta.parquet"),
+        "--calibration", str(p / "cal.parquet"),
+        "--targets", str(p / "targets.parquet"),
+        "-o", str(out), "--workers", "1", "--no-progress",
+    ])
+    assert rc == 0
+    assert pq.read_table(out / "counter_n.parquet").num_rows == 1
+
+
 def test_counter_cofit_units_partition_and_size_cap():
     # the parent-side partitioner: two co-isobaric, co-eluting targets group into one
     # component; the size cap splits an oversized component back to singletons.
