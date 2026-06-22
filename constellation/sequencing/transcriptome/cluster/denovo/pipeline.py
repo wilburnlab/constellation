@@ -16,13 +16,15 @@ on the same edge).
 from __future__ import annotations
 
 import multiprocessing as mp
+import sys
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from constellation.core.sequence.nucleic import STANDARD, CodonTable, find_orfs
 from constellation.sequencing.schemas.quant import FEATURE_QUANT
@@ -112,6 +114,25 @@ def _best_clean_orf(seq: str, *, min_aa_length: int):
     return max(per_stop.values(), key=lambda o: o.length)
 
 
+# A single cluster holding more unique sequences than this is almost
+# certainly a connected-components chaining artifact (a low-complexity or
+# repeat minimizer bridging unrelated reads) rather than a real transcript.
+_MEGA_CLUSTER_UNIQUES = 2_000_000
+
+# Edlib budget (fraction of the shorter length) for re-aligning a member to
+# its centroid when the edge wasn't directly verified.
+_REALIGN_MAX_FRAC = 0.15
+
+# Consensus / variant / haplotype statistics saturate well before this many
+# unique members; capping the members that feed the per-cluster PWM bounds
+# memory + edlib work for both genuinely high-expression clusters and
+# chaining artifacts. Quant + membership still cover every read.
+_CONSENSUS_MAX_MEMBERS = 20_000
+
+# Variant positions feeding the haplotype matrix + pairwise r². The variant
+# table keeps every position; only the covariance build is capped.
+_HAPLOTYPE_MAX_VARIANTS = 64
+
 # ── Per-cluster consensus + ORF + member metrics (fork-shared globals) ──
 _W: dict[str, Any] = {}
 
@@ -132,7 +153,12 @@ def _member_alignment(c: int, m: int):
         return s, lng, int(hit[0]), hit[1]
     import edlib
 
-    res = edlib.align(seqs[s], seqs[lng], mode="HW", task="path")
+    # Bounded re-align: members reach the centroid through the component but
+    # may be many edits away. Cap the edlib budget so a chain-far member exits
+    # fast (returns None → default metrics, excluded from the consensus PWM by
+    # the consensus_gate anyway) instead of doing unbounded path-construction.
+    budget = int(_REALIGN_MAX_FRAC * min(int(seqlen[s]), int(seqlen[lng])))
+    res = edlib.align(seqs[s], seqs[lng], mode="HW", task="path", k=budget)
     if res["editDistance"] < 0 or not res["locations"]:
         return None
     return s, lng, int(res["locations"][0][0]), (res["cigar"] or "")
@@ -166,11 +192,18 @@ def _cluster_chunk(
     for cid in range(lo, hi):
         c = int(centroid[cid])
         mem = members[ptr[cid] : ptr[cid + 1]]
+        nonc = mem[mem != c]
+        # Cap the members that get aligned + vote in the consensus to the
+        # most-abundant N (statistics saturate; bounds memory + edlib on
+        # high-expression or chained clusters). Overflow members keep their
+        # default membership metrics and still count toward quant.
+        if nonc.shape[0] > _CONSENSUS_MAX_MEMBERS:
+            top = nonc[np.argsort(-abund[nonc], kind="stable")[:_CONSENSUS_MAX_MEMBERS]]
+        else:
+            top = nonc
         specs: list[MemberSpec] = []
-        for m in mem:
+        for m in top:
             m = int(m)
-            if m == c:
-                continue
             al = _member_alignment(c, m)
             if al is None:
                 metric_out.append((m, int(seqlen[m]), 0, 0, 0, 0, 0, 0))
@@ -202,21 +235,35 @@ def _cluster_chunk(
             if vrows:
                 keep = cres.winner < 4
                 centroid_of_cons = np.flatnonzero(keep)
-                var_cons = np.array([r[0] for r in vrows], dtype=np.int64)
-                var_centroid = centroid_of_cons[var_cons]
                 member_weights = np.array(
                     [float(abund[c])] + [s.weight for s in specs], dtype=np.float64
                 )
+                # Cap the variant positions feeding the haplotype matrix +
+                # pairwise r² to the most-supported ones — bounds the (M, V)
+                # allele matrix and the list<int32> column (a real offset-
+                # overflow risk if a chained cluster has thousands of variants).
+                if len(vrows) > _HAPLOTYPE_MAX_VARIANTS:
+                    sel = sorted(
+                        sorted(range(len(vrows)), key=lambda i: -vrows[i][6])[
+                            :_HAPLOTYPE_MAX_VARIANTS
+                        ]
+                    )
+                else:
+                    sel = list(range(len(vrows)))
+                sub = [vrows[i] for i in sel]
+                var_cons = np.array([r[0] for r in sub], dtype=np.int64)
+                var_centroid = centroid_of_cons[var_cons]
                 hres = build_haplotypes(
                     cres,
                     var_centroid,
                     var_cons,
-                    [r[2] for r in vrows],
-                    [r[1] for r in vrows],
+                    [r[2] for r in sub],
+                    [r[1] for r in sub],
                     member_weights,
                 )
+                r2_by_idx = {sel[j]: float(hres.max_r2[j]) for j in range(len(sub))}
                 for i, vr in enumerate(vrows):
-                    variant_out.append((cid, *vr, float(hres.max_r2[i])))
+                    variant_out.append((cid, *vr, r2_by_idx.get(i, 0.0)))
                 for hid, (astr, ab, nu, comp) in enumerate(hres.haplotypes):
                     haplotype_out.append(
                         (cid, hid, astr, hres.variant_positions, ab, nu, comp)
@@ -254,13 +301,19 @@ def assemble_clusters(
     error_model: ErrorModel | None = None,
     fit_empirical: bool = False,
     threads: int = 1,
+    progress: Callable[[str], None] | None = None,
 ) -> AssembledClusters:
     """Pure in-memory de novo first-round assembly over a reads table.
 
     ``reads`` carries ``(read_id, sequence, sample_id)`` — the trimmed
-    transcript windows of Complete, non-fragment reads.
+    transcript windows of Complete, non-fragment reads. ``progress`` is an
+    optional ``str -> None`` sink called at each stage boundary (the CLI
+    wires it to a flushing stderr printer so the last line before a crash
+    pinpoints the failing stage).
     """
+    log = progress or (lambda _m: None)
     n_input = reads.num_rows
+    log(f"dereplicating {n_input:,} reads…")
     uniq_table, read_map = dereplicate(reads)
     n_uniq = uniq_table.num_rows
     empty = AssembledClusters(
@@ -273,6 +326,7 @@ def assemble_clusters(
         n_uniq,
     )
     if n_uniq == 0:
+        log("no unique sequences — nothing to cluster")
         return empty
 
     seqs = uniq_table.column("sequence").to_pylist()
@@ -283,8 +337,13 @@ def assemble_clusters(
         uniq_table.column("seq_len").to_numpy(zero_copy_only=False).astype(np.int64)
     )
 
+    log(f"{n_uniq:,} unique sequences — extracting minimizers (k={kmer}, w={window})…")
     index = extract_minimizers(uniq_table.column("sequence"), k=kmer, w=window)
+    log(f"{index.mini_hash.shape[0]:,} minimizers — generating candidate pairs…")
     candidates = generate_candidates(index, abundance)
+    log(
+        f"{candidates.num_rows:,} candidate pairs — verifying (edlib, identity≥{identity})…"
+    )
     accepted = verify_candidates(
         candidates,
         seqs,
@@ -293,6 +352,7 @@ def assemble_clusters(
         max_3p=max_3p_overhang,
         threads=threads,
     )
+    log(f"{accepted.num_rows:,} accepted edges — grouping (connected components)…")
     comp = connected_components(
         n_uniq,
         abundance,
@@ -317,7 +377,20 @@ def assemble_clusters(
     surviving_centroids = centroid_uniq[survive]
     n_clusters = surviving_centroids.shape[0]
     if n_clusters == 0:
+        log("no clusters survived the size filter")
         return empty
+    largest = int(n_uniq_raw[survive].max()) if n_clusters else 0
+    log(
+        f"{n_clusters:,} clusters (largest holds {largest:,} unique sequences) — "
+        "building consensus + variants…"
+    )
+    if largest > _MEGA_CLUSTER_UNIQUES:
+        log(
+            f"WARNING: a cluster holds {largest:,} unique sequences — likely a "
+            "connected-components chaining artifact (low-complexity / repeat). "
+            "Consensus uses abundance-weighted chunked accumulation; if this "
+            "stalls, raise --identity or --min-cluster-size."
+        )
 
     # ── CSR members per surviving cluster ──
     uniq_ids = np.arange(n_uniq, dtype=np.int64)
@@ -395,13 +468,17 @@ def assemble_clusters(
         read_map=read_map,
         uniq_table=uniq_table,
         cluster_of=cluster_of,
-        centroid_set=set(int(c) for c in surviving_centroids),
+        surviving_centroids=surviving_centroids,
         seqlen=seqlen,
         metric_res=metric_res,
     )
     feature_quant = cluster_feature_quant(read_map, cluster_of)
     variants = _build_variant_table(variant_res)
     haplotypes = _build_haplotype_table(hap_res)
+    log(
+        f"assembled {clusters.num_rows:,} clusters, "
+        f"{membership.num_rows:,} membership rows, {variants.num_rows:,} variants"
+    )
     return AssembledClusters(
         clusters, membership, feature_quant, variants, haplotypes, n_input, n_uniq
     )
@@ -508,13 +585,14 @@ def _build_membership_table(
     read_map: pa.Table,
     uniq_table: pa.Table,
     cluster_of: np.ndarray,
-    centroid_set: set[int],
+    surviving_centroids: np.ndarray,
     seqlen: np.ndarray,
     metric_res: list[tuple],
 ) -> pa.Table:
     n_uniq = uniq_table.num_rows
-    uniq_ids = np.arange(n_uniq, dtype=np.int64)
-    is_centroid = np.array([int(u) in centroid_set for u in uniq_ids], dtype=bool)
+    is_centroid = np.zeros(n_uniq, dtype=bool)
+    if surviving_centroids.shape[0]:
+        is_centroid[surviving_centroids] = True
 
     # Per-uniq metrics — centroid self-values by default.
     match_rate = np.ones(n_uniq, dtype=np.float64)
@@ -543,9 +621,17 @@ def _build_membership_table(
     r_uniq = read_map.column("uniq_id").to_numpy(zero_copy_only=False)
     r_cluster = cluster_of[r_uniq]
     keep = r_cluster >= 0
-    rep_per_uniq = np.array(uniq_table.column("representative_read_id").to_pylist())
-    read_ids = np.array(read_map.column("read_id").to_pylist())
-    is_uniq_rep = read_ids == rep_per_uniq[r_uniq]
+    keep_arr = pa.array(keep)
+
+    # role — Arrow-native so read_id never round-trips through a Python list /
+    # a giant numpy '<U' array (the read-cardinality anti-pattern + a real
+    # offset-overflow / OOM hazard at PromethION scale).
+    expected_rep = pc.take(
+        uniq_table.column("representative_read_id"), pa.array(r_uniq)
+    )
+    is_uniq_rep = pc.equal(read_map.column("read_id"), expected_rep).to_numpy(
+        zero_copy_only=False
+    )
     uniq_is_centroid = is_centroid[r_uniq]
     role = np.where(
         ~is_uniq_rep,
@@ -556,7 +642,9 @@ def _build_membership_table(
     return pa.table(
         {
             "cluster_id": pa.array(r_cluster[keep].astype(np.int64)),
-            "read_id": pa.array(read_ids[keep]),
+            "read_id": pc.filter(read_map.column("read_id"), keep_arr).cast(
+                pa.string()
+            ),
             "role": pa.array(role[keep]),
             "drift_5p_bp": pa.array(drift5[r_uniq][keep].astype(np.int32)),
             "drift_3p_bp": pa.array(drift3[r_uniq][keep].astype(np.int32)),
@@ -591,9 +679,15 @@ def cluster_transcripts(
     write_fasta: bool = True,
     report: bool = True,
     progress_cb: Any | None = None,
+    verbose: bool = False,
     resume: bool = False,
 ) -> dict[str, Path]:
-    """Run de novo first-round assembly over an S1 demux output dir."""
+    """Run de novo first-round assembly over an S1 demux output dir.
+
+    ``verbose`` prints per-stage breadcrumbs to stderr (flushed immediately,
+    so the last line survives even a native-library abort); ``progress_cb``,
+    if given, additionally receives a ``ProgressEvent`` per stage.
+    """
     from constellation.sequencing.transcriptome.cluster.denovo._io import (
         load_demux_windows,
         write_outputs,
@@ -601,6 +695,30 @@ def cluster_transcripts(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stage logger — flush immediately so the last line is visible even if a
+    # native library aborts the process (the std::length_error class of crash
+    # bypasses Python's normal stderr flush).
+    log: Callable[[str], None] | None = None
+    if verbose or progress_cb is not None:
+
+        def _log(msg: str) -> None:
+            if verbose:
+                print(f"[de-novo] {msg}", file=sys.stderr, flush=True)
+            if progress_cb is not None:
+                try:
+                    from constellation.core.progress import ProgressEvent
+
+                    progress_cb(
+                        ProgressEvent(
+                            kind="stage_progress", stage="de-novo", message=msg
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+        log = _log
+        log(f"loading Complete demux windows from {demux_dir}…")
 
     reads = load_demux_windows(Path(demux_dir))
     result = assemble_clusters(
@@ -617,6 +735,7 @@ def cluster_transcripts(
         overdispersion=overdispersion,
         fit_empirical=(error_model == "empirical"),
         threads=threads,
+        progress=log,
     )
     paths = write_outputs(
         result,

@@ -3046,7 +3046,6 @@ def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
     import sys
     from pathlib import Path
 
-    from constellation.core.progress import NullProgress, StreamProgress
     from constellation.sequencing.transcriptome.cluster.denovo import (
         cluster_transcripts,
     )
@@ -3091,8 +3090,6 @@ def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
-    progress = StreamProgress() if args.progress else NullProgress()
-
     paths = cluster_transcripts(
         demux_dir,
         output_dir=output_dir,
@@ -3114,7 +3111,7 @@ def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
         samples=samples,
         write_fasta=bool(args.write_fasta),
         report=bool(getattr(args, "report", True)),
-        progress_cb=progress,
+        verbose=bool(args.progress),
         resume=bool(args.resume),
     )
 
