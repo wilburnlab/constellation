@@ -347,9 +347,14 @@ superseded by VB-on-panel.
   members split off. (ii) `--rt-overlap-s` is clamped to `--rt-window` (a unit can't span beyond the
   obs window) + a defensive μ-bound guard in `estimate_component` (skip narrowing for a prior outside
   the obs window — no `lo>hi` inversion crash). (iii) an empty reference grid falls back to per-member
-  singleton fits, not a blanket `no_signal`. **Deferred to PR-H2:** widen the worker return to carry
-  fitted `parameters_dict()` (for step 7's `StagedCalibration` rebuild) + emit
-  `panel_attribution_table` at iteration 0.
+  singleton fits, not a blanket `no_signal`.
+- ✓ **PR-H2 (attribution emission):** `counter estimate --emit-attribution` writes the sparse
+  ion→progenitor soft-attribution map (`COUNTER_PEAK_ATTRIBUTION_TABLE`, the "what's left" /
+  interference bookkeeping) alongside the count table. The worker contract is now uniform —
+  `(records, attribution)` per unit; the singleton path has its panel in hand, the component path
+  gets it via `estimate_component(return_panel=True)`; the parent concatenates + saves it in the
+  `CounterResult` bundle. Opt-in (default off → byte-identical count output). The fitted-`parameters_dict`
+  return for step 7's `StagedCalibration` rebuild stays deferred to step 7 (its needs are clearer there).
 - ✓ **Hardening (follow-up 1 of 3):** `collide_ppm` is now auto-clamped to the trace's **recorded XIC
   extraction tolerance** — `chromatogram extract` stamps `x.massspec.extraction_tolerance` into the
   trace schema metadata; `counter estimate` reads it (overridable via `--extraction-tolerance-ppm`)

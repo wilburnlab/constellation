@@ -210,6 +210,37 @@ def test_cli_counter_estimate_on_bundle_directory(tmp_path):
     assert pq.read_table(out / "counter_n.parquet").num_rows == 1
 
 
+def test_cli_counter_estimate_emit_attribution(tmp_path):
+    p = _inputs(tmp_path)
+    out = p / "est_attr"
+    rc = _run([
+        "massspec", "counter", "estimate",
+        "--trace", str(p / "trace.parquet"),
+        "--scan-metadata", str(p / "scan_meta.parquet"),
+        "--calibration", str(p / "cal.parquet"),
+        "--targets", str(p / "targets.parquet"),
+        # --workers 2: the attribution pa.Table must round-trip through the spawn Pool
+        "-o", str(out), "--workers", "2", "--emit-attribution", "--no-progress",
+    ])
+    assert rc == 0
+    attr = pq.read_table(out / "peak_attribution.parquet")
+    assert attr.num_rows > 0
+    assert {"peak_id", "progenitor_index", "responsibility", "target_id"} <= set(attr.column_names)
+    assert set(attr.column("target_id").to_pylist()) == {0}
+
+    # default (no flag) → no attribution file written
+    out2 = p / "est_noattr"
+    _run([
+        "massspec", "counter", "estimate",
+        "--trace", str(p / "trace.parquet"),
+        "--scan-metadata", str(p / "scan_meta.parquet"),
+        "--calibration", str(p / "cal.parquet"),
+        "--targets", str(p / "targets.parquet"),
+        "-o", str(out2), "--workers", "1", "--no-progress",
+    ])
+    assert not (out2 / "peak_attribution.parquet").exists()
+
+
 def test_counter_cofit_units_partition_and_size_cap():
     # the parent-side partitioner: two co-isobaric, co-eluting targets group into one
     # component; the size cap splits an oversized component back to singletons.
