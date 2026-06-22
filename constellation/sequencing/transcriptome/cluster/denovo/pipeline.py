@@ -15,6 +15,7 @@ on the same edge).
 
 from __future__ import annotations
 
+import functools
 import multiprocessing as mp
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -26,7 +27,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from constellation.core.sequence.nucleic import STANDARD, CodonTable, find_orfs
+from constellation.core.sequence.nucleic import STANDARD, CodonTable, translate
 from constellation.sequencing.schemas.quant import FEATURE_QUANT
 from constellation.sequencing.schemas.transcriptome import (
     CLUSTER_MEMBERSHIP_TABLE,
@@ -92,26 +93,52 @@ class AssembledClusters:
     n_unique: int
 
 
-def _best_clean_orf(seq: str, *, min_aa_length: int):
-    if len(seq) < min_aa_length * 3:
-        return None
-    orfs = find_orfs(
-        seq,
-        codon_table=_ORF_CODON_TABLE,
-        min_aa_length=min_aa_length,
-        both_strands=False,
-        longest_per_stop=False,
+@functools.lru_cache(maxsize=8)
+def _orf_regex(min_aa_length: int):
+    import regex
+
+    # ATG start … ≥ min_aa_length codons … stop. Compiled once per length
+    # (vs once per call inside find_orfs — at 10M+ clusters that recompile
+    # dominated the per-cluster cost).
+    return regex.compile(
+        f"(?:ATG)(?:[ACGT]{{3}}){{{min_aa_length - 1},}}?(?:TAA|TAG|TGA)"
     )
-    clean = [o for o in orfs if "*" not in o.protein]
-    if not clean:
+
+
+def _is_low_complexity(seq: str) -> bool:
+    """Cheap guard: a consensus dominated by one base or a long homopolymer
+    is almost always a connected-components chaining artifact. Such sequences
+    make the overlapped-ORF regex pathological, so skip ORF prediction."""
+    n = len(seq)
+    if n < 30:
+        return False
+    counts = (seq.count("A"), seq.count("C"), seq.count("G"), seq.count("T"))
+    return max(counts) > 0.8 * n
+
+
+def _best_clean_orf(seq: str, *, min_aa_length: int):
+    """Longest internal-stop-free ATG ORF as ``(protein, start, end, strand,
+    transl_table)``, or ``None``. Cached regex + low-complexity guard make it
+    cheap enough to run on every one of millions of cluster consensuses."""
+    if len(seq) < min_aa_length * 3 or _is_low_complexity(seq):
         return None
-    per_stop: dict[tuple[str, int], Any] = {}
-    for o in clean:
-        key = (o.strand, o.end)
-        prior = per_stop.get(key)
-        if prior is None or o.length > prior.length:
-            per_stop[key] = o
-    return max(per_stop.values(), key=lambda o: o.length)
+    s = seq.upper().replace("U", "T")
+    pat = _orf_regex(min_aa_length)
+    # Best (longest) internal-stop-free protein per (frame, stop position).
+    best: dict[tuple[int, int], tuple] = {}
+    for m in pat.finditer(s, overlapped=True):
+        nt = s[m.start() : m.end()]
+        prot = translate(nt[:-3], codon_table=_ORF_CODON_TABLE, partial="discard")
+        if "*" in prot or len(prot) < min_aa_length:
+            continue
+        key = (m.start() % 3, m.end())
+        prior = best.get(key)
+        if prior is None or len(prot) > len(prior[0]):
+            best[key] = (prot, m.start(), m.end())
+    if not best:
+        return None
+    prot, st, en = max(best.values(), key=lambda x: len(x[0]))
+    return prot, int(st), int(en), "+", _ORF_CODON_TABLE.transl_table
 
 
 # A single cluster holding more unique sequences than this is almost
@@ -171,6 +198,7 @@ def _cluster_chunk(
     min_aa_length: int,
     identity: float,
     overdispersion: float,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[list[tuple], list[tuple], list[tuple]]:
     seqs = _W["seqs"]
     abund = _W["abund"]
@@ -274,14 +302,12 @@ def _cluster_chunk(
         if predict_orfs:
             orf = _best_clean_orf(consensus, min_aa_length=min_aa_length)
             if orf is not None:
-                protein = orf.protein
-                orf_start = int(orf.start)
-                orf_end = int(orf.end)
-                orf_strand = orf.strand
-                codon_tbl = int(orf.transl_table)
+                protein, orf_start, orf_end, orf_strand, codon_tbl = orf
         cluster_out.append(
             (cid, consensus, protein, orf_start, orf_end, orf_strand, codon_tbl)
         )
+        if progress is not None and (cid - lo) % 500_000 == 499_999:
+            progress(f"  …consensus/variants: {cid - lo + 1:,} clusters processed")
     return cluster_out, metric_out, variant_out, haplotype_out, disagree
 
 
@@ -432,16 +458,22 @@ def assemble_clusters(
     disagree: dict = {}
     try:
         if threads <= 1 or n_clusters < 256:
+            if threads <= 1 and n_clusters >= 1_000_000:
+                log(
+                    f"  consensus/variants for {n_clusters:,} clusters "
+                    "single-threaded — pass --threads N to parallelise"
+                )
             cluster_res, metric_res, variant_res, hap_res, disagree = _cluster_chunk(
-                (0, n_clusters), **worker_kw
+                (0, n_clusters), progress=log, **worker_kw
             )
         else:
-            step = max(1, (n_clusters + threads * 4 - 1) // (threads * 4))
+            step = max(1, (n_clusters + threads * 8 - 1) // (threads * 8))
             bounds = [
                 (lo, min(lo + step, n_clusters)) for lo in range(0, n_clusters, step)
             ]
             ctx = mp.get_context("fork")
             cluster_res, metric_res, variant_res, hap_res = [], [], [], []
+            done = 0
             with ProcessPoolExecutor(max_workers=threads, mp_context=ctx) as ex:
                 futs = [ex.submit(_cluster_chunk, b, **worker_kw) for b in bounds]
                 for fut in futs:
@@ -451,6 +483,9 @@ def assemble_clusters(
                     variant_res.extend(vr)
                     hap_res.extend(hr)
                     merge_disagreements(disagree, dg)
+                    done += 1
+                    if done % max(1, len(bounds) // 20) == 0:
+                        log(f"  …consensus/variants: {done}/{len(bounds)} chunks done")
     finally:
         _W.clear()
     cluster_res.sort(key=lambda r: r[0])

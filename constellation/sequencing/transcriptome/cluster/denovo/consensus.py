@@ -1,4 +1,4 @@
-"""Centroid-anchored consensus via a CIGAR-walk PWM (torch scatter).
+"""Centroid-anchored consensus via a CIGAR-walk PWM (numpy scatter).
 
 Each cluster member is projected onto the centroid coordinate frame
 using the **cached** verify-stage CIGAR (no re-alignment), and its bases
@@ -21,7 +21,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch
 
 from constellation.sequencing.transcriptome.cluster.denovo._cigar import (
     base_codes,
@@ -58,7 +57,7 @@ class ConsensusResult:
     """
 
     consensus: str
-    pwm: torch.Tensor
+    pwm: np.ndarray  # (L, 5) float64 abundance-weighted PWM in centroid coords
     # Per-centroid-position winning base (0-3 = ACGT, 4 = gap/dropped),
     # before gap positions are removed — the centroid↔consensus coordinate map.
     winner: np.ndarray = field(repr=False)
@@ -177,22 +176,23 @@ def centroid_consensus(
             v_weight.append(np.full(gc_in.shape[0], spec.weight, dtype=np.float64))
             v_member.append(np.full(gc_in.shape[0], m_i, dtype=np.int64))
 
-    flat_pwm = torch.zeros(L * 5, dtype=torch.float64)
+    # Scatter-add the votes into the (L, 5) PWM with numpy bincount — kept
+    # torch-free so this runs inside fork()ed ProcessPool workers without the
+    # torch/OpenMP-after-fork deadlock (by this stage the parent has already
+    # spawned torch's thread pool during minimizer extraction).
     if flat_idx:
         idx_all = np.concatenate(flat_idx)
         w_all = np.concatenate(weights)
-        flat_pwm.index_add_(
-            0,
-            torch.from_numpy(idx_all),
-            torch.from_numpy(w_all),
-        )
-    pwm = flat_pwm.view(L, 5)
+        flat_pwm = np.bincount(idx_all, weights=w_all, minlength=L * 5)
+    else:
+        flat_pwm = np.zeros(L * 5, dtype=np.float64)
+    pwm = flat_pwm.reshape(L, 5)
 
-    row_max, best = pwm.max(dim=1)
-    best_np = best.numpy()
+    row_max = pwm.max(axis=1)
+    best_np = pwm.argmax(axis=1)
     # No-coverage positions fall back to the centroid base; gap-winning
     # positions (and centroid Ns, encoded 4) drop out of the consensus.
-    winner = np.where(row_max.numpy() <= 0.0, centroid_codes, best_np)
+    winner = np.where(row_max <= 0.0, centroid_codes, best_np)
     keep = winner < _GAP
     consensus = _IDX_TO_BASE_NP[winner[keep]].tobytes().decode("ascii")
 

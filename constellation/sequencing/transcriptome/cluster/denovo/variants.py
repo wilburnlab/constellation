@@ -102,7 +102,7 @@ def call_variants(
     ``cluster_id`` is attached by the caller.
     """
     model = model or ErrorModel()
-    pwm = cres.pwm.numpy()
+    pwm = cres.pwm
     winner = cres.winner
     consensus = cres.consensus
     L = pwm.shape[0]
@@ -199,7 +199,7 @@ def disagreement_stats(
     is 0=substitution, 1=homopolymer_indel, 2=non_hp_indel. Fully
     vectorized over the consensus.
     """
-    pwm = cres.pwm.numpy()
+    pwm = cres.pwm
     winner = cres.winner
     consensus = cres.consensus
     L = pwm.shape[0]
