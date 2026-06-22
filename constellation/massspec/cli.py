@@ -3126,6 +3126,11 @@ def _counter_worker_component(unit: list[dict]) -> tuple[list[dict], Any]:
             attr = panel_attribution_table(
                 panel, obs, acquisition_id=opts["acquisition_id"],
                 target_id=int(members[0]["target_id"]),
+                # the panel's progenitors ARE the members in order (a component
+                # does no discovery), so stamp each row with its member's real
+                # target_id rather than flattening co-members into anonymous
+                # interferers under the reference's id.
+                progenitor_target_ids=[int(m["target_id"]) for m in members],
             )
         else:
             results, attr = out, None
@@ -3246,6 +3251,13 @@ def _cmd_counter_estimate(args: argparse.Namespace) -> int:
         import pyarrow as pa
 
         peak_attribution = pa.concat_tables(attr_tables)
+    elif args.emit_attribution:
+        # --emit-attribution was requested but no unit produced rows (every target
+        # no_signal / errored). Write the schema-correct EMPTY table so the requested
+        # output file always exists rather than being silently omitted.
+        from constellation.massspec.counter import COUNTER_PEAK_ATTRIBUTION_TABLE
+
+        peak_attribution = COUNTER_PEAK_ATTRIBUTION_TABLE.empty_table()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     save_counter(
         CounterResult(counter_n=counter_n_table(ok), peak_attribution=peak_attribution),
