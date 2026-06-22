@@ -1,22 +1,27 @@
 """Layer-0 exact dereplication.
 
 Collapse byte-identical transcript windows to unique sequences with an
-abundance count, via a C++-speed Arrow ``group_by("sequence")``. This
-bounds *all* downstream work (minimizers, candidates, verify, consensus)
-to the number of unique sequences rather than the raw read count.
+abundance count. This bounds *all* downstream work (minimizers,
+candidates, verify, consensus) to the number of unique sequences rather
+than the raw read count.
+
+We do **not** ``group_by`` the raw sequence string: at PromethION scale
+the distinct grouping keys total tens of GB (≈18M unique × ~1 kb), which
+overflows the int32 offset in Acero's distinct-key storage and aborts the
+process with ``std::length_error: vector::_M_default_append``. Instead we
+hash each window to a fixed-width 128-bit key (xxh3-128, fixed_size_binary
+— collision probability ≈ n²/2¹²⁹ ≈ 1e-22 at 19M reads, i.e. never) and
+group on that fixed-width column; the representative sequence is recovered
+with a ``pc.take`` at each group's first row.
 
 Returns two tables:
 
 * ``uniq_table`` — one row per unique sequence: ``uniq_id`` (dense
   ``0..U-1``), ``sequence``, ``abundance`` (raw read multiplicity),
-  ``representative_read_id`` (lexicographically-first read), ``seq_len``.
+  ``representative_read_id`` (the group's first-occurring read), ``seq_len``.
 * ``read_map`` — one row per input read: ``read_id`` → ``uniq_id`` +
   ``sample_id``. Drives per-(cluster, sample) quant and the
   per-(cluster, read) membership edges.
-
-``uniq_id`` is the row index in ``uniq_table``; ``read_map.uniq_id`` is
-resolved with a single ``pc.index_in`` hash-table build over the unique
-sequences (no second string join).
 """
 
 from __future__ import annotations
@@ -45,6 +50,44 @@ READ_MAP_SCHEMA = pa.schema(
 )
 
 
+def _hash_sequences(seq_col: pa.Array | pa.ChunkedArray) -> pa.Array:
+    """Per-read 128-bit sequence hash as a ``fixed_size_binary(16)`` array.
+
+    Hashing to a fixed-width key lets the dedup ``group_by`` avoid Acero's
+    variable-length distinct-key storage, whose int32 offset overflows once
+    the unique keys exceed ~2 GB. Walks the Arrow value buffers directly
+    (offset-aware, chunk-aware) — no per-row Python string materialisation
+    beyond the unavoidable hash call.
+    """
+    import xxhash
+
+    digest = xxhash.xxh3_128_digest
+    n_total = len(seq_col)
+    out = bytearray(16 * n_total)
+    chunks = (
+        seq_col.chunks if isinstance(seq_col, pa.ChunkedArray) else [seq_col]
+    )
+    pos = 0
+    for ch in chunks:
+        nch = len(ch)
+        if nch == 0:
+            continue
+        if not pa.types.is_large_string(ch.type):
+            ch = pc.cast(ch, pa.large_string())
+        bufs = ch.buffers()
+        offsets = np.frombuffer(bufs[1], dtype=np.int64)
+        base = ch.offset
+        data = memoryview(bufs[2]) if bufs[2] is not None else memoryview(b"")
+        for i in range(nch):
+            a = int(offsets[base + i])
+            b = int(offsets[base + i + 1])
+            out[pos : pos + 16] = digest(data[a:b])
+            pos += 16
+    return pa.Array.from_buffers(
+        pa.binary(16), n_total, [None, pa.py_buffer(bytes(out))]
+    )
+
+
 def dereplicate(reads: pa.Table) -> tuple[pa.Table, pa.Table]:
     """Exact-dereplicate ``reads`` → ``(uniq_table, read_map)``.
 
@@ -57,30 +100,36 @@ def dereplicate(reads: pa.Table) -> tuple[pa.Table, pa.Table]:
     seq = reads.column("sequence")
     if not pa.types.is_large_string(seq.type):
         seq = pc.cast(seq, pa.large_string())
-    reads = reads.set_column(reads.schema.get_field_index("sequence"), "sequence", seq)
+    n = reads.num_rows
 
-    grouped = reads.group_by("sequence").aggregate(
-        [("read_id", "count"), ("read_id", "min")]
+    seq_hash = _hash_sequences(seq)
+    work = pa.table(
+        {"h": seq_hash, "row_idx": pa.array(np.arange(n, dtype=np.int64))}
     )
-    uniq_seq = grouped.column("sequence").combine_chunks()
+    grouped = work.group_by("h").aggregate([("row_idx", "min"), ("row_idx", "count")])
+    group_hash = grouped.column("h")
+    rep_row = grouped.column("row_idx_min")
     n_uniq = grouped.num_rows
+
+    # Representative sequence + read_id = the group's first-occurring row.
+    uniq_seq = pc.take(seq, rep_row)
+    rep_read = pc.cast(pc.take(reads.column("read_id"), rep_row), pa.string())
 
     uniq_table = pa.table(
         {
             "uniq_id": pa.array(np.arange(n_uniq, dtype=np.int64)),
             "sequence": uniq_seq,
-            "abundance": pc.cast(grouped.column("read_id_count"), pa.int64()),
-            "representative_read_id": pc.cast(
-                grouped.column("read_id_min"), pa.string()
-            ),
+            "abundance": pc.cast(grouped.column("row_idx_count"), pa.int64()),
+            "representative_read_id": rep_read,
             "seq_len": pc.cast(pc.utf8_length(uniq_seq), pa.int32()),
         },
         schema=UNIQ_TABLE_SCHEMA,
     )
 
-    # uniq_id per read: position of each read's sequence in the unique set.
+    # uniq_id per read = position of each read's hash in the distinct-hash
+    # set (group_by output order, which is the uniq_id order).
     uid_per_read = pc.cast(
-        pc.index_in(reads.column("sequence"), value_set=uniq_seq), pa.int64()
+        pc.index_in(seq_hash, value_set=group_hash), pa.int64()
     )
     read_map = pa.table(
         {
@@ -93,4 +142,4 @@ def dereplicate(reads: pa.Table) -> tuple[pa.Table, pa.Table]:
     return uniq_table, read_map
 
 
-__all__ = ["dereplicate", "UNIQ_TABLE_SCHEMA", "READ_MAP_SCHEMA"]
+__all__ = ["dereplicate", "_hash_sequences", "UNIQ_TABLE_SCHEMA", "READ_MAP_SCHEMA"]
