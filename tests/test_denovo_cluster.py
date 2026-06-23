@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
@@ -564,6 +565,38 @@ def test_empirical_and_betabinom_more_conservative(synthetic_panel):
         "ambiguous",
         "collapsed_error",
     }
+
+
+def test_emit_alignments(synthetic_panel):
+    from constellation.sequencing.transcriptome.cluster.denovo._cigar import parse_cigar
+
+    table, *_ = synthetic_panel
+    res = assemble_clusters(table, identity=0.96, predict_orfs=False, emit_alignments=True)
+    aln = res.alignments
+    assert aln.num_rows > 0
+    assert set(aln.column("role").to_pylist()) <= {"representative", "member"}
+    rep = aln.filter(pc.equal(aln.column("role"), "representative"))
+    assert set(rep.column("cluster_id").to_pylist()) <= set(
+        res.clusters.column("cluster_id").to_pylist()
+    )
+    # centroid frame length per cluster = the representative row's n_match
+    # (the centroid aligned to itself as "<len>=").
+    centroid_len = dict(
+        zip(rep.column("cluster_id").to_pylist(), rep.column("n_match").to_pylist())
+    )
+    for r in aln.to_pylist():
+        ref_consumed = sum(
+            n for n, op in parse_cigar(r["cigar"]) if op in ("=", "X", "D", "M")
+        )
+        # CIGAR ref span matches the match/mismatch/delete counts and the
+        # member→centroid alignment stays inside the centroid frame.
+        assert ref_consumed == r["n_match"] + r["n_mismatch"] + r["n_delete"]
+        assert r["ref_start"] >= 0
+        assert r["ref_start"] + ref_consumed <= centroid_len[r["cluster_id"]]
+        assert 0.0 <= r["identity"] <= 1.0
+    # default run does not emit alignments
+    res2 = assemble_clusters(table, identity=0.96, predict_orfs=False)
+    assert res2.alignments.num_rows == 0
 
 
 def test_cluster_transcripts_io(tmp_path):

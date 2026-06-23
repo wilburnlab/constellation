@@ -57,6 +57,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.quant import (
     cluster_feature_quant,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.schemas import (
+    CLUSTER_ALIGNMENT_TABLE,
     CLUSTER_HAPLOTYPE_TABLE,
     CLUSTER_VARIANT_TABLE,
 )
@@ -89,6 +90,7 @@ class AssembledClusters:
     feature_quant: pa.Table  # FEATURE_QUANT(feature_origin='cluster_id')
     variants: pa.Table  # CLUSTER_VARIANT_TABLE
     haplotypes: pa.Table  # CLUSTER_HAPLOTYPE_TABLE
+    alignments: pa.Table  # CLUSTER_ALIGNMENT_TABLE (empty unless emit_alignments)
     n_input_reads: int
     n_unique: int
 
@@ -164,6 +166,16 @@ _HAPLOTYPE_MAX_VARIANTS = 64
 _W: dict[str, Any] = {}
 
 
+_CIGAR_TRANSPOSE = str.maketrans("ID", "DI")
+
+
+def _transpose_cigar(cigar: str) -> str:
+    """Swap I↔D so an edlib ``query=centroid → ref=member`` CIGAR reads as
+    ``member → centroid`` (member as query) — used to emit every member's
+    alignment in one consistent centroid-as-reference frame."""
+    return cigar.translate(_CIGAR_TRANSPOSE)
+
+
 def _member_alignment(c: int, m: int):
     """Aligned (short, long, ref_start, cigar) for the (centroid, member)
     edge — cache hit when directly verified, else a fresh edlib re-align."""
@@ -198,8 +210,9 @@ def _cluster_chunk(
     min_aa_length: int,
     identity: float,
     overdispersion: float,
+    emit_alignments: bool = False,
     progress: Callable[[str], None] | None = None,
-) -> tuple[list[tuple], list[tuple], list[tuple]]:
+) -> tuple[list[tuple], list[tuple], list[tuple], list[tuple], dict, list[tuple]]:
     seqs = _W["seqs"]
     abund = _W["abund"]
     seqlen = _W["seqlen"]
@@ -216,6 +229,7 @@ def _cluster_chunk(
     metric_out: list[tuple] = []
     variant_out: list[tuple] = []
     haplotype_out: list[tuple] = []
+    align_out: list[tuple] = []
     disagree: dict[tuple[int, int], tuple[float, float]] = {}
     for cid in range(lo, hi):
         c = int(centroid[cid])
@@ -229,6 +243,12 @@ def _cluster_chunk(
             top = nonc[np.argsort(-abund[nonc], kind="stable")[:_CONSENSUS_MAX_MEMBERS]]
         else:
             top = nonc
+        if emit_alignments:
+            # Centroid self-row: the consensus frame is anchored on it.
+            lc = int(seqlen[c])
+            align_out.append(
+                (cid, c, "representative", 0, f"{lc}=", lc, 0, 0, 0, 0, 0, True)
+            )
         specs: list[MemberSpec] = []
         for m in top:
             m = int(m)
@@ -245,7 +265,8 @@ def _cluster_chunk(
             metric_out.append((m, nm, nx, ni, nd, oh5, oh3, m_is_long))
             len_short = int(seqlen[s])
             edit = nx + ni + nd
-            if len_short > 0 and (edit / len_short) <= consensus_gate:
+            in_cons = len_short > 0 and (edit / len_short) <= consensus_gate
+            if in_cons:
                 specs.append(
                     MemberSpec(
                         member_seq=seqs[m],
@@ -253,6 +274,32 @@ def _cluster_chunk(
                         cigar=cigar,
                         centroid_is_query=(s == c),
                         ref_start=ref_start,
+                    )
+                )
+            if emit_alignments:
+                # Normalise to a member→centroid alignment (centroid as ref).
+                # When the centroid was the shorter query, transpose the CIGAR
+                # (I↔D) and swap insert/delete into the member frame.
+                if s == c:
+                    cig_out, rs_out, ins_m, del_m = _transpose_cigar(cigar), 0, nd, ni
+                else:  # centroid was the longer ref → already member→centroid
+                    cig_out, rs_out, ins_m, del_m = cigar, ref_start, ni, nd
+                sd5 = oh5 if m_is_long else -oh5
+                sd3 = oh3 if m_is_long else -oh3
+                align_out.append(
+                    (
+                        cid,
+                        m,
+                        "member",
+                        rs_out,
+                        cig_out,
+                        nm,
+                        nx,
+                        ins_m,
+                        del_m,
+                        sd5,
+                        sd3,
+                        bool(in_cons),
                     )
                 )
         if specs:
@@ -308,7 +355,7 @@ def _cluster_chunk(
         )
         if progress is not None and (cid - lo) % 500_000 == 499_999:
             progress(f"  …consensus/variants: {cid - lo + 1:,} clusters processed")
-    return cluster_out, metric_out, variant_out, haplotype_out, disagree
+    return cluster_out, metric_out, variant_out, haplotype_out, disagree, align_out
 
 
 def assemble_clusters(
@@ -327,6 +374,7 @@ def assemble_clusters(
     overdispersion: float = 0.0,
     error_model: ErrorModel | None = None,
     fit_empirical: bool = False,
+    emit_alignments: bool = False,
     threads: int = 1,
     progress: Callable[[str], None] | None = None,
 ) -> AssembledClusters:
@@ -349,6 +397,7 @@ def assemble_clusters(
         FEATURE_QUANT.empty_table(),
         CLUSTER_VARIANT_TABLE.empty_table(),
         CLUSTER_HAPLOTYPE_TABLE.empty_table(),
+        CLUSTER_ALIGNMENT_TABLE.empty_table(),
         n_input,
         n_uniq,
     )
@@ -454,8 +503,10 @@ def assemble_clusters(
         min_aa_length=min_aa_length,
         identity=identity,
         overdispersion=overdispersion,
+        emit_alignments=emit_alignments,
     )
     disagree: dict = {}
+    align_res: list[tuple] = []
     try:
         if threads <= 1 or n_clusters < 256:
             if threads <= 1 and n_clusters >= 1_000_000:
@@ -463,9 +514,14 @@ def assemble_clusters(
                     f"  consensus/variants for {n_clusters:,} clusters "
                     "single-threaded — pass --threads N to parallelise"
                 )
-            cluster_res, metric_res, variant_res, hap_res, disagree = _cluster_chunk(
-                (0, n_clusters), progress=log, **worker_kw
-            )
+            (
+                cluster_res,
+                metric_res,
+                variant_res,
+                hap_res,
+                disagree,
+                align_res,
+            ) = _cluster_chunk((0, n_clusters), progress=log, **worker_kw)
         else:
             step = max(1, (n_clusters + threads * 8 - 1) // (threads * 8))
             bounds = [
@@ -477,12 +533,13 @@ def assemble_clusters(
             with ProcessPoolExecutor(max_workers=threads, mp_context=ctx) as ex:
                 futs = [ex.submit(_cluster_chunk, b, **worker_kw) for b in bounds]
                 for fut in futs:
-                    cr, mr, vr, hr, dg = fut.result()
+                    cr, mr, vr, hr, dg, ar = fut.result()
                     cluster_res.extend(cr)
                     metric_res.extend(mr)
                     variant_res.extend(vr)
                     hap_res.extend(hr)
                     merge_disagreements(disagree, dg)
+                    align_res.extend(ar)
                     done += 1
                     if done % max(1, len(bounds) // 20) == 0:
                         log(f"  …consensus/variants: {done}/{len(bounds)} chunks done")
@@ -518,12 +575,20 @@ def assemble_clusters(
     feature_quant = cluster_feature_quant(read_map, cluster_of)
     variants = _build_variant_table(variant_res)
     haplotypes = _build_haplotype_table(hap_res)
+    alignments = _build_alignment_table(align_res, uniq_table)
     log(
         f"assembled {clusters.num_rows:,} clusters, "
         f"{membership.num_rows:,} membership rows, {variants.num_rows:,} variants"
     )
     return AssembledClusters(
-        clusters, membership, feature_quant, variants, haplotypes, n_input, n_uniq
+        clusters,
+        membership,
+        feature_quant,
+        variants,
+        haplotypes,
+        alignments,
+        n_input,
+        n_uniq,
     )
 
 
@@ -568,6 +633,46 @@ def _build_haplotype_table(hap_res: list[tuple]) -> pa.Table:
             "is_complete": pa.array(cols[6], pa.bool_()),
         },
         schema=CLUSTER_HAPLOTYPE_TABLE,
+    )
+
+
+def _build_alignment_table(align_res: list[tuple], uniq_table: pa.Table) -> pa.Table:
+    """Resolve per-member alignment rows (keyed on uniq_id) into the
+    CLUSTER_ALIGNMENT_TABLE — read_id + abundance taken from uniq_table."""
+    if not align_res:
+        return CLUSTER_ALIGNMENT_TABLE.empty_table()
+    cols = list(zip(*align_res))
+    uid = np.asarray(cols[1], dtype=np.int64)
+    nm = np.asarray(cols[5], dtype=np.int64)
+    nx = np.asarray(cols[6], dtype=np.int64)
+    ni = np.asarray(cols[7], dtype=np.int64)
+    nd = np.asarray(cols[8], dtype=np.int64)
+    aligned = nm + nx + ni + nd
+    identity = np.where(aligned > 0, nm / np.maximum(aligned, 1), 1.0).astype(
+        np.float32
+    )
+    return pa.table(
+        {
+            "cluster_id": pa.array(cols[0], pa.int64()),
+            "read_id": pc.take(
+                uniq_table.column("representative_read_id"), pa.array(uid)
+            ).cast(pa.string()),
+            "role": pa.array(cols[2], pa.string()),
+            "abundance": pc.take(uniq_table.column("abundance"), pa.array(uid)).cast(
+                pa.int64()
+            ),
+            "ref_start": pa.array(cols[3], pa.int32()),
+            "cigar": pa.array(cols[4], pa.string()),
+            "n_match": pa.array(nm, pa.int32()),
+            "n_mismatch": pa.array(nx, pa.int32()),
+            "n_insert": pa.array(ni, pa.int32()),
+            "n_delete": pa.array(nd, pa.int32()),
+            "identity": pa.array(identity),
+            "overhang_5p": pa.array(cols[9], pa.int32()),
+            "overhang_3p": pa.array(cols[10], pa.int32()),
+            "in_consensus": pa.array(cols[11], pa.bool_()),
+        },
+        schema=CLUSTER_ALIGNMENT_TABLE,
     )
 
 
@@ -718,6 +823,7 @@ def cluster_transcripts(
     min_aa_length: int = 60,
     emit_cluster_detail: bool = False,
     detail_top_n: int = 50,
+    emit_alignments: bool = False,
     threads: int = 1,
     samples: Any | None = None,
     write_fasta: bool = True,
@@ -779,6 +885,7 @@ def cluster_transcripts(
         min_aa_length=min_aa_length,
         overdispersion=overdispersion,
         fit_empirical=(error_model == "empirical"),
+        emit_alignments=emit_alignments,
         threads=threads,
         progress=log,
     )
@@ -808,6 +915,7 @@ def cluster_transcripts(
             "overdispersion": float(overdispersion),
             "predict_orfs": bool(predict_orfs),
             "min_aa_length": int(min_aa_length),
+            "emit_alignments": bool(emit_alignments),
             "threads": int(threads),
         },
     )

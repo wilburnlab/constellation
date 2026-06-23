@@ -65,8 +65,53 @@ CLUSTER_HAPLOTYPE_TABLE: pa.Schema = pa.schema(
 )
 
 
+# One row per unique member aligned to its cluster's centroid frame — the
+# raw alignments that built the consensus PWM, persisted for assembly QC
+# (reconstruct a pileup / MSA, inspect what each member contributed). Opt-in
+# (``--emit-alignments``) because it's ~one row per unique member.
+#
+# Coordinate frame: the cluster **centroid** = the ``representative`` row's
+# read (the seed the PWM was anchored on). The ``consensus_sequence`` in
+# clusters.parquet is this same frame with the rare cluster-wide-deletion
+# columns removed, so it is identical for clusters with no such columns and
+# at most a few positions shorter otherwise.
+CLUSTER_ALIGNMENT_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("cluster_id", pa.int64(), nullable=False),
+        # Representative read of the unique member; the 'representative' role
+        # row is the centroid the frame is anchored on (cigar = "<len>=").
+        pa.field("read_id", pa.string(), nullable=False),
+        pa.field("role", pa.string(), nullable=False),  # 'representative' | 'member'
+        # Reads collapsed into this unique member.
+        pa.field("abundance", pa.int64(), nullable=False),
+        # Alignment of the member to the centroid coordinate frame: the member
+        # starts at centroid position ``ref_start``; ``cigar`` is the extended
+        # (=/X/I/D) member-vs-centroid path (I = member insertion, D = member
+        # deletion relative to the centroid).
+        pa.field("ref_start", pa.int32(), nullable=False),
+        pa.field("cigar", pa.string(), nullable=False),
+        pa.field("n_match", pa.int32(), nullable=False),
+        pa.field("n_mismatch", pa.int32(), nullable=False),
+        pa.field("n_insert", pa.int32(), nullable=False),
+        pa.field("n_delete", pa.int32(), nullable=False),
+        pa.field("identity", pa.float32(), nullable=False),
+        # Signed member overhang vs consensus (+ extends beyond, − truncated).
+        pa.field("overhang_5p", pa.int32(), nullable=False),
+        pa.field("overhang_3p", pa.int32(), nullable=False),
+        # True iff the member passed the consensus gate and voted in the PWM.
+        pa.field("in_consensus", pa.bool_(), nullable=False),
+    ],
+    metadata={b"schema_name": b"ClusterAlignmentTable"},
+)
+
+
 register_schema("ClusterVariantTable", CLUSTER_VARIANT_TABLE)
 register_schema("ClusterHaplotypeTable", CLUSTER_HAPLOTYPE_TABLE)
+register_schema("ClusterAlignmentTable", CLUSTER_ALIGNMENT_TABLE)
 
 
-__all__ = ["CLUSTER_VARIANT_TABLE", "CLUSTER_HAPLOTYPE_TABLE"]
+__all__ = [
+    "CLUSTER_VARIANT_TABLE",
+    "CLUSTER_HAPLOTYPE_TABLE",
+    "CLUSTER_ALIGNMENT_TABLE",
+]

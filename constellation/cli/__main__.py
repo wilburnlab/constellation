@@ -1318,6 +1318,17 @@ def _build_transcriptome_parser(subs) -> None:
         ),
     )
     p_cluster.add_argument(
+        "--emit-alignments",
+        action="store_true",
+        help=(
+            "de-novo: write cluster_alignments.parquet — the per-member CIGAR "
+            "alignments (to each cluster's representative/centroid sequence) "
+            "that built the consensus PWM (for assembly QC: reconstruct a "
+            "pileup, inspect each member's identity / indels / overhangs). "
+            "~one row per unique member; off by default."
+        ),
+    )
+    p_cluster.add_argument(
         "--detail-top-n",
         type=int,
         default=50,
@@ -3121,6 +3132,7 @@ def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
         min_aa_length=int(args.min_aa_length),
         emit_cluster_detail=bool(args.emit_cluster_detail),
         detail_top_n=int(args.detail_top_n),
+        emit_alignments=bool(args.emit_alignments),
         threads=int(args.threads),
         samples=samples,
         write_fasta=bool(args.write_fasta),

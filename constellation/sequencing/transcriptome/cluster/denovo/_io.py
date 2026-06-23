@@ -180,6 +180,13 @@ def write_outputs(
         outputs["cluster_haplotypes"] = "cluster_haplotypes.parquet"
         paths["haplotypes"] = hap_path
 
+    alignments = getattr(result, "alignments", None)
+    if alignments is not None and alignments.num_rows:
+        aln_path = output_dir / "cluster_alignments.parquet"
+        pq.write_table(alignments, aln_path)
+        outputs["cluster_alignments"] = "cluster_alignments.parquet"
+        paths["alignments"] = aln_path
+
     name_map = _sample_name_map(samples)
     counts_path = output_dir / "cluster_counts.tsv"
     _write_counts_tsv(counts_path, result.feature_quant, name_map)
