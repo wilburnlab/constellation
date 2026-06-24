@@ -1,13 +1,14 @@
 """Within-cluster haplotypes + variant covariance (phasing).
 
-From the consensus stage's retained per-member base votes, build the
-read × variant-position allele matrix, collapse it to distinct
-allele-combination **haplotypes** (abundance-weighted), and compute the
-pairwise **r²** between variant positions. Phased variants co-occur on
-the same haplotype — the signal that distinguishes "one transcript with
-scattered errors" from "a mix of alleles / paralogs that maybe should be
-split." Everything is vectorized over the (small) set of variant
-positions; no per-read Python loop.
+Build the read × variant-position allele matrix (one row per **member** —
+the caller aligns *every* member, not just the consensus-voting subset,
+so haplotype abundances sum to the cluster's read count), collapse it to
+distinct allele-combination **haplotypes** (abundance-weighted), and
+compute the pairwise **r²** between variant positions. Phased variants
+co-occur on the same haplotype — the signal that distinguishes "one
+transcript with scattered errors" from "a mix of alleles / paralogs that
+maybe should be split." Vectorized over the (small) set of variant
+positions.
 """
 
 from __future__ import annotations
@@ -15,6 +16,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+
+from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
+    project_member,
+)
 
 
 _IDX_TO_CHAR = np.array(
@@ -34,39 +39,60 @@ class HaplotypeResult:
     max_r2: np.ndarray  # per variant position, max pairwise r² to any other
 
 
+def member_allele_row(
+    cigar_ops: list[tuple[int, str]],
+    member_codes: np.ndarray,
+    *,
+    centroid_is_query: bool,
+    centroid_start: int,
+    member_start: int,
+    var_sorted: np.ndarray,
+) -> np.ndarray:
+    """A member's allele (``int8``: 0-3 = ACGT, 4 = gap/deletion, -1 =
+    uncovered) at each variant **centroid** position (``var_sorted`` ascending).
+
+    Projects the member onto the centroid frame and reads off the alleles at
+    the variant columns — the per-read assignment that places every member on
+    a haplotype."""
+    mc, mb, gc = project_member(
+        cigar_ops,
+        member_codes,
+        centroid_is_query=centroid_is_query,
+        centroid_start=centroid_start,
+        member_start=member_start,
+    )
+    V = var_sorted.shape[0]
+    row = np.full(V, -1, dtype=np.int8)
+    if mc.shape[0]:
+        good = mb < 4  # skip ambiguous / N (matches the PWM vote filter)
+        mcg, mbg = mc[good], mb[good]
+        idx = np.clip(np.searchsorted(var_sorted, mcg), 0, V - 1)
+        inb = var_sorted[idx] == mcg
+        row[idx[inb]] = mbg[inb].astype(np.int8)
+    if gc.shape[0]:
+        idxg = np.clip(np.searchsorted(var_sorted, gc), 0, V - 1)
+        inbg = var_sorted[idxg] == gc
+        row[idxg[inbg]] = 4
+    return row
+
+
 def build_haplotypes(
-    cres,
-    var_centroid_positions: np.ndarray,
-    var_consensus_positions: np.ndarray,
+    A: np.ndarray,
+    member_weights: np.ndarray,
+    var_consensus_positions: list[int],
     minor_alleles: list[str],
     consensus_alleles: list[str],
-    member_weights: np.ndarray,
 ) -> HaplotypeResult:
-    """Collapse members to haplotypes + compute variant covariance.
+    """Collapse a member × variant-position allele matrix ``A`` to distinct
+    haplotypes + compute variant covariance.
 
-    ``var_centroid_positions`` are the variants' centroid-frame columns
-    (to index the votes); ``var_consensus_positions`` label them in the
-    output. ``member_weights[i]`` is member ``i``'s read multiplicity
-    (member 0 = centroid).
+    ``A[i, v]`` is member ``i``'s allele (0-3 ACGT, 4 gap, -1 uncovered) at
+    variant column ``v``; ``member_weights[i]`` is its read multiplicity.
+    ``var_consensus_positions`` label the columns in the output.
     """
-    V = int(var_centroid_positions.shape[0])
-    M = int(member_weights.shape[0])
+    M, V = A.shape
     if V == 0 or M == 0:
         return HaplotypeResult([], [], np.zeros(0, dtype=np.float32))
-
-    # Allele matrix A[member, variant]; -1 = position not covered by member.
-    A = np.full((M, V), -1, dtype=np.int8)
-    vp = var_centroid_positions.astype(np.int64)
-    order = np.argsort(vp)
-    vp_sorted = vp[order]
-    cpos = cres.votes_cpos
-    if cpos.shape[0]:
-        idx = np.searchsorted(vp_sorted, cpos)
-        idx_c = np.clip(idx, 0, V - 1)
-        inb = vp_sorted[idx_c] == cpos
-        col = order[idx_c]
-        sel = inb
-        A[cres.votes_member[sel], col[sel]] = cres.votes_base[sel].astype(np.int8)
 
     # Distinct haplotypes (rows of A), abundance-weighted.
     uniq_rows, inverse, counts = np.unique(
@@ -128,4 +154,4 @@ def build_haplotypes(
     )
 
 
-__all__ = ["build_haplotypes", "HaplotypeResult"]
+__all__ = ["build_haplotypes", "member_allele_row", "HaplotypeResult"]

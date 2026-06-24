@@ -523,6 +523,53 @@ def test_haplotype_phasing_and_map(tmp_path):
     assert svgs and svgs[0].read_text().startswith("<?xml")
 
 
+def test_haplotype_abundance_sums_to_cluster_reads():
+    # Every read is assigned to exactly one haplotype, so the per-cluster
+    # haplotype abundances sum to the cluster's read count (quant-grade) —
+    # not just the consensus-voting subset that fed the PWM.
+    rng = np.random.default_rng(77)
+    base = _rand(rng, 700)
+    p = 350
+    alt = "A" if base[p] != "A" else "C"
+    rows, rid = [], 0
+    for i in range(160):
+        s = list(base)
+        if i < 64:  # ~40% carry an interior SNP → a real, phaseable column
+            s[p] = alt
+        j = int(rng.integers(len(s)))  # one scattered error each
+        s[j] = rng.choice(list("ACGT"))
+        s = "".join(s)
+        s = s[int(rng.integers(0, 25)) : len(s) - int(rng.integers(0, 25))]  # ragged
+        rows.append((f"r{rid}", s, 0))
+        rid += 1
+    table = pa.table(
+        {
+            "read_id": [r[0] for r in rows],
+            "sequence": [r[1] for r in rows],
+            "sample_id": pa.array([r[2] for r in rows], pa.int64()),
+        }
+    )
+    res = assemble_clusters(table, identity=0.95, predict_orfs=False)
+    assert res.haplotypes.num_rows > 0
+    n_reads = dict(
+        zip(
+            res.clusters.column("cluster_id").to_pylist(),
+            res.clusters.column("n_reads").to_pylist(),
+        )
+    )
+    hap_total: dict[int, int] = {}
+    for cid, ab in zip(
+        res.haplotypes.column("cluster_id").to_pylist(),
+        res.haplotypes.column("abundance").to_pylist(),
+    ):
+        hap_total[cid] = hap_total.get(cid, 0) + ab
+    # for every cluster that produced haplotypes, abundances sum to its reads
+    for cid, total in hap_total.items():
+        assert total == n_reads[cid]
+    # and the dominant cluster captured (nearly) all 160 reads
+    assert max(hap_total.values()) >= 150
+
+
 def test_estimate_error_rates_recovers_ratios():
     from constellation.sequencing.transcriptome.cluster.denovo.variants import (
         estimate_error_rates,

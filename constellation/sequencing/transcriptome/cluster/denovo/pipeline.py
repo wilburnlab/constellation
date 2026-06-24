@@ -33,7 +33,11 @@ from constellation.sequencing.schemas.transcriptome import (
     CLUSTER_MEMBERSHIP_TABLE,
     TRANSCRIPT_CLUSTER_TABLE,
 )
-from constellation.sequencing.transcriptome.cluster.denovo._cigar import cigar_stats
+from constellation.sequencing.transcriptome.cluster.denovo._cigar import (
+    base_codes,
+    cigar_stats,
+    parse_cigar,
+)
 from constellation.sequencing.transcriptome.cluster.denovo.candidates import (
     generate_candidates,
 )
@@ -49,6 +53,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.dereplicate import (
 )
 from constellation.sequencing.transcriptome.cluster.denovo.haplotypes import (
     build_haplotypes,
+    member_allele_row,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.minimizers import (
     extract_minimizers,
@@ -203,6 +208,101 @@ def _member_alignment(c: int, m: int):
     return s, lng, int(res["locations"][0][0]), (res["cigar"] or "")
 
 
+# Haplotype assignment covers *every* member (not just the ≤20k consensus-voting
+# subset), so haplotype abundances sum to the cluster's read count — quant treats
+# each read as belonging to exactly one haplotype. Cap the distinct rows that
+# enter the (M, V) allele matrix + pairwise-r² build by abundance; overflow
+# members collapse into a single all-uncovered "unassigned" bucket carrying their
+# summed weight, so the abundance total is preserved without an unbounded matrix.
+_HAPLOTYPE_ASSIGN_MAX = 50_000
+
+
+def _assign_haplotypes(
+    *,
+    cid: int,
+    c: int,
+    nonc: np.ndarray,
+    var_centroid: np.ndarray,
+    var_cons: np.ndarray,
+    sub: list[tuple],
+    spec_by_uniq: dict[int, MemberSpec],
+    seqs: list[str],
+    abund: np.ndarray,
+):
+    """Place every cluster member on the variant columns + collapse to
+    abundance-weighted haplotypes.
+
+    The centroid contributes its own bases; each member is projected via its
+    cached consensus alignment when it voted in the PWM, else a bounded
+    re-align onto the centroid frame (an all-uncovered row when even that
+    fails). Members beyond ``_HAPLOTYPE_ASSIGN_MAX`` (by abundance) fold into
+    one all-uncovered bucket carrying their summed weight, so the haplotype
+    abundances still sum to the cluster's read count (quant-grade)."""
+    V = int(var_centroid.shape[0])
+    rows: list[np.ndarray] = []
+    weights: list[float] = []
+
+    # Centroid self-row: its own bases at the variant positions (N → uncovered).
+    cen_row = base_codes(seqs[c])[var_centroid].astype(np.int8)
+    cen_row[cen_row >= 4] = -1
+    rows.append(cen_row)
+    weights.append(float(abund[c]))
+
+    if nonc.shape[0] > _HAPLOTYPE_ASSIGN_MAX:
+        order = np.argsort(-abund[nonc], kind="stable")
+        assign = nonc[order[:_HAPLOTYPE_ASSIGN_MAX]]
+        overflow_w = float(abund[nonc[order[_HAPLOTYPE_ASSIGN_MAX:]]].sum())
+    else:
+        assign = nonc
+        overflow_w = 0.0
+
+    for m in assign:
+        m = int(m)
+        spec = spec_by_uniq.get(m)
+        if spec is not None:
+            ops = parse_cigar(spec.cigar)
+            mcodes = base_codes(spec.member_seq)
+            ciq = spec.centroid_is_query
+            rs = spec.ref_start
+        else:
+            al = _member_alignment(c, m)
+            if al is None:
+                rows.append(np.full(V, -1, dtype=np.int8))
+                weights.append(float(abund[m]))
+                continue
+            s, _lng, rs, cigar = al
+            ops = parse_cigar(cigar)
+            mcodes = base_codes(seqs[m])
+            ciq = s == c
+        cstart = 0 if ciq else rs
+        mstart = rs if ciq else 0
+        rows.append(
+            member_allele_row(
+                ops,
+                mcodes,
+                centroid_is_query=ciq,
+                centroid_start=cstart,
+                member_start=mstart,
+                var_sorted=var_centroid,
+            )
+        )
+        weights.append(float(abund[m]))
+
+    if overflow_w > 0.0:
+        rows.append(np.full(V, -1, dtype=np.int8))
+        weights.append(overflow_w)
+
+    A = np.array(rows, dtype=np.int8)
+    member_weights = np.asarray(weights, dtype=np.float64)
+    return build_haplotypes(
+        A,
+        member_weights,
+        [int(x) for x in var_cons],
+        [r[2] for r in sub],
+        [r[1] for r in sub],
+    )
+
+
 def _cluster_chunk(
     bounds: tuple[int, int],
     *,
@@ -250,6 +350,7 @@ def _cluster_chunk(
                 (cid, c, "representative", 0, f"{lc}=", lc, 0, 0, 0, 0, 0, True)
             )
         specs: list[MemberSpec] = []
+        spec_by_uniq: dict[int, MemberSpec] = {}
         for m in top:
             m = int(m)
             al = _member_alignment(c, m)
@@ -267,15 +368,15 @@ def _cluster_chunk(
             edit = nx + ni + nd
             in_cons = len_short > 0 and (edit / len_short) <= consensus_gate
             if in_cons:
-                specs.append(
-                    MemberSpec(
-                        member_seq=seqs[m],
-                        weight=float(abund[m]),
-                        cigar=cigar,
-                        centroid_is_query=(s == c),
-                        ref_start=ref_start,
-                    )
+                spec = MemberSpec(
+                    member_seq=seqs[m],
+                    weight=float(abund[m]),
+                    cigar=cigar,
+                    centroid_is_query=(s == c),
+                    ref_start=ref_start,
                 )
+                specs.append(spec)
+                spec_by_uniq[m] = spec
             if emit_alignments:
                 # Normalise to a member→centroid alignment (centroid as ref).
                 # When the centroid was the shorter query, transpose the CIGAR
@@ -310,9 +411,6 @@ def _cluster_chunk(
             if vrows:
                 keep = cres.winner < 4
                 centroid_of_cons = np.flatnonzero(keep)
-                member_weights = np.array(
-                    [float(abund[c])] + [s.weight for s in specs], dtype=np.float64
-                )
                 # Haplotype columns: **in-core base-substitution** variants —
                 # in_core (vr[11]) drops the ragged-end coverage ramps, and a
                 # base (not gap) minor allele (vr[2]) drops the terminal
@@ -331,14 +429,19 @@ def _cluster_chunk(
                 if sel:
                     sub = [vrows[i] for i in sel]
                     var_cons = np.array([r[0] for r in sub], dtype=np.int64)
+                    # centroid positions are ascending (consensus order ↔
+                    # centroid order is monotonic), so usable as var_sorted.
                     var_centroid = centroid_of_cons[var_cons]
-                    hres = build_haplotypes(
-                        cres,
-                        var_centroid,
-                        var_cons,
-                        [r[2] for r in sub],
-                        [r[1] for r in sub],
-                        member_weights,
+                    hres = _assign_haplotypes(
+                        cid=cid,
+                        c=c,
+                        nonc=nonc,
+                        var_centroid=var_centroid,
+                        var_cons=var_cons,
+                        sub=sub,
+                        spec_by_uniq=spec_by_uniq,
+                        seqs=seqs,
+                        abund=abund,
                     )
                     r2_by_idx = {sel[j]: float(hres.max_r2[j]) for j in range(len(sub))}
                     for hid, (astr, ab, nu, comp) in enumerate(hres.haplotypes):
