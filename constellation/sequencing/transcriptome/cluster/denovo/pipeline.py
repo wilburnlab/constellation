@@ -313,36 +313,40 @@ def _cluster_chunk(
                 member_weights = np.array(
                     [float(abund[c])] + [s.weight for s in specs], dtype=np.float64
                 )
-                # Cap the variant positions feeding the haplotype matrix +
-                # pairwise r² to the most-supported ones — bounds the (M, V)
-                # allele matrix and the list<int32> column (a real offset-
-                # overflow risk if a chained cluster has thousands of variants).
-                if len(vrows) > _HAPLOTYPE_MAX_VARIANTS:
-                    sel = sorted(
-                        sorted(range(len(vrows)), key=lambda i: -vrows[i][6])[
-                            :_HAPLOTYPE_MAX_VARIANTS
-                        ]
+                # Haplotype columns: **in-core base-substitution** variants —
+                # in_core (vr[11]) drops the ragged-end coverage ramps, and a
+                # base (not gap) minor allele (vr[2]) drops the terminal
+                # deletion/length-variation positions that otherwise split reads
+                # into spurious 3'-length-class "haplotypes". Ranked by
+                # significance (real-first, then p_error asc; vr[10]/vr[8]),
+                # capped to bound the (M, V) matrix + list<int32> column.
+                core_idx = [
+                    i
+                    for i in range(len(vrows))
+                    if vrows[i][11] and vrows[i][2] in ("A", "C", "G", "T")
+                ]
+                core_idx.sort(key=lambda i: (vrows[i][10] != "real", vrows[i][8]))
+                sel = sorted(core_idx[:_HAPLOTYPE_MAX_VARIANTS])
+                r2_by_idx: dict[int, float] = {}
+                if sel:
+                    sub = [vrows[i] for i in sel]
+                    var_cons = np.array([r[0] for r in sub], dtype=np.int64)
+                    var_centroid = centroid_of_cons[var_cons]
+                    hres = build_haplotypes(
+                        cres,
+                        var_centroid,
+                        var_cons,
+                        [r[2] for r in sub],
+                        [r[1] for r in sub],
+                        member_weights,
                     )
-                else:
-                    sel = list(range(len(vrows)))
-                sub = [vrows[i] for i in sel]
-                var_cons = np.array([r[0] for r in sub], dtype=np.int64)
-                var_centroid = centroid_of_cons[var_cons]
-                hres = build_haplotypes(
-                    cres,
-                    var_centroid,
-                    var_cons,
-                    [r[2] for r in sub],
-                    [r[1] for r in sub],
-                    member_weights,
-                )
-                r2_by_idx = {sel[j]: float(hres.max_r2[j]) for j in range(len(sub))}
+                    r2_by_idx = {sel[j]: float(hres.max_r2[j]) for j in range(len(sub))}
+                    for hid, (astr, ab, nu, comp) in enumerate(hres.haplotypes):
+                        haplotype_out.append(
+                            (cid, hid, astr, hres.variant_positions, ab, nu, comp)
+                        )
                 for i, vr in enumerate(vrows):
                     variant_out.append((cid, *vr, r2_by_idx.get(i, 0.0)))
-                for hid, (astr, ab, nu, comp) in enumerate(hres.haplotypes):
-                    haplotype_out.append(
-                        (cid, hid, astr, hres.variant_positions, ab, nu, comp)
-                    )
         else:
             consensus = seqs[c]
         protein = orf_start = orf_end = orf_strand = codon_tbl = None
@@ -610,7 +614,8 @@ def _build_variant_table(variant_res: list[tuple]) -> pa.Table:
             "p_error": pa.array(cols[9], pa.float64()),
             "epsilon_class": pa.array(cols[10], pa.float32()),
             "call": pa.array(cols[11], pa.string()),
-            "max_linkage_r2": pa.array(cols[12], pa.float32()),
+            "in_core": pa.array(cols[12], pa.bool_()),
+            "max_linkage_r2": pa.array(cols[13], pa.float32()),
         },
         schema=CLUSTER_VARIANT_TABLE,
     )

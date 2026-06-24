@@ -81,6 +81,25 @@ def _survival(a: np.ndarray, n: np.ndarray, eps: np.ndarray, overdispersion: flo
     return stats.binom.sf(a - 1, n, eps)
 
 
+def _core_region(kept_coverage: np.ndarray, core_frac: float) -> tuple[int, int]:
+    """Contiguous well-covered core ``[start, end]`` (consensus positions).
+
+    The 5'/3' ends ramp down in coverage (transcript-end length variation /
+    SSP priming), so positions below ``core_frac`` of the coverage plateau
+    are terminal raggedness, not real variation. Returns the first/last
+    consensus position whose depth ≥ ``core_frac × median-plateau-depth``."""
+    covered = kept_coverage[kept_coverage > 0]
+    if covered.size == 0:
+        return 0, max(0, kept_coverage.shape[0] - 1)
+    plateau = float(np.median(covered))
+    above = kept_coverage >= core_frac * plateau
+    if not above.any():
+        return 0, kept_coverage.shape[0] - 1
+    start = int(np.argmax(above))
+    end = int(above.shape[0] - 1 - np.argmax(above[::-1]))
+    return start, end
+
+
 def call_variants(
     cres,
     *,
@@ -90,6 +109,7 @@ def call_variants(
     q_real: float = 0.01,
     alpha_amb: float = 0.05,
     overdispersion: float = 0.0,
+    core_frac: float = 0.5,
 ) -> list[tuple]:
     """Call within-cluster variants from a :class:`ConsensusResult`.
 
@@ -97,9 +117,12 @@ def call_variants(
 
         (consensus_pos, consensus_allele, minor_allele, variant_class,
          homopolymer_run, depth_total, depth_minor, minor_fraction,
-         p_error, epsilon_class, call)
+         p_error, epsilon_class, call, in_core)
 
-    ``cluster_id`` is attached by the caller.
+    ``in_core`` is False for positions in the ragged 5'/3' coverage ramps
+    (terminal length variation), so the caller can keep them out of the
+    haplotype columns while still cataloguing them. ``cluster_id`` is
+    attached by the caller.
     """
     model = model or ErrorModel()
     pwm = cres.pwm
@@ -127,7 +150,15 @@ def call_variants(
     cons_codes = base_codes(consensus)
     runs = _homopolymer_runs(cons_codes)
 
+    # Well-covered core (consensus coordinates) for the terminal-raggedness
+    # gate. Use BASE coverage (A/C/G/T votes, excluding gap): at ragged ends
+    # many reads vote a deletion relative to the longer seed, so total coverage
+    # (n, which counts gaps) stays flat there while base coverage ramps down.
+    base_cov = pwm[:, :4].sum(axis=1)
+    core_start, core_end = _core_region(base_cov[np.flatnonzero(keep)], core_frac)
+
     cpos = cons_pos_of_centroid[cand_idx]
+    in_core = (cpos >= core_start) & (cpos <= core_end)
     mj = major[cand_idx]
     mn = minor[cand_idx]
     a = np.rint(minor_count[cand_idx]).astype(np.int64)
@@ -181,6 +212,7 @@ def call_variants(
                 float(pvals[i]),
                 float(eps[i]),
                 call,
+                bool(in_core[i]),
             )
         )
     rows.sort(key=lambda r: r[0])

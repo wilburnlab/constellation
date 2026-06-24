@@ -567,11 +567,61 @@ def test_empirical_and_betabinom_more_conservative(synthetic_panel):
     }
 
 
+def test_in_core_excludes_terminal_length_variation():
+    rng = np.random.default_rng(3)
+    base = _rand(rng, 700)
+    p = 350
+    alt = "A" if base[p] != "A" else "C"
+    rows, rid = [], 0
+    for i in range(200):
+        s = list(base)
+        if i < 80:
+            s[p] = alt
+        s = "".join(s)
+        s = s[int(rng.integers(0, 25)) : len(s) - int(rng.integers(0, 25))]  # ragged
+        rows.append((f"r{rid}", s, 0))
+        rid += 1
+    table = pa.table(
+        {
+            "read_id": [r[0] for r in rows],
+            "sequence": [r[1] for r in rows],
+            "sample_id": pa.array([r[2] for r in rows], pa.int64()),
+        }
+    )
+    res = assemble_clusters(table, identity=0.95, predict_orfs=False)
+    # the variant catalog carries the in_core flag
+    assert "in_core" in res.variants.column_names
+    clen = max(
+        len(s or "") for s in res.clusters.column("consensus_sequence").to_pylist()
+    )
+    assert res.haplotypes.num_rows > 0
+    vps = res.haplotypes.column("variant_positions").to_pylist()[0]
+    # haplotype columns are interior (no terminal 5'/3' ramp positions) …
+    assert all(15 <= q <= clen - 15 for q in vps)
+    # … and base substitutions only (no gap/length columns)
+    v = {r["consensus_pos"]: r for r in res.variants.to_pylist()}
+    assert all(v[q]["minor_allele"] in "ACGT" for q in vps)
+    # the planted ~40% interior SNP is captured as a real, phaseable column
+    assert any(
+        v[q]["minor_allele"] in "ACGT" and 0.3 <= v[q]["minor_fraction"] <= 0.5
+        for q in vps
+    )
+    # terminal gap "variants" are catalogued but kept out of the haplotype columns
+    term_gaps = [
+        cp
+        for cp, r in v.items()
+        if r["minor_allele"] == "-" and (cp < 8 or cp > clen - 8)
+    ]
+    assert all(cp not in vps for cp in term_gaps)
+
+
 def test_emit_alignments(synthetic_panel):
     from constellation.sequencing.transcriptome.cluster.denovo._cigar import parse_cigar
 
     table, *_ = synthetic_panel
-    res = assemble_clusters(table, identity=0.96, predict_orfs=False, emit_alignments=True)
+    res = assemble_clusters(
+        table, identity=0.96, predict_orfs=False, emit_alignments=True
+    )
     aln = res.alignments
     assert aln.num_rows > 0
     assert set(aln.column("role").to_pylist()) <= {"representative", "member"}

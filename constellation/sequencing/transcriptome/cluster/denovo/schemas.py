@@ -37,6 +37,10 @@ CLUSTER_VARIANT_TABLE: pa.Schema = pa.schema(
         pa.field("epsilon_class", pa.float32(), nullable=False),
         # 'real' | 'collapsed_error' | 'ambiguous'
         pa.field("call", pa.string(), nullable=False),
+        # False for positions in the ragged 5'/3' coverage ramps (terminal
+        # transcript-end length variation) — these are catalogued but kept out
+        # of the haplotype columns, which use only in-core variants.
+        pa.field("in_core", pa.bool_(), nullable=False),
         # Max pairwise r² to any other variant in the cluster (Cut 3).
         pa.field("max_linkage_r2", pa.float32(), nullable=True),
     ],
