@@ -47,9 +47,28 @@ ArgumentType = Literal["str", "int", "float", "flag", "enum", "path", "multi"]
   BooleanOptionalAction collapse here
 - ``enum`` — argparse ``choices=`` set → dropdown
 - ``path`` — heuristically detected by ``dest`` suffix
-  (``_dir`` / ``_file`` / ``_path``); rendered as plain text in v1,
-  FilePicker in a follow-up PR
-- ``multi`` — ``nargs in ('+', '*', N>1)`` → repeating list input
+  (``_dir`` / ``_file`` / ``_path`` …); rendered by the frontend as a
+  text box plus a "Browse…" button that opens the FilePicker over
+  ``GET /api/fs/list``. The ``path_kind`` sub-field says whether the
+  picker opens in directory or file mode.
+- ``multi`` — ``nargs in ('+', '*', N>1)`` → repeating list input. When
+  the dest is also path-ish, ``path_kind`` is set so the frontend can
+  offer a Browse-to-append affordance.
+"""
+
+PathKind = Literal["dir", "file", "either"]
+"""Sub-classification for path-ish args (``type == 'path'`` or a
+path-ish ``multi``). Derived from the ``dest`` heuristic; overridable
+per-argument via ``curated.json`` ``arg_hints``. ``either`` — the arg
+accepts a directory or a file (e.g. ``--reads`` takes a run directory
+or individual BAM/SAM files); the picker lets the user select both."""
+
+WidgetHint = Literal["reference"]
+"""Optional richer-widget hint decoupled from ``type``.
+
+- ``reference`` — the arg is a reference *cache handle* (dest
+  ``reference``), rendered as an editable dropdown fed by
+  ``GET /api/references`` rather than a plain text box.
 """
 
 
@@ -61,6 +80,9 @@ class ArgumentSchema(TypedDict, total=False):
     metavar: str | None
     help: str | None
     type: ArgumentType
+    path_kind: PathKind | None
+    widget: WidgetHint | None
+    glob: str | None
     default: Any
     choices: list[Any] | None
     required: bool
@@ -79,12 +101,29 @@ class CommandSchema(TypedDict, total=False):
 
 
 class CuratedEntry(TypedDict, total=False):
-    """One row from ``curated.json``."""
+    """One row from ``curated.json`` ``curated`` array (the Common overlay)."""
 
     path: list[str]
     label: str
     group: str
     hint: str
+
+
+class ArgPathHint(TypedDict, total=False):
+    """One row from ``curated.json`` ``arg_hints`` array.
+
+    Refines the auto-walked classification of a single argument the pure
+    ``dest`` heuristic can't get right (e.g. ``--samples`` is a TSV file
+    even though its dest lacks a path suffix). Applied as a post-pass in
+    :func:`build_cli_schema`. ``path`` + ``dest`` locate the argument.
+    """
+
+    path: list[str]
+    dest: str
+    is_path: bool
+    path_kind: PathKind
+    widget: WidgetHint
+    glob: str
 
 
 class CliSchema(TypedDict):

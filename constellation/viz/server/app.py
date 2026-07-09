@@ -19,7 +19,11 @@ Dashboard PR 2 added:
 - `POST/WS/GET/DELETE /api/commands[...]    → subprocess runner`
 - `/static/dashboard/...                    → dashboard SPA bundle`
 
-`/api/fs/list` (sandboxed file picker) remains deferred to a follow-up.
+The file-picker follow-up added:
+
+- `GET /api/fs/list                         → sandboxed directory listing`
+  confined to `app.state.fs_roots` (home + cwd + WSL drives by default;
+  widened with `constellation dashboard --root DIR`).
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from fastapi.staticfiles import StaticFiles
 import constellation.viz  # noqa: F401
 from constellation.viz.server.endpoints import cli_schema as cli_schema_ep
 from constellation.viz.server.endpoints import commands as commands_ep
+from constellation.viz.server.endpoints import fs as fs_ep
 from constellation.viz.server.endpoints import references as references_ep
 from constellation.viz.server.endpoints import saved_sessions as saved_sessions_ep
 from constellation.viz.server.endpoints import sessions as sessions_ep
@@ -62,6 +67,7 @@ def create_app(
     *,
     static_root: Path | None = None,
     default_entry: str = "genome",
+    fs_roots: list[Path] | None = None,
 ) -> FastAPI:
     """Build the viz FastAPI app.
 
@@ -80,6 +86,12 @@ def create_app(
         Subdirectory under `static_root` whose `index.html` we redirect
         to from `/`. PR 1 ships only `"genome"`; PR 2 adds
         `"dashboard"` and the CLI dispatches to the right one.
+    fs_roots
+        Sandbox roots for the file-picker endpoint (`GET /api/fs/list`).
+        When `None`, falls back to `default_fs_roots()` (home + cwd +
+        WSL drives). The CLI's `--root DIR` widens this. Every root is
+        resolved to an absolute real path; the endpoint refuses to list
+        anything outside them.
     """
     sessions_dict = _normalize_sessions(sessions)
     app = FastAPI(
@@ -93,6 +105,18 @@ def create_app(
     # Discovery is fast but binding resolution is deterministic, so we
     # avoid recomputing on every /api/tracks/{kind}/data hit.
     app.state.track_bindings_cache = {}
+    # Sandbox roots for the file picker. Resolve once at build time so
+    # the endpoint's containment check compares real absolute paths;
+    # dedup so the picker's roots dropdown has no repeats.
+    raw_roots = fs_roots if fs_roots is not None else fs_ep.default_fs_roots()
+    seen_roots: set[str] = set()
+    resolved_roots: list[Path] = []
+    for r in raw_roots:
+        rp = Path(r).expanduser().resolve(strict=False)
+        if str(rp) not in seen_roots:
+            seen_roots.add(str(rp))
+            resolved_roots.append(rp)
+    app.state.fs_roots = resolved_roots
 
     @app.get("/api/health")
     def _health() -> dict:
@@ -108,6 +132,7 @@ def create_app(
     app.include_router(saved_sessions_ep.router)
     app.include_router(cli_schema_ep.router)
     app.include_router(commands_ep.router)
+    app.include_router(fs_ep.router)
 
     # Static bundle: mount when present. The `genome/` and `dashboard/`
     # subdirectories are produced by `python -m constellation.viz.frontend.build`.

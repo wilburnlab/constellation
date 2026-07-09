@@ -1,0 +1,243 @@
+/* FilePicker popover + PathInput row.
+ *
+ * Shares the elevation / border / shadow language of .dataset-popover
+ * (widgets/GenomeBrowser.css) but is intentionally NOT scoped under
+ * .genome-browser-root so it also renders inside the dashboard's
+ * CommandForm. Colors read the shared chrome CSS variables (defined by
+ * both the genome and dashboard entries) with hard fallbacks. */
+
+/* ---- PathInput row (input + Browse button) ---- */
+.path-input-row {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+  width: 100%;
+}
+.path-input-field {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg-elev, #1c1a25);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+.path-input-field.invalid {
+  border-color: var(--danger, #ff6767);
+}
+.path-input-browse {
+  flex: 0 0 auto;
+  background: var(--bg-elev, #1c1a25);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.path-input-browse:hover {
+  border-color: var(--accent, #a277ff);
+  color: var(--accent, #a277ff);
+}
+
+/* ---- FilePicker popover ---- */
+.file-picker-popover {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elev, #1c1a25);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
+  border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  width: 380px;
+  max-width: 90vw;
+  max-height: 420px;
+  font-size: 12px;
+}
+
+.fp-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border, #2d2b3a);
+}
+.fp-title {
+  font-weight: 600;
+}
+.fp-close {
+  background: transparent;
+  border: none;
+  color: var(--fg-dim, #9c99a8);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+}
+.fp-close:hover {
+  color: var(--fg, #edecee);
+}
+
+.fp-roots-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px 0;
+}
+.fp-roots-label {
+  color: var(--fg-dim, #9c99a8);
+}
+.fp-roots-select {
+  flex: 1 1 auto;
+  background: var(--bg, #15141b);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+
+.fp-breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border, #2d2b3a);
+}
+.fp-crumb {
+  background: transparent;
+  border: none;
+  color: var(--accent, #a277ff);
+  cursor: pointer;
+  padding: 1px 3px;
+  font-size: 12px;
+  border-radius: 3px;
+}
+.fp-crumb:hover {
+  background: rgba(var(--accent-rgb, 162, 119, 255), 0.15);
+}
+.fp-crumb-sep {
+  color: var(--fg-dim, #9c99a8);
+}
+
+.fp-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  min-height: 120px;
+  padding: 4px 0;
+}
+.fp-entry {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.fp-entry:hover {
+  background: rgba(var(--accent-rgb, 162, 119, 255), 0.12);
+}
+.fp-icon {
+  flex: 0 0 auto;
+  font-size: 12px;
+}
+.fp-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fp-dir .fp-name {
+  color: var(--fg, #edecee);
+}
+.fp-file .fp-name {
+  color: var(--fg-dim, #9c99a8);
+}
+.fp-disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+.fp-disabled:hover {
+  background: transparent;
+}
+.fp-empty {
+  padding: 8px 10px;
+  color: var(--fg-dim, #9c99a8);
+  font-style: italic;
+}
+
+.fp-error {
+  padding: 6px 10px;
+  color: var(--danger, #ff6767);
+  border-top: 1px solid var(--border, #2d2b3a);
+}
+
+.fp-footer {
+  border-top: 1px solid var(--border, #2d2b3a);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.fp-goto-row {
+  display: flex;
+}
+.fp-goto-input,
+.fp-newfolder-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg, #15141b);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+.fp-select-row {
+  display: flex;
+}
+.fp-select-btn {
+  flex: 1 1 auto;
+  background: var(--accent, #a277ff);
+  color: var(--bg, #15141b);
+  border: none;
+  border-radius: 4px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.fp-select-btn:hover {
+  filter: brightness(1.1);
+}
+.fp-newfolder-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.fp-newfolder-label {
+  color: var(--fg-dim, #9c99a8);
+  white-space: nowrap;
+}
+.fp-newfolder-btn {
+  flex: 0 0 auto;
+  background: var(--bg-elev, #1c1a25);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
+  border-radius: 4px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.fp-newfolder-btn:hover {
+  border-color: var(--accent, #a277ff);
+}
+.fp-hint {
+  color: var(--fg-dim, #9c99a8);
+  font-style: italic;
+}
