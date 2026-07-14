@@ -138,6 +138,35 @@ def test_file_path_is_400(sandbox: Path) -> None:
     assert r.status_code == 400
 
 
+def test_listing_truncates_at_entry_cap(
+    sandbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accepting `_MAX_ENTRIES` stops the scan and flags truncated — the
+    response never materializes an unbounded directory."""
+    monkeypatch.setattr(fs_ep, "_MAX_ENTRIES", 3)
+    for i in range(10):
+        (sandbox / f"d{i:02d}").mkdir()
+    with _client([sandbox]) as c:
+        r = c.get("/api/fs/list", params={"path": str(sandbox)}).json()
+    assert r["truncated"] is True
+    assert len(r["entries"]) == 3
+
+
+def test_scan_cap_bounds_work_under_restrictive_filter(
+    sandbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restrictive filter can't walk the whole directory: `_MAX_SCAN`
+    caps the raw entries examined even when few/none are accepted."""
+    monkeypatch.setattr(fs_ep, "_MAX_SCAN", 2)
+    for i in range(10):
+        (sandbox / f"f{i:02d}.bam").write_text("x")
+    with _client([sandbox]) as c:
+        r = c.get(
+            "/api/fs/list", params={"path": str(sandbox), "globs": "*.nomatch"}
+        ).json()
+    assert r["truncated"] is True
+
+
 # ----------------------------------------------------------------------
 # Resolver + WSL units
 # ----------------------------------------------------------------------

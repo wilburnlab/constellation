@@ -214,8 +214,14 @@ export class FilePicker {
       useBtn.className = 'fp-newfolder-btn';
       useBtn.textContent = 'Use';
       const useNewFolder = (): void => {
-        const name = newInput.value.trim().replace(/^\/+|\/+$/g, '');
+        const name = newInput.value.trim();
         if (!name || !this.current) return;
+        // A subfolder is a single path segment — reject separators and
+        // dot-segments so a name can't climb out of the current dir.
+        if (name === '.' || name === '..' || /[\\/]/.test(name)) {
+          this.showError('Subfolder name must be a single name (no "/" or "..").');
+          return;
+        }
         this.select(joinPath(this.current, name));
       };
       useBtn.addEventListener('click', useNewFolder);
@@ -252,13 +258,12 @@ export class FilePicker {
     const seed = this.opts.initialPath?.trim();
     if (seed) {
       if (await this.tryLoad(seed)) return;
-      // Fall back to the parent (handles a not-yet-existing output dir
-      // or a full file path in dir mode). POSIX paths only — a pasted
-      // Windows path is normalized+listed server-side, no parent math.
-      if (!/^[A-Za-z]:/.test(seed) && seed.includes('/')) {
-        const parent = seed.replace(/\/+$/, '').replace(/\/[^/]*$/, '') || '/';
-        if (parent !== seed && (await this.tryLoad(parent))) return;
-      }
+      // Fall back to the parent — handles a not-yet-existing output dir
+      // or a full file path (e.g. a seeded `C:\Users\me\data.bam` in
+      // file mode lands the user in `C:\Users\me`; the server normalizes
+      // the Windows drive path on load).
+      const parent = parentPath(seed);
+      if (parent && parent !== seed && (await this.tryLoad(parent))) return;
     }
     await this.tryLoad(undefined);
   }
@@ -455,4 +460,17 @@ function containingRoot(path: string, roots: FsRoot[]): FsRoot | null {
 
 function joinPath(base: string, name: string): string {
   return base.endsWith('/') ? base + name : `${base}/${name}`;
+}
+
+/** The parent of a path, handling both POSIX (`/`) and Windows (`\`)
+ *  separators. Returns null when there is no separator to strip. */
+function parentPath(p: string): string | null {
+  const trimmed = p.replace(/[\\/]+$/, '');
+  const idx = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  if (idx < 0) return null;
+  const parent = trimmed.slice(0, idx);
+  if (parent === '') return '/';
+  // Bare drive root ("C:") → "C:\" so the server resolves it correctly.
+  if (/^[A-Za-z]:$/.test(parent)) return `${parent}\\`;
+  return parent;
 }

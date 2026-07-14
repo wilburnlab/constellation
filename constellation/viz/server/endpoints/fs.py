@@ -28,8 +28,12 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 router = APIRouter(prefix="/api/fs", tags=["fs"])
 
-# Defensive cap so a pathological directory can't produce a huge payload.
+# Defensive caps so a pathological directory can't spike memory or hang
+# the (unauthenticated) endpoint. `_MAX_ENTRIES` bounds the response;
+# `_MAX_SCAN` bounds the raw directory entries examined even when a
+# restrictive filter (dirs_only / globs) would otherwise walk millions.
 _MAX_ENTRIES = 5000
+_MAX_SCAN = 50000
 
 _WIN_DRIVE_RE = re.compile(r"^([A-Za-z]):[\\/](.*)$")
 
@@ -209,55 +213,67 @@ def list_directory(
     glob_list = [g.strip() for g in globs.split(",")] if globs else []
     glob_list = [g for g in glob_list if g]
 
+    # Stream the directory (os.scandir is lazy — no whole-listing
+    # materialization) and stop early: bail once we've accepted
+    # `_MAX_ENTRIES` or scanned `_MAX_SCAN` raw entries. Only the bounded
+    # accepted set is sorted, so a huge directory can't spike memory/CPU.
+    entries: list[dict] = []
+    truncated = False
+    scanned = 0
     try:
-        children = list(target.iterdir())
+        with os.scandir(target) as it:
+            for entry in it:
+                scanned += 1
+                if scanned > _MAX_SCAN:
+                    truncated = True
+                    break
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    continue
+                # Only symlinks can leave the sandbox — `target` is an
+                # already-resolved real path within a root, so its plain
+                # children are in-root by construction. Resolve just the
+                # symlinks and drop any that escape (no back door).
+                if entry.is_symlink():
+                    try:
+                        real = Path(entry.path).resolve(strict=False)
+                    except (OSError, RuntimeError):
+                        continue
+                    if not _within_any(real, roots):
+                        continue
+                if not is_dir:
+                    if dirs_only:
+                        continue
+                    if not _matches_globs(entry.name, glob_list):
+                        continue
+                size: int | None = None
+                mtime: float | None = None
+                try:
+                    st = entry.stat()
+                    mtime = st.st_mtime
+                    if not is_dir:
+                        size = st.st_size
+                except OSError:
+                    pass
+                entries.append(
+                    {
+                        "name": entry.name,
+                        "path": entry.path,
+                        "is_dir": is_dir,
+                        "size": size,
+                        "mtime": mtime,
+                    }
+                )
+                if len(entries) >= _MAX_ENTRIES:
+                    truncated = True
+                    break
     except PermissionError as exc:
         raise HTTPException(403, f"permission denied: {target}") from exc
     except OSError as exc:
         raise HTTPException(400, f"cannot read directory: {target}") from exc
 
-    entries: list[dict] = []
-    truncated = False
-    for entry in sorted(children, key=lambda c: c.name.lower()):
-        try:
-            real = entry.resolve(strict=False)
-        except (OSError, RuntimeError):
-            continue
-        # Drop symlinks that escape the sandbox — no back door.
-        if not _within_any(real, roots):
-            continue
-        try:
-            is_dir = entry.is_dir()
-        except OSError:
-            continue
-        if not is_dir:
-            if dirs_only:
-                continue
-            if not _matches_globs(entry.name, glob_list):
-                continue
-        size: int | None = None
-        mtime: float | None = None
-        try:
-            st = entry.stat()
-            mtime = st.st_mtime
-            if not is_dir:
-                size = st.st_size
-        except OSError:
-            pass
-        entries.append(
-            {
-                "name": entry.name,
-                "path": str(entry),
-                "is_dir": is_dir,
-                "size": size,
-                "mtime": mtime,
-            }
-        )
-        if len(entries) >= _MAX_ENTRIES:
-            truncated = True
-            break
-
-    # Directories first, then files; each already alphabetical.
+    # Directories first, then alphabetical within each group.
     entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
 
     parent = target.parent
