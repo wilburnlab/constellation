@@ -42,5 +42,25 @@
       "group": "Visualize",
       "hint": "Embedded IGV-style browser over a pipeline session — opens in this tab"
     }
+  ],
+  "arg_hints": [
+    {
+      "path": ["transcriptome", "demultiplex"],
+      "dest": "samples",
+      "path_kind": "file",
+      "glob": "*.tsv,*.txt"
+    },
+    {
+      "path": ["transcriptome", "demultiplex"],
+      "dest": "reads",
+      "path_kind": "either",
+      "glob": "*.bam,*.sam"
+    },
+    {
+      "path": ["transcriptome", "align"],
+      "dest": "junc_bed",
+      "path_kind": "file",
+      "glob": "*.bed"
+    }
   ]
 }

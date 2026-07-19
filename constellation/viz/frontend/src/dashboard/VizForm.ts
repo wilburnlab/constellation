@@ -6,6 +6,7 @@
 // panel passes its own host element + a transition callback).
 
 import type { VizDescriptor } from './viz_registry';
+import { PathInput } from '../widgets/PathInput';
 
 export interface VizFormOptions {
   descriptor: VizDescriptor;
@@ -23,6 +24,7 @@ export class VizForm {
   ) => void | Promise<void>;
   private element: HTMLElement | null = null;
   private inputs = new Map<string, HTMLInputElement>();
+  private pathInputs = new Map<string, PathInput>();
   private submitBtn: HTMLButtonElement | null = null;
   private errorEl: HTMLElement | null = null;
 
@@ -68,26 +70,40 @@ export class VizForm {
       }
       row.appendChild(label);
 
-      const input = document.createElement('input');
-      input.type = 'text';
-      input.placeholder = field.placeholder ?? '';
-      input.spellcheck = false;
-      input.autocomplete = 'off';
-
       const initial =
         this.prefill[field.name] ??
         (field.remember ? readStored(field.name) : '');
-      input.value = initial;
 
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          void this.submit();
-        }
-      });
-      input.addEventListener('input', () => this.updateSubmitButton());
-      this.inputs.set(field.name, input);
-      row.appendChild(input);
+      if (
+        field.kind === 'path' ||
+        field.kind === 'dir' ||
+        field.kind === 'file'
+      ) {
+        const pi = new PathInput({
+          value: initial,
+          kind: field.kind === 'file' ? 'file' : 'dir',
+          placeholder: field.placeholder,
+          onChange: () => this.updateSubmitButton(),
+        });
+        this.pathInputs.set(field.name, pi);
+        row.appendChild(pi.render());
+      } else {
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.placeholder = field.placeholder ?? '';
+        input.spellcheck = false;
+        input.autocomplete = 'off';
+        input.value = initial;
+        input.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            void this.submit();
+          }
+        });
+        input.addEventListener('input', () => this.updateSubmitButton());
+        this.inputs.set(field.name, input);
+        row.appendChild(input);
+      }
 
       section.appendChild(row);
     }
@@ -112,10 +128,19 @@ export class VizForm {
 
   destroy(): void {
     this.inputs.clear();
+    for (const pi of this.pathInputs.values()) pi.destroy();
+    this.pathInputs.clear();
     this.submitBtn = null;
     this.errorEl = null;
     if (this.element) this.element.innerHTML = '';
     this.element = null;
+  }
+
+  /** Current value of a field regardless of widget kind. */
+  private fieldValue(name: string): string {
+    const pi = this.pathInputs.get(name);
+    if (pi) return pi.getValue();
+    return this.inputs.get(name)?.value ?? '';
   }
 
   /** Public entry so the welcome-panel quick-launch path can trigger
@@ -125,12 +150,12 @@ export class VizForm {
     const values: Record<string, string> = {};
     const fields = this.descriptor.fields ?? [];
     for (const field of fields) {
-      const input = this.inputs.get(field.name);
-      const raw = (input?.value ?? '').trim();
+      const raw = this.fieldValue(field.name).trim();
       values[field.name] = raw;
       if (field.required && !raw) {
         this.showError(`${field.label} is required.`);
-        input?.focus();
+        this.pathInputs.get(field.name)?.focus();
+        this.inputs.get(field.name)?.focus();
         return;
       }
     }
@@ -151,8 +176,7 @@ export class VizForm {
     if (!this.submitBtn) return;
     const ok = (this.descriptor.fields ?? []).every((f) => {
       if (!f.required) return true;
-      const input = this.inputs.get(f.name);
-      return Boolean(input && input.value.trim());
+      return this.fieldValue(f.name).trim().length > 0;
     });
     this.submitBtn.disabled = !ok;
     if (this.errorEl) this.errorEl.textContent = '';
