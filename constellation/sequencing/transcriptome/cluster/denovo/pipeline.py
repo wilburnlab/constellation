@@ -411,19 +411,29 @@ def _cluster_chunk(
             if vrows:
                 keep = cres.winner < 4
                 centroid_of_cons = np.flatnonzero(keep)
-                # Haplotype columns: **in-core base-substitution** variants —
-                # in_core (vr[11]) drops the ragged-end coverage ramps, and a
-                # base (not gap) minor allele (vr[2]) drops the terminal
-                # deletion/length-variation positions that otherwise split reads
-                # into spurious 3'-length-class "haplotypes". Ranked by
-                # significance (real-first, then p_error asc; vr[10]/vr[8]),
-                # capped to bound the (M, V) matrix + list<int32> column.
+                # Haplotype columns: **statistically-supported, in-core,
+                # base-substitution** variants. Three gates:
+                #   • call == 'real' (vr[10]) — only FDR-supported variants
+                #     define haplotypes. 'collapsed_error' / 'ambiguous'
+                #     positions (minor mass consistent with basecaller / PCR /
+                #     RT error under the context-conditional null, or too shallow
+                #     to judge) are still catalogued in cluster_variants but
+                #     never split reads into distinct haplotypes — otherwise a
+                #     single error read fragments a clean cluster into spurious
+                #     haplotypes and dilutes their abundances.
+                #   • in_core (vr[11]) drops the ragged-end coverage ramps.
+                #   • base (not gap) minor allele (vr[2]) drops the terminal
+                #     deletion / length-variation positions.
+                # Ranked by significance (p_error asc; vr[8]) and capped to
+                # bound the (M, V) matrix + list<int32> column.
                 core_idx = [
                     i
                     for i in range(len(vrows))
-                    if vrows[i][11] and vrows[i][2] in ("A", "C", "G", "T")
+                    if vrows[i][10] == "real"
+                    and vrows[i][11]
+                    and vrows[i][2] in ("A", "C", "G", "T")
                 ]
-                core_idx.sort(key=lambda i: (vrows[i][10] != "real", vrows[i][8]))
+                core_idx.sort(key=lambda i: vrows[i][8])
                 sel = sorted(core_idx[:_HAPLOTYPE_MAX_VARIANTS])
                 r2_by_idx: dict[int, float] = {}
                 if sel:

@@ -732,3 +732,44 @@ def test_cluster_transcripts_io(tmp_path):
     assert (out / "diagnostics" / "report.md").exists()
     report = (out / "diagnostics" / "report.md").read_text()
     assert "Variant composition" in report and "Haplotypes" in report
+
+
+def test_haplotype_columns_gated_on_real_call():
+    # Only FDR-supported ('real') in-core substitutions define haplotypes.
+    # A low-frequency in-core substitution that the caller classifies as
+    # 'ambiguous'/'collapsed_error' (minor mass consistent with error) must be
+    # catalogued in cluster_variants but kept OUT of the haplotype columns —
+    # otherwise a handful of error reads fragment a clean cluster.
+    rng = np.random.default_rng(11)
+    base = _rand(rng, 600)
+    p_real, p_noise = 300, 150
+    a_real = next(b for b in "ACGT" if b != base[p_real])
+    a_noise = next(b for b in "ACGT" if b != base[p_noise])
+    rows = []
+    for i in range(300):
+        s = list(base)
+        if i < 120:  # 40% -> a real, phaseable column
+            s[p_real] = a_real
+        if i < 4:  # ~1.3% in-core substitution -> not 'real'
+            s[p_noise] = a_noise
+        rows.append((f"r{i}", "".join(s), 0))
+    table = pa.table(
+        {
+            "read_id": [r[0] for r in rows],
+            "sequence": [r[1] for r in rows],
+            "sample_id": pa.array([r[2] for r in rows], pa.int64()),
+        }
+    )
+    res = assemble_clusters(table, identity=0.97, predict_orfs=False)
+    v = {r["consensus_pos"]: r for r in res.variants.to_pylist()}
+    # both positions are tested and in-core; only the 40% one is 'real'
+    assert v[p_real]["call"] == "real"
+    assert p_noise in v and v[p_noise]["in_core"] and v[p_noise]["call"] != "real"
+    hap_positions = set()
+    for vps in res.haplotypes.column("variant_positions").to_pylist():
+        hap_positions.update(vps)
+    assert p_real in hap_positions  # real column kept
+    assert p_noise not in hap_positions  # non-real in-core substitution dropped
+    # with only the single real column, the cluster resolves to 2 haplotypes,
+    # not the 3+ that the noise column would have manufactured
+    assert res.haplotypes.num_rows == 2

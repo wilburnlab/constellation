@@ -39,7 +39,9 @@ CLUSTER_VARIANT_TABLE: pa.Schema = pa.schema(
         pa.field("call", pa.string(), nullable=False),
         # False for positions in the ragged 5'/3' coverage ramps (terminal
         # transcript-end length variation) — these are catalogued but kept out
-        # of the haplotype columns, which use only in-core variants.
+        # of the haplotype columns. Haplotype columns require in_core AND
+        # call == 'real' AND a base minor allele; every tested position is
+        # recorded here regardless of call.
         pa.field("in_core", pa.bool_(), nullable=False),
         # Max pairwise r² to any other variant in the cluster (Cut 3).
         pa.field("max_linkage_r2", pa.float32(), nullable=True),
@@ -54,7 +56,8 @@ CLUSTER_HAPLOTYPE_TABLE: pa.Schema = pa.schema(
         pa.field("cluster_id", pa.int64(), nullable=False),
         # Rank within the cluster, 0 = most abundant.
         pa.field("haplotype_id", pa.int32(), nullable=False),
-        # Alleles at the cluster's variant positions, in consensus order;
+        # Alleles at the cluster's variant positions (the FDR-supported
+        # 'real', in-core, base-substitution sites), in consensus order;
         # '.' marks a position the haplotype's reads don't cover.
         pa.field("allele_string", pa.string(), nullable=False),
         pa.field("variant_positions", pa.list_(pa.int32()), nullable=False),
