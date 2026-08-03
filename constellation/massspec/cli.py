@@ -501,22 +501,111 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
     p = subs.add_parser(
         "predict-library",
         help=(
-            "FASTA → predicted .dlib via EncyclopeDIA 6.5.15's bundled "
-            "JChronologer (RT) + Sculptor (CCS/IMS) + Electrician "
-            "(charge). In-process PyTorch — no Koina round-trip."
+            "FASTA → predicted spectral library. --backend encyclopedia "
+            "(default) runs EncyclopeDIA 6.5.15's bundled JChronologer "
+            "(RT) + Sculptor (CCS/IMS) + Electrician (charge) in-process; "
+            "--backend koina calls the Koina model server, which adds CID "
+            "models and HCD at arbitrary collision energy."
         ),
     )
     p.add_argument(
+        "--backend",
+        choices=["encyclopedia", "koina"],
+        default="encyclopedia",
+        help="prediction backend (default: encyclopedia)",
+    )
+    p.add_argument(
         "--fasta",
-        required=True,
         type=Path,
         help="input protein FASTA",
     )
     p.add_argument(
         "--output-dlib",
-        required=True,
         type=Path,
-        help="output predicted .dlib path",
+        help=(
+            "output predicted .dlib path (required for --backend "
+            "encyclopedia; optional extra output for --backend koina)"
+        ),
+    )
+    # ── koina backend ───────────────────────────────────────────────
+    koina = p.add_argument_group(
+        "koina backend",
+        "Only meaningful with --backend koina.",
+    )
+    koina.add_argument(
+        "--peptides",
+        type=Path,
+        default=None,
+        help=(
+            "explicit peptide list (TSV/CSV/parquet with a "
+            "modified_sequence column, optional charge) instead of "
+            "digesting a FASTA — no m/z or length filtering is applied"
+        ),
+    )
+    koina.add_argument(
+        "--from-library",
+        type=Path,
+        default=None,
+        help=(
+            "re-predict an existing library's exact precursors under a "
+            "different model/energy (e.g. an HCD-built panel under a CID "
+            "model)"
+        ),
+    )
+    koina.add_argument(
+        "--ms2-model",
+        default="Prosit_2020_intensity_HCD",
+        help="Koina fragment-intensity model (default: %(default)s)",
+    )
+    koina.add_argument(
+        "--rt-model",
+        default="Chronologer_RT",
+        help=(
+            "Koina retention-time model, or 'none' to skip RT prediction "
+            "(default: %(default)s)"
+        ),
+    )
+    koina.add_argument(
+        "--koina-url",
+        default=None,
+        help=(
+            "Koina server host:port (default: $CONSTELLATION_KOINA_URL, "
+            "else koina.wilhelmlab.org:443)"
+        ),
+    )
+    koina.add_argument(
+        "--collision-energy",
+        default=None,
+        help=(
+            "collision energy, or a comma-separated sweep (e.g. "
+            "'20,25,30') which writes one library per energy under "
+            "<output-dir>/ce_NN/. Rejected for models that declare no "
+            "collision-energy input, since every energy would then "
+            "produce an identical library."
+        ),
+    )
+    koina.add_argument(
+        "--output-library",
+        type=Path,
+        default=None,
+        help=(
+            "ParquetDir output path (default: <output-dir>/library_pqdir)"
+        ),
+    )
+    koina.add_argument(
+        "--on-unsupported-mod",
+        choices=["error", "skip"],
+        default="error",
+        help=(
+            "what to do with precursors the model cannot represent "
+            "(default: error)"
+        ),
+    )
+    koina.add_argument(
+        "--min-intensity",
+        type=float,
+        default=1e-4,
+        help="drop predicted fragments below this intensity (default: %(default)s)",
     )
     _add_output_dir_arg(p)
     p.add_argument(
@@ -1397,7 +1486,34 @@ def _write_manifest_for_search(
     write_manifest(output_dir / "manifest.json", manifest)
 
 
+#: Flags that only the EncyclopeDIA backend implements, paired with the
+#: parser's declared default. Silently ignoring one under --backend koina
+#: would let a user believe their PTM settings or JVM heap took effect
+#: when they did nothing at all — so a *non-default* value is an error.
+#: Compare against the real default, not a sentinel: --jvm-heap-max
+#: defaults to "12g" and --encyclopedia-arg to [], so a truthiness test
+#: would reject every invocation.
+_ENCYCLOPEDIA_ONLY_ARGS: tuple[tuple[str, str, object], ...] = (
+    ("encyclopedia_arg", "--encyclopedia-arg", []),
+    ("jvm_heap_max", "--jvm-heap-max", "12g"),
+    ("jvm_heap_min", "--jvm-heap-min", None),
+    ("jvm_tmpdir", "--jvm-tmpdir", None),
+    ("prediction_cache", "--prediction-cache", None),
+    ("generate_protein_entrapments", "--generate-protein-entrapments", False),
+    ("ragged_n_term", "--ragged-n-term", False),
+    ("no_decoys", "--no-decoys", False),
+    ("max_variable_forms", "--max-variable-forms", 1000),
+)
+
+
 def _cmd_massspec_predict_library(args: argparse.Namespace) -> int:
+    """Dispatch predict-library onto the selected backend."""
+    if getattr(args, "backend", "encyclopedia") == "koina":
+        return _cmd_predict_library_koina(args)
+    return _cmd_predict_library_encyclopedia(args)
+
+
+def _cmd_predict_library_encyclopedia(args: argparse.Namespace) -> int:
     """FASTA → predicted .dlib via EncyclopeDIA's JChronologer pipeline.
 
     Runs the jar, optionally ingests the produced .dlib into a
@@ -1406,6 +1522,16 @@ def _cmd_massspec_predict_library(args: argparse.Namespace) -> int:
     ``_SUCCESS`` last.
     """
     import sys as _sys
+
+    if args.fasta is None:
+        print("error: --fasta is required", file=_sys.stderr)
+        return 1
+    if args.output_dlib is None:
+        print(
+            "error: --output-dlib is required for --backend encyclopedia",
+            file=_sys.stderr,
+        )
+        return 1
 
     from constellation import __version__ as constellation_version
     from constellation.massspec.io.encyclopedia import read_encyclopedia
@@ -1579,6 +1705,254 @@ def _cmd_massspec_predict_library(args: argparse.Namespace) -> int:
             )
         else:
             print(f"predict-library done: {output_dlib}")
+    return 0
+
+
+def _parse_collision_energies(raw: str | None) -> list[float | None]:
+    """``"20,25,30"`` → ``[20.0, 25.0, 30.0]``; ``None`` → ``[None]``."""
+    if raw is None:
+        return [None]
+    out: list[float | None] = []
+    for token in str(raw).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.append(float(token))
+        except ValueError as exc:
+            raise ValueError(f"bad collision energy {token!r}") from exc
+    return out or [None]
+
+
+def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
+    """FASTA / peptide list / existing library → predicted Library via Koina.
+
+    Keeps the same run-dir contract as the EncyclopeDIA backend:
+    ``manifest.json`` + ``_SUCCESS``, with ``--resume`` short-circuiting a
+    completed directory. A multi-energy sweep writes one library per
+    energy under ``ce_NN/``, each with its own ``_SUCCESS`` so a run
+    interrupted at energy 12 of 17 resumes there.
+    """
+    import json
+    import sys as _sys
+
+    from constellation import __version__ as constellation_version
+    from constellation.massspec.library import save_library
+    from constellation.massspec.library.digest import (
+        precursors_from_fasta,
+        precursors_from_library,
+        precursors_from_peptide_list,
+    )
+    from constellation.massspec.library.koina import (
+        KoinaError,
+        KoinaInputError,
+        resolve_server,
+    )
+    from constellation.massspec.library.koina.api import predict_library
+    from constellation.massspec.library.koina.client import make_client
+
+    used = [
+        flag
+        for attr, flag, default in _ENCYCLOPEDIA_ONLY_ARGS
+        if getattr(args, attr, default) != default
+    ]
+    ptm_flags = [
+        f"--ptm-{_camel_to_kebab(name)}"
+        for name in _PTM_NAMES
+        if getattr(args, f"ptm_{_camel_to_kebab(name).replace('-', '_')}", "off")
+        != _ptm_default_for(name)
+    ]
+    if used or ptm_flags:
+        print(
+            "error: these flags are EncyclopeDIA-only and have no effect "
+            f"with --backend koina: {', '.join(used + ptm_flags)}",
+            file=_sys.stderr,
+        )
+        return 1
+
+    sources = [args.fasta, args.peptides, args.from_library]
+    if sum(s is not None for s in sources) != 1:
+        print(
+            "error: pass exactly one of --fasta, --peptides, or "
+            "--from-library",
+            file=_sys.stderr,
+        )
+        return 1
+
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    success_path = output_dir / "_SUCCESS"
+    if success_path.exists():
+        if not args.resume:
+            print(
+                f"error: --output-dir already complete (_SUCCESS exists). "
+                f"Pass --resume to re-use it, or delete {output_dir} to "
+                f"start fresh.",
+                file=_sys.stderr,
+            )
+            return 1
+        print(f"already complete: {output_dir}")
+        return 0
+
+    try:
+        energies = _parse_collision_energies(args.collision_energy)
+    except ValueError as exc:
+        print(f"error: {exc}", file=_sys.stderr)
+        return 1
+
+    server = resolve_server(args.koina_url)
+    rt_model_name = None if str(args.rt_model).lower() == "none" else args.rt_model
+
+    # ── build the precursor grid once, reused across energies ───────
+    try:
+        if args.fasta is not None:
+            fasta = Path(args.fasta).resolve()
+            if not fasta.is_file():
+                print(f"error: --fasta not found: {fasta}", file=_sys.stderr)
+                return 1
+            specs = precursors_from_fasta(
+                fasta,
+                protease=args.enzyme,
+                missed_cleavages=args.max_missed_cleavage,
+                min_mz=args.min_mz,
+                max_mz=args.max_mz,
+                charges=tuple(range(args.min_charge, args.max_charge + 1)),
+                fixed_mods={"C": "UNIMOD:4"},
+                variable_mods={"M": "UNIMOD:35"},
+                max_variable_mods=args.max_variable_mods,
+            )
+            source = str(fasta)
+        elif args.peptides is not None:
+            specs = precursors_from_peptide_list(
+                args.peptides,
+                charges=tuple(range(args.min_charge, args.max_charge + 1)),
+            )
+            source = str(Path(args.peptides).resolve())
+        else:
+            specs = precursors_from_library(args.from_library)
+            source = str(Path(args.from_library).resolve())
+    except (OSError, ValueError) as exc:
+        print(f"error: could not build precursor list: {exc}", file=_sys.stderr)
+        return 1
+
+    if not specs:
+        print("error: no precursors to predict", file=_sys.stderr)
+        return 1
+
+    # ── reject a sweep the model would silently collapse ────────────
+    try:
+        probe = make_client(args.ms2_model, server=args.koina_url)
+        declared = set(probe.model_inputs)
+    except KoinaError as exc:
+        print(f"error: {exc}", file=_sys.stderr)
+        return 1
+
+    takes_energy = "collision_energies" in declared
+    if len(energies) > 1 and not takes_energy:
+        print(
+            f"error: {args.ms2_model} declares no collision-energy input, so "
+            f"the {len(energies)} energies you gave would produce "
+            f"{len(energies)} identical libraries. Drop --collision-energy, "
+            f"or pick a model that accepts one.",
+            file=_sys.stderr,
+        )
+        return 1
+    if takes_energy and energies == [None]:
+        energies = [float(args.default_nce)]
+    if not takes_energy:
+        energies = [None]
+
+    multi = len(energies) > 1
+    summaries: list[dict[str, object]] = []
+
+    for energy in energies:
+        run_dir = output_dir / f"ce_{energy:g}" if multi else output_dir
+        run_dir.mkdir(parents=True, exist_ok=True)
+        marker = run_dir / "_SUCCESS" if multi else None
+        if marker is not None and marker.exists() and args.resume:
+            print(f"  ce={energy:g}: already complete, skipping")
+            continue
+
+        try:
+            library, stats = predict_library(
+                specs=specs,
+                ms2_model_name=args.ms2_model,
+                rt_model_name=rt_model_name,
+                collision_energy=energy,
+                adjust_nce_for_dia=not args.no_adjust_nce_for_dia,
+                server=args.koina_url,
+                min_intensity=args.min_intensity,
+                on_unsupported=args.on_unsupported_mod,
+                metadata={"x.koina.server_url": server, "x.koina.source": source},
+            )
+        except KoinaInputError as exc:
+            print(f"error: {exc}", file=_sys.stderr)
+            return 1
+        except KoinaError as exc:
+            print(f"error: Koina prediction failed: {exc}", file=_sys.stderr)
+            return 2
+
+        pqdir = (
+            Path(args.output_library).resolve()
+            if args.output_library is not None and not multi
+            else run_dir / "library_pqdir"
+        )
+        save_library(library, pqdir, format="parquet_dir")
+
+        dlib_path = None
+        if args.output_dlib is not None:
+            dlib_path = (
+                Path(args.output_dlib).resolve()
+                if not multi
+                else run_dir / Path(args.output_dlib).name
+            )
+            dlib_path.parent.mkdir(parents=True, exist_ok=True)
+            save_library(library, dlib_path, format="encyclopedia.dlib")
+
+        summary = {
+            "collision_energy": energy,
+            "library_pqdir": str(pqdir),
+            "output_dlib": str(dlib_path) if dlib_path else None,
+            "counts": {
+                "proteins": library.proteins.num_rows,
+                "peptides": library.peptides.num_rows,
+                "precursors": library.precursors.num_rows,
+                "fragments": library.fragments.num_rows,
+            },
+            "assembly": stats.as_dict(),
+        }
+        summaries.append(summary)
+        if marker is not None:
+            (run_dir / "manifest.json").write_text(json.dumps(summary, indent=2))
+            marker.write_bytes(b"")
+        if not args.no_progress:
+            label = f"ce={energy:g}: " if multi else ""
+            print(
+                f"  {label}{library.precursors.num_rows} precursors, "
+                f"{library.fragments.num_rows} fragments "
+                f"(max m/z deviation {stats.max_abs_ppm_deviation:.3f} ppm)"
+            )
+
+    manifest = {
+        "tool": "constellation massspec predict-library",
+        "backend": "koina",
+        "constellation_version": constellation_version,
+        "source": source,
+        "n_precursors_requested": len(specs),
+        "koina": {
+            "server": server,
+            "ms2_model": args.ms2_model,
+            "rt_model": rt_model_name,
+            "adjust_nce_for_dia": not args.no_adjust_nce_for_dia,
+            "min_intensity": args.min_intensity,
+        },
+        "runs": summaries,
+    }
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    success_path.write_bytes(b"")
+
+    if not args.no_progress:
+        print(f"predict-library done ({len(summaries)} library/libraries): {output_dir}")
     return 0
 
 

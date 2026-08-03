@@ -347,6 +347,10 @@ def assign_ids(
                     fields (``ion_type``, ``position``, ion ``charge``,
                     optional ``loss_id``, ``mz_theoretical``,
                     ``intensity_predicted``, optional ``annotation``).
+                    ``ion_type`` / ``position`` / ``charge`` may be
+                    ``None`` (or absent) for partial-ID rows whose raw
+                    annotation didn't structurally resolve; the raw
+                    string rides in ``annotation`` for later re-parsing.
                     To disambiguate parent-charge from fragment-charge,
                     use ``precursor_charge`` and ``charge`` (fragment).
     ``protein_peptide`` iterable of ``(accession, modified_sequence)``.
@@ -403,9 +407,14 @@ def assign_ids(
         fragment_rows.append(
             {
                 "precursor_id": pkey_to_id[(modseq, parent_charge)],
-                "ion_type": int(f["ion_type"]),
-                "position": int(f["position"]),
-                "charge": int(f["charge"]),
+                # ion_type / position / charge stay NULL when the source
+                # couldn't structurally resolve the annotation — see the
+                # nullability rationale on LIBRARY_FRAGMENT_TABLE. Coercing
+                # None through int() here would reject exactly the
+                # partial-ID rows the schema exists to preserve.
+                "ion_type": _opt_int(f.get("ion_type")),
+                "position": _opt_int(f.get("position")),
+                "charge": _opt_int(f.get("charge")),
                 "loss_id": f.get("loss_id"),
                 "mz_theoretical": float(f["mz_theoretical"]),
                 "intensity_predicted": float(f.get("intensity_predicted", -1.0)),
@@ -429,6 +438,11 @@ def assign_ids(
         protein_peptide=_to_table(pp_rows, PROTEIN_PEPTIDE_EDGE),
         metadata_extras=dict(metadata or {}),
     )
+
+
+def _opt_int(value: Any) -> int | None:
+    """``int(value)``, passing ``None`` through unchanged."""
+    return None if value is None else int(value)
 
 
 def _to_table(rows: Sequence[dict[str, Any]], schema: pa.Schema) -> pa.Table:
