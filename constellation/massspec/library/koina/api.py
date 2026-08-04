@@ -213,6 +213,8 @@ def predict_fragments(
     server: str | None = None,
     min_intensity: float = 1e-4,
     on_unsupported: str = "error",
+    fragmentation: str | None = None,
+    instrument: str = "LUMOS",
     client: PredictClient | None = None,
 ) -> tuple[list[PrecursorSpec], dict[str, np.ndarray]]:
     """Predict fragment intensities for a precursor grid.
@@ -259,6 +261,17 @@ def predict_fragments(
             f"{sorted(declared)}. Supplying one would be silently ignored and "
             f"every energy would yield an identical prediction."
         )
+
+    # Categorical inputs the PTM-aware models require and the 2020 series
+    # does not declare. Supplied only when the server asks for them, so a
+    # model that ignores them never receives one.
+    if "fragmentation_types" in declared:
+        frag = fragmentation or overlay.fragmentation
+        arrays["fragmentation_types"] = np.array(
+            [frag] * len(specs), dtype=object).reshape(-1, 1)
+    if "instrument_types" in declared:
+        arrays["instrument_types"] = np.array(
+            [instrument] * len(specs), dtype=object).reshape(-1, 1)
 
     return specs, cl.predict(arrays, min_intensity=min_intensity)
 
@@ -312,6 +325,7 @@ def predict_library(
     server: str | None = None,
     min_intensity: float = 1e-4,
     on_unsupported: str = "error",
+    fragmentation: str | None = None,
     metadata: Mapping[str, Any] | None = None,
     ms2_client: PredictClient | None = None,
     rt_client: PredictClient | None = None,
@@ -334,6 +348,7 @@ def predict_library(
         server=server,
         min_intensity=min_intensity,
         on_unsupported=on_unsupported,
+        fragmentation=fragmentation,
         client=ms2_client,
     )
 

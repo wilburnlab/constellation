@@ -48,6 +48,9 @@ class Ms2Model:
     min_charge: int = 1
     supported_mods: frozenset[str] | None = None
     supports_n_term_mods: bool = False
+    #: Value sent for a declared ``fragmentation_types`` input. The PTM
+    #: models require it; the 2020 series does not declare it at all.
+    fragmentation: str = "HCD"
     registered: bool = True
 
 
@@ -76,6 +79,25 @@ MS2_MODELS: dict[str, Ms2Model] = {
         Ms2Model("Prosit_2020_intensity_HCD", supported_mods=_PROSIT_2020_MODS),
         Ms2Model("Prosit_2020_intensity_CID", supported_mods=_PROSIT_2020_MODS),
         Ms2Model("Prosit_2023_intensity_timsTOF", supported_mods=_PROSIT_2020_MODS),
+        # PTM-aware series. Limits measured live 2026-08-04 on
+        # Prosit_2025_intensity_22PTM: length 1-30 (31 rejected), charge
+        # 1-6 (7 rejected), fragmentation_types accepts HCD/CID/ETD/ETHCD,
+        # and it takes Phospho-S/Y, Acetyl-K and N-TERMINAL acetyl, which
+        # the 2020 series rejects outright.
+        #
+        # supported_mods is left None (permissive) rather than guessed:
+        # the model advertises 22 PTMs and enumerating them from probing
+        # would be a partial list presented as complete.
+        #
+        # NOTE the length ceiling is still 30. Peptides longer than that
+        # -- including the 34-46mers carrying the EphA3 activation-loop
+        # tyrosines -- cannot be predicted by any of these models.
+        Ms2Model("Prosit_2025_intensity_22PTM", max_charge=6,
+                 supports_n_term_mods=True),
+        Ms2Model("Prosit_2025_intensity_40PTM", max_charge=6,
+                 supports_n_term_mods=True),
+        Ms2Model("Prosit_2024_intensity_PTMs_gl", max_charge=6,
+                 supports_n_term_mods=True),
     )
 }
 
