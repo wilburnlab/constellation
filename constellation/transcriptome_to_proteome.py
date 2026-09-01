@@ -1218,8 +1218,7 @@ def run_transcriptome_to_proteomics(
                 jvm_heap_max=args.jvm_heap_max,
                 jvm_heap_min=args.jvm_heap_min,
                 jvm_tmpdir=args.jvm_tmpdir,
-                fragment_tolerance_ppm=args.fragment_tolerance_ppm,
-                precursor_tolerance_ppm=args.precursor_tolerance_ppm,
+                **_tolerance_kwargs(args),
                 percolator_version=args.percolator_version,
                 percolator_threshold=args.percolator_threshold,
                 threads=args.threads,
@@ -1279,8 +1278,7 @@ def run_transcriptome_to_proteomics(
             subcommand="07_gpf_search",
             params={
                 "collision_filter": not args.no_collision_filter,
-                "fragment_tolerance_ppm": args.fragment_tolerance_ppm,
-                "precursor_tolerance_ppm": args.precursor_tolerance_ppm,
+                **_tolerance_kwargs(args),
             },
             counts={"n_losers": n_losers},
             runtime=search_runtime,
@@ -1415,6 +1413,10 @@ def run_transcriptome_to_proteomics(
                     1, args.threads // max(1, args.injection_threads)
                 ),
                 "n_injections": len(injection_files),
+                # Stage 9 hands these to the jar too — record them here so
+                # the per-injection manifest is not silently thinner than
+                # stage 7's.
+                **_tolerance_kwargs(args),
             },
         )
         _touch_success(stage_dir)
@@ -1675,6 +1677,18 @@ def _passthrough_args(arg_list: list[str]) -> list[str]:
     return encyclopedia_passthrough_args(arg_list)
 
 
+def _tolerance_kwargs(args) -> dict[str, object]:
+    """The six search-tolerance values as ``run_library_search`` kwargs.
+
+    Also used verbatim as the stage-manifest ``params`` block, so a run's
+    recorded tolerances and the ones actually handed to the jar cannot
+    drift. Mirrors the massspec CLI's helper.
+    """
+    from constellation.massspec.cli import _resolve_tolerance_args
+
+    return _resolve_tolerance_args(args)
+
+
 def _maybe_auto_ingest_elib(
     elib_path: Path, run_dir: Path, no_ingest: bool
 ) -> None:
@@ -1743,8 +1757,7 @@ def _run_per_injection_searches(
             jvm_heap_max=args.jvm_heap_max,
             jvm_heap_min=args.jvm_heap_min,
             jvm_tmpdir=args.jvm_tmpdir,
-            fragment_tolerance_ppm=args.fragment_tolerance_ppm,
-            precursor_tolerance_ppm=args.precursor_tolerance_ppm,
+            **_tolerance_kwargs(args),
             percolator_version=args.percolator_version,
             percolator_threshold=args.percolator_threshold,
             threads=max(1, args.threads // max(1, args.injection_threads)),
