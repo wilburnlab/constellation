@@ -1816,7 +1816,7 @@ def _cmd_massspec_process_dia(args: argparse.Namespace) -> int:
     # otherwise a sweep that merges N injections per condition has to
     # special-case whichever conditions happen to have exactly one.
     if len(inputs) == 1 and not output_dia.is_file():
-        produced = single_input_dia_path(inputs[0])
+        produced = single_input_dia_path(inputs[0], cwd=output_dir)
         if produced is not None:
             output_dia.parent.mkdir(parents=True, exist_ok=True)
             _shutil.move(str(produced), str(output_dia))
@@ -1833,6 +1833,22 @@ def _cmd_massspec_process_dia(args: argparse.Namespace) -> int:
             f"produced at {output_dia}; check {result.stderr_log}",
             file=_sys.stderr,
         )
+        if len(inputs) == 1:
+            # Single input ignores -o, so the file lands by convention.
+            # Name every place we looked — otherwise diagnosing a new
+            # convention means another round-trip to the cluster.
+            print(
+                "  single-input mode: the jar chooses the output path "
+                "itself. Looked for it at:",
+                file=_sys.stderr,
+            )
+            for cand in (
+                output_dir / f"{inputs[0].stem}.dia",
+                output_dir / f"{inputs[0].name}.dia",
+                inputs[0].with_suffix(".dia"),
+                inputs[0].parent / f"{inputs[0].name}.dia",
+            ):
+                print(f"    {cand}", file=_sys.stderr)
         return 2
 
     # Manifest captures inputs (with SHA256s) + jar + JVM + runtime.

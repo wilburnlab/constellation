@@ -123,3 +123,36 @@ def test_build_args_extra_args_appended(tmp_path: Path) -> None:
 def test_build_args_empty_inputs_rejected() -> None:
     with pytest.raises(ValueError, match="at least one input"):
         build_process_dia_args(inputs=[])
+
+
+def test_single_input_dia_path_prefers_cwd(tmp_path: Path) -> None:
+    """cwd wins over next-to-input, mirroring find_search_elib.
+
+    6.5.15 writes the single-input .dia into the process's working
+    directory, not beside the input. The runner pins cwd=output_dir, so
+    that candidate must be checked first — otherwise a stale .dia
+    sitting next to the raw file would be picked up in preference to the
+    one this run just produced.
+    """
+    from constellation.massspec.search.encyclopedia import single_input_dia_path
+
+    raw_dir = tmp_path / "MS_Data"
+    raw_dir.mkdir()
+    inp = raw_dir / "sample.raw"
+    inp.write_bytes(b"")
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    # Nothing anywhere yet.
+    assert single_input_dia_path(inp, cwd=run_dir) is None
+
+    # Only next-to-input: still found (older convention).
+    beside = raw_dir / "sample.dia"
+    beside.write_bytes(b"x")
+    assert single_input_dia_path(inp, cwd=run_dir) == beside
+
+    # cwd copy appears -> it wins.
+    in_cwd = run_dir / "sample.dia"
+    in_cwd.write_bytes(b"x")
+    assert single_input_dia_path(inp, cwd=run_dir) == in_cwd

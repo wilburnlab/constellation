@@ -59,18 +59,43 @@ def build_process_dia_args(
     return args
 
 
-def single_input_dia_path(input_file: Path) -> Path | None:
-    """Locate the ``.dia`` the jar wrote beside a single input.
+def single_input_dia_path(
+    input_file: Path,
+    *,
+    cwd: Path | None = None,
+) -> Path | None:
+    """Locate the ``.dia`` the jar produced from a single input.
 
-    Single-input mode ignores ``-o`` and writes the cache next to the
-    input file. Version drift over ``<stem>.dia`` vs ``<name>.dia`` is
-    handled the same way :func:`library_search.find_search_elib` handles
-    the ``.elib``: check both, return the first that exists.
+    Single-input mode ignores ``-o``, so the output lands by convention
+    rather than by request — and the convention has the same two axes of
+    drift :func:`library_search.find_search_elib` already handles for the
+    ``.elib``:
+
+      * **where** — 6.5.15 writes to the process's *current working
+        directory*, not next to the input. Older behaviour was
+        next-to-input. Both are checked, cwd first.
+      * **what** — ``<stem>.dia`` vs ``<name>.dia``.
+
+    ``cwd`` should be the same path the runner handed :func:`run_jar`.
+    Returns ``None`` when nothing matches so the caller can surface a
+    clear error naming where it looked.
     """
-    for candidate in (
-        input_file.with_suffix(".dia"),
-        input_file.parent / f"{input_file.name}.dia",
-    ):
+    candidates: list[Path] = []
+    if cwd is not None:
+        cwd = Path(cwd)
+        candidates.extend(
+            [
+                cwd / f"{input_file.stem}.dia",
+                cwd / f"{input_file.name}.dia",
+            ]
+        )
+    candidates.extend(
+        [
+            input_file.with_suffix(".dia"),
+            input_file.parent / f"{input_file.name}.dia",
+        ]
+    )
+    for candidate in candidates:
         if candidate.is_file():
             return candidate
     return None
@@ -104,12 +129,19 @@ def run_process_dia(
     Streams the jar's stdout/stderr to ``<output_dir>/logs/`` and
     returns a :class:`JvmResult`. Raises :class:`JvmRunError` on
     non-zero exit.
+
+    Runs with ``cwd=output_dir``, matching
+    :func:`library_search.run_library_search`. This matters for more
+    than tidiness: in single-input mode the jar writes ``<stem>.dia``
+    into its working directory, so without this it would land in
+    whatever shell (or Slurm submit) directory launched the run.
     """
     args = build_process_dia_args(
         inputs=inputs,
         output_dia=output_dia,
         extra_args=extra_args,
     )
+    output_dir.mkdir(parents=True, exist_ok=True)
     return run_jar(
         "encyclopedia",
         args=args,
@@ -119,6 +151,7 @@ def run_process_dia(
         extra_jvm_args=extra_jvm_args,
         log_dir=output_dir / "logs",
         stream_to_stderr=stream_to_stderr,
+        cwd=output_dir,
     )
 
 
