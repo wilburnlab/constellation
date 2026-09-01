@@ -32,9 +32,14 @@ def build_process_dia_args(
     """Translate typed kwargs to the EncyclopeDIA CLI argv (no JVM call).
 
     Multi-input mode (``len(inputs) > 1``) requires ``output_dia``;
-    EncyclopeDIA writes the consolidated cache there. Single-input mode
-    can omit ``output_dia`` — the jar writes a ``.DIA`` cache next to
-    the input file automatically.
+    EncyclopeDIA writes the consolidated cache there.
+
+    **Single-input mode must NOT emit ``-o``.** The jar hard-errors with
+    "When using one input, do not specify an output file!" and exits 1 —
+    it always writes the cache next to the input as
+    ``<input_stem>.dia``. So ``output_dia`` is *ignored* here when there
+    is exactly one input; the caller is responsible for relocating the
+    produced file if it wants it elsewhere (the CLI handler does).
 
     Pure function — exists so the Tier A test can exercise the flag
     layout without spawning Java.
@@ -48,10 +53,27 @@ def build_process_dia_args(
         "-i",
         joined,
     ]
-    if output_dia is not None:
+    if output_dia is not None and len(inputs) > 1:
         args.extend(["-o", str(output_dia)])
     args.extend(str(a) for a in extra_args)
     return args
+
+
+def single_input_dia_path(input_file: Path) -> Path | None:
+    """Locate the ``.dia`` the jar wrote beside a single input.
+
+    Single-input mode ignores ``-o`` and writes the cache next to the
+    input file. Version drift over ``<stem>.dia`` vs ``<name>.dia`` is
+    handled the same way :func:`library_search.find_search_elib` handles
+    the ``.elib``: check both, return the first that exists.
+    """
+    for candidate in (
+        input_file.with_suffix(".dia"),
+        input_file.parent / f"{input_file.name}.dia",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def run_process_dia(
@@ -68,8 +90,10 @@ def run_process_dia(
 ) -> JvmResult:
     """Preprocess one or more spectra files into a combined ``.DIA`` cache.
 
-    Single-input mode preprocesses one acquisition (decode + index +
-    cache; ``.DIA`` lands next to the input). Multi-input mode merges
+    Single-input mode preprocesses one acquisition; the ``.DIA`` lands
+    next to the input as ``<input_stem>.dia`` and ``output_dia`` is
+    ignored (the jar refuses ``-o`` with one input). Use
+    :func:`single_input_dia_path` to locate it. Multi-input mode merges
     gas-phase fractions into one ``.DIA`` at ``output_dia`` — the
     intended GPF workflow.
 
@@ -98,4 +122,8 @@ def run_process_dia(
     )
 
 
-__all__ = ["build_process_dia_args", "run_process_dia"]
+__all__ = [
+    "build_process_dia_args",
+    "run_process_dia",
+    "single_input_dia_path",
+]

@@ -289,3 +289,81 @@ def test_require_min_encyclopedia_accepts_current_and_unparseable(capsys) -> Non
     assert require_min_encyclopedia(_encyclopedia_handle("6.6.0")) == 0
     assert require_min_encyclopedia(_encyclopedia_handle(None)) == 0
     assert capsys.readouterr().err == ""
+
+
+# ── _write_manifest_for_search: the CALLER, not just the envelope ──────
+
+
+def test_write_manifest_for_search_records_tolerances(tmp_path) -> None:
+    """Exercise the search handler's own manifest call.
+
+    Regression guard: ``build_manifest_envelope`` takes a named
+    ``extras`` parameter, not ``**kwargs``. Passing ``search_params=``
+    directly raises TypeError — and because this call happens AFTER the
+    jar and the auto-ingest have finished, the failure costs a full
+    search run before it surfaces. Testing the envelope builder in
+    isolation does not catch a bad call site, so this test drives
+    ``_write_manifest_for_search`` end to end with fakes.
+    """
+    import json
+    import types
+
+    from constellation.massspec.cli import _write_manifest_for_search
+    from constellation.massspec.search.encyclopedia import (
+        build_manifest_envelope,
+        write_manifest,
+    )
+
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    for name in ("in.dia", "lib.dlib", "bg.fasta"):
+        (tmp_path / name).write_bytes(b"x")
+
+    result = types.SimpleNamespace(
+        argv=["-i", "in.dia", "-ptol", "0.3", "-ptolunits", "AMU"],
+        jar_sha256="deadbeef",
+        java_version="17.0.1",
+        java_source="bundled",
+        java_path=tmp_path / "java",
+        stdout_log=output_dir / "logs" / "stdout.log",
+        stderr_log=output_dir / "logs" / "stderr.log",
+        elapsed_seconds=1.0,
+        returncode=0,
+    )
+    handle = types.SimpleNamespace(
+        version="6.5.15", path=tmp_path / "encyclopedia-6.5.15.jar", source="env"
+    )
+    tolerances = {
+        "precursor_tolerance": 0.3,
+        "precursor_tolerance_unit": "Da",
+        "fragment_tolerance": 0.8,
+        "fragment_tolerance_unit": "Da",
+        "library_fragment_tolerance": None,
+        "library_fragment_tolerance_unit": "ppm",
+    }
+
+    _write_manifest_for_search(
+        args=types.SimpleNamespace(),
+        input_file=tmp_path / "in.dia",
+        library=tmp_path / "lib.dlib",
+        fasta=tmp_path / "bg.fasta",
+        report_path=output_dir / "report.txt",
+        elib_path=output_dir / "in.elib",
+        output_dir=output_dir,
+        result=result,
+        handle=handle,
+        ingest_info={"skipped": False},
+        library_pqdir=None,
+        quant_pqdir=None,
+        search_pqdir=None,
+        extra_args=[],
+        tolerances=tolerances,
+        build_manifest_envelope=build_manifest_envelope,
+        write_manifest=write_manifest,
+        constellation_version="0.0.0",
+    )
+
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["search_params"] == tolerances
+    # The jar's own token spelling still rides along in argv.java.
+    assert "-ptolunits" in manifest["argv"]["java"]

@@ -37,7 +37,19 @@ def test_build_args_single_input(tmp_path: Path) -> None:
     ]
 
 
-def test_build_args_single_input_with_output(tmp_path: Path) -> None:
+def test_build_args_single_input_never_emits_output_flag(tmp_path: Path) -> None:
+    """``-o`` must be suppressed when there is exactly one input.
+
+    EncyclopeDIA 6.5.15 rejects the combination outright — "When using
+    one input, do not specify an output file!" — and exits 1 before
+    doing any work. This test previously asserted the opposite, which
+    is how a Slurm sweep ended up losing six array tasks in the first
+    four minutes.
+
+    ``output_dia`` is still accepted (callers want a uniform interface
+    regardless of input count); the CLI handler relocates the
+    jar-produced ``<input_stem>.dia`` afterwards.
+    """
     inp = tmp_path / "a.mzML"
     out = tmp_path / "out.dia"
     args = build_process_dia_args(inputs=[inp], output_dia=out)
@@ -46,9 +58,26 @@ def test_build_args_single_input_with_output(tmp_path: Path) -> None:
         "-processDIA",
         "-i",
         str(inp),
-        "-o",
-        str(out),
     ]
+    assert "-o" not in args
+
+
+def test_single_input_dia_path_finds_both_conventions(tmp_path: Path) -> None:
+    """Locate the .dia the jar drops beside a single input."""
+    from constellation.massspec.search.encyclopedia import single_input_dia_path
+
+    inp = tmp_path / "a.raw"
+    inp.write_bytes(b"")
+    assert single_input_dia_path(inp) is None
+
+    stem_form = tmp_path / "a.dia"
+    stem_form.write_bytes(b"x")
+    assert single_input_dia_path(inp) == stem_form
+    stem_form.unlink()
+
+    name_form = tmp_path / "a.raw.dia"
+    name_form.write_bytes(b"x")
+    assert single_input_dia_path(inp) == name_form
 
 
 def test_build_args_multi_input_colon_joined(tmp_path: Path) -> None:
