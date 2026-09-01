@@ -191,10 +191,16 @@ def run_library_search(
     """Run an EncyclopeDIA DIA library search.
 
     Required: ``input_file`` (.mzML / .dia / .raw / .d), ``library``
-    (.dlib chromatogram-free or .elib chromatogram-library). Optional
-    ``fasta`` is the background proteome — required by some scoring
-    pathways but not by the default chromatogram-library search when
-    the library already carries decoys.
+    (.dlib chromatogram-free or .elib chromatogram-library), and
+    ``fasta`` (the background proteome).
+
+    ``fasta`` is typed as optional here only because
+    :func:`build_library_search_args` is a general argv builder, but
+    EncyclopeDIA 6.5.15's default search **aborts** without ``-f`` —
+    "You are required to specify an input file (-i), a library file
+    (-l), and a fasta file (-f)" — even when the library already carries
+    decoys. Older versions did not. The CLI marks ``--fasta`` required
+    so this surfaces at parse time rather than as a jar exit code.
 
     The chromatogram ``.elib`` output is written alongside the input
     file by EncyclopeDIA's convention. Locating it post-run is the

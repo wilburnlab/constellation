@@ -88,13 +88,16 @@ Verified from `java -jar encyclopedia-6.5.15.jar --help` on 6.5.15.
 |---|---|---|
 | `-i` | path | input `.DIA` or `.mzML` (or vendor `.raw`/`.d` via bundled MSRawJava) |
 | `-l` | path | library `.dlib` (chromatogram-free predicted) or `.elib` (chromatogram library) |
+| `-f` | path | background proteome FASTA |
+
+**`-f` is mandatory in 6.5.15**, which is a change from older versions. Omitting it aborts the run before any file is opened with `You are required to specify an input file (-i), a library file (-l), and a fasta file (-f)` — and it does so *even when the library already carries decoys*, contradicting the older "only needed for decoy generation" guidance. Verified empirically: `-i` + `-l` alone produces that message, while adding `-f` proceeds to the library read. `--fasta` is therefore `required=True` on `massspec search` so the failure surfaces at argparse time instead of as a jar exit code after JVM startup.
 
 **Common optional flags (wrapped as typed CLI args):**
 
 | Flag | Default | Constellation CLI flag |
 |---|---|---|
 | `-o` | `<input>.encyclopedia.txt` | always set by handler to `<output-dir>/<input-stem>.encyclopedia.txt` |
-| `-f` | — | `--fasta` (optional; required only for non-EncyclopeDIA-pathway scoring) |
+| `-f` | — | `--fasta` (**required** — see note below) |
 | `-ptol` / `-ptolunits` | `10 ppm` | `--precursor-tolerance` + `--precursor-tolerance-unit {ppm,Da}` |
 | `-ftol` / `-ftolunits` | `10 ppm` | `--fragment-tolerance` + `--fragment-tolerance-unit {ppm,Da}` |
 | `-lftol` / `-lftolunits` | `10 ppm` | `--library-fragment-tolerance` + `--library-fragment-tolerance-unit {ppm,Da}` |

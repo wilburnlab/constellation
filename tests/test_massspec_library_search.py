@@ -324,3 +324,43 @@ def test_jar_rejects_literal_da(tmp_path: Path) -> None:
     """
     out = _run_jar_for_units(tmp_path, ["-ftol", "0.8", "-ftolunits", "Da"])
     assert "Error parsing fragment mass error unit type" in out, out
+
+
+@pytest.mark.skipif(
+    not _HAVE_ENC,
+    reason="needs $CONSTELLATION_ENCYCLOPEDIA_HOME with the encyclopedia jar",
+)
+def test_jar_requires_fasta(tmp_path: Path) -> None:
+    """6.5.15's default search aborts without ``-f``.
+
+    This is why ``massspec search`` marks ``--fasta`` required. Older
+    versions treated it as optional (needed only for decoy generation),
+    and the CLI's help text said so until a real run proved otherwise.
+    If this ever starts failing, the jar has relaxed the requirement and
+    ``--fasta`` could go back to being optional.
+    """
+    import subprocess
+
+    from constellation.thirdparty.jvm import _resolve_java
+    from constellation.thirdparty.registry import find
+
+    handle = find("encyclopedia")
+    java_path, _source, _version = _resolve_java(handle)
+    proc = subprocess.run(
+        [
+            str(java_path),
+            "-Djava.awt.headless=true",
+            "-jar",
+            str(handle.path),
+            "-i",
+            str(tmp_path / "nope.mzML"),
+            "-l",
+            str(tmp_path / "nope.dlib"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        cwd=tmp_path,
+    )
+    out = proc.stdout + proc.stderr
+    assert "required to specify" in out, out

@@ -464,15 +464,15 @@ def _add_input_args_for_search(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--fasta",
-        required=False,
-        default=None,
+        required=True,
         type=Path,
         help=(
-            "background proteome FASTA (optional). Used for decoy "
-            "generation when the library lacks decoys. EncyclopeDIA's "
-            "default search does not require it when the library "
-            "already contains decoys (e.g. predict-library output "
-            "with -addDecoys true), but providing it never hurts."
+            "background proteome FASTA. REQUIRED — EncyclopeDIA 6.5.15's "
+            "default search refuses to start without -f ('You are "
+            "required to specify an input file (-i), a library file (-l), "
+            "and a fasta file (-f)'), even when the library already "
+            "carries decoys. Older versions treated it as optional. Use "
+            "the same FASTA the library was built from."
         ),
     )
 
