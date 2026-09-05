@@ -68,8 +68,54 @@ class FakeKoinaClient:
         return self._outputs
 
     def predict(self, arrays, *, min_intensity=1e-4, mode="semi_async"):
+        """Replay the fixture rows the request actually asks for.
+
+        Deliberately request-AWARE. An earlier version validated column
+        names and then returned the whole captured response regardless,
+        so a one-precursor request happily received eight precursors'
+        worth of rows and every downstream alignment assertion passed
+        vacuously. That is why the offline suite could not catch a
+        caller sending the wrong values or the wrong number of rows.
+        """
         validate_columns(arrays.keys(), self._inputs, model=self.model)
-        return {k[len("out_") :]: v for k, v in self._data.items() if k.startswith("out_")}
+        self.last_request = {k: np.asarray(v) for k, v in arrays.items()}
+
+        def _flat(a):
+            return [
+                x.decode() if isinstance(x, bytes) else x
+                for x in np.asarray(a).ravel().tolist()
+            ]
+
+        want = list(
+            zip(
+                _flat(arrays["peptide_sequences"]),
+                [int(z) for z in _flat(arrays["precursor_charges"])],
+                strict=True,
+            )
+        )
+        have = list(
+            zip(
+                _flat(self._data["in_peptide_sequences"]),
+                [int(z) for z in _flat(self._data["in_precursor_charges"])],
+                strict=True,
+            )
+        )
+        index_of: dict[tuple[str, int], int] = {}
+        for i, row in enumerate(have):
+            index_of.setdefault(row, i)
+        try:
+            take = [index_of[row] for row in want]
+        except KeyError as exc:
+            raise AssertionError(
+                f"{self.model} fixture has no captured response for "
+                f"{exc.args[0]!r}; the request does not correspond to what "
+                f"was captured"
+            ) from None
+        return {
+            k[len("out_") :]: np.asarray(v)[take]
+            for k, v in self._data.items()
+            if k.startswith("out_")
+        }
 
 
 def fixture_specs(model: str) -> list[PrecursorSpec]:
@@ -447,3 +493,152 @@ def test_library_package_does_not_import_pandas():
         if "import pandas" in path.read_text()
     ]
     assert offenders == []
+
+
+# ── the request contract ───────────────────────────────────────────────
+
+
+def test_instrument_is_forwarded_from_predict_library(monkeypatch) -> None:
+    """predict_library must not swallow instrument into **digest_kwargs.
+
+    The lower level defaults to LUMOS, so a caller asking for TIMSTOF
+    against a model that declares instrument_types silently received
+    LUMOS-conditioned intensities that look perfectly valid.
+    """
+    from constellation.massspec.library.koina import api
+
+    seen = {}
+
+    def _spy(specs, **kw):
+        seen.update(kw)
+        raise RuntimeError("stop after capturing the call")
+
+    monkeypatch.setattr(api, "predict_fragments", _spy)
+    with pytest.raises(RuntimeError, match="stop after capturing"):
+        api.predict_library(
+            specs=fixture_specs(HCD), ms2_model_name=HCD,
+            rt_model_name=None, instrument="TIMSTOF",
+        )
+    assert seen["instrument"] == "TIMSTOF"
+
+
+def test_unknown_kwargs_are_rejected_with_explicit_specs() -> None:
+    """Digest options only mean something on the fasta= path.
+
+    Absorbing them silently is what let `instrument=` vanish; an
+    unrecognised kwarg must be an error, not a no-op.
+    """
+    from constellation.massspec.library.koina import api
+
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        api.predict_library(
+            specs=fixture_specs(HCD), ms2_model_name=HCD,
+            rt_model_name=None, missed_cleavages=2,
+        )
+
+
+def test_fake_client_rejects_a_request_it_did_not_capture() -> None:
+    """The fake must be request-aware, or every alignment test is vacuous."""
+    client = FakeKoinaClient(HCD)
+    with pytest.raises(AssertionError, match="does not correspond"):
+        client.predict(
+            {
+                "peptide_sequences": np.array([["NOTINFIXTURE"]], dtype=object),
+                "precursor_charges": np.array([[2]]),
+                "collision_energies": np.array([[30.0]]),
+            }
+        )
+
+
+def test_fake_client_returns_only_the_rows_requested() -> None:
+    client = FakeKoinaClient(HCD)
+    specs = fixture_specs(HCD)
+    assert len(specs) > 1, "fixture needs >1 precursor for this to mean anything"
+    out = client.predict(
+        {
+            "peptide_sequences": np.array(
+                [[specs[0].modified_sequence]], dtype=object
+            ),
+            "precursor_charges": np.array([[specs[0].charge]]),
+            "collision_energies": np.array([[30.0]]),
+        }
+    )
+    assert out["intensities"].shape[0] == 1
+
+
+# ── model-aware N-terminal modifications ───────────────────────────────
+#
+# Wire formats measured against koina.wilhelmlab.org: the PTM series
+# accepts the ProForma "[UNIMOD:1]-PEPTIDEK" form and rejects the
+# bracket-only, paren and underscore variants; the 2020 series rejects
+# all of them. supports_n_term_mods carried that knowledge but nothing
+# read it, so N-terminal acetyl failed local preflight on every model.
+
+
+def test_n_term_mod_allowed_for_models_that_declare_support() -> None:
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.massspec.library.koina._modseq import format_koina_modseq
+
+    out = format_koina_modseq(
+        parse_proforma("[UNIMOD:1]-PEPTIDEK"), allow_n_term_mods=True
+    )
+    assert out == "[UNIMOD:1]-PEPTIDEK"
+
+
+def test_n_term_mod_still_rejected_by_default() -> None:
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.massspec.library.koina._modseq import (
+        KoinaModSeqError,
+        format_koina_modseq,
+    )
+
+    with pytest.raises(KoinaModSeqError, match="N-terminal"):
+        format_koina_modseq(parse_proforma("[UNIMOD:1]-PEPTIDEK"))
+
+
+def test_c_term_mod_rejected_even_when_n_term_allowed() -> None:
+    """The overlay flag speaks only for the N-terminus, which is what
+    was measured. Sending a mod the model may silently ignore would
+    return intensities that look valid and are not."""
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.massspec.library.koina._modseq import (
+        KoinaModSeqError,
+        format_koina_modseq,
+    )
+
+    with pytest.raises(KoinaModSeqError, match="C-terminal"):
+        format_koina_modseq(
+            parse_proforma("PEPTIDEK-[UNIMOD:1]"), allow_n_term_mods=True
+        )
+
+
+def test_ptm_models_declare_n_term_support_and_2020_does_not() -> None:
+    from constellation.massspec.library.koina.models import ms2_model
+
+    assert ms2_model("Prosit_2025_intensity_22PTM").supports_n_term_mods is True
+    assert ms2_model(HCD).supports_n_term_mods is False
+
+
+# ── neutral-loss channels ──────────────────────────────────────────────
+
+
+def test_registered_models_declare_no_loss_channels() -> None:
+    """Measured: Prosit 2020 and the PTM series emit bare b/y only.
+
+    Pins the observation the overlay encodes, so a model that starts
+    emitting losses shows up as a failure here rather than as silently
+    degraded fragment identities.
+    """
+    from constellation.massspec.library.koina.models import MS2_MODELS
+
+    assert all(m.neutral_losses == () for m in MS2_MODELS.values())
+
+
+def test_undeclared_loss_channel_is_reported_not_swallowed() -> None:
+    """A loss the overlay doesn't declare misses the ladder and becomes a
+    partial-ID row. That is recoverable information — name it."""
+    from constellation.massspec.library.koina.assemble import AssemblyStats
+
+    stats = AssemblyStats()
+    stats.undeclared_loss_ids.add("H2O")
+    assert stats.as_dict()["undeclared_loss_ids"] == ["H2O"]

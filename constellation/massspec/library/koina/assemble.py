@@ -52,6 +52,11 @@ class AssemblyStats:
     n_ladder_misses: int = 0
     max_abs_ppm_deviation: float = 0.0
     worst_ppm_annotation: str | None = None
+    #: Loss ids the response used that the model overlay does not
+    #: declare. Non-empty means those peaks became partial-ID rows and
+    #: skipped the m/z cross-check — add them to the overlay's
+    #: ``neutral_losses``.
+    undeclared_loss_ids: set[str] = field(default_factory=set)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -61,6 +66,7 @@ class AssemblyStats:
             "n_ladder_misses": self.n_ladder_misses,
             "max_abs_ppm_deviation": round(self.max_abs_ppm_deviation, 4),
             "worst_ppm_annotation": self.worst_ppm_annotation,
+            "undeclared_loss_ids": sorted(self.undeclared_loss_ids),
         }
 
 
@@ -112,6 +118,11 @@ def assemble_library(
         [peptidoforms[m] for m in order],
         ion_types=tuple(ms2_model.ion_types),
         max_fragment_charge=ms2_model.max_fragment_charge,
+        # Without the model's loss channels every y3-H2O+1 misses the
+        # ladder and becomes a partial-ID row. Empty for every model
+        # registered today (all emit bare b/y); declared per-model so a
+        # loss-emitting model works without changing this code.
+        neutral_losses=list(ms2_model.neutral_losses) or None,
     )
     ladder_by_modseq = dict(zip(order, ladders, strict=True))
 
@@ -163,6 +174,11 @@ def assemble_library(
                     # In the model's grid but off our biochem-licensed
                     # ladder — keep as partial-ID rather than invent a mass.
                     stats.n_ladder_misses += 1
+                    if loss_id is not None:
+                        # A miss carrying a loss id means the overlay is
+                        # missing that channel, which is fixable — name it
+                        # rather than silently dropping the identity.
+                        stats.undeclared_loss_ids.add(loss_id)
                     ion_type = position = charge = loss_id = None
                     mz_theoretical = predicted_mz
                 else:

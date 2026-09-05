@@ -48,6 +48,14 @@ class Ms2Model:
     min_charge: int = 1
     supported_mods: frozenset[str] | None = None
     supports_n_term_mods: bool = False
+    #: Neutral-loss channels the model's annotation grid uses. Measured
+    #: empty for every model registered here — Prosit 2020 and the PTM
+    #: series both emit bare b/y only. A model that DOES emit e.g.
+    #: ``y3-H2O+1`` needs its loss ids listed, otherwise every such peak
+    #: misses the locally built ladder and degrades to a partial-ID row
+    #: with null structured fields that also skips the m/z cross-check.
+    #: :class:`AssemblyStats` reports any loss id seen but not declared.
+    neutral_losses: tuple[str, ...] = ()
     #: Value sent for a declared ``fragmentation_types`` input. The PTM
     #: models require it; the 2020 series does not declare it at all.
     fragmentation: str = "HCD"

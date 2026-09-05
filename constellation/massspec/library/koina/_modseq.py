@@ -63,6 +63,7 @@ def format_koina_modseq(
     peptidoform: Peptidoform,
     *,
     supported: Collection[str] | None = None,
+    allow_n_term_mods: bool = False,
 ) -> str:
     """``Peptidoform`` → a Koina modified-sequence string.
 
@@ -70,10 +71,29 @@ def format_koina_modseq(
     model was trained on; anything outside it raises rather than being
     sent off to fail opaquely server-side.
 
-    Raises ``KoinaModSeqError`` for terminal mods, mass-delta-only mods,
-    and every ProForma feature above compliance level 2 (ranges,
-    cross-links, branches, labile, unknown-position, global isotopes,
-    global fixed mods) — none of which Koina can express.
+    ``allow_n_term_mods`` opts into the N-terminal dialect for models
+    that accept it — see :attr:`Ms2Model.supports_n_term_mods`. The
+    2020-series models reject a terminal mod in every bracket form, but
+    the PTM-aware series accepts the ProForma ``[UNIMOD:N]-PEPTIDE``
+    form. Measured against koina.wilhelmlab.org:
+
+    =========================== ====================== ==================
+    model                       ``[UNIMOD:1]-PEPTIDEK`` ``[UNIMOD:1]PEPTIDEK``
+    =========================== ====================== ==================
+    Prosit_2025_intensity_22PTM accepted               rejected
+    Prosit_2020_intensity_HCD   rejected               rejected
+    =========================== ====================== ==================
+
+    C-terminal mods stay rejected regardless: the overlay flag speaks
+    only for the N-terminus, which is what was measured. Sending a mod
+    the model silently ignores would return intensities that look valid
+    and are not.
+
+    Raises ``KoinaModSeqError`` for unsupported terminal mods,
+    mass-delta-only mods, and every ProForma feature above compliance
+    level 2 (ranges, cross-links, branches, labile, unknown-position,
+    global isotopes, global fixed mods) — none of which Koina can
+    express.
     """
     if isinstance(peptidoform, MultiPeptidoform):
         raise KoinaModSeqError(
@@ -81,11 +101,17 @@ def format_koina_modseq(
             "via Koina"
         )
 
-    if peptidoform.n_term_mods or peptidoform.c_term_mods:
+    if peptidoform.c_term_mods:
         raise KoinaModSeqError(
-            "terminal modifications are not accepted by the Prosit models on "
-            "Koina (verified for [UNIMOD:N]-, [UNIMOD:N] and (UNIMOD:N) "
-            "forms); drop the terminal mod or use the EncyclopeDIA backend"
+            "C-terminal modifications are not accepted by the Prosit models "
+            "on Koina; drop the terminal mod or use the EncyclopeDIA backend"
+        )
+    if peptidoform.n_term_mods and not allow_n_term_mods:
+        raise KoinaModSeqError(
+            "N-terminal modifications are not accepted by this model "
+            "(verified for [UNIMOD:N]-, [UNIMOD:N] and (UNIMOD:N) forms); "
+            "drop the terminal mod, pick a PTM-aware model, or use the "
+            "EncyclopeDIA backend"
         )
     for attr, label in (
         ("labile_mods", "labile modifications"),
@@ -99,6 +125,14 @@ def format_koina_modseq(
 
     seq = peptidoform.sequence
     out: list[str] = []
+    for tagged in peptidoform.n_term_mods or ():
+        acc = _accession(tagged)
+        if supported is not None and acc not in supported:
+            raise KoinaModSeqError(
+                f"N-terminal modification {acc} is outside the model's "
+                f"supported set {sorted(supported)}"
+            )
+        out.append(f"[{acc}]-")
     for i, residue in enumerate(seq):
         out.append(residue)
         for tagged in peptidoform.residue_mods.get(i, ()):

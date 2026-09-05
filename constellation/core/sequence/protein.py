@@ -405,18 +405,21 @@ def _slots_for_site(site: str, seq: str) -> list[int | str]:
     return [i for i, aa in enumerate(seq) if aa == site]
 
 
-def _check_specificity(key: str, site: str, vocab: ModVocab) -> None:
+def _check_specificity(key: str, site: str, vocab: ModVocab, peptide: str) -> None:
     mod = vocab[key]
     if site == N_TERM:
-        ok = mod.has_n_term_specificity
+        ok = bool(peptide) and mod.has_terminal_specificity_for(N_TERM, peptide[0])
+        detail = f" for a peptide starting with {peptide[:1]!r}" if peptide else ""
     elif site == C_TERM:
-        ok = mod.has_c_term_specificity
+        ok = bool(peptide) and mod.has_terminal_specificity_for(C_TERM, peptide[-1])
+        detail = f" for a peptide ending with {peptide[-1:]!r}" if peptide else ""
     else:
         ok = mod.has_residue_specificity(site)
+        detail = ""
     if not ok:
         raise ValueError(
-            f"{key} ({mod.name}) has no UNIMOD specificity for site {site!r}; "
-            f"pass validate_specificity=False to apply it anyway"
+            f"{key} ({mod.name}) has no UNIMOD specificity for site {site!r}"
+            f"{detail}; pass validate_specificity=False to apply it anyway"
         )
 
 
@@ -473,7 +476,7 @@ def enumerate_modforms(
             if key not in vocab:
                 raise ValueError(f"unknown modification key {key!r} for site {site!r}")
             if validate_specificity:
-                _check_specificity(key, site, vocab)
+                _check_specificity(key, site, vocab, peptide)
 
     for site, keys in fixed_spec.items():
         if len(keys) != 1:

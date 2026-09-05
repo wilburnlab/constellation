@@ -65,7 +65,7 @@ def test_rt_output_column_names_are_stable():
 def test_hcd_responds_to_collision_energy(hcd_client):
     from constellation.massspec.library.koina.api import predict
 
-    def at(energy: float) -> np.ndarray:
+    def at(energy: float) -> dict[str, float]:
         table = predict(
             HCD,
             {
@@ -75,10 +75,29 @@ def test_hcd_responds_to_collision_energy(hcd_client):
             },
             client=hcd_client,
         )
-        return np.asarray(table.column("intensities").to_pylist())
+        # Keyed by annotation, not positional. The surviving peak set is
+        # itself energy-dependent — 15 eV and 45 eV came back as (20,)
+        # and (13,) — so comparing the two arrays elementwise compared
+        # different ions, and np.allclose failed on shape rather than on
+        # the physics the test is about.
+        return {
+            str(a): float(i)
+            for a, i in zip(
+                table.column("annotation").to_pylist(),
+                table.column("intensities").to_pylist(),
+                strict=True,
+            )
+        }
 
     low, high = at(15.0), at(45.0)
-    assert not np.allclose(low, high), "HCD ignored collision energy"
+    if set(low) != set(high):
+        return  # different ions survive -> responded to energy, by definition
+
+    shared = sorted(set(low) & set(high))
+    assert shared, "no annotations in common; cannot compare intensities"
+    lo = np.array([low[a] for a in shared])
+    hi = np.array([high[a] for a in shared])
+    assert not np.allclose(lo, hi), "HCD ignored collision energy"
 
 
 def test_cid_is_energy_independent(cid_client):

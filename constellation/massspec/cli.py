@@ -1965,7 +1965,23 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
         run_dir.mkdir(parents=True, exist_ok=True)
         marker = run_dir / "_SUCCESS" if multi else None
         if marker is not None and marker.exists() and args.resume:
-            print(f"  ce={energy:g}: already complete, skipping")
+            # Restore the completed run's summary. Skipping without it
+            # drops finished energies from the aggregate manifest —
+            # resuming a 20/30 sweep listed only 30, and resuming after
+            # every energy had finished wrote "runs": [] and still
+            # reported success.
+            prior = run_dir / "manifest.json"
+            if not prior.is_file():
+                print(
+                    f"error: {run_dir} has _SUCCESS but no manifest.json, so "
+                    f"its summary cannot be restored and the aggregate would "
+                    f"under-report the sweep. Delete that directory to "
+                    f"recompute this energy.",
+                    file=_sys.stderr,
+                )
+                return 1
+            summaries.append(json.loads(prior.read_text()))
+            print(f"  ce={energy:g}: already complete, restored from manifest")
             continue
 
         try:

@@ -176,6 +176,7 @@ def _validate_specs(specs: Sequence[PrecursorSpec], model: Ms2Model) -> list[str
                 format_koina_modseq(
                     parse_proforma(spec.modified_sequence),
                     supported=model.supported_mods,
+                    allow_n_term_mods=model.supports_n_term_mods,
                 )
             )
         except KoinaModSeqError as exc:
@@ -326,6 +327,7 @@ def predict_library(
     min_intensity: float = 1e-4,
     on_unsupported: str = "error",
     fragmentation: str | None = None,
+    instrument: str = "LUMOS",
     metadata: Mapping[str, Any] | None = None,
     ms2_client: PredictClient | None = None,
     rt_client: PredictClient | None = None,
@@ -336,6 +338,14 @@ def predict_library(
         raise ValueError("pass exactly one of specs= or fasta=")
     if specs is None:
         specs = precursors_from_fasta(fasta, **digest_kwargs)
+    elif digest_kwargs:
+        # digest options only mean something on the fasta= path. Silently
+        # absorbing them let instrument= disappear into **digest_kwargs
+        # and the model receive the LUMOS default instead.
+        raise TypeError(
+            f"unexpected keyword argument(s) {sorted(digest_kwargs)} — digest "
+            f"options apply only when predicting from fasta=, not from specs="
+        )
     if not specs:
         raise ValueError("no precursors to predict")
 
@@ -349,6 +359,7 @@ def predict_library(
         min_intensity=min_intensity,
         on_unsupported=on_unsupported,
         fragmentation=fragmentation,
+        instrument=instrument,
         client=ms2_client,
     )
 
@@ -365,6 +376,7 @@ def predict_library(
         "x.koina.ms2_model": ms2_model_name,
         "x.koina.rt_model": rt_model_name or "",
         "x.koina.collision_energy": collision_energy,
+        "x.koina.instrument": instrument,
         "x.koina.adjust_nce_for_dia": adjust_nce_for_dia,
         "x.koina.rt_scale": rt_model(rt_model_name).scale if rt_model_name else "",
         **(metadata or {}),
