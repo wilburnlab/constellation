@@ -173,7 +173,12 @@ def section_haplotypes(cluster_dir: Path) -> ReportSection:
             body="_no multi-variant clusters — nothing to phase_",
         )
     cid = np.array(haps.column("cluster_id").to_pylist())
-    per_cluster = np.bincount(cid - cid.min()) if cid.size else np.array([])
+    # np.unique, not bincount: bincount's length is the numeric SPAN of
+    # the ids, so haplotypes in clusters 2 and 100 reported 99
+    # variant-bearing clusters instead of 2.
+    per_cluster = (
+        np.unique(cid, return_counts=True)[1] if cid.size else np.array([])
+    )
     multi = int((per_cluster > 1).sum())
     variants = pq.read_table(cluster_dir / "cluster_variants.parquet")
     r2 = variants.column("max_linkage_r2").to_numpy(zero_copy_only=False)
@@ -195,8 +200,18 @@ def section_consensus_quality(cluster_dir: Path) -> ReportSection:
     clusters = pq.read_table(cluster_dir / "clusters.parquet")
     if mem.num_rows == 0:
         return ReportSection(title="Consensus quality", body="_no members_")
-    mr = mem.column("match_rate").to_numpy(zero_copy_only=False)
-    mr = mr[~np.isnan(mr.astype(float))]
+    mr = mem.column("match_rate").to_numpy(zero_copy_only=False).astype(float)
+    # -1.0 is the project's "not observed" sentinel, written for members
+    # whose re-align failed or that the consensus cap never measured. It
+    # is not an identity: leaving it in put two unmeasured members and one
+    # 99% match at a reported median of -100%. Drop and report the count.
+    n_unmeasured = int((mr < 0).sum())
+    mr = mr[~np.isnan(mr) & (mr >= 0)]
+    if mr.size == 0:
+        return ReportSection(
+            title="Consensus quality",
+            body=f"_no measured members ({n_unmeasured} unmeasured)_",
+        )
     n_protein = int(
         sum(1 for p in clusters.column("predicted_protein").to_pylist() if p)
     )
@@ -205,6 +220,13 @@ def section_consensus_quality(cluster_dir: Path) -> ReportSection:
         f"10th pct {100 * np.percentile(mr, 10):.2f}%.\n\n"
         f"Clusters with a predicted ORF protein: {n_protein} / "
         f"{clusters.num_rows}."
+        + (
+            f"\n\n{n_unmeasured} member(s) were not measured against the "
+            f"consensus (re-align failed, or beyond the consensus cap) and "
+            f"are excluded from the identity percentiles."
+            if n_unmeasured
+            else ""
+        )
     )
     return ReportSection(title="Consensus quality", body=body)
 

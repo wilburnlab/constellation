@@ -130,11 +130,17 @@ def _block_minimizers(
     # chunk-invariance).
     same_seq = seq_id[0:n_win] == seq_id[last : last + n_win]
     usable = same_seq & valid[0:n_win] & valid[last : last + n_win]
-    if not bool(usable.any()):
-        empty_i = torch.empty(0, dtype=torch.int64)
-        return empty_i, empty_i, torch.empty(0, dtype=torch.int32)
-    sel_idx = min_pos_idx[usable]
-    sel_hash = win_min[usable]
+    # No early return on "no usable window": a batch of only-short
+    # sequences has no full-width window at all, and returning here
+    # skipped the per-sequence rescue below — so two 18-base reads each
+    # produced one minimizer alone but zero together, making the result
+    # depend on unrelated batch contents.
+    if bool(usable.any()):
+        sel_idx = min_pos_idx[usable]
+        sel_hash = win_min[usable]
+    else:
+        sel_idx = torch.empty(0, dtype=torch.int64)
+        sel_hash = torch.empty(0, dtype=canon_hash.dtype)
     # Per-sequence rescue. `wsize` is sized on the whole concatenated
     # block, so a sequence with fewer than w valid k-mers has every
     # w-wide window touching it straddle a sequence boundary — rejected
@@ -162,6 +168,9 @@ def _block_minimizers(
     sel_pos = pos_in_seq[sel_idx]
     # Dedup distinct (uniq, pos): adjacent windows repeatedly select the
     # same minimizer. (uniq < 2**31, pos < 2**31 → pack into one int64.)
+    if sel_idx.numel() == 0:
+        empty_i = torch.empty(0, dtype=torch.int64)
+        return empty_i, empty_i, torch.empty(0, dtype=torch.int32)
     key = (sel_uniq << 32) | sel_pos.to(torch.int64)
     order = torch.argsort(key)
     key_s = key[order]

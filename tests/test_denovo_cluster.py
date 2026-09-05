@@ -603,10 +603,15 @@ def test_empirical_and_betabinom_more_conservative(synthetic_panel):
         table, identity=0.97, predict_orfs=False, overdispersion=0.1
     )
     n_real = lambda r: Counter(r.variants.column("call").to_pylist())["real"]  # noqa: E731
-    # empirical + overdispersion both tighten the real-variant calls vs the
-    # default prior (they fit / widen the error null), never loosen.
-    assert n_real(empirical) <= n_real(default)
+    # Overdispersion WIDENS the null, so it can only tighten the calls.
     assert n_real(betabinom) <= n_real(default)
+    # Empirical FITS the null; it does not merely tighten it. This panel is
+    # synthetic and near-error-free, so the fitted epsilon sits far below
+    # the generic default prior and empirical legitimately recovers MORE
+    # planted variants. The previous assertion (empirical <= default) held
+    # only because indel exposure was accumulated over indel-showing
+    # positions alone, inflating the fitted rate — it pinned the bug.
+    assert n_real(empirical) >= n_real(default)
     # the variant table still validates against the schema
     assert set(empirical.variants.column("call").to_pylist()) <= {
         "real",
@@ -827,7 +832,11 @@ def test_demoted_column_is_dropped_and_haplotypes_remerge() -> None:
     # The demoted site keeps its catalogue row but loses its linkage,
     # which described a column that no longer exists.
     assert [r[-1] for r in fixed if r[1] == 20] == [0.0]
-    assert [r[-1] for r in fixed if r[1] == 10] == [0.5]
+    # And so does its SURVIVING partner: r2 is a per-site maximum over
+    # partners, so with the only other column gone there is nothing left
+    # to be linked to. The earlier version of this test asserted the
+    # survivor kept its original 0.5 — it pinned the stale value.
+    assert [r[-1] for r in fixed if r[1] == 10] == [0.0]
 
 
 def test_all_columns_demoted_emits_no_haplotypes() -> None:
@@ -1099,3 +1108,256 @@ def test_haplotype_diagnostics_counts_distinct_clusters(tmp_path) -> None:
     span_based = len(np.bincount(cid - cid.min()))
     distinct = len(np.unique(cid, return_counts=True)[1])
     assert span_based == 99 and distinct == 2
+
+
+# ── round-3 review findings ────────────────────────────────────────────
+
+
+def test_unresolved_n_does_not_shorten_the_consensus() -> None:
+    """An N is unresolved, not deleted.
+
+    base_codes encodes N and gap alike as 4, so a column the centroid
+    calls N and nobody covers was dropped: two 300-base sequences sharing
+    an N gave a 299-base consensus though neither had a deletion. That
+    shifts every downstream coordinate and can move the ORF frame.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
+        centroid_consensus,
+    )
+
+    centroid = "ACGT" * 74 + "N" + "ACG"  # 300 bases, one N
+    res = centroid_consensus(centroid, 1.0, [])
+    assert len(res.consensus) == len(centroid) == 300
+    assert res.consensus[296] == "N"
+
+
+def test_haplotype_section_counts_distinct_clusters(tmp_path) -> None:
+    """Calls the real report function, not numpy arithmetic.
+
+    The previous regression asserted np.unique vs np.bincount directly,
+    so it stayed green when the production fix was reverted.
+    """
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from constellation.sequencing.transcriptome.cluster.denovo.diagnostics import (
+        section_haplotypes,
+    )
+
+    pq.write_table(
+        pa.table(
+            {
+                "cluster_id": pa.array([2, 2, 100], pa.int64()),
+                "haplotype_id": pa.array([0, 1, 0], pa.int32()),
+            }
+        ),
+        tmp_path / "cluster_haplotypes.parquet",
+    )
+    pq.write_table(
+        pa.table({"max_linkage_r2": pa.array([0.9, 0.1], pa.float32())}),
+        tmp_path / "cluster_variants.parquet",
+    )
+    body = section_haplotypes(tmp_path).body
+    assert "2 clusters carry called variants" in body, body
+    assert "99" not in body
+    del np
+
+
+def test_identity_percentiles_exclude_unmeasured_members(tmp_path) -> None:
+    """The -1.0 sentinel is not a 100%-wrong identity.
+
+    Two unmeasured members plus one 99% match reported a median of -100%.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from constellation.sequencing.transcriptome.cluster.denovo.diagnostics import (
+        section_consensus_quality,
+    )
+
+    pq.write_table(
+        pa.table(
+            {
+                "match_rate": pa.array([-1.0, -1.0, 0.99], pa.float32()),
+                "indel_rate": pa.array([-1.0, -1.0, 0.0], pa.float32()),
+            }
+        ),
+        tmp_path / "cluster_membership.parquet",
+    )
+    pq.write_table(
+        pa.table({"predicted_protein": pa.array([None], pa.string())}),
+        tmp_path / "clusters.parquet",
+    )
+    body = section_consensus_quality(tmp_path).body
+    assert "median 99.00%" in body, body
+    assert "-100" not in body
+    assert "2 member(s) were not measured" in body
+
+
+def test_short_only_batch_still_yields_minimizers() -> None:
+    """Results must not depend on unrelated batch contents.
+
+    Two 18-base reads each produced one minimizer alone but zero
+    together, because with no full-width window the function returned
+    before the per-sequence rescue.
+    """
+    import numpy as np
+    import pyarrow as pa
+
+    from constellation.sequencing.transcriptome.cluster.denovo.minimizers import (
+        extract_minimizers,
+    )
+
+    seqs = pa.array(["ACGTTGCAACGTTGCAAC", "TTTTGGGGCCCCAAAATT"])
+    uid = np.asarray(extract_minimizers(seqs, k=15, w=10).uniq_id)
+    assert int((uid == 0).sum()) > 0
+    assert int((uid == 1).sum()) > 0
+
+
+def test_empty_quant_keeps_the_registry_schema(tmp_path) -> None:
+    """An empty result must not have a different schema from a full one."""
+    import pyarrow as pa
+
+    from constellation.sequencing.transcriptome.cluster.denovo._io import (
+        _write_counts_tsv,
+    )
+
+    empty = pa.table(
+        {
+            "feature_id": pa.array([], pa.int64()),
+            "sample_id": pa.array([], pa.int64()),
+            "count": pa.array([], pa.int64()),
+        }
+    )
+    path = tmp_path / "counts.tsv"
+    _write_counts_tsv(path, empty, {10: "a", 11: "b"})
+    assert path.read_text().strip().split("\t") == ["cluster_id", "a", "b"]
+
+
+def test_uncapped_member_is_unmeasured_not_perfect() -> None:
+    """A member the consensus cap skipped gets no metric row at all."""
+    import numpy as np
+    import pyarrow as pa
+
+    from constellation.sequencing.transcriptome.cluster.denovo.pipeline import (
+        _build_membership_table,
+    )
+
+    uniq = pa.table(
+        {
+            "uniq_id": pa.array([0, 1], pa.int64()),
+            "representative_read_id": pa.array(["r0", "r1"]),
+        }
+    )
+    read_map = pa.table(
+        {"read_id": pa.array(["r0", "r1"]), "uniq_id": pa.array([0, 1], pa.int64())}
+    )
+    out = _build_membership_table(
+        read_map=read_map,
+        uniq_table=uniq,
+        cluster_of=np.array([0, 0], dtype=np.int64),
+        surviving_centroids=np.array([0], dtype=np.int64),
+        seqlen=np.array([100, 100], dtype=np.int64),
+        metric_res=[],  # nothing measured at all
+    )
+    by_read = dict(
+        zip(out.column("read_id").to_pylist(), out.column("match_rate").to_pylist())
+    )
+    assert by_read["r0"] == 1.0, "the centroid is a real self-match"
+    assert by_read["r1"] == -1.0, "an unmeasured member must not read as perfect"
+
+
+def test_surviving_partner_loses_linkage_to_a_dropped_column() -> None:
+    """r2 is a per-site max over partners; drop the partner, drop the max."""
+    from constellation.sequencing.transcriptome.cluster.denovo.pipeline import (
+        _reconcile_haplotypes_after_reclassification,
+    )
+
+    haps = [
+        _hap(1, 0, "AC", [10, 20], 50, 2),
+        _hap(1, 1, "GT", [10, 20], 50, 2),
+    ]
+    variants = [
+        _var(1, 10, "G", "real", r2=1.0),
+        _var(1, 20, "T", "ambiguous", r2=1.0),
+    ]
+    _out, fixed, _p = _reconcile_haplotypes_after_reclassification(haps, variants)
+    assert [r[-1] for r in fixed if r[1] == 10] == [0.0]
+    assert [r[-1] for r in fixed if r[1] == 20] == [0.0]
+
+
+def test_single_column_haplotype_is_not_counted_as_a_promotion() -> None:
+    """A lone column has r2 == 0 by construction, not because it is absent.
+
+    Inferring the column set from `r2 != 0` misread that as un-projected.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.pipeline import (
+        _reconcile_haplotypes_after_reclassification,
+    )
+
+    haps = [_hap(1, 0, "A", [10], 60, 2), _hap(1, 1, "G", [10], 40, 1)]
+    variants = [_var(1, 10, "G", "real", r2=0.0)]
+    out, _fixed, promoted = _reconcile_haplotypes_after_reclassification(
+        haps, variants
+    )
+    assert promoted == 0
+    assert len(out) == 2
+
+
+def test_api_resume_short_circuits_a_completed_dir(tmp_path) -> None:
+    """The public entry point must honour resume, not only the CLI."""
+    from constellation.sequencing.transcriptome.cluster.denovo.pipeline import (
+        cluster_transcripts,
+    )
+
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "_SUCCESS").write_bytes(b"")
+    (out / "clusters.parquet").write_bytes(b"")
+
+    paths = cluster_transcripts(tmp_path / "demux", output_dir=out, resume=True)
+    assert "clusters" in paths
+
+    with pytest.raises(FileExistsError, match="already complete"):
+        cluster_transcripts(tmp_path / "demux", output_dir=out, resume=False)
+
+
+def test_indel_exposure_includes_error_free_positions() -> None:
+    """Exposure follows context, not the minor allele a position showed.
+
+    Bucketing the denominator by observed minor meant error-free
+    positions contributed no indel opportunity, so the indel rate was
+    computed over indel-showing positions only.
+    """
+    import numpy as np
+
+    from constellation.sequencing.transcriptome.cluster.denovo.variants import (
+        disagreement_stats,
+    )
+
+    L, depth = 200, 100
+    pwm = np.zeros((L, 5))
+    pwm[:, 0] = depth              # every position a clean 'A'
+    pwm[0, 0] = depth - 2
+    pwm[0, 4] = 2                  # one position with a 2% gap minor
+    winner = np.zeros(L, dtype=np.int64)
+    consensus = "A" * L
+
+    from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
+        ConsensusResult,
+    )
+
+    stats = disagreement_stats(
+        ConsensusResult(consensus=consensus, pwm=pwm, winner=winner),
+        min_depth=10,
+        min_major_frac=0.8,
+    )
+    # 2 gap observations over ~L*depth indel opportunities, not over the
+    # single position that happened to show one.
+    indel = [v for k, v in stats.items() if k[0] != 0]
+    assert indel, stats
+    total_minor = sum(v[0] for v in indel)
+    total_exposure = sum(v[1] for v in indel)
+    assert total_minor == 2
+    assert total_exposure >= L * depth * 0.9, total_exposure

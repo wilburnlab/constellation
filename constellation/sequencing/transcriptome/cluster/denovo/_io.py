@@ -107,7 +107,15 @@ def _write_counts_tsv(
 ) -> None:
     """Wide cluster × sample count matrix."""
     if feature_quant.num_rows == 0:
-        path.write_text("cluster_id\n", encoding="utf-8")
+        # Still emit the registry's columns. Returning a bare header
+        # dropped every registered sample whenever all clusters were
+        # filtered out, so an empty result had a DIFFERENT schema from a
+        # populated one — the same schema-depends-on-content problem the
+        # populated path had.
+        headers = ["cluster_id"] + [
+            name_map.get(s, f"sample_{s}") for s in sorted(name_map)
+        ]
+        path.write_text("\t".join(headers) + "\n", encoding="utf-8")
         return
     cid = feature_quant.column("feature_id").to_numpy(zero_copy_only=False)
     sid = feature_quant.column("sample_id").to_numpy(zero_copy_only=False)

@@ -32,6 +32,7 @@ _IDX_TO_BASE_NP = np.array(
     [ord("A"), ord("C"), ord("G"), ord("T"), ord("-"), ord("N")], dtype=np.uint8
 )
 _GAP = 4
+_AMBIG = 5  # renders as 'N' via _IDX_TO_BASE_NP
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,9 +168,18 @@ def centroid_consensus(
     row_max = pwm.max(axis=1)
     best_np = pwm.argmax(axis=1)
     # No-coverage positions fall back to the centroid base; gap-winning
-    # positions (and centroid Ns, encoded 4) drop out of the consensus.
+    # positions drop out of the consensus.
     winner = np.where(row_max <= 0.0, centroid_codes, best_np)
-    keep = winner < _GAP
+    # An N the centroid carries and no member covers is UNRESOLVED, not a
+    # deletion. base_codes encodes both as 4, so such a column used to be
+    # dropped: two 300-base sequences sharing an N produced a 299-base
+    # consensus though neither had a deletion, shifting every downstream
+    # coordinate and potentially the ORF reading frame. Emit N and keep
+    # the column; only a genuine gap-winning column is removed.
+    winner = np.where(
+        (row_max <= 0.0) & (centroid_codes >= _GAP), _AMBIG, winner
+    )
+    keep = winner != _GAP
     consensus = _IDX_TO_BASE_NP[winner[keep]].tobytes().decode("ascii")
 
     return ConsensusResult(consensus=consensus, pwm=pwm, winner=winner)

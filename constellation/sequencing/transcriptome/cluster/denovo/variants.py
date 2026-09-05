@@ -132,7 +132,10 @@ def call_variants(
     if L == 0 or not consensus:
         return []
 
-    keep = winner < 4
+    # Must match centroid_consensus's rule exactly — cons_pos is a cumsum
+    # over `keep`, so any divergence misaligns every reported variant
+    # position. An unresolved N (code 5) IS a consensus column.
+    keep = winner != 4
     cons_pos_of_centroid = np.cumsum(keep) - 1
     n = pwm.sum(axis=1)
     sorted_counts = np.sort(pwm, axis=1)
@@ -237,7 +240,10 @@ def disagreement_stats(
     L = pwm.shape[0]
     if L == 0 or not consensus:
         return {}
-    keep = winner < 4
+    # Must match centroid_consensus's rule exactly — cons_pos is a cumsum
+    # over `keep`, so any divergence misaligns every reported variant
+    # position. An unresolved N (code 5) IS a consensus column.
+    keep = winner != 4
     n = pwm.sum(axis=1)
     major = np.sort(pwm, axis=1)[:, -1]
     minor_total = n - major
@@ -259,13 +265,30 @@ def disagreement_stats(
     class_code = np.where(is_gap, np.where(is_hp, 1, 2), 0)
     run_key = np.where(is_hp, hp_run, 0)
 
-    keys = class_code.astype(np.int64) * 1000 + run_key
-    uk, inv = np.unique(keys, return_inverse=True)
-    inv = inv.ravel()
+    # Exposure (the denominator) is a property of a position's CONTEXT,
+    # not of the minor allele it happened to show. Bucketing numerator and
+    # denominator together by the observed minor meant an error-free
+    # position never contributed indel opportunity, so the indel rate was
+    # computed over indel-showing positions only — a controlled case
+    # estimated 2% where the truth was 0.02%, inflating the null that
+    # classifies variants. Every high-confidence position is an
+    # opportunity for BOTH a substitution and the indel class its
+    # homopolymer context implies; only the numerator follows the
+    # observed minor.
+    sub_keys = np.zeros(idx.shape[0], dtype=np.int64)
+    indel_keys = np.where(is_hp, 1, 2).astype(np.int64) * 1000 + run_key
+    obs_keys = class_code.astype(np.int64) * 1000 + run_key
+
+    uk = np.unique(np.concatenate([sub_keys, indel_keys, obs_keys]))
+    pos_of = {int(k): i for i, k in enumerate(uk)}
     ms = np.zeros(uk.shape[0])
     ts = np.zeros(uk.shape[0])
-    np.add.at(ms, inv, minor_total[idx])
-    np.add.at(ts, inv, n[idx])
+    sub_inv = np.array([pos_of[int(k)] for k in sub_keys], dtype=np.int64)
+    indel_inv = np.array([pos_of[int(k)] for k in indel_keys], dtype=np.int64)
+    obs_inv = np.array([pos_of[int(k)] for k in obs_keys], dtype=np.int64)
+    np.add.at(ts, sub_inv, n[idx])
+    np.add.at(ts, indel_inv, n[idx])
+    np.add.at(ms, obs_inv, minor_total[idx])
     return {
         (int(k // 1000), int(k % 1000)): (float(ms[i]), float(ts[i]))
         for i, k in enumerate(uk)

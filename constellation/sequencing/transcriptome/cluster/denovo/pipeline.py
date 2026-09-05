@@ -853,7 +853,7 @@ def _build_alignment_lookup(accepted: pa.Table) -> dict[int, tuple[int, str]]:
 # Row layout of the (cid, *vr, r2) tuples in ``variant_res`` — mirrors
 # variants._VR_* shifted by the leading cluster_id.
 _VRES_CID, _VRES_POS, _VRES_MINOR = 0, 1, 3
-_VRES_IN_CORE, _VRES_CALL, _VRES_R2 = 12, 11, -1
+_VRES_MAJOR, _VRES_IN_CORE, _VRES_CALL, _VRES_R2 = 2, 12, 11, -1
 
 
 def _reconcile_haplotypes_after_reclassification(
@@ -886,7 +886,7 @@ def _reconcile_haplotypes_after_reclassification(
         return hap_res, variant_res, 0
 
     real_by_cid: dict[int, set[int]] = {}
-    was_column: dict[int, set[int]] = {}
+    major_minor: dict[tuple[int, int], tuple[str, str]] = {}
     for row in variant_res:
         cid = row[_VRES_CID]
         if (
@@ -895,12 +895,23 @@ def _reconcile_haplotypes_after_reclassification(
             and row[_VRES_MINOR] in ("A", "C", "G", "T")
         ):
             real_by_cid.setdefault(cid, set()).add(int(row[_VRES_POS]))
-        if row[_VRES_R2]:
-            was_column.setdefault(cid, set()).add(int(row[_VRES_POS]))
+        major_minor[(cid, int(row[_VRES_POS]))] = (
+            row[_VRES_MAJOR],
+            row[_VRES_MINOR],
+        )
 
     by_cid: dict[int, list[tuple]] = {}
     for row in hap_res:
         by_cid.setdefault(row[0], []).append(row)
+
+    # The column set is what the haplotype rows were actually built over.
+    # Inferring it from "r2 != 0" was wrong in both directions: a genuine
+    # single-column haplotype has r2 == 0 (nothing to link to) and so
+    # looked un-projected, while a cluster with no haplotypes at all could
+    # never register a promotion.
+    was_column: dict[int, set[int]] = {
+        cid: set(int(x) for x in rows[0][3]) for cid, rows in by_cid.items()
+    }
 
     out: list[tuple] = []
     for cid, rows in by_cid.items():
@@ -931,8 +942,56 @@ def _reconcile_haplotypes_after_reclassification(
                 (cid, hid, astr, kept_positions, ab, nu, "." not in astr)
             )
 
-    # Linkage r2 belonged to a column that may no longer exist; a site
-    # that is not a haplotype column carries 0.0 by construction.
+    # Linkage must be RECOMPUTED, not just zeroed on the demoted site.
+    # r2 is a per-site maximum over its partners, so dropping a column
+    # leaves every surviving partner still reporting the linkage it had
+    # to the site that just disappeared — reduce two perfectly linked
+    # columns to one and the survivor still claimed r2 = 1 with nothing
+    # left to link to. The merged haplotype rows are exactly the distinct
+    # allele patterns with their summed weights, which is all the r2
+    # computation needs, so recompute from them.
+    new_by_cid: dict[int, list[tuple]] = {}
+    for row in out:
+        new_by_cid.setdefault(row[0], []).append(row)
+    r2_by: dict[tuple[int, int], float] = {}
+    for cid, rows in new_by_cid.items():
+        positions = list(rows[0][3])
+        if len(positions) < 2:
+            # Nothing to link to; 0.0 is the honest value.
+            for pos in positions:
+                r2_by[(cid, int(pos))] = 0.0
+            continue
+        alleles = np.array([[ch for ch in r[2]] for r in rows])
+        w = np.array([float(r[4]) for r in rows])
+        V = len(positions)
+        B = np.full((len(rows), V), np.nan)
+        for v, pos in enumerate(positions):
+            maj, minr = major_minor.get((cid, int(pos)), (None, None))
+            B[alleles[:, v] == maj, v] = 0.0
+            B[alleles[:, v] == minr, v] = 1.0
+        best = np.zeros(V)
+        for u in range(V):
+            for v in range(u + 1, V):
+                m = ~np.isnan(B[:, u]) & ~np.isnan(B[:, v])
+                if not m.any():
+                    continue
+                ww = w[m]
+                W = ww.sum()
+                if W <= 0:
+                    continue
+                bu, bv = B[m, u], B[m, v]
+                pu = (ww * bu).sum() / W
+                pv = (ww * bv).sum() / W
+                puv = (ww * bu * bv).sum() / W
+                denom = pu * (1 - pu) * pv * (1 - pv)
+                if denom <= 0:
+                    continue
+                r2 = (puv - pu * pv) ** 2 / denom
+                best[u] = max(best[u], r2)
+                best[v] = max(best[v], r2)
+        for v, pos in enumerate(positions):
+            r2_by[(cid, int(pos))] = float(best[v])
+
     n_promoted = 0
     fixed_variants: list[tuple] = []
     for row in variant_res:
@@ -940,9 +999,13 @@ def _reconcile_haplotypes_after_reclassification(
         pos = int(row[_VRES_POS])
         real = real_by_cid.get(cid, set())
         cols = was_column.get(cid, set())
-        if pos in cols and pos not in real:
+        if (cid, pos) in r2_by:
+            row = (*row[:-1], r2_by[(cid, pos)])
+        elif pos in cols:
+            # Was a column, is not one now: its linkage described a
+            # structure that no longer exists.
             row = (*row[:-1], 0.0)
-        elif pos in real and pos not in cols and cid in by_cid:
+        if pos in real and pos not in cols:
             n_promoted += 1
         fixed_variants.append(row)
     return out, fixed_variants, n_promoted
@@ -1005,10 +1068,14 @@ def _build_membership_table(
     if surviving_centroids.shape[0]:
         is_centroid[surviving_centroids] = True
 
-    # Per-uniq metrics — centroid self-values by default.
-    match_rate = np.ones(n_uniq, dtype=np.float64)
-    indel_rate = np.zeros(n_uniq, dtype=np.float64)
-    n_aligned = seqlen.astype(np.int64).copy()
+    # Per-uniq metrics. Centroids are genuine self-matches; every other
+    # unique sequence starts UNMEASURED. Defaulting all of them to a
+    # perfect self-match meant members the consensus cap excluded — which
+    # never get a metric row at all — reported match_rate=1.0 while
+    # carrying known SNPs, exactly inverting what the metric is for.
+    match_rate = np.where(is_centroid, 1.0, -1.0)
+    indel_rate = np.where(is_centroid, 0.0, -1.0)
+    n_aligned = np.where(is_centroid, seqlen.astype(np.int64), 0)
     drift5 = np.zeros(n_uniq, dtype=np.int64)
     drift3 = np.zeros(n_uniq, dtype=np.int64)
 
@@ -1075,6 +1142,26 @@ def _build_membership_table(
     )
 
 
+def _existing_outputs(output_dir: Path) -> dict[str, Path]:
+    """Paths of a previously completed run, for the resume short-circuit."""
+    names = (
+        "clusters.parquet",
+        "cluster_membership.parquet",
+        "cluster_variants.parquet",
+        "cluster_haplotypes.parquet",
+        "cluster_alignments.parquet",
+        "cluster_counts.tsv",
+        "clusters.fasta",
+        "proteins.fasta",
+        "manifest.json",
+    )
+    return {
+        n.split(".")[0]: output_dir / n
+        for n in names
+        if (output_dir / n).exists()
+    }
+
+
 def cluster_transcripts(
     demux_dir: Path,
     *,
@@ -1127,6 +1214,19 @@ def cluster_transcripts(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Honour resume here, not only in the CLI. This is the public entry
+    # point: a direct API caller passing resume=True got a full re-run
+    # that overwrote a completed output dir, because the _SUCCESS guard
+    # lived solely in the CLI handler.
+    success = output_dir / "_SUCCESS"
+    if success.exists():
+        if not resume:
+            raise FileExistsError(
+                f"output dir already complete: {output_dir} (pass "
+                f"resume=True to short-circuit; refusing to overwrite)"
+            )
+        return _existing_outputs(output_dir)
 
     # Stage logger — flush immediately so the last line is visible even if a
     # native library aborts the process (the std::length_error class of crash
