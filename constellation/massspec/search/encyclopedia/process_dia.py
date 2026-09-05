@@ -17,6 +17,8 @@ sits at ``--output-dia``.
 
 from __future__ import annotations
 
+import shutil
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -38,8 +40,8 @@ def build_process_dia_args(
     "When using one input, do not specify an output file!" and exits 1 —
     it always writes the cache next to the input as
     ``<input_stem>.dia``. So ``output_dia`` is *ignored* here when there
-    is exactly one input; the caller is responsible for relocating the
-    produced file if it wants it elsewhere (the CLI handler does).
+    is exactly one input; :func:`run_process_dia` relocates the
+    produced file to ``output_dia`` afterwards.
 
     Pure function — exists so the Tier A test can exercise the flag
     layout without spawning Java.
@@ -115,12 +117,14 @@ def run_process_dia(
 ) -> JvmResult:
     """Preprocess one or more spectra files into a combined ``.DIA`` cache.
 
-    Single-input mode preprocesses one acquisition; the ``.DIA`` lands
-    next to the input as ``<input_stem>.dia`` and ``output_dia`` is
-    ignored (the jar refuses ``-o`` with one input). Use
-    :func:`single_input_dia_path` to locate it. Multi-input mode merges
-    gas-phase fractions into one ``.DIA`` at ``output_dia`` — the
-    intended GPF workflow.
+    Single-input mode preprocesses one acquisition. The jar refuses
+    ``-o`` with one input and names the cache itself, so this function
+    locates the produced ``<input_stem>.dia`` and moves it to
+    ``output_dia`` afterwards. ``output_dia`` therefore means the same
+    thing regardless of input count, and no caller has to special-case
+    the runs that happen to have exactly one input. Multi-input mode
+    merges gas-phase fractions into one ``.DIA`` at ``output_dia`` —
+    the intended GPF workflow.
 
     Inputs may be ``.mzML``, ``.raw``, ``.d``, or ``.DIA`` — vendor-raw
     formats decode via the bundled MSRawJava (no external msconvert
@@ -135,14 +139,28 @@ def run_process_dia(
     than tidiness: in single-input mode the jar writes ``<stem>.dia``
     into its working directory, so without this it would land in
     whatever shell (or Slurm submit) directory launched the run.
+
+    Path arguments are resolved against the *caller's* working
+    directory before that switch, so relative paths mean what the
+    caller meant.
     """
+    # Resolve before run_jar changes directory. A relative
+    # ``-i data/sample.raw`` would otherwise be looked up beneath
+    # output_dir, and a relative output_dia would be written into an
+    # unintended nested location. Both in-tree callers already resolve;
+    # this is for the public wrapper's own callers.
+    inputs = [Path(p).resolve() for p in inputs]
+    output_dir = Path(output_dir).resolve()
+    if output_dia is not None:
+        output_dia = Path(output_dia).resolve()
+
     args = build_process_dia_args(
         inputs=inputs,
         output_dia=output_dia,
         extra_args=extra_args,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    return run_jar(
+    result = run_jar(
         "encyclopedia",
         args=args,
         jvm_heap_max=jvm_heap_max,
@@ -153,6 +171,28 @@ def run_process_dia(
         stream_to_stderr=stream_to_stderr,
         cwd=output_dir,
     )
+
+    # Single-input mode ignores -o and names the cache itself, so the
+    # relocation belongs here rather than in each caller — the
+    # orchestrator called this directly and marked its stage complete
+    # while the cache still sat under the input-derived name.
+    #
+    # Unconditional, deliberately: an earlier interrupted run can leave
+    # a stale file at output_dia, and skipping the move when the
+    # destination already exists would silently bind those old spectra
+    # to this run's manifest.
+    if len(inputs) == 1 and output_dia is not None:
+        produced = single_input_dia_path(inputs[0], cwd=output_dir)
+        if produced is not None and produced != output_dia:
+            output_dia.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(produced), str(output_dia))
+            if stream_to_stderr:
+                print(
+                    f"process-dia: single input — moved {produced.name} "
+                    f"→ {output_dia}",
+                    file=sys.stderr,
+                )
+    return result
 
 
 __all__ = [

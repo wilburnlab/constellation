@@ -1738,7 +1738,6 @@ def _cmd_massspec_process_dia(args: argparse.Namespace) -> int:
     consumption (search / library export), not Constellation-native
     analysis.
     """
-    import shutil as _shutil
     import sys as _sys
 
     from constellation import __version__ as constellation_version
@@ -1747,7 +1746,6 @@ def _cmd_massspec_process_dia(args: argparse.Namespace) -> int:
         encyclopedia_passthrough_args,
         require_min_encyclopedia,
         run_process_dia,
-        single_input_dia_path,
         write_manifest,
     )
     from constellation.thirdparty.jvm import JvmRunError
@@ -1810,23 +1808,9 @@ def _cmd_massspec_process_dia(args: argparse.Namespace) -> int:
         print(f"  see {exc.stderr_log} for the full log", file=_sys.stderr)
         return exc.returncode
 
-    # Single-input mode ignores -o and drops <input_stem>.dia beside the
-    # input (the jar rejects -o outright with one input). Relocate it so
-    # --output-dia means the same thing regardless of input count —
-    # otherwise a sweep that merges N injections per condition has to
-    # special-case whichever conditions happen to have exactly one.
-    if len(inputs) == 1 and not output_dia.is_file():
-        produced = single_input_dia_path(inputs[0], cwd=output_dir)
-        if produced is not None:
-            output_dia.parent.mkdir(parents=True, exist_ok=True)
-            _shutil.move(str(produced), str(output_dia))
-            if not args.no_progress:
-                print(
-                    f"process-dia: single input — moved {produced.name} "
-                    f"→ {output_dia}",
-                    file=_sys.stderr,
-                )
-
+    # run_process_dia relocates the jar-named single-input cache onto
+    # output_dia, so by this point --output-dia means the same thing
+    # regardless of input count.
     if not output_dia.is_file():
         print(
             f"error: encyclopedia exited 0 but the expected .DIA was not "

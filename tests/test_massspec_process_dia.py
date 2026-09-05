@@ -156,3 +156,155 @@ def test_single_input_dia_path_prefers_cwd(tmp_path: Path) -> None:
     in_cwd = run_dir / "sample.dia"
     in_cwd.write_bytes(b"x")
     assert single_input_dia_path(inp, cwd=run_dir) == in_cwd
+
+
+# ── runner: single-input relocation ────────────────────────────────────
+#
+# The relocation lives in run_process_dia rather than in each caller.
+# It used to live only in the CLI handler, so the transcriptome→proteome
+# orchestrator — which calls the runner directly — marked its Stage 6
+# complete while the cache still sat under the jar-chosen name, and
+# Stage 7 then searched a path that did not exist.
+
+
+class _FakeJvmResult:
+    """Stand-in for JvmResult; run_process_dia returns it untouched."""
+
+    returncode = 0
+    elapsed_seconds = 0.01
+
+
+def _fake_jar_writing(stem_source: str):
+    """Build a run_jar double that writes ``<stem>.dia`` into its cwd.
+
+    Mirrors 6.5.15 single-input behaviour: the jar ignores ``-o`` and
+    names the cache itself, relative to the working directory.
+    """
+    captured: dict[str, object] = {}
+
+    def _fake_run_jar(tool, *, args, cwd, **kw):
+        captured["args"] = list(args)
+        captured["cwd"] = Path(cwd)
+        produced = Path(cwd) / f"{stem_source}.dia"
+        produced.parent.mkdir(parents=True, exist_ok=True)
+        produced.write_bytes(b"fresh")
+        return _FakeJvmResult()
+
+    return _fake_run_jar, captured
+
+
+def test_run_process_dia_relocates_single_input_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Single input: the runner moves the jar-named cache onto output_dia.
+
+    Direct callers (the orchestrator) get the same ``--output-dia``
+    contract the CLI does, without special-casing input count.
+    """
+    from constellation.massspec.search.encyclopedia import process_dia as pd
+
+    inp = tmp_path / "MS_Data" / "sample.raw"
+    inp.parent.mkdir(parents=True)
+    inp.write_bytes(b"")
+    out_dir = tmp_path / "06_process_dia"
+    out_dia = out_dir / "run_combined_GPF.dia"
+
+    fake, _ = _fake_jar_writing("sample")
+    monkeypatch.setattr(pd, "run_jar", fake)
+
+    pd.run_process_dia(
+        inputs=[inp], output_dia=out_dia, output_dir=out_dir,
+        stream_to_stderr=False,
+    )
+
+    assert out_dia.is_file()
+    assert out_dia.read_bytes() == b"fresh"
+    assert not (out_dir / "sample.dia").exists()
+
+
+def test_run_process_dia_replaces_stale_single_input_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale destination must not shadow what this JVM just produced.
+
+    Reruns of an incomplete output dir (an ``--output-dia`` present but
+    no ``_SUCCESS`` — exactly what the manifest-kwarg TypeError left
+    behind) previously skipped the move on ``not output_dia.is_file()``,
+    then accepted the stale file and wrote a manifest over it, binding
+    old spectra to the new run.
+    """
+    from constellation.massspec.search.encyclopedia import process_dia as pd
+
+    inp = tmp_path / "MS_Data" / "sample.raw"
+    inp.parent.mkdir(parents=True)
+    inp.write_bytes(b"")
+    out_dir = tmp_path / "06_process_dia"
+    out_dir.mkdir()
+    out_dia = out_dir / "run_combined_GPF.dia"
+    out_dia.write_bytes(b"stale")
+
+    fake, _ = _fake_jar_writing("sample")
+    monkeypatch.setattr(pd, "run_jar", fake)
+
+    pd.run_process_dia(
+        inputs=[inp], output_dia=out_dia, output_dir=out_dir,
+        stream_to_stderr=False,
+    )
+
+    assert out_dia.read_bytes() == b"fresh"
+
+
+def test_run_process_dia_no_move_when_already_at_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """output_dia may itself BE the jar's chosen path — must not self-move."""
+    from constellation.massspec.search.encyclopedia import process_dia as pd
+
+    inp = tmp_path / "sample.raw"
+    inp.write_bytes(b"")
+    out_dir = tmp_path / "run"
+    out_dia = out_dir / "sample.dia"  # exactly what the jar will write
+
+    fake, _ = _fake_jar_writing("sample")
+    monkeypatch.setattr(pd, "run_jar", fake)
+
+    pd.run_process_dia(
+        inputs=[inp], output_dia=out_dia, output_dir=out_dir,
+        stream_to_stderr=False,
+    )
+
+    assert out_dia.read_bytes() == b"fresh"
+
+
+def test_run_process_dia_resolves_relative_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Relative paths resolve against the CALLER's cwd, not output_dir.
+
+    run_jar runs with ``cwd=output_dir``, so an unresolved relative
+    ``-i data/sample.raw`` would be looked up beneath output_dir and a
+    relative output_dia would land somewhere nested. Both in-tree
+    callers resolve first; this pins it for the public wrapper.
+    """
+    from constellation.massspec.search.encyclopedia import process_dia as pd
+
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "sample.raw").write_bytes(b"")
+    monkeypatch.chdir(tmp_path)
+
+    fake, captured = _fake_jar_writing("sample")
+    monkeypatch.setattr(pd, "run_jar", fake)
+
+    pd.run_process_dia(
+        inputs=[Path("data/sample.raw")],
+        output_dia=Path("out/combined.dia"),
+        output_dir=Path("rundir"),
+        stream_to_stderr=False,
+    )
+
+    i_value = captured["args"][captured["args"].index("-i") + 1]
+    assert Path(i_value).is_absolute()
+    assert Path(i_value) == (tmp_path / "data" / "sample.raw").resolve()
+    assert captured["cwd"] == (tmp_path / "rundir").resolve()
+    # And the cache still lands where the caller asked, not under rundir.
+    assert (tmp_path / "out" / "combined.dia").is_file()

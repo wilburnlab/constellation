@@ -1158,6 +1158,17 @@ def run_transcriptome_to_proteomics(
             extra_args=_passthrough_args(args.encyclopedia_arg),
             stream_to_stderr=progress,
         )
+        # run_process_dia relocates the jar-named single-input cache, so
+        # combined_dia is the contract for every input count. Verify it
+        # before _SUCCESS — Stage 7 searches this path, and a stage
+        # marked complete over a missing cache fails much later and far
+        # less legibly.
+        if not combined_dia.is_file():
+            raise RuntimeError(
+                f"Stage 6: encyclopedia exited 0 but no .DIA cache is at "
+                f"{combined_dia}. See {stage_dir / 'logs'} for the jar's "
+                f"own output."
+            )
         _write_stage_manifest(
             stage_dir,
             subcommand="06_process_dia",
