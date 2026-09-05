@@ -146,17 +146,30 @@ class GlobalCalibration(nn.Module):
         return self.log_nu_mz.clamp(min=_LOG_NU_MIN).exp()
 
     def mz_center_ppm(
-        self, channel_mz: torch.Tensor, z: torch.Tensor, isotope: torch.Tensor
+        self,
+        channel_mz: torch.Tensor,
+        z: torch.Tensor,
+        isotope: torch.Tensor,
+        reference_mz: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Expected m/z-error center [ppm] for channels at observed m/z
-        `channel_mz` [Th], charge `z`, isotope index `isotope`.
+        """Expected m/z-error center [ppm] for channels at theoretical m/z
+        `channel_mz` [Th], charge `z`, isotope index `isotope`, measured relative
+        to `reference_mz` [Th] (the observed-grid m/z the error was computed
+        against; defaults to `channel_mz` — the single-species / grid-defining case).
 
-        `ε_center = mz_offset + (d_mz_k / z) → ppm`. The per-isotope `d_mz_k`
-        [Da] is a neutral-mass spacing correction; dividing by `z` gives the
-        m/z offset, and `da_to_ppm` converts it relative to the channel m/z
-        (the Da→ppm step the manuscript's Eq. 20 left implicit). `d_mz_0` is
-        the monoisotopic reference and contributes only `mz_offset`.
+        `ε_center = mz_offset + ((channel_mz − reference_mz) + d_mz_k / z) → ppm`.
+
+        The global `mz_offset` is the **single calibration anchor**; the per-isotope
+        `d_mz_k` [Da] is a neutral-mass spacing correction (÷`z` → m/z); and
+        `channel_mz − reference_mz` is the candidate's **theoretical Δ** from the
+        reference grid — zero for the species that defines the grid, non-zero for a
+        near-isobaric co-eluting candidate scored against the SAME observed peaks
+        (so a blend resolves by the candidates' distinct mass defects). Nothing
+        per-candidate drifts the offset, so admitting more blend candidates never
+        adds free calibration DOF. `da_to_ppm` is taken relative to `reference_mz`;
+        with `reference_mz=None` this reduces exactly to the prior single-grid form.
         """
+        ref = channel_mz if reference_mz is None else reference_mz
         iso = torch.as_tensor(isotope, dtype=torch.long)
         # The monoisotopic (k=0) d_mz is the reference and is pinned to 0: its
         # absolute m/z position is `mz_offset`, so a free d_mz_0 would be
@@ -165,8 +178,10 @@ class GlobalCalibration(nn.Module):
         # (index 0 is a constant zero, so no gradient reaches d_mz_da[0]).
         d_pinned = torch.cat([self.d_mz_da.new_zeros(1), self.d_mz_da[1:]])
         d_da = d_pinned.index_select(0, iso.reshape(-1)).reshape(iso.shape)
-        mz_offset_da = d_da / torch.as_tensor(z, dtype=self._dtype)
-        return self.mz_offset_ppm + da_to_ppm(mz_offset_da, channel_mz)
+        cmz = torch.as_tensor(channel_mz, dtype=self._dtype)
+        rmz = torch.as_tensor(ref, dtype=self._dtype)
+        mz_offset_da = (cmz - rmz) + d_da / torch.as_tensor(z, dtype=self._dtype)
+        return self.mz_offset_ppm + da_to_ppm(mz_offset_da, rmz)
 
     # -- resolution -----------------------------------------------------
 

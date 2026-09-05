@@ -88,15 +88,19 @@ Verified from `java -jar encyclopedia-6.5.15.jar --help` on 6.5.15.
 |---|---|---|
 | `-i` | path | input `.DIA` or `.mzML` (or vendor `.raw`/`.d` via bundled MSRawJava) |
 | `-l` | path | library `.dlib` (chromatogram-free predicted) or `.elib` (chromatogram library) |
+| `-f` | path | background proteome FASTA |
+
+**`-f` is mandatory in 6.5.15**, which is a change from older versions. Omitting it aborts the run before any file is opened with `You are required to specify an input file (-i), a library file (-l), and a fasta file (-f)` — and it does so *even when the library already carries decoys*, contradicting the older "only needed for decoy generation" guidance. Verified empirically: `-i` + `-l` alone produces that message, while adding `-f` proceeds to the library read. `--fasta` is therefore `required=True` on `massspec search` so the failure surfaces at argparse time instead of as a jar exit code after JVM startup.
 
 **Common optional flags (wrapped as typed CLI args):**
 
 | Flag | Default | Constellation CLI flag |
 |---|---|---|
 | `-o` | `<input>.encyclopedia.txt` | always set by handler to `<output-dir>/<input-stem>.encyclopedia.txt` |
-| `-f` | — | `--fasta` (optional; required only for non-EncyclopeDIA-pathway scoring) |
-| `-ftol` / `-ftolunits` | `10 ppm` | `--fragment-tolerance-ppm` (assumed ppm) |
-| `-ptol` / `-ptolunits` | `10 ppm` | `--precursor-tolerance-ppm` (assumed ppm) |
+| `-f` | — | `--fasta` (**required** — see note below) |
+| `-ptol` / `-ptolunits` | `10 ppm` | `--precursor-tolerance` + `--precursor-tolerance-unit {ppm,Da}` |
+| `-ftol` / `-ftolunits` | `10 ppm` | `--fragment-tolerance` + `--fragment-tolerance-unit {ppm,Da}` |
+| `-lftol` / `-lftolunits` | `10 ppm` | `--library-fragment-tolerance` + `--library-fragment-tolerance-unit {ppm,Da}` |
 | `-acquisition` | `DIA` | `--acquisition` |
 | `-enzyme` | `trypsin` | `--enzyme` |
 | `-frag` | `CID` | `--fragmentation` |
@@ -105,7 +109,19 @@ Verified from `java -jar encyclopedia-6.5.15.jar --help` on 6.5.15.
 | `-percolatorProteinThreshold` | `0.01` | `--percolator-protein-threshold` |
 | `-numberOfThreadsUsed` | `20` | `--threads` |
 
-**Anything not wrapped** passes through via `--encyclopedia-arg FLAG=VALUE` (repeatable). The full flag surface (~50 options including `-adjustInferredRTBoundaries`, `-expectedPeakWidth`, `-filterPeaklists`, `-fixed C=57.0214635`, `-foffset`, `-integratePrecursors`, `-lftol`, `-localizationModification`, `-maskBadIntegrations`, `-maxWindowWidth`, `-minIntensity`, `-minIntensityNumIons`, `-minNumIntegratedRTPoints`, `-minNumOfQuantitativePeaks`, `-normalizeByTIC`, `-numberOfExtraDecoyLibrariesSearche`, `-numberOfQuantitativePeaks`, `-percolatorTrainingFDR`, `-percolatorTrainingSetSize`, `-poffset`, `-precursorIsolationMargin`, `-precursorWindowSize`, `-rtWindowInMin`, `-scoringBreadthType`, `-skipLibraryRetentionTime`, `-smoothIntegrations`, `-subtractBackground`, `-topNTargetsUsed`, `-usePercolator`, `-verifyModificationIons`) is documented in the jar's `--help`; expose typed flags here as lab use cases demand them.
+### Mass-tolerance units
+
+EncyclopeDIA's `MassErrorUnitType` enum is `{PPM, AMU, RESOLUTION}`, matched case-insensitively. Three things follow, all verified against the 6.5.15 jar:
+
+* **Daltons are spelled `AMU`.** The literal `Da` is rejected — `EncyclopediaException: Error parsing fragment mass error unit type from [Da]`. Constellation's CLI takes `Da` (the spelling used by `massspec chromatogram extract` and `peptide.match.match_mz`) and translates in `library_search._ENCYCLOPEDIA_UNITS`.
+* **`AMU` is the only absolute window.** From `MassTolerance`'s constructor + `getTolerance(mass)`: `PPM` stores `percent = v/1e6` and returns `percent × mass`; `AMU` stores `amuTolerance = v` and returns it unchanged. `isRelativeTolerance()` is false only for `AMU`. This is what ion-trap data wants — ±0.8 Da at m/z 300 and at m/z 1500 alike.
+* **`RESOLUTION` is `PPM` re-parameterized**, not a third kind of tolerance: the constructor stores `ppmTolerance = 500000 / v`, i.e. a window half-width of `mass / (2R)` (half the peak FWHM at resolving power `R`). `-ftolunits Resolution -ftol 30000` ≡ `-ftolunits ppm -ftol 16.67`. It adds no capability, so it is not exposed as a typed choice; reach it via `--encyclopedia-arg '-ftolunits=Resolution'`.
+
+`-ftol` and `-lftol` are deliberately **not** coupled. `DotProduct.getIndividualPeakScores` consults both: `-ftol` is the window applied to the acquired spectrum, `-lftol` the one applied to the library peak list. Against a *predicted* library the library m/z are exact theoretical values and want the tight ppm default even when `-ftol` is widened to 0.8 Da for ion-trap data; only widen `-lftol` when searching a *measured* chromatogram `.elib` whose peaks carry the instrument's own mass error.
+
+Unit parsing happens in `SearchParameterParser.parseParameters` **before** any input file is opened, which makes the translation cheap to smoke-test — a run with nonexistent paths still validates the units and then fails on the library read. `tests/test_massspec_library_search.py` uses exactly that (Tier B, gated on a resolved encyclopedia install).
+
+**Anything not wrapped** passes through via `--encyclopedia-arg FLAG=VALUE` (repeatable). The full flag surface (~50 options including `-adjustInferredRTBoundaries`, `-expectedPeakWidth`, `-filterPeaklists`, `-fixed C=57.0214635`, `-foffset`, `-integratePrecursors`, `-localizationModification`, `-maskBadIntegrations`, `-maxWindowWidth`, `-minIntensity`, `-minIntensityNumIons`, `-minNumIntegratedRTPoints`, `-minNumOfQuantitativePeaks`, `-normalizeByTIC`, `-numberOfExtraDecoyLibrariesSearche`, `-numberOfQuantitativePeaks`, `-percolatorTrainingFDR`, `-percolatorTrainingSetSize`, `-poffset`, `-precursorIsolationMargin`, `-precursorWindowSize`, `-rtWindowInMin`, `-scoringBreadthType`, `-skipLibraryRetentionTime`, `-smoothIntegrations`, `-subtractBackground`, `-topNTargetsUsed`, `-usePercolator`, `-verifyModificationIons`) is documented in the jar's `--help`; expose typed flags here as lab use cases demand them.
 
 **Output convention quirk worth knowing:** the chromatogram `.elib` lands **next to the input file** as `<input>.elib` (EncyclopeDIA convention; not redirectable via `-o`, which controls only the `.encyclopedia.txt` report). The Constellation handler runs the jar with `cwd=output_dir` to keep incidental files in the run-dir, then locates the produced `.elib` via filename convention for the auto-ingest step.
 

@@ -106,6 +106,13 @@ def observation_from_trace(
     intensity = torch.zeros((n_scans, n_chan), dtype=dtype)
     mz_error = torch.zeros((n_scans, n_chan), dtype=dtype)
     mask = torch.zeros((n_scans, n_chan), dtype=torch.bool)
+    # Observed m/z [Th] per filled cell (NaN elsewhere): the matched peak's measured
+    # m/z, copied straight from the trace. With the `scan` axis it forms the stable
+    # `(scan, source_mz)` physical-peak identity that a fitted panel's soft
+    # attribution maps back to — IDENTICAL for a peak extracted under any target
+    # (unlike a per-(target,scan,ion) trace row index, which cannot reconcile a peak
+    # claimed across panels).
+    source_mz = torch.full((n_scans, n_chan), float("nan"), dtype=dtype)
 
     # -- filter + scatter the trace -----------------------------------------
     t = trace
@@ -120,6 +127,13 @@ def observation_from_trace(
         iso = t.column("isotope").to_numpy(zero_copy_only=False).astype(np.int64)
         inten = t.column("intensity").to_numpy(zero_copy_only=False).astype("float64")
         merr = t.column("mz_error_ppm").to_numpy(zero_copy_only=False).astype("float64")
+        # observed m/z is the stable peak identity; absent (e.g. a minimal trace) →
+        # NaN, so the cell still scores but carries no raw-peak provenance.
+        mz_obs = (
+            t.column("mz_observed").to_numpy(zero_copy_only=False).astype("float64")
+            if "mz_observed" in t.column_names
+            else np.full(t.num_rows, np.nan)
+        )
 
         # scan → row index (only rows whose scan is in the window)
         s_idx = np.searchsorted(sm_scan, scan)
@@ -133,17 +147,18 @@ def observation_from_trace(
         valid = in_range & (c_idx >= 0) & np.isfinite(inten) & (inten > intensity_floor)
         if valid.any():
             flat = s_idx[valid] * n_chan + c_idx[valid]
-            iv, ev = inten[valid], merr[valid]
+            iv, ev, mv = inten[valid], merr[valid], mz_obs[valid]
             # de-duplicate (scan, channel): keep the most intense peak. Sort by
             # (flat, intensity asc) so the last row of each flat group is the max.
             srt = np.lexsort((iv, flat))
-            flat_s, iv_s, ev_s = flat[srt], iv[srt], ev[srt]
+            flat_s, iv_s, ev_s, mv_s = flat[srt], iv[srt], ev[srt], mv[srt]
             last = np.ones(flat_s.shape[0], dtype=bool)
             last[:-1] = flat_s[1:] != flat_s[:-1]
             fk = torch.as_tensor(flat_s[last], dtype=torch.long)
             intensity.view(-1)[fk] = torch.as_tensor(iv_s[last], dtype=dtype)
             mz_error.view(-1)[fk] = torch.as_tensor(ev_s[last], dtype=dtype)
             mask.view(-1)[fk] = True
+            source_mz.view(-1)[fk] = torch.as_tensor(mv_s[last], dtype=dtype)
 
     return CounterObservation(
         rt=rt,
@@ -154,6 +169,8 @@ def observation_from_trace(
         channel_z=cz,
         channel_isotope=ck,
         channel_mz=channel_mz.to(dtype),
+        scan=torch.as_tensor(sm_scan, dtype=torch.long),
+        source_mz=source_mz,
     )
 
 

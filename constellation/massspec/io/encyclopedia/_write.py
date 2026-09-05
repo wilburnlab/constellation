@@ -259,6 +259,22 @@ def _write_entries(con, library: Library, quant: Quant | None) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 
+#: Accession prefix for a peptide with no protein mapping. A DLIB's
+#: reader gates ``entries`` on ``peptidetoprotein``, so an unmapped
+#: peptide would be written and then read back as nothing at all. That
+#: is a real case, not a malformed library: a synthetic-peptide panel
+#: has no protein of origin.
+#:
+#: One pseudo-accession PER PEPTIDE, not one shared bucket. EncyclopeDIA
+#: runs protein-level inference and FDR over accessions, so collapsing N
+#: synthetic peptides onto a single accession would present them as one
+#: protein with N supporting peptides — the shape of a confidently
+#: identified protein. Per-peptide accessions keep them the independent
+#: single-peptide entities they actually are, and the prefix keeps every
+#: synthetic target greppable downstream.
+UNMAPPED_ACCESSION_PREFIX = "UNMAPPED_"
+
+
 def _write_peptidetoprotein(con, library: Library) -> None:
     accession_for = dict(
         zip(
@@ -274,6 +290,9 @@ def _write_peptidetoprotein(con, library: Library) -> None:
             strict=True,
         )
     )
+    mapped_peptide_ids = set(
+        library.protein_peptide.column("peptide_id").to_pylist()
+    )
     rows = [
         (seq_for[k], False, accession_for[p])
         for p, k in zip(
@@ -282,6 +301,11 @@ def _write_peptidetoprotein(con, library: Library) -> None:
             strict=True,
         )
     ]
+    rows.extend(
+        (seq, False, f"{UNMAPPED_ACCESSION_PREFIX}{seq}")
+        for pid, seq in seq_for.items()
+        if pid not in mapped_peptide_ids
+    )
     _sql.insert_many(
         con, "peptidetoprotein", ("PeptideSeq", "isDecoy", "ProteinAccession"), rows
     )

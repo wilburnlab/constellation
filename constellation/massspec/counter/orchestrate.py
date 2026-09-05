@@ -63,20 +63,25 @@ def seed_peak_from_observation(
 ) -> None:
     """Initialize the progenitor's `HyperEMGPeak` from the observation.
 
-    The total observed intensity per scan, divided by `Σ_c α(z)·f_z·p_k`, is
-    an estimate of the latent flux `N(t)`; its RT-centroid seeds `μ`, its
-    spread seeds `σ`/`τ`, and its trapezoidal integral seeds `N_total` (which
-    is ≈ the answer — the fit then refines it under the full likelihood).
-    `rt_prior_ms` (e.g. a PSM RT) overrides the centroid for `μ`. A good seed
-    makes the gradient fit robust without a wide global search."""
+    The RT-centroid (weighted by the per-scan recovered ion count `N = I·τ/α`,
+    NOT raw intensity — so high-injection-time scans are not under-weighted: the
+    N-weighted-μ fix, L6) seeds `μ`; its spread seeds `σ`/`τ`; and the trapezoidal
+    integral of the implied flux `N(t)` seeds `N_total` (≈ the answer — the fit
+    then refines it under the full likelihood). `rt_prior_ms` (e.g. a PSM RT)
+    overrides the centroid for `μ`. A good seed makes the gradient fit robust
+    without a wide global search."""
     rt = obs.rt
-    i_tot = (obs.intensity * obs.mask).sum(dim=1)  # (S,)
-    w = i_tot.clamp(min=0.0)
+    # μ-centroid weight = per-scan recovered count Σ_c I·τ/α (count-weighted), so a
+    # scan's pull reflects ions accumulated, not raw intensity. Reduces to the old
+    # intensity-weighting at constant τ + single gain; diverges where τ varies (AGC).
+    n_obs = obs.recovered_count(progenitor.calibration)  # (S, C), 0 on non-detections
+    w = n_obs.sum(dim=1)  # (S,)
     total_w = w.sum().clamp(min=1e-12)
     centroid = (w * rt).sum() / total_w
     var = (w * (rt - centroid) ** 2).sum() / total_w
     sigma = var.clamp(min=1e4).sqrt()  # ≥ 100 ms
 
+    i_tot = (obs.intensity * obs.mask).sum(dim=1)  # (S,)
     f_ch = progenitor.charge_fractions().index_select(
         0, progenitor.charge_index_of_channel
     )
@@ -153,6 +158,8 @@ def estimate_n(
     guide_params: Sequence[str] = ("peak.*",),
     isotope_offset_sigma: float = 0.5,
     eta_sigma: float = 1.0,
+    n_total_prior: bool = False,
+    n_total_sigma: float = 2.0,
     n_elbo_samples: int = 16,
     n_ci_samples: int = 4096,
     vb_lr: float = 0.02,
@@ -193,6 +200,10 @@ def estimate_n(
         raise ValueError(f"inference must be 'map' or 'vb'; got {inference!r}")
     if reseed:
         seed_peak_from_observation(progenitor, obs, rt_prior_ms=rt_prior_ms)
+    # L6 N_total prior center = the seed's integrated-count estimate (captured
+    # BEFORE the MAP fit moves it). Safe on the single-progenitor path (no blend to
+    # contaminate it); the multi-progenitor panel prior awaits VB-on-panel.
+    n_total_center = float(progenitor.peak.log_N_total.detach()) if n_total_prior else None
     if bounds is None:
         bounds = _default_bounds(progenitor, obs)
 
@@ -227,6 +238,8 @@ def estimate_n(
             rt_sigma_ms=rt_sigma_ms,
             isotope_offset_sigma=isotope_offset_sigma,
             eta_sigma=eta_sigma,
+            n_total_center=n_total_center,
+            n_total_sigma=n_total_sigma,
             n_elbo_samples=n_elbo_samples,
             n_ci_samples=n_ci_samples,
             vb_lr=vb_lr,
@@ -262,6 +275,8 @@ def _fit_vb(
     rt_sigma_ms: float,
     isotope_offset_sigma: float,
     eta_sigma: float,
+    n_total_center: float | None,
+    n_total_sigma: float,
     n_elbo_samples: int,
     n_ci_samples: int,
     vb_lr: float,
@@ -298,6 +313,10 @@ def _fit_vb(
     log_prior = make_log_prior(
         rt_prior_ms=rt_prior_ms,
         rt_sigma_ms=rt_sigma_ms,
+        # gated on `log_N_total` being guided — else the term would index a key the
+        # guide-sample dict doesn't carry.
+        n_total_center=(n_total_center if in_guide("peak.log_N_total") else None),
+        n_total_sigma=n_total_sigma,
         isotope_offset_sigma=(
             isotope_offset_sigma if in_guide("isotope_energy_offset") else None
         ),
@@ -337,6 +356,15 @@ _SHAPE_PARAM_NAMES = (
     "peak.log_tau_r",
     "peak.log_tau_l",
     "peak.logit_eta",
+)
+
+# Peak-shape hyperprior param → its COUNTER_GLOBAL_CALIBRATION_TABLE column prefix
+# (`<prefix>_mean` / `<prefix>_std`). `prior_log_tau` is τ_r for back-compat.
+_SHAPE_PRIOR_COLUMNS = (
+    ("peak.log_sigma", "prior_log_sigma"),
+    ("peak.log_tau_r", "prior_log_tau"),
+    ("peak.log_tau_l", "prior_log_tau_l"),
+    ("peak.logit_eta", "prior_logit_eta"),
 )
 
 _STAGE_CONFIG = {
@@ -634,21 +662,21 @@ def calibration_to_table(
         "prior_log_sigma_std": None,
         "prior_log_tau_mean": None,
         "prior_log_tau_std": None,
+        "prior_log_tau_l_mean": None,
+        "prior_log_tau_l_std": None,
+        "prior_logit_eta_mean": None,
+        "prior_logit_eta_std": None,
     }
-    # Promoted peak-shape hyperprior (StagedCalibration): persist σ + τ_r (the
-    # schema's two shape slots; τ_l / η priors stay in-memory only).
+    # Promoted peak-shape hyperprior (StagedCalibration): persist ALL FOUR shape
+    # params (σ, τ_r, τ_l, η) so a prior-run warm-start round-trips the full
+    # hyperprior — step 7 re-broadcasts the calibration each round, and dropping
+    # τ_l / η (the pre-v2 behavior) silently corrupted the promoted prior.
     prior = cal.peak_shape_prior
     if prior:
-        if "peak.log_sigma" in prior:
-            row["prior_log_sigma_mean"], row["prior_log_sigma_std"] = (
-                float(prior["peak.log_sigma"][0]),
-                float(prior["peak.log_sigma"][1]),
-            )
-        if "peak.log_tau_r" in prior:
-            row["prior_log_tau_mean"], row["prior_log_tau_std"] = (
-                float(prior["peak.log_tau_r"][0]),
-                float(prior["peak.log_tau_r"][1]),
-            )
+        for leaf, col in _SHAPE_PRIOR_COLUMNS:
+            if leaf in prior:
+                row[f"{col}_mean"] = float(prior[leaf][0])
+                row[f"{col}_std"] = float(prior[leaf][1])
     return pa.table({k: [v] for k, v in row.items()}).cast(
         COUNTER_GLOBAL_CALIBRATION_TABLE
     )
@@ -688,18 +716,14 @@ def calibration_from_table(
             cal.log_alpha_z.copy_(
                 torch.tensor(list(row["alpha_z"]), dtype=dtype).clamp(min=1e-6).log()
             )
-    if row["prior_log_sigma_mean"] is not None:
-        prior: dict[str, tuple[float, float]] = {
-            "peak.log_sigma": (
-                float(row["prior_log_sigma_mean"]),
-                float(row["prior_log_sigma_std"]),
-            )
-        }
-        if row["prior_log_tau_mean"] is not None:
-            prior["peak.log_tau_r"] = (
-                float(row["prior_log_tau_mean"]),
-                float(row["prior_log_tau_std"]),
-            )
+    # Restore whichever shape-prior slots are present. `.get` tolerates a v1
+    # parquet (no τ_l / η columns) — those simply stay unset.
+    prior: dict[str, tuple[float, float]] = {}
+    for leaf, col in _SHAPE_PRIOR_COLUMNS:
+        mean, std = row.get(f"{col}_mean"), row.get(f"{col}_std")
+        if mean is not None and std is not None:
+            prior[leaf] = (float(mean), float(std))
+    if prior:
         cal.set_peak_shape_prior(prior)
     return cal
 

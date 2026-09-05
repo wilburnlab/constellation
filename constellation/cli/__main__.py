@@ -462,6 +462,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     # Taxonomy + catalog rows — surface bundled vs fetched + per-source counts.
     rows.append(_doctor_taxonomy_row())
     rows.append(_doctor_catalogs_row())
+    rows.append(_doctor_koina_row())
 
     if not rows:
         print("no third-party tools or frontend bundles registered")
@@ -523,6 +524,34 @@ def _doctor_frontend_rows() -> list[tuple[str, str, str, str]]:
                 )
             )
     return rows
+
+
+def _doctor_koina_row() -> tuple[str, str, str, str]:
+    """Report local readiness for the Koina prediction backend.
+
+    Deliberately **never touches the network**: `doctor` is run on
+    offline machines and in CI, and a row that hangs on a gRPC connect
+    or reports "down" because the user is on a plane would be worse than
+    useless. It answers only "is koinapy importable, and where would we
+    connect to" — the server itself is probed when a prediction actually
+    runs.
+    """
+    from constellation.massspec.library.koina.client import resolve_server
+
+    server = resolve_server()
+    try:
+        from importlib.metadata import version
+
+        koinapy_version = version("koinapy")
+    except Exception:
+        return (
+            "koina",
+            "missing",
+            "-",
+            f"koinapy not installed (pip install 'constellation-bio[ms]'); "
+            f"would use {server}",
+        )
+    return ("koina", "ok", koinapy_version, server)
 
 
 def _doctor_reference_cache_row() -> tuple[str, str, str, str]:
@@ -726,7 +755,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # the underlying modules are ported.
     for name, summary in [
         ("mzpeak", "Convert raw MS files to Parquet-backed mzpeak (TODO)"),
-        ("koina", "Build spectral libraries via Koina (TODO)"),
+        # `koina` is deliberately absent: Koina prediction ships as
+        # `massspec predict-library --backend koina`, beside the
+        # EncyclopeDIA backend it shares an argument surface with. A
+        # second top-level entry point would drift from it.
         ("pod5", "Ingest POD5 signal to Parquet (TODO)"),
         ("structure", "Prepare structures for MD (TODO)"),
         # Other sequencing pipeline verbs — wire as additional sessions land.
@@ -4895,8 +4927,13 @@ def main_mzpeak(argv: list[str] | None = None) -> int:
 
 
 def main_koina(argv: list[str] | None = None) -> int:
+    """`koina-library` → `massspec predict-library --backend koina`.
+
+    The console script keeps working; it just forwards to where the
+    implementation actually lives rather than to a placeholder.
+    """
     raw = list(sys.argv[1:] if argv is None else argv)
-    return main(["koina", *raw])
+    return main(["massspec", "predict-library", "--backend", "koina", *raw])
 
 
 if __name__ == "__main__":  # pragma: no cover

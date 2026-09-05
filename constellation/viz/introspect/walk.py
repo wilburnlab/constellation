@@ -24,6 +24,7 @@ from importlib.resources import files
 from typing import Any
 
 from constellation.viz.introspect.schema import (
+    ArgPathHint,
     ArgumentSchema,
     ArgumentType,
     CliSchema,
@@ -31,8 +32,38 @@ from constellation.viz.introspect.schema import (
     CuratedEntry,
 )
 
-_PATH_DEST_SUFFIXES = ("_dir", "_file", "_path", "dir", "path", "file")
-_PATH_DEST_EXACT = {"output_dir", "demux_dir", "align_dir", "session"}
+# Directory-vs-file classification for path-ish argparse dests. argparse
+# doesn't carry semantic types beyond callables, so we lean on the dest
+# naming convention used throughout the CLI. Directory dests win over
+# file dests when both would match (checked first below).
+_DIR_DEST_SUFFIXES = ("_dir",)
+_DIR_DEST_EXACT = {
+    "output_dir",
+    "demux_dir",
+    "align_dir",
+    "cluster_dir",
+    "reference_dir",
+    "session",
+    "dir",
+}
+_FILE_DEST_SUFFIXES = (
+    "_file",
+    "_path",
+    "_bed",
+    "_tsv",
+    "_bam",
+    "_sam",
+    "_fasta",
+    "_fa",
+    "_gff",
+    "_gff3",
+    "_vcf",
+)
+_FILE_DEST_EXACT = {"samples", "reads", "file", "path"}
+# Dests that look path-ish (or would collide with a suffix) but are NOT
+# filesystem paths — cache handles, free-text labels. Guarded out of the
+# picker entirely.
+_NOT_PATH_DEST = {"reference", "library_design"}
 
 
 def walk_parser(
@@ -123,21 +154,49 @@ def _action_to_schema(action: argparse.Action) -> ArgumentSchema:
         "nargs": _nargs_str(action.nargs),
         "is_positional": not action.option_strings,
     }
+
+    # Stamp the directory-vs-file sub-kind on path-ish args (both plain
+    # `path` and repeatable `multi` — a `nargs="+"` path arg stays multi
+    # but the frontend offers a Browse-to-append affordance).
+    kind = _path_kind_or_none(action)
+    if kind is not None and arg_type in ("path", "multi"):
+        schema["path_kind"] = kind
+
+    # Reference cache handles (dest `reference`) get an editable dropdown
+    # fed by GET /api/references — universal for any command that takes
+    # `--reference`, no curated entry required.
+    if action.dest == "reference":
+        schema["widget"] = "reference"
+
     return schema
 
 
-def _looks_like_path(action: argparse.Action) -> bool:
-    """Heuristic — argparse doesn't carry semantic types beyond callables.
+def _path_kind_or_none(action: argparse.Action) -> str | None:
+    """Return ``"dir"``, ``"file"``, or ``None`` for an argparse action.
 
-    Matches when ``dest`` ends in a path-ish suffix or is a known
-    file-input dest (``output_dir``, ``demux_dir``, ``align_dir``,
-    ``session``). Misses get rendered as plain text inputs; the v2
-    FilePicker will refine this via the curated overlay.
+    Pure ``dest``-name heuristic (argparse carries no semantic type).
+    Directory dests are checked before file dests so a ``*_dir`` wins.
+    Dests in :data:`_NOT_PATH_DEST` (cache handles, labels) return
+    ``None`` even if they'd otherwise match. Misses that are genuine file
+    inputs get refined via the ``arg_hints`` curated overlay.
     """
     dest = action.dest or ""
-    if dest in _PATH_DEST_EXACT:
-        return True
-    return any(dest.endswith(suffix) for suffix in _PATH_DEST_SUFFIXES)
+    if dest in _NOT_PATH_DEST:
+        return None
+    if dest in _DIR_DEST_EXACT or any(
+        dest.endswith(suffix) for suffix in _DIR_DEST_SUFFIXES
+    ):
+        return "dir"
+    if dest in _FILE_DEST_EXACT or any(
+        dest.endswith(suffix) for suffix in _FILE_DEST_SUFFIXES
+    ):
+        return "file"
+    return None
+
+
+def _looks_like_path(action: argparse.Action) -> bool:
+    """True when ``dest`` classifies as a directory or file path."""
+    return _path_kind_or_none(action) is not None
 
 
 def _metavar_str(metavar: Any) -> str | None:
@@ -199,9 +258,88 @@ def load_curated() -> list[CuratedEntry]:
     return [e for e in entries if isinstance(e, dict) and "path" in e]
 
 
+def load_arg_hints() -> list[ArgPathHint]:
+    """Read the packaged ``curated.json`` ``arg_hints`` overlay.
+
+    Each hint refines one argument's classification (see
+    :class:`ArgPathHint`). Returns an empty list when the file is missing
+    or malformed — the auto-walked classification stands unchanged.
+    """
+    try:
+        raw = files("constellation.viz.introspect").joinpath("curated.json").read_text()
+    except (FileNotFoundError, ModuleNotFoundError):
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    hints = data.get("arg_hints")
+    if not isinstance(hints, list):
+        return []
+    return [
+        h
+        for h in hints
+        if isinstance(h, dict) and "path" in h and "dest" in h
+    ]
+
+
+def _find_command(root: CommandSchema, path: list[str]) -> CommandSchema | None:
+    """Descend the walked tree to the command node at ``path``."""
+    node = root
+    for name in path:
+        nxt = None
+        for child in node.get("subcommands", ()):
+            if child.get("name") == name:
+                nxt = child
+                break
+        if nxt is None:
+            return None
+        node = nxt
+    return node
+
+
+def _apply_arg_hints(root: CommandSchema, hints: list[ArgPathHint]) -> None:
+    """Patch the walked tree in place from the ``arg_hints`` overlay.
+
+    Locates each hint's ``(path, dest)`` argument and applies:
+    ``is_path`` (force ``type`` to/from ``path``), ``path_kind``,
+    ``widget``, and ``glob``. Unknown paths / dests are skipped silently
+    so a stale hint never breaks the schema.
+    """
+    for hint in hints:
+        path = hint.get("path")
+        dest = hint.get("dest")
+        if not isinstance(path, list) or not isinstance(dest, str):
+            continue
+        node = _find_command(root, path)
+        if node is None:
+            continue
+        for arg in node.get("arguments", ()):
+            if arg.get("dest") != dest:
+                continue
+            if "is_path" in hint:
+                if hint["is_path"] and arg.get("type") not in ("path", "multi"):
+                    arg["type"] = "path"
+                elif not hint["is_path"] and arg.get("type") == "path":
+                    arg["type"] = "str"
+                    arg.pop("path_kind", None)
+            if "path_kind" in hint:
+                arg["path_kind"] = hint["path_kind"]
+                # A path_kind hint implies the arg IS a path unless it's a
+                # repeatable multi (which keeps its type).
+                if arg.get("type") not in ("path", "multi"):
+                    arg["type"] = "path"
+            if "widget" in hint:
+                arg["widget"] = hint["widget"]
+            if "glob" in hint:
+                arg["glob"] = hint["glob"]
+            break
+
+
 def build_cli_schema(parser: argparse.ArgumentParser) -> CliSchema:
     """Walk ``parser`` and pair the result with the curated overlay."""
     root = walk_parser(parser)
+    _apply_arg_hints(root, load_arg_hints())
     return {
         "prog": parser.prog or "constellation",
         "help": parser.description,

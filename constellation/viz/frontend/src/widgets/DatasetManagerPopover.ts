@@ -7,6 +7,8 @@
 // each mutation. The host owns track-state persistence and the actual
 // /api/sessions/{id}/sources roundtrip.
 
+import { PathInput } from './PathInput';
+
 export interface SourceRow {
   source_id: string;
   label: string;
@@ -42,7 +44,7 @@ export interface DatasetManagerOptions {
 export class DatasetManagerPopover {
   private readonly opts: DatasetManagerOptions;
   private readonly root: HTMLElement;
-  private addInput: HTMLInputElement | null = null;
+  private addPathInput: PathInput | null = null;
   private addError: HTMLElement | null = null;
   private addBtn: HTMLButtonElement | null = null;
   private outsideHandler: ((e: MouseEvent) => void) | null = null;
@@ -72,6 +74,8 @@ export class DatasetManagerPopover {
       document.removeEventListener('keydown', this.escHandler);
       this.escHandler = null;
     }
+    this.addPathInput?.destroy();
+    this.addPathInput = null;
     this.root.remove();
   }
 
@@ -146,16 +150,13 @@ export class DatasetManagerPopover {
 
     const inputRow = document.createElement('div');
     inputRow.className = 'dataset-add-row';
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.placeholder = 'absolute path to an align/ or cluster/ output dir';
-    input.className = 'dataset-add-input';
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        void this.handleAdd();
-      }
+    const pathInput = new PathInput({
+      kind: 'dir',
+      placeholder: 'align/ or cluster/ output dir',
     });
+    const piEl = pathInput.render();
+    piEl.style.flex = '1 1 auto';
+    piEl.style.minWidth = '0';
     const addBtn = document.createElement('button');
     addBtn.type = 'button';
     addBtn.className = 'dataset-add-btn';
@@ -163,7 +164,7 @@ export class DatasetManagerPopover {
     addBtn.addEventListener('click', () => {
       void this.handleAdd();
     });
-    inputRow.appendChild(input);
+    inputRow.appendChild(piEl);
     inputRow.appendChild(addBtn);
     addWrap.appendChild(inputRow);
 
@@ -174,7 +175,7 @@ export class DatasetManagerPopover {
 
     this.root.appendChild(addWrap);
 
-    this.addInput = input;
+    this.addPathInput = pathInput;
     this.addError = err;
     this.addBtn = addBtn;
   }
@@ -197,8 +198,8 @@ export class DatasetManagerPopover {
   }
 
   private async handleAdd(): Promise<void> {
-    if (!this.addInput || !this.addError || !this.addBtn) return;
-    const path = this.addInput.value.trim();
+    if (!this.addPathInput || !this.addError || !this.addBtn) return;
+    const path = this.addPathInput.getValue().trim();
     if (!path) return;
     this.addError.hidden = true;
     this.addBtn.disabled = true;
@@ -206,7 +207,7 @@ export class DatasetManagerPopover {
     try {
       const result = await this.opts.handlers.onAddSource(path);
       if (result.ok) {
-        this.addInput.value = '';
+        this.addPathInput.setValue('');
         // The host will dispose + re-open us; nothing more to do.
       } else {
         this.addError.textContent = result.error;

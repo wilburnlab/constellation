@@ -27,6 +27,7 @@ import type {
   TrackLayoutEntry,
 } from './types';
 import { DashboardState } from './state';
+import { PathInput } from '../widgets/PathInput';
 
 interface SourceRow {
   path: string;
@@ -63,6 +64,7 @@ export class GenomeBrowserForm {
   private savedSelect: HTMLSelectElement | null = null;
   private saveAsInput: HTMLInputElement | null = null;
   private rowsContainer: HTMLElement | null = null;
+  private rowPathInputs: PathInput[] = [];
   private unsubscribers: Array<() => void> = [];
 
   constructor(opts: GenomeBrowserFormOptions) {
@@ -88,6 +90,8 @@ export class GenomeBrowserForm {
   destroy(): void {
     for (const u of this.unsubscribers) u();
     this.unsubscribers = [];
+    for (const pi of this.rowPathInputs) pi.destroy();
+    this.rowPathInputs = [];
     if (this.host) this.host.innerHTML = '';
     this.host = null;
   }
@@ -410,26 +414,32 @@ export class GenomeBrowserForm {
 
   private renderRows(): void {
     if (!this.rowsContainer) return;
+    for (const pi of this.rowPathInputs) pi.destroy();
+    this.rowPathInputs = [];
     this.rowsContainer.innerHTML = '';
     this.sources.forEach((src, idx) => {
       const row = document.createElement('div');
       row.className = 'source-row';
       row.style.display = 'grid';
-      row.style.gridTemplateColumns = '1fr 110px 1fr auto';
+      row.style.gridTemplateColumns = 'minmax(0, 2fr) 100px minmax(0, 1.2fr) auto';
       row.style.gap = '8px';
       row.style.marginBottom = '4px';
 
-      const path = document.createElement('input');
-      path.type = 'text';
-      path.placeholder = '/path/to/align/output';
-      path.value = src.path;
-      path.spellcheck = false;
-      path.autocomplete = 'off';
-      path.addEventListener('change', () => {
-        this.sources[idx].path = path.value.trim();
-        void this.inspectRow(idx);
+      const pathInput = new PathInput({
+        value: src.path,
+        kind: 'dir',
+        placeholder: '/path/to/align/output',
+        onChange: (v) => {
+          this.sources[idx].path = v.trim();
+          this.updateSubmitButton();
+        },
+        onCommit: (v) => {
+          this.sources[idx].path = v.trim();
+          void this.inspectRow(idx);
+        },
       });
-      row.appendChild(path);
+      this.rowPathInputs.push(pathInput);
+      row.appendChild(pathInput.render());
 
       const kind = document.createElement('input');
       kind.type = 'text';

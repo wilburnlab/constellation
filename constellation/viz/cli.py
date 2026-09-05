@@ -113,6 +113,19 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         action="store_true",
         help="don't auto-open a browser (just print the URL)",
     )
+    p_genome.add_argument(
+        "--root",
+        action="append",
+        default=None,
+        type=Path,
+        metavar="DIR",
+        help=(
+            "extra directory the file picker is allowed to browse. "
+            "Repeatable. Added on top of the default roots (home + "
+            "working dir + WSL drives); paths outside every root are "
+            "refused by `/api/fs/list`."
+        ),
+    )
     p_genome.set_defaults(func=cmd_viz_genome)
 
     p_install = viz_subs.add_parser(
@@ -234,7 +247,36 @@ def build_dashboard_parser(subs: argparse._SubParsersAction) -> None:
         action="store_true",
         help="don't auto-open a browser (just print the URL)",
     )
+    p_dash.add_argument(
+        "--root",
+        action="append",
+        default=None,
+        type=Path,
+        metavar="DIR",
+        help=(
+            "extra directory the file picker is allowed to browse. "
+            "Repeatable. Added on top of the default roots (home + "
+            "working dir + WSL drives); paths outside every root are "
+            "refused by `/api/fs/list`. Widen this when your data lives "
+            "outside $HOME."
+        ),
+    )
     p_dash.set_defaults(func=cmd_dashboard)
+
+
+def _fs_roots_from_args(args: argparse.Namespace) -> list[Path] | None:
+    """Combine the default file-picker roots with any ``--root`` flags.
+
+    Returns ``None`` when no ``--root`` was passed so ``create_app`` uses
+    its own ``default_fs_roots()``. Otherwise returns defaults + extras
+    (create_app resolves + dedups).
+    """
+    extra = getattr(args, "root", None)
+    if not extra:
+        return None
+    from constellation.viz.server.endpoints.fs import default_fs_roots
+
+    return default_fs_roots() + [Path(r) for r in extra]
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
@@ -257,7 +299,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
     import uvicorn
 
-    app = create_app({}, default_entry="dashboard")
+    app = create_app(
+        {}, default_entry="dashboard", fs_roots=_fs_roots_from_args(args)
+    )
     config = uvicorn.Config(app, host=args.host, port=port, log_level="info")
     server = uvicorn.Server(config)
     server.run()
@@ -373,7 +417,7 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
 
     import uvicorn
 
-    app = create_app(session)
+    app = create_app(session, fs_roots=_fs_roots_from_args(args))
     config = uvicorn.Config(app, host=args.host, port=port, log_level="info")
     server = uvicorn.Server(config)
     server.run()

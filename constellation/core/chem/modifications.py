@@ -134,6 +134,37 @@ class Modification:
             for s in self.specificities
         )
 
+    def has_terminal_specificity_for(self, terminus: str, residue: str) -> bool:
+        """True iff this mod may sit on `terminus` when the terminal
+        residue is `residue`.
+
+        The site of a terminal specificity is load-bearing, so this is
+        strictly narrower than :attr:`has_n_term_specificity`. UNIMOD:28
+        (Gln->pyro-Glu) is "Any N-term" with site "Q" — licensed only
+        when the peptide actually starts with Q. Asking merely whether
+        the mod has *any* N-terminal specificity would license pyro-Glu
+        on P.
+
+        Site "N-term" / "C-term" means the mod targets the terminus
+        itself (an alpha-amine acetyl, say), so it is residue-agnostic.
+
+        `terminus` is "N-term" or "C-term".
+        """
+        if terminus == "N-term":
+            positions, own_site = _N_TERM_POSITIONS, "N-term"
+        elif terminus == "C-term":
+            positions, own_site = _C_TERM_POSITIONS, "C-term"
+        else:
+            raise ValueError(
+                f"terminus must be 'N-term' or 'C-term'; got {terminus!r}"
+            )
+        for spec in self.specificities:
+            if spec.position not in positions:
+                continue
+            if spec.site == own_site or spec.site == residue:
+                return True
+        return False
+
 
 # ──────────────────────────────────────────────────────────────────────
 # ModVocab — registry with first-class subsetting

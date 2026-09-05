@@ -173,3 +173,46 @@ def test_calibration_table_persists_hyperprior() -> None:
     # unset prior → null columns.
     tbl0 = calibration_to_table(_cal(), acquisition_id=0)
     assert tbl0.column("prior_log_sigma_mean")[0].as_py() is None
+
+
+_FULL_PRIOR = {
+    "peak.log_sigma": (8.7, 0.2),
+    "peak.log_tau_r": (8.6, 0.3),
+    "peak.log_tau_l": (8.4, 0.25),
+    "peak.logit_eta": (1.1, 0.5),
+}
+
+
+def _assert_prior_equal(got, want) -> None:
+    assert set(got) == set(want)
+    for k in want:
+        assert got[k][0] == pytest.approx(want[k][0])
+        assert got[k][1] == pytest.approx(want[k][1])
+
+
+def test_calibration_hyperprior_roundtrips_all_four_shape_slots() -> None:
+    # D8: τ_l and η priors used to be silently dropped (only σ + τ_r persisted).
+    from constellation.massspec.counter import calibration_from_table
+
+    cal = _cal()
+    cal.set_peak_shape_prior(dict(_FULL_PRIOR))
+    tbl = calibration_to_table(cal, acquisition_id=0)
+    assert tbl.column("prior_log_tau_l_mean")[0].as_py() == pytest.approx(8.4)
+    assert tbl.column("prior_logit_eta_std")[0].as_py() == pytest.approx(0.5)
+    _assert_prior_equal(calibration_from_table(tbl).peak_shape_prior, _FULL_PRIOR)
+
+
+def test_calibration_from_table_reads_v1_parquet_without_new_slots() -> None:
+    # A v1 table has no τ_l / η columns; from_table must still load it.
+    from constellation.massspec.counter import calibration_from_table
+
+    cal = _cal()
+    cal.set_peak_shape_prior(dict(_FULL_PRIOR))
+    v1 = calibration_to_table(cal, acquisition_id=0).drop_columns(
+        ["prior_log_tau_l_mean", "prior_log_tau_l_std",
+         "prior_logit_eta_mean", "prior_logit_eta_std"]
+    )
+    restored = calibration_from_table(v1).peak_shape_prior  # must not raise
+    _assert_prior_equal(
+        restored, {"peak.log_sigma": (8.7, 0.2), "peak.log_tau_r": (8.6, 0.3)}
+    )

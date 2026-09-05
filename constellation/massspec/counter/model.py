@@ -34,6 +34,7 @@ from constellation.core.stats.peaks import HyperEMGPeak
 from constellation.massspec.peptide.envelope import EnvelopeMode, peptide_envelope
 
 from .calibration import GlobalCalibration
+from .iit import accumulated_count
 
 __all__ = ["CounterObservation", "Progenitor"]
 
@@ -56,6 +57,16 @@ class CounterObservation:
     channel_z: torch.Tensor  # (C,) charge (long)
     channel_isotope: torch.Tensor  # (C,) isotope index (long)
     channel_mz: torch.Tensor  # (C,) theoretical m/z (float, Th)
+    # Stable physical-peak identity for mapping a fitted panel's soft attribution
+    # back to raw peaks ("what's left" after targets are searched, AND cross-panel
+    # reconciliation): `scan` is the (S,) scan-number axis; `source_mz` the (S, C)
+    # measured m/z [Th] of the peak in each filled cell (NaN elsewhere). The pair
+    # `(scan, source_mz)` is IDENTICAL for a peak extracted under different targets
+    # — a per-(target,scan,ion) trace row index is not — so it survives as the
+    # anti-join / cross-panel key. Optional — None for simulated / legacy
+    # observations built without a raw-peak source.
+    scan: torch.Tensor | None = None  # (S,) long — scan numbers
+    source_mz: torch.Tensor | None = None  # (S, C) float — observed m/z, NaN where unobserved
 
     @property
     def n_scans(self) -> int:
@@ -64,6 +75,21 @@ class CounterObservation:
     @property
     def n_channels(self) -> int:
         return int(self.channel_z.shape[0])
+
+    def recovered_count(self, calibration: GlobalCalibration) -> torch.Tensor:
+        """Per-channel recovered ion count `N_obs = I·τ/α(z)` `(S, C)` on observed
+        cells, 0 on non-detections — the per-ion count substrate for logL-based ion
+        selection (L4) and N-weighted seeding (L6). Uses the canonical
+        `iit.accumulated_count` (`I·τ/α`); a *derived projection* given a
+        calibration, so the observation itself stays raw (the count is not stored).
+
+        The count is floored at `accumulated_count`'s `1e-9` (so it can safely feed
+        `log` / `N^{−α_mz}` terms); below that floor it diverges from the likelihood's
+        unclamped `n_obs` in `panel_log_prob` — irrelevant at real ion counts (≫1),
+        but do not treat the two as identical at the sub-1e-9 boundary."""
+        gain_ch = calibration.gain(self.channel_z.to(self.intensity.dtype))  # (C,)
+        count = accumulated_count(self.intensity, self.iit[:, None], gain_ch[None, :])
+        return torch.where(self.mask, count, torch.zeros_like(count))
 
 
 def _channel_grid(

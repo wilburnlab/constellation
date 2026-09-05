@@ -191,3 +191,101 @@ def test_round_trip_overwrites_only_when_asked(tmp_path: Path):
     with pytest.raises(FileExistsError):
         write_encyclopedia(out, library)
     write_encyclopedia(out, library, overwrite=True)  # must not raise
+
+
+# ── orphan peptides survive a DLIB round-trip ──────────────────────────
+#
+# A DLIB's reader gates `entries` on `peptidetoprotein`, so a peptide
+# with no protein mapping was written and then read back as nothing —
+# a nonempty file that reloads empty. That is a real case, not a
+# malformed library: a synthetic-peptide panel has no protein of origin.
+
+
+def _one_peptide_library(*, with_protein: bool):
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.massspec.library.library import assign_ids
+    from constellation.massspec.peptide.ions import (
+        IonType,
+        fragment_ladder_indices_batch,
+    )
+
+    seq = "PEPTIDEK"
+    ladder = fragment_ladder_indices_batch(
+        [parse_proforma(seq)],
+        ion_types=(IonType.B, IonType.Y),
+        max_fragment_charge=1,
+    )[0]
+    key = (int(IonType.Y), 4, 1, None)
+    return assign_ids(
+        proteins=[{"accession": "P1"}] if with_protein else [],
+        peptides=[{"modified_sequence": seq, "sequence": seq}],
+        precursors=[
+            {
+                "modified_sequence": seq,
+                "charge": 2,
+                "precursor_mz": 456.7,
+                "rt_predicted": 100.0,
+            }
+        ],
+        fragments=[
+            {
+                "modified_sequence": seq,
+                "precursor_charge": 2,
+                "ion_type": int(IonType.Y),
+                "position": 4,
+                "charge": 1,
+                "loss_id": None,
+                "mz_theoretical": ladder[key],
+                "intensity_predicted": 0.5,
+                "annotation": "y3^1",
+            }
+        ],
+        protein_peptide=[("P1", seq)] if with_protein else [],
+        metadata={},
+    )
+
+
+def test_orphan_peptide_survives_dlib_roundtrip(tmp_path) -> None:
+    from constellation.massspec.library.io import load_library, save_library
+
+    lib = _one_peptide_library(with_protein=False)
+    path = tmp_path / "orphan.dlib"
+    save_library(lib, path, format="encyclopedia.dlib")
+    back = load_library(path)
+
+    assert back.precursors.num_rows == lib.precursors.num_rows == 1
+    assert back.fragments.num_rows == lib.fragments.num_rows == 1
+
+
+def test_orphan_peptide_gets_a_per_peptide_accession(tmp_path) -> None:
+    """One pseudo-accession per peptide, never one shared bucket.
+
+    EncyclopeDIA runs protein-level inference and FDR over accessions,
+    so collapsing N synthetic peptides onto a single accession would
+    present them as one protein with N supporting peptides — the shape
+    of a confidently identified protein.
+    """
+    from constellation.massspec.io.encyclopedia._write import (
+        UNMAPPED_ACCESSION_PREFIX,
+    )
+    from constellation.massspec.library.io import load_library, save_library
+
+    path = tmp_path / "orphan.dlib"
+    save_library(
+        _one_peptide_library(with_protein=False), path, format="encyclopedia.dlib"
+    )
+    accessions = load_library(path).proteins.column("accession").to_pylist()
+    assert accessions == [f"{UNMAPPED_ACCESSION_PREFIX}PEPTIDEK"]
+
+
+def test_mapped_peptide_keeps_its_real_accession(tmp_path) -> None:
+    """The orphan path must not perturb a normally-mapped library."""
+    from constellation.massspec.library.io import load_library, save_library
+
+    path = tmp_path / "mapped.dlib"
+    save_library(
+        _one_peptide_library(with_protein=True), path, format="encyclopedia.dlib"
+    )
+    back = load_library(path)
+    assert back.proteins.column("accession").to_pylist() == ["P1"]
+    assert back.precursors.num_rows == 1

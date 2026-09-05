@@ -22,7 +22,7 @@ import type {
   TrackLayoutEntry,
 } from './types';
 
-export type VizFieldKind = 'path' | 'text';
+export type VizFieldKind = 'path' | 'dir' | 'file' | 'text';
 
 export interface VizFormField {
   name: string;
