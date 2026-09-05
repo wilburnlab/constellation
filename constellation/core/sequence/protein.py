@@ -20,8 +20,10 @@ envelopes, and Hill-formula formatting for free.
 
 from __future__ import annotations
 
+import itertools
 import json
-from collections.abc import Iterator, Mapping
+import math
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
@@ -375,6 +377,165 @@ def _length_ok(peptide: str, min_length: int, max_length: int | None) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Modification enumeration
+# ──────────────────────────────────────────────────────────────────────
+
+N_TERM = "N-term"
+C_TERM = "C-term"
+
+
+def _normalize_mod_spec(
+    spec: Mapping[str, str | Sequence[str]] | None,
+) -> dict[str, tuple[str, ...]]:
+    """Site → tuple-of-mod-keys, accepting a bare string per site."""
+    out: dict[str, tuple[str, ...]] = {}
+    for site, keys in (spec or {}).items():
+        out[site] = (keys,) if isinstance(keys, str) else tuple(keys)
+    return out
+
+
+def _slots_for_site(site: str, seq: str) -> list[int | str]:
+    """Positions in `seq` a site specifier applies to.
+
+    Residue sites yield 0-indexed offsets; ``N-term`` / ``C-term`` yield
+    themselves as sentinel slots.
+    """
+    if site in (N_TERM, C_TERM):
+        return [site]
+    return [i for i, aa in enumerate(seq) if aa == site]
+
+
+def _check_specificity(key: str, site: str, vocab: ModVocab, peptide: str) -> None:
+    mod = vocab[key]
+    if site == N_TERM:
+        ok = bool(peptide) and mod.has_terminal_specificity_for(N_TERM, peptide[0])
+        detail = f" for a peptide starting with {peptide[:1]!r}" if peptide else ""
+    elif site == C_TERM:
+        ok = bool(peptide) and mod.has_terminal_specificity_for(C_TERM, peptide[-1])
+        detail = f" for a peptide ending with {peptide[-1:]!r}" if peptide else ""
+    else:
+        ok = mod.has_residue_specificity(site)
+        detail = ""
+    if not ok:
+        raise ValueError(
+            f"{key} ({mod.name}) has no UNIMOD specificity for site {site!r}"
+            f"{detail}; pass validate_specificity=False to apply it anyway"
+        )
+
+
+def _tagged(key: str) -> TaggedMod:
+    cv, _, acc = key.partition(":")
+    return TaggedMod(mod=ModRef(cv=cv, accession=acc))
+
+
+@requires_canonical
+def enumerate_modforms(
+    peptide: str,
+    *,
+    fixed: Mapping[str, str | Sequence[str]] | None = None,
+    variable: Mapping[str, str | Sequence[str]] | None = None,
+    max_variable: int = 3,
+    max_forms: int | None = None,
+    vocab: ModVocab = UNIMOD,
+    validate_specificity: bool = True,
+    validate_alphabet: bool = True,
+) -> list[Peptidoform]:
+    """Enumerate the modified forms of one peptide.
+
+    ``fixed`` mods are applied to **every** matching site and are not
+    enumerated. ``variable`` mods are enumerated over all combinations of
+    0..``max_variable`` simultaneously-modified sites. Both map a *site*
+    — a residue letter, or the ``N-term`` / ``C-term`` sentinels — to one
+    mod key (``"UNIMOD:35"``) or several (``["UNIMOD:21", "UNIMOD:35"]``),
+    the latter meaning "any one of these may occupy this site".
+
+    A site already carrying a fixed mod is not offered to the variable
+    enumeration, so ``fixed={"C": "UNIMOD:4"}`` and
+    ``variable={"C": ...}`` do not stack on the same cysteine.
+
+    Returns forms ordered by increasing variable-mod count, the
+    fixed-only form first. Mod keys are validated against ``vocab``, and
+    against each mod's UNIMOD specificity unless
+    ``validate_specificity=False`` — the latter is the escape hatch for
+    deliberately non-canonical placements.
+
+    Raises ``ValueError`` if the enumeration would exceed ``max_forms``
+    (when set) rather than silently truncating, since a truncated set
+    reads downstream as a complete one.
+    """
+    if validate_alphabet:
+        validate(peptide, AA)
+    if max_variable < 0:
+        raise ValueError(f"max_variable must be >= 0, got {max_variable}")
+
+    fixed_spec = _normalize_mod_spec(fixed)
+    var_spec = _normalize_mod_spec(variable)
+
+    for site, keys in (*fixed_spec.items(), *var_spec.items()):
+        for key in keys:
+            if key not in vocab:
+                raise ValueError(f"unknown modification key {key!r} for site {site!r}")
+            if validate_specificity:
+                _check_specificity(key, site, vocab, peptide)
+
+    for site, keys in fixed_spec.items():
+        if len(keys) != 1:
+            raise ValueError(
+                f"fixed site {site!r} takes exactly one modification, got {list(keys)}"
+            )
+
+    # Fixed application — every matching slot, always.
+    fixed_slots: dict[int | str, TaggedMod] = {}
+    for site, keys in fixed_spec.items():
+        for slot in _slots_for_site(site, peptide):
+            fixed_slots[slot] = _tagged(keys[0])
+
+    # Variable candidates — slot → the mod keys that may occupy it.
+    candidates: dict[int | str, list[str]] = {}
+    for site, keys in var_spec.items():
+        for slot in _slots_for_site(site, peptide):
+            if slot in fixed_slots:
+                continue
+            candidates.setdefault(slot, []).extend(keys)
+
+    ordered = sorted(
+        candidates, key=lambda s: (isinstance(s, str), s if isinstance(s, int) else str(s))
+    )
+    k_max = min(max_variable, len(ordered))
+
+    if max_forms is not None:
+        total = sum(
+            math.prod(len(candidates[s]) for s in combo)
+            for k in range(k_max + 1)
+            for combo in itertools.combinations(ordered, k)
+        )
+        if total > max_forms:
+            raise ValueError(
+                f"{peptide} would yield {total} modforms, exceeding max_forms="
+                f"{max_forms}; lower max_variable or narrow the variable mods"
+            )
+
+    forms: list[Peptidoform] = []
+    for k in range(k_max + 1):
+        for combo in itertools.combinations(ordered, k):
+            for choice in itertools.product(*(candidates[s] for s in combo)):
+                assigned = dict(fixed_slots)
+                assigned.update(zip(combo, (_tagged(c) for c in choice), strict=True))
+                residue_mods = {
+                    slot: (tag,) for slot, tag in assigned.items() if isinstance(slot, int)
+                }
+                forms.append(
+                    Peptidoform(
+                        sequence=peptide,
+                        residue_mods=residue_mods,
+                        n_term_mods=(assigned[N_TERM],) if N_TERM in assigned else (),
+                        c_term_mods=(assigned[C_TERM],) if C_TERM in assigned else (),
+                    )
+                )
+    return forms
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Peptide composition + mass
 # ──────────────────────────────────────────────────────────────────────
 
@@ -667,6 +828,9 @@ __all__ = [
     "Peptide",
     "cleave",
     "cleave_sites",
+    "enumerate_modforms",
+    "N_TERM",
+    "C_TERM",
     "peptide_composition",
     "peptide_mass",
     "protein_composition",

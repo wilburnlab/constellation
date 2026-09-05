@@ -64,7 +64,13 @@ def test_all_four_subcommands_register() -> None:
         # older versions treated -f as optional, which is what this
         # parser (and its help text) used to claim.
         ("search", {"--mzml", "--library", "--fasta", "--output-dir"}),
-        ("predict-library", {"--fasta", "--output-dlib", "--output-dir"}),
+        # --fasta and --output-dlib became conditionally required when the
+        # koina backend landed: koina can source precursors from
+        # --peptides / --from-library instead of a FASTA, and emits a
+        # ParquetDir rather than a .dlib. Both are still enforced for
+        # --backend encyclopedia, in-handler — see
+        # test_predict_library_encyclopedia_still_requires_fasta_and_dlib.
+        ("predict-library", {"--output-dir"}),
         ("process-dia", {"--inputs", "--output-dia", "--output-dir"}),
         (
             "library-export",

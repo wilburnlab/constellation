@@ -494,3 +494,52 @@ def test_peptide_composition_feeds_isotope_envelope():
     assert intens.shape == (5,)
     # Monoisotopic peak should be the largest for a small peptide.
     assert intens[0] == intens.max()
+
+
+# ── terminal-mod specificity is residue-aware ──────────────────────────
+#
+# A terminal specificity carries a site as well as a position, and the
+# site is load-bearing. Checking only "does this mod have ANY N-terminal
+# specificity" licensed UNIMOD:28 (Gln->pyro-Glu, "Any N-term" site "Q")
+# on a peptide starting with P.
+
+
+def test_n_term_mod_requires_matching_terminal_residue() -> None:
+    from constellation.core.sequence.protein import enumerate_modforms
+
+    with pytest.raises(ValueError, match="no UNIMOD specificity"):
+        enumerate_modforms("PEPTIDEK", variable={"N-term": "UNIMOD:28"})
+
+
+def test_n_term_mod_accepted_on_its_declared_residue() -> None:
+    from constellation.core.sequence.protein import enumerate_modforms
+
+    forms = enumerate_modforms("QEPTIDEK", variable={"N-term": "UNIMOD:28"})
+    assert len(forms) == 2  # unmodified + pyro-Glu
+
+
+def test_terminus_targeting_mod_is_residue_agnostic() -> None:
+    """Acetyl is "Any N-term"/site "N-term" — the alpha-amine itself.
+
+    Residue-agnostic by construction, so narrowing the check must not
+    start rejecting it.
+    """
+    from constellation.core.sequence.protein import enumerate_modforms
+
+    assert len(enumerate_modforms("PEPTIDEK", variable={"N-term": "UNIMOD:1"})) == 2
+
+
+def test_specificity_check_can_still_be_waived() -> None:
+    from constellation.core.sequence.protein import enumerate_modforms
+
+    forms = enumerate_modforms(
+        "PEPTIDEK", variable={"N-term": "UNIMOD:28"}, validate_specificity=False
+    )
+    assert len(forms) == 2
+
+
+def test_has_terminal_specificity_for_rejects_unknown_terminus() -> None:
+    from constellation.core.chem.modifications import UNIMOD
+
+    with pytest.raises(ValueError, match="N-term.*C-term"):
+        UNIMOD["UNIMOD:1"].has_terminal_specificity_for("middle", "K")
