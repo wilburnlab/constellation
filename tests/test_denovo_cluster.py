@@ -774,3 +774,216 @@ def test_haplotype_columns_gated_on_real_call():
     # with only the single real column, the cluster resolves to 2 haplotypes,
     # not the 3+ that the noise column would have manufactured
     assert res.haplotypes.num_rows == 2
+
+
+# ── empirical re-fit must not leave haplotypes on demoted sites ────────
+#
+# Haplotype columns are picked inside the workers under the DEFAULT error
+# model, because the empirical epsilon is fitted cluster-wide and is not
+# knowable until every chunk has reported. When --error-model empirical
+# then demotes one of those sites, the haplotypes were still splitting
+# reads on it.
+
+
+def _hap(cid, hid, astr, positions, ab, nu, complete=True):
+    return (cid, hid, astr, positions, ab, nu, complete)
+
+
+def _var(cid, pos, minor, call, in_core=True, r2=0.5):
+    """A (cid, *vr, r2) row shaped like the pipeline's variant tuples."""
+    row = [None] * 13
+    row[0] = cid          # _VRES_CID
+    row[1] = pos          # _VRES_POS
+    row[3] = minor        # _VRES_MINOR
+    row[11] = call        # _VRES_CALL
+    row[12] = in_core     # _VRES_IN_CORE
+    return (*row, r2)
+
+
+def test_demoted_column_is_dropped_and_haplotypes_remerge() -> None:
+    from constellation.sequencing.transcriptome.cluster.denovo.pipeline import (
+        _reconcile_haplotypes_after_reclassification,
+    )
+
+    # Two columns; the second is demoted. AC and AT then both collapse
+    # to "A", so the two haplotypes merge and their counts sum.
+    haps = [
+        _hap(1, 0, "AC", [10, 20], 70, 3),
+        _hap(1, 1, "AT", [10, 20], 30, 2),
+    ]
+    variants = [
+        _var(1, 10, "A", "real"),
+        _var(1, 20, "C", "collapsed_error"),
+    ]
+    out, fixed, promoted = _reconcile_haplotypes_after_reclassification(
+        haps, variants
+    )
+    assert len(out) == 1
+    cid, hid, astr, positions, ab, nu, complete = out[0]
+    assert (astr, positions) == ("A", [10])
+    assert ab == 100 and nu == 5      # abundance + unique counts preserved
+    assert complete is True
+    assert promoted == 0
+    # The demoted site keeps its catalogue row but loses its linkage,
+    # which described a column that no longer exists.
+    assert [r[-1] for r in fixed if r[1] == 20] == [0.0]
+    assert [r[-1] for r in fixed if r[1] == 10] == [0.5]
+
+
+def test_all_columns_demoted_emits_no_haplotypes() -> None:
+    """One degenerate all-reads haplotype is worse than none."""
+    from constellation.sequencing.transcriptome.cluster.denovo.pipeline import (
+        _reconcile_haplotypes_after_reclassification,
+    )
+
+    haps = [_hap(1, 0, "C", [20], 100, 5)]
+    variants = [_var(1, 20, "C", "ambiguous")]
+    out, _fixed, _promoted = _reconcile_haplotypes_after_reclassification(
+        haps, variants
+    )
+    assert out == []
+
+
+def test_untouched_clusters_pass_through_unchanged() -> None:
+    from constellation.sequencing.transcriptome.cluster.denovo.pipeline import (
+        _reconcile_haplotypes_after_reclassification,
+    )
+
+    haps = [_hap(1, 0, "AC", [10, 20], 70, 3)]
+    variants = [_var(1, 10, "A", "real"), _var(1, 20, "C", "real")]
+    out, _fixed, promoted = _reconcile_haplotypes_after_reclassification(
+        haps, variants
+    )
+    assert out == haps and promoted == 0
+
+
+def test_promotion_is_counted_not_silently_ignored() -> None:
+    """A site promoted to real was never projected, so it cannot become a
+    column here — but the run must say so rather than look complete."""
+    from constellation.sequencing.transcriptome.cluster.denovo.pipeline import (
+        _reconcile_haplotypes_after_reclassification,
+    )
+
+    haps = [_hap(1, 0, "A", [10], 100, 5)]
+    variants = [
+        _var(1, 10, "A", "real"),
+        _var(1, 99, "G", "real", r2=0.0),  # newly real, never a column
+    ]
+    _out, _fixed, promoted = _reconcile_haplotypes_after_reclassification(
+        haps, variants
+    )
+    assert promoted == 1
+
+
+def test_reconciliation_preserves_abundance_totals() -> None:
+    """Quant-grade invariant: dropping a column regroups reads, never
+    loses them."""
+    from constellation.sequencing.transcriptome.cluster.denovo.pipeline import (
+        _reconcile_haplotypes_after_reclassification,
+    )
+
+    haps = [
+        _hap(1, 0, "AC", [10, 20], 70, 3),
+        _hap(1, 1, "AT", [10, 20], 30, 2),
+        _hap(1, 2, "GC", [10, 20], 11, 1),
+    ]
+    variants = [
+        _var(1, 10, "A", "real"),
+        _var(1, 20, "C", "ambiguous"),
+    ]
+    out, _f, _p = _reconcile_haplotypes_after_reclassification(haps, variants)
+    assert sum(r[4] for r in out) == sum(r[4] for r in haps) == 111
+    assert sum(r[5] for r in out) == sum(r[5] for r in haps) == 6
+    # And ids are re-issued densely, abundance-descending.
+    assert [r[1] for r in out] == list(range(len(out)))
+    assert [r[4] for r in out] == sorted((r[4] for r in out), reverse=True)
+
+
+# ── a failed re-align must not look like a perfect match ───────────────
+
+
+def test_unaligned_member_is_sentinel_not_perfect() -> None:
+    """A member whose bounded re-align failed reported match_rate=1.0.
+
+    That is the chain-distant member the metric exists to expose: it is
+    in the component only transitively, and calling it a perfect
+    full-length match hides the connected-component chaining artifact.
+    """
+    import numpy as np
+    import pyarrow as pa
+
+    from constellation.sequencing.transcriptome.cluster.denovo.pipeline import (
+        _build_membership_table,
+    )
+
+    uniq = pa.table(
+        {
+            "uniq_id": pa.array([0, 1], pa.int64()),
+            "representative_read_id": pa.array(["r0", "r1"]),
+        }
+    )
+    read_map = pa.table(
+        {
+            "read_id": pa.array(["r0", "r1"]),
+            "uniq_id": pa.array([0, 1], pa.int64()),
+        }
+    )
+    out = _build_membership_table(
+        read_map=read_map,
+        uniq_table=uniq,
+        cluster_of=np.array([0, 0], dtype=np.int64),
+        surviving_centroids=np.array([0], dtype=np.int64),
+        seqlen=np.array([100, 100], dtype=np.int64),
+        # uniq 1 failed to align: all-zero counts.
+        metric_res=[(1, 0, 0, 0, 0, 0, 0, 0)],
+    )
+    by_read = dict(
+        zip(
+            out.column("read_id").to_pylist(),
+            zip(
+                out.column("match_rate").to_pylist(),
+                out.column("indel_rate").to_pylist(),
+                out.column("n_aligned_bp").to_pylist(),
+            ),
+            strict=True,
+        )
+    )
+    mr, ir, nab = by_read["r1"]
+    assert mr == -1.0, "unaligned member must not report a perfect match"
+    assert ir == -1.0
+    assert nab == 0, "and must not claim full-length alignment"
+    # The centroid itself is still a genuine self-match.
+    assert by_read["r0"][0] == 1.0
+
+
+def test_aligned_member_still_reports_real_rates() -> None:
+    """The sentinel must not swallow genuinely-measured members."""
+    import numpy as np
+    import pyarrow as pa
+
+    from constellation.sequencing.transcriptome.cluster.denovo.pipeline import (
+        _build_membership_table,
+    )
+
+    uniq = pa.table(
+        {
+            "uniq_id": pa.array([0, 1], pa.int64()),
+            "representative_read_id": pa.array(["r0", "r1"]),
+        }
+    )
+    read_map = pa.table(
+        {"read_id": pa.array(["r0", "r1"]), "uniq_id": pa.array([0, 1], pa.int64())}
+    )
+    out = _build_membership_table(
+        read_map=read_map,
+        uniq_table=uniq,
+        cluster_of=np.array([0, 0], dtype=np.int64),
+        surviving_centroids=np.array([0], dtype=np.int64),
+        seqlen=np.array([100, 100], dtype=np.int64),
+        # 90 match, 10 mismatch, 0 indels.
+        metric_res=[(1, 90, 10, 0, 0, 0, 0, 0)],
+    )
+    idx = out.column("read_id").to_pylist().index("r1")
+    assert out.column("match_rate").to_pylist()[idx] == pytest.approx(0.9)
+    assert out.column("indel_rate").to_pylist()[idx] == 0.0
+    assert out.column("n_aligned_bp").to_pylist()[idx] == 100

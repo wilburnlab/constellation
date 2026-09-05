@@ -355,7 +355,16 @@ def _cluster_chunk(
             m = int(m)
             al = _member_alignment(c, m)
             if al is None:
-                metric_out.append((m, int(seqlen[m]), 0, 0, 0, 0, 0, 0))
+                # The bounded re-align onto the centroid failed — this
+                # member only reaches the centroid transitively through
+                # the component. Emitting seqlen in the n_match slot made
+                # _build_membership_table report match_rate=1.0,
+                # indel_rate=0 and full-length alignment for precisely
+                # the chain-distant member that could NOT be aligned,
+                # hiding the chaining artifact it is evidence of. All
+                # zeros marks it unaligned; the sentinel is applied
+                # downstream.
+                metric_out.append((m, 0, 0, 0, 0, 0, 0, 0))
                 continue
             s, lng, ref_start, cigar = al
             nm, nx, ni, nd = cigar_stats(cigar)
@@ -671,6 +680,20 @@ def assemble_clusters(
         variant_res = reclassify_variants(
             variant_res, fitted, overdispersion=overdispersion
         )
+        # Haplotype columns were chosen under the DEFAULT model inside the
+        # workers — the fitted epsilon is cluster-wide and so unknowable
+        # until every chunk reported. Reconcile them against the final
+        # calls, or the haplotypes split reads on sites the caller has
+        # just decided are not real.
+        hap_res, variant_res, n_promoted = (
+            _reconcile_haplotypes_after_reclassification(hap_res, variant_res)
+        )
+        if n_promoted:
+            log(
+                f"  note: {n_promoted:,} variant(s) were promoted to 'real' by "
+                f"the empirical re-fit but were not projected as haplotype "
+                f"columns, so they do not split haplotypes in this run"
+            )
 
     clusters = _build_cluster_table(
         cluster_res,
@@ -803,6 +826,104 @@ def _build_alignment_lookup(accepted: pa.Table) -> dict[int, tuple[int, str]]:
     return {int(k): (int(rs), cg) for k, rs, cg in zip(keys, ref_start, cigar)}
 
 
+# Row layout of the (cid, *vr, r2) tuples in ``variant_res`` — mirrors
+# variants._VR_* shifted by the leading cluster_id.
+_VRES_CID, _VRES_POS, _VRES_MINOR = 0, 1, 3
+_VRES_IN_CORE, _VRES_CALL, _VRES_R2 = 12, 11, -1
+
+
+def _reconcile_haplotypes_after_reclassification(
+    hap_res: list[tuple],
+    variant_res: list[tuple],
+) -> tuple[list[tuple], list[tuple], int]:
+    """Drop haplotype columns the empirical re-fit demoted, and re-merge.
+
+    Haplotype columns are chosen inside the worker under the DEFAULT
+    error model, because the empirical epsilon is fitted cluster-wide and
+    so is not knowable until every chunk has reported. When
+    ``--error-model empirical`` then demotes one of those sites to
+    ``ambiguous`` / ``collapsed_error``, the haplotypes still split reads
+    on it — contradicting the schema's guarantee that haplotype columns
+    are FDR-supported ``real`` variants, and leaving the site's linkage
+    r2 attributed to a column that no longer exists.
+
+    Demotion is reconcilable exactly and cheaply from what the workers
+    already returned: the allele string carries one character per
+    column, so dropping a column is a character deletion, and haplotypes
+    whose remaining strings coincide merge — summing abundance and
+    unique-sequence counts. No re-projection, no second consensus.
+
+    Promotion is NOT reconcilable this way: a site that becomes ``real``
+    was never projected, so no allele column for it exists. Those are
+    counted and returned so the caller can surface the number rather
+    than let it pass silently.
+    """
+    if not hap_res:
+        return hap_res, variant_res, 0
+
+    real_by_cid: dict[int, set[int]] = {}
+    was_column: dict[int, set[int]] = {}
+    for row in variant_res:
+        cid = row[_VRES_CID]
+        if (
+            row[_VRES_CALL] == "real"
+            and row[_VRES_IN_CORE]
+            and row[_VRES_MINOR] in ("A", "C", "G", "T")
+        ):
+            real_by_cid.setdefault(cid, set()).add(int(row[_VRES_POS]))
+        if row[_VRES_R2]:
+            was_column.setdefault(cid, set()).add(int(row[_VRES_POS]))
+
+    by_cid: dict[int, list[tuple]] = {}
+    for row in hap_res:
+        by_cid.setdefault(row[0], []).append(row)
+
+    out: list[tuple] = []
+    for cid, rows in by_cid.items():
+        positions = list(rows[0][3])
+        real = real_by_cid.get(cid, set())
+        keep = [j for j, pos in enumerate(positions) if pos in real]
+        if len(keep) == len(positions):
+            out.extend(rows)
+            continue
+        if not keep:
+            # Every column demoted: the cluster has no supported
+            # haplotype structure left, so emit none rather than one
+            # degenerate all-reads haplotype.
+            continue
+        kept_positions = [positions[j] for j in keep]
+        merged: dict[str, list] = {}
+        for _cid, _hid, astr, _pos, ab, nu, _comp in rows:
+            key = "".join(astr[j] for j in keep)
+            slot = merged.get(key)
+            if slot is None:
+                merged[key] = [ab, nu]
+            else:
+                slot[0] += ab
+                slot[1] += nu
+        ordered = sorted(merged.items(), key=lambda kv: -kv[1][0])
+        for hid, (astr, (ab, nu)) in enumerate(ordered):
+            out.append(
+                (cid, hid, astr, kept_positions, ab, nu, "." not in astr)
+            )
+
+    # Linkage r2 belonged to a column that may no longer exist; a site
+    # that is not a haplotype column carries 0.0 by construction.
+    n_promoted = 0
+    fixed_variants: list[tuple] = []
+    for row in variant_res:
+        cid = row[_VRES_CID]
+        pos = int(row[_VRES_POS])
+        real = real_by_cid.get(cid, set())
+        cols = was_column.get(cid, set())
+        if pos in cols and pos not in real:
+            row = (*row[:-1], 0.0)
+        elif pos in real and pos not in cols and cid in by_cid:
+            n_promoted += 1
+        fixed_variants.append(row)
+    return out, fixed_variants, n_promoted
+
+
 def _build_cluster_table(
     results: list[tuple],
     *,
@@ -873,14 +994,22 @@ def _build_membership_table(
         nm, nx, ni, nd = arr[:, 1], arr[:, 2], arr[:, 3], arr[:, 4]
         oh5, oh3, m_is_long = arr[:, 5], arr[:, 6], arr[:, 7].astype(bool)
         aligned = nm + nx + ni + nd
+        # aligned == 0 means the re-align failed, not that the member
+        # matched perfectly over zero bases. Per the project-wide
+        # convention, -1.0 is "not observed" for float fields — so these
+        # members are visibly unmeasured rather than silently ideal, and
+        # a consensus-quality scan can find them.
+        unaligned = aligned == 0
         with np.errstate(divide="ignore", invalid="ignore"):
             mr = np.where((nm + nx) > 0, nm / (nm + nx), 1.0)
             ir = np.where(aligned > 0, (ni + nd) / aligned, 0.0)
+        mr = np.where(unaligned, -1.0, mr)
+        ir = np.where(unaligned, -1.0, ir)
         d5 = np.where(m_is_long, oh5, -oh5)
         d3 = np.where(m_is_long, oh3, -oh3)
         match_rate[mu] = mr
         indel_rate[mu] = ir
-        n_aligned[mu] = np.where(aligned > 0, aligned, seqlen[mu])
+        n_aligned[mu] = np.where(unaligned, 0, aligned)
         drift5[mu] = d5
         drift3[mu] = d3
 
