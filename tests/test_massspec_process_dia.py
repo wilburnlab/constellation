@@ -174,20 +174,28 @@ class _FakeJvmResult:
     elapsed_seconds = 0.01
 
 
-def _fake_jar_writing(stem_source: str):
+def _fake_jar_writing(stem_source: str | None):
     """Build a run_jar double that writes ``<stem>.dia`` into its cwd.
 
     Mirrors 6.5.15 single-input behaviour: the jar ignores ``-o`` and
     names the cache itself, relative to the working directory.
+
+    ``stem_source=None`` models the jar exiting 0 having produced no new
+    cache — what happens when it is handed an existing ``.DIA`` and
+    reuses it. Every kwarg is captured, not just args/cwd, so tests can
+    assert on what the JVM was actually handed.
     """
     captured: dict[str, object] = {}
 
     def _fake_run_jar(tool, *, args, cwd, **kw):
+        captured["tool"] = tool
         captured["args"] = list(args)
         captured["cwd"] = Path(cwd)
-        produced = Path(cwd) / f"{stem_source}.dia"
-        produced.parent.mkdir(parents=True, exist_ok=True)
-        produced.write_bytes(b"fresh")
+        captured.update(kw)
+        Path(cwd).mkdir(parents=True, exist_ok=True)
+        if stem_source is not None:
+            produced = Path(cwd) / f"{stem_source}.dia"
+            produced.write_bytes(b"fresh")
         return _FakeJvmResult()
 
     return _fake_run_jar, captured
@@ -308,3 +316,117 @@ def test_run_process_dia_resolves_relative_paths(
     assert captured["cwd"] == (tmp_path / "rundir").resolve()
     # And the cache still lands where the caller asked, not under rundir.
     assert (tmp_path / "out" / "combined.dia").is_file()
+
+
+# ── runner: the input is never the product ─────────────────────────────
+
+
+def test_run_process_dia_never_moves_a_dia_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``.DIA`` input must survive the run byte-for-byte.
+
+    ``.DIA`` is a documented input format — the jar reuses the cache and
+    emits nothing new. But ``sample.dia``.with_suffix(".dia") IS
+    ``sample.dia``, so the lookup returned the input itself and the
+    relocation carried the caller's source file off to output_dia. The
+    CLI then raised FileNotFoundError hashing an input that no longer
+    existed, and the user's cache was gone.
+    """
+    from constellation.massspec.search.encyclopedia import process_dia as pd
+
+    inp = tmp_path / "MS_Data" / "sample.dia"
+    inp.parent.mkdir(parents=True)
+    inp.write_bytes(b"original-cache")
+    out_dir = tmp_path / "run"
+    out_dia = out_dir / "combined.dia"
+
+    fake, _ = _fake_jar_writing(None)  # exits 0, produces nothing
+    monkeypatch.setattr(pd, "run_jar", fake)
+
+    pd.run_process_dia(
+        inputs=[inp], output_dia=out_dia, output_dir=out_dir,
+        stream_to_stderr=False,
+    )
+
+    assert inp.is_file(), "the .DIA input was moved away"
+    assert inp.read_bytes() == b"original-cache"
+    # Reuse still honours --output-dia — by copy, not by consuming it.
+    assert out_dia.read_bytes() == b"original-cache"
+
+
+def test_run_process_dia_leaves_non_dia_input_alone_when_nothing_produced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Jar exits 0 but emits no cache: report nothing, touch nothing.
+
+    The caller owns the error message (it names every path searched);
+    the runner must not invent an output or disturb the input.
+    """
+    from constellation.massspec.search.encyclopedia import process_dia as pd
+
+    inp = tmp_path / "sample.raw"
+    inp.write_bytes(b"raw-bytes")
+    out_dir = tmp_path / "run"
+    out_dia = out_dir / "combined.dia"
+
+    fake, _ = _fake_jar_writing(None)
+    monkeypatch.setattr(pd, "run_jar", fake)
+
+    pd.run_process_dia(
+        inputs=[inp], output_dia=out_dia, output_dir=out_dir,
+        stream_to_stderr=False,
+    )
+
+    assert not out_dia.exists()
+    assert inp.read_bytes() == b"raw-bytes"
+
+
+def test_single_input_dia_path_excludes_the_inputs(tmp_path: Path) -> None:
+    """``exclude`` keeps a .DIA input from being reported as the product."""
+    from constellation.massspec.search.encyclopedia import single_input_dia_path
+
+    inp = tmp_path / "sample.dia"
+    inp.write_bytes(b"cache")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    # Without the exclusion the input itself matches.
+    assert single_input_dia_path(inp, cwd=run_dir) == inp
+    assert single_input_dia_path(inp, cwd=run_dir, exclude=[inp]) is None
+
+    # A genuinely produced cache still wins.
+    produced = run_dir / "sample.dia"
+    produced.write_bytes(b"fresh")
+    assert single_input_dia_path(inp, cwd=run_dir, exclude=[inp]) == produced
+
+
+def test_run_process_dia_resolves_jvm_tmpdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative --jvm-tmpdir must not be reinterpreted under output_dir.
+
+    Java resolves ``-Djava.io.tmpdir`` against its own cwd, which run_jar
+    sets to output_dir — so ``./scratch`` would silently become
+    ``<output_dir>/scratch``, spilling onto whatever filesystem holds the
+    results rather than the fast scratch the caller picked.
+    """
+    from constellation.massspec.search.encyclopedia import process_dia as pd
+
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "sample.raw").write_bytes(b"")
+    (tmp_path / "scratch").mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    fake, captured = _fake_jar_writing("sample")
+    monkeypatch.setattr(pd, "run_jar", fake)
+
+    pd.run_process_dia(
+        inputs=[Path("data/sample.raw")],
+        output_dia=Path("out/combined.dia"),
+        output_dir=Path("rundir"),
+        jvm_tmpdir=Path("scratch"),
+        stream_to_stderr=False,
+    )
+
+    assert captured["jvm_tmpdir"] == (tmp_path / "scratch").resolve()

@@ -61,10 +61,25 @@ def build_process_dia_args(
     return args
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    """True when two paths denote the same file.
+
+    ``Path.samefile`` is the honest check — it sees through symlinks and
+    case-insensitive filesystems (macOS is best-effort-supported) — but
+    it raises when either side is absent, so fall back to comparing
+    resolved paths.
+    """
+    try:
+        return a.samefile(b)
+    except OSError:
+        return a.resolve() == b.resolve()
+
+
 def single_input_dia_path(
     input_file: Path,
     *,
     cwd: Path | None = None,
+    exclude: Sequence[Path] = (),
 ) -> Path | None:
     """Locate the ``.dia`` the jar produced from a single input.
 
@@ -81,6 +96,14 @@ def single_input_dia_path(
     ``cwd`` should be the same path the runner handed :func:`run_jar`.
     Returns ``None`` when nothing matches so the caller can surface a
     clear error naming where it looked.
+
+    ``exclude`` lists paths that must never be reported as the produced
+    cache — pass the run's inputs. A ``.DIA`` input is legal (the jar
+    reuses an existing cache and emits nothing new), and for such an
+    input ``with_suffix(".dia")`` is the input itself. Without the
+    exclusion the caller would relocate the user's source file, and
+    every later step reading that input fails on a path that no longer
+    exists.
     """
     candidates: list[Path] = []
     if cwd is not None:
@@ -98,8 +121,11 @@ def single_input_dia_path(
         ]
     )
     for candidate in candidates:
-        if candidate.is_file():
-            return candidate
+        if not candidate.is_file():
+            continue
+        if any(_same_file(candidate, Path(x)) for x in exclude):
+            continue
+        return candidate
     return None
 
 
@@ -153,6 +179,12 @@ def run_process_dia(
     output_dir = Path(output_dir).resolve()
     if output_dia is not None:
         output_dia = Path(output_dia).resolve()
+    if jvm_tmpdir is not None:
+        # Java resolves -Djava.io.tmpdir against ITS cwd, which is
+        # output_dir — so a relative ./scratch would silently become
+        # <output_dir>/scratch rather than the caller's scratch, sending
+        # spill files to the wrong (possibly much smaller) filesystem.
+        jvm_tmpdir = Path(jvm_tmpdir).resolve()
 
     args = build_process_dia_args(
         inputs=inputs,
@@ -182,14 +214,38 @@ def run_process_dia(
     # destination already exists would silently bind those old spectra
     # to this run's manifest.
     if len(inputs) == 1 and output_dia is not None:
-        produced = single_input_dia_path(inputs[0], cwd=output_dir)
-        if produced is not None and produced != output_dia:
+        # exclude=inputs: never mistake the source for the product. A
+        # .DIA input is legal and the jar then emits nothing new, so the
+        # naive lookup returns the input itself and the move would carry
+        # the user's own file away.
+        produced = single_input_dia_path(
+            inputs[0], cwd=output_dir, exclude=inputs
+        )
+        if produced is not None and not _same_file(produced, output_dia):
             output_dia.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(produced), str(output_dia))
             if stream_to_stderr:
                 print(
                     f"process-dia: single input — moved {produced.name} "
                     f"→ {output_dia}",
+                    file=sys.stderr,
+                )
+        elif (
+            produced is None
+            and inputs[0].suffix.lower() == ".dia"
+            and inputs[0].is_file()
+            and not _same_file(inputs[0], output_dia)
+        ):
+            # Cache reuse: the jar was handed a .DIA and produced no new
+            # file. COPY, never move — output_dia still has to mean what
+            # it means for every other input count, but not at the cost
+            # of consuming the caller's source.
+            output_dia.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(inputs[0]), str(output_dia))
+            if stream_to_stderr:
+                print(
+                    f"process-dia: single .DIA input reused — copied "
+                    f"{inputs[0].name} → {output_dia}",
                     file=sys.stderr,
                 )
     return result
