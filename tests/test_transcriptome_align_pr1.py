@@ -37,21 +37,21 @@ from constellation.sequencing.transcriptome.manifest import (
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Manifest schema v4
+# Manifest schema v5
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_manifest_schema_version_is_v4() -> None:
+def test_manifest_schema_version_is_v5() -> None:
     """The single MANIFEST_SCHEMA_VERSION constant drives every writer
     and the reader's exact-match check; this test pins the bump."""
-    assert MANIFEST_SCHEMA_VERSION == 4
+    assert MANIFEST_SCHEMA_VERSION == 5
 
 
-def test_align_manifest_round_trip_v4(tmp_path: Path) -> None:
-    """v4 align manifests round-trip with the new ``read_samples`` key
+def test_align_manifest_round_trip_v5(tmp_path: Path) -> None:
+    """v5 align manifests round-trip with the new ``read_samples`` key
     present in outputs. Older v3 manifests are refused with an
     actionable message — no silent back-compat."""
-    align_dir = tmp_path / "align_v4"
+    align_dir = tmp_path / "align_v5"
     align_dir.mkdir()
     write_align_manifest(
         align_dir / "manifest.json",
@@ -71,7 +71,7 @@ def test_align_manifest_round_trip_v4(tmp_path: Path) -> None:
     )
     loaded = read_manifest_dir(align_dir)
     assert loaded.kind == "align"
-    assert loaded.schema_version == 4
+    assert loaded.schema_version == 5
     assert loaded.outputs["read_samples"].endswith("read_samples.parquet")
     assert loaded.outputs["alignment_cs"].endswith("alignment_cs")
     assert loaded.samples == ["sample_a", "sample_b"]

@@ -378,6 +378,7 @@ def _write_demux_dir(tmp_path: Path, rows: list[tuple]) -> Path:
             "read_id": [r[0] for r in rows],
             "transcript_segment_index": [0] * len(rows),
             "sample_id": pa.array([r[2] for r in rows], pa.int64()),
+            "orientation": ["+"] * len(rows),
             "transcript_start": pa.array([len(lead)] * len(rows), pa.int32()),
             "transcript_end": pa.array(
                 [len(lead) + len(r[1]) for r in rows], pa.int32()

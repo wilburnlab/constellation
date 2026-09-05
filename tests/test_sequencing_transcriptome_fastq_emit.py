@@ -155,6 +155,22 @@ def _decode_fastq(path: Path) -> list[tuple[str, str, str]]:
     return out
 
 
+
+_COMPLEMENT = str.maketrans("ACGTacgt", "TGCAtgca")
+
+
+def _expected_window(seq: str, qual: str, orientation: str, ts: int, te: int):
+    """The window an orientation-aware emitter must produce.
+
+    Mirrors demux's own framing: for '-' the offsets index the
+    reverse-complemented read, so reconstruct that frame and slice it.
+    """
+    if orientation == "-":
+        seq = seq.translate(_COMPLEMENT)[::-1]
+        qual = qual[::-1]
+    return seq[ts:te], qual[ts:te]
+
+
 def test_emit_per_sample_fastq_synthetic(tmp_path: Path) -> None:
     """End-to-end: run pipeline with emit_fastq=True, validate every file.
 
@@ -206,6 +222,7 @@ def test_emit_per_sample_fastq_synthetic(tmp_path: Path) -> None:
         columns=[
             "read_id",
             "sample_id",
+            "orientation",
             "transcript_start",
             "transcript_end",
             "status",
@@ -238,12 +255,17 @@ def test_emit_per_sample_fastq_synthetic(tmp_path: Path) -> None:
             assert d["status"] == "Complete"
             assert not d["is_fragment"]
             assert not d["is_chimera"]
-            assert seq == seq_by_read[read_id][ts:te], (
-                f"sequence mismatch on {read_id}"
+            # The window is expressed in the CHOSEN-orientation frame,
+            # so a '-' read's emitted record is the reverse-complement
+            # of an interval of the stored bytes. Asserting a raw
+            # [ts:te] slice pinned the pre-fix behaviour and would pass
+            # while reverse reads were emitted on the wrong strand.
+            expect_seq, expect_qual = _expected_window(
+                seq_by_read[read_id], qual_by_read[read_id],
+                d["orientation"], ts, te,
             )
-            assert qual == qual_by_read[read_id][ts:te], (
-                f"quality mismatch on {read_id}"
-            )
+            assert seq == expect_seq, f"sequence mismatch on {read_id}"
+            assert qual == expect_qual, f"quality mismatch on {read_id}"
 
     assert total_emitted == sum(expected.values())
 

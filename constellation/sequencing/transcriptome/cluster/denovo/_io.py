@@ -16,7 +16,7 @@ import pyarrow.parquet as pq
 
 from constellation.sequencing.align.map import (
     _iter_demux_read_batches,
-    _string_buf_and_offsets,
+    transcript_window_buffers,
 )
 
 
@@ -30,29 +30,20 @@ _READS_SCHEMA = pa.schema(
 
 
 def _trim_batch(batch: pa.RecordBatch) -> pa.Table:
-    """Extract the transcript window of each read (vectorized ragged gather)."""
-    data, off = _string_buf_and_offsets(batch.column("sequence"))
-    off = off.astype(np.int64)
+    """Extract the transcript window of each read, orientation-aware.
+
+    Delegates the gather to :func:`transcript_window_buffers` so this
+    stage cannot drift from the align / FASTQ consumers: the window
+    offsets index the chosen-orientation frame, so a ``'-'`` read's
+    window is the reverse-complement of an interval of the stored bytes.
+    Slicing the stored bytes directly used to put reverse-oriented reads
+    in clusters of their own instead of joining their forward twins.
+    """
+    buf, new_off = transcript_window_buffers(batch)
     n = batch.num_rows
-    ts = (
-        batch.column("transcript_start").to_numpy(zero_copy_only=False).astype(np.int64)
-    )
-    te = batch.column("transcript_end").to_numpy(zero_copy_only=False).astype(np.int64)
-    row_start = off[:-1]
-    row_end = off[1:]
-    abs_start = np.clip(row_start + ts, row_start, row_end)
-    abs_end = np.clip(row_start + te, abs_start, row_end)
-    lens = abs_end - abs_start
-    new_off = np.zeros(n + 1, dtype=np.int64)
-    np.cumsum(lens, out=new_off[1:])
-    total = int(new_off[-1])
-    if total == 0:
+    if new_off[-1] == 0:
         window = pa.array([""] * n, type=pa.large_string())
     else:
-        seg = np.repeat(np.arange(n, dtype=np.int64), lens)
-        within = np.arange(total, dtype=np.int64) - new_off[seg]
-        src = abs_start[seg] + within
-        buf = np.frombuffer(data, dtype=np.uint8)[src]
         window = pa.LargeStringArray.from_buffers(
             length=n,
             value_offsets=pa.py_buffer(new_off.tobytes()),
