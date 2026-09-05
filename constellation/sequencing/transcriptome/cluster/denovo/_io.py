@@ -113,7 +113,13 @@ def _write_counts_tsv(
     sid = feature_quant.column("sample_id").to_numpy(zero_copy_only=False)
     cnt = feature_quant.column("count").to_numpy(zero_copy_only=False)
     clusters = sorted(set(int(c) for c in cid))
-    samples = sorted(set(int(s) for s in sid))
+    # Union with the persisted sample registry, not just what was
+    # observed. A sample whose reads all failed to survive into a
+    # cluster has no feature_quant row, and deriving the columns from
+    # that table alone silently dropped it — making the matrix schema
+    # depend on the counts it contains. An all-zero column is the
+    # correct answer and keeps downstream comparisons aligned.
+    samples = sorted(set(int(s) for s in sid) | {int(s) for s in name_map})
     row_of = {c: i for i, c in enumerate(clusters)}
     col_of = {s: i for i, s in enumerate(samples)}
     mat = np.zeros((len(clusters), len(samples)), dtype=np.int64)

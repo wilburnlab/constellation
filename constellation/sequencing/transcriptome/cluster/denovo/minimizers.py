@@ -135,6 +135,29 @@ def _block_minimizers(
         return empty_i, empty_i, torch.empty(0, dtype=torch.int32)
     sel_idx = min_pos_idx[usable]
     sel_hash = win_min[usable]
+    # Per-sequence rescue. `wsize` is sized on the whole concatenated
+    # block, so a sequence with fewer than w valid k-mers has every
+    # w-wide window touching it straddle a sequence boundary — rejected
+    # by same_seq, leaving it with NO minimizers and therefore unable to
+    # pair with anything however identical. Such a sequence's own
+    # window is its full k-mer run, whose minimizer is simply its
+    # minimum, so recover exactly that.
+    covered = torch.zeros(int(seq_id.max()) + 1, dtype=torch.bool) if n_pos else None
+    if covered is not None and sel_idx.numel():
+        covered[seq_id[sel_idx]] = True
+    if covered is not None and not bool(covered.all()):
+        missing = torch.nonzero(~covered, as_tuple=False).flatten()
+        extra_idx = []
+        for sidv in missing.tolist():
+            mask = (seq_id == sidv) & valid
+            if not bool(mask.any()):
+                continue
+            pos = torch.nonzero(mask, as_tuple=False).flatten()
+            extra_idx.append(int(pos[int(torch.argmin(canon_hash[pos]))]))
+        if extra_idx:
+            extra = torch.tensor(extra_idx, dtype=torch.int64)
+            sel_idx = torch.cat([sel_idx, extra])
+            sel_hash = torch.cat([sel_hash, canon_hash[extra]])
     sel_uniq = seq_id[sel_idx] + uniq_offset
     sel_pos = pos_in_seq[sel_idx]
     # Dedup distinct (uniq, pos): adjacent windows repeatedly select the

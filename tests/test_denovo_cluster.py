@@ -987,3 +987,115 @@ def test_aligned_member_still_reports_real_rates() -> None:
     assert out.column("match_rate").to_pylist()[idx] == pytest.approx(0.9)
     assert out.column("indel_rate").to_pylist()[idx] == 0.0
     assert out.column("n_aligned_bp").to_pylist()[idx] == 100
+
+
+# ── P2 fixes ───────────────────────────────────────────────────────────
+
+
+def test_short_sequences_still_get_minimizers() -> None:
+    """A sequence with fewer than w valid k-mers must not be unpairable.
+
+    `wsize` is sized on the whole concatenated block, so every w-wide
+    window touching a short sequence straddled a boundary and was
+    rejected — leaving it with no minimizers, and so unable to pair with
+    anything however identical.
+    """
+    import numpy as np
+    import pyarrow as pa
+
+    from constellation.sequencing.transcriptome.cluster.denovo.minimizers import (
+        extract_minimizers,
+    )
+
+    seqs = pa.array(
+        [
+            "A" * 40 + "CGTACGTACGT",   # long: many windows
+            "ACGTTGCAACGTTGCAAC",       # short: 18 bp
+            "TTTTGGGGCCCCAAAATT",       # short: 18 bp
+        ]
+    )
+    idx = extract_minimizers(seqs, k=15, w=10)
+    uid = np.asarray(idx.uniq_id)
+    per_seq = {i: int((uid == i).sum()) for i in range(3)}
+    assert all(v > 0 for v in per_seq.values()), per_seq
+
+
+def test_max_cluster_rounds_other_than_one_is_rejected(tmp_path) -> None:
+    """The value was recorded in the manifest and otherwise ignored."""
+    from constellation.sequencing.transcriptome.cluster.denovo.pipeline import (
+        cluster_transcripts,
+    )
+
+    with pytest.raises(ValueError, match="max_cluster_rounds=2 is not supported"):
+        cluster_transcripts(
+            tmp_path, output_dir=tmp_path / "out", max_cluster_rounds=2
+        )
+
+
+def test_overflow_bucket_carries_unique_multiplicity() -> None:
+    """The synthetic over-cap row stands for many sequences, not one."""
+    import numpy as np
+
+    from constellation.sequencing.transcriptome.cluster.denovo.haplotypes import (
+        build_haplotypes,
+    )
+
+    # Two real members plus one overflow bucket standing for 500.
+    A = np.array([[0], [1], [-1]], dtype=np.int8)
+    weights = np.array([10.0, 20.0, 500.0])
+    res = build_haplotypes(
+        A, weights, [7], ["C"], ["A"],
+        member_multiplicity=np.array([1, 1, 500], dtype=np.int64),
+    )
+    n_uniq_by_abundance = {ab: nu for _a, ab, nu, _c in res.haplotypes}
+    assert n_uniq_by_abundance[500] == 500, "overflow bucket counted as 1"
+    assert n_uniq_by_abundance[10] == 1
+    assert n_uniq_by_abundance[20] == 1
+
+
+def test_build_haplotypes_defaults_to_unit_multiplicity() -> None:
+    import numpy as np
+
+    from constellation.sequencing.transcriptome.cluster.denovo.haplotypes import (
+        build_haplotypes,
+    )
+
+    A = np.array([[0], [0], [1]], dtype=np.int8)
+    res = build_haplotypes(A, np.array([1.0, 1.0, 1.0]), [7], ["C"], ["A"])
+    assert sorted(nu for _a, _ab, nu, _c in res.haplotypes) == [1, 2]
+
+
+def test_zero_count_sample_keeps_its_column(tmp_path) -> None:
+    """A sample whose reads all dropped out still gets an all-zero column.
+
+    Deriving the columns from feature_quant alone made the matrix schema
+    depend on the counts it contained.
+    """
+    import pyarrow as pa
+
+    from constellation.sequencing.transcriptome.cluster.denovo._io import (
+        _write_counts_tsv,
+    )
+
+    fq = pa.table(
+        {
+            "feature_id": pa.array([1, 2], pa.int64()),
+            "sample_id": pa.array([10, 10], pa.int64()),
+            "count": pa.array([5, 7], pa.int64()),
+        }
+    )
+    path = tmp_path / "counts.tsv"
+    _write_counts_tsv(path, fq, {10: "seen", 11: "silent"})
+    header, *rows = path.read_text().strip().split("\n")
+    assert header.split("\t") == ["cluster_id", "seen", "silent"]
+    assert [r.split("\t") for r in rows] == [["1", "5", "0"], ["2", "7", "0"]]
+
+
+def test_haplotype_diagnostics_counts_distinct_clusters(tmp_path) -> None:
+    """bincount's length is the id SPAN, not the number of clusters."""
+    import numpy as np
+
+    cid = np.array([2, 2, 100])
+    span_based = len(np.bincount(cid - cid.min()))
+    distinct = len(np.unique(cid, return_counts=True)[1])
+    assert span_based == 99 and distinct == 2

@@ -251,10 +251,13 @@ def _assign_haplotypes(
     if nonc.shape[0] > _HAPLOTYPE_ASSIGN_MAX:
         order = np.argsort(-abund[nonc], kind="stable")
         assign = nonc[order[:_HAPLOTYPE_ASSIGN_MAX]]
-        overflow_w = float(abund[nonc[order[_HAPLOTYPE_ASSIGN_MAX:]]].sum())
+        overflow = nonc[order[_HAPLOTYPE_ASSIGN_MAX:]]
+        overflow_w = float(abund[overflow].sum())
+        overflow_n = int(overflow.shape[0])
     else:
         assign = nonc
         overflow_w = 0.0
+        overflow_n = 0
 
     for m in assign:
         m = int(m)
@@ -288,9 +291,14 @@ def _assign_haplotypes(
         )
         weights.append(float(abund[m]))
 
+    # One synthetic row stands for every over-cap member, so it must
+    # carry BOTH their summed abundance and how many unique sequences it
+    # represents — otherwise n_unique_sequences counts it as 1.
+    multiplicity = [1] * len(rows)
     if overflow_w > 0.0:
         rows.append(np.full(V, -1, dtype=np.int8))
         weights.append(overflow_w)
+        multiplicity.append(overflow_n)
 
     A = np.array(rows, dtype=np.int8)
     member_weights = np.asarray(weights, dtype=np.float64)
@@ -300,6 +308,7 @@ def _assign_haplotypes(
         [int(x) for x in var_cons],
         [r[2] for r in sub],
         [r[1] for r in sub],
+        member_multiplicity=np.asarray(multiplicity, dtype=np.int64),
     )
 
 
@@ -343,6 +352,17 @@ def _cluster_chunk(
             top = nonc[np.argsort(-abund[nonc], kind="stable")[:_CONSENSUS_MAX_MEMBERS]]
         else:
             top = nonc
+        # The consensus-voting cap must not also cap the opt-in alignment
+        # artifact: --emit-alignments promises one row per unique member,
+        # and the high-diversity / chained clusters that overflow the cap
+        # are exactly the ones whose pileup needs inspecting. Walk every
+        # member when it is on; only the capped `top` votes in the PWM.
+        if emit_alignments and nonc.shape[0] > top.shape[0]:
+            walk = nonc
+            votes = set(int(x) for x in top)
+        else:
+            walk = top
+            votes = None
         if emit_alignments:
             # Centroid self-row: the consensus frame is anchored on it.
             lc = int(seqlen[c])
@@ -351,7 +371,7 @@ def _cluster_chunk(
             )
         specs: list[MemberSpec] = []
         spec_by_uniq: dict[int, MemberSpec] = {}
-        for m in top:
+        for m in walk:
             m = int(m)
             al = _member_alignment(c, m)
             if al is None:
@@ -375,7 +395,11 @@ def _cluster_chunk(
             metric_out.append((m, nm, nx, ni, nd, oh5, oh3, m_is_long))
             len_short = int(seqlen[s])
             edit = nx + ni + nd
-            in_cons = len_short > 0 and (edit / len_short) <= consensus_gate
+            in_cons = (
+                len_short > 0
+                and (edit / len_short) <= consensus_gate
+                and (votes is None or int(m) in votes)
+            )
             if in_cons:
                 spec = MemberSpec(
                     member_seq=seqs[m],
@@ -1085,6 +1109,17 @@ def cluster_transcripts(
     so the last line survives even a native-library abort); ``progress_cb``,
     if given, additionally receives a ``ProgressEvent`` per stage.
     """
+    if max_cluster_rounds != 1:
+        # Only the first round is implemented — the value was copied into
+        # the manifest and otherwise ignored, so `--max-cluster-rounds 2`
+        # ran ONE round while recording 2: inaccurate provenance plus a
+        # silent denial of the consensus-anchored refinement asked for.
+        raise ValueError(
+            f"max_cluster_rounds={max_cluster_rounds} is not supported; only "
+            f"a single round is implemented, so pass 1 (the default). "
+            f"Consensus-anchored refinement rounds are Phase 4 work."
+        )
+
     from constellation.sequencing.transcriptome.cluster.denovo._io import (
         load_demux_windows,
         write_outputs,

@@ -3262,19 +3262,34 @@ def _cmd_transcriptome_diagnose(args: argparse.Namespace) -> int:
             rc = 1
 
     if args.cluster_dir:
-        from constellation.sequencing.transcriptome.cluster.diagnostics import (
-            build_cluster_diagnostics_report,
-        )
         cluster_dir = Path(args.cluster_dir).expanduser().resolve()
         if not cluster_dir.is_dir():
             print(f"error: --cluster-dir not found: {cluster_dir}", file=sys.stderr)
             return 1
+        # A de-novo cluster dir has no reference, no gene spans, no
+        # drift filter and no intron chains, so the genome-guided
+        # builder produces a report of failures and irrelevant stubs —
+        # and, since this command exists to recover a failed automatic
+        # report, it failed exactly where it was needed. Dispatch on
+        # what the directory actually contains.
+        is_denovo = (cluster_dir / "cluster_variants.parquet").is_file()
         try:
-            report_path = build_cluster_diagnostics_report(
-                cluster_dir,
-                reference=reference,
-                annotation=annotation,
-            )
+            if is_denovo:
+                from constellation.sequencing.transcriptome.cluster.denovo.diagnostics import (  # noqa: E501
+                    build_denovo_diagnostics_report,
+                )
+
+                report_path = build_denovo_diagnostics_report(cluster_dir)
+            else:
+                from constellation.sequencing.transcriptome.cluster.diagnostics import (  # noqa: E501
+                    build_cluster_diagnostics_report,
+                )
+
+                report_path = build_cluster_diagnostics_report(
+                    cluster_dir,
+                    reference=reference,
+                    annotation=annotation,
+                )
             print(f"cluster report: {report_path}", flush=True)
         except Exception as exc:
             print(

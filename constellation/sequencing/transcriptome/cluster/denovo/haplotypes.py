@@ -82,6 +82,7 @@ def build_haplotypes(
     var_consensus_positions: list[int],
     minor_alleles: list[str],
     consensus_alleles: list[str],
+    member_multiplicity: np.ndarray | None = None,
 ) -> HaplotypeResult:
     """Collapse a member × variant-position allele matrix ``A`` to distinct
     haplotypes + compute variant covariance.
@@ -89,6 +90,15 @@ def build_haplotypes(
     ``A[i, v]`` is member ``i``'s allele (0-3 ACGT, 4 gap, -1 uncovered) at
     variant column ``v``; ``member_weights[i]`` is its read multiplicity.
     ``var_consensus_positions`` label the columns in the output.
+
+    ``member_multiplicity[i]`` is how many UNIQUE sequences row ``i``
+    stands for — 1 for a real member, but larger for the synthetic
+    overflow row that folds every member beyond the assignment cap into
+    a single all-uncovered bucket. Counting matrix rows alone made that
+    bucket contribute 1 no matter how many sequences it represented, so
+    ``n_unique_sequences`` understated deep clusters (and understated
+    them further when the bucket merged with other uncovered rows).
+    Defaults to all-ones.
     """
     M, V = A.shape
     if V == 0 or M == 0:
@@ -101,7 +111,11 @@ def build_haplotypes(
     inverse = inverse.ravel()
     hap_abund = np.zeros(uniq_rows.shape[0], dtype=np.int64)
     np.add.at(hap_abund, inverse, member_weights.astype(np.int64))
-    hap_nuniq = counts.astype(np.int64)
+    if member_multiplicity is None:
+        hap_nuniq = counts.astype(np.int64)
+    else:
+        hap_nuniq = np.zeros(uniq_rows.shape[0], dtype=np.int64)
+        np.add.at(hap_nuniq, inverse, np.asarray(member_multiplicity, dtype=np.int64))
     sort_h = np.argsort(-hap_abund)
 
     haplotypes: list[tuple[str, int, int, bool]] = []
