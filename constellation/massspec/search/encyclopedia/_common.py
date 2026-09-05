@@ -263,10 +263,16 @@ def build_manifest_envelope(
           "outputs": {"elib": ..., "library_pqdir": ..., ...},
           "runtime": {"elapsed_seconds", "returncode", "host",
                       "platform", "python"},
-          "ingest": {"skipped", "fragment_tolerance_ppm",
-                     "library_counts", ...},
-          "encyclopedia_passthrough_args": [...]
+          "ingest": {"skipped", "counts", ...},
+          "encyclopedia_passthrough_args": [...],
+          "search_params": {"precursor_tolerance",
+                            "precursor_tolerance_unit", ...}
         }
+
+    ``search_params`` arrives via ``extras`` from the ``massspec search``
+    handler; it records the tolerances in the user-facing spelling
+    (``Da``), whereas ``argv.java`` carries the jar's own token
+    (``AMU``).
     """
     runtime_envelope: dict[str, Any] = {
         "host": socket.gethostname(),

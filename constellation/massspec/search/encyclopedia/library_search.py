@@ -22,6 +22,20 @@ Full flag surface lives in
 wraps the headline params + the common Percolator / tolerance knobs;
 the escape-hatch ``--encyclopedia-arg FLAG=VALUE`` passthrough covers
 everything else without code changes.
+
+Three independent tolerances are wrapped, each as a value + unit pair
+(see :data:`_ENCYCLOPEDIA_UNITS` for the ``Da`` → ``AMU`` translation):
+
+  * ``-ptol`` — precursor window.
+  * ``-ftol`` — window applied to the **acquired** spectrum.
+  * ``-lftol`` — window applied to the **library** peak list. The jar's
+    ``DotProduct.getIndividualPeakScores`` consults both this and
+    ``-ftol``, so they are deliberately NOT coupled: against a
+    *predicted* library the library m/z are exact theoretical values and
+    want a tight ppm window even when the acquired data is ion-trap and
+    ``-ftol`` is widened to ~0.8 Da. Only widen ``-lftol`` when searching
+    a *measured* chromatogram ``.elib`` whose peaks carry the
+    instrument's own mass error.
 """
 
 from __future__ import annotations
@@ -32,14 +46,48 @@ from pathlib import Path
 from constellation.thirdparty.jvm import JvmResult, run_jar
 
 
+#: User-facing tolerance unit → the token EncyclopeDIA's
+#: ``MassErrorUnitType`` enum accepts. The jar spells Daltons ``AMU`` and
+#: hard-errors on the literal ``Da`` ("Error parsing fragment mass error
+#: unit type from [Da]"), so the translation is load-bearing rather than
+#: cosmetic — ``Da`` is the spelling the rest of Constellation uses
+#: (``massspec chromatogram extract``, ``peptide.match.match_mz``).
+#:
+#: The enum's third member, ``RESOLUTION``, is deliberately not exposed:
+#: it is ``PPM`` re-parameterized by resolving power (the jar stores
+#: ``ppmTolerance = 500000 / value``, i.e. a window half-width of
+#: ``mass / (2 * R)``), so it adds no capability. Callers who want it can
+#: reach it through the ``--encyclopedia-arg`` passthrough.
+_ENCYCLOPEDIA_UNITS = {"ppm": "PPM", "da": "AMU"}
+
+
+def _unit_token(unit: str) -> str:
+    """Translate a user-facing tolerance unit to EncyclopeDIA's token.
+
+    Case-insensitive (the jar matches its enum with
+    ``equalsIgnoreCase``). Raises ``ValueError`` naming the accepted
+    values rather than letting an unknown unit reach the JVM, where it
+    surfaces as a stack trace after the process has already started.
+    """
+    token = _ENCYCLOPEDIA_UNITS.get(str(unit).strip().lower())
+    if token is None:
+        accepted = ", ".join(sorted(_ENCYCLOPEDIA_UNITS))
+        raise ValueError(f"tolerance unit must be one of {accepted}; got {unit!r}")
+    return token
+
+
 def build_library_search_args(
     *,
     input_file: Path,
     library: Path,
     fasta: Path | None = None,
     report_output: Path | None = None,
-    fragment_tolerance_ppm: float | None = None,
-    precursor_tolerance_ppm: float | None = None,
+    precursor_tolerance: float | None = None,
+    precursor_tolerance_unit: str = "ppm",
+    fragment_tolerance: float | None = None,
+    fragment_tolerance_unit: str = "ppm",
+    library_fragment_tolerance: float | None = None,
+    library_fragment_tolerance_unit: str = "ppm",
     acquisition: str | None = None,
     enzyme: str | None = None,
     fragmentation: str | None = None,
@@ -66,10 +114,33 @@ def build_library_search_args(
         args.extend(["-f", str(fasta)])
     if report_output is not None:
         args.extend(["-o", str(report_output)])
-    if fragment_tolerance_ppm is not None:
-        args.extend(["-ftol", str(float(fragment_tolerance_ppm)), "-ftolunits", "ppm"])
-    if precursor_tolerance_ppm is not None:
-        args.extend(["-ptol", str(float(precursor_tolerance_ppm)), "-ptolunits", "ppm"])
+    if precursor_tolerance is not None:
+        args.extend(
+            [
+                "-ptol",
+                str(float(precursor_tolerance)),
+                "-ptolunits",
+                _unit_token(precursor_tolerance_unit),
+            ]
+        )
+    if fragment_tolerance is not None:
+        args.extend(
+            [
+                "-ftol",
+                str(float(fragment_tolerance)),
+                "-ftolunits",
+                _unit_token(fragment_tolerance_unit),
+            ]
+        )
+    if library_fragment_tolerance is not None:
+        args.extend(
+            [
+                "-lftol",
+                str(float(library_fragment_tolerance)),
+                "-lftolunits",
+                _unit_token(library_fragment_tolerance_unit),
+            ]
+        )
     if acquisition is not None:
         args.extend(["-acquisition", str(acquisition)])
     if enzyme is not None:
@@ -97,8 +168,12 @@ def run_library_search(
     fasta: Path | None = None,
     report_output: Path | None = None,
     output_dir: Path,
-    fragment_tolerance_ppm: float | None = None,
-    precursor_tolerance_ppm: float | None = None,
+    precursor_tolerance: float | None = None,
+    precursor_tolerance_unit: str = "ppm",
+    fragment_tolerance: float | None = None,
+    fragment_tolerance_unit: str = "ppm",
+    library_fragment_tolerance: float | None = None,
+    library_fragment_tolerance_unit: str = "ppm",
     acquisition: str | None = None,
     enzyme: str | None = None,
     fragmentation: str | None = None,
@@ -116,10 +191,16 @@ def run_library_search(
     """Run an EncyclopeDIA DIA library search.
 
     Required: ``input_file`` (.mzML / .dia / .raw / .d), ``library``
-    (.dlib chromatogram-free or .elib chromatogram-library). Optional
-    ``fasta`` is the background proteome — required by some scoring
-    pathways but not by the default chromatogram-library search when
-    the library already carries decoys.
+    (.dlib chromatogram-free or .elib chromatogram-library), and
+    ``fasta`` (the background proteome).
+
+    ``fasta`` is typed as optional here only because
+    :func:`build_library_search_args` is a general argv builder, but
+    EncyclopeDIA 6.5.15's default search **aborts** without ``-f`` —
+    "You are required to specify an input file (-i), a library file
+    (-l), and a fasta file (-f)" — even when the library already carries
+    decoys. Older versions did not. The CLI marks ``--fasta`` required
+    so this surfaces at parse time rather than as a jar exit code.
 
     The chromatogram ``.elib`` output is written alongside the input
     file by EncyclopeDIA's convention. Locating it post-run is the
@@ -136,8 +217,12 @@ def run_library_search(
         library=library,
         fasta=fasta,
         report_output=report_output,
-        fragment_tolerance_ppm=fragment_tolerance_ppm,
-        precursor_tolerance_ppm=precursor_tolerance_ppm,
+        precursor_tolerance=precursor_tolerance,
+        precursor_tolerance_unit=precursor_tolerance_unit,
+        fragment_tolerance=fragment_tolerance,
+        fragment_tolerance_unit=fragment_tolerance_unit,
+        library_fragment_tolerance=library_fragment_tolerance,
+        library_fragment_tolerance_unit=library_fragment_tolerance_unit,
         acquisition=acquisition,
         enzyme=enzyme,
         fragmentation=fragmentation,
