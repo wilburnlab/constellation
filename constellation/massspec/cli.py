@@ -390,24 +390,7 @@ def _build_search_parser(subs: argparse._SubParsersAction) -> None:
             "after the jar exits"
         ),
     )
-    p.add_argument(
-        "--fragment-tolerance-ppm",
-        type=float,
-        default=None,
-        help=(
-            "EncyclopeDIA -ftol value (ppm). Default: jar's built-in "
-            "default (10 ppm in 6.5.15)."
-        ),
-    )
-    p.add_argument(
-        "--precursor-tolerance-ppm",
-        type=float,
-        default=None,
-        help=(
-            "EncyclopeDIA -ptol value (ppm). Default: jar's built-in "
-            "default (10 ppm in 6.5.15)."
-        ),
-    )
+    _add_tolerance_args(p)
     p.add_argument(
         "--acquisition",
         default=None,
@@ -481,15 +464,15 @@ def _add_input_args_for_search(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--fasta",
-        required=False,
-        default=None,
+        required=True,
         type=Path,
         help=(
-            "background proteome FASTA (optional). Used for decoy "
-            "generation when the library lacks decoys. EncyclopeDIA's "
-            "default search does not require it when the library "
-            "already contains decoys (e.g. predict-library output "
-            "with -addDecoys true), but providing it never hurts."
+            "background proteome FASTA. REQUIRED — EncyclopeDIA 6.5.15's "
+            "default search refuses to start without -f ('You are "
+            "required to specify an input file (-i), a library file (-l), "
+            "and a fasta file (-f)'), even when the library already "
+            "carries decoys. Older versions treated it as optional. Use "
+            "the same FASTA the library was built from."
         ),
     )
 
@@ -1031,6 +1014,105 @@ def _add_output_dir_arg(p: argparse.ArgumentParser) -> None:
     )
 
 
+#: The three EncyclopeDIA search tolerances, as
+#: ``(flag-stem, dest-stem, jar-flag, help-tail)``. Shared by
+#: :func:`_add_tolerance_args` and :func:`_resolve_tolerance_args` so the
+#: flag surface and the validation can't drift apart.
+_TOLERANCES = (
+    (
+        "precursor-tolerance",
+        "precursor_tolerance",
+        "-ptol",
+        "precursor m/z window",
+    ),
+    (
+        "fragment-tolerance",
+        "fragment_tolerance",
+        "-ftol",
+        "window applied to the acquired spectrum's fragment peaks",
+    ),
+    (
+        "library-fragment-tolerance",
+        "library_fragment_tolerance",
+        "-lftol",
+        (
+            "window applied to the LIBRARY's fragment peaks. Independent of "
+            "--fragment-tolerance on purpose: a predicted library's m/z are "
+            "exact theoretical values and want a tight ppm window even when "
+            "the acquired data is ion-trap. Widen this only when searching a "
+            "measured chromatogram .elib whose peaks carry the instrument's "
+            "own mass error"
+        ),
+    ),
+)
+
+
+def _add_tolerance_args(p: argparse.ArgumentParser, *, default: float | None = None) -> None:
+    """Add the value + unit flag pair for each EncyclopeDIA tolerance.
+
+    ``default`` is the shared default for the *value* flags — ``None``
+    (``massspec search``) omits the flag entirely so the jar's built-in
+    10 ppm applies; ``transcriptome-to-proteome`` passes ``10.0`` to
+    preserve its pipeline's explicit defaults.
+    """
+    default_note = (
+        f"default {default}, in the unit given by the paired --*-unit flag"
+        if default is not None
+        else "default: jar's built-in 10 ppm"
+    )
+    for flag, dest, jar_flag, tail in _TOLERANCES:
+        p.add_argument(
+            f"--{flag}",
+            type=float,
+            default=default,
+            help=f"EncyclopeDIA {jar_flag} value — {tail} ({default_note}).",
+        )
+        p.add_argument(
+            f"--{flag}-unit",
+            choices=["ppm", "Da"],
+            default="ppm",
+            help=(
+                f"unit for --{flag} (default: %(default)s). 'Da' is sent to "
+                f"the jar as its 'AMU' token — use it for ion-trap data, "
+                f"where the window is absolute rather than mass-proportional."
+            ),
+        )
+
+
+def _resolve_tolerance_args(args: argparse.Namespace) -> dict[str, object]:
+    """Validate the tolerance flags and project them onto runner kwargs.
+
+    Guards the one real footgun: because the unit defaults to ``ppm``, a
+    bare ``--fragment-tolerance-unit Da`` with no matching value flag is
+    a silent no-op. That combination is always a mistake, so error on it.
+    """
+    resolved: dict[str, object] = {}
+    for flag, dest, _jar_flag, _tail in _TOLERANCES:
+        value = getattr(args, dest, None)
+        unit = getattr(args, f"{dest}_unit", "ppm")
+        if value is None and unit != "ppm":
+            raise ValueError(
+                f"--{flag}-unit {unit} was given without --{flag}; the unit "
+                f"alone has no effect. Pass a value, or drop the unit flag."
+            )
+        resolved[dest] = value
+        resolved[f"{dest}_unit"] = unit
+    return resolved
+
+
+def _format_tolerance_summary(resolved: dict[str, object]) -> str:
+    """One-line human summary of the resolved tolerances, for stderr."""
+    parts = []
+    for flag, dest, _jar_flag, _tail in _TOLERANCES:
+        value = resolved[dest]
+        label = flag.removesuffix("-tolerance")
+        if value is None:
+            parts.append(f"{label} jar-default")
+        else:
+            parts.append(f"{label} {value} {resolved[f'{dest}_unit']}")
+    return "search tolerances: " + ", ".join(parts)
+
+
 _JVM_HEAP_RE = re.compile(r"^\d+[kKmMgGtT]$")
 
 
@@ -1187,6 +1269,13 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
 
     extra_args = encyclopedia_passthrough_args(args.encyclopedia_arg)
 
+    try:
+        tolerances = _resolve_tolerance_args(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=_sys.stderr)
+        return 1
+    print(_format_tolerance_summary(tolerances), file=_sys.stderr)
+
     # Report file lands in output_dir; the .elib itself lands beside the input
     # (EncyclopeDIA convention — not redirectable via -o for default search).
     report_path = output_dir / f"{input_file.stem}.encyclopedia.txt"
@@ -1198,8 +1287,7 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
             fasta=fasta,
             report_output=report_path,
             output_dir=output_dir,
-            fragment_tolerance_ppm=args.fragment_tolerance_ppm,
-            precursor_tolerance_ppm=args.precursor_tolerance_ppm,
+            **tolerances,
             acquisition=args.acquisition,
             enzyme=args.enzyme,
             fragmentation=args.fragmentation,
@@ -1255,6 +1343,7 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
                 quant_pqdir=None,
                 search_pqdir=None,
                 extra_args=extra_args,
+                tolerances=tolerances,
                 build_manifest_envelope=build_manifest_envelope,
                 write_manifest=write_manifest,
                 constellation_version=constellation_version,
@@ -1310,6 +1399,7 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
         quant_pqdir=quant_pqdir,
         search_pqdir=search_pqdir,
         extra_args=extra_args,
+        tolerances=tolerances,
         build_manifest_envelope=build_manifest_envelope,
         write_manifest=write_manifest,
         constellation_version=constellation_version,
@@ -1349,6 +1439,7 @@ def _write_manifest_for_search(
     quant_pqdir: Path | None,
     search_pqdir: Path | None,
     extra_args: list[str],
+    tolerances: dict[str, object],
     build_manifest_envelope,
     write_manifest,
     constellation_version: str,
@@ -1393,6 +1484,10 @@ def _write_manifest_for_search(
         },
         ingest=ingest_info,
         encyclopedia_passthrough_args=extra_args,
+        # `extras` is a named parameter, NOT **kwargs — passing
+        # `search_params=` directly is a TypeError that only surfaces
+        # after the jar has already run to completion.
+        extras={"search_params": tolerances},
     )
     write_manifest(output_dir / "manifest.json", manifest)
 
@@ -1713,12 +1808,31 @@ def _cmd_massspec_process_dia(args: argparse.Namespace) -> int:
         print(f"  see {exc.stderr_log} for the full log", file=_sys.stderr)
         return exc.returncode
 
+    # run_process_dia relocates the jar-named single-input cache onto
+    # output_dia, so by this point --output-dia means the same thing
+    # regardless of input count.
     if not output_dia.is_file():
         print(
             f"error: encyclopedia exited 0 but the expected .DIA was not "
             f"produced at {output_dia}; check {result.stderr_log}",
             file=_sys.stderr,
         )
+        if len(inputs) == 1:
+            # Single input ignores -o, so the file lands by convention.
+            # Name every place we looked — otherwise diagnosing a new
+            # convention means another round-trip to the cluster.
+            print(
+                "  single-input mode: the jar chooses the output path "
+                "itself. Looked for it at:",
+                file=_sys.stderr,
+            )
+            for cand in (
+                output_dir / f"{inputs[0].stem}.dia",
+                output_dir / f"{inputs[0].name}.dia",
+                inputs[0].with_suffix(".dia"),
+                inputs[0].parent / f"{inputs[0].name}.dia",
+            ):
+                print(f"    {cand}", file=_sys.stderr)
         return 2
 
     # Manifest captures inputs (with SHA256s) + jar + JVM + runtime.

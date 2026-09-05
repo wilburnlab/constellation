@@ -64,6 +64,7 @@ from constellation.massspec.search.encyclopedia.predict_library import (
 from constellation.massspec.search.encyclopedia.process_dia import (
     build_process_dia_args,
     run_process_dia,
+    single_input_dia_path,
 )
 
 __all__ = [
@@ -86,6 +87,7 @@ __all__ = [
     "run_library_search",
     "run_predict_library",
     "run_process_dia",
+    "single_input_dia_path",
     "sha256_file",
     "write_manifest",
 ]

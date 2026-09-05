@@ -57,10 +57,13 @@ def test_all_four_subcommands_register() -> None:
 @pytest.mark.parametrize(
     "subcommand, required_args",
     [
-        # --fasta is optional for search per EncyclopeDIA 6.5.15 — the
-        # default-mode library search doesn't require it when the
-        # library already carries decoys (e.g. predict-library output).
-        ("search", {"--mzml", "--library", "--output-dir"}),
+        # --fasta IS required for search: 6.5.15's default-mode library
+        # search aborts with "You are required to specify an input file
+        # (-i), a library file (-l), and a fasta file (-f)" even when the
+        # library already carries decoys. Verified against the real jar;
+        # older versions treated -f as optional, which is what this
+        # parser (and its help text) used to claim.
+        ("search", {"--mzml", "--library", "--fasta", "--output-dir"}),
         ("predict-library", {"--fasta", "--output-dlib", "--output-dir"}),
         ("process-dia", {"--inputs", "--output-dia", "--output-dir"}),
         (
