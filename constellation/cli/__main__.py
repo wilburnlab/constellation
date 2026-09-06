@@ -465,6 +465,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     # Taxonomy + catalog rows — surface bundled vs fetched + per-source counts.
     rows.append(_doctor_taxonomy_row())
     rows.append(_doctor_catalogs_row())
+    rows.append(_doctor_koina_row())
 
     if not rows:
         print("no third-party tools or frontend bundles registered")
@@ -526,6 +527,34 @@ def _doctor_frontend_rows() -> list[tuple[str, str, str, str]]:
                 )
             )
     return rows
+
+
+def _doctor_koina_row() -> tuple[str, str, str, str]:
+    """Report local readiness for the Koina prediction backend.
+
+    Deliberately **never touches the network**: `doctor` is run on
+    offline machines and in CI, and a row that hangs on a gRPC connect
+    or reports "down" because the user is on a plane would be worse than
+    useless. It answers only "is koinapy importable, and where would we
+    connect to" — the server itself is probed when a prediction actually
+    runs.
+    """
+    from constellation.massspec.library.koina.client import resolve_server
+
+    server = resolve_server()
+    try:
+        from importlib.metadata import version
+
+        koinapy_version = version("koinapy")
+    except Exception:
+        return (
+            "koina",
+            "missing",
+            "-",
+            f"koinapy not installed (pip install 'constellation-bio[ms]'); "
+            f"would use {server}",
+        )
+    return ("koina", "ok", koinapy_version, server)
 
 
 def _doctor_reference_cache_row() -> tuple[str, str, str, str]:
@@ -734,7 +763,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # the underlying modules are ported.
     for name, summary in [
         ("mzpeak", "Convert raw MS files to Parquet-backed mzpeak (TODO)"),
-        ("koina", "Build spectral libraries via Koina (TODO)"),
+        # `koina` is deliberately absent: Koina prediction ships as
+        # `massspec predict-library --backend koina`, beside the
+        # EncyclopeDIA backend it shares an argument surface with. A
+        # second top-level entry point would drift from it.
         ("pod5", "Ingest POD5 signal to Parquet (TODO)"),
         ("structure", "Prepare structures for MD (TODO)"),
         # `basecall` is now top-level (real); `assemble` / `scaffold` /
@@ -1184,10 +1216,12 @@ def _build_transcriptome_parser(subs) -> None:
     )
     p_cluster.add_argument(
         "--align-dir",
-        required=True,
+        required=False,
+        default=None,
         help=(
             "directory produced by `transcriptome align` "
-            "(must contain alignments/ + alignment_blocks/ + introns.parquet)."
+            "(must contain alignments/ + alignment_blocks/ + introns.parquet). "
+            "Required for --mode genome-guided; ignored for --mode de-novo."
         ),
     )
     p_cluster.add_argument(
@@ -1222,12 +1256,120 @@ def _build_transcriptome_parser(subs) -> None:
     )
     p_cluster.add_argument(
         "--mode",
-        choices=("genome-guided",),
+        choices=("genome-guided", "de-novo"),
         default="genome-guided",
         help=(
-            "clustering mode (Phase 2 ships only genome-guided; Phase 3 "
-            "adds de-novo; Phase 4 adds validate)."
+            "clustering mode. genome-guided (Phase 2) keys on splicing "
+            "topology against a reference; de-novo (Phase 3) is reference-"
+            "free minimizer + edit-distance assembly of the demux windows."
         ),
+    )
+    # ── de-novo (--mode de-novo) flags ──────────────────────────────
+    p_cluster.add_argument(
+        "--identity",
+        type=float,
+        default=0.98,
+        help=(
+            "de-novo: minimum pairwise sequence identity for two reads to "
+            "share a cluster edge (edit_distance / shorter_len ≤ 1-identity). "
+            "Note this is read-to-read: two reads each ~1%% from the true "
+            "transcript are ~2%% apart, so ~0.96-0.97 reduces tail "
+            "fragmentation for ~1%% error reads. Default 0.98."
+        ),
+    )
+    p_cluster.add_argument(
+        "--max-5p-overhang",
+        type=int,
+        default=30,
+        help="de-novo: max 5' length overhang (bp) to still collapse. Default 30.",
+    )
+    p_cluster.add_argument(
+        "--max-3p-overhang",
+        type=int,
+        default=30,
+        help="de-novo: max 3' length overhang (bp) to still collapse. Default 30.",
+    )
+    p_cluster.add_argument(
+        "--kmer", type=int, default=15, help="de-novo: minimizer k-mer length."
+    )
+    p_cluster.add_argument(
+        "--window", type=int, default=10, help="de-novo: minimizer window size."
+    )
+    p_cluster.add_argument(
+        "--minimizers-per-seq",
+        type=int,
+        default=50,
+        help=(
+            "de-novo: cap each sequence's sketch to its N smallest-hash "
+            "minimizers (bottom-N MinHash). The dominant memory lever at "
+            "scale — lower it (or raise --window) if RAM is tight; 0 = "
+            "uncapped. Default 50."
+        ),
+    )
+    p_cluster.add_argument(
+        "--min-abundance",
+        type=int,
+        default=1,
+        help=(
+            "de-novo: drop a lone singleton cluster whose total read count is "
+            "below this (multi-read clusters always kept). Default 1."
+        ),
+    )
+    p_cluster.add_argument(
+        "--max-cluster-rounds",
+        type=int,
+        default=1,
+        help="de-novo: iterative-refinement rounds (v1 ships round 1). Default 1.",
+    )
+    p_cluster.add_argument(
+        "--error-model",
+        choices=("default", "empirical"),
+        default="default",
+        help="de-novo: variant-confidence error model (Cut 2+). Default 'default'.",
+    )
+    p_cluster.add_argument(
+        "--overdispersion",
+        type=float,
+        default=0.0,
+        help="de-novo: beta-binomial overdispersion ρ for variant SF (Cut 4).",
+    )
+    p_cluster.add_argument(
+        "--predict-orfs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="de-novo: predict ORFs on each consensus (populates proteins.fasta).",
+    )
+    p_cluster.add_argument(
+        "--min-aa-length",
+        type=int,
+        default=60,
+        help="de-novo: minimum predicted-protein length (AA). Default 60.",
+    )
+    p_cluster.add_argument(
+        "--emit-cluster-detail",
+        action="store_true",
+        help=(
+            "de-novo: write per-cluster haplotype-map SVGs + variant TSVs "
+            "(Cut 3; off by default — these are the verbose per-cluster "
+            "printouts)."
+        ),
+    )
+    p_cluster.add_argument(
+        "--emit-alignments",
+        action="store_true",
+        help=(
+            "de-novo: write cluster_alignments.parquet — the per-member CIGAR "
+            "alignments (to each cluster's representative/centroid sequence) "
+            "that built the consensus PWM (for assembly QC: reconstruct a "
+            "pileup, inspect each member's identity / indels / overhangs). "
+            "~one row per unique member; off by default."
+        ),
+    )
+    p_cluster.add_argument(
+        "--detail-top-n",
+        type=int,
+        default=50,
+        help="de-novo: limit --emit-cluster-detail to the top-N clusters by reads.",
     )
     p_cluster.add_argument(
         "--max-5p-drift",
@@ -2365,14 +2507,16 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         read_manifest_dir,
     )
 
-    if args.mode != "genome-guided":  # pragma: no cover — argparse-gated
+    if args.mode == "de-novo":
+        return _cmd_transcriptome_cluster_denovo(args)
+
+    if args.align_dir is None:
         print(
-            f"--mode {args.mode} not yet implemented; only "
-            "genome-guided is wired in this release.",
+            "--mode genome-guided requires --align-dir "
+            "(a `transcriptome align` output dir).",
             file=sys.stderr,
         )
         return 2
-
     align_dir = Path(args.align_dir)
     blocks_success = align_dir / "alignment_blocks" / "_SUCCESS"
     if not blocks_success.exists():
@@ -2950,6 +3094,104 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
+    """Phase 3 — reference-free de novo first-round assembly.
+
+    Collapses the Complete, non-fragment transcript windows from an S1
+    demux dir into clusters via minimizer sketching + edit-distance
+    verification + connected-components grouping, emitting a consensus +
+    per-sample quant + (optional) predicted protein per cluster.
+    """
+    import sys
+    from pathlib import Path
+
+    from constellation.sequencing.transcriptome.cluster.denovo import (
+        cluster_transcripts,
+    )
+
+    demux_dir = Path(args.demux_dir)
+    if not demux_dir.is_dir():
+        raise FileNotFoundError(f"--demux-dir not found: {demux_dir}")
+    for sub in ("read_demux", "reads"):
+        if not (demux_dir / sub).is_dir():
+            print(
+                f"--demux-dir missing {sub}/: {demux_dir}",
+                file=sys.stderr,
+            )
+            return 2
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    success = output_dir / "_SUCCESS"
+    if success.exists() and not args.resume:
+        print(
+            f"output dir already complete: {output_dir} "
+            "(pass --resume to short-circuit; refusing to overwrite)",
+            file=sys.stderr,
+        )
+        return 1
+    if success.exists() and args.resume:
+        print(f"--resume: output already complete: {output_dir}", flush=True)
+        return 0
+
+    # Optional Samples container (for sample-named count columns).
+    samples = None
+    samples_dir = demux_dir / "samples"
+    if samples_dir.is_dir():
+        try:
+            from constellation.sequencing.samples import load_samples
+
+            samples = load_samples(samples_dir)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"WARNING: could not load samples from {samples_dir}: {exc}; "
+                "count columns will use numeric sample ids.",
+                file=sys.stderr,
+            )
+
+    paths = cluster_transcripts(
+        demux_dir,
+        output_dir=output_dir,
+        identity=float(args.identity),
+        max_5p_overhang=int(args.max_5p_overhang),
+        max_3p_overhang=int(args.max_3p_overhang),
+        kmer=int(args.kmer),
+        window=int(args.window),
+        minimizers_per_seq=(
+            int(args.minimizers_per_seq) if int(args.minimizers_per_seq) > 0 else None
+        ),
+        min_cluster_size=int(args.min_cluster_size),
+        min_abundance=int(args.min_abundance),
+        max_cluster_rounds=int(args.max_cluster_rounds),
+        error_model=str(args.error_model),
+        overdispersion=float(args.overdispersion),
+        predict_orfs=bool(args.predict_orfs),
+        min_aa_length=int(args.min_aa_length),
+        emit_cluster_detail=bool(args.emit_cluster_detail),
+        detail_top_n=int(args.detail_top_n),
+        emit_alignments=bool(args.emit_alignments),
+        threads=int(args.threads),
+        samples=samples,
+        write_fasta=bool(args.write_fasta),
+        report=bool(getattr(args, "report", True)),
+        verbose=bool(args.progress),
+        resume=bool(args.resume),
+    )
+
+    if not args.progress and "report" in paths:
+        print(f"diagnostic report: {paths['report']}", flush=True)
+
+    if not args.progress:
+        import pyarrow.parquet as pq
+
+        n_clusters = pq.read_metadata(paths["clusters"]).num_rows
+        print(
+            f"de-novo cluster done: {n_clusters} clusters → {output_dir}",
+            flush=True,
+        )
+    return 0
+
+
 def _cmd_transcriptome_diagnose(args: argparse.Namespace) -> int:
     """Regenerate diagnostic report(s) for an existing align / cluster dir.
 
@@ -3025,19 +3267,34 @@ def _cmd_transcriptome_diagnose(args: argparse.Namespace) -> int:
             rc = 1
 
     if args.cluster_dir:
-        from constellation.sequencing.transcriptome.cluster.diagnostics import (
-            build_cluster_diagnostics_report,
-        )
         cluster_dir = Path(args.cluster_dir).expanduser().resolve()
         if not cluster_dir.is_dir():
             print(f"error: --cluster-dir not found: {cluster_dir}", file=sys.stderr)
             return 1
+        # A de-novo cluster dir has no reference, no gene spans, no
+        # drift filter and no intron chains, so the genome-guided
+        # builder produces a report of failures and irrelevant stubs —
+        # and, since this command exists to recover a failed automatic
+        # report, it failed exactly where it was needed. Dispatch on
+        # what the directory actually contains.
+        is_denovo = (cluster_dir / "cluster_variants.parquet").is_file()
         try:
-            report_path = build_cluster_diagnostics_report(
-                cluster_dir,
-                reference=reference,
-                annotation=annotation,
-            )
+            if is_denovo:
+                from constellation.sequencing.transcriptome.cluster.denovo.diagnostics import (  # noqa: E501
+                    build_denovo_diagnostics_report,
+                )
+
+                report_path = build_denovo_diagnostics_report(cluster_dir)
+            else:
+                from constellation.sequencing.transcriptome.cluster.diagnostics import (  # noqa: E501
+                    build_cluster_diagnostics_report,
+                )
+
+                report_path = build_cluster_diagnostics_report(
+                    cluster_dir,
+                    reference=reference,
+                    annotation=annotation,
+                )
             print(f"cluster report: {report_path}", flush=True)
         except Exception as exc:
             print(
@@ -5150,8 +5407,13 @@ def main_mzpeak(argv: list[str] | None = None) -> int:
 
 
 def main_koina(argv: list[str] | None = None) -> int:
+    """`koina-library` → `massspec predict-library --backend koina`.
+
+    The console script keeps working; it just forwards to where the
+    implementation actually lives rather than to a placeholder.
+    """
     raw = list(sys.argv[1:] if argv is None else argv)
-    return main(["koina", *raw])
+    return main(["massspec", "predict-library", "--backend", "koina", *raw])
 
 
 if __name__ == "__main__":  # pragma: no cover

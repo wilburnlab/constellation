@@ -17,6 +17,7 @@ from constellation.viz.introspect import (
     load_curated,
     walk_parser,
 )
+from constellation.viz.introspect.walk import load_arg_hints
 
 
 def _commands_by_path(schema, path):
@@ -177,3 +178,92 @@ def test_path_heuristic_recognizes_dest_suffixes():
     genome = _commands_by_path(schema, ["viz", "genome"])
     align_dir = _arg_by_dest(genome, "align_dir")
     assert align_dir["type"] == "path"
+
+
+def test_path_kind_directory_vs_file():
+    """Path args carry a `path_kind` sub-field so the FilePicker opens
+    in the right mode. Directories (``*_dir``) vs files must split."""
+    schema = build_cli_schema(_build_parser())
+    align = _commands_by_path(schema, ["transcriptome", "align"])
+    # Directory dests
+    for dest in ("demux_dir", "output_dir"):
+        arg = _arg_by_dest(align, dest)
+        assert arg["type"] == "path"
+        assert arg["path_kind"] == "dir"
+    # File dest — junc_bed matches the `_bed` suffix (dir-first, file-next)
+    junc = _arg_by_dest(align, "junc_bed")
+    assert junc["type"] == "path"
+    assert junc["path_kind"] == "file"
+
+    demux = _commands_by_path(schema, ["transcriptome", "demultiplex"])
+    samples = _arg_by_dest(demux, "samples")
+    assert samples["type"] == "path"
+    assert samples["path_kind"] == "file"
+
+
+def test_repeatable_path_arg_stays_multi_with_path_kind():
+    """``--reads`` is ``nargs='+'`` so it stays ``type='multi'`` (the
+    textarea), but carries a ``path_kind`` so the frontend can offer a
+    Browse-to-append affordance. The curated overlay marks it 'either'
+    (a run dir or individual BAM/SAM files)."""
+    schema = build_cli_schema(_build_parser())
+    demux = _commands_by_path(schema, ["transcriptome", "demultiplex"])
+    reads = _arg_by_dest(demux, "reads")
+    assert reads["type"] == "multi"
+    assert reads["path_kind"] == "either"
+
+
+def test_reference_handle_is_widget_not_path():
+    """``--reference`` is a cache handle, NOT a filesystem path — it must
+    stay ``type='str'`` (no path_kind, no picker) and carry
+    ``widget='reference'`` so the form renders the references dropdown."""
+    schema = build_cli_schema(_build_parser())
+    align = _commands_by_path(schema, ["transcriptome", "align"])
+    ref = _arg_by_dest(align, "reference")
+    assert ref["type"] == "str"
+    assert ref.get("path_kind") is None
+    assert ref["widget"] == "reference"
+
+    # `--library-design` (a plain label) must stay a free-text str.
+    demux = _commands_by_path(schema, ["transcriptome", "demultiplex"])
+    lib = _arg_by_dest(demux, "library_design")
+    assert lib["type"] == "str"
+    assert lib.get("path_kind") is None
+    assert lib.get("widget") is None
+
+
+def test_arg_hints_apply_globs():
+    """The curated ``arg_hints`` overlay refines path args with file
+    globs the pure dest heuristic can't infer."""
+    schema = build_cli_schema(_build_parser())
+    demux = _commands_by_path(schema, ["transcriptome", "demultiplex"])
+    samples = _arg_by_dest(demux, "samples")
+    assert samples["glob"] == "*.tsv,*.txt"
+    reads = _arg_by_dest(demux, "reads")
+    assert reads["glob"] == "*.bam,*.sam"
+    align = _commands_by_path(schema, ["transcriptome", "align"])
+    junc = _arg_by_dest(align, "junc_bed")
+    assert junc["glob"] == "*.bed"
+
+
+def test_arg_hints_loader_shape():
+    """load_arg_hints returns only well-formed rows (path + dest)."""
+    hints = load_arg_hints()
+    assert isinstance(hints, list)
+    assert len(hints) >= 3
+    for h in hints:
+        assert isinstance(h.get("path"), list)
+        assert isinstance(h.get("dest"), str)
+
+
+def test_arg_hints_do_not_break_json():
+    """The full schema (with path_kind / widget / glob) still serializes
+    for the FastAPI JSON encoder."""
+    schema = build_cli_schema(_build_parser())
+    json.dumps(schema)
+    # arg_hints block in curated.json must be a list when present.
+    from importlib.resources import files
+
+    raw = files("constellation.viz.introspect").joinpath("curated.json").read_text()
+    data = json.loads(raw)
+    assert isinstance(data.get("arg_hints", []), list)

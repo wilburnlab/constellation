@@ -10,12 +10,24 @@ export type ArgumentType =
   | 'path'
   | 'multi';
 
+/** Directory-vs-file sub-kind for path-ish args (type 'path' or a
+ *  path-ish 'multi'). Drives which mode the FilePicker opens in.
+ *  'either' allows selecting a directory or a file. */
+export type PathKind = 'dir' | 'file' | 'either';
+
+/** Richer-widget hint decoupled from `type`. `reference` → an editable
+ *  dropdown fed by GET /api/references. */
+export type WidgetHint = 'reference';
+
 export interface ArgumentSchema {
   dest: string;
   option_strings: string[];
   metavar: string | null;
   help: string | null;
   type: ArgumentType;
+  path_kind?: PathKind | null;
+  widget?: WidgetHint | null;
+  glob?: string | null;
   default: unknown;
   choices: unknown[] | null;
   required: boolean;

@@ -33,6 +33,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from constellation.massspec.cli import _add_tolerance_args
 from constellation.massspec.search.encyclopedia.ptm_defaults import (
     default_for as _ptm_default_for,
 )
@@ -244,18 +245,7 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     )
 
     # ── Per-stage passthroughs ─────────────────────────────────────────
-    p.add_argument(
-        "--fragment-tolerance-ppm",
-        type=float,
-        default=10.0,
-        help="fragment m/z tolerance ppm for search (default 10.0)",
-    )
-    p.add_argument(
-        "--precursor-tolerance-ppm",
-        type=float,
-        default=10.0,
-        help="precursor m/z tolerance ppm for search (default 10.0)",
-    )
+    _add_tolerance_args(p, default=10.0)
     p.add_argument(
         "--percolator-version",
         default="v3-05",

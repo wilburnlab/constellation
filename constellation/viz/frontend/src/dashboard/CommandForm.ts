@@ -6,8 +6,15 @@
 // TaskPanel can swap its content to a terminal in-place. On 409,
 // surfaces the rejection message inline.
 
-import type { ArgumentSchema, CommandResponse, CommandSchema } from './types';
+import type {
+  ArgumentSchema,
+  CommandResponse,
+  CommandSchema,
+  InstalledReference,
+} from './types';
 import { DashboardState } from './state';
+import { PathInput } from '../widgets/PathInput';
+import { FilePicker } from '../widgets/FilePicker';
 
 export interface CommandFormOptions {
   command: CommandSchema;
@@ -50,6 +57,9 @@ export class CommandForm {
   private runButton: HTMLButtonElement | null = null;
   private errorEl: HTMLElement | null = null;
   private destroyFn: (() => void) | null = null;
+  // Teardown hooks for path pickers so open popovers don't leak when the
+  // panel is disposed.
+  private readonly disposers: Array<() => void> = [];
 
   constructor(opts: CommandFormOptions) {
     this.command = opts.command;
@@ -119,6 +129,8 @@ export class CommandForm {
   destroy(): void {
     this.destroyFn?.();
     this.destroyFn = null;
+    for (const dispose of this.disposers) dispose();
+    this.disposers.length = 0;
     if (this.element) this.element.innerHTML = '';
   }
 
@@ -267,6 +279,7 @@ export class CommandForm {
       return sel;
     }
     if (arg.type === 'multi') {
+      const wrap = document.createElement('div');
       const ta = document.createElement('textarea');
       ta.rows = 3;
       ta.style.background = 'var(--bg-elev)';
@@ -281,17 +294,30 @@ export class CommandForm {
       ta.placeholder = 'one value per line';
       const current = this.values.get(dest);
       ta.value = Array.isArray(current) ? current.join('\n') : '';
-      ta.addEventListener('input', () => {
+      const commit = (): void => {
         const lines = ta.value
           .split('\n')
           .map((s) => s.trim())
           .filter((s) => s.length > 0);
         this.values.set(dest, lines);
         this.updateRunButton();
-      });
-      return ta;
+      };
+      ta.addEventListener('input', commit);
+      wrap.appendChild(ta);
+      // Repeatable path args (nargs="+" with a path-ish dest) stay a
+      // textarea but gain a Browse-to-append affordance.
+      if (arg.path_kind) {
+        wrap.appendChild(this.renderMultiBrowse(arg, ta, commit));
+      }
+      return wrap;
     }
-    // text / int / float / path all render as a single-line input
+    if (arg.widget === 'reference') {
+      return this.renderReferenceInput(arg);
+    }
+    if (arg.type === 'path') {
+      return this.renderPathInput(arg);
+    }
+    // text / int / float render as a single-line input
     const input = document.createElement('input');
     if (arg.type === 'int' || arg.type === 'float') {
       input.type = 'number';
@@ -300,7 +326,6 @@ export class CommandForm {
       input.type = 'text';
     }
     if (arg.metavar) input.placeholder = arg.metavar;
-    else if (arg.type === 'path') input.placeholder = '/path/to/...';
     const current = this.values.get(dest);
     input.value = current === null || current === undefined ? '' : String(current);
     input.addEventListener('input', () => {
@@ -309,6 +334,111 @@ export class CommandForm {
       this.updateRunButton();
     });
     return input;
+  }
+
+  /** Path arg → editable text box + Browse button (the universal lever;
+   *  every current and future `type:'path'` arg flows through here). */
+  private renderPathInput(arg: ArgumentSchema): HTMLElement {
+    const dest = arg.dest;
+    const kind = arg.path_kind ?? 'dir';
+    const pi = new PathInput({
+      value: String(this.values.get(dest) ?? ''),
+      kind,
+      globs: parseGlobs(arg.glob),
+      placeholder: arg.metavar ?? undefined,
+      onChange: (v) => {
+        this.values.set(dest, v);
+        this.updateRunButton();
+      },
+    });
+    this.disposers.push(() => pi.destroy());
+    return pi.render();
+  }
+
+  /** Reference-handle arg → editable input backed by a datalist of
+   *  installed references (GET /api/references). Free text is still
+   *  allowed for a handle not yet in the cache. */
+  private renderReferenceInput(arg: ArgumentSchema): HTMLElement {
+    const dest = arg.dest;
+    const listId = `ref-list-${refUid++}`;
+    const wrap = document.createElement('div');
+    wrap.className = 'path-input-row';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'path-input-field';
+    input.spellcheck = false;
+    input.autocomplete = 'off';
+    input.setAttribute('list', listId);
+    input.placeholder = arg.metavar ?? 'organism@source-release';
+    input.value = String(this.values.get(dest) ?? '');
+    input.addEventListener('input', () => {
+      this.values.set(dest, input.value);
+      this.updateRunButton();
+    });
+    const datalist = document.createElement('datalist');
+    datalist.id = listId;
+    wrap.appendChild(input);
+    wrap.appendChild(datalist);
+    void loadReferenceHandles()
+      .then((refs) => {
+        datalist.replaceChildren();
+        for (const ref of refs) {
+          const opt = document.createElement('option');
+          opt.value = ref.handle;
+          opt.textContent = `${ref.handle} — ${ref.organism} · ${ref.source} ${ref.release}`;
+          datalist.appendChild(opt);
+        }
+      })
+      .catch(() => {
+        /* leave the field as free text if the catalog can't load */
+      });
+    return wrap;
+  }
+
+  /** "Browse to add…" button for a repeatable path arg — appends the
+   *  picked path as a new textarea line. */
+  private renderMultiBrowse(
+    arg: ArgumentSchema,
+    ta: HTMLTextAreaElement,
+    commit: () => void,
+  ): HTMLElement {
+    const kind = arg.path_kind ?? 'dir';
+    const globs = parseGlobs(arg.glob);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'path-input-browse';
+    btn.style.marginTop = '4px';
+    btn.textContent = 'Browse to add…';
+    let picker: FilePicker | null = null;
+    const close = (): void => {
+      picker?.dispose();
+      picker = null;
+    };
+    btn.addEventListener('click', () => {
+      if (picker) {
+        close();
+        return;
+      }
+      picker = new FilePicker({
+        anchor: btn,
+        kind,
+        globs,
+        onSelect: (path) => {
+          const lines = ta.value ? ta.value.split('\n') : [];
+          lines.push(path);
+          ta.value = lines
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0)
+            .join('\n');
+          commit();
+          close();
+        },
+        onClose: () => close(),
+      });
+      picker.mount(btn.parentElement ?? btn);
+    });
+    this.disposers.push(close);
+    return btn;
   }
 
   private validateInput(input: HTMLInputElement, arg: ArgumentSchema): void {
@@ -475,4 +605,23 @@ function isAdvanced(arg: ArgumentSchema): boolean {
 
 function formatLabel(cmd: CommandSchema): string {
   return cmd.path.map((p) => p.replace(/-/g, ' ')).join(' / ');
+}
+
+// Monotonic id source so multiple open forms don't collide on <datalist>
+// ids for the reference dropdown.
+let refUid = 0;
+
+function parseGlobs(glob: string | null | undefined): string[] | undefined {
+  if (!glob) return undefined;
+  const parts = glob
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return parts.length > 0 ? parts : undefined;
+}
+
+async function loadReferenceHandles(): Promise<InstalledReference[]> {
+  const resp = await fetch('/api/references');
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  return (await resp.json()) as InstalledReference[];
 }

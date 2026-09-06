@@ -29,6 +29,7 @@ import argparse
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 from constellation.massspec.search.encyclopedia.ptm_defaults import (
     PTM_NAMES as _PTM_NAMES,
@@ -56,6 +57,7 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     _build_classify_novel_peptides_parser(ms_subs)
     _build_collision_filter_parser(ms_subs)
     _build_chromatogram_parser(ms_subs)
+    _build_counter_parser(ms_subs)
 
 
 # ── convert ─────────────────────────────────────────────────────────────
@@ -388,24 +390,7 @@ def _build_search_parser(subs: argparse._SubParsersAction) -> None:
             "after the jar exits"
         ),
     )
-    p.add_argument(
-        "--fragment-tolerance-ppm",
-        type=float,
-        default=None,
-        help=(
-            "EncyclopeDIA -ftol value (ppm). Default: jar's built-in "
-            "default (10 ppm in 6.5.15)."
-        ),
-    )
-    p.add_argument(
-        "--precursor-tolerance-ppm",
-        type=float,
-        default=None,
-        help=(
-            "EncyclopeDIA -ptol value (ppm). Default: jar's built-in "
-            "default (10 ppm in 6.5.15)."
-        ),
-    )
+    _add_tolerance_args(p)
     p.add_argument(
         "--acquisition",
         default=None,
@@ -479,15 +464,15 @@ def _add_input_args_for_search(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--fasta",
-        required=False,
-        default=None,
+        required=True,
         type=Path,
         help=(
-            "background proteome FASTA (optional). Used for decoy "
-            "generation when the library lacks decoys. EncyclopeDIA's "
-            "default search does not require it when the library "
-            "already contains decoys (e.g. predict-library output "
-            "with -addDecoys true), but providing it never hurts."
+            "background proteome FASTA. REQUIRED — EncyclopeDIA 6.5.15's "
+            "default search refuses to start without -f ('You are "
+            "required to specify an input file (-i), a library file (-l), "
+            "and a fasta file (-f)'), even when the library already "
+            "carries decoys. Older versions treated it as optional. Use "
+            "the same FASTA the library was built from."
         ),
     )
 
@@ -499,22 +484,111 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
     p = subs.add_parser(
         "predict-library",
         help=(
-            "FASTA → predicted .dlib via EncyclopeDIA 6.5.15's bundled "
-            "JChronologer (RT) + Sculptor (CCS/IMS) + Electrician "
-            "(charge). In-process PyTorch — no Koina round-trip."
+            "FASTA → predicted spectral library. --backend encyclopedia "
+            "(default) runs EncyclopeDIA 6.5.15's bundled JChronologer "
+            "(RT) + Sculptor (CCS/IMS) + Electrician (charge) in-process; "
+            "--backend koina calls the Koina model server, which adds CID "
+            "models and HCD at arbitrary collision energy."
         ),
     )
     p.add_argument(
+        "--backend",
+        choices=["encyclopedia", "koina"],
+        default="encyclopedia",
+        help="prediction backend (default: encyclopedia)",
+    )
+    p.add_argument(
         "--fasta",
-        required=True,
         type=Path,
         help="input protein FASTA",
     )
     p.add_argument(
         "--output-dlib",
-        required=True,
         type=Path,
-        help="output predicted .dlib path",
+        help=(
+            "output predicted .dlib path (required for --backend "
+            "encyclopedia; optional extra output for --backend koina)"
+        ),
+    )
+    # ── koina backend ───────────────────────────────────────────────
+    koina = p.add_argument_group(
+        "koina backend",
+        "Only meaningful with --backend koina.",
+    )
+    koina.add_argument(
+        "--peptides",
+        type=Path,
+        default=None,
+        help=(
+            "explicit peptide list (TSV/CSV/parquet with a "
+            "modified_sequence column, optional charge) instead of "
+            "digesting a FASTA — no m/z or length filtering is applied"
+        ),
+    )
+    koina.add_argument(
+        "--from-library",
+        type=Path,
+        default=None,
+        help=(
+            "re-predict an existing library's exact precursors under a "
+            "different model/energy (e.g. an HCD-built panel under a CID "
+            "model)"
+        ),
+    )
+    koina.add_argument(
+        "--ms2-model",
+        default="Prosit_2020_intensity_HCD",
+        help="Koina fragment-intensity model (default: %(default)s)",
+    )
+    koina.add_argument(
+        "--rt-model",
+        default="Chronologer_RT",
+        help=(
+            "Koina retention-time model, or 'none' to skip RT prediction "
+            "(default: %(default)s)"
+        ),
+    )
+    koina.add_argument(
+        "--koina-url",
+        default=None,
+        help=(
+            "Koina server host:port (default: $CONSTELLATION_KOINA_URL, "
+            "else koina.wilhelmlab.org:443)"
+        ),
+    )
+    koina.add_argument(
+        "--collision-energy",
+        default=None,
+        help=(
+            "collision energy, or a comma-separated sweep (e.g. "
+            "'20,25,30') which writes one library per energy under "
+            "<output-dir>/ce_NN/. Rejected for models that declare no "
+            "collision-energy input, since every energy would then "
+            "produce an identical library."
+        ),
+    )
+    koina.add_argument(
+        "--output-library",
+        type=Path,
+        default=None,
+        help=(
+            "ParquetDir output path (default: <output-dir>/library_pqdir)"
+        ),
+    )
+    koina.add_argument(
+        "--on-unsupported-mod",
+        choices=["error", "skip"],
+        default="error",
+        help=(
+            "what to do with precursors the model cannot represent "
+            "(default: error)"
+        ),
+    )
+    koina.add_argument(
+        "--min-intensity",
+        type=float,
+        default=1e-4,
+        help="drop predicted fragments below this intensity (default: %(default)s)",
     )
     _add_output_dir_arg(p)
     p.add_argument(
@@ -1029,6 +1103,105 @@ def _add_output_dir_arg(p: argparse.ArgumentParser) -> None:
     )
 
 
+#: The three EncyclopeDIA search tolerances, as
+#: ``(flag-stem, dest-stem, jar-flag, help-tail)``. Shared by
+#: :func:`_add_tolerance_args` and :func:`_resolve_tolerance_args` so the
+#: flag surface and the validation can't drift apart.
+_TOLERANCES = (
+    (
+        "precursor-tolerance",
+        "precursor_tolerance",
+        "-ptol",
+        "precursor m/z window",
+    ),
+    (
+        "fragment-tolerance",
+        "fragment_tolerance",
+        "-ftol",
+        "window applied to the acquired spectrum's fragment peaks",
+    ),
+    (
+        "library-fragment-tolerance",
+        "library_fragment_tolerance",
+        "-lftol",
+        (
+            "window applied to the LIBRARY's fragment peaks. Independent of "
+            "--fragment-tolerance on purpose: a predicted library's m/z are "
+            "exact theoretical values and want a tight ppm window even when "
+            "the acquired data is ion-trap. Widen this only when searching a "
+            "measured chromatogram .elib whose peaks carry the instrument's "
+            "own mass error"
+        ),
+    ),
+)
+
+
+def _add_tolerance_args(p: argparse.ArgumentParser, *, default: float | None = None) -> None:
+    """Add the value + unit flag pair for each EncyclopeDIA tolerance.
+
+    ``default`` is the shared default for the *value* flags — ``None``
+    (``massspec search``) omits the flag entirely so the jar's built-in
+    10 ppm applies; ``transcriptome-to-proteome`` passes ``10.0`` to
+    preserve its pipeline's explicit defaults.
+    """
+    default_note = (
+        f"default {default}, in the unit given by the paired --*-unit flag"
+        if default is not None
+        else "default: jar's built-in 10 ppm"
+    )
+    for flag, dest, jar_flag, tail in _TOLERANCES:
+        p.add_argument(
+            f"--{flag}",
+            type=float,
+            default=default,
+            help=f"EncyclopeDIA {jar_flag} value — {tail} ({default_note}).",
+        )
+        p.add_argument(
+            f"--{flag}-unit",
+            choices=["ppm", "Da"],
+            default="ppm",
+            help=(
+                f"unit for --{flag} (default: %(default)s). 'Da' is sent to "
+                f"the jar as its 'AMU' token — use it for ion-trap data, "
+                f"where the window is absolute rather than mass-proportional."
+            ),
+        )
+
+
+def _resolve_tolerance_args(args: argparse.Namespace) -> dict[str, object]:
+    """Validate the tolerance flags and project them onto runner kwargs.
+
+    Guards the one real footgun: because the unit defaults to ``ppm``, a
+    bare ``--fragment-tolerance-unit Da`` with no matching value flag is
+    a silent no-op. That combination is always a mistake, so error on it.
+    """
+    resolved: dict[str, object] = {}
+    for flag, dest, _jar_flag, _tail in _TOLERANCES:
+        value = getattr(args, dest, None)
+        unit = getattr(args, f"{dest}_unit", "ppm")
+        if value is None and unit != "ppm":
+            raise ValueError(
+                f"--{flag}-unit {unit} was given without --{flag}; the unit "
+                f"alone has no effect. Pass a value, or drop the unit flag."
+            )
+        resolved[dest] = value
+        resolved[f"{dest}_unit"] = unit
+    return resolved
+
+
+def _format_tolerance_summary(resolved: dict[str, object]) -> str:
+    """One-line human summary of the resolved tolerances, for stderr."""
+    parts = []
+    for flag, dest, _jar_flag, _tail in _TOLERANCES:
+        value = resolved[dest]
+        label = flag.removesuffix("-tolerance")
+        if value is None:
+            parts.append(f"{label} jar-default")
+        else:
+            parts.append(f"{label} {value} {resolved[f'{dest}_unit']}")
+    return "search tolerances: " + ", ".join(parts)
+
+
 _JVM_HEAP_RE = re.compile(r"^\d+[kKmMgGtT]$")
 
 
@@ -1185,6 +1358,13 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
 
     extra_args = encyclopedia_passthrough_args(args.encyclopedia_arg)
 
+    try:
+        tolerances = _resolve_tolerance_args(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=_sys.stderr)
+        return 1
+    print(_format_tolerance_summary(tolerances), file=_sys.stderr)
+
     # Report file lands in output_dir; the .elib itself lands beside the input
     # (EncyclopeDIA convention — not redirectable via -o for default search).
     report_path = output_dir / f"{input_file.stem}.encyclopedia.txt"
@@ -1196,8 +1376,7 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
             fasta=fasta,
             report_output=report_path,
             output_dir=output_dir,
-            fragment_tolerance_ppm=args.fragment_tolerance_ppm,
-            precursor_tolerance_ppm=args.precursor_tolerance_ppm,
+            **tolerances,
             acquisition=args.acquisition,
             enzyme=args.enzyme,
             fragmentation=args.fragmentation,
@@ -1253,6 +1432,7 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
                 quant_pqdir=None,
                 search_pqdir=None,
                 extra_args=extra_args,
+                tolerances=tolerances,
                 build_manifest_envelope=build_manifest_envelope,
                 write_manifest=write_manifest,
                 constellation_version=constellation_version,
@@ -1308,6 +1488,7 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
         quant_pqdir=quant_pqdir,
         search_pqdir=search_pqdir,
         extra_args=extra_args,
+        tolerances=tolerances,
         build_manifest_envelope=build_manifest_envelope,
         write_manifest=write_manifest,
         constellation_version=constellation_version,
@@ -1347,6 +1528,7 @@ def _write_manifest_for_search(
     quant_pqdir: Path | None,
     search_pqdir: Path | None,
     extra_args: list[str],
+    tolerances: dict[str, object],
     build_manifest_envelope,
     write_manifest,
     constellation_version: str,
@@ -1391,11 +1573,42 @@ def _write_manifest_for_search(
         },
         ingest=ingest_info,
         encyclopedia_passthrough_args=extra_args,
+        # `extras` is a named parameter, NOT **kwargs — passing
+        # `search_params=` directly is a TypeError that only surfaces
+        # after the jar has already run to completion.
+        extras={"search_params": tolerances},
     )
     write_manifest(output_dir / "manifest.json", manifest)
 
 
+#: Flags that only the EncyclopeDIA backend implements, paired with the
+#: parser's declared default. Silently ignoring one under --backend koina
+#: would let a user believe their PTM settings or JVM heap took effect
+#: when they did nothing at all — so a *non-default* value is an error.
+#: Compare against the real default, not a sentinel: --jvm-heap-max
+#: defaults to "12g" and --encyclopedia-arg to [], so a truthiness test
+#: would reject every invocation.
+_ENCYCLOPEDIA_ONLY_ARGS: tuple[tuple[str, str, object], ...] = (
+    ("encyclopedia_arg", "--encyclopedia-arg", []),
+    ("jvm_heap_max", "--jvm-heap-max", "12g"),
+    ("jvm_heap_min", "--jvm-heap-min", None),
+    ("jvm_tmpdir", "--jvm-tmpdir", None),
+    ("prediction_cache", "--prediction-cache", None),
+    ("generate_protein_entrapments", "--generate-protein-entrapments", False),
+    ("ragged_n_term", "--ragged-n-term", False),
+    ("no_decoys", "--no-decoys", False),
+    ("max_variable_forms", "--max-variable-forms", 1000),
+)
+
+
 def _cmd_massspec_predict_library(args: argparse.Namespace) -> int:
+    """Dispatch predict-library onto the selected backend."""
+    if getattr(args, "backend", "encyclopedia") == "koina":
+        return _cmd_predict_library_koina(args)
+    return _cmd_predict_library_encyclopedia(args)
+
+
+def _cmd_predict_library_encyclopedia(args: argparse.Namespace) -> int:
     """FASTA → predicted .dlib via EncyclopeDIA's JChronologer pipeline.
 
     Runs the jar, optionally ingests the produced .dlib into a
@@ -1404,6 +1617,16 @@ def _cmd_massspec_predict_library(args: argparse.Namespace) -> int:
     ``_SUCCESS`` last.
     """
     import sys as _sys
+
+    if args.fasta is None:
+        print("error: --fasta is required", file=_sys.stderr)
+        return 1
+    if args.output_dlib is None:
+        print(
+            "error: --output-dlib is required for --backend encyclopedia",
+            file=_sys.stderr,
+        )
+        return 1
 
     from constellation import __version__ as constellation_version
     from constellation.massspec.io.encyclopedia import read_encyclopedia
@@ -1580,6 +1803,270 @@ def _cmd_massspec_predict_library(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_collision_energies(raw: str | None) -> list[float | None]:
+    """``"20,25,30"`` → ``[20.0, 25.0, 30.0]``; ``None`` → ``[None]``."""
+    if raw is None:
+        return [None]
+    out: list[float | None] = []
+    for token in str(raw).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.append(float(token))
+        except ValueError as exc:
+            raise ValueError(f"bad collision energy {token!r}") from exc
+    return out or [None]
+
+
+def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
+    """FASTA / peptide list / existing library → predicted Library via Koina.
+
+    Keeps the same run-dir contract as the EncyclopeDIA backend:
+    ``manifest.json`` + ``_SUCCESS``, with ``--resume`` short-circuiting a
+    completed directory. A multi-energy sweep writes one library per
+    energy under ``ce_NN/``, each with its own ``_SUCCESS`` so a run
+    interrupted at energy 12 of 17 resumes there.
+    """
+    import json
+    import sys as _sys
+
+    from constellation import __version__ as constellation_version
+    from constellation.massspec.library import save_library
+    from constellation.massspec.library.digest import (
+        precursors_from_fasta,
+        precursors_from_library,
+        precursors_from_peptide_list,
+    )
+    from constellation.massspec.library.koina import (
+        KoinaError,
+        KoinaInputError,
+        resolve_server,
+    )
+    from constellation.massspec.library.koina.api import predict_library
+    from constellation.massspec.library.koina.client import make_client
+
+    used = [
+        flag
+        for attr, flag, default in _ENCYCLOPEDIA_ONLY_ARGS
+        if getattr(args, attr, default) != default
+    ]
+    ptm_flags = [
+        f"--ptm-{_camel_to_kebab(name)}"
+        for name in _PTM_NAMES
+        if getattr(args, f"ptm_{_camel_to_kebab(name).replace('-', '_')}", "off")
+        != _ptm_default_for(name)
+    ]
+    if used or ptm_flags:
+        print(
+            "error: these flags are EncyclopeDIA-only and have no effect "
+            f"with --backend koina: {', '.join(used + ptm_flags)}",
+            file=_sys.stderr,
+        )
+        return 1
+
+    sources = [args.fasta, args.peptides, args.from_library]
+    if sum(s is not None for s in sources) != 1:
+        print(
+            "error: pass exactly one of --fasta, --peptides, or "
+            "--from-library",
+            file=_sys.stderr,
+        )
+        return 1
+
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    success_path = output_dir / "_SUCCESS"
+    if success_path.exists():
+        if not args.resume:
+            print(
+                f"error: --output-dir already complete (_SUCCESS exists). "
+                f"Pass --resume to re-use it, or delete {output_dir} to "
+                f"start fresh.",
+                file=_sys.stderr,
+            )
+            return 1
+        print(f"already complete: {output_dir}")
+        return 0
+
+    try:
+        energies = _parse_collision_energies(args.collision_energy)
+    except ValueError as exc:
+        print(f"error: {exc}", file=_sys.stderr)
+        return 1
+
+    server = resolve_server(args.koina_url)
+    rt_model_name = None if str(args.rt_model).lower() == "none" else args.rt_model
+
+    # ── build the precursor grid once, reused across energies ───────
+    try:
+        if args.fasta is not None:
+            fasta = Path(args.fasta).resolve()
+            if not fasta.is_file():
+                print(f"error: --fasta not found: {fasta}", file=_sys.stderr)
+                return 1
+            specs = precursors_from_fasta(
+                fasta,
+                protease=args.enzyme,
+                missed_cleavages=args.max_missed_cleavage,
+                min_mz=args.min_mz,
+                max_mz=args.max_mz,
+                charges=tuple(range(args.min_charge, args.max_charge + 1)),
+                fixed_mods={"C": "UNIMOD:4"},
+                variable_mods={"M": "UNIMOD:35"},
+                max_variable_mods=args.max_variable_mods,
+            )
+            source = str(fasta)
+        elif args.peptides is not None:
+            specs = precursors_from_peptide_list(
+                args.peptides,
+                charges=tuple(range(args.min_charge, args.max_charge + 1)),
+            )
+            source = str(Path(args.peptides).resolve())
+        else:
+            specs = precursors_from_library(args.from_library)
+            source = str(Path(args.from_library).resolve())
+    except (OSError, ValueError) as exc:
+        print(f"error: could not build precursor list: {exc}", file=_sys.stderr)
+        return 1
+
+    if not specs:
+        print("error: no precursors to predict", file=_sys.stderr)
+        return 1
+
+    # ── reject a sweep the model would silently collapse ────────────
+    try:
+        probe = make_client(args.ms2_model, server=args.koina_url)
+        declared = set(probe.model_inputs)
+    except KoinaError as exc:
+        print(f"error: {exc}", file=_sys.stderr)
+        return 1
+
+    takes_energy = "collision_energies" in declared
+    if len(energies) > 1 and not takes_energy:
+        print(
+            f"error: {args.ms2_model} declares no collision-energy input, so "
+            f"the {len(energies)} energies you gave would produce "
+            f"{len(energies)} identical libraries. Drop --collision-energy, "
+            f"or pick a model that accepts one.",
+            file=_sys.stderr,
+        )
+        return 1
+    if takes_energy and energies == [None]:
+        energies = [float(args.default_nce)]
+    if not takes_energy:
+        energies = [None]
+
+    multi = len(energies) > 1
+    summaries: list[dict[str, object]] = []
+
+    for energy in energies:
+        run_dir = output_dir / f"ce_{energy:g}" if multi else output_dir
+        run_dir.mkdir(parents=True, exist_ok=True)
+        marker = run_dir / "_SUCCESS" if multi else None
+        if marker is not None and marker.exists() and args.resume:
+            # Restore the completed run's summary. Skipping without it
+            # drops finished energies from the aggregate manifest —
+            # resuming a 20/30 sweep listed only 30, and resuming after
+            # every energy had finished wrote "runs": [] and still
+            # reported success.
+            prior = run_dir / "manifest.json"
+            if not prior.is_file():
+                print(
+                    f"error: {run_dir} has _SUCCESS but no manifest.json, so "
+                    f"its summary cannot be restored and the aggregate would "
+                    f"under-report the sweep. Delete that directory to "
+                    f"recompute this energy.",
+                    file=_sys.stderr,
+                )
+                return 1
+            summaries.append(json.loads(prior.read_text()))
+            print(f"  ce={energy:g}: already complete, restored from manifest")
+            continue
+
+        try:
+            library, stats = predict_library(
+                specs=specs,
+                ms2_model_name=args.ms2_model,
+                rt_model_name=rt_model_name,
+                collision_energy=energy,
+                adjust_nce_for_dia=not args.no_adjust_nce_for_dia,
+                server=args.koina_url,
+                min_intensity=args.min_intensity,
+                on_unsupported=args.on_unsupported_mod,
+                metadata={"x.koina.server_url": server, "x.koina.source": source},
+            )
+        except KoinaInputError as exc:
+            print(f"error: {exc}", file=_sys.stderr)
+            return 1
+        except KoinaError as exc:
+            print(f"error: Koina prediction failed: {exc}", file=_sys.stderr)
+            return 2
+
+        pqdir = (
+            Path(args.output_library).resolve()
+            if args.output_library is not None and not multi
+            else run_dir / "library_pqdir"
+        )
+        save_library(library, pqdir, format="parquet_dir")
+
+        dlib_path = None
+        if args.output_dlib is not None:
+            dlib_path = (
+                Path(args.output_dlib).resolve()
+                if not multi
+                else run_dir / Path(args.output_dlib).name
+            )
+            dlib_path.parent.mkdir(parents=True, exist_ok=True)
+            save_library(library, dlib_path, format="encyclopedia.dlib")
+
+        summary = {
+            "collision_energy": energy,
+            "library_pqdir": str(pqdir),
+            "output_dlib": str(dlib_path) if dlib_path else None,
+            "counts": {
+                "proteins": library.proteins.num_rows,
+                "peptides": library.peptides.num_rows,
+                "precursors": library.precursors.num_rows,
+                "fragments": library.fragments.num_rows,
+            },
+            "assembly": stats.as_dict(),
+        }
+        summaries.append(summary)
+        if marker is not None:
+            (run_dir / "manifest.json").write_text(json.dumps(summary, indent=2))
+            marker.write_bytes(b"")
+        if not args.no_progress:
+            label = f"ce={energy:g}: " if multi else ""
+            print(
+                f"  {label}{library.precursors.num_rows} precursors, "
+                f"{library.fragments.num_rows} fragments "
+                f"(max m/z deviation {stats.max_abs_ppm_deviation:.3f} ppm)"
+            )
+
+    manifest = {
+        "tool": "constellation massspec predict-library",
+        "backend": "koina",
+        "constellation_version": constellation_version,
+        "source": source,
+        "n_precursors_requested": len(specs),
+        "koina": {
+            "server": server,
+            "ms2_model": args.ms2_model,
+            "rt_model": rt_model_name,
+            "adjust_nce_for_dia": not args.no_adjust_nce_for_dia,
+            "min_intensity": args.min_intensity,
+        },
+        "runs": summaries,
+    }
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    success_path.write_bytes(b"")
+
+    if not args.no_progress:
+        print(f"predict-library done ({len(summaries)} library/libraries): {output_dir}")
+    return 0
+
+
 def _write_manifest_for_predict_library(
     *,
     args: argparse.Namespace,
@@ -1711,12 +2198,31 @@ def _cmd_massspec_process_dia(args: argparse.Namespace) -> int:
         print(f"  see {exc.stderr_log} for the full log", file=_sys.stderr)
         return exc.returncode
 
+    # run_process_dia relocates the jar-named single-input cache onto
+    # output_dia, so by this point --output-dia means the same thing
+    # regardless of input count.
     if not output_dia.is_file():
         print(
             f"error: encyclopedia exited 0 but the expected .DIA was not "
             f"produced at {output_dia}; check {result.stderr_log}",
             file=_sys.stderr,
         )
+        if len(inputs) == 1:
+            # Single input ignores -o, so the file lands by convention.
+            # Name every place we looked — otherwise diagnosing a new
+            # convention means another round-trip to the cluster.
+            print(
+                "  single-input mode: the jar chooses the output path "
+                "itself. Looked for it at:",
+                file=_sys.stderr,
+            )
+            for cand in (
+                output_dir / f"{inputs[0].stem}.dia",
+                output_dir / f"{inputs[0].name}.dia",
+                inputs[0].with_suffix(".dia"),
+                inputs[0].parent / f"{inputs[0].name}.dia",
+            ):
+                print(f"    {cand}", file=_sys.stderr)
         return 2
 
     # Manifest captures inputs (with SHA256s) + jar + JVM + runtime.
@@ -2810,6 +3316,533 @@ def _warn_level_flag_mismatch(args: argparse.Namespace) -> None:
     elif args.level == 2:
         if args.n_isotopes != _DEFAULT_N_ISOTOPES or tuple(args.charge_range) != _DEFAULT_CHARGE_RANGE:
             print("warning: MS1 isotope options ignored with --level 2", file=sys.stderr)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# counter — panel-shaped ion-count estimation + per-acquisition calibration
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _build_counter_parser(subs: argparse._SubParsersAction) -> None:
+    p = subs.add_parser(
+        "counter",
+        help=(
+            "Counter ion-count estimation. `calibrate` fits a per-acquisition "
+            "GlobalCalibration from spiked calibrants; `estimate` runs the "
+            "panel-shaped per-seed estimate (one panel per target, parallel "
+            "across seeds) producing N_total + credible intervals."
+        ),
+    )
+    csubs = p.add_subparsers(dest="counter_subcommand", required=True)
+    _build_counter_calibrate_parser(csubs)
+    _build_counter_estimate_parser(csubs)
+
+
+def _add_counter_common_inputs(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--trace", type=Path, required=True,
+                   help="XIC_TRACE_TABLE .parquet (MS1, ideally an all_in_window extraction).")
+    p.add_argument("--scan-metadata", type=Path, required=True,
+                   help="SCAN_METADATA_TABLE .parquet (the scan axis; level-1 rows are used).")
+    p.add_argument("--rt-window", type=float, default=60.0,
+                   help="Half-width (s) of the scan-axis window around each target's rt_center.")
+    p.add_argument("--n-isotopes", type=int, default=_DEFAULT_N_ISOTOPES)
+    p.add_argument("--acquisition-id", type=int, default=0)
+    p.add_argument("--no-progress", action="store_true")
+
+
+def _build_counter_calibrate_parser(subs: argparse._SubParsersAction) -> None:
+    p = subs.add_parser(
+        "calibrate",
+        help="Fit a per-acquisition GlobalCalibration (+ peptide params) from calibrants.",
+    )
+    _add_counter_common_inputs(p)
+    p.add_argument("--calibrants", type=Path, required=True,
+                   help="XIC_TARGET_TABLE .parquet of calibrant peptides (target_id, "
+                        "modified_sequence, precursor_charge, rt_center).")
+    p.add_argument("-o", "--output-dir", type=Path, required=True)
+    p.add_argument("--gain", action="store_true",
+                   help="Co-fit the gain alpha(z) (weakly identified; off by default).")
+    p.set_defaults(func=_cmd_counter_calibrate)
+
+
+def _build_counter_estimate_parser(subs: argparse._SubParsersAction) -> None:
+    p = subs.add_parser(
+        "estimate",
+        help="Panel-shaped per-seed ion-count estimate (parallel across seeds).",
+    )
+    _add_counter_common_inputs(p)
+    p.add_argument("--targets", type=Path, required=True,
+                   help="XIC_TARGET_TABLE .parquet of seed peptides to quantify.")
+    p.add_argument("--calibration", type=Path, required=True,
+                   help="COUNTER_GLOBAL_CALIBRATION_TABLE .parquet (from `counter calibrate`).")
+    p.add_argument("-o", "--output-dir", type=Path, required=True)
+    p.add_argument("--workers", type=int, default=1,
+                   help="Process-pool size over seeds (each seed is an independent panel).")
+    p.add_argument("--neighborhood-ppm", type=float, default=100.0,
+                   help="Per-channel m/z neighborhood retained as discovery candidate nodes.")
+    p.add_argument("--detect-threshold", type=float, default=8.0)
+    p.add_argument("--max-candidates", type=int, default=1,
+                   help="Max same-grid interferers per panel (default 1; >1 is "
+                        "weakly identifiable and overfits until the parsimony pass lands).")
+    p.add_argument("--no-background", dest="background", action="store_false",
+                   help="Disable the additive background channel.")
+    p.add_argument("--collide-ppm", type=float, default=20.0,
+                   help="m/z tolerance for grouping targets into channel-overlap "
+                        "components that are co-fit jointly (default 20). Auto-clamped to "
+                        "the trace's recorded XIC extraction tolerance — a member beyond "
+                        "that tolerance has no extracted signal on the reference grid.")
+    p.add_argument("--extraction-tolerance-ppm", type=float, default=None,
+                   help="Override the trace's recorded XIC extraction tolerance (ppm) used "
+                        "to clamp --collide-ppm. Default: read from the trace metadata.")
+    p.add_argument("--rt-overlap-s", type=float, default=None,
+                   help="RT-center span (s) within which component members are co-fit as "
+                        "one unit (default + max: --rt-window; larger values are clamped, "
+                        "since a unit can't span beyond the reference observation window).")
+    p.add_argument("--max-component-size", type=int, default=8,
+                   help="Co-fit units larger than this fall back to independent "
+                        "single-target fits (guards against a dense isobaric region "
+                        "chaining into one pool-stalling mega-panel).")
+    p.add_argument("--emit-attribution", action="store_true",
+                   help="Also write the sparse ion→progenitor soft-attribution map "
+                        "(COUNTER_PEAK_ATTRIBUTION_TABLE) — the 'what's left' / interference "
+                        "bookkeeping — alongside the count table.")
+    p.set_defaults(func=_cmd_counter_estimate)
+
+
+def _counter_targets(path: Path) -> list[dict]:
+    import pyarrow.parquet as pq
+
+    t = pq.read_table(path)
+    need = ("target_id", "modified_sequence", "precursor_charge", "rt_center")
+    missing = [c for c in need if c not in t.column_names]
+    if missing:
+        raise SystemExit(f"error: targets missing columns {missing}")
+    rows = t.select(list(need)).to_pylist()
+    tids = [r["target_id"] for r in rows]
+    if len(set(tids)) != len(tids):
+        from collections import Counter
+
+        dups = sorted(tid for tid, n in Counter(tids).items() if n > 1)
+        raise SystemExit(
+            f"error: targets has duplicate target_id(s) (must be unique): {dups[:10]}"
+        )
+    return rows
+
+
+# -- estimate: spawn worker pool over seeds (each an independent panel) --
+
+_COUNTER_CTX: dict = {}
+
+
+def _counter_worker_init(trace_path: str, scan_meta_path: str, calibration_path: str, opts: dict) -> None:
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    from constellation.massspec.counter import calibration_from_table
+    from constellation.massspec.quant.chromatogram import load_xic
+
+    # load_xic handles both a `chromatogram extract` bundle directory and a bare parquet.
+    trace = load_xic(trace_path)
+    sm = pq.read_table(scan_meta_path)
+    if "level" in sm.column_names:
+        sm = sm.filter(pc.equal(sm.column("level"), 1))
+    _COUNTER_CTX.update(
+        trace=trace,
+        ms1=sm.select(["scan", "rt", "iit"]),
+        cal=calibration_from_table(pq.read_table(calibration_path)),
+        opts=opts,
+    )
+
+
+def _counter_worker_estimate(target: dict) -> tuple[list[dict], Any]:
+    """Singleton per-target fit. Returns (records, attribution) — the uniform worker
+    contract; `attribution` is a COUNTER_PEAK_ATTRIBUTION_TABLE (or None unless
+    `--emit-attribution`)."""
+    import pyarrow.compute as pc
+
+    from constellation.core.sequence.proforma import Peptidoform
+    from constellation.massspec.counter import (
+        DiscoverConfig,
+        Panel,
+        Progenitor,
+        estimate_panel,
+        observation_for_region,
+        panel_attribution_table,
+    )
+
+    opts, cal, trace, ms1 = (_COUNTER_CTX[k] for k in ("opts", "cal", "trace", "ms1"))
+    tid = int(target["target_id"])
+    modseq = target["modified_sequence"]
+    base = {"acquisition_id": opts["acquisition_id"], "target_id": tid,
+            "modified_sequence": modseq, "precursor_charge": target["precursor_charge"]}
+    try:
+        # Coerce inside the try: a null charge / rt_center / modseq is one bad seed,
+        # not a run-aborting crash.
+        z = int(target["precursor_charge"])
+        rtc = float(target["rt_center"])
+        prog = Progenitor.for_peptide(Peptidoform(sequence=modseq), [z], cal,
+                                      n_isotopes=opts["n_isotopes"])
+        rt = ms1.column("rt")
+        win = ms1.filter(pc.less_equal(pc.abs(pc.subtract(rt, rtc)), opts["rt_window"]))
+        obs, region = observation_for_region(trace, win, prog, target_id=tid,
+                                             neighborhood_ppm=opts["neighborhood_ppm"])
+        if int(obs.mask.sum()) == 0:
+            return [{**base, "status": "no_signal"}], None
+        panel = Panel([prog], cal, background=opts["background"])
+        cfg = DiscoverConfig(detect_threshold=opts["detect_threshold"],
+                             max_candidates=opts["max_candidates"])
+        res = estimate_panel(panel, obs, region, config=cfg, rt_prior_ms=rtc * 1000.0,
+                             inference="map")
+        attr = (
+            panel_attribution_table(panel, obs, acquisition_id=opts["acquisition_id"], target_id=tid)
+            if opts.get("emit_attribution") else None
+        )
+        return [{**base, **res, "status": "ok"}], attr
+    except Exception as exc:  # noqa: BLE001 — one bad seed shouldn't kill the run
+        return [{**base, "status": f"error:{type(exc).__name__}"}], None
+
+
+def _counter_cofit_units(targets: list[dict], opts: dict) -> tuple[list[list[dict]], int]:
+    """Partition targets into co-fit units: channel-overlap components (shared m/z)
+    refined to co-eluting sub-clusters (shared RT), with oversized units split back
+    to singletons (the mega-component pool-stall guard). Each unit is a list of
+    target dicts sorted by `target_id` ([0] is the reference grid). Targets without a
+    `modified_sequence` (no envelope) stay singletons. Returns (units, n_capped)."""
+    from constellation.core.sequence.proforma import Peptidoform
+    from constellation.massspec.counter import (
+        TheoreticalCandidateIndex,
+        channel_overlap_components,
+        refine_components_by_rt,
+        restrict_to_reference_star,
+    )
+
+    by_tid = {int(t["target_id"]): t for t in targets}
+    entries: list[tuple] = []
+    rt_centers: dict[int, float] = {}
+    no_envelope: list[int] = []
+    for t in targets:
+        tid = int(t["target_id"])
+        if t.get("rt_center") is not None:
+            rt_centers[tid] = float(t["rt_center"])
+        # A target needs a modseq AND a charge to form a theoretical envelope; any
+        # missing/malformed field → keep it a singleton (the worker reports the error,
+        # rather than the parent partitioner crashing the whole run).
+        try:
+            if t["modified_sequence"] and t.get("precursor_charge") is not None:
+                entries.append(
+                    (tid, Peptidoform(sequence=t["modified_sequence"]), [int(t["precursor_charge"])])
+                )
+            else:
+                no_envelope.append(tid)
+        except Exception:  # noqa: BLE001 — malformed modseq/charge → singleton fallback
+            no_envelope.append(tid)
+
+    unit_tids: list = []
+    if entries:
+        index = TheoreticalCandidateIndex.from_peptides(entries, n_isotopes=opts["n_isotopes"])
+        comps = channel_overlap_components(index, collide_ppm=opts["collide_ppm"])
+        unit_tids = refine_components_by_rt(comps, rt_centers, rt_overlap_s=opts["rt_overlap_s"])
+        # Reference-star restriction: a transitive m/z component co-fit on the
+        # reference grid would under-score members that only indirectly overlap (their
+        # peaks were never extracted onto the reference grid). Keep only members
+        # DIRECTLY overlapping each star's reference; the rest fall into their own
+        # stars (singletons if they overlap nobody).
+        unit_tids = restrict_to_reference_star(unit_tids, index, collide_ppm=opts["collide_ppm"])
+    unit_tids += [frozenset({tid}) for tid in no_envelope]
+
+    cap = int(opts["max_component_size"])
+    units: list[list[dict]] = []
+    n_capped = 0
+    for u in unit_tids:
+        members = sorted(u)
+        if len(members) > cap:
+            n_capped += 1
+            units.extend([[by_tid[tid]] for tid in members])  # fall back to singletons
+        else:
+            units.append([by_tid[tid] for tid in members])
+    units.sort(key=lambda u: int(u[0]["target_id"]))  # deterministic work-item order
+    return units, n_capped
+
+
+def _counter_worker_component(unit: list[dict]) -> tuple[list[dict], Any]:
+    """Joint co-fit of a multi-member unit — one panel over the reference member's
+    grid (`unit[0]`), each member scored at its own mass defect. Returns (records,
+    attribution) per the uniform worker contract (one record per member)."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    from constellation.core.sequence.proforma import Peptidoform
+    from constellation.massspec.counter import (
+        DiscoverConfig,
+        Progenitor,
+        estimate_component,
+        observation_for_region,
+        panel_attribution_table,
+    )
+
+    opts, cal, trace, ms1 = (_COUNTER_CTX[k] for k in ("opts", "cal", "trace", "ms1"))
+    emit = bool(opts.get("emit_attribution"))
+    members = sorted(unit, key=lambda t: int(t["target_id"]))  # reference = min target_id
+    bases = [
+        {
+            "acquisition_id": opts["acquisition_id"],
+            "target_id": int(t["target_id"]),
+            "modified_sequence": t["modified_sequence"],
+            "precursor_charge": int(t["precursor_charge"]),
+        }
+        for t in members
+    ]
+    try:
+        progs = [
+            Progenitor.for_peptide(
+                Peptidoform(sequence=t["modified_sequence"]),
+                [int(t["precursor_charge"])],
+                cal,
+                n_isotopes=opts["n_isotopes"],
+            )
+            for t in members
+        ]
+        rtc_ref = float(members[0]["rt_center"])
+        rt = ms1.column("rt")
+        win = ms1.filter(pc.less_equal(pc.abs(pc.subtract(rt, rtc_ref)), opts["rt_window"]))
+        obs, _region = observation_for_region(
+            trace, win, progs[0], target_id=int(members[0]["target_id"]),
+            neighborhood_ppm=opts["neighborhood_ppm"],
+        )
+        if int(obs.mask.sum()) == 0:
+            # faint/absent reference grid → don't blanket-no_signal the co-members
+            # (the reference is min target_id, arbitrary w.r.t. abundance); fit each
+            # member on its OWN grid as an independent singleton.
+            subs = [_counter_worker_estimate(t) for t in members]
+            records = [r for s in subs for r in s[0]]
+            attrs = [s[1] for s in subs if s[1] is not None]
+            return records, (pa.concat_tables(attrs) if attrs else None)
+        cfg = DiscoverConfig(
+            detect_threshold=opts["detect_threshold"], max_candidates=opts["max_candidates"]
+        )
+        out = estimate_component(
+            progs, obs, config=cfg, background=opts["background"],
+            rt_priors_ms=[float(t["rt_center"]) * 1000.0 for t in members],
+            return_panel=emit,
+        )
+        if emit:
+            results, panel = out
+            attr = panel_attribution_table(
+                panel, obs, acquisition_id=opts["acquisition_id"],
+                target_id=int(members[0]["target_id"]),
+                # the panel's progenitors ARE the members in order (a component
+                # does no discovery), so stamp each row with its member's real
+                # target_id rather than flattening co-members into anonymous
+                # interferers under the reference's id.
+                progenitor_target_ids=[int(m["target_id"]) for m in members],
+            )
+        else:
+            results, attr = out, None
+        return [{**b, **r, "status": "ok"} for b, r in zip(bases, results)], attr
+    except Exception as exc:  # noqa: BLE001 — one bad component shouldn't kill the run
+        return [{**b, "status": f"error:{type(exc).__name__}"} for b in bases], None
+
+
+def _counter_worker_unit(unit: list[dict]) -> tuple[list[dict], Any]:
+    """Dispatch a co-fit unit: a singleton → the per-target discovery path; a
+    multi-member unit → the joint component co-fit. Both return (records, attribution)."""
+    if len(unit) == 1:
+        return _counter_worker_estimate(unit[0])
+    return _counter_worker_component(unit)
+
+
+def _resolve_collide_ppm(args: argparse.Namespace) -> float:
+    """Clamp --collide-ppm to the XIC extraction tolerance: a member beyond the
+    tolerance the trace was extracted at has NO signal on the reference grid, so
+    grouping it would silently under-score it. The tolerance is read from the trace's
+    schema metadata (stamped by `chromatogram extract`); --extraction-tolerance-ppm
+    overrides; absent + no override → warn and leave --collide-ppm as-is."""
+    import pyarrow.parquet as pq
+
+    extraction_tol = args.extraction_tolerance_ppm
+    if extraction_tol is None:
+        # --trace may be a `chromatogram extract` BUNDLE DIRECTORY (xic_trace.parquet +
+        # manifest.json) or a bare parquet; read the schema from the right place.
+        schema_path = (
+            args.trace / "xic_trace.parquet" if args.trace.is_dir() else args.trace
+        )
+        try:
+            meta = pq.read_schema(schema_path).metadata or {}
+        except Exception:  # noqa: BLE001 — unreadable footer → treat as unrecorded
+            meta = {}
+        tol_b = meta.get(b"x.massspec.extraction_tolerance")
+        if tol_b is not None and meta.get(b"x.massspec.extraction_tolerance_unit") == b"ppm":
+            extraction_tol = float(tol_b.decode("utf-8"))
+    if extraction_tol is None:
+        if not args.no_progress:
+            print(
+                f"warning: trace records no ppm extraction tolerance; --collide-ppm "
+                f"{args.collide_ppm} not validated (pass --extraction-tolerance-ppm)",
+                file=sys.stderr,
+            )
+        return float(args.collide_ppm)
+    if args.collide_ppm > extraction_tol:
+        if not args.no_progress:
+            print(
+                f"warning: --collide-ppm {args.collide_ppm} > extraction tolerance "
+                f"{extraction_tol} ppm; clamping (a member beyond it has no extracted "
+                "signal on the reference grid)",
+                file=sys.stderr,
+            )
+        return float(extraction_tol)
+    return float(args.collide_ppm)
+
+
+def _cmd_counter_estimate(args: argparse.Namespace) -> int:
+    import multiprocessing as mp
+
+
+    from constellation.massspec.counter import CounterResult, counter_n_table, save_counter
+
+    for path in (args.trace, args.scan_metadata, args.calibration, args.targets):
+        if not path.exists():
+            print(f"error: not found: {path}", file=sys.stderr)
+            return 2
+    success = args.output_dir / "_SUCCESS"
+    if success.exists():
+        print(f"error: --output-dir already complete ({success} exists)", file=sys.stderr)
+        return 1
+
+    targets = _counter_targets(args.targets)
+    rt_overlap_s = args.rt_overlap_s if args.rt_overlap_s is not None else args.rt_window
+    if rt_overlap_s > args.rt_window:
+        # a unit's RT span can't exceed the reference's ± rt_window obs window, or a
+        # co-member's elution falls outside the observation entirely.
+        if not args.no_progress:
+            print(
+                f"warning: --rt-overlap-s {rt_overlap_s} > --rt-window {args.rt_window}; "
+                f"clamping to {args.rt_window}",
+                file=sys.stderr,
+            )
+        rt_overlap_s = args.rt_window
+    collide_ppm = _resolve_collide_ppm(args)
+    opts = dict(
+        acquisition_id=args.acquisition_id, n_isotopes=args.n_isotopes,
+        rt_window=args.rt_window, neighborhood_ppm=args.neighborhood_ppm,
+        detect_threshold=args.detect_threshold, max_candidates=args.max_candidates,
+        background=args.background, collide_ppm=collide_ppm,
+        rt_overlap_s=rt_overlap_s, max_component_size=args.max_component_size,
+        emit_attribution=args.emit_attribution,
+    )
+    # Partition into co-fit units in the parent (cheap, data-independent): m/z-overlap
+    # components × RT co-elution. Singletons stay on the per-target discovery path; a
+    # multi-member unit is one joint panel. The worker maps over UNITS, not targets.
+    units, n_capped = _counter_cofit_units(targets, opts)
+    initargs = (str(args.trace), str(args.scan_metadata), str(args.calibration), opts)
+    if args.workers > 1:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(args.workers, initializer=_counter_worker_init, initargs=initargs) as pool:
+            grouped = pool.map(_counter_worker_unit, units)
+    else:
+        _counter_worker_init(*initargs)
+        try:
+            grouped = [_counter_worker_unit(u) for u in units]
+        finally:
+            _COUNTER_CTX.clear()  # don't leak this run's trace/cal into a later in-process call
+    records = [r for group, _attr in grouped for r in group]
+    attr_tables = [attr for _group, attr in grouped if attr is not None]
+
+    ok = [r for r in records if r.get("status") == "ok"]
+    skipped = len(records) - len(ok)
+    n_multi = sum(1 for u in units if len(u) > 1)
+    peak_attribution = None
+    if attr_tables:
+        import pyarrow as pa
+
+        peak_attribution = pa.concat_tables(attr_tables)
+    elif args.emit_attribution:
+        # --emit-attribution was requested but no unit produced rows (every target
+        # no_signal / errored). Write the schema-correct EMPTY table so the requested
+        # output file always exists rather than being silently omitted.
+        from constellation.massspec.counter import COUNTER_PEAK_ATTRIBUTION_TABLE
+
+        peak_attribution = COUNTER_PEAK_ATTRIBUTION_TABLE.empty_table()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    save_counter(
+        CounterResult(counter_n=counter_n_table(ok), peak_attribution=peak_attribution),
+        args.output_dir,
+    )
+    success.touch()
+    if not args.no_progress:
+        extra = f", {n_multi} co-fit components" if n_multi else ""
+        extra += f", {n_capped} oversized split" if n_capped else ""
+        if peak_attribution is not None:
+            extra += f", {peak_attribution.num_rows} attribution rows"
+        print(f"counter estimate: {len(ok)} estimated, {skipped} skipped{extra} → {args.output_dir}",
+              file=sys.stderr)
+    return 0
+
+
+def _cmd_counter_calibrate(args: argparse.Namespace) -> int:
+
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    from constellation.core.sequence.proforma import Peptidoform
+    from constellation.massspec.counter import (
+        GlobalCalibration,
+        Progenitor,
+        StagedCalibration,
+        calibration_to_table,
+        observation_for_progenitor,
+        peptide_params_to_table,
+    )
+
+    for path in (args.trace, args.scan_metadata, args.calibrants):
+        if not path.exists():
+            print(f"error: not found: {path}", file=sys.stderr)
+            return 2
+    success = args.output_dir / "_SUCCESS"
+    if success.exists():
+        print(f"error: --output-dir already complete ({success} exists)", file=sys.stderr)
+        return 1
+
+    trace = pq.read_table(args.trace)
+    sm = pq.read_table(args.scan_metadata)
+    if "level" in sm.column_names:
+        sm = sm.filter(pc.equal(sm.column("level"), 1))
+    ms1 = sm.select(["scan", "rt", "iit"])
+    calibrants = _counter_targets(args.calibrants)
+
+    cal = GlobalCalibration(n_isotopes=args.n_isotopes, charges=(1, 2, 3, 4))
+    progs, obss, tids, mods = [], [], [], []
+    rt = ms1.column("rt")
+    for c in calibrants:
+        tid, modseq, z, rtc = (int(c["target_id"]), c["modified_sequence"],
+                               int(c["precursor_charge"]), float(c["rt_center"]))
+        prog = Progenitor.for_peptide(Peptidoform(sequence=modseq), [z], cal, n_isotopes=args.n_isotopes)
+        win = ms1.filter(pc.less_equal(pc.abs(pc.subtract(rt, rtc)), args.rt_window))
+        obs = observation_for_progenitor(prog, trace, win, target_id=tid)
+        if int(obs.mask.sum()) == 0:
+            continue
+        progs.append(prog)
+        obss.append(obs)
+        tids.append(tid)
+        mods.append(modseq)
+    if not progs:
+        print("error: no calibrant yielded signal", file=sys.stderr)
+        return 1
+
+    from constellation.massspec.counter.orchestrate import _DEFAULT_GLOBAL_PARAMS, _GAIN_PARAM_NAMES
+
+    gp = tuple(_DEFAULT_GLOBAL_PARAMS) + (_GAIN_PARAM_NAMES if args.gain else ())
+    StagedCalibration(progs, obss, cal).run(global_params=gp)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(calibration_to_table(cal, acquisition_id=args.acquisition_id),
+                   args.output_dir / "global_calibration.parquet")
+    pq.write_table(peptide_params_to_table(progs, acquisition_id=args.acquisition_id,
+                                           target_ids=tids, modified_sequences=mods),
+                   args.output_dir / "peptide_params.parquet")
+    success.touch()
+    if not args.no_progress:
+        print(f"counter calibrate: {len(progs)} calibrants → {args.output_dir}", file=sys.stderr)
+    return 0
 
 
 __all__ = ["build_parser"]

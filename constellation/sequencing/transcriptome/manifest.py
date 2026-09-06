@@ -21,9 +21,18 @@ output dir as a ParquetDir bundle (``<demux-dir>/samples/``) and read
 forward by align + cluster, so the path to the original TSV is no
 longer load-bearing.
 
-Schema v4 fields (top level)::
+Schema v5 adds no fields of its own; it marks the demux output's
+``read_demux/`` table gaining an ``orientation`` column. That column is
+load-bearing rather than informational — ``transcript_start`` /
+``transcript_end`` index the chosen-orientation frame, so without it a
+consumer slicing ``READ_TABLE.sequence`` silently extracts the wrong
+strand over the wrong interval for every reverse-oriented read. The
+version bump exists so a v4 demux directory is recognisable as one that
+must be regenerated rather than read with a missing column.
 
-    schema_version  = 4
+Schema v5 fields (top level)::
+
+    schema_version  = 5
     kind            "demux" | "align" | "cluster"
     created_at      ISO 8601 UTC timestamp
 
@@ -69,7 +78,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 
-MANIFEST_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 5
 MANIFEST_FILENAME = "manifest.json"
 
 

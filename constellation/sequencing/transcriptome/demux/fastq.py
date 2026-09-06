@@ -52,6 +52,7 @@ import pyarrow as pa
 
 from constellation.sequencing.align.map import (
     _iter_demux_read_batches,
+    transcript_window_buffers,
     _string_buf_and_offsets,
 )
 from constellation.core.progress import (
@@ -153,22 +154,25 @@ class _SampleWriter:
 def _format_per_sample_chunks(batch: pa.RecordBatch) -> dict[int, bytes]:
     """Group a joined batch by sample_id and assemble FASTQ bytes per sample.
 
-    Operates on the raw StringArray byte buffers (no per-row str
-    decode + encode round-trip).  Uses numpy.argsort for stable
-    grouping by ``sample_id`` so the inner write loop touches each
-    sample's contiguous run of rows once.
+    Windows come from :func:`transcript_window_buffers`, so a ``'-'``
+    read is emitted reverse-complemented into the sense strand with its
+    quality reversed to match. Slicing the stored bytes directly emitted
+    the wrong strand over the wrong interval for reverse-oriented reads.
+
+    Uses numpy.argsort for stable grouping by ``sample_id`` so the inner
+    write loop touches each sample's contiguous run of rows once.
     """
     rid_data, rid_off = _string_buf_and_offsets(batch.column("read_id"))
-    seq_data, seq_off = _string_buf_and_offsets(batch.column("sequence"))
+    seq_buf, seq_off = transcript_window_buffers(batch)
     has_quality = "quality" in batch.schema.names
     if has_quality:
-        qual_data, qual_off = _string_buf_and_offsets(batch.column("quality"))
+        qual_buf, qual_off = transcript_window_buffers(
+            batch, column="quality", complement=False
+        )
     else:
-        qual_data, qual_off = b"", None
+        qual_buf, qual_off = None, None
 
     sample_ids = batch.column("sample_id").to_numpy()
-    ts = batch.column("transcript_start").to_numpy()
-    te = batch.column("transcript_end").to_numpy()
     n_rows = batch.num_rows
     if n_rows == 0:
         return {}
@@ -190,30 +194,22 @@ def _format_per_sample_chunks(batch: pa.RecordBatch) -> dict[int, bytes]:
         sid = int(sample_ids[run[0]])
         buf = bytearray()
         for i in run:
-            ts_i = int(ts[i])
-            te_i = int(te[i])
-            window_len = te_i - ts_i
+            start_i, end_i = int(seq_off[i]), int(seq_off[i + 1])
+            window_len = end_i - start_i
             if window_len <= 0:
-                continue
-            row_data_end = int(seq_off[i + 1])
-            seq_start = int(seq_off[i]) + ts_i
-            seq_end = int(seq_off[i]) + te_i
-            if seq_end > row_data_end:
                 continue
             buf.append(0x40)  # '@'
             buf += rid_data[rid_off[i]:rid_off[i + 1]]
             buf.append(0x0A)  # '\n'
-            buf += seq_data[seq_start:seq_end]
+            buf += seq_buf[start_i:end_i].tobytes()
             buf += b"\n+\n"
-            if qual_off is not None:
-                q_start = int(qual_off[i]) + ts_i
-                q_end = int(qual_off[i]) + te_i
-                if q_end - q_start == window_len:
-                    buf += qual_data[q_start:q_end]
-                else:
-                    # Null / wrong-length quality → synthetic Q40.
-                    buf += b"I" * window_len
+            if (
+                qual_off is not None
+                and int(qual_off[i + 1]) - int(qual_off[i]) == window_len
+            ):
+                buf += qual_buf[int(qual_off[i]):int(qual_off[i + 1])].tobytes()
             else:
+                # Null / wrong-length quality -> synthetic Q40.
                 buf += b"I" * window_len
             buf.append(0x0A)  # '\n'
         if buf:

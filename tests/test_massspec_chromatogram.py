@@ -120,6 +120,9 @@ def test_ms1_schema_and_signal_recovery():
         tolerance=_TOL_PPM,
     )
     assert out.schema.equals(XIC_TRACE_TABLE)
+    # the XIC match tolerance is recorded in the trace metadata (downstream clamps)
+    assert float(out.schema.metadata[b"x.massspec.extraction_tolerance"]) == _TOL_PPM
+    assert out.schema.metadata[b"x.massspec.extraction_tolerance_unit"] == b"ppm"
     sub = _charge2(out)
     assert sub.num_rows == 9  # 3 isotopes × 3 signal scans
     errs = sub.column("mz_error_ppm").to_pylist()

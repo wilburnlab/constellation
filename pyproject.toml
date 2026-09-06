@@ -11,9 +11,14 @@ dynamic = ["version"]
 description = "Integrative bioinformatics platform for analysis of diverse omic and bioanalytical datasets"
 readme = "README.md"
 license = { text = "Apache-2.0" }
-# Ceiling <3.13 driven by koinapy 0.0.10 + PyTorch 2.5.x (same as
-# Cartographer). pythonnet 3.0.3 itself supports 3.12 fine. Revisit
-# when koinapy ships a 3.13-compatible wheel.
+# Ceiling <3.13 is driven by koinapy alone: koinapy 0.0.10 declares
+# Requires-Python >=3.8,<3.13. PyTorch no longer contributes (torch 2.12
+# requires only >=3.10), and pythonnet 3.0.3 supports 3.12 fine.
+# koinapy is load-bearing as of the Koina prediction backend
+# (massspec.library.koina), but it is confined to one module and is a
+# thin wrapper over tritonclient, which declares no Python bound — so
+# lifting this ceiling means reimplementing that one client against
+# tritonclient directly, not a broad migration.
 requires-python = ">=3.12, <3.13"
 dependencies = [
     "torch>=2.2",
@@ -41,7 +46,12 @@ dependencies = [
 # binaries (Thermo DLLs, EncyclopeDIA jar, mmseqs2, Dorado, ...) go
 # through `scripts/install-*.sh` and thirdparty/ adapters — not extras.
 ms         = ["requests", "koinapy"]
-sequencing = ["pod5>=0.3", "edlib", "parasail", "pysam>=0.21"]
+# xxhash: 64/128-bit non-cryptographic hashes for read fingerprints
+# (cluster.fingerprints) and de-novo dereplication keys
+# (cluster.denovo.dereplicate). environment.yml already installs it,
+# but a `pip install constellation-bio[sequencing]` did not, so the
+# first clustering run died on ModuleNotFoundError.
+sequencing = ["pod5>=0.3", "edlib", "parasail", "pysam>=0.21", "xxhash>=3.4"]
 structure  = []  # OpenMM + PDBFixer are conda-only; guarded lazy-import in thirdparty/
 dynamics   = []  # same
 # Visualization layer: FastAPI server + Datashader rasterization for the

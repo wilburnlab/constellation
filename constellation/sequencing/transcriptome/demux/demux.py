@@ -581,6 +581,8 @@ def locate_segments(
                 "read_id": read_id,
                 "transcript_segment_index": 0,
                 "sample_id": None,
+                # The frame transcript_start/end are expressed in.
+                "orientation": anno.orientation,
                 "transcript_start": (
                     anno.transcript_start if anno.transcript_start is not None else -1
                 ),

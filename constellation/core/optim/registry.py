@@ -2,9 +2,10 @@
 
 Per Principle 5, DE and the torch.optim families share one registry so
 `Parametric.fit(optimizer=OPTIMIZER_REGISTRY["de"](model, **kwargs))`
-works without import-time discrimination. The registry is small in v1
-(LBFGS + DE) and grows as more torch.optim wrappers earn their keep —
-add Adam/SGD when a real `core.nn` training loop demands them, not
+works without import-time discrimination. v1 shipped LBFGS + DE; Adam
+landed when the Monte-Carlo ELBO objective (`core.stats.variational`)
+demanded a stochastic-gradient optimizer LBFGS's line search can't serve.
+More torch.optim wrappers (SGD, ...) join as concrete needs arise, not
 preemptively.
 
 Factories accept `(model, **kwargs)` and return an instance satisfying
@@ -18,6 +19,7 @@ from typing import Any, Callable
 
 from torch import nn
 
+from ._adam import AdamOptimizer
 from ._de import DifferentialEvolution
 from ._lbfgs import LBFGSOptimizer
 
@@ -25,6 +27,7 @@ OptimizerFactory = Callable[..., Any]
 
 OPTIMIZER_REGISTRY: dict[str, OptimizerFactory] = {
     "lbfgs": LBFGSOptimizer,
+    "adam": AdamOptimizer,
     "de": DifferentialEvolution,
 }
 

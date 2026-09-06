@@ -205,7 +205,7 @@ def test_t2p_reference_from_demux_dir_rejected(
     demux_dir = tmp_path / "demux"
     demux_dir.mkdir()
     (demux_dir / "manifest.json").write_text(
-        '{"schema_version": 4, "kind": "demux", "output_dir": "."}'
+        '{"schema_version": 5, "kind": "demux", "output_dir": "."}'
     )
 
     args = argparse.Namespace(reference=None, reference_from=demux_dir)
@@ -226,7 +226,7 @@ def test_t2p_reference_and_reference_from_disagreement_rejected(
     align_dir = tmp_path / "align"
     align_dir.mkdir()
     (align_dir / "manifest.json").write_text(
-        '{"schema_version": 4, "kind": "align", "output_dir": ".", '
+        '{"schema_version": 5, "kind": "align", "output_dir": ".", '
         '"input_demux_dir": "x", "input_bam_paths": [], "samples": [], '
         '"reference_handle": "mus_musculus@refseq-other", '
         '"reference_path": "/tmp/x", "assembly_accession": null}'
@@ -1067,3 +1067,127 @@ def test_orchestrator_preflight_rejects_old_encyclopedia(
     assert "2.12.30" in err and "6.5.15" in err
     # Failed at preflight — Stage 0 never created its output dir.
     assert not (stub_inputs["output_dir"] / "00_deduped_refseq").exists()
+
+
+# ── Stage 6 → Stage 7 handoff with the REAL runner ─────────────────────
+#
+# stub_external_calls replaces run_process_dia with a fake that writes
+# straight to the requested output_dia. That is convenient but it hides
+# the seam that actually broke: with a single GPF the jar ignores -o and
+# names the cache itself, and only run_process_dia relocates it. These
+# two tests put the real wrapper back and fake only run_jar beneath it.
+
+
+def _fake_jar_single_input_convention(cwd_writer):
+    """run_jar double honouring 6.5.15 single-input convention.
+
+    Ignores ``-o`` entirely and writes ``<input_stem>.dia`` into its own
+    cwd — never to the path the caller asked for.
+    """
+
+    def _fake_run_jar(tool, *, args, cwd, **kw):
+        first_input = Path(args[args.index("-i") + 1].split(":")[0])
+        cwd_writer(Path(cwd) / f"{first_input.stem}.dia")
+
+        class _R:
+            elapsed_seconds = 0.01
+            returncode = 0
+            java_version = "stub-java"
+            argv = list(args)
+            jar_sha256 = "0" * 64
+            java_source = "stub"
+            java_path = Path("/usr/bin/java")
+            stdout_log = Path(cwd) / "logs" / "stdout.log"
+            stderr_log = Path(cwd) / "logs" / "stderr.log"
+
+        return _R()
+
+    return _fake_run_jar
+
+
+def _write_dia_sqlite(path: Path) -> None:
+    """Minimal .DIA the downstream collision filter can open."""
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(path))
+    try:
+        con.execute(
+            "CREATE TABLE ranges (Start REAL, Stop REAL, "
+            "DutyCycle REAL, NumWindows INTEGER)"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_orchestrator_stage6_real_runner_relocates_single_gpf(
+    stub_inputs, stub_external_calls, monkeypatch
+) -> None:
+    """One GPF, real run_process_dia: Stage 7 must receive a real cache.
+
+    Regression for the handoff that shipped broken — Stage 6 touched
+    _SUCCESS while the cache still sat under the jar-chosen name, and
+    Stage 7 searched a path that had never existed.
+    """
+    from constellation.massspec.search.encyclopedia import process_dia as pd
+    from constellation.transcriptome_to_proteome import (
+        run_transcriptome_to_proteomics,
+    )
+
+    monkeypatch.setattr(
+        "constellation.massspec.search.encyclopedia.run_process_dia",
+        pd.run_process_dia,
+    )
+    monkeypatch.setattr(
+        pd, "run_jar", _fake_jar_single_input_convention(_write_dia_sqlite)
+    )
+
+    args = _build_args(stub_inputs)
+    rc = run_transcriptome_to_proteomics(
+        args=args,
+        reference=stub_inputs["reference"],
+        swissprot_reference=stub_inputs["swissprot_reference"],
+    )
+    assert rc == 0
+
+    stage6 = stub_inputs["output_dir"] / "06_process_dia"
+    assert (stage6 / "_SUCCESS").is_file()
+    combined = stage6 / f"{stub_inputs['output_dir'].name}_combined_GPF.dia"
+    assert combined.is_file(), "Stage 7 would have searched a missing cache"
+    # The jar-named intermediate must not be left behind beside it.
+    assert not (stage6 / "gpf.dia").exists()
+
+
+def test_orchestrator_stage6_fails_without_success_when_no_cache(
+    stub_inputs, stub_external_calls, monkeypatch
+) -> None:
+    """No cache produced → Stage 6 raises and leaves no _SUCCESS.
+
+    A stage marked complete over a missing artifact fails much later and
+    far less legibly, in Stage 7's search.
+    """
+    from constellation.massspec.search.encyclopedia import process_dia as pd
+    from constellation.transcriptome_to_proteome import (
+        run_transcriptome_to_proteomics,
+    )
+
+    monkeypatch.setattr(
+        "constellation.massspec.search.encyclopedia.run_process_dia",
+        pd.run_process_dia,
+    )
+    # Exits 0 having written nothing at all.
+    monkeypatch.setattr(
+        pd, "run_jar", _fake_jar_single_input_convention(lambda _p: None)
+    )
+
+    args = _build_args(stub_inputs)
+    with pytest.raises(RuntimeError, match="no .DIA cache"):
+        run_transcriptome_to_proteomics(
+            args=args,
+            reference=stub_inputs["reference"],
+            swissprot_reference=stub_inputs["swissprot_reference"],
+        )
+
+    stage6 = stub_inputs["output_dir"] / "06_process_dia"
+    assert not (stage6 / "_SUCCESS").exists()

@@ -95,7 +95,19 @@ READ_DEMUX_TABLE: pa.Schema = pa.schema(
         # assigned reads; null sample_id is the explicit "Source_None"
         # case in NanoporeAnalysis's per-read output.
         pa.field("sample_id", pa.int64(), nullable=True),
-        # 0-based half-open offsets into the read for the transcript window
+        # Orientation of the frame the offsets below are expressed in.
+        # '+' = the read as stored in READ_TABLE matched the construct;
+        # '-' = demux reverse-complemented it to match, and the window
+        # offsets index THAT reverse-complemented sequence, not the
+        # stored one. Consumers slicing READ_TABLE.sequence must
+        # reverse-complement first when this is '-' — otherwise they
+        # extract the wrong strand over the wrong interval. Carried here
+        # (rather than left in READ_SEGMENT_TABLE) because it is a
+        # property of the resolved record and every window consumer
+        # needs it.
+        pa.field("orientation", pa.string(), nullable=False),
+        # 0-based half-open offsets into the read for the transcript
+        # window, in the frame named by `orientation` above.
         pa.field("transcript_start", pa.int32(), nullable=False),
         pa.field("transcript_end", pa.int32(), nullable=False),
         # Aggregated demux confidence (0..1)

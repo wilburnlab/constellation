@@ -344,6 +344,23 @@ def _finalize(table: pa.Table, output_path: Path | str | None) -> pa.Table | Pat
     return out
 
 
+_EXTRACTION_TOL_KEY = b"x.massspec.extraction_tolerance"
+_EXTRACTION_TOL_UNIT_KEY = b"x.massspec.extraction_tolerance_unit"
+
+
+def _stamp_extraction_tolerance(
+    table: pa.Table, tolerance: float, tolerance_unit: str
+) -> pa.Table:
+    """Record the XIC match tolerance in the trace's schema metadata. A peak only
+    enters a target's trace when it sits within this tolerance of a target channel,
+    so a downstream consumer (e.g. counter component grouping) can read it to bound
+    how far apart two co-fit candidates may be and still share extracted signal."""
+    meta = dict(table.schema.metadata or {})
+    meta[_EXTRACTION_TOL_KEY] = repr(float(tolerance)).encode("utf-8")
+    meta[_EXTRACTION_TOL_UNIT_KEY] = str(tolerance_unit).encode("utf-8")
+    return table.replace_schema_metadata(meta)
+
+
 def save_xic(
     table: pa.Table,
     path: Path | str,
@@ -580,7 +597,10 @@ def extract_xic_scan_major(
             within=within,
             drop_unmatched=drop_unmatched,
         )
-    return _finalize(builder.table(), output_path)
+    return _finalize(
+        _stamp_extraction_tolerance(builder.table(), tolerance, tolerance_unit),
+        output_path,
+    )
 
 
 def _build_obs_matrices(
@@ -803,7 +823,9 @@ def extract_xic_indexed(
     table = builder.table()
     if exact_error and _index_mz_is_f32(manifest) and peaks_dir is not None:
         table = _enrich_exact_error(table, peaks_dir, level)
-    return _finalize(table, output_path)
+    return _finalize(
+        _stamp_extraction_tolerance(table, tolerance, tolerance_unit), output_path
+    )
 
 
 def _extract_target_indexed(

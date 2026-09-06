@@ -87,7 +87,7 @@ Locked decisions vs the original draft (after framework re-evaluation):
 - **Layout library**: `dockview-core` (vanilla TS, zero deps, MIT). The original draft said `dockview-react`; once we confirmed dockview's *core* package is framework-agnostic, we kept the vanilla-TS paradigm from PR 1 instead of introducing React. Lumino was a viable alternative (BSD-3, JupyterLab's framework) — slightly higher theoretical ceiling but less batteries-included theming and a larger v1 footprint.
 - **Layout scope**: full splittable docking from day one (`DockviewComponent` with the `createComponent` factory), not a tab strip. Avoids a state-model rewrite when a second terminal + viz panel co-exist.
 - **What ships in v1**: bare `constellation` no-arg dispatch + sidebar + form generator + xterm.js terminal + subprocess runner + lock + 2 endpoints (`/api/cli/schema`, `/api/commands*`).
-- **What's deferred**: IPython panel (would reuse runner plumbing with `python -m IPython --simple-prompt`), sandboxed FilePicker + `/api/fs/list`, embedded-genome-as-dock-panel (v1 deep-links to `/static/genome/`), desktop shortcut generator. None of these are blockers for the launch UX; each is a focused follow-up PR.
+- **What's deferred**: IPython panel (would reuse runner plumbing with `python -m IPython --simple-prompt`), ~~sandboxed FilePicker + `/api/fs/list`~~ (**SHIPPED** in the file-picker PR — `server/endpoints/fs.py` + `widgets/{PathInput,FilePicker}.ts`; see `viz/CLAUDE.md`), embedded-genome-as-dock-panel (**SHIPPED** PR 3), desktop shortcut generator. None of these are blockers for the launch UX; each is a focused follow-up PR.
 - **Theming**: dockview-core's dark theme as v1 default; ~40 `--dv-*` CSS variables exposed for palette tweaks; corners softened via `--dv-tab-border-radius: 6px`.
 
 Concrete deliverables:
@@ -407,7 +407,7 @@ constellation/viz/
 
 ### CLI changes (PR 2)
 
-`_build_dashboard_parser` adds `dashboard` subcommand: `--port`, `--host`, `--no-browser`, `--root DIR` (sandboxed root for the file picker; defaults to `$HOME`).
+`_build_dashboard_parser` adds `dashboard` subcommand: `--port`, `--host`, `--no-browser`, `--root DIR` (**shipped**: repeatable; *widens* the file-picker sandbox on top of the default roots — home + cwd + WSL `/mnt/*` drives — rather than replacing `$HOME`; the same flag is on `viz genome`).
 
 Modify `main()` to handle bare invocation:
 

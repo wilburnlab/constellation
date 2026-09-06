@@ -95,6 +95,7 @@ def test_iter_demux_read_batches_filters_and_slices(tmp_path: Path) -> None:
             "read_id": read_id,
             "transcript_segment_index": 0,
             "sample_id": sample_id,
+            "orientation": "+",
             "transcript_start": 10,
             "transcript_end": 50,
             "score": 0.0,
@@ -150,10 +151,12 @@ def test_iter_demux_read_batches_skips_invalid_window(tmp_path: Path) -> None:
     ]
     demux = [
         {"read_id": "r0", "transcript_segment_index": 0, "sample_id": 1,
+         "orientation": "+",
          "transcript_start": -1, "transcript_end": -1, "score": 0.0,
          "is_chimera": False, "status": "Complete", "is_fragment": False,
          "artifact": "none"},
         {"read_id": "r1", "transcript_segment_index": 0, "sample_id": 1,
+         "orientation": "+",
          "transcript_start": 50, "transcript_end": 50, "score": 0.0,
          "is_chimera": False, "status": "Complete", "is_fragment": False,
          "artifact": "none"},
@@ -200,6 +203,7 @@ def test_map_to_genome_end_to_end(tmp_path: Path) -> None:
             "read_id": "r0",
             "transcript_segment_index": 0,
             "sample_id": 1,
+            "orientation": "+",
             "transcript_start": 30,
             "transcript_end": 130,
             "score": 0.0,
@@ -252,6 +256,7 @@ def test_map_to_genome_caches_fasta(tmp_path: Path) -> None:
     demux = [
         {
             "read_id": "r0", "transcript_segment_index": 0, "sample_id": 1,
+            "orientation": "+",
             "transcript_start": 0, "transcript_end": len(transcript),
             "score": 0.0, "is_chimera": False, "status": "Complete",
             "is_fragment": False, "artifact": "none",
@@ -304,3 +309,157 @@ def test_minimap2_run_accepts_arbitrary_args(tmp_path: Path) -> None:
     assert out == sam
     assert sam.exists()
     assert sam.stat().st_size > 0
+
+
+# ── orientation-aware transcript windows ───────────────────────────────
+#
+# transcript_start/end index the CHOSEN-orientation frame, but reads/
+# stores the original strand (stages.py builds the reads shard from the
+# raw parse, then runs demux on it). Slicing the stored bytes directly
+# took the wrong strand over the wrong interval for every '-' read, so
+# reverse-oriented reads clustered apart from the forward reads of the
+# same transcript instead of joining them.
+
+
+def _demux_one(seq: str, qual: str, read_id: str):
+    """Run demux on a single read; return its resolved annotation."""
+    import pyarrow as pa
+
+    from constellation.sequencing.schemas.reads import READ_TABLE
+    from constellation.sequencing.transcriptome.demux.demux import locate_segments
+    from constellation.sequencing.transcriptome.demux.designs import CDNA_WILBURN_V1
+
+    reads = pa.Table.from_pylist(
+        [
+            {
+                "read_id": read_id,
+                "acquisition_id": 0,
+                "sequence": seq,
+                "quality": qual,
+            }
+        ],
+        schema=READ_TABLE,
+    )
+    _segments, _demux, results = locate_segments(reads, CDNA_WILBURN_V1)
+    return results[0]
+
+
+def test_reverse_oriented_read_yields_the_same_window_as_its_forward_twin():
+    """The same molecule, sequenced both ways, must give one window.
+
+    This is the whole point: if the two disagree, the reverse read forms
+    its own cluster and the transcript's abundance is split in two.
+    """
+    import numpy as np
+    import pyarrow as pa
+
+    from constellation.sequencing.align.map import transcript_window_buffers
+    from constellation.sequencing.transcriptome.demux import simulator as sim
+    from constellation.sequencing.transcriptome.demux.demux import (
+        _reverse_complement,
+    )
+    from constellation.sequencing.transcriptome.demux.designs import CDNA_WILBURN_V1
+
+    rng = np.random.default_rng(7)
+    seq, qual = sim.assemble_sequence(
+        sim.ReadSpec(
+            read_id="x",
+            expected_status=sim.ReadStatus.COMPLETE,
+            orientation="+",
+            transcript_length=400,
+            transcript_id="T1",
+            polyA_length=30,
+            polyA_artifact="clean",
+            barcode_index=2,
+        ),
+        CDNA_WILBURN_V1,
+        rng=rng,
+    )
+    rows = [("fwd", seq, qual), ("rev", _reverse_complement(seq), qual[::-1])]
+    annotated = [(rid, s, q, _demux_one(s, q, rid)) for rid, s, q in rows]
+
+    # Precondition: the two really did resolve to opposite orientations,
+    # otherwise this test proves nothing.
+    orientations = [a.annotation.orientation for _r, _s, _q, a in annotated]
+    assert orientations == ["+", "-"], orientations
+
+    batch = pa.RecordBatch.from_pylist(
+        [
+            {
+                "read_id": rid,
+                "sequence": s,
+                "quality": q,
+                "orientation": a.annotation.orientation,
+                "transcript_start": a.annotation.transcript_start,
+                "transcript_end": a.annotation.transcript_end,
+            }
+            for rid, s, q, a in annotated
+        ]
+    )
+    buf, off = transcript_window_buffers(batch)
+    windows = [bytes(buf[off[i] : off[i + 1]]).decode() for i in range(2)]
+    assert windows[0] == windows[1]
+
+    # And it is demux's own notion of the window, not merely self-consistent.
+    fwd = annotated[0][3]
+    assert windows[0] == fwd.chosen_sequence[
+        fwd.annotation.transcript_start : fwd.annotation.transcript_end
+    ]
+
+
+def test_quality_window_is_reversed_but_not_complemented():
+    """Quality travels with the bases but has no complement."""
+    import numpy as np
+    import pyarrow as pa
+
+    from constellation.sequencing.align.map import transcript_window_buffers
+
+    batch = pa.RecordBatch.from_pylist(
+        [
+            {
+                "read_id": "r",
+                "sequence": "AAACCCGGGTTT",
+                "quality": "0123456789ab",
+                "orientation": "-",
+                "transcript_start": 0,
+                "transcript_end": 12,
+            }
+        ]
+    )
+    seq_buf, seq_off = transcript_window_buffers(batch)
+    q_buf, q_off = transcript_window_buffers(batch, column="quality", complement=False)
+    assert bytes(seq_buf).decode() == "AAACCCGGGTTT"  # revcomp of itself here
+    assert bytes(q_buf).decode() == "ba9876543210"
+    assert int(seq_off[-1]) == int(q_off[-1]) == 12
+    del np
+
+
+def test_missing_orientation_column_is_refused(tmp_path):
+    """A pre-orientation demux dir must error, not silently mis-slice."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from constellation.sequencing.align.map import _iter_demux_read_batches
+
+    (tmp_path / "reads").mkdir(parents=True)
+    (tmp_path / "read_demux").mkdir(parents=True)
+    pq.write_table(
+        pa.table({"read_id": ["a"], "sequence": ["ACGT"]}),
+        tmp_path / "reads" / "part-00000.parquet",
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "read_id": ["a"],
+                "sample_id": pa.array([1], pa.int64()),
+                "transcript_start": pa.array([0], pa.int32()),
+                "transcript_end": pa.array([4], pa.int32()),
+                "status": ["Complete"],
+                "is_fragment": [False],
+                "is_chimera": [False],
+            }
+        ),
+        tmp_path / "read_demux" / "part-00000.parquet",
+    )
+    with pytest.raises(ValueError, match="predates the `orientation` column"):
+        list(_iter_demux_read_batches(tmp_path))
