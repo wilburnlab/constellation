@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk '{printf \"%d\\\\t%s\\\\n\", NR+167, $0}')",
+      "Bash(awk '{printf \"%d\\\\t%s\\\\n\", NR+102, $0}')"
+    ]
+  }
+}

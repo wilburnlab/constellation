@@ -46,7 +46,12 @@ dependencies = [
 # binaries (Thermo DLLs, EncyclopeDIA jar, mmseqs2, Dorado, ...) go
 # through `scripts/install-*.sh` and thirdparty/ adapters — not extras.
 ms         = ["requests", "koinapy"]
-sequencing = ["pod5>=0.3", "edlib", "parasail", "pysam>=0.21"]
+# xxhash: 64/128-bit non-cryptographic hashes for read fingerprints
+# (cluster.fingerprints) and de-novo dereplication keys
+# (cluster.denovo.dereplicate). environment.yml already installs it,
+# but a `pip install constellation-bio[sequencing]` did not, so the
+# first clustering run died on ModuleNotFoundError.
+sequencing = ["pod5>=0.3", "edlib", "parasail", "pysam>=0.21", "xxhash>=3.4"]
 structure  = []  # OpenMM + PDBFixer are conda-only; guarded lazy-import in thirdparty/
 dynamics   = []  # same
 # Visualization layer: FastAPI server + Datashader rasterization for the

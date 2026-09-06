@@ -205,7 +205,7 @@ def test_t2p_reference_from_demux_dir_rejected(
     demux_dir = tmp_path / "demux"
     demux_dir.mkdir()
     (demux_dir / "manifest.json").write_text(
-        '{"schema_version": 4, "kind": "demux", "output_dir": "."}'
+        '{"schema_version": 5, "kind": "demux", "output_dir": "."}'
     )
 
     args = argparse.Namespace(reference=None, reference_from=demux_dir)
@@ -226,7 +226,7 @@ def test_t2p_reference_and_reference_from_disagreement_rejected(
     align_dir = tmp_path / "align"
     align_dir.mkdir()
     (align_dir / "manifest.json").write_text(
-        '{"schema_version": 4, "kind": "align", "output_dir": ".", '
+        '{"schema_version": 5, "kind": "align", "output_dir": ".", '
         '"input_demux_dir": "x", "input_bam_paths": [], "samples": [], '
         '"reference_handle": "mus_musculus@refseq-other", '
         '"reference_path": "/tmp/x", "assembly_accession": null}'
