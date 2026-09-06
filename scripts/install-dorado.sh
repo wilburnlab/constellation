@@ -31,10 +31,18 @@ PINNED_VERSION="2.0.0"
 # verified 2026-06-09; arm64 / osx-arm64 are placeholders — pass --checksum
 # to verify those (or fill them in once verified). For any other --version,
 # pass --checksum.
-declare -A PINNED_SHA
-PINNED_SHA[linux-x64]="311c4be8fe5177ee2ffe08e2b6ae08bd7f4f1c11caf273e6161562bd9ba48b49"
-PINNED_SHA[linux-arm64]="REPLACE_WITH_VERIFIED_SHA256"
-PINNED_SHA[osx-arm64]="REPLACE_WITH_VERIFIED_SHA256"
+# Portable case mapping rather than `declare -A`: associative arrays need
+# Bash 4+, and macOS ships Bash 3.2. This script advertises Darwin-arm64,
+# and `declare -A` runs before argument parsing — so on a stock Mac even
+# `--help` exited here.
+pinned_sha_for() {
+    case "$1" in
+        linux-x64)   printf '%s' "311c4be8fe5177ee2ffe08e2b6ae08bd7f4f1c11caf273e6161562bd9ba48b49" ;;
+        linux-arm64) printf '%s' "REPLACE_WITH_VERIFIED_SHA256" ;;
+        osx-arm64)   printf '%s' "REPLACE_WITH_VERIFIED_SHA256" ;;
+        *)           printf '%s' "" ;;
+    esac
+}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -143,7 +151,7 @@ else
     if [[ -n "${override_sha}" ]]; then
         EXPECTED_SHA="${override_sha}"
     elif [[ "${VERSION}" == "${PINNED_VERSION}" ]]; then
-        EXPECTED_SHA="${PINNED_SHA[${PLATFORM}]:-}"
+        EXPECTED_SHA="$(pinned_sha_for "${PLATFORM}")"
     else
         EXPECTED_SHA=""
     fi

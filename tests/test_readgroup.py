@@ -60,9 +60,19 @@ def test_validate_multiple_models_raises():
 
 
 def test_validate_multiple_models_allow_override():
+    """--allow-multi-model skips the guard; it does not pick a winner.
+
+    This previously asserted a "deterministic pick (sorted)", i.e. that
+    the lexicographically first model was returned — which
+    harmonize_read_group then stamped onto every read, making a mixed
+    BAM look homogeneous so `dorado polish` would apply m1's model to
+    m2's reads with nothing left to detect the mismatch. Returning None
+    omits the DS:basecall_model tag entirely, so the header makes no
+    model claim and polish must be given one explicitly, which is what
+    the flag's help already promises.
+    """
     models = {Path("a.bam"): {"m2"}, Path("b.bam"): {"m1"}}
-    # deterministic pick (sorted) when overridden
-    assert validate_single_model(models, allow_multi=True) == "m1"
+    assert validate_single_model(models, allow_multi=True) is None
 
 
 # ── integration: harmonize (needs samtools + pysam) ──────────────────

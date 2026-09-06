@@ -169,25 +169,43 @@ class RunHandle:
         """Iterator over progress events parsed from stderr, following the
         log until the run finishes."""
         log = Path(self.stderr_log)
-        yielded = 0
+        # Advance from the last byte offset rather than rereading the
+        # whole log each tick. At 200 ms over a multi-day run the reread
+        # is quadratic in log size, and --progress / --follow got steadily
+        # more expensive exactly when the run was longest.
+        offset = 0
+        pending = ""
         while True:
-            lines = log.read_text(errors="replace").splitlines() if log.exists() else []
-            for line in lines[yielded:]:
+            lines: list[str] = []
+            if log.exists():
+                with log.open("rb") as fh:
+                    fh.seek(offset)
+                    chunk = fh.read()
+                    offset = fh.tell()
+                if chunk:
+                    pending += chunk.decode("utf-8", errors="replace")
+                    parts = pending.split("\n")
+                    pending = parts.pop()
+                    lines = parts
+            for line in lines:
                 yield _parse_progress(line, self.started_at)
-            yielded = len(lines)
             if self.poll() in (
                 RunStatus.COMPLETED,
                 RunStatus.FAILED,
                 RunStatus.UNKNOWN,
                 RunStatus.CANCELLED,
             ):
-                final = (
-                    log.read_text(errors="replace").splitlines()
-                    if log.exists()
-                    else []
-                )
-                for line in final[yielded:]:
-                    yield _parse_progress(line, self.started_at)
+                # Drain whatever landed after the last read, plus any
+                # trailing partial line the writer never terminated.
+                if log.exists():
+                    with log.open("rb") as fh:
+                        fh.seek(offset)
+                        tail = fh.read()
+                    if tail:
+                        pending += tail.decode("utf-8", errors="replace")
+                for line in pending.split("\n"):
+                    if line:
+                        yield _parse_progress(line, self.started_at)
                 return
             time.sleep(0.2)
 

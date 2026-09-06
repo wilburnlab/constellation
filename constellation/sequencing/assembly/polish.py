@@ -49,13 +49,36 @@ class PolishRunner:
         progress_cb: ProgressCallback | None = None,
     ) -> Assembly:
         n = rounds if rounds is not None else self.rounds
+        if n < 0:
+            # 0 intentionally disables polishing; a negative count is a
+            # typo that silently returned the input unchanged while the
+            # standalone command printed "polished" and the pipeline
+            # wrote a successful manifest recording polish_rounds: -1.
+            raise ValueError(f"polish rounds must be >= 0; got {n}")
         if n < 1:
             return assembly
         if not read_paths:
             raise ValueError("PolishRunner.run needs the harmonized reads BAM")
-        reads_bam = Path(read_paths[0])
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        if len(read_paths) == 1:
+            reads_bam = Path(read_paths[0])
+        else:
+            # `genome polish --reads` takes nargs="+". Using only the
+            # first silently dropped every other flow cell from alignment
+            # and consensus, materially cutting coverage and biasing the
+            # polished assembly. Harmonize them into one model-tagged @RG,
+            # exactly as the assemble pipeline does — dorado polish
+            # rejects multi-model BAMs, so this is also what it needs.
+            from constellation.sequencing.basecall.readgroup import (
+                harmonize_read_group,
+            )
+
+            reads_bam = harmonize_read_group(
+                [Path(p) for p in read_paths],
+                output_dir / "harmonized.bam",
+                threads=self.threads,
+            )
 
         dorado = DoradoRunner(device=self.device, threads=self.threads)
         # Baseline polish count carried in from a prior polish run, if any.
@@ -87,20 +110,41 @@ class PolishRunner:
                 round_dir / "draft.fasta.meta.json",
             )
             aligned = round_dir / "aligned.bam"
-            dorado.aligner(draft_fasta, reads_bam, aligned).wait()
+            rc = dorado.aligner(draft_fasta, reads_bam, aligned).wait()
+            if rc != 0:
+                raise RuntimeError(
+                    f"dorado aligner exited {rc} in polish round {r} "
+                    f"({round_dir}); refusing to continue"
+                )
             sorted_bam = round_dir / "aligned.sorted.bam"
             samtools_sort(aligned, sorted_bam, threads=self.threads)
             samtools_index(sorted_bam, threads=self.threads)
 
             consensus = round_dir / "consensus.fasta"
-            dorado.polish(
+            rc = dorado.polish(
                 sorted_bam,
                 draft_fasta,
                 consensus,
                 extra=tuple(self.dorado_polish_extra),
             ).wait()
+            # The exit code was discarded and the stdout file parsed
+            # regardless. read_fasta_genome accepts an empty or truncated
+            # FASTA, so an OOM or model mismatch produced a persisted,
+            # _SUCCESS-marked, possibly EMPTY assembly that looked like a
+            # completed polish.
+            if rc != 0:
+                raise RuntimeError(
+                    f"dorado polish exited {rc} in round {r} ({round_dir}); "
+                    f"refusing to read {consensus.name} as a polished assembly"
+                )
 
             polished_genome = read_fasta_genome(consensus)
+            if polished_genome.contigs.num_rows == 0:
+                raise RuntimeError(
+                    f"dorado polish exited 0 in round {r} but produced no "
+                    f"contigs at {consensus}; refusing to persist an empty "
+                    f"assembly"
+                )
             provenance = json.dumps(
                 {
                     "stage": "polish",

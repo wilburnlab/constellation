@@ -3942,9 +3942,18 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.follow:
-        pids = sorted(output_dir.glob("*.pid"))
+        # --detach writes the PID file beside the OUTPUT, which may live
+        # outside --output-dir; searching only output_dir meant the
+        # command printed after detaching could never reattach.
+        search_dirs = [output_dir]
+        if getattr(args, "output", None):
+            search_dirs.append(Path(args.output).expanduser().resolve().parent)
+        pids = sorted(
+            {q for d in search_dirs for q in d.glob("*.pid")}
+        )
         if not pids:
-            print(f"--follow: no .pid file under {output_dir}", file=sys.stderr)
+            where = ", ".join(str(d) for d in search_dirs)
+            print(f"--follow: no .pid file under {where}", file=sys.stderr)
             return 1
         handle = RunHandle.attach(pids[0])
         for event in handle.tail_progress():
@@ -3968,6 +3977,18 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
     runner = DoradoRunner(device=args.device, threads=args.threads, extra_args=_shlex_tuple(args.dorado_extra))
     try:
         if args.duplex:
+            if args.resume:
+                # DoradoRunner.duplex has no resume path and _launch opens
+                # the output "wb", so this would truncate a partial
+                # multi-day result and silently restart from zero.
+                print(
+                    "error: --resume is not supported with --duplex "
+                    "(duplex basecalling has no resume path; re-running "
+                    "would truncate the existing output). Drop --resume "
+                    "to restart deliberately, or basecall simplex.",
+                    file=sys.stderr,
+                )
+                return 2
             handle = runner.duplex(model, pod5, output, device=args.device, detach=args.detach)
         else:
             handle = runner.basecaller(
@@ -4056,6 +4077,7 @@ def _cmd_genome_assemble(args: argparse.Namespace) -> int:
             pod5=[Path(p) for p in args.pod5] if args.pod5 else None,
             basecall_model=args.model,
             modified_bases=mods,
+            dorado_extra=_shlex_tuple(getattr(args, "dorado_extra", None)),
             device=args.device,
             duplex=args.duplex,
             emit_moves=args.emit_moves,
@@ -4086,6 +4108,64 @@ def _cmd_genome_assemble(args: argparse.Namespace) -> int:
     return 0
 
 
+def _stage_progress_cb(args):
+    """StreamProgress when --progress was asked for, else NullProgress.
+
+    The standalone scaffold / polish parsers advertise --progress but
+    neither handler read it, so these multi-hour re-entry commands ran
+    silent even when progress was explicitly requested.
+    """
+    from constellation.core.progress import NullProgress, StreamProgress
+
+    return StreamProgress() if getattr(args, "progress", False) else NullProgress()
+
+
+def _latest_assembly_bundle(
+    assembly_dir: Path,
+    *,
+    prefer: tuple[str, ...] = ("polish", "scaffold", "assembly"),
+) -> Path | None:
+    """The most advanced completed bundle under a pipeline root.
+
+    Always taking ``assembly/assembly`` restarted standalone POLISHING
+    from the original unscaffolded, unpolished draft even when the
+    directory already held later stages, silently discarding the lineage
+    the user expected to build on.
+
+    ``prefer`` orders the search because the right answer differs per
+    verb. Polishing continues from whatever is furthest along. Scaffolding
+    does NOT: the canonical order is assemble → scaffold → polish, so
+    reaching into a polish bundle would scaffold already-polished
+    contigs, and reaching into a scaffold bundle would scaffold twice —
+    both re-orderings a user should have to ask for explicitly rather
+    than inherit from directory contents.
+    """
+    import json as _json
+
+    manifest = assembly_dir / "manifest.json"
+    if manifest.is_file():
+        try:
+            outputs = _json.loads(manifest.read_text()).get("outputs", {})
+        except (OSError, _json.JSONDecodeError):
+            outputs = {}
+        for stage in prefer:
+            rel = outputs.get(f"{stage}_bundle")
+            if not rel:
+                continue
+            cand = Path(rel)
+            if not cand.is_absolute():
+                cand = assembly_dir / rel
+            if cand.is_dir():
+                return cand
+    for stage in prefer:
+        cand = assembly_dir / stage / "assembly"
+        if cand.is_dir():
+            return cand
+    if "assembly" in prefer and (assembly_dir / "assembly").is_dir():
+        return assembly_dir / "assembly"
+    return None
+
+
 def _cmd_genome_scaffold(args: argparse.Namespace) -> int:
     import dataclasses
     import sys
@@ -4098,10 +4178,8 @@ def _cmd_genome_scaffold(args: argparse.Namespace) -> int:
     from constellation.sequencing.assembly.stats import apply_busco
 
     assembly_dir = Path(args.assembly_dir).expanduser().resolve()
-    bundle = assembly_dir / "assembly" / "assembly"
-    if not bundle.is_dir():
-        bundle = assembly_dir / "assembly"
-    if not bundle.is_dir():
+    bundle = _latest_assembly_bundle(assembly_dir, prefer=("assembly",))
+    if bundle is None:
         print(f"error: no assembly bundle under {assembly_dir}", file=sys.stderr)
         return 1
     draft = load_assembly(bundle)
@@ -4118,7 +4196,12 @@ def _cmd_genome_scaffold(args: argparse.Namespace) -> int:
     try:
         scaffolded = RagTagRunner(
             threads=args.threads, extra_args=_shlex_tuple(args.ragtag_extra)
-        ).run(draft, scaffold_reference, output_dir / "scaffold")
+        ).run(
+            draft,
+            scaffold_reference,
+            output_dir / "scaffold",
+            progress_cb=_stage_progress_cb(args),
+        )
     except (FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -4151,10 +4234,8 @@ def _cmd_genome_polish(args: argparse.Namespace) -> int:
     from constellation.sequencing.assembly.stats import apply_busco
 
     assembly_dir = Path(args.assembly_dir).expanduser().resolve()
-    bundle = assembly_dir / "assembly" / "assembly"
-    if not bundle.is_dir():
-        bundle = assembly_dir / "assembly"
-    if not bundle.is_dir():
+    bundle = _latest_assembly_bundle(assembly_dir)
+    if bundle is None:
         print(f"error: no assembly bundle under {assembly_dir}", file=sys.stderr)
         return 1
     working = load_assembly(bundle)
@@ -4179,7 +4260,12 @@ def _cmd_genome_polish(args: argparse.Namespace) -> int:
         polished = PolishRunner(
             rounds=args.polish_rounds, threads=args.threads, device=args.device,
             dorado_polish_extra=_shlex_tuple(args.dorado_polish_extra),
-        ).run(working, reads, output_dir / "polish")
+        ).run(
+            working,
+            reads,
+            output_dir / "polish",
+            progress_cb=_stage_progress_cb(args),
+        )
     except (FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

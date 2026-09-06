@@ -146,6 +146,12 @@ class ParquetDirWriter:
         if assembly.scaffolds is not None:
             pq.write_table(assembly.scaffolds, path / "scaffolds.parquet")
             tables.append("scaffolds")
+        else:
+            # Overwriting a bundle that previously had scaffolds left the
+            # old file in place, and ParquetDirReader loads scaffolds on
+            # file existence alone — so the round-trip resurrected stale
+            # scaffold data belonging to a different assembly.
+            (path / "scaffolds.parquet").unlink(missing_ok=True)
         manifest = {
             "format": self.format_name,
             "tables": tables,

@@ -222,3 +222,134 @@ def test_pipeline_no_keep_intermediates_deletes_fastq(tmp_path: Path, mocks):
     )
     assert not (out / "reads" / "reads.fastq.gz").exists()  # cleaned up
     assert (out / "assembly" / "assembly").is_dir()  # but assembly survived
+
+
+# ── review findings on #92 ─────────────────────────────────────────────
+
+
+def test_default_shorthand_expands_to_a_canonical_model_name() -> None:
+    """R10.4.1 identifiers carry the translocation speed.
+
+    Without it the advertised `sup@v5.0.0` shorthand named a model that
+    does not exist; the same header form is what this package's own @RG
+    parser documents and tests against.
+    """
+    from constellation.sequencing.basecall.models import DoradoModel
+
+    assert (
+        DoradoModel.parse("sup@v5.0.0").model_name()
+        == "dna_r10.4.1_e8.2_400bps_sup@v5.0.0"
+    )
+
+
+def test_stage_key_tracks_parameters_and_chains() -> None:
+    from constellation.sequencing.assembly.pipeline import _stage_key
+
+    a = _stage_key(up="x", rounds=1)
+    assert _stage_key(up="x", rounds=2) != a, "a changed parameter must differ"
+    assert _stage_key(up="y", rounds=1) != a, "an upstream change must cascade"
+    assert _stage_key(up="x", rounds=1) == a, "and be stable otherwise"
+
+
+def test_done_requires_a_matching_key(tmp_path) -> None:
+    """Reuse hinged on _SUCCESS alone, so a rerun with different inputs
+    reused the old bundle while the manifest recorded the new ones."""
+    from constellation.sequencing.assembly.pipeline import _done, _mark_done
+
+    d = tmp_path / "stage"
+    _mark_done(d, "key-1")
+    assert _done(d, "key-1")
+    assert not _done(d, "key-2")
+    # A legacy marker with no key is a miss: re-run rather than trust
+    # output of unknown provenance.
+    (d / "_SUCCESS").write_text("")
+    assert not _done(d, "key-1")
+
+
+def test_latest_assembly_bundle_prefers_the_most_advanced_stage(tmp_path) -> None:
+    """Standalone polish restarted from the unscaffolded draft."""
+    from constellation.cli.__main__ import _latest_assembly_bundle
+
+    root = tmp_path / "run"
+    (root / "assembly" / "assembly").mkdir(parents=True)
+    assert _latest_assembly_bundle(root).name == "assembly"
+    assert _latest_assembly_bundle(root).parent.name == "assembly"
+
+    (root / "scaffold" / "assembly").mkdir(parents=True)
+    assert _latest_assembly_bundle(root).parent.name == "scaffold"
+
+    (root / "polish" / "assembly").mkdir(parents=True)
+    assert _latest_assembly_bundle(root).parent.name == "polish"
+
+    # Scaffolding does NOT walk forward: the canonical order is
+    # assemble -> scaffold -> polish, so inheriting a polish (or an
+    # existing scaffold) bundle from directory contents would silently
+    # re-order the pipeline.
+    assert (
+        _latest_assembly_bundle(root, prefer=("assembly",)).parent.name
+        == "assembly"
+    )
+
+    assert _latest_assembly_bundle(tmp_path / "nothing") is None
+
+
+def test_missing_model_metadata_is_rejected(tmp_path) -> None:
+    """One BAM naming a model and another naming none is a mismatch."""
+    import pytest
+
+    from constellation.sequencing.basecall.readgroup import validate_single_model
+
+    models = {Path("a.bam"): {"dna_r10.4.1_e8.2_400bps_sup@v5.0.0"}, Path("b.bam"): set()}
+    with pytest.raises(ValueError, match="declare no basecaller model"):
+        validate_single_model(models)
+    # --allow-multi-model is the documented override.
+    assert validate_single_model(models, allow_multi=True) is not None
+    # And no models anywhere is still the documented None.
+    assert validate_single_model({Path("a.bam"): set()}) is None
+
+
+def test_allow_multi_model_does_not_fabricate_one_model() -> None:
+    """--allow-multi-model must skip the guard, not invent homogeneity.
+
+    Returning the lexicographically first model stamped it onto every
+    read, so `dorado polish` would apply m1's model to m2's reads with
+    nothing left to detect the mismatch.
+    """
+    from constellation.sequencing.basecall.readgroup import validate_single_model
+
+    mixed = {Path("a.bam"): {"m1"}, Path("b.bam"): {"m2"}}
+    assert validate_single_model(mixed, allow_multi=True) is None
+    # A genuine single model is still reported.
+    assert (
+        validate_single_model({Path("a.bam"): {"m1"}}, allow_multi=True) == "m1"
+    )
+
+
+def test_negative_polish_rounds_rejected() -> None:
+    """0 disables polishing; a negative count silently returned the input
+    unchanged while the caller reported success."""
+    import pytest
+
+    from constellation.sequencing.assembly.polish import PolishRunner
+
+    with pytest.raises(ValueError, match="must be >= 0"):
+        PolishRunner(rounds=-1).run(None, [], Path("/tmp/x"), rounds=-1)
+
+
+def test_ont_mode_requires_a_capable_hifiasm(monkeypatch) -> None:
+    """An old system hifiasm used to fail hours in, on an unknown flag."""
+    import pytest
+
+    from constellation.sequencing.assembly import hifiasm as H
+
+    monkeypatch.setattr(H, "_hifiasm_version", lambda: "0.19.5")
+    with pytest.raises(RuntimeError, match=r"does not support --ont"):
+        H._require_ont_capable_hifiasm("ont")
+
+    # New enough, a non-ONT mode, and an unprobeable version all proceed.
+    monkeypatch.setattr(H, "_hifiasm_version", lambda: "0.25.0")
+    H._require_ont_capable_hifiasm("ont")
+    monkeypatch.setattr(H, "_hifiasm_version", lambda: "0.19.5")
+    H._require_ont_capable_hifiasm("hifi")
+    monkeypatch.setattr(H, "_hifiasm_version", lambda: None)
+    H._require_ont_capable_hifiasm("ont")

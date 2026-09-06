@@ -68,3 +68,18 @@ def test_sequences_one_row_group_per_contig(tmp_path: Path):
     save_assembly(a, tmp_path / "asm")
     pf = pq.ParquetFile(tmp_path / "asm" / "sequences.parquet")
     assert pf.num_row_groups == a.n_contigs
+
+
+def test_overwrite_drops_stale_scaffolds(tmp_path: Path):
+    """ParquetDirReader loads scaffolds on file existence alone.
+
+    Overwriting a scaffolded bundle with an unscaffolded assembly left
+    the old scaffolds.parquet behind, so the round-trip resurrected
+    scaffold data belonging to a different assembly.
+    """
+    save_assembly(_toy(scaffolds=_scaffolds()), tmp_path / "asm")
+    assert (tmp_path / "asm" / "scaffolds.parquet").exists()
+
+    save_assembly(_toy(), tmp_path / "asm")
+    assert not (tmp_path / "asm" / "scaffolds.parquet").exists()
+    assert load_assembly(tmp_path / "asm").scaffolds is None

@@ -52,6 +52,7 @@ class HiFiAsmRunner:
         threads: int | None = None,
         progress_cb: ProgressCallback | None = None,
     ) -> Assembly:
+        _require_ont_capable_hifiasm(self.mode)
         prefix = self._invoke(read_paths, output_prefix, threads, progress_cb)
         gfa = _find_gfa(prefix, ("bp.p_ctg", "p_ctg"))
         records = parse_gfa_contigs(gfa)
@@ -178,6 +179,41 @@ def _hifiasm_version() -> str | None:
         return find("hifiasm").version
     except ToolNotFoundError:
         return None
+
+
+_MIN_ONT_HIFIASM = (0, 25, 0)
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for chunk in v.strip().lstrip("v").split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _require_ont_capable_hifiasm(mode: str) -> None:
+    """Fail fast when the resolved hifiasm predates ``--ont``.
+
+    The resolver accepts any registered or PATH hifiasm, so an older
+    system build started a multi-hour run and only then died on an
+    unrecognised option. Mirror the actionable minimum-version error the
+    Dorado path already gives.
+    """
+    if mode != "ont":
+        return
+    v = _hifiasm_version()
+    if not v:
+        return  # version unprobeable; let the run proceed rather than block
+    if _version_tuple(v) < _MIN_ONT_HIFIASM:
+        want = ".".join(str(x) for x in _MIN_ONT_HIFIASM)
+        raise RuntimeError(
+            f"hifiasm {v} does not support --ont (needs >= {want}). "
+            f"Install a newer build via `bash scripts/install-hifiasm.sh`, "
+            f"or set $CONSTELLATION_HIFIASM_HOME to one."
+        )
 
 
 __all__ = ["HiFiAsmRunner"]

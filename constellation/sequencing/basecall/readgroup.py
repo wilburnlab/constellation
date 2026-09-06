@@ -92,19 +92,48 @@ def validate_single_model(
 ) -> str | None:
     """Collapse per-file model sets to the single shared model.
 
-    Returns the one model string, or ``None`` when no input named a model
+    Returns the one model string, or ``None`` when NO input named a model
     (harmonization still proceeds — but ``dorado polish`` will need a
-    model supplied another way). Raises ``ValueError`` naming the
+    model supplied another way). When SOME inputs name a model and others
+    do not, that is a mismatch, not agreement, and raises unless
+    ``allow_multi``. Raises ``ValueError`` naming the
     divergent models + their files when more than one distinct model is
-    present and ``allow_multi`` is false.
+    present and ``allow_multi`` is false. With ``allow_multi`` and a
+    genuine mix, returns ``None`` rather than choosing one — the unified
+    header then carries no model claim.
     """
     distinct: set[str] = set()
     for model_set in models.values():
         distinct |= model_set
-    if len(distinct) <= 1:
-        return next(iter(distinct)) if distinct else None
+    if not distinct:
+        return None
+    # An input that names NO model is not agreement. Ignoring the empty
+    # set let one BAM's model be stamped onto reads from a BAM that never
+    # declared one, and `dorado polish` would then apply that model to
+    # them without any mismatch to detect.
+    silent = sorted(str(path) for path, ms in models.items() if not ms)
+    if silent and not allow_multi:
+        raise ValueError(
+            "these inputs declare no basecaller model in their @RG "
+            "headers, so the model of the others cannot be assumed for "
+            "them:\n"
+            + "\n".join(f"  {p}" for p in silent)
+            + "\nre-basecall them with a model-tagged @RG, or pass "
+            "--allow-multi-model to harmonize anyway (polish will then "
+            "need an explicit model)."
+        )
+    if len(distinct) == 1:
+        return next(iter(distinct))
     if allow_multi:
-        return sorted(distinct)[0]
+        # Deliberately None, not sorted(distinct)[0]. Picking the
+        # lexicographically first model and stamping it on every read
+        # makes the BAM look homogeneous, so `dorado polish` would apply
+        # m1's model to m2's reads with nothing left to detect the
+        # mismatch. Returning None omits the DS:basecall_model tag
+        # entirely, so the header claims no model and polish must be
+        # given one explicitly — which is what --allow-multi-model's help
+        # already tells the user to expect.
+        return None
     lines = [
         f"  {path}: {', '.join(sorted(model_set))}"
         for path, model_set in models.items()
@@ -169,9 +198,30 @@ def harmonize_read_group(
     rg_line = "\t".join(rg_tokens)
 
     try:
+        # `samtools cat` takes BAM or CRAM, not SAM, but the CLI
+        # advertises --reads *.sam. Convert those first rather than
+        # failing partway through harmonization on an advertised input.
+        cat_inputs: list[Path] = []
+        for i, b in enumerate(in_bams):
+            b = Path(b)
+            if b.suffix.lower() == ".sam":
+                # Index the name: two flow cells can both be calls.sam in
+                # different directories, and keying on the stem alone made
+                # the second conversion overwrite the first, silently
+                # merging one flow cell twice and dropping the other.
+                converted = merged.parent / f"{i:03d}.{b.stem}.from-sam.bam"
+                _emit(progress_cb, "harmonize-rg", f"samtools view {b.name}")
+                subprocess.run(
+                    [samtools, "view", "-@", str(int(threads)), "-b",
+                     "-o", str(converted), str(b)],
+                    check=True,
+                )
+                cat_inputs.append(converted)
+            else:
+                cat_inputs.append(b)
         _emit(progress_cb, "harmonize-rg", "samtools cat")
         subprocess.run(
-            [samtools, "cat", "-o", str(merged), *(str(b) for b in in_bams)],
+            [samtools, "cat", "-o", str(merged), *(str(b) for b in cat_inputs)],
             check=True,
         )
         _emit(progress_cb, "harmonize-rg", "samtools addreplacerg")

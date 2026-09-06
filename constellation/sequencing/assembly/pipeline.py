@@ -18,6 +18,7 @@ the per-stage ``Assembly`` bundles + the manifest this writes.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 from pathlib import Path
 
@@ -68,13 +69,69 @@ def _collect_inputs(paths: list[Path], suffixes: tuple[str, ...]) -> list[Path]:
     return out
 
 
-def _done(stage_dir: Path) -> bool:
-    return (stage_dir / "_SUCCESS").exists()
+def _stage_key(**parts: object) -> str:
+    """Digest of everything a stage's output depends on.
+
+    Written into the stage's ``_SUCCESS`` so ``--resume`` can tell a
+    genuinely completed stage from one whose inputs or parameters have
+    since changed. Keys are chained (each stage folds in its upstream
+    key), so an early change invalidates everything downstream.
+    """
+    import hashlib
+
+    payload = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.blake2b(payload.encode(), digest_size=16).hexdigest()
 
 
-def _mark_done(stage_dir: Path) -> None:
+def _input_identity(paths: "list[Path] | tuple[Path, ...]") -> list[str]:
+    """(path, size, mtime) per input — cheap stand-in for content hashing
+    whole BAMs, and enough to notice a swapped or regenerated flow cell."""
+    out = []
+    for q in sorted(Path(x) for x in paths):
+        try:
+            st = q.stat()
+            out.append(f"{q}:{st.st_size}:{int(st.st_mtime)}")
+        except OSError:
+            out.append(f"{q}:missing")
+    return out
+
+
+def _done(stage_dir: Path, key: str | None = None) -> bool:
+    """True iff the stage completed AND its recorded key still matches.
+
+    Reuse used to hinge on _SUCCESS alone, so a rerun with different
+    reads, hifiasm args, BUSCO lineage, scaffold reference or
+    polish-round count silently reused the old bundle while the manifest
+    was rewritten with the NEW parameters — `--polish-rounds 1` changed
+    to `2` reused the one-round result and recorded two. A marker with no
+    key (or a stale one) is treated as a miss, which re-runs rather than
+    trusting output of unknown provenance.
+    """
+    marker = stage_dir / "_SUCCESS"
+    if not marker.exists():
+        return False
+    if key is None:
+        return True
+    try:
+        return marker.read_text().strip() == key
+    except OSError:
+        return False
+
+
+def _invalidate(stage_dir: Path) -> None:
+    """Drop a stage's success marker before its outputs are rewritten.
+
+    Without this an interrupted refresh left configuration A's marker
+    sitting beside configuration B's half-written bundle, and the next
+    --resume accepted it. The marker must never outlive the outputs it
+    describes, so it is removed first and only re-created on success.
+    """
+    (stage_dir / "_SUCCESS").unlink(missing_ok=True)
+
+
+def _mark_done(stage_dir: Path, key: str | None = None) -> None:
     stage_dir.mkdir(parents=True, exist_ok=True)
-    (stage_dir / "_SUCCESS").touch()
+    (stage_dir / "_SUCCESS").write_text("" if key is None else key)
 
 
 # Map the user-facing --reads-compression vocabulary to the codec understood
@@ -160,6 +217,19 @@ def _finalize_stage(
     return asm
 
 
+def _gfa_from_provenance(assembly: Assembly, output_dir: Path) -> str:
+    """The GFA path the assembler recorded, relative to output_dir."""
+    col = assembly.contigs.column("provenance_json")
+    if len(col):
+        try:
+            gfa = json.loads(col[0].as_py() or "{}").get("gfa")
+            if gfa:
+                return _rel_or_abs(Path(gfa), output_dir)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return "assembly/primary.bp.p_ctg.gfa"
+
+
 def run_assembly_pipeline(
     *,
     output_dir: Path,
@@ -167,6 +237,11 @@ def run_assembly_pipeline(
     pod5: list[Path] | None = None,
     basecall_model: str | None = None,
     modified_bases: tuple[str, ...] = (),
+    # Passthrough flags for inline basecalling. Parsed by the CLI but
+    # never forwarded, so `genome assemble --pod5 --dorado-extra ...`
+    # silently ignored them — unlike top-level `basecall`, which wires
+    # them into DoradoRunner.
+    dorado_extra: tuple[str, ...] = (),
     device: str = "cuda:0",
     duplex: bool = False,
     emit_moves: bool = True,
@@ -208,6 +283,45 @@ def run_assembly_pipeline(
     stage_stats: dict[str, pa.Table] = {}
     stages: dict[str, dict] = {}
 
+    # ── stage cache keys ────────────────────────────────────────────
+    # Chained: each stage folds in its upstream key, so a change early in
+    # the pipeline invalidates every stage after it rather than leaving a
+    # bundle from one invocation described by another's manifest.
+    k_basecall = _stage_key(
+        pod5=_input_identity(pod5 or []),
+        model=basecall_model,
+        mods=sorted(modified_bases),
+        extra=list(dorado_extra),
+        duplex=duplex,
+        emit_moves=emit_moves,
+    )
+    k_harmonize = _stage_key(
+        up=k_basecall,
+        reads=_input_identity(reads or []),
+        read_group=read_group,
+        allow_multi_model=allow_multi_model,
+    )
+    k_fastq = _stage_key(up=k_harmonize, compression=reads_compression)
+    k_assemble = _stage_key(
+        up=k_fastq,
+        mode=hifiasm_mode,
+        extra=list(hifiasm_extra),
+        busco=busco_lineage,
+    )
+    k_scaffold = _stage_key(
+        up=k_assemble,
+        reference=scaffold_reference_handle or scaffold_reference_path,
+        accession=assembly_accession,
+        extra=list(ragtag_extra),
+        busco=busco_lineage,
+    )
+    k_polish = _stage_key(
+        up=k_scaffold if scaffold_reference is not None else k_assemble,
+        rounds=polish_rounds,
+        extra=list(dorado_polish_extra),
+        busco=busco_lineage,
+    )
+
     # ── 1. basecall (pod5 mode only) ────────────────────────────────
     if pod5:
         if not basecall_model:
@@ -217,28 +331,38 @@ def run_assembly_pipeline(
         model = DoradoModel.parse(basecall_model)
         basecall_dir = output_dir / "basecall"
         bam_inputs: list[Path] = []
-        runner = DoradoRunner(device=device, threads=threads)
+        runner = DoradoRunner(
+            device=device, threads=threads, extra_args=tuple(dorado_extra)
+        )
         # Each --pod5 argument is one flow cell → its own basecall BAM
         # (a directory of .pod5 is passed whole to dorado).
         for i, source in enumerate(Path(p) for p in pod5):
             out_bam = basecall_dir / f"flowcell_{i:03d}.bam"
-            if resume and out_bam.exists() and _done(basecall_dir):
+            if resume and out_bam.exists() and _done(basecall_dir, k_basecall):
                 bam_inputs.append(out_bam)
                 continue
+            _invalidate(basecall_dir)
             _emit(progress_cb, "stage_start", "basecall", str(source))
             if duplex:
                 handle = runner.duplex(model, [source], out_bam, device=device)
             else:
+                # `resume` is passed explicitly. DoradoRunner.basecaller
+                # defaults it to True, so omitting it made a FRESH run —
+                # or one whose key just changed — resume from a partial
+                # BAM produced under different parameters. Only resume
+                # when the caller asked to AND the stage key still
+                # matches; otherwise start clean.
                 handle = runner.basecaller(
                     model, [source], out_bam,
                     modified_bases=modified_bases, device=device,
                     emit_moves=emit_moves,
+                    resume=bool(resume) and _done(basecall_dir, k_basecall),
                 )
             rc = handle.wait()
             if rc != 0:
                 raise RuntimeError(f"dorado basecaller failed (rc={rc}) for {source}")
             bam_inputs.append(out_bam)
-        _mark_done(basecall_dir)
+        _mark_done(basecall_dir, k_basecall)
         _emit(progress_cb, "stage_done", "basecall", f"{len(bam_inputs)} BAM(s)")
     else:
         input_mode = "bam"
@@ -252,7 +376,7 @@ def run_assembly_pipeline(
     harmonized = bam_dir / "harmonized.bam"
     models = read_basecaller_models(bam_inputs)
     model_ds = validate_single_model(models, allow_multi=allow_multi_model)
-    if resume and harmonized.exists() and _done(bam_dir):
+    if resume and harmonized.exists() and _done(bam_dir, k_harmonize):
         _emit(progress_cb, "stage_progress", "harmonize", "resume: using existing")
     else:
         _emit(progress_cb, "stage_start", "harmonize", str(harmonized))
@@ -261,7 +385,7 @@ def run_assembly_pipeline(
             unified_rg_id=read_group, model_ds=model_ds,
             threads=threads, progress_cb=progress_cb,
         )
-        _mark_done(bam_dir)
+        _mark_done(bam_dir, k_harmonize)
         _emit(progress_cb, "stage_done", "harmonize", str(harmonized))
 
     # ── 3. fastq ────────────────────────────────────────────────────
@@ -271,26 +395,29 @@ def run_assembly_pipeline(
     # force needless rework.
     assembly_dir = output_dir / "assembly"
     assembly_done = (
-        resume and _done(assembly_dir) and (assembly_dir / "assembly").exists()
+        resume and _done(assembly_dir, k_assemble)
+        and (assembly_dir / "assembly").exists()
     )
     reads_dir = _resolve_scratch_root(scratch_dir, output_dir) / "reads"
     fastq_name = "reads.fastq" if reads_compression == "none" else "reads.fastq.gz"
     fastq = reads_dir / fastq_name
-    if assembly_done or (resume and fastq.exists() and _done(reads_dir)):
+    if assembly_done or (resume and fastq.exists() and _done(reads_dir, k_fastq)):
         pass
     else:
+        _invalidate(reads_dir)
         _emit(progress_cb, "stage_start", "fastq", str(fastq))
         samtools_fastq(
             harmonized, fastq, threads=threads,
             codec=_FASTQ_CODEC.get(reads_compression, "bgzf"),
         )
-        _mark_done(reads_dir)
+        _mark_done(reads_dir, k_fastq)
         _emit(progress_cb, "stage_done", "fastq", str(fastq))
 
     # ── 4. assemble ─────────────────────────────────────────────────
     if assembly_done:
         draft = load_assembly(assembly_dir / "assembly")
     else:
+        _invalidate(assembly_dir)
         _emit(progress_cb, "stage_start", "assemble", "hifiasm")
         draft = HiFiAsmRunner(
             threads=threads, mode=hifiasm_mode, extra_args=hifiasm_extra
@@ -299,7 +426,7 @@ def run_assembly_pipeline(
             draft, stage_dir=assembly_dir, stage_label="draft",
             busco_lineage=busco_lineage, threads=threads, emit_report=emit_report,
         )
-        _mark_done(assembly_dir)
+        _mark_done(assembly_dir, k_assemble)
         _emit(progress_cb, "stage_done", "assemble", f"{draft.n_contigs} contigs")
     # Throwaway FASTQ cleanup once assembly is complete.
     if not keep_intermediates:
@@ -311,13 +438,22 @@ def run_assembly_pipeline(
         "harmonized_bam": _rel_or_abs(harmonized, output_dir),
         "reads_fastq": _rel_or_abs(fastq, output_dir),
         "assembly_bundle": "assembly/assembly",
-        "primary_gfa": "assembly/primary.bp.p_ctg.gfa",
+        # The runner picks whichever of primary.bp.p_ctg.gfa /
+        # primary.p_ctg.gfa hifiasm emitted and records it in each
+        # contig's provenance. Hardcoding the first handed downstream
+        # consumers a nonexistent path whenever --hifiasm-extra selected
+        # a primary-only mode.
+        "primary_gfa": _gfa_from_provenance(draft, output_dir),
     }
 
     # ── 5. scaffold (optional) ──────────────────────────────────────
     if scaffold_reference is not None:
         scaffold_dir = output_dir / "scaffold"
-        if resume and _done(scaffold_dir) and (scaffold_dir / "assembly").exists():
+        if (
+            resume
+            and _done(scaffold_dir, k_scaffold)
+            and (scaffold_dir / "assembly").exists()
+        ):
             scaffolded = load_assembly(scaffold_dir / "assembly")
         else:
             _emit(progress_cb, "stage_start", "scaffold", "ragtag")
@@ -328,7 +464,7 @@ def run_assembly_pipeline(
                 scaffolded, stage_dir=scaffold_dir, stage_label="scaffold",
                 busco_lineage=busco_lineage, threads=threads, emit_report=emit_report,
             )
-            _mark_done(scaffold_dir)
+            _mark_done(scaffold_dir, k_scaffold)
             _emit(progress_cb, "stage_done", "scaffold", f"{scaffolded.n_contigs} scaffolds")
         stage_stats["scaffold"] = scaffolded.stats
         stages["scaffold"] = _stage_stats_dict(scaffolded)
@@ -338,7 +474,11 @@ def run_assembly_pipeline(
     # ── 6. polish (optional) ────────────────────────────────────────
     if polish_rounds > 0:
         polish_dir = output_dir / "polish"
-        if resume and _done(polish_dir) and (polish_dir / "assembly").exists():
+        if (
+            resume
+            and _done(polish_dir, k_polish)
+            and (polish_dir / "assembly").exists()
+        ):
             polished = load_assembly(polish_dir / "assembly")
         else:
             _emit(progress_cb, "stage_start", "polish", f"{polish_rounds} round(s)")
@@ -350,7 +490,7 @@ def run_assembly_pipeline(
                 polished, stage_dir=polish_dir, stage_label="polish",
                 busco_lineage=busco_lineage, threads=threads, emit_report=emit_report,
             )
-            _mark_done(polish_dir)
+            _mark_done(polish_dir, k_polish)
             _emit(progress_cb, "stage_done", "polish", "done")
         stage_stats["polish"] = polished.stats
         stages["polish"] = _stage_stats_dict(polished)

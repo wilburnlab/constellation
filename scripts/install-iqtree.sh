@@ -97,8 +97,20 @@ fi
 EXPECTED_SHA="${override_sha:-${SHA256_BY_VARIANT[${VARIANT}]}}"
 
 if [[ "${EXPECTED_SHA}" == REPLACE_WITH_VERIFIED_SHA256* ]]; then
-    echo "error: SHA256 placeholder for --variant ${VARIANT} — verify upstream and re-run with --checksum" >&2
-    echo "  upstream releases: https://github.com/iqtree/iqtree3/releases/tag/v${VERSION}" >&2
+    # This variant has no verified pin. Only `intel` was verified against
+    # upstream; `arm` is auto-selected on aarch64 hosts, so the default
+    # invocation cannot proceed there without a user-supplied checksum.
+    # A pin computed from the same download it is meant to guard would be
+    # no guarantee at all, so this stays a hard stop with the exact
+    # remedy rather than a fabricated hash.
+    _tarball="iqtree-${VERSION}-Linux${SUFFIX_BY_VARIANT[${VARIANT}]}.tar.gz"
+    _url="https://github.com/iqtree/iqtree3/releases/download/v${VERSION}/${_tarball}"
+    echo "error: no verified SHA256 for --variant ${VARIANT} (only 'intel' is pinned)." >&2
+    echo "  Verify the checksum against upstream, then re-run with it:" >&2
+    echo "    curl -fsSLO ${_url}" >&2
+    echo "    shasum -a 256 ${_tarball}   # compare against the upstream release page" >&2
+    echo "    bash scripts/install-iqtree.sh --variant ${VARIANT} --checksum <SHA256>" >&2
+    echo "  release page: https://github.com/iqtree/iqtree3/releases/tag/v${VERSION}" >&2
     exit 1
 fi
 
