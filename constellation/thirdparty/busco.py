@@ -1,12 +1,11 @@
 """BUSCO (Benchmarking Universal Single-Copy Orthologs) — ToolSpec.
 
-Standard genome-completeness metric for eukaryotic assemblies.
-Bioconda-provided. Lineage data (eukaryota_odb10, vertebrata_odb12,
-...) lives outside this registry — see the BUSCO docs for downloading,
-or the install script which can stage it under
-``$CONSTELLATION_BUSCO_HOME/lineages/``.
-
-Status: STUB.
+Standard genome-completeness metric for eukaryotic assemblies. Installed
+into a dedicated conda env by ``scripts/install-busco.sh`` (bioconda
+bundles BUSCO's external aligners); the registry artifact ``busco`` is a
+wrapper that runs the tool inside that env. Lineage data (eukaryota_odb12,
+vertebrata_odb12, ...) lives outside this registry — see the BUSCO docs or
+the install script's ``--lineage`` pre-stage.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from pathlib import Path
 from constellation.thirdparty.registry import ToolSpec, register
 
 
-BUSCO_VERSION = "5.7.1"
+BUSCO_VERSION = "6.1.0"
 
 
 def _probe_version(path: Path) -> str | None:

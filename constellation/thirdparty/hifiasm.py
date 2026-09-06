@@ -4,7 +4,11 @@ The lab's primary genome assembler. Resolution prefers conda-installed
 ``hifiasm`` on ``$PATH``; ``$CONSTELLATION_HIFIASM_HOME`` overrides
 when a from-source build is needed.
 
-Status: STUB. Pinned version is provisional.
+License: MIT (upstream chhylp123/hifiasm) — bundles / installs freely.
+
+Pinned at 0.25.0: the first release with a stable built-in ONT
+corrector (``--ont``), which the genome-assembly pipeline relies on for
+R10.4.1 simplex reads. Bump as upstream ships ONT-model improvements.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ from pathlib import Path
 from constellation.thirdparty.registry import ToolSpec, register
 
 
-HIFIASM_VERSION = "0.20.0"
+HIFIASM_VERSION = "0.25.0"
 
 
 def _probe_version(path: Path) -> str | None:

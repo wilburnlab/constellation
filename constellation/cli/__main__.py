@@ -22,11 +22,14 @@ from typing import Callable
 # import time so the `doctor` subcommand sees every known tool.
 from constellation.thirdparty import (  # noqa: F401
     busco,
+    cactus,
     dorado,
     encyclopedia,
     hifiasm,
+    iqtree,
     minimap2,
     mmseqs2,
+    ragout,
     ragtag,
     samtools,
     thermo,
@@ -713,6 +716,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # Sequencing transcriptomics pipeline (S1 — demultiplex shipped).
     _build_transcriptome_parser(subs)
 
+    # Genome assembly pipeline (HiFiASM + Dorado + RagTag) + top-level
+    # `basecall` (cross-modal — genomics + transcriptomics).
+    _build_genome_parser(subs)
+    _build_basecall_parser(subs)
+
     # Reference imports / fetch / summary / validate.
     _build_reference_parser(subs)
 
@@ -761,11 +769,8 @@ def _build_parser() -> argparse.ArgumentParser:
         # second top-level entry point would drift from it.
         ("pod5", "Ingest POD5 signal to Parquet (TODO)"),
         ("structure", "Prepare structures for MD (TODO)"),
-        # Other sequencing pipeline verbs — wire as additional sessions land.
-        ("basecall", "Run Dorado basecaller against POD5 inputs (TODO)"),
-        ("assemble", "Assemble reads with HiFiASM (TODO)"),
-        ("polish", "Polish a draft assembly with Dorado + minimap2 (TODO)"),
-        ("scaffold", "Reference-guided scaffolding via RagTag (TODO)"),
+        # `basecall` is now top-level (real); `assemble` / `scaffold` /
+        # `polish` are now `constellation genome {assemble,scaffold,polish}`.
         ("annotate", "BUSCO + repeat / telomere annotation (TODO)"),
         ("project", "Initialize / inspect a Constellation project (TODO)"),
     ]:
@@ -3778,6 +3783,552 @@ def _resolve_reference_argument(arg: str) -> "tuple[object, str]":
     from constellation.sequencing.reference.handle import resolve as resolve_handle
 
     return resolve_handle(arg), "handle"
+
+
+def _build_basecall_parser(subs) -> None:
+    """Wire top-level ``constellation basecall`` (cross-modal Dorado)."""
+    p = subs.add_parser(
+        "basecall",
+        help="Dorado simplex/duplex basecalling of POD5 → BAM",
+    )
+    p.add_argument("--pod5", nargs="+", help="POD5 file(s) or directory")
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--output", default=None, help="Output BAM (default <output-dir>/calls.bam)")
+    p.add_argument("--model", default=None, help="Dorado model shorthand, e.g. sup@v5.0.0 or hac@v4.3+5mC,5hmC")
+    p.add_argument("--modified-bases", default=None, help="Comma list overriding the model's mods")
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--duplex", action="store_true")
+    p.add_argument("--emit-moves", action=argparse.BooleanOptionalAction, default=True,
+                   help="Emit the `mv` move-table tag (required for move-aware `dorado polish`; on by default)")
+    p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--detach", action="store_true", help="Fork dorado + write a PID file, return immediately")
+    p.add_argument("--follow", action="store_true", help="Attach to a detached run in --output-dir and stream progress")
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--progress", action="store_true")
+    p.add_argument("--dorado-extra", default=None, help="shlex-split extra args appended to dorado")
+    p.set_defaults(func=_cmd_basecall)
+
+
+def _build_genome_parser(subs) -> None:
+    """Wire the ``constellation genome ...`` sub-tree."""
+    p_genome = subs.add_parser(
+        "genome",
+        help="Long-read genome assembly pipeline (HiFiASM + Dorado + RagTag)",
+    )
+    gsubs = p_genome.add_subparsers(dest="genome_subcommand", required=True)
+
+    # ── assemble (umbrella) ─────────────────────────────────────────
+    pa_ = gsubs.add_parser(
+        "assemble",
+        help="POD5/BAM → harmonize @RG → HiFiASM → (scaffold) → (polish) → analysis",
+    )
+    src = pa_.add_mutually_exclusive_group(required=True)
+    src.add_argument("--reads", nargs="+", help="Dorado BAM/SAM file(s) or dir (multi-flow-cell)")
+    src.add_argument("--pod5", nargs="+", help="POD5 file(s)/dir → basecalled inline (requires --model)")
+    pa_.add_argument("--output-dir", required=True)
+    pa_.add_argument("--model", default=None, help="Dorado model shorthand (required with --pod5)")
+    pa_.add_argument("--modified-bases", default=None)
+    pa_.add_argument("--device", default="cuda:0")
+    pa_.add_argument("--duplex", action="store_true")
+    pa_.add_argument("--emit-moves", action=argparse.BooleanOptionalAction, default=True,
+                     help="Emit the `mv` move-table tag during inline basecalling "
+                          "(required for move-aware `dorado polish`; on by default)")
+    pa_.add_argument("--dorado-extra", default=None)
+    pa_.add_argument("--threads", type=int, default=None,
+                     help="Worker threads per stage (default: $SLURM_CPUS_PER_TASK "
+                          "or all detected cores)")
+    pa_.add_argument("--reads-compression", choices=("auto", "bgzf", "gzip", "none"),
+                     default="auto",
+                     help="Compression of the intermediate reads FASTQ: auto/bgzf "
+                          "(multithreaded bgzip pipe), gzip (single-threaded), or none "
+                          "(plain FASTQ — fastest, ~3x disk; pair with --scratch-dir)")
+    pa_.add_argument("--scratch-dir", default=None,
+                     help="Route the throwaway reads FASTQ to node-local storage: a "
+                          "path, or 'auto' for $SLURM_TMPDIR/$TMPDIR (default: in the "
+                          "output dir)")
+    pa_.add_argument("--keep-intermediates", action=argparse.BooleanOptionalAction,
+                     default=True,
+                     help="Keep the reads FASTQ after assembly (on by default; "
+                          "--no-keep-intermediates deletes it once hifiasm succeeds)")
+    pa_.add_argument("--resume", action="store_true")
+    pa_.add_argument("--progress", action="store_true")
+    pa_.add_argument("--no-report", action="store_true")
+    pa_.add_argument("--read-group", default="constellation_unified")
+    pa_.add_argument("--allow-multi-model", action="store_true",
+                     help="Skip the single-basecaller-model guard (dorado polish may fail)")
+    pa_.add_argument("--hifiasm-mode", choices=("ont", "hifi"), default="ont")
+    pa_.add_argument("--hifiasm-extra", default=None)
+    sref = pa_.add_mutually_exclusive_group()
+    sref.add_argument("--scaffold-reference", default=None, help="Reference cache handle for RagTag scaffolding")
+    sref.add_argument("--scaffold-reference-dir", default=None, help="Escape hatch: a release dir with a genome/ subdir")
+    pa_.add_argument("--ragtag-extra", default=None)
+    pa_.add_argument("--polish-rounds", type=int, default=0)
+    pa_.add_argument("--dorado-polish-extra", default=None)
+    pa_.add_argument("--busco-lineage", default=None)
+    pa_.set_defaults(func=_cmd_genome_assemble)
+
+    # ── scaffold (re-entry) ─────────────────────────────────────────
+    ps = gsubs.add_parser("scaffold", help="RagTag-scaffold an existing assemble output dir")
+    ps.add_argument("--assembly-dir", required=True, help="A `genome assemble` output dir")
+    sref2 = ps.add_mutually_exclusive_group(required=True)
+    sref2.add_argument("--scaffold-reference", default=None)
+    sref2.add_argument("--scaffold-reference-dir", default=None)
+    ps.add_argument("--output-dir", required=True)
+    ps.add_argument("--threads", type=int, default=8)
+    ps.add_argument("--ragtag-extra", default=None)
+    ps.add_argument("--busco-lineage", default=None)
+    ps.add_argument("--no-report", action="store_true")
+    ps.add_argument("--progress", action="store_true")
+    ps.set_defaults(func=_cmd_genome_scaffold)
+
+    # ── polish (re-entry) ───────────────────────────────────────────
+    pp = gsubs.add_parser("polish", help="Dorado-polish an existing assemble output dir")
+    pp.add_argument("--assembly-dir", required=True)
+    pp.add_argument("--reads", nargs="+", default=None,
+                    help="Harmonized reads BAM (default: harmonized_bam from the manifest)")
+    pp.add_argument("--polish-rounds", type=int, default=1)
+    pp.add_argument("--output-dir", required=True)
+    pp.add_argument("--threads", type=int, default=8)
+    pp.add_argument("--device", default="cuda:0")
+    pp.add_argument("--dorado-polish-extra", default=None)
+    pp.add_argument("--busco-lineage", default=None)
+    pp.add_argument("--no-report", action="store_true")
+    pp.add_argument("--progress", action="store_true")
+    pp.set_defaults(func=_cmd_genome_polish)
+
+    # ── diagnose (read-only) ────────────────────────────────────────
+    pd = gsubs.add_parser("diagnose", help="Regenerate assembly diagnostic reports (read-only)")
+    pd.add_argument("--assembly-dir", required=True)
+    pd.add_argument("--scaffold-dir", default=None)
+    pd.add_argument("--polish-dir", default=None)
+    pd.add_argument("--output-dir", default=None, help="Default <assembly-dir>/diagnostics")
+    pd.set_defaults(func=_cmd_genome_diagnose)
+
+
+def _shlex_tuple(value: str | None) -> tuple[str, ...]:
+    import shlex
+
+    return tuple(shlex.split(value)) if value else ()
+
+
+def _resolve_threads(requested: int | None) -> int:
+    """Resolve the per-stage thread budget.
+
+    Explicit ``--threads`` wins; otherwise auto-detect from the SLURM
+    allocation (``$SLURM_CPUS_PER_TASK`` / ``$SLURM_CPUS_ON_NODE``) and fall
+    back to all detected cores. The previous default of ``1`` silently left
+    every stage single-threaded on multi-core nodes — a real footgun for the
+    bgzip / hifiasm stages.
+    """
+    import os
+
+    if requested is not None:
+        return max(1, int(requested))
+    for var in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
+        val = os.environ.get(var)
+        if val and val.isdigit():
+            return max(1, int(val))
+    return os.cpu_count() or 1
+
+
+def _cmd_basecall(args: argparse.Namespace) -> int:
+    import sys
+    from pathlib import Path
+
+    from constellation.sequencing.basecall.dorado import DoradoRunner, RunHandle
+    from constellation.sequencing.basecall.models import DoradoModel
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.follow:
+        # --detach writes the PID file beside the OUTPUT, which may live
+        # outside --output-dir; searching only output_dir meant the
+        # command printed after detaching could never reattach.
+        search_dirs = [output_dir]
+        if getattr(args, "output", None):
+            search_dirs.append(Path(args.output).expanduser().resolve().parent)
+        pids = sorted(
+            {q for d in search_dirs for q in d.glob("*.pid")}
+        )
+        if not pids:
+            where = ", ".join(str(d) for d in search_dirs)
+            print(f"--follow: no .pid file under {where}", file=sys.stderr)
+            return 1
+        handle = RunHandle.attach(pids[0])
+        for event in handle.tail_progress():
+            print(event.raw, file=sys.stderr)
+        rc = handle.wait()
+        print(f"basecall {'completed' if rc == 0 else 'failed'} (rc={rc})", file=sys.stderr)
+        return 0 if rc == 0 else 1
+
+    if not args.pod5 or not args.model:
+        print("error: --pod5 and --model are required (except with --follow)", file=sys.stderr)
+        return 2
+    try:
+        model = DoradoModel.parse(args.model)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    output = Path(args.output).expanduser().resolve() if args.output else output_dir / "calls.bam"
+    pod5 = [Path(p) for p in args.pod5]
+    mods = tuple(m for m in args.modified_bases.split(",") if m) if args.modified_bases else ()
+    runner = DoradoRunner(device=args.device, threads=args.threads, extra_args=_shlex_tuple(args.dorado_extra))
+    try:
+        if args.duplex:
+            if args.resume:
+                # DoradoRunner.duplex has no resume path and _launch opens
+                # the output "wb", so this would truncate a partial
+                # multi-day result and silently restart from zero.
+                print(
+                    "error: --resume is not supported with --duplex "
+                    "(duplex basecalling has no resume path; re-running "
+                    "would truncate the existing output). Drop --resume "
+                    "to restart deliberately, or basecall simplex.",
+                    file=sys.stderr,
+                )
+                return 2
+            handle = runner.duplex(model, pod5, output, device=args.device, detach=args.detach)
+        else:
+            handle = runner.basecaller(
+                model, pod5, output,
+                modified_bases=mods, device=args.device,
+                emit_moves=args.emit_moves,
+                resume=args.resume, detach=args.detach,
+            )
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.detach:
+        print(f"detached: pid={handle.pid}  pid_file={handle.pid_file}", file=sys.stderr)
+        print(f"follow with: constellation basecall --follow --output-dir {output_dir}", file=sys.stderr)
+        return 0
+    if args.progress:
+        for event in handle.tail_progress():
+            print(event.raw, file=sys.stderr)
+    rc = handle.wait()
+    if rc == 0:
+        print(f"basecalled → {output}", file=sys.stderr)
+        return 0
+    print(f"dorado basecaller failed (rc={rc}); see {handle.stderr_log}", file=sys.stderr)
+    return 1
+
+
+def _resolve_scaffold_reference(handle_arg, dir_arg):
+    """Resolve a scaffold reference → (GenomeReference, handle, path, accession)
+    or (None, ...) on error (message already printed)."""
+    import sys
+    from pathlib import Path
+
+    from constellation.sequencing.reference.io import load_genome_reference
+
+    release, handle, accession = _resolve_reference_args(handle_arg=handle_arg, dir_arg=dir_arg)
+    if release is None:
+        return None, None, None, None
+    genome_dir = Path(release) / "genome"
+    if not genome_dir.is_dir():
+        print(f"error: scaffold reference missing genome/: {release}", file=sys.stderr)
+        return None, None, None, None
+    return load_genome_reference(genome_dir), handle, str(release), accession
+
+
+def _cmd_genome_assemble(args: argparse.Namespace) -> int:
+    import sys
+    from pathlib import Path
+
+    from constellation.core.progress import NullProgress, StreamProgress
+    from constellation.sequencing.assembly.pipeline import run_assembly_pipeline
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    if (output_dir / "_SUCCESS").exists() and not args.resume:
+        print(f"output dir already complete: {output_dir} (pass --resume)", file=sys.stderr)
+        return 1
+    if args.pod5 and not args.model:
+        print("error: --pod5 requires --model", file=sys.stderr)
+        return 2
+
+    scaffold_reference = sref_handle = sref_path = sref_acc = None
+    if args.scaffold_reference or args.scaffold_reference_dir:
+        scaffold_reference, sref_handle, sref_path, sref_acc = _resolve_scaffold_reference(
+            args.scaffold_reference, args.scaffold_reference_dir
+        )
+        if scaffold_reference is None:
+            return 1
+
+    if not args.no_report:
+        _preload_matplotlib_for_reports()
+    cb = StreamProgress() if args.progress else NullProgress()
+
+    threads = _resolve_threads(args.threads)
+    if args.reads_compression == "none" and args.scratch_dir is None:
+        print(
+            "warning: --reads-compression none writes a plain (uncompressed) FASTQ "
+            "into the output dir; pass --scratch-dir to keep ~100 GB off shared storage",
+            file=sys.stderr,
+        )
+
+    mods = tuple(m for m in args.modified_bases.split(",") if m) if args.modified_bases else ()
+    try:
+        run_assembly_pipeline(
+            output_dir=output_dir,
+            reads=[Path(p) for p in args.reads] if args.reads else None,
+            pod5=[Path(p) for p in args.pod5] if args.pod5 else None,
+            basecall_model=args.model,
+            modified_bases=mods,
+            dorado_extra=_shlex_tuple(getattr(args, "dorado_extra", None)),
+            device=args.device,
+            duplex=args.duplex,
+            emit_moves=args.emit_moves,
+            read_group=args.read_group,
+            allow_multi_model=args.allow_multi_model,
+            hifiasm_mode=args.hifiasm_mode,
+            hifiasm_extra=_shlex_tuple(args.hifiasm_extra),
+            scaffold_reference=scaffold_reference,
+            scaffold_reference_handle=sref_handle,
+            scaffold_reference_path=sref_path,
+            assembly_accession=sref_acc,
+            ragtag_extra=_shlex_tuple(args.ragtag_extra),
+            polish_rounds=args.polish_rounds,
+            dorado_polish_extra=_shlex_tuple(args.dorado_polish_extra),
+            busco_lineage=args.busco_lineage,
+            threads=threads,
+            reads_compression=args.reads_compression,
+            scratch_dir=args.scratch_dir,
+            keep_intermediates=args.keep_intermediates,
+            resume=args.resume,
+            emit_report=not args.no_report,
+            progress_cb=cb,
+        )
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"assembly complete → {output_dir}", file=sys.stderr)
+    return 0
+
+
+def _stage_progress_cb(args):
+    """StreamProgress when --progress was asked for, else NullProgress.
+
+    The standalone scaffold / polish parsers advertise --progress but
+    neither handler read it, so these multi-hour re-entry commands ran
+    silent even when progress was explicitly requested.
+    """
+    from constellation.core.progress import NullProgress, StreamProgress
+
+    return StreamProgress() if getattr(args, "progress", False) else NullProgress()
+
+
+def _latest_assembly_bundle(
+    assembly_dir: Path,
+    *,
+    prefer: tuple[str, ...] = ("polish", "scaffold", "assembly"),
+) -> Path | None:
+    """The most advanced completed bundle under a pipeline root.
+
+    Always taking ``assembly/assembly`` restarted standalone POLISHING
+    from the original unscaffolded, unpolished draft even when the
+    directory already held later stages, silently discarding the lineage
+    the user expected to build on.
+
+    ``prefer`` orders the search because the right answer differs per
+    verb. Polishing continues from whatever is furthest along. Scaffolding
+    does NOT: the canonical order is assemble → scaffold → polish, so
+    reaching into a polish bundle would scaffold already-polished
+    contigs, and reaching into a scaffold bundle would scaffold twice —
+    both re-orderings a user should have to ask for explicitly rather
+    than inherit from directory contents.
+    """
+    import json as _json
+
+    manifest = assembly_dir / "manifest.json"
+    if manifest.is_file():
+        try:
+            outputs = _json.loads(manifest.read_text()).get("outputs", {})
+        except (OSError, _json.JSONDecodeError):
+            outputs = {}
+        for stage in prefer:
+            rel = outputs.get(f"{stage}_bundle")
+            if not rel:
+                continue
+            cand = Path(rel)
+            if not cand.is_absolute():
+                cand = assembly_dir / rel
+            if cand.is_dir():
+                return cand
+    for stage in prefer:
+        cand = assembly_dir / stage / "assembly"
+        if cand.is_dir():
+            return cand
+    if "assembly" in prefer and (assembly_dir / "assembly").is_dir():
+        return assembly_dir / "assembly"
+    return None
+
+
+def _cmd_genome_scaffold(args: argparse.Namespace) -> int:
+    import dataclasses
+    import sys
+    from pathlib import Path
+
+    from constellation.sequencing.annotation.busco import BuscoRunner
+    from constellation.sequencing.assembly.diagnostics import generate_assembly_report
+    from constellation.sequencing.assembly.io import load_assembly, save_assembly
+    from constellation.sequencing.assembly.ragtag import RagTagRunner
+    from constellation.sequencing.assembly.stats import apply_busco
+
+    assembly_dir = Path(args.assembly_dir).expanduser().resolve()
+    bundle = _latest_assembly_bundle(assembly_dir, prefer=("assembly",))
+    if bundle is None:
+        print(f"error: no assembly bundle under {assembly_dir}", file=sys.stderr)
+        return 1
+    draft = load_assembly(bundle)
+
+    scaffold_reference, _h, _p, _a = _resolve_scaffold_reference(
+        args.scaffold_reference, args.scaffold_reference_dir
+    )
+    if scaffold_reference is None:
+        return 1
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    if not args.no_report:
+        _preload_matplotlib_for_reports()
+    try:
+        scaffolded = RagTagRunner(
+            threads=args.threads, extra_args=_shlex_tuple(args.ragtag_extra)
+        ).run(
+            draft,
+            scaffold_reference,
+            output_dir / "scaffold",
+            progress_cb=_stage_progress_cb(args),
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.busco_lineage:
+        busco_row, _f = BuscoRunner(lineage=args.busco_lineage, threads=args.threads).run(
+            scaffolded, output_dir / "scaffold" / "busco"
+        )
+        scaffolded = dataclasses.replace(
+            scaffolded, stats=apply_busco(scaffolded.stats, busco_row)
+        )
+    save_assembly(scaffolded, output_dir / "assembly")
+    if not args.no_report:
+        generate_assembly_report(
+            scaffolded, output_dir=output_dir / "diagnostics", stage_label="scaffold"
+        )
+    print(f"scaffolded → {output_dir}", file=sys.stderr)
+    return 0
+
+
+def _cmd_genome_polish(args: argparse.Namespace) -> int:
+    import dataclasses
+    import sys
+    from pathlib import Path
+
+    from constellation.sequencing.annotation.busco import BuscoRunner
+    from constellation.sequencing.assembly.diagnostics import generate_assembly_report
+    from constellation.sequencing.assembly.io import load_assembly, save_assembly
+    from constellation.sequencing.assembly.manifest import read_manifest_dir
+    from constellation.sequencing.assembly.polish import PolishRunner
+    from constellation.sequencing.assembly.stats import apply_busco
+
+    assembly_dir = Path(args.assembly_dir).expanduser().resolve()
+    bundle = _latest_assembly_bundle(assembly_dir)
+    if bundle is None:
+        print(f"error: no assembly bundle under {assembly_dir}", file=sys.stderr)
+        return 1
+    working = load_assembly(bundle)
+
+    if args.reads:
+        reads = [Path(p) for p in args.reads]
+    else:
+        try:
+            manifest = read_manifest_dir(assembly_dir)
+            harmonized = manifest.outputs.get("harmonized_bam")
+            if not harmonized:
+                raise ValueError("manifest has no harmonized_bam")
+            reads = [assembly_dir / harmonized]
+        except ValueError as exc:
+            print(f"error: --reads omitted and {exc}", file=sys.stderr)
+            return 1
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    if not args.no_report:
+        _preload_matplotlib_for_reports()
+    try:
+        polished = PolishRunner(
+            rounds=args.polish_rounds, threads=args.threads, device=args.device,
+            dorado_polish_extra=_shlex_tuple(args.dorado_polish_extra),
+        ).run(
+            working,
+            reads,
+            output_dir / "polish",
+            progress_cb=_stage_progress_cb(args),
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.busco_lineage:
+        busco_row, _f = BuscoRunner(lineage=args.busco_lineage, threads=args.threads).run(
+            polished, output_dir / "polish" / "busco"
+        )
+        polished = dataclasses.replace(
+            polished, stats=apply_busco(polished.stats, busco_row)
+        )
+    save_assembly(polished, output_dir / "assembly")
+    if not args.no_report:
+        generate_assembly_report(
+            polished, output_dir=output_dir / "diagnostics", stage_label="polish"
+        )
+    print(f"polished → {output_dir}", file=sys.stderr)
+    return 0
+
+
+def _cmd_genome_diagnose(args: argparse.Namespace) -> int:
+    import sys
+    from pathlib import Path
+
+    from constellation.sequencing.assembly.diagnostics import (
+        generate_assembly_report,
+        generate_comparative_report,
+    )
+    from constellation.sequencing.assembly.io import load_assembly
+
+    _preload_matplotlib_for_reports()
+
+    def _load(dir_arg: str) -> object:
+        d = Path(dir_arg).expanduser().resolve()
+        bundle = d / "assembly" / "assembly"
+        if not bundle.is_dir():
+            bundle = d / "assembly"
+        return load_assembly(bundle)
+
+    stage_stats = {}
+    try:
+        draft = _load(args.assembly_dir)
+    except (FileNotFoundError, ValueError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    out_base = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else Path(args.assembly_dir).expanduser().resolve() / "diagnostics"
+    )
+    generate_assembly_report(draft, output_dir=out_base, stage_label="draft")
+    stage_stats["draft"] = draft.stats
+    if args.scaffold_dir:
+        sc = _load(args.scaffold_dir)
+        generate_assembly_report(sc, output_dir=out_base / "scaffold", stage_label="scaffold")
+        stage_stats["scaffold"] = sc.stats
+    if args.polish_dir:
+        po = _load(args.polish_dir)
+        generate_assembly_report(po, output_dir=out_base / "polish", stage_label="polish")
+        stage_stats["polish"] = po.stats
+    if len(stage_stats) >= 2:
+        generate_comparative_report(stage_stats, output_dir=out_base)
+    print(f"diagnostics → {out_base}", file=sys.stderr)
+    return 0
 
 
 def _resolve_reference_args(

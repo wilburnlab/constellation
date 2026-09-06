@@ -24,12 +24,16 @@ from constellation.thirdparty.registry import (
 # adapter first, and `registered()` / `constellation doctor` see a
 # partial set depending on call-site ordering.
 from constellation.thirdparty import (  # noqa: F401  (import-for-side-effect)
+    bgzip,
     busco,
+    cactus,
     dorado,
     encyclopedia,
     hifiasm,
+    iqtree,
     minimap2,
     mmseqs2,
+    ragout,
     ragtag,
     samtools,
     thermo,

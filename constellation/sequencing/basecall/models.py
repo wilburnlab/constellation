@@ -35,7 +35,13 @@ _FAMILIES = frozenset({"sup", "hac", "fast"})
 # Default chemistry by family — ``DoradoModel.parse`` uses this when the
 # shorthand omits the chemistry prefix. Override by passing chemistry=
 # explicitly to ``DoradoModel(...)``.
-DEFAULT_DNA_CHEMISTRY = "dna_r10.4.1_e8.2"
+# R10.4.1 Dorado model identifiers carry the translocation speed, so the
+# canonical name is dna_r10.4.1_e8.2_400bps_sup@v5.0.0 — the same form
+# this package's own @RG parser documents and tests against. Without the
+# _400bps component the advertised `sup@v5.0.0` shorthand expanded to a
+# model that does not exist and basecalling failed unless the user knew
+# to spell out the full chemistry prefix.
+DEFAULT_DNA_CHEMISTRY = "dna_r10.4.1_e8.2_400bps"
 DEFAULT_RNA_CHEMISTRY = "rna004_130bps"
 
 
