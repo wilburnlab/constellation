@@ -61,6 +61,12 @@
       "dest": "junc_bed",
       "path_kind": "file",
       "glob": "*.bed"
+    },
+    {
+      "path": ["massspec", "inclusion-list"],
+      "dest": "fasta",
+      "path_kind": "file",
+      "glob": "*.fasta,*.fa,*.faa,*.fas"
     }
   ]
 }

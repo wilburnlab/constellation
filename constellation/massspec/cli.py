@@ -26,8 +26,10 @@ Per-utility extension comes in PR 1-4 as wrappers fill in.
 from __future__ import annotations
 
 import argparse
+import functools
 import re
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +60,7 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     _build_collision_filter_parser(ms_subs)
     _build_chromatogram_parser(ms_subs)
     _build_counter_parser(ms_subs)
+    _build_inclusion_list_parser(ms_subs)
 
 
 # ── convert ─────────────────────────────────────────────────────────────
@@ -3842,6 +3845,438 @@ def _cmd_counter_calibrate(args: argparse.Namespace) -> int:
     success.touch()
     if not args.no_progress:
         print(f"counter calibrate: {len(progs)} calibrants → {args.output_dir}", file=sys.stderr)
+    return 0
+
+
+# ── inclusion-list ──────────────────────────────────────────────────────
+
+
+#: Applied when the user names no fixed mods. Matches the lab default
+#: (``ptm_defaults`` has Carbamidomethyl at ``fix``) and the mod set the
+#: koina predict-library path hardcodes.
+_DEFAULT_FIXED_MODS: tuple[str, ...] = ("C:UNIMOD:4",)
+
+
+@functools.cache
+def _protease_ids() -> tuple[str, ...]:
+    """Registered protease ids, without importing ``core.sequence.protein``.
+
+    That import pulls ``core.chem.elements`` → torch into every
+    ``constellation --help``, and parser construction is torch-free
+    today. This reads the same packaged file ``PROTEASES`` is built from
+    (~3 ms); the handler still resolves through the registry, so drift
+    between the two surfaces as a ``KeyError``, never as a wrong digest.
+    ``test_protease_choices_match_registry`` pins them together.
+    """
+    import json
+    from importlib import resources
+
+    doc = json.loads(
+        resources.files("constellation.data").joinpath("proteases.json").read_text()
+    )
+    return tuple(entry["id"] for entry in doc["proteases"])
+
+
+def _parse_mod_specs(raw: Sequence[str], *, kind: str) -> dict[str, list[str]]:
+    """``["C:UNIMOD:4", "M:Oxidation"]`` → ``{"C": ["UNIMOD:4"], "M": ["UNIMOD:35"]}``.
+
+    Split on the *first* colon, so ``C:UNIMOD:4`` needs no escaping. Keys
+    are resolved to their UNIMOD accession here as well as inside
+    ``enumerate_modforms``, so an unknown mod fails at argument-parse
+    time quoting the flag and the token the user actually typed rather
+    than deep inside mass computation.
+    """
+    from constellation.core.chem.modifications import UNIMOD
+    from constellation.core.sequence.protein import C_TERM, N_TERM
+
+    out: dict[str, list[str]] = {}
+    for item in raw:
+        site, sep, key = item.partition(":")
+        site, key = site.strip(), key.strip()
+        if not sep or not site or not key:
+            raise ValueError(
+                f"invalid --{kind}-mod {item!r}: expected SITE:MODKEY, e.g. "
+                f"'C:UNIMOD:4', 'M:Oxidation', 'N-term:UNIMOD:1'"
+            )
+        lowered = site.lower()
+        if lowered in ("n-term", "nterm"):
+            site = N_TERM
+        elif lowered in ("c-term", "cterm"):
+            site = C_TERM
+        else:
+            site = site.upper()
+            if len(site) != 1 or not site.isalpha():
+                raise ValueError(
+                    f"invalid site {site!r} in --{kind}-mod {item!r}: expected a "
+                    f"single residue letter, or 'N-term' / 'C-term'"
+                )
+        if key not in UNIMOD:
+            raise ValueError(
+                f"unknown modification {key!r} in --{kind}-mod {item!r}; pass a "
+                f"UNIMOD accession ('UNIMOD:4') or a UNIMOD name "
+                f"('Carbamidomethyl')"
+            )
+        out.setdefault(site, []).append(UNIMOD[key].id)
+
+    if kind == "fixed":
+        for site, keys in out.items():
+            if len(keys) > 1:
+                raise ValueError(
+                    f"site {site!r} has {len(keys)} fixed mods ({', '.join(keys)}); "
+                    f"a fixed site takes exactly one. Use --variable-mod to offer "
+                    f"alternatives at one site."
+                )
+    return out
+
+
+def _resolve_fixed_mod_args(args: argparse.Namespace) -> list[str]:
+    """``--fixed-mod`` with the default applied only when unspecified.
+
+    ``action="append"`` appends *on top of* a non-empty ``default=``, so
+    the default lives here instead: naming any fixed mod replaces the
+    default rather than adding to it.
+    """
+    if args.fixed_mod is not None:
+        return list(args.fixed_mod)
+    return [] if args.no_default_mods else list(_DEFAULT_FIXED_MODS)
+
+
+def _format_mod_summary(spec: dict[str, list[str]]) -> str:
+    if not spec:
+        return "none"
+    return " ".join(f"{site}:{key}" for site, keys in spec.items() for key in keys)
+
+
+def _build_inclusion_list_parser(subs: argparse._SubParsersAction) -> None:
+    p = subs.add_parser(
+        "inclusion-list",
+        help=(
+            "FASTA → instrument inclusion-list CSV (Compound, m/z). Digests, "
+            "enumerates fixed/variable modforms, sweeps charge and filters to "
+            "the instrument's m/z range. Compound is the ProForma modseq with "
+            "the charge appended: PEPTIDEC[UNIMOD:4]K_2."
+        ),
+    )
+    p.add_argument(
+        "--fasta",
+        type=Path,
+        required=True,
+        help="input protein FASTA (typically one or a few target proteins)",
+    )
+    p.add_argument(
+        "-o",
+        "--output-dir",
+        type=Path,
+        required=True,
+        help=(
+            "run directory: inclusion_list.csv, precursors.parquet (the "
+            "full-precision grid the CSV is projected from) and manifest.json"
+        ),
+    )
+    p.add_argument(
+        "--output-name",
+        default="inclusion_list.csv",
+        help="CSV file name inside --output-dir (default: %(default)s)",
+    )
+
+    dig = p.add_argument_group("digestion")
+    dig.add_argument(
+        "--protease",
+        default="Trypsin",
+        choices=list(_protease_ids()),
+        help=(
+            "cleavage rule from constellation/data/proteases.json (default: "
+            "%(default)s). Spelled --protease, not --enzyme: this path is "
+            "native, while predict-library's --enzyme names an EncyclopeDIA "
+            "jar token"
+        ),
+    )
+    dig.add_argument("--missed-cleavages", type=int, default=1)
+    dig.add_argument("--min-peptide-length", type=int, default=6)
+    dig.add_argument("--max-peptide-length", type=int, default=30)
+    dig.add_argument(
+        "--no-excise-initiator-met",
+        dest="excise_initiator_met",
+        action="store_false",
+        help="skip the initiator-Met-excised variant of the N-terminal peptide",
+    )
+
+    mods = p.add_argument_group("modifications")
+    mods.add_argument(
+        "--fixed-mod",
+        action="append",
+        default=None,
+        metavar="SITE:MODKEY",
+        help=(
+            "repeatable; SITE is a residue letter or N-term/C-term, MODKEY is a "
+            "UNIMOD accession (UNIMOD:4) or name (Carbamidomethyl). Applied to "
+            f"every matching site. Naming any replaces the default "
+            f"({' '.join(_DEFAULT_FIXED_MODS)})"
+        ),
+    )
+    mods.add_argument(
+        "--variable-mod",
+        action="append",
+        default=None,
+        metavar="SITE:MODKEY",
+        help=(
+            "repeatable; enumerated over 0..--max-variable-mods simultaneous "
+            "sites. Repeating a site offers each mod as an alternative for it. "
+            "Default: none"
+        ),
+    )
+    mods.add_argument("--max-variable-mods", type=int, default=1)
+    mods.add_argument(
+        "--no-default-mods",
+        action="store_true",
+        help="start from an empty fixed-mod set instead of the default",
+    )
+
+    prec = p.add_argument_group("precursor window")
+    prec.add_argument("--min-charge", type=int, default=2)
+    prec.add_argument("--max-charge", type=int, default=4)
+    prec.add_argument(
+        "--min-mz",
+        type=float,
+        default=350.0,
+        help=(
+            "lower bound of the instrument's MS1 scan range (default: "
+            "%(default)s). Deliberately not EncyclopeDIA's 396.4 GPF-window "
+            "default, which would drop most targets from an inclusion list"
+        ),
+    )
+    prec.add_argument(
+        "--max-mz",
+        type=float,
+        default=2000.0,
+        help="upper bound of the instrument's MS1 scan range (default: %(default)s)",
+    )
+
+    out = p.add_argument_group("output")
+    out.add_argument(
+        "--mz-decimals",
+        type=int,
+        default=3,
+        help=(
+            "decimal places for the m/z column (default: %(default)s; 1e-3 Da "
+            "at m/z 1000 is 1 ppm, far below any isolation window)"
+        ),
+    )
+    out.add_argument("--sort", choices=["mz", "compound", "input"], default="mz")
+    out.add_argument(
+        "--warn-collision-ppm",
+        type=float,
+        default=10.0,
+        help=(
+            "warn when two entries fall within this many ppm of each other "
+            "(default: %(default)s; 0 disables). Reported, never filtered"
+        ),
+    )
+    out.add_argument(
+        "--no-sidecar",
+        action="store_true",
+        help="skip precursors.parquet",
+    )
+    out.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="suppress the run summary on stderr",
+    )
+    p.set_defaults(func=_cmd_massspec_inclusion_list)
+
+
+def _cmd_massspec_inclusion_list(args: argparse.Namespace) -> int:
+    import json
+    from datetime import datetime, timezone
+
+    from constellation import __version__ as constellation_version
+    from constellation.massspec.library.digest import (
+        precursors_from_fasta,
+        specs_to_table,
+    )
+    from constellation.massspec.library.inclusion import (
+        build_inclusion_list,
+        count_levels,
+        dedupe_specs,
+        find_mz_collisions,
+        write_inclusion_list,
+    )
+    from constellation.massspec.search.encyclopedia._common import sha256_file
+
+    fasta = Path(args.fasta).resolve()
+    if not fasta.is_file():
+        print(f"error: --fasta not found: {fasta}", file=sys.stderr)
+        return 2
+    if args.min_charge < 1 or args.min_charge > args.max_charge:
+        print(
+            f"error: --min-charge {args.min_charge} must be >= 1 and <= "
+            f"--max-charge {args.max_charge}",
+            file=sys.stderr,
+        )
+        return 1
+    if args.min_mz > args.max_mz:
+        print(
+            f"error: --min-mz {args.min_mz} exceeds --max-mz {args.max_mz}",
+            file=sys.stderr,
+        )
+        return 1
+    if args.mz_decimals < 0:
+        print(f"error: --mz-decimals must be >= 0, got {args.mz_decimals}", file=sys.stderr)
+        return 1
+
+    try:
+        fixed = _parse_mod_specs(_resolve_fixed_mod_args(args), kind="fixed")
+        variable = _parse_mod_specs(args.variable_mod or [], kind="variable")
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    charges = tuple(range(args.min_charge, args.max_charge + 1))
+    digest_kwargs: dict[str, Any] = {
+        "protease": args.protease,
+        "missed_cleavages": args.missed_cleavages,
+        "min_length": args.min_peptide_length,
+        "max_length": args.max_peptide_length,
+        "excise_initiator_met": args.excise_initiator_met,
+        "fixed_mods": {site: keys[0] for site, keys in fixed.items()},
+        "variable_mods": variable,
+        "max_variable_mods": args.max_variable_mods,
+    }
+    try:
+        specs = precursors_from_fasta(
+            fasta,
+            charges=charges,
+            min_mz=args.min_mz,
+            max_mz=args.max_mz,
+            **digest_kwargs,
+        )
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"error: digestion failed: {exc}", file=sys.stderr)
+        return 1
+
+    if not specs:
+        # Diagnose rather than emit an empty file: an empty CSV loaded into
+        # a method reads as "nothing to target". Re-digest without the m/z
+        # window — by far the most common cause, and the same cost as the
+        # digest that just ran, unlike widening the length bounds too.
+        try:
+            unwindowed = precursors_from_fasta(
+                fasta,
+                charges=charges,
+                min_mz=0.0,
+                max_mz=float("inf"),
+                **digest_kwargs,
+            )
+            detail = (
+                f"Dropping the m/z window alone leaves {len(unwindowed)} "
+                f"(peptidoform, charge) pair(s). "
+            )
+        except (OSError, ValueError, KeyError):
+            detail = ""
+        print(
+            f"error: no precursors survived the filters. {detail}Your window is "
+            f"m/z [{args.min_mz}, {args.max_mz}], charge [{args.min_charge}, "
+            f"{args.max_charge}], peptide length [{args.min_peptide_length}, "
+            f"{args.max_peptide_length}]. Widen it, or check --protease "
+            f"{args.protease}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    kept = dedupe_specs(specs)
+    counts = count_levels(kept)
+    counts["duplicates_dropped"] = len(specs) - len(kept)
+    table = build_inclusion_list(kept, sort=args.sort, dedupe=False)
+
+    collisions = (
+        find_mz_collisions(table, tolerance_ppm=args.warn_collision_ppm)
+        if args.warn_collision_ppm > 0
+        else None
+    )
+    counts["mz_collisions"] = 0 if collisions is None else collisions.num_rows
+
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = write_inclusion_list(
+        table,
+        output_dir / args.output_name,
+        decimals={"m/z": args.mz_decimals},
+    )
+
+    sidecar: str | None = None
+    if not args.no_sidecar:
+        import pyarrow.parquet as pq
+
+        sidecar_path = output_dir / "precursors.parquet"
+        pq.write_table(specs_to_table(kept), sidecar_path)
+        sidecar = str(sidecar_path)
+
+    # Proteins actually contributing a target, not proteins in the FASTA —
+    # one whose every peptide fell outside the window is not covered.
+    n_proteins = len({accession for spec in kept for accession in spec.proteins})
+    manifest = {
+        "tool": "constellation massspec inclusion-list",
+        "constellation_version": constellation_version,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "argv": list(sys.argv),
+        "inputs": {
+            "fasta": {"path": str(fasta), "sha256": sha256_file(fasta)},
+            "n_proteins_covered": n_proteins,
+        },
+        "outputs": {
+            "inclusion_list_csv": str(csv_path),
+            "precursors_parquet": sidecar,
+        },
+        "params": {
+            "protease": args.protease,
+            "missed_cleavages": args.missed_cleavages,
+            "min_peptide_length": args.min_peptide_length,
+            "max_peptide_length": args.max_peptide_length,
+            "excise_initiator_met": args.excise_initiator_met,
+            "fixed_mods": {site: keys[0] for site, keys in fixed.items()},
+            "variable_mods": variable,
+            "max_variable_mods": args.max_variable_mods,
+            "charges": list(charges),
+            "min_mz": args.min_mz,
+            "max_mz": args.max_mz,
+            "mz_decimals": args.mz_decimals,
+            "sort": args.sort,
+        },
+        "counts": counts,
+    }
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+    if not args.no_progress:
+        print(
+            f"inclusion list: {counts['entries']} entries "
+            f"({counts['peptides']} peptides, {counts['peptidoforms']} "
+            f"peptidoforms, charge {args.min_charge}-{args.max_charge})",
+            file=sys.stderr,
+        )
+        print(
+            f"  covering {n_proteins} protein(s) from {fasta.name}; "
+            f"m/z {args.min_mz}-{args.max_mz}",
+            file=sys.stderr,
+        )
+        print(
+            f"  mods: fixed {_format_mod_summary(fixed)}  "
+            f"variable {_format_mod_summary(variable)} "
+            f"(max {args.max_variable_mods})",
+            file=sys.stderr,
+        )
+        print(f"  → {csv_path}", file=sys.stderr)
+        if collisions is not None and collisions.num_rows:
+            print(
+                f"  warning: {collisions.num_rows} pair(s) within "
+                f"{args.warn_collision_ppm} ppm — co-isolation risk:",
+                file=sys.stderr,
+            )
+            for row in collisions.slice(0, 5).to_pylist():
+                print(
+                    f"    {row['compound_a']} / {row['compound_b']}   "
+                    f"{row['delta_ppm']:.2f} ppm",
+                    file=sys.stderr,
+                )
     return 0
 
 

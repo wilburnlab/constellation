@@ -54,6 +54,8 @@ import constellation.massspec.annotation
 import constellation.massspec.annotation.mzpaf
 import constellation.massspec.annotation.usi
 import constellation.massspec.library
+import constellation.massspec.library.digest
+import constellation.massspec.library.inclusion
 import constellation.massspec.library.io
 import constellation.massspec.library.library
 import constellation.massspec.library.schemas

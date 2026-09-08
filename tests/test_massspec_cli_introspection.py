@@ -43,6 +43,7 @@ def test_all_four_subcommands_register() -> None:
         "collision-filter",
         "chromatogram",
         "counter",
+        "inclusion-list",
     }
     # chromatogram + counter are nested groups with their own sub-subcommands.
     chrom_subs = _subparsers_action(ms_subs.choices["chromatogram"])
@@ -87,6 +88,7 @@ def test_all_four_subcommands_register() -> None:
             "collision-filter",
             {"--elib", "--dia", "--output-elib", "--output-dir"},
         ),
+        ("inclusion-list", {"--fasta", "--output-dir"}),
     ],
 )
 def test_subcommand_required_args(
@@ -227,6 +229,7 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
         "collision-filter",
         "chromatogram",
         "counter",
+        "inclusion-list",
     }
     # Each subcommand surfaces either direct arguments (leaf) or nested
     # subcommands (group). chromatogram is the nested group.
