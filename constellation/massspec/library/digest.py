@@ -74,6 +74,7 @@ def precursors_from_fasta(
     *,
     protease: str = "Trypsin",
     missed_cleavages: int = 1,
+    min_missed_cleavages: int = 0,
     min_length: int = 6,
     max_length: int = 30,
     excise_initiator_met: bool = True,
@@ -91,7 +92,22 @@ def precursors_from_fasta(
     parent accession, matching ``PROTEIN_PEPTIDE_EDGE``'s M:N semantics —
     predicting the same peptidoform once per protein would be wasted
     inference and would break the Library's PK uniqueness.
+
+    ``missed_cleavages`` is the *maximum*; ``min_missed_cleavages`` is the
+    matching floor, so ``min_missed_cleavages=1, missed_cleavages=1``
+    yields only the singly-missed peptides. A peptide reachable at more
+    than one missed-cleavage count (the same residues spanning different
+    cut sites) is kept if any of its spans satisfies the floor.
     """
+    if min_missed_cleavages < 0:
+        raise ValueError(
+            f"min_missed_cleavages must be >= 0, got {min_missed_cleavages}"
+        )
+    if min_missed_cleavages > missed_cleavages:
+        raise ValueError(
+            f"min_missed_cleavages ({min_missed_cleavages}) exceeds "
+            f"missed_cleavages ({missed_cleavages})"
+        )
     from constellation.massspec.search.novel import read_fasta_proteins
 
     table = read_fasta_proteins(fasta)
@@ -101,6 +117,10 @@ def precursors_from_fasta(
     # peptide sequence → the accessions it came from, first-seen order.
     peptide_proteins: dict[str, list[str]] = {}
     for accession, protein_seq in zip(accessions, sequences, strict=True):
+        # Spans rather than bare sequences so `n_missed` is available to
+        # filter on; `cleave` sorts them by (start, end) and the
+        # setdefault below dedups on sequence, reproducing the bare-string
+        # path's first-seen ordering exactly.
         peptides = cleave(
             protein_seq,
             protease,
@@ -109,9 +129,12 @@ def precursors_from_fasta(
             max_length=max_length,
             excise_initiator_met=excise_initiator_met,
             validate_alphabet=False,
+            return_spans=True,
         )
         for peptide in peptides:
-            owners = peptide_proteins.setdefault(peptide, [])
+            if peptide.n_missed < min_missed_cleavages:
+                continue
+            owners = peptide_proteins.setdefault(peptide.sequence, [])
             if accession not in owners:
                 owners.append(accession)
 

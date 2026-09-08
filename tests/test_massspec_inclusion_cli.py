@@ -101,6 +101,73 @@ def test_default_mz_decimals_is_three(fasta, tmp_path) -> None:
         assert len(line.split(",")[1].split(".")[1]) == 3
 
 
+# ── missed-cleavage band ───────────────────────────────────────────────
+
+
+def _compounds(out) -> set[str]:
+    return {
+        line.split(",")[0]
+        for line in (out / "inclusion_list.csv").read_text().splitlines()[1:]
+    }
+
+
+def test_min_missed_cleavages_selects_only_that_band(fasta, tmp_path) -> None:
+    """``--min-missed-cleavages 1 --missed-cleavages 1`` lists only the
+    singly-missed peptides — the fully-cleaved ones drop out entirely."""
+    zero, upto_one, only_one = tmp_path / "z", tmp_path / "u", tmp_path / "o"
+    assert _invoke(fasta, zero, "--missed-cleavages", "0") == 0
+    assert _invoke(fasta, upto_one, "--missed-cleavages", "1") == 0
+    assert (
+        _invoke(
+            fasta, only_one, "--missed-cleavages", "1", "--min-missed-cleavages", "1"
+        )
+        == 0
+    )
+
+    fully, ceiling, band = _compounds(zero), _compounds(upto_one), _compounds(only_one)
+    assert band, "expected at least one singly-missed peptide"
+    # The band is exactly what the ceiling adds over the fully-cleaved set.
+    assert band == ceiling - fully
+    assert not (band & fully)
+
+
+def test_min_missed_cleavages_defaults_to_zero(fasta, tmp_path) -> None:
+    a, b = tmp_path / "a", tmp_path / "b"
+    assert _invoke(fasta, a, "--missed-cleavages", "1") == 0
+    assert _invoke(fasta, b, "--missed-cleavages", "1", "--min-missed-cleavages", "0") == 0
+    assert _compounds(a) == _compounds(b)
+
+
+def test_min_missed_cleavages_recorded_in_manifest(fasta, tmp_path) -> None:
+    out = tmp_path / "out"
+    assert (
+        _invoke(fasta, out, "--missed-cleavages", "2", "--min-missed-cleavages", "2")
+        == 0
+    )
+    params = json.loads((out / "manifest.json").read_text())["params"]
+    assert params["min_missed_cleavages"] == 2
+    assert params["missed_cleavages"] == 2
+
+
+def test_min_missed_cleavages_above_max_rejected(fasta, tmp_path, capsys) -> None:
+    out = tmp_path / "out"
+    assert (
+        _invoke(fasta, out, "--missed-cleavages", "1", "--min-missed-cleavages", "2")
+        == 1
+    )
+    assert "--min-missed-cleavages" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_summary_reports_the_missed_cleavage_band(fasta, tmp_path, capsys) -> None:
+    out = tmp_path / "out"
+    assert (
+        _invoke(fasta, out, "--missed-cleavages", "1", "--min-missed-cleavages", "1")
+        == 0
+    )
+    assert "missed cleavages 1-1" in capsys.readouterr().err
+
+
 # ── modifications ──────────────────────────────────────────────────────
 
 
@@ -214,6 +281,63 @@ def test_parse_mod_specs_resolves_names_to_accessions() -> None:
         "C": ["UNIMOD:4"],
         "M": ["UNIMOD:35"],
     }
+
+
+# ── isolation-window merging ───────────────────────────────────────────
+
+
+def test_merge_within_da_collapses_rows(tmp_path, capsys) -> None:
+    path = tmp_path / "iso.fasta"
+    path.write_text(">sp|A|A x\nMKLSKAAAAAKISKAAAAAK\n")
+    plain, merged = tmp_path / "plain", tmp_path / "merged"
+    assert _invoke(path, plain, "--min-peptide-length", "3", "--min-mz", "300") == 0
+    capsys.readouterr()
+    assert (
+        _invoke(
+            path, merged, "--min-peptide-length", "3", "--min-mz", "300",
+            "--merge-within-da", "0.5",
+        )
+        == 0
+    )
+    err = capsys.readouterr().err
+
+    n_plain = len((plain / "inclusion_list.csv").read_text().splitlines())
+    n_merged = len((merged / "inclusion_list.csv").read_text().splitlines())
+    assert n_merged < n_plain
+    assert ";" in (merged / "inclusion_list.csv").read_text()
+    assert "merged" in err
+
+    counts = json.loads((merged / "manifest.json").read_text())["counts"]
+    assert counts["merged_away"] == n_plain - n_merged
+    assert counts["rows"] == n_merged - 1  # minus the header line
+
+
+def test_merge_off_by_default(fasta, tmp_path) -> None:
+    out = tmp_path / "out"
+    assert _invoke(fasta, out) == 0
+    assert ";" not in (out / "inclusion_list.csv").read_text()
+    counts = json.loads((out / "manifest.json").read_text())["counts"]
+    assert counts["merged_away"] == 0
+    assert counts["rows"] == counts["entries"]
+
+
+def test_merge_does_not_touch_the_parquet_sidecar(tmp_path) -> None:
+    """The grid stays the canonical record — merging is a CSV projection."""
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "iso.fasta"
+    path.write_text(">sp|A|A x\nMKLSKAAAAAKISKAAAAAK\n")
+    out = tmp_path / "out"
+    assert (
+        _invoke(
+            path, out, "--min-peptide-length", "3", "--min-mz", "300",
+            "--merge-within-da", "0.5",
+        )
+        == 0
+    )
+    grid = pq.read_table(out / "precursors.parquet")
+    counts = json.loads((out / "manifest.json").read_text())["counts"]
+    assert grid.num_rows == counts["entries"] > counts["rows"]
 
 
 # ── validation ─────────────────────────────────────────────────────────

@@ -3991,7 +3991,23 @@ def _build_inclusion_list_parser(subs: argparse._SubParsersAction) -> None:
             "jar token"
         ),
     )
-    dig.add_argument("--missed-cleavages", type=int, default=1)
+    dig.add_argument(
+        "--missed-cleavages",
+        type=int,
+        default=1,
+        help="maximum missed cleavages per peptide (default: %(default)s)",
+    )
+    dig.add_argument(
+        "--min-missed-cleavages",
+        type=int,
+        default=0,
+        help=(
+            "minimum missed cleavages (default: %(default)s). Pairs with "
+            "--missed-cleavages to select a band rather than a ceiling: "
+            "'--min-missed-cleavages 1 --missed-cleavages 1' lists ONLY the "
+            "singly-missed peptides"
+        ),
+    )
     dig.add_argument("--min-peptide-length", type=int, default=6)
     dig.add_argument("--max-peptide-length", type=int, default=30)
     dig.add_argument(
@@ -4064,6 +4080,21 @@ def _build_inclusion_list_parser(subs: argparse._SubParsersAction) -> None:
     )
     out.add_argument("--sort", choices=["mz", "compound", "input"], default="mz")
     out.add_argument(
+        "--merge-within-da",
+        type=float,
+        default=0.0,
+        metavar="DA",
+        help=(
+            "collapse precursors whose m/z span this many Da into ONE row, "
+            "targeting their mean with a ';'-joined Compound "
+            "(ISTDDMK_2;AVDEGYR_2). Set this to the instrument's isolation "
+            "width on a low-resolution instrument — 0.5 is a typical ion-trap "
+            "value — where two entries a few mDa apart are the same isolation "
+            "and listing both just runs it twice. Default 0 (no merging), "
+            "since on a high-resolution instrument they are separable targets"
+        ),
+    )
+    out.add_argument(
         "--warn-collision-ppm",
         type=float,
         default=10.0,
@@ -4099,6 +4130,7 @@ def _cmd_massspec_inclusion_list(args: argparse.Namespace) -> int:
         count_levels,
         dedupe_specs,
         find_mz_collisions,
+        merge_isolation_groups,
         write_inclusion_list,
     )
     from constellation.massspec.search.encyclopedia._common import sha256_file
@@ -4123,6 +4155,13 @@ def _cmd_massspec_inclusion_list(args: argparse.Namespace) -> int:
     if args.mz_decimals < 0:
         print(f"error: --mz-decimals must be >= 0, got {args.mz_decimals}", file=sys.stderr)
         return 1
+    if args.min_missed_cleavages < 0 or args.min_missed_cleavages > args.missed_cleavages:
+        print(
+            f"error: --min-missed-cleavages {args.min_missed_cleavages} must be "
+            f">= 0 and <= --missed-cleavages {args.missed_cleavages}",
+            file=sys.stderr,
+        )
+        return 1
 
     try:
         fixed = _parse_mod_specs(_resolve_fixed_mod_args(args), kind="fixed")
@@ -4135,6 +4174,7 @@ def _cmd_massspec_inclusion_list(args: argparse.Namespace) -> int:
     digest_kwargs: dict[str, Any] = {
         "protease": args.protease,
         "missed_cleavages": args.missed_cleavages,
+        "min_missed_cleavages": args.min_missed_cleavages,
         "min_length": args.min_peptide_length,
         "max_length": args.max_peptide_length,
         "excise_initiator_met": args.excise_initiator_met,
@@ -4177,8 +4217,9 @@ def _cmd_massspec_inclusion_list(args: argparse.Namespace) -> int:
             f"error: no precursors survived the filters. {detail}Your window is "
             f"m/z [{args.min_mz}, {args.max_mz}], charge [{args.min_charge}, "
             f"{args.max_charge}], peptide length [{args.min_peptide_length}, "
-            f"{args.max_peptide_length}]. Widen it, or check --protease "
-            f"{args.protease}.",
+            f"{args.max_peptide_length}], missed cleavages "
+            f"[{args.min_missed_cleavages}, {args.missed_cleavages}]. Widen it, "
+            f"or check --protease {args.protease}.",
             file=sys.stderr,
         )
         return 1
@@ -4187,6 +4228,16 @@ def _cmd_massspec_inclusion_list(args: argparse.Namespace) -> int:
     counts = count_levels(kept)
     counts["duplicates_dropped"] = len(specs) - len(kept)
     table = build_inclusion_list(kept, sort=args.sort, dedupe=False)
+
+    # Merge before the collision scan so what's reported is the risk that
+    # SURVIVES merging, not the pairs we just collapsed into one target.
+    n_before_merge = table.num_rows
+    if args.merge_within_da > 0:
+        table = merge_isolation_groups(table, tolerance_da=args.merge_within_da)
+        if args.sort == "compound":
+            table = table.sort_by([("Compound", "ascending")])
+    counts["rows"] = table.num_rows
+    counts["merged_away"] = n_before_merge - table.num_rows
 
     collisions = (
         find_mz_collisions(table, tolerance_ppm=args.warn_collision_ppm)
@@ -4230,6 +4281,7 @@ def _cmd_massspec_inclusion_list(args: argparse.Namespace) -> int:
         "params": {
             "protease": args.protease,
             "missed_cleavages": args.missed_cleavages,
+            "min_missed_cleavages": args.min_missed_cleavages,
             "min_peptide_length": args.min_peptide_length,
             "max_peptide_length": args.max_peptide_length,
             "excise_initiator_met": args.excise_initiator_met,
@@ -4241,6 +4293,7 @@ def _cmd_massspec_inclusion_list(args: argparse.Namespace) -> int:
             "max_mz": args.max_mz,
             "mz_decimals": args.mz_decimals,
             "sort": args.sort,
+            "merge_within_da": args.merge_within_da,
         },
         "counts": counts,
     }
@@ -4248,14 +4301,22 @@ def _cmd_massspec_inclusion_list(args: argparse.Namespace) -> int:
 
     if not args.no_progress:
         print(
-            f"inclusion list: {counts['entries']} entries "
-            f"({counts['peptides']} peptides, {counts['peptidoforms']} "
-            f"peptidoforms, charge {args.min_charge}-{args.max_charge})",
+            f"inclusion list: {table.num_rows} rows "
+            f"({counts['entries']} precursors, {counts['peptides']} peptides, "
+            f"{counts['peptidoforms']} peptidoforms, charge "
+            f"{args.min_charge}-{args.max_charge})",
             file=sys.stderr,
         )
+        if counts["merged_away"]:
+            print(
+                f"  merged {counts['merged_away']} precursor(s) into shared "
+                f"rows within {args.merge_within_da} Da",
+                file=sys.stderr,
+            )
         print(
             f"  covering {n_proteins} protein(s) from {fasta.name}; "
-            f"m/z {args.min_mz}-{args.max_mz}",
+            f"m/z {args.min_mz}-{args.max_mz}; missed cleavages "
+            f"{args.min_missed_cleavages}-{args.missed_cleavages}",
             file=sys.stderr,
         )
         print(

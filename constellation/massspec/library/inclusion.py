@@ -162,6 +162,65 @@ def write_inclusion_list(
     return out
 
 
+def merge_isolation_groups(
+    table: pa.Table,
+    *,
+    tolerance_da: float = 0.5,
+    separator: str = ";",
+) -> pa.Table:
+    """Collapse entries that share an isolation window into one target.
+
+    A low-resolution isolation window (an ion trap's is typically 0.4-2
+    Da) cannot separate precursors a few mDa apart, so listing them as
+    two rows asks the instrument to run the same isolation twice. Merged
+    rows carry the mean m/z and a `separator`-joined Compound —
+    ``ISTDDMK_2;AVDEGYR_2`` — so the ambiguity stays visible in the
+    method and in the raw file rather than being silently dropped.
+
+    Grouping is greedy over the m/z-sorted list and bounded by **span,
+    not by neighbour distance**: an entry joins the open group only while
+    ``mz - group_min <= tolerance_da``. Single-linkage chaining would let
+    a group creep arbitrarily far — A-B and B-C each within tolerance
+    while A-C is not — and the resulting "one target" would no longer fit
+    in one window. Bounding the span guarantees every member is reachable
+    from one isolation of that width, and that the mean sits within
+    ``tolerance_da / 2`` of each member.
+
+    ``tolerance_da <= 0`` disables merging and returns `table` unchanged.
+    """
+    if tolerance_da <= 0 or table.num_rows == 0:
+        return table
+
+    ordered = table.sort_by([("m/z", "ascending"), ("Compound", "ascending")])
+    names = ordered.column("Compound").to_pylist()
+    mzs = ordered.column("m/z").to_pylist()
+
+    out_names: list[str] = []
+    out_mzs: list[float] = []
+    group_names: list[str] = [names[0]]
+    group_mzs: list[float] = [mzs[0]]
+
+    def _flush() -> None:
+        out_names.append(separator.join(group_names))
+        out_mzs.append(sum(group_mzs) / len(group_mzs))
+
+    for name, mz in zip(names[1:], mzs[1:], strict=True):
+        if mz - group_mzs[0] <= tolerance_da:
+            group_names.append(name)
+            group_mzs.append(mz)
+            continue
+        _flush()
+        group_names, group_mzs = [name], [mz]
+    _flush()
+
+    return pa.table(
+        {
+            "Compound": pa.array(out_names, pa.string()),
+            "m/z": pa.array(out_mzs, pa.float64()),
+        }
+    )
+
+
 def find_mz_collisions(table: pa.Table, *, tolerance_ppm: float = 10.0) -> pa.Table:
     """Adjacent entries in the m/z-sorted list within `tolerance_ppm`.
 
@@ -229,5 +288,6 @@ __all__ = [
     "count_levels",
     "dedupe_specs",
     "find_mz_collisions",
+    "merge_isolation_groups",
     "write_inclusion_list",
 ]

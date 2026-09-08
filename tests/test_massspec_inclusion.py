@@ -12,6 +12,7 @@ from constellation.massspec.library.inclusion import (
     count_levels,
     dedupe_specs,
     find_mz_collisions,
+    merge_isolation_groups,
     write_inclusion_list,
 )
 
@@ -194,6 +195,70 @@ def test_write_roundtrips_through_pyarrow_csv_read(tmp_path) -> None:
 # ── collisions ─────────────────────────────────────────────────────────
 
 
+# ── isolation-window merging ───────────────────────────────────────────
+
+
+def test_merge_collapses_entries_inside_one_window() -> None:
+    table = build_inclusion_list(
+        [_spec("ISTDDMK", 2, 405.189), _spec("AVDEGYR", 2, 405.193)]
+    )
+    merged = merge_isolation_groups(table, tolerance_da=0.5)
+    assert merged.num_rows == 1
+    row = merged.to_pylist()[0]
+    assert row["Compound"] == "ISTDDMK_2;AVDEGYR_2"
+    assert row["m/z"] == pytest.approx(405.191, abs=1e-9)
+
+
+def test_merge_leaves_separated_entries_alone() -> None:
+    table = build_inclusion_list([_spec("AK", 2, 405.1), _spec("BK", 2, 406.9)])
+    merged = merge_isolation_groups(table, tolerance_da=0.5)
+    assert merged.num_rows == 2
+    assert merged.column("Compound").to_pylist() == ["AK_2", "BK_2"]
+
+
+def test_merge_is_bounded_by_span_not_by_neighbour_distance() -> None:
+    """Single-linkage chaining would swallow C (each gap is 0.4 Da) into a
+    0.8 Da-wide group that no 0.5 Da isolation could actually capture."""
+    table = build_inclusion_list(
+        [_spec("AK", 2, 500.0), _spec("BK", 2, 500.4), _spec("CK", 2, 500.8)]
+    )
+    merged = merge_isolation_groups(table, tolerance_da=0.5)
+    assert merged.column("Compound").to_pylist() == ["AK_2;BK_2", "CK_2"]
+    # Every group fits inside one window of the requested width.
+    assert merged.column("m/z").to_pylist() == pytest.approx([500.2, 500.8])
+
+
+def test_merged_mean_is_within_half_tolerance_of_every_member() -> None:
+    specs = [_spec("AK", 2, 500.0), _spec("BK", 2, 500.5)]
+    merged = merge_isolation_groups(build_inclusion_list(specs), tolerance_da=0.5)
+    center = merged.column("m/z")[0].as_py()
+    for s in specs:
+        assert abs(center - s.precursor_mz) <= 0.5 / 2 + 1e-9
+
+
+def test_merge_disabled_by_nonpositive_tolerance() -> None:
+    table = build_inclusion_list(
+        [_spec("ISTDDMK", 2, 405.189), _spec("AVDEGYR", 2, 405.193)]
+    )
+    assert merge_isolation_groups(table, tolerance_da=0.0).num_rows == 2
+    assert merge_isolation_groups(table, tolerance_da=-1.0).num_rows == 2
+
+
+def test_merge_preserves_columns_and_handles_empty() -> None:
+    empty = build_inclusion_list([])
+    merged = merge_isolation_groups(empty, tolerance_da=0.5)
+    assert merged.column_names == ["Compound", "m/z"]
+    assert merged.num_rows == 0
+
+
+def test_merge_orders_members_by_mz() -> None:
+    table = build_inclusion_list(
+        [_spec("ZK", 2, 500.30), _spec("AK", 2, 500.10), _spec("MK", 2, 500.20)]
+    )
+    merged = merge_isolation_groups(table, tolerance_da=0.5)
+    assert merged.column("Compound").to_pylist() == ["AK_2;MK_2;ZK_2"]
+
+
 def test_find_mz_collisions_flags_near_isobars() -> None:
     table = build_inclusion_list(
         [
@@ -223,6 +288,36 @@ def test_find_mz_collisions_columns_on_empty_result() -> None:
 
 
 # ── end to end from a FASTA ────────────────────────────────────────────
+
+
+def test_min_missed_cleavages_partitions_the_digest(tmp_path) -> None:
+    """The ``[min, max]`` band is a partition of the ceiling: the 0-band
+    and the 1-band are disjoint and together reproduce ``max=1``."""
+    fasta = tmp_path / "targets.fasta"
+    fasta.write_text(_FASTA)
+    common = dict(protease="Trypsin", charges=(2,), min_mz=0.0, max_mz=1e9)
+
+    ceiling = precursors_from_fasta(fasta, missed_cleavages=1, **common)
+    zero = precursors_from_fasta(
+        fasta, missed_cleavages=0, min_missed_cleavages=0, **common
+    )
+    one = precursors_from_fasta(
+        fasta, missed_cleavages=1, min_missed_cleavages=1, **common
+    )
+
+    seqs = lambda specs: {s.modified_sequence for s in specs}  # noqa: E731
+    assert seqs(one)
+    assert not (seqs(zero) & seqs(one))
+    assert seqs(zero) | seqs(one) == seqs(ceiling)
+
+
+def test_min_missed_cleavages_validates_against_the_ceiling(tmp_path) -> None:
+    fasta = tmp_path / "targets.fasta"
+    fasta.write_text(_FASTA)
+    with pytest.raises(ValueError, match="exceeds"):
+        precursors_from_fasta(fasta, missed_cleavages=1, min_missed_cleavages=2)
+    with pytest.raises(ValueError, match="must be >= 0"):
+        precursors_from_fasta(fasta, min_missed_cleavages=-1)
 
 
 def test_end_to_end_from_fasta(tmp_path) -> None:
