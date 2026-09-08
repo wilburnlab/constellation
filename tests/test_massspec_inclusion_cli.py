@@ -68,7 +68,10 @@ def test_happy_path_writes_csv_parquet_manifest(fasta, tmp_path) -> None:
     assert manifest["params"]["charges"] == [2, 3, 4]
     assert manifest["params"]["fixed_mods"] == {"C": "UNIMOD:4"}
     assert manifest["inputs"]["fasta"]["sha256"]
-    assert manifest["counts"]["entries"] == len(csv_path.read_text().splitlines()) - 1
+    # `rows` is what the CSV holds; `entries` is the pre-merge precursor
+    # count, which merging can make larger.
+    assert manifest["counts"]["rows"] == len(csv_path.read_text().splitlines()) - 1
+    assert manifest["counts"]["entries"] >= manifest["counts"]["rows"]
 
 
 def test_sidecar_can_be_skipped(fasta, tmp_path) -> None:
@@ -290,7 +293,13 @@ def test_merge_within_da_collapses_rows(tmp_path, capsys) -> None:
     path = tmp_path / "iso.fasta"
     path.write_text(">sp|A|A x\nMKLSKAAAAAKISKAAAAAK\n")
     plain, merged = tmp_path / "plain", tmp_path / "merged"
-    assert _invoke(path, plain, "--min-peptide-length", "3", "--min-mz", "300") == 0
+    assert (
+        _invoke(
+            path, plain, "--min-peptide-length", "3", "--min-mz", "300",
+            "--merge-within-da", "0",
+        )
+        == 0
+    )
     capsys.readouterr()
     assert (
         _invoke(
@@ -312,9 +321,27 @@ def test_merge_within_da_collapses_rows(tmp_path, capsys) -> None:
     assert counts["rows"] == n_merged - 1  # minus the header line
 
 
-def test_merge_off_by_default(fasta, tmp_path) -> None:
+def test_merge_defaults_to_half_a_dalton(fasta, tmp_path) -> None:
+    """On by default at an ion-trap isolation width — pinned so the
+    default can't drift silently, since it changes what gets acquired."""
     out = tmp_path / "out"
     assert _invoke(fasta, out) == 0
+    assert json.loads((out / "manifest.json").read_text())["params"][
+        "merge_within_da"
+    ] == 0.5
+
+
+def test_merge_can_be_disabled(tmp_path) -> None:
+    path = tmp_path / "iso.fasta"
+    path.write_text(">sp|A|A x\nMKLSKAAAAAKISKAAAAAK\n")
+    out = tmp_path / "out"
+    assert (
+        _invoke(
+            path, out, "--min-peptide-length", "3", "--min-mz", "300",
+            "--merge-within-da", "0",
+        )
+        == 0
+    )
     assert ";" not in (out / "inclusion_list.csv").read_text()
     counts = json.loads((out / "manifest.json").read_text())["counts"]
     assert counts["merged_away"] == 0
@@ -418,15 +445,42 @@ def test_no_progress_silences_the_summary(fasta, tmp_path, capsys) -> None:
 
 
 def test_collision_warning_emitted(tmp_path, capsys) -> None:
-    """GGGGGGKR and its 2+ near-isobar land inside 10 ppm of each other."""
+    """LSK / ISK differ only by Leu/Ile — exactly isobaric. With merging
+    disabled they stay two rows, and the scan flags them."""
     path = tmp_path / "iso.fasta"
-    # LSK / ISK differ only by Leu/Ile — exactly isobaric.
     path.write_text(">sp|A|A x\nMKLSKAAAAAKISKAAAAAK\n")
     out = tmp_path / "out"
-    assert _invoke(path, out, "--min-peptide-length", "3", "--min-mz", "300") == 0
+    assert (
+        _invoke(
+            path, out, "--min-peptide-length", "3", "--min-mz", "300",
+            "--merge-within-da", "0",
+        )
+        == 0
+    )
     err = capsys.readouterr().err
     assert "co-isolation risk" in err
     assert json.loads((out / "manifest.json").read_text())["counts"]["mz_collisions"] > 0
+
+
+def test_merging_resolves_what_the_collision_scan_would_warn_about(
+    tmp_path, capsys
+) -> None:
+    """The scan runs *after* merging, so it reports the risk that
+    survives — entries already folded into one target are not a risk."""
+    path = tmp_path / "iso.fasta"
+    path.write_text(">sp|A|A x\nMKLSKAAAAAKISKAAAAAK\n")
+    out = tmp_path / "out"
+    assert (
+        _invoke(
+            path, out, "--min-peptide-length", "3", "--min-mz", "300",
+            "--merge-within-da", "0.5",
+        )
+        == 0
+    )
+    assert "co-isolation risk" not in capsys.readouterr().err
+    counts = json.loads((out / "manifest.json").read_text())["counts"]
+    assert counts["merged_away"] > 0
+    assert counts["mz_collisions"] == 0
 
 
 def test_collision_warning_disabled(tmp_path, capsys) -> None:
@@ -436,7 +490,7 @@ def test_collision_warning_disabled(tmp_path, capsys) -> None:
     assert (
         _invoke(
             path, out, "--min-peptide-length", "3", "--min-mz", "300",
-            "--warn-collision-ppm", "0",
+            "--merge-within-da", "0", "--warn-collision-ppm", "0",
         )
         == 0
     )

@@ -4082,16 +4082,16 @@ def _build_inclusion_list_parser(subs: argparse._SubParsersAction) -> None:
     out.add_argument(
         "--merge-within-da",
         type=float,
-        default=0.0,
+        default=0.5,
         metavar="DA",
         help=(
             "collapse precursors whose m/z span this many Da into ONE row, "
             "targeting their mean with a ';'-joined Compound "
-            "(ISTDDMK_2;AVDEGYR_2). Set this to the instrument's isolation "
-            "width on a low-resolution instrument — 0.5 is a typical ion-trap "
-            "value — where two entries a few mDa apart are the same isolation "
-            "and listing both just runs it twice. Default 0 (no merging), "
-            "since on a high-resolution instrument they are separable targets"
+            "(ISTDDMK_2;AVDEGYR_2). Defaults to %(default)s, a typical "
+            "ion-trap isolation width, where two entries a few mDa apart are "
+            "the same isolation and listing both just runs it twice. Raise it "
+            "to match a wider window; pass 0 to disable merging on a "
+            "high-resolution instrument, where they are separable targets"
         ),
     )
     out.add_argument(
