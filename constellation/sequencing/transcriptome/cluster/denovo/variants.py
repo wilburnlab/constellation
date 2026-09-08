@@ -131,12 +131,16 @@ def call_variants(
     L = pwm.shape[0]
     if L == 0 or not consensus:
         return []
+    # The PWM and the winner call live in the same (frame) coordinate system;
+    # every position map below assumes it.
+    assert winner.shape[0] == L, "pwm / winner frame length mismatch"
 
-    # Must match centroid_consensus's rule exactly — cons_pos is a cumsum
-    # over `keep`, so any divergence misaligns every reported variant
-    # position. An unresolved N (code 5) IS a consensus column.
+    # Must match frame_consensus's rule exactly — cons_pos is a cumsum over
+    # `keep`, so any divergence misaligns every reported variant position. An
+    # unresolved N (code 5) IS a consensus column. `consensus_of_frame` in
+    # consensus.py is the shared definition.
     keep = winner != 4
-    cons_pos_of_centroid = np.cumsum(keep) - 1
+    cons_pos_of_frame = np.cumsum(keep) - 1
     n = pwm.sum(axis=1)
     sorted_counts = np.sort(pwm, axis=1)
     minor_count = sorted_counts[:, -2]
@@ -160,7 +164,7 @@ def call_variants(
     base_cov = pwm[:, :4].sum(axis=1)
     core_start, core_end = _core_region(base_cov[np.flatnonzero(keep)], core_frac)
 
-    cpos = cons_pos_of_centroid[cand_idx]
+    cpos = cons_pos_of_frame[cand_idx]
     in_core = (cpos >= core_start) & (cpos <= core_end)
     mj = major[cand_idx]
     mn = minor[cand_idx]
@@ -240,9 +244,9 @@ def disagreement_stats(
     L = pwm.shape[0]
     if L == 0 or not consensus:
         return {}
-    # Must match centroid_consensus's rule exactly — cons_pos is a cumsum
-    # over `keep`, so any divergence misaligns every reported variant
-    # position. An unresolved N (code 5) IS a consensus column.
+    # Must match frame_consensus's rule exactly — cons_pos is a cumsum over
+    # `keep`, so any divergence misaligns every reported variant position. An
+    # unresolved N (code 5) IS a consensus column.
     keep = winner != 4
     n = pwm.sum(axis=1)
     major = np.sort(pwm, axis=1)[:, -1]

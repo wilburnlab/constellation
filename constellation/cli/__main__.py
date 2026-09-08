@@ -1334,6 +1334,27 @@ def _build_transcriptome_parser(subs) -> None:
         help="de-novo: beta-binomial overdispersion ρ for variant SF (Cut 4).",
     )
     p_cluster.add_argument(
+        "--fold-insertions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "de-novo: let the consensus splice in insertions a majority of "
+            "members carry and extend past the centroid's ends, so a deletion "
+            "error in the centroid is repairable and the result does not "
+            "depend on which read became the frame. Default on."
+        ),
+    )
+    p_cluster.add_argument(
+        "--consensus-max-passes",
+        type=int,
+        default=3,
+        help=(
+            "de-novo: cap on consensus PWM passes when --fold-insertions is "
+            "on (each pass past the first re-aligns members onto the grown "
+            "frame). Default 3."
+        ),
+    )
+    p_cluster.add_argument(
         "--predict-orfs",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -3165,6 +3186,8 @@ def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
         max_cluster_rounds=int(args.max_cluster_rounds),
         error_model=str(args.error_model),
         overdispersion=float(args.overdispersion),
+        fold_insertions=bool(args.fold_insertions),
+        consensus_max_passes=int(args.consensus_max_passes),
         predict_orfs=bool(args.predict_orfs),
         min_aa_length=int(args.min_aa_length),
         emit_cluster_detail=bool(args.emit_cluster_detail),
