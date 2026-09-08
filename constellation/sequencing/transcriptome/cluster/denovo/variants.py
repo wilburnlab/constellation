@@ -117,12 +117,19 @@ def call_variants(
 
         (consensus_pos, consensus_allele, minor_allele, variant_class,
          homopolymer_run, depth_total, depth_minor, minor_fraction,
-         p_error, epsilon_class, call, in_core)
+         p_error, epsilon_class, call, in_core, pwm_column)
 
     ``in_core`` is False for positions in the ragged 5'/3' coverage ramps
     (terminal length variation), so the caller can keep them out of the
     haplotype columns while still cataloguing them. ``cluster_id`` is
-    attached by the caller.
+    attached by the caller, which also drops ``pwm_column`` before writing
+    ``CLUSTER_VARIANT_TABLE``.
+
+    ``pwm_column`` is the position in the PWM's own (expanded) column space,
+    and is what a caller must use to read per-member alleles — an insertion
+    column has **no** consensus position at all, and ``consensus_pos`` for
+    such a column is the preceding kept column, i.e. an anchor rather than an
+    address.
     """
     model = model or ErrorModel()
     pwm = cres.pwm
@@ -140,11 +147,20 @@ def call_variants(
     # unresolved N (code 5) IS a consensus column. `consensus_of_frame` in
     # consensus.py is the shared definition.
     keep = winner != 4
+    # `keep` answers "is this column in the consensus string"; it must NOT
+    # also answer "is this column testable as a variant". An insertion column
+    # is gap-winning by construction whenever the insertion is a minority, so
+    # gating candidates on `keep` made a minority insertion untestable while
+    # the same minority *deletion* tested fine — an asymmetry that turned on
+    # nothing but which direction the seed read happened to differ. A column
+    # is testable if it has depth and a real minor allele, full stop; `in_core`
+    # below still handles the terminal coverage ramps `keep` was partly
+    # proxying for.
     cons_pos_of_frame = np.cumsum(keep) - 1
     n = pwm.sum(axis=1)
     sorted_counts = np.sort(pwm, axis=1)
     minor_count = sorted_counts[:, -2]
-    cand = keep & (minor_count >= a_min) & (n >= 1)
+    cand = (minor_count >= a_min) & (n >= 1)
     cand_idx = np.flatnonzero(cand)
     if cand_idx.size == 0:
         return []
@@ -172,7 +188,10 @@ def call_variants(
     nn = np.rint(n[cand_idx]).astype(np.int64)
     hp_run_full = runs[np.clip(cpos, 0, len(runs) - 1)]
 
-    is_gap = mn == 4
+    # An indel event is either allele being a gap. On an insertion column the
+    # MAJOR allele is the gap and the minor is a base, so keying only off the
+    # minor would score a length change against the substitution null.
+    is_gap = (mn == 4) | (mj == 4)
     is_hp = is_gap & (hp_run_full >= 2)
     eps = np.empty(cand_idx.shape[0], dtype=np.float64)
     eps[~is_gap] = model.eps_sub
@@ -220,6 +239,7 @@ def call_variants(
                 float(eps[i]),
                 call,
                 bool(in_core[i]),
+                int(cand_idx[i]),
             )
         )
     rows.sort(key=lambda r: r[0])

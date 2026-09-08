@@ -42,18 +42,14 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from constellation.sequencing.transcriptome.cluster.denovo._cigar import (
-    base_codes,
-    parse_cigar,
-)
 from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
     ConsensusResult,
     MemberSpec,
     frame_consensus,
+    member_alleles,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.haplotypes import (
     build_haplotypes,
-    member_allele_row,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.orf import (
     ORF_CODON_TABLE,
@@ -194,12 +190,16 @@ def _haplotype_columns(
     which admits only base-substitution minor alleles. An in-core indel
     changes the *reading frame*, so its consequence is categorical rather
     than quantitative: a 1-nt deletion in a 5-G run three codons before the
-    stop bypasses the stop and reads a further 70 residues out of the 3' UTR.
-    Requiring that column to beat a homopolymer null would delete exactly the
-    proteoform it produces — and the whole point of a homopolymer-aware null
-    is that a 22% indel rate at such a run is *expected*, so the node must be
-    kept and flagged rather than believed or dropped. The read floor is what
-    keeps stray 1-2 read indels from becoming columns.
+    stop bypasses the stop and reads a further ~60 residues out of the 3' UTR.
+
+    Under the **default** error model the clause is close to a no-op — the
+    prior homopolymer rate is ~1%, so a 20% deletion at depth 125 clears FDR
+    on its own (measured p ≈ 1e-24). It earns its place under
+    ``--error-model empirical``, where ε is refit from the data: the real
+    5-G run carries a ~22% indel rate, a fitted null therefore *expects* the
+    deletion, and the readthrough proteoform would be dropped as error. That
+    is the case ledger #22 names — the node must be kept and flagged, not
+    believed or deleted. The read floor keeps stray 1-2 read indels out.
     """
     idx = []
     for i, vr in enumerate(vrows):
@@ -286,28 +286,13 @@ def refine_template(
     # Place every member on the selected columns and collapse to haplotypes.
     sub = [vrows[i] for i in sel]
     var_cons = np.array([r[0] for r in sub], dtype=np.int64)
-    var_frame = pooled.frame_of_cons[var_cons]
-    by_id = {a.member_id: a for a in pooled.alignments}
-    rows, weights, member_of_row = [], [], []
-    for j, m in enumerate(members):
-        aln = by_id.get(m.member_id)
-        if aln is None:
-            rows.append(np.full(var_frame.size, -1, dtype=np.int8))
-        else:
-            rows.append(
-                member_allele_row(
-                    parse_cigar(aln.cigar),
-                    base_codes(m.member_seq),
-                    frame_is_query=False,
-                    frame_start=aln.frame_start,
-                    member_start=aln.member_start,
-                    var_sorted=var_frame,
-                )
-            )
-        weights.append(m.weight)
-        member_of_row.append(j)
-
-    A = np.asarray(rows, dtype=np.int8)
+    # Read alleles at the PWM columns the caller reported. An insertion
+    # column has no consensus position to map back from, so going via
+    # `frame_of_cons[var_cons]` would silently address the wrong column.
+    var_frame = np.array([r[12] for r in sub], dtype=np.int64)
+    A = member_alleles(pooled, var_frame)
+    weights = [m.weight for m in members]
+    member_of_row = list(range(len(members)))
     w = np.asarray(weights, dtype=np.float64)
     # Phasing r² per selected column; the caller attaches it to the variant
     # table so a reader can tell a linked allele pair from scattered error.
@@ -361,8 +346,9 @@ def refine_template(
     if out:
         # The full variant catalogue hangs off the major node, each row
         # carrying its phasing r² (0.0 for positions that defined no column).
+        # vr[12] is the PWM column — internal, not a table field.
         r2_of = {i: float(hres.max_r2[j]) for j, i in enumerate(sel)}
-        out[0].variants = [(*vr, r2_of.get(i, 0.0)) for i, vr in enumerate(vrows)]
+        out[0].variants = [(*vr[:12], r2_of.get(i, 0.0)) for i, vr in enumerate(vrows)]
     return out
 
 

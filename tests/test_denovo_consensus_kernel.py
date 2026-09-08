@@ -28,6 +28,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.consensus import (  #
     COL_TEMPLATE,
     MemberSpec,
     centroid_consensus,
+    member_alleles,
     consensus_of_frame,
     frame_consensus,
     frame_of_consensus,
@@ -260,18 +261,6 @@ def test_fixpoint_terminates_when_nothing_reaches_a_majority():
     assert res.consensus == truth
 
 
-def test_max_passes_bounds_the_work():
-    rng = np.random.default_rng(71)
-    truth = _rand(rng, 500)
-    frame = truth[:250] + truth[251:]
-    specs = _specs(frame, [truth] * 20)
-    for cap in (1, 2, 3):
-        res = frame_consensus(frame, specs, max_passes=cap)
-        assert res.n_passes <= cap
-    # One pass cannot splice at all — it only builds the PWM.
-    assert frame_consensus(frame, specs, max_passes=1).n_inserted_columns == 0
-
-
 def test_large_shared_insertion_terminates():
     """A 300-base insertion carried by every member is a real exon, not a
     runaway — it splices once and settles."""
@@ -286,73 +275,128 @@ def test_large_shared_insertion_terminates():
 # ── returned alignments describe the FINAL frame ──────────────────────
 
 
-def _assert_alignments_walk(res):
-    """Every FrameAlignment must describe the frame that came back, in the
-    member-as-query convention it advertises (``I`` consumes the member,
-    ``D`` consumes the frame). A swapped orientation or a drifted offset
-    shows up as a walk that overruns its interval or matches nothing."""
-    fseq = res.frame
-    assert res.alignments, "expected alignments to inspect"
+# ── one pass over a pre-planned column space ──────────────────────────
+
+
+def test_kernel_is_single_pass():
+    """The column space accommodates every member up front, so there is no
+    frame to grow into and iterate over."""
+    rng = np.random.default_rng(71)
+    truth = _rand(rng, 500)
+    frame = truth[:250] + truth[251:]
+    res = frame_consensus(frame, _specs(frame, [truth] * 20))
+    assert res.n_passes == 1
+    assert res.consensus == truth
+
+
+def test_alignments_are_template_coordinates():
+    """FrameAlignment describes the member against the TEMPLATE, not against
+    the expanded PWM column space — the two differ by every insertion block.
+    Pinning it here is what stops a caller walking a CIGAR in the wrong
+    coordinate system, which is exactly the bug member_alleles exists to
+    prevent."""
+    rng = np.random.default_rng(89)
+    truth = _rand(rng, 700)
+    frame = truth[:350] + truth[351:]
+    res = frame_consensus(frame, _specs(frame, [truth] * 20))
+    assert res.n_columns_planned > len(frame), "fixture must create a block"
+
     for aln in res.alignments:
-        fpos, mpos = aln.frame_start, aln.member_start
+        tpos, mpos = aln.template_start, aln.member_start
         matched = total = 0
         for length, op in parse_cigar(aln.cigar):
             if op in ("=", "X", "M"):
                 for k in range(length):
                     total += 1
-                    matched += fseq[fpos + k] == aln.member_seq[mpos + k]
-                fpos += length
+                    matched += frame[tpos + k] == aln.member_seq[mpos + k]
+                tpos += length
                 mpos += length
-            elif op == "D":  # consumes the frame only
-                fpos += length
+            elif op == "D":  # consumes the template only
+                tpos += length
             elif op == "I":  # consumes the member only
                 mpos += length
-        assert fpos == aln.frame_end, "CIGAR does not consume the frame span"
-        assert mpos == aln.member_end, "CIGAR does not consume the member span"
-        assert 0 <= aln.frame_start and aln.frame_end <= len(fseq)
-        assert 0 <= aln.member_start and aln.member_end <= len(aln.member_seq)
-        assert matched / max(total, 1) > 0.95, "alignment coordinates drifted"
+        assert tpos == aln.template_end
+        assert mpos == aln.member_end
+        assert tpos <= len(frame), "template coords must index the TEMPLATE"
+        assert matched / max(total, 1) > 0.95
 
 
-def test_alignments_consistent_after_splice_and_realign():
-    """The splice / shift / re-align path is where a coordinate can silently
-    drift: a member on the shift fast path keeps its old CIGAR, a re-aligned
-    one gets a fresh CIGAR against a longer frame."""
-    rng = np.random.default_rng(89)
-    truth = _rand(rng, 900)
-    # Short at both ends AND missing an interior base, so folding, both
-    # extensions and re-alignment all fire at once.
-    frame = truth[60:400] + truth[401:-45]
-    members = [truth] * 12 + [truth[100:]] * 8 + [truth[:-200]] * 6
-    res = frame_consensus(frame, _specs(frame, members))
-    assert res.n_inserted_columns > 0
-    assert res.n_extended_5p > 0 and res.n_extended_3p > 0
-    _assert_alignments_walk(res)
+# ── the column space is a haplotype substrate ─────────────────────────
 
 
-def test_alignments_normalised_when_the_frame_was_the_edlib_query():
-    """A member that is never re-aligned keeps its *cached* CIGAR, and when
-    the frame was the shorter edlib query that CIGAR is frame-as-query — I and
-    D mean the opposite of what FrameAlignment promises. It has to be
-    transposed on the way out, or every allele read off it is wrong."""
-    rng = np.random.default_rng(97)
+def test_minority_insertion_and_deletion_are_symmetric():
+    """The property the pre-planned column space exists for.
+
+    A minority variant must resolve identically whether it reads as an
+    insertion or a deletion relative to the template — otherwise whether a
+    proteoform survives depends on nothing but which direction the seed read
+    happened to differ from its own variants.
+    """
+    rng = np.random.default_rng(101)
+    truth = _rand(rng, 400)
+    P = 200
+    short = truth[:P] + truth[P + 1 :]
+
+    def _profile(frame, majority, minority):
+        members = _specs(frame, [majority] * 75) + _specs(frame, [minority] * 25)
+        res = frame_consensus(frame, members)
+        # The contested column is the one with two well-supported alleles.
+        contested = int(np.argmax(np.sort(res.pwm, axis=1)[:, -2]))
+        A = member_alleles(res, np.array([contested]))
+        counts = sorted(np.bincount(A[:, 0] + 1).tolist(), reverse=True)
+        return res.consensus, counts[:2]
+
+    cons_i, split_i = _profile(short, short, truth)  # minority INSERTS
+    cons_d, split_d = _profile(truth, truth, short)  # minority DELETES
+
+    assert cons_i == short and cons_d == truth, "majority must win both ways"
+    assert split_i == split_d == [75, 25], (
+        "a minority variant must split 75/25 whichever direction it reads as"
+    )
+
+
+def test_insertion_column_exists_even_when_the_majority_lacks_it():
+    rng = np.random.default_rng(103)
+    truth = _rand(rng, 400)
+    frame = truth[:200] + truth[201:]
+    res = frame_consensus(frame, _specs(frame, [frame] * 75) + _specs(frame, [truth] * 25))
+    # The column is planned, and is NOT part of the consensus (gap wins).
+    assert res.n_columns_planned == len(frame) + 1
+    assert res.consensus == frame
+    assert res.n_inserted_columns == 0, "counters report BASES KEPT, not columns made"
+    # But its allele is readable, which is the whole point.
+    contested = int(np.argmax(np.sort(res.pwm, axis=1)[:, -2]))
+    A = member_alleles(res, np.array([contested]))
+    alleles = np.unique(A[:, 0]).tolist()
+    assert len(alleles) == 2 and 4 in alleles, "one gap allele and one base allele"
+    assert [a for a in alleles if a != 4][0] in (0, 1, 2, 3)
+    assert int((A[:, 0] == 4).sum()) == 75 and int((A[:, 0] != 4).sum()) == 25
+
+
+def test_member_alleles_uncovered_where_a_member_does_not_reach():
+    rng = np.random.default_rng(107)
     truth = _rand(rng, 600)
-    # Each member drops base 300 and carries a 3' tail, so it is LONGER than
-    # the frame (edlib makes the frame the query) and the cached CIGAR really
-    # contains an indel op — without one, transposing is a no-op and the test
-    # would pass whether or not the bug is present.
-    tail = _rand(rng, 40)
-    members = [truth[:300] + truth[301:] + tail for _ in range(6)]
-    specs = _specs(truth, members)
-    assert all(s.centroid_is_query for s in specs), "fixture must be frame-as-query"
-    assert "I" in specs[0].cigar, "fixture must exercise an indel op"
-    # No folding and no extension ⇒ nobody is re-aligned, so the cached
-    # orientation is what reaches the caller.
-    res = frame_consensus(truth, specs, fold_insertions=False, extend_ends=False)
-    assert res.n_passes == 1
-    # The frame's own I became the member's D on the way out.
-    assert "D" in res.alignments[0].cigar and "I" not in res.alignments[0].cigar
-    _assert_alignments_walk(res)
+    frame = truth[:300] + truth[301:]
+    members = _specs(frame, [truth] * 10) + _specs(frame, [truth[450:]] * 10)
+    res = frame_consensus(frame, members)
+    contested = int(np.argmax(np.sort(res.pwm, axis=1)[:, -2]))
+    A = member_alleles(res, np.array([contested]))
+    # The 10 truncated members start well 3' of the column and know nothing.
+    assert (A[10:, 0] == -1).all()
+    assert (A[:10, 0] >= 0).all()
+
+
+def test_min_insertion_support_bounds_the_column_space():
+    """A singleton insertion creates no column — replication is the
+    certificate. That is also what bounds a chimeric read's damage to memory
+    rather than correctness."""
+    rng = np.random.default_rng(109)
+    truth = _rand(rng, 400)
+    frame = truth[:200] + truth[201:]
+    lone = _specs(frame, [frame] * 20) + _specs(frame, [truth])
+    assert frame_consensus(frame, lone).n_columns_planned == len(frame)
+    pair = _specs(frame, [frame] * 20) + _specs(frame, [truth] * 2)
+    assert frame_consensus(frame, pair).n_columns_planned == len(frame) + 1
 
 
 # ── the legacy shim ───────────────────────────────────────────────────

@@ -46,6 +46,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
     MemberSpec,
     default_realign,
     frame_consensus,
+    member_alleles,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.dereplicate import (
     dereplicate,
@@ -182,69 +183,58 @@ def _assign_haplotypes(
     var_frame: np.ndarray,
     var_cons: np.ndarray,
     sub: list[tuple],
-    aln_by_member: dict[int, Any],
-    frame_seq: str,
-    frame_changed: bool,
+    cres,
     seqs: list[str],
     abund: np.ndarray,
 ):
     """Place every cluster member on the variant columns + collapse to
     abundance-weighted haplotypes.
 
-    Each member is projected via its **final** consensus alignment when it
-    voted in the PWM, else a bounded re-align onto the consensus frame (an
-    all-uncovered row when even that fails). Members beyond
-    ``_HAPLOTYPE_ASSIGN_MAX`` (by abundance) fold into one all-uncovered
-    bucket carrying their summed weight, so the haplotype abundances still
-    sum to the cluster's read count (quant-grade).
+    Members that voted in the PWM read their alleles straight off it via
+    :func:`member_alleles`, which resolves the template↔PWM column spaces.
+    Members that did not vote (excluded by the consensus gate, or past the
+    member cap) are re-aligned to the **consensus** and read at consensus
+    positions — so they can still be placed on ordinary columns, but an
+    insertion column, which has no consensus position at all, reads
+    uncovered for them rather than guessing.
 
-    ``frame_changed`` says whether insertion folding grew the frame past the
-    centroid. When it did, the cached centroid-frame alignments are stale and
-    a non-voting member must be re-aligned against ``frame_seq`` instead."""
+    Members beyond ``_HAPLOTYPE_ASSIGN_MAX`` (by abundance) fold into one
+    all-uncovered bucket carrying their summed weight, so the haplotype
+    abundances still sum to the cluster's read count (quant-grade)."""
     V = int(var_frame.shape[0])
     rows: list[np.ndarray] = []
     weights: list[float] = []
 
+    voted = {m.member_id: i for i, m in enumerate(cres.members)}
+    voted_alleles = member_alleles(cres, var_frame) if voted else None
+    # Consensus positions of the variant columns; -1 where the column is an
+    # insertion block and therefore absent from the consensus string.
+    cons_of = cres.cons_of_frame[var_frame]
+    on_consensus = cons_of >= 0
+
     def _row(m: int) -> np.ndarray:
-        """Member ``m``'s alleles at the variant frame columns."""
-        aln = aln_by_member.get(m)
-        if aln is not None:
-            return member_allele_row(
-                parse_cigar(aln.cigar),
-                base_codes(seqs[m]),
-                frame_is_query=False,  # cres.alignments is member-as-query
-                frame_start=aln.frame_start,
-                member_start=aln.member_start,
-                var_sorted=var_frame,
-            )
-        if frame_changed:
-            # The frame grew past the centroid, so the cached centroid-frame
-            # CIGARs no longer describe it — re-align onto the real frame.
-            res = default_realign(frame_seq, seqs[m], max_frac=_REALIGN_MAX_FRAC)
-            if res is None:
-                return np.full(V, -1, dtype=np.int8)
-            cig, fstart, mstart = res
-            return member_allele_row(
-                parse_cigar(cig),
-                base_codes(seqs[m]),
-                frame_is_query=False,
-                frame_start=fstart,
-                member_start=mstart,
-                var_sorted=var_frame,
-            )
-        al = _member_alignment(c, m)
-        if al is None:
-            return np.full(V, -1, dtype=np.int8)
-        s, _lng, rs, cigar = al
-        ciq = s == c
-        return member_allele_row(
-            parse_cigar(cigar),
+        slot = voted.get(m)
+        if slot is not None:
+            return voted_alleles[slot]
+        row = np.full(V, -1, dtype=np.int8)
+        if not on_consensus.any():
+            return row
+        res = default_realign(cres.consensus, seqs[m], max_frac=_REALIGN_MAX_FRAC)
+        if res is None:
+            return row
+        cig, fstart, mstart = res
+        sub_cols = cons_of[on_consensus].astype(np.int64)
+        order = np.argsort(sub_cols)
+        got = member_allele_row(
+            parse_cigar(cig),
             base_codes(seqs[m]),
-            frame_is_query=ciq,
-            frame_start=0 if ciq else rs,
-            member_start=rs if ciq else 0,
-            var_sorted=var_frame,
+            frame_is_query=False,
+            frame_start=fstart,
+            member_start=mstart,
+            var_sorted=sub_cols[order],
         )
+        row[np.flatnonzero(on_consensus)[order]] = got
+        return row
 
     # The centroid is a member of the PWM like any other; when it did vote it
     # has a real alignment onto the (possibly grown) frame.
@@ -440,12 +430,9 @@ def _cluster_chunk(
                 realign_max_frac=_REALIGN_MAX_FRAC,
             )
             consensus = cres.consensus
-            aln_by_member = {a.member_id: a for a in cres.alignments}
-            frame_changed = cres.frame != seqs[c]
             merge_disagreements(disagree, disagreement_stats(cres))
             vrows = call_variants(cres, model=model, overdispersion=overdispersion)
             if vrows:
-                centroid_of_cons = cres.frame_of_cons
                 # Haplotype columns: **statistically-supported, in-core,
                 # base-substitution** variants. Three gates:
                 #   • call == 'real' (vr[10]) — only FDR-supported variants
@@ -474,9 +461,10 @@ def _cluster_chunk(
                 if sel:
                     sub = [vrows[i] for i in sel]
                     var_cons = np.array([r[0] for r in sub], dtype=np.int64)
-                    # Frame columns are ascending (consensus order ↔ frame
-                    # order is monotonic), so usable as var_sorted.
-                    var_frame = centroid_of_cons[var_cons]
+                    # Read alleles at the PWM column the caller reported, not
+                    # via the consensus position: an insertion column has no
+                    # consensus position to map back from.
+                    var_frame = np.array([r[12] for r in sub], dtype=np.int64)
                     hres = _assign_haplotypes(
                         cid=cid,
                         c=c,
@@ -484,9 +472,7 @@ def _cluster_chunk(
                         var_frame=var_frame,
                         var_cons=var_cons,
                         sub=sub,
-                        aln_by_member=aln_by_member,
-                        frame_seq=cres.frame,
-                        frame_changed=frame_changed,
+                        cres=cres,
                         seqs=seqs,
                         abund=abund,
                     )
@@ -496,7 +482,8 @@ def _cluster_chunk(
                             (cid, hid, astr, hres.variant_positions, ab, nu, comp)
                         )
                 for i, vr in enumerate(vrows):
-                    variant_out.append((cid, *vr, r2_by_idx.get(i, 0.0)))
+                    # vr[12] is the PWM column — internal, not a table field.
+                    variant_out.append((cid, *vr[:12], r2_by_idx.get(i, 0.0)))
         else:
             consensus = seqs[c]
         protein = orf_start = orf_end = orf_strand = codon_tbl = None
