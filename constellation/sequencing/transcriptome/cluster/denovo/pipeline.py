@@ -15,7 +15,6 @@ on the same edge).
 
 from __future__ import annotations
 
-import functools
 import multiprocessing as mp
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -27,7 +26,6 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from constellation.core.sequence.nucleic import STANDARD, CodonTable, translate
 from constellation.sequencing.schemas.quant import FEATURE_QUANT
 from constellation.sequencing.schemas.transcriptome import (
     CLUSTER_MEMBERSHIP_TABLE,
@@ -59,6 +57,10 @@ from constellation.sequencing.transcriptome.cluster.denovo.haplotypes import (
 from constellation.sequencing.transcriptome.cluster.denovo.minimizers import (
     extract_minimizers,
 )
+from constellation.sequencing.transcriptome.cluster.denovo.orf import (
+    ORF_CODON_TABLE,
+    best_sense_orf,
+)
 from constellation.sequencing.transcriptome.cluster.denovo.quant import (
     cluster_feature_quant,
 )
@@ -80,15 +82,6 @@ from constellation.sequencing.transcriptome.cluster.denovo.verify import (
 )
 
 
-_ORF_CODON_TABLE: CodonTable = CodonTable(
-    transl_table=STANDARD.transl_table,
-    name=f"{STANDARD.name} (ATG-only starts)",
-    forward=STANDARD.forward,
-    starts=frozenset({"ATG"}),
-    stops=STANDARD.stops,
-)
-
-
 @dataclass(slots=True)
 class AssembledClusters:
     clusters: pa.Table  # TRANSCRIPT_CLUSTER_TABLE
@@ -101,52 +94,15 @@ class AssembledClusters:
     n_unique: int
 
 
-@functools.lru_cache(maxsize=8)
-def _orf_regex(min_aa_length: int):
-    import regex
-
-    # ATG start … ≥ min_aa_length codons … stop. Compiled once per length
-    # (vs once per call inside find_orfs — at 10M+ clusters that recompile
-    # dominated the per-cluster cost).
-    return regex.compile(
-        f"(?:ATG)(?:[ACGT]{{3}}){{{min_aa_length - 1},}}?(?:TAA|TAG|TGA)"
-    )
-
-
-def _is_low_complexity(seq: str) -> bool:
-    """Cheap guard: a consensus dominated by one base or a long homopolymer
-    is almost always a connected-components chaining artifact. Such sequences
-    make the overlapped-ORF regex pathological, so skip ORF prediction."""
-    n = len(seq)
-    if n < 30:
-        return False
-    counts = (seq.count("A"), seq.count("C"), seq.count("G"), seq.count("T"))
-    return max(counts) > 0.8 * n
-
-
 def _best_clean_orf(seq: str, *, min_aa_length: int):
-    """Longest internal-stop-free ATG ORF as ``(protein, start, end, strand,
-    transl_table)``, or ``None``. Cached regex + low-complexity guard make it
-    cheap enough to run on every one of millions of cluster consensuses."""
-    if len(seq) < min_aa_length * 3 or _is_low_complexity(seq):
+    """``(protein, start, end, strand, transl_table)`` for the consensus ORF,
+    or ``None``. Thin adapter over :func:`orf.best_sense_orf`, which the
+    ORF-anchored seeding stage shares."""
+    hit = best_sense_orf(seq, min_aa_length=min_aa_length)
+    if hit is None:
         return None
-    s = seq.upper().replace("U", "T")
-    pat = _orf_regex(min_aa_length)
-    # Best (longest) internal-stop-free protein per (frame, stop position).
-    best: dict[tuple[int, int], tuple] = {}
-    for m in pat.finditer(s, overlapped=True):
-        nt = s[m.start() : m.end()]
-        prot = translate(nt[:-3], codon_table=_ORF_CODON_TABLE, partial="discard")
-        if "*" in prot or len(prot) < min_aa_length:
-            continue
-        key = (m.start() % 3, m.end())
-        prior = best.get(key)
-        if prior is None or len(prot) > len(prior[0]):
-            best[key] = (prot, m.start(), m.end())
-    if not best:
-        return None
-    prot, st, en = max(best.values(), key=lambda x: len(x[0]))
-    return prot, int(st), int(en), "+", _ORF_CODON_TABLE.transl_table
+    prot, st, en = hit
+    return prot, st, en, "+", ORF_CODON_TABLE.transl_table
 
 
 # A single cluster holding more unique sequences than this is almost
