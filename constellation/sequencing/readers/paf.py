@@ -186,44 +186,49 @@ def iter_paf_batches(
 ) -> Iterator[pa.RecordBatch]:
     """Stream PAF into ``PAF_RECORD_SCHEMA`` record batches.
 
-    ``source`` may be a path, an open binary file object, or a live pipe
-    (minimap2 stdout). Reads ``chunk_bytes`` at a time and splits at the last
-    newline, carrying the partial tail into the next block — so batch
-    boundaries never split a record and the result is independent of
-    ``chunk_bytes``.
+    ``source`` may be a path, an open binary file object, or an **iterable of
+    byte chunks** — the last is what ``minimap2_stream`` yields off a live
+    pipe, and it has no ``.read``. Reads ``chunk_bytes`` at a time and splits
+    at the last newline, carrying the partial tail into the next block, so
+    batch boundaries never split a record and the result is independent of
+    ``chunk_bytes`` and of how the producer happened to chunk its output.
     """
-    close = False
-    if isinstance(source, (str, Path)):
-        fh: BinaryIO = open(source, "rb")  # noqa: SIM115 — closed in finally
-        close = True
-    else:
-        fh = source  # type: ignore[assignment]
+
+    def _blocks():
+        if isinstance(source, (str, Path)):
+            with open(source, "rb") as fh:
+                while True:
+                    b = fh.read(chunk_bytes)
+                    if not b:
+                        return
+                    yield b
+        elif hasattr(source, "read"):
+            while True:
+                b = source.read(chunk_bytes)
+                if not b:
+                    return
+                yield b
+        else:
+            yield from source
 
     tail = b""
-    try:
-        while True:
-            block = fh.read(chunk_bytes)
-            if not block:
-                break
-            block = tail + block
-            cut = block.rfind(b"\n")
-            if cut < 0:
-                tail = block
-                continue
-            tail = block[cut + 1 :]
-            usable = block[: cut + 1]
-            if usable:
-                yield _block_to_batch(
-                    np.frombuffer(usable, dtype=np.uint8), want_cigar=want_cigar
-                )
-        leftover = tail.strip()
-        if leftover:
+    for raw_block in _blocks():
+        block = tail + raw_block
+        cut = block.rfind(b"\n")
+        if cut < 0:
+            tail = block
+            continue
+        tail = block[cut + 1 :]
+        usable = block[: cut + 1]
+        if usable:
             yield _block_to_batch(
-                np.frombuffer(leftover + b"\n", dtype=np.uint8), want_cigar=want_cigar
+                np.frombuffer(usable, dtype=np.uint8), want_cigar=want_cigar
             )
-    finally:
-        if close:
-            fh.close()
+    leftover = tail.strip()
+    if leftover:
+        yield _block_to_batch(
+            np.frombuffer(leftover + b"\n", dtype=np.uint8), want_cigar=want_cigar
+        )
 
 
 def read_paf(source: "Path | str", *, want_cigar: bool = True) -> pa.Table:
@@ -250,7 +255,16 @@ def paf_to_alignment_table(paf: pa.Table, *, acquisition_id: int = 0) -> pa.Tabl
     q_end = paf.column("q_end").to_numpy(zero_copy_only=False)
     q_len = paf.column("q_len").to_numpy(zero_copy_only=False)
     cig = paf.column("cigar").to_pylist()
-    lead, trail = q_start.astype(int), (q_len - q_end).astype(int)
+    # PAF reports q_start/q_end on the FORWARD query regardless of strand,
+    # but a SAM CIGAR is written in alignment orientation — so on a '-' hit the
+    # clips swap. Reconstructing them forward-first would describe a different
+    # molecule than the CIGAR does.
+    fwd_lead, fwd_trail = q_start.astype(int), (q_len - q_end).astype(int)
+    is_rev = np.array(
+        [x == "-" for x in paf.column("strand").to_pylist()], dtype=bool
+    )
+    lead = np.where(is_rev, fwd_trail, fwd_lead)
+    trail = np.where(is_rev, fwd_lead, fwd_trail)
     clipped = []
     for i in range(n):
         if not cig[i]:

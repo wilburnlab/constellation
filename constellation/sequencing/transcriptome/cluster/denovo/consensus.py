@@ -197,6 +197,12 @@ class ConsensusResult:
     n_realign_failures: int = 0
     plan: object | None = field(repr=False, default=None)
     members: object = field(repr=False, default=())
+    # (ProjectedMember, weight) per member and their base codes, as built for
+    # the scatter. `member_alleles` reuses them instead of re-parsing every
+    # CIGAR; they are all live during the scatter regardless, so keeping them
+    # does not raise peak memory.
+    projections: object = field(repr=False, default=())
+    member_codes: object = field(repr=False, default=())
     # Columns the plan *created*; the n_* counters above report how many
     # survived the argmax into the consensus.
     n_columns_planned: int = 0
@@ -439,12 +445,41 @@ def _member_events(
     them as one event class is what collapses "end extension" and "insertion
     folding" into a single mechanism.
     """
-    events = [(j, c) for j, c in proj.ins_events if c.size]
+    by_j: dict[int, list[np.ndarray]] = {}
+    # A terminal clip and a leading/trailing insertion op describe the SAME
+    # junction, and both are real member sequence — keeping only one (as a
+    # dict build would) silently drops bases the member unanimously carries.
+    # Order matters: at the 5' end the clipped prefix precedes the inserted
+    # run in member order, at the 3' end it follows it.
     if proj.frame_start == 0 and proj.member_start > 0:
-        events.append((0, member_codes[: proj.member_start]))
+        by_j.setdefault(0, []).append(member_codes[: proj.member_start])
+    for j, c in proj.ins_events:
+        if c.size:
+            by_j.setdefault(j, []).append(c)
     if proj.frame_end == n_template and proj.member_end < member_codes.shape[0]:
-        events.append((n_template, member_codes[proj.member_end :]))
-    return events
+        by_j.setdefault(n_template, []).append(member_codes[proj.member_end :])
+    return [
+        (j, parts[0] if len(parts) == 1 else np.concatenate(parts))
+        for j, parts in by_j.items()
+    ]
+
+
+def _covers_junction(proj: ProjectedMember, j: int, n_template: int) -> bool:
+    """Does this member have evidence about an insertion at junction ``j``?
+
+    An interior junction needs the alignment to span it — a read whose
+    alignment *ends* exactly at ``j`` has aligned bases on one side only and
+    knows nothing about what follows, so counting it as a gap vote lets reads
+    that stopped short outvote reads that actually looked. The terminal
+    junctions are different: being anchored at the template's end is itself
+    the evidence, since the member's own flank (or its absence) is what the
+    block is made of.
+    """
+    if j <= 0:
+        return proj.frame_start == 0
+    if j >= n_template:
+        return proj.frame_end == n_template
+    return proj.frame_start < j < proj.frame_end
 
 
 def plan_columns(
@@ -470,7 +505,7 @@ def plan_columns(
         by_junction: dict[int, list[tuple[int, float]]] = {}
         for (proj, w), codes in zip(projections, member_codes):
             for j, c in _member_events(proj, codes, n_template):
-                if 0 <= j <= n_template:
+                if 0 <= j <= n_template and _covers_junction(proj, j, n_template):
                     by_junction.setdefault(j, []).append((int(c.size), float(w)))
         for j, evs in by_junction.items():
             lengths = np.array([ln for ln, _ in evs], dtype=np.int64)
@@ -545,8 +580,8 @@ def _scatter_expanded(
         filled = {j: c for j, c in _member_events(proj, codes, plan.n_template)}
         for j in active:
             j = int(j)
-            if not (proj.frame_start <= j <= proj.frame_end):
-                continue  # member never reaches this junction — no vote
+            if not _covers_junction(proj, j, plan.n_template):
+                continue  # no evidence about this junction — no vote
             wdt = int(b_width[j])
             c = filled.get(j)
             k = 0 if c is None else min(int(c.size), wdt)
@@ -592,6 +627,7 @@ def frame_consensus(
     min_insertion_support: float = 2.0,
     max_insertion_block: int | None = None,
     template_of_frame: np.ndarray | None = None,
+    plan: "ColumnPlan | None" = None,
     **_legacy,
 ) -> ConsensusResult:
     """Build the abundance-weighted consensus for one cluster.
@@ -608,6 +644,11 @@ def frame_consensus(
 
     One pass, no re-alignment: the plan accommodates every member up front,
     so there is no frame to grow into and iterate over.
+
+    Pass ``plan`` to reuse a column space computed elsewhere. Haplotype
+    children must do this: built on their own plans they would each have a
+    different column space, and a position from the parent would address a
+    different base in every child.
 
     ``frame_weight`` is the frame's own self-vote and defaults to **0** — in
     the EM M-step the frame is a scaffold, not an observation: in round 1 the
@@ -636,7 +677,7 @@ def frame_consensus(
             )
         )
 
-    plan = (
+    plan = plan if plan is not None else (
         plan_columns(
             projections,
             codes_of,
@@ -715,6 +756,8 @@ def frame_consensus(
         alignments=alignments,
         plan=plan,
         members=tuple(members),
+        projections=tuple(projections),
+        member_codes=tuple(codes_of),
         n_passes=1,
         n_columns_planned=int(plan.n_columns),
         n_inserted_columns=int((kept_kind == COL_INSERTED).sum()),
@@ -776,16 +819,22 @@ def member_alleles(cres: ConsensusResult, columns) -> np.ndarray:
     t_want = t_of[t_idx]
     b_idx = np.flatnonzero(j_of >= 0)
 
+    cached = list(cres.projections or ())
+    codes_cache = list(cres.member_codes or ())
     for i, spec in enumerate(members):
-        codes = base_codes(spec.member_seq)
-        fstart, mstart = _offsets(spec)
-        proj = project_member_events(
-            parse_cigar(spec.cigar),
-            codes,
-            frame_is_query=spec.centroid_is_query,
-            frame_start=fstart,
-            member_start=mstart,
-        )
+        if i < len(cached) and i < len(codes_cache):
+            proj = cached[i][0]
+            codes = codes_cache[i]
+        else:  # constructed by hand (tests); fall back to re-projecting
+            codes = base_codes(spec.member_seq)
+            fstart, mstart = _offsets(spec)
+            proj = project_member_events(
+                parse_cigar(spec.cigar),
+                codes,
+                frame_is_query=spec.centroid_is_query,
+                frame_start=fstart,
+                member_start=mstart,
+            )
         row = out[i]
 
         if t_idx.shape[0]:
@@ -803,8 +852,8 @@ def member_alleles(cres: ConsensusResult, columns) -> np.ndarray:
             events = dict(_member_events(proj, codes, plan.n_template))
             for k in b_idx:
                 j = int(j_of[k])
-                if not (proj.frame_start <= j <= proj.frame_end):
-                    continue  # never reaches this junction — no evidence
+                if not _covers_junction(proj, j, plan.n_template):
+                    continue  # no evidence about this junction
                 w = int(plan.block_width[j])
                 o = int(o_of[k])
                 c = events.get(j)

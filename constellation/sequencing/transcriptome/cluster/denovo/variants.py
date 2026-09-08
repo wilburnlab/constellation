@@ -31,6 +31,9 @@ from constellation.sequencing.transcriptome.cluster.denovo._cigar import base_co
 
 
 _IDX_TO_BASE = "ACGT-"
+# consensus.COL_EXT_5P / COL_EXT_3P — duplicated rather than imported, since
+# variants.py is downstream of consensus.py in the module DAG only by data.
+_COL_EXT_5P, _COL_EXT_3P = 2, 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +185,18 @@ def call_variants(
 
     cpos = cons_pos_of_frame[cand_idx]
     in_core = (cpos >= core_start) & (cpos <= core_end)
+    # A dropped column takes its `cons_pos` from the last kept column before
+    # it, so a terminal extension block anchors *inside* the core and would
+    # pass a purely positional test — letting a 75/25 length mixture define
+    # haplotypes, which is the raggedness this gate exists to exclude. Column
+    # provenance settles it. Note the criterion cannot be per-column base
+    # coverage: an interior insertion column is low-base-coverage by
+    # construction (non-inserters vote gap), so that rule would throw away
+    # exactly the minority insertions the column space was built to keep.
+    kind = getattr(cres, "column_kind", None)
+    if kind is not None and len(kind) == L:
+        terminal = np.isin(np.asarray(kind)[cand_idx], (_COL_EXT_5P, _COL_EXT_3P))
+        in_core = in_core & ~terminal
     mj = major[cand_idx]
     mn = minor[cand_idx]
     a = np.rint(minor_count[cand_idx]).astype(np.int64)

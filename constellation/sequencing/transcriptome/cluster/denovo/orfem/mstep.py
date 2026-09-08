@@ -106,22 +106,43 @@ def gated_orf(
     consensus: str,
     certified: np.ndarray,
     *,
+    seed_orf_start: int,
     seed_orf_end: int,
     min_aa_length: int = 30,
 ):
-    """Predict the ORF, truncating it where read support runs out.
+    """Predict the ORF, refusing sequence that reads do not support.
 
-    ``seed_orf_end`` is the previous round's ORF end in *consensus*
-    coordinates; anything at or before it is already certified by
-    construction. Returns ``(protein, start, end, certified_end, truncated)``
+    ``seed_orf_start`` / ``seed_orf_end`` bound the previous round's ORF in
+    *this consensus's* coordinates; that interval is certified by
+    construction and only ground **outside** it is judged. Both ends are
+    gated: an upstream ATG sitting in single-read flank can extend the
+    protein just as silently as a downstream readthrough can, and sharing
+    the seed's stop codon makes it look like an ordinary N-terminal
+    extension. Returns ``(protein, start, end, certified_end, truncated)``
     or ``None``.
     """
     hit = best_sense_orf(consensus, min_aa_length=min_aa_length)
     if hit is None:
         return None
     prot, st, en = hit
-    if en <= max(seed_orf_end, st) or certified.size == 0:
+    if certified.size == 0:
         return prot, st, en, en, False
+    truncated = False
+
+    # 5': reaching an upstream start means crossing everything between it and
+    # the seed's start, so all of that has to be certified.
+    if st < seed_orf_start:
+        lo, hi = max(0, st), min(seed_orf_start, certified.size)
+        if hi > lo and not certified[lo:hi].all():
+            resume = lo + int(np.flatnonzero(~certified[lo:hi])[-1]) + 1
+            again = best_sense_orf(consensus[resume:], min_aa_length=min_aa_length)
+            if again is None:
+                return None
+            prot, st, en = again[0], again[1] + resume, again[2] + resume
+            truncated = True
+
+    if en <= max(seed_orf_end, st):
+        return prot, st, en, en, truncated
 
     # Walk forward from wherever the certificate ends and find the first
     # uncertified column the ORF would have to pass through.
@@ -130,7 +151,7 @@ def gated_orf(
     while limit < min(en, certified.size) and certified[limit]:
         limit += 1
     if limit >= en:
-        return prot, st, en, en, False
+        return prot, st, en, en, truncated
 
     # Report the ORF as ending at the last certified column, on a codon
     # boundary. It no longer ends in a stop — that is the point of the flag.
@@ -205,7 +226,11 @@ def _haplotype_columns(
     for i, vr in enumerate(vrows):
         if not vr[11]:  # in_core
             continue
-        is_indel = vr[2] == "-"
+        # Either allele being a gap makes it an indel: on a minority
+        # INSERTION column the major allele is the gap and the minor is a
+        # base, so keying off the minor alone reinstates exactly the
+        # insertion/deletion asymmetry the column space was built to remove.
+        is_indel = vr[2] == "-" or vr[1] == "-"
         if vr[10] == "real" or (is_indel and vr[6] >= min_indel_reads):
             idx.append(i)
     idx.sort(key=lambda i: vrows[i][8])  # most significant first
@@ -217,7 +242,7 @@ def refine_template(
     members: list[MemberSpec],
     *,
     template_id: int = 0,
-    seed_orf_end: int = 0,
+    seed_orf: tuple[int, int] | None = None,
     error_model: ErrorModel | None = None,
     overdispersion: float = 0.0,
     min_aa_length: int = 30,
@@ -234,6 +259,15 @@ def refine_template(
     model = error_model or ErrorModel()
     pooled = frame_consensus(frame, members, frame_weight=0.0, **kernel_kwargs)
     total_reads = float(sum(m.weight for m in members))
+    # The seed ORF interval arrives in TEMPLATE coordinates; resolve it once
+    # into the shared PWM column space, where every child can translate it
+    # into its own consensus.
+    t_start, t_end = seed_orf if seed_orf is not None else (0, 0)
+    t_at = pooled.plan.template_at
+    seed_col_start = int(t_at[np.clip(t_start, 0, t_at.shape[0] - 1)]) if t_at.size else 0
+    seed_col_end = (
+        int(t_at[np.clip(t_end - 1, 0, t_at.shape[0] - 1)]) + 1 if t_at.size else 0
+    )
 
     vrows = call_variants(pooled, model=model, overdispersion=overdispersion)
     sel = (
@@ -246,16 +280,58 @@ def refine_template(
         else []
     )
 
+    def _child_position(cres: ConsensusResult, column: int, *, forward: bool) -> int:
+        """A PWM column's position in one child's own consensus.
+
+        A column dropped by that child (its haplotype votes gap there) has no
+        position, so walk to the nearest kept neighbour in the direction the
+        caller cares about. Reusing the parent's number instead is how a
+        boundary silently slides: deleting 30 upstream bases moves an ORF end
+        from 336 to 306, and certifying through 336 waves ten unsupported
+        residues past the gate.
+        """
+        c_of = cres.cons_of_frame
+        n = c_of.shape[0]
+        col = int(np.clip(column, 0, n - 1))
+        step = -1 if forward else 1
+        while 0 <= col < n and c_of[col] < 0:
+            col += step
+        if not (0 <= col < n):
+            return len(cres.consensus) if forward else 0
+        return int(c_of[col])
+
     def _node(
         hid: int, hap_members: list[MemberSpec], allele: str, cols: np.ndarray
     ) -> RefinedTemplate | None:
+        """``cols`` are **PWM columns** of the shared plan."""
+        # Children are built on the POOLED column plan. On their own plans
+        # each would have a different column space, and a position taken from
+        # the parent would address a different base in every child.
         cres = (
             pooled
             if hid == 0 and len(hap_members) == len(members)
-            else frame_consensus(frame, hap_members, frame_weight=0.0, **kernel_kwargs)
+            else frame_consensus(
+                frame,
+                hap_members,
+                frame_weight=0.0,
+                plan=pooled.plan,
+                **kernel_kwargs,
+            )
         )
         certified = certified_columns(
             cres, min_depth=support_min_depth, min_agreement=support_min_agreement
+        )
+        # Declared columns are PWM columns; each child reports them in its own
+        # consensus coordinates, and drops the ones it has no base for (a
+        # minority insertion exists for the node that carries it and nowhere
+        # else — which is exactly the right answer).
+        child_cols = (
+            np.array(
+                [int(cres.cons_of_frame[c]) for c in cols if cres.cons_of_frame[c] >= 0],
+                dtype=np.int64,
+            )
+            if cols.size
+            else np.empty(0, dtype=np.int64)
         )
         node = RefinedTemplate(
             parent_template_id=template_id,
@@ -264,7 +340,7 @@ def refine_template(
             n_reads=int(round(sum(m.weight for m in hap_members))),
             node_weight=float(sum(m.weight for m in hap_members)),
             allele_string=allele,
-            declared_variants=cols,
+            declared_variants=child_cols,
             n_inserted_columns=cres.n_inserted_columns,
             n_extended_5p=cres.n_extended_5p,
             n_extended_3p=cres.n_extended_3p,
@@ -273,7 +349,8 @@ def refine_template(
         orf = gated_orf(
             cres.consensus,
             certified,
-            seed_orf_end=seed_orf_end,
+            seed_orf_start=_child_position(cres, seed_col_start, forward=False),
+            seed_orf_end=_child_position(cres, seed_col_end, forward=True),
             min_aa_length=min_aa_length,
         )
         if orf is not None:
@@ -340,7 +417,10 @@ def refine_template(
                 hid,
                 [members[member_of_row[int(i)]] for i in idx],
                 allele,
-                var_cons,
+                # PWM columns, NOT pooled-consensus positions: `_node` maps
+                # them into each child's own consensus, and a consensus
+                # position would silently address a different column there.
+                var_frame,
             )
         )
     if out:

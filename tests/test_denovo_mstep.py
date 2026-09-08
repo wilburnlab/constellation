@@ -82,7 +82,8 @@ def test_orf_is_truncated_at_the_last_certified_column():
     consensus = "ATG" + "GCT" * 100 + "TAA"
     certified = np.zeros(len(consensus), dtype=bool)
     certified[:180] = True  # support runs out mid-ORF
-    got = gated_orf(consensus, certified, seed_orf_end=90, min_aa_length=30)
+    got = gated_orf(consensus, certified, seed_orf_start=0, seed_orf_end=90,
+                    min_aa_length=30)
     assert got is not None
     prot, st, en, cert_end, truncated = got
     assert truncated is True
@@ -97,7 +98,7 @@ def test_fully_certified_orf_is_not_truncated():
     consensus = "ATG" + "GCT" * 100 + "TAA"
     certified = np.ones(len(consensus), dtype=bool)
     prot, st, en, cert_end, truncated = gated_orf(
-        consensus, certified, seed_orf_end=90, min_aa_length=30
+        consensus, certified, seed_orf_start=0, seed_orf_end=90, min_aa_length=30
     )
     assert truncated is False
     assert en == len(consensus)
@@ -110,7 +111,8 @@ def test_orf_within_the_seed_boundary_is_never_gated():
     consensus = "ATG" + "GCT" * 40 + "TAA"
     certified = np.zeros(len(consensus), dtype=bool)
     _prot, _st, en, _ce, truncated = gated_orf(
-        consensus, certified, seed_orf_end=len(consensus), min_aa_length=30
+        consensus, certified, seed_orf_start=0, seed_orf_end=len(consensus),
+        min_aa_length=30,
     )
     assert truncated is False
     assert en == len(consensus)

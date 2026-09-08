@@ -172,6 +172,80 @@ def classify_pairs(
     return out
 
 
+
+def _merge_by_representative(
+    res,
+    orf_nt: list[str],
+    seq_len: np.ndarray,
+    group_n_reads: np.ndarray,
+    *,
+    identity: float,
+    max_len_delta: int,
+    min_edit_budget: int,
+    kmer: int,
+    window: int,
+    minimizers_per_seq: int | None,
+    threads: int,
+):
+    """Second fold pass over the group representatives only.
+
+    Candidate pairs come from abundance-anchored minimizer *stars*, so two
+    ORFs are compared when they share an anchor. If an abundant suffix ORF
+    becomes that anchor, both of its edges are rejected as suffix-containment
+    and the two longer ORFs behind it may never be compared to each other —
+    the anchor-star's coverage and the classifier's rejections interact.
+    Re-verifying the surviving representatives closes that gap for a few
+    thousand sequences instead of a few hundred thousand, and is the same
+    rule-1 merge the round loop applies to consensus ORFs later.
+    """
+    reps = res.group_rep_orf
+    if reps.shape[0] < 2:
+        return res
+    rep_seqs = [orf_nt[int(i)] for i in reps]
+    rep_len = seq_len[reps]
+    index = extract_minimizers(
+        pa.array(rep_seqs, type=pa.large_string()),
+        k=kmer,
+        w=window,
+        max_per_seq=minimizers_per_seq,
+    )
+    cands = generate_candidates(index, group_n_reads)
+    if cands.num_rows == 0:
+        return res
+    accepted = verify_candidates(
+        cands,
+        rep_seqs,
+        identity=identity,
+        max_5p=2**31 - 1,
+        max_3p=2**31 - 1,
+        min_budget=min_edit_budget,
+        threads=threads,
+    )
+    rules = classify_pairs(
+        accepted, rep_len, max_len_delta=max_len_delta, allow_frameshift=False
+    )
+    keep = rules == FoldRule.ERROR_VARIANT
+    if not keep.any():
+        return res
+    ea = accepted.column("uniq_short").to_numpy(zero_copy_only=False)[keep]
+    eb = accepted.column("uniq_long").to_numpy(zero_copy_only=False)[keep]
+    merged = greedy_set_cover(reps.shape[0], group_n_reads, rep_len, ea, eb)
+    # Re-index the original ORFs through the merged representative groups.
+    group_of_orf = merged.cluster_of[res.group_of_orf]
+    new_reps = reps[merged.centroid_uniq]
+    n_new = new_reps.shape[0]
+    n_reads = np.zeros(n_new, dtype=np.int64)
+    np.add.at(n_reads, merged.cluster_of, group_n_reads)
+    return FoldResult(
+        group_of_orf=group_of_orf,
+        group_rep_orf=new_reps,
+        group_n_reads=n_reads,
+        rule_of_edge=res.rule_of_edge,
+        declared_variants=[np.empty(0, dtype=np.int64) for _ in range(n_new)],
+        n_separate_contained=res.n_separate_contained,
+    )
+
+
 def fold_orfs(
     seed: pa.Table,
     *,
@@ -185,6 +259,7 @@ def fold_orfs(
     minimizers_per_seq: int | None = 50,
     min_shared: int = 2,
     diag_span_max: int = 20,
+    merge_representatives: bool = True,
     threads: int = 1,
     progress: Callable[[str], None] | None = None,
 ) -> FoldResult:
@@ -257,8 +332,7 @@ def fold_orfs(
             accepted, rules, res.cluster_of, res.centroid_uniq, seed
         )
 
-    log(f"  → {n_groups:,} ORF groups (compression {n_orf / max(n_groups, 1):.2f}×)")
-    return FoldResult(
+    result = FoldResult(
         group_of_orf=res.cluster_of,
         group_rep_orf=res.centroid_uniq,
         group_n_reads=group_n_reads,
@@ -266,6 +340,23 @@ def fold_orfs(
         declared_variants=declared,
         n_separate_contained=n_sep,
     )
+    if merge_representatives and not fold_frameshifts:
+        result = _merge_by_representative(
+            result,
+            orf_nt.to_pylist(),
+            seq_len,
+            result.group_n_reads,
+            identity=identity,
+            max_len_delta=max_len_delta,
+            min_edit_budget=min_edit_budget,
+            kmer=kmer,
+            window=window,
+            minimizers_per_seq=minimizers_per_seq,
+            threads=threads,
+        )
+    n_groups = result.group_rep_orf.shape[0]
+    log(f"  → {n_groups:,} ORF groups (compression {n_orf / max(n_groups, 1):.2f}×)")
+    return result
 
 
 def _declare_frameshift_columns(

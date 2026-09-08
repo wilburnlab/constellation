@@ -210,6 +210,58 @@ def _allele_string(
     return "".join("." if v < 0 else "ACGT-"[v] for v in row)
 
 
+def _orf_interval_stats(
+    cigar: str, t_start: int, orf_start: int, orf_end: int
+) -> tuple[int, int]:
+    """``(n_match, n_columns)`` restricted to the template's ORF interval.
+
+    Whole-alignment identity is the wrong statistic for ORF support: a read
+    matching the CDS perfectly but disagreeing across both UTRs scores ~0.5,
+    which reads as a poor ORF when it is a perfect one. Requires ``--eqx``
+    to distinguish ``=`` from ``X``; a bare ``M`` is counted as a match, the
+    same convention ``cigar_stats`` uses.
+    """
+    if not cigar or orf_end <= orf_start:
+        return 0, 0
+    tpos = t_start
+    n_match = n_cols = 0
+    for length, op in parse_cigar(cigar):
+        if op in ("=", "X", "M"):
+            lo, hi = max(tpos, orf_start), min(tpos + length, orf_end)
+            if hi > lo:
+                n_cols += hi - lo
+                if op != "X":
+                    n_match += hi - lo
+            tpos += length
+        elif op == "D":  # consumes the template only
+            lo, hi = max(tpos, orf_start), min(tpos + length, orf_end)
+            if hi > lo:
+                n_cols += hi - lo
+            tpos += length
+        elif op == "I":  # consumes the read only
+            if orf_start <= tpos < orf_end:
+                n_cols += length
+    return n_match, n_cols
+
+
+def _best_slot_per_template(
+    slots: np.ndarray, tmpl: np.ndarray, as_score: np.ndarray
+) -> np.ndarray:
+    """One placement per template — the best-scoring one.
+
+    A read can align to the same template more than once (a repeat, a tandem
+    duplication, a spurious secondary). Treating those as separate candidates
+    would give that template a share of the read's mass proportional to how
+    many times it happened to place, not to how well it explains the read.
+    """
+    if slots.size == 0:
+        return slots
+    order = slots[np.lexsort((-as_score[slots], tmpl[slots]))]
+    keep_first = np.ones(order.size, dtype=bool)
+    keep_first[1:] = tmpl[order][1:] != tmpl[order][:-1]
+    return np.sort(order[keep_first])
+
+
 @dataclass(slots=True)
 class _Group:
     """One read's hits, accumulated across PAF batch boundaries."""
@@ -322,8 +374,11 @@ def assign_reads(
         nb = int(n_banded[0])
         sample = None if sample_of_read is None else sample_of_read.get(grp.read_id)
 
-        if tie_resolution == "fractional" and nb > 1:
-            slots = np.flatnonzero(in_band)
+        banded = _best_slot_per_template(
+            np.flatnonzero(in_band), tmpl, as_score
+        )
+        if tie_resolution == "fractional" and banded.size > 1:
+            slots = banded
             nw = templates.node_weight[tmpl[slots]].astype(np.float64)
             share = nw / nw.sum() if nw.sum() > 0 else np.full(slots.size, 1 / slots.size)
         else:
@@ -363,18 +418,24 @@ def assign_reads(
             )
 
         if emit_coverage:
-            for slot in np.flatnonzero(in_band).tolist():
+            # One row per (read, template): the support table is keyed that
+            # way, so a read placing twice on one template must not emit two.
+            for slot in banded.tolist():
                 t = int(tmpl[slot])
-                lo = max(grp.t_start[slot], int(templates.orf_start[t]))
-                hi = min(grp.t_end[slot], int(templates.orf_end[t]))
-                span = max(int(templates.orf_end[t] - templates.orf_start[t]), 1)
+                o_lo, o_hi = int(templates.orf_start[t]), int(templates.orf_end[t])
+                lo = max(grp.t_start[slot], o_lo)
+                hi = min(grp.t_end[slot], o_hi)
+                span = max(o_hi - o_lo, 1)
+                n_match, n_cols = _orf_interval_stats(
+                    grp.cigar[slot], grp.t_start[slot], o_lo, o_hi
+                )
                 c_rows.append(
                     (
                         grp.read_id,
                         int(templates.template_id[t]),
                         round_index,
                         max(hi - lo, 0) / span,
-                        grp.n_match[slot] / max(grp.aln_len[slot], 1),
+                        (n_match / n_cols) if n_cols else 0.0,
                         int(as_score[slot]),
                         slot == w_slot,
                     )
