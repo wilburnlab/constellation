@@ -204,6 +204,7 @@ import constellation.sequencing.transcriptome.cluster.denovo.encode
 import constellation.sequencing.transcriptome.cluster.denovo.minimizers
 import constellation.sequencing.transcriptome.cluster.denovo.orf
 import constellation.sequencing.transcriptome.cluster.denovo.orfem
+import constellation.sequencing.transcriptome.cluster.denovo.orfem.estep
 import constellation.sequencing.transcriptome.cluster.denovo.orfem.fold
 import constellation.sequencing.transcriptome.cluster.denovo.orfem.seed
 import constellation.sequencing.transcriptome.cluster.denovo.pipeline
