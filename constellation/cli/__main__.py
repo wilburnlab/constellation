@@ -1345,16 +1345,6 @@ def _build_transcriptome_parser(subs) -> None:
         ),
     )
     p_cluster.add_argument(
-        "--consensus-max-passes",
-        type=int,
-        default=3,
-        help=(
-            "de-novo: cap on consensus PWM passes when --fold-insertions is "
-            "on (each pass past the first re-aligns members onto the grown "
-            "frame). Default 3."
-        ),
-    )
-    p_cluster.add_argument(
         "--predict-orfs",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -3187,7 +3177,6 @@ def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
         error_model=str(args.error_model),
         overdispersion=float(args.overdispersion),
         fold_insertions=bool(args.fold_insertions),
-        consensus_max_passes=int(args.consensus_max_passes),
         predict_orfs=bool(args.predict_orfs),
         min_aa_length=int(args.min_aa_length),
         emit_cluster_detail=bool(args.emit_cluster_detail),

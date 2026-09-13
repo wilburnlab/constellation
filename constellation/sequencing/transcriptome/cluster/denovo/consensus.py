@@ -618,6 +618,45 @@ def _scatter_expanded(
     return flat.reshape(n, 5)
 
 
+# Keywords the iterated kernel took before the pre-planned column space
+# replaced it. They describe machinery that no longer exists (there is one
+# pass and no re-alignment), so they are accepted with a warning for one
+# release rather than silently ignored.
+_RETIRED_KWARGS: dict[str, str] = {
+    "max_passes": "the kernel is single-pass; there is nothing to bound",
+    "extend_ends": "terminal blocks are planned like any other insertion "
+    "block; use min_insertion_support",
+    "realign_max_frac": "members are never re-aligned",
+    "ins_min_fraction": "a column's fate is the ordinary argmax, not a "
+    "splice threshold",
+    "ins_min_weight": "use min_insertion_support",
+    "ext_min_fraction": "terminal blocks follow min_insertion_support",
+    "ext_min_weight": "use min_insertion_support",
+    "max_extension_per_pass": "use max_insertion_block",
+    "realign": "members are never re-aligned",
+}
+
+
+def _reject_retired_kwargs(kwargs: dict) -> None:
+    """Warn on a retired keyword; raise on anything else."""
+    import warnings
+
+    unknown = sorted(k for k in kwargs if k not in _RETIRED_KWARGS)
+    if unknown:
+        raise TypeError(
+            f"frame_consensus() got unexpected keyword argument(s) "
+            f"{unknown}. Did you mean one of "
+            f"{sorted(('frame_weight', 'fold_insertions', 'min_insertion_support', 'max_insertion_block', 'template_of_frame', 'plan'))}?"
+        )
+    for name in sorted(kwargs):
+        warnings.warn(
+            f"frame_consensus({name}=...) is retired and ignored: "
+            f"{_RETIRED_KWARGS[name]}.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+
 def frame_consensus(
     frame_seq: str,
     members: Sequence[MemberSpec],
@@ -628,7 +667,7 @@ def frame_consensus(
     max_insertion_block: int | None = None,
     template_of_frame: np.ndarray | None = None,
     plan: "ColumnPlan | None" = None,
-    **_legacy,
+    **retired,
 ) -> ConsensusResult:
     """Build the abundance-weighted consensus for one cluster.
 
@@ -656,7 +695,16 @@ def frame_consensus(
     in later rounds the frame is a consensus with no reads of its own. It also
     keeps the PWM column sums equal to raw read multiplicity, which
     ``variants.py`` relies on as its binomial ``n``.
+
+    Unknown keywords **raise**. This used to be a silent ``**_legacy`` sink,
+    which is how ``--consensus-max-passes`` survived as a user-facing flag
+    that did nothing for a whole release after the pre-planned column space
+    removed iteration — and how two tests came to pass ``extend_ends=False``
+    while asserting behaviour they were not controlling. Retired names warn;
+    anything else is a typo and is refused.
     """
+    if retired:
+        _reject_retired_kwargs(retired)
     n_template = len(frame_seq)
     frame_codes = base_codes(frame_seq).astype(np.int64)
     codes_of = [base_codes(m.member_seq) for m in members]

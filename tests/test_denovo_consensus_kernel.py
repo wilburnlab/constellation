@@ -227,8 +227,11 @@ def test_unresolved_n_column_maps_through_frame_of_cons():
     truth = _rand(rng, 400)
     frame = truth[:10] + "N" + truth[11:]
     # Every member starts 3' of the N, so column 10 has no coverage at all.
+    # They are also 5'-truncated, so none is anchored at the frame's start and
+    # no 5' block is reserved — nothing here needs extension suppressed.
     members = [truth[20:]] * 12
-    res = frame_consensus(frame, _specs(frame, members), extend_ends=False)
+    res = frame_consensus(frame, _specs(frame, members))
+    assert res.n_extended_5p == 0
 
     assert "N" in res.consensus
     assert len(res.frame_of_cons) == len(res.consensus)
@@ -421,6 +424,38 @@ def test_shim_centroid_self_vote_outweighs_members():
     m = c[:50] + ("A" if c[50] != "A" else "C") + c[51:]
     assert centroid_consensus(c, 5.0, _specs(c, [m])).consensus == c
     assert centroid_consensus(c, 1.0, _specs(c, [m], weight=5.0)).consensus == m
+
+
+# ── the kwargs surface is closed ──────────────────────────────────────
+
+
+def test_unknown_kwarg_raises_instead_of_being_swallowed():
+    """A silent ``**_legacy`` sink is how ``--consensus-max-passes`` survived
+    as a user-facing flag that did nothing for a release after the pre-planned
+    column space removed iteration, and how two tests came to pass
+    ``extend_ends=False`` while asserting behaviour they were not
+    controlling."""
+    rng = np.random.default_rng(211)
+    truth = _rand(rng, 200)
+    specs = _specs(truth, [truth] * 3)
+
+    with pytest.raises(TypeError, match="fold_insertion"):
+        frame_consensus(truth, specs, fold_insertion=True)  # singular typo
+    with pytest.raises(TypeError, match="banana"):
+        frame_consensus(truth, specs, banana=1)
+
+
+def test_retired_kwargs_warn_but_do_not_raise():
+    """Names the iterated kernel took are accepted for one release with a
+    warning, so an out-of-tree caller gets a diagnosis rather than a crash."""
+    rng = np.random.default_rng(213)
+    truth = _rand(rng, 200)
+    specs = _specs(truth, [truth] * 3)
+
+    with pytest.warns(DeprecationWarning, match="max_passes"):
+        res = frame_consensus(truth, specs, max_passes=9)
+    assert res.consensus == truth
+    assert res.n_passes == 1
 
 
 # ── fork safety ───────────────────────────────────────────────────────

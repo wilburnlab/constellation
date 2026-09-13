@@ -286,7 +286,6 @@ def _cluster_chunk(
     identity: float,
     overdispersion: float,
     fold_insertions: bool = True,
-    consensus_max_passes: int = 3,
     emit_alignments: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[list[tuple], list[tuple], list[tuple], list[tuple], dict, list[tuple]]:
@@ -425,9 +424,6 @@ def _cluster_chunk(
                 specs,
                 frame_weight=0.0,
                 fold_insertions=fold_insertions,
-                max_passes=consensus_max_passes,
-                extend_ends=fold_insertions,
-                realign_max_frac=_REALIGN_MAX_FRAC,
             )
             consensus = cres.consensus
             merge_disagreements(disagree, disagreement_stats(cres))
@@ -516,7 +512,6 @@ def assemble_clusters(
     error_model: ErrorModel | None = None,
     fit_empirical: bool = False,
     fold_insertions: bool = True,
-    consensus_max_passes: int = 3,
     emit_alignments: bool = False,
     threads: int = 1,
     progress: Callable[[str], None] | None = None,
@@ -533,7 +528,7 @@ def assemble_clusters(
     majority of members carry and extend past the centroid's ends, so a
     deletion error in the centroid is repairable and the result does not
     depend on which read became the frame. It costs one re-alignment pass per
-    cluster that actually splices; ``consensus_max_passes`` bounds that.
+    cluster whose members carry an insertion the frame lacks.
     """
     log = progress or (lambda _m: None)
     n_input = reads.num_rows
@@ -653,7 +648,6 @@ def assemble_clusters(
         identity=identity,
         overdispersion=overdispersion,
         fold_insertions=fold_insertions,
-        consensus_max_passes=consensus_max_passes,
         emit_alignments=emit_alignments,
     )
     disagree: dict = {}
@@ -1179,7 +1173,6 @@ def cluster_transcripts(
     error_model: Literal["default", "empirical"] = "default",
     overdispersion: float = 0.0,
     fold_insertions: bool = True,
-    consensus_max_passes: int = 3,
     predict_orfs: bool = True,
     min_aa_length: int = 60,
     emit_cluster_detail: bool = False,
@@ -1271,7 +1264,6 @@ def cluster_transcripts(
         overdispersion=overdispersion,
         fit_empirical=(error_model == "empirical"),
         fold_insertions=fold_insertions,
-        consensus_max_passes=consensus_max_passes,
         emit_alignments=emit_alignments,
         threads=threads,
         progress=log,
@@ -1301,7 +1293,6 @@ def cluster_transcripts(
             "error_model": str(error_model),
             "overdispersion": float(overdispersion),
             "fold_insertions": bool(fold_insertions),
-            "consensus_max_passes": int(consensus_max_passes),
             "predict_orfs": bool(predict_orfs),
             "min_aa_length": int(min_aa_length),
             "emit_alignments": bool(emit_alignments),

@@ -67,8 +67,11 @@ def test_certified_columns_tracks_base_coverage_not_total():
     rng = np.random.default_rng(3)
     truth = _rand(rng, 400)
     # 12 members cover only the middle; the flanks are the frame's own bases.
+    # None is anchored at either end, so no terminal block is reserved and the
+    # frame keeps its own length.
     members = _specs(truth, [truth[100:300]] * 12)
-    cres = frame_consensus(truth, members, extend_ends=False)
+    cres = frame_consensus(truth, members)
+    assert cres.n_extended_5p == 0 and cres.n_extended_3p == 0
     cert = certified_columns(cres, min_depth=3.0, min_agreement=0.6)
     assert cert.shape[0] == len(cres.consensus)
     assert cert[150:250].all(), "well-covered core must certify"
