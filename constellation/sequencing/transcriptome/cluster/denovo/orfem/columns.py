@@ -81,7 +81,8 @@ class ColumnStats:
     is_gap: np.ndarray  # bool — either allele is a gap ⇒ length change
     is_hp: np.ndarray  # bool — …and it sits in a homopolymer
     column_kind: np.ndarray  # int8 — DIAGNOSTICS ONLY, never a gate
-    boundary: np.ndarray  # bool — some member's covered span starts/ends here
+    boundary: np.ndarray  # bool — a clustered span endpoint sits here
+    boundary_mass: np.ndarray  # float64 — weight of spans ending/starting there
     n_assigned: float
     n_columns: int
 
@@ -104,6 +105,12 @@ class CandidateSet:
     effect: np.ndarray  # (V,) float64 — minority mass of the split, ≤ 0.5
     eps: np.ndarray  # (V,) float64 — per-column mismatch rate for the LL
     major: np.ndarray  # (V,) int8 — the majority allele
+    # (V,) float64 — weight of the span endpoints at this representative's
+    # DELIMITING boundary, which is the evidence for its claim. Not the
+    # cumulative uncovered mass: what a coverage representative asserts is
+    # "these reads start/stop here", and a degradation ramp accumulates a
+    # large uncovered fraction out of boundaries that each carry one read.
+    boundary_mass: np.ndarray
     p_value: np.ndarray  # (V,) float64 — allelic route only; 1.0 elsewhere
     q_cut: float  # the BH cutoff that admitted the allelic family
     n_allelic: int
@@ -127,6 +134,43 @@ def _local_max(x: np.ndarray, window: int) -> np.ndarray:
     from scipy.ndimage import maximum_filter1d
 
     return maximum_filter1d(x, size=2 * int(window) + 1, mode="nearest")
+
+
+def _cluster_boundaries(
+    pos: np.ndarray, weight: np.ndarray, n_columns: int, tolerance: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Support-ranked greedy clustering of span endpoints within ±tolerance.
+
+    Returns ``(is_seed, mass)``, both ``(F,)``.
+
+    The same rule ``cluster_junctions`` uses for intron donor/acceptor
+    positions, and for the same reason: a real boundary is one dominant
+    position with a low-support jitter skirt, not a uniform grid. Untolerated
+    endpoints are what let a 5' start mode with ±5 nt of soft-clip jitter look
+    like 200 separate boundaries of one read each — which is arithmetically
+    indistinguishable from a degradation ramp, and is what makes the
+    distinction between the two decidable at all.
+    """
+    is_seed = np.zeros(n_columns, dtype=bool)
+    mass = np.zeros(n_columns, dtype=np.float64)
+    if pos.shape[0] == 0:
+        return is_seed, mass
+    raw = np.bincount(
+        np.clip(pos, 0, n_columns - 1), weights=weight, minlength=n_columns
+    )
+    live = np.flatnonzero(raw > 0)
+    if live.size == 0:
+        return is_seed, mass
+    # Highest support first, ties by position so the result is reproducible
+    # across worker counts.
+    for c in live[np.lexsort((live, -raw[live]))]:
+        if raw[c] <= 0:
+            continue  # already absorbed
+        lo, hi = max(0, c - tolerance), min(n_columns, c + tolerance + 1)
+        is_seed[c] = True
+        mass[c] = raw[lo:hi].sum()
+        raw[lo:hi] = 0.0
+    return is_seed, mass
 
 
 def _context_codes(cres, pwm: np.ndarray) -> np.ndarray:
@@ -165,6 +209,7 @@ def column_stats(
     n_assigned: float,
     eps_floor: float = 0.0,
     local_window: int = 200,
+    boundary_tolerance: int = 10,
 ) -> ColumnStats:
     """Summarise every PWM column of ``cres``.
 
@@ -221,10 +266,17 @@ def column_stats(
     np.maximum(eps, float(eps_floor), out=eps)
 
     lo, hi = member_spans(cres)
-    boundary = np.zeros(f + 1, dtype=bool)
-    if lo.shape[0]:
-        boundary[np.clip(lo, 0, f)] = True
-        boundary[np.clip(hi, 0, f)] = True
+    w = np.array([float(m.weight) for m in cres.members], dtype=np.float64)
+    if lo.shape[0] != w.shape[0]:  # hand-built results
+        w = np.ones(lo.shape[0], dtype=np.float64)
+    # An interior boundary is one endpoint; the two template termini are not
+    # boundaries at all (every read that reaches them is anchored there), so
+    # they are dropped rather than clustered into the first real mode.
+    interior = np.concatenate([lo[lo > 0], hi[hi < f]])
+    mass_w = np.concatenate([w[lo > 0], w[hi < f]])
+    boundary, boundary_mass = _cluster_boundaries(
+        interior, mass_w, f, int(boundary_tolerance)
+    )
 
     kind = getattr(cres, "column_kind", None)
     kind = (
@@ -247,10 +299,32 @@ def column_stats(
         is_gap=is_gap,
         is_hp=is_hp,
         column_kind=kind,
-        boundary=boundary[:f],
+        boundary=boundary,
+        boundary_mass=boundary_mass,
         n_assigned=total,
         n_columns=f,
     )
+
+
+def _delimiting_mass(stats: ColumnStats, cols: np.ndarray) -> np.ndarray:
+    """Mass of the clustered boundaries that delimit each column's block.
+
+    A block of columns sharing one covered read-set is bounded on each side by
+    a boundary (or by a template terminus, which carries no mass), and its
+    claim is evidenced by whichever of the two the reads agree on. Run collapse
+    guarantees there is no boundary strictly inside a run, so every column of a
+    run gets the same pair.
+    """
+    seeds = np.flatnonzero(stats.boundary)
+    out = np.zeros(cols.shape[0], dtype=np.float64)
+    if seeds.size == 0 or cols.size == 0:
+        return out
+    mass = stats.boundary_mass[seeds]
+    prev = np.searchsorted(seeds, cols, side="right") - 1
+    nxt = np.searchsorted(seeds, cols, side="right")
+    lo = np.where(prev >= 0, mass[np.clip(prev, 0, seeds.size - 1)], 0.0)
+    hi = np.where(nxt < seeds.size, mass[np.clip(nxt, 0, seeds.size - 1)], 0.0)
+    return np.maximum(lo, hi)
 
 
 def candidate_columns(
@@ -353,6 +427,7 @@ def candidate_columns(
             effect=np.zeros(0, dtype=np.float64),
             eps=np.zeros(0, dtype=np.float64),
             major=np.zeros(0, dtype=np.int8),
+            boundary_mass=np.zeros(0, dtype=np.float64),
             p_value=np.zeros(0, dtype=np.float64),
             q_cut=q_cut,
             n_allelic=0,
@@ -429,6 +504,7 @@ def candidate_columns(
         effect=effect,
         eps=eps,
         major=stats.major[cols],
+        boundary_mass=_delimiting_mass(stats, cols),
         p_value=p_value[cols],
         q_cut=q_cut,
         n_allelic=int((route & ROUTE_ALLELIC).astype(bool).sum()),

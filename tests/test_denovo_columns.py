@@ -267,19 +267,52 @@ def test_run_collapse_is_what_makes_a_fused_template_affordable():
     assert kept.n_capped == 0
 
 
-def test_a_degradation_ramp_has_uncorrelated_boundaries():
-    """The route admits columns; it is covariance that rejects the ramp. What
-    this layer must guarantee is that a ramp is NOT collapsed into one
-    perfectly-correlated representative — every read ends somewhere else, so
-    every column is its own boundary."""
+def test_a_ramp_and_a_start_mode_are_separated_by_boundary_mass():
+    """Not by correlation — measured, a ramp's uncovered sets are *nested*,
+    which is maximal association, not independence: two ramp columns 200 apart
+    on a 300-read fixture test at p = 9e-44. Coverage is an interval, so
+    "uncovered at u" and "uncovered at v" are both implied by "ended before
+    min(u, v)", and no threshold on a pairwise test can separate them.
+
+    What does separate them is the mass at the *delimiting* boundary. A start
+    mode is many reads agreeing on one position; a ramp accumulates the same
+    uncovered fraction out of boundaries carrying one read each.
+    """
     rng = np.random.default_rng(47)
     truth = _rand(rng, 600)
-    members = [(truth[: 300 + 10 * i], 2.0) for i in range(30)]
+    ramp = [(truth[: 300 + 10 * i], 2.0) for i in range(30)]
+    _cres, stats = _stats(truth, ramp)
+    cand = candidate_columns(stats)
+    cov = (cand.route & ROUTE_COVERAGE).astype(bool)
+    assert cov.sum() > 5, "many separate representatives, not one block"
+    assert cand.boundary_mass[cov].max() <= 6.0, "no boundary carries real mass"
+
+    # The same total uncovered mass, concentrated at one position.
+    _cres2, mode = _stats(truth, [(truth, 30.0), (truth[300:], 30.0)])
+    cand2 = candidate_columns(mode)
+    cov2 = (cand2.route & ROUTE_COVERAGE).astype(bool)
+    assert cand2.boundary_mass[cov2].max() == pytest.approx(30.0)
+
+
+def test_a_jittered_start_mode_survives_the_boundary_tolerance():
+    """Real 5' ends jitter by a few nt. Without a tolerance, 30 reads of one
+    start mode look like 30 boundaries of one read — arithmetically
+    indistinguishable from a ramp. The ±bp clustering is the same rule
+    ``cluster_junctions`` applies to intron donors."""
+    rng = np.random.default_rng(83)
+    truth = _rand(rng, 800)
+    members = [(truth, 30.0)]
+    members += [(truth[400 + int(j) :], 3.0) for j in rng.integers(-4, 5, 10)]
     _cres, stats = _stats(truth, members)
     cand = candidate_columns(stats)
-    cov_len = cand.run_len[(cand.route & ROUTE_COVERAGE).astype(bool)]
-    assert cov_len.size > 5, "many separate representatives, not one block"
-    assert int(cov_len.max()) <= 10, "no long perfectly-correlated run"
+    cov = (cand.route & ROUTE_COVERAGE).astype(bool)
+    assert cand.boundary_mass[cov].max() >= 24.0, "the jitter skirt is one mode"
+
+    # Turn the tolerance off and the same reads fragment.
+    _cres2, raw = _stats(truth, members, boundary_tolerance=0)
+    raw_cand = candidate_columns(raw)
+    raw_cov = (raw_cand.route & ROUTE_COVERAGE).astype(bool)
+    assert raw_cand.boundary_mass[raw_cov].max() <= 9.0
 
 
 def test_terminal_columns_are_not_excluded():
