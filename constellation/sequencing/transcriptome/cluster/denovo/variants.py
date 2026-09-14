@@ -51,14 +51,18 @@ class ErrorModel:
     hp_ref_len: int = 3
     hp_slope: float = 0.015  # per extra base beyond hp_ref_len
     hp_min: float = 0.005
-    hp_max: float = 0.15
+    # Raised from 0.15: the H3f3b 5-G run carries a measured 22% indel rate,
+    # so the old ceiling sat *below* the observation and clamped the empirical
+    # fit rather than merely bounding the prior. A refit could never reach the
+    # thing it was fitting.
+    hp_max: float = 0.35
 
     def epsilon_homopolymer(self, run_len: int) -> float:
         eps = self.eps_hp0 * (1.0 + self.hp_slope * (run_len - self.hp_ref_len))
         return float(min(max(eps, self.hp_min), self.hp_max))
 
 
-def _homopolymer_runs(codes: np.ndarray) -> np.ndarray:
+def homopolymer_runs(codes: np.ndarray) -> np.ndarray:
     """Per-position length of the homopolymer run containing each position."""
     n = codes.shape[0]
     if n == 0:
@@ -71,8 +75,22 @@ def _homopolymer_runs(codes: np.ndarray) -> np.ndarray:
     return sizes[grp].astype(np.int32)
 
 
-def _survival(a: np.ndarray, n: np.ndarray, eps: np.ndarray, overdispersion: float):
-    """P(X ≥ a) under Binomial(n, eps) — or Beta-Binomial when ρ > 0."""
+# Private alias kept so existing call sites read unchanged.
+_homopolymer_runs = homopolymer_runs
+
+
+def survival(
+    a: np.ndarray, n: np.ndarray, eps: np.ndarray, overdispersion: float = 0.0
+) -> np.ndarray:
+    """P(X ≥ a) under Binomial(n, eps) — or Beta-Binomial when ρ > 0.
+
+    ρ is the depth penalty: a point binomial over-calls sub-1% minor alleles
+    once depth passes ~10k reads, and ρ caps the effective depth at ~1/ρ.
+
+    ``scipy`` is imported **inside** the function on purpose — the per-cluster
+    pools are fork-based, and importing heavy numerics at module scope in the
+    parent is what the torch-after-fork rule exists to avoid.
+    """
     from scipy import stats
 
     if overdispersion and overdispersion > 0.0:
@@ -82,6 +100,44 @@ def _survival(a: np.ndarray, n: np.ndarray, eps: np.ndarray, overdispersion: flo
         beta = (1.0 - eps) * conc
         return stats.betabinom.sf(a - 1, n, alpha, beta)
     return stats.binom.sf(a - 1, n, eps)
+
+
+# Private alias kept so existing call sites read unchanged.
+_survival = survival
+
+
+def benjamini_hochberg(pvals: np.ndarray, q: float) -> tuple[np.ndarray, float]:
+    """Benjamini-Hochberg step-up. Returns ``(significant_mask, cutoff)``.
+
+    ``cutoff`` is the largest p-value that passes ``p ≤ (i/m)·q``, or ``-1.0``
+    when nothing does — the form the callers want, so they can report the
+    threshold alongside the calls.
+
+    Factored out of two byte-identical inline copies (the per-consensus family
+    in :func:`call_variants` and the per-cluster family in
+    :func:`reclassify_variants`); the covariance M-step's pairwise family is
+    the third consumer.
+    """
+    m = pvals.shape[0]
+    if m == 0:
+        return np.zeros(0, dtype=bool), -1.0
+    ranked = np.sort(pvals)
+    passing = ranked <= (np.arange(1, m + 1) / m) * q
+    cutoff = float(ranked[passing].max()) if passing.any() else -1.0
+    return pvals <= cutoff, cutoff
+
+
+def _jeffreys(m: float, t: float) -> float:
+    """``(m + 0.5) / (t + 1)`` — the Jeffreys posterior mean for a rate.
+
+    A plain ``m / t`` returns **exactly 0** for a class that happened to show
+    no minor allele, and ``binom.sf(a - 1, n, 0.0)`` is 0 for every ``a ≥ 1``
+    — so every column in that class becomes maximally significant and the FDR
+    gate stops gating. That is not a precision problem, it is a failure mode:
+    the estimator has to be bounded away from zero, and Jeffreys is the
+    standard way to do it without inventing a threshold.
+    """
+    return float((m + 0.5) / (t + 1.0)) if t > 0 else 0.0
 
 
 def _core_region(kept_coverage: np.ndarray, core_frac: float) -> tuple[int, int]:
@@ -214,14 +270,11 @@ def call_variants(
     for i in np.flatnonzero(is_hp):
         eps[i] = model.epsilon_homopolymer(int(hp_run_full[i]))
 
-    pvals = _survival(a, nn, eps, overdispersion)
+    pvals = survival(a, nn, eps, overdispersion)
 
-    # Benjamini-Hochberg threshold over the cluster's tested positions.
+    # Benjamini-Hochberg over this consensus's tested positions.
     m = pvals.shape[0]
-    order = np.argsort(pvals)
-    ranked = pvals[order]
-    bh = ranked <= (np.arange(1, m + 1) / m) * q_real
-    bh_cut = ranked[bh].max() if bh.any() else -1.0
+    _sig, bh_cut = benjamini_hochberg(pvals, q_real)
 
     rows: list[tuple] = []
     for i in range(m):
@@ -362,8 +415,8 @@ def estimate_error_rates(
     sub_t = sum(t for (c, _), (_m, t) in stats.items() if c == 0)
     ind_m = sum(m for (c, _), (m, _t) in stats.items() if c == 2)
     ind_t = sum(t for (c, _), (_m, t) in stats.items() if c == 2)
-    eps_sub = sub_m / sub_t if sub_t >= min_total else base.eps_sub
-    eps_indel = ind_m / ind_t if ind_t >= min_total else base.eps_indel
+    eps_sub = _jeffreys(sub_m, sub_t) if sub_t >= min_total else base.eps_sub
+    eps_indel = _jeffreys(ind_m, ind_t) if ind_t >= min_total else base.eps_indel
 
     hp = [
         (run, m, t)
@@ -373,7 +426,7 @@ def estimate_error_rates(
     eps_hp0, hp_slope = base.eps_hp0, base.hp_slope
     if len(hp) >= 2 and sum(t for _r, _m, t in hp) >= min_total:
         runs = np.array([r for r, _m, _t in hp], dtype=np.float64)
-        eps_obs = np.array([m / t for _r, m, t in hp])
+        eps_obs = np.array([_jeffreys(m, t) for _r, m, t in hp])
         wt = np.array([t for _r, _m, t in hp])
         x = runs - base.hp_ref_len
         # weighted least squares: eps = intercept + coef * x
@@ -440,18 +493,14 @@ def reclassify_variants(
             eps[i] = model.eps_indel
         a[i] = int(r[_VR_DMINOR])
         n[i] = int(r[_VR_DTOTAL])
-    pvals = _survival(a, n, eps, overdispersion)
+    pvals = survival(a, n, eps, overdispersion)
 
     by_cluster: dict[int, list[int]] = {}
     for i, r in enumerate(rows):
         by_cluster.setdefault(int(r[_VR_CLUSTER]), []).append(i)
     for idxs in by_cluster.values():
-        m = len(idxs)
-        cl_p = np.array([pvals[i] for i in idxs])
-        order = np.argsort(cl_p)
-        ranked = cl_p[order]
-        bh = ranked <= (np.arange(1, m + 1) / m) * q_real
-        bh_cut = ranked[bh].max() if bh.any() else -1.0
+        # The correction family is one cluster, not the whole run.
+        _sig, bh_cut = benjamini_hochberg(np.array([pvals[i] for i in idxs]), q_real)
         for i in idxs:
             if n[i] < n_min:
                 call = "ambiguous"
@@ -474,4 +523,11 @@ __all__ = [
     "merge_disagreements",
     "estimate_error_rates",
     "reclassify_variants",
+    # Shared primitives. The context-conditional null and its multiple-testing
+    # correction live here because this module already owns the error model and
+    # is a leaf (it imports only `_cigar`); the covariance M-step reuses them
+    # rather than growing a third copy.
+    "benjamini_hochberg",
+    "survival",
+    "homopolymer_runs",
 ]
