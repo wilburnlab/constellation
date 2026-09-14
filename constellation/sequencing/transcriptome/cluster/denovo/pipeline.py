@@ -1173,6 +1173,7 @@ def cluster_transcripts(
     error_model: Literal["default", "empirical"] = "default",
     overdispersion: float = 0.0,
     fold_insertions: bool = True,
+    max_window_length: int | None = None,
     predict_orfs: bool = True,
     min_aa_length: int = 60,
     emit_cluster_detail: bool = False,
@@ -1248,7 +1249,16 @@ def cluster_transcripts(
         log = _log
         log(f"loading Complete demux windows from {demux_dir}…")
 
-    reads = load_demux_windows(Path(demux_dir))
+    reads, read_stats = load_demux_windows(
+        Path(demux_dir), max_window_length=max_window_length
+    )
+    if read_stats["n_dropped_long"]:
+        log(
+            f"  dropped {read_stats['n_dropped_long']:,} of "
+            f"{read_stats['n_input']:,} windows longer than "
+            f"{max_window_length:,} nt (longest input "
+            f"{read_stats['max_input_length']:,} nt)"
+        )
     result = assemble_clusters(
         reads,
         identity=identity,
@@ -1293,6 +1303,11 @@ def cluster_transcripts(
             "error_model": str(error_model),
             "overdispersion": float(overdispersion),
             "fold_insertions": bool(fold_insertions),
+            "max_window_length": (
+                int(max_window_length) if max_window_length else None
+            ),
+            "n_dropped_long": int(read_stats["n_dropped_long"]),
+            "max_input_window_length": int(read_stats["max_input_length"]),
             "predict_orfs": bool(predict_orfs),
             "min_aa_length": int(min_aa_length),
             "emit_alignments": bool(emit_alignments),
