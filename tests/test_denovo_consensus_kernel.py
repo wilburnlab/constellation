@@ -28,7 +28,9 @@ from constellation.sequencing.transcriptome.cluster.denovo.consensus import (  #
     COL_TEMPLATE,
     MemberSpec,
     centroid_consensus,
+    member_allele_events,
     member_alleles,
+    member_spans,
     consensus_of_frame,
     frame_consensus,
     frame_of_consensus,
@@ -424,6 +426,65 @@ def test_shim_centroid_self_vote_outweighs_members():
     m = c[:50] + ("A" if c[50] != "A" else "C") + c[51:]
     assert centroid_consensus(c, 5.0, _specs(c, [m])).consensus == c
     assert centroid_consensus(c, 1.0, _specs(c, [m], weight=5.0)).consensus == m
+
+
+# ── the sparse reader agrees with the dense one ───────────────────────
+
+
+def _densify(ev, major):
+    """Rebuild the dense (M, V) allele matrix from the CSR form."""
+    out = np.full((ev.n_members, ev.n_candidates), -1, dtype=np.int8)
+    for i in range(ev.n_members):
+        # Everything not listed as non-major or uncovered agrees with major.
+        out[i, :] = major
+        lo, hi = ev.uc_ptr[i], ev.uc_ptr[i + 1]
+        out[i, ev.uc_v[lo:hi]] = -1
+        lo, hi = ev.nm_ptr[i], ev.nm_ptr[i + 1]
+        out[i, ev.nm_v[lo:hi]] = ev.nm_allele[lo:hi]
+    return out
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_member_allele_events_reconstructs_member_alleles(seed):
+    """The sparse form exists to keep the dense (M, V) int8 from being
+    unbounded once the 64-column cap is gone. It must say exactly the same
+    thing — the two share one row builder precisely so they cannot drift."""
+    rng = np.random.default_rng(seed)
+    truth = _rand(rng, 400)
+    at = int(rng.integers(80, 320))
+    frame = truth[:at] + truth[at + 1 :]  # plant an insertion column
+    members = (
+        [truth] * int(rng.integers(2, 8))
+        + [frame] * int(rng.integers(2, 8))
+        + [frame[50:]] * int(rng.integers(1, 5))  # 5'-truncated
+        + [truth[: len(truth) - 60]] * int(rng.integers(1, 5))  # 3'-truncated
+    )
+    res = frame_consensus(frame, _specs(frame, members))
+
+    cols = np.arange(res.pwm.shape[0], dtype=np.int64)
+    dense = member_alleles(res, cols)
+    major = np.argmax(res.pwm, axis=1).astype(np.int8)
+    ev = member_allele_events(res, cols, major=major)
+    assert np.array_equal(_densify(ev, major), dense)
+
+
+def test_member_spans_bracket_every_covered_column():
+    """The span is the interval a member has any evidence in, in PWM columns
+    — which is what the co-occurrence pass uses as its co-coverage test."""
+    rng = np.random.default_rng(131)
+    truth = _rand(rng, 400)
+    frame = truth[:200] + truth[201:]
+    members = [truth] * 6 + [frame[80:300]] * 6
+    res = frame_consensus(frame, _specs(frame, members))
+
+    cols = np.arange(res.pwm.shape[0], dtype=np.int64)
+    dense = member_alleles(res, cols)
+    lo, hi = member_spans(res)
+    for i in range(dense.shape[0]):
+        covered = np.flatnonzero(dense[i] >= 0)
+        assert covered.size, "fixture members all cover something"
+        assert lo[i] <= covered.min(), "span must start at or before coverage"
+        assert hi[i] > covered.max(), "span must end after coverage"
 
 
 # ── the kwargs surface is closed ──────────────────────────────────────

@@ -867,63 +867,204 @@ def member_alleles(cres: ConsensusResult, columns) -> np.ndarray:
     t_want = t_of[t_idx]
     b_idx = np.flatnonzero(j_of >= 0)
 
-    cached = list(cres.projections or ())
-    codes_cache = list(cres.member_codes or ())
-    for i, spec in enumerate(members):
-        if i < len(cached) and i < len(codes_cache):
-            proj = cached[i][0]
-            codes = codes_cache[i]
-        else:  # constructed by hand (tests); fall back to re-projecting
-            codes = base_codes(spec.member_seq)
-            fstart, mstart = _offsets(spec)
-            proj = project_member_events(
-                parse_cigar(spec.cigar),
-                codes,
-                frame_is_query=spec.centroid_is_query,
-                frame_start=fstart,
-                member_start=mstart,
-            )
-        row = out[i]
-
-        if t_idx.shape[0]:
-            hit, pos = _lookup_sorted(proj.match_fpos, t_want)
-            if hit.any():
-                vals = proj.match_base[pos[hit]].astype(np.int8)
-                # An ambiguous member base is no evidence, not a gap.
-                vals = np.where(vals >= 4, np.int8(-1), vals)
-                row[t_idx[hit]] = vals
-            hitg, _posg = _lookup_sorted(proj.gap_fpos, t_want)
-            if hitg.any():
-                row[t_idx[hitg]] = 4
-
-        if b_idx.shape[0]:
-            events = dict(_member_events(proj, codes, plan.n_template))
-            for k in b_idx:
-                j = int(j_of[k])
-                if not _covers_junction(proj, j, plan.n_template):
-                    continue  # no evidence about this junction
-                w = int(plan.block_width[j])
-                o = int(o_of[k])
-                c = events.get(j)
-                if c is None or c.size == 0:
-                    row[k] = 4
-                    continue
-                kk = min(int(c.size), w)
-                # Junction 0's block abuts template column 0 on its right, so
-                # it right-justifies; every other block abuts the column on
-                # its left and left-justifies.
-                if j == 0:
-                    filled = o >= w - kk
-                    src = int(c.size) - (w - o) if filled else -1
-                else:
-                    filled = o < kk
-                    src = o if filled else -1
-                if not filled:
-                    row[k] = 4
-                else:
-                    base = int(c[src])
-                    row[k] = -1 if base >= 4 else base
+    for i in range(len(members)):
+        proj, codes = _member_projection(cres, i)
+        _member_row(
+            out[i], proj, codes, plan, t_idx, t_want, b_idx, j_of, o_of
+        )
     return out
+
+
+def _member_projection(cres: ConsensusResult, i: int):
+    """``(ProjectedMember, codes)`` for member ``i``, cached when available."""
+    cached = cres.projections or ()
+    codes_cache = cres.member_codes or ()
+    if i < len(cached) and i < len(codes_cache):
+        return cached[i][0], codes_cache[i]
+    # Constructed by hand (tests); fall back to re-projecting.
+    spec = cres.members[i]
+    codes = base_codes(spec.member_seq)
+    fstart, mstart = _offsets(spec)
+    return (
+        project_member_events(
+            parse_cigar(spec.cigar),
+            codes,
+            frame_is_query=spec.centroid_is_query,
+            frame_start=fstart,
+            member_start=mstart,
+        ),
+        codes,
+    )
+
+
+def _member_row(row, proj, codes, plan, t_idx, t_want, b_idx, j_of, o_of) -> None:
+    """Fill ``row`` (pre-set to -1) with one member's alleles.
+
+    The single definition of "what does this member say at this PWM column",
+    shared by the dense :func:`member_alleles` and the sparse
+    :func:`member_allele_events` so the two cannot drift.
+    """
+    if t_idx.shape[0]:
+        hit, pos = _lookup_sorted(proj.match_fpos, t_want)
+        if hit.any():
+            vals = proj.match_base[pos[hit]].astype(np.int8)
+            # An ambiguous member base is no evidence, not a gap.
+            vals = np.where(vals >= 4, np.int8(-1), vals)
+            row[t_idx[hit]] = vals
+        hitg, _posg = _lookup_sorted(proj.gap_fpos, t_want)
+        if hitg.any():
+            row[t_idx[hitg]] = 4
+
+    if b_idx.shape[0]:
+        events = dict(_member_events(proj, codes, plan.n_template))
+        for k in b_idx:
+            j = int(j_of[k])
+            if not _covers_junction(proj, j, plan.n_template):
+                continue  # no evidence about this junction
+            w = int(plan.block_width[j])
+            o = int(o_of[k])
+            c = events.get(j)
+            if c is None or c.size == 0:
+                row[k] = 4
+                continue
+            kk = min(int(c.size), w)
+            # Junction 0's block abuts template column 0 on its right, so it
+            # right-justifies; every other block abuts the column on its left
+            # and left-justifies.
+            if j == 0:
+                filled = o >= w - kk
+                src = int(c.size) - (w - o) if filled else -1
+            else:
+                filled = o < kk
+                src = o if filled else -1
+            if not filled:
+                row[k] = 4
+            else:
+                base = int(c[src])
+                row[k] = -1 if base >= 4 else base
+
+
+@dataclass(frozen=True, slots=True)
+class AlleleEvents:
+    """Sparse per-member state over a candidate column set.
+
+    Two CSR structures indexed by **candidate index** ``v ∈ [0, V)``, not by
+    PWM column: ``nm_*`` holds the columns where a member is **non-major**,
+    ``uc_*`` the columns it does not cover. Everything else — the majority
+    agreement, which is most of the matrix — is implicit.
+
+    The dense ``(M, V) int8`` this replaces is unbounded once the 64-column
+    cap is gone: at 20k members and 5,000 candidates it is a 100 MB
+    allocation inside a fork worker, per template. The measured non-major
+    load is 0-17 columns per read.
+    """
+
+    nm_ptr: np.ndarray  # (M+1,) int64
+    nm_v: np.ndarray  # (nnz,) int32 — candidate index
+    nm_allele: np.ndarray  # (nnz,) int8 — 0-3 base, 4 gap
+    uc_ptr: np.ndarray  # (M+1,) int64
+    uc_v: np.ndarray  # (nnz,) int32
+    span_lo: np.ndarray  # (M,) int64 — covered PWM-column interval, inclusive
+    span_hi: np.ndarray  # (M,) int64 — exclusive
+    n_members: int
+    n_candidates: int
+
+
+def member_spans(cres: ConsensusResult) -> tuple[np.ndarray, np.ndarray]:
+    """Each member's covered interval ``[lo, hi)`` in **PWM columns**.
+
+    Coverage is contiguous in the expanded space: a member covers its
+    template columns, every interior junction block strictly inside its
+    aligned span (those blocks lie between the template columns it covers),
+    and a terminal block only when it is anchored at that end — which is
+    exactly :func:`_covers_junction`'s rule.
+    """
+    plan = cres.plan
+    n = len(cres.members)
+    lo = np.zeros(n, dtype=np.int64)
+    hi = np.zeros(n, dtype=np.int64)
+    if plan is None or n == 0:
+        return lo, hi
+    t_at = plan.template_at
+    T = plan.n_template
+    for i in range(n):
+        proj, _codes = _member_projection(cres, i)
+        ts = max(0, min(int(proj.frame_start), T))
+        te = max(ts, min(int(proj.frame_end), T))
+        if te <= ts:  # degenerate alignment
+            lo[i] = hi[i] = int(t_at[ts]) if ts < T else plan.n_columns
+            continue
+        # Junction ts is covered only at the 5' terminus; an interior junction
+        # needs frame_start < j, which ts never satisfies. Same at the 3' end.
+        lo[i] = 0 if (ts == 0 and proj.frame_start == 0) else int(t_at[ts])
+        hi[i] = (
+            plan.n_columns
+            if (te == T and proj.frame_end == T)
+            else int(t_at[te - 1]) + 1
+        )
+    return lo, hi
+
+
+def member_allele_events(
+    cres: ConsensusResult, columns, *, major: np.ndarray
+) -> AlleleEvents:
+    """Sparse non-major / uncovered state over ``columns`` (PWM columns).
+
+    ``major`` is the per-candidate majority allele code, so "non-major" is
+    decided against the column's own consensus rather than against a
+    reference base.
+    """
+    plan = cres.plan
+    cols = np.asarray(columns, dtype=np.int64)
+    n_members = len(cres.members)
+    v = cols.shape[0]
+    empty_i32 = np.empty(0, dtype=np.int32)
+    if plan is None or v == 0 or n_members == 0:
+        z = np.zeros(n_members + 1, dtype=np.int64)
+        return AlleleEvents(
+            z, empty_i32, np.empty(0, np.int8), z.copy(), empty_i32,
+            np.zeros(n_members, np.int64), np.zeros(n_members, np.int64),
+            n_members, v,
+        )
+
+    t_of, j_of, o_of = _classify_columns(plan, cols)
+    t_idx = np.flatnonzero(t_of >= 0)
+    t_want = t_of[t_idx]
+    b_idx = np.flatnonzero(j_of >= 0)
+    maj = np.asarray(major, dtype=np.int8)
+
+    nm_v_parts: list[np.ndarray] = []
+    nm_a_parts: list[np.ndarray] = []
+    uc_v_parts: list[np.ndarray] = []
+    nm_ptr = np.zeros(n_members + 1, dtype=np.int64)
+    uc_ptr = np.zeros(n_members + 1, dtype=np.int64)
+    row = np.empty(v, dtype=np.int8)
+    for i in range(n_members):
+        row.fill(-1)
+        proj, codes = _member_projection(cres, i)
+        _member_row(row, proj, codes, plan, t_idx, t_want, b_idx, j_of, o_of)
+        uncovered = np.flatnonzero(row < 0).astype(np.int32)
+        non_major = np.flatnonzero((row >= 0) & (row != maj)).astype(np.int32)
+        nm_v_parts.append(non_major)
+        nm_a_parts.append(row[non_major].copy())
+        uc_v_parts.append(uncovered)
+        nm_ptr[i + 1] = nm_ptr[i] + non_major.shape[0]
+        uc_ptr[i + 1] = uc_ptr[i] + uncovered.shape[0]
+
+    lo, hi = member_spans(cres)
+    return AlleleEvents(
+        nm_ptr=nm_ptr,
+        nm_v=(np.concatenate(nm_v_parts) if nm_v_parts else empty_i32),
+        nm_allele=(
+            np.concatenate(nm_a_parts) if nm_a_parts else np.empty(0, np.int8)
+        ),
+        uc_ptr=uc_ptr,
+        uc_v=(np.concatenate(uc_v_parts) if uc_v_parts else empty_i32),
+        span_lo=lo,
+        span_hi=hi,
+        n_members=n_members,
+        n_candidates=v,
+    )
 
 
 def centroid_consensus(
@@ -957,6 +1098,9 @@ __all__ = [
     "project_member_events",
     "plan_columns",
     "member_alleles",
+    "member_allele_events",
+    "member_spans",
+    "AlleleEvents",
     "ColumnPlan",
     "frame_of_consensus",
     "consensus_of_frame",
