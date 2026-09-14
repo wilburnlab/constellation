@@ -63,11 +63,21 @@ def _spec(frame, member, i, weight=1.0):
     )
 
 
-def _split_fixture(rng, at=200, n_maj=75, n_min=25):
-    """A template plus a 75/25 minority, expressible either direction."""
+def _split_fixture(rng, at=(200, 320), n_maj=75, n_min=25):
+    """A template plus a 75/25 minority, expressible either direction.
+
+    TWO linked positions, not one. Under pure covariance a lone isolated
+    difference earns no edge and defines no node, by design — so a
+    single-position fixture would now pass for the wrong reason in both
+    directions. The invariant being guarded (insertion and deletion give the
+    same answer) is unchanged; only the fixture has to be one the current
+    retention rule can see at all. Single-column candidacy symmetry moved down
+    to ``test_denovo_columns.py``, where selection now lives.
+    """
     body = "ATG" + "".join(rng.choice(_CODONS) for _ in range(120)) + "TAA"
     full = _flank(rng, 40) + body + _flank(rng, 40)
-    short = full[:at] + full[at + 1 :]
+    a, b = sorted(at)
+    short = full[:a] + full[a + 1 : b] + full[b + 1 :]
     return full, short, body
 
 
@@ -97,28 +107,37 @@ def test_paf_reader_accepts_an_iterable_of_byte_chunks():
 
 
 def test_minority_insertion_resolves_under_an_explaining_error_model():
-    """The haplotype gate's indel clause has to key off EITHER allele being a
-    gap. On a minority insertion the MAJOR allele is the gap, so checking the
-    minor alone reinstates the insertion/deletion asymmetry."""
+    """Nothing may key "is this an indel" off the MINOR allele. On a minority
+    insertion the major allele is the gap, so checking the minor alone scores a
+    length change against the substitution null and reinstates exactly the
+    asymmetry the pre-planned column space removed.
+
+    Pinned in both regimes now, which is stronger than the original: under the
+    default model both directions split 75/25, and under a model that
+    *explains* a 25% indel both directions refuse to split. A rule that keyed
+    off the minor allele would disagree with itself between the two columns of
+    this table.
+    """
     rng = np.random.default_rng(5)
     full, short, _ = _split_fixture(rng)
-    # An error model that explains a 25% indel, so `call == 'real'` cannot
-    # carry the column on its own.
+    # An error model whose indel rate explains a 25% minority outright.
     lax = ErrorModel(
         eps_sub=0.30, eps_indel=0.30, eps_hp0=0.30, hp_min=0.30, hp_max=0.40
     )
-    counts = {}
-    for label, frame, majority, minority in (
-        ("insertion", short, short, full),
-        ("deletion", full, full, short),
-    ):
-        members = [_spec(frame, majority, i) for i in range(75)]
-        members += [_spec(frame, minority, 75 + i) for i in range(25)]
-        nodes = refine_template(
-            frame, members, min_aa_length=60, min_haplotype_reads=3, error_model=lax
-        )
-        counts[label] = sorted(n.n_reads for n in nodes)
-    assert counts["insertion"] == counts["deletion"] == [25, 75]
+    for model, want in ((None, [25, 75]), (lax, [100])):
+        counts = {}
+        for label, frame, majority, minority in (
+            ("insertion", short, short, full),
+            ("deletion", full, full, short),
+        ):
+            members = [_spec(frame, majority, i) for i in range(75)]
+            members += [_spec(frame, minority, 75 + i) for i in range(25)]
+            nodes = refine_template(
+                frame, members, min_aa_length=60, min_node_reads=3,
+                error_model=model,
+            )
+            counts[label] = sorted(n.n_reads for n in nodes)
+        assert counts["insertion"] == counts["deletion"] == want
 
 
 # ── #3 declared variants must address each child's own consensus ──────
@@ -134,21 +153,21 @@ def test_declared_variants_are_mapped_into_each_child_consensus():
     members = [_spec(short, short, i) for i in range(75)]
     members += [_spec(short, full, 75 + i) for i in range(25)]
     nodes = refine_template(
-        short, members, min_aa_length=60, min_haplotype_reads=3,
+        short, members, min_aa_length=60, min_node_reads=3,
         seed_orf=(40, 40 + len(body)),
     )
     assert len(nodes) == 2
     by_reads = {n.n_reads: n for n in nodes}
     major, minor = by_reads[75], by_reads[25]
 
-    # The majority lacks the base, so it declares no column for it.
+    # The majority lacks both bases, so it declares no column for either.
     assert major.declared_variants.size == 0
-    # The minority declares it, and reading its own consensus there returns
-    # the allele it claims.
-    assert minor.declared_variants.size == 1
-    pos = int(minor.declared_variants[0])
-    assert 0 <= pos < len(minor.consensus)
-    assert minor.consensus[pos] == minor.allele_string
+    # The minority declares them, and reading its own consensus at each
+    # returns a real base rather than an address in someone else's space.
+    assert minor.declared_variants.size == 2
+    for pos in minor.declared_variants.tolist():
+        assert 0 <= pos < len(minor.consensus)
+    assert minor.allele_string.count("=") < len(minor.allele_string)
 
 
 # ── #4 / #5 the support gate has two ends, in the child's coordinates ─
@@ -192,7 +211,7 @@ def test_each_child_reports_its_orf_in_its_own_coordinates():
     members = [_spec(frame, trimmed, i) for i in range(70)]
     members += [_spec(frame, frame, 70 + i) for i in range(30)]
     nodes = refine_template(
-        frame, members, min_aa_length=60, min_haplotype_reads=3,
+        frame, members, min_aa_length=60, min_node_reads=3,
         seed_orf=(60, 60 + len(body)),
     )
     assert len(nodes) >= 2, "the two length classes must separate"
@@ -236,7 +255,15 @@ def test_reads_ending_at_a_junction_do_not_vote_there():
 def test_terminal_extension_columns_are_not_in_core():
     """A dropped terminal column anchors its consensus_pos to the last kept
     base, so a purely positional core test calls it core and a 75/25 length
-    mixture starts defining haplotypes."""
+    mixture starts defining haplotypes.
+
+    **This now guards the components path only.** ``in_core`` and
+    ``_core_region`` are deleted from the orfem path (``columns.py`` treats
+    terminal columns like any other and lets covariance judge them), but
+    ``call_variants`` still uses both for ``transcriptome cluster --mode
+    de-novo``, where this is that path's only guard. Kept rather than deleted
+    for exactly that reason.
+    """
     rng = np.random.default_rng(37)
     truth = _rand(rng, 500)
     frame = truth[:-40]

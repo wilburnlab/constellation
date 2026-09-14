@@ -83,6 +83,12 @@ class ColumnStats:
     column_kind: np.ndarray  # int8 — DIAGNOSTICS ONLY, never a gate
     boundary: np.ndarray  # bool — a clustered span endpoint sits here
     boundary_mass: np.ndarray  # float64 — weight of spans ending/starting there
+    # float64 — endpoint mass a LOCALLY UNIFORM spread would put in the same
+    # ±tolerance window. A degradation ramp scatters endpoints evenly, so its
+    # boundaries sit at this value; a start mode piles them at one position
+    # and stands far above it. That contrast is what makes "mode" decidable
+    # without a bare threshold on either mass or fraction.
+    boundary_expected: np.ndarray
     n_assigned: float
     n_columns: int
 
@@ -111,6 +117,8 @@ class CandidateSet:
     # "these reads start/stop here", and a degradation ramp accumulates a
     # large uncovered fraction out of boundaries that each carry one read.
     boundary_mass: np.ndarray
+    # (V,) float64 — what a locally uniform endpoint spread would give there.
+    boundary_expected: np.ndarray
     p_value: np.ndarray  # (V,) float64 — allelic route only; 1.0 elsewhere
     q_cut: float  # the BH cutoff that admitted the allelic family
     n_allelic: int
@@ -171,6 +179,29 @@ def _cluster_boundaries(
         mass[c] = raw[lo:hi].sum()
         raw[lo:hi] = 0.0
     return is_seed, mass
+
+
+def _uniform_expectation(
+    pos: np.ndarray,
+    weight: np.ndarray,
+    n_columns: int,
+    tolerance: int,
+    local_window: int,
+) -> np.ndarray:
+    """Endpoint mass a locally uniform spread would put in each ±tolerance
+    window: ``(mass within ±local_window) × (2·tol+1) / (window width)``."""
+    out = np.zeros(n_columns, dtype=np.float64)
+    if pos.shape[0] == 0 or n_columns == 0:
+        return out
+    ep = np.bincount(
+        np.clip(pos, 0, n_columns - 1), weights=weight, minlength=n_columns
+    )
+    csum = np.concatenate([[0.0], np.cumsum(ep)])
+    c = np.arange(n_columns)
+    lo = np.maximum(0, c - local_window)
+    hi = np.minimum(n_columns, c + local_window + 1)
+    local = csum[hi] - csum[lo]
+    return local * (2.0 * tolerance + 1.0) / np.maximum(hi - lo, 1)
 
 
 def _context_codes(cres, pwm: np.ndarray) -> np.ndarray:
@@ -277,6 +308,9 @@ def column_stats(
     boundary, boundary_mass = _cluster_boundaries(
         interior, mass_w, f, int(boundary_tolerance)
     )
+    boundary_expected = _uniform_expectation(
+        interior, mass_w, f, int(boundary_tolerance), int(local_window)
+    )
 
     kind = getattr(cres, "column_kind", None)
     kind = (
@@ -301,13 +335,16 @@ def column_stats(
         column_kind=kind,
         boundary=boundary,
         boundary_mass=boundary_mass,
+        boundary_expected=boundary_expected,
         n_assigned=total,
         n_columns=f,
     )
 
 
-def _delimiting_mass(stats: ColumnStats, cols: np.ndarray) -> np.ndarray:
-    """Mass of the clustered boundaries that delimit each column's block.
+def _delimiting_boundary(
+    stats: ColumnStats, cols: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(mass, expected)`` of the boundary that delimits each column's block.
 
     A block of columns sharing one covered read-set is bounded on each side by
     a boundary (or by a template terminus, which carries no mass), and its
@@ -316,15 +353,24 @@ def _delimiting_mass(stats: ColumnStats, cols: np.ndarray) -> np.ndarray:
     run gets the same pair.
     """
     seeds = np.flatnonzero(stats.boundary)
-    out = np.zeros(cols.shape[0], dtype=np.float64)
+    zero = np.zeros(cols.shape[0], dtype=np.float64)
     if seeds.size == 0 or cols.size == 0:
-        return out
-    mass = stats.boundary_mass[seeds]
-    prev = np.searchsorted(seeds, cols, side="right") - 1
-    nxt = np.searchsorted(seeds, cols, side="right")
-    lo = np.where(prev >= 0, mass[np.clip(prev, 0, seeds.size - 1)], 0.0)
-    hi = np.where(nxt < seeds.size, mass[np.clip(nxt, 0, seeds.size - 1)], 0.0)
-    return np.maximum(lo, hi)
+        return zero, zero.copy()
+    prev = np.clip(np.searchsorted(seeds, cols, side="right") - 1, 0, seeds.size - 1)
+    nxt = np.clip(np.searchsorted(seeds, cols, side="right"), 0, seeds.size - 1)
+    has_p = (np.searchsorted(seeds, cols, side="right") - 1) >= 0
+    has_n = np.searchsorted(seeds, cols, side="right") < seeds.size
+    m_p = np.where(has_p, stats.boundary_mass[seeds[prev]], 0.0)
+    m_n = np.where(has_n, stats.boundary_mass[seeds[nxt]], 0.0)
+    # Whichever side carries the evidence; its own expectation goes with it.
+    take_p = m_p >= m_n
+    mass = np.where(take_p, m_p, m_n)
+    exp = np.where(
+        take_p,
+        np.where(has_p, stats.boundary_expected[seeds[prev]], 0.0),
+        np.where(has_n, stats.boundary_expected[seeds[nxt]], 0.0),
+    )
+    return mass, exp
 
 
 def candidate_columns(
@@ -428,6 +474,7 @@ def candidate_columns(
             eps=np.zeros(0, dtype=np.float64),
             major=np.zeros(0, dtype=np.int8),
             boundary_mass=np.zeros(0, dtype=np.float64),
+            boundary_expected=np.zeros(0, dtype=np.float64),
             p_value=np.zeros(0, dtype=np.float64),
             q_cut=q_cut,
             n_allelic=0,
@@ -484,17 +531,20 @@ def candidate_columns(
             run_len[keep],
         )
 
+    b_mass, b_exp = _delimiting_boundary(stats, cols)
     n_capped = 0
     if max_columns is not None and cols.shape[0] > max_columns:
         order = np.lexsort((cols, -run_len, -effect))[:max_columns]
         order.sort()
         n_capped = int(cols.shape[0] - max_columns)
-        cols, route, effect, eps, run_len = (
+        cols, route, effect, eps, run_len, b_mass, b_exp = (
             cols[order],
             route[order],
             effect[order],
             eps[order],
             run_len[order],
+            b_mass[order],
+            b_exp[order],
         )
 
     return CandidateSet(
@@ -504,7 +554,8 @@ def candidate_columns(
         effect=effect,
         eps=eps,
         major=stats.major[cols],
-        boundary_mass=_delimiting_mass(stats, cols),
+        boundary_mass=b_mass,
+        boundary_expected=b_exp,
         p_value=p_value[cols],
         q_cut=q_cut,
         n_allelic=int((route & ROUTE_ALLELIC).astype(bool).sum()),

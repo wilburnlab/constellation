@@ -1,4 +1,4 @@
-"""Stage 3 — M-step: consensus, haplotypes, and the ORF support gate.
+"""Stage 3 — M-step: covariance-driven template refinement.
 
 For one template and the reads the E-step assigned to it:
 
@@ -9,15 +9,22 @@ For one template and the reads the E-step assigned to it:
    ``frame_start = t_start`` and ``member_start = q_start``, and the
    soft-clipped read flanks become the end-extension candidates. Only the
    post-splice passes call edlib.
-2. **Variants**, unchanged. The existing null is already homopolymer-run-length
-   aware, which is what a 5-G run with a 22% indel rate needs.
-3. **Haplotypes** from the FDR-supported, in-core, base-substitution columns.
-4. **Per-haplotype folded consensus**, then the ORF re-predicted under a
-   support gate.
+2. **Candidate columns** (:mod:`.columns`) by allele or by coverage.
+3. **Covariance** (:mod:`.covariance`) — which of them earn a node, grouped
+   into signatures, with every read assigned to one pattern of each.
+4. **One node per observed state-tuple**, its consensus built on the pooled
+   column plan, its ORF re-predicted under a support gate.
 
 The order matters and is not obvious: the pooled PWM has to come first,
-because in round 1 there are no declared columns to group by — the columns
-come out of the variant caller.
+because in round 1 there are no declared columns to group by.
+
+**Emit by state-tuple, not per signature.** A read's label is the tuple of its
+per-signature states, and each distinct observed tuple with enough mass is one
+node. Three reasons. Every read lands in exactly one node, so
+``Σ n_reads == template total`` — the invariant quant depends on. Two
+independent signatures correctly give up to **four** templates rather than two
+marginals that double-count reads. And the tuple space is bounded by *observed*
+combinations, not ``2^k``.
 
 **The support gate.** A template's flanks are one read's sequence and carry no
 certificate, so an ORF must not silently extend through them. Certification is
@@ -28,12 +35,19 @@ seed ORF's boundary is truncated at the last certified column and flagged.
 This is only meaningful *because* the consensus kernel can now extend past the
 frame at all — before that, an ORF could never reach uncertified ground.
 
-**The minor-haplotype floor.** The spec says "≥3 reads **and** ≥1%", but 1% of
-a template with 20,000 assigned reads is 200, which discards exactly the
-~5-read minority proteoform the whole design exists to preserve. The haplotype
-columns are already FDR-gated by the context-conditional null, so the fraction
-floor is redundant at low depth and harmful at high depth: it defaults to 0.0
-here, and ``--overdispersion`` is the right instrument at high depth.
+**What is gone, and why.** ``call_variants`` and ``build_haplotypes`` are no
+longer called from this path (they are unchanged, and the components path
+still uses them). With them go ``_core_region``'s unimodal-plateau assumption,
+the indel FDR bypass, the 64-column cap, ``np.unique(A, axis=0)`` treating
+uncovered as a *symbol*, modal absorption folding unsupported rows into the
+major node distance-blind, and the ``max_r2`` vector that the pairwise test in
+:mod:`.covariance` replaces. Each of those was measured producing nodes on the
+9.4M-read run: 28.1% of minor nodes differed from their major only at
+uncovered positions, and 71.7% of the rest differed at exactly one.
+
+**No ``**kernel_kwargs``.** Every annealing knob is an explicit per-round
+argument, because a forwarded ``**kwargs`` is how ``--consensus-max-passes``
+survived as a user-facing flag that did nothing for a release.
 """
 
 from __future__ import annotations
@@ -46,24 +60,26 @@ from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
     ConsensusResult,
     MemberSpec,
     frame_consensus,
-    member_alleles,
-)
-from constellation.sequencing.transcriptome.cluster.denovo.haplotypes import (
-    build_haplotypes,
+    member_allele_events,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.orf import (
     ORF_CODON_TABLE,
     best_sense_orf,
 )
+from constellation.sequencing.transcriptome.cluster.denovo.orfem import covariance as cv
+from constellation.sequencing.transcriptome.cluster.denovo.orfem.columns import (
+    candidate_columns,
+    column_stats,
+)
 from constellation.sequencing.transcriptome.cluster.denovo.variants import (
     ErrorModel,
-    call_variants,
+    disagreement_stats,
 )
 
 
 @dataclass(slots=True)
 class RefinedTemplate:
-    """One node: a haplotype's consensus, its ORF, and its read support."""
+    """One node: a state-tuple's consensus, its ORF, and its read support."""
 
     parent_template_id: int
     haplotype_id: int
@@ -80,7 +96,14 @@ class RefinedTemplate:
     n_inserted_columns: int = 0
     n_extended_5p: int = 0
     n_extended_3p: int = 0
-    variants: list[tuple] = field(default_factory=list, repr=False)
+    n_trimmed_5p: int = 0
+    n_trimmed_3p: int = 0
+    #: Per-template diagnostics, on the major node only. Carries the
+    #: ``disagreement_stats`` the bench driver merges across round *r*'s
+    #: templates to refit round *r+1*'s error model, plus the covariance
+    #: counters ("the method returned one template" has to be visible rather
+    #: than inferred from a quiet result).
+    stats: dict = field(default_factory=dict, repr=False)
 
 
 def certified_columns(
@@ -195,46 +218,122 @@ def specs_from_assignments(
     return out
 
 
-def _haplotype_columns(
-    vrows: list[tuple], *, min_indel_reads: float = 3.0, max_columns: int = 64
-) -> list[int]:
-    """Indices of the variants allowed to define haplotypes.
 
-    ``in_core`` always applies — the ragged 5'/3' coverage ramps are length
-    classes, not alleles. On top of that a column is admitted when either:
 
-    * ``call == 'real'`` — the FDR gate against the context-conditional null,
-      which stops one error read fragmenting a clean template; or
-    * it is an **indel** carrying at least ``min_indel_reads``.
+def _child_position(cres: ConsensusResult, column: int, *, forward: bool) -> int:
+    """A PWM column's position in one child's own consensus.
 
-    That second clause is a deliberate departure from the components path,
-    which admits only base-substitution minor alleles. An in-core indel
-    changes the *reading frame*, so its consequence is categorical rather
-    than quantitative: a 1-nt deletion in a 5-G run three codons before the
-    stop bypasses the stop and reads a further ~60 residues out of the 3' UTR.
-
-    Under the **default** error model the clause is close to a no-op — the
-    prior homopolymer rate is ~1%, so a 20% deletion at depth 125 clears FDR
-    on its own (measured p ≈ 1e-24). It earns its place under
-    ``--error-model empirical``, where ε is refit from the data: the real
-    5-G run carries a ~22% indel rate, a fitted null therefore *expects* the
-    deletion, and the readthrough proteoform would be dropped as error. That
-    is the case ledger #22 names — the node must be kept and flagged, not
-    believed or deleted. The read floor keeps stray 1-2 read indels out.
+    A column dropped by that child (its state votes gap there) has no
+    position, so walk to the nearest kept neighbour in the direction the
+    caller cares about. Reusing the parent's number instead is how a boundary
+    silently slides: deleting 30 upstream bases moves an ORF end from 336 to
+    306, and certifying through 336 waves ten unsupported residues past the
+    gate.
     """
-    idx = []
-    for i, vr in enumerate(vrows):
-        if not vr[11]:  # in_core
-            continue
-        # Either allele being a gap makes it an indel: on a minority
-        # INSERTION column the major allele is the gap and the minor is a
-        # base, so keying off the minor alone reinstates exactly the
-        # insertion/deletion asymmetry the column space was built to remove.
-        is_indel = vr[2] == "-" or vr[1] == "-"
-        if vr[10] == "real" or (is_indel and vr[6] >= min_indel_reads):
-            idx.append(i)
-    idx.sort(key=lambda i: vrows[i][8])  # most significant first
-    return sorted(idx[:max_columns])
+    c_of = cres.cons_of_frame
+    n = c_of.shape[0]
+    col = int(np.clip(column, 0, n - 1))
+    step = -1 if forward else 1
+    while 0 <= col < n and c_of[col] < 0:
+        col += step
+    if not (0 <= col < n):
+        return len(cres.consensus) if forward else 0
+    return int(c_of[col])
+
+
+def _ALLELE_CHAR(v: int) -> str:
+    """One character per signature column, for the human-facing node label."""
+    if v == cv.MAJOR:
+        return "="
+    if v == cv.UNOBSERVED:
+        return "."
+    if v == cv.UNCOVERED:
+        return "~"
+    return "ACGT-"[v - 1]
+
+
+def _sig_eps(cand, signatures) -> np.ndarray:
+    """Per-column epsilon over the concatenated signature columns."""
+    if not signatures:
+        return np.zeros(0, dtype=np.float64)
+    return np.clip(
+        np.concatenate([cand.eps[s] for s in signatures]), 1e-9, 0.5 - 1e-9
+    )
+
+
+def _log_odds(eps: np.ndarray) -> np.ndarray:
+    """``log((1 − ε)/ε)`` — the per-column weight of a disagreement."""
+    return np.log((1.0 - eps) / eps) if eps.size else np.zeros(0, dtype=np.float64)
+
+
+def _support_span(cres: ConsensusResult) -> tuple[int, int]:
+    """``[lo, hi)`` of the child's consensus that its own reads cover.
+
+    A child built on the POOLED column plan still has a column for every
+    position of the parent, and ``_call_winner`` falls back to the template
+    base where nobody voted — so a node whose reads all start 200 nt in would
+    otherwise emit the parent's first 200 nt as its own reference, sequence no
+    read of that node ever supported. Trimming to the covered span is what
+    makes consensus **length** an output of the signature, and it is the
+    direct answer to references inflating without bound (mean 1,558 → 2,346 nt
+    across six rounds while their ORFs shrank).
+
+    Only the flanks are trimmed. An interior hole means the node spans two
+    disjoint regions, and splicing those together would fabricate a junction —
+    strictly worse than carrying the parent's base through it.
+    """
+    f = cres.frame_of_cons
+    if f is None or f.size == 0:
+        return 0, 0
+    covered = cres.pwm[f].sum(axis=1) > 0
+    if not covered.any():
+        return 0, 0
+    lo = int(np.argmax(covered))
+    hi = covered.shape[0] - int(np.argmax(covered[::-1]))
+    return lo, hi
+
+
+def _tuple_patterns(assignments, tuples: np.ndarray) -> np.ndarray:
+    """``(T, ΣS)`` concatenated pattern vector for each distinct state-tuple."""
+    if not assignments:
+        return np.zeros((tuples.shape[0], 0), dtype=np.int8)
+    return np.concatenate(
+        [a.patterns[tuples[:, j]] for j, a in enumerate(assignments)], axis=1
+    )
+
+
+def _fold_small_tuples(
+    keys: np.ndarray,
+    mass: np.ndarray,
+    inverse: np.ndarray,
+    patterns: np.ndarray,
+    weights: np.ndarray,
+    column_weight: np.ndarray,
+    *,
+    min_node_reads: float,
+    max_nodes: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Keep the heaviest tuples; send the rest to the nearest survivor.
+
+    "Nearest" is the same ε-weighted metric §3g assigns reads by, applied one
+    level up — which is the point of deleting modal absorption. Folding an
+    unsupported combination into the *modal* node regardless of distance is
+    what let a read that actively disagreed be counted as agreeing.
+    """
+    order = np.argsort(-mass, kind="stable")
+    survivors = [int(t) for t in order if mass[t] >= min_node_reads][:max_nodes]
+    if not survivors:
+        survivors = [int(order[0])]
+    surv = np.asarray(survivors, dtype=np.int64)
+    remap = np.empty(keys.shape[0], dtype=np.int64)
+    remap[surv] = np.arange(surv.shape[0])
+    lost = np.setdiff1d(np.arange(keys.shape[0]), surv, assume_unique=False)
+    if lost.size:
+        diff = patterns[lost][:, None, :] != patterns[surv][None, :, :]
+        remap[lost] = np.argmin(diff @ column_weight, axis=1)
+    labels = remap[inverse]
+    new_mass = np.bincount(labels, weights=weights, minlength=surv.shape[0])
+    return labels, new_mass, surv
 
 
 def refine_template(
@@ -243,192 +342,229 @@ def refine_template(
     *,
     template_id: int = 0,
     seed_orf: tuple[int, int] | None = None,
+    n_assigned: float | None = None,
     error_model: ErrorModel | None = None,
-    overdispersion: float = 0.0,
+    overdispersion: float = 0.01,
+    eps_floor: float = 0.0,
+    f_min: float = 0.02,
+    a_min: float = 3.0,
+    q_candidate: float = 0.01,
+    q_edge: float = 0.01,
+    gamma: float = 0.6,
+    local_window: int = 200,
+    boundary_tolerance: int = 10,
+    max_candidate_columns: int = 512,
+    max_state_per_read: int = 64,
+    max_nodes: int = 8,
+    min_node_reads: float = 2.0,
     min_aa_length: int = 30,
-    min_haplotype_reads: int = 3,
-    min_haplotype_frac: float = 0.0,
     support_min_depth: float = 3.0,
     support_min_agreement: float = 0.6,
-    max_haplotype_columns: int = 64,
-    **kernel_kwargs,
+    fold_insertions: bool = True,
+    min_insertion_support: float = 2.0,
+    min_extension_support: float | None = 3.0,
 ) -> list[RefinedTemplate]:
-    """Refine one template into its haplotype nodes."""
+    """Refine one template into its state-tuple nodes.
+
+    Every annealing knob is an explicit per-round argument so the round loop
+    in the bench driver can schedule them; there is no ``**kwargs`` for one to
+    hide in.
+    """
     if not members:
         return []
     model = error_model or ErrorModel()
-    pooled = frame_consensus(frame, members, frame_weight=0.0, **kernel_kwargs)
-    total_reads = float(sum(m.weight for m in members))
+    pooled = frame_consensus(
+        frame,
+        members,
+        frame_weight=0.0,
+        fold_insertions=fold_insertions,
+        min_insertion_support=min_insertion_support,
+        min_extension_support=min_extension_support,
+    )
+    w = np.array([float(m.weight) for m in members], dtype=np.float64)
+    total_reads = float(w.sum())
+
     # The seed ORF interval arrives in TEMPLATE coordinates; resolve it once
     # into the shared PWM column space, where every child can translate it
     # into its own consensus.
     t_start, t_end = seed_orf if seed_orf is not None else (0, 0)
     t_at = pooled.plan.template_at
-    seed_col_start = int(t_at[np.clip(t_start, 0, t_at.shape[0] - 1)]) if t_at.size else 0
+    seed_col_start = (
+        int(t_at[np.clip(t_start, 0, t_at.shape[0] - 1)]) if t_at.size else 0
+    )
     seed_col_end = (
         int(t_at[np.clip(t_end - 1, 0, t_at.shape[0] - 1)]) + 1 if t_at.size else 0
     )
 
-    vrows = call_variants(pooled, model=model, overdispersion=overdispersion)
-    sel = (
-        _haplotype_columns(
-            vrows,
-            min_indel_reads=min_haplotype_reads,
-            max_columns=max_haplotype_columns,
-        )
-        if vrows
-        else []
+    stats = column_stats(
+        pooled,
+        model=model,
+        n_assigned=float(n_assigned if n_assigned is not None else total_reads),
+        eps_floor=eps_floor,
+        local_window=local_window,
+        boundary_tolerance=boundary_tolerance,
+    )
+    cand = candidate_columns(
+        stats,
+        f_min=f_min,
+        a_min=a_min,
+        q_candidate=q_candidate,
+        overdispersion=overdispersion,
+        max_columns=max_candidate_columns,
     )
 
-    def _child_position(cres: ConsensusResult, column: int, *, forward: bool) -> int:
-        """A PWM column's position in one child's own consensus.
+    diag: dict = {
+        "n_reads": total_reads,
+        "n_columns": int(stats.n_columns),
+        "n_candidates": int(cand.columns.size),
+        "n_allelic": cand.n_allelic,
+        "n_coverage": cand.n_coverage,
+        "n_collapsed": cand.n_collapsed,
+        "n_candidates_capped": cand.n_capped,
+        "disagreements": disagreement_stats(pooled),
+    }
 
-        A column dropped by that child (its haplotype votes gap there) has no
-        position, so walk to the nearest kept neighbour in the direction the
-        caller cares about. Reusing the parent's number instead is how a
-        boundary silently slides: deleting 30 upstream bases moves an ORF end
-        from 336 to 306, and certifying through 336 waves ten unsupported
-        residues past the gate.
-        """
-        c_of = cres.cons_of_frame
-        n = c_of.shape[0]
-        col = int(np.clip(column, 0, n - 1))
-        step = -1 if forward else 1
-        while 0 <= col < n and c_of[col] < 0:
-            col += step
-        if not (0 <= col < n):
-            return len(cres.consensus) if forward else 0
-        return int(c_of[col])
+    signatures: list[np.ndarray] = []
+    assignments: list[cv.Assignment] = []
+    if cand.columns.size:
+        events = member_allele_events(pooled, cand.columns, major=cand.major)
+        states = cv.read_states(events, cand, w)
+        graph = cv.covariance_graph(
+            states,
+            cand,
+            q_edge=q_edge,
+            max_state_per_read=max_state_per_read,
+        )
+        diag.update(
+            n_pairs_seen=graph.n_pairs_seen,
+            n_tested_pairs=graph.n_tested,
+            n_significant_edges=graph.n_significant,
+            n_retained=int(graph.keep.sum()),
+            n_reads_capped=graph.n_reads_capped,
+            sum_k2=graph.sum_k2,
+        )
+        signatures = cv.quasi_cliques(graph, gamma=gamma)
+        assignments = [
+            cv.resolve_signature(
+                states, s, eps=cand.eps[s], a_min=a_min, max_patterns=max_nodes
+            )
+            for s in signatures
+        ]
+    diag["n_signatures"] = len(signatures)
 
-    def _node(
-        hid: int, hap_members: list[MemberSpec], allele: str, cols: np.ndarray
-    ) -> RefinedTemplate | None:
-        """``cols`` are **PWM columns** of the shared plan."""
-        # Children are built on the POOLED column plan. On their own plans
-        # each would have a different column space, and a position taken from
-        # the parent would address a different base in every child.
+    declared = (
+        np.concatenate([cand.columns[s] for s in signatures])
+        if signatures
+        else np.empty(0, dtype=np.int64)
+    )
+    declared.sort()
+
+    def _node(hid: int, idx: np.ndarray, allele: str) -> RefinedTemplate:
+        hap = [members[int(i)] for i in idx]
+        # Children are built on the POOLED column plan. On their own plans each
+        # would have a different column space, and a position taken from the
+        # parent would address a different base in every child.
         cres = (
             pooled
-            if hid == 0 and len(hap_members) == len(members)
+            if len(hap) == len(members)
             else frame_consensus(
                 frame,
-                hap_members,
+                hap,
                 frame_weight=0.0,
                 plan=pooled.plan,
-                **kernel_kwargs,
+                fold_insertions=fold_insertions,
+                min_insertion_support=min_insertion_support,
+                min_extension_support=min_extension_support,
             )
         )
         certified = certified_columns(
             cres, min_depth=support_min_depth, min_agreement=support_min_agreement
         )
+        lo, hi = _support_span(cres)
+        consensus = cres.consensus[lo:hi]
+        certified = certified[lo:hi]
         # Declared columns are PWM columns; each child reports them in its own
-        # consensus coordinates, and drops the ones it has no base for (a
+        # consensus coordinates and drops the ones it has no base for (a
         # minority insertion exists for the node that carries it and nowhere
-        # else — which is exactly the right answer).
-        child_cols = (
-            np.array(
-                [int(cres.cons_of_frame[c]) for c in cols if cres.cons_of_frame[c] >= 0],
-                dtype=np.int64,
-            )
-            if cols.size
-            else np.empty(0, dtype=np.int64)
+        # else — which is exactly the right answer), and the ones its own
+        # reads do not reach.
+        child_cols = np.array(
+            [
+                int(cres.cons_of_frame[c]) - lo
+                for c in declared
+                if lo <= cres.cons_of_frame[c] < hi
+            ],
+            dtype=np.int64,
         )
         node = RefinedTemplate(
             parent_template_id=template_id,
             haplotype_id=hid,
-            consensus=cres.consensus,
-            n_reads=int(round(sum(m.weight for m in hap_members))),
-            node_weight=float(sum(m.weight for m in hap_members)),
+            consensus=consensus,
+            n_reads=int(round(float(w[idx].sum()))),
+            node_weight=float(w[idx].sum()),
             allele_string=allele,
             declared_variants=child_cols,
             n_inserted_columns=cres.n_inserted_columns,
             n_extended_5p=cres.n_extended_5p,
             n_extended_3p=cres.n_extended_3p,
-            variants=vrows if hid == 0 else [],
+            n_trimmed_5p=lo,
+            n_trimmed_3p=len(cres.consensus) - hi,
+            stats=diag if hid == 0 else {},
         )
+        span = hi - lo
         orf = gated_orf(
-            cres.consensus,
+            consensus,
             certified,
-            seed_orf_start=_child_position(cres, seed_col_start, forward=False),
-            seed_orf_end=_child_position(cres, seed_col_end, forward=True),
+            seed_orf_start=int(
+                np.clip(_child_position(cres, seed_col_start, forward=False) - lo,
+                        0, span)
+            ),
+            seed_orf_end=int(
+                np.clip(_child_position(cres, seed_col_end, forward=True) - lo,
+                        0, span)
+            ),
             min_aa_length=min_aa_length,
         )
         if orf is not None:
-            node.protein, node.orf_start, node.orf_end, node.orf_certified_end, node.orf_is_truncated_by_support = orf
+            (
+                node.protein,
+                node.orf_start,
+                node.orf_end,
+                node.orf_certified_end,
+                node.orf_is_truncated_by_support,
+            ) = orf
         return node
 
-    if not sel:
-        return [_node(0, members, "", np.empty(0, dtype=np.int64))]
+    if not assignments:
+        diag["n_nodes"] = 1
+        return [_node(0, np.arange(len(members)), "")]
 
-    # Place every member on the selected columns and collapse to haplotypes.
-    sub = [vrows[i] for i in sel]
-    var_cons = np.array([r[0] for r in sub], dtype=np.int64)
-    # Read alleles at the PWM columns the caller reported. An insertion
-    # column has no consensus position to map back from, so going via
-    # `frame_of_cons[var_cons]` would silently address the wrong column.
-    var_frame = np.array([r[12] for r in sub], dtype=np.int64)
-    A = member_alleles(pooled, var_frame)
-    weights = [m.weight for m in members]
-    member_of_row = list(range(len(members)))
-    w = np.asarray(weights, dtype=np.float64)
-    # Phasing r² per selected column; the caller attaches it to the variant
-    # table so a reader can tell a linked allele pair from scattered error.
-    hres = build_haplotypes(
-        A,
-        w,
-        [int(x) for x in var_cons],
-        [r[2] for r in sub],
-        [r[1] for r in sub],
-    )
-
-    # Group members by their allele row, most-supported first.
-    uniq_rows, inverse = np.unique(A, axis=0, return_inverse=True)
+    # One node per observed state-tuple. Not per signature: two independent
+    # signatures give up to four templates, and two marginals would each count
+    # every read once — twice in total.
+    state = np.stack([a.labels for a in assignments], axis=1)
+    keys, inverse = np.unique(state, axis=0, return_inverse=True)
     inverse = inverse.ravel()
-    mass = np.zeros(uniq_rows.shape[0], dtype=np.float64)
-    np.add.at(mass, inverse, w)
-    ranked = np.argsort(-mass, kind="stable")
+    mass = np.bincount(inverse, weights=w, minlength=keys.shape[0])
+    labels, new_mass, surv = _fold_small_tuples(
+        keys,
+        mass,
+        inverse,
+        _tuple_patterns(assignments, keys),
+        w,
+        _log_odds(_sig_eps(cand, signatures)),
+        min_node_reads=min_node_reads,
+        max_nodes=max_nodes,
+    )
+    diag["n_nodes"] = int(surv.shape[0])
+    diag["n_tuples_observed"] = int(keys.shape[0])
 
-    keep: list[tuple[int, np.ndarray]] = []
-    absorbed: list[int] = []
-    for rank, h in enumerate(ranked.tolist()):
-        idx = np.flatnonzero(inverse == h)
-        # The most-supported haplotype is always a node; a minor one needs
-        # real support. min_haplotype_frac defaults to 0 — see the module
-        # docstring for why a 1% floor is actively harmful at depth.
-        if rank == 0 or (
-            mass[h] >= min_haplotype_reads
-            and mass[h] >= min_haplotype_frac * total_reads
-        ):
-            keep.append((h, idx))
-        else:
-            absorbed.extend(idx.tolist())
-
-    # Unsupported haplotypes fold into the major node rather than vanishing,
-    # so the node read counts still sum to the template's total.
-    if absorbed:
-        h0, idx0 = keep[0]
-        keep[0] = (h0, np.concatenate([idx0, np.asarray(absorbed, dtype=np.int64)]))
-
+    pats = _tuple_patterns(assignments, keys[surv])
+    order = np.argsort(-new_mass, kind="stable")
     out: list[RefinedTemplate] = []
-    for hid, (h, idx) in enumerate(keep):
-        allele = "".join("." if v < 0 else "ACGT-"[v] for v in uniq_rows[h])
-        out.append(
-            _node(
-                hid,
-                [members[member_of_row[int(i)]] for i in idx],
-                allele,
-                # PWM columns, NOT pooled-consensus positions: `_node` maps
-                # them into each child's own consensus, and a consensus
-                # position would silently address a different column there.
-                var_frame,
-            )
-        )
-    if out:
-        # The full variant catalogue hangs off the major node, each row
-        # carrying its phasing r² (0.0 for positions that defined no column).
-        # vr[12] is the PWM column — internal, not a table field.
-        r2_of = {i: float(hres.max_r2[j]) for j, i in enumerate(sel)}
-        out[0].variants = [(*vr[:12], r2_of.get(i, 0.0)) for i, vr in enumerate(vrows)]
+    for hid, t in enumerate(order.tolist()):
+        allele = "".join(_ALLELE_CHAR(int(v)) for v in pats[t])
+        out.append(_node(hid, np.flatnonzero(labels == t), allele))
     return out
 
 

@@ -34,7 +34,8 @@ from constellation.sequencing.transcriptome.cluster.denovo.orfem.covariance impo
 # ── builders ──────────────────────────────────────────────────────────
 
 
-def _cand(n, *, route=None, run_len=None, boundary_mass=None, eps=0.003):
+def _cand(n, *, route=None, run_len=None, boundary_mass=None,
+          boundary_expected=None, eps=0.003):
     route = np.full(n, ROUTE_ALLELIC, np.int8) if route is None else np.asarray(
         route, np.int8
     )
@@ -47,6 +48,11 @@ def _cand(n, *, route=None, run_len=None, boundary_mass=None, eps=0.003):
         major=np.zeros(n, np.int8),
         boundary_mass=(
             np.zeros(n) if boundary_mass is None else np.asarray(boundary_mass, float)
+        ),
+        boundary_expected=(
+            np.full(n, 0.5)
+            if boundary_expected is None
+            else np.asarray(boundary_expected, float)
         ),
         p_value=np.zeros(n),
         q_cut=0.01,
@@ -115,6 +121,18 @@ def test_an_indel_with_a_covarying_partner_does_become_a_node():
     assert not g.keep[[1, 3]].any()
 
 
+def test_mutual_exclusivity_is_an_edge_too():
+    """Depletion is evidence. On the synthetic fused template gene A's columns
+    and gene B's columns describe the SAME read partition from opposite sides,
+    so their co-occurrence is exactly zero — a one-sided test finds no edge,
+    they become two signatures, and the state-tuple product then re-splits the
+    template along a partition it had already made."""
+    rows = [[(0, 2)] if i < 100 else [(1, 2)] for i in range(200)]
+    g = covariance_graph(_states(rows, 2), _cand(2))
+    assert g.edges.tolist() == [[0, 1]]
+    assert g.keep.all()
+
+
 def test_independent_columns_are_not_linked():
     rng = np.random.default_rng(5)
     rows = []
@@ -129,14 +147,26 @@ def test_independent_columns_are_not_linked():
     assert g.n_significant == 0
 
 
-def test_a_small_table_is_untested_not_called():
-    """Any expected cell below 5 contributes no edge. This is what stops a
-    two-read terminal extension block — a 2-clique is a clique — from
-    spawning its own template every round."""
+def test_min_n11_is_the_floor_on_observed_co_occurrence():
+    """The floor is on observed counts, not on a chi-square approximation's
+    validity. Two co-occurrences is below ``min_n11``, so the pair is never
+    considered — and candidacy's ``a_min`` has already refused both columns
+    upstream, which is what actually stops a two-read terminal extension
+    block (a 2-clique is a clique) from spawning a template every round."""
     rows = [[(0, 2), (1, 2)] if i < 2 else [] for i in range(60)]
     g = covariance_graph(_states(rows, 2), _cand(2))
-    assert g.n_pairs_seen == 0 or g.n_tested == 0
+    assert g.n_pairs_seen == 0
     assert not g.keep.any()
+
+
+def test_a_low_frequency_linked_pair_survives():
+    """The measured cost of the chi-square expected-cell rule this replaces:
+    it demanded k >= sqrt(5n) — 51 reads of 520 — and so rejected exactly the
+    low-frequency linked proteoform the design exists to keep."""
+    rows = [[(0, 2), (1, 2)] if i < 20 else [] for i in range(520)]
+    g = covariance_graph(_states(rows, 2), _cand(2))
+    assert g.keep[[0, 1]].all()
+    assert g.p_value[0] < 1e-30
 
 
 # ── the coverage route ────────────────────────────────────────────────
@@ -195,24 +225,31 @@ def test_a_collapsed_start_mode_earns_a_self_edge():
         route=route,
         run_len=[3, 1, 1, 1, 1, 1],
         boundary_mass=[30.0, 0, 0, 0, 0, 0],
+        boundary_expected=[0.2, 0, 0, 0, 0, 0],
     )
     g = covariance_graph(_states(rows, n_v, route=route, spans=spans), cand)
     assert g.keep[0]
     assert g.edges.tolist() == [[0, 0]], "a self-edge, standing for the run"
 
 
-def test_a_ramp_boundary_carries_too_little_mass_for_a_self_edge():
-    """Same machinery, same run_len >= 2 — only the boundary mass differs.
-    2 reads of 300 give an expected cell of 0.013, so the table is untested."""
+def test_a_ramp_boundary_is_what_a_uniform_spread_would_give():
+    """Same machinery, same run_len >= 2. What separates a ramp from a mode is
+    not mass and not fraction — once endpoints are clustered, a ramp's
+    boundaries carry ~10% of the template each — but *concentration* against
+    the local endpoint density."""
     n_v = 6
     route = np.full(n_v, ROUTE_COVERAGE, np.int8)
-    rows = [[(v, UNCOVERED) for v in range(3)] if i < 2 else [] for i in range(300)]
-    spans = [(3, n_v) if i < 2 else (0, n_v) for i in range(300)]
-    cand = _cand(
-        n_v, route=route, run_len=[3, 1, 1, 1, 1, 1], boundary_mass=[2.0, 0, 0, 0, 0, 0]
-    )
-    g = covariance_graph(_states(rows, n_v, route=route, spans=spans), cand)
-    assert not g.keep.any()
+    rows = [[(v, UNCOVERED) for v in range(3)] if i < 6 else [] for i in range(60)]
+    spans = [(3, n_v) if i < 6 else (0, n_v) for i in range(60)]
+    common = dict(route=route, run_len=[3, 1, 1, 1, 1, 1],
+                  boundary_mass=[6.0, 0, 0, 0, 0, 0])
+    st = _states(rows, n_v, route=route, spans=spans)
+    # A ramp: 6 endpoints here is what the neighbourhood averages anyway.
+    ramp = _cand(n_v, boundary_expected=[6.0, 0, 0, 0, 0, 0], **common)
+    assert not covariance_graph(st, ramp).keep.any()
+    # A mode: the same 6 endpoints against a near-empty neighbourhood.
+    mode = _cand(n_v, boundary_expected=[0.05, 0, 0, 0, 0, 0], **common)
+    assert covariance_graph(st, mode).keep[0]
 
 
 def test_a_coverage_column_can_link_to_an_allelic_one():
@@ -244,7 +281,6 @@ def _graph(n_v, edges, p=1e-12):
     keep[e.ravel()] = True
     return CovarianceGraph(
         edges=e,
-        chi2=np.full(e.shape[0], 50.0),
         p_value=np.full(e.shape[0], p),
         keep=keep,
         q_cut=0.01,

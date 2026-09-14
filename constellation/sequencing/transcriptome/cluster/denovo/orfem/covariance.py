@@ -75,7 +75,7 @@ class ReadStates:
     obs_lo: np.ndarray  # (M,) int32 — first candidate index the read covers
     obs_hi: np.ndarray  # (M,) int32 — one past the last
     weight: np.ndarray  # (M,) float64
-    is_coverage: np.ndarray  # (V,) bool
+    is_coverage: np.ndarray  # (V,) bool — uncovered is a STATE at these
     n_members: int
     n_candidates: int
 
@@ -89,7 +89,6 @@ class CovarianceGraph:
     """Significant covariance edges and the columns they retain."""
 
     edges: np.ndarray  # (E, 2) int32 — u ≤ v; u == v is a collapsed-run self-edge
-    chi2: np.ndarray  # (E,) float64
     p_value: np.ndarray  # (E,) float64
     keep: np.ndarray  # (V,) bool
     q_cut: float
@@ -103,15 +102,25 @@ class CovarianceGraph:
 def read_states(events, cand: CandidateSet, weight: np.ndarray) -> ReadStates:
     """Project :class:`AlleleEvents` onto the candidate set's state alphabet.
 
-    An uncovered entry becomes a *state* at a coverage column and *missing
-    data* at an allelic one. That split is the direct fix for the 28.1% of
-    round-6 nodes (1.24M reads) that differed from their major only at
+    An uncovered entry becomes a *state* at a **pure**-coverage column and
+    *missing data* everywhere else. That split is the direct fix for the 28.1%
+    of round-6 nodes (1.24M reads) that differed from their major only at
     uncovered positions: there, missing data was a symbol everywhere, so a
-    read that said nothing manufactured a species. Here it can only speak at
-    a column selected because coverage varies there.
+    read that said nothing manufactured a species. Here it can only speak at a
+    column selected *because* coverage varies there.
+
+    "Pure" is load-bearing, and was measured. A column admitted by both routes
+    already carries the coverage fact through the collapsed pure-coverage
+    representative of the same block, so letting it speak again makes a read
+    outside a block report "I am not here" once per column of every other
+    block. On a 12 kb six-gene fused template that is 85 states per read
+    instead of ~21 — past ``max_state_per_read`` for **every** read, which
+    silently emptied the whole co-occurrence pass and left the within-block
+    allelic splits undetected. The redundancy, not the cap, was the bug.
     """
     v_cols = np.asarray(cand.columns, dtype=np.int64)
-    is_cov = (np.asarray(cand.route) & ROUTE_COVERAGE).astype(bool)
+    route = np.asarray(cand.route)
+    is_cov = ((route & ROUTE_COVERAGE) != 0) & ((route & ROUTE_ALLELIC) == 0)
     m = int(events.n_members)
 
     lo = np.searchsorted(v_cols, events.span_lo, side="left").astype(np.int32)
@@ -126,7 +135,7 @@ def read_states(events, cand: CandidateSet, weight: np.ndarray) -> ReadStates:
         nm_s = (events.nm_allele[a:b] + 1).astype(np.int8)
         c, d = events.uc_ptr[i], events.uc_ptr[i + 1]
         uc_v = events.uc_v[c:d]
-        uc_v = uc_v[is_cov[uc_v]]
+        uc_v = uc_v[is_cov[uc_v]]  # pure-coverage columns only
         vv = np.concatenate([nm_v, uc_v])
         ss = np.concatenate([nm_s, np.full(uc_v.shape[0], UNCOVERED, np.int8)])
         order = np.argsort(vv, kind="stable")
@@ -260,40 +269,125 @@ def _observation_tables(
     return d, a_tab
 
 
-def _chi2_yates(
-    n11: np.ndarray, n1x: np.ndarray, nx1: np.ndarray, n: np.ndarray, min_expected: float
-) -> tuple[np.ndarray, np.ndarray]:
-    """Vectorized 2×2 chi-square with Yates' correction.
+def _pair_pvalues(
+    n11: np.ndarray,
+    n1x: np.ndarray,
+    nx1: np.ndarray,
+    n: np.ndarray,
+    *,
+    min_expected: float = 5.0,
+    max_exact: int = 20_000,
+) -> np.ndarray:
+    """Two-sided p-values for many 2×2 tables: chi-square where its
+    approximation holds, exact hypergeometric where it does not.
 
-    Returns ``(chi2, tested)``. A table with any expected cell below
-    ``min_expected`` is **untested** and contributes no edge — the
-    conservative direction, and the reason a two-read terminal block cannot
-    spawn a template on its own.
+    An earlier draft used chi-square everywhere and declared any table with an
+    expected cell below 5 *untested*, "the conservative direction". Measured,
+    that is not conservative, it is disabling: the expected co-occurrence cell
+    is ``k²/n``, so requiring it to reach 5 demands ``k ≥ √(5n)`` — 51 reads of
+    520, 316 of 20,000. It rejects precisely the low-frequency linked
+    proteoform the pipeline exists to preserve, and only those.
 
-    Never :func:`scipy.stats.fisher_exact`: it is a scalar Python function,
-    and at 10k tested pairs per template it is pitfall #1 in the module guide
-    ("a method that does work-per-call inside a hot row loop").
+    The fix is not to test those tables with the wrong distribution but to
+    test them with the right one. The split also pays for itself: the exact
+    test costs ~51 µs per pair, so at the 512-column cap testing every pair
+    exactly is ~6.7 s **per template**, while chi-square is a vectorized
+    microsecond. Small-cell tables are the sparse co-occurring ones — bounded
+    by the co-occurrence budget, 35 of 36 on the synthetic fused fixture —
+    so the exact path stays small by construction, with ``max_exact`` as a
+    backstop that keeps the most extreme tables and leaves the rest untested.
     """
-    n = np.asarray(n, dtype=np.float64)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        e11 = n1x * nx1 / n
-        e10 = n1x * (n - nx1) / n
-        e01 = (n - n1x) * nx1 / n
-        e00 = (n - n1x) * (n - nx1) / n
-        tested = (
-            (n > 0)
-            & (e11 >= min_expected)
-            & (e10 >= min_expected)
-            & (e01 >= min_expected)
-            & (e00 >= min_expected)
+    e11 = n1x * nx1 / n
+    e10 = n1x * (n - nx1) / n
+    e01 = (n - n1x) * nx1 / n
+    e00 = (n - n1x) * (n - nx1) / n
+    valid = (n > 0) & (n1x > 0) & (nx1 > 0) & (n1x < n) & (nx1 < n)
+    big = valid & (
+        (e11 >= min_expected)
+        & (e10 >= min_expected)
+        & (e01 >= min_expected)
+        & (e00 >= min_expected)
+    )
+    out = np.ones(n.shape[0], dtype=np.float64)
+    if big.any():
+        from scipy import stats
+
+        n10 = n1x[big] - n11[big]
+        n01 = nx1[big] - n11[big]
+        n00 = n[big] - n1x[big] - nx1[big] + n11[big]
+        num = (
+            np.maximum(
+                np.abs(n11[big] * n00 - n10 * n01) - n[big] / 2.0, 0.0
+            )
+            ** 2
         )
-        n10 = n1x - n11
-        n01 = nx1 - n11
-        n00 = n - n1x - nx1 + n11
-        num = np.maximum(np.abs(n11 * n00 - n10 * n01) - n / 2.0, 0.0) ** 2
-        den = n1x * (n - n1x) * nx1 * (n - nx1)
-        chi2 = np.where(tested & (den > 0), n * num / np.where(den > 0, den, 1.0), 0.0)
-    return chi2, tested
+        den = n1x[big] * (n[big] - n1x[big]) * nx1[big] * (n[big] - nx1[big])
+        out[big] = stats.chi2.sf(n[big] * num / den, 1)
+
+    small = np.flatnonzero(valid & ~big)
+    if small.size > max_exact:
+        extreme = np.abs(n11[small] - e11[small])
+        small = small[np.argsort(-extreme, kind="stable")[:max_exact]]
+    if small.size:
+        out[small] = _fisher_sf(
+            n11[small], n1x[small], nx1[small], n[small]
+        )
+    return out
+
+
+def _fisher_sf(
+    n11: np.ndarray, n1x: np.ndarray, nx1: np.ndarray, n: np.ndarray
+) -> np.ndarray:
+    """Two-sided Fisher exact p-values for many 2×2 tables at once.
+
+    ``scipy.stats.hypergeom.sf`` **is** the one-sided Fisher test and it is a
+    vectorized ufunc, so this never becomes the scalar
+    ``scipy.stats.fisher_exact`` in a hot row loop — pitfall #1 in the module
+    guide, and at 10k pairs per template it would dominate the M-step.
+
+    The test is **two-sided**, because depletion is evidence too. Measured on
+    the synthetic fused template: gene A's columns and gene B's columns encode
+    the same read partition from opposite sides, so a read non-major at one is
+    never non-major at the other and their co-occurrence is exactly zero. A
+    one-sided test finds no edge, the two column sets become two separate
+    signatures, and the state-tuple product then re-splits the template along
+    a partition it had already made — emitting a spurious node for every
+    disagreement between two descriptions of the same thing.
+
+    Weights are read multiplicities, so they are rounded to integers here.
+    """
+    from scipy import stats
+
+    nn = np.rint(n).astype(np.int64)
+    a = np.rint(n1x).astype(np.int64)
+    b = np.rint(nx1).astype(np.int64)
+    k = np.rint(n11).astype(np.int64)
+    ok = (nn > 0) & (a > 0) & (b > 0) & (a <= nn) & (b <= nn)
+    out = np.ones(nn.shape[0], dtype=np.float64)
+    if ok.any():
+        upper = stats.hypergeom.sf(k[ok] - 1, nn[ok], a[ok], b[ok])
+        lower = stats.hypergeom.cdf(k[ok], nn[ok], a[ok], b[ok])
+        out[ok] = np.clip(2.0 * np.minimum(upper, lower), 0.0, 1.0)
+    return out
+
+
+def _mode_sf(mass: np.ndarray, expected: np.ndarray) -> np.ndarray:
+    """Is this boundary a *mode*, or what a locally uniform spread would give?
+
+    A collapsed coverage representative does not pose a question about
+    association — run collapse already proved its columns are identical. The
+    question is whether the boundary delimiting it is real, and the thing that
+    separates an alternative transcription start from a degradation ramp is
+    not mass and not fraction (measured, a ramp's boundaries carry 10% of the
+    template each once endpoints are clustered) but *concentration*: a ramp
+    scatters endpoints evenly across its support, a mode piles them at one
+    position. So the null is "endpoints are uniform within ±``local_window``"
+    and the statistic is a Poisson upper tail against that local density.
+    """
+    from scipy import stats
+
+    lam = np.maximum(np.asarray(expected, dtype=np.float64), 1e-9)
+    return stats.poisson.sf(np.rint(mass).astype(np.int64) - 1, lam)
 
 
 def covariance_graph(
@@ -302,17 +396,21 @@ def covariance_graph(
     *,
     q_edge: float = 0.01,
     min_n11: float = 3.0,
-    min_expected: float = 5.0,
+    min_mode_mass: float = 3.0,
     max_state_per_read: int = 64,
 ) -> CovarianceGraph:
     """Test every co-occurring candidate pair and retain what earns an edge."""
     n_v = states.n_candidates
     route = np.asarray(cand.route)
-    is_cov = (route & ROUTE_COVERAGE).astype(bool)
     is_all = (route & ROUTE_ALLELIC).astype(bool)
+    # A dual-route column speaks only through its allele here; its coverage
+    # half is already carried by the block's collapsed pure-coverage
+    # representative. `is_cov` therefore means "uncovered is a state", which
+    # is what both the observation counts and `read_states` use.
+    pure_cov = ((route & ROUTE_COVERAGE) != 0) & ~is_all
+    is_cov = pure_cov
     active = np.ones(states.n_members, dtype=bool)
 
-    pure_cov = is_cov & ~is_all
     n11, deg_w, n_capped, sum_k2 = _cooccurrence(
         states, active, max_state_per_read, pure_cov
     )
@@ -320,32 +418,37 @@ def covariance_graph(
     total_w = float(states.weight[active].sum())
 
     uu, vv = np.triu_indices(n_v, 1)
-    seen = n11[uu, vv] >= min_n11
-    # A pair of pure-coverage columns is excluded, not thresholded: coverage
-    # is an interval, so nested uncovered sets make the test significant
-    # whether or not anything latent is there. See the module docstring.
+    # "Observes" means covered at an allelic column and unconditional at a
+    # coverage column, so the co-observed set is an intersection of the two.
+    k11 = n11[uu, vv]
+    n1x = np.where(is_cov[vv], deg_w[uu], a_tab[uu, vv])
+    nx1 = np.where(is_cov[uu], deg_w[vv], a_tab[vv, uu])
+    n_obs = np.where(
+        is_cov[uu] & is_cov[vv],
+        total_w,
+        np.where(
+            is_cov[uu],
+            d_tab[vv, vv],
+            np.where(is_cov[vv], d_tab[uu, uu], d_tab[uu, vv]),
+        ),
+    )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        expect = np.where(n_obs > 0, n1x * nx1 / np.maximum(n_obs, 1e-12), 0.0)
+    # Either tail is evidence, so a pair qualifies on observed co-occurrence
+    # OR on having enough expected co-occurrence for its absence to mean
+    # something. A pair of pure-coverage columns is excluded outright, not
+    # thresholded: coverage is an interval, so nested uncovered sets make the
+    # test significant whether or not anything latent is there.
+    seen = (k11 >= min_n11) | (expect >= min_n11)
     seen &= ~(pure_cov[uu] & pure_cov[vv])
     uu, vv = uu[seen], vv[seen]
     n_pairs_seen = int(seen.sum())
 
     if uu.size:
-        k11 = n11[uu, vv]
-        # "Observes" means covered at an allelic column and unconditional at a
-        # coverage column, so the co-observed set is an intersection of the two.
-        n1x = np.where(is_cov[vv], deg_w[uu], a_tab[uu, vv])
-        nx1 = np.where(is_cov[uu], deg_w[vv], a_tab[vv, uu])
-        n_obs = np.where(
-            is_cov[uu] & is_cov[vv],
-            total_w,
-            np.where(
-                is_cov[uu],
-                d_tab[vv, vv],
-                np.where(is_cov[vv], d_tab[uu, uu], d_tab[uu, vv]),
-            ),
-        )
-        chi2_p, tested_p = _chi2_yates(k11, n1x, nx1, n_obs, min_expected)
+        p_pair = _pair_pvalues(k11[seen], n1x[seen], nx1[seen], n_obs[seen])
+        tested_p = np.ones(p_pair.shape[0], dtype=bool)
     else:
-        chi2_p = np.zeros(0)
+        p_pair = np.zeros(0)
         tested_p = np.zeros(0, dtype=bool)
 
     # Collapsed coverage runs: the representative already stands for a clique
@@ -356,15 +459,13 @@ def covariance_graph(
     self_v = np.flatnonzero(pure_cov & (np.asarray(cand.run_len) >= 2))
     if self_v.size:
         k = np.asarray(cand.boundary_mass, dtype=np.float64)[self_v]
-        nn = np.full(self_v.shape[0], total_w)
-        chi2_s, tested_s = _chi2_yates(k, k, k, nn, min_expected)
+        p_self = _mode_sf(k, np.asarray(cand.boundary_expected)[self_v])
+        tested_s = k >= min_mode_mass
     else:
-        chi2_s = np.zeros(0)
+        p_self = np.zeros(0)
         tested_s = np.zeros(0, dtype=bool)
 
-    from scipy import stats
-
-    chi2 = np.concatenate([chi2_p, chi2_s])
+    pvals = np.concatenate([p_pair, p_self])
     tested = np.concatenate([tested_p, tested_s])
     eu = np.concatenate([uu, self_v]).astype(np.int32)
     ev = np.concatenate([vv, self_v]).astype(np.int32)
@@ -374,7 +475,6 @@ def covariance_graph(
     if t_idx.size == 0:
         return CovarianceGraph(
             edges=np.zeros((0, 2), np.int32),
-            chi2=np.zeros(0),
             p_value=np.zeros(0),
             keep=keep,
             q_cut=-1.0,
@@ -384,14 +484,13 @@ def covariance_graph(
             n_reads_capped=n_capped,
             sum_k2=sum_k2,
         )
-    p = stats.chi2.sf(chi2[t_idx], 1)
+    p = pvals[t_idx]
     sig, q_cut = benjamini_hochberg(p, q_edge)
     hit = t_idx[sig]
     keep[eu[hit]] = True
     keep[ev[hit]] = True
     return CovarianceGraph(
         edges=np.stack([eu[hit], ev[hit]], axis=1),
-        chi2=chi2[hit],
         p_value=p[sig],
         keep=keep,
         q_cut=q_cut,

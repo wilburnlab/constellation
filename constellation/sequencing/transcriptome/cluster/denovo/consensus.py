@@ -488,6 +488,7 @@ def plan_columns(
     n_template: int,
     *,
     min_support: float = 2.0,
+    terminal_min_support: float | None = None,
     max_block: int | None = None,
 ) -> ColumnPlan:
     """Size the insertion block at every junction from the members' CIGARs.
@@ -499,6 +500,15 @@ def plan_columns(
     insertion no template explains fails the E-step's band and spawns its own
     template rather than quietly widening someone else's. ``max_block`` is a
     belt-and-braces cap and is normally ``None``.
+
+    ``terminal_min_support`` (default: same as ``min_support``) is a separate,
+    higher floor for the two **terminal** junctions. Those are enfranchised
+    differently — ``_covers_junction`` lets only reads anchored at that end
+    vote, measured at 191 of 324 members on a real cluster — so two reads of
+    *enfranchised* weight can reserve a terminal block. Under covariance those
+    two columns then covary with each other (a 2-clique is a clique) and spawn
+    their own template every round: template *explosion* where the pre-existing
+    failure was template *inflation*.
     """
     width = np.zeros(n_template + 1, dtype=np.int64)
     if projections:
@@ -507,13 +517,15 @@ def plan_columns(
             for j, c in _member_events(proj, codes, n_template):
                 if 0 <= j <= n_template and _covers_junction(proj, j, n_template):
                     by_junction.setdefault(j, []).append((int(c.size), float(w)))
+        term = min_support if terminal_min_support is None else terminal_min_support
         for j, evs in by_junction.items():
+            need = min_support if 0 < j < n_template else term
             lengths = np.array([ln for ln, _ in evs], dtype=np.int64)
             weights = np.array([w for _, w in evs], dtype=np.float64)
             order = np.argsort(-lengths)
             # support(L) = weight of every event at least L long.
             cum = np.cumsum(weights[order])
-            ok = np.flatnonzero(cum >= min_support)
+            ok = np.flatnonzero(cum >= need)
             if ok.size:
                 width[j] = int(lengths[order][ok[0]])
         if max_block is not None:
@@ -664,6 +676,7 @@ def frame_consensus(
     frame_weight: float = 0.0,
     fold_insertions: bool = True,
     min_insertion_support: float = 2.0,
+    min_extension_support: float | None = None,
     max_insertion_block: int | None = None,
     template_of_frame: np.ndarray | None = None,
     plan: "ColumnPlan | None" = None,
@@ -731,6 +744,7 @@ def frame_consensus(
             codes_of,
             n_template,
             min_support=min_insertion_support,
+            terminal_min_support=min_extension_support,
             max_block=max_insertion_block,
         )
         if fold_insertions
