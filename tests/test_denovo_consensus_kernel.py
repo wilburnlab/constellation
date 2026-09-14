@@ -487,6 +487,51 @@ def test_member_spans_bracket_every_covered_column():
         assert hi[i] > covered.max(), "span must end after coverage"
 
 
+# ── PWM mass accounting ───────────────────────────────────────────────
+
+
+def test_pwm_base_mass_is_less_than_read_mass_for_stated_reasons():
+    """``pwm[:, :4].sum()`` is NOT the total base content of the members, and
+    the shortfall has to be intentional rather than incidental.
+
+    Three causes, all by design, measured at 0.62% on the real run (79%
+    soft-clipped flank, 18% sub-support insertions, 2% truncation):
+
+    1. a read base outside the planned column space votes nowhere — a flank no
+       block was reserved for has no column to vote in;
+    2. an insertion carried by less than ``min_insertion_support`` reserves no
+       block, so those bases are dropped;
+    3. an ambiguous base is no evidence and is not counted as a gap either.
+
+    What must NOT happen is base mass appearing from nowhere, because
+    ``variants.py`` uses the column sums as its binomial ``n``. This pins the
+    inequality and attributes the gap.
+    """
+    rng = np.random.default_rng(101)
+    truth = _rand(rng, 600)
+    members = [truth] * 10
+    # (1) a 40 nt 5' flank carried by ONE read: below min_insertion_support, so
+    #     no terminal block is reserved and those 40 bases vote nowhere.
+    members.append(_rand(rng, 40) + truth)
+    # (2) a 5 nt interior insertion carried by one read: same rule, interior.
+    members.append(truth[:300] + _rand(rng, 5) + truth[300:])
+    frame = truth
+    res = frame_consensus(frame, _specs(frame, members))
+
+    read_mass = float(sum(len(m) for m in members))
+    base_mass = float(res.pwm[:, :4].sum())
+    assert base_mass < read_mass, "votes must never exceed the bases cast"
+    # Exactly the planted unsupported bases, and nothing else.
+    assert res.n_columns_planned == len(frame), "no block was reserved"
+    assert read_mass - base_mass == pytest.approx(45.0), "40 nt flank + 5 nt insert"
+
+    # Raise the support floor's electorate instead and the flank comes back.
+    with_support = frame_consensus(
+        frame, _specs(frame, members + [_rand(rng, 40) + truth])
+    )
+    assert with_support.n_columns_planned > len(frame)
+
+
 # ── the kwargs surface is closed ──────────────────────────────────────
 
 
