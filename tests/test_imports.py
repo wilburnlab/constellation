@@ -213,6 +213,7 @@ import constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool
 import constellation.sequencing.transcriptome.cluster.denovo.em.likelihood
 import constellation.sequencing.transcriptome.cluster.denovo.em.paf_scan
 import constellation.sequencing.transcriptome.cluster.denovo.em.refine
+import constellation.sequencing.transcriptome.cluster.denovo.em.rounds
 import constellation.sequencing.transcriptome.cluster.denovo.em.scheduler
 import constellation.sequencing.transcriptome.cluster.denovo.em.templates
 import constellation.sequencing.transcriptome.cluster.denovo.em.seed

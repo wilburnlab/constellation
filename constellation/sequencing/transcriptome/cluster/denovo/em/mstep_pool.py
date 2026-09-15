@@ -33,6 +33,7 @@ exception.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -272,10 +273,165 @@ def sort_assignments_by_template(assignments: pa.Table) -> tuple[pa.Table, np.nd
     return srt, starts
 
 
+# Per-process handles, opened on first use and reused. A forked worker
+# inherits an empty dict and mmaps for itself, so nothing large is pickled and
+# nothing depends on the start method.
+_OPEN: dict[str, object] = {}
+
+
+def _reads(path: str):
+    key = f"reads:{path}"
+    if key not in _OPEN:
+        from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
+            ReadStore,
+        )
+
+        _OPEN[key] = ReadStore.open(path)
+    return _OPEN[key]
+
+
+def _templates(path: str):
+    key = f"templates:{path}"
+    if key not in _OPEN:
+        from constellation.sequencing.transcriptome.cluster.denovo.em.templates import (
+            TemplateStore,
+        )
+
+        _OPEN[key] = TemplateStore.open(path)
+    return _OPEN[key]
+
+
+def mstep_worker(
+    batch: pa.Table,
+    *,
+    corpus_path: str,
+    templates_path: str,
+    round_index: int,
+    params: "MStepParams",
+    error_model=None,
+) -> dict[str, pa.Table]:
+    """Refine every template in one unit. Module-level, so it pickles by name.
+
+    ``batch`` is this unit's slice of the template-sorted assignment table.
+    Nothing else crosses the process boundary: the corpus and the templates
+    are mmapped here.
+
+    **No torch below this line.** The parent has already spawned torch's
+    thread pool during minimizer extraction, and a torch op after ``fork()``
+    deadlocks on OpenMP — a silent hang, not an exception. The kernels this
+    calls (consensus / columns / covariance) are numpy-only by design.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        refine_template,
+    )
+
+    reads = _reads(corpus_path)
+    store = _templates(templates_path)
+    if batch.num_rows == 0:
+        return {"nodes": REFINED_NODE_TABLE.empty_table()}
+
+    tr = batch.column("template_row").to_numpy(zero_copy_only=False)
+    starts = np.flatnonzero(np.concatenate([[True], tr[1:] != tr[:-1]]))
+    bounds = np.concatenate([starts, [batch.num_rows]])
+
+    rows: list[tuple] = []
+    for i in range(starts.size):
+        lo, hi = int(bounds[i]), int(bounds[i + 1])
+        row = int(tr[lo])
+        members, fraction = specs_from_assignment_slice(
+            batch.slice(lo, hi - lo),
+            reads,
+            max_members=params.max_members_per_template,
+        )
+        if not members:
+            continue
+        orf = (int(store.orf_start[row]), int(store.orf_end[row]))
+        try:
+            nodes = refine_template(
+                store.sequence(row),
+                members,
+                template_id=int(store.template_id[row]),
+                seed_orf=orf,
+                n_assigned=float(sum(m.weight for m in members)),
+                error_model=error_model,
+                **params.kernel_kwargs(),
+            )
+        except Exception:  # noqa: BLE001 — one bad template must not kill a unit
+            continue
+        scale = 1.0 / fraction if fraction > 0 else 1.0
+        for node in nodes:
+            rows.append(
+                _node_row(node, row, round_index, len(members), fraction, scale)
+            )
+
+    return {"nodes": _rows_to_nodes(rows)}
+
+
+def _node_row(node, parent_row, round_index, n_members, fraction, scale) -> tuple:
+    return (
+        int(round_index),
+        int(node.parent_template_id),
+        int(parent_row),
+        int(node.haplotype_id),
+        node.consensus,
+        int(node.n_reads),
+        # Scaled back up when the member cap subsampled, so quant stays on the
+        # real read mass rather than on the sampled mass.
+        float(node.node_weight) * scale,
+        node.protein or None,
+        int(node.orf_start),
+        int(node.orf_end),
+        int(node.orf_certified_end),
+        bool(node.orf_is_truncated_by_support),
+        node.allele_string,
+        [int(v) for v in np.asarray(node.declared_variants).tolist()],
+        int(node.n_inserted_columns),
+        int(node.n_extended_5p),
+        int(node.n_extended_3p),
+        int(node.n_trimmed_5p),
+        int(node.n_trimmed_3p),
+        int(n_members),
+        float(fraction),
+    )
+
+
+def _rows_to_nodes(rows: list[tuple]) -> pa.Table:
+    if not rows:
+        return REFINED_NODE_TABLE.empty_table()
+    cols = list(zip(*rows))
+    return pa.table(
+        {
+            f.name: pa.array(cols[i], type=f.type)
+            for i, f in enumerate(REFINED_NODE_TABLE)
+        },
+        schema=REFINED_NODE_TABLE,
+    )
+
+
+def iter_unit_batches(
+    sorted_assignments: pa.Table, units: list[MStepUnit]
+) -> Iterator[pa.Table]:
+    """One ``pa.Table`` per unit, largest first.
+
+    Yielded lazily so ``run_batched``'s bounded in-flight window backpressures
+    the iterator instead of the whole round's slices existing at once.
+    """
+    for unit in units:
+        pieces = [
+            sorted_assignments.slice(int(lo), int(hi - lo))
+            for lo, hi in zip(unit.row_lo, unit.row_hi)
+            if hi > lo
+        ]
+        if pieces:
+            yield pa.concat_tables(pieces)
+
+
 __all__ = [
     "REFINED_NODE_TABLE",
     "MStepParams",
     "MStepUnit",
+    "iter_unit_batches",
+    "mstep_worker",
     "plan_mstep_units",
     "sort_assignments_by_template",
     "specs_from_assignment_slice",
