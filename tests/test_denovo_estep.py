@@ -216,8 +216,37 @@ def test_assign_reads_drops_antisense_hits():
     )
     aln, _ = assign_reads(_batches(raw), _templates())
     assert aln.column("read_id").to_pylist() == ["r2"]
-    aln, _ = assign_reads(_batches(raw), _templates(), allow_antisense=True)
-    assert sorted(aln.column("read_id").to_pylist()) == ["r1", "r2"]
+    # There is no opt-in. `allow_antisense=True` used to admit the hit and
+    # then hand `specs_from_assignments` a reverse-complement CIGAR paired
+    # with a forward member_seq, so a hit supporting GGGG voted CCCC into the
+    # PWM. Supporting antisense means reverse-complementing the read and
+    # recomputing the offsets, which nothing on this path does.
+    with pytest.raises(TypeError):
+        assign_reads(_batches(raw), _templates(), allow_antisense=True)
+
+
+def test_a_multipart_index_is_refused_rather_than_double_counted():
+    """minimap2 applies -p/-N and the primary call WITHIN each index part, so
+    a read is emitted once per part and its mass counted more than once. The
+    template-bases ceiling bounds the reference, not the -I setting."""
+    from constellation.sequencing.transcriptome.cluster.denovo.orfem.estep import (
+        _parse_size,
+        run_estep,
+    )
+
+    assert _parse_size("16G") == 16 * 10**9
+    assert _parse_size("1K") == 1000
+    assert _parse_size("4m") == 4 * 10**6
+    assert _parse_size("512") == 512
+
+    templates = _templates()
+    with pytest.raises(ValueError, match="multi-part index"):
+        run_estep(
+            reads_fasta="unused.fa",
+            templates=templates,
+            work_dir="unused",
+            index_batch_size="1K",
+        )
 
 
 def test_assign_reads_records_offset_and_contest():

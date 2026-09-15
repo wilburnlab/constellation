@@ -35,7 +35,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.orfem.covariance impo
 
 
 def _cand(n, *, route=None, run_len=None, boundary_mass=None,
-          boundary_expected=None, eps=0.003):
+          boundary_expected=None, effect=None, eps=0.003):
     route = np.full(n, ROUTE_ALLELIC, np.int8) if route is None else np.asarray(
         route, np.int8
     )
@@ -43,7 +43,7 @@ def _cand(n, *, route=None, run_len=None, boundary_mass=None,
         columns=np.arange(n, dtype=np.int64),
         route=route,
         run_len=np.ones(n, np.int32) if run_len is None else np.asarray(run_len, np.int32),
-        effect=np.full(n, 0.5),
+        effect=(np.full(n, 0.5) if effect is None else np.asarray(effect, float)),
         eps=np.full(n, eps),
         major=np.zeros(n, np.int8),
         boundary_mass=(
@@ -145,6 +145,42 @@ def test_independent_columns_are_not_linked():
         rows.append(r)
     g = covariance_graph(_states(rows, 2), _cand(2))
     assert g.n_significant == 0
+
+
+def test_one_population_for_numerator_marginals_and_denominator():
+    """Columns 0 and 1 are exactly independent; columns 2.. are junk carried
+    only by the reads that carry both. Censoring reads by their state count,
+    in the numerator but not the marginals, made that pair significant at
+    p = 4e-88 through the depletion tail. The budget control drops columns
+    instead, which leaves every read's contribution comparable."""
+    n_junk = 8
+    rows = []
+    for i in range(400):
+        r = []
+        a, b = i % 2 == 0, (i // 2) % 2 == 0
+        if a:
+            r.append((0, 2))
+        if b:
+            r.append((1, 2))
+        if a and b:
+            r += [(2 + j, 2) for j in range(n_junk)]
+        rows.append(r)
+    st = _states(rows, 2 + n_junk)
+    g = covariance_graph(st, _cand(2 + n_junk))
+    assert (0, 1) not in [tuple(e) for e in g.edges.tolist()]
+
+
+def test_the_budget_drops_columns_never_reads():
+    """A budget so small only the highest-effect columns survive. Reads are
+    never censored, so the surviving pair is still tested on the whole
+    population."""
+    rows = [[(0, 2), (1, 2)] if i < 40 else [] for i in range(200)]
+    cand = _cand(4, effect=[1.0, 0.9, 0.1, 0.1])
+    g = covariance_graph(_states(rows, 4), cand, max_cooccurrence_budget=1e12)
+    assert g.n_columns_dropped == 0
+    tiny = covariance_graph(_states(rows, 4), cand, max_cooccurrence_budget=1)
+    assert tiny.n_columns_dropped > 0
+    assert not tiny.keep.any(), "no budget, no edges — but no biased ones either"
 
 
 def test_min_n11_is_the_floor_on_observed_co_occurrence():
@@ -287,7 +323,7 @@ def _graph(n_v, edges, p=1e-12):
         n_pairs_seen=e.shape[0],
         n_tested=e.shape[0],
         n_significant=e.shape[0],
-        n_reads_capped=0,
+        n_columns_dropped=0,
         sum_k2=0,
     )
 
@@ -434,3 +470,65 @@ def test_an_unreliable_column_is_discounted_not_excluded():
     w = np.log((1 - eps) / eps)
     assert w[0] > 4 * w[1], "one substitution outweighs four homopolymers"
     assert a.patterns.shape[0] >= 2
+
+
+# ── pattern seeding must be a metric, not exact matching ──────────────
+
+
+def _noisy_rows(n_major, n_minor, n_cols, n_err, seed):
+    """A clean biallelic split plus `n_err` independent flips per read, ON the
+    signature's own columns — so no two reads share an exact row."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for i in range(n_major + n_minor):
+        base = {} if i < n_major else {c: 2 for c in range(n_cols)}
+        for c in rng.choice(n_cols, n_err, replace=False):
+            c = int(c)
+            base[c] = 2 if c not in base else 3  # flip away from this read's own state
+        rows.append(sorted(base.items()))
+    return rows
+
+
+@pytest.mark.parametrize("n_err", [0, 1, 2, 3])
+def test_a_minority_survives_noise_on_its_own_signature_columns(n_err):
+    """Exact-row seeding was unstable in both directions here: at one error
+    per read it shattered the major population into spurious nodes, at two it
+    found no qualifying row and emitted one node of everything. A metric has
+    no "matches nothing" case at either level."""
+    rows = _noisy_rows(100, 40, 24, n_err, seed=11 + n_err)
+    st = _states(rows, 24)
+    a = resolve_signature(st, np.arange(24), eps=np.full(24, 0.003))
+    assert a.patterns.shape[0] == 2, f"{n_err} errors/read"
+    assert sorted(a.mass.tolist()) == [40.0, 100.0]
+
+
+def test_independent_noise_does_not_spawn_patterns():
+    """The BIC guard. Six reads sharing one flipped column gain ~35 nats
+    against a ~123-nat penalty, so the pattern is refused — where a bare mass
+    floor of 3 would have kept it."""
+    rng = np.random.default_rng(13)
+    rows = []
+    for _ in range(140):
+        r = {int(c): 2 for c in rng.choice(24, 1, replace=False)}
+        rows.append(sorted(r.items()))
+    a = resolve_signature(_states(rows, 24), np.arange(24), eps=np.full(24, 0.003))
+    assert a.patterns.shape[0] == 1
+    assert a.mass[0] == pytest.approx(140.0)
+
+
+def test_a_three_read_minority_over_many_columns_is_kept():
+    """BIC scales with the evidence, not the count: three reads differing at
+    24 columns gain ~836 nats against the same ~123-nat penalty. The read
+    floor this replaces could not express that."""
+    rows = [[(c, 2) for c in range(24)] if i < 3 else [] for i in range(140)]
+    a = resolve_signature(_states(rows, 24), np.arange(24), eps=np.full(24, 0.003))
+    assert a.patterns.shape[0] == 2
+    assert sorted(a.mass.tolist()) == [3.0, 137.0]
+
+
+def test_pattern_penalty_is_the_annealing_knob():
+    rows = _noisy_rows(100, 40, 24, 1, seed=17)
+    st, cols, eps = _states(rows, 24), np.arange(24), np.full(24, 0.003)
+    assert resolve_signature(st, cols, eps=eps).patterns.shape[0] == 2
+    strict = resolve_signature(st, cols, eps=eps, pattern_penalty=500.0)
+    assert strict.patterns.shape[0] == 1, "a heavy penalty refuses to split"

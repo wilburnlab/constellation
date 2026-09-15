@@ -360,7 +360,7 @@ def refine_template(
     local_window: int = 200,
     boundary_tolerance: int = 10,
     max_candidate_columns: int = 512,
-    max_state_per_read: int = 64,
+    max_cooccurrence_budget: float = 2e8,
     max_nodes: int = 8,
     min_node_reads: float = 2.0,
     min_aa_length: int = 30,
@@ -439,14 +439,14 @@ def refine_template(
             states,
             cand,
             q_edge=q_edge,
-            max_state_per_read=max_state_per_read,
+            max_cooccurrence_budget=max_cooccurrence_budget,
         )
         diag.update(
             n_pairs_seen=graph.n_pairs_seen,
             n_tested_pairs=graph.n_tested,
             n_significant_edges=graph.n_significant,
             n_retained=int(graph.keep.sum()),
-            n_reads_capped=graph.n_reads_capped,
+            n_columns_dropped=graph.n_columns_dropped,
             sum_k2=graph.sum_k2,
         )
         signatures = cv.quasi_cliques(graph, gamma=gamma)

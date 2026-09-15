@@ -95,7 +95,7 @@ class CovarianceGraph:
     n_pairs_seen: int  # pairs with any co-occurrence at all
     n_tested: int  # size of the BH family
     n_significant: int
-    n_reads_capped: int  # excluded from the pass by max_state_per_read
+    n_columns_dropped: int  # lowest-effect columns dropped to fit the budget
     sum_k2: int  # Sigma k_i^2 actually spent by the co-occurrence pass
 
 
@@ -114,7 +114,7 @@ def read_states(events, cand: CandidateSet, weight: np.ndarray) -> ReadStates:
     representative of the same block, so letting it speak again makes a read
     outside a block report "I am not here" once per column of every other
     block. On a 12 kb six-gene fused template that is 85 states per read
-    instead of ~21 — past ``max_state_per_read`` for **every** read, which
+    instead of ~21 — past the old per-read state cap for **every** read, which
     silently emptied the whole co-occurrence pass and left the within-block
     allelic splits undetected. The redundancy, not the cap, was the bug.
     """
@@ -135,7 +135,15 @@ def read_states(events, cand: CandidateSet, weight: np.ndarray) -> ReadStates:
         nm_s = (events.nm_allele[a:b] + 1).astype(np.int8)
         c, d = events.uc_ptr[i], events.uc_ptr[i + 1]
         uc_v = events.uc_v[c:d]
-        uc_v = uc_v[is_cov[uc_v]]  # pure-coverage columns only
+        # The allele reader writes -1 for two different things: a column
+        # outside the read's alignment span, and an ambiguous base INSIDE it.
+        # Only the first is absence. Without the span test an internal N made
+        # a read say "I am not here" at a coverage column while it demonstrably
+        # was, which is evidence for a coverage split manufactured out of a
+        # basecall. An in-span ambiguity at a coverage column is therefore
+        # simply presence (MAJOR).
+        outside = (uc_v < lo[i]) | (uc_v >= hi[i])
+        uc_v = uc_v[is_cov[uc_v] & outside]  # pure-coverage, genuinely absent
         vv = np.concatenate([nm_v, uc_v])
         ss = np.concatenate([nm_s, np.full(uc_v.shape[0], UNCOVERED, np.int8)])
         order = np.argsort(vv, kind="stable")
@@ -163,10 +171,10 @@ def read_states(events, cand: CandidateSet, weight: np.ndarray) -> ReadStates:
 def _cooccurrence(
     states: ReadStates,
     active: np.ndarray,
-    max_state_per_read: int,
     pure_cov: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, int, int]:
-    """``(n11, deg_w, n_capped, budget)`` over reads within the state cap.
+    column_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """``(n11, deg_w, budget)`` over the ``active`` reads.
 
     ``n11`` is ``Aᵀ·diag(w)·A`` over the sparse non-major indicator, which
     touches only pairs that actually co-occur and never the ``V²`` that do
@@ -176,28 +184,33 @@ def _cooccurrence(
     column — skipping it takes the co-occurrence budget from 257,273 to 0 on
     the 300-read synthetic fixture, rather than spending it to test nothing.
 
-    ``max_state_per_read`` is a diagnostic escape hatch, not a design element.
-    A read excluded here is still assigned; it just does not vote on which
-    columns are linked. It exists because the budget is ``Σ kᵢ²`` and a read
-    outside a wide coverage block contributes one state per column of it.
+    The caller passes ONE ``active`` mask and uses it for the observation
+    tables and the total weight as well. An earlier version censored reads
+    here by their state count while the marginals and the denominator kept
+    them, so the numerator and the population it was compared against were
+    different sets: an exactly independent pair came back at p = 4e-88 under
+    the default cap, through the depletion tail, because ``n11`` was missing
+    reads the marginals still counted.
+
+    ``column_mask`` is the honest form of that control. Censoring a read by
+    how many states it carries is censoring on the thing being measured;
+    dropping the lowest-effect *columns* costs resolution but leaves every
+    read's contribution comparable.
     """
     from scipy import sparse
 
     s_ptr, w = states.ptr, states.weight
     n_v = states.n_candidates
-    k = (s_ptr[1:] - s_ptr[:-1]).astype(np.int64)
-    ok = active & (k <= max_state_per_read)
-    n_capped = int((active & ~ok).sum())
-
-    rows = np.flatnonzero(ok)
+    rows = np.flatnonzero(active)
     n11 = np.zeros((n_v, n_v), dtype=np.float64)
     deg_w = np.zeros(n_v, dtype=np.float64)
     if rows.size == 0 or n_v == 0:
-        return n11, deg_w, n_capped, 0
+        return n11, deg_w, 0
 
     gather = np.concatenate([np.arange(s_ptr[i], s_ptr[i + 1]) for i in rows])
     if gather.size == 0:
-        return n11, deg_w, n_capped, 0
+        return n11, deg_w, 0
+    k = (s_ptr[1:] - s_ptr[:-1]).astype(np.int64)
     col = states.v[gather].astype(np.int64)
     row = np.repeat(np.arange(rows.shape[0]), k[rows])
     ww = np.repeat(w[rows], k[rows])
@@ -207,10 +220,14 @@ def _cooccurrence(
     a_ind = sparse.csr_matrix((np.ones(col.shape[0]), (row, col)), shape=shape)
     a_w = sparse.csr_matrix((ww, (row, col)), shape=shape)
 
-    oth = np.flatnonzero(~pure_cov)
-    pcv = np.flatnonzero(pure_cov)
-    k_oth = np.bincount(row, weights=(~pure_cov)[col], minlength=rows.shape[0])
-    k_pc = k[rows] - k_oth
+    oth = np.flatnonzero(~pure_cov & column_mask)
+    pcv = np.flatnonzero(pure_cov & column_mask)
+    k_oth = np.bincount(
+        row, weights=(~pure_cov & column_mask)[col], minlength=rows.shape[0]
+    )
+    k_pc = np.bincount(
+        row, weights=(pure_cov & column_mask)[col], minlength=rows.shape[0]
+    )
     budget = int((k_oth**2).sum() + (k_pc * k_oth).sum())
     if oth.size:
         blk = (a_ind[:, oth].T @ a_w[:, oth]).toarray()
@@ -220,7 +237,57 @@ def _cooccurrence(
             n11[np.ix_(pcv, oth)] = cross
             n11[np.ix_(oth, pcv)] = cross.T
     np.fill_diagonal(n11, 0.0)
-    return n11, deg_w, n_capped, budget
+    return n11, deg_w, budget
+
+
+def _fit_budget(
+    states: ReadStates,
+    pure_cov: np.ndarray,
+    effect: np.ndarray,
+    max_budget: float,
+) -> tuple[np.ndarray, int, int]:
+    """Largest set of columns whose co-occurrence pass fits ``max_budget``.
+
+    Binary search on how many of the highest-effect columns to keep, scoring
+    each candidate set by the ``Σ kᵢ²`` it would actually cost. Effect size is
+    the ranking because p-value ranking fills a budget with homopolymers —
+    significance grows with depth and says nothing about how much of the
+    template disagrees.
+    """
+    n_v = states.n_candidates
+    all_on = np.ones(n_v, dtype=bool)
+    if n_v == 0 or states.v.size == 0:
+        return all_on, 0, 0
+
+    k = (states.ptr[1:] - states.ptr[:-1]).astype(np.int64)
+    row = np.repeat(np.arange(states.n_members), k)
+    col = states.v.astype(np.int64)
+
+    def cost(mask: np.ndarray) -> int:
+        oth = mask & ~pure_cov
+        k_oth = np.bincount(row, weights=oth[col], minlength=states.n_members)
+        k_pc = np.bincount(row, weights=(mask & pure_cov)[col],
+                           minlength=states.n_members)
+        return int((k_oth**2).sum() + (k_pc * k_oth).sum())
+
+    full = cost(all_on)
+    if full <= max_budget:
+        return all_on, 0, full
+
+    order = np.argsort(-np.asarray(effect, dtype=np.float64), kind="stable")
+    lo, hi, best = 0, n_v, None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        mask = np.zeros(n_v, dtype=bool)
+        mask[order[:mid]] = True
+        c = cost(mask)
+        if c <= max_budget:
+            best, lo = (mask, c), mid + 1
+        else:
+            hi = mid - 1
+    if best is None:
+        best = (np.zeros(n_v, dtype=bool), 0)
+    return best[0], int(n_v - best[0].sum()), best[1]
 
 
 def _observation_tables(
@@ -397,9 +464,19 @@ def covariance_graph(
     q_edge: float = 0.01,
     min_n11: float = 3.0,
     min_mode_mass: float = 3.0,
-    max_state_per_read: int = 64,
+    max_cooccurrence_budget: float = 2e8,
 ) -> CovarianceGraph:
-    """Test every co-occurring candidate pair and retain what earns an edge."""
+    """Test every co-occurring candidate pair and retain what earns an edge.
+
+    The co-occurrence pass costs ``Σ kᵢ²``, and on a template with many
+    allelic columns that can run away. The control is ``max_cooccurrence_
+    budget``, which drops the **lowest-effect columns** until the projected
+    cost fits — never reads. Censoring a read by how many states it carries
+    censors on the thing being measured, and doing it inconsistently (numerator
+    without those reads, marginals with them) made an exactly independent pair
+    significant at p = 4e-88. Dropping columns costs resolution, is already the
+    ranking ``max_candidate_columns`` uses, and leaves every read comparable.
+    """
     n_v = states.n_candidates
     route = np.asarray(cand.route)
     is_all = (route & ROUTE_ALLELIC).astype(bool)
@@ -410,10 +487,11 @@ def covariance_graph(
     pure_cov = ((route & ROUTE_COVERAGE) != 0) & ~is_all
     is_cov = pure_cov
     active = np.ones(states.n_members, dtype=bool)
-
-    n11, deg_w, n_capped, sum_k2 = _cooccurrence(
-        states, active, max_state_per_read, pure_cov
+    column_mask, n_budget_dropped, sum_k2 = _fit_budget(
+        states, pure_cov, np.asarray(cand.effect), max_cooccurrence_budget
     )
+
+    n11, deg_w, sum_k2 = _cooccurrence(states, active, pure_cov, column_mask)
     d_tab, a_tab = _observation_tables(states, active)
     total_w = float(states.weight[active].sum())
 
@@ -441,6 +519,11 @@ def covariance_graph(
     # test significant whether or not anything latent is there.
     seen = (k11 >= min_n11) | (expect >= min_n11)
     seen &= ~(pure_cov[uu] & pure_cov[vv])
+    # A column the budget dropped has no computed co-occurrence, so admitting
+    # it here would read n11 = 0 and fire the DEPLETION tail — the same defect
+    # the budget control replaced, wearing a different hat. Dropped means
+    # dropped: not counted, and not tested against.
+    seen &= column_mask[uu] & column_mask[vv]
     uu, vv = uu[seen], vv[seen]
     n_pairs_seen = int(seen.sum())
 
@@ -481,7 +564,7 @@ def covariance_graph(
             n_pairs_seen=n_pairs_seen,
             n_tested=0,
             n_significant=0,
-            n_reads_capped=n_capped,
+            n_columns_dropped=n_budget_dropped,
             sum_k2=sum_k2,
         )
     p = pvals[t_idx]
@@ -497,7 +580,7 @@ def covariance_graph(
         n_pairs_seen=n_pairs_seen,
         n_tested=int(t_idx.size),
         n_significant=int(hit.size),
-        n_reads_capped=n_capped,
+        n_columns_dropped=n_budget_dropped,
         sum_k2=sum_k2,
     )
 
@@ -623,6 +706,47 @@ def dense_states(states: ReadStates, columns: np.ndarray) -> np.ndarray:
     return x
 
 
+def _score(x, observed, wc, patterns, prior, *, chunk=4096):
+    """``(M, K)`` log-likelihoods, up to a pattern-independent constant.
+
+    ``Σ_observed log(1−ε_c)`` does not depend on the pattern, so the argmax
+    reduces to ``log π_j`` minus an ε-weighted Hamming distance over the
+    columns the read observes. Chunked over reads because the natural form
+    materialises a dense ``(M, K)`` float64 mismatch product — 78 MiB per
+    pattern at 20,000 reads × 512 columns, allocated once per pattern per
+    iteration.
+    """
+    m, k = x.shape[0], patterns.shape[0]
+    out = np.empty((m, k), dtype=np.float64)
+    log_prior = np.log(np.maximum(prior, 1e-12))
+    for lo in range(0, m, chunk):
+        hi = min(lo + chunk, m)
+        xs, obs = x[lo:hi], observed[lo:hi]
+        for j in range(k):
+            mism = obs & (xs != patterns[j][None, :])
+            out[lo:hi, j] = log_prior[j] - mism @ wc
+    return out
+
+
+def _lloyd(x, observed, w, wc, patterns, n_rounds):
+    """Assign → re-estimate, ``n_rounds`` times. Returns the settled state."""
+    k = patterns.shape[0]
+    total = float(w.sum())
+    # Uniform priors to start: a freshly seeded pattern has zero mass, and
+    # log(0) would stop it ever attracting the reads it was seeded from.
+    prior = np.full(k, max(total / max(k, 1), 1e-9))
+    labels = np.zeros(x.shape[0], dtype=np.int32)
+    for _ in range(max(1, n_rounds)):
+        ll = _score(x, observed, wc, patterns, prior)
+        labels = np.argmax(ll, axis=1).astype(np.int32)
+        prior = np.bincount(labels, weights=w, minlength=k)
+        patterns = _reestimate(x, observed, labels, w, patterns)
+    ll = _score(x, observed, wc, patterns, prior)
+    labels = np.argmax(ll, axis=1).astype(np.int32)
+    prior = np.bincount(labels, weights=w, minlength=k)
+    return patterns, prior, labels, ll
+
+
 def resolve_signature(
     states: ReadStates,
     columns: np.ndarray,
@@ -631,6 +755,7 @@ def resolve_signature(
     a_min: float = 3.0,
     max_patterns: int = 8,
     n_rounds: int = 3,
+    pattern_penalty: float = 1.0,
 ) -> Assignment:
     """Assign every read to one pattern of ``columns`` by likelihood.
 
@@ -641,70 +766,86 @@ def resolve_signature(
                                  + 1{a_r[c] != P_j[c]}·log ε_c ]
 
     An unobserved column contributes exactly **0** — never a symbol, never a
-    pseudo-allele.
-
-    Since ``Σ_observed log(1−ε_c)`` does not depend on the pattern, the argmax
-    reduces to an ε-weighted Hamming distance over observed columns minus a
-    log-prior, with ``w_c = log((1−ε_c)/ε_c)``. That reduction is the physical
-    content: a substitution column (ε = 0.003) is worth 5.8 nats and a 22%
-    homopolymer column 1.27, so the scheme discounts the unreliable column
-    with no special case. It also means **"matches nothing" is not a case** —
-    exact-row grouping has one, a metric does not. A read observing none of
-    the signature scores ``log π_j`` against every pattern and lands on the
-    prior with ``margin ≈ 0``, which reports the ambiguity: a read that *said
-    nothing* placed on the most probable node is not the same as modal
+    pseudo-allele. Since the match term does not depend on the pattern, the
+    argmax reduces to an ε-weighted Hamming distance over observed columns
+    minus a log-prior, with ``w_c = log((1−ε_c)/ε_c)``. That reduction is the
+    physical content: a substitution column (ε = 0.003) is worth 5.8 nats and
+    a 22% homopolymer column 1.27, so the scheme discounts the unreliable
+    column with no special case. It also means **"matches nothing" is not a
+    case** — exact-row grouping has one, a metric does not. A read observing
+    none of the signature scores ``log π_j`` against every pattern and lands
+    on the prior with ``margin ≈ 0``, which reports the ambiguity: a read that
+    *said nothing* placed on the most probable node is not the same as modal
     absorption folding in a read that *disagreed*.
 
-    Patterns are seeded from distinct observed state vectors over reads
-    observing all of ``columns`` with mass ≥ ``a_min``, then refined by
-    ``n_rounds`` of (assign → re-estimate each pattern as its members'
-    weighted per-column majority). This is not ``np.unique(A, axis=0)`` in
-    disguise: the key never contains unobserved, it is over a denoised clique
-    rather than every selected column, assignment is by likelihood rather than
-    byte identity, and patterns are re-estimated from their members rather
-    than frozen at an observed row.
+    **How many patterns there are is decided by the same metric.** Patterns
+    used to be seeded from distinct *exactly matching* observed rows with mass
+    ≥ ``a_min``, which reintroduced the "matches nothing" case one level up:
+    the probability a read's row is clean is ``(1−ε)^S``, so at 24 columns it
+    is 79% and at a few hundred it is ~0. Measured on a 100-major / 40-minor
+    fixture over 24 linked columns, that seeding was unstable in **both**
+    directions — with one error per read it shattered the major population
+    into six spurious 5–7 read nodes, and with two it found no qualifying row
+    at all and emitted a single 140-read node, erasing a well-supported
+    minority. Neither is a threshold problem; exact matching is.
+
+    So patterns are grown instead: start from the weighted per-column
+    majority, and repeatedly seed a new one from the **worst-explained read**
+    (farthest in the same ε-weighted metric), re-fit, and keep it only if the
+    likelihood gain clears a BIC penalty of ``(S + 1)·ln(N)`` nats. That
+    penalty is what distinguishes the two cases above: a junk pattern
+    capturing six reads that each save one column's weight gains ~35 nats
+    against a ~123-nat penalty and is refused, while a real minority of 40
+    reads differing at 22 columns gains ~5,100 and is kept — and so is a
+    minority of 3 reads differing at 24, which the old read floor could not
+    express. ``pattern_penalty`` scales it, so the round loop can anneal how
+    readily a template is allowed to split.
     """
     cols = np.asarray(columns, dtype=np.int64)
     x = dense_states(states, cols)
     w = states.weight
     eps = np.clip(np.asarray(eps, dtype=np.float64), 1e-9, 0.5 - 1e-9)
     wc = np.log((1.0 - eps) / eps)
-
     observed = x != UNOBSERVED
-    # Seed over the columns anyone observes. A signature column that NO read
-    # observes must not collapse the seeding to a single all-major pattern —
-    # an unobserved column contributes 0 to every score, so it can only ever
-    # be major, and it must not decide how many patterns exist.
-    usable = observed.any(axis=0)
-    patterns = np.full((1, cols.shape[0]), MAJOR, dtype=np.int8)
-    prior = np.array([max(float(w.sum()), 1.0)])
-    if usable.any():
-        full = np.flatnonzero(observed[:, usable].all(axis=1))
-        if full.size:
-            keys, inv = np.unique(x[np.ix_(full, np.flatnonzero(usable))],
-                                  axis=0, return_inverse=True)
-            mass = np.bincount(inv, weights=w[full], minlength=keys.shape[0])
-            order = np.argsort(-mass, kind="stable")
-            order = order[mass[order] >= a_min][:max_patterns]
-            if order.size:
-                patterns = np.full((order.size, cols.shape[0]), MAJOR, dtype=np.int8)
-                patterns[:, usable] = keys[order]
-                prior = mass[order]
+    n_cols = cols.shape[0]
 
-    labels = np.zeros(states.n_members, dtype=np.int32)
-    margin = np.zeros(states.n_members, dtype=np.float64)
-    for _ in range(max(1, n_rounds)):
-        ll = np.empty((states.n_members, patterns.shape[0]), dtype=np.float64)
-        log_prior = np.log(np.maximum(prior, 1e-12))
-        for j in range(patterns.shape[0]):
-            mism = observed & (x != patterns[j][None, :])
-            ll[:, j] = log_prior[j] - mism.astype(np.float64) @ wc
-        labels = np.argmax(ll, axis=1).astype(np.int32)
-        if patterns.shape[0] > 1:
-            part = np.partition(ll, -2, axis=1)
-            margin = part[:, -1] - part[:, -2]
-        prior = np.bincount(labels, weights=w, minlength=patterns.shape[0])
-        patterns = _reestimate(x, observed, labels, w, patterns)
+    seed = np.full((1, n_cols), MAJOR, dtype=np.int8)
+    patterns, prior, labels, ll = _lloyd(
+        x, observed, w, wc, _reestimate(x, observed, np.zeros(x.shape[0], np.int32),
+                                        w, seed), n_rounds
+    )
+    best = float(ll[np.arange(x.shape[0]), labels].sum())
+    n_eff = max(int(observed.any(axis=1).sum()), 2)
+    penalty = float(pattern_penalty) * (n_cols + 1) * np.log(n_eff)
+
+    while patterns.shape[0] < max_patterns:
+        cost = (observed & (x != patterns[labels])).astype(np.float64) @ wc
+        r = int(np.argmax(cost))
+        if cost[r] <= 0.0:
+            break
+        trial = np.vstack(
+            [patterns, np.where(observed[r], x[r], patterns[labels[r]])]
+        )
+        t_pat, t_prior, t_lab, t_ll = _lloyd(x, observed, w, wc, trial, n_rounds)
+        t_best = float(t_ll[np.arange(x.shape[0]), t_lab].sum())
+        if 2.0 * (t_best - best) <= penalty:
+            break
+        patterns, prior, labels, ll, best = t_pat, t_prior, t_lab, t_ll, t_best
+
+    # A pattern that ends up under-supported is folded away and its reads
+    # re-assigned by the same metric — not absorbed into the modal node.
+    if patterns.shape[0] > 1:
+        keep = prior >= a_min
+        if keep.any() and not keep.all():
+            patterns, prior, labels, ll = _lloyd(
+                x, observed, w, wc, patterns[keep], n_rounds
+            )
+
+    if patterns.shape[0] > 1:
+        part = np.partition(ll, -2, axis=1)
+        margin = part[:, -1] - part[:, -2]
+    else:
+        margin = np.zeros(x.shape[0], dtype=np.float64)
     return Assignment(
         columns=cols, patterns=patterns, mass=prior, labels=labels, margin=margin
     )

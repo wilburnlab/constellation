@@ -291,14 +291,21 @@ class _Group:
 def iter_read_hit_groups(
     batches: Iterable[pa.RecordBatch],
     templates: TemplateSet,
-    *,
-    allow_antisense: bool = False,
 ) -> Iterator[_Group]:
     """Regroup streaming PAF batches into one accumulator per read.
 
     minimap2 emits a query's hits contiguously, so a group only ever straddles
     a batch boundary — the tail carries forward rather than the whole table
     being materialised.
+
+    Reverse-strand hits are dropped unconditionally. There used to be an
+    ``allow_antisense`` escape hatch, and it was a trap: PAF reports
+    ``q_start``/``q_end`` on the **forward** query while ``cg:Z`` describes the
+    alignment of the reverse complement, so `specs_from_assignments` paired a
+    reverse CIGAR with a forward ``member_seq`` and a hit that supports
+    ``GGGG`` voted ``CCCC`` into the PWM. Supporting antisense means
+    reverse-complementing the read and recomputing the offsets, which nothing
+    on this path does — so the option is gone rather than silently wrong.
     """
     idx_of = templates.index_of_name()
     cur = _Group()
@@ -307,7 +314,7 @@ def iter_read_hit_groups(
     for batch in batches:
         cols = {n: batch.column(n).to_pylist() for n in batch.schema.names}
         for i in range(batch.num_rows):
-            if not allow_antisense and cols["strand"][i] != "+":
+            if cols["strand"][i] != "+":
                 continue
             t = idx_of.get(cols["t_name"][i])
             if t is None:
@@ -345,7 +352,6 @@ def assign_reads(
     tie_resolution: Literal["rank", "fractional"] = "rank",
     keep_cigars: bool = True,
     emit_coverage: bool = False,
-    allow_antisense: bool = False,
 ) -> tuple[pa.Table, pa.Table]:
     """Assign every read to a template. Returns ``(assignments, coverage)``.
 
@@ -354,9 +360,7 @@ def assign_reads(
     """
     a_rows: list[tuple] = []
     c_rows: list[tuple] = []
-    for grp in iter_read_hit_groups(
-        batches, templates, allow_antisense=allow_antisense
-    ):
+    for grp in iter_read_hit_groups(batches, templates):
         n = len(grp)
         as_score = np.asarray(grp.as_score, dtype=np.int64)
         tmpl = np.asarray(grp.tmpl, dtype=np.int64)
@@ -457,6 +461,26 @@ def _rows_to_table(rows: list[tuple], schema: pa.Schema) -> pa.Table:
     )
 
 
+def _parse_size(value: str | int) -> int:
+    """minimap2's ``-I`` size grammar: a number with an optional K/M/G suffix.
+
+    The ceiling on template bases was never enough on its own — it bounds the
+    reference, not the indexing configuration, so a caller lowering ``-I``
+    still got a multi-part index and duplicated read mass (measured: two reads
+    produced two assignments at 16G and four at 1K).
+    """
+    text = str(value).strip()
+    mult = {"k": 10**3, "m": 10**6, "g": 10**9}.get(text[-1:].lower())
+    if mult is not None:
+        text = text[:-1]
+    else:
+        mult = 1
+    try:
+        return int(float(text) * mult)
+    except ValueError as exc:  # pragma: no cover - argument hygiene
+        raise ValueError(f"unparseable minimap2 -I value: {value!r}") from exc
+
+
 def run_estep(
     templates: TemplateSet,
     reads_fasta,
@@ -487,6 +511,16 @@ def run_estep(
     from constellation.sequencing.readers.paf import iter_paf_batches
 
     total = sum(len(s) for s in templates.sequence)
+    index_bases = _parse_size(index_batch_size)
+    if index_bases < total:
+        raise ValueError(
+            f"-I is {index_batch_size} ({index_bases / 1e9:.3f} Gb) but the "
+            f"template set is {total / 1e9:.3f} Gb, so minimap2 would build a "
+            "multi-part index. It then runs the queries once per part and "
+            "applies -p, -N and the primary/secondary call WITHIN each part, "
+            "so a read is emitted once per part and its mass is counted more "
+            "than once. Raise --index-batch-size above the template total."
+        )
     if total > max_template_bases:
         raise ValueError(
             f"template set is {total / 1e9:.2f} Gb over {len(templates.sequence):,} "
