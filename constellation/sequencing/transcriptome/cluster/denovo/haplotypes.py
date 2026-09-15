@@ -43,22 +43,23 @@ def member_allele_row(
     cigar_ops: list[tuple[int, str]],
     member_codes: np.ndarray,
     *,
-    centroid_is_query: bool,
-    centroid_start: int,
+    frame_is_query: bool,
+    frame_start: int,
     member_start: int,
     var_sorted: np.ndarray,
 ) -> np.ndarray:
     """A member's allele (``int8``: 0-3 = ACGT, 4 = gap/deletion, -1 =
-    uncovered) at each variant **centroid** position (``var_sorted`` ascending).
+    uncovered) at each variant **frame** column (``var_sorted`` ascending).
 
-    Projects the member onto the centroid frame and reads off the alleles at
+    Projects the member onto the consensus frame and reads off the alleles at
     the variant columns — the per-read assignment that places every member on
-    a haplotype."""
+    a haplotype. Callers map consensus positions to frame columns with
+    ``ConsensusResult.frame_of_cons``."""
     mc, mb, gc = project_member(
         cigar_ops,
         member_codes,
-        centroid_is_query=centroid_is_query,
-        centroid_start=centroid_start,
+        frame_is_query=frame_is_query,
+        frame_start=frame_start,
         member_start=member_start,
     )
     V = var_sorted.shape[0]

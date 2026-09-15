@@ -15,7 +15,7 @@ the runner pipes minimap2's SAM stdout through ``samtools view -b``
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 from constellation.core.progress import ProgressCallback, ProgressEvent
@@ -133,6 +133,57 @@ def minimap2_run(
     return output_path
 
 
+def minimap2_stream(
+    target: Path,
+    queries: Sequence[Path],
+    *,
+    args: tuple[str, ...] = (),
+    threads: int = 8,
+    chunk_bytes: int = 8 << 20,
+    progress_cb: ProgressCallback | None = None,
+) -> Iterator[bytes]:
+    """Run ``minimap2`` and yield its stdout in byte chunks.
+
+    The file-writing sibling :func:`minimap2_run` is wrong for high-secondary
+    workloads: with ``--secondary=yes -N 50`` every read can emit 51 PAF lines,
+    which is ~6 GB of text at 1M reads and >1 TB at PromethION scale. Streaming
+    lets the caller reduce each query's hit group in flight and never
+    materialise the stream.
+
+    The caller is responsible for not passing ``-a`` when it expects PAF.
+    Raises ``subprocess.CalledProcessError`` on a non-zero exit, after the
+    stream is drained.
+    """
+    minimap2_bin = _resolve_minimap2()
+    cmd = [
+        str(minimap2_bin),
+        *args,
+        "-t",
+        str(int(threads)),
+        str(Path(target)),
+        *(str(q) for q in queries),
+    ]
+    _emit(
+        progress_cb,
+        ProgressEvent(kind="stage_start", stage="minimap2", message=" ".join(cmd)),
+    )
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=chunk_bytes)
+    try:
+        assert proc.stdout is not None
+        while True:
+            block = proc.stdout.read(chunk_bytes)
+            if not block:
+                break
+            yield block
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+        rc = proc.wait()
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, cmd)
+    _emit(progress_cb, ProgressEvent(kind="stage_done", stage="minimap2"))
+
+
 def minimap2_build_index(
     fasta: Path,
     mmi_path: Path,
@@ -173,4 +224,4 @@ def minimap2_build_index(
     return mmi_path
 
 
-__all__ = ["minimap2_run", "minimap2_build_index"]
+__all__ = ["minimap2_run", "minimap2_stream", "minimap2_build_index"]

@@ -1334,6 +1334,28 @@ def _build_transcriptome_parser(subs) -> None:
         help="de-novo: beta-binomial overdispersion ρ for variant SF (Cut 4).",
     )
     p_cluster.add_argument(
+        "--max-window-length",
+        type=int,
+        default=15000,
+        help=(
+            "de-novo: drop transcript windows longer than this before "
+            "seeding and alignment (0 disables). Oversized windows are "
+            "concatemers, not transcripts; they seed giant templates and "
+            "reserve terminal blocks on other templates. Default 15000."
+        ),
+    )
+    p_cluster.add_argument(
+        "--fold-insertions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "de-novo: let the consensus splice in insertions a majority of "
+            "members carry and extend past the centroid's ends, so a deletion "
+            "error in the centroid is repairable and the result does not "
+            "depend on which read became the frame. Default on."
+        ),
+    )
+    p_cluster.add_argument(
         "--predict-orfs",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -3165,6 +3187,10 @@ def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
         max_cluster_rounds=int(args.max_cluster_rounds),
         error_model=str(args.error_model),
         overdispersion=float(args.overdispersion),
+        fold_insertions=bool(args.fold_insertions),
+        max_window_length=(
+            int(args.max_window_length) if args.max_window_length > 0 else None
+        ),
         predict_orfs=bool(args.predict_orfs),
         min_aa_length=int(args.min_aa_length),
         emit_cluster_detail=bool(args.emit_cluster_detail),

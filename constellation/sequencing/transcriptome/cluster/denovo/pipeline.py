@@ -15,7 +15,6 @@ on the same edge).
 
 from __future__ import annotations
 
-import functools
 import multiprocessing as mp
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -27,7 +26,6 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from constellation.core.sequence.nucleic import STANDARD, CodonTable, translate
 from constellation.sequencing.schemas.quant import FEATURE_QUANT
 from constellation.sequencing.schemas.transcriptome import (
     CLUSTER_MEMBERSHIP_TABLE,
@@ -46,7 +44,9 @@ from constellation.sequencing.transcriptome.cluster.denovo.cluster_graph import 
 )
 from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
     MemberSpec,
-    centroid_consensus,
+    default_realign,
+    frame_consensus,
+    member_alleles,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.dereplicate import (
     dereplicate,
@@ -57,6 +57,10 @@ from constellation.sequencing.transcriptome.cluster.denovo.haplotypes import (
 )
 from constellation.sequencing.transcriptome.cluster.denovo.minimizers import (
     extract_minimizers,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.orf import (
+    ORF_CODON_TABLE,
+    best_sense_orf,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.quant import (
     cluster_feature_quant,
@@ -79,15 +83,6 @@ from constellation.sequencing.transcriptome.cluster.denovo.verify import (
 )
 
 
-_ORF_CODON_TABLE: CodonTable = CodonTable(
-    transl_table=STANDARD.transl_table,
-    name=f"{STANDARD.name} (ATG-only starts)",
-    forward=STANDARD.forward,
-    starts=frozenset({"ATG"}),
-    stops=STANDARD.stops,
-)
-
-
 @dataclass(slots=True)
 class AssembledClusters:
     clusters: pa.Table  # TRANSCRIPT_CLUSTER_TABLE
@@ -100,52 +95,15 @@ class AssembledClusters:
     n_unique: int
 
 
-@functools.lru_cache(maxsize=8)
-def _orf_regex(min_aa_length: int):
-    import regex
-
-    # ATG start … ≥ min_aa_length codons … stop. Compiled once per length
-    # (vs once per call inside find_orfs — at 10M+ clusters that recompile
-    # dominated the per-cluster cost).
-    return regex.compile(
-        f"(?:ATG)(?:[ACGT]{{3}}){{{min_aa_length - 1},}}?(?:TAA|TAG|TGA)"
-    )
-
-
-def _is_low_complexity(seq: str) -> bool:
-    """Cheap guard: a consensus dominated by one base or a long homopolymer
-    is almost always a connected-components chaining artifact. Such sequences
-    make the overlapped-ORF regex pathological, so skip ORF prediction."""
-    n = len(seq)
-    if n < 30:
-        return False
-    counts = (seq.count("A"), seq.count("C"), seq.count("G"), seq.count("T"))
-    return max(counts) > 0.8 * n
-
-
 def _best_clean_orf(seq: str, *, min_aa_length: int):
-    """Longest internal-stop-free ATG ORF as ``(protein, start, end, strand,
-    transl_table)``, or ``None``. Cached regex + low-complexity guard make it
-    cheap enough to run on every one of millions of cluster consensuses."""
-    if len(seq) < min_aa_length * 3 or _is_low_complexity(seq):
+    """``(protein, start, end, strand, transl_table)`` for the consensus ORF,
+    or ``None``. Thin adapter over :func:`orf.best_sense_orf`, which the
+    ORF-anchored seeding stage shares."""
+    hit = best_sense_orf(seq, min_aa_length=min_aa_length)
+    if hit is None:
         return None
-    s = seq.upper().replace("U", "T")
-    pat = _orf_regex(min_aa_length)
-    # Best (longest) internal-stop-free protein per (frame, stop position).
-    best: dict[tuple[int, int], tuple] = {}
-    for m in pat.finditer(s, overlapped=True):
-        nt = s[m.start() : m.end()]
-        prot = translate(nt[:-3], codon_table=_ORF_CODON_TABLE, partial="discard")
-        if "*" in prot or len(prot) < min_aa_length:
-            continue
-        key = (m.start() % 3, m.end())
-        prior = best.get(key)
-        if prior is None or len(prot) > len(prior[0]):
-            best[key] = (prot, m.start(), m.end())
-    if not best:
-        return None
-    prot, st, en = max(best.values(), key=lambda x: len(x[0]))
-    return prot, int(st), int(en), "+", _ORF_CODON_TABLE.transl_table
+    prot, st, en = hit
+    return prot, st, en, "+", ORF_CODON_TABLE.transl_table
 
 
 # A single cluster holding more unique sequences than this is almost
@@ -222,30 +180,65 @@ def _assign_haplotypes(
     cid: int,
     c: int,
     nonc: np.ndarray,
-    var_centroid: np.ndarray,
+    var_frame: np.ndarray,
     var_cons: np.ndarray,
     sub: list[tuple],
-    spec_by_uniq: dict[int, MemberSpec],
+    cres,
     seqs: list[str],
     abund: np.ndarray,
 ):
     """Place every cluster member on the variant columns + collapse to
     abundance-weighted haplotypes.
 
-    The centroid contributes its own bases; each member is projected via its
-    cached consensus alignment when it voted in the PWM, else a bounded
-    re-align onto the centroid frame (an all-uncovered row when even that
-    fails). Members beyond ``_HAPLOTYPE_ASSIGN_MAX`` (by abundance) fold into
-    one all-uncovered bucket carrying their summed weight, so the haplotype
+    Members that voted in the PWM read their alleles straight off it via
+    :func:`member_alleles`, which resolves the template↔PWM column spaces.
+    Members that did not vote (excluded by the consensus gate, or past the
+    member cap) are re-aligned to the **consensus** and read at consensus
+    positions — so they can still be placed on ordinary columns, but an
+    insertion column, which has no consensus position at all, reads
+    uncovered for them rather than guessing.
+
+    Members beyond ``_HAPLOTYPE_ASSIGN_MAX`` (by abundance) fold into one
+    all-uncovered bucket carrying their summed weight, so the haplotype
     abundances still sum to the cluster's read count (quant-grade)."""
-    V = int(var_centroid.shape[0])
+    V = int(var_frame.shape[0])
     rows: list[np.ndarray] = []
     weights: list[float] = []
 
-    # Centroid self-row: its own bases at the variant positions (N → uncovered).
-    cen_row = base_codes(seqs[c])[var_centroid].astype(np.int8)
-    cen_row[cen_row >= 4] = -1
-    rows.append(cen_row)
+    voted = {m.member_id: i for i, m in enumerate(cres.members)}
+    voted_alleles = member_alleles(cres, var_frame) if voted else None
+    # Consensus positions of the variant columns; -1 where the column is an
+    # insertion block and therefore absent from the consensus string.
+    cons_of = cres.cons_of_frame[var_frame]
+    on_consensus = cons_of >= 0
+
+    def _row(m: int) -> np.ndarray:
+        slot = voted.get(m)
+        if slot is not None:
+            return voted_alleles[slot]
+        row = np.full(V, -1, dtype=np.int8)
+        if not on_consensus.any():
+            return row
+        res = default_realign(cres.consensus, seqs[m], max_frac=_REALIGN_MAX_FRAC)
+        if res is None:
+            return row
+        cig, fstart, mstart = res
+        sub_cols = cons_of[on_consensus].astype(np.int64)
+        order = np.argsort(sub_cols)
+        got = member_allele_row(
+            parse_cigar(cig),
+            base_codes(seqs[m]),
+            frame_is_query=False,
+            frame_start=fstart,
+            member_start=mstart,
+            var_sorted=sub_cols[order],
+        )
+        row[np.flatnonzero(on_consensus)[order]] = got
+        return row
+
+    # The centroid is a member of the PWM like any other; when it did vote it
+    # has a real alignment onto the (possibly grown) frame.
+    rows.append(_row(c))
     weights.append(float(abund[c]))
 
     if nonc.shape[0] > _HAPLOTYPE_ASSIGN_MAX:
@@ -261,34 +254,7 @@ def _assign_haplotypes(
 
     for m in assign:
         m = int(m)
-        spec = spec_by_uniq.get(m)
-        if spec is not None:
-            ops = parse_cigar(spec.cigar)
-            mcodes = base_codes(spec.member_seq)
-            ciq = spec.centroid_is_query
-            rs = spec.ref_start
-        else:
-            al = _member_alignment(c, m)
-            if al is None:
-                rows.append(np.full(V, -1, dtype=np.int8))
-                weights.append(float(abund[m]))
-                continue
-            s, _lng, rs, cigar = al
-            ops = parse_cigar(cigar)
-            mcodes = base_codes(seqs[m])
-            ciq = s == c
-        cstart = 0 if ciq else rs
-        mstart = rs if ciq else 0
-        rows.append(
-            member_allele_row(
-                ops,
-                mcodes,
-                centroid_is_query=ciq,
-                centroid_start=cstart,
-                member_start=mstart,
-                var_sorted=var_centroid,
-            )
-        )
+        rows.append(_row(m))
         weights.append(float(abund[m]))
 
     # One synthetic row stands for every over-cap member, so it must
@@ -319,6 +285,7 @@ def _cluster_chunk(
     min_aa_length: int,
     identity: float,
     overdispersion: float,
+    fold_insertions: bool = True,
     emit_alignments: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[list[tuple], list[tuple], list[tuple], list[tuple], dict, list[tuple]]:
@@ -370,7 +337,6 @@ def _cluster_chunk(
                 (cid, c, "representative", 0, f"{lc}=", lc, 0, 0, 0, 0, 0, True)
             )
         specs: list[MemberSpec] = []
-        spec_by_uniq: dict[int, MemberSpec] = {}
         for m in walk:
             m = int(m)
             al = _member_alignment(c, m)
@@ -407,9 +373,9 @@ def _cluster_chunk(
                     cigar=cigar,
                     centroid_is_query=(s == c),
                     ref_start=ref_start,
+                    member_id=m,
                 )
                 specs.append(spec)
-                spec_by_uniq[m] = spec
             if emit_alignments:
                 # Normalise to a member→centroid alignment (centroid as ref).
                 # When the centroid was the shorter query, transpose the CIGAR
@@ -437,13 +403,32 @@ def _cluster_chunk(
                     )
                 )
         if specs:
-            cres = centroid_consensus(seqs[c], float(abund[c]), specs)
+            # The centroid joins the PWM as a member with an identity
+            # alignment rather than as a bare self-vote, so insertion folding
+            # can re-align it onto the grown frame like everyone else. At pass
+            # 1 the two are numerically identical.
+            lc = int(seqlen[c])
+            specs.append(
+                MemberSpec(
+                    member_seq=seqs[c],
+                    weight=float(abund[c]),
+                    cigar=f"{lc}=",
+                    centroid_is_query=False,
+                    ref_start=0,
+                    member_start=0,
+                    member_id=c,
+                )
+            )
+            cres = frame_consensus(
+                seqs[c],
+                specs,
+                frame_weight=0.0,
+                fold_insertions=fold_insertions,
+            )
             consensus = cres.consensus
             merge_disagreements(disagree, disagreement_stats(cres))
             vrows = call_variants(cres, model=model, overdispersion=overdispersion)
             if vrows:
-                keep = cres.winner < 4
-                centroid_of_cons = np.flatnonzero(keep)
                 # Haplotype columns: **statistically-supported, in-core,
                 # base-substitution** variants. Three gates:
                 #   • call == 'real' (vr[10]) — only FDR-supported variants
@@ -472,17 +457,18 @@ def _cluster_chunk(
                 if sel:
                     sub = [vrows[i] for i in sel]
                     var_cons = np.array([r[0] for r in sub], dtype=np.int64)
-                    # centroid positions are ascending (consensus order ↔
-                    # centroid order is monotonic), so usable as var_sorted.
-                    var_centroid = centroid_of_cons[var_cons]
+                    # Read alleles at the PWM column the caller reported, not
+                    # via the consensus position: an insertion column has no
+                    # consensus position to map back from.
+                    var_frame = np.array([r[12] for r in sub], dtype=np.int64)
                     hres = _assign_haplotypes(
                         cid=cid,
                         c=c,
                         nonc=nonc,
-                        var_centroid=var_centroid,
+                        var_frame=var_frame,
                         var_cons=var_cons,
                         sub=sub,
-                        spec_by_uniq=spec_by_uniq,
+                        cres=cres,
                         seqs=seqs,
                         abund=abund,
                     )
@@ -492,7 +478,8 @@ def _cluster_chunk(
                             (cid, hid, astr, hres.variant_positions, ab, nu, comp)
                         )
                 for i, vr in enumerate(vrows):
-                    variant_out.append((cid, *vr, r2_by_idx.get(i, 0.0)))
+                    # vr[12] is the PWM column — internal, not a table field.
+                    variant_out.append((cid, *vr[:12], r2_by_idx.get(i, 0.0)))
         else:
             consensus = seqs[c]
         protein = orf_start = orf_end = orf_strand = codon_tbl = None
@@ -524,6 +511,7 @@ def assemble_clusters(
     overdispersion: float = 0.0,
     error_model: ErrorModel | None = None,
     fit_empirical: bool = False,
+    fold_insertions: bool = True,
     emit_alignments: bool = False,
     threads: int = 1,
     progress: Callable[[str], None] | None = None,
@@ -535,6 +523,12 @@ def assemble_clusters(
     optional ``str -> None`` sink called at each stage boundary (the CLI
     wires it to a flushing stderr printer so the last line before a crash
     pinpoints the failing stage).
+
+    ``fold_insertions`` lets the per-cluster consensus splice in insertions a
+    majority of members carry and extend past the centroid's ends, so a
+    deletion error in the centroid is repairable and the result does not
+    depend on which read became the frame. It costs one re-alignment pass per
+    cluster whose members carry an insertion the frame lacks.
     """
     log = progress or (lambda _m: None)
     n_input = reads.num_rows
@@ -653,6 +647,7 @@ def assemble_clusters(
         min_aa_length=min_aa_length,
         identity=identity,
         overdispersion=overdispersion,
+        fold_insertions=fold_insertions,
         emit_alignments=emit_alignments,
     )
     disagree: dict = {}
@@ -1177,6 +1172,8 @@ def cluster_transcripts(
     max_cluster_rounds: int = 1,
     error_model: Literal["default", "empirical"] = "default",
     overdispersion: float = 0.0,
+    fold_insertions: bool = True,
+    max_window_length: int | None = None,
     predict_orfs: bool = True,
     min_aa_length: int = 60,
     emit_cluster_detail: bool = False,
@@ -1231,7 +1228,13 @@ def cluster_transcripts(
     # Stage logger — flush immediately so the last line is visible even if a
     # native library aborts the process (the std::length_error class of crash
     # bypasses Python's normal stderr flush).
-    log: Callable[[str], None] | None = None
+    # A no-op default rather than None: every `log(...)` below then works
+    # unconditionally. The previous `None` default made the length-filter
+    # report a TypeError on any quiet run that actually dropped a window —
+    # i.e. the exact runs where the number matters.
+    def log(msg: str) -> None:
+        return None
+
     if verbose or progress_cb is not None:
 
         def _log(msg: str) -> None:
@@ -1252,7 +1255,16 @@ def cluster_transcripts(
         log = _log
         log(f"loading Complete demux windows from {demux_dir}…")
 
-    reads = load_demux_windows(Path(demux_dir))
+    reads, read_stats = load_demux_windows(
+        Path(demux_dir), max_window_length=max_window_length
+    )
+    if read_stats["n_dropped_long"]:
+        log(
+            f"  dropped {read_stats['n_dropped_long']:,} of "
+            f"{read_stats['n_input']:,} windows longer than "
+            f"{max_window_length:,} nt (longest input "
+            f"{read_stats['max_input_length']:,} nt)"
+        )
     result = assemble_clusters(
         reads,
         identity=identity,
@@ -1267,6 +1279,7 @@ def cluster_transcripts(
         min_aa_length=min_aa_length,
         overdispersion=overdispersion,
         fit_empirical=(error_model == "empirical"),
+        fold_insertions=fold_insertions,
         emit_alignments=emit_alignments,
         threads=threads,
         progress=log,
@@ -1295,6 +1308,12 @@ def cluster_transcripts(
             "max_cluster_rounds": int(max_cluster_rounds),
             "error_model": str(error_model),
             "overdispersion": float(overdispersion),
+            "fold_insertions": bool(fold_insertions),
+            "max_window_length": (
+                int(max_window_length) if max_window_length else None
+            ),
+            "n_dropped_long": int(read_stats["n_dropped_long"]),
+            "max_input_window_length": int(read_stats["max_input_length"]),
             "predict_orfs": bool(predict_orfs),
             "min_aa_length": int(min_aa_length),
             "emit_alignments": bool(emit_alignments),
