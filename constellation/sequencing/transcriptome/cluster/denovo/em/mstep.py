@@ -218,8 +218,6 @@ def specs_from_assignments(
     return out
 
 
-
-
 def _consensus_offset(cres: ConsensusResult, column: int) -> int:
     """How many consensus bases of ``cres`` precede PWM ``column``.
 
@@ -262,9 +260,7 @@ def _sig_eps(cand, signatures) -> np.ndarray:
     """Per-column epsilon over the concatenated signature columns."""
     if not signatures:
         return np.zeros(0, dtype=np.float64)
-    return np.clip(
-        np.concatenate([cand.eps[s] for s in signatures]), 1e-9, 0.5 - 1e-9
-    )
+    return np.clip(np.concatenate([cand.eps[s] for s in signatures]), 1e-9, 0.5 - 1e-9)
 
 
 def _log_odds(eps: np.ndarray) -> np.ndarray:

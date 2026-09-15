@@ -103,12 +103,15 @@ register_schema("ReadOrfCoverageTable", READ_ORF_COVERAGE_TABLE)
 # cg:Z string is all `M` and cigar_stats folds mismatches into matches, so
 # every identity comes out 1.0.
 TEMPLATE_MINIMAP2_ARGS: tuple[str, ...] = (
-    "-x", "map-ont",
+    "-x",
+    "map-ont",
     "-c",
     "--eqx",
     "--secondary=yes",
-    "-N", "50",
-    "-p", "0.05",
+    "-N",
+    "50",
+    "-p",
+    "0.05",
 )
 
 
@@ -378,13 +381,13 @@ def assign_reads(
         nb = int(n_banded[0])
         sample = None if sample_of_read is None else sample_of_read.get(grp.read_id)
 
-        banded = _best_slot_per_template(
-            np.flatnonzero(in_band), tmpl, as_score
-        )
+        banded = _best_slot_per_template(np.flatnonzero(in_band), tmpl, as_score)
         if tie_resolution == "fractional" and banded.size > 1:
             slots = banded
             nw = templates.node_weight[tmpl[slots]].astype(np.float64)
-            share = nw / nw.sum() if nw.sum() > 0 else np.full(slots.size, 1 / slots.size)
+            share = (
+                nw / nw.sum() if nw.sum() > 0 else np.full(slots.size, 1 / slots.size)
+            )
         else:
             slots = np.array([w_slot], dtype=np.int64)
             share = np.array([1.0])

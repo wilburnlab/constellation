@@ -124,16 +124,24 @@ def test_absolute_band_admits_a_near_tie_and_excludes_a_far_hit():
     t = _templates()
 
     _w, n_banded, delta, in_band = rank_banded_candidates(
-        as_score, tmpl, ptr, node_weight=t.node_weight,
-        orf_aa_length=t.orf_aa_length, band_abs=40,
+        as_score,
+        tmpl,
+        ptr,
+        node_weight=t.node_weight,
+        orf_aa_length=t.orf_aa_length,
+        band_abs=40,
     )
     assert in_band.tolist() == [True, True, False]
     assert int(n_banded[0]) == 2
     assert delta.tolist() == [0, 40, 100]
 
     _w, n20, _d20, in20 = rank_banded_candidates(
-        as_score, tmpl, ptr, node_weight=t.node_weight,
-        orf_aa_length=t.orf_aa_length, band_abs=20,
+        as_score,
+        tmpl,
+        ptr,
+        node_weight=t.node_weight,
+        orf_aa_length=t.orf_aa_length,
+        band_abs=20,
     )
     assert in20.tolist() == [True, False, False]
     assert int(n20[0]) == 1
@@ -148,8 +156,12 @@ def test_band_is_absolute_not_a_ratio():
         as_score = np.array([best, best - 40], dtype=np.int64)
         ptr = np.array([0, 2], dtype=np.int64)
         _w, _n, _d, in_band = rank_banded_candidates(
-            np.asarray(as_score), np.array([0, 1]), ptr,
-            node_weight=t.node_weight, orf_aa_length=t.orf_aa_length, band_abs=40,
+            np.asarray(as_score),
+            np.array([0, 1]),
+            ptr,
+            node_weight=t.node_weight,
+            orf_aa_length=t.orf_aa_length,
+            band_abs=40,
         )
         assert in_band.tolist() == [True, True], "40 points is 40 points"
 
@@ -176,8 +188,11 @@ def test_tie_break_group_size_then_orf_length_then_score():
     # Equal weight and length → higher score wins.
     t = _templates(node_weight=[5.0] * 3, aa=[80] * 3)
     w, *_ = rank_banded_candidates(
-        np.array([2990, 3000, 2980], dtype=np.int64), tmpl, ptr,
-        node_weight=t.node_weight, orf_aa_length=t.orf_aa_length,
+        np.array([2990, 3000, 2980], dtype=np.int64),
+        tmpl,
+        ptr,
+        node_weight=t.node_weight,
+        orf_aa_length=t.orf_aa_length,
     )
     assert int(w[0]) == 1
 
@@ -194,8 +209,12 @@ def test_ranking_handles_many_reads_at_once():
     tmpl = rng.integers(0, 3, size=n).astype(np.int64)
     t = _templates(node_weight=[1.0, 1.0, 1.0], aa=[80, 80, 80])
     w, n_banded, delta, _ = rank_banded_candidates(
-        as_score, tmpl, ptr, node_weight=t.node_weight,
-        orf_aa_length=t.orf_aa_length, band_abs=0,
+        as_score,
+        tmpl,
+        ptr,
+        node_weight=t.node_weight,
+        orf_aa_length=t.orf_aa_length,
+        band_abs=0,
     )
     for g in range(200):
         lo, hi = int(ptr[g]), int(ptr[g + 1])

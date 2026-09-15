@@ -239,8 +239,8 @@ def extract_seed_orfs(
     orf_start = np.array([h[1] for h in hits], dtype=np.int64)
     orf_end = np.array([h[2] for h in hits], dtype=np.int64)
     abundance = uniq.column("abundance").to_numpy(zero_copy_only=False)[row]
-    tmpl_len = uniq.column("seq_len").to_numpy(zero_copy_only=False)[row].astype(
-        np.int64
+    tmpl_len = (
+        uniq.column("seq_len").to_numpy(zero_copy_only=False)[row].astype(np.int64)
     )
     orf_nt = pa.array(
         [seqs[int(i)][int(a) : int(b)] for i, a, b in zip(row, orf_start, orf_end)],

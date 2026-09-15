@@ -60,6 +60,7 @@ MAJOR = 0
 UNCOVERED = 6  # observed *as* a state, at coverage columns only
 UNOBSERVED = -1  # missing data: contributes exactly 0 to every score
 
+
 @dataclass(frozen=True, slots=True)
 class ReadStates:
     """Sparse per-read state over ``V`` candidate columns.
@@ -155,9 +156,7 @@ def read_states(events, cand: CandidateSet, weight: np.ndarray) -> ReadStates:
     np.cumsum(counts, out=ptr[1:])
     return ReadStates(
         ptr=ptr,
-        v=(
-            np.concatenate(rows_v) if rows_v else np.zeros(0, np.int32)
-        ),
+        v=(np.concatenate(rows_v) if rows_v else np.zeros(0, np.int32)),
         state=(np.concatenate(rows_s) if rows_s else np.zeros(0, np.int8)),
         obs_lo=lo,
         obs_hi=hi,
@@ -266,8 +265,9 @@ def _fit_budget(
     def cost(mask: np.ndarray) -> int:
         oth = mask & ~pure_cov
         k_oth = np.bincount(row, weights=oth[col], minlength=states.n_members)
-        k_pc = np.bincount(row, weights=(mask & pure_cov)[col],
-                           minlength=states.n_members)
+        k_pc = np.bincount(
+            row, weights=(mask & pure_cov)[col], minlength=states.n_members
+        )
         return int((k_oth**2).sum() + (k_pc * k_oth).sum())
 
     full = cost(all_on)
@@ -321,17 +321,21 @@ def _observation_tables(
     # accumulated as a single pair of bincounts over (u, span endpoint).
     s_ptr = states.ptr
     counts = (s_ptr[1:] - s_ptr[:-1])[rows]
-    gather = np.concatenate(
-        [np.arange(s_ptr[i], s_ptr[i + 1]) for i in rows]
-    ).astype(np.int64) if rows.size and counts.sum() else np.zeros(0, np.int64)
+    gather = (
+        np.concatenate([np.arange(s_ptr[i], s_ptr[i + 1]) for i in rows]).astype(
+            np.int64
+        )
+        if rows.size and counts.sum()
+        else np.zeros(0, np.int64)
+    )
     flat_u = states.v[gather].astype(np.int64)
     width = n_v + 2
     keys_lo = flat_u * width + np.repeat(lo, counts)
     keys_hi = flat_u * width + np.repeat(hi, counts)
     rep_w = np.repeat(w, counts)
-    diff = np.bincount(
-        keys_lo, weights=rep_w, minlength=n_v * width
-    ) - np.bincount(keys_hi, weights=rep_w, minlength=n_v * width)
+    diff = np.bincount(keys_lo, weights=rep_w, minlength=n_v * width) - np.bincount(
+        keys_hi, weights=rep_w, minlength=n_v * width
+    )
     a_tab = np.cumsum(diff.reshape(n_v, width), axis=1)[:, :n_v]
     return d, a_tab
 
@@ -382,12 +386,7 @@ def _pair_pvalues(
         n10 = n1x[big] - n11[big]
         n01 = nx1[big] - n11[big]
         n00 = n[big] - n1x[big] - nx1[big] + n11[big]
-        num = (
-            np.maximum(
-                np.abs(n11[big] * n00 - n10 * n01) - n[big] / 2.0, 0.0
-            )
-            ** 2
-        )
+        num = np.maximum(np.abs(n11[big] * n00 - n10 * n01) - n[big] / 2.0, 0.0) ** 2
         den = n1x[big] * (n[big] - n1x[big]) * nx1[big] * (n[big] - nx1[big])
         out[big] = stats.chi2.sf(n[big] * num / den, 1)
 
@@ -396,9 +395,7 @@ def _pair_pvalues(
         extreme = np.abs(n11[small] - e11[small])
         small = small[np.argsort(-extreme, kind="stable")[:max_exact]]
     if small.size:
-        out[small] = _fisher_sf(
-            n11[small], n1x[small], nx1[small], n[small]
-        )
+        out[small] = _fisher_sf(n11[small], n1x[small], nx1[small], n[small])
     return out
 
 
@@ -811,8 +808,12 @@ def resolve_signature(
 
     seed = np.full((1, n_cols), MAJOR, dtype=np.int8)
     patterns, prior, labels, ll = _lloyd(
-        x, observed, w, wc, _reestimate(x, observed, np.zeros(x.shape[0], np.int32),
-                                        w, seed), n_rounds
+        x,
+        observed,
+        w,
+        wc,
+        _reestimate(x, observed, np.zeros(x.shape[0], np.int32), w, seed),
+        n_rounds,
     )
     best = float(ll[np.arange(x.shape[0]), labels].sum())
     n_eff = max(int(observed.any(axis=1).sum()), 2)
@@ -823,9 +824,7 @@ def resolve_signature(
         r = int(np.argmax(cost))
         if cost[r] <= 0.0:
             break
-        trial = np.vstack(
-            [patterns, np.where(observed[r], x[r], patterns[labels[r]])]
-        )
+        trial = np.vstack([patterns, np.where(observed[r], x[r], patterns[labels[r]])])
         t_pat, t_prior, t_lab, t_ll = _lloyd(x, observed, w, wc, trial, n_rounds)
         t_best = float(t_ll[np.arange(x.shape[0]), t_lab].sum())
         if 2.0 * (t_best - best) <= penalty:

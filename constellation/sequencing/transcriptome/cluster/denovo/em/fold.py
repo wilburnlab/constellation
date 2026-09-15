@@ -159,10 +159,7 @@ def classify_pairs(
 
     if allow_frameshift:
         maybe = (
-            ~rule1
-            & (n_insert == 0)
-            & (n_mismatch <= max_fs_mismatch)
-            & (net % 3 != 0)
+            ~rule1 & (n_insert == 0) & (n_mismatch <= max_fs_mismatch) & (net % 3 != 0)
         )
         idx = np.flatnonzero(maybe)
         if idx.size:
@@ -170,7 +167,6 @@ def classify_pairs(
             ok = np.array([indel_runs(c) == (0, 1) for c in cig], dtype=bool)
             out[idx[ok]] = FoldRule.FRAMESHIFT
     return out
-
 
 
 def _merge_by_representative(
@@ -279,9 +275,7 @@ def fold_orfs(
     n_reads = seed.column("n_reads").to_numpy(zero_copy_only=False).astype(np.int64)
 
     log(f"folding {n_orf:,} distinct ORFs at identity {identity}…")
-    index = extract_minimizers(
-        orf_nt, k=kmer, w=window, max_per_seq=minimizers_per_seq
-    )
+    index = extract_minimizers(orf_nt, k=kmer, w=window, max_per_seq=minimizers_per_seq)
     cands = generate_candidates(
         index, n_reads, min_shared=min_shared, diag_span_max=diag_span_max
     )

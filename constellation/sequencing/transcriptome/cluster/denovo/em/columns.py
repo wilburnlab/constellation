@@ -276,11 +276,11 @@ def column_stats(
         minor_frac = np.where(depth > 0, n_minor / depth, 0.0)
 
     total = float(max(n_assigned, 0.0))
-    uncov_frac = (
-        np.clip(1.0 - depth / total, 0.0, 1.0) if total > 0 else np.zeros(f)
-    )
+    uncov_frac = np.clip(1.0 - depth / total, 0.0, 1.0) if total > 0 else np.zeros(f)
     loc = _local_max(depth, local_window)
-    uncov_frac_local = np.where(loc > 0, np.clip(1.0 - depth / np.maximum(loc, 1e-12), 0.0, 1.0), 0.0)
+    uncov_frac_local = np.where(
+        loc > 0, np.clip(1.0 - depth / np.maximum(loc, 1e-12), 0.0, 1.0), 0.0
+    )
 
     hp_run = homopolymer_runs(_context_codes(cres, pwm))
     # Either allele being a gap is a length change. On a minority-insertion
@@ -441,9 +441,7 @@ def candidate_columns(
     f = stats.n_columns
 
     # ── allelic ──
-    testable = (
-        (stats.minor_frac >= f_min) & (stats.n_minor >= a_min) & (depth > 0)
-    )
+    testable = (stats.minor_frac >= f_min) & (stats.n_minor >= a_min) & (depth > 0)
     t_idx = np.flatnonzero(testable)
     p_value = np.ones(f, dtype=np.float64)
     q_cut = -1.0
