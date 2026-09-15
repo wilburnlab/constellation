@@ -1,4 +1,30 @@
-"""Stage 2 — E-step: assign every read to a template.
+"""Stage 2 — E-step: assign every read to a template. **SUPERSEDED.**
+
+.. warning::
+
+   The assignment rule in this module is no longer the one the loop runs.
+   :mod:`.scheduler` holds the rule, :mod:`.assign` the reducer, and
+   :mod:`.paf_scan` the decoder; ``em/rounds.py`` calls those. Nothing in the
+   library imports anything below this docstring any more.
+
+   It is kept rather than deleted because it still carries two capabilities
+   the new path does not, and deleting it would make that a silent regression
+   rather than a recorded gap:
+
+   * **``tie_resolution="fractional"``** — splitting a read's mass across its
+     banded templates by ``node_weight``, which drives node weights and the
+     M-step PWM while reported membership and quant still come from the
+     argmax. The new rule emits one winner at ``weight=1.0``. Library-only;
+     it was never reachable from the CLI.
+   * **``emit_coverage`` / ``READ_ORF_COVERAGE_TABLE``** — the non-exclusive
+     (read, template) ORF-coverage view, which is the input to the later
+     graph stage. Deliberately not emitted during rounds: it is one Python
+     CIGAR walk per *banded* pair, i.e. 50-90M per round at 9.4M reads.
+
+   Restoring either onto the new path is a small piece of work; doing it
+   inside this module is not, because the ranking it is wired to is gone.
+
+Every read is aligned to every template with minimap2 and assigned by
 
 Every read is aligned to every template with minimap2 and assigned by
 alignment score, with candidates inside an **absolute** band of the best
