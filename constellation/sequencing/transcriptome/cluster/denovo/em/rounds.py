@@ -118,6 +118,7 @@ def run_em(
     *,
     params: EmParams | None = None,
     resume: bool = False,
+    report: bool = True,
     progress=None,
 ) -> list[RoundResult]:
     """Run the EM loop to convergence (or ``params.rounds``)."""
@@ -141,12 +142,12 @@ def run_em(
 
     reads = ReadStore.open(corpus.arrow_path)
     try:
-        return _loop(corpus, reads, output_dir, params, resume, log)
+        return _loop(corpus, reads, output_dir, params, resume, report, log)
     finally:
         reads.close()
 
 
-def _loop(corpus, reads, output_dir, params, resume, log) -> list[RoundResult]:
+def _loop(corpus, reads, output_dir, params, resume, report, log) -> list[RoundResult]:
     rounds_dir = output_dir / "rounds"
     start, templates_table = _resume_point(rounds_dir, resume, log)
 
@@ -214,6 +215,18 @@ def _loop(corpus, reads, output_dir, params, resume, log) -> list[RoundResult]:
             f"wrote {clusters.num_rows:,} clusters over "
             f"{membership.num_rows:,} assigned reads"
         )
+    if report:
+        try:
+            from constellation.sequencing.transcriptome.cluster.denovo.em import (
+                diagnostics as em_diag,
+            )
+
+            log(f"diagnostic report: {em_diag.build_em_report(output_dir)}")
+        except Exception as exc:  # noqa: BLE001 — a report never sinks a run
+            log(
+                f"diagnostics failed ({type(exc).__name__}); "
+                f"regenerate with `em.diagnostics.build_em_report`: {exc}"
+            )
     return results
 
 

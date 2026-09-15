@@ -207,6 +207,7 @@ import constellation.sequencing.transcriptome.cluster.denovo.em
 import constellation.sequencing.transcriptome.cluster.denovo.em.assign
 import constellation.sequencing.transcriptome.cluster.denovo.em.outputs
 import constellation.sequencing.transcriptome.cluster.denovo.em.corpus
+import constellation.sequencing.transcriptome.cluster.denovo.em.diagnostics
 import constellation.sequencing.transcriptome.cluster.denovo.em.estep
 import constellation.sequencing.transcriptome.cluster.denovo.em.fold
 import constellation.sequencing.transcriptome.cluster.denovo.em.mstep

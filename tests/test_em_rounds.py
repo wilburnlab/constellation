@@ -289,3 +289,42 @@ def test_the_user_facing_outputs_are_written_in_the_shared_shapes(corpus_dir, tm
         roles.setdefault(cid, []).append(role)
     for cid, rs in roles.items():
         assert rs.count("representative") == 1, cid
+
+
+def test_the_diagnostics_report_is_emitted_and_reads_the_real_artifacts(
+    corpus_dir, tmp_path
+):
+    """Every metric is a pure function over what the loop already wrote."""
+    out = tmp_path / "em"
+    run_em(corpus_dir, out, params=_params(rounds=2))
+
+    report = (out / "diagnostics" / "report.md").read_text()
+    for heading in (
+        "Convergence",
+        "Candidate pool",
+        "Assignment rule",
+        "Reference drift",
+        "Cluster sizes",
+    ):
+        assert f"## {heading}" in report
+
+    # Regenerable read-only against a finished run.
+    from constellation.sequencing.transcriptome.cluster.denovo.em.diagnostics import (
+        build_em_report,
+    )
+
+    assert build_em_report(out).exists()
+
+
+def test_a_saturated_candidate_pool_is_flagged(corpus_dir, tmp_path):
+    """-N is a correctness parameter; truncation must be loud, not logged."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.diagnostics import (
+        section_candidate_pool,
+    )
+
+    out = tmp_path / "em"
+    # -N 1 guarantees every read's pool is truncated.
+    run_em(corpus_dir, out, params=_params(rounds=1, minimap2_n=1))
+    section = section_candidate_pool(out)
+    assert section.flags, "a truncated pool must raise a flag"
+    assert "TRUNCATED" in section.flags[0]
