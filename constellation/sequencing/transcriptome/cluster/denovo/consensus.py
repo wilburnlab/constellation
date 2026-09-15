@@ -403,7 +403,9 @@ def _build_pwm(
     return flat.reshape(f, 5)
 
 
-def _call_winner(pwm: np.ndarray, frame_codes: np.ndarray) -> np.ndarray:
+def _call_winner(
+    pwm: np.ndarray, frame_codes: np.ndarray, is_template: np.ndarray | None = None
+) -> np.ndarray:
     """Per-column winning code: 0-3 base, 4 gap (dropped), 5 unresolved N."""
     row_max = pwm.max(axis=1)
     winner = np.where(row_max <= 0.0, frame_codes, pwm.argmax(axis=1))
@@ -413,7 +415,18 @@ def _call_winner(pwm: np.ndarray, frame_codes: np.ndarray) -> np.ndarray:
     # consensus though neither had a deletion, shifting every downstream
     # coordinate and potentially the ORF reading frame. Emit N and keep the
     # column; only a genuine gap-winning column is removed.
-    return np.where((row_max <= 0.0) & (frame_codes >= _GAP), _AMBIG, winner)
+    #
+    # That reasoning is about a base the TEMPLATE carries. An insertion column
+    # carries none — `frame_codes` is `_GAP` there by construction — so an
+    # unvoted one is the absence of an insertion, not an unknown base. Without
+    # the `is_template` guard a child sharing a pooled plan emitted one N per
+    # column of a block some *other* population created: `AACCGG` came back as
+    # `AACNNNCGG`, longer than the template, with every downstream coordinate
+    # shifted, on the strength of reads that were not its own.
+    unresolved = (row_max <= 0.0) & (frame_codes >= _GAP)
+    if is_template is not None:
+        unresolved &= is_template
+    return np.where(unresolved, _AMBIG, winner)
 
 @dataclass(frozen=True, slots=True)
 class ColumnPlan:
@@ -763,7 +776,9 @@ def frame_consensus(
     # base, so an uncovered one is a gap rather than a fallback.
     expanded_codes = np.full(plan.n_columns, _GAP, dtype=np.int64)
     expanded_codes[plan.template_at] = frame_codes
-    winner = _call_winner(pwm, expanded_codes)
+    is_template = np.zeros(plan.n_columns, dtype=bool)
+    is_template[plan.template_at] = True
+    winner = _call_winner(pwm, expanded_codes, is_template)
 
     tmpl_src = (
         np.arange(n_template, dtype=np.int64)

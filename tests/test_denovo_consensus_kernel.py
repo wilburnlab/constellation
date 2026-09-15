@@ -487,6 +487,46 @@ def test_member_spans_bracket_every_covered_column():
         assert hi[i] > covered.max(), "span must end after coverage"
 
 
+# ── a shared plan must not put another population's sequence in a child ──
+
+
+def test_an_unvoted_insertion_column_is_a_gap_not_an_unresolved_n():
+    """A child sharing a pooled column plan has a column for every insertion
+    ANY population carried. An unvoted one is the absence of an insertion, not
+    an unknown base — the unresolved-N rule is about a base the *template*
+    carries, and the template carries none at an insertion column.
+
+    Without the distinction the child emitted one N per column of someone
+    else's block: `AACCGG` came back as `AACNNNCGG`, longer than the template,
+    every downstream coordinate shifted, on the strength of reads that were
+    not its own.
+    """
+    rng = np.random.default_rng(107)
+    body = _rand(rng, 400)
+    inserted = body[:200] + "TTT" + body[200:]
+    pooled = frame_consensus(body, _specs(body, [inserted] * 20), frame_weight=0.0)
+    assert pooled.plan.n_columns == len(body) + 3, "the fixture must plan a block"
+
+    # A child whose reads all stop at or start at the junction: nothing spans
+    # it, so the block has zero depth and the template offers no base. Split at
+    # the junction the plan actually chose — edlib is free to place an
+    # insertion at either end of an equally good position.
+    j = int(np.flatnonzero(pooled.plan.block_width > 0)[0])
+    halves = [body[:j]] * 10 + [body[j:]] * 10
+    child = frame_consensus(
+        body, _specs(body, halves), frame_weight=0.0, plan=pooled.plan
+    )
+    block = np.flatnonzero(child.column_kind == COL_INSERTED)
+    assert block.size == 3 and child.pwm[block].sum() == 0.0
+    assert "N" not in child.consensus
+    assert len(child.consensus) == len(body)
+
+    # A template N with no coverage is still kept — that rule is unchanged.
+    with_n = body[:100] + "N" + body[101:]
+    alone = frame_consensus(with_n, [], frame_weight=0.0)
+    assert alone.consensus[100] == "N"
+
+
 # ── PWM mass accounting ───────────────────────────────────────────────
 
 

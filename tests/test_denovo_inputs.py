@@ -127,3 +127,31 @@ def test_the_boundary_is_inclusive(tmp_path, limit):
         _write_demux_dir(tmp_path, [("r", "A" * 500, 0)]), max_window_length=limit
     )
     assert reads.num_rows == (0 if limit < 500 else 1)
+
+
+def test_dropping_a_window_does_not_crash_a_quiet_run(tmp_path, monkeypatch):
+    """The length-filter report called a logger that only exists under
+    `verbose` or a progress callback — so the report crashed on exactly the
+    runs where a window was actually dropped and the number mattered."""
+    from constellation.sequencing.transcriptome.cluster.denovo import pipeline
+
+    demux = _corpus(tmp_path)
+    seen = {}
+
+    def _fake(reads, **kw):
+        seen["n"] = reads.num_rows
+        raise _Stop
+
+    class _Stop(Exception):
+        pass
+
+    monkeypatch.setattr(pipeline, "assemble_clusters", _fake)
+    with pytest.raises(_Stop):
+        pipeline.cluster_transcripts(
+            demux_dir=demux,
+            output_dir=tmp_path / "out",
+            max_window_length=1000,
+            verbose=False,
+            progress_cb=None,
+        )
+    assert seen["n"] == 2, "the filter ran; the report must not have crashed"

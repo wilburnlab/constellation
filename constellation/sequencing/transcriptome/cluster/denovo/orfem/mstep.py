@@ -220,25 +220,31 @@ def specs_from_assignments(
 
 
 
-def _child_position(cres: ConsensusResult, column: int, *, forward: bool) -> int:
-    """A PWM column's position in one child's own consensus.
+def _consensus_offset(cres: ConsensusResult, column: int) -> int:
+    """How many consensus bases of ``cres`` precede PWM ``column``.
 
-    A column dropped by that child (its state votes gap there) has no
-    position, so walk to the nearest kept neighbour in the direction the
-    caller cares about. Reusing the parent's number instead is how a boundary
-    silently slides: deleting 30 upstream bases moves an ORF end from 336 to
-    306, and certifying through 336 waves ten unsupported residues past the
-    gate.
+    One function for both ends of the seed interval, because both want the
+    same number: an *inclusive* PWM start maps to the consensus index of the
+    base there (= the count of bases before it), and an *exclusive* PWM end
+    maps to the exclusive consensus bound (= the same count). A column the
+    child dropped contributes 0, which places the boundary where that base
+    would have sat — the reason this exists at all, since reusing the parent's
+    number is how a boundary silently slides: deleting 30 upstream bases moves
+    an ORF end from 336 to 306, and certifying through 336 waves ten
+    unsupported residues past the gate.
+
+    The predecessor walked to the nearest kept neighbour and returned *its*
+    consensus index, which is an inclusive position used as an exclusive
+    bound. At the template's own end it also clamped ``n_columns`` to
+    ``n_columns - 1``, so a seed ORF running to the end of its template came
+    back one base short — and ``gated_orf`` then judged, and truncated,
+    ground inside the interval it is explicitly told to treat as certified
+    (measured: a 126 nt seed reported ``orf_end=123`` and a support-truncation
+    flag whenever depth sat below ``support_min_depth``).
     """
-    c_of = cres.cons_of_frame
-    n = c_of.shape[0]
-    col = int(np.clip(column, 0, n - 1))
-    step = -1 if forward else 1
-    while 0 <= col < n and c_of[col] < 0:
-        col += step
-    if not (0 <= col < n):
-        return len(cres.consensus) if forward else 0
-    return int(c_of[col])
+    keep = np.asarray(cres.cons_of_frame) >= 0
+    c = int(np.clip(column, 0, keep.shape[0]))
+    return int(np.count_nonzero(keep[:c]))
 
 
 def _ALLELE_CHAR(v: int) -> str:
@@ -516,12 +522,10 @@ def refine_template(
             consensus,
             certified,
             seed_orf_start=int(
-                np.clip(_child_position(cres, seed_col_start, forward=False) - lo,
-                        0, span)
+                np.clip(_consensus_offset(cres, seed_col_start) - lo, 0, span)
             ),
             seed_orf_end=int(
-                np.clip(_child_position(cres, seed_col_end, forward=True) - lo,
-                        0, span)
+                np.clip(_consensus_offset(cres, seed_col_end) - lo, 0, span)
             ),
             min_aa_length=min_aa_length,
         )

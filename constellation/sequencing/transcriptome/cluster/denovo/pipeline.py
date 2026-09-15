@@ -1228,7 +1228,13 @@ def cluster_transcripts(
     # Stage logger — flush immediately so the last line is visible even if a
     # native library aborts the process (the std::length_error class of crash
     # bypasses Python's normal stderr flush).
-    log: Callable[[str], None] | None = None
+    # A no-op default rather than None: every `log(...)` below then works
+    # unconditionally. The previous `None` default made the length-filter
+    # report a TypeError on any quiet run that actually dropped a window —
+    # i.e. the exact runs where the number matters.
+    def log(msg: str) -> None:
+        return None
+
     if verbose or progress_cb is not None:
 
         def _log(msg: str) -> None:

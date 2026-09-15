@@ -364,6 +364,25 @@ def test_haplotype_read_counts_sum_to_the_template_total():
     assert sum(n.n_reads for n in nodes) == 75
 
 
+def test_a_seed_orf_running_to_the_template_end_is_not_gated():
+    """The seed interval is certified by construction; only ground OUTSIDE it
+    is judged. An exclusive PWM end was being clamped to the last column index
+    and then read as an inclusive position, so a seed ORF ending at the
+    template's own end came back one base short — and the gate then truncated
+    inside the interval it is told to trust, at any depth below
+    ``support_min_depth``."""
+    rng = np.random.default_rng(43)
+    orf = "ATG" + "".join(rng.choice(_CODONS) for _ in range(40)) + "TAA"
+    for n_reads in (1, 2, 20):
+        nodes = refine_template(
+            orf, _specs(orf, [orf] * n_reads), min_aa_length=30,
+            seed_orf=(0, len(orf)),
+        )
+        n = nodes[0]
+        assert n.orf_end == len(orf), f"{n_reads} reads"
+        assert n.orf_is_truncated_by_support is False, f"{n_reads} reads"
+
+
 # ── minimap2 CIGARs feed the PWM directly ─────────────────────────────
 
 
