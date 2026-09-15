@@ -226,17 +226,26 @@ def measure_churn(
 
     n_inherited = 0
     if n_moved and lineage.num_rows:
-        edges = _pack(
-            lineage.column("child_template_id").to_numpy(zero_copy_only=False),
-            lineage.column("parent_template_id").to_numpy(zero_copy_only=False),
+        edges = np.unique(
+            _pair_key(
+                lineage.column("child_template_id").to_numpy(zero_copy_only=False),
+                lineage.column("parent_template_id").to_numpy(zero_copy_only=False),
+            )
         )
-        edges = np.unique(edges)
-        probe = _pack(cur[moved], prev[moved])
+        probe = _pair_key(cur[moved], prev[moved])
         pos = np.searchsorted(edges, probe)
         ok = (pos < edges.size) & (edges[np.clip(pos, 0, edges.size - 1)] == probe)
         n_inherited = int(ok.sum())
 
     genuine = n_moved - n_inherited
+    n_gained = int(((prev < 0) & (cur >= 0)).sum())
+    n_lost = int(((prev >= 0) & (cur < 0)).sum())
+    # Reads that GAINED or LOST an assignment are movement too. Measured over
+    # the both-assigned population alone, losing half the assignments scores
+    # zero churn as long as the survivors kept their lineage — so the loop
+    # would call that converged. The denominator is therefore every read
+    # assigned in EITHER round.
+    n_either = n_both + n_gained + n_lost
     return {
         "n_compared": n_both,
         "n_moved_raw": n_moved,
@@ -244,8 +253,13 @@ def measure_churn(
         "n_moved_genuine": genuine,
         "frac_changed": (n_moved / n_both) if n_both else 0.0,
         "frac_changed_lineage": (genuine / n_both) if n_both else 0.0,
-        "n_gained": int((~(prev >= 0) & (cur >= 0)).sum()),
-        "n_lost": int(((prev >= 0) & ~(cur >= 0)).sum()),
+        # What the stopping rule reads: unstable reads over reads assigned in
+        # either round, so gains and losses cannot hide inside a stable core.
+        "frac_unsettled": (
+            (genuine + n_gained + n_lost) / n_either if n_either else 0.0
+        ),
+        "n_gained": n_gained,
+        "n_lost": n_lost,
     }
 
 
@@ -258,11 +272,21 @@ def _scatter(out: np.ndarray, table: pa.Table) -> None:
     out[rows[keep]] = tid[keep]
 
 
-def _pack(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """A sortable key over an (id, id) pair, without a Python tuple per row."""
-    return (np.asarray(a, dtype=np.int64) << np.int64(21)) ^ np.asarray(
-        b, dtype=np.int64
-    )
+#: Exact (id, id) comparison with no packing. The bit-packed form this
+#: replaces, ``(child << 21) ^ parent``, overlaps the two ids once a row index
+#: reaches 2**21 — and round 1 carries ~4.17M templates, so the collision is
+#: reachable in production, not theoretical. A collision reports an unrelated
+#: switch as inherited, which reads as zero lineage-aware churn and stops the
+#: loop early.
+_PAIR_DTYPE = np.dtype([("child", np.int64), ("parent", np.int64)])
+
+
+def _pair_key(child: np.ndarray, parent: np.ndarray) -> np.ndarray:
+    """A lexicographically sortable structured view of (child, parent)."""
+    out = np.empty(np.asarray(child).size, dtype=_PAIR_DTYPE)
+    out["child"] = child
+    out["parent"] = parent
+    return out
 
 
 # ── the redundancy detector (B2) ──────────────────────────────────────

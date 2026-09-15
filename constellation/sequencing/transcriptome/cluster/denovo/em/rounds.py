@@ -45,6 +45,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
 from constellation.sequencing.transcriptome.cluster.denovo.em.fold import fold_orfs
 from constellation.sequencing.transcriptome.cluster.denovo.em.outputs import (
     build_cluster_tables,
+    write_em_manifest,
     write_em_outputs,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
@@ -143,14 +144,18 @@ def run_em(
 
     reads = ReadStore.open(corpus.arrow_path)
     try:
-        return _loop(corpus, reads, output_dir, params, resume, report, log)
+        return _loop(
+            corpus, reads, output_dir, Path(demux_dir), params, resume, report, log
+        )
     finally:
         reads.close()
 
 
-def _loop(corpus, reads, output_dir, params, resume, report, log) -> list[RoundResult]:
+def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> list[RoundResult]:
     rounds_dir = output_dir / "rounds"
-    start, templates_table = _resume_point(rounds_dir, resume, log)
+    start, templates_table, prev_assignments, history = _resume_point(
+        rounds_dir, resume, log
+    )
 
     if templates_table is None:
         templates_table = _round_one_templates(
@@ -161,7 +166,6 @@ def _loop(corpus, reads, output_dir, params, resume, report, log) -> list[RoundR
             return []
 
     results: list[RoundResult] = []
-    prev_assignments: pa.Table | None = None
     final_nodes: pa.Table | None = None
     final_assignments: pa.Table | None = None
     final_membership: pa.Table | None = None
@@ -186,9 +190,13 @@ def _loop(corpus, reads, output_dir, params, resume, report, log) -> list[RoundR
 
             if r == start + params.rounds - 1:
                 break
+            # frac_unsettled, not frac_changed_lineage: the latter is measured
+            # only over reads assigned in BOTH rounds, so losing half the
+            # assignments scores zero churn as long as the survivors kept
+            # their lineage, and the loop would call that converged.
             if (
                 prev_assignments is not None
-                and result.churn.get("frac_changed_lineage", 1.0)
+                and result.churn.get("frac_unsettled", 1.0)
                 < params.stop_frac_changed
             ):
                 log(f"converged at round {r}")
@@ -208,7 +216,7 @@ def _loop(corpus, reads, output_dir, params, resume, report, log) -> list[RoundR
         finally:
             store.close()
 
-    _write_summary(output_dir, results)
+    _write_summary(output_dir, history + results)
     if final_nodes is not None and final_assignments is not None:
         clusters, membership, sample_id = build_cluster_tables(
             final_nodes,
@@ -217,7 +225,26 @@ def _loop(corpus, reads, output_dir, params, resume, report, log) -> list[RoundR
             reads=reads,
             identity_threshold=params.p_floor,
         )
-        write_em_outputs(output_dir, clusters, membership, sample_id)
+        paths = write_em_outputs(output_dir, clusters, membership, sample_id)
+        last = results[-1] if results else None
+        write_em_manifest(
+            output_dir,
+            demux_dir,
+            parameters={"mode": "em", **asdict(params)},
+            stages={
+                "n_input_reads": int(corpus.stats.get("n_input", corpus.n_reads)),
+                "n_reads": int(corpus.n_reads),
+                "n_rounds": len(results),
+                "n_clusters": int(clusters.num_rows),
+                "n_membership_rows": int(membership.num_rows),
+                "converged": bool(
+                    last is not None
+                    and last.churn.get("frac_unsettled", 1.0)
+                    < params.stop_frac_changed
+                ),
+            },
+            outputs={k: v.name for k, v in paths.items()},
+        )
         log(
             f"wrote {clusters.num_rows:,} clusters over "
             f"{membership.num_rows:,} assigned reads"
@@ -416,39 +443,87 @@ def _read_lineage(rd: Path) -> pa.Table:
 
 
 def _resume_point(rounds_dir: Path, resume: bool, log):
-    """Start after the last round with a ``_SUCCESS``; rebuild its successor."""
+    """Start after the last round with a ``_SUCCESS``; rebuild its successor.
+
+    Returns ``(start_round, templates, prev_assignments, history)``. The last
+    two matter: without the previous round's assignments the resumed round has
+    nothing to measure churn against and reports none, and without the history
+    ``churn.tsv`` is overwritten with only the resumed invocation's rounds.
+    """
     if not resume or not rounds_dir.exists():
-        return 1, None
+        return 1, None, None, []
     done = sorted(
         int(d.name[1:])
         for d in rounds_dir.glob("r*")
         if d.name[1:].isdigit() and (d / _SUCCESS).exists()
     )
     if not done:
-        return 1, None
+        return 1, None, None, []
     last = done[-1]
-    nxt = rounds_dir / f"r{last + 1:02d}" / "templates" / TEMPLATES_ARROW
-    if nxt.exists():
+    prev = _read_assignments(rounds_dir / f"r{last:02d}" / "assignments")
+    history = _read_history(rounds_dir, done)
+    nxt_dir = rounds_dir / f"r{last + 1:02d}" / "templates"
+    # The _SUCCESS marker, not the file's existence: a run interrupted DURING
+    # that write leaves a truncated Arrow file behind, and trusting it makes
+    # resume die with ArrowInvalid instead of rebuilding from the round that
+    # did finish.
+    if (nxt_dir / _SUCCESS).exists() and (nxt_dir / TEMPLATES_ARROW).exists():
         log(f"resuming at round {last + 1}")
-        with pa.memory_map(str(nxt), "r") as mm:
+        with pa.memory_map(str(nxt_dir / TEMPLATES_ARROW), "r") as mm:
             with pa.ipc.open_file(mm) as reader:
-                return last + 1, reader.read_all()
+                return last + 1, reader.read_all(), prev, history
     # The successor's templates were never written: rebuild them from this
     # round's nodes, which with the assignments is all a restart needs.
     rd = rounds_dir / f"r{last:02d}"
     nodes_dir = rd / "mstep" / "nodes"
     store_path = rd / "templates" / TEMPLATES_ARROW
     if not nodes_dir.exists() or not store_path.exists():
-        return 1, None
+        return 1, None, None, []
     log(f"resuming after round {last} (rebuilding its successor's templates)")
     store = TemplateStore.open(store_path)
     try:
         nodes = pa_ds.dataset(
             sorted(nodes_dir.glob("part-*.parquet")), schema=REFINED_NODE_TABLE
         ).to_table()
-        return last + 1, rf.next_templates(nodes, store, round_index=last).templates
+        refined = rf.next_templates(nodes, store, round_index=last)
+        # Persist the rebuilt lineage too: the resumed round's churn needs it
+        # to tell a split from a genuine switch, and rebuilding it without
+        # writing it would discard exactly that.
+        lineage_path = rd / "lineage.parquet"
+        if not lineage_path.exists():
+            pq.write_table(refined.lineage, lineage_path)
+        return last + 1, refined.templates, prev, history
     finally:
         store.close()
+
+
+def _read_history(rounds_dir: Path, done: list[int]) -> list[RoundResult]:
+    """Rebuild finished rounds' summaries from their own ``round.json``.
+
+    So a resumed run's churn.tsv carries the whole run rather than only the
+    rounds this invocation happened to execute.
+    """
+    out: list[RoundResult] = []
+    for r in done:
+        j = _round_json(rounds_dir / f"r{r:02d}")
+        if not j:
+            continue
+        out.append(
+            RoundResult(
+                round_index=int(j.get("round_index", r)),
+                n_templates=int(j.get("n_templates", 0)),
+                estep=j.get("estep", {}),
+                n_nodes=int(j.get("n_nodes", 0)),
+                churn=j.get("churn", {}),
+                seconds=j.get("seconds", {}),
+            )
+        )
+    return out
+
+
+def _round_json(d: Path) -> dict:
+    path = d / "round.json"
+    return json.loads(path.read_text()) if path.exists() else {}
 
 
 def _write_summary(output_dir: Path, results: list[RoundResult]) -> None:

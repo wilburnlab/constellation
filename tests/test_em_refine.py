@@ -322,3 +322,73 @@ def test_sample_ids_come_from_the_assignments():
     )
     assert sorted(sample_id.tolist()) == [10, 10, 20]
     assert -1 not in sample_id.tolist(), "pooling into sample -1 corrupts TPM"
+
+
+def test_unique_sequence_count_is_not_the_read_count():
+    """Identical reads are one sequence; counting reads makes the ratio 1."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.outputs import (
+        build_cluster_tables,
+    )
+
+    class _Reads:
+        n_reads = 4
+        sequence = pa.chunked_array(
+            [pa.array(["AAAA", "AAAA", "AAAA", "CCCC"], pa.large_string())]
+        )
+
+    nodes = _nodes([(10, 0, 0, "ACGT" * 25, 4, 4.0)])
+    membership = _node_membership(
+        [(10, 0, 0, 1.0), (10, 0, 1, 1.0), (10, 0, 2, 1.0), (10, 0, 3, 1.0)]
+    )
+    clusters, _, _ = build_cluster_tables(
+        nodes,
+        _assignments_for([0, 1, 2, 3], 10),
+        membership,
+        reads=_Reads(),
+        identity_threshold=0.97,
+    )
+    assert clusters.column("n_reads").to_pylist() == [4]
+    assert clusters.column("n_unique_sequences").to_pylist() == [2]
+
+
+def test_lineage_membership_does_not_collide_at_scale():
+    """(child << 21) ^ parent overlaps the two ids past 2**21 template rows.
+
+    Round 1 carries ~4.17M templates, so this is reachable in production: a
+    collision reports an unrelated switch as inherited, which reads as zero
+    lineage-aware churn and stops the loop early.
+    """
+    child_a, parent_a = (2 << 40) | 0, (1 << 40) | 0
+    child_b, parent_b = (2 << 40) | 1, (1 << 40) | 2_097_152
+    # These two edges collide under the old packing.
+    assert ((child_a << 21) ^ parent_a) == ((child_b << 21) ^ parent_b)
+
+    lineage = pa.table(
+        {
+            "round": pa.array([2], pa.int32()),
+            "child_template_id": pa.array([child_a], pa.int64()),
+            "parent_template_id": pa.array([parent_a], pa.int64()),
+            "rule": pa.array(["carry"], pa.string()),
+            "n_reads": pa.array([1.0], pa.float64()),
+        },
+        schema=LINEAGE_TABLE,
+    )
+    # Read 0 genuinely switched from parent_b to child_b — an unrelated pair.
+    stats = measure_churn(
+        _assign([(0, parent_b)]), _assign([(0, child_b)]), lineage, n_reads=1
+    )
+    assert stats["n_moved_inherited"] == 0, "collided onto an unrelated edge"
+    assert stats["frac_changed_lineage"] == pytest.approx(1.0)
+
+
+def test_convergence_counts_reads_that_gain_or_lose_an_assignment():
+    """Measured over both-assigned reads alone, losing half scores zero churn."""
+    prev = _assign([(0, 10), (1, 10), (2, 10), (3, 10)])
+    cur = _assign([(0, 10), (1, 10)])  # two reads lost their assignment
+    stats = measure_churn(prev, cur, LINEAGE_TABLE.empty_table(), n_reads=4)
+
+    assert stats["frac_changed_lineage"] == pytest.approx(0.0), "the old measure"
+    assert stats["n_lost"] == 2
+    # The stopping rule reads this one, so half the corpus vanishing cannot
+    # look converged.
+    assert stats["frac_unsettled"] == pytest.approx(0.5)

@@ -332,6 +332,41 @@ def write_em_outputs(
     return paths
 
 
+def write_em_manifest(
+    output_dir: Path,
+    demux_dir: Path,
+    *,
+    parameters: dict,
+    stages: dict,
+    outputs: dict[str, str],
+    samples: list[str] | None = None,
+) -> Path:
+    """Write the ``manifest.json`` every downstream consumer keys on.
+
+    Without it ``read_manifest_dir`` rejects a completed run as an
+    unrecognised pipeline output, so the viz layer cannot attach the directory
+    as a source however well-formed its parquet is. The manifest is what makes
+    an output dir a *stage* rather than a pile of files.
+    """
+    from constellation.sequencing.transcriptome.manifest import write_cluster_manifest
+
+    write_cluster_manifest(
+        Path(output_dir) / "manifest.json",
+        reference_handle=None,
+        reference_path=None,
+        assembly_accession=None,
+        # No align dir: this is a reference-free clusterer, the same as the
+        # kmer path writes.
+        align_dir="",
+        demux_dir=str(demux_dir),
+        parameters=parameters,
+        stages=stages,
+        outputs=outputs,
+        samples=samples,
+    )
+    return Path(output_dir) / "manifest.json"
+
+
 def _write_fasta(path: Path, names, seqs) -> None:
     with Path(path).open("w", encoding="utf-8") as fh:
         for name, seq in zip(names, seqs):
@@ -344,5 +379,6 @@ __all__ = [
     "LEGACY_CLUSTER_MODES",
     "MODE_EM",
     "build_cluster_tables",
+    "write_em_manifest",
     "write_em_outputs",
 ]

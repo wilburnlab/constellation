@@ -11,6 +11,7 @@ already tested without it.
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -328,3 +329,105 @@ def test_a_saturated_candidate_pool_is_flagged(corpus_dir, tmp_path):
     section = section_candidate_pool(out)
     assert section.flags, "a truncated pool must raise a flag"
     assert "TRUNCATED" in section.flags[0]
+
+
+# ── review regressions ────────────────────────────────────────────────
+
+
+def test_a_read_minimap2_never_reports_is_still_accounted_for(tmp_path):
+    """No PAF line means no row — the read vanished from the rejection rate.
+
+    minimap2 emits nothing for a read with no hit above its chaining
+    threshold, so such reads were neither assigned nor unassigned and had no
+    row at all. That silently understates the number the admission floor
+    exists to make visible.
+    """
+    rng = np.random.default_rng(5)
+    truth = _orf(rng, 120)
+    rows = [
+        (f"real_{i}", _mutate(rng, truth, 0.01), 30.0) for i in range(8)
+    ]
+    # Something with no relationship to the rest, and no ORF of its own.
+    rows.append(("stranger", "AT" * 300, 30.0))
+
+    out = tmp_path / "em"
+    results = run_em(
+        _write_demux(tmp_path, rows), out, params=_params(rounds=1, min_aa_length=40)
+    )
+    st = results[0].estep
+    # It really is the unmapped path, not the identity floor: minimap2
+    # reported nothing at all for this read.
+    assert st["n_unmapped"] == 1
+    assert st["n_assigned"] + st["n_unassigned"] == st["n_reads_seen"]
+    assert st["n_reads_seen"] == 9, "every corpus read is accounted for"
+
+    table = pq.read_table(out / "rounds" / "r01" / "assignments")
+    assert table.num_rows == 9
+    ids = table.column("read_id").to_pylist()
+    assert "stranger" in ids
+    row = table.filter(pa.compute.equal(table.column("read_id"), "stranger"))
+    assert row.column("template_id").to_pylist() == [-1]
+
+
+def test_a_truncated_template_file_falls_back_to_the_finished_round(tmp_path):
+    """An interrupted write must not be trusted just because the file exists."""
+    corpus = _write_demux(
+        tmp_path,
+        [
+            (f"r{i}", _mutate(np.random.default_rng(i), _orf(np.random.default_rng(1), 120), 0.01), 30.0)
+            for i in range(12)
+        ],
+    )
+    out = tmp_path / "em"
+    run_em(corpus, out, params=_params(rounds=1))
+
+    # Simulate an interruption during the NEXT round's template write.
+    nxt = out / "rounds" / "r02" / "templates"
+    nxt.mkdir(parents=True, exist_ok=True)
+    (nxt / "templates.arrow").write_bytes(b"ARROW1\x00\x00truncated")
+
+    # Must rebuild from round 1's nodes rather than dying on the stub.
+    results = run_em(corpus, out, params=_params(rounds=1), resume=True)
+    assert results, "resume must recover rather than raise"
+
+
+def test_resume_keeps_the_churn_history_and_measures_the_resumed_round(tmp_path):
+    """Otherwise churn.tsv holds only this invocation and round 2 reports none."""
+    corpus_rows = []
+    rng = np.random.default_rng(9)
+    for t_idx in range(2):
+        truth = _orf(rng, 130)
+        for i in range(20):
+            corpus_rows.append(
+                (f"g{t_idx}_r{i}", _mutate(rng, truth, 0.01), 30.0)
+            )
+    corpus = _write_demux(tmp_path, corpus_rows)
+    out = tmp_path / "em"
+
+    run_em(corpus, out, params=_params(rounds=1, min_aa_length=40))
+    run_em(corpus, out, params=_params(rounds=1, min_aa_length=40), resume=True)
+
+    rounds = [
+        line.split("\t")[0]
+        for line in (out / "churn.tsv").read_text().splitlines()[1:]
+    ]
+    assert rounds == ["1", "2"], "history must survive the resumed invocation"
+
+    r2 = json.loads((out / "rounds" / "r02" / "round.json").read_text())
+    assert r2["churn"], "the resumed round has a previous round to compare to"
+
+
+def test_a_completed_run_is_a_readable_stage(tmp_path):
+    """Without a manifest the viz layer cannot attach the directory at all."""
+    from constellation.sequencing.transcriptome.manifest import read_manifest_dir
+
+    out = tmp_path / "em"
+    run_em(_write_demux(tmp_path, [
+        ("a", "ATG" + "GCT" * 60 + "TAA", 30.0),
+        ("b", "ATG" + "GCT" * 60 + "TAA", 30.0),
+    ]), out, params=_params(rounds=1, min_aa_length=40))
+
+    manifest = read_manifest_dir(out)
+    assert manifest.kind == "cluster"
+    assert manifest.stages["n_clusters"] >= 1
+    assert manifest.parameters["mode"] == "em"

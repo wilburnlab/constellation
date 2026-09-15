@@ -310,6 +310,11 @@ def run_em_estep(
         stream, n_templates=store.n_templates, block_bytes=block_bytes
     )
 
+    # Which corpus rows minimap2 actually reported on. `n_reads` is None when
+    # the caller did not supply a corpus size (tests on hand-built stores).
+    n_reads = getattr(reads, "n_reads", None)
+    seen = np.zeros(int(n_reads), dtype=bool) if n_reads else None
+
     stats = {
         "n_reads_seen": 0,
         "n_assigned": 0,
@@ -341,17 +346,75 @@ def run_em_estep(
         stats["n_cap_hit"] += int(
             pc.sum(batch.column("candidate_cap_hit")).as_py() or 0
         )
+        if seen is not None:
+            seen[batch.column("read_row").to_numpy(zero_copy_only=False)] = True
         pq.write_table(
             pa.Table.from_batches([batch], schema=EM_ASSIGNMENT_TABLE),
             output_dir / f"part-{shard:05d}.parquet",
         )
         shard += 1
 
+    # Reads minimap2 never reported at all — no hit above its chaining
+    # threshold — produce no PAF line and would otherwise disappear from the
+    # accounting entirely: not assigned, not unassigned, no row. That silently
+    # understates the rejection rate, which is the one number the admission
+    # floor exists to make visible. Emit them explicitly.
+    n_unmapped = 0
+    if seen is not None:
+        missing = np.flatnonzero(~seen)
+        if missing.size:
+            n_unmapped = int(missing.size)
+            pq.write_table(
+                pa.Table.from_batches(
+                    [_unassigned_batch(missing, reads, round_index)],
+                    schema=EM_ASSIGNMENT_TABLE,
+                ),
+                output_dir / f"part-{shard:05d}.parquet",
+            )
+            shard += 1
+
+    stats["n_unmapped"] = n_unmapped
+    stats["n_reads_seen"] += n_unmapped
+    stats["n_unassigned"] += n_unmapped
     stats["n_shards"] = shard
     stats["cap_hit_fraction"] = (
         stats["n_cap_hit"] / stats["n_reads_seen"] if stats["n_reads_seen"] else 0.0
     )
     return stats
+
+
+def _unassigned_batch(rows: np.ndarray, reads, round_index: int) -> pa.RecordBatch:
+    """One ``template_id = -1`` row per corpus read minimap2 never reported."""
+    n = rows.size
+    idx = pa.array(rows.astype(np.int64))
+    zero32 = pa.array(np.zeros(n, dtype=np.int32))
+    return pa.RecordBatch.from_arrays(
+        [
+            pc.take(reads.read_id, idx).combine_chunks().cast(pa.string()),
+            pa.array(rows.astype(np.int32)),
+            pa.array(np.full(n, -1, dtype=np.int64)),
+            pa.array(np.full(n, -1, dtype=np.int32)),
+            pa.array(np.full(n, int(round_index), dtype=np.int32)),
+            pa.array(np.zeros(n, dtype=np.float32)),
+            zero32,
+            zero32,
+            pa.array(np.full(n, np.nan, dtype=np.float32)),
+            pa.array(np.full(n, np.nan, dtype=np.float32)),
+            zero32,
+            zero32,
+            pa.array(np.zeros(n, dtype=bool)),
+            zero32,
+            zero32,
+            zero32,
+            zero32,
+            zero32,
+            pa.nulls(n, pa.large_string()),
+            pa.array(reads.sample_id[rows].astype(np.int64))
+            if reads.sample_id.size
+            else pa.nulls(n, pa.int64()),
+        ],
+        schema=EM_ASSIGNMENT_TABLE,
+    )
 
 
 def _check_single_index_part(store, index_batch_size: str) -> None:
