@@ -13,12 +13,12 @@ import itertools
 import numpy as np
 import pytest
 
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.columns import (
+from constellation.sequencing.transcriptome.cluster.denovo.em.columns import (
     ROUTE_ALLELIC,
     ROUTE_COVERAGE,
     CandidateSet,
 )
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.covariance import (
+from constellation.sequencing.transcriptome.cluster.denovo.em.covariance import (
     MAJOR,
     UNCOVERED,
     UNOBSERVED,

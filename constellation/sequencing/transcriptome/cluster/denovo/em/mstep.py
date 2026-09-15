@@ -66,8 +66,8 @@ from constellation.sequencing.transcriptome.cluster.denovo.orf import (
     ORF_CODON_TABLE,
     best_sense_orf,
 )
-from constellation.sequencing.transcriptome.cluster.denovo.orfem import covariance as cv
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.columns import (
+from constellation.sequencing.transcriptome.cluster.denovo.em import covariance as cv
+from constellation.sequencing.transcriptome.cluster.denovo.em.columns import (
     candidate_columns,
     column_stats,
 )

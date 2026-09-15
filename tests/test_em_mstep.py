@@ -20,7 +20,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.consensus import (  #
 from constellation.sequencing.transcriptome.cluster.denovo.orf import (  # noqa: E402
     best_sense_orf,
 )
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.mstep import (  # noqa: E402
+from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (  # noqa: E402
     certified_columns,
     gated_orf,
     refine_template,

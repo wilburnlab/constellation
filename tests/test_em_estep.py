@@ -20,7 +20,7 @@ from constellation.sequencing.readers.paf import (
     paf_to_alignment_table,
     read_paf,
 )
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.estep import (
+from constellation.sequencing.transcriptome.cluster.denovo.em.estep import (
     TEMPLATE_MINIMAP2_ARGS,
     TemplateSet,
     assign_reads,
@@ -229,7 +229,7 @@ def test_a_multipart_index_is_refused_rather_than_double_counted():
     """minimap2 applies -p/-N and the primary call WITHIN each index part, so
     a read is emitted once per part and its mass counted more than once. The
     template-bases ceiling bounds the reference, not the -I setting."""
-    from constellation.sequencing.transcriptome.cluster.denovo.orfem.estep import (
+    from constellation.sequencing.transcriptome.cluster.denovo.em.estep import (
         _parse_size,
         run_estep,
     )

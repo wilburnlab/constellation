@@ -203,11 +203,11 @@ import constellation.sequencing.transcriptome.cluster.denovo.diagnostics
 import constellation.sequencing.transcriptome.cluster.denovo.encode
 import constellation.sequencing.transcriptome.cluster.denovo.minimizers
 import constellation.sequencing.transcriptome.cluster.denovo.orf
-import constellation.sequencing.transcriptome.cluster.denovo.orfem
-import constellation.sequencing.transcriptome.cluster.denovo.orfem.estep
-import constellation.sequencing.transcriptome.cluster.denovo.orfem.fold
-import constellation.sequencing.transcriptome.cluster.denovo.orfem.mstep
-import constellation.sequencing.transcriptome.cluster.denovo.orfem.seed
+import constellation.sequencing.transcriptome.cluster.denovo.em
+import constellation.sequencing.transcriptome.cluster.denovo.em.estep
+import constellation.sequencing.transcriptome.cluster.denovo.em.fold
+import constellation.sequencing.transcriptome.cluster.denovo.em.mstep
+import constellation.sequencing.transcriptome.cluster.denovo.em.seed
 import constellation.sequencing.transcriptome.cluster.denovo.pipeline
 import constellation.sequencing.transcriptome.cluster.denovo.quant
 import constellation.sequencing.transcriptome.cluster.denovo.schemas

@@ -44,7 +44,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.columns import (
+from constellation.sequencing.transcriptome.cluster.denovo.em.columns import (
     ROUTE_ALLELIC,
     ROUTE_COVERAGE,
     CandidateSet,

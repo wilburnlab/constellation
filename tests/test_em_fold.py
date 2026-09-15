@@ -21,12 +21,12 @@ from constellation.sequencing.transcriptome.cluster.denovo.cluster_graph import 
 from constellation.sequencing.transcriptome.cluster.denovo.orf import (  # noqa: E402
     best_sense_orf,
 )
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.fold import (  # noqa: E402
+from constellation.sequencing.transcriptome.cluster.denovo.em.fold import (  # noqa: E402
     FoldRule,
     classify_pair,
     fold_orfs,
 )
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.seed import (  # noqa: E402
+from constellation.sequencing.transcriptome.cluster.denovo.em.seed import (  # noqa: E402
     REPRESENTATIVE_POLICIES,
     extract_seed_orfs,
 )

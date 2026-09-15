@@ -30,11 +30,11 @@ from constellation.sequencing.transcriptome.cluster.denovo.variants import (  # 
     ErrorModel,
     call_variants,
 )
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.estep import (  # noqa: E402
+from constellation.sequencing.transcriptome.cluster.denovo.em.estep import (  # noqa: E402
     TemplateSet,
     assign_reads,
 )
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.mstep import (  # noqa: E402
+from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (  # noqa: E402
     gated_orf,
     refine_template,
 )
@@ -258,7 +258,7 @@ def test_terminal_extension_columns_are_not_in_core():
     mixture starts defining haplotypes.
 
     **This now guards the components path only.** ``in_core`` and
-    ``_core_region`` are deleted from the orfem path (``columns.py`` treats
+    ``_core_region`` are deleted from the EM path (``columns.py`` treats
     terminal columns like any other and lets covariance judge them), but
     ``call_variants`` still uses both for ``transcriptome cluster --mode
     de-novo``, where this is that path's only guard. Kept rather than deleted
