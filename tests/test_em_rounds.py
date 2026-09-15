@@ -431,3 +431,16 @@ def test_a_completed_run_is_a_readable_stage(tmp_path):
     assert manifest.kind == "cluster"
     assert manifest.stages["n_clusters"] >= 1
     assert manifest.parameters["mode"] == "em"
+
+
+def test_the_report_shows_the_metric_the_stopping_rule_reads(corpus_dir, tmp_path):
+    """A broken section renders as a note, so it must be asserted, not eyeballed."""
+    out = tmp_path / "em"
+    run_em(corpus_dir, out, params=_params(rounds=2))
+    report = (out / "diagnostics" / "report.md").read_text()
+    section = report.split("## Convergence", 1)[1].split("## ", 1)[0]
+    assert "could not be computed" not in section
+    assert "unsettled" in section
+    header = (out / "churn.tsv").read_text().splitlines()[0]
+    for col in ("frac_unsettled", "reads_gained", "reads_lost"):
+        assert col in header

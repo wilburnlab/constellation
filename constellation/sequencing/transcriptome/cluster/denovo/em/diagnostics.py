@@ -76,31 +76,42 @@ def section_convergence(em_dir: Path) -> ReportSection:
                 est.get("n_unassigned", 0),
                 churn.get("frac_changed"),
                 churn.get("frac_changed_lineage"),
+                churn.get("frac_unsettled"),
+                churn.get("n_gained"),
+                churn.get("n_lost"),
             )
         )
     if not rows:
         return ReportSection(title="Convergence", body="_no completed rounds_")
 
     lines = [
-        "| round | templates | nodes | assigned | unassigned | churn | churn (lineage) |",
-        "|---:|---:|---:|---:|---:|---:|---:|",
+        "| round | templates | nodes | assigned | unassigned | churn (lineage) "
+        "| gained | lost | **unsettled** |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for r, nt, nn, na, nu, ch, chl in rows:
+    for r, nt, nn, na, nu, _ch, chl, uns, gain, lost in rows:
         f = lambda v: "—" if v is None else f"{v:.4f}"  # noqa: E731
+        i = lambda v: "—" if v is None else f"{v:,}"  # noqa: E731
         lines.append(
-            f"| {r} | {nt:,} | {nn:,} | {na:,} | {nu:,} | {f(ch)} | {f(chl)} |"
+            f"| {r} | {nt:,} | {nn:,} | {na:,} | {nu:,} | {f(chl)} "
+            f"| {i(gain)} | {i(lost)} | **{f(uns)}** |"
         )
 
     last = rows[-1]
-    if last[6] is not None and last[6] > 0.02:
+    if last[7] is not None and last[7] > 0.02:
         flags.append(
-            f"the loop had not converged when it stopped — lineage-aware churn "
-            f"was still {last[6]:.3f} at round {last[0]}; consider --rounds"
+            f"the loop had not converged when it stopped — unsettled reads were "
+            f"still {last[7]:.3f} at round {last[0]}; consider --rounds"
         )
     body = "\n".join(lines) + (
-        "\n\nChurn is measured **lineage-aware**: a read that moved only because "
-        "its template split has not chosen differently, and counting it would "
-        "leave the loop looking unconverged forever."
+        "\n\nChurn is **lineage-aware**: a read that moved only because its "
+        "template split has not chosen differently, and counting it would "
+        "leave the loop looking unconverged forever.\n\n"
+        "**unsettled** is what the stopping rule reads — genuine switches plus "
+        "gains plus losses, over reads assigned in *either* round. Lineage "
+        "churn alone is measured only over reads assigned in **both**, so "
+        "losing half the assignments scores zero as long as the survivors keep "
+        "their lineage."
     )
     return ReportSection(title="Convergence", body=body, flags=flags)
 

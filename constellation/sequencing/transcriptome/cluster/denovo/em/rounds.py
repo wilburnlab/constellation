@@ -541,6 +541,11 @@ def _write_summary(output_dir: Path, results: list[RoundResult]) -> None:
             "cap_hit_fraction": round(r.estep.get("cap_hit_fraction", 0.0), 5),
             "frac_changed": r.churn.get("frac_changed"),
             "frac_changed_lineage": r.churn.get("frac_changed_lineage"),
+            # What the stopping rule reads — shown so the decision is legible
+            # rather than inferred from the two columns beside it.
+            "frac_unsettled": r.churn.get("frac_unsettled"),
+            "reads_gained": r.churn.get("n_gained"),
+            "reads_lost": r.churn.get("n_lost"),
             "estep_s": r.seconds.get("estep"),
             "mstep_s": r.seconds.get("mstep"),
         }
