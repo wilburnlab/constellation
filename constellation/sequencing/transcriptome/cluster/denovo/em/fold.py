@@ -38,6 +38,7 @@ from typing import Callable
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from constellation.sequencing.transcriptome.cluster.denovo._cigar import (
     indel_runs,
@@ -271,7 +272,15 @@ def fold_orfs(
         return FoldResult(empty64, empty64, empty64, np.empty(0, np.int8), [], 0)
 
     orf_nt = seed.column("orf_nucleotide")
-    seq_len = np.array([len(s) for s in orf_nt.to_pylist()], dtype=np.int64)
+    # `pc.utf8_length` reads the offsets buffer; the comprehension it
+    # replaces decoded ~18M ORF strings into Python purely to call len().
+    # The remaining decode is then SHARED across the three consumers
+    # below, which each used to materialise the same ~18M sequences
+    # afresh.
+    seq_len = pc.utf8_length(orf_nt).to_numpy(zero_copy_only=False).astype(
+        np.int64
+    )
+    orf_seqs = orf_nt.to_pylist()
     n_reads = seed.column("n_reads").to_numpy(zero_copy_only=False).astype(np.int64)
 
     log(f"folding {n_orf:,} distinct ORFs at identity {identity}…")
@@ -286,7 +295,7 @@ def fold_orfs(
     unbounded = 2**31 - 1
     accepted = verify_candidates(
         cands,
-        orf_nt.to_pylist(),
+        orf_seqs,
         identity=identity,
         max_5p=unbounded,
         max_3p=unbounded,
@@ -337,7 +346,7 @@ def fold_orfs(
     if merge_representatives and not fold_frameshifts:
         result = _merge_by_representative(
             result,
-            orf_nt.to_pylist(),
+            orf_seqs,
             seq_len,
             result.group_n_reads,
             identity=identity,

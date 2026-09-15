@@ -15,6 +15,8 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from constellation.sequencing.transcriptome._render import (
@@ -338,14 +340,20 @@ def emit_cluster_details(cluster_dir: Path, *, top_n: int = 50) -> int:
     order = np.argsort(-n_reads)[:top_n]
     top_cids = set(int(cids[i]) for i in order)
 
+    # Filter to the top clusters BEFORE decoding. Decoding first turned every
+    # row of cluster_variants.parquet and cluster_haplotypes.parquet into a
+    # Python dict — millions of them at scale — to keep ~50 clusters' worth,
+    # and it ran by default inside a bare `except Exception: pass`, so at
+    # scale it would OOM silently and the run would look clean.
+    wanted = pa.array(sorted(top_cids), type=pa.int64())
     var_by_cluster: dict[int, list[dict]] = {}
-    for r in variants.to_pylist():
-        if r["cluster_id"] in top_cids:
-            var_by_cluster.setdefault(r["cluster_id"], []).append(r)
+    for r in variants.filter(pc.is_in(variants.column("cluster_id"), wanted)).to_pylist():
+        var_by_cluster.setdefault(r["cluster_id"], []).append(r)
     hap_by_cluster: dict[int, list[dict]] = {}
-    for r in haplotypes.to_pylist():
-        if r["cluster_id"] in top_cids:
-            hap_by_cluster.setdefault(r["cluster_id"], []).append(r)
+    for r in haplotypes.filter(
+        pc.is_in(haplotypes.column("cluster_id"), wanted)
+    ).to_pylist():
+        hap_by_cluster.setdefault(r["cluster_id"], []).append(r)
 
     n = 0
     for cid in sorted(top_cids):
