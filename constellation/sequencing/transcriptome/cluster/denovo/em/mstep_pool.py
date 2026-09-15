@@ -77,6 +77,28 @@ REFINED_NODE_TABLE: pa.Schema = pa.schema(
 register_schema("EmRefinedNodeTable", REFINED_NODE_TABLE)
 
 
+#: Which reads a node holds, not merely how many. Keyed on
+#: ``(parent_template_id, haplotype_id)`` because that pair is unique within a
+#: round and is known at emission, where the child's future ``template_id``
+#: is not — it is assigned by row once every shard is concatenated.
+#:
+#: Without this table the only recoverable mapping is read -> *parent*, and a
+#: parent that split into several nodes collapses back into one cluster: every
+#: one of its reads lands on whichever child happened to be last.
+NODE_MEMBERSHIP_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("round", pa.int32(), nullable=False),
+        pa.field("parent_template_id", pa.int64(), nullable=False),
+        pa.field("haplotype_id", pa.int32(), nullable=False),
+        pa.field("read_row", pa.int32(), nullable=False),
+        pa.field("weight", pa.float32(), nullable=False),
+    ],
+    metadata={b"schema_name": b"EmNodeMembershipTable"},
+)
+
+register_schema("EmNodeMembershipTable", NODE_MEMBERSHIP_TABLE)
+
+
 @dataclass(frozen=True, slots=True)
 class MStepUnit:
     """A contiguous row range of the template-sorted assignment table."""
@@ -135,9 +157,13 @@ class MStepParams:
 
 
 def specs_from_assignment_slice(
-    rows: pa.Table, reads, *, max_members: int = 20_000
-) -> tuple[list[MemberSpec], float]:
-    """PWM members for one template. Returns ``(members, subsample_fraction)``.
+    rows: pa.Table, reads, *, max_members: int = 20_000, seed: int = 0
+) -> tuple[list[MemberSpec], np.ndarray, float]:
+    """PWM members for one template.
+
+    Returns ``(members, read_row, subsample_fraction)`` — the read rows run
+    parallel to ``members`` so a node's ``member_ids`` can be turned back into
+    reads.
 
     Replaces the dict-per-assignment-row + ``dict[read_id, str]`` form. The
     caller passes this template's contiguous slice of the sorted assignment
@@ -148,27 +174,37 @@ def specs_from_assignment_slice(
     Orientation is fixed: minimap2 emits query -> target, so the template is
     the reference and ``centroid_is_query`` is False.
     """
+    empty = np.empty(0, dtype=np.int64)
     if rows.num_rows == 0:
-        return [], 1.0
+        return [], empty, 1.0
 
     keep = pc.is_valid(rows.column("cigar"))
     keep = pc.and_(keep, pc.not_equal(pc.binary_length(rows.column("cigar")), 0))
     rows = rows.filter(keep)
     if rows.num_rows == 0:
-        return [], 1.0
+        return [], empty, 1.0
 
     weight = rows.column("weight").to_numpy(zero_copy_only=False).astype(np.float64)
     fraction = 1.0
     if max_members and rows.num_rows > max_members:
-        # Abundance-weighted subsample: keep the heaviest members, which are
-        # the ones the PWM is actually shaped by.
-        order = np.argsort(-weight, kind="stable")[:max_members]
-        order.sort()
+        # A UNIFORM RANDOM sample, not the heaviest members. Under the current
+        # rule every assigned read has weight 1.0, so "take the heaviest" is a
+        # stable sort over ties — i.e. the first `max_members` rows in
+        # whatever order the assignment table happened to be in. That is a
+        # prefix, not a sample, and it is systematically biased: a 60/40
+        # variant mixture can lose the minority entirely, which is precisely
+        # the population this pipeline exists to keep.
+        #
+        # Seeded per template so a re-run and a resumed run agree.
+        rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
+        order = np.sort(
+            rng.choice(rows.num_rows, size=max_members, replace=False)
+        )
         fraction = max_members / rows.num_rows
         rows = rows.take(pa.array(order))
         weight = weight[order]
 
-    read_row = rows.column("read_row").to_numpy(zero_copy_only=False)
+    read_row = rows.column("read_row").to_numpy(zero_copy_only=False).astype(np.int64)
     seqs = reads.take_sequences(read_row)
     cigars = rows.column("cigar").to_pylist()
     t_start = rows.column("t_start").to_numpy(zero_copy_only=False)
@@ -185,7 +221,7 @@ def specs_from_assignment_slice(
             member_id=i,
         )
         for i in range(rows.num_rows)
-    ], fraction
+    ], read_row, fraction
 
 
 def plan_mstep_units(
@@ -328,20 +364,28 @@ def mstep_worker(
     reads = _reads(corpus_path)
     store = _templates(templates_path)
     if batch.num_rows == 0:
-        return {"nodes": REFINED_NODE_TABLE.empty_table()}
+        return {
+            "nodes": REFINED_NODE_TABLE.empty_table(),
+            "node_membership": NODE_MEMBERSHIP_TABLE.empty_table(),
+        }
 
     tr = batch.column("template_row").to_numpy(zero_copy_only=False)
     starts = np.flatnonzero(np.concatenate([[True], tr[1:] != tr[:-1]]))
     bounds = np.concatenate([starts, [batch.num_rows]])
 
     rows: list[tuple] = []
+    mem_parent: list[np.ndarray] = []
+    mem_hap: list[np.ndarray] = []
+    mem_read: list[np.ndarray] = []
+    mem_weight: list[np.ndarray] = []
     for i in range(starts.size):
         lo, hi = int(bounds[i]), int(bounds[i + 1])
         row = int(tr[lo])
-        members, fraction = specs_from_assignment_slice(
+        members, member_read_row, fraction = specs_from_assignment_slice(
             batch.slice(lo, hi - lo),
             reads,
             max_members=params.max_members_per_template,
+            seed=int(store.template_id[row]),
         )
         if not members:
             continue
@@ -363,8 +407,38 @@ def mstep_worker(
             rows.append(
                 _node_row(node, row, round_index, len(members), fraction, scale)
             )
+            idx = np.asarray(node.member_ids, dtype=np.int64)
+            if idx.size == 0:
+                continue
+            mem_parent.append(np.full(idx.size, node.parent_template_id, np.int64))
+            mem_hap.append(np.full(idx.size, node.haplotype_id, np.int32))
+            mem_read.append(member_read_row[idx])
+            mem_weight.append(
+                np.array([members[int(j)].weight for j in idx], dtype=np.float32)
+            )
 
-    return {"nodes": _rows_to_nodes(rows)}
+    return {
+        "nodes": _rows_to_nodes(rows),
+        "node_membership": _rows_to_membership(
+            round_index, mem_parent, mem_hap, mem_read, mem_weight
+        ),
+    }
+
+
+def _rows_to_membership(round_index, parent, hap, read, weight) -> pa.Table:
+    if not parent:
+        return NODE_MEMBERSHIP_TABLE.empty_table()
+    p_arr = np.concatenate(parent)
+    return pa.table(
+        {
+            "round": pa.array(np.full(p_arr.size, int(round_index), np.int32)),
+            "parent_template_id": pa.array(p_arr),
+            "haplotype_id": pa.array(np.concatenate(hap)),
+            "read_row": pa.array(np.concatenate(read).astype(np.int32)),
+            "weight": pa.array(np.concatenate(weight)),
+        },
+        schema=NODE_MEMBERSHIP_TABLE,
+    )
 
 
 def _node_row(node, parent_row, round_index, n_members, fraction, scale) -> tuple:
@@ -427,6 +501,7 @@ def iter_unit_batches(
 
 
 __all__ = [
+    "NODE_MEMBERSHIP_TABLE",
     "REFINED_NODE_TABLE",
     "MStepParams",
     "MStepUnit",

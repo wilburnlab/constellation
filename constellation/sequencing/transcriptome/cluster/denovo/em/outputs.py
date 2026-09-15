@@ -36,45 +36,67 @@ LEGACY_CLUSTER_MODES = {"genome-guided": "genome", "de-novo": "kmer"}
 MODE_EM = "em"
 
 
-def _sample_ids(membership: pa.Table, samples, m: int) -> pa.Array:
-    """Per-membership-row sample_id. Null when the run is unsampled."""
-    if samples is not None and "sample_id" in getattr(samples, "column_names", []):
-        return samples.column("sample_id").cast(pa.int64())
-    return pa.nulls(m, pa.int64())
-
-
 def build_cluster_tables(
-    nodes: pa.Table, assignments: pa.Table, *, identity_threshold: float
-) -> tuple[pa.Table, pa.Table]:
-    """``(clusters, membership)`` from a final round's nodes + assignments.
+    nodes: pa.Table,
+    assignments: pa.Table,
+    node_membership: pa.Table,
+    *,
+    reads=None,
+    identity_threshold: float,
+) -> tuple[pa.Table, pa.Table, np.ndarray]:
+    """``(clusters, membership)`` from a final round's nodes + membership.
 
-    One cluster per node. ``cluster_id`` is the node's own ``template_id``
-    would-be — i.e. its row in the final node table — so it is stable within
-    the run and independent of how the assignments happen to be ordered.
+    One cluster per node, and **membership comes from the M-step's own
+    per-node read lists**, not from the read -> template mapping in the
+    assignment table. That mapping is read -> *parent*, and a parent that the
+    M-step split into several nodes has several children behind one id: using
+    it collapses every split back into a single cluster and leaves the other
+    children with no reads and no representative.
     """
     n = nodes.num_rows
     if n == 0:
         return (
             TRANSCRIPT_CLUSTER_TABLE.empty_table(),
             CLUSTER_MEMBERSHIP_TABLE.empty_table(),
+            np.empty(0, dtype=np.int64),
         )
 
-    parent_id = nodes.column("parent_template_id").to_numpy(zero_copy_only=False)
-    cluster_of_parent = {int(p): i for i, p in enumerate(parent_id)}
-
-    assigned = assignments.filter(
-        pc.greater_equal(assignments.column("template_id"), 0)
+    # (parent_template_id, haplotype_id) is the join key: it is unique within
+    # a round and known when a node is emitted, where the child's eventual
+    # cluster_id is not.
+    node_key = _pack_node_key(
+        nodes.column("parent_template_id").to_numpy(zero_copy_only=False),
+        nodes.column("haplotype_id").to_numpy(zero_copy_only=False),
     )
-    a_tid = assigned.column("template_id").to_numpy(zero_copy_only=False)
-    cluster_id = np.array(
-        [cluster_of_parent.get(int(t), -1) for t in a_tid], dtype=np.int64
-    )
-    keep = cluster_id >= 0
-    assigned = assigned.filter(pa.array(keep))
-    cluster_id = cluster_id[keep]
+    order = np.argsort(node_key, kind="stable")
+    sorted_key = node_key[order]
 
-    rep_read = _representative_per_cluster(assigned, cluster_id, n)
-    counts = np.bincount(cluster_id, minlength=n).astype(np.int32)
+    cluster_id = np.empty(0, dtype=np.int64)
+    read_row = np.empty(0, dtype=np.int64)
+    if node_membership is not None and node_membership.num_rows:
+        mem_key = _pack_node_key(
+            node_membership.column("parent_template_id").to_numpy(
+                zero_copy_only=False
+            ),
+            node_membership.column("haplotype_id").to_numpy(zero_copy_only=False),
+        )
+        pos = np.searchsorted(sorted_key, mem_key)
+        ok = (pos < sorted_key.size) & (
+            sorted_key[np.clip(pos, 0, max(sorted_key.size - 1, 0))] == mem_key
+        )
+        cluster_id = order[np.clip(pos, 0, max(sorted_key.size - 1, 0))][ok]
+        read_row = (
+            node_membership.column("read_row")
+            .to_numpy(zero_copy_only=False)
+            .astype(np.int64)[ok]
+        )
+
+    read_id, sample_id, span = _read_facts(assignments, read_row)
+    counts = np.bincount(cluster_id, minlength=n).astype(np.int32) if n else np.zeros(
+        0, np.int32
+    )
+    rep_read = _representative_per_cluster(assignments, cluster_id, read_row, n)
+    n_unique = _unique_sequences_per_cluster(reads, cluster_id, read_row, n)
 
     clusters = pa.table(
         {
@@ -98,59 +120,152 @@ def build_cluster_tables(
             "span_start": pa.nulls(n, pa.int64()),
             "span_end": pa.nulls(n, pa.int64()),
             "fingerprint_hash": pa.nulls(n, pa.uint64()),
-            "n_unique_sequences": pa.array(np.maximum(counts, 0).astype(np.int32)),
+            "n_unique_sequences": pa.array(n_unique),
             "sample_id": pa.nulls(n, pa.int64()),
         },
         schema=TRANSCRIPT_CLUSTER_TABLE,
     )
+    # sample_id rides alongside rather than inside: CLUSTER_MEMBERSHIP_TABLE
+    # has no such column, and quant needs it per read. Taking it from the
+    # ASSIGNMENTS is the point — it used to come from an optional argument the
+    # round loop never supplied, so every run pooled into one sample_id = -1
+    # row and per-sample counts and TPM were silently wrong.
+    membership = _membership(cluster_id, read_id, span, rep_read)
+    return clusters, membership, sample_id
 
-    membership = _membership(assigned, cluster_id, rep_read)
-    return clusters, membership
+
+def _pack_node_key(parent: np.ndarray, hap: np.ndarray) -> np.ndarray:
+    """A sortable key over ``(parent_template_id, haplotype_id)``.
+
+    ``haplotype_id`` is bounded by ``max_nodes`` (8 by default, and the M-step
+    caps it), so 16 bits is ample headroom and the parent id is not truncated.
+    """
+    return (np.asarray(parent, dtype=np.int64) << np.int64(16)) | np.asarray(
+        hap, dtype=np.int64
+    )
+
+
+def _read_facts(assignments: pa.Table, read_row: np.ndarray):
+    """read_id / sample_id / aligned span for each membership row.
+
+    Looked up from the assignment table by ``read_row``, which is a dense
+    corpus index — so this is a scatter, not a join.
+    """
+    n = read_row.size
+    if assignments is None or assignments.num_rows == 0 or n == 0:
+        return [""] * n, np.full(n, -1, np.int64), np.zeros(n, np.int64)
+    rows = assignments.column("read_row").to_numpy(zero_copy_only=False).astype(
+        np.int64
+    )
+    size = int(max(rows.max(initial=-1), read_row.max(initial=-1))) + 1
+    slot = np.full(size, -1, dtype=np.int64)
+    slot[rows] = np.arange(rows.size)
+    take = slot[np.clip(read_row, 0, size - 1)]
+    valid = take >= 0
+    idx = np.where(valid, take, 0)
+
+    ids = assignments.column("read_id").to_pylist()
+    read_id = [ids[int(i)] if v else "" for i, v in zip(idx, valid)]
+    sample = assignments.column("sample_id")
+    sample_np = pc.fill_null(sample, -1).to_numpy(zero_copy_only=False).astype(np.int64)
+    q_end = assignments.column("q_end").to_numpy(zero_copy_only=False).astype(np.int64)
+    q_start = assignments.column("q_start").to_numpy(zero_copy_only=False).astype(
+        np.int64
+    )
+    return (
+        read_id,
+        np.where(valid, sample_np[idx], -1),
+        np.where(valid, (q_end - q_start)[idx], 0),
+    )
 
 
 def _representative_per_cluster(
-    assigned: pa.Table, cluster_id: np.ndarray, n: int
+    assignments: pa.Table, cluster_id: np.ndarray, read_row: np.ndarray, n: int
 ) -> list[str]:
     """The best-scoring read of each cluster.
 
-    From round 2 the frame is a consensus with no read of its own, so there
-    is nothing to inherit; the schema requires a non-null representative, and
-    the read that fits the consensus best is the honest choice.
+    From round 2 the frame is a consensus with no read of its own, so there is
+    nothing to inherit; the schema requires a non-null representative, and the
+    read that fits the consensus best is the honest choice.
     """
     rep = [""] * n
-    if assigned.num_rows == 0:
+    if cluster_id.size == 0 or assignments is None or assignments.num_rows == 0:
         return rep
-    score = assigned.column("as_score").to_numpy(zero_copy_only=False)
-    read_id = assigned.column("read_id").to_pylist()
-    order = np.lexsort((-score, cluster_id))
-    first = np.flatnonzero(
-        np.concatenate([[True], cluster_id[order][1:] != cluster_id[order][:-1]])
+    rows = assignments.column("read_row").to_numpy(zero_copy_only=False).astype(
+        np.int64
     )
+    size = int(max(rows.max(initial=-1), read_row.max(initial=-1))) + 1
+    slot = np.full(size, -1, dtype=np.int64)
+    slot[rows] = np.arange(rows.size)
+    take = slot[np.clip(read_row, 0, size - 1)]
+    valid = take >= 0
+    if not valid.any():
+        return rep
+    score = assignments.column("as_score").to_numpy(zero_copy_only=False)
+    ids = assignments.column("read_id").to_pylist()
+    c, t = cluster_id[valid], take[valid]
+    order = np.lexsort((-score[t], c))
+    first = np.flatnonzero(np.concatenate([[True], c[order][1:] != c[order][:-1]]))
     for pos in first:
-        row = int(order[pos])
-        rep[int(cluster_id[row])] = read_id[row]
+        k = int(order[pos])
+        rep[int(c[k])] = ids[int(t[k])]
     return rep
 
 
+def _unique_sequences_per_cluster(
+    reads, cluster_id: np.ndarray, read_row: np.ndarray, n: int
+) -> np.ndarray:
+    """Distinct trimmed windows per cluster — the heterogeneity diagnostic.
+
+    Counting reads here instead (which is what this used to do) makes the
+    unique/read ratio identically 1 and the diagnostic meaningless: identical
+    reads are reported as distinct sequences.
+    """
+    out = np.zeros(n, dtype=np.int32)
+    if reads is None or cluster_id.size == 0:
+        return np.bincount(cluster_id, minlength=n).astype(np.int32) if n else out
+    from constellation.sequencing.transcriptome.cluster.denovo.dereplicate import (
+        _hash_sequences,
+    )
+
+    digest = _hash_sequences(reads.sequence)
+    key = np.frombuffer(
+        digest.combine_chunks().buffers()[1]
+        if isinstance(digest, pa.ChunkedArray)
+        else digest.buffers()[1],
+        dtype=np.uint64,
+    )[: 2 * reads.n_reads].reshape(-1, 2)[:, 0]
+    pair = np.stack([cluster_id, key[read_row].astype(np.int64)], axis=1)
+    uniq = np.unique(pair, axis=0)
+    counts = np.bincount(uniq[:, 0].astype(np.int64), minlength=n)
+    out[: counts.size] = counts.astype(np.int32)
+    return out
+
+
 def _membership(
-    assigned: pa.Table, cluster_id: np.ndarray, rep_read: list[str]
+    cluster_id: np.ndarray,
+    read_id: list[str],
+    span: np.ndarray,
+    rep_read: list[str],
 ) -> pa.Table:
-    m = assigned.num_rows
+    m = cluster_id.size
     if m == 0:
         return CLUSTER_MEMBERSHIP_TABLE.empty_table()
-    read_id = assigned.column("read_id")
-    is_rep = pc.equal(read_id, pa.array([rep_read[int(c)] for c in cluster_id]))
-    span = pc.subtract(assigned.column("q_end"), assigned.column("q_start"))
+    is_rep = np.array(
+        [rid == rep_read[int(c)] for rid, c in zip(read_id, cluster_id)], dtype=bool
+    )
     return pa.table(
         {
             "cluster_id": pa.array(cluster_id),
-            "read_id": read_id.cast(pa.string()),
-            "role": pc.if_else(is_rep, "representative", "member").cast(pa.string()),
+            "read_id": pa.array(read_id, pa.string()),
+            "role": pa.array(
+                np.where(is_rep, "representative", "member"), pa.string()
+            ),
             "drift_5p_bp": pa.nulls(m, pa.int32()),
             "drift_3p_bp": pa.nulls(m, pa.int32()),
             "match_rate": pa.nulls(m, pa.float32()),
             "indel_rate": pa.nulls(m, pa.float32()),
-            "n_aligned_bp": span.cast(pa.int32()),
+            "n_aligned_bp": pa.array(span.astype(np.int32)),
         },
         schema=CLUSTER_MEMBERSHIP_TABLE,
     )
@@ -160,8 +275,8 @@ def write_em_outputs(
     output_dir: Path,
     clusters: pa.Table,
     membership: pa.Table,
+    sample_id: np.ndarray | None = None,
     *,
-    samples=None,
     write_fasta: bool = True,
 ) -> dict[str, Path]:
     """Write the user-facing files and return what was written."""
@@ -188,7 +303,11 @@ def write_em_outputs(
             {
                 "read_id": membership.column("read_id"),
                 "uniq_id": pa.array(np.arange(m, dtype=np.int64)),
-                "sample_id": _sample_ids(membership, samples, m),
+                "sample_id": pa.array(
+                    np.asarray(sample_id, dtype=np.int64)
+                    if sample_id is not None and len(sample_id) == m
+                    else np.full(m, -1, dtype=np.int64)
+                ),
             }
         )
         quant = cluster_feature_quant(

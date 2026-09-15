@@ -216,3 +216,109 @@ def test_gained_and_lost_reads_are_counted_separately():
     assert stats["n_compared"] == 0
     assert stats["n_gained"] == 1
     assert stats["n_lost"] == 1
+
+
+# ── final outputs: a split parent keeps both children's reads ─────────
+
+
+def _node_membership(rows):
+    """rows = [(parent_id, hap, read_row, weight)]"""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        NODE_MEMBERSHIP_TABLE,
+    )
+
+    n = len(rows)
+    return pa.table(
+        {
+            "round": pa.array([1] * n, pa.int32()),
+            "parent_template_id": pa.array([r[0] for r in rows], pa.int64()),
+            "haplotype_id": pa.array([r[1] for r in rows], pa.int32()),
+            "read_row": pa.array([r[2] for r in rows], pa.int32()),
+            "weight": pa.array([r[3] for r in rows], pa.float32()),
+        },
+        schema=NODE_MEMBERSHIP_TABLE,
+    )
+
+
+def _assignments_for(read_rows, template_id, *, samples=None):
+    from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
+        EM_ASSIGNMENT_TABLE,
+    )
+
+    n = len(read_rows)
+    samples = samples if samples is not None else [0] * n
+    return pa.table(
+        {
+            "read_id": pa.array([f"r{r}" for r in read_rows], pa.string()),
+            "read_row": pa.array(read_rows, pa.int32()),
+            "template_id": pa.array([template_id] * n, pa.int64()),
+            "template_row": pa.array([0] * n, pa.int32()),
+            "round": pa.array([1] * n, pa.int32()),
+            "weight": pa.array([1.0] * n, pa.float32()),
+            "as_score": pa.array(list(range(100, 100 + n)), pa.int32()),
+            "as_delta": pa.array([0] * n, pa.int32()),
+            "logl": pa.nulls(n, pa.float32()),
+            "logl_delta": pa.nulls(n, pa.float32()),
+            "n_hits": pa.array([1] * n, pa.int32()),
+            "n_admitted": pa.array([1] * n, pa.int32()),
+            "candidate_cap_hit": pa.array([False] * n, pa.bool_()),
+            "offset_5p": pa.array([0] * n, pa.int32()),
+            "q_start": pa.array([0] * n, pa.int32()),
+            "q_end": pa.array([100] * n, pa.int32()),
+            "t_start": pa.array([0] * n, pa.int32()),
+            "t_end": pa.array([100] * n, pa.int32()),
+            "cigar": pa.array(["100="] * n, pa.large_string()),
+            "sample_id": pa.array(samples, pa.int64()),
+        },
+        schema=EM_ASSIGNMENT_TABLE,
+    )
+
+
+def test_a_split_parent_does_not_collapse_into_one_cluster():
+    """The read -> template map is read -> PARENT; using it loses every split.
+
+    One parent emitting two nodes with 3 and 2 reads must export as 3/2. Keyed
+    on the parent id alone it exports as 0/5, and the first child has no reads
+    and no representative.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.outputs import (
+        build_cluster_tables,
+    )
+
+    nodes = _nodes(
+        [(10, 0, 0, "ACGT" * 25, 3, 3.0), (10, 0, 1, "ACGA" * 25, 2, 2.0)]
+    )
+    membership = _node_membership(
+        [(10, 0, 0, 1.0), (10, 0, 1, 1.0), (10, 0, 2, 1.0),
+         (10, 1, 3, 1.0), (10, 1, 4, 1.0)]
+    )
+    clusters, member_tbl, _ = build_cluster_tables(
+        nodes,
+        _assignments_for([0, 1, 2, 3, 4], 10),
+        membership,
+        identity_threshold=0.97,
+    )
+    assert clusters.column("n_reads").to_pylist() == [3, 2]
+    assert all(clusters.column("representative_read_id").to_pylist())
+    per = {}
+    for cid in member_tbl.column("cluster_id").to_pylist():
+        per[cid] = per.get(cid, 0) + 1
+    assert per == {0: 3, 1: 2}
+
+
+def test_sample_ids_come_from_the_assignments():
+    """They used to come from an argument the round loop never supplied."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.outputs import (
+        build_cluster_tables,
+    )
+
+    nodes = _nodes([(10, 0, 0, "ACGT" * 25, 3, 3.0)])
+    membership = _node_membership([(10, 0, 0, 1.0), (10, 0, 1, 1.0), (10, 0, 2, 1.0)])
+    _, _, sample_id = build_cluster_tables(
+        nodes,
+        _assignments_for([0, 1, 2], 10, samples=[10, 20, 10]),
+        membership,
+        identity_threshold=0.97,
+    )
+    assert sorted(sample_id.tolist()) == [10, 10, 20]
+    assert -1 not in sample_id.tolist(), "pooling into sample -1 corrupts TPM"

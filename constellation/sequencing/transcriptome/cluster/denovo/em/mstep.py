@@ -98,6 +98,12 @@ class RefinedTemplate:
     n_extended_3p: int = 0
     n_trimmed_5p: int = 0
     n_trimmed_3p: int = 0
+    #: Indices into the ``members`` list this node was built from — i.e. WHICH
+    #: reads it holds, not merely how many. Without it a caller that sees two
+    #: nodes from one parent has no way to say which read went where, and the
+    #: only recoverable mapping is read -> *parent*, which collapses every
+    #: split back into one cluster.
+    member_ids: np.ndarray = field(default_factory=lambda: np.empty(0, np.int64))
     #: Per-template diagnostics, on the major node only. Carries the
     #: ``disagreement_stats`` the bench driver merges across round *r*'s
     #: templates to refit round *r+1*'s error model, plus the covariance
@@ -511,6 +517,7 @@ def refine_template(
             n_extended_3p=cres.n_extended_3p,
             n_trimmed_5p=lo,
             n_trimmed_3p=len(cres.consensus) - hi,
+            member_ids=np.asarray(idx, dtype=np.int64),
             stats=diag if hid == 0 else {},
         )
         span = hi - lo

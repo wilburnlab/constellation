@@ -66,8 +66,12 @@ def _assignments(rows):
 def test_members_come_from_the_corpus_by_row_not_by_read_id():
     reads = _Reads(["AAAA", "CCCC", "GGGG"])
     tbl = _assignments([(2, 0, "4=", 0, 0, 1.0), (0, 0, "4=", 3, 1, 2.0)])
-    members, fraction = specs_from_assignment_slice(tbl, reads)
+    members, read_row, fraction = specs_from_assignment_slice(tbl, reads)
     assert fraction == 1.0
+    # The read rows run PARALLEL to members, so a node's member_ids can be
+    # turned back into reads — without that, a split parent's children have no
+    # recoverable membership.
+    assert read_row.tolist() == [2, 0]
     assert [m.member_seq for m in members] == ["GGGG", "AAAA"]
     assert [m.ref_start for m in members] == [0, 3]
     assert [m.member_start for m in members] == [0, 1]
@@ -79,26 +83,50 @@ def test_members_come_from_the_corpus_by_row_not_by_read_id():
 def test_rows_without_a_cigar_are_skipped():
     reads = _Reads(["AAAA", "CCCC"])
     tbl = _assignments([(0, 0, None, 0, 0, 1.0), (1, 0, "4=", 0, 0, 1.0)])
-    members, _ = specs_from_assignment_slice(tbl, reads)
+    members, read_row, _ = specs_from_assignment_slice(tbl, reads)
     assert [m.member_seq for m in members] == ["CCCC"]
+    assert read_row.tolist() == [1]
 
 
-def test_member_cap_subsamples_by_weight_and_reports_the_fraction():
-    """LPT cannot split one template; the cap is what bounds it."""
-    reads = _Reads([f"{i:04d}" for i in range(10)])
-    rows = [(i, 0, "4=", 0, 0, float(i)) for i in range(10)]
-    members, fraction = specs_from_assignment_slice(
-        _assignments(rows), reads, max_members=3
+def test_member_cap_takes_a_sample_not_a_prefix():
+    """The cap must not systematically favour the head of the table.
+
+    Every assigned read has weight 1.0 under the current rule, so a
+    weight-ordered stable sort degenerates to "the first max_members rows" —
+    a prefix, not a sample. A minority variant that happens to sit late in
+    the assignment order then disappears entirely, which is exactly the
+    population this pipeline exists to keep.
+    """
+    reads = _Reads([f"{i:04d}" for i in range(100)])
+    rows = [(i, 0, "4=", 0, 0, 1.0) for i in range(100)]
+    members, read_row, fraction = specs_from_assignment_slice(
+        _assignments(rows), reads, max_members=20, seed=7
     )
-    assert len(members) == 3
-    assert fraction == pytest.approx(0.3)
-    # The heaviest members survive — they are what shapes the PWM.
-    assert sorted(m.weight for m in members) == [7.0, 8.0, 9.0]
+    assert len(members) == 20
+    assert fraction == pytest.approx(0.2)
+    assert sorted(read_row.tolist()) == read_row.tolist(), "order preserved"
+    # Not a prefix: the sample must reach the tail of the table.
+    assert max(read_row) >= 50
+    assert len(set(read_row.tolist())) == 20
+
+
+def test_the_member_sample_is_reproducible():
+    """A re-run and a resumed run must agree on which members were used."""
+    reads = _Reads([f"{i:04d}" for i in range(100)])
+    tbl = _assignments([(i, 0, "4=", 0, 0, 1.0) for i in range(100)])
+    a = specs_from_assignment_slice(tbl, reads, max_members=20, seed=42)[1]
+    b = specs_from_assignment_slice(tbl, reads, max_members=20, seed=42)[1]
+    c = specs_from_assignment_slice(tbl, reads, max_members=20, seed=43)[1]
+    assert a.tolist() == b.tolist()
+    assert a.tolist() != c.tolist(), "a different template must sample differently"
 
 
 def test_empty_slice_is_not_an_error():
-    members, fraction = specs_from_assignment_slice(_assignments([]), _Reads([]))
+    members, read_row, fraction = specs_from_assignment_slice(
+        _assignments([]), _Reads([])
+    )
     assert members == []
+    assert read_row.tolist() == []
     assert fraction == 1.0
 
 

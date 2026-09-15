@@ -48,6 +48,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.outputs import (
     write_em_outputs,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+    NODE_MEMBERSHIP_TABLE,
     REFINED_NODE_TABLE,
     MStepParams,
     iter_unit_batches,
@@ -163,6 +164,7 @@ def _loop(corpus, reads, output_dir, params, resume, report, log) -> list[RoundR
     prev_assignments: pa.Table | None = None
     final_nodes: pa.Table | None = None
     final_assignments: pa.Table | None = None
+    final_membership: pa.Table | None = None
     for r in range(start, start + params.rounds):
         rd = rounds_dir / f"r{r:02d}"
         rd.mkdir(parents=True, exist_ok=True)
@@ -174,11 +176,12 @@ def _loop(corpus, reads, output_dir, params, resume, report, log) -> list[RoundR
             (tdir / _SUCCESS).write_bytes(b"")
         store = TemplateStore.open(tdir / TEMPLATES_ARROW)
         try:
-            result, assignments, nodes = _one_round(
+            result, assignments, nodes, node_membership = _one_round(
                 r, rd, store, corpus, reads, params, prev_assignments, t0, log
             )
             results.append(result)
             final_nodes, final_assignments = nodes, assignments
+            final_membership = node_membership
             (rd / _SUCCESS).write_bytes(b"")
 
             if r == start + params.rounds - 1:
@@ -207,10 +210,14 @@ def _loop(corpus, reads, output_dir, params, resume, report, log) -> list[RoundR
 
     _write_summary(output_dir, results)
     if final_nodes is not None and final_assignments is not None:
-        clusters, membership = build_cluster_tables(
-            final_nodes, final_assignments, identity_threshold=params.p_floor
+        clusters, membership, sample_id = build_cluster_tables(
+            final_nodes,
+            final_assignments,
+            final_membership,
+            reads=reads,
+            identity_threshold=params.p_floor,
         )
-        write_em_outputs(output_dir, clusters, membership)
+        write_em_outputs(output_dir, clusters, membership, sample_id)
         log(
             f"wrote {clusters.num_rows:,} clusters over "
             f"{membership.num_rows:,} assigned reads"
@@ -254,7 +261,9 @@ def _one_round(r, rd, store, corpus, reads, params, prev_assignments, t0, log):
 
     assignments = _read_assignments(rd / "assignments")
     t1 = time.time()
-    nodes = _run_mstep(r, rd, store, corpus, assignments, params, log)
+    nodes, node_membership = _run_mstep(
+        r, rd, store, corpus, assignments, params, log
+    )
     t_mstep = time.time() - t1
 
     churn = (
@@ -273,7 +282,7 @@ def _one_round(r, rd, store, corpus, reads, params, prev_assignments, t0, log):
         seconds={"estep": round(t_estep, 1), "mstep": round(t_mstep, 1)},
     )
     (rd / "round.json").write_text(json.dumps(asdict(result), indent=2, default=str))
-    return result, assignments, nodes
+    return result, assignments, nodes, node_membership
 
 
 def _warn_on_saturation(stats: dict, params: EmParams, log) -> None:
@@ -339,11 +348,11 @@ def _round_one_templates(corpus, reads, output_dir, params, resume, log):
     return templates
 
 
-def _run_mstep(r, rd, store, corpus, assignments, params, log) -> pa.Table:
+def _run_mstep(r, rd, store, corpus, assignments, params, log):
     out = rd / "mstep"
     srt, starts = sort_assignments_by_template(assignments)
     if srt.num_rows == 0:
-        return REFINED_NODE_TABLE.empty_table()
+        return REFINED_NODE_TABLE.empty_table(), NODE_MEMBERSHIP_TABLE.empty_table()
 
     bounds = np.concatenate([starts, [srt.num_rows]])
     tr = srt.column("template_row").to_numpy(zero_copy_only=False)
@@ -368,7 +377,7 @@ def _run_mstep(r, rd, store, corpus, assignments, params, log) -> pa.Table:
         mstep_worker,
         iter_unit_batches(srt, units),
         output_dir=out,
-        output_keys=("nodes",),
+        output_keys=("nodes", "node_membership"),
         n_workers=max(int(workers), 1),
         worker_kwargs={
             "corpus_path": str(corpus.arrow_path),
@@ -380,9 +389,18 @@ def _run_mstep(r, rd, store, corpus, assignments, params, log) -> pa.Table:
         total=len(units),
     )
     shards = outputs["nodes"].shard_paths
-    if not shards:
-        return REFINED_NODE_TABLE.empty_table()
-    return pa_ds.dataset(shards, schema=REFINED_NODE_TABLE).to_table()
+    nodes = (
+        pa_ds.dataset(shards, schema=REFINED_NODE_TABLE).to_table()
+        if shards
+        else REFINED_NODE_TABLE.empty_table()
+    )
+    mem_shards = outputs["node_membership"].shard_paths
+    membership = (
+        pa_ds.dataset(mem_shards, schema=NODE_MEMBERSHIP_TABLE).to_table()
+        if mem_shards
+        else NODE_MEMBERSHIP_TABLE.empty_table()
+    )
+    return nodes, membership
 
 
 def _read_assignments(directory: Path) -> pa.Table:
