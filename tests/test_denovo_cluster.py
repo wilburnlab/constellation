@@ -329,7 +329,7 @@ def test_assemble_clusters_schema_and_quant(synthetic_panel):
     table, *_ = synthetic_panel
     res = assemble_clusters(table, identity=0.97, predict_orfs=True, min_aa_length=40)
     # cluster table mode + nulled genome columns
-    assert set(res.clusters.column("mode").to_pylist()) == {"de-novo"}
+    assert set(res.clusters.column("mode").to_pylist()) == {"kmer"}
     assert res.clusters.column("contig_id").null_count == res.clusters.num_rows
     # feature_quant origin/engine + per-sample TPM sums ~1e6
     fq = res.feature_quant
@@ -723,7 +723,7 @@ def test_cluster_transcripts_io(tmp_path):
     manifest = json.loads((out / "manifest.json").read_text())
     assert manifest["kind"] == "cluster"
     assert manifest["align_dir"] == ""
-    assert manifest["parameters"]["mode"] == "de-novo"
+    assert manifest["parameters"]["mode"] == "kmer"
     # FASTA + protein + counts + variants + report emitted
     assert (out / "cluster.fa").read_text().count(">") == clusters.num_rows
     assert (out / "cluster_counts.tsv").exists()

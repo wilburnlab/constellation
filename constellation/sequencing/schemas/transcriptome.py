@@ -176,7 +176,8 @@ TRANSCRIPT_CLUSTER_TABLE: pa.Schema = pa.schema(
         pa.field("orf_strand", pa.string(), nullable=True),
         # 1 (Standard) | 2 (Vertebrate Mito) | ... — NCBI transl_table
         pa.field("codon_table", pa.int32(), nullable=True),
-        # 'genome-guided' | 'de-novo'
+        # 'genome' | 'kmer' | 'em'. The pre-rename spellings 'genome-guided'
+        # and 'de-novo' still load: existing outputs need no migration.
         pa.field("mode", pa.string(), nullable=False),
         # Splicing-topology columns — Phase 2 (genome-guided) only.
         pa.field("contig_id", pa.int64(), nullable=True),

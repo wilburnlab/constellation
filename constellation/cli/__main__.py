@@ -1256,15 +1256,135 @@ def _build_transcriptome_parser(subs) -> None:
     )
     p_cluster.add_argument(
         "--mode",
-        choices=("genome-guided", "de-novo"),
-        default="genome-guided",
+        # The first three are canonical. The last two are the pre-rename
+        # spellings, accepted so existing scripts and manifests keep working;
+        # they normalise and warn.
+        choices=("genome", "kmer", "em", "genome-guided", "de-novo"),
+        default="genome",
+        metavar="{genome,kmer,em}",
         help=(
-            "clustering mode. genome-guided (Phase 2) keys on splicing "
-            "topology against a reference; de-novo (Phase 3) is reference-"
-            "free minimizer + edit-distance assembly of the demux windows."
+            "clustering mode, named for the MECHANISM rather than the "
+            "provenance. genome keys on splicing topology against a "
+            "reference; kmer is reference-free connected components over a "
+            "minimizer + edit-distance graph; em iterates align -> refine to "
+            "converged reference transcripts. 'genome-guided' and 'de-novo' "
+            "are accepted as deprecated aliases for genome and kmer."
         ),
     )
-    # ── de-novo (--mode de-novo) flags ──────────────────────────────
+    # ── em (--mode em) flags ────────────────────────────────────────
+    p_cluster.add_argument(
+        "--rounds",
+        type=int,
+        default=6,
+        help="em: EM rounds. Merging is exhausted by round 3 in the bench, so "
+        "budget is better spent on rounds 1-3 plus the fixes.",
+    )
+    p_cluster.add_argument(
+        "--stop-frac-changed",
+        type=float,
+        default=0.005,
+        help="em: stop when fewer than this fraction of reads change template, "
+        "measured LINEAGE-AWARE so a read whose template merely split "
+        "does not count.",
+    )
+    p_cluster.add_argument(
+        "--p-floor",
+        type=float,
+        default=0.97,
+        help="em: absolute admission floor on n_match/aln_len. A read with no "
+        "candidate above it is emitted unassigned rather than forced "
+        "somewhere. This is the pipeline's only absolute quality gate.",
+    )
+    p_cluster.add_argument(
+        "--minimap2-n",
+        type=int,
+        default=500,
+        help="em: minimap2 -N. A CORRECTNESS parameter, not a cost one — the "
+        "candidate pool must hold every template within --p-floor, and "
+        "minimap2 truncates by score, so a truncated pool means the "
+        "ranking arbitrated over an arbitrary subset. Raise it if the "
+        "saturation warning fires.",
+    )
+    p_cluster.add_argument(
+        "--index-batch-size",
+        default="16G",
+        help="em: minimap2 -I. Must exceed the template total: a multi-part "
+        "index double-counts read mass AND breaks the query contiguity "
+        "the E-step reducer's grouping depends on.",
+    )
+    p_cluster.add_argument(
+        "--near-tie-delta-logl",
+        type=float,
+        default=5.0,
+        help="em: how close in log-likelihood (nats) a candidate must be to "
+        "the argmax for abundance to override it. ~5 is one "
+        "discriminating substitution's worth of evidence.",
+    )
+    p_cluster.add_argument(
+        "--support-ratio",
+        type=float,
+        default=20.0,
+        help="em: how much more abundant a near-tie candidate must be to win. "
+        "Deliberately extreme: the override should be rare and decisive.",
+    )
+    p_cluster.add_argument(
+        "--near-tie-z",
+        type=float,
+        default=2.0,
+        help="em: width of the AS shortlist the likelihood is computed over, "
+        "in SDs of Binomial(L, e) mismatch noise. z=2 reproduces the "
+        "hand-tuned band_abs=40 at the median 1.2 kb read.",
+    )
+    p_cluster.add_argument(
+        "--read-error-rate",
+        type=float,
+        default=0.01,
+        help="em: per-base error rate for the shortlist width.",
+    )
+    p_cluster.add_argument(
+        "--seed-representative",
+        default="longest-above-quality",
+        choices=(
+            "longest-above-quality",
+            "median-length",
+            "longest-template",
+            "most-5p-flank",
+            "most-replicated",
+        ),
+        help="em: which read of an ORF group becomes the round-1 template. "
+        "Default is the longest read clearing Q22 — quality selects read "
+        "accuracy ~4x where length selects it not at all.",
+    )
+    p_cluster.add_argument(
+        "--min-seed-reads",
+        type=int,
+        default=1,
+        help="em: drop ORF groups below this many reads BEFORE the E-step. "
+        "Keep at 1: a pre-E-step filter erases minority proteoforms "
+        "before they can be tested, and there is no prune downstream to "
+        "compensate.",
+    )
+    p_cluster.add_argument(
+        "--fold-identity",
+        type=float,
+        default=0.97,
+        help="em: ORF-level fold identity for seed grouping.",
+    )
+    p_cluster.add_argument(
+        "--max-members-per-template",
+        type=int,
+        default=20000,
+        help="em: cap on PWM members per template, abundance-weighted. LPT "
+        "cannot split one mega-template, so this is what bounds the "
+        "M-step's critical path.",
+    )
+    p_cluster.add_argument(
+        "--mstep-workers",
+        type=int,
+        default=0,
+        help="em: M-step pool size (0 = --threads).",
+    )
+    # ── kmer (--mode kmer) flags ────────────────────────────────────
     p_cluster.add_argument(
         "--identity",
         type=float,
@@ -2529,12 +2649,15 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         read_manifest_dir,
     )
 
-    if args.mode == "de-novo":
+    mode = _normalise_cluster_mode(args.mode)
+    if mode == "em":
+        return _cmd_transcriptome_cluster_em(args)
+    if mode == "kmer":
         return _cmd_transcriptome_cluster_denovo(args)
 
     if args.align_dir is None:
         print(
-            "--mode genome-guided requires --align-dir "
+            "--mode genome requires --align-dir "
             "(a `transcriptome align` output dir).",
             file=sys.stderr,
         )
@@ -3113,6 +3236,100 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
             f"({membership.num_rows} membership rows)",
             flush=True,
         )
+    return 0
+
+
+#: Pre-rename --mode spellings, accepted so existing scripts and manifests
+#: keep working. They describe provenance where the canonical names describe
+#: the mechanism, which is what a user actually chooses between.
+_CLUSTER_MODE_ALIASES = {"genome-guided": "genome", "de-novo": "kmer"}
+
+
+def _normalise_cluster_mode(mode: str) -> str:
+    """Canonical --mode, warning once on a deprecated spelling."""
+    canonical = _CLUSTER_MODE_ALIASES.get(mode)
+    if canonical is None:
+        return mode
+    print(
+        f"note: --mode {mode} is deprecated; use --mode {canonical}. "
+        "The modes are named for the mechanism now (genome / kmer / em).",
+        file=sys.stderr,
+    )
+    return canonical
+
+
+def _cmd_transcriptome_cluster_em(args: argparse.Namespace) -> int:
+    """`transcriptome cluster --mode em` — the iterative EM clusterer."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        EmParams,
+        run_em,
+    )
+
+    demux_dir = Path(args.demux_dir)
+    for sub in ("read_demux", "reads"):
+        if not (demux_dir / sub).exists():
+            print(
+                f"{demux_dir} is not a `transcriptome demultiplex` output dir "
+                f"(missing {sub}/).",
+                file=sys.stderr,
+            )
+            return 2
+
+    output_dir = Path(args.output_dir)
+    if (output_dir / "_SUCCESS").exists() and not args.resume:
+        print(
+            f"{output_dir} already holds a completed run; pass --resume to "
+            "continue it or choose another --output-dir.",
+            file=sys.stderr,
+        )
+        return 2
+
+    log = (
+        (lambda m: print(f"[em] {m}", file=sys.stderr, flush=True))
+        if args.progress
+        else None
+    )
+    params = EmParams(
+        rounds=int(args.rounds),
+        stop_frac_changed=float(args.stop_frac_changed),
+        p_floor=float(args.p_floor),
+        minimap2_n=int(args.minimap2_n),
+        index_batch_size=str(args.index_batch_size),
+        delta_logl=float(args.near_tie_delta_logl),
+        support_ratio=float(args.support_ratio),
+        near_tie_z=float(args.near_tie_z),
+        read_error_rate=float(args.read_error_rate),
+        min_aa_length=int(args.min_aa_length),
+        seed_representative=str(args.seed_representative),
+        min_seed_reads=int(args.min_seed_reads),
+        fold_identity=float(args.fold_identity),
+        max_window_length=(
+            int(args.max_window_length) if args.max_window_length > 0 else None
+        ),
+        threads=int(args.threads),
+        mstep_workers=int(args.mstep_workers),
+        mstep=MStepParams(
+            min_aa_length=int(args.min_aa_length),
+            overdispersion=float(args.overdispersion),
+            max_members_per_template=int(args.max_members_per_template),
+        ),
+    )
+    results = run_em(
+        demux_dir, output_dir, params=params, resume=args.resume, progress=log
+    )
+    if not results:
+        print("no clusters were produced", file=sys.stderr)
+        return 1
+    (output_dir / "_SUCCESS").write_bytes(b"")
+    last = results[-1]
+    print(
+        f"{len(results)} round(s); {last.n_nodes:,} clusters over "
+        f"{last.estep.get('n_assigned', 0):,} assigned reads "
+        f"({last.estep.get('n_unassigned', 0):,} unassigned)"
+    )
     return 0
 
 

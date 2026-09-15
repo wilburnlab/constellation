@@ -250,3 +250,42 @@ def test_the_loop_converges_and_keeps_genes_apart(tmp_path):
     dominant = sum(max(c.values()) for c in per_cluster.values())
     assert total > 0
     assert dominant / total >= 0.99, "a cluster must not mix two transcripts"
+
+
+def test_the_user_facing_outputs_are_written_in_the_shared_shapes(corpus_dir, tmp_path):
+    """Every existing consumer reads these; none may need a clusterer branch."""
+    import pyarrow as pa_
+    from constellation.sequencing.schemas.transcriptome import (
+        CLUSTER_MEMBERSHIP_TABLE,
+        TRANSCRIPT_CLUSTER_TABLE,
+    )
+
+    out = tmp_path / "em"
+    run_em(corpus_dir, out, params=_params(rounds=1))
+
+    clusters = pq.read_table(out / "clusters.parquet")
+    membership = pq.read_table(out / "cluster_membership.parquet")
+    assert clusters.schema.equals(TRANSCRIPT_CLUSTER_TABLE)
+    assert membership.schema.equals(CLUSTER_MEMBERSHIP_TABLE)
+    assert clusters.num_rows > 0
+
+    # The renamed mode vocabulary, not the pre-rename spelling.
+    assert set(clusters.column("mode").to_pylist()) == {"em"}
+    # Genome columns stay null: this is a reference-free clusterer.
+    assert clusters.column("contig_id").null_count == clusters.num_rows
+
+    # The schema requires a representative even though a round-2 frame is a
+    # consensus with no read of its own.
+    assert all(clusters.column("representative_read_id").to_pylist())
+    assert (out / "cluster.fa").exists()
+    assert (out / "feature_quant.parquet").exists()
+
+    # Exactly one representative per cluster that holds reads.
+    roles = {}
+    for cid, role in zip(
+        membership.column("cluster_id").to_pylist(),
+        membership.column("role").to_pylist(),
+    ):
+        roles.setdefault(cid, []).append(role)
+    for cid, rs in roles.items():
+        assert rs.count("representative") == 1, cid

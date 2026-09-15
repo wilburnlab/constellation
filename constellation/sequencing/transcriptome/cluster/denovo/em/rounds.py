@@ -43,6 +43,10 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
     write_corpus,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.fold import fold_orfs
+from constellation.sequencing.transcriptome.cluster.denovo.em.outputs import (
+    build_cluster_tables,
+    write_em_outputs,
+)
 from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
     REFINED_NODE_TABLE,
     MStepParams,
@@ -156,6 +160,8 @@ def _loop(corpus, reads, output_dir, params, resume, log) -> list[RoundResult]:
 
     results: list[RoundResult] = []
     prev_assignments: pa.Table | None = None
+    final_nodes: pa.Table | None = None
+    final_assignments: pa.Table | None = None
     for r in range(start, start + params.rounds):
         rd = rounds_dir / f"r{r:02d}"
         rd.mkdir(parents=True, exist_ok=True)
@@ -171,6 +177,7 @@ def _loop(corpus, reads, output_dir, params, resume, log) -> list[RoundResult]:
                 r, rd, store, corpus, reads, params, prev_assignments, t0, log
             )
             results.append(result)
+            final_nodes, final_assignments = nodes, assignments
             (rd / _SUCCESS).write_bytes(b"")
 
             if r == start + params.rounds - 1:
@@ -198,6 +205,15 @@ def _loop(corpus, reads, output_dir, params, resume, log) -> list[RoundResult]:
             store.close()
 
     _write_summary(output_dir, results)
+    if final_nodes is not None and final_assignments is not None:
+        clusters, membership = build_cluster_tables(
+            final_nodes, final_assignments, identity_threshold=params.p_floor
+        )
+        write_em_outputs(output_dir, clusters, membership)
+        log(
+            f"wrote {clusters.num_rows:,} clusters over "
+            f"{membership.num_rows:,} assigned reads"
+        )
     return results
 
 

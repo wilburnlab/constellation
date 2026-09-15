@@ -1,7 +1,7 @@
 // cluster_pileup renderer — two views:
 //
 //   clusters (default) — one rectangle per cluster from span_start to
-//     span_end, colored by `mode` (genome-guided vs de-novo), with
+//     span_end, colored by `mode` (genome / kmer / em), with
 //     log-scaled opacity by n_reads. Hybrid mode paints a datashader
 //     PNG.
 //
@@ -27,7 +27,14 @@ import {
   pickPaletteColor,
 } from './style';
 
+// Keyed on the `mode` column of clusters.parquet. The canonical names
+// describe the mechanism (genome / kmer / em); the two pre-rename spellings
+// are kept so clusters.parquet files written before the rename still colour
+// correctly rather than falling through to grey.
 const MODE_COLOR_DEFAULTS: Record<string, string> = {
+  genome: '#5ed6cf',
+  kmer: '#a8d65e',
+  em: '#d6a85e',
   'genome-guided': '#5ed6cf',
   'de-novo': '#a8d65e',
   default: '#888',
