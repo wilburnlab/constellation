@@ -64,22 +64,40 @@ for _i, _b in enumerate(b"acgt"):
     _BASE_LUT[_b] = _i
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class TemplateStore:
     """Row-indexed, zero-copy access to a round's templates.
 
-    ``hp_run`` is the per-base homopolymer run length over the concatenated
-    sequence buffer, computed once when the store is opened. The likelihood
-    ranker needs the run length at scattered ``(template, position)`` pairs,
-    and a precomputed array makes that a gather; deriving it per event from a
-    windowed scan costs ``events x window`` instead.
+    ``hp_run`` — the per-base homopolymer run length the likelihood ranker
+    gathers at scattered ``(template, position)`` pairs — is computed **on
+    first access, not on open**, and stored as ``uint8``.
+
+    Both details are load-bearing at scale. Only the E-step reducer needs this
+    context; every M-step worker opens a store and never touches it. Building
+    it eagerly as int32 cost 4 bytes per template base *per process*: measured,
+    4 MB of sequence peaked at 112 MB, and round 1's ~6.2 Gb of templates would
+    have wanted **~25 GB in every one of ~52 workers**. Lazy + uint8 makes it
+    zero in the workers and ~6 GB once in the reducer.
+
+    uint8 loses nothing: the epsilon table saturates at a run length of 64 and
+    the error model clamps at ``hp_max`` well before that, so runs are capped
+    at 255 rather than truncated into a wrong context.
     """
 
     table: pa.Table
     seq_offsets: np.ndarray  # int64 (T+1) — into the concatenated buffer
     seq_buffer: np.ndarray  # uint8
-    hp_run: np.ndarray  # int32, parallel to seq_buffer
+    _hp_run: np.ndarray | None = None
     _mm: pa.MemoryMappedFile | None = None
+
+    @property
+    def hp_run(self) -> np.ndarray:
+        """Per-base homopolymer run length, built on first use."""
+        if self._hp_run is None:
+            self._hp_run = _homopolymer_runs_segmented(
+                self.seq_buffer, self.seq_offsets
+            )
+        return self._hp_run
 
     @classmethod
     def open(cls, path: Path | str) -> TemplateStore:
@@ -102,13 +120,7 @@ class TemplateStore:
             seq = seq.chunk(0) if seq.num_chunks else pa.array([], pa.large_string())
         offsets = np.asarray(seq.buffers()[1]).view(np.int64)[: len(seq) + 1].copy()
         data = np.asarray(seq.buffers()[2]).view(np.uint8)[: int(offsets[-1])]
-        return cls(
-            table=table,
-            seq_offsets=offsets,
-            seq_buffer=data,
-            hp_run=_homopolymer_runs_segmented(data, offsets),
-            _mm=mm,
-        )
+        return cls(table=table, seq_offsets=offsets, seq_buffer=data, _mm=mm)
 
     @property
     def n_templates(self) -> int:
@@ -167,35 +179,73 @@ class TemplateStore:
         g = np.clip(
             lo + np.asarray(positions, dtype=np.int64), lo, np.maximum(hi - 1, lo)
         )
-        if self.hp_run.size == 0:
+        runs = self.hp_run
+        if runs.size == 0:
             return np.ones(rows.size, dtype=np.int32)
-        return self.hp_run[np.clip(g, 0, self.hp_run.size - 1)]
+        return runs[np.clip(g, 0, runs.size - 1)].astype(np.int32)
 
     def close(self) -> None:
         if self._mm is not None:
             self._mm.close()
 
 
+#: Bases per homopolymer-run block. The construction temporaries are int64
+#: (a cumsum group index plus its gather), so peak is ~16x the block rather
+#: than ~16x the whole buffer: unchunked, 4 MB of sequence peaked at 128 MB,
+#: which at round 1's ~6.2 Gb of templates would have wanted ~200 GB.
+_HP_BLOCK_BASES = 8_000_000
+
+
 def _homopolymer_runs_segmented(data: np.ndarray, offsets: np.ndarray) -> np.ndarray:
     """Per-base homopolymer run length, reset at every template boundary.
 
+    Chunked **on template boundaries**, which is what makes the chunking free
+    of edge cases: a run never crosses one (that is the reset), so no block
+    can split a run and there is nothing to stitch.
+
     Running :func:`homopolymer_runs` over the concatenated buffer directly
-    would merge a template ending in ``AAA`` with the next one starting
-    ``AAA`` into a single run of six, which is a fabricated context exactly
-    where the error model is most sensitive to it.
+    would also merge a template ending in ``AAA`` with the next one starting
+    ``AAA`` into a single run of six — a fabricated context exactly where the
+    error model is most sensitive to it.
     """
     n = data.size
     if n == 0:
-        return np.zeros(0, dtype=np.int32)
+        return np.zeros(0, dtype=np.uint8)
+
+    out = np.empty(n, dtype=np.uint8)
+    n_templates = offsets.size - 1
+    lo_row = 0
+    while lo_row < n_templates:
+        base = int(offsets[lo_row])
+        # Take whole templates until the block budget is spent; always at
+        # least one, so a single template larger than the budget still fits.
+        hi_row = int(
+            np.searchsorted(offsets, base + _HP_BLOCK_BASES, side="right") - 1
+        )
+        hi_row = min(max(hi_row, lo_row + 1), n_templates)
+        stop = int(offsets[hi_row])
+        if stop > base:
+            out[base:stop] = _runs_one_block(
+                data[base:stop], offsets[lo_row : hi_row + 1] - base
+            )
+        lo_row = hi_row
+    return out
+
+
+def _runs_one_block(data: np.ndarray, offsets: np.ndarray) -> np.ndarray:
     codes = _BASE_LUT[data]
-    change = np.empty(n, dtype=bool)
+    m = codes.size
+    change = np.empty(m, dtype=bool)
     change[0] = True
     change[1:] = codes[1:] != codes[:-1]
     starts = offsets[:-1]
-    change[starts[starts < n]] = True
+    change[starts[(starts >= 0) & (starts < m)]] = True
     grp = np.cumsum(change) - 1
     sizes = np.bincount(grp)
-    return sizes[grp].astype(np.int32)
+    # uint8: the epsilon table saturates at 64 and the error model clamps at
+    # hp_max long before that, so capping is not a truncation into a wrong
+    # context — and it is 4x smaller than a per-base int32.
+    return np.minimum(sizes[grp], 255).astype(np.uint8)
 
 
 def write_templates(table: pa.Table, directory: Path) -> tuple[Path, Path]:
