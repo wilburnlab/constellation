@@ -81,6 +81,22 @@ class RepCandidates:
     # Abundance-weighted median template_length of the row's own group,
     # broadcast per row so a policy is a pure elementwise function.
     median_length: np.ndarray  # int64
+    # Best `dorado_quality` among the reads sharing this exact cDNA, or -1
+    # where the demux dir predates the qs:f tag. Reads sharing an exact cDNA
+    # are byte-identical, so the best of them is the right representative and
+    # the choice costs the template sequence nothing.
+    quality: np.ndarray  # float64
+
+
+#: Default floor for the quality-aware policy. The knee of the measured
+#: decile curve: median error by `dorado_quality` decile runs 0.02321,
+#: 0.01152, 0.00796, 0.00607, then flattens — so everything above the third
+#: decile is nearly equivalent and there is nothing to buy above ~Q22.
+SEED_QUALITY_FLOOR = 22.0
+
+#: Ranks are int64 lexsort keys. Quality-failing rows are offset past every
+#: possible `-template_length` so they sort strictly after every clearing row.
+_RANK_FAIL_BASE = 1 << 40
 
 
 RepresentativePolicy = Callable[[RepCandidates], np.ndarray]
@@ -102,6 +118,35 @@ def _rank_most_replicated(c: RepCandidates) -> np.ndarray:
     return -c.abundance
 
 
+def _rank_longest_above_quality(c: RepCandidates) -> np.ndarray:
+    """Longest cDNA clearing the quality floor; else the highest-quality one.
+
+    The trade this appears to require does not exist. Over 8.3M reads,
+    Spearman(length, error) is **+0.015 to +0.049** in every length stratum —
+    length and accuracy are independent — so constraining one and optimising
+    the other is nearly free. As selectors of read accuracy they are not
+    comparable at all: the top decile by ``dorado_quality`` has median error
+    0.00114 (0.25x), by ``mean_quality`` 0.00166, and by ``length`` 0.00501,
+    which is **1.10x** — slightly worse than picking at random.
+
+    So quality is the floor and length is the objective, in that order,
+    because quality's benefit saturates (the decile curve flattens after the
+    third) while length's cost does not: a 500 nt seed for a 3 kb transcript
+    can never represent it, and since the covariance M-step made extent
+    representable a truncated seed emits a truncated ORF rather than being
+    silently extended.
+
+    Honest limit: even the top quality decile has *mean* error 0.0068 against
+    *median* 0.00114, so a floor makes bad seeds rarer, not absent. A
+    single-read seed is one draw from that tail.
+    """
+    clears = c.quality >= SEED_QUALITY_FLOOR
+    # Failing rows rank by quality descending, after every clearing row — so
+    # "fall back to the group's best read" needs no group-level branch.
+    fail = _RANK_FAIL_BASE - np.rint(c.quality * 1000.0).astype(np.int64)
+    return np.where(clears, -c.template_length, fail)
+
+
 REPRESENTATIVE_POLICIES: dict[str, RepresentativePolicy] = {
     # Default. The longest cDNA is the most likely chimera / concatemer /
     # internal-priming artifact, so electing it makes the template a
@@ -111,6 +156,8 @@ REPRESENTATIVE_POLICIES: dict[str, RepresentativePolicy] = {
     # unrecoverable ceiling, which is why "longest" would have been the
     # defensive choice. Expect this to be swept.
     "median-length": _rank_median_length,
+    # The EM path's default. See :func:`_rank_longest_above_quality`.
+    "longest-above-quality": _rank_longest_above_quality,
     "longest-template": _rank_longest_template,
     # Maximises the 5' flank the M-step gets to extend an ORF into.
     "most-5p-flank": _rank_most_5p_flank,
@@ -227,6 +274,7 @@ def extract_seed_orfs(
     n_uniq = uniq.num_rows
     if n_uniq == 0:
         return SEED_ORF_TABLE.empty_table(), READ_ORF_MAP_SCHEMA.empty_table()
+    uniq_quality, uniq_best_read = _best_quality_per_uniq(reads, read_map, n_uniq)
 
     seqs = uniq.column("sequence").to_pylist()
     log(f"predicting sense ORFs (≥{min_aa_length} aa) over {n_uniq:,} unique cDNAs…")
@@ -272,6 +320,7 @@ def extract_seed_orfs(
         orf_start=orf_start[order],
         abundance=abundance[order].astype(np.int64),
         median_length=median_len[group_of_row],
+        quality=uniq_quality[row[order]],
     )
     rank = np.asarray(policy(cand), dtype=np.int64)
     # Deterministic tie-breaks: more reads, then longer cDNA, then row order.
@@ -293,7 +342,18 @@ def extract_seed_orfs(
     rep_row = order[first_of_group]
 
     rep_uniq = row[rep_row]
+    # Name the best-quality read of the elected cDNA rather than whichever
+    # row dereplication happened to keep. The sequence is identical either
+    # way — reads share an exact cDNA — so this costs the template nothing
+    # and gives the round-1 ranker an accurate seed quality to break ties on.
     rep_read_id = pc.take(uniq.column("representative_read_id"), pa.array(rep_uniq))
+    best_ids = uniq_best_read[rep_uniq]
+    if best_ids is not None:
+        rep_read_id = pc.if_else(
+            pa.array(best_ids >= 0),
+            pc.take(reads.column("read_id"), pa.array(np.maximum(best_ids, 0))),
+            rep_read_id,
+        )
     n_orfs = n_groups
     seed = pa.table(
         {
@@ -330,8 +390,53 @@ def extract_seed_orfs(
     return seed, read_orf
 
 
+def _best_quality_per_uniq(
+    reads: pa.Table, read_map: pa.Table, n_uniq: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per distinct cDNA: the best ``dorado_quality``, and which read has it.
+
+    Returns ``(quality, read_row)`` with ``-1`` where the column is absent or
+    all-null, which makes the quality-aware policy degrade to "highest of
+    nothing" — every row fails the floor, so the group falls through to its
+    existing abundance / length tie-breaks rather than erroring.
+    """
+    quality = np.full(n_uniq, -1.0, dtype=np.float64)
+    best_row = np.full(n_uniq, -1, dtype=np.int64)
+    if "dorado_quality" not in reads.schema.names or read_map.num_rows == 0:
+        return quality, best_row
+
+    q_col = reads.column("dorado_quality")
+    if q_col.null_count == reads.num_rows:
+        return quality, best_row
+
+    # read_map is (read_id, uniq_id, ...); recover each read's ROW in `reads`
+    # by position rather than by a string join — dereplicate preserves order,
+    # so `pc.index_in` over read_id is the only string touch and it happens
+    # once per read rather than once per hit.
+    row_of_read = pc.index_in(
+        read_map.column("read_id"), value_set=reads.column("read_id").combine_chunks()
+    ).to_numpy(zero_copy_only=False)
+    uid = read_map.column("uniq_id").to_numpy(zero_copy_only=False)
+    q = pc.fill_null(q_col, -1.0).to_numpy(zero_copy_only=False).astype(np.float64)
+    valid = ~np.isnan(row_of_read.astype(np.float64))
+    if not valid.any():
+        return quality, best_row
+    rows = row_of_read[valid].astype(np.int64)
+    uids = uid[valid].astype(np.int64)
+    qv = q[rows]
+
+    # Highest quality first, so the first occurrence of each uniq_id is its best.
+    order = np.lexsort((-qv, uids))
+    su, sq, sr = uids[order], qv[order], rows[order]
+    first = np.flatnonzero(np.concatenate([[True], su[1:] != su[:-1]]))
+    quality[su[first]] = sq[first]
+    best_row[su[first]] = sr[first]
+    return quality, best_row
+
+
 __all__ = [
     "SEED_ORF_TABLE",
+    "SEED_QUALITY_FLOOR",
     "READ_ORF_MAP_SCHEMA",
     "RepCandidates",
     "REPRESENTATIVE_POLICIES",
