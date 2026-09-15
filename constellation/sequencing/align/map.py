@@ -114,7 +114,9 @@ def transcript_window_buffers(
     data, off = _string_buf_and_offsets(batch.column(column))
     off = off.astype(np.int64)
     n = batch.num_rows
-    ts = batch.column("transcript_start").to_numpy(zero_copy_only=False).astype(np.int64)
+    ts = (
+        batch.column("transcript_start").to_numpy(zero_copy_only=False).astype(np.int64)
+    )
     te = batch.column("transcript_end").to_numpy(zero_copy_only=False).astype(np.int64)
     row_start, row_end = off[:-1], off[1:]
     lengths = row_end - row_start
@@ -194,13 +196,9 @@ def _iter_demux_read_batches(
     reads_dir = demux_dir / "reads"
     demux_part_dir = demux_dir / "read_demux"
     if not reads_dir.is_dir():
-        raise FileNotFoundError(
-            f"demux output missing reads/: {demux_dir}"
-        )
+        raise FileNotFoundError(f"demux output missing reads/: {demux_dir}")
     if not demux_part_dir.is_dir():
-        raise FileNotFoundError(
-            f"demux output missing read_demux/: {demux_dir}"
-        )
+        raise FileNotFoundError(f"demux output missing read_demux/: {demux_dir}")
 
     if only_complete:
         filt = (
@@ -241,8 +239,18 @@ def _iter_demux_read_batches(
         return
 
     reads_ds = pa_ds.dataset(reads_dir)
-    has_quality = "quality" in set(reads_ds.schema.names)
-    reads_columns = ["read_id", "sequence"] + (["quality"] if has_quality else [])
+    reads_names = set(reads_ds.schema.names)
+    reads_columns = ["read_id", "sequence"]
+    if "quality" in reads_names:
+        reads_columns.append("quality")
+    if "dorado_quality" in reads_names:
+        # The per-read `qs:f` tag. Carried because the EM seeder ranks
+        # representatives on it (it selects read accuracy ~4x where length
+        # selects it not at all), and because the round-1 assignment rule
+        # tie-breaks candidate templates on their seed read's quality.
+        # Presence-guarded: READ_TABLE has carried it since S1 ingest, but
+        # demux dirs written before that predate the column.
+        reads_columns.append("dorado_quality")
 
     # Build the streaming plan: dataset scan -> hashjoin with the
     # in-memory demux table on the right (build) side.
@@ -346,12 +354,12 @@ def _format_fastq_bytes(batch: pa.RecordBatch) -> tuple[bytes, int]:
         if width <= 0:
             continue
         out.append(0x40)  # '@'
-        out += rid_data[rid_off[i]:rid_off[i + 1]]
+        out += rid_data[rid_off[i] : rid_off[i + 1]]
         out.append(0x0A)  # '\n'
         out += seq_buf[start:end].tobytes()
         out += b"\n+\n"
         if qual_off is not None and int(qual_off[i + 1]) - int(qual_off[i]) == width:
-            out += qual_buf[int(qual_off[i]):int(qual_off[i + 1])].tobytes()
+            out += qual_buf[int(qual_off[i]) : int(qual_off[i + 1])].tobytes()
         else:
             # No quality column, or this row's value was null / the wrong
             # length — synthesise Q40 across the window.
@@ -473,9 +481,7 @@ def map_to_genome(
 
     procs: list[tuple[subprocess.Popen, list[str]]] = []
     try:
-        mm2 = subprocess.Popen(
-            cmd_mm2, stdin=subprocess.PIPE, stdout=subprocess.PIPE
-        )
+        mm2 = subprocess.Popen(cmd_mm2, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         procs.append((mm2, cmd_mm2))
         sort = subprocess.Popen(cmd_sort, stdin=mm2.stdout)
         procs.append((sort, cmd_sort))

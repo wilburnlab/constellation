@@ -26,6 +26,10 @@ _READS_SCHEMA = pa.schema(
         pa.field("read_id", pa.string(), nullable=False),
         pa.field("sequence", pa.large_string(), nullable=False),
         pa.field("sample_id", pa.int64(), nullable=True),
+        # The `qs:f` Dorado tag, null on demux dirs that predate it. Used by
+        # the EM seeder (quality selects read accuracy ~4x; length does not)
+        # and by the round-1 assignment tie-break.
+        pa.field("dorado_quality", pa.float32(), nullable=True),
     ]
 )
 
@@ -52,16 +56,21 @@ def _trim_batch(batch: pa.RecordBatch) -> pa.Table:
             null_bitmap=None,
             null_count=0,
         )
+    names = set(batch.schema.names)
     sample = (
-        batch.column("sample_id")
-        if "sample_id" in batch.schema.names
-        else pa.nulls(n, pa.int64())
+        batch.column("sample_id") if "sample_id" in names else pa.nulls(n, pa.int64())
+    )
+    quality = (
+        batch.column("dorado_quality")
+        if "dorado_quality" in names
+        else pa.nulls(n, pa.float32())
     )
     return pa.table(
         {
             "read_id": batch.column("read_id"),
             "sequence": window,
             "sample_id": pa.array(sample).cast(pa.int64()),
+            "dorado_quality": pa.array(quality).cast(pa.float32()),
         },
         schema=_READS_SCHEMA,
     )
