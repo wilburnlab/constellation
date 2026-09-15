@@ -305,3 +305,51 @@ def test_streaming_is_independent_of_chunk_size(chunk):
     assert table.num_rows == 20
     assert table.column("read_row").to_pylist() == list(range(20))
     assert set(table.column("template_row").to_pylist()) == {1}
+
+
+# ── the runner's guards ───────────────────────────────────────────────
+
+
+def test_a_multipart_index_is_refused():
+    """Two things depend on a single index part, not one."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
+        _check_single_index_part,
+        _parse_size,
+    )
+
+    store = _store(["A" * 2000, "C" * 2000])
+    _check_single_index_part(store, "16G")  # comfortably above 4 kb
+
+    with pytest.raises(ValueError, match="multi-part index"):
+        _check_single_index_part(store, "1K")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("16G", 16_000_000_000), ("4M", 4_000_000), ("500K", 500_000), ("123", 123)],
+)
+def test_index_size_grammar(text, expected):
+    from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
+        _parse_size,
+    )
+
+    assert _parse_size(text) == expected
+
+
+def test_minimap2_flags_carry_the_load_bearing_options():
+    from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
+        TEMPLATE_MINIMAP2_ARGS,
+    )
+
+    flags = list(TEMPLATE_MINIMAP2_ARGS)
+    # --eqx: without it cg:Z is all M, so mismatches fold into matches and
+    # both the identity gate and the likelihood read every hit as perfect.
+    assert "--eqx" in flags
+    # -p 0.05: the stock 0.8 hides exactly the nested / 5'-truncated
+    # proteoforms this pipeline exists to separate.
+    assert flags[flags.index("-p") + 1] == "0.05"
+    assert "--secondary=yes" in flags
+    assert "-c" in flags
+    # -N is NOT baked in: it is a per-run correctness parameter, since the
+    # pool must contain every template within p_floor.
+    assert "-N" not in flags

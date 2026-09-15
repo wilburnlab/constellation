@@ -209,6 +209,7 @@ import constellation.sequencing.transcriptome.cluster.denovo.em.corpus
 import constellation.sequencing.transcriptome.cluster.denovo.em.estep
 import constellation.sequencing.transcriptome.cluster.denovo.em.fold
 import constellation.sequencing.transcriptome.cluster.denovo.em.mstep
+import constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool
 import constellation.sequencing.transcriptome.cluster.denovo.em.likelihood
 import constellation.sequencing.transcriptome.cluster.denovo.em.paf_scan
 import constellation.sequencing.transcriptome.cluster.denovo.em.scheduler

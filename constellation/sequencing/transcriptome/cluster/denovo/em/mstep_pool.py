@@ -1,0 +1,282 @@
+"""Fanning the M-step out over templates, without a copy-on-write trap.
+
+``refine_template`` handles one template. Making that a round means answering
+two questions the prototype got wrong in opposite directions.
+
+**What crosses the fork boundary.** The prototype put a ``dict[read_id, str]``
+of every read plus one dict per assignment into a module global and forked,
+expecting copy-on-write to share them. Measured: ~16 GB *private* per worker
+over a ~30 GB shared base, because CPython writes the refcount word of every
+object a worker touches. Here nothing large crosses: a worker receives its
+slice of the assignment table and **opens the corpus and the templates
+itself** by mmap. That also makes the design correct under ``spawn``, rather
+than silently depending on ``fork``.
+
+**How templates are scheduled.** The prototype handed out static contiguous
+template ranges, so one mega-template serialised the stage — effective
+parallelism was ~2-3 workers of 8. Units are bin-packed largest-cost-first
+instead (cost = members x template length, the ``frame_consensus`` term),
+which measures at load imbalance 1.000 packing 4M templates into 832 units.
+
+LPT cannot fix a single template that is the critical path on its own, so
+``max_members_per_template`` subsamples by abundance above a cap. That is the
+likeliest explanation for the prototype's 12.7 h round-1 M-step:
+``_CONSENSUS_MAX_MEMBERS`` bounds the components path but nothing bounded
+this one.
+
+**No torch, ever, below this line.** ``consensus`` / ``columns`` /
+``covariance`` are numpy-only by design because the parent has already spawned
+torch's thread pool during minimizer extraction, and a torch op after
+``fork()`` deadlocks on OpenMP. The failure is a silent hang, not an
+exception.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from constellation.core.io.schemas import register_schema
+from constellation.sequencing.transcriptome.cluster.denovo.consensus import MemberSpec
+
+
+REFINED_NODE_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("round", pa.int32(), nullable=False),
+        pa.field("parent_template_id", pa.int64(), nullable=False),
+        pa.field("parent_template_row", pa.int32(), nullable=False),
+        pa.field("haplotype_id", pa.int32(), nullable=False),
+        pa.field("consensus", pa.large_string(), nullable=False),
+        pa.field("n_reads", pa.int64(), nullable=False),
+        pa.field("node_weight", pa.float64(), nullable=False),
+        pa.field("protein", pa.large_string(), nullable=True),
+        pa.field("orf_start", pa.int32(), nullable=False),
+        pa.field("orf_end", pa.int32(), nullable=False),
+        pa.field("orf_certified_end", pa.int32(), nullable=False),
+        pa.field("orf_truncated_by_support", pa.bool_(), nullable=False),
+        pa.field("allele_string", pa.string(), nullable=True),
+        pa.field("declared_variants", pa.list_(pa.int64()), nullable=False),
+        pa.field("n_inserted_columns", pa.int32(), nullable=False),
+        pa.field("n_extended_5p", pa.int32(), nullable=False),
+        pa.field("n_extended_3p", pa.int32(), nullable=False),
+        pa.field("n_trimmed_5p", pa.int32(), nullable=False),
+        pa.field("n_trimmed_3p", pa.int32(), nullable=False),
+        pa.field("n_members_used", pa.int32(), nullable=False),
+        # <1.0 when max_members_per_template subsampled; node_weight is
+        # scaled back up by its reciprocal so quant stays on the real mass.
+        pa.field("subsample_fraction", pa.float32(), nullable=False),
+    ],
+    metadata={b"schema_name": b"EmRefinedNodeTable"},
+)
+
+register_schema("EmRefinedNodeTable", REFINED_NODE_TABLE)
+
+
+@dataclass(frozen=True, slots=True)
+class MStepUnit:
+    """A contiguous row range of the template-sorted assignment table."""
+
+    unit_idx: int
+    rows: np.ndarray  # template rows in this unit
+    row_lo: np.ndarray  # per template, start in the sorted table
+    row_hi: np.ndarray
+    cost: float
+
+
+@dataclass(frozen=True, slots=True)
+class MStepParams:
+    """Every annealing knob, explicitly. No ``**kwargs``.
+
+    Forwarding ``**kwargs`` is how ``--consensus-max-passes`` survived as a
+    user-facing flag that did nothing for a release, so the round loop passes
+    this object and a typo is a TypeError rather than a silently ignored key.
+    """
+
+    min_aa_length: int = 30
+    min_node_reads: float = 2.0
+    f_min: float = 0.02
+    a_min: float = 3.0
+    q_candidate: float = 0.01
+    q_edge: float = 0.01
+    gamma: float = 0.6
+    max_nodes: int = 8
+    max_candidate_columns: int = 512
+    support_min_depth: float = 3.0
+    support_min_agreement: float = 0.6
+    overdispersion: float = 0.01
+    eps_floor: float = 0.0
+    min_extension_support: float | None = 3.0
+    fold_insertions: bool = True
+    max_members_per_template: int = 20_000
+
+    def kernel_kwargs(self) -> dict[str, Any]:
+        return {
+            "min_aa_length": self.min_aa_length,
+            "min_node_reads": self.min_node_reads,
+            "f_min": self.f_min,
+            "a_min": self.a_min,
+            "q_candidate": self.q_candidate,
+            "q_edge": self.q_edge,
+            "gamma": self.gamma,
+            "max_nodes": self.max_nodes,
+            "max_candidate_columns": self.max_candidate_columns,
+            "support_min_depth": self.support_min_depth,
+            "support_min_agreement": self.support_min_agreement,
+            "overdispersion": self.overdispersion,
+            "eps_floor": self.eps_floor,
+            "min_extension_support": self.min_extension_support,
+            "fold_insertions": self.fold_insertions,
+        }
+
+
+def specs_from_assignment_slice(
+    rows: pa.Table, reads, *, max_members: int = 20_000
+) -> tuple[list[MemberSpec], float]:
+    """PWM members for one template. Returns ``(members, subsample_fraction)``.
+
+    Replaces the dict-per-assignment-row + ``dict[read_id, str]`` form. The
+    caller passes this template's contiguous slice of the sorted assignment
+    table; sequences come from the mmapped corpus by ``read_row``, so the only
+    Python strings that exist are this template's own members — bounded by
+    ``max_members``, never by the corpus.
+
+    Orientation is fixed: minimap2 emits query -> target, so the template is
+    the reference and ``centroid_is_query`` is False.
+    """
+    if rows.num_rows == 0:
+        return [], 1.0
+
+    keep = pc.is_valid(rows.column("cigar"))
+    keep = pc.and_(keep, pc.not_equal(pc.binary_length(rows.column("cigar")), 0))
+    rows = rows.filter(keep)
+    if rows.num_rows == 0:
+        return [], 1.0
+
+    weight = rows.column("weight").to_numpy(zero_copy_only=False).astype(np.float64)
+    fraction = 1.0
+    if max_members and rows.num_rows > max_members:
+        # Abundance-weighted subsample: keep the heaviest members, which are
+        # the ones the PWM is actually shaped by.
+        order = np.argsort(-weight, kind="stable")[:max_members]
+        order.sort()
+        fraction = max_members / rows.num_rows
+        rows = rows.take(pa.array(order))
+        weight = weight[order]
+
+    read_row = rows.column("read_row").to_numpy(zero_copy_only=False)
+    seqs = reads.take_sequences(read_row)
+    cigars = rows.column("cigar").to_pylist()
+    t_start = rows.column("t_start").to_numpy(zero_copy_only=False)
+    q_start = rows.column("q_start").to_numpy(zero_copy_only=False)
+
+    return [
+        MemberSpec(
+            member_seq=seqs[i],
+            weight=float(weight[i]),
+            cigar=cigars[i],
+            centroid_is_query=False,
+            ref_start=int(t_start[i]),
+            member_start=int(q_start[i]),
+            member_id=i,
+        )
+        for i in range(rows.num_rows)
+    ], fraction
+
+
+def plan_mstep_units(
+    template_row: np.ndarray,
+    row_lo: np.ndarray,
+    row_hi: np.ndarray,
+    template_length: np.ndarray,
+    *,
+    n_units: int,
+    max_members: int = 20_000,
+) -> list[MStepUnit]:
+    """Bin-pack templates into ``n_units``, largest cost first.
+
+    Cost is ``min(members, max_members) x template length`` — the
+    ``frame_consensus`` term, capped exactly as the worker caps it. The cap
+    has to be in the model or the two disagree: a 500k-member template costs
+    the planner 60x a unit's budget and gets its own unit, while the worker
+    only ever builds 20k of them.
+
+    It is also why the cap exists at all. LPT balances what it can divide, and
+    packing 200k templates with no mega-template measures at load imbalance
+    **1.000**; insert one 500k-member template and it goes to **60.6**,
+    because no packing can split a single unit of work. Capping members is the
+    only thing that bounds it.
+    """
+    sizes = (row_hi - row_lo).astype(np.int64)
+    live = np.flatnonzero(sizes > 0)
+    if live.size == 0:
+        return []
+    effective = (
+        np.minimum(sizes[live], int(max_members)) if max_members else sizes[live]
+    )
+    cost = effective.astype(np.float64) * np.maximum(
+        template_length[template_row[live]].astype(np.float64), 1.0
+    )
+    order = live[np.argsort(-cost, kind="stable")]
+    n_units = max(1, min(int(n_units), order.size))
+
+    loads = np.zeros(n_units, dtype=np.float64)
+    buckets: list[list[int]] = [[] for _ in range(n_units)]
+    cost_of = dict(zip(live.tolist(), cost.tolist()))
+    for t in order.tolist():
+        b = int(np.argmin(loads))
+        buckets[b].append(t)
+        loads[b] += cost_of[t]
+
+    units: list[MStepUnit] = []
+    for idx in np.argsort(-loads):
+        members = buckets[int(idx)]
+        if not members:
+            continue
+        sel = np.array(sorted(members), dtype=np.int64)
+        units.append(
+            MStepUnit(
+                unit_idx=len(units),
+                rows=template_row[sel],
+                row_lo=row_lo[sel],
+                row_hi=row_hi[sel],
+                cost=float(loads[int(idx)]),
+            )
+        )
+    return units
+
+
+def sort_assignments_by_template(assignments: pa.Table) -> tuple[pa.Table, np.ndarray]:
+    """Sort by ``template_row`` and return ``(sorted, group_starts)``.
+
+    Sorts on the NARROW numeric projection and then takes once, rather than
+    handing Acero the wide table: at this cardinality putting ``cigar`` and
+    ``read_id`` through the offsets rewrite pins one core for hours (the
+    standing resolve-stage rule).
+    """
+    assigned = assignments.filter(
+        pc.greater_equal(assignments.column("template_row"), 0)
+    )
+    if assigned.num_rows == 0:
+        return assigned, np.zeros(1, dtype=np.int64)
+    perm = pc.sort_indices(
+        assigned.select(["template_row"]),
+        sort_keys=[("template_row", "ascending")],
+    )
+    srt = assigned.take(perm)
+    tr = srt.column("template_row").to_numpy(zero_copy_only=False)
+    starts = np.flatnonzero(np.concatenate([[True], tr[1:] != tr[:-1]]))
+    return srt, starts
+
+
+__all__ = [
+    "REFINED_NODE_TABLE",
+    "MStepParams",
+    "MStepUnit",
+    "plan_mstep_units",
+    "sort_assignments_by_template",
+    "specs_from_assignment_slice",
+]

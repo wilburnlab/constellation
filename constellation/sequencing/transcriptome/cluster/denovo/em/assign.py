@@ -231,4 +231,176 @@ def assign_blocks(blocks: Iterable[HitBlock], **kwargs) -> Iterator[pa.RecordBat
             yield batch
 
 
-__all__ = ["EM_ASSIGNMENT_TABLE", "assign_block", "assign_blocks"]
+# minimap2 flags for aligning reads to templates.
+#
+# `-p 0.05` and a large `-N` are load-bearing, and for different reasons.
+# `-p`: the stock 0.8 suppresses any hit scoring below 80% of the best, which
+# is structurally what a nested or 5'-truncated proteoform of a longer
+# template IS, so earlier E-steps ran blind to them.
+# `-N`: the pool must contain EVERY template within p_floor of the read,
+# because both rankers assume it — round 1 picks the most-replicated
+# candidate and round 2+ the most likely one, and minimap2 truncates by
+# SCORE. Among near-clone templates score differences are 1-2 units, so a
+# truncated pool is close to an arbitrary sample of the set being ranked.
+# That is not a degraded answer; it is an answer to a different question.
+# `--eqx` is required too: without it cg:Z is all `M`, mismatches fold into
+# matches, and both the identity gate and the likelihood read every alignment
+# as perfect.
+TEMPLATE_MINIMAP2_ARGS: tuple[str, ...] = (
+    "-x",
+    "map-ont",
+    "-c",
+    "--eqx",
+    "--secondary=yes",
+    "-p",
+    "0.05",
+)
+
+
+def run_em_estep(
+    templates_fasta,
+    reads_fasta,
+    *,
+    store,
+    reads,
+    output_dir,
+    round_index: int,
+    threads: int = 8,
+    minimap2_n: int = 500,
+    index_batch_size: str = "16G",
+    block_bytes: int = 128 << 20,
+    extra_minimap2_args: tuple[str, ...] = (),
+    progress=None,
+    **assign_kwargs,
+) -> dict:
+    """Align every read to every template and stream assignments to Parquet.
+
+    Writes ``output_dir/part-NNNNN.parquet`` per PAF block and returns the
+    round's counters. Nothing is written to disk by minimap2 and nothing
+    read-cardinality is held in RAM: the hit stream is reduced as it arrives.
+    """
+    from pathlib import Path
+
+    import pyarrow.parquet as pq
+
+    from constellation.sequencing.align.minimap2 import minimap2_stream
+    from constellation.sequencing.transcriptome.cluster.denovo.em.paf_scan import (
+        iter_hit_blocks,
+    )
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log = progress or (lambda _m: None)
+
+    _check_single_index_part(store, index_batch_size)
+
+    args = (
+        *TEMPLATE_MINIMAP2_ARGS,
+        "-N",
+        str(int(minimap2_n)),
+        "-I",
+        index_batch_size,
+        *extra_minimap2_args,
+    )
+    log(f"round {round_index}: minimap2 {' '.join(args)}")
+    stream = minimap2_stream(
+        Path(templates_fasta), [Path(reads_fasta)], args=args, threads=threads
+    )
+    blocks = iter_hit_blocks(
+        stream, n_templates=store.n_templates, block_bytes=block_bytes
+    )
+
+    stats = {
+        "n_reads_seen": 0,
+        "n_assigned": 0,
+        "n_unassigned": 0,
+        "n_cap_hit": 0,
+        "n_hits": 0,
+        "n_dropped_strand": 0,
+        "n_dropped_template": 0,
+    }
+    shard = 0
+    for hb in blocks:
+        stats["n_hits"] += len(hb)
+        stats["n_dropped_strand"] += hb.n_dropped_strand
+        stats["n_dropped_template"] += hb.n_dropped_template
+        batch = assign_block(
+            hb,
+            store=store,
+            reads=reads,
+            round_index=round_index,
+            minimap2_n=minimap2_n,
+            **assign_kwargs,
+        )
+        if not batch.num_rows:
+            continue
+        stats["n_reads_seen"] += batch.num_rows
+        assigned = pc.sum(pc.greater_equal(batch.column("template_id"), 0)).as_py() or 0
+        stats["n_assigned"] += int(assigned)
+        stats["n_unassigned"] += batch.num_rows - int(assigned)
+        stats["n_cap_hit"] += int(
+            pc.sum(batch.column("candidate_cap_hit")).as_py() or 0
+        )
+        pq.write_table(
+            pa.Table.from_batches([batch], schema=EM_ASSIGNMENT_TABLE),
+            output_dir / f"part-{shard:05d}.parquet",
+        )
+        shard += 1
+
+    stats["n_shards"] = shard
+    stats["cap_hit_fraction"] = (
+        stats["n_cap_hit"] / stats["n_reads_seen"] if stats["n_reads_seen"] else 0.0
+    )
+    return stats
+
+
+def _check_single_index_part(store, index_batch_size: str) -> None:
+    """Refuse a multi-part minimap2 index. Two separate things depend on it.
+
+    minimap2 with a multi-part index runs the queries once per part and
+    applies ``-p``, ``-N`` and the primary/secondary call *within* each part,
+    so (a) a read is emitted once per part and its mass counted more than
+    once, and (b) a query's hits are no longer contiguous in the output —
+    which is the assumption the block reducer's group detection rests on.
+    Merging parts correctly needs a two-pass shuffle; refusing is the honest
+    alternative.
+
+    Note this is now the ONLY ceiling. The separate hard-coded 3 Gb
+    `max_template_bases` guard is gone: it was a second, unstated scoping
+    number that fired ~5x below where this correctness argument bites, and at
+    9.4M reads it forced `--min-seed-reads 2`, which erases minority
+    proteoforms before they can be tested at all.
+    """
+    total = int(store.lengths().sum())
+    limit = _parse_size(index_batch_size)
+    if limit < total:
+        raise ValueError(
+            f"-I is {index_batch_size} ({limit / 1e9:.3f} Gb) but the template "
+            f"set is {total / 1e9:.3f} Gb, so minimap2 would build a multi-part "
+            "index. It then runs the queries once per part and applies -p, -N "
+            "and the primary/secondary call WITHIN each part, so a read is "
+            "emitted once per part (its mass counted more than once) and its "
+            "hits are no longer contiguous in the output, which the block "
+            "reducer's grouping depends on. Raise --index-batch-size above the "
+            "template total."
+        )
+
+
+def _parse_size(value: str | int) -> int:
+    """minimap2's ``-I`` size grammar: a number with an optional K/M/G suffix."""
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        raise ValueError("empty -I value")
+    mult = {"K": 1_000, "M": 1_000_000, "G": 1_000_000_000}.get(text[-1].upper())
+    return int(float(text[:-1]) * mult) if mult else int(float(text))
+
+
+__all__ = [
+    "EM_ASSIGNMENT_TABLE",
+    "TEMPLATE_MINIMAP2_ARGS",
+    "assign_block",
+    "assign_blocks",
+    "run_em_estep",
+]
