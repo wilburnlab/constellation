@@ -1450,8 +1450,16 @@ def _build_transcriptome_parser(subs) -> None:
     p_cluster.add_argument(
         "--overdispersion",
         type=float,
-        default=0.0,
-        help="de-novo: beta-binomial overdispersion ρ for variant SF (Cut 4).",
+        default=None,
+        # The right default DIFFERS by mode, so it is resolved in each handler
+        # rather than baked in here: kmer's call_variants wants rho off, em's
+        # candidate-column test wants it on at 0.01. Sharing one default would
+        # silently hand the EM path the setting known not to work.
+        help=(
+            "beta-binomial overdispersion rho; caps effective depth at ~1/rho, "
+            "which is the depth penalty on the variant test. Default 0.0 for "
+            "--mode kmer, 0.01 for --mode em."
+        ),
     )
     p_cluster.add_argument(
         "--max-window-length",
@@ -3313,7 +3321,13 @@ def _cmd_transcriptome_cluster_em(args: argparse.Namespace) -> int:
         mstep_workers=int(args.mstep_workers),
         mstep=MStepParams(
             min_aa_length=int(args.min_aa_length),
-            overdispersion=float(args.overdispersion),
+            # rho defaults ON for the EM path's candidate-column test: at
+            # 1,525 reads a point binomial under a 1% null admits 1,924
+            # columns where rho=0.01 admits none. The shared flag's None
+            # default is resolved per mode for exactly this reason.
+            overdispersion=(
+                0.01 if args.overdispersion is None else float(args.overdispersion)
+            ),
             max_members_per_template=int(args.max_members_per_template),
         ),
     )
@@ -3403,7 +3417,7 @@ def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
         min_abundance=int(args.min_abundance),
         max_cluster_rounds=int(args.max_cluster_rounds),
         error_model=str(args.error_model),
-        overdispersion=float(args.overdispersion),
+        overdispersion=float(args.overdispersion or 0.0),
         fold_insertions=bool(args.fold_insertions),
         max_window_length=(
             int(args.max_window_length) if args.max_window_length > 0 else None

@@ -100,3 +100,33 @@ def test_the_frontend_colour_maps_keep_the_old_keys():
 def test_the_em_path_stamps_the_canonical_mode():
     assert MODE_EM == "em"
     assert MODE_EM in CLUSTER_MODES
+
+
+# ── per-mode defaults ─────────────────────────────────────────────────
+
+
+def test_overdispersion_defaults_differ_by_mode():
+    """One flag, two right answers — so its default is resolved per handler.
+
+    kmer's `call_variants` wants rho off. The EM path's candidate-column test
+    wants it ON at 0.01: at 1,525 reads a point binomial under a 1% null
+    admits 1,924 columns where rho=0.01 admits none. A shared default would
+    hand the EM path the setting known not to work, silently.
+    """
+    from constellation.cli.__main__ import _build_parser
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+    )
+
+    parser = _build_parser()
+    base = ["transcriptome", "cluster", "--demux-dir", "d", "--output-dir", "o"]
+
+    args = parser.parse_args(base)
+    assert args.overdispersion is None, "the default must be mode-resolved"
+
+    # The EM kernel's own default is the on value.
+    assert MStepParams().overdispersion == 0.01
+
+    # An explicit value still wins for either mode.
+    args = parser.parse_args([*base, "--overdispersion", "0.05"])
+    assert args.overdispersion == 0.05
