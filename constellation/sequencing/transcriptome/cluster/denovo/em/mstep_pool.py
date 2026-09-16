@@ -482,6 +482,18 @@ def _rows_to_nodes(rows: list[tuple]) -> pa.Table:
     )
 
 
+#: The only columns the worker reads. Projecting before the pickle boundary
+#: drops `read_id` and thirteen others that cross it for nothing.
+MSTEP_WORKER_COLUMNS: tuple[str, ...] = (
+    "template_row",
+    "read_row",
+    "cigar",
+    "t_start",
+    "q_start",
+    "weight",
+)
+
+
 def iter_unit_batches(
     sorted_assignments: pa.Table, units: list[MStepUnit]
 ) -> Iterator[pa.Table]:
@@ -489,18 +501,37 @@ def iter_unit_batches(
 
     Yielded lazily so ``run_batched``'s bounded in-flight window backpressures
     the iterator instead of the whole round's slices existing at once.
+
+    **``combine_chunks()`` here is not tidying — it is the difference between
+    running and dying.** ``pa.concat_tables`` of one slice per template gives
+    a table with one CHUNK per template, and every Arrow chunk holds a
+    reference to the whole parent buffer. Pickling for ``ProcessPoolExecutor``
+    then serialises that parent once per chunk, so the payload scales with the
+    NUMBER OF TEMPLATES in the unit rather than the rows it contains.
+
+    Measured on a 200k-row stand-in, 400 templates to a unit: **7,360 MB
+    pickled, against 3.7 MB after combining — 1,991x, for byte-identical
+    content.** On the real 1M-read data it was ~90 GB per batch against 1.4 MB,
+    which is why 100k reads ran and 1M did not, and why *fewer* workers made it
+    worse: fewer workers means more templates per unit means a linearly larger
+    pickle.
     """
+    columns = [c for c in MSTEP_WORKER_COLUMNS if c in sorted_assignments.column_names]
+    narrow = sorted_assignments.select(columns)
     for unit in units:
         pieces = [
-            sorted_assignments.slice(int(lo), int(hi - lo))
+            narrow.slice(int(lo), int(hi - lo))
             for lo, hi in zip(unit.row_lo, unit.row_hi)
             if hi > lo
         ]
         if pieces:
-            yield pa.concat_tables(pieces)
+            # Materialise the unit's own rows into contiguous buffers, so what
+            # crosses the process boundary is the unit, not the round.
+            yield pa.concat_tables(pieces).combine_chunks()
 
 
 __all__ = [
+    "MSTEP_WORKER_COLUMNS",
     "NODE_MEMBERSHIP_TABLE",
     "REFINED_NODE_TABLE",
     "MStepParams",

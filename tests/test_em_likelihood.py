@@ -257,3 +257,86 @@ def test_error_model_is_respected():
     strict = _logl(store, ["99=1X"], model=ErrorModel(eps_sub=1e-6), **args)
     loose = _logl(store, ["99=1X"], model=ErrorModel(eps_sub=1e-1), **args)
     assert loose[0] > strict[0]
+
+
+# ── what a worker pays to open a store ────────────────────────────────
+
+
+def test_opening_a_template_store_copies_nothing(tmp_path):
+    """Every M-step worker opens one; a copy here is a copy per worker.
+
+    Two ways this regressed before: `combine_chunks()` allocates even for a
+    SINGLE chunk (measured 32.2 MB for a 32.2 MB array, against 0 for
+    `chunk(0)`), and a templates table built from the M-step's node shards has
+    one chunk per shard, so the written file had no contiguous buffer to map.
+    """
+    import numpy as np
+    import pyarrow as pa
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.templates import (
+        TemplateStore,
+        write_templates,
+    )
+
+    rng = np.random.default_rng(0)
+
+    def _table(rows, chunks):
+        per, parts = rows // chunks, []
+        for _ in range(chunks):
+            seqs = ["".join(rng.choice(list("ACGT"), 800)) for _ in range(per)]
+            m = len(seqs)
+            parts.append(
+                pa.table(
+                    {
+                        "template_id": pa.array(np.arange(m, dtype=np.int64)),
+                        "sequence": pa.array(seqs, pa.large_string()),
+                        "orf_start": pa.array(np.zeros(m, np.int32)),
+                        "orf_end": pa.array(np.full(m, 100, np.int32)),
+                        "orf_aa_length": pa.array(np.zeros(m, np.int32)),
+                        "node_weight": pa.array(np.ones(m)),
+                        "orf_replication": pa.array(np.ones(m, np.int64)),
+                        "seed_read_quality": pa.nulls(m, pa.float32()),
+                        "seed_read_row": pa.array(np.full(m, -1, np.int32)),
+                        "declared_variants": pa.array([[]] * m, pa.list_(pa.int64())),
+                    },
+                    schema=TEMPLATE_TABLE,
+                )
+            )
+        return pa.concat_tables(parts)
+
+    # Both the contiguous case and the one the round loop actually produces.
+    for chunks in (1, 32):
+        d = tmp_path / f"t{chunks}"
+        table = _table(4000, chunks)
+        write_templates(table, d)
+        with pa.memory_map(str(d / "templates.arrow"), "r") as mm:
+            with pa.ipc.open_file(mm) as reader:
+                assert reader.num_record_batches == 1, "written as one batch"
+
+        before = pa.total_allocated_bytes()
+        store = TemplateStore.open(d / "templates.arrow")
+        allocated = pa.total_allocated_bytes() - before
+        try:
+            assert store.seq_buffer.nbytes > 1_000_000, "a real amount of sequence"
+            assert allocated == 0, (
+                f"{allocated / 1e6:.1f} MB copied opening a store with "
+                f"{chunks} input chunks — that cost is paid per worker"
+            )
+        finally:
+            store.close()
+
+
+def test_the_homopolymer_context_is_not_built_until_it_is_asked_for(tmp_path):
+    """Only the E-step reducer needs it; workers must not pay for it."""
+    import numpy as np
+    import pyarrow as pa
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.templates import (
+        TemplateStore,
+    )
+
+    store = _store(["ACGT" * 500] * 200)
+    assert store._hp_run is None, "built on open"
+    _ = store.hp_run
+    assert store._hp_run is not None
+    assert store.hp_run.dtype == np.uint8

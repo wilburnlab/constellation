@@ -16,6 +16,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
     EM_ASSIGNMENT_TABLE,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+    iter_unit_batches,
     plan_mstep_units,
     sort_assignments_by_template,
     specs_from_assignment_slice,
@@ -197,3 +198,93 @@ def test_every_live_template_lands_in_exactly_one_unit():
     units = plan_mstep_units(np.arange(n), lo, lo + sizes, np.full(n, 800), n_units=32)
     seen = np.concatenate([u.rows for u in units]) if units else np.array([])
     assert sorted(seen.tolist()) == sorted(np.flatnonzero(sizes > 0).tolist())
+
+
+# ── what crosses the process boundary ─────────────────────────────────
+
+
+def _big_sorted_assignments(n_rows: int, n_templates: int):
+    rng = np.random.default_rng(0)
+    tr = np.sort(rng.integers(0, n_templates, n_rows)).astype(np.int32)
+    rows = [
+        (int(i), int(tr[i]), "100=1X50=" * 8, 0, 0, 1.0) for i in range(n_rows)
+    ]
+    return _assignments(rows), tr
+
+
+def test_a_unit_pickles_to_its_own_size_not_the_whole_rounds():
+    """The 1M-read OOM, in one assertion.
+
+    `pa.concat_tables` of one slice per template gives one CHUNK per template,
+    and every Arrow chunk references the whole parent buffer — so pickling for
+    ProcessPoolExecutor serialises the parent once per chunk and the payload
+    scales with the NUMBER OF TEMPLATES in the unit, not its rows. Measured
+    before the fix: 7,360 MB for 3.7 MB of content.
+
+    It also explains why fewer workers made it worse: n_units is
+    workers x units_per_worker, so fewer workers means more templates per
+    unit means a linearly larger pickle.
+    """
+    import pickle
+
+    n_rows, n_templates = 40_000, 800
+    srt, tr = _big_sorted_assignments(n_rows, n_templates)
+    starts = np.flatnonzero(np.concatenate([[True], tr[1:] != tr[:-1]]))
+    bounds = np.concatenate([starts, [n_rows]])
+    lo = np.zeros(n_templates, np.int64)
+    hi = np.zeros(n_templates, np.int64)
+    lo[tr[starts]] = bounds[:-1]
+    hi[tr[starts]] = bounds[1:]
+
+    # ONE unit holding every template — the worst case, and the one a small
+    # --mstep-workers produces.
+    units = plan_mstep_units(
+        np.arange(n_templates), lo, hi, np.full(n_templates, 1500), n_units=1
+    )
+    batch = next(iter(iter_unit_batches(srt, units)))
+    assert batch.num_rows == n_rows
+
+    pickled = len(pickle.dumps(batch))
+    # The payload must track the unit's CONTENT. Anything proportional to the
+    # template count is the bug returning.
+    assert pickled < 3 * batch.nbytes, (
+        f"{pickled / 1e6:.1f} MB pickled for {batch.nbytes / 1e6:.1f} MB of "
+        "content — a chunk-per-template table is being serialised"
+    )
+    assert pickled < srt.nbytes, "a unit must not out-weigh the whole round"
+
+
+def test_units_carry_only_the_columns_the_worker_reads():
+    """read_id and thirteen others crossed the pickle boundary for nothing."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MSTEP_WORKER_COLUMNS,
+    )
+
+    srt, tr = _big_sorted_assignments(400, 20)
+    starts = np.flatnonzero(np.concatenate([[True], tr[1:] != tr[:-1]]))
+    bounds = np.concatenate([starts, [400]])
+    lo = np.zeros(20, np.int64)
+    hi = np.zeros(20, np.int64)
+    lo[tr[starts]] = bounds[:-1]
+    hi[tr[starts]] = bounds[1:]
+    units = plan_mstep_units(np.arange(20), lo, hi, np.full(20, 1500), n_units=2)
+    batch = next(iter(iter_unit_batches(srt, units)))
+    assert set(batch.column_names) == set(MSTEP_WORKER_COLUMNS)
+    assert "read_id" not in batch.column_names
+
+
+def test_unit_batches_still_hold_every_row_of_their_templates():
+    """The projection and the combine must not change what a unit contains."""
+    srt, tr = _big_sorted_assignments(1000, 50)
+    starts = np.flatnonzero(np.concatenate([[True], tr[1:] != tr[:-1]]))
+    bounds = np.concatenate([starts, [1000]])
+    lo = np.zeros(50, np.int64)
+    hi = np.zeros(50, np.int64)
+    lo[tr[starts]] = bounds[:-1]
+    hi[tr[starts]] = bounds[1:]
+    units = plan_mstep_units(np.arange(50), lo, hi, np.full(50, 1500), n_units=7)
+
+    seen = []
+    for batch in iter_unit_batches(srt, units):
+        seen.extend(batch.column("read_row").to_pylist())
+    assert sorted(seen) == list(range(1000)), "every row lands in exactly one unit"

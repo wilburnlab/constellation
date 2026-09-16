@@ -115,9 +115,24 @@ class TemplateStore:
     def _from_table(
         cls, table: pa.Table, mm: pa.MemoryMappedFile | None
     ) -> TemplateStore:
-        seq = table.column("sequence").combine_chunks()
-        if isinstance(seq, pa.ChunkedArray):
-            seq = seq.chunk(0) if seq.num_chunks else pa.array([], pa.large_string())
+        # `chunk(0)`, NOT `combine_chunks()`, when the column is already
+        # contiguous: combine_chunks allocates and copies even for a single
+        # chunk (measured: 32.2 MB for a 32.2 MB array, against 0 for
+        # chunk(0)). On a mmapped file that turns a free view into a full copy
+        # of every template base — in every M-step worker.
+        col = table.column("sequence")
+        if isinstance(col, pa.ChunkedArray):
+            if col.num_chunks == 1:
+                seq = col.chunk(0)
+            elif col.num_chunks == 0:
+                seq = pa.array([], pa.large_string())
+            else:
+                # Multi-batch file: there is no contiguous buffer to view, so
+                # this one is unavoidable. `write_templates` makes it rare by
+                # writing a single batch.
+                seq = col.combine_chunks()
+        else:
+            seq = col
         offsets = np.asarray(seq.buffers()[1]).view(np.int64)[: len(seq) + 1].copy()
         data = np.asarray(seq.buffers()[2]).view(np.uint8)[: int(offsets[-1])]
         return cls(table=table, seq_offsets=offsets, seq_buffer=data, _mm=mm)
@@ -255,9 +270,14 @@ def write_templates(table: pa.Table, directory: Path) -> tuple[Path, Path]:
     table = table.cast(TEMPLATE_TABLE)
 
     arrow_path = directory / TEMPLATES_ARROW
+    # ONE record batch, always. `write_table` emits a batch per chunk, and a
+    # templates table built from the M-step's node shards has one chunk per
+    # shard — which would leave every reader with a multi-chunk sequence
+    # column and no contiguous buffer to memory-map. Paying one copy here, in
+    # the parent, saves it in each of N workers.
     with pa.OSFile(str(arrow_path), "wb") as sink:
         with pa.ipc.new_file(sink, TEMPLATE_TABLE) as writer:
-            writer.write_table(table)
+            writer.write_table(table.combine_chunks())
 
     fasta_path = directory / TEMPLATES_FASTA
     seq_col = table.column("sequence")
