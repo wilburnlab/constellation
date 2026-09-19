@@ -284,3 +284,49 @@ def test_rows_resolve_to_the_right_chunk(tmp_path):
         assert store.sample_id.tolist() == [b for b in range(4) for _ in range(10)]
     finally:
         store.close()
+
+
+# ── what the cache is keyed on ────────────────────────────────────────
+
+
+def test_resume_refuses_a_corpus_built_from_a_different_demux_dir(tmp_path):
+    """The cache was keyed on nothing but its own existence.
+
+    So a resumed run pointed at a different --demux-dir silently analysed the
+    reads already on disk while the manifest recorded the directory that had
+    been ASKED for. Every number downstream is attributed to the wrong input.
+    """
+    a = _write_demux_dir(tmp_path / "a", [("r0", "A" * 100, 0, 30.0)])
+    b = _write_demux_dir(tmp_path / "b", [("s0", "C" * 100, 0, 30.0)])
+    out = tmp_path / "corpus"
+    write_corpus(a, out, max_window_length=None)
+
+    with pytest.raises(ValueError, match="cannot resume"):
+        write_corpus(b, out, max_window_length=None, resume=True)
+
+    # The same dir still resumes.
+    again = write_corpus(a, out, max_window_length=None, resume=True)
+    assert again.n_reads == 1
+
+
+def test_resume_refuses_a_different_max_window_length(tmp_path):
+    """The filter runs at corpus-build time, so a cached corpus already had
+    it applied — asking for a different one and getting the old corpus back
+    is silently the wrong read set."""
+    rows = [("r0", "A" * 100, 0, 30.0), ("r1", "C" * 4000, 0, 30.0)]
+    demux = _write_demux_dir(tmp_path, rows)
+    out = tmp_path / "corpus"
+    first = write_corpus(demux, out, max_window_length=None)
+    assert first.n_reads == 2
+
+    with pytest.raises(ValueError, match="max_window_length"):
+        write_corpus(demux, out, max_window_length=1000, resume=True)
+
+
+def test_a_corpus_written_before_settings_were_recorded_still_resumes(tmp_path):
+    """Nothing to disagree with is not a disagreement."""
+    demux = _write_demux_dir(tmp_path, [("r0", "A" * 100, 0, 30.0)])
+    out = tmp_path / "corpus"
+    write_corpus(demux, out, max_window_length=None)
+    (out / "settings.json").unlink(missing_ok=True)
+    assert write_corpus(demux, out, max_window_length=7, resume=True).n_reads == 1

@@ -444,3 +444,134 @@ def test_the_report_shows_the_metric_the_stopping_rule_reads(corpus_dir, tmp_pat
     header = (out / "churn.tsv").read_text().splitlines()[0]
     for col in ("frac_unsettled", "reads_gained", "reads_lost"):
         assert col in header
+
+
+def test_a_retried_estep_does_not_inherit_the_dead_attempt_s_shards(tmp_path):
+    """Shards are numbered from zero and the reader globs the directory.
+
+    So an attempt that crashed after writing N shards, followed by one that
+    writes fewer, leaves the tail of the DEAD attempt for the reader to pick
+    up as this round's assignments — reads counted twice, on templates that
+    may no longer exist.
+    """
+    rng = np.random.default_rng(5)
+    truth = _orf(rng, 120)
+    corpus = _write_demux(
+        tmp_path, [(f"r{i}", _mutate(rng, truth, 0.01), 30.0) for i in range(12)]
+    )
+    out = tmp_path / "em"
+    run_em(corpus, out, params=_params(rounds=1))
+
+    adir = out / "rounds" / "r01" / "assignments"
+    real = sorted(adir.glob("part-*.parquet"))
+    assert real
+    clean = pq.read_table(real[0]).schema
+    # A leftover from a previous, longer attempt.
+    stale = pq.read_table(real[0])
+    pq.write_table(stale.cast(clean), adir / "part-09999.parquet")
+    n_stale = stale.num_rows
+
+    shutil.rmtree(out / "rounds" / "r01" / "mstep", ignore_errors=True)
+    (out / "rounds" / "r01" / "_SUCCESS").unlink()
+    run_em(corpus, out, params=_params(rounds=1))
+
+    assert not (adir / "part-09999.parquet").exists(), "surplus shard survived"
+    table = pa_ds_table(adir)
+    assert len(set(table.column("read_id").to_pylist())) == table.num_rows, (
+        f"{n_stale} reads counted twice from the previous attempt"
+    )
+
+
+def pa_ds_table(directory: Path) -> pa.Table:
+    import pyarrow.dataset as pa_ds
+
+    return pa_ds.dataset(sorted(Path(directory).glob("part-*.parquet"))).to_table()
+
+
+def test_a_round_is_not_marked_done_until_its_lineage_is_on_disk(
+    tmp_path, monkeypatch
+):
+    """`_SUCCESS` means "everything the next round needs is written".
+
+    lineage.parquet is one of those things — without it the next round cannot
+    tell a template split from a genuine switch. It used to be written AFTER
+    the marker, so a run killed in between left a round that claimed to be
+    complete and was not, and the resumed run then died on ArrowInvalid.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em import (
+        rounds as rounds_mod,
+    )
+
+    rng = np.random.default_rng(7)
+    rows = []
+    for g in range(2):
+        truth = _orf(rng, 130)
+        rows += [(f"g{g}_r{i}", _mutate(rng, truth, 0.01), 30.0) for i in range(20)]
+    corpus = _write_demux(tmp_path, rows)
+    out = tmp_path / "em"
+
+    def _die(*a, **k):
+        raise RuntimeError("killed between the marker and the lineage")
+
+    monkeypatch.setattr(rounds_mod.rf, "next_templates", _die)
+    with pytest.raises(RuntimeError):
+        run_em(corpus, out, params=_params(rounds=2, min_aa_length=40))
+
+    r1 = out / "rounds" / "r01"
+    assert not (r1 / "_SUCCESS").exists() or (r1 / "lineage.parquet").exists(), (
+        "round 1 is marked complete without the lineage round 2 reads"
+    )
+
+
+def test_a_half_written_lineage_is_replaced_rather_than_trusted(tmp_path):
+    """A parquet file is only readable once its footer lands.
+
+    So an interrupted write leaves a path that EXISTS and cannot be opened.
+    Recovery keyed on existence declined to rebuild it, and the resumed round
+    died reading it.
+    """
+    rng = np.random.default_rng(13)
+    rows = []
+    for g in range(2):
+        truth = _orf(rng, 130)
+        rows += [(f"g{g}_r{i}", _mutate(rng, truth, 0.01), 30.0) for i in range(20)]
+    corpus = _write_demux(tmp_path, rows)
+    out = tmp_path / "em"
+    run_em(corpus, out, params=_params(rounds=1, min_aa_length=40))
+
+    r1 = out / "rounds" / "r01"
+    (r1 / "lineage.parquet").write_bytes(b"PAR1\x00\x00truncated")
+    shutil.rmtree(out / "rounds" / "r02", ignore_errors=True)
+
+    results = run_em(corpus, out, params=_params(rounds=1, min_aa_length=40),
+                     resume=True)
+    assert results, "resume must replace the damaged lineage, not die on it"
+    pq.read_table(r1 / "lineage.parquet")
+
+
+def test_stale_optional_exports_do_not_survive_a_later_run(tmp_path):
+    """proteins.fasta / cluster.fa / feature_quant are all conditional.
+
+    A file the current export does not produce is not "unchanged" — it
+    describes results that no longer exist, and nothing on disk marks it
+    stale.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.outputs import (
+        CLUSTER_MEMBERSHIP_TABLE,
+        TRANSCRIPT_CLUSTER_TABLE,
+        write_em_outputs,
+    )
+
+    out = tmp_path / "exports"
+    out.mkdir()
+    for name in ("proteins.fasta", "cluster.fa", "feature_quant.parquet"):
+        (out / name).write_bytes(b"from an earlier run\n")
+
+    write_em_outputs(
+        out,
+        TRANSCRIPT_CLUSTER_TABLE.empty_table(),
+        CLUSTER_MEMBERSHIP_TABLE.empty_table(),
+        None,
+    )
+    for name in ("proteins.fasta", "cluster.fa", "feature_quant.parquet"):
+        assert not (out / name).exists(), f"{name} outlived the results it described"

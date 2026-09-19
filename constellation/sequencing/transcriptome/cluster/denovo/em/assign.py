@@ -294,6 +294,15 @@ def run_em_estep(
     output_dir.mkdir(parents=True, exist_ok=True)
     log = progress or (lambda _m: None)
 
+    # Replace the shard set rather than overwrite into it. Shards are numbered
+    # from zero each time, and the reader globs the directory — so an attempt
+    # that crashed after writing 40 shards, followed by one that writes 31,
+    # leaves 9 shards of the DEAD attempt for the reader to pick up as if they
+    # were this round's. A retried E-step re-runs minimap2 from scratch, so
+    # there is nothing here worth keeping.
+    for stale in output_dir.glob("part-*.parquet"):
+        stale.unlink()
+
     _check_single_index_part(store, index_batch_size)
 
     args = (

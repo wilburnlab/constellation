@@ -231,7 +231,15 @@ def write_corpus(
     success = output_dir / CORPUS_SUCCESS
 
     stats_path = output_dir / "stats.json"
+    settings = {
+        "demux_dir": str(Path(demux_dir).resolve()),
+        "max_window_length": (
+            int(max_window_length) if max_window_length is not None else None
+        ),
+    }
+    settings_path = output_dir / "settings.json"
     if resume and success.exists() and arrow_path.exists() and stats_path.exists():
+        _check_resume_settings(settings_path, settings)
         stats = {k: int(v) for k, v in json.loads(stats_path.read_text()).items()}
         return Corpus(directory=output_dir, n_reads=stats["n_reads"], stats=stats)
 
@@ -294,8 +302,46 @@ def write_corpus(
         "max_input_length": max_seen,
     }
     stats_path.write_text(json.dumps(stats, indent=2))
+    settings_path.write_text(json.dumps(settings, indent=2))
     success.write_bytes(b"")
     return Corpus(directory=output_dir, n_reads=n_written, stats=stats)
+
+
+def _check_resume_settings(settings_path: Path, settings: dict) -> None:
+    """Refuse a resume whose corpus was built from different inputs.
+
+    The cache was keyed on nothing but its own existence, so pointing a
+    resumed run at a different ``--demux-dir``, or asking for a different
+    ``--max-window-length``, silently reused the corpus already there — and
+    the manifest then recorded the parameters that had been ASKED for rather
+    than the ones the reads on disk came from. Every number downstream is
+    attributed to the wrong run.
+
+    Rejecting rather than rebuilding, because the corpus is the run's whole
+    substrate and a mistyped path is the more likely cause than a deliberate
+    change. A corpus written before settings were recorded is accepted, since
+    there is nothing to disagree with.
+    """
+    if not settings_path.exists():
+        return
+    try:
+        stored = json.loads(settings_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    differing = {
+        k: (stored.get(k), v) for k, v in settings.items() if stored.get(k) != v
+    }
+    if not differing:
+        return
+    detail = "; ".join(
+        f"{k}: corpus was built with {was!r}, this run asks for {now!r}"
+        for k, (was, now) in sorted(differing.items())
+    )
+    raise ValueError(
+        f"cannot resume: the corpus at {settings_path.parent} does not match "
+        f"this run's settings ({detail}). Use a different --output-dir, or "
+        f"delete {settings_path.parent} to rebuild it."
+    )
 
 
 def _write_fasta_rows(fh, table: pa.Table, *, start_row: int) -> int:

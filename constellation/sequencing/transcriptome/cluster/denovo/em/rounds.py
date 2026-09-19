@@ -186,24 +186,37 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
             results.append(result)
             final_nodes, final_assignments = nodes, assignments
             final_membership = node_membership
-            (rd / _SUCCESS).write_bytes(b"")
 
-            if r == start + params.rounds - 1:
-                break
+            last_round = r == start + params.rounds - 1
             # frac_unsettled, not frac_changed_lineage: the latter is measured
             # only over reads assigned in BOTH rounds, so losing half the
             # assignments scores zero churn as long as the survivors kept
             # their lineage, and the loop would call that converged.
-            if (
+            converged = (
                 prev_assignments is not None
                 and result.churn.get("frac_unsettled", 1.0)
                 < params.stop_frac_changed
-            ):
+            )
+
+            # Refine, and write the lineage, BEFORE the round is marked done.
+            # `_SUCCESS` means "everything this round owes the next one is on
+            # disk", and lineage.parquet is one of those things: without it
+            # the next round cannot tell a split from a genuine switch. Dying
+            # between the marker and the write left a round that claimed to
+            # be complete and was not.
+            refined = (
+                None if (last_round or converged)
+                else rf.next_templates(nodes, store, round_index=r)
+            )
+            if refined is not None:
+                _write_lineage(rd, refined.lineage)
+            (rd / _SUCCESS).write_bytes(b"")
+
+            if last_round:
+                break
+            if converged:
                 log(f"converged at round {r}")
                 break
-
-            refined = rf.next_templates(nodes, store, round_index=r)
-            pq.write_table(refined.lineage, rd / "lineage.parquet")
             log(
                 f"round {r}: {refined.n_parents:,} templates -> "
                 f"{refined.n_children:,} ({refined.n_unrecruited:,} recruited nothing)"
@@ -437,6 +450,22 @@ def _read_assignments(directory: Path) -> pa.Table:
     return pa_ds.dataset(files, schema=EM_ASSIGNMENT_TABLE).to_table()
 
 
+def _write_lineage(rd: Path, lineage: pa.Table) -> Path:
+    """Write ``rd/lineage.parquet`` atomically.
+
+    A parquet file is only readable once its footer lands, so a run killed
+    mid-write leaves a file that EXISTS and cannot be opened. Recovery then
+    sees a present file, declines to rebuild, and the next round dies on
+    ArrowInvalid instead. Rename into place so the path is either absent or
+    complete.
+    """
+    path = rd / "lineage.parquet"
+    tmp = path.with_suffix(".parquet.tmp")
+    pq.write_table(lineage, tmp)
+    tmp.replace(path)
+    return path
+
+
 def _read_lineage(rd: Path) -> pa.Table:
     path = rd.parent / f"r{int(rd.name[1:]) - 1:02d}" / "lineage.parquet"
     return pq.read_table(path) if path.exists() else rf.LINEAGE_TABLE.empty_table()
@@ -488,13 +517,25 @@ def _resume_point(rounds_dir: Path, resume: bool, log):
         refined = rf.next_templates(nodes, store, round_index=last)
         # Persist the rebuilt lineage too: the resumed round's churn needs it
         # to tell a split from a genuine switch, and rebuilding it without
-        # writing it would discard exactly that.
-        lineage_path = rd / "lineage.parquet"
-        if not lineage_path.exists():
-            pq.write_table(refined.lineage, lineage_path)
+        # writing it would discard exactly that. Existence is not the test —
+        # a file left behind by an interrupted write is present and
+        # unreadable, and skipping it on that basis is what makes the NEXT
+        # round die. Replace anything that will not open.
+        if not _lineage_is_readable(rd / "lineage.parquet"):
+            _write_lineage(rd, refined.lineage)
         return last + 1, refined.templates, prev, history
     finally:
         store.close()
+
+
+def _lineage_is_readable(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        pq.read_table(path)
+    except Exception:  # noqa: BLE001 - any failure to open means "rebuild it"
+        return False
+    return True
 
 
 def _read_history(rounds_dir: Path, done: list[int]) -> list[RoundResult]:

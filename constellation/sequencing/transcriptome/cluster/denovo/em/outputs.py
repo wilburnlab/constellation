@@ -293,6 +293,16 @@ def write_em_outputs(
     paths["membership"] = output_dir / "cluster_membership.parquet"
     pq.write_table(membership, paths["membership"])
 
+    # Every artifact below is conditional, and this directory may hold one
+    # from an earlier run. A file that the current export does not produce is
+    # not "unchanged" — it describes results that no longer exist, and
+    # nothing marks it as stale. Clear them first so the directory only ever
+    # holds this export.
+    for optional in ("feature_quant.parquet", "cluster.fa", "proteins.fasta"):
+        stale = output_dir / optional
+        if stale.exists():
+            stale.unlink()
+
     if membership.num_rows:
         # `cluster_feature_quant` is written against the components path's
         # (read_map, cluster_of) shape: read -> uniq -> cluster. The EM path
