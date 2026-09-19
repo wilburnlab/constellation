@@ -288,3 +288,37 @@ def test_unit_batches_still_hold_every_row_of_their_templates():
     for batch in iter_unit_batches(srt, units):
         seen.extend(batch.column("read_row").to_pylist())
     assert sorted(seen) == list(range(1000)), "every row lands in exactly one unit"
+
+
+def test_a_one_template_unit_also_detaches_from_the_round():
+    """`combine_chunks()` is a NO-OP on a single-chunk column.
+
+    A unit holding one template is exactly one slice, so the earlier
+    concat+combine left the parent attached: measured 60.4 MB pickled for 6 KB
+    of content. It is not an edge case — LPT deliberately packs the biggest
+    templates alone, and live templates can fall below the requested unit
+    count.
+    """
+    import pickle
+
+    n_rows, n_templates = 20_000, 4
+    srt, tr = _big_sorted_assignments(n_rows, n_templates)
+    starts = np.flatnonzero(np.concatenate([[True], tr[1:] != tr[:-1]]))
+    bounds = np.concatenate([starts, [n_rows]])
+    lo = np.zeros(n_templates, np.int64)
+    hi = np.zeros(n_templates, np.int64)
+    lo[tr[starts]] = bounds[:-1]
+    hi[tr[starts]] = bounds[1:]
+
+    # More units than templates -> every unit holds exactly one.
+    units = plan_mstep_units(
+        np.arange(n_templates), lo, hi, np.full(n_templates, 1500), n_units=16
+    )
+    assert units and all(u.rows.size == 1 for u in units)
+    for batch in iter_unit_batches(srt, units):
+        pickled = len(pickle.dumps(batch))
+        assert pickled < 3 * batch.nbytes, (
+            f"{pickled / 1e6:.1f} MB for {batch.nbytes / 1e6:.3f} MB of content "
+            "— a single-template unit is still holding the round's buffers"
+        )
+        assert pickled < srt.nbytes

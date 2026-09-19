@@ -402,20 +402,52 @@ def mstep_worker(
             )
         except Exception:  # noqa: BLE001 — one bad template must not kill a unit
             continue
-        scale = 1.0 / fraction if fraction > 0 else 1.0
+        # Every read assigned to this template, not just the ones sampled into
+        # the PWM. The cap bounds what the CONSENSUS is built from; it must not
+        # bound what the cluster CONTAINS. Emitting only sampled reads made
+        # exported counts and quantification report the cap — 20 reads capped
+        # at 5 exported as 5 — and scaling node_weight did not repair it,
+        # because both are counted from membership rows.
+        all_read_row = (
+            batch.slice(lo, hi - lo)
+            .column("read_row")
+            .to_numpy(zero_copy_only=False)
+            .astype(np.int64)
+        )
+        node_of_member = np.zeros(len(members), dtype=np.int32)
+        for h, node in enumerate(nodes):
+            node_of_member[np.asarray(node.member_ids, dtype=np.int64)] = h
+
+        # The sample is uniform, so the unsampled tail is exchangeable with it;
+        # there is no per-read evidence to place those reads on a minor node.
+        # They go to the major one (nodes are emitted mass-descending), which
+        # is the approximation the cap buys and is recorded as such.
+        sampled = np.zeros(all_read_row.size, dtype=bool)
+        pos_of_row = {int(r): k for k, r in enumerate(all_read_row)}
+        take_pos = np.array(
+            [pos_of_row[int(r)] for r in member_read_row], dtype=np.int64
+        )
+        sampled[take_pos] = True
+        hap_of_row = np.zeros(all_read_row.size, dtype=np.int32)
+        hap_of_row[take_pos] = np.array(
+            [nodes[int(h)].haplotype_id for h in node_of_member], dtype=np.int32
+        )
+        hap_of_row[~sampled] = nodes[0].haplotype_id
+
+        counts = np.bincount(
+            hap_of_row, minlength=max(n.haplotype_id for n in nodes) + 1
+        )
         for node in nodes:
+            n_reads = int(counts[node.haplotype_id])
             rows.append(
-                _node_row(node, row, round_index, len(members), fraction, scale)
+                _node_row(node, row, round_index, len(members), fraction, n_reads)
             )
-            idx = np.asarray(node.member_ids, dtype=np.int64)
-            if idx.size == 0:
-                continue
-            mem_parent.append(np.full(idx.size, node.parent_template_id, np.int64))
-            mem_hap.append(np.full(idx.size, node.haplotype_id, np.int32))
-            mem_read.append(member_read_row[idx])
-            mem_weight.append(
-                np.array([members[int(j)].weight for j in idx], dtype=np.float32)
-            )
+        mem_parent.append(
+            np.full(all_read_row.size, nodes[0].parent_template_id, np.int64)
+        )
+        mem_hap.append(hap_of_row)
+        mem_read.append(all_read_row)
+        mem_weight.append(np.ones(all_read_row.size, dtype=np.float32))
 
     return {
         "nodes": _rows_to_nodes(rows),
@@ -441,17 +473,18 @@ def _rows_to_membership(round_index, parent, hap, read, weight) -> pa.Table:
     )
 
 
-def _node_row(node, parent_row, round_index, n_members, fraction, scale) -> tuple:
+def _node_row(node, parent_row, round_index, n_members, fraction, n_reads) -> tuple:
     return (
         int(round_index),
         int(node.parent_template_id),
         int(parent_row),
         int(node.haplotype_id),
         node.consensus,
-        int(node.n_reads),
-        # Scaled back up when the member cap subsampled, so quant stays on the
-        # real read mass rather than on the sampled mass.
-        float(node.node_weight) * scale,
+        # From MEMBERSHIP, not from the PWM's sampled mass: n_reads and
+        # node_weight are what quant and the next round's abundance ranking
+        # read, and they have to describe the reads the cluster actually holds.
+        int(n_reads),
+        float(n_reads),
         node.protein or None,
         int(node.orf_start),
         int(node.orf_end),
@@ -510,24 +543,31 @@ def iter_unit_batches(
     NUMBER OF TEMPLATES in the unit rather than the rows it contains.
 
     Measured on a 200k-row stand-in, 400 templates to a unit: **7,360 MB
-    pickled, against 3.7 MB after combining — 1,991x, for byte-identical
+    pickled, against 3.7 MB after detaching — 1,991x, for byte-identical
     content.** On the real 1M-read data it was ~90 GB per batch against 1.4 MB,
     which is why 100k reads ran and 1M did not, and why *fewer* workers made it
     worse: fewer workers means more templates per unit means a linearly larger
     pickle.
+
+    ``take`` rather than ``concat_tables(...).combine_chunks()``, because
+    **combine_chunks is a no-op on a single-chunk column** and a unit holding
+    ONE template is exactly one slice. Measured: such a unit pickled at
+    **60.4 MB for 6 KB of content** while its parent stayed attached. That is
+    not an edge case — a unit holds one template whenever a mega-template is
+    packed alone, which LPT does deliberately for the biggest ones, and
+    whenever live templates fall below the requested unit count. ``take``
+    gathers into fresh buffers unconditionally.
     """
     columns = [c for c in MSTEP_WORKER_COLUMNS if c in sorted_assignments.column_names]
     narrow = sorted_assignments.select(columns)
     for unit in units:
-        pieces = [
-            narrow.slice(int(lo), int(hi - lo))
+        spans = [
+            np.arange(int(lo), int(hi), dtype=np.int64)
             for lo, hi in zip(unit.row_lo, unit.row_hi)
             if hi > lo
         ]
-        if pieces:
-            # Materialise the unit's own rows into contiguous buffers, so what
-            # crosses the process boundary is the unit, not the round.
-            yield pa.concat_tables(pieces).combine_chunks()
+        if spans:
+            yield narrow.take(pa.array(np.concatenate(spans)))
 
 
 __all__ = [

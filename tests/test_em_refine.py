@@ -392,3 +392,105 @@ def test_convergence_counts_reads_that_gain_or_lose_an_assignment():
     # The stopping rule reads this one, so half the corpus vanishing cannot
     # look converged.
     assert stats["frac_unsettled"] == pytest.approx(0.5)
+
+
+def test_a_capped_template_still_reports_all_of_its_reads():
+    """The cap bounds what the CONSENSUS is built from, not what the cluster
+    CONTAINS.
+
+    Membership used to carry only the sampled reads, so a template with 20
+    reads capped at 5 exported 5 members and n_reads 5. Scaling node_weight
+    did not repair it: exported counts and quant are both counted from
+    membership rows.
+    """
+    import pyarrow as pa_
+    import pyarrow.parquet as pq_
+    import tempfile
+    from pathlib import Path as _Path
+
+    from constellation.sequencing.transcriptome.cluster.denovo._io import (
+        _READS_SCHEMA,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
+        EM_ASSIGNMENT_TABLE,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+        mstep_worker,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.templates import (
+        write_templates,
+    )
+
+    d = _Path(tempfile.mkdtemp())
+    seq = "ATG" + "GCT" * 40 + "TAA"
+    n = 20
+    with pa_.OSFile(str(d / "reads.arrow"), "wb") as sink:
+        with pa_.ipc.new_file(sink, _READS_SCHEMA) as w:
+            w.write_table(
+                pa_.table(
+                    {
+                        "read_id": pa_.array([f"r{i}" for i in range(n)], pa_.string()),
+                        "sequence": pa_.array([seq] * n, pa_.large_string()),
+                        "sample_id": pa_.array(np.zeros(n, np.int64)),
+                        "dorado_quality": pa_.array(np.full(n, 30.0, np.float32)),
+                    },
+                    schema=_READS_SCHEMA,
+                )
+            )
+    write_templates(
+        pa_.table(
+            {
+                "template_id": pa_.array([7], pa_.int64()),
+                "sequence": pa_.array([seq], pa_.large_string()),
+                "orf_start": pa_.array([0], pa_.int32()),
+                "orf_end": pa_.array([len(seq)], pa_.int32()),
+                "orf_aa_length": pa_.array([40], pa_.int32()),
+                "node_weight": pa_.array([float(n)]),
+                "orf_replication": pa_.array([n], pa_.int64()),
+                "seed_read_quality": pa_.nulls(1, pa_.float32()),
+                "seed_read_row": pa_.array([0], pa_.int32()),
+                "declared_variants": pa_.array([[]], pa_.list_(pa_.int64())),
+            },
+            schema=TEMPLATE_TABLE,
+        ),
+        d,
+    )
+    batch = pa_.table(
+        {
+            "read_id": pa_.array([f"r{i}" for i in range(n)], pa_.string()),
+            "read_row": pa_.array(np.arange(n, dtype=np.int32)),
+            "template_id": pa_.array(np.full(n, 7, np.int64)),
+            "template_row": pa_.array(np.zeros(n, np.int32)),
+            "round": pa_.array(np.ones(n, np.int32)),
+            "weight": pa_.array(np.ones(n, np.float32)),
+            "as_score": pa_.array(np.zeros(n, np.int32)),
+            "as_delta": pa_.array(np.zeros(n, np.int32)),
+            "logl": pa_.nulls(n, pa_.float32()),
+            "logl_delta": pa_.nulls(n, pa_.float32()),
+            "n_hits": pa_.array(np.ones(n, np.int32)),
+            "n_admitted": pa_.array(np.ones(n, np.int32)),
+            "candidate_cap_hit": pa_.array(np.zeros(n, bool)),
+            "offset_5p": pa_.array(np.zeros(n, np.int32)),
+            "q_start": pa_.array(np.zeros(n, np.int32)),
+            "q_end": pa_.array(np.full(n, len(seq), np.int32)),
+            "t_start": pa_.array(np.zeros(n, np.int32)),
+            "t_end": pa_.array(np.full(n, len(seq), np.int32)),
+            "cigar": pa_.array([f"{len(seq)}="] * n, pa_.large_string()),
+            "sample_id": pa_.array(np.zeros(n, np.int64)),
+        },
+        schema=EM_ASSIGNMENT_TABLE,
+    )
+    for cap in (n, 5):
+        out = mstep_worker(
+            batch,
+            corpus_path=str(d / "reads.arrow"),
+            templates_path=str(d / "templates.arrow"),
+            round_index=1,
+            params=MStepParams(max_members_per_template=cap, min_aa_length=10),
+        )
+        mem, nodes = out["node_membership"], out["nodes"]
+        assert mem.num_rows == n, f"cap={cap} exported {mem.num_rows} of {n} reads"
+        assert sorted(mem.column("read_row").to_pylist()) == list(range(n))
+        assert sum(nodes.column("n_reads").to_pylist()) == n
+        assert sum(nodes.column("node_weight").to_pylist()) == float(n)
