@@ -494,3 +494,53 @@ def test_a_capped_template_still_reports_all_of_its_reads():
         assert sorted(mem.column("read_row").to_pylist()) == list(range(n))
         assert sum(nodes.column("n_reads").to_pylist()) == n
         assert sum(nodes.column("node_weight").to_pylist()) == float(n)
+
+
+def _template_table(seqs):
+    n = len(seqs)
+    return pa.table(
+        {
+            "template_id": pa.array(np.arange(n, dtype=np.int64)),
+            "sequence": pa.array(seqs, pa.large_string()),
+            "orf_start": pa.array(np.zeros(n, np.int32)),
+            "orf_end": pa.array(np.array([len(s) for s in seqs], np.int32)),
+            "orf_aa_length": pa.array(np.full(n, 1, np.int32)),
+            "node_weight": pa.array(np.ones(n)),
+            "orf_replication": pa.array(np.ones(n, np.int64)),
+            "seed_read_quality": pa.nulls(n, pa.float32()),
+            "seed_read_row": pa.array(np.arange(n, dtype=np.int32)),
+            "declared_variants": pa.array([[]] * n, pa.list_(pa.int64())),
+        },
+        schema=TEMPLATE_TABLE,
+    )
+
+
+def test_a_sliced_template_table_reads_back_its_own_rows():
+    """`Array.offset` is not zero after a slice, and `chunk(0)` preserves it.
+
+    Reading the offsets buffer from index 0 then returns a DIFFERENT row —
+    silently, with a plausible sequence. Every consumer downstream (the PWM,
+    the likelihood, the redundancy detector) would be reading one template's
+    bases under another's id. Introduced by the chunk(0) fast path that
+    replaced combine_chunks to stop each worker copying the corpus.
+    """
+    seqs = ["AAAA", "CCCC", "GGGG"]
+    table = _template_table(seqs)
+    assert table.column("sequence").chunk(0).offset == 0
+
+    for lo in range(len(seqs)):
+        for length in range(1, len(seqs) - lo + 1):
+            sliced = table.slice(lo, length)
+            store = TemplateStore.from_table(sliced)
+            got = [store.sequence(i) for i in range(store.n_templates)]
+            assert got == seqs[lo : lo + length], f"slice({lo}, {length})"
+
+    # And the unsliced case is unchanged.
+    store = TemplateStore.from_table(table)
+    assert [store.sequence(i) for i in range(3)] == seqs
+
+
+def test_an_empty_template_table_opens_without_indexing_a_buffer():
+    store = TemplateStore.from_table(_template_table([]))
+    assert store.n_templates == 0
+    assert store.seq_buffer.size == 0

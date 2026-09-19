@@ -133,8 +133,17 @@ class TemplateStore:
                 seq = col.combine_chunks()
         else:
             seq = col
-        offsets = np.asarray(seq.buffers()[1]).view(np.int64)[: len(seq) + 1].copy()
-        data = np.asarray(seq.buffers()[2]).view(np.uint8)[: int(offsets[-1])]
+        # `seq.offset` is NOT zero for a sliced array, and `chunk(0)` on a
+        # sliced ChunkedArray preserves it. Indexing the offsets buffer from 0
+        # then returns the wrong row entirely — `["AAAA","CCCC","GGGG"].slice(1,1)`
+        # held "CCCC" and read back "AAAA". Rebase so the store's row i is the
+        # table's row i.
+        start = seq.offset
+        raw = np.asarray(seq.buffers()[1]).view(np.int64)[start : start + len(seq) + 1]
+        offsets = (raw - raw[0]).copy() if len(seq) else np.zeros(1, dtype=np.int64)
+        data = np.asarray(seq.buffers()[2]).view(np.uint8)[
+            int(raw[0]) : int(raw[-1])
+        ] if len(seq) else np.zeros(0, dtype=np.uint8)
         return cls(table=table, seq_offsets=offsets, seq_buffer=data, _mm=mm)
 
     @property
