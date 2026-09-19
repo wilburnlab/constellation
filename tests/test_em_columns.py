@@ -19,7 +19,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.consensus import (  #
     MemberSpec,
     frame_consensus,
 )
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.columns import (  # noqa: E402
+from constellation.sequencing.transcriptome.cluster.denovo.em.columns import (  # noqa: E402
     ROUTE_ALLELIC,
     ROUTE_COVERAGE,
     candidate_columns,

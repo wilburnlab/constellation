@@ -2,7 +2,7 @@
 
 Shared by the consensus stage (ORF on each cluster consensus) and the
 ORF-anchored EM's seeding stage (ORF on each read window). Lives in its own
-leaf module so ``orfem/`` can use it without importing ``pipeline``.
+leaf module so ``em/`` can use it without importing ``pipeline``.
 
 Semantics, matching the shipped de novo pipeline:
 

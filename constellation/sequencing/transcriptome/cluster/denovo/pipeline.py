@@ -1036,7 +1036,7 @@ def _build_cluster_table(
             "orf_end": pa.array([r[4] for r in results], pa.int32()),
             "orf_strand": pa.array([r[5] for r in results], pa.string()),
             "codon_table": pa.array([r[6] for r in results], pa.int32()),
-            "mode": pa.array(["de-novo"] * len(cid), pa.string()),
+            "mode": pa.array(["kmer"] * len(cid), pa.string()),
             "contig_id": pa.nulls(len(cid), pa.int64()),
             "strand": pa.nulls(len(cid), pa.string()),
             "span_start": pa.nulls(len(cid), pa.int64()),
@@ -1239,14 +1239,14 @@ def cluster_transcripts(
 
         def _log(msg: str) -> None:
             if verbose:
-                print(f"[de-novo] {msg}", file=sys.stderr, flush=True)
+                print(f"[kmer] {msg}", file=sys.stderr, flush=True)
             if progress_cb is not None:
                 try:
                     from constellation.core.progress import ProgressEvent
 
                     progress_cb(
                         ProgressEvent(
-                            kind="stage_progress", stage="de-novo", message=msg
+                            kind="stage_progress", stage="kmer", message=msg
                         )
                     )
                 except Exception:  # noqa: BLE001
@@ -1294,7 +1294,7 @@ def cluster_transcripts(
         emit_cluster_detail=emit_cluster_detail,
         detail_top_n=detail_top_n,
         parameters={
-            "mode": "de-novo",
+            "mode": "kmer",
             "identity": float(identity),
             "max_5p_overhang": int(max_5p_overhang),
             "max_3p_overhang": int(max_3p_overhang),

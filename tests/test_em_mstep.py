@@ -20,7 +20,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.consensus import (  #
 from constellation.sequencing.transcriptome.cluster.denovo.orf import (  # noqa: E402
     best_sense_orf,
 )
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.mstep import (  # noqa: E402
+from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (  # noqa: E402
     certified_columns,
     gated_orf,
     refine_template,
@@ -85,8 +85,9 @@ def test_orf_is_truncated_at_the_last_certified_column():
     consensus = "ATG" + "GCT" * 100 + "TAA"
     certified = np.zeros(len(consensus), dtype=bool)
     certified[:180] = True  # support runs out mid-ORF
-    got = gated_orf(consensus, certified, seed_orf_start=0, seed_orf_end=90,
-                    min_aa_length=30)
+    got = gated_orf(
+        consensus, certified, seed_orf_start=0, seed_orf_end=90, min_aa_length=30
+    )
     assert got is not None
     prot, st, en, cert_end, truncated = got
     assert truncated is True
@@ -114,7 +115,10 @@ def test_orf_within_the_seed_boundary_is_never_gated():
     consensus = "ATG" + "GCT" * 40 + "TAA"
     certified = np.zeros(len(consensus), dtype=bool)
     _prot, _st, en, _ce, truncated = gated_orf(
-        consensus, certified, seed_orf_start=0, seed_orf_end=len(consensus),
+        consensus,
+        certified,
+        seed_orf_start=0,
+        seed_orf_end=len(consensus),
         min_aa_length=30,
     )
     assert truncated is False
@@ -136,7 +140,7 @@ def test_support_gate_end_to_end_on_a_one_read_flank():
     body = "ATG" + "".join(rng.choice(_CODONS) for _ in range(120))
     tail = "".join(rng.choice(_CODONS) for _ in range(40))  # no stop in here
     frame = _flank(rng, 30) + body + tail + "TAA" + _flank(rng, 30)
-    short = frame[:33 + len(body)]  # members stop before the tail
+    short = frame[: 33 + len(body)]  # members stop before the tail
 
     starved = refine_template(
         frame, _specs(frame, [short] * 25 + [frame]), min_aa_length=60
@@ -298,7 +302,9 @@ def test_an_alternative_start_gives_two_nodes_of_different_length():
     frame = _flank(rng, 200) + body + _flank(rng, 40)
     short = frame[200:]  # an alternative start exactly 200 nt in
     nodes = refine_template(
-        frame, _specs(frame, [frame] * 40 + [short] * 40), min_aa_length=60,
+        frame,
+        _specs(frame, [frame] * 40 + [short] * 40),
+        min_aa_length=60,
         seed_orf=(200, 200 + len(body)),
     )
     assert len(nodes) == 2
@@ -341,8 +347,7 @@ def test_the_major_node_carries_the_refit_substrate_and_the_counters():
     assert st["n_reads"] == 30
     # "The method returned one template in the tail" has to be visible rather
     # than inferred from a quiet result.
-    for key in ("n_candidates", "n_allelic", "n_coverage", "n_signatures",
-                "n_nodes"):
+    for key in ("n_candidates", "n_allelic", "n_coverage", "n_signatures", "n_nodes"):
         assert key in st, key
     assert all(n.stats == {} for n in nodes[1:]), "diagnostics on the major only"
 
@@ -375,7 +380,9 @@ def test_a_seed_orf_running_to_the_template_end_is_not_gated():
     orf = "ATG" + "".join(rng.choice(_CODONS) for _ in range(40)) + "TAA"
     for n_reads in (1, 2, 20):
         nodes = refine_template(
-            orf, _specs(orf, [orf] * n_reads), min_aa_length=30,
+            orf,
+            _specs(orf, [orf] * n_reads),
+            min_aa_length=30,
             seed_orf=(0, len(orf)),
         )
         n = nodes[0]

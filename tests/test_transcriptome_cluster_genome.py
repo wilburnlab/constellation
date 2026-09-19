@@ -473,14 +473,14 @@ def test_empty_inputs_return_empty_schema_shaped_tables() -> None:
     assert membership.schema.equals(CLUSTER_MEMBERSHIP_TABLE)
 
 
-def test_mode_field_is_genome_guided() -> None:
+def test_mode_field_is_genome() -> None:
     fps = _fingerprints([_fp(read_id="rA")])
     al = _alignments([_alignment(alignment_id=1, read_id="rA")])
     rd = _reads(
         [{"read_id": "rA", "sequence": "AAAA", "dorado_quality": 20.0}]
     )
     clusters, _ = cluster_by_fingerprint(fps, rd, alignments=al)
-    assert clusters.column("mode").to_pylist() == ["genome-guided"]
+    assert clusters.column("mode").to_pylist() == ["genome"]
 
 
 def test_index_then_take_handles_reordered_sources() -> None:

@@ -402,14 +402,19 @@ export class TrackSettingsPanel {
       );
     } else if (kind === 'cluster_pileup') {
       const modes = stringList(this.opts.meta.modes);
+      // Old spellings kept alongside the canonical ones so pre-rename
+      // clusters.parquet files still colour correctly.
       const defaults: Record<string, string> = {
+        genome: '#5ed6cf',
+        kmer: '#a8d65e',
+        em: '#d6a85e',
         'genome-guided': '#5ed6cf',
         'de-novo': '#a8d65e',
         default: '#888888',
       };
       if (modes.length === 0) {
         // Fall back to the known modes so the picker isn't empty.
-        modes.push('genome-guided', 'de-novo');
+        modes.push('genome', 'kmer', 'em');
       }
       modes.forEach((mode) => {
         const fallback = defaults[mode] ?? '#888888';
@@ -642,7 +647,7 @@ export class TrackSettingsPanel {
         section.appendChild(clusterViewRow);
       }
       const modes = stringList(this.opts.meta.modes);
-      if (modes.length === 0) modes.push('genome-guided', 'de-novo');
+      if (modes.length === 0) modes.push('genome', 'kmer', 'em');
       section.appendChild(
         allowListRow(
           'Visible modes',

@@ -13,12 +13,12 @@ import itertools
 import numpy as np
 import pytest
 
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.columns import (
+from constellation.sequencing.transcriptome.cluster.denovo.em.columns import (
     ROUTE_ALLELIC,
     ROUTE_COVERAGE,
     CandidateSet,
 )
-from constellation.sequencing.transcriptome.cluster.denovo.orfem.covariance import (
+from constellation.sequencing.transcriptome.cluster.denovo.em.covariance import (
     MAJOR,
     UNCOVERED,
     UNOBSERVED,
@@ -34,15 +34,27 @@ from constellation.sequencing.transcriptome.cluster.denovo.orfem.covariance impo
 # ── builders ──────────────────────────────────────────────────────────
 
 
-def _cand(n, *, route=None, run_len=None, boundary_mass=None,
-          boundary_expected=None, effect=None, eps=0.003):
-    route = np.full(n, ROUTE_ALLELIC, np.int8) if route is None else np.asarray(
-        route, np.int8
+def _cand(
+    n,
+    *,
+    route=None,
+    run_len=None,
+    boundary_mass=None,
+    boundary_expected=None,
+    effect=None,
+    eps=0.003,
+):
+    route = (
+        np.full(n, ROUTE_ALLELIC, np.int8)
+        if route is None
+        else np.asarray(route, np.int8)
     )
     return CandidateSet(
         columns=np.arange(n, dtype=np.int64),
         route=route,
-        run_len=np.ones(n, np.int32) if run_len is None else np.asarray(run_len, np.int32),
+        run_len=np.ones(n, np.int32)
+        if run_len is None
+        else np.asarray(run_len, np.int32),
         effect=(np.full(n, 0.5) if effect is None else np.asarray(effect, float)),
         eps=np.full(n, eps),
         major=np.zeros(n, np.int8),
@@ -277,8 +289,9 @@ def test_a_ramp_boundary_is_what_a_uniform_spread_would_give():
     route = np.full(n_v, ROUTE_COVERAGE, np.int8)
     rows = [[(v, UNCOVERED) for v in range(3)] if i < 6 else [] for i in range(60)]
     spans = [(3, n_v) if i < 6 else (0, n_v) for i in range(60)]
-    common = dict(route=route, run_len=[3, 1, 1, 1, 1, 1],
-                  boundary_mass=[6.0, 0, 0, 0, 0, 0])
+    common = dict(
+        route=route, run_len=[3, 1, 1, 1, 1, 1], boundary_mass=[6.0, 0, 0, 0, 0, 0]
+    )
     st = _states(rows, n_v, route=route, spans=spans)
     # A ramp: 6 endpoints here is what the neighbourhood averages anyway.
     ramp = _cand(n_v, boundary_expected=[6.0, 0, 0, 0, 0, 0], **common)
@@ -293,7 +306,9 @@ def test_a_coverage_column_can_link_to_an_allelic_one():
     substitution is real evidence, and the interval confound does not apply
     because the allelic column's own marginal is over reads that cover it."""
     n_v = 4
-    route = np.array([ROUTE_COVERAGE, ROUTE_ALLELIC, ROUTE_ALLELIC, ROUTE_ALLELIC], np.int8)
+    route = np.array(
+        [ROUTE_COVERAGE, ROUTE_ALLELIC, ROUTE_ALLELIC, ROUTE_ALLELIC], np.int8
+    )
     rows, spans = [], []
     for i in range(80):
         if i < 30:  # the short form, which also carries a substitution at 2
@@ -302,8 +317,9 @@ def test_a_coverage_column_can_link_to_an_allelic_one():
         else:
             rows.append([])
             spans.append((0, n_v))
-    g = covariance_graph(_states(rows, n_v, route=route, spans=spans),
-                         _cand(n_v, route=route))
+    g = covariance_graph(
+        _states(rows, n_v, route=route, spans=spans), _cand(n_v, route=route)
+    )
     assert g.keep[[0, 2]].all()
     assert sorted(map(tuple, g.edges.tolist())) == [(0, 2)]
 
@@ -405,9 +421,7 @@ def test_the_weighted_hamming_reduction_is_argmax_equivalent():
         match = obs & (x == p[None, :])
         mism = obs & (x != p[None, :])
         ll[:, j] = (
-            np.log(max(a.mass[j], 1e-12))
-            + match @ np.log(1 - eps)
-            + mism @ np.log(eps)
+            np.log(max(a.mass[j], 1e-12)) + match @ np.log(1 - eps) + mism @ np.log(eps)
         )
     assert np.array_equal(np.argmax(ll, axis=1), a.labels)
 

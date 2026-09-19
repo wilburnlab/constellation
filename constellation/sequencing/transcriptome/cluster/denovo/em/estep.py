@@ -1,4 +1,30 @@
-"""Stage 2 — E-step: assign every read to a template.
+"""Stage 2 — E-step: assign every read to a template. **SUPERSEDED.**
+
+.. warning::
+
+   The assignment rule in this module is no longer the one the loop runs.
+   :mod:`.scheduler` holds the rule, :mod:`.assign` the reducer, and
+   :mod:`.paf_scan` the decoder; ``em/rounds.py`` calls those. Nothing in the
+   library imports anything below this docstring any more.
+
+   It is kept rather than deleted because it still carries two capabilities
+   the new path does not, and deleting it would make that a silent regression
+   rather than a recorded gap:
+
+   * **``tie_resolution="fractional"``** — splitting a read's mass across its
+     banded templates by ``node_weight``, which drives node weights and the
+     M-step PWM while reported membership and quant still come from the
+     argmax. The new rule emits one winner at ``weight=1.0``. Library-only;
+     it was never reachable from the CLI.
+   * **``emit_coverage`` / ``READ_ORF_COVERAGE_TABLE``** — the non-exclusive
+     (read, template) ORF-coverage view, which is the input to the later
+     graph stage. Deliberately not emitted during rounds: it is one Python
+     CIGAR walk per *banded* pair, i.e. 50-90M per round at 9.4M reads.
+
+   Restoring either onto the new path is a small piece of work; doing it
+   inside this module is not, because the ranking it is wired to is gone.
+
+Every read is aligned to every template with minimap2 and assigned by
 
 Every read is aligned to every template with minimap2 and assigned by
 alignment score, with candidates inside an **absolute** band of the best
@@ -103,12 +129,15 @@ register_schema("ReadOrfCoverageTable", READ_ORF_COVERAGE_TABLE)
 # cg:Z string is all `M` and cigar_stats folds mismatches into matches, so
 # every identity comes out 1.0.
 TEMPLATE_MINIMAP2_ARGS: tuple[str, ...] = (
-    "-x", "map-ont",
+    "-x",
+    "map-ont",
     "-c",
     "--eqx",
     "--secondary=yes",
-    "-N", "50",
-    "-p", "0.05",
+    "-N",
+    "50",
+    "-p",
+    "0.05",
 )
 
 
@@ -378,13 +407,13 @@ def assign_reads(
         nb = int(n_banded[0])
         sample = None if sample_of_read is None else sample_of_read.get(grp.read_id)
 
-        banded = _best_slot_per_template(
-            np.flatnonzero(in_band), tmpl, as_score
-        )
+        banded = _best_slot_per_template(np.flatnonzero(in_band), tmpl, as_score)
         if tie_resolution == "fractional" and banded.size > 1:
             slots = banded
             nw = templates.node_weight[tmpl[slots]].astype(np.float64)
-            share = nw / nw.sum() if nw.sum() > 0 else np.full(slots.size, 1 / slots.size)
+            share = (
+                nw / nw.sum() if nw.sum() > 0 else np.full(slots.size, 1 / slots.size)
+            )
         else:
             slots = np.array([w_slot], dtype=np.int64)
             share = np.array([1.0])
