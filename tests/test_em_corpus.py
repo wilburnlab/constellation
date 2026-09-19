@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -163,3 +165,122 @@ def test_resume_skips_a_completed_corpus(tmp_path):
     second = write_corpus(demux, out, max_window_length=None, resume=True)
     assert second.n_reads == first.n_reads
     assert second.fasta_path.read_text() == sentinel
+
+
+# ── residency, not just output size ───────────────────────────────────
+
+
+def _chunked_corpus(tmp_path, n_batches=8, per_batch=50):
+    """A corpus written as several record batches, as a real one is."""
+    from constellation.sequencing.transcriptome.cluster.denovo._io import _READS_SCHEMA
+
+    path = tmp_path / "chunked.arrow"
+    rng = np.random.default_rng(0)
+    with pa.OSFile(str(path), "wb") as sink:
+        with pa.ipc.new_file(sink, _READS_SCHEMA) as writer:
+            for b in range(n_batches):
+                writer.write_table(
+                    pa.table(
+                        {
+                            "read_id": pa.array(
+                                [f"b{b}_r{i}" for i in range(per_batch)], pa.string()
+                            ),
+                            "sequence": pa.array(
+                                [
+                                    "".join(rng.choice(list("ACGT"), 60))
+                                    for _ in range(per_batch)
+                                ],
+                                pa.large_string(),
+                            ),
+                            "sample_id": pa.array(
+                                np.full(per_batch, b, np.int64)
+                            ),
+                            "dorado_quality": pa.array(
+                                np.full(per_batch, 30.0, np.float32)
+                            ),
+                        },
+                        schema=_READS_SCHEMA,
+                    )
+                )
+    return path
+
+
+def test_take_never_concatenates_the_chunked_corpus(tmp_path, monkeypatch):
+    """`pc.take` on a ChunkedArray concatenates it ALL before indexing.
+
+    So fetching one row off a 232 MB / 48-chunk mmapped corpus peaked at
+    +444.8 MB — about twice the corpus — against +5.1 MB taking chunk-locally.
+    At 9.4M reads the corpus is ~25 GB, which is ~47 GB per worker on first
+    access, in every worker: a lazy file-backed corpus made fully resident.
+
+    Asserted structurally rather than by measuring memory, so it cannot go
+    quiet on a different allocator: `pc.take` must never be handed the
+    chunked column at all.
+    """
+    import pyarrow.compute as pc
+
+    store = ReadStore.open(_chunked_corpus(tmp_path))
+    try:
+        assert store.sequence.num_chunks > 1, "the fixture must be chunked"
+
+        real_take = pc.take
+        offenders = []
+
+        def spy(data, indices, **kw):
+            if isinstance(data, pa.ChunkedArray) and data.num_chunks > 1:
+                offenders.append(data.num_chunks)
+            return real_take(data, indices, **kw)
+
+        monkeypatch.setattr(pc, "take", spy)
+        store.take_sequences(np.array([3, 199, 45]))
+        store.take_read_ids(np.array([3, 199, 45]))
+        assert not offenders, (
+            f"pc.take was handed a {offenders[0]}-chunk column — that "
+            "concatenates the whole corpus"
+        )
+    finally:
+        store.close()
+
+
+def test_chunked_take_matches_pc_take_exactly(tmp_path):
+    """Cheaper is only useful if it is also identical."""
+    import pyarrow.compute as pc
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
+        chunked_take,
+    )
+
+    store = ReadStore.open(_chunked_corpus(tmp_path))
+    try:
+        rng = np.random.default_rng(3)
+        for _ in range(50):
+            rows = rng.integers(0, store.n_reads, int(rng.integers(1, 40)))
+            want = pc.take(store.sequence, pa.array(rows)).to_pylist()
+            got = chunked_take(store.sequence, rows, store.chunk_starts).to_pylist()
+            assert want == got
+        # order, duplicates and the boundaries between chunks
+        edges = np.array([0, 49, 50, 51, 99, 100, store.n_reads - 1])
+        assert (
+            chunked_take(store.sequence, edges, store.chunk_starts).to_pylist()
+            == pc.take(store.sequence, pa.array(edges)).to_pylist()
+        )
+        rev = np.array([120, 7, 120, 3, 7])
+        assert (
+            chunked_take(store.sequence, rev, store.chunk_starts).to_pylist()
+            == pc.take(store.sequence, pa.array(rev)).to_pylist()
+        )
+        assert chunked_take(store.sequence, np.array([]), store.chunk_starts).to_pylist() == []
+    finally:
+        store.close()
+
+
+def test_rows_resolve_to_the_right_chunk(tmp_path):
+    """A row must come back as itself, not as its neighbour in another chunk."""
+    store = ReadStore.open(_chunked_corpus(tmp_path, n_batches=4, per_batch=10))
+    try:
+        assert store.take_read_ids(np.arange(40)).to_pylist() == [
+            f"b{b}_r{i}" for b in range(4) for i in range(10)
+        ]
+        assert store.sample_id.tolist() == [b for b in range(4) for _ in range(10)]
+    finally:
+        store.close()

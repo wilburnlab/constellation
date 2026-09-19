@@ -32,9 +32,17 @@ class _Reads:
 
     def __init__(self, ids, samples=None):
         self.read_id = pa.chunked_array([pa.array(ids, pa.string())])
+        self.chunk_starts = np.array([0, len(ids)], dtype=np.int64)
         self.sample_id = np.asarray(
             samples if samples is not None else [0] * len(ids), dtype=np.int64
         )
+
+    def take_read_ids(self, rows):
+        from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
+            chunked_take,
+        )
+
+        return chunked_take(self.read_id, rows, self.chunk_starts).cast(pa.string())
 
 
 def _store(sequences, *, replication=None, quality=None, weight=None):

@@ -31,7 +31,7 @@ Rows are dense and stable: row ``i`` of the IPC file is the read named
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -88,13 +88,21 @@ class ReadStore:
 
     table: pa.Table
     _mm: pa.MemoryMappedFile
+    #: Row index at which each chunk starts, ``(n_chunks + 1,)``. Computed on
+    #: open from chunk lengths alone — no data is touched.
+    chunk_starts: np.ndarray = field(default_factory=lambda: np.zeros(1, np.int64))
 
     @classmethod
     def open(cls, path: Path | str) -> ReadStore:
         mm = pa.memory_map(str(path), "r")
         with pa.ipc.open_file(mm) as reader:
             table = reader.read_all()
-        return cls(table=table, _mm=mm)
+        col = table.column("sequence")
+        lengths = (
+            [len(c) for c in col.chunks] if isinstance(col, pa.ChunkedArray) else [len(col)]
+        )
+        starts = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
+        return cls(table=table, _mm=mm, chunk_starts=starts)
 
     @property
     def n_reads(self) -> int:
@@ -123,17 +131,73 @@ class ReadStore:
     def take_sequences(self, rows: np.ndarray) -> list[str]:
         """The sequences at ``rows``, as Python strings.
 
-        The only sanctioned way to get ``str`` out of the corpus, and it is
-        bounded by design: callers pass one template's member rows (capped at
-        ``max_members_per_template``), never the whole corpus.
+        The only sanctioned way to get ``str`` out of the corpus, and bounded
+        in **residency** as well as in output: callers pass one template's
+        member rows, never the whole corpus.
+
+        That second guarantee is the whole point of :func:`chunked_take`. The
+        obvious ``pc.take(self.sequence, rows)`` is not bounded — ``pc.take``
+        concatenates every chunk of a ChunkedArray before indexing, so
+        fetching ONE row off a 232 MB / 48-chunk mmapped corpus cost +219 MB
+        RSS (measured). At 9.4M reads the corpus is ~25 GB, so that is ~47 GB
+        of anonymous memory per worker, on first access, in every worker — a
+        lazy file-backed corpus turned fully resident.
         """
-        if len(rows) == 0:
-            return []
-        idx = pa.array(np.asarray(rows, dtype=np.int64))
-        return pc.take(self.sequence, idx).to_pylist()
+        return chunked_take(self.sequence, rows, self.chunk_starts).to_pylist()
+
+    def take_read_ids(self, rows: np.ndarray) -> pa.Array:
+        """The read ids at ``rows``, without materialising the whole column."""
+        return chunked_take(self.read_id, rows, self.chunk_starts).cast(pa.string())
 
     def close(self) -> None:
         self._mm.close()
+
+
+def chunked_take(
+    column: pa.ChunkedArray | pa.Array,
+    rows: np.ndarray,
+    chunk_starts: np.ndarray,
+) -> pa.Array:
+    """``column.take(rows)`` that touches only the chunks ``rows`` fall in.
+
+    ``pyarrow.compute.take`` on a ChunkedArray concatenates the whole array
+    first, so its cost is the column's size no matter how few rows are asked
+    for. Resolving each row to ``(chunk, offset)`` and taking chunk-locally
+    costs the chunks actually hit — measured +219 MB against +41 MB for one
+    row of a 232 MB corpus, and the gap widens with the corpus.
+
+    Input order is preserved.
+    """
+    rows = np.asarray(rows, dtype=np.int64)
+    if rows.size == 0:
+        return (
+            column.chunk(0).slice(0, 0)
+            if isinstance(column, pa.ChunkedArray) and column.num_chunks
+            else column.slice(0, 0)
+        )
+    if not isinstance(column, pa.ChunkedArray) or column.num_chunks == 1:
+        flat = column.chunk(0) if isinstance(column, pa.ChunkedArray) else column
+        return flat.take(pa.array(rows))
+
+    which = np.searchsorted(chunk_starts, rows, side="right") - 1
+    np.clip(which, 0, column.num_chunks - 1, out=which)
+    local = rows - chunk_starts[which]
+
+    # Visit each chunk once, in chunk order, then restore the caller's order.
+    order = np.argsort(which, kind="stable")
+    parts, sizes = [], []
+    lo = 0
+    ordered_which = which[order]
+    while lo < order.size:
+        hi = int(np.searchsorted(ordered_which, ordered_which[lo], side="right"))
+        sel = order[lo:hi]
+        parts.append(column.chunk(int(ordered_which[lo])).take(pa.array(local[sel])))
+        sizes.append(sel.size)
+        lo = hi
+    gathered = parts[0] if len(parts) == 1 else pa.concat_arrays(parts)
+    inverse = np.empty(order.size, dtype=np.int64)
+    inverse[order] = np.arange(order.size)
+    return gathered.take(pa.array(inverse))
 
 
 def write_corpus(
@@ -254,6 +318,7 @@ def _write_fasta_rows(fh, table: pa.Table, *, start_row: int) -> int:
 
 __all__ = [
     "CORPUS_ARROW",
+    "chunked_take",
     "CORPUS_FASTA",
     "Corpus",
     "ReadStore",

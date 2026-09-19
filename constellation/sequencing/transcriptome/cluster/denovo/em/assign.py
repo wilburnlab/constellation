@@ -180,13 +180,15 @@ def assign_block(
 
     t_row = np.where(has, hb.template_row[slot], -1).astype(np.int32)
     t_id = np.where(has, store.template_id[hb.template_row[slot]], -1).astype(np.int64)
-    group_idx = pa.array(read_of_group)
 
     return pa.RecordBatch.from_arrays(
         [
             # read_id is materialised exactly once per round, on the winners —
-            # never decoded over the ~51x larger hit stream.
-            pc.take(reads.read_id, group_idx).combine_chunks().cast(pa.string()),
+            # never decoded over the ~51x larger hit stream. And taken
+            # CHUNK-LOCALLY: `pc.take` on a chunked column concatenates the
+            # whole column first, so this would pull the corpus's entire
+            # read_id array resident once per block.
+            reads.take_read_ids(read_of_group),
             pa.array(read_of_group.astype(np.int32)),
             pa.array(t_id),
             pa.array(t_row),
@@ -386,11 +388,10 @@ def run_em_estep(
 def _unassigned_batch(rows: np.ndarray, reads, round_index: int) -> pa.RecordBatch:
     """One ``template_id = -1`` row per corpus read minimap2 never reported."""
     n = rows.size
-    idx = pa.array(rows.astype(np.int64))
     zero32 = pa.array(np.zeros(n, dtype=np.int32))
     return pa.RecordBatch.from_arrays(
         [
-            pc.take(reads.read_id, idx).combine_chunks().cast(pa.string()),
+            reads.take_read_ids(rows),
             pa.array(rows.astype(np.int32)),
             pa.array(np.full(n, -1, dtype=np.int64)),
             pa.array(np.full(n, -1, dtype=np.int32)),
