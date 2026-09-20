@@ -850,7 +850,7 @@ def _build_transcriptome_parser(subs) -> None:
     p_dem.add_argument(
         "--min-aa-length",
         type=int,
-        default=60,
+        default=None,
         help=(
             "minimum protein length (in amino acids) for ORF prediction "
             "(default 60 — matches NanoporeAnalysis _fixed1 baseline)"
@@ -1256,19 +1256,32 @@ def _build_transcriptome_parser(subs) -> None:
     )
     p_cluster.add_argument(
         "--mode",
-        # The first three are canonical. The last two are the pre-rename
-        # spellings, accepted so existing scripts and manifests keep working;
-        # they normalise and warn.
-        choices=("genome", "kmer", "em", "genome-guided", "de-novo"),
+        # The first four are canonical. `em` is an accepted under-specified
+        # spelling of em-orf; the last two are the pre-rename spellings,
+        # accepted so existing scripts and manifests keep working.
+        choices=(
+            "genome",
+            "kmer",
+            "em-orf",
+            "em-kmer",
+            "em",
+            "genome-guided",
+            "de-novo",
+        ),
         default="genome",
-        metavar="{genome,kmer,em}",
+        metavar="{genome,kmer,em-orf,em-kmer}",
         help=(
             "clustering mode, named for the MECHANISM rather than the "
             "provenance. genome keys on splicing topology against a "
             "reference; kmer is reference-free connected components over a "
-            "minimizer + edit-distance graph; em iterates align -> refine to "
-            "converged reference transcripts. 'genome-guided' and 'de-novo' "
-            "are accepted as deprecated aliases for genome and kmer."
+            "minimizer + edit-distance graph; em-orf and em-kmer both iterate "
+            "align -> refine to converged reference transcripts and differ "
+            "only in how round 1 is SEEDED — one template per distinct ORF, "
+            "or one per read cluster. At 9.4M reads kmer seeding is 4.4x "
+            "fewer templates and a 2.9 h round-1 E-step against 13.95 h, at "
+            "the same gene agreement. 'em' is accepted for em-orf; "
+            "'genome-guided' and 'de-novo' are deprecated aliases for genome "
+            "and kmer."
         ),
     )
     # ── em (--mode em) flags ────────────────────────────────────────
@@ -1351,24 +1364,31 @@ def _build_transcriptome_parser(subs) -> None:
             "most-5p-flank",
             "most-replicated",
         ),
-        help="em: which read of an ORF group becomes the round-1 template. "
+        help="em: which read of a seed group becomes the round-1 template. "
         "Default is the longest read clearing Q22 — quality selects read "
-        "accuracy ~4x where length selects it not at all.",
+        "accuracy ~4x where length selects it not at all. One policy is "
+        "em-orf only: most-5p-flank ranks on the ORF's position in the read, "
+        "which kmer seeding has not predicted at election time.",
     )
     p_cluster.add_argument(
         "--min-seed-reads",
         type=int,
         default=1,
-        help="em: drop ORF groups below this many reads BEFORE the E-step. "
-        "Keep at 1: a pre-E-step filter erases minority proteoforms "
-        "before they can be tested, and there is no prune downstream to "
-        "compensate.",
+        help="em: drop seed groups (ORF groups / read clusters) below this "
+        "many reads BEFORE the E-step. Keep at 1: a pre-E-step filter erases "
+        "minority proteoforms before they can be tested, and there is no "
+        "prune downstream to compensate. Under em-kmer, 2 is the extreme "
+        "operating point — 112k templates and a 9-minute round-1 E-step at "
+        "9.4M reads, but transcript template recall halves (0.52 vs 0.87).",
     )
     p_cluster.add_argument(
         "--fold-identity",
         type=float,
-        default=0.97,
-        help="em: ORF-level fold identity for seed grouping.",
+        default=None,
+        help=(
+            "em-orf: ORF-level fold identity for seed grouping. Default 0.97. "
+            "Not used by --mode em-kmer, which has no ORF-level fold."
+        ),
     )
     p_cluster.add_argument(
         "--max-members-per-template",
@@ -1385,29 +1405,101 @@ def _build_transcriptome_parser(subs) -> None:
         help="em: M-step pool size (0 = --threads).",
     )
     # ── kmer (--mode kmer) flags ────────────────────────────────────
+    # The read-to-read gate. Shared by --mode kmer and --mode em-kmer, whose
+    # right defaults DIFFER (0.98/30:30 vs 0.93/inf:100) — so the default is
+    # None and each handler resolves it, the same treatment --overdispersion
+    # already gets below. Measured: 0.98/30:30 costs the EM the same 14 h as
+    # ORF seeding, and relaxing to 0.93/inf:100 is the 4.8x cut.
     p_cluster.add_argument(
         "--identity",
         type=float,
-        default=0.98,
+        default=None,
         help=(
-            "de-novo: minimum pairwise sequence identity for two reads to "
-            "share a cluster edge (edit_distance / shorter_len ≤ 1-identity). "
-            "Note this is read-to-read: two reads each ~1%% from the true "
-            "transcript are ~2%% apart, so ~0.96-0.97 reduces tail "
-            "fragmentation for ~1%% error reads. Default 0.98."
+            "kmer / em-kmer: minimum pairwise sequence identity for two reads "
+            "to share a cluster edge (edit_distance / shorter_len ≤ "
+            "1-identity). Note this is read-to-read: two reads each ~1%% from "
+            "the true transcript are ~2%% apart, so ~0.96-0.97 reduces tail "
+            "fragmentation for ~1%% error reads. Default 0.98 for --mode "
+            "kmer, 0.93 for --mode em-kmer."
         ),
     )
     p_cluster.add_argument(
         "--max-5p-overhang",
-        type=int,
-        default=30,
-        help="de-novo: max 5' length overhang (bp) to still collapse. Default 30.",
+        type=_overhang,
+        default=None,
+        help=(
+            "kmer / em-kmer: max 5' length overhang (bp) to still collapse; "
+            "'inf' (or a negative value) means unbounded. Default 30 for "
+            "--mode kmer, inf for --mode em-kmer — 30%% of Complete windows "
+            "are 5'-partial, so 5'-unbounded recruitment is the point, and "
+            "the 3' cap is what makes it safe."
+        ),
     )
     p_cluster.add_argument(
         "--max-3p-overhang",
+        type=_overhang,
+        default=None,
+        help=(
+            "kmer / em-kmer: max 3' length overhang (bp) to still collapse; "
+            "'inf' means unbounded. Default 30 for --mode kmer, 100 for "
+            "--mode em-kmer. Load-bearing: at 9.4M reads, unbounded ends put "
+            "76%% of the corpus in ONE connected component at purity 0.154, "
+            "and even 500 leaves a 410k-read one."
+        ),
+    )
+    p_cluster.add_argument(
+        "--min-shared",
         type=int,
-        default=30,
-        help="de-novo: max 3' length overhang (bp) to still collapse. Default 30.",
+        default=2,
+        help=(
+            "kmer / em-kmer: minimum shared minimizers for a candidate pair. "
+            "Raising it to 3 costs 2-10 points of gene contiguity; 2 is the "
+            "measured operating point."
+        ),
+    )
+    p_cluster.add_argument(
+        "--diag-span-max",
+        type=int,
+        default=20,
+        help=(
+            "kmer / em-kmer: max diagonal span for candidate consistency. "
+            "60 buys ~1 point of contiguity over 20, so this is the one of "
+            "the two worth relaxing."
+        ),
+    )
+    p_cluster.add_argument(
+        "--seed-grouping",
+        choices=("components", "greedy"),
+        default="components",
+        help=(
+            "em-kmer: how verified edges become clusters. components is the "
+            "measured default; greedy (radius-1 set cover) cannot chain by "
+            "construction — largest cluster 60k vs 7.1M — at ~1.4x the "
+            "templates and 10 points of contiguity, so it is the fallback if "
+            "a hard no-chaining guarantee is wanted."
+        ),
+    )
+    p_cluster.add_argument(
+        "--max-seed-cluster-frac",
+        type=float,
+        default=None,
+        help=(
+            "em-kmer: fail seeding if one cluster holds more than this "
+            "fraction of the reads (and at least --min-chain-cluster-reads of "
+            "them). Default 0.25 — a quarter of a corpus is never one "
+            "transcript, and the chained-component failure it catches costs a "
+            "multi-hour round. 0 disables."
+        ),
+    )
+    p_cluster.add_argument(
+        "--min-chain-cluster-reads",
+        type=int,
+        default=None,
+        help=(
+            "em-kmer: absolute read floor below which the chaining guard says "
+            "nothing — a fraction needs a corpus to be a fraction of. "
+            "Default 10000."
+        ),
     )
     p_cluster.add_argument(
         "--kmer", type=int, default=15, help="de-novo: minimizer k-mer length."
@@ -1492,8 +1584,16 @@ def _build_transcriptome_parser(subs) -> None:
     p_cluster.add_argument(
         "--min-aa-length",
         type=int,
-        default=60,
-        help="de-novo: minimum predicted-protein length (AA). Default 60.",
+        default=None,
+        help=(
+            "minimum ORF length (AA). **em-orf**: the SEEDING key — a "
+            "template exists because a distinct ORF of at least this length "
+            "did — default 30 (60 cannot seed Prm1, 51 aa, the most abundant "
+            "transcript in mouse testis). **kmer**: the protein-annotation "
+            "floor on each consensus, default 60. **em-kmer**: not used — "
+            "that seeder predicts no ORF, and the EM's M-step has no minimum "
+            "protein length in either mode."
+        ),
     )
     p_cluster.add_argument(
         "--emit-cluster-detail",
@@ -2658,8 +2758,13 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     )
 
     mode = _normalise_cluster_mode(args.mode)
+    seeding = _em_seeding(args.mode) if mode == "em" else "orf"
+    problem = _reject_inapplicable(args, mode, seeding)
+    if problem is not None:
+        print(f"error: {problem}", file=sys.stderr)
+        return 2
     if mode == "em":
-        return _cmd_transcriptome_cluster_em(args)
+        return _cmd_transcriptome_cluster_em(args, seeding=seeding)
     if mode == "kmer":
         return _cmd_transcriptome_cluster_denovo(args)
 
@@ -3247,33 +3352,143 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     return 0
 
 
+def _overhang(value: str) -> int:
+    """`--max-{5,3}p-overhang`: an int, or 'inf' / 'none' / negative.
+
+    The verify gate is a plain `overhang > max` comparison, so "unbounded" is
+    a value no real overhang reaches. Parsed here rather than spelled as a
+    magic number at the call site, so `inf:100` round-trips into the manifest
+    legibly.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.verify import (
+        UNBOUNDED_OVERHANG,
+    )
+
+    if value.strip().lower() in {"inf", "none", "unbounded"}:
+        return UNBOUNDED_OVERHANG
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected an integer or 'inf', got {value!r}"
+        ) from None
+    return UNBOUNDED_OVERHANG if n < 0 else n
+
+
 #: Pre-rename --mode spellings, accepted so existing scripts and manifests
 #: keep working. They describe provenance where the canonical names describe
 #: the mechanism, which is what a user actually chooses between.
 _CLUSTER_MODE_ALIASES = {"genome-guided": "genome", "de-novo": "kmer"}
 
+#: The EM spellings. All three are the same MECHANISM — an EM loop — and
+#: differ only in how round 1 is seeded, so they collapse to one mode plus a
+#: seeding choice rather than becoming separate values of the `mode` column.
+#: That keeps `clusters.parquet` and the viz colour maps untouched, and makes
+#: the eventual `--mode em --seeding kmer` consolidation a pure CLI change.
+_EM_SEEDING = {"em": "orf", "em-orf": "orf", "em-kmer": "kmer"}
+
 
 def _normalise_cluster_mode(mode: str) -> str:
     """Canonical --mode, warning once on a deprecated spelling."""
+    if mode in _EM_SEEDING:
+        return "em"
     canonical = _CLUSTER_MODE_ALIASES.get(mode)
     if canonical is None:
         return mode
     print(
         f"note: --mode {mode} is deprecated; use --mode {canonical}. "
-        "The modes are named for the mechanism now (genome / kmer / em).",
+        "The modes are named for the mechanism now "
+        "(genome / kmer / em-orf / em-kmer).",
         file=sys.stderr,
     )
     return canonical
 
 
-def _cmd_transcriptome_cluster_em(args: argparse.Namespace) -> int:
-    """`transcriptome cluster --mode em` — the iterative EM clusterer."""
+def _em_seeding(mode: str) -> str:
+    """Which round-1 seeder `--mode` asked for: 'orf' or 'kmer'.
+
+    Bare `em` means `em-orf` — under-specified rather than wrong, so it is a
+    note rather than a deprecation. The default deliberately does NOT flip to
+    kmer seeding yet: it dominates ORF seeding on every measured round-1 axis,
+    but the multi-round comparison that would justify the flip is the reason
+    this exists, and flipping first destroys the baseline it is measured
+    against.
+    """
+    if mode == "em":
+        print(
+            "note: --mode em now names its seeder explicitly. This run uses "
+            "--mode em-orf (one template per distinct ORF); --mode em-kmer "
+            "seeds from read clusters instead.",
+            file=sys.stderr,
+        )
+    return _EM_SEEDING.get(mode, "orf")
+
+
+def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
+    """A flag that does nothing under this mode is an error, not a no-op.
+
+    Silently ignoring `--fold-identity` under kmer seeding means a swept
+    parameter had no effect and the run looks like evidence about it.
+    """
+    em = mode == "em"
+    banned: list[tuple[str, bool, str]] = [
+        # (flag, is-set, what to use instead)
+        (
+            "--identity",
+            args.identity is not None and em and seeding == "orf",
+            "--fold-identity (the ORF-level fold gate)",
+        ),
+        (
+            "--max-5p-overhang",
+            args.max_5p_overhang is not None and em and seeding == "orf",
+            "nothing — the ORF fold verifies with unbounded ends by design",
+        ),
+        (
+            "--max-3p-overhang",
+            args.max_3p_overhang is not None and em and seeding == "orf",
+            "nothing — the ORF fold verifies with unbounded ends by design",
+        ),
+        (
+            "--fold-identity",
+            args.fold_identity is not None and em and seeding == "kmer",
+            "--identity (the read-to-read gate)",
+        ),
+        (
+            "--min-aa-length",
+            args.min_aa_length is not None and em and seeding == "kmer",
+            "nothing — kmer seeding predicts no ORF and the M-step has no "
+            "minimum protein length, so this would have no effect",
+        ),
+        (
+            "--seed-grouping",
+            args.seed_grouping != "components" and not (em and seeding == "kmer"),
+            "nothing — only --mode em-kmer groups reads into seed clusters",
+        ),
+    ]
+    for flag, is_set, instead in banned:
+        if is_set:
+            return f"--mode {args.mode} does not use {flag}; use {instead}."
+    return None
+
+
+def _cmd_transcriptome_cluster_em(
+    args: argparse.Namespace, *, seeding: str = "orf"
+) -> int:
+    """`transcriptome cluster --mode em-{orf,kmer}` — the iterative EM clusterer."""
     from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
         MStepParams,
     )
     from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
         EmParams,
         run_em,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.seed_kmer import (
+        DEFAULT_MAX_CLUSTER_READ_FRAC,
+        DEFAULT_MIN_CHAIN_CLUSTER_READS,
+        DEFAULT_SEED_IDENTITY,
+        DEFAULT_SEED_MAX_3P,
+        DEFAULT_SEED_MAX_5P,
+        ChainedClusterError,
     )
 
     demux_dir = Path(args.demux_dir)
@@ -3301,6 +3516,7 @@ def _cmd_transcriptome_cluster_em(args: argparse.Namespace) -> int:
         else None
     )
     params = EmParams(
+        seeding=seeding,
         rounds=int(args.rounds),
         stop_frac_changed=float(args.stop_frac_changed),
         p_floor=float(args.p_floor),
@@ -3310,17 +3526,57 @@ def _cmd_transcriptome_cluster_em(args: argparse.Namespace) -> int:
         support_ratio=float(args.support_ratio),
         near_tie_z=float(args.near_tie_z),
         read_error_rate=float(args.read_error_rate),
-        min_aa_length=int(args.min_aa_length),
+        # The em-orf SEEDING key, and nothing else — kmer seeding does not
+        # read it and the M-step has no floor at all. 30, not the parser's
+        # 60: at 60 the seeder cannot make a template for Prm1 (51 aa), the
+        # most abundant transcript in the tissue this pipeline was built for.
+        min_aa_length=(30 if args.min_aa_length is None else int(args.min_aa_length)),
         seed_representative=str(args.seed_representative),
         min_seed_reads=int(args.min_seed_reads),
-        fold_identity=float(args.fold_identity),
+        # Per-mode defaults for the shared flags. The kmer gate's right
+        # answer (0.93 / inf:100) is not the --mode kmer gate's (0.98 /
+        # 30:30), so neither can be baked into the parser.
+        fold_identity=(
+            0.97 if args.fold_identity is None else float(args.fold_identity)
+        ),
+        seed_identity=(
+            DEFAULT_SEED_IDENTITY if args.identity is None else float(args.identity)
+        ),
+        seed_max_5p_overhang=(
+            DEFAULT_SEED_MAX_5P
+            if args.max_5p_overhang is None
+            else int(args.max_5p_overhang)
+        ),
+        seed_max_3p_overhang=(
+            DEFAULT_SEED_MAX_3P
+            if args.max_3p_overhang is None
+            else int(args.max_3p_overhang)
+        ),
+        seed_grouping=str(args.seed_grouping),
+        min_shared=int(args.min_shared),
+        diag_span_max=int(args.diag_span_max),
+        max_cluster_read_frac=(
+            DEFAULT_MAX_CLUSTER_READ_FRAC
+            if args.max_seed_cluster_frac is None
+            else float(args.max_seed_cluster_frac)
+        ),
+        min_chain_cluster_reads=(
+            DEFAULT_MIN_CHAIN_CLUSTER_READS
+            if args.min_chain_cluster_reads is None
+            else int(args.min_chain_cluster_reads)
+        ),
+        kmer=int(args.kmer),
+        window=int(args.window),
+        minimizers_per_seq=int(args.minimizers_per_seq),
         max_window_length=(
             int(args.max_window_length) if args.max_window_length > 0 else None
         ),
         threads=int(args.threads),
         mstep_workers=int(args.mstep_workers),
         mstep=MStepParams(
-            min_aa_length=int(args.min_aa_length),
+            # No `min_aa_length`: the M-step has no minimum protein length.
+            # Its job is to report what each node's consensus encodes, and a
+            # floor there is a claim about biology imposed on a measurement.
             # rho defaults ON for the EM path's candidate-column test: at
             # 1,525 reads a point binomial under a 1% null admits 1,924
             # columns where rho=0.01 admits none. The shared flag's None
@@ -3331,9 +3587,19 @@ def _cmd_transcriptome_cluster_em(args: argparse.Namespace) -> int:
             max_members_per_template=int(args.max_members_per_template),
         ),
     )
-    results = run_em(
-        demux_dir, output_dir, params=params, resume=args.resume, progress=log
-    )
+    try:
+        results = run_em(
+            demux_dir, output_dir, params=params, resume=args.resume, progress=log
+        )
+    except ChainedClusterError as exc:
+        # A seeding failure is a parameter problem the user can fix, not a
+        # crash: print the guidance the exception carries and exit 2.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        # The resume stamp mismatch, and the policy refusals, land here.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if not results:
         print("no clusters were produced", file=sys.stderr)
         return 1
@@ -3405,9 +3671,17 @@ def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
     paths = cluster_transcripts(
         demux_dir,
         output_dir=output_dir,
-        identity=float(args.identity),
-        max_5p_overhang=int(args.max_5p_overhang),
-        max_3p_overhang=int(args.max_3p_overhang),
+        identity=(0.98 if args.identity is None else float(args.identity)),
+        # The shared read-to-read gate: None means "this mode's default",
+        # which is 0.98 / 30:30 here and 0.93 / inf:100 under --mode em-kmer.
+        max_5p_overhang=(
+            30 if args.max_5p_overhang is None else int(args.max_5p_overhang)
+        ),
+        max_3p_overhang=(
+            30 if args.max_3p_overhang is None else int(args.max_3p_overhang)
+        ),
+        min_shared=int(args.min_shared),
+        diag_span_max=int(args.diag_span_max),
         kmer=int(args.kmer),
         window=int(args.window),
         minimizers_per_seq=(
@@ -3423,7 +3697,7 @@ def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
             int(args.max_window_length) if args.max_window_length > 0 else None
         ),
         predict_orfs=bool(args.predict_orfs),
-        min_aa_length=int(args.min_aa_length),
+        min_aa_length=(60 if args.min_aa_length is None else int(args.min_aa_length)),
         emit_cluster_detail=bool(args.emit_cluster_detail),
         detail_top_n=int(args.detail_top_n),
         emit_alignments=bool(args.emit_alignments),

@@ -19,9 +19,6 @@ Two things about this that are easy to get backwards:
 
 from __future__ import annotations
 
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
@@ -33,7 +30,18 @@ from constellation.sequencing.transcriptome.cluster.denovo.dereplicate import (
     _hash_sequences,
     dereplicate,
 )
-from constellation.sequencing.transcriptome.cluster.denovo.orf import best_sense_orf
+from constellation.sequencing.transcriptome.cluster.denovo.em.elect import (
+    REPRESENTATIVE_POLICIES,
+    SEED_QUALITY_FLOOR,
+    RepCandidates,
+    RepresentativePolicy,
+    best_quality_per_uniq,
+    elect_representatives,
+    resolve_policy,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.orf import (
+    predict_orfs_parallel,
+)
 
 
 # One row per distinct ORF nucleotide sequence.
@@ -68,183 +76,6 @@ READ_ORF_MAP_SCHEMA: pa.Schema = pa.schema(
 register_schema("SeedOrfTable", SEED_ORF_TABLE)
 
 
-# ── representative-read policies ──────────────────────────────────────
-
-
-@dataclass(frozen=True, slots=True)
-class RepCandidates:
-    """The distinct cDNAs carrying one exact ORF, as parallel arrays."""
-
-    template_length: np.ndarray  # int64
-    orf_start: np.ndarray  # int64 — 5' flank length
-    abundance: np.ndarray  # int64 — reads on each distinct cDNA
-    # Abundance-weighted median template_length of the row's own group,
-    # broadcast per row so a policy is a pure elementwise function.
-    median_length: np.ndarray  # int64
-    # Best `dorado_quality` among the reads sharing this exact cDNA, or -1
-    # where the demux dir predates the qs:f tag. Reads sharing an exact cDNA
-    # are byte-identical, so the best of them is the right representative and
-    # the choice costs the template sequence nothing.
-    quality: np.ndarray  # float64
-
-
-#: Default floor for the quality-aware policy. The knee of the measured
-#: decile curve: median error by `dorado_quality` decile runs 0.02321,
-#: 0.01152, 0.00796, 0.00607, then flattens — so everything above the third
-#: decile is nearly equivalent and there is nothing to buy above ~Q22.
-SEED_QUALITY_FLOOR = 22.0
-
-#: Ranks are int64 lexsort keys. Quality-failing rows are offset past every
-#: possible `-template_length` so they sort strictly after every clearing row.
-_RANK_FAIL_BASE = 1 << 40
-
-
-RepresentativePolicy = Callable[[RepCandidates], np.ndarray]
-
-
-def _rank_median_length(c: RepCandidates) -> np.ndarray:
-    return np.abs(c.template_length - c.median_length)
-
-
-def _rank_longest_template(c: RepCandidates) -> np.ndarray:
-    return -c.template_length
-
-
-def _rank_most_5p_flank(c: RepCandidates) -> np.ndarray:
-    return -c.orf_start
-
-
-def _rank_most_replicated(c: RepCandidates) -> np.ndarray:
-    return -c.abundance
-
-
-def _rank_longest_above_quality(c: RepCandidates) -> np.ndarray:
-    """Longest cDNA clearing the quality floor; else the highest-quality one.
-
-    The trade this appears to require does not exist. Over 8.3M reads,
-    Spearman(length, error) is **+0.015 to +0.049** in every length stratum —
-    length and accuracy are independent — so constraining one and optimising
-    the other is nearly free. As selectors of read accuracy they are not
-    comparable at all: the top decile by ``dorado_quality`` has median error
-    0.00114 (0.25x), by ``mean_quality`` 0.00166, and by ``length`` 0.00501,
-    which is **1.10x** — slightly worse than picking at random.
-
-    So quality is the floor and length is the objective, in that order,
-    because quality's benefit saturates (the decile curve flattens after the
-    third) while length's cost does not: a 500 nt seed for a 3 kb transcript
-    can never represent it, and since the covariance M-step made extent
-    representable a truncated seed emits a truncated ORF rather than being
-    silently extended.
-
-    Honest limit: even the top quality decile has *mean* error 0.0068 against
-    *median* 0.00114, so a floor makes bad seeds rarer, not absent. A
-    single-read seed is one draw from that tail.
-    """
-    clears = c.quality >= SEED_QUALITY_FLOOR
-    # Failing rows rank by quality descending, after every clearing row — so
-    # "fall back to the group's best read" needs no group-level branch.
-    fail = _RANK_FAIL_BASE - np.rint(c.quality * 1000.0).astype(np.int64)
-    return np.where(clears, -c.template_length, fail)
-
-
-REPRESENTATIVE_POLICIES: dict[str, RepresentativePolicy] = {
-    # Default. The longest cDNA is the most likely chimera / concatemer /
-    # internal-priming artifact, so electing it makes the template a
-    # low-support outlier; the central length is the robust estimate of the
-    # real extent. Safe ONLY because the consensus kernel can now extend past
-    # the frame's ends — before that a too-short template was an
-    # unrecoverable ceiling, which is why "longest" would have been the
-    # defensive choice. Expect this to be swept.
-    "median-length": _rank_median_length,
-    # The EM path's default. See :func:`_rank_longest_above_quality`.
-    "longest-above-quality": _rank_longest_above_quality,
-    "longest-template": _rank_longest_template,
-    # Maximises the 5' flank the M-step gets to extend an ORF into.
-    "most-5p-flank": _rank_most_5p_flank,
-    # Most-replicated exact cDNA; ties fall through to length.
-    "most-replicated": _rank_most_replicated,
-}
-
-
-# ── ORF prediction over the unique cDNAs (fork pool) ──────────────────
-
-# Set in the parent before the pool forks; workers read it copy-on-write.
-_SEED_SEQS: list[str] | None = None
-
-
-def _orf_chunk(lo: int, hi: int, min_aa_length: int) -> list[tuple]:
-    seqs = _SEED_SEQS
-    assert seqs is not None
-    out: list[tuple] = []
-    for i in range(lo, hi):
-        hit = best_sense_orf(seqs[i], min_aa_length=min_aa_length)
-        if hit is not None:
-            _prot, st, en = hit
-            out.append((i, st, en))
-    return out
-
-
-def _predict_orfs(
-    seqs: list[str], *, min_aa_length: int, threads: int, chunk: int = 20_000
-) -> list[tuple]:
-    """``[(uniq_index, orf_start, orf_end), …]`` for the cDNAs that have one."""
-    global _SEED_SEQS
-    n = len(seqs)
-    if n == 0:
-        return []
-    _SEED_SEQS = seqs
-    try:
-        if threads <= 1 or n < chunk:
-            return _orf_chunk(0, n, min_aa_length)
-        bounds = [(i, min(i + chunk, n)) for i in range(0, n, chunk)]
-        ctx = mp.get_context("fork")
-        out: list[tuple] = []
-        with ProcessPoolExecutor(max_workers=threads, mp_context=ctx) as ex:
-            futs = [ex.submit(_orf_chunk, lo, hi, min_aa_length) for lo, hi in bounds]
-            for fut in futs:
-                out.extend(fut.result())
-        return out
-    finally:
-        _SEED_SEQS = None
-
-
-# ── group statistics ──────────────────────────────────────────────────
-
-
-def _group_bounds(keys: np.ndarray) -> np.ndarray:
-    """Start offset of each run in a sorted key array, plus the end sentinel."""
-    if keys.shape[0] == 0:
-        return np.zeros(1, dtype=np.int64)
-    change = np.flatnonzero(keys[1:] != keys[:-1]) + 1
-    return np.concatenate(
-        [np.zeros(1, dtype=np.int64), change, np.array([keys.shape[0]], np.int64)]
-    )
-
-
-def _weighted_median_per_group(
-    starts: np.ndarray, values: np.ndarray, weights: np.ndarray
-) -> np.ndarray:
-    """Abundance-weighted median of ``values`` per group.
-
-    ``values`` must already be sorted ascending *within* each group. Uses a
-    global cumulative-weight scan plus one searchsorted per group boundary —
-    no per-group Python loop.
-    """
-    n_groups = starts.shape[0] - 1
-    if n_groups <= 0:
-        return np.empty(0, dtype=np.int64)
-    cw = np.cumsum(weights)
-    lo, hi = starts[:-1], starts[1:]
-    base = np.where(lo > 0, cw[np.maximum(lo - 1, 0)], 0.0)
-    total = cw[hi - 1] - base
-    target = base + total / 2.0
-    # side='left' lands on the first row whose cumulative weight reaches half
-    # the group's mass — the weighted median row.
-    idx = np.searchsorted(cw, target, side="left")
-    idx = np.clip(idx, lo, hi - 1)
-    return values[idx]
-
-
 def extract_seed_orfs(
     reads: pa.Table,
     *,
@@ -261,11 +92,9 @@ def extract_seed_orfs(
     lost — the E-step still assigns them to whichever template wins).
     """
     log = progress or (lambda _m: None)
-    policy: RepresentativePolicy = (
-        REPRESENTATIVE_POLICIES[representative]
-        if isinstance(representative, str)
-        else representative
-    )
+    # Resolve the policy BEFORE ORF prediction: an unknown name should fail in
+    # a millisecond, not after an hour of `best_sense_orf` over 9M cDNAs.
+    policy: RepresentativePolicy = resolve_policy(representative)
 
     # Predict once per distinct cDNA, not once per read: at ~1% error most
     # reads are distinct, but the collapse is free and never wrong.
@@ -274,11 +103,13 @@ def extract_seed_orfs(
     n_uniq = uniq.num_rows
     if n_uniq == 0:
         return SEED_ORF_TABLE.empty_table(), READ_ORF_MAP_SCHEMA.empty_table()
-    uniq_quality, uniq_best_read = _best_quality_per_uniq(reads, read_map, n_uniq)
+    uniq_quality, uniq_best_read = best_quality_per_uniq(reads, read_map, n_uniq)
 
     seqs = uniq.column("sequence").to_pylist()
     log(f"predicting sense ORFs (≥{min_aa_length} aa) over {n_uniq:,} unique cDNAs…")
-    hits = _predict_orfs(seqs, min_aa_length=min_aa_length, threads=threads)
+    hits = predict_orfs_parallel(
+        seqs, min_aa_length=min_aa_length, threads=threads
+    )
     if not hits:
         log("no read carries a qualifying ORF")
         return SEED_ORF_TABLE.empty_table(), READ_ORF_MAP_SCHEMA.empty_table()
@@ -301,45 +132,25 @@ def extract_seed_orfs(
     orf_hash = _hash_sequences(orf_nt).to_numpy(zero_copy_only=False)
     log(f"{len(hits):,} unique cDNAs carry an ORF; grouping by exact ORF…")
 
-    # Pass A: sort by (orf, template_length) for the group statistics.
-    order = np.lexsort((tmpl_len, orf_hash))
-    g_hash = orf_hash[order]
-    starts = _group_bounds(g_hash)
-    lo, hi = starts[:-1], starts[1:]
-    g_abund = abundance[order].astype(np.float64)
-    median_len = _weighted_median_per_group(starts, tmpl_len[order], g_abund)
-    cw = np.cumsum(g_abund)
-    base = np.where(lo > 0, cw[np.maximum(lo - 1, 0)], 0.0)
-    n_reads = (cw[hi - 1] - base).astype(np.int64)
-    n_templates = (hi - lo).astype(np.int32)
+    # Densify the hash into an orf_id. `np.unique` sorts, so the ids are in
+    # hash order — the same order the previous inline lexsort assigned them
+    # in, which is what keeps `orf_id` stable across this refactor.
+    _uniq_hash, orf_id = np.unique(orf_hash, return_inverse=True)
+    orf_id = orf_id.astype(np.int64)
+    n_groups = int(_uniq_hash.shape[0])
+    n_templates = np.bincount(orf_id, minlength=n_groups).astype(np.int32)
 
-    # Pass B: rank inside each group by the policy, then take the first row.
-    group_of_row = np.repeat(np.arange(starts.shape[0] - 1), hi - lo)
-    cand = RepCandidates(
-        template_length=tmpl_len[order],
-        orf_start=orf_start[order],
-        abundance=abundance[order].astype(np.int64),
-        median_length=median_len[group_of_row],
-        quality=uniq_quality[row[order]],
+    # The election itself is shared with the kmer seeder — same policy, same
+    # tie-breaks, different group key (ORF hash here, read cluster there).
+    rep_row, n_reads = elect_representatives(
+        orf_id,
+        n_groups,
+        template_length=tmpl_len,
+        abundance=abundance,
+        quality=uniq_quality[row],
+        orf_start=orf_start,
+        policy=policy,
     )
-    rank = np.asarray(policy(cand), dtype=np.int64)
-    # Deterministic tie-breaks: more reads, then longer cDNA, then row order.
-    pick_order = np.lexsort(
-        (
-            np.arange(rank.shape[0]),
-            -cand.template_length,
-            -cand.abundance,
-            rank,
-            group_of_row,
-        )
-    )
-    # pick_order is sorted by group first, so the first occurrence of each
-    # group id in it is that group's elected row.
-    n_groups = starts.shape[0] - 1
-    first_of_group = pick_order[
-        np.searchsorted(group_of_row[pick_order], np.arange(n_groups))
-    ]
-    rep_row = order[first_of_group]
 
     rep_uniq = row[rep_row]
     # Name the best-quality read of the elected cDNA rather than whichever
@@ -378,8 +189,8 @@ def extract_seed_orfs(
     # read → orf_id, via the uniq_id each read dereplicated to.
     uniq_to_orf = pa.table(
         {
-            "uniq_id": pa.array(row[order], type=pa.int64()),
-            "orf_id": pa.array(group_of_row.astype(np.int64)),
+            "uniq_id": pa.array(row, type=pa.int64()),
+            "orf_id": pa.array(orf_id),
         }
     )
     mapped = read_map.join(uniq_to_orf, keys="uniq_id", join_type="inner")
@@ -388,50 +199,6 @@ def extract_seed_orfs(
     )
     log(f"seeded {n_orfs:,} distinct ORFs over {read_orf.num_rows:,} reads")
     return seed, read_orf
-
-
-def _best_quality_per_uniq(
-    reads: pa.Table, read_map: pa.Table, n_uniq: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Per distinct cDNA: the best ``dorado_quality``, and which read has it.
-
-    Returns ``(quality, read_row)`` with ``-1`` where the column is absent or
-    all-null, which makes the quality-aware policy degrade to "highest of
-    nothing" — every row fails the floor, so the group falls through to its
-    existing abundance / length tie-breaks rather than erroring.
-    """
-    quality = np.full(n_uniq, -1.0, dtype=np.float64)
-    best_row = np.full(n_uniq, -1, dtype=np.int64)
-    if "dorado_quality" not in reads.schema.names or read_map.num_rows == 0:
-        return quality, best_row
-
-    q_col = reads.column("dorado_quality")
-    if q_col.null_count == reads.num_rows:
-        return quality, best_row
-
-    # read_map is (read_id, uniq_id, ...); recover each read's ROW in `reads`
-    # by position rather than by a string join — dereplicate preserves order,
-    # so `pc.index_in` over read_id is the only string touch and it happens
-    # once per read rather than once per hit.
-    row_of_read = pc.index_in(
-        read_map.column("read_id"), value_set=reads.column("read_id").combine_chunks()
-    ).to_numpy(zero_copy_only=False)
-    uid = read_map.column("uniq_id").to_numpy(zero_copy_only=False)
-    q = pc.fill_null(q_col, -1.0).to_numpy(zero_copy_only=False).astype(np.float64)
-    valid = ~np.isnan(row_of_read.astype(np.float64))
-    if not valid.any():
-        return quality, best_row
-    rows = row_of_read[valid].astype(np.int64)
-    uids = uid[valid].astype(np.int64)
-    qv = q[rows]
-
-    # Highest quality first, so the first occurrence of each uniq_id is its best.
-    order = np.lexsort((-qv, uids))
-    su, sq, sr = uids[order], qv[order], rows[order]
-    first = np.flatnonzero(np.concatenate([[True], su[1:] != su[:-1]]))
-    quality[su[first]] = sq[first]
-    best_row[su[first]] = sr[first]
-    return quality, best_row
 
 
 __all__ = [

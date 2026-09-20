@@ -133,7 +133,7 @@ def test_minority_insertion_resolves_under_an_explaining_error_model():
             members = [_spec(frame, majority, i) for i in range(75)]
             members += [_spec(frame, minority, 75 + i) for i in range(25)]
             nodes = refine_template(
-                frame, members, min_aa_length=60, min_node_reads=3,
+                frame, members, min_node_reads=3,
                 error_model=model,
             )
             counts[label] = sorted(n.n_reads for n in nodes)
@@ -153,7 +153,7 @@ def test_declared_variants_are_mapped_into_each_child_consensus():
     members = [_spec(short, short, i) for i in range(75)]
     members += [_spec(short, full, 75 + i) for i in range(25)]
     nodes = refine_template(
-        short, members, min_aa_length=60, min_node_reads=3,
+        short, members, min_node_reads=3,
         seed_orf=(40, 40 + len(body)),
     )
     assert len(nodes) == 2
@@ -183,7 +183,6 @@ def test_upstream_start_through_unsupported_sequence_is_gated():
     certified[:30] = False  # the first 10 codons are one read's sequence
     prot, st, en, _cert, truncated = gated_orf(
         consensus, certified, seed_orf_start=30, seed_orf_end=len(consensus),
-        min_aa_length=30,
     )
     assert truncated is True, "an uncertified upstream start must be refused"
     assert st == 30, "the ORF must restart at the supported ATG"
@@ -211,7 +210,7 @@ def test_each_child_reports_its_orf_in_its_own_coordinates():
     members = [_spec(frame, trimmed, i) for i in range(70)]
     members += [_spec(frame, frame, 70 + i) for i in range(30)]
     nodes = refine_template(
-        frame, members, min_aa_length=60, min_node_reads=3,
+        frame, members, min_node_reads=3,
         seed_orf=(60, 60 + len(body)),
     )
     assert len(nodes) >= 2, "the two length classes must separate"

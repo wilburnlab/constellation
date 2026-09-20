@@ -86,7 +86,7 @@ def test_orf_is_truncated_at_the_last_certified_column():
     certified = np.zeros(len(consensus), dtype=bool)
     certified[:180] = True  # support runs out mid-ORF
     got = gated_orf(
-        consensus, certified, seed_orf_start=0, seed_orf_end=90, min_aa_length=30
+        consensus, certified, seed_orf_start=0, seed_orf_end=90
     )
     assert got is not None
     prot, st, en, cert_end, truncated = got
@@ -102,7 +102,7 @@ def test_fully_certified_orf_is_not_truncated():
     consensus = "ATG" + "GCT" * 100 + "TAA"
     certified = np.ones(len(consensus), dtype=bool)
     prot, st, en, cert_end, truncated = gated_orf(
-        consensus, certified, seed_orf_start=0, seed_orf_end=90, min_aa_length=30
+        consensus, certified, seed_orf_start=0, seed_orf_end=90
     )
     assert truncated is False
     assert en == len(consensus)
@@ -119,7 +119,6 @@ def test_orf_within_the_seed_boundary_is_never_gated():
         certified,
         seed_orf_start=0,
         seed_orf_end=len(consensus),
-        min_aa_length=30,
     )
     assert truncated is False
     assert en == len(consensus)
@@ -143,14 +142,14 @@ def test_support_gate_end_to_end_on_a_one_read_flank():
     short = frame[: 33 + len(body)]  # members stop before the tail
 
     starved = refine_template(
-        frame, _specs(frame, [short] * 25 + [frame]), min_aa_length=60
+        frame, _specs(frame, [short] * 25 + [frame])
     )
     assert len(starved) == 1, "one read is not a node"
     assert starved[0].n_reads == 26, "…and it is not discarded either"
     assert starved[0].orf_is_truncated_by_support is True
 
     covered = refine_template(
-        frame, _specs(frame, [short] * 25 + [frame] * 25), min_aa_length=60
+        frame, _specs(frame, [short] * 25 + [frame] * 25)
     )
     assert len(covered) == 2, "25 reads of extra 3' extent is a clique"
     full = [n for n in covered if not n.orf_is_truncated_by_support and n.protein]
@@ -169,7 +168,7 @@ def test_a_node_is_trimmed_to_the_sequence_its_own_reads_support():
     tail = _flank(rng, 150)
     frame = _flank(rng, 30) + body + tail
     short = frame[: 33 + len(body)]
-    nodes = refine_template(frame, _specs(frame, [short] * 25), min_aa_length=60)
+    nodes = refine_template(frame, _specs(frame, [short] * 25))
     assert len(nodes) == 1
     # Within a few nt: edlib's HW placement can carry the alignment a base or
     # two past the planted cut, which is coverage, not fabrication.
@@ -207,11 +206,11 @@ def test_a_lone_readthrough_deletion_does_not_become_its_own_node():
 
     # The fixture really does encode a readthrough — otherwise the test proves
     # nothing about what was given up.
-    assert len(best_sense_orf(frame, min_aa_length=60)[0]) == 102
-    assert len(best_sense_orf(deleted, min_aa_length=60)[0]) == 164
+    assert len(best_sense_orf(frame)[0]) == 102
+    assert len(best_sense_orf(deleted)[0]) == 164
 
     nodes = refine_template(
-        frame, _specs(frame, [frame] * 100 + [deleted] * 25), min_aa_length=60
+        frame, _specs(frame, [frame] * 100 + [deleted] * 25)
     )
     assert len(nodes) == 1, "a lone indel has no covarying partner"
     assert nodes[0].n_reads == 125, "…and its reads are not lost, only unsplit"
@@ -233,7 +232,7 @@ def test_the_same_deletion_with_a_covarying_partner_does_become_a_node():
     linked = deleted[:at] + ("A" if deleted[at] != "A" else "C") + deleted[at + 1 :]
 
     nodes = refine_template(
-        frame, _specs(frame, [frame] * 100 + [linked] * 25), min_aa_length=60
+        frame, _specs(frame, [frame] * 100 + [linked] * 25)
     )
     assert len(nodes) == 2
     assert sorted(n.n_reads for n in nodes) == [25, 100]
@@ -257,13 +256,13 @@ def test_a_minority_with_no_edge_is_not_split_off():
         return "".join(out)
 
     linked = refine_template(
-        frame, _specs(frame, [frame] * 60 + [_alt(2)] * 20), min_aa_length=60
+        frame, _specs(frame, [frame] * 60 + [_alt(2)] * 20)
     )
     lone = refine_template(
-        frame, _specs(frame, [frame] * 60 + [_alt(1)] * 20), min_aa_length=60
+        frame, _specs(frame, [frame] * 60 + [_alt(1)] * 20)
     )
     tiny = refine_template(
-        frame, _specs(frame, [frame] * 60 + [_alt(2)] * 2), min_aa_length=60
+        frame, _specs(frame, [frame] * 60 + [_alt(2)] * 2)
     )
     assert len(linked) == 2, "two linked columns split"
     assert len(lone) == 1, "one column alone does not"
@@ -283,11 +282,11 @@ def test_a_minority_is_kept_by_evidence_not_by_fraction_of_the_template():
         alt[p] = "A" if frame[p] != "A" else "G"
     members = _specs(frame, [frame] * 500 + ["".join(alt)] * 20)
 
-    kept = refine_template(frame, members, min_aa_length=60)
+    kept = refine_template(frame, members)
     assert len(kept) == 2, "20 of 520 is 3.8% — above f_min, and linked"
     assert sorted(n.n_reads for n in kept) == [20, 500]
     # Raising f_min above the effect size is what discards it, explicitly.
-    coarse = refine_template(frame, members, min_aa_length=60, f_min=0.10)
+    coarse = refine_template(frame, members, f_min=0.10)
     assert len(coarse) == 1
     assert coarse[0].n_reads == 520, "unsplit reads keep their weight"
 
@@ -304,7 +303,6 @@ def test_an_alternative_start_gives_two_nodes_of_different_length():
     nodes = refine_template(
         frame,
         _specs(frame, [frame] * 40 + [short] * 40),
-        min_aa_length=60,
         seed_orf=(200, 200 + len(body)),
     )
     assert len(nodes) == 2
@@ -321,7 +319,7 @@ def test_a_degradation_ramp_gives_one_node():
     frame = _flank(rng, 200) + body + _flank(rng, 40)
     members = _specs(frame, [frame[5 * i :] for i in range(40)])
     nodes = refine_template(
-        frame, members, min_aa_length=60, seed_orf=(200, 200 + len(body))
+        frame, members, seed_orf=(200, 200 + len(body))
     )
     assert len(nodes) == 1
     assert nodes[0].n_reads == 40
@@ -341,7 +339,7 @@ def test_the_major_node_carries_the_refit_substrate_and_the_counters():
     rng = np.random.default_rng(41)
     body = "ATG" + "".join(rng.choice(_CODONS) for _ in range(100)) + "TAA"
     frame = _flank(rng, 40) + body + _flank(rng, 40)
-    nodes = refine_template(frame, _specs(frame, [frame] * 30), min_aa_length=60)
+    nodes = refine_template(frame, _specs(frame, [frame] * 30))
     st = nodes[0].stats
     assert "disagreements" in st
     assert st["n_reads"] == 30
@@ -364,7 +362,7 @@ def test_haplotype_read_counts_sum_to_the_template_total():
         alt[p] = "A" if frame[p] != "A" else "G"
     short = frame[60:]
     members = _specs(frame, [frame] * 40 + ["".join(alt)] * 15 + [short] * 20)
-    nodes = refine_template(frame, members, min_aa_length=60)
+    nodes = refine_template(frame, members)
     assert len(nodes) >= 2, "the fixture must actually split"
     assert sum(n.n_reads for n in nodes) == 75
 
@@ -382,7 +380,6 @@ def test_a_seed_orf_running_to_the_template_end_is_not_gated():
         nodes = refine_template(
             orf,
             _specs(orf, [orf] * n_reads),
-            min_aa_length=30,
             seed_orf=(0, len(orf)),
         )
         n = nodes[0]
@@ -434,8 +431,74 @@ def test_refined_orf_is_recallable_from_its_own_consensus():
     rng = np.random.default_rng(37)
     body = "ATG" + "".join(rng.choice(_CODONS) for _ in range(120)) + "TAA"
     frame = _flank(rng, 40) + body + _flank(rng, 40)
-    nodes = refine_template(frame, _specs(frame, [frame] * 30), min_aa_length=60)
+    nodes = refine_template(frame, _specs(frame, [frame] * 30))
     node = nodes[0]
-    again = best_sense_orf(node.consensus, min_aa_length=60)
+    again = best_sense_orf(node.consensus)
     assert again is not None
     assert again[0] == node.protein
+
+
+# ── the M-step has no minimum protein length ──────────────────────────
+
+
+def test_the_mstep_has_no_minimum_protein_length():
+    """It reports what the consensus encodes; a floor is the caller's business.
+
+    A length floor inside the M-step is a claim about biology imposed on a
+    measurement — and it leaked: the floor governed `gated_orf`, whose ORF
+    interval carries forward as the next round's certified `seed_orf`, so a
+    protein-annotation knob was steering how conservatively later rounds
+    gated their own ORFs.
+    """
+    import inspect
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        gated_orf,
+        refine_template,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+    )
+
+    assert "min_aa_length" not in inspect.signature(gated_orf).parameters
+    assert "min_aa_length" not in inspect.signature(refine_template).parameters
+    assert not hasattr(MStepParams(), "min_aa_length")
+
+
+def test_a_short_orf_is_reported_rather_than_discarded():
+    """Prm1 is 51 aa; the old default of 60 silently erased proteins like it."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        gated_orf,
+    )
+
+    # 10 aa: ATG + 9 codons + stop. Nothing about it is unreportable.
+    consensus = "ATG" + "GCT" * 9 + "TAA"
+    certified = np.ones(len(consensus), dtype=bool)
+    hit = gated_orf(consensus, certified, seed_orf_start=0, seed_orf_end=0)
+    assert hit is not None
+    assert len(hit[0]) == 10
+
+
+def test_removing_the_floor_is_monotone():
+    """It can only ADD short ORFs, never change a long one.
+
+    `best_sense_orf` keeps the longest ATG→stop per (frame, stop) and takes
+    the global max, and the longest for a given stop is its earliest in-frame
+    ATG — which does not depend on the floor. That is why every M-step test
+    above passes unchanged.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.orf import (
+        best_sense_orf,
+    )
+
+    rng = np.random.default_rng(31)
+    codons = ["GCT", "TGC", "GAT", "GAA", "TTT", "GGT", "CAT", "ATT", "AAA", "CTT"]
+    long_orf = "ATG" + "".join(rng.choice(codons) for _ in range(99)) + "TAA"
+    seq = "GGCACT" + long_orf + "CCTAGG"
+    assert best_sense_orf(seq, min_aa_length=1) == best_sense_orf(
+        seq, min_aa_length=60
+    )
+    # ...and where the floor found nothing, no floor finds the short one.
+    short = "GGCACT" + "ATG" + "GCT" * 4 + "TAA" + "CCTAGG"
+    assert best_sense_orf(short, min_aa_length=60) is None
+    assert best_sense_orf(short, min_aa_length=1) is not None

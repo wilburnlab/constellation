@@ -119,7 +119,6 @@ class MStepParams:
     this object and a typo is a TypeError rather than a silently ignored key.
     """
 
-    min_aa_length: int = 30
     min_node_reads: float = 2.0
     f_min: float = 0.02
     a_min: float = 3.0
@@ -138,7 +137,6 @@ class MStepParams:
 
     def kernel_kwargs(self) -> dict[str, Any]:
         return {
-            "min_aa_length": self.min_aa_length,
             "min_node_reads": self.min_node_reads,
             "f_min": self.f_min,
             "a_min": self.a_min,

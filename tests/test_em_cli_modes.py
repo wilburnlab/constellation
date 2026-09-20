@@ -130,3 +130,176 @@ def test_overdispersion_defaults_differ_by_mode():
     # An explicit value still wins for either mode.
     args = parser.parse_args([*base, "--overdispersion", "0.05"])
     assert args.overdispersion == 0.05
+
+
+# ── em seeding: one mechanism, two seeders ────────────────────────────
+
+
+def _args(*extra):
+    from constellation.cli.__main__ import _build_parser
+
+    return _build_parser().parse_args(
+        ["transcriptome", "cluster", "--demux-dir", "d", "--output-dir", "o", *extra]
+    )
+
+
+@pytest.mark.parametrize(
+    ("spelling", "seeding"),
+    [("em", "orf"), ("em-orf", "orf"), ("em-kmer", "kmer")],
+)
+def test_the_em_spellings_pick_a_seeder_and_keep_one_mode(spelling, seeding):
+    """All three are the EM loop; they differ only in how round 1 is seeded.
+
+    So the `mode` COLUMN stays "em" and the vocabulary does not widen —
+    nothing downstream (clusters.parquet, the viz colour maps) has to change
+    for a seeding choice.
+    """
+    from constellation.cli.__main__ import _em_seeding, _normalise_cluster_mode
+
+    assert _normalise_cluster_mode(spelling) == MODE_EM
+    assert _em_seeding(spelling) == seeding
+
+
+def test_bare_em_notes_that_it_means_orf_seeding(capsys):
+    """Under-specified rather than wrong, so a note and not a deprecation."""
+    from constellation.cli.__main__ import _em_seeding
+
+    assert _em_seeding("em") == "orf"
+    err = capsys.readouterr().err
+    assert "em-orf" in err and "em-kmer" in err
+
+
+def test_the_default_seeder_has_not_flipped():
+    """kmer seeding dominates ORF seeding on every measured round-1 axis.
+
+    Flipping the default before the multi-round comparison runs would destroy
+    the baseline that comparison is against, so `em` still means `em-orf`.
+    """
+    from constellation.cli.__main__ import _em_seeding
+
+    assert _em_seeding("em") == "orf"
+
+
+def test_the_new_spellings_parse():
+    for spelling in ("em-orf", "em-kmer"):
+        assert _args("--mode", spelling).mode == spelling
+
+
+# ── shared flags, per-mode defaults ───────────────────────────────────
+
+
+def test_the_read_to_read_gate_defaults_differ_by_mode():
+    """One flag, two right answers, so the parser holds neither.
+
+    `0.98 / 30:30` is the --mode kmer gate; under --mode em-kmer it costs the
+    same 14 h round-1 E-step as ORF seeding, and `0.93 / inf:100` is the 4.8x
+    cut. Baking either into the parser hands the other mode a setting known
+    to be wrong for it.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.seed_kmer import (
+        DEFAULT_SEED_IDENTITY,
+        DEFAULT_SEED_MAX_3P,
+    )
+
+    args = _args("--mode", "em-kmer")
+    assert args.identity is None
+    assert args.max_5p_overhang is None and args.max_3p_overhang is None
+    assert DEFAULT_SEED_IDENTITY == 0.93
+    assert DEFAULT_SEED_MAX_3P == 100
+
+
+def test_unbounded_overhangs_are_spellable():
+    from constellation.sequencing.transcriptome.cluster.denovo.verify import (
+        UNBOUNDED_OVERHANG,
+    )
+
+    for spelling in ("inf", "none", "-1"):
+        args = _args("--mode", "em-kmer", "--max-5p-overhang", spelling)
+        assert args.max_5p_overhang == UNBOUNDED_OVERHANG
+    assert _args("--mode", "em-kmer", "--max-5p-overhang", "30").max_5p_overhang == 30
+
+
+# ── inapplicable flags error rather than no-op ────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("mode", "flag", "value"),
+    [
+        ("em-orf", "--identity", "0.93"),
+        ("em-orf", "--max-3p-overhang", "100"),
+        ("em-kmer", "--fold-identity", "0.97"),
+        ("kmer", "--seed-grouping", "greedy"),
+    ],
+)
+def test_a_flag_this_mode_ignores_is_an_error(mode, flag, value):
+    """A swept parameter that silently did nothing makes the run look like
+    evidence about it. Same rule as predict-library's backend-only flags."""
+    from constellation.cli.__main__ import _em_seeding, _normalise_cluster_mode
+    from constellation.cli.__main__ import _reject_inapplicable
+
+    args = _args("--mode", mode, flag, value)
+    canonical = _normalise_cluster_mode(mode)
+    seeding = _em_seeding(mode) if canonical == "em" else "orf"
+    problem = _reject_inapplicable(args, canonical, seeding)
+    assert problem is not None and flag in problem
+
+
+def test_the_applicable_flags_are_not_rejected():
+    from constellation.cli.__main__ import _reject_inapplicable
+
+    args = _args("--mode", "em-kmer", "--identity", "0.90", "--max-3p-overhang", "100")
+    assert _reject_inapplicable(args, "em", "kmer") is None
+    args = _args("--mode", "em-orf", "--fold-identity", "0.97")
+    assert _reject_inapplicable(args, "em", "orf") is None
+    args = _args("--mode", "kmer", "--identity", "0.96")
+    assert _reject_inapplicable(args, "kmer", "orf") is None
+
+
+# ── --min-aa-length means one thing, in one place ─────────────────────
+
+
+def test_min_aa_length_is_the_em_orf_seeding_key_at_30():
+    """30, not the parser's old 60.
+
+    At 60 the seeder cannot make a template for Prm1 (51 aa), the most
+    abundant transcript in the tissue this pipeline was built for — so the
+    effective default had been silently excluding real short-ORF seeds
+    (ledger #6).
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        EmParams,
+    )
+
+    assert _args("--mode", "em-orf").min_aa_length is None
+    assert EmParams().min_aa_length == 30
+
+
+def test_min_aa_length_still_defaults_to_60_for_plain_kmer_mode():
+    """A shared flag with two right answers holds neither in the parser."""
+    from constellation.cli.__main__ import _cmd_transcriptome_cluster_denovo  # noqa: F401
+
+    assert _args("--mode", "kmer").min_aa_length is None
+
+
+def test_min_aa_length_is_refused_under_em_kmer():
+    """Nothing reads it there: that seeder predicts no ORF, and the M-step
+    has no minimum protein length in either mode."""
+    from constellation.cli.__main__ import _reject_inapplicable
+
+    args = _args("--mode", "em-kmer", "--min-aa-length", "30")
+    problem = _reject_inapplicable(args, "em", "kmer")
+    assert problem is not None and "--min-aa-length" in problem
+    # ...and it is fine where it means something.
+    assert _reject_inapplicable(_args("--mode", "em-orf", "--min-aa-length", "30"),
+                                "em", "orf") is None
+    assert _reject_inapplicable(_args("--mode", "kmer", "--min-aa-length", "60"),
+                                "kmer", "orf") is None
+
+
+def test_the_mstep_never_receives_a_length_floor():
+    """The CLI cannot hand the M-step a floor, because it has no field for one."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+    )
+
+    assert "min_aa_length" not in MStepParams.__dataclass_fields__

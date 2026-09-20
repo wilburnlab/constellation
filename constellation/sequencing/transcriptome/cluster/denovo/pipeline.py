@@ -504,6 +504,8 @@ def assemble_clusters(
     kmer: int = 15,
     window: int = 10,
     minimizers_per_seq: int | None = 50,
+    min_shared: int = 2,
+    diag_span_max: int = 20,
     min_cluster_size: int = 1,
     min_abundance: int = 1,
     predict_orfs: bool = True,
@@ -565,7 +567,9 @@ def assemble_clusters(
         max_per_seq=minimizers_per_seq,
     )
     log(f"{index.mini_hash.shape[0]:,} minimizers — generating candidate pairs…")
-    candidates = generate_candidates(index, abundance)
+    candidates = generate_candidates(
+        index, abundance, min_shared=min_shared, diag_span_max=diag_span_max
+    )
     del index  # free the minimizer index (~tens of GB) before verify
     log(
         f"{candidates.num_rows:,} candidate pairs — verifying (edlib, identity≥{identity})…"
@@ -1167,6 +1171,8 @@ def cluster_transcripts(
     kmer: int = 15,
     window: int = 10,
     minimizers_per_seq: int | None = 50,
+    min_shared: int = 2,
+    diag_span_max: int = 20,
     min_cluster_size: int = 1,
     min_abundance: int = 1,
     max_cluster_rounds: int = 1,
@@ -1273,6 +1279,8 @@ def cluster_transcripts(
         kmer=kmer,
         window=window,
         minimizers_per_seq=minimizers_per_seq,
+        min_shared=min_shared,
+        diag_span_max=diag_span_max,
         min_cluster_size=min_cluster_size,
         min_abundance=min_abundance,
         predict_orfs=predict_orfs,
@@ -1303,6 +1311,8 @@ def cluster_transcripts(
             "minimizers_per_seq": (
                 int(minimizers_per_seq) if minimizers_per_seq is not None else None
             ),
+            "min_shared": int(min_shared),
+            "diag_span_max": int(diag_span_max),
             "min_cluster_size": int(min_cluster_size),
             "min_abundance": int(min_abundance),
             "max_cluster_rounds": int(max_cluster_rounds),

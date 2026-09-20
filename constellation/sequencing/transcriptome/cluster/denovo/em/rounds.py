@@ -25,10 +25,11 @@ import json
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 
@@ -60,6 +61,14 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import 
 from constellation.sequencing.transcriptome.cluster.denovo.em.seed import (
     extract_seed_orfs,
 )
+from constellation.sequencing.transcriptome.cluster.denovo.em.seed_kmer import (
+    DEFAULT_MAX_CLUSTER_READ_FRAC,
+    DEFAULT_MIN_CHAIN_CLUSTER_READS,
+    DEFAULT_SEED_IDENTITY,
+    DEFAULT_SEED_MAX_3P,
+    DEFAULT_SEED_MAX_5P,
+    seed_by_kmer_clustering,
+)
 from constellation.sequencing.transcriptome.cluster.denovo.em.templates import (
     TEMPLATE_TABLE,
     TEMPLATES_ARROW,
@@ -88,14 +97,36 @@ class EmParams:
     near_tie_z: float = 2.0
     read_error_rate: float = 0.01
     # Seeding (Part C).
+    #: Which round-1 seeder builds the templates. "orf" is the original —
+    #: one template per distinct sense ORF, folded. "kmer" clusters the READS
+    #: with the `--mode kmer` kernels and elects one per cluster; measured on
+    #: 9.39M reads it is 4.4x fewer templates and a 2.9 h round-1 E-step
+    #: against 13.95 h, at the same gene agreement. Fields below are split by
+    #: which seeder reads them; the sketch ones are shared because the two
+    #: seeders never both run.
+    seeding: Literal["orf", "kmer"] = "orf"
+    #: The ORF seeder's floor, and separately the M-step's protein-annotation
+    #: floor (`MStepParams.min_aa_length`). Under kmer seeding only the second
+    #: meaning applies — that seeder predicts no ORF at all.
     min_aa_length: int = 30
     seed_representative: str = "longest-above-quality"
     min_seed_reads: int = 1
+    # orf seeding only — the ORF-level fold.
     fold_identity: float = 0.97
     max_len_delta: int = 9
+    # Shared sketch (fold's ORFs / kmer's reads).
     kmer: int = 15
     window: int = 10
     minimizers_per_seq: int = 50
+    # kmer seeding only — the read-level gate and grouping.
+    seed_identity: float = DEFAULT_SEED_IDENTITY
+    seed_max_5p_overhang: int = DEFAULT_SEED_MAX_5P
+    seed_max_3p_overhang: int = DEFAULT_SEED_MAX_3P
+    seed_grouping: str = "components"
+    min_shared: int = 2
+    diag_span_max: int = 20
+    max_cluster_read_frac: float = DEFAULT_MAX_CLUSTER_READ_FRAC
+    min_chain_cluster_reads: int = DEFAULT_MIN_CHAIN_CLUSTER_READS
     # Corpus.
     max_window_length: int | None = 15_000
     threads: int = 8
@@ -153,6 +184,14 @@ def run_em(
 
 def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> list[RoundResult]:
     rounds_dir = output_dir / "rounds"
+    # Before anything is reused. The stamp describes what produced ROUND 1's
+    # templates, and every later round descends from those — so a resume that
+    # restarts at round 4 is just as committed to the original seeder as one
+    # that reuses `seed/` directly, and checking only in the latter path left
+    # the former silently running one seeder's templates under the other's
+    # manifest.
+    if resume:
+        _check_seed_stamp(output_dir / "seed", params, log)
     start, templates_table, prev_assignments, history = _resume_point(
         rounds_dir, resume, log
     )
@@ -162,7 +201,11 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
             corpus, reads, output_dir, params, resume, log
         )
         if templates_table.num_rows == 0:
-            log("no read carries a qualifying ORF; nothing to cluster")
+            log(
+                "no read carries a qualifying ORF; nothing to cluster"
+                if params.seeding == "orf"
+                else "no cluster cleared --min-seed-reads; nothing to cluster"
+            )
             return []
 
     results: list[RoundResult] = []
@@ -344,12 +387,93 @@ def _warn_on_saturation(stats: dict, params: EmParams, log) -> None:
         )
 
 
+def _seed_stamp(params: EmParams) -> dict:
+    """Only the fields the seeder actually reads, per seeding mode.
+
+    Stamping every field would refuse a resume over a changed `--rounds`,
+    which the seed stage neither reads nor is invalidated by.
+    """
+    shared = ("seeding", "seed_representative", "min_seed_reads")
+    per_mode = (
+        # `min_aa_length` is the ORF seeder's KEY — change it and the seeds
+        # are different ORFs. The kmer seeder never reads it (its templates
+        # carry no ORF), so it must not invalidate a kmer resume.
+        (
+            "min_aa_length",
+            "fold_identity",
+            "max_len_delta",
+            "kmer",
+            "window",
+            "minimizers_per_seq",
+        )
+        if params.seeding == "orf"
+        else (
+            "kmer",
+            "window",
+            "minimizers_per_seq",
+            "seed_identity",
+            "seed_max_5p_overhang",
+            "seed_max_3p_overhang",
+            "seed_grouping",
+            "min_shared",
+            "diag_span_max",
+        )
+    )
+    return {k: getattr(params, k) for k in (*shared, *per_mode)}
+
+
+def _check_seed_stamp(seed_dir: Path, params: EmParams, log) -> None:
+    """Refuse a resume whose seeding parameters differ from what is on disk."""
+    if not (seed_dir / _SUCCESS).exists():
+        return  # nothing was seeded here yet; there is nothing to disagree with
+    path = seed_dir / "params.json"
+    if not path.exists():
+        # Pre-stamp output dir. It can only have come from the ORF seeder,
+        # since that is the only one that existed, so resuming a kmer run
+        # against it would reuse ORF templates under a kmer manifest.
+        if params.seeding != "orf":
+            raise ValueError(
+                f"{seed_dir} predates seed-parameter stamping, so it can only "
+                f"hold ORF-seeded templates, but this run asks for "
+                f"seeding={params.seeding!r}. Choose another --output-dir."
+            )
+        return
+    want = _seed_stamp(params)
+    have = json.loads(path.read_text())
+    if have.get("seeding") != want["seeding"]:
+        # Report only this. The stamp is per-mode, so every other "difference"
+        # is really a field the other seeder does not have, and listing them
+        # buries the one fact that matters.
+        raise ValueError(
+            f"--resume would reuse the seed stage in {seed_dir}, but it was "
+            f"produced by the {have.get('seeding')!r} seeder and this run asks "
+            f"for {want['seeding']!r}. Round 1's templates would be one "
+            f"seeder's while the manifest recorded the other's. Choose another "
+            f"--output-dir."
+        )
+    changed = [k for k, v in want.items() if have.get(k) != v]
+    if changed:
+        detail = ", ".join(f"{k}: {have.get(k)!r} -> {want[k]!r}" for k in changed)
+        raise ValueError(
+            f"--resume would reuse the seed stage in {seed_dir}, but its "
+            f"parameters differ ({detail}). Re-seeding silently would leave "
+            f"round 1's templates disagreeing with the manifest. Choose "
+            f"another --output-dir, or restore the original values."
+        )
+    log(f"--resume: reusing the {have.get('seeding', 'orf')} seed stage")
+
+
 def _round_one_templates(corpus, reads, output_dir, params, resume, log):
-    """Seed + fold. Round 1's templates are fold-group representatives."""
+    """Round 1's templates, from whichever seeder ``params.seeding`` names."""
     seed_dir = output_dir / "seed"
     seed_dir.mkdir(parents=True, exist_ok=True)
+    # The stamp is already checked in `_loop`, for every resume rather than
+    # only the ones that land here.
     if resume and (seed_dir / _SUCCESS).exists():
         return pq.read_table(seed_dir / "templates.parquet")
+
+    if params.seeding == "kmer":
+        return _seed_kmer(reads, seed_dir, params, log)
 
     log(f"seeding ORFs over {reads.n_reads:,} reads…")
     seed, _read_orf = extract_seed_orfs(
@@ -383,9 +507,83 @@ def _round_one_templates(corpus, reads, output_dir, params, resume, log):
     )
     pq.write_table(templates, seed_dir / "templates.parquet")
     pq.write_table(seed, seed_dir / "seed_orfs.parquet")
-    (seed_dir / _SUCCESS).write_bytes(b"")
+    # The same shape the kmer seeder reports, so `section_seeding` renders
+    # either without branching and the two are comparable at a glance.
+    n_reads = np.asarray(
+        templates.column("orf_replication").to_numpy(zero_copy_only=False)
+    )
+    _write_seed_stage(
+        seed_dir,
+        params,
+        {
+            "seeding": "orf",
+            "n_reads": int(reads.n_reads),
+            "n_orfs": int(seed.num_rows),
+            "n_clusters": int(templates.num_rows),
+            "n_clusters_ge2": int((n_reads >= 2).sum()),
+            "template_mb": round(
+                float(
+                    pc.sum(pc.utf8_length(templates.column("sequence"))).as_py() or 0
+                )
+                / 1e6,
+                3,
+            ),
+            "reads_per_template": round(
+                float(n_reads.sum() / max(templates.num_rows, 1)), 3
+            ),
+            "singleton_frac": round(
+                float((n_reads == 1).mean()) if n_reads.size else 0.0, 6
+            ),
+            "largest_cluster_reads": int(n_reads.max()) if n_reads.size else 0,
+            "largest_cluster_read_frac": round(
+                float(n_reads.max() / reads.n_reads) if n_reads.size else 0.0, 6
+            ),
+        },
+    )
     log(f"round 1: {templates.num_rows:,} templates")
     return templates
+
+
+def _seed_kmer(reads, seed_dir, params, log):
+    """Round 1's templates from read-level kmer clustering."""
+    log(f"kmer-clustering {reads.n_reads:,} reads for seeding…")
+    result = seed_by_kmer_clustering(
+        reads.table,
+        identity=params.seed_identity,
+        max_5p_overhang=params.seed_max_5p_overhang,
+        max_3p_overhang=params.seed_max_3p_overhang,
+        kmer=params.kmer,
+        window=params.window,
+        minimizers_per_seq=params.minimizers_per_seq,
+        min_shared=params.min_shared,
+        diag_span_max=params.diag_span_max,
+        grouping=params.seed_grouping,
+        min_seed_reads=params.min_seed_reads,
+        representative=params.seed_representative,
+        max_cluster_read_frac=params.max_cluster_read_frac,
+        min_chain_cluster_reads=params.min_chain_cluster_reads,
+        threads=params.threads,
+        progress=log,
+    )
+    pq.write_table(result.templates, seed_dir / "templates.parquet")
+    pq.write_table(result.read_cluster, seed_dir / "read_cluster.parquet")
+    _write_seed_stage(seed_dir, params, result.stats)
+    log(f"round 1: {result.templates.num_rows:,} templates")
+    return result.templates
+
+
+def _write_seed_stage(seed_dir: Path, params: EmParams, stats: dict) -> None:
+    """Persist the seed stage's stats + parameter stamp, then mark it done.
+
+    `_SUCCESS` last, and only after both writes: it means "everything this
+    stage owes the run is on disk", and the stamp is one of those things —
+    without it a resume cannot tell which seeder produced these templates.
+    """
+    (seed_dir / "stats.json").write_text(json.dumps(stats, indent=2, default=str))
+    (seed_dir / "params.json").write_text(
+        json.dumps(_seed_stamp(params), indent=2, default=str)
+    )
+    (seed_dir / _SUCCESS).write_bytes(b"")
 
 
 def _run_mstep(r, rd, store, corpus, assignments, params, log):
