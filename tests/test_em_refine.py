@@ -487,7 +487,7 @@ def test_a_capped_template_still_reports_all_of_its_reads():
             corpus_path=str(d / "reads.arrow"),
             templates_path=str(d / "templates.arrow"),
             round_index=1,
-            params=MStepParams(max_members_per_template=cap, min_aa_length=10),
+            params=MStepParams(max_members_per_template=cap),
         )
         mem, nodes = out["node_membership"], out["nodes"]
         assert mem.num_rows == n, f"cap={cap} exported {mem.num_rows} of {n} reads"

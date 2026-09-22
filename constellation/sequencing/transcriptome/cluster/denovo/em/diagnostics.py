@@ -116,6 +116,96 @@ def section_convergence(em_dir: Path) -> ReportSection:
     return ReportSection(title="Convergence", body=body, flags=flags)
 
 
+def section_seeding(em_dir: Path) -> ReportSection:
+    """What round 1 was given to work with, from whichever seeder ran.
+
+    Two numbers here are not ordinary instrumentation. **Template count and
+    bases** are what round 1's E-step cost is linear in — at 9.39M reads the
+    ORF seeder's 3.78M templates / 6.12 Gb cost 13.95 h against the kmer
+    seeder's 874k / 1.31 Gb at 2.89 h. And **the largest cluster's read
+    fraction** is the chaining guard (ledger #50): connected components with
+    unbounded ends put 76% of that corpus into ONE component at purity 0.154,
+    a failure invisible below full scale, where the same setting peaks at 3%.
+    """
+    path = Path(em_dir) / "seed" / "stats.json"
+    if not path.exists():
+        return ReportSection(
+            title="Seeding",
+            body="_no seed/stats.json — this run predates seed-stage stats_",
+        )
+    s = json.loads(path.read_text())
+    seeding = s.get("seeding", "orf")
+    flags: list[str] = []
+
+    rows = [("seeder", seeding), ("reads", f"{s.get('n_reads', 0):,}")]
+    if "n_uniq" in s:
+        rows.append(("unique reads", f"{s['n_uniq']:,}"))
+    if seeding == "kmer":
+        rows += [
+            ("identity", f"{s.get('identity', '—')}"),
+            (
+                "ends (5':3')",
+                f"{_ov_label(s.get('max_5p_overhang'))}:"
+                f"{_ov_label(s.get('max_3p_overhang'))}",
+            ),
+            ("grouping", str(s.get("grouping", "—"))),
+            ("minimizers", f"{s.get('n_minimizers', 0):,}"),
+            ("candidate pairs", f"{s.get('n_candidates', 0):,}"),
+            ("verified edges", f"{s.get('n_edges', 0):,}"),
+        ]
+    for key, label in (
+        ("n_clusters", "templates"),
+        ("n_orfs", "distinct ORFs"),
+        ("n_clusters_ge2", "templates with ≥2 reads"),
+        ("n_dropped_below_min_seed_reads", "dropped by --min-seed-reads"),
+        ("template_mb", "template bases (Mb)"),
+        ("reads_per_template", "reads per template"),
+        ("singleton_frac", "singleton fraction"),
+        ("seed_quality_median", "elected-read quality (median)"),
+        ("seed_quality_ge_floor_frac", "elected reads clearing Q22"),
+    ):
+        if key in s:
+            v = s[key]
+            rows.append((label, f"{v:,}" if isinstance(v, int) else f"{v}"))
+
+    largest = s.get("largest_cluster_reads")
+    frac = s.get("largest_cluster_read_frac")
+    if largest is not None and frac is not None:
+        rows.append(("largest cluster", f"{largest:,} reads ({frac:.2%})"))
+        # 1% of a real corpus is already two orders of magnitude past any
+        # transcript's depth; on real data at the shipped gate it is 0.83%.
+        if frac > 0.01 and largest >= 10_000:
+            flags.append(
+                f"the largest seed cluster holds {largest:,} reads "
+                f"({frac:.1%} of the corpus) — far past any transcript's "
+                "depth, so this is very likely connected-components chaining; "
+                "check --max-3p-overhang / --identity"
+            )
+
+    lines = ["| | |", "|---|---:|"]
+    lines += [f"| {k} | {v} |" for k, v in rows]
+    body = "\n".join(lines) + (
+        "\n\nRound 1's E-step cost is close to linear in template bases "
+        "(measured: 1,306 Mb → 221 s, 2,455 Mb → 462 s at 9.4M reads), so "
+        "this table is also the cost estimate for the round that follows it."
+    )
+    if seeding == "kmer":
+        body += (
+            "\n\nNo ORF column here, deliberately: kmer seeding partitions on "
+            "read similarity and its templates carry no ORF. Proteins are "
+            "predicted per NODE by the M-step, under `--min-aa-length`; see "
+            "the reference-drift section."
+        )
+    return ReportSection(title="Seeding", body=body, flags=flags)
+
+
+def _ov_label(v) -> str:
+    """Render an overhang bound as the sweep writes them (`inf`, `100`)."""
+    if v is None:
+        return "—"
+    return "inf" if int(v) >= (1 << 30) else str(int(v))
+
+
 def section_candidate_pool(em_dir: Path) -> ReportSection:
     """Saturation of the ``-N`` candidate cap. FLAGS-level, by design."""
     rows, flags = [], []
@@ -291,6 +381,7 @@ def build_em_report(em_dir: Path) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     sections = []
     for fn in (
+        section_seeding,
         section_convergence,
         section_candidate_pool,
         section_assignment_rule,
@@ -309,7 +400,7 @@ def build_em_report(em_dir: Path) -> Path:
     return render_report(
         title="EM clustering diagnostics",
         intro=(
-            "`transcriptome cluster --mode em` — seed → fold → "
+            "`transcriptome cluster --mode em-{orf,kmer}` — seed → "
             "[E-step → M-step → refine] × N. Every metric below is a pure "
             "function over artifacts the loop already wrote, so this can be "
             "regenerated against a finished run without re-running anything."
@@ -326,4 +417,5 @@ __all__ = [
     "section_cluster_sizes",
     "section_convergence",
     "section_reference_drift",
+    "section_seeding",
 ]

@@ -18,6 +18,8 @@ Semantics, matching the shipped de novo pipeline:
 from __future__ import annotations
 
 import functools
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 
 from constellation.core.sequence.nucleic import STANDARD, CodonTable, translate
 
@@ -83,9 +85,62 @@ def best_sense_orf(seq: str, *, min_aa_length: int = 30):
     return prot, int(st), int(en)
 
 
+# ── ORF prediction over many sequences (fork pool) ────────────────────
+
+# Set in the parent before the pool forks; workers read it copy-on-write.
+_POOL_SEQS: list[str] | None = None
+
+
+def _orf_chunk(lo: int, hi: int, min_aa_length: int) -> list[tuple]:
+    seqs = _POOL_SEQS
+    assert seqs is not None
+    out: list[tuple] = []
+    for i in range(lo, hi):
+        hit = best_sense_orf(seqs[i], min_aa_length=min_aa_length)
+        if hit is not None:
+            _prot, st, en = hit
+            out.append((i, st, en))
+    return out
+
+
+def predict_orfs_parallel(
+    seqs: list[str], *, min_aa_length: int, threads: int = 1, chunk: int = 20_000
+) -> list[tuple]:
+    """``[(index, orf_start, orf_end), …]`` for the sequences that have one.
+
+    Sequences without a qualifying ORF are simply absent — the caller decides
+    what that means (the ORF seeder drops the read; the kmer seeder keeps the
+    template with a null ORF interval, because that cluster earned its
+    template on read support, not on carrying a protein).
+
+    Shared by both seeders, which call it at very different cardinalities:
+    once per unique cDNA (~9.15M at PromethION scale) for ORF seeding, once
+    per *elected template* (~0.9M) for kmer seeding.
+    """
+    global _POOL_SEQS
+    n = len(seqs)
+    if n == 0:
+        return []
+    _POOL_SEQS = seqs
+    try:
+        if threads <= 1 or n < chunk:
+            return _orf_chunk(0, n, min_aa_length)
+        bounds = [(i, min(i + chunk, n)) for i in range(0, n, chunk)]
+        ctx = mp.get_context("fork")
+        out: list[tuple] = []
+        with ProcessPoolExecutor(max_workers=threads, mp_context=ctx) as ex:
+            futs = [ex.submit(_orf_chunk, lo, hi, min_aa_length) for lo, hi in bounds]
+            for fut in futs:
+                out.extend(fut.result())
+        return out
+    finally:
+        _POOL_SEQS = None
+
+
 __all__ = [
     "ORF_CODON_TABLE",
     "best_sense_orf",
     "is_low_complexity",
     "orf_regex",
+    "predict_orfs_parallel",
 ]

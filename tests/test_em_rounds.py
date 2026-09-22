@@ -575,3 +575,114 @@ def test_stale_optional_exports_do_not_survive_a_later_run(tmp_path):
     )
     for name in ("proteins.fasta", "cluster.fa", "feature_quant.parquet"):
         assert not (out / name).exists(), f"{name} outlived the results it described"
+
+
+# ── seeding mode (`--mode em-orf` vs `--mode em-kmer`) ────────────────
+
+
+def _kmer_params(**kw):
+    """The kmer seeder, with the chaining guard scaled to a fixture.
+
+    The guard's thresholds are fractions of a 9.4M-read corpus; a two-
+    transcript fixture is 50% per cluster by construction, so the absolute
+    floor is what keeps it quiet here — and that floor is exactly what these
+    tests must not depend on.
+    """
+    base = dict(
+        seeding="kmer",
+        seed_identity=0.90,
+        min_chain_cluster_reads=0,
+        max_cluster_read_frac=0.0,
+    )
+    base.update(kw)
+    return _params(**base)
+
+
+def test_the_kmer_seeder_produces_far_fewer_round_one_templates(corpus_dir, tmp_path):
+    """The whole point: one template per read CLUSTER, not per distinct ORF.
+
+    At 9.39M reads that is 3,778,760 ORF templates against 850,450 kmer ones,
+    and a round-1 E-step of 13.95 h against 2.89 h. The fixture reproduces the
+    direction, not the ratio.
+    """
+    orf = run_em(corpus_dir, tmp_path / "orf", params=_params(rounds=1))
+    kmer = run_em(corpus_dir, tmp_path / "kmer", params=_kmer_params(rounds=1))
+
+    assert kmer[0].n_templates < orf[0].n_templates
+    # Two transcripts in, two templates out — the seeder has already done what
+    # the ORF path needs a whole E-step to approach.
+    assert kmer[0].n_templates == 2
+
+
+def test_the_kmer_seed_stage_is_addressable_and_stamped(corpus_dir, tmp_path):
+    out = tmp_path / "em"
+    run_em(corpus_dir, out, params=_kmer_params(rounds=1))
+
+    seed = out / "seed"
+    assert (seed / "_SUCCESS").exists()
+    assert (seed / "templates.parquet").exists()
+    assert (seed / "read_cluster.parquet").exists()
+    stamp = json.loads((seed / "params.json").read_text())
+    assert stamp["seeding"] == "kmer"
+    assert stamp["seed_identity"] == 0.90
+    stats = json.loads((seed / "stats.json").read_text())
+    assert stats["n_clusters"] == 2
+    # Every read accounted for, so the diagnostics can price the size filter.
+    assert stats["n_reads"] == stats["n_reads_in_templates"]
+
+
+def test_the_seeding_mode_reaches_the_manifest(corpus_dir, tmp_path):
+    out = tmp_path / "em"
+    run_em(corpus_dir, out, params=_kmer_params(rounds=1))
+    manifest = json.loads((out / "manifest.json").read_text())
+    params = manifest["parameters"]
+    assert params["seeding"] == "kmer"
+    assert params["seed_max_3p_overhang"] == 100
+    # The mode COLUMN stays "em": the mechanism is the EM loop, the seeder is
+    # a parameter of it, and widening the column would touch every consumer.
+    assert params["mode"] == "em"
+
+
+def test_a_resume_across_a_changed_seeder_is_refused(corpus_dir, tmp_path):
+    """Reusing seed/templates.parquet under a different seeder is silent-wrong.
+
+    The templates would be one seeder's and the manifest would record the
+    other's, with nothing on disk marking the disagreement.
+    """
+    out = tmp_path / "em"
+    run_em(corpus_dir, out, params=_params(rounds=1))
+
+    with pytest.raises(ValueError, match="produced by the 'orf' seeder"):
+        run_em(corpus_dir, out, params=_kmer_params(rounds=1), resume=True)
+
+
+def test_a_resume_across_a_changed_seed_gate_is_refused(corpus_dir, tmp_path):
+    out = tmp_path / "em"
+    run_em(corpus_dir, out, params=_kmer_params(rounds=1))
+
+    with pytest.raises(ValueError, match="seed_identity"):
+        run_em(
+            corpus_dir,
+            out,
+            params=_kmer_params(rounds=1, seed_identity=0.96),
+            resume=True,
+        )
+
+
+def test_an_unchanged_seed_stage_resumes(corpus_dir, tmp_path):
+    out = tmp_path / "em"
+    first = run_em(corpus_dir, out, params=_kmer_params(rounds=1))
+    again = run_em(corpus_dir, out, params=_kmer_params(rounds=1), resume=True)
+    assert again[0].n_templates == first[0].n_templates
+
+
+def test_a_pre_stamp_seed_dir_cannot_be_resumed_as_kmer(corpus_dir, tmp_path):
+    """Output dirs from before this change hold ORF templates, unlabelled."""
+    out = tmp_path / "em"
+    run_em(corpus_dir, out, params=_params(rounds=1))
+    (out / "seed" / "params.json").unlink()
+
+    # The ORF path resumes it, because that is the only thing it can be.
+    assert run_em(corpus_dir, out, params=_params(rounds=1), resume=True)
+    with pytest.raises(ValueError, match="predates seed-parameter stamping"):
+        run_em(corpus_dir, out, params=_kmer_params(rounds=1), resume=True)

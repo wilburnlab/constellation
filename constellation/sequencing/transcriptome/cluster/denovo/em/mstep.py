@@ -131,13 +131,24 @@ def certified_columns(
     return (base_cov >= min_depth) & (agreement >= min_agreement)
 
 
+#: `best_sense_orf` needs *a* bound — its regex is "ATG, N codons, stop" —
+#: so 1 is how "no floor" is spelled: ATG plus a stop is an ORF and nothing
+#: shorter exists. **The M-step has no minimum protein length**, deliberately.
+#: Its job is to report the protein each node's consensus encodes, and a
+#: length floor there is a claim about biology imposed on a measurement; the
+#: caller filters if it wants to. Removing it is also *monotone* — the
+#: longest ATG→stop per (frame, stop) does not depend on the floor, so
+#: lowering it can only ADD short ORFs where there previously were none, and
+#: never changes the answer for a consensus that already had a long one.
+_NO_LENGTH_FLOOR = 1
+
+
 def gated_orf(
     consensus: str,
     certified: np.ndarray,
     *,
     seed_orf_start: int,
     seed_orf_end: int,
-    min_aa_length: int = 30,
 ):
     """Predict the ORF, refusing sequence that reads do not support.
 
@@ -149,8 +160,10 @@ def gated_orf(
     the seed's stop codon makes it look like an ordinary N-terminal
     extension. Returns ``(protein, start, end, certified_end, truncated)``
     or ``None``.
+
+    There is **no minimum protein length** — see :data:`_NO_LENGTH_FLOOR`.
     """
-    hit = best_sense_orf(consensus, min_aa_length=min_aa_length)
+    hit = best_sense_orf(consensus, min_aa_length=_NO_LENGTH_FLOOR)
     if hit is None:
         return None
     prot, st, en = hit
@@ -164,7 +177,9 @@ def gated_orf(
         lo, hi = max(0, st), min(seed_orf_start, certified.size)
         if hi > lo and not certified[lo:hi].all():
             resume = lo + int(np.flatnonzero(~certified[lo:hi])[-1]) + 1
-            again = best_sense_orf(consensus[resume:], min_aa_length=min_aa_length)
+            again = best_sense_orf(
+                consensus[resume:], min_aa_length=_NO_LENGTH_FLOOR
+            )
             if again is None:
                 return None
             prot, st, en = again[0], again[1] + resume, again[2] + resume
@@ -185,7 +200,9 @@ def gated_orf(
     # Report the ORF as ending at the last certified column, on a codon
     # boundary. It no longer ends in a stop — that is the point of the flag.
     trunc_end = st + 3 * ((limit - st) // 3)
-    if trunc_end - st < min_aa_length * 3:
+    if trunc_end - st < 3:
+        # Not a floor — a truncation that leaves no whole codon leaves no
+        # protein, so there is nothing to report.
         return None
     from constellation.core.sequence.nucleic import translate
 
@@ -365,7 +382,6 @@ def refine_template(
     max_cooccurrence_budget: float = 2e8,
     max_nodes: int = 8,
     min_node_reads: float = 2.0,
-    min_aa_length: int = 30,
     support_min_depth: float = 3.0,
     support_min_agreement: float = 0.6,
     fold_insertions: bool = True,
@@ -530,7 +546,6 @@ def refine_template(
             seed_orf_end=int(
                 np.clip(_consensus_offset(cres, seed_col_end) - lo, 0, span)
             ),
-            min_aa_length=min_aa_length,
         )
         if orf is not None:
             (

@@ -47,6 +47,13 @@ ACCEPTED_ALIGNMENT_SCHEMA = pa.schema(
     ]
 )
 
+#: "No limit" for `max_5p` / `max_3p`. The gate is a plain `overhang > max`
+#: comparison, so a value no real overhang can reach IS unbounded — no kernel
+#: branch, and the number round-trips legibly through a manifest. Named rather
+#: than spelled inline because `--mode em-kmer` runs 5'-unbounded by default
+#: and "1073741824" in a parameters dict explains nothing.
+UNBOUNDED_OVERHANG = 1 << 30
+
 # Set in the parent before the pool forks; workers read it copy-on-write.
 _VERIFY_SEQS: list[str] | None = None
 
@@ -207,4 +214,4 @@ def verify_candidates(
     )
 
 
-__all__ = ["verify_candidates", "ACCEPTED_ALIGNMENT_SCHEMA"]
+__all__ = ["UNBOUNDED_OVERHANG", "verify_candidates", "ACCEPTED_ALIGNMENT_SCHEMA"]
