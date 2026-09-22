@@ -850,7 +850,7 @@ def _build_transcriptome_parser(subs) -> None:
     p_dem.add_argument(
         "--min-aa-length",
         type=int,
-        default=None,
+        default=60,
         help=(
             "minimum protein length (in amino acids) for ORF prediction "
             "(default 60 — matches NanoporeAnalysis _fixed1 baseline)"
@@ -3567,7 +3567,14 @@ def _cmd_transcriptome_cluster_em(
         ),
         kmer=int(args.kmer),
         window=int(args.window),
-        minimizers_per_seq=int(args.minimizers_per_seq),
+        # 0 means uncapped, and the kernel spells that None — passing 0
+        # through literally caps every sketch at zero minimizers, so the
+        # graph has no edges and every read becomes its own template.
+        minimizers_per_seq=(
+            int(args.minimizers_per_seq)
+            if int(args.minimizers_per_seq) > 0
+            else None
+        ),
         max_window_length=(
             int(args.max_window_length) if args.max_window_length > 0 else None
         ),

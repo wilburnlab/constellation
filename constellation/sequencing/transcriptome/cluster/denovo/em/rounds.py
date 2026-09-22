@@ -117,7 +117,8 @@ class EmParams:
     # Shared sketch (fold's ORFs / kmer's reads).
     kmer: int = 15
     window: int = 10
-    minimizers_per_seq: int = 50
+    #: ``None`` is uncapped. 0 is NOT — it caps every sketch at zero.
+    minimizers_per_seq: int | None = 50
     # kmer seeding only — the read-level gate and grouping.
     seed_identity: float = DEFAULT_SEED_IDENTITY
     seed_max_5p_overhang: int = DEFAULT_SEED_MAX_5P
@@ -428,15 +429,7 @@ def _check_seed_stamp(seed_dir: Path, params: EmParams, log) -> None:
         return  # nothing was seeded here yet; there is nothing to disagree with
     path = seed_dir / "params.json"
     if not path.exists():
-        # Pre-stamp output dir. It can only have come from the ORF seeder,
-        # since that is the only one that existed, so resuming a kmer run
-        # against it would reuse ORF templates under a kmer manifest.
-        if params.seeding != "orf":
-            raise ValueError(
-                f"{seed_dir} predates seed-parameter stamping, so it can only "
-                f"hold ORF-seeded templates, but this run asks for "
-                f"seeding={params.seeding!r}. Choose another --output-dir."
-            )
+        _check_legacy_seed(seed_dir, params)
         return
     want = _seed_stamp(params)
     have = json.loads(path.read_text())
@@ -461,6 +454,67 @@ def _check_seed_stamp(seed_dir: Path, params: EmParams, log) -> None:
             f"another --output-dir, or restore the original values."
         )
     log(f"--resume: reusing the {have.get('seeding', 'orf')} seed stage")
+
+
+def _check_legacy_seed(seed_dir: Path, params: EmParams) -> None:
+    """An unstamped ``seed/`` predates stamping. Verify it another way, or refuse.
+
+    It can only have come from the ORF seeder, since that is the only one that
+    existed — so a kmer run against it would reuse ORF templates under a kmer
+    manifest. But "it is ORF-seeded" is not enough on its own: this release
+    changed the effective ``--min-aa-length`` for ORF seeding from 60 to 30,
+    so an ordinary legacy resume would keep the 60-aa seeds and write a
+    manifest claiming 30. That is the same defect the stamp exists to prevent,
+    one release earlier.
+
+    A *completed* legacy run recorded its parameters in ``manifest.json``, so
+    that is checkable. An interrupted one recorded nothing, and reusing what
+    cannot be verified is exactly how an artifact from an earlier attempt gets
+    read back as if it belonged to this one — so that case is refused.
+    """
+    if params.seeding != "orf":
+        raise ValueError(
+            f"{seed_dir} predates seed-parameter stamping, so it can only "
+            f"hold ORF-seeded templates, but this run asks for "
+            f"seeding={params.seeding!r}. Choose another --output-dir."
+        )
+
+    manifest = seed_dir.parent / "manifest.json"
+    if not manifest.exists():
+        raise ValueError(
+            f"{seed_dir} predates seed-parameter stamping and its run never "
+            f"completed, so there is no record of what produced these "
+            f"templates — and this release changed the ORF seeder's effective "
+            f"--min-aa-length from 60 to 30, so reusing them would put "
+            f"60-aa-seeded templates under a manifest claiming 30. Start a "
+            f"fresh --output-dir, or delete {seed_dir} to re-seed."
+        )
+    try:
+        recorded = json.loads(manifest.read_text()).get("parameters", {})
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"{seed_dir} predates seed-parameter stamping and its "
+            f"manifest.json could not be read ({exc}), so what produced these "
+            f"templates cannot be verified. Start a fresh --output-dir."
+        ) from None
+
+    want = _seed_stamp(params)
+    # `seeding` postdates those manifests; everything else is comparable.
+    changed = [
+        k
+        for k, v in want.items()
+        if k != "seeding" and k in recorded and recorded[k] != v
+    ]
+    if changed:
+        detail = ", ".join(f"{k}: {recorded[k]!r} -> {want[k]!r}" for k in changed)
+        raise ValueError(
+            f"--resume would reuse the pre-stamp seed stage in {seed_dir}, but "
+            f"the manifest of the run that produced it records different "
+            f"parameters ({detail}). Note this release changed the ORF "
+            f"seeder's effective --min-aa-length from 60 to 30, so an "
+            f"unchanged command line can still land here. Pass the original "
+            f"values, or choose another --output-dir."
+        )
 
 
 def _round_one_templates(corpus, reads, output_dir, params, resume, log):

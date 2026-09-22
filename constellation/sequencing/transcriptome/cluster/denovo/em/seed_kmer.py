@@ -330,13 +330,13 @@ def seed_by_kmer_clustering(
     stats["n_clusters"] = n_templates
     stats["n_clusters_ge2"] = int((cluster_reads >= 2).sum())
     stats["n_dropped_below_min_seed_reads"] = int(n_clusters_raw - n_templates)
+    # Built before the early exit, not after it: the contract is one row per
+    # INPUT read, and "every cluster was filtered out" is exactly the case
+    # where knowing which reads were dropped matters most.
+    read_cluster = _read_cluster_map(read_map, cluster_of, new_id)
     if n_templates == 0:
         log("no cluster cleared --min-seed-reads")
-        return KmerSeedResult(
-            TEMPLATE_TABLE.empty_table(),
-            READ_CLUSTER_MAP_SCHEMA.empty_table(),
-            stats,
-        )
+        return KmerSeedResult(TEMPLATE_TABLE.empty_table(), read_cluster, stats)
 
     del seqs
     take = pa.array(elected_uniq)
@@ -379,22 +379,6 @@ def seed_by_kmer_clustering(
         schema=TEMPLATE_TABLE,
     )
 
-    read_cluster = pa.table(
-        {
-            "read_id": read_map.column("read_id"),
-            "cluster_id": pa.array(
-                new_id[
-                    cluster_of[
-                        read_map.column("uniq_id")
-                        .to_numpy(zero_copy_only=False)
-                        .astype(np.int64)
-                    ]
-                ]
-            ),
-            "sample_id": read_map.column("sample_id"),
-        },
-        schema=READ_CLUSTER_MAP_SCHEMA,
-    )
     stats["n_reads_in_templates"] = int(cluster_reads.sum())
     stats["singleton_frac"] = round(
         float((cluster_reads == 1).mean()) if n_templates else 0.0, 6
@@ -414,6 +398,21 @@ def seed_by_kmer_clustering(
         f"({stats['template_mb']:.0f} Mb) over {n_reads:,} reads"
     )
     return KmerSeedResult(templates, read_cluster, stats)
+
+
+def _read_cluster_map(
+    read_map: pa.Table, cluster_of: np.ndarray, new_id: np.ndarray
+) -> pa.Table:
+    """One row per input read; ``cluster_id`` is -1 where the cluster was cut."""
+    uid = read_map.column("uniq_id").to_numpy(zero_copy_only=False).astype(np.int64)
+    return pa.table(
+        {
+            "read_id": read_map.column("read_id"),
+            "cluster_id": pa.array(new_id[cluster_of[uid]]),
+            "sample_id": read_map.column("sample_id"),
+        },
+        schema=READ_CLUSTER_MAP_SCHEMA,
+    )
 
 
 def _ov(v: int) -> str:
