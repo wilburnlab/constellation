@@ -229,6 +229,11 @@ def test_unbounded_overhangs_are_spellable():
         ("em-orf", "--max-3p-overhang", "100"),
         ("em-kmer", "--fold-identity", "0.97"),
         ("kmer", "--seed-grouping", "greedy"),
+        # The shortlist knobs exist only on the two-pass E-step.
+        ("em-kmer", "--estep-shortlist-k", "8"),
+        ("em-orf", "--estep-shortlist-frac", "0.7"),
+        ("em-kmer", "--estep-align-workers", "4"),
+        ("kmer", "--estep-aligner", "edlib"),
     ],
 )
 def test_a_flag_this_mode_ignores_is_an_error(mode, flag, value):
@@ -303,3 +308,22 @@ def test_the_mstep_never_receives_a_length_floor():
     )
 
     assert "min_aa_length" not in MStepParams.__dataclass_fields__
+
+
+def test_the_two_pass_estep_is_opt_in_and_its_knobs_apply_under_it():
+    from constellation.cli.__main__ import _reject_inapplicable
+
+    assert _args("--mode", "em-kmer").estep_aligner == "minimap2"
+    args = _args(
+        "--mode",
+        "em-kmer",
+        "--estep-aligner",
+        "edlib",
+        "--estep-shortlist-k",
+        "8",
+        "--estep-shortlist-frac",
+        "0.7",
+        "--estep-align-workers",
+        "4",
+    )
+    assert _reject_inapplicable(args, "em", "kmer") is None

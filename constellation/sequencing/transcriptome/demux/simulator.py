@@ -182,9 +182,10 @@ def _polyA_with_artifact(
     Artifact catalogue:
 
       ``clean``         exactly ``length`` A's
-      ``substitution``  one base substituted in the middle (anchors at
-                        the ends remain "AAAA" so the polyA scorer's
-                        edge_distance=1 merge still finds the run)
+      ``substitution``  one base substituted in the middle; the polyA
+                        scorer's gap-bridging merge calls it as one
+                        run (before the ``_merge_runs`` fix it did not —
+                        only the 3' half was called)
       ``expanded``      ``length + 8`` A's (homopolymer over-call sim)
       ``deleted``       ``length - 6`` A's (homopolymer under-call sim;
                         clamped to 0 minimum)

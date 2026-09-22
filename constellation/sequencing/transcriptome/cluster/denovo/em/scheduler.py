@@ -249,10 +249,48 @@ def shortlist_for_likelihood(
     return admitted & (masked >= np.repeat(best, sizes) - width)
 
 
+def shortlist_by_chain(
+    chain_score: np.ndarray,
+    group_ptr: np.ndarray,
+    *,
+    k: int,
+    frac: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The two-pass E-step's shortlist: which hits get base-aligned at all.
+
+    Keeps a hit iff its chaining score is ≥ ``frac`` × its read's best **and**
+    it is among the read's top ``k`` by chaining score (ties broken by hit
+    order, which is deterministic). Returns ``(keep, chain_rank, n_eligible)``:
+    the mask, each hit's 0-based rank within its read by chaining score, and
+    per read how many hits cleared the ``frac`` cut before ``k`` was applied —
+    so ``n_eligible > k`` is exactly "the shortlist cut something".
+
+    Unlike the single-pass pool this is **not** guaranteed to contain every
+    template within ``p_floor``: the chaining score is a proxy for identity,
+    not the thing itself. ``k`` and ``frac`` are unmeasured operating points,
+    which is why the truncation is reported per read.
+    """
+    n_groups = group_ptr.size - 1
+    s1 = np.asarray(chain_score, dtype=np.float64)
+    if n_groups <= 0 or s1.size == 0:
+        z = np.zeros(s1.size, dtype=bool)
+        return z, np.zeros(s1.size, dtype=np.int64), np.zeros(max(n_groups, 0), np.int64)
+    grp, sizes = _group_of_hit(group_ptr)
+    best = np.maximum.reduceat(s1, group_ptr[:-1])
+    eligible = s1 >= float(frac) * np.repeat(best, sizes)
+    order = np.lexsort((np.arange(s1.size), -s1, grp))
+    rank = np.empty(s1.size, dtype=np.int64)
+    rank[order] = np.arange(s1.size) - np.repeat(group_ptr[:-1], sizes)
+    keep = eligible & (rank < int(k))
+    n_eligible = np.add.reduceat(eligible.astype(np.int64), group_ptr[:-1])
+    return keep, rank, n_eligible
+
+
 __all__ = [
     "UNASSIGNED",
     "admit_candidates",
     "rank_likelihood",
     "rank_round1",
+    "shortlist_by_chain",
     "shortlist_for_likelihood",
 ]

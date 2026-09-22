@@ -100,6 +100,9 @@ class Scorer(Protocol):
         min_length: int,
         max_length: int | None,
         edge_distance: int,
+        residual_max_gap: int = 0,
+        residual_min_run: int = 1,
+        residual_max_walk: int = 0,
     ) -> PolyAVerdict: ...
 
     def find_5p_adapter(
@@ -144,30 +147,117 @@ def _merge_runs(
     *,
     edge_distance: int,
 ) -> list[tuple[int, int]]:
-    """Merge overlapping / adjacent ``(start, end_inclusive)`` runs.
+    """Merge ``(start, end_inclusive)`` runs separated by at most
+    ``edge_distance`` non-anchor bases.
 
-    Two runs are merged when the second's end is within
-    ``current_end + 1 + edge_distance`` of the running end — i.e. they
-    overlap or are separated by at most ``edge_distance`` mismatches.
-    Mirrors NanoporeAnalysis's ``merge_overlapped_indices`` byte-for-
-    byte (same iteration order, same boundary check) so polyA detection
-    parity is preserved.
+    Two runs are merged when the second's **start** lies within
+    ``current_end + 1 + edge_distance`` — i.e. they overlap, abut, or
+    are separated by a gap of ≤ ``edge_distance`` bases.
+
+    **Deliberate divergence from NanoporeAnalysis.** Upstream's
+    ``merge_overlapped_indices`` compares the next run's *end* against
+    that bound. With 4-mer ``AAAA`` anchors a run's end is its start
+    + 3, so the effective gap tolerance is ``edge_distance − 3``: at
+    the shipped ``edge_distance = 1`` a tail interrupted by a single
+    miscall (``AAAAAAAA G AAAA…``) was never bridged, only the last
+    fragment was called, and the 5' fragment plus the interrupting
+    base stayed in the transcript window — a random-length terminal
+    A-run that the de novo M-step then split templates on.
 
     Input is expected sorted ascending by start (caller responsibility).
     """
+    return [(s, e) for s, e, _ in _merge_runs_with_fragments(
+        pairs, edge_distance=edge_distance
+    )]
+
+
+def _merge_runs_with_fragments(
+    pairs: list[tuple[int, int]],
+    *,
+    edge_distance: int,
+) -> list[tuple[int, int, int]]:
+    """:func:`_merge_runs`, also reporting each merged run's **3'-most
+    uninterrupted fragment** length (a stretch covered by overlapping /
+    abutting anchors).
+
+    ``PolyASlot.max_length`` is judged on that fragment. It is the one
+    the upstream merge would have called in isolation, so a tail made
+    of a single fragment is capped exactly as before, while a long tail
+    bridged across a miscall (43 A + TG + 30 A, seen on the parity
+    fixture) is not rejected merely because it is now called whole.
+    """
     if not pairs:
         return []
-    out: list[tuple[int, int]] = []
-    cur_start, cur_end = pairs[0]
+    # Pass 1: contiguous fragments (anchors that overlap or abut).
+    frags: list[tuple[int, int]] = []
+    fs, fe = pairs[0]
     for start, end in pairs[1:]:
-        if end <= cur_end + 1 + edge_distance:
-            # overlap or near-adjacency → merge
-            cur_end = max(cur_end, end)
+        if start <= fe + 1:
+            fe = max(fe, end)
         else:
-            out.append((cur_start, cur_end))
-            cur_start, cur_end = start, end
-    out.append((cur_start, cur_end))
+            frags.append((fs, fe))
+            fs, fe = start, end
+    frags.append((fs, fe))
+    # Pass 2: bridge gaps of ≤ edge_distance bases between fragments.
+    out: list[tuple[int, int, int]] = []
+    cs, ce = frags[0]
+    last = ce - cs + 1
+    for start, end in frags[1:]:
+        if start <= ce + 1 + edge_distance:
+            ce = max(ce, end)
+            last = end - start + 1
+        else:
+            out.append((cs, ce, last))
+            cs, ce = start, end
+            last = end - start + 1
+    out.append((cs, ce, last))
     return out
+
+
+def _walk_residual_polyA(
+    sequence: str,
+    start: int,
+    *,
+    max_gap: int,
+    min_run: int,
+    max_walk: int,
+) -> int:
+    """Move a poly-A start 5'-ward through an A-rich remnant.
+
+    Repeatedly: absorb consecutive ``A``; then absorb up to ``max_gap``
+    non-A bases **only if** at least ``min_run`` consecutive ``A`` lie
+    immediately 5' of them. Never moves more than ``max_walk`` bases.
+    Returns the new start.
+
+    This catches tails fragmented by more miscalls than the merge
+    bridges. It is a canonicalisation rather than a measurement: a
+    genomic A-run abutting the cleavage site cannot be told apart from
+    a tail remnant, and every read of the transcript is trimmed the
+    same way — which is the property clustering depends on.
+    """
+    lo = max(0, start - max_walk)
+    pos = start
+    while True:
+        i = pos - 1
+        while i >= lo and sequence[i] == "A":
+            i -= 1
+        pos = i + 1
+        # Try to bridge a short non-A gap into a further A-run.
+        j = i
+        gap = 0
+        while j >= lo and sequence[j] != "A" and gap < max_gap:
+            j -= 1
+            gap += 1
+        if gap == 0 or j < lo or sequence[j] != "A":
+            return pos
+        run = 0
+        k = j
+        while k >= lo and sequence[k] == "A":
+            run += 1
+            k -= 1
+        if run < min_run:
+            return pos
+        pos = j + 1  # the loop head absorbs the run
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -182,8 +272,9 @@ class HardThresholdScorer:
     filters edlib's ``-1`` no-match sentinels before picking the
     winning barcode).
 
-    PolyA: exact 'AAAA' anchor + adjacent-run merge with edge-distance
-    tolerance + length filter + last-run wins. SSP / primer3 / barcode:
+    PolyA: exact 'AAAA' anchor + gap-bridging run merge (a deliberate
+    divergence from upstream — see :func:`_merge_runs`) + length filter
+    + last-run wins + optional 5' residual-remnant walk. SSP / primer3 / barcode:
     edlib HW with hard ``max_distance``; barcode picks the smallest
     surviving edit distance over the panel (filtering ``-1`` no-match
     sentinels first).
@@ -199,7 +290,23 @@ class HardThresholdScorer:
         min_length: int,
         max_length: int | None,
         edge_distance: int,
+        residual_max_gap: int = 0,
+        residual_min_run: int = 1,
+        residual_max_walk: int = 0,
     ) -> PolyAVerdict:
+        """Locate the poly-A tail.
+
+        Anchors are exact ``AAAA`` hits; runs separated by ≤
+        ``edge_distance`` non-A bases merge (see :func:`_merge_runs`
+        for the deliberate divergence from NanoporeAnalysis). A merged
+        run is valid when its full span is ≥ ``min_length`` and its
+        3'-most *uninterrupted* fragment is ≤ ``max_length`` (the
+        fragment upstream would have judged; see
+        :func:`_merge_runs_with_fragments`). The last valid run wins. When
+        ``residual_max_walk > 0`` its start is then walked 5'-ward
+        through any A-rich remnant (:func:`_walk_residual_polyA`), so
+        the transcript window cut at ``start`` carries no tail.
+        """
         if not sequence:
             return PolyAVerdict(found=False)
         all_matches = locate_substring(
@@ -207,22 +314,32 @@ class HardThresholdScorer:
         )
         if not all_matches:
             return PolyAVerdict(found=False)
-        # Convert half-open `end` back to inclusive end for parity with
-        # NanoporeAnalysis's merge bookkeeping.
+        # Convert half-open `end` back to inclusive end for the merge
+        # bookkeeping.
         pairs = sorted(
             ((m.start, m.end - 1) for m in all_matches),
             key=lambda p: (p[0], p[1]),
         )
-        merged = _merge_runs(pairs, edge_distance=edge_distance)
+        merged = _merge_runs_with_fragments(pairs, edge_distance=edge_distance)
         cap = max_length if max_length is not None else (1 << 30)
         valid = [
-            (s, e) for s, e in merged if min_length <= (e - s + 1) <= cap
+            (s, e)
+            for s, e, last_frag in merged
+            if (e - s + 1) >= min_length and last_frag <= cap
         ]
         if not valid:
             return PolyAVerdict(found=False)
         # NanoporeAnalysis takes the LAST (largest-start) run.
         valid.sort(key=lambda p: p[0], reverse=True)
         s, e = valid[0]
+        if residual_max_walk > 0:
+            s = _walk_residual_polyA(
+                sequence,
+                s,
+                max_gap=residual_max_gap,
+                min_run=residual_min_run,
+                max_walk=residual_max_walk,
+            )
         return PolyAVerdict(
             found=True,
             start=s,
@@ -368,6 +485,9 @@ class ProbabilisticScorer:
         min_length: int,  # noqa: ARG002
         max_length: int | None,  # noqa: ARG002
         edge_distance: int,  # noqa: ARG002
+        residual_max_gap: int = 0,  # noqa: ARG002
+        residual_min_run: int = 1,  # noqa: ARG002
+        residual_max_walk: int = 0,  # noqa: ARG002
     ) -> PolyAVerdict:
         raise NotImplementedError(
             "ProbabilisticScorer pending Session 2 — see plan file"

@@ -269,6 +269,8 @@ def _assignments_for(read_rows, template_id, *, samples=None):
             "t_end": pa.array([100] * n, pa.int32()),
             "cigar": pa.array(["100="] * n, pa.large_string()),
             "sample_id": pa.array(samples, pa.int64()),
+            "chain_score": pa.nulls(n, pa.int32()),
+            "shortlist_truncated": pa.nulls(n, pa.bool_()),
         },
         schema=EM_ASSIGNMENT_TABLE,
     )
@@ -433,6 +435,8 @@ def test_a_capped_template_still_reports_all_of_its_reads():
                         "read_id": pa_.array([f"r{i}" for i in range(n)], pa_.string()),
                         "sequence": pa_.array([seq] * n, pa_.large_string()),
                         "sample_id": pa_.array(np.zeros(n, np.int64)),
+                        "chain_score": pa_.nulls(n, pa_.int32()),
+                        "shortlist_truncated": pa_.nulls(n, pa_.bool_()),
                         "dorado_quality": pa_.array(np.full(n, 30.0, np.float32)),
                     },
                     schema=_READS_SCHEMA,
@@ -478,6 +482,8 @@ def test_a_capped_template_still_reports_all_of_its_reads():
             "t_end": pa_.array(np.full(n, len(seq), np.int32)),
             "cigar": pa_.array([f"{len(seq)}="] * n, pa_.large_string()),
             "sample_id": pa_.array(np.zeros(n, np.int64)),
+            "chain_score": pa_.nulls(n, pa_.int32()),
+            "shortlist_truncated": pa_.nulls(n, pa_.bool_()),
         },
         schema=EM_ASSIGNMENT_TABLE,
     )

@@ -1319,6 +1319,41 @@ def _build_transcriptome_parser(subs) -> None:
         "saturation warning fires.",
     )
     p_cluster.add_argument(
+        "--estep-aligner",
+        choices=("minimap2", "edlib"),
+        default="minimap2",
+        help="em: the E-step's base aligner. 'minimap2' (default) base-aligns "
+        "every candidate with minimap2 -c. 'edlib' is the two-pass path: "
+        "minimap2 without -c shortlists on chaining score, and only the "
+        "shortlist is base-aligned with edlib (~67%% of E-step wall time "
+        "was -c). Opt-in until its shortlist operating point is measured.",
+    )
+    p_cluster.add_argument(
+        "--estep-shortlist-k",
+        type=int,
+        default=None,
+        help="em, --estep-aligner edlib only: at most this many candidates per "
+        "read are base-aligned, by chaining score (default 16). UNMEASURED "
+        "operating point; each read's `shortlist_truncated` reports whether "
+        "the cut could have changed its answer.",
+    )
+    p_cluster.add_argument(
+        "--estep-shortlist-frac",
+        type=float,
+        default=None,
+        help="em, --estep-aligner edlib only: a candidate is shortlisted only "
+        "if its chaining score is at least this fraction of the read's best "
+        "(default 0.8). UNMEASURED operating point.",
+    )
+    p_cluster.add_argument(
+        "--estep-align-workers",
+        type=int,
+        default=None,
+        help="em, --estep-aligner edlib only: processes base-aligning the "
+        "shortlist (default --threads). They run concurrently with "
+        "minimap2's chaining.",
+    )
+    p_cluster.add_argument(
         "--index-batch-size",
         default="16G",
         help="em: minimap2 -I. Must exceed the template total: a multi-part "
@@ -2007,6 +2042,12 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         StreamProgress,
     )
     from constellation.sequencing.samples import Samples, save_samples
+    from constellation.sequencing.transcriptome.demux.demux import (
+        polyA_provenance,
+    )
+    from constellation.sequencing.transcriptome.demux.designs import (
+        load_design,
+    )
     from constellation.sequencing.transcriptome.manifest import (
         write_demux_manifest,
     )
@@ -2078,6 +2119,7 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         "batch_size": args.batch_size,
         "resumed": args.resume,
         "emit_fastq": args.emit_fastq,
+        **polyA_provenance(load_design(args.library_design)),
     }
     stages: dict[str, object] = {
         "n_reads": n_reads,
@@ -3464,7 +3506,26 @@ def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
             args.seed_grouping != "components" and not (em and seeding == "kmer"),
             "nothing — only --mode em-kmer groups reads into seed clusters",
         ),
+        (
+            "--estep-aligner",
+            args.estep_aligner != "minimap2" and not em,
+            "nothing — only the --mode em-* E-step has an aligner choice",
+        ),
     ]
+    edlib = em and args.estep_aligner == "edlib"
+    for flag in (
+        "--estep-shortlist-k",
+        "--estep-shortlist-frac",
+        "--estep-align-workers",
+    ):
+        banned.append(
+            (
+                flag,
+                getattr(args, flag[2:].replace("-", "_")) is not None and not edlib,
+                "--estep-aligner edlib, which is the only E-step with a "
+                "shortlist",
+            )
+        )
     for flag, is_set, instead in banned:
         if is_set:
             return f"--mode {args.mode} does not use {flag}; use {instead}."
@@ -3522,6 +3583,18 @@ def _cmd_transcriptome_cluster_em(
         p_floor=float(args.p_floor),
         minimap2_n=int(args.minimap2_n),
         index_batch_size=str(args.index_batch_size),
+        estep_aligner=str(args.estep_aligner),
+        estep_shortlist_k=(
+            16 if args.estep_shortlist_k is None else int(args.estep_shortlist_k)
+        ),
+        estep_shortlist_frac=(
+            0.8
+            if args.estep_shortlist_frac is None
+            else float(args.estep_shortlist_frac)
+        ),
+        estep_align_workers=(
+            0 if args.estep_align_workers is None else int(args.estep_align_workers)
+        ),
         delta_logl=float(args.near_tie_delta_logl),
         support_ratio=float(args.support_ratio),
         near_tie_z=float(args.near_tie_z),

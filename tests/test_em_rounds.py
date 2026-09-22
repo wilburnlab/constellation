@@ -253,6 +253,76 @@ def test_the_loop_converges_and_keeps_genes_apart(tmp_path):
     assert dominant / total >= 0.99, "a cluster must not mix two transcripts"
 
 
+def test_the_two_pass_estep_converges_and_keeps_genes_apart(tmp_path):
+    """The same panel under --estep-aligner edlib, through a real worker pool.
+
+    Pins that the two-pass path composes end to end — minimap2 without -c,
+    shortlist, edlib finalists, M-step on edlib CIGARs — at the same purity
+    bar the single-pass path is held to.
+    """
+    rng = np.random.default_rng(7)
+    truths = [_orf(rng, 150) for _ in range(4)]
+    rows, truth_of = [], {}
+    for t, truth in enumerate(truths):
+        for i in range(40):
+            rid = f"g{t}_r{i}"
+            truth_of[rid] = t
+            rows.append((rid, _mutate(rng, truth, 0.012), float(rng.uniform(12, 34))))
+
+    out = tmp_path / "em"
+    results = run_em(
+        _write_demux(tmp_path, rows),
+        out,
+        params=_params(
+            rounds=3,
+            threads=2,
+            minimap2_n=100,
+            min_aa_length=40,
+            estep_aligner="edlib",
+            estep_align_workers=2,
+        ),
+    )
+    assert results[-1].estep["aligner"] == "edlib"
+    assert results[-1].churn.get("frac_changed_lineage", 1.0) < 0.02
+    last = pq.read_table(
+        out / "rounds" / f"r{results[-1].round_index:02d}" / "assignments"
+    )
+    assert pc_count_valid(last.column("chain_score")) > 0
+    per_cluster: dict[int, dict[int, int]] = {}
+    for rid, tid in zip(
+        last.column("read_id").to_pylist(), last.column("template_id").to_pylist()
+    ):
+        if tid >= 0:
+            per_cluster.setdefault(tid, {}).setdefault(truth_of[rid], 0)
+            per_cluster[tid][truth_of[rid]] += 1
+    total = sum(sum(c.values()) for c in per_cluster.values())
+    dominant = sum(max(c.values()) for c in per_cluster.values())
+    assert total >= 0.9 * len(rows)
+    assert dominant / total >= 0.99, "a cluster must not mix two transcripts"
+
+
+def pc_count_valid(col) -> int:
+    return len(col) - col.null_count
+
+
+def test_resume_refuses_to_switch_estep_aligners(tmp_path):
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        _check_estep_stamp,
+    )
+
+    rounds = tmp_path / "rounds"
+    _check_estep_stamp(rounds, _params(), resume=False)
+    (rounds / "r01").mkdir()
+    (rounds / "r01" / "_SUCCESS").write_bytes(b"")
+    _check_estep_stamp(rounds, _params(), resume=True)  # same aligner: fine
+    with pytest.raises(ValueError, match="estep-aligner"):
+        _check_estep_stamp(rounds, _params(estep_aligner="edlib"), resume=True)
+    # A stampless run predates the flag and can only be minimap2's.
+    (rounds / "estep.json").unlink()
+    with pytest.raises(ValueError, match="minimap2"):
+        _check_estep_stamp(rounds, _params(estep_aligner="edlib"), resume=True)
+
+
 def test_the_user_facing_outputs_are_written_in_the_shared_shapes(corpus_dir, tmp_path):
     """Every existing consumer reads these; none may need a clusterer branch."""
     import pyarrow as pa_

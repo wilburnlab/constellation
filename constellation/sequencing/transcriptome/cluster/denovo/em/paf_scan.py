@@ -150,6 +150,9 @@ class HitBlock:
     row_end: np.ndarray
     tab: np.ndarray
     first_tab: np.ndarray
+    #: ``s1:i`` chaining score per surviving hit, decoded only when the scan
+    #: asked for it (the two-pass E-step's shortlist key); else ``None``.
+    chain_score: np.ndarray | None = None
 
     def __len__(self) -> int:
         return int(self.read_row.size)
@@ -172,6 +175,7 @@ class HitBlock:
             row_end=self.row_end,
             tab=self.tab,
             first_tab=self.first_tab,
+            chain_score=None if self.chain_score is None else self.chain_score[sel],
         )
 
     def int_fields(
@@ -286,7 +290,9 @@ def _gather_large_string(
     )
 
 
-def scan_paf_block(buf: np.ndarray, *, n_templates: int) -> HitBlock:
+def scan_paf_block(
+    buf: np.ndarray, *, n_templates: int, chain_score: bool = False
+) -> HitBlock:
     """Decode one newline-terminated PAF byte block.
 
     Reverse-strand hits are dropped here rather than downstream, and as a
@@ -297,6 +303,9 @@ def scan_paf_block(buf: np.ndarray, *, n_templates: int) -> HitBlock:
 
     Hits whose ``t_name`` is outside ``[0, n_templates)`` are dropped too —
     that is a template FASTA / TemplateSet mismatch, not data.
+
+    ``chain_score=True`` also decodes ``s1:i`` (0 where absent). It is off by
+    default so the single-pass path pays nothing for it.
     """
     nl = np.flatnonzero(buf == _NL)
     if nl.size == 0:
@@ -327,6 +336,7 @@ def scan_paf_block(buf: np.ndarray, *, n_templates: int) -> HitBlock:
     n_match = _parse_int_field(buf, tab[first_tab + 8] + 1, tab[first_tab + 9])
     aln_len = _parse_int_field(buf, tab[first_tab + 9] + 1, tab[first_tab + 10])
     as_score = _scan_as_tag(buf, nl, tab, n_rows)
+    s1 = _scan_int_tag(buf, nl, tab, n_rows, b"s1:i:") if chain_score else None
 
     keep_strand = plus
     n_dropped_strand = int((~keep_strand).sum())
@@ -350,7 +360,38 @@ def scan_paf_block(buf: np.ndarray, *, n_templates: int) -> HitBlock:
         row_end=row_end,
         tab=tab,
         first_tab=first_tab.astype(np.int64),
+        chain_score=None if s1 is None else s1[src],
     )
+
+
+def _scan_int_tag(
+    buf: np.ndarray, nl: np.ndarray, tab: np.ndarray, n_rows: int, tag: bytes
+) -> np.ndarray:
+    """An integer tag (``tag`` including its ``:i:``) per row, 0 where absent.
+
+    Seeded on the tabs — every tag starts right after one — which is general
+    where :func:`_scan_as_tag`'s rare-byte seed is specific to ``AS``.
+    """
+    out = np.zeros(n_rows, dtype=np.int64)
+    width = len(tag)
+    pos = tab + 1
+    pos = pos[pos + width < buf.size]
+    if pos.size == 0:
+        return out
+    ok = np.ones(pos.size, dtype=bool)
+    for i, b in enumerate(tag):
+        ok &= buf[pos + i] == b
+    starts = pos[ok] + width
+    if starts.size == 0:
+        return out
+    nxt = np.searchsorted(tab, starts, side="left")
+    tab_end = np.where(
+        nxt < tab.size, tab[np.clip(nxt, 0, max(tab.size - 1, 0))], buf.size
+    )
+    rows = np.searchsorted(nl, starts, side="left")
+    ends = np.minimum(tab_end, nl[np.clip(rows, 0, nl.size - 1)])
+    out[rows] = _parse_int_field(buf, starts, ends)
+    return out
 
 
 def _scan_as_tag(
@@ -431,6 +472,48 @@ def iter_hit_blocks(
             )
 
 
+def iter_group_blocks(
+    chunks: Iterable[bytes], *, block_bytes: int = 128 << 20
+) -> Iterator[bytes]:
+    """Group-aligned **raw** PAF blocks, for decoding somewhere else.
+
+    The same guarantee as :func:`iter_hit_blocks` — every block holds only
+    complete read groups — without decoding anything, so a pool worker can
+    receive plain ``bytes`` (cheap to pickle, no parent buffer attached) and
+    scan them itself. The cut is found on raw ``q_name`` bytes of the last
+    few lines, so it is independent of which hits a scan would drop.
+    """
+    tail = b""
+    for raw in chunks:
+        tail = tail + raw if tail else raw
+        if len(tail) < block_bytes:
+            continue
+        cut = tail.rfind(b"\n") + 1
+        if cut == 0:
+            continue
+        group_start = _last_group_start(tail, cut)
+        if group_start == 0:
+            continue  # one read's hits fill the block; wait for more bytes
+        yield tail[:group_start]
+        tail = tail[group_start:]
+    if tail:
+        cut = tail.rfind(b"\n") + 1
+        if cut:
+            yield tail[:cut]
+
+
+def _last_group_start(buf: bytes, end: int) -> int:
+    """Byte offset of the first line of the read group ending at ``end``."""
+    line_start = buf.rfind(b"\n", 0, end - 1) + 1
+    name = buf[line_start : buf.index(b"\t", line_start)]
+    while line_start > 0:
+        prev = buf.rfind(b"\n", 0, line_start - 1) + 1
+        if buf[prev : buf.index(b"\t", prev)] != name:
+            break
+        line_start = prev
+    return line_start
+
+
 def _split_trailing_group(hb: HitBlock) -> tuple[HitBlock | None, int]:
     """Cut ``hb`` before its last read group. Returns ``(block, carry_offset)``.
 
@@ -457,6 +540,7 @@ def _split_trailing_group(hb: HitBlock) -> tuple[HitBlock | None, int]:
 
 __all__ = [
     "HitBlock",
+    "iter_group_blocks",
     "iter_hit_blocks",
     "scan_paf_block",
 ]

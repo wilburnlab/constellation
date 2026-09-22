@@ -56,6 +56,8 @@ def _assignments(rows):
             "t_end": pa.array([100] * n, pa.int32()),
             "cigar": pa.array([r[2] for r in rows], pa.large_string()),
             "sample_id": pa.array([0] * n, pa.int64()),
+            "chain_score": pa.nulls(n, pa.int32()),
+            "shortlist_truncated": pa.nulls(n, pa.bool_()),
         },
         schema=EM_ASSIGNMENT_TABLE,
     )

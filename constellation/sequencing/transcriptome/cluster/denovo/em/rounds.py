@@ -91,6 +91,16 @@ class EmParams:
     p_floor: float = 0.97
     minimap2_n: int = 500
     index_batch_size: str = "16G"
+    # The E-step's base aligner. "minimap2" is the single pass (`-c` on every
+    # candidate); "edlib" shortlists on minimap2's chaining score and
+    # base-aligns only the shortlist (`em/realign.py`). The shortlist size is
+    # an UNMEASURED operating point — `shortlist_truncated` reports its cost
+    # per read — which is why edlib is opt-in.
+    estep_aligner: Literal["minimap2", "edlib"] = "minimap2"
+    estep_shortlist_k: int = 16
+    estep_shortlist_frac: float = 0.8
+    #: 0 means `threads`.
+    estep_align_workers: int = 0
     # Round 2+ ranking (A3).
     delta_logl: float = 5.0
     support_ratio: float = 20.0
@@ -134,6 +144,14 @@ class EmParams:
     mstep_workers: int = 0
     units_per_worker: int = 16
     mstep: MStepParams = field(default_factory=MStepParams)
+
+    def __post_init__(self) -> None:
+        if self.estep_aligner not in ("minimap2", "edlib"):
+            raise ValueError(f"unknown estep_aligner {self.estep_aligner!r}")
+        if self.estep_shortlist_k < 1:
+            raise ValueError("estep_shortlist_k must be >= 1")
+        if not 0.0 < self.estep_shortlist_frac <= 1.0:
+            raise ValueError("estep_shortlist_frac must be in (0, 1]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +211,7 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
     # manifest.
     if resume:
         _check_seed_stamp(output_dir / "seed", params, log)
+    _check_estep_stamp(rounds_dir, params, resume)
     start, templates_table, prev_assignments, history = _resume_point(
         rounds_dir, resume, log
     )
@@ -339,6 +358,7 @@ def _one_round(r, rd, store, corpus, reads, params, prev_assignments, t0, log):
         near_tie_z=params.near_tie_z,
         error_rate=params.read_error_rate,
         progress=log,
+        **_estep_aligner_kwargs(params, rd, corpus),
     )
     t_estep = time.time() - t0
     _warn_on_saturation(estep_stats, params, log)
@@ -369,6 +389,53 @@ def _one_round(r, rd, store, corpus, reads, params, prev_assignments, t0, log):
     return result, assignments, nodes, node_membership
 
 
+def _estep_aligner_kwargs(params: EmParams, rd: Path, corpus) -> dict:
+    """The extra ``run_em_estep`` arguments for the chosen aligner."""
+    if params.estep_aligner == "minimap2":
+        return {}
+    return {
+        "aligner": "edlib",
+        "shortlist_k": params.estep_shortlist_k,
+        "shortlist_frac": params.estep_shortlist_frac,
+        "align_workers": params.estep_align_workers or params.threads,
+        "corpus_path": corpus.arrow_path,
+        "templates_path": rd / "templates" / TEMPLATES_ARROW,
+    }
+
+
+_ESTEP_STAMP = "estep.json"
+
+
+def _check_estep_stamp(rounds_dir: Path, params: EmParams, resume: bool) -> None:
+    """Refuse a resume that would switch E-step aligners mid-run; stamp it.
+
+    Rounds already on disk were assigned by one aligner, and the M-step built
+    the next round's templates from those CIGARs — so a resume that continues
+    under the other aligner writes a run whose rounds disagree about how a
+    read was aligned while the manifest records one of them. A stampless
+    rounds directory predates the flag and can only be minimap2's.
+    """
+    rounds_dir.mkdir(parents=True, exist_ok=True)
+    path = rounds_dir / _ESTEP_STAMP
+    want = {"estep_aligner": params.estep_aligner}
+    if resume and any(rounds_dir.glob(f"r*/{_SUCCESS}")):
+        have = (
+            json.loads(path.read_text())
+            if path.exists()
+            else {"estep_aligner": "minimap2"}
+        )
+        if have.get("estep_aligner") != want["estep_aligner"]:
+            raise ValueError(
+                f"--resume would continue {rounds_dir.parent}, whose finished "
+                f"rounds were assigned with --estep-aligner "
+                f"{have.get('estep_aligner')!r}, under {want['estep_aligner']!r}. "
+                f"Later rounds' templates were built from those alignments, so "
+                f"the run would mix aligners under one manifest. Choose another "
+                f"--output-dir, or restore the original aligner."
+            )
+    path.write_text(json.dumps(want, indent=2))
+
+
 def _warn_on_saturation(stats: dict, params: EmParams, log) -> None:
     """The pool must contain every template within p_floor. Say so if it did not.
 
@@ -385,6 +452,14 @@ def _warn_on_saturation(stats: dict, params: EmParams, log) -> None:
             f"  WARNING: {frac:.2%} of reads hit the -N {params.minimap2_n} "
             "candidate cap, so their pool was TRUNCATED and this round's "
             f"rankings are unsound for them. Raise --minimap2-n."
+        )
+    trunc = stats.get("shortlist_truncated_fraction", 0.0)
+    if trunc > 0.01:
+        log(
+            f"  WARNING: {trunc:.2%} of reads had their edlib shortlist cut "
+            f"(--estep-shortlist-k {params.estep_shortlist_k}) where the cut "
+            "could have changed their assignment. Raise --estep-shortlist-k "
+            "or lower --estep-shortlist-frac."
         )
 
 
