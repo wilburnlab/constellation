@@ -20,18 +20,30 @@ not carry forward. Self-capture — which would otherwise keep every round-1
 template alive forever — is handled where it arises, in the round-1 ranking
 (see :mod:`.scheduler`), not by deleting anything here.
 
-**There is no merge either.** Merge existed to undo self-capture (ledger #25
-is explicit: "the between-round merge is the structural fix"), and the
-round-1 rule removes that at the source: redundant templates lose their reads
-at assignment time. The two worked examples resolve without it — Tcp1 is
-separated by the covariance M-step, and H3f3b's elongated frameshift template
-loses round 1 outright to the more-replicated correct form.
+**Merge is back (2026-09-23), with evidence behind its criterion.** It was
+dropped on the argument that redundant templates lose their reads at
+assignment time, and :func:`detect_redundant_templates` was left to make that
+checkable — but its minimap2 flags combined ``-X`` with ``--secondary=no``,
+which minimap2 refuses, so the check never ran. Run with corrected flags on the
+finished em-kmer runs, **26.9% (1M reads) and 29.4% (9.4M) of the final
+template set was removable redundancy**, the median redundant pair exactly
+identical and the largest component 331 templates. The mechanism: round-1
+M-steps split at shallow depth, round 2 redistributes a large read population
+onto whichever fragment matches best, and nothing revisits the split — so a
+split made on evidence that later evaporates is permanent without a merge.
 
-What remains is the *detector*: :func:`detect_redundant_templates` reports
-pairs that a merge would have collapsed, so the decision to drop the
-operation is checkable rather than assumed. If the count is negligible, merge
-was correctly dropped; if it is not, merge returns with evidence behind its
-criterion.
+The criterion is ``handoff_scheduler_v3`` §5's: a whole-*template* alignment
+(transcripts, never consensus ORFs — the ORF-level merge was struck for
+joining parents at 74.5% transcript identity) with identity ≥ ``p_merge``
+(0.995, deliberately stricter than the 0.97 read floor, because a merge is a
+stronger claim than an assignment) and coverage ≥ 0.95 **in both
+directions**. Groups are formed by abundance-ordered **radius-1** greedy set
+cover (:func:`select_merges`), so ``A~B~C`` cannot merge ``A`` with ``C``;
+whatever a pass leaves is caught next round. The survivor is the
+best-supported member; the next M-step re-derives its consensus from the
+union of reads the E-step hands it, so a merged group is re-consensused for
+free one round later. A merge is recorded in the lineage as the inverse of a
+split (``rule='merge'``), so churn does not read it as mass reassignment.
 """
 
 from __future__ import annotations
@@ -56,6 +68,8 @@ LINEAGE_TABLE: pa.Schema = pa.schema(
         # 'carry'       — the parent emitted exactly one node
         # 'split'       — it emitted several; the read did not really move
         # 'unrecruited' — it emitted none and does not carry forward
+        # 'merge'       — its node was absorbed into a redundant survivor;
+        #                 child_template_id is the SURVIVOR's id
         pa.field("rule", pa.string(), nullable=False),
         pa.field("n_reads", pa.float64(), nullable=False),
     ],
@@ -79,6 +93,7 @@ class RefineResult:
     n_parents: int
     n_children: int
     n_unrecruited: int
+    n_merged: int = 0
 
 
 def next_templates(
@@ -295,32 +310,59 @@ MERGE_MINIMAP2_ARGS: tuple[str, ...] = (
     "-x",
     "asm5",
     # -c is MANDATORY, not an optimisation: without base-level alignment PAF
-    # column 10 is chain-anchor matches, which underestimates identity badly
-    # and makes a 0.995 threshold meaningless.
+    # column 10 is chain-anchor matches — one substitution removes ~19 bases
+    # of asm5 anchors — which underestimates identity badly and makes a 0.995
+    # threshold mean "exactly identical".
     "-c",
     # -X (= -DP --dual=no) skips self-hits and reports each unordered pair
-    # once, halving the work and removing the q_name == t_name filter.
+    # once, halving the work and removing the q_name == t_name filter. It must
+    # NOT be combined with --secondary=no: minimap2 refuses the pair outright
+    # ("-X/-P and --secondary=no can't be applied at the same time"), which is
+    # why this detector never produced a number before 2026-09-23.
     "-X",
-    "--secondary=no",
     "-p",
     "0.9",
     "-N",
     "5",
 )
 
+#: Returned by :func:`detect_redundant_templates`: one row per redundant
+#: unordered pair, named by template ROW (the FASTAs name by row index).
+REDUNDANT_PAIR_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("a_row", pa.int64(), nullable=False),
+        pa.field("b_row", pa.int64(), nullable=False),
+        pa.field("identity", pa.float64(), nullable=False),
+        pa.field("coverage_a", pa.float64(), nullable=False),
+        pa.field("coverage_b", pa.float64(), nullable=False),
+    ],
+    metadata={b"schema_name": b"EmRedundantPairTable"},
+)
+
+
+#: Pairs are REPORTED down to this identity, below the merge threshold, so
+#: the near-threshold population — where a genuine single-position variant
+#: lives — is visible in the diagnostics rather than silently excluded.
+REPORT_IDENTITY_FLOOR = 0.99
+
 
 def detect_redundant_templates(
     templates_fasta: Path,
     *,
-    p_merge: float = 0.995,
+    min_identity: float = REPORT_IDENTITY_FLOOR,
     min_mutual_coverage: float = 0.95,
     threads: int = 8,
+    index_batch_size: str = "16G",
 ) -> pa.Table:
-    """Pairs a merge would have collapsed. **Collapses nothing.**
+    """Near-identical template pairs (``REDUNDANT_PAIR_TABLE``). Collapses nothing.
 
-    Runs on the final round only, where the template count is smallest. Why
-    ``asm5`` rather than ``map-ont`` is not a tuning preference: a preset sets
-    the seed length and how densely seeds are sampled. ``map-ont`` uses
+    Every pair with identity ≥ ``min_identity`` and both coverages ≥
+    ``min_mutual_coverage``; the merge threshold ``p_merge`` is applied by the
+    consumers (:func:`redundancy_stats`, :func:`select_merges`), so one scan
+    serves both the merge and the near-threshold report.
+
+    Why ``asm5`` rather than ``map-ont`` is not a tuning preference: a preset
+    sets the seed length and how densely seeds are sampled. ``map-ont`` uses
     k=15/w=10 because a noisy read has an error every ~100 bp and only a short
     seed has a good chance of being error-free — at the cost of specificity,
     since a 15-mer recurs by chance across a transcriptome. ``asm5`` uses
@@ -329,8 +371,11 @@ def detect_redundant_templates(
     it can sample ~2x more sparsely. Template-vs-template at >=99.5% is the
     second situation.
 
-    Needs **no CIGAR**: identity and both coverages come from PAF columns that
-    are already parsed and otherwise unused.
+    ``-I`` is passed explicitly: an all-vs-all over a multi-part index never
+    compares templates that land in different parts.
+
+    Needs **no CIGAR**: identity and both coverages come from PAF columns.
+    The FASTA must name templates by row index, as ``write_templates`` does.
     """
     from constellation.sequencing.align.minimap2 import minimap2_stream
     from constellation.sequencing.readers.paf import iter_paf_batches
@@ -338,30 +383,27 @@ def detect_redundant_templates(
     stream = minimap2_stream(
         Path(templates_fasta),
         [Path(templates_fasta)],
-        args=MERGE_MINIMAP2_ARGS,
+        args=(*MERGE_MINIMAP2_ARGS, "-I", str(index_batch_size)),
         threads=threads,
     )
     rows: list[pa.Table] = []
     for batch in iter_paf_batches(stream, want_cigar=False):
         tbl = pa.Table.from_batches([batch])
+        f64 = pa.float64()
         identity = pc.divide(
-            pc.cast(tbl.column("n_match"), pa.float64()),
-            pc.max_element_wise(pc.cast(tbl.column("aln_len"), pa.float64()), 1.0),
+            pc.cast(tbl.column("n_match"), f64),
+            pc.max_element_wise(pc.cast(tbl.column("aln_len"), f64), 1.0),
         )
         cov_q = pc.divide(
-            pc.cast(
-                pc.subtract(tbl.column("q_end"), tbl.column("q_start")), pa.float64()
-            ),
-            pc.max_element_wise(pc.cast(tbl.column("q_len"), pa.float64()), 1.0),
+            pc.cast(pc.subtract(tbl.column("q_end"), tbl.column("q_start")), f64),
+            pc.max_element_wise(pc.cast(tbl.column("q_len"), f64), 1.0),
         )
         cov_t = pc.divide(
-            pc.cast(
-                pc.subtract(tbl.column("t_end"), tbl.column("t_start")), pa.float64()
-            ),
-            pc.max_element_wise(pc.cast(tbl.column("t_len"), pa.float64()), 1.0),
+            pc.cast(pc.subtract(tbl.column("t_end"), tbl.column("t_start")), f64),
+            pc.max_element_wise(pc.cast(tbl.column("t_len"), f64), 1.0),
         )
         keep = pc.and_(
-            pc.greater_equal(identity, p_merge),
+            pc.greater_equal(identity, min_identity),
             pc.and_(
                 pc.greater_equal(cov_q, min_mutual_coverage),
                 pc.greater_equal(cov_t, min_mutual_coverage),
@@ -369,33 +411,282 @@ def detect_redundant_templates(
         )
         sel = pa.table(
             {
-                "a_name": tbl.column("q_name"),
-                "b_name": tbl.column("t_name"),
+                "a_row": pc.cast(tbl.column("q_name"), pa.int64()),
+                "b_row": pc.cast(tbl.column("t_name"), pa.int64()),
                 "identity": identity,
                 "coverage_a": cov_q,
                 "coverage_b": cov_t,
-            }
+            },
+            schema=REDUNDANT_PAIR_TABLE,
         ).filter(keep)
         if sel.num_rows:
             rows.append(sel)
     if not rows:
-        return pa.table(
-            {
-                "a_name": pa.array([], pa.large_string()),
-                "b_name": pa.array([], pa.large_string()),
-                "identity": pa.array([], pa.float64()),
-                "coverage_a": pa.array([], pa.float64()),
-                "coverage_b": pa.array([], pa.float64()),
-            }
+        return REDUNDANT_PAIR_TABLE.empty_table()
+    return pa.concat_tables(rows).combine_chunks()
+
+
+def _pair_edges(
+    pairs: pa.Table, n: int, p_merge: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """The pairs at or above ``p_merge``, as in-range edge arrays."""
+    a = pairs.column("a_row").to_numpy(zero_copy_only=False).astype(np.int64)
+    b = pairs.column("b_row").to_numpy(zero_copy_only=False).astype(np.int64)
+    ident = pairs.column("identity").to_numpy(zero_copy_only=False)
+    ok = (a >= 0) & (a < n) & (b >= 0) & (b < n) & (a != b) & (ident >= p_merge)
+    return a[ok], b[ok]
+
+
+#: Identity-histogram bin edges for :func:`redundancy_stats`. The 0.99-0.995
+#: band is below the merge threshold and reported so the near-threshold
+#: population (where a real single-position variant lives) stays visible.
+_IDENTITY_BINS = (0.99, 0.995, 0.998, 0.999, 0.9995, 1.0 - 1e-12, 1.0 + 1e-12)
+
+
+def redundancy_stats(
+    pairs: pa.Table, n_templates: int, *, p_merge: float = 0.995
+) -> dict:
+    """The handoff's redundancy numbers for one template set.
+
+    ``removable`` is what collapsing every connected component to one would
+    remove — the upper bound, and the number that answers "should merge
+    exist". The merge itself uses radius-1 greedy (:func:`select_merges`), so
+    one pass may remove less; the next round catches the rest.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.cluster_graph import (
+        connected_components,
+    )
+
+    n = int(n_templates)
+    a, b = _pair_edges(pairs, n, p_merge)
+    ident = pairs.column("identity").to_numpy(zero_copy_only=False)
+    counts, _ = np.histogram(ident, bins=np.asarray(_IDENTITY_BINS))
+    labels = ["0.990-0.995", "0.995-0.998", "0.998-0.999", "0.999-0.9995",
+              "0.9995-<1", "1.0"]
+    out: dict = {
+        "n_templates": n,
+        "p_merge": float(p_merge),
+        "n_pairs": int(a.size),
+        "n_near_threshold_pairs": int(((ident < p_merge)).sum()),
+        "identity_hist": {k: int(v) for k, v in zip(labels, counts)},
+    }
+    if a.size == 0 or n == 0:
+        out.update(
+            n_in_pairs=0,
+            n_components=0,
+            component_size_median=0.0,
+            component_size_p90=0.0,
+            component_size_max=0,
+            removable=0,
+            removable_frac=0.0,
         )
-    return pa.concat_tables(rows)
+        return out
+    comp = connected_components(n, np.ones(n), np.ones(n), a, b).cluster_of
+    involved = np.zeros(n, dtype=bool)
+    involved[a] = True
+    involved[b] = True
+    sizes = np.bincount(comp[involved])
+    sizes = sizes[sizes > 1]
+    removable = int(sizes.sum() - sizes.size)
+    out.update(
+        n_in_pairs=int(involved.sum()),
+        n_components=int(sizes.size),
+        component_size_median=float(np.median(sizes)) if sizes.size else 0.0,
+        component_size_p90=float(np.percentile(sizes, 90)) if sizes.size else 0.0,
+        component_size_max=int(sizes.max()) if sizes.size else 0,
+        removable=removable,
+        removable_frac=removable / n,
+    )
+    return out
+
+
+def select_merges(
+    pairs: pa.Table,
+    n_reads: np.ndarray,
+    seq_len: np.ndarray,
+    *,
+    p_merge: float = 0.995,
+) -> np.ndarray:
+    """``survivor_of[i]`` — the row template ``i`` merges into (itself if none).
+
+    Radius-1 greedy set cover in ``(reads desc, length desc, row asc)`` order:
+    each unclaimed template claims its unclaimed *direct* redundant
+    neighbours, so a chain ``A~B~C`` never merges ``A`` with ``C`` (whose
+    identity to each other may be below ``p_merge``). The survivor is the
+    group's claimant — its best-supported member.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.cluster_graph import (
+        greedy_set_cover,
+    )
+
+    n = int(np.asarray(n_reads).size)
+    if n == 0:
+        return np.empty(0, dtype=np.int64)
+    a, b = _pair_edges(pairs, n, p_merge)
+    res = greedy_set_cover(
+        n,
+        np.maximum(np.asarray(n_reads, dtype=np.int64), 0),
+        np.asarray(seq_len, dtype=np.int64),
+        a,
+        b,
+    )
+    return res.centroid_uniq[res.cluster_of].astype(np.int64)
+
+
+def apply_merge(
+    refined: RefineResult, pairs: pa.Table, *, p_merge: float = 0.995
+) -> RefineResult:
+    """Collapse the redundant templates of ``refined`` into their survivors.
+
+    ``pairs`` rows index ``refined.templates``. Child ids are stable — the
+    table is filtered, never re-indexed — so survivors keep their ids and an
+    absorbed template's lineage row is re-pointed at its survivor with
+    ``rule='merge'``: the edge ``(survivor, absorbed parent)`` then makes a
+    read moving from the absorbed parent to the survivor count as inherited,
+    exactly like a split.
+    """
+    t = refined.templates
+    n = t.num_rows
+    if n == 0 or pairs.num_rows == 0:
+        return refined
+    reads = t.column("orf_replication").to_numpy(zero_copy_only=False)
+    seq_len = pc.utf8_length(t.column("sequence")).to_numpy(zero_copy_only=False)
+    survivor = select_merges(pairs, reads, seq_len, p_merge=p_merge)
+    absorbed = survivor != np.arange(n)
+    if not absorbed.any():
+        return refined
+
+    weight = t.column("node_weight").to_numpy(zero_copy_only=False).astype(float)
+    merged_weight = np.bincount(survivor, weights=weight, minlength=n)
+    merged_reads = np.bincount(
+        survivor, weights=np.maximum(reads, 0).astype(float), minlength=n
+    )
+    keep = ~absorbed
+    templates = (
+        t.set_column(
+            t.schema.get_field_index("node_weight"),
+            "node_weight",
+            pa.array(merged_weight, pa.float64()),
+        )
+        .set_column(
+            t.schema.get_field_index("orf_replication"),
+            "orf_replication",
+            pa.array(np.rint(merged_reads).astype(np.int64)),
+        )
+        .filter(pa.array(keep))
+    )
+
+    ids = t.column("template_id").to_numpy(zero_copy_only=False)
+    remap = dict(zip(ids[absorbed].tolist(), ids[survivor[absorbed]].tolist()))
+    lin = refined.lineage
+    child = lin.column("child_template_id").to_numpy(zero_copy_only=False).copy()
+    rule = np.asarray(lin.column("rule").to_pylist(), dtype=object)
+    for i, c in enumerate(child.tolist()):
+        s = remap.get(c)
+        if s is not None:
+            child[i] = s
+            rule[i] = "merge"
+    lineage = lin.set_column(
+        lin.schema.get_field_index("child_template_id"),
+        "child_template_id",
+        pa.array(child, pa.int64()),
+    ).set_column(
+        lin.schema.get_field_index("rule"), "rule", pa.array(list(rule), pa.string())
+    )
+    # set_column drops the declared not-null flags; restore the schemas.
+    templates = templates.cast(TEMPLATE_TABLE)
+    lineage = lineage.cast(LINEAGE_TABLE)
+    return RefineResult(
+        templates=templates,
+        lineage=lineage,
+        n_parents=refined.n_parents,
+        n_children=int(templates.num_rows),
+        n_unrecruited=refined.n_unrecruited,
+        n_merged=int(absorbed.sum()),
+    )
+
+
+def merge_nodes(
+    nodes: pa.Table,
+    node_membership: pa.Table,
+    pairs: pa.Table,
+    *,
+    p_merge: float = 0.995,
+) -> tuple[pa.Table, pa.Table, int]:
+    """The final-output merge: collapse redundant NODES and their membership.
+
+    ``pairs`` rows index ``nodes``. Absorbed nodes are dropped and their
+    membership rows re-keyed to the survivor's ``(parent_template_id,
+    haplotype_id)``; counts and quant are computed from membership, so every
+    read is kept and totals are conserved. Returns ``(nodes, membership,
+    n_merged)``.
+    """
+    n = nodes.num_rows
+    if n == 0 or pairs.num_rows == 0:
+        return nodes, node_membership, 0
+    n_reads = nodes.column("n_reads").to_numpy(zero_copy_only=False)
+    seq_len = pc.utf8_length(nodes.column("consensus")).to_numpy(zero_copy_only=False)
+    survivor = select_merges(pairs, n_reads, seq_len, p_merge=p_merge)
+    absorbed = survivor != np.arange(n)
+    if not absorbed.any():
+        return nodes, node_membership, 0
+
+    pid = nodes.column("parent_template_id").to_numpy(zero_copy_only=False)
+    hap = nodes.column("haplotype_id").to_numpy(zero_copy_only=False)
+    sums = {}
+    for col in ("n_reads", "node_weight"):
+        v = nodes.column(col).to_numpy(zero_copy_only=False).astype(float)
+        sums[col] = np.bincount(survivor, weights=np.maximum(v, 0), minlength=n)
+    out = nodes.set_column(
+        nodes.schema.get_field_index("n_reads"),
+        "n_reads",
+        pa.array(np.rint(sums["n_reads"]).astype(np.int64)),
+    ).set_column(
+        nodes.schema.get_field_index("node_weight"),
+        "node_weight",
+        pa.array(sums["node_weight"], pa.float64()),
+    ).filter(pa.array(~absorbed))
+
+    membership = node_membership
+    if membership is not None and membership.num_rows:
+        # Exact (parent_template_id, haplotype_id) lookup — the same
+        # structured-pair comparison the churn measure uses, no bit packing.
+        key = _pair_key(pid, hap.astype(np.int64))
+        order = np.argsort(key)
+        m_pid = membership.column("parent_template_id").to_numpy(zero_copy_only=False)
+        m_hap = membership.column("haplotype_id").to_numpy(zero_copy_only=False)
+        mkey = _pair_key(m_pid, m_hap.astype(np.int64))
+        pos = np.clip(np.searchsorted(key[order], mkey), 0, n - 1)
+        found = key[order][pos] == mkey
+        target = survivor[order[pos]]
+        new_pid = np.where(found, pid[target], m_pid)
+        new_hap = np.where(found, hap[target], m_hap)
+        membership = membership.set_column(
+            membership.schema.get_field_index("parent_template_id"),
+            "parent_template_id",
+            pa.array(new_pid.astype(np.int64)),
+        ).set_column(
+            membership.schema.get_field_index("haplotype_id"),
+            "haplotype_id",
+            pa.array(new_hap.astype(np.int32)),
+        )
+    out = out.cast(nodes.schema)
+    if membership is not None and membership.num_rows:
+        membership = membership.cast(node_membership.schema)
+    return out, membership, int(absorbed.sum())
 
 
 __all__ = [
     "LINEAGE_TABLE",
     "MERGE_MINIMAP2_ARGS",
+    "REDUNDANT_PAIR_TABLE",
+    "REPORT_IDENTITY_FLOOR",
     "RefineResult",
+    "apply_merge",
     "detect_redundant_templates",
+    "merge_nodes",
+    "redundancy_stats",
+    "select_merges",
     "measure_churn",
     "next_templates",
     "template_id_for",

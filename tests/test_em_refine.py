@@ -550,3 +550,194 @@ def test_an_empty_template_table_opens_without_indexing_a_buffer():
     store = TemplateStore.from_table(_template_table([]))
     assert store.n_templates == 0
     assert store.seq_buffer.size == 0
+
+
+# ── merge (2026-09-23) ────────────────────────────────────────────────
+
+import random  # noqa: E402
+import shutil  # noqa: E402
+
+from constellation.sequencing.transcriptome.cluster.denovo.em.refine import (  # noqa: E402
+    REDUNDANT_PAIR_TABLE,
+    apply_merge,
+    detect_redundant_templates,
+    merge_nodes,
+    redundancy_stats,
+    select_merges,
+)
+
+
+def _pairs(rows):
+    """rows = [(a, b, identity)]"""
+    return pa.table(
+        {
+            "a_row": pa.array([r[0] for r in rows], pa.int64()),
+            "b_row": pa.array([r[1] for r in rows], pa.int64()),
+            "identity": pa.array([r[2] for r in rows], pa.float64()),
+            "coverage_a": pa.array([1.0] * len(rows), pa.float64()),
+            "coverage_b": pa.array([1.0] * len(rows), pa.float64()),
+        },
+        schema=REDUNDANT_PAIR_TABLE,
+    )
+
+
+def test_the_best_supported_member_survives():
+    pairs = _pairs([(0, 1, 1.0), (0, 2, 0.999)])
+    # 1 has the most reads and claims its direct neighbour 0; 2 is 0's
+    # neighbour, not 1's, so it waits for the next round's pass.
+    assert select_merges(pairs, np.array([3, 40, 5]), np.array([900, 900, 900])).tolist() == [1, 1, 2]
+    # Tie on reads: the longer wins, then the lower row.
+    pairs = _pairs([(0, 1, 1.0)])
+    assert select_merges(pairs, np.array([5, 5]), np.array([900, 950])).tolist() == [1, 1]
+    assert select_merges(pairs, np.array([5, 5]), np.array([900, 900])).tolist() == [0, 0]
+
+
+def test_merges_do_not_chain():
+    """A~B and B~C at p_merge do not license merging A with C: radius-1
+    greedy claims only DIRECT neighbours of the survivor."""
+    pairs = _pairs([(0, 1, 0.996), (1, 2, 0.996)])
+    survivor = select_merges(pairs, np.array([50, 10, 5]), np.full(3, 900))
+    assert survivor.tolist() == [0, 0, 2]
+
+
+def test_pairs_below_p_merge_are_reported_but_never_merged():
+    pairs = _pairs([(0, 1, 0.993)])
+    assert select_merges(pairs, np.array([5, 1]), np.full(2, 900)).tolist() == [0, 1]
+    st = redundancy_stats(pairs, 2)
+    assert st["n_pairs"] == 0 and st["removable"] == 0
+    assert st["n_near_threshold_pairs"] == 1
+    assert st["identity_hist"]["0.990-0.995"] == 1
+
+
+def test_redundancy_stats_counts_components():
+    pairs = _pairs([(0, 1, 1.0), (1, 2, 1.0), (3, 4, 0.999)])
+    st = redundancy_stats(pairs, 10)
+    assert st["n_in_pairs"] == 5
+    assert st["n_components"] == 2
+    assert st["component_size_max"] == 3
+    assert st["removable"] == 3 and st["removable_frac"] == 0.3
+
+
+def test_apply_merge_sums_support_keeps_ids_and_records_lineage():
+    store = _store(3, ids=[10, 11, 12])
+    seq = "ACGT" * 25
+    refined = next_templates(
+        _nodes(
+            [
+                (10, 0, 0, seq, 30, 30.0),
+                (11, 1, 0, seq, 4, 4.0),
+                (12, 2, 0, "TTGCA" * 20, 7, 7.0),
+            ]
+        ),
+        store,
+        round_index=1,
+    )
+    merged = apply_merge(refined, _pairs([(0, 1, 1.0)]))
+    assert merged.n_merged == 1 and merged.n_children == 2
+    t = merged.templates
+    ids = t.column("template_id").to_pylist()
+    assert ids == [int(template_id_for(2, 0)), int(template_id_for(2, 2))]
+    assert t.column("node_weight").to_pylist()[0] == 34.0
+    assert t.column("orf_replication").to_pylist()[0] == 34
+    lin = merged.lineage.to_pylist()
+    absorbed = [r for r in lin if r["parent_template_id"] == 11][0]
+    assert absorbed["rule"] == "merge"
+    assert absorbed["child_template_id"] == ids[0]
+
+
+def test_churn_reads_a_merge_as_inherited_not_as_movement():
+    """A merge is the inverse of a split: reads that moved from an absorbed
+    template to its survivor did not choose differently."""
+    store = _store(2, ids=[10, 11])
+    seq = "ACGT" * 25
+    refined = next_templates(
+        _nodes([(10, 0, 0, seq, 3, 3.0), (11, 1, 0, seq, 2, 2.0)]), store, round_index=1
+    )
+    merged = apply_merge(refined, _pairs([(0, 1, 1.0)]))
+    survivor = merged.templates.column("template_id").to_pylist()[0]
+    prev = _assign([(0, 10), (1, 10), (2, 10), (3, 11), (4, 11)])
+    cur = _assign([(i, survivor) for i in range(5)])
+    churn = measure_churn(prev, cur, merged.lineage, n_reads=5)
+    # Every template id changes between rounds, so all five "moved" raw — and
+    # through carry (10 -> survivor) and merge (11 -> survivor) edges, none
+    # of them genuinely.
+    assert churn["n_moved_raw"] == 5
+    assert churn["n_moved_genuine"] == 0
+
+
+def _membership(rows):
+    """rows = [(parent_id, hap, read_row)]"""
+    return pa.table(
+        {
+            "round": pa.array([1] * len(rows), pa.int32()),
+            "parent_template_id": pa.array([r[0] for r in rows], pa.int64()),
+            "haplotype_id": pa.array([r[1] for r in rows], pa.int32()),
+            "read_row": pa.array([r[2] for r in rows], pa.int32()),
+            "weight": pa.array([1.0] * len(rows), pa.float32()),
+        }
+    )
+
+
+def test_final_merge_keeps_every_read():
+    seq = "ACGT" * 25
+    nodes = _nodes(
+        [(10, 0, 0, seq, 3, 3.0), (10, 0, 1, seq, 2, 2.0), (11, 1, 0, "TTGCA" * 20, 1, 1.0)]
+    )
+    member = _membership(
+        [(10, 0, 0), (10, 0, 1), (10, 0, 2), (10, 1, 3), (10, 1, 4), (11, 0, 5)]
+    )
+    out, mem, n = merge_nodes(nodes, member, _pairs([(0, 1, 1.0)]))
+    assert n == 1 and out.num_rows == 2
+    assert out.column("n_reads").to_pylist() == [5, 1]
+    keys = list(zip(mem.column("parent_template_id").to_pylist(),
+                    mem.column("haplotype_id").to_pylist()))
+    assert keys == [(10, 0)] * 5 + [(11, 0)]
+    assert mem.num_rows == member.num_rows
+
+
+# The detector must actually be RUN in a test: a unit test that never shells
+# out would not have caught the -X / --secondary=no refusal that kept it dead.
+needs_minimap2 = pytest.mark.skipif(
+    shutil.which("minimap2") is None, reason="minimap2 not on PATH"
+)
+
+
+def _mutate_subs(seq, k, seed):
+    r = random.Random(seed)
+    s = list(seq)
+    for p in r.sample(range(50, len(s) - 50), k):
+        s[p] = {"A": "C", "C": "G", "G": "T", "T": "A"}[s[p]]
+    return "".join(s)
+
+
+@needs_minimap2
+def test_detector_runs_and_applies_the_worked_examples(tmp_path):
+    rng = random.Random(1)
+    base = "".join(rng.choice("ACGT") for _ in range(1900))
+    seqs = [
+        base,  # 0
+        base,  # 1: exact duplicate -> redundant
+        _mutate_subs(base, 28, 2),  # 2: Tcp1-like, 98.5% -> separate
+        base[:900] + base[901:],  # 3: H3f3b-like frameshift, ~99.95% -> redundant
+        "".join(rng.choice("ACGT") for _ in range(1500)),  # 4: unrelated
+    ]
+    fa = tmp_path / "t.fa"
+    fa.write_text("".join(f">{i}\n{s}\n" for i, s in enumerate(seqs)))
+    pairs = detect_redundant_templates(fa, threads=2)
+    assert pairs.schema.equals(REDUNDANT_PAIR_TABLE, check_metadata=False)
+    merged_pairs = {
+        tuple(sorted(p))
+        for p, ident in zip(
+            zip(pairs.column("a_row").to_pylist(), pairs.column("b_row").to_pylist()),
+            pairs.column("identity").to_pylist(),
+        )
+        if ident >= 0.995
+    }
+    assert merged_pairs == {(0, 1), (0, 3), (1, 3)}
+    # -X reports each unordered pair once.
+    assert pairs.num_rows == len(
+        {tuple(sorted(p)) for p in zip(pairs.column("a_row").to_pylist(),
+                                        pairs.column("b_row").to_pylist())}
+    )
+    survivor = select_merges(pairs, np.array([10, 1, 1, 1, 1]), np.array([len(s) for s in seqs]))
+    assert survivor.tolist() == [0, 0, 2, 0, 4]

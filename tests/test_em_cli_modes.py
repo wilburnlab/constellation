@@ -234,6 +234,9 @@ def test_unbounded_overhangs_are_spellable():
         ("em-orf", "--estep-shortlist-frac", "0.7"),
         ("em-kmer", "--estep-align-workers", "4"),
         ("kmer", "--estep-aligner", "edlib"),
+        # Merge exists only in the em loop, and its knobs only when it is on.
+        ("kmer", "--p-merge", "0.99"),
+        ("em-kmer --no-merge", "--merge-from-round", "3"),
     ],
 )
 def test_a_flag_this_mode_ignores_is_an_error(mode, flag, value):
@@ -242,7 +245,8 @@ def test_a_flag_this_mode_ignores_is_an_error(mode, flag, value):
     from constellation.cli.__main__ import _em_seeding, _normalise_cluster_mode
     from constellation.cli.__main__ import _reject_inapplicable
 
-    args = _args("--mode", mode, flag, value)
+    mode, *extra = mode.split()
+    args = _args("--mode", mode, *extra, flag, value)
     canonical = _normalise_cluster_mode(mode)
     seeding = _em_seeding(mode) if canonical == "em" else "orf"
     problem = _reject_inapplicable(args, canonical, seeding)
@@ -327,3 +331,12 @@ def test_the_two_pass_estep_is_opt_in_and_its_knobs_apply_under_it():
         "4",
     )
     assert _reject_inapplicable(args, "em", "kmer") is None
+
+
+def test_merge_is_on_by_default_and_its_knobs_apply_under_em():
+    from constellation.cli.__main__ import _reject_inapplicable
+
+    args = _args("--mode", "em-kmer", "--p-merge", "0.998", "--merge-from-round", "2")
+    assert not args.no_merge
+    assert _reject_inapplicable(args, "em", "kmer") is None
+    assert _reject_inapplicable(_args("--mode", "kmer", "--no-merge"), "kmer", "orf")

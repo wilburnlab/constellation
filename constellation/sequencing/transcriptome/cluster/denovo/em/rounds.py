@@ -101,6 +101,15 @@ class EmParams:
     estep_shortlist_frac: float = 0.8
     #: 0 means `threads`.
     estep_align_workers: int = 0
+    # Merge (refine.py). Redundant templates — whole-template identity >=
+    # p_merge AND coverage >= merge_min_coverage both ways — collapse into
+    # their best-supported member between rounds and in the final output.
+    # Redundancy is DETECTED and reported every round even with merge off.
+    merge: bool = True
+    p_merge: float = 0.995
+    merge_min_coverage: float = 0.95
+    #: Merge only after rounds >= this (1 = every round).
+    merge_from_round: int = 1
     # Round 2+ ranking (A3).
     delta_logl: float = 5.0
     support_ratio: float = 20.0
@@ -152,6 +161,10 @@ class EmParams:
             raise ValueError("estep_shortlist_k must be >= 1")
         if not 0.0 < self.estep_shortlist_frac <= 1.0:
             raise ValueError("estep_shortlist_frac must be in (0, 1]")
+        if not 0.0 < self.p_merge <= 1.0:
+            raise ValueError("p_merge must be in (0, 1]")
+        if not 0.0 < self.merge_min_coverage <= 1.0:
+            raise ValueError("merge_min_coverage must be in (0, 1]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,7 +226,7 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
         _check_seed_stamp(output_dir / "seed", params, log)
     _check_estep_stamp(rounds_dir, params, resume)
     start, templates_table, prev_assignments, history = _resume_point(
-        rounds_dir, resume, log
+        rounds_dir, resume, log, params
     )
 
     if templates_table is None:
@@ -269,7 +282,7 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
             # be complete and was not.
             refined = (
                 None if (last_round or converged)
-                else rf.next_templates(nodes, store, round_index=r)
+                else _refine_and_merge(rd, nodes, store, r, params, log)
             )
             if refined is not None:
                 _write_lineage(rd, refined.lineage)
@@ -282,7 +295,8 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
                 break
             log(
                 f"round {r}: {refined.n_parents:,} templates -> "
-                f"{refined.n_children:,} ({refined.n_unrecruited:,} recruited nothing)"
+                f"{refined.n_children:,} ({refined.n_unrecruited:,} recruited "
+                f"nothing, {refined.n_merged:,} merged as redundant)"
             )
             if refined.templates.num_rows == 0:
                 log("nothing carried forward; stopping")
@@ -294,6 +308,13 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
 
     _write_summary(output_dir, history + results)
     if final_nodes is not None and final_assignments is not None:
+        final_nodes, final_membership = _merge_final_nodes(
+            rounds_dir / f"r{results[-1].round_index:02d}" / "merge_final",
+            final_nodes,
+            final_membership,
+            params,
+            log,
+        )
         clusters, membership, sample_id = build_cluster_tables(
             final_nodes,
             final_assignments,
@@ -777,6 +798,108 @@ def _read_assignments(directory: Path) -> pa.Table:
     return pa_ds.dataset(files, schema=EM_ASSIGNMENT_TABLE).to_table()
 
 
+def _write_fasta(sequences: pa.ChunkedArray | pa.Array, path: Path) -> Path:
+    """Row-index-named FASTA, as the detector requires."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = 0
+    with path.open("w", encoding="utf-8") as fh:
+        for lo in range(0, len(sequences), 50_000):
+            for seq in sequences.slice(lo, 50_000).to_pylist():
+                fh.write(f">{row}\n{seq}\n")
+                row += 1
+    return path
+
+
+def _redundancy(
+    merge_dir: Path, sequences, params: EmParams, log
+) -> tuple[pa.Table, dict]:
+    """Detect redundant pairs among ``sequences`` (rows), cached on disk.
+
+    ``pairs.parquet`` is reused only if it opens — the same rule the lineage
+    follows, because a file an interrupted write left behind exists and is
+    unreadable. It is written atomically, so a present file is complete.
+    """
+    pairs_path = merge_dir / "pairs.parquet"
+    if _lineage_is_readable(pairs_path):
+        pairs = pq.read_table(pairs_path)
+    else:
+        fasta = _write_fasta(sequences, merge_dir / "candidates.fa")
+        try:
+            pairs = rf.detect_redundant_templates(
+                fasta,
+                min_identity=min(rf.REPORT_IDENTITY_FLOOR, params.p_merge),
+                min_mutual_coverage=params.merge_min_coverage,
+                threads=params.threads,
+                index_batch_size=params.index_batch_size,
+            )
+        finally:
+            fasta.unlink(missing_ok=True)
+        tmp = pairs_path.with_suffix(".parquet.tmp")
+        pq.write_table(pairs, tmp)
+        tmp.replace(pairs_path)
+    stats = rf.redundancy_stats(pairs, len(sequences), p_merge=params.p_merge)
+    return pairs, stats
+
+
+def _write_merge_stats(merge_dir: Path, stats: dict) -> None:
+    (merge_dir / "stats.json").write_text(json.dumps(stats, indent=2))
+
+
+def _refine_and_merge(rd: Path, nodes, store, r: int, params: EmParams, log):
+    """Next templates from this round's nodes, with redundant ones merged.
+
+    One path for the live loop and the resume rebuild, so a resumed round
+    merges identically. Detection always runs (redundancy is reported even
+    with merge off); the merge applies when enabled and ``r >=
+    merge_from_round``.
+    """
+    refined = rf.next_templates(nodes, store, round_index=r)
+    if refined.templates.num_rows == 0:
+        return refined
+    merge_dir = rd / "merge"
+    pairs, stats = _redundancy(
+        merge_dir, refined.templates.column("sequence"), params, log
+    )
+    if params.merge and r >= params.merge_from_round:
+        refined = rf.apply_merge(refined, pairs, p_merge=params.p_merge)
+    stats["n_merged"] = int(refined.n_merged)
+    stats["merge_applied"] = bool(params.merge and r >= params.merge_from_round)
+    _write_merge_stats(merge_dir, stats)
+    if stats["removable_frac"] > 0 and log:
+        log(
+            f"round {r}: {stats['removable_frac']:.1%} of next templates redundant "
+            f"({stats['n_pairs']:,} pairs >= {params.p_merge}); "
+            f"merged {refined.n_merged:,}"
+        )
+    return refined
+
+
+def _merge_final_nodes(merge_dir: Path, nodes, membership, params: EmParams, log):
+    """Merge redundant FINAL nodes, so the output carries no duplicates.
+
+    The last round is never refined, so without this ``clusters.parquet``
+    keeps whatever redundancy its M-step made. Membership is re-keyed to the
+    survivor, so every read is kept and counts / quant are conserved.
+    """
+    if nodes.num_rows == 0:
+        return nodes, membership
+    pairs, stats = _redundancy(merge_dir, nodes.column("consensus"), params, log)
+    n_merged = 0
+    if params.merge:
+        nodes, membership, n_merged = rf.merge_nodes(
+            nodes, membership, pairs, p_merge=params.p_merge
+        )
+    stats["n_merged"] = int(n_merged)
+    stats["merge_applied"] = bool(params.merge)
+    _write_merge_stats(merge_dir, stats)
+    if log and stats["removable_frac"] > 0:
+        log(
+            f"final output: {stats['removable_frac']:.1%} of nodes redundant; "
+            f"merged {n_merged:,}"
+        )
+    return nodes, membership
+
+
 def _write_lineage(rd: Path, lineage: pa.Table) -> Path:
     """Write ``rd/lineage.parquet`` atomically.
 
@@ -798,7 +921,7 @@ def _read_lineage(rd: Path) -> pa.Table:
     return pq.read_table(path) if path.exists() else rf.LINEAGE_TABLE.empty_table()
 
 
-def _resume_point(rounds_dir: Path, resume: bool, log):
+def _resume_point(rounds_dir: Path, resume: bool, log, params: EmParams | None = None):
     """Start after the last round with a ``_SUCCESS``; rebuild its successor.
 
     Returns ``(start_round, templates, prev_assignments, history)``. The last
@@ -841,7 +964,9 @@ def _resume_point(rounds_dir: Path, resume: bool, log):
         nodes = pa_ds.dataset(
             sorted(nodes_dir.glob("part-*.parquet")), schema=REFINED_NODE_TABLE
         ).to_table()
-        refined = rf.next_templates(nodes, store, round_index=last)
+        refined = _refine_and_merge(
+            rd, nodes, store, last, params or EmParams(), log
+        )
         # Persist the rebuilt lineage too: the resumed round's churn needs it
         # to tell a split from a genuine switch, and rebuilding it without
         # writing it would discard exactly that. Existence is not the test —

@@ -756,3 +756,159 @@ def test_a_pre_stamp_seed_dir_cannot_be_resumed_as_kmer(corpus_dir, tmp_path):
     assert run_em(corpus_dir, out, params=_params(rounds=1), resume=True)
     with pytest.raises(ValueError, match="predates seed-parameter stamping"):
         run_em(corpus_dir, out, params=_kmer_params(rounds=1), resume=True)
+
+
+# ── merge (2026-09-23) ────────────────────────────────────────────────
+#
+# The synthetic panels make no redundancy of their own (their templates differ
+# in extent or sequence), so these inject it: a duplicated template between
+# rounds, and a final node whose reads are split across an identical twin —
+# the shape the real-data M-step leaves behind.
+
+
+def _panel(tmp_path, seed=7):
+    rng = np.random.default_rng(seed)
+    rows = []
+    for g in range(2):
+        truth = _orf(rng, 130)
+        rows += [(f"g{g}_r{i}", _mutate(rng, truth, 0.01), 30.0) for i in range(20)]
+    return _write_demux(tmp_path, rows)
+
+
+def _duplicate_first_template(monkeypatch):
+    from constellation.sequencing.transcriptome.cluster.denovo.em import (
+        rounds as rounds_mod,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.refine import (
+        RefineResult,
+        template_id_for,
+    )
+
+    real = rounds_mod.rf.next_templates
+
+    def _dup(nodes, store, *, round_index):
+        res = real(nodes, store, round_index=round_index)
+        t = res.templates
+        twin = t.slice(0, 1)
+        new_id = int(template_id_for(round_index + 1, 10_000))
+        twin = twin.set_column(
+            0, t.schema.field(0), pa.array([new_id], pa.int64())
+        )
+        lin = res.lineage.slice(0, 1)
+        lin = lin.set_column(1, lin.schema.field(1), pa.array([new_id], pa.int64()))
+        return RefineResult(
+            templates=pa.concat_tables([t, twin]),
+            lineage=pa.concat_tables([res.lineage, lin]),
+            n_parents=res.n_parents,
+            n_children=res.n_children + 1,
+            n_unrecruited=res.n_unrecruited,
+        )
+
+    monkeypatch.setattr(rounds_mod.rf, "next_templates", _dup)
+
+
+def test_a_redundant_template_is_merged_before_the_next_round(tmp_path, monkeypatch):
+    _duplicate_first_template(monkeypatch)
+    out = tmp_path / "em"
+    run_em(_panel(tmp_path), out, params=_params(rounds=2, min_aa_length=40))
+    st = json.loads((out / "rounds" / "r01" / "merge" / "stats.json").read_text())
+    assert st["n_pairs"] >= 1 and st["n_merged"] >= 1 and st["merge_applied"]
+    lin = pq.read_table(out / "rounds" / "r01" / "lineage.parquet")
+    assert "merge" in lin.column("rule").to_pylist()
+    with pa.memory_map(str(out / "rounds" / "r02" / "templates" / "templates.arrow")) as mm:
+        r2 = pa.ipc.open_file(mm).read_all()
+        seqs = r2.column("sequence").to_pylist()
+    assert len(seqs) == len(set(seqs)), "the duplicate reached round 2"
+
+
+def test_no_merge_still_reports_redundancy(tmp_path, monkeypatch):
+    _duplicate_first_template(monkeypatch)
+    out = tmp_path / "em"
+    run_em(_panel(tmp_path), out, params=_params(rounds=2, min_aa_length=40, merge=False))
+    st = json.loads((out / "rounds" / "r01" / "merge" / "stats.json").read_text())
+    assert st["removable"] >= 1 and st["n_merged"] == 0 and not st["merge_applied"]
+    from constellation.sequencing.transcriptome.cluster.denovo.em.diagnostics import (
+        section_redundancy,
+    )
+
+    sec = section_redundancy(out)
+    assert "after r1" in sec.body
+
+
+def test_the_final_output_merges_twins_and_keeps_every_read(tmp_path, monkeypatch):
+    """A final node whose reads the M-step split across an identical twin."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import (
+        rounds as rounds_mod,
+    )
+
+    corpus = _panel(tmp_path)
+    base = tmp_path / "base"
+    run_em(corpus, base, params=_params(rounds=1, min_aa_length=40))
+    base_clusters = pq.read_table(base / "clusters.parquet")
+
+    real = rounds_mod._one_round
+
+    def _twin(*a, **k):
+        result, assignments, nodes, membership = real(*a, **k)
+        twin = nodes.slice(0, 1)
+        i = twin.schema.get_field_index("haplotype_id")
+        twin = twin.set_column(i, twin.schema.field(i), pa.array([99], pa.int32()))
+        pid = nodes.column("parent_template_id")[0].as_py()
+        hap = nodes.column("haplotype_id")[0].as_py()
+        mp = membership.column("parent_template_id").to_numpy()
+        mh = membership.column("haplotype_id").to_numpy()
+        mine = np.flatnonzero((mp == pid) & (mh == hap))
+        new_hap = mh.copy()
+        new_hap[mine[: mine.size // 2]] = 99
+        j = membership.schema.get_field_index("haplotype_id")
+        membership = membership.set_column(
+            j, membership.schema.field(j), pa.array(new_hap.astype(np.int32))
+        )
+        return result, assignments, pa.concat_tables([nodes, twin]), membership
+
+    monkeypatch.setattr(rounds_mod, "_one_round", _twin)
+    out = tmp_path / "em"
+    run_em(corpus, out, params=_params(rounds=1, min_aa_length=40))
+    clusters = pq.read_table(out / "clusters.parquet")
+    assert clusters.num_rows == base_clusters.num_rows
+    assert sum(clusters.column("n_reads").to_pylist()) == sum(
+        base_clusters.column("n_reads").to_pylist()
+    )
+    st = json.loads(
+        (out / "rounds" / "r01" / "merge_final" / "stats.json").read_text()
+    )
+    assert st["n_merged"] == 1
+
+
+def _r2_sequences(out):
+    with pa.memory_map(str(out / "rounds" / "r02" / "templates" / "templates.arrow")) as mm:
+        return sorted(pa.ipc.open_file(mm).read_all().column("sequence").to_pylist())
+
+
+def test_a_resumed_round_merges_exactly_as_the_live_one(tmp_path, monkeypatch):
+    """Killed after the redundancy scan and before the marker: the resume
+    rebuild goes through the same refine-and-merge path, reusing the pairs."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import (
+        rounds as rounds_mod,
+    )
+
+    _duplicate_first_template(monkeypatch)
+    corpus = _panel(tmp_path)
+    clean = tmp_path / "clean"
+    run_em(corpus, clean, params=_params(rounds=2, min_aa_length=40))
+
+    out = tmp_path / "em"
+    real_apply = rounds_mod.rf.apply_merge
+
+    def _die(*a, **k):
+        raise RuntimeError("killed between the scan and the marker")
+
+    monkeypatch.setattr(rounds_mod.rf, "apply_merge", _die)
+    with pytest.raises(RuntimeError):
+        run_em(corpus, out, params=_params(rounds=2, min_aa_length=40))
+    assert (out / "rounds" / "r01" / "merge" / "pairs.parquet").exists()
+    assert not (out / "rounds" / "r01" / "_SUCCESS").exists()
+
+    monkeypatch.setattr(rounds_mod.rf, "apply_merge", real_apply)
+    run_em(corpus, out, params=_params(rounds=2, min_aa_length=40), resume=True)
+    assert _r2_sequences(out) == _r2_sequences(clean)

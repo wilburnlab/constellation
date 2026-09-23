@@ -372,6 +372,66 @@ def section_cluster_sizes(em_dir: Path) -> ReportSection:
     return ReportSection(title="Cluster sizes", body=body, flags=flags)
 
 
+def _merge_stats(path: Path) -> dict | None:
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def section_redundancy(em_dir: Path) -> ReportSection:
+    """Redundant templates per round and in the final output. FLAGS-level.
+
+    A template set where a large fraction is near-identical to another member
+    has a count that does not mean anything, and every redundant template
+    costs E-step time. ``removable`` collapses each connected component to
+    one — the upper bound a merge could remove; ``merged`` is what the
+    radius-1 merge actually removed.
+    """
+    rows, flags = [], []
+    for r, d in _rounds(em_dir):
+        for label, sub in ((f"after r{r}", "merge"), ("final output", "merge_final")):
+            st = _merge_stats(d / sub / "stats.json")
+            if st is not None:
+                rows.append((label, st))
+    if not rows:
+        return ReportSection(title="Redundancy", body="_no redundancy scans recorded_")
+
+    lines = [
+        "| set | templates | pairs ≥ p_merge | in pairs | comp. median / p90 / max "
+        "| removable | merged | near-threshold pairs |",
+        "|---|---:|---:|---:|---|---:|---:|---:|",
+    ]
+    for label, st in rows:
+        lines.append(
+            f"| {label} | {st['n_templates']:,} | {st['n_pairs']:,} | "
+            f"{st['n_in_pairs']:,} | {st['component_size_median']:.0f} / "
+            f"{st['component_size_p90']:.0f} / {st['component_size_max']:,} | "
+            f"{st['removable']:,} ({st['removable_frac']:.1%}) | "
+            f"{st.get('n_merged', 0):,} | {st.get('n_near_threshold_pairs', 0):,} |"
+        )
+        frac = float(st["removable_frac"])
+        if label == "final output" and frac > 0.05:
+            flags.append(
+                f"final output: {frac:.1%} of clusters are redundant (identity ≥ "
+                f"{st['p_merge']}, mutual coverage) — the cluster count does not "
+                "mean anything at that level"
+            )
+        elif not st.get("merge_applied", True) and frac > 0.05:
+            flags.append(
+                f"{label}: {frac:.1%} of next templates are redundant and merge "
+                "is off — the template count does not mean anything, and each "
+                "redundant template costs E-step time"
+            )
+    hist = rows[-1][1].get("identity_hist") or {}
+    body = "\n".join(lines)
+    if hist:
+        body += (
+            "\n\nPair identity, last scan (pairs ≥ 0.99 are reported; only ≥ "
+            "p_merge merge — the 0.990–0.995 band is where a genuine "
+            "single-position variant lives, so watch it):\n\n| identity | pairs |\n"
+            "|---|---:|\n" + "\n".join(f"| {k} | {v:,} |" for k, v in hist.items())
+        )
+    return ReportSection(title="Redundancy", body=body, flags=flags)
+
+
 def build_em_report(em_dir: Path) -> Path:
     """Assemble the EM diagnostics report under ``diagnostics/report.md``."""
     from constellation.sequencing._render import render_report
@@ -384,6 +444,7 @@ def build_em_report(em_dir: Path) -> Path:
         section_seeding,
         section_convergence,
         section_candidate_pool,
+        section_redundancy,
         section_assignment_rule,
         section_reference_drift,
         section_cluster_sizes,
@@ -416,6 +477,7 @@ __all__ = [
     "section_candidate_pool",
     "section_cluster_sizes",
     "section_convergence",
+    "section_redundancy",
     "section_reference_drift",
     "section_seeding",
 ]

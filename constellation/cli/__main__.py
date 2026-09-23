@@ -1319,6 +1319,36 @@ def _build_transcriptome_parser(subs) -> None:
         "saturation warning fires.",
     )
     p_cluster.add_argument(
+        "--no-merge",
+        action="store_true",
+        help="em: do not merge redundant templates (whole-template identity >= "
+        "--p-merge, coverage >= --merge-min-coverage both ways) between "
+        "rounds or in the final output. Redundancy is still detected and "
+        "reported. Measured without merge, ~29%% of a 9.4M-read run's final "
+        "templates were redundant.",
+    )
+    p_cluster.add_argument(
+        "--p-merge",
+        type=float,
+        default=None,
+        help="em: whole-template identity at or above which two templates are "
+        "redundant (default 0.995 — stricter than --p-floor, because a merge "
+        "is a stronger claim than an assignment).",
+    )
+    p_cluster.add_argument(
+        "--merge-min-coverage",
+        type=float,
+        default=None,
+        help="em: each template of a redundant pair must be covered at least "
+        "this much by the alignment (default 0.95).",
+    )
+    p_cluster.add_argument(
+        "--merge-from-round",
+        type=int,
+        default=None,
+        help="em: merge only after rounds >= this (default 1: every round).",
+    )
+    p_cluster.add_argument(
         "--estep-aligner",
         choices=("minimap2", "edlib"),
         default="minimap2",
@@ -3512,6 +3542,23 @@ def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
             "nothing — only the --mode em-* E-step has an aligner choice",
         ),
     ]
+    banned.append(
+        (
+            "--no-merge",
+            args.no_merge and not em,
+            "nothing — only the --mode em-* loop merges templates",
+        )
+    )
+    for flag in ("--p-merge", "--merge-min-coverage", "--merge-from-round"):
+        dest = flag[2:].replace("-", "_")
+        banned.append(
+            (
+                flag,
+                getattr(args, dest) is not None and (not em or args.no_merge),
+                "--mode em-* without --no-merge, which is the only place "
+                "templates merge",
+            )
+        )
     edlib = em and args.estep_aligner == "edlib"
     for flag in (
         "--estep-shortlist-k",
@@ -3594,6 +3641,16 @@ def _cmd_transcriptome_cluster_em(
         ),
         estep_align_workers=(
             0 if args.estep_align_workers is None else int(args.estep_align_workers)
+        ),
+        merge=not args.no_merge,
+        p_merge=0.995 if args.p_merge is None else float(args.p_merge),
+        merge_min_coverage=(
+            0.95
+            if args.merge_min_coverage is None
+            else float(args.merge_min_coverage)
+        ),
+        merge_from_round=(
+            1 if args.merge_from_round is None else int(args.merge_from_round)
         ),
         delta_logl=float(args.near_tie_delta_logl),
         support_ratio=float(args.support_ratio),
