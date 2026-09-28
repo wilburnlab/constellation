@@ -234,9 +234,20 @@ def test_unbounded_overhangs_are_spellable():
         ("em-orf", "--estep-shortlist-frac", "0.7"),
         ("em-kmer", "--estep-align-workers", "4"),
         ("kmer", "--estep-aligner", "edlib"),
-        # Merge exists only in the em loop, and its knobs only when it is on.
-        ("kmer", "--p-merge", "0.99"),
+        # The template graph and the merge exist only in the em loop.
+        ("kmer", "--template-graph", "final"),
+        ("kmer", "--merge-max-edits", "1"),
+        ("kmer", "--graph-identity-floor", "0.98"),
+        # --merge-from-round only schedules merging, which is off by default.
+        ("em-kmer", "--merge-from-round", "3"),
         ("em-kmer --no-merge", "--merge-from-round", "3"),
+        # With the graph off nothing reads the graph's or the predicate's knobs.
+        ("em-kmer --template-graph off", "--graph-5p-tolerance", "20"),
+        ("em-kmer --template-graph off", "--merge-max-edits", "1"),
+        ("em-orf --template-graph off", "--merge-min-reads", "5"),
+        # Under 'final' only the final output merges, and that merge is exact.
+        ("em-kmer --merge --template-graph final", "--merge-from-round", "2"),
+        ("em-kmer --merge --template-graph final", "--merge-max-edits", "1"),
     ],
 )
 def test_a_flag_this_mode_ignores_is_an_error(mode, flag, value):
@@ -333,10 +344,208 @@ def test_the_two_pass_estep_is_opt_in_and_its_knobs_apply_under_it():
     assert _reject_inapplicable(args, "em", "kmer") is None
 
 
-def test_merge_is_on_by_default_and_its_knobs_apply_under_em():
+def test_merge_is_off_by_default_and_both_spellings_parse():
+    """`--no-merge` stays valid as the explicit default, so a script that
+    passed it keeps meaning what it meant."""
     from constellation.cli.__main__ import _reject_inapplicable
 
-    args = _args("--mode", "em-kmer", "--p-merge", "0.998", "--merge-from-round", "2")
-    assert not args.no_merge
-    assert _reject_inapplicable(args, "em", "kmer") is None
-    assert _reject_inapplicable(_args("--mode", "kmer", "--no-merge"), "kmer", "orf")
+    assert _args("--mode", "em-kmer").merge is None
+    assert _args("--mode", "em-kmer", "--merge").merge is True
+    explicit = _args("--mode", "em-kmer", "--no-merge")
+    assert explicit.merge is False
+    assert _reject_inapplicable(explicit, "em", "kmer") is None
+    for spelling in ("--merge", "--no-merge"):
+        problem = _reject_inapplicable(_args("--mode", "kmer", spelling), "kmer", "orf")
+        assert problem is not None and spelling in problem
+
+
+def test_the_predicate_applies_to_the_report_as_well_as_to_a_merge():
+    """The predicate defines the graph's `mergeable` column, so its knobs act
+    whether or not the run merges — that is how "what would a stricter
+    predicate collapse" is asked without collapsing anything."""
+    from constellation.cli.__main__ import _reject_inapplicable
+
+    knobs = (
+        "--merge-max-edits",
+        "1",
+        "--merge-5p-tolerance",
+        "20",
+        "--merge-3p-tolerance",
+        "20",
+        "--merge-min-reads",
+        "5",
+        "--merge-siblings",
+    )
+    assert _reject_inapplicable(_args("--mode", "em-kmer", *knobs), "em", "kmer") is None
+    merging = _args("--mode", "em-kmer", "--merge", "--merge-from-round", "2", *knobs)
+    assert _reject_inapplicable(merging, "em", "kmer") is None
+    final = _args("--mode", "em-orf", "--merge", "--template-graph", "final")
+    assert _reject_inapplicable(final, "em", "orf") is None
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "replacement"),
+    [
+        ("--p-merge", "0.999", "--merge-max-edits"),
+        ("--merge-min-coverage", "0.95", "--merge-5p-tolerance"),
+    ],
+)
+@pytest.mark.parametrize("mode", ["em-kmer", "em-orf", "kmer", "genome"])
+def test_the_removed_merge_flags_say_what_replaced_them(mode, flag, value, replacement):
+    """What they meant is gone — identity on a local alignment, end tolerance
+    as a proportion — so accepting one silently would misreport the run, and
+    "this mode does not use it" would be the wrong thing to say."""
+    from constellation.cli.__main__ import _em_seeding, _normalise_cluster_mode
+    from constellation.cli.__main__ import _reject_inapplicable
+
+    args = _args("--mode", mode, flag, value)
+    canonical = _normalise_cluster_mode(mode)
+    seeding = _em_seeding(mode) if canonical == "em" else "orf"
+    problem = _reject_inapplicable(args, canonical, seeding)
+    assert problem is not None
+    assert flag in problem and "removed" in problem and replacement in problem
+
+
+def test_the_removed_flags_are_hidden_from_help():
+    from constellation.cli.__main__ import _build_parser
+
+    parser = _build_parser()
+    cluster = parser._subparsers._group_actions[0].choices["transcriptome"]
+    cluster = cluster._subparsers._group_actions[0].choices["cluster"]
+    text = cluster.format_help()
+    assert "--p-merge" not in text and "--merge-min-coverage" not in text
+    assert "--template-graph" in text and "--merge-max-edits" in text
+
+
+def test_the_escape_hatch_refuses_merge():
+    """`--template-graph off` runs nothing after the M-step, and a merge
+    reads the graph."""
+    from constellation.cli.__main__ import _reject_inapplicable
+
+    off = _args("--mode", "em-kmer", "--template-graph", "off")
+    assert _reject_inapplicable(off, "em", "kmer") is None
+    both = _args("--mode", "em-kmer", "--template-graph", "off", "--merge")
+    problem = _reject_inapplicable(both, "em", "kmer")
+    assert problem is not None and "--template-graph off" in problem
+
+
+def _resolved(*extra):
+    from constellation.cli.__main__ import _em_params
+    from constellation.sequencing.transcriptome.cluster.denovo.em.graph import (
+        GraphParams,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        EmParams,
+    )
+
+    args = _args("--mode", "em-kmer", *extra)
+    return _em_params(args, "kmer", EmParams, GraphParams, MStepParams)
+
+
+def test_a_run_reports_and_merges_nothing_unless_asked():
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        EmParams,
+    )
+
+    for params in (EmParams(), _resolved()):
+        assert params.template_graph == "rounds"
+        assert params.merge is False
+        assert not any(params.merges_after(r) for r in range(1, 13))
+        pred = params.merge_predicate()
+        assert (pred.max_edits, pred.tol_5p, pred.tol_3p) == (0, 30, 30)
+        assert pred.min_reads == 0 and pred.merge_siblings is False
+    assert not hasattr(EmParams(), "p_merge")
+    assert not hasattr(EmParams(), "merge_min_coverage")
+
+
+def test_the_merge_flags_reach_the_predicate():
+    params = _resolved(
+        "--merge",
+        "--merge-from-round",
+        "3",
+        "--merge-max-edits",
+        "1",
+        "--merge-5p-tolerance",
+        "10",
+        "--merge-min-reads",
+        "4",
+        "--merge-siblings",
+        "--graph-3p-tolerance",
+        "50",
+        "--graph-identity-floor",
+        "0.98",
+    )
+    assert params.merge and not params.merges_after(2) and params.merges_after(3)
+    pred = params.merge_predicate()
+    assert (pred.max_edits, pred.tol_5p, pred.min_reads) == (1, 10, 4)
+    assert pred.merge_siblings is True
+    # An unset merge tolerance is the graph's.
+    assert pred.tol_3p == 50 == params.graph.tol_3p
+    assert params.graph.identity_floor == 0.98
+    assert params.graph.bucket_cap == 20_480
+
+
+def test_under_final_only_the_final_output_merges():
+    params = _resolved("--merge", "--template-graph", "final")
+    assert params.merge and not any(params.merges_after(r) for r in range(1, 13))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"merge": True, "template_graph": "off"}, "needs the template graph"),
+        ({"merge_tol_5p": 31}, "merge_tol_5p"),
+        ({"merge_tol_3p": -1}, "merge_tol_3p"),
+        ({"merge_max_edits": -1}, "merge_max_edits"),
+        ({"merge_from_round": 0}, "merge_from_round"),
+        ({"template_graph": "sometimes"}, "template_graph"),
+        (
+            {"merge": True, "template_graph": "final", "merge_from_round": 2},
+            "merge_from_round",
+        ),
+        (
+            {"merge": True, "template_graph": "final", "merge_max_edits": 1},
+            "always exact",
+        ),
+        # A knob that cannot act is an error here too, not only in the parser.
+        ({"merge_from_round": 3}, "merge_from_round has no effect without merge"),
+        ({"template_graph": "final", "merge_from_round": 2}, "merge_from_round"),
+        ({"template_graph": "off", "merge_max_edits": 1}, "merge_max_edits has no effect"),
+        ({"template_graph": "off", "merge_tol_5p": 10}, "merge_tol_5p has no effect"),
+        ({"template_graph": "off", "merge_min_reads": 3}, "merge_min_reads has no effect"),
+        ({"template_graph": "off", "merge_siblings": True}, "merge_siblings has no effect"),
+        # Not counts: a float would be truncated, a string is truthy.
+        ({"merge_tol_5p": 10.5}, "merge_tol_5p must be an int"),
+        ({"merge_max_edits": 1.5}, "merge_max_edits must be an int"),
+        ({"merge_min_reads": True}, "merge_min_reads must be an int"),
+        ({"merge": "yes"}, "merge must be a bool"),
+    ],
+)
+def test_emparams_refuses_what_the_cli_refuses(kwargs, match):
+    """The library is a second way in, so the rule is not only the parser's."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        EmParams,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        EmParams(**kwargs)
+
+
+def test_graph_parameters_have_no_effect_with_the_graph_off():
+    from constellation.sequencing.transcriptome.cluster.denovo.em.graph import (
+        GraphParams,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        EmParams,
+    )
+
+    with pytest.raises(ValueError, match="graph parameters have no effect"):
+        EmParams(template_graph="off", graph=GraphParams(tol_5p=20))
+    # How the work is cut up is a parameter of the graph too; with no graph
+    # there is no work.
+    with pytest.raises(ValueError, match="graph parameters have no effect"):
+        EmParams(template_graph="off", graph=GraphParams(chunk_rows=1_000))
+    assert EmParams(template_graph="off").graph == GraphParams()

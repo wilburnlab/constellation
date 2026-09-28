@@ -373,6 +373,7 @@ def test_the_diagnostics_report_is_emitted_and_reads_the_real_artifacts(
     for heading in (
         "Convergence",
         "Candidate pool",
+        "Template relationships",
         "Assignment rule",
         "Reference drift",
         "Cluster sizes",
@@ -620,7 +621,8 @@ def test_a_half_written_lineage_is_replaced_rather_than_trusted(tmp_path):
 
 
 def test_stale_optional_exports_do_not_survive_a_later_run(tmp_path):
-    """proteins.fasta / cluster.fa / feature_quant are all conditional.
+    """proteins.fasta / cluster.fa / feature_quant / cluster_edges are all
+    conditional.
 
     A file the current export does not produce is not "unchanged" — it
     describes results that no longer exist, and nothing on disk marks it
@@ -634,7 +636,13 @@ def test_stale_optional_exports_do_not_survive_a_later_run(tmp_path):
 
     out = tmp_path / "exports"
     out.mkdir()
-    for name in ("proteins.fasta", "cluster.fa", "feature_quant.parquet"):
+    optional = (
+        "proteins.fasta",
+        "cluster.fa",
+        "feature_quant.parquet",
+        "cluster_edges.parquet",
+    )
+    for name in optional:
         (out / name).write_bytes(b"from an earlier run\n")
 
     write_em_outputs(
@@ -643,7 +651,7 @@ def test_stale_optional_exports_do_not_survive_a_later_run(tmp_path):
         CLUSTER_MEMBERSHIP_TABLE.empty_table(),
         None,
     )
-    for name in ("proteins.fasta", "cluster.fa", "feature_quant.parquet"):
+    for name in optional:
         assert not (out / name).exists(), f"{name} outlived the results it described"
 
 
@@ -758,12 +766,14 @@ def test_a_pre_stamp_seed_dir_cannot_be_resumed_as_kmer(corpus_dir, tmp_path):
         run_em(corpus_dir, out, params=_kmer_params(rounds=1), resume=True)
 
 
-# ── merge (2026-09-23) ────────────────────────────────────────────────
+# ── the template graph, and the opt-in merge ─────────────────────────
 #
-# The synthetic panels make no redundancy of their own (their templates differ
-# in extent or sequence), so these inject it: a duplicated template between
-# rounds, and a final node whose reads are split across an identical twin —
-# the shape the real-data M-step leaves behind.
+# The synthetic panels make nothing mergeable of their own (their templates
+# differ in extent or sequence), so these inject it: a second node carrying
+# the first one's consensus and half its reads — the shape the real-data
+# M-step leaves behind. It is written into the node and membership SHARDS,
+# not only returned, because a resumed run rebuilds a round's successor from
+# the shards and would otherwise never see it.
 
 
 def _panel(tmp_path, seed=7):
@@ -775,109 +785,86 @@ def _panel(tmp_path, seed=7):
     return _write_demux(tmp_path, rows)
 
 
-def _duplicate_first_template(monkeypatch):
-    from constellation.sequencing.transcriptome.cluster.denovo.em import (
-        rounds as rounds_mod,
-    )
-    from constellation.sequencing.transcriptome.cluster.denovo.em.refine import (
-        RefineResult,
-        template_id_for,
-    )
+def _twin_first_node(monkeypatch, *, sibling: bool, trim_5p: int = 0):
+    """Give node 0 a twin after every M-step.
 
-    real = rounds_mod.rf.next_templates
-
-    def _dup(nodes, store, *, round_index):
-        res = real(nodes, store, round_index=round_index)
-        t = res.templates
-        twin = t.slice(0, 1)
-        new_id = int(template_id_for(round_index + 1, 10_000))
-        twin = twin.set_column(
-            0, t.schema.field(0), pa.array([new_id], pa.int64())
-        )
-        lin = res.lineage.slice(0, 1)
-        lin = lin.set_column(1, lin.schema.field(1), pa.array([new_id], pa.int64()))
-        return RefineResult(
-            templates=pa.concat_tables([t, twin]),
-            lineage=pa.concat_tables([res.lineage, lin]),
-            n_parents=res.n_parents,
-            n_children=res.n_children + 1,
-            n_unrecruited=res.n_unrecruited,
-        )
-
-    monkeypatch.setattr(rounds_mod.rf, "next_templates", _dup)
-
-
-def test_a_redundant_template_is_merged_before_the_next_round(tmp_path, monkeypatch):
-    _duplicate_first_template(monkeypatch)
-    out = tmp_path / "em"
-    run_em(_panel(tmp_path), out, params=_params(rounds=2, min_aa_length=40))
-    st = json.loads((out / "rounds" / "r01" / "merge" / "stats.json").read_text())
-    assert st["n_pairs"] >= 1 and st["n_merged"] >= 1 and st["merge_applied"]
-    lin = pq.read_table(out / "rounds" / "r01" / "lineage.parquet")
-    assert "merge" in lin.column("rule").to_pylist()
-    with pa.memory_map(str(out / "rounds" / "r02" / "templates" / "templates.arrow")) as mm:
-        r2 = pa.ipc.open_file(mm).read_all()
-        seqs = r2.column("sequence").to_pylist()
-    assert len(seqs) == len(set(seqs)), "the duplicate reached round 2"
-
-
-def test_no_merge_still_reports_redundancy(tmp_path, monkeypatch):
-    _duplicate_first_template(monkeypatch)
-    out = tmp_path / "em"
-    run_em(_panel(tmp_path), out, params=_params(rounds=2, min_aa_length=40, merge=False))
-    st = json.loads((out / "rounds" / "r01" / "merge" / "stats.json").read_text())
-    assert st["removable"] >= 1 and st["n_merged"] == 0 and not st["merge_applied"]
-    from constellation.sequencing.transcriptome.cluster.denovo.em.diagnostics import (
-        section_redundancy,
-    )
-
-    sec = section_redundancy(out)
-    assert "after r1" in sec.body
-
-
-def test_the_final_output_merges_twins_and_keeps_every_read(tmp_path, monkeypatch):
-    """A final node whose reads the M-step split across an identical twin."""
+    ``sibling`` makes the twin a second node of the SAME parent — what a split
+    looks like. Otherwise it hangs off another template, so the two are
+    unrelated by lineage. ``trim_5p`` shortens the twin's 5' end:
+    a byte-identical twin is mergeable whatever its lineage, one that differs
+    in extent is not.
+    """
     from constellation.sequencing.transcriptome.cluster.denovo.em import (
         rounds as rounds_mod,
     )
 
-    corpus = _panel(tmp_path)
-    base = tmp_path / "base"
-    run_em(corpus, base, params=_params(rounds=1, min_aa_length=40))
-    base_clusters = pq.read_table(base / "clusters.parquet")
+    real = rounds_mod._run_mstep
 
-    real = rounds_mod._one_round
+    def _with_twin(r, rd, store, corpus, assignments, params, log):
+        nodes, membership = real(r, rd, store, corpus, assignments, params, log)
+        pid = int(nodes.column("parent_template_id")[0].as_py())
+        hap = int(nodes.column("haplotype_id")[0].as_py())
+        if sibling:
+            twin_pid, twin_row, twin_hap = (
+                pid,
+                int(nodes.column("parent_template_row")[0].as_py()),
+                99,
+            )
+        else:
+            # A template that recruited nothing, if there is one; by round 2
+            # there usually is not, and then another parent's node gets a
+            # second haplotype. Either way the twin is no kin of node 0.
+            rows = nodes.column("parent_template_row").to_pylist()
+            free = [i for i in range(store.n_templates) if i not in set(rows)]
+            other = [i for i in rows if i != rows[0]]
+            twin_row, twin_hap = (free[0], 0) if free else (other[0], 99)
+            twin_pid = int(store.template_id[twin_row])
 
-    def _twin(*a, **k):
-        result, assignments, nodes, membership = real(*a, **k)
-        twin = nodes.slice(0, 1)
-        i = twin.schema.get_field_index("haplotype_id")
-        twin = twin.set_column(i, twin.schema.field(i), pa.array([99], pa.int32()))
-        pid = nodes.column("parent_template_id")[0].as_py()
-        hap = nodes.column("haplotype_id")[0].as_py()
-        mp = membership.column("parent_template_id").to_numpy()
-        mh = membership.column("haplotype_id").to_numpy()
-        mine = np.flatnonzero((mp == pid) & (mh == hap))
-        new_hap = mh.copy()
-        new_hap[mine[: mine.size // 2]] = 99
-        j = membership.schema.get_field_index("haplotype_id")
+        m_pid = membership.column("parent_template_id").to_numpy()
+        m_hap = membership.column("haplotype_id").to_numpy()
+        mine = np.flatnonzero((m_pid == pid) & (m_hap == hap))
+        moved = mine[: mine.size // 2]
+        new_pid, new_hap = m_pid.copy(), m_hap.copy()
+        new_pid[moved], new_hap[moved] = twin_pid, twin_hap
         membership = membership.set_column(
-            j, membership.schema.field(j), pa.array(new_hap.astype(np.int32))
-        )
-        return result, assignments, pa.concat_tables([nodes, twin]), membership
+            membership.schema.get_field_index("parent_template_id"),
+            "parent_template_id",
+            pa.array(new_pid, pa.int64()),
+        ).set_column(
+            membership.schema.get_field_index("haplotype_id"),
+            "haplotype_id",
+            pa.array(new_hap.astype(np.int32)),
+        ).cast(membership.schema)
 
-    monkeypatch.setattr(rounds_mod, "_one_round", _twin)
-    out = tmp_path / "em"
-    run_em(corpus, out, params=_params(rounds=1, min_aa_length=40))
-    clusters = pq.read_table(out / "clusters.parquet")
-    assert clusters.num_rows == base_clusters.num_rows
-    assert sum(clusters.column("n_reads").to_pylist()) == sum(
-        base_clusters.column("n_reads").to_pylist()
-    )
-    st = json.loads(
-        (out / "rounds" / "r01" / "merge_final" / "stats.json").read_text()
-    )
-    assert st["n_merged"] == 1
+        def put(table, name, values, kind):
+            i = table.schema.get_field_index(name)
+            return table.set_column(i, table.schema.field(i), pa.array(values, kind))
+
+        first, twin = nodes.slice(0, 1), nodes.slice(0, 1)
+        first = put(first, "n_reads", [mine.size - moved.size], pa.int64())
+        first = put(first, "node_weight", [float(mine.size - moved.size)], pa.float64())
+        twin = put(twin, "parent_template_id", [twin_pid], pa.int64())
+        twin = put(twin, "parent_template_row", [twin_row], pa.int32())
+        twin = put(twin, "haplotype_id", [twin_hap], pa.int32())
+        twin = put(twin, "n_reads", [moved.size], pa.int64())
+        twin = put(twin, "node_weight", [float(moved.size)], pa.float64())
+        if trim_5p:
+            seq = twin.column("consensus")[0].as_py()[trim_5p:]
+            twin = put(twin, "consensus", [seq], pa.large_string())
+        nodes = pa.concat_tables([first, nodes.slice(1), twin]).cast(nodes.schema)
+
+        for sub, table in (("nodes", nodes), ("node_membership", membership)):
+            shard_dir = rd / "mstep" / sub
+            for old in shard_dir.glob("part-*.parquet"):
+                old.unlink()
+            pq.write_table(table, shard_dir / "part-00000.parquet")
+        return nodes, membership
+
+    monkeypatch.setattr(rounds_mod, "_run_mstep", _with_twin)
+
+
+def _json(path):
+    return json.loads(Path(path).read_text())
 
 
 def _r2_sequences(out):
@@ -885,30 +872,325 @@ def _r2_sequences(out):
         return sorted(pa.ipc.open_file(mm).read_all().column("sequence").to_pylist())
 
 
-def test_a_resumed_round_merges_exactly_as_the_live_one(tmp_path, monkeypatch):
-    """Killed after the redundancy scan and before the marker: the resume
-    rebuild goes through the same refine-and-merge path, reusing the pairs."""
+def test_the_default_reports_edges_and_merges_nothing(tmp_path, monkeypatch):
+    """Report-only: the twin is an edge in the graph, and still a template."""
+    _twin_first_node(monkeypatch, sibling=False)
+    out = tmp_path / "em"
+    run_em(_panel(tmp_path), out, params=_params(rounds=2, min_aa_length=40))
+
+    r1 = out / "rounds" / "r01"
+    record = _json(r1 / "refine.json")
+    assert record["graph"] == "ok" and not record["merge_applied"]
+    assert record["n_merged"] == 0
+    edges = pq.read_table(r1 / "graph" / "edges.parquet")
+    twins = edges.filter(pa.array(edges.column("n_edits").to_numpy() == 0))
+    assert twins.num_rows >= 1
+    assert "equivalent" in twins.column("relation").to_pylist()
+    assert any(twins.column("mergeable").to_pylist())
+    assert pq.read_table(r1 / "merged.parquet").num_rows == 0
+    assert "merge" not in pq.read_table(r1 / "lineage.parquet").column("rule").to_pylist()
+    seqs = _r2_sequences(out)
+    assert len(seqs) > len(set(seqs)), "the twin should have reached round 2"
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.diagnostics import (
+        section_template_graph,
+    )
+
+    body = section_template_graph(out).body
+    assert "| r1 |" in body and "Final output (r2)" in body
+    assert (out / "cluster_edges.parquet").exists()
+    assert _json(out / "manifest.json")["outputs"]["cluster_edges"] == (
+        "cluster_edges.parquet"
+    )
+
+
+def test_an_exact_twin_is_merged_when_merge_is_on(tmp_path, monkeypatch):
+    _twin_first_node(monkeypatch, sibling=False)
+    out = tmp_path / "em"
+    run_em(_panel(tmp_path), out, params=_params(rounds=2, min_aa_length=40, merge=True))
+
+    r1 = out / "rounds" / "r01"
+    record = _json(r1 / "refine.json")
+    assert record["merge_applied"] and record["n_merged"] >= 1
+    assert record["n_templates_after"] == (
+        record["n_templates_before"] - record["n_merged"]
+    )
+    assert record["predicate"]["max_edits"] == 0 and "graph_stamp" in record
+    lin = pq.read_table(r1 / "lineage.parquet")
+    assert "merge" in lin.column("rule").to_pylist()
+    assert pq.read_table(r1 / "merged.parquet").num_rows == record["n_merged"]
+    seqs = _r2_sequences(out)
+    assert len(seqs) == len(set(seqs)), "the twin reached round 2"
+
+
+def test_the_final_output_merges_twins_and_keeps_every_read(tmp_path, monkeypatch):
+    """A final node whose reads the M-step split across an identical twin."""
+    corpus = _panel(tmp_path)
+    base = tmp_path / "base"
+    run_em(corpus, base, params=_params(rounds=1, min_aa_length=40))
+    base_clusters = pq.read_table(base / "clusters.parquet")
+
+    _twin_first_node(monkeypatch, sibling=False)
+    out = tmp_path / "em"
+    run_em(corpus, out, params=_params(rounds=1, min_aa_length=40, merge=True))
+    clusters = pq.read_table(out / "clusters.parquet")
+    assert clusters.num_rows == base_clusters.num_rows
+    assert sum(clusters.column("n_reads").to_pylist()) == sum(
+        base_clusters.column("n_reads").to_pylist()
+    )
+    final = _json(out / "rounds" / "r01" / "final.json")
+    assert final["merge_applied"] and final["n_merged"] == 1
+    assert final["n_clusters"] == clusters.num_rows
+    assert final["n_twin_clusters"] == 0
+    assert pq.read_table(out / "rounds" / "r01" / "merged_final.parquet").num_rows == 1
+
+    edges = pq.read_table(out / "cluster_edges.parquet")
+    src = edges.column("src_cluster_id").to_pylist()
+    dst = edges.column("dst_cluster_id").to_pylist()
+    assert all(0 <= i < clusters.num_rows for i in src + dst)
+    assert all(a != b for a, b in zip(src, dst))
+
+
+def test_split_siblings_are_not_merged_unless_asked(tmp_path, monkeypatch):
+    """Two nodes of one parent that differ only in extent are what an M-step
+    split on a start mode leaves behind. Merging them back is the limit
+    cycle, so it takes --merge-siblings."""
+    corpus = _panel(tmp_path)
+    _twin_first_node(monkeypatch, sibling=True, trim_5p=12)
+
+    kept = tmp_path / "kept"
+    run_em(corpus, kept, params=_params(rounds=1, min_aa_length=40, merge=True))
+    assert _json(kept / "rounds" / "r01" / "final.json")["n_merged"] == 0
+    edges = pq.read_table(kept / "rounds" / "r01" / "graph" / "edges.parquet")
+    kin = edges.filter(edges.column("same_split_origin"))
+    assert kin.num_rows >= 1 and not any(kin.column("mergeable").to_pylist())
+
+    joined = tmp_path / "joined"
+    run_em(
+        corpus,
+        joined,
+        params=_params(rounds=1, min_aa_length=40, merge=True, merge_siblings=True),
+    )
+    final = _json(joined / "rounds" / "r01" / "final.json")
+    assert final["n_merged"] == 1
+    # Nothing rebuilds a consensus after the final merge, so the longer of
+    # the two is what is reported: no 12 nt are lost.
+    merged = pq.read_table(joined / "rounds" / "r01" / "merged_final.parquet")
+    assert merged.column("delta_5p").to_pylist() == [12]
+
+
+def test_a_round_killed_after_its_graph_finds_it_on_disk(tmp_path, monkeypatch):
+    """Killed after the graph and before the marker. The round has no marker,
+    so the resume runs it again from its E-step — to the same nodes, and so
+    to the graph that is already there."""
     from constellation.sequencing.transcriptome.cluster.denovo.em import (
         rounds as rounds_mod,
     )
 
-    _duplicate_first_template(monkeypatch)
+    _twin_first_node(monkeypatch, sibling=False)
     corpus = _panel(tmp_path)
+    params = _params(rounds=2, min_aa_length=40, merge=True)
     clean = tmp_path / "clean"
-    run_em(corpus, clean, params=_params(rounds=2, min_aa_length=40))
+    run_em(corpus, clean, params=params)
 
     out = tmp_path / "em"
     real_apply = rounds_mod.rf.apply_merge
 
     def _die(*a, **k):
-        raise RuntimeError("killed between the scan and the marker")
+        raise RuntimeError("killed between the graph and the marker")
 
     monkeypatch.setattr(rounds_mod.rf, "apply_merge", _die)
     with pytest.raises(RuntimeError):
-        run_em(corpus, out, params=_params(rounds=2, min_aa_length=40))
-    assert (out / "rounds" / "r01" / "merge" / "pairs.parquet").exists()
-    assert not (out / "rounds" / "r01" / "_SUCCESS").exists()
+        run_em(corpus, out, params=params)
+    r1 = out / "rounds" / "r01"
+    assert (r1 / "graph" / "_SUCCESS").exists()
+    assert not (r1 / "_SUCCESS").exists() and not (r1 / "refine.json").exists()
 
     monkeypatch.setattr(rounds_mod.rf, "apply_merge", real_apply)
-    run_em(corpus, out, params=_params(rounds=2, min_aa_length=40), resume=True)
+    built = []
+    real_build = rounds_mod.gr.build_graph
+
+    def _spy(*a, **k):
+        built.append(k.get("node_round"))
+        return real_build(*a, **k)
+
+    monkeypatch.setattr(rounds_mod.gr, "build_graph", _spy)
+    run_em(corpus, out, params=params, resume=True)
     assert _r2_sequences(out) == _r2_sequences(clean)
+    assert 1 not in built, "round 1's graph was on disk and was built again"
+
+
+def test_an_extended_run_merges_exactly_as_an_uninterrupted_one(tmp_path, monkeypatch):
+    """A finished round has no successor: the resume REBUILDS one from the
+    round's node shards, through the same refine-and-merge path. Two rounds
+    run as one and then one must give what two rounds run together give."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import (
+        rounds as rounds_mod,
+    )
+
+    _twin_first_node(monkeypatch, sibling=False)
+    corpus = _panel(tmp_path)
+    whole = tmp_path / "whole"
+    run_em(corpus, whole, params=_params(rounds=2, min_aa_length=40, merge=True))
+
+    out = tmp_path / "em"
+    one = _params(rounds=1, min_aa_length=40, merge=True)
+    run_em(corpus, out, params=one)
+    r1 = out / "rounds" / "r01"
+    assert not (r1 / "refine.json").exists(), "the last round is never refined"
+    assert _json(r1 / "final.json")["n_merged"] >= 1
+
+    rebuilt = []
+    real = rounds_mod._refine_and_merge
+
+    def _spy(rd, *a, **k):
+        rebuilt.append(rd.name)
+        return real(rd, *a, **k)
+
+    monkeypatch.setattr(rounds_mod, "_refine_and_merge", _spy)
+    run_em(corpus, out, params=one, resume=True)
+    assert rebuilt == ["r01"], "the resume should have rebuilt round 1's successor"
+    assert _r2_sequences(out) == _r2_sequences(whole)
+    for name in ("lineage.parquet", "merged.parquet"):
+        assert pq.read_table(r1 / name).equals(
+            pq.read_table(whole / "rounds" / "r01" / name)
+        ), name
+    assert _json(r1 / "refine.json")["n_merged"] == (
+        _json(whole / "rounds" / "r01" / "refine.json")["n_merged"]
+    )
+    assert pq.read_table(out / "clusters.parquet").equals(
+        pq.read_table(whole / "clusters.parquet")
+    )
+
+
+def test_a_rebuilt_round_replaces_the_lineage_it_found(tmp_path, monkeypatch):
+    """A round refined by something that did not merge — an older version,
+    here — has a lineage on disk that opens perfectly well. Rebuilt with
+    merge on, it needs the `merge` rows: without them the reads of an
+    absorbed template count as having chosen differently."""
+    _twin_first_node(monkeypatch, sibling=False)
+    corpus = _panel(tmp_path)
+    out = tmp_path / "em"
+    run_em(corpus, out, params=_params(rounds=2, min_aa_length=40))
+    r1 = out / "rounds" / "r01"
+    assert "merge" not in pq.read_table(r1 / "lineage.parquet").column("rule").to_pylist()
+    # What such a directory looks like: round 1 done, with its lineage and
+    # no record of how it was refined; nothing after it.
+    shutil.rmtree(out / "rounds" / "r02")
+    (r1 / "refine.json").unlink()
+    (out / "_SUCCESS").unlink(missing_ok=True)
+
+    run_em(
+        corpus,
+        out,
+        params=_params(rounds=1, min_aa_length=40, merge=True),
+        resume=True,
+    )
+    record = _json(r1 / "refine.json")
+    assert record["merge_applied"] and record["n_merged"] >= 1
+    lineage = pq.read_table(r1 / "lineage.parquet")
+    assert lineage.column("rule").to_pylist().count("merge") == record["n_merged"]
+    seqs = _r2_sequences(out)
+    assert len(seqs) == len(set(seqs))
+
+
+def test_a_graph_left_by_an_earlier_run_does_not_outlive_the_graph_being_off(tmp_path):
+    corpus = _panel(tmp_path)
+    out = tmp_path / "em"
+    run_em(corpus, out, params=_params(rounds=1, min_aa_length=40))
+    assert (out / "rounds" / "r01" / "graph").exists()
+    assert (out / "cluster_edges.parquet").exists()
+    run_em(
+        corpus,
+        out,
+        params=_params(rounds=1, min_aa_length=40, template_graph="off"),
+        resume=True,
+    )
+    assert not list(out.glob("rounds/r*/graph"))
+    assert not (out / "cluster_edges.parquet").exists()
+    assert "cluster_edges" not in _json(out / "manifest.json")["outputs"]
+    report = (out / "diagnostics" / "report.md").read_text()
+    assert "template graph disabled" in report and "| r1 |" not in report
+
+
+def test_template_graph_off_runs_no_alignment_at_all(tmp_path, monkeypatch):
+    """The escape hatch: nothing after the M-step, not a quieter something."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import (
+        rounds as rounds_mod,
+    )
+
+    def _never(*a, **k):
+        raise AssertionError("the template graph ran with template_graph='off'")
+
+    monkeypatch.setattr(rounds_mod.gr, "build_graph", _never)
+    monkeypatch.setattr(rounds_mod.gr, "split_origins", _never)
+    out = tmp_path / "em"
+    run_em(
+        _panel(tmp_path),
+        out,
+        params=_params(rounds=2, min_aa_length=40, template_graph="off"),
+    )
+    assert not list(out.glob("rounds/r*/graph"))
+    assert not (out / "cluster_edges.parquet").exists()
+    assert "cluster_edges" not in _json(out / "manifest.json")["outputs"]
+    assert _json(out / "rounds" / "r01" / "refine.json")["graph"] == "off"
+    assert _json(out / "rounds" / "r02" / "final.json")["graph"] == "off"
+    report = (out / "diagnostics" / "report.md").read_text()
+    assert "template graph disabled" in report
+
+
+def test_template_graph_final_relates_only_the_last_round(tmp_path):
+    out = tmp_path / "em"
+    run_em(
+        _panel(tmp_path),
+        out,
+        params=_params(rounds=2, min_aa_length=40, template_graph="final"),
+    )
+    assert not (out / "rounds" / "r01" / "graph").exists()
+    assert (out / "rounds" / "r02" / "graph" / "_SUCCESS").exists()
+    assert (out / "cluster_edges.parquet").exists()
+
+
+def test_an_extended_run_has_one_final_round(tmp_path):
+    """Every invocation finalises its own last round. When the run is
+    extended that round gets a successor, and its final record must go."""
+    corpus = _panel(tmp_path)
+    out = tmp_path / "em"
+    run_em(corpus, out, params=_params(rounds=1, min_aa_length=40))
+    assert (out / "rounds" / "r01" / "final.json").exists()
+    run_em(corpus, out, params=_params(rounds=1, min_aa_length=40), resume=True)
+    assert not (out / "rounds" / "r01" / "final.json").exists()
+    assert not (out / "rounds" / "r01" / "merged_final.parquet").exists()
+    assert (out / "rounds" / "r02" / "final.json").exists()
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.diagnostics import (
+        section_template_graph,
+    )
+
+    assert section_template_graph(out).body.count("Final output") == 1
+
+
+def test_merge_may_start_after_the_finished_rounds(tmp_path, monkeypatch):
+    """The natural experiment: a finished report-only run, extended with
+    merge on. Its recorded rounds did not merge, so merging "from round 1"
+    is refused, and merging from the first unrecorded round is not."""
+    _twin_first_node(monkeypatch, sibling=False)
+    corpus = _panel(tmp_path)
+    out = tmp_path / "em"
+    run_em(corpus, out, params=_params(rounds=2, min_aa_length=40))
+
+    with pytest.raises(ValueError, match="--merge-from-round 2"):
+        run_em(
+            corpus,
+            out,
+            params=_params(rounds=1, min_aa_length=40, merge=True),
+            resume=True,
+        )
+    run_em(
+        corpus,
+        out,
+        params=_params(rounds=1, min_aa_length=40, merge=True, merge_from_round=2),
+        resume=True,
+    )
+    assert _json(out / "rounds" / "r02" / "refine.json")["merge_applied"]
+    assert not _json(out / "rounds" / "r01" / "refine.json")["merge_applied"]

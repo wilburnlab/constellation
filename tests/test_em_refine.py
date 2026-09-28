@@ -552,87 +552,131 @@ def test_an_empty_template_table_opens_without_indexing_a_buffer():
     assert store.seq_buffer.size == 0
 
 
-# ── merge (2026-09-23) ────────────────────────────────────────────────
-
-import random  # noqa: E402
-import shutil  # noqa: E402
+# ── merge ─────────────────────────────────────────────────────────────
+#
+# Only the collapse lives in refine.py. WHICH pairs are mergeable is the
+# graph's question (tests/test_em_graph*.py); these tests hand the collapse
+# pairs directly and check what it does with them.
 
 from constellation.sequencing.transcriptome.cluster.denovo.em.refine import (  # noqa: E402
-    REDUNDANT_PAIR_TABLE,
+    MERGED_TABLE,
     apply_merge,
-    detect_redundant_templates,
+    claim_order,
     merge_nodes,
-    redundancy_stats,
     select_merges,
 )
 
+_TOL = {"tol_5p": 30, "tol_3p": 30}
 
-def _pairs(rows):
-    """rows = [(a, b, identity)]"""
-    return pa.table(
-        {
-            "a_row": pa.array([r[0] for r in rows], pa.int64()),
-            "b_row": pa.array([r[1] for r in rows], pa.int64()),
-            "identity": pa.array([r[2] for r in rows], pa.float64()),
-            "coverage_a": pa.array([1.0] * len(rows), pa.float64()),
-            "coverage_b": pa.array([1.0] * len(rows), pa.float64()),
-        },
-        schema=REDUNDANT_PAIR_TABLE,
-    )
+
+def _edges(rows):
+    """rows = [(a, b)] or [(a, b, off_5p, off_3p)] or [(.., identical)], by ROW."""
+    full = [tuple(r) + (0, 0, False)[len(r) - 2 :] for r in rows]
+    return {
+        "src_row": np.array([r[0] for r in full], dtype=np.int64),
+        "dst_row": np.array([r[1] for r in full], dtype=np.int64),
+        "off_5p": np.array([r[2] for r in full], dtype=np.int64),
+        "off_3p": np.array([r[3] for r in full], dtype=np.int64),
+        "identical": np.array([r[4] for r in full], dtype=bool),
+    }
+
+
+def _by_id(rows, ids):
+    """The same pairs keyed by template id, as `graph.mergeable_pairs` gives them."""
+    e = _edges(rows)
+    ids = np.asarray(ids, dtype=np.int64)
+    e["src_template_id"] = ids[e["src_row"]]
+    e["dst_template_id"] = ids[e["dst_row"]]
+    return e
+
+
+def _survivors(rows, n_reads, seq_len, **kw):
+    e = _edges(rows)
+    n = len(n_reads)
+    return select_merges(
+        n,
+        e["src_row"],
+        e["dst_row"],
+        e["off_5p"],
+        e["off_3p"],
+        np.asarray(n_reads),
+        np.asarray(seq_len),
+        identical=e["identical"],
+        **{**_TOL, **kw},
+    ).tolist()
 
 
 def test_the_best_supported_member_survives():
-    pairs = _pairs([(0, 1, 1.0), (0, 2, 0.999)])
     # 1 has the most reads and claims its direct neighbour 0; 2 is 0's
     # neighbour, not 1's, so it waits for the next round's pass.
-    assert select_merges(pairs, np.array([3, 40, 5]), np.array([900, 900, 900])).tolist() == [1, 1, 2]
+    assert _survivors([(0, 1), (0, 2)], [3, 40, 5], [900, 900, 900]) == [1, 1, 2]
     # Tie on reads: the longer wins, then the lower row.
-    pairs = _pairs([(0, 1, 1.0)])
-    assert select_merges(pairs, np.array([5, 5]), np.array([900, 950])).tolist() == [1, 1]
-    assert select_merges(pairs, np.array([5, 5]), np.array([900, 900])).tolist() == [0, 0]
+    assert _survivors([(0, 1)], [5, 5], [900, 950]) == [1, 1]
+    assert _survivors([(0, 1)], [5, 5], [900, 900]) == [0, 0]
+
+
+def test_the_longest_member_survives_when_nothing_will_rebuild_the_consensus():
+    """The final output reports the survivor's own sequence, so there the
+    order is length first: over the shared span the members agree base for
+    base, and the longest discards nobody's extension."""
+    rows = [(0, 1, 20, 0)]
+    assert _survivors(rows, [40, 3], [900, 920]) == [0, 0]
+    assert _survivors(rows, [40, 3], [900, 920], prefer="length") == [1, 1]
+    assert claim_order(np.array([40, 3]), np.array([900, 920]), "length").tolist() == [1, 0]
+    with pytest.raises(ValueError, match="prefer"):
+        claim_order(np.array([1]), np.array([1]), "reads")
 
 
 def test_merges_do_not_chain():
-    """A~B and B~C at p_merge do not license merging A with C: radius-1
-    greedy claims only DIRECT neighbours of the survivor."""
-    pairs = _pairs([(0, 1, 0.996), (1, 2, 0.996)])
-    survivor = select_merges(pairs, np.array([50, 10, 5]), np.full(3, 900))
-    assert survivor.tolist() == [0, 0, 2]
+    """A~B and B~C do not license merging A with C: radius-1 claims only
+    DIRECT neighbours of the survivor."""
+    assert _survivors([(0, 1), (1, 2)], [50, 10, 5], [900] * 3) == [0, 0, 2]
 
 
-def test_pairs_below_p_merge_are_reported_but_never_merged():
-    pairs = _pairs([(0, 1, 0.993)])
-    assert select_merges(pairs, np.array([5, 1]), np.full(2, 900)).tolist() == [0, 1]
-    st = redundancy_stats(pairs, 2)
-    assert st["n_pairs"] == 0 and st["removable"] == 0
-    assert st["n_near_threshold_pairs"] == 1
-    assert st["identity_hist"]["0.990-0.995"] == 1
+def test_a_hub_does_not_join_two_split_siblings():
+    """Pairwise, the hub is mergeable with each child of the split and the
+    children are not mergeable with each other. Grouped as a plain star they
+    would all collapse — the limit cycle, reached in one hop."""
+    rows = [(2, 0), (2, 1)]
+    reads, length = [40, 35, 90], [900] * 3
+    origin = np.array([7, 7, -1])
+    assert _survivors(rows, reads, length, origin=origin) == [2, 1, 2]
+    # --merge-siblings switches the kin guard off by passing no origin.
+    assert _survivors(rows, reads, length, origin=None) == [2, 2, 2]
+    # Byte-identical siblings cannot be told apart by reads, so they merge.
+    twins = [(2, 0, 0, 0, True), (2, 1, 0, 0, True)]
+    assert _survivors(twins, reads, length, origin=origin) == [2, 2, 2]
 
 
-def test_redundancy_stats_counts_components():
-    pairs = _pairs([(0, 1, 1.0), (1, 2, 1.0), (3, 4, 0.999)])
-    st = redundancy_stats(pairs, 10)
-    assert st["n_in_pairs"] == 5
-    assert st["n_components"] == 2
-    assert st["component_size_max"] == 3
-    assert st["removable"] == 3 and st["removable_frac"] == 0.3
+def test_members_on_opposite_sides_of_the_hub_are_too_far_apart():
+    """Each is within 30 nt of the hub; from each other they are 50."""
+    rows = [(0, 1, 25, 0), (0, 2, -25, 0)]
+    assert _survivors(rows, [90, 40, 35], [900] * 3) == [0, 0, 2]
+    same_side = [(0, 1, 25, 0), (0, 2, 20, 0)]
+    assert _survivors(same_side, [90, 40, 35], [900] * 3) == [0, 0, 0]
+
+
+def test_a_pair_naming_a_row_that_does_not_exist_is_dropped():
+    assert _survivors([(0, 5), (1, 1), (-1, 0), (0, 1)], [5, 1], [900] * 2) == [0, 0]
+    assert select_merges(0, *([np.empty(0, np.int64)] * 6), **_TOL).tolist() == []
+
+
+def _refined(rows, ids):
+    return next_templates(_nodes(rows), _store(len(ids), ids=ids), round_index=1)
 
 
 def test_apply_merge_sums_support_keeps_ids_and_records_lineage():
-    store = _store(3, ids=[10, 11, 12])
     seq = "ACGT" * 25
-    refined = next_templates(
-        _nodes(
-            [
-                (10, 0, 0, seq, 30, 30.0),
-                (11, 1, 0, seq, 4, 4.0),
-                (12, 2, 0, "TTGCA" * 20, 7, 7.0),
-            ]
-        ),
-        store,
-        round_index=1,
+    refined = _refined(
+        [
+            (10, 0, 0, seq, 30, 30.0),
+            (11, 1, 0, seq, 4, 4.0),
+            (12, 2, 0, "TTGCA" * 20, 7, 7.0),
+        ],
+        [10, 11, 12],
     )
-    merged = apply_merge(refined, _pairs([(0, 1, 1.0)]))
+    child = refined.templates.column("template_id").to_pylist()
+    merged = apply_merge(refined, _by_id([(0, 1)], child), **_TOL)
     assert merged.n_merged == 1 and merged.n_children == 2
     t = merged.templates
     ids = t.column("template_id").to_pylist()
@@ -643,17 +687,113 @@ def test_apply_merge_sums_support_keeps_ids_and_records_lineage():
     absorbed = [r for r in lin if r["parent_template_id"] == 11][0]
     assert absorbed["rule"] == "merge"
     assert absorbed["child_template_id"] == ids[0]
+    # Every other lineage row is exactly what it was.
+    assert [r["rule"] for r in lin if r["parent_template_id"] != 11] == ["carry", "carry"]
+
+
+def test_the_merged_table_records_what_the_lineage_overwrote():
+    """The lineage re-points an absorbed child at its survivor, so afterwards
+    the absorbed id appears nowhere else."""
+    seq = "ACGT" * 25
+    refined = _refined(
+        [(10, 0, 0, seq + "AC" * 10, 30, 30.0), (11, 1, 0, seq, 4, 4.0)], [10, 11]
+    )
+    child = refined.templates.column("template_id").to_pylist()
+    # By id, 11's child is src and reaches 0 nt beyond; the survivor (10's
+    # child) reaches 20 nt further at 3'.
+    pairs = _by_id([(1, 0, 0, 20)], child)
+    merged = apply_merge(refined, pairs, **_TOL)
+    assert merged.merged.schema.equals(MERGED_TABLE, check_metadata=False)
+    assert merged.merged.to_pylist() == [
+        {
+            "round": 2,
+            "absorbed_template_id": child[1],
+            "survivor_template_id": child[0],
+            "delta_5p": 0,
+            "delta_3p": 20,
+            "absorbed_n_reads": 4,
+        }
+    ]
+    # The same pair stored the other way round reads the same.
+    flipped = apply_merge(refined, _by_id([(0, 1, 0, -20)], child), **_TOL)
+    assert flipped.merged.to_pylist() == merged.merged.to_pylist()
+    # A pass that absorbs nothing still says so, with an empty table.
+    nothing = apply_merge(refined, _by_id([], child), **_TOL)
+    assert nothing.n_merged == 0 and nothing.merged.num_rows == 0
+
+
+def test_a_zero_length_node_ahead_of_a_twin_does_not_shift_the_merge():
+    """Ids are assigned over node rows and the empty consensus is dropped
+    afterwards, so from there on template row != node row. Joined by row, the
+    twin at node rows (1, 2) would land on template rows (1, 2): the twin and
+    its UNRELATED neighbour."""
+    seq = "ACGT" * 25
+    refined = _refined(
+        [
+            (10, 0, 0, "", 2, 2.0),
+            (11, 1, 0, seq, 30, 30.0),
+            (12, 2, 0, seq, 4, 4.0),
+            (13, 3, 0, "TTGCA" * 20, 7, 7.0),
+        ],
+        [10, 11, 12, 13],
+    )
+    assert refined.templates.num_rows == 3
+    node_ids = template_id_for(2, np.arange(4))
+    merged = apply_merge(refined, _by_id([(1, 2)], node_ids), **_TOL)
+    t = merged.templates
+    assert t.column("template_id").to_pylist() == [int(node_ids[1]), int(node_ids[3])]
+    assert t.column("orf_replication").to_pylist() == [34, 7]
+    assert t.column("sequence").to_pylist() == [seq, "TTGCA" * 20]
+    # A pair with the dropped node is a pair with a template that is not there.
+    ghost = apply_merge(refined, _by_id([(0, 1)], node_ids), **_TOL)
+    assert ghost.n_merged == 0 and ghost.templates.num_rows == 3
+
+
+def test_apply_merge_reads_each_template_s_split_origin_by_id():
+    """`origin` is indexed by graph NODE. Node 0 has no template, so read by
+    template row every origin would be the node's before it."""
+    seq = "ACGT" * 25
+    nodes = [
+        (10, 0, 0, "", 2, 2.0),
+        (11, 1, 0, seq, 30, 30.0),
+        (11, 1, 1, seq + "A", 4, 4.0),
+        (13, 3, 0, seq + "AC", 90, 90.0),
+    ]
+    refined = _refined(nodes, [10, 11, 12, 13])
+    node_ids = template_id_for(2, np.arange(4))
+    pairs = _by_id([(3, 1), (3, 2)], node_ids)
+
+    # Nodes 1 and 2 are the children of one split: the hub takes the better
+    # supported of them and leaves the other.
+    siblings = np.array([-1, 11, 11, -1])
+    kept_apart = apply_merge(
+        refined, pairs, origin_ids=node_ids, origin=siblings, **_TOL
+    )
+    assert kept_apart.n_merged == 1
+    assert kept_apart.templates.column("template_id").to_pylist() == [
+        int(node_ids[2]),
+        int(node_ids[3]),
+    ]
+    # The same origins one node earlier: now it is the EMPTY node and node 1
+    # that share one, nodes 1 and 2 do not, and the hub takes both. Read by
+    # template row this case and the one above would swap answers.
+    shifted = np.array([11, 11, -1, -1])
+    both = apply_merge(refined, pairs, origin_ids=node_ids, origin=shifted, **_TOL)
+    assert both.n_merged == 2
+    assert both.templates.column("template_id").to_pylist() == [int(node_ids[3])]
+
+    assert apply_merge(refined, pairs, **_TOL).n_merged == 2
+    with pytest.raises(ValueError, match="origin_ids"):
+        apply_merge(refined, pairs, origin=siblings, **_TOL)
 
 
 def test_churn_reads_a_merge_as_inherited_not_as_movement():
     """A merge is the inverse of a split: reads that moved from an absorbed
     template to its survivor did not choose differently."""
-    store = _store(2, ids=[10, 11])
     seq = "ACGT" * 25
-    refined = next_templates(
-        _nodes([(10, 0, 0, seq, 3, 3.0), (11, 1, 0, seq, 2, 2.0)]), store, round_index=1
-    )
-    merged = apply_merge(refined, _pairs([(0, 1, 1.0)]))
+    refined = _refined([(10, 0, 0, seq, 3, 3.0), (11, 1, 0, seq, 2, 2.0)], [10, 11])
+    child = refined.templates.column("template_id").to_pylist()
+    merged = apply_merge(refined, _by_id([(0, 1)], child), **_TOL)
     survivor = merged.templates.column("template_id").to_pylist()[0]
     prev = _assign([(0, 10), (1, 10), (2, 10), (3, 11), (4, 11)])
     cur = _assign([(i, survivor) for i in range(5)])
@@ -686,58 +826,29 @@ def test_final_merge_keeps_every_read():
     member = _membership(
         [(10, 0, 0), (10, 0, 1), (10, 0, 2), (10, 1, 3), (10, 1, 4), (11, 0, 5)]
     )
-    out, mem, n = merge_nodes(nodes, member, _pairs([(0, 1, 1.0)]))
+    out, mem, n, survivor = merge_nodes(nodes, member, _edges([(0, 1)]), **_TOL)
     assert n == 1 and out.num_rows == 2
+    assert survivor.tolist() == [0, 0, 2]
     assert out.column("n_reads").to_pylist() == [5, 1]
     keys = list(zip(mem.column("parent_template_id").to_pylist(),
                     mem.column("haplotype_id").to_pylist()))
     assert keys == [(10, 0)] * 5 + [(11, 0)]
     assert mem.num_rows == member.num_rows
+    # Nothing to merge: the tables come back as they went in.
+    same, mem2, n2, survivor2 = merge_nodes(nodes, member, _edges([]), **_TOL)
+    assert n2 == 0 and same.equals(nodes) and mem2.equals(member)
+    assert survivor2.tolist() == [0, 1, 2]
 
 
-# The detector must actually be RUN in a test: a unit test that never shells
-# out would not have caught the -X / --secondary=no refusal that kept it dead.
-needs_minimap2 = pytest.mark.skipif(
-    shutil.which("minimap2") is None, reason="minimap2 not on PATH"
-)
-
-
-def _mutate_subs(seq, k, seed):
-    r = random.Random(seed)
-    s = list(seq)
-    for p in r.sample(range(50, len(s) - 50), k):
-        s[p] = {"A": "C", "C": "G", "G": "T", "T": "A"}[s[p]]
-    return "".join(s)
-
-
-@needs_minimap2
-def test_detector_runs_and_applies_the_worked_examples(tmp_path):
-    rng = random.Random(1)
-    base = "".join(rng.choice("ACGT") for _ in range(1900))
-    seqs = [
-        base,  # 0
-        base,  # 1: exact duplicate -> redundant
-        _mutate_subs(base, 28, 2),  # 2: Tcp1-like, 98.5% -> separate
-        base[:900] + base[901:],  # 3: H3f3b-like frameshift, ~99.95% -> redundant
-        "".join(rng.choice("ACGT") for _ in range(1500)),  # 4: unrelated
-    ]
-    fa = tmp_path / "t.fa"
-    fa.write_text("".join(f">{i}\n{s}\n" for i, s in enumerate(seqs)))
-    pairs = detect_redundant_templates(fa, threads=2)
-    assert pairs.schema.equals(REDUNDANT_PAIR_TABLE, check_metadata=False)
-    merged_pairs = {
-        tuple(sorted(p))
-        for p, ident in zip(
-            zip(pairs.column("a_row").to_pylist(), pairs.column("b_row").to_pylist()),
-            pairs.column("identity").to_pylist(),
-        )
-        if ident >= 0.995
-    }
-    assert merged_pairs == {(0, 1), (0, 3), (1, 3)}
-    # -X reports each unordered pair once.
-    assert pairs.num_rows == len(
-        {tuple(sorted(p)) for p in zip(pairs.column("a_row").to_pylist(),
-                                        pairs.column("b_row").to_pylist())}
-    )
-    survivor = select_merges(pairs, np.array([10, 1, 1, 1, 1]), np.array([len(s) for s in seqs]))
-    assert survivor.tolist() == [0, 0, 2, 0, 4]
+def test_the_final_merge_keeps_the_longer_node_s_extension():
+    """Defect 5 of the merge this replaced: the best-supported node survived
+    and a longer absorbed node's 5' extension went with it. Nothing rebuilds
+    the consensus after the final merge, so the longest survives."""
+    core = "ACGT" * 25
+    nodes = _nodes([(10, 0, 0, core, 30, 30.0), (11, 1, 0, "ATGGCC" + core, 4, 4.0)])
+    member = _membership([(10, 0, i) for i in range(30)] + [(11, 0, 30 + i) for i in range(4)])
+    out, mem, n, survivor = merge_nodes(nodes, member, _edges([(0, 1, 6, 0)]), **_TOL)
+    assert n == 1 and survivor.tolist() == [1, 1]
+    assert out.column("consensus").to_pylist() == ["ATGGCC" + core]
+    assert out.column("n_reads").to_pylist() == [34]
+    assert set(mem.column("parent_template_id").to_pylist()) == {11}

@@ -35,7 +35,13 @@ stage            what it does
                  haplotype consensus → ORF re-predicted under a support
                  gate, with **no minimum protein length** — the floor
                  leaked into the next round's certified interval
-``refine``       carry recruiting templates forward, iterate
+``graph``        relate each round's nodes to each other — the same
+                 transcript within an end tolerance, or one contained in
+                 another — by kmer candidates and two edlib infix
+                 alignments per pair. A report: nothing is collapsed
+``refine``       carry recruiting templates forward, iterate; with
+                 ``merge`` (off by default) collapse the pairs the merge
+                 predicate accepts over the graph
 ===============  =======================================================
 
 Measured at 9.39M reads, kmer seeding is **4.4x fewer templates** (850,450 vs

@@ -1289,8 +1289,9 @@ def _build_transcriptome_parser(subs) -> None:
         "--rounds",
         type=int,
         default=6,
-        help="em: EM rounds. Merging is exhausted by round 3 in the bench, so "
-        "budget is better spent on rounds 1-3 plus the fixes.",
+        help="em: EM rounds to run. On --resume this is how many MORE. At "
+        "9.4M reads the templates stopped changing at round 6 (reference "
+        "length, ORF length and fidelity flat from 6 to 12).",
     )
     p_cluster.add_argument(
         "--stop-frac-changed",
@@ -1319,34 +1320,103 @@ def _build_transcriptome_parser(subs) -> None:
         "saturation warning fires.",
     )
     p_cluster.add_argument(
-        "--no-merge",
+        "--template-graph",
+        choices=("rounds", "final", "off"),
+        default=None,
+        help="em: relate the templates to each other after the M-step — which "
+        "are the same transcript within an end tolerance (`equivalent`), which "
+        "are contained in which (`contained`) — by kmer candidates and two "
+        "edlib infix alignments per pair. 'rounds' (default) does it for every "
+        "round's nodes and writes rounds/rNN/graph/edges.parquet plus "
+        "cluster_edges.parquet; 'final' only for the last round's; 'off' runs "
+        "nothing at all after the M-step. A report: nothing is collapsed "
+        "unless --merge is passed.",
+    )
+    p_cluster.add_argument(
+        "--merge",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="em: collapse the pairs the merge predicate accepts, between "
+        "rounds and in the final output (default: --no-merge). The merge this "
+        "replaces judged identity on a local alignment and end tolerance as a "
+        "proportion, and cost 13 points of ORF carriage on 9.4M reads. The "
+        "final-output merge is always exact and keeps the longest member, "
+        "because no M-step follows to rebuild a consensus.",
+    )
+    p_cluster.add_argument(
+        "--merge-max-edits",
+        type=int,
+        default=None,
+        help="em: a pair is mergeable only within this many edits over the "
+        "span the two share (default 0: exact). An absolute count like the "
+        "end tolerances — a fraction lets two differences through above 2 kb "
+        "and blocks them below. Defines the `mergeable` column whether or not "
+        "the run merges.",
+    )
+    p_cluster.add_argument(
+        "--merge-5p-tolerance",
+        type=int,
+        default=None,
+        help="em: nt by which a mergeable pair's 5' ends may differ (default: "
+        "--graph-5p-tolerance, which it may not exceed).",
+    )
+    p_cluster.add_argument(
+        "--merge-3p-tolerance",
+        type=int,
+        default=None,
+        help="em: nt by which a mergeable pair's 3' ends may differ (default: "
+        "--graph-3p-tolerance, which it may not exceed).",
+    )
+    p_cluster.add_argument(
+        "--merge-min-reads",
+        type=int,
+        default=None,
+        help="em: a pair is mergeable only if both templates hold at least "
+        "this many reads (default 0: no depth gate).",
+    )
+    p_cluster.add_argument(
+        "--merge-siblings",
         action="store_true",
-        help="em: do not merge redundant templates (whole-template identity >= "
-        "--p-merge, coverage >= --merge-min-coverage both ways) between "
-        "rounds or in the final output. Redundancy is still detected and "
-        "reported. Measured without merge, ~29%% of a 9.4M-read run's final "
-        "templates were redundant.",
-    )
-    p_cluster.add_argument(
-        "--p-merge",
-        type=float,
-        default=None,
-        help="em: whole-template identity at or above which two templates are "
-        "redundant (default 0.995 — stricter than --p-floor, because a merge "
-        "is a stronger claim than an assignment).",
-    )
-    p_cluster.add_argument(
-        "--merge-min-coverage",
-        type=float,
-        default=None,
-        help="em: each template of a redundant pair must be covered at least "
-        "this much by the alignment (default 0.95).",
+        help="em: let templates an M-step split apart be merged again. Off by "
+        "default: 51.6%% of the old merge's pairs were exactly that, a "
+        "split/merge cycle moving ~7.5%% of reads a round. Byte-identical "
+        "templates are mergeable either way.",
     )
     p_cluster.add_argument(
         "--merge-from-round",
         type=int,
         default=None,
-        help="em: merge only after rounds >= this (default 1: every round).",
+        help="em, --merge only: merge after rounds >= this (default 1: every "
+        "round).",
+    )
+    p_cluster.add_argument(
+        "--graph-identity-floor",
+        type=float,
+        default=None,
+        help="em: a pair is an edge only at or above this identity over the "
+        "span the two share (default 0.99).",
+    )
+    p_cluster.add_argument(
+        "--graph-5p-tolerance",
+        type=int,
+        default=None,
+        help="em: two templates are `equivalent` when neither reaches more "
+        "than this many nt beyond the other at the 5' end (default 30; "
+        "min(30, length // 10) below 300 nt).",
+    )
+    p_cluster.add_argument(
+        "--graph-3p-tolerance",
+        type=int,
+        default=None,
+        help="em: the same at the 3' end (default 30).",
+    )
+    # Removed. Kept so that passing one says what replaced it, which
+    # argparse's "unrecognized arguments" would not.
+    p_cluster.add_argument(
+        "--p-merge", type=float, default=None, help=argparse.SUPPRESS
+    )
+    p_cluster.add_argument(
+        "--merge-min-coverage", type=float, default=None, help=argparse.SUPPRESS
     )
     p_cluster.add_argument(
         "--estep-aligner",
@@ -3496,12 +3566,34 @@ def _em_seeding(mode: str) -> str:
     return _EM_SEEDING.get(mode, "orf")
 
 
+#: Flags of the merge this version removed, and what to say when one is
+#: passed. Keyed by argparse dest.
+_REMOVED_CLUSTER_FLAGS = {
+    "p_merge": (
+        "--p-merge was removed: identity is no longer measured on a local "
+        "alignment, and a fraction is length-dependent. Use --merge-max-edits "
+        "(edits over the shared span; default 0) with --merge."
+    ),
+    "merge_min_coverage": (
+        "--merge-min-coverage was removed: end tolerance is in nucleotides "
+        "now, not a proportion. Use --merge-5p-tolerance / "
+        "--merge-3p-tolerance (default 30 / 30)."
+    ),
+}
+
+
 def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
     """A flag that does nothing under this mode is an error, not a no-op.
 
     Silently ignoring `--fold-identity` under kmer seeding means a swept
     parameter had no effect and the run looks like evidence about it.
     """
+    # Removed flags first, and in every mode: what they meant is gone, so
+    # "this mode does not use it" would be the wrong thing to say.
+    for dest, message in _REMOVED_CLUSTER_FLAGS.items():
+        if getattr(args, dest, None) is not None:
+            return message
+
     em = mode == "em"
     banned: list[tuple[str, bool, str]] = [
         # (flag, is-set, what to use instead)
@@ -3542,23 +3634,86 @@ def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
             "nothing — only the --mode em-* E-step has an aligner choice",
         ),
     ]
+    graph_mode = "rounds" if args.template_graph is None else args.template_graph
+    graph_on = em and graph_mode != "off"
+    merging = em and args.merge is True
+    if merging and graph_mode == "off":
+        return (
+            "--merge needs the template graph, and --template-graph off runs "
+            "nothing after the M-step. Drop one of them."
+        )
     banned.append(
         (
-            "--no-merge",
-            args.no_merge and not em,
+            "--template-graph",
+            args.template_graph is not None and not em,
+            "nothing — only the --mode em-* loop relates its templates",
+        )
+    )
+    banned.append(
+        (
+            "--merge" if args.merge else "--no-merge",
+            args.merge is not None and not em,
             "nothing — only the --mode em-* loop merges templates",
         )
     )
-    for flag in ("--p-merge", "--merge-min-coverage", "--merge-from-round"):
-        dest = flag[2:].replace("-", "_")
+    for flag in (
+        "--graph-identity-floor",
+        "--graph-5p-tolerance",
+        "--graph-3p-tolerance",
+    ):
         banned.append(
             (
                 flag,
-                getattr(args, dest) is not None and (not em or args.no_merge),
-                "--mode em-* without --no-merge, which is the only place "
-                "templates merge",
+                getattr(args, flag[2:].replace("-", "_")) is not None
+                and not graph_on,
+                "--mode em-* with the template graph on, which is the only "
+                "thing that reads it",
             )
         )
+    # The predicate defines the `mergeable` column of the graph whether or
+    # not the run merges, so its knobs act whenever there is a graph.
+    for flag in (
+        "--merge-max-edits",
+        "--merge-5p-tolerance",
+        "--merge-3p-tolerance",
+        "--merge-min-reads",
+    ):
+        banned.append(
+            (
+                flag,
+                getattr(args, flag[2:].replace("-", "_")) is not None
+                and not graph_on,
+                "--mode em-* with the template graph on: it defines which "
+                "edges are `mergeable`",
+            )
+        )
+    banned.append(
+        (
+            "--merge-siblings",
+            args.merge_siblings and not graph_on,
+            "--mode em-* with the template graph on: it defines which edges "
+            "are `mergeable`",
+        )
+    )
+    banned.append(
+        (
+            "--merge-from-round",
+            args.merge_from_round is not None and not merging,
+            "--merge, which is off by default; it only schedules merging",
+        )
+    )
+    if merging and graph_mode == "final":
+        # No graph between rounds, so only the final output merges — and that
+        # merge is always exact.
+        for flag in ("--merge-from-round", "--merge-max-edits"):
+            banned.append(
+                (
+                    flag,
+                    getattr(args, flag[2:].replace("-", "_")) is not None,
+                    "--template-graph rounds; under 'final' only the final "
+                    "output merges, and that merge is always exact",
+                )
+            )
     edlib = em and args.estep_aligner == "edlib"
     for flag in (
         "--estep-shortlist-k",
@@ -3583,6 +3738,9 @@ def _cmd_transcriptome_cluster_em(
     args: argparse.Namespace, *, seeding: str = "orf"
 ) -> int:
     """`transcriptome cluster --mode em-{orf,kmer}` — the iterative EM clusterer."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.graph import (
+        GraphParams,
+    )
     from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
         MStepParams,
     )
@@ -3591,11 +3749,6 @@ def _cmd_transcriptome_cluster_em(
         run_em,
     )
     from constellation.sequencing.transcriptome.cluster.denovo.em.seed_kmer import (
-        DEFAULT_MAX_CLUSTER_READ_FRAC,
-        DEFAULT_MIN_CHAIN_CLUSTER_READS,
-        DEFAULT_SEED_IDENTITY,
-        DEFAULT_SEED_MAX_3P,
-        DEFAULT_SEED_MAX_5P,
         ChainedClusterError,
     )
 
@@ -3623,7 +3776,60 @@ def _cmd_transcriptome_cluster_em(
         if args.progress
         else None
     )
-    params = EmParams(
+    try:
+        params = _em_params(args, seeding, EmParams, GraphParams, MStepParams)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        results = run_em(
+            demux_dir, output_dir, params=params, resume=args.resume, progress=log
+        )
+    except ChainedClusterError as exc:
+        # A seeding failure is a parameter problem the user can fix, not a
+        # crash: print the guidance the exception carries and exit 2.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        # The resume stamp mismatch, and the policy refusals, land here.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not results:
+        print("no clusters were produced", file=sys.stderr)
+        return 1
+    (output_dir / "_SUCCESS").write_bytes(b"")
+    last = results[-1]
+    # Counted from what was written: a final merge makes it fewer than the
+    # last round's nodes.
+    import pyarrow.parquet as pq
+
+    clusters = output_dir / "clusters.parquet"
+    n_clusters = (
+        pq.read_metadata(clusters).num_rows if clusters.exists() else last.n_nodes
+    )
+    print(
+        f"{len(results)} round(s); {n_clusters:,} clusters over "
+        f"{last.estep.get('n_assigned', 0):,} assigned reads "
+        f"({last.estep.get('n_unassigned', 0):,} unassigned)"
+    )
+    return 0
+
+
+def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
+    """`EmParams` from the parsed flags, every `None` resolved for this mode.
+
+    The classes are passed in because the handler imports them lazily — the
+    CLI must not import the clusterer to print `--help`.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.seed_kmer import (
+        DEFAULT_MAX_CLUSTER_READ_FRAC,
+        DEFAULT_MIN_CHAIN_CLUSTER_READS,
+        DEFAULT_SEED_IDENTITY,
+        DEFAULT_SEED_MAX_3P,
+        DEFAULT_SEED_MAX_5P,
+    )
+
+    return EmParams(
         seeding=seeding,
         rounds=int(args.rounds),
         stop_frac_changed=float(args.stop_frac_changed),
@@ -3642,13 +3848,39 @@ def _cmd_transcriptome_cluster_em(
         estep_align_workers=(
             0 if args.estep_align_workers is None else int(args.estep_align_workers)
         ),
-        merge=not args.no_merge,
-        p_merge=0.995 if args.p_merge is None else float(args.p_merge),
-        merge_min_coverage=(
-            0.95
-            if args.merge_min_coverage is None
-            else float(args.merge_min_coverage)
+        template_graph=(
+            "rounds" if args.template_graph is None else str(args.template_graph)
         ),
+        graph=GraphParams(
+            identity_floor=(
+                0.99
+                if args.graph_identity_floor is None
+                else float(args.graph_identity_floor)
+            ),
+            tol_5p=(
+                30 if args.graph_5p_tolerance is None else int(args.graph_5p_tolerance)
+            ),
+            tol_3p=(
+                30 if args.graph_3p_tolerance is None else int(args.graph_3p_tolerance)
+            ),
+        ),
+        # OFF unless asked for: `--merge` is None when neither spelling was
+        # passed, and the default is not to merge.
+        merge=bool(args.merge),
+        merge_max_edits=(
+            0 if args.merge_max_edits is None else int(args.merge_max_edits)
+        ),
+        # None is "the graph's tolerance", resolved by EmParams.
+        merge_tol_5p=(
+            None if args.merge_5p_tolerance is None else int(args.merge_5p_tolerance)
+        ),
+        merge_tol_3p=(
+            None if args.merge_3p_tolerance is None else int(args.merge_3p_tolerance)
+        ),
+        merge_min_reads=(
+            0 if args.merge_min_reads is None else int(args.merge_min_reads)
+        ),
+        merge_siblings=bool(args.merge_siblings),
         merge_from_round=(
             1 if args.merge_from_round is None else int(args.merge_from_round)
         ),
@@ -3724,30 +3956,6 @@ def _cmd_transcriptome_cluster_em(
             max_members_per_template=int(args.max_members_per_template),
         ),
     )
-    try:
-        results = run_em(
-            demux_dir, output_dir, params=params, resume=args.resume, progress=log
-        )
-    except ChainedClusterError as exc:
-        # A seeding failure is a parameter problem the user can fix, not a
-        # crash: print the guidance the exception carries and exit 2.
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except ValueError as exc:
-        # The resume stamp mismatch, and the policy refusals, land here.
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    if not results:
-        print("no clusters were produced", file=sys.stderr)
-        return 1
-    (output_dir / "_SUCCESS").write_bytes(b"")
-    last = results[-1]
-    print(
-        f"{len(results)} round(s); {last.n_nodes:,} clusters over "
-        f"{last.estep.get('n_assigned', 0):,} assigned reads "
-        f"({last.estep.get('n_unassigned', 0):,} unassigned)"
-    )
-    return 0
 
 
 def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:

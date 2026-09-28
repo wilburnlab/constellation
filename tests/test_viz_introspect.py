@@ -267,3 +267,34 @@ def test_arg_hints_do_not_break_json():
     raw = files("constellation.viz.introspect").joinpath("curated.json").read_text()
     data = json.loads(raw)
     assert isinstance(data.get("arg_hints", []), list)
+
+
+def test_suppressed_actions_are_not_form_fields():
+    """A flag hidden from `--help` is a removed flag kept so that passing it
+    explains itself. In the dashboard it would render as a field labelled
+    "==SUPPRESS==" that errors when filled in."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="t")
+    parser.add_argument("--kept", type=int, help="shown")
+    parser.add_argument("--gone", type=float, default=None, help=argparse.SUPPRESS)
+    dests = [a["dest"] for a in walk_parser(parser)["arguments"]]
+    assert dests == ["kept"]
+
+
+def test_the_removed_merge_flags_do_not_reach_the_cluster_form():
+    from constellation.cli.__main__ import _build_parser
+
+    def find(node, path):
+        for sub in node["subcommands"]:
+            if sub["path"] == path:
+                return sub
+            hit = find(sub, path)
+            if hit is not None:
+                return hit
+        return None
+
+    cluster = find(walk_parser(_build_parser()), ["transcriptome", "cluster"])
+    dests = {a["dest"] for a in cluster["arguments"]}
+    assert {"template_graph", "merge", "merge_max_edits"} <= dests
+    assert not {"p_merge", "merge_min_coverage"} & dests
