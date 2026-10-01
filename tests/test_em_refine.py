@@ -64,8 +64,6 @@ def _nodes(rows):
             "protein": pa.array([None] * n, pa.large_string()),
             "orf_start": pa.array([0] * n, pa.int32()),
             "orf_end": pa.array([30] * n, pa.int32()),
-            "orf_certified_end": pa.array([30] * n, pa.int32()),
-            "orf_truncated_by_support": pa.array([False] * n, pa.bool_()),
             "allele_string": pa.array([None] * n, pa.string()),
             "declared_variants": pa.array([[]] * n, pa.list_(pa.int64())),
             "n_inserted_columns": pa.array([0] * n, pa.int32()),
@@ -840,15 +838,25 @@ def test_final_merge_keeps_every_read():
     assert survivor2.tolist() == [0, 1, 2]
 
 
-def test_the_final_merge_keeps_the_longer_node_s_extension():
-    """Defect 5 of the merge this replaced: the best-supported node survived
-    and a longer absorbed node's 5' extension went with it. Nothing rebuilds
-    the consensus after the final merge, so the longest survives."""
+def test_the_final_merge_keeps_the_deepest_node_and_the_caller_rebuilds_it():
+    """The deepest member survives, as between rounds. The 5' extension the
+    shallower node carries is not lost by this: the caller rebuilds the
+    survivor's consensus from the pooled reads (`rebuild.rebuild_survivors`),
+    and an extension three reads carry comes back through that. Kept the
+    other way round — longest survives, pairs held exact — the longest form
+    overshot the annotated TSS in 41% of 914 groups against 24% (ledger #52).
+    """
     core = "ACGT" * 25
     nodes = _nodes([(10, 0, 0, core, 30, 30.0), (11, 1, 0, "ATGGCC" + core, 4, 4.0)])
     member = _membership([(10, 0, i) for i in range(30)] + [(11, 0, 30 + i) for i in range(4)])
     out, mem, n, survivor = merge_nodes(nodes, member, _edges([(0, 1, 6, 0)]), **_TOL)
-    assert n == 1 and survivor.tolist() == [1, 1]
-    assert out.column("consensus").to_pylist() == ["ATGGCC" + core]
+    assert n == 1 and survivor.tolist() == [0, 0]
+    assert out.column("consensus").to_pylist() == [core]
     assert out.column("n_reads").to_pylist() == [34]
-    assert set(mem.column("parent_template_id").to_pylist()) == {11}
+    assert set(mem.column("parent_template_id").to_pylist()) == {10}
+    # The old rule is still there to ask for.
+    out, _, _, survivor = merge_nodes(
+        nodes, member, _edges([(0, 1, 6, 0)]), prefer="length", **_TOL
+    )
+    assert survivor.tolist() == [1, 1]
+    assert out.column("consensus").to_pylist() == ["ATGGCC" + core]

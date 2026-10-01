@@ -35,9 +35,11 @@ parent in the same round, a limit cycle moving ~7.5% of reads every round.
 
 What replaces it is a relationship *graph* (:mod:`.graph`): kmer candidates,
 two infix alignments per pair, and a typed edge per related pair. A merge is a
-predicate over that graph's ``equivalent`` edges — by default zero edits over
-the shared span, ends within 30 nt, and not separated by the same M-step
-split — and nothing is collapsed unless the run asks for it.
+predicate over that graph's ``equivalent`` edges — by default at most two
+edits over the shared span, ends within 30 nt, and not separated by the same
+M-step split. It is on by default: at 9.4M reads a sweep of the edit cap
+from 1 to 6 left protein recovery flat while two edits nearly stopped node
+growth between rounds (ledger #55).
 
 What lives here is only the collapse. Groups are formed by an
 abundance-ordered **radius-1** set cover, so ``A~B~C`` cannot merge ``A`` with
@@ -46,8 +48,9 @@ abundance-ordered **radius-1** set cover, so ``A~B~C`` cannot merge ``A`` with
 children of a split would otherwise join them through itself. Between rounds
 the best-supported member survives and the next M-step re-derives its
 consensus from the union of reads. In the final output no M-step follows, so
-that merge is exact and the *longest* member survives — the cores agree base
-for base, and no 5' extension is discarded. A merge is recorded in the lineage
+the loop does that part itself: the deepest member survives and its consensus
+is rebuilt from the group's pooled reads (:mod:`.rebuild`) before the ORF is
+called. A merge is recorded in the lineage
 as the inverse of a split (``rule='merge'``), so churn does not read it as
 mass reassignment, and in :data:`MERGED_TABLE`, because the lineage overwrites
 an absorbed template's id with its survivor's.
@@ -616,7 +619,7 @@ def merge_nodes(
     tol_5p: int,
     tol_3p: int,
     origin: np.ndarray | None = None,
-    prefer: Prefer = "length",
+    prefer: Prefer = "support",
 ) -> tuple[pa.Table, pa.Table, int, np.ndarray]:
     """The final-output merge: collapse mergeable NODES and their membership.
 
@@ -627,11 +630,11 @@ def merge_nodes(
     and quant are computed from membership, so every read is kept and totals
     are conserved.
 
-    No M-step follows this merge, so the survivor's own consensus, ORF and
-    protein are what the output reports. That is why the caller passes only
-    exact pairs and why the default order is ``"length"``: over the shared
-    span the members agree base for base, and the longest of them is a
-    sequence the M-step emitted that discards nobody's extension.
+    The survivor's consensus is what is written here; the caller rebuilds
+    it from the pooled membership afterwards (:mod:`.rebuild`), which is why
+    the merge may be edit-tolerant and why the deepest member is kept, as
+    between rounds. Keeping the longest instead, with the pairs held exact,
+    was measured the wrong form more often than not (ledger #52).
 
     Returns ``(nodes, membership, n_merged, survivor_of)``; ``survivor_of``
     indexes the INPUT rows.

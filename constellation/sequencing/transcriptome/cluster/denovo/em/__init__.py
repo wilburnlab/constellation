@@ -24,24 +24,26 @@ stage            what it does
                  READS — dereplicate → minimizers → candidates → verify
                  (5' unbounded, 3' ≤ 100) → connected components — then
                  one elected read per cluster. No ORF: this partition
-                 does not consult one, and asserting a seed ORF would
-                 relax the M-step's support gate for nothing
+                 does not consult one
 ``elect``        shared by both: rank a seed group's distinct cDNAs by
                  the ``--seed-representative`` policy and take the first
 ``estep``        every read aligned to every template (minimap2),
                  assigned by an absolute identity floor with a ranked
                  tie-break
-``mstep``        per-template folded PWM → variants → haplotypes → per-
-                 haplotype consensus → ORF re-predicted under a support
-                 gate, with **no minimum protein length** — the floor
-                 leaked into the next round's certified interval
+``mstep``        per-template folded PWM → candidate columns (by allele;
+                 by coverage only with ``coverage_route``) → covariance
+                 → one node per state-tuple → consensus → the longest
+                 sense ORF at or above ``min_aa_length``, an annotation
 ``graph``        relate each round's nodes to each other — the same
                  transcript within an end tolerance, or one contained in
                  another — by kmer candidates and two edlib infix
-                 alignments per pair. A report: nothing is collapsed
+                 alignments per pair
 ``refine``       carry recruiting templates forward, iterate; with
-                 ``merge`` (off by default) collapse the pairs the merge
-                 predicate accepts over the graph
+                 ``merge`` (on by default, two edits) collapse the pairs
+                 the merge predicate accepts over the graph
+``rebuild``      the final merge's survivors, re-consensused from their
+                 pooled reads — the M-step's consensus step without the
+                 split, since no M-step follows
 ===============  =======================================================
 
 Measured at 9.39M reads, kmer seeding is **4.4x fewer templates** (850,450 vs

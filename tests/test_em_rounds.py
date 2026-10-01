@@ -872,11 +872,13 @@ def _r2_sequences(out):
         return sorted(pa.ipc.open_file(mm).read_all().column("sequence").to_pylist())
 
 
-def test_the_default_reports_edges_and_merges_nothing(tmp_path, monkeypatch):
+def test_report_only_writes_edges_and_merges_nothing(tmp_path, monkeypatch):
     """Report-only: the twin is an edge in the graph, and still a template."""
     _twin_first_node(monkeypatch, sibling=False)
     out = tmp_path / "em"
-    run_em(_panel(tmp_path), out, params=_params(rounds=2, min_aa_length=40))
+    run_em(
+        _panel(tmp_path), out, params=_params(rounds=2, min_aa_length=40, merge=False)
+    )
 
     r1 = out / "rounds" / "r01"
     record = _json(r1 / "refine.json")
@@ -904,10 +906,12 @@ def test_the_default_reports_edges_and_merges_nothing(tmp_path, monkeypatch):
     )
 
 
-def test_an_exact_twin_is_merged_when_merge_is_on(tmp_path, monkeypatch):
+def test_an_exact_twin_is_merged_by_default(tmp_path, monkeypatch):
     _twin_first_node(monkeypatch, sibling=False)
     out = tmp_path / "em"
-    run_em(_panel(tmp_path), out, params=_params(rounds=2, min_aa_length=40, merge=True))
+    params = _params(rounds=2, min_aa_length=40)
+    assert params.merge and params.merge_max_edits == 2
+    run_em(_panel(tmp_path), out, params=params)
 
     r1 = out / "rounds" / "r01"
     record = _json(r1 / "refine.json")
@@ -915,7 +919,7 @@ def test_an_exact_twin_is_merged_when_merge_is_on(tmp_path, monkeypatch):
     assert record["n_templates_after"] == (
         record["n_templates_before"] - record["n_merged"]
     )
-    assert record["predicate"]["max_edits"] == 0 and "graph_stamp" in record
+    assert record["predicate"]["max_edits"] == 2 and "graph_stamp" in record
     lin = pq.read_table(r1 / "lineage.parquet")
     assert "merge" in lin.column("rule").to_pylist()
     assert pq.read_table(r1 / "merged.parquet").num_rows == record["n_merged"]
@@ -942,6 +946,12 @@ def test_the_final_output_merges_twins_and_keeps_every_read(tmp_path, monkeypatc
     assert final["merge_applied"] and final["n_merged"] == 1
     assert final["n_clusters"] == clusters.num_rows
     assert final["n_twin_clusters"] == 0
+    # The survivor was rebuilt from the pooled reads of both nodes, and the
+    # consensus it reports is a sequence those reads support.
+    assert final["rebuild"] == "ok" and final["n_rebuilt"] == 1
+    assert final["n_rebuild_failed"] == 0
+    assert final["predicate"]["max_edits"] == 2
+    assert all(clusters.column("consensus_sequence").to_pylist())
     assert pq.read_table(out / "rounds" / "r01" / "merged_final.parquet").num_rows == 1
 
     edges = pq.read_table(out / "cluster_edges.parquet")
@@ -1071,7 +1081,7 @@ def test_a_rebuilt_round_replaces_the_lineage_it_found(tmp_path, monkeypatch):
     _twin_first_node(monkeypatch, sibling=False)
     corpus = _panel(tmp_path)
     out = tmp_path / "em"
-    run_em(corpus, out, params=_params(rounds=2, min_aa_length=40))
+    run_em(corpus, out, params=_params(rounds=2, min_aa_length=40, merge=False))
     r1 = out / "rounds" / "r01"
     assert "merge" not in pq.read_table(r1 / "lineage.parquet").column("rule").to_pylist()
     # What such a directory looks like: round 1 done, with its lineage and
@@ -1103,7 +1113,7 @@ def test_a_graph_left_by_an_earlier_run_does_not_outlive_the_graph_being_off(tmp
     run_em(
         corpus,
         out,
-        params=_params(rounds=1, min_aa_length=40, template_graph="off"),
+        params=_params(rounds=1, min_aa_length=40, template_graph="off", merge=False),
         resume=True,
     )
     assert not list(out.glob("rounds/r*/graph"))
@@ -1128,7 +1138,7 @@ def test_template_graph_off_runs_no_alignment_at_all(tmp_path, monkeypatch):
     run_em(
         _panel(tmp_path),
         out,
-        params=_params(rounds=2, min_aa_length=40, template_graph="off"),
+        params=_params(rounds=2, min_aa_length=40, template_graph="off", merge=False),
     )
     assert not list(out.glob("rounds/r*/graph"))
     assert not (out / "cluster_edges.parquet").exists()
@@ -1177,7 +1187,7 @@ def test_merge_may_start_after_the_finished_rounds(tmp_path, monkeypatch):
     _twin_first_node(monkeypatch, sibling=False)
     corpus = _panel(tmp_path)
     out = tmp_path / "em"
-    run_em(corpus, out, params=_params(rounds=2, min_aa_length=40))
+    run_em(corpus, out, params=_params(rounds=2, min_aa_length=40, merge=False))
 
     with pytest.raises(ValueError, match="--merge-from-round 2"):
         run_em(

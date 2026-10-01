@@ -383,6 +383,7 @@ def candidate_columns(
     eps_coverage: float = 0.02,
     collapse_runs: bool = True,
     max_columns: int | None = 512,
+    coverage_route: bool = True,
 ) -> CandidateSet:
     """Admit columns for covariance testing.
 
@@ -421,6 +422,15 @@ def candidate_columns(
     problem on its own; it is a problem only if every admitted column is
     tested separately, which is what **run collapse** below prevents.
 
+    ``coverage_route=False`` keeps the allelic route only: no column is a
+    candidate for its covered read-set, so the template splits on alleles
+    and never on extent. This is the operating point of every bench run
+    since 2026-09-23 (as an uncommitted, env-gated patch until it became
+    this parameter) and the default the loop runs with — see
+    :class:`~.mstep_pool.MStepParams`. The measurement that motivated it
+    was not written down; both arms of its A/B are on the bench node
+    (``eval/em/{merge1M,nocov1M}_260923``).
+
     **Run collapse** is exact, not an approximation. Adjacent columns have the
     same covered read-set unless some member's span starts or ends between
     them, so a maximal run with no interior boundary partitions the reads
@@ -457,8 +467,11 @@ def candidate_columns(
     # ── coverage ──
     ufl = stats.uncov_frac_local
     ufg = stats.uncov_frac
-    in_local = (ufl >= f_min) & (ufl <= 1.0 - f_min)
-    in_global = (ufg >= f_min) & (ufg <= 1.0 - f_min)
+    if coverage_route:
+        in_local = (ufl >= f_min) & (ufl <= 1.0 - f_min)
+        in_global = (ufg >= f_min) & (ufg <= 1.0 - f_min)
+    else:
+        in_local = in_global = np.zeros(f, dtype=bool)
     coverage = in_local | in_global
 
     cand = allelic | coverage

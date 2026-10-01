@@ -1337,21 +1337,27 @@ def _build_transcriptome_parser(subs) -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="em: collapse the pairs the merge predicate accepts, between "
-        "rounds and in the final output (default: --no-merge). The merge this "
-        "replaces judged identity on a local alignment and end tolerance as a "
-        "proportion, and cost 13 points of ORF carriage on 9.4M reads. The "
-        "final-output merge is always exact and keeps the longest member, "
-        "because no M-step follows to rebuild a consensus.",
+        "rounds and in the final output (default: --merge, unless "
+        "--template-graph off). Between rounds the deepest member survives "
+        "and the next M-step rebuilds its consensus; in the final output the "
+        "deepest survives too, and its consensus is rebuilt here from the "
+        "pooled reads of the group before its ORF is called. Measured on "
+        "9.4M reads: protein recovery flat against --no-merge, node growth "
+        "between rounds nearly stopped.",
     )
     p_cluster.add_argument(
         "--merge-max-edits",
         type=int,
         default=None,
         help="em: a pair is mergeable only within this many edits over the "
-        "span the two share (default 0: exact). An absolute count like the "
-        "end tolerances — a fraction lets two differences through above 2 kb "
-        "and blocks them below. Defines the `mergeable` column whether or not "
-        "the run merges.",
+        "span the two share (default 2). An absolute count like the end "
+        "tolerances — a fraction lets two differences through above 2 kb and "
+        "blocks them below. 2 is the conservative point of a 1-6 sweep: "
+        "substitutions carry alleles, so a larger cap wants to be edit-type-"
+        "aware rather than a bigger number. The graph's edit budget follows "
+        "it (min_budget = max(3, this)), so the identity floor can never "
+        "block a merge the cap allows. Defines the `mergeable` column whether "
+        "or not the run merges.",
     )
     p_cluster.add_argument(
         "--merge-5p-tolerance",
@@ -1539,6 +1545,16 @@ def _build_transcriptome_parser(subs) -> None:
         default=0,
         help="em: M-step pool size (0 = --threads).",
     )
+    p_cluster.add_argument(
+        "--coverage-route",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="em: let the M-step admit a candidate column for its covered "
+        "read-set — an alternative start or end — as well as for a minor "
+        "allele (default: --no-coverage-route). Off is the operating point "
+        "every bench result since 2026-09-23 was measured at; with it the "
+        "templates split on alleles and never on extent.",
+    )
     # ── kmer (--mode kmer) flags ────────────────────────────────────
     # The read-to-read gate. Shared by --mode kmer and --mode em-kmer, whose
     # right defaults DIFFER (0.98/30:30 vs 0.93/inf:100) — so the default is
@@ -1721,13 +1737,14 @@ def _build_transcriptome_parser(subs) -> None:
         type=int,
         default=None,
         help=(
-            "minimum ORF length (AA). **em-orf**: the SEEDING key — a "
-            "template exists because a distinct ORF of at least this length "
-            "did — default 30 (60 cannot seed Prm1, 51 aa, the most abundant "
-            "transcript in mouse testis). **kmer**: the protein-annotation "
-            "floor on each consensus, default 60. **em-kmer**: not used — "
-            "that seeder predicts no ORF, and the EM's M-step has no minimum "
-            "protein length in either mode."
+            "minimum ORF length (AA). **em-***: the protein-annotation floor "
+            "on every node's consensus, default 30 (60 cannot report Prm1, "
+            "51 aa, the most abundant transcript in mouse testis) — and under "
+            "em-orf also the SEEDING key, since there a template exists "
+            "because a distinct ORF of at least this length did. The ORF is "
+            "an annotation: nothing in the loop reads it, so the floor "
+            "changes what is reported, never how a template is split. "
+            "**kmer**: the same floor on each consensus, default 60."
         ),
     )
     p_cluster.add_argument(
@@ -3618,10 +3635,9 @@ def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
             "--identity (the read-to-read gate)",
         ),
         (
-            "--min-aa-length",
-            args.min_aa_length is not None and em and seeding == "kmer",
-            "nothing — kmer seeding predicts no ORF and the M-step has no "
-            "minimum protein length, so this would have no effect",
+            "--coverage-route" if args.coverage_route else "--no-coverage-route",
+            args.coverage_route is not None and not em,
+            "nothing — only the --mode em-* M-step has a coverage route",
         ),
         (
             "--seed-grouping",
@@ -3636,8 +3652,11 @@ def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
     ]
     graph_mode = "rounds" if args.template_graph is None else args.template_graph
     graph_on = em and graph_mode != "off"
-    merging = em and args.merge is True
-    if merging and graph_mode == "off":
+    # Merge is on by default wherever there is a graph; `--template-graph
+    # off` with neither spelling of --merge is the one case that resolves
+    # it off, since there is nothing to merge on.
+    merging = em and (args.merge is True or (args.merge is None and graph_on))
+    if args.merge is True and graph_mode == "off":
         return (
             "--merge needs the template graph, and --template-graph off runs "
             "nothing after the M-step. Drop one of them."
@@ -3699,21 +3718,19 @@ def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
         (
             "--merge-from-round",
             args.merge_from_round is not None and not merging,
-            "--merge, which is off by default; it only schedules merging",
+            "--merge; it only schedules merging",
         )
     )
     if merging and graph_mode == "final":
-        # No graph between rounds, so only the final output merges — and that
-        # merge is always exact.
-        for flag in ("--merge-from-round", "--merge-max-edits"):
-            banned.append(
-                (
-                    flag,
-                    getattr(args, flag[2:].replace("-", "_")) is not None,
-                    "--template-graph rounds; under 'final' only the final "
-                    "output merges, and that merge is always exact",
-                )
+        # No graph between rounds, so only the final output merges.
+        banned.append(
+            (
+                "--merge-from-round",
+                args.merge_from_round is not None,
+                "--template-graph rounds; under 'final' only the final "
+                "output merges",
             )
+        )
     edlib = em and args.estep_aligner == "edlib"
     for flag in (
         "--estep-shortlist-k",
@@ -3864,11 +3881,13 @@ def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
                 30 if args.graph_3p_tolerance is None else int(args.graph_3p_tolerance)
             ),
         ),
-        # OFF unless asked for: `--merge` is None when neither spelling was
-        # passed, and the default is not to merge.
-        merge=bool(args.merge),
+        # ON unless asked otherwise: `--merge` is None when neither spelling
+        # was passed, and the default is to merge wherever there is a graph.
+        merge=(
+            args.template_graph != "off" if args.merge is None else bool(args.merge)
+        ),
         merge_max_edits=(
-            0 if args.merge_max_edits is None else int(args.merge_max_edits)
+            2 if args.merge_max_edits is None else int(args.merge_max_edits)
         ),
         # None is "the graph's tolerance", resolved by EmParams.
         merge_tol_5p=(
@@ -3888,10 +3907,10 @@ def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
         support_ratio=float(args.support_ratio),
         near_tie_z=float(args.near_tie_z),
         read_error_rate=float(args.read_error_rate),
-        # The em-orf SEEDING key, and nothing else — kmer seeding does not
-        # read it and the M-step has no floor at all. 30, not the parser's
-        # 60: at 60 the seeder cannot make a template for Prm1 (51 aa), the
-        # most abundant transcript in the tissue this pipeline was built for.
+        # The protein-annotation floor on every node (MStepParams below), and
+        # under em-orf the SEEDING key as well. 30, not the parser's 60: at
+        # 60 there is no Prm1 (51 aa), the most abundant transcript in the
+        # tissue this pipeline was built for.
         min_aa_length=(30 if args.min_aa_length is None else int(args.min_aa_length)),
         seed_representative=str(args.seed_representative),
         min_seed_reads=int(args.min_seed_reads),
@@ -3943,9 +3962,10 @@ def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
         threads=int(args.threads),
         mstep_workers=int(args.mstep_workers),
         mstep=MStepParams(
-            # No `min_aa_length`: the M-step has no minimum protein length.
-            # Its job is to report what each node's consensus encodes, and a
-            # floor there is a claim about biology imposed on a measurement.
+            # `min_aa_length` comes from EmParams, which sets it here itself.
+            # OFF unless asked for: the operating point of every bench
+            # result since 2026-09-23.
+            coverage_route=bool(args.coverage_route),
             # rho defaults ON for the EM path's candidate-column test: at
             # 1,525 reads a point binomial under a 1% null admits 1,924
             # columns where rho=0.01 admits none. The shared flag's None

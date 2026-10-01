@@ -542,6 +542,21 @@ def section_template_graph(em_dir: Path) -> ReportSection:
         elif final.get("graph") == "ok":
             n_clusters = int(final.get("n_clusters", 0))
             twins = int(final.get("n_twin_clusters", 0))
+            rebuilt = ""
+            if final.get("rebuild") == "ok":
+                rebuilt = (
+                    f" The {final.get('n_rebuilt', 0):,} merged survivors were "
+                    f"rebuilt from their pooled reads"
+                    + (
+                        f" ({final['n_rebuild_failed']:,} kept their own "
+                        f"consensus, nothing placed)"
+                        if final.get("n_rebuild_failed")
+                        else ""
+                    )
+                    + "."
+                )
+            elif final.get("merge_applied") and final.get("n_merged"):
+                rebuilt = f" Survivors were not rebuilt: {final.get('rebuild')}."
             parts.append(
                 f"**Final output (r{final_r})**: {final.get('n_nodes', 0):,} "
                 f"nodes → **{n_clusters:,} clusters** "
@@ -549,8 +564,14 @@ def section_template_graph(em_dir: Path) -> ReportSection:
                 f"{final.get('n_cluster_edges', 0):,} edges between them; "
                 f"{final.get('n_still_mergeable', 0):,} still accepted by the "
                 f"merge predicate, {twins:,} clusters byte-identical to "
-                f"another."
+                f"another.{rebuilt}"
             )
+            if final.get("rebuild") == "ok" and final.get("n_rebuild_failed"):
+                flags.append(
+                    f"final output: {final['n_rebuild_failed']:,} merged "
+                    f"survivors could not be rebuilt from their reads and kept "
+                    f"their own consensus"
+                )
             if n_clusters and twins / n_clusters > 0.05:
                 flags.append(
                     f"final output: {twins:,} clusters ({twins / n_clusters:.1%}) "

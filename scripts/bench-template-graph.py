@@ -64,6 +64,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.em import graph as gr
 from constellation.sequencing.transcriptome.cluster.denovo.em.refine import (
     template_id_for,
 )
+from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import EmParams
 
 #: Candidate pairs at 1.57M templates above which the stage is too dear to
 #: run every round by default: ~45 min a round on 48 threads at the measured
@@ -392,7 +393,9 @@ def _full(
             split_origin=origin,
             node_round=r,
             params=params,
-            predicate=gr.MergePredicate(tol_5p=params.tol_5p, tol_3p=params.tol_3p),
+            # The run's default predicate — the loop's, not the bare
+            # dataclass's (which is the exact one).
+            predicate=EmParams(graph=params).merge_predicate(),
             threads=threads,
             output_path=path,
             progress=lambda line: print(f"  [graph] {line}", file=sys.stderr),

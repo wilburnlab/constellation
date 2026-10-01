@@ -37,6 +37,7 @@ template ids (they are ``(round << 40) | row``, not a counter).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import shutil
 import time
@@ -81,6 +82,9 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import 
     mstep_worker,
     plan_mstep_units,
     sort_assignments_by_template,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.em.rebuild import (
+    rebuild_survivors,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.seed import (
     extract_seed_orfs,
@@ -130,15 +134,22 @@ class EmParams:
     # the M-step — the escape hatch. A report unless `merge` is set.
     template_graph: Literal["rounds", "final", "off"] = "rounds"
     graph: GraphParams = field(default_factory=GraphParams)
-    # Merge (refine.py), OFF by default: measured on 9.4M reads the merge this
-    # replaced cost 13 points of ORF carriage and 14 of full-length recovery.
-    # When on, a pair merges iff it is `equivalent` in the graph, within
-    # `merge_max_edits` over the shared span and the end tolerances, and not
-    # separated by the same M-step split.
-    merge: bool = False
+    # Merge (refine.py). A pair merges iff it is `equivalent` in the graph,
+    # within `merge_max_edits` over the shared span and the end tolerances,
+    # and not separated by the same M-step split. ON by default since
+    # 2026-09-30: at 9.4M reads a K = 1..6 sweep left full-length proteins
+    # and genes flat (±0.3%) while K = 2 nearly stopped node growth (r4→r5
+    # +1,790 nodes against +4,543 exact and +5,623 unmerged) and was
+    # nominally best on every recall count. The merge this one replaced,
+    # which cost 13 points of ORF carriage, judged identity on a local
+    # alignment and re-joined what the M-step had split.
+    merge: bool = True
     #: Edits over the shared span. An absolute count, like the tolerances: a
-    #: fraction lets two differences through above 2 kb and blocks them below.
-    merge_max_edits: int = 0
+    #: fraction lets two differences through above 2 kb and blocks them
+    #: below. 2 is the conservative point of the sweep: genotype structure
+    #: rises with the count and substitutions carry alleles, so a larger K
+    #: wants to be edit-type-aware rather than a bigger number.
+    merge_max_edits: int = 2
     #: ``None`` is the graph's tolerance; a merge tolerance may not exceed it,
     #: because `equivalent` is defined by the graph's.
     merge_tol_5p: int | None = None
@@ -163,9 +174,9 @@ class EmParams:
     #: which seeder reads them; the sketch ones are shared because the two
     #: seeders never both run.
     seeding: Literal["orf", "kmer"] = "orf"
-    #: The ORF seeder's floor, and separately the M-step's protein-annotation
-    #: floor (`MStepParams.min_aa_length`). Under kmer seeding only the second
-    #: meaning applies — that seeder predicts no ORF at all.
+    #: The protein-annotation floor on every node (`best_sense_orf` on its
+    #: consensus), and under ORF seeding the seeding key as well. One source
+    #: of truth: `mstep.min_aa_length` is set from this in `__post_init__`.
     min_aa_length: int = 30
     seed_representative: str = "longest-above-quality"
     min_seed_reads: int = 1
@@ -225,26 +236,22 @@ class EmParams:
             raise ValueError("merge_from_round must be >= 1")
         if not self.merge and self.merge_from_round != 1:
             raise ValueError(
-                "merge_from_round has no effect without merge, which is off "
-                "by default: it only schedules merging"
+                "merge_from_round has no effect without merge: it only "
+                "schedules merging"
             )
         if self.template_graph == "off":
             # Nothing reads them, and a knob that did nothing makes a run
-            # look like evidence about it.
+            # look like evidence about it. Judged against the field defaults,
+            # which is all a library caller can be held to: the CLI refuses
+            # the FLAGS, whatever their values.
             if self.graph != GraphParams():
                 raise ValueError(
                     "graph parameters have no effect under template_graph='off'"
                 )
-            for name, default in (
-                ("merge_max_edits", 0),
-                ("merge_tol_5p", None),
-                ("merge_tol_3p", None),
-                ("merge_min_reads", 0),
-                ("merge_siblings", False),
-            ):
-                if getattr(self, name) != default:
+            for f in dataclasses.fields(self):
+                if f.name.startswith("merge_") and getattr(self, f.name) != f.default:
                     raise ValueError(
-                        f"{name} has no effect under template_graph='off': "
+                        f"{f.name} has no effect under template_graph='off': "
                         f"there is no graph for it to define `mergeable` on"
                     )
         for name, limit in (
@@ -261,21 +268,43 @@ class EmParams:
         if self.merge and self.template_graph == "off":
             raise ValueError(
                 "merge needs the template graph: template_graph='off' runs "
-                "nothing after the M-step"
+                "nothing after the M-step (merge is on by default; pass "
+                "merge=False)"
             )
         if self.merge and self.template_graph == "final":
-            # No graph between rounds, so nothing to merge there; and the
-            # final merge is always exact. A knob that cannot act is an error.
+            # No graph between rounds, so nothing to merge there. A knob
+            # that cannot act is an error.
             if self.merge_from_round != 1:
                 raise ValueError(
                     "merge_from_round has no effect under template_graph="
                     "'final', which merges the final output only"
                 )
-            if self.merge_max_edits != 0:
-                raise ValueError(
-                    "merge_max_edits has no effect under template_graph="
-                    "'final': the final-output merge is always exact"
-                )
+        if (
+            isinstance(self.min_aa_length, bool)
+            or not isinstance(self.min_aa_length, (int, np.integer))
+            or self.min_aa_length < 1
+        ):
+            raise ValueError(
+                f"min_aa_length must be an int >= 1, got {self.min_aa_length!r}"
+            )
+        if self.mstep.min_aa_length != self.min_aa_length:
+            object.__setattr__(
+                self,
+                "mstep",
+                dataclasses.replace(self.mstep, min_aa_length=int(self.min_aa_length)),
+            )
+        # The graph's edit budget may never pre-empt the merge cap: an edge
+        # exists only within `edit_budget = max(min_budget, floor(L * (1 -
+        # identity_floor)))`, so at the default 0.99 a pair whose shorter
+        # template is under 100 * K nt could not merge at K edits however
+        # the predicate read — 13% of a 9.4M-read run's nodes at K = 6. The
+        # budget follows the cap; long-template edges are unchanged.
+        if self.merge_max_edits > self.graph.min_budget:
+            object.__setattr__(
+                self,
+                "graph",
+                dataclasses.replace(self.graph, min_budget=int(self.merge_max_edits)),
+            )
 
     def merge_predicate(self) -> MergePredicate:
         """The merge predicate with its tolerances resolved."""
@@ -450,6 +479,7 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
             results[-1].round_index,
             params,
             log,
+            corpus_path=corpus.arrow_path,
         )
         clusters, membership, sample_id = build_cluster_tables(
             final_nodes,
@@ -1155,15 +1185,28 @@ def _merge_counts(merged: pa.Table, pairs: dict, graph: _NodeGraph) -> dict:
 
 
 def _final_graph_and_merge(
-    rd: Path, nodes, membership, r: int, params: EmParams, log
+    rd: Path,
+    nodes,
+    membership,
+    r: int,
+    params: EmParams,
+    log,
+    *,
+    corpus_path: Path | str | None = None,
 ) -> tuple[pa.Table, pa.Table, dict]:
     """The final nodes' graph, and the final merge if the run merges.
 
     The last round is never refined, so its graph is built here (or found, if
-    an earlier invocation stopped at this round). The merge is exact whatever
-    ``merge_max_edits`` says: no M-step follows to rebuild a consensus from
-    the union, so the only pairs safe to collapse are the ones whose shared
-    span already agrees base for base — and of those the longest survives.
+    an earlier invocation stopped at this round). The merge is the run's —
+    the same predicate as between rounds, the deepest member surviving — and
+    because no M-step follows, the survivor's consensus is rebuilt here from
+    the pooled reads of its group (:mod:`.rebuild`) and its ORF called on
+    that. Held to exact pairs with the longest member kept, as it once was,
+    the final output carried 7-13k of round 6's splits unmerged and the
+    wrong form more often than not (ledger #52, #55).
+
+    ``corpus_path`` is where the reads are; without it (tests) the survivors
+    keep their own consensus and ``final["rebuild"]`` says so.
     """
     final: dict[str, Any] = {
         "round": int(r),
@@ -1192,7 +1235,7 @@ def _final_graph_and_merge(
     merged = rf.MERGED_TABLE.empty_table()
     if params.merge:
         pred = params.merge_predicate()
-        pairs = _mergeable(graph, params, exact_only=True)
+        pairs = _mergeable(graph, params, exact_only=False)
         nodes, membership, n_merged, survivor = rf.merge_nodes(
             nodes,
             membership,
@@ -1200,6 +1243,7 @@ def _final_graph_and_merge(
             tol_5p=pred.tol_5p,
             tol_3p=pred.tol_3p,
             origin=None if pred.merge_siblings else graph.origin,
+            prefer="support",
         )
         merged = rf.merged_table(
             graph.ids,
@@ -1215,12 +1259,31 @@ def _final_graph_and_merge(
         final.update(
             merge_applied=True,
             n_merged=int(n_merged),
-            predicate={**asdict(pred), "max_edits": 0},
+            predicate=asdict(pred),
             graph_stamp=graph.stamp,
             n_merged_kin=_merge_counts(merged, pairs, graph)["n_merged_kin"],
         )
         if n_merged and log:
             log(f"final output: merged {n_merged:,} nodes")
+        if n_merged:
+            # Survivors that absorbed something, as rows of the MERGED table.
+            absorbed_into = np.bincount(survivor, minlength=survivor.shape[0])[keep]
+            grew = np.flatnonzero(absorbed_into > 1)
+            if corpus_path is None:
+                final["rebuild"] = "skipped: no corpus"
+            else:
+                nodes, counts = rebuild_survivors(
+                    nodes,
+                    membership,
+                    grew,
+                    str(corpus_path),
+                    params=params.mstep,
+                    identity_floor=params.p_floor,
+                    threads=params.threads,
+                    log=log,
+                )
+                final["rebuild"] = "ok"
+                final.update(counts)
     _write_table(rd / "merged_final.parquet", merged)
     final["edges_path"] = graph.path
     final["keep_rows"] = keep

@@ -85,8 +85,6 @@ def _nodes(rows, r=1):
             "protein": pa.array([None] * n, pa.large_string()),
             "orf_start": pa.array([0] * n, pa.int32()),
             "orf_end": pa.array([30] * n, pa.int32()),
-            "orf_certified_end": pa.array([30] * n, pa.int32()),
-            "orf_truncated_by_support": pa.array([False] * n, pa.bool_()),
             "allele_string": pa.array([None] * n, pa.string()),
             "declared_variants": pa.array([[]] * n, pa.list_(pa.int64())),
             "n_inserted_columns": pa.array([0] * n, pa.int32()),
@@ -177,10 +175,12 @@ def _relations(path):
 # ── the default: a report ─────────────────────────────────────────────
 
 
-def test_the_default_relates_the_nodes_and_merges_nothing(panel, tmp_path):
+def test_report_only_relates_the_nodes_and_merges_nothing(panel, tmp_path):
     nodes, store = panel
     rd = _rd(tmp_path)
-    refined = _refine_and_merge(rd, nodes, store, 1, EmParams(threads=1), _log)
+    refined = _refine_and_merge(
+        rd, nodes, store, 1, EmParams(threads=1, merge=False), _log
+    )
 
     assert refined.n_merged == 0 and refined.templates.num_rows == 5
     assert "merge" not in refined.lineage.column("rule").to_pylist()
@@ -202,7 +202,8 @@ def test_the_default_relates_the_nodes_and_merges_nothing(panel, tmp_path):
 def test_merge_collapses_the_twin_and_leaves_the_sibling(panel, tmp_path):
     nodes, store = panel
     rd = _rd(tmp_path)
-    params = EmParams(threads=1, merge=True)
+    params = EmParams(threads=1)
+    assert params.merge and params.merge_max_edits == 2, "the default merges"
     refined = _refine_and_merge(rd, nodes, store, 1, params, _log)
 
     assert refined.n_merged == 1 and refined.templates.num_rows == 4
@@ -293,7 +294,7 @@ def test_template_graph_off_runs_nothing(panel, tmp_path, monkeypatch):
     monkeypatch.setattr(rounds_mod.gr, "split_origins", _never)
     monkeypatch.setattr(rounds_mod.gr, "input_digest", _never)
     rd = _rd(tmp_path)
-    params = EmParams(threads=1, template_graph="off")
+    params = EmParams(threads=1, template_graph="off", merge=False)
     refined = _refine_and_merge(rd, nodes, store, 1, params, _log)
     assert refined.templates.num_rows == 5 and not (rd / "graph").exists()
     assert _json(rd / "refine.json")["graph"] == "off"
@@ -329,15 +330,14 @@ def test_a_failed_report_does_not_sink_the_round(panel, tmp_path, monkeypatch):
     monkeypatch.setattr(rounds_mod.gr, "build_graph", _boom)
     rd = _rd(tmp_path)
     said = []
-    refined = _refine_and_merge(rd, nodes, store, 1, EmParams(threads=1), said.append)
+    report = EmParams(threads=1, merge=False)
+    refined = _refine_and_merge(rd, nodes, store, 1, report, said.append)
     assert refined.templates.num_rows == 5
     record = _json(rd / "refine.json")
     assert record["graph"] == "failed" and "MemoryError" in record["graph_error"]
     assert any("failed" in line for line in said)
 
-    _, _, final = _final_graph_and_merge(
-        rd, nodes, _membership(nodes), 1, EmParams(threads=1), _log
-    )
+    _, _, final = _final_graph_and_merge(rd, nodes, _membership(nodes), 1, report, _log)
     assert final["graph"] == "failed" and "edges_path" not in final
 
 
@@ -437,19 +437,19 @@ def _clusters(nodes):
     )
 
 
-def test_the_final_merge_is_exact_and_keeps_every_read(panel, tmp_path):
+def test_the_final_merge_follows_the_cap_and_keeps_every_read(panel, tmp_path):
     nodes, _ = panel
     rd = _rd(tmp_path)
     out = tmp_path / "run"
     member = _membership(nodes)
-    # max_edits 3 would be honoured between rounds; the final merge is exact.
     params = EmParams(threads=1, merge=True, merge_max_edits=3)
     merged_nodes, mem, final = _final_graph_and_merge(
         rd, nodes, member, 1, params, _log
     )
 
     assert final["merge_applied"] and final["n_merged"] == 1
-    assert final["predicate"]["max_edits"] == 0
+    assert final["predicate"]["max_edits"] == 3, "the run's predicate, not exact"
+    assert final["rebuild"] == "skipped: no corpus"
     assert final["keep_rows"].tolist() == [0, 1, 3, 4]
     assert merged_nodes.column("n_reads").to_pylist() == [35, 8, 40, 6]
     assert mem.num_rows == member.num_rows
@@ -496,7 +496,7 @@ def test_an_unmerged_final_output_says_how_many_clusters_are_twins(panel, tmp_pa
     nodes, _ = panel
     rd = _rd(tmp_path)
     _, _, final = _final_graph_and_merge(
-        rd, nodes, _membership(nodes), 1, EmParams(threads=1), _log
+        rd, nodes, _membership(nodes), 1, EmParams(threads=1, merge=False), _log
     )
     assert not final["merge_applied"] and final["keep_rows"].tolist() == [0, 1, 2, 3, 4]
     assert pq.read_table(rd / "merged_final.parquet").num_rows == 0
@@ -561,7 +561,7 @@ def _record(params, r, *, merged):
 
 
 def test_nothing_is_checked_unless_the_run_is_resumed(tmp_path):
-    report = EmParams()
+    report = EmParams(merge=False)
     rounds_dir = _finished(tmp_path, {1: _record(report, 1, merged=False)})
     _check_merge_state(rounds_dir, EmParams(merge=True), resume=False)
     _check_merge_state(tmp_path / "nowhere", EmParams(merge=True), resume=True)
@@ -574,20 +574,22 @@ def test_report_only_parameters_may_change_between_invocations(tmp_path):
 
     rounds_dir = _finished(
         tmp_path,
-        {1: _record(EmParams(), 1, merged=False), 2: None},
+        {1: _record(EmParams(merge=False), 1, merged=False), 2: None},
     )
     for params in (
-        EmParams(),
-        EmParams(graph=GraphParams(tol_5p=10, identity_floor=0.98)),
-        EmParams(merge_max_edits=2, merge_siblings=True),
-        EmParams(template_graph="final"),
-        EmParams(template_graph="off"),
+        EmParams(merge=False),
+        EmParams(merge=False, graph=GraphParams(tol_5p=10, identity_floor=0.98)),
+        EmParams(merge=False, merge_max_edits=4, merge_siblings=True),
+        EmParams(merge=False, template_graph="final"),
+        EmParams(merge=False, template_graph="off"),
+        # Merging from the first round that has not run yet is fine too.
+        EmParams(merge_from_round=2),
     ):
         _check_merge_state(rounds_dir, params, resume=True)
 
 
 def test_merge_cannot_be_switched_on_for_rounds_that_did_not_merge(tmp_path):
-    report = EmParams()
+    report = EmParams(merge=False)
     rounds_dir = _finished(
         tmp_path,
         {
@@ -612,7 +614,7 @@ def test_merge_cannot_be_switched_off_for_rounds_that_merged(tmp_path):
     rounds_dir = _finished(tmp_path, {1: _record(merging, 1, merged=True), 2: None})
     _check_merge_state(rounds_dir, merging, resume=True)
     with pytest.raises(ValueError, match="round 1 merged"):
-        _check_merge_state(rounds_dir, EmParams(), resume=True)
+        _check_merge_state(rounds_dir, EmParams(merge=False), resume=True)
     with pytest.raises(ValueError, match="round 1 merged"):
         _check_merge_state(
             rounds_dir, EmParams(merge=True, merge_from_round=2), resume=True
@@ -708,7 +710,7 @@ def test_a_legacy_run_that_merged_nothing_resumes(tmp_path, stats):
     `merge/stats.json`. Its templates are nobody's merge, so it resumes — as
     what it is: a run whose round 1 did not merge."""
     rounds_dir = _finished(tmp_path, {1: None, 2: None}, legacy={1: stats})
-    _check_merge_state(rounds_dir, EmParams(), resume=True)
+    _check_merge_state(rounds_dir, EmParams(merge=False), resume=True)
     _check_merge_state(
         rounds_dir, EmParams(merge=True, merge_from_round=2), resume=True
     )
@@ -766,7 +768,7 @@ def test_the_report_flags_twins_left_in_the_final_output(panel, tmp_path):
     run = tmp_path / "run"
     rd = _rd(tmp_path)
     _, _, final = _final_graph_and_merge(
-        rd, nodes, _membership(nodes), 1, EmParams(threads=1), _log
+        rd, nodes, _membership(nodes), 1, EmParams(threads=1, merge=False), _log
     )
     _, counts = write_cluster_edges(
         run, final["edges_path"], final["keep_rows"], _clusters(nodes)
@@ -781,7 +783,7 @@ def test_the_report_says_when_there_was_no_graph(panel, tmp_path, monkeypatch):
     nodes, store = panel
     run = tmp_path / "run"
     rd = _rd(tmp_path)
-    params = EmParams(threads=1, template_graph="off")
+    params = EmParams(threads=1, template_graph="off", merge=False)
     _refine_and_merge(rd, nodes, store, 1, params, _log)
     _done(rd)
     assert "template graph disabled" in section_template_graph(run).body
@@ -790,7 +792,7 @@ def test_the_report_says_when_there_was_no_graph(panel, tmp_path, monkeypatch):
     failed = tmp_path / "failed"
     rd = _rd(failed)
     monkeypatch.setattr(rounds_mod.gr, "build_graph", _boom)
-    _refine_and_merge(rd, nodes, store, 1, EmParams(threads=1), _log)
+    _refine_and_merge(rd, nodes, store, 1, EmParams(threads=1, merge=False), _log)
     _done(rd)
     assert "MemoryError" in section_template_graph(failed / "run").body
 
@@ -968,10 +970,50 @@ def test_the_hub_does_not_rejoin_a_split_in_the_final_output(tmp_path):
     assert joined["n_merged"] == 2
 
 
-def test_the_final_survivor_is_the_longest_not_the_best_supported(hub, tmp_path):
+def _corpus(tmp_path, nodes, *, mutate=None) -> Path:
+    """A read corpus laid out as `_membership` numbers the rows: node by
+    node, `n_reads` reads each, every read the node's own consensus (or
+    `mutate(rng, seq)` of it)."""
+    from constellation.sequencing.transcriptome.cluster.denovo._io import _READS_SCHEMA
+
+    rng = random.Random(99)
+    seqs = []
+    for seq, n in zip(
+        nodes.column("consensus").to_pylist(), nodes.column("n_reads").to_pylist()
+    ):
+        seqs += [mutate(rng, seq) if mutate else seq for _ in range(n)]
+    path = tmp_path / "reads.arrow"
+    table = pa.table(
+        {
+            "read_id": pa.array([f"r{i}" for i in range(len(seqs))], pa.string()),
+            "sequence": pa.array(seqs, pa.large_string()),
+            "sample_id": pa.array(np.zeros(len(seqs), np.int64)),
+            "dorado_quality": pa.array(np.full(len(seqs), 30.0, np.float32)),
+        },
+        schema=_READS_SCHEMA,
+    )
+    with pa.OSFile(str(path), "wb") as sink, pa.ipc.new_file(sink, _READS_SCHEMA) as w:
+        w.write_table(table)
+    return path
+
+
+def _one_substitution(rng, seq):
+    at = rng.randrange(20, len(seq) - 20)
+    other = rng.choice([b for b in "ACGT" if b != seq[at]])
+    return seq[:at] + other + seq[at + 1 :]
+
+
+def test_the_final_survivor_is_the_deepest_and_is_rebuilt_from_the_pool(hub, tmp_path):
     """Between rounds the hub (50 reads) survives and the next M-step
-    rebuilds its consensus. In the final output nothing does, so the longest
-    survives and no 5' extension is lost."""
+    rebuilds its consensus. In the final output nothing follows, so the
+    loop does the rebuild itself: the deepest member survives, every read of
+    the group is aligned to it, and the consensus is built from the pool —
+    with each read carrying one error of its own, which the pool outvotes.
+    The 6 nt the eight full-length reads reach past the hub do NOT come
+    back: the fifty hub-length reads are anchored at that end too and vote
+    against them, which is the kernel's rule and the deepest form's start.
+    Keeping the longest member instead was measured the wrong form more
+    often than not (ledger #52)."""
     nodes, store = hub
     full = nodes.column("consensus")[0].as_py()
     between = _refine_and_merge(
@@ -981,20 +1023,36 @@ def test_the_final_survivor_is_the_longest_not_the_best_supported(hub, tmp_path)
     assert full not in between.templates.column("sequence").to_pylist()
 
     rd = _rd(tmp_path / "final")
-    out_nodes, _, final = _final_graph_and_merge(
-        rd, nodes, _membership(nodes), 1, EmParams(threads=1, merge=True), _log
+    member = _membership(nodes)
+    out_nodes, mem, final = _final_graph_and_merge(
+        rd,
+        nodes,
+        member,
+        1,
+        EmParams(threads=1, merge=True),
+        _log,
+        corpus_path=_corpus(tmp_path, nodes, mutate=_one_substitution),
     )
-    assert final["keep_rows"].tolist() == [0, 1]
-    assert out_nodes.column("consensus").to_pylist() == [full, full[12:]]
-    assert out_nodes.column("n_reads").to_pylist() == [58, 6]
+    assert final["keep_rows"].tolist() == [1, 2], "the hub, not the full-length node"
+    assert out_nodes.column("n_reads").to_pylist() == [6, 58]
+    assert mem.num_rows == member.num_rows
     merged = pq.read_table(rd / "merged_final.parquet").to_pylist()
-    assert [(m["delta_5p"], m["absorbed_n_reads"]) for m in merged] == [(6, 50)]
+    assert [(m["delta_5p"], m["absorbed_n_reads"]) for m in merged] == [(-6, 8)]
+
+    assert final["rebuild"] == "ok" and final["n_rebuilt"] == 1
+    assert final["n_rebuild_failed"] == 0 and final["n_rebuild_reads_skipped"] == 0
+    rebuilt = out_nodes.slice(1, 1).to_pylist()[0]
+    assert rebuilt["consensus"] == full[6:], "the pool outvotes every read's error"
+    assert rebuilt["n_members_used"] == 58 and rebuilt["subsample_fraction"] == 1.0
+    assert rebuilt["n_extended_5p"] == 0, "8 flanked reads against 50 anchored"
+    untouched = out_nodes.slice(0, 1).to_pylist()[0]
+    assert untouched["consensus"] == full[12:] and untouched["n_members_used"] == 6
 
 
-def test_the_final_merge_ignores_an_inexact_pair_the_predicate_accepts(tmp_path):
-    """One substitution apart. `merge_max_edits=1` merges them between
-    rounds, where the next M-step rebuilds the consensus from both; in the
-    final output nothing would, so they stay two clusters."""
+def test_the_final_merge_accepts_an_inexact_pair_within_the_cap_and_rebuilds(tmp_path):
+    """One substitution apart. The final merge honours the run's cap, like
+    the merges between rounds, and the survivor's consensus comes from the
+    pooled reads: 30 of one form and 5 of the other vote the deeper base."""
     a = _rnd(random.Random(17), 900)
     b = a[:450] + ("C" if a[450] != "C" else "G") + a[451:]
     nodes = _nodes([(10, 0, 0, a, 30), (11, 1, 0, b, 5)])
@@ -1005,11 +1063,69 @@ def test_the_final_merge_ignores_an_inexact_pair_the_predicate_accepts(tmp_path)
     assert _relations(rd / "graph" / "edges.parquet")[(0, 1)] == ("equivalent", True)
     assert between.n_merged == 1
 
+    corpus = _corpus(tmp_path, nodes)
     out_nodes, _, final = _final_graph_and_merge(
-        _rd(tmp_path / "final"), nodes, _membership(nodes), 1, params, _log
+        _rd(tmp_path / "final"),
+        nodes,
+        _membership(nodes),
+        1,
+        params,
+        _log,
+        corpus_path=corpus,
     )
-    assert final["merge_applied"] and final["n_merged"] == 0
-    assert out_nodes.num_rows == 2
+    assert final["merge_applied"] and final["n_merged"] == 1
+    assert final["predicate"]["max_edits"] == 1
+    assert out_nodes.num_rows == 1
+    (node,) = out_nodes.to_pylist()
+    assert node["consensus"] == a and node["n_reads"] == 35
+    assert node["n_members_used"] == 35 and final["n_rebuilt"] == 1
+
+    # Held exact, the pair stays two clusters — the old final rule, by request.
+    out_nodes, _, final = _final_graph_and_merge(
+        _rd(tmp_path / "exact"),
+        nodes,
+        _membership(nodes),
+        1,
+        EmParams(threads=1, merge=True, merge_max_edits=0),
+        _log,
+        corpus_path=corpus,
+    )
+    assert final["n_merged"] == 0 and out_nodes.num_rows == 2
+    assert "rebuild" not in final
+
+
+def test_the_rebuild_runs_in_a_pool_and_agrees_with_the_parent(tmp_path):
+    """Three merged groups, two workers: the same table as one worker, and
+    the survivors the merge did not touch keep their rows exactly."""
+    rng = random.Random(21)
+    rows = []
+    for p in range(3):
+        seq = _rnd(rng, 700 + 100 * p)
+        rows += [(10 + p, p, 0, seq, 12), (20 + p, 3 + p, 0, seq[8:], 4)]
+    rows.append((30, 6, 0, _rnd(rng, 650), 9))
+    nodes = _nodes(rows)
+    corpus = _corpus(tmp_path, nodes, mutate=_one_substitution)
+    outs = []
+    for threads in (1, 2):
+        out_nodes, _, final = _final_graph_and_merge(
+            _rd(tmp_path / f"t{threads}"),
+            nodes,
+            _membership(nodes),
+            1,
+            EmParams(threads=threads, merge=True),
+            _log,
+            corpus_path=corpus,
+        )
+        assert final["n_merged"] == 3 and final["n_rebuilt"] == 3
+        outs.append(out_nodes)
+    assert outs[0].equals(outs[1])
+    assert outs[0].num_rows == 4
+    by_parent = {r["parent_template_id"]: r for r in outs[0].to_pylist()}
+    assert by_parent[30]["n_members_used"] == 9, "untouched"
+    for p in range(3):
+        assert by_parent[10 + p]["n_reads"] == 16
+        assert by_parent[10 + p]["n_members_used"] == 16
+        assert by_parent[10 + p]["consensus"] == rows[2 * p][3]
 
 
 # ── what is left behind ───────────────────────────────────────────────
@@ -1026,7 +1142,12 @@ def test_a_round_without_a_graph_of_its_own_keeps_nobody_else_s(panel, tmp_path)
         )
         assert (rd / "graph" / "_SUCCESS").exists()
         _refine_and_merge(
-            rd, nodes, store, 1, EmParams(threads=1, template_graph=mode), _log
+            rd,
+            nodes,
+            store,
+            1,
+            EmParams(threads=1, template_graph=mode, merge=mode != "off"),
+            _log,
         )
         assert not (rd / "graph").exists()
     rd = _rd(tmp_path / "final-off")
@@ -1036,7 +1157,7 @@ def test_a_round_without_a_graph_of_its_own_keeps_nobody_else_s(panel, tmp_path)
         nodes,
         _membership(nodes),
         1,
-        EmParams(threads=1, template_graph="off"),
+        EmParams(threads=1, template_graph="off", merge=False),
         _log,
     )
     assert not (rd / "graph").exists()

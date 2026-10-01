@@ -1,9 +1,10 @@
-"""Stage 3 of the ORF-anchored EM: consensus, haplotypes, ORF support gate.
+"""Stage 3 of the EM: consensus, haplotypes, and the ORF as an annotation.
 
-The headline cases are the two the design exists for: a homopolymer deletion
+The headline case is the one the design exists for: a homopolymer deletion
 that produces a readthrough ORF must surface as its own node with its own read
-count, and an ORF must not extend through template flanks that only one read
-supports.
+count. The ORF itself is `best_sense_orf` on each node's consensus, under the
+run's floor, and nothing more — the support gate that used to stand between
+them is gone (ledger #52).
 """
 
 from __future__ import annotations
@@ -21,8 +22,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.orf import (  # noqa:
     best_sense_orf,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (  # noqa: E402
-    certified_columns,
-    gated_orf,
+    pooled_node,
     refine_template,
     specs_from_assignments,
 )
@@ -58,103 +58,156 @@ def _specs(frame, members, weight=1.0):
     return [_spec(frame, m, weight, i) for i, m in enumerate(members)]
 
 
-# ── the support gate ──────────────────────────────────────────────────
+# ── the ORF is an annotation of the consensus ─────────────────────────
 
 
-def test_certified_columns_tracks_base_coverage_not_total():
-    """At a ragged end many members vote a deletion, so total coverage stays
-    flat while base coverage ramps down. The gate must follow the latter."""
-    rng = np.random.default_rng(3)
-    truth = _rand(rng, 400)
-    # 12 members cover only the middle; the flanks are the frame's own bases.
-    # None is anchored at either end, so no terminal block is reserved and the
-    # frame keeps its own length.
-    members = _specs(truth, [truth[100:300]] * 12)
-    cres = frame_consensus(truth, members)
-    assert cres.n_extended_5p == 0 and cres.n_extended_3p == 0
-    cert = certified_columns(cres, min_depth=3.0, min_agreement=0.6)
-    assert cert.shape[0] == len(cres.consensus)
-    assert cert[150:250].all(), "well-covered core must certify"
-    assert not cert[:50].any(), "uncovered 5' flank must not certify"
-    assert not cert[-50:].any(), "uncovered 3' flank must not certify"
-
-
-def test_orf_is_truncated_at_the_last_certified_column():
-    """An ORF running past the seed ORF into single-read flank is reported as
-    ending at the last certified column, and flagged."""
-    consensus = "ATG" + "GCT" * 100 + "TAA"
-    certified = np.zeros(len(consensus), dtype=bool)
-    certified[:180] = True  # support runs out mid-ORF
-    got = gated_orf(
-        consensus, certified, seed_orf_start=0, seed_orf_end=90
-    )
-    assert got is not None
-    prot, st, en, cert_end, truncated = got
-    assert truncated is True
-    assert st == 0
-    assert en <= 180 and en % 3 == 0
-    assert cert_end == 180
-    assert len(prot) == en // 3
-    assert "*" not in prot
-
-
-def test_fully_certified_orf_is_not_truncated():
-    consensus = "ATG" + "GCT" * 100 + "TAA"
-    certified = np.ones(len(consensus), dtype=bool)
-    prot, st, en, cert_end, truncated = gated_orf(
-        consensus, certified, seed_orf_start=0, seed_orf_end=90
-    )
-    assert truncated is False
-    assert en == len(consensus)
-    assert cert_end == en
-
-
-def test_orf_within_the_seed_boundary_is_never_gated():
-    """Everything at or before the previous round's ORF end is certified by
-    construction — the gate only judges *new* ground."""
-    consensus = "ATG" + "GCT" * 40 + "TAA"
-    certified = np.zeros(len(consensus), dtype=bool)
-    _prot, _st, en, _ce, truncated = gated_orf(
-        consensus,
-        certified,
-        seed_orf_start=0,
-        seed_orf_end=len(consensus),
-    )
-    assert truncated is False
-    assert en == len(consensus)
-
-
-def test_support_gate_end_to_end_on_a_one_read_flank():
-    """The real shape: a template whose 3' flank is covered by exactly ONE
-    read, and an ORF that would run into it.
-
-    One read is the case the gate exists for; *zero* reads is now handled one
-    step earlier by trimming the node to its supported span, so the fixture
-    has to plant a flank that is thinly covered rather than uncovered. With
-    25 reads against it the split also fires on 3' extent, which is the point
-    — so the assertion is that some node carries the untruncated protein, not
-    that a particular one does (the 25/25 mass tie is order-dependent).
-    """
-    rng = np.random.default_rng(11)
+def _one_read_flank(rng):
+    """A template whose 3' flank is covered by exactly ONE read, with an ORF
+    that runs into it: the shape the support gate was built for."""
     body = "ATG" + "".join(rng.choice(_CODONS) for _ in range(120))
     tail = "".join(rng.choice(_CODONS) for _ in range(40))  # no stop in here
     frame = _flank(rng, 30) + body + tail + "TAA" + _flank(rng, 30)
     short = frame[: 33 + len(body)]  # members stop before the tail
+    return frame, short
 
-    starved = refine_template(
-        frame, _specs(frame, [short] * 25 + [frame])
-    )
+
+def test_the_orf_is_the_consensus_s_longest_sense_orf_whatever_the_depth():
+    """No support gate. Measured on 9.4M reads the gate cost 9.7% of
+    full-length RefSeq proteins: a per-node certification evaluated on a
+    3-read node was noise, and under kmer seeding there was never a seed
+    interval to anchor it. The protein is what the consensus encodes."""
+    rng = np.random.default_rng(11)
+    frame, short = _one_read_flank(rng)
+
+    starved = refine_template(frame, _specs(frame, [short] * 25 + [frame]))
     assert len(starved) == 1, "one read is not a node"
     assert starved[0].n_reads == 26, "…and it is not discarded either"
-    assert starved[0].orf_is_truncated_by_support is True
+    node = starved[0]
+    expect = best_sense_orf(node.consensus, min_aa_length=30)
+    assert expect is not None
+    assert (node.protein, node.orf_start, node.orf_end) == expect
+    assert not hasattr(node, "orf_is_truncated_by_support")
+    assert not hasattr(node, "orf_certified_end")
 
-    covered = refine_template(
-        frame, _specs(frame, [short] * 25 + [frame] * 25)
-    )
+    covered = refine_template(frame, _specs(frame, [short] * 25 + [frame] * 25))
     assert len(covered) == 2, "25 reads of extra 3' extent is a clique"
-    full = [n for n in covered if not n.orf_is_truncated_by_support and n.protein]
-    assert full, "some node must carry the untruncated protein"
-    assert len(full[0].protein) > len(starved[0].protein)
+    # The short form holds no stop codon, so it has no ORF to report; the
+    # long one reports the full protein, uncertified flank or not.
+    orfs = {
+        (n.protein, n.orf_start, n.orf_end) == (
+            best_sense_orf(n.consensus, min_aa_length=30) or (None, -1, -1)
+        )
+        for n in covered
+    }
+    assert orfs == {True}
+    assert sorted(len(n.protein or "") for n in covered) == [0, 161]
+
+
+def test_the_floor_is_applied_and_is_the_only_thing_that_is():
+    """Prm1 is 51 aa, so the floor is 30, not 60. And it IS applied: a floor
+    of 1 shipped 14,813 sub-30-aa proteins in one round."""
+    rng = np.random.default_rng(12)
+    tiny = "ATG" + "GCT" * 9 + "TAA"  # 10 aa
+    frame = _flank(rng, 40) + tiny + _flank(rng, 40)
+    members = _specs(frame, [frame] * 8)
+    assert refine_template(frame, members)[0].protein is None
+    assert refine_template(frame, members, min_aa_length=10)[0].protein == "MAAAAAAAAA"
+    assert refine_template(frame, members, min_aa_length=11)[0].protein is None
+
+    prm1 = "ATG" + "".join(rng.choice(_CODONS) for _ in range(50)) + "TAA"  # 51 aa
+    frame = _flank(rng, 40) + prm1 + _flank(rng, 40)
+    members = _specs(frame, [frame] * 8)
+    assert len(refine_template(frame, members)[0].protein) == 51
+    assert refine_template(frame, members, min_aa_length=60)[0].protein is None
+
+
+def test_nothing_in_the_mstep_reads_a_seed_orf_or_a_support_threshold():
+    import inspect
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em import mstep
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+    )
+
+    params = inspect.signature(refine_template).parameters
+    assert "min_aa_length" in params and "coverage_route" in params
+    for gone in ("seed_orf", "support_min_depth", "support_min_agreement"):
+        assert gone not in params
+    for gone in ("gated_orf", "certified_columns", "_NO_LENGTH_FLOOR"):
+        assert not hasattr(mstep, gone)
+    assert MStepParams().min_aa_length == 30
+    assert "min_aa_length" in MStepParams().kernel_kwargs()
+    assert not hasattr(MStepParams(), "support_min_depth")
+
+
+# ── the pooled node: the consensus step without the split ─────────────
+
+
+def test_a_pooled_node_is_the_consensus_of_every_member_with_its_orf():
+    """What the final merge rebuilds a survivor from. The members of a
+    merged group, aligned to the survivor, give one consensus — trimmed to
+    what they cover, with the deepest form's bases — and its ORF."""
+    rng = np.random.default_rng(14)
+    body = "ATG" + "".join(rng.choice(_CODONS) for _ in range(120)) + "TAA"
+    frame = _flank(rng, 60) + body + _flank(rng, 60)
+    # 30 members carry a substitution the frame lacks; 5 agree with it.
+    at = 60 + 3 * 50 + 1
+    other = "C" if frame[at] != "C" else "G"
+    variant = frame[:at] + other + frame[at + 1 :]
+    members = _specs(frame, [variant] * 30 + [frame] * 5)
+    node = pooled_node(frame, members, template_id=7, haplotype_id=2)
+    assert node is not None
+    assert node.consensus == variant
+    assert (node.parent_template_id, node.haplotype_id) == (7, 2)
+    assert node.n_reads == 35 and node.node_weight == 35.0
+    assert node.member_ids.tolist() == list(range(35))
+    assert (node.protein, node.orf_start, node.orf_end) == best_sense_orf(
+        variant, min_aa_length=30
+    )
+    assert node.protein != best_sense_orf(frame, min_aa_length=30)[0]
+
+    # Trimmed to the covered span, like any node.
+    short = frame[40:-40]
+    trimmed = pooled_node(frame, _specs(frame, [short] * 10))
+    assert trimmed is not None
+    assert abs(len(trimmed.consensus) - len(short)) <= 5
+    assert trimmed.n_trimmed_5p + trimmed.n_trimmed_3p >= 70
+
+    assert pooled_node(frame, []) is None
+    assert pooled_node(frame, members, min_aa_length=200).protein is None
+
+
+# ── the coverage route is a parameter ─────────────────────────────────
+
+
+def test_the_coverage_route_can_be_switched_off():
+    """Every bench result since 2026-09-23 was measured with it off. Off,
+    the alternative start below is one node; the allelic split still fires."""
+    rng = np.random.default_rng(31)
+    body = "ATG" + "".join(rng.choice(_CODONS) for _ in range(150)) + "TAA"
+    frame = _flank(rng, 200) + body + _flank(rng, 40)
+    short = frame[200:]
+    members = _specs(frame, [frame] * 40 + [short] * 40)
+    by_extent = refine_template(frame, members, coverage_route=True)
+    assert len(by_extent) == 2
+    assert by_extent[0].stats["n_coverage"] > 0
+
+    alone = refine_template(frame, members, coverage_route=False)
+    assert len(alone) == 1
+    assert alone[0].n_reads == 80
+    assert alone[0].stats["n_coverage"] == 0
+
+    # Two linked substitutions: a column earns a node only by co-varying
+    # with another, so one alone never splits.
+    variant = list(frame)
+    for at in (200 + 3 * 40 + 1, 200 + 3 * 90 + 1):
+        variant[at] = "C" if frame[at] != "C" else "G"
+    variant = "".join(variant)
+    allelic = refine_template(
+        frame, _specs(frame, [frame] * 40 + [variant] * 40), coverage_route=False
+    )
+    assert len(allelic) == 2
+    assert sorted(n.n_reads for n in allelic) == [40, 40]
 
 
 def test_a_node_is_trimmed_to_the_sequence_its_own_reads_support():
@@ -300,11 +353,7 @@ def test_an_alternative_start_gives_two_nodes_of_different_length():
     body = "ATG" + "".join(rng.choice(_CODONS) for _ in range(150)) + "TAA"
     frame = _flank(rng, 200) + body + _flank(rng, 40)
     short = frame[200:]  # an alternative start exactly 200 nt in
-    nodes = refine_template(
-        frame,
-        _specs(frame, [frame] * 40 + [short] * 40),
-        seed_orf=(200, 200 + len(body)),
-    )
+    nodes = refine_template(frame, _specs(frame, [frame] * 40 + [short] * 40))
     assert len(nodes) == 2
     assert sorted(n.n_reads for n in nodes) == [40, 40]
     lengths = sorted(len(n.consensus) for n in nodes)
@@ -318,9 +367,7 @@ def test_a_degradation_ramp_gives_one_node():
     body = "ATG" + "".join(rng.choice(_CODONS) for _ in range(150)) + "TAA"
     frame = _flank(rng, 200) + body + _flank(rng, 40)
     members = _specs(frame, [frame[5 * i :] for i in range(40)])
-    nodes = refine_template(
-        frame, members, seed_orf=(200, 200 + len(body))
-    )
+    nodes = refine_template(frame, members)
     assert len(nodes) == 1
     assert nodes[0].n_reads == 40
 
@@ -365,26 +412,6 @@ def test_haplotype_read_counts_sum_to_the_template_total():
     nodes = refine_template(frame, members)
     assert len(nodes) >= 2, "the fixture must actually split"
     assert sum(n.n_reads for n in nodes) == 75
-
-
-def test_a_seed_orf_running_to_the_template_end_is_not_gated():
-    """The seed interval is certified by construction; only ground OUTSIDE it
-    is judged. An exclusive PWM end was being clamped to the last column index
-    and then read as an inclusive position, so a seed ORF ending at the
-    template's own end came back one base short — and the gate then truncated
-    inside the interval it is told to trust, at any depth below
-    ``support_min_depth``."""
-    rng = np.random.default_rng(43)
-    orf = "ATG" + "".join(rng.choice(_CODONS) for _ in range(40)) + "TAA"
-    for n_reads in (1, 2, 20):
-        nodes = refine_template(
-            orf,
-            _specs(orf, [orf] * n_reads),
-            seed_orf=(0, len(orf)),
-        )
-        n = nodes[0]
-        assert n.orf_end == len(orf), f"{n_reads} reads"
-        assert n.orf_is_truncated_by_support is False, f"{n_reads} reads"
 
 
 # ── minimap2 CIGARs feed the PWM directly ─────────────────────────────
@@ -436,47 +463,6 @@ def test_refined_orf_is_recallable_from_its_own_consensus():
     again = best_sense_orf(node.consensus)
     assert again is not None
     assert again[0] == node.protein
-
-
-# ── the M-step has no minimum protein length ──────────────────────────
-
-
-def test_the_mstep_has_no_minimum_protein_length():
-    """It reports what the consensus encodes; a floor is the caller's business.
-
-    A length floor inside the M-step is a claim about biology imposed on a
-    measurement — and it leaked: the floor governed `gated_orf`, whose ORF
-    interval carries forward as the next round's certified `seed_orf`, so a
-    protein-annotation knob was steering how conservatively later rounds
-    gated their own ORFs.
-    """
-    import inspect
-
-    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
-        gated_orf,
-        refine_template,
-    )
-    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
-        MStepParams,
-    )
-
-    assert "min_aa_length" not in inspect.signature(gated_orf).parameters
-    assert "min_aa_length" not in inspect.signature(refine_template).parameters
-    assert not hasattr(MStepParams(), "min_aa_length")
-
-
-def test_a_short_orf_is_reported_rather_than_discarded():
-    """Prm1 is 51 aa; the old default of 60 silently erased proteins like it."""
-    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
-        gated_orf,
-    )
-
-    # 10 aa: ATG + 9 codons + stop. Nothing about it is unreportable.
-    consensus = "ATG" + "GCT" * 9 + "TAA"
-    certified = np.ones(len(consensus), dtype=bool)
-    hit = gated_orf(consensus, certified, seed_orf_start=0, seed_orf_end=0)
-    assert hit is not None
-    assert len(hit[0]) == 10
 
 
 def test_removing_the_floor_is_monotone():

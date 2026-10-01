@@ -43,13 +43,11 @@ Three things about this that are easy to get backwards:
   did. This seeder clusters on read sequence similarity, the M-step splits on
   column covariance, and round 1 ranks on cluster support and seed quality,
   so nothing in the loop consults an ORF. Templates therefore ship
-  ``orf_start == orf_end == 0`` and no ORF is predicted at seed time. That is
-  load-bearing rather than an omission: ``mstep.gated_orf`` treats the seed
-  ORF interval as **certified by construction** and declines to judge it, so
-  predicting one here would silently *relax* the M-step's support gate on the
-  strength of a claim this seeder never made. The M-step predicts each node's
-  ORF on its own consensus, under its own ``min_aa_length``, which is where
-  the protein annotation belongs.
+  ``orf_start == orf_end == 0`` and no ORF is predicted at seed time:
+  predicting one per unique cDNA is the 9.15M-call cost this seeder exists
+  to avoid, and nothing reads it. The M-step predicts each node's ORF on its
+  own consensus, under the run's ``min_aa_length``, which is where the
+  protein annotation belongs.
 
 * **A 3' cap is what makes 5'-unbounded recruitment safe, and it only shows
   at depth.** With unbounded ends, connected components put **7,096,457 reads
@@ -358,9 +356,8 @@ def seed_by_kmer_clustering(
             "template_id": pa.array(np.arange(n_templates, dtype=np.int64)),
             "sequence": pc.take(uniq.column("sequence"), take).cast(pa.large_string()),
             # No ORF, deliberately — see "the ORF is annotation" above.
-            # (0, 0) is not a placeholder: it is what `gated_orf` reads as
-            # "nothing here is certified by construction", which is the true
-            # statement about a template this seeder elected.
+            # Nothing reads the interval; the M-step annotates each node's
+            # consensus itself.
             "orf_start": pa.array(np.zeros(n_templates, dtype=np.int32)),
             "orf_end": pa.array(np.zeros(n_templates, dtype=np.int32)),
             "orf_aa_length": pa.array(np.zeros(n_templates, dtype=np.int32)),

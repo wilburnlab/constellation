@@ -158,6 +158,40 @@ def test_dereplicate_counts_and_map():
         assert seq_of_uniq[uid] == seq
 
 
+def test_unique_reads_are_numbered_in_first_occurrence_order():
+    """`uniq_id` is the order a sequence is first seen in, which is a
+    property of the input alone. It used to be the output order of a
+    multithreaded group_by, and that order is what breaks abundance ties
+    in the anchor-star — so two seedings of one corpus disagreed on 1.2%
+    of candidate pairs and ~1% of round-1 templates."""
+    rng = np.random.default_rng(31)
+    pool = ["".join(rng.choice(list("ACGT"), 60)) for _ in range(400)]
+    picks = rng.integers(0, len(pool), 5000)
+    seqs = [pool[i] for i in picks]
+    reads = pa.table(
+        {
+            "read_id": pa.array([f"r{i}" for i in range(len(seqs))], pa.string()),
+            "sequence": pa.array(seqs, pa.large_string()),
+            "sample_id": pa.array(np.zeros(len(seqs), np.int64)),
+        }
+    )
+    first_seen: dict[str, int] = {}
+    for s in seqs:
+        first_seen.setdefault(s, len(first_seen))
+
+    uniq, rmap = dereplicate(reads)
+    assert uniq.column("uniq_id").to_pylist() == list(range(len(first_seen)))
+    assert uniq.column("sequence").to_pylist() == list(first_seen)
+    assert rmap.column("uniq_id").to_pylist() == [first_seen[s] for s in seqs]
+    # A second call, and a chunked column, give the same numbering.
+    again, _ = dereplicate(reads)
+    assert again.equals(uniq)
+    chunked = reads.set_column(
+        1, "sequence", pa.chunked_array([seqs[:1234], seqs[1234:]], pa.large_string())
+    )
+    assert dereplicate(chunked)[0].equals(uniq)
+
+
 # ── verify: overhang normalization both orientations ──────────────────
 
 

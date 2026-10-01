@@ -238,16 +238,18 @@ def test_unbounded_overhangs_are_spellable():
         ("kmer", "--template-graph", "final"),
         ("kmer", "--merge-max-edits", "1"),
         ("kmer", "--graph-identity-floor", "0.98"),
-        # --merge-from-round only schedules merging, which is off by default.
-        ("em-kmer", "--merge-from-round", "3"),
+        # --merge-from-round only schedules merging.
         ("em-kmer --no-merge", "--merge-from-round", "3"),
+        ("em-kmer --template-graph off", "--merge-from-round", "3"),
         # With the graph off nothing reads the graph's or the predicate's knobs.
         ("em-kmer --template-graph off", "--graph-5p-tolerance", "20"),
         ("em-kmer --template-graph off", "--merge-max-edits", "1"),
         ("em-orf --template-graph off", "--merge-min-reads", "5"),
-        # Under 'final' only the final output merges, and that merge is exact.
+        # Under 'final' only the final output merges.
         ("em-kmer --merge --template-graph final", "--merge-from-round", "2"),
-        ("em-kmer --merge --template-graph final", "--merge-max-edits", "1"),
+        ("em-kmer --template-graph final", "--merge-from-round", "2"),
+        # The coverage route is the em M-step's.
+        ("kmer", "--coverage-route", ""),
     ],
 )
 def test_a_flag_this_mode_ignores_is_an_error(mode, flag, value):
@@ -257,7 +259,7 @@ def test_a_flag_this_mode_ignores_is_an_error(mode, flag, value):
     from constellation.cli.__main__ import _reject_inapplicable
 
     mode, *extra = mode.split()
-    args = _args("--mode", mode, *extra, flag, value)
+    args = _args("--mode", mode, *extra, flag, *([value] if value else []))
     canonical = _normalise_cluster_mode(mode)
     seeding = _em_seeding(mode) if canonical == "em" else "orf"
     problem = _reject_inapplicable(args, canonical, seeding)
@@ -301,28 +303,34 @@ def test_min_aa_length_still_defaults_to_60_for_plain_kmer_mode():
     assert _args("--mode", "kmer").min_aa_length is None
 
 
-def test_min_aa_length_is_refused_under_em_kmer():
-    """Nothing reads it there: that seeder predicts no ORF, and the M-step
-    has no minimum protein length in either mode."""
+def test_min_aa_length_is_the_annotation_floor_in_every_em_mode():
+    """It reaches the M-step under both seeders, and under em-orf it is the
+    seeding key as well. It was refused under em-kmer while the M-step had
+    no floor; that floor is back (a floor of 1 shipped 14,813 sub-30-aa
+    proteins in one round), so the flag means something there again."""
     from constellation.cli.__main__ import _reject_inapplicable
 
-    args = _args("--mode", "em-kmer", "--min-aa-length", "30")
-    problem = _reject_inapplicable(args, "em", "kmer")
-    assert problem is not None and "--min-aa-length" in problem
-    # ...and it is fine where it means something.
-    assert _reject_inapplicable(_args("--mode", "em-orf", "--min-aa-length", "30"),
-                                "em", "orf") is None
+    for mode, seeding in (("em-kmer", "kmer"), ("em-orf", "orf")):
+        args = _args("--mode", mode, "--min-aa-length", "45")
+        assert _reject_inapplicable(args, "em", seeding) is None
+        params = _resolved_for(seeding, "--min-aa-length", "45")
+        assert params.min_aa_length == 45
+        assert params.mstep.min_aa_length == 45
+    assert _resolved().mstep.min_aa_length == 30
     assert _reject_inapplicable(_args("--mode", "kmer", "--min-aa-length", "60"),
                                 "kmer", "orf") is None
 
 
-def test_the_mstep_never_receives_a_length_floor():
-    """The CLI cannot hand the M-step a floor, because it has no field for one."""
-    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
-        MStepParams,
-    )
+def test_the_coverage_route_is_off_unless_asked_for():
+    from constellation.cli.__main__ import _reject_inapplicable
 
-    assert "min_aa_length" not in MStepParams.__dataclass_fields__
+    assert _resolved().mstep.coverage_route is False
+    assert _resolved("--no-coverage-route").mstep.coverage_route is False
+    assert _resolved("--coverage-route").mstep.coverage_route is True
+    problem = _reject_inapplicable(
+        _args("--mode", "kmer", "--coverage-route"), "kmer", "orf"
+    )
+    assert problem is not None and "--coverage-route" in problem
 
 
 def test_the_two_pass_estep_is_opt_in_and_its_knobs_apply_under_it():
@@ -429,7 +437,7 @@ def test_the_escape_hatch_refuses_merge():
     assert problem is not None and "--template-graph off" in problem
 
 
-def _resolved(*extra):
+def _resolved_for(seeding, *extra):
     from constellation.cli.__main__ import _em_params
     from constellation.sequencing.transcriptome.cluster.denovo.em.graph import (
         GraphParams,
@@ -441,24 +449,66 @@ def _resolved(*extra):
         EmParams,
     )
 
-    args = _args("--mode", "em-kmer", *extra)
-    return _em_params(args, "kmer", EmParams, GraphParams, MStepParams)
+    args = _args("--mode", f"em-{seeding}", *extra)
+    return _em_params(args, seeding, EmParams, GraphParams, MStepParams)
 
 
-def test_a_run_reports_and_merges_nothing_unless_asked():
+def _resolved(*extra):
+    return _resolved_for("kmer", *extra)
+
+
+def test_a_run_merges_within_two_edits_by_default():
+    """The operating point of the 2026-09-30 sweep: K = 2 nominally best on
+    every recall count, node growth between rounds nearly stopped."""
     from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
         EmParams,
     )
 
     for params in (EmParams(), _resolved()):
         assert params.template_graph == "rounds"
-        assert params.merge is False
-        assert not any(params.merges_after(r) for r in range(1, 13))
+        assert params.merge is True
+        assert all(params.merges_after(r) for r in range(1, 13))
         pred = params.merge_predicate()
-        assert (pred.max_edits, pred.tol_5p, pred.tol_3p) == (0, 30, 30)
+        assert (pred.max_edits, pred.tol_5p, pred.tol_3p) == (2, 30, 30)
         assert pred.min_reads == 0 and pred.merge_siblings is False
     assert not hasattr(EmParams(), "p_merge")
     assert not hasattr(EmParams(), "merge_min_coverage")
+
+
+def test_no_merge_and_the_graph_off_both_switch_it_off():
+    off = _resolved("--no-merge")
+    assert off.merge is False and not off.merges_after(1)
+    assert off.merge_predicate().max_edits == 2, "the report still says mergeable"
+    silent = _resolved("--template-graph", "off")
+    assert silent.merge is False and silent.template_graph == "off"
+    assert _resolved("--template-graph", "final").merge is True
+
+
+def test_the_edit_budget_follows_the_merge_cap():
+    """An edge exists only within `edit_budget = max(min_budget, floor(L *
+    (1 - identity_floor)))`, so at 0.99 a pair whose shorter template is
+    under 100 K nt could never merge at K edits — 13% of a 9.4M-read run's
+    nodes at K = 6 — and the bench passed --graph-identity-floor 0.98 to get
+    round it. The budget follows the cap; longer templates are untouched."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.graph import (
+        GraphParams,
+        edit_budget,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        EmParams,
+    )
+
+    assert _resolved().graph.min_budget == 3
+    six = _resolved("--merge-max-edits", "6")
+    assert six.graph.min_budget == 6
+    assert edit_budget(300, six.graph) == 6 and edit_budget(900, six.graph) == 9
+    assert EmParams(merge_max_edits=6).graph.min_budget == 6
+    assert EmParams(merge_max_edits=1).graph.min_budget == 3
+    # An explicit, larger budget is kept; the stamp sees the budget it ran at.
+    kept = EmParams(merge_max_edits=6, graph=GraphParams(min_budget=9))
+    assert kept.graph.min_budget == 9
+    assert EmParams(merge=False, merge_max_edits=6).graph.min_budget == 6
+    assert six.graph.semantic()["min_budget"] == 6
 
 
 def test_the_merge_flags_reach_the_predicate():
@@ -491,6 +541,9 @@ def test_the_merge_flags_reach_the_predicate():
 def test_under_final_only_the_final_output_merges():
     params = _resolved("--merge", "--template-graph", "final")
     assert params.merge and not any(params.merges_after(r) for r in range(1, 13))
+    # ...and it merges within the cap: the final merge is no longer exact.
+    assert params.merge_predicate().max_edits == 2
+    assert _resolved("--template-graph", "final", "--merge-max-edits", "1").graph
 
 
 @pytest.mark.parametrize(
@@ -506,17 +559,29 @@ def test_under_final_only_the_final_output_merges():
             {"merge": True, "template_graph": "final", "merge_from_round": 2},
             "merge_from_round",
         ),
-        (
-            {"merge": True, "template_graph": "final", "merge_max_edits": 1},
-            "always exact",
-        ),
         # A knob that cannot act is an error here too, not only in the parser.
-        ({"merge_from_round": 3}, "merge_from_round has no effect without merge"),
+        (
+            {"merge": False, "merge_from_round": 3},
+            "merge_from_round has no effect without merge",
+        ),
+        ({"template_graph": "off"}, "merge is on by default; pass merge=False"),
         ({"template_graph": "final", "merge_from_round": 2}, "merge_from_round"),
-        ({"template_graph": "off", "merge_max_edits": 1}, "merge_max_edits has no effect"),
-        ({"template_graph": "off", "merge_tol_5p": 10}, "merge_tol_5p has no effect"),
-        ({"template_graph": "off", "merge_min_reads": 3}, "merge_min_reads has no effect"),
-        ({"template_graph": "off", "merge_siblings": True}, "merge_siblings has no effect"),
+        (
+            {"template_graph": "off", "merge": False, "merge_max_edits": 1},
+            "merge_max_edits has no effect",
+        ),
+        (
+            {"template_graph": "off", "merge": False, "merge_tol_5p": 10},
+            "merge_tol_5p has no effect",
+        ),
+        (
+            {"template_graph": "off", "merge": False, "merge_min_reads": 3},
+            "merge_min_reads has no effect",
+        ),
+        (
+            {"template_graph": "off", "merge": False, "merge_siblings": True},
+            "merge_siblings has no effect",
+        ),
         # Not counts: a float would be truncated, a string is truthy.
         ({"merge_tol_5p": 10.5}, "merge_tol_5p must be an int"),
         ({"merge_max_edits": 1.5}, "merge_max_edits must be an int"),
@@ -543,9 +608,9 @@ def test_graph_parameters_have_no_effect_with_the_graph_off():
     )
 
     with pytest.raises(ValueError, match="graph parameters have no effect"):
-        EmParams(template_graph="off", graph=GraphParams(tol_5p=20))
+        EmParams(template_graph="off", merge=False, graph=GraphParams(tol_5p=20))
     # How the work is cut up is a parameter of the graph too; with no graph
     # there is no work.
     with pytest.raises(ValueError, match="graph parameters have no effect"):
-        EmParams(template_graph="off", graph=GraphParams(chunk_rows=1_000))
-    assert EmParams(template_graph="off").graph == GraphParams()
+        EmParams(template_graph="off", merge=False, graph=GraphParams(chunk_rows=1_000))
+    assert EmParams(template_graph="off", merge=False).graph == GraphParams()
