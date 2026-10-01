@@ -66,7 +66,8 @@ def _corpus(tmp_path):
 
 def test_filter_drops_above_the_limit_and_keeps_the_boundary(tmp_path):
     reads, stats = load_demux_windows(_corpus(tmp_path), max_window_length=1000)
-    assert reads.column("read_id").to_pylist() == ["short", "at_limit"]
+    # In read_id order, not input order: see the ordering test below.
+    assert reads.column("read_id").to_pylist() == ["at_limit", "short"]
     assert stats["n_input"] == 4
     assert stats["n_dropped_long"] == 2
     assert stats["max_input_length"] == 40_000
@@ -155,3 +156,38 @@ def test_dropping_a_window_does_not_crash_a_quiet_run(tmp_path, monkeypatch):
             progress_cb=None,
         )
     assert seen["n"] == 2, "the filter ran; the report must not have crashed"
+
+
+def test_the_windows_come_back_in_read_id_order_whatever_the_reader_gives(
+    tmp_path, monkeypatch
+):
+    """`--mode kmer` dereplicates these in first-occurrence order, which the
+    anchor-star breaks ties on; the demux join's order changes from call to
+    call (ledger #59, #61), so the loader sorts as the EM corpus does."""
+    import numpy as np
+
+    from constellation.sequencing.align.map import _iter_demux_read_batches
+    from constellation.sequencing.transcriptome.cluster.denovo import _io
+
+    rng = np.random.default_rng(4)
+    rows = [
+        (f"r{int(i):05d}", "".join(rng.choice(list("ACGT"), 60)), int(i) % 3)
+        for i in rng.permutation(400)
+    ]
+    demux = _write_demux_dir(tmp_path, rows)
+
+    def scrambled(seed):
+        def reader(demux_dir, **kwargs):
+            r = np.random.default_rng(seed)
+            for b in _iter_demux_read_batches(demux_dir, **kwargs):
+                yield b.take(pa.array(r.permutation(b.num_rows)))
+
+        return reader
+
+    tables = []
+    for seed in range(3):
+        monkeypatch.setattr(_io, "_iter_demux_read_batches", scrambled(seed))
+        reads, _ = load_demux_windows(demux)
+        tables.append(reads)
+    assert tables[0].equals(tables[1]) and tables[0].equals(tables[2])
+    assert tables[0].column("read_id").to_pylist() == sorted(r[0] for r in rows)

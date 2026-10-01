@@ -152,7 +152,6 @@ def _iter_demux_read_batches(
     *,
     only_complete: bool = True,
     batch_size: int = 100_000,
-    ordered: bool = False,
 ) -> Iterator[pa.RecordBatch]:
     """Stream joined reads ⨝ demux record batches.
 
@@ -188,20 +187,6 @@ def _iter_demux_read_batches(
 
     ``batch_size`` is unused (preserved for source compatibility with
     the previous signature); acero chooses its own internal batch size.
-
-    ``ordered=True`` yields the reads in the order of the ``reads/``
-    dataset — shard by shard, row by row — and the same order every time.
-    The default plan runs the join on the thread pool and emits probe
-    batches as they finish, so two calls on one directory return the same
-    reads in two orders (measured: 6 of 6 calls distinct). That is fine for
-    a BAM that is sorted afterwards or a FASTQ nobody orders, and not for
-    the EM corpus, whose row order becomes `uniq_id`, the anchor-star's
-    tie-break and so the seed templates (ledger #59). Ordered, the scan is
-    asked for sequenced output and the plan runs on a serial executor;
-    measured on 500k reads it costs nothing (0.72 s against 0.71 s). Serial
-    alone is NOT enough — the scan's readahead still reorders — and
-    sequenced output on the thread pool is not either; the two together
-    were stable in 5 of 5 and equal to the dataset order.
 
     Memory at 200M-read scale: filtered demux index ~10 GB (50 B/row),
     resident as the hash side; reads streamed via the scan node.
@@ -271,9 +256,7 @@ def _iter_demux_read_batches(
     # in-memory demux table on the right (build) side.
     scan_node = pa_ac.Declaration(
         "scan",
-        pa_ac.ScanNodeOptions(
-            reads_ds, columns=reads_columns, require_sequenced_output=ordered
-        ),
+        pa_ac.ScanNodeOptions(reads_ds, columns=reads_columns),
     )
     # ``scan`` emits internal __fragment_index / __batch_index /
     # __last_in_fragment columns; project them away before joining so
@@ -308,7 +291,7 @@ def _iter_demux_read_batches(
         ],
     )
 
-    reader = join_node.to_reader(use_threads=not ordered)
+    reader = join_node.to_reader(use_threads=True)
     try:
         for batch in reader:
             if batch.num_rows == 0:
@@ -324,8 +307,11 @@ def _string_buf_and_offsets(
     """Extract the raw byte buffer + value_offsets from a StringArray.
 
     Acero's join output may be a ChunkedArray with a single chunk
-    (combine before slicing); the returned offsets are int32 with
-    ``len(arr) + 1`` entries, and ``arr[i] == data[offsets[i]:offsets[i+1]]``.
+    (combine before slicing); the returned offsets have ``len(arr) + 1``
+    entries, and ``arr[i] == data[offsets[i]:offsets[i+1]]``. They are int32
+    for ``string`` and int64 for ``large_string``: reading a large_string's
+    offsets as int32 splits each into a value and a zero, which made every
+    other window in a batch silently empty.
     """
     if isinstance(arr, pa.ChunkedArray):
         arr = arr.combine_chunks()
@@ -335,7 +321,10 @@ def _string_buf_and_offsets(
         # Easiest: round-trip through combine_chunks via a 1-chunk Chunked.
         arr = pa.chunked_array([arr]).combine_chunks()
     buffers = arr.buffers()
-    offsets = np.frombuffer(buffers[1], dtype=np.int32, count=len(arr) + 1)
+    wide = pa.types.is_large_string(arr.type) or pa.types.is_large_binary(arr.type)
+    offsets = np.frombuffer(
+        buffers[1], dtype=np.int64 if wide else np.int32, count=len(arr) + 1
+    )
     data = bytes(buffers[2]) if buffers[2] is not None else b""
     return data, offsets
 
