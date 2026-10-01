@@ -37,6 +37,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.dataset as pa_ds
 
 from constellation.sequencing.align.map import _iter_demux_read_batches
 from constellation.sequencing.transcriptome.cluster.denovo._io import (
@@ -200,6 +201,37 @@ def chunked_take(
     return gathered.take(pa.array(inverse))
 
 
+def _check_reads_order(demux_dir: Path, arrow_path: Path) -> None:
+    """Refuse a corpus whose rows are not in the reads dataset's order.
+
+    The order is what `ordered=True` on the reader promises, and it rests on
+    Acero running a sequenced scan through a serial join in probe order —
+    measured, not documented. If a future Arrow stops doing that the corpus
+    would be silently non-deterministic again, so the order is checked
+    against the dataset: its `read_id` column, filtered to the reads the
+    corpus holds, must equal the corpus's `read_id` column. Two string
+    columns of read-cardinality, a few hundred MB at 9.4M reads.
+    """
+    with pa.memory_map(str(arrow_path), "r") as mm, pa.ipc.open_file(mm) as reader:
+        written = reader.read_all().column("read_id").combine_chunks()
+    if len(written) == 0:
+        return
+    on_disk = (
+        pa_ds.dataset(Path(demux_dir) / "reads")
+        .to_table(columns=["read_id"])
+        .column("read_id")
+        .combine_chunks()
+    )
+    expected = on_disk.filter(pc.is_in(on_disk, value_set=written))
+    if len(expected) != len(written) or not expected.equals(written):
+        raise RuntimeError(
+            "the corpus is not in the reads dataset's order: the ordered "
+            "join did not preserve it. Row order is the corpus's identity "
+            "(uniq_id, seeding), so this is refused rather than written. "
+            f"{len(expected):,} reads expected, {len(written):,} written."
+        )
+
+
 def write_corpus(
     demux_dir: Path,
     output_dir: Path,
@@ -256,7 +288,15 @@ def write_corpus(
     pending_rows = 0
     try:
         with tmp_fasta.open("w", encoding="utf-8") as fh:
-            for batch in _iter_demux_read_batches(demux_dir, only_complete=True):
+            # `ordered`: in the order of the reads dataset, every time. Row
+            # order IS the corpus's identity downstream — `uniq_id` is
+            # first-occurrence order, the anchor-star breaks abundance ties
+            # on it, and the seed templates follow — and the default join
+            # emits the same reads in a different order on every call
+            # (ledger #59). Checked below against the dataset itself.
+            for batch in _iter_demux_read_batches(
+                demux_dir, only_complete=True, ordered=True
+            ):
                 if batch.num_rows == 0:
                     continue
                 trimmed = _trim_batch(batch)
@@ -291,6 +331,7 @@ def write_corpus(
     finally:
         writer.close()
 
+    _check_reads_order(demux_dir, tmp_arrow)
     tmp_arrow.replace(arrow_path)
     tmp_fasta.replace(fasta_path)
 

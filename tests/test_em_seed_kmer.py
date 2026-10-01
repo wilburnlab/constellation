@@ -114,7 +114,10 @@ def test_seeding_the_same_reads_twice_gives_the_same_templates(three_transcripts
     two = seed_by_kmer_clustering(reads, identity=0.90)
     assert one.templates.equals(two.templates)
     assert one.read_cluster.equals(two.read_cluster)
-    assert one.stats == two.stats
+    # Everything but the stage timings, which are wall-clock seconds.
+    counts = lambda stats: {k: v for k, v in stats.items() if not k.endswith("_s")}  # noqa: E731
+    assert counts(one.stats) == counts(two.stats)
+    assert any(k.endswith("_s") for k in one.stats)
 
 
 def test_every_read_gets_a_row_and_the_counts_reconcile(three_transcripts):

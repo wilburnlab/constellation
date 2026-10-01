@@ -872,6 +872,56 @@ def _r2_sequences(out):
         return sorted(pa.ipc.open_file(mm).read_all().column("sequence").to_pylist())
 
 
+def _templates_of(out, r):
+    path = out / "rounds" / f"r{r:02d}" / "templates" / "templates.arrow"
+    with pa.memory_map(str(path)) as mm:
+        t = pa.ipc.open_file(mm).read_all()
+    return list(
+        zip(t.column("template_id").to_pylist(), t.column("sequence").to_pylist())
+    )
+
+
+def test_the_worker_count_does_not_change_the_template_ids(tmp_path):
+    """Nodes are written one shard per M-step unit, and the units are a
+    bin-packing over the worker count — so concatenated they stood in an
+    order that depended on --mstep-workers, and template ids are row
+    positions. Measured: the same nodes at two worker counts, one merge
+    different in round 1, 94,560 clusters against 94,556 (ledger #60)."""
+    # Enough live templates that one worker packs them into its 16 units
+    # and three workers do not: 24 transcripts, 3 reads each.
+    rng = np.random.default_rng(23)
+    rows = []
+    for g in range(24):
+        truth = _orf(rng, 90 + g)
+        rows += [(f"g{g}_r{i}", _mutate(rng, truth, 0.01), 30.0) for i in range(3)]
+    corpus = _write_demux(tmp_path, rows)
+    runs = {}
+    shard_order = {}
+    for workers in (1, 3):
+        out = tmp_path / f"w{workers}"
+        run_em(
+            corpus,
+            out,
+            params=_params(rounds=2, min_aa_length=40, mstep_workers=workers),
+        )
+        shards = sorted((out / "rounds" / "r01" / "mstep" / "nodes").glob("part-*.parquet"))
+        shard_order[workers] = [
+            pq.read_table(s, columns=["parent_template_id"]).column(0).to_pylist()
+            for s in shards
+        ]
+        runs[workers] = (
+            _templates_of(out, 2),
+            pq.read_table(out / "clusters.parquet").to_pylist(),
+            pq.read_table(out / "cluster_membership.parquet").to_pylist(),
+        )
+    assert runs[1][0] == runs[3][0], "same ids, same sequences, same rows"
+    assert runs[1][1] == runs[3][1]
+    assert runs[1][2] == runs[3][2]
+    flat = {w: [p for shard in s for p in shard] for w, s in shard_order.items()}
+    assert flat[1] != flat[3], "the shards stand in different orders, and that is fine"
+    assert len(flat[1]) > 16
+
+
 def test_report_only_writes_edges_and_merges_nothing(tmp_path, monkeypatch):
     """Report-only: the twin is an edge in the graph, and still a template."""
     _twin_first_node(monkeypatch, sibling=False)

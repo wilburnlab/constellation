@@ -466,6 +466,49 @@ def mstep_worker(
     }
 
 
+def in_node_order(nodes: pa.Table) -> pa.Table:
+    """``nodes`` sorted by ``(parent_template_id, haplotype_id)``: the order
+    the next round's template ids are assigned in.
+
+    The shards are written unit by unit, and the units are a bin-packing of
+    the templates over ``--mstep-workers x 16``, so concatenated they stand
+    in an order that depends on the worker count. Template ids are row
+    positions (``template_id_for(round, row)``), and the claim order of the
+    merge, the set cover and the E-step's final tie-break all read them —
+    so the same nodes at two worker counts gave different ids, one different
+    merge in round 1 and 94,560 clusters against 94,556 (ledger #60). The
+    pair is unique within a round and known at emission, which makes it the
+    one order that is a property of the nodes alone. Membership rows are
+    keyed on the same pair and are sorted with :func:`in_membership_order`.
+    """
+    if nodes.num_rows < 2:
+        return nodes
+    return nodes.take(
+        pc.sort_indices(
+            nodes.select(["parent_template_id", "haplotype_id"]),
+            sort_keys=[("parent_template_id", "ascending"), ("haplotype_id", "ascending")],
+        )
+    )
+
+
+def in_membership_order(membership: pa.Table) -> pa.Table:
+    """``membership`` sorted by ``(parent_template_id, haplotype_id,
+    read_row)`` — see :func:`in_node_order`; this is what fixes the row order
+    of ``cluster_membership.parquet``."""
+    if membership.num_rows < 2:
+        return membership
+    return membership.take(
+        pc.sort_indices(
+            membership.select(["parent_template_id", "haplotype_id", "read_row"]),
+            sort_keys=[
+                ("parent_template_id", "ascending"),
+                ("haplotype_id", "ascending"),
+                ("read_row", "ascending"),
+            ],
+        )
+    )
+
+
 def _rows_to_membership(round_index, parent, hap, read, weight) -> pa.Table:
     if not parent:
         return NODE_MEMBERSHIP_TABLE.empty_table()
@@ -583,6 +626,8 @@ __all__ = [
     "REFINED_NODE_TABLE",
     "MStepParams",
     "MStepUnit",
+    "in_membership_order",
+    "in_node_order",
     "iter_unit_batches",
     "mstep_worker",
     "plan_mstep_units",

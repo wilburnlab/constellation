@@ -61,6 +61,9 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from constellation.sequencing.transcriptome.cluster.denovo.em import graph as gr
+from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+    in_node_order,
+)
 from constellation.sequencing.transcriptome.cluster.denovo.em.refine import (
     template_id_for,
 )
@@ -113,7 +116,8 @@ def _load(round_dir: Path, limit: int | None, seed: int):
     if not (name.startswith("r") and name[1:].isdigit()):
         raise SystemExit(f"{round_dir.name!r} is not a round directory (rNN)")
     r = int(name[1:])
-    nodes = ds.dataset(shards).to_table(columns=_NODE_COLUMNS)
+    # The loop's order, so the ids below are the loop's ids.
+    nodes = in_node_order(ds.dataset(shards).to_table(columns=_NODE_COLUMNS))
     n_all = nodes.num_rows
     parents = nodes.column("parent_template_id").to_numpy(zero_copy_only=False)
     # Over ALL the nodes, before any sampling: a sample keeps one child of a

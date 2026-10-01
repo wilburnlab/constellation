@@ -324,3 +324,65 @@ def test_a_one_template_unit_also_detaches_from_the_round():
             "— a single-template unit is still holding the round's buffers"
         )
         assert pickled < srt.nbytes
+
+
+# ── node order is a property of the nodes, not of the worker count ────
+
+
+def test_nodes_and_membership_are_put_in_their_own_order():
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        NODE_MEMBERSHIP_TABLE,
+        REFINED_NODE_TABLE,
+        in_membership_order,
+        in_node_order,
+    )
+
+    rows = [(30, 1), (10, 0), (30, 0), (10, 2), (20, 0), (10, 1)]
+    nodes = pa.table(
+        {
+            f.name: pa.array(
+                [r[0] for r in rows]
+                if f.name == "parent_template_id"
+                else [r[1] for r in rows]
+                if f.name == "haplotype_id"
+                else [[] for _ in rows]
+                if f.name == "declared_variants"
+                else ["x"] * len(rows)
+                if pa.types.is_string(f.type) or pa.types.is_large_string(f.type)
+                else [1] * len(rows),
+                type=f.type,
+            )
+            for f in REFINED_NODE_TABLE
+        },
+        schema=REFINED_NODE_TABLE,
+    )
+    ordered = in_node_order(nodes)
+    assert ordered.schema.equals(nodes.schema)
+    assert list(
+        zip(
+            ordered.column("parent_template_id").to_pylist(),
+            ordered.column("haplotype_id").to_pylist(),
+        )
+    ) == sorted(rows)
+    assert in_node_order(nodes.slice(0, 1)).equals(nodes.slice(0, 1))
+
+    members = [(30, 1, 5), (10, 0, 9), (10, 0, 2), (30, 0, 1)]
+    membership = pa.table(
+        {
+            "round": pa.array([1] * len(members), pa.int32()),
+            "parent_template_id": pa.array([m[0] for m in members], pa.int64()),
+            "haplotype_id": pa.array([m[1] for m in members], pa.int32()),
+            "read_row": pa.array([m[2] for m in members], pa.int32()),
+            "weight": pa.array([1.0] * len(members), pa.float32()),
+        },
+        schema=NODE_MEMBERSHIP_TABLE,
+    )
+    got = in_membership_order(membership)
+    assert list(
+        zip(
+            got.column("parent_template_id").to_pylist(),
+            got.column("haplotype_id").to_pylist(),
+            got.column("read_row").to_pylist(),
+        )
+    ) == sorted(members)
+    assert in_membership_order(NODE_MEMBERSHIP_TABLE.empty_table()).num_rows == 0

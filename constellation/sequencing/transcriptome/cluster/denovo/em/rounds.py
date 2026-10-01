@@ -78,6 +78,8 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import 
     NODE_MEMBERSHIP_TABLE,
     REFINED_NODE_TABLE,
     MStepParams,
+    in_membership_order,
+    in_node_order,
     iter_unit_batches,
     mstep_worker,
     plan_mstep_units,
@@ -947,13 +949,16 @@ def _run_mstep(r, rd, store, corpus, assignments, params, log):
         total=len(units),
     )
     shards = outputs["nodes"].shard_paths
-    nodes = (
+    # In node order, not shard order: the shards are one per unit and the
+    # units depend on the worker count, while the rows here become the next
+    # round's template ids.
+    nodes = in_node_order(
         pa_ds.dataset(shards, schema=REFINED_NODE_TABLE).to_table()
         if shards
         else REFINED_NODE_TABLE.empty_table()
     )
     mem_shards = outputs["node_membership"].shard_paths
-    membership = (
+    membership = in_membership_order(
         pa_ds.dataset(mem_shards, schema=NODE_MEMBERSHIP_TABLE).to_table()
         if mem_shards
         else NODE_MEMBERSHIP_TABLE.empty_table()
@@ -1499,9 +1504,11 @@ def _resume_point(rounds_dir: Path, resume: bool, log, params: EmParams | None =
     log(f"resuming after round {last} (rebuilding its successor's templates)")
     store = TemplateStore.open(store_path)
     try:
-        nodes = pa_ds.dataset(
-            sorted(nodes_dir.glob("part-*.parquet")), schema=REFINED_NODE_TABLE
-        ).to_table()
+        nodes = in_node_order(
+            pa_ds.dataset(
+                sorted(nodes_dir.glob("part-*.parquet")), schema=REFINED_NODE_TABLE
+            ).to_table()
+        )
         refined = _refine_and_merge(
             rd, nodes, store, last, params or EmParams(), log
         )

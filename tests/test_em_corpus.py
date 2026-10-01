@@ -330,3 +330,110 @@ def test_a_corpus_written_before_settings_were_recorded_still_resumes(tmp_path):
     write_corpus(demux, out, max_window_length=None)
     (out / "settings.json").unlink(missing_ok=True)
     assert write_corpus(demux, out, max_window_length=7, resume=True).n_reads == 1
+
+
+# ── row order is the corpus's identity ────────────────────────────────
+
+
+def _multi_shard_demux(tmp_path, *, n_shards=6, per_shard=4_000, seed=0) -> tuple[Path, list[str]]:
+    """A demux dir with several `reads/` shards and several `read_demux/`
+    shards in a shuffled order, with 70% of the reads Complete. Returns the
+    dir and the Complete read ids in reads-dataset order."""
+    rng = np.random.default_rng(seed)
+    demux = tmp_path / "demux"
+    (demux / "reads").mkdir(parents=True)
+    (demux / "read_demux").mkdir(parents=True)
+    in_order: list[str] = []
+    kept: list[str] = []
+    for s in range(n_shards):
+        ids = [f"s{s}_r{i}" for i in range(per_shard)]
+        seqs = ["".join(rng.choice(list("ACGT"), 80)) for _ in range(per_shard)]
+        pq.write_table(
+            pa.table(
+                {
+                    "read_id": ids,
+                    "sequence": seqs,
+                    "dorado_quality": pa.array(np.full(per_shard, 20.0, np.float32)),
+                }
+            ),
+            demux / "reads" / f"part-{s:05d}.parquet",
+            row_group_size=1_000,
+        )
+        in_order += ids
+        kept += [i for i in ids if rng.random() < 0.7]
+    shuffled = list(kept)
+    rng.shuffle(shuffled)
+    for s in range(3):
+        sl = shuffled[s::3]
+        n = len(sl)
+        pq.write_table(
+            pa.table(
+                {
+                    "read_id": sl,
+                    "transcript_segment_index": [0] * n,
+                    "sample_id": pa.array([0] * n, pa.int64()),
+                    "orientation": ["+"] * n,
+                    "transcript_start": pa.array([5] * n, pa.int32()),
+                    "transcript_end": pa.array([75] * n, pa.int32()),
+                    "score": pa.array([1.0] * n, pa.float32()),
+                    "is_chimera": [False] * n,
+                    "status": ["Complete"] * n,
+                    "is_fragment": [False] * n,
+                    "artifact": ["none"] * n,
+                }
+            ),
+            demux / "read_demux" / f"part-{s:05d}.parquet",
+        )
+    return demux, kept
+
+
+def test_the_corpus_is_in_the_reads_dataset_s_order_every_time(tmp_path):
+    """The reader's default join emits probe batches as the thread pool
+    finishes them, so two corpora from one demux dir held the same reads in
+    two orders — and row order is `uniq_id`, the anchor-star's tie-break and
+    the seed templates (ledger #59). Ordered, it is the dataset's order."""
+    from constellation.sequencing.align.map import _iter_demux_read_batches
+
+    demux, in_order = _multi_shard_demux(tmp_path)
+    assert len(in_order) > 10_000
+    corpora = []
+    for i in range(3):
+        corpus = write_corpus(demux, tmp_path / f"corpus{i}", max_window_length=None)
+        store = ReadStore.open(corpus.arrow_path)
+        try:
+            corpora.append(store.read_id.to_pylist())
+        finally:
+            store.close()
+        assert corpus.n_reads == len(in_order)
+    assert corpora[0] == in_order
+    assert corpora[1] == corpora[0] and corpora[2] == corpora[0]
+    assert (tmp_path / "corpus0" / "reads.arrow").read_bytes() == (
+        tmp_path / "corpus1" / "reads.arrow"
+    ).read_bytes()
+
+    # The ordered reader is what makes it so; the plain one does not promise it.
+    ordered = [
+        rid
+        for b in _iter_demux_read_batches(demux, ordered=True)
+        for rid in b.column("read_id").to_pylist()
+    ]
+    assert ordered == in_order
+
+
+def test_a_corpus_out_of_dataset_order_is_refused(tmp_path):
+    from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
+        _check_reads_order,
+    )
+
+    demux, in_order = _multi_shard_demux(tmp_path, n_shards=2, per_shard=500, seed=1)
+    corpus = write_corpus(demux, tmp_path / "corpus", max_window_length=None)
+    _check_reads_order(demux, corpus.arrow_path)  # as written: fine
+
+    with pa.memory_map(str(corpus.arrow_path), "r") as mm, pa.ipc.open_file(mm) as r:
+        table = r.read_all()
+    shuffled = table.take(pa.array(np.random.default_rng(2).permutation(table.num_rows)))
+    bad = tmp_path / "shuffled.arrow"
+    with pa.OSFile(str(bad), "wb") as sink, pa.ipc.new_file(sink, table.schema) as w:
+        w.write_table(shuffled)
+    with pytest.raises(RuntimeError, match="not in the reads dataset's order"):
+        _check_reads_order(demux, bad)
