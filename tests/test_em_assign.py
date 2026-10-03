@@ -434,3 +434,30 @@ def test_the_minimap2_reducer_takes_a_per_read_floor():
         p_floor_quality_scale=1.5,
     )
     assert eased.to_pylist()[0]["template_id"] == 100
+
+
+def test_the_minimap2_reducer_runs_round_one_on_the_band_rule_when_asked():
+    """Replication-first hands both reads to the 500-replication template;
+    the band rule keeps the read whose best match is 1.5 points better."""
+    seq = "ACGTACGTAC" * 20
+    store = _store([seq, seq], replication=[500, 5])
+    rows = [
+        _row(0, 0, n_match=195, aln_len=200, as_score=370, cigar="195=5X"),
+        _row(0, 1, n_match=198, aln_len=200, as_score=388, cigar="198=2X"),
+    ]
+    old = assign_block(
+        scan_paf_block(_paf(rows), n_templates=2),
+        store=store,
+        reads=_Reads(["r0"]),
+        round_index=1,
+    )
+    assert old.column("template_row").to_pylist() == [0]
+    new = assign_block(
+        scan_paf_block(_paf(rows), n_templates=2),
+        store=store,
+        reads=_Reads(["r0"]),
+        round_index=1,
+        round1_rule="identity_band",
+    )
+    assert new.column("template_row").to_pylist() == [1]
+    assert new.column("identity").to_pylist()[0] == pytest.approx(0.99)

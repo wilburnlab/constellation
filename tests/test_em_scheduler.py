@@ -267,3 +267,88 @@ def test_shortlist_never_includes_an_unadmitted_hit():
         span=np.full(2, 1200.0),
     )
     assert keep.tolist() == [True, False]
+
+
+# ── round 1 by identity, replication inside the noise ────────────────
+
+
+def test_identity_wins_outside_the_band_and_replication_inside_it():
+    from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
+        rank_round1_identity,
+    )
+
+    ptr = np.array([0, 2])
+    tid = np.array([0, 1])
+    adm = np.array([True, True])
+    rep = np.array([500, 5])
+    qual = np.array([25.0, 25.0])
+    kw = dict(
+        span=np.array([1200, 1200]),
+        orf_replication=rep,
+        seed_read_quality=qual,
+        z=2.0,
+        error_rate=0.01,
+    )
+    # Band at 1.2 kb / 1% error / z=2 is ~0.0057 identity.
+    outside = rank_round1_identity(
+        adm, tid, ptr, identity=np.array([0.978, 0.990]), **kw
+    )
+    assert outside.tolist() == [1], "1.2 points apart: the measurement decides"
+    inside = rank_round1_identity(
+        adm, tid, ptr, identity=np.array([0.9895, 0.9900]), **kw
+    )
+    assert inside.tolist() == [0], "0.05 points apart is noise: consolidate"
+    one_admitted = rank_round1_identity(
+        np.array([True, False]), tid, ptr, identity=np.array([0.978, 0.990]), **kw
+    )
+    assert one_admitted.tolist() == [0], "the band is over ADMITTED hits"
+    none = rank_round1_identity(
+        np.array([False, False]), tid, ptr, identity=np.array([0.99, 0.99]), **kw
+    )
+    assert none.tolist() == [-1]
+
+
+def test_the_band_scales_with_the_aligned_length():
+    """The same 0.4-point gap is noise at 300 nt and a decision at 10 kb."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
+        rank_round1_identity,
+    )
+
+    ptr = np.array([0, 2])
+    tid = np.array([0, 1])
+    adm = np.array([True, True])
+    kw = dict(
+        orf_replication=np.array([500, 5]),
+        seed_read_quality=np.array([25.0, 25.0]),
+        z=2.0,
+        error_rate=0.01,
+    )
+    ident = np.array([0.986, 0.990])
+    short = rank_round1_identity(
+        adm, tid, ptr, identity=ident, span=np.array([300, 300]), **kw
+    )
+    assert short.tolist() == [0], "band ~1.1% at 300 nt: replication"
+    long = rank_round1_identity(
+        adm, tid, ptr, identity=ident, span=np.array([10_000, 10_000]), **kw
+    )
+    assert long.tolist() == [1], "band ~0.2% at 10 kb: identity"
+
+
+def test_inside_the_band_the_length_match_breaks_replication_ties():
+    from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
+        rank_round1_identity,
+    )
+
+    ptr = np.array([0, 2])
+    winner = rank_round1_identity(
+        np.array([True, True]),
+        np.array([0, 1]),
+        ptr,
+        identity=np.array([0.990, 0.990]),
+        span=np.array([1200, 1200]),
+        orf_replication=np.array([20, 20]),
+        seed_read_quality=np.array([25.0, 25.0]),
+        read_len=np.array([1200.0, 1200.0]),
+        template_len=np.array([5000.0, 1250.0]),
+    )
+    assert winner.tolist() == [1], "the template whose length matches the read"

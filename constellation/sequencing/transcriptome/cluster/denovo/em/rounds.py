@@ -331,6 +331,15 @@ class EmParams:
                 dataclasses.replace(self.graph, min_budget=int(self.merge_max_edits)),
             )
 
+    def round1_rule(self) -> str:
+        """The seeder's round-1 ranking rule (`scheduler.ROUND1_RULES`).
+
+        kmer seeding ranks by identity with replication inside the noise
+        band; ORF seeding keeps replication-first, because there each read's
+        own ORF elects a template and argmax-identity is self-capture.
+        """
+        return "identity_band" if self.seeding == "kmer" else "replication"
+
     def merge_predicate(self) -> MergePredicate:
         """The merge predicate with its tolerances resolved."""
         return MergePredicate(
@@ -607,6 +616,9 @@ def _one_round(
             support_ratio=params.support_ratio,
             shortlist_k=params.estep_shortlist_k,
             shortlist_frac=params.estep_shortlist_frac,
+            round1_rule=params.round1_rule(),
+            near_tie_z=params.near_tie_z,
+            error_rate=params.read_error_rate,
         )
     else:
         estep_stats = run_em_estep(
@@ -625,6 +637,7 @@ def _one_round(
             support_ratio=params.support_ratio,
             near_tie_z=params.near_tie_z,
             error_rate=params.read_error_rate,
+            round1_rule=params.round1_rule(),
             progress=log,
             **_estep_aligner_kwargs(params, rd, corpus),
         )
@@ -708,6 +721,7 @@ def _check_estep_stamp(rounds_dir: Path, params: EmParams, resume: bool) -> None
     want: dict = {
         "estep_aligner": params.estep_aligner,
         "p_floor_quality_scale": params.p_floor_quality_scale,
+        "round1_rule": params.round1_rule(),
     }
     if params.estep_aligner == "native":
         from constellation.sequencing.transcriptome.cluster.denovo.em.native import (
@@ -721,8 +735,14 @@ def _check_estep_stamp(rounds_dir: Path, params: EmParams, resume: bool) -> None
         )
     if resume and any(rounds_dir.glob(f"r*/{_SUCCESS}")):
         # A stamp from before a field existed reads as that field's default:
-        # an old run could only have been running the default.
-        defaults = {"estep_aligner": "minimap2", "p_floor_quality_scale": None}
+        # an old run could only have been running what the code then did —
+        # which for the round-1 rule was replication-first, whatever the
+        # seeder.
+        defaults = {
+            "estep_aligner": "minimap2",
+            "p_floor_quality_scale": None,
+            "round1_rule": "replication",
+        }
         have = json.loads(path.read_text()) if path.exists() else {}
         for key, value in want.items():
             if have.get(key, defaults.get(key)) == value:

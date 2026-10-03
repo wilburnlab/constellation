@@ -493,3 +493,64 @@ def test_params_that_cannot_mean_anything_are_refused():
         with pytest.raises(ValueError):
             nv.NativeParams(**kw)
     assert "block_reads" not in nv.NativeParams().semantic()
+
+
+# ── round 1: identity with the noise band ─────────────────────────────
+
+
+def _two_cluster_panel(tmp_path, n_subs):
+    """30 reads of a 5-read cluster's transcript, next to a 500-read
+    cluster's seed exactly ``n_subs`` substitutions away."""
+    rng = random.Random(21)
+    major = _rnd(rng, 1200)
+    out = list(major)
+    for at in rng.sample(range(30, 1170), n_subs):
+        out[at] = rng.choice([b for b in "ACGT" if b != out[at]])
+    minor = "".join(out)
+    rows = [(f"m{i}", _mutated(rng, minor), 30.0) for i in range(30)]
+    corpus = _write_corpus(tmp_path, rows)
+    t_path = _write_templates(tmp_path, [major, minor], weight=[500, 5])
+    return tmp_path, corpus, t_path, [major, minor]
+
+
+@pytest.mark.parametrize(
+    ("n_subs", "want_row"),
+    [
+        (12, 1),  # 1%: a real variant, outside the ~0.57% band — identity
+        (3, 0),  # 0.25%: inside the band — consolidate, the M-step's case
+        (0, 0),  # byte-identical seeds — consolidate by replication
+    ],
+)
+def test_round_one_identity_band_keeps_variants_and_consolidates_twins(
+    tmp_path, n_subs, want_row
+):
+    """The capture case (ledger #63): replication-first treated the whole
+    admission band as a tie, so every read of a variant within ~2% of a
+    deep cluster went to that cluster at seed time — 30/30 at 0.8%
+    divergence, where round 2's likelihood got 30/30 right on the same
+    candidates. Under the band rule the best identity wins unless the gap
+    is inside the read's own measurement noise; inside it, consolidation
+    is deliberate, and separating such pairs is the M-step's covariance
+    split, not round 1's."""
+    panel = _two_cluster_panel(tmp_path, n_subs)
+    _, table = _run(
+        panel,
+        tmp_path / "out",
+        round_index=1,
+        round1_rule="identity_band",
+        near_tie_z=2.0,
+        error_rate=0.01,
+    )
+    rows = table.column("template_row").to_pylist()
+    assert rows.count(want_row) >= 28, rows
+
+
+def test_round_one_replication_rule_still_walks_lazily(tmp_path):
+    """em-orf keeps the old rule, and under it the deep cluster captures —
+    which is exactly why the rule is the seeder's property."""
+    panel = _two_cluster_panel(tmp_path, 12)
+    stats, table = _run(
+        panel, tmp_path / "out", round_index=1, round1_rule="replication"
+    )
+    assert table.column("template_row").to_pylist() == [0] * 30
+    assert stats["n_aligned"] <= 35, "the lazy walk stops at the first admitted"

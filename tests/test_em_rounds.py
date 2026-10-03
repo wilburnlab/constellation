@@ -335,9 +335,7 @@ def test_resume_refuses_a_changed_floor_rule_or_native_knob(tmp_path):
     (rounds / "r01").mkdir()
     (rounds / "r01" / "_SUCCESS").write_bytes(b"")
     with pytest.raises(ValueError, match="p_floor_quality_scale"):
-        _check_estep_stamp(
-            rounds, _params(p_floor_quality_scale=1.5), resume=True
-        )
+        _check_estep_stamp(rounds, _params(p_floor_quality_scale=1.5), resume=True)
     # A stampless directory reads as the defaults, so the default passes...
     (rounds / "estep.json").unlink()
     _check_estep_stamp(rounds, _params(), resume=True)
@@ -354,6 +352,43 @@ def test_resume_refuses_a_changed_floor_rule_or_native_knob(tmp_path):
     (native / "estep.json").write_text(json.dumps(stamp))
     with pytest.raises(ValueError, match="bucket_cap"):
         _check_estep_stamp(native, _params(estep_aligner="native"), resume=True)
+
+
+def test_a_kmer_seeded_native_loop_runs_round_one_on_the_band_rule(
+    tmp_path, monkeypatch
+):
+    """em-kmer + native is the whole loop with no minimap2 anywhere, and
+    its round 1 ranks by identity with the noise band — the rule is the
+    SEEDER's property and it is stamped, so an old run (stampless, which
+    could only have walked by replication) cannot silently continue under
+    the new rule."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        _check_estep_stamp,
+    )
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    corpus = _panel(tmp_path)
+    out = tmp_path / "em"
+    params = _params(rounds=2, min_aa_length=40, seeding="kmer", estep_aligner="native")
+    assert params.round1_rule() == "identity_band"
+    assert _params().round1_rule() == "replication", "em-orf keeps the walk"
+    run_em(corpus, out, params=params)
+    clusters = pq.read_table(out / "clusters.parquet")
+    assert clusters.num_rows == 2
+    assert sum(clusters.column("n_reads").to_pylist()) == 40
+    assert _json(out / "rounds" / "estep.json")["round1_rule"] == "identity_band"
+
+    # The aligner mismatch fires first on a stampless directory; the rule
+    # has to refuse on its own even when the aligner matches.
+    stampless = tmp_path / "old" / "rounds"
+    (stampless / "r01").mkdir(parents=True)
+    (stampless / "r01" / "_SUCCESS").write_bytes(b"")
+    with pytest.raises(ValueError, match="round1_rule"):
+        _check_estep_stamp(
+            stampless,
+            _params(rounds=2, min_aa_length=40, seeding="kmer"),
+            resume=True,
+        )
 
 
 def test_the_loop_runs_natively_with_no_minimap2_anywhere(tmp_path, monkeypatch):
@@ -489,9 +524,7 @@ def test_a_read_minimap2_never_reports_is_still_accounted_for(tmp_path):
     """
     rng = np.random.default_rng(5)
     truth = _orf(rng, 120)
-    rows = [
-        (f"real_{i}", _mutate(rng, truth, 0.01), 30.0) for i in range(8)
-    ]
+    rows = [(f"real_{i}", _mutate(rng, truth, 0.01), 30.0) for i in range(8)]
     # Something with no relationship to the rest, and no ORF of its own.
     rows.append(("stranger", "AT" * 300, 30.0))
 
@@ -519,7 +552,13 @@ def test_a_truncated_template_file_falls_back_to_the_finished_round(tmp_path):
     corpus = _write_demux(
         tmp_path,
         [
-            (f"r{i}", _mutate(np.random.default_rng(i), _orf(np.random.default_rng(1), 120), 0.01), 30.0)
+            (
+                f"r{i}",
+                _mutate(
+                    np.random.default_rng(i), _orf(np.random.default_rng(1), 120), 0.01
+                ),
+                30.0,
+            )
             for i in range(12)
         ],
     )
@@ -543,9 +582,7 @@ def test_resume_keeps_the_churn_history_and_measures_the_resumed_round(tmp_path)
     for t_idx in range(2):
         truth = _orf(rng, 130)
         for i in range(20):
-            corpus_rows.append(
-                (f"g{t_idx}_r{i}", _mutate(rng, truth, 0.01), 30.0)
-            )
+            corpus_rows.append((f"g{t_idx}_r{i}", _mutate(rng, truth, 0.01), 30.0))
     corpus = _write_demux(tmp_path, corpus_rows)
     out = tmp_path / "em"
 
@@ -553,8 +590,7 @@ def test_resume_keeps_the_churn_history_and_measures_the_resumed_round(tmp_path)
     run_em(corpus, out, params=_params(rounds=1, min_aa_length=40), resume=True)
 
     rounds = [
-        line.split("\t")[0]
-        for line in (out / "churn.tsv").read_text().splitlines()[1:]
+        line.split("\t")[0] for line in (out / "churn.tsv").read_text().splitlines()[1:]
     ]
     assert rounds == ["1", "2"], "history must survive the resumed invocation"
 
@@ -567,10 +603,17 @@ def test_a_completed_run_is_a_readable_stage(tmp_path):
     from constellation.sequencing.transcriptome.manifest import read_manifest_dir
 
     out = tmp_path / "em"
-    run_em(_write_demux(tmp_path, [
-        ("a", "ATG" + "GCT" * 60 + "TAA", 30.0),
-        ("b", "ATG" + "GCT" * 60 + "TAA", 30.0),
-    ]), out, params=_params(rounds=1, min_aa_length=40))
+    run_em(
+        _write_demux(
+            tmp_path,
+            [
+                ("a", "ATG" + "GCT" * 60 + "TAA", 30.0),
+                ("b", "ATG" + "GCT" * 60 + "TAA", 30.0),
+            ],
+        ),
+        out,
+        params=_params(rounds=1, min_aa_length=40),
+    )
 
     manifest = read_manifest_dir(out)
     assert manifest.kind == "cluster"
@@ -633,9 +676,7 @@ def pa_ds_table(directory: Path) -> pa.Table:
     return pa_ds.dataset(sorted(Path(directory).glob("part-*.parquet"))).to_table()
 
 
-def test_a_round_is_not_marked_done_until_its_lineage_is_on_disk(
-    tmp_path, monkeypatch
-):
+def test_a_round_is_not_marked_done_until_its_lineage_is_on_disk(tmp_path, monkeypatch):
     """`_SUCCESS` means "everything the next round needs is written".
 
     lineage.parquet is one of those things — without it the next round cannot
@@ -688,8 +729,9 @@ def test_a_half_written_lineage_is_replaced_rather_than_trusted(tmp_path):
     (r1 / "lineage.parquet").write_bytes(b"PAR1\x00\x00truncated")
     shutil.rmtree(out / "rounds" / "r02", ignore_errors=True)
 
-    results = run_em(corpus, out, params=_params(rounds=1, min_aa_length=40),
-                     resume=True)
+    results = run_em(
+        corpus, out, params=_params(rounds=1, min_aa_length=40), resume=True
+    )
     assert results, "resume must replace the damaged lineage, not die on it"
     pq.read_table(r1 / "lineage.parquet")
 
@@ -900,15 +942,19 @@ def _twin_first_node(monkeypatch, *, sibling: bool, trim_5p: int = 0):
         moved = mine[: mine.size // 2]
         new_pid, new_hap = m_pid.copy(), m_hap.copy()
         new_pid[moved], new_hap[moved] = twin_pid, twin_hap
-        membership = membership.set_column(
-            membership.schema.get_field_index("parent_template_id"),
-            "parent_template_id",
-            pa.array(new_pid, pa.int64()),
-        ).set_column(
-            membership.schema.get_field_index("haplotype_id"),
-            "haplotype_id",
-            pa.array(new_hap.astype(np.int32)),
-        ).cast(membership.schema)
+        membership = (
+            membership.set_column(
+                membership.schema.get_field_index("parent_template_id"),
+                "parent_template_id",
+                pa.array(new_pid, pa.int64()),
+            )
+            .set_column(
+                membership.schema.get_field_index("haplotype_id"),
+                "haplotype_id",
+                pa.array(new_hap.astype(np.int32)),
+            )
+            .cast(membership.schema)
+        )
 
         def put(table, name, values, kind):
             i = table.schema.get_field_index(name)
@@ -942,7 +988,9 @@ def _json(path):
 
 
 def _r2_sequences(out):
-    with pa.memory_map(str(out / "rounds" / "r02" / "templates" / "templates.arrow")) as mm:
+    with pa.memory_map(
+        str(out / "rounds" / "r02" / "templates" / "templates.arrow")
+    ) as mm:
         return sorted(pa.ipc.open_file(mm).read_all().column("sequence").to_pylist())
 
 
@@ -978,7 +1026,9 @@ def test_the_worker_count_does_not_change_the_template_ids(tmp_path):
             out,
             params=_params(rounds=2, min_aa_length=40, mstep_workers=workers),
         )
-        shards = sorted((out / "rounds" / "r01" / "mstep" / "nodes").glob("part-*.parquet"))
+        shards = sorted(
+            (out / "rounds" / "r01" / "mstep" / "nodes").glob("part-*.parquet")
+        )
         shard_order[workers] = [
             pq.read_table(s, columns=["parent_template_id"]).column(0).to_pylist()
             for s in shards
@@ -1014,7 +1064,9 @@ def test_report_only_writes_edges_and_merges_nothing(tmp_path, monkeypatch):
     assert "equivalent" in twins.column("relation").to_pylist()
     assert any(twins.column("mergeable").to_pylist())
     assert pq.read_table(r1 / "merged.parquet").num_rows == 0
-    assert "merge" not in pq.read_table(r1 / "lineage.parquet").column("rule").to_pylist()
+    assert (
+        "merge" not in pq.read_table(r1 / "lineage.parquet").column("rule").to_pylist()
+    )
     seqs = _r2_sequences(out)
     assert len(seqs) > len(set(seqs)), "the twin should have reached round 2"
 
@@ -1189,8 +1241,9 @@ def test_an_extended_run_merges_exactly_as_an_uninterrupted_one(tmp_path, monkey
         assert pq.read_table(r1 / name).equals(
             pq.read_table(whole / "rounds" / "r01" / name)
         ), name
-    assert _json(r1 / "refine.json")["n_merged"] == (
-        _json(whole / "rounds" / "r01" / "refine.json")["n_merged"]
+    assert (
+        _json(r1 / "refine.json")["n_merged"]
+        == (_json(whole / "rounds" / "r01" / "refine.json")["n_merged"])
     )
     assert pq.read_table(out / "clusters.parquet").equals(
         pq.read_table(whole / "clusters.parquet")
@@ -1207,7 +1260,9 @@ def test_a_rebuilt_round_replaces_the_lineage_it_found(tmp_path, monkeypatch):
     out = tmp_path / "em"
     run_em(corpus, out, params=_params(rounds=2, min_aa_length=40, merge=False))
     r1 = out / "rounds" / "r01"
-    assert "merge" not in pq.read_table(r1 / "lineage.parquet").column("rule").to_pylist()
+    assert (
+        "merge" not in pq.read_table(r1 / "lineage.parquet").column("rule").to_pylist()
+    )
     # What such a directory looks like: round 1 done, with its lineage and
     # no record of how it was refined; nothing after it.
     shutil.rmtree(out / "rounds" / "r02")

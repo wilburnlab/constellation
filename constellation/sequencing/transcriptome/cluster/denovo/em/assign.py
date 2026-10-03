@@ -196,8 +196,15 @@ def assign_block(
     minimap2_n: int = 500,
     keep_cigars: bool = True,
     p_floor_quality_scale: float | None = None,
+    round1_rule: str = "replication",
 ) -> pa.RecordBatch:
-    """Reduce one :class:`HitBlock` to one assignment row per read."""
+    """Reduce one :class:`HitBlock` to one assignment row per read.
+
+    ``round1_rule`` is the seeder's property: ``"replication"`` (em-orf —
+    identity among single-read seeds is self-capture bait) or
+    ``"identity_band"`` (em-kmer — best identity wins, replication only
+    inside the read's own noise). See the module docstring.
+    """
     ptr, read_of_group = _group_bounds(hb.read_row)
     n_groups = read_of_group.size
     if n_groups == 0:
@@ -218,7 +225,25 @@ def assign_block(
     logl = np.full(hb.read_row.size, -np.inf, dtype=np.float64)
     logl_delta = np.full(hb.read_row.size, np.inf, dtype=np.float64)
 
-    if round_index <= 1:
+    if round_index <= 1 and round1_rule == "identity_band":
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ident_h = np.where(
+                hb.aln_len > 0, hb.n_match / np.maximum(hb.aln_len, 1), 0.0
+            )
+        winner = sched.rank_round1_identity(
+            admitted,
+            hb.template_row,
+            ptr,
+            identity=ident_h,
+            span=hb.aln_len,
+            orf_replication=store.orf_replication,
+            seed_read_quality=store.seed_read_quality,
+            read_len=hb.aln_len.astype(np.float64),
+            template_len=store.lengths().astype(np.float64),
+            z=near_tie_z,
+            error_rate=error_rate,
+        )
+    elif round_index <= 1:
         winner = sched.rank_round1(
             admitted,
             hb.template_row,
@@ -359,6 +384,9 @@ def assign_block_edlib(
     align_fn=None,
     p_floor_quality_scale: float | None = None,
     cap_hit: np.ndarray | None = None,
+    round1_rule: str = "replication",
+    near_tie_z: float = 2.0,
+    error_rate: float = 0.01,
     **_ignored,
 ) -> tuple[pa.RecordBatch, int]:
     """The two-pass reducer: chained hits in, base-aligned winners out.
@@ -368,16 +396,20 @@ def assign_block_edlib(
     shortlisted pair (:mod:`.realign`), never from the chained columns — see
     that module for why. Returns ``(batch, n_aligned)``.
 
-    Round 1 aligns **lazily**: its ranking ignores score entirely (ORF
-    replication, then seed quality — :func:`.scheduler.rank_round1`), so all
-    of a read's hits are walked in that order and the first admitted one
-    wins, which is exactly ``rank_round1`` unless ``shortlist_k`` attempts
-    all fail. The chain-score shortlist does not apply in round 1 (it would
-    hand the replication ranking an arbitrary subset). The expected cost is
-    about one alignment per read. Round 2+ aligns the whole
+    Round 1 under ``round1_rule="replication"`` (em-orf) aligns **lazily**:
+    its ranking ignores score entirely (ORF replication, then seed quality —
+    :func:`.scheduler.rank_round1`), so all of a read's hits are walked in
+    that order and the first admitted one wins, which is exactly
+    ``rank_round1`` unless ``shortlist_k`` attempts all fail; the chain
+    shortlist does not apply, since it would hand the replication ranking an
+    arbitrary subset. Under ``"identity_band"`` (em-kmer) round 1 is shaped
+    like round 2+: shortlist, align it all, admit — and rank with
+    :func:`.scheduler.rank_round1_identity`, so the best identity wins and
+    replication decides only inside the read's own noise (``near_tie_z`` x
+    the binomial width, via ``error_rate``). Round 2+ aligns the whole
     shortlist, admits on the aligned identity and ranks on the likelihood
-    unchanged. ``near_tie_z`` / the AS shortlist do not apply here: the
-    chain-score shortlist replaces them.
+    unchanged; the AS near-tie shortlist does not apply here, the
+    chain-score shortlist replaces it.
 
     ``cap_hit`` overrides the ``candidate_cap_hit`` column (one bool per
     GROUP, in group order): the default reads the pool as minimap2's and
@@ -402,10 +434,11 @@ def assign_block_edlib(
     keep, chain_rank, n_eligible = sched.shortlist_by_chain(
         chain, ptr, k=shortlist_k, frac=shortlist_frac
     )
-    if round_index <= 1:
-        # Round 1 ranks on replication, which the chain score knows nothing
-        # about, so a chain-score shortlist would hand the ranking an
-        # arbitrary subset (measured on the synthetic panel: 55% of reads
+    lazy_round1 = round_index <= 1 and round1_rule != "identity_band"
+    if lazy_round1:
+        # Replication-first round 1 ranks on something the chain score knows
+        # nothing about, so a chain-score shortlist would hand the ranking
+        # an arbitrary subset (measured on the synthetic panel: 55% of reads
         # cut, 28 surviving templates against minimap2's 13). Every hit
         # stays a candidate; `shortlist_k` bounds the ALIGNMENT ATTEMPTS of
         # the lazy walk instead, which usually stops at the first.
@@ -471,7 +504,7 @@ def assign_block_edlib(
     logl_delta = np.full(m, np.inf, dtype=np.float64)
     winner = np.full(n_groups, sched.UNASSIGNED, dtype=np.int64)
 
-    if round_index <= 1:
+    if lazy_round1:
         quality = np.asarray(store.seed_read_quality, dtype=np.float64)[t_row]
         rep = np.asarray(store.orf_replication, dtype=np.int64)[t_row]
         order = np.lexsort((t_row, -quality, -rep, sub_grp))
@@ -489,6 +522,25 @@ def assign_block_edlib(
             winner[active[won]] = cand[won]
             pending[active[won]] = False
         admitted = _admitted()
+    elif round_index <= 1:
+        for i in range(m):
+            _align(i)
+        admitted = _admitted()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ident = np.where(aln_len > 0, n_match / np.maximum(aln_len, 1), 0.0)
+        winner = sched.rank_round1_identity(
+            admitted,
+            t_row,
+            sub_ptr,
+            identity=ident,
+            span=aln_len,
+            orf_replication=store.orf_replication,
+            seed_read_quality=store.seed_read_quality,
+            read_len=_reads_len(read_seqs, sub_grp).astype(np.float64),
+            template_len=store.lengths().astype(np.float64),
+            z=near_tie_z,
+            error_rate=error_rate,
+        )
     else:
         for i in range(m):
             _align(i)
@@ -530,7 +582,7 @@ def assign_block_edlib(
     )
     best_score = np.where(np.isfinite(best_score), best_score, 0.0)
 
-    if round_index <= 1:
+    if lazy_round1:
         # The walk gave up after `shortlist_k` attempts with candidates left:
         # an admissible one may have been among them.
         truncated = ~has & (sizes > int(shortlist_k))

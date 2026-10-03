@@ -19,18 +19,32 @@ match was admitted whenever it was its only match — and that read then entered
 the PWM of whatever it landed on, which is how an errored template's consensus
 gets built in the first place.
 
-**Round 1 ranks by abundance and quality.** Every round-1 template is a single
-errored read, so a score measuring "how close is this read to that read"
-cannot separate signal from the ~1% error both copies carry. Worse, argmax-AS
-returns each read its own seed by construction — perfect self-identity scores
-~2L against ~1.94L for the gene's true consensus, a ~72-point gap at 1.2 kb
-that no near-tie window reaches. Self-capture would be total and permanent.
+**Round 1 has two rules, and which one is right depends on the seeder.**
 
-So round 1 ranks by ORF replication (how many reads carried that template's
-ORF) and breaks ties on the seed read's Dorado quality. A read joins the
-best-supported, best-sequenced representative within 3% of it; a read with
-nothing within 3% has only its own template admitted and stays there as an
-honest singleton. Nothing is pruned and no support threshold exists.
+*Replication-first* (:func:`rank_round1`, em-orf): rank by ORF replication,
+tie-break on the seed read's Dorado quality, identity consulted only as the
+admission gate. Under ORF seeding this is load-bearing — each read's own ORF
+elects a template, so argmax-identity returns each read its own seed by
+construction (perfect self-identity scores ~2L against ~1.94L for the gene's
+true consensus, a gap no near-tie window reaches) and self-capture would be
+total and permanent.
+
+*Identity with a noise band* (:func:`rank_round1_identity`, em-kmer): the
+best-identity candidate wins, and a better-replicated one takes it only
+within the read's own measurement noise. Replication-first treated the WHOLE
+admission band as a tie: any candidate within 3% lost to the biggest
+cluster, so a real variant 0.4-2% from a deep neighbour had every read
+handed to that neighbour at seed time (measured: 30/30 captured at 0.8% and
+0.4% divergence against a 500-read cluster, where round 2's likelihood got
+30/30 right on the same candidates) — and the native candidate join made it
+bite harder, because minimap2's minimizer masking used to hide the deep
+families from the pool. The band is where identity genuinely cannot tell two
+seeds apart: ``z * sqrt(L * e(1 - e)) / L`` — the same noise width the AS
+shortlist uses, in identity units — so at 1.2 kb and 1% error a z of 2 is
+~0.6%. Inside it, consolidate by replication (that is what the rule was
+for); outside it, the measurement decides. Under kmer seeding a read that IS
+a seed self-assigns at identity 1.0, which is correct — it represents its
+own cluster.
 
 **Round 2+ ranks by likelihood.** Templates are consensuses now, so the
 comparison has real content — see :mod:`.likelihood` for why it is computed
@@ -329,11 +343,84 @@ def shortlist_by_chain(
 
 
 __all__ = [
+    "ROUND1_RULES",
     "UNASSIGNED",
     "admit_candidates",
     "floor_per_read",
     "rank_likelihood",
     "rank_round1",
+    "rank_round1_identity",
     "shortlist_by_chain",
     "shortlist_for_likelihood",
 ]
+
+
+def rank_round1_identity(
+    admitted: np.ndarray,
+    template_idx: np.ndarray,
+    group_ptr: np.ndarray,
+    *,
+    identity: np.ndarray,
+    span: np.ndarray,
+    orf_replication: np.ndarray,
+    seed_read_quality: np.ndarray,
+    read_len: np.ndarray | None = None,
+    template_len: np.ndarray | None = None,
+    z: float = 2.0,
+    error_rate: float = 0.01,
+) -> np.ndarray:
+    """Round-1 winner per group: best identity, replication inside the noise.
+
+    ``identity`` and ``span`` (the aligned length the identity was measured
+    over) are per hit; ``orf_replication`` / ``seed_read_quality`` are per
+    template. A hit is a contender iff its identity is within
+    ``z * sqrt(span * e(1-e)) / span`` of its group's best — the band where
+    two identities to single-read seeds are indistinguishable — and among
+    contenders replication, then seed quality, then identity decide. The
+    best hit is always its own contender, so a group with any admitted hit
+    has a winner.
+
+    ``read_len`` / ``template_len`` (optional) add the round-2 length
+    tie-break inside the band: among equally-replicated contenders the
+    template whose length matches the read wins, which is what resists a
+    short high-identity fragment. A fragment whose identity beats the band
+    outright still wins — the known limit; under kmer seeding round-1
+    templates are whole reads, so the case is rare where this rule runs.
+
+    Returns ``UNASSIGNED`` for a group with no admitted hit.
+    """
+    n_groups = group_ptr.size - 1
+    if n_groups <= 0 or admitted.size == 0:
+        return np.full(max(n_groups, 0), UNASSIGNED, dtype=np.int64)
+    grp, sizes = _group_of_hit(group_ptr)
+    ident = np.asarray(identity, dtype=np.float64)
+    span = np.maximum(np.asarray(span, dtype=np.float64), 1.0)
+
+    masked = np.where(admitted, ident, -np.inf)
+    best = np.maximum.reduceat(masked, group_ptr[:-1])
+    best = np.where(sizes > 0, best, -np.inf)
+    width = (
+        float(z)
+        * np.sqrt(span * float(error_rate) * (1.0 - float(error_rate)))
+        / span
+    )
+    contender = admitted & (masked >= np.repeat(best, sizes) - width)
+
+    if read_len is not None and template_len is not None:
+        len_key = _length_key(
+            np.asarray(template_len, dtype=np.float64)[template_idx],
+            np.asarray(read_len, dtype=np.float64),
+        )
+    else:
+        len_key = np.zeros(ident.shape[0], dtype=np.float64)
+    rep = np.asarray(orf_replication, dtype=np.int64)[template_idx]
+    quality = np.asarray(seed_read_quality, dtype=np.float64)[template_idx]
+    order = np.lexsort(
+        (template_idx, -masked, len_key, -quality, -rep, ~contender, grp)
+    )
+    winner = _first_per_group(order, grp, n_groups)
+    return np.where(admitted[winner], winner, UNASSIGNED)
+
+
+#: The two round-1 rules; which one runs is the SEEDER's property.
+ROUND1_RULES = ("replication", "identity_band")
