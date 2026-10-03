@@ -58,6 +58,9 @@ def _assignments(rows):
             "sample_id": pa.array([0] * n, pa.int64()),
             "chain_score": pa.nulls(n, pa.int32()),
             "shortlist_truncated": pa.nulls(n, pa.bool_()),
+            "identity": pa.nulls(n, pa.float32()),
+            "aligned_len": pa.nulls(n, pa.int32()),
+            "unassigned_reason": pa.nulls(n, pa.string()),
         },
         schema=EM_ASSIGNMENT_TABLE,
     )

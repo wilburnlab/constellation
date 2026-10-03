@@ -234,6 +234,7 @@ def test_unbounded_overhangs_are_spellable():
         ("em-orf", "--estep-shortlist-frac", "0.7"),
         ("em-kmer", "--estep-align-workers", "4"),
         ("kmer", "--estep-aligner", "edlib"),
+        ("kmer", "--p-floor-quality-scale", "1.5"),
         # The template graph and the merge exist only in the em loop.
         ("kmer", "--template-graph", "final"),
         ("kmer", "--merge-max-edits", "1"),
@@ -337,19 +338,29 @@ def test_the_two_pass_estep_is_opt_in_and_its_knobs_apply_under_it():
     from constellation.cli.__main__ import _reject_inapplicable
 
     assert _args("--mode", "em-kmer").estep_aligner == "minimap2"
-    args = _args(
-        "--mode",
-        "em-kmer",
-        "--estep-aligner",
-        "edlib",
-        "--estep-shortlist-k",
-        "8",
-        "--estep-shortlist-frac",
-        "0.7",
-        "--estep-align-workers",
-        "4",
+    for aligner in ("edlib", "native"):
+        args = _args(
+            "--mode",
+            "em-kmer",
+            "--estep-aligner",
+            aligner,
+            "--estep-shortlist-k",
+            "8",
+            "--estep-shortlist-frac",
+            "0.7",
+            "--estep-align-workers",
+            "4",
+        )
+        assert _reject_inapplicable(args, "em", "kmer") is None, aligner
+
+
+def test_the_native_aligner_and_the_quality_floor_reach_the_params():
+    params = _resolved(
+        "--estep-aligner", "native", "--p-floor-quality-scale", "1.5"
     )
-    assert _reject_inapplicable(args, "em", "kmer") is None
+    assert params.estep_aligner == "native"
+    assert params.p_floor_quality_scale == 1.5
+    assert _resolved().p_floor_quality_scale is None
 
 
 def test_merge_is_off_by_default_and_both_spellings_parse():

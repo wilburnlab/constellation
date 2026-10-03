@@ -123,14 +123,28 @@ class EmParams:
     index_batch_size: str = "16G"
     # The E-step's base aligner. "minimap2" is the single pass (`-c` on every
     # candidate); "edlib" shortlists on minimap2's chaining score and
-    # base-aligns only the shortlist (`em/realign.py`). The shortlist size is
-    # an UNMEASURED operating point — `shortlist_truncated` reports its cost
-    # per read — which is why edlib is opt-in.
-    estep_aligner: Literal["minimap2", "edlib"] = "minimap2"
+    # base-aligns only the shortlist (`em/realign.py`); "native" replaces the
+    # shortlist's SOURCE too — Constellation's own minimizer join supplies
+    # the candidates (`em/native.py`), because minimap2 masks high-frequency
+    # minimizers as repeats when here they are usually unconsolidated
+    # near-duplicate templates, exactly what the E-step must see. Alignment,
+    # admission floor and ranking are the same code under edlib and native.
+    # The shortlist size is an UNMEASURED operating point —
+    # `shortlist_truncated` reports its cost per read — which is why both
+    # two-pass aligners are opt-in.
+    estep_aligner: Literal["minimap2", "edlib", "native"] = "minimap2"
     estep_shortlist_k: int = 16
     estep_shortlist_frac: float = 0.8
     #: 0 means `threads`.
     estep_align_workers: int = 0
+    #: None is the flat admission floor. A value `s` lets each read's floor
+    #: ease to `min(p_floor, 1 - s * 10^(-Q/10))` — a read may miss its
+    #: template by `s` times its own expected error before it is rejected,
+    #: which is what stops the below-Q20 tail from being dropped wholesale.
+    #: UNCALIBRATED: the per-read identity/quality record the E-step writes
+    #: is the calibration substrate, so the first run stays flat and the
+    #: second is a one-flag change (ledger #62).
+    p_floor_quality_scale: float | None = None
     # The template graph (graph.py). "rounds" relates every round's nodes and
     # the final ones; "final" only the last round's; "off" runs nothing after
     # the M-step — the escape hatch. A report unless `merge` is set.
@@ -207,12 +221,21 @@ class EmParams:
     mstep: MStepParams = field(default_factory=MStepParams)
 
     def __post_init__(self) -> None:
-        if self.estep_aligner not in ("minimap2", "edlib"):
+        if self.estep_aligner not in ("minimap2", "edlib", "native"):
             raise ValueError(f"unknown estep_aligner {self.estep_aligner!r}")
         if self.estep_shortlist_k < 1:
             raise ValueError("estep_shortlist_k must be >= 1")
         if not 0.0 < self.estep_shortlist_frac <= 1.0:
             raise ValueError("estep_shortlist_frac must be in (0, 1]")
+        if self.p_floor_quality_scale is not None and (
+            isinstance(self.p_floor_quality_scale, bool)
+            or not isinstance(self.p_floor_quality_scale, (int, float))
+            or not self.p_floor_quality_scale > 0
+        ):
+            raise ValueError(
+                f"p_floor_quality_scale must be a positive number or None, "
+                f"got {self.p_floor_quality_scale!r}"
+            )
         if self.template_graph not in ("rounds", "final", "off"):
             raise ValueError(f"unknown template_graph {self.template_graph!r}")
         for name in ("merge", "merge_siblings"):
@@ -390,6 +413,23 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
         _check_seed_stamp(output_dir / "seed", params, log)
     _check_estep_stamp(rounds_dir, params, resume)
     _check_merge_state(rounds_dir, params, resume)
+
+    # The native E-step's read sketch: once per run, in the parent, before
+    # any pool has forked — the sketch is torch and a forked child must
+    # never be. Cached under its (kmer, window, corpus) stamp, so a resume
+    # reuses it.
+    minis_dir: Path | None = None
+    if params.estep_aligner == "native":
+        from constellation.sequencing.transcriptome.cluster.denovo.em import native
+
+        minis_dir = native.write_read_minimizers(
+            corpus.arrow_path,
+            Path(output_dir) / "corpus" / "minimizers",
+            kmer=params.kmer,
+            window=params.window,
+            progress=log,
+        )
+
     start, templates_table, prev_assignments, history = _resume_point(
         rounds_dir, resume, log, params
     )
@@ -422,7 +462,16 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
         store = TemplateStore.open(tdir / TEMPLATES_ARROW)
         try:
             result, assignments, nodes, node_membership = _one_round(
-                r, rd, store, corpus, reads, params, prev_assignments, t0, log
+                r,
+                rd,
+                store,
+                corpus,
+                reads,
+                params,
+                prev_assignments,
+                t0,
+                log,
+                minis_dir=minis_dir,
             )
             results.append(result)
             final_nodes, final_assignments = nodes, assignments
@@ -533,30 +582,58 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
     return results
 
 
-def _one_round(r, rd, store, corpus, reads, params, prev_assignments, t0, log):
+def _one_round(
+    r, rd, store, corpus, reads, params, prev_assignments, t0, log, *, minis_dir=None
+):
     log(f"round {r}: E-step over {store.n_templates:,} templates")
-    estep_stats = run_em_estep(
-        rd / "templates" / TEMPLATES_FASTA,
-        corpus.fasta_path,
-        store=store,
-        reads=reads,
-        output_dir=rd / "assignments",
-        round_index=r,
-        threads=params.threads,
-        minimap2_n=params.minimap2_n,
-        index_batch_size=params.index_batch_size,
-        p_floor=params.p_floor,
-        delta_logl=params.delta_logl,
-        support_ratio=params.support_ratio,
-        near_tie_z=params.near_tie_z,
-        error_rate=params.read_error_rate,
-        progress=log,
-        **_estep_aligner_kwargs(params, rd, corpus),
-    )
+    if params.estep_aligner == "native":
+        from constellation.sequencing.transcriptome.cluster.denovo.em import native
+
+        estep_stats = native.run_native_estep(
+            store=store,
+            reads=reads,
+            output_dir=rd / "assignments",
+            round_index=r,
+            minis_dir=minis_dir,
+            kmer=params.kmer,
+            window=params.window,
+            align_workers=params.estep_align_workers or params.threads,
+            corpus_path=corpus.arrow_path,
+            templates_path=rd / "templates" / TEMPLATES_ARROW,
+            progress=log,
+            p_floor=params.p_floor,
+            p_floor_quality_scale=params.p_floor_quality_scale,
+            delta_logl=params.delta_logl,
+            support_ratio=params.support_ratio,
+            shortlist_k=params.estep_shortlist_k,
+            shortlist_frac=params.estep_shortlist_frac,
+        )
+    else:
+        estep_stats = run_em_estep(
+            rd / "templates" / TEMPLATES_FASTA,
+            corpus.fasta_path,
+            store=store,
+            reads=reads,
+            output_dir=rd / "assignments",
+            round_index=r,
+            threads=params.threads,
+            minimap2_n=params.minimap2_n,
+            index_batch_size=params.index_batch_size,
+            p_floor=params.p_floor,
+            p_floor_quality_scale=params.p_floor_quality_scale,
+            delta_logl=params.delta_logl,
+            support_ratio=params.support_ratio,
+            near_tie_z=params.near_tie_z,
+            error_rate=params.read_error_rate,
+            progress=log,
+            **_estep_aligner_kwargs(params, rd, corpus),
+        )
     t_estep = time.time() - t0
     _warn_on_saturation(estep_stats, params, log)
 
     assignments = _read_assignments(rd / "assignments")
+    if prev_assignments is not None:
+        estep_stats["n_newly_lost"] = _newly_lost(prev_assignments, assignments)
     t1 = time.time()
     nodes, node_membership = _run_mstep(
         r, rd, store, corpus, assignments, params, log
@@ -596,6 +673,24 @@ def _estep_aligner_kwargs(params: EmParams, rd: Path, corpus) -> dict:
     }
 
 
+def _newly_lost(prev: pa.Table, now: pa.Table) -> int:
+    """Reads assigned in the previous round and unassigned in this one.
+
+    The cheapest leading indicator of a systemic loss — a masked family, a
+    quality tail — visible in ``round.json`` instead of needing a forensic
+    job over two rounds' parquet.
+    """
+    prev_rows = prev.column("read_row").to_numpy(zero_copy_only=False)
+    prev_has = prev.column("template_id").to_numpy(zero_copy_only=False) >= 0
+    now_rows = now.column("read_row").to_numpy(zero_copy_only=False)
+    now_has = now.column("template_id").to_numpy(zero_copy_only=False) >= 0
+    was = np.sort(prev_rows[prev_has])
+    lost = now_rows[~now_has]
+    at = np.searchsorted(was, lost)
+    np.clip(at, 0, max(was.shape[0] - 1, 0), out=at)
+    return int((was[at] == lost).sum()) if was.size else 0
+
+
 _ESTEP_STAMP = "estep.json"
 
 
@@ -610,21 +705,43 @@ def _check_estep_stamp(rounds_dir: Path, params: EmParams, resume: bool) -> None
     """
     rounds_dir.mkdir(parents=True, exist_ok=True)
     path = rounds_dir / _ESTEP_STAMP
-    want = {"estep_aligner": params.estep_aligner}
-    if resume and any(rounds_dir.glob(f"r*/{_SUCCESS}")):
-        have = (
-            json.loads(path.read_text())
-            if path.exists()
-            else {"estep_aligner": "minimap2"}
+    want: dict = {
+        "estep_aligner": params.estep_aligner,
+        "p_floor_quality_scale": params.p_floor_quality_scale,
+    }
+    if params.estep_aligner == "native":
+        from constellation.sequencing.transcriptome.cluster.denovo.em.native import (
+            NativeParams,
         )
-        if have.get("estep_aligner") != want["estep_aligner"]:
+
+        want.update(
+            kmer=int(params.kmer),
+            window=int(params.window),
+            **NativeParams().semantic(),
+        )
+    if resume and any(rounds_dir.glob(f"r*/{_SUCCESS}")):
+        # A stamp from before a field existed reads as that field's default:
+        # an old run could only have been running the default.
+        defaults = {"estep_aligner": "minimap2", "p_floor_quality_scale": None}
+        have = json.loads(path.read_text()) if path.exists() else {}
+        for key, value in want.items():
+            if have.get(key, defaults.get(key)) == value:
+                continue
+            if key == "estep_aligner":
+                raise ValueError(
+                    f"--resume would continue {rounds_dir.parent}, whose "
+                    f"finished rounds were assigned with --estep-aligner "
+                    f"{have.get(key, 'minimap2')!r}, under {value!r}. Later "
+                    f"rounds' templates were built from those alignments, so "
+                    f"the run would mix aligners under one manifest. Choose "
+                    f"another --output-dir, or restore the original aligner."
+                )
             raise ValueError(
                 f"--resume would continue {rounds_dir.parent}, whose finished "
-                f"rounds were assigned with --estep-aligner "
-                f"{have.get('estep_aligner')!r}, under {want['estep_aligner']!r}. "
-                f"Later rounds' templates were built from those alignments, so "
-                f"the run would mix aligners under one manifest. Choose another "
-                f"--output-dir, or restore the original aligner."
+                f"rounds admitted and shortlisted with {key} = "
+                f"{have.get(key, defaults.get(key))!r}, under {value!r}. The "
+                f"assignments would not be comparable across rounds. Choose "
+                f"another --output-dir, or restore the original value."
             )
     path.write_text(json.dumps(want, indent=2))
 

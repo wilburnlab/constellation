@@ -1426,38 +1426,59 @@ def _build_transcriptome_parser(subs) -> None:
     )
     p_cluster.add_argument(
         "--estep-aligner",
-        choices=("minimap2", "edlib"),
+        choices=("minimap2", "edlib", "native"),
         default="minimap2",
         help="em: the E-step's base aligner. 'minimap2' (default) base-aligns "
         "every candidate with minimap2 -c. 'edlib' is the two-pass path: "
         "minimap2 without -c shortlists on chaining score, and only the "
         "shortlist is base-aligned with edlib (~67%% of E-step wall time "
-        "was -c). Opt-in until its shortlist operating point is measured.",
+        "was -c). 'native' replaces the candidate SOURCE as well: "
+        "Constellation's own minimizer join supplies the candidates with no "
+        "minimap2 anywhere — minimap2 masks high-frequency minimizers as "
+        "repeats, and here those are usually near-duplicate templates the "
+        "loop has not consolidated yet, exactly what the E-step must see. "
+        "Alignment, admission and ranking are the edlib path's, unchanged. "
+        "Both are opt-in until their operating points are measured.",
     )
     p_cluster.add_argument(
         "--estep-shortlist-k",
         type=int,
         default=None,
-        help="em, --estep-aligner edlib only: at most this many candidates per "
-        "read are base-aligned, by chaining score (default 16). UNMEASURED "
-        "operating point; each read's `shortlist_truncated` reports whether "
-        "the cut could have changed its answer.",
+        help="em, --estep-aligner edlib/native only: at most this many "
+        "candidates per read are base-aligned, by the shortlist key "
+        "(chaining score under edlib, shared probes under native; default "
+        "16). UNMEASURED operating point; each read's `shortlist_truncated` "
+        "reports whether the cut could have changed its answer.",
     )
     p_cluster.add_argument(
         "--estep-shortlist-frac",
         type=float,
         default=None,
-        help="em, --estep-aligner edlib only: a candidate is shortlisted only "
-        "if its chaining score is at least this fraction of the read's best "
-        "(default 0.8). UNMEASURED operating point.",
+        help="em, --estep-aligner edlib/native only: a candidate is "
+        "shortlisted only if its shortlist key is at least this fraction of "
+        "the read's best (default 0.8). UNMEASURED operating point.",
     )
     p_cluster.add_argument(
         "--estep-align-workers",
         type=int,
         default=None,
-        help="em, --estep-aligner edlib only: processes base-aligning the "
-        "shortlist (default --threads). They run concurrently with "
-        "minimap2's chaining.",
+        help="em, --estep-aligner edlib/native only: processes base-aligning "
+        "the shortlist (default --threads). Under edlib they run "
+        "concurrently with minimap2's chaining; under native they run the "
+        "candidate join too.",
+    )
+    p_cluster.add_argument(
+        "--p-floor-quality-scale",
+        type=float,
+        default=None,
+        help="em: let each read's admission floor ease with its own quality "
+        "— min(--p-floor, 1 - SCALE * 10^(-Q/10)), so a read may miss its "
+        "template by SCALE times its expected error rate before it is "
+        "rejected. Unset (the default) every read is held to the flat "
+        "--p-floor, under which a below-Q20 read cannot clear 0.97 against "
+        "ANY template. UNCALIBRATED: run flat once — the E-step records "
+        "every read's identity beside its quality — then set the scale from "
+        "that run's data. A read with no quality keeps the flat floor.",
     )
     p_cluster.add_argument(
         "--index-batch-size",
@@ -3649,6 +3670,11 @@ def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
             args.estep_aligner != "minimap2" and not em,
             "nothing — only the --mode em-* E-step has an aligner choice",
         ),
+        (
+            "--p-floor-quality-scale",
+            args.p_floor_quality_scale is not None and not em,
+            "nothing — only the --mode em-* E-step admits on a floor",
+        ),
     ]
     graph_mode = "rounds" if args.template_graph is None else args.template_graph
     graph_on = em and graph_mode != "off"
@@ -3731,7 +3757,7 @@ def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
                 "output merges",
             )
         )
-    edlib = em and args.estep_aligner == "edlib"
+    two_pass = em and args.estep_aligner in ("edlib", "native")
     for flag in (
         "--estep-shortlist-k",
         "--estep-shortlist-frac",
@@ -3740,8 +3766,9 @@ def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
         banned.append(
             (
                 flag,
-                getattr(args, flag[2:].replace("-", "_")) is not None and not edlib,
-                "--estep-aligner edlib, which is the only E-step with a "
+                getattr(args, flag[2:].replace("-", "_")) is not None
+                and not two_pass,
+                "--estep-aligner edlib or native, the two E-steps with a "
                 "shortlist",
             )
         )
@@ -3864,6 +3891,11 @@ def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
         ),
         estep_align_workers=(
             0 if args.estep_align_workers is None else int(args.estep_align_workers)
+        ),
+        p_floor_quality_scale=(
+            None
+            if args.p_floor_quality_scale is None
+            else float(args.p_floor_quality_scale)
         ),
         template_graph=(
             "rounds" if args.template_graph is None else str(args.template_graph)

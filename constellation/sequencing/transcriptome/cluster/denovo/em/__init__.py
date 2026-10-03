@@ -30,6 +30,11 @@ stage            what it does
 ``estep``        every read aligned to every template (minimap2),
                  assigned by an absolute identity floor with a ranked
                  tie-break
+``native``       ``--estep-aligner native``: the candidates come from
+                 Constellation's own minimizer join instead of minimap2,
+                 which masks high-frequency minimizers as repeats when
+                 they are usually unconsolidated near-duplicate templates;
+                 alignment, floor and ranking are the edlib path's
 ``mstep``        per-template folded PWM → candidate columns (by allele;
                  by coverage only with ``coverage_route``) → covariance
                  → one node per state-tuple → consensus → the longest

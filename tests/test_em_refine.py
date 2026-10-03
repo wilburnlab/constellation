@@ -269,6 +269,9 @@ def _assignments_for(read_rows, template_id, *, samples=None):
             "sample_id": pa.array(samples, pa.int64()),
             "chain_score": pa.nulls(n, pa.int32()),
             "shortlist_truncated": pa.nulls(n, pa.bool_()),
+            "identity": pa.nulls(n, pa.float32()),
+            "aligned_len": pa.nulls(n, pa.int32()),
+            "unassigned_reason": pa.nulls(n, pa.string()),
         },
         schema=EM_ASSIGNMENT_TABLE,
     )
@@ -482,6 +485,9 @@ def test_a_capped_template_still_reports_all_of_its_reads():
             "sample_id": pa_.array(np.zeros(n, np.int64)),
             "chain_score": pa_.nulls(n, pa_.int32()),
             "shortlist_truncated": pa_.nulls(n, pa_.bool_()),
+            "identity": pa_.nulls(n, pa_.float32()),
+            "aligned_len": pa_.nulls(n, pa_.int32()),
+            "unassigned_reason": pa_.nulls(n, pa_.string()),
         },
         schema=EM_ASSIGNMENT_TABLE,
     )

@@ -30,11 +30,15 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.templates import (
 class _Reads:
     """The slice of ReadStore the reducer touches."""
 
-    def __init__(self, ids, samples=None):
+    def __init__(self, ids, samples=None, quality=None):
         self.read_id = pa.chunked_array([pa.array(ids, pa.string())])
         self.chunk_starts = np.array([0, len(ids)], dtype=np.int64)
         self.sample_id = np.asarray(
             samples if samples is not None else [0] * len(ids), dtype=np.int64
+        )
+        self.dorado_quality = np.asarray(
+            quality if quality is not None else [30.0] * len(ids),
+            dtype=np.float64,
         )
 
     def take_read_ids(self, rows):
@@ -361,3 +365,72 @@ def test_minimap2_flags_carry_the_load_bearing_options():
     # -N is NOT baked in: it is a per-run correctness parameter, since the
     # pool must contain every template within p_floor.
     assert "-N" not in flags
+
+
+# ── the per-read floor, and the record of why ─────────────────────────
+
+
+def test_floor_per_read_eases_with_quality_and_never_rises():
+    from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
+        floor_per_read,
+    )
+
+    q = np.array([30.0, 20.0, 13.0, np.nan, -1.0])
+    flat = floor_per_read(q, p_floor=0.97, quality_scale=None)
+    assert flat.tolist() == [0.97] * 5
+    eased = floor_per_read(q, p_floor=0.97, quality_scale=1.5)
+    assert eased[0] == 0.97, "Q30: 1 - 1.5e-3 is above the flat floor"
+    assert eased[1] == pytest.approx(0.985) or eased[1] == 0.97
+    assert eased[1] == 0.97, "min() with the flat floor: it never rises"
+    assert eased[2] == pytest.approx(1 - 1.5 * 10**-1.3)
+    assert eased[3] == 0.97 and eased[4] == 0.97, "no quality: flat"
+
+
+def test_the_minimap2_reducer_records_identity_and_the_reason():
+    """One clean read, one whose only hit is under the floor: the winner
+    carries its identity and length, the loser the best identity it had and
+    `below_floor`."""
+    seq = "ACGTACGTAC" * 20
+    store = _store([seq])
+    hb = scan_paf_block(
+        _paf(
+            [
+                _row(0, 0, n_match=198, aln_len=200, as_score=388, cigar="200="),
+                _row(1, 0, n_match=188, aln_len=200, as_score=328, cigar="200="),
+            ]
+        ),
+        n_templates=1,
+    )
+    batch = assign_block(hb, store=store, reads=_Reads(["a", "b"]), round_index=1)
+    got = batch.to_pylist()
+    assert got[0]["identity"] == pytest.approx(0.99)
+    assert got[0]["aligned_len"] == 200
+    assert got[0]["unassigned_reason"] is None
+    assert got[1]["template_id"] == -1
+    assert got[1]["identity"] == pytest.approx(0.94)
+    assert got[1]["aligned_len"] is None
+    assert got[1]["unassigned_reason"] == "below_floor"
+
+
+def test_the_minimap2_reducer_takes_a_per_read_floor():
+    """The same 0.94 hit: rejected at the flat floor, admitted once the
+    read's Q13 eases its own floor below it."""
+    seq = "ACGTACGTAC" * 20
+    store = _store([seq])
+    rows = [_row(0, 0, n_match=188, aln_len=200, as_score=328, cigar="200=")]
+    reads = _Reads(["a"], quality=[13.0])
+    flat = assign_block(
+        scan_paf_block(_paf(rows), n_templates=1),
+        store=store,
+        reads=reads,
+        round_index=1,
+    )
+    assert flat.to_pylist()[0]["template_id"] == -1
+    eased = assign_block(
+        scan_paf_block(_paf(rows), n_templates=1),
+        store=store,
+        reads=reads,
+        round_index=1,
+        p_floor_quality_scale=1.5,
+    )
+    assert eased.to_pylist()[0]["template_id"] == 100

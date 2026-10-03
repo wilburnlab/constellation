@@ -52,6 +52,45 @@ import numpy as np
 UNASSIGNED = -1
 
 
+def floor_per_read(
+    quality: np.ndarray,
+    *,
+    p_floor: float = 0.97,
+    quality_scale: float | None = None,
+) -> np.ndarray:
+    """Each read's admission floor, from its Dorado quality.
+
+    ``None`` (the default) is the flat floor: every read is held to
+    ``p_floor``. With a scale ``s`` the floor is::
+
+        min(p_floor, 1 - s * 10^(-Q / 10))
+
+    i.e. a read is allowed to miss its template by ``s`` times its own
+    expected error rate before it is rejected — a Q13 read (5% expected
+    error) cannot clear a flat 0.97 against ANY template, however real its
+    transcript, which is how the below-Q20 tail went missing. The floor
+    only ever comes DOWN from ``p_floor``: at high quality the flat floor
+    still governs, so ``s`` changes nothing for reads the flat rule already
+    admitted.
+
+    ``s`` is an UNCALIBRATED operating point. What calibrates it is the
+    per-read record the E-step now writes — every confidently assigned
+    read's alignment identity alongside its quality — so the first run at
+    the flat floor is the measurement and the second is a one-flag change.
+
+    A read with no quality (NaN, or a non-positive placeholder) is held to
+    the flat floor: no evidence for leniency is not leniency.
+    """
+    q = np.asarray(quality, dtype=np.float64)
+    out = np.full(q.shape, float(p_floor), dtype=np.float64)
+    if quality_scale is None:
+        return out
+    known = np.isfinite(q) & (q > 0)
+    eased = 1.0 - float(quality_scale) * np.power(10.0, -q[known] / 10.0)
+    out[known] = np.minimum(float(p_floor), eased)
+    return out
+
+
 def _group_of_hit(group_ptr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     sizes = np.diff(group_ptr)
     return np.repeat(np.arange(sizes.size), sizes), sizes
@@ -69,18 +108,21 @@ def admit_candidates(
     aln_len: np.ndarray,
     group_ptr: np.ndarray,
     *,
-    p_floor: float = 0.97,
+    p_floor: float | np.ndarray = 0.97,
 ) -> tuple[np.ndarray, np.ndarray]:
     """The candidate pool. Returns ``(admitted mask, n_admitted per group)``.
 
     ``aln_len == 0`` is not admitted rather than dividing by zero: an
     alignment of no length is no evidence.
+
+    ``p_floor`` is a scalar, or one floor PER HIT (the caller repeats a
+    per-read floor over each read's hits — see :func:`floor_per_read`).
     """
     n_match = np.asarray(n_match, dtype=np.int64)
     aln_len = np.asarray(aln_len, dtype=np.int64)
     with np.errstate(divide="ignore", invalid="ignore"):
         identity = np.where(aln_len > 0, n_match / np.maximum(aln_len, 1), 0.0)
-    admitted = (aln_len > 0) & (identity >= p_floor)
+    admitted = (aln_len > 0) & (identity >= np.asarray(p_floor, dtype=np.float64))
     starts = group_ptr[:-1]
     n_groups = group_ptr.size - 1
     if n_groups <= 0 or admitted.size == 0:
@@ -289,6 +331,7 @@ def shortlist_by_chain(
 __all__ = [
     "UNASSIGNED",
     "admit_candidates",
+    "floor_per_read",
     "rank_likelihood",
     "rank_round1",
     "shortlist_by_chain",

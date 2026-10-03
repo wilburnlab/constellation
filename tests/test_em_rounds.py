@@ -323,6 +323,80 @@ def test_resume_refuses_to_switch_estep_aligners(tmp_path):
         _check_estep_stamp(rounds, _params(estep_aligner="edlib"), resume=True)
 
 
+def test_resume_refuses_a_changed_floor_rule_or_native_knob(tmp_path):
+    """Admission is per round; a floor that moved mid-run makes the rounds'
+    assignments incomparable, exactly like a switched aligner."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        _check_estep_stamp,
+    )
+
+    rounds = tmp_path / "rounds"
+    _check_estep_stamp(rounds, _params(), resume=False)
+    (rounds / "r01").mkdir()
+    (rounds / "r01" / "_SUCCESS").write_bytes(b"")
+    with pytest.raises(ValueError, match="p_floor_quality_scale"):
+        _check_estep_stamp(
+            rounds, _params(p_floor_quality_scale=1.5), resume=True
+        )
+    # A stampless directory reads as the defaults, so the default passes...
+    (rounds / "estep.json").unlink()
+    _check_estep_stamp(rounds, _params(), resume=True)
+    # ...and the native path stamps its join parameters: hand-edit one and
+    # the resume is refused by its name.
+    native = tmp_path / "native" / "rounds"
+    _check_estep_stamp(native, _params(estep_aligner="native"), resume=False)
+    (native / "r01").mkdir()
+    (native / "r01" / "_SUCCESS").write_bytes(b"")
+    _check_estep_stamp(native, _params(estep_aligner="native"), resume=True)
+    stamp = json.loads((native / "estep.json").read_text())
+    assert stamp["kmer"] == 15 and stamp["bucket_cap"] == 20_480
+    stamp["bucket_cap"] = 1_024
+    (native / "estep.json").write_text(json.dumps(stamp))
+    with pytest.raises(ValueError, match="bucket_cap"):
+        _check_estep_stamp(native, _params(estep_aligner="native"), resume=True)
+
+
+def test_the_loop_runs_natively_with_no_minimap2_anywhere(tmp_path, monkeypatch):
+    """`--estep-aligner native` never launches minimap2: the loop must
+    finish with the binary unreachable. The read sketch is built once, in
+    the parent, and reused by the second round and by a resume."""
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    corpus = _panel(tmp_path)
+    out = tmp_path / "em"
+    run_em(
+        corpus,
+        out,
+        params=_params(rounds=2, min_aa_length=40, estep_aligner="native"),
+    )
+    clusters = pq.read_table(out / "clusters.parquet")
+    assert clusters.num_rows == 2
+    assert sum(clusters.column("n_reads").to_pylist()) == 40
+    stamp = _json(out / "rounds" / "estep.json")
+    assert stamp["estep_aligner"] == "native" and stamp["kmer"] == 15
+    minis = out / "corpus" / "minimizers"
+    assert (minis / "minimizers.arrow").exists()
+    r1 = _json(out / "rounds" / "r01" / "round.json")["estep"]
+    assert r1["aligner"] == "native" and r1["n_assigned"] == 40
+    assert r1["n_aligned"] <= 45, "round 1 aligns lazily"
+    r2 = _json(out / "rounds" / "r02" / "round.json")["estep"]
+    assert r2["n_newly_lost"] == 0
+    for key in ("n_no_candidate", "n_below_floor", "n_no_alignment"):
+        assert key in r2
+    a = pq.read_table(
+        next((out / "rounds" / "r02" / "assignments").glob("part-*.parquet"))
+    )
+    assert all(v is not None for v in a.column("identity").to_pylist())
+
+    before = (minis / "minimizers.arrow").stat().st_mtime_ns
+    run_em(
+        corpus,
+        out,
+        params=_params(rounds=1, min_aa_length=40, estep_aligner="native"),
+        resume=True,
+    )
+    assert (minis / "minimizers.arrow").stat().st_mtime_ns == before
+
+
 def test_the_user_facing_outputs_are_written_in_the_shared_shapes(corpus_dir, tmp_path):
     """Every existing consumer reads these; none may need a clusterer branch."""
     import pyarrow as pa_
