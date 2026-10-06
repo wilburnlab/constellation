@@ -1446,9 +1446,11 @@ def _build_transcriptome_parser(subs) -> None:
         default=None,
         help="em, --estep-aligner edlib/native only: at most this many "
         "candidates per read are base-aligned, by the shortlist key "
-        "(chaining score under edlib, shared probes under native; default "
-        "16). UNMEASURED operating point; each read's `shortlist_truncated` "
-        "reports whether the cut could have changed its answer.",
+        "(chaining score under edlib, shared probes under native), ties to "
+        "the better-supported template so dense templates absorb reads "
+        "rather than fragment them (default 32). Each read's "
+        "`shortlist_truncated` reports whether the cut could have changed "
+        "its answer.",
     )
     p_cluster.add_argument(
         "--estep-shortlist-frac",
@@ -1466,6 +1468,16 @@ def _build_transcriptome_parser(subs) -> None:
         "the shortlist (default --threads). Under edlib they run "
         "concurrently with minimap2's chaining; under native they run the "
         "candidate join too.",
+    )
+    p_cluster.add_argument(
+        "--estep-probes-per-read",
+        type=int,
+        default=None,
+        help="em, --estep-aligner native only: probes per read in the "
+        "candidate join, one per position stratum (default 32). Also the "
+        "resolution of the shortlist key — shared probes cannot exceed it — "
+        "so raising it is what lets the shortlist discriminate inside a "
+        "deep family. Stamped: a resume under a different value is refused.",
     )
     p_cluster.add_argument(
         "--p-floor-quality-scale",
@@ -3675,6 +3687,13 @@ def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
             args.p_floor_quality_scale is not None and not em,
             "nothing — only the --mode em-* E-step admits on a floor",
         ),
+        (
+            "--estep-probes-per-read",
+            args.estep_probes_per_read is not None
+            and not (em and args.estep_aligner == "native"),
+            "--estep-aligner native, whose candidate join is what chooses "
+            "the probes",
+        ),
     ]
     graph_mode = "rounds" if args.template_graph is None else args.template_graph
     graph_on = em and graph_mode != "off"
@@ -3882,7 +3901,7 @@ def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
         index_batch_size=str(args.index_batch_size),
         estep_aligner=str(args.estep_aligner),
         estep_shortlist_k=(
-            16 if args.estep_shortlist_k is None else int(args.estep_shortlist_k)
+            32 if args.estep_shortlist_k is None else int(args.estep_shortlist_k)
         ),
         estep_shortlist_frac=(
             0.8
@@ -3891,6 +3910,11 @@ def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
         ),
         estep_align_workers=(
             0 if args.estep_align_workers is None else int(args.estep_align_workers)
+        ),
+        estep_probes_per_read=(
+            32
+            if args.estep_probes_per_read is None
+            else int(args.estep_probes_per_read)
         ),
         p_floor_quality_scale=(
             None

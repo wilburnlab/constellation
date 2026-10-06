@@ -554,3 +554,29 @@ def test_round_one_replication_rule_still_walks_lazily(tmp_path):
     )
     assert table.column("template_row").to_pylist() == [0] * 30
     assert stats["n_aligned"] <= 35, "the lazy walk stops at the first admitted"
+
+
+def test_a_dense_template_is_shortlisted_over_tied_shallow_siblings(tmp_path):
+    """A family whose candidates all tie on shared probes, the dense member
+    sitting at a HIGH row, and a shortlist smaller than the family: by hit
+    order the dense template never reaches the aligner and the read lands
+    on an arbitrary shallow sibling. Ties go to support instead, so the
+    family's mass concentrates rather than fragments."""
+    rng = random.Random(31)
+    truth = _rnd(rng, 900)
+    # Ten byte-identical seeds — the unconsolidated-family limit, where
+    # every candidate ties on EVERYTHING the join can measure.
+    family = [truth] * 10
+    weight = [1.0] * 9 + [400.0]  # the dense template is row 9
+    corpus = _write_corpus(tmp_path, [("r", _mutated(rng, truth, 0.01), 30.0)])
+    t_path = _write_templates(tmp_path, family, weight=weight)
+    panel = (tmp_path, corpus, t_path, family)
+    _, table = _run(
+        panel,
+        tmp_path / "out",
+        round_index=1,
+        round1_rule="identity_band",
+        shortlist_k=3,
+    )
+    assert table.column("template_row").to_pylist() == [9]
+    assert table.column("chain_score").to_pylist()[0] >= 2

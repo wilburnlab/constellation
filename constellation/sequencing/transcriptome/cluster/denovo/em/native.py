@@ -97,8 +97,12 @@ class NativeParams:
     parameters (:class:`~.rounds.EmParams`); everything here is stamped into
     ``estep.json`` so a resume under different values is refused."""
 
-    #: One probe per position stratum, smallest hash per stratum.
-    probes_per_read: int = 16
+    #: One probe per position stratum, smallest hash per stratum. 32 (up
+    #: from 16, 2026-10-05): the probe count is also the resolution of the
+    #: shortlist key — `n_shared` cannot exceed it — and at 16 a family's
+    #: candidates tied so densely that the 16-deep shortlist cut became an
+    #: arbitrary subset. CLI: `--estep-probes-per-read`.
+    probes_per_read: int = 32
     #: A template bucket larger than this joins through its
     #: ``overflow_anchors`` best-supported entries instead of whole.
     bucket_cap: int = 20_480

@@ -352,3 +352,28 @@ def test_inside_the_band_the_length_match_breaks_replication_ties():
         template_len=np.array([5000.0, 1250.0]),
     )
     assert winner.tolist() == [1], "the template whose length matches the read"
+
+
+def test_shortlist_ties_go_to_the_better_supported_template():
+    """Under the native candidates the shortlist key is shared probes, a
+    small integer, so family candidates tie in droves — and ties by hit
+    order are ties by template row, an arbitrary subset that can exclude
+    the family's dense template entirely."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
+        shortlist_by_chain,
+    )
+
+    ptr = np.array([0, 5])
+    chain = np.array([7, 7, 7, 7, 6])
+    support = np.array([1.0, 1.0, 400.0, 2.0, 900.0])
+    keep, rank, n_eligible = shortlist_by_chain(
+        chain, ptr, k=2, frac=0.5, support=support
+    )
+    assert keep.tolist() == [False, False, True, True, False], (
+        "the two best-supported of the tied four; the 900-support hit has a "
+        "lower key and support never outranks the key itself"
+    )
+    assert n_eligible.tolist() == [5]
+    # Without support, the old arbitrary-by-order behaviour.
+    keep, _, _ = shortlist_by_chain(chain, ptr, k=2, frac=0.5)
+    assert keep.tolist() == [True, True, False, False, False]

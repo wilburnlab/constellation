@@ -311,18 +311,30 @@ def shortlist_by_chain(
     *,
     k: int,
     frac: float,
+    support: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The two-pass E-step's shortlist: which hits get base-aligned at all.
 
     Keeps a hit iff its chaining score is ≥ ``frac`` × its read's best **and**
-    it is among the read's top ``k`` by chaining score (ties broken by hit
-    order, which is deterministic). Returns ``(keep, chain_rank, n_eligible)``:
-    the mask, each hit's 0-based rank within its read by chaining score, and
-    per read how many hits cleared the ``frac`` cut before ``k`` was applied —
-    so ``n_eligible > k`` is exactly "the shortlist cut something".
+    it is among the read's top ``k`` by chaining score, ties broken by
+    ``support`` (the candidate template's read mass), then by hit order.
+    Returns ``(keep, chain_rank, n_eligible)``: the mask, each hit's 0-based
+    rank within its read, and per read how many hits cleared the ``frac``
+    cut before ``k`` was applied — so ``n_eligible > k`` is exactly "the
+    shortlist cut something".
+
+    The support tie-break is load-bearing under the native candidates, not
+    cosmetic: there the shortlist key is SHARED PROBES, a small integer, so
+    inside a family of near-duplicate templates most candidates tie — and
+    "ties by hit order" is ties by template row, an arbitrary subset that
+    can exclude the family's dense template entirely. A read then aligns
+    against k arbitrary shallow siblings, fragments onto one of them or
+    clears the floor against none, which is how high-abundance genes shed
+    reads for no reason the data contains. Dense templates first is the
+    same direction every other tie in the loop already leans.
 
     Unlike the single-pass pool this is **not** guaranteed to contain every
-    template within ``p_floor``: the chaining score is a proxy for identity,
+    template within ``p_floor``: the shortlist key is a proxy for identity,
     not the thing itself. ``k`` and ``frac`` are unmeasured operating points,
     which is why the truncation is reported per read.
     """
@@ -334,7 +346,12 @@ def shortlist_by_chain(
     grp, sizes = _group_of_hit(group_ptr)
     best = np.maximum.reduceat(s1, group_ptr[:-1])
     eligible = s1 >= float(frac) * np.repeat(best, sizes)
-    order = np.lexsort((np.arange(s1.size), -s1, grp))
+    support_h = (
+        np.zeros(s1.size, dtype=np.float64)
+        if support is None
+        else np.asarray(support, dtype=np.float64)
+    )
+    order = np.lexsort((np.arange(s1.size), -support_h, -s1, grp))
     rank = np.empty(s1.size, dtype=np.int64)
     rank[order] = np.arange(s1.size) - np.repeat(group_ptr[:-1], sizes)
     keep = eligible & (rank < int(k))

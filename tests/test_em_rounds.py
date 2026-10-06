@@ -339,6 +339,21 @@ def test_resume_refuses_a_changed_floor_rule_or_native_knob(tmp_path):
     # A stampless directory reads as the defaults, so the default passes...
     (rounds / "estep.json").unlink()
     _check_estep_stamp(rounds, _params(), resume=True)
+    # ...and a two-pass run stamped before the shortlist keys existed ran
+    # the old 16-deep shortlist, so the new 32 default refuses it unless
+    # the old value is restored.
+    edlib_dir = tmp_path / "edlib" / "rounds"
+    (edlib_dir / "r01").mkdir(parents=True)
+    (edlib_dir / "r01" / "_SUCCESS").write_bytes(b"")
+    (edlib_dir / "estep.json").write_text(json.dumps({"estep_aligner": "edlib"}))
+    with pytest.raises(ValueError, match="estep_shortlist_k"):
+        _check_estep_stamp(edlib_dir, _params(estep_aligner="edlib"), resume=True)
+    (edlib_dir / "estep.json").write_text(json.dumps({"estep_aligner": "edlib"}))
+    _check_estep_stamp(
+        edlib_dir,
+        _params(estep_aligner="edlib", estep_shortlist_k=16),
+        resume=True,
+    )
     # ...and the native path stamps its join parameters: hand-edit one and
     # the resume is refused by its name.
     native = tmp_path / "native" / "rounds"

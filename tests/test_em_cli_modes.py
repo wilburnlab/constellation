@@ -318,8 +318,12 @@ def test_min_aa_length_is_the_annotation_floor_in_every_em_mode():
         assert params.min_aa_length == 45
         assert params.mstep.min_aa_length == 45
     assert _resolved().mstep.min_aa_length == 30
-    assert _reject_inapplicable(_args("--mode", "kmer", "--min-aa-length", "60"),
-                                "kmer", "orf") is None
+    assert (
+        _reject_inapplicable(
+            _args("--mode", "kmer", "--min-aa-length", "60"), "kmer", "orf"
+        )
+        is None
+    )
 
 
 def test_the_coverage_route_is_off_unless_asked_for():
@@ -355,12 +359,45 @@ def test_the_two_pass_estep_is_opt_in_and_its_knobs_apply_under_it():
 
 
 def test_the_native_aligner_and_the_quality_floor_reach_the_params():
-    params = _resolved(
-        "--estep-aligner", "native", "--p-floor-quality-scale", "1.5"
-    )
+    params = _resolved("--estep-aligner", "native", "--p-floor-quality-scale", "1.5")
     assert params.estep_aligner == "native"
     assert params.p_floor_quality_scale == 1.5
     assert _resolved().p_floor_quality_scale is None
+
+
+def test_the_shortlist_and_probe_counts_default_to_32_and_reach_the_params():
+    """Raised from 16 (2026-10-05): under native the shortlist key is
+    shared probes, so family candidates tie in droves and a 16-deep cut
+    over near-ties was an arbitrary subset that cost deep genes reads."""
+    defaults = _resolved()
+    assert defaults.estep_shortlist_k == 32
+    assert defaults.estep_probes_per_read == 32
+    params = _resolved(
+        "--estep-aligner",
+        "native",
+        "--estep-shortlist-k",
+        "64",
+        "--estep-probes-per-read",
+        "48",
+    )
+    assert params.estep_shortlist_k == 64
+    assert params.estep_probes_per_read == 48
+
+    from constellation.cli.__main__ import _reject_inapplicable
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        EmParams,
+    )
+
+    for mode_args, seeding in (
+        (("--mode", "em-kmer"), "kmer"),  # default aligner is minimap2
+        (("--mode", "em-kmer", "--estep-aligner", "edlib"), "kmer"),
+    ):
+        problem = _reject_inapplicable(
+            _args(*mode_args, "--estep-probes-per-read", "48"), "em", seeding
+        )
+        assert problem is not None and "--estep-probes-per-read" in problem
+    with pytest.raises(ValueError, match="estep_probes_per_read"):
+        EmParams(estep_probes_per_read=1)
 
 
 def test_merge_is_off_by_default_and_both_spellings_parse():
@@ -395,7 +432,9 @@ def test_the_predicate_applies_to_the_report_as_well_as_to_a_merge():
         "5",
         "--merge-siblings",
     )
-    assert _reject_inapplicable(_args("--mode", "em-kmer", *knobs), "em", "kmer") is None
+    assert (
+        _reject_inapplicable(_args("--mode", "em-kmer", *knobs), "em", "kmer") is None
+    )
     merging = _args("--mode", "em-kmer", "--merge", "--merge-from-round", "2", *knobs)
     assert _reject_inapplicable(merging, "em", "kmer") is None
     final = _args("--mode", "em-orf", "--merge", "--template-graph", "final")

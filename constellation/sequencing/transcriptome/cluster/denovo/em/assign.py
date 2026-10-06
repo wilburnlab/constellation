@@ -432,7 +432,11 @@ def assign_block_edlib(
         else np.zeros(len(hb), dtype=np.int64)
     )
     keep, chain_rank, n_eligible = sched.shortlist_by_chain(
-        chain, ptr, k=shortlist_k, frac=shortlist_frac
+        chain,
+        ptr,
+        k=shortlist_k,
+        frac=shortlist_frac,
+        support=np.asarray(store.node_weight, dtype=np.float64)[hb.template_row],
     )
     lazy_round1 = round_index <= 1 and round1_rule != "identity_band"
     if lazy_round1:

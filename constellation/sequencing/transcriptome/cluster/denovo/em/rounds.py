@@ -133,8 +133,17 @@ class EmParams:
     # `shortlist_truncated` reports its cost per read — which is why both
     # two-pass aligners are opt-in.
     estep_aligner: Literal["minimap2", "edlib", "native"] = "minimap2"
-    estep_shortlist_k: int = 16
+    #: Candidates base-aligned per read under the two-pass aligners. 32, up
+    #: from 16 (2026-10-05): under native the shortlist key is shared
+    #: probes, a small integer, so family candidates tie in droves and a
+    #: 16-deep cut over near-ties lost reads of deep genes outright.
+    estep_shortlist_k: int = 32
     estep_shortlist_frac: float = 0.8
+    #: Probes per read in the native candidate join — one per position
+    #: stratum, so also how finely a read's length is sampled. Raised with
+    #: the shortlist: more probes means finer `n_shared` granularity, which
+    #: is what makes the shortlist key discriminate inside a family at all.
+    estep_probes_per_read: int = 32
     #: 0 means `threads`.
     estep_align_workers: int = 0
     #: None is the flat admission floor. A value `s` lets each read's floor
@@ -227,6 +236,16 @@ class EmParams:
             raise ValueError("estep_shortlist_k must be >= 1")
         if not 0.0 < self.estep_shortlist_frac <= 1.0:
             raise ValueError("estep_shortlist_frac must be in (0, 1]")
+        if (
+            isinstance(self.estep_probes_per_read, bool)
+            or not isinstance(self.estep_probes_per_read, int)
+            or self.estep_probes_per_read < 2
+        ):
+            # min_shared needs two probes: one cannot make a candidate.
+            raise ValueError(
+                f"estep_probes_per_read must be an integer >= 2, got "
+                f"{self.estep_probes_per_read!r}"
+            )
         if self.p_floor_quality_scale is not None and (
             isinstance(self.p_floor_quality_scale, bool)
             or not isinstance(self.p_floor_quality_scale, (int, float))
@@ -606,6 +625,9 @@ def _one_round(
             minis_dir=minis_dir,
             kmer=params.kmer,
             window=params.window,
+            params=native.NativeParams(
+                probes_per_read=params.estep_probes_per_read
+            ),
             align_workers=params.estep_align_workers or params.threads,
             corpus_path=corpus.arrow_path,
             templates_path=rd / "templates" / TEMPLATES_ARROW,
@@ -723,6 +745,14 @@ def _check_estep_stamp(rounds_dir: Path, params: EmParams, resume: bool) -> None
         "p_floor_quality_scale": params.p_floor_quality_scale,
         "round1_rule": params.round1_rule(),
     }
+    if params.estep_aligner in ("edlib", "native"):
+        # The shortlist is what the ranking sees; a changed size mid-run
+        # makes the rounds' assignments incomparable, exactly like a
+        # changed floor. Stamped only where it acts.
+        want.update(
+            estep_shortlist_k=int(params.estep_shortlist_k),
+            estep_shortlist_frac=float(params.estep_shortlist_frac),
+        )
     if params.estep_aligner == "native":
         from constellation.sequencing.transcriptome.cluster.denovo.em.native import (
             NativeParams,
@@ -731,17 +761,23 @@ def _check_estep_stamp(rounds_dir: Path, params: EmParams, resume: bool) -> None
         want.update(
             kmer=int(params.kmer),
             window=int(params.window),
-            **NativeParams().semantic(),
+            **NativeParams(
+                probes_per_read=params.estep_probes_per_read
+            ).semantic(),
         )
     if resume and any(rounds_dir.glob(f"r*/{_SUCCESS}")):
         # A stamp from before a field existed reads as that field's default:
         # an old run could only have been running what the code then did —
         # which for the round-1 rule was replication-first, whatever the
         # seeder.
+        # The shortlist defaults are what the OLD code ran, not today's: a
+        # stamp from before they were recorded belongs to a 16-deep run.
         defaults = {
             "estep_aligner": "minimap2",
             "p_floor_quality_scale": None,
             "round1_rule": "replication",
+            "estep_shortlist_k": 16,
+            "estep_shortlist_frac": 0.8,
         }
         have = json.loads(path.read_text()) if path.exists() else {}
         for key, value in want.items():
