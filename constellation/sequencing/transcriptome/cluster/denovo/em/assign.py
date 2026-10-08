@@ -66,9 +66,132 @@ EM_ASSIGNMENT_TABLE: pa.Schema = pa.schema(
         pa.field("t_end", pa.int32(), nullable=False),
         pa.field("cigar", pa.large_string(), nullable=True),
         pa.field("sample_id", pa.int64(), nullable=True),
+        # Two-pass E-step (`--estep-aligner edlib` / `native`) only; null
+        # under the single-pass minimap2 -c path. `chain_score` is the
+        # winner's shortlist key — minimap2's `s1:i` under edlib, shared
+        # probes under native. `shortlist_truncated` marks a read whose
+        # shortlist cut candidates that could have changed its answer — the
+        # analogue of `candidate_cap_hit` one level down.
+        pa.field("chain_score", pa.int32(), nullable=True),
+        pa.field("shortlist_truncated", pa.bool_(), nullable=True),
+        # Why each read was, or was not, assigned — the record that would
+        # have caught both the minimizer-masking loss and the low-quality
+        # tail without a forensic job (ledger #63). For an assigned read,
+        # the winner's identity (n_match / aln_len) and aligned length. For
+        # an unassigned one, the BEST identity among the candidates whose
+        # alignment COUNTED — produced, and placed over enough of the pair
+        # (null if none did) — no aligned length, and a reason:
+        # 'no_candidate' (nothing to align against), 'below_floor' (a
+        # counted alignment, none cleared the admission floor),
+        # 'no_alignment' (every alignment attempt failed outright) or
+        # 'short_placement' (alignments came back, every one a sliver of the
+        # pair — a chance match, which says nothing about the floor and is
+        # kept out of `identity` so it cannot poison a floor calibration).
+        pa.field("identity", pa.float32(), nullable=True),
+        pa.field("aligned_len", pa.int32(), nullable=True),
+        pa.field("unassigned_reason", pa.string(), nullable=True),
     ],
     metadata={b"schema_name": b"EmAssignmentTable"},
 )
+
+
+#: The `unassigned_reason` vocabulary.
+UNASSIGNED_REASONS = (
+    "no_candidate",
+    "below_floor",
+    "no_alignment",
+    "short_placement",
+)
+
+
+def reason_tallies() -> dict[str, int]:
+    """A zeroed ``n_<reason>`` counter per :data:`UNASSIGNED_REASONS`."""
+    return {f"n_{reason}": 0 for reason in UNASSIGNED_REASONS}
+
+
+def _identity_columns(
+    has: np.ndarray,
+    slot: np.ndarray,
+    n_match: np.ndarray,
+    aln_len: np.ndarray,
+    group_ptr: np.ndarray,
+    attempted: np.ndarray | None = None,
+    placed: np.ndarray | None = None,
+) -> tuple[pa.Array, pa.Array, pa.Array]:
+    """``(identity, aligned_len, unassigned_reason)`` for one block.
+
+    ``n_match`` / ``aln_len`` are per hit under ``group_ptr``'s grouping;
+    ``attempted`` marks hits where an alignment was tried at all (every hit,
+    for a single-pass aligner); ``placed`` marks alignments that cover
+    enough of the pair to count (every one, where no guard applies). An
+    unassigned read's identity is the best among alignments that COUNTED.
+    """
+    n_groups = group_ptr.size - 1
+    sizes = np.diff(group_ptr)
+    produced = aln_len > 0
+    counted = produced if placed is None else produced & placed
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ident = np.where(produced, n_match / np.maximum(aln_len, 1), -np.inf)
+    if ident.size:
+        best = np.maximum.reduceat(np.where(counted, ident, -np.inf), group_ptr[:-1])
+        best = np.where(sizes > 0, best, -np.inf)
+        n_produced = np.add.reduceat(produced.astype(np.int64), group_ptr[:-1])
+        n_counted = np.add.reduceat(counted.astype(np.int64), group_ptr[:-1])
+        tried = attempted if attempted is not None else np.ones_like(produced)
+        n_tried = np.add.reduceat(tried.astype(np.int64), group_ptr[:-1])
+    else:
+        best = np.full(n_groups, -np.inf)
+        n_produced = np.zeros(n_groups, dtype=np.int64)
+        n_counted = np.zeros(n_groups, dtype=np.int64)
+        n_tried = np.zeros(n_groups, dtype=np.int64)
+    n_produced = np.where(sizes > 0, n_produced, 0)
+    n_counted = np.where(sizes > 0, n_counted, 0)
+    n_tried = np.where(sizes > 0, n_tried, 0)
+
+    out_ident = np.where(has, ident[slot] if ident.size else np.nan, best)
+    ident_arr = pa.array(
+        np.where(np.isfinite(out_ident), out_ident, np.nan).astype(np.float32),
+        mask=~np.isfinite(out_ident),
+    )
+    win_len = aln_len[slot] if aln_len.size else np.zeros(n_groups, dtype=np.int64)
+    len_arr = pa.array(win_len.astype(np.int32), mask=~has)
+    # Indices into UNASSIGNED_REASONS.
+    reason = np.where(
+        has,
+        -1,
+        np.where(
+            n_counted > 0,
+            1,
+            np.where(n_produced > 0, 3, np.where(n_tried > 0, 2, 0)),
+        ),
+    )
+    lookup = np.array([None, *UNASSIGNED_REASONS], dtype=object)
+    reason_arr = pa.array(lookup[reason + 1], pa.string())
+    return ident_arr, len_arr, reason_arr
+
+
+def _hit_floor(
+    reads,
+    read_of_group: np.ndarray,
+    sizes: np.ndarray,
+    *,
+    p_floor: float,
+    quality_scale: float | None,
+) -> tuple[float | np.ndarray, np.ndarray | None]:
+    """``(per-hit floor, per-group floor)`` — scalars when the rule is flat.
+
+    The flat rule never touches the corpus, so a caller without quality
+    columns (hand-built test stores) pays nothing for the plumbing.
+    """
+    if quality_scale is None:
+        return float(p_floor), None
+    grp_floor = sched.floor_per_read(
+        np.asarray(reads.dorado_quality, dtype=np.float64)[read_of_group],
+        p_floor=p_floor,
+        quality_scale=quality_scale,
+    )
+    return np.repeat(grp_floor, sizes), grp_floor
+
 
 register_schema("EmAssignmentTable", EM_ASSIGNMENT_TABLE)
 
@@ -99,22 +222,62 @@ def assign_block(
     error_model: ErrorModel | None = None,
     minimap2_n: int = 500,
     keep_cigars: bool = True,
+    p_floor_quality_scale: float | None = None,
+    round1_rule: str = "replication",
 ) -> pa.RecordBatch:
-    """Reduce one :class:`HitBlock` to one assignment row per read."""
+    """Reduce one :class:`HitBlock` to one assignment row per read.
+
+    ``round1_rule`` is the seeder's property: ``"replication"`` (em-orf —
+    identity among single-read seeds is self-capture bait) or
+    ``"identity_band"`` (em-kmer — best identity wins, replication only
+    inside the read's own noise). See the module docstring.
+    """
     ptr, read_of_group = _group_bounds(hb.read_row)
     n_groups = read_of_group.size
     if n_groups == 0:
         return pa.RecordBatch.from_pylist([], schema=EM_ASSIGNMENT_TABLE)
 
     sizes = np.diff(ptr)
+    hit_floor, _ = _hit_floor(
+        reads,
+        read_of_group,
+        sizes,
+        p_floor=p_floor,
+        quality_scale=p_floor_quality_scale,
+    )
     admitted, n_admitted = sched.admit_candidates(
-        hb.n_match, hb.aln_len, ptr, p_floor=p_floor
+        hb.n_match, hb.aln_len, ptr, p_floor=hit_floor
     )
 
     logl = np.full(hb.read_row.size, -np.inf, dtype=np.float64)
     logl_delta = np.full(hb.read_row.size, np.inf, dtype=np.float64)
 
-    if round_index <= 1:
+    if round_index <= 1 and round1_rule == "identity_band":
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ident_h = np.where(
+                hb.aln_len > 0, hb.n_match / np.maximum(hb.aln_len, 1), 0.0
+            )
+        # The read's own length, decoded once per read (PAF repeats it on
+        # every line). The aligned length is NOT a stand-in for it here:
+        # minimap2's hit is local, so a 300-nt hit on a 300-nt template
+        # read "length-matched" for a 1,000-nt read and tied with the
+        # template that explains all of it (review of 91e7c69). The two-pass
+        # reducer already ranks on the true length.
+        read_len_g = hb.int_fields(ptr[:-1], ("q_len",))["q_len"]
+        winner = sched.rank_round1_identity(
+            admitted,
+            hb.template_row,
+            ptr,
+            identity=ident_h,
+            span=hb.aln_len,
+            orf_replication=store.orf_replication,
+            seed_read_quality=store.seed_read_quality,
+            read_len=np.repeat(read_len_g, sizes).astype(np.float64),
+            template_len=store.lengths().astype(np.float64),
+            z=near_tie_z,
+            error_rate=error_rate,
+        )
+    elif round_index <= 1:
         winner = sched.rank_round1(
             admitted,
             hb.template_row,
@@ -181,6 +344,9 @@ def assign_block(
     t_row = np.where(has, hb.template_row[slot], -1).astype(np.int32)
     t_id = np.where(has, store.template_id[hb.template_row[slot]], -1).astype(np.int64)
 
+    ident_arr, len_arr, reason_arr = _identity_columns(
+        has, slot, np.asarray(hb.n_match), np.asarray(hb.aln_len), ptr
+    )
     return pa.RecordBatch.from_arrays(
         [
             # read_id is materialised exactly once per round, on the winners —
@@ -220,8 +386,336 @@ def assign_block(
             pa.array(reads.sample_id[read_of_group].astype(np.int64))
             if reads.sample_id.size
             else pa.nulls(n_groups, pa.int64()),
+            pa.nulls(n_groups, pa.int32()),
+            pa.nulls(n_groups, pa.bool_()),
+            ident_arr,
+            len_arr,
+            reason_arr,
         ],
         schema=EM_ASSIGNMENT_TABLE,
+    )
+
+
+_SHORTLIST_FIELDS = ("q_start", "q_end", "t_start", "t_end")
+
+
+def assign_block_edlib(
+    hb: HitBlock,
+    *,
+    store,
+    reads,
+    round_index: int,
+    p_floor: float = 0.97,
+    delta_logl: float = 5.0,
+    support_ratio: float = 20.0,
+    error_model: ErrorModel | None = None,
+    minimap2_n: int = 500,
+    shortlist_k: int = 16,
+    shortlist_frac: float = 0.8,
+    pad: int = 20,
+    k_anchor: int = 5,
+    keep_cigars: bool = True,
+    align_fn=None,
+    p_floor_quality_scale: float | None = None,
+    cap_hit: np.ndarray | None = None,
+    round1_rule: str = "replication",
+    near_tie_z: float = 2.0,
+    error_rate: float = 0.01,
+    min_placed_fraction: float = sched.MIN_PLACED_FRACTION,
+    **_ignored,
+) -> tuple[pa.RecordBatch, int]:
+    """The two-pass reducer: chained hits in, base-aligned winners out.
+
+    ``hb`` comes from a **no-``-c``** PAF scanned with ``chain_score=True``.
+    Every admission and ranking input is taken from the edlib alignment of a
+    shortlisted pair (:mod:`.realign`), never from the chained columns — see
+    that module for why. Returns ``(batch, n_aligned)``.
+
+    Round 1 under ``round1_rule="replication"`` (em-orf) aligns **lazily**:
+    its ranking ignores score entirely (ORF replication, then seed quality —
+    :func:`.scheduler.rank_round1`), so all of a read's hits are walked in
+    that order and the first admitted one wins, which is exactly
+    ``rank_round1`` unless ``shortlist_k`` attempts all fail; the chain
+    shortlist does not apply, since it would hand the replication ranking an
+    arbitrary subset. Under ``"identity_band"`` (em-kmer) round 1 is shaped
+    like round 2+: shortlist, align it all, admit — and rank with
+    :func:`.scheduler.rank_round1_identity`, so the best identity wins and
+    replication decides only inside the read's own noise (``near_tie_z`` x
+    the binomial width, via ``error_rate``). Round 2+ aligns the whole
+    shortlist, admits on the aligned identity and ranks on the likelihood
+    unchanged; the AS near-tie shortlist does not apply here, the
+    chain-score shortlist replaces it.
+
+    ``cap_hit`` overrides the ``candidate_cap_hit`` column (one bool per
+    GROUP, in group order): the default reads the pool as minimap2's and
+    flags ``sizes >= minimap2_n + 1``, which is meaningless for a native
+    block, whose pool is truncated by its own join caps.
+
+    Admission is identity AND placement: the alignment must cover
+    ``min_placed_fraction`` of the shorter of read and template
+    (:func:`.scheduler.placed_enough`). The aligner score-trims to its best
+    stretch, so without the second clause a chance match of a few bases is
+    a perfect alignment and clears any identity floor.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.realign import (
+        align_finalist,
+    )
+
+    align_fn = align_fn or align_finalist
+    ptr, read_of_group = _group_bounds(hb.read_row)
+    n_groups = read_of_group.size
+    if n_groups == 0:
+        return pa.RecordBatch.from_pylist([], schema=EM_ASSIGNMENT_TABLE), 0
+    sizes = np.diff(ptr)
+    chain = (
+        hb.chain_score
+        if hb.chain_score is not None
+        else np.zeros(len(hb), dtype=np.int64)
+    )
+    keep, chain_rank, n_eligible = sched.shortlist_by_chain(
+        chain,
+        ptr,
+        k=shortlist_k,
+        frac=shortlist_frac,
+        support=np.asarray(store.node_weight, dtype=np.float64)[hb.template_row],
+    )
+    lazy_round1 = round_index <= 1 and round1_rule != "identity_band"
+    if lazy_round1:
+        # Replication-first round 1 ranks on something the chain score knows
+        # nothing about, so a chain-score shortlist would hand the ranking
+        # an arbitrary subset (measured on the synthetic panel: 55% of reads
+        # cut, 28 surviving templates against minimap2's 13). Every hit
+        # stays a candidate; `shortlist_k` bounds the ALIGNMENT ATTEMPTS of
+        # the lazy walk instead, which usually stops at the first.
+        keep = np.ones(len(hb), dtype=bool)
+    sel = np.flatnonzero(keep)  # hit order is preserved, so groups stay contiguous
+    sub_sizes = np.add.reduceat(keep.astype(np.int64), ptr[:-1])
+    sub_ptr = np.concatenate([[0], np.cumsum(sub_sizes)]).astype(np.int64)
+    sub_grp = np.repeat(np.arange(n_groups), sub_sizes)
+    t_row = hb.template_row[sel]
+    chained = hb.int_fields(sel, _SHORTLIST_FIELDS)
+
+    m = sel.size
+    aligned = np.zeros(m, dtype=bool)
+    n_match = np.zeros(m, dtype=np.int64)
+    aln_len = np.zeros(m, dtype=np.int64)
+    score = np.zeros(m, dtype=np.int64)
+    q_start = np.zeros(m, dtype=np.int64)
+    q_end = np.zeros(m, dtype=np.int64)
+    t_start = np.zeros(m, dtype=np.int64)
+    t_end = np.zeros(m, dtype=np.int64)
+    cigars: list[str | None] = [None] * m
+
+    read_seqs = reads.take_sequences(read_of_group)
+    tmpl_cache: dict[int, str] = {}
+    # One len() per READ, gathered per hit: round 1's lazy walk keeps every
+    # hit, and a Python call per hit there is tens of millions a block.
+    read_len_h = _reads_len(read_seqs, np.arange(n_groups))[sub_grp]
+    t_len_h = np.asarray(store.lengths(), dtype=np.int64)[t_row]
+
+    def _align(i: int) -> None:
+        row = int(t_row[i])
+        tmpl = tmpl_cache.get(row)
+        if tmpl is None:
+            tmpl = tmpl_cache[row] = store.sequence(row)
+        f = align_fn(
+            read_seqs[int(sub_grp[i])],
+            tmpl,
+            q_start=int(chained["q_start"][i]),
+            q_end=int(chained["q_end"][i]),
+            t_start=int(chained["t_start"][i]),
+            t_end=int(chained["t_end"][i]),
+            pad=pad,
+            k_anchor=k_anchor,
+        )
+        aligned[i] = True
+        if f is None:
+            return
+        n_match[i], aln_len[i], score[i] = f.n_match, f.aln_len, f.score
+        q_start[i], q_end[i] = f.q_start, f.q_end
+        t_start[i], t_end[i] = f.t_start, f.t_end
+        cigars[i] = f.cigar
+
+    sub_floor, _ = _hit_floor(
+        reads,
+        read_of_group,
+        sub_sizes,
+        p_floor=p_floor,
+        quality_scale=p_floor_quality_scale,
+    )
+
+    def _placed() -> np.ndarray:
+        return sched.placed_enough(
+            q_start,
+            q_end,
+            t_start,
+            t_end,
+            read_len_h,
+            t_len_h,
+            fraction=min_placed_fraction,
+        )
+
+    def _admitted() -> np.ndarray:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ident = np.where(aln_len > 0, n_match / np.maximum(aln_len, 1), 0.0)
+        return aligned & (aln_len > 0) & _placed() & (ident >= sub_floor)
+
+    logl = np.full(m, -np.inf, dtype=np.float64)
+    logl_delta = np.full(m, np.inf, dtype=np.float64)
+    winner = np.full(n_groups, sched.UNASSIGNED, dtype=np.int64)
+
+    if lazy_round1:
+        quality = np.asarray(store.seed_read_quality, dtype=np.float64)[t_row]
+        rep = np.asarray(store.orf_replication, dtype=np.int64)[t_row]
+        order = np.lexsort((t_row, -quality, -rep, sub_grp))
+        pending = np.ones(n_groups, dtype=bool)
+        for j in range(min(int(sub_sizes.max(initial=0)), int(shortlist_k))):
+            active = np.flatnonzero(pending & (sub_sizes > j))
+            if active.size == 0:
+                break
+            for g in active:
+                i = int(order[sub_ptr[g] + j])
+                _align(i)
+            adm = _admitted()
+            cand = order[sub_ptr[active] + j]
+            won = adm[cand]
+            winner[active[won]] = cand[won]
+            pending[active[won]] = False
+        admitted = _admitted()
+    elif round_index <= 1:
+        for i in range(m):
+            _align(i)
+        admitted = _admitted()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ident = np.where(aln_len > 0, n_match / np.maximum(aln_len, 1), 0.0)
+        winner = sched.rank_round1_identity(
+            admitted,
+            t_row,
+            sub_ptr,
+            identity=ident,
+            span=aln_len,
+            orf_replication=store.orf_replication,
+            seed_read_quality=store.seed_read_quality,
+            read_len=read_len_h.astype(np.float64),
+            template_len=store.lengths().astype(np.float64),
+            z=near_tie_z,
+            error_rate=error_rate,
+        )
+    else:
+        for i in range(m):
+            _align(i)
+        admitted = _admitted()
+        idx = np.flatnonzero(admitted)
+        if idx.size:
+            logl[idx] = read_template_loglik(
+                [cigars[i] for i in idx],
+                t_start=t_start[idx],
+                q_start=q_start[idx],
+                q_end=q_end[idx],
+                q_len=read_len_h[idx],
+                template_row=t_row[idx],
+                store=store,
+                model=error_model,
+            )
+        winner, logl_delta = sched.rank_likelihood(
+            admitted,
+            t_row,
+            sub_ptr,
+            logl=logl,
+            support=store.node_weight,
+            read_len=aln_len.astype(np.float64),
+            template_len=store.lengths().astype(np.float64),
+            delta_logl=delta_logl,
+            support_ratio=support_ratio,
+        )
+
+    has = winner != sched.UNASSIGNED
+    slot = np.where(has, winner, 0)
+    n_admitted = (
+        np.add.reduceat(admitted.astype(np.int64), sub_ptr[:-1])
+        if m
+        else np.zeros(n_groups, dtype=np.int64)
+    )
+    masked = np.where(admitted, score.astype(np.float64), -np.inf)
+    best_score = np.maximum.reduceat(masked, sub_ptr[:-1]) if m else np.zeros(n_groups)
+    best_score = np.where(np.isfinite(best_score), best_score, 0.0)
+
+    if lazy_round1:
+        # The walk gave up after `shortlist_k` attempts with candidates left:
+        # an admissible one may have been among them.
+        truncated = ~has & (sizes > int(shortlist_k))
+    else:
+        cut = n_eligible > int(shortlist_k)
+        # The likelihood tracks the chain score, so a cut matters only when
+        # nothing was admitted or the winner sat in the last slot.
+        last_slot = has & (chain_rank[sel[slot]] == int(shortlist_k) - 1)
+        truncated = cut & (~has | last_slot)
+
+    if m and has.any():
+        win_cig = [cigars[int(i)] if h else None for i, h in zip(slot, has)]
+    else:
+        win_cig = [None] * n_groups
+    if not keep_cigars:
+        win_cig = [None] * n_groups
+
+    t_row_out = np.where(has, t_row[slot] if m else -1, -1).astype(np.int32)
+    t_id = np.where(has, store.template_id[t_row[slot]] if m else -1, -1).astype(
+        np.int64
+    )
+
+    def _w(a):
+        return np.where(has, a[slot] if m else 0, 0)
+
+    ident_arr, len_arr, reason_arr = _identity_columns(
+        has, slot, n_match, aln_len, sub_ptr, attempted=aligned, placed=_placed()
+    )
+    cap_col = cap_hit if cap_hit is not None else sizes >= int(minimap2_n) + 1
+    batch = pa.RecordBatch.from_arrays(
+        [
+            reads.take_read_ids(read_of_group),
+            pa.array(read_of_group.astype(np.int32)),
+            pa.array(t_id),
+            pa.array(t_row_out),
+            pa.array(np.full(n_groups, int(round_index), dtype=np.int32)),
+            pa.array(np.where(has, 1.0, 0.0).astype(np.float32)),
+            pa.array(_w(score).astype(np.int32)),
+            pa.array(np.where(has, best_score - _w(score), 0).astype(np.int32)),
+            pa.array(
+                np.where(has & np.isfinite(_w(logl)), _w(logl), np.nan).astype(
+                    np.float32
+                )
+            ),
+            pa.array(
+                np.where(
+                    has & np.isfinite(_w(logl_delta)), _w(logl_delta), np.nan
+                ).astype(np.float32)
+            ),
+            pa.array(sizes.astype(np.int32)),
+            pa.array(n_admitted.astype(np.int32)),
+            pa.array(np.asarray(cap_col, dtype=bool)),
+            pa.array((_w(t_start) - _w(q_start)).astype(np.int32)),
+            pa.array(_w(q_start).astype(np.int32)),
+            pa.array(_w(q_end).astype(np.int32)),
+            pa.array(_w(t_start).astype(np.int32)),
+            pa.array(_w(t_end).astype(np.int32)),
+            pa.array(win_cig, pa.large_string()),
+            pa.array(reads.sample_id[read_of_group].astype(np.int64))
+            if reads.sample_id.size
+            else pa.nulls(n_groups, pa.int64()),
+            pa.array(np.where(has, chain[sel[slot]] if m else 0, 0).astype(np.int32)),
+            pa.array(truncated.astype(bool)),
+            ident_arr,
+            len_arr,
+            reason_arr,
+        ],
+        schema=EM_ASSIGNMENT_TABLE,
+    )
+    return batch, int(aligned.sum())
+
+
+def _reads_len(read_seqs: list[str], groups: np.ndarray) -> np.ndarray:
+    return np.fromiter(
+        (len(read_seqs[int(g)]) for g in groups), dtype=np.int64, count=len(groups)
     )
 
 
@@ -258,6 +752,17 @@ TEMPLATE_MINIMAP2_ARGS: tuple[str, ...] = (
     "0.05",
 )
 
+# The two-pass E-step's first pass: the same candidate generation with the
+# base alignment (`-c`, and `--eqx`, which only shapes its CIGAR) removed.
+# Measured at 400k reads x 994k templates: 528 s -> 173 s of minimap2 wall,
+# 37,009 -> 7,920 CPU-s. `-N`, `-p` and the single-index-part guard are
+# unchanged, because the candidate pool is the same question.
+TEMPLATE_MINIMAP2_ARGS_SHORTLIST: tuple[str, ...] = tuple(
+    a for a in TEMPLATE_MINIMAP2_ARGS if a not in ("-c", "--eqx")
+)
+
+ESTEP_ALIGNERS = ("minimap2", "edlib")
+
 
 def run_em_estep(
     templates_fasta,
@@ -273,6 +778,10 @@ def run_em_estep(
     block_bytes: int = 128 << 20,
     extra_minimap2_args: tuple[str, ...] = (),
     progress=None,
+    aligner: str = "minimap2",
+    align_workers: int = 1,
+    corpus_path=None,
+    templates_path=None,
     **assign_kwargs,
 ) -> dict:
     """Align every read to every template and stream assignments to Parquet.
@@ -280,6 +789,12 @@ def run_em_estep(
     Writes ``output_dir/part-NNNNN.parquet`` per PAF block and returns the
     round's counters. Nothing is written to disk by minimap2 and nothing
     read-cardinality is held in RAM: the hit stream is reduced as it arrives.
+
+    ``aligner="edlib"`` is the two-pass path: minimap2 without ``-c``
+    shortlists, and :func:`assign_block_edlib` base-aligns the shortlist,
+    fanned out over ``align_workers`` processes (each opens the corpus and
+    templates from ``corpus_path`` / ``templates_path`` itself). With one
+    worker it runs inline on ``store`` / ``reads``.
     """
     from pathlib import Path
 
@@ -304,9 +819,15 @@ def run_em_estep(
         stale.unlink()
 
     _check_single_index_part(store, index_batch_size)
+    if aligner not in ESTEP_ALIGNERS:
+        raise ValueError(f"unknown E-step aligner {aligner!r}; want {ESTEP_ALIGNERS}")
 
     args = (
-        *TEMPLATE_MINIMAP2_ARGS,
+        *(
+            TEMPLATE_MINIMAP2_ARGS
+            if aligner == "minimap2"
+            else TEMPLATE_MINIMAP2_ARGS_SHORTLIST
+        ),
         "-N",
         str(int(minimap2_n)),
         "-I",
@@ -317,6 +838,20 @@ def run_em_estep(
     stream = minimap2_stream(
         Path(templates_fasta), [Path(reads_fasta)], args=args, threads=threads
     )
+    if aligner == "edlib":
+        return _run_edlib_estep(
+            stream,
+            store=store,
+            reads=reads,
+            output_dir=output_dir,
+            round_index=round_index,
+            minimap2_n=minimap2_n,
+            block_bytes=block_bytes,
+            align_workers=align_workers,
+            corpus_path=corpus_path,
+            templates_path=templates_path,
+            assign_kwargs=assign_kwargs,
+        )
     blocks = iter_hit_blocks(
         stream, n_templates=store.n_templates, block_bytes=block_bytes
     )
@@ -334,6 +869,7 @@ def run_em_estep(
         "n_hits": 0,
         "n_dropped_strand": 0,
         "n_dropped_template": 0,
+        **reason_tallies(),
     }
     shard = 0
     for hb in blocks:
@@ -357,6 +893,8 @@ def run_em_estep(
         stats["n_cap_hit"] += int(
             pc.sum(batch.column("candidate_cap_hit")).as_py() or 0
         )
+        for key, value in _reason_counts(batch).items():
+            stats[key] += value
         if seen is not None:
             seen[batch.column("read_row").to_numpy(zero_copy_only=False)] = True
         pq.write_table(
@@ -385,17 +923,226 @@ def run_em_estep(
             shard += 1
 
     stats["n_unmapped"] = n_unmapped
+    stats["n_no_candidate"] += n_unmapped
     stats["n_reads_seen"] += n_unmapped
     stats["n_unassigned"] += n_unmapped
     stats["n_shards"] = shard
+    stats["aligner"] = "minimap2"
     stats["cap_hit_fraction"] = (
         stats["n_cap_hit"] / stats["n_reads_seen"] if stats["n_reads_seen"] else 0.0
     )
     return stats
 
 
-def _unassigned_batch(rows: np.ndarray, reads, round_index: int) -> pa.RecordBatch:
-    """One ``template_id = -1`` row per corpus read minimap2 never reported."""
+def _edlib_block(
+    block: bytes,
+    shard: int,
+    *,
+    output_dir: str,
+    round_index: int,
+    minimap2_n: int,
+    assign_kwargs: dict,
+    corpus_path: str | None = None,
+    templates_path: str | None = None,
+    store=None,
+    reads=None,
+) -> tuple[dict, np.ndarray]:
+    """Scan, shortlist, align and rank one raw PAF block; write its shard.
+
+    Module-level so a pool can pickle it. In a worker the stores are opened
+    from their paths (once per process — ``mstep_pool``'s handle cache), so
+    nothing large crosses the process boundary in either direction: raw
+    ``bytes`` in, counters and the block's read rows out.
+    """
+    import pyarrow.parquet as pq
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em import mstep_pool
+    from constellation.sequencing.transcriptome.cluster.denovo.em.paf_scan import (
+        scan_paf_block,
+    )
+
+    if store is None:
+        store = mstep_pool._templates(str(templates_path))
+    if reads is None:
+        reads = mstep_pool._reads(str(corpus_path))
+    hb = scan_paf_block(
+        np.frombuffer(block, dtype=np.uint8),
+        n_templates=store.n_templates,
+        chain_score=True,
+    )
+    stats = {
+        "n_hits": len(hb),
+        "n_dropped_strand": hb.n_dropped_strand,
+        "n_dropped_template": hb.n_dropped_template,
+        "n_reads_seen": 0,
+        "n_assigned": 0,
+        "n_cap_hit": 0,
+        "n_aligned": 0,
+        "n_shortlist_truncated": 0,
+        **reason_tallies(),
+    }
+    batch, n_aligned = assign_block_edlib(
+        hb,
+        store=store,
+        reads=reads,
+        round_index=round_index,
+        minimap2_n=minimap2_n,
+        **assign_kwargs,
+    )
+    stats["n_aligned"] = n_aligned
+    if not batch.num_rows:
+        return stats, np.empty(0, dtype=np.int64)
+    stats["n_reads_seen"] = batch.num_rows
+    stats["n_assigned"] = int(
+        pc.sum(pc.greater_equal(batch.column("template_id"), 0)).as_py() or 0
+    )
+    stats["n_cap_hit"] = int(pc.sum(batch.column("candidate_cap_hit")).as_py() or 0)
+    stats["n_shortlist_truncated"] = int(
+        pc.sum(batch.column("shortlist_truncated")).as_py() or 0
+    )
+    stats.update(_reason_counts(batch))
+    from pathlib import Path
+
+    pq.write_table(
+        pa.Table.from_batches([batch], schema=EM_ASSIGNMENT_TABLE),
+        Path(output_dir) / f"part-{shard:05d}.parquet",
+    )
+    return stats, batch.column("read_row").to_numpy(zero_copy_only=False).astype(
+        np.int64
+    )
+
+
+def _run_edlib_estep(
+    stream,
+    *,
+    store,
+    reads,
+    output_dir,
+    round_index: int,
+    minimap2_n: int,
+    block_bytes: int,
+    align_workers: int,
+    corpus_path,
+    templates_path,
+    assign_kwargs: dict,
+) -> dict:
+    """Drive :func:`_edlib_block` over the minimap2 stream, in parallel.
+
+    Blocks are numbered in stream order and each writes its own shard, so the
+    output is independent of the worker count. At most ``2 x workers`` blocks
+    are in flight, which bounds the parent's memory at a few blocks of PAF
+    whatever the stream length. minimap2 without ``-c`` is chaining-only and
+    runs concurrently with the pool.
+    """
+    from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.paf_scan import (
+        iter_group_blocks,
+    )
+
+    n_reads = getattr(reads, "n_reads", None)
+    seen = np.zeros(int(n_reads), dtype=bool) if n_reads else None
+    totals = {
+        "n_reads_seen": 0,
+        "n_assigned": 0,
+        "n_cap_hit": 0,
+        "n_hits": 0,
+        "n_dropped_strand": 0,
+        "n_dropped_template": 0,
+        "n_aligned": 0,
+        "n_shortlist_truncated": 0,
+        **reason_tallies(),
+    }
+
+    def _collect(result: tuple[dict, np.ndarray]) -> None:
+        stats, rows = result
+        for k, v in stats.items():
+            totals[k] += v
+        if seen is not None and rows.size:
+            seen[rows] = True
+
+    common = {
+        "output_dir": str(output_dir),
+        "round_index": round_index,
+        "minimap2_n": minimap2_n,
+        "assign_kwargs": assign_kwargs,
+    }
+    shard = 0
+    blocks = iter_group_blocks(stream, block_bytes=block_bytes)
+    if align_workers <= 1:
+        for block in blocks:
+            _collect(_edlib_block(block, shard, store=store, reads=reads, **common))
+            shard += 1
+    else:
+        if corpus_path is None or templates_path is None:
+            raise ValueError(
+                "align_workers > 1 needs corpus_path and templates_path: pool "
+                "workers open the stores themselves rather than inheriting them"
+            )
+        pending = set()
+        with ProcessPoolExecutor(max_workers=int(align_workers)) as ex:
+            for block in blocks:
+                pending.add(
+                    ex.submit(
+                        _edlib_block,
+                        block,
+                        shard,
+                        corpus_path=str(corpus_path),
+                        templates_path=str(templates_path),
+                        **common,
+                    )
+                )
+                shard += 1
+                if len(pending) >= 2 * int(align_workers):
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for f in done:
+                        _collect(f.result())
+            for f in pending:
+                _collect(f.result())
+
+    import pyarrow.parquet as pq
+
+    n_unmapped = 0
+    if seen is not None:
+        missing = np.flatnonzero(~seen)
+        if missing.size:
+            n_unmapped = int(missing.size)
+            pq.write_table(
+                pa.Table.from_batches(
+                    [_unassigned_batch(missing, reads, round_index)],
+                    schema=EM_ASSIGNMENT_TABLE,
+                ),
+                output_dir / f"part-{shard:05d}.parquet",
+            )
+            shard += 1
+
+    totals["n_unmapped"] = n_unmapped
+    totals["n_no_candidate"] += n_unmapped
+    totals["n_reads_seen"] += n_unmapped
+    totals["n_unassigned"] = totals["n_reads_seen"] - totals["n_assigned"]
+    totals["n_shards"] = shard
+    denom = totals["n_reads_seen"]
+    totals["cap_hit_fraction"] = totals["n_cap_hit"] / denom if denom else 0.0
+    totals["shortlist_truncated_fraction"] = (
+        totals["n_shortlist_truncated"] / denom if denom else 0.0
+    )
+    totals["aligner"] = "edlib"
+    return totals
+
+
+def _reason_counts(batch: pa.RecordBatch) -> dict[str, int]:
+    """Per-reason tallies of one batch, as ``n_<reason>`` keys."""
+    col = batch.column(batch.schema.get_field_index("unassigned_reason"))
+    return {
+        f"n_{reason}": int(pc.sum(pc.equal(col, reason)).as_py() or 0)
+        for reason in UNASSIGNED_REASONS
+    }
+
+
+def _unassigned_batch(
+    rows: np.ndarray, reads, round_index: int, reason: str = "no_candidate"
+) -> pa.RecordBatch:
+    """One ``template_id = -1`` row per corpus read the aligner never saw."""
     n = rows.size
     zero32 = pa.array(np.zeros(n, dtype=np.int32))
     return pa.RecordBatch.from_arrays(
@@ -422,6 +1169,11 @@ def _unassigned_batch(rows: np.ndarray, reads, round_index: int) -> pa.RecordBat
             pa.array(reads.sample_id[rows].astype(np.int64))
             if reads.sample_id.size
             else pa.nulls(n, pa.int64()),
+            pa.nulls(n, pa.int32()),
+            pa.nulls(n, pa.bool_()),
+            pa.nulls(n, pa.float32()),
+            pa.nulls(n, pa.int32()),
+            pa.array([reason] * n, pa.string()),
         ],
         schema=EM_ASSIGNMENT_TABLE,
     )
@@ -472,8 +1224,13 @@ def _parse_size(value: str | int) -> int:
 
 __all__ = [
     "EM_ASSIGNMENT_TABLE",
+    "ESTEP_ALIGNERS",
+    "UNASSIGNED_REASONS",
+    "reason_tallies",
     "TEMPLATE_MINIMAP2_ARGS",
+    "TEMPLATE_MINIMAP2_ARGS_SHORTLIST",
     "assign_block",
+    "assign_block_edlib",
     "assign_blocks",
     "run_em_estep",
 ]

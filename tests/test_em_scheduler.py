@@ -267,3 +267,134 @@ def test_shortlist_never_includes_an_unadmitted_hit():
         span=np.full(2, 1200.0),
     )
     assert keep.tolist() == [True, False]
+
+
+# ── round 1 by identity, replication inside the noise ────────────────
+
+
+def test_identity_wins_outside_the_band_and_replication_inside_it():
+    from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
+        rank_round1_identity,
+    )
+
+    ptr = np.array([0, 2])
+    tid = np.array([0, 1])
+    adm = np.array([True, True])
+    rep = np.array([500, 5])
+    qual = np.array([25.0, 25.0])
+    kw = dict(
+        span=np.array([1200, 1200]),
+        orf_replication=rep,
+        seed_read_quality=qual,
+        z=2.0,
+        error_rate=0.01,
+    )
+    # Band at 1.2 kb / 1% error / z=2 is ~0.0057 identity.
+    outside = rank_round1_identity(
+        adm, tid, ptr, identity=np.array([0.978, 0.990]), **kw
+    )
+    assert outside.tolist() == [1], "1.2 points apart: the measurement decides"
+    inside = rank_round1_identity(
+        adm, tid, ptr, identity=np.array([0.9895, 0.9900]), **kw
+    )
+    assert inside.tolist() == [0], "0.05 points apart is noise: consolidate"
+    one_admitted = rank_round1_identity(
+        np.array([True, False]), tid, ptr, identity=np.array([0.978, 0.990]), **kw
+    )
+    assert one_admitted.tolist() == [0], "the band is over ADMITTED hits"
+    none = rank_round1_identity(
+        np.array([False, False]), tid, ptr, identity=np.array([0.99, 0.99]), **kw
+    )
+    assert none.tolist() == [-1]
+
+
+def test_the_band_scales_with_the_aligned_length():
+    """The same 0.4-point gap is noise at 300 nt and a decision at 10 kb."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
+        rank_round1_identity,
+    )
+
+    ptr = np.array([0, 2])
+    tid = np.array([0, 1])
+    adm = np.array([True, True])
+    kw = dict(
+        orf_replication=np.array([500, 5]),
+        seed_read_quality=np.array([25.0, 25.0]),
+        z=2.0,
+        error_rate=0.01,
+    )
+    ident = np.array([0.986, 0.990])
+    short = rank_round1_identity(
+        adm, tid, ptr, identity=ident, span=np.array([300, 300]), **kw
+    )
+    assert short.tolist() == [0], "band ~1.1% at 300 nt: replication"
+    long = rank_round1_identity(
+        adm, tid, ptr, identity=ident, span=np.array([10_000, 10_000]), **kw
+    )
+    assert long.tolist() == [1], "band ~0.2% at 10 kb: identity"
+
+
+def test_inside_the_band_the_length_match_breaks_replication_ties():
+    from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
+        rank_round1_identity,
+    )
+
+    ptr = np.array([0, 2])
+    winner = rank_round1_identity(
+        np.array([True, True]),
+        np.array([0, 1]),
+        ptr,
+        identity=np.array([0.990, 0.990]),
+        span=np.array([1200, 1200]),
+        orf_replication=np.array([20, 20]),
+        seed_read_quality=np.array([25.0, 25.0]),
+        read_len=np.array([1200.0, 1200.0]),
+        template_len=np.array([5000.0, 1250.0]),
+    )
+    assert winner.tolist() == [1], "the template whose length matches the read"
+
+
+def test_shortlist_ties_go_to_the_better_supported_template():
+    """Under the native candidates the shortlist key is shared probes, a
+    small integer, so family candidates tie in droves — and ties by hit
+    order are ties by template row, an arbitrary subset that can exclude
+    the family's dense template entirely."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
+        shortlist_by_chain,
+    )
+
+    ptr = np.array([0, 5])
+    chain = np.array([7, 7, 7, 7, 6])
+    support = np.array([1.0, 1.0, 400.0, 2.0, 900.0])
+    keep, rank, n_eligible = shortlist_by_chain(
+        chain, ptr, k=2, frac=0.5, support=support
+    )
+    assert keep.tolist() == [False, False, True, True, False], (
+        "the two best-supported of the tied four; the 900-support hit has a "
+        "lower key and support never outranks the key itself"
+    )
+    assert n_eligible.tolist() == [5]
+    # Without support, the old arbitrary-by-order behaviour.
+    keep, _, _ = shortlist_by_chain(chain, ptr, k=2, frac=0.5)
+    assert keep.tolist() == [True, True, False, False, False]
+
+
+def test_placement_is_measured_on_the_shorter_sequence_and_the_smaller_span():
+    """Half the shorter of read and template, on whichever span is smaller:
+    a gappy alignment cannot claim on one side what it did not place on
+    the other."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import (
+        scheduler as sched,
+    )
+
+    ok = sched.placed_enough(
+        np.array([0, 0, 750, 0, 0]),  # q_start
+        np.array([1, 250, 1250, 600, 300]),  # q_end
+        np.array([0, 0, 0, 0, 0]),  # t_start
+        np.array([1, 250, 500, 200, 300]),  # t_end
+        np.array([600, 500, 2000, 600, 600]),  # q_len
+        np.array([600, 2000, 500, 600, 600]),  # t_len
+    )
+    assert ok.tolist() == [False, True, True, False, True]
+    assert bool(sched.placed_enough(0, 1, 0, 1, 600, 600, fraction=0.0))
+    assert sched.MIN_PLACED_FRACTION == 0.5

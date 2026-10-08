@@ -200,6 +200,163 @@ def chunked_take(
     return gathered.take(pa.array(inverse))
 
 
+#: The corpus's row order: these columns, ascending. ``read_id`` alone is
+#: unique for every demux written today; the other two only break ties
+#: between rows that share one (a read whose demux record has several
+#: windows), and rows equal in all three are identical, so their order
+#: cannot matter.
+CORPUS_ORDER: tuple[str, ...] = ("read_id", "sequence", "sample_id")
+
+
+def corpus_digest(arrow_path: Path | str) -> str:
+    """xxh3-128 of the corpus as ROWS: every read's id and sequence, in order.
+
+    What anything keyed on a corpus ROW depends on. A row count is not an
+    identity — the same reads in another order have the same count, which
+    is exactly what a corpus rebuilt under :data:`CORPUS_ORDER` is to the
+    one it replaced — and nor is the path, which is where the rebuilt one
+    is written.
+
+    A digest of the rows, not of how the file holds them: record-batch
+    boundaries do not enter. One pass over the memory-mapped file.
+    """
+    import xxhash
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.graph import (
+        _string_chunks,
+    )
+
+    streams = {
+        name: (xxhash.xxh3_128(), xxhash.xxh3_128())
+        for name in ("read_id", "sequence")
+    }
+    n = 0
+    with pa.memory_map(str(arrow_path), "r") as mm:
+        reader = pa.ipc.open_file(mm)
+        for b in range(reader.num_record_batches):
+            batch = reader.get_batch(b)
+            n += batch.num_rows
+            for name, (of_lengths, of_bytes) in streams.items():
+                column = batch.column(batch.schema.get_field_index(name))
+                for lengths, held in _string_chunks(column):
+                    # Lengths as well as bytes: the same bytes cut at other
+                    # places are other reads.
+                    of_lengths.update(np.ascontiguousarray(lengths, dtype="<i8"))
+                    of_bytes.update(np.ascontiguousarray(held))
+    state = xxhash.xxh3_128()
+    state.update(b"constellation.em.corpus.rows/1")
+    state.update(np.array([n], dtype="<i8"))
+    for of_lengths, of_bytes in streams.values():
+        state.update(of_lengths.digest())
+        state.update(of_bytes.digest())
+    return state.hexdigest()
+
+
+def _in_corpus_order(table: pa.Table) -> pa.Table:
+    """``table`` sorted by :data:`CORPUS_ORDER`, in memory."""
+    if table.num_rows < 2:
+        return table
+    return table.take(
+        pc.sort_indices(
+            table.select(list(CORPUS_ORDER)),
+            sort_keys=[(k, "ascending") for k in CORPUS_ORDER],
+        )
+    )
+
+
+def _sort_into(unsorted_path: Path, arrow_path: Path, fasta_path: Path) -> int:
+    """Rewrite ``unsorted_path`` to ``arrow_path`` + ``fasta_path`` in
+    :data:`CORPUS_ORDER`. Returns the row count.
+
+    Row order IS the corpus's identity downstream: FASTA names are row
+    indices, ``uniq_id`` is first-occurrence order, the anchor-star breaks
+    abundance ties on it, and the seed templates follow (ledger #56). The
+    demux join hands reads over in whatever order its thread pool finishes
+    them, so no streaming order is safe to rely on — not the default plan,
+    and not a sequenced scan on a serial executor either, which was stable
+    on 500k reads on a 12-core workstation and gave seven different orders
+    of the same 9,445,987 reads on 96-core nodes (ledger #59, #61).
+
+    Sorting by ``read_id`` takes the order out of the reader's hands
+    entirely. It is a property of the read set alone, so it also survives
+    a demux re-run that sharded its output differently, which the order of
+    the ``reads/`` dataset would not.
+
+    ``unsorted_path`` holds **sorted runs** — each record batch already in
+    :data:`CORPUS_ORDER`, sorted in memory as it was written — so this is a
+    merge: the global order takes a prefix of every run, then the next
+    stretch of every run, and each :data:`_BATCH_ROWS` block gathers one
+    contiguous, ascending range from each run. Every run is read once, front
+    to back. Measured at 1.5M reads (2.1 GB) from a cold page cache, the
+    gather takes 24 s from sorted runs against 47-55 s from an unsorted file
+    of the same rows — the difference is random 4 kB faults into the memory
+    map, which on a network filesystem and a 25 GB corpus cost more still.
+    The sort itself is under a second; what remains is reading and writing
+    the corpus once.
+
+    Bounded: only the sort keys are compared (``sequence`` only on a tied
+    ``read_id``), one block is gathered at a time, and the order is verified
+    on what is written, batch by batch. Costs a second copy of the corpus on
+    disk until the unsorted one is removed.
+    """
+    with pa.memory_map(str(unsorted_path), "r") as mm:
+        table = pa.ipc.open_file(mm).read_all()
+        n = table.num_rows
+        lengths = [len(c) for c in table.column("read_id").chunks]
+        chunk_starts = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
+        order = (
+            pc.sort_indices(
+                table.select(list(CORPUS_ORDER)),
+                sort_keys=[(k, "ascending") for k in CORPUS_ORDER],
+            )
+            .to_numpy()
+            .astype(np.int64)
+            if n
+            else np.empty(0, dtype=np.int64)
+        )
+        last_id: str | None = None
+        with pa.OSFile(str(arrow_path), "wb") as sink, pa.ipc.new_file(
+            sink, _READS_SCHEMA
+        ) as writer, fasta_path.open("w", encoding="utf-8") as fh:
+            row = 0
+            for lo in range(0, n, _BATCH_ROWS):
+                rows = order[lo : lo + _BATCH_ROWS]
+                block = pa.table(
+                    {
+                        f.name: chunked_take(table.column(f.name), rows, chunk_starts)
+                        for f in _READS_SCHEMA
+                    },
+                    schema=_READS_SCHEMA,
+                )
+                last_id = _check_sorted(block.column("read_id"), last_id)
+                writer.write_table(block)
+                row = _write_fasta_rows(fh, block, start_row=row)
+    return n
+
+
+def _check_sorted(ids: pa.ChunkedArray | pa.Array, before: str | None) -> str | None:
+    """Raise unless ``ids`` is non-decreasing and starts at or after
+    ``before``; return its last value. One pass over one written batch, so
+    it is as cheap at 9.4M reads as at nine — the check it replaces loaded
+    the whole ``reads/`` dataset (154M ids) into one string column and
+    overflowed its offsets."""
+    if isinstance(ids, pa.ChunkedArray):
+        ids = ids.combine_chunks()
+    if len(ids) == 0:
+        return before
+    if before is not None and ids[0].as_py() < before:
+        raise RuntimeError(
+            "the corpus is not in read_id order across a batch boundary; "
+            "this is a defect in the corpus writer"
+        )
+    if len(ids) > 1 and pc.any(pc.less(ids.slice(1), ids.slice(0, len(ids) - 1))).as_py():
+        raise RuntimeError(
+            "the corpus is not in read_id order; this is a defect in the "
+            "corpus writer"
+        )
+    return ids[len(ids) - 1].as_py()
+
+
 def write_corpus(
     demux_dir: Path,
     output_dir: Path,
@@ -223,6 +380,11 @@ def write_corpus(
 
     Empty windows are dropped too, so corpus rows are dense and every row has
     a FASTA record.
+
+    Rows are in :data:`CORPUS_ORDER` — by ``read_id`` — whatever order the
+    demux join produced them in (:func:`_sort_into` says why). Two corpora
+    from one demux dir are byte-identical, and so is one from a demux re-run
+    that sharded the same reads differently.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -247,50 +409,57 @@ def write_corpus(
     n_dropped_long = 0
     n_dropped_empty = 0
     max_seen = 0
-    n_written = 0
 
     tmp_arrow = arrow_path.with_suffix(".arrow.tmp")
     tmp_fasta = fasta_path.with_suffix(".fa.tmp")
-    writer = pa.ipc.new_file(pa.OSFile(str(tmp_arrow), "wb"), _READS_SCHEMA)
+    unsorted = output_dir / "reads.unsorted.arrow.tmp"
+    writer = pa.ipc.new_file(pa.OSFile(str(unsorted), "wb"), _READS_SCHEMA)
     pending: list[pa.Table] = []
     pending_rows = 0
     try:
-        with tmp_fasta.open("w", encoding="utf-8") as fh:
-            for batch in _iter_demux_read_batches(demux_dir, only_complete=True):
-                if batch.num_rows == 0:
-                    continue
-                trimmed = _trim_batch(batch)
-                n_input += trimmed.num_rows
+        # In whatever order the join hands them over: the order is imposed
+        # by sorting each batch written and then merging the batches
+        # (`_sort_into`), and nothing here may depend on it.
+        for batch in _iter_demux_read_batches(demux_dir, only_complete=True):
+            if batch.num_rows == 0:
+                continue
+            trimmed = _trim_batch(batch)
+            n_input += trimmed.num_rows
 
-                lengths = pc.utf8_length(trimmed.column("sequence"))
-                if trimmed.num_rows:
-                    max_seen = max(max_seen, int(pc.max(lengths).as_py() or 0))
+            lengths = pc.utf8_length(trimmed.column("sequence"))
+            if trimmed.num_rows:
+                max_seen = max(max_seen, int(pc.max(lengths).as_py() or 0))
 
-                keep = pc.greater(lengths, 0)
-                n_dropped_empty += trimmed.num_rows - int(pc.sum(keep).as_py() or 0)
-                if max_window_length is not None and max_window_length > 0:
-                    short_enough = pc.less_equal(lengths, max_window_length)
-                    n_dropped_long += trimmed.num_rows - int(
-                        pc.sum(short_enough).as_py() or 0
-                    )
-                    keep = pc.and_(keep, short_enough)
-                trimmed = trimmed.filter(keep)
-                if trimmed.num_rows == 0:
-                    continue
+            keep = pc.greater(lengths, 0)
+            n_dropped_empty += trimmed.num_rows - int(pc.sum(keep).as_py() or 0)
+            if max_window_length is not None and max_window_length > 0:
+                short_enough = pc.less_equal(lengths, max_window_length)
+                n_dropped_long += trimmed.num_rows - int(
+                    pc.sum(short_enough).as_py() or 0
+                )
+                keep = pc.and_(keep, short_enough)
+            trimmed = trimmed.filter(keep)
+            if trimmed.num_rows == 0:
+                continue
 
-                # FASTA names are corpus row indices, assigned in write order.
-                n_written = _write_fasta_rows(fh, trimmed, start_row=n_written)
-
-                pending.append(trimmed)
-                pending_rows += trimmed.num_rows
-                if pending_rows >= _BATCH_ROWS:
-                    writer.write_table(pa.concat_tables(pending))
-                    pending, pending_rows = [], 0
-            if pending:
-                writer.write_table(pa.concat_tables(pending))
+            pending.append(trimmed)
+            pending_rows += trimmed.num_rows
+            if pending_rows >= _BATCH_ROWS:
+                # One sorted run per batch: what makes `_sort_into` a merge
+                # that reads each run once, in order, rather than a gather.
+                writer.write_table(_in_corpus_order(pa.concat_tables(pending)))
+                pending, pending_rows = [], 0
+        if pending:
+            writer.write_table(_in_corpus_order(pa.concat_tables(pending)))
     finally:
         writer.close()
 
+    try:
+        # FASTA names are corpus row indices, so the FASTA is written here,
+        # in the final order, and nowhere else.
+        n_written = _sort_into(unsorted, tmp_arrow, tmp_fasta)
+    finally:
+        unsorted.unlink(missing_ok=True)
     tmp_arrow.replace(arrow_path)
     tmp_fasta.replace(fasta_path)
 
@@ -302,7 +471,12 @@ def write_corpus(
         "max_input_length": max_seen,
     }
     stats_path.write_text(json.dumps(stats, indent=2))
-    settings_path.write_text(json.dumps(settings, indent=2))
+    # `row_order` is recorded, not compared: a corpus written before it was
+    # sorted resumes as what it is, consistent with itself and with no other
+    # run. Refusing it would strand every run directory written before.
+    settings_path.write_text(
+        json.dumps({**settings, "row_order": list(CORPUS_ORDER)}, indent=2)
+    )
     success.write_bytes(b"")
     return Corpus(directory=output_dir, n_reads=n_written, stats=stats)
 
@@ -364,6 +538,7 @@ def _write_fasta_rows(fh, table: pa.Table, *, start_row: int) -> int:
 
 __all__ = [
     "CORPUS_ARROW",
+    "CORPUS_ORDER",
     "chunked_take",
     "CORPUS_FASTA",
     "Corpus",

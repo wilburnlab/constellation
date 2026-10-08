@@ -12,6 +12,7 @@ Two contracts are load-bearing enough to pin here:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -330,3 +331,214 @@ def test_a_corpus_written_before_settings_were_recorded_still_resumes(tmp_path):
     write_corpus(demux, out, max_window_length=None)
     (out / "settings.json").unlink(missing_ok=True)
     assert write_corpus(demux, out, max_window_length=7, resume=True).n_reads == 1
+
+
+# ── row order is the corpus's identity ────────────────────────────────
+
+
+def _multi_shard_demux(
+    tmp_path, *, n_shards=6, per_shard=4_000, seed=0
+) -> tuple[Path, list[str]]:
+    """A demux dir with several `reads/` shards and several `read_demux/`
+    shards in a shuffled order, with 70% of the reads Complete. Returns the
+    dir and the Complete read ids in reads-dataset order."""
+    rng = np.random.default_rng(seed)
+    demux = tmp_path / "demux"
+    (demux / "reads").mkdir(parents=True)
+    (demux / "read_demux").mkdir(parents=True)
+    in_order: list[str] = []
+    kept: list[str] = []
+    for s in range(n_shards):
+        ids = [f"s{s}_r{i}" for i in range(per_shard)]
+        seqs = ["".join(rng.choice(list("ACGT"), 80)) for _ in range(per_shard)]
+        pq.write_table(
+            pa.table(
+                {
+                    "read_id": ids,
+                    "sequence": seqs,
+                    "dorado_quality": pa.array(np.full(per_shard, 20.0, np.float32)),
+                }
+            ),
+            demux / "reads" / f"part-{s:05d}.parquet",
+            row_group_size=1_000,
+        )
+        in_order += ids
+        kept += [i for i in ids if rng.random() < 0.7]
+    shuffled = list(kept)
+    rng.shuffle(shuffled)
+    for s in range(3):
+        sl = shuffled[s::3]
+        n = len(sl)
+        pq.write_table(
+            pa.table(
+                {
+                    "read_id": sl,
+                    "transcript_segment_index": [0] * n,
+                    "sample_id": pa.array([0] * n, pa.int64()),
+                    "orientation": ["+"] * n,
+                    "transcript_start": pa.array([5] * n, pa.int32()),
+                    "transcript_end": pa.array([75] * n, pa.int32()),
+                    "score": pa.array([1.0] * n, pa.float32()),
+                    "is_chimera": [False] * n,
+                    "status": ["Complete"] * n,
+                    "is_fragment": [False] * n,
+                    "artifact": ["none"] * n,
+                }
+            ),
+            demux / "read_demux" / f"part-{s:05d}.parquet",
+        )
+    return demux, kept
+
+
+def _scrambled_reader(seed):
+    """The demux reader, with its batches and the rows inside each batch
+    handed over in a random order — what a 96-core node's thread pool does
+    to it, and what no small machine reproduces reliably (ledger #61)."""
+    from constellation.sequencing.align.map import _iter_demux_read_batches
+
+    def scrambled(demux_dir, **kwargs):
+        rng = np.random.default_rng(seed)
+        batches = list(_iter_demux_read_batches(demux_dir, **kwargs))
+        for i in rng.permutation(len(batches)):
+            b = batches[int(i)]
+            yield b.take(pa.array(rng.permutation(b.num_rows)))
+
+    return scrambled
+
+
+def _corpus_bytes(directory):
+    return (
+        (directory / "reads.arrow").read_bytes(),
+        (directory / "reads.fa").read_bytes(),
+    )
+
+
+def test_the_corpus_is_in_read_id_order_whatever_order_the_reader_gives(
+    tmp_path, monkeypatch
+):
+    """Row order is the corpus's identity downstream — FASTA names, first-
+    occurrence `uniq_id`, the anchor-star's tie-break, the seed templates.
+    The demux join's order is not stable, and asking Acero for a sequenced
+    scan on a serial executor was stable on a workstation and gave seven
+    different orders of the same 9.4M reads on 96-core nodes. So the order
+    is imposed afterwards, by read_id, and the reader's cannot matter."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import (
+        corpus as corpus_mod,
+    )
+
+    demux, kept = _multi_shard_demux(tmp_path)
+    assert len(kept) > 10_000
+    written = []
+    for seed in range(3):
+        monkeypatch.setattr(
+            corpus_mod, "_iter_demux_read_batches", _scrambled_reader(seed)
+        )
+        out = tmp_path / f"corpus{seed}"
+        corpus = write_corpus(demux, out, max_window_length=None)
+        assert corpus.n_reads == len(kept)
+        written.append(_corpus_bytes(out))
+        assert not list(out.glob("*.tmp")), "the unsorted copy is removed"
+    assert written[0] == written[1] == written[2]
+
+    store = ReadStore.open(tmp_path / "corpus0" / "reads.arrow")
+    try:
+        ids = store.read_id.to_pylist()
+        seqs = store.sequence.to_pylist()
+    finally:
+        store.close()
+    assert ids == sorted(kept)
+    fasta = _parse_fasta(tmp_path / "corpus0" / "reads.fa")
+    assert [name for name, _ in fasta] == [str(i) for i in range(len(ids))]
+    assert [seq for _, seq in fasta] == seqs
+    settings = json.loads((tmp_path / "corpus0" / "settings.json").read_text())
+    assert settings["row_order"] == ["read_id", "sequence", "sample_id"]
+
+
+def test_the_order_does_not_depend_on_how_demux_sharded_the_reads(tmp_path):
+    """The reads dataset's own order would: a demux re-run at another thread
+    count writes the same reads into a different set of shards."""
+    one, kept = _multi_shard_demux(tmp_path / "a", n_shards=2, per_shard=3_000)
+
+    # The same reads, two shardings: re-shard `one`'s reads/ into seven parts.
+    reads = pq.read_table(one / "reads")
+    resharded = tmp_path / "c" / "demux"
+    (resharded / "reads").mkdir(parents=True)
+    bounds = np.linspace(0, reads.num_rows, 8).astype(int)
+    perm = np.random.default_rng(5).permutation(reads.num_rows)
+    for i, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:])):
+        pq.write_table(
+            reads.take(pa.array(perm[lo:hi])),
+            resharded / "reads" / f"part-{i:05d}.parquet",
+        )
+    import shutil
+
+    shutil.copytree(one / "read_demux", resharded / "read_demux")
+    a = write_corpus(one, tmp_path / "corpus_a", max_window_length=None)
+    c = write_corpus(resharded, tmp_path / "corpus_c", max_window_length=None)
+    assert a.n_reads == c.n_reads == len(kept)
+    assert _corpus_bytes(tmp_path / "corpus_a") == _corpus_bytes(tmp_path / "corpus_c")
+
+
+def test_a_read_with_two_windows_is_ordered_by_its_windows(tmp_path, monkeypatch):
+    """`read_id` is unique for every demux written today; a read whose demux
+    record carries several windows ties on it, and the window breaks the tie."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import (
+        corpus as corpus_mod,
+    )
+
+    rows = [
+        ("r1", "C" * 60, 0, 30.0),
+        ("r0", "G" * 60, 0, 30.0),
+        ("r2", "T" * 60, 0, 30.0),
+    ]
+    demux = _write_demux_dir(tmp_path, rows)
+    # A second, shorter window on r1 — "CCC…" twice, the second 40 long.
+    extra = pq.read_table(demux / "read_demux" / "part-00000.parquet").slice(0, 1)
+    extra = extra.set_column(
+        extra.schema.get_field_index("transcript_end"),
+        "transcript_end",
+        pa.array([10 + 40], pa.int32()),
+    )
+    pq.write_table(extra, demux / "read_demux" / "part-00001.parquet")
+    written = []
+    for seed in range(4):
+        monkeypatch.setattr(
+            corpus_mod, "_iter_demux_read_batches", _scrambled_reader(seed)
+        )
+        write_corpus(demux, tmp_path / f"c{seed}", max_window_length=None)
+        written.append(_corpus_bytes(tmp_path / f"c{seed}"))
+    assert len(set(written)) == 1
+    store = ReadStore.open(tmp_path / "c0" / "reads.arrow")
+    try:
+        got = list(zip(store.read_id.to_pylist(), store.sequence.to_pylist()))
+    finally:
+        store.close()
+    assert got == [
+        ("r0", "G" * 60),
+        ("r1", "C" * 40),
+        ("r1", "C" * 60),
+        ("r2", "T" * 60),
+    ]
+
+
+def test_the_written_order_is_checked_one_batch_at_a_time():
+    """On what is written, never against `reads/`: the check this replaces
+    loaded all 154M ids of the reads dataset into one string column and
+    overflowed its offsets at 9.4M reads."""
+    import inspect
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
+        _check_sorted,
+    )
+
+    assert list(inspect.signature(_check_sorted).parameters) == ["ids", "before"]
+    assert _check_sorted(pa.array(["a", "b", "b", "c"]), None) == "c"
+    assert _check_sorted(pa.array(["c", "d"]), "c") == "d"
+    assert _check_sorted(pa.array([], pa.string()), "x") == "x"
+    assert (
+        _check_sorted(pa.chunked_array([["a"], ["b"]], pa.large_string()), None) == "b"
+    )
+    with pytest.raises(RuntimeError, match="not in read_id order"):
+        _check_sorted(pa.array(["a", "c", "b"]), None)
+    with pytest.raises(RuntimeError, match="across a batch boundary"):
+        _check_sorted(pa.array(["b", "c"]), "c")

@@ -57,8 +57,6 @@ REFINED_NODE_TABLE: pa.Schema = pa.schema(
         pa.field("protein", pa.large_string(), nullable=True),
         pa.field("orf_start", pa.int32(), nullable=False),
         pa.field("orf_end", pa.int32(), nullable=False),
-        pa.field("orf_certified_end", pa.int32(), nullable=False),
-        pa.field("orf_truncated_by_support", pa.bool_(), nullable=False),
         pa.field("allele_string", pa.string(), nullable=True),
         pa.field("declared_variants", pa.list_(pa.int64()), nullable=False),
         pa.field("n_inserted_columns", pa.int32(), nullable=False),
@@ -127,8 +125,23 @@ class MStepParams:
     gamma: float = 0.6
     max_nodes: int = 8
     max_candidate_columns: int = 512
-    support_min_depth: float = 3.0
-    support_min_agreement: float = 0.6
+    #: The protein-annotation floor: `best_sense_orf` on each node's
+    #: consensus, at or above this many residues. 30, not 60: at 60 there
+    #: is no Prm1 (51 aa), the most abundant transcript in the tissue this
+    #: was built for. The ORF is an annotation — nothing in the loop reads
+    #: it — so the floor changes which proteins are REPORTED, never how a
+    #: template is split or what its consensus is. The round loop sets it
+    #: from `EmParams.min_aa_length`, the one source of truth.
+    min_aa_length: int = 30
+    #: Admit candidate columns for their covered read-set as well as for a
+    #: minor allele (`columns.candidate_columns`). OFF: every bench result
+    #: since 2026-09-23 was produced with the coverage route disabled — as
+    #: an env-gated patch (`EM_NO_COVERAGE_ROUTE=1`) that lived only on the
+    #: bench checkout until it became this field — and the merge, graph and
+    #: ORF decisions that followed were all measured under it. The A/B that
+    #: motivated it (`slurm/88`, `merge1M_260923` vs `nocov1M_260923`) was
+    #: never written up; its outputs are on the bench node.
+    coverage_route: bool = False
     overdispersion: float = 0.01
     eps_floor: float = 0.0
     min_extension_support: float | None = 3.0
@@ -145,8 +158,8 @@ class MStepParams:
             "gamma": self.gamma,
             "max_nodes": self.max_nodes,
             "max_candidate_columns": self.max_candidate_columns,
-            "support_min_depth": self.support_min_depth,
-            "support_min_agreement": self.support_min_agreement,
+            "min_aa_length": self.min_aa_length,
+            "coverage_route": self.coverage_route,
             "overdispersion": self.overdispersion,
             "eps_floor": self.eps_floor,
             "min_extension_support": self.min_extension_support,
@@ -387,13 +400,11 @@ def mstep_worker(
         )
         if not members:
             continue
-        orf = (int(store.orf_start[row]), int(store.orf_end[row]))
         try:
             nodes = refine_template(
                 store.sequence(row),
                 members,
                 template_id=int(store.template_id[row]),
-                seed_orf=orf,
                 n_assigned=float(sum(m.weight for m in members)),
                 error_model=error_model,
                 **params.kernel_kwargs(),
@@ -455,6 +466,49 @@ def mstep_worker(
     }
 
 
+def in_node_order(nodes: pa.Table) -> pa.Table:
+    """``nodes`` sorted by ``(parent_template_id, haplotype_id)``: the order
+    the next round's template ids are assigned in.
+
+    The shards are written unit by unit, and the units are a bin-packing of
+    the templates over ``--mstep-workers x 16``, so concatenated they stand
+    in an order that depends on the worker count. Template ids are row
+    positions (``template_id_for(round, row)``), and the claim order of the
+    merge, the set cover and the E-step's final tie-break all read them —
+    so the same nodes at two worker counts gave different ids, one different
+    merge in round 1 and 94,560 clusters against 94,556 (ledger #60). The
+    pair is unique within a round and known at emission, which makes it the
+    one order that is a property of the nodes alone. Membership rows are
+    keyed on the same pair and are sorted with :func:`in_membership_order`.
+    """
+    if nodes.num_rows < 2:
+        return nodes
+    return nodes.take(
+        pc.sort_indices(
+            nodes.select(["parent_template_id", "haplotype_id"]),
+            sort_keys=[("parent_template_id", "ascending"), ("haplotype_id", "ascending")],
+        )
+    )
+
+
+def in_membership_order(membership: pa.Table) -> pa.Table:
+    """``membership`` sorted by ``(parent_template_id, haplotype_id,
+    read_row)`` — see :func:`in_node_order`; this is what fixes the row order
+    of ``cluster_membership.parquet``."""
+    if membership.num_rows < 2:
+        return membership
+    return membership.take(
+        pc.sort_indices(
+            membership.select(["parent_template_id", "haplotype_id", "read_row"]),
+            sort_keys=[
+                ("parent_template_id", "ascending"),
+                ("haplotype_id", "ascending"),
+                ("read_row", "ascending"),
+            ],
+        )
+    )
+
+
 def _rows_to_membership(round_index, parent, hap, read, weight) -> pa.Table:
     if not parent:
         return NODE_MEMBERSHIP_TABLE.empty_table()
@@ -486,8 +540,6 @@ def _node_row(node, parent_row, round_index, n_members, fraction, n_reads) -> tu
         node.protein or None,
         int(node.orf_start),
         int(node.orf_end),
-        int(node.orf_certified_end),
-        bool(node.orf_is_truncated_by_support),
         node.allele_string,
         [int(v) for v in np.asarray(node.declared_variants).tolist()],
         int(node.n_inserted_columns),
@@ -574,6 +626,8 @@ __all__ = [
     "REFINED_NODE_TABLE",
     "MStepParams",
     "MStepUnit",
+    "in_membership_order",
+    "in_node_order",
     "iter_unit_batches",
     "mstep_worker",
     "plan_mstep_units",

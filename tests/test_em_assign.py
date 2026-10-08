@@ -30,11 +30,15 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.templates import (
 class _Reads:
     """The slice of ReadStore the reducer touches."""
 
-    def __init__(self, ids, samples=None):
+    def __init__(self, ids, samples=None, quality=None):
         self.read_id = pa.chunked_array([pa.array(ids, pa.string())])
         self.chunk_starts = np.array([0, len(ids)], dtype=np.int64)
         self.sample_id = np.asarray(
             samples if samples is not None else [0] * len(ids), dtype=np.int64
+        )
+        self.dorado_quality = np.asarray(
+            quality if quality is not None else [30.0] * len(ids),
+            dtype=np.float64,
         )
 
     def take_read_ids(self, rows):
@@ -361,3 +365,155 @@ def test_minimap2_flags_carry_the_load_bearing_options():
     # -N is NOT baked in: it is a per-run correctness parameter, since the
     # pool must contain every template within p_floor.
     assert "-N" not in flags
+
+
+# ── the per-read floor, and the record of why ─────────────────────────
+
+
+def test_floor_per_read_eases_with_quality_and_never_rises():
+    from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
+        floor_per_read,
+    )
+
+    q = np.array([30.0, 20.0, 13.0, np.nan, -1.0])
+    flat = floor_per_read(q, p_floor=0.97, quality_scale=None)
+    assert flat.tolist() == [0.97] * 5
+    eased = floor_per_read(q, p_floor=0.97, quality_scale=1.5)
+    assert eased[0] == 0.97, "Q30: 1 - 1.5e-3 is above the flat floor"
+    assert eased[1] == pytest.approx(0.985) or eased[1] == 0.97
+    assert eased[1] == 0.97, "min() with the flat floor: it never rises"
+    assert eased[2] == pytest.approx(1 - 1.5 * 10**-1.3)
+    assert eased[3] == 0.97 and eased[4] == 0.97, "no quality: flat"
+
+
+def test_the_minimap2_reducer_records_identity_and_the_reason():
+    """One clean read, one whose only hit is under the floor: the winner
+    carries its identity and length, the loser the best identity it had and
+    `below_floor`."""
+    seq = "ACGTACGTAC" * 20
+    store = _store([seq])
+    hb = scan_paf_block(
+        _paf(
+            [
+                _row(0, 0, n_match=198, aln_len=200, as_score=388, cigar="200="),
+                _row(1, 0, n_match=188, aln_len=200, as_score=328, cigar="200="),
+            ]
+        ),
+        n_templates=1,
+    )
+    batch = assign_block(hb, store=store, reads=_Reads(["a", "b"]), round_index=1)
+    got = batch.to_pylist()
+    assert got[0]["identity"] == pytest.approx(0.99)
+    assert got[0]["aligned_len"] == 200
+    assert got[0]["unassigned_reason"] is None
+    assert got[1]["template_id"] == -1
+    assert got[1]["identity"] == pytest.approx(0.94)
+    assert got[1]["aligned_len"] is None
+    assert got[1]["unassigned_reason"] == "below_floor"
+
+
+def test_the_minimap2_reducer_takes_a_per_read_floor():
+    """The same 0.94 hit: rejected at the flat floor, admitted once the
+    read's Q13 eases its own floor below it."""
+    seq = "ACGTACGTAC" * 20
+    store = _store([seq])
+    rows = [_row(0, 0, n_match=188, aln_len=200, as_score=328, cigar="200=")]
+    reads = _Reads(["a"], quality=[13.0])
+    flat = assign_block(
+        scan_paf_block(_paf(rows), n_templates=1),
+        store=store,
+        reads=reads,
+        round_index=1,
+    )
+    assert flat.to_pylist()[0]["template_id"] == -1
+    eased = assign_block(
+        scan_paf_block(_paf(rows), n_templates=1),
+        store=store,
+        reads=reads,
+        round_index=1,
+        p_floor_quality_scale=1.5,
+    )
+    assert eased.to_pylist()[0]["template_id"] == 100
+
+
+def test_the_minimap2_reducer_runs_round_one_on_the_band_rule_when_asked():
+    """Replication-first hands both reads to the 500-replication template;
+    the band rule keeps the read whose best match is 1.5 points better."""
+    seq = "ACGTACGTAC" * 20
+    store = _store([seq, seq], replication=[500, 5])
+    rows = [
+        _row(0, 0, n_match=195, aln_len=200, as_score=370, cigar="195=5X"),
+        _row(0, 1, n_match=198, aln_len=200, as_score=388, cigar="198=2X"),
+    ]
+    old = assign_block(
+        scan_paf_block(_paf(rows), n_templates=2),
+        store=store,
+        reads=_Reads(["r0"]),
+        round_index=1,
+    )
+    assert old.column("template_row").to_pylist() == [0]
+    new = assign_block(
+        scan_paf_block(_paf(rows), n_templates=2),
+        store=store,
+        reads=_Reads(["r0"]),
+        round_index=1,
+        round1_rule="identity_band",
+    )
+    assert new.column("template_row").to_pylist() == [1]
+    assert new.column("identity").to_pylist()[0] == pytest.approx(0.99)
+
+
+def test_round_one_measures_length_against_the_read_not_the_aligned_stretch():
+    """A local hit covering all of a short template is not a length match
+    for a read three times as long. With equal identity, replication and
+    seed quality inside the band, the template that explains the whole read
+    wins — the aligned length stood in for the read's once, and the two
+    tied (review of 91e7c69)."""
+    store = _store(["A" * 300, "A" * 1000], replication=[7, 7])
+    rows = [
+        _row(
+            0, 0, n_match=297, aln_len=300, as_score=560, cigar="297=3X",
+            q_len=1000, q_end=300, t_len=300, t_end=300,
+        ),
+        _row(
+            0, 1, n_match=990, aln_len=1000, as_score=1900, cigar="990=10X",
+            q_len=1000, q_end=1000, t_len=1000, t_end=1000,
+        ),
+    ]  # fmt: skip
+    out = assign_block(
+        scan_paf_block(_paf(rows), n_templates=2),
+        store=store,
+        reads=_Reads(["r0"]),
+        round_index=1,
+        round1_rule="identity_band",
+    )
+    assert out.column("template_row").to_pylist() == [1]
+    assert out.column("aligned_len").to_pylist() == [1000]
+
+
+def test_a_sliver_is_not_the_identity_an_unassigned_read_reports():
+    """The identity column of an unassigned read is what a floor is
+    calibrated from, so it reads only alignments that COUNTED. A sliver at
+    1.0 beside a counted 0.95 reports 0.95 / below_floor; slivers alone
+    report nothing / short_placement."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
+        _identity_columns,
+    )
+
+    n_match = np.array([5, 190, 3, 0], dtype=np.int64)
+    aln_len = np.array([5, 200, 3, 0], dtype=np.int64)
+    placed = np.array([False, True, False, False])
+    ptr = np.array([0, 2, 3, 4], dtype=np.int64)
+    has = np.zeros(3, dtype=bool)
+    ident, length, reason = _identity_columns(
+        has, np.zeros(3, dtype=np.int64), n_match, aln_len, ptr, placed=placed
+    )
+    assert ident.to_pylist() == [pytest.approx(0.95), None, None]
+    assert reason.to_pylist() == ["below_floor", "short_placement", "no_alignment"]
+    assert length.to_pylist() == [None, None, None]
+    # With no guard in play every produced alignment counts, as before.
+    ident, _, reason = _identity_columns(
+        has, np.zeros(3, dtype=np.int64), n_match, aln_len, ptr
+    )
+    assert ident.to_pylist() == [pytest.approx(1.0), pytest.approx(1.0), None]
+    assert reason.to_pylist() == ["below_floor", "below_floor", "no_alignment"]

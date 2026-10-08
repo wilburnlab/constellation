@@ -109,13 +109,26 @@ class PolyASlot(Segment):
     on antisense) required to call a polyA region. ``max_length``
     optionally caps how many A's are permitted before the run is
     rejected as a homopolymer artifact rather than a polyA tail
-    (NanoporeAnalysis caps at 40). ``edge_distance`` permits this many
-    edit operations at the boundaries (homopolymer error tolerance).
+    (NanoporeAnalysis caps at 40); it is judged on the tail's 3'-most
+    *uninterrupted* A-run, the one upstream would have called. ``edge_distance`` is the
+    number of non-A bases (basecall miscalls) a tail may be interrupted
+    by and still be called as one run.
+
+    ``residual_trim`` walks the tail's start 5'-ward through an A-rich
+    remnant the merge did not bridge: up to ``residual_max_gap`` non-A
+    bases are absorbed when ≥ ``residual_min_run`` A's lie beyond them,
+    for at most ``residual_max_walk`` bases. Without it a tail
+    fragmented by several miscalls leaves a random-length A-run at the
+    end of the transcript window.
     """
 
     min_length: int = 20
     max_length: int | None = None
-    edge_distance: int = 1
+    edge_distance: int = 2
+    residual_trim: bool = True
+    residual_max_gap: int = 2
+    residual_min_run: int = 3
+    residual_max_walk: int = 60
     kind: ClassVar[str] = "polyA"
 
 

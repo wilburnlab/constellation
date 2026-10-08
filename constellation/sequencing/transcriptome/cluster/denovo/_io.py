@@ -127,7 +127,20 @@ def load_demux_windows(
     }
     if not parts:
         return _READS_SCHEMA.empty_table(), stats
-    return pa.concat_tables(parts), stats
+    # By read_id, not in the order the demux join produced them: that order
+    # changes from call to call, and `dereplicate` numbers unique reads in
+    # first-occurrence order, which the anchor-star breaks ties on — so the
+    # clusters would too (ledger #59, #61). The same order as the EM corpus.
+    reads = pa.concat_tables(parts)
+    order = pc.sort_indices(
+        reads.select(["read_id", "sequence", "sample_id"]),
+        sort_keys=[
+            ("read_id", "ascending"),
+            ("sequence", "ascending"),
+            ("sample_id", "ascending"),
+        ],
+    )
+    return reads.take(order), stats
 
 
 def _write_fasta(path: Path, ids: list[str], seqs: list[str]) -> None:

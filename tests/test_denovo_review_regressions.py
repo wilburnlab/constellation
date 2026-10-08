@@ -35,7 +35,6 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.estep import (  # 
     assign_reads,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (  # noqa: E402
-    gated_orf,
     refine_template,
 )
 
@@ -152,10 +151,7 @@ def test_declared_variants_are_mapped_into_each_child_consensus():
     full, short, body = _split_fixture(rng)
     members = [_spec(short, short, i) for i in range(75)]
     members += [_spec(short, full, 75 + i) for i in range(25)]
-    nodes = refine_template(
-        short, members, min_node_reads=3,
-        seed_orf=(40, 40 + len(body)),
-    )
+    nodes = refine_template(short, members, min_node_reads=3)
     assert len(nodes) == 2
     by_reads = {n.n_reads: n for n in nodes}
     major, minor = by_reads[75], by_reads[25]
@@ -170,24 +166,7 @@ def test_declared_variants_are_mapped_into_each_child_consensus():
     assert minor.allele_string.count("=") < len(minor.allele_string)
 
 
-# ── #4 / #5 the support gate has two ends, in the child's coordinates ─
-
-
-def test_upstream_start_through_unsupported_sequence_is_gated():
-    """An upstream ATG can extend a protein through uncovered flank while
-    sharing the seed's stop — the 3'-only gate never sees it."""
-    # Two in-frame starts sharing one stop: an upstream one sitting in
-    # uncovered flank, and a supported one 30 nt in.
-    consensus = "ATG" + "GCT" * 9 + "ATG" + "GCT" * 90 + "TAA"
-    certified = np.ones(len(consensus), dtype=bool)
-    certified[:30] = False  # the first 10 codons are one read's sequence
-    prot, st, en, _cert, truncated = gated_orf(
-        consensus, certified, seed_orf_start=30, seed_orf_end=len(consensus),
-    )
-    assert truncated is True, "an uncertified upstream start must be refused"
-    assert st == 30, "the ORF must restart at the supported ATG"
-    assert consensus[st : st + 3] == "ATG"
-    assert en == len(consensus), "it still runs to the shared stop"
+# ── #5 each child reports its ORF in its own coordinates ─────────────
 
 
 def test_each_child_reports_its_orf_in_its_own_coordinates():
@@ -196,10 +175,9 @@ def test_each_child_reports_its_orf_in_its_own_coordinates():
 
     Unlike the others here this pins the post-fix invariant rather than
     reproducing the pre-fix failure: children are now built on the *pooled*
-    column plan and the seed boundary is mapped per child, so the drift this
-    guards against is no longer expressible through the public API (the old
-    signature took a bare consensus position, which a caller could only get
-    right for one child).
+    column plan, so the drift this guards against is no longer expressible
+    through the public API (the old signature took a bare consensus position,
+    which a caller could only get right for one child).
     """
     rng = np.random.default_rng(31)
     body = "ATG" + "".join(rng.choice(_CODONS) for _ in range(120)) + "TAA"
@@ -209,10 +187,7 @@ def test_each_child_reports_its_orf_in_its_own_coordinates():
     trimmed = frame[:10] + frame[40:]
     members = [_spec(frame, trimmed, i) for i in range(70)]
     members += [_spec(frame, frame, 70 + i) for i in range(30)]
-    nodes = refine_template(
-        frame, members, min_node_reads=3,
-        seed_orf=(60, 60 + len(body)),
-    )
+    nodes = refine_template(frame, members, min_node_reads=3)
     assert len(nodes) >= 2, "the two length classes must separate"
     lengths = {len(n.consensus) for n in nodes}
     assert len(lengths) > 1, "the children must actually differ in length"

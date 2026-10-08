@@ -21,6 +21,13 @@ open, not to tour the outputs:
 * **Reference and ORF length per round** is the instrumentation for the
   deferred ledger #42 question (whether the covariance M-step over-trims
   ORFs, or whether that was an artifact the admission floor removes).
+* **Template relationships** reports how each round's nodes relate — the same
+  transcript within an end tolerance, or one contained in another — and what
+  the merge predicate would collapse. It is read from the graph's own
+  ``stats.json``, never from the edges, and it counts what is there AFTER a
+  merge. The section it replaces flagged the pre-merge redundancy of a
+  cluster table that had already been merged, and called templates differing
+  at positions the M-step had separated reads on "redundant".
 """
 
 from __future__ import annotations
@@ -372,6 +379,238 @@ def section_cluster_sizes(em_dir: Path) -> ReportSection:
     return ReportSection(title="Cluster sizes", body=body, flags=flags)
 
 
+def _json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _resplit_survivors(rd: Path, next_rd: Path | None) -> int | None:
+    """Survivors of round ``rd``'s merge that the NEXT M-step split again.
+
+    The M-step clusters span endpoints within 10 nt and the merge tolerance
+    is 30, so two templates merged on an extent difference in between can be
+    re-separated one round later. This is the count that shows it.
+    """
+    merged = rd / "merged.parquet"
+    if next_rd is None or not merged.exists():
+        return None
+    survivors = pq.read_table(merged, columns=["survivor_template_id"]).column(0)
+    if len(survivors) == 0:
+        return 0
+    files = sorted((next_rd / "mstep" / "nodes").glob("part-*.parquet"))
+    if not files:
+        return None
+    parents = pa_ds.dataset(files).to_table(columns=["parent_template_id"]).column(0)
+    ids, counts = np.unique(
+        parents.to_numpy(zero_copy_only=False), return_counts=True
+    )
+    split = ids[counts > 1]
+    return int(np.isin(np.unique(survivors.to_numpy(zero_copy_only=False)), split).sum())
+
+
+def section_template_graph(em_dir: Path) -> ReportSection:
+    """How each round's nodes relate, and what the merge did about it.
+
+    ``equivalent`` is a statement of similarity, not of redundancy: below
+    identity 1 the two templates differ at positions the M-step separated
+    reads on. "Redundant" is kept for byte-identical twins, which reads
+    cannot tell apart.
+
+    A round's graph is shown only if the record of that round says this run
+    built it: a directory extended under other settings can still hold a
+    graph from before.
+    """
+    title = "Template relationships"
+    rounds = _rounds(em_dir)
+    if not rounds:
+        return ReportSection(title=title, body="_no completed rounds_")
+
+    final_r, final_d = rounds[-1]
+    final = _json(final_d / "final.json")
+
+    rows, flags, notes = [], [], []
+    modes: set[str] = set()
+    last_graph: dict | None = None
+    for i, (r, d) in enumerate(rounds):
+        record = _json(d / "refine.json")
+        if record is None and d == final_d:
+            record = final
+        if record is None:
+            if (d / "merge" / "stats.json").exists():
+                notes.append(
+                    f"r{r}: run with the minimap2 redundancy scan this version "
+                    f"removed; its `merge/` record is not comparable and is "
+                    f"not shown"
+                )
+            continue
+        modes.add(str(record.get("template_graph")))
+        if record.get("graph") == "failed":
+            notes.append(
+                f"r{r}: the template graph failed "
+                f"({record.get('graph_error', 'no reason recorded')}); "
+                f"nothing depended on it"
+            )
+        st = _json(d / "graph" / "stats.json")
+        if record.get("graph") != "ok" or st is None:
+            continue
+        last_graph = st
+        merged = int(record.get("n_merged", 0))
+        # Between rounds what is left is the record's; the final round's is
+        # counted over the clusters and reported on the line below.
+        still = record.get("n_still_mergeable", st.get("n_mergeable", 0))
+        nxt = rounds[i + 1][1] if i + 1 < len(rounds) else None
+        resplit = _resplit_survivors(d, nxt) if merged else None
+        contained = st.get("contained", {})
+        rows.append(
+            f"| r{r} | {st.get('n_sequences', 0):,} | {st.get('n_equivalent', 0):,} "
+            f"| {st.get('n_exact_twins', 0):,} | {st.get('n_same_split_origin', 0):,} "
+            f"| {contained.get('5p', 0):,} / {contained.get('3p', 0):,} / "
+            f"{contained.get('both', 0):,} | {st.get('n_exact_nested', 0):,} "
+            f"| {st.get('n_mergeable', 0):,} | {merged:,} | {int(still):,} "
+            f"| {'—' if resplit is None else f'{resplit:,}'} "
+            f"| {st.get('seconds', {}).get('total', 0):,.1f} |"
+        )
+        hit = st.get("n_overflow_templates", 0) + st.get("n_truncated_templates", 0)
+        if hit:
+            n = max(int(st.get("n_sequences", 0)), 1)
+            flags.append(
+                f"r{r}: {hit:,} templates ({hit / n:.1%}) hit a candidate cap "
+                f"({st.get('n_overflow_templates', 0):,} in minimizer buckets "
+                f"above the cap, {st.get('n_truncated_templates', 0):,} with "
+                f"more candidates than are kept) — their edge lists are "
+                f"incomplete"
+            )
+        kin = int(record.get("n_merged_kin", 0))
+        if kin:
+            flags.append(
+                f"r{r}: {kin:,} of {merged:,} merges rejoined templates an "
+                f"M-step split had separated (--merge-siblings) — the "
+                f"split/merge cycle measured on 2026-09-24"
+            )
+
+    parts = []
+    if rows:
+        parts.append(
+            "\n".join(
+                [
+                    "| nodes of | nodes | equivalent | exact twins | same split "
+                    "| contained 5' / 3' / both | exact nested | mergeable "
+                    "| merged | still mergeable | re-split next round | graph s |",
+                    "|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|",
+                    *rows,
+                ]
+            )
+        )
+        parts.append(
+            "_Counts are edges of that round's nodes, before its merge. "
+            "`equivalent`: same extent within the end tolerance. `exact "
+            "twins`: byte-identical. `same split`: equivalent pairs an M-step "
+            "split separated. `exact nested`: contained at zero edits. "
+            "`mergeable`: what the run's merge predicate accepts, whether or "
+            "not the run merges; `still mergeable`: those of them whose two "
+            "templates were both still there afterwards. `re-split`: "
+            "survivors of the merge that the next M-step split again._"
+        )
+    elif modes and modes <= {"off"}:
+        parts.append("_template graph disabled (`--template-graph off`)_")
+    elif modes and modes <= {"final", "off"} and final is None:
+        parts.append(
+            "_the template graph is built for the final round only "
+            "(`--template-graph final`), and this run has not reached it_"
+        )
+    elif not notes:
+        parts.append("_no template graph was built_")
+
+    if final is not None and rows:
+        if final.get("template_graph") == "off":
+            parts.append("Final output: template graph disabled (`--template-graph off`).")
+        elif final.get("graph") == "failed":
+            parts.append(
+                f"Final output: the template graph failed "
+                f"({final.get('graph_error', 'no reason recorded')}); the "
+                f"clusters are unaffected and `cluster_edges.parquet` was not "
+                f"written."
+            )
+        elif final.get("cluster_edges_error"):
+            parts.append(
+                f"Final output: `cluster_edges.parquet` could not be written "
+                f"({final['cluster_edges_error']}); the clusters are "
+                f"unaffected."
+            )
+        elif final.get("graph") == "ok":
+            n_clusters = int(final.get("n_clusters", 0))
+            twins = int(final.get("n_twin_clusters", 0))
+            rebuilt = ""
+            if final.get("rebuild") == "ok":
+                rebuilt = (
+                    f" The {final.get('n_rebuilt', 0):,} merged survivors were "
+                    f"rebuilt from their pooled reads"
+                    + (
+                        f" ({final['n_rebuild_failed']:,} kept their own "
+                        f"consensus, nothing placed)"
+                        if final.get("n_rebuild_failed")
+                        else ""
+                    )
+                    + "."
+                )
+            elif final.get("merge_applied") and final.get("n_merged"):
+                rebuilt = f" Survivors were not rebuilt: {final.get('rebuild')}."
+            if final.get("cluster_edges_source") == "final_clusters":
+                # The round's row above is the graph the merge READ; these
+                # counts are of the clusters as written.
+                rebuilt += (
+                    " The edges counted here were measured again on the "
+                    "clusters as written (`graph_final/`), since the round's "
+                    "graph describes the consensus sequences the rebuild "
+                    "replaced."
+                )
+            parts.append(
+                f"**Final output (r{final_r})**: {final.get('n_nodes', 0):,} "
+                f"nodes → **{n_clusters:,} clusters** "
+                f"({final.get('n_merged', 0):,} merged), "
+                f"{final.get('n_cluster_edges', 0):,} edges between them; "
+                f"{final.get('n_still_mergeable', 0):,} still accepted by the "
+                f"merge predicate, {twins:,} clusters byte-identical to "
+                f"another.{rebuilt}"
+            )
+            if final.get("rebuild") == "ok" and final.get("n_rebuild_failed"):
+                flags.append(
+                    f"final output: {final['n_rebuild_failed']:,} merged "
+                    f"survivors could not be rebuilt from their reads and kept "
+                    f"their own consensus"
+                )
+            if n_clusters and twins / n_clusters > 0.05:
+                flags.append(
+                    f"final output: {twins:,} clusters ({twins / n_clusters:.1%}) "
+                    f"are byte-identical to another cluster, so their reads "
+                    f"are split across identical references; `--merge` "
+                    f"collapses them"
+                )
+    if last_graph is not None:
+        hist = last_graph.get("n_edits_hist") or {}
+        dropped = last_graph.get("dropped") or {}
+        if hist:
+            parts.append(
+                "Edits over the shared span, `equivalent` edges of the last "
+                "graph:\n\n| edits | edges |\n|---|---:|\n"
+                + "\n".join(f"| {k} | {v:,} |" for k, v in hist.items())
+            )
+        if dropped:
+            parts.append(
+                "Candidate pairs that are not edges, last graph. A pair over "
+                "the edit budget is aligned without a trace, so an "
+                "alternative end on a short template is counted "
+                "`below_floor` and the same end on a long one "
+                "`divergent`:\n\n| reason | pairs |\n|---|---:|\n"
+                + "\n".join(f"| {k} | {v:,} |" for k, v in dropped.items())
+            )
+    if notes:
+        parts.append("\n".join(f"- {n}" for n in notes))
+    return ReportSection(title=title, body="\n\n".join(parts), flags=flags)
+
+
 def build_em_report(em_dir: Path) -> Path:
     """Assemble the EM diagnostics report under ``diagnostics/report.md``."""
     from constellation.sequencing._render import render_report
@@ -384,6 +623,7 @@ def build_em_report(em_dir: Path) -> Path:
         section_seeding,
         section_convergence,
         section_candidate_pool,
+        section_template_graph,
         section_assignment_rule,
         section_reference_drift,
         section_cluster_sizes,
@@ -418,4 +658,5 @@ __all__ = [
     "section_convergence",
     "section_reference_drift",
     "section_seeding",
+    "section_template_graph",
 ]

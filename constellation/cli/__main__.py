@@ -1289,8 +1289,9 @@ def _build_transcriptome_parser(subs) -> None:
         "--rounds",
         type=int,
         default=6,
-        help="em: EM rounds. Merging is exhausted by round 3 in the bench, so "
-        "budget is better spent on rounds 1-3 plus the fixes.",
+        help="em: EM rounds to run. On --resume this is how many MORE. At "
+        "9.4M reads the templates stopped changing at round 6 (reference "
+        "length, ORF length and fidelity flat from 6 to 12).",
     )
     p_cluster.add_argument(
         "--stop-frac-changed",
@@ -1317,6 +1318,179 @@ def _build_transcriptome_parser(subs) -> None:
         "minimap2 truncates by score, so a truncated pool means the "
         "ranking arbitrated over an arbitrary subset. Raise it if the "
         "saturation warning fires.",
+    )
+    p_cluster.add_argument(
+        "--template-graph",
+        choices=("rounds", "final", "off"),
+        default=None,
+        help="em: relate the templates to each other after the M-step — which "
+        "are the same transcript within an end tolerance (`equivalent`), which "
+        "are contained in which (`contained`) — by kmer candidates and two "
+        "edlib infix alignments per pair. 'rounds' (default) does it for every "
+        "round's nodes and writes rounds/rNN/graph/edges.parquet plus "
+        "cluster_edges.parquet; 'final' only for the last round's; 'off' runs "
+        "nothing at all after the M-step. A report: nothing is collapsed "
+        "unless --merge is passed.",
+    )
+    p_cluster.add_argument(
+        "--merge",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="em: collapse the pairs the merge predicate accepts, between "
+        "rounds and in the final output (default: --merge, unless "
+        "--template-graph off). Between rounds the deepest member survives "
+        "and the next M-step rebuilds its consensus; in the final output the "
+        "deepest survives too, and its consensus is rebuilt here from the "
+        "pooled reads of the group before its ORF is called. Measured on "
+        "9.4M reads: protein recovery flat against --no-merge, node growth "
+        "between rounds nearly stopped.",
+    )
+    p_cluster.add_argument(
+        "--merge-max-edits",
+        type=int,
+        default=None,
+        help="em: a pair is mergeable only within this many edits over the "
+        "span the two share (default 2). An absolute count like the end "
+        "tolerances — a fraction lets two differences through above 2 kb and "
+        "blocks them below. 2 is the conservative point of a 1-6 sweep: "
+        "substitutions carry alleles, so a larger cap wants to be edit-type-"
+        "aware rather than a bigger number. The graph's edit budget follows "
+        "it (min_budget = max(3, this)), so the identity floor can never "
+        "block a merge the cap allows. Defines the `mergeable` column whether "
+        "or not the run merges.",
+    )
+    p_cluster.add_argument(
+        "--merge-5p-tolerance",
+        type=int,
+        default=None,
+        help="em: nt by which a mergeable pair's 5' ends may differ (default: "
+        "--graph-5p-tolerance, which it may not exceed).",
+    )
+    p_cluster.add_argument(
+        "--merge-3p-tolerance",
+        type=int,
+        default=None,
+        help="em: nt by which a mergeable pair's 3' ends may differ (default: "
+        "--graph-3p-tolerance, which it may not exceed).",
+    )
+    p_cluster.add_argument(
+        "--merge-min-reads",
+        type=int,
+        default=None,
+        help="em: a pair is mergeable only if both templates hold at least "
+        "this many reads (default 0: no depth gate).",
+    )
+    p_cluster.add_argument(
+        "--merge-siblings",
+        action="store_true",
+        help="em: let templates an M-step split apart be merged again. Off by "
+        "default: 51.6%% of the old merge's pairs were exactly that, a "
+        "split/merge cycle moving ~7.5%% of reads a round. Byte-identical "
+        "templates are mergeable either way.",
+    )
+    p_cluster.add_argument(
+        "--merge-from-round",
+        type=int,
+        default=None,
+        help="em, --merge only: merge after rounds >= this (default 1: every "
+        "round).",
+    )
+    p_cluster.add_argument(
+        "--graph-identity-floor",
+        type=float,
+        default=None,
+        help="em: a pair is an edge only at or above this identity over the "
+        "span the two share (default 0.99).",
+    )
+    p_cluster.add_argument(
+        "--graph-5p-tolerance",
+        type=int,
+        default=None,
+        help="em: two templates are `equivalent` when neither reaches more "
+        "than this many nt beyond the other at the 5' end (default 30; "
+        "min(30, length // 10) below 300 nt).",
+    )
+    p_cluster.add_argument(
+        "--graph-3p-tolerance",
+        type=int,
+        default=None,
+        help="em: the same at the 3' end (default 30).",
+    )
+    # Removed. Kept so that passing one says what replaced it, which
+    # argparse's "unrecognized arguments" would not.
+    p_cluster.add_argument(
+        "--p-merge", type=float, default=None, help=argparse.SUPPRESS
+    )
+    p_cluster.add_argument(
+        "--merge-min-coverage", type=float, default=None, help=argparse.SUPPRESS
+    )
+    p_cluster.add_argument(
+        "--estep-aligner",
+        choices=("minimap2", "edlib", "native"),
+        default="minimap2",
+        help="em: the E-step's base aligner. 'minimap2' (default) base-aligns "
+        "every candidate with minimap2 -c. 'edlib' is the two-pass path: "
+        "minimap2 without -c shortlists on chaining score, and only the "
+        "shortlist is base-aligned with edlib (~67%% of E-step wall time "
+        "was -c). 'native' replaces the candidate SOURCE as well: "
+        "Constellation's own minimizer join supplies the candidates with no "
+        "minimap2 anywhere — minimap2 masks high-frequency minimizers as "
+        "repeats, and here those are usually near-duplicate templates the "
+        "loop has not consolidated yet, exactly what the E-step must see. "
+        "Alignment, admission and ranking are the edlib path's, unchanged. "
+        "Both are opt-in until their operating points are measured.",
+    )
+    p_cluster.add_argument(
+        "--estep-shortlist-k",
+        type=int,
+        default=None,
+        help="em, --estep-aligner edlib/native only: at most this many "
+        "candidates per read are base-aligned, by the shortlist key "
+        "(chaining score under edlib, shared probes under native), ties to "
+        "the better-supported template so dense templates absorb reads "
+        "rather than fragment them (default 32). Each read's "
+        "`shortlist_truncated` reports whether the cut could have changed "
+        "its answer.",
+    )
+    p_cluster.add_argument(
+        "--estep-shortlist-frac",
+        type=float,
+        default=None,
+        help="em, --estep-aligner edlib/native only: a candidate is "
+        "shortlisted only if its shortlist key is at least this fraction of "
+        "the read's best (default 0.8). UNMEASURED operating point.",
+    )
+    p_cluster.add_argument(
+        "--estep-align-workers",
+        type=int,
+        default=None,
+        help="em, --estep-aligner edlib/native only: processes base-aligning "
+        "the shortlist (default --threads). Under edlib they run "
+        "concurrently with minimap2's chaining; under native they run the "
+        "candidate join too.",
+    )
+    p_cluster.add_argument(
+        "--estep-probes-per-read",
+        type=int,
+        default=None,
+        help="em, --estep-aligner native only: probes per read in the "
+        "candidate join, one per position stratum (default 32). Also the "
+        "resolution of the shortlist key — shared probes cannot exceed it — "
+        "so raising it is what lets the shortlist discriminate inside a "
+        "deep family. Stamped: a resume under a different value is refused.",
+    )
+    p_cluster.add_argument(
+        "--p-floor-quality-scale",
+        type=float,
+        default=None,
+        help="em: let each read's admission floor ease with its own quality "
+        "— min(--p-floor, 1 - SCALE * 10^(-Q/10)), so a read may miss its "
+        "template by SCALE times its expected error rate before it is "
+        "rejected. Unset (the default) every read is held to the flat "
+        "--p-floor, under which a below-Q20 read cannot clear 0.97 against "
+        "ANY template. UNCALIBRATED: run flat once — the E-step records "
+        "every read's identity beside its quality — then set the scale from "
+        "that run's data. A read with no quality keeps the flat floor.",
     )
     p_cluster.add_argument(
         "--index-batch-size",
@@ -1403,6 +1577,16 @@ def _build_transcriptome_parser(subs) -> None:
         type=int,
         default=0,
         help="em: M-step pool size (0 = --threads).",
+    )
+    p_cluster.add_argument(
+        "--coverage-route",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="em: let the M-step admit a candidate column for its covered "
+        "read-set — an alternative start or end — as well as for a minor "
+        "allele (default: --no-coverage-route). Off is the operating point "
+        "every bench result since 2026-09-23 was measured at; with it the "
+        "templates split on alleles and never on extent.",
     )
     # ── kmer (--mode kmer) flags ────────────────────────────────────
     # The read-to-read gate. Shared by --mode kmer and --mode em-kmer, whose
@@ -1586,13 +1770,14 @@ def _build_transcriptome_parser(subs) -> None:
         type=int,
         default=None,
         help=(
-            "minimum ORF length (AA). **em-orf**: the SEEDING key — a "
-            "template exists because a distinct ORF of at least this length "
-            "did — default 30 (60 cannot seed Prm1, 51 aa, the most abundant "
-            "transcript in mouse testis). **kmer**: the protein-annotation "
-            "floor on each consensus, default 60. **em-kmer**: not used — "
-            "that seeder predicts no ORF, and the EM's M-step has no minimum "
-            "protein length in either mode."
+            "minimum ORF length (AA). **em-***: the protein-annotation floor "
+            "on every node's consensus, default 30 (60 cannot report Prm1, "
+            "51 aa, the most abundant transcript in mouse testis) — and under "
+            "em-orf also the SEEDING key, since there a template exists "
+            "because a distinct ORF of at least this length did. The ORF is "
+            "an annotation: nothing in the loop reads it, so the floor "
+            "changes what is reported, never how a template is split. "
+            "**kmer**: the same floor on each consensus, default 60."
         ),
     )
     p_cluster.add_argument(
@@ -2011,6 +2196,7 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         write_demux_manifest,
     )
     from constellation.sequencing.transcriptome.stages import (
+        DemuxResumeError,
         run_demux_pipeline,
     )
 
@@ -2037,19 +2223,24 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
 
     cb = StreamProgress() if args.progress else NullProgress()
 
-    artefacts = run_demux_pipeline(
-        pipeline_inputs,
-        library_design=args.library_design,
-        samples=samples,
-        output_dir=output_dir,
-        batch_size=args.batch_size,
-        n_workers=args.threads,
-        min_aa_length=args.min_aa_length,
-        min_protein_count=args.min_protein_count,
-        progress_cb=cb,
-        resume=args.resume,
-        emit_fastq=args.emit_fastq,
-    )
+    try:
+        artefacts = run_demux_pipeline(
+            pipeline_inputs,
+            library_design=args.library_design,
+            samples=samples,
+            output_dir=output_dir,
+            batch_size=args.batch_size,
+            n_workers=args.threads,
+            min_aa_length=args.min_aa_length,
+            min_protein_count=args.min_protein_count,
+            progress_cb=cb,
+            resume=args.resume,
+            emit_fastq=args.emit_fastq,
+        )
+    except DemuxResumeError as exc:
+        # The directory holds another run's shards; nothing was touched.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     n_reads = artefacts["n_reads"]
     quant_table = artefacts["quant_table"]
@@ -2071,13 +2262,18 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
     if fastq_dir is not None:
         outputs["fastq_dir"] = str(fastq_dir)
 
+    # What is TRUE of the outputs, not what this invocation asked for: under
+    # --resume over a directory from before the poly-A fix the shards were
+    # reused, and stamping them `polyA_merge = "gap"` here claimed a
+    # trimming they never had (review of 91e7c69).
+    settings = dict(artefacts["settings"])
+    library_design = settings.pop("library_design")
     parameters: dict[str, object] = {
-        "min_aa_length": args.min_aa_length,
-        "min_protein_count": args.min_protein_count,
         "n_workers": args.threads,
         "batch_size": args.batch_size,
         "resumed": args.resume,
         "emit_fastq": args.emit_fastq,
+        **settings,
     }
     stages: dict[str, object] = {
         "n_reads": n_reads,
@@ -2094,7 +2290,7 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         output_dir / "manifest.json",
         input_files=[str(f) for f in input_files],
         acquisition_map={str(f): aid for f, aid in pipeline_inputs},
-        library_design=args.library_design,
+        library_design=library_design,
         parameters=parameters,
         stages=stages,
         outputs=outputs,
@@ -3424,12 +3620,34 @@ def _em_seeding(mode: str) -> str:
     return _EM_SEEDING.get(mode, "orf")
 
 
+#: Flags of the merge this version removed, and what to say when one is
+#: passed. Keyed by argparse dest.
+_REMOVED_CLUSTER_FLAGS = {
+    "p_merge": (
+        "--p-merge was removed: identity is no longer measured on a local "
+        "alignment, and a fraction is length-dependent. Use --merge-max-edits "
+        "(edits over the shared span; default 0) with --merge."
+    ),
+    "merge_min_coverage": (
+        "--merge-min-coverage was removed: end tolerance is in nucleotides "
+        "now, not a proportion. Use --merge-5p-tolerance / "
+        "--merge-3p-tolerance (default 30 / 30)."
+    ),
+}
+
+
 def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
     """A flag that does nothing under this mode is an error, not a no-op.
 
     Silently ignoring `--fold-identity` under kmer seeding means a swept
     parameter had no effect and the run looks like evidence about it.
     """
+    # Removed flags first, and in every mode: what they meant is gone, so
+    # "this mode does not use it" would be the wrong thing to say.
+    for dest, message in _REMOVED_CLUSTER_FLAGS.items():
+        if getattr(args, dest, None) is not None:
+            return message
+
     em = mode == "em"
     banned: list[tuple[str, bool, str]] = [
         # (flag, is-set, what to use instead)
@@ -3454,17 +3672,129 @@ def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
             "--identity (the read-to-read gate)",
         ),
         (
-            "--min-aa-length",
-            args.min_aa_length is not None and em and seeding == "kmer",
-            "nothing — kmer seeding predicts no ORF and the M-step has no "
-            "minimum protein length, so this would have no effect",
+            "--coverage-route" if args.coverage_route else "--no-coverage-route",
+            args.coverage_route is not None and not em,
+            "nothing — only the --mode em-* M-step has a coverage route",
         ),
         (
             "--seed-grouping",
             args.seed_grouping != "components" and not (em and seeding == "kmer"),
             "nothing — only --mode em-kmer groups reads into seed clusters",
         ),
+        (
+            "--estep-aligner",
+            args.estep_aligner != "minimap2" and not em,
+            "nothing — only the --mode em-* E-step has an aligner choice",
+        ),
+        (
+            "--p-floor-quality-scale",
+            args.p_floor_quality_scale is not None and not em,
+            "nothing — only the --mode em-* E-step admits on a floor",
+        ),
+        (
+            "--estep-probes-per-read",
+            args.estep_probes_per_read is not None
+            and not (em and args.estep_aligner == "native"),
+            "--estep-aligner native, whose candidate join is what chooses "
+            "the probes",
+        ),
     ]
+    graph_mode = "rounds" if args.template_graph is None else args.template_graph
+    graph_on = em and graph_mode != "off"
+    # Merge is on by default wherever there is a graph; `--template-graph
+    # off` with neither spelling of --merge is the one case that resolves
+    # it off, since there is nothing to merge on.
+    merging = em and (args.merge is True or (args.merge is None and graph_on))
+    if args.merge is True and graph_mode == "off":
+        return (
+            "--merge needs the template graph, and --template-graph off runs "
+            "nothing after the M-step. Drop one of them."
+        )
+    banned.append(
+        (
+            "--template-graph",
+            args.template_graph is not None and not em,
+            "nothing — only the --mode em-* loop relates its templates",
+        )
+    )
+    banned.append(
+        (
+            "--merge" if args.merge else "--no-merge",
+            args.merge is not None and not em,
+            "nothing — only the --mode em-* loop merges templates",
+        )
+    )
+    for flag in (
+        "--graph-identity-floor",
+        "--graph-5p-tolerance",
+        "--graph-3p-tolerance",
+    ):
+        banned.append(
+            (
+                flag,
+                getattr(args, flag[2:].replace("-", "_")) is not None
+                and not graph_on,
+                "--mode em-* with the template graph on, which is the only "
+                "thing that reads it",
+            )
+        )
+    # The predicate defines the `mergeable` column of the graph whether or
+    # not the run merges, so its knobs act whenever there is a graph.
+    for flag in (
+        "--merge-max-edits",
+        "--merge-5p-tolerance",
+        "--merge-3p-tolerance",
+        "--merge-min-reads",
+    ):
+        banned.append(
+            (
+                flag,
+                getattr(args, flag[2:].replace("-", "_")) is not None
+                and not graph_on,
+                "--mode em-* with the template graph on: it defines which "
+                "edges are `mergeable`",
+            )
+        )
+    banned.append(
+        (
+            "--merge-siblings",
+            args.merge_siblings and not graph_on,
+            "--mode em-* with the template graph on: it defines which edges "
+            "are `mergeable`",
+        )
+    )
+    banned.append(
+        (
+            "--merge-from-round",
+            args.merge_from_round is not None and not merging,
+            "--merge; it only schedules merging",
+        )
+    )
+    if merging and graph_mode == "final":
+        # No graph between rounds, so only the final output merges.
+        banned.append(
+            (
+                "--merge-from-round",
+                args.merge_from_round is not None,
+                "--template-graph rounds; under 'final' only the final "
+                "output merges",
+            )
+        )
+    two_pass = em and args.estep_aligner in ("edlib", "native")
+    for flag in (
+        "--estep-shortlist-k",
+        "--estep-shortlist-frac",
+        "--estep-align-workers",
+    ):
+        banned.append(
+            (
+                flag,
+                getattr(args, flag[2:].replace("-", "_")) is not None
+                and not two_pass,
+                "--estep-aligner edlib or native, the two E-steps with a "
+                "shortlist",
+            )
+        )
     for flag, is_set, instead in banned:
         if is_set:
             return f"--mode {args.mode} does not use {flag}; use {instead}."
@@ -3475,6 +3805,9 @@ def _cmd_transcriptome_cluster_em(
     args: argparse.Namespace, *, seeding: str = "orf"
 ) -> int:
     """`transcriptome cluster --mode em-{orf,kmer}` — the iterative EM clusterer."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.graph import (
+        GraphParams,
+    )
     from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
         MStepParams,
     )
@@ -3483,11 +3816,6 @@ def _cmd_transcriptome_cluster_em(
         run_em,
     )
     from constellation.sequencing.transcriptome.cluster.denovo.em.seed_kmer import (
-        DEFAULT_MAX_CLUSTER_READ_FRAC,
-        DEFAULT_MIN_CHAIN_CLUSTER_READS,
-        DEFAULT_SEED_IDENTITY,
-        DEFAULT_SEED_MAX_3P,
-        DEFAULT_SEED_MAX_5P,
         ChainedClusterError,
     )
 
@@ -3515,21 +3843,134 @@ def _cmd_transcriptome_cluster_em(
         if args.progress
         else None
     )
-    params = EmParams(
+    try:
+        params = _em_params(args, seeding, EmParams, GraphParams, MStepParams)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        results = run_em(
+            demux_dir, output_dir, params=params, resume=args.resume, progress=log
+        )
+    except ChainedClusterError as exc:
+        # A seeding failure is a parameter problem the user can fix, not a
+        # crash: print the guidance the exception carries and exit 2.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        # The resume stamp mismatch, and the policy refusals, land here.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not results:
+        print("no clusters were produced", file=sys.stderr)
+        return 1
+    (output_dir / "_SUCCESS").write_bytes(b"")
+    last = results[-1]
+    # Counted from what was written: a final merge makes it fewer than the
+    # last round's nodes.
+    import pyarrow.parquet as pq
+
+    clusters = output_dir / "clusters.parquet"
+    n_clusters = (
+        pq.read_metadata(clusters).num_rows if clusters.exists() else last.n_nodes
+    )
+    print(
+        f"{len(results)} round(s); {n_clusters:,} clusters over "
+        f"{last.estep.get('n_assigned', 0):,} assigned reads "
+        f"({last.estep.get('n_unassigned', 0):,} unassigned)"
+    )
+    return 0
+
+
+def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
+    """`EmParams` from the parsed flags, every `None` resolved for this mode.
+
+    The classes are passed in because the handler imports them lazily — the
+    CLI must not import the clusterer to print `--help`.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.seed_kmer import (
+        DEFAULT_MAX_CLUSTER_READ_FRAC,
+        DEFAULT_MIN_CHAIN_CLUSTER_READS,
+        DEFAULT_SEED_IDENTITY,
+        DEFAULT_SEED_MAX_3P,
+        DEFAULT_SEED_MAX_5P,
+    )
+
+    return EmParams(
         seeding=seeding,
         rounds=int(args.rounds),
         stop_frac_changed=float(args.stop_frac_changed),
         p_floor=float(args.p_floor),
         minimap2_n=int(args.minimap2_n),
         index_batch_size=str(args.index_batch_size),
+        estep_aligner=str(args.estep_aligner),
+        estep_shortlist_k=(
+            32 if args.estep_shortlist_k is None else int(args.estep_shortlist_k)
+        ),
+        estep_shortlist_frac=(
+            0.8
+            if args.estep_shortlist_frac is None
+            else float(args.estep_shortlist_frac)
+        ),
+        estep_align_workers=(
+            0 if args.estep_align_workers is None else int(args.estep_align_workers)
+        ),
+        estep_probes_per_read=(
+            32
+            if args.estep_probes_per_read is None
+            else int(args.estep_probes_per_read)
+        ),
+        p_floor_quality_scale=(
+            None
+            if args.p_floor_quality_scale is None
+            else float(args.p_floor_quality_scale)
+        ),
+        template_graph=(
+            "rounds" if args.template_graph is None else str(args.template_graph)
+        ),
+        graph=GraphParams(
+            identity_floor=(
+                0.99
+                if args.graph_identity_floor is None
+                else float(args.graph_identity_floor)
+            ),
+            tol_5p=(
+                30 if args.graph_5p_tolerance is None else int(args.graph_5p_tolerance)
+            ),
+            tol_3p=(
+                30 if args.graph_3p_tolerance is None else int(args.graph_3p_tolerance)
+            ),
+        ),
+        # ON unless asked otherwise: `--merge` is None when neither spelling
+        # was passed, and the default is to merge wherever there is a graph.
+        merge=(
+            args.template_graph != "off" if args.merge is None else bool(args.merge)
+        ),
+        merge_max_edits=(
+            2 if args.merge_max_edits is None else int(args.merge_max_edits)
+        ),
+        # None is "the graph's tolerance", resolved by EmParams.
+        merge_tol_5p=(
+            None if args.merge_5p_tolerance is None else int(args.merge_5p_tolerance)
+        ),
+        merge_tol_3p=(
+            None if args.merge_3p_tolerance is None else int(args.merge_3p_tolerance)
+        ),
+        merge_min_reads=(
+            0 if args.merge_min_reads is None else int(args.merge_min_reads)
+        ),
+        merge_siblings=bool(args.merge_siblings),
+        merge_from_round=(
+            1 if args.merge_from_round is None else int(args.merge_from_round)
+        ),
         delta_logl=float(args.near_tie_delta_logl),
         support_ratio=float(args.support_ratio),
         near_tie_z=float(args.near_tie_z),
         read_error_rate=float(args.read_error_rate),
-        # The em-orf SEEDING key, and nothing else — kmer seeding does not
-        # read it and the M-step has no floor at all. 30, not the parser's
-        # 60: at 60 the seeder cannot make a template for Prm1 (51 aa), the
-        # most abundant transcript in the tissue this pipeline was built for.
+        # The protein-annotation floor on every node (MStepParams below), and
+        # under em-orf the SEEDING key as well. 30, not the parser's 60: at
+        # 60 there is no Prm1 (51 aa), the most abundant transcript in the
+        # tissue this pipeline was built for.
         min_aa_length=(30 if args.min_aa_length is None else int(args.min_aa_length)),
         seed_representative=str(args.seed_representative),
         min_seed_reads=int(args.min_seed_reads),
@@ -3581,9 +4022,10 @@ def _cmd_transcriptome_cluster_em(
         threads=int(args.threads),
         mstep_workers=int(args.mstep_workers),
         mstep=MStepParams(
-            # No `min_aa_length`: the M-step has no minimum protein length.
-            # Its job is to report what each node's consensus encodes, and a
-            # floor there is a claim about biology imposed on a measurement.
+            # `min_aa_length` comes from EmParams, which sets it here itself.
+            # OFF unless asked for: the operating point of every bench
+            # result since 2026-09-23.
+            coverage_route=bool(args.coverage_route),
             # rho defaults ON for the EM path's candidate-column test: at
             # 1,525 reads a point binomial under a 1% null admits 1,924
             # columns where rho=0.01 admits none. The shared flag's None
@@ -3594,30 +4036,6 @@ def _cmd_transcriptome_cluster_em(
             max_members_per_template=int(args.max_members_per_template),
         ),
     )
-    try:
-        results = run_em(
-            demux_dir, output_dir, params=params, resume=args.resume, progress=log
-        )
-    except ChainedClusterError as exc:
-        # A seeding failure is a parameter problem the user can fix, not a
-        # crash: print the guidance the exception carries and exit 2.
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except ValueError as exc:
-        # The resume stamp mismatch, and the policy refusals, land here.
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    if not results:
-        print("no clusters were produced", file=sys.stderr)
-        return 1
-    (output_dir / "_SUCCESS").write_bytes(b"")
-    last = results[-1]
-    print(
-        f"{len(results)} round(s); {last.n_nodes:,} clusters over "
-        f"{last.estep.get('n_assigned', 0):,} assigned reads "
-        f"({last.estep.get('n_unassigned', 0):,} unassigned)"
-    )
-    return 0
 
 
 def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:

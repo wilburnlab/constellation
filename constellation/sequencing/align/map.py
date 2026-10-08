@@ -307,8 +307,11 @@ def _string_buf_and_offsets(
     """Extract the raw byte buffer + value_offsets from a StringArray.
 
     Acero's join output may be a ChunkedArray with a single chunk
-    (combine before slicing); the returned offsets are int32 with
-    ``len(arr) + 1`` entries, and ``arr[i] == data[offsets[i]:offsets[i+1]]``.
+    (combine before slicing); the returned offsets have ``len(arr) + 1``
+    entries, and ``arr[i] == data[offsets[i]:offsets[i+1]]``. They are int32
+    for ``string`` and int64 for ``large_string``: reading a large_string's
+    offsets as int32 splits each into a value and a zero, which made every
+    other window in a batch silently empty.
     """
     if isinstance(arr, pa.ChunkedArray):
         arr = arr.combine_chunks()
@@ -318,7 +321,10 @@ def _string_buf_and_offsets(
         # Easiest: round-trip through combine_chunks via a 1-chunk Chunked.
         arr = pa.chunked_array([arr]).combine_chunks()
     buffers = arr.buffers()
-    offsets = np.frombuffer(buffers[1], dtype=np.int32, count=len(arr) + 1)
+    wide = pa.types.is_large_string(arr.type) or pa.types.is_large_binary(arr.type)
+    offsets = np.frombuffer(
+        buffers[1], dtype=np.int64 if wide else np.int32, count=len(arr) + 1
+    )
     data = bytes(buffers[2]) if buffers[2] is not None else b""
     return data, offsets
 

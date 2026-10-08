@@ -463,3 +463,26 @@ def test_missing_orientation_column_is_refused(tmp_path):
     )
     with pytest.raises(ValueError, match="predates the `orientation` column"):
         list(_iter_demux_read_batches(tmp_path))
+
+
+@pytest.mark.parametrize("seq_type", [pa.string(), pa.large_string()])
+def test_windows_are_cut_from_either_string_width(seq_type):
+    """A large_string's offsets are int64. Read as int32 they split into a
+    value and a zero, and every other window in the batch came back empty —
+    silently, since an empty window is a legal one."""
+    from constellation.sequencing.align.map import transcript_window_buffers
+
+    seqs = ["AAAACCCCGG", "TTTTGGGGCC", "ACGTACGTAC", "GGGGAAAATT"]
+    batch = pa.record_batch(
+        {
+            "sequence": pa.array(seqs, seq_type),
+            "orientation": pa.array(["+", "-", "+", "-"]),
+            "transcript_start": pa.array([2, 2, 0, 3], pa.int32()),
+            "transcript_end": pa.array([8, 8, 10, 6], pa.int32()),
+        }
+    )
+    buf, off = transcript_window_buffers(batch)
+    got = [bytes(buf[off[i] : off[i + 1]]).decode() for i in range(len(seqs))]
+    comp = str.maketrans("ACGT", "TGCA")
+    rc = [s.translate(comp)[::-1] for s in seqs]
+    assert got == [seqs[0][2:8], rc[1][2:8], seqs[2], rc[3][3:6]]

@@ -104,6 +104,22 @@ def test_reads_of_one_transcript_land_in_one_cluster(three_transcripts):
     assert len({next(iter(v)) for v in by_truth.values()}) == len(truths)
 
 
+def test_seeding_the_same_reads_twice_gives_the_same_templates(three_transcripts):
+    """Deterministic, by construction and not by luck: the first seeding of
+    a 9.4M corpus and the second differed in 1.2% of candidate pairs, because
+    the unique reads were numbered in whatever order a threaded group_by
+    emitted them and the anchor-star broke ties on that number."""
+    reads, _ = three_transcripts
+    one = seed_by_kmer_clustering(reads, identity=0.90)
+    two = seed_by_kmer_clustering(reads, identity=0.90)
+    assert one.templates.equals(two.templates)
+    assert one.read_cluster.equals(two.read_cluster)
+    # Everything but the stage timings, which are wall-clock seconds.
+    counts = lambda stats: {k: v for k, v in stats.items() if not k.endswith("_s")}  # noqa: E731
+    assert counts(one.stats) == counts(two.stats)
+    assert any(k.endswith("_s") for k in one.stats)
+
+
 def test_every_read_gets_a_row_and_the_counts_reconcile(three_transcripts):
     reads, _ = three_transcripts
     res = seed_by_kmer_clustering(reads, identity=0.90)
@@ -304,36 +320,43 @@ def test_min_aa_length_is_not_a_parameter_of_this_seeder():
     assert "min_aa_length" not in sig.parameters
 
 
-def test_an_empty_seed_orf_leaves_the_support_gate_judging_everything():
-    """(0, 0) is the honest statement, and gated_orf reads it that way.
-
-    `gated_orf` treats the seed ORF interval as certified BY CONSTRUCTION and
-    declines to judge it. Predicting an ORF at seed time would therefore
-    relax the M-step's support gate on the strength of a claim this seeder
-    never made — which is exactly ORF detection leaking into the algorithm.
-    """
+def test_the_mstep_annotates_a_kmer_seeded_template_s_orf_under_the_floor():
+    """The seeder predicts no ORF; the M-step calls one on each node's
+    consensus, under `min_aa_length`, and nothing in the loop reads it. The
+    support gate that once read the seed interval as "certified by
+    construction" is gone, so (0, 0) carries no meaning any more."""
     from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
-        gated_orf,
+        refine_template,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.orf import (
+        best_sense_orf,
+    )
+
+    from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
+        MemberSpec,
     )
 
     rng = np.random.default_rng(23)
     consensus = _orf(rng, 60)
-    # Everything certified: the ORF survives either way.
-    certified = np.ones(len(consensus), dtype=bool)
-    assert (
-        gated_orf(consensus, certified, seed_orf_start=0, seed_orf_end=0) is not None
+    # Five identical members, each the frame itself: an identity CIGAR.
+    members = [
+        MemberSpec(
+            member_seq=consensus,
+            weight=1.0,
+            cigar=f"{len(consensus)}=",
+            centroid_is_query=False,
+            ref_start=0,
+            member_start=0,
+            member_id=i,
+        )
+        for i in range(5)
+    ]
+    (node,) = refine_template(consensus, members)
+    assert (node.protein, node.orf_start, node.orf_end) == best_sense_orf(
+        consensus, min_aa_length=30
     )
-
-    # Now strip certification from the ORF's 3' half. With no seed interval
-    # the gate judges it and truncates; with the interval asserted it does not.
-    certified[len(consensus) // 2 :] = False
-    ungated = gated_orf(consensus, certified, seed_orf_start=0, seed_orf_end=0)
-    asserted = gated_orf(
-        consensus, certified, seed_orf_start=0, seed_orf_end=len(consensus)
-    )
-    assert ungated is not None and ungated[4] is True, "must be flagged truncated"
-    assert asserted is not None and asserted[4] is False
-    assert ungated[2] < asserted[2], "the empty seed interval must gate harder"
+    (floored,) = refine_template(consensus, members, min_aa_length=61)
+    assert floored.protein is None
 
 
 # ── the shared election helper ────────────────────────────────────────

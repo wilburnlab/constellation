@@ -11,6 +11,10 @@ The only schema movement is the ``mode`` vocabulary, which follows the CLI:
 ``'genome' | 'kmer' | 'em'`` rather than ``'genome-guided' | 'de-novo'``. The
 old spellings still load — the column is a plain string and the viz colour
 maps keep entries for both — so existing outputs keep working.
+
+One file is the EM path's alone: ``cluster_edges.parquet``, how the final
+clusters relate to each other (:mod:`.graph`). It is additive — nothing that
+reads the shared files has to know it exists.
 """
 
 from __future__ import annotations
@@ -34,6 +38,8 @@ CLUSTER_MODES = ("genome", "kmer", "em")
 LEGACY_CLUSTER_MODES = {"genome-guided": "genome", "de-novo": "kmer"}
 
 MODE_EM = "em"
+
+CLUSTER_EDGES = "cluster_edges.parquet"
 
 
 def build_cluster_tables(
@@ -298,7 +304,12 @@ def write_em_outputs(
     # not "unchanged" — it describes results that no longer exist, and
     # nothing marks it as stale. Clear them first so the directory only ever
     # holds this export.
-    for optional in ("feature_quant.parquet", "cluster.fa", "proteins.fasta"):
+    for optional in (
+        "feature_quant.parquet",
+        "cluster.fa",
+        "proteins.fasta",
+        CLUSTER_EDGES,
+    ):
         stale = output_dir / optional
         if stale.exists():
             stale.unlink()
@@ -340,6 +351,89 @@ def write_em_outputs(
                 paths["proteins"], [n for n, _ in named], [p for _, p in named]
             )
     return paths
+
+
+def write_cluster_edges(
+    output_dir: Path,
+    edges_path: Path,
+    keep_rows: np.ndarray,
+    clusters: pa.Table,
+    *,
+    batch_rows: int = 1 << 20,
+) -> tuple[Path, dict[str, int]]:
+    """Project the final round's edges onto the clusters that were written.
+
+    ``keep_rows`` are the node rows that survived as clusters, in cluster
+    order — cluster ``i`` is node row ``keep_rows[i]``. The edge file is read
+    and written a batch at a time: at 1.6M templates it is tens of millions
+    of rows, and nothing here needs more than one batch of them.
+
+    Call it AFTER :func:`write_em_outputs`, which clears a stale edge file
+    along with the other optional exports.
+
+    Returns the path and three counts the final record carries:
+    ``n_cluster_edges``, ``n_still_mergeable`` (edges the run's predicate
+    accepts that are still there — refused by a group guard, or inexact where
+    the final merge is exact) and ``n_twin_clusters`` (clusters byte-identical
+    to another one).
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.graph import (
+        CLUSTER_EDGE_TABLE,
+        cluster_edges,
+    )
+
+    output_dir = Path(output_dir)
+    n = clusters.num_rows
+    cluster_len = (
+        pc.utf8_length(clusters.column("consensus_sequence"))
+        .to_numpy(zero_copy_only=False)
+        .astype(np.int64)
+    )
+    cluster_n_reads = (
+        clusters.column("n_reads").to_numpy(zero_copy_only=False).astype(np.int64)
+    )
+    keep_rows = np.asarray(keep_rows, dtype=np.int64)
+    if keep_rows.shape[0] != n:
+        raise ValueError(
+            f"{keep_rows.shape[0]:,} surviving node rows for {n:,} clusters: "
+            f"the edges would be keyed on the wrong clusters"
+        )
+
+    path = output_dir / CLUSTER_EDGES
+    tmp = path.with_name(path.name + ".tmp")
+    counts = {"n_cluster_edges": 0, "n_still_mergeable": 0}
+    twin = np.zeros(n, dtype=bool)
+    overhangs = (
+        "src_overhang_5p",
+        "src_overhang_3p",
+        "dst_overhang_5p",
+        "dst_overhang_3p",
+    )
+    with pq.ParquetWriter(tmp, CLUSTER_EDGE_TABLE) as writer:
+        for batch in pq.ParquetFile(edges_path).iter_batches(batch_size=batch_rows):
+            out = cluster_edges(
+                pa.Table.from_batches([batch]),
+                keep_rows,
+                cluster_len=cluster_len,
+                cluster_n_reads=cluster_n_reads,
+            )
+            if out.num_rows == 0:
+                continue
+            writer.write_table(out)
+            counts["n_cluster_edges"] += out.num_rows
+            counts["n_still_mergeable"] += int(pc.sum(out.column("mergeable")).as_py())
+
+            def col(name):
+                return out.column(name).to_numpy(zero_copy_only=False)
+
+            same = (col("n_edits") == 0) & (col("src_len") == col("dst_len"))
+            for name in overhangs:
+                same &= col(name) == 0
+            twin[col("src_cluster_id")[same]] = True
+            twin[col("dst_cluster_id")[same]] = True
+    tmp.replace(path)
+    counts["n_twin_clusters"] = int(twin.sum())
+    return path, counts
 
 
 def write_em_manifest(
@@ -385,10 +479,12 @@ def _write_fasta(path: Path, names, seqs) -> None:
 
 
 __all__ = [
+    "CLUSTER_EDGES",
     "CLUSTER_MODES",
     "LEGACY_CLUSTER_MODES",
     "MODE_EM",
     "build_cluster_tables",
+    "write_cluster_edges",
     "write_em_manifest",
     "write_em_outputs",
 ]

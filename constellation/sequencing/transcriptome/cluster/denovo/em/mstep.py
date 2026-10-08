@@ -13,7 +13,7 @@ For one template and the reads the E-step assigned to it:
 3. **Covariance** (:mod:`.covariance`) — which of them earn a node, grouped
    into signatures, with every read assigned to one pattern of each.
 4. **One node per observed state-tuple**, its consensus built on the pooled
-   column plan, its ORF re-predicted under a support gate.
+   column plan, its ORF predicted on that consensus.
 
 The order matters and is not obvious: the pooled PWM has to come first,
 because in round 1 there are no declared columns to group by.
@@ -26,14 +26,26 @@ independent signatures correctly give up to **four** templates rather than two
 marginals that double-count reads. And the tuple space is bounded by *observed*
 combinations, not ``2^k``.
 
-**The support gate.** A template's flanks are one read's sequence and carry no
-certificate, so an ORF must not silently extend through them. Certification is
-evaluated on *consensus* columns (where gap-winning columns do not exist,
-which resolves an ambiguity in the spec): a column is certified when its base
-coverage and its agreement both clear thresholds. An ORF reaching past the
-seed ORF's boundary is truncated at the last certified column and flagged.
-This is only meaningful *because* the consensus kernel can now extend past the
-frame at all — before that, an ORF could never reach uncertified ground.
+**The ORF is an annotation of the consensus, and nothing more.** Each node's
+protein is :func:`~..orf.best_sense_orf` on its consensus, under the run's
+``min_aa_length``. Nothing in the loop reads it: the E-step's rankers and the
+split do not, and the consensus itself is governed by the kernel's own
+franchise rules (``min_insertion_support``, ``min_extension_support``, and the
+trim to the covered span below). The support gate that used to stand here —
+per-consensus-column base coverage and agreement thresholds, an ORF interval
+carried forward from the previous round as "certified by construction", and a
+truncation flag — was a holdover from ORF seeding. Measured on 9.4M reads it
+cost 9.7% of full-length RefSeq proteins: evaluated on a 3-read node it was
+noise, and under kmer seeding there was never a seed interval to anchor it.
+The length floor is applied too, which it was not (``_NO_LENGTH_FLOOR = 1``
+shipped 14,813 sub-30-aa proteins in one round). Lowering the floor only
+*adds* short ORFs — the longest ATG→stop per (frame, stop) does not depend on
+it — so it changes no protein a node already had.
+
+**The coverage route is a parameter.** Candidate columns come by allele or by
+coverage (:mod:`.columns`), and ``coverage_route=False`` keeps the allelic
+route only. Every bench run since 2026-09-23 has run with it off; see
+:class:`~.mstep_pool.MStepParams`.
 
 **What is gone, and why.** ``call_variants`` and ``build_haplotypes`` are no
 longer called from this path (they are unchanged, and the components path
@@ -62,10 +74,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
     frame_consensus,
     member_allele_events,
 )
-from constellation.sequencing.transcriptome.cluster.denovo.orf import (
-    ORF_CODON_TABLE,
-    best_sense_orf,
-)
+from constellation.sequencing.transcriptome.cluster.denovo.orf import best_sense_orf
 from constellation.sequencing.transcriptome.cluster.denovo.em import covariance as cv
 from constellation.sequencing.transcriptome.cluster.denovo.em.columns import (
     candidate_columns,
@@ -89,8 +98,6 @@ class RefinedTemplate:
     protein: str | None = None
     orf_start: int = -1
     orf_end: int = -1
-    orf_certified_end: int = -1
-    orf_is_truncated_by_support: bool = False
     allele_string: str = ""
     declared_variants: np.ndarray = field(default_factory=lambda: np.empty(0, np.int64))
     n_inserted_columns: int = 0
@@ -110,106 +117,6 @@ class RefinedTemplate:
     #: counters ("the method returned one template" has to be visible rather
     #: than inferred from a quiet result).
     stats: dict = field(default_factory=dict, repr=False)
-
-
-def certified_columns(
-    cres: ConsensusResult, *, min_depth: float, min_agreement: float
-) -> np.ndarray:
-    """Per **consensus** position: is this column supported by real reads?
-
-    ``base_cov`` counts A/C/G/T votes only. At a ragged end many members vote
-    a deletion, so total coverage stays flat there while base coverage ramps
-    down — which is exactly the distinction the gate needs.
-    """
-    f = cres.frame_of_cons
-    if f is None or f.size == 0:
-        return np.zeros(0, dtype=bool)
-    rows = cres.pwm[f]
-    base_cov = rows[:, :4].sum(axis=1)
-    total = rows.sum(axis=1)
-    agreement = rows.max(axis=1) / np.maximum(total, 1.0)
-    return (base_cov >= min_depth) & (agreement >= min_agreement)
-
-
-#: `best_sense_orf` needs *a* bound — its regex is "ATG, N codons, stop" —
-#: so 1 is how "no floor" is spelled: ATG plus a stop is an ORF and nothing
-#: shorter exists. **The M-step has no minimum protein length**, deliberately.
-#: Its job is to report the protein each node's consensus encodes, and a
-#: length floor there is a claim about biology imposed on a measurement; the
-#: caller filters if it wants to. Removing it is also *monotone* — the
-#: longest ATG→stop per (frame, stop) does not depend on the floor, so
-#: lowering it can only ADD short ORFs where there previously were none, and
-#: never changes the answer for a consensus that already had a long one.
-_NO_LENGTH_FLOOR = 1
-
-
-def gated_orf(
-    consensus: str,
-    certified: np.ndarray,
-    *,
-    seed_orf_start: int,
-    seed_orf_end: int,
-):
-    """Predict the ORF, refusing sequence that reads do not support.
-
-    ``seed_orf_start`` / ``seed_orf_end`` bound the previous round's ORF in
-    *this consensus's* coordinates; that interval is certified by
-    construction and only ground **outside** it is judged. Both ends are
-    gated: an upstream ATG sitting in single-read flank can extend the
-    protein just as silently as a downstream readthrough can, and sharing
-    the seed's stop codon makes it look like an ordinary N-terminal
-    extension. Returns ``(protein, start, end, certified_end, truncated)``
-    or ``None``.
-
-    There is **no minimum protein length** — see :data:`_NO_LENGTH_FLOOR`.
-    """
-    hit = best_sense_orf(consensus, min_aa_length=_NO_LENGTH_FLOOR)
-    if hit is None:
-        return None
-    prot, st, en = hit
-    if certified.size == 0:
-        return prot, st, en, en, False
-    truncated = False
-
-    # 5': reaching an upstream start means crossing everything between it and
-    # the seed's start, so all of that has to be certified.
-    if st < seed_orf_start:
-        lo, hi = max(0, st), min(seed_orf_start, certified.size)
-        if hi > lo and not certified[lo:hi].all():
-            resume = lo + int(np.flatnonzero(~certified[lo:hi])[-1]) + 1
-            again = best_sense_orf(
-                consensus[resume:], min_aa_length=_NO_LENGTH_FLOOR
-            )
-            if again is None:
-                return None
-            prot, st, en = again[0], again[1] + resume, again[2] + resume
-            truncated = True
-
-    if en <= max(seed_orf_end, st):
-        return prot, st, en, en, truncated
-
-    # Walk forward from wherever the certificate ends and find the first
-    # uncertified column the ORF would have to pass through.
-    lo = min(max(seed_orf_end, st), len(consensus))
-    limit = lo
-    while limit < min(en, certified.size) and certified[limit]:
-        limit += 1
-    if limit >= en:
-        return prot, st, en, en, truncated
-
-    # Report the ORF as ending at the last certified column, on a codon
-    # boundary. It no longer ends in a stop — that is the point of the flag.
-    trunc_end = st + 3 * ((limit - st) // 3)
-    if trunc_end - st < 3:
-        # Not a floor — a truncation that leaves no whole codon leaves no
-        # protein, so there is nothing to report.
-        return None
-    from constellation.core.sequence.nucleic import translate
-
-    prot_t = translate(
-        consensus[st:trunc_end], codon_table=ORF_CODON_TABLE, partial="discard"
-    )
-    return prot_t, st, trunc_end, limit, True
 
 
 def specs_from_assignments(
@@ -239,33 +146,6 @@ def specs_from_assignments(
             )
         )
     return out
-
-
-def _consensus_offset(cres: ConsensusResult, column: int) -> int:
-    """How many consensus bases of ``cres`` precede PWM ``column``.
-
-    One function for both ends of the seed interval, because both want the
-    same number: an *inclusive* PWM start maps to the consensus index of the
-    base there (= the count of bases before it), and an *exclusive* PWM end
-    maps to the exclusive consensus bound (= the same count). A column the
-    child dropped contributes 0, which places the boundary where that base
-    would have sat — the reason this exists at all, since reusing the parent's
-    number is how a boundary silently slides: deleting 30 upstream bases moves
-    an ORF end from 336 to 306, and certifying through 336 waves ten
-    unsupported residues past the gate.
-
-    The predecessor walked to the nearest kept neighbour and returned *its*
-    consensus index, which is an inclusive position used as an exclusive
-    bound. At the template's own end it also clamped ``n_columns`` to
-    ``n_columns - 1``, so a seed ORF running to the end of its template came
-    back one base short — and ``gated_orf`` then judged, and truncated,
-    ground inside the interval it is explicitly told to treat as certified
-    (measured: a 126 nt seed reported ``orf_end=123`` and a support-truncation
-    flag whenever depth sat below ``support_min_depth``).
-    """
-    keep = np.asarray(cres.cons_of_frame) >= 0
-    c = int(np.clip(column, 0, keep.shape[0]))
-    return int(np.count_nonzero(keep[:c]))
 
 
 def _ALLELE_CHAR(v: int) -> str:
@@ -361,12 +241,69 @@ def _fold_small_tuples(
     return labels, new_mass, surv
 
 
+def _annotate_orf(node: RefinedTemplate, min_aa_length: int) -> RefinedTemplate:
+    """The longest sense ORF of the node's consensus, at or above the floor."""
+    hit = best_sense_orf(node.consensus, min_aa_length=min_aa_length)
+    if hit is not None:
+        node.protein, node.orf_start, node.orf_end = hit
+    return node
+
+
+def pooled_node(
+    frame: str,
+    members: list[MemberSpec],
+    *,
+    template_id: int = 0,
+    haplotype_id: int = 0,
+    min_aa_length: int = 30,
+    fold_insertions: bool = True,
+    min_insertion_support: float = 2.0,
+    min_extension_support: float | None = 3.0,
+) -> RefinedTemplate | None:
+    """One node from every member, with no split: the consensus step alone.
+
+    What the final merge rebuilds a survivor from. The members are the pooled
+    reads of every node the survivor absorbed, aligned to ITS consensus, and
+    the result is the same consensus the M-step would have built for a
+    template that recruited exactly those reads — trimmed to the span they
+    cover, extended where enough of them reach past it — with its ORF called
+    on that. ``None`` when nothing was covered.
+    """
+    if not members:
+        return None
+    cres = frame_consensus(
+        frame,
+        members,
+        frame_weight=0.0,
+        fold_insertions=fold_insertions,
+        min_insertion_support=min_insertion_support,
+        min_extension_support=min_extension_support,
+    )
+    lo, hi = _support_span(cres)
+    if hi <= lo:
+        return None
+    w = float(sum(m.weight for m in members))
+    node = RefinedTemplate(
+        parent_template_id=template_id,
+        haplotype_id=haplotype_id,
+        consensus=cres.consensus[lo:hi],
+        n_reads=int(round(w)),
+        node_weight=w,
+        n_inserted_columns=cres.n_inserted_columns,
+        n_extended_5p=cres.n_extended_5p,
+        n_extended_3p=cres.n_extended_3p,
+        n_trimmed_5p=lo,
+        n_trimmed_3p=len(cres.consensus) - hi,
+        member_ids=np.arange(len(members), dtype=np.int64),
+    )
+    return _annotate_orf(node, min_aa_length)
+
+
 def refine_template(
     frame: str,
     members: list[MemberSpec],
     *,
     template_id: int = 0,
-    seed_orf: tuple[int, int] | None = None,
     n_assigned: float | None = None,
     error_model: ErrorModel | None = None,
     overdispersion: float = 0.01,
@@ -382,8 +319,8 @@ def refine_template(
     max_cooccurrence_budget: float = 2e8,
     max_nodes: int = 8,
     min_node_reads: float = 2.0,
-    support_min_depth: float = 3.0,
-    support_min_agreement: float = 0.6,
+    min_aa_length: int = 30,
+    coverage_route: bool = True,
     fold_insertions: bool = True,
     min_insertion_support: float = 2.0,
     min_extension_support: float | None = 3.0,
@@ -408,18 +345,6 @@ def refine_template(
     w = np.array([float(m.weight) for m in members], dtype=np.float64)
     total_reads = float(w.sum())
 
-    # The seed ORF interval arrives in TEMPLATE coordinates; resolve it once
-    # into the shared PWM column space, where every child can translate it
-    # into its own consensus.
-    t_start, t_end = seed_orf if seed_orf is not None else (0, 0)
-    t_at = pooled.plan.template_at
-    seed_col_start = (
-        int(t_at[np.clip(t_start, 0, t_at.shape[0] - 1)]) if t_at.size else 0
-    )
-    seed_col_end = (
-        int(t_at[np.clip(t_end - 1, 0, t_at.shape[0] - 1)]) + 1 if t_at.size else 0
-    )
-
     stats = column_stats(
         pooled,
         model=model,
@@ -435,6 +360,7 @@ def refine_template(
         q_candidate=q_candidate,
         overdispersion=overdispersion,
         max_columns=max_candidate_columns,
+        coverage_route=coverage_route,
     )
 
     diag: dict = {
@@ -501,12 +427,8 @@ def refine_template(
                 min_extension_support=min_extension_support,
             )
         )
-        certified = certified_columns(
-            cres, min_depth=support_min_depth, min_agreement=support_min_agreement
-        )
         lo, hi = _support_span(cres)
         consensus = cres.consensus[lo:hi]
-        certified = certified[lo:hi]
         # Declared columns are PWM columns; each child reports them in its own
         # consensus coordinates and drops the ones it has no base for (a
         # minority insertion exists for the node that carries it and nowhere
@@ -536,26 +458,7 @@ def refine_template(
             member_ids=np.asarray(idx, dtype=np.int64),
             stats=diag if hid == 0 else {},
         )
-        span = hi - lo
-        orf = gated_orf(
-            consensus,
-            certified,
-            seed_orf_start=int(
-                np.clip(_consensus_offset(cres, seed_col_start) - lo, 0, span)
-            ),
-            seed_orf_end=int(
-                np.clip(_consensus_offset(cres, seed_col_end) - lo, 0, span)
-            ),
-        )
-        if orf is not None:
-            (
-                node.protein,
-                node.orf_start,
-                node.orf_end,
-                node.orf_certified_end,
-                node.orf_is_truncated_by_support,
-            ) = orf
-        return node
+        return _annotate_orf(node, min_aa_length)
 
     if not assignments:
         diag["n_nodes"] = 1
@@ -592,8 +495,7 @@ def refine_template(
 
 __all__ = [
     "RefinedTemplate",
-    "certified_columns",
-    "gated_orf",
+    "pooled_node",
     "refine_template",
     "specs_from_assignments",
 ]
