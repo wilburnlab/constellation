@@ -970,10 +970,10 @@ def test_the_hub_does_not_rejoin_a_split_in_the_final_output(tmp_path):
     assert joined["n_merged"] == 2
 
 
-def _corpus(tmp_path, nodes, *, mutate=None) -> Path:
+def _corpus(tmp_path, nodes, *, mutate=None, quality=30.0) -> Path:
     """A read corpus laid out as `_membership` numbers the rows: node by
     node, `n_reads` reads each, every read the node's own consensus (or
-    `mutate(rng, seq)` of it)."""
+    `mutate(rng, seq)` of it), all at one `quality`."""
     from constellation.sequencing.transcriptome.cluster.denovo._io import _READS_SCHEMA
 
     rng = random.Random(99)
@@ -988,7 +988,7 @@ def _corpus(tmp_path, nodes, *, mutate=None) -> Path:
             "read_id": pa.array([f"r{i}" for i in range(len(seqs))], pa.string()),
             "sequence": pa.array(seqs, pa.large_string()),
             "sample_id": pa.array(np.zeros(len(seqs), np.int64)),
-            "dorado_quality": pa.array(np.full(len(seqs), 30.0, np.float32)),
+            "dorado_quality": pa.array(np.full(len(seqs), quality, np.float32)),
         },
         schema=_READS_SCHEMA,
     )
@@ -1092,6 +1092,179 @@ def test_the_final_merge_accepts_an_inexact_pair_within_the_cap_and_rebuilds(tmp
     )
     assert final["n_merged"] == 0 and out_nodes.num_rows == 2
     assert "rebuild" not in final
+
+
+def test_the_final_rebuild_admits_under_the_runs_own_floor(tmp_path):
+    """A run with ``--p-floor-quality-scale`` assigned its low-quality reads
+    under an eased floor; the final rebuild pooled them under the flat one,
+    so a merged survivor whose reads are all Q13 placed none of them and
+    kept the consensus the merge was meant to replace (review of 91e7c69)."""
+
+    def five_percent(rng, seq):
+        out = list(seq)
+        for at in rng.sample(range(20, len(seq) - 20), len(seq) // 20):
+            out[at] = rng.choice([b for b in "ACGT" if b != out[at]])
+        return "".join(out)
+
+    a = _rnd(random.Random(23), 900)
+    nodes = _nodes([(10, 0, 0, a, 12), (11, 1, 0, a[8:], 4)])
+    corpus = _corpus(tmp_path, nodes, mutate=five_percent, quality=13.0)
+
+    _, _, flat = _final_graph_and_merge(
+        _rd(tmp_path / "flat"),
+        nodes,
+        _membership(nodes),
+        1,
+        EmParams(threads=1, merge=True),
+        _log,
+        corpus_path=corpus,
+    )
+    assert flat["n_merged"] == 1 and flat["n_rebuilt"] == 0
+    assert flat["n_rebuild_failed"] == 1 and flat["n_rebuild_reads_skipped"] == 16
+
+    out_nodes, _, eased = _final_graph_and_merge(
+        _rd(tmp_path / "eased"),
+        nodes,
+        _membership(nodes),
+        1,
+        EmParams(threads=1, merge=True, p_floor_quality_scale=1.5),
+        _log,
+        corpus_path=corpus,
+    )
+    assert eased["n_rebuilt"] == 1 and eased["n_rebuild_failed"] == 0
+    assert eased["n_rebuild_reads_skipped"] == 0
+    (node,) = out_nodes.to_pylist()
+    assert node["n_members_used"] == 16 and node["consensus"] == a
+
+
+def _stale_edge_case(tmp_path):
+    """A survivor whose reads all reach 40 nt past its consensus, beside an
+    unrelated node that already has those 40 nt.
+
+    Before the final merge the survivor is CONTAINED in that node (cut 40
+    nt short at 5'). The merge absorbs a 4-nt-shorter equivalent, the
+    rebuild extends the survivor by the 40 nt its sixteen reads carry — and
+    the two clusters that are written are byte-identical.
+    """
+    rng = random.Random(29)
+    long = _rnd(rng, 940)
+    short = long[40:]
+    nodes = _nodes(
+        [(10, 0, 0, short, 12), (11, 1, 0, short[4:], 4), (12, 2, 0, long, 9)]
+    )
+    corpus = _corpus(tmp_path, nodes, mutate=lambda _rng, _seq: long)
+    return nodes, corpus, long
+
+
+def test_cluster_edges_describe_the_clusters_that_were_written(tmp_path):
+    """The round's graph relates the nodes the M-step emitted; the final
+    merge then rebuilds its survivors' consensus. Projected onto the
+    clusters, that graph called two byte-identical 940-nt clusters
+    'contained, 40 nt short at 5\'' — numbers measured on a sequence that
+    is in no output, beside a length from the one that is (review of
+    91e7c69)."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        _cluster_edges,
+    )
+
+    nodes, corpus, long = _stale_edge_case(tmp_path)
+    rd = _rd(tmp_path)
+    params = EmParams(threads=1, merge=True)
+    out_nodes, _, final = _final_graph_and_merge(
+        rd, nodes, _membership(nodes), 1, params, _log, corpus_path=corpus
+    )
+    assert final["n_merged"] == 1 and final["n_rebuilt"] == 1
+    assert out_nodes.column("consensus").to_pylist() == [long, long]
+    assert out_nodes.slice(0, 1).to_pylist()[0]["n_extended_5p"] == 40
+    # What the merge read, and still says: about the nodes, correctly.
+    before = pq.read_table(rd / "graph" / "edges.parquet").to_pylist()
+    stale = next(e for e in before if (e["src_row"], e["dst_row"]) == (0, 2))
+    assert (stale["relation"], stale["truncation"]) == ("contained", "5p")
+    assert stale["dst_overhang_5p"] == 40
+
+    out = tmp_path / "run_out"
+    out.mkdir()
+    paths: dict = {}
+    said: list[str] = []
+    counts = _cluster_edges(
+        out, final, _clusters(out_nodes), paths, said.append, rd=rd, params=params
+    )
+    assert final["cluster_edges_source"] == "final_clusters"
+    assert any("relating the 2 clusters again" in line for line in said)
+    (edge,) = pq.read_table(paths["cluster_edges"]).to_pylist()
+    assert {edge["src_cluster_id"], edge["dst_cluster_id"]} == {0, 1}
+    assert (edge["relation"], edge["truncation"]) == ("equivalent", None)
+    assert edge["n_edits"] == 0 and edge["src_len"] == edge["dst_len"] == 940
+    assert edge["dst_overhang_5p"] == edge["src_overhang_5p"] == 0
+    assert (edge["src_n_reads"], edge["dst_n_reads"]) in ((16, 9), (9, 16))
+    assert counts["n_twin_clusters"] == 2 and counts["n_cluster_edges"] == 1
+    # The round's graph is the merge's record and is not rewritten.
+    assert pq.read_table(rd / "graph" / "edges.parquet").to_pylist() == before
+    assert (rd / "graph_final" / "_SUCCESS").exists()
+
+    _write_final_record(rd, final, out_nodes.num_rows, counts)
+    record = _json(rd / "final.json")
+    assert record["cluster_edges_source"] == "final_clusters"
+    assert "export_graph" not in record and record["n_twin_clusters"] == 2
+
+
+def test_an_unrebuilt_final_output_projects_the_rounds_graph_and_builds_no_other(
+    panel, tmp_path, monkeypatch
+):
+    """Nothing rebuilt, nothing stale: the projection is exact and free."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        _cluster_edges,
+    )
+
+    nodes, _ = panel
+    rd = _rd(tmp_path)
+    (rd / "graph_final").mkdir()  # an earlier invocation's
+    (rd / "graph_final" / "edges.parquet").write_bytes(b"not this run's")
+    params = EmParams(threads=1, merge=False)
+    _, _, final = _final_graph_and_merge(rd, nodes, _membership(nodes), 1, params, _log)
+    assert "export_graph" not in final
+    assert not (rd / "graph_final").exists(), "stale, and removed"
+    built = _spy(monkeypatch)
+    paths: dict = {}
+    (tmp_path / "o").mkdir()
+    counts = _cluster_edges(
+        tmp_path / "o", final, _clusters(nodes), paths, _log, rd=rd, params=params
+    )
+    assert built == [] and counts["n_cluster_edges"] > 0
+    assert final["cluster_edges_source"] == "round_graph"
+
+
+def test_a_failure_relating_the_final_clusters_writes_no_stale_edges(
+    tmp_path, monkeypatch
+):
+    """The edge file is a report and its failure never sinks the run — but
+    what is NOT written in its place is the projection known to be stale."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        _cluster_edges,
+    )
+
+    nodes, corpus, _ = _stale_edge_case(tmp_path)
+    rd = _rd(tmp_path)
+    params = EmParams(threads=1, merge=True)
+    out_nodes, _, final = _final_graph_and_merge(
+        rd, nodes, _membership(nodes), 1, params, _log, corpus_path=corpus
+    )
+
+    def _boom(*_a, **_k):
+        raise MemoryError("the join did not fit")
+
+    monkeypatch.setattr(rounds_mod.gr, "build_graph", _boom)
+    out = tmp_path / "run_out"
+    out.mkdir()
+    paths: dict = {}
+    said: list[str] = []
+    counts = _cluster_edges(
+        out, final, _clusters(out_nodes), paths, said.append, rd=rd, params=params
+    )
+    assert counts == {} and "cluster_edges" not in paths
+    assert not list(out.glob("cluster_edges.parquet*"))
+    assert "the join did not fit" in final["cluster_edges_error"]
+    assert any("could not be written" in line for line in said)
 
 
 def test_the_rebuild_runs_in_a_pool_and_agrees_with_the_parent(tmp_path):

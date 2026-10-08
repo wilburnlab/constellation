@@ -557,6 +557,15 @@ def section_template_graph(em_dir: Path) -> ReportSection:
                 )
             elif final.get("merge_applied") and final.get("n_merged"):
                 rebuilt = f" Survivors were not rebuilt: {final.get('rebuild')}."
+            if final.get("cluster_edges_source") == "final_clusters":
+                # The round's row above is the graph the merge READ; these
+                # counts are of the clusters as written.
+                rebuilt += (
+                    " The edges counted here were measured again on the "
+                    "clusters as written (`graph_final/`), since the round's "
+                    "graph describes the consensus sequences the rebuild "
+                    "replaced."
+                )
             parts.append(
                 f"**Final output (r{final_r})**: {final.get('n_nodes', 0):,} "
                 f"nodes → **{n_clusters:,} clusters** "

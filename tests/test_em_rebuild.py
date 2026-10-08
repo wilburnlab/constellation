@@ -30,14 +30,15 @@ def _rnd(rng, n):
     return "".join(rng.choice("ACGT") for _ in range(n))
 
 
-def _corpus(tmp_path, seqs):
+def _corpus(tmp_path, seqs, quality=None):
     path = tmp_path / "reads.arrow"
+    quality = quality if quality is not None else [30.0] * len(seqs)
     table = pa.table(
         {
             "read_id": pa.array([f"r{i}" for i in range(len(seqs))], pa.string()),
             "sequence": pa.array(seqs, pa.large_string()),
             "sample_id": pa.array(np.zeros(len(seqs), np.int64)),
-            "dorado_quality": pa.array(np.full(len(seqs), 30.0, np.float32)),
+            "dorado_quality": pa.array(quality, pa.float32()),
         },
         schema=_READS_SCHEMA,
     )
@@ -125,6 +126,55 @@ def test_one_survivor_is_rebuilt_from_its_reads_and_the_cap_samples(tmp_path):
         identity_floor=0.97,
     )
     assert none is None and n_skipped == 2
+
+
+def _substituted(rng, seq, n):
+    out = list(seq)
+    for at in rng.sample(range(len(seq)), n):
+        out[at] = rng.choice([b for b in "ACGT" if b != out[at]])
+    return "".join(out)
+
+
+def test_a_read_is_held_to_the_floor_it_was_admitted_under(tmp_path):
+    """The rebuild pools the reads the E-step ASSIGNED. Under
+    ``--p-floor-quality-scale`` a Q13 read at 0.95 identity was admitted
+    (its floor is ~0.925); held to the flat 0.97 here it was dropped from
+    the pool, and a survivor made of such reads was not rebuilt at all."""
+    rng = random.Random(5)
+    body = _rnd(rng, 800)
+    noisy = [_substituted(rng, body, 40) for _ in range(6)]  # 0.95 identity
+    seqs = [body] * 10 + noisy
+    corpus = _corpus(tmp_path, seqs, quality=[30.0] * 10 + [13.0] * 6)
+    kwargs = {
+        "template_id": 7,
+        "corpus_path": corpus,
+        "params": MStepParams(),
+        "identity_floor": 0.97,
+    }
+    _, flat, n_skipped, _ = rebuild_one(0, body, np.arange(16), **kwargs)
+    assert n_skipped == 6 and flat["n_members_used"] == 10
+    _, eased, n_skipped, _ = rebuild_one(
+        0, body, np.arange(16), quality_scale=1.5, **kwargs
+    )
+    assert n_skipped == 0 and eased["n_members_used"] == 16
+    assert eased["consensus"] == body
+
+    # The floor only comes down for the reads whose quality earns it: the
+    # same noisy reads called Q30 are still refused under the scale.
+    (tmp_path / "hi").mkdir()
+    hi = _corpus(tmp_path / "hi", seqs)
+    _, _, n_skipped, _ = rebuild_one(
+        0, body, np.arange(16), quality_scale=1.5, **{**kwargs, "corpus_path": hi}
+    )
+    assert n_skipped == 6
+
+    # A survivor made ONLY of such reads: nothing placed, nothing rebuilt.
+    _, none, n_skipped, _ = rebuild_one(0, body, np.arange(10, 16), **kwargs)
+    assert none is None and n_skipped == 6
+    _, some, n_skipped, _ = rebuild_one(
+        0, body, np.arange(10, 16), quality_scale=1.5, **kwargs
+    )
+    assert some is not None and n_skipped == 0 and some["consensus"] == body
 
 
 def _nodes(rows):

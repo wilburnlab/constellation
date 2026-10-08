@@ -1192,6 +1192,26 @@ def split_origins(
     return _kin_classes(n, np.concatenate(met_node), np.concatenate(met_origin))
 
 
+def merged_origins(
+    origin: np.ndarray, survivor: np.ndarray, keep_rows: np.ndarray
+) -> np.ndarray:
+    """The split origins of what a merge left, one per surviving row.
+
+    ``origin[i]`` is node ``i``'s kin class (``-1`` = none), ``survivor[i]``
+    the row standing for it after the merge, ``keep_rows`` the ascending
+    surviving rows. A survivor inherits the origin of everything it
+    absorbed, and origins that meet in one survivor are one class —
+    :func:`split_origins`' rule, for a merge that has written no lineage
+    row to walk (the final one).
+    """
+    origin = _int64_column("origin", origin, None)
+    survivor = _int64_column("survivor", survivor, origin.shape[0])
+    keep_rows = _int64_column("keep_rows", keep_rows, None)
+    has = origin >= 0
+    node = np.searchsorted(keep_rows, survivor[has])
+    return _kin_classes(int(keep_rows.shape[0]), node, origin[has])
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Input: one buffer, one digest
 # ──────────────────────────────────────────────────────────────────────
@@ -2185,6 +2205,7 @@ __all__ = [
     "input_digest",
     "is_mergeable",
     "mergeable_pairs",
+    "merged_origins",
     "relate_pair",
     "split_origins",
 ]

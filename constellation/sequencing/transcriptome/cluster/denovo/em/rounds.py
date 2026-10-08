@@ -152,7 +152,7 @@ class EmParams:
     #: which is what stops the below-Q20 tail from being dropped wholesale.
     #: UNCALIBRATED: the per-read identity/quality record the E-step writes
     #: is the calibration substrate, so the first run stays flat and the
-    #: second is a one-flag change (ledger #62).
+    #: second is a one-flag change (ledger #66, #68).
     p_floor_quality_scale: float | None = None
     # The template graph (graph.py). "rounds" relates every round's nodes and
     # the final ones; "final" only the last round's; "off" runs nothing after
@@ -568,7 +568,9 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
             identity_threshold=params.p_floor,
         )
         paths = write_em_outputs(output_dir, clusters, membership, sample_id)
-        counts = _cluster_edges(output_dir, final, clusters, paths, log)
+        counts = _cluster_edges(
+            output_dir, final, clusters, paths, log, rd=final_rd, params=params
+        )
         _write_final_record(final_rd, final, int(clusters.num_rows), counts)
         # Again, now that the last round's graph has a time to report.
         _write_summary(output_dir, history + results)
@@ -728,6 +730,14 @@ def _newly_lost(prev: pa.Table, now: pa.Table) -> int:
 
 _ESTEP_STAMP = "estep.json"
 
+#: The two-pass E-step's admission and candidate rules, as a version. A
+#: change to WHAT is admitted or HOW a candidate is scored is as much a
+#: mid-run switch as a changed floor, and has no parameter to stamp.
+#: 1 — through 91e7c69. 2 — placement guard (half the shorter sequence);
+#: native candidates scored by distinct probes and aligned at the join's
+#: diagonal (review of 91e7c69).
+_TWO_PASS_RULES = 2
+
 
 def _check_estep_stamp(rounds_dir: Path, params: EmParams, resume: bool) -> None:
     """Refuse a resume that would switch E-step aligners mid-run; stamp it.
@@ -752,6 +762,7 @@ def _check_estep_stamp(rounds_dir: Path, params: EmParams, resume: bool) -> None
         want.update(
             estep_shortlist_k=int(params.estep_shortlist_k),
             estep_shortlist_frac=float(params.estep_shortlist_frac),
+            two_pass_rules=_TWO_PASS_RULES,
         )
     if params.estep_aligner == "native":
         from constellation.sequencing.transcriptome.cluster.denovo.em.native import (
@@ -778,6 +789,7 @@ def _check_estep_stamp(rounds_dir: Path, params: EmParams, resume: bool) -> None
             "round1_rule": "replication",
             "estep_shortlist_k": 16,
             "estep_shortlist_frac": 0.8,
+            "two_pass_rules": 1,
         }
         have = json.loads(path.read_text()) if path.exists() else {}
         for key, value in want.items():
@@ -791,6 +803,18 @@ def _check_estep_stamp(rounds_dir: Path, params: EmParams, resume: bool) -> None
                     f"rounds' templates were built from those alignments, so "
                     f"the run would mix aligners under one manifest. Choose "
                     f"another --output-dir, or restore the original aligner."
+                )
+            if key == "two_pass_rules":
+                raise ValueError(
+                    f"--resume would continue {rounds_dir.parent}, whose "
+                    f"finished rounds were assigned by an earlier two-pass "
+                    f"E-step (rules v{have.get(key, 1)}; this is "
+                    f"v{value}). v2 refuses an alignment placed over less "
+                    f"than half the shorter of read and template, and under "
+                    f"--estep-aligner native scores a candidate by distinct "
+                    f"shared probes and aligns it where the join placed it. "
+                    f"The rounds would not be comparable. Choose another "
+                    f"--output-dir."
                 )
             raise ValueError(
                 f"--resume would continue {rounds_dir.parent}, whose finished "
@@ -1334,6 +1358,7 @@ def _refine_and_merge(rd: Path, nodes, store, r: int, params: EmParams, log):
     # This round has a successor now, so it is no longer anybody's final one.
     for stale in ("final.json", "merged_final.parquet"):
         (rd / stale).unlink(missing_ok=True)
+    shutil.rmtree(rd / _FINAL_GRAPH, ignore_errors=True)
     _write_json(rd / "refine.json", record)
     if refined.n_merged and log:
         log(f"round {r}: merged {refined.n_merged:,} templates")
@@ -1394,6 +1419,8 @@ def _final_graph_and_merge(
         "n_merged": 0,
         "n_nodes": int(nodes.num_rows),
     }
+    # Whatever an earlier invocation related here, it was not these clusters.
+    shutil.rmtree(rd / _FINAL_GRAPH, ignore_errors=True)
     if params.template_graph == "off":
         shutil.rmtree(rd / "graph", ignore_errors=True)
         return nodes, membership, final
@@ -1457,30 +1484,117 @@ def _final_graph_and_merge(
                     str(corpus_path),
                     params=params.mstep,
                     identity_floor=params.p_floor,
+                    quality_scale=params.p_floor_quality_scale,
                     threads=params.threads,
                     log=log,
                 )
                 final["rebuild"] = "ok"
                 final.update(counts)
+                if counts["n_rebuilt"]:
+                    # The graph the merge read measured consensus sequences
+                    # the rebuild has just replaced. What the export needs
+                    # to measure the clusters that are actually written.
+                    final["export_graph"] = {
+                        "sequences": nodes.column("consensus"),
+                        "ids": graph.ids[keep],
+                        "n_reads": nodes.column("n_reads")
+                        .to_numpy(zero_copy_only=False)
+                        .astype(np.int64),
+                        "origin": gr.merged_origins(graph.origin, survivor, keep),
+                    }
     _write_table(rd / "merged_final.parquet", merged)
     final["edges_path"] = graph.path
     final["keep_rows"] = keep
     return nodes, membership, final
 
 
-def _cluster_edges(output_dir: Path, final: dict, clusters, paths: dict, log) -> dict:
+#: Where the final clusters are related again, when the final merge rebuilt
+#: any of them. Beside the round's own ``graph/``, which is the graph the
+#: merge read and stays what it was.
+_FINAL_GRAPH = "graph_final"
+
+
+def _relate_final_clusters(rd: Path, final: dict, params: EmParams, log) -> Path:
+    """Relate the clusters as written; return the edge file.
+
+    The round's graph relates the nodes the M-step emitted. The final merge
+    then rebuilt every survivor's consensus from its pooled reads, so an
+    edge of that graph touching a rebuilt survivor describes a sequence
+    that is in no output: its overhangs, edits and relation were measured
+    on the consensus the rebuild replaced, beside a length taken from the
+    one that replaced it (review of 91e7c69). A rebuild moves ends and
+    bases, so the pairs that are edges can change too — a pair that was
+    staggered may be equivalent now — and only a fresh candidate join finds
+    those. So the final clusters are related from scratch: one more graph
+    stage, 4-8 min at 9.4M reads like the round's own, and only when
+    something was rebuilt.
+    """
+    export = final["export_graph"]
+    gdir = rd / _FINAL_GRAPH
+    shutil.rmtree(gdir, ignore_errors=True)
+    gdir.mkdir(parents=True, exist_ok=True)
+    log(
+        f"final output: relating the {len(export['sequences']):,} clusters "
+        f"again ({final['n_rebuilt']:,} were rebuilt after the round's graph)"
+    )
+    result = gr.build_graph(
+        export["sequences"],
+        ids=export["ids"],
+        n_reads=export["n_reads"],
+        split_origin=export["origin"],
+        node_round=int(final["round"]),
+        params=params.graph,
+        predicate=params.merge_predicate(),
+        threads=params.threads,
+        output_path=gdir / "edges.parquet",
+        progress=log,
+    )
+    _write_json(gdir / "stats.json", result.stats)
+    (gdir / _SUCCESS).write_bytes(b"")
+    return gdir / "edges.parquet"
+
+
+def _cluster_edges(
+    output_dir: Path,
+    final: dict,
+    clusters,
+    paths: dict,
+    log,
+    *,
+    rd: Path | None = None,
+    params: EmParams | None = None,
+) -> dict:
     """Write ``cluster_edges.parquet``; return its counts.
 
     Nothing reads this file back — not even a merge, which has already
     happened — so it is a report whichever way the run was configured, and
     the run it describes is finished: the clusters are on disk. A failure
     here is recorded, and must not cost the run its manifest.
+
+    The edges come from the round's graph, projected onto the survivors —
+    unless the final merge rebuilt a consensus, in which case that graph is
+    about sequences that were not written and the clusters are related
+    again (:func:`_relate_final_clusters`). ``final["cluster_edges_source"]``
+    says which. If relating them again fails there is no edge file, rather
+    than the stale one.
     """
     if final.get("edges_path") is None:
         return {}
     try:
+        edges_path, keep_rows = final["edges_path"], final["keep_rows"]
+        final["cluster_edges_source"] = "round_graph"
+        if final.get("export_graph") is not None:
+            if rd is None or params is None:
+                raise ValueError(
+                    "the final merge rebuilt consensus sequences, so the "
+                    "clusters must be related again, and that needs the "
+                    "round directory and the run's parameters"
+                )
+            final["cluster_edges_source"] = "final_clusters"
+            edges_path = _relate_final_clusters(rd, final, params, log)
+            keep_rows = np.arange(clusters.num_rows, dtype=np.int64)
         paths["cluster_edges"], counts = write_cluster_edges(
-            output_dir, final["edges_path"], final["keep_rows"], clusters
+            output_dir, edges_path, keep_rows, clusters
         )
         return counts
     except Exception as exc:  # noqa: BLE001 — a report never sinks a run
@@ -1502,7 +1616,9 @@ def _write_final_record(rd: Path, final: dict, n_clusters: int, counts: dict) ->
     table that had already been merged.
     """
     record = {
-        k: v for k, v in final.items() if k not in ("edges_path", "keep_rows")
+        k: v
+        for k, v in final.items()
+        if k not in ("edges_path", "keep_rows", "export_graph")
     }
     record["n_clusters"] = int(n_clusters)
     record.update({k: int(v) for k, v in counts.items()})

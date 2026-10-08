@@ -34,17 +34,28 @@ when it completes. With ``resume=True``, an already-complete stage is
 skipped and its shards are reused; a partially-written stage (shards
 present, no marker) re-runs only the missing shard indices. The
 parent ``resolve`` stage writes its own marker on completion.
+
+What is reused must be what this invocation would have written, or the
+manifest written at the end describes shards it did not produce. So the
+settings the shards are a function of are stamped into
+``demux_settings.json`` BEFORE any work, and a resume is checked against
+them — see :func:`check_demux_resume`.
 """
 
 from __future__ import annotations
 
+import json
+import sys
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from constellation.sequencing.parallel import (
     StageOutput,
+    _existing_shard_indices,
+    _is_complete,
     run_batched,
 )
 from constellation.core.progress import (
@@ -448,6 +459,172 @@ def resolve_and_quantify(
 # ──────────────────────────────────────────────────────────────────────
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Resume: what is on disk must be what this run would have written
+# ──────────────────────────────────────────────────────────────────────
+
+#: The stamp of the settings a demux directory's shards are a function of.
+DEMUX_SETTINGS = "demux_settings.json"
+
+_FUSED_KEYS = (
+    KEY_READS,
+    KEY_READ_SEGMENTS,
+    KEY_READ_DEMUX,
+    KEY_ORFS,
+    KEY_FEATURE_QUANT,
+)
+
+
+class DemuxResumeError(ValueError):
+    """``resume`` would reuse a directory this invocation did not write."""
+
+
+def demux_settings(
+    library_design: str, *, min_aa_length: int, min_protein_count: int
+) -> dict[str, Any]:
+    """Every setting the manifest reports that the outputs depend on.
+
+    The library design by name, the poly-A trimming it implies — including
+    ``polyA_merge``, which names the run-merge ALGORITHM and so stands for
+    the code that trimmed (:func:`~.demux.demux.polyA_provenance`) — and the
+    two thresholds the ORF shards and the count matrix were cut at. Threads
+    and batch size describe how the work was done, not what it produced.
+    """
+    from constellation.sequencing.transcriptome.demux.demux import polyA_provenance
+    from constellation.sequencing.transcriptome.demux.designs import load_design
+
+    return {
+        "library_design": str(library_design),
+        "min_aa_length": int(min_aa_length),
+        "min_protein_count": int(min_protein_count),
+        **polyA_provenance(load_design(library_design)),
+    }
+
+
+def _differences(have: dict, want: dict) -> str:
+    return ", ".join(
+        f"{key}: {have.get(key)!r} on disk, {value!r} now"
+        for key, value in want.items()
+        if have.get(key) != value
+    )
+
+
+def check_demux_resume(
+    output_dir: Path, settings: dict[str, Any], *, resume: bool
+) -> dict[str, Any]:
+    """Refuse a resume that would reuse another run's shards as this one's.
+
+    Returns the settings that are TRUE of what the directory will hold when
+    the pipeline finishes — which the caller records in the manifest in
+    place of the ones it was invoked with — and writes the stamp when they
+    are this invocation's.
+
+    The failure this exists for (review of 91e7c69): ``--resume`` over a
+    directory demultiplexed before the poly-A run-merge was corrected
+    reused every shard and then wrote a manifest stamped
+    ``polyA_merge = "gap"`` — the one field that says a directory's
+    transcript windows are free of the split-tail remnant, asserted of
+    windows that carry it.
+
+    * **No earlier work** (or ``resume=False``, which redoes all of it):
+      the stamp is written and ``settings`` returned.
+    * **A stamp**: it must equal ``settings``. Anything else is refused
+      before a read is touched, naming what differs.
+    * **No stamp, demultiplexing complete** — a directory from before the
+      stamp. Nothing will be re-trimmed, so nothing can be mixed, and its
+      own ``manifest.json`` is its record: the settings there must agree
+      with this invocation's wherever both speak, and its poly-A fields
+      are returned AS THEY ARE. A manifest with no ``polyA_merge`` stays a
+      manifest with none, which is how such a directory is known.
+    * **No stamp, demultiplexing incomplete** (or complete with no
+      manifest): refused. New shards would sit beside ones whose trimming
+      nothing records.
+    """
+    output_dir = Path(output_dir)
+    stamp = output_dir / DEMUX_SETTINGS
+    key_dirs = [output_dir / key for key in _FUSED_KEYS]
+    started = any(_is_complete(d) or _existing_shard_indices(d) for d in key_dirs)
+    if not resume or not started:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+        return dict(settings)
+
+    if stamp.is_file():
+        have = json.loads(stamp.read_text(encoding="utf-8"))
+        if have != settings:
+            raise DemuxResumeError(
+                f"--resume would reuse {output_dir}, which was demultiplexed "
+                f"under other settings ({_differences(have, settings)}). Its "
+                f"shards are not what this run would write, and the manifest "
+                f"would describe them wrongly. Use another --output-dir, or "
+                f"restore the original settings."
+            )
+        return dict(settings)
+
+    complete = all(_is_complete(d) for d in key_dirs)
+    manifest_path = output_dir / "manifest.json"
+    recorded: dict[str, Any] | None = None
+    if complete and manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            recorded = {
+                **dict(manifest.get("parameters") or {}),
+                "library_design": manifest.get("library_design"),
+            }
+        except (OSError, ValueError):
+            recorded = None
+    if recorded is None:
+        raise DemuxResumeError(
+            f"--resume would continue {output_dir}, whose shards were "
+            f"written by a version that did not record its trimming "
+            f"settings ({DEMUX_SETTINGS} is missing"
+            + (
+                ", and so is a readable manifest.json"
+                if complete
+                else ", and demultiplexing did not finish"
+            )
+            + "). Shards trimmed by this version cannot be told from, or "
+            "mixed with, ones that may carry the split poly-A remnant. "
+            "Demultiplex into another --output-dir."
+        )
+
+    legacy = recorded.get("polyA_merge") != settings["polyA_merge"]
+    # Where the old manifest speaks it must agree; where it is silent (a
+    # field newer than it) there is nothing to contradict — except the
+    # poly-A fields of a legacy directory, which are silent BECAUSE the
+    # trimming was another algorithm, and are carried as they are.
+    comparable = {
+        key: value
+        for key, value in settings.items()
+        if key in recorded and not (legacy and key.startswith("polyA_"))
+    }
+    if any(recorded[key] != value for key, value in comparable.items()):
+        raise DemuxResumeError(
+            f"--resume would reuse {output_dir}, which was demultiplexed "
+            f"under other settings ({_differences(recorded, comparable)}). "
+            f"Use another --output-dir, or restore the original settings."
+        )
+    if not legacy:
+        # Verified current, field for field: adopt it.
+        stamp.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+        return dict(settings)
+    print(
+        f"warning: {output_dir} was demultiplexed before the poly-A "
+        f"run-merge was corrected (its manifest records no "
+        f"polyA_merge = {settings['polyA_merge']!r}). Its transcript windows "
+        f"can carry a residual poly-A remnant. They are reused as they are "
+        f"and the manifest will keep saying so; demultiplex into another "
+        f"--output-dir to trim them with this version.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return {
+        key: (recorded[key] if key in recorded else value)
+        for key, value in settings.items()
+        if not key.startswith("polyA_") or key in recorded
+    }
+
+
 def run_demux_pipeline(
     input_path: Path | list[tuple[Path, int]],
     *,
@@ -484,12 +661,25 @@ def run_demux_pipeline(
     Returns a dict with ``n_reads`` (sum of records ingested across
     all input files), ``demux_outputs`` (per-key StageOutput), the
     final ``quant_table`` + ``fasta_records`` + ``tsv_text`` for the
-    CLI manifest. ``read_demux/`` is a partitioned dataset on disk —
-    consumers open it via ``pa.dataset.dataset(...)`` directly.
+    CLI manifest, and ``settings`` — the design, thresholds and poly-A
+    trimming that are true of what is on disk, which under ``resume`` over
+    an older directory are that directory's and not this call's
+    (:func:`check_demux_resume`). ``read_demux/`` is a partitioned dataset
+    on disk — consumers open it via ``pa.dataset.dataset(...)`` directly.
     """
     cb = progress_cb or NullProgress()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Before any work: a refused resume must not have touched a shard.
+    settings = check_demux_resume(
+        output_dir,
+        demux_settings(
+            library_design,
+            min_aa_length=min_aa_length,
+            min_protein_count=min_protein_count,
+        ),
+        resume=resume,
+    )
 
     # Backwards-compat: callers passing the old ``batch_size`` get it
     # wired to the new kwarg name.
@@ -553,10 +743,13 @@ def run_demux_pipeline(
         "fasta_records": fasta_records,
         "tsv_text": tsv_text,
         "fastq_dir": fastq_dir,
+        "settings": settings,
     }
 
 
 __all__ = [
+    "DEMUX_SETTINGS",
+    "DemuxResumeError",
     "KEY_FEATURE_QUANT",
     "KEY_ORFS",
     "KEY_PROTEIN_COUNTS_TSV",
@@ -564,6 +757,8 @@ __all__ = [
     "KEY_READS",
     "KEY_READ_DEMUX",
     "KEY_READ_SEGMENTS",
+    "check_demux_resume",
+    "demux_settings",
     "resolve_and_quantify",
     "run_demux_pipeline",
     "run_fused_demux_stage",

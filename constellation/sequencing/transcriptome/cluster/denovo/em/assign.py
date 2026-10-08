@@ -76,13 +76,17 @@ EM_ASSIGNMENT_TABLE: pa.Schema = pa.schema(
         pa.field("shortlist_truncated", pa.bool_(), nullable=True),
         # Why each read was, or was not, assigned — the record that would
         # have caught both the minimizer-masking loss and the low-quality
-        # tail without a forensic job (ledger #62). For an assigned read,
+        # tail without a forensic job (ledger #63). For an assigned read,
         # the winner's identity (n_match / aln_len) and aligned length. For
-        # an unassigned one, the BEST identity among the candidates that
-        # produced an alignment (null if none did), no aligned length, and a
-        # reason: 'no_candidate' (nothing to align against), 'below_floor'
-        # (aligned, nothing cleared the admission floor) or 'no_alignment'
-        # (every alignment attempt failed outright).
+        # an unassigned one, the BEST identity among the candidates whose
+        # alignment COUNTED — produced, and placed over enough of the pair
+        # (null if none did) — no aligned length, and a reason:
+        # 'no_candidate' (nothing to align against), 'below_floor' (a
+        # counted alignment, none cleared the admission floor),
+        # 'no_alignment' (every alignment attempt failed outright) or
+        # 'short_placement' (alignments came back, every one a sliver of the
+        # pair — a chance match, which says nothing about the floor and is
+        # kept out of `identity` so it cannot poison a floor calibration).
         pa.field("identity", pa.float32(), nullable=True),
         pa.field("aligned_len", pa.int32(), nullable=True),
         pa.field("unassigned_reason", pa.string(), nullable=True),
@@ -92,7 +96,17 @@ EM_ASSIGNMENT_TABLE: pa.Schema = pa.schema(
 
 
 #: The `unassigned_reason` vocabulary.
-UNASSIGNED_REASONS = ("no_candidate", "below_floor", "no_alignment")
+UNASSIGNED_REASONS = (
+    "no_candidate",
+    "below_floor",
+    "no_alignment",
+    "short_placement",
+)
+
+
+def reason_tallies() -> dict[str, int]:
+    """A zeroed ``n_<reason>`` counter per :data:`UNASSIGNED_REASONS`."""
+    return {f"n_{reason}": 0 for reason in UNASSIGNED_REASONS}
 
 
 def _identity_columns(
@@ -102,29 +116,36 @@ def _identity_columns(
     aln_len: np.ndarray,
     group_ptr: np.ndarray,
     attempted: np.ndarray | None = None,
+    placed: np.ndarray | None = None,
 ) -> tuple[pa.Array, pa.Array, pa.Array]:
     """``(identity, aligned_len, unassigned_reason)`` for one block.
 
     ``n_match`` / ``aln_len`` are per hit under ``group_ptr``'s grouping;
     ``attempted`` marks hits where an alignment was tried at all (every hit,
-    for a single-pass aligner).
+    for a single-pass aligner); ``placed`` marks alignments that cover
+    enough of the pair to count (every one, where no guard applies). An
+    unassigned read's identity is the best among alignments that COUNTED.
     """
     n_groups = group_ptr.size - 1
     sizes = np.diff(group_ptr)
     produced = aln_len > 0
+    counted = produced if placed is None else produced & placed
     with np.errstate(divide="ignore", invalid="ignore"):
         ident = np.where(produced, n_match / np.maximum(aln_len, 1), -np.inf)
     if ident.size:
-        best = np.maximum.reduceat(ident, group_ptr[:-1])
+        best = np.maximum.reduceat(np.where(counted, ident, -np.inf), group_ptr[:-1])
         best = np.where(sizes > 0, best, -np.inf)
         n_produced = np.add.reduceat(produced.astype(np.int64), group_ptr[:-1])
+        n_counted = np.add.reduceat(counted.astype(np.int64), group_ptr[:-1])
         tried = attempted if attempted is not None else np.ones_like(produced)
         n_tried = np.add.reduceat(tried.astype(np.int64), group_ptr[:-1])
     else:
         best = np.full(n_groups, -np.inf)
         n_produced = np.zeros(n_groups, dtype=np.int64)
+        n_counted = np.zeros(n_groups, dtype=np.int64)
         n_tried = np.zeros(n_groups, dtype=np.int64)
     n_produced = np.where(sizes > 0, n_produced, 0)
+    n_counted = np.where(sizes > 0, n_counted, 0)
     n_tried = np.where(sizes > 0, n_tried, 0)
 
     out_ident = np.where(has, ident[slot] if ident.size else np.nan, best)
@@ -134,10 +155,15 @@ def _identity_columns(
     )
     win_len = aln_len[slot] if aln_len.size else np.zeros(n_groups, dtype=np.int64)
     len_arr = pa.array(win_len.astype(np.int32), mask=~has)
+    # Indices into UNASSIGNED_REASONS.
     reason = np.where(
         has,
         -1,
-        np.where(n_produced > 0, 1, np.where(n_tried > 0, 2, 0)),
+        np.where(
+            n_counted > 0,
+            1,
+            np.where(n_produced > 0, 3, np.where(n_tried > 0, 2, 0)),
+        ),
     )
     lookup = np.array([None, *UNASSIGNED_REASONS], dtype=object)
     reason_arr = pa.array(lookup[reason + 1], pa.string())
@@ -165,6 +191,7 @@ def _hit_floor(
         quality_scale=quality_scale,
     )
     return np.repeat(grp_floor, sizes), grp_floor
+
 
 register_schema("EmAssignmentTable", EM_ASSIGNMENT_TABLE)
 
@@ -230,6 +257,13 @@ def assign_block(
             ident_h = np.where(
                 hb.aln_len > 0, hb.n_match / np.maximum(hb.aln_len, 1), 0.0
             )
+        # The read's own length, decoded once per read (PAF repeats it on
+        # every line). The aligned length is NOT a stand-in for it here:
+        # minimap2's hit is local, so a 300-nt hit on a 300-nt template
+        # read "length-matched" for a 1,000-nt read and tied with the
+        # template that explains all of it (review of 91e7c69). The two-pass
+        # reducer already ranks on the true length.
+        read_len_g = hb.int_fields(ptr[:-1], ("q_len",))["q_len"]
         winner = sched.rank_round1_identity(
             admitted,
             hb.template_row,
@@ -238,7 +272,7 @@ def assign_block(
             span=hb.aln_len,
             orf_replication=store.orf_replication,
             seed_read_quality=store.seed_read_quality,
-            read_len=hb.aln_len.astype(np.float64),
+            read_len=np.repeat(read_len_g, sizes).astype(np.float64),
             template_len=store.lengths().astype(np.float64),
             z=near_tie_z,
             error_rate=error_rate,
@@ -387,6 +421,7 @@ def assign_block_edlib(
     round1_rule: str = "replication",
     near_tie_z: float = 2.0,
     error_rate: float = 0.01,
+    min_placed_fraction: float = sched.MIN_PLACED_FRACTION,
     **_ignored,
 ) -> tuple[pa.RecordBatch, int]:
     """The two-pass reducer: chained hits in, base-aligned winners out.
@@ -415,6 +450,12 @@ def assign_block_edlib(
     GROUP, in group order): the default reads the pool as minimap2's and
     flags ``sizes >= minimap2_n + 1``, which is meaningless for a native
     block, whose pool is truncated by its own join caps.
+
+    Admission is identity AND placement: the alignment must cover
+    ``min_placed_fraction`` of the shorter of read and template
+    (:func:`.scheduler.placed_enough`). The aligner score-trims to its best
+    stretch, so without the second clause a chance match of a few bases is
+    a perfect alignment and clears any identity floor.
     """
     from constellation.sequencing.transcriptome.cluster.denovo.em.realign import (
         align_finalist,
@@ -467,6 +508,10 @@ def assign_block_edlib(
 
     read_seqs = reads.take_sequences(read_of_group)
     tmpl_cache: dict[int, str] = {}
+    # One len() per READ, gathered per hit: round 1's lazy walk keeps every
+    # hit, and a Python call per hit there is tens of millions a block.
+    read_len_h = _reads_len(read_seqs, np.arange(n_groups))[sub_grp]
+    t_len_h = np.asarray(store.lengths(), dtype=np.int64)[t_row]
 
     def _align(i: int) -> None:
         row = int(t_row[i])
@@ -499,10 +544,21 @@ def assign_block_edlib(
         quality_scale=p_floor_quality_scale,
     )
 
+    def _placed() -> np.ndarray:
+        return sched.placed_enough(
+            q_start,
+            q_end,
+            t_start,
+            t_end,
+            read_len_h,
+            t_len_h,
+            fraction=min_placed_fraction,
+        )
+
     def _admitted() -> np.ndarray:
         with np.errstate(divide="ignore", invalid="ignore"):
             ident = np.where(aln_len > 0, n_match / np.maximum(aln_len, 1), 0.0)
-        return aligned & (aln_len > 0) & (ident >= sub_floor)
+        return aligned & (aln_len > 0) & _placed() & (ident >= sub_floor)
 
     logl = np.full(m, -np.inf, dtype=np.float64)
     logl_delta = np.full(m, np.inf, dtype=np.float64)
@@ -540,7 +596,7 @@ def assign_block_edlib(
             span=aln_len,
             orf_replication=store.orf_replication,
             seed_read_quality=store.seed_read_quality,
-            read_len=_reads_len(read_seqs, sub_grp).astype(np.float64),
+            read_len=read_len_h.astype(np.float64),
             template_len=store.lengths().astype(np.float64),
             z=near_tie_z,
             error_rate=error_rate,
@@ -556,7 +612,7 @@ def assign_block_edlib(
                 t_start=t_start[idx],
                 q_start=q_start[idx],
                 q_end=q_end[idx],
-                q_len=_reads_len(read_seqs, sub_grp[idx]),
+                q_len=read_len_h[idx],
                 template_row=t_row[idx],
                 store=store,
                 model=error_model,
@@ -581,9 +637,7 @@ def assign_block_edlib(
         else np.zeros(n_groups, dtype=np.int64)
     )
     masked = np.where(admitted, score.astype(np.float64), -np.inf)
-    best_score = (
-        np.maximum.reduceat(masked, sub_ptr[:-1]) if m else np.zeros(n_groups)
-    )
+    best_score = np.maximum.reduceat(masked, sub_ptr[:-1]) if m else np.zeros(n_groups)
     best_score = np.where(np.isfinite(best_score), best_score, 0.0)
 
     if lazy_round1:
@@ -605,15 +659,15 @@ def assign_block_edlib(
         win_cig = [None] * n_groups
 
     t_row_out = np.where(has, t_row[slot] if m else -1, -1).astype(np.int32)
-    t_id = np.where(
-        has, store.template_id[t_row[slot]] if m else -1, -1
-    ).astype(np.int64)
+    t_id = np.where(has, store.template_id[t_row[slot]] if m else -1, -1).astype(
+        np.int64
+    )
 
     def _w(a):
         return np.where(has, a[slot] if m else 0, 0)
 
     ident_arr, len_arr, reason_arr = _identity_columns(
-        has, slot, n_match, aln_len, sub_ptr, attempted=aligned
+        has, slot, n_match, aln_len, sub_ptr, attempted=aligned, placed=_placed()
     )
     cap_col = cap_hit if cap_hit is not None else sizes >= int(minimap2_n) + 1
     batch = pa.RecordBatch.from_arrays(
@@ -632,8 +686,9 @@ def assign_block_edlib(
                 )
             ),
             pa.array(
-                np.where(has & np.isfinite(_w(logl_delta)), _w(logl_delta), np.nan)
-                .astype(np.float32)
+                np.where(
+                    has & np.isfinite(_w(logl_delta)), _w(logl_delta), np.nan
+                ).astype(np.float32)
             ),
             pa.array(sizes.astype(np.int32)),
             pa.array(n_admitted.astype(np.int32)),
@@ -647,9 +702,7 @@ def assign_block_edlib(
             pa.array(reads.sample_id[read_of_group].astype(np.int64))
             if reads.sample_id.size
             else pa.nulls(n_groups, pa.int64()),
-            pa.array(
-                np.where(has, chain[sel[slot]] if m else 0, 0).astype(np.int32)
-            ),
+            pa.array(np.where(has, chain[sel[slot]] if m else 0, 0).astype(np.int32)),
             pa.array(truncated.astype(bool)),
             ident_arr,
             len_arr,
@@ -770,7 +823,11 @@ def run_em_estep(
         raise ValueError(f"unknown E-step aligner {aligner!r}; want {ESTEP_ALIGNERS}")
 
     args = (
-        *(TEMPLATE_MINIMAP2_ARGS if aligner == "minimap2" else TEMPLATE_MINIMAP2_ARGS_SHORTLIST),
+        *(
+            TEMPLATE_MINIMAP2_ARGS
+            if aligner == "minimap2"
+            else TEMPLATE_MINIMAP2_ARGS_SHORTLIST
+        ),
         "-N",
         str(int(minimap2_n)),
         "-I",
@@ -812,9 +869,7 @@ def run_em_estep(
         "n_hits": 0,
         "n_dropped_strand": 0,
         "n_dropped_template": 0,
-        "n_no_candidate": 0,
-        "n_below_floor": 0,
-        "n_no_alignment": 0,
+        **reason_tallies(),
     }
     shard = 0
     for hb in blocks:
@@ -924,9 +979,7 @@ def _edlib_block(
         "n_cap_hit": 0,
         "n_aligned": 0,
         "n_shortlist_truncated": 0,
-        "n_no_candidate": 0,
-        "n_below_floor": 0,
-        "n_no_alignment": 0,
+        **reason_tallies(),
     }
     batch, n_aligned = assign_block_edlib(
         hb,
@@ -998,9 +1051,7 @@ def _run_edlib_estep(
         "n_dropped_template": 0,
         "n_aligned": 0,
         "n_shortlist_truncated": 0,
-        "n_no_candidate": 0,
-        "n_below_floor": 0,
-        "n_no_alignment": 0,
+        **reason_tallies(),
     }
 
     def _collect(result: tuple[dict, np.ndarray]) -> None:
@@ -1175,6 +1226,7 @@ __all__ = [
     "EM_ASSIGNMENT_TABLE",
     "ESTEP_ALIGNERS",
     "UNASSIGNED_REASONS",
+    "reason_tallies",
     "TEMPLATE_MINIMAP2_ARGS",
     "TEMPLATE_MINIMAP2_ARGS_SHORTLIST",
     "assign_block",

@@ -47,6 +47,11 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import 
 from constellation.sequencing.transcriptome.cluster.denovo.em.realign import (
     align_finalist,
 )
+from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
+    MIN_PLACED_FRACTION,
+    floor_per_read,
+    placed_enough,
+)
 
 #: The node columns a rebuild rewrites. ``n_reads`` and ``node_weight`` are
 #: the merge's (summed over the group) and are not touched.
@@ -68,11 +73,12 @@ REBUILT_COLUMNS: tuple[str, ...] = (
 _IN_FLIGHT = 4
 
 #: A placement must cover this fraction of whichever is shorter, the read or
-#: the survivor. In the E-step a read reaches the aligner through a minimap2
-#: chain, which is its proof of existence; here the whole read is placed
-#: infix with no chain, and a read from the wrong group can place a handful
-#: of bases somewhere by chance at identity 1.0.
-_MIN_PLACED_FRACTION = 0.5
+#: the survivor: the whole read is placed infix with no chain, and a read
+#: from the wrong group can place a handful of bases somewhere by chance at
+#: identity 1.0. The E-step's two-pass reducer applies the same guard
+#: (:data:`~.scheduler.MIN_PLACED_FRACTION`), so a read the rebuild pools is
+#: one the E-step could have admitted.
+_MIN_PLACED_FRACTION = MIN_PLACED_FRACTION
 
 
 def align_to_survivor(read: str, consensus: str, *, identity_floor: float):
@@ -94,10 +100,29 @@ def align_to_survivor(read: str, consensus: str, *, identity_floor: float):
         return None
     if hit.n_match / hit.aln_len < identity_floor:
         return None
-    placed = min(hit.q_end - hit.q_start, hit.t_end - hit.t_start)
-    if placed < _MIN_PLACED_FRACTION * min(len(read), len(consensus)):
+    if not placed_enough(
+        hit.q_start,
+        hit.q_end,
+        hit.t_start,
+        hit.t_end,
+        len(read),
+        len(consensus),
+        fraction=_MIN_PLACED_FRACTION,
+    ):
         return None
     return hit.cigar, int(hit.t_start), int(hit.q_start)
+
+
+#: One quality column per worker process: the property materialises the
+#: whole column, and a survivor is one of thousands.
+_QUALITY: dict[str, np.ndarray] = {}
+
+
+def _quality(reads, corpus_path: str) -> np.ndarray:
+    got = _QUALITY.get(corpus_path)
+    if got is None:
+        got = _QUALITY[corpus_path] = np.asarray(reads.dorado_quality, dtype=np.float64)
+    return got
 
 
 def rebuild_one(
@@ -109,12 +134,20 @@ def rebuild_one(
     corpus_path: str,
     params: MStepParams,
     identity_floor: float,
+    quality_scale: float | None = None,
 ) -> tuple[int, dict | None, int, float]:
     """One survivor. Returns ``(row, rebuilt or None, n_skipped, fraction)``.
 
     ``rebuilt`` is the new value of every :data:`REBUILT_COLUMNS` column;
     ``None`` when no read could be placed. Module-level so it pickles by
     name; numpy, edlib and the consensus kernel only below the fork.
+
+    ``quality_scale`` is the run's ``--p-floor-quality-scale``: each read is
+    held to the floor the E-step ADMITTED it under
+    (:func:`~.scheduler.floor_per_read`), not the flat one. Held to the flat
+    floor, a low-quality read the eased rule had assigned was dropped from
+    the pool here, and a survivor made only of such reads kept the
+    consensus the merge was supposed to replace (review of 91e7c69).
     """
     reads = _reads(corpus_path)
     rows = np.asarray(read_rows, dtype=np.int64)
@@ -126,10 +159,18 @@ def rebuild_one(
         rng = np.random.default_rng(int(template_id) & 0xFFFFFFFF)
         rows = np.sort(rng.choice(rows, size=cap, replace=False))
         fraction = cap / read_rows.shape[0]
+    if quality_scale is None:
+        floors = np.full(rows.shape[0], float(identity_floor))
+    else:
+        floors = floor_per_read(
+            _quality(reads, corpus_path)[rows],
+            p_floor=float(identity_floor),
+            quality_scale=float(quality_scale),
+        )
     members: list[MemberSpec] = []
     n_skipped = 0
     for i, seq in enumerate(reads.take_sequences(rows)):
-        placed = align_to_survivor(seq, consensus, identity_floor=identity_floor)
+        placed = align_to_survivor(seq, consensus, identity_floor=float(floors[i]))
         if placed is None:
             n_skipped += 1
             continue
@@ -191,7 +232,9 @@ def _read_rows_of(
     hap = nodes.column("haplotype_id").to_numpy(zero_copy_only=False).astype(np.int64)
     m_pid = membership.column("parent_template_id").to_numpy(zero_copy_only=False)
     m_hap = membership.column("haplotype_id").to_numpy(zero_copy_only=False)
-    m_row = membership.column("read_row").to_numpy(zero_copy_only=False).astype(np.int64)
+    m_row = (
+        membership.column("read_row").to_numpy(zero_copy_only=False).astype(np.int64)
+    )
     m_key = _pair_key(m_pid, m_hap.astype(np.int64))
     order = np.argsort(m_key, kind="stable")
     sorted_key, sorted_row = m_key[order], m_row[order]
@@ -209,6 +252,7 @@ def rebuild_survivors(
     *,
     params: MStepParams,
     identity_floor: float,
+    quality_scale: float | None = None,
     threads: int = 1,
     log=None,
 ) -> tuple[pa.Table, dict]:
@@ -219,7 +263,8 @@ def rebuild_survivors(
     ``rows`` the survivors that absorbed something. Returns the node table
     with those rows rewritten, and counts: ``n_rebuilt``, ``n_rebuild_failed``
     (no read could be placed; the survivor's own consensus stands) and
-    ``n_rebuild_reads_skipped``.
+    ``n_rebuild_reads_skipped``. ``identity_floor`` and ``quality_scale``
+    are the run's admission rule, whole — see :func:`rebuild_one`.
     """
     rows = np.asarray(rows, dtype=np.int64)
     counts = {"n_rebuilt": 0, "n_rebuild_failed": 0, "n_rebuild_reads_skipped": 0}
@@ -233,6 +278,7 @@ def rebuild_survivors(
         "corpus_path": str(corpus_path),
         "params": params,
         "identity_floor": float(identity_floor),
+        "quality_scale": quality_scale,
     }
     tasks = [
         (int(r), consensus[int(r)].as_py(), read_rows[i], int(template_id[r]))
@@ -262,7 +308,12 @@ def rebuild_survivors(
                 for row, seq, member_rows, tid in tasks:
                     flying.append(
                         pool.submit(
-                            rebuild_one, row, seq, member_rows, template_id=tid, **kwargs
+                            rebuild_one,
+                            row,
+                            seq,
+                            member_rows,
+                            template_id=tid,
+                            **kwargs,
                         )
                     )
                     if len(flying) >= workers * _IN_FLIGHT:
@@ -293,7 +344,9 @@ def rebuild_survivors(
     out = nodes
     for name in REBUILT_COLUMNS:
         field = nodes.schema.field(name)
-        values = pa.array([results[int(r)][name] for r in rebuilt_rows], type=field.type)
+        values = pa.array(
+            [results[int(r)][name] for r in rebuilt_rows], type=field.type
+        )
         column = nodes.column(name)
         if isinstance(column, pa.ChunkedArray):
             column = column.combine_chunks()

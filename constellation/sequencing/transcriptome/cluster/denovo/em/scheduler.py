@@ -147,6 +147,41 @@ def admit_candidates(
     return admitted, n_admitted
 
 
+#: A placement must cover this fraction of whichever is shorter, the read or
+#: the template, before its identity means anything. The aligner score-trims
+#: to the best-scoring stretch, so an unrelated pair that shares a few bases
+#: by chance comes back as a perfect alignment of those few bases: identity
+#: 1.0 over 1 nt cleared a 0.97 floor (review of 91e7c69). Half the shorter
+#: is the weakest claim that still says the two are the same molecule over
+#: most of one of them — a read contained in its template, or a template
+#: its read extends, places ~all of the shorter.
+MIN_PLACED_FRACTION = 0.5
+
+
+def placed_enough(
+    q_start,
+    q_end,
+    t_start,
+    t_end,
+    q_len,
+    t_len,
+    *,
+    fraction: float = MIN_PLACED_FRACTION,
+):
+    """Whether an alignment covers ``fraction`` of the shorter sequence.
+
+    Coverage is the smaller of the two spans, so a gappy alignment cannot
+    claim on one sequence what it did not place on the other. Scalars or
+    numpy arrays; ``fraction <= 0`` admits everything.
+    """
+    placed = np.minimum(
+        np.asarray(q_end) - np.asarray(q_start),
+        np.asarray(t_end) - np.asarray(t_start),
+    )
+    need = float(fraction) * np.minimum(np.asarray(q_len), np.asarray(t_len))
+    return placed >= need
+
+
 def _length_key(template_len: np.ndarray, read_len: np.ndarray) -> np.ndarray:
     """``|log(template_len / read_len)|`` — smaller is a better length match.
 
@@ -342,7 +377,11 @@ def shortlist_by_chain(
     s1 = np.asarray(chain_score, dtype=np.float64)
     if n_groups <= 0 or s1.size == 0:
         z = np.zeros(s1.size, dtype=bool)
-        return z, np.zeros(s1.size, dtype=np.int64), np.zeros(max(n_groups, 0), np.int64)
+        return (
+            z,
+            np.zeros(s1.size, dtype=np.int64),
+            np.zeros(max(n_groups, 0), np.int64),
+        )
     grp, sizes = _group_of_hit(group_ptr)
     best = np.maximum.reduceat(s1, group_ptr[:-1])
     eligible = s1 >= float(frac) * np.repeat(best, sizes)
@@ -360,10 +399,12 @@ def shortlist_by_chain(
 
 
 __all__ = [
+    "MIN_PLACED_FRACTION",
     "ROUND1_RULES",
     "UNASSIGNED",
     "admit_candidates",
     "floor_per_read",
+    "placed_enough",
     "rank_likelihood",
     "rank_round1",
     "rank_round1_identity",
@@ -417,9 +458,7 @@ def rank_round1_identity(
     best = np.maximum.reduceat(masked, group_ptr[:-1])
     best = np.where(sizes > 0, best, -np.inf)
     width = (
-        float(z)
-        * np.sqrt(span * float(error_rate) * (1.0 - float(error_rate)))
-        / span
+        float(z) * np.sqrt(span * float(error_rate) * (1.0 - float(error_rate))) / span
     )
     contender = admitted & (masked >= np.repeat(best, sizes) - width)
 

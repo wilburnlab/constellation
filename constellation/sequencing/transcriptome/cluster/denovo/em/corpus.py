@@ -208,6 +208,50 @@ def chunked_take(
 CORPUS_ORDER: tuple[str, ...] = ("read_id", "sequence", "sample_id")
 
 
+def corpus_digest(arrow_path: Path | str) -> str:
+    """xxh3-128 of the corpus as ROWS: every read's id and sequence, in order.
+
+    What anything keyed on a corpus ROW depends on. A row count is not an
+    identity — the same reads in another order have the same count, which
+    is exactly what a corpus rebuilt under :data:`CORPUS_ORDER` is to the
+    one it replaced — and nor is the path, which is where the rebuilt one
+    is written.
+
+    A digest of the rows, not of how the file holds them: record-batch
+    boundaries do not enter. One pass over the memory-mapped file.
+    """
+    import xxhash
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.graph import (
+        _string_chunks,
+    )
+
+    streams = {
+        name: (xxhash.xxh3_128(), xxhash.xxh3_128())
+        for name in ("read_id", "sequence")
+    }
+    n = 0
+    with pa.memory_map(str(arrow_path), "r") as mm:
+        reader = pa.ipc.open_file(mm)
+        for b in range(reader.num_record_batches):
+            batch = reader.get_batch(b)
+            n += batch.num_rows
+            for name, (of_lengths, of_bytes) in streams.items():
+                column = batch.column(batch.schema.get_field_index(name))
+                for lengths, held in _string_chunks(column):
+                    # Lengths as well as bytes: the same bytes cut at other
+                    # places are other reads.
+                    of_lengths.update(np.ascontiguousarray(lengths, dtype="<i8"))
+                    of_bytes.update(np.ascontiguousarray(held))
+    state = xxhash.xxh3_128()
+    state.update(b"constellation.em.corpus.rows/1")
+    state.update(np.array([n], dtype="<i8"))
+    for of_lengths, of_bytes in streams.values():
+        state.update(of_lengths.digest())
+        state.update(of_bytes.digest())
+    return state.hexdigest()
+
+
 def _in_corpus_order(table: pa.Table) -> pa.Table:
     """``table`` sorted by :data:`CORPUS_ORDER`, in memory."""
     if table.num_rows < 2:

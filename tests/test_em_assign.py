@@ -461,3 +461,59 @@ def test_the_minimap2_reducer_runs_round_one_on_the_band_rule_when_asked():
     )
     assert new.column("template_row").to_pylist() == [1]
     assert new.column("identity").to_pylist()[0] == pytest.approx(0.99)
+
+
+def test_round_one_measures_length_against_the_read_not_the_aligned_stretch():
+    """A local hit covering all of a short template is not a length match
+    for a read three times as long. With equal identity, replication and
+    seed quality inside the band, the template that explains the whole read
+    wins — the aligned length stood in for the read's once, and the two
+    tied (review of 91e7c69)."""
+    store = _store(["A" * 300, "A" * 1000], replication=[7, 7])
+    rows = [
+        _row(
+            0, 0, n_match=297, aln_len=300, as_score=560, cigar="297=3X",
+            q_len=1000, q_end=300, t_len=300, t_end=300,
+        ),
+        _row(
+            0, 1, n_match=990, aln_len=1000, as_score=1900, cigar="990=10X",
+            q_len=1000, q_end=1000, t_len=1000, t_end=1000,
+        ),
+    ]  # fmt: skip
+    out = assign_block(
+        scan_paf_block(_paf(rows), n_templates=2),
+        store=store,
+        reads=_Reads(["r0"]),
+        round_index=1,
+        round1_rule="identity_band",
+    )
+    assert out.column("template_row").to_pylist() == [1]
+    assert out.column("aligned_len").to_pylist() == [1000]
+
+
+def test_a_sliver_is_not_the_identity_an_unassigned_read_reports():
+    """The identity column of an unassigned read is what a floor is
+    calibrated from, so it reads only alignments that COUNTED. A sliver at
+    1.0 beside a counted 0.95 reports 0.95 / below_floor; slivers alone
+    report nothing / short_placement."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
+        _identity_columns,
+    )
+
+    n_match = np.array([5, 190, 3, 0], dtype=np.int64)
+    aln_len = np.array([5, 200, 3, 0], dtype=np.int64)
+    placed = np.array([False, True, False, False])
+    ptr = np.array([0, 2, 3, 4], dtype=np.int64)
+    has = np.zeros(3, dtype=bool)
+    ident, length, reason = _identity_columns(
+        has, np.zeros(3, dtype=np.int64), n_match, aln_len, ptr, placed=placed
+    )
+    assert ident.to_pylist() == [pytest.approx(0.95), None, None]
+    assert reason.to_pylist() == ["below_floor", "short_placement", "no_alignment"]
+    assert length.to_pylist() == [None, None, None]
+    # With no guard in play every produced alignment counts, as before.
+    ident, _, reason = _identity_columns(
+        has, np.zeros(3, dtype=np.int64), n_match, aln_len, ptr
+    )
+    assert ident.to_pylist() == [pytest.approx(1.0), pytest.approx(1.0), None]
+    assert reason.to_pylist() == ["below_floor", "below_floor", "no_alignment"]

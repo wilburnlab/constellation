@@ -2192,16 +2192,11 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         StreamProgress,
     )
     from constellation.sequencing.samples import Samples, save_samples
-    from constellation.sequencing.transcriptome.demux.demux import (
-        polyA_provenance,
-    )
-    from constellation.sequencing.transcriptome.demux.designs import (
-        load_design,
-    )
     from constellation.sequencing.transcriptome.manifest import (
         write_demux_manifest,
     )
     from constellation.sequencing.transcriptome.stages import (
+        DemuxResumeError,
         run_demux_pipeline,
     )
 
@@ -2228,19 +2223,24 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
 
     cb = StreamProgress() if args.progress else NullProgress()
 
-    artefacts = run_demux_pipeline(
-        pipeline_inputs,
-        library_design=args.library_design,
-        samples=samples,
-        output_dir=output_dir,
-        batch_size=args.batch_size,
-        n_workers=args.threads,
-        min_aa_length=args.min_aa_length,
-        min_protein_count=args.min_protein_count,
-        progress_cb=cb,
-        resume=args.resume,
-        emit_fastq=args.emit_fastq,
-    )
+    try:
+        artefacts = run_demux_pipeline(
+            pipeline_inputs,
+            library_design=args.library_design,
+            samples=samples,
+            output_dir=output_dir,
+            batch_size=args.batch_size,
+            n_workers=args.threads,
+            min_aa_length=args.min_aa_length,
+            min_protein_count=args.min_protein_count,
+            progress_cb=cb,
+            resume=args.resume,
+            emit_fastq=args.emit_fastq,
+        )
+    except DemuxResumeError as exc:
+        # The directory holds another run's shards; nothing was touched.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     n_reads = artefacts["n_reads"]
     quant_table = artefacts["quant_table"]
@@ -2262,14 +2262,18 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
     if fastq_dir is not None:
         outputs["fastq_dir"] = str(fastq_dir)
 
+    # What is TRUE of the outputs, not what this invocation asked for: under
+    # --resume over a directory from before the poly-A fix the shards were
+    # reused, and stamping them `polyA_merge = "gap"` here claimed a
+    # trimming they never had (review of 91e7c69).
+    settings = dict(artefacts["settings"])
+    library_design = settings.pop("library_design")
     parameters: dict[str, object] = {
-        "min_aa_length": args.min_aa_length,
-        "min_protein_count": args.min_protein_count,
         "n_workers": args.threads,
         "batch_size": args.batch_size,
         "resumed": args.resume,
         "emit_fastq": args.emit_fastq,
-        **polyA_provenance(load_design(args.library_design)),
+        **settings,
     }
     stages: dict[str, object] = {
         "n_reads": n_reads,
@@ -2286,7 +2290,7 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         output_dir / "manifest.json",
         input_files=[str(f) for f in input_files],
         acquisition_map={str(f): aid for f, aid in pipeline_inputs},
-        library_design=args.library_design,
+        library_design=library_design,
         parameters=parameters,
         stages=stages,
         outputs=outputs,

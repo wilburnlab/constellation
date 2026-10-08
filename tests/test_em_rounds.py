@@ -348,12 +348,33 @@ def test_resume_refuses_a_changed_floor_rule_or_native_knob(tmp_path):
     (edlib_dir / "estep.json").write_text(json.dumps({"estep_aligner": "edlib"}))
     with pytest.raises(ValueError, match="estep_shortlist_k"):
         _check_estep_stamp(edlib_dir, _params(estep_aligner="edlib"), resume=True)
+    # Restoring the old depth is not enough for THAT run: it also predates
+    # the placement guard (review of 91e7c69), a rule with no flag to restore.
     (edlib_dir / "estep.json").write_text(json.dumps({"estep_aligner": "edlib"}))
+    with pytest.raises(ValueError, match="earlier two-pass"):
+        _check_estep_stamp(
+            edlib_dir,
+            _params(estep_aligner="edlib", estep_shortlist_k=16),
+            resume=True,
+        )
+    # A run stamped under today's rules resumes at whatever depth it ran.
+    (edlib_dir / "estep.json").write_text(
+        json.dumps(
+            {
+                "estep_aligner": "edlib",
+                "estep_shortlist_k": 16,
+                "estep_shortlist_frac": 0.8,
+                "two_pass_rules": 2,
+            }
+        )
+    )
     _check_estep_stamp(
         edlib_dir,
         _params(estep_aligner="edlib", estep_shortlist_k=16),
         resume=True,
     )
+    # The single-pass minimap2 path is not what changed, and is not stamped.
+    assert "two_pass_rules" not in json.loads((rounds / "estep.json").read_text())
     # ...and the native path stamps its join parameters: hand-edit one and
     # the resume is refused by its name.
     native = tmp_path / "native" / "rounds"
@@ -430,7 +451,12 @@ def test_the_loop_runs_natively_with_no_minimap2_anywhere(tmp_path, monkeypatch)
     assert r1["n_aligned"] <= 45, "round 1 aligns lazily"
     r2 = _json(out / "rounds" / "r02" / "round.json")["estep"]
     assert r2["n_newly_lost"] == 0
-    for key in ("n_no_candidate", "n_below_floor", "n_no_alignment"):
+    for key in (
+        "n_no_candidate",
+        "n_below_floor",
+        "n_no_alignment",
+        "n_short_placement",
+    ):
         assert key in r2
     a = pq.read_table(
         next((out / "rounds" / "r02" / "assignments").glob("part-*.parquet"))

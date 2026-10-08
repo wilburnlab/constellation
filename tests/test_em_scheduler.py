@@ -377,3 +377,24 @@ def test_shortlist_ties_go_to_the_better_supported_template():
     # Without support, the old arbitrary-by-order behaviour.
     keep, _, _ = shortlist_by_chain(chain, ptr, k=2, frac=0.5)
     assert keep.tolist() == [True, True, False, False, False]
+
+
+def test_placement_is_measured_on_the_shorter_sequence_and_the_smaller_span():
+    """Half the shorter of read and template, on whichever span is smaller:
+    a gappy alignment cannot claim on one side what it did not place on
+    the other."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import (
+        scheduler as sched,
+    )
+
+    ok = sched.placed_enough(
+        np.array([0, 0, 750, 0, 0]),  # q_start
+        np.array([1, 250, 1250, 600, 300]),  # q_end
+        np.array([0, 0, 0, 0, 0]),  # t_start
+        np.array([1, 250, 500, 200, 300]),  # t_end
+        np.array([600, 500, 2000, 600, 600]),  # q_len
+        np.array([600, 2000, 500, 600, 600]),  # t_len
+    )
+    assert ok.tolist() == [False, True, True, False, True]
+    assert bool(sched.placed_enough(0, 1, 0, 1, 600, 600, fraction=0.0))
+    assert sched.MIN_PLACED_FRACTION == 0.5

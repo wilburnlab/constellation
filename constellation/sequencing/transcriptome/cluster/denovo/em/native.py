@@ -157,11 +157,22 @@ def write_read_minimizers(
     """Sketch every corpus read, uncapped, into ``out_dir`` — once per run.
 
     Parent only (torch). Reuses a store whose stamp matches; a stamp that
-    disagrees on ``kmer`` / ``window`` / the corpus row count is rebuilt,
-    which is safe because the store is derived data and the build is
-    deterministic. Values are written per corpus record batch, re-sorted to
-    ``(read row, position)``, so the write-side transient is one batch.
+    disagrees on ``kmer`` / ``window`` / the corpus is rebuilt, which is
+    safe because the store is derived data and the build is deterministic.
+    Values are written per corpus record batch, re-sorted to ``(read row,
+    position)``, so the write-side transient is one batch.
+
+    "The corpus" is a digest of its rows (:func:`~.corpus.corpus_digest`),
+    not its row count. The store is keyed on the read ROW, and a corpus
+    rebuilt at the same path holds the same number of reads in another
+    order — a store reused across that hands every read another read's
+    minimizers, and nothing fails: the candidates are simply wrong and the
+    reads come back unassigned (review of 91e7c69). A stamp from before the
+    digest was recorded names no corpus and is rebuilt.
     """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
+        corpus_digest,
+    )
     from constellation.sequencing.transcriptome.cluster.denovo.minimizers import (
         extract_minimizers,
     )
@@ -173,16 +184,35 @@ def write_read_minimizers(
     offsets_path = out_dir / MINIS_OFFSETS
     meta_path = out_dir / MINIS_META
 
+    t_digest = time.time()
+    digest = corpus_digest(corpus_arrow)
+    t_digest = time.time() - t_digest
     with pa.memory_map(str(corpus_arrow), "r") as mm:
         reader = pa.ipc.open_file(mm)
         n_reads = sum(
             reader.get_batch(b).num_rows for b in range(reader.num_record_batches)
         )
-        want = {"kmer": int(kmer), "window": int(window), "n_reads": int(n_reads)}
+        want = {
+            "kmer": int(kmer),
+            "window": int(window),
+            "n_reads": int(n_reads),
+            "corpus_digest": digest,
+        }
         if meta_path.exists() and values_path.exists() and offsets_path.exists():
-            have = json.loads(meta_path.read_text())
+            try:
+                have = json.loads(meta_path.read_text())
+            except ValueError:
+                have = {}
             if {k: have.get(k) for k in want} == want:
                 return out_dir
+            stale = [k for k in want if have.get(k) != want[k]]
+            log(
+                f"read minimizers: the store in {out_dir} was built for "
+                f"another {' / '.join(stale)}; rebuilding"
+            )
+        # The stamp goes first: a build that dies half way must not leave
+        # new values under a stamp that vouches for the old ones.
+        meta_path.unlink(missing_ok=True)
 
         t0 = time.time()
         offsets = [0]
@@ -234,7 +264,8 @@ def write_read_minimizers(
     meta_path.write_text(json.dumps({**want, "n_entries": n_entries}, indent=2))
     log(
         f"read minimizers: {n_entries:,} entries over {n_reads:,} reads "
-        f"(k{kmer}/w{window}, uncapped) in {time.time() - t0:.1f}s"
+        f"(k{kmer}/w{window}, uncapped) in {time.time() - t0:.1f}s "
+        f"(corpus digest {t_digest:.1f}s)"
     )
     return out_dir
 
@@ -423,6 +454,60 @@ class TemplateMinimizerIndex:
 _SUBCHUNK_ROWS = 16_000_000
 
 
+def _window_scores(
+    key: np.ndarray,
+    pair_id: np.ndarray,
+    strat: np.ndarray,
+    band: int,
+    probes_per_read: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(rows, distinct probes)`` in the diagonal window starting at each row.
+
+    Rows are sorted by ``key`` — ``(pair, diagonal)`` packed so that a band
+    cannot reach into another pair — and the window starting at row ``i`` is
+    the rows from ``i`` on whose key is within ``band`` of it. ``strat`` is
+    each row's probe (its position stratum on the read).
+
+    A window is scored by the DISTINCT PROBES in it, not by its rows. A
+    k-mer the template repeats puts one probe on several diagonals, and
+    counting rows let an unrelated template carrying a 200-nt A-run
+    out-score a read's own exact template 130 to 52 at 32 probes, after
+    which the shortlist's fraction cut discarded the exact template (review
+    of 91e7c69). It also let ONE probe on two diagonals meet ``min_shared``.
+
+    Exact, and no Python loop. Row ``j`` repeats a probe inside the window
+    starting at row ``i`` exactly when the previous row of its (pair, probe)
+    lies at or after ``i``; the windows that reach ``j`` start at
+    ``reach[j]`` or later; so ``j`` is a repeat for the starts
+    ``reach[j] .. prev[j]`` — one range update per repeated row, summed
+    with a difference array.
+    """
+    m = int(key.shape[0])
+    row_i = np.arange(m, dtype=np.int64)
+    hits = np.searchsorted(key, key + band, side="right") - row_i
+    # Rows ascend by pair, so grouping them by probe stratum alone — a radix
+    # sort on a 16-bit key, linear — leaves each (pair, probe)'s rows
+    # adjacent and in row order.
+    if probes_per_read <= 1 << 16:
+        by_probe = np.argsort(strat.astype(np.uint16), kind="stable")
+    else:
+        by_probe = np.lexsort((pair_id, strat))
+    pair_s, strat_s = pair_id[by_probe], strat[by_probe]
+    same = (strat_s[1:] == strat_s[:-1]) & (pair_s[1:] == pair_s[:-1])
+    prev = np.full(m, -1, dtype=np.int64)
+    prev[by_probe[1:][same]] = by_probe[:-1][same]
+    again = np.flatnonzero(prev >= 0)  # few: most probes sit on one diagonal
+    if again.shape[0] == 0:
+        return hits, hits
+    reach = np.searchsorted(key, key[again] - band, side="left")
+    inside = prev[again] >= reach
+    again, reach = again[inside], reach[inside]
+    delta = np.bincount(reach, minlength=m + 1) - np.bincount(
+        prev[again] + 1, minlength=m + 1
+    )
+    return hits, hits - np.cumsum(delta[:m])
+
+
 def _expand_and_window(
     probe: np.ndarray,
     pb: np.ndarray,
@@ -494,15 +579,20 @@ def _expand_and_window(
     width = int(diag.max()) - d_min + int(params.diag_band) + 2
     key = pair_id * width + (diag - d_min)
     row_i = np.arange(m, dtype=np.int64)
-    hits = np.searchsorted(key, key + int(params.diag_band), side="right") - row_i
-    n_shared = np.maximum.reduceat(hits, pair_first)
-    lead = np.minimum.reduceat(
-        np.where(hits == np.repeat(n_shared, pair_size), row_i, m), pair_first
+    hits, distinct = _window_scores(
+        key, pair_id, strat, int(params.diag_band), int(params.probes_per_read)
     )
-    median = diag[lead + (n_shared - 1) // 2]
+    n_shared = np.maximum.reduceat(distinct, pair_first)
+    lead = np.minimum.reduceat(
+        np.where(distinct == np.repeat(n_shared, pair_size), row_i, m), pair_first
+    )
+    #: Rows the chosen window holds — its EXTENT, which the placement hint
+    #: and the antisense test read; ``n_shared`` is its score.
+    in_window = hits[lead]
+    median = diag[lead + (in_window - 1) // 2]
 
     # ── sense or antisense: the containment join's two-clause rule ──
-    spread = diag[lead + n_shared - 1] - diag[lead]
+    spread = diag[lead + in_window - 1] - diag[lead]
     antisense = np.zeros(n_pairs, dtype=bool)
     unsure = np.flatnonzero(spread > 0)
     if unsure.shape[0]:
@@ -511,7 +601,7 @@ def _expand_and_window(
         anti[m] = 0
         bound = np.empty(2 * unsure.shape[0], dtype=np.int64)
         bound[0::2] = lead[unsure]
-        bound[1::2] = lead[unsure] + n_shared[unsure]
+        bound[1::2] = lead[unsure] + in_window[unsure]
         anti_spread = (
             np.maximum.reduceat(anti, bound)[0::2]
             - np.minimum.reduceat(anti, bound)[0::2]
@@ -751,15 +841,27 @@ def candidates_block(
 class _NativeBlock:
     """Candidates dressed as a hit block, so :func:`~.assign.assign_block_edlib`
     runs UNCHANGED: ``chain_score`` is the shared-probe count (the shortlist
-    key), and the "chained" coordinates are whole-sequence — the finalist
-    aligner places the read infix against the whole template, exactly as the
-    final merge's rebuild does."""
+    key), and the "chained" coordinates are the candidate's own PLACEMENT —
+    the overlap the join's median diagonal implies.
+
+    Whole-sequence coordinates were measured wrong (review of 91e7c69): the
+    finalist aligner windows only the READ from them, so a 500-nt template
+    contained in a 2,000-nt read was aligned as the whole read placed infix
+    into the 500-nt template and anchor-trimmed to a 130-nt sliver at
+    identity 1.0. The diagonal says read position 0 sits at template
+    position ``diag``, so the overlap is ``[max(0, -diag), min(q_len,
+    t_len - diag))`` on the read and the mirror on the template — which the
+    aligner pads, anchors and re-extends exactly as it does a minimap2
+    chain, recovering the full containment and the terminal-extension
+    evidence the M-step votes on.
+    """
 
     def __init__(
         self,
         read_row: np.ndarray,
         template_row: np.ndarray,
         n_shared: np.ndarray,
+        diag: np.ndarray,
         read_len: np.ndarray,
         t_len: np.ndarray,
         n_antisense: int,
@@ -771,18 +873,29 @@ class _NativeBlock:
         self.n_dropped_template = 0
         self._q_len = read_len
         self._t_len = t_len
+        diag = diag.astype(np.int64)
+        q_start = np.maximum(-diag, 0)
+        q_end = np.minimum(read_len, t_len - diag)
+        t_start = np.maximum(diag, 0)
+        t_end = np.minimum(t_len, diag + read_len)
+        # A degenerate hint (no overlap under it) falls back to the whole
+        # pair rather than an empty window.
+        bad = (q_end <= q_start) | (t_end <= t_start)
+        self._q_start = np.where(bad, 0, q_start)
+        self._q_end = np.where(bad, read_len, q_end)
+        self._t_start = np.where(bad, 0, t_start)
+        self._t_end = np.where(bad, t_len, t_end)
 
     def __len__(self) -> int:
         return int(self.read_row.size)
 
     def int_fields(self, hits: np.ndarray, columns) -> dict[str, np.ndarray]:
         hits = np.asarray(hits, dtype=np.int64)
-        zero = np.zeros(hits.shape[0], dtype=np.int64)
         full = {
-            "q_start": zero,
-            "q_end": self._q_len[hits],
-            "t_start": zero,
-            "t_end": self._t_len[hits],
+            "q_start": self._q_start[hits],
+            "q_end": self._q_end[hits],
+            "t_start": self._t_start[hits],
+            "t_end": self._t_end[hits],
             "q_len": self._q_len[hits],
             "t_len": self._t_len[hits],
         }
@@ -840,6 +953,7 @@ def _native_block(
         _reason_counts,
         _unassigned_batch,
         assign_block_edlib,
+        reason_tallies,
     )
 
     state = _NATIVE_STATE
@@ -864,9 +978,7 @@ def _native_block(
         "n_aligned": 0,
         "n_shortlist_truncated": 0,
         "n_overflow_reads": int(found.overflow.sum()),
-        "n_no_candidate": 0,
-        "n_below_floor": 0,
-        "n_no_alignment": 0,
+        **reason_tallies(),
     }
     import pyarrow as pa_
 
@@ -874,6 +986,7 @@ def _native_block(
         read_row=found.local + lo,
         template_row=found.template_row,
         n_shared=found.n_shared,
+        diag=found.diag,
         read_len=read_len[found.local + lo],
         t_len=index.t_len[found.template_row],
         n_antisense=found.n_antisense,
@@ -971,6 +1084,10 @@ def run_native_estep(
         for i in range(len(bounds) - 1)
         if bounds[i + 1] > bounds[i]
     ]
+    from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
+        reason_tallies,
+    )
+
     totals = {
         "n_reads_seen": 0,
         "n_assigned": 0,
@@ -982,9 +1099,7 @@ def run_native_estep(
         "n_aligned": 0,
         "n_shortlist_truncated": 0,
         "n_overflow_reads": 0,
-        "n_no_candidate": 0,
-        "n_below_floor": 0,
-        "n_no_alignment": 0,
+        **reason_tallies(),
     }
 
     def _collect(result: tuple[dict, int]) -> None:
