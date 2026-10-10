@@ -401,6 +401,46 @@ describe('genome track settings: edits', () => {
   });
 });
 
+describe('genome track settings: cluster pile-up views', () => {
+  function rowLabels(root: HTMLElement): string[] {
+    return Array.from(root.querySelectorAll('.settings-row .settings-row-label'), (l) => l.textContent ?? '');
+  }
+
+  const CLUSTERS = ['em', 'genome', 'kmer', 'Min row height (px)', 'Max row height (px)', 'Opacity min', 'Opacity max', 'Cluster view', 'Min reads'];
+  const MEMBERS = ['Intron connector', 'Mismatch glyph', 'Intron dasharray', 'Intron stroke (px)', 'Mismatch glyph size (px)', 'Min row height (px)', 'Max row height (px)', 'Read opacity', 'Cluster view', 'Min MAPQ'];
+
+  it('swaps to the member-read controls when the view is switched, and back', () => {
+    const h = mount('cluster_pileup');
+    expect(rowLabels(h.root)).toEqual(CLUSTERS);
+    expect(rowByLabel(h.root, 'Min row height (px)').querySelector('input')!.value).toBe('4');
+
+    setValue(rowByLabel(h.root, 'Cluster view').querySelector('select')!, 'members');
+    expect(h.onFilterChange).toHaveBeenLastCalledWith({ cluster_view: 'members' });
+    expect(rowLabels(h.root)).toEqual(MEMBERS);
+    // Row height is one stored key; unset, each view shows its own default.
+    expect(rowByLabel(h.root, 'Min row height (px)').querySelector('input')!.value).toBe('2');
+    expect(rowByLabel(h.root, 'Max row height (px)').querySelector('input')!.value).toBe('8');
+
+    setValue(rowByLabel(h.root, 'Cluster view').querySelector('select')!, 'clusters');
+    expect(rowLabels(h.root)).toEqual(CLUSTERS);
+  });
+
+  it('writes the member view MAPQ threshold as the filter the kernel applies', () => {
+    const h = mount('cluster_pileup', { filter: { cluster_view: 'members' } });
+    setValue(rowByLabel(h.root, 'Min MAPQ').querySelector('input')!, '20');
+    expect(h.onFilterChange).toHaveBeenLastCalledWith({ cluster_view: 'members', min_mapq: 20 });
+  });
+
+  it('keeps the cluster controls when members is stored but the kernel cannot serve it', () => {
+    // Without the upstream align dir the kernel answers with clusters.
+    const h = mount('cluster_pileup', {
+      meta: { cluster_view_supported: false },
+      filter: { cluster_view: 'members' },
+    });
+    expect(rowLabels(h.root)).toEqual(CLUSTERS.filter((l) => l !== 'Cluster view'));
+  });
+});
+
 describe('genome track settings: dismissal', () => {
   it('closes on Escape and on a mousedown outside the panel and anchor', () => {
     const h = mount('gene_annotation');

@@ -213,4 +213,61 @@ describe('SettingsPanel', () => {
     expect(row(h.root, 'Size').querySelector('input')!.value).toBe('3');
     expect(h.root.textContent).not.toContain('Minimum');
   });
+
+  // A schema whose controls depend on one of its own values: choosing a
+  // mode swaps one set of controls for another.
+  const MODAL: SettingsSchema = {
+    sections: [
+      {
+        title: 'Mode',
+        controls: [
+          { type: 'select', target: 'filter', key: 'mode', label: 'Mode', default: 'a',
+            options: [{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }] },
+          { type: 'number', target: 'style', key: 'gap', label: 'Gap', default: 1, min: 0, max: 9, step: 1,
+            when: (env) => env.filter.mode !== 'b' },
+          { type: 'number', target: 'style', key: 'gap', label: 'Gap (wide)', default: 5, min: 0, max: 9, step: 1,
+            when: (env) => env.filter.mode === 'b' },
+        ],
+      },
+      { title: 'Only B', when: (env) => env.filter.mode === 'b', controls: [{ type: 'note', text: 'b only' }] },
+    ],
+  };
+
+  function openModal(filter: Dict = {}) {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    const cb = { onStyleChange: vi.fn(), onFilterChange: vi.fn(), onReset: vi.fn(), onClose: vi.fn() };
+    const panel = new SettingsPanel({
+      anchor, kind: 'toy', label: 'Modal', schema: MODAL, meta: {}, style: {}, filter, ...cb,
+    });
+    panel.mount(document.body);
+    opened.push(panel);
+    const root = document.body.querySelector('.track-settings-popover:last-of-type') as HTMLElement;
+    return { root, ...cb };
+  }
+
+  it('swaps controls in place when an edit changes which ones apply', () => {
+    const h = openModal();
+    expect(titles(h.root)).toEqual(['Mode']);
+    expect(row(h.root, 'Gap').querySelector('input')!.value).toBe('1');
+
+    fire(row(h.root, 'Mode').querySelector('select')!, 'b');
+
+    // The host hears the edit, then the popover shows the other set —
+    // with that set's default, since the shared key is still unset.
+    expect(h.onFilterChange).toHaveBeenLastCalledWith({ mode: 'b' });
+    expect(titles(h.root)).toEqual(['Mode', 'Only B']);
+    expect(row(h.root, 'Gap (wide)').querySelector('input')!.value).toBe('5');
+    expect(() => row(h.root, 'Gap')).toThrow();
+    expect(row(h.root, 'Mode').querySelector('select')!.value).toBe('b');
+  });
+
+  it('leaves the DOM alone on an edit that changes nothing about what applies', () => {
+    const h = openModal({ mode: 'b' });
+    const input = row(h.root, 'Gap (wide)').querySelector('input')!;
+    fire(input, '7');
+    // Same element, so a control keeps focus while it is being edited.
+    expect(row(h.root, 'Gap (wide)').querySelector('input')).toBe(input);
+    expect(h.onStyleChange).toHaveBeenLastCalledWith({ gap: 7 });
+  });
 });

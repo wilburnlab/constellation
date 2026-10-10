@@ -10,10 +10,10 @@
 //     by `cluster_id` so the user can see which reads got grouped
 //     together. Delegates to the shared _alignment_view helper.
 //
-// The active view is signaled by the response's X-Track-View header
-// (kernel-side mode_extra.cluster_view) AND by which columns are
-// present on the wire — the renderer branches on column presence as
-// a defensive check.
+// The view is chosen by the `cluster_view` filter, which the kernel
+// applies; the renderer tells which one it was sent by which columns
+// are on the wire. The settings popover follows the same filter, so it
+// offers each view the controls that view is drawn with.
 
 import { Table } from 'apache-arrow';
 import { svgEl, clear } from '../../../engine/svg_layer';
@@ -21,7 +21,12 @@ import { TrackMode } from '../../../engine/arrow_client';
 import { decodeHybrid, appendHybridImage } from '../../../engine/hybrid_layer';
 import { TrackRenderer, RenderContext } from './base';
 import { clusterView, minMapq } from './pushdown';
-import { renderAlignmentRows } from './_alignment_view';
+import {
+  ALIGNMENT_PALETTE,
+  ALIGNMENT_STYLE_CONTROLS,
+  MIN_MAPQ_CONTROL,
+  renderAlignmentRows,
+} from './_alignment_view';
 import { SettingsEnv, SettingsSchema } from '../../../panels/settings_schema';
 import {
   REFETCH_HINT,
@@ -29,6 +34,7 @@ import {
   opacity,
   orFallback,
   plainOptions,
+  shownWhen,
   stringList,
 } from './settings_common';
 import {
@@ -81,24 +87,46 @@ function modesOf(env: SettingsEnv): string[] {
   return orFallback(stringList(env.meta.modes_in_data), KNOWN_MODES);
 }
 
+/** True while the track shows member reads: that view is selected and
+ *  the kernel can serve it (asked for it without the upstream align
+ *  dir, the kernel answers with clusters). */
+function membersView(env: SettingsEnv): boolean {
+  return env.filter.cluster_view === 'members' && env.meta.cluster_view_supported === true;
+}
+
+function clustersView(env: SettingsEnv): boolean {
+  return !membersView(env);
+}
+
+// The two views are drawn by different code from different columns, so
+// each offers its own controls. Row height is one stored key with a
+// per-view default; per-cluster colours and the `visible_clusters`
+// filter the members view also honours have no control, because the
+// track's metadata does not list cluster ids.
 const SETTINGS: SettingsSchema = {
   sections: [
     {
       title: 'Style',
       controls: [
-        {
-          type: 'palette',
-          entries: (env) =>
-            modesOf(env).map((mode) => ({
-              key: mode,
-              label: mode,
-              default: MODE_COLOR_DEFAULTS[mode] ?? MODE_COLOR_DEFAULTS.default,
-            })),
-        },
-        num('style', 'min_row_height_px', 'Min row height (px)', DEFAULTS.min_row_height_px, 1, 20, 1),
-        num('style', 'max_row_height_px', 'Max row height (px)', DEFAULTS.max_row_height_px, 2, 40, 1),
-        opacity('opacity_min', 'Opacity min', DEFAULTS.opacity_min),
-        opacity('opacity_max', 'Opacity max', DEFAULTS.opacity_max),
+        ...shownWhen(clustersView, [
+          {
+            type: 'palette',
+            entries: (env) =>
+              modesOf(env).map((mode) => ({
+                key: mode,
+                label: mode,
+                default: MODE_COLOR_DEFAULTS[mode] ?? MODE_COLOR_DEFAULTS.default,
+              })),
+          },
+          num('style', 'min_row_height_px', 'Min row height (px)', DEFAULTS.min_row_height_px, 1, 20, 1),
+          num('style', 'max_row_height_px', 'Max row height (px)', DEFAULTS.max_row_height_px, 2, 40, 1),
+          opacity('opacity_min', 'Opacity min', DEFAULTS.opacity_min),
+          opacity('opacity_max', 'Opacity max', DEFAULTS.opacity_max),
+        ]),
+        ...shownWhen(membersView, [
+          { type: 'palette', entries: [...ALIGNMENT_PALETTE] },
+          ...ALIGNMENT_STYLE_CONTROLS,
+        ]),
       ],
     },
     {
@@ -119,9 +147,15 @@ const SETTINGS: SettingsSchema = {
           when: (env) => env.meta.cluster_view_supported === true,
           hint: REFETCH_HINT,
         },
-        { type: 'allowlist', target: 'filter', key: 'visible_modes', label: 'Visible modes', options: (env) => plainOptions(modesOf(env)) },
-        { type: 'allowlist', target: 'filter', key: 'visible_strands', label: 'Visible strands', options: plainOptions(['+', '-', '.']) },
-        num('filter', 'min_reads', 'Min reads', DEFAULTS.min_reads, 1, 1_000_000, 1),
+        ...shownWhen(clustersView, [
+          { type: 'allowlist', target: 'filter', key: 'visible_modes', label: 'Visible modes', options: (env) => plainOptions(modesOf(env)) },
+          { type: 'allowlist', target: 'filter', key: 'visible_strands', label: 'Visible strands', options: plainOptions(['+', '-', '.']) },
+          num('filter', 'min_reads', 'Min reads', DEFAULTS.min_reads, 1, 1_000_000, 1),
+        ]),
+        ...shownWhen(membersView, [
+          { type: 'allowlist', target: 'filter', key: 'visible_strands', label: 'Visible strands', options: plainOptions(['+', '-']) },
+          MIN_MAPQ_CONTROL,
+        ]),
       ],
     },
   ],

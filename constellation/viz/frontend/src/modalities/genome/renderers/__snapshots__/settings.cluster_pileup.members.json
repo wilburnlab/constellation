@@ -6,24 +6,41 @@
       "title": "Style",
       "controls": [
         {
-          "label": "em",
+          "label": "Intron connector",
           "control": "color",
-          "value": "#d6a85e"
+          "value": "#5a5a63"
         },
         {
-          "label": "genome",
+          "label": "Mismatch glyph",
           "control": "color",
-          "value": "#5ed6cf"
+          "value": "#e3493a"
         },
         {
-          "label": "kmer",
-          "control": "color",
-          "value": "#a8d65e"
+          "label": "Intron dasharray",
+          "control": "text",
+          "value": "2,2",
+          "placeholder": "(inherit)"
+        },
+        {
+          "label": "Intron stroke (px)",
+          "control": "number",
+          "value": "1",
+          "min": "0.5",
+          "max": "4",
+          "step": "0.5"
+        },
+        {
+          "label": "Mismatch glyph size (px)",
+          "control": "number",
+          "value": "6",
+          "min": "2",
+          "max": "20",
+          "step": "1"
         },
         {
           "label": "Min row height (px)",
           "control": "number",
-          "value": "4",
+          "value": "2",
           "min": "1",
           "max": "20",
           "step": "1"
@@ -31,21 +48,13 @@
         {
           "label": "Max row height (px)",
           "control": "number",
-          "value": "10",
+          "value": "8",
           "min": "2",
           "max": "40",
           "step": "1"
         },
         {
-          "label": "Opacity min",
-          "control": "number",
-          "value": "0.4",
-          "min": "0",
-          "max": "1",
-          "step": "0.05"
-        },
-        {
-          "label": "Opacity max",
+          "label": "Read opacity",
           "control": "number",
           "value": "1",
           "min": "0",
@@ -76,24 +85,6 @@
           ]
         },
         {
-          "label": "Visible modes",
-          "control": "allowlist",
-          "options": [
-            {
-              "label": "em",
-              "checked": true
-            },
-            {
-              "label": "genome",
-              "checked": true
-            },
-            {
-              "label": "kmer",
-              "checked": true
-            }
-          ]
-        },
-        {
           "label": "Visible strands",
           "control": "allowlist",
           "options": [
@@ -104,20 +95,19 @@
             {
               "label": "-",
               "checked": true
-            },
-            {
-              "label": ".",
-              "checked": true
             }
           ]
         },
         {
-          "label": "Min reads",
+          "label": "Min MAPQ",
           "control": "number",
-          "value": "1",
-          "min": "1",
-          "max": "1000000",
-          "step": "1"
+          "value": "0",
+          "min": "0",
+          "max": "60",
+          "step": "1",
+          "hints": [
+            "changing this triggers a refetch"
+          ]
         }
       ]
     }

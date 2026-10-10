@@ -7,6 +7,7 @@ import {
   PaletteEntry,
   SettingsEnv,
   SettingsSchema,
+  When,
 } from '../../../panels/settings_schema';
 
 /** Per-sample colour cycle. Shared by coverage and read pile-up so the
@@ -45,6 +46,11 @@ export function toggle(
   fallback: boolean,
 ): Control {
   return { type: 'toggle', target, key, label, default: fallback };
+}
+
+/** The same controls, each shown only while `when` holds. */
+export function shownWhen(when: When, controls: readonly Control[]): Control[] {
+  return controls.map((control) => ({ ...control, when }));
 }
 
 /** Options whose label is the value itself. */

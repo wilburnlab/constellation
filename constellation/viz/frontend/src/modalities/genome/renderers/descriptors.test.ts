@@ -88,6 +88,8 @@ describe('genome track settings offer nothing the track ignores', () => {
     { kind: 'coverage_histogram', fixture: 'coverage_histogram', domain: [0, 12_000] },
     { kind: 'read_pileup', fixture: 'read_pileup', domain: [0, 12_000] },
     { kind: 'cluster_pileup', fixture: 'cluster_pileup.clusters', domain: [0, 12_000] },
+    { kind: 'cluster_pileup', fixture: 'cluster_pileup.members', domain: [0, 1000],
+      filter: { cluster_view: 'members' } },
     { kind: 'splice_junctions', fixture: 'splice_junctions', domain: [0, 12_000] },
   ];
 

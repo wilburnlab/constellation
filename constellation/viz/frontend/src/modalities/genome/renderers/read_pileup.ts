@@ -15,13 +15,15 @@ import { TrackMode } from '../../../engine/arrow_client';
 import { decodeHybrid, appendHybridImage } from '../../../engine/hybrid_layer';
 import { TrackRenderer, RenderContext } from './base';
 import { minMapq } from './pushdown';
-import { ALIGNMENT_DEFAULTS, renderAlignmentRows } from './_alignment_view';
+import {
+  ALIGNMENT_PALETTE,
+  ALIGNMENT_STYLE_CONTROLS,
+  MIN_MAPQ_CONTROL,
+  renderAlignmentRows,
+} from './_alignment_view';
 import { SettingsSchema } from '../../../panels/settings_schema';
 import {
-  REFETCH_HINT,
   SAMPLE_PALETTE_CYCLE,
-  num,
-  opacity,
   plainOptions,
   sampleOptions,
   samplePalette,
@@ -46,18 +48,10 @@ const SETTINGS: SettingsSchema = {
           entries: [
             { key: '+', label: 'Forward strand (fallback)', default: STRAND_FALLBACK['+'] },
             { key: '-', label: 'Reverse strand (fallback)', default: STRAND_FALLBACK['-'] },
-            // Shared across every read: sample identity lives in the exon
-            // fill, so the mismatch colour stays one consistent value.
-            { key: 'intron', label: 'Intron connector', default: ALIGNMENT_DEFAULTS.intron_color },
-            { key: 'mismatch', label: 'Mismatch glyph', default: ALIGNMENT_DEFAULTS.mismatch_color },
+            ...ALIGNMENT_PALETTE,
           ],
         },
-        { type: 'text', target: 'style', key: 'intron_stroke_dasharray', label: 'Intron dasharray', default: ALIGNMENT_DEFAULTS.intron_stroke_dasharray },
-        num('style', 'intron_stroke_width_px', 'Intron stroke (px)', ALIGNMENT_DEFAULTS.intron_stroke_width_px, 0.5, 4, 0.5),
-        num('style', 'mismatch_glyph_size_px', 'Mismatch glyph size (px)', ALIGNMENT_DEFAULTS.mismatch_glyph_size_px, 2, 20, 1),
-        num('style', 'min_row_height_px', 'Min row height (px)', ALIGNMENT_DEFAULTS.min_row_height_px, 1, 20, 1),
-        num('style', 'max_row_height_px', 'Max row height (px)', ALIGNMENT_DEFAULTS.max_row_height_px, 2, 40, 1),
-        opacity('read_opacity', 'Read opacity', ALIGNMENT_DEFAULTS.read_opacity),
+        ...ALIGNMENT_STYLE_CONTROLS,
       ],
     },
     {
@@ -65,8 +59,7 @@ const SETTINGS: SettingsSchema = {
       controls: [
         { type: 'allowlist', target: 'filter', key: 'visible_samples', label: 'Visible samples', options: sampleOptions() },
         { type: 'allowlist', target: 'filter', key: 'visible_strands', label: 'Visible strands', options: plainOptions(['+', '-']) },
-        // Applied by the kernel, not from the cached table.
-        num('filter', 'min_mapq', 'Min MAPQ', 0, 0, 60, 1, REFETCH_HINT),
+        MIN_MAPQ_CONTROL,
       ],
     },
   ],

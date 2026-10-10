@@ -19,6 +19,8 @@ import {
   pickPaletteColor,
   pickString,
 } from '../../../panels/style';
+import { Control, PaletteEntry } from '../../../panels/settings_schema';
+import { REFETCH_HINT, num, opacity } from './settings_common';
 
 export interface AlignmentViewOptions {
   /** Wire column whose value keys the per-row exon-fill palette.
@@ -53,6 +55,27 @@ export const ALIGNMENT_DEFAULTS = {
   mismatch_color: '#e3493a',
   intron_color: '#5a5a63',
 } as const;
+
+/** Colours shared by every row whatever keys its fill: identity lives
+ *  in the exon fill, so these stay one consistent value each. */
+export const ALIGNMENT_PALETTE: readonly PaletteEntry[] = [
+  { key: 'intron', label: 'Intron connector', default: ALIGNMENT_DEFAULTS.intron_color },
+  { key: 'mismatch', label: 'Mismatch glyph', default: ALIGNMENT_DEFAULTS.mismatch_color },
+];
+
+/** The style controls of an alignment-row view, for the settings of any
+ *  track that draws one. */
+export const ALIGNMENT_STYLE_CONTROLS: readonly Control[] = [
+  { type: 'text', target: 'style', key: 'intron_stroke_dasharray', label: 'Intron dasharray', default: ALIGNMENT_DEFAULTS.intron_stroke_dasharray },
+  num('style', 'intron_stroke_width_px', 'Intron stroke (px)', ALIGNMENT_DEFAULTS.intron_stroke_width_px, 0.5, 4, 0.5),
+  num('style', 'mismatch_glyph_size_px', 'Mismatch glyph size (px)', ALIGNMENT_DEFAULTS.mismatch_glyph_size_px, 2, 20, 1),
+  num('style', 'min_row_height_px', 'Min row height (px)', ALIGNMENT_DEFAULTS.min_row_height_px, 1, 20, 1),
+  num('style', 'max_row_height_px', 'Max row height (px)', ALIGNMENT_DEFAULTS.max_row_height_px, 2, 40, 1),
+  opacity('read_opacity', 'Read opacity', ALIGNMENT_DEFAULTS.read_opacity),
+];
+
+/** MAPQ threshold. Applied by the kernel, not from the cached table. */
+export const MIN_MAPQ_CONTROL: Control = num('filter', 'min_mapq', 'Min MAPQ', 0, 0, 60, 1, REFETCH_HINT);
 
 const STRAND_FALLBACK_DEFAULT: Record<string, string> = {
   '+': '#5e9cd6',

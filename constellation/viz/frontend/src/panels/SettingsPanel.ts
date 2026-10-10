@@ -45,6 +45,8 @@ export class SettingsPanel {
   private readonly root: HTMLElement;
   private style: Record<string, unknown>;
   private filter: Record<string, unknown>;
+  /** Which sections and controls were shown at the last build. */
+  private shown = '';
   private detachDismiss: (() => void) | null = null;
 
   constructor(opts: SettingsPanelArgs) {
@@ -127,6 +129,27 @@ export class SettingsPanel {
     });
     actions.appendChild(resetBtn);
     this.root.appendChild(actions);
+    this.shown = this.shape();
+  }
+
+  /** Which sections and controls the schema shows for the current
+   *  values, as a comparable string. */
+  private shape(): string {
+    const env = this.env();
+    return this.opts.schema.sections
+      .map((section) =>
+        section.when && !section.when(env)
+          ? '-'
+          : section.controls.map((c) => (c.when && !c.when(env) ? '0' : '1')).join(''),
+      )
+      .join('|');
+  }
+
+  /** After an edit: rebuild if it changed which controls apply (a view
+   *  switch swaps one set for another). Any other edit leaves the DOM
+   *  alone, so focus stays in the control being edited. */
+  private edited(): void {
+    if (this.shape() !== this.shown) this.build();
   }
 
   /** The DOM for one control: usually one row, one per entry for a
@@ -220,6 +243,7 @@ export class SettingsPanel {
       this.filter[key] = value;
       this.opts.onFilterChange(this.filter);
     }
+    this.edited();
   }
 
   private remove(target: 'style' | 'filter', key: string): void {
@@ -230,6 +254,7 @@ export class SettingsPanel {
       delete this.filter[key];
       this.opts.onFilterChange(this.filter);
     }
+    this.edited();
   }
 
   // Palette colours are stored under `palette.<key>` so the renderers'
@@ -238,6 +263,7 @@ export class SettingsPanel {
   private setPalette(key: string, hex: string): void {
     this.style[`palette.${key}`] = hex;
     this.opts.onStyleChange(this.style);
+    this.edited();
   }
 
   private getPalette(key: string): string | undefined {
@@ -267,6 +293,7 @@ export class SettingsPanel {
       this.filter[key] = selected;
     }
     this.opts.onFilterChange(this.filter);
+    this.edited();
   }
 }
 
