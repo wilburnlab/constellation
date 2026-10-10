@@ -7,7 +7,7 @@ import { TrackMode } from '../../../engine/arrow_client';
 import { TrackRenderer, RenderContext } from './base';
 import { SettingsSchema } from '../../../panels/settings_schema';
 import { pickNumber, pickPaletteColor, pickString } from '../../../panels/style';
-import { generalSection, num } from './settings_common';
+import { num } from './settings_common';
 
 const BASE_COLOR_DEFAULTS: Record<string, string> = {
   A: '#5cd66e',
@@ -28,7 +28,6 @@ const DEFAULTS = {
 
 const SETTINGS: SettingsSchema = {
   sections: [
-    generalSection(1.0),
     {
       title: 'Style',
       controls: [

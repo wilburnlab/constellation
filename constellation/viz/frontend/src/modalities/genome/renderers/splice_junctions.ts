@@ -13,7 +13,6 @@ import {
 } from '../../../panels/style';
 import { SettingsEnv, SettingsSchema } from '../../../panels/settings_schema';
 import {
-  generalSection,
   num,
   opacity,
   orFallback,
@@ -48,7 +47,6 @@ function motifsOf(env: SettingsEnv): string[] {
 
 const SETTINGS: SettingsSchema = {
   sections: [
-    generalSection(0.85),
     {
       title: 'Style',
       controls: [

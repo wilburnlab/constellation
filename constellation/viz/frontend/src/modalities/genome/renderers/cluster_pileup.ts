@@ -25,7 +25,6 @@ import { renderAlignmentRows } from './_alignment_view';
 import { SettingsEnv, SettingsSchema } from '../../../panels/settings_schema';
 import {
   REFETCH_HINT,
-  generalSection,
   num,
   opacity,
   orFallback,
@@ -84,7 +83,6 @@ function modesOf(env: SettingsEnv): string[] {
 
 const SETTINGS: SettingsSchema = {
   sections: [
-    generalSection(1.0),
     {
       title: 'Style',
       controls: [

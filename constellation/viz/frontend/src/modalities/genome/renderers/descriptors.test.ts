@@ -1,7 +1,11 @@
 // What each genome track kind declares about itself to the host.
 
 import { describe, expect, it } from 'vitest';
+import { ensureSvg } from '../../../engine/svg_layer';
 import { UNKNOWN_KIND_ORDER, encodePushdown } from '../../../panels/kind';
+import { SettingsEnv, resolve } from '../../../panels/settings_schema';
+import { loadFixture, metadataFor } from '../__fixtures__/load';
+import { xScale } from '../scales';
 import { getRenderer, kindRank, registeredKinds } from './index';
 import { clusterView, minMapq } from './pushdown';
 
@@ -58,6 +62,88 @@ describe('genome track descriptors', () => {
       ['min_mapq', '20'],
       ['cluster_view', 'members'],
     ]);
+  });
+});
+
+// A control is live when drawing consults it. Each case draws a kind
+// from its kernel fixture through `style` / `filter` dicts that record
+// every key looked up, then checks that everything the popover offers
+// for that state was among them — or is a filter the server applies.
+describe('genome track settings offer nothing the track ignores', () => {
+  interface Case {
+    kind: string;
+    fixture: string;
+    domain: [number, number];
+    /** Stored filter state the popover is opened with. */
+    filter?: Record<string, unknown>;
+    /** Palette entries for categories this fixture's data does not hold;
+     *  a colour is only looked up for a category that is drawn. */
+    absentFromFixture?: string[];
+  }
+
+  const CASES: Case[] = [
+    { kind: 'reference_sequence', fixture: 'reference_sequence.letters', domain: [0, 48],
+      absentFromFixture: ['palette.U'] },
+    { kind: 'gene_annotation', fixture: 'gene_annotation', domain: [0, 12_000] },
+    { kind: 'coverage_histogram', fixture: 'coverage_histogram', domain: [0, 12_000] },
+    { kind: 'read_pileup', fixture: 'read_pileup', domain: [0, 12_000] },
+    { kind: 'cluster_pileup', fixture: 'cluster_pileup.clusters', domain: [0, 12_000] },
+    { kind: 'splice_junctions', fixture: 'splice_junctions', domain: [0, 12_000] },
+  ];
+
+  /** A dict that reports nothing set and remembers what was asked for. */
+  function recording(seen: Set<string>): Record<string, unknown> {
+    return new Proxy({}, {
+      get: (_target, key) => {
+        if (typeof key === 'string') seen.add(key);
+        return undefined;
+      },
+    });
+  }
+
+  function keysRead(c: Case): { style: Set<string>; filter: Set<string> } {
+    const read = { style: new Set<string>(), filter: new Set<string>() };
+    const svg = ensureSvg(document.createElement('div'), 1000, 120);
+    getRenderer(c.kind)!.render(loadFixture(c.fixture), 'vector', {
+      svg,
+      widthPx: 1000,
+      heightPx: 120,
+      xScale: xScale(c.domain, 1000),
+      meta: metadataFor(c.kind),
+      showLabels: true,
+      style: recording(read.style),
+      filter: recording(read.filter),
+    });
+    return read;
+  }
+
+  /** `[target, key]` for every control the popover shows in this state. */
+  function keysOffered(c: Case): Array<['style' | 'filter', string]> {
+    const env: SettingsEnv = { meta: metadataFor(c.kind), style: {}, filter: c.filter ?? {}, host: {} };
+    const out: Array<['style' | 'filter', string]> = [];
+    for (const section of getRenderer(c.kind)!.settings!.sections) {
+      if (section.when && !section.when(env)) continue;
+      for (const control of section.controls) {
+        if (control.type === 'note') continue;
+        if (control.when && !control.when(env)) continue;
+        if (control.type === 'palette') {
+          for (const entry of resolve(control.entries, env)) out.push(['style', `palette.${entry.key}`]);
+        } else {
+          out.push([control.target, control.key]);
+        }
+      }
+    }
+    return out;
+  }
+
+  it.each(CASES)('$fixture', (c) => {
+    const read = keysRead(c);
+    const pushdown = new Set(Object.keys(getRenderer(c.kind)!.pushdown ?? {}));
+    const ignored = keysOffered(c)
+      .filter(([target, key]) => !read[target].has(key))
+      .filter(([target, key]) => !(target === 'filter' && pushdown.has(key)))
+      .map(([, key]) => key);
+    expect(ignored.sort()).toEqual((c.absentFromFixture ?? []).sort());
   });
 });
 

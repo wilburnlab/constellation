@@ -21,7 +21,6 @@ import {
 import { SettingsSchema } from '../../../panels/settings_schema';
 import {
   SAMPLE_PALETTE_CYCLE,
-  generalSection,
   num,
   opacity,
   sampleOptions,
@@ -44,7 +43,6 @@ const NO_SAMPLES = 'no samples in window yet';
 
 const SETTINGS: SettingsSchema = {
   sections: [
-    generalSection(0.4),
     {
       title: 'Style',
       controls: [

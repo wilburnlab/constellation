@@ -20,7 +20,6 @@ import { SettingsSchema } from '../../../panels/settings_schema';
 import {
   REFETCH_HINT,
   SAMPLE_PALETTE_CYCLE,
-  generalSection,
   num,
   opacity,
   plainOptions,
@@ -36,7 +35,6 @@ const STRAND_FALLBACK: Record<string, string> = {
 
 const SETTINGS: SettingsSchema = {
   sections: [
-    generalSection(1.0),
     {
       title: 'Style',
       controls: [
@@ -48,7 +46,6 @@ const SETTINGS: SettingsSchema = {
           entries: [
             { key: '+', label: 'Forward strand (fallback)', default: STRAND_FALLBACK['+'] },
             { key: '-', label: 'Reverse strand (fallback)', default: STRAND_FALLBACK['-'] },
-            { key: 'default', label: 'Unstranded / default', default: STRAND_FALLBACK.default },
             // Shared across every read: sample identity lives in the exon
             // fill, so the mismatch colour stays one consistent value.
             { key: 'intron', label: 'Intron connector', default: ALIGNMENT_DEFAULTS.intron_color },

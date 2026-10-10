@@ -7,7 +7,6 @@ import {
   PaletteEntry,
   SettingsEnv,
   SettingsSchema,
-  SettingsSection,
 } from '../../../panels/settings_schema';
 
 /** Per-sample colour cycle. Shared by coverage and read pile-up so the
@@ -53,23 +52,9 @@ export function plainOptions(values: readonly string[]): Opt[] {
   return values.map((value) => ({ value, label: value }));
 }
 
-/** The "General" section every genome track's popover opens with. */
-export function generalSection(defaultOpacity: number): SettingsSection {
-  return {
-    title: 'General',
-    controls: [
-      opacity('opacity', 'Opacity', defaultOpacity),
-      { type: 'text', target: 'style', key: 'label_font_family', label: 'Label font family', default: '' },
-      num('style', 'label_font_size_px', 'Label font size (px)', 10, 6, 24, 1),
-      toggle('style', 'show_legend', 'Show legend / labels', true),
-    ],
-  };
-}
-
 /** What the popover shows for a kind with no renderer registered. */
 export const FALLBACK_SETTINGS: SettingsSchema = {
   sections: [
-    generalSection(1.0),
     { title: 'Style', controls: [{ type: 'note', text: 'no style controls for this track kind' }] },
     { title: 'Filter', controls: [{ type: 'note', text: 'no filter controls for this track kind' }] },
   ],

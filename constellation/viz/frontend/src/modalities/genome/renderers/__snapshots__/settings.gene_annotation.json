@@ -3,38 +3,6 @@
   "kind": "gene_annotation",
   "sections": [
     {
-      "title": "General",
-      "controls": [
-        {
-          "label": "Opacity",
-          "control": "number",
-          "value": "0.85",
-          "min": "0",
-          "max": "1",
-          "step": "0.05"
-        },
-        {
-          "label": "Label font family",
-          "control": "text",
-          "value": "",
-          "placeholder": "(inherit)"
-        },
-        {
-          "label": "Label font size (px)",
-          "control": "number",
-          "value": "10",
-          "min": "6",
-          "max": "24",
-          "step": "1"
-        },
-        {
-          "label": "Show legend / labels",
-          "control": "checkbox",
-          "checked": true
-        }
-      ]
-    },
-    {
       "title": "Style",
       "controls": [
         {
@@ -73,11 +41,6 @@
           "value": "#d65e5e"
         },
         {
-          "label": "default",
-          "control": "color",
-          "value": "#888888"
-        },
-        {
           "label": "Row height (px)",
           "control": "number",
           "value": "14",
@@ -92,6 +55,20 @@
           "min": "0",
           "max": "1",
           "step": "0.05"
+        },
+        {
+          "label": "Label font family",
+          "control": "text",
+          "value": "",
+          "placeholder": "(inherit)"
+        },
+        {
+          "label": "Label font size (px)",
+          "control": "number",
+          "value": "10",
+          "min": "6",
+          "max": "24",
+          "step": "1"
         },
         {
           "label": "Label min width (px)",

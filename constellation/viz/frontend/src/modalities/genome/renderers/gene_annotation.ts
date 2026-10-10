@@ -14,7 +14,7 @@ import {
   pickString,
 } from '../../../panels/style';
 import { SettingsSchema } from '../../../panels/settings_schema';
-import { generalSection, num, opacity, plainOptions, toggle } from './settings_common';
+import { num, opacity, plainOptions, toggle } from './settings_common';
 
 const TYPE_COLOR_DEFAULTS: Record<string, string> = {
   gene: '#5e8cd6',
@@ -45,20 +45,21 @@ const KNOWN_TYPES = Object.keys(TYPE_COLOR_DEFAULTS).filter((t) => t !== 'defaul
 
 const SETTINGS: SettingsSchema = {
   sections: [
-    generalSection(0.85),
     {
       title: 'Style',
       controls: [
         {
           type: 'palette',
-          entries: Object.entries(TYPE_COLOR_DEFAULTS).map(([type, color]) => ({
+          entries: KNOWN_TYPES.map((type) => ({
             key: type,
             label: type,
-            default: color,
+            default: TYPE_COLOR_DEFAULTS[type],
           })),
         },
         num('style', 'row_height_px', 'Row height (px)', DEFAULTS.row_height_px, 6, 40, 1),
         opacity('feature_opacity', 'Feature opacity', DEFAULTS.feature_opacity),
+        { type: 'text', target: 'style', key: 'label_font_family', label: 'Label font family', default: DEFAULTS.label_font_family },
+        num('style', 'label_font_size_px', 'Label font size (px)', DEFAULTS.label_font_size_px, 6, 24, 1),
         num('style', 'label_min_width_px', 'Label min width (px)', DEFAULTS.label_min_width_px, 0, 200, 1),
         toggle('style', 'show_chevrons', 'Show chevrons', DEFAULTS.show_chevrons),
         toggle('style', 'show_labels', 'Show labels', true),
