@@ -21,6 +21,16 @@ export const DEFAULT_BROWSER_OPTIONS: BrowserOptions = {
   clip_svg: false,
 };
 
+/** Validate an options blob read back from storage. Unknown keys are
+ *  dropped and missing ones take their default; a non-object is rejected. */
+export function parseBrowserOptions(raw: unknown): BrowserOptions | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const parsed = raw as Record<string, unknown>;
+  const out: BrowserOptions = { ...DEFAULT_BROWSER_OPTIONS };
+  if (typeof parsed.clip_svg === 'boolean') out.clip_svg = parsed.clip_svg;
+  return out;
+}
+
 export interface OptionsPopoverHandlers {
   onChange<K extends keyof BrowserOptions>(
     key: K,

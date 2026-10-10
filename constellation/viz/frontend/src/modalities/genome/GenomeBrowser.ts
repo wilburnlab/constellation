@@ -38,9 +38,22 @@ import {
   SourceRow,
 } from './DatasetManagerPopover';
 import {
+  LayoutEntry,
+  LayoutStore,
+  MAX_PANEL_HEIGHT,
+  MIN_PANEL_HEIGHT,
+  applyLayout,
+  createLayoutStore,
+  mergeLayoutAfterReload,
+  reorderVisible,
+  snapshotLayout,
+  visibleSorted,
+} from '../../panels/layout';
+import {
   BrowserOptions,
   DEFAULT_BROWSER_OPTIONS,
   OptionsPopover,
+  parseBrowserOptions,
 } from '../../panels/OptionsPopover';
 import { TrackSettingsPanel } from './TrackSettingsPanel';
 import './GenomeBrowser.css';
@@ -94,18 +107,6 @@ interface MountedTrack {
   cancel?: AbortController;
 }
 
-interface TrackLayoutEntry {
-  source_id: string;        // "" for reference-only bindings
-  kind: string;
-  visible: boolean;
-  display_order: number;
-  height_px: number;
-  collapsed: boolean;
-  style?: Record<string, unknown>;
-  filter?: Record<string, unknown>;
-}
-
-
 interface SessionManifest {
   session_id: string;
   label: string;
@@ -149,21 +150,17 @@ export interface GenomeBrowserOptions {
   sessionId: string;
   /** Optional initial layout (e.g. restored from a saved-session TOML).
    * Takes precedence over localStorage when present. */
-  initialLayout?: TrackLayoutEntry[];
+  initialLayout?: LayoutEntry[];
 }
 
 const LABELS_KEY = 'constellation.genome.labels';
-const layoutStorageKey = (sessionId: string): string =>
-  `constellation.genome.layout.${sessionId}`;
-const optionsStorageKey = (sessionId: string): string =>
-  `constellation.genome.options.${sessionId}`;
+/** localStorage prefix for this browser's layout + options. */
+const STORAGE_NAMESPACE = 'constellation.genome';
 const OVERVIEW_HEIGHT = 18;
 const RULER_HEIGHT = 28;
 const COLLAPSED_BODY_HEIGHT = 0;
 const SEARCH_DEBOUNCE_MS = 200;
 const LAYOUT_PERSIST_DEBOUNCE_MS = 200;
-const MIN_TRACK_HEIGHT = 24;
-const MAX_TRACK_HEIGHT = 800;
 
 // Canonical kind order — initial render stacks tracks in this order;
 // new bindings added at runtime get slotted into their kind's cluster.
@@ -176,14 +173,11 @@ const KIND_ORDER: readonly string[] = [
   'splice_junctions',
 ];
 
-const layoutKey = (sourceId: string | null | undefined, kind: string): string =>
-  `${sourceId ?? ''}|${kind}`;
-
 export class GenomeBrowser {
   readonly bus = new ViewportBus();
   private readonly host: HTMLElement;
   private readonly sessionId: string;
-  private readonly initialLayout: TrackLayoutEntry[] | null;
+  private readonly initialLayout: LayoutEntry[] | null;
   private toolbar!: HTMLElement;
   private overviewHost!: HTMLElement;
   private rulerHost!: HTMLElement;
@@ -210,11 +204,18 @@ export class GenomeBrowser {
   private persistTimer: number | null = null;
   private dragSourceTrack: MountedTrack | null = null;
   private options: BrowserOptions = { ...DEFAULT_BROWSER_OPTIONS };
+  private readonly layoutStore: LayoutStore<BrowserOptions>;
 
   constructor(opts: GenomeBrowserOptions) {
     this.host = opts.host;
     this.sessionId = opts.sessionId;
     this.initialLayout = opts.initialLayout ?? null;
+    this.layoutStore = createLayoutStore<BrowserOptions>({
+      namespace: STORAGE_NAMESPACE,
+      sessionId: this.sessionId,
+      parseOptions: parseBrowserOptions,
+      savedSlug: () => this.manifest?.saved_as ?? null,
+    });
   }
 
   async mount(): Promise<void> {
@@ -466,53 +467,17 @@ export class GenomeBrowser {
   // Layout state — persistence + apply
   // --------------------------------------------------------------------
 
-  private snapshotLayout(): TrackLayoutEntry[] {
-    return this.tracks.map((t) => {
-      const entry: TrackLayoutEntry = {
-        source_id: t.entry.source_id ?? '',
-        kind: t.entry.kind,
-        visible: t.visible,
-        display_order: t.displayOrder,
-        height_px: Math.round(t.heightPx),
-        collapsed: t.collapsed,
-      };
-      if (Object.keys(t.style).length > 0) entry.style = { ...t.style };
-      if (Object.keys(t.filter).length > 0) entry.filter = { ...t.filter };
-      return entry;
-    });
-  }
-
   private applyPersistedLayout(): void {
     // Browser-wide options are loaded independently of track layout.
-    const storedOptions = readOptionsFromStorage(this.sessionId);
+    const storedOptions = this.layoutStore.loadOptions();
     if (storedOptions) this.options = { ...this.options, ...storedOptions };
 
-    let entries: TrackLayoutEntry[] | null = this.initialLayout;
+    let entries: LayoutEntry[] | null = this.initialLayout;
     if (!entries || entries.length === 0) {
-      entries = readLayoutFromStorage(this.sessionId);
+      entries = this.layoutStore.loadLayout();
     }
     if (!entries || entries.length === 0) return;
-    const byKey = new Map<string, TrackLayoutEntry>();
-    for (const e of entries) {
-      byKey.set(layoutKey(e.source_id || null, e.kind), e);
-    }
-    for (const t of this.tracks) {
-      const e = byKey.get(layoutKey(t.entry.source_id, t.entry.kind));
-      if (!e) continue;
-      t.visible = e.visible;
-      t.collapsed = e.collapsed;
-      t.displayOrder = e.display_order;
-      if (
-        Number.isFinite(e.height_px) &&
-        e.height_px >= MIN_TRACK_HEIGHT
-      ) {
-        t.heightPx = Math.min(MAX_TRACK_HEIGHT, e.height_px);
-      }
-      if (e.style && typeof e.style === 'object') t.style = { ...e.style };
-      if (e.filter && typeof e.filter === 'object') t.filter = { ...e.filter };
-      t.collapseBtn.textContent = t.collapsed ? '▸' : '▾';
-      t.collapseBtn.title = t.collapsed ? 'Expand track' : 'Collapse track';
-    }
+    applyLayout(this.tracks, entries, syncCollapseButton);
   }
 
   private schedulePersistLayout(): void {
@@ -526,23 +491,7 @@ export class GenomeBrowser {
   }
 
   private persistLayoutNow(): void {
-    const entries = this.snapshotLayout();
-    writeLayoutToStorage(this.sessionId, entries);
-    writeOptionsToStorage(this.sessionId, this.options);
-    const slug = this.manifest?.saved_as ?? null;
-    if (slug) {
-      const payload: Record<string, unknown> = {
-        track_layout: entries,
-        options: { ...this.options },
-      };
-      fetchJsonMethod<unknown>(
-        `/api/saved-sessions/${encodeURIComponent(slug)}/layout`,
-        'PATCH',
-        payload,
-      ).catch((err) => {
-        console.warn('failed to PATCH saved-session layout', err);
-      });
-    }
+    this.layoutStore.save(snapshotLayout(this.tracks), this.options);
   }
 
   // --------------------------------------------------------------------
@@ -612,17 +561,7 @@ export class GenomeBrowser {
   }
 
   private reorderTrack(moved: MountedTrack, target: MountedTrack): void {
-    const visible = this.visibleSortedTracks();
-    const movedIdx = visible.indexOf(moved);
-    const targetIdx = visible.indexOf(target);
-    if (movedIdx === -1 || targetIdx === -1) return;
-    visible.splice(movedIdx, 1);
-    visible.splice(targetIdx, 0, moved);
-    visible.forEach((t, i) => {
-      t.displayOrder = i;
-    });
-    // Hidden tracks retain their existing order values; they don't
-    // participate in the visible sequence but persist for re-show.
+    if (!reorderVisible(this.tracks, moved, target)) return;
     this.refreshTrackStackOrder();
     this.schedulePersistLayout();
   }
@@ -640,8 +579,8 @@ export class GenomeBrowser {
       if (!active) return;
       const dy = e.clientY - startY;
       const next = Math.max(
-        MIN_TRACK_HEIGHT,
-        Math.min(MAX_TRACK_HEIGHT, startH + dy),
+        MIN_PANEL_HEIGHT,
+        Math.min(MAX_PANEL_HEIGHT, startH + dy),
       );
       track.heightPx = next;
       // Live re-render is heavy; just resize the body and re-render on
@@ -677,9 +616,7 @@ export class GenomeBrowser {
   // --------------------------------------------------------------------
 
   private visibleSortedTracks(): MountedTrack[] {
-    return this.tracks
-      .filter((t) => t.visible)
-      .sort((a, b) => a.displayOrder - b.displayOrder);
+    return visibleSorted(this.tracks);
   }
 
   private refreshTrackStackOrder(): void {
@@ -997,7 +934,7 @@ export class GenomeBrowser {
       this.scheduleRender();
       return;
     }
-    const heightPx = Math.max(MIN_TRACK_HEIGHT, Math.round(track.heightPx));
+    const heightPx = Math.max(MIN_PANEL_HEIGHT, Math.round(track.heightPx));
     const svg = ensureSvg(track.bodyHost, widthPx, heightPx);
     const ctx = {
       svg,
@@ -1061,7 +998,7 @@ export class GenomeBrowser {
     // Any open per-track settings popover anchors a torn-down DOM node
     // — close it before the rebuild.
     this.closeSettingsPanel();
-    const previous = this.snapshotLayout();
+    const previous = snapshotLayout(this.tracks);
     for (const t of this.tracks) {
       t.cancel?.abort();
       t.panel.remove();
@@ -1069,76 +1006,12 @@ export class GenomeBrowser {
     this.tracks = [];
     await this.loadManifest();
     await this.loadAvailableTracks();
-    this.mergeLayoutAfterReload(previous);
+    mergeLayoutAfterReload(this.tracks, previous, kindRank, syncCollapseButton);
     this.refreshTrackStackOrder();
     this.updateTrackCountStatus();
     this.refreshPopoverIfOpen();
     this.schedulePersistLayout();
     this.scheduleRender();
-  }
-
-  private mergeLayoutAfterReload(previous: TrackLayoutEntry[]): void {
-    const byKey = new Map<string, TrackLayoutEntry>();
-    for (const e of previous) {
-      byKey.set(layoutKey(e.source_id || null, e.kind), e);
-    }
-    // Maximum displayOrder we've seen so we can extend it for fresh
-    // bindings that weren't in the previous snapshot.
-    let maxOrder = previous.reduce(
-      (m, e) => (e.display_order > m ? e.display_order : m),
-      -1,
-    );
-    for (const t of this.tracks) {
-      const e = byKey.get(layoutKey(t.entry.source_id, t.entry.kind));
-      if (e) {
-        t.visible = e.visible;
-        t.collapsed = e.collapsed;
-        t.displayOrder = e.display_order;
-        if (
-          Number.isFinite(e.height_px) &&
-          e.height_px >= MIN_TRACK_HEIGHT
-        ) {
-          t.heightPx = Math.min(MAX_TRACK_HEIGHT, e.height_px);
-        }
-        if (e.style && typeof e.style === 'object') t.style = { ...e.style };
-        if (e.filter && typeof e.filter === 'object') t.filter = { ...e.filter };
-        t.collapseBtn.textContent = t.collapsed ? '▸' : '▾';
-        t.collapseBtn.title = t.collapsed
-          ? 'Expand track'
-          : 'Collapse track';
-      } else {
-        // New binding: slot it in at the end of its kind cluster.
-        maxOrder += 1;
-        t.displayOrder = this.computeInsertOrder(t, byKey, maxOrder);
-      }
-    }
-  }
-
-  private computeInsertOrder(
-    track: MountedTrack,
-    previousByKey: Map<string, TrackLayoutEntry>,
-    fallback: number,
-  ): number {
-    // Find the largest display_order in `previousByKey` whose kindRank
-    // is <= this track's kindRank. Place new binding right after that.
-    const rank = kindRank(track.entry.kind);
-    let bestOrder = -1;
-    for (const e of previousByKey.values()) {
-      if (kindRank(e.kind) <= rank && e.display_order > bestOrder) {
-        bestOrder = e.display_order;
-      }
-    }
-    // Push downstream entries by 1 to make room. This is small (≤10s of
-    // tracks) so the O(N) shift is fine.
-    if (bestOrder === -1) return fallback;
-    const insertAt = bestOrder + 1;
-    for (const t of this.tracks) {
-      if (t === track) continue;
-      if (t.displayOrder >= insertAt) {
-        t.displayOrder += 1;
-      }
-    }
-    return insertAt;
   }
 
   // --------------------------------------------------------------------
@@ -1349,7 +1222,7 @@ export class GenomeBrowser {
       }
       track.cancel?.abort();
       track.cancel = new AbortController();
-      const heightPx = Math.max(MIN_TRACK_HEIGHT, Math.round(track.heightPx));
+      const heightPx = Math.max(MIN_PANEL_HEIGHT, Math.round(track.heightPx));
       const svg = ensureSvg(track.bodyHost, widthPx, heightPx);
       const ctx = {
         svg,
@@ -1509,58 +1382,10 @@ function warningFor(
   return null;
 }
 
-function readLayoutFromStorage(sessionId: string): TrackLayoutEntry[] | null {
-  try {
-    const raw = window.localStorage.getItem(layoutStorageKey(sessionId));
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return null;
-    return parsed as TrackLayoutEntry[];
-  } catch {
-    return null;
-  }
-}
-
-function writeLayoutToStorage(
-  sessionId: string,
-  entries: TrackLayoutEntry[],
-): void {
-  try {
-    window.localStorage.setItem(
-      layoutStorageKey(sessionId),
-      JSON.stringify(entries),
-    );
-  } catch {
-    // ignored — storage may be disabled
-  }
-}
-
-function readOptionsFromStorage(sessionId: string): BrowserOptions | null {
-  try {
-    const raw = window.localStorage.getItem(optionsStorageKey(sessionId));
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') return null;
-    const out: BrowserOptions = { ...DEFAULT_BROWSER_OPTIONS };
-    if (typeof parsed.clip_svg === 'boolean') out.clip_svg = parsed.clip_svg;
-    return out;
-  } catch {
-    return null;
-  }
-}
-
-function writeOptionsToStorage(
-  sessionId: string,
-  options: BrowserOptions,
-): void {
-  try {
-    window.localStorage.setItem(
-      optionsStorageKey(sessionId),
-      JSON.stringify(options),
-    );
-  } catch {
-    // ignored — storage may be disabled
-  }
+/** Bring a track's collapse button in line with its restored state. */
+function syncCollapseButton(t: MountedTrack): void {
+  t.collapseBtn.textContent = t.collapsed ? '▸' : '▾';
+  t.collapseBtn.title = t.collapsed ? 'Expand track' : 'Collapse track';
 }
 
 function labeled(labelText: string, control: HTMLElement): HTMLElement {
