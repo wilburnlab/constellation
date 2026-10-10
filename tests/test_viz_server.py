@@ -31,7 +31,7 @@ from constellation.viz.server.arrow_stream import (  # noqa: E402
     collect_to_table,
     encode_ipc_stream,
 )
-from constellation.viz.server.session import Session  # noqa: E402
+from _viz_fixtures import Session, open_session  # noqa: E402
 from constellation.viz.tracks.coverage_histogram import (  # noqa: E402
     COVERAGE_VECTOR_SCHEMA,
 )
@@ -714,10 +714,7 @@ def cluster_pileup_client(tmp_path: Path, monkeypatch) -> TestClient:
         sequences=[{"contig_id": 1, "sequence": "N" * 100}],
     )
     # Re-open with the explicit (align + cluster) source pair.
-    from constellation.viz.server.session import Session
-
-    session = Session.open(
-        reference_handle=DEFAULT_HANDLE,
+    session = open_session(
         sources=[
             {"path": str(align_dir), "kind": "align"},
             {"path": str(cluster_dir), "kind": "cluster"},

@@ -30,8 +30,7 @@ from constellation.viz.tracks.coverage_histogram import (
     COVERAGE_VECTOR_SCHEMA,
     CoverageHistogramKernel,
 )
-from constellation.viz.server.session import Session
-from _viz_fixtures import build_viz_session
+from _viz_fixtures import Session, build_viz_session, kernel_query
 
 
 # ----------------------------------------------------------------------
@@ -181,7 +180,7 @@ def test_coverage_kernel_fetch_emits_wire_schema(
     kernel = get_kernel("coverage_histogram")
     [binding] = kernel.discover(session)
 
-    query = TrackQuery(contig="chr1", start=0, end=100)
+    query = kernel_query("coverage_histogram", contig="chr1", start=0, end=100)
     mode = kernel.threshold(binding, query)
     assert mode is ThresholdDecision.VECTOR
 
@@ -207,7 +206,7 @@ def test_coverage_kernel_fetch_unknown_contig_is_empty(
     kernel = get_kernel("coverage_histogram")
     [binding] = kernel.discover(session)
 
-    query = TrackQuery(contig="chrX_unknown", start=0, end=1000)
+    query = kernel_query("coverage_histogram", contig="chrX_unknown", start=0, end=1000)
     batches = list(kernel.fetch(binding, query, ThresholdDecision.VECTOR))
     assert batches == []
 
@@ -245,6 +244,6 @@ def test_coverage_kernel_estimate_vector_cost_matches_row_count(
     )
     kernel = get_kernel("coverage_histogram")
     [binding] = kernel.discover(session)
-    query = TrackQuery(contig="chr1", start=0, end=150)
+    query = kernel_query("coverage_histogram", contig="chr1", start=0, end=150)
     cost = kernel.estimate_vector_cost(binding, query)
     assert cost == 2  # only the rows overlapping [0, 150)

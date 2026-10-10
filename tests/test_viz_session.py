@@ -17,12 +17,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from constellation.viz.server.session import Session
 from _viz_fixtures import (
     DEFAULT_ASSEMBLY,
     DEFAULT_HANDLE,
     build_viz_session,
     install_fake_reference,
+    open_session,
     write_align_source,
 )
 
@@ -157,8 +157,7 @@ def test_open_legacy_manifest_is_rejected(
         )
     )
     with pytest.raises(ValueError, match="schema_version"):
-        Session.open(
-            reference_handle=DEFAULT_HANDLE,
+        open_session(
             sources=[{"path": str(legacy), "kind": "align"}],
         )
 
@@ -180,8 +179,7 @@ def test_open_handle_kind_mismatch_raises(
         reference_path=str(cache_root / "test_org" / "local_import-20260522"),
     )
     with pytest.raises(ValueError, match="kind"):
-        Session.open(
-            reference_handle=DEFAULT_HANDLE,
+        open_session(
             sources=[{"path": str(align_dir), "kind": "cluster"}],
         )
     # Sanity: session_dir was built ok and supports to_manifest().
@@ -240,8 +238,7 @@ def test_open_resolves_cwd_relative_outputs(
     }
     (align_dir / "manifest.json").write_text(json.dumps(manifest))
 
-    session = Session.open(
-        reference_handle=DEFAULT_HANDLE,
+    session = open_session(
         sources=[{"path": str(align_dir), "kind": "align"}],
     )
     assert session.sources[0].coverage == (align_dir / "coverage.parquet").resolve()
@@ -273,7 +270,7 @@ def test_open_unknown_handle_errors(tmp_path: Path, monkeypatch) -> None:
     cache_root.mkdir()
     monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache_root))
     with pytest.raises(ValueError, match="could not be resolved"):
-        Session.open(
+        open_session(
             reference_handle="missing_org@local_import-20260522",
             sources=[],
         )

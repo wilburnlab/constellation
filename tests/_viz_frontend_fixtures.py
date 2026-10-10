@@ -28,16 +28,16 @@ from typing import Any
 import pyarrow as pa
 
 from _viz_fixtures import (
-    DEFAULT_HANDLE,
+    Session,
     install_fake_reference,
+    kernel_query,
+    open_session,
     write_align_source,
     write_cluster_source,
 )
-from constellation.viz.server.session import Session
 from constellation.viz.tracks.base import (
     HYBRID_SCHEMA,
     ThresholdDecision,
-    TrackQuery,
     get_kernel,
 )
 
@@ -318,8 +318,7 @@ def _build_session(tmp_path: Path, monkeypatch) -> Session:
         cluster_membership=_MEMBERSHIP,
         align_dir=str(align_dir),
     )
-    return Session.open(
-        reference_handle=DEFAULT_HANDLE,
+    return open_session(
         sources=[
             {"path": str(align_dir), "kind": "align", "label": "run-a"},
             {"path": str(cluster_dir), "kind": "cluster", "label": "run-a clusters"},
@@ -340,12 +339,12 @@ def decode(data: bytes) -> pa.Table:
 
 
 # (file stem, kernel kind, binding_id, query, optional row cap)
-_VECTOR_CASES: list[tuple[str, str, str, TrackQuery, int | None]] = [
+_VECTOR_CASES: list[tuple[str, str, str, Any, int | None]] = [
     (
         "reference_sequence.letters",
         "reference_sequence",
         "reference_sequence",
-        TrackQuery(contig=_CONTIG, start=0, end=48),
+        kernel_query("reference_sequence", contig=_CONTIG, start=0, end=48),
         None,
     ),
     (
@@ -354,47 +353,48 @@ _VECTOR_CASES: list[tuple[str, str, str, TrackQuery, int | None]] = [
         "reference_sequence.decimated",
         "reference_sequence",
         "reference_sequence",
-        TrackQuery(contig=_CONTIG, start=0, end=_CONTIG_LENGTH),
+        kernel_query("reference_sequence", contig=_CONTIG, start=0, end=_CONTIG_LENGTH),
         12,
     ),
     (
         "gene_annotation",
         "gene_annotation",
         "reference",
-        TrackQuery(contig=_CONTIG, start=0, end=3000),
+        kernel_query("gene_annotation", contig=_CONTIG, start=0, end=3000),
         None,
     ),
     (
         "coverage_histogram",
         "coverage_histogram",
         "coverage-0",
-        TrackQuery(contig=_CONTIG, start=0, end=3000),
+        kernel_query("coverage_histogram", contig=_CONTIG, start=0, end=3000),
         None,
     ),
     (
         "read_pileup",
         "read_pileup",
         "read_pileup-0",
-        TrackQuery(contig=_CONTIG, start=0, end=1000, viewport_px=1000),
+        kernel_query("read_pileup", contig=_CONTIG, start=0, end=1000, viewport_px=1000),
         None,
     ),
     (
         "cluster_pileup.clusters",
         "cluster_pileup",
         "cluster_pileup-1",
-        TrackQuery(contig=_CONTIG, start=0, end=1000, viewport_px=1000),
+        kernel_query("cluster_pileup", contig=_CONTIG, start=0, end=1000, viewport_px=1000),
         None,
     ),
     (
         "cluster_pileup.members",
         "cluster_pileup",
         "cluster_pileup-1",
-        TrackQuery(
+        kernel_query(
+            "cluster_pileup",
             contig=_CONTIG,
             start=0,
             end=1000,
             viewport_px=1000,
-            mode_extra={"cluster_view": "members"},
+            cluster_view="members",
         ),
         None,
     ),
@@ -402,7 +402,7 @@ _VECTOR_CASES: list[tuple[str, str, str, TrackQuery, int | None]] = [
         "splice_junctions",
         "splice_junctions",
         "splice_junctions-0",
-        TrackQuery(contig=_CONTIG, start=0, end=3000),
+        kernel_query("splice_junctions", contig=_CONTIG, start=0, end=3000),
         None,
     ),
 ]

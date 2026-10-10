@@ -39,6 +39,7 @@ from constellation.sequencing.transcriptome.manifest import (
     write_cluster_manifest,
 )
 from constellation.viz.server.session import Session
+from constellation.viz.tracks.base import TrackQuery
 
 
 DEFAULT_HANDLE = "test_org@local_import-20260522"
@@ -58,6 +59,37 @@ _DEFAULT_CONTIGS: list[dict[str, Any]] = [
 _DEFAULT_SEQUENCES: list[dict[str, Any]] = [
     {"contig_id": 1, "sequence": "ACGTACGTACGTACGT" * 10}
 ]
+
+
+def kernel_query(
+    kind: str, *, cluster_view: str | None = None, **fields: Any
+) -> TrackQuery:
+    """Build the query the ``kind`` kernel takes.
+
+    Tests construct queries through this rather than naming the query
+    type, so that type can become kernel-specific without touching every
+    test. ``cluster_view`` selects cluster_pileup's view.
+    """
+    del kind  # every kernel shares one query type today
+    mode_extra = {"cluster_view": cluster_view} if cluster_view else {}
+    return TrackQuery(mode_extra=mode_extra, **fields)
+
+
+def open_session(
+    *,
+    sources: list[dict[str, Any]],
+    reference_handle: str = "",
+    label: str | None = None,
+) -> Session:
+    """Open a genome session against the (monkeypatched) reference cache.
+
+    The one place tests name the session constructor.
+    """
+    return Session.open(
+        reference_handle=reference_handle or DEFAULT_HANDLE,
+        sources=sources,
+        label=label,
+    )
 
 
 def install_fake_reference(
@@ -314,7 +346,7 @@ def build_viz_session(
                 {"path": str(src_dir), "kind": "cluster", "label": label_arg or f"cluster-{i}"}
             )
 
-    return Session.open(
+    return open_session(
         reference_handle=handle,
         sources=sources_payload,
         label=label,
