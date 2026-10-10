@@ -4,7 +4,13 @@
 
 - **Stage 0 (PR A) — housekeeping and safety net:** implemented on
   `chore/viz-foundation-housekeeping` (2026-10-09).
-- **Stage 1 (PR B) — backend contracts:** not started.
+- **Stage 1 (PR B) — backend contracts:** implemented on
+  `feat/viz-modality-backend` (2026-10-09), stacked on the Stage 0 branch.
+  Two departures from the steps below, both forced by the code: the
+  import-boundary test landed with step 3 rather than step 2 (two of the
+  six import sites were still in core endpoints until the routes moved),
+  and the per-modality request models cover the saved-session POST as
+  well as session open.
 - **Stage 2 (PR C) — frontend factoring:** not started.
 
 Plan approved 2026-10-09. Companion to

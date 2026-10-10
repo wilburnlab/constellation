@@ -52,13 +52,15 @@ core  ─►  {massspec, sequencing, structure, codon, nmr,
            chromatography, electrophoresis}  ─►  cli
            (domain modules — never cross-import)             ▲
                                                              │
-                                       viz ─────────read parquet only,
-                                            never imports a domain module
+                                       viz ─────────reads parquet; its core
+                                            imports no domain module, a
+                                            modality only a declared,
+                                            pure-function surface
 ```
 
 Domain modules import from `core` and from `thirdparty` adapters; they **never cross-import to another domain module**. If a workflow legitimately spans modalities (e.g. the transcriptomic → proteomic pipeline), it lives as a thin top-level script under `constellation/` that imports from the relevant domains — no dedicated `bridges/` or `pipelines/` folder until we have ≥2 such workflows to compare.
 
-`viz` is a peer to the domain modules with a stricter constraint: it consumes the parquet outputs the domain pipelines produce (via `pa.dataset.dataset(path)` + filter pushdown) but never imports a domain module's Python API at runtime. The cli dispatcher lazy-imports `viz.cli` so the `[viz]` extras (fastapi / uvicorn / datashader) only become required when the user actually invokes a viz subcommand. The viz layer is then imported by `cli` like any other domain wiring.
+`viz` is a peer to the domain modules with a stricter constraint: it consumes the parquet outputs the domain pipelines produce (via `pa.dataset.dataset(path)` + filter pushdown) rather than their Python API. The rule has two tiers, both enforced by `tests/test_viz_import_boundary.py`. The viz **core** (`viz/server/`, `viz/tracks/base.py`, `viz/raster/`, `viz/sessions/`, ...) imports no domain module at all. A **modality** package (`viz/modalities/<name>/` — `genome` today) may import a small pure-function surface from one — a manifest reader, a handle resolver, a grammar parser — provided each name is declared in the package's `DOMAIN_IMPORTS`, the import sits inside a function body, and the object is a function or an exception class. `cli/__main__.py` imports `viz.cli` while building the parser for every command, so nothing reached by `import constellation.viz` may need the `[viz]` extras (fastapi / pydantic / uvicorn / datashader) or load a domain module; `tests/test_viz_base_install.py` enforces that, and the release workflow depends on it because it packs the frontend from a base install. The extras only become required when a viz subcommand actually runs.
 
 Adding a new module: confirm its place in this DAG before touching imports. Adding a new reader (Bruker `.d`, Sciex `.wiff`, DCD trajectory, ...) follows the reader-subclasses-core.io.readers rule without special handling.
 
