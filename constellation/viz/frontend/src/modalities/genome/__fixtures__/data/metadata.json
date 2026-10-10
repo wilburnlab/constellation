@@ -1,0 +1,73 @@
+{
+  "cluster_pileup/cluster_pileup-1": {
+    "binding_id": "cluster_pileup-1",
+    "cluster_view_supported": true,
+    "default_height_px": 200,
+    "kind": "cluster_pileup",
+    "label": "Transcript clusters (run-a clusters)",
+    "mismatch_glyph_bp_per_pixel_limit": 5.0,
+    "modes_in_data": [
+      "em",
+      "genome",
+      "kmer"
+    ],
+    "vector_bp_per_pixel_limit": 50.0,
+    "vector_glyph_limit": 6000
+  },
+  "coverage_histogram/coverage-0": {
+    "binding_id": "coverage-0",
+    "default_height_px": 80,
+    "depth_max": 12.0,
+    "kind": "coverage_histogram",
+    "label": "Coverage (run-a)",
+    "samples_in_data": [
+      0,
+      1
+    ]
+  },
+  "gene_annotation/reference": {
+    "binding_id": "reference",
+    "default_height_px": 60,
+    "feature_limit": 2000,
+    "kind": "gene_annotation",
+    "label": "Annotation (reference)",
+    "source": "reference"
+  },
+  "read_pileup/read_pileup-0": {
+    "binding_id": "read_pileup-0",
+    "default_height_px": 240,
+    "kind": "read_pileup",
+    "label": "Reads (run-a)",
+    "mismatch_glyph_bp_per_pixel_limit": 5.0,
+    "sample_names": [
+      "alpha",
+      "beta"
+    ],
+    "samples_in_data": [
+      1,
+      2
+    ],
+    "vector_bp_per_pixel_limit": 50.0,
+    "vector_glyph_limit": 4000
+  },
+  "reference_sequence/reference_sequence": {
+    "binding_id": "reference_sequence",
+    "default_height_px": 24,
+    "kind": "reference_sequence",
+    "label": "Reference sequence",
+    "vector_glyph_limit": 5000
+  },
+  "splice_junctions/splice_junctions-0": {
+    "binding_id": "splice_junctions-0",
+    "default_height_px": 80,
+    "kind": "splice_junctions",
+    "label": "Splice junctions (run-a)",
+    "max_support": 40,
+    "motifs_in_data": [
+      "AT-AC",
+      "GC-AG",
+      "GT-AG"
+    ],
+    "vector_glyph_limit": 1500
+  }
+}

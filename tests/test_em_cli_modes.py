@@ -88,10 +88,9 @@ def test_the_frontend_colour_maps_keep_the_old_keys():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1] / "constellation" / "viz" / "frontend"
-    for rel in (
-        "src/track_renderers/cluster_pileup.ts",
-        "src/widgets/TrackSettingsPanel.ts",
-    ):
+    # One map now: the renderer's, which its settings popover also reads its
+    # default swatches from (there used to be a second copy in the popover).
+    for rel in ("src/modalities/genome/renderers/cluster_pileup.ts",):
         text = (root / rel).read_text()
         for key in (*CLUSTER_MODES, *LEGACY_CLUSTER_MODES):
             assert f"'{key}'" in text or f"{key}:" in text, (rel, key)

@@ -31,9 +31,12 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pyarrow as pa
+
+if TYPE_CHECKING:
+    from constellation.viz.server.session import SessionLike
 
 
 # ----------------------------------------------------------------------
@@ -75,43 +78,36 @@ class ThresholdDecision(StrEnum):
 # ----------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class TrackQuery:
-    """A single read request from the frontend.
+    """The modality-neutral part of a read request.
 
-    `viewport_px` is the on-screen width the client intends to draw the
-    track at; `max_glyphs` is the client's ceiling for per-glyph rendering
-    (when exceeded, kernels switch to hybrid). Both are advisory — the
-    kernel's threshold logic is the source of truth, but the client values
-    let kernels make zoom-aware decisions.
+    A kernel declares the query it takes as ``query_model``: a subclass
+    adding the fields that say *what* to read (a locus for the genome
+    kernels; a retention-time or m/z window for a mass-spec one). The
+    data endpoint validates the request's query string against that
+    model, so the fields a kernel declares are exactly the parameters of
+    its endpoint and nothing kernel-specific is named in shared code.
 
-    `force` is the optional `?force=vector|hybrid` override; when set, the
-    kernel must honor it (or, in the case of `force=vector` with a too-
-    expensive payload, return vector with a truncated flag in the response
-    metadata — handled at the server layer, not the kernel).
+    Subclasses are stdlib keyword-only frozen dataclasses. Range
+    constraints go in ``field(metadata=...)`` using pydantic ``Field``
+    keyword names (``ge``, ``le``, ...) and fail validation with HTTP
+    422; rules spanning several fields go in :meth:`check` (HTTP 400).
+    The names ``session`` and ``binding`` are taken by the endpoint.
 
-    `min_mapq` is a kernel-pushdown filter (read_pileup only at present)
-    — alignments with ``mapq < min_mapq`` are dropped at scan time. The
-    default of 0 admits every primary alignment and matches pre-PR-4
-    behavior. Other kernels ignore it.
+    ``viewport_px`` is the on-screen width the client intends to draw
+    at, which lets a kernel make zoom-aware decisions.
 
-    `mode_extra` is a generic per-kernel kwargs bag. First use:
-    ``cluster_view: 'clusters' | 'members'`` on cluster_pileup
-    (cluster-rectangle view vs per-member read view). Future kernels
-    add their own keys without bloating the TrackQuery surface. Empty
-    dict by default — kernels that don't read a key see no behavior
-    change.
+    ``force`` is the optional ``?force=vector|hybrid`` override; when
+    set, the kernel must honor it.
     """
 
-    contig: str
-    start: int
-    end: int
-    samples: tuple[str, ...] = ()
-    viewport_px: int = 1200
-    max_glyphs: int = 50_000
+    viewport_px: int = field(default=1200, metadata={"ge": 1, "le": 8192})
     force: ThresholdDecision | None = None
-    min_mapq: int = 0
-    mode_extra: dict[str, str] = field(default_factory=dict)
+
+    def check(self) -> None:
+        """Raise ``ValueError`` if the fields are inconsistent with each
+        other. Subclasses extend this with ``super().check()``."""
 
 
 @dataclass(frozen=True)
@@ -143,28 +139,37 @@ class TrackKernel(ABC):
     """Per-modality data kernel. Concrete subclasses register via
     `@register_track` so the server can look them up by `kind`.
 
-    Subclasses MUST set the class-level attributes `kind` and `schema`. The
-    `schema` is the *vector-mode* wire schema; hybrid-mode payloads always
-    use `HYBRID_SCHEMA`.
+    Subclasses MUST set the class-level attributes `kind`, `modality` and
+    `schema`, and set `query_model` when they take more than the base
+    query. The `schema` is the *vector-mode* wire schema; hybrid-mode
+    payloads always use `HYBRID_SCHEMA`.
 
-    Threshold defaults (`vector_glyph_limit`, `vector_bp_per_pixel_limit`)
-    are class attributes so kernels can override them and tunings can land
-    without touching the threshold method body.
+    Threshold defaults (`vector_glyph_limit`, plus whatever a modality's
+    own base class adds) are class attributes so kernels can override
+    them and tunings can land without touching the threshold method body.
     """
 
     #: Short string identifier — must be unique across registered kernels.
     kind: ClassVar[str]
 
+    #: Registry key of the modality this kernel belongs to
+    #: (``constellation.viz.modalities``). A kernel is only ever asked
+    #: about sessions of its own modality.
+    modality: ClassVar[str]
+
     #: Vector-mode wire schema. Hybrid mode always uses `HYBRID_SCHEMA`.
     schema: ClassVar[pa.Schema]
 
-    #: Default threshold knobs (kernels override as appropriate). A kernel
-    #: that's always vector (e.g. coverage_histogram) leaves these unused.
+    #: The query this kernel takes. The data endpoint builds an instance
+    #: of it from the request's query string.
+    query_model: ClassVar[type[TrackQuery]] = TrackQuery
+
+    #: Default threshold knob (kernels override as appropriate). A kernel
+    #: that's always vector (e.g. coverage_histogram) leaves it unused.
     vector_glyph_limit: ClassVar[int] = 4_000
-    vector_bp_per_pixel_limit: ClassVar[float] = 50.0
 
     @abstractmethod
-    def discover(self, session: "Session") -> list[TrackBinding]:  # noqa: F821
+    def discover(self, session: "SessionLike") -> list[TrackBinding]:
         """Return all renderable bindings this kernel can produce for the
         given session. Empty list when no relevant outputs are present."""
 
@@ -197,7 +202,7 @@ class TrackKernel(ABC):
         Default: ``HYBRID_SCHEMA`` when ``mode`` is hybrid, otherwise
         ``self.schema``. Kernels that emit more than one vector-mode
         schema (cluster_pileup branches between cluster-rectangle and
-        per-member-read views via ``query.mode_extra['cluster_view']``)
+        per-member-read views on its query's ``cluster_view``)
         override this. The endpoint passes the returned schema to the
         Arrow IPC writer, so it must match the batches yielded by
         ``fetch`` exactly.
@@ -205,6 +210,13 @@ class TrackKernel(ABC):
         if mode is ThresholdDecision.HYBRID:
             return HYBRID_SCHEMA
         return self.schema
+
+    def response_headers(
+        self, query: TrackQuery, mode: ThresholdDecision
+    ) -> dict[str, str]:
+        """Extra response headers for a data request, beyond the
+        ``X-Track-Mode`` / ``X-Track-Kind`` the endpoint always sends."""
+        return {}
 
     # ------------------------------------------------------------------
     # Helpers shared by kernel implementations
@@ -245,6 +257,11 @@ def register_track(cls: type[TrackKernel]) -> type[TrackKernel]:
         raise TypeError(f"{cls.__name__} must set a non-empty `kind` class attribute")
     if cls.kind in _REGISTRY:
         raise ValueError(f"track kernel {cls.kind!r} already registered")
+    modality = getattr(cls, "modality", None)
+    if not isinstance(modality, str) or not modality:
+        raise TypeError(
+            f"{cls.__name__} must set a non-empty `modality` class attribute"
+        )
     _REGISTRY[cls.kind] = cls()
     return cls
 
@@ -268,7 +285,7 @@ def registered_kinds() -> list[str]:
 
 
 def iter_sources_with(session, *attrs):
-    """Yield ``(index, SessionSource)`` for sources where every attribute
+    """Yield ``(index, source)`` for sources where every attribute
     in ``attrs`` resolves to a non-None Path.
 
     The index is used by kernels to make binding_ids deterministic

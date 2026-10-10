@@ -13,8 +13,9 @@ caches (env override → XDG → home), so all three siblings under
 Schema v2 (current)::
 
     schema_version = 2
+    modality = "genome"       # which browser this configuration is for
     label = "..."
-    reference_handle = "<organism>@<source>-<release>"
+    reference_handle = "<organism>@<source>-<release>"   # genome sessions
     saved_at = "2026-05-22T..."
 
     [[sources]]
@@ -55,6 +56,12 @@ to the v2 schema — older Constellations reading a file that includes
 them silently drop the unknown keys; newer Constellations reading an
 older v2 file see absent options + empty per-entry style/filter and
 fall back to defaults. No schema_version bump is required.
+
+``modality`` is the same kind of extension. A file without the key was
+written before modalities existed and is a genome session. The top-level
+``reference_handle`` and ``[last_viewed_locus]`` are the genome
+modality's keys, kept where they have always been so existing files read
+unchanged; ``reference_handle`` is required only for a genome session.
 """
 
 from __future__ import annotations
@@ -66,6 +73,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from constellation.viz.modalities import DEFAULT_MODALITY
 
 
 SAVED_SESSION_SCHEMA_VERSION = 2
@@ -110,17 +119,21 @@ class SavedSession:
 
     slug: str
     label: str
-    reference_handle: str
+    reference_handle: str = ""
     sources: list[dict[str, Any]] = field(default_factory=list)
     saved_at: str = ""
     last_viewed_locus: dict[str, Any] | None = None
     track_layout: list[dict[str, Any]] | None = None
     options: dict[str, Any] | None = None
     path: Path | None = None  # populated by readers; absent on fresh constructs
+    #: Registry key of the modality (``constellation.viz.modalities``)
+    #: this configuration belongs to.
+    modality: str = DEFAULT_MODALITY
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "slug": self.slug,
+            "modality": self.modality,
             "label": self.label,
             "reference_handle": self.reference_handle,
             "n_sources": len(self.sources),
@@ -217,7 +230,7 @@ def _normalize_options(options: dict[str, Any] | None) -> dict[str, Any]:
 def write_saved(
     *,
     label: str,
-    reference_handle: str,
+    reference_handle: str = "",
     sources: list[dict[str, Any]],
     last_viewed_locus: dict[str, Any] | None = None,
     track_layout: list[dict[str, Any]] | None = None,
@@ -225,16 +238,23 @@ def write_saved(
     saved_at: str | None = None,
     slug: str | None = None,
     root: Path | None = None,
+    modality: str = DEFAULT_MODALITY,
 ) -> SavedSession:
     """Persist a saved-session TOML; return the resulting dataclass.
 
     A fresh ``saved_at`` timestamp is generated when not provided. The
     slug defaults to ``derive_slug(label, saved_at)``; pass an explicit
     slug to overwrite an existing entry.
+
+    Every caller that rewrites an existing file must pass its
+    ``modality`` back: the file is written whole, so a field left out
+    here is dropped.
     """
     if not label:
         raise ValueError("saved session requires a non-empty label")
-    if not reference_handle:
+    if not modality:
+        raise ValueError("saved session requires a modality")
+    if modality == DEFAULT_MODALITY and not reference_handle:
         raise ValueError("saved session requires a reference_handle")
     if root is None:
         root = cache_root()
@@ -263,10 +283,12 @@ def write_saved(
 
     lines: list[str] = [
         f"schema_version = {SAVED_SESSION_SCHEMA_VERSION}",
+        f'modality = "{_toml_escape(modality)}"',
         f'label = "{_toml_escape(label)}"',
-        f'reference_handle = "{_toml_escape(reference_handle)}"',
-        f'saved_at = "{final_saved_at}"',
     ]
+    if reference_handle:
+        lines.append(f'reference_handle = "{_toml_escape(reference_handle)}"')
+    lines.append(f'saved_at = "{final_saved_at}"')
     for src in normalized_sources:
         lines.append("")
         lines.append("[[sources]]")
@@ -321,6 +343,7 @@ def write_saved(
         track_layout=normalized_layout or None,
         options=normalized_options or None,
         path=path,
+        modality=modality,
     )
 
 
@@ -369,8 +392,9 @@ def read_saved(slug: str, *, root: Path | None = None) -> SavedSession:
             f"{list(_SUPPORTED_SCHEMA_VERSIONS)}"
         )
     label = str(raw.get("label") or slug)
+    modality = str(raw.get("modality") or DEFAULT_MODALITY)
     reference_handle = str(raw.get("reference_handle") or "")
-    if not reference_handle:
+    if modality == DEFAULT_MODALITY and not reference_handle:
         raise ValueError(
             f"saved session at {path} is missing reference_handle"
         )
@@ -421,6 +445,7 @@ def read_saved(slug: str, *, root: Path | None = None) -> SavedSession:
         track_layout=track_layout or None,
         options=options or None,
         path=path,
+        modality=modality,
     )
 
 

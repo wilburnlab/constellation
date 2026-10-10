@@ -1,0 +1,60 @@
+{
+  "title": "Reference sequence",
+  "kind": "reference_sequence",
+  "sections": [
+    {
+      "title": "Style",
+      "controls": [
+        {
+          "label": "A",
+          "control": "color",
+          "value": "#5cd66e"
+        },
+        {
+          "label": "C",
+          "control": "color",
+          "value": "#5e9cd6"
+        },
+        {
+          "label": "G",
+          "control": "color",
+          "value": "#d6c95e"
+        },
+        {
+          "label": "T",
+          "control": "color",
+          "value": "#d65e5e"
+        },
+        {
+          "label": "U",
+          "control": "color",
+          "value": "#d65e5e"
+        },
+        {
+          "label": "N",
+          "control": "color",
+          "value": "#666666"
+        },
+        {
+          "label": "Letter font size (px)",
+          "control": "number",
+          "value": "11",
+          "min": "6",
+          "max": "20",
+          "step": "1"
+        },
+        {
+          "label": "Letter threshold (px/bp)",
+          "control": "number",
+          "value": "6",
+          "min": "1",
+          "max": "40",
+          "step": "1"
+        }
+      ]
+    }
+  ],
+  "actions": [
+    "Reset to defaults"
+  ]
+}

@@ -1,0 +1,89 @@
+{
+  "title": "Splice junctions (run-a)",
+  "kind": "splice_junctions",
+  "sections": [
+    {
+      "title": "Style",
+      "controls": [
+        {
+          "label": "AT-AC",
+          "control": "color",
+          "value": "#d6a05e"
+        },
+        {
+          "label": "GC-AG",
+          "control": "color",
+          "value": "#9b5ed6"
+        },
+        {
+          "label": "GT-AG",
+          "control": "color",
+          "value": "#5e9cd6"
+        },
+        {
+          "label": "Min stroke (px)",
+          "control": "number",
+          "value": "1",
+          "min": "0.5",
+          "max": "10",
+          "step": "0.5"
+        },
+        {
+          "label": "Max stroke (px)",
+          "control": "number",
+          "value": "4",
+          "min": "0.5",
+          "max": "12",
+          "step": "0.5"
+        },
+        {
+          "label": "Arc opacity",
+          "control": "number",
+          "value": "0.85",
+          "min": "0",
+          "max": "1",
+          "step": "0.05"
+        }
+      ]
+    },
+    {
+      "title": "Filter",
+      "controls": [
+        {
+          "label": "Visible motifs",
+          "control": "allowlist",
+          "options": [
+            {
+              "label": "AT-AC",
+              "checked": true
+            },
+            {
+              "label": "GC-AG",
+              "checked": true
+            },
+            {
+              "label": "GT-AG",
+              "checked": true
+            }
+          ]
+        },
+        {
+          "label": "Min support",
+          "control": "number",
+          "value": "1",
+          "min": "1",
+          "max": "1000000",
+          "step": "1"
+        },
+        {
+          "label": "Only annotated junctions",
+          "control": "checkbox",
+          "checked": false
+        }
+      ]
+    }
+  ],
+  "actions": [
+    "Reset to defaults"
+  ]
+}

@@ -1,0 +1,11 @@
+<svg class="track-canvas" width="1000" height="200" data-natural-height="24">
+<rect x="0" y="4" width="300" height="8" fill="#5ed6cf" opacity="0.66" data-cluster-id="1">
+<title>cluster (genome) · 2 reads</title>
+</rect>
+<rect x="400" y="14" width="300" height="8" fill="#d6a85e" opacity="1.00" data-cluster-id="3">
+<title>cluster (em) · 12 reads</title>
+</rect>
+<rect x="350" y="4" width="150" height="8" fill="#5ed6cf" opacity="0.66" data-cluster-id="4">
+<title>cluster (genome) · 2 reads</title>
+</rect>
+</svg>

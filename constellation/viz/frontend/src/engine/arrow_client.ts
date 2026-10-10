@@ -14,25 +14,41 @@ export interface FetchedTable {
   mode: TrackMode;
 }
 
+/** One query-string value: a scalar, or a list sent as a repeated
+ *  parameter. `undefined` leaves the parameter out. */
+export type TrackQueryValue = string | number | readonly string[] | undefined;
+
+/** Query parameters for a track's data request. `session` and `binding`
+ *  address the track; everything else is whatever that track's kernel
+ *  declares in its query model (a locus for the genome kernels) — this
+ *  layer does not know or name any of it. */
 export interface TrackQueryParams {
   session: string;
   binding: string;
-  contig: string;
-  start: number;
-  end: number;
-  samples?: string[];
-  viewport_px?: number;
-  max_glyphs?: number;
-  /** Kernel-pushdown filter (read_pileup only at present): drop
-   *  alignments with mapq below this threshold at scan time. 0 admits
-   *  every primary alignment (the default). */
-  min_mapq?: number;
-  /** Cluster_pileup view selector (PR 5): 'clusters' renders the
-   *  default rectangle-per-cluster view; 'members' expands clusters
-   *  into their member-read alignments with the read_pileup visual
-   *  vocabulary. Undefined defaults to 'clusters' server-side. */
-  cluster_view?: 'clusters' | 'members';
-  force?: TrackMode;
+  [field: string]: TrackQueryValue;
+}
+
+/** Build the absolute `/api/tracks/{kind}/data` URL for a query. Pure,
+ *  so the exact wire form is unit-testable. Parameters are emitted in
+ *  the order they appear in `params`. */
+export function buildTrackDataUrl(
+  kind: string,
+  params: TrackQueryParams,
+  origin: string,
+): string {
+  const url = new URL(
+    `/api/tracks/${encodeURIComponent(kind)}/data`,
+    origin,
+  );
+  for (const [name, value] of Object.entries(params)) {
+    if (value === undefined) continue;
+    if (typeof value === 'string' || typeof value === 'number') {
+      url.searchParams.set(name, String(value));
+    } else {
+      for (const item of value) url.searchParams.append(name, item);
+    }
+  }
+  return url.toString();
 }
 
 export async function fetchTrackData(
@@ -40,35 +56,10 @@ export async function fetchTrackData(
   params: TrackQueryParams,
   signal?: AbortSignal,
 ): Promise<FetchedTable> {
-  const url = new URL(
-    `/api/tracks/${encodeURIComponent(kind)}/data`,
-    window.location.origin,
+  const response = await fetch(
+    buildTrackDataUrl(kind, params, window.location.origin),
+    { signal },
   );
-  url.searchParams.set('session', params.session);
-  url.searchParams.set('binding', params.binding);
-  url.searchParams.set('contig', params.contig);
-  url.searchParams.set('start', String(params.start));
-  url.searchParams.set('end', String(params.end));
-  if (params.viewport_px !== undefined) {
-    url.searchParams.set('viewport_px', String(params.viewport_px));
-  }
-  if (params.max_glyphs !== undefined) {
-    url.searchParams.set('max_glyphs', String(params.max_glyphs));
-  }
-  if (params.min_mapq !== undefined && params.min_mapq > 0) {
-    url.searchParams.set('min_mapq', String(params.min_mapq));
-  }
-  if (params.cluster_view) {
-    url.searchParams.set('cluster_view', params.cluster_view);
-  }
-  if (params.force) {
-    url.searchParams.set('force', params.force);
-  }
-  for (const sample of params.samples ?? []) {
-    url.searchParams.append('samples', sample);
-  }
-
-  const response = await fetch(url.toString(), { signal });
   if (!response.ok) {
     const body = await response.text().catch(() => '');
     throw new Error(

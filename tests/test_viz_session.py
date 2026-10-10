@@ -3,7 +3,7 @@
 Exercises the reference-cache-first construction path:
 - builds a fake cache root via monkeypatch + ``CONSTELLATION_REFERENCES_HOME``
 - writes one-or-more `transcriptome align` / `cluster` source dirs with
-  schema-v2 manifests
+  current-schema manifests
 - calls ``Session.open(reference_handle, sources)`` and asserts the
   resolved dataclass shape, slot resolution, and mismatch-warning logic.
 """
@@ -17,12 +17,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from constellation.viz.server.session import Session
 from _viz_fixtures import (
     DEFAULT_ASSEMBLY,
     DEFAULT_HANDLE,
     build_viz_session,
     install_fake_reference,
+    open_session,
     write_align_source,
 )
 
@@ -157,8 +157,7 @@ def test_open_legacy_manifest_is_rejected(
         )
     )
     with pytest.raises(ValueError, match="schema_version"):
-        Session.open(
-            reference_handle=DEFAULT_HANDLE,
+        open_session(
             sources=[{"path": str(legacy), "kind": "align"}],
         )
 
@@ -180,8 +179,7 @@ def test_open_handle_kind_mismatch_raises(
         reference_path=str(cache_root / "test_org" / "local_import-20260522"),
     )
     with pytest.raises(ValueError, match="kind"):
-        Session.open(
-            reference_handle=DEFAULT_HANDLE,
+        open_session(
             sources=[{"path": str(align_dir), "kind": "cluster"}],
         )
     # Sanity: session_dir was built ok and supports to_manifest().
@@ -240,8 +238,7 @@ def test_open_resolves_cwd_relative_outputs(
     }
     (align_dir / "manifest.json").write_text(json.dumps(manifest))
 
-    session = Session.open(
-        reference_handle=DEFAULT_HANDLE,
+    session = open_session(
         sources=[{"path": str(align_dir), "kind": "align"}],
     )
     assert session.sources[0].coverage == (align_dir / "coverage.parquet").resolve()
@@ -273,7 +270,58 @@ def test_open_unknown_handle_errors(tmp_path: Path, monkeypatch) -> None:
     cache_root.mkdir()
     monkeypatch.setenv("CONSTELLATION_REFERENCES_HOME", str(cache_root))
     with pytest.raises(ValueError, match="could not be resolved"):
-        Session.open(
+        open_session(
             reference_handle="missing_org@local_import-20260522",
             sources=[],
         )
+
+
+# ----------------------------------------------------------------------
+# Identifier pins
+# ----------------------------------------------------------------------
+
+
+def test_source_id_literal_values() -> None:
+    """``source_id`` is persisted: it keys ``[[track_layout]]`` entries in
+    saved-session TOMLs and the browser's ``localStorage`` layout. A change
+    to the hash input or digest size orphans every saved layout, so the
+    values are pinned literally rather than only checked for stability."""
+    from constellation.viz.modalities.genome.session import GenomeSource
+    from constellation.viz.server.session import derive_source_id
+
+    assert derive_source_id(Path("/data/run1/align"), "align") == "src-585de6ec"
+    assert derive_source_id(Path("/data/run1/cluster"), "cluster") == "src-5783a900"
+
+    # The genome source derives its id through the shared helper.
+    source = GenomeSource(
+        path=Path("/data/run1/align"),
+        kind="align",
+        label="ignored",
+        assembly_accession=None,
+        reference_handle=None,
+    )
+    assert source.source_id == "src-585de6ec"
+
+
+def test_session_id_literal_values() -> None:
+    """``session_id`` names the ``localStorage`` layout/options keys and is
+    preserved across ``with_sources`` rebuilds; pin the derivation."""
+    from constellation.viz.server.session import derive_session_id
+
+    release = Path("/refs/homo_sapiens/ensembl-111")
+    assert derive_session_id(release, "My Run 2026") == "my-run-2026-d11f07d2"
+    assert derive_session_id(release, "ensembl-111") == "ensembl-111-65b4a124"
+
+
+def test_genome_session_satisfies_the_core_contract(tmp_path: Path, monkeypatch) -> None:
+    """The server core only ever touches what ``SessionLike`` names."""
+    session = build_viz_session(tmp_path, monkeypatch, align_sources=[{"coverage": []}])
+    assert session.modality == "genome"
+    assert session.summary()["modality"] == "genome"
+    assert session.to_manifest()["modality"] == "genome"
+    assert session.summary()["session_id"] == session.session_id
+    rebuilt = session.with_sources(
+        [{"path": str(s.path), "kind": s.kind} for s in session.sources]
+    )
+    assert rebuilt.session_id == session.session_id
+    assert [s.source_id for s in rebuilt.sources] == [s.source_id for s in session.sources]

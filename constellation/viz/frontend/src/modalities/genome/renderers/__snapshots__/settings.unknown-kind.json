@@ -1,0 +1,27 @@
+{
+  "title": "not_a_kind",
+  "kind": "not_a_kind",
+  "sections": [
+    {
+      "title": "Style",
+      "controls": [
+        {
+          "control": "empty",
+          "text": "no style controls for this track kind"
+        }
+      ]
+    },
+    {
+      "title": "Filter",
+      "controls": [
+        {
+          "control": "empty",
+          "text": "no filter controls for this track kind"
+        }
+      ]
+    }
+  ],
+  "actions": [
+    "Reset to defaults"
+  ]
+}

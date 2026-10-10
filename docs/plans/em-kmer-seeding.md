@@ -315,8 +315,9 @@ Implementation: `_normalise_cluster_mode` returns `"em"` for all three EM spelli
 `_em_seeding(mode) -> Literal["orf", "kmer"]` carries the choice into `EmParams.seeding`. **The
 `mode` column of `clusters.parquet` stays `"em"`** — the mechanism is still EM, the seeder is a
 parameter — so `CLUSTER_MODES`, the viz colour maps
-([cluster_pileup.ts:39](../../constellation/viz/frontend/src/track_renderers/cluster_pileup.ts#L39),
-[TrackSettingsPanel.ts:412](../../constellation/viz/frontend/src/widgets/TrackSettingsPanel.ts#L412))
+([cluster_pileup.ts](../../constellation/viz/frontend/src/modalities/genome/renderers/cluster_pileup.ts) —
+the renderer's `MODE_COLOR_DEFAULTS`, which since the viz modality factoring is
+also where the settings popover takes its swatches from)
 and `test_em_cli_modes.py::test_the_frontend_colour_maps_keep_the_old_keys` are untouched. It also
 makes the eventual consolidation to `--mode em --seeding kmer` a pure CLI change.
 

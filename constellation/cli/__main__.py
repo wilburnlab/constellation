@@ -747,7 +747,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _build_t2p_parser(subs)
 
-    # Visualization subtree — `constellation viz genome --session DIR`.
+    # Visualization subtree — `constellation viz genome --reference <handle> ...`.
     # The full `[viz]` extras (fastapi / uvicorn / datashader) are
     # only required when the user actually invokes a viz subcommand;
     # the parser registration is cheap import-wise.
@@ -6011,8 +6011,11 @@ def _cmd_reference_link(args: argparse.Namespace) -> int:
         try:
             os.symlink(src, dst)
         except OSError as exc:
-            # WSL/Windows fallback: write a session.toml stub instead of
-            # symlinks. Users edit the toml to drop in handles.
+            # WSL/Windows fallback: record the handle in a session.toml
+            # stub instead of symlinks. Nothing reads this file any more
+            # (the viz `Session.from_root` walker that did was removed in
+            # the reference-cache-first cutover), so the message below
+            # points the user at `--reference <handle>` instead.
             session_toml = target_root / "session.toml"
             session_toml.write_text(
                 f"schema_version = 1\n\n[reference]\nhandle = \"{args.handle}\"\n",
@@ -6020,8 +6023,9 @@ def _cmd_reference_link(args: argparse.Namespace) -> int:
             )
             print(
                 f"warning: symlink creation failed ({exc}); wrote "
-                f"{session_toml} as a fallback. The viz Session.from_root "
-                f"resolves handles via session.toml the same way.",
+                f"{session_toml} recording the handle instead. No "
+                f"constellation command reads that file — pass "
+                f"`--reference {args.handle}` to them directly.",
                 file=sys.stderr,
             )
             return 0

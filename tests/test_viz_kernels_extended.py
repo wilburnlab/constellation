@@ -31,7 +31,6 @@ from constellation.sequencing.schemas.transcriptome import (
     CLUSTER_MEMBERSHIP_TABLE,
     TRANSCRIPT_CLUSTER_TABLE,
 )
-from constellation.viz.server.session import Session
 from constellation.sequencing.transcriptome.manifest import (
     write_align_manifest,
     write_cluster_manifest,
@@ -42,20 +41,27 @@ from constellation.viz.tracks.base import (
     TrackQuery,
     get_kernel,
 )
-from _viz_fixtures import DEFAULT_ASSEMBLY, DEFAULT_HANDLE, install_fake_reference
-from constellation.viz.tracks.cluster_pileup import (
+from _viz_fixtures import (
+    DEFAULT_ASSEMBLY,
+    DEFAULT_HANDLE,
+    Session,
+    install_fake_reference,
+    kernel_query,
+    open_session,
+)
+from constellation.viz.modalities.genome.tracks.cluster_pileup import (
     CLUSTER_MEMBER_VECTOR_SCHEMA,
     CLUSTER_PILEUP_VECTOR_SCHEMA,
 )
-from constellation.viz.tracks.gene_annotation import (
+from constellation.viz.modalities.genome.tracks.gene_annotation import (
     GENE_ANNOTATION_VECTOR_SCHEMA,
 )
-from constellation.viz.tracks.read_pileup import READ_PILEUP_VECTOR_SCHEMA
-from constellation.viz.tracks import reference_sequence as ref_seq_mod
-from constellation.viz.tracks.reference_sequence import (
+from constellation.viz.modalities.genome.tracks.read_pileup import READ_PILEUP_VECTOR_SCHEMA
+from constellation.viz.modalities.genome.tracks import reference_sequence as ref_seq_mod
+from constellation.viz.modalities.genome.tracks.reference_sequence import (
     REFERENCE_SEQUENCE_VECTOR_SCHEMA,
 )
-from constellation.viz.tracks.splice_junctions import (
+from constellation.viz.modalities.genome.tracks.splice_junctions import (
     SPLICE_JUNCTIONS_VECTOR_SCHEMA,
 )
 
@@ -197,10 +203,7 @@ def _make_session(
         sources.append(
             {"path": str(cluster_dir), "kind": "cluster", "label": "cluster"}
         )
-    return Session.open(
-        reference_handle=DEFAULT_HANDLE,
-        sources=sources,
-    )
+    return open_session(sources=sources)
 
 
 # ----------------------------------------------------------------------
@@ -216,7 +219,7 @@ def test_reference_sequence_vector_returns_per_base(
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("reference_sequence")
     [binding] = kernel.discover(session)
-    query = TrackQuery(contig="chr1", start=0, end=10, viewport_px=400)
+    query = kernel_query("reference_sequence", contig="chr1", start=0, end=10, viewport_px=400)
     mode = kernel.threshold(binding, query)
     assert mode is ThresholdDecision.VECTOR
     table = pa.Table.from_batches(
@@ -257,7 +260,7 @@ def test_reference_sequence_cache_reuses_string_across_calls(
             list(
                 kernel.fetch(
                     binding,
-                    TrackQuery(contig="chr1", start=0, end=10, viewport_px=400),
+                    kernel_query("reference_sequence", contig="chr1", start=0, end=10, viewport_px=400),
                     ThresholdDecision.VECTOR,
                 )
             ),
@@ -267,7 +270,7 @@ def test_reference_sequence_cache_reuses_string_across_calls(
             list(
                 kernel.fetch(
                     binding,
-                    TrackQuery(contig="chr1", start=20, end=30, viewport_px=400),
+                    kernel_query("reference_sequence", contig="chr1", start=20, end=30, viewport_px=400),
                     ThresholdDecision.VECTOR,
                 )
             ),
@@ -357,10 +360,10 @@ def test_reference_sequence_decimates_when_window_exceeds_cap(
         ],
         sequences=[{"contig_id": 1, "sequence": "A" * 50_000}],
     )
-    session = Session.open(reference_handle=DEFAULT_HANDLE, sources=[])
+    session = open_session(sources=[])
     kernel = get_kernel("reference_sequence")
     [binding] = kernel.discover(session)
-    query = TrackQuery(contig="chr1", start=0, end=50_000, viewport_px=1200)
+    query = kernel_query("reference_sequence", contig="chr1", start=0, end=50_000, viewport_px=1200)
     table = pa.Table.from_batches(
         list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
         schema=REFERENCE_SEQUENCE_VECTOR_SCHEMA,
@@ -438,7 +441,7 @@ def test_gene_annotation_fetch_filters_by_window(
     session = _make_session(monkeypatch, tmp_path, root, use_root_annotation=True)
     kernel = get_kernel("gene_annotation")
     [binding] = kernel.discover(session)
-    query = TrackQuery(contig="chr1", start=50, end=400)
+    query = kernel_query("gene_annotation", contig="chr1", start=50, end=400)
     table = pa.Table.from_batches(
         list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
         schema=GENE_ANNOTATION_VECTOR_SCHEMA,
@@ -471,7 +474,7 @@ def test_gene_annotation_truncates_above_feature_limit(
     kernel = get_kernel("gene_annotation")
     kernel.feature_limit = 8  # tune for this test only
     [binding] = kernel.discover(session)
-    query = TrackQuery(contig="chr1", start=0, end=20_000)
+    query = kernel_query("gene_annotation", contig="chr1", start=0, end=20_000)
     table = pa.Table.from_batches(
         list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
         schema=GENE_ANNOTATION_VECTOR_SCHEMA,
@@ -540,7 +543,7 @@ def test_splice_junctions_emits_one_arc_per_cluster(
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("splice_junctions")
     [binding] = kernel.discover(session)
-    query = TrackQuery(contig="chr1", start=0, end=10_000)
+    query = kernel_query("splice_junctions", contig="chr1", start=0, end=10_000)
     table = pa.Table.from_batches(
         list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
         schema=SPLICE_JUNCTIONS_VECTOR_SCHEMA,
@@ -702,7 +705,7 @@ def test_read_pileup_vector_returns_packed_rows(
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("read_pileup")
     [binding] = kernel.discover(session)
-    query = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)
+    query = kernel_query("read_pileup", contig="chr1", start=0, end=400, viewport_px=1200)
     mode = kernel.threshold(binding, query)
     assert mode is ThresholdDecision.VECTOR
     table = pa.Table.from_batches(
@@ -736,7 +739,7 @@ def test_read_pileup_vector_emits_blocks_column(
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("read_pileup")
     [binding] = kernel.discover(session)
-    query = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)
+    query = kernel_query("read_pileup", contig="chr1", start=0, end=400, viewport_px=1200)
     table = pa.Table.from_batches(
         list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
         schema=READ_PILEUP_VECTOR_SCHEMA,
@@ -768,7 +771,7 @@ def test_read_pileup_vector_emits_mismatch_positions(
     [binding] = kernel.discover(session)
     # viewport_px chosen so bp/pixel < mismatch_glyph_bp_per_pixel_limit
     # (default 5.0); cs parse runs.
-    query = TrackQuery(contig="chr1", start=0, end=15, viewport_px=1200)
+    query = kernel_query("read_pileup", contig="chr1", start=0, end=15, viewport_px=1200)
     table = pa.Table.from_batches(
         list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
         schema=READ_PILEUP_VECTOR_SCHEMA,
@@ -795,7 +798,8 @@ def test_read_pileup_skips_mismatch_parse_at_coarse_zoom(
     [binding] = kernel.discover(session)
     # 100_000 bp window at 1200 px → ~83 bp/pixel, well above the 5.0
     # threshold → kernel skips the cs:long parse.
-    query = TrackQuery(
+    query = kernel_query(
+        "read_pileup",
         contig="chr1",
         start=0,
         end=100_000,
@@ -832,7 +836,7 @@ def test_read_pileup_vector_emits_sample_id_and_name(
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("read_pileup")
     [binding] = kernel.discover(session)
-    query = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)
+    query = kernel_query("read_pileup", contig="chr1", start=0, end=400, viewport_px=1200)
     table = pa.Table.from_batches(
         list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
         schema=READ_PILEUP_VECTOR_SCHEMA,
@@ -865,7 +869,7 @@ def test_read_pileup_vector_handles_missing_sample_row(
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("read_pileup")
     [binding] = kernel.discover(session)
-    query = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)
+    query = kernel_query("read_pileup", contig="chr1", start=0, end=400, viewport_px=1200)
     table = pa.Table.from_batches(
         list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
         schema=READ_PILEUP_VECTOR_SCHEMA,
@@ -924,7 +928,8 @@ def test_read_pileup_filter_by_sample_name(
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("read_pileup")
     [binding] = kernel.discover(session)
-    query = TrackQuery(
+    query = kernel_query(
+        "read_pileup",
         contig="chr1",
         start=0,
         end=400,
@@ -961,7 +966,8 @@ def test_read_pileup_filter_by_sample_id(
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("read_pileup")
     [binding] = kernel.discover(session)
-    query = TrackQuery(
+    query = kernel_query(
+        "read_pileup",
         contig="chr1",
         start=0,
         end=400,
@@ -996,7 +1002,8 @@ def test_read_pileup_min_mapq_drops_low_quality_alignments(
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("read_pileup")
     [binding] = kernel.discover(session)
-    query = TrackQuery(
+    query = kernel_query(
+        "read_pileup",
         contig="chr1",
         start=0,
         end=400,
@@ -1028,7 +1035,7 @@ def test_read_pileup_min_mapq_zero_admits_all(
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("read_pileup")
     [binding] = kernel.discover(session)
-    query = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)
+    query = kernel_query("read_pileup", contig="chr1", start=0, end=400, viewport_px=1200)
     table = pa.Table.from_batches(
         list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
         schema=READ_PILEUP_VECTOR_SCHEMA,
@@ -1044,7 +1051,7 @@ def test_read_pileup_min_mapq_affects_threshold_count(
     vector_glyph_limit keeps the renderer in vector mode even when the
     unfiltered count would tip to hybrid. Verifies the predicate is
     threaded through both _scan_window AND _count_in_window."""
-    from constellation.viz.tracks.read_pileup import ReadPileupKernel
+    from constellation.viz.modalities.genome.tracks.read_pileup import ReadPileupKernel
 
     # Fixture: more rows than the default vector_glyph_limit when
     # unfiltered; few rows above the MAPQ threshold.
@@ -1073,8 +1080,9 @@ def test_read_pileup_min_mapq_affects_threshold_count(
     original_limit = ReadPileupKernel.vector_glyph_limit
     ReadPileupKernel.vector_glyph_limit = monkeypatch_limit
     try:
-        q_unfiltered = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)
-        q_filtered = TrackQuery(
+        q_unfiltered = kernel_query("read_pileup", contig="chr1", start=0, end=400, viewport_px=1200)
+        q_filtered = kernel_query(
+            "read_pileup",
             contig="chr1", start=0, end=400, viewport_px=1200, min_mapq=20
         )
         assert kernel.threshold(binding, q_unfiltered) is ThresholdDecision.HYBRID
@@ -1174,7 +1182,8 @@ def test_read_pileup_hybrid_emits_png(tmp_path: Path, monkeypatch) -> None:
     [binding] = kernel.discover(session)
     # Force hybrid via the explicit param so we don't depend on
     # threshold tuning.
-    query = TrackQuery(
+    query = kernel_query(
+        "read_pileup",
         contig="chr1",
         start=0,
         end=200,
@@ -1202,7 +1211,8 @@ def test_read_pileup_threshold_force_override(
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("read_pileup")
     [binding] = kernel.discover(session)
-    q = TrackQuery(
+    q = kernel_query(
+        "read_pileup",
         contig="chr1",
         start=0,
         end=200,
@@ -1270,7 +1280,7 @@ def test_cluster_pileup_vector_emits_packed_rows(
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("cluster_pileup")
     [binding] = kernel.discover(session)
-    query = TrackQuery(contig="chr1", start=0, end=400, viewport_px=1200)
+    query = kernel_query("cluster_pileup", contig="chr1", start=0, end=400, viewport_px=1200)
     mode = kernel.threshold(binding, query)
     assert mode is ThresholdDecision.VECTOR
     table = pa.Table.from_batches(
@@ -1282,6 +1292,57 @@ def test_cluster_pileup_vector_emits_packed_rows(
     assert rows[1]["row"] == 0
     assert rows[2]["row"] == 1
     assert rows[3]["row"] == 0
+
+
+def test_cluster_pileup_hybrid_emits_png(tmp_path: Path, monkeypatch) -> None:
+    pytest.importorskip("datashader")
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    cluster_dir = root / "S2_cluster"
+    cluster_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                _cluster(cluster_id=1, span_start=0, span_end=100),
+                _cluster(cluster_id=2, span_start=50, span_end=150),
+                _cluster(cluster_id=3, span_start=200, span_end=300, n_reads=2),
+            ],
+            schema=TRANSCRIPT_CLUSTER_TABLE,
+        ),
+        cluster_dir / "clusters.parquet",
+    )
+    pq.write_table(
+        pa.Table.from_pylist([], schema=CLUSTER_MEMBERSHIP_TABLE),
+        cluster_dir / "cluster_membership.parquet",
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("cluster_pileup")
+    [binding] = kernel.discover(session)
+    query = kernel_query(
+        "cluster_pileup",
+        contig="chr1",
+        start=0,
+        end=400,
+        viewport_px=900,
+        force=ThresholdDecision.HYBRID,
+    )
+    assert kernel.threshold(binding, query) is ThresholdDecision.HYBRID
+    assert kernel.schema_for(query, ThresholdDecision.HYBRID) == HYBRID_SCHEMA
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, ThresholdDecision.HYBRID)),
+        schema=HYBRID_SCHEMA,
+    )
+    assert table.num_rows == 1
+    row = table.to_pylist()[0]
+    assert row["mode"] == "hybrid"
+    assert row["n_items"] == 3
+    assert (row["extent_start"], row["extent_end"]) == (0, 400)
+    assert row["width_px"] == 900
+    img = Image.open(io.BytesIO(row["png_bytes"]))
+    assert img.size == (900, row["height_px"])
 
 
 # ----------------------------------------------------------------------
@@ -1370,12 +1431,13 @@ def test_cluster_pileup_members_emits_per_alignment_rows(
     session = _setup_cluster_members_session(tmp_path, monkeypatch)
     kernel = get_kernel("cluster_pileup")
     [binding] = kernel.discover(session)
-    query = TrackQuery(
+    query = kernel_query(
+        "cluster_pileup",
         contig="chr1",
         start=0,
         end=400,
         viewport_px=1200,
-        mode_extra={"cluster_view": "members"},
+        cluster_view="members",
     )
     mode = kernel.threshold(binding, query)
     assert mode is ThresholdDecision.VECTOR
@@ -1407,14 +1469,16 @@ def test_cluster_pileup_members_uses_member_schema(
     session = _setup_cluster_members_session(tmp_path, monkeypatch)
     kernel = get_kernel("cluster_pileup")
     [binding] = kernel.discover(session)
-    members_query = TrackQuery(
+    members_query = kernel_query(
+        "cluster_pileup",
         contig="chr1",
         start=0,
         end=400,
         viewport_px=1200,
-        mode_extra={"cluster_view": "members"},
+        cluster_view="members",
     )
-    clusters_query = TrackQuery(
+    clusters_query = kernel_query(
+        "cluster_pileup",
         contig="chr1", start=0, end=400, viewport_px=1200
     )
     assert (
@@ -1465,12 +1529,13 @@ def test_cluster_pileup_members_view_unsupported_without_align_dir(
     meta = kernel.metadata(binding)
     assert meta["cluster_view_supported"] is False
     # A members-view fetch defends against an unsupported call.
-    query = TrackQuery(
+    query = kernel_query(
+        "cluster_pileup",
         contig="chr1",
         start=0,
         end=400,
         viewport_px=1200,
-        mode_extra={"cluster_view": "members"},
+        cluster_view="members",
     )
     table = pa.Table.from_batches(
         list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),
@@ -1508,13 +1573,14 @@ def test_cluster_pileup_members_min_mapq_pushdown(
     session = _make_session(monkeypatch, tmp_path, root)
     kernel = get_kernel("cluster_pileup")
     [binding] = kernel.discover(session)
-    query = TrackQuery(
+    query = kernel_query(
+        "cluster_pileup",
         contig="chr1",
         start=0,
         end=200,
         viewport_px=1200,
         min_mapq=20,
-        mode_extra={"cluster_view": "members"},
+        cluster_view="members",
     )
     table = pa.Table.from_batches(
         list(kernel.fetch(binding, query, ThresholdDecision.VECTOR)),

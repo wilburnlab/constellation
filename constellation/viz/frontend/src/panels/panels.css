@@ -1,0 +1,289 @@
+/* Panel chrome — the styles of the generic `panels/` layer.
+ *
+ * Imported by the modules that build these elements (`Panel`,
+ * `SettingsPanel`, `OptionsPopover`), so they travel with any host that
+ * uses them. Nothing here is scoped to a host: a panel's rules hang off
+ * its own root (`.track`), the stack's off its container
+ * (`.track-stack`), and the popovers mount on `document.body`. Relies on
+ * the page's `--bg`, `--fg`, `--border`, `--accent-rgb`, … variables.
+ */
+
+/* One panel */
+.track {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  position: relative;
+  background: var(--bg);
+}
+.track.track-dragging {
+  opacity: 0.5;
+}
+.track.track-drop-target {
+  box-shadow: inset 0 2px 0 0 rgba(var(--accent-rgb), 0.9);
+}
+.track .track-header {
+  padding: 4px 12px 4px 6px;
+  background: var(--bg-elev);
+  font-size: 12px;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.track .track-handle {
+  cursor: grab;
+  color: var(--fg-dim);
+  user-select: none;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.track .track-handle:active { cursor: grabbing; }
+.track .track-collapse-btn,
+.track .track-hide-btn,
+.track .track-settings-btn {
+  background: transparent;
+  color: var(--fg-dim);
+  border: none;
+  padding: 0 4px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+.track .track-collapse-btn:hover,
+.track .track-hide-btn:hover,
+.track .track-settings-btn:hover {
+  color: var(--fg);
+}
+.track .track-header-label {
+  color: var(--fg);
+  font-weight: 500;
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.track .track-header-status {
+  color: var(--fg-dim);
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+.track .track-body {
+  position: relative;
+  overflow: hidden;
+}
+.track .track-canvas {
+  display: block;
+  background: var(--bg);
+}
+.track .track-resize-handle {
+  height: 4px;
+  cursor: ns-resize;
+  background: transparent;
+}
+.track .track-resize-handle:hover,
+.track .track-resize-handle:active {
+  background: rgba(var(--accent-rgb), 0.4);
+}
+
+/* A vertical stack of panels */
+.track-stack > .track {
+  margin: 0 6px 6px;
+}
+.track-stack > .track:first-of-type { margin-top: 6px; }
+.track-stack-empty {
+  padding: 16px;
+  color: var(--fg-dim);
+  text-align: center;
+  font-style: italic;
+}
+
+/* Options popover — browser-wide preferences; rows are full-width
+ * labeled checkboxes. */
+.options-popover {
+  background: var(--bg-elev, #1c1a25);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
+  border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  min-width: 280px;
+  max-width: 380px;
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: 6px 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    Helvetica, Arial, sans-serif;
+  font-size: 13px;
+}
+.options-popover .options-section-title {
+  padding: 6px 12px 4px;
+  font-size: 11px;
+  color: var(--fg-dim, #adacae);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.options-popover .options-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.options-popover .options-row:hover {
+  background: rgba(var(--accent-rgb), 0.12);
+}
+.options-popover .options-row input[type='checkbox'] {
+  margin-top: 2px;
+}
+.options-popover .options-row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.options-popover .options-row-label {
+  color: var(--fg, #edecee);
+  font-weight: 500;
+}
+.options-popover .options-row-hint {
+  color: var(--fg-dim, #adacae);
+  font-size: 11px;
+}
+
+/* Settings popover (per-panel gear) */
+.track-settings-popover {
+  background: var(--bg-elev, #1c1a25);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
+  border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  min-width: 320px;
+  max-width: 420px;
+  max-height: 80vh;
+  overflow-y: auto;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    Helvetica, Arial, sans-serif;
+  font-size: 13px;
+}
+.track-settings-popover .settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border, #2d2b3a);
+}
+.track-settings-popover .settings-title {
+  font-weight: 600;
+  color: var(--fg, #edecee);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.track-settings-popover .settings-kind {
+  font-size: 11px;
+  color: var(--fg-dim, #adacae);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.track-settings-popover .settings-section {
+  border-bottom: 1px solid var(--border, #2d2b3a);
+  padding: 8px 12px;
+}
+.track-settings-popover .settings-section:last-child {
+  border-bottom: none;
+}
+.track-settings-popover .settings-section-title {
+  font-size: 11px;
+  color: var(--fg-dim, #adacae);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+.track-settings-popover .settings-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.track-settings-popover .settings-row-label {
+  color: var(--fg, #edecee);
+  font-size: 12px;
+}
+.track-settings-popover .settings-row input[type='text'],
+.track-settings-popover .settings-row input[type='number'],
+.track-settings-popover .settings-row select {
+  background: var(--bg, #15141b);
+  color: var(--fg, #edecee);
+  border: 1px solid var(--border, #2d2b3a);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 12px;
+  min-width: 120px;
+}
+.track-settings-popover .settings-row input[type='number'] {
+  min-width: 70px;
+}
+.track-settings-popover .settings-row input[type='range'] {
+  width: 140px;
+}
+.track-settings-popover .settings-row input[type='color'] {
+  width: 32px;
+  height: 22px;
+  border: 1px solid var(--border, #2d2b3a);
+  border-radius: 4px;
+  background: var(--bg, #15141b);
+  padding: 0;
+}
+.track-settings-popover .settings-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  cursor: pointer;
+  font-size: 12px;
+}
+.track-settings-popover .settings-checkbox-row:hover {
+  color: var(--fg, #edecee);
+}
+.track-settings-popover .settings-palette-grid {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+.track-settings-popover .settings-empty {
+  color: var(--fg-dim, #adacae);
+  font-size: 11px;
+  font-style: italic;
+}
+.track-settings-popover .settings-row-hint {
+  grid-column: 1 / -1;
+  margin-top: 2px;
+  color: var(--fg-dim, #adacae);
+  font-size: 10px;
+  font-style: italic;
+}
+.track-settings-popover .settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border, #2d2b3a);
+}
+.track-settings-popover .settings-reset-btn {
+  background: transparent;
+  color: var(--fg-dim, #adacae);
+  border: 1px solid var(--border, #2d2b3a);
+  border-radius: 4px;
+  padding: 3px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.track-settings-popover .settings-reset-btn:hover {
+  color: var(--fg, #edecee);
+  border-color: var(--fg-dim, #adacae);
+}

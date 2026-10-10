@@ -1,0 +1,520 @@
+"""Transcript-cluster pile-up track — isoform-resolution stacked bars
+with an opt-in member-read expansion.
+
+Two views, switchable per binding via the query's ``cluster_view``:
+
+- **clusters** (default) — one horizontal bar per ``clusters.parquet``
+  row from ``span_start`` to ``span_end``, stacked greedily so
+  overlapping isoforms don't collide. Glyph color is keyed on the
+  cluster's ``mode`` (genome-guided vs de-novo). Hybrid mode mirrors
+  ``read_pileup`` — bp/pixel + cluster count thresholds.
+
+- **members** — one rectangle per *member alignment* (joined through
+  ``cluster_membership.parquet`` to the upstream align dir's
+  alignments / alignment_blocks / alignment_cs), with the read_pileup
+  visual vocabulary (solid exon segments, dotted intron connectors,
+  per-base X glyphs at substitution sites). Color is keyed by
+  ``cluster_id`` so the user can immediately see which reads belong to
+  the same cluster — letting them vet whether the clustering picked up
+  isoform-consistent reads. Members view is always vector (no hybrid)
+  and capped at ``vector_glyph_limit``.
+
+The members view requires the cluster ``GenomeSource`` to carry
+populated ``alignments`` + ``alignment_blocks`` + ``alignment_cs``
+slots; these are resolved from the cluster manifest's ``align_dir``
+back-pointer at session load time. When unavailable (legacy clusters,
+or future de-novo outputs that don't ride on genome alignments), the
+``cluster_view_supported`` metadata flag is ``False`` and the gear
+popover hides the toggle.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import Any
+
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as pa_ds
+import pyarrow.parquet as pq
+
+from constellation.viz.modalities.genome.kernel import GenomeTrackKernel
+from constellation.viz.modalities.genome.query import ClusterPileupQuery
+from constellation.viz.modalities.genome.session import GenomeSession
+from constellation.viz.modalities.genome.tracks._alignment_view import (
+    BLOCKS_LIST_TYPE,
+    MISMATCH_POSITIONS_TYPE,
+    attach_blocks,
+    attach_mismatch_positions,
+)
+from constellation.viz.tracks.base import (
+    HYBRID_SCHEMA,
+    ThresholdDecision,
+    TrackBinding,
+    iter_sources_with,
+    register_track,
+)
+
+
+CLUSTER_PILEUP_VECTOR_SCHEMA: pa.Schema = pa.schema(
+    [
+        pa.field("cluster_id", pa.int64(), nullable=False),
+        pa.field("span_start", pa.int64(), nullable=False),
+        pa.field("span_end", pa.int64(), nullable=False),
+        pa.field("strand", pa.string(), nullable=False),
+        pa.field("n_reads", pa.int32(), nullable=False),
+        pa.field("row", pa.int32(), nullable=False),
+        pa.field("mode", pa.string(), nullable=False),
+    ],
+    metadata={b"schema_name": b"VizClusterPileup"},
+)
+
+
+# Members view: one row per member alignment, parallel to the
+# read_pileup schema but colored by `cluster_id` (each cluster gets a
+# distinct palette entry). `role` carries the cluster_membership
+# classification so the renderer can subtly differentiate
+# representative reads vs drift-filtered candidates.
+CLUSTER_MEMBER_VECTOR_SCHEMA: pa.Schema = pa.schema(
+    [
+        pa.field("alignment_id", pa.int64(), nullable=False),
+        pa.field("read_id", pa.string(), nullable=False),
+        pa.field("cluster_id", pa.int64(), nullable=False),
+        pa.field("ref_start", pa.int64(), nullable=False),
+        pa.field("ref_end", pa.int64(), nullable=False),
+        pa.field("strand", pa.string(), nullable=False),
+        pa.field("mapq", pa.int32(), nullable=False),
+        pa.field("row", pa.int32(), nullable=False),
+        pa.field("blocks", BLOCKS_LIST_TYPE, nullable=False),
+        pa.field("mismatch_positions", MISMATCH_POSITIONS_TYPE, nullable=False),
+        pa.field("role", pa.string(), nullable=False),
+    ],
+    metadata={b"schema_name": b"VizClusterPileupMembers"},
+)
+
+
+@register_track
+class ClusterPileupKernel(GenomeTrackKernel):
+    """Per-cluster pile-up track with opt-in member-read expansion."""
+
+    kind = "cluster_pileup"
+    query_model = ClusterPileupQuery
+    schema = CLUSTER_PILEUP_VECTOR_SCHEMA
+
+    # Cluster counts are an order of magnitude smaller than read counts
+    # at the same locus; the threshold is correspondingly higher.
+    vector_glyph_limit = 6_000
+    vector_bp_per_pixel_limit = 50.0
+
+    # Members view shares the read_pileup zoom rules for per-base
+    # mismatch glyphs — above this bp/pixel ratio the cs:long parse is
+    # skipped and `mismatch_positions` is emitted empty.
+    mismatch_glyph_bp_per_pixel_limit = 5.0
+
+    def discover(self, session: GenomeSession) -> list[TrackBinding]:
+        if session.reference_genome is None:
+            return []
+        bindings: list[TrackBinding] = []
+        for idx, src in iter_sources_with(
+            session, "clusters", "cluster_membership"
+        ):
+            paths: dict[str, Any] = {
+                "clusters": src.clusters,
+                "cluster_membership": src.cluster_membership,
+                "genome": session.reference_genome,
+            }
+            # Members-view dependencies (may be None — the kernel
+            # surfaces availability via cluster_view_supported in
+            # metadata, and refuses the view at fetch time when any is
+            # missing).
+            paths["alignments"] = src.alignments
+            paths["alignment_blocks"] = src.alignment_blocks
+            paths["alignment_cs"] = src.alignment_cs
+            label = (
+                f"Transcript clusters ({src.label})"
+                if len(session.sources) > 1
+                else "Transcript clusters"
+            )
+            bindings.append(
+                TrackBinding(
+                    session_id=session.session_id,
+                    kind=self.kind,
+                    binding_id=f"cluster_pileup-{idx}",
+                    label=label,
+                    paths=paths,
+                    config={"source_id": src.source_id},
+                )
+            )
+        return bindings
+
+    def metadata(self, binding: TrackBinding) -> dict[str, Any]:
+        # Surface the unique cluster modes so the renderer can color
+        # genome-guided vs de-novo distinctly when both are present.
+        path = binding.paths["clusters"]
+        modes: list[str] = []
+        if path.exists():
+            table = pq.read_table(path, columns=["mode"])
+            modes = sorted({m for m in table.column("mode").to_pylist() if m})
+        # The members view requires three upstream artifacts joined via
+        # the cluster's align_dir back-pointer. When any is absent we
+        # surface that via the metadata flag so the gear popover hides
+        # the cluster-view selector.
+        members_supported = all(
+            binding.paths.get(k) is not None
+            for k in ("alignments", "alignment_blocks", "alignment_cs")
+        )
+        return {
+            "kind": self.kind,
+            "binding_id": binding.binding_id,
+            "label": binding.label,
+            "modes_in_data": modes,
+            "vector_glyph_limit": self.vector_glyph_limit,
+            "vector_bp_per_pixel_limit": self.vector_bp_per_pixel_limit,
+            "mismatch_glyph_bp_per_pixel_limit": (
+                self.mismatch_glyph_bp_per_pixel_limit
+            ),
+            "cluster_view_supported": members_supported,
+            "default_height_px": 200,
+        }
+
+    def schema_for(
+        self, query: ClusterPileupQuery, mode: ThresholdDecision
+    ) -> pa.Schema:
+        if mode is ThresholdDecision.HYBRID:
+            return HYBRID_SCHEMA
+        if query.cluster_view == "members":
+            return CLUSTER_MEMBER_VECTOR_SCHEMA
+        return self.schema
+
+    def threshold(
+        self, binding: TrackBinding, query: ClusterPileupQuery
+    ) -> ThresholdDecision:
+        if query.force is not None:
+            return query.force
+        if query.cluster_view == "members":
+            # Members view is always vector (no hybrid mode yet); the
+            # vector_glyph_limit cap is enforced inside _fetch_members
+            # via a top-N truncation if the join exceeds it.
+            return ThresholdDecision.VECTOR
+        bp_per_pixel = (query.end - query.start) / max(1, query.viewport_px)
+        if bp_per_pixel > self.vector_bp_per_pixel_limit:
+            return ThresholdDecision.HYBRID
+        n = self._count_in_window(binding, query)
+        if n > self.vector_glyph_limit:
+            return ThresholdDecision.HYBRID
+        return ThresholdDecision.VECTOR
+
+    def fetch(
+        self,
+        binding: TrackBinding,
+        query: ClusterPileupQuery,
+        mode: ThresholdDecision,
+    ) -> Iterator[pa.RecordBatch]:
+        if (
+            mode is ThresholdDecision.VECTOR
+            and query.cluster_view == "members"
+        ):
+            return self._fetch_members(binding, query)
+
+        contig_id = _resolve_contig_id(binding.paths["genome"], query.contig)
+        if contig_id is None:
+            return iter(())
+
+        rows = self._scan_window(binding, contig_id, query)
+        if rows.num_rows == 0:
+            return iter(())
+
+        starts = rows.column("span_start").to_pylist()
+        ends = rows.column("span_end").to_pylist()
+        from constellation.viz.raster.datashader_png import greedy_row_assign
+
+        assigned = greedy_row_assign(starts, ends)
+
+        if mode is ThresholdDecision.VECTOR:
+            return self._emit_vector(rows, assigned)
+        return self._emit_hybrid(rows, assigned, query)
+
+    def estimate_vector_cost(
+        self, binding: TrackBinding, query: ClusterPileupQuery
+    ) -> int | None:
+        return self._count_in_window(binding, query)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _count_in_window(
+        self, binding: TrackBinding, query: ClusterPileupQuery
+    ) -> int:
+        contig_id = _resolve_contig_id(binding.paths["genome"], query.contig)
+        if contig_id is None:
+            return 0
+        # clusters.parquet is a single file (not a partitioned dataset)
+        # in the current pipeline output; pa.dataset still handles it.
+        dataset = pa_ds.dataset(str(binding.paths["clusters"]), format="parquet")
+        return int(dataset.count_rows(filter=self._predicate(contig_id, query)))
+
+    def _scan_window(
+        self, binding: TrackBinding, contig_id: int, query: ClusterPileupQuery
+    ) -> pa.Table:
+        dataset = pa_ds.dataset(str(binding.paths["clusters"]), format="parquet")
+        scanner = dataset.scanner(
+            columns=[
+                "cluster_id",
+                "span_start",
+                "span_end",
+                "strand",
+                "n_reads",
+                "mode",
+            ],
+            filter=self._predicate(contig_id, query),
+        )
+        return scanner.to_table()
+
+    @staticmethod
+    def _predicate(contig_id: int, query: ClusterPileupQuery) -> Any:
+        contig_field = pc.field("contig_id")
+        span_start = pc.field("span_start")
+        span_end = pc.field("span_end")
+        return (
+            (contig_field == pa.scalar(contig_id, pa.int64()))
+            & (span_end > pa.scalar(int(query.start), pa.int64()))
+            & (span_start < pa.scalar(int(query.end), pa.int64()))
+        )
+
+    def _emit_vector(
+        self, rows: pa.Table, assigned: list[int]
+    ) -> Iterator[pa.RecordBatch]:
+        # n_reads in TRANSCRIPT_CLUSTER_TABLE is int32; strand may
+        # be null for unstranded clusters — fill with '.' so the wire
+        # schema's non-null promise holds.
+        strand = rows.column("strand")
+        if strand.null_count:
+            strand = pc.fill_null(strand, ".")
+        out = pa.Table.from_arrays(
+            [
+                rows.column("cluster_id"),
+                rows.column("span_start"),
+                rows.column("span_end"),
+                strand,
+                rows.column("n_reads"),
+                pa.array(assigned, pa.int32()),
+                rows.column("mode"),
+            ],
+            schema=CLUSTER_PILEUP_VECTOR_SCHEMA,
+        )
+        return iter(out.to_batches())
+
+    def _emit_hybrid(
+        self, rows: pa.Table, assigned: list[int], query: ClusterPileupQuery
+    ) -> Iterator[pa.RecordBatch]:
+        from constellation.viz.raster.datashader_png import rasterize_segments
+
+        starts = rows.column("span_start").to_pylist()
+        ends = rows.column("span_end").to_pylist()
+        n_rows = max(assigned) + 1 if assigned else 1
+        height_px = min(2_000, max(40, 6 * n_rows))
+        png = rasterize_segments(
+            starts=starts,
+            ends=ends,
+            rows=assigned,
+            x_range=(int(query.start), int(query.end)),
+            n_rows=n_rows,
+            width_px=int(query.viewport_px),
+            height_px=height_px,
+        )
+        frame = pa.Table.from_pydict(
+            {
+                "png_bytes": [png],
+                "extent_start": [int(query.start)],
+                "extent_end": [int(query.end)],
+                "extent_y0": [0.0],
+                "extent_y1": [float(n_rows)],
+                "width_px": [int(query.viewport_px)],
+                "height_px": [int(height_px)],
+                "n_items": [int(rows.num_rows)],
+                "mode": ["hybrid"],
+            },
+            schema=HYBRID_SCHEMA,
+        )
+        return iter(frame.to_batches())
+
+    # ------------------------------------------------------------------
+    # Members-view fetch path (cluster_view='members')
+    # ------------------------------------------------------------------
+
+    def _fetch_members(
+        self, binding: TrackBinding, query: ClusterPileupQuery
+    ) -> Iterator[pa.RecordBatch]:
+        # Member expansion needs the upstream alignment artifacts; the
+        # discover/metadata layer surfaces unavailability via
+        # cluster_view_supported, but kernels must still defend against
+        # a `?cluster_view=members` query when the slots aren't there.
+        if any(
+            binding.paths.get(k) is None
+            for k in ("alignments", "alignment_blocks", "alignment_cs")
+        ):
+            return iter(())
+
+        contig_id = _resolve_contig_id(binding.paths["genome"], query.contig)
+        if contig_id is None:
+            return iter(())
+
+        # 1. In-window clusters give us the cluster_id set.
+        cluster_window = self._scan_window(binding, contig_id, query)
+        if cluster_window.num_rows == 0:
+            return iter(())
+        cluster_ids = pc.unique(cluster_window.column("cluster_id"))
+
+        # 2. cluster_membership filters down to (cluster_id, read_id, role)
+        #    rows for those clusters.
+        membership_dataset = pa_ds.dataset(
+            str(binding.paths["cluster_membership"]), format="parquet"
+        )
+        membership = membership_dataset.to_table(
+            columns=["cluster_id", "read_id", "role"],
+            filter=pc.field("cluster_id").isin(cluster_ids),
+        )
+        if membership.num_rows == 0:
+            return iter(())
+
+        # 3. Alignments table for those read_ids — bounded scan via
+        #    `read_id in (...)`. The standard ref_name / window
+        #    predicate also applies so we only render alignments that
+        #    fall inside the visible window (a read may belong to the
+        #    cluster but its alignment may live outside the window if
+        #    the cluster spans multiple gene loci on the same contig).
+        member_read_ids = pc.unique(membership.column("read_id"))
+        aln_dataset = pa_ds.dataset(
+            str(binding.paths["alignments"]), format="parquet"
+        )
+        contig_name = query.contig
+        aln_filter = (
+            (pc.field("ref_name") == pa.scalar(contig_name, pa.string()))
+            & (pc.field("ref_end") > pa.scalar(int(query.start), pa.int64()))
+            & (pc.field("ref_start") < pa.scalar(int(query.end), pa.int64()))
+            & pc.field("read_id").isin(member_read_ids)
+        )
+        if query.min_mapq > 0:
+            aln_filter = aln_filter & (
+                pc.field("mapq") >= pa.scalar(int(query.min_mapq), pa.int32())
+            )
+        aln_table = aln_dataset.scanner(
+            columns=[
+                "alignment_id",
+                "read_id",
+                "ref_start",
+                "ref_end",
+                "strand",
+                "mapq",
+                "is_secondary",
+                "is_supplementary",
+            ],
+            filter=aln_filter,
+        ).to_table()
+        if aln_table.num_rows == 0:
+            return iter(())
+        primary_mask = pc.and_(
+            pc.invert(aln_table.column("is_secondary")),
+            pc.invert(aln_table.column("is_supplementary")),
+        )
+        aln_table = aln_table.filter(primary_mask).drop_columns(
+            ["is_secondary", "is_supplementary"]
+        )
+        if aln_table.num_rows == 0:
+            return iter(())
+
+        # 4. Hash-join cluster_id + role onto the alignments. read_id is
+        #    the join key; the membership table may have multiple rows
+        #    for the same read_id under different roles (rare but
+        #    possible when a read is a representative for one cluster
+        #    and a duplicate for another). For simplicity we keep all
+        #    such rows and let the renderer color them by cluster_id.
+        joined = aln_table.join(
+            membership.select(["cluster_id", "read_id", "role"]),
+            keys="read_id",
+            join_type="inner",
+        )
+        if joined.num_rows == 0:
+            return iter(())
+
+        # 5. Cap at vector_glyph_limit (top-N by alignment_id for
+        #    determinism — a future "by cluster size" sort could be a
+        #    style option). Same idea as splice_junctions's support cap.
+        if joined.num_rows > self.vector_glyph_limit:
+            order = pc.sort_indices(joined.column("alignment_id"))
+            joined = pc.take(joined, order.slice(0, self.vector_glyph_limit))
+
+        # 6. Row-pack the alignments; greedy by (ref_start, ref_end).
+        starts = joined.column("ref_start").to_pylist()
+        ends = joined.column("ref_end").to_pylist()
+        from constellation.viz.raster.datashader_png import greedy_row_assign
+
+        assigned = greedy_row_assign(starts, ends)
+
+        # 7. Attach blocks + mismatch positions exactly like read_pileup.
+        joined = attach_blocks(
+            joined, self._scan_blocks(binding, joined)
+        )
+        bp_per_pixel = (query.end - query.start) / max(1, query.viewport_px)
+        skip_mismatch = bp_per_pixel > self.mismatch_glyph_bp_per_pixel_limit
+        joined = attach_mismatch_positions(
+            joined,
+            binding.paths["alignment_cs"],
+            skip=skip_mismatch,
+        )
+
+        return self._emit_members(joined, assigned)
+
+    @staticmethod
+    def _scan_blocks(
+        binding: TrackBinding, alignments: pa.Table
+    ) -> pa.Table:
+        ids = pc.unique(alignments.column("alignment_id"))
+        dataset = pa_ds.dataset(
+            str(binding.paths["alignment_blocks"]), format="parquet"
+        )
+        return dataset.to_table(
+            columns=[
+                "alignment_id",
+                "block_index",
+                "ref_start",
+                "ref_end",
+                "n_match",
+                "n_mismatch",
+            ],
+            filter=pc.field("alignment_id").isin(ids),
+        )
+
+    @staticmethod
+    def _emit_members(
+        rows: pa.Table, assigned: list[int]
+    ) -> Iterator[pa.RecordBatch]:
+        out = pa.Table.from_arrays(
+            [
+                rows.column("alignment_id"),
+                rows.column("read_id"),
+                rows.column("cluster_id"),
+                rows.column("ref_start"),
+                rows.column("ref_end"),
+                rows.column("strand"),
+                rows.column("mapq"),
+                pa.array(assigned, pa.int32()),
+                rows.column("blocks"),
+                rows.column("mismatch_positions"),
+                rows.column("role"),
+            ],
+            schema=CLUSTER_MEMBER_VECTOR_SCHEMA,
+        )
+        return iter(out.to_batches())
+
+
+def _resolve_contig_id(genome_dir: Any, contig_name: str) -> int | None:
+    contigs_path = genome_dir / "contigs.parquet"
+    if not contigs_path.exists():
+        return None
+    table = pq.read_table(contigs_path, columns=["contig_id", "name"])
+    matches = table.filter(pc.field("name") == pa.scalar(contig_name, pa.string()))
+    if matches.num_rows == 0:
+        return None
+    return int(matches.column("contig_id")[0].as_py())

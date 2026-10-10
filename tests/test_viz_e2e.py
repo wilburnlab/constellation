@@ -31,7 +31,7 @@ from constellation.sequencing.schemas.quant import COVERAGE_TABLE  # noqa: E402
 from constellation.sequencing.schemas.reference import CONTIG_TABLE  # noqa: E402
 from constellation.viz.server.app import create_app  # noqa: E402
 from constellation.viz.server.arrow_stream import ARROW_IPC_MEDIA_TYPE  # noqa: E402
-from constellation.viz.server.session import Session  # noqa: E402
+from _viz_fixtures import Session  # noqa: E402
 
 
 pytestmark = pytest.mark.slow

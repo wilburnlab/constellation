@@ -3,10 +3,12 @@
 
 Subcommands:
 
-- ``constellation viz genome --session DIR`` — focused IGV-style genome
-  browser on the session's parquet outputs. Boots a local FastAPI server
-  via uvicorn and (unless ``--no-browser``) opens the browser at the
-  served URL.
+- ``constellation viz genome --reference <handle> --align-dir DIR [...]
+  [--cluster-dir DIR ...]`` (or ``--saved-session <slug>``) — focused
+  IGV-style genome browser over one cached reference plus the attached
+  ``transcriptome align`` / ``cluster`` output dirs. Boots a local
+  FastAPI server via uvicorn and (unless ``--no-browser``) opens the
+  browser at the served URL.
 - ``constellation viz install-frontend --from <tarball>`` — extract a
   prebuilt frontend bundle into the package's ``static/<entry>/`` dir.
   Used by source-checkout / HPC installs where the JS toolchain isn't
@@ -321,7 +323,10 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
          `--align-dir` / `--cluster-dir` — ad-hoc one-shot session.
     """
     from constellation.viz.server.app import create_app
-    from constellation.viz.server.session import Session, _from_saved_session
+    from constellation.viz.modalities.genome.session import (
+        GenomeSession,
+        session_from_saved,
+    )
     from constellation.viz.sessions import read_saved
 
     align_dirs = list(args.align_dir or [])
@@ -343,11 +348,21 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
             return 2
         try:
             saved = read_saved(args.saved_session)
-        except FileNotFoundError as exc:
+        except (FileNotFoundError, ValueError) as exc:
+            # ValueError: an unreadable file (unsupported schema version,
+            # a genome session with no reference handle).
             print(f"error: {exc}", file=sys.stderr)
             return 2
+        if saved.modality != GenomeSession.modality:
+            print(
+                f"error: saved session {args.saved_session!r} is a "
+                f"{saved.modality!r} session; `viz genome` opens genome "
+                f"sessions only",
+                file=sys.stderr,
+            )
+            return 2
         try:
-            session = _from_saved_session(saved)
+            session = session_from_saved(saved)
         except ValueError as exc:
             print(f"error opening saved session: {exc}", file=sys.stderr)
             return 1
@@ -389,7 +404,7 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
             for p in cluster_dirs
         ]
         try:
-            session = Session.open(
+            session = GenomeSession.open(
                 reference_handle=args.reference,
                 sources=sources,
                 label=args.label,

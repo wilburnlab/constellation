@@ -39,14 +39,14 @@ from fastapi.staticfiles import StaticFiles
 # registration via @register_track. Without this the /api/tracks
 # endpoints would return an empty list.
 import constellation.viz  # noqa: F401
+from constellation.viz.modalities import get_modality, registered_modalities
 from constellation.viz.server.endpoints import cli_schema as cli_schema_ep
 from constellation.viz.server.endpoints import commands as commands_ep
 from constellation.viz.server.endpoints import fs as fs_ep
-from constellation.viz.server.endpoints import references as references_ep
 from constellation.viz.server.endpoints import saved_sessions as saved_sessions_ep
 from constellation.viz.server.endpoints import sessions as sessions_ep
 from constellation.viz.server.endpoints import tracks as tracks_ep
-from constellation.viz.server.session import Session
+from constellation.viz.server.session import SessionLike
 
 
 # Resolve the bundled-static directory once at import time. It lives
@@ -63,7 +63,7 @@ def _package_version() -> str:
 
 
 def create_app(
-    sessions: dict[str, Session] | list[Session] | Session,
+    sessions: dict[str, SessionLike] | list[SessionLike] | SessionLike,
     *,
     static_root: Path | None = None,
     default_entry: str = "genome",
@@ -128,8 +128,13 @@ def create_app(
 
     app.include_router(sessions_ep.router)
     app.include_router(tracks_ep.router)
-    app.include_router(references_ep.router)
     app.include_router(saved_sessions_ep.router)
+    # Each modality contributes its own routes (the genome browser's
+    # contigs / feature search / reference list). The factory imports its
+    # FastAPI module here, not when the modality registered.
+    for name in registered_modalities():
+        for modality_router in get_modality(name).routers():
+            app.include_router(modality_router)
     app.include_router(cli_schema_ep.router)
     app.include_router(commands_ep.router)
     app.include_router(fs_ep.router)
@@ -195,20 +200,23 @@ def _resolve_index_file(entry_dir: Path, entry: str) -> Path | None:
 
 
 def _normalize_sessions(
-    sessions: dict[str, Session] | list[Session] | Session,
-) -> dict[str, Session]:
-    if isinstance(sessions, Session):
-        return {sessions.session_id: sessions}
+    sessions: dict[str, SessionLike] | list[SessionLike] | SessionLike,
+) -> dict[str, SessionLike]:
+    # Containers first: a session is anything else that carries a
+    # ``session_id`` (sessions are per-modality classes with no common
+    # base, so there is no single type to test for).
+    if isinstance(sessions, dict):
+        return dict(sessions)
     if isinstance(sessions, list):
-        out: dict[str, Session] = {}
+        out: dict[str, SessionLike] = {}
         for s in sessions:
             if s.session_id in out:
                 raise ValueError(f"duplicate session_id: {s.session_id}")
             out[s.session_id] = s
         return out
-    if isinstance(sessions, dict):
-        return dict(sessions)
+    if hasattr(sessions, "session_id"):
+        return {sessions.session_id: sessions}
     raise TypeError(
-        f"sessions must be Session, list[Session], or dict[str, Session]; "
-        f"got {type(sessions).__name__}"
+        f"sessions must be a session, a list of sessions, or a "
+        f"{{session_id: session}} dict; got {type(sessions).__name__}"
     )
