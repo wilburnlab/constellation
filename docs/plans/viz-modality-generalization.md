@@ -34,8 +34,11 @@
   - Verification went past the plan. jsdom applies no CSS, so the stylesheet
     split, the inline-style removal and the popover changes were checked with
     headless-Chrome screenshots of the standalone page over a synthetic
-    session, in 13 UI states, compared pixel-for-pixel before and after. The
-    harness was a one-off and is not in the tree.
+    session, in 13 UI states, compared pixel-for-pixel before and after, and
+    against a build of `main` for both the standalone page and the browser
+    embedded in the dashboard (identical everywhere except the gear popovers
+    the parity exceptions changed). The harness was a one-off and is not in
+    the tree; `viz/CLAUDE.md` describes the technique.
 
 Plan approved 2026-10-09. Companion to
 [viz-and-dashboard.md](viz-and-dashboard.md), which records how the viz layer
@@ -308,6 +311,11 @@ current behavior by tests.
   copies them all.
 - Clearing a number field in the settings popover stores 0 rather than
   removing the key (`Number('') === 0`); a text field removes it.
+- In the dashboard, the genome entry form leaves its `viz-form` class on the
+  task panel, so the browser mounted there is inset by the form's padding and
+  its toolbar inherits the form's label / input rules ("Go to:" wraps). The
+  form's own selects and link buttons have no dark-theme rule at all. Both are
+  pixel-identical on `main`.
 - Knobs the drawing code reads that no popover offers:
   `letter_font_family` (reference_sequence), `strand_chevron_min_width_px`
   (gene_annotation), `palette.exon` (read_pileup), `palette.default`
