@@ -1,7 +1,7 @@
 """Shared test helpers for the reference-cache-first viz layer.
 
 Builds an end-to-end Session backed by a fake reference cache + one or
-more `transcriptome align` / `cluster` output dirs with schema-v2
+more `transcriptome align` / `cluster` output dirs with current-schema
 manifests. Used by `tests/test_viz_session.py`, the kernel tests, and
 the server endpoint tests.
 
@@ -130,7 +130,7 @@ def write_align_source(
     derived_annotation_features: list[dict[str, Any]] | None = None,
     samples: list[str] | None = None,
 ) -> Path:
-    """Write a `transcriptome align` source dir with a v4 manifest.
+    """Write a `transcriptome align` source dir with a manifest.
 
     Each ``*`` kwarg, when non-None, writes the corresponding artifact
     and records it in the manifest's ``outputs`` map. Missing artifacts
@@ -217,7 +217,13 @@ def write_cluster_source(
     clusters: list[dict[str, Any]] | None = None,
     cluster_membership: list[dict[str, Any]] | None = None,
     samples: list[str] | None = None,
+    align_dir: str = "",
 ) -> Path:
+    """Write a `transcriptome cluster` source dir with a manifest.
+
+    ``align_dir`` is the manifest's back-reference to the upstream align
+    run; set it to expose the cluster_pileup members view.
+    """
     source_dir.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, str] = {}
     if clusters is not None:
@@ -239,7 +245,7 @@ def write_cluster_source(
         reference_handle=reference_handle,
         reference_path=reference_path,
         assembly_accession=assembly_accession,
-        align_dir="",
+        align_dir=align_dir,
         demux_dir="",
         parameters={},
         stages={},
