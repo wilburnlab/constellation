@@ -3,10 +3,12 @@
 
 Subcommands:
 
-- ``constellation viz genome --session DIR`` — focused IGV-style genome
-  browser on the session's parquet outputs. Boots a local FastAPI server
-  via uvicorn and (unless ``--no-browser``) opens the browser at the
-  served URL.
+- ``constellation viz genome --reference <handle> --align-dir DIR [...]
+  [--cluster-dir DIR ...]`` (or ``--saved-session <slug>``) — focused
+  IGV-style genome browser over one cached reference plus the attached
+  ``transcriptome align`` / ``cluster`` output dirs. Boots a local
+  FastAPI server via uvicorn and (unless ``--no-browser``) opens the
+  browser at the served URL.
 - ``constellation viz install-frontend --from <tarball>`` — extract a
   prebuilt frontend bundle into the package's ``static/<entry>/`` dir.
   Used by source-checkout / HPC installs where the JS toolchain isn't

@@ -8,8 +8,8 @@ canonical axis here; the genome browser dashboard always picks a
 reference first and then adds zero or more sources keyed to it.
 
 Sessions are constructed exclusively via :meth:`Session.open` (handle +
-list-of-sources) or :meth:`Session.from_saved` (load a saved-session
-TOML from ``~/.constellation/sessions/``). The legacy ``from_root`` /
+list-of-sources); :func:`_from_saved_session` adapts a saved-session
+TOML from ``~/.constellation/sessions/`` onto it. The legacy ``from_root`` /
 directory-walk discovery / ``session.toml`` v1 reader were removed in
 the reference-cache-first cutover — the dashboard's entry form is now
 the sole on-ramp.
@@ -185,9 +185,10 @@ class Session:
 
         ``kind`` is auto-detected from each source's ``manifest.json``
         when omitted. ``label`` defaults to the directory basename. Each
-        source must have a schema-v2 manifest (``reference_handle``
-        optional, ``assembly_accession`` may be ``None`` for escape-hatch
-        runs); pre-v2 manifests raise ``ValueError`` with an actionable
+        source must have a manifest at the transcriptome module's current
+        schema version (``reference_handle`` optional,
+        ``assembly_accession`` may be ``None`` for escape-hatch runs);
+        any other version raises ``ValueError`` with an actionable
         message.
         """
         from constellation.sequencing.reference.handle import (
@@ -339,7 +340,8 @@ class Session:
 def _load_source(entry: dict[str, Any]) -> SessionSource:
     """Build a SessionSource from a ``{path, kind?, label?}`` dict.
 
-    Reads the source's ``manifest.json`` (schema v4 required), assembles
+    Reads the source's ``manifest.json`` (current schema version
+    required — see ``sequencing.transcriptome.manifest``), assembles
     the per-kind slot map by joining the manifest's ``outputs`` against
     the well-known relative paths, and returns a frozen dataclass.
     """
@@ -429,7 +431,7 @@ def _attach_align_slots_from_cluster(
     expansion (no sibling-source lookup required).
 
     Silently skips when align_dir is empty, missing, or doesn't carry a
-    readable v4 align manifest — the cluster source still loads, just
+    readable align manifest — the cluster source still loads, just
     without the alignment slots populated (the kernel surfaces that
     state via ``cluster_view_supported = False`` in its metadata).
     """
@@ -499,9 +501,9 @@ def _resolve_slot(base: Path, rel: str) -> Path | None:
 def _from_saved_session(saved: Any, *, cache_root: Path | None = None) -> Session:
     """Construct a Session from a SavedSession dataclass.
 
-    Centralized here so the saved-sessions endpoint, the standalone
-    ``constellation viz genome --saved-session`` CLI, and any future
-    callers all route through the same loader.
+    Used by the standalone ``constellation viz genome --saved-session``
+    CLI. (The dashboard's saved-session flow does not come through here:
+    its form reads the saved TOML and POSTs ``/api/sessions/open``.)
     """
     return Session.open(
         reference_handle=saved.reference_handle,
