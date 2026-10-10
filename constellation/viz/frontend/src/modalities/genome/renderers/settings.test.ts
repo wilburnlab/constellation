@@ -252,6 +252,16 @@ describe('genome track settings: form model', () => {
     expect(allowList(root, 'Visible modes')).toEqual(['em']);
   });
 
+  it('gives the pre-rename mode spellings their colour, not the grey fallback', () => {
+    // clusters.parquet files written before the mode rename still say
+    // genome-guided / de-novo.
+    const { root } = mount('cluster_pileup', { meta: { modes_in_data: ['de-novo', 'genome-guided'] } });
+    const swatch = (label: string): string =>
+      (rowByLabel(root, label).querySelector('input[type="color"]') as HTMLInputElement).value;
+    expect(swatch('genome-guided')).toBe('#5ed6cf');
+    expect(swatch('de-novo')).toBe('#a8d65e');
+  });
+
   it('offers only the splice motifs the track holds, null motifs aside', () => {
     const { root } = mount('splice_junctions', { meta: { motifs_in_data: ['GT-AG', null, 'CT-AC'] } });
     expect(paletteLabels(root)).toEqual(['GT-AG', 'CT-AC']);

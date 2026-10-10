@@ -19,7 +19,7 @@ Architectural invariants:
   `@register_track` (the ABC and registry are in `viz.tracks.base`), and own
   their visual vocabulary + threshold logic. Each kernel is mirror-symmetric
   to a TS module under
-  `constellation/viz/frontend/src/track_renderers/<kind>.ts`.
+  `constellation/viz/frontend/src/modalities/<modality>/renderers/<kind>.ts`.
 - **Read-only over parquet**. The viz server never writes pipeline outputs.
   Long-running compute stays in CLI/notebook; the GUI only consumes.
 

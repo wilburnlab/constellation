@@ -20,7 +20,7 @@ Kernels (reading slot names per ``genome.session.GenomeSource``):
 shared by the two pile-up kernels.
 
 The mirror-symmetric TS renderer for each kernel lives under
-``constellation/viz/frontend/src/track_renderers/<kind>.ts``.
+``constellation/viz/frontend/src/modalities/genome/renderers/<kind>.ts``.
 """
 
 from constellation.viz.modalities.genome.tracks import (  # noqa: F401
