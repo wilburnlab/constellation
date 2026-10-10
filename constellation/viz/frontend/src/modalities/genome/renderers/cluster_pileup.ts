@@ -22,6 +22,16 @@ import { decodeHybrid, appendHybridImage } from '../../../engine/hybrid_layer';
 import { TrackRenderer, RenderContext } from './base';
 import { clusterView, minMapq } from './pushdown';
 import { renderAlignmentRows } from './_alignment_view';
+import { SettingsEnv, SettingsSchema } from '../../../panels/settings_schema';
+import {
+  REFETCH_HINT,
+  generalSection,
+  num,
+  opacity,
+  orFallback,
+  plainOptions,
+  stringList,
+} from './settings_common';
 import {
   pickAllowList,
   pickNumber,
@@ -55,12 +65,77 @@ const CLUSTER_PALETTE_CYCLE = [
   '#5ed694',
 ];
 
+/** Style and filter defaults for the clusters view, shared by the
+ *  drawing code and the settings popover. */
+const DEFAULTS = {
+  min_row_height_px: 4,
+  max_row_height_px: 10,
+  opacity_min: 0.4,
+  opacity_max: 1.0,
+  min_reads: 1,
+} as const;
+
+/** Offered when the track's metadata names no modes. */
+const KNOWN_MODES = ['genome', 'kmer', 'em'];
+
+function modesOf(env: SettingsEnv): string[] {
+  return orFallback(stringList(env.meta.modes), KNOWN_MODES);
+}
+
+const SETTINGS: SettingsSchema = {
+  sections: [
+    generalSection(1.0),
+    {
+      title: 'Style',
+      controls: [
+        {
+          type: 'palette',
+          entries: (env) =>
+            modesOf(env).map((mode) => ({
+              key: mode,
+              label: mode,
+              default: MODE_COLOR_DEFAULTS[mode] ?? MODE_COLOR_DEFAULTS.default,
+            })),
+        },
+        num('style', 'min_row_height_px', 'Min row height (px)', DEFAULTS.min_row_height_px, 1, 20, 1),
+        num('style', 'max_row_height_px', 'Max row height (px)', DEFAULTS.max_row_height_px, 2, 40, 1),
+        opacity('opacity_min', 'Opacity min', DEFAULTS.opacity_min),
+        opacity('opacity_max', 'Opacity max', DEFAULTS.opacity_max),
+      ],
+    },
+    {
+      title: 'Filter',
+      controls: [
+        {
+          // Offered only when the kernel can expand clusters into member
+          // reads (it needs the upstream align dir). Applied by the kernel.
+          type: 'select',
+          target: 'filter',
+          key: 'cluster_view',
+          label: 'Cluster view',
+          default: 'clusters',
+          options: [
+            { value: 'clusters', label: 'Clusters' },
+            { value: 'members', label: 'Member reads' },
+          ],
+          when: (env) => env.meta.cluster_view_supported === true,
+          hint: REFETCH_HINT,
+        },
+        { type: 'allowlist', target: 'filter', key: 'visible_modes', label: 'Visible modes', options: (env) => plainOptions(modesOf(env)) },
+        { type: 'allowlist', target: 'filter', key: 'visible_strands', label: 'Visible strands', options: plainOptions(['+', '-', '.']) },
+        num('filter', 'min_reads', 'Min reads', DEFAULTS.min_reads, 1, 1_000_000, 1),
+      ],
+    },
+  ],
+};
+
 const renderer: TrackRenderer = {
   kind: 'cluster_pileup',
   order: 4,
   unit: ['cluster', 'clusters'],
   // The status line counts clusters in either view.
   pushdown: { min_mapq: minMapq, cluster_view: clusterView },
+  settings: SETTINGS,
   render(table: Table, mode: TrackMode, ctx: RenderContext): void {
     clear(ctx.svg);
 
@@ -118,15 +193,15 @@ function renderClusters(table: Table, ctx: RenderContext): void {
     return;
   }
 
-  const minRowH = pickNumber(ctx.style, 'min_row_height_px', 4);
-  const maxRowH = pickNumber(ctx.style, 'max_row_height_px', 10);
-  const opacityMin = pickNumber(ctx.style, 'opacity_min', 0.4);
-  const opacityMax = pickNumber(ctx.style, 'opacity_max', 1.0);
+  const minRowH = pickNumber(ctx.style, 'min_row_height_px', DEFAULTS.min_row_height_px);
+  const maxRowH = pickNumber(ctx.style, 'max_row_height_px', DEFAULTS.max_row_height_px);
+  const opacityMin = pickNumber(ctx.style, 'opacity_min', DEFAULTS.opacity_min);
+  const opacityMax = pickNumber(ctx.style, 'opacity_max', DEFAULTS.opacity_max);
   const opacityRange = Math.max(0, opacityMax - opacityMin);
 
   const allowedModes = pickAllowList(ctx.filter, 'visible_modes');
   const allowedStrands = pickAllowList(ctx.filter, 'visible_strands');
-  const minReads = pickNumber(ctx.filter, 'min_reads', 1);
+  const minReads = pickNumber(ctx.filter, 'min_reads', DEFAULTS.min_reads);
 
   const admit: boolean[] = new Array(table.numRows);
   let maxRow = -1;

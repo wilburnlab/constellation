@@ -11,6 +11,16 @@ import {
   pickNumber,
   pickPaletteColor,
 } from '../../../panels/style';
+import { SettingsEnv, SettingsSchema } from '../../../panels/settings_schema';
+import {
+  generalSection,
+  num,
+  opacity,
+  orFallback,
+  plainOptions,
+  stringList,
+  toggle,
+} from './settings_common';
 
 const MOTIF_COLOR_DEFAULTS: Record<string, string> = {
   'GT-AG': '#5e9cd6',
@@ -19,19 +29,68 @@ const MOTIF_COLOR_DEFAULTS: Record<string, string> = {
   default: '#888',
 };
 
+/** Style and filter defaults, shared by the drawing code and the
+ *  settings popover. */
+const DEFAULTS = {
+  arc_stroke_min_px: 1,
+  arc_stroke_max_px: 4,
+  arc_opacity: 0.85,
+  min_support: 1,
+  annotated_only: false,
+} as const;
+
+/** Offered when the track's metadata names no motifs. */
+const KNOWN_MOTIFS = Object.keys(MOTIF_COLOR_DEFAULTS).filter((m) => m !== 'default');
+
+function motifsOf(env: SettingsEnv): string[] {
+  return orFallback(stringList(env.meta.motifs), KNOWN_MOTIFS);
+}
+
+const SETTINGS: SettingsSchema = {
+  sections: [
+    generalSection(0.85),
+    {
+      title: 'Style',
+      controls: [
+        {
+          type: 'palette',
+          entries: (env) =>
+            motifsOf(env).map((motif) => ({
+              key: motif,
+              label: motif,
+              default: MOTIF_COLOR_DEFAULTS[motif] ?? MOTIF_COLOR_DEFAULTS.default,
+            })),
+        },
+        num('style', 'arc_stroke_min_px', 'Min stroke (px)', DEFAULTS.arc_stroke_min_px, 0.5, 10, 0.5),
+        num('style', 'arc_stroke_max_px', 'Max stroke (px)', DEFAULTS.arc_stroke_max_px, 0.5, 12, 0.5),
+        opacity('arc_opacity', 'Arc opacity', DEFAULTS.arc_opacity),
+      ],
+    },
+    {
+      title: 'Filter',
+      controls: [
+        { type: 'allowlist', target: 'filter', key: 'visible_motifs', label: 'Visible motifs', options: (env) => plainOptions(motifsOf(env)) },
+        num('filter', 'min_support', 'Min support', DEFAULTS.min_support, 1, 1_000_000, 1),
+        toggle('filter', 'annotated_only', 'Only annotated junctions', DEFAULTS.annotated_only),
+      ],
+    },
+  ],
+};
+
 const renderer: TrackRenderer = {
   kind: 'splice_junctions',
   order: 5,
   unit: ['junction', 'junctions'],
+  settings: SETTINGS,
   render(table: Table, _mode: TrackMode, ctx: RenderContext): void {
     clear(ctx.svg);
 
-    const strokeMin = pickNumber(ctx.style, 'arc_stroke_min_px', 1);
-    const strokeMax = pickNumber(ctx.style, 'arc_stroke_max_px', 4);
-    const arcOpacity = pickNumber(ctx.style, 'arc_opacity', 0.85);
+    const strokeMin = pickNumber(ctx.style, 'arc_stroke_min_px', DEFAULTS.arc_stroke_min_px);
+    const strokeMax = pickNumber(ctx.style, 'arc_stroke_max_px', DEFAULTS.arc_stroke_max_px);
+    const arcOpacity = pickNumber(ctx.style, 'arc_opacity', DEFAULTS.arc_opacity);
     const allowedMotifs = pickAllowList(ctx.filter, 'visible_motifs');
-    const minSupport = pickNumber(ctx.filter, 'min_support', 1);
-    const annotatedOnly = pickBool(ctx.filter, 'annotated_only', false);
+    const minSupport = pickNumber(ctx.filter, 'min_support', DEFAULTS.min_support);
+    const annotatedOnly = pickBool(ctx.filter, 'annotated_only', DEFAULTS.annotated_only);
 
     if (table.numRows === 0) {
       const text = svgEl('text', {

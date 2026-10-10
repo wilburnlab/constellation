@@ -5,7 +5,9 @@ import { Table } from 'apache-arrow';
 import { svgEl, clear } from '../../../engine/svg_layer';
 import { TrackMode } from '../../../engine/arrow_client';
 import { TrackRenderer, RenderContext } from './base';
+import { SettingsSchema } from '../../../panels/settings_schema';
 import { pickNumber, pickPaletteColor, pickString } from '../../../panels/style';
+import { generalSection, num } from './settings_common';
 
 const BASE_COLOR_DEFAULTS: Record<string, string> = {
   A: '#5cd66e',
@@ -18,10 +20,38 @@ const BASE_COLOR_DEFAULTS: Record<string, string> = {
 
 const DEFAULT_LETTER_FONT = 'ui-monospace, SF Mono, Menlo, monospace';
 
+/** Style defaults, shared by the drawing code and the settings popover. */
+const DEFAULTS = {
+  letter_font_size_px: 11,
+  letter_threshold_px_per_bp: 6,
+} as const;
+
+const SETTINGS: SettingsSchema = {
+  sections: [
+    generalSection(1.0),
+    {
+      title: 'Style',
+      controls: [
+        {
+          type: 'palette',
+          entries: Object.entries(BASE_COLOR_DEFAULTS).map(([base, color]) => ({
+            key: base,
+            label: base,
+            default: color,
+          })),
+        },
+        num('style', 'letter_font_size_px', 'Letter font size (px)', DEFAULTS.letter_font_size_px, 6, 20, 1),
+        num('style', 'letter_threshold_px_per_bp', 'Letter threshold (px/bp)', DEFAULTS.letter_threshold_px_per_bp, 1, 40, 1),
+      ],
+    },
+  ],
+};
+
 const renderer: TrackRenderer = {
   kind: 'reference_sequence',
   order: 0,
   unit: ['base', 'bases'],
+  settings: SETTINGS,
   render(table: Table, _mode: TrackMode, ctx: RenderContext): void {
     clear(ctx.svg);
     const fontFamily = pickString(
@@ -29,11 +59,11 @@ const renderer: TrackRenderer = {
       'letter_font_family',
       DEFAULT_LETTER_FONT,
     );
-    const fontSize = pickNumber(ctx.style, 'letter_font_size_px', 11);
+    const fontSize = pickNumber(ctx.style, 'letter_font_size_px', DEFAULTS.letter_font_size_px);
     const letterThreshold = pickNumber(
       ctx.style,
       'letter_threshold_px_per_bp',
-      6,
+      DEFAULTS.letter_threshold_px_per_bp,
     );
 
     if (table.numRows === 0) {

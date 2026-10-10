@@ -41,6 +41,19 @@ export interface AlignmentViewOptions {
   glyphDataAttrs?: Array<{ attr: string; column: string }>;
 }
 
+/** Style defaults for alignment rows, shared by the drawing code and
+ *  the settings of every track that draws them. */
+export const ALIGNMENT_DEFAULTS = {
+  min_row_height_px: 2,
+  max_row_height_px: 8,
+  read_opacity: 1.0,
+  intron_stroke_dasharray: '2,2',
+  intron_stroke_width_px: 1,
+  mismatch_glyph_size_px: 6,
+  mismatch_color: '#e3493a',
+  intron_color: '#5a5a63',
+} as const;
+
 const STRAND_FALLBACK_DEFAULT: Record<string, string> = {
   '+': '#5e9cd6',
   '-': '#d6755e',
@@ -94,18 +107,18 @@ export function renderAlignmentRows(
     return { admittedRows: 0, naturalHeight: ctx.heightPx };
   }
 
-  const minRowH = pickNumber(ctx.style, 'min_row_height_px', 2);
-  const maxRowH = pickNumber(ctx.style, 'max_row_height_px', 8);
-  const readOpacity = pickNumber(ctx.style, 'read_opacity', 1.0);
+  const minRowH = pickNumber(ctx.style, 'min_row_height_px', ALIGNMENT_DEFAULTS.min_row_height_px);
+  const maxRowH = pickNumber(ctx.style, 'max_row_height_px', ALIGNMENT_DEFAULTS.max_row_height_px);
+  const readOpacity = pickNumber(ctx.style, 'read_opacity', ALIGNMENT_DEFAULTS.read_opacity);
   const intronDasharray = pickString(
     ctx.style,
     'intron_stroke_dasharray',
-    '2,2',
+    ALIGNMENT_DEFAULTS.intron_stroke_dasharray,
   );
-  const intronStrokeWidth = pickNumber(ctx.style, 'intron_stroke_width_px', 1);
-  const mismatchSize = pickNumber(ctx.style, 'mismatch_glyph_size_px', 6);
-  const mismatchColor = pickPaletteColor(ctx.style, 'mismatch', '#e3493a');
-  const intronColor = pickPaletteColor(ctx.style, 'intron', '#5a5a63');
+  const intronStrokeWidth = pickNumber(ctx.style, 'intron_stroke_width_px', ALIGNMENT_DEFAULTS.intron_stroke_width_px);
+  const mismatchSize = pickNumber(ctx.style, 'mismatch_glyph_size_px', ALIGNMENT_DEFAULTS.mismatch_glyph_size_px);
+  const mismatchColor = pickPaletteColor(ctx.style, 'mismatch', ALIGNMENT_DEFAULTS.mismatch_color);
+  const intronColor = pickPaletteColor(ctx.style, 'intron', ALIGNMENT_DEFAULTS.intron_color);
   const allowedStrands = pickAllowList(ctx.filter, 'visible_strands');
   // Sample / cluster filter — the same allowlist mechanism applies on
   // whichever colorKey is in use. Filter name follows the column.

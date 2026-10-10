@@ -13,6 +13,8 @@ import {
   pickPaletteColor,
   pickString,
 } from '../../../panels/style';
+import { SettingsSchema } from '../../../panels/settings_schema';
+import { generalSection, num, opacity, plainOptions, toggle } from './settings_common';
 
 const TYPE_COLOR_DEFAULTS: Record<string, string> = {
   gene: '#5e8cd6',
@@ -25,24 +27,74 @@ const TYPE_COLOR_DEFAULTS: Record<string, string> = {
   default: '#888',
 };
 
+/** Style and filter defaults, shared by the drawing code and the
+ *  settings popover. */
+const DEFAULTS = {
+  row_height_px: 14,
+  feature_opacity: 0.85,
+  label_font_family: '',
+  label_font_size_px: 10,
+  label_min_width_px: 24,
+  strand_chevron_min_width_px: 12,
+  show_chevrons: true,
+  min_length_bp: 0,
+} as const;
+
+/** The feature types with a palette entry of their own. */
+const KNOWN_TYPES = Object.keys(TYPE_COLOR_DEFAULTS).filter((t) => t !== 'default');
+
+const SETTINGS: SettingsSchema = {
+  sections: [
+    generalSection(0.85),
+    {
+      title: 'Style',
+      controls: [
+        {
+          type: 'palette',
+          entries: Object.entries(TYPE_COLOR_DEFAULTS).map(([type, color]) => ({
+            key: type,
+            label: type,
+            default: color,
+          })),
+        },
+        num('style', 'row_height_px', 'Row height (px)', DEFAULTS.row_height_px, 6, 40, 1),
+        opacity('feature_opacity', 'Feature opacity', DEFAULTS.feature_opacity),
+        num('style', 'label_min_width_px', 'Label min width (px)', DEFAULTS.label_min_width_px, 0, 200, 1),
+        toggle('style', 'show_chevrons', 'Show chevrons', DEFAULTS.show_chevrons),
+        toggle('style', 'show_labels', 'Show labels', true),
+      ],
+    },
+    {
+      title: 'Filter',
+      controls: [
+        { type: 'allowlist', target: 'filter', key: 'visible_types', label: 'Visible feature types', options: plainOptions(KNOWN_TYPES) },
+        { type: 'allowlist', target: 'filter', key: 'visible_strands', label: 'Visible strands', options: plainOptions(['+', '-', '.']) },
+        { type: 'allowlist', target: 'filter', key: 'visible_sources', label: 'Visible sources', options: plainOptions(['reference', 'derived']) },
+        num('filter', 'min_length_bp', 'Min length (bp)', DEFAULTS.min_length_bp, 0, 1_000_000, 10),
+      ],
+    },
+  ],
+};
+
 const renderer: TrackRenderer = {
   kind: 'gene_annotation',
   order: 1,
   unit: ['feature', 'features'],
+  settings: SETTINGS,
   render(table: Table, _mode: TrackMode, ctx: RenderContext): void {
     clear(ctx.svg);
 
-    const rowH = pickNumber(ctx.style, 'row_height_px', 14);
-    const featureOpacity = pickNumber(ctx.style, 'feature_opacity', 0.85);
-    const labelFontFamily = pickString(ctx.style, 'label_font_family', '');
-    const labelFontSize = pickNumber(ctx.style, 'label_font_size_px', 10);
-    const labelMinWidth = pickNumber(ctx.style, 'label_min_width_px', 24);
+    const rowH = pickNumber(ctx.style, 'row_height_px', DEFAULTS.row_height_px);
+    const featureOpacity = pickNumber(ctx.style, 'feature_opacity', DEFAULTS.feature_opacity);
+    const labelFontFamily = pickString(ctx.style, 'label_font_family', DEFAULTS.label_font_family);
+    const labelFontSize = pickNumber(ctx.style, 'label_font_size_px', DEFAULTS.label_font_size_px);
+    const labelMinWidth = pickNumber(ctx.style, 'label_min_width_px', DEFAULTS.label_min_width_px);
     const chevronMinWidth = pickNumber(
       ctx.style,
       'strand_chevron_min_width_px',
-      12,
+      DEFAULTS.strand_chevron_min_width_px,
     );
-    const showChevrons = pickBool(ctx.style, 'show_chevrons', true);
+    const showChevrons = pickBool(ctx.style, 'show_chevrons', DEFAULTS.show_chevrons);
     const showLabelsStyle = ctx.style?.show_labels;
     const showLabels =
       typeof showLabelsStyle === 'boolean'
@@ -52,7 +104,7 @@ const renderer: TrackRenderer = {
     const allowedTypes = pickAllowList(ctx.filter, 'visible_types');
     const allowedStrands = pickAllowList(ctx.filter, 'visible_strands');
     const allowedSources = pickAllowList(ctx.filter, 'visible_sources');
-    const minLengthBp = pickNumber(ctx.filter, 'min_length_bp', 0);
+    const minLengthBp = pickNumber(ctx.filter, 'min_length_bp', DEFAULTS.min_length_bp);
 
     if (table.numRows === 0) {
       const t = svgEl('text', {

@@ -18,24 +18,88 @@ import {
   pickNumber,
   pickString,
 } from '../../../panels/style';
+import { SettingsSchema } from '../../../panels/settings_schema';
+import {
+  SAMPLE_PALETTE_CYCLE,
+  generalSection,
+  num,
+  opacity,
+  sampleOptions,
+  samplePalette,
+  toggle,
+} from './settings_common';
 
-const PALETTE = ['#4f9efb', '#fb7c4f', '#a4d65e', '#d65eb6', '#5ed6cf'];
+/** Style and filter defaults, shared by the drawing code and the
+ *  settings popover. */
+const DEFAULTS = {
+  fill_opacity: 0.4,
+  stroke_width_px: 1,
+  y_scale: 'linear',
+  show_sample_labels: true,
+  show_max_depth: true,
+  min_depth: 0,
+} as const;
+
+const NO_SAMPLES = 'no samples in window yet';
+
+const SETTINGS: SettingsSchema = {
+  sections: [
+    generalSection(0.4),
+    {
+      title: 'Style',
+      controls: [
+        // An unstratified coverage table carries one pseudo-sample, -1.
+        { type: 'palette', entries: samplePalette({ unstratified: 'all (unstratified)' }), emptyHint: NO_SAMPLES },
+        opacity('fill_opacity', 'Fill opacity', DEFAULTS.fill_opacity),
+        num('style', 'stroke_width_px', 'Stroke width (px)', DEFAULTS.stroke_width_px, 0, 6, 0.5),
+        {
+          type: 'select',
+          target: 'style',
+          key: 'y_scale',
+          label: 'Y scale',
+          default: DEFAULTS.y_scale,
+          options: [
+            { value: 'linear', label: 'linear' },
+            { value: 'log', label: 'log' },
+          ],
+        },
+        toggle('style', 'show_sample_labels', 'Show sample labels', DEFAULTS.show_sample_labels),
+        toggle('style', 'show_max_depth', 'Show max depth', DEFAULTS.show_max_depth),
+      ],
+    },
+    {
+      title: 'Filter',
+      controls: [
+        {
+          type: 'allowlist',
+          target: 'filter',
+          key: 'visible_samples',
+          label: 'Visible samples',
+          options: sampleOptions({ unstratified: 'all' }),
+          emptyHint: NO_SAMPLES,
+        },
+        num('filter', 'min_depth', 'Min depth', DEFAULTS.min_depth, 0, 1_000_000, 1),
+      ],
+    },
+  ],
+};
 
 const renderer: TrackRenderer = {
   kind: 'coverage_histogram',
   order: 2,
   unit: ['bin', 'bins'],
+  settings: SETTINGS,
   render(table: Table, _mode: TrackMode, ctx: RenderContext): void {
     clear(ctx.svg);
 
-    const fillOpacity = pickNumber(ctx.style, 'fill_opacity', 0.4);
-    const strokeWidth = pickNumber(ctx.style, 'stroke_width_px', 1);
-    const yScaleMode = pickString(ctx.style, 'y_scale', 'linear');
-    const showSampleLabels = pickBool(ctx.style, 'show_sample_labels', true);
-    const showMaxDepth = pickBool(ctx.style, 'show_max_depth', true);
+    const fillOpacity = pickNumber(ctx.style, 'fill_opacity', DEFAULTS.fill_opacity);
+    const strokeWidth = pickNumber(ctx.style, 'stroke_width_px', DEFAULTS.stroke_width_px);
+    const yScaleMode = pickString(ctx.style, 'y_scale', DEFAULTS.y_scale);
+    const showSampleLabels = pickBool(ctx.style, 'show_sample_labels', DEFAULTS.show_sample_labels);
+    const showMaxDepth = pickBool(ctx.style, 'show_max_depth', DEFAULTS.show_max_depth);
 
     const allowedSamples = pickAllowList(ctx.filter, 'visible_samples');
-    const minDepth = pickNumber(ctx.filter, 'min_depth', 0);
+    const minDepth = pickNumber(ctx.filter, 'min_depth', DEFAULTS.min_depth);
 
     const startCol = table.getChild('start');
     const endCol = table.getChild('end');
@@ -93,7 +157,7 @@ const renderer: TrackRenderer = {
 
     let paletteIdx = 0;
     for (const [sample, intervals] of bySample) {
-      const color = pickCycledColor(ctx.style, sample, PALETTE, paletteIdx);
+      const color = pickCycledColor(ctx.style, sample, SAMPLE_PALETTE_CYCLE, paletteIdx);
       paletteIdx++;
       intervals.sort((a, b) => a.s - b.s);
       // Build a stepped <path>: one move + alternating H/V segments.

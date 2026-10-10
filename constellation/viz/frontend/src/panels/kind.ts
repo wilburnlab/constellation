@@ -6,6 +6,8 @@
 // renderer now states these for itself, so a host handles any kind
 // without naming it and a new kind is one module.
 
+import { SettingsSchema } from './settings_schema';
+
 /** Turn a stored filter value into its query-string form, or `undefined`
  *  to leave the parameter out of the request. */
 export type PushdownEncoder = (value: unknown) => string | undefined;
@@ -29,6 +31,9 @@ export interface PanelKind {
    *  stored value to the request parameter of the same name. Parameters
    *  are sent in the order the keys are declared. */
   pushdown?: Readonly<Record<string, PushdownEncoder>>;
+
+  /** The controls this kind's settings popover offers. */
+  settings?: SettingsSchema;
 }
 
 /** Sort rank for a kind no renderer is registered for: after every
