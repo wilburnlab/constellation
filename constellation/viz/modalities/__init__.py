@@ -32,6 +32,12 @@ from pathlib import Path
 from typing import Any
 
 
+#: Modality assumed when a request or a saved-session file does not name
+#: one: clients and files from before modalities existed carry no
+#: ``modality`` and are genome-browser ones.
+DEFAULT_MODALITY = "genome"
+
+
 def _no_routers() -> Sequence[Any]:
     return ()
 
@@ -97,6 +103,7 @@ def registered_modalities() -> list[str]:
 
 
 __all__ = [
+    "DEFAULT_MODALITY",
     "Modality",
     "get_modality",
     "register_modality",

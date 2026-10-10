@@ -326,7 +326,11 @@ export class GenomeBrowserForm {
     try {
       const r = await fetch('/api/saved-sessions');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      this.savedSessions = (await r.json()) as SavedSessionSummary[];
+      // The saved-session cache is shared by every browser; offer only
+      // the configurations this one can open.
+      this.savedSessions = ((await r.json()) as SavedSessionSummary[]).filter(
+        (s) => (s.modality ?? 'genome') === 'genome',
+      );
     } catch (err) {
       // Don't surface — saved-sessions are optional, the form still
       // works without them. Log to console for diagnostics.

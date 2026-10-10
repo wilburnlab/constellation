@@ -123,6 +123,9 @@ export interface OpenSessionResult {
 
 export interface SavedSessionSummary {
   slug: string;
+  /** Which browser the configuration is for. Absent on responses from a
+   *  server that predates modalities, where every session is a genome one. */
+  modality?: string;
   label: string;
   reference_handle: string;
   n_sources: number;

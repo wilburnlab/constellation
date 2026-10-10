@@ -26,17 +26,13 @@ from typing import Any
 from fastapi import APIRouter, Body, HTTPException, Request
 from pydantic import BaseModel
 
-from constellation.viz.modalities import Modality, get_modality
+from constellation.viz.modalities import DEFAULT_MODALITY, Modality, get_modality
 from constellation.viz.server.endpoints.tracks import invalidate_binding_cache
 from constellation.viz.server.session import SessionLike
 from constellation.viz.server.validation import validate
 
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
-
-#: Modality assumed when a request does not name one. Clients written
-#: before modalities existed send no ``modality`` field.
-DEFAULT_MODALITY = "genome"
 
 
 def _modality_or_400(name: str) -> Modality:

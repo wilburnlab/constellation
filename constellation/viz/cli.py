@@ -348,8 +348,18 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
             return 2
         try:
             saved = read_saved(args.saved_session)
-        except FileNotFoundError as exc:
+        except (FileNotFoundError, ValueError) as exc:
+            # ValueError: an unreadable file (unsupported schema version,
+            # a genome session with no reference handle).
             print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if saved.modality != GenomeSession.modality:
+            print(
+                f"error: saved session {args.saved_session!r} is a "
+                f"{saved.modality!r} session; `viz genome` opens genome "
+                f"sessions only",
+                file=sys.stderr,
+            )
             return 2
         try:
             session = session_from_saved(saved)
