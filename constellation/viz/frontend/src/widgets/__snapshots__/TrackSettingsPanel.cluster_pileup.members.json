@@ -1,0 +1,160 @@
+{
+  "title": "Transcript clusters (run-a clusters)",
+  "kind": "cluster_pileup",
+  "sections": [
+    {
+      "title": "General",
+      "controls": [
+        {
+          "label": "Opacity",
+          "control": "number",
+          "value": "1",
+          "min": "0",
+          "max": "1",
+          "step": "0.05"
+        },
+        {
+          "label": "Label font family",
+          "control": "text",
+          "value": "",
+          "placeholder": "(inherit)"
+        },
+        {
+          "label": "Label font size (px)",
+          "control": "number",
+          "value": "10",
+          "min": "6",
+          "max": "24",
+          "step": "1"
+        },
+        {
+          "label": "Show legend / labels",
+          "control": "checkbox",
+          "checked": true
+        }
+      ]
+    },
+    {
+      "title": "Style",
+      "controls": [
+        {
+          "label": "genome",
+          "control": "color",
+          "value": "#5ed6cf"
+        },
+        {
+          "label": "kmer",
+          "control": "color",
+          "value": "#a8d65e"
+        },
+        {
+          "label": "em",
+          "control": "color",
+          "value": "#d6a85e"
+        },
+        {
+          "label": "Min row height (px)",
+          "control": "number",
+          "value": "4",
+          "min": "1",
+          "max": "20",
+          "step": "1"
+        },
+        {
+          "label": "Max row height (px)",
+          "control": "number",
+          "value": "10",
+          "min": "2",
+          "max": "40",
+          "step": "1"
+        },
+        {
+          "label": "Opacity min",
+          "control": "number",
+          "value": "0.4",
+          "min": "0",
+          "max": "1",
+          "step": "0.05"
+        },
+        {
+          "label": "Opacity max",
+          "control": "number",
+          "value": "1",
+          "min": "0",
+          "max": "1",
+          "step": "0.05"
+        }
+      ]
+    },
+    {
+      "title": "Filter",
+      "controls": [
+        {
+          "label": "Cluster view",
+          "control": "select",
+          "value": "members",
+          "options": [
+            {
+              "value": "clusters",
+              "label": "Clusters"
+            },
+            {
+              "value": "members",
+              "label": "Member reads"
+            }
+          ],
+          "hints": [
+            "changing this triggers a refetch"
+          ]
+        },
+        {
+          "label": "Visible modes",
+          "control": "allowlist",
+          "options": [
+            {
+              "label": "genome",
+              "checked": true
+            },
+            {
+              "label": "kmer",
+              "checked": true
+            },
+            {
+              "label": "em",
+              "checked": true
+            }
+          ]
+        },
+        {
+          "label": "Visible strands",
+          "control": "allowlist",
+          "options": [
+            {
+              "label": "+",
+              "checked": true
+            },
+            {
+              "label": "-",
+              "checked": true
+            },
+            {
+              "label": ".",
+              "checked": true
+            }
+          ]
+        },
+        {
+          "label": "Min reads",
+          "control": "number",
+          "value": "1",
+          "min": "1",
+          "max": "1000000",
+          "step": "1"
+        }
+      ]
+    }
+  ],
+  "actions": [
+    "Reset to defaults"
+  ]
+}

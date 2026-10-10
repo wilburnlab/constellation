@@ -1,0 +1,199 @@
+{
+  "title": "Annotation (reference)",
+  "kind": "gene_annotation",
+  "sections": [
+    {
+      "title": "General",
+      "controls": [
+        {
+          "label": "Opacity",
+          "control": "number",
+          "value": "0.85",
+          "min": "0",
+          "max": "1",
+          "step": "0.05"
+        },
+        {
+          "label": "Label font family",
+          "control": "text",
+          "value": "Georgia",
+          "placeholder": "(inherit)"
+        },
+        {
+          "label": "Label font size (px)",
+          "control": "number",
+          "value": "10",
+          "min": "6",
+          "max": "24",
+          "step": "1"
+        },
+        {
+          "label": "Show legend / labels",
+          "control": "checkbox",
+          "checked": true
+        }
+      ]
+    },
+    {
+      "title": "Style",
+      "controls": [
+        {
+          "label": "gene",
+          "control": "color",
+          "value": "#123456"
+        },
+        {
+          "label": "mRNA",
+          "control": "color",
+          "value": "#7a99e0"
+        },
+        {
+          "label": "CDS",
+          "control": "color",
+          "value": "#abcdef"
+        },
+        {
+          "label": "exon",
+          "control": "color",
+          "value": "#aabbcc"
+        },
+        {
+          "label": "three_prime_UTR",
+          "control": "color",
+          "value": "#a89dc4"
+        },
+        {
+          "label": "five_prime_UTR",
+          "control": "color",
+          "value": "#a89dc4"
+        },
+        {
+          "label": "repeat_region",
+          "control": "color",
+          "value": "#d65e5e"
+        },
+        {
+          "label": "default",
+          "control": "color",
+          "value": "#888888"
+        },
+        {
+          "label": "Row height (px)",
+          "control": "number",
+          "value": "20",
+          "min": "6",
+          "max": "40",
+          "step": "1"
+        },
+        {
+          "label": "Feature opacity",
+          "control": "number",
+          "value": "0.5",
+          "min": "0",
+          "max": "1",
+          "step": "0.05"
+        },
+        {
+          "label": "Label min width (px)",
+          "control": "number",
+          "value": "24",
+          "min": "0",
+          "max": "200",
+          "step": "1"
+        },
+        {
+          "label": "Show chevrons",
+          "control": "checkbox",
+          "checked": true
+        },
+        {
+          "label": "Show labels",
+          "control": "checkbox",
+          "checked": false
+        }
+      ]
+    },
+    {
+      "title": "Filter",
+      "controls": [
+        {
+          "label": "Visible feature types",
+          "control": "allowlist",
+          "options": [
+            {
+              "label": "gene",
+              "checked": true
+            },
+            {
+              "label": "mRNA",
+              "checked": true
+            },
+            {
+              "label": "CDS",
+              "checked": false
+            },
+            {
+              "label": "exon",
+              "checked": false
+            },
+            {
+              "label": "three_prime_UTR",
+              "checked": false
+            },
+            {
+              "label": "five_prime_UTR",
+              "checked": false
+            },
+            {
+              "label": "repeat_region",
+              "checked": false
+            }
+          ]
+        },
+        {
+          "label": "Visible strands",
+          "control": "allowlist",
+          "options": [
+            {
+              "label": "+",
+              "checked": false
+            },
+            {
+              "label": "-",
+              "checked": false
+            },
+            {
+              "label": ".",
+              "checked": false
+            }
+          ]
+        },
+        {
+          "label": "Visible sources",
+          "control": "allowlist",
+          "options": [
+            {
+              "label": "reference",
+              "checked": true
+            },
+            {
+              "label": "derived",
+              "checked": true
+            }
+          ]
+        },
+        {
+          "label": "Min length (bp)",
+          "control": "number",
+          "value": "250",
+          "min": "0",
+          "max": "1000000",
+          "step": "10"
+        }
+      ]
+    }
+  ],
+  "actions": [
+    "Reset to defaults"
+  ]
+}

@@ -1,0 +1,171 @@
+{
+  "title": "Reads (run-a)",
+  "kind": "read_pileup",
+  "sections": [
+    {
+      "title": "General",
+      "controls": [
+        {
+          "label": "Opacity",
+          "control": "number",
+          "value": "1",
+          "min": "0",
+          "max": "1",
+          "step": "0.05"
+        },
+        {
+          "label": "Label font family",
+          "control": "text",
+          "value": "",
+          "placeholder": "(inherit)"
+        },
+        {
+          "label": "Label font size (px)",
+          "control": "number",
+          "value": "10",
+          "min": "6",
+          "max": "24",
+          "step": "1"
+        },
+        {
+          "label": "Show legend / labels",
+          "control": "checkbox",
+          "checked": true
+        }
+      ]
+    },
+    {
+      "title": "Style",
+      "controls": [
+        {
+          "label": "alpha (1)",
+          "control": "color",
+          "value": "#008080"
+        },
+        {
+          "label": "beta (2)",
+          "control": "color",
+          "value": "#fb7c4f"
+        },
+        {
+          "label": "Forward strand (fallback)",
+          "control": "color",
+          "value": "#5e9cd6"
+        },
+        {
+          "label": "Reverse strand (fallback)",
+          "control": "color",
+          "value": "#d6755e"
+        },
+        {
+          "label": "Unstranded / default",
+          "control": "color",
+          "value": "#888888"
+        },
+        {
+          "label": "Intron connector",
+          "control": "color",
+          "value": "#5a5a63"
+        },
+        {
+          "label": "Mismatch glyph",
+          "control": "color",
+          "value": "#e3493a"
+        },
+        {
+          "label": "Intron dasharray",
+          "control": "text",
+          "value": "4,1",
+          "placeholder": "(inherit)"
+        },
+        {
+          "label": "Intron stroke (px)",
+          "control": "number",
+          "value": "1",
+          "min": "0.5",
+          "max": "4",
+          "step": "0.5"
+        },
+        {
+          "label": "Mismatch glyph size (px)",
+          "control": "number",
+          "value": "6",
+          "min": "2",
+          "max": "20",
+          "step": "1"
+        },
+        {
+          "label": "Min row height (px)",
+          "control": "number",
+          "value": "2",
+          "min": "1",
+          "max": "20",
+          "step": "1"
+        },
+        {
+          "label": "Max row height (px)",
+          "control": "number",
+          "value": "8",
+          "min": "2",
+          "max": "40",
+          "step": "1"
+        },
+        {
+          "label": "Read opacity",
+          "control": "number",
+          "value": "0.6",
+          "min": "0",
+          "max": "1",
+          "step": "0.05"
+        }
+      ]
+    },
+    {
+      "title": "Filter",
+      "controls": [
+        {
+          "label": "Visible samples",
+          "control": "allowlist",
+          "options": [
+            {
+              "label": "alpha (1)",
+              "checked": false
+            },
+            {
+              "label": "beta (2)",
+              "checked": true
+            }
+          ]
+        },
+        {
+          "label": "Visible strands",
+          "control": "allowlist",
+          "options": [
+            {
+              "label": "+",
+              "checked": true
+            },
+            {
+              "label": "-",
+              "checked": false
+            }
+          ]
+        },
+        {
+          "label": "Min MAPQ",
+          "control": "number",
+          "value": "20",
+          "min": "0",
+          "max": "60",
+          "step": "1",
+          "hints": [
+            "changing this triggers a refetch"
+          ]
+        }
+      ]
+    }
+  ],
+  "actions": [
+    "Reset to defaults"
+  ]
+}

@@ -35,14 +35,17 @@ export interface TrackQueryParams {
   force?: TrackMode;
 }
 
-export async function fetchTrackData(
+/** Build the absolute `/api/tracks/{kind}/data` URL for a query. Pure,
+ *  so the exact wire form (parameter names, order, and which optional
+ *  parameters are omitted) is unit-testable. */
+export function buildTrackDataUrl(
   kind: string,
   params: TrackQueryParams,
-  signal?: AbortSignal,
-): Promise<FetchedTable> {
+  origin: string,
+): string {
   const url = new URL(
     `/api/tracks/${encodeURIComponent(kind)}/data`,
-    window.location.origin,
+    origin,
   );
   url.searchParams.set('session', params.session);
   url.searchParams.set('binding', params.binding);
@@ -67,8 +70,18 @@ export async function fetchTrackData(
   for (const sample of params.samples ?? []) {
     url.searchParams.append('samples', sample);
   }
+  return url.toString();
+}
 
-  const response = await fetch(url.toString(), { signal });
+export async function fetchTrackData(
+  kind: string,
+  params: TrackQueryParams,
+  signal?: AbortSignal,
+): Promise<FetchedTable> {
+  const response = await fetch(
+    buildTrackDataUrl(kind, params, window.location.origin),
+    { signal },
+  );
   if (!response.ok) {
     const body = await response.text().catch(() => '');
     throw new Error(

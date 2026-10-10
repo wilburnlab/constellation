@@ -1,0 +1,28 @@
+<svg class="track-canvas" width="1000" height="60" data-natural-height="74">
+<rect x="33.333333333333336" y="32" width="266.6666666666667" height="10" fill="#5e8cd6" opacity="0.85" data-feature-id="1">
+<title>gene geneA (+)</title>
+</rect>
+<rect x="33.333333333333336" y="46" width="266.6666666666667" height="10" fill="#7a99e0" opacity="0.85" data-feature-id="2">
+<title>mRNA geneA-201 (+)</title>
+</rect>
+<rect x="33.333333333333336" y="18" width="66.66666666666666" height="10" fill="#9bc23a" opacity="0.85" data-feature-id="3">
+</rect>
+<rect x="166.66666666666666" y="18" width="133.33333333333334" height="10" fill="#9bc23a" opacity="0.85" data-feature-id="4">
+</rect>
+<rect x="50" y="4" width="50" height="10" fill="#c5d65e" opacity="0.85" data-feature-id="5">
+</rect>
+<rect x="166.66666666666666" y="4" width="100.00000000000003" height="10" fill="#c5d65e" opacity="0.85" data-feature-id="6">
+</rect>
+<rect x="33.333333333333336" y="4" width="16.666666666666664" height="10" fill="#a89dc4" opacity="0.85" data-feature-id="7">
+</rect>
+<rect x="266.6666666666667" y="4" width="33.333333333333314" height="10" fill="#a89dc4" opacity="0.85" data-feature-id="8">
+</rect>
+<rect x="233.33333333333334" y="60" width="266.66666666666663" height="10" fill="#5e8cd6" opacity="0.85" data-feature-id="9">
+<title>gene geneB (-)</title>
+</rect>
+<rect x="533.3333333333334" y="4" width="33.33333333333326" height="10" fill="#d65e5e" opacity="0.85" data-feature-id="10">
+</rect>
+<rect x="666.6666666666666" y="4" width="133.33333333333337" height="10" fill="#888" opacity="0.85" data-feature-id="11">
+<title>pseudogene psi1 (+)</title>
+</rect>
+</svg>

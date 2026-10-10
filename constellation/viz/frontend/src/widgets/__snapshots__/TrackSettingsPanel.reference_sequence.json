@@ -1,0 +1,92 @@
+{
+  "title": "Reference sequence",
+  "kind": "reference_sequence",
+  "sections": [
+    {
+      "title": "General",
+      "controls": [
+        {
+          "label": "Opacity",
+          "control": "number",
+          "value": "1",
+          "min": "0",
+          "max": "1",
+          "step": "0.05"
+        },
+        {
+          "label": "Label font family",
+          "control": "text",
+          "value": "",
+          "placeholder": "(inherit)"
+        },
+        {
+          "label": "Label font size (px)",
+          "control": "number",
+          "value": "10",
+          "min": "6",
+          "max": "24",
+          "step": "1"
+        },
+        {
+          "label": "Show legend / labels",
+          "control": "checkbox",
+          "checked": true
+        }
+      ]
+    },
+    {
+      "title": "Style",
+      "controls": [
+        {
+          "label": "A",
+          "control": "color",
+          "value": "#5cd66e"
+        },
+        {
+          "label": "C",
+          "control": "color",
+          "value": "#5e9cd6"
+        },
+        {
+          "label": "G",
+          "control": "color",
+          "value": "#d6c95e"
+        },
+        {
+          "label": "T",
+          "control": "color",
+          "value": "#d65e5e"
+        },
+        {
+          "label": "U",
+          "control": "color",
+          "value": "#d65e5e"
+        },
+        {
+          "label": "N",
+          "control": "color",
+          "value": "#666666"
+        },
+        {
+          "label": "Letter font size (px)",
+          "control": "number",
+          "value": "11",
+          "min": "6",
+          "max": "20",
+          "step": "1"
+        },
+        {
+          "label": "Letter threshold (px/bp)",
+          "control": "number",
+          "value": "6",
+          "min": "1",
+          "max": "40",
+          "step": "1"
+        }
+      ]
+    }
+  ],
+  "actions": [
+    "Reset to defaults"
+  ]
+}

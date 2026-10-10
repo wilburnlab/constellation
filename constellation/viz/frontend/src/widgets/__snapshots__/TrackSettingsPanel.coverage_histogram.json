@@ -1,0 +1,124 @@
+{
+  "title": "Coverage (run-a)",
+  "kind": "coverage_histogram",
+  "sections": [
+    {
+      "title": "General",
+      "controls": [
+        {
+          "label": "Opacity",
+          "control": "number",
+          "value": "0.4",
+          "min": "0",
+          "max": "1",
+          "step": "0.05"
+        },
+        {
+          "label": "Label font family",
+          "control": "text",
+          "value": "",
+          "placeholder": "(inherit)"
+        },
+        {
+          "label": "Label font size (px)",
+          "control": "number",
+          "value": "10",
+          "min": "6",
+          "max": "24",
+          "step": "1"
+        },
+        {
+          "label": "Show legend / labels",
+          "control": "checkbox",
+          "checked": true
+        }
+      ]
+    },
+    {
+      "title": "Style",
+      "controls": [
+        {
+          "label": "sample 0",
+          "control": "color",
+          "value": "#4f9efb"
+        },
+        {
+          "label": "sample 1",
+          "control": "color",
+          "value": "#fb7c4f"
+        },
+        {
+          "label": "Fill opacity",
+          "control": "number",
+          "value": "0.4",
+          "min": "0",
+          "max": "1",
+          "step": "0.05"
+        },
+        {
+          "label": "Stroke width (px)",
+          "control": "number",
+          "value": "1",
+          "min": "0",
+          "max": "6",
+          "step": "0.5"
+        },
+        {
+          "label": "Y scale",
+          "control": "select",
+          "value": "linear",
+          "options": [
+            {
+              "value": "linear",
+              "label": "linear"
+            },
+            {
+              "value": "log",
+              "label": "log"
+            }
+          ]
+        },
+        {
+          "label": "Show sample labels",
+          "control": "checkbox",
+          "checked": true
+        },
+        {
+          "label": "Show max depth",
+          "control": "checkbox",
+          "checked": true
+        }
+      ]
+    },
+    {
+      "title": "Filter",
+      "controls": [
+        {
+          "label": "Visible samples",
+          "control": "allowlist",
+          "options": [
+            {
+              "label": "sample 0",
+              "checked": true
+            },
+            {
+              "label": "sample 1",
+              "checked": true
+            }
+          ]
+        },
+        {
+          "label": "Min depth",
+          "control": "number",
+          "value": "0",
+          "min": "0",
+          "max": "1000000",
+          "step": "1"
+        }
+      ]
+    }
+  ],
+  "actions": [
+    "Reset to defaults"
+  ]
+}
