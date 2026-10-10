@@ -1,37 +1,44 @@
-// GenomeBrowser — composes a locus picker + overview + ruler + a
-// dynamically ordered stack of tracks. The widget owns the track list,
-// per-binding layout state (visible / display order / height / collapsed),
-// a ViewportBus, a ResizeObserver-driven re-render scheduler, and the
-// chrome-level controls (zoom buttons, feature search, label toggle,
-// dataset manager popover, Save SVG).
+// GenomeBrowser — a locus picker, overview bar and ruler over a stack of
+// genome tracks.
 //
-// Per-track layout state persists to localStorage keyed by sessionId and,
-// when the session was saved with a slug, also syncs to the saved-session
-// TOML via PATCH /api/saved-sessions/{slug}/layout. Layout entries are
-// keyed by (source_id, kind) so they survive runtime source add/remove
-// (handled by POST/DELETE /api/sessions/{id}/sources, which rebuilds the
-// Session in place under the same session_id).
+// The stack itself — the per-track chrome, order, drag-to-reorder,
+// resize, hide / collapse, the gear popover and layout persistence — is
+// the generic `PanelStack`. What lives here is what makes it a genome
+// browser: the session's reference and sources, the locus (a
+// `ViewportBus`), the toolbar (contig / Go-to / zoom / Labels / feature
+// search / Options / Datasets / Save SVG), the overview and ruler, and
+// the two things the stack asks of its host — fetch a track's data for
+// a locus, and draw it with that kind's renderer.
 //
-// Each track's renderer module knows nothing about the widget — it just
-// consumes a (table, mode, ctx) tuple. Per-feature host UI state
-// (showLabels) rides on the RenderContext.
+// Layout persists to localStorage keyed by sessionId and, when the
+// session was saved with a slug, also to the saved-session TOML via
+// PATCH /api/saved-sessions/{slug}/layout. Layout entries are keyed by
+// (source_id, kind) so they survive runtime source add/remove (POST /
+// DELETE /api/sessions/{id}/sources, which rebuild the session in place
+// under the same session_id).
+//
+// A renderer knows nothing about the browser — it consumes a
+// (table, mode, ctx) tuple. Host UI state it may follow (showLabels)
+// rides on the RenderContext.
 
-import { Table } from 'apache-arrow';
 import { axisBottom } from 'd3-axis';
 import { select } from 'd3-selection';
 import {
+  FetchedTable,
   fetchJson,
   fetchJsonMethod,
   fetchTrackData,
-  TrackMode,
 } from '../../engine/arrow_client';
 import { attachPanZoom, zoomLocus, ZOOM_STEP } from './interactions';
 import { GenomicScale, makeAxis, xScale, formatGenomic } from './scales';
 import { svgEl, ensureSvg } from '../../engine/svg_layer';
 import { Locus, ViewportBus } from './viewport_bus';
 import { buildCompositeSvg, downloadSvg, estimateGlyphCount } from '../../engine/export';
-import { encodePushdown, pushdownChanged, unitFor } from '../../panels/kind';
+import { encodePushdown } from '../../panels/kind';
+import { Panel, PanelEntry } from '../../panels/Panel';
+import { PanelStack, PanelView } from '../../panels/PanelStack';
 import { getRenderer, kindRank } from './renderers';
+import { FALLBACK_SETTINGS } from './renderers/settings_common';
 import { TrackMetadata } from './renderers/base';
 import {
   BindingRow,
@@ -41,14 +48,7 @@ import {
 import {
   LayoutEntry,
   LayoutStore,
-  MAX_PANEL_HEIGHT,
-  MIN_PANEL_HEIGHT,
-  applyLayout,
   createLayoutStore,
-  mergeLayoutAfterReload,
-  reorderVisible,
-  snapshotLayout,
-  visibleSorted,
 } from '../../panels/layout';
 import {
   BrowserOptions,
@@ -56,7 +56,6 @@ import {
   OptionsPopover,
   parseBrowserOptions,
 } from '../../panels/OptionsPopover';
-import { TrackSettingsPanel } from './TrackSettingsPanel';
 import './GenomeBrowser.css';
 
 interface ContigInfo {
@@ -65,33 +64,14 @@ interface ContigInfo {
   length: number;
 }
 
-interface TrackEntry {
-  kind: string;
-  binding_id: string;
-  label: string;
-  source_id: string | null;
-}
+/** A track's data as fetched: the Arrow table plus the mode the server
+ *  chose for it. */
+type TrackPanel = Panel<FetchedTable>;
 
-interface MountedTrack {
-  entry: TrackEntry;
-  meta: TrackMetadata;
-  panel: HTMLElement;
-  headerLabelEl: HTMLElement;
-  statusEl: HTMLElement;
-  bodyHost: HTMLElement;
-  collapseBtn: HTMLButtonElement;
-  settingsBtn: HTMLButtonElement;
-  hideBtn: HTMLButtonElement;
-  visible: boolean;
-  collapsed: boolean;
-  heightPx: number;
-  displayOrder: number;
-  style: Record<string, unknown>;
-  filter: Record<string, unknown>;
-  /** Last successfully fetched Arrow data + locus. Reused by
-   *  restyleTrack() so style/filter changes don't trigger a refetch. */
-  lastFetched?: { table: Table; mode: TrackMode; locusKey: string };
-  cancel?: AbortController;
+/** What every track is fetched and drawn for in one render pass. */
+interface GenomeView extends PanelView {
+  locus: Locus;
+  showLabels: boolean;
 }
 
 interface SessionManifest {
@@ -145,9 +125,7 @@ const LABELS_KEY = 'constellation.genome.labels';
 const STORAGE_NAMESPACE = 'constellation.genome';
 const OVERVIEW_HEIGHT = 18;
 const RULER_HEIGHT = 28;
-const COLLAPSED_BODY_HEIGHT = 0;
 const SEARCH_DEBOUNCE_MS = 200;
-const LAYOUT_PERSIST_DEBOUNCE_MS = 200;
 
 export class GenomeBrowser {
   readonly bus = new ViewportBus();
@@ -162,7 +140,7 @@ export class GenomeBrowser {
   private browser!: HTMLElement;
   private contigs: ContigInfo[] = [];
   private manifest: SessionManifest | null = null;
-  private tracks: MountedTrack[] = [];
+  private stack!: PanelStack<GenomeView, FetchedTable, BrowserOptions>;
   private currentContig: ContigInfo | null = null;
   private rerenderTimer: number | null = null;
   private resizeObserver: ResizeObserver | null = null;
@@ -175,10 +153,6 @@ export class GenomeBrowser {
   private trackCountStatus!: HTMLElement;
   private popover: DatasetManagerPopover | null = null;
   private optionsPopover: OptionsPopover | null = null;
-  private settingsPopover: TrackSettingsPanel | null = null;
-  private settingsAnchor: MountedTrack | null = null;
-  private persistTimer: number | null = null;
-  private dragSourceTrack: MountedTrack | null = null;
   private options: BrowserOptions = { ...DEFAULT_BROWSER_OPTIONS };
   private readonly layoutStore: LayoutStore<BrowserOptions>;
 
@@ -225,10 +199,30 @@ export class GenomeBrowser {
     this.emptyPlaceholder.hidden = true;
     this.browser.appendChild(this.emptyPlaceholder);
 
+    this.stack = new PanelStack<GenomeView, FetchedTable, BrowserOptions>({
+      stackHost: this.trackHost,
+      emptyPlaceholder: this.emptyPlaceholder,
+      driver: {
+        view: () => this.currentView(),
+        fetch: (track, view, signal) => this.fetchTrack(track, view, signal),
+        draw: (track, data, view, svg, size) =>
+          this.drawTrack(track, data, view, svg, size),
+      },
+      kindOf: getRenderer,
+      fallbackSettings: FALLBACK_SETTINGS,
+      store: this.layoutStore,
+      options: () => this.options,
+      requestRender: () => this.scheduleRender(),
+      onChanged: () => {
+        this.updateTrackCountStatus();
+        this.refreshPopoverIfOpen();
+      },
+    });
+
     await Promise.all([this.loadManifest(), this.loadContigs()]);
     await this.loadAvailableTracks();
     this.applyPersistedLayout();
-    this.refreshTrackStackOrder();
+    this.stack.refreshOrder();
     this.updateTrackCountStatus();
     this.buildToolbar();
 
@@ -267,10 +261,6 @@ export class GenomeBrowser {
       window.clearTimeout(this.searchTimer);
       this.searchTimer = null;
     }
-    if (this.persistTimer !== null) {
-      window.clearTimeout(this.persistTimer);
-      this.persistTimer = null;
-    }
     this.searchAbort?.abort();
     this.searchAbort = null;
     this.resizeObserver?.disconnect();
@@ -281,10 +271,7 @@ export class GenomeBrowser {
     this.popover = null;
     this.optionsPopover?.dispose();
     this.optionsPopover = null;
-    this.settingsPopover?.dispose();
-    this.settingsPopover = null;
-    this.settingsAnchor = null;
-    for (const track of this.tracks) track.cancel?.abort();
+    this.stack?.dispose();
     this.host.classList.remove('genome-browser-root');
   }
 
@@ -305,7 +292,7 @@ export class GenomeBrowser {
   }
 
   private async loadAvailableTracks(): Promise<void> {
-    const entries = await fetchJson<TrackEntry[]>(
+    const entries = await fetchJson<PanelEntry[]>(
       `/api/tracks?session=${encodeURIComponent(this.sessionId)}`,
     );
     // Stable canonical order: by each kind's declared rank, then per-kind insertion
@@ -320,7 +307,7 @@ export class GenomeBrowser {
           `/api/tracks/${encodeURIComponent(entry.kind)}/metadata?session=${encodeURIComponent(this.sessionId)}&binding=${encodeURIComponent(entry.binding_id)}`,
         );
         const defaultHeight = Number(meta.default_height_px ?? 80);
-        const mounted = this.mountTrackPanel({
+        this.stack.add({
           entry,
           meta,
           visible: true,
@@ -330,113 +317,10 @@ export class GenomeBrowser {
           style: {},
           filter: {},
         });
-        this.tracks.push(mounted);
       } catch (err) {
         console.warn(`failed to load track ${entry.kind}/${entry.binding_id}`, err);
       }
     }
-  }
-
-  private mountTrackPanel(args: {
-    entry: TrackEntry;
-    meta: TrackMetadata;
-    visible: boolean;
-    collapsed: boolean;
-    heightPx: number;
-    displayOrder: number;
-    style: Record<string, unknown>;
-    filter: Record<string, unknown>;
-  }): MountedTrack {
-    const { entry, meta } = args;
-    const panel = document.createElement('div');
-    panel.className = 'track';
-    panel.dataset.bindingId = entry.binding_id;
-    panel.dataset.kind = entry.kind;
-    panel.draggable = true;
-
-    const header = document.createElement('div');
-    header.className = 'track-header';
-
-    const dragHandle = document.createElement('span');
-    dragHandle.className = 'track-handle';
-    dragHandle.textContent = '⋮⋮';
-    dragHandle.title = 'Drag to reorder';
-
-    const collapseBtn = document.createElement('button');
-    collapseBtn.type = 'button';
-    collapseBtn.className = 'track-collapse-btn';
-    collapseBtn.title = args.collapsed ? 'Expand track' : 'Collapse track';
-    collapseBtn.textContent = args.collapsed ? '▸' : '▾';
-
-    const labelEl = document.createElement('span');
-    labelEl.className = 'track-header-label';
-    labelEl.textContent = entry.label;
-
-    const statusEl = document.createElement('span');
-    statusEl.className = 'track-header-status';
-    statusEl.textContent = '—';
-
-    const settingsBtn = document.createElement('button');
-    settingsBtn.type = 'button';
-    settingsBtn.className = 'track-settings-btn';
-    settingsBtn.textContent = '⚙';
-    settingsBtn.title = 'Style and filter controls';
-
-    const hideBtn = document.createElement('button');
-    hideBtn.type = 'button';
-    hideBtn.className = 'track-hide-btn';
-    hideBtn.textContent = '👁';
-    hideBtn.title = 'Hide track (re-enable from the Datasets menu)';
-
-    header.appendChild(dragHandle);
-    header.appendChild(collapseBtn);
-    header.appendChild(labelEl);
-    header.appendChild(statusEl);
-    header.appendChild(settingsBtn);
-    header.appendChild(hideBtn);
-
-    const body = document.createElement('div');
-    body.className = 'track-body';
-
-    const resizeHandle = document.createElement('div');
-    resizeHandle.className = 'track-resize-handle';
-    resizeHandle.title = 'Drag to resize';
-
-    panel.appendChild(header);
-    panel.appendChild(body);
-    panel.appendChild(resizeHandle);
-
-    const mounted: MountedTrack = {
-      entry,
-      meta,
-      panel,
-      headerLabelEl: labelEl,
-      statusEl,
-      bodyHost: body,
-      collapseBtn,
-      settingsBtn,
-      hideBtn,
-      visible: args.visible,
-      collapsed: args.collapsed,
-      heightPx: args.heightPx,
-      displayOrder: args.displayOrder,
-      style: { ...args.style },
-      filter: { ...args.filter },
-    };
-
-    collapseBtn.addEventListener('click', () => {
-      this.setCollapsed(mounted, !mounted.collapsed);
-    });
-    hideBtn.addEventListener('click', () => {
-      this.setVisible(mounted, false);
-    });
-    settingsBtn.addEventListener('click', () => {
-      this.toggleSettingsPanel(mounted);
-    });
-    this.attachReorderDrag(mounted);
-    this.attachResize(mounted, resizeHandle);
-
-    return mounted;
   }
 
   // --------------------------------------------------------------------
@@ -453,159 +337,7 @@ export class GenomeBrowser {
       entries = this.layoutStore.loadLayout();
     }
     if (!entries || entries.length === 0) return;
-    applyLayout(this.tracks, entries, syncCollapseButton);
-  }
-
-  private schedulePersistLayout(): void {
-    if (this.persistTimer !== null) {
-      window.clearTimeout(this.persistTimer);
-    }
-    this.persistTimer = window.setTimeout(() => {
-      this.persistTimer = null;
-      this.persistLayoutNow();
-    }, LAYOUT_PERSIST_DEBOUNCE_MS);
-  }
-
-  private persistLayoutNow(): void {
-    this.layoutStore.save(snapshotLayout(this.tracks), this.options);
-  }
-
-  // --------------------------------------------------------------------
-  // Per-track mutations
-  // --------------------------------------------------------------------
-
-  private setVisible(track: MountedTrack, visible: boolean): void {
-    if (track.visible === visible) return;
-    track.visible = visible;
-    this.refreshTrackStackOrder();
-    this.updateTrackCountStatus();
-    this.refreshPopoverIfOpen();
-    this.schedulePersistLayout();
-    if (visible) this.scheduleRender();
-  }
-
-  private setCollapsed(track: MountedTrack, collapsed: boolean): void {
-    if (track.collapsed === collapsed) return;
-    track.collapsed = collapsed;
-    track.collapseBtn.textContent = collapsed ? '▸' : '▾';
-    track.collapseBtn.title = collapsed ? 'Expand track' : 'Collapse track';
-    if (collapsed) {
-      track.bodyHost.style.height = `${COLLAPSED_BODY_HEIGHT}px`;
-      track.bodyHost.style.overflow = 'hidden';
-    } else {
-      track.bodyHost.style.height = '';
-      track.bodyHost.style.overflow = '';
-      this.scheduleRender();
-    }
-    this.schedulePersistLayout();
-  }
-
-  // --------------------------------------------------------------------
-  // Drag-to-reorder
-  // --------------------------------------------------------------------
-
-  private attachReorderDrag(track: MountedTrack): void {
-    const panel = track.panel;
-    panel.addEventListener('dragstart', (e) => {
-      this.dragSourceTrack = track;
-      panel.classList.add('track-dragging');
-      e.dataTransfer?.setData('text/plain', track.entry.binding_id);
-      if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
-    });
-    panel.addEventListener('dragend', () => {
-      panel.classList.remove('track-dragging');
-      this.trackHost
-        .querySelectorAll('.track-drop-target')
-        .forEach((el) => el.classList.remove('track-drop-target'));
-      this.dragSourceTrack = null;
-    });
-    panel.addEventListener('dragover', (e) => {
-      if (!this.dragSourceTrack || this.dragSourceTrack === track) return;
-      e.preventDefault();
-      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
-      panel.classList.add('track-drop-target');
-    });
-    panel.addEventListener('dragleave', () => {
-      panel.classList.remove('track-drop-target');
-    });
-    panel.addEventListener('drop', (e) => {
-      e.preventDefault();
-      panel.classList.remove('track-drop-target');
-      if (!this.dragSourceTrack || this.dragSourceTrack === track) return;
-      this.reorderTrack(this.dragSourceTrack, track);
-    });
-  }
-
-  private reorderTrack(moved: MountedTrack, target: MountedTrack): void {
-    if (!reorderVisible(this.tracks, moved, target)) return;
-    this.refreshTrackStackOrder();
-    this.schedulePersistLayout();
-  }
-
-  // --------------------------------------------------------------------
-  // Drag-to-resize
-  // --------------------------------------------------------------------
-
-  private attachResize(track: MountedTrack, handle: HTMLElement): void {
-    let startY = 0;
-    let startH = 0;
-    let active = false;
-
-    const onMove = (e: PointerEvent): void => {
-      if (!active) return;
-      const dy = e.clientY - startY;
-      const next = Math.max(
-        MIN_PANEL_HEIGHT,
-        Math.min(MAX_PANEL_HEIGHT, startH + dy),
-      );
-      track.heightPx = next;
-      // Live re-render is heavy; just resize the body and re-render on
-      // pointerup. We resize the SVG via re-render to keep glyph scaling
-      // consistent. Cheap path: just update body min-height so the
-      // visual feedback is immediate.
-      track.bodyHost.style.minHeight = `${next}px`;
-    };
-    const onUp = (e: PointerEvent): void => {
-      if (!active) return;
-      active = false;
-      handle.releasePointerCapture(e.pointerId);
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      track.bodyHost.style.minHeight = '';
-      this.scheduleRender();
-      this.schedulePersistLayout();
-    };
-    handle.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
-      active = true;
-      startY = e.clientY;
-      startH = track.heightPx;
-      handle.setPointerCapture(e.pointerId);
-      window.addEventListener('pointermove', onMove);
-      window.addEventListener('pointerup', onUp);
-      e.preventDefault();
-    });
-  }
-
-  // --------------------------------------------------------------------
-  // Render-stack ordering
-  // --------------------------------------------------------------------
-
-  private visibleSortedTracks(): MountedTrack[] {
-    return visibleSorted(this.tracks);
-  }
-
-  private refreshTrackStackOrder(): void {
-    const visible = this.visibleSortedTracks();
-    // Detach all panels and re-append in current visible order; hidden
-    // panels are removed from the DOM but kept alive in this.tracks.
-    while (this.trackHost.firstChild) {
-      this.trackHost.removeChild(this.trackHost.firstChild);
-    }
-    for (const t of visible) {
-      this.trackHost.appendChild(t.panel);
-    }
-    this.emptyPlaceholder.hidden = visible.length > 0;
+    this.stack.applyLayout(entries);
   }
 
   // --------------------------------------------------------------------
@@ -714,8 +446,8 @@ export class GenomeBrowser {
 
   private updateTrackCountStatus(): void {
     if (!this.trackCountStatus) return;
-    const total = this.tracks.length;
-    const visible = this.tracks.filter((t) => t.visible).length;
+    const total = this.stack.panels.length;
+    const visible = this.stack.panels.filter((t) => t.visible).length;
     this.trackCountStatus.textContent =
       total === visible
         ? `${total} tracks`
@@ -744,7 +476,7 @@ export class GenomeBrowser {
       this.manifest.reference.handle ||
       this.manifest.reference.path ||
       'reference';
-    const referenceBindings: BindingRow[] = this.tracks
+    const referenceBindings: BindingRow[] = this.stack.panels
       .filter((t) => t.entry.source_id === null)
       .map((t) => this.toBindingRow(t));
     const sourceLookup = new Map<string, ManifestSource>();
@@ -757,7 +489,7 @@ export class GenomeBrowser {
       warning: warningFor(s, this.manifest!),
     }));
     const bindingsBySource = new Map<string, BindingRow[]>();
-    for (const t of this.tracks) {
+    for (const t of this.stack.panels) {
       const sid = t.entry.source_id;
       if (sid === null) continue;
       if (!bindingsBySource.has(sid)) bindingsBySource.set(sid, []);
@@ -771,8 +503,8 @@ export class GenomeBrowser {
       bindingsBySource,
       handlers: {
         onToggleBinding: (binding_id, visible) => {
-          const t = this.tracks.find((x) => x.entry.binding_id === binding_id);
-          if (t) this.setVisible(t, visible);
+          const t = this.stack.panels.find((x) => x.entry.binding_id === binding_id);
+          if (t) this.stack.setVisible(t, visible);
         },
         onRemoveSource: async (sid) => {
           await this.removeSource(sid);
@@ -789,7 +521,7 @@ export class GenomeBrowser {
     this.popover.mount(document.body);
   }
 
-  private toBindingRow(t: MountedTrack): BindingRow {
+  private toBindingRow(t: TrackPanel): BindingRow {
     return {
       binding_id: t.entry.binding_id,
       kind: t.entry.kind,
@@ -815,7 +547,7 @@ export class GenomeBrowser {
       handlers: {
         onChange: (key, value) => {
           this.options = { ...this.options, [key]: value };
-          this.schedulePersistLayout();
+          this.stack.schedulePersist();
         },
       },
       onClose: () => {
@@ -824,114 +556,6 @@ export class GenomeBrowser {
       },
     });
     this.optionsPopover.mount(document.body);
-  }
-
-  // --------------------------------------------------------------------
-  // Per-track gear popover
-  // --------------------------------------------------------------------
-
-  private toggleSettingsPanel(track: MountedTrack): void {
-    if (this.settingsPopover && this.settingsAnchor === track) {
-      this.closeSettingsPanel();
-      return;
-    }
-    this.closeSettingsPanel();
-    this.openSettingsPanel(track);
-  }
-
-  private openSettingsPanel(track: MountedTrack): void {
-    this.settingsAnchor = track;
-    this.settingsPopover = new TrackSettingsPanel({
-      anchor: track.settingsBtn,
-      kind: track.entry.kind,
-      label: track.entry.label,
-      meta: track.meta,
-      style: { ...track.style },
-      filter: { ...track.filter },
-      onStyleChange: (style) => {
-        track.style = { ...style };
-        this.restyleTrack(track);
-        this.schedulePersistLayout();
-      },
-      onFilterChange: (filter) => {
-        const before = track.filter;
-        track.filter = { ...filter };
-        if (pushdownChanged(getRenderer(track.entry.kind), before, track.filter)) {
-          // Server-side filter — invalidate the cache so the next
-          // render fetches fresh data, then schedule. The 60ms render
-          // debounce absorbs slider drag.
-          track.lastFetched = undefined;
-          this.scheduleRender();
-        } else {
-          this.restyleTrack(track);
-        }
-        this.schedulePersistLayout();
-      },
-      onReset: () => {
-        const before = track.filter;
-        track.style = {};
-        track.filter = {};
-        if (pushdownChanged(getRenderer(track.entry.kind), before, track.filter)) {
-          track.lastFetched = undefined;
-          this.scheduleRender();
-        } else {
-          this.restyleTrack(track);
-        }
-        this.schedulePersistLayout();
-      },
-      onClose: () => {
-        this.closeSettingsPanel();
-      },
-    });
-    this.settingsPopover.mount(document.body);
-  }
-
-  private closeSettingsPanel(): void {
-    this.settingsPopover?.dispose();
-    this.settingsPopover = null;
-    this.settingsAnchor = null;
-  }
-
-  /** Re-run the renderer against `track.lastFetched` so style/filter
-   *  changes apply without a server round-trip. Falls back to the
-   *  scheduler when the cache is empty (e.g. before first render). */
-  private restyleTrack(track: MountedTrack): void {
-    if (!track.visible || track.collapsed) return;
-    const cached = track.lastFetched;
-    if (!cached) {
-      this.scheduleRender();
-      return;
-    }
-    const locus = this.bus.locus;
-    const widthPx = Math.max(200, this.host.clientWidth - 40);
-    const expectedKey = `${locus.contig}|${locus.start}|${locus.end}|${widthPx}`;
-    if (cached.locusKey !== expectedKey) {
-      // Viewport moved since the last fetch — schedule a full render.
-      this.scheduleRender();
-      return;
-    }
-    const heightPx = Math.max(MIN_PANEL_HEIGHT, Math.round(track.heightPx));
-    const svg = ensureSvg(track.bodyHost, widthPx, heightPx);
-    const ctx = {
-      svg,
-      widthPx,
-      heightPx,
-      xScale: xScale([locus.start, locus.end], widthPx),
-      meta: track.meta,
-      showLabels: this.showLabels,
-      style: track.style,
-      filter: track.filter,
-    };
-    const renderer = getRenderer(track.entry.kind);
-    if (!renderer) return;
-    try {
-      renderer.render(cached.table, cached.mode, ctx);
-    } catch (err) {
-      console.warn(
-        `restyle failed for ${track.entry.kind}/${track.entry.binding_id}`,
-        err,
-      );
-    }
   }
 
   // --------------------------------------------------------------------
@@ -973,20 +597,16 @@ export class GenomeBrowser {
     // defaults at the tail of their kind cluster.
     // Any open per-track settings popover anchors a torn-down DOM node
     // — close it before the rebuild.
-    this.closeSettingsPanel();
-    const previous = snapshotLayout(this.tracks);
-    for (const t of this.tracks) {
-      t.cancel?.abort();
-      t.panel.remove();
-    }
-    this.tracks = [];
+    this.stack.closeSettings();
+    const previous = this.stack.snapshot();
+    this.stack.clear();
     await this.loadManifest();
     await this.loadAvailableTracks();
-    mergeLayoutAfterReload(this.tracks, previous, kindRank, syncCollapseButton);
-    this.refreshTrackStackOrder();
+    this.stack.mergeAfterReload(previous);
+    this.stack.refreshOrder();
     this.updateTrackCountStatus();
     this.refreshPopoverIfOpen();
-    this.schedulePersistLayout();
+    this.stack.schedulePersist();
     this.scheduleRender();
   }
 
@@ -1178,68 +798,70 @@ export class GenomeBrowser {
   }
 
   private async render(): Promise<void> {
+    const view = this.currentView();
+    if (!view) return;
+    this.renderOverview(view.widthPx, view.locus);
+    this.renderRuler(view.widthPx, view.locus);
+    await this.stack.render();
+  }
+
+  // --------------------------------------------------------------------
+  // What the track stack asks of its host
+  // --------------------------------------------------------------------
+
+  /** The locus and width every track is drawn for right now; null until
+   *  a contig is selected. */
+  private currentView(): GenomeView | null {
     const locus = this.bus.locus;
-    if (!locus.contig) return;
+    if (!locus.contig) return null;
     const widthPx = Math.max(200, this.host.clientWidth - 40);
-    this.renderOverview(widthPx, locus);
-    this.renderRuler(widthPx, locus);
+    return {
+      key: `${locus.contig}|${locus.start}|${locus.end}|${widthPx}`,
+      widthPx,
+      locus,
+      showLabels: this.showLabels,
+    };
+  }
 
-    const locusKey = `${locus.contig}|${locus.start}|${locus.end}|${widthPx}`;
-    for (const track of this.visibleSortedTracks()) {
-      if (track.collapsed) {
-        // Collapsed tracks render the header only; clear any prior SVG
-        // so the panel doesn't keep stale glyphs in DOM (which would
-        // also surface in Save SVG).
-        while (track.bodyHost.firstChild) {
-          track.bodyHost.removeChild(track.bodyHost.firstChild);
-        }
-        track.statusEl.textContent = 'collapsed';
-        continue;
-      }
-      track.cancel?.abort();
-      track.cancel = new AbortController();
-      const heightPx = Math.max(MIN_PANEL_HEIGHT, Math.round(track.heightPx));
-      const svg = ensureSvg(track.bodyHost, widthPx, heightPx);
-      const ctx = {
-        svg,
-        widthPx,
-        heightPx,
-        xScale: xScale([locus.start, locus.end], widthPx),
-        meta: track.meta,
-        showLabels: this.showLabels,
-        style: track.style,
-        filter: track.filter,
-      };
+  private fetchTrack(
+    track: TrackPanel,
+    view: GenomeView,
+    signal: AbortSignal,
+  ): Promise<FetchedTable> {
+    return fetchTrackData(
+      track.entry.kind,
+      {
+        session: this.sessionId,
+        binding: track.entry.binding_id,
+        contig: view.locus.contig,
+        start: view.locus.start,
+        end: view.locus.end,
+        viewport_px: view.widthPx,
+        // The kind's server-side filters, as it declares them.
+        ...encodePushdown(getRenderer(track.entry.kind), track.filter),
+      },
+      signal,
+    );
+  }
 
-      try {
-        const renderer = getRenderer(track.entry.kind);
-        if (!renderer) continue;
-        const { table, mode } = await fetchTrackData(
-          track.entry.kind,
-          {
-            session: this.sessionId,
-            binding: track.entry.binding_id,
-            contig: locus.contig,
-            start: locus.start,
-            end: locus.end,
-            viewport_px: widthPx,
-            // The kind's server-side filters, as it declares them.
-            ...encodePushdown(renderer, track.filter),
-          },
-          track.cancel.signal,
-        );
-        renderer.render(table, mode as TrackMode, ctx);
-        track.lastFetched = { table, mode: mode as TrackMode, locusKey };
-        track.statusEl.textContent =
-          table.numRows === 0
-            ? '— no data in window'
-            : `showing ${table.numRows.toLocaleString()} ${unitFor(renderer, table.numRows)}`;
-      } catch (err) {
-        if ((err as Error).name === 'AbortError') continue;
-        console.warn(`render failed for ${track.entry.kind}`, err);
-        track.statusEl.textContent = 'render failed';
-      }
-    }
+  private drawTrack(
+    track: TrackPanel,
+    data: FetchedTable,
+    view: GenomeView,
+    svg: SVGSVGElement,
+    size: { widthPx: number; heightPx: number },
+  ): number {
+    getRenderer(track.entry.kind)?.render(data.table, data.mode, {
+      svg,
+      widthPx: size.widthPx,
+      heightPx: size.heightPx,
+      xScale: xScale([view.locus.start, view.locus.end], size.widthPx),
+      meta: track.meta as TrackMetadata,
+      showLabels: view.showLabels,
+      style: track.style,
+      filter: track.filter,
+    });
+    return data.table.numRows;
   }
 
   private renderRuler(widthPx: number, locus: Locus): void {
@@ -1303,9 +925,9 @@ export class GenomeBrowser {
   // --------------------------------------------------------------------
 
   private exportSvg(): void {
-    const visible = this.visibleSortedTracks().filter((t) => !t.collapsed);
+    const visible = this.stack.visibleSorted().filter((t) => !t.collapsed);
     const widthPx = Math.max(200, this.host.clientWidth - 40);
-    const panels = visible.map((t) => t.panel);
+    const panels = visible.map((t) => t.element);
     const cost = estimateGlyphCount(panels);
     if (cost > 50_000) {
       const ok = window.confirm(
@@ -1346,12 +968,6 @@ function warningFor(
     return `assembly ${source.assembly_accession} ≠ reference ${refAssembly}`;
   }
   return null;
-}
-
-/** Bring a track's collapse button in line with its restored state. */
-function syncCollapseButton(t: MountedTrack): void {
-  t.collapseBtn.textContent = t.collapsed ? '▸' : '▾';
-  t.collapseBtn.title = t.collapsed ? 'Expand track' : 'Collapse track';
 }
 
 function labeled(labelText: string, control: HTMLElement): HTMLElement {

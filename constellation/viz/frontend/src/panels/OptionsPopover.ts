@@ -1,5 +1,5 @@
 // OptionsPopover — toolbar popover for browser-wide preferences that
-// aren't per-track (those live in TrackSettingsPanel on each gear
+// aren't per-panel (those live in the SettingsPanel on each gear
 // button). The host owns the options blob; we just render rows and
 // emit per-key changes via callbacks.
 //

@@ -1,20 +1,24 @@
-// TrackSettingsPanel — form-model snapshots and edit propagation.
+// The genome track kinds' settings schemas — form-model snapshots and
+// edit propagation.
 //
 // The form model is what the gear popover offers for each track kind:
 // sections, controls, their labels, initial values, bounds and options.
 // It is pinned per kind so the settings code can be restructured with
-// the popover's contents held fixed.
+// the popover's contents held fixed. Each case mounts the generic
+// `SettingsPanel` with the schema the kind's renderer declares, which is
+// what the browser's track stack does.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { loadMetadata } from './__fixtures__/load';
-import type { TrackMetadata } from './renderers/base';
-import { registeredKinds } from './renderers';
-import { TrackSettingsPanel } from './TrackSettingsPanel';
+import { SettingsPanel } from '../../../panels/SettingsPanel';
+import { loadMetadata } from '../__fixtures__/load';
+import type { TrackMetadata } from './base';
+import { getRenderer, registeredKinds } from './index';
+import { FALLBACK_SETTINGS } from './settings_common';
 
 type Dict = Record<string, unknown>;
 
 interface Harness {
-  panel: TrackSettingsPanel;
+  panel: SettingsPanel;
   root: HTMLElement;
   anchor: HTMLElement;
   onStyleChange: ReturnType<typeof vi.fn>;
@@ -44,10 +48,11 @@ function mount(
     onReset: vi.fn(),
     onClose: vi.fn(),
   };
-  const panel = new TrackSettingsPanel({
+  const panel = new SettingsPanel({
     anchor,
     kind,
     label: meta.label,
+    schema: getRenderer(kind)?.settings ?? FALLBACK_SETTINGS,
     meta,
     style: opts.style ?? {},
     filter: opts.filter ?? {},
@@ -156,11 +161,11 @@ function snapshotJson(model: Dict): string {
 // Snapshots
 // ----------------------------------------------------------------------
 
-describe('TrackSettingsPanel form model', () => {
+describe('genome track settings: form model', () => {
   it.each(registeredKinds())('%s (defaults, kernel metadata)', async (kind) => {
     const { root } = mount(kind);
     await expect(snapshotJson(formModel(root))).toMatchFileSnapshot(
-      `./__snapshots__/TrackSettingsPanel.${kind}.json`,
+      `./__snapshots__/settings.${kind}.json`,
     );
   });
 
@@ -177,7 +182,7 @@ describe('TrackSettingsPanel form model', () => {
       filter: { visible_types: ['gene', 'mRNA'], visible_strands: [], min_length_bp: 250 },
     });
     await expect(snapshotJson(formModel(root))).toMatchFileSnapshot(
-      './__snapshots__/TrackSettingsPanel.gene_annotation.stored.json',
+      './__snapshots__/settings.gene_annotation.stored.json',
     );
   });
 
@@ -187,42 +192,42 @@ describe('TrackSettingsPanel form model', () => {
       filter: { visible_samples: [2], visible_strands: ['+'], min_mapq: 20 },
     });
     await expect(snapshotJson(formModel(root))).toMatchFileSnapshot(
-      './__snapshots__/TrackSettingsPanel.read_pileup.stored.json',
+      './__snapshots__/settings.read_pileup.stored.json',
     );
   });
 
   it('coverage_histogram before any samples are known', async () => {
     const { root } = mount('coverage_histogram', { meta: { samples_in_data: [] } });
     await expect(snapshotJson(formModel(root))).toMatchFileSnapshot(
-      './__snapshots__/TrackSettingsPanel.coverage_histogram.no-samples.json',
+      './__snapshots__/settings.coverage_histogram.no-samples.json',
     );
   });
 
   it('coverage_histogram with the unstratified (-1) sample', async () => {
     const { root } = mount('coverage_histogram', { meta: { samples_in_data: [-1] } });
     await expect(snapshotJson(formModel(root))).toMatchFileSnapshot(
-      './__snapshots__/TrackSettingsPanel.coverage_histogram.unstratified.json',
+      './__snapshots__/settings.coverage_histogram.unstratified.json',
     );
   });
 
   it('cluster_pileup when the members view is unavailable', async () => {
     const { root } = mount('cluster_pileup', { meta: { cluster_view_supported: false } });
     await expect(snapshotJson(formModel(root))).toMatchFileSnapshot(
-      './__snapshots__/TrackSettingsPanel.cluster_pileup.no-members.json',
+      './__snapshots__/settings.cluster_pileup.no-members.json',
     );
   });
 
   it('cluster_pileup in the members view', async () => {
     const { root } = mount('cluster_pileup', { filter: { cluster_view: 'members' } });
     await expect(snapshotJson(formModel(root))).toMatchFileSnapshot(
-      './__snapshots__/TrackSettingsPanel.cluster_pileup.members.json',
+      './__snapshots__/settings.cluster_pileup.members.json',
     );
   });
 
   it('an unregistered kind', async () => {
     const { root } = mount('not_a_kind');
     await expect(snapshotJson(formModel(root))).toMatchFileSnapshot(
-      './__snapshots__/TrackSettingsPanel.unknown-kind.json',
+      './__snapshots__/settings.unknown-kind.json',
     );
   });
 
@@ -270,7 +275,7 @@ function allowListBox(root: HTMLElement, listLabel: string, option: string): HTM
   return hit as HTMLElement;
 }
 
-describe('TrackSettingsPanel edits', () => {
+describe('genome track settings: edits', () => {
   it('writes a number row into style and reports the whole dict', () => {
     const h = mount('gene_annotation', { style: { feature_opacity: 0.5 } });
     setValue(rowByLabel(h.root, 'Row height (px)').querySelector('input')!, '22');
@@ -363,7 +368,7 @@ describe('TrackSettingsPanel edits', () => {
   });
 });
 
-describe('TrackSettingsPanel dismissal', () => {
+describe('genome track settings: dismissal', () => {
   it('closes on Escape and on a mousedown outside the panel and anchor', () => {
     const h = mount('gene_annotation');
     h.root.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
