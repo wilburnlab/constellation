@@ -62,7 +62,10 @@ const SETTINGS: SettingsSchema = {
         num('style', 'label_font_size_px', 'Label font size (px)', DEFAULTS.label_font_size_px, 6, 24, 1),
         num('style', 'label_min_width_px', 'Label min width (px)', DEFAULTS.label_min_width_px, 0, 200, 1),
         toggle('style', 'show_chevrons', 'Show chevrons', DEFAULTS.show_chevrons),
-        toggle('style', 'show_labels', 'Show labels', true),
+        // Unset, the track follows the browser's Labels toggle; the box
+        // shows what is drawn either way. Ticking or clearing it pins this
+        // track's choice.
+        { type: 'toggle', target: 'style', key: 'show_labels', label: 'Show labels', default: (env) => env.host.showLabels !== false },
       ],
     },
     {

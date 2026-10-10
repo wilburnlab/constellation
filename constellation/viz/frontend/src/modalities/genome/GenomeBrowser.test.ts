@@ -175,6 +175,13 @@ function setInput(el: HTMLInputElement | HTMLSelectElement, value: string, event
   el.dispatchEvent(new Event(event, { bubbles: true }));
 }
 
+/** The stored style of the reference annotation track, once the
+ *  debounced save has run. */
+function storedLayoutAfter(): Record<string, unknown> | undefined {
+  vi.advanceTimersByTime(200);
+  return storedLayout().find((e) => e.kind === 'gene_annotation' && e.source_id === '')?.style;
+}
+
 function storedLayout(): LayoutEntry[] {
   return JSON.parse(window.localStorage.getItem(LAYOUT_KEY) ?? 'null') as LayoutEntry[];
 }
@@ -925,6 +932,28 @@ describe('GenomeBrowser toolbar actions', () => {
     await settle(60);
     expect(server.dataRequests(mark)).toHaveLength(6);
     expect(svgOf(host, 'reference')!.querySelectorAll('text').length).toBeLessThan(before);
+  });
+
+  it('shows the Labels toggle state on a track that has no choice of its own', async () => {
+    const { host } = await open();
+    const gear = track(host, 'reference').querySelector('.track-settings-btn');
+    const box = (): HTMLInputElement => settingsRow('Show labels').querySelector('input')!;
+
+    click(gear);
+    expect(box().checked).toBe(true);
+    click(gear);
+
+    click(host.querySelector<HTMLElement>('button.toggle'));
+    await settle(60);
+    click(gear);
+    // The track is drawn without labels, and the box now says so.
+    expect(svgOf(host, 'reference')!.querySelectorAll('text')).toHaveLength(0);
+    expect(box().checked).toBe(false);
+
+    // Ticking it pins this track on, whatever the toolbar says.
+    box().click();
+    expect(svgOf(host, 'reference')!.querySelectorAll('text').length).toBeGreaterThan(0);
+    expect(storedLayoutAfter()).toMatchObject({ show_labels: true });
   });
 
   it('starts with labels off when that was the stored choice', async () => {

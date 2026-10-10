@@ -31,7 +31,7 @@ const open: Harness[] = [];
 
 function mount(
   kind: string,
-  opts: { meta?: Dict; style?: Dict; filter?: Dict } = {},
+  opts: { meta?: Dict; style?: Dict; filter?: Dict; host?: Dict } = {},
 ): Harness {
   const all = loadMetadata();
   const key = Object.keys(all).find((k) => k.startsWith(`${kind}/`));
@@ -56,6 +56,7 @@ function mount(
     meta,
     style: opts.style ?? {},
     filter: opts.filter ?? {},
+    host: opts.host,
     onStyleChange: h.onStyleChange,
     onFilterChange: h.onFilterChange,
     onReset: h.onReset,
@@ -438,6 +439,31 @@ describe('genome track settings: cluster pile-up views', () => {
       filter: { cluster_view: 'members' },
     });
     expect(rowLabels(h.root)).toEqual(CLUSTERS.filter((l) => l !== 'Cluster view'));
+  });
+});
+
+describe('genome track settings: Show labels', () => {
+  const box = (root: HTMLElement): HTMLInputElement =>
+    rowByLabel(root, 'Show labels').querySelector('input') as HTMLInputElement;
+
+  it('follows the browser Labels toggle while the track has no choice of its own', () => {
+    expect(box(mount('gene_annotation', { host: { showLabels: true } }).root).checked).toBe(true);
+    expect(box(mount('gene_annotation', { host: { showLabels: false } }).root).checked).toBe(false);
+    // No host state at all reads as on, which is what the renderer draws.
+    expect(box(mount('gene_annotation').root).checked).toBe(true);
+  });
+
+  it('shows the track\'s own choice over the toggle once it has one', () => {
+    const on = mount('gene_annotation', { host: { showLabels: false }, style: { show_labels: true } });
+    expect(box(on.root).checked).toBe(true);
+    const off = mount('gene_annotation', { host: { showLabels: true }, style: { show_labels: false } });
+    expect(box(off.root).checked).toBe(false);
+  });
+
+  it('pins the choice when the box is ticked against the toggle', () => {
+    const h = mount('gene_annotation', { host: { showLabels: false } });
+    toggle(rowByLabel(h.root, 'Show labels'));
+    expect(h.onStyleChange).toHaveBeenLastCalledWith({ show_labels: true });
   });
 });
 

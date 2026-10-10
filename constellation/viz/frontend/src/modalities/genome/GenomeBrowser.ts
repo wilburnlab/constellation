@@ -210,6 +210,7 @@ export class GenomeBrowser {
       },
       kindOf: getRenderer,
       fallbackSettings: FALLBACK_SETTINGS,
+      settingsHost: () => ({ showLabels: this.showLabels }),
       store: this.layoutStore,
       options: () => this.options,
       requestRender: () => this.scheduleRender(),
