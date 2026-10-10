@@ -88,6 +88,8 @@ export class PanelStack<V extends PanelView, D, O> {
   private settingsAnchor: Panel<D> | null = null;
   private persistTimer: number | null = null;
   private dragSource: Panel<D> | null = null;
+  /** Ends a resize drag in progress (its window listeners), if any. */
+  private endResize: (() => void) | null = null;
 
   constructor(config: PanelStackConfig<V, D, O>) {
     this.config = config;
@@ -121,6 +123,7 @@ export class PanelStack<V extends PanelView, D, O> {
 
   /** Remove every panel (their in-flight fetches are aborted). */
   clear(): void {
+    this.endResize?.();
     for (const t of this.panelList) {
       t.cancel?.abort();
       t.element.remove();
@@ -134,6 +137,7 @@ export class PanelStack<V extends PanelView, D, O> {
       this.persistTimer = null;
     }
     this.closeSettings();
+    this.endResize?.();
     for (const t of this.panelList) t.cancel?.abort();
   }
 
@@ -264,12 +268,18 @@ export class PanelStack<V extends PanelView, D, O> {
       // visual feedback is immediate.
       track.bodyHost.style.minHeight = `${next}px`;
     };
-    const onUp = (e: PointerEvent): void => {
-      if (!active) return;
+    // Window listeners live only for the duration of a drag. `stop` is
+    // also what a dispose mid-drag calls, so they cannot outlive the stack.
+    const stop = (): void => {
       active = false;
-      handle.releasePointerCapture(e.pointerId);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      this.endResize = null;
+    };
+    const onUp = (e: PointerEvent): void => {
+      if (!active) return;
+      stop();
+      handle.releasePointerCapture(e.pointerId);
       track.bodyHost.style.minHeight = '';
       this.config.requestRender();
       this.schedulePersist();
@@ -282,6 +292,7 @@ export class PanelStack<V extends PanelView, D, O> {
       handle.setPointerCapture(e.pointerId);
       window.addEventListener('pointermove', onMove);
       window.addEventListener('pointerup', onUp);
+      this.endResize = stop;
       e.preventDefault();
     });
   }

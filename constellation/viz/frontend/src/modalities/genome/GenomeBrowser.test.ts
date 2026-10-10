@@ -991,6 +991,63 @@ describe('GenomeBrowser toolbar actions', () => {
     expect(svg.split('<clipPath').length - 1).toBe(6);
   });
 
+  it('dispose releases every document and window listener and stops following the locus', async () => {
+    // Count listeners per target as add/remove pairs, from before the
+    // browser exists until after it is disposed.
+    const live = new Map<EventTarget, Map<unknown, string>>([
+      [document, new Map()],
+      [window, new Map()],
+    ]);
+    const restore: Array<() => void> = [];
+    for (const [target, held] of live) {
+      const add = target.addEventListener;
+      const remove = target.removeEventListener;
+      target.addEventListener = function (this: EventTarget, type: string, fn: unknown, ...rest: unknown[]) {
+        held.set(fn, type);
+        return (add as (...a: unknown[]) => void).call(this, type, fn, ...rest);
+      } as typeof target.addEventListener;
+      target.removeEventListener = function (this: EventTarget, type: string, fn: unknown, ...rest: unknown[]) {
+        held.delete(fn);
+        return (remove as (...a: unknown[]) => void).call(this, type, fn, ...rest);
+      } as typeof target.removeEventListener;
+      restore.push(() => {
+        target.addEventListener = add;
+        target.removeEventListener = remove;
+      });
+    }
+    const held = (target: EventTarget): string[] => Array.from(live.get(target)!.values()).sort();
+
+    try {
+      const { host, browser } = await open();
+      // Open every popover and start a resize drag, so their listeners
+      // are live too when the browser goes away.
+      click(host.querySelector('.dataset-btn'));
+      click(host.querySelector('.options-btn'));
+      click(track(host, 'coverage-0').querySelector('.track-settings-btn'));
+      track(host, 'coverage-0')
+        .querySelector('.track-resize-handle')!
+        .dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, clientY: 100 }));
+      expect(held(document).length).toBeGreaterThan(0);
+      expect(held(window)).toEqual(
+        ['mousemove', 'mousemove', 'mouseup', 'mouseup', 'pointermove', 'pointerup'].sort(),
+      );
+
+      browser.dispose();
+      expect(held(document)).toEqual([]);
+      expect(held(window)).toEqual([]);
+
+      // The locus bus is the browser's own, but it must not keep the
+      // disposed browser rendering.
+      const mark = server.calls.length;
+      browser.bus.setLocus({ contig: 'chr1', start: 100, end: 900 });
+      await settle(200);
+      expect(server.calls.length).toBe(mark);
+      expect(locusInput(host).value).toBe('chr1:0-12000');
+    } finally {
+      for (const undo of restore) undo();
+    }
+  });
+
   it('dispose closes popovers, drops the root class and cancels a pending render', async () => {
     const { host, browser } = await open();
     click(host.querySelector('.dataset-btn'));

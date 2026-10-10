@@ -145,6 +145,10 @@ export class GenomeBrowser {
   private rerenderTimer: number | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private detachPanZoom: (() => void) | null = null;
+  /** Undo for everything registered outside the browser's own DOM —
+   *  bus subscriptions and document / window listeners. Its own elements
+   *  take their listeners with them. */
+  private teardown: Array<() => void> = [];
   private showLabels = readLabelsPref();
   private searchTimer: number | null = null;
   private searchAbort: AbortController | null = null;
@@ -244,7 +248,7 @@ export class GenomeBrowser {
       getContigLength: () => this.currentContig?.length ?? 0,
     });
 
-    this.bus.on('locus:changed', () => this.scheduleRender());
+    this.teardown.push(this.bus.on('locus:changed', () => this.scheduleRender()));
 
     this.resizeObserver = new ResizeObserver(() => this.scheduleRender());
     this.resizeObserver.observe(this.host);
@@ -268,6 +272,7 @@ export class GenomeBrowser {
     this.resizeObserver = null;
     this.detachPanZoom?.();
     this.detachPanZoom = null;
+    for (const undo of this.teardown.splice(0)) undo();
     this.popover?.dispose();
     this.popover = null;
     this.optionsPopover?.dispose();
@@ -381,9 +386,11 @@ export class GenomeBrowser {
       if (e.key === 'Enter') applyLocus();
     });
     this.toolbar.appendChild(labeled('Go to:', locusInput));
-    this.bus.on('locus:changed', (locus) => {
-      locusInput.value = `${locus.contig}:${locus.start}-${locus.end}`;
-    });
+    this.teardown.push(
+      this.bus.on('locus:changed', (locus) => {
+        locusInput.value = `${locus.contig}:${locus.start}-${locus.end}`;
+      }),
+    );
 
     // Zoom + Fit buttons
     const zoomGroup = document.createElement('div');
@@ -653,9 +660,13 @@ export class GenomeBrowser {
         hide();
       }
     });
-    document.addEventListener('mousedown', (e) => {
+    const onOutsideMouseDown = (e: MouseEvent): void => {
       if (!wrap.contains(e.target as Node)) hide();
-    });
+    };
+    document.addEventListener('mousedown', onOutsideMouseDown);
+    this.teardown.push(() =>
+      document.removeEventListener('mousedown', onOutsideMouseDown),
+    );
 
     return wrap;
   }
@@ -775,12 +786,18 @@ export class GenomeBrowser {
       centerAt(e.clientX);
       e.preventDefault();
     });
-    window.addEventListener('mousemove', (e) => {
+    const onMouseMove = (e: MouseEvent): void => {
       if (!dragStart) return;
       centerAt(e.clientX);
-    });
-    window.addEventListener('mouseup', () => {
+    };
+    const onMouseUp = (): void => {
       dragStart = null;
+    };
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    this.teardown.push(() => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
     });
   }
 
