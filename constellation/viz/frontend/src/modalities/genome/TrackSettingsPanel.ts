@@ -16,6 +16,7 @@
 // Categorical lists (samples/modes/motifs) come from the binding's
 // metadata payload which is already fetched at mount time.
 
+import { attachDismiss, positionBelowRight } from '../../engine/popover';
 import { TrackMetadata } from './renderers/base';
 
 export interface TrackSettingsArgs {
@@ -36,8 +37,7 @@ export class TrackSettingsPanel {
   private readonly root: HTMLElement;
   private style: Record<string, unknown>;
   private filter: Record<string, unknown>;
-  private outsideHandler: ((e: MouseEvent) => void) | null = null;
-  private escHandler: ((e: KeyboardEvent) => void) | null = null;
+  private detachDismiss: (() => void) | null = null;
 
   constructor(opts: TrackSettingsArgs) {
     this.opts = opts;
@@ -48,8 +48,12 @@ export class TrackSettingsPanel {
     this.root.setAttribute('role', 'dialog');
     this.root.setAttribute('aria-label', `Track settings — ${opts.label}`);
     this.build();
-    this.position();
-    this.attachDismiss();
+    // Keep 8px off the right edge: the gear sits at the far right of
+    // its track header.
+    positionBelowRight(this.root, opts.anchor, { minRightPx: 8 });
+    this.detachDismiss = attachDismiss(this.root, opts.anchor, () =>
+      this.opts.onClose(),
+    );
   }
 
   mount(parent: HTMLElement): void {
@@ -57,14 +61,8 @@ export class TrackSettingsPanel {
   }
 
   dispose(): void {
-    if (this.outsideHandler) {
-      document.removeEventListener('mousedown', this.outsideHandler);
-      this.outsideHandler = null;
-    }
-    if (this.escHandler) {
-      document.removeEventListener('keydown', this.escHandler);
-      this.escHandler = null;
-    }
+    this.detachDismiss?.();
+    this.detachDismiss = null;
     this.root.remove();
   }
 
@@ -890,31 +888,6 @@ export class TrackSettingsPanel {
   // --------------------------------------------------------------------
   // Positioning + dismiss
   // --------------------------------------------------------------------
-
-  private position(): void {
-    const rect = this.opts.anchor.getBoundingClientRect();
-    this.root.style.position = 'fixed';
-    this.root.style.top = `${rect.bottom + 4}px`;
-    // Anchor to the right edge of the gear so the panel grows leftward
-    // and doesn't fall off the right edge of the viewport.
-    const right = Math.max(8, window.innerWidth - rect.right);
-    this.root.style.right = `${right}px`;
-    this.root.style.zIndex = '30';
-  }
-
-  private attachDismiss(): void {
-    this.outsideHandler = (e: MouseEvent): void => {
-      const target = e.target as Node;
-      if (this.root.contains(target)) return;
-      if (this.opts.anchor.contains(target)) return;
-      this.opts.onClose();
-    };
-    this.escHandler = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') this.opts.onClose();
-    };
-    document.addEventListener('mousedown', this.outsideHandler);
-    document.addEventListener('keydown', this.escHandler);
-  }
 }
 
 // ----------------------------------------------------------------------

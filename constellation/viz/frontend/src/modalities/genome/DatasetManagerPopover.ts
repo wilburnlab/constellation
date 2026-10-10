@@ -8,6 +8,7 @@
 // /api/sessions/{id}/sources roundtrip.
 
 import { PathInput } from '../../widgets/PathInput';
+import { attachDismiss, positionBelowRight } from '../../engine/popover';
 
 export interface SourceRow {
   source_id: string;
@@ -47,8 +48,7 @@ export class DatasetManagerPopover {
   private addPathInput: PathInput | null = null;
   private addError: HTMLElement | null = null;
   private addBtn: HTMLButtonElement | null = null;
-  private outsideHandler: ((e: MouseEvent) => void) | null = null;
-  private escHandler: ((e: KeyboardEvent) => void) | null = null;
+  private detachDismiss: (() => void) | null = null;
 
   constructor(opts: DatasetManagerOptions) {
     this.opts = opts;
@@ -57,8 +57,10 @@ export class DatasetManagerPopover {
     this.root.setAttribute('role', 'dialog');
     this.root.setAttribute('aria-label', 'Loaded datasets and visible tracks');
     this.build();
-    this.position();
-    this.attachDismiss();
+    positionBelowRight(this.root, opts.anchor);
+    this.detachDismiss = attachDismiss(this.root, opts.anchor, () =>
+      this.opts.onClose(),
+    );
   }
 
   mount(parent: HTMLElement): void {
@@ -66,14 +68,8 @@ export class DatasetManagerPopover {
   }
 
   dispose(): void {
-    if (this.outsideHandler) {
-      document.removeEventListener('mousedown', this.outsideHandler);
-      this.outsideHandler = null;
-    }
-    if (this.escHandler) {
-      document.removeEventListener('keydown', this.escHandler);
-      this.escHandler = null;
-    }
+    this.detachDismiss?.();
+    this.detachDismiss = null;
     this.addPathInput?.destroy();
     this.addPathInput = null;
     this.root.remove();
@@ -231,28 +227,6 @@ export class DatasetManagerPopover {
     } catch (err) {
       console.warn('failed to remove source', err);
     }
-  }
-
-  private position(): void {
-    const rect = this.opts.anchor.getBoundingClientRect();
-    this.root.style.position = 'fixed';
-    this.root.style.top = `${rect.bottom + 4}px`;
-    this.root.style.right = `${window.innerWidth - rect.right}px`;
-    this.root.style.zIndex = '30';
-  }
-
-  private attachDismiss(): void {
-    this.outsideHandler = (e: MouseEvent): void => {
-      const target = e.target as Node;
-      if (this.root.contains(target)) return;
-      if (this.opts.anchor.contains(target)) return;
-      this.opts.onClose();
-    };
-    this.escHandler = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') this.opts.onClose();
-    };
-    document.addEventListener('mousedown', this.outsideHandler);
-    document.addEventListener('keydown', this.escHandler);
   }
 }
 

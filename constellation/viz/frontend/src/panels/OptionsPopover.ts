@@ -7,6 +7,8 @@
 // boolean toggles slot in without restructuring (default-label
 // visibility, axis-font globals, etc.).
 
+import { attachDismiss, positionBelowRight } from '../engine/popover';
+
 export interface BrowserOptions {
   /** When true, "Save SVG" wraps each panel in a clipPath of the
    *  configured heightPx — matching exactly what's on screen. When
@@ -36,8 +38,7 @@ export interface OptionsPopoverArgs {
 export class OptionsPopover {
   private readonly opts: OptionsPopoverArgs;
   private readonly root: HTMLElement;
-  private outsideHandler: ((e: MouseEvent) => void) | null = null;
-  private escHandler: ((e: KeyboardEvent) => void) | null = null;
+  private detachDismiss: (() => void) | null = null;
 
   constructor(opts: OptionsPopoverArgs) {
     this.opts = opts;
@@ -46,8 +47,10 @@ export class OptionsPopover {
     this.root.setAttribute('role', 'dialog');
     this.root.setAttribute('aria-label', 'Browser options');
     this.build();
-    this.position();
-    this.attachDismiss();
+    positionBelowRight(this.root, opts.anchor);
+    this.detachDismiss = attachDismiss(this.root, opts.anchor, () =>
+      this.opts.onClose(),
+    );
   }
 
   mount(parent: HTMLElement): void {
@@ -55,14 +58,8 @@ export class OptionsPopover {
   }
 
   dispose(): void {
-    if (this.outsideHandler) {
-      document.removeEventListener('mousedown', this.outsideHandler);
-      this.outsideHandler = null;
-    }
-    if (this.escHandler) {
-      document.removeEventListener('keydown', this.escHandler);
-      this.escHandler = null;
-    }
+    this.detachDismiss?.();
+    this.detachDismiss = null;
     this.root.remove();
   }
 
@@ -111,27 +108,5 @@ export class OptionsPopover {
     row.appendChild(cb);
     row.appendChild(text);
     return row;
-  }
-
-  private position(): void {
-    const rect = this.opts.anchor.getBoundingClientRect();
-    this.root.style.position = 'fixed';
-    this.root.style.top = `${rect.bottom + 4}px`;
-    this.root.style.right = `${window.innerWidth - rect.right}px`;
-    this.root.style.zIndex = '30';
-  }
-
-  private attachDismiss(): void {
-    this.outsideHandler = (e: MouseEvent): void => {
-      const target = e.target as Node;
-      if (this.root.contains(target)) return;
-      if (this.opts.anchor.contains(target)) return;
-      this.opts.onClose();
-    };
-    this.escHandler = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') this.opts.onClose();
-    };
-    document.addEventListener('mousedown', this.outsideHandler);
-    document.addEventListener('keydown', this.escHandler);
   }
 }
