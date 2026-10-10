@@ -10,9 +10,9 @@
 //   sample_id: int64?, sample_name: string?
 
 import { Table } from 'apache-arrow';
-import { svgEl, clear } from '../engine/svg_layer';
-import { TrackMode } from '../engine/arrow_client';
-import { decodeHybrid, appendHybridImage } from '../engine/hybrid_layer';
+import { svgEl, clear } from '../../../engine/svg_layer';
+import { TrackMode } from '../../../engine/arrow_client';
+import { decodeHybrid, appendHybridImage } from '../../../engine/hybrid_layer';
 import { TrackRenderer, RenderContext } from './base';
 import { renderAlignmentRows } from './_alignment_view';
 

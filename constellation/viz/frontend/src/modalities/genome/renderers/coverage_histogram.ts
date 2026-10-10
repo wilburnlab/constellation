@@ -8,8 +8,8 @@
 // track shows a single area below the depth curve.
 
 import { Table } from 'apache-arrow';
-import { svgEl, clear } from '../engine/svg_layer';
-import { TrackMode } from '../engine/arrow_client';
+import { svgEl, clear } from '../../../engine/svg_layer';
+import { TrackMode } from '../../../engine/arrow_client';
 import { TrackRenderer, RenderContext } from './base';
 import {
   pickAllowList,
@@ -17,7 +17,7 @@ import {
   pickCycledColor,
   pickNumber,
   pickString,
-} from './style';
+} from '../../../panels/style';
 
 const PALETTE = ['#4f9efb', '#fb7c4f', '#a4d65e', '#d65eb6', '#5ed6cf'];
 

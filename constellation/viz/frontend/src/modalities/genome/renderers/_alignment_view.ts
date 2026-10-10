@@ -10,15 +10,15 @@
 // order — pan/zoom preserves the same color for the same key.
 
 import { Table } from 'apache-arrow';
-import { svgEl } from '../engine/svg_layer';
-import { GenomicScale } from '../engine/scales';
+import { svgEl } from '../../../engine/svg_layer';
+import { GenomicScale } from '../scales';
 import {
   pickAllowList,
   pickCycledColor,
   pickNumber,
   pickPaletteColor,
   pickString,
-} from './style';
+} from '../../../panels/style';
 
 export interface AlignmentViewOptions {
   /** Wire column whose value keys the per-row exon-fill palette.

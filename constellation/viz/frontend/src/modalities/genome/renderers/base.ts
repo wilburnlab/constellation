@@ -6,8 +6,8 @@
 // modules + a registry entry in `track_renderers/index.ts`.
 
 import { Table } from 'apache-arrow';
-import { TrackMode } from '../engine/arrow_client';
-import { GenomicScale } from '../engine/scales';
+import { TrackMode } from '../../../engine/arrow_client';
+import { GenomicScale } from '../scales';
 
 export interface TrackMetadata {
   kind: string;

@@ -2,15 +2,15 @@
 // scaled by support, color by motif.
 
 import { Table } from 'apache-arrow';
-import { svgEl, clear } from '../engine/svg_layer';
-import { TrackMode } from '../engine/arrow_client';
+import { svgEl, clear } from '../../../engine/svg_layer';
+import { TrackMode } from '../../../engine/arrow_client';
 import { TrackRenderer, RenderContext } from './base';
 import {
   pickAllowList,
   pickBool,
   pickNumber,
   pickPaletteColor,
-} from './style';
+} from '../../../panels/style';
 
 const MOTIF_COLOR_DEFAULTS: Record<string, string> = {
   'GT-AG': '#5e9cd6',

@@ -3,8 +3,8 @@
 // resolves within the visible set.
 
 import { Table } from 'apache-arrow';
-import { svgEl, clear } from '../engine/svg_layer';
-import { TrackMode } from '../engine/arrow_client';
+import { svgEl, clear } from '../../../engine/svg_layer';
+import { TrackMode } from '../../../engine/arrow_client';
 import { TrackRenderer, RenderContext } from './base';
 import {
   pickAllowList,
@@ -12,7 +12,7 @@ import {
   pickNumber,
   pickPaletteColor,
   pickString,
-} from './style';
+} from '../../../panels/style';
 
 const TYPE_COLOR_DEFAULTS: Record<string, string> = {
   gene: '#5e8cd6',

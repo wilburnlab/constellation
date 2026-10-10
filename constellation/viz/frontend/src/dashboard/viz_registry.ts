@@ -13,7 +13,7 @@
 // Adding a second viz tool (spectrum viewer, structure browser, etc.)
 // is one entry; no introspect or schema changes required.
 
-import { GenomeBrowserForm } from './GenomeBrowserForm';
+import { GenomeBrowserForm } from '../modalities/genome/GenomeBrowserForm';
 import { DashboardState } from './state';
 import type {
   CommandSchema,
@@ -91,7 +91,7 @@ const VIZ_DESCRIPTORS: VizDescriptor[] = [
           initialLayout: TrackLayoutEntry[] | null,
         ) {
           await ctx.transitionToWidget(async (widgetHost) => {
-            const { GenomeBrowser } = await import('../widgets/GenomeBrowser');
+            const { GenomeBrowser } = await import('../modalities/genome/GenomeBrowser');
             widgetHost.innerHTML = '';
             const browser = new GenomeBrowser({
               host: widgetHost,

@@ -24,14 +24,14 @@ import {
   fetchJsonMethod,
   fetchTrackData,
   TrackMode,
-} from '../engine/arrow_client';
-import { attachPanZoom, zoomLocus, ZOOM_STEP } from '../engine/interactions';
-import { GenomicScale, makeAxis, xScale, formatGenomic } from '../engine/scales';
-import { svgEl, ensureSvg } from '../engine/svg_layer';
-import { Locus, ViewportBus } from '../engine/viewport_bus';
-import { buildCompositeSvg, downloadSvg, estimateGlyphCount } from '../engine/export';
-import { getRenderer } from '../track_renderers';
-import { TrackMetadata } from '../track_renderers/base';
+} from '../../engine/arrow_client';
+import { attachPanZoom, zoomLocus, ZOOM_STEP } from './interactions';
+import { GenomicScale, makeAxis, xScale, formatGenomic } from './scales';
+import { svgEl, ensureSvg } from '../../engine/svg_layer';
+import { Locus, ViewportBus } from './viewport_bus';
+import { buildCompositeSvg, downloadSvg, estimateGlyphCount } from '../../engine/export';
+import { getRenderer } from './renderers';
+import { TrackMetadata } from './renderers/base';
 import {
   BindingRow,
   DatasetManagerPopover,
@@ -41,7 +41,7 @@ import {
   BrowserOptions,
   DEFAULT_BROWSER_OPTIONS,
   OptionsPopover,
-} from './OptionsPopover';
+} from '../../panels/OptionsPopover';
 import { TrackSettingsPanel } from './TrackSettingsPanel';
 import './GenomeBrowser.css';
 

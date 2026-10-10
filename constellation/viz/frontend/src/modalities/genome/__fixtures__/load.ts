@@ -1,19 +1,19 @@
 // Test-only loaders for the kernel-generated fixtures under
-// `__fixtures__/genome/` (see scripts/build-viz-frontend-fixtures.py).
+// `__fixtures__/data/` (see scripts/build-viz-frontend-fixtures.py).
 
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Table, tableFromIPC } from 'apache-arrow';
-import type { TrackMetadata } from '../track_renderers/base';
+import type { TrackMetadata } from '../renderers/base';
 
 // Resolved through the file path rather than `new URL(rel, import.meta.url)`:
 // Vite rewrites that pattern as a bundled-asset reference.
-const GENOME_DIR = join(dirname(fileURLToPath(import.meta.url)), 'genome');
+const DATA_DIR = join(dirname(fileURLToPath(import.meta.url)), 'data');
 
 /** Raw Arrow IPC stream bytes, as the server would put them on the wire. */
 export function loadFixtureBytes(name: string): Uint8Array {
-  return new Uint8Array(readFileSync(join(GENOME_DIR, `${name}.arrow`)));
+  return new Uint8Array(readFileSync(join(DATA_DIR, `${name}.arrow`)));
 }
 
 export function loadFixture(name: string): Table {
@@ -23,7 +23,7 @@ export function loadFixture(name: string): Table {
 /** Kernel `metadata()` payloads, keyed `"<kind>/<binding_id>"`. */
 export function loadMetadata(): Record<string, TrackMetadata> {
   return JSON.parse(
-    readFileSync(join(GENOME_DIR, 'metadata.json'), 'utf-8'),
+    readFileSync(join(DATA_DIR, 'metadata.json'), 'utf-8'),
   ) as Record<string, TrackMetadata>;
 }
 

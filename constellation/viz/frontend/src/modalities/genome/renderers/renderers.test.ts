@@ -8,11 +8,11 @@
 
 import { describe, expect, it } from 'vitest';
 import type { Table } from 'apache-arrow';
-import type { TrackMode } from '../engine/arrow_client';
-import { xScale } from '../engine/scales';
-import { ensureSvg } from '../engine/svg_layer';
+import type { TrackMode } from '../../../engine/arrow_client';
+import { xScale } from '../scales';
+import { ensureSvg } from '../../../engine/svg_layer';
 import { loadFixture, metadataFor } from '../__fixtures__/load';
-import { getRenderer, registeredKinds } from './index';
+import { getRenderer, registeredKinds } from '.';
 
 interface Case {
   name: string;

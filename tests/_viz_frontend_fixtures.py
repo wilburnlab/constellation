@@ -9,7 +9,7 @@ runs every kernel against it, and returns the encoded payloads.
 Two consumers:
 
 - ``scripts/build-viz-frontend-fixtures.py`` writes the payloads under
-  ``constellation/viz/frontend/src/__fixtures__/genome/``.
+  ``constellation/viz/frontend/src/modalities/genome/__fixtures__/data/``.
 - ``tests/test_viz_frontend_fixtures.py`` rebuilds them and fails when the
   committed files no longer match, so a kernel change that alters the wire
   shape surfaces as a fixture diff (and then a renderer snapshot diff).
@@ -48,8 +48,10 @@ FIXTURE_DIR: Path = (
     / "viz"
     / "frontend"
     / "src"
-    / "__fixtures__"
+    / "modalities"
     / "genome"
+    / "__fixtures__"
+    / "data"
 )
 
 _CONTIG = "chr1"

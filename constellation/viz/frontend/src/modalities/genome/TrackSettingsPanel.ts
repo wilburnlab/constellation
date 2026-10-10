@@ -16,7 +16,7 @@
 // Categorical lists (samples/modes/motifs) come from the binding's
 // metadata payload which is already fetched at mount time.
 
-import { TrackMetadata } from '../track_renderers/base';
+import { TrackMetadata } from './renderers/base';
 
 export interface TrackSettingsArgs {
   anchor: HTMLElement;

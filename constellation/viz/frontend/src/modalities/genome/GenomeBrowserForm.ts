@@ -17,7 +17,7 @@
 // "Load saved session…" populates every field from a previously saved
 // configuration in one click.
 
-import { CommandSchema } from './types';
+import { CommandSchema } from '../../dashboard/types';
 import type {
   InstalledReference,
   OpenSessionResult,
@@ -25,9 +25,9 @@ import type {
   SavedSessionSummary,
   SourceInspection,
   TrackLayoutEntry,
-} from './types';
-import { DashboardState } from './state';
-import { PathInput } from '../widgets/PathInput';
+} from '../../dashboard/types';
+import { DashboardState } from '../../dashboard/state';
+import { PathInput } from '../../widgets/PathInput';
 
 interface SourceRow {
   path: string;

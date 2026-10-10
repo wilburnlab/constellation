@@ -7,7 +7,7 @@
 // each mutation. The host owns track-state persistence and the actual
 // /api/sessions/{id}/sources roundtrip.
 
-import { PathInput } from './PathInput';
+import { PathInput } from '../../widgets/PathInput';
 
 export interface SourceRow {
   source_id: string;

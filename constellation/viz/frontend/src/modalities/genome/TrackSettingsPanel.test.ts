@@ -6,9 +6,9 @@
 // the popover's contents held fixed.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { loadMetadata } from '../__fixtures__/load';
-import type { TrackMetadata } from '../track_renderers/base';
-import { registeredKinds } from '../track_renderers';
+import { loadMetadata } from './__fixtures__/load';
+import type { TrackMetadata } from './renderers/base';
+import { registeredKinds } from './renderers';
 import { TrackSettingsPanel } from './TrackSettingsPanel';
 
 type Dict = Record<string, unknown>;

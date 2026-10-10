@@ -2,7 +2,8 @@
 """Regenerate the Arrow fixtures used by the viz frontend's renderer tests.
 
 Runs the real track kernels against a small synthetic session and writes
-their output to ``constellation/viz/frontend/src/__fixtures__/genome/``.
+their output to
+``constellation/viz/frontend/src/modalities/genome/__fixtures__/data/``.
 The builder lives in ``tests/_viz_frontend_fixtures.py`` so the drift
 guard (``tests/test_viz_frontend_fixtures.py``) and this script share one
 definition of the fixture data.

@@ -12,17 +12,17 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../engine/export', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../engine/export')>();
+vi.mock('../../engine/export', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../engine/export')>();
   return { ...actual, downloadSvg: vi.fn() };
 });
 
-import { downloadSvg } from '../engine/export';
+import { downloadSvg } from '../../engine/export';
 import {
   ADDED_SOURCE_ID,
   FakeServer,
   SESSION_ID,
-} from '../__fixtures__/fake_server';
+} from './__fixtures__/fake_server';
 import { GenomeBrowser } from './GenomeBrowser';
 
 const LAYOUT_KEY = `constellation.genome.layout.${SESSION_ID}`;

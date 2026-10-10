@@ -2,10 +2,10 @@
 // blocks at moderate zoom; horizontal line when fully decimated.
 
 import { Table } from 'apache-arrow';
-import { svgEl, clear } from '../engine/svg_layer';
-import { TrackMode } from '../engine/arrow_client';
+import { svgEl, clear } from '../../../engine/svg_layer';
+import { TrackMode } from '../../../engine/arrow_client';
 import { TrackRenderer, RenderContext } from './base';
-import { pickNumber, pickPaletteColor, pickString } from './style';
+import { pickNumber, pickPaletteColor, pickString } from '../../../panels/style';
 
 const BASE_COLOR_DEFAULTS: Record<string, string> = {
   A: '#5cd66e',

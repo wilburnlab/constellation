@@ -1,6 +1,6 @@
 """Drift guard for the frontend's Arrow fixtures.
 
-``constellation/viz/frontend/src/__fixtures__/genome/`` holds kernel
+``constellation/viz/frontend/src/modalities/genome/__fixtures__/data/`` holds kernel
 output that the vitest renderer snapshots are drawn from. This test
 rebuilds those payloads from the live kernels and compares them with the
 committed files, so a kernel change that alters the wire shape cannot

@@ -16,16 +16,16 @@
 // a defensive check.
 
 import { Table } from 'apache-arrow';
-import { svgEl, clear } from '../engine/svg_layer';
-import { TrackMode } from '../engine/arrow_client';
-import { decodeHybrid, appendHybridImage } from '../engine/hybrid_layer';
+import { svgEl, clear } from '../../../engine/svg_layer';
+import { TrackMode } from '../../../engine/arrow_client';
+import { decodeHybrid, appendHybridImage } from '../../../engine/hybrid_layer';
 import { TrackRenderer, RenderContext } from './base';
 import { renderAlignmentRows } from './_alignment_view';
 import {
   pickAllowList,
   pickNumber,
   pickPaletteColor,
-} from './style';
+} from '../../../panels/style';
 
 // Keyed on the `mode` column of clusters.parquet. The canonical names
 // describe the mechanism (genome / kmer / em); the two pre-rename spellings
