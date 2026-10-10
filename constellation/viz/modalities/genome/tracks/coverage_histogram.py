@@ -30,12 +30,12 @@ import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 
+from constellation.viz.modalities.genome.kernel import GenomeTrackKernel
+from constellation.viz.modalities.genome.query import CoverageQuery
 from constellation.viz.modalities.genome.session import GenomeSession
 from constellation.viz.tracks.base import (
     ThresholdDecision,
     TrackBinding,
-    TrackKernel,
-    TrackQuery,
     iter_sources_with,
     register_track,
 )
@@ -53,11 +53,11 @@ COVERAGE_VECTOR_SCHEMA: pa.Schema = pa.schema(
 
 
 @register_track
-class CoverageHistogramKernel(TrackKernel):
+class CoverageHistogramKernel(GenomeTrackKernel):
     """Per-sample read-depth track."""
 
     kind = "coverage_histogram"
-    modality = "genome"
+    query_model = CoverageQuery
     schema = COVERAGE_VECTOR_SCHEMA
 
     # Coverage tracks are always vector; thresholds are unused but kept
@@ -121,7 +121,7 @@ class CoverageHistogramKernel(TrackKernel):
         }
 
     def threshold(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: CoverageQuery
     ) -> ThresholdDecision:
         # Honor an explicit force=hybrid (rasterize anyway) but the
         # default is always vector.
@@ -132,7 +132,7 @@ class CoverageHistogramKernel(TrackKernel):
     def fetch(
         self,
         binding: TrackBinding,
-        query: TrackQuery,
+        query: CoverageQuery,
         mode: ThresholdDecision,
     ) -> Iterator[pa.RecordBatch]:
         if mode is not ThresholdDecision.VECTOR:
@@ -172,7 +172,7 @@ class CoverageHistogramKernel(TrackKernel):
         return _project_batches(scanner.to_batches())
 
     def estimate_vector_cost(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: CoverageQuery
     ) -> int | None:
         # One glyph per RLE interval per sample. Quick scan via the
         # filtered dataset's row count; we don't materialize the rows.

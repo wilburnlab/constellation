@@ -8,21 +8,29 @@ For each registered kernel, the server exposes:
 - `GET /api/tracks/{kind}/metadata?session=<id>&binding=<binding_id>`
     → the per-binding metadata JSON the renderer uses to set up the
       track (palette, samples, height, ...).
-- `GET /api/tracks/{kind}/data?session=<id>&binding=<binding_id>&contig=&start=&end=...`
-    → Arrow IPC stream. The `X-Track-Mode` response header carries the
-      resolved mode (`vector` or `hybrid`) so the renderer branches
-      without inspecting the payload schema.
+- `GET /api/tracks/{kind}/data?session=<id>&binding=<binding_id>&<query fields>`
+    → Arrow IPC stream. The query fields are whatever the kernel's
+      `query_model` declares (`contig`, `start`, `end`, ... for the
+      genome kernels); nothing kernel-specific is named here. The
+      `X-Track-Mode` response header carries the resolved mode (`vector`
+      or `hybrid`) so the renderer branches without inspecting the
+      payload schema.
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from dataclasses import fields
+from functools import lru_cache
+from typing import Any, get_origin, get_type_hints
+
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from starlette.datastructures import QueryParams
 
 from constellation.viz.server.arrow_stream import batches_to_response
 from constellation.viz.server.session import SessionLike
+from constellation.viz.server.validation import validate
 from constellation.viz.tracks.base import (
-    ThresholdDecision,
     TrackBinding,
     TrackQuery,
     get_kernel,
@@ -125,56 +133,76 @@ def get_metadata(
     return kernel.metadata(track_binding)
 
 
+#: Query-string names the data endpoint reads itself; a query model must
+#: not declare a field with either name.
+_RESERVED = frozenset({"session", "binding"})
+
+
+@lru_cache(maxsize=None)
+def _query_plan(model: type[TrackQuery]) -> tuple[tuple[str, ...], frozenset[str]]:
+    """``(field names, names of the sequence-typed fields)`` for a query
+    model. Cached per class; kernels (and so models) can register late."""
+    names = tuple(f.name for f in fields(model))
+    clash = _RESERVED.intersection(names)
+    if clash:
+        raise TypeError(
+            f"{model.__name__} declares {sorted(clash)}, which the data "
+            f"endpoint reserves"
+        )
+    hints = get_type_hints(model)
+    sequences = frozenset(
+        name for name in names if get_origin(hints.get(name)) in (tuple, list)
+    )
+    return names, sequences
+
+
+def _parse_query(model: type[TrackQuery], params: QueryParams) -> TrackQuery:
+    """Build the kernel's query from the request's query string.
+
+    Only the fields the model declares are read — any other parameter is
+    ignored, as FastAPI ignores undeclared ones. A repeated parameter
+    feeds a sequence field in full and a scalar field with its last
+    value. Type and range failures are HTTP 422; a failed cross-field
+    ``check()`` is HTTP 400.
+    """
+    names, sequences = _query_plan(model)
+    raw: dict[str, Any] = {}
+    for name in names:
+        if name not in params:
+            continue
+        raw[name] = params.getlist(name) if name in sequences else params[name]
+    query = validate(model, raw, where="query")
+    try:
+        query.check()
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return query
+
+
 @router.get("/{kind}/data")
 def get_data(
     kind: str,
     session: str,
     binding: str,
-    contig: str,
-    start: int = Query(..., ge=0),
-    end: int = Query(..., ge=0),
-    samples: list[str] | None = Query(None),
-    viewport_px: int = Query(1200, ge=1, le=8192),
-    max_glyphs: int = Query(50_000, ge=100),
-    min_mapq: int = Query(0, ge=0, le=60),
-    cluster_view: str | None = Query(
-        None, pattern="^(clusters|members)$"
-    ),
-    force: str | None = Query(None, pattern="^(vector|hybrid)$"),
-    request: Request = None,  # type: ignore[assignment]
+    request: Request,
 ) -> StreamingResponse:
-    """Stream Arrow IPC for the requested track + viewport."""
-    if end <= start:
-        raise HTTPException(400, "end must be greater than start")
+    """Stream Arrow IPC for the requested track + view."""
+    try:
+        kernel = get_kernel(kind)
+    except KeyError as e:
+        raise HTTPException(404, str(e)) from e
+    # The kernel decides what its query looks like, so it is resolved
+    # before the query string can be read.
+    query = _parse_query(kernel.query_model, request.query_params)
 
     sessions: dict = request.app.state.sessions
     cache: dict = request.app.state.track_bindings_cache
     s = sessions.get(session)
     if s is None:
         raise HTTPException(404, f"unknown session_id: {session}")
-    try:
-        kernel = get_kernel(kind)
-    except KeyError as e:
-        raise HTTPException(404, str(e)) from e
     track_binding = _find_binding(s, kind, binding, cache)
     if track_binding is None:
         raise HTTPException(404, f"binding {binding!r} not found for kind {kind!r}")
-
-    forced = ThresholdDecision(force) if force else None
-    mode_extra: dict[str, str] = {}
-    if cluster_view is not None:
-        mode_extra["cluster_view"] = cluster_view
-    query = TrackQuery(
-        contig=contig,
-        start=int(start),
-        end=int(end),
-        samples=tuple(samples) if samples else (),
-        viewport_px=int(viewport_px),
-        max_glyphs=int(max_glyphs),
-        force=forced,
-        min_mapq=int(min_mapq),
-        mode_extra=mode_extra,
-    )
 
     mode = kernel.threshold(track_binding, query)
     schema = kernel.schema_for(query, mode)
@@ -185,9 +213,6 @@ def get_data(
         headers={
             "X-Track-Mode": mode.value,
             "X-Track-Kind": kind,
-            # When the kernel has multi-view vector schemas (cluster_pileup)
-            # the chosen view rides on the response so the TS layer can
-            # branch even before inspecting column presence.
-            "X-Track-View": mode_extra.get("cluster_view", ""),
+            **kernel.response_headers(query, mode),
         },
     )

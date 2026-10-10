@@ -28,12 +28,12 @@ import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 
+from constellation.viz.modalities.genome.kernel import GenomeTrackKernel
+from constellation.viz.modalities.genome.query import GenomeQuery
 from constellation.viz.modalities.genome.session import GenomeSession
 from constellation.viz.tracks.base import (
     ThresholdDecision,
     TrackBinding,
-    TrackKernel,
-    TrackQuery,
     iter_sources_with,
     register_track,
 )
@@ -55,11 +55,10 @@ GENE_ANNOTATION_VECTOR_SCHEMA: pa.Schema = pa.schema(
 
 
 @register_track
-class GeneAnnotationKernel(TrackKernel):
+class GeneAnnotationKernel(GenomeTrackKernel):
     """GFF3-shaped feature-annotation track."""
 
     kind = "gene_annotation"
-    modality = "genome"
     schema = GENE_ANNOTATION_VECTOR_SCHEMA
 
     # Soft cap: when a window contains more features than this, the
@@ -134,7 +133,7 @@ class GeneAnnotationKernel(TrackKernel):
         }
 
     def threshold(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: GenomeQuery
     ) -> ThresholdDecision:
         # Annotations are always vector. A future hybrid-density mode
         # for whole-chromosome views would land here; for v1 we cap at
@@ -146,7 +145,7 @@ class GeneAnnotationKernel(TrackKernel):
     def fetch(
         self,
         binding: TrackBinding,
-        query: TrackQuery,
+        query: GenomeQuery,
         mode: ThresholdDecision,
     ) -> Iterator[pa.RecordBatch]:
         if mode is not ThresholdDecision.VECTOR:
@@ -198,7 +197,7 @@ class GeneAnnotationKernel(TrackKernel):
         return iter(table.to_batches())
 
     def estimate_vector_cost(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: GenomeQuery
     ) -> int | None:
         contig_id = _resolve_contig_id(binding.paths["genome"], query.contig)
         if contig_id is None:

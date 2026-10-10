@@ -1,7 +1,7 @@
 """Transcript-cluster pile-up track — isoform-resolution stacked bars
 with an opt-in member-read expansion.
 
-Two views, switchable per binding via ``query.mode_extra['cluster_view']``:
+Two views, switchable per binding via the query's ``cluster_view``:
 
 - **clusters** (default) — one horizontal bar per ``clusters.parquet``
   row from ``span_start`` to ``span_end``, stacked greedily so
@@ -38,6 +38,8 @@ import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 
+from constellation.viz.modalities.genome.kernel import GenomeTrackKernel
+from constellation.viz.modalities.genome.query import ClusterPileupQuery
 from constellation.viz.modalities.genome.session import GenomeSession
 from constellation.viz.modalities.genome.tracks._alignment_view import (
     BLOCKS_LIST_TYPE,
@@ -49,8 +51,6 @@ from constellation.viz.tracks.base import (
     HYBRID_SCHEMA,
     ThresholdDecision,
     TrackBinding,
-    TrackKernel,
-    TrackQuery,
     iter_sources_with,
     register_track,
 )
@@ -94,11 +94,11 @@ CLUSTER_MEMBER_VECTOR_SCHEMA: pa.Schema = pa.schema(
 
 
 @register_track
-class ClusterPileupKernel(TrackKernel):
+class ClusterPileupKernel(GenomeTrackKernel):
     """Per-cluster pile-up track with opt-in member-read expansion."""
 
     kind = "cluster_pileup"
-    modality = "genome"
+    query_model = ClusterPileupQuery
     schema = CLUSTER_PILEUP_VECTOR_SCHEMA
 
     # Cluster counts are an order of magnitude smaller than read counts
@@ -178,20 +178,20 @@ class ClusterPileupKernel(TrackKernel):
         }
 
     def schema_for(
-        self, query: TrackQuery, mode: ThresholdDecision
+        self, query: ClusterPileupQuery, mode: ThresholdDecision
     ) -> pa.Schema:
         if mode is ThresholdDecision.HYBRID:
             return HYBRID_SCHEMA
-        if query.mode_extra.get("cluster_view") == "members":
+        if query.cluster_view == "members":
             return CLUSTER_MEMBER_VECTOR_SCHEMA
         return self.schema
 
     def threshold(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: ClusterPileupQuery
     ) -> ThresholdDecision:
         if query.force is not None:
             return query.force
-        if query.mode_extra.get("cluster_view") == "members":
+        if query.cluster_view == "members":
             # Members view is always vector (no hybrid mode yet); the
             # vector_glyph_limit cap is enforced inside _fetch_members
             # via a top-N truncation if the join exceeds it.
@@ -207,12 +207,12 @@ class ClusterPileupKernel(TrackKernel):
     def fetch(
         self,
         binding: TrackBinding,
-        query: TrackQuery,
+        query: ClusterPileupQuery,
         mode: ThresholdDecision,
     ) -> Iterator[pa.RecordBatch]:
         if (
             mode is ThresholdDecision.VECTOR
-            and query.mode_extra.get("cluster_view") == "members"
+            and query.cluster_view == "members"
         ):
             return self._fetch_members(binding, query)
 
@@ -235,7 +235,7 @@ class ClusterPileupKernel(TrackKernel):
         return self._emit_hybrid(rows, assigned, query)
 
     def estimate_vector_cost(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: ClusterPileupQuery
     ) -> int | None:
         return self._count_in_window(binding, query)
 
@@ -244,7 +244,7 @@ class ClusterPileupKernel(TrackKernel):
     # ------------------------------------------------------------------
 
     def _count_in_window(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: ClusterPileupQuery
     ) -> int:
         contig_id = _resolve_contig_id(binding.paths["genome"], query.contig)
         if contig_id is None:
@@ -255,7 +255,7 @@ class ClusterPileupKernel(TrackKernel):
         return int(dataset.count_rows(filter=self._predicate(contig_id, query)))
 
     def _scan_window(
-        self, binding: TrackBinding, contig_id: int, query: TrackQuery
+        self, binding: TrackBinding, contig_id: int, query: ClusterPileupQuery
     ) -> pa.Table:
         dataset = pa_ds.dataset(str(binding.paths["clusters"]), format="parquet")
         scanner = dataset.scanner(
@@ -272,7 +272,7 @@ class ClusterPileupKernel(TrackKernel):
         return scanner.to_table()
 
     @staticmethod
-    def _predicate(contig_id: int, query: TrackQuery) -> Any:
+    def _predicate(contig_id: int, query: ClusterPileupQuery) -> Any:
         contig_field = pc.field("contig_id")
         span_start = pc.field("span_start")
         span_end = pc.field("span_end")
@@ -306,7 +306,7 @@ class ClusterPileupKernel(TrackKernel):
         return iter(out.to_batches())
 
     def _emit_hybrid(
-        self, rows: pa.Table, assigned: list[int], query: TrackQuery
+        self, rows: pa.Table, assigned: list[int], query: ClusterPileupQuery
     ) -> Iterator[pa.RecordBatch]:
         from constellation.viz.raster.datashader_png import rasterize_segments
 
@@ -344,7 +344,7 @@ class ClusterPileupKernel(TrackKernel):
     # ------------------------------------------------------------------
 
     def _fetch_members(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: ClusterPileupQuery
     ) -> Iterator[pa.RecordBatch]:
         # Member expansion needs the upstream alignment artifacts; the
         # discover/metadata layer surfaces unavailability via

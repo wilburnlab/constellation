@@ -41,7 +41,7 @@ from constellation.sequencing.transcriptome.manifest import (
 from constellation.viz.modalities.genome.session import (
     GenomeSession as Session,
 )
-from constellation.viz.tracks.base import TrackQuery
+from constellation.viz.tracks.base import TrackQuery, get_kernel
 
 
 DEFAULT_HANDLE = "test_org@local_import-20260522"
@@ -72,9 +72,9 @@ def kernel_query(
     type, so that type can become kernel-specific without touching every
     test. ``cluster_view`` selects cluster_pileup's view.
     """
-    del kind  # every kernel shares one query type today
-    mode_extra = {"cluster_view": cluster_view} if cluster_view else {}
-    return TrackQuery(mode_extra=mode_extra, **fields)
+    if cluster_view is not None:
+        fields["cluster_view"] = cluster_view
+    return get_kernel(kind).query_model(**fields)
 
 
 def open_session(

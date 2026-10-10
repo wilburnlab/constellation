@@ -47,6 +47,8 @@ import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 
+from constellation.viz.modalities.genome.kernel import GenomeTrackKernel
+from constellation.viz.modalities.genome.query import ReadPileupQuery
 from constellation.viz.modalities.genome.session import GenomeSession
 from constellation.viz.modalities.genome.tracks._alignment_view import (
     BLOCKS_LIST_TYPE,
@@ -58,8 +60,6 @@ from constellation.viz.tracks.base import (
     HYBRID_SCHEMA,
     ThresholdDecision,
     TrackBinding,
-    TrackKernel,
-    TrackQuery,
     iter_sources_with,
     register_track,
 )
@@ -88,11 +88,11 @@ READ_PILEUP_VECTOR_SCHEMA: pa.Schema = pa.schema(
 
 
 @register_track
-class ReadPileupKernel(TrackKernel):
+class ReadPileupKernel(GenomeTrackKernel):
     """Per-read pileup track with CIGAR-aware block geometry."""
 
     kind = "read_pileup"
-    modality = "genome"
+    query_model = ReadPileupQuery
     schema = READ_PILEUP_VECTOR_SCHEMA
 
     # Hybrid threshold defaults — calibrated against typical workstation
@@ -190,7 +190,7 @@ class ReadPileupKernel(TrackKernel):
         }
 
     def threshold(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: ReadPileupQuery
     ) -> ThresholdDecision:
         if query.force is not None:
             return query.force
@@ -208,7 +208,7 @@ class ReadPileupKernel(TrackKernel):
     def fetch(
         self,
         binding: TrackBinding,
-        query: TrackQuery,
+        query: ReadPileupQuery,
         mode: ThresholdDecision,
     ) -> Iterator[pa.RecordBatch]:
         contig_id_value = _resolve_contig_id_or_name(
@@ -260,7 +260,7 @@ class ReadPileupKernel(TrackKernel):
         return self._emit_hybrid(rows, assigned, query)
 
     def estimate_vector_cost(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: ReadPileupQuery
     ) -> int | None:
         return self._count_in_window(binding, query)
 
@@ -269,7 +269,7 @@ class ReadPileupKernel(TrackKernel):
     # ------------------------------------------------------------------
 
     def _count_in_window(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: ReadPileupQuery
     ) -> int:
         dataset = pa_ds.dataset(str(binding.paths["alignments"]), format="parquet")
         predicate = self._predicate(
@@ -278,7 +278,7 @@ class ReadPileupKernel(TrackKernel):
         return int(dataset.count_rows(filter=predicate))
 
     def _scan_window(
-        self, binding: TrackBinding, contig_name: str, query: TrackQuery
+        self, binding: TrackBinding, contig_name: str, query: ReadPileupQuery
     ) -> pa.Table:
         dataset = pa_ds.dataset(str(binding.paths["alignments"]), format="parquet")
         predicate = self._predicate(
@@ -373,7 +373,7 @@ class ReadPileupKernel(TrackKernel):
         return iter(out.to_batches())
 
     def _emit_hybrid(
-        self, rows: pa.Table, assigned: list[int], query: TrackQuery
+        self, rows: pa.Table, assigned: list[int], query: ReadPileupQuery
     ) -> Iterator[pa.RecordBatch]:
         from constellation.viz.raster.datashader_png import rasterize_segments
 

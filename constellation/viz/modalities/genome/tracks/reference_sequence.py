@@ -23,12 +23,12 @@ import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 
+from constellation.viz.modalities.genome.kernel import GenomeTrackKernel
+from constellation.viz.modalities.genome.query import GenomeQuery
 from constellation.viz.modalities.genome.session import GenomeSession
 from constellation.viz.tracks.base import (
     ThresholdDecision,
     TrackBinding,
-    TrackKernel,
-    TrackQuery,
     register_track,
 )
 
@@ -68,11 +68,10 @@ REFERENCE_SEQUENCE_VECTOR_SCHEMA: pa.Schema = pa.schema(
 
 
 @register_track
-class ReferenceSequenceKernel(TrackKernel):
+class ReferenceSequenceKernel(GenomeTrackKernel):
     """Per-base reference-sequence track."""
 
     kind = "reference_sequence"
-    modality = "genome"
     schema = REFERENCE_SEQUENCE_VECTOR_SCHEMA
 
     # ~5kb of letters before decimation kicks in. The renderer uses
@@ -109,7 +108,7 @@ class ReferenceSequenceKernel(TrackKernel):
         }
 
     def threshold(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: GenomeQuery
     ) -> ThresholdDecision:
         if query.force is not None:
             return query.force
@@ -118,7 +117,7 @@ class ReferenceSequenceKernel(TrackKernel):
     def fetch(
         self,
         binding: TrackBinding,
-        query: TrackQuery,
+        query: GenomeQuery,
         mode: ThresholdDecision,
     ) -> Iterator[pa.RecordBatch]:
         if mode is not ThresholdDecision.VECTOR:
@@ -171,7 +170,7 @@ class ReferenceSequenceKernel(TrackKernel):
         return iter(table.to_batches())
 
     def estimate_vector_cost(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: GenomeQuery
     ) -> int | None:
         window_len = query.end - query.start
         # The cap caps the row count regardless of zoom.

@@ -543,6 +543,79 @@ def test_track_data_force_hybrid_via_endpoint(
     assert row["png_bytes"][:8] == b"\x89PNG\r\n\x1a\n"
 
 
+def test_track_data_samples_filter_via_endpoint(
+    read_pileup_client: TestClient,
+) -> None:
+    """A repeated ``samples`` parameter reaches the kernel as a sequence."""
+    session_id = read_pileup_client.session_id  # type: ignore[attr-defined]
+    base = [
+        ("session", session_id),
+        ("binding", "read_pileup-0"),
+        ("contig", "chr1"),
+        ("start", "0"),
+        ("end", "400"),
+    ]
+
+    def rows(extra: list[tuple[str, str]]) -> int:
+        response = read_pileup_client.get(
+            "/api/tracks/read_pileup/data", params=base + extra
+        )
+        assert response.status_code == 200
+        return pa.ipc.RecordBatchStreamReader(
+            io.BytesIO(response.content)
+        ).read_all().num_rows
+
+    assert rows([]) == 3
+    assert rows([("samples", "a")]) == 3
+    assert rows([("samples", "nobody"), ("samples", "a")]) == 3
+    assert rows([("samples", "nobody")]) == 0
+
+
+def test_track_data_query_is_validated_against_the_kernel_model(
+    client: TestClient, fixture_session: Session
+) -> None:
+    """The data endpoint names no kernel-specific parameter: each kernel's
+    ``query_model`` says what its query string holds."""
+    params = {
+        "session": fixture_session.session_id,
+        "binding": "coverage-0",
+        "contig": "chr1",
+        "start": 0,
+        "end": 100,
+    }
+    url = "/api/tracks/coverage_histogram/data"
+
+    ok = client.get(url, params=params)
+    assert ok.status_code == 200
+    # Every genome track reports the requested cluster view (none here).
+    assert ok.headers["x-track-view"] == ""
+
+    # A required field of the model that is missing is a 422 that names it.
+    missing = client.get(url, params={k: v for k, v in params.items() if k != "contig"})
+    assert missing.status_code == 422
+    assert missing.json()["detail"][0]["loc"] == ["query", "contig"]
+    assert missing.json()["detail"][0]["type"] == "missing"
+
+    # Type and range failures on declared fields are 422s too.
+    for bad in ({"start": "1.5"}, {"start": -1}, {"viewport_px": 0},
+                {"viewport_px": 9000}, {"force": "raster"}):
+        response = client.get(url, params={**params, **bad})
+        assert response.status_code == 422, bad
+        assert response.json()["detail"][0]["loc"] == ["query", next(iter(bad))]
+
+    # Parameters this kernel does not declare are not its parameters:
+    # they are ignored, whatever their value.
+    ignored = client.get(
+        url,
+        params={**params, "min_mapq": -5, "cluster_view": "bogus", "max_glyphs": 1},
+    )
+    assert ignored.status_code == 200
+
+    # An unknown kind is reported before its (unknowable) query is parsed.
+    unknown = client.get("/api/tracks/not_a_kind/data", params={"session": "x", "binding": "y"})
+    assert unknown.status_code == 404
+
+
 def test_track_data_min_mapq_rejects_negative(
     read_pileup_client: TestClient,
 ) -> None:

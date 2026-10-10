@@ -21,12 +21,12 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from constellation.viz.modalities.genome.kernel import GenomeTrackKernel
+from constellation.viz.modalities.genome.query import GenomeQuery
 from constellation.viz.modalities.genome.session import GenomeSession
 from constellation.viz.tracks.base import (
     ThresholdDecision,
     TrackBinding,
-    TrackKernel,
-    TrackQuery,
     iter_sources_with,
     register_track,
 )
@@ -47,11 +47,10 @@ SPLICE_JUNCTIONS_VECTOR_SCHEMA: pa.Schema = pa.schema(
 
 
 @register_track
-class SpliceJunctionsKernel(TrackKernel):
+class SpliceJunctionsKernel(GenomeTrackKernel):
     """Splice-junction arcs."""
 
     kind = "splice_junctions"
-    modality = "genome"
     schema = SPLICE_JUNCTIONS_VECTOR_SCHEMA
 
     # Soft cap on visible junctions. When exceeded, the kernel keeps
@@ -107,7 +106,7 @@ class SpliceJunctionsKernel(TrackKernel):
         }
 
     def threshold(
-        self, binding: TrackBinding, query: TrackQuery
+        self, binding: TrackBinding, query: GenomeQuery
     ) -> ThresholdDecision:
         if query.force is not None:
             return query.force
@@ -116,7 +115,7 @@ class SpliceJunctionsKernel(TrackKernel):
     def fetch(
         self,
         binding: TrackBinding,
-        query: TrackQuery,
+        query: GenomeQuery,
         mode: ThresholdDecision,
     ) -> Iterator[pa.RecordBatch]:
         if mode is not ThresholdDecision.VECTOR:
