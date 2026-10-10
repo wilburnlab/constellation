@@ -1284,6 +1284,56 @@ def test_cluster_pileup_vector_emits_packed_rows(
     assert rows[3]["row"] == 0
 
 
+def test_cluster_pileup_hybrid_emits_png(tmp_path: Path, monkeypatch) -> None:
+    pytest.importorskip("datashader")
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    root = tmp_path / "run"
+    _write_genome(root / "genome")
+    cluster_dir = root / "S2_cluster"
+    cluster_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                _cluster(cluster_id=1, span_start=0, span_end=100),
+                _cluster(cluster_id=2, span_start=50, span_end=150),
+                _cluster(cluster_id=3, span_start=200, span_end=300, n_reads=2),
+            ],
+            schema=TRANSCRIPT_CLUSTER_TABLE,
+        ),
+        cluster_dir / "clusters.parquet",
+    )
+    pq.write_table(
+        pa.Table.from_pylist([], schema=CLUSTER_MEMBERSHIP_TABLE),
+        cluster_dir / "cluster_membership.parquet",
+    )
+    session = _make_session(monkeypatch, tmp_path, root)
+    kernel = get_kernel("cluster_pileup")
+    [binding] = kernel.discover(session)
+    query = TrackQuery(
+        contig="chr1",
+        start=0,
+        end=400,
+        viewport_px=900,
+        force=ThresholdDecision.HYBRID,
+    )
+    assert kernel.threshold(binding, query) is ThresholdDecision.HYBRID
+    assert kernel.schema_for(query, ThresholdDecision.HYBRID) == HYBRID_SCHEMA
+    table = pa.Table.from_batches(
+        list(kernel.fetch(binding, query, ThresholdDecision.HYBRID)),
+        schema=HYBRID_SCHEMA,
+    )
+    assert table.num_rows == 1
+    row = table.to_pylist()[0]
+    assert row["mode"] == "hybrid"
+    assert row["n_items"] == 3
+    assert (row["extent_start"], row["extent_end"]) == (0, 400)
+    assert row["width_px"] == 900
+    img = Image.open(io.BytesIO(row["png_bytes"]))
+    assert img.size == (900, row["height_px"])
+
+
 # ----------------------------------------------------------------------
 # Cluster pileup — members view (PR 5)
 # ----------------------------------------------------------------------

@@ -3,7 +3,7 @@
 Exercises the reference-cache-first construction path:
 - builds a fake cache root via monkeypatch + ``CONSTELLATION_REFERENCES_HOME``
 - writes one-or-more `transcriptome align` / `cluster` source dirs with
-  schema-v2 manifests
+  current-schema manifests
 - calls ``Session.open(reference_handle, sources)`` and asserts the
   resolved dataclass shape, slot resolution, and mismatch-warning logic.
 """
@@ -277,3 +277,38 @@ def test_open_unknown_handle_errors(tmp_path: Path, monkeypatch) -> None:
             reference_handle="missing_org@local_import-20260522",
             sources=[],
         )
+
+
+# ----------------------------------------------------------------------
+# Identifier pins
+# ----------------------------------------------------------------------
+
+
+def test_source_id_literal_values() -> None:
+    """``source_id`` is persisted: it keys ``[[track_layout]]`` entries in
+    saved-session TOMLs and the browser's ``localStorage`` layout. A change
+    to the hash input or digest size orphans every saved layout, so the
+    values are pinned literally rather than only checked for stability."""
+    from constellation.viz.server.session import SessionSource
+
+    def _source(path: str, kind: str) -> SessionSource:
+        return SessionSource(
+            path=Path(path),
+            kind=kind,  # type: ignore[arg-type]
+            label="ignored",
+            assembly_accession=None,
+            reference_handle=None,
+        )
+
+    assert _source("/data/run1/align", "align").source_id == "src-585de6ec"
+    assert _source("/data/run1/cluster", "cluster").source_id == "src-5783a900"
+
+
+def test_session_id_literal_values() -> None:
+    """``session_id`` names the ``localStorage`` layout/options keys and is
+    preserved across ``with_sources`` rebuilds; pin the derivation."""
+    from constellation.viz.server.session import _derive_session_id
+
+    release = Path("/refs/homo_sapiens/ensembl-111")
+    assert _derive_session_id(release, "My Run 2026") == "my-run-2026-d11f07d2"
+    assert _derive_session_id(release, "ensembl-111") == "ensembl-111-65b4a124"

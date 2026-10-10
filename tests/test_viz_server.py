@@ -507,6 +507,42 @@ def test_track_data_min_mapq_pushdown_via_endpoint(
     assert kept_ids == [1, 3]
 
 
+def test_track_data_force_hybrid_via_endpoint(
+    read_pileup_client: TestClient,
+) -> None:
+    """``force=hybrid`` round-trips over HTTP: the mode header flips, the
+    payload is the one-row hybrid frame, and ``viewport_px`` sizes the
+    raster."""
+    pytest.importorskip("datashader")
+    from constellation.viz.tracks.base import HYBRID_SCHEMA
+
+    session_id = read_pileup_client.session_id  # type: ignore[attr-defined]
+    response = read_pileup_client.get(
+        "/api/tracks/read_pileup/data",
+        params={
+            "session": session_id,
+            "binding": "read_pileup-0",
+            "contig": "chr1",
+            "start": 0,
+            "end": 400,
+            "viewport_px": 800,
+            "force": "hybrid",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["x-track-mode"] == "hybrid"
+    assert response.headers["x-track-kind"] == "read_pileup"
+    table = pa.ipc.RecordBatchStreamReader(io.BytesIO(response.content)).read_all()
+    assert table.schema == HYBRID_SCHEMA
+    assert table.num_rows == 1
+    row = table.to_pylist()[0]
+    assert row["mode"] == "hybrid"
+    assert row["n_items"] == 3
+    assert (row["extent_start"], row["extent_end"]) == (0, 400)
+    assert row["width_px"] == 800
+    assert row["png_bytes"][:8] == b"\x89PNG\r\n\x1a\n"
+
+
 def test_track_data_min_mapq_rejects_negative(
     read_pileup_client: TestClient,
 ) -> None:
