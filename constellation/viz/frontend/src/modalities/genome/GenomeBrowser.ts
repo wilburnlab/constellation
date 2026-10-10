@@ -56,7 +56,7 @@ import {
   OptionsPopover,
   parseBrowserOptions,
 } from '../../panels/OptionsPopover';
-import './GenomeBrowser.css';
+import './genome.css';
 
 interface ContigInfo {
   contig_id: number;

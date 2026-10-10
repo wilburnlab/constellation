@@ -12,6 +12,7 @@
 
 import { Bag } from './settings_schema';
 import { LayoutPanel } from './layout';
+import './panels.css';
 
 /** How the server lists one renderable thing. */
 export interface PanelEntry {

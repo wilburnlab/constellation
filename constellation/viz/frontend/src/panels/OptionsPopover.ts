@@ -8,6 +8,7 @@
 // visibility, axis-font globals, etc.).
 
 import { attachDismiss, positionBelowRight } from '../engine/popover';
+import './panels.css';
 
 export interface BrowserOptions {
   /** When true, "Save SVG" wraps each panel in a clipPath of the

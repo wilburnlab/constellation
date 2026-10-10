@@ -1,7 +1,7 @@
 /* FilePicker popover + PathInput row.
  *
  * Shares the elevation / border / shadow language of .dataset-popover
- * (widgets/GenomeBrowser.css) but is intentionally NOT scoped under
+ * (modalities/genome/genome.css) but is intentionally NOT scoped under
  * .genome-browser-root so it also renders inside the dashboard's
  * CommandForm. Colors read the shared chrome CSS variables (defined by
  * both the genome and dashboard entries) with hard fallbacks. */

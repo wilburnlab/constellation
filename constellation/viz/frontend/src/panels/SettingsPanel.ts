@@ -20,6 +20,7 @@ import {
   SettingsSchema,
   resolve,
 } from './settings_schema';
+import './panels.css';
 
 export interface SettingsPanelArgs {
   anchor: HTMLElement;
