@@ -26,7 +26,7 @@ from constellation.viz.tracks.base import (
     register_track,
     registered_kinds,
 )
-from constellation.viz.tracks.coverage_histogram import (
+from constellation.viz.modalities.genome.tracks.coverage_histogram import (
     COVERAGE_VECTOR_SCHEMA,
     CoverageHistogramKernel,
 )

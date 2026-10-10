@@ -47,8 +47,8 @@ import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 
-from constellation.viz.server.session import Session
-from constellation.viz.tracks._alignment_view import (
+from constellation.viz.modalities.genome.session import Session
+from constellation.viz.modalities.genome.tracks._alignment_view import (
     BLOCKS_LIST_TYPE,
     MISMATCH_POSITIONS_TYPE,
     attach_blocks,

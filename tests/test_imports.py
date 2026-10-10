@@ -267,14 +267,17 @@ import constellation.viz.runner.registry
 import constellation.viz.runner.runner
 import constellation.viz.tracks
 import constellation.viz.tracks.base
-import constellation.viz.tracks.coverage_histogram
-import constellation.viz.tracks.gene_annotation
-import constellation.viz.tracks.reference_sequence
-import constellation.viz.tracks.splice_junctions
-import constellation.viz.tracks.read_pileup
-import constellation.viz.tracks.cluster_pileup
+import constellation.viz.modalities
+import constellation.viz.modalities.genome
+import constellation.viz.modalities.genome.tracks
+import constellation.viz.modalities.genome.tracks.coverage_histogram
+import constellation.viz.modalities.genome.tracks.gene_annotation
+import constellation.viz.modalities.genome.tracks.reference_sequence
+import constellation.viz.modalities.genome.tracks.splice_junctions
+import constellation.viz.modalities.genome.tracks.read_pileup
+import constellation.viz.modalities.genome.tracks.cluster_pileup
 import constellation.viz.server
-import constellation.viz.server.session
+import constellation.viz.modalities.genome.session
 import constellation.viz.frontend
 import constellation.viz.frontend.build
 # `viz.server.arrow_stream`, `viz.server.app`, `viz.server.endpoints.*`,

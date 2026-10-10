@@ -32,14 +32,14 @@ from constellation.viz.server.arrow_stream import (  # noqa: E402
     encode_ipc_stream,
 )
 from _viz_fixtures import Session, open_session  # noqa: E402
-from constellation.viz.tracks.coverage_histogram import (  # noqa: E402
+from constellation.viz.modalities.genome.tracks.coverage_histogram import (  # noqa: E402
     COVERAGE_VECTOR_SCHEMA,
 )
-from constellation.viz.tracks.cluster_pileup import (  # noqa: E402
+from constellation.viz.modalities.genome.tracks.cluster_pileup import (  # noqa: E402
     CLUSTER_MEMBER_VECTOR_SCHEMA,
     CLUSTER_PILEUP_VECTOR_SCHEMA,
 )
-from constellation.viz.tracks.read_pileup import (  # noqa: E402
+from constellation.viz.modalities.genome.tracks.read_pileup import (  # noqa: E402
     READ_PILEUP_VECTOR_SCHEMA,
 )
 

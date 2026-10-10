@@ -29,7 +29,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from constellation.viz.server.endpoints.tracks import invalidate_binding_cache
-from constellation.viz.server.session import Session
+from constellation.viz.modalities.genome.session import Session
 
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])

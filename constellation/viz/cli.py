@@ -323,7 +323,7 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
          `--align-dir` / `--cluster-dir` — ad-hoc one-shot session.
     """
     from constellation.viz.server.app import create_app
-    from constellation.viz.server.session import Session, _from_saved_session
+    from constellation.viz.modalities.genome.session import Session, _from_saved_session
     from constellation.viz.sessions import read_saved
 
     align_dirs = list(args.align_dir or [])

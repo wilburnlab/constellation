@@ -21,7 +21,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from constellation.viz.server.session import Session
+from constellation.viz.modalities.genome.session import Session
 from constellation.viz.tracks.base import (
     ThresholdDecision,
     TrackBinding,

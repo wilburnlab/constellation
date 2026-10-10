@@ -14,9 +14,11 @@ Architectural invariants:
   primitives), hybrid (SVG envelope around a Datashader PNG `<image>`), raster
   (PNG-only, thumbnails). Hybrid is the interactive default for dense kernels;
   vector is always available for export.
-- **Per-modality kernels** live under `constellation.viz.tracks.*`, register
-  via `@register_track`, and own their visual vocabulary + threshold logic.
-  Each kernel is mirror-symmetric to a TS module under
+- **Per-modality kernels** live under
+  `constellation.viz.modalities.<modality>.tracks.*`, register via
+  `@register_track` (the ABC and registry are in `viz.tracks.base`), and own
+  their visual vocabulary + threshold logic. Each kernel is mirror-symmetric
+  to a TS module under
   `constellation/viz/frontend/src/track_renderers/<kind>.ts`.
 - **Read-only over parquet**. The viz server never writes pipeline outputs.
   Long-running compute stays in CLI/notebook; the GUI only consumes.
@@ -31,20 +33,11 @@ Public surface (re-exports from submodules):
 
 from __future__ import annotations
 
-# Importing tracks pulls in every kernel module so they can self-register
-# via `@register_track` at module load time. Order matches the module layout
-# in docs/plans/oh-your-dashboard-design-floofy-scott.md. Kernels are added
-# here as their modules land; until then their `kind` strings are simply
-# absent from the registry, and the server returns 404 for them.
-from constellation.viz.tracks import (  # noqa: F401
-    base,
-    coverage_histogram,
-    gene_annotation,
-    reference_sequence,
-    splice_junctions,
-    read_pileup,
-    cluster_pileup,
-)
+# Importing a modality package registers its track kernels (each kernel
+# module self-registers via `@register_track` at load time). A modality
+# that is not imported here is simply absent from the registry, and the
+# server returns 404 for its kinds.
+from constellation.viz.modalities import genome  # noqa: F401
 from constellation.viz.tracks.base import (
     HYBRID_SCHEMA,
     ThresholdDecision,

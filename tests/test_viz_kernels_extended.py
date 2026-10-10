@@ -49,19 +49,19 @@ from _viz_fixtures import (
     kernel_query,
     open_session,
 )
-from constellation.viz.tracks.cluster_pileup import (
+from constellation.viz.modalities.genome.tracks.cluster_pileup import (
     CLUSTER_MEMBER_VECTOR_SCHEMA,
     CLUSTER_PILEUP_VECTOR_SCHEMA,
 )
-from constellation.viz.tracks.gene_annotation import (
+from constellation.viz.modalities.genome.tracks.gene_annotation import (
     GENE_ANNOTATION_VECTOR_SCHEMA,
 )
-from constellation.viz.tracks.read_pileup import READ_PILEUP_VECTOR_SCHEMA
-from constellation.viz.tracks import reference_sequence as ref_seq_mod
-from constellation.viz.tracks.reference_sequence import (
+from constellation.viz.modalities.genome.tracks.read_pileup import READ_PILEUP_VECTOR_SCHEMA
+from constellation.viz.modalities.genome.tracks import reference_sequence as ref_seq_mod
+from constellation.viz.modalities.genome.tracks.reference_sequence import (
     REFERENCE_SEQUENCE_VECTOR_SCHEMA,
 )
-from constellation.viz.tracks.splice_junctions import (
+from constellation.viz.modalities.genome.tracks.splice_junctions import (
     SPLICE_JUNCTIONS_VECTOR_SCHEMA,
 )
 
@@ -1051,7 +1051,7 @@ def test_read_pileup_min_mapq_affects_threshold_count(
     vector_glyph_limit keeps the renderer in vector mode even when the
     unfiltered count would tip to hybrid. Verifies the predicate is
     threaded through both _scan_window AND _count_in_window."""
-    from constellation.viz.tracks.read_pileup import ReadPileupKernel
+    from constellation.viz.modalities.genome.tracks.read_pileup import ReadPileupKernel
 
     # Fixture: more rows than the default vector_glyph_limit when
     # unfiltered; few rows above the MAPQ threshold.

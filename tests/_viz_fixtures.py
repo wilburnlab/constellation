@@ -38,7 +38,7 @@ from constellation.sequencing.transcriptome.manifest import (
     write_align_manifest,
     write_cluster_manifest,
 )
-from constellation.viz.server.session import Session
+from constellation.viz.modalities.genome.session import Session
 from constellation.viz.tracks.base import TrackQuery
 
 

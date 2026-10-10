@@ -286,7 +286,7 @@ def test_source_id_literal_values() -> None:
     saved-session TOMLs and the browser's ``localStorage`` layout. A change
     to the hash input or digest size orphans every saved layout, so the
     values are pinned literally rather than only checked for stability."""
-    from constellation.viz.server.session import SessionSource
+    from constellation.viz.modalities.genome.session import SessionSource
 
     def _source(path: str, kind: str) -> SessionSource:
         return SessionSource(
@@ -304,7 +304,7 @@ def test_source_id_literal_values() -> None:
 def test_session_id_literal_values() -> None:
     """``session_id`` names the ``localStorage`` layout/options keys and is
     preserved across ``with_sources`` rebuilds; pin the derivation."""
-    from constellation.viz.server.session import _derive_session_id
+    from constellation.viz.modalities.genome.session import _derive_session_id
 
     release = Path("/refs/homo_sapiens/ensembl-111")
     assert _derive_session_id(release, "My Run 2026") == "my-run-2026-d11f07d2"

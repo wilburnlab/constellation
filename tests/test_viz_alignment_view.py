@@ -27,7 +27,7 @@ from constellation.sequencing.schemas.alignment import (
     ALIGNMENT_BLOCK_TABLE,
     ALIGNMENT_CS_TABLE,
 )
-from constellation.viz.tracks._alignment_view import (
+from constellation.viz.modalities.genome.tracks._alignment_view import (
     BLOCKS_LIST_TYPE,
     MISMATCH_POSITIONS_TYPE,
     attach_blocks,

@@ -46,7 +46,7 @@ from constellation.viz.server.endpoints import references as references_ep
 from constellation.viz.server.endpoints import saved_sessions as saved_sessions_ep
 from constellation.viz.server.endpoints import sessions as sessions_ep
 from constellation.viz.server.endpoints import tracks as tracks_ep
-from constellation.viz.server.session import Session
+from constellation.viz.modalities.genome.session import Session
 
 
 # Resolve the bundled-static directory once at import time. It lives

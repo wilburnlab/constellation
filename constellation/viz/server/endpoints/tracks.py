@@ -20,7 +20,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from constellation.viz.server.arrow_stream import batches_to_response
-from constellation.viz.server.session import Session
+from constellation.viz.modalities.genome.session import Session
 from constellation.viz.tracks.base import (
     ThresholdDecision,
     TrackBinding,
