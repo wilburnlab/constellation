@@ -1,6 +1,9 @@
 # CI — runs on every push and PR to main. Two required gates:
 #   Lint (ruff)    ruff check (E/F/W per pyproject; not ruff format)
 #   Tests (pytest) full pytest suite in the canonical conda env
+# plus one job that is not yet a required check:
+#   Frontend (typecheck + vitest)   viz frontend: tsc --noEmit + unit tests
+# To require it, add its name to the branch-protection contexts (see below).
 #
 # The job `name:` values below are load-bearing: they become the check-run
 # "context" strings that branch protection requires. Renaming a job means
@@ -102,3 +105,36 @@ jobs:
         shell: micromamba-shell {0}
         # pyproject addopts already supplies -v.
         run: pytest
+
+  frontend:
+    name: Frontend (typecheck + vitest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: constellation/viz/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same toolchain as the release build (release.yml): pnpm 9 + Node 20,
+      # so the tests run on what produces the shipped bundle. The two setup
+      # actions are on their Node-24-runtime majors.
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: constellation/viz/frontend/pnpm-lock.yaml
+
+      # --frozen-lockfile: fail rather than rewrite pnpm-lock.yaml when it
+      # has drifted from package.json.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests (vitest)
+        run: pnpm test
