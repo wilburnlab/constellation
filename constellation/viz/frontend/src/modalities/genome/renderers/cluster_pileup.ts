@@ -79,7 +79,7 @@ const DEFAULTS = {
 const KNOWN_MODES = ['genome', 'kmer', 'em'];
 
 function modesOf(env: SettingsEnv): string[] {
-  return orFallback(stringList(env.meta.modes), KNOWN_MODES);
+  return orFallback(stringList(env.meta.modes_in_data), KNOWN_MODES);
 }
 
 const SETTINGS: SettingsSchema = {

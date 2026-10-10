@@ -231,6 +231,39 @@ describe('genome track settings: form model', () => {
     );
   });
 
+  // The mode and motif pickers follow the data: the kernel reports which
+  // values the track holds, and only those are offered.
+  function paletteLabels(root: HTMLElement): string[] {
+    return Array.from(root.querySelectorAll('.settings-row'))
+      .filter((row) => row.querySelector('input[type="color"]') !== null)
+      .map((row) => row.querySelector('.settings-row-label')?.textContent ?? '');
+  }
+
+  function allowList(root: HTMLElement, label: string): string[] {
+    const model = formModel(root) as { sections: Array<{ controls: Dict[] }> };
+    const hit = model.sections.flatMap((s) => s.controls).find((c) => c.label === label);
+    return ((hit?.options ?? []) as Array<{ label: string }>).map((o) => o.label);
+  }
+
+  it('offers only the cluster modes the track holds', () => {
+    const { root } = mount('cluster_pileup', { meta: { modes_in_data: ['em'] } });
+    expect(paletteLabels(root)).toEqual(['em']);
+    expect(allowList(root, 'Visible modes')).toEqual(['em']);
+  });
+
+  it('offers only the splice motifs the track holds, null motifs aside', () => {
+    const { root } = mount('splice_junctions', { meta: { motifs_in_data: ['GT-AG', null, 'CT-AC'] } });
+    expect(paletteLabels(root)).toEqual(['GT-AG', 'CT-AC']);
+    expect(allowList(root, 'Visible motifs')).toEqual(['GT-AG', 'CT-AC']);
+  });
+
+  it('falls back to the known modes and motifs when the metadata names none', () => {
+    const clusters = mount('cluster_pileup', { meta: { modes_in_data: [] } });
+    expect(allowList(clusters.root, 'Visible modes')).toEqual(['genome', 'kmer', 'em']);
+    const junctions = mount('splice_junctions', { meta: { motifs_in_data: undefined } });
+    expect(allowList(junctions.root, 'Visible motifs')).toEqual(['GT-AG', 'GC-AG', 'AT-AC']);
+  });
+
   it('leaves no control the extractor cannot classify', () => {
     for (const kind of registeredKinds()) {
       const { root } = mount(kind);

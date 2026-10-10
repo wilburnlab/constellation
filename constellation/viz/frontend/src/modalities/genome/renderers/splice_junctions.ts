@@ -43,7 +43,7 @@ const DEFAULTS = {
 const KNOWN_MOTIFS = Object.keys(MOTIF_COLOR_DEFAULTS).filter((m) => m !== 'default');
 
 function motifsOf(env: SettingsEnv): string[] {
-  return orFallback(stringList(env.meta.motifs), KNOWN_MOTIFS);
+  return orFallback(stringList(env.meta.motifs_in_data), KNOWN_MOTIFS);
 }
 
 const SETTINGS: SettingsSchema = {

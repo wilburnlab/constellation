@@ -38,9 +38,9 @@
       "title": "Style",
       "controls": [
         {
-          "label": "GT-AG",
+          "label": "AT-AC",
           "control": "color",
-          "value": "#5e9cd6"
+          "value": "#d6a05e"
         },
         {
           "label": "GC-AG",
@@ -48,9 +48,9 @@
           "value": "#9b5ed6"
         },
         {
-          "label": "AT-AC",
+          "label": "GT-AG",
           "control": "color",
-          "value": "#d6a05e"
+          "value": "#5e9cd6"
         },
         {
           "label": "Min stroke (px)",
@@ -86,7 +86,7 @@
           "control": "allowlist",
           "options": [
             {
-              "label": "GT-AG",
+              "label": "AT-AC",
               "checked": true
             },
             {
@@ -94,7 +94,7 @@
               "checked": true
             },
             {
-              "label": "AT-AC",
+              "label": "GT-AG",
               "checked": true
             }
           ]

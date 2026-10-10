@@ -38,6 +38,11 @@
       "title": "Style",
       "controls": [
         {
+          "label": "em",
+          "control": "color",
+          "value": "#d6a85e"
+        },
+        {
           "label": "genome",
           "control": "color",
           "value": "#5ed6cf"
@@ -46,11 +51,6 @@
           "label": "kmer",
           "control": "color",
           "value": "#a8d65e"
-        },
-        {
-          "label": "em",
-          "control": "color",
-          "value": "#d6a85e"
         },
         {
           "label": "Min row height (px)",
@@ -112,15 +112,15 @@
           "control": "allowlist",
           "options": [
             {
+              "label": "em",
+              "checked": true
+            },
+            {
               "label": "genome",
               "checked": true
             },
             {
               "label": "kmer",
-              "checked": true
-            },
-            {
-              "label": "em",
               "checked": true
             }
           ]
