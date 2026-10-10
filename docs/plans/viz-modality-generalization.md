@@ -11,7 +11,31 @@
   six import sites were still in core endpoints until the routes moved),
   and the per-modality request models cover the saved-session POST as
   well as session open.
-- **Stage 2 (PR C) — frontend factoring:** not started.
+- **Stage 2 (PR C) — frontend factoring:** implemented on
+  `feat/viz-modality-frontend` (2026-10-10), stacked on the Stage 1 branch;
+  fourteen commits in the order of the steps below. Departures:
+  - `PanelDriver` takes the host's viewport as one snapshot per render —
+    `view()` returns `{key, widthPx, …}` and `fetch` / `draw` receive it —
+    instead of separate `viewKey()` / `contentWidth()` calls, so every panel
+    of a pass is fetched and drawn for the same view. `draw` returns the
+    item count for the status line.
+  - `DatasetManagerPopover` stayed under `modalities/genome/`: its rows are
+    the genome session's reference and align / cluster sources. The viewport
+    stayed three modules (`viewport_bus`, `interactions`, `scales`).
+  - The thin `TrackSettingsPanel` subclass was deleted rather than kept: the
+    stack opens the generic `SettingsPanel` with the kind's schema.
+  - Panel CSS hangs off the panel's own root (`.track`) and the stack's
+    container (`.track-stack`), not off a host scope class.
+  - Parity exception 2 added a test for the property itself (everything a
+    popover offers is looked up when the track is drawn), which then also
+    covered exception 3.
+  - Parity exception 6 changed nothing visible: the two rules that existed
+    only in the inline copy had no effect on the rendered page.
+  - Verification went past the plan. jsdom applies no CSS, so the stylesheet
+    split, the inline-style removal and the popover changes were checked with
+    headless-Chrome screenshots of the standalone page over a synthetic
+    session, in 13 UI states, compared pixel-for-pixel before and after. The
+    harness was a one-off and is not in the tree.
 
 Plan approved 2026-10-09. Companion to
 [viz-and-dashboard.md](viz-and-dashboard.md), which records how the viz layer
@@ -264,9 +288,9 @@ stays byte-identical.
 colour (fixing it changes drawn output). Saved `[options]` are written but never
 read back into the browser. `_normalize_options` keeps only `clip_svg`.
 
-**Found during Stage 0, not yet scheduled.** Two more defects surfaced while
-writing the characterization tests. Both are pinned as current behavior; decide
-before PR C whether they join the parity exceptions.
+**Found along the way, not scheduled.** Defects that surfaced while writing
+the tests and doing the work. None was changed; the first two are pinned as
+current behavior by tests.
 - The gear popover's "Visible sources" filter offers `reference` / `derived`,
   but the renderer compares against each feature's own `source` column (the GFF
   source, e.g. `RefSeq`), so unticking either box hides every feature with a
@@ -274,16 +298,32 @@ before PR C whether they join the parity exceptions.
 - Adding a source can persist duplicate `display_order` values
   (`computeInsertOrder` shifts siblings whose saved order has not been restored
   yet). The on-screen order is still correct because the sort is stable.
+- In the `cluster_pileup` members view the status line reads "showing N
+  clusters", but N is the number of member reads drawn. A kind's unit is one
+  fixed pair; a per-view unit needs the renderer to report it.
+- A cluster source inherits every align slot through its `align_dir`
+  back-reference (`_attach_align_slots_from_cluster`), so attaching an align
+  dir and the cluster dir built from it lists coverage, reads and splice
+  junctions twice — once per source. The docstring names four slots; the loop
+  copies them all.
+- Clearing a number field in the settings popover stores 0 rather than
+  removing the key (`Number('') === 0`); a text field removes it.
+- Knobs the drawing code reads that no popover offers:
+  `letter_font_family` (reference_sequence), `strand_chevron_min_width_px`
+  (gene_annotation), `palette.exon` (read_pileup), `palette.default`
+  (splice_junctions, for junctions with no motif), and per-cluster colours and
+  `visible_clusters` in the members view.
 
 ---
 
 ## Seams deliberately left open (not built here)
 
-- **Viewport model.** `PanelDriver.viewKey()` and `draw()` are opaque to
-  `panels/`, so a linked RT × m/z viewport and y-axes need no change there.
-- **Fetch scheduling.** The serial loop is one `PanelStack` method over
-  `PanelDriver.fetch`. Parallel fetch, client cache, overscan and server-side
-  decimation replace that method.
+- **Viewport model.** The view a `PanelDriver` returns is opaque to `panels/`
+  beyond a cache key and a width, so a linked RT × m/z viewport and y-axes
+  need no change there.
+- **Fetch scheduling.** The serial loop is one `PanelStack` method
+  (`render`) over `PanelDriver.fetch`. Parallel fetch, client cache, overscan
+  and server-side decimation replace that method.
 - **Layout containers and export.** A grid container is a sibling of
   `PanelStack`; `buildCompositeSvg` stays a vertical stack.
 - **Hybrid schema.** Extents stay int64. Widening them to float is a wire change
@@ -313,6 +353,9 @@ Stage-specific:
 
 Manual, once per PR. jsdom cannot exercise real drag-and-drop, pointer capture
 or CSS, so each PR ends with a check in a browser against a real saved session.
+(For PR C the static appearance was additionally compared in headless Chrome
+against a synthetic session — see Status. That covers CSS and layout, not
+drag, resize, or real data.)
 Confirm: every track renders; reorder, resize,
 collapse and hide survive a reload; the gear popover works for each kind; add
 and remove a dataset; Save SVG with clip on and off; the standalone

@@ -2,7 +2,7 @@
 
 This file extends the project-wide rules in [../../CLAUDE.md](../../CLAUDE.md). Read that first.
 
-`viz/` ships the first-party visualization layer. The standalone IGV-style genome browser boots via `constellation viz genome --reference <handle> --align-dir DIR [...] [--cluster-dir DIR ...]` or `--saved-session <slug>`; the dashboard shell (bare `constellation`) launches a JupyterLab-style soft GUI that wraps every CLI subcommand as a form + xterm.js terminal, splittable via dockview-core panes. The single `task` panel transitions in-place — sidebar entries open a form; compute commands swap that form for an xterm terminal on Run; viz commands swap it for the actual widget on Open. The genome-browser entry form is reference-cache-first: the user picks a reference from the `~/.constellation/references/` dropdown, then attaches one or more `transcriptome align` / `cluster` output dirs as "results" rows. Once a session is open, a Datasets toolbar popover lets the user toggle per-binding visibility, drag-to-reorder rows, collapse/hide individual tracks, and add or remove sources on the fly without reopening the browser. Each track's gear (⚙) opens a per-binding settings popover for color / palette / font / opacity / dataset-slice filters (publication-quality SVG export), and a sibling toolbar Options dropdown holds browser-wide preferences like SVG clip-to-viewport. Both SPAs share one FastAPI app. See [docs/plans/viz-and-dashboard.md](../../docs/plans/viz-and-dashboard.md) for the multi-PR plan that built it, and [docs/plans/viz-modality-generalization.md](../../docs/plans/viz-modality-generalization.md) for the in-progress work that makes genome one modality among several (pre-work for a mass-spec data browser).
+`viz/` ships the first-party visualization layer. The standalone IGV-style genome browser boots via `constellation viz genome --reference <handle> --align-dir DIR [...] [--cluster-dir DIR ...]` or `--saved-session <slug>`; the dashboard shell (bare `constellation`) launches a JupyterLab-style soft GUI that wraps every CLI subcommand as a form + xterm.js terminal, splittable via dockview-core panes. The single `task` panel transitions in-place — sidebar entries open a form; compute commands swap that form for an xterm terminal on Run; viz commands swap it for the actual widget on Open. The genome-browser entry form is reference-cache-first: the user picks a reference from the `~/.constellation/references/` dropdown, then attaches one or more `transcriptome align` / `cluster` output dirs as "results" rows. Once a session is open, a Datasets toolbar popover lets the user toggle per-binding visibility, drag-to-reorder rows, collapse/hide individual tracks, and add or remove sources on the fly without reopening the browser. Each track's gear (⚙) opens a per-binding settings popover for color / palette / font / opacity / dataset-slice filters (publication-quality SVG export), and a sibling toolbar Options dropdown holds browser-wide preferences like SVG clip-to-viewport. Both SPAs share one FastAPI app. See [docs/plans/viz-and-dashboard.md](../../docs/plans/viz-and-dashboard.md) for the multi-PR plan that built it, and [docs/plans/viz-modality-generalization.md](../../docs/plans/viz-modality-generalization.md) for the work that made genome one modality among several, on both the server and the frontend (pre-work for a mass-spec data browser).
 
 The `[viz]` extras (`fastapi`, `pydantic`, `uvicorn[standard]`, `datashader`, `websockets`, `httpx`) gate the runtime; the package skeleton (`tracks/base.py`, `modalities/` including each modality's kernels, sessions and query models, `server/session.py`, `introspect/`, `runner/`) imports cleanly under the base install and is exercised by `tests/test_imports.py` and `tests/test_viz_base_install.py`. Modules that need fastapi / datashader live behind `pytest.importorskip` in their own test files.
 
@@ -40,17 +40,18 @@ The `[viz]` extras (`fastapi`, `pydantic`, `uvicorn[standard]`, `datashader`, `w
    - Declares its wire schema as a class-level `pa.Schema`
    - Owns its threshold logic (`vector_glyph_limit`, `vector_bp_per_pixel_limit`)
    - Declares its `modality` and the query it takes (`query_model`)
-   - Has a TS counterpart at [frontend/src/track_renderers/<kind>.ts](frontend/src/track_renderers/) that mirrors the Python emit shape
+   - Has a TS counterpart at [frontend/src/modalities/<name>/renderers/<kind>.ts](frontend/src/modalities/genome/renderers/) that mirrors the Python emit shape and declares what its host needs to know about the kind (default order, unit noun, server-side filters, settings)
 
-   Kernels live with their modality, under `modalities/<name>/tracks/`.
+   Kernels live with their modality, under `modalities/<name>/tracks/`; renderers under the frontend's `src/modalities/<name>/renderers/`.
 4. **Read-only over parquet.** The viz server never writes pipeline outputs. Long-running compute stays in CLI / notebook; the GUI consumes parquet datasets via `pa.dataset.dataset(...)` + filter pushdown. PR 2's dashboard preserves this rule: it constructs `constellation <subcmd> ...` invocations and shows their stdout in xterm.js — never duplicates compute logic.
 5. **One server, many frontends.** The same FastAPI app serves the focused `constellation viz genome` tool and the PR 2 dashboard panel mount. Kernels don't know which shell mounted them. (An `anywidget` mount for Marimo / Jupyter cells was part of this design but has not been built — there is no anywidget code in the tree.)
 6. **Frontend ships pre-built in release wheels.** `constellation/viz/static/<entry>/` is git-ignored; the build helper at [frontend/build.py](frontend/build.py) (`python -m constellation.viz.frontend.build`) runs pnpm/npm. Build at install time was rejected — see "Frontend distribution" in the plan. Source-tarball installs without prebuilt assets see an actionable error message when hitting `/`.
 7. **Reference cache as the GUI's entry point.** The dashboard's genome-browser entry form always picks a reference first (from `~/.constellation/references/<organism>/<release>/`, surfaced via `GET /api/references`), then attaches one or more "source" directories that the user has produced with `constellation transcriptome align` / `cluster`. Each source's `manifest.json` (the transcriptome manifest's current schema — v5 at the time of writing; `read_manifest_dir` rejects any other version) names the reference handle it was produced against, so the form can warn on assembly mismatch without needing the user to re-spell the relationship. Sessions are not directory-rooted any more — there is no `session.toml` discovery layer, and the legacy `Session.from_root` / `Session.discover` walks were removed in the reference-cache-first cutover. Saved configurations persist to `~/.constellation/sessions/<slug>.toml` (a sibling of the references and catalogs caches) for one-click resume.
-8. **One panel kind per command, in-place phase transitions (PR 3).** Sidebar `command:open` always opens a single `'task'` panel via `dashboard/TaskPanel.ts`. Phase 1 is a form — `CommandForm` for compute, `VizForm` for any path matching `viz_registry`. Phase 2 swaps the form's DOM root for either `TerminalPanel` (compute; streams `/api/commands/{id}/stream`) or the viz widget itself (e.g. `widgets/GenomeBrowser`), and the tab title updates accordingly. The welcome page's quick-launch creates the same panel with `autoSubmit: true` so a session-path entry skips straight to phase 2. New viz tools register one descriptor in `dashboard/viz_registry.ts` and never touch the rest of the shell.
+8. **One panel kind per command, in-place phase transitions (PR 3).** Sidebar `command:open` always opens a single `'task'` panel via `dashboard/TaskPanel.ts`. Phase 1 is a form — `CommandForm` for compute, `VizForm` for any path matching `viz_registry`. Phase 2 swaps the form's DOM root for either `TerminalPanel` (compute; streams `/api/commands/{id}/stream`) or the viz widget itself (e.g. `modalities/genome/GenomeBrowser`), and the tab title updates accordingly. The welcome page's quick-launch creates the same panel with `autoSubmit: true` so a session-path entry skips straight to phase 2. New viz tools register one descriptor in `dashboard/viz_registry.ts` — the only dashboard file allowed to import a modality — and never touch the rest of the shell.
 9. **Sessions stay frozen; mutation = atomic rebuild + cache evict (PR 5).** A modality's session and source classes (`GenomeSession`, `GenomeSource`) are `@dataclass(frozen=True, slots=True)`. Source mutation does not touch the existing instance — `session.with_sources(new_sources)` calls back through the validating `open(...)` path and returns a fresh frozen instance, which the endpoint swaps into `app.state.sessions[session_id]` (the `session_id` derives deterministically from `(reference_path, label)` so it's preserved across rebuilds). `invalidate_binding_cache(cache, session_id)` then evicts every `(session_id, kind)` entry in `app.state.track_bindings_cache` so the next `/api/tracks` discovers against the rebuilt source list. Client-side layout state is keyed by `(source_id, kind)` — never `binding_id` — so persisted state survives the rebuild even though kernel `binding_id`s remain index-based.
-10. **Per-binding style/filter are opaque to the layout type; renderers own their schema (PR 6).** `TrackLayoutEntry` carries optional `style?: Record<string, unknown>` and `filter?: Record<string, unknown>` dicts that the layout layer never inspects. Each renderer reads keys it knows about via the `track_renderers/style.ts` helpers (`pickPaletteColor`, `pickNumber`, `pickAllowList`, …) with hardcoded defaults as fallback — unset = pre-PR-6 behavior, fully backward-compatible. New style or filter knobs land as renderer-only changes: add a `pick*(ctx.style, 'my_key', fallback)` call and a row in `widgets/TrackSettingsPanel.ts`; no schema migration, no persistence layer change. Client-side re-render (`MountedTrack.lastFetched` Arrow cache + `restyleTrack()`) means style edits don't re-hit the kernel — color picks are instant. Two filters are pushed down to the kernel instead of applied client-side: `min_mapq` (`read_pileup`, and `cluster_pileup`'s members view) and `cluster_view` (`cluster_pileup`; the wire schema differs between its two views). They are fields of the kernels' query models (`ReadPileupQuery.min_mapq`, `ClusterPileupQuery.cluster_view`), and `PUSHDOWN_FILTER_KEYS` in `GenomeBrowser.ts` routes a change in either to a refetch (of every visible track) rather than a restyle. Further pushdown filters (a supplementary-flag toggle, anything that changes row packing) follow the same route. SVG export uses `svg.dataset.naturalHeight` (set by every renderer) for panel y-offsets so overflow content auto-grows the export when clip is off, or wraps each panel in a `<clipPath>` when clip is on (the Options dropdown toggle).
+10. **Per-binding style/filter are opaque to the layout type; each kind declares its own controls (PR 6, restated by the modality work).** A layout entry (`panels/layout.ts::LayoutEntry`) carries optional `style?: Record<string, unknown>` and `filter?: Record<string, unknown>` dicts that the layout layer never inspects. Each renderer reads the keys it knows through the `panels/style.ts` helpers (`pickPaletteColor`, `pickNumber`, `pickAllowList`, …) with its `DEFAULTS` constant as fallback — unset = the renderer's literal default — and declares the matching controls as a `SettingsSchema` (`panels/settings_schema.ts`) built from the same constant, which the generic `panels/SettingsPanel.ts` renders. A new knob is a renderer-only change: one `pick*(ctx.style, 'my_key', DEFAULTS.my_key)` call and one control in that renderer's schema; no shared code, no schema migration, no persistence change. `renderers/descriptors.test.ts` draws every kind through recording dicts and fails if a popover offers a key the drawing code never looks up. Style and client-side filter edits redraw from the table already fetched (`Panel.lastFetched` + `PanelStack.restyle()`), so colour picks are instant. A filter the kernel applies is declared in the renderer's `pushdown` map (key → query-parameter encoder): `min_mapq` (`read_pileup`, and `cluster_pileup`'s members view) and `cluster_view` (`cluster_pileup`; the wire schema differs between its two views), which are fields of the kernels' query models (`ReadPileupQuery.min_mapq`, `ClusterPileupQuery.cluster_view`). A change to a declared key drops the cache and refetches (every visible track) rather than restyling. Further pushdown filters (a supplementary-flag toggle, anything that changes row packing) are one field on the query model plus one `pushdown` entry. SVG export uses `svg.dataset.naturalHeight` (set by every renderer) for panel y-offsets so overflow content auto-grows the export when clip is off, or wraps each panel in a `<clipPath>` when clip is on (the Options dropdown toggle).
 11. **Genome is one modality; the server core names none.** `viz/server/` and `viz/tracks/base.py` know nothing about loci, references or contigs. A session is anything satisfying `SessionLike` (`session_id`, `label`, `modality`, `sources`, `warnings`, `saved_as`, `with_sources`, `summary`, `to_manifest`) — Protocols, not base classes, because the concrete classes are slots dataclasses and zero-argument `super()` fails in a slots-dataclass subclass on Python 3.12. Requests name a modality (`"genome"` when omitted, which is what every pre-modality client and saved file means); `POST /api/sessions/open`, `/inspect-source` and `POST /api/saved-sessions` validate the body against that modality's own stdlib-dataclass model and dispatch to it. A kernel only ever sees sessions of its own modality (the guard is in `endpoints/tracks.py::_bindings_for`). Adding a modality is: one `viz/modalities/<name>/` package that calls `register_modality`, an import of it in `constellation/viz/__init__.py`, a `viz <name>` CLI subcommand, and the frontend counterpart. `tests/test_viz_modalities.py` proves it by registering a toy modality entirely inside the test.
+12. **The frontend has the same shape: generic layers below, one folder per modality above.** `src/engine/` (transport, SVG, export, popover mechanics), `src/panels/` (panel chrome, the reorderable stack, layout persistence, the schema-driven settings popover) and `src/widgets/` (path inputs) never import `src/modalities/`; a modality never imports another; `src/dashboard/` reaches a modality only through `viz_registry.ts`. `src/boundary.test.ts` enforces all three. `panels/` is a set of components a host drives, not a framework: a host builds a `PanelStack`, gives it a three-method `PanelDriver` (the current view; fetch one panel; draw one panel) and calls `render()`. The stack asks each kind's `PanelKind` descriptor for anything kind-specific and treats the host's view as opaque beyond a cache key and a width — which is what lets a browser with a different viewport (a retention-time or m/z window instead of a locus) reuse it unchanged. `Panel` is separate from `PanelStack` so a different container (a grid) can hold the same panels. `panels/PanelStack.test.ts` drives the stack under a non-genome host as the acceptance test. The frontend counterpart of a new modality is one `src/modalities/<name>/` folder plus one descriptor in `dashboard/viz_registry.ts` (and an `index.<name>.html` shell if it also ships standalone — entries are discovered from the shells by both `vite.config.ts` and `build.py`).
 
 ## Track kernel contract
 
@@ -131,9 +132,9 @@ Kernels iterate via the shared `iter_sources_with(session, *attrs)` helper in `t
   - `modalities/genome/endpoints.py` → `sequencing.reference.handle.{list_installed, read_defaults}`.
 
   Widening the surface means adding to `DOMAIN_IMPORTS`, which makes it a reviewed change rather than a quiet one. The bar for a new name: pure function, narrow surface, no upstream state.
-- **Frontend renderers receive a `(table, mode, ctx)` tuple and clear-then-rewrite the SVG.** No data-binding / diffing — each render call is full-replacement. The host (`GenomeBrowser` widget) decides re-render cadence (60ms debounce on viewport changes). `ctx.showLabels` rides through so kernels can branch on host-level UI toggles without owning state.
-- **Genome browser owns its own chrome and styles.** Toolbar (contig select / Go-to / zoom +/–/Fit / Labels toggle / feature search / Datasets popover / Save SVG) + IGV-style contig overview bar + ruler + track stack live in `widgets/GenomeBrowser.ts`; styles ship in `widgets/GenomeBrowser.css` scoped under `.genome-browser-root` so the widget mounts cleanly in either the standalone SPA or a dashboard task panel. A `ResizeObserver` on the host re-renders through the existing 60ms debounce when the pane resizes. Per-track controls (drag-grip reorder via HTML5 DnD, collapse chevron, hide eye, bottom-edge pointer-event resize handle) live in the per-track header. The Datasets popover is its own component (`widgets/DatasetManagerPopover.ts`) anchored to the toolbar button; it lists the reference plus every attached source with per-binding checkboxes, per-source remove (✕), and an inline "Add dataset" form that POSTs to `/api/sessions/{id}/sources`. The empty-state placeholder "All tracks hidden — open the Datasets menu to enable some" appears when every binding is hidden.
-- **Per-binding layout state is keyed by `(source_id, kind)`** in the client, not by `binding_id`. State (visible / displayOrder / heightPx / collapsed) persists to `localStorage["constellation.genome.layout.<sessionId>"]` debounced 200 ms; when `session.saved_as` is set, the client also PATCHes `/api/saved-sessions/{slug}/layout` so the configuration survives across machines. On reopen, the saved-session loader prefills the form which then passes `initialLayout` to `GenomeBrowser`. An `initialLayout` takes precedence: the `localStorage` layout is read only when none is supplied. Browser-wide options are always read from `localStorage` (the saved session's `[options]` block is written but not read back into the browser). Default ordering is kind-grouped: `reference_sequence < gene_annotation < coverage_histogram < read_pileup < cluster_pileup < splice_junctions`, ties broken by source insertion order; runtime adds slot new bindings into the tail of their kind cluster; user reorder via drag reassigns displayOrders sequentially.
+- **Frontend renderers receive a `(table, mode, ctx)` tuple and clear-then-rewrite the SVG.** No data-binding / diffing — each render call is full-replacement. The host (`GenomeBrowser` widget) decides re-render cadence (60ms debounce on viewport changes); `PanelStack.render()` then fetches and draws the visible panels one after another. `ctx.showLabels` rides through so kernels can branch on host-level UI toggles without owning state.
+- **Genome browser owns its own chrome; the track stack is the generic one.** Toolbar (contig select / Go-to / zoom +/–/Fit / Labels toggle / feature search / Options / Datasets popover / Save SVG) + IGV-style contig overview bar + ruler live in `modalities/genome/GenomeBrowser.ts`, styled by `modalities/genome/genome.css` scoped under `.genome-browser-root` so the widget mounts cleanly in either the standalone SPA or a dashboard task panel (the standalone page's HTML supplies only the palette variables and the full-height frame). The track stack below them is a `panels/PanelStack`: per-track header controls (drag-grip reorder via HTML5 DnD, collapse chevron, gear, hide eye), the bottom-edge pointer-event resize handle, the empty-state placeholder and layout persistence all live in `panels/` and are styled by `panels/panels.css`, whose rules hang off the panel's own root (`.track`) and the stack's container (`.track-stack`) rather than off any host. A `ResizeObserver` on the host re-renders through the browser's 60 ms debounce when the pane resizes. The Datasets popover is genome's own component (`modalities/genome/DatasetManagerPopover.ts`) anchored to the toolbar button; it lists the reference plus every attached source with per-binding checkboxes, per-source remove (✕), and an inline "Add dataset" form that POSTs to `/api/sessions/{id}/sources`. `dispose()` releases everything the browser registered outside its own DOM (bus subscriptions, document / window listeners).
+- **Per-binding layout state is keyed by `(source_id, kind)`** in the client, not by `binding_id`. State (visible / displayOrder / heightPx / collapsed) persists to `localStorage["constellation.genome.layout.<sessionId>"]` debounced 200 ms; when `session.saved_as` is set, the client also PATCHes `/api/saved-sessions/{slug}/layout` so the configuration survives across machines. The entry shape, the merge-after-reload rule and the single writer are `panels/layout.ts` (`LayoutStore`); the genome browser supplies only its storage namespace. On reopen, the saved-session loader prefills the form which then passes `initialLayout` to `GenomeBrowser`. An `initialLayout` takes precedence: the `localStorage` layout is read only when none is supplied. Browser-wide options are always read from `localStorage` (the saved session's `[options]` block is written but not read back into the browser). Default ordering is kind-grouped by each renderer's declared `order`: `reference_sequence < gene_annotation < coverage_histogram < read_pileup < cluster_pileup < splice_junctions`, ties broken by source insertion order; runtime adds slot new bindings into the tail of their kind cluster; user reorder via drag reassigns displayOrders sequentially.
 - **Thresholds default to class attributes.** `read_pileup.vector_glyph_limit = 4_000`; `cluster_pileup.vector_glyph_limit = 6_000`; `gene_annotation.feature_limit = 2_000`. Empirical tuning lives by adjusting the class attribute, not by editing the threshold method body. `?force=` overrides everything.
 - **No mutable shared state across requests.** The FastAPI app keeps a per-process `track_bindings_cache: dict[(session_id, kind), list[TrackBinding]]` for discover-result memoization, but no per-request state. Session and source classes are frozen dataclasses; runtime source mutation rebuilds the session via its `with_sources()` and atomically swaps the registry entry under the same `session_id` (the source-mutation endpoints invariably call `invalidate_binding_cache(app.state.track_bindings_cache, session_id)` before returning).
 - **Endpoint shape is REST-flat, not GraphQL.** Modality-neutral routes live in `server/endpoints/`; routes that only make sense for one modality live with it and are mounted through its `routers()` factory (genome: `/api/sessions/{id}/contigs`, `/api/sessions/{id}/search`, `/api/references`, which answer 404 for a non-genome session). `/api/sessions`, `/api/sessions/open`, `/api/sessions/inspect-source`, `/api/sessions/{id}/manifest`, `/api/sessions/{id}/contigs`, `/api/sessions/{id}/search`, `/api/sessions/{id}/sources` (POST), `/api/sessions/{id}/sources/{source_id}` (DELETE), `/api/tracks?session=...` (each listing carries `source_id`), `/api/tracks/{kind}/metadata`, `/api/tracks/{kind}/data`. The dashboard PR adds `/api/commands`, `/api/cli/schema`. The reference-cache-first flow adds `/api/references` (cache enumeration) and `/api/saved-sessions` CRUD; PR 5 added `PATCH /api/saved-sessions/{slug}/layout`. PR 6 extended both `POST /api/saved-sessions` and the PATCH endpoint to accept optional per-entry `style` + `filter` and a top-level `options` field; the PATCH preserves on-disk options when the payload omits the key. The file-picker layer adds `GET /api/fs/list` (sandboxed directory listing confined to `app.state.fs_roots`).
@@ -167,24 +168,30 @@ Fixture sessions are built in tmp_path by `tests/_viz_fixtures.py`: populate a f
 
 ### Frontend (vitest)
 
-`pnpm test` in `constellation/viz/frontend/` (vitest + jsdom; config in `vitest.config.ts`, separate from the bundle's `vite.config.ts`). About 145 tests, ~2 s. Test files sit beside the code as `*.test.ts`. CI runs `pnpm typecheck` + `pnpm test` in the `Frontend (typecheck + vitest)` job.
+`pnpm test` in `constellation/viz/frontend/` (vitest + jsdom; config in `vitest.config.ts`, separate from the bundle's `vite.config.ts`). About 240 tests in 16 files, ~3 s. Test files sit beside the code as `*.test.ts`. CI runs `pnpm typecheck` + `pnpm test` in the `Frontend (typecheck + vitest)` job.
 
 | File | Covers |
 |---|---|
-| `engine/{interactions,scales,export,arrow_client}.test.ts` | Zoom/clamp math; scale + unit formatting; composite-SVG sizing and clipping; the exact `/api/tracks/{kind}/data` URL (`buildTrackDataUrl`). |
-| `track_renderers/style.test.ts` | Every `pick*` helper. |
-| `track_renderers/renderers.test.ts` | **Renderer parity snapshots.** Each renderer draws from the Arrow table its kernel really emits, at default and non-default `style` / `filter`, plus empty and hybrid paths. Snapshots are standalone files under `track_renderers/__snapshots__/*.svg` — open one in a browser to see the track. |
-| `widgets/TrackSettingsPanel.test.ts` | **Form-model snapshots** (`widgets/__snapshots__/TrackSettingsPanel.*.json`): the sections, controls, labels, initial values, bounds and options the gear popover offers per kind. Plus edit propagation, reset and dismissal. |
-| `widgets/GenomeBrowser.test.ts` | **Black-box host test.** Mounts the real widget against an in-memory fake server (`__fixtures__/fake_server.ts`) and pins request order and URLs, the track stack, status text, `localStorage` + the layout PATCH, restyle-versus-refetch routing, drag-reorder, resize, add/remove source, navigation, search and export. |
+| `boundary.test.ts` | **Layering.** `engine/`, `panels/` and `widgets/` import no modality; a modality imports no other; `dashboard/` names a modality only in `viz_registry.ts`. Checks itself against planted violations. |
+| `engine/{export,arrow_client,popover}.test.ts` | Composite-SVG sizing and clipping; the exact `/api/tracks/{kind}/data` URL (`buildTrackDataUrl`); popover dismissal and anchoring. |
+| `panels/{style,layout,kind}.test.ts` | Every `pick*` helper; layout snapshot / apply / merge-after-reload / reorder and the `LayoutStore`; unit nouns and pushdown encoding. |
+| `panels/SettingsPanel.test.ts` | The schema interpreter on a schema that belongs to no real kind: every control type, defaults versus stored values, computed defaults and option lists, conditional controls, in-place rebuild when an edit changes which controls apply, reset. |
+| `panels/PanelStack.test.ts` | **Generic-stack acceptance test.** The stack under a host that is not a genome browser (a time-window view, numeric data, two toy kinds): chrome, order, hide / collapse, debounced persistence, serial fetch-and-draw, status line, restyle-versus-refetch routing, rebuild after a source change. |
+| `modalities/genome/{interactions,scales}.test.ts` | Zoom / clamp math; scale + unit formatting. |
+| `modalities/genome/renderers/renderers.test.ts` | **Renderer parity snapshots.** Each renderer draws from the Arrow table its kernel really emits, at default and non-default `style` / `filter`, plus empty and hybrid paths. Snapshots are standalone files under `renderers/__snapshots__/*.svg` — open one in a browser to see the track. |
+| `modalities/genome/renderers/settings.test.ts` | **Form-model snapshots** (`renderers/__snapshots__/settings.*.json`): the sections, controls, labels, initial values, bounds and options each kind's schema produces. Plus edit propagation, the data-driven mode / motif pickers, the cluster view switch, "Show labels" following the toolbar, reset and dismissal. |
+| `modalities/genome/renderers/descriptors.test.ts` | What each kind declares (order, unit, pushdown), and **no dead controls**: each kind is drawn from its fixture through `style` / `filter` dicts that record every key looked up, and everything its popover offers must be among them or be a server-side filter. |
+| `modalities/genome/GenomeBrowser.test.ts` | **Black-box host test.** Mounts the real widget against an in-memory fake server (`__fixtures__/fake_server.ts`) and pins request order and URLs, the track stack, status text, `localStorage` + the layout PATCH, restyle-versus-refetch routing, drag-reorder, resize, add/remove source, navigation, search, export, and that `dispose()` leaves no document / window listener or bus subscription behind. |
+| `dashboard/VizForm.test.ts` | Remembered fields are stored per tool; the older shared key is still read. |
 
-**Fixtures come from the kernels.** `src/__fixtures__/genome/*.arrow` are Arrow IPC streams produced by the real Python kernels over a small synthetic session (`tests/_viz_frontend_fixtures.py`), so the renderers are tested against the true wire types (Int64, nested `list<struct>`, nullable strings) rather than tables hand-built in JS. `tests/test_viz_frontend_fixtures.py` rebuilds them on every pytest run and fails if the committed files differ, so a kernel change that alters the wire shape surfaces as a fixture diff and then a renderer snapshot diff. Regenerate with:
+**Fixtures come from the kernels.** `src/modalities/genome/__fixtures__/data/*.arrow` are Arrow IPC streams produced by the real Python kernels over a small synthetic session (`tests/_viz_frontend_fixtures.py`), so the renderers are tested against the true wire types (Int64, nested `list<struct>`, nullable strings) rather than tables hand-built in JS. `tests/test_viz_frontend_fixtures.py` rebuilds them on every pytest run and fails if the committed files differ, so a kernel change that alters the wire shape surfaces as a fixture diff and then a renderer snapshot diff. Regenerate with:
 
 ```
 python scripts/build-viz-frontend-fixtures.py
 pnpm -C constellation/viz/frontend test -- -u     # then review the snapshot diff
 ```
 
-**What jsdom cannot check:** CSS, real layout (element sizes are stubbed), native drag-and-drop and pointer capture (driven by synthetic events). Those still need a look in a browser.
+**What jsdom cannot check:** CSS (it applies none), real layout (element sizes are stubbed), native drag-and-drop and pointer capture (driven by synthetic events). Those need a browser. A cheap way to cover the static half without adding a browser to the test stack: `constellation viz genome --no-browser --port N` over a small session, then headless Chrome (`chrome --headless=new --screenshot=out.png --window-size=1400,1600 --virtual-time-budget=9000 http://localhost:N/`) before and after a change, and a pixel diff of the two PNGs. Repeat shots differ by ~76 px at delta 1 (anti-aliasing), so compare with that tolerance. Under WSL the Windows Chrome binary works against the WSL server on `localhost`.
 
 ## Frontend distribution
 
@@ -236,65 +243,84 @@ The handler reads the adjacent `.sha256` sidecar (GNU coreutils format: `<hex>  
 ```
 constellation/viz/frontend/
 ├── package.json                   pnpm dependency manifest (lockfile: pnpm-lock.yaml, pnpm 9)
-├── vite.config.ts                 multi-entry build (genome + dashboard), base="/static/<entry>/"
+├── vite.config.ts                 multi-entry build; entries discovered from index.<entry>.html,
+│                                  base="/static/<entry>/"
 ├── vitest.config.ts               unit-test config (jsdom); `pnpm test`
 ├── tsconfig.json                  ES2022 + strict
-├── index.genome.html              shell HTML for the genome entry
-├── index.dashboard.html           shell HTML for the dashboard entry (PR 2)
+├── index.genome.html              shell HTML for the genome entry (palette + frame only)
+├── index.dashboard.html           shell HTML for the dashboard entry
 ├── build.py                       `python -m constellation.viz.frontend.build` (+ `--pack` for release-style tarballs); `--entry NAME [NAME ...]` builds multiple entries
 └── src/                           (`*.test.ts` files sit beside the code they test)
-    ├── __fixtures__/              test-only: kernel-generated Arrow fixtures (`genome/*.arrow`),
-    │                              their loaders, and the in-memory fake server
+    ├── boundary.test.ts           the layering rule below, enforced
     ├── main_genome.ts             genome entry point (mounts GenomeBrowser)
-    ├── main_dashboard.ts          dashboard entry point (PR 2; fetches /api/cli/schema, mounts DashboardShell)
-    ├── engine/                    shared with both entries
-    │   ├── arrow_client.ts        apache-arrow IPC fetch + JSON helpers
-    │   ├── scales.ts              d3-scale + d3-axis wrappers
-    │   ├── viewport_bus.ts        ViewportBus (locus + selection events)
-    │   ├── svg_layer.ts           svgEl/clear/ensureSvg primitives
+    ├── main_dashboard.ts          dashboard entry point (fetches /api/cli/schema, mounts DashboardShell)
+    │
+    │   ── generic layers: never import modalities/ ──
+    ├── engine/                    transport + drawing primitives
+    │   ├── arrow_client.ts        apache-arrow IPC fetch + JSON helpers; the data URL carries
+    │   │                          whatever parameters the caller passes and names none
+    │   ├── svg_layer.ts           svgEl / clear / ensureSvg primitives
     │   ├── hybrid_layer.ts        decode HYBRID_SCHEMA + <image> mount
-    │   ├── interactions.ts        wheel/drag pan-zoom into ViewportBus
-    │   └── export.ts              composite-SVG serializer + download
-    ├── track_renderers/           genome-only
-    │   ├── base.ts                TrackRenderer interface (RenderContext.showLabels / style / filter)
-    │   ├── style.ts               PR 6 — pick*(ctx.style|filter, key, fallback) coercion helpers
-    │   ├── index.ts               kind → renderer registry
-    │   └── <kind>.ts              one renderer per Python kernel
-    ├── widgets/                   mounted from both entries
-    │   ├── GenomeBrowser.ts       toolbar (zoom +/–/Fit / Labels / search / Options popover /
-    │   │                          Datasets popover / Save SVG) + overview bar + ruler + track
-    │   │                          stack with per-track drag-grip / collapse / gear / hide /
-    │   │                          bottom-edge resize controls; owns per-binding
-    │   │                          visible/displayOrder/heightPx/collapsed/style/filter +
-    │   │                          MountedTrack.lastFetched Arrow cache for restyleTrack(); persists
-    │   │                          layout + browser-wide options to localStorage + saved-session TOML
-    │   ├── DatasetManagerPopover.ts  PR 5 — popover anchored to the Datasets toolbar button;
-    │   │                          reference + per-source binding checkboxes + per-source remove
-    │   │                          + inline "Add dataset" form (calls POST /api/sessions/{id}/sources)
-    │   ├── OptionsPopover.ts      PR 6 — toolbar Options popover; browser-wide preferences
-    │   │                          (v1: "Clip SVG export to viewport"); persists to
-    │   │                          localStorage["constellation.genome.options.<sid>"] + PATCH layout
-    │   ├── TrackSettingsPanel.ts  PR 6 — per-track gear popover; three sections (General / Style /
-    │   │                          Filter) keyed off the kernel `kind`; pickers for color / font /
-    │   │                          opacity / row-height bounds / dataset-slice filters (samples /
-    │   │                          modes / motifs / strands / min-thresholds); reset-to-defaults
-    │   ├── PathInput.ts           editable path text box + "Browse…" button (the hybrid path
-    │   │                          widget every form drops in); onChange + onCommit callbacks
+    │   ├── export.ts              composite-SVG serializer + download
+    │   └── popover.ts             attachDismiss (outside click / Escape) + positionBelowRight
+    ├── panels/                    modality-neutral panel chrome
+    │   ├── Panel.ts               one panel: header (grip / collapse / label / status / gear /
+    │   │                          hide), body, resize handle; its layout state and the last
+    │   │                          data it was drawn from
+    │   ├── PanelStack.ts          a vertical, reorderable stack of panels: order, drag-reorder,
+    │   │                          resize, hide / collapse, gear popover, restyle-vs-refetch,
+    │   │                          status line, debounced persistence, the serial render loop.
+    │   │                          Driven by its host through `PanelDriver`
+    │   ├── kind.ts                `PanelKind` — what a kind declares: order, unit, pushdown
+    │   │                          encoders, settings schema
+    │   ├── layout.ts              the persisted `LayoutEntry`, apply / merge-after-reload /
+    │   │                          reorder, and the single-writer `LayoutStore`
+    │   │                          (localStorage + saved-session PATCH)
+    │   ├── settings_schema.ts     the declarative control vocabulary: number / text / select /
+    │   │                          toggle / allow-list / palette / note, with values that may be
+    │   │                          functions of `{meta, style, filter, host}`
+    │   ├── SettingsPanel.ts       renders a schema as the gear popover
+    │   ├── OptionsPopover.ts      toolbar Options popover (v1: "Clip SVG export to viewport")
+    │   ├── style.ts               pick*(style|filter, key, fallback) coercion helpers
+    │   └── panels.css             panel chrome + the two popovers
+    ├── widgets/                   reusable inputs
+    │   ├── PathInput.ts           editable path text box + "Browse…" button; onChange + onCommit
     │   ├── FilePicker.ts          directory/file browser popover over GET /api/fs/list; roots
     │   │                          dropdown + breadcrumb + dir-first list; dir/file/either modes
     │   │                          (new-subfolder name for output dirs — never mkdir's on disk)
-    │   ├── FilePicker.css         PathInput row + .file-picker-popover chrome (NOT scoped under
-    │   │                          .genome-browser-root — also renders in the dashboard CommandForm)
-    │   └── GenomeBrowser.css      widget + popover styles scoped under .genome-browser-root
-    │                              / .dataset-popover / .options-popover / .track-settings-popover
-    └── dashboard/                 dashboard-only (PR 2 + PR 3)
+    │   └── FilePicker.css         PathInput row + .file-picker-popover chrome
+    │
+    │   ── one folder per modality: may import the layers above, never another modality ──
+    ├── modalities/genome/
+    │   ├── GenomeBrowser.ts       session, locus, toolbar, overview bar, ruler, feature search,
+    │   │                          SVG export; composes a PanelStack and implements its driver
+    │   │                          (fetch a track for a locus; draw it with the kind's renderer)
+    │   ├── GenomeBrowserForm.ts   reference-cache-first multi-row entry form
+    │   ├── DatasetManagerPopover.ts  reference + per-source binding checkboxes, per-source
+    │   │                          remove, inline "Add dataset" form
+    │   ├── viewport_bus.ts        ViewportBus (locus events)
+    │   ├── interactions.ts        wheel / drag pan-zoom into the bus
+    │   ├── scales.ts              d3-scale + d3-axis wrappers, bp formatting
+    │   ├── types.ts               wire shapes of the genome session endpoints
+    │   ├── genome.css             the browser's own chrome, scoped under .genome-browser-root
+    │   ├── renderers/
+    │   │   ├── base.ts            TrackRenderer = PanelKind + render(table, mode, ctx)
+    │   │   ├── index.ts           kind → renderer registry
+    │   │   ├── <kind>.ts          one per Python kernel: DEFAULTS, settings schema, drawing
+    │   │   ├── _alignment_view.ts alignment-row drawing + its controls, shared by read_pileup
+    │   │   │                      and cluster_pileup's members view
+    │   │   ├── pushdown.ts        encoders for the server-side filters
+    │   │   └── settings_common.ts schema helpers the kinds share
+    │   └── __fixtures__/          test-only: kernel-generated Arrow fixtures (`data/*.arrow`),
+    │                              their loaders, and the in-memory fake server
+    │
+    └── dashboard/                 the shell; names a modality only in viz_registry.ts
         ├── DashboardShell.ts      DockviewComponent owner; two panel kinds (welcome, task)
         │                          + persistent sidebar rail mount + collapse toggle
         ├── TaskPanel.ts           single-panel phase machine (form → terminal | viz)
         ├── Sidebar.ts             Common ↔ All toggle, search, command tree
         ├── CommandForm.ts         schema-driven argv constructor; onJobStarted callback
         ├── VizForm.ts             descriptor-driven simple form for viz tools
-        ├── GenomeBrowserForm.ts   reference-cache-first multi-row entry form
         ├── viz_registry.ts        per-viz-tool descriptors (currently viz/genome)
         ├── Terminal.ts            xterm.js wrapping the /api/commands/{id}/stream WS
         ├── StatusBar.ts           polls /api/commands/active; toast on lock rejection
@@ -302,20 +328,34 @@ constellation/viz/frontend/
         └── types.ts               TS mirror of introspect/schema.py TypedDicts
 ```
 
+**A host's side of `panels/`** — everything the generic layer asks of a browser:
+
+```ts
+interface PanelView { key: string; widthPx: number }        // extend with a locus, a time window, …
+interface PanelDriver<V extends PanelView, D> {
+  view(): V | null;                                          // null = nothing to show yet
+  fetch(panel: Panel<D>, view: V, signal: AbortSignal): Promise<D>;
+  draw(panel: Panel<D>, data: D, view: V, svg: SVGSVGElement,
+       size: { widthPx: number; heightPx: number }): number; // items drawn, for the status line
+}
+```
+
+plus `kindOf(kind)` returning each kind's `PanelKind`, a `LayoutStore`, and two notifications (`requestRender`, `onChanged`). The view is taken once per render so every panel of a pass is fetched and drawn for the same one, and `key` is what cached data is checked against before a redraw.
+
 ## Dashboard frontend (`frontend/src/dashboard/`, PR 2 + PR 3)
 
 The dashboard SPA is vanilla TypeScript (no React) — same paradigm as the PR 1 genome browser. Layout uses dockview-core's `DockviewComponent` for splittable docking; xterm.js renders subprocess output.
 
 | File | Role |
 |---|---|
-| `types.ts` | TypeScript mirror of `introspect/schema.py` TypedDicts (`CliSchema`, `CommandSchema`, `ArgumentSchema`) + the `/api/commands` wire shapes. |
-| `state.ts` | `DashboardState` event bus (mirrors `engine/viewport_bus.ts` from PR 1) + `getStored`/`setStored` localStorage helpers namespaced under `constellation.dashboard.*`. |
+| `types.ts` | TypeScript mirror of `introspect/schema.py` TypedDicts (`CliSchema`, `CommandSchema`, `ArgumentSchema`) + the `/api/commands` wire shapes + `InstalledReference` (`/api/references`, read by `CommandForm` for any reference-handle argument). A browser's own session shapes live with it (`modalities/genome/types.ts`). |
+| `state.ts` | `DashboardState` event bus (same pattern as the genome browser's `viewport_bus.ts`) + `getStored`/`setStored` localStorage helpers namespaced under `constellation.dashboard.*`. |
 | `Sidebar.ts` | Mode-switch toggle (Common ↔ All — state persisted), search filter, tree of commands; clicking a leaf emits `command:open`. Public `setMode(mode)` / `focusSearch()` / `getMode()` are called by `DashboardShell` from the collapsed-rail shortcut buttons (PR 7). Mounts into a host element (`#shell-sidebar-body` in the dashboard) — no longer a dockview panel as of PR 7. |
-| `viz_registry.ts` | Per-viz-tool descriptors. Two flavours: simple-form descriptors (`{path, label, fields, open}`) render through `VizForm`; rich descriptors set `customForm: (ctx) => CustomFormHandle` to mount their own UI (used by the genome browser entry — see `GenomeBrowserForm.ts`). `findVizDescriptor(path)` resolves sidebar paths starting with `['viz', …]`. New viz tools land as one entry, no shell changes. PR 5 — the genome descriptor's `onSubmit` receives an `initialLayout: TrackLayoutEntry[] \| null` (populated when the form loaded from a saved session) and forwards it to `new GenomeBrowser({ ..., initialLayout })`. |
+| `viz_registry.ts` | Per-viz-tool descriptors. Two flavours: simple-form descriptors (`{path, label, fields, open}`) render through `VizForm`; rich descriptors set `customForm: (ctx) => CustomFormHandle` to mount their own UI (used by the genome browser entry — see `GenomeBrowserForm.ts`). `findVizDescriptor(path)` resolves sidebar paths starting with `['viz', …]`. New viz tools land as one entry, no shell changes. PR 5 — the genome descriptor's `onSubmit` receives an `initialLayout: LayoutEntry[] \| null` (populated when the form loaded from a saved session) and forwards it to `new GenomeBrowser({ ..., initialLayout })`. |
 | `TaskPanel.ts` | Single panel owner. `mount(host, init)` renders phase 1 (`CommandForm` for compute, `VizForm` or descriptor `customForm` for viz). On Run, `CommandForm`'s `onJobStarted` callback transitions the panel to a `TerminalPanel`; on Open, the form invokes `transitionToWidget(mount)` and the panel hosts the widget. dockview-core's `dispose` hook tears down whichever child is active. |
-| `GenomeBrowserForm.ts` | Reference-cache-first entry form for the genome browser. Loads `GET /api/references` into a dropdown (with a "Add new genome…" link that emits `command:open` for `reference fetch` in a sibling tab, and a "Refresh catalog" button that POSTs `argv=['catalog','update','--source','all']` to `/api/commands`), renders a repeating list of source rows (each `change` hits `POST /api/sessions/inspect-source` for kind + assembly mismatch detection), and a "Save as…" input that persists the configuration to `~/.constellation/sessions/<slug>.toml` via `POST /api/saved-sessions` on submit. Submit POSTs to `/api/sessions/open` and mounts `GenomeBrowser` on the task panel's host. PR 5 — when the user loads a saved session, the form captures `payload.track_layout` and passes it as the third arg to `onSubmit(result, saved, initialLayout)` so the mounted `GenomeBrowser` can restore per-binding visibility / order / height / collapsed state. |
+| `../modalities/genome/GenomeBrowserForm.ts` | (Lives with the genome modality; listed here because the task panel hosts it.) Reference-cache-first entry form for the genome browser. Loads `GET /api/references` into a dropdown (with a "Add new genome…" link that emits `command:open` for `reference fetch` in a sibling tab, and a "Refresh catalog" button that POSTs `argv=['catalog','update','--source','all']` to `/api/commands`), renders a repeating list of source rows (each `change` hits `POST /api/sessions/inspect-source` for kind + assembly mismatch detection), and a "Save as…" input that persists the configuration to `~/.constellation/sessions/<slug>.toml` via `POST /api/saved-sessions` on submit. Submit POSTs to `/api/sessions/open` and mounts `GenomeBrowser` on the task panel's host. PR 5 — when the user loads a saved session, the form captures `payload.track_layout` and passes it as the third arg to `onSubmit(result, saved, initialLayout)` so the mounted `GenomeBrowser` can restore per-binding visibility / order / height / collapsed state. |
 | `CommandForm.ts` | JSON-schema-driven form generator. Buckets args into Required / Optional / Advanced (heuristic on dest); validates required-but-empty + numeric type mismatches; assembles `argv` and POSTs to `/api/commands`. On 200, invokes the host-provided `onJobStarted({jobId, argv})` callback (no broadcast through `DashboardState`). On 409, surfaces the error inline. |
-| `VizForm.ts` | Renders a simple-form descriptor's `fields` list; `remember: true` fields recall from `localStorage` under `constellation.dashboard.viz.<name>`. Submit calls `descriptor.open(host, values)` via the task panel. Descriptors that need richer UI (e.g. the genome browser's multi-row form) skip VizForm via `customForm` instead. |
+| `VizForm.ts` | Renders a simple-form descriptor's `fields` list; `remember: true` fields recall from `localStorage` under `constellation.dashboard.viz.<tool>.<field>` (`<tool>` = the descriptor's command path without its leading `viz`; a value under the older shared `constellation.dashboard.viz.<field>` key is read as a fallback). Submit calls `descriptor.open(host, values)` via the task panel. Descriptors that need richer UI (e.g. the genome browser's multi-row form) skip VizForm via `customForm` instead. |
 | `Terminal.ts` | xterm.js + `@xterm/addon-fit` wrapping a WS to `/api/commands/{id}/stream`. Frames are newline-delimited JSON `{stream, line}`; stderr renders red; the final `{stream:'exit',line:N}` frame closes the timer. |
 | `StatusBar.ts` | Polls `/api/commands/active` every 2s; emits `job:active`. Toasts on `job:rejected`. |
 | `DashboardShell.ts` | Owns the `DockviewComponent` for the right-hand workspace and the persistent left rail outside dockview. dockview-core 3.x uses a `createComponent(opts)` factory (not a `components: {name: Class}` map); we switch on `opts.name` to instantiate the right renderer. PR 7 dropped the `sidebar` factory case — the rail is no longer a dockview panel — leaving two kinds: `welcome` + `task` (always backed by `TaskPanel`). The rail (`#shell-sidebar`) toggles between 280 px expanded / 48 px collapsed via the logo header; collapse state persists at `localStorage["constellation.dashboard.sidebar.collapsed.v1"]`. Workspace layout persists at `localStorage["constellation.dashboard.layout.v2"]` (bumped from `.v1` when the sidebar moved out — stale v1 blobs that referenced a `sidebar` panel are ignored on read). When collapsed, the rail surfaces ★ Common / ☰ All / ⌕ Search shortcut buttons that expand the sidebar and set the relevant mode / focus the search input via `Sidebar.setMode()` / `Sidebar.focusSearch()`. |
@@ -324,22 +364,20 @@ dockview-core theming uses ~40 `--dv-*` CSS variables; v1 ships the dark theme a
 
 ## Known issues
 
-Found while writing the characterization tests; each is pinned as current behavior so it cannot change by accident. The first five are scheduled as explicit "parity exceptions" in [docs/plans/viz-modality-generalization.md](../../docs/plans/viz-modality-generalization.md).
+Found while writing the characterization tests and doing the modality work. None is fixed; the first two are pinned as current behavior by tests so they cannot change by accident. (Six others found the same way were fixed as the plan's "parity exceptions" — see [docs/plans/viz-modality-generalization.md](../../docs/plans/viz-modality-generalization.md).)
 
-- **Mode / motif pickers ignore the data.** `TrackSettingsPanel` reads `meta.modes` / `meta.motifs`, but the kernels send `modes_in_data` / `motifs_in_data`, so the hard-coded fallback lists always win.
-- **Controls nothing reads.** The General section's Opacity and "Show legend / labels", and the `palette.default` rows for `gene_annotation` and `read_pileup`, are not read by any renderer. The two label-font rows are read only by `gene_annotation`.
-- **`cluster_pileup` members view** draws with the alignment helper's keys and defaults (row height 2 / 8), while the popover shows the clusters-view controls (4 / 10).
-- **"Show labels" checkbox** always shows ticked when unset, though the renderer then follows the toolbar Labels toggle.
-- **Listeners outlive `dispose()`** — the search control's document `mousedown`, the overview's window `mousemove` / `mouseup`, and the bus subscriptions.
-- **"Visible sources" filter matches the wrong thing.** The popover offers `reference` / `derived`, but the renderer compares against each feature's own `source` column (the GFF source, e.g. `RefSeq`). Unticking either box hides every feature whose source column is non-empty. Not yet scheduled.
-- **Duplicate `display_order` after adding a source.** `computeInsertOrder` shifts not-yet-restored siblings, so the persisted layout can carry ties (e.g. `0,1,2,3,3,4,4,5`). The on-screen order is still right because the sort is stable over the track list. Not yet scheduled.
+- **"Visible sources" filter matches the wrong thing.** The `gene_annotation` popover offers `reference` / `derived`, but the renderer compares against each feature's own `source` column (the GFF source, e.g. `RefSeq`). Unticking either box hides every feature whose source column is non-empty.
+- **Duplicate `display_order` after adding a source.** `computeInsertOrder` shifts not-yet-restored siblings, so the persisted layout can carry ties (e.g. `0,1,2,3,3,4,4,5`). The on-screen order is still right because the sort is stable over the panel list.
 - **Default swatch can differ from the drawn colour.** The popover indexes the colour cycle by position in the metadata list; the renderers by encounter order in the current window. Left alone deliberately: fixing it changes drawn output.
 - **Saved `[options]` are write-only**, and `_normalize_options` keeps only `clip_svg`.
-- **`max_glyphs`** was removed from the query (no kernel read it, no client sent it), but `engine/arrow_client.ts` still has the optional parameter; the server ignores it. Goes with the frontend factoring.
+- **The members view counts reads as clusters.** In `cluster_pileup`'s members view the status line reads "showing N clusters" where N is the number of member reads drawn; a kind's unit is one fixed pair.
+- **A cluster source repeats its align source's tracks.** `_attach_align_slots_from_cluster` copies every align slot through the cluster manifest's `align_dir` back-reference (its docstring names four), so attaching an align dir and the cluster dir built from it lists coverage, reads and splice junctions once per source.
+- **Clearing a number field stores 0** (`Number('') === 0`) instead of removing the key; a text field removes it.
+- **Knobs with no control.** The drawing code reads `letter_font_family` (reference_sequence), `strand_chevron_min_width_px` (gene_annotation), `palette.exon` (read_pileup), `palette.default` (splice_junctions, for junctions with no motif), and per-cluster colours and `visible_clusters` in the members view; no popover offers them. They can only be set by editing a saved session.
 
 ## What's deferred (later)
 
-- **More kernel-pushdown filters** — `min_mapq` and `cluster_view` are pushed down today (see invariant 10). Still client-side or absent: a supplementary-flag toggle on `read_pileup`, and anything that affects row-packing or the top-N truncation on `splice_junctions`. Each needs a field on the kernel's query model, `fetch()` predicate plumbing, and an entry in `PUSHDOWN_FILTER_KEYS`.
+- **More kernel-pushdown filters** — `min_mapq` and `cluster_view` are pushed down today (see invariant 10). Still client-side or absent: a supplementary-flag toggle on `read_pileup`, and anything that affects row-packing or the top-N truncation on `splice_junctions`. Each needs a field on the kernel's query model, `fetch()` predicate plumbing, and an entry in the renderer's `pushdown` map.
 - **anywidget / Jupyter mount** — designed (invariant 5), never built.
 - **Source-grouped layout option** — current rendering is kind-grouped (all coverage rows together, then all pileup rows, etc.), then fully user-reorderable. A toggle to switch the default to source-grouped (all of sample-A's tracks together, then sample-B's) was discussed and deferred — drag-to-reorder already gives users the manual escape hatch.
 - **Per-track Options follow-ons** — the PR 6 Options dropdown currently holds one toggle (clip SVG export). Natural future occupants without dedicated UI today: default label-visibility, axis-font globals, color-blind palette swap. Each lands as one new row in `OptionsPopover.build()` plus an entry in the `BrowserOptions` interface.
@@ -347,8 +385,8 @@ Found while writing the characterization tests; each is pinned as current behavi
 - **File picker follow-ons** — the shipped `widgets/FilePicker.ts` + `widgets/PathInput.ts` (over `GET /api/fs/list`) replace every plain-text path box across the GUI (auto-introspected `CommandForm` `path` args, `GenomeBrowserForm` source rows, the Datasets "Add dataset" form, `VizForm` path fields). Deferred: retrofitting the existing unsandboxed path-reading endpoints (`/api/sessions/inspect-source`, `/api/sessions/open`) onto the same `_resolve_within_roots` sandbox; a picker that can `mkdir` (kept read-only by design — the CLI creates output dirs); and converting `--reads` into repeating `PathInput` rows (kept as a textarea + Browse-to-append to avoid touching argv assembly).
 - Desktop shortcut generator (`constellation install-shortcut` writing `.desktop` / `.lnk` / `.app`).
 - Advanced-search column picker — v1 `/api/sessions/{id}/search` hardcodes `(table=annotation, column=name)`; v2 will accept `table`/`column` query params and a Basic ↔ Advanced toggle in the toolbar dropdown.
-- Frontend render-pileup guard — concurrent `render()` calls in `GenomeBrowser.ts` are not currently guarded by a generation counter. The 60 ms debounce + per-track AbortController cover the common case; needed if/when a fetchTrackData call takes longer than one user-pan cadence.
-- Cross-modality coordination types (Vitessce-style; lands once a non-genome modality kernel exists). `ViewportBus` declares a `selection:feature` event, but nothing emits or subscribes to it today, and each `GenomeBrowser` owns a private bus.
+- Frontend render guard and fetch scheduling — concurrent `PanelStack.render()` calls are not guarded by a generation counter, and panels are fetched one after another. The host's 60 ms debounce + per-panel AbortController cover the common case. Parallel fetch, a client cache with overscan, and server-side decimation all replace that one method; they are planned with the mass-spec browser, which needs them.
+- Cross-panel and cross-modality coordination (Vitessce-style; lands once a non-genome modality exists). `ViewportBus` declares a `selection:feature` event, but nothing emits or subscribes to it today, and each `GenomeBrowser` owns a private bus. Not built yet either: generic (non-locus) axes and y-axes, a selection bus, a grid container beside `PanelStack`, and export for anything but a vertical stack.
 - Spectrum / structure / phylogeny / NN-activation kernels (separate PRs).
 - proBAM / proBED emission (deferred per the project-wide note pending the genome→proteome bridge work).
 
