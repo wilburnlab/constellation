@@ -1,7 +1,8 @@
 // VizForm — phase-1 form for visualization task panels.
 //
 // Renders the descriptor's fields, recalls `remember:true` fields from
-// localStorage, and invokes the provided onSubmit on confirm.
+// localStorage (per tool, so two tools with a field of the same name do
+// not overwrite each other), and invokes the provided onSubmit on confirm.
 // onSubmit is responsible for mounting the actual widget (the task
 // panel passes its own host element + a transition callback).
 
@@ -72,7 +73,7 @@ export class VizForm {
 
       const initial =
         this.prefill[field.name] ??
-        (field.remember ? readStored(field.name) : '');
+        (field.remember ? readStored(this.descriptor, field.name) : '');
 
       if (
         field.kind === 'path' ||
@@ -160,7 +161,7 @@ export class VizForm {
       }
     }
     for (const field of fields) {
-      if (field.remember) writeStored(field.name, values[field.name]);
+      if (field.remember) writeStored(this.descriptor, field.name, values[field.name]);
     }
     this.showError('');
     this.submitBtn.disabled = true;
@@ -187,17 +188,30 @@ export class VizForm {
   }
 }
 
-function readStored(name: string): string {
+/** `constellation.dashboard.viz.<tool>.<field>`, where `<tool>` is the
+ *  descriptor's command path without its leading `viz`. */
+function storageKey(descriptor: VizDescriptor, name: string): string {
+  const path = descriptor.path[0] === 'viz' ? descriptor.path.slice(1) : descriptor.path;
+  return `${STORAGE_PREFIX}${path.join('.')}.${name}`;
+}
+
+function readStored(descriptor: VizDescriptor, name: string): string {
   try {
-    return window.localStorage.getItem(STORAGE_PREFIX + name) ?? '';
+    // Values remembered before keys were per tool sit under the bare
+    // field name; they are read as a fallback and never written again.
+    return (
+      window.localStorage.getItem(storageKey(descriptor, name)) ??
+      window.localStorage.getItem(STORAGE_PREFIX + name) ??
+      ''
+    );
   } catch {
     return '';
   }
 }
 
-function writeStored(name: string, value: string): void {
+function writeStored(descriptor: VizDescriptor, name: string, value: string): void {
   try {
-    window.localStorage.setItem(STORAGE_PREFIX + name, value);
+    window.localStorage.setItem(storageKey(descriptor, name), value);
   } catch {
     /* ignore — private mode etc. */
   }

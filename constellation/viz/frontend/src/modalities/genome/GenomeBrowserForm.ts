@@ -17,15 +17,14 @@
 // "Load saved session…" populates every field from a previously saved
 // configuration in one click.
 
-import { CommandSchema } from '../../dashboard/types';
+import type { CommandSchema, InstalledReference } from '../../dashboard/types';
+import type { LayoutEntry } from '../../panels/layout';
 import type {
-  InstalledReference,
   OpenSessionResult,
   SavedSessionPayload,
   SavedSessionSummary,
   SourceInspection,
-  TrackLayoutEntry,
-} from '../../dashboard/types';
+} from './types';
 import { DashboardState } from '../../dashboard/state';
 import { PathInput } from '../../widgets/PathInput';
 
@@ -42,7 +41,7 @@ export interface GenomeBrowserFormOptions {
   onSubmit: (
     result: OpenSessionResult,
     saved: SavedSessionSummary | null,
-    initialLayout: TrackLayoutEntry[] | null,
+    initialLayout: LayoutEntry[] | null,
   ) => Promise<void>;
 }
 
@@ -57,7 +56,7 @@ export class GenomeBrowserForm {
   private sources: SourceRow[] = [{ path: '', kind: '', label: '', warning: null, error: null }];
   private selectedReference: string = '';
   private saveAs: string = '';
-  private loadedTrackLayout: TrackLayoutEntry[] | null = null;
+  private loadedTrackLayout: LayoutEntry[] | null = null;
   private errorBanner: HTMLElement | null = null;
   private submitBtn: HTMLButtonElement | null = null;
   private referenceSelect: HTMLSelectElement | null = null;

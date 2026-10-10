@@ -82,7 +82,10 @@ export interface OutputFrame {
 }
 
 // ---------------------------------------------------------------------
-// Reference cache + session entry endpoints
+// Reference cache — GET /api/references. Read by the shell itself: any
+// command form whose argument is a reference handle offers the installed
+// ones. (A browser's own session shapes live with that browser, under
+// modalities/<name>/.)
 // ---------------------------------------------------------------------
 
 export interface InstalledReference {
@@ -99,62 +102,4 @@ export interface InstalledReference {
   size_bytes: number | null;
   scientific_name: string | null;
   is_default: boolean;
-}
-
-export interface SourceInspection {
-  path: string;
-  kind: 'align' | 'cluster';
-  reference_handle: string | null;
-  reference_path: string | null;
-  assembly_accession: string | null;
-  samples: string[];
-}
-
-export interface OpenSessionResult {
-  session_id: string;
-  label: string;
-  reference_handle: string;
-  reference_path: string;
-  n_sources: number;
-  stages_present: Record<string, boolean>;
-  warnings: string[];
-  saved_as: string | null;
-}
-
-export interface SavedSessionSummary {
-  slug: string;
-  /** Which browser the configuration is for. Absent on responses from a
-   *  server that predates modalities, where every session is a genome one. */
-  modality?: string;
-  label: string;
-  reference_handle: string;
-  n_sources: number;
-  saved_at: string;
-  last_viewed_locus: { contig: string; start: number; end: number } | null;
-}
-
-export interface TrackLayoutEntry {
-  source_id: string;
-  kind: string;
-  visible: boolean;
-  display_order: number;
-  height_px: number;
-  collapsed: boolean;
-  /** Per-binding visual style overrides — opaque to the layout type,
-   *  interpreted by each kernel's renderer. */
-  style?: Record<string, unknown>;
-  /** Per-binding dataset-slice filters — opaque to the layout type,
-   *  interpreted by each kernel's renderer. */
-  filter?: Record<string, unknown>;
-}
-
-/** Browser-wide options persisted alongside per-track layout. */
-export interface BrowserOptions {
-  clip_svg: boolean;
-}
-
-export interface SavedSessionPayload extends SavedSessionSummary {
-  sources: Array<{ path: string; kind: string; label: string }>;
-  track_layout?: TrackLayoutEntry[];
-  options?: BrowserOptions;
 }
