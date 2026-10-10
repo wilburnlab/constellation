@@ -39,10 +39,10 @@ from fastapi.staticfiles import StaticFiles
 # registration via @register_track. Without this the /api/tracks
 # endpoints would return an empty list.
 import constellation.viz  # noqa: F401
+from constellation.viz.modalities import get_modality, registered_modalities
 from constellation.viz.server.endpoints import cli_schema as cli_schema_ep
 from constellation.viz.server.endpoints import commands as commands_ep
 from constellation.viz.server.endpoints import fs as fs_ep
-from constellation.viz.server.endpoints import references as references_ep
 from constellation.viz.server.endpoints import saved_sessions as saved_sessions_ep
 from constellation.viz.server.endpoints import sessions as sessions_ep
 from constellation.viz.server.endpoints import tracks as tracks_ep
@@ -128,8 +128,13 @@ def create_app(
 
     app.include_router(sessions_ep.router)
     app.include_router(tracks_ep.router)
-    app.include_router(references_ep.router)
     app.include_router(saved_sessions_ep.router)
+    # Each modality contributes its own routes (the genome browser's
+    # contigs / feature search / reference list). The factory imports its
+    # FastAPI module here, not when the modality registered.
+    for name in registered_modalities():
+        for modality_router in get_modality(name).routers():
+            app.include_router(modality_router)
     app.include_router(cli_schema_ep.router)
     app.include_router(commands_ep.router)
     app.include_router(fs_ep.router)

@@ -158,6 +158,11 @@ class TrackKernel(ABC):
     #: Short string identifier — must be unique across registered kernels.
     kind: ClassVar[str]
 
+    #: Registry key of the modality this kernel belongs to
+    #: (``constellation.viz.modalities``). A kernel is only ever asked
+    #: about sessions of its own modality.
+    modality: ClassVar[str]
+
     #: Vector-mode wire schema. Hybrid mode always uses `HYBRID_SCHEMA`.
     schema: ClassVar[pa.Schema]
 
@@ -248,6 +253,11 @@ def register_track(cls: type[TrackKernel]) -> type[TrackKernel]:
         raise TypeError(f"{cls.__name__} must set a non-empty `kind` class attribute")
     if cls.kind in _REGISTRY:
         raise ValueError(f"track kernel {cls.kind!r} already registered")
+    modality = getattr(cls, "modality", None)
+    if not isinstance(modality, str) or not modality:
+        raise TypeError(
+            f"{cls.__name__} must set a non-empty `modality` class attribute"
+        )
     _REGISTRY[cls.kind] = cls()
     return cls
 

@@ -325,7 +325,7 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
     from constellation.viz.server.app import create_app
     from constellation.viz.modalities.genome.session import (
         GenomeSession,
-        _from_saved_session,
+        session_from_saved,
     )
     from constellation.viz.sessions import read_saved
 
@@ -352,7 +352,7 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         try:
-            session = _from_saved_session(saved)
+            session = session_from_saved(saved)
         except ValueError as exc:
             print(f"error opening saved session: {exc}", file=sys.stderr)
             return 1

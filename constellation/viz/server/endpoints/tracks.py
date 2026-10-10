@@ -40,9 +40,15 @@ router = APIRouter(prefix="/api/tracks", tags=["tracks"])
 def _bindings_for(
     session: SessionLike, kind: str, cache: dict[tuple[str, str], list[TrackBinding]]
 ) -> list[TrackBinding]:
+    kernel = get_kernel(kind)
+    # A kernel only understands sessions of its own modality: it reads
+    # modality-specific attributes off the session in ``discover``. For
+    # any other session it simply has no bindings, on every route.
+    if kernel.modality != session.modality:
+        return []
     key = (session.session_id, kind)
     if key not in cache:
-        cache[key] = get_kernel(kind).discover(session)
+        cache[key] = kernel.discover(session)
     return cache[key]
 
 

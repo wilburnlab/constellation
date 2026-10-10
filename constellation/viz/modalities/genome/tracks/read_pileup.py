@@ -92,6 +92,7 @@ class ReadPileupKernel(TrackKernel):
     """Per-read pileup track with CIGAR-aware block geometry."""
 
     kind = "read_pileup"
+    modality = "genome"
     schema = READ_PILEUP_VECTOR_SCHEMA
 
     # Hybrid threshold defaults — calibrated against typical workstation

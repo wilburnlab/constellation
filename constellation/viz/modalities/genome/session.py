@@ -9,7 +9,7 @@ browser's entry form always picks a reference first and then adds zero
 or more sources keyed to it.
 
 Sessions are constructed exclusively via :meth:`GenomeSession.open`
-(handle + list-of-sources); :func:`_from_saved_session` adapts a
+(handle + list-of-sources); :func:`session_from_saved` adapts a
 saved-session TOML from ``~/.constellation/sessions/`` onto it. The
 legacy ``from_root`` / directory-walk discovery / ``session.toml`` v1
 reader were removed in the reference-cache-first cutover — the
@@ -519,7 +519,37 @@ def _resolve_slot(base: Path, rel: str) -> Path | None:
 # ----------------------------------------------------------------------
 
 
-def _from_saved_session(saved: Any, *, cache_root: Path | None = None) -> GenomeSession:
+def inspect_source(path: Path) -> dict[str, Any]:
+    """Describe a candidate source directory for the entry form.
+
+    Reads the directory's ``manifest.json`` and returns its kind plus the
+    reference it was produced against, so the form can auto-detect the
+    kind and warn about a reference mismatch before the user submits.
+    Raises ``ValueError`` when the directory is not an ``align`` /
+    ``cluster`` output.
+    """
+    from constellation.sequencing.transcriptome.manifest import (
+        read_manifest_dir,
+    )
+
+    manifest = read_manifest_dir(path)
+    if manifest.kind == "demux":
+        raise ValueError(
+            f"{path} is a `transcriptome demultiplex` output; the "
+            "genome browser attaches `transcriptome align` or "
+            "`transcriptome cluster` output dirs"
+        )
+    return {
+        "path": str(path.resolve()),
+        "kind": manifest.kind,
+        "reference_handle": manifest.reference_handle,
+        "reference_path": getattr(manifest, "reference_path", None),
+        "assembly_accession": manifest.assembly_accession,
+        "samples": list(manifest.samples or ()),
+    }
+
+
+def session_from_saved(saved: Any, *, cache_root: Path | None = None) -> GenomeSession:
     """Construct a GenomeSession from a SavedSession dataclass.
 
     Used by the standalone ``constellation viz genome --saved-session``
@@ -550,4 +580,6 @@ def _stringify(p: Path | None) -> str | None:
 __all__ = [
     "GenomeSession",
     "GenomeSource",
+    "inspect_source",
+    "session_from_saved",
 ]

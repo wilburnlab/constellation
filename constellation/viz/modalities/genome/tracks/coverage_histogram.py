@@ -57,6 +57,7 @@ class CoverageHistogramKernel(TrackKernel):
     """Per-sample read-depth track."""
 
     kind = "coverage_histogram"
+    modality = "genome"
     schema = COVERAGE_VECTOR_SCHEMA
 
     # Coverage tracks are always vector; thresholds are unused but kept

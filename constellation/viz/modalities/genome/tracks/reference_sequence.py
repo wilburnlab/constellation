@@ -72,6 +72,7 @@ class ReferenceSequenceKernel(TrackKernel):
     """Per-base reference-sequence track."""
 
     kind = "reference_sequence"
+    modality = "genome"
     schema = REFERENCE_SEQUENCE_VECTOR_SCHEMA
 
     # ~5kb of letters before decimation kicks in. The renderer uses

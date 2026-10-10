@@ -59,6 +59,7 @@ class GeneAnnotationKernel(TrackKernel):
     """GFF3-shaped feature-annotation track."""
 
     kind = "gene_annotation"
+    modality = "genome"
     schema = GENE_ANNOTATION_VECTOR_SCHEMA
 
     # Soft cap: when a window contains more features than this, the

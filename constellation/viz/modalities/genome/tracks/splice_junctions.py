@@ -51,6 +51,7 @@ class SpliceJunctionsKernel(TrackKernel):
     """Splice-junction arcs."""
 
     kind = "splice_junctions"
+    modality = "genome"
     schema = SPLICE_JUNCTIONS_VECTOR_SCHEMA
 
     # Soft cap on visible junctions. When exceeded, the kernel keeps

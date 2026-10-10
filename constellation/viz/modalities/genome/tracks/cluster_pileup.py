@@ -98,6 +98,7 @@ class ClusterPileupKernel(TrackKernel):
     """Per-cluster pile-up track with opt-in member-read expansion."""
 
     kind = "cluster_pileup"
+    modality = "genome"
     schema = CLUSTER_PILEUP_VECTOR_SCHEMA
 
     # Cluster counts are an order of magnitude smaller than read counts
