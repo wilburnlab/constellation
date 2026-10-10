@@ -277,6 +277,7 @@ import constellation.viz.modalities.genome.tracks.splice_junctions
 import constellation.viz.modalities.genome.tracks.read_pileup
 import constellation.viz.modalities.genome.tracks.cluster_pileup
 import constellation.viz.server
+import constellation.viz.server.session
 import constellation.viz.modalities.genome.session
 import constellation.viz.frontend
 import constellation.viz.frontend.build

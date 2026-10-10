@@ -19,10 +19,10 @@ Two views, switchable per binding via ``query.mode_extra['cluster_view']``:
   isoform-consistent reads. Members view is always vector (no hybrid)
   and capped at ``vector_glyph_limit``.
 
-The members view requires the cluster ``SessionSource`` to carry
+The members view requires the cluster ``GenomeSource`` to carry
 populated ``alignments`` + ``alignment_blocks`` + ``alignment_cs``
 slots; these are resolved from the cluster manifest's ``align_dir``
-back-pointer at Session load time. When unavailable (legacy clusters,
+back-pointer at session load time. When unavailable (legacy clusters,
 or future de-novo outputs that don't ride on genome alignments), the
 ``cluster_view_supported`` metadata flag is ``False`` and the gear
 popover hides the toggle.
@@ -38,7 +38,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 
-from constellation.viz.modalities.genome.session import Session
+from constellation.viz.modalities.genome.session import GenomeSession
 from constellation.viz.modalities.genome.tracks._alignment_view import (
     BLOCKS_LIST_TYPE,
     MISMATCH_POSITIONS_TYPE,
@@ -110,7 +110,7 @@ class ClusterPileupKernel(TrackKernel):
     # skipped and `mismatch_positions` is emitted empty.
     mismatch_glyph_bp_per_pixel_limit = 5.0
 
-    def discover(self, session: Session) -> list[TrackBinding]:
+    def discover(self, session: GenomeSession) -> list[TrackBinding]:
         if session.reference_genome is None:
             return []
         bindings: list[TrackBinding] = []

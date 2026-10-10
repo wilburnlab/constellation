@@ -29,7 +29,8 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from constellation.viz.server.endpoints.tracks import invalidate_binding_cache
-from constellation.viz.modalities.genome.session import Session
+from constellation.viz.modalities.genome.session import GenomeSession
+from constellation.viz.server.session import SessionLike
 
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -40,24 +41,11 @@ router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 # ----------------------------------------------------------------------
 
 
-def _summarize(session: Session) -> dict:
-    return {
-        "session_id": session.session_id,
-        "label": session.label,
-        "reference_handle": session.reference_handle,
-        "reference_path": str(session.reference_path),
-        "n_sources": len(session.sources),
-        "stages_present": session.stages_present(),
-        "warnings": list(session.warnings),
-        "saved_as": session.saved_as,
-    }
-
-
 @router.get("")
 def list_sessions(request: Request) -> list[dict]:
     """Return a small summary record per registered session."""
     sessions: dict = request.app.state.sessions
-    return [_summarize(s) for s in sessions.values()]
+    return [s.summary() for s in sessions.values()]
 
 
 # ----------------------------------------------------------------------
@@ -90,7 +78,7 @@ def open_session(body: OpenSessionRequest, request: Request) -> dict:
     block the open.
     """
     try:
-        session = Session.open(
+        session = GenomeSession.open(
             reference_handle=body.reference_handle,
             sources=[s.model_dump() for s in body.sources],
             label=body.label,
@@ -105,7 +93,7 @@ def open_session(body: OpenSessionRequest, request: Request) -> dict:
         request.app.state.track_bindings_cache, session.session_id
     )
 
-    return _summarize(session)
+    return session.summary()
 
 
 # ----------------------------------------------------------------------
@@ -121,15 +109,15 @@ class AddSourceRequest(BaseModel):
 
 def _sources_to_entries(sources: tuple) -> list[dict[str, Any]]:
     """Turn a session's frozen source tuple back into a list of input
-    dicts suitable for :meth:`Session.with_sources`."""
+    dicts suitable for the session's ``with_sources``."""
     return [
         {"path": str(src.path), "kind": src.kind, "label": src.label}
         for src in sources
     ]
 
 
-def _replace_session(request: Request, session: Session) -> None:
-    """Atomically install a rebuilt Session in the registry and evict
+def _replace_session(request: Request, session: SessionLike) -> None:
+    """Atomically install a rebuilt session in the registry and evict
     the per-kind binding cache for that ``session_id``."""
     request.app.state.sessions[session.session_id] = session
     invalidate_binding_cache(
@@ -145,7 +133,7 @@ def add_source(
 
     The source path's ``manifest.json`` supplies the kind + assembly
     automatically (mirrors ``POST /api/sessions/inspect-source``). The
-    session is rebuilt via :meth:`Session.with_sources`; the
+    session is rebuilt via its ``with_sources``; the
     ``session_id`` is preserved (deterministic over reference + label)
     so clients don't need to re-bind. The next ``GET /api/tracks?...``
     call returns the bindings for the new source.

@@ -21,7 +21,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from constellation.viz.modalities.genome.session import Session
+from constellation.viz.modalities.genome.session import GenomeSession
 from constellation.viz.tracks.base import (
     ThresholdDecision,
     TrackBinding,
@@ -58,7 +58,7 @@ class SpliceJunctionsKernel(TrackKernel):
     # rasterize an arc-density heatmap when the cap is hit; v1 punts.
     vector_glyph_limit = 1_500
 
-    def discover(self, session: Session) -> list[TrackBinding]:
+    def discover(self, session: GenomeSession) -> list[TrackBinding]:
         if session.reference_genome is None:
             return []
         bindings: list[TrackBinding] = []

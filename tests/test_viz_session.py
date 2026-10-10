@@ -286,26 +286,42 @@ def test_source_id_literal_values() -> None:
     saved-session TOMLs and the browser's ``localStorage`` layout. A change
     to the hash input or digest size orphans every saved layout, so the
     values are pinned literally rather than only checked for stability."""
-    from constellation.viz.modalities.genome.session import SessionSource
+    from constellation.viz.modalities.genome.session import GenomeSource
+    from constellation.viz.server.session import derive_source_id
 
-    def _source(path: str, kind: str) -> SessionSource:
-        return SessionSource(
-            path=Path(path),
-            kind=kind,  # type: ignore[arg-type]
-            label="ignored",
-            assembly_accession=None,
-            reference_handle=None,
-        )
+    assert derive_source_id(Path("/data/run1/align"), "align") == "src-585de6ec"
+    assert derive_source_id(Path("/data/run1/cluster"), "cluster") == "src-5783a900"
 
-    assert _source("/data/run1/align", "align").source_id == "src-585de6ec"
-    assert _source("/data/run1/cluster", "cluster").source_id == "src-5783a900"
+    # The genome source derives its id through the shared helper.
+    source = GenomeSource(
+        path=Path("/data/run1/align"),
+        kind="align",
+        label="ignored",
+        assembly_accession=None,
+        reference_handle=None,
+    )
+    assert source.source_id == "src-585de6ec"
 
 
 def test_session_id_literal_values() -> None:
     """``session_id`` names the ``localStorage`` layout/options keys and is
     preserved across ``with_sources`` rebuilds; pin the derivation."""
-    from constellation.viz.modalities.genome.session import _derive_session_id
+    from constellation.viz.server.session import derive_session_id
 
     release = Path("/refs/homo_sapiens/ensembl-111")
-    assert _derive_session_id(release, "My Run 2026") == "my-run-2026-d11f07d2"
-    assert _derive_session_id(release, "ensembl-111") == "ensembl-111-65b4a124"
+    assert derive_session_id(release, "My Run 2026") == "my-run-2026-d11f07d2"
+    assert derive_session_id(release, "ensembl-111") == "ensembl-111-65b4a124"
+
+
+def test_genome_session_satisfies_the_core_contract(tmp_path: Path, monkeypatch) -> None:
+    """The server core only ever touches what ``SessionLike`` names."""
+    session = build_viz_session(tmp_path, monkeypatch, align_sources=[{"coverage": []}])
+    assert session.modality == "genome"
+    assert session.summary()["modality"] == "genome"
+    assert session.to_manifest()["modality"] == "genome"
+    assert session.summary()["session_id"] == session.session_id
+    rebuilt = session.with_sources(
+        [{"path": str(s.path), "kind": s.kind} for s in session.sources]
+    )
+    assert rebuilt.session_id == session.session_id
+    assert [s.source_id for s in rebuilt.sources] == [s.source_id for s in session.sources]

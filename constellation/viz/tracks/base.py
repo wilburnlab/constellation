@@ -31,9 +31,12 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pyarrow as pa
+
+if TYPE_CHECKING:
+    from constellation.viz.server.session import SessionLike
 
 
 # ----------------------------------------------------------------------
@@ -164,7 +167,7 @@ class TrackKernel(ABC):
     vector_bp_per_pixel_limit: ClassVar[float] = 50.0
 
     @abstractmethod
-    def discover(self, session: "Session") -> list[TrackBinding]:  # noqa: F821
+    def discover(self, session: "SessionLike") -> list[TrackBinding]:
         """Return all renderable bindings this kernel can produce for the
         given session. Empty list when no relevant outputs are present."""
 
@@ -268,7 +271,7 @@ def registered_kinds() -> list[str]:
 
 
 def iter_sources_with(session, *attrs):
-    """Yield ``(index, SessionSource)`` for sources where every attribute
+    """Yield ``(index, source)`` for sources where every attribute
     in ``attrs`` resolves to a non-None Path.
 
     The index is used by kernels to make binding_ids deterministic

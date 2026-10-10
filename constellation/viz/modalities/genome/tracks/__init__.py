@@ -3,7 +3,7 @@
 Each module holds one kernel, self-registered via ``@register_track``;
 importing this package pulls them all in exactly once.
 
-Kernels (reading slot names per ``genome.session.SessionSource``):
+Kernels (reading slot names per ``genome.session.GenomeSource``):
 
 - ``reference_sequence`` — vector; one binding for the session's reference.
 - ``gene_annotation``    — vector; the reference annotation, plus one binding

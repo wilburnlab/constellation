@@ -20,7 +20,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from constellation.viz.server.arrow_stream import batches_to_response
-from constellation.viz.modalities.genome.session import Session
+from constellation.viz.server.session import SessionLike
 from constellation.viz.tracks.base import (
     ThresholdDecision,
     TrackBinding,
@@ -38,7 +38,7 @@ router = APIRouter(prefix="/api/tracks", tags=["tracks"])
 # Discovery is cheap (filesystem stat + small parquet reads) but bindings
 # carry resolved Path objects that don't need to be recomputed per query.
 def _bindings_for(
-    session: Session, kind: str, cache: dict[tuple[str, str], list[TrackBinding]]
+    session: SessionLike, kind: str, cache: dict[tuple[str, str], list[TrackBinding]]
 ) -> list[TrackBinding]:
     key = (session.session_id, kind)
     if key not in cache:
@@ -47,7 +47,7 @@ def _bindings_for(
 
 
 def _find_binding(
-    session: Session,
+    session: SessionLike,
     kind: str,
     binding_id: str,
     cache: dict[tuple[str, str], list[TrackBinding]],

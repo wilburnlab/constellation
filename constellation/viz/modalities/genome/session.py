@@ -1,26 +1,31 @@
-"""Session model for the viz layer.
+"""Genome-browser session.
 
-A ``Session`` binds one reference (resolved from the per-user reference
-cache) to a list of "result" directories the user wants to overlay onto
-that reference — outputs of ``constellation transcriptome align`` and/or
-``transcriptome cluster``. The reference cache (``handle.py``) is the
-canonical axis here; the genome browser dashboard always picks a
-reference first and then adds zero or more sources keyed to it.
+A ``GenomeSession`` binds one reference (resolved from the per-user
+reference cache) to a list of "result" directories the user wants to
+overlay onto that reference — outputs of ``constellation transcriptome
+align`` and/or ``transcriptome cluster``. The reference cache
+(``sequencing.reference.handle``) is the canonical axis here; the genome
+browser's entry form always picks a reference first and then adds zero
+or more sources keyed to it.
 
-Sessions are constructed exclusively via :meth:`Session.open` (handle +
-list-of-sources); :func:`_from_saved_session` adapts a saved-session
-TOML from ``~/.constellation/sessions/`` onto it. The legacy ``from_root`` /
-directory-walk discovery / ``session.toml`` v1 reader were removed in
-the reference-cache-first cutover — the dashboard's entry form is now
-the sole on-ramp.
+Sessions are constructed exclusively via :meth:`GenomeSession.open`
+(handle + list-of-sources); :func:`_from_saved_session` adapts a
+saved-session TOML from ``~/.constellation/sessions/`` onto it. The
+legacy ``from_root`` / directory-walk discovery / ``session.toml`` v1
+reader were removed in the reference-cache-first cutover — the
+dashboard's entry form is now the sole on-ramp.
+
+These two classes are the genome modality's implementation of the
+``SessionLike`` / ``SourceLike`` contracts in ``viz.server.session``.
 """
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, ClassVar, Iterable, Literal
+
+from constellation.viz.server.session import derive_session_id, derive_source_id
 
 
 # ----------------------------------------------------------------------
@@ -29,7 +34,7 @@ from typing import Any, Iterable, Literal
 
 
 # Per-kind well-known filenames that map manifest ``outputs`` keys to the
-# slots ``SessionSource`` exposes. Kernel ``discover()`` methods read
+# slots ``GenomeSource`` exposes. Kernel ``discover()`` methods read
 # these slots directly; missing slots resolve to ``None`` and kernels
 # skip the corresponding binding.
 _ALIGN_SLOT_KEYS: tuple[tuple[str, str, bool], ...] = (
@@ -79,7 +84,7 @@ _CLUSTER_DEFAULT_PATHS: dict[str, str] = {
 
 
 @dataclass(frozen=True, slots=True)
-class SessionSource:
+class GenomeSource:
     """One data source attached to a session.
 
     A source is the output directory of one ``transcriptome align`` or
@@ -118,9 +123,7 @@ class SessionSource:
         (visibility, display order, height) keyed by ``source_id``
         remains valid across session rebuilds.
         """
-        payload = f"{self.path}|{self.kind}".encode("utf-8")
-        digest = hashlib.blake2b(payload, digest_size=4).hexdigest()
-        return f"src-{digest}"
+        return derive_source_id(self.path, self.kind)
 
     def slot_paths(self) -> dict[str, str | None]:
         """JSON-friendly slot view for the dashboard's session manifest."""
@@ -140,7 +143,7 @@ class SessionSource:
 
 
 @dataclass(frozen=True, slots=True)
-class Session:
+class GenomeSession:
     """Resolved entry point for a viz server.
 
     A session is one reference plus zero-or-more attached sources. The
@@ -150,6 +153,9 @@ class Session:
     does not block the open.
     """
 
+    #: Registry key of this session's modality (``viz.modalities``).
+    modality: ClassVar[str] = "genome"
+
     session_id: str
     label: str
     reference_handle: str
@@ -157,7 +163,7 @@ class Session:
     reference_genome: Path
     reference_annotation: Path | None
     assembly_accession: str | None
-    sources: tuple[SessionSource, ...]
+    sources: tuple[GenomeSource, ...]
     warnings: tuple[str, ...] = ()
     saved_as: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
@@ -175,8 +181,8 @@ class Session:
         label: str | None = None,
         saved_as: str | None = None,
         cache_root: Path | None = None,
-    ) -> "Session":
-        """Build a Session from a reference handle and a list of sources.
+    ) -> "GenomeSession":
+        """Build a GenomeSession from a reference handle and a list of sources.
 
         ``sources`` is an iterable of dicts shaped::
 
@@ -224,7 +230,7 @@ class Session:
         annotation_dir = release_path / "annotation"
         annotation_path: Path | None = annotation_dir if annotation_dir.is_dir() else None
 
-        built_sources: list[SessionSource] = []
+        built_sources: list[GenomeSource] = []
         warnings: list[str] = []
         for entry in sources:
             built = _load_source(entry)
@@ -241,7 +247,7 @@ class Session:
                 )
 
         resolved_label = label or release_path.name
-        session_id = _derive_session_id(release_path, resolved_label)
+        session_id = derive_session_id(release_path, resolved_label)
         return cls(
             session_id=session_id,
             label=resolved_label,
@@ -260,17 +266,17 @@ class Session:
         sources: Iterable[dict[str, Any]],
         *,
         cache_root: Path | None = None,
-    ) -> "Session":
+    ) -> "GenomeSession":
         """Rebuild this session with a new list of attached sources.
 
         Used by the runtime add/remove-source endpoints. Reuses
         ``reference_handle``, ``label``, and ``saved_as``; the returned
-        Session's ``session_id`` matches ``self.session_id`` by
-        construction (``_derive_session_id`` is deterministic over
+        GenomeSession's ``session_id`` matches ``self.session_id`` by
+        construction (``derive_session_id`` is deterministic over
         ``(reference_path, label)``), so the registry entry can be
         swapped in place without notifying the client.
         """
-        return Session.open(
+        return GenomeSession.open(
             reference_handle=self.reference_handle,
             sources=sources,
             label=self.label,
@@ -300,10 +306,25 @@ class Session:
             "has_cluster_sources": has_cluster,
         }
 
+    def summary(self) -> dict[str, Any]:
+        """Small JSON record for ``GET /api/sessions``."""
+        return {
+            "session_id": self.session_id,
+            "modality": self.modality,
+            "label": self.label,
+            "reference_handle": self.reference_handle,
+            "reference_path": str(self.reference_path),
+            "n_sources": len(self.sources),
+            "stages_present": self.stages_present(),
+            "warnings": list(self.warnings),
+            "saved_as": self.saved_as,
+        }
+
     def to_manifest(self) -> dict[str, Any]:
         """Serialize to JSON-friendly form for the sessions endpoint."""
         return {
             "session_id": self.session_id,
+            "modality": self.modality,
             "label": self.label,
             "reference": {
                 "handle": self.reference_handle,
@@ -337,8 +358,8 @@ class Session:
 # ----------------------------------------------------------------------
 
 
-def _load_source(entry: dict[str, Any]) -> SessionSource:
-    """Build a SessionSource from a ``{path, kind?, label?}`` dict.
+def _load_source(entry: dict[str, Any]) -> GenomeSource:
+    """Build a GenomeSource from a ``{path, kind?, label?}`` dict.
 
     Reads the source's ``manifest.json`` (current schema version
     required — see ``sequencing.transcriptome.manifest``), assembles
@@ -404,7 +425,7 @@ def _load_source(entry: dict[str, Any]) -> SessionSource:
             slots,
         )
 
-    return SessionSource(
+    return GenomeSource(
         path=source_path,
         kind=manifest.kind,
         label=label,
@@ -420,7 +441,7 @@ def _attach_align_slots_from_cluster(
     align_dir_str: str,
     slots: dict[str, Path | None],
 ) -> None:
-    """Populate the alignment-related slots on a cluster ``SessionSource``
+    """Populate the alignment-related slots on a cluster ``GenomeSource``
     from the upstream align dir recorded in the cluster's manifest.
 
     Cluster outputs reference their align_dir as a back-pointer; we
@@ -498,14 +519,14 @@ def _resolve_slot(base: Path, rel: str) -> Path | None:
 # ----------------------------------------------------------------------
 
 
-def _from_saved_session(saved: Any, *, cache_root: Path | None = None) -> Session:
-    """Construct a Session from a SavedSession dataclass.
+def _from_saved_session(saved: Any, *, cache_root: Path | None = None) -> GenomeSession:
+    """Construct a GenomeSession from a SavedSession dataclass.
 
     Used by the standalone ``constellation viz genome --saved-session``
     CLI. (The dashboard's saved-session flow does not come through here:
     its form reads the saved TOML and POSTs ``/api/sessions/open``.)
     """
-    return Session.open(
+    return GenomeSession.open(
         reference_handle=saved.reference_handle,
         sources=[
             {"path": src["path"], "kind": src.get("kind"), "label": src.get("label")}
@@ -526,24 +547,7 @@ def _stringify(p: Path | None) -> str | None:
     return None if p is None else str(p)
 
 
-def _derive_session_id(release_path: Path, label: str) -> str:
-    """Stable short id for a (release_path, label) pair, URL-safe."""
-    payload = f"{release_path}|{label}".encode("utf-8")
-    digest = hashlib.blake2b(payload, digest_size=4).hexdigest()
-    return f"{_slug(label)}-{digest}"
-
-
-def _slug(s: str) -> str:
-    out: list[str] = []
-    for ch in s.lower():
-        if ch.isalnum() or ch in "-_":
-            out.append(ch)
-        else:
-            out.append("-")
-    return "".join(out).strip("-") or "session"
-
-
 __all__ = [
-    "Session",
-    "SessionSource",
+    "GenomeSession",
+    "GenomeSource",
 ]

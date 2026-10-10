@@ -23,7 +23,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 
-from constellation.viz.modalities.genome.session import Session
+from constellation.viz.modalities.genome.session import GenomeSession
 from constellation.viz.tracks.base import (
     ThresholdDecision,
     TrackBinding,
@@ -78,7 +78,7 @@ class ReferenceSequenceKernel(TrackKernel):
     # `step > 1` as a signal to draw dashes / blocks instead of letters.
     vector_glyph_limit = 5_000
 
-    def discover(self, session: Session) -> list[TrackBinding]:
+    def discover(self, session: GenomeSession) -> list[TrackBinding]:
         if session.reference_genome is None:
             return []
         sequences = session.reference_genome / "sequences.parquet"

@@ -47,7 +47,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 
-from constellation.viz.modalities.genome.session import Session
+from constellation.viz.modalities.genome.session import GenomeSession
 from constellation.viz.modalities.genome.tracks._alignment_view import (
     BLOCKS_LIST_TYPE,
     MISMATCH_POSITIONS_TYPE,
@@ -106,7 +106,7 @@ class ReadPileupKernel(TrackKernel):
     # rectangles still render at any zoom.
     mismatch_glyph_bp_per_pixel_limit = 5.0
 
-    def discover(self, session: Session) -> list[TrackBinding]:
+    def discover(self, session: GenomeSession) -> list[TrackBinding]:
         if session.reference_genome is None:
             return []
         bindings: list[TrackBinding] = []
