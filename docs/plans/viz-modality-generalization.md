@@ -13,7 +13,11 @@
   well as session open.
 - **Stage 2 (PR C) — frontend factoring:** implemented on
   `feat/viz-modality-frontend` (2026-10-10), stacked on the Stage 1 branch;
-  fourteen commits in the order of the steps below. Departures:
+  its commits follow the order of the steps below. One Python test outside
+  the viz suite (`test_em_cli_modes.py`) read two frontend files by path and
+  was broken by the move until the last commit of the stage, so the
+  intermediate commits are not all green under the full pytest suite.
+  Departures:
   - `PanelDriver` takes the host's viewport as one snapshot per render —
     `view()` returns `{key, widthPx, …}` and `fetch` / `draw` receive it —
     instead of separate `viewKey()` / `contentWidth()` calls, so every panel
