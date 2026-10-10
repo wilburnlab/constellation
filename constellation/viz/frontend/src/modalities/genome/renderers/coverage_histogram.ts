@@ -23,6 +23,8 @@ const PALETTE = ['#4f9efb', '#fb7c4f', '#a4d65e', '#d65eb6', '#5ed6cf'];
 
 const renderer: TrackRenderer = {
   kind: 'coverage_histogram',
+  order: 2,
+  unit: ['bin', 'bins'],
   render(table: Table, _mode: TrackMode, ctx: RenderContext): void {
     clear(ctx.svg);
 

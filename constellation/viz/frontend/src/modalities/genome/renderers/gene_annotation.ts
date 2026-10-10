@@ -27,6 +27,8 @@ const TYPE_COLOR_DEFAULTS: Record<string, string> = {
 
 const renderer: TrackRenderer = {
   kind: 'gene_annotation',
+  order: 1,
+  unit: ['feature', 'features'],
   render(table: Table, _mode: TrackMode, ctx: RenderContext): void {
     clear(ctx.svg);
 

@@ -40,15 +40,25 @@ describe('buildTrackDataUrl', () => {
     );
   });
 
-  it('omits min_mapq when it is zero and cluster_view when unset', () => {
+  it('leaves out undefined parameters and keeps falsy ones', () => {
     const url = buildTrackDataUrl(
       'read_pileup',
-      { ...BASE, viewport_px: 900, min_mapq: 0, cluster_view: undefined },
+      { ...BASE, viewport_px: 900, min_mapq: undefined, depth: 0, tag: '' },
       ORIGIN,
     );
     expect(url).not.toContain('min_mapq');
-    expect(url).not.toContain('cluster_view');
-    expect(url.endsWith('&viewport_px=900')).toBe(true);
+    expect(url.endsWith('&viewport_px=900&depth=0&tag=')).toBe(true);
+  });
+
+  it('emits parameters in the order given and repeats a list', () => {
+    const url = buildTrackDataUrl(
+      'toy_trace',
+      { session: 's', binding: 'b', x1: 2.5, x0: 0.5, tags: ['a', 'b'], empty: [] },
+      ORIGIN,
+    );
+    expect(url).toBe(
+      `${ORIGIN}/api/tracks/toy_trace/data?session=s&binding=b&x1=2.5&x0=0.5&tags=a&tags=b`,
+    );
   });
 
   it('percent-encodes the kind and parameter values', () => {

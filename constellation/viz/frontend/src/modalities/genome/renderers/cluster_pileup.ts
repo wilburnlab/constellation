@@ -20,6 +20,7 @@ import { svgEl, clear } from '../../../engine/svg_layer';
 import { TrackMode } from '../../../engine/arrow_client';
 import { decodeHybrid, appendHybridImage } from '../../../engine/hybrid_layer';
 import { TrackRenderer, RenderContext } from './base';
+import { clusterView, minMapq } from './pushdown';
 import { renderAlignmentRows } from './_alignment_view';
 import {
   pickAllowList,
@@ -56,6 +57,10 @@ const CLUSTER_PALETTE_CYCLE = [
 
 const renderer: TrackRenderer = {
   kind: 'cluster_pileup',
+  order: 4,
+  unit: ['cluster', 'clusters'],
+  // The status line counts clusters in either view.
+  pushdown: { min_mapq: minMapq, cluster_view: clusterView },
   render(table: Table, mode: TrackMode, ctx: RenderContext): void {
     clear(ctx.svg);
 

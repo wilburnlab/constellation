@@ -21,6 +21,8 @@ const MOTIF_COLOR_DEFAULTS: Record<string, string> = {
 
 const renderer: TrackRenderer = {
   kind: 'splice_junctions',
+  order: 5,
+  unit: ['junction', 'junctions'],
   render(table: Table, _mode: TrackMode, ctx: RenderContext): void {
     clear(ctx.svg);
 

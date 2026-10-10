@@ -20,6 +20,8 @@ const DEFAULT_LETTER_FONT = 'ui-monospace, SF Mono, Menlo, monospace';
 
 const renderer: TrackRenderer = {
   kind: 'reference_sequence',
+  order: 0,
+  unit: ['base', 'bases'],
   render(table: Table, _mode: TrackMode, ctx: RenderContext): void {
     clear(ctx.svg);
     const fontFamily = pickString(

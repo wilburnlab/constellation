@@ -2,6 +2,7 @@
 // track-renderer module. Mirrors the Python-side `register_track`
 // pattern in `constellation/viz/tracks/__init__.py`.
 
+import { UNKNOWN_KIND_ORDER } from '../../../panels/kind';
 import { TrackRenderer } from './base';
 import coverage_histogram from './coverage_histogram';
 import gene_annotation from './gene_annotation';
@@ -25,4 +26,9 @@ export function getRenderer(kind: string): TrackRenderer | null {
 
 export function registeredKinds(): string[] {
   return Object.keys(renderers).sort();
+}
+
+/** Default stacking rank of a kind; unknown kinds sort last. */
+export function kindRank(kind: string): number {
+  return renderers[kind]?.order ?? UNKNOWN_KIND_ORDER;
 }

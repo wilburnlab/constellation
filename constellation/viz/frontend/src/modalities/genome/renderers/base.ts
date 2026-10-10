@@ -3,10 +3,11 @@
 // Each renderer module exports a default object satisfying this
 // interface. The GenomeBrowser widget composes track renderers based
 // on the `kind` returned by /api/tracks; new track types land as new
-// modules + a registry entry in `track_renderers/index.ts`.
+// modules + a registry entry in `renderers/index.ts`.
 
 import { Table } from 'apache-arrow';
 import { TrackMode } from '../../../engine/arrow_client';
+import { PanelKind } from '../../../panels/kind';
 import { GenomicScale } from '../scales';
 
 export interface TrackMetadata {
@@ -36,8 +37,9 @@ export interface RenderContext {
   filter?: Record<string, unknown>;
 }
 
-export interface TrackRenderer {
-  kind: string;
+/** A genome track kind: what the host needs to know about it
+ *  (`PanelKind`) plus how to draw it over a locus. */
+export interface TrackRenderer extends PanelKind {
   /** Render a freshly fetched table into the provided SVG. The
    *  renderer is responsible for clearing previous contents. */
   render(table: Table, mode: TrackMode, ctx: RenderContext): void;

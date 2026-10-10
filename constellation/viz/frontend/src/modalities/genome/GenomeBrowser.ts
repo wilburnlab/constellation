@@ -30,7 +30,8 @@ import { GenomicScale, makeAxis, xScale, formatGenomic } from './scales';
 import { svgEl, ensureSvg } from '../../engine/svg_layer';
 import { Locus, ViewportBus } from './viewport_bus';
 import { buildCompositeSvg, downloadSvg, estimateGlyphCount } from '../../engine/export';
-import { getRenderer } from './renderers';
+import { encodePushdown, pushdownChanged, unitFor } from '../../panels/kind';
+import { getRenderer, kindRank } from './renderers';
 import { TrackMetadata } from './renderers/base';
 import {
   BindingRow,
@@ -57,20 +58,6 @@ import {
 } from '../../panels/OptionsPopover';
 import { TrackSettingsPanel } from './TrackSettingsPanel';
 import './GenomeBrowser.css';
-
-/** Filter keys whose values are pushed down to the kernel — changing
- *  any of these requires a server refetch, not a client-side restyle.
- *  Everything else (palette overrides, visible-strands allowlist, etc.)
- *  is satisfied off the cached Arrow table via restyleTrack().
- *
- *  - `min_mapq` (PR 4) — read_pileup MAPQ filter.
- *  - `cluster_view` (PR 5) — cluster_pileup switch between cluster
- *    rectangles and per-member-read expansion; the schema actually
- *    differs between views so a refetch is mandatory. */
-const PUSHDOWN_FILTER_KEYS: ReadonlySet<string> = new Set([
-  'min_mapq',
-  'cluster_view',
-]);
 
 interface ContigInfo {
   contig_id: number;
@@ -161,17 +148,6 @@ const RULER_HEIGHT = 28;
 const COLLAPSED_BODY_HEIGHT = 0;
 const SEARCH_DEBOUNCE_MS = 200;
 const LAYOUT_PERSIST_DEBOUNCE_MS = 200;
-
-// Canonical kind order — initial render stacks tracks in this order;
-// new bindings added at runtime get slotted into their kind's cluster.
-const KIND_ORDER: readonly string[] = [
-  'reference_sequence',
-  'gene_annotation',
-  'coverage_histogram',
-  'read_pileup',
-  'cluster_pileup',
-  'splice_junctions',
-];
 
 export class GenomeBrowser {
   readonly bus = new ViewportBus();
@@ -332,7 +308,7 @@ export class GenomeBrowser {
     const entries = await fetchJson<TrackEntry[]>(
       `/api/tracks?session=${encodeURIComponent(this.sessionId)}`,
     );
-    // Stable canonical order: KIND_ORDER groups, then per-kind insertion
+    // Stable canonical order: by each kind's declared rank, then per-kind insertion
     // order from the endpoint (which iterates session.sources in order).
     entries.sort((a, b) => kindRank(a.kind) - kindRank(b.kind));
 
@@ -880,7 +856,7 @@ export class GenomeBrowser {
       onFilterChange: (filter) => {
         const before = track.filter;
         track.filter = { ...filter };
-        if (pushdownFiltersChanged(before, track.filter)) {
+        if (pushdownChanged(getRenderer(track.entry.kind), before, track.filter)) {
           // Server-side filter — invalidate the cache so the next
           // render fetches fresh data, then schedule. The 60ms render
           // debounce absorbs slider drag.
@@ -895,7 +871,7 @@ export class GenomeBrowser {
         const before = track.filter;
         track.style = {};
         track.filter = {};
-        if (pushdownFiltersChanged(before, track.filter)) {
+        if (pushdownChanged(getRenderer(track.entry.kind), before, track.filter)) {
           track.lastFetched = undefined;
           this.scheduleRender();
         } else {
@@ -1236,8 +1212,8 @@ export class GenomeBrowser {
       };
 
       try {
-        const minMapq = readNumberFilter(track.filter, 'min_mapq');
-        const clusterView = readStringFilter(track.filter, 'cluster_view');
+        const renderer = getRenderer(track.entry.kind);
+        if (!renderer) continue;
         const { table, mode } = await fetchTrackData(
           track.entry.kind,
           {
@@ -1247,22 +1223,17 @@ export class GenomeBrowser {
             start: locus.start,
             end: locus.end,
             viewport_px: widthPx,
-            min_mapq: minMapq > 0 ? minMapq : undefined,
-            cluster_view:
-              clusterView === 'clusters' || clusterView === 'members'
-                ? clusterView
-                : undefined,
+            // The kind's server-side filters, as it declares them.
+            ...encodePushdown(renderer, track.filter),
           },
           track.cancel.signal,
         );
-        const renderer = getRenderer(track.entry.kind);
-        if (!renderer) continue;
         renderer.render(table, mode as TrackMode, ctx);
         track.lastFetched = { table, mode: mode as TrackMode, locusKey };
         track.statusEl.textContent =
           table.numRows === 0
             ? '— no data in window'
-            : `showing ${table.numRows.toLocaleString()} ${pluralUnit(track.entry.kind, table.numRows)}`;
+            : `showing ${table.numRows.toLocaleString()} ${unitFor(renderer, table.numRows)}`;
       } catch (err) {
         if ((err as Error).name === 'AbortError') continue;
         console.warn(`render failed for ${track.entry.kind}`, err);
@@ -1362,11 +1333,6 @@ export class GenomeBrowser {
 // Helpers
 // ----------------------------------------------------------------------
 
-function kindRank(kind: string): number {
-  const idx = KIND_ORDER.indexOf(kind);
-  return idx === -1 ? KIND_ORDER.length : idx;
-}
-
 function warningFor(
   source: ManifestSource,
   manifest: SessionManifest,
@@ -1422,19 +1388,6 @@ function parseLocus(input: string): Locus | null {
   return { contig: m[1], start, end };
 }
 
-function pluralUnit(kind: string, n: number): string {
-  const map: Record<string, [string, string]> = {
-    gene_annotation: ['feature', 'features'],
-    coverage_histogram: ['bin', 'bins'],
-    read_pileup: ['read', 'reads'],
-    cluster_pileup: ['cluster', 'clusters'],
-    splice_junctions: ['junction', 'junctions'],
-    reference_sequence: ['base', 'bases'],
-  };
-  const [singular, plural] = map[kind] ?? ['row', 'rows'];
-  return n === 1 ? singular : plural;
-}
-
 function readLabelsPref(): boolean {
   try {
     const raw = window.localStorage.getItem(LABELS_KEY);
@@ -1451,53 +1404,4 @@ function writeLabelsPref(value: boolean): void {
   } catch {
     // ignored — storage may be disabled in private modes
   }
-}
-
-
-/** True when any pushdown-routed filter key differs between the two
- *  filter dicts (including a transition between present-and-absent).
- *  The route between restyle vs refetch on filter change depends on
- *  this signal — non-pushdown changes (palettes, allowlists already in
- *  the cached payload) get the cheap client-side restyle. */
-function pushdownFiltersChanged(
-  before: Record<string, unknown>,
-  after: Record<string, unknown>,
-): boolean {
-  for (const key of PUSHDOWN_FILTER_KEYS) {
-    if (!shallowEqual(before[key], after[key])) return true;
-  }
-  return false;
-}
-
-
-function shallowEqual(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (a === undefined || b === undefined) return false;
-  if (a === null || b === null) return false;
-  return JSON.stringify(a) === JSON.stringify(b);
-}
-
-
-/** Coerce a filter dict value to a finite number, defaulting to 0. */
-function readNumberFilter(
-  filter: Record<string, unknown>,
-  key: string,
-): number {
-  const v = filter[key];
-  if (typeof v === 'number' && Number.isFinite(v)) return v;
-  if (typeof v === 'string') {
-    const parsed = Number(v);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return 0;
-}
-
-
-/** Coerce a filter dict value to a string, defaulting to ''. */
-function readStringFilter(
-  filter: Record<string, unknown>,
-  key: string,
-): string {
-  const v = filter[key];
-  return typeof v === 'string' ? v : '';
 }

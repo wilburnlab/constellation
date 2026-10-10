@@ -14,6 +14,7 @@ import { svgEl, clear } from '../../../engine/svg_layer';
 import { TrackMode } from '../../../engine/arrow_client';
 import { decodeHybrid, appendHybridImage } from '../../../engine/hybrid_layer';
 import { TrackRenderer, RenderContext } from './base';
+import { minMapq } from './pushdown';
 import { renderAlignmentRows } from './_alignment_view';
 
 // Mirror of the coverage_histogram per-sample palette so multi-track
@@ -34,6 +35,9 @@ const STRAND_FALLBACK: Record<string, string> = {
 
 const renderer: TrackRenderer = {
   kind: 'read_pileup',
+  order: 3,
+  unit: ['read', 'reads'],
+  pushdown: { min_mapq: minMapq },
   render(table: Table, mode: TrackMode, ctx: RenderContext): void {
     clear(ctx.svg);
 
