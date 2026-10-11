@@ -98,7 +98,8 @@ register_schema("MSPeakTable", MS_PEAK_TABLE)
 # ScanMetadataTable — one row per scan. Ports cartographer SCAN_METADATA_SCHEMA.
 # ──────────────────────────────────────────────────────────────────────
 
-SCAN_METADATA_SCHEMA_VERSION: int = 2
+# v3 (additive): scan_window_lower / scan_window_upper.
+SCAN_METADATA_SCHEMA_VERSION: int = 3
 
 
 # Mirrors Cartographer's SCAN_METADATA_SCHEMA v5 column-for-column with
@@ -130,6 +131,13 @@ SCAN_METADATA_TABLE: pa.Schema = pa.schema(
         pa.field("faims_cv", pa.float32(), nullable=True),
         pa.field("isolation_lower", pa.float64(), nullable=True),
         pa.field("isolation_upper", pa.float64(), nullable=True),
+        # The m/z range the scan was acquired over (the `[lo-hi]` at the
+        # end of a Thermo filter string), for every MS level. For an MS1
+        # scan this is what an EncyclopeDIA `.dia` records as the scan's
+        # isolation bounds, which is why it is a column and not left
+        # inside filter_string. Null in bundles written before v3.
+        pa.field("scan_window_lower", pa.float64(), nullable=True),
+        pa.field("scan_window_upper", pa.float64(), nullable=True),
         pa.field("precursor_scan", pa.float64(), nullable=True),
         pa.field("precursor_mz", pa.float64(), nullable=True),
         pa.field("precursor_charge", pa.int8(), nullable=True),

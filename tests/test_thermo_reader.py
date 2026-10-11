@@ -409,7 +409,7 @@ class TestSchemaRegistration:
         assert {"analyzer", "activation_type"} <= names
         assert SCAN_METADATA_TABLE.field("analyzer").type == pa.string()
         assert SCAN_METADATA_TABLE.field("activation_type").type == pa.string()
-        assert SCAN_METADATA_TABLE.metadata[b"schema_version"] == b"2"
+        assert SCAN_METADATA_TABLE.metadata[b"schema_version"] == b"3"
 
     def test_acquisition_metadata_table_has_tune_data_map(self):
         f = ACQUISITION_METADATA_TABLE.field("tune_data")
