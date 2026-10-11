@@ -142,8 +142,9 @@ def _order_by_id(acq: Acquisitions) -> dict[int, int | None]:
 
 
 def test_schema_has_version_and_instrument_fields() -> None:
-    assert ACQUISITION_TABLE.metadata[b"schema_version"] == b"1"
-    assert ACQUISITION_SCHEMA_VERSION == 1
+    assert ACQUISITION_TABLE.metadata[b"schema_version"] == b"2"
+    assert ACQUISITION_SCHEMA_VERSION == 2
+    assert ACQUISITION_TABLE.field("source_sha256").nullable
     names = set(ACQUISITION_TABLE.names)
     assert {"instrument_serial", "instrument_model", "acquisition_order"} <= names
     assert ACQUISITION_TABLE.field("instrument_serial").type == pa.string()
@@ -261,3 +262,119 @@ def test_with_acquisition_order_rejects_non_iso_datetime() -> None:
     ]
     with pytest.raises(ValueError, match="not ISO-8601"):
         Acquisitions.from_records(recs).with_acquisition_order()
+
+
+# ── identity: ids fixed once, runs bound by name ───────────────────────
+
+
+def _raw(name: str, sha: str | None = None, **extra) -> dict[str, object]:
+    return {"source_file": name, "source_kind": "thermo_acquisition", "source_sha256": sha, **extra}
+
+
+def test_register_hands_out_ids_once_and_keeps_them() -> None:
+    from constellation.massspec.acquisitions import Acquisitions
+
+    acq, ids = Acquisitions.empty().register([_raw("/data/a.raw", "aa"), _raw("/data/b.raw", "bb")])
+    assert ids == [0, 1] and acq.ids == [0, 1]
+
+    # A later call with one known run (found by content, under another
+    # path) and one new run: the known id stands, the new one is next.
+    acq2, ids2 = acq.register([_raw("/elsewhere/a.raw", "aa"), _raw("/data/c.raw", "cc")])
+    assert ids2 == [0, 2] and acq2.ids == [0, 1, 2]
+    assert acq2.table.column("source_file").to_pylist()[0] == "/data/a.raw"
+    assert acq.ids == [0, 1]  # the original is untouched
+
+    # Without a hash, the file name decides; the hash is learned later.
+    bare, _ = Acquisitions.empty().register([_raw("/data/a.raw")])
+    learned, ids3 = bare.register([_raw("/copy/a.raw", "aa")])
+    assert ids3 == [0] and learned.table.column("source_sha256").to_pylist() == ["aa"]
+
+
+def test_register_refuses_two_files_with_one_name() -> None:
+    from constellation.massspec.acquisitions import Acquisitions
+
+    acq, _ = Acquisitions.empty().register([_raw("/monday/run.raw", "aa")])
+    with pytest.raises(ValueError, match="two different files are both named 'run.raw'"):
+        acq.register([_raw("/tuesday/run.raw", "bb")])
+    with pytest.raises(ValueError, match="needs source_file and source_kind"):
+        acq.register([{"source_file": "x.raw"}])
+
+
+def test_id_for_source_binds_what_a_tool_reports() -> None:
+    from constellation.massspec.acquisitions import Acquisitions
+
+    acq, _ = Acquisitions.empty().register(
+        [_raw("/data/run_01.raw", "aa"), _raw("/data/run_02.raw", "bb")]
+    )
+    assert acq.id_for_source("/data/run_02.raw") == 1  # exactly as recorded
+    assert acq.id_for_source("run_01.raw") == 0  # EncyclopeDIA's SourceFile
+    assert acq.id_for_source("E:\\somewhere\\run_02.raw") == 1  # a Windows path
+    assert acq.id_for_source("run_01.dia") == 0  # same run, another extension
+    with pytest.raises(KeyError, match="no acquisition is named 'run_03.raw'"):
+        acq.id_for_source("run_03.raw")
+
+    # Two runs that differ only by extension cannot be bound by bare name.
+    both, _ = Acquisitions.empty().register([_raw("run.raw", "aa"), _raw("run.mzML", "bb")])
+    assert both.id_for_source("run.raw") == 0
+    with pytest.raises(KeyError, match="matches 2 acquisitions by name without extension"):
+        both.id_for_source("run.dia")
+
+
+def test_acquisitions_persist_and_older_files_load(tmp_path) -> None:
+    import pyarrow.parquet as pq
+
+    from constellation.massspec.acquisitions import (
+        Acquisitions,
+        load_acquisitions,
+        save_acquisitions,
+    )
+
+    acq, _ = Acquisitions.empty().register([_raw("/data/a.raw", "aa", instrument_model="Stellar")])
+    path = save_acquisitions(acq, tmp_path / "acquisitions")
+    assert path.name == "acquisitions.parquet" and not list(path.parent.glob(".*tmp"))
+    again = load_acquisitions(tmp_path / "acquisitions")
+    assert again.table.to_pylist() == acq.table.to_pylist()
+    # Reloaded, a known run still gets the id it had.
+    assert again.register([_raw("/moved/a.raw", "aa")])[1] == [0]
+
+    # A version-1 file (no source_sha256) loads with the column null.
+    old = acq.table.drop_columns(["source_sha256"])
+    (tmp_path / "old").mkdir()
+    pq.write_table(old, tmp_path / "old" / "acquisitions.parquet")
+    assert load_acquisitions(tmp_path / "old").table.column("source_sha256").to_pylist() == [None]
+    with pytest.raises(FileNotFoundError):
+        load_acquisitions(tmp_path / "absent")
+
+
+def test_record_from_a_converted_bundle(tmp_path) -> None:
+    import json
+
+    from constellation.massspec.acquisitions import Acquisitions, acquisition_record_from_bundle
+
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "kind": "thermo_acquisition",
+                "source_file": "/data/run_01.raw",
+                "source_sha256": "a5766964",
+                "run_metadata": {
+                    "instrument_model": "Stellar",
+                    "instrument_serial": "QLT-S-10199",
+                    "creation_date": "10/06/2026 22:19:53",
+                },
+            }
+        )
+    )
+    record = acquisition_record_from_bundle(tmp_path)
+    assert record == {
+        "source_file": "/data/run_01.raw",
+        "source_kind": "thermo_acquisition",
+        "source_sha256": "a5766964",
+        "acquisition_datetime": "2026-10-06T22:19:53",
+        "instrument_serial": "QLT-S-10199",
+        "instrument_model": "Stellar",
+    }
+    acq, ids = Acquisitions.empty().register([record])
+    assert ids == [0] and acq.with_acquisition_order().table.column("acquisition_order").to_pylist() == [1]
+    with pytest.raises(FileNotFoundError, match="not a converted acquisition bundle"):
+        acquisition_record_from_bundle(tmp_path / "nowhere")

@@ -9,15 +9,37 @@ helper that other containers call from their ``validate()`` paths.
 Lives at the ``massspec/`` top level (rather than inside library/quant/
 search) because every empirical sibling references it; one schema, one
 container, one helper.
+
+Identity
+--------
+
+``acquisition_id`` is a small sequential number, scoped to one
+experiment: it is assigned when a run is first registered
+(:meth:`Acquisitions.register`), written down once
+(:func:`save_acquisitions`), and never reassigned, so every table of the
+experiment can be partitioned and joined on it. It says nothing across
+experiments; what does is ``source_sha256``, the hash of the instrument
+file, which a converted bundle's manifest carries.
+
+Tools name a run their own way. A search engine reports the run it
+searched by file name (EncyclopeDIA copies the ``.raw`` name into every
+result row as ``SourceFile``), not by any id of ours, so results are
+bound back with :meth:`Acquisitions.id_for_source`, which matches on the
+file name and falls back to the name without its extension (the same
+run may be known as ``run.raw``, ``run.dia`` or ``run.mzML``).
 """
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from constellation.core.io.schemas import (
     cast_to_schema,
@@ -36,7 +58,8 @@ from constellation.core.io.schemas import (
 # Additive + nullable, so older 1-version-behind parquet still loads:
 # ``cast_to_schema`` fills the missing columns with nulls and merges this
 # (newer) metadata in, so a file read by newer code is treated as v1-shaped.
-ACQUISITION_SCHEMA_VERSION: int = 1
+# v2 adds ``source_sha256`` (identity across experiments).
+ACQUISITION_SCHEMA_VERSION: int = 2
 
 
 ACQUISITION_TABLE: pa.Schema = pa.schema(
@@ -52,6 +75,9 @@ ACQUISITION_TABLE: pa.Schema = pa.schema(
         pa.field("instrument_serial", pa.string(), nullable=True),
         pa.field("instrument_model", pa.string(), nullable=True),
         pa.field("acquisition_order", pa.int32(), nullable=True),
+        # SHA-256 of the instrument file (hex). The identity of a run
+        # across experiments; null when the source was never hashed.
+        pa.field("source_sha256", pa.string(), nullable=True),
     ],
     metadata={
         b"schema_name": b"AcquisitionTable",
@@ -225,6 +251,183 @@ class Acquisitions:
     def __len__(self) -> int:
         return self.table.num_rows
 
+    # ── identity ────────────────────────────────────────────────────
+
+    def id_for_source(self, name: str) -> int:
+        """The ``acquisition_id`` of the run a tool calls ``name``.
+
+        ``name`` is a file name or path as some tool reported it. Tried
+        in order: the recorded ``source_file`` exactly; the same file
+        name; the same name without its extension. Raises ``KeyError``
+        when nothing matches or when more than one run does (two runs
+        that differ only by directory or extension cannot be told apart
+        by name).
+        """
+        sources = self.table.column("source_file").to_pylist()
+        ids = self.ids
+        wanted = _file_name(name)
+        for describe, key in (
+            ("source file", lambda s: s == name),
+            ("file name", lambda s: _file_name(s) == wanted),
+            ("name without extension", lambda s: _stem(s) == _stem(name)),
+        ):
+            hits = [i for i, s in zip(ids, sources, strict=True) if key(s)]
+            if len(hits) == 1:
+                return hits[0]
+            if len(hits) > 1:
+                raise KeyError(
+                    f"{name!r} matches {len(hits)} acquisitions by {describe} "
+                    f"(ids {hits}); it does not identify one run"
+                )
+        known = ", ".join(sorted(_file_name(s) for s in sources)[:5]) or "none"
+        raise KeyError(f"no acquisition is named {name!r} (known: {known})")
+
+    def register(
+        self, records: Iterable[dict[str, object]]
+    ) -> tuple[Acquisitions, list[int]]:
+        """Add runs, keeping every id already handed out.
+
+        Each record needs ``source_file`` and ``source_kind`` and may
+        carry the other columns (``source_sha256`` above all). A record
+        for a run that is already here gets that run's id and adds no
+        row; a new one gets the next id. Returns the extended container
+        and the id of each record, in order.
+
+        "Already here" is decided by content when it can be: equal
+        ``source_sha256``. When either side has no hash it is the file
+        name. Two *different* files (different hashes) with the same
+        file name are refused, because results are bound to runs by
+        name and could not tell them apart.
+        """
+        rows = self.table.to_pylist()
+        next_id = max(self.ids, default=-1) + 1
+        out: list[int] = []
+        for record in records:
+            if "source_file" not in record or "source_kind" not in record:
+                raise ValueError("an acquisition record needs source_file and source_kind")
+            sha = record.get("source_sha256")
+            name = _file_name(str(record["source_file"]))
+            match: dict[str, object] | None = None
+            for row in rows:
+                row_sha = row["source_sha256"]
+                same_name = _file_name(row["source_file"]) == name
+                if sha and row_sha:
+                    if sha == row_sha:
+                        match = row
+                        break
+                    if same_name:
+                        raise ValueError(
+                            f"two different files are both named {name!r} "
+                            f"(sha256 {str(row_sha)[:12]}... and {str(sha)[:12]}...); "
+                            f"results are bound to runs by file name, so one experiment "
+                            f"cannot hold both"
+                        )
+                elif same_name:
+                    match = row
+                    break
+            if match is not None:
+                if sha and not match["source_sha256"]:
+                    match["source_sha256"] = sha  # learn the hash; the id stands
+                out.append(int(match["acquisition_id"]))  # type: ignore[arg-type]
+                continue
+            row = {field.name: record.get(field.name) for field in ACQUISITION_TABLE}
+            row["acquisition_id"] = next_id
+            rows.append(row)
+            out.append(next_id)
+            next_id += 1
+        table = pa.Table.from_pylist(rows, schema=ACQUISITION_TABLE)
+        table = table.replace_schema_metadata(self.table.schema.metadata)
+        return Acquisitions(table), out
+
+
+def _file_name(source: str) -> str:
+    """Last path component, for POSIX or Windows spellings alike (a
+    result written on Windows names its run with backslashes)."""
+    return re.split(r"[\\/]", source)[-1]
+
+
+def _stem(source: str) -> str:
+    name = _file_name(source)
+    return name.rsplit(".", 1)[0] if "." in name else name
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Persistence + bundle bridge
+# ──────────────────────────────────────────────────────────────────────
+
+ACQUISITIONS_FILENAME = "acquisitions.parquet"
+
+
+def save_acquisitions(acquisitions: Acquisitions, directory: Path | str) -> Path:
+    """Write the table as ``<directory>/acquisitions.parquet`` (atomic:
+    a temporary file, then a rename) and return the path."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / ACQUISITIONS_FILENAME
+    tmp = directory / f".{ACQUISITIONS_FILENAME}.tmp"
+    try:
+        pq.write_table(acquisitions.table, tmp)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return path
+
+
+def load_acquisitions(directory: Path | str) -> Acquisitions:
+    """Read what :func:`save_acquisitions` wrote. A file from an older
+    schema version loads with the newer columns null."""
+    path = Path(directory) / ACQUISITIONS_FILENAME
+    if not path.is_file():
+        raise FileNotFoundError(f"no {ACQUISITIONS_FILENAME} in {Path(directory)}")
+    return Acquisitions(pq.read_table(path))
+
+
+def _iso_datetime(value: object) -> str | None:
+    """A run date as ISO-8601, or ``None`` when it is absent or in no
+    form met so far. Thermo run headers read ``MM/DD/YYYY HH:MM:SS``."""
+    if not value:
+        return None
+    text = str(value)
+    for fmt in ("%m/%d/%Y %H:%M:%S",):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            continue
+    try:
+        datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return text
+
+
+def acquisition_record_from_bundle(bundle_dir: Path | str) -> dict[str, object]:
+    """The registration record for a converted run.
+
+    ``bundle_dir`` is what ``massspec convert`` or ``massspec
+    encyclopedia import-spectra`` writes; its ``manifest.json`` names
+    the source file, its hash (when it was computed) and the instrument.
+    Feed the result to :meth:`Acquisitions.register`.
+    """
+    manifest_path = Path(bundle_dir) / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"{Path(bundle_dir)} has no manifest.json: not a converted acquisition bundle"
+        ) from None
+    source = manifest.get("source_file")
+    if not source:
+        raise ValueError(f"{manifest_path} names no source_file")
+    run = manifest.get("run_metadata") or {}
+    return {
+        "source_file": str(source),
+        "source_kind": str(manifest.get("kind") or "unknown"),
+        "source_sha256": manifest.get("source_sha256"),
+        "acquisition_datetime": _iso_datetime(run.get("creation_date")),
+        "instrument_serial": run.get("instrument_serial"),
+        "instrument_model": run.get("instrument_model"),
+    }
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Cross-check helper
@@ -269,8 +472,12 @@ def validate_acquisitions(
 
 
 __all__ = [
+    "ACQUISITIONS_FILENAME",
     "ACQUISITION_SCHEMA_VERSION",
     "ACQUISITION_TABLE",
     "Acquisitions",
+    "acquisition_record_from_bundle",
+    "load_acquisitions",
+    "save_acquisitions",
     "validate_acquisitions",
 ]

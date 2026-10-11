@@ -23,12 +23,13 @@ against a search of the reference file.
 
 from __future__ import annotations
 
-import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+
+from constellation.massspec.io.encyclopedia._modseq import encyclopedia_residue_form
 
 
 @dataclass
@@ -120,21 +121,15 @@ def _open(path: Path) -> sqlite3.Connection:
     return con
 
 
-_LEADING_MOD_RE = re.compile(r"^((?:\[[^\]]*\])+)([A-Za-z])")
-
-
 def _precursor_key(modseq: str, charge: int) -> tuple[str, int]:
     """One spelling per precursor across a result library's tables.
 
-    EncyclopeDIA 6.9.23 writes an N-terminal modification two ways in the
-    same file: before the first residue in ``entries`` and
-    ``peptidescores`` (``[+42.010565]MDFQ...``), on it in
-    ``peptidequants`` (``M[+42.010565]DFQ...``, and ahead of the
-    residue's own modification: ``C[+42.010565][+57.0214635]DF...``).
-    Joined on the raw string, every N-terminally modified precursor (758
-    of 31,830 in the first file looked at) would have no quantity.
+    ``entries`` and ``peptidequants`` spell an N-terminal modification
+    differently (:func:`._modseq.encyclopedia_residue_form`); joined on
+    the raw string, every N-terminally modified precursor (758 of 31,830
+    in the first file looked at) would have no quantity.
     """
-    return _LEADING_MOD_RE.sub(r"\2\1", modseq, count=1), int(charge)
+    return encyclopedia_residue_form(modseq), int(charge)
 
 
 def _load(path: Path) -> tuple[dict, dict, set[str]]:

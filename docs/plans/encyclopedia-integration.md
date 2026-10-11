@@ -82,7 +82,31 @@ Plan approved by the PI on 2026-10-10. Eight PR-sized phases (P0–P7).
     said is fine (nobody depends on them).
   - **Not done:** `-libexport` on WSL2 (it runs Percolator too, selected by a different flag);
     the `vsyscall=emulate` kernel setting, which needs a WSL restart.
-- **P3–P7: not started.** `process-dia` (jar-side conversion) is still a CLI verb; the plan
+- **P3 (foundations): in progress, 2026-10-11.** Done, each with tests:
+  - **Modified sequences.** The EncyclopeDIA parser resolves terminal masses against the first
+    residue, so both of the jar's N-terminal spellings give one peptide (pyro-Glu is now
+    `[UNIMOD:28]-`), and `encyclopedia_residue_form` is the shared key for joining a result
+    file's tables. In the old reader every peptide of run A now has its peptide-level quantity
+    and the total equals the jar's exactly; the only other change to its output is
+    `mz_theoretical` of the 188 pyro-Glu precursors' b ions, by under 1e-7 Da.
+  - **Ids.** `massspec/library/ids.py`: canonical peptide / precursor / protein keys and
+    content ids (`content-v1`), `with_content_ids(library)`. **One departure from the plan
+    text:** the hash is BLAKE2b (8 bytes), not xxh64. It is in the standard library, where
+    xxhash is only in the `sequencing` extra, and anyone can recompute it in any language.
+    Nothing has been written with these ids yet, so this is the moment to object. Checked over
+    every modified sequence in the old sample files and the two 6.9.23 reference results.
+  - **Stage and manifest helpers.** `core/stages.py`, `core/manifests.py`, and the three
+    mass-spec manifest kinds in `massspec/manifest.py` (field names fixed, nothing writes them
+    until P4).
+  - **Acquisition identity.** `ACQUISITION_TABLE` v2 (`source_sha256`),
+    `Acquisitions.register` / `id_for_source`, `save_acquisitions` / `load_acquisitions`,
+    `acquisition_record_from_bundle`. On the reference set the eight converted runs register in
+    order and the run names inside the peptide-centric and ScribeTwo results bind to the right
+    ones. A result of a *merged* spectra file names the merged file, which is no acquisition:
+    P5 has to carry that binding in the unit's manifest.
+  - **Not done: the CLI split** (`massspec/cli.py` → `massspec/cli/`). It is a pure move and has
+    to be its own commit on a clean base, so it waits for P2 and the above to be committed.
+- **P4–P7: not started.** `process-dia` (jar-side conversion) is still a CLI verb; the plan
   removes it in P4, once the new search path takes bundles directly.
 - **Naming (PI, 2026-10-11).** No command or flag is named `dia`: DIA is an acquisition method,
   and `.dia` is one tool's file extension. The P1 commands were first built as

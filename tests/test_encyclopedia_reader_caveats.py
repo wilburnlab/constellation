@@ -126,6 +126,51 @@ def test_unmatched_quantity_rows_are_counted(tmp_path: Path) -> None:
     assert read.quant.peptide_quant.num_rows == 1
 
 
+def test_quantities_join_across_the_two_n_terminal_spellings(tmp_path: Path) -> None:
+    """``entries`` says ``[-17.026549]QLSALHR``, ``peptidequants`` says
+    ``Q[-17.026549]LSALHR``: one peptide, and it keeps its quantity.
+    (Every pyro-Glu peptide used to lose it.)"""
+    entries = [
+        _entry(
+            "[-17.026549]QLSALHR",
+            "QLSALHR",
+            2,
+            quant_modseq="Q[-17.026549]LSALHR",
+            total_intensity=3.0e6,
+        ),
+        _entry(
+            "[+42.010565]C[+57.0214635]DFTEDK",
+            "CDFTEDK",
+            2,
+            quant_modseq="C[+42.010565][+57.0214635]DFTEDK",
+            total_intensity=4.0e6,
+        ),
+    ]
+    read = read_encyclopedia(build_result_library(tmp_path / "run.elib", entries))
+    assert read.library.peptides.column("modified_sequence").to_pylist() == [
+        "[UNIMOD:28]-QLSALHR",
+        "[UNIMOD:1]-C[UNIMOD:4]DFTEDK",
+    ]
+    assert sorted(read.quant.peptide_quant.column("abundance").to_pylist()) == [3.0e6, 4.0e6]
+    assert not any("peptidequants rows" in c for c in read.caveats)
+
+
+def test_a_quantity_row_that_fits_two_peptides_is_not_guessed(tmp_path: Path) -> None:
+    """N-terminal acetyl and lysine acetyl on a leading K are two
+    peptides in ``entries`` and one spelling in ``peptidequants``."""
+    entries = [
+        _entry(
+            "[+42.010565]KVERPDK", "KVERPDK", 2, quant_modseq="K[+42.010565]VERPDK"
+        ),
+        _entry("K[+42.010565]VERPDK", "KVERPDK", 2),
+    ]
+    read = read_encyclopedia(build_result_library(tmp_path / "run.elib", entries))
+    assert read.library.peptides.num_rows == 2
+    assert read.quant.peptide_quant.num_rows == 0
+    (note,) = [c for c in read.caveats if "fit more than one peptide" in c]
+    assert note.startswith("2 peptidequants rows")
+
+
 def test_a_library_without_quantities_has_no_caveats(tmp_path: Path) -> None:
     path = build_result_library(
         tmp_path / "lib.dlib", [_entry("PEPTIDEK", "PEPTIDEK", 2, total_intensity=None)]

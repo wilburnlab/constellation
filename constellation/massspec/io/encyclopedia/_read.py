@@ -28,6 +28,7 @@ from constellation.massspec.io.encyclopedia._codec import (
     decompress_mz,
 )
 from constellation.massspec.io.encyclopedia._modseq import (
+    encyclopedia_residue_form,
     parse_encyclopedia_modseq,
 )
 from constellation.massspec.library.library import Library
@@ -111,7 +112,7 @@ def read_encyclopedia(
         meta = _sql.fetch_metadata(con)
 
         # ── Phase A: Library ───────────────────────────────────────
-        library, peptide_id_for, precursor_id_for, peak_counts = _build_library(
+        library, peptide_id_for, precursor_id_for, peak_counts, by_residue_form = _build_library(
             con,
             annotate_fragments=annotate_fragments,
             fragment_tolerance_ppm=fragment_tolerance_ppm,
@@ -121,7 +122,9 @@ def read_encyclopedia(
         )
 
         # ── Phase B: Quant (conditional) ───────────────────────────
-        quant, quant_notes = _build_quant(con, peptide_id_for, precursor_id_for)
+        quant, quant_notes = _build_quant(
+            con, peptide_id_for, precursor_id_for, by_residue_form
+        )
 
         # ── Phase C: Search (conditional) ──────────────────────────
         search = _build_search(con, library, peptide_id_for, include_decoys)
@@ -162,11 +165,13 @@ def _build_library(
     vocab: ModVocab,
     include_decoys: bool,
     metadata_extras: dict[str, Any],
-) -> tuple[Library, dict, dict, tuple[int, int]]:
+) -> tuple[Library, dict, dict, tuple[int, int], dict]:
     """Build the Library + return id-mapping dicts the Quant/Search build
-    need, and ``(stored, annotated)``: the number of fragment peaks the
-    file stores for the entries read and how many of them were
-    annotated (both 0 when fragments are not annotated)."""
+    need; ``(stored, annotated)``, the number of fragment peaks the file
+    stores for the entries read and how many of them were annotated
+    (both 0 when fragments are not annotated); and the peptide ids under
+    each ``(sequence, residue-form modseq)``, the key other tables are
+    joined to ``entries`` by."""
     # 1. peptidetoprotein → distinct accessions + edges.
     accession_to_id: dict[str, int] = {}
     pp_pairs: list[tuple[str, str]] = []  # (accession, peptide_seq)
@@ -195,6 +200,7 @@ def _build_library(
     # Walk entries once, keep parsed Peptidoform objects so the fragment
     # re-annotation step doesn't have to re-parse.
     peptide_id_for: dict[tuple[str, str], int] = {}
+    peptide_ids_by_residue_form: dict[tuple[str, str], set[int]] = {}
     peptidoform_for: dict[int, Any] = {}
     peptide_rows: list[dict[str, Any]] = []
     precursor_id_for: dict[tuple[int, int, str], int] = {}  # (peptide_id, charge, source) → precursor_id
@@ -227,6 +233,9 @@ def _build_library(
                 }
             )
         peptide_id = peptide_id_for[key]
+        peptide_ids_by_residue_form.setdefault(
+            (seq, encyclopedia_residue_form(modseq_raw)), set()
+        ).add(peptide_id)
         charge = int(row["PrecursorCharge"])
         source_file = row["SourceFile"]
         prec_key = (peptide_id, charge, source_file)
@@ -298,7 +307,13 @@ def _build_library(
         protein_peptide=pp_table,
         metadata_extras=metadata_extras,
     )
-    return library, peptide_id_for, precursor_id_for, (n_stored_peaks, n_annotated_peaks)
+    return (
+        library,
+        peptide_id_for,
+        precursor_id_for,
+        (n_stored_peaks, n_annotated_peaks),
+        peptide_ids_by_residue_form,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -310,6 +325,7 @@ def _build_quant(
     con,
     peptide_id_for: dict[tuple[str, str], int],
     precursor_id_for: dict[tuple[int, int, str], int],
+    peptide_ids_by_residue_form: dict[tuple[str, str], set[int]],
 ) -> tuple[Quant | None, list[str]]:
     """Build a Quant if any sample-specific data is present, else None.
 
@@ -396,20 +412,33 @@ def _build_quant(
         )
         # One row per (peptide, acquisition); peptidequants has one per
         # charge state, so intensities are summed across charges.
+        #
+        # A row is matched to its peptide through the residue-form
+        # spelling of the modified sequence, not by parsing it: this
+        # table writes N-terminal modifications on the first residue
+        # where ``entries`` writes them before it, and the residue form
+        # alone cannot always say which peptide is meant. If two
+        # peptides of ``entries`` share a residue form (N-terminal vs
+        # lysine acetyl on a leading K), the row is ambiguous and is
+        # counted, not guessed.
         peptide_quant_by_key: dict[tuple[int, int], dict[str, Any]] = {}
         n_unmatched = 0
+        n_ambiguous = 0
         for row in _sql.iter_peptidequants(con):
-            modseq_proforma = format_proforma(
-                parse_encyclopedia_modseq(row["PeptideModSeq"])
-            )
-            key = (row["PeptideSeq"], modseq_proforma)
             source_file = row["SourceFile"]
             if source_file not in source_to_acq:
                 continue
-            if key not in peptide_id_for:
+            candidates = peptide_ids_by_residue_form.get(
+                (row["PeptideSeq"], encyclopedia_residue_form(row["PeptideModSeq"])), ()
+            )
+            if not candidates:
                 n_unmatched += 1
                 continue
-            pk = (peptide_id_for[key], source_to_acq[source_file])
+            if len(candidates) > 1:
+                n_ambiguous += 1
+                continue
+            (matched_peptide_id,) = candidates
+            pk = (matched_peptide_id, source_to_acq[source_file])
             existing = peptide_quant_by_key.get(pk)
             if existing is not None:
                 existing["abundance"] += float(row["TotalIntensity"])
@@ -423,8 +452,13 @@ def _build_quant(
         if n_unmatched:
             notes.append(
                 f"{n_unmatched:,} peptidequants rows matched no peptide of the entries "
-                f"table (same sequence, modified sequence not recognised as the same) "
-                f"and are left out of peptide_quant"
+                f"table and are left out of peptide_quant"
+            )
+        if n_ambiguous:
+            notes.append(
+                f"{n_ambiguous:,} peptidequants rows fit more than one peptide of the "
+                f"entries table (the table cannot tell an N-terminal modification from "
+                f"one on the first residue) and are left out of peptide_quant"
             )
         peptide_quant_rows = list(peptide_quant_by_key.values())
         peptide_quant_table = pa.Table.from_pylist(peptide_quant_rows, schema=PEPTIDE_QUANT) if peptide_quant_rows else PEPTIDE_QUANT.empty_table()

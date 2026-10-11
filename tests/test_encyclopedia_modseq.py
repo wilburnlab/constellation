@@ -324,3 +324,60 @@ def test_n_term_distinguishable_from_side_chain_on_k():
     assert n_term == "[UNIMOD:1]-KVERPD"
     assert side_chain == "K[UNIMOD:1]VERPD"
     assert n_term != side_chain
+
+
+# ── the two N-terminal spellings of one result file ────────────────────
+#
+# EncyclopeDIA 6.9.23 writes an N-terminal modification before the first
+# residue in ``entries`` / ``peptidescores`` and on the first residue in
+# ``peptidequants``. Both must name the same peptide, or the same
+# molecule gets two identities (and, before this was fixed, every
+# pyro-Glu peptide lost its quantity).
+
+
+@pytest.mark.parametrize(
+    ("leading", "on_residue", "expected"),
+    [
+        ("[+42.010565]MDFQHRPGGK", "M[+42.010565]DFQHRPGGK", "[UNIMOD:1]-MDFQHRPGGK"),
+        ("[-17.026549]QLSALHR", "Q[-17.026549]LSALHR", "[UNIMOD:28]-QLSALHR"),
+        ("[-18.010565]ELSALHR", "E[-18.010565]LSALHR", "[UNIMOD:27]-ELSALHR"),
+        (
+            "[+42.010565]C[+57.0214635]DFTEDK",
+            "C[+42.010565][+57.0214635]DFTEDK",
+            "[UNIMOD:1]-C[UNIMOD:4]DFTEDK",
+        ),
+    ],
+)
+def test_both_n_terminal_spellings_name_the_same_peptide(
+    leading: str, on_residue: str, expected: str
+) -> None:
+    from constellation.massspec.io.encyclopedia._modseq import encyclopedia_residue_form
+
+    assert format_proforma(parse_encyclopedia_modseq(leading)) == expected
+    assert format_proforma(parse_encyclopedia_modseq(on_residue)) == expected
+    assert encyclopedia_residue_form(leading) == on_residue
+    assert encyclopedia_residue_form(on_residue) == on_residue
+
+
+def test_a_terminal_mass_is_resolved_against_the_first_residue() -> None:
+    """-17.026549 is pyro-Glu on N-terminal Q and ammonia loss on
+    N-terminal C: two UNIMOD entries, one per residue, never a tie."""
+    assert format_proforma(parse_encyclopedia_modseq("[-17.026549]QPEPK")) == "[UNIMOD:28]-QPEPK"
+    assert format_proforma(parse_encyclopedia_modseq("[-17.026549]CPEPK")) == "[UNIMOD:385]-CPEPK"
+    # On a residue neither entry is licensed for, it stays a mass.
+    assert format_proforma(parse_encyclopedia_modseq("[-17.026549]APEPK")) == "[-17.026549]-APEPK"
+    # ...and it is never pyro-Glu away from the N-terminus.
+    assert format_proforma(parse_encyclopedia_modseq("PEPQ[-17.026549]K")) == "PEPQ[-17.026549]K"
+
+
+def test_residue_form_is_a_join_key_not_an_identity() -> None:
+    """On a leading lysine the residue-attached spelling cannot say
+    whether the acetyl is on the N-terminus or the side chain, so the
+    two peptides share a join key while parsing to different peptides."""
+    from constellation.massspec.io.encyclopedia._modseq import encyclopedia_residue_form
+
+    n_terminal, side_chain = "[+42.010565]KVERPD", "K[+42.010565]VERPD"
+    assert encyclopedia_residue_form(n_terminal) == encyclopedia_residue_form(side_chain)
+    assert format_proforma(parse_encyclopedia_modseq(n_terminal)) == "[UNIMOD:1]-KVERPD"
+    assert format_proforma(parse_encyclopedia_modseq(side_chain)) == "K[UNIMOD:1]VERPD"
+    assert encyclopedia_residue_form("PEPTIDEK") == "PEPTIDEK"
