@@ -188,8 +188,22 @@ LIBRARY_TABLE_NAMES = frozenset(name for name, _ddl in LIBRARY_TABLES)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# .dia raw-spectra schema (4 tables)
+# .dia raw-spectra schema
 # ──────────────────────────────────────────────────────────────────────
+#
+# Two generations exist and the reader accepts both:
+#
+#   0.5.0  written by EncyclopeDIA 2.12.30's own mzML converter. Four
+#          tables; the ``DIA_*_DDL`` constants without a suffix.
+#   0.8.0  written by MSRawJava (the library inside EncyclopeDIA 6.x and
+#          MSForest). Adds ``fractions``, ion-mobility arrays, a per-MS2
+#          ``TIC``, RT and ion-mobility bounds on ``ranges``, and renames
+#          ``spectra.IsolationWindowCenter`` to ``IsolationWindowTarget``.
+#          The ``*_V08`` constants, copied from a file that library wrote.
+#
+# Constellation writes 0.8.0 only (``DIA_FORMAT_VERSION``).
+
+DIA_FORMAT_VERSION = "0.8.0"
 
 
 DIA_METADATA_DDL = """
@@ -253,7 +267,94 @@ DIA_TABLES: tuple[tuple[str, str], ...] = (
     ("ranges", DIA_RANGES_DDL),
     ("spectra", DIA_SPECTRA_DDL),
 )
-DIA_TABLE_NAMES = frozenset(name for name, _ddl in DIA_TABLES)
+
+DIA_FRACTIONS_DDL = """
+CREATE TABLE fractions (
+    Fraction int not null,
+    Name string not null,
+    primary key (Fraction)
+)
+"""
+
+DIA_PRECURSOR_DDL_V08 = """
+CREATE TABLE precursor (
+    Fraction int not null,
+    SpectrumName string not null,
+    SpectrumIndex int not null,
+    ScanStartTime float not null,
+    IonInjectionTime float,
+    IsolationWindowLower float not null,
+    IsolationWindowUpper float not null,
+    MassEncodedLength int not null,
+    MassArray blob not null,
+    IntensityEncodedLength int not null,
+    IntensityArray blob not null,
+    IonMobilityArrayEncodedLength int,
+    IonMobilityArray blob,
+    TIC float,
+    primary key (SpectrumIndex)
+)
+"""
+
+DIA_RANGES_DDL_V08 = """
+CREATE TABLE ranges (
+    Start float not null,
+    Stop float not null,
+    DutyCycle float not null,
+    NumWindows int,
+    IonMobilityStart float,
+    IonMobilityStop float,
+    RtStart float,
+    RtStop float
+)
+"""
+
+DIA_SPECTRA_DDL_V08 = """
+CREATE TABLE spectra (
+    Fraction int not null,
+    SpectrumName string not null,
+    PrecursorName string,
+    SpectrumIndex int not null,
+    ScanStartTime float not null,
+    IonInjectionTime float,
+    IsolationWindowLower float not null,
+    IsolationWindowTarget float not null,
+    IsolationWindowUpper float not null,
+    PrecursorCharge int not null,
+    MassEncodedLength int not null,
+    MassArray blob not null,
+    IntensityEncodedLength int not null,
+    IntensityArray blob not null,
+    IonMobilityArrayEncodedLength int,
+    IonMobilityArray blob,
+    TIC float,
+    primary key (SpectrumIndex)
+)
+"""
+
+DIA_TABLES_V08: tuple[tuple[str, str], ...] = (
+    ("metadata", DIA_METADATA_DDL),
+    ("fractions", DIA_FRACTIONS_DDL),
+    ("precursor", DIA_PRECURSOR_DDL_V08),
+    ("ranges", DIA_RANGES_DDL_V08),
+    ("spectra", DIA_SPECTRA_DDL_V08),
+)
+
+# Built after the rows are in. Names and column lists as MSRawJava
+# creates them.
+DIA_INDEXES_V08: tuple[str, ...] = (
+    'CREATE INDEX "precursor_index_isolation_window_lower" on "precursor" ("IsolationWindowLower" ASC)',
+    'CREATE INDEX "precursor_index_isolation_window_upper" on "precursor" ("IsolationWindowUpper" ASC)',
+    'CREATE INDEX "precursor_index_scan_start_time" on "precursor" ("ScanStartTime" ASC)',
+    'CREATE INDEX "spectra_index_isolation_window_lower" on "spectra" ("IsolationWindowLower" ASC)',
+    'CREATE INDEX "spectra_index_isolation_window_upper" on "spectra" ("IsolationWindowUpper" ASC)',
+    'CREATE INDEX "spectra_index_scan_start_time_and_windows" on "spectra" '
+    '("ScanStartTime","IsolationWindowLower","IsolationWindowUpper" ASC)',
+)
+
+DIA_TABLE_NAMES = frozenset(
+    name for name, _ddl in (*DIA_TABLES, *DIA_TABLES_V08)
+)
 
 
 __all__ = [
@@ -274,5 +375,12 @@ __all__ = [
     "DIA_RANGES_DDL",
     "DIA_SPECTRA_DDL",
     "DIA_TABLES",
+    "DIA_FORMAT_VERSION",
+    "DIA_FRACTIONS_DDL",
+    "DIA_PRECURSOR_DDL_V08",
+    "DIA_RANGES_DDL_V08",
+    "DIA_SPECTRA_DDL_V08",
+    "DIA_TABLES_V08",
+    "DIA_INDEXES_V08",
     "DIA_TABLE_NAMES",
 ]

@@ -27,7 +27,10 @@ from __future__ import annotations
 
 # Trigger registration in LIBRARY_/QUANT_/SEARCH_ READERS+WRITERS
 from constellation.massspec.io.encyclopedia import adapters as adapters  # noqa: F401
-from constellation.massspec.io.encyclopedia._dia import DiaReader
+from constellation.massspec.io.encyclopedia._dia import DiaFile, DiaReader
+from constellation.massspec.io.encyclopedia._dia_diff import DiaDiff, diff_dia
+from constellation.massspec.io.encyclopedia._dia_import import import_dia
+from constellation.massspec.io.encyclopedia._dia_write import DiaWriteSummary, write_dia
 from constellation.massspec.io.encyclopedia._modseq import (
     format_encyclopedia_modseq,
     parse_encyclopedia_modseq,
@@ -47,6 +50,12 @@ __all__ = [
     "read_encyclopedia",
     "write_encyclopedia",
     "EncyclopediaReadResult",
+    "DiaFile",
     "DiaReader",
+    "DiaDiff",
+    "DiaWriteSummary",
+    "diff_dia",
+    "import_dia",
+    "write_dia",
     "WRITER_VERSION",
 ]

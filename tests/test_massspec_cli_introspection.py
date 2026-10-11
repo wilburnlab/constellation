@@ -41,10 +41,16 @@ def test_all_four_subcommands_register() -> None:
         "library-export",
         "classify-novel-peptides",
         "collision-filter",
+        "encyclopedia",
         "chromatogram",
         "counter",
     }
-    # chromatogram + counter are nested groups with their own sub-subcommands.
+    # encyclopedia, chromatogram + counter are nested groups with their own
+    # sub-subcommands. No verb is named for the `.dia` extension: DIA is an
+    # acquisition method, and the file holds DDA runs too.
+    enc_subs = _subparsers_action(ms_subs.choices["encyclopedia"])
+    assert set(enc_subs.choices) == {"export-spectra", "import-spectra", "compare-spectra"}
+    assert "dia" not in ms_subs.choices
     chrom_subs = _subparsers_action(ms_subs.choices["chromatogram"])
     assert set(chrom_subs.choices) == {"build-index", "extract"}
     counter_subs = _subparsers_action(ms_subs.choices["counter"])
@@ -225,6 +231,7 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
         "library-export",
         "classify-novel-peptides",
         "collision-filter",
+        "encyclopedia",
         "chromatogram",
         "counter",
     }

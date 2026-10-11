@@ -49,6 +49,7 @@ import constellation.chromatography.readers
 import constellation.electrophoresis
 import constellation.electrophoresis.readers
 import constellation.massspec
+import constellation.massspec.acquisition_structure
 import constellation.massspec.acquisitions
 import constellation.massspec.annotation
 import constellation.massspec.annotation.mzpaf

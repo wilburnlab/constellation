@@ -104,7 +104,56 @@ def compress_chromatogram(arr: torch.Tensor) -> tuple[bytes, int]:
     return compress_intensity(arr)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# numpy-native variants — for the spectra path
+# ──────────────────────────────────────────────────────────────────────
+#
+# A `.dia` holds one m/z blob and one intensity blob per scan, hundreds
+# of thousands of them. Converting each to a torch tensor and back buys
+# nothing there (no math happens on them), so the `.dia` reader and
+# writer stay in numpy. zlib releases the GIL, so these are safe to map
+# over a thread pool.
+
+
+def decode_f8(blob: bytes, encoded_length: int | None = None) -> np.ndarray:
+    """zlib ``>f8`` blob → native float64 array (a copy, writable)."""
+    raw = zlib.decompress(blob)
+    if encoded_length is not None and len(raw) != encoded_length:
+        raise ValueError(
+            f"m/z blob length mismatch: decoded {len(raw)} bytes, "
+            f"encoded_length={encoded_length}"
+        )
+    return np.frombuffer(raw, dtype=">f8").astype("<f8")
+
+
+def decode_f4(blob: bytes, encoded_length: int | None = None) -> np.ndarray:
+    """zlib ``>f4`` blob → native float32 array (a copy, writable)."""
+    raw = zlib.decompress(blob)
+    if encoded_length is not None and len(raw) != encoded_length:
+        raise ValueError(
+            f"intensity blob length mismatch: decoded {len(raw)} bytes, "
+            f"encoded_length={encoded_length}"
+        )
+    return np.frombuffer(raw, dtype=">f4").astype("<f4")
+
+
+def encode_f8(arr: np.ndarray) -> tuple[bytes, int]:
+    """float array → ``(zlib blob, uncompressed byte length)`` as ``>f8``."""
+    raw = np.ascontiguousarray(arr, dtype=">f8").tobytes()
+    return zlib.compress(raw), len(raw)
+
+
+def encode_f4(arr: np.ndarray) -> tuple[bytes, int]:
+    """float array → ``(zlib blob, uncompressed byte length)`` as ``>f4``."""
+    raw = np.ascontiguousarray(arr, dtype=">f4").tobytes()
+    return zlib.compress(raw), len(raw)
+
+
 __all__ = [
+    "decode_f8",
+    "decode_f4",
+    "encode_f8",
+    "encode_f4",
     "decompress_mz",
     "decompress_intensity",
     "decompress_chromatogram",

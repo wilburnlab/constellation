@@ -8,20 +8,41 @@ Plan approved by the PI on 2026-10-10. Eight PR-sized phases (P0–P7).
   whole app directory and runs under its bundled Java; its command line is checked in as data
   (`constellation/data/encyclopedia_cli.json`, raw help under `data/_raw/encyclopedia/6.9.23/`);
   `doctor` reports a too-old jar. Survey note: [`encyclopedia-6.9.23-survey.md`](encyclopedia-6.9.23-survey.md).
-- **P1 (`.dia` codec): not started.** Gathered ahead of it:
-  - Constellation's own conversion already reproduces the reference peak lists. For
-    `261006_u2os_dia_gpf-900-1000…raw`, `massspec convert` gives the same 1,637 MS1 + 80,213 MS2
-    scans as the reference `.dia`, and on the 99 scans compared the peak counts, m/z and
-    intensities are identical. The "Thermo centroids differ" risk below is retired for this file.
-  - The reference `.dia` files were written by MSRawJava's `EncyclopeDIAFile` (the library bundled
-    in both EncyclopeDIA and MSForest). Scalar columns hold float32-rounded values, and `TIC` is
-    the sequential float32 sum of the stored intensities. The metadata keys that library and the
-    search jar read are `version`, `filename`, `sourcename`, `filelocation`, `runStartTime`,
-    `totalPrecursorTIC`, `InstrumentConfigurations`, `SoftwareVersion_*`, `rawFileStructure.*`
-    and `conversion.*`; the `file.*`, `run.*`, `thermo.*` keys are provenance only.
-  - P1 will read the MS1 scan range from the stored `filter_string` rather than add
-    `scan_window_*` columns to `SCAN_METADATA_TABLE`, so existing bundles need no re-conversion.
-- **P2–P7: not started.**
+- **P1 (EncyclopeDIA spectra file, the `.dia`): done, 2026-10-11.**
+  `massspec encyclopedia {export-spectra, import-spectra, compare-spectra}`;
+  `io/encyclopedia/{_dia.py, _dia_write.py, _dia_import.py, _dia_diff.py}`;
+  `massspec/acquisition_structure.py`; `SCAN_METADATA_TABLE` v3 (`scan_window_lower/upper`).
+  Measured against the reference files in `/mnt/e/261010_u2os`, starting from each `.raw`
+  (`massspec convert` → `massspec encyclopedia export-spectra` →
+  `massspec encyclopedia compare-spectra`, no tolerances):
+  - **Single-run DIA** (`…gpf-900-1000…`): identical. 81,850 scans, 109,001,282 peaks, the 49
+    isolation windows and every metadata value both files carry.
+  - **Merged GPF** (six fractions): identical in all 1,000,398 shared scans, 1,147,820,018 peaks,
+    the 294 windows, the `fractions` table and all metadata. The only difference is two MS2 scans
+    the reference lacks, and the `SpectrumIndex` shift that follows from them.
+  - **DDA**: identical in all 188,509 shared scans and 195,219,042 peaks. Differences: one MS2
+    scan the reference lacks, and the `ranges` table (the reference lists a sample of the
+    windows; Constellation lists all of them, by design).
+  - **Round trip** (`.dia` → bundle → `.dia`): every scan and peak exact; only values derived
+    from scan times at float32 move, by one unit in the last place.
+  - **The reference writer drops scans.** Four of the eight reference files are each missing
+    one MS2 scan that the `.raw` contains and the file's own `acq.ms2_count` counts.
+    Constellation keeps them.
+  - Writing took 30 s for the 1 GB DIA run, about a minute for the 1.8 GB DDA run, and about
+    8 minutes for the merged 9.6 GB file (12 cores, with other jobs running). The writer reads the MS1 scan range from the new columns, or from `filter_string`
+    for bundles converted before they existed, so nothing needs re-converting.
+  - Not done here, and still the first job of P2: an actual search on a Constellation-written
+    file. Equal content makes that very likely to work, but it has not been run.
+  - 15 provenance metadata keys the reference carries (instrument-method text, sample vial,
+    integrated-intensity summaries) are not written, because a bundle does not hold them. The
+    search jar reads none of them.
+- **P2–P7: not started.** `process-dia` (jar-side conversion) is still a CLI verb; the plan
+  removes it in P4, once the new search path takes bundles directly.
+- **Naming (PI, 2026-10-11).** No command or flag is named `dia`: DIA is an acquisition method,
+  and `.dia` is one tool's file extension. The P1 commands were first built as
+  `massspec dia {export,import,diff}` and renamed to the `massspec encyclopedia …-spectra` group
+  above; the plan text below has been updated to match. Later phases follow the same rule
+  (`massspec encyclopedia {run,flags}` was already tool-named).
 - **PI decisions on P0's open items (2026-10-11).** `EncyclopediaTwo` is not a working or
   available program (probably unfinished code in the jar) and is of no interest: ignore it.
   Undocumented parameters are to be recorded, not used: they are listed in
@@ -196,8 +217,8 @@ alongside.
 | Phase | Goal | Main files | Proves |
 |---|---|---|---|
 | **P0** Command survey and pin | Capture `-h` for the top level and every program and sub-program of 6.9.23; build the flag JSON; raise the floor; diff against the 6.5.15 notes | `scripts/{survey-encyclopedia.py*, build-encyclopedia-cli-json.py*}`; `constellation/data/_raw/encyclopedia/6.9.23/help/`*; `constellation/data/encyclopedia_cli.json`*; `thirdparty/{registry.py, encyclopedia.py, jvm.py}` (`ToolSpec.min_version`, doctor "too old", bundled JRE preferred for this tool); `search/encyclopedia/_common.py`; `scripts/install-encyclopedia.sh` (`--from-dir`); `docs/plans/encyclopedia-6.9.23-survey.md`* replacing the 6.5.15 notes | The full flag set per program is in the repo and tested against; the jar is installed off the Windows drive and resolved with its bundled Java; `doctor` flags a too-old jar. Open items for the PI: how `EncyclopediaTwo` is invoked, and whether the unlisted flags should be used |
-| **P1** `.dia` codec | Streaming reader (0.5.0 and 0.8.0), writer (0.8.0, single and merged), `.dia` → bundle import, structural diff; `massspec dia {export,import,diff}` | `massspec/io/encyclopedia/{_dia.py, _dia_write.py*, _dia_diff.py*, _codec.py, _schema.py}`; `massspec/schemas.py` + `readers/thermo/_read.py` (additive `scan_window_lower/upper`) | Each reference `.dia` → import → export → diff is clean, the merged one included; synthetic round trip runs in CI |
-| **P2** First real run | With today's verbs, run end to end on the reference data; record the DDL and location of every output; settle the JVM flags | `constellation/data/_raw/encyclopedia/6.9.23/{schema,outputs}/`*; `thirdparty/jvm.py` | Re-running the reference search on the reference `.dia` reproduces it (and measures run-to-run noise). raw → bundle → Constellation `.dia` → the same search lands within that noise. Constellation `.dia` vs reference `.dia` by `dia diff` |
+| **P1** EncyclopeDIA spectra file (`.dia`) | Streaming reader (0.5.0 and 0.8.0), writer (0.8.0, single and merged), `.dia` → bundle import, structural diff; `massspec encyclopedia {export-spectra,import-spectra,compare-spectra}` | `massspec/io/encyclopedia/{_dia.py, _dia_write.py*, _dia_diff.py*, _codec.py, _schema.py}`; `massspec/schemas.py` + `readers/thermo/_read.py` (additive `scan_window_lower/upper`) | Each reference `.dia` → import → export → diff is clean, the merged one included; synthetic round trip runs in CI |
+| **P2** First real run | With today's verbs, run end to end on the reference data; record the DDL and location of every output; settle the JVM flags | `constellation/data/_raw/encyclopedia/6.9.23/{schema,outputs}/`*; `thirdparty/jvm.py` | Re-running the reference search on the reference `.dia` reproduces it (and measures run-to-run noise). raw → bundle → Constellation `.dia` → the same search lands within that noise. Constellation `.dia` vs reference `.dia` by `encyclopedia compare-spectra` |
 | **P3** Foundations | Split the 3,848-line CLI module (pure move); shared stage and manifest helpers; identity | `massspec/cli.py` → `massspec/cli/`; `core/{stages.py*, manifests.py*}`; `massspec/manifest.py*`; `massspec/acquisitions.py`; `massspec/library/ids.py*` | Suite unchanged after the split; canonical-key tests over every sample modseq |
 | **P4** Single-acquisition path | New runner, mode resolver, mirror reader, typed manifest, experiment layout; `search` takes bundles / `.raw` / `.dia`; `process-dia` removed; `massspec encyclopedia {run,flags}` | `search/encyclopedia/{cli_spec.py*, runner.py*, params.py*, outputs.py*}`; `io/encyclopedia/{_mirror.py*, _project.py*}`; `massspec/workflows/encyclopedia.py*`; `search/schemas.py`, `quant/schemas.py`, `quant/targets.py` | Parquet row counts equal SQL counts; no orphan ids; `chromatogram extract` accepts the result as targets |
 | **P5** Orchestration | Fan-out, resume, per-unit status, detach/follow; fraction merge; chromatogram-library step with the collision filter; quant report | `workflows/encyclopedia.py`; `core/detach.py*`; `_dia_write.py`; `cli/encyclopedia.py` | Kill + `--resume` reruns only unfinished units; chained standalone equals orchestrated |
@@ -241,7 +262,7 @@ pipeline defect to the review note.
 | CI | nothing | Flags vs snapshot JSON; `.dia` round trip on a generated bundle; reader on SQLite built from checked-in 6.9.23 DDL; resume with a fake jar |
 | Samples | `$CONSTELLATION_ENCYCLOPEDIA_SAMPLES` (old 2.12.30 files) and the reference folder | `.dia` round trip for 0.5.0 and 0.8.0; row-count invariants on the reference `.elib` and ScribeTwo `.dlib` |
 | Jar | 6.9.23 installed | Flag acceptance; re-survey equals snapshot |
-| Jar + data | reference folder, FASTA, library | Reproduce the reference search; Constellation `.dia` vs reference `.dia` (`dia diff`, then search results within measured noise) |
+| Jar + data | reference folder, FASTA, library | Reproduce the reference search; Constellation `.dia` vs reference `.dia` (`encyclopedia compare-spectra`, then search results within measured noise) |
 | + Thermo DLLs | | The same starting from `.raw` |
 
 Comparisons are on logical content sorted by natural key, never SQLite bytes; search results are
@@ -249,7 +270,7 @@ compared against the noise measured by running the same input twice.
 
 ## Main risks and the early check for each
 
-- The jar rejects or misreads a Constellation `.dia` (a wrong or missing metadata key would change how it searches, silently): the P2 run, plus `dia diff` against the reference `.dia`, metadata included.
+- The jar rejects or misreads a Constellation `.dia` (a wrong or missing metadata key would change how it searches, silently): the P2 run, plus `encyclopedia compare-spectra` against the reference `.dia`, metadata included.
 - Thermo centroids differ from the reference `.dia`'s peak lists: per-scan peak count and intensity sum on 100 scans.
 - 6.9.23 changed something the frozen pipeline relies on (for example `.raw` passed straight to search): snapshot test over its four arg builders in P0, one direct-`.raw` search in P2; reported, not patched.
 - The jar's commands drift again or differ from what help shows (the repo's notes were already wrong for ScribeTwo): P0 checks the full snapshot in, and tests compare every flag Constellation emits against it.

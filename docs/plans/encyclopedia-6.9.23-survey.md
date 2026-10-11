@@ -152,6 +152,23 @@ prediction; `-models`, `-url`).
   `<source> search type` (`EncyclopeDIA`, `ScribeTwoDDA`) and `PercolatorVersion` (`3.01`,
   `JavaPot`).
 - **ScribeTwo writes its result as `<input>.dia.dlib`**, in the same container.
+- **The reference `.dia` files were written by MSRawJava** (its `EncyclopeDIAFile` class; the
+  library is bundled in both EncyclopeDIA and MSForest). Found while reproducing them:
+  - Scalars are stored float32-rounded; `TIC` is the sequential float32 sum of the stored
+    intensities; `ranges.DutyCycle` is computed from unrounded scan times.
+  - **DDA:** `spectra.PrecursorName` is the parent MS1 scan number (0 in DIA, which has none);
+    `IsolationWindowTarget` is the full-precision isolation m/z, not the filter string's four
+    decimals; metadata carries `rawFileStructure.dataAcquisitionType` only, with no `isStaggered`
+    or `precursorMarginSize`.
+  - **DDA `ranges` are a sample.** 134,180 rows for 159,789 distinct windows, and `NumWindows`
+    sums to 149,158 of 179,532 MS2 scans. What is sampled is not recoverable from the file.
+  - **Four of the eight reference `.dia` files are each missing one MS2 scan.** The `.raw`
+    contains it, `massspec convert` reads it, and the file's own `acq.ms2_count` counts it, but
+    the `spectra` table has one row fewer: scan 156345 of `…gpf-500-600…`, 88035 of
+    `…gpf-800-900…`, 225323 of `…350-1200_8mz…`, 139436 of `…dda…-1`. Nothing about those scans
+    looks unusual (thousands of peaks, ordinary injection times). The merged GPF file inherits two
+    of them. Constellation keeps every scan, so its files differ from the reference by exactly
+    these.
 - **Peptide-centric sidecars**, all `<input>.dia.*` beside the input: `.features.txt` (Percolator
   input, 35 columns), `.encyclopedia.txt` and `.encyclopedia.decoy.txt` (Percolator output),
   `.encyclopedia.txt.model`, `first` / `final` `rt_fit`, `ms1_fit`, `ms2_fit` tables with PDFs,
@@ -162,4 +179,5 @@ prediction; `-models`, `-url`).
 - Whether search accepts a `.raw` directly in 6.9.23.
 - Whether `-libexport` needs `-f` in its default mode.
 - What ScribeTwo writes when run from the CLI.
-- Which tool and version wrote the reference `.dia` files (`conversion.outputType = EncyclopeDIA`).
+- Whether ScribeTwo's DDA search reads the `ranges` table (Constellation writes every window; the
+  reference writes a sample).
