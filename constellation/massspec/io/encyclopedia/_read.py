@@ -22,7 +22,7 @@ from constellation.massspec.acquisitions import (
     Acquisitions,
 )
 from constellation.massspec.io.encyclopedia import _sql
-from constellation.massspec.io.encyclopedia._annotate import annotate_peaks
+from constellation.massspec.io.encyclopedia._annotate import annotate_peaks_counted
 from constellation.massspec.io.encyclopedia._codec import (
     decompress_intensity,
     decompress_mz,
@@ -62,11 +62,20 @@ class EncyclopediaReadResult:
     ``entries`` rows, populated ``peptidequants`` / ``fragmentquants``
     / ``retentiontimes`` tables). ``search`` is populated when
     ``peptidescores`` or ``proteinscores`` carry any rows.
+
+    ``caveats`` says, in sentences with counts, where this projection
+    is not the whole file: stored fragment peaks that were not carried
+    into ``library.fragments``, quantity rows that matched no peptide,
+    and the fact that ``quant.precursor_quant.intensity`` is not the
+    quantity EncyclopeDIA computed. Empty when none applies. Callers
+    that write the projection to disk should show them and record them,
+    so a reader of the Parquet copy is not left to find out.
     """
 
     library: Library
     quant: Quant | None
     search: Search | None
+    caveats: tuple[str, ...] = ()
 
 
 def read_encyclopedia(
@@ -102,7 +111,7 @@ def read_encyclopedia(
         meta = _sql.fetch_metadata(con)
 
         # ── Phase A: Library ───────────────────────────────────────
-        library, peptide_id_for, precursor_id_for = _build_library(
+        library, peptide_id_for, precursor_id_for, peak_counts = _build_library(
             con,
             annotate_fragments=annotate_fragments,
             fragment_tolerance_ppm=fragment_tolerance_ppm,
@@ -112,12 +121,32 @@ def read_encyclopedia(
         )
 
         # ── Phase B: Quant (conditional) ───────────────────────────
-        quant = _build_quant(con, peptide_id_for, precursor_id_for)
+        quant, quant_notes = _build_quant(con, peptide_id_for, precursor_id_for)
 
         # ── Phase C: Search (conditional) ──────────────────────────
         search = _build_search(con, library, peptide_id_for, include_decoys)
 
-    return EncyclopediaReadResult(library=library, quant=quant, search=search)
+    caveats: list[str] = []
+    n_stored, n_annotated = peak_counts
+    if n_stored > n_annotated:
+        dropped = n_stored - n_annotated
+        caveats.append(
+            f"{dropped:,} of {n_stored:,} stored fragment peaks "
+            f"({100 * dropped / n_stored:.1f}%) are not in the fragment table: "
+            f"only peaks within {fragment_tolerance_ppm:g} ppm of a b or y ion at "
+            f"fragment charge 1 or 2 are kept (intact-precursor ions and higher-charge "
+            f"fragments are the usual remainder)"
+        )
+    n_twice = library.fragments.num_rows - n_annotated
+    if n_twice > 0:
+        caveats.append(
+            f"{n_twice:,} fragment rows repeat a stored peak: it fits two theoretical "
+            f"ions of the same m/z and is listed under each, with the same intensity"
+        )
+    caveats.extend(quant_notes)
+    return EncyclopediaReadResult(
+        library=library, quant=quant, search=search, caveats=tuple(caveats)
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -133,8 +162,11 @@ def _build_library(
     vocab: ModVocab,
     include_decoys: bool,
     metadata_extras: dict[str, Any],
-) -> tuple[Library, dict, dict]:
-    """Build the Library + return id-mapping dicts the Quant/Search build need."""
+) -> tuple[Library, dict, dict, tuple[int, int]]:
+    """Build the Library + return id-mapping dicts the Quant/Search build
+    need, and ``(stored, annotated)``: the number of fragment peaks the
+    file stores for the entries read and how many of them were
+    annotated (both 0 when fragments are not annotated)."""
     # 1. peptidetoprotein → distinct accessions + edges.
     accession_to_id: dict[str, int] = {}
     pp_pairs: list[tuple[str, str]] = []  # (accession, peptide_seq)
@@ -168,6 +200,8 @@ def _build_library(
     precursor_id_for: dict[tuple[int, int, str], int] = {}  # (peptide_id, charge, source) → precursor_id
     precursor_rows: list[dict[str, Any]] = []
     fragment_rows: list[dict[str, Any]] = []
+    n_stored_peaks = 0
+    n_annotated_peaks = 0
 
     valid_peptide_seqs = {seq for _acc, seq in pp_pairs}
 
@@ -214,16 +248,19 @@ def _build_library(
 
         if annotate_fragments:
             mz_t = decompress_mz(row["MassArray"], int(row["MassEncodedLength"]))
+            n_stored_peaks += int(mz_t.numel())
             int_t = decompress_intensity(
                 row["IntensityArray"], int(row["IntensityEncodedLength"])
             )
-            for frag in annotate_peaks(
+            frags, n_peaks = annotate_peaks_counted(
                 peptidoform,
                 precursor_charge=charge,
                 obs_mz=mz_t,
                 obs_intensity=int_t,
                 tolerance_ppm=fragment_tolerance_ppm,
-            ):
+            )
+            n_annotated_peaks += n_peaks
+            for frag in frags:
                 frag["precursor_id"] = cid
                 fragment_rows.append(frag)
 
@@ -234,13 +271,20 @@ def _build_library(
     # 3. Build PROTEIN_PEPTIDE_EDGE; deduplicate (acc, peptide_seq) pairs
     # since a peptide can appear in peptidetoprotein with both decoy and
     # target rows for the same accession.
+    # A peptide may appear under multiple charge / modified states;
+    # protein↔peptide adjacency is at the canonical-sequence level, so
+    # index the peptides by sequence once. (Scanning every peptide for
+    # every protein link is quadratic: 1.1e9 comparisons and 99 s on a
+    # 32,000-precursor search result, and days on a proteome-scale
+    # predicted library.)
+    peptide_ids_by_seq: dict[str, list[int]] = {}
+    for (pseq, _modseq), pid in peptide_id_for.items():
+        peptide_ids_by_seq.setdefault(pseq, []).append(pid)
     edges: set[tuple[int, int]] = set()
     for acc, seq in pp_pairs:
-        # A peptide may appear under multiple charge / modified states;
-        # protein↔peptide adjacency is at the canonical-sequence level.
-        for (pseq, _modseq), pid in peptide_id_for.items():
-            if pseq == seq:
-                edges.add((accession_to_id[acc], pid))
+        protein_id = accession_to_id[acc]
+        for pid in peptide_ids_by_seq.get(seq, ()):
+            edges.add((protein_id, pid))
     pp_table = pa.Table.from_pylist(
         [{"protein_id": p, "peptide_id": k} for p, k in sorted(edges)],
         schema=PROTEIN_PEPTIDE_EDGE,
@@ -254,7 +298,7 @@ def _build_library(
         protein_peptide=pp_table,
         metadata_extras=metadata_extras,
     )
-    return library, peptide_id_for, precursor_id_for
+    return library, peptide_id_for, precursor_id_for, (n_stored_peaks, n_annotated_peaks)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -266,21 +310,26 @@ def _build_quant(
     con,
     peptide_id_for: dict[tuple[str, str], int],
     precursor_id_for: dict[tuple[int, int, str], int],
-) -> Quant | None:
-    """Build a Quant if any sample-specific data is present, else None."""
+) -> tuple[Quant | None, list[str]]:
+    """Build a Quant if any sample-specific data is present, else None.
+
+    The second value is the caveats that apply to it (see
+    :class:`EncyclopediaReadResult`).
+    """
+    notes: list[str] = []
     has_chrom = _entries_have_chromatograms(con)
     has_pq = _sql.has_rows(con, "peptidequants")
     has_fq = _sql.has_rows(con, "fragmentquants")
     has_rt = _sql.has_rows(con, "retentiontimes")
     if not (has_chrom or has_pq or has_fq or has_rt):
-        return None
+        return None, notes
 
     # Acquisitions: distinct entries.SourceFile values.
     source_files = sorted(
         {src for (_pid, _ch, src) in precursor_id_for.keys() if src}
     )
     if not source_files:
-        return None
+        return None, notes
     acq_rows = [
         {
             "acquisition_id": i,
@@ -339,44 +388,50 @@ def _build_quant(
     # PEPTIDE_QUANT: from peptidequants table when populated, else
     # rolled up from PRECURSOR_QUANT.
     if has_pq:
-        peptide_quant_rows = []
-        seen_pkq: set[tuple[int, int]] = set()
+        notes.append(
+            "precursor_quant.intensity is the sum of each entry's stored spectrum, not "
+            "the quantity EncyclopeDIA computed; that (peptidequants.TotalIntensity, "
+            "over the ions it chose to quantify with, summed across charge states) is "
+            "peptide_quant.abundance"
+        )
+        # One row per (peptide, acquisition); peptidequants has one per
+        # charge state, so intensities are summed across charges.
+        peptide_quant_by_key: dict[tuple[int, int], dict[str, Any]] = {}
+        n_unmatched = 0
         for row in _sql.iter_peptidequants(con):
             modseq_proforma = format_proforma(
                 parse_encyclopedia_modseq(row["PeptideModSeq"])
             )
             key = (row["PeptideSeq"], modseq_proforma)
-            if key not in peptide_id_for:
-                continue
-            peptide_id = peptide_id_for[key]
             source_file = row["SourceFile"]
             if source_file not in source_to_acq:
                 continue
-            acq_id = source_to_acq[source_file]
-            if (peptide_id, acq_id) in seen_pkq:
-                # peptidequants can have multiple rows per (peptide,
-                # source) when the peptide appears at multiple charge
-                # states. Sum intensities across charges.
-                # Find the existing row and accumulate.
-                for r in peptide_quant_rows:
-                    if r["peptide_id"] == peptide_id and r["acquisition_id"] == acq_id:
-                        r["abundance"] += float(row["TotalIntensity"])
-                        break
+            if key not in peptide_id_for:
+                n_unmatched += 1
                 continue
-            seen_pkq.add((peptide_id, acq_id))
-            peptide_quant_rows.append(
-                {
-                    "peptide_id": peptide_id,
-                    "acquisition_id": acq_id,
-                    "abundance": float(row["TotalIntensity"]),
-                    "score": None,
-                }
+            pk = (peptide_id_for[key], source_to_acq[source_file])
+            existing = peptide_quant_by_key.get(pk)
+            if existing is not None:
+                existing["abundance"] += float(row["TotalIntensity"])
+                continue
+            peptide_quant_by_key[pk] = {
+                "peptide_id": pk[0],
+                "acquisition_id": pk[1],
+                "abundance": float(row["TotalIntensity"]),
+                "score": None,
+            }
+        if n_unmatched:
+            notes.append(
+                f"{n_unmatched:,} peptidequants rows matched no peptide of the entries "
+                f"table (same sequence, modified sequence not recognised as the same) "
+                f"and are left out of peptide_quant"
             )
+        peptide_quant_rows = list(peptide_quant_by_key.values())
         peptide_quant_table = pa.Table.from_pylist(peptide_quant_rows, schema=PEPTIDE_QUANT) if peptide_quant_rows else PEPTIDE_QUANT.empty_table()
     else:
         peptide_quant_table = PEPTIDE_QUANT.empty_table()
 
-    return Quant(
+    quant = Quant(
         acquisitions=acquisitions,
         protein_quant=PROTEIN_QUANT.empty_table(),
         peptide_quant=peptide_quant_table,
@@ -384,6 +439,7 @@ def _build_quant(
         transmission_protein_peptide=TRANSMISSION_PROTEIN_PEPTIDE.empty_table(),
         transmission_peptide_precursor=TRANSMISSION_PEPTIDE_PRECURSOR.empty_table(),
     )
+    return quant, notes
 
 
 def _entries_have_chromatograms(con) -> bool:

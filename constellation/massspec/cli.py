@@ -1291,6 +1291,19 @@ def _not_yet_wired(subcommand: str) -> int:
     return 2
 
 
+def _report_ingest_caveats(ingest_result, ingest_info: dict[str, object]) -> None:
+    """Show, and record in the manifest, where the Parquet copy of a
+    ``.dlib`` / ``.elib`` is not the whole file (dropped fragment peaks,
+    unmatched quantity rows, what ``precursor_quant.intensity`` is).
+    The file itself is complete; this is about the copy."""
+    caveats = list(getattr(ingest_result, "caveats", ()))
+    if not caveats:
+        return
+    ingest_info["caveats"] = caveats
+    for caveat in caveats:
+        print(f"note: ingest: {caveat}", file=sys.stderr)
+
+
 def _cmd_massspec_search(args: argparse.Namespace) -> int:
     """DIA library search via EncyclopeDIA's default mode.
 
@@ -1483,6 +1496,7 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
                 "protein_scores": ingest_result.search.protein_scores.num_rows,
             }
         ingest_info["counts"] = ingest_counts
+        _report_ingest_caveats(ingest_result, ingest_info)
 
     # ── manifest + _SUCCESS ─────────────────────────────────────────
     _write_manifest_for_search(
@@ -1778,6 +1792,7 @@ def _cmd_predict_library_encyclopedia(args: argparse.Namespace) -> int:
             return 3
         library_pqdir = output_dir / "library_pqdir"
         save_library(ingest_result.library, library_pqdir, format="parquet_dir")
+        _report_ingest_caveats(ingest_result, ingest_info)
         ingest_info["library_counts"] = {
             "proteins": ingest_result.library.proteins.num_rows,
             "peptides": ingest_result.library.peptides.num_rows,
@@ -2415,6 +2430,7 @@ def _cmd_massspec_library_export(args: argparse.Namespace) -> int:
             return 3
         library_pqdir = output_dir / "library_pqdir"
         save_library(ingest_result.library, library_pqdir, format="parquet_dir")
+        _report_ingest_caveats(ingest_result, ingest_info)
         ingest_info["library_counts"] = {
             "proteins": ingest_result.library.proteins.num_rows,
             "peptides": ingest_result.library.peptides.num_rows,
@@ -3059,6 +3075,7 @@ def _cmd_massspec_collision_filter(args: argparse.Namespace) -> int:
         else:
             library_pqdir = output_dir / "library_pqdir"
             save_library(ingest.library, library_pqdir, format="parquet_dir")
+            _report_ingest_caveats(ingest, ingest_info)
             ingest_info["library_counts"] = {
                 "proteins": ingest.library.proteins.num_rows,
                 "peptides": ingest.library.peptides.num_rows,
