@@ -1280,7 +1280,7 @@ def _not_yet_wired(subcommand: str) -> int:
     print(
         f"error: `constellation massspec {subcommand}` is registered for "
         f"dashboard introspection but the runner wiring is not yet "
-        f"implemented. See docs/plans/encyclopedia-6.5.15-utilities.md for "
+        f"implemented. See docs/plans/encyclopedia-6.9.23-survey.md for "
         f"the rollout order.",
         file=sys.stderr,
     )

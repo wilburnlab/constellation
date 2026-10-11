@@ -9,7 +9,7 @@ discovery, JVM resolution, or subprocess plumbing.
 Priority utilities (CLI verb → jar invocation):
 
 ==================  =================================================
-Constellation CLI   EncyclopeDIA 6.5.15 invocation
+Constellation CLI   EncyclopeDIA invocation (pinned >= 6.9.23)
 ==================  =================================================
 ``search``          (default) ``-i <mzml|dia> -l <library> [...]``
 ``predict-library`` ``-convert -fastaToJChronologerLibrary``
@@ -17,12 +17,16 @@ Constellation CLI   EncyclopeDIA 6.5.15 invocation
 ``library-export``  ``-libexport``
 ==================  =================================================
 
-Other v6.5.15 programs (``-walnut``, ``-thesaurus``, ``-xcordia``,
-``-scribe``, ``-scribetwo{dda,dia}``, ``-browser``, ``-batch``, the
-rest of ``-convert``) are deliberately not wrapped yet — they enter
-``encyclopedia.<utility>.py`` on-demand when a lab use case appears.
-The authoritative inventory lives in
-``docs/plans/encyclopedia-6.5.15-utilities.md``.
+Other programs (``-scribetwo``, ``-scribe``, ``-walnut``,
+``-thesaurus``, ``-xcordia``, ``-batch``, the rest of ``-convert``) are
+not wrapped yet.
+
+The jar's programs and flags are not written down by hand: they are
+captured from the pinned jar's ``-h`` output into
+``constellation/data/encyclopedia_cli.json`` and queried through
+:mod:`.cli_spec`. ``tests/test_encyclopedia_cli_spec.py`` checks every
+flag these wrappers emit against that snapshot. The survey note is
+``docs/plans/encyclopedia-6.9.23-survey.md``.
 """
 
 from __future__ import annotations

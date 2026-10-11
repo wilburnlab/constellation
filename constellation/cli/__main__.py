@@ -34,7 +34,7 @@ from constellation.thirdparty import (  # noqa: F401
     samtools,
     thermo,
 )
-from constellation.thirdparty.registry import registered, try_find
+from constellation.thirdparty.registry import meets_min_version, registered, try_find
 
 
 _LIBSTDCXX_REEXEC_SENTINEL = "_CONSTELLATION_LIBSTDCXX_REEXECED"
@@ -448,6 +448,15 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
             status = "not found"
             where = f"(set {spec.env_var} or run {spec.install_script or '—'})"
             version = "—"
+        elif not meets_min_version(handle):
+            # Resolved, but below the tool's declared floor: the commands
+            # that use it will refuse to run, so don't call it "ok".
+            status = "too old"
+            where = (
+                f"{handle.source}: {handle.path} "
+                f"(needs >= {spec.min_version}; run {spec.install_script or '—'})"
+            )
+            version = handle.version or "—"
         else:
             status = "ok"
             where = f"{handle.source}: {handle.path}"

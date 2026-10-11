@@ -1,0 +1,32 @@
+SearchToLIB Help
+You should prefix your arguments with a high memory setting, e.g. "-Xmx8g" for 8gb
+Other Programs:
+	-pecan	run Pecanpie export (use -pecan -h for Pecan help)
+	-xcordia	run XCorDIA export (use -xcordia -h for XCorDIA help)
+	-phospho	run phospho localization export (use -phospho -h for localization help)
+Required Parameters:
+	-i	input .DIA or .MZML file or directory
+	-o	output library .ELIB file
+	-a	align between files (default=true)
+	-blib	write .BLIB instead of .ELIB (default=false)
+Potentially Required Parameters:
+	-l	original searched library .DLIB or .ELIB file (required by EncyclopeDIA Export)
+	-f	original fasta file (required by Pecan/XCorDIA Export)
+	-t	original target file (optional for Pecan/XCorDIA Export)
+Other Parameters:
+	-fixed                               (default: C=57.0214635)
+	-foffset                             (default: 0)
+	-ftol                                (default: 10)
+	-ftolunits                           (default: ppm)
+	-integratePrecursors                 (default: false)
+	-localizationModification            (default: none)
+	-maskBadIntegrations                 (default: false)
+	-minNumOfQuantitativePeaks           (default: 3)
+	-normalizeByTIC                      (default: true)
+	-numberOfExtraDecoyLibrariesSearche  (default: 0.0)
+	-numberOfQuantitativePeaks           (default: 5)
+	-percolatorLocation                  (default: internal)
+	-percolatorProteinThreshold          (default: 0.01)
+	-percolatorThreshold                 (default: 0.01)
+	-smoothIntegrations                  (default: true)
+	-subtractBackground                  (default: true)

@@ -245,22 +245,27 @@ def test_write_manifest_round_trip(tmp_path: Path) -> None:
     assert parsed["tool"]["version"] == "6.5.15"
 
 
-# ── minimum-version pin (>= 6.5.15) ────────────────────────────────────
+# ── minimum-version pin (>= 6.9.23) ────────────────────────────────────
 
 
 def test_minimum_encyclopedia_version_is_pinned() -> None:
-    assert MINIMUM_ENCYCLOPEDIA_VERSION == "6.5.15"
+    from constellation.thirdparty.encyclopedia import MINIMUM_VERSION
+
+    assert MINIMUM_ENCYCLOPEDIA_VERSION == "6.9.23"
+    # One floor, defined once: the registry spec and the guard agree.
+    assert MINIMUM_ENCYCLOPEDIA_VERSION == MINIMUM_VERSION
 
 
 @pytest.mark.parametrize(
     ("version", "supported"),
     [
-        ("6.5.15", True),    # the floor
-        ("6.5.16", True),
-        ("6.6.0", True),     # newer minor — forward-compatible
+        ("6.9.23", True),    # the floor
+        ("6.9.24", True),
+        ("6.10.0", True),    # newer minor — numeric, not string, compare
         ("7.0.0", True),     # much newer
         ("2.12.30", False),  # legacy public release — string-compare TRAP
-        ("6.5.14", False),   # just below the floor
+        ("6.9.22", False),   # just below the floor
+        ("6.5.15", False),   # the previous floor
         (None, True),        # unparseable build: can't prove it's old -> allowed
     ],
 )
@@ -277,16 +282,16 @@ def _encyclopedia_handle(version):
 
 
 def test_require_min_encyclopedia_rejects_old(capsys) -> None:
-    rc = require_min_encyclopedia(_encyclopedia_handle("2.12.30"))
+    rc = require_min_encyclopedia(_encyclopedia_handle("6.5.15"))
     assert rc == 1
     err = capsys.readouterr().err
-    assert "2.12.30" in err          # names the offending version
-    assert "6.5.15" in err           # and the floor
+    assert "6.5.15" in err           # names the offending version
+    assert "6.9.23" in err           # and the floor
 
 
 def test_require_min_encyclopedia_accepts_current_and_unparseable(capsys) -> None:
-    assert require_min_encyclopedia(_encyclopedia_handle("6.5.15")) == 0
-    assert require_min_encyclopedia(_encyclopedia_handle("6.6.0")) == 0
+    assert require_min_encyclopedia(_encyclopedia_handle("6.9.23")) == 0
+    assert require_min_encyclopedia(_encyclopedia_handle("6.10.0")) == 0
     assert require_min_encyclopedia(_encyclopedia_handle(None)) == 0
     assert capsys.readouterr().err == ""
 

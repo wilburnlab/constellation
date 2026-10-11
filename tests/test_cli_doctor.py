@@ -27,3 +27,26 @@ def test_constellation_help_shows_doctor(capsys):
     assert exc.value.code == 0
     out = capsys.readouterr().out
     assert "doctor" in out
+
+
+def test_doctor_reports_a_too_old_tool(capsys, monkeypatch, tmp_path):
+    """A resolved install below its spec's ``min_version`` is not ``ok``."""
+    from constellation.cli import __main__ as cli_main
+    from constellation.thirdparty.registry import ToolHandle
+
+    real_try_find = cli_main.try_find
+
+    def _try_find(name):
+        if name != "encyclopedia":
+            return real_try_find(name)
+        spec = next(s for s in cli_main.registered() if s.name == "encyclopedia")
+        return ToolHandle(spec, tmp_path / "encyclopedia-6.5.15.jar", "env", "6.5.15")
+
+    monkeypatch.setattr(cli_main, "try_find", _try_find)
+    rc = main(["doctor"])
+    row = next(
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("encyclopedia")
+    )
+    assert "too old" in row
+    assert "6.5.15" in row and "needs >= 6.9.23" in row
+    assert rc == 1

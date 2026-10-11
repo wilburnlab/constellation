@@ -31,7 +31,7 @@ Run `constellation doctor` to see what's installed and what's missing.
 
 | Script | Tool | License | Notes |
 |---|---|---|---|
-| `install-encyclopedia.sh` | EncyclopeDIA ≥ 6.5.15 | Apache-2.0 | Installs to `~/.constellation/encyclopedia/`. `--installer <install4j.sh>` works today; default URL mode pending the public ≥ 6.5.15 release. |
+| `install-encyclopedia.sh` | EncyclopeDIA ≥ 6.9.23 | Apache-2.0 | Installs the whole app dir (jar + `lib/` + bundled JRE; the jar is not standalone) to `~/.constellation/encyclopedia/`. `--installer <install4j.sh>` and `--from-dir <extracted install>` work today; default URL mode pending a public ≥ 6.9.23 release. |
 
 More installers (Thermo DLLs, Dorado, IQ-TREE, …) land here as the
 corresponding domain modules are wired.

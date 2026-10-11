@@ -1,0 +1,8 @@
+Convert Convert BLIB to Library
+Required Parameters:
+	-i	input .BLIB file
+	-f	taxon .FASTA database
+	-higherScoresAreBetter	(true/false, default: [true])
+Other Parameters:
+	-o	output .dlib file
+	-r	input .IRTDB file

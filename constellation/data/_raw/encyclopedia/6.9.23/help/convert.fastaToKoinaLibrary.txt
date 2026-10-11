@@ -1,0 +1,39 @@
+CLI for Convert -> Create Prosit Library From FASTA using Koina
+Required Parameters:
+	-i	input .FASTA file
+
+Other Parameters:
+	-o	output .dlib file
+	-addDecoys          (default: true)
+	-adjustNCEForDIA    (default: true)
+	-defaultCharge      (default: 3)
+	-defaultNCE         (default: 33)
+	-enzyme             (default: Trypsin)
+	-maxCharge          (default: 3)
+	-maxMissedCleavage  (default: 1)
+	-maxMz              (default: 1002.7)
+	-minCharge          (default: 2)
+	-minMz              (default: 396.4)
+	-models             (default: Prosit_2020_HCD;IM2Deep_CCS;Prosit_2019_iRT)
+	-url                (default: https://koina.wilhelmlab.org:443/)
+
+Notes:
+	-addDecoys true predicts reversed decoys through Koina, writes them to the DLIB decoy table for ScribeTwo, and roughly doubles prediction time.
+
+Available Models:
+	Fragmentation Models:
+		Prosit_2020_HCD
+		Prosit_2020_CID
+		Prosit_2023_timsTOF
+		Prosit_2019_HCD
+		Prosit_2020_TMT_HCD
+		Prosit_2020_TMT_CID
+	CCS Models:
+		IM2Deep_CCS
+		AlphaPeptDeep_CCS
+	RT Models:
+		Prosit_2019_iRT
+		Chronologer_%ACN
+		DeepLC_HeLa_iRT
+		AlphaPeptDeep_iRT
+		Prosit_2020_TMT_iRT

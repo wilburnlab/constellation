@@ -18,7 +18,13 @@ Java resolution order:
     2. ``<tool_home>/jre/bin/java`` (install4j-style bundled JRE next to the jar)
     3. raise :class:`JvmNotFoundError`
 
-The bundled-JRE fallback is not tool-specific — install4j (and
+A tool whose ``ToolSpec`` sets ``prefer_bundled_jre`` swaps steps 1 and
+2: its bundled JRE wins when present, and the system ``java`` is the
+fallback. That is for tools tied to a Java major version (EncyclopeDIA
+warns outside 11-21 and bundles 21; an unpinned conda ``openjdk`` drifts
+past that).
+
+The bundled-JRE lookup is not tool-specific — install4j (and
 InstallAnywhere, and a few others) lay out an ``app/jre/bin/java`` next
 to the application jar on Linux. Any tool installed via that pattern is
 self-sufficient on a machine with no system Java.
@@ -117,15 +123,18 @@ def _resolve_java(tool_handle: ToolHandle) -> tuple[Path, str, str | None]:
     first line of ``java -version`` stderr output (e.g.
     ``openjdk version "21.0.11" 2026-04-21 LTS``) when probing succeeded.
     """
+    # install4j layout: <install_dir>/jre/bin/java sits next to the jar
+    # (the jar's parent is the install dir).
+    jar_parent = tool_handle.path.parent
+    bundled = jar_parent / "jre" / "bin" / "java"
+    if tool_handle.spec.prefer_bundled_jre and bundled.is_file():
+        return bundled, "bundled", _probe_java_version(bundled)
+
     system_java = shutil.which("java")
     if system_java is not None:
         path = Path(system_java)
         return path, "system", _probe_java_version(path)
 
-    # install4j layout: <install_dir>/jre/bin/java sits next to the jar
-    # (the jar's parent is the install dir).
-    jar_parent = tool_handle.path.parent
-    bundled = jar_parent / "jre" / "bin" / "java"
     if bundled.is_file():
         return bundled, "bundled", _probe_java_version(bundled)
 

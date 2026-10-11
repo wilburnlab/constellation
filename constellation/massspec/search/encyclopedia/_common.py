@@ -18,21 +18,22 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
+from constellation.thirdparty.encyclopedia import MINIMUM_VERSION
 from constellation.thirdparty.registry import ToolHandle, version_ge
 
 PtmToggle = Literal["off", "var", "fix"]
 
-# Constellation pins EncyclopeDIA to >= this version. 6.5.15 is the build
-# available at public release and the floor the transcriptome→proteome
-# pipeline needs — older builds (e.g. the public 2.12.30) lack the
-# ``-convert -fastaToJChronologerLibrary`` predict-library utility. The
+# Constellation pins EncyclopeDIA to >= this version (6.9.23, defined once
+# in ``thirdparty.encyclopedia``). It is the build the checked-in command
+# snapshot was captured from; the 6.5.15 floor it replaces spelled
+# ScribeTwo differently and wrote older ``.dia`` / library containers. The
 # registry resolves the highest installed jar; this is where we hard-error
 # if that's still below the floor.
-MINIMUM_ENCYCLOPEDIA_VERSION = "6.5.15"
+MINIMUM_ENCYCLOPEDIA_VERSION = MINIMUM_VERSION
 
 
 def is_supported_version(version: str | None) -> bool:
-    """``True`` when ``version`` meets the >= 6.5.15 floor.
+    """``True`` when ``version`` meets the minimum-version floor.
 
     ``None`` (the filename version probe couldn't parse the jar — an
     interim / oddly-named build the user deliberately pointed at)
@@ -47,7 +48,7 @@ def is_supported_version(version: str | None) -> bool:
 
 def require_min_encyclopedia(handle: ToolHandle, *, stream=None) -> int:
     """Hard-error guard: returns ``1`` (and prints a message) when
-    ``handle`` resolves below the >= 6.5.15 floor, else ``0``.
+    ``handle`` resolves below the minimum-version floor, else ``0``.
 
     Centralises the version check shared by the four EncyclopeDIA CLI
     handlers and the transcriptome→proteome orchestrator so they can't
@@ -64,7 +65,8 @@ def require_min_encyclopedia(handle: ToolHandle, *, stream=None) -> int:
         f"error: EncyclopeDIA {handle.version} resolved at {handle.path}, "
         f"but Constellation requires >= {MINIMUM_ENCYCLOPEDIA_VERSION}. "
         f"Install a current build: "
-        f"bash scripts/install-encyclopedia.sh --installer <path-to-6.5.15+.sh>",
+        f"bash scripts/install-encyclopedia.sh --installer <install4j .sh> "
+        f"(or --from-dir <extracted install dir>)",
         file=stream,
     )
     return 1

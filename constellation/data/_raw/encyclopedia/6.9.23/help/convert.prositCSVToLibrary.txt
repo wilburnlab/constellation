@@ -1,0 +1,6 @@
+Convert Prosit/Spectronaut/DIA-NN CSV to library
+Required Parameters:
+	-i	input .CSV file
+	-f	taxon .FASTA database
+Other Parameters:
+	-o	output .dlib file

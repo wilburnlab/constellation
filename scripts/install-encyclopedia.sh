@@ -1,35 +1,45 @@
 #!/usr/bin/env bash
-# Install EncyclopeDIA (>= 6.5.15) into Constellation's per-user cache.
+# Install EncyclopeDIA (>= 6.9.23) into Constellation's per-user cache.
 #
-# Constellation pins EncyclopeDIA to >= 6.5.15 — the version available at
-# public release and the floor the transcriptome->proteome pipeline needs
-# (older builds lack the `-convert -fastaToJChronologerLibrary`
-# predict-library utility). This script never installs anything older.
+# Constellation pins EncyclopeDIA to >= 6.9.23, the build its checked-in
+# command snapshot (constellation/data/_raw/encyclopedia/) was captured
+# from. This script never installs anything older.
 #
 # Install location (NOT third_party/ — the install4j build is a heavy app
-# dir with a bundled JRE + native MSRawJava libs, so it lives in the
-# per-user home cache alongside ~/.constellation/{references,catalogs,...}):
+# dir with a bundled JRE, ~100 library jars and native MSRawJava libs, so it
+# lives in the per-user home cache alongside
+# ~/.constellation/{references,catalogs,...}):
 #
 #   ~/.constellation/encyclopedia/<version>/encyclopedia-<version>.jar
+#   ~/.constellation/encyclopedia/<version>/lib/...   (the jar's Class-Path)
 #   ~/.constellation/encyclopedia/<version>/jre/...   (bundled by install4j)
 #   ~/.constellation/encyclopedia/current  -> <version>/   (symlink)
 #
+# The jar is NOT standalone: its manifest Class-Path points at lib/ beside
+# it, so the whole app dir has to be installed, never the jar on its own.
+#
 # `constellation.thirdparty.registry.find("encyclopedia")` auto-discovers
 # this location (env var -> ~/.constellation/encyclopedia/current ->
-# third_party -> $PATH). Override with $CONSTELLATION_ENCYCLOPEDIA_HOME to
-# point at an install elsewhere (e.g. a shared cluster install or an
-# ad-hoc dev build); in that case you don't need this script.
+# third_party). Override with $CONSTELLATION_ENCYCLOPEDIA_HOME to point at
+# an install elsewhere (e.g. a shared cluster install); in that case you
+# don't need this script.
 #
-# Two modes:
+# Three modes:
 #   --installer <path>   run a local install4j self-extracting installer
-#                        (the lab's 6.5.15+ build). WORKS TODAY.
+#                        (the lab's build). WORKS TODAY.
+#   --from-dir <path>    copy an already-extracted install directory (the
+#                        one holding encyclopedia-<version>.jar, lib/ and
+#                        jre/). WORKS TODAY. Use this to move an install off
+#                        a slow or foreign filesystem (a Windows drive under
+#                        WSL, a network mount).
 #   (default)            download from the public release URL. The public
-#                        >= 6.5.15 release is NOT YET PUBLISHED, so the
+#                        >= 6.9.23 release is NOT YET PUBLISHED, so the
 #                        default mode currently errors and points you at
-#                        --installer.
+#                        the two modes above.
 #
 # Usage:
-#   bash scripts/install-encyclopedia.sh --installer /path/to/encyclopedia-6.5.15.sh
+#   bash scripts/install-encyclopedia.sh --installer /path/to/EncyclopeDIA_unix_6_9_23.sh
+#   bash scripts/install-encyclopedia.sh --from-dir /path/to/EncyclopeDIA
 #   bash scripts/install-encyclopedia.sh --installer ... --sha256 <hex>   # verify the installer blob
 #   bash scripts/install-encyclopedia.sh --installer ... --force          # overwrite an existing install
 #   bash scripts/install-encyclopedia.sh                                  # default URL mode (pending public release)
@@ -37,13 +47,13 @@
 # Apache-2.0; no license-acknowledgement prompt required.
 set -euo pipefail
 
-MINIMUM_VERSION="6.5.15"
+MINIMUM_VERSION="6.9.23"
 
-# Public >= 6.5.15 release artifact — NOT YET PUBLISHED. Leave these as the
+# Public >= 6.9.23 release artifact — NOT YET PUBLISHED. Leave these as the
 # sentinel until a public release exists; default mode errors helpfully
 # while RELEASE_URL is unset. When a release ships, set RELEASE_URL to the
-# download (a `.jar` or an install4j `.sh`) and RELEASE_SHA256 to its
-# verified digest. The download artifact type is auto-detected.
+# download (the install4j `.sh`) and RELEASE_SHA256 to its
+# verified digest. It must be the install4j `.sh`: a bare jar cannot run.
 RELEASE_URL="__UNSET__"
 RELEASE_SHA256="__UNSET__"
 
@@ -51,6 +61,7 @@ INSTALL_ROOT="${HOME}/.constellation/encyclopedia"
 
 # ── Arg parsing ─────────────────────────────────────────────────────────
 installer_path=""
+from_dir=""
 sha256_override=""
 force=0
 
@@ -63,6 +74,7 @@ print_usage() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --installer) installer_path="${2:?--installer requires a path}"; shift 2 ;;
+        --from-dir)  from_dir="${2:?--from-dir requires a path}"; shift 2 ;;
         --sha256)    sha256_override="${2:?--sha256 requires a hex digest}"; shift 2 ;;
         --force)     force=1; shift ;;
         -h|--help)   print_usage; exit 0 ;;
@@ -78,18 +90,10 @@ if ! printf '1\n2\n' | sort -V >/dev/null 2>&1; then
     exit 1
 fi
 
-# EncyclopeDIA is a JVM tool. The install4j build bundles its own JRE, so a
-# system `java` is not strictly required to RUN it — but a bare-jar install
-# (default-mode `.jar`) would need one. Warn rather than block.
-if ! command -v java >/dev/null 2>&1; then
-    cat >&2 <<'EOF'
-warning: no `java` found on PATH.
-
-  The install4j build bundles its own JRE (jre/bin/java beside the jar),
-  so it will still run. A bare-jar install would need Java — get it via:
-      conda env update -f environment.yml --prune    # pulls in openjdk
-EOF
-fi
+# EncyclopeDIA is a JVM tool, but the install4j build bundles the JRE it
+# was built against (jre/bin/java beside the jar) and Constellation's runner
+# prefers that one, so no system `java` is needed. The jar itself warns
+# outside Java 11-21.
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 is_sentinel() { [[ "$1" == "__UNSET__" ]]; }
@@ -113,7 +117,7 @@ _check_version() {  # ver jar_basename ; exits nonzero on failure
     [[ -n "${ver}" ]] || { echo "error: cannot parse a version from ${name}" >&2; exit 1; }
     if ! version_ge "${ver}" "${MINIMUM_VERSION}"; then
         echo "error: ${name} is EncyclopeDIA ${ver}, but Constellation requires >= ${MINIMUM_VERSION}." >&2
-        echo "       Provide a >= ${MINIMUM_VERSION} build (the lab's install4j installer) via --installer." >&2
+        echo "       Provide a >= ${MINIMUM_VERSION} build via --installer or --from-dir." >&2
         exit 1
     fi
 }
@@ -188,6 +192,29 @@ install_from_installer() {  # installer_sh staging
     finalize_install "$(dirname "${jar}")" "${ver}"
 }
 
+# Copy an already-extracted install directory (jar + lib/ + jre/) into the
+# staging area, version-check it, and install. The source is left untouched.
+install_from_dir() {  # src_dir staging
+    local src="$1" staging="$2"
+    [[ -d "${src}" ]] || { echo "error: --from-dir is not a directory: ${src}" >&2; exit 1; }
+    local jar
+    jar="$(find "${src}" -maxdepth 1 -name 'encyclopedia-*.jar' -print | sort -V | tail -n1)"
+    [[ -n "${jar}" ]] || { echo "error: no encyclopedia-*.jar at the top of ${src}" >&2; exit 1; }
+    local ver
+    ver="$(_jar_version "${jar}")"
+    _check_version "${ver}" "$(basename "${jar}")"
+    if [[ ! -d "${src}/lib" ]]; then
+        echo "error: ${src} has no lib/ directory. The jar is not standalone (its" >&2
+        echo "       Class-Path points at lib/); copy the whole install directory." >&2
+        exit 1
+    fi
+    [[ -x "${src}/jre/bin/java" ]] || echo "warning: ${src} has no bundled jre/bin/java; a system Java 11-21 will be needed." >&2
+    echo "copying EncyclopeDIA ${ver} from ${src} ..."
+    local dest="${staging}/app"
+    cp -a "${src}" "${dest}"
+    finalize_install "${dest}" "${ver}"
+}
+
 # Download the public release and install it (artifact-type-agnostic).
 install_default() {  # staging
     local staging="$1"
@@ -196,8 +223,10 @@ install_default() {  # staging
 error: no public EncyclopeDIA >= ${MINIMUM_VERSION} release is published yet,
 and RELEASE_URL in this script is still a placeholder.
 
-Install the lab's install4j build now:
-    bash scripts/install-encyclopedia.sh --installer /path/to/encyclopedia-${MINIMUM_VERSION}.sh
+Install the lab's build now, from its install4j installer or from an
+already-extracted install directory:
+    bash scripts/install-encyclopedia.sh --installer /path/to/EncyclopeDIA_unix_<version>.sh
+    bash scripts/install-encyclopedia.sh --from-dir  /path/to/EncyclopeDIA
 
 When a public >= ${MINIMUM_VERSION} release ships, set RELEASE_URL (+ RELEASE_SHA256)
 in this script and re-run with no --installer flag. Or point
@@ -217,14 +246,11 @@ EOF
             # Public release ships as an install4j installer.
             install_from_installer "${download}" "${staging}" ;;
         *.jar)
-            local jar_base ver app_root
-            jar_base="$(basename "${download}")"
-            ver="$(_jar_version "${download}")"
-            _check_version "${ver}" "${jar_base}"
-            app_root="${staging}/app"
-            mkdir -p "${app_root}"
-            mv "${download}" "${app_root}/${jar_base}"
-            finalize_install "${app_root}" "${ver}" ;;
+            # Since 6.x the jar's Class-Path points at lib/ beside it, so a
+            # jar on its own cannot start.
+            echo "error: ${download} is a bare jar, which cannot run without the" >&2
+            echo "       install directory's lib/. Point RELEASE_URL at the install4j .sh." >&2
+            exit 1 ;;
         *)
             echo "error: unrecognized download artifact: ${download} (expected .sh or .jar)" >&2
             exit 1 ;;
@@ -236,8 +262,15 @@ mkdir -p "${INSTALL_ROOT}"
 STAGING="$(mktemp -d "${INSTALL_ROOT}/.staging.XXXXXX")"
 trap 'rm -rf "${STAGING}"' EXIT
 
+if [[ -n "${installer_path}" && -n "${from_dir}" ]]; then
+    echo "error: pass --installer or --from-dir, not both" >&2
+    exit 2
+fi
+
 if [[ -n "${installer_path}" ]]; then
     install_from_installer "${installer_path}" "${STAGING}"
+elif [[ -n "${from_dir}" ]]; then
+    install_from_dir "${from_dir}" "${STAGING}"
 else
     install_default "${STAGING}"
 fi

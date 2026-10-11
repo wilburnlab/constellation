@@ -1,0 +1,76 @@
+ScribeTwo Help
+ScribeTwo is a fragment-indexed library search engine for DDA and DIA data.
+You should prefix your arguments with a high memory setting, e.g. "-Xmx8g" for 8gb
+Required Parameters:
+	-scribetwo	run ScribeTwo
+	-i	input .DIA or .MZML file
+	-f	protein .FASTA database
+Optional Parameters:
+	-searchType	search type: auto, dia, dda_chimeric, or dda (default: auto)
+	-l	library .DLIB or .ELIB file (library mode)
+	-o	output report file (default: [input file].scribe2.txt)
+	-nce	normalized collision energy for FASTA prediction (default: 33)
+	-NCE	alias for -nce
+	-defaultCharge	default charge used for FASTA prediction NCE adjustment (default: 3)
+	-maxMissedCleavage	maximum FASTA missed cleavages; -1 allows any number (default: 1)
+	-fixed	fixed site masses, for example C=57.0214635; use -fixed - for none
+	-variable	variable site masses, for example S=79.966331,T=79.966331; use -variable - for none
+	-ptm...	named Chronologer PTM state (off|var|fix); do not mix with -fixed/-variable
+		Fixed TMT requires -ptmProteinNTermAcetyl off -ptmPyroGluQ off to avoid terminal-site conflicts.
+	-minLength/-maxLength	FASTA peptide length range (default: 7-31)
+	-minCharge/-maxCharge	FASTA precursor charge range (default: 1-6)
+	-maxVariableMods	maximum variable modifications per peptide (default: 1)
+	-maxVariableForms	maximum variable peptide forms (default: 1000)
+	-requireVariableMods	require at least one variable modification (default: false)
+	-predictionCache	directory for shared FASTA prediction cache (default: OS-specific user data directory)
+	-scribeTwoXCorrCacheSize	bounded LRU cache size for ScribeTwo theoretical XCorr calculators (default: 4096)
+	-scribeTwoAstralScoringFeatures	emit non-zero experimental Astral scoring features (default: true)
+	-scribeTwoEffectiveIonCountFloor	minimum effective ion count used by the ion-count-calibrated X!Tandem feature (default: 7)
+	-scribeTwoRelativeIntensityThreshold	fraction of the predicted base fragment intensity used for relative-intensity scoring (default: 0.15)
+	-scribeTwoRelativeIntensityMinIonCount	minimum top predicted fragment ions used for relative-intensity scoring (default: 5)
+	-mzIdentML	write mzIdentML 1.2.0 and converted adjusted mzML output (DDA mode only, default: false)
+	-acquisition                         (default: DIA)
+	-adjustInferredRTBoundaries          (default: false)
+	-enzyme                              (default: trypsin)
+	-expectedPeakWidth                   (default: 25)
+	-filterPeaklists                     (default: false)
+	-fixed                               (default: C=57.0214635)
+	-foffset                             (default: 0)
+	-frag                                (default: CID)
+	-ftol                                (default: 10)
+	-ftolunits                           (default: ppm)
+	-integratePrecursors                 (default: false)
+	-lftol                               (default: 10)
+	-lftolunits                          (default: ppm)
+	-localizationModification            (default: none)
+	-maskBadIntegrations                 (default: false)
+	-maxWindowWidth                      (default: -1)
+	-minIntensity                        (default: -1.0)
+	-minIntensityNumIons                 (default: -1.0)
+	-minNumIntegratedRTPoints            (default: 3)
+	-minNumOfQuantitativePeaks           (default: 3)
+	-normalizeByTIC                      (default: true)
+	-numberOfExtraDecoyLibrariesSearche  (default: 0.0)
+	-numberOfQuantitativePeaks           (default: 5)
+	-numberOfThreadsUsed                 (default: <host cores>)
+	-peakPickTimsIMS                     (default: true)
+	-percolatorProteinThreshold          (default: 0.01)
+	-percolatorThreshold                 (default: 0.01)
+	-percolatorTrainingFDR               (default: 0.0)
+	-percolatorTrainingSetSize           (default: 500000)
+	-percolatorVersion                   (default: v3-01)
+	-poffset                             (default: 0)
+	-precursorIsolationMargin            (default: 0)
+	-precursorWindowSize                 (default: -1)
+	-predictRawSettings                  (default: true)
+	-ptol                                (default: 10)
+	-ptolunits                           (default: ppm)
+	-rtWindowInMin                       (default: -1.0)
+	-scoringBreadthType                  (default: recal)
+	-skipLibraryRetentionTime            (default: false)
+	-smoothIntegrations                  (default: true)
+	-subtractBackground                  (default: true)
+	-topNTargetsUsed                     (default: 10)
+	-usePercolator                       (default: true)
+	-verifyModificationIons              (default: true)
+	-quiet	suppress log output to stdout/stderr

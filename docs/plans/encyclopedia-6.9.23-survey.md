@@ -1,209 +1,165 @@
-# EncyclopeDIA 6.5.15 — utility inventory
+# EncyclopeDIA 6.9.23 — command survey
 
-Authoritative catalogue of every jar entry point exposed by EncyclopeDIA 6.5.15, with the flag table per utility and a "what changed since 2.12.30" diff. Each Python wrapper under [constellation/massspec/search/encyclopedia/](../../constellation/massspec/search/encyclopedia/) translates a typed kwarg surface to the flag table for one utility; new utilities land as new wrapper files PR by PR.
+Constellation pins EncyclopeDIA to **>= 6.9.23**
+(`constellation.thirdparty.encyclopedia.MINIMUM_VERSION`). This note records what that jar offers
+and how Constellation tracks it. It replaces the hand-maintained 6.5.15 flag tables, which had
+drifted: they listed `-scribetwodda` / `-scribetwodia` for a jar whose ScribeTwo is one program.
 
-Status: **stub** — populated by PR 1 (which surveys the jar end-to-end) and extended by each follow-on PR. Until then the high-level invocation summaries below are the contract PR 0's CLI parsers and stub wrappers anchor on.
+Surveyed 2026-10-10. Everything in "Programs" and "Changes since 6.5.15" comes from running the
+jar's own `-h`. Everything in "What help does not show" comes from reading the outputs of real
+6.9.23 runs (a GUI-driven peptide-centric DIA search and a ScribeTwo DDA search on a Stellar);
+nothing in that section has been reproduced from Constellation's CLI yet.
 
-## How to (re)survey
+## Where the facts live
 
-`scripts/install-encyclopedia.sh --installer <install4j.sh>` installs into the per-user home cache `~/.constellation/encyclopedia/<version>/`, and `constellation.thirdparty.registry.find("encyclopedia")` discovers it there (env var → home cache → `third_party/`). `$CONSTELLATION_ENCYCLOPEDIA_HOME` overrides the location — point it at any install dir containing `encyclopedia-<version>.jar`.
+The flag tables are data, not prose, so they are not repeated here.
 
-> The earlier dev build was placed at an **in-repo `constellation/encyclopedia/` path** with `$CONSTELLATION_ENCYCLOPEDIA_HOME` pointed at it — *not* `~/.constellation/encyclopedia/6.5.15-dev/` (a stale assumption that previously appeared here). `~/.constellation/encyclopedia/` is the canonical home the installer now establishes.
+| Artefact | What | Written by |
+|---|---|---|
+| `constellation/data/_raw/encyclopedia/6.9.23/help/<program>.txt` | normalised `-h` output, one file per program | `scripts/survey-encyclopedia.py` (needs the jar) |
+| `constellation/data/_raw/encyclopedia/6.9.23/programs.json` | the programs probed, the jar's SHA-256, the Java used | same |
+| `constellation/data/encyclopedia_cli.json` | programs and flags parsed from the help text; packaged | `scripts/build-encyclopedia-cli-json.py` (no jar needed) |
 
-The commands below resolve the jar through the env var (or the home-cache `current` symlink) so they work regardless of where the build lives:
+`constellation.massspec.search.encyclopedia.cli_spec` loads the JSON and answers "is this flag
+documented for this program" (`is_known_flag`, `unknown_flags`). `tests/test_encyclopedia_cli_spec.py`
+holds three things in place: the JSON is in step with the raw text, every flag the hand-written
+wrappers emit is documented, and, when the pinned jar is installed, a fresh capture equals the
+snapshot.
+
+### Re-surveying (a new pin, or a suspicion that help changed)
 
 ```bash
-ENC="${CONSTELLATION_ENCYCLOPEDIA_HOME:-$HOME/.constellation/encyclopedia/current}"
-
-# Top-level help — lists all -<program> entry points
-"$ENC"/jre/bin/java -jar "$ENC"/encyclopedia-*.jar --help
-
-# Per-program help (e.g. -walnut, -convert, -libexport, -scribetwodda)
-"$ENC"/jre/bin/java -jar "$ENC"/encyclopedia-*.jar <program> -h
-
-# Nested -convert subcommands
-"$ENC"/jre/bin/java -jar "$ENC"/encyclopedia-*.jar -convert -<subprogram> -h
+constellation doctor                          # encyclopedia must be `ok`
+python3 scripts/survey-encyclopedia.py        # jar -> _raw/encyclopedia/<version>/
+python3 scripts/build-encyclopedia-cli-json.py
+git diff constellation/data                   # the changes, flag by flag
+pytest tests/test_encyclopedia_cli_spec.py
 ```
 
-When system Java is available, the runner picks `shutil.which("java")`; the bundled JRE in the install dir is the fallback for boxes without one.
+The capture is normalised so it is the same on every machine and every run: `[HH:MM:SS]` prefixes
+are stripped, the MSRawJava "Thermo server" line is dropped (another thread writes it, so it lands
+somewhere different each time), and the `-numberOfThreadsUsed` default, which is the host's core
+count, is replaced with `<host cores>`.
 
-## Top-level programs (verified from `--help`)
+## Installing and running the jar
 
-| Program | Role | Wrapped? | Notes |
+- **The jar is not standalone.** Its manifest `Class-Path` points at `lib/` beside it (108 jars;
+  MSRawJava is loaded at startup). A copy of `encyclopedia-6.9.23.jar` on its own fails with
+  `NoClassDefFoundError`. Install the whole directory:
+  `bash scripts/install-encyclopedia.sh --from-dir <extracted install>` or
+  `--installer <install4j .sh>`, into `~/.constellation/encyclopedia/<version>/`.
+- **Java.** The jar warns that execution "may be unstable" outside Java 11–21 and bundles
+  Temurin 21. The conda env's `openjdk` is unpinned (25 at the time of the survey), so the registry
+  spec sets `prefer_bundled_jre` and `run_jar` uses `jre/bin/java` beside the jar.
+- **Side effect at startup.** Every invocation, `-h` included, makes MSRawJava unpack "Thermo
+  server" runtime files. Where they go was not traced. Relevant to parallel runs.
+- **The install4j `.vmoptions`** (`-Xmx…`) applies only to the `EncyclopeDIA` launcher script, not
+  to `java -jar`, which is what Constellation runs.
+
+## Programs
+
+`listed` = advertised by a parent program's help. "Constellation" = how it is reached today.
+
+| Program | argv | Listed | Constellation |
 |---|---|---|---|
-| (default) | DIA library search — `-i <mzml/dia> -l <library>` | PR 1 → [library_search.py](../../constellation/massspec/search/encyclopedia/library_search.py) | Headline workflow. Default Percolator is `v3-01` (bundled). |
-| `-walnut` | DDA FASTA-search (PECAN-style scoring) | not yet | Wrap on lab demand. |
-| `-thesaurus` | Phospho-site localization | not yet | Wrap on lab demand. |
-| `-xcordia` | Cross-correlation DIA scoring | not yet | Alternative scoring engine. |
-| `-scribe` | Scribe library search (DDA) | not yet | Older scoring engine. |
-| `-scribetwodda` | ScribeTwo, DDA mode (fragment-indexed) | not yet | Optional FASTA prediction baked in (`-nce`, `-defaultCharge`, `-predictionCache`). |
-| `-scribetwodia` | ScribeTwo, DIA mode | not yet | Same as `-scribetwodda` flag surface. |
-| `-browser` | Interactive ELIB browser | never (GUI) | Not a CLI-driven workflow. |
-| `-libexport` | Combine searches → quant-report library | PR 4 → [library_export.py](../../constellation/massspec/search/encyclopedia/library_export.py) | Nested sub-modes `-pecan` / `-xcordia` / `-phospho` for non-default scoring pipelines, deferred. |
-| `-convert` | File-format converters and preprocessing (nested — see below) | partial (PR 2 + PR 3) | One nested verb per row in the next table. |
-| `-batch` | XML-driven batch driver | not yet | Wrap if a batch use case appears. |
+| peptide-centric search (the original EncyclopeDIA algorithm; DIA only) | none (also `-encyclopedia`) | yes | `massspec search` |
+| ScribeTwo, spectrum-centric: DDA, DDA+ (chimeric) and DIA | `-scribetwo -searchType auto\|dia\|dda_chimeric\|dda` | yes | not yet (planned as `--search-mode spectrum-centric`) |
+| Scribe, the original (DIA-style scoring on spectrum-centric analysis) | `-scribe` | yes | no |
+| Walnut, FASTA search with PECAN-style scoring | `-walnut` (alias `-pecan`) | yes | no |
+| Thesaurus, phospho positional isomers | `-thesaurus` | yes | no |
+| XCorDIA | `-xcordia` | yes | no |
+| Library export / quant report | `-libexport` (sub-modes `-pecan`, `-xcordia`, `-phospho` print the same help) | yes | `massspec library-export` |
+| Batch, XML-driven | `-batch` | yes | no (`-batch -h` prints two lines, then throws `NullPointerException`) |
+| ELIB browser | `-browser` | yes | never; it opens the GUI, so it is not surveyed |
+| Converters | `-convert -<name>` | yes | see below |
 
-## `-convert` sub-utilities (verified from `-convert -h`)
+Converters (`-convert -h`): `-fastaToJChronologerLibrary` (`massspec predict-library`),
+`-processDIA` (legacy wrapper kept only for the transcriptome pipeline; Constellation writes
+`.dia` itself), `-prositCSVToLibrary`, `-blibToLib`, `-mspToLib`, `-openswathTSVToLibrary`,
+`-libraryToBlib`, `-mergeLibraries`, `-fastaToPrositCSV`, `-adjustLibraryForPTMs`. Accepted but
+not listed: `-mergeDIA` (prints the `-processDIA` help) and `-fastaToKoinaLibrary` (jar-side Koina
+prediction; `-models`, `-url`).
 
-| Sub-utility | Role | Wrapped? | Notes |
-|---|---|---|---|
-| `-fastaToJChronologerLibrary` | **FASTA → predicted .dlib via JChronologer** | PR 2 → [predict_library.py](../../constellation/massspec/search/encyclopedia/predict_library.py) | **New in 6.5.15.** JChronologer (RT) + Sculptor (CCS/IMS) + Electrician (charge prob). In-process PyTorch; replaces Prosit/Koina. PTM toggles are per-PTM `off\|var\|fix` enums. Peptide length fixed 7-31. |
-| `-processDIA` | Preprocess one mzML or merge multiple → `.dia` | PR 3 → [process_dia.py](../../constellation/massspec/search/encyclopedia/process_dia.py) | Accepts `.mzML`, `.raw`, `.d`, `.DIA`. Multi-file input is colon-delimited (`-i a:b:c`). |
-| `-prositCSVToLibrary` | Prosit / Spectronaut / DIA-NN CSV → DLIB | not yet | |
-| `-blibToLib` | BLIB → DLIB | not yet | |
-| `-mspToLib` | MSP / SPTXT → DLIB | not yet | |
-| `-openswathTSVToLibrary` | OpenSwath TSV → DLIB | not yet | |
-| `-libraryToBlib` | DLIB → BLIB | not yet | |
-| `-mergeLibraries` | merge N DLIBs → one DLIB | not yet | |
-| `-fastaToPrositCSV` | FASTA → Prosit input CSV | not yet | Only needed if the lab keeps a Koina path in parallel. |
-| `-adjustLibraryForPTMs` | add PTM / SILAC masses to a library | not yet | |
+### ScribeTwo in particular
 
-## Detailed flag tables
+- Requires `-i` and `-f`. `-l` is **optional**: without a library it predicts from the FASTA on
+  the fly, using its own `-nce`, `-defaultCharge`, `-minLength/-maxLength`, `-minCharge/-maxCharge`,
+  `-fixed` / `-variable`, `-ptm…` and `-predictionCache`.
+- It also takes the whole shared search-parameter set (`-ptol`, `-ftol`, `-enzyme`, …).
+- `-mzIdentML` writes mzIdentML 1.2.0 plus an adjusted mzML, DDA mode only.
+- Default report name `[input].scribe2.txt`. The GUI reference run wrote no text reports, so what
+  the CLI writes besides the result library is unconfirmed.
 
-Filled by PR 1 (top-level search + `-libexport`) and PR 2 (predict-library) and PR 3 (process-dia). One subsection per utility, format:
+## Changes since 6.5.15
 
-> ### `<utility>`
->
-> Invocation: `java -jar encyclopedia-6.5.15.jar <flags>`
->
-> | Flag | Type | Required | Default (6.5.15) | Notes |
-> |---|---|---|---|---|
->
-> Diff vs 2.12.30:
-> - **Added**: ...
-> - **Removed**: ...
-> - **Renamed**: ...
+- ScribeTwo is `-scribetwo -searchType …`; `-scribetwodda` and `-scribetwodia` are gone.
+- New shared search flags: `-peakPickTimsIMS`, `-predictRawSettings`.
+- `-libexport` gains `-percolatorLocation`; its help says `-f` is needed only for the Pecan /
+  XCorDIA export modes. (Constellation's wrapper comments say 6.5.15 required `-f` for the default
+  mode too. Unresolved until a `-libexport` run without `-f`.)
+- `-convert -fastaToJChronologerLibrary`: flags and defaults unchanged.
+- `-convert -processDIA` still documents `.mzML`, `.raw`, `.d`, `.DIA` input. Search programs
+  document `.DIA` or `.MZML` only; whether search still takes a `.raw` directly is unconfirmed, and
+  the transcriptome pipeline's per-injection stage relies on it.
+- Every flag the four existing wrappers emit is still documented.
 
-Stubbed below — populated as the PRs land.
+## What help does not show
 
-### (default) library search
+- **Truncated names.** The shared-parameter table cuts names at 35 characters: it prints
+  `-numberOfExtraDecoyLibrariesSearche` for `-numberOfExtraDecoyLibrariesSearched`.
+  `cli_spec.is_known_flag` treats a documented name of exactly that width as a prefix.
+- **Undocumented parameters.** A result library's `metadata` table records every effective
+  parameter under its flag name. Recorded but not in help, peptide-centric: `-instrument`,
+  `-proteinGroupScoreMode`, `-quantifyAcrossSamples`, `-percolatorTrainingIterations`,
+  `-percolatorModelFile`, `-precursorIsolationRangeFile`, `-targetWindowCenter`,
+  `-percolatorVersionNumber`. ScribeTwo adds `-chimericSearching`, `-adjustTolerances`,
+  `-isomerSearch`, `-acceptWeakPrecursors`, `-scribeTwoBucketSize`, `-scribeTwoMinFragMz`,
+  `-scribeTwoTopCandidates`, `-scribeTwoUseProteinContextFeatures`,
+  `-scribeTwoUseSharedChargeStateSupportFeatures`. Also present in the jar and unlisted for
+  `-libexport`: `-alignOnly`, `-alignmentFrom`. So "not in the snapshot" means "not documented",
+  not "rejected". The top-level `-enableAdvancedOptions` flag may be what exposes them. **Decision
+  (PI, 2026-10-11): keep a record, do not use them.** The record is
+  `UNDOCUMENTED_PARAMETERS` in `constellation/massspec/search/encyclopedia/cli_spec.py`, with where
+  each name came from; none has been tried on the command line and none is needed near-term.
+- **`EncyclopediaTwo` is not a program to use.** A class of that name exists in the jar with a
+  `-p` pre-alignment-library option and a `.encyclopedia2.txt` report, and it is in no help text.
+  Per the PI (2026-10-11) nothing by that name is working or available: it is most likely
+  unfinished code that shipped in the jar. Constellation ignores it. (The default program's log
+  does print "Using EncyclopeDIA 2.X Scoring System"; what that refers to was not looked into.)
+- **Reference runs came from the GUI**, so there are no command lines to copy. Rebuild a run's
+  parameters from its result library's metadata and pass them explicitly; GUI and CLI defaults may
+  differ.
 
-Invocation: `java -jar encyclopedia-6.5.15.jar -i <input> -l <library> [...]`
+### File formats written by 6.9.23-era tools
 
-Verified from `java -jar encyclopedia-6.5.15.jar --help` on 6.5.15.
+- **`.dia` is format `version 0.8.0`** (Constellation's schema is 0.5.0, from 2.12.30). New: a
+  `fractions` table; `spectra.IsolationWindowTarget` (was `IsolationWindowCenter`); `spectra.TIC`;
+  ion-mobility array columns on `spectra` and `precursor`; `ranges.RtStart`, `RtStop`,
+  `IonMobilityStart`, `IonMobilityStop`.
+- **The jar reads `.dia` metadata to decide how to search** (log: "predicted as DIA
+  staggered=false (metadata)"): `rawFileStructure.dataAcquisitionType`,
+  `rawFileStructure.isStaggered`, `rawFileStructure.precursorMarginSize`, among about fifty
+  `file.*`, `run.*`, `instrument.*`, `acq.*`, `thermo.*`, `conversion.*` keys.
+- **Single file:** `SpectrumIndex` is the raw scan number, `SpectrumName` is `scan=N`; scan and
+  injection times are in seconds; DIA `PrecursorCharge` is 0; MS1 isolation bounds are the scan
+  range; `ranges.DutyCycle = (RtStop − RtStart) / (NumWindows − 1)`.
+- **Merged file:** `fractions` names each source; `SpectrumIndex` is renumbered 0-based and
+  continuous, each fraction's MS1 block before its MS2 block; each fraction's MS1 bounds are set to
+  its MS2 span; metadata shrinks to 13 keys.
+- **Result libraries are container `version 0.1.18`** (Constellation's schema is 0.1.15): a
+  `decoyentries` table, `entries.IonMobility`, `peptidequants.QuantIonCorrelation*`, 22 indexes.
+  `SourceFile` is the `.dia`'s `sourcename`, i.e. the `.raw` name. Metadata carries
+  `<source> search type` (`EncyclopeDIA`, `ScribeTwoDDA`) and `PercolatorVersion` (`3.01`,
+  `JavaPot`).
+- **ScribeTwo writes its result as `<input>.dia.dlib`**, in the same container.
+- **Peptide-centric sidecars**, all `<input>.dia.*` beside the input: `.features.txt` (Percolator
+  input, 35 columns), `.encyclopedia.txt` and `.encyclopedia.decoy.txt` (Percolator output),
+  `.encyclopedia.txt.model`, `first` / `final` `rt_fit`, `ms1_fit`, `ms2_fit` tables with PDFs,
+  `.encyclopedia.txt.log`.
 
-**Required flags:**
+## Open items
 
-| Flag | Type | Notes |
-|---|---|---|
-| `-i` | path | input `.DIA` or `.mzML` (or vendor `.raw`/`.d` via bundled MSRawJava) |
-| `-l` | path | library `.dlib` (chromatogram-free predicted) or `.elib` (chromatogram library) |
-| `-f` | path | background proteome FASTA |
-
-**`-f` is mandatory in 6.5.15**, which is a change from older versions. Omitting it aborts the run before any file is opened with `You are required to specify an input file (-i), a library file (-l), and a fasta file (-f)` — and it does so *even when the library already carries decoys*, contradicting the older "only needed for decoy generation" guidance. Verified empirically: `-i` + `-l` alone produces that message, while adding `-f` proceeds to the library read. `--fasta` is therefore `required=True` on `massspec search` so the failure surfaces at argparse time instead of as a jar exit code after JVM startup.
-
-**Common optional flags (wrapped as typed CLI args):**
-
-| Flag | Default | Constellation CLI flag |
-|---|---|---|
-| `-o` | `<input>.encyclopedia.txt` | always set by handler to `<output-dir>/<input-stem>.encyclopedia.txt` |
-| `-f` | — | `--fasta` (**required** — see note below) |
-| `-ptol` / `-ptolunits` | `10 ppm` | `--precursor-tolerance` + `--precursor-tolerance-unit {ppm,Da}` |
-| `-ftol` / `-ftolunits` | `10 ppm` | `--fragment-tolerance` + `--fragment-tolerance-unit {ppm,Da}` |
-| `-lftol` / `-lftolunits` | `10 ppm` | `--library-fragment-tolerance` + `--library-fragment-tolerance-unit {ppm,Da}` |
-| `-acquisition` | `DIA` | `--acquisition` |
-| `-enzyme` | `trypsin` | `--enzyme` |
-| `-frag` | `CID` | `--fragmentation` |
-| `-percolatorVersion` | `v3-01` | `--percolator-version` |
-| `-percolatorThreshold` | `0.01` | `--percolator-threshold` |
-| `-percolatorProteinThreshold` | `0.01` | `--percolator-protein-threshold` |
-| `-numberOfThreadsUsed` | `20` | `--threads` |
-
-### Mass-tolerance units
-
-EncyclopeDIA's `MassErrorUnitType` enum is `{PPM, AMU, RESOLUTION}`, matched case-insensitively. Three things follow, all verified against the 6.5.15 jar:
-
-* **Daltons are spelled `AMU`.** The literal `Da` is rejected — `EncyclopediaException: Error parsing fragment mass error unit type from [Da]`. Constellation's CLI takes `Da` (the spelling used by `massspec chromatogram extract` and `peptide.match.match_mz`) and translates in `library_search._ENCYCLOPEDIA_UNITS`.
-* **`AMU` is the only absolute window.** From `MassTolerance`'s constructor + `getTolerance(mass)`: `PPM` stores `percent = v/1e6` and returns `percent × mass`; `AMU` stores `amuTolerance = v` and returns it unchanged. `isRelativeTolerance()` is false only for `AMU`. This is what ion-trap data wants — ±0.8 Da at m/z 300 and at m/z 1500 alike.
-* **`RESOLUTION` is `PPM` re-parameterized**, not a third kind of tolerance: the constructor stores `ppmTolerance = 500000 / v`, i.e. a window half-width of `mass / (2R)` (half the peak FWHM at resolving power `R`). `-ftolunits Resolution -ftol 30000` ≡ `-ftolunits ppm -ftol 16.67`. It adds no capability, so it is not exposed as a typed choice; reach it via `--encyclopedia-arg '-ftolunits=Resolution'`.
-
-`-ftol` and `-lftol` are deliberately **not** coupled. `DotProduct.getIndividualPeakScores` consults both: `-ftol` is the window applied to the acquired spectrum, `-lftol` the one applied to the library peak list. Against a *predicted* library the library m/z are exact theoretical values and want the tight ppm default even when `-ftol` is widened to 0.8 Da for ion-trap data; only widen `-lftol` when searching a *measured* chromatogram `.elib` whose peaks carry the instrument's own mass error.
-
-Unit parsing happens in `SearchParameterParser.parseParameters` **before** any input file is opened, which makes the translation cheap to smoke-test — a run with nonexistent paths still validates the units and then fails on the library read. `tests/test_massspec_library_search.py` uses exactly that (Tier B, gated on a resolved encyclopedia install).
-
-**Anything not wrapped** passes through via `--encyclopedia-arg FLAG=VALUE` (repeatable). The full flag surface (~50 options including `-adjustInferredRTBoundaries`, `-expectedPeakWidth`, `-filterPeaklists`, `-fixed C=57.0214635`, `-foffset`, `-integratePrecursors`, `-localizationModification`, `-maskBadIntegrations`, `-maxWindowWidth`, `-minIntensity`, `-minIntensityNumIons`, `-minNumIntegratedRTPoints`, `-minNumOfQuantitativePeaks`, `-normalizeByTIC`, `-numberOfExtraDecoyLibrariesSearche`, `-numberOfQuantitativePeaks`, `-percolatorTrainingFDR`, `-percolatorTrainingSetSize`, `-poffset`, `-precursorIsolationMargin`, `-precursorWindowSize`, `-rtWindowInMin`, `-scoringBreadthType`, `-skipLibraryRetentionTime`, `-smoothIntegrations`, `-subtractBackground`, `-topNTargetsUsed`, `-usePercolator`, `-verifyModificationIons`) is documented in the jar's `--help`; expose typed flags here as lab use cases demand them.
-
-**Output convention quirk worth knowing:** the chromatogram `.elib` lands **next to the input file** as `<input>.elib` (EncyclopeDIA convention; not redirectable via `-o`, which controls only the `.encyclopedia.txt` report). The Constellation handler runs the jar with `cwd=output_dir` to keep incidental files in the run-dir, then locates the produced `.elib` via filename convention for the auto-ingest step.
-
-Diff vs 2.12.30:
-- **Default Percolator version changed**: was `v3-01` in 2.12.30 too; the `v3-05` Linux binary is also bundled in 6.5.15 for users who want to opt into newer Percolator.
-- **Vendor-raw input support**: 6.5.15 accepts `.raw`/`.d` directly via bundled MSRawJava (2.12.30 required msconvert).
-
-### `-convert -fastaToJChronologerLibrary`
-
-Invocation: `java -jar encyclopedia-6.5.15.jar -convert -fastaToJChronologerLibrary <flags>`
-
-Verified from `java -jar encyclopedia-6.5.15.jar -convert -fastaToJChronologerLibrary -h` on 6.5.15.
-
-| Flag | Type | Required | Default (6.5.15) | Notes |
-|---|---|---|---|---|
-| `-i` | path | yes | — | input `.FASTA` |
-| `-o` | path | no | — | output `.dlib` path |
-| `-addDecoys` | bool | no | `true` | predict reversed decoys + write to DLIB decoy table (roughly doubles prediction time) |
-| `-adjustNCEForDIA` | bool | no | `true` | DIA-mode NCE adjustment |
-| `-defaultCharge` | int | no | `3` | charge used for FASTA-prediction NCE adjustment |
-| `-defaultNCE` | int | no | `33` | normalized collision energy |
-| `-entrapmentSeed` | int | no | `1` | RNG seed for protein-entrapment generation |
-| `-enzyme` | string | no | `Trypsin` | enzyme name |
-| `-generateProteinEntrapments` | bool | no | `false` | one shuffled protein-level entrapment per target |
-| `-maxCharge` | int | no | `6` | max precursor charge filter |
-| `-maxMissedCleavage` | int | no | `1` | |
-| `-maxMz` | float | no | `1002.7` | max precursor m/z filter |
-| `-maxVariableForms` | int | no | `1000` | max number of variable-modification combinations per peptide |
-| `-maxVariableMods` | int | no | `1` | max number of variable mods per peptide |
-| `-minCharge` | int | no | `1` | |
-| `-minMz` | float | no | `396.4` | |
-| `-predictionCache` | path | no | OS user-data dir | shared FASTA-prediction cache dir |
-| `-raggedNTerm` | bool | no | `false` | enumerate N-terminal ragged variants |
-| `-ptmAcetyl` | enum | no | `off` | `off\|var\|fix` |
-| `-ptmProteinNTermAcetyl` | enum | no | `var` | `off\|var\|fix` |
-| `-ptmCarbamidomethyl` | enum | no | `fix` | `off\|var\|fix` |
-| `-ptmDeamidation` | enum | no | `off` | `off\|var\|fix` |
-| `-ptmDimethyl` | enum | no | `off` | `off\|var\|fix` |
-| `-ptmGlyGly` | enum | no | `off` | `off\|var\|fix` |
-| `-ptmHexNAc` | enum | no | `off` | `off\|var\|fix` |
-| `-ptmMethyl` | enum | no | `off` | `off\|var\|fix` |
-| `-ptmOxidation` | enum | no | `off` | `off\|var\|fix` |
-| `-ptmPhospho` | enum | no | `off` | `off\|var\|fix` |
-| `-ptmPyroGluQ` | enum | no | `var` | `off\|var\|fix` |
-| `-ptmSuccinyl` | enum | no | `off` | `off\|var\|fix` |
-| `-ptmTrimethyl` | enum | no | `off` | `off\|var\|fix` |
-| `-ptmTMT` | enum | no | `off` | `off\|var\|fix` |
-
-Constraints noted in `-h`:
-- Peptide length fixed at 7-31 residues for JChronologer prediction.
-- Charge states selected from Electrician probabilities (>1%), then filtered by charge range + m/z range.
-- JChronologer always runs Sculptor CCS/IMS prediction and stores it in the library `IonMobility` column.
-
-Diff vs 2.12.30:
-- **Added**: entire utility is new in 6.5.15 (the v2.12.30 family has no in-jar FASTA-prediction path — Prosit CSV via `-convert -fastaToPrositCSV` then Koina round-trip).
-
-### `-convert -processDIA`
-
-Invocation: `java -jar encyclopedia-6.5.15.jar -convert -processDIA <flags>`
-
-Verified from `java -jar encyclopedia-6.5.15.jar -convert -processDIA -h` on 6.5.15.
-
-| Flag | Type | Required | Default (6.5.15) | Notes |
-|---|---|---|---|---|
-| `-i` | path(s) | yes | — | input `.mzML`, `.raw`, `.d`, or `.DIA` files; merge multiple by deliminating with `:` |
-| `-o` | path | yes (merge mode) | — | output merged `.DIA` file (only used when merging multiple inputs) |
-
-Single-input mode preprocesses one acquisition into its `.DIA` cache (the cache lands next to the input). Multi-input mode merges N acquisitions into one consolidated `.DIA` (`-o`) — this is the gas-phase-fractionation workflow: one `.raw` per GPF fraction → one merged `.DIA` covering the full m/z range.
-
-Window-metadata preservation: per-MS2 isolation-window info (target m/z + lower/upper offsets) is read from the input via MSRawJava for vendor formats or directly from mzML and propagated to the `.DIA` cache. Overlapping / staggered DIA window schemes are preserved intact; demultiplexing happens at the search stage, not the preprocess stage.
-
-Diff vs 2.12.30:
-- **Added**: direct vendor-raw support (`.raw`, `.d`) via the bundled MSRawJava. The v2.12.30 path required msconvert (ProteoWizard) to produce mzML first.
-
-### `-libexport`
-
-*Pending PR 4 — default mode only; `-libexport -pecan` / `-xcordia` / `-phospho` deferred unless a use case appears.*
-
-## v2.12.30 is no longer supported
-
-Constellation pins EncyclopeDIA to **>= 6.5.15** (`MINIMUM_ENCYCLOPEDIA_VERSION` in `massspec.search.encyclopedia._common`). The old public 2.12.30 release is hand-rolled CLI (not picocli), single-program-per-invocation, and — fatally for the transcriptome→proteome pipeline — has no `-convert -fastaToJChronologerLibrary` predict-library utility (new in 6.5.15). Resolving a sub-6.5.15 jar now **hard-errors** (was: warn-and-proceed) via `require_min_encyclopedia`, naming the offending version and pointing at `scripts/install-encyclopedia.sh --installer`. The install script no longer fetches 2.12.30.
-
-## When a public >= 6.5.15 release ships
-
-No adapter code edit is needed — [constellation/thirdparty/encyclopedia.py](../../constellation/thirdparty/encyclopedia.py) globs `encyclopedia-*.jar` and picks the highest version (`pick="highest"`), so 6.5.15 / 6.6.0 / 7.0 all resolve as-is. Just fill in the `RELEASE_URL` + `RELEASE_SHA256` `__UNSET__` sentinels in [scripts/install-encyclopedia.sh](../../scripts/install-encyclopedia.sh); the default (no-`--installer`) mode then downloads + verifies + installs to `~/.constellation/encyclopedia/<version>/`, auto-detecting whether the artifact is a bare `.jar` or an install4j `.sh`. Until then, `--installer <install4j.sh>` is the working path. Wrapper code is unaffected — `run_jar` is artifact-shape-agnostic.
+- Whether search accepts a `.raw` directly in 6.9.23.
+- Whether `-libexport` needs `-f` in its default mode.
+- What ScribeTwo writes when run from the CLI.
+- Which tool and version wrote the reference `.dia` files (`conversion.outputType = EncyclopeDIA`).

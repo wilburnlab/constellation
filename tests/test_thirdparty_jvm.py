@@ -262,6 +262,37 @@ def test_run_jar_bundled_jre_fallback(
     assert result.java_path == bundled_java
 
 
+def test_run_jar_prefers_bundled_jre_when_spec_asks(
+    hello_jar: Path, tmp_path: Path
+) -> None:
+    """``prefer_bundled_jre`` swaps the order: the JRE beside the jar wins
+    even though a system ``java`` is on PATH (EncyclopeDIA's case — it
+    ships the Java it was built against and warns outside 11-21)."""
+    import os
+
+    from constellation.thirdparty.registry import _REGISTRY, ToolSpec, register
+
+    home = tmp_path / "bundled-home"
+    home.mkdir()
+    jar = home / hello_jar.name
+    jar.write_bytes(hello_jar.read_bytes())
+    bundled = home / "jre" / "bin" / "java"
+    bundled.parent.mkdir(parents=True)
+    bundled.symlink_to(Path(shutil.which("java")))
+
+    name, env_var = "_test_hello_bundled", "_TEST_HELLO_BUNDLED_HOME"
+    register(ToolSpec(name=name, env_var=env_var, artifact=jar.name, prefer_bundled_jre=True))
+    os.environ[env_var] = str(home)
+    try:
+        result = run_jar(name, args=[], log_dir=tmp_path / "logs", stream_to_stderr=False)
+    finally:
+        os.environ.pop(env_var, None)
+        _REGISTRY.pop(name, None)
+    assert result.returncode == 0
+    assert result.java_source == "bundled"
+    assert result.java_path == bundled
+
+
 def test_run_jar_headless_default(register_hello_tool, tmp_path: Path) -> None:
     """``-Djava.awt.headless=true`` is on every argv by default so AWT-using
     libraries (JFreeChart, etc.) work on compute nodes without an X11

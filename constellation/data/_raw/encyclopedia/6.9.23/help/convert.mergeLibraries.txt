@@ -1,0 +1,9 @@
+Merge Library Files
+Required Parameters:
+	-i	input library files or directories (merge multiple files by deliminating with ":")
+Other Parameters:
+	-o	output .DLIB file
+	-fasta	(default: empty), use to reset the peptide-protein annotations
+	-rtAlign	(default: false)
+	-removeDuplicates	(default: true)
+	-higherScoresAreBetter	(default: false), only used if removeDuplicates=true

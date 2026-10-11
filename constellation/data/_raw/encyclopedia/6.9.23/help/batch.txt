@@ -1,0 +1,7 @@
+EncyclopeDIA Batch Help
+EncyclopeDIA Batch allows to driving EncyclopeDIA with an XML file (*.encxml).
+These files can be created by the GUI by saving an XML driver file of a queue.
+Exception in thread "main" java.lang.NullPointerException
+	at java.base/java.io.File.<init>(File.java:278)
+	at edu.washington.gs.maccoss.encyclopedia.Batch.main(Batch.java:28)
+	at edu.washington.gs.maccoss.encyclopedia.Main.main(Main.java:74)

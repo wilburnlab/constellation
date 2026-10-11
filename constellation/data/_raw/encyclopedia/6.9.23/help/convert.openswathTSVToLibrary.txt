@@ -1,0 +1,14 @@
+Convert OpenSwath TSV to library
+Required Parameters:
+	-i	input .TSV file
+	-f	taxon .FASTA database
+Other Parameters:
+	-o	output .dlib file
+
+Input TSV format:
+	ModifiedSequence: Peptide sequence and modifications (aliases: FullPeptideName, FullUniModPeptideName, LabeledSequence, ModifiedPeptide, ModifiedPeptideSequence, PeptideSequence, Sequence, StrippedSequence, modification_sequence)
+	PrecursorCharge: Precursor charge (aliases: Charge, prec_z)
+	ProductMz: Fragment m/z (aliases: FragmentMz)
+	LibraryIntensity: Fragment intensity (aliases: RelativeIntensity, RelativeFragmentIntensity, RelativeFragmentIonIntensity, relative_intensity)
+	NormalizedRetentionTime: Retention time (aliases: RetentionTime, RetentionTimeCalculatorScore, RT_detected, Tr_recalibrated, iRT)
+	TransitionGroupId: Unique integer ID for each entry (optional) (aliases: ElutionGroup, transition_group_id)

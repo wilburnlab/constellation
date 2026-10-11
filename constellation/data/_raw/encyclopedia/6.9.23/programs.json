@@ -1,0 +1,225 @@
+{
+ "encyclopedia_version": "6.9.23",
+ "jar_sha256": "1a19dc43be165618044b8adc2dabc96cf6221e5b4f7a8b0773deeab082d7b301",
+ "java": "openjdk version \"21.0.12.1\" 2026-08-18 LTS",
+ "host_cores_placeholder": "<host cores>",
+ "programs": [
+  {
+   "name": "batch",
+   "argv": [
+    "-batch"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "convert",
+   "argv": [
+    "-convert"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "convert.adjustLibraryForPTMs",
+   "argv": [
+    "-convert",
+    "-adjustLibraryForPTMs"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "convert.blibToLib",
+   "argv": [
+    "-convert",
+    "-blibToLib"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "convert.fastaToJChronologerLibrary",
+   "argv": [
+    "-convert",
+    "-fastaToJChronologerLibrary"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "convert.fastaToKoinaLibrary",
+   "argv": [
+    "-convert",
+    "-fastaToKoinaLibrary"
+   ],
+   "listed": false,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "convert.fastaToPrositCSV",
+   "argv": [
+    "-convert",
+    "-fastaToPrositCSV"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "convert.libraryToBlib",
+   "argv": [
+    "-convert",
+    "-libraryToBlib"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "convert.mergeDIA",
+   "argv": [
+    "-convert",
+    "-mergeDIA"
+   ],
+   "listed": false,
+   "alias_of": "convert.processDIA",
+   "note": null
+  },
+  {
+   "name": "convert.mergeLibraries",
+   "argv": [
+    "-convert",
+    "-mergeLibraries"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "convert.mspToLib",
+   "argv": [
+    "-convert",
+    "-mspToLib"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "convert.openswathTSVToLibrary",
+   "argv": [
+    "-convert",
+    "-openswathTSVToLibrary"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "convert.processDIA",
+   "argv": [
+    "-convert",
+    "-processDIA"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "convert.prositCSVToLibrary",
+   "argv": [
+    "-convert",
+    "-prositCSVToLibrary"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "encyclopedia",
+   "argv": [
+    "-encyclopedia"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": "the default, peptide-centric search; runs when no program flag is given, so its argv prefix is empty"
+  },
+  {
+   "name": "libexport",
+   "argv": [
+    "-libexport"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "main",
+   "argv": [],
+   "listed": true,
+   "alias_of": null,
+   "note": "dispatcher help: `-h` with no program"
+  },
+  {
+   "name": "pecan",
+   "argv": [
+    "-pecan"
+   ],
+   "listed": false,
+   "alias_of": "walnut",
+   "note": null
+  },
+  {
+   "name": "scribe",
+   "argv": [
+    "-scribe"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "scribetwo",
+   "argv": [
+    "-scribetwo"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "thesaurus",
+   "argv": [
+    "-thesaurus"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "walnut",
+   "argv": [
+    "-walnut"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  },
+  {
+   "name": "xcordia",
+   "argv": [
+    "-xcordia"
+   ],
+   "listed": true,
+   "alias_of": null,
+   "note": null
+  }
+ ]
+}

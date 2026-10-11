@@ -99,6 +99,7 @@ import constellation.massspec.search
 import constellation.massspec.search.collision
 import constellation.massspec.search.crosscheck
 import constellation.massspec.search.encyclopedia
+import constellation.massspec.search.encyclopedia.cli_spec
 import constellation.massspec.search.novel
 import constellation.massspec.search.encyclopedia.library_export
 import constellation.massspec.search.encyclopedia.library_search
