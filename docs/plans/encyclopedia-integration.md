@@ -82,7 +82,7 @@ Plan approved by the PI on 2026-10-10. Eight PR-sized phases (P0–P7).
     said is fine (nobody depends on them).
   - **Not done:** `-libexport` on WSL2 (it runs Percolator too, selected by a different flag);
     the `vsyscall=emulate` kernel setting, which needs a WSL restart.
-- **P3 (foundations): in progress, 2026-10-11.** Done, each with tests:
+- **P3 (foundations): done, 2026-10-11.** Each part with tests:
   - **Modified sequences.** The EncyclopeDIA parser resolves terminal masses against the first
     residue, so both of the jar's N-terminal spellings give one peptide (pyro-Glu is now
     `[UNIMOD:28]-`), and `encyclopedia_residue_form` is the shared key for joining a result
@@ -104,8 +104,12 @@ Plan approved by the PI on 2026-10-10. Eight PR-sized phases (P0–P7).
     order and the run names inside the peptide-centric and ScribeTwo results bind to the right
     ones. A result of a *merged* spectra file names the merged file, which is no acquisition:
     P5 has to carry that binding in the unit's manifest.
-  - **Not done: the CLI split** (`massspec/cli.py` → `massspec/cli/`). It is a pure move and has
-    to be its own commit on a clean base, so it waits for P2 and the above to be committed.
+  - **The CLI split.** `massspec/cli.py` (4,065 lines) is now the `massspec/cli/` package, one
+    module per verb plus `_common.py`. A pure move, checked three ways: each of the 70
+    definitions is byte-identical to the original, the whole `massspec` parser tree (help text,
+    defaults, types, handlers) is identical before and after, and the test suite passes
+    unchanged with no test edited. `__init__` re-exports the private names the frozen pipeline
+    and the tests import.
 - **P4–P7: not started.** `process-dia` (jar-side conversion) is still a CLI verb; the plan
   removes it in P4, once the new search path takes bundles directly.
 - **Naming (PI, 2026-10-11).** No command or flag is named `dia`: DIA is an acquisition method,

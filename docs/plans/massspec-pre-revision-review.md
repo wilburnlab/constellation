@@ -183,7 +183,7 @@ Layering loose ends in the bridge:
 ## 4. Counter and how it meets the rest
 
 Counter imports only `core.stats`, `core.optim`, `core.sequence.proforma` and
-`massspec.peptide.envelope`. Its only consumer is `massspec/cli.py`. It is MS1-only.
+`massspec.peptide.envelope`. Its only consumer is the CLI (`massspec/cli/counter.py` since the 2026-10-11 split of `massspec/cli.py`). It is MS1-only.
 
 The two data paths do not meet:
 
@@ -210,14 +210,14 @@ Each is marked **run** (reproduced) or **read** (from the code only).
 2. **`counter calibrate --trace` fails on a `chromatogram extract` bundle directory** (run:
    `pq.read_table` on a directory holding `xic_trace.parquet` + `manifest.json` raises
    `ArrowInvalid`). It uses `pq.read_table`
-   ([`massspec/cli.py:3805`](../../constellation/massspec/cli.py#L3805)) where `estimate` uses
+   (`_cmd_counter_calibrate` in [`massspec/cli/counter.py`](../../constellation/massspec/cli/counter.py)) where `estimate` uses
    `load_xic`.
 3. **A Search bundle ingested from an `.elib` yields zero XIC targets** (read). `targets_from_search`
    reads only `psms`; the EncyclopeDIA reader leaves `psms` empty and the ParquetDir writer always
    writes the empty `psms.parquet`, so `load_targets` picks that path and returns nothing, silently.
 4. **A Quant bundle cannot be used as XIC targets from the CLI** (read). `load_targets` needs
    `library=` for that source and `chromatogram extract` has no `--library` flag
-   ([`massspec/cli.py:3270`](../../constellation/massspec/cli.py#L3270)), so it raises. This is the
+   (`_cmd_chromatogram_extract` in [`massspec/cli/chromatogram.py`](../../constellation/massspec/cli/chromatogram.py)), so it raises. This is the
    observed-RT source, the one a Counter run on pipeline output would want.
 5. **`modified_sequence` does not join across outputs** (read). Stage 8 and `_load_detected_peptides`
    read `PeptideModSeq` from SQLite directly, so `NOVEL_PEPTIDE_TABLE` carries EncyclopeDIA
@@ -229,7 +229,7 @@ Each is marked **run** (reproduced) or **read** (from the code only).
    equivalent in effect, since deduplication is by sequence.
 7. **Counter's batch driver is not importable API** (read). Co-fit partitioning and the worker pool
    live in private CLI functions
-   ([`massspec/cli.py:3432-3693`](../../constellation/massspec/cli.py#L3432-L3693)).
+   (the `_counter_*` functions of [`massspec/cli/counter.py`](../../constellation/massspec/cli/counter.py)).
 8. **`library-export --fasta` optional vs required** — see §2.
 9. **A pipeline run without `--protein-fasta` fails after all ten stages** (found 2026-10-10,
    after this review; the helper call was run, the end-to-end consequence was read).
