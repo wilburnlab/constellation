@@ -411,8 +411,11 @@ def _build_search_parser(subs: argparse._SubParsersAction) -> None:
         "--percolator-version",
         default=None,
         help=(
-            "EncyclopeDIA -percolatorVersion (v2-10, v3-01, v3-05). "
-            "Default: jar default (v3-01 in 6.5.15)."
+            "EncyclopeDIA -percolatorVersion: one of the builds inside the jar "
+            "(v2-10, v3-01, v3-05) or the path of a Percolator executable. "
+            "Default: the jar's (v3-01). The bundled v3-01 cannot run on a Linux "
+            "kernel booted with vsyscall=none (WSL2's default); the command "
+            "says so before starting and lists the ways round it."
         ),
     )
     p.add_argument(
@@ -1315,6 +1318,7 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
         run_library_search,
         write_manifest,
     )
+    from constellation.massspec.search.encyclopedia.percolator import percolator_blocker
     from constellation.massspec.search.io import save_search
     from constellation.thirdparty.jvm import JvmRunError
     from constellation.thirdparty.registry import ToolNotFoundError, find
@@ -1358,6 +1362,13 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
         return 1
 
     extra_args = encyclopedia_passthrough_args(args.encyclopedia_arg)
+
+    # The jar runs Percolator only after scoring the whole run; find out
+    # now whether the selected build can start on this kernel.
+    blocker = percolator_blocker(args.percolator_version, extra_args)
+    if blocker is not None:
+        print(f"error: {blocker}", file=_sys.stderr)
+        return 1
 
     try:
         tolerances = _resolve_tolerance_args(args)
@@ -3338,7 +3349,7 @@ def _build_encyclopedia_parser(subs: argparse._SubParsersAction) -> None:
             "the search jar reads; despite the extension it holds DIA or "
             "DDA runs) is written and read by Constellation itself, with "
             "no jar and no MSForest: `export-spectra`, `import-spectra`, "
-            "`compare-spectra`."
+            "`compare-spectra`. `compare-results` compares two searches."
         ),
     )
     esubs = p.add_subparsers(dest="encyclopedia_subcommand", required=True)
@@ -3409,6 +3420,25 @@ def _build_encyclopedia_parser(subs: argparse._SubParsersAction) -> None:
                         "(by default only keys both files have are compared).")
     d.set_defaults(func=_cmd_encyclopedia_compare_spectra)
 
+    r = esubs.add_parser(
+        "compare-results",
+        help=(
+            "Compare two EncyclopeDIA result libraries (`.elib`, or ScribeTwo's "
+            "`.dlib`) from single-run searches: the precursors, peptides and "
+            "proteins each identified, and for the shared precursors how far "
+            "apart retention time, score and quantity are. Two searches of the "
+            "same file can differ by a few precursors at the FDR line, so a "
+            "repeat search is the yardstick. Exits 0 when the precursor overlap "
+            "reaches --min-overlap, 1 when not."
+        ),
+    )
+    r.add_argument("a", type=Path, help="First result library.")
+    r.add_argument("b", type=Path, help="Second result library.")
+    r.add_argument("--min-overlap", type=float, default=1.0,
+                   help="Smallest acceptable Jaccard overlap of the two precursor "
+                        "sets, 0-1. Default 1: identical identifications.")
+    r.set_defaults(func=_cmd_encyclopedia_compare_results)
+
 
 def _cmd_encyclopedia_export_spectra(args: argparse.Namespace) -> int:
     from constellation.massspec.io.encyclopedia import write_dia
@@ -3471,6 +3501,21 @@ def _cmd_encyclopedia_compare_spectra(args: argparse.Namespace) -> int:
         return 2
     print(result.report())
     return 0 if result.identical else 1
+
+
+def _cmd_encyclopedia_compare_results(args: argparse.Namespace) -> int:
+    from constellation.massspec.io.encyclopedia import compare_results
+
+    if not 0.0 <= args.min_overlap <= 1.0:
+        print("error: --min-overlap must be between 0 and 1", file=sys.stderr)
+        return 2
+    try:
+        result = compare_results(args.a, args.b)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(result.report())
+    return 0 if result.precursors.jaccard >= args.min_overlap else 1
 
 
 # ──────────────────────────────────────────────────────────────────────

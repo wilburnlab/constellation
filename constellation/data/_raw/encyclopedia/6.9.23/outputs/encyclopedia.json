@@ -1,0 +1,280 @@
+{
+  "encyclopedia_version": "6.9.23",
+  "program": "encyclopedia",
+  "container_version": "0.1.18",
+  "note": "Files a run leaves in its output directory when -o names a report there and the JVM's working directory is that directory; <run> is the input's name without its extension. Nothing is written beside the input in that arrangement.",
+  "files": [
+    {
+      "name": "<run>.elib",
+      "kind": "sqlite",
+      "tables_with_rows": [
+        "entries",
+        "metadata",
+        "peptidequants",
+        "peptidescores",
+        "peptidetoprotein",
+        "proteinscores"
+      ]
+    },
+    {
+      "name": "<run>.encyclopedia.decoy.txt",
+      "kind": "tsv",
+      "columns": [
+        "PSMId",
+        "score",
+        "q-value",
+        "posterior_error_prob",
+        "peptide",
+        "proteinIds"
+      ]
+    },
+    {
+      "name": "<run>.encyclopedia.txt",
+      "kind": "tsv",
+      "columns": [
+        "PSMId",
+        "score",
+        "q-value",
+        "posterior_error_prob",
+        "peptide",
+        "proteinIds"
+      ]
+    },
+    {
+      "name": "<run>.encyclopedia.txt.final.delta_ms1.pdf",
+      "kind": "pdf"
+    },
+    {
+      "name": "<run>.encyclopedia.txt.final.delta_ms2.pdf",
+      "kind": "pdf"
+    },
+    {
+      "name": "<run>.encyclopedia.txt.final.delta_rt.pdf",
+      "kind": "pdf"
+    },
+    {
+      "name": "<run>.encyclopedia.txt.final.ms1_fit.pdf",
+      "kind": "pdf"
+    },
+    {
+      "name": "<run>.encyclopedia.txt.final.ms1_fit.txt",
+      "kind": "tsv",
+      "columns": [
+        "Retention Time (Min)",
+        "Mass Error (AMU)",
+        "predictedMassError",
+        "correctedMassError",
+        "within95p",
+        "isDecoy",
+        "sequence"
+      ]
+    },
+    {
+      "name": "<run>.encyclopedia.txt.final.ms2_fit.pdf",
+      "kind": "pdf"
+    },
+    {
+      "name": "<run>.encyclopedia.txt.final.ms2_fit.txt",
+      "kind": "tsv",
+      "columns": [
+        "Retention Time (Min)",
+        "Mass Error (AMU)",
+        "predictedMassError",
+        "correctedMassError",
+        "within95p",
+        "isDecoy",
+        "sequence"
+      ]
+    },
+    {
+      "name": "<run>.encyclopedia.txt.final.rt_fit.pdf",
+      "kind": "pdf"
+    },
+    {
+      "name": "<run>.encyclopedia.txt.final.rt_fit.txt",
+      "kind": "tsv",
+      "columns": [
+        "library",
+        "actual",
+        "warpToactual",
+        "delta",
+        "within95p",
+        "isDecoy",
+        "sequence"
+      ]
+    },
+    {
+      "name": "<run>.encyclopedia.txt.first.delta_ms1.pdf",
+      "kind": "pdf"
+    },
+    {
+      "name": "<run>.encyclopedia.txt.first.delta_ms2.pdf",
+      "kind": "pdf"
+    },
+    {
+      "name": "<run>.encyclopedia.txt.first.delta_rt.pdf",
+      "kind": "pdf"
+    },
+    {
+      "name": "<run>.encyclopedia.txt.first.ms1_fit.pdf",
+      "kind": "pdf"
+    },
+    {
+      "name": "<run>.encyclopedia.txt.first.ms1_fit.txt",
+      "kind": "tsv",
+      "columns": [
+        "Retention Time (Min)",
+        "Mass Error (AMU)",
+        "predictedMassError",
+        "correctedMassError",
+        "within95p",
+        "isDecoy",
+        "sequence"
+      ]
+    },
+    {
+      "name": "<run>.encyclopedia.txt.first.ms2_fit.pdf",
+      "kind": "pdf"
+    },
+    {
+      "name": "<run>.encyclopedia.txt.first.ms2_fit.txt",
+      "kind": "tsv",
+      "columns": [
+        "Retention Time (Min)",
+        "Mass Error (AMU)",
+        "predictedMassError",
+        "correctedMassError",
+        "within95p",
+        "isDecoy",
+        "sequence"
+      ]
+    },
+    {
+      "name": "<run>.encyclopedia.txt.first.rt_fit.pdf",
+      "kind": "pdf"
+    },
+    {
+      "name": "<run>.encyclopedia.txt.first.rt_fit.txt",
+      "kind": "tsv",
+      "columns": [
+        "library",
+        "actual",
+        "warpToactual",
+        "delta",
+        "within95p",
+        "isDecoy",
+        "sequence"
+      ]
+    },
+    {
+      "name": "<run>.encyclopedia.txt.log",
+      "kind": "log"
+    },
+    {
+      "name": "<run>.encyclopedia.txt.model",
+      "kind": "model"
+    },
+    {
+      "name": "<run>.features.txt",
+      "kind": "tsv",
+      "columns": [
+        "id",
+        "Label",
+        "ScanNr",
+        "primary",
+        "evalue",
+        "correlationToGaussian",
+        "correlationToPrecursor",
+        "isIntegratedSignal",
+        "isIntegratedPrecursor",
+        "numPeaksWithGoodCorrelation",
+        "HyperScore",
+        "xCorrLib",
+        "xCorrModel",
+        "scribe",
+        "numberOfMatchingPeaks",
+        "numberOfMatchingPeaksAboveThreshold",
+        "averageFragmentDeltaMasses",
+        "isotopeDotProduct",
+        "averageParentDeltaMass",
+        "lnSp",
+        "maxLadderLength",
+        "deltaRT",
+        "ms1MassError",
+        "ms2MassError",
+        "numMissedCleavage",
+        "pepLength",
+        "charge1",
+        "charge2",
+        "charge3",
+        "charge4",
+        "precursorMz",
+        "precursorMass",
+        "RTinMin",
+        "sequence",
+        "Proteins"
+      ]
+    }
+  ],
+  "result_metadata_keys": [
+    "-acquisition",
+    "-adjustInferredRTBoundaries",
+    "-enzyme",
+    "-expectedPeakWidth",
+    "-filterPeaklists",
+    "-fixed",
+    "-foffset",
+    "-frag",
+    "-ftol",
+    "-ftolunits",
+    "-instrument",
+    "-integratePrecursors",
+    "-lftol",
+    "-lftolunits",
+    "-localizationModification",
+    "-maskBadIntegrations",
+    "-maxWindowWidth",
+    "-minIntensity",
+    "-minIntensityNumIons",
+    "-minNumIntegratedRTPoints",
+    "-minNumOfQuantitativePeaks",
+    "-normalizeByTIC",
+    "-numberOfExtraDecoyLibrariesSearched",
+    "-numberOfQuantitativePeaks",
+    "-numberOfThreadsUsed",
+    "-peakPickTimsIMS",
+    "-percolatorModelFile",
+    "-percolatorThreshold",
+    "-percolatorTrainingFDR",
+    "-percolatorTrainingIterations",
+    "-percolatorTrainingSetSize",
+    "-percolatorVersion",
+    "-percolatorVersionNumber",
+    "-poffset",
+    "-precursorIsolationRangeFile",
+    "-precursorWindowSize",
+    "-predictRawSettings",
+    "-proteinGroupScoreMode",
+    "-ptol",
+    "-ptolunits",
+    "-quantifyAcrossSamples",
+    "-rtWindowInMin",
+    "-scoringBreadthType",
+    "-skipLibraryRetentionTime",
+    "-smoothIntegrations",
+    "-subtractBackground",
+    "-targetWindowCenter",
+    "-topNTargetsUsed",
+    "-usePercolator",
+    "-verifyModificationIons",
+    "261008_u2os_dia_100min-IOa_HCD26_350-1200_8mz.raw library",
+    "<source file> search type",
+    "EncyclopediaVersion",
+    "PercolatorVersion",
+    "RT align between samples",
+    "TIC_261008_u2os_dia_100min-IOa_HCD26_350-1200_8mz.raw",
+    "pi0",
+    "sourcefile",
+    "version"
+  ]
+}

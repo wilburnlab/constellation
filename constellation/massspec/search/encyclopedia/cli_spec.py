@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -63,6 +62,7 @@ __all__ = [
     "program_names",
     "program_argv",
     "known_flags",
+    "flag_default",
     "is_known_flag",
     "unknown_flags",
 ]
@@ -362,17 +362,13 @@ def _run_help(java: Path, jar: Path, argv: Sequence[str], *, timeout: float) -> 
     incidental files to the working directory before they look at their
     arguments.
     """
+    from constellation.thirdparty.jvm import capture_jar
+
     with tempfile.TemporaryDirectory(prefix="encyclopedia-help-") as cwd:
-        proc = subprocess.run(
-            [str(java), "-Djava.awt.headless=true", "-Xmx1g", "-jar", str(jar), *argv, "-h"],
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout,
-            check=False,
+        out = capture_jar(
+            java, jar, [*argv, "-h"], jvm_args=["-Xmx1g"], timeout=timeout, cwd=Path(cwd)
         )
-    return normalize_help(proc.stdout)
+    return normalize_help(out)
 
 
 def _sub_name(parent: str, flag: str) -> str:
@@ -485,6 +481,12 @@ def program_argv(name: str) -> tuple[str, ...]:
 def known_flags(name: str) -> frozenset[str]:
     """Flags the jar's help documents for ``name`` (families excluded)."""
     return frozenset(_program(name)["flags"])
+
+
+def flag_default(name: str, flag: str) -> str | None:
+    """The default the jar's help prints for ``flag`` of program ``name``
+    (``None`` when it prints none, or does not document the flag)."""
+    return _program(name)["flags"].get(flag, {}).get("default")
 
 
 def is_known_flag(name: str, flag: str) -> bool:

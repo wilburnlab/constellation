@@ -35,6 +35,10 @@ from constellation.massspec.io.encyclopedia._modseq import (
     format_encyclopedia_modseq,
     parse_encyclopedia_modseq,
 )
+from constellation.massspec.io.encyclopedia._result_diff import (
+    ResultComparison,
+    compare_results,
+)
 from constellation.massspec.io.encyclopedia._read import (
     EncyclopediaReadResult,
     read_encyclopedia,
@@ -54,6 +58,8 @@ __all__ = [
     "DiaReader",
     "DiaDiff",
     "DiaWriteSummary",
+    "ResultComparison",
+    "compare_results",
     "diff_dia",
     "import_dia",
     "write_dia",

@@ -21,6 +21,7 @@ real Java, no mocking. The conda env ships openjdk (which includes
 from __future__ import annotations
 
 import shutil
+import tempfile
 import subprocess
 from pathlib import Path
 
@@ -344,3 +345,116 @@ def test_run_jar_log_dir_created(
     assert deep.is_dir()
     assert (deep / "stdout.log").exists()
     assert (deep / "stderr.log").exists()
+
+
+# ── cleaning up after the JVM ──────────────────────────────────────────
+
+
+def _alive(pid: int) -> bool:
+    import os
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _gone_within(pid: int, seconds: float = 5.0) -> bool:
+    import time
+
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _leader_with_helper(script: str):
+    """Start ``bash -c script`` in its own session; return it and the pid it prints."""
+    import subprocess
+
+    leader = subprocess.Popen(
+        ["bash", "-c", script], stdout=subprocess.PIPE, text=True, start_new_session=True
+    )
+    return leader, int(leader.stdout.readline())
+
+
+def test_reap_process_group_stops_what_the_leader_left_behind() -> None:
+    """EncyclopeDIA's failure mode: the JVM exits and the server it
+    started keeps running. The leader's own exit status survives."""
+    from constellation.thirdparty.jvm import _wait_for_exit, reap_process_group
+
+    # setsid-free helper: stays in the leader's group, ignores its exit.
+    leader, helper = _leader_with_helper("sleep 300 & echo $! ; exit 7")
+    _wait_for_exit(leader)
+    assert _alive(helper)
+
+    assert reap_process_group(leader) == 7
+    assert _gone_within(helper), "orphaned helper survived"
+    # Nothing left: a second call is a no-op that still knows the status.
+    assert reap_process_group(leader) == 7
+
+
+def test_reap_process_group_abandons_a_running_leader() -> None:
+    """The Ctrl-C / exception path: the leader is still alive."""
+    import signal
+
+    from constellation.thirdparty.jvm import reap_process_group
+
+    leader, helper = _leader_with_helper("sleep 300 & echo $! ; wait")
+    assert leader.poll() is None
+
+    assert reap_process_group(leader) == -signal.SIGTERM
+    assert _gone_within(helper)
+
+
+def test_reap_process_group_escalates_to_sigkill() -> None:
+    """A helper that ignores SIGTERM is killed after the grace period."""
+    from constellation.thirdparty.jvm import _wait_for_exit, reap_process_group
+
+    # The subshell ignores SIGTERM, and so does the sleep it becomes.
+    leader, helper = _leader_with_helper(
+        '(trap "" TERM; echo $BASHPID; exec sleep 300) & sleep 0.3; exit 0'
+    )
+    _wait_for_exit(leader)
+    assert _alive(helper)
+
+    assert reap_process_group(leader, grace_s=0.5) == 0
+    assert _gone_within(helper), "SIGTERM-immune helper survived"
+
+
+def test_capture_jar_returns_output_and_cleans_up(register_hello_tool, tmp_path: Path) -> None:
+    from constellation.thirdparty.jvm import _resolve_java, capture_jar
+    from constellation.thirdparty.registry import find
+
+    handle = find(register_hello_tool)
+    java, _source, _version = _resolve_java(handle)
+    before = {p.name for p in Path(tempfile.gettempdir()).glob("constellation-jvm-*")}
+    out = capture_jar(java, handle.path, ["one", "two"], timeout=120, cwd=tmp_path)
+    assert out.strip()
+    after = {p.name for p in Path(tempfile.gettempdir()).glob("constellation-jvm-*")}
+    assert after <= before
+
+
+def test_run_jar_private_tmpdir_is_removed(register_hello_tool, tmp_path: Path) -> None:
+    """Without ``jvm_tmpdir`` the run gets its own java.io.tmpdir and it
+    is gone afterwards; a caller-chosen one is left alone."""
+    result = run_jar(
+        register_hello_tool, args=[], log_dir=tmp_path / "logs", stream_to_stderr=False
+    )
+    (flag,) = [a for a in result.argv if a.startswith("-Djava.io.tmpdir=")]
+    private = Path(flag.split("=", 1)[1])
+    assert private.name.startswith("constellation-jvm-") and not private.exists()
+
+    chosen = tmp_path / "java-tmp"
+    chosen.mkdir()
+    result = run_jar(
+        register_hello_tool,
+        args=[],
+        jvm_tmpdir=chosen,
+        log_dir=tmp_path / "logs2",
+        stream_to_stderr=False,
+    )
+    assert f"-Djava.io.tmpdir={chosen}" in result.argv and chosen.is_dir()

@@ -104,6 +104,7 @@ import constellation.massspec.search.encyclopedia.cli_spec
 import constellation.massspec.search.novel
 import constellation.massspec.search.encyclopedia.library_export
 import constellation.massspec.search.encyclopedia.library_search
+import constellation.massspec.search.encyclopedia.percolator
 import constellation.massspec.search.encyclopedia.predict_library
 import constellation.massspec.search.encyclopedia.process_dia
 import constellation.massspec.search.io
