@@ -238,6 +238,34 @@ Each is marked **run** (reproduced) or **read** (from the code only).
    ([`transcriptome_to_proteome.py:1552`](../../constellation/transcriptome_to_proteome.py#L1552));
    that value is `None` unless the flag is given. The mocked end-to-end test always passes the
    flag, so it does not see this.
+10. **The pipeline cannot finish a search under WSL2** (found 2026-10-11; the standalone search
+    was run, the pipeline consequence was read). EncyclopeDIA's default Linux Percolator (3.01)
+    segfaults on a kernel booted with `vsyscall=none`, which is how WSL2 boots, after the run has
+    been scored. `massspec search` now checks for this before starting the jar; the orchestrator
+    calls `run_library_search` directly, with no `percolator_version` argument, so it would get as
+    far as its first search and fail there with `Percolator exited with non-zero status: 139`.
+    Native Linux hosts with the usual kernel settings (OSC) are not affected.
+11. **The `.elib` → ParquetDir ingest gives a partial and in places wrong copy of a search
+    result** (run, 2026-10-11, on a 6.9.23 result with 31,830 precursors; numbers and method in
+    the survey note, "What the existing ingest does with a 6.9.23 result"). The `.elib` itself
+    is untouched. In the Parquet copy that `read_encyclopedia` produces:
+    - `precursor_quant.intensity` is the sum of all stored peak intensities, not the jar's
+      `TotalIntensity` (median 2x it, 5th to 95th percentile 1.02x to 219x), and the 5,608
+      precursors the jar could not quantify get a non-zero value;
+    - the 188 pyro-Glu peptides have no `peptide_quant` row, because the jar spells N-terminal
+      modifications differently in `entries` and `peptidequants` and `parse_encyclopedia_modseq`
+      maps the two spellings of `-17.026549` to different strings;
+    - 8.5% of stored fragment peaks are dropped: mostly intact-precursor ions (6.7% of peaks,
+      10.4% of stored intensity), plus b/y ions at charge 3 or more (1.6%);
+    - quantified-ion flags, correlations, integration boundaries, chromatograms and decoy score
+      rows are not carried;
+    - it took 223 s, 99 s of it in a quadratic protein-peptide linking loop (which would not
+      finish at all on a proteome-scale predicted library).
+    Both the standalone handlers and the pipeline's `_maybe_auto_ingest_elib` go through this.
+    **Partly addressed 2026-10-11:** the loop is replaced (same output, 37 s), and the reader now
+    reports the first three points as `caveats` with counts, which the standalone commands print
+    and write to their manifests (the pipeline's helper does not show them). The numbers are
+    unchanged until the phase 4 reader of the EncyclopeDIA integration replaces this path.
 
 ## 6. Stale docstrings, also left as they are
 

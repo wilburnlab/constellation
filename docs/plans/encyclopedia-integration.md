@@ -31,12 +31,58 @@ Plan approved by the PI on 2026-10-10. Eight PR-sized phases (P0–P7).
   - Writing took 30 s for the 1 GB DIA run, about a minute for the 1.8 GB DDA run, and about
     8 minutes for the merged 9.6 GB file (12 cores, with other jobs running). The writer reads the MS1 scan range from the new columns, or from `filter_string`
     for bundles converted before they existed, so nothing needs re-converting.
-  - Not done here, and still the first job of P2: an actual search on a Constellation-written
-    file. Equal content makes that very likely to work, but it has not been run.
+  - An actual search on a Constellation-written file was left to P2 (below).
   - 15 provenance metadata keys the reference carries (instrument-method text, sample vial,
     integrated-intensity summaries) are not written, because a bundle does not hold them. The
     search jar reads none of them.
-- **P2–P7: not started.** `process-dia` (jar-side conversion) is still a CLI verb; the plan
+- **P2 (first real run): done, 2026-10-11.** Details and numbers are in the survey note's
+  "Running a search" section; the short version:
+  - **The acceptance test passed.** The reference wide-window run, `.raw` → `massspec convert` →
+    `massspec encyclopedia export-spectra` → `massspec search` with the reference run's
+    parameters, identifies exactly the 31,833 precursors and 5,168 proteins of the GUI reference
+    result, with identical retention times and quantities. Two repeat searches of the reference
+    `.dia` itself gave 31,833 (identical) and 31,830 (11 precursors different), which is the
+    run-to-run noise. For one GPF fraction, the jar's own direct read of the `.raw` and a search
+    of the Constellation-written `.dia` produced the same Percolator input row for row.
+  - **Search takes a `.raw` directly in 6.9.23** and writes no intermediate file, so the frozen
+    pipeline's per-injection stage still works. The risk item about it is closed.
+  - **The jar's default Percolator does not run under WSL2** (a 2017 static binary that needs
+    the legacy vsyscall page; the kernel is booted with `vsyscall=none`). The search died after
+    scoring the whole run. Now detected before the JVM starts
+    (`search/encyclopedia/percolator.py`; `massspec search` refuses with the fixes; `doctor` has a
+    `percolator` row). `--percolator-version` takes `v3-05` or the path of any Percolator
+    executable. Not handled: the frozen pipeline, which calls the wrapper directly.
+  - **The jar leaks a helper server and temp files.** `thirdparty/jvm.py` now starts every JVM in
+    its own session, stops what is left of its process group afterwards, and gives each run a
+    private `java.io.tmpdir`; `capture_jar` is the same for short calls (`-h`, argument probes).
+  - **JVM flags settled:** bundled Temurin 21, `-Xmx` and headless only. None of the older
+    project's WSL2 / XML flags was needed across six complete searches. Memory stayed under 4 GB.
+  - **Two searches at once** run without colliding (about 1.7x slower each on 12 cores).
+  - **Outputs recorded:** `data/_raw/encyclopedia/6.9.23/schema/{result_library,spectra_file}.sql`
+    and `outputs/encyclopedia.json` (`scripts/survey-encyclopedia-outputs.py`), with a test that
+    holds Constellation's schemas to them.
+  - **New verb:** `massspec encyclopedia compare-results` (`io/encyclopedia/_result_diff.py`).
+  - **A CLI defect fixed on the way:** the libstdc++ defence in `cli/__main__.py` took "the env"
+    from `$CONDA_PREFIX` (the activated env) instead of the interpreter's own, so calling
+    `constellation` by full path printed a false skew note, re-executed every command, and put
+    another env's `lib` first for child processes.
+  - **For P4:** the existing `.elib` ingest gives a partial and in places wrong Parquet copy of
+    a 0.1.18 result (survey note, "What the existing ingest does"): its precursor-level
+    intensity is not the jar's quantity, pyro-Glu peptides lose their peptide-level quantity,
+    8.5% of stored fragment peaks (mostly intact-precursor ions) are dropped, and it took
+    about four minutes. Also found: the jar spells N-terminal modifications differently in
+    `entries` and `peptidequants`. The `.elib` is unaffected. **Decided with the PI
+    (2026-10-11):** now, only the free parts: the quadratic loop is gone (37 s, output
+    unchanged; a proteome-scale `.dlib` still cannot be ingested with fragments, because every
+    row is built in memory, which is the P4 reader's job) and the reader reports
+    what its copy leaves out (`EncyclopediaReadResult.caveats`, printed and written to
+    `ingest.caveats`). The modified-sequence fix is P3's (the ids need it). Quantity and peak
+    handling are fixed once in P4, and **`read_encyclopedia` is rebuilt on the P4 reader** so
+    there is one reader; that changes the frozen pipeline's Parquet numbers, which the PI has
+    said is fine (nobody depends on them).
+  - **Not done:** `-libexport` on WSL2 (it runs Percolator too, selected by a different flag);
+    the `vsyscall=emulate` kernel setting, which needs a WSL restart.
+- **P3–P7: not started.** `process-dia` (jar-side conversion) is still a CLI verb; the plan
   removes it in P4, once the new search path takes bundles directly.
 - **Naming (PI, 2026-10-11).** No command or flag is named `dia`: DIA is an acquisition method,
   and `.dia` is one tool's file extension. The P1 commands were first built as

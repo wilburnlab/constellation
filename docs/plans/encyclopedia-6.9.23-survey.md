@@ -7,8 +7,9 @@ drifted: they listed `-scribetwodda` / `-scribetwodia` for a jar whose ScribeTwo
 
 Surveyed 2026-10-10. Everything in "Programs" and "Changes since 6.5.15" comes from running the
 jar's own `-h`. Everything in "What help does not show" comes from reading the outputs of real
-6.9.23 runs (a GUI-driven peptide-centric DIA search and a ScribeTwo DDA search on a Stellar);
-nothing in that section has been reproduced from Constellation's CLI yet.
+6.9.23 runs (a GUI-driven peptide-centric DIA search and a ScribeTwo DDA search on a Stellar).
+"Running a search" (2026-10-11) is the peptide-centric search reproduced from Constellation's CLI;
+ScribeTwo has not been run from the command line yet.
 
 ## Where the facts live
 
@@ -19,12 +20,17 @@ The flag tables are data, not prose, so they are not repeated here.
 | `constellation/data/_raw/encyclopedia/6.9.23/help/<program>.txt` | normalised `-h` output, one file per program | `scripts/survey-encyclopedia.py` (needs the jar) |
 | `constellation/data/_raw/encyclopedia/6.9.23/programs.json` | the programs probed, the jar's SHA-256, the Java used | same |
 | `constellation/data/encyclopedia_cli.json` | programs and flags parsed from the help text; packaged | `scripts/build-encyclopedia-cli-json.py` (no jar needed) |
+| `constellation/data/_raw/encyclopedia/6.9.23/schema/{result_library,spectra_file}.sql` | the `CREATE` statements of a result library (`.elib` / `.dlib`, container 0.1.18) and of a spectra file (`.dia`, format 0.8.0) | `scripts/survey-encyclopedia-outputs.py` (needs a finished run) |
+| `constellation/data/_raw/encyclopedia/6.9.23/outputs/encyclopedia.json` | the files a peptide-centric search leaves behind, the columns of the tab-separated ones, the tables the result library fills, its metadata keys | same |
 
 `constellation.massspec.search.encyclopedia.cli_spec` loads the JSON and answers "is this flag
 documented for this program" (`is_known_flag`, `unknown_flags`). `tests/test_encyclopedia_cli_spec.py`
 holds three things in place: the JSON is in step with the raw text, every flag the hand-written
 wrappers emit is documented, and, when the pinned jar is installed, a fresh capture equals the
-snapshot.
+snapshot. `tests/test_encyclopedia_output_capture.py` holds Constellation's own schemas to the
+captured table definitions: the `.dia` writer matches exactly, and the result-library writer
+(still the 0.1.15 layout) differs by a stated list (a `decoyentries` table, `entries.IonMobility`,
+two `peptidequants.QuantIonCorrelation*` columns, 16 indexes).
 
 ### Re-surveying (a new pin, or a suspicion that help changed)
 
@@ -51,8 +57,20 @@ count, is replaced with `<host cores>`.
 - **Java.** The jar warns that execution "may be unstable" outside Java 11–21 and bundles
   Temurin 21. The conda env's `openjdk` is unpinned (25 at the time of the survey), so the registry
   spec sets `prefer_bundled_jre` and `run_jar` uses `jre/bin/java` beside the jar.
-- **Side effect at startup.** Every invocation, `-h` included, makes MSRawJava unpack "Thermo
-  server" runtime files. Where they go was not traced. Relevant to parallel runs.
+- **A helper process and temp files on every invocation.** MSRawJava unpacks a .NET "Thermo
+  server" (about 200 MB of runtime files) into `java.io.tmpdir` as `msraw-thermo-<n>/` and starts
+  it, for every run, `-h` included. The jar does not reliably tidy up. Measured: every run leaves
+  its directory behind, empty after a clean exit and holding 65-80 MB after an error exit; and the
+  server process is usually stopped but not always (several were found running hours after quick
+  error exits made while the machine was busy). The test and survey runs of the first two days
+  had left 237 directories (1.4 GB) in `/tmp` and six orphan servers. So `thirdparty.jvm` trusts
+  nothing: `run_jar` and `capture_jar` start the JVM in its own session, stop whatever is left in
+  its process group when it is done (also on Ctrl-C), and give each run a private
+  `java.io.tmpdir` that is removed afterwards. Anything that starts the jar should go through one
+  of the two. A side benefit: two searches at once cannot collide on temp files, and each run's
+  Percolator executable is unpacked into its own directory.
+- **Percolator is an external executable, and the default one does not run under WSL2.** See
+  "Running a search" below.
 - **The install4j `.vmoptions`** (`-Xmx…`) applies only to the `EncyclopeDIA` launcher script, not
   to `java -jar`, which is what Constellation runs.
 
@@ -169,15 +187,178 @@ prediction; `-models`, `-url`).
     looks unusual (thousands of peaks, ordinary injection times). The merged GPF file inherits two
     of them. Constellation keeps every scan, so its files differ from the reference by exactly
     these.
-- **Peptide-centric sidecars**, all `<input>.dia.*` beside the input: `.features.txt` (Percolator
-  input, 35 columns), `.encyclopedia.txt` and `.encyclopedia.decoy.txt` (Percolator output),
-  `.encyclopedia.txt.model`, `first` / `final` `rt_fit`, `ms1_fit`, `ms2_fit` tables with PDFs,
-  `.encyclopedia.txt.log`.
+- **Peptide-centric sidecars**: `.features.txt` (Percolator input, 35 columns),
+  `.encyclopedia.txt` and `.encyclopedia.decoy.txt` (Percolator output), `.encyclopedia.txt.model`,
+  `first` / `final` `rt_fit`, `ms1_fit`, `ms2_fit` tables with PDFs, `.encyclopedia.txt.log`. The
+  GUI writes them all beside the input as `<input>.dia.*`. From the command line with
+  `-o <dir>/<run>.encyclopedia.txt` and the JVM's working directory set to `<dir>` (what
+  `massspec search` does), all 24 files land in `<dir>` as `<run>.*`, the result library as
+  `<run>.elib`, and nothing is written beside the input. The inventory is checked in
+  (`outputs/encyclopedia.json`).
+
+## Running a search (first real run, 2026-10-11)
+
+The wide-window DIA run of the reference set (`261008_u2os_dia_100min-IOa_HCD26_350-1200_8mz`,
+106 windows of 8 m/z, 237,652 MS2 scans) searched against the GPF chromatogram library, from
+`constellation massspec search` on WSL2, 12 cores. Parameters rebuilt from the reference result's
+metadata: all three tolerances 0.35 Da (`AMU` to the jar), and `--encyclopedia-arg=-fixed=`,
+because the reference recorded an empty `-fixed` where the command line defaults to
+`C=57.0214635`. The CLI run's result metadata then equals the GUI run's in 56 of 59 keys; the
+other three are the thread count, the Percolator path and `pi0`.
+
+| Run | Input | Percolator | Peptides at 1% FDR | Against the GUI reference |
+|---|---|---|---|---|
+| reference | reference `.dia`, GUI on Windows | 3.01 | 31,833 | |
+| A | copy of the reference `.dia` | 3.01 | 31,830 | 31,826 shared; 7 and 4 unshared |
+| A2 | the same file again | 3.01 | 31,833 | identical set |
+| **B** | **`.dia` written by Constellation from the `.raw`** | 3.01 | **31,833** | **identical set** |
+| C | copy of the reference `.dia` | 3.05 | 31,836 | 31,829 shared; 4 and 7 unshared |
+
+- **A Constellation-written spectra file searches the same as the reference file.** B identifies
+  exactly the reference's 31,833 precursors and 5,168 proteins; over all of them retention times
+  and quantities are identical and the largest score difference is 0.0011.
+- **Run-to-run noise is real and small.** Of two repeat searches of one file, one matched the
+  reference exactly and one differed by 11 precursors (Jaccard 0.99965). The scoring itself is
+  reproducible: the Percolator input has the same 76,400 rows in the same order every time, and
+  between any two runs 40 to 190 of them differ, only in `deltaRT` (by at most 0.035), which
+  comes from the retention-time fit. That is enough to move a handful of precursors across the
+  FDR line. For every pair of runs, shared precursors have identical retention times and, for
+  the 26,130 the jar quantifies, identical quantities (it gives the other 18% of its
+  identifications a quantity of zero). `massspec encyclopedia compare-results` is the tool; a repeat search is the
+  yardstick. The reproduction is kept as an opt-in test,
+  `tests/test_encyclopedia_search_reference.py` (it needs the jar, the data and minutes of CPU,
+  so it runs only when `CONSTELLATION_SEARCH_REFERENCE_*` name them).
+- **The jar reads a `.raw` directly, with no intermediate file.** `-i <run>.raw` is accepted by
+  the search (help documents `.DIA` or `.MZML` only), is read through the Thermo server, and
+  nothing is written beside the input. So the transcriptome pipeline's per-injection stage, which
+  passes `.raw` straight to search, still works on 6.9.23. For `…gpf-900-1000…` the direct `.raw`
+  search and a search of the Constellation-written `.dia` gave the same Percolator input, row for
+  row (3,771 rows, none differing), and the same 3,600 precursors with zero difference in score,
+  retention time or quantity.
+- **Time and memory.** 8.4 to 9.4 minutes for the wide-window run on 12 cores with other work
+  going on (the GUI reference: 3.0 minutes on 96 threads); about a minute for one GPF fraction.
+  Resident memory stayed under 4 GB with `-Xmx10g` and `-Xmx16g`.
+- **Two searches at once work.** A2 and C ran concurrently (10 GB heap each, 12 threads each on
+  12 cores), about 15 minutes each, with separate output directories and the private temp
+  directories described above. Nothing collided.
+- **JVM flags.** An older lab project carried `-XX:TieredStopAtLevel=1` ("prevents OpenJDK 11 C2
+  JIT segfaults on WSL2"), `--enable-native-access=ALL-UNNAMED` and two
+  `-Djdk.xml.*EntitySizeLimit=0` properties as must-keep flags. None is passed here and none was
+  needed: six complete searches under the bundled Temurin 21 on WSL2 with only `-Xmx` and
+  `-Djava.awt.headless=true`, no JVM crash, nothing on stderr. (The XML limits concern mzML
+  input, which was not exercised. Whether that old WSL2 segfault was really the JIT, or the
+  Percolator crash below seen from further away, is not known.)
+
+### Percolator on a `vsyscall=none` kernel (WSL2)
+
+The first search here failed after 6.5 minutes with
+`Percolator exited with non-zero status: 139`, having scored the whole run.
+
+- The jar carries its Percolator builds as executables (`bin/percolator-v{2-10,3-01,3-05}.*`),
+  unpacks the selected one into `java.io.tmpdir` and runs it twice per search (after the first
+  pass with `--maxiter 3`, then for the final result).
+- The default on Linux, `percolator-v3-01.lin`, is a statically linked build from May 2017
+  ("for GNU/Linux 2.6.18"). Its C library implements `time()` by calling the legacy vsyscall page
+  at `0xffffffffff600400`. A kernel booted with `vsyscall=none` does not map that page, so the
+  process dies with SIGSEGV before printing anything. The kernel log says so directly:
+  `vsyscall attempted with vsyscall=none ip:ffffffffff600400`. The WSL2 kernel (6.6.87 here) is
+  booted that way. It is one call site in the binary; a copy with that one call replaced by the
+  real `time` system call runs normally, which is how runs A, A2 and B above were made with
+  Percolator 3.01.
+- `percolator-v2-10.lin` and `percolator-v3-05.lin` are dynamically linked and have no such
+  call. 3.05 needs `libgomp.so.1`, which this machine has only in the conda env; Constellation's
+  CLI puts the env's `lib` on `LD_LIBRARY_PATH` for its children, and run C used it that way.
+- **`-percolatorVersion` also accepts the path of a Percolator executable.** Not in the help;
+  read from the jar's `PercolatorVersion` class (`parseFilePath`, then `parseUri`) and confirmed
+  by runs A, A2 and B. The result's metadata then records the path under `-percolatorVersion`
+  and the version the executable reports under `PercolatorVersion`.
+- **What Constellation does.** `search.encyclopedia.percolator.percolator_blocker` checks, before
+  the JVM starts, whether the selected build needs the vsyscall page and whether this kernel maps
+  it (`[vsyscall]` in `/proc/self/maps`). `massspec search` refuses with the three ways out
+  (boot with `vsyscall=emulate`, which on WSL2 is `kernelCommandLine = vsyscall=emulate` under
+  `[wsl2]` in `.wslconfig`; `--percolator-version v3-05`; `--percolator-version <path>`), and
+  `constellation doctor` has a `percolator` row. The kernel-parameter route is the documented
+  one for old static binaries and was **not** tried on this machine (it needs a WSL restart).
+  Constellation does not patch or replace the binary itself.
+- **Not covered.** The transcriptome pipeline calls the search wrapper directly, so it gets no
+  pre-flight and would fail at its first search on such a kernel. `-libexport` also runs
+  Percolator and takes `-percolatorLocation` rather than `-percolatorVersion`; it has not been
+  run here.
+
+### What the existing ingest does with a 6.9.23 result
+
+`massspec search` follows the jar with `read_encyclopedia(<run>.elib)` and writes Library, Quant
+and Search ParquetDir bundles. The `.elib` is not changed and remains the complete record; the
+bundles are a derived copy. Checked on run A (31,830 precursors, container 0.1.18). What the copy
+gets right: the 31,830 precursors with their retention times, 31,830 peptide scores, 5,167
+protein scores, and peptide-level quantities taken from the jar's `peptidequants.TotalIntensity`.
+What it gets wrong or leaves out, most serious first:
+
+1. **`precursor_quant.intensity` is not EncyclopeDIA's quantity.** It is the sum of every
+   intensity in the entry's stored spectrum (about 36 peaks), where the jar's own number is the
+   sum over the few ions it chose to quantify with. Against `TotalIntensity` for the same
+   precursor: median ratio 1.98, 5th to 95th percentile 1.02 to 219, 15.8% within 10%, log-log
+   r = 0.70. The 5,608 precursors the jar identified but could not quantify
+   (`NumberOfQuantIons` = 0, `TotalIntensity` = 0) get a non-zero value.
+2. **188 peptides have no peptide-level quantity**: every pyro-Glu peptide. The jar spells an
+   N-terminal modification two ways in one file (see the format note below), and the reader
+   resolves the two spellings of `-17.026549` to different ProForma strings (`[-17.026549]-Q…`
+   and `Q[-17.026549]…`; neither is resolved to the UNIMOD entry), so the quantity row finds no
+   peptide. N-terminal acetyl (570 peptides) survives because both spellings resolve to
+   `[UNIMOD:1]-`.
+3. **8.5% of stored fragment peaks are not carried over** (100,450 of 1,181,605). The reader
+   keeps a stored peak only if it lies within 20 ppm of a b or y ion at fragment charge 1 or 2.
+   (A further 2,499 rows of the fragment table repeat a stored peak: it fits a singly and a
+   doubly charged ion of the same m/z and is listed under both, which is the matcher's
+   documented behaviour.) On an 8,000-entry sample the dropped peaks are: the intact precursor
+   or its water / ammonia loss, at any charge up to the precursor's (6.7% of all peaks, 10.4% of
+   stored intensity; EncyclopeDIA stores these in the spectrum, they are not sequence fragments);
+   b or y ions at charge 3 or more (1.6% of peaks, 0.6% of intensity); everything else 0.1%. No
+   entry lost all its peaks; one of 8,000 was left with fewer than three.
+4. **Nothing else in `entries` or `peptidequants` is carried**: which ions were quantified
+   (`QuantifiedIonsArray`, `QuantIon*Array`), per-fragment correlations, integration boundaries,
+   chromatograms. Decoy rows of `peptidescores` (317) and `proteinscores` (27) are dropped, by
+   the reader's default. `protein_quant` is empty.
+5. **It was slow**: 223 s on this machine (8 to 15 minutes alongside other searches), 99 s of
+   it a loop comparing every protein link with every peptide (35,767 x 31,830 = 1.1 billion
+   string comparisons). On the human predicted library (2.5 million entries, 2.7 million protein
+   links) the same loop extrapolates to about a week, so `predict-library` with its default
+   ingest, or loading that `.dlib`, could not finish.
+
+None of this affects the search or anything measured in this note: `compare-results` reads the
+`.elib` directly.
+
+**What was done about it (2026-10-11, PI decision):** only what costs nothing later. The
+linking loop is replaced by an index (same output, 37 s for run A; all nine Parquet tables are
+identical to what the old code wrote). That removes one wall, not the other: the reader still
+builds every fragment row as a Python object in memory (about 1 GB for run A's 32,000
+precursors, so roughly 85 GB extrapolated for the 2.5-million-entry predicted library), so a
+proteome-scale `.dlib` still cannot be ingested with fragments; that needs the streaming phase 4
+reader. And the reader no longer keeps quiet:
+`EncyclopediaReadResult.caveats` states items 1 to 3 in sentences with counts, and every command
+that writes the Parquet copy prints them and records them under `ingest.caveats` in its
+manifest. The numbers themselves are unchanged. Item 2 is fixed in phase 3 (the modified-sequence
+parser, which the content-derived ids need anyway); items 1, 3 and 4 are fixed once, in the
+phase 4 reader, on top of which `read_encyclopedia` is to be rebuilt so that there is one
+reader. Nobody depends on the current Parquet numbers, the frozen pipeline's included.
+
+**Format note found on the way: N-terminal modifications are spelled two ways in one result
+file.** `entries` and `peptidescores` write the modification before the first residue
+(`[+42.010565]MDFQHRPGGK`); `peptidequants` writes it on the residue (`M[+42.010565]DFQHRPGGK`),
+ahead of the residue's own modification if it has one (`C[+42.010565][+57.0214635]DF…`). 758 of
+31,830 precursors here (570 acetyl, 188 pyro-Glu). A join between the two tables on
+`PeptideModSeq` loses them; `compare_results` normalises to one spelling
+(`_result_diff._precursor_key`), and the phase 4 reader must do the same.
 
 ## Open items
 
-- Whether search accepts a `.raw` directly in 6.9.23.
-- Whether `-libexport` needs `-f` in its default mode.
+- Whether `-libexport` needs `-f` in its default mode, and how its Percolator is selected
+  (`-percolatorLocation`).
 - What ScribeTwo writes when run from the CLI.
 - Whether ScribeTwo's DDA search reads the `ranges` table (Constellation writes every window; the
   reference writes a sample).
+- Whether `vsyscall=emulate` in `.wslconfig` makes the bundled Percolator 3.01 run under WSL2
+  (expected; untested).
+
+Closed on 2026-10-11: search accepts a `.raw` directly (yes, and writes no `.dia`); where the
+Thermo server's files go (`java.io.tmpdir`).
