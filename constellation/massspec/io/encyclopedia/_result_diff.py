@@ -12,8 +12,9 @@ repeat search of the same input as the yardstick.
 This reads the two files' own tables (no Constellation ids involved, so
 it works on any single-run result library) and reports:
 
-- which precursors (``PeptideModSeq`` + charge), peptides and target
-  proteins each one identified, and how many they share;
+- which precursors (the peptide an ``entries`` row names, plus charge),
+  peptides and target proteins each one identified, and how many they
+  share;
 - for the shared precursors, how far apart the retention times, scores
   and quantities are.
 
@@ -29,7 +30,11 @@ from pathlib import Path
 
 import numpy as np
 
-from constellation.massspec.io.encyclopedia._modseq import encyclopedia_residue_form
+from constellation.core.sequence.proforma import format_proforma
+from constellation.massspec.io.encyclopedia._modseq import (
+    encyclopedia_residue_form,
+    parse_encyclopedia_modseq,
+)
 
 
 @dataclass
@@ -76,6 +81,9 @@ class ResultComparison:
     #: files quantify: median absolute value, 99th percentile, the
     #: fraction within 1%, and the Pearson r of the log intensities.
     intensity: dict[str, float] = field(default_factory=dict)
+    #: Quantity rows of ``a`` and of ``b`` that fit more than one
+    #: precursor of their own file and were left out of ``intensity``.
+    ambiguous_quantities: tuple[int, int] = (0, 0)
 
     @property
     def identical_identifications(self) -> bool:
@@ -106,6 +114,13 @@ class ResultComparison:
                 f"{100 * q['frac_within_1pct']:.2f}% within 1%; "
                 f"Pearson r (log) {q['pearson_log']:.6f}"
             )
+        if any(self.ambiguous_quantities):
+            n_a, n_b = self.ambiguous_quantities
+            lines.append(
+                f"{n_a:,} and {n_b:,} quantity rows fit more than one precursor of their "
+                f"file (an N-terminal modification and one on the first residue are spelled "
+                f"alike in peptidequants) and were left out of the quantity comparison"
+            )
         return "\n".join(lines)
 
 
@@ -121,19 +136,37 @@ def _open(path: Path) -> sqlite3.Connection:
     return con
 
 
-def _precursor_key(modseq: str, charge: int) -> tuple[str, int]:
-    """One spelling per precursor across a result library's tables.
+def _identity(modseq: str, charge: int) -> tuple[str, int]:
+    """What a precursor *is*: the peptide its ``entries`` spelling names,
+    as canonical ProForma, and its charge.
 
-    ``entries`` and ``peptidequants`` spell an N-terminal modification
-    differently (:func:`._modseq.encyclopedia_residue_form`); joined on
-    the raw string, every N-terminally modified precursor (758 of 31,830
-    in the first file looked at) would have no quantity.
+    ``entries`` writes an N-terminal modification before the first
+    residue, so its spelling distinguishes ``[+42.010565]KVERPD``
+    (N-terminal acetyl) from ``K[+42.010565]VERPD`` (acetyl-lysine).
+    Those are different molecules and stay different precursors here.
+    """
+    return format_proforma(parse_encyclopedia_modseq(modseq)), int(charge)
+
+
+def _quant_join_key(modseq: str, charge: int) -> tuple[str, int]:
+    """The spelling ``peptidequants`` uses for a precursor of ``entries``.
+
+    That table writes an N-terminal modification on the first residue
+    (:func:`._modseq.encyclopedia_residue_form`), so a quantity row is
+    found through this key: joined on the raw string, every N-terminally
+    modified precursor (758 of 31,830 in the first file looked at) would
+    have no quantity. It is a join key only. It cannot tell the two
+    molecules in :func:`_identity` apart, so it is never used to say
+    which precursors a result holds, and a quantity row whose key fits
+    two precursors is counted as ambiguous, not assigned.
     """
     return encyclopedia_residue_form(modseq), int(charge)
 
 
-def _load(path: Path) -> tuple[dict, dict, set[str]]:
-    """``{precursor: (rt, score)}``, ``{precursor: intensity}`` and target proteins."""
+def _load(path: Path) -> tuple[dict, dict, set[str], int]:
+    """``{precursor: (rt, score)}``, ``{precursor: intensity}``, target
+    proteins, and the number of quantity rows that fit more than one
+    precursor. Precursors are keyed by :func:`_identity`."""
     con = _open(path)
     try:
         sources = [r[0] for r in con.execute("SELECT DISTINCT SourceFile FROM entries")]
@@ -142,18 +175,30 @@ def _load(path: Path) -> tuple[dict, dict, set[str]]:
                 f"{path} holds {len(sources)} runs ({', '.join(sorted(sources)[:3])}, ...); "
                 f"compare_results compares single-run result libraries"
             )
-        entries = {
-            _precursor_key(modseq, charge): (float(rt), float(score))
-            for modseq, charge, rt, score in con.execute(
-                "SELECT PeptideModSeq, PrecursorCharge, RTInSeconds, Score FROM entries"
-            )
-        }
-        quants = {
-            _precursor_key(modseq, charge): float(total)
-            for modseq, charge, total in con.execute(
-                "SELECT PeptideModSeq, PrecursorCharge, TotalIntensity FROM peptidequants"
-            )
-        }
+        entries: dict[tuple[str, int], tuple[float, float]] = {}
+        by_join_key: dict[tuple[str, int], list[tuple[str, int]]] = {}
+        for modseq, charge, rt, score in con.execute(
+            "SELECT PeptideModSeq, PrecursorCharge, RTInSeconds, Score FROM entries"
+        ):
+            key = _identity(modseq, charge)
+            if key in entries:
+                raise ValueError(
+                    f"{path} lists the same precursor twice ({key[0]}/{key[1]}), "
+                    f"under two spellings or in two rows"
+                )
+            entries[key] = (float(rt), float(score))
+            by_join_key.setdefault(_quant_join_key(modseq, charge), []).append(key)
+
+        quants: dict[tuple[str, int], float] = {}
+        n_ambiguous = 0
+        for modseq, charge, total in con.execute(
+            "SELECT PeptideModSeq, PrecursorCharge, TotalIntensity FROM peptidequants"
+        ):
+            candidates = by_join_key.get(_quant_join_key(modseq, charge), ())
+            if len(candidates) == 1:
+                quants[candidates[0]] = float(total)
+            elif candidates:
+                n_ambiguous += 1
         proteins = {
             r[0]
             for r in con.execute(
@@ -162,7 +207,7 @@ def _load(path: Path) -> tuple[dict, dict, set[str]]:
         }
     finally:
         con.close()
-    return entries, quants, proteins
+    return entries, quants, proteins, n_ambiguous
 
 
 def _spread(values: np.ndarray) -> dict[str, float]:
@@ -177,16 +222,18 @@ def compare_results(a: Path | str, b: Path | str) -> ResultComparison:
     """Compare two EncyclopeDIA result libraries (``.elib``, or ScribeTwo's ``.dlib``).
 
     A precursor is a ``(PeptideModSeq, PrecursorCharge)`` row of
-    ``entries`` (N-terminal modifications in one spelling, see
-    :func:`_precursor_key`); a peptide is its ``PeptideModSeq``; a protein is a
+    ``entries``, identified by the peptide that spelling names
+    (:func:`_identity`: N-terminal and first-residue modifications are
+    different precursors); a peptide is that identity without the
+    charge; a protein is a
     non-decoy ``ProteinAccession`` of ``proteinscores``. Each file must
     describe one run (a multi-run quantitative report is refused); the
     run's name is not compared, so the same acquisition searched under
     two file names lines up.
     """
     a, b = Path(a), Path(b)
-    entries_a, quants_a, proteins_a = _load(a)
-    entries_b, quants_b, proteins_b = _load(b)
+    entries_a, quants_a, proteins_a, ambiguous_a = _load(a)
+    entries_b, quants_b, proteins_b, ambiguous_b = _load(b)
 
     shared = sorted(entries_a.keys() & entries_b.keys())
     peptides_a = {k[0] for k in entries_a}
@@ -197,6 +244,7 @@ def compare_results(a: Path | str, b: Path | str) -> ResultComparison:
         precursors=SetOverlap(len(entries_a), len(entries_b), len(shared)),
         peptides=SetOverlap(len(peptides_a), len(peptides_b), len(peptides_a & peptides_b)),
         proteins=SetOverlap(len(proteins_a), len(proteins_b), len(proteins_a & proteins_b)),
+        ambiguous_quantities=(ambiguous_a, ambiguous_b),
     )
     if shared:
         pairs_a = np.array([entries_a[k] for k in shared])

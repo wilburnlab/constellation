@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from constellation.massspec.io.encyclopedia import compare_results
+from constellation.massspec.io.encyclopedia._modseq import encyclopedia_residue_form
 
 # (modseq, charge, rt seconds, score, total intensity or None, protein)
 _BASE = [
@@ -37,7 +38,11 @@ def _write_result(path: Path, rows, *, source: str = "run.raw", decoy_protein: s
         con.execute("INSERT INTO entries VALUES (?,?,?,?,?)", (modseq, charge, rt, score, src))
         con.execute("INSERT INTO peptidescores VALUES (?,?,?)", (modseq, charge, src))
         if total is not None:
-            con.execute("INSERT INTO peptidequants VALUES (?,?,?,?)", (modseq, charge, total, src))
+            # As the jar does: N-terminal modifications on the first residue here.
+            con.execute(
+                "INSERT INTO peptidequants VALUES (?,?,?,?)",
+                (encyclopedia_residue_form(modseq), charge, total, src),
+            )
         proteins.add(protein)
     for protein in sorted(proteins):
         con.execute("INSERT INTO proteinscores VALUES (?,0,?)", (protein, "run.raw"))
@@ -95,14 +100,14 @@ def test_n_terminal_modifications_join_across_the_two_spellings(tmp_path: Path) 
     """6.9.23 writes ``[+42.010565]MDFQ...`` in ``entries`` and
     ``M[+42.010565]DFQ...`` in ``peptidequants``; the quantity must
     still be found, also when the first residue has its own modification."""
-    from constellation.massspec.io.encyclopedia._result_diff import _precursor_key
+    from constellation.massspec.io.encyclopedia._result_diff import _quant_join_key
 
-    assert _precursor_key("[+42.010565]MDFQHRPGGK", 3) == ("M[+42.010565]DFQHRPGGK", 3)
-    assert _precursor_key("[+42.010565]C[+57.0214635]DFTEDK", 2) == (
+    assert _quant_join_key("[+42.010565]MDFQHRPGGK", 3) == ("M[+42.010565]DFQHRPGGK", 3)
+    assert _quant_join_key("[+42.010565]C[+57.0214635]DFTEDK", 2) == (
         "C[+42.010565][+57.0214635]DFTEDK",
         2,
     )
-    assert _precursor_key("M[+15.994915]ELVISK", 2) == ("M[+15.994915]ELVISK", 2)
+    assert _quant_join_key("M[+15.994915]ELVISK", 2) == ("M[+15.994915]ELVISK", 2)
 
     def _result(path: Path, total: float) -> Path:
         con = sqlite3.connect(_write_result(path, []))
@@ -160,3 +165,56 @@ def test_cli_exit_status_follows_min_overlap(tmp_path: Path, capsys) -> None:
     capsys.readouterr()
     assert main([*base, "--min-overlap", "1.5"]) == 2
     assert main(["massspec", "encyclopedia", "compare-results", str(a), str(tmp_path / "x")]) == 2
+
+
+# ── identity is the entry's own spelling, not the join key ─────────────
+# (Regression from the review of b1fe1ca: the residue-form key used for
+# joining quantities was also used as precursor identity, so N-terminal
+# and lysine acetylation on a leading K were one precursor.)
+
+_N_TERMINAL = ("[+42.010565]KVERPDK", 2, 300.0, 0.001, 1.0e6, "P1")
+_ON_LYSINE = ("K[+42.010565]VERPDK", 2, 310.0, 0.002, 2.0e6, "P1")
+
+
+def test_n_terminal_and_side_chain_modification_are_different_precursors(tmp_path: Path) -> None:
+    a = _write_result(tmp_path / "a.elib", [_N_TERMINAL])
+    b = _write_result(tmp_path / "b.elib", [_ON_LYSINE])
+    result = compare_results(a, b)
+    assert (result.precursors.n_a, result.precursors.n_b, result.precursors.n_shared) == (1, 1, 0)
+    assert result.peptides.n_shared == 0
+    assert not result.identical_identifications
+
+
+def test_both_placements_in_one_file_are_both_counted(tmp_path: Path) -> None:
+    """They used to overwrite each other in a dict."""
+    both = _write_result(tmp_path / "both.elib", [_N_TERMINAL, _ON_LYSINE])
+    only_one = _write_result(tmp_path / "one.elib", [_N_TERMINAL])
+    result = compare_results(both, only_one)
+    assert (result.precursors.n_a, result.precursors.n_b, result.precursors.n_shared) == (2, 1, 1)
+    assert result.peptides.n_a == 2
+
+
+def test_a_quantity_that_fits_two_precursors_is_left_out_and_reported(tmp_path: Path) -> None:
+    """``peptidequants`` writes both placements as ``K[+42.010565]...``.
+    When both precursors exist the quantity rows cannot be told apart;
+    they are excluded from the quantity comparison and the report says so."""
+    both = _write_result(tmp_path / "both.elib", [_N_TERMINAL, _ON_LYSINE, _BASE[0]])
+    result = compare_results(both, both)
+    assert result.precursors.n_shared == 3
+    assert result.intensity["n"] == 1  # only PEPTIDEK 2+ is unambiguous
+    assert result.ambiguous_quantities == (2, 2)
+    assert "2 and 2 quantity rows fit more than one precursor" in result.report()
+    # With one placement present the row is unambiguous and is used.
+    one = _write_result(tmp_path / "one.elib", [_N_TERMINAL])
+    alone = compare_results(one, one)
+    assert alone.intensity["n"] == 1 and alone.ambiguous_quantities == (0, 0)
+    assert "fit more than one precursor" not in alone.report()
+
+
+def test_two_spellings_of_one_precursor_in_entries_are_refused(tmp_path: Path) -> None:
+    path = _write_result(
+        tmp_path / "dup.elib",
+        [("M[+42.010565]DFQK", 2, 1.0, 0.1, 1.0, "P1"), ("[+42.010565]MDFQK", 2, 1.0, 0.1, 1.0, "P1")],
+    )
+    with pytest.raises(ValueError, match="the same precursor twice"):
+        compare_results(path, path)
