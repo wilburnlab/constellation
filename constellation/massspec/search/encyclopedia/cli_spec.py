@@ -198,6 +198,11 @@ EXTRA_PROBES: tuple[HelpProbe, ...] = (
 # ──────────────────────────────────────────────────────────────────────
 
 
+# The helper thread's line, with its own timestamp when it starts
+# mid-line: "... [HH:MM:SS] Thermo server: <message>".
+_THERMO_LINE_RE = re.compile(r"(?:\[\d{2}:\d{2}:\d{2}\] )?Thermo server:.*$")
+
+
 def normalize_help(raw: str) -> str:
     """Strip what varies between runs from a jar ``-h`` capture.
 
@@ -205,13 +210,28 @@ def normalize_help(raw: str) -> str:
     "Thermo server" line (written from another thread, so it lands at a
     different place each run), and replaces the thread-count default,
     which is the host's core count, with :data:`HOST_CORES`.
+
+    The helper thread does not wait for a line break. About one capture
+    in thirty it writes into the middle of another line::
+
+        Exception in thread "main" [23:21:49] Thermo server: extracting...
+        java.lang.NullPointerException
+
+    so what stood before it is kept and rejoined with what follows,
+    rather than dropped along with it.
     """
     lines: list[str] = []
+    carry = ""
     for line in raw.replace("\r\n", "\n").split("\n"):
-        line = _TIMESTAMP_RE.sub("", line).rstrip()
-        if "Thermo server:" in line:
+        line = carry + _TIMESTAMP_RE.sub("", line)
+        carry = ""
+        interrupted = _THERMO_LINE_RE.search(line)
+        if interrupted:
+            carry = line[: interrupted.start()]
             continue
-        lines.append(line)
+        lines.append(line.rstrip())
+    if carry.strip():
+        lines.append(carry.rstrip())
     while lines and not lines[-1]:
         lines.pop()
     text = "\n".join(lines) + "\n"

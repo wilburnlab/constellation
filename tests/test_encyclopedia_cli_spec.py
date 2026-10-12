@@ -61,6 +61,30 @@ def test_normalize_is_independent_of_where_the_thermo_line_lands() -> None:
     assert normalize_help(a) == normalize_help(b) == "Title\nbody\n"
 
 
+def test_normalize_survives_the_thermo_line_landing_mid_line() -> None:
+    """The helper thread does not wait for a line break: seen about once
+    in thirty captures of ``-batch -h``, where it cut the crash line in
+    two. What stood before it must not be dropped with it."""
+    clean = (
+        "[23:21:49] EncyclopeDIA Batch Help\n"
+        "[23:21:49] Thermo server: extracting common runtime files...\n"
+        'Exception in thread "main" java.lang.NullPointerException\n'
+        "\tat java.base/java.io.File.<init>(File.java:278)\n"
+    )
+    interrupted = (
+        "[23:21:49] EncyclopeDIA Batch Help\n"
+        'Exception in thread "main" [23:21:49] Thermo server: extracting common runtime files...\n'
+        "java.lang.NullPointerException\n"
+        "\tat java.base/java.io.File.<init>(File.java:278)\n"
+    )
+    assert normalize_help(interrupted) == normalize_help(clean)
+    assert 'Exception in thread "main" java.lang.NullPointerException' in normalize_help(clean)
+    # At the very end of the output, the fragment before it is still kept.
+    assert normalize_help("Title\nlast words [01:02:03] Thermo server: bye\n") == (
+        "Title\nlast words\n"
+    )
+
+
 def test_normalize_replaces_host_core_count_default() -> None:
     raw = "T\n\t-numberOfThreadsUsed                 (default: 96)\n\t-ptol  (default: 10)\n"
     out = normalize_help(raw)
