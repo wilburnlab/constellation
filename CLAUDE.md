@@ -124,6 +124,7 @@ Domain-specific conventions live in [constellation/core/CLAUDE.md](constellation
 - **Classes:** `PascalCase` (always — no legacy carryover). Legacy `snake_case` class names from Cartographer (`resnet_block`, `resnet_unit`) do not come across.
 - **Third-party tool env-var convention:** `$CONSTELLATION_<TOOL>_HOME` (uniform across all tools — no `_JAR` / `_DIR` / `_HOME` mixing).
 - **Tolerance:** default fragment tolerance 20 ppm; functions accept `tolerance_unit` as `'ppm'` or `'Da'` (same as Cartographer).
+- **Content-derived ids use the xxhash family.** An id computed from what an entity *is* (so that independent producers agree on it) is xxh64: the read fingerprints in `sequencing`, and the peptide / precursor / protein ids of `massspec.library.ids`. Where 64 bits are too few, xxh3-128 (dereplication keys, corpus digests). One convention rather than a hash per module (PI, 2026-10-11). Digests with a different job keep their own function: SHA-256 identifies files (`source_sha256`, manifest inputs), and stage keys (`core.stages`, standard library only) and viz source ids are BLAKE2b.
 - **Sentinel values:** `-1.0` = "not observed" / "not set" for float fields; `-1` in intensity tensors flags loss-masked positions.
 
 ## Companion-instrument data formats

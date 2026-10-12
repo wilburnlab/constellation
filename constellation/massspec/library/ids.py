@@ -14,12 +14,17 @@ number for the same molecule, so tables from independent runs
 concatenate and join as they are. The price is that ids are large and
 carry no order.
 
-The recipe (``ID_SCHEME``) is small enough to redo by hand or in another
-language::
+The recipe (``ID_SCHEME``) is small enough to redo in another language::
 
     key = canonical string            (see the three ``canonical_*_key``)
-    id  = first 8 bytes of BLAKE2b(key as UTF-8), big-endian,
-          top bit cleared            (so it fits a signed int64, >= 0)
+    id  = XXH64(key as UTF-8, seed 0), top bit cleared
+                                      (so it fits a signed int64, >= 0)
+
+xxh64 because it is the hash Constellation uses for content-derived ids
+everywhere (the read fingerprints of ``sequencing`` are xxh64 too): one
+convention, decided by the PI on 2026-10-11, rather than a hash per
+module. It needs the ``xxhash`` package, which the ``ms`` extra
+installs.
 
 Opt-in. Nothing switches to these ids on its own: build keys and ids
 with the functions here, or re-key a whole ``Library`` with
@@ -54,13 +59,13 @@ different molecules and get different ids.
 
 from __future__ import annotations
 
-import hashlib
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
 
 import pyarrow as pa
 import pyarrow.compute as pc
+import xxhash
 
 from constellation.core.chem.modifications import UNIMOD, ModVocab
 from constellation.core.sequence.proforma import (
@@ -243,8 +248,7 @@ def canonical_protein_key(accession: str) -> str:
 
 def content_id(key: str) -> int:
     """The id of a canonical key (the recipe in the module docstring)."""
-    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
-    return int.from_bytes(digest, "big") & _ID_MASK
+    return xxhash.xxh64_intdigest(key.encode("utf-8")) & _ID_MASK
 
 
 def content_ids(keys: Sequence[str]) -> pa.Array:

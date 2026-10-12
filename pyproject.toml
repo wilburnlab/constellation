@@ -45,7 +45,10 @@ dependencies = [
 # Modality extras: install the Python-wheel-available bits. Native
 # binaries (Thermo DLLs, EncyclopeDIA jar, mmseqs2, Dorado, ...) go
 # through `scripts/install-*.sh` and thirdparty/ adapters — not extras.
-ms         = ["requests", "koinapy"]
+# xxhash here too: content-derived peptide / precursor / protein ids
+# (massspec.library.ids) are xxh64, the same hash as the read
+# fingerprints below, so `pip install constellation-bio[ms]` must bring it.
+ms         = ["requests", "koinapy", "xxhash>=3.4"]
 # xxhash: 64/128-bit non-cryptographic hashes for read fingerprints
 # (cluster.fingerprints) and de-novo dereplication keys
 # (cluster.denovo.dereplicate). environment.yml already installs it,

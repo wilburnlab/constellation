@@ -38,16 +38,18 @@ def test_the_id_recipe_is_pinned() -> None:
     """These numbers are what `content-v1` means. If one changes, ids
     already written to disk no longer match: bump ``ID_SCHEME`` instead."""
     assert ID_SCHEME == "content-v1"
-    assert content_id("PEPTIDEK") == 1792753019647354276
-    assert peptide_id("PEPC[UNIMOD:4]TIDEK") == 2515000382947725677
-    assert precursor_id("PEPC[UNIMOD:4]TIDEK", 2) == 6067920219105794426
-    assert protein_id("P12345") == 4585892463021593304
+    assert content_id("PEPTIDEK") == 1737381178641768046
+    assert peptide_id("PEPC[UNIMOD:4]TIDEK") == 4725029620709091951
+    assert precursor_id("PEPC[UNIMOD:4]TIDEK", 2) == 4801674327333987085
+    assert protein_id("P12345") == 5491472677257627428
     assert all(0 <= content_id(k) < 2**63 for k in ("", "A", "PEPTIDEK/2", "[UNIMOD:1]-K"))
-    # The recipe, spelled out independently of the module.
-    import hashlib
+    # The recipe, spelled out independently of the module: XXH64, seed 0,
+    # of the UTF-8 key, top bit cleared. The empty input is the reference
+    # implementation's published test vector.
+    import xxhash
 
-    digest = hashlib.blake2b(b"PEPTIDEK", digest_size=8).digest()
-    assert content_id("PEPTIDEK") == int.from_bytes(digest, "big") & (2**63 - 1)
+    assert content_id("PEPTIDEK") == xxhash.xxh64_intdigest(b"PEPTIDEK", seed=0) & (2**63 - 1)
+    assert content_id("") == 0xEF46DB3751D8E999 & (2**63 - 1)
 
 
 # ── canonical keys ─────────────────────────────────────────────────────

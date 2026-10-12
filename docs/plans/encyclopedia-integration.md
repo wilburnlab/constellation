@@ -90,11 +90,12 @@ Plan approved by the PI on 2026-10-10. Eight PR-sized phases (P0–P7).
     and the total equals the jar's exactly; the only other change to its output is
     `mz_theoretical` of the 188 pyro-Glu precursors' b ions, by under 1e-7 Da.
   - **Ids.** `massspec/library/ids.py`: canonical peptide / precursor / protein keys and
-    content ids (`content-v1`), `with_content_ids(library)`. **One departure from the plan
-    text:** the hash is BLAKE2b (8 bytes), not xxh64. It is in the standard library, where
-    xxhash is only in the `sequencing` extra, and anyone can recompute it in any language.
-    Nothing has been written with these ids yet, so this is the moment to object. Checked over
-    every modified sequence in the old sample files and the two 6.9.23 reference results.
+    content ids (`content-v1`), `with_content_ids(library)`. The hash is xxh64, as the plan
+    said and as the read fingerprints of `sequencing` use: one hash for content-derived ids
+    across Constellation (PI, 2026-10-11). It was first committed as BLAKE2b (standard library,
+    no dependency) and switched before anything was written with it; the `ms` extra now
+    installs `xxhash`. Checked over every modified sequence in the old sample files and the two
+    6.9.23 reference results.
   - **Stage and manifest helpers.** `core/stages.py`, `core/manifests.py`, and the three
     mass-spec manifest kinds in `massspec/manifest.py` (field names fixed, nothing writes them
     until P4).
