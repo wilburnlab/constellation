@@ -60,12 +60,11 @@ different molecules and get different ids.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 
 import pyarrow as pa
 import pyarrow.compute as pc
-import xxhash
 
 from constellation.core.chem.modifications import UNIMOD, ModVocab
 from constellation.core.sequence.proforma import (
@@ -246,9 +245,32 @@ def canonical_protein_key(accession: str) -> str:
 # ──────────────────────────────────────────────────────────────────────
 
 
+_xxh64: Callable[[bytes], int] | None = None
+
+
+def _xxh64_intdigest() -> Callable[[bytes], int]:
+    """``xxhash.xxh64_intdigest``, imported on first use.
+
+    Not at module import: this module is on its way to being imported by
+    the readers, which the CLI loads while building its parser, and a
+    base install (no ``ms`` extra, so no ``xxhash``) must still start.
+    """
+    global _xxh64
+    if _xxh64 is None:
+        try:
+            import xxhash
+        except ImportError as exc:
+            raise ImportError(
+                "content-derived ids need the `xxhash` package: "
+                "pip install 'constellation-bio[ms]'"
+            ) from exc
+        _xxh64 = xxhash.xxh64_intdigest
+    return _xxh64
+
+
 def content_id(key: str) -> int:
     """The id of a canonical key (the recipe in the module docstring)."""
-    return xxhash.xxh64_intdigest(key.encode("utf-8")) & _ID_MASK
+    return _xxh64_intdigest()(key.encode("utf-8")) & _ID_MASK
 
 
 def content_ids(keys: Sequence[str]) -> pa.Array:
@@ -257,10 +279,11 @@ def content_ids(keys: Sequence[str]) -> pa.Array:
     Equal keys get equal ids (that is the point); two *different* keys
     with the same id raise :class:`IdCollisionError`.
     """
+    digest = _xxh64_intdigest()
     seen: dict[int, str] = {}
     out: list[int] = []
     for key in keys:
-        value = content_id(key)
+        value = digest(key.encode("utf-8")) & _ID_MASK
         other = seen.setdefault(value, key)
         if other != key:
             raise IdCollisionError(

@@ -135,9 +135,39 @@ def test_content_ids_keeps_order_and_notices_a_collision(monkeypatch) -> None:
     assert out.type == pa.int64()
     assert out.to_pylist() == [content_id(k) for k in keys]
 
-    monkeypatch.setattr(ids, "content_id", lambda key: 7)
+    monkeypatch.setattr(ids, "_xxh64", lambda data: 7)
     with pytest.raises(IdCollisionError, match="'PEPTIDEK' and 'ELVISK'"):
         ids.content_ids(keys)
+
+
+def test_the_module_imports_without_xxhash_and_says_what_is_missing() -> None:
+    """A base install has no ``xxhash``. Importing the module (which the
+    readers will do, and the CLI loads the readers at start-up) must not
+    need it; asking for an id must say what to install. In a fresh
+    interpreter, so nothing here is reloaded under the other tests."""
+    import subprocess
+    import sys
+
+    import constellation
+
+    code = (
+        "import sys; sys.modules['xxhash'] = None\n"  # makes `import xxhash` fail
+        "from constellation.massspec.library import ids\n"
+        "assert ids.canonical_peptide_key('PEPM[Oxidation]TIDEK') == 'PEPM[UNIMOD:35]TIDEK'\n"
+        "try:\n"
+        "    ids.content_id('PEPTIDEK')\n"
+        "except ImportError as exc:\n"
+        "    print('refused:', exc)\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=Path(constellation.__file__).parents[1],
+        timeout=120,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "refused:" in done.stdout and "constellation-bio[ms]" in done.stdout
 
 
 # ── the two EncyclopeDIA spellings ─────────────────────────────────────
