@@ -111,6 +111,34 @@ Plan approved by the PI on 2026-10-10. Eight PR-sized phases (P0–P7).
     defaults, types, handlers) is identical before and after, and the test suite passes
     unchanged with no test edited. `__init__` re-exports the private names the frozen pipeline
     and the tests import.
+- **Review of the foundations before P4 (Codex on `b1fe1ca`, 2026-10-11): three defects, all
+  reproduced, each fixed with a regression test written first.**
+  - **Acquisition registration could bind results to the wrong run.** A hash match ended
+    validation before the other rows' file names were checked, so a copy of run 0 arriving under
+    run 1's name was registered as run 0 while `id_for_source` resolved the name to run 1; and a
+    renamed copy got the right id but lost its name, so results under it found nothing. Now
+    every name of a record is checked against every run before anything is accepted, a run
+    keeps its other names (`source_aliases`), and `with_source_alias` binds a name outright.
+  - **SIGTERM to the wrapper left the JVM running.** It runs in its own session, and the default
+    SIGTERM action kills Python without any cleanup. `jvm.cancellation_scope` now handles SIGTERM
+    and SIGHUP while a JVM runs. The worker-thread case needed more than raising from the
+    handler: CPython 3.12 marks a thread as finished when an exception from a signal handler
+    lands in `Thread.join`, so the process exited with that thread's cleanup half done; the
+    handler now waits for runs in other threads before unwinding. Checked with a fake Java
+    (main thread and worker thread, SIGTERM and SIGHUP) and by cancelling a real search.
+  - **`compare-results` merged distinct modification sites.** It used the residue-form join key
+    as precursor identity, so N-terminal and lysine acetylation on a leading K were one
+    precursor, and one overwrote the other when both occurred. Identity is now the peptide the
+    `entries` spelling names; the join key is used only to find quantities, and a quantity row
+    that fits two precursors is counted and reported. Every comparison in the survey note was
+    re-run and is unchanged.
+  - Also, mine: `massspec.library.ids` imports `xxhash` on first use, because the P4 reader will
+    import it and the CLI loads the readers at start-up, which a base install must survive.
+  - Also, found by the full test run: the help-snapshot test was flaky (about one capture in
+    thirty). The jar's helper thread sometimes prints into the middle of another line, and the
+    normalisation dropped the whole line. It now keeps what stood before the interruption; sixty
+    consecutive captures of the affected program match the snapshot.
+  - The review's two requirements for P4 are added to its acceptance criteria below.
 - **P4–P7: not started.** `process-dia` (jar-side conversion) is still a CLI verb; the plan
   removes it in P4, once the new search path takes bundles directly.
 - **Naming (PI, 2026-10-11).** No command or flag is named `dia`: DIA is an acquisition method,
@@ -295,7 +323,7 @@ alongside.
 | **P1** EncyclopeDIA spectra file (`.dia`) | Streaming reader (0.5.0 and 0.8.0), writer (0.8.0, single and merged), `.dia` → bundle import, structural diff; `massspec encyclopedia {export-spectra,import-spectra,compare-spectra}` | `massspec/io/encyclopedia/{_dia.py, _dia_write.py*, _dia_diff.py*, _codec.py, _schema.py}`; `massspec/schemas.py` + `readers/thermo/_read.py` (additive `scan_window_lower/upper`) | Each reference `.dia` → import → export → diff is clean, the merged one included; synthetic round trip runs in CI |
 | **P2** First real run | With today's verbs, run end to end on the reference data; record the DDL and location of every output; settle the JVM flags | `constellation/data/_raw/encyclopedia/6.9.23/{schema,outputs}/`*; `thirdparty/jvm.py` | Re-running the reference search on the reference `.dia` reproduces it (and measures run-to-run noise). raw → bundle → Constellation `.dia` → the same search lands within that noise. Constellation `.dia` vs reference `.dia` by `encyclopedia compare-spectra` |
 | **P3** Foundations | Split the 3,848-line CLI module (pure move); shared stage and manifest helpers; identity | `massspec/cli.py` → `massspec/cli/`; `core/{stages.py*, manifests.py*}`; `massspec/manifest.py*`; `massspec/acquisitions.py`; `massspec/library/ids.py*` | Suite unchanged after the split; canonical-key tests over every sample modseq |
-| **P4** Single-acquisition path | New runner, mode resolver, mirror reader, typed manifest, experiment layout; `search` takes bundles / `.raw` / `.dia`; `process-dia` removed; `massspec encyclopedia {run,flags}` | `search/encyclopedia/{cli_spec.py*, runner.py*, params.py*, outputs.py*}`; `io/encyclopedia/{_mirror.py*, _project.py*}`; `massspec/workflows/encyclopedia.py*`; `search/schemas.py`, `quant/schemas.py`, `quant/targets.py` | Parquet row counts equal SQL counts; no orphan ids; `chromatogram extract` accepts the result as targets |
+| **P4** Single-acquisition path | New runner, mode resolver, mirror reader, typed manifest, experiment layout; `search` takes bundles / `.raw` / `.dia`; `process-dia` removed; `massspec encyclopedia {run,flags}` | `search/encyclopedia/{cli_spec.py*, runner.py*, params.py*, outputs.py*}`; `io/encyclopedia/{_mirror.py*, _project.py*}`; `massspec/workflows/encyclopedia.py*`; `search/schemas.py`, `quant/schemas.py`, `quant/targets.py` | Parquet row counts equal SQL counts; no orphan ids; `chromatogram extract` accepts the result as targets. **Added after review (2026-10-11):** field-level agreement, not only counts (each precursor's parsed quantity, retention time and score equal the jar's own values for that precursor); and every result bound to its acquisition explicitly, through a binding the unit's manifest records, never by matching names after the fact |
 | **P5** Orchestration | Fan-out, resume, per-unit status, detach/follow; fraction merge; chromatogram-library step with the collision filter; quant report | `workflows/encyclopedia.py`; `core/detach.py*`; `_dia_write.py`; `cli/encyclopedia.py` | Kill + `--resume` reruns only unfinished units; chained standalone equals orchestrated |
 | **P6** ScribeTwo | `--search-mode spectrum-centric` (until then that choice exits with "not yet available"): `-searchType` dia / dda / dda_chimeric, with or without a library; parse its `.dia.dlib` result, plus whatever reports the CLI turns out to write and the optional mzIdentML, into `PSM_TABLE`. Independent of P5 and can swap with it | `params.py`, `_project.py`, `search/schemas.py` | The reference DDA run re-run from the CLI with its recorded parameters lands near its 17,640 entries; ScribeTwo also runs on DIA; PSM scans join to scan metadata |
 | **P7** Breadth and write fidelity | Chromatograms, fragment quants, RT alignment, sidecars (Percolator input/output, calibration fit tables), ion mobility; writer on container 0.1.18 (`decoyentries`, `IonMobility`, 22 indexes) | `_project.py`, `_write.py`, `_schema.py`, `io/encyclopedia/_sidecar.py*` | The jar searches a Constellation-written `.dlib` and accepts a rewritten `.elib` |

@@ -68,7 +68,11 @@ count, is replaced with `<host cores>`.
   its process group when it is done (also on Ctrl-C), and give each run a private
   `java.io.tmpdir` that is removed afterwards. Anything that starts the jar should go through one
   of the two. A side benefit: two searches at once cannot collide on temp files, and each run's
-  Percolator executable is unpacked into its own directory.
+  Percolator executable is unpacked into its own directory. The cost of the separate session is
+  that a signal to the wrapper no longer reaches the JVM, so SIGTERM and SIGHUP are handled while
+  one is running (`jvm.cancellation_scope`): a real search cancelled with SIGTERM twenty seconds
+  in exits with status 143 in about a second, JVM, helper server and temp directory gone.
+  SIGKILL of the wrapper cannot be intercepted.
 - **Percolator is an external executable, and the default one does not run under WSL2.** See
   "Running a search" below.
 - **The install4j `.vmoptions`** (`-Xmx…`) applies only to the `EncyclopeDIA` launcher script, not
