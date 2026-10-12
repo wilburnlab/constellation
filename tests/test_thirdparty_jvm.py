@@ -458,3 +458,148 @@ def test_run_jar_private_tmpdir_is_removed(register_hello_tool, tmp_path: Path) 
         stream_to_stderr=False,
     )
     assert f"-Djava.io.tmpdir={chosen}" in result.argv and chosen.is_dir()
+
+
+# ── cancelling the wrapper stops the JVM ───────────────────────────────
+# (Regression from the review of b1fe1ca. The JVM runs in its own
+# session, so a signal to the wrapper no longer reaches it, and the
+# default SIGTERM action kills Python without running any `finally`:
+# a cancelled search kept running, with its helper and its temp files.)
+
+_FAKE_JAVA = """#!/usr/bin/env bash
+if [ "$1" = "-version" ]; then echo 'openjdk version "21-fake"' >&2; exit 0; fi
+for a in "$@"; do case "$a" in -Djava.io.tmpdir=*) tmp="${a#-Djava.io.tmpdir=}";; esac; done
+sleep 300 &
+echo "$$ $! $tmp" > "$FAKE_JAVA_PIDFILE"
+wait
+"""
+
+_WRAPPER = """
+import sys, threading
+from pathlib import Path
+from constellation.thirdparty.jvm import cancellation_scope, run_jar
+from constellation.thirdparty.registry import ToolSpec, register
+
+register(ToolSpec(name="_fake", env_var="_FAKE_HOME", artifact="fake-1.0.0.jar",
+                  prefer_bundled_jre=True))
+
+def search():
+    run_jar("_fake", args=[], log_dir=Path(sys.argv[1]), stream_to_stderr=False, check=False)
+
+if sys.argv[2] == "main":
+    search()
+else:  # the orchestrated shape: jars in worker threads, the scope in the main thread
+    with cancellation_scope():
+        worker = threading.Thread(target=search)
+        worker.start()
+        while worker.is_alive():
+            worker.join(0.1)
+"""
+
+
+def _start_wrapped_fake_java(tmp_path: Path, mode: str):
+    """A wrapper process running a fake Java (which starts a helper of
+    its own) through ``run_jar``. Returns the wrapper and the pids and
+    temp directory the fake Java reported."""
+    import os
+    import sys
+    import time
+
+    import constellation
+
+    home = tmp_path / "tool"
+    (home / "jre" / "bin").mkdir(parents=True)
+    (home / "fake-1.0.0.jar").write_bytes(b"")
+    java = home / "jre" / "bin" / "java"
+    java.write_text(_FAKE_JAVA)
+    java.chmod(0o755)
+    pidfile = tmp_path / "pids"
+    wrapper = subprocess.Popen(
+        [sys.executable, "-c", _WRAPPER, str(tmp_path / "logs"), mode],
+        env={**os.environ, "_FAKE_HOME": str(home), "FAKE_JAVA_PIDFILE": str(pidfile)},
+        cwd=Path(constellation.__file__).parents[1],
+    )
+    deadline = time.monotonic() + 30
+    while not (pidfile.is_file() and pidfile.read_text().strip()):
+        assert wrapper.poll() is None, "the wrapper exited before starting the fake Java"
+        assert time.monotonic() < deadline, "the fake Java never started"
+        time.sleep(0.05)
+    java_pid, helper_pid, java_tmp = pidfile.read_text().split()
+    return wrapper, int(java_pid), int(helper_pid), Path(java_tmp)
+
+
+@pytest.mark.parametrize("mode", ["main", "thread"])
+@pytest.mark.parametrize("signame", ["SIGTERM", "SIGHUP"])
+def test_signalling_the_wrapper_stops_the_jvm_and_cleans_up(
+    tmp_path: Path, mode: str, signame: str
+) -> None:
+    import os
+    import signal
+
+    signum = getattr(signal, signame)
+    wrapper, java_pid, helper_pid, java_tmp = _start_wrapped_fake_java(tmp_path, mode)
+    try:
+        assert _alive(java_pid) and _alive(helper_pid) and java_tmp.is_dir()
+        wrapper.send_signal(signum)  # the wrapper only, not its process group
+        assert wrapper.wait(timeout=30) == 128 + signum
+        assert _gone_within(java_pid), "the JVM outlived its cancelled wrapper"
+        assert _gone_within(helper_pid), "the JVM's helper outlived the cancelled wrapper"
+        assert not java_tmp.exists(), "the run's private temp directory was left behind"
+    finally:
+        if wrapper.poll() is None:
+            wrapper.kill()
+        try:
+            os.killpg(java_pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def test_cancellation_scope_installs_and_restores_handlers() -> None:
+    import signal
+
+    from constellation.thirdparty import jvm
+
+    before = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
+    with jvm.cancellation_scope():
+        assert signal.getsignal(signal.SIGTERM) is jvm._on_cancel_signal
+        with jvm.cancellation_scope():  # re-entrant
+            assert signal.getsignal(signal.SIGTERM) is jvm._on_cancel_signal
+        assert signal.getsignal(signal.SIGTERM) is jvm._on_cancel_signal
+    assert {s: signal.getsignal(s) for s in before} == before
+
+
+def test_cancellation_scope_leaves_an_ignored_signal_ignored() -> None:
+    """``nohup constellation ...`` ignores SIGHUP; that must stay so."""
+    import signal
+
+    from constellation.thirdparty import jvm
+
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        with jvm.cancellation_scope():
+            assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+            assert signal.getsignal(signal.SIGTERM) is jvm._on_cancel_signal
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+
+def test_cancellation_scope_is_inert_off_the_main_thread() -> None:
+    """Handlers can only be set from the main thread; a scope entered
+    elsewhere changes nothing and does not raise."""
+    import signal
+    import threading
+
+    from constellation.thirdparty import jvm
+
+    seen: list[object] = []
+
+    def enter() -> None:
+        with jvm.cancellation_scope():
+            seen.append(signal.getsignal(signal.SIGTERM))
+
+    before = signal.getsignal(signal.SIGTERM)
+    thread = threading.Thread(target=enter)
+    thread.start()
+    thread.join()
+    assert seen == [before]
