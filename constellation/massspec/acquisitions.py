@@ -27,6 +27,18 @@ result row as ``SourceFile``), not by any id of ours, so results are
 bound back with :meth:`Acquisitions.id_for_source`, which matches on the
 file name and falls back to the name without its extension (the same
 run may be known as ``run.raw``, ``run.dia`` or ``run.mzML``).
+
+That makes file names part of identity, with one rule: **a file name
+means one run**. A run may have several names (the original, a renamed
+copy, a file a workflow wrote for it); they are kept as
+``source_aliases``. :meth:`Acquisitions.register` checks every name of
+an incoming record against every run before it accepts anything, a hash
+match included, and refuses a name that already belongs to a different
+run, because a result reported under that name would be bound to the
+wrong one. A workflow that hands an engine a file of its own making
+should not rely on names at all: it says which run the file stands for
+(:meth:`Acquisitions.with_source_alias`) and records the binding in its
+manifest.
 """
 
 from __future__ import annotations
@@ -58,7 +70,8 @@ from constellation.core.io.schemas import (
 # Additive + nullable, so older 1-version-behind parquet still loads:
 # ``cast_to_schema`` fills the missing columns with nulls and merges this
 # (newer) metadata in, so a file read by newer code is treated as v1-shaped.
-# v2 adds ``source_sha256`` (identity across experiments).
+# v2 adds ``source_sha256`` (identity across experiments) and
+# ``source_aliases`` (the other file names a run is known by).
 ACQUISITION_SCHEMA_VERSION: int = 2
 
 
@@ -78,6 +91,9 @@ ACQUISITION_TABLE: pa.Schema = pa.schema(
         # SHA-256 of the instrument file (hex). The identity of a run
         # across experiments; null when the source was never hashed.
         pa.field("source_sha256", pa.string(), nullable=True),
+        # Other file names (no directories) this run is known by, beyond
+        # the name in ``source_file``. Null when there are none.
+        pa.field("source_aliases", pa.list_(pa.string()), nullable=True),
     ],
     metadata={
         b"schema_name": b"AcquisitionTable",
@@ -257,21 +273,20 @@ class Acquisitions:
         """The ``acquisition_id`` of the run a tool calls ``name``.
 
         ``name`` is a file name or path as some tool reported it. Tried
-        in order: the recorded ``source_file`` exactly; the same file
-        name; the same name without its extension. Raises ``KeyError``
-        when nothing matches or when more than one run does (two runs
-        that differ only by directory or extension cannot be told apart
-        by name).
+        in order: the recorded ``source_file`` exactly; any of the run's
+        file names (``source_file`` or an alias); the same name without
+        its extension. Raises ``KeyError`` when nothing matches or when
+        more than one run does (two runs that differ only by directory
+        or extension cannot be told apart by name).
         """
-        sources = self.table.column("source_file").to_pylist()
-        ids = self.ids
-        wanted = _file_name(name)
+        rows = self.table.to_pylist()
+        wanted, wanted_stem = _file_name(name), _stem(name)
         for describe, key in (
-            ("source file", lambda s: s == name),
-            ("file name", lambda s: _file_name(s) == wanted),
-            ("name without extension", lambda s: _stem(s) == _stem(name)),
+            ("source file", lambda r: r["source_file"] == name),
+            ("file name", lambda r: wanted in _names_of(r)),
+            ("name without extension", lambda r: wanted_stem in {_stem(n) for n in _names_of(r)}),
         ):
-            hits = [i for i, s in zip(ids, sources, strict=True) if key(s)]
+            hits = [int(r["acquisition_id"]) for r in rows if key(r)]
             if len(hits) == 1:
                 return hits[0]
             if len(hits) > 1:
@@ -279,7 +294,7 @@ class Acquisitions:
                     f"{name!r} matches {len(hits)} acquisitions by {describe} "
                     f"(ids {hits}); it does not identify one run"
                 )
-        known = ", ".join(sorted(_file_name(s) for s in sources)[:5]) or "none"
+        known = ", ".join(sorted(n for r in rows for n in _names_of(r))[:5]) or "none"
         raise KeyError(f"no acquisition is named {name!r} (known: {known})")
 
     def register(
@@ -288,16 +303,25 @@ class Acquisitions:
         """Add runs, keeping every id already handed out.
 
         Each record needs ``source_file`` and ``source_kind`` and may
-        carry the other columns (``source_sha256`` above all). A record
-        for a run that is already here gets that run's id and adds no
-        row; a new one gets the next id. Returns the extended container
-        and the id of each record, in order.
+        carry the other columns (``source_sha256`` above all, and
+        ``source_aliases`` for further names). A record for a run that
+        is already here gets that run's id and adds no row; a new one
+        gets the next id. Returns the extended container and the id of
+        each record, in order.
 
-        "Already here" is decided by content when it can be: equal
-        ``source_sha256``. When either side has no hash it is the file
-        name. Two *different* files (different hashes) with the same
-        file name are refused, because results are bound to runs by
-        name and could not tell them apart.
+        Which run a record is, is decided by content when it can be:
+        equal ``source_sha256``. When the record or the stored run has
+        no hash, it is the file name. Either way every name the record
+        brings is first checked against every run:
+
+        - a name that already belongs to a *different* run is refused
+          (also when the hash matched some other row: a copy of run 0
+          arriving under run 1's name would have results bound to run
+          1);
+        - two different files (different hashes) with one name are
+          refused for the same reason;
+        - a name that is new for its run is kept as an alias, so that
+          results reported under it are found.
         """
         rows = self.table.to_pylist()
         next_id = max(self.ids, default=-1) + 1
@@ -305,39 +329,102 @@ class Acquisitions:
         for record in records:
             if "source_file" not in record or "source_kind" not in record:
                 raise ValueError("an acquisition record needs source_file and source_kind")
-            sha = record.get("source_sha256")
-            name = _file_name(str(record["source_file"]))
-            match: dict[str, object] | None = None
-            for row in rows:
-                row_sha = row["source_sha256"]
-                same_name = _file_name(row["source_file"]) == name
-                if sha and row_sha:
-                    if sha == row_sha:
-                        match = row
-                        break
-                    if same_name:
+            sha = record.get("source_sha256") or None
+            names = [_file_name(str(record["source_file"]))]
+            names += [_file_name(str(a)) for a in (record.get("source_aliases") or ())]
+
+            same_content = [r for r in rows if sha and r["source_sha256"] == sha]
+            if len(same_content) > 1:
+                raise ValueError(
+                    f"acquisitions {[r['acquisition_id'] for r in same_content]} share "
+                    f"sha256 {str(sha)[:12]}...; the table holds one run twice"
+                )
+            target = same_content[0] if same_content else None
+            if target is None:
+                # No run with this content is known. A run already using one
+                # of the names is this run only if hashes cannot say otherwise.
+                holders = _unique_rows(r for n in names for r in rows if n in _names_of(r))
+                if len(holders) > 1:
+                    raise ValueError(
+                        f"the names {names} belong to different acquisitions "
+                        f"({[r['acquisition_id'] for r in holders]})"
+                    )
+                if holders:
+                    target = holders[0]
+                    held = target["source_sha256"]
+                    if sha and held and held != sha:
+                        name = next(n for n in names if n in _names_of(target))
                         raise ValueError(
                             f"two different files are both named {name!r} "
-                            f"(sha256 {str(row_sha)[:12]}... and {str(sha)[:12]}...); "
+                            f"(sha256 {str(held)[:12]}... and {str(sha)[:12]}...); "
                             f"results are bound to runs by file name, so one experiment "
                             f"cannot hold both"
                         )
-                elif same_name:
-                    match = row
-                    break
-            if match is not None:
-                if sha and not match["source_sha256"]:
-                    match["source_sha256"] = sha  # learn the hash; the id stands
-                out.append(int(match["acquisition_id"]))  # type: ignore[arg-type]
-                continue
-            row = {field.name: record.get(field.name) for field in ACQUISITION_TABLE}
-            row["acquisition_id"] = next_id
-            rows.append(row)
-            out.append(next_id)
-            next_id += 1
+            if target is None:
+                row = {field.name: record.get(field.name) for field in ACQUISITION_TABLE}
+                row["acquisition_id"] = next_id
+                row["source_sha256"] = sha
+                row["source_aliases"] = None
+                rows.append(row)
+                target = row
+                next_id += 1
+            _claim_names(rows, target, names)
+            if sha and not target["source_sha256"]:
+                target["source_sha256"] = sha  # learn the hash; the id stands
+            out.append(int(target["acquisition_id"]))  # type: ignore[arg-type]
+        return self._rebuilt(rows), out
+
+    def with_source_alias(self, acquisition_id: int, name: str) -> Acquisitions:
+        """Say outright that the file ``name`` stands for a run.
+
+        For a workflow that gives an engine a file it wrote itself (a
+        spectra file under a unit directory, say): the engine will
+        report results under that file's name, and this is what binds
+        them. Refused if the name already belongs to another run;
+        a no-op if the run already has it.
+        """
+        rows = self.table.to_pylist()
+        target = next((r for r in rows if r["acquisition_id"] == acquisition_id), None)
+        if target is None:
+            raise KeyError(f"no acquisition {acquisition_id}")
+        _claim_names(rows, target, [_file_name(name)])
+        return self._rebuilt(rows)
+
+    def _rebuilt(self, rows: list[dict[str, object]]) -> Acquisitions:
         table = pa.Table.from_pylist(rows, schema=ACQUISITION_TABLE)
-        table = table.replace_schema_metadata(self.table.schema.metadata)
-        return Acquisitions(table), out
+        return Acquisitions(table.replace_schema_metadata(self.table.schema.metadata))
+
+
+def _names_of(row: dict[str, object]) -> set[str]:
+    """Every file name a run is known by."""
+    names = {_file_name(str(row["source_file"]))}
+    names.update(row.get("source_aliases") or ())  # type: ignore[arg-type]
+    return names
+
+
+def _unique_rows(rows: Iterable[dict[str, object]]) -> list[dict[str, object]]:
+    return list({id(r): r for r in rows}.values())
+
+
+def _claim_names(
+    rows: list[dict[str, object]], target: dict[str, object], names: Iterable[str]
+) -> None:
+    """Give ``target`` each of ``names``, refusing any that another run has.
+
+    Checked against every row, whatever led to ``target`` being chosen.
+    """
+    for name in names:
+        for row in rows:
+            if row is not target and name in _names_of(row):
+                raise ValueError(
+                    f"{name!r} already names acquisition {row['acquisition_id']}, so it cannot "
+                    f"also name acquisition {target['acquisition_id']}: results reported under "
+                    f"that name could not be bound to one run. Rename the file, or keep the "
+                    f"two runs in separate experiments."
+                )
+    new = [n for n in dict.fromkeys(names) if n not in _names_of(target)]
+    if new:
+        target["source_aliases"] = sorted([*(target.get("source_aliases") or ()), *new])  # type: ignore[misc]
 
 
 def _file_name(source: str) -> str:

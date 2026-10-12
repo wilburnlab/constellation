@@ -378,3 +378,76 @@ def test_record_from_a_converted_bundle(tmp_path) -> None:
     assert ids == [0] and acq.with_acquisition_order().table.column("acquisition_order").to_pylist() == [1]
     with pytest.raises(FileNotFoundError, match="not a converted acquisition bundle"):
         acquisition_record_from_bundle(tmp_path / "nowhere")
+
+
+# ── names are checked against every run, and a run keeps all its names ─
+# (Regressions from the review of b1fe1ca: a hash match used to end
+# validation before the remaining file-name conflicts were looked at.)
+
+
+def test_a_copy_registered_under_another_runs_name_is_refused() -> None:
+    """a.raw and b.raw are two runs. A copy of a.raw, named b.raw, is run
+    0 by content, but "b.raw" already means run 1: a result reported
+    under that name would bind to the wrong run, so it is refused."""
+    from constellation.massspec.acquisitions import Acquisitions
+
+    acq, ids = Acquisitions.empty().register([_raw("a.raw", "hash-A"), _raw("b.raw", "hash-B")])
+    assert ids == [0, 1]
+    with pytest.raises(ValueError, match="'b.raw' already names acquisition 1"):
+        acq.register([_raw("/copies/b.raw", "hash-A")])
+    # Order of the existing rows must not matter.
+    swapped, _ = Acquisitions.empty().register([_raw("b.raw", "hash-B"), _raw("a.raw", "hash-A")])
+    with pytest.raises(ValueError, match="'b.raw' already names acquisition 0"):
+        swapped.register([_raw("/copies/b.raw", "hash-A")])
+
+
+def test_a_renamed_copy_keeps_its_name_as_an_alias(tmp_path) -> None:
+    """The same run under a new file name gets the run's id, and results
+    reported under the new name find it."""
+    from constellation.massspec.acquisitions import (
+        Acquisitions,
+        load_acquisitions,
+        save_acquisitions,
+    )
+
+    acq, _ = Acquisitions.empty().register([_raw("/data/a.raw", "hash-A"), _raw("b.raw", "hash-B")])
+    renamed, ids = acq.register([_raw("/copies/c.raw", "hash-A")])
+    assert ids == [0] and renamed.ids == [0, 1]
+    assert renamed.id_for_source("c.raw") == 0
+    assert renamed.id_for_source("a.raw") == 0 and renamed.id_for_source("b.raw") == 1
+    assert renamed.table.column("source_aliases").to_pylist() == [["c.raw"], None]
+    # Registering it again adds nothing; the alias survives a round trip.
+    again, ids2 = renamed.register([_raw("/elsewhere/c.raw", "hash-A")])
+    assert ids2 == [0] and again.table.column("source_aliases").to_pylist() == [["c.raw"], None]
+    save_acquisitions(renamed, tmp_path)
+    assert load_acquisitions(tmp_path).id_for_source("c.raw") == 0
+    # An alias is a name like any other: it cannot be taken by another run.
+    with pytest.raises(ValueError, match="two different files are both named 'c.raw'"):
+        renamed.register([_raw("c.raw", "hash-C")])
+
+
+def test_with_source_alias_binds_a_name_explicitly() -> None:
+    """What a workflow does when it hands an engine a file it wrote
+    itself: say outright which run that file name stands for."""
+    from constellation.massspec.acquisitions import Acquisitions
+
+    acq, _ = Acquisitions.empty().register([_raw("run_01.raw", "aa"), _raw("run_02.raw", "bb")])
+    bound = acq.with_source_alias(1, "/work/units/u7/input.dia")
+    assert bound.id_for_source("input.dia") == 1
+    assert acq.table.column("source_aliases").to_pylist() == [None, None]  # original untouched
+    assert bound.with_source_alias(1, "input.dia").table.equals(bound.table)  # idempotent
+    with pytest.raises(ValueError, match="'run_01.raw' already names acquisition 0"):
+        acq.with_source_alias(1, "run_01.raw")
+    with pytest.raises(KeyError, match="no acquisition 9"):
+        acq.with_source_alias(9, "x.dia")
+
+
+def test_identity_columns_survive_reordering() -> None:
+    from constellation.massspec.acquisitions import Acquisitions
+
+    acq, _ = Acquisitions.empty().register(
+        [_raw("a.raw", "aa", instrument_serial="S", acquisition_datetime="2026-10-06T22:19:53")]
+    )
+    ordered = acq.with_source_alias(0, "a.dia").with_acquisition_order()
+    row = ordered.table.to_pylist()[0]
+    assert (row["source_sha256"], row["source_aliases"], row["acquisition_order"]) == ("aa", ["a.dia"], 1)
