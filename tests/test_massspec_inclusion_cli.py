@@ -58,7 +58,7 @@ def test_happy_path_writes_csv_parquet_manifest(fasta, tmp_path) -> None:
     assert _invoke(fasta, out, "--missed-cleavages", "0") == 0
 
     csv_path = out / "inclusion_list.csv"
-    assert csv_path.read_bytes().split(b"\r\n")[0] == b"Compound,m/z"
+    assert csv_path.read_bytes().split(b"\r\n")[0] == b"Compound,m/z,z"
     assert (out / "precursors.parquet").is_file()
 
     manifest = json.loads((out / "manifest.json").read_text())

@@ -16,6 +16,17 @@ write boundary.
 ``Compound`` is the ProForma modseq with the charge appended —
 ``PEPTIDEK_2``, ``PEPTIDEC[UNIMOD:4]K_2`` — so modifications carry their
 UNIMOD accession into the method editor and back out of the raw file.
+
+The charge is *also* emitted as the vendor ``z`` column, and that column
+is what the instrument actually reads — it does not parse the name. Lists
+written before ``z`` existed (2026-09-18 and earlier) made the Stellar
+record charge 0 on every inclusion-triggered MS2 scan, leaving search
+engines to guess: on the 260908 multi-protease series MSFragger assigned
+the wrong charge to ~14% of targeted-run PSMs (a 2+ at m/z 597.4 reported
+as 3+ with a +598 Da delta mass, PeptideProphet 0.999, because the
+fragment evidence is identical under any assumed charge). Raw files from
+those runs still need charge re-derived from observed m/z and peptide
+mass — see ``Stellar_analysis/260918_search_id_counts.py:load_psms``.
 """
 
 from __future__ import annotations
@@ -34,8 +45,9 @@ from constellation.massspec.library.digest import PrecursorSpec
 #: names verbatim so there is no rename map between builder and writer to
 #: drift — a deliberate departure from the package's snake_case schema
 #: convention, since this is a vendor projection and not a schema
-#: registered with ``core.io``.
-INCLUSION_COLUMNS: Final[tuple[str, ...]] = ("Compound", "m/z")
+#: registered with ``core.io``. ``z`` is load-bearing, not cosmetic — see
+#: the module docstring.
+INCLUSION_COLUMNS: Final[tuple[str, ...]] = ("Compound", "m/z", "z")
 
 #: Column → decimal places, applied at write time only. 1e-3 Da at m/z
 #: 1000 is 1 ppm, orders of magnitude tighter than any isolation window
@@ -90,7 +102,8 @@ def build_inclusion_list(
     dedupe: bool = True,
     separator: str = "_",
 ) -> pa.Table:
-    """The two-column table, shaped exactly like the emitted CSV.
+    """The ``Compound`` / ``m/z`` / ``z`` table, shaped exactly like the
+    emitted CSV.
 
     Sorted ascending by m/z by default — the vendor convention, how a
     human checks coverage against the scan range, and what lets
@@ -110,6 +123,7 @@ def build_inclusion_list(
                 [compound_name(s, separator=separator) for s in rows], pa.string()
             ),
             "m/z": pa.array([float(s.precursor_mz) for s in rows], pa.float64()),
+            "z": pa.array([int(s.charge) for s in rows], pa.int32()),
         }
     )
     if sort == "mz":
@@ -177,6 +191,12 @@ def merge_isolation_groups(
     ``ISTDDMK_2;AVDEGYR_2`` — so the ambiguity stays visible in the
     method and in the raw file rather than being silently dropped.
 
+    A merged row's ``z`` is the **lowest** member charge. Same-charge
+    groups (the common case) are exact; a mixed group (``X_2;Y_3``) has no
+    single true charge, so the higher-charge member's MS2 scans are
+    recorded at the lower charge and its PSMs inherit it — the Compound
+    name still carries each member's real charge for downstream repair.
+
     Grouping is greedy over the m/z-sorted list and bounded by **span,
     not by neighbour distance**: an entry joins the open group only while
     ``mz - group_min <= tolerance_da``. Single-linkage chaining would let
@@ -194,29 +214,35 @@ def merge_isolation_groups(
     ordered = table.sort_by([("m/z", "ascending"), ("Compound", "ascending")])
     names = ordered.column("Compound").to_pylist()
     mzs = ordered.column("m/z").to_pylist()
+    zs = ordered.column("z").to_pylist()
 
     out_names: list[str] = []
     out_mzs: list[float] = []
+    out_zs: list[int] = []
     group_names: list[str] = [names[0]]
     group_mzs: list[float] = [mzs[0]]
+    group_zs: list[int] = [zs[0]]
 
     def _flush() -> None:
         out_names.append(separator.join(group_names))
         out_mzs.append(sum(group_mzs) / len(group_mzs))
+        out_zs.append(min(group_zs))
 
-    for name, mz in zip(names[1:], mzs[1:], strict=True):
+    for name, mz, z in zip(names[1:], mzs[1:], zs[1:], strict=True):
         if mz - group_mzs[0] <= tolerance_da:
             group_names.append(name)
             group_mzs.append(mz)
+            group_zs.append(z)
             continue
         _flush()
-        group_names, group_mzs = [name], [mz]
+        group_names, group_mzs, group_zs = [name], [mz], [z]
     _flush()
 
     return pa.table(
         {
             "Compound": pa.array(out_names, pa.string()),
             "m/z": pa.array(out_mzs, pa.float64()),
+            "z": pa.array(out_zs, pa.int32()),
         }
     )
 

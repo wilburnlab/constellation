@@ -66,9 +66,19 @@ def test_compound_name_separator_is_configurable() -> None:
 # ── table shape ────────────────────────────────────────────────────────
 
 
-def test_columns_are_exactly_compound_and_mz() -> None:
+def test_columns_are_exactly_compound_mz_and_z() -> None:
     table = build_inclusion_list([_spec("PEPTIDEK", 2, 500.0)])
-    assert table.column_names == ["Compound", "m/z"]
+    assert table.column_names == ["Compound", "m/z", "z"]
+
+
+def test_z_column_carries_the_spec_charge() -> None:
+    """The instrument reads charge from ``z``, never from the Compound
+    name — without it every triggered MS2 scan is recorded at charge 0."""
+    table = build_inclusion_list(
+        [_spec("PEPTIDEK", 2, 500.0), _spec("PEPTIDEK", 3, 333.7)]
+    )
+    rows = {r["Compound"]: r["z"] for r in table.to_pylist()}
+    assert rows == {"PEPTIDEK_2": 2, "PEPTIDEK_3": 3}
 
 
 def test_build_dedupes_on_compound() -> None:
@@ -131,13 +141,13 @@ def test_write_header_is_unquoted_and_exact(tmp_path) -> None:
     path = write_inclusion_list(
         build_inclusion_list([_spec("PEPTIDEK", 2, 500.0)]), tmp_path / "list.csv"
     )
-    assert path.read_bytes().split(b"\r\n")[0] == b"Compound,m/z"
+    assert path.read_bytes().split(b"\r\n")[0] == b"Compound,m/z,z"
 
 
 def test_write_leaves_modified_compound_unquoted(tmp_path) -> None:
     spec = _spec("PEPTIDEC[UNIMOD:4]K", 2, 500.0, seq="PEPTIDECK")
     path = write_inclusion_list(build_inclusion_list([spec]), tmp_path / "list.csv")
-    assert b"PEPTIDEC[UNIMOD:4]K_2,500.000\r\n" in path.read_bytes()
+    assert b"PEPTIDEC[UNIMOD:4]K_2,500.000,2\r\n" in path.read_bytes()
 
 
 def test_write_uses_crlf(tmp_path) -> None:
@@ -186,10 +196,11 @@ def test_write_roundtrips_through_pyarrow_csv_read(tmp_path) -> None:
     specs = [_spec("PEPTIDEK", 2, 582.319012), _spec("SAMPLERK", 3, 401.5551)]
     path = write_inclusion_list(build_inclusion_list(specs), tmp_path / "list.csv")
     back = pa_csv.read_csv(path)
-    assert back.column_names == ["Compound", "m/z"]
+    assert back.column_names == ["Compound", "m/z", "z"]
     assert back.column("m/z").to_pylist() == pytest.approx(
         [401.555, 582.319], abs=1e-3
     )
+    assert back.column("z").to_pylist() == [3, 2]
 
 
 # ── collisions ─────────────────────────────────────────────────────────
@@ -247,8 +258,29 @@ def test_merge_disabled_by_nonpositive_tolerance() -> None:
 def test_merge_preserves_columns_and_handles_empty() -> None:
     empty = build_inclusion_list([])
     merged = merge_isolation_groups(empty, tolerance_da=0.5)
-    assert merged.column_names == ["Compound", "m/z"]
+    assert merged.column_names == ["Compound", "m/z", "z"]
     assert merged.num_rows == 0
+
+
+def test_merge_keeps_z_for_a_same_charge_group() -> None:
+    table = build_inclusion_list(
+        [_spec("ISTDDMK", 2, 405.189), _spec("AVDEGYR", 2, 405.193)]
+    )
+    merged = merge_isolation_groups(table, tolerance_da=0.5)
+    assert merged.column("z").to_pylist() == [2]
+
+
+def test_merge_takes_the_lowest_z_for_a_mixed_charge_group() -> None:
+    """No single true charge exists for ``AK_3;BK_2``; the lowest wins,
+    and the Compound name keeps each member's real charge."""
+    table = build_inclusion_list(
+        [_spec("AK", 3, 500.10), _spec("BK", 2, 500.20), _spec("CK", 4, 502.0)]
+    )
+    merged = merge_isolation_groups(table, tolerance_da=0.5)
+    assert merged.to_pylist() == [
+        {"Compound": "AK_3;BK_2", "m/z": pytest.approx(500.15), "z": 2},
+        {"Compound": "CK_4", "m/z": pytest.approx(502.0), "z": 4},
+    ]
 
 
 def test_merge_orders_members_by_mz() -> None:

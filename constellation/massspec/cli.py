@@ -3951,10 +3951,12 @@ def _build_inclusion_list_parser(subs: argparse._SubParsersAction) -> None:
     p = subs.add_parser(
         "inclusion-list",
         help=(
-            "FASTA → instrument inclusion-list CSV (Compound, m/z). Digests, "
-            "enumerates fixed/variable modforms, sweeps charge and filters to "
-            "the instrument's m/z range. Compound is the ProForma modseq with "
-            "the charge appended: PEPTIDEC[UNIMOD:4]K_2."
+            "FASTA → instrument inclusion-list CSV (Compound, m/z, z). "
+            "Digests, enumerates fixed/variable modforms, sweeps charge and "
+            "filters to the instrument's m/z range. Compound is the ProForma "
+            "modseq with the charge appended: PEPTIDEC[UNIMOD:4]K_2; z is the "
+            "charge the instrument records on each triggered MS2 scan (a "
+            "merged mixed-charge row takes its lowest member charge)."
         ),
     )
     p.add_argument(
