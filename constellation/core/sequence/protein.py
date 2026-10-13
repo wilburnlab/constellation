@@ -428,6 +428,39 @@ def _tagged(key: str) -> TaggedMod:
     return TaggedMod(mod=ModRef(cv=cv, accession=acc))
 
 
+def _canonical_mod_spec(
+    spec: dict[str, tuple[str, ...]],
+    *,
+    vocab: ModVocab,
+    peptide: str,
+    validate_specificity: bool,
+) -> dict[str, tuple[str, ...]]:
+    """Validate every mod key, then resolve it to the vocabulary's id.
+
+    ``key in vocab`` accepts an alias (``"Oxidation"``) as readily as an
+    accession, but :func:`_tagged` builds the ProForma tag by splitting on
+    ``':'`` with no lookup — so an un-resolved alias becomes the malformed
+    tag ``[Oxidation:]``, which survives enumeration and only blows up
+    later inside :func:`peptide_mass` with a ``KeyError`` naming a string
+    the caller never wrote. Resolving here makes the alias support that
+    the membership check already implies actually work.
+
+    Validation runs against the caller's spelling so error messages quote
+    what they typed.
+    """
+    out: dict[str, tuple[str, ...]] = {}
+    for site, keys in spec.items():
+        resolved: list[str] = []
+        for key in keys:
+            if key not in vocab:
+                raise ValueError(f"unknown modification key {key!r} for site {site!r}")
+            if validate_specificity:
+                _check_specificity(key, site, vocab, peptide)
+            resolved.append(vocab[key].id)
+        out[site] = tuple(resolved)
+    return out
+
+
 @requires_canonical
 def enumerate_modforms(
     peptide: str,
@@ -454,8 +487,11 @@ def enumerate_modforms(
     ``variable={"C": ...}`` do not stack on the same cysteine.
 
     Returns forms ordered by increasing variable-mod count, the
-    fixed-only form first. Mod keys are validated against ``vocab``, and
-    against each mod's UNIMOD specificity unless
+    fixed-only form first. Mod keys may be given as an accession
+    (``"UNIMOD:35"``) or any name ``vocab`` knows (``"Oxidation"``); both
+    are resolved to the accession before the ProForma tag is built, so
+    the emitted modseq always reads ``[UNIMOD:35]``. Keys are validated
+    against ``vocab``, and against each mod's UNIMOD specificity unless
     ``validate_specificity=False`` — the latter is the escape hatch for
     deliberately non-canonical placements.
 
@@ -468,15 +504,18 @@ def enumerate_modforms(
     if max_variable < 0:
         raise ValueError(f"max_variable must be >= 0, got {max_variable}")
 
-    fixed_spec = _normalize_mod_spec(fixed)
-    var_spec = _normalize_mod_spec(variable)
-
-    for site, keys in (*fixed_spec.items(), *var_spec.items()):
-        for key in keys:
-            if key not in vocab:
-                raise ValueError(f"unknown modification key {key!r} for site {site!r}")
-            if validate_specificity:
-                _check_specificity(key, site, vocab, peptide)
+    fixed_spec = _canonical_mod_spec(
+        _normalize_mod_spec(fixed),
+        vocab=vocab,
+        peptide=peptide,
+        validate_specificity=validate_specificity,
+    )
+    var_spec = _canonical_mod_spec(
+        _normalize_mod_spec(variable),
+        vocab=vocab,
+        peptide=peptide,
+        validate_specificity=validate_specificity,
+    )
 
     for site, keys in fixed_spec.items():
         if len(keys) != 1:

@@ -201,6 +201,20 @@ def test_path_kind_directory_vs_file():
     assert samples["path_kind"] == "file"
 
 
+def test_inclusion_list_fasta_is_a_file_picker():
+    """``dest='fasta'`` misses the walker's ``endswith('_fasta')``
+    heuristic, so the curated overlay supplies the classification —
+    without it the dashboard renders a plain text box."""
+    schema = build_cli_schema(_build_parser())
+    inclusion = _commands_by_path(schema, ["massspec", "inclusion-list"])
+    fasta = _arg_by_dest(inclusion, "fasta")
+    assert fasta["type"] == "path"
+    assert fasta["path_kind"] == "file"
+    assert "*.fasta" in fasta["glob"]
+    # The output dir still classifies through the dest heuristic.
+    assert _arg_by_dest(inclusion, "output_dir")["path_kind"] == "dir"
+
+
 def test_repeatable_path_arg_stays_multi_with_path_kind():
     """``--reads`` is ``nargs='+'`` so it stays ``type='multi'`` (the
     textarea), but carries a ``path_kind`` so the frontend can offer a

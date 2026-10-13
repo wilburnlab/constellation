@@ -538,6 +538,49 @@ def test_specificity_check_can_still_be_waived() -> None:
     assert len(forms) == 2
 
 
+# ── mod keys resolve to accessions before the tag is built ─────────────
+#
+# ``key in vocab`` accepts an alias as readily as an accession, but
+# ``_tagged`` builds the ProForma tag by splitting on ':' with no lookup.
+# Un-resolved, "Oxidation" became the malformed tag "[Oxidation:]", which
+# survived enumeration and only blew up later inside peptide_mass with a
+# KeyError naming a string the caller never wrote.
+
+
+def test_mod_alias_renders_as_its_accession() -> None:
+    from constellation.core.sequence.protein import enumerate_modforms
+    from constellation.core.sequence.proforma import format_proforma
+
+    forms = enumerate_modforms("PEPTIDEMK", variable={"M": "Oxidation"}, max_variable=1)
+    assert [format_proforma(f) for f in forms] == [
+        "PEPTIDEMK",
+        "PEPTIDEM[UNIMOD:35]K",
+    ]
+
+
+def test_mod_alias_and_accession_give_the_same_mass() -> None:
+    from constellation.core.sequence.protein import enumerate_modforms, peptide_mass
+
+    by_name = enumerate_modforms("PEPTIDEMK", variable={"M": "Oxidation"})
+    by_id = enumerate_modforms("PEPTIDEMK", variable={"M": "UNIMOD:35"})
+    assert [peptide_mass(f) for f in by_name] == [peptide_mass(f) for f in by_id]
+
+
+def test_fixed_mod_alias_resolves_too() -> None:
+    from constellation.core.sequence.protein import enumerate_modforms
+    from constellation.core.sequence.proforma import format_proforma
+
+    (form,) = enumerate_modforms("PEPTIDECK", fixed={"C": "Carbamidomethyl"})
+    assert format_proforma(form) == "PEPTIDEC[UNIMOD:4]K"
+
+
+def test_unknown_mod_key_still_names_the_callers_spelling() -> None:
+    from constellation.core.sequence.protein import enumerate_modforms
+
+    with pytest.raises(ValueError, match="unknown modification key 'Nonsense'"):
+        enumerate_modforms("PEPTIDEMK", variable={"M": "Nonsense"})
+
+
 def test_has_terminal_specificity_for_rejects_unknown_terminus() -> None:
     from constellation.core.chem.modifications import UNIMOD
 
