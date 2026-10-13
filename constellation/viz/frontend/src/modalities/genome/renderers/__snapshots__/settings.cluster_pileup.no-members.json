@@ -1,0 +1,110 @@
+{
+  "title": "Transcript clusters (run-a clusters)",
+  "kind": "cluster_pileup",
+  "sections": [
+    {
+      "title": "Style",
+      "controls": [
+        {
+          "label": "em",
+          "control": "color",
+          "value": "#d6a85e"
+        },
+        {
+          "label": "genome",
+          "control": "color",
+          "value": "#5ed6cf"
+        },
+        {
+          "label": "kmer",
+          "control": "color",
+          "value": "#a8d65e"
+        },
+        {
+          "label": "Min row height (px)",
+          "control": "number",
+          "value": "4",
+          "min": "1",
+          "max": "20",
+          "step": "1"
+        },
+        {
+          "label": "Max row height (px)",
+          "control": "number",
+          "value": "10",
+          "min": "2",
+          "max": "40",
+          "step": "1"
+        },
+        {
+          "label": "Opacity min",
+          "control": "number",
+          "value": "0.4",
+          "min": "0",
+          "max": "1",
+          "step": "0.05"
+        },
+        {
+          "label": "Opacity max",
+          "control": "number",
+          "value": "1",
+          "min": "0",
+          "max": "1",
+          "step": "0.05"
+        }
+      ]
+    },
+    {
+      "title": "Filter",
+      "controls": [
+        {
+          "label": "Visible modes",
+          "control": "allowlist",
+          "options": [
+            {
+              "label": "em",
+              "checked": true
+            },
+            {
+              "label": "genome",
+              "checked": true
+            },
+            {
+              "label": "kmer",
+              "checked": true
+            }
+          ]
+        },
+        {
+          "label": "Visible strands",
+          "control": "allowlist",
+          "options": [
+            {
+              "label": "+",
+              "checked": true
+            },
+            {
+              "label": "-",
+              "checked": true
+            },
+            {
+              "label": ".",
+              "checked": true
+            }
+          ]
+        },
+        {
+          "label": "Min reads",
+          "control": "number",
+          "value": "1",
+          "min": "1",
+          "max": "1000000",
+          "step": "1"
+        }
+      ]
+    }
+  ],
+  "actions": [
+    "Reset to defaults"
+  ]
+}

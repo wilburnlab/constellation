@@ -15,6 +15,7 @@
 // In both modes a "Go to" box navigates to a pasted path (Windows
 // C:\… paths are normalized server-side under WSL).
 
+import { attachDismiss } from '../engine/popover';
 import './FilePicker.css';
 
 export type PathKindMode = 'dir' | 'file' | 'either';
@@ -70,8 +71,7 @@ export class FilePicker {
 
   private current = '';
   private roots: FsRoot[] = [];
-  private outsideHandler: ((e: MouseEvent) => void) | null = null;
-  private escHandler: ((e: KeyboardEvent) => void) | null = null;
+  private detachDismiss: (() => void) | null = null;
 
   constructor(opts: FilePickerOptions) {
     this.opts = opts;
@@ -81,7 +81,9 @@ export class FilePicker {
     this.root.setAttribute('aria-label', modeTitle(opts.kind));
     this.build();
     this.position();
-    this.attachDismiss();
+    this.detachDismiss = attachDismiss(this.root, opts.anchor, () =>
+      this.opts.onClose(),
+    );
   }
 
   /** Append the popover under `parent`. Mounting inside the anchor's own
@@ -94,14 +96,8 @@ export class FilePicker {
   }
 
   dispose(): void {
-    if (this.outsideHandler) {
-      document.removeEventListener('mousedown', this.outsideHandler);
-      this.outsideHandler = null;
-    }
-    if (this.escHandler) {
-      document.removeEventListener('keydown', this.escHandler);
-      this.escHandler = null;
-    }
+    this.detachDismiss?.();
+    this.detachDismiss = null;
     this.root.remove();
   }
 
@@ -403,20 +399,6 @@ export class FilePicker {
     this.root.style.top = `${Math.max(8, top)}px`;
     this.root.style.left = `${Math.max(8, left)}px`;
     this.root.style.zIndex = '40';
-  }
-
-  private attachDismiss(): void {
-    this.outsideHandler = (e: MouseEvent): void => {
-      const target = e.target as Node;
-      if (this.root.contains(target)) return;
-      if (this.opts.anchor.contains(target)) return;
-      this.opts.onClose();
-    };
-    this.escHandler = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') this.opts.onClose();
-    };
-    document.addEventListener('mousedown', this.outsideHandler);
-    document.addEventListener('keydown', this.escHandler);
   }
 }
 

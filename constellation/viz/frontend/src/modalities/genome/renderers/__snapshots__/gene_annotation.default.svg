@@ -1,0 +1,54 @@
+<svg class="track-canvas" width="1000" height="60" data-natural-height="74">
+<rect x="33.333333333333336" y="32" width="266.6666666666667" height="10" fill="#5e8cd6" opacity="0.85" data-feature-id="1">
+<title>gene geneA (+)</title>
+</rect>
+<path d="M 296 34 L 300 37 L 296 40" stroke="#fff" stroke-width="1.5" fill="none" opacity="0.7">
+</path>
+<text x="36.333333333333336" y="40" font-size="10" fill="#e3e3e8" pointer-events="none" paint-order="stroke" stroke="#0f0f12" stroke-width="2" stroke-linejoin="round">geneA</text>
+<rect x="33.333333333333336" y="46" width="266.6666666666667" height="10" fill="#7a99e0" opacity="0.85" data-feature-id="2">
+<title>mRNA geneA-201 (+)</title>
+</rect>
+<path d="M 296 48 L 300 51 L 296 54" stroke="#fff" stroke-width="1.5" fill="none" opacity="0.7">
+</path>
+<text x="36.333333333333336" y="54" font-size="10" fill="#e3e3e8" pointer-events="none" paint-order="stroke" stroke="#0f0f12" stroke-width="2" stroke-linejoin="round">geneA-201</text>
+<rect x="33.333333333333336" y="18" width="66.66666666666666" height="10" fill="#9bc23a" opacity="0.85" data-feature-id="3">
+</rect>
+<path d="M 96 20 L 100 23 L 96 26" stroke="#fff" stroke-width="1.5" fill="none" opacity="0.7">
+</path>
+<rect x="166.66666666666666" y="18" width="133.33333333333334" height="10" fill="#9bc23a" opacity="0.85" data-feature-id="4">
+</rect>
+<path d="M 296 20 L 300 23 L 296 26" stroke="#fff" stroke-width="1.5" fill="none" opacity="0.7">
+</path>
+<rect x="50" y="4" width="50" height="10" fill="#c5d65e" opacity="0.85" data-feature-id="5">
+</rect>
+<path d="M 96 6 L 100 9 L 96 12" stroke="#fff" stroke-width="1.5" fill="none" opacity="0.7">
+</path>
+<rect x="166.66666666666666" y="4" width="100.00000000000003" height="10" fill="#c5d65e" opacity="0.85" data-feature-id="6">
+</rect>
+<path d="M 262.6666666666667 6 L 266.6666666666667 9 L 262.6666666666667 12" stroke="#fff" stroke-width="1.5" fill="none" opacity="0.7">
+</path>
+<rect x="33.333333333333336" y="4" width="16.666666666666664" height="10" fill="#a89dc4" opacity="0.85" data-feature-id="7">
+</rect>
+<path d="M 46 6 L 50 9 L 46 12" stroke="#fff" stroke-width="1.5" fill="none" opacity="0.7">
+</path>
+<rect x="266.6666666666667" y="4" width="33.333333333333314" height="10" fill="#a89dc4" opacity="0.85" data-feature-id="8">
+</rect>
+<path d="M 296 6 L 300 9 L 296 12" stroke="#fff" stroke-width="1.5" fill="none" opacity="0.7">
+</path>
+<rect x="233.33333333333334" y="60" width="266.66666666666663" height="10" fill="#5e8cd6" opacity="0.85" data-feature-id="9">
+<title>gene geneB (-)</title>
+</rect>
+<path d="M 237.33333333333334 62 L 233.33333333333334 65 L 237.33333333333334 68" stroke="#fff" stroke-width="1.5" fill="none" opacity="0.7">
+</path>
+<text x="236.33333333333334" y="68" font-size="10" fill="#e3e3e8" pointer-events="none" paint-order="stroke" stroke="#0f0f12" stroke-width="2" stroke-linejoin="round">geneB</text>
+<rect x="533.3333333333334" y="4" width="33.33333333333326" height="10" fill="#d65e5e" opacity="0.85" data-feature-id="10">
+</rect>
+<path d="M 562.6666666666666 6 L 566.6666666666666 9 L 562.6666666666666 12" stroke="#fff" stroke-width="1.5" fill="none" opacity="0.7">
+</path>
+<rect x="666.6666666666666" y="4" width="133.33333333333337" height="10" fill="#888" opacity="0.85" data-feature-id="11">
+<title>pseudogene psi1 (+)</title>
+</rect>
+<path d="M 796 6 L 800 9 L 796 12" stroke="#fff" stroke-width="1.5" fill="none" opacity="0.7">
+</path>
+<text x="669.6666666666666" y="12" font-size="10" fill="#e3e3e8" pointer-events="none" paint-order="stroke" stroke="#0f0f12" stroke-width="2" stroke-linejoin="round">psi1</text>
+</svg>

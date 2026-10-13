@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from constellation.sequencing.align.map import (
@@ -25,6 +26,10 @@ _READS_SCHEMA = pa.schema(
         pa.field("read_id", pa.string(), nullable=False),
         pa.field("sequence", pa.large_string(), nullable=False),
         pa.field("sample_id", pa.int64(), nullable=True),
+        # The `qs:f` Dorado tag, null on demux dirs that predate it. Used by
+        # the EM seeder (quality selects read accuracy ~4x; length does not)
+        # and by the round-1 assignment tie-break.
+        pa.field("dorado_quality", pa.float32(), nullable=True),
     ]
 )
 
@@ -51,31 +56,91 @@ def _trim_batch(batch: pa.RecordBatch) -> pa.Table:
             null_bitmap=None,
             null_count=0,
         )
+    names = set(batch.schema.names)
     sample = (
-        batch.column("sample_id")
-        if "sample_id" in batch.schema.names
-        else pa.nulls(n, pa.int64())
+        batch.column("sample_id") if "sample_id" in names else pa.nulls(n, pa.int64())
+    )
+    quality = (
+        batch.column("dorado_quality")
+        if "dorado_quality" in names
+        else pa.nulls(n, pa.float32())
     )
     return pa.table(
         {
             "read_id": batch.column("read_id"),
             "sequence": window,
             "sample_id": pa.array(sample).cast(pa.int64()),
+            "dorado_quality": pa.array(quality).cast(pa.float32()),
         },
         schema=_READS_SCHEMA,
     )
 
 
-def load_demux_windows(demux_dir: Path) -> pa.Table:
-    """Stream + trim Complete, non-fragment transcript windows from a demux dir."""
+def load_demux_windows(
+    demux_dir: Path, *, max_window_length: int | None = None
+) -> tuple[pa.Table, dict[str, int]]:
+    """Stream + trim Complete, non-fragment transcript windows from a demux dir.
+
+    Returns ``(reads, stats)``.
+
+    ``max_window_length`` drops windows longer than it. This is **the** place
+    to do it, not the seeding stage: three consumers read this corpus — the
+    ORF seeder (a table), the reads FASTA the E-step aligns (a path), and the
+    per-read sequence map the M-step projects into its PWM. Filtering at
+    seeding removes an oversized read from the first only. It still wins a
+    banded hit, still lands on a template, and still contributes its unaligned
+    flank as a terminal extension event, and ``min_insertion_support`` guards
+    only against a *singleton* — concatemers come in classes, so a pair of
+    40 kb reads is enough to reserve a 40 kb block on someone else's template.
+
+    Filtering here also runs before ``dereplicate``, so unique abundances are
+    right without a remap.
+
+    Oversized windows are **dropped, never trimmed**: a 361,908 nt "cDNA" is a
+    concatemer, and truncating it to 15 kb manufactures a read that was never
+    sequenced.
+
+    ``None`` (the library default) disables the filter, so the returned table
+    is byte-identical to the pre-filter behaviour.
+    """
     parts: list[pa.Table] = []
+    n_input = 0
+    n_dropped_long = 0
+    max_seen = 0
     for batch in _iter_demux_read_batches(demux_dir, only_complete=True):
         if batch.num_rows == 0:
             continue
-        parts.append(_trim_batch(batch))
+        trimmed = _trim_batch(batch)
+        n_input += trimmed.num_rows
+        lengths = pc.utf8_length(trimmed.column("sequence"))
+        if trimmed.num_rows:
+            max_seen = max(max_seen, int(pc.max(lengths).as_py() or 0))
+        if max_window_length is not None and max_window_length > 0:
+            keep = pc.less_equal(lengths, max_window_length)
+            n_dropped_long += trimmed.num_rows - int(pc.sum(keep).as_py() or 0)
+            trimmed = trimmed.filter(keep)
+        parts.append(trimmed)
+    stats = {
+        "n_input": n_input,
+        "n_dropped_long": n_dropped_long,
+        "max_input_length": max_seen,
+    }
     if not parts:
-        return _READS_SCHEMA.empty_table()
-    return pa.concat_tables(parts)
+        return _READS_SCHEMA.empty_table(), stats
+    # By read_id, not in the order the demux join produced them: that order
+    # changes from call to call, and `dereplicate` numbers unique reads in
+    # first-occurrence order, which the anchor-star breaks ties on — so the
+    # clusters would too (ledger #59, #61). The same order as the EM corpus.
+    reads = pa.concat_tables(parts)
+    order = pc.sort_indices(
+        reads.select(["read_id", "sequence", "sample_id"]),
+        sort_keys=[
+            ("read_id", "ascending"),
+            ("sequence", "ascending"),
+            ("sample_id", "ascending"),
+        ],
+    )
+    return reads.take(order), stats
 
 
 def _write_fasta(path: Path, ids: list[str], seqs: list[str]) -> None:

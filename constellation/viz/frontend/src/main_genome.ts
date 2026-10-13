@@ -6,7 +6,7 @@
 // via a separate entry.
 
 import { fetchJson } from './engine/arrow_client';
-import { GenomeBrowser } from './widgets/GenomeBrowser';
+import { GenomeBrowser } from './modalities/genome/GenomeBrowser';
 
 interface SessionSummary {
   session_id: string;

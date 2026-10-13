@@ -103,6 +103,16 @@ def dereplicate(reads: pa.Table) -> tuple[pa.Table, pa.Table]:
     seq_hash = _hash_sequences(seq)
     work = pa.table({"h": seq_hash, "row_idx": pa.array(np.arange(n, dtype=np.int64))})
     grouped = work.group_by("h").aggregate([("row_idx", "min"), ("row_idx", "count")])
+    # In FIRST-OCCURRENCE order, not in the order `group_by` emits. That
+    # order is the output of a multithreaded hash aggregation and differs
+    # between two identical calls in one process — and it becomes `uniq_id`,
+    # which the anchor-star in `generate_candidates` uses to break abundance
+    # ties. Almost every unique read has abundance 1, so nearly every bucket's
+    # anchor followed the arbitrary numbering: two seedings of the same
+    # 9.4M reads differed by 1.2% of candidate pairs and ~1% of round-1
+    # templates. Sorting by the group's first row makes the numbering a
+    # property of the input alone.
+    grouped = grouped.sort_by("row_idx_min")
     group_hash = grouped.column("h")
     rep_row = grouped.column("row_idx_min")
     n_uniq = grouped.num_rows
@@ -123,7 +133,7 @@ def dereplicate(reads: pa.Table) -> tuple[pa.Table, pa.Table]:
     )
 
     # uniq_id per read = position of each read's hash in the distinct-hash
-    # set (group_by output order, which is the uniq_id order).
+    # set, which is in first-occurrence order (the uniq_id order).
     uid_per_read = pc.cast(pc.index_in(seq_hash, value_set=group_hash), pa.int64())
     read_map = pa.table(
         {

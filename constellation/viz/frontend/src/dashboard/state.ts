@@ -1,6 +1,6 @@
 // Shared event bus + persisted UI state for the dashboard.
 //
-// Mirrors the `ViewportBus` pattern from PR 1 (engine/viewport_bus.ts):
+// Mirrors the genome browser's `ViewportBus` (modalities/genome/viewport_bus.ts):
 // a thin EventTarget wrapper plus per-key localStorage persistence.
 // Components don't depend on each other directly — they subscribe to
 // events.

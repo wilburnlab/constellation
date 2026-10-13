@@ -60,6 +60,9 @@ dynamics   = []  # same
 # built by python -m constellation.viz.frontend.build or by CI on tag push).
 viz        = [
     "fastapi>=0.110",
+    # Imported directly by the server endpoints (request models). Pinned
+    # here rather than left transitive: fastapi>=0.110 still admits v1.
+    "pydantic>=2",
     "uvicorn[standard]>=0.27",
     "datashader>=0.16",
     "websockets>=12",

@@ -65,9 +65,18 @@ def _iter_seq_blocks(seq_col, chunk_bases: int):
         i = 0
         while i < nch:
             byte0 = int(off[base + i])
-            j = i + 1
-            while j < nch and int(off[base + j]) - byte0 < chunk_bases:
-                j += 1
+            # Binary-search the block boundary instead of walking to it. The
+            # inner `while` this replaces ran once per SEQUENCE (~18M at
+            # PromethION scale), each iteration paying an int() on a numpy
+            # scalar, purely to find a cut point the sorted offsets already
+            # answer in one step. `j` must still advance at least one row so a
+            # single sequence longer than `chunk_bases` cannot stall the loop.
+            k = int(
+                np.searchsorted(
+                    off[base + i : base + nch + 1], byte0 + chunk_bases, side="left"
+                )
+            )
+            j = min(max(i + k, i + 1), nch)
             byte1 = int(off[base + j])
             sub_data = bytes(data[byte0:byte1])  # bounded ~chunk_bases copy
             sub_off = (off[base + i : base + j + 1] - byte0).astype(np.int64)

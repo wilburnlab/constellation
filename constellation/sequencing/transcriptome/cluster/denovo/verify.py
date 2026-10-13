@@ -47,6 +47,13 @@ ACCEPTED_ALIGNMENT_SCHEMA = pa.schema(
     ]
 )
 
+#: "No limit" for `max_5p` / `max_3p`. The gate is a plain `overhang > max`
+#: comparison, so a value no real overhang can reach IS unbounded — no kernel
+#: branch, and the number round-trips legibly through a manifest. Named rather
+#: than spelled inline because `--mode em-kmer` runs 5'-unbounded by default
+#: and "1073741824" in a parameters dict explains nothing.
+UNBOUNDED_OVERHANG = 1 << 30
+
 # Set in the parent before the pool forks; workers read it copy-on-write.
 _VERIFY_SEQS: list[str] | None = None
 
@@ -61,7 +68,13 @@ def _order_pair(a: int, b: int, seqs: list[str]) -> tuple[int, int]:
 
 
 def _verify_one(
-    a: int, b: int, *, identity: float, max_5p: int, max_3p: int
+    a: int,
+    b: int,
+    *,
+    identity: float,
+    max_5p: int,
+    max_3p: int,
+    min_budget: int = 0,
 ) -> tuple | None:
     """Align one candidate pair; return an accepted-record tuple or None."""
     import edlib
@@ -72,7 +85,12 @@ def _verify_one(
     q, r = seqs[short], seqs[long]
     if not q or not r:
         return None
-    budget = int((1.0 - identity) * len(q))
+    # A pure fractional gate is unusable on short sequences: at identity 0.97
+    # a 30-aa ORF (93 nt) gets a budget of 2 edits, while two reads each at
+    # ~1% error differ by ~1.9 bases in expectation — so a large fraction of
+    # genuinely-same-proteoform short pairs would fail to verify and fragment
+    # into singletons. `min_budget` puts a floor under it.
+    budget = max(int(min_budget), int((1.0 - identity) * len(q)))
     res = edlib.align(q, r, mode="HW", task="path", k=budget)
     ed = res["editDistance"]
     if ed < 0:
@@ -105,7 +123,11 @@ def _verify_one(
 
 
 def _verify_chunk(
-    pairs: np.ndarray, identity: float, max_5p: int, max_3p: int
+    pairs: np.ndarray,
+    identity: float,
+    max_5p: int,
+    max_3p: int,
+    min_budget: int = 0,
 ) -> list[tuple]:
     out: list[tuple] = []
     for i in range(pairs.shape[0]):
@@ -115,6 +137,7 @@ def _verify_chunk(
             identity=identity,
             max_5p=max_5p,
             max_3p=max_3p,
+            min_budget=min_budget,
         )
         if rec is not None:
             out.append(rec)
@@ -128,12 +151,16 @@ def verify_candidates(
     identity: float = 0.98,
     max_5p: int = 30,
     max_3p: int = 30,
+    min_budget: int = 0,
     threads: int = 1,
     chunk_size: int = 20_000,
 ) -> pa.Table:
     """Verify candidate pairs; return accepted alignments (with CIGARs).
 
     ``seqs`` is the unique-sequence list indexed by ``uniq_id``.
+    ``min_budget`` floors the per-pair edit budget so short sequences are not
+    gated out by rounding (see :func:`_verify_one`); 0 keeps the pure
+    fractional behaviour.
     """
     global _VERIFY_SEQS
     n = candidates.num_rows
@@ -151,13 +178,13 @@ def verify_candidates(
     records: list[tuple] = []
     try:
         if threads <= 1:
-            records = _verify_chunk(pairs, identity, max_5p, max_3p)
+            records = _verify_chunk(pairs, identity, max_5p, max_3p, min_budget)
         else:
             chunks = [pairs[i : i + chunk_size] for i in range(0, n, chunk_size)]
             ctx = mp.get_context("fork")
             with ProcessPoolExecutor(max_workers=threads, mp_context=ctx) as ex:
                 futs = [
-                    ex.submit(_verify_chunk, c, identity, max_5p, max_3p)
+                    ex.submit(_verify_chunk, c, identity, max_5p, max_3p, min_budget)
                     for c in chunks
                 ]
                 for fut in futs:
@@ -187,4 +214,4 @@ def verify_candidates(
     )
 
 
-__all__ = ["verify_candidates", "ACCEPTED_ALIGNMENT_SCHEMA"]
+__all__ = ["UNBOUNDED_OVERHANG", "verify_candidates", "ACCEPTED_ALIGNMENT_SCHEMA"]

@@ -82,6 +82,11 @@ def walk_parser(
     for action in parser._actions:
         if isinstance(action, argparse._HelpAction):
             continue
+        # A suppressed action is one `--help` does not print — a removed flag
+        # kept only so that passing it says what replaced it. As a form field
+        # it would be a box labelled "==SUPPRESS==" that errors when filled.
+        if action.help is argparse.SUPPRESS:
+            continue
         if isinstance(action, argparse._SubParsersAction):
             # Sort for deterministic output; the sidebar respects this order.
             for sub_name in sorted(action.choices):

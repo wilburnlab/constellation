@@ -1,0 +1,27 @@
+<svg class="track-canvas" width="1000" height="240" data-natural-height="28">
+<rect x="0" y="4" width="100" height="11" fill="#008080" opacity="0.6" data-alignment-id="1">
+</rect>
+<rect x="200" y="4" width="100" height="11" fill="#008080" opacity="0.6" data-alignment-id="1">
+</rect>
+<line x1="100" y1="10" x2="200" y2="10" stroke="#0000ff" stroke-width="2" stroke-dasharray="4,1" opacity="0.6">
+</line>
+<line x1="5" y1="5" x2="15" y2="15" stroke="#ff00ff" stroke-width="1.2" stroke-linecap="round">
+</line>
+<line x1="5" y1="15" x2="15" y2="5" stroke="#ff00ff" stroke-width="1.2" stroke-linecap="round">
+</line>
+<line x1="243" y1="5" x2="253" y2="15" stroke="#ff00ff" stroke-width="1.2" stroke-linecap="round">
+</line>
+<line x1="243" y1="15" x2="253" y2="5" stroke="#ff00ff" stroke-width="1.2" stroke-linecap="round">
+</line>
+<rect x="50" y="16" width="200" height="11" fill="#fb7c4f" opacity="0.6" data-alignment-id="2">
+</rect>
+<rect x="400" y="4" width="300" height="11" fill="#008080" opacity="0.6" data-alignment-id="3">
+</rect>
+<line x1="515" y1="5" x2="525" y2="15" stroke="#ff00ff" stroke-width="1.2" stroke-linecap="round">
+</line>
+<line x1="515" y1="15" x2="525" y2="5" stroke="#ff00ff" stroke-width="1.2" stroke-linecap="round">
+</line>
+<rect x="420" y="16" width="230" height="11" fill="#101010" opacity="0.6" data-alignment-id="4">
+</rect>
+<text x="996" y="12" font-size="10" text-anchor="end" fill="#8a8a93">vector · 4 reads</text>
+</svg>

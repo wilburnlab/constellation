@@ -158,6 +158,40 @@ def test_dereplicate_counts_and_map():
         assert seq_of_uniq[uid] == seq
 
 
+def test_unique_reads_are_numbered_in_first_occurrence_order():
+    """`uniq_id` is the order a sequence is first seen in, which is a
+    property of the input alone. It used to be the output order of a
+    multithreaded group_by, and that order is what breaks abundance ties
+    in the anchor-star — so two seedings of one corpus disagreed on 1.2%
+    of candidate pairs and ~1% of round-1 templates."""
+    rng = np.random.default_rng(31)
+    pool = ["".join(rng.choice(list("ACGT"), 60)) for _ in range(400)]
+    picks = rng.integers(0, len(pool), 5000)
+    seqs = [pool[i] for i in picks]
+    reads = pa.table(
+        {
+            "read_id": pa.array([f"r{i}" for i in range(len(seqs))], pa.string()),
+            "sequence": pa.array(seqs, pa.large_string()),
+            "sample_id": pa.array(np.zeros(len(seqs), np.int64)),
+        }
+    )
+    first_seen: dict[str, int] = {}
+    for s in seqs:
+        first_seen.setdefault(s, len(first_seen))
+
+    uniq, rmap = dereplicate(reads)
+    assert uniq.column("uniq_id").to_pylist() == list(range(len(first_seen)))
+    assert uniq.column("sequence").to_pylist() == list(first_seen)
+    assert rmap.column("uniq_id").to_pylist() == [first_seen[s] for s in seqs]
+    # A second call, and a chunked column, give the same numbering.
+    again, _ = dereplicate(reads)
+    assert again.equals(uniq)
+    chunked = reads.set_column(
+        1, "sequence", pa.chunked_array([seqs[:1234], seqs[1234:]], pa.large_string())
+    )
+    assert dereplicate(chunked)[0].equals(uniq)
+
+
 # ── verify: overhang normalization both orientations ──────────────────
 
 
@@ -329,7 +363,7 @@ def test_assemble_clusters_schema_and_quant(synthetic_panel):
     table, *_ = synthetic_panel
     res = assemble_clusters(table, identity=0.97, predict_orfs=True, min_aa_length=40)
     # cluster table mode + nulled genome columns
-    assert set(res.clusters.column("mode").to_pylist()) == {"de-novo"}
+    assert set(res.clusters.column("mode").to_pylist()) == {"kmer"}
     assert res.clusters.column("contig_id").null_count == res.clusters.num_rows
     # feature_quant origin/engine + per-sample TPM sums ~1e6
     fq = res.feature_quant
@@ -723,7 +757,7 @@ def test_cluster_transcripts_io(tmp_path):
     manifest = json.loads((out / "manifest.json").read_text())
     assert manifest["kind"] == "cluster"
     assert manifest["align_dir"] == ""
-    assert manifest["parameters"]["mode"] == "de-novo"
+    assert manifest["parameters"]["mode"] == "kmer"
     # FASTA + protein + counts + variants + report emitted
     assert (out / "cluster.fa").read_text().count(">") == clusters.num_rows
     assert (out / "cluster_counts.tsv").exists()

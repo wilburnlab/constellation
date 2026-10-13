@@ -1,0 +1,27 @@
+<svg class="track-canvas" width="1000" height="200" data-natural-height="20">
+<rect x="0" y="4" width="100" height="7" fill="#5e9cd6" opacity="1" data-alignment-id="1" data-cluster-id="1">
+</rect>
+<rect x="200" y="4" width="100" height="7" fill="#5e9cd6" opacity="1" data-alignment-id="1" data-cluster-id="1">
+</rect>
+<line x1="100" y1="8" x2="200" y2="8" stroke="#5a5a63" stroke-width="1" stroke-dasharray="2,2" opacity="1">
+</line>
+<line x1="7" y1="5" x2="13" y2="11" stroke="#e3493a" stroke-width="1.2" stroke-linecap="round">
+</line>
+<line x1="7" y1="11" x2="13" y2="5" stroke="#e3493a" stroke-width="1.2" stroke-linecap="round">
+</line>
+<line x1="245" y1="5" x2="251" y2="11" stroke="#e3493a" stroke-width="1.2" stroke-linecap="round">
+</line>
+<line x1="245" y1="11" x2="251" y2="5" stroke="#e3493a" stroke-width="1.2" stroke-linecap="round">
+</line>
+<rect x="50" y="12" width="200" height="7" fill="#5e9cd6" opacity="1" data-alignment-id="2" data-cluster-id="1">
+</rect>
+<rect x="400" y="4" width="300" height="7" fill="#d6755e" opacity="1" data-alignment-id="3" data-cluster-id="3">
+</rect>
+<line x1="517" y1="5" x2="523" y2="11" stroke="#e3493a" stroke-width="1.2" stroke-linecap="round">
+</line>
+<line x1="517" y1="11" x2="523" y2="5" stroke="#e3493a" stroke-width="1.2" stroke-linecap="round">
+</line>
+<rect x="420" y="12" width="230" height="7" fill="#d6755e" opacity="1" data-alignment-id="4" data-cluster-id="3">
+</rect>
+<text x="996" y="12" font-size="10" text-anchor="end" fill="#8a8a93">members · 4 reads</text>
+</svg>

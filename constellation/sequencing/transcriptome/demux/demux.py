@@ -162,6 +162,12 @@ def _extract_design_params(design: LibraryDesign) -> dict[str, Any]:
         "polyA_min_length": polyA_slot.min_length,
         "polyA_max_length": polyA_slot.max_length,
         "polyA_edge_distance": polyA_slot.edge_distance,
+        "polyA_residual_max_gap": polyA_slot.residual_max_gap,
+        "polyA_residual_min_run": polyA_slot.residual_min_run,
+        # 0 disables the walk inside the scorer.
+        "polyA_residual_max_walk": (
+            polyA_slot.residual_max_walk if polyA_slot.residual_trim else 0
+        ),
         "barcodes": barcode_slot.barcodes,
         # Hard mode uses an integer max-distance; derive it from the
         # slot's normalized min_score.
@@ -170,6 +176,26 @@ def _extract_design_params(design: LibraryDesign) -> dict[str, Any]:
             if barcode_slot.barcodes else 16,
         ),
         "transcript_min_length": transcript_slot.min_length,
+    }
+
+
+def polyA_provenance(design: LibraryDesign) -> dict[str, Any]:
+    """The poly-A trimming parameters a demux run used, for its manifest.
+
+    ``polyA_merge = "gap"`` marks the corrected run-merge semantics
+    (``scoring._merge_runs``); a demux dir whose manifest lacks it was
+    written by the upstream end-comparing merge, whose transcript windows
+    can carry a residual poly-A remnant.
+    """
+    params = _extract_design_params(design)
+    return {
+        "polyA_merge": "gap",
+        "polyA_min_length": params["polyA_min_length"],
+        "polyA_max_length": params["polyA_max_length"],
+        "polyA_edge_distance": params["polyA_edge_distance"],
+        "polyA_residual_max_gap": params["polyA_residual_max_gap"],
+        "polyA_residual_min_run": params["polyA_residual_min_run"],
+        "polyA_residual_max_walk": params["polyA_residual_max_walk"],
     }
 
 
@@ -200,6 +226,9 @@ def _annotate_strand(
         min_length=params["polyA_min_length"],
         max_length=params["polyA_max_length"],
         edge_distance=params["polyA_edge_distance"],
+        residual_max_gap=params["polyA_residual_max_gap"],
+        residual_min_run=params["polyA_residual_min_run"],
+        residual_max_walk=params["polyA_residual_max_walk"],
     )
 
     # 2. Slice into pre_polyA / post_polyA
@@ -668,5 +697,6 @@ __all__ = [
     "ReadDemuxResult",
     "demux_one_read",
     "locate_segments",
+    "polyA_provenance",
     "resolve_demux",
 ]

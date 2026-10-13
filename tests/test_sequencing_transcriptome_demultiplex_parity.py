@@ -5,15 +5,18 @@ Runs the full pipeline (SAM → segments → demux → ORF → count matrix)
 on the lab's ``test_simplex.sam`` fixture and asserts the output
 matches the supplied baseline:
 
-    1. Per-read ``sample_id`` agreement: ≥99.7% match. Divergences
+    1. Per-read barcode agreement: ≥99.4% match. Divergences
        are NanoporeAnalysis bugs we deliberately don't replicate
        (see ``transcriptome.demux._pick_orientation`` for the
-       Unknown-Fragment bug we corrected, and the empty-subject
-       short-circuit in ``align.locate.locate_substring``).
-    2. Per-read ``status`` agreement: ≥99.4%. The remaining ~20 reads
-       are reads where the upstream Unknown-Fragment bug was hiding
-       a real annotation; constellation surfaces it (e.g. baseline's
-       ``"Unknown Fragment"`` becomes our ``"5' Only Fragment"``).
+       Unknown-Fragment bug we corrected, the empty-subject
+       short-circuit in ``align.locate.locate_substring``, and the
+       poly-A run merge in ``demux.scoring._merge_runs`` that never
+       bridged a miscall inside a tail).
+    2. Per-read ``status`` agreement: ≥98.7%. ~20 reads are where the
+       upstream Unknown-Fragment bug was hiding a real annotation
+       (e.g. baseline's ``"Unknown Fragment"`` becomes our
+       ``"5' Only Fragment"``); ~31 are fragmented poly-A tails that
+       upstream failed to detect.
     3. Count matrix: every ``(protein_sequence, sample_name)`` cell
        in the baseline TSV has the matching count in our output.
        This is the gate that actually matters for downstream analysis;
@@ -145,33 +148,43 @@ def _mine_umi_map(segments, design) -> dict[str, str | None]:
 
 @pytest.mark.slow
 def test_status_agreement_floor(pipeline_outputs, baseline):
-    """≥99.4% per-read status agreement.
+    """≥98.7% per-read status agreement (measured 0.9873, 3958/4009).
 
-    Divergences (~20 reads on test_simplex.sam) are reads where
+    Two deliberate divergence classes. (1) ~20 reads where
     NanoporeAnalysis's Unknown-Fragment string-equality bug discarded
-    a real forward-orientation annotation; constellation surfaces it.
-    See ``transcriptome.demux._pick_orientation`` for the rationale.
+    a real forward-orientation annotation; constellation surfaces it
+    (see ``transcriptome.demux._pick_orientation``). (2) ~31 reads whose
+    poly-A tail is interrupted by a miscall: upstream's run merge never
+    bridged the gap (``scoring._merge_runs``), so a tail whose fragments
+    were each under the length floor went undetected. Most of these
+    become Complete / 3' Only with a barcode; a few become Complex
+    because both orientations now classify.
     """
     base = _baseline_status_map(baseline["parquet"])
     mine = _mine_status_map(pipeline_outputs["demux"])
     agree = sum(1 for k in base if mine.get(k) == base[k])
     rate = agree / len(base)
-    assert rate >= 0.994, (
-        f"status agreement {rate:.4f} below 99.4% floor "
+    assert rate >= 0.987, (
+        f"status agreement {rate:.4f} below 98.7% floor "
         f"({agree}/{len(base)})"
     )
 
 
 @pytest.mark.slow
 def test_barcode_agreement_floor(pipeline_outputs, baseline):
-    """≥99.7% per-read barcode agreement."""
+    """≥99.4% per-read barcode agreement (measured 0.9940, 3985/4009).
+
+    Below upstream's pre-fix 99.7% because reads with a fragmented poly-A
+    tail now get a barcode where upstream found no tail at all; no read
+    that upstream assigned a barcode changes barcode.
+    """
     base = _baseline_umi_map(baseline["parquet"])
     mine = _mine_umi_map(pipeline_outputs["segments"], CDNA_WILBURN_V1)
     # Compare on baseline's read set, treating missing-from-mine as None.
     agree = sum(1 for k in base if mine.get(k) == base[k])
     rate = agree / len(base)
-    assert rate >= 0.997, (
-        f"barcode agreement {rate:.4f} below 99.7% floor "
+    assert rate >= 0.994, (
+        f"barcode agreement {rate:.4f} below 99.4% floor "
         f"({agree}/{len(base)})"
     )
 

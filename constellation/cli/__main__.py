@@ -747,7 +747,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _build_t2p_parser(subs)
 
-    # Visualization subtree — `constellation viz genome --session DIR`.
+    # Visualization subtree — `constellation viz genome --reference <handle> ...`.
     # The full `[viz]` extras (fastapi / uvicorn / datashader) are
     # only required when the user actually invokes a viz subcommand;
     # the parser registration is cheap import-wise.
@@ -1256,38 +1256,434 @@ def _build_transcriptome_parser(subs) -> None:
     )
     p_cluster.add_argument(
         "--mode",
-        choices=("genome-guided", "de-novo"),
-        default="genome-guided",
+        # The first four are canonical. `em` is an accepted under-specified
+        # spelling of em-orf; the last two are the pre-rename spellings,
+        # accepted so existing scripts and manifests keep working.
+        choices=(
+            "genome",
+            "kmer",
+            "em-orf",
+            "em-kmer",
+            "em",
+            "genome-guided",
+            "de-novo",
+        ),
+        default="genome",
+        metavar="{genome,kmer,em-orf,em-kmer}",
         help=(
-            "clustering mode. genome-guided (Phase 2) keys on splicing "
-            "topology against a reference; de-novo (Phase 3) is reference-"
-            "free minimizer + edit-distance assembly of the demux windows."
+            "clustering mode, named for the MECHANISM rather than the "
+            "provenance. genome keys on splicing topology against a "
+            "reference; kmer is reference-free connected components over a "
+            "minimizer + edit-distance graph; em-orf and em-kmer both iterate "
+            "align -> refine to converged reference transcripts and differ "
+            "only in how round 1 is SEEDED — one template per distinct ORF, "
+            "or one per read cluster. At 9.4M reads kmer seeding is 4.4x "
+            "fewer templates and a 2.9 h round-1 E-step against 13.95 h, at "
+            "the same gene agreement. 'em' is accepted for em-orf; "
+            "'genome-guided' and 'de-novo' are deprecated aliases for genome "
+            "and kmer."
         ),
     )
-    # ── de-novo (--mode de-novo) flags ──────────────────────────────
+    # ── em (--mode em) flags ────────────────────────────────────────
+    p_cluster.add_argument(
+        "--rounds",
+        type=int,
+        default=6,
+        help="em: EM rounds to run. On --resume this is how many MORE. At "
+        "9.4M reads the templates stopped changing at round 6 (reference "
+        "length, ORF length and fidelity flat from 6 to 12).",
+    )
+    p_cluster.add_argument(
+        "--stop-frac-changed",
+        type=float,
+        default=0.005,
+        help="em: stop when fewer than this fraction of reads change template, "
+        "measured LINEAGE-AWARE so a read whose template merely split "
+        "does not count.",
+    )
+    p_cluster.add_argument(
+        "--p-floor",
+        type=float,
+        default=0.97,
+        help="em: absolute admission floor on n_match/aln_len. A read with no "
+        "candidate above it is emitted unassigned rather than forced "
+        "somewhere. This is the pipeline's only absolute quality gate.",
+    )
+    p_cluster.add_argument(
+        "--minimap2-n",
+        type=int,
+        default=500,
+        help="em: minimap2 -N. A CORRECTNESS parameter, not a cost one — the "
+        "candidate pool must hold every template within --p-floor, and "
+        "minimap2 truncates by score, so a truncated pool means the "
+        "ranking arbitrated over an arbitrary subset. Raise it if the "
+        "saturation warning fires.",
+    )
+    p_cluster.add_argument(
+        "--template-graph",
+        choices=("rounds", "final", "off"),
+        default=None,
+        help="em: relate the templates to each other after the M-step — which "
+        "are the same transcript within an end tolerance (`equivalent`), which "
+        "are contained in which (`contained`) — by kmer candidates and two "
+        "edlib infix alignments per pair. 'rounds' (default) does it for every "
+        "round's nodes and writes rounds/rNN/graph/edges.parquet plus "
+        "cluster_edges.parquet; 'final' only for the last round's; 'off' runs "
+        "nothing at all after the M-step. A report: nothing is collapsed "
+        "unless --merge is passed.",
+    )
+    p_cluster.add_argument(
+        "--merge",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="em: collapse the pairs the merge predicate accepts, between "
+        "rounds and in the final output (default: --merge, unless "
+        "--template-graph off). Between rounds the deepest member survives "
+        "and the next M-step rebuilds its consensus; in the final output the "
+        "deepest survives too, and its consensus is rebuilt here from the "
+        "pooled reads of the group before its ORF is called. Measured on "
+        "9.4M reads: protein recovery flat against --no-merge, node growth "
+        "between rounds nearly stopped.",
+    )
+    p_cluster.add_argument(
+        "--merge-max-edits",
+        type=int,
+        default=None,
+        help="em: a pair is mergeable only within this many edits over the "
+        "span the two share (default 2). An absolute count like the end "
+        "tolerances — a fraction lets two differences through above 2 kb and "
+        "blocks them below. 2 is the conservative point of a 1-6 sweep: "
+        "substitutions carry alleles, so a larger cap wants to be edit-type-"
+        "aware rather than a bigger number. The graph's edit budget follows "
+        "it (min_budget = max(3, this)), so the identity floor can never "
+        "block a merge the cap allows. Defines the `mergeable` column whether "
+        "or not the run merges.",
+    )
+    p_cluster.add_argument(
+        "--merge-5p-tolerance",
+        type=int,
+        default=None,
+        help="em: nt by which a mergeable pair's 5' ends may differ (default: "
+        "--graph-5p-tolerance, which it may not exceed).",
+    )
+    p_cluster.add_argument(
+        "--merge-3p-tolerance",
+        type=int,
+        default=None,
+        help="em: nt by which a mergeable pair's 3' ends may differ (default: "
+        "--graph-3p-tolerance, which it may not exceed).",
+    )
+    p_cluster.add_argument(
+        "--merge-min-reads",
+        type=int,
+        default=None,
+        help="em: a pair is mergeable only if both templates hold at least "
+        "this many reads (default 0: no depth gate).",
+    )
+    p_cluster.add_argument(
+        "--merge-siblings",
+        action="store_true",
+        help="em: let templates an M-step split apart be merged again. Off by "
+        "default: 51.6%% of the old merge's pairs were exactly that, a "
+        "split/merge cycle moving ~7.5%% of reads a round. Byte-identical "
+        "templates are mergeable either way.",
+    )
+    p_cluster.add_argument(
+        "--merge-from-round",
+        type=int,
+        default=None,
+        help="em, --merge only: merge after rounds >= this (default 1: every "
+        "round).",
+    )
+    p_cluster.add_argument(
+        "--graph-identity-floor",
+        type=float,
+        default=None,
+        help="em: a pair is an edge only at or above this identity over the "
+        "span the two share (default 0.99).",
+    )
+    p_cluster.add_argument(
+        "--graph-5p-tolerance",
+        type=int,
+        default=None,
+        help="em: two templates are `equivalent` when neither reaches more "
+        "than this many nt beyond the other at the 5' end (default 30; "
+        "min(30, length // 10) below 300 nt).",
+    )
+    p_cluster.add_argument(
+        "--graph-3p-tolerance",
+        type=int,
+        default=None,
+        help="em: the same at the 3' end (default 30).",
+    )
+    # Removed. Kept so that passing one says what replaced it, which
+    # argparse's "unrecognized arguments" would not.
+    p_cluster.add_argument(
+        "--p-merge", type=float, default=None, help=argparse.SUPPRESS
+    )
+    p_cluster.add_argument(
+        "--merge-min-coverage", type=float, default=None, help=argparse.SUPPRESS
+    )
+    p_cluster.add_argument(
+        "--estep-aligner",
+        choices=("minimap2", "edlib", "native"),
+        default="minimap2",
+        help="em: the E-step's base aligner. 'minimap2' (default) base-aligns "
+        "every candidate with minimap2 -c. 'edlib' is the two-pass path: "
+        "minimap2 without -c shortlists on chaining score, and only the "
+        "shortlist is base-aligned with edlib (~67%% of E-step wall time "
+        "was -c). 'native' replaces the candidate SOURCE as well: "
+        "Constellation's own minimizer join supplies the candidates with no "
+        "minimap2 anywhere — minimap2 masks high-frequency minimizers as "
+        "repeats, and here those are usually near-duplicate templates the "
+        "loop has not consolidated yet, exactly what the E-step must see. "
+        "Alignment, admission and ranking are the edlib path's, unchanged. "
+        "Both are opt-in until their operating points are measured.",
+    )
+    p_cluster.add_argument(
+        "--estep-shortlist-k",
+        type=int,
+        default=None,
+        help="em, --estep-aligner edlib/native only: at most this many "
+        "candidates per read are base-aligned, by the shortlist key "
+        "(chaining score under edlib, shared probes under native), ties to "
+        "the better-supported template so dense templates absorb reads "
+        "rather than fragment them (default 32). Each read's "
+        "`shortlist_truncated` reports whether the cut could have changed "
+        "its answer.",
+    )
+    p_cluster.add_argument(
+        "--estep-shortlist-frac",
+        type=float,
+        default=None,
+        help="em, --estep-aligner edlib/native only: a candidate is "
+        "shortlisted only if its shortlist key is at least this fraction of "
+        "the read's best (default 0.8). UNMEASURED operating point.",
+    )
+    p_cluster.add_argument(
+        "--estep-align-workers",
+        type=int,
+        default=None,
+        help="em, --estep-aligner edlib/native only: processes base-aligning "
+        "the shortlist (default --threads). Under edlib they run "
+        "concurrently with minimap2's chaining; under native they run the "
+        "candidate join too.",
+    )
+    p_cluster.add_argument(
+        "--estep-probes-per-read",
+        type=int,
+        default=None,
+        help="em, --estep-aligner native only: probes per read in the "
+        "candidate join, one per position stratum (default 32). Also the "
+        "resolution of the shortlist key — shared probes cannot exceed it — "
+        "so raising it is what lets the shortlist discriminate inside a "
+        "deep family. Stamped: a resume under a different value is refused.",
+    )
+    p_cluster.add_argument(
+        "--p-floor-quality-scale",
+        type=float,
+        default=None,
+        help="em: let each read's admission floor ease with its own quality "
+        "— min(--p-floor, 1 - SCALE * 10^(-Q/10)), so a read may miss its "
+        "template by SCALE times its expected error rate before it is "
+        "rejected. Unset (the default) every read is held to the flat "
+        "--p-floor, under which a below-Q20 read cannot clear 0.97 against "
+        "ANY template. UNCALIBRATED: run flat once — the E-step records "
+        "every read's identity beside its quality — then set the scale from "
+        "that run's data. A read with no quality keeps the flat floor.",
+    )
+    p_cluster.add_argument(
+        "--index-batch-size",
+        default="16G",
+        help="em: minimap2 -I. Must exceed the template total: a multi-part "
+        "index double-counts read mass AND breaks the query contiguity "
+        "the E-step reducer's grouping depends on.",
+    )
+    p_cluster.add_argument(
+        "--near-tie-delta-logl",
+        type=float,
+        default=5.0,
+        help="em: how close in log-likelihood (nats) a candidate must be to "
+        "the argmax for abundance to override it. ~5 is one "
+        "discriminating substitution's worth of evidence.",
+    )
+    p_cluster.add_argument(
+        "--support-ratio",
+        type=float,
+        default=20.0,
+        help="em: how much more abundant a near-tie candidate must be to win. "
+        "Deliberately extreme: the override should be rare and decisive.",
+    )
+    p_cluster.add_argument(
+        "--near-tie-z",
+        type=float,
+        default=2.0,
+        help="em: width of the AS shortlist the likelihood is computed over, "
+        "in SDs of Binomial(L, e) mismatch noise. z=2 reproduces the "
+        "hand-tuned band_abs=40 at the median 1.2 kb read.",
+    )
+    p_cluster.add_argument(
+        "--read-error-rate",
+        type=float,
+        default=0.01,
+        help="em: per-base error rate for the shortlist width.",
+    )
+    p_cluster.add_argument(
+        "--seed-representative",
+        default="longest-above-quality",
+        choices=(
+            "longest-above-quality",
+            "median-length",
+            "longest-template",
+            "most-5p-flank",
+            "most-replicated",
+        ),
+        help="em: which read of a seed group becomes the round-1 template. "
+        "Default is the longest read clearing Q22 — quality selects read "
+        "accuracy ~4x where length selects it not at all. One policy is "
+        "em-orf only: most-5p-flank ranks on the ORF's position in the read, "
+        "which kmer seeding has not predicted at election time.",
+    )
+    p_cluster.add_argument(
+        "--min-seed-reads",
+        type=int,
+        default=1,
+        help="em: drop seed groups (ORF groups / read clusters) below this "
+        "many reads BEFORE the E-step. Keep at 1: a pre-E-step filter erases "
+        "minority proteoforms before they can be tested, and there is no "
+        "prune downstream to compensate. Under em-kmer, 2 is the extreme "
+        "operating point — 112k templates and a 9-minute round-1 E-step at "
+        "9.4M reads, but transcript template recall halves (0.52 vs 0.87).",
+    )
+    p_cluster.add_argument(
+        "--fold-identity",
+        type=float,
+        default=None,
+        help=(
+            "em-orf: ORF-level fold identity for seed grouping. Default 0.97. "
+            "Not used by --mode em-kmer, which has no ORF-level fold."
+        ),
+    )
+    p_cluster.add_argument(
+        "--max-members-per-template",
+        type=int,
+        default=20000,
+        help="em: cap on PWM members per template, abundance-weighted. LPT "
+        "cannot split one mega-template, so this is what bounds the "
+        "M-step's critical path.",
+    )
+    p_cluster.add_argument(
+        "--mstep-workers",
+        type=int,
+        default=0,
+        help="em: M-step pool size (0 = --threads).",
+    )
+    p_cluster.add_argument(
+        "--coverage-route",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="em: let the M-step admit a candidate column for its covered "
+        "read-set — an alternative start or end — as well as for a minor "
+        "allele (default: --no-coverage-route). Off is the operating point "
+        "every bench result since 2026-09-23 was measured at; with it the "
+        "templates split on alleles and never on extent.",
+    )
+    # ── kmer (--mode kmer) flags ────────────────────────────────────
+    # The read-to-read gate. Shared by --mode kmer and --mode em-kmer, whose
+    # right defaults DIFFER (0.98/30:30 vs 0.93/inf:100) — so the default is
+    # None and each handler resolves it, the same treatment --overdispersion
+    # already gets below. Measured: 0.98/30:30 costs the EM the same 14 h as
+    # ORF seeding, and relaxing to 0.93/inf:100 is the 4.8x cut.
     p_cluster.add_argument(
         "--identity",
         type=float,
-        default=0.98,
+        default=None,
         help=(
-            "de-novo: minimum pairwise sequence identity for two reads to "
-            "share a cluster edge (edit_distance / shorter_len ≤ 1-identity). "
-            "Note this is read-to-read: two reads each ~1%% from the true "
-            "transcript are ~2%% apart, so ~0.96-0.97 reduces tail "
-            "fragmentation for ~1%% error reads. Default 0.98."
+            "kmer / em-kmer: minimum pairwise sequence identity for two reads "
+            "to share a cluster edge (edit_distance / shorter_len ≤ "
+            "1-identity). Note this is read-to-read: two reads each ~1%% from "
+            "the true transcript are ~2%% apart, so ~0.96-0.97 reduces tail "
+            "fragmentation for ~1%% error reads. Default 0.98 for --mode "
+            "kmer, 0.93 for --mode em-kmer."
         ),
     )
     p_cluster.add_argument(
         "--max-5p-overhang",
-        type=int,
-        default=30,
-        help="de-novo: max 5' length overhang (bp) to still collapse. Default 30.",
+        type=_overhang,
+        default=None,
+        help=(
+            "kmer / em-kmer: max 5' length overhang (bp) to still collapse; "
+            "'inf' (or a negative value) means unbounded. Default 30 for "
+            "--mode kmer, inf for --mode em-kmer — 30%% of Complete windows "
+            "are 5'-partial, so 5'-unbounded recruitment is the point, and "
+            "the 3' cap is what makes it safe."
+        ),
     )
     p_cluster.add_argument(
         "--max-3p-overhang",
+        type=_overhang,
+        default=None,
+        help=(
+            "kmer / em-kmer: max 3' length overhang (bp) to still collapse; "
+            "'inf' means unbounded. Default 30 for --mode kmer, 100 for "
+            "--mode em-kmer. Load-bearing: at 9.4M reads, unbounded ends put "
+            "76%% of the corpus in ONE connected component at purity 0.154, "
+            "and even 500 leaves a 410k-read one."
+        ),
+    )
+    p_cluster.add_argument(
+        "--min-shared",
         type=int,
-        default=30,
-        help="de-novo: max 3' length overhang (bp) to still collapse. Default 30.",
+        default=2,
+        help=(
+            "kmer / em-kmer: minimum shared minimizers for a candidate pair. "
+            "Raising it to 3 costs 2-10 points of gene contiguity; 2 is the "
+            "measured operating point."
+        ),
+    )
+    p_cluster.add_argument(
+        "--diag-span-max",
+        type=int,
+        default=20,
+        help=(
+            "kmer / em-kmer: max diagonal span for candidate consistency. "
+            "60 buys ~1 point of contiguity over 20, so this is the one of "
+            "the two worth relaxing."
+        ),
+    )
+    p_cluster.add_argument(
+        "--seed-grouping",
+        choices=("components", "greedy"),
+        default="components",
+        help=(
+            "em-kmer: how verified edges become clusters. components is the "
+            "measured default; greedy (radius-1 set cover) cannot chain by "
+            "construction — largest cluster 60k vs 7.1M — at ~1.4x the "
+            "templates and 10 points of contiguity, so it is the fallback if "
+            "a hard no-chaining guarantee is wanted."
+        ),
+    )
+    p_cluster.add_argument(
+        "--max-seed-cluster-frac",
+        type=float,
+        default=None,
+        help=(
+            "em-kmer: fail seeding if one cluster holds more than this "
+            "fraction of the reads (and at least --min-chain-cluster-reads of "
+            "them). Default 0.25 — a quarter of a corpus is never one "
+            "transcript, and the chained-component failure it catches costs a "
+            "multi-hour round. 0 disables."
+        ),
+    )
+    p_cluster.add_argument(
+        "--min-chain-cluster-reads",
+        type=int,
+        default=None,
+        help=(
+            "em-kmer: absolute read floor below which the chaining guard says "
+            "nothing — a fraction needs a corpus to be a fraction of. "
+            "Default 10000."
+        ),
     )
     p_cluster.add_argument(
         "--kmer", type=int, default=15, help="de-novo: minimizer k-mer length."
@@ -1330,8 +1726,38 @@ def _build_transcriptome_parser(subs) -> None:
     p_cluster.add_argument(
         "--overdispersion",
         type=float,
-        default=0.0,
-        help="de-novo: beta-binomial overdispersion ρ for variant SF (Cut 4).",
+        default=None,
+        # The right default DIFFERS by mode, so it is resolved in each handler
+        # rather than baked in here: kmer's call_variants wants rho off, em's
+        # candidate-column test wants it on at 0.01. Sharing one default would
+        # silently hand the EM path the setting known not to work.
+        help=(
+            "beta-binomial overdispersion rho; caps effective depth at ~1/rho, "
+            "which is the depth penalty on the variant test. Default 0.0 for "
+            "--mode kmer, 0.01 for --mode em."
+        ),
+    )
+    p_cluster.add_argument(
+        "--max-window-length",
+        type=int,
+        default=15000,
+        help=(
+            "de-novo: drop transcript windows longer than this before "
+            "seeding and alignment (0 disables). Oversized windows are "
+            "concatemers, not transcripts; they seed giant templates and "
+            "reserve terminal blocks on other templates. Default 15000."
+        ),
+    )
+    p_cluster.add_argument(
+        "--fold-insertions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "de-novo: let the consensus splice in insertions a majority of "
+            "members carry and extend past the centroid's ends, so a deletion "
+            "error in the centroid is repairable and the result does not "
+            "depend on which read became the frame. Default on."
+        ),
     )
     p_cluster.add_argument(
         "--predict-orfs",
@@ -1342,8 +1768,17 @@ def _build_transcriptome_parser(subs) -> None:
     p_cluster.add_argument(
         "--min-aa-length",
         type=int,
-        default=60,
-        help="de-novo: minimum predicted-protein length (AA). Default 60.",
+        default=None,
+        help=(
+            "minimum ORF length (AA). **em-***: the protein-annotation floor "
+            "on every node's consensus, default 30 (60 cannot report Prm1, "
+            "51 aa, the most abundant transcript in mouse testis) — and under "
+            "em-orf also the SEEDING key, since there a template exists "
+            "because a distinct ORF of at least this length did. The ORF is "
+            "an annotation: nothing in the loop reads it, so the floor "
+            "changes what is reported, never how a template is split. "
+            "**kmer**: the same floor on each consensus, default 60."
+        ),
     )
     p_cluster.add_argument(
         "--emit-cluster-detail",
@@ -1761,6 +2196,7 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         write_demux_manifest,
     )
     from constellation.sequencing.transcriptome.stages import (
+        DemuxResumeError,
         run_demux_pipeline,
     )
 
@@ -1787,19 +2223,24 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
 
     cb = StreamProgress() if args.progress else NullProgress()
 
-    artefacts = run_demux_pipeline(
-        pipeline_inputs,
-        library_design=args.library_design,
-        samples=samples,
-        output_dir=output_dir,
-        batch_size=args.batch_size,
-        n_workers=args.threads,
-        min_aa_length=args.min_aa_length,
-        min_protein_count=args.min_protein_count,
-        progress_cb=cb,
-        resume=args.resume,
-        emit_fastq=args.emit_fastq,
-    )
+    try:
+        artefacts = run_demux_pipeline(
+            pipeline_inputs,
+            library_design=args.library_design,
+            samples=samples,
+            output_dir=output_dir,
+            batch_size=args.batch_size,
+            n_workers=args.threads,
+            min_aa_length=args.min_aa_length,
+            min_protein_count=args.min_protein_count,
+            progress_cb=cb,
+            resume=args.resume,
+            emit_fastq=args.emit_fastq,
+        )
+    except DemuxResumeError as exc:
+        # The directory holds another run's shards; nothing was touched.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     n_reads = artefacts["n_reads"]
     quant_table = artefacts["quant_table"]
@@ -1821,13 +2262,18 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
     if fastq_dir is not None:
         outputs["fastq_dir"] = str(fastq_dir)
 
+    # What is TRUE of the outputs, not what this invocation asked for: under
+    # --resume over a directory from before the poly-A fix the shards were
+    # reused, and stamping them `polyA_merge = "gap"` here claimed a
+    # trimming they never had (review of 91e7c69).
+    settings = dict(artefacts["settings"])
+    library_design = settings.pop("library_design")
     parameters: dict[str, object] = {
-        "min_aa_length": args.min_aa_length,
-        "min_protein_count": args.min_protein_count,
         "n_workers": args.threads,
         "batch_size": args.batch_size,
         "resumed": args.resume,
         "emit_fastq": args.emit_fastq,
+        **settings,
     }
     stages: dict[str, object] = {
         "n_reads": n_reads,
@@ -1844,7 +2290,7 @@ def _cmd_transcriptome_demultiplex(args: argparse.Namespace) -> int:
         output_dir / "manifest.json",
         input_files=[str(f) for f in input_files],
         acquisition_map={str(f): aid for f, aid in pipeline_inputs},
-        library_design=args.library_design,
+        library_design=library_design,
         parameters=parameters,
         stages=stages,
         outputs=outputs,
@@ -2507,12 +2953,20 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
         read_manifest_dir,
     )
 
-    if args.mode == "de-novo":
+    mode = _normalise_cluster_mode(args.mode)
+    seeding = _em_seeding(args.mode) if mode == "em" else "orf"
+    problem = _reject_inapplicable(args, mode, seeding)
+    if problem is not None:
+        print(f"error: {problem}", file=sys.stderr)
+        return 2
+    if mode == "em":
+        return _cmd_transcriptome_cluster_em(args, seeding=seeding)
+    if mode == "kmer":
         return _cmd_transcriptome_cluster_denovo(args)
 
     if args.align_dir is None:
         print(
-            "--mode genome-guided requires --align-dir "
+            "--mode genome requires --align-dir "
             "(a `transcriptome align` output dir).",
             file=sys.stderr,
         )
@@ -3094,6 +3548,496 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
     return 0
 
 
+def _overhang(value: str) -> int:
+    """`--max-{5,3}p-overhang`: an int, or 'inf' / 'none' / negative.
+
+    The verify gate is a plain `overhang > max` comparison, so "unbounded" is
+    a value no real overhang reaches. Parsed here rather than spelled as a
+    magic number at the call site, so `inf:100` round-trips into the manifest
+    legibly.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.verify import (
+        UNBOUNDED_OVERHANG,
+    )
+
+    if value.strip().lower() in {"inf", "none", "unbounded"}:
+        return UNBOUNDED_OVERHANG
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected an integer or 'inf', got {value!r}"
+        ) from None
+    return UNBOUNDED_OVERHANG if n < 0 else n
+
+
+#: Pre-rename --mode spellings, accepted so existing scripts and manifests
+#: keep working. They describe provenance where the canonical names describe
+#: the mechanism, which is what a user actually chooses between.
+_CLUSTER_MODE_ALIASES = {"genome-guided": "genome", "de-novo": "kmer"}
+
+#: The EM spellings. All three are the same MECHANISM — an EM loop — and
+#: differ only in how round 1 is seeded, so they collapse to one mode plus a
+#: seeding choice rather than becoming separate values of the `mode` column.
+#: That keeps `clusters.parquet` and the viz colour maps untouched, and makes
+#: the eventual `--mode em --seeding kmer` consolidation a pure CLI change.
+_EM_SEEDING = {"em": "orf", "em-orf": "orf", "em-kmer": "kmer"}
+
+
+def _normalise_cluster_mode(mode: str) -> str:
+    """Canonical --mode, warning once on a deprecated spelling."""
+    if mode in _EM_SEEDING:
+        return "em"
+    canonical = _CLUSTER_MODE_ALIASES.get(mode)
+    if canonical is None:
+        return mode
+    print(
+        f"note: --mode {mode} is deprecated; use --mode {canonical}. "
+        "The modes are named for the mechanism now "
+        "(genome / kmer / em-orf / em-kmer).",
+        file=sys.stderr,
+    )
+    return canonical
+
+
+def _em_seeding(mode: str) -> str:
+    """Which round-1 seeder `--mode` asked for: 'orf' or 'kmer'.
+
+    Bare `em` means `em-orf` — under-specified rather than wrong, so it is a
+    note rather than a deprecation. The default deliberately does NOT flip to
+    kmer seeding yet: it dominates ORF seeding on every measured round-1 axis,
+    but the multi-round comparison that would justify the flip is the reason
+    this exists, and flipping first destroys the baseline it is measured
+    against.
+    """
+    if mode == "em":
+        print(
+            "note: --mode em now names its seeder explicitly. This run uses "
+            "--mode em-orf (one template per distinct ORF); --mode em-kmer "
+            "seeds from read clusters instead.",
+            file=sys.stderr,
+        )
+    return _EM_SEEDING.get(mode, "orf")
+
+
+#: Flags of the merge this version removed, and what to say when one is
+#: passed. Keyed by argparse dest.
+_REMOVED_CLUSTER_FLAGS = {
+    "p_merge": (
+        "--p-merge was removed: identity is no longer measured on a local "
+        "alignment, and a fraction is length-dependent. Use --merge-max-edits "
+        "(edits over the shared span; default 0) with --merge."
+    ),
+    "merge_min_coverage": (
+        "--merge-min-coverage was removed: end tolerance is in nucleotides "
+        "now, not a proportion. Use --merge-5p-tolerance / "
+        "--merge-3p-tolerance (default 30 / 30)."
+    ),
+}
+
+
+def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
+    """A flag that does nothing under this mode is an error, not a no-op.
+
+    Silently ignoring `--fold-identity` under kmer seeding means a swept
+    parameter had no effect and the run looks like evidence about it.
+    """
+    # Removed flags first, and in every mode: what they meant is gone, so
+    # "this mode does not use it" would be the wrong thing to say.
+    for dest, message in _REMOVED_CLUSTER_FLAGS.items():
+        if getattr(args, dest, None) is not None:
+            return message
+
+    em = mode == "em"
+    banned: list[tuple[str, bool, str]] = [
+        # (flag, is-set, what to use instead)
+        (
+            "--identity",
+            args.identity is not None and em and seeding == "orf",
+            "--fold-identity (the ORF-level fold gate)",
+        ),
+        (
+            "--max-5p-overhang",
+            args.max_5p_overhang is not None and em and seeding == "orf",
+            "nothing — the ORF fold verifies with unbounded ends by design",
+        ),
+        (
+            "--max-3p-overhang",
+            args.max_3p_overhang is not None and em and seeding == "orf",
+            "nothing — the ORF fold verifies with unbounded ends by design",
+        ),
+        (
+            "--fold-identity",
+            args.fold_identity is not None and em and seeding == "kmer",
+            "--identity (the read-to-read gate)",
+        ),
+        (
+            "--coverage-route" if args.coverage_route else "--no-coverage-route",
+            args.coverage_route is not None and not em,
+            "nothing — only the --mode em-* M-step has a coverage route",
+        ),
+        (
+            "--seed-grouping",
+            args.seed_grouping != "components" and not (em and seeding == "kmer"),
+            "nothing — only --mode em-kmer groups reads into seed clusters",
+        ),
+        (
+            "--estep-aligner",
+            args.estep_aligner != "minimap2" and not em,
+            "nothing — only the --mode em-* E-step has an aligner choice",
+        ),
+        (
+            "--p-floor-quality-scale",
+            args.p_floor_quality_scale is not None and not em,
+            "nothing — only the --mode em-* E-step admits on a floor",
+        ),
+        (
+            "--estep-probes-per-read",
+            args.estep_probes_per_read is not None
+            and not (em and args.estep_aligner == "native"),
+            "--estep-aligner native, whose candidate join is what chooses "
+            "the probes",
+        ),
+    ]
+    graph_mode = "rounds" if args.template_graph is None else args.template_graph
+    graph_on = em and graph_mode != "off"
+    # Merge is on by default wherever there is a graph; `--template-graph
+    # off` with neither spelling of --merge is the one case that resolves
+    # it off, since there is nothing to merge on.
+    merging = em and (args.merge is True or (args.merge is None and graph_on))
+    if args.merge is True and graph_mode == "off":
+        return (
+            "--merge needs the template graph, and --template-graph off runs "
+            "nothing after the M-step. Drop one of them."
+        )
+    banned.append(
+        (
+            "--template-graph",
+            args.template_graph is not None and not em,
+            "nothing — only the --mode em-* loop relates its templates",
+        )
+    )
+    banned.append(
+        (
+            "--merge" if args.merge else "--no-merge",
+            args.merge is not None and not em,
+            "nothing — only the --mode em-* loop merges templates",
+        )
+    )
+    for flag in (
+        "--graph-identity-floor",
+        "--graph-5p-tolerance",
+        "--graph-3p-tolerance",
+    ):
+        banned.append(
+            (
+                flag,
+                getattr(args, flag[2:].replace("-", "_")) is not None
+                and not graph_on,
+                "--mode em-* with the template graph on, which is the only "
+                "thing that reads it",
+            )
+        )
+    # The predicate defines the `mergeable` column of the graph whether or
+    # not the run merges, so its knobs act whenever there is a graph.
+    for flag in (
+        "--merge-max-edits",
+        "--merge-5p-tolerance",
+        "--merge-3p-tolerance",
+        "--merge-min-reads",
+    ):
+        banned.append(
+            (
+                flag,
+                getattr(args, flag[2:].replace("-", "_")) is not None
+                and not graph_on,
+                "--mode em-* with the template graph on: it defines which "
+                "edges are `mergeable`",
+            )
+        )
+    banned.append(
+        (
+            "--merge-siblings",
+            args.merge_siblings and not graph_on,
+            "--mode em-* with the template graph on: it defines which edges "
+            "are `mergeable`",
+        )
+    )
+    banned.append(
+        (
+            "--merge-from-round",
+            args.merge_from_round is not None and not merging,
+            "--merge; it only schedules merging",
+        )
+    )
+    if merging and graph_mode == "final":
+        # No graph between rounds, so only the final output merges.
+        banned.append(
+            (
+                "--merge-from-round",
+                args.merge_from_round is not None,
+                "--template-graph rounds; under 'final' only the final "
+                "output merges",
+            )
+        )
+    two_pass = em and args.estep_aligner in ("edlib", "native")
+    for flag in (
+        "--estep-shortlist-k",
+        "--estep-shortlist-frac",
+        "--estep-align-workers",
+    ):
+        banned.append(
+            (
+                flag,
+                getattr(args, flag[2:].replace("-", "_")) is not None
+                and not two_pass,
+                "--estep-aligner edlib or native, the two E-steps with a "
+                "shortlist",
+            )
+        )
+    for flag, is_set, instead in banned:
+        if is_set:
+            return f"--mode {args.mode} does not use {flag}; use {instead}."
+    return None
+
+
+def _cmd_transcriptome_cluster_em(
+    args: argparse.Namespace, *, seeding: str = "orf"
+) -> int:
+    """`transcriptome cluster --mode em-{orf,kmer}` — the iterative EM clusterer."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.graph import (
+        GraphParams,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        EmParams,
+        run_em,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.seed_kmer import (
+        ChainedClusterError,
+    )
+
+    demux_dir = Path(args.demux_dir)
+    for sub in ("read_demux", "reads"):
+        if not (demux_dir / sub).exists():
+            print(
+                f"{demux_dir} is not a `transcriptome demultiplex` output dir "
+                f"(missing {sub}/).",
+                file=sys.stderr,
+            )
+            return 2
+
+    output_dir = Path(args.output_dir)
+    if (output_dir / "_SUCCESS").exists() and not args.resume:
+        print(
+            f"{output_dir} already holds a completed run; pass --resume to "
+            "continue it or choose another --output-dir.",
+            file=sys.stderr,
+        )
+        return 2
+
+    log = (
+        (lambda m: print(f"[em] {m}", file=sys.stderr, flush=True))
+        if args.progress
+        else None
+    )
+    try:
+        params = _em_params(args, seeding, EmParams, GraphParams, MStepParams)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        results = run_em(
+            demux_dir, output_dir, params=params, resume=args.resume, progress=log
+        )
+    except ChainedClusterError as exc:
+        # A seeding failure is a parameter problem the user can fix, not a
+        # crash: print the guidance the exception carries and exit 2.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        # The resume stamp mismatch, and the policy refusals, land here.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not results:
+        print("no clusters were produced", file=sys.stderr)
+        return 1
+    (output_dir / "_SUCCESS").write_bytes(b"")
+    last = results[-1]
+    # Counted from what was written: a final merge makes it fewer than the
+    # last round's nodes.
+    import pyarrow.parquet as pq
+
+    clusters = output_dir / "clusters.parquet"
+    n_clusters = (
+        pq.read_metadata(clusters).num_rows if clusters.exists() else last.n_nodes
+    )
+    print(
+        f"{len(results)} round(s); {n_clusters:,} clusters over "
+        f"{last.estep.get('n_assigned', 0):,} assigned reads "
+        f"({last.estep.get('n_unassigned', 0):,} unassigned)"
+    )
+    return 0
+
+
+def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
+    """`EmParams` from the parsed flags, every `None` resolved for this mode.
+
+    The classes are passed in because the handler imports them lazily — the
+    CLI must not import the clusterer to print `--help`.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.seed_kmer import (
+        DEFAULT_MAX_CLUSTER_READ_FRAC,
+        DEFAULT_MIN_CHAIN_CLUSTER_READS,
+        DEFAULT_SEED_IDENTITY,
+        DEFAULT_SEED_MAX_3P,
+        DEFAULT_SEED_MAX_5P,
+    )
+
+    return EmParams(
+        seeding=seeding,
+        rounds=int(args.rounds),
+        stop_frac_changed=float(args.stop_frac_changed),
+        p_floor=float(args.p_floor),
+        minimap2_n=int(args.minimap2_n),
+        index_batch_size=str(args.index_batch_size),
+        estep_aligner=str(args.estep_aligner),
+        estep_shortlist_k=(
+            32 if args.estep_shortlist_k is None else int(args.estep_shortlist_k)
+        ),
+        estep_shortlist_frac=(
+            0.8
+            if args.estep_shortlist_frac is None
+            else float(args.estep_shortlist_frac)
+        ),
+        estep_align_workers=(
+            0 if args.estep_align_workers is None else int(args.estep_align_workers)
+        ),
+        estep_probes_per_read=(
+            32
+            if args.estep_probes_per_read is None
+            else int(args.estep_probes_per_read)
+        ),
+        p_floor_quality_scale=(
+            None
+            if args.p_floor_quality_scale is None
+            else float(args.p_floor_quality_scale)
+        ),
+        template_graph=(
+            "rounds" if args.template_graph is None else str(args.template_graph)
+        ),
+        graph=GraphParams(
+            identity_floor=(
+                0.99
+                if args.graph_identity_floor is None
+                else float(args.graph_identity_floor)
+            ),
+            tol_5p=(
+                30 if args.graph_5p_tolerance is None else int(args.graph_5p_tolerance)
+            ),
+            tol_3p=(
+                30 if args.graph_3p_tolerance is None else int(args.graph_3p_tolerance)
+            ),
+        ),
+        # ON unless asked otherwise: `--merge` is None when neither spelling
+        # was passed, and the default is to merge wherever there is a graph.
+        merge=(
+            args.template_graph != "off" if args.merge is None else bool(args.merge)
+        ),
+        merge_max_edits=(
+            2 if args.merge_max_edits is None else int(args.merge_max_edits)
+        ),
+        # None is "the graph's tolerance", resolved by EmParams.
+        merge_tol_5p=(
+            None if args.merge_5p_tolerance is None else int(args.merge_5p_tolerance)
+        ),
+        merge_tol_3p=(
+            None if args.merge_3p_tolerance is None else int(args.merge_3p_tolerance)
+        ),
+        merge_min_reads=(
+            0 if args.merge_min_reads is None else int(args.merge_min_reads)
+        ),
+        merge_siblings=bool(args.merge_siblings),
+        merge_from_round=(
+            1 if args.merge_from_round is None else int(args.merge_from_round)
+        ),
+        delta_logl=float(args.near_tie_delta_logl),
+        support_ratio=float(args.support_ratio),
+        near_tie_z=float(args.near_tie_z),
+        read_error_rate=float(args.read_error_rate),
+        # The protein-annotation floor on every node (MStepParams below), and
+        # under em-orf the SEEDING key as well. 30, not the parser's 60: at
+        # 60 there is no Prm1 (51 aa), the most abundant transcript in the
+        # tissue this pipeline was built for.
+        min_aa_length=(30 if args.min_aa_length is None else int(args.min_aa_length)),
+        seed_representative=str(args.seed_representative),
+        min_seed_reads=int(args.min_seed_reads),
+        # Per-mode defaults for the shared flags. The kmer gate's right
+        # answer (0.93 / inf:100) is not the --mode kmer gate's (0.98 /
+        # 30:30), so neither can be baked into the parser.
+        fold_identity=(
+            0.97 if args.fold_identity is None else float(args.fold_identity)
+        ),
+        seed_identity=(
+            DEFAULT_SEED_IDENTITY if args.identity is None else float(args.identity)
+        ),
+        seed_max_5p_overhang=(
+            DEFAULT_SEED_MAX_5P
+            if args.max_5p_overhang is None
+            else int(args.max_5p_overhang)
+        ),
+        seed_max_3p_overhang=(
+            DEFAULT_SEED_MAX_3P
+            if args.max_3p_overhang is None
+            else int(args.max_3p_overhang)
+        ),
+        seed_grouping=str(args.seed_grouping),
+        min_shared=int(args.min_shared),
+        diag_span_max=int(args.diag_span_max),
+        max_cluster_read_frac=(
+            DEFAULT_MAX_CLUSTER_READ_FRAC
+            if args.max_seed_cluster_frac is None
+            else float(args.max_seed_cluster_frac)
+        ),
+        min_chain_cluster_reads=(
+            DEFAULT_MIN_CHAIN_CLUSTER_READS
+            if args.min_chain_cluster_reads is None
+            else int(args.min_chain_cluster_reads)
+        ),
+        kmer=int(args.kmer),
+        window=int(args.window),
+        # 0 means uncapped, and the kernel spells that None — passing 0
+        # through literally caps every sketch at zero minimizers, so the
+        # graph has no edges and every read becomes its own template.
+        minimizers_per_seq=(
+            int(args.minimizers_per_seq)
+            if int(args.minimizers_per_seq) > 0
+            else None
+        ),
+        max_window_length=(
+            int(args.max_window_length) if args.max_window_length > 0 else None
+        ),
+        threads=int(args.threads),
+        mstep_workers=int(args.mstep_workers),
+        mstep=MStepParams(
+            # `min_aa_length` comes from EmParams, which sets it here itself.
+            # OFF unless asked for: the operating point of every bench
+            # result since 2026-09-23.
+            coverage_route=bool(args.coverage_route),
+            # rho defaults ON for the EM path's candidate-column test: at
+            # 1,525 reads a point binomial under a 1% null admits 1,924
+            # columns where rho=0.01 admits none. The shared flag's None
+            # default is resolved per mode for exactly this reason.
+            overdispersion=(
+                0.01 if args.overdispersion is None else float(args.overdispersion)
+            ),
+            max_members_per_template=int(args.max_members_per_template),
+        ),
+    )
+
+
 def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
     """Phase 3 — reference-free de novo first-round assembly.
 
@@ -3152,9 +4096,17 @@ def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
     paths = cluster_transcripts(
         demux_dir,
         output_dir=output_dir,
-        identity=float(args.identity),
-        max_5p_overhang=int(args.max_5p_overhang),
-        max_3p_overhang=int(args.max_3p_overhang),
+        identity=(0.98 if args.identity is None else float(args.identity)),
+        # The shared read-to-read gate: None means "this mode's default",
+        # which is 0.98 / 30:30 here and 0.93 / inf:100 under --mode em-kmer.
+        max_5p_overhang=(
+            30 if args.max_5p_overhang is None else int(args.max_5p_overhang)
+        ),
+        max_3p_overhang=(
+            30 if args.max_3p_overhang is None else int(args.max_3p_overhang)
+        ),
+        min_shared=int(args.min_shared),
+        diag_span_max=int(args.diag_span_max),
         kmer=int(args.kmer),
         window=int(args.window),
         minimizers_per_seq=(
@@ -3164,9 +4116,13 @@ def _cmd_transcriptome_cluster_denovo(args: argparse.Namespace) -> int:
         min_abundance=int(args.min_abundance),
         max_cluster_rounds=int(args.max_cluster_rounds),
         error_model=str(args.error_model),
-        overdispersion=float(args.overdispersion),
+        overdispersion=float(args.overdispersion or 0.0),
+        fold_insertions=bool(args.fold_insertions),
+        max_window_length=(
+            int(args.max_window_length) if args.max_window_length > 0 else None
+        ),
         predict_orfs=bool(args.predict_orfs),
-        min_aa_length=int(args.min_aa_length),
+        min_aa_length=(60 if args.min_aa_length is None else int(args.min_aa_length)),
         emit_cluster_detail=bool(args.emit_cluster_detail),
         detail_top_n=int(args.detail_top_n),
         emit_alignments=bool(args.emit_alignments),
@@ -5055,8 +6011,11 @@ def _cmd_reference_link(args: argparse.Namespace) -> int:
         try:
             os.symlink(src, dst)
         except OSError as exc:
-            # WSL/Windows fallback: write a session.toml stub instead of
-            # symlinks. Users edit the toml to drop in handles.
+            # WSL/Windows fallback: record the handle in a session.toml
+            # stub instead of symlinks. Nothing reads this file any more
+            # (the viz `Session.from_root` walker that did was removed in
+            # the reference-cache-first cutover), so the message below
+            # points the user at `--reference <handle>` instead.
             session_toml = target_root / "session.toml"
             session_toml.write_text(
                 f"schema_version = 1\n\n[reference]\nhandle = \"{args.handle}\"\n",
@@ -5064,8 +6023,9 @@ def _cmd_reference_link(args: argparse.Namespace) -> int:
             )
             print(
                 f"warning: symlink creation failed ({exc}); wrote "
-                f"{session_toml} as a fallback. The viz Session.from_root "
-                f"resolves handles via session.toml the same way.",
+                f"{session_toml} recording the handle instead. No "
+                f"constellation command reads that file — pass "
+                f"`--reference {args.handle}` to them directly.",
                 file=sys.stderr,
             )
             return 0

@@ -310,3 +310,154 @@ def test_patch_layout_preserves_existing_options_when_absent(
 
     r = client.get(f"/api/saved-sessions/{slug}")
     assert r.json()["options"] == {"clip_svg": True}
+
+
+# ----------------------------------------------------------------------
+# Modality discriminator
+# ----------------------------------------------------------------------
+
+
+def test_modality_is_written_and_defaults_to_genome(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CONSTELLATION_SESSIONS_HOME", str(tmp_path))
+    saved = write_saved(
+        label="A",
+        reference_handle="h1@x-1",
+        sources=[{"path": "/p", "kind": "align"}],
+    )
+    assert saved.modality == "genome"
+    assert 'modality = "genome"' in saved.path.read_text()  # type: ignore[union-attr]
+    assert read_saved(saved.slug).modality == "genome"
+
+
+def test_file_without_modality_reads_as_genome(tmp_path: Path, monkeypatch) -> None:
+    """Every saved session written before the key existed is a genome one,
+    and must keep opening."""
+    monkeypatch.setenv("CONSTELLATION_SESSIONS_HOME", str(tmp_path))
+    (tmp_path / "legacy.toml").write_text(
+        "schema_version = 2\n"
+        'label = "legacy"\n'
+        'reference_handle = "h1@x-1"\n'
+        'saved_at = "2026-05-22T00:00:00Z"\n'
+        "\n[[sources]]\n"
+        'path = "/p"\nkind = "align"\nlabel = "A"\n'
+    )
+    saved = read_saved("legacy")
+    assert saved.modality == "genome"
+    assert saved.reference_handle == "h1@x-1"
+
+
+def test_reference_handle_is_required_only_for_genome(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CONSTELLATION_SESSIONS_HOME", str(tmp_path))
+    with pytest.raises(ValueError, match="reference_handle"):
+        write_saved(label="g", sources=[{"path": "/p", "kind": "align"}])
+
+    saved = write_saved(
+        label="other",
+        modality="toy",
+        sources=[{"path": "/runs/a", "kind": "acquisition"}],
+    )
+    assert "reference_handle" not in saved.path.read_text()  # type: ignore[union-attr]
+    reloaded = read_saved(saved.slug)
+    assert reloaded.modality == "toy"
+    assert reloaded.reference_handle == ""
+    assert reloaded.sources[0]["kind"] == "acquisition"
+    assert [s.modality for s in list_saved()] == ["toy"]
+
+
+def test_patch_layout_preserves_modality(tmp_path: Path, monkeypatch) -> None:
+    """PATCH rewrites the whole file from typed fields, so a field that is
+    not threaded through is silently lost — a non-genome session would
+    come back as a genome one with no reference handle, and vanish from
+    the listing."""
+    app = _make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    saved = write_saved(
+        label="other",
+        modality="toy",
+        sources=[{"path": "/runs/a", "kind": "acquisition"}],
+    )
+    r = client.patch(
+        f"/api/saved-sessions/{saved.slug}/layout",
+        json={
+            "track_layout": [
+                {"source_id": "src-1", "kind": "toy_trace", "visible": False,
+                 "display_order": 0, "height_px": 90, "collapsed": False}
+            ]
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["modality"] == "toy"
+    reloaded = read_saved(saved.slug)
+    assert reloaded.modality == "toy"
+    assert reloaded.track_layout is not None
+    assert reloaded.track_layout[0]["visible"] is False
+    assert [s["slug"] for s in client.get("/api/saved-sessions").json()] == [saved.slug]
+
+
+def test_endpoint_validates_the_body_per_modality(tmp_path: Path, monkeypatch) -> None:
+    app = _make_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    sources = [{"path": "/p", "kind": "align", "label": "A"}]
+
+    # No modality named: a genome session, so reference_handle is required.
+    r = client.post("/api/saved-sessions", json={"label": "x", "sources": sources})
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["loc"] == ["body", "reference_handle"]
+
+    r = client.post(
+        "/api/saved-sessions",
+        json={"modality": "no_such", "label": "x", "sources": sources},
+    )
+    assert r.status_code == 400
+    assert "no_such" in r.json()["detail"]
+
+    r = client.post(
+        "/api/saved-sessions",
+        json={"modality": "genome", "label": "x", "reference_handle": "h@x-1",
+              "sources": sources},
+    )
+    assert r.status_code == 201
+    assert r.json()["modality"] == "genome"
+    assert client.get("/api/saved-sessions").json()[0]["modality"] == "genome"
+
+
+def test_viz_genome_refuses_a_saved_session_it_cannot_open(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """``viz genome --saved-session`` reports an unusable file and exits,
+    rather than opening another modality's session or dying on a
+    traceback."""
+    import argparse
+
+    from constellation.viz.cli import cmd_viz_genome
+
+    monkeypatch.setenv("CONSTELLATION_SESSIONS_HOME", str(tmp_path))
+    toy = write_saved(
+        label="other",
+        modality="toy",
+        sources=[{"path": "/runs/a", "kind": "acquisition"}],
+    )
+    (tmp_path / "future.toml").write_text('schema_version = 99\nlabel = "f"\n')
+
+    def run(slug: str) -> int:
+        return cmd_viz_genome(
+            argparse.Namespace(
+                saved_session=slug,
+                reference=None,
+                reference_dir=None,
+                align_dir=None,
+                cluster_dir=None,
+                label=None,
+                host="127.0.0.1",
+                port=0,
+                no_browser=True,
+                root=None,
+            )
+        )
+
+    assert run(toy.slug) == 2
+    assert "'toy' session" in capsys.readouterr().err
+    assert run("future") == 2
+    assert "schema_version=99" in capsys.readouterr().err
+    assert run("missing") == 2
+    assert "no saved session" in capsys.readouterr().err

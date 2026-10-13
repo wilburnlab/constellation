@@ -1,18 +1,23 @@
 """Saved-session endpoints — CRUD over ``~/.constellation/sessions/``.
 
-Saved sessions persist a reference handle + ordered list of data
-sources so the dashboard can restore a configuration in one click.
-These endpoints don't open the session — the form re-POSTs through
-``/api/sessions/open`` after the user clicks ``Open`` so the
+A saved session persists one browser configuration — its modality, the
+ordered list of data sources, and whatever anchors them (a reference
+handle for the genome browser) — so the dashboard can restore it in one
+click. These endpoints don't open the session — the form re-POSTs
+through ``/api/sessions/open`` after the user clicks ``Open`` so the
 endpoint contract stays small.
 """
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel
+
+from constellation.viz.modalities import DEFAULT_MODALITY, get_modality
+from constellation.viz.server.validation import validate
 
 
 router = APIRouter(prefix="/api/saved-sessions", tags=["saved-sessions"])
@@ -21,6 +26,7 @@ router = APIRouter(prefix="/api/saved-sessions", tags=["saved-sessions"])
 def _summarize(saved) -> dict[str, Any]:
     return {
         "slug": saved.slug,
+        "modality": saved.modality,
         "label": saved.label,
         "reference_handle": saved.reference_handle,
         "n_sources": len(saved.sources),
@@ -58,31 +64,35 @@ def get_saved(slug: str) -> dict[str, Any]:
     return payload
 
 
-class SaveRequest(BaseModel):
-    label: str
-    reference_handle: str
-    sources: list[dict[str, Any]]
-    last_viewed_locus: dict[str, Any] | None = None
-    track_layout: list[dict[str, Any]] | None = None
-    options: dict[str, Any] | None = None
-    slug: str | None = None
-
-
 @router.post("", status_code=201)
-def save_session_endpoint(body: SaveRequest) -> dict[str, Any]:
+def save_session_endpoint(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Persist a saved session. Pass an explicit ``slug`` to overwrite an
-    existing entry; otherwise a fresh slug is derived."""
+    existing entry; otherwise a fresh slug is derived.
+
+    ``body["modality"]`` (default ``"genome"``) selects the modality,
+    whose ``save_request`` model the body is validated against — so the
+    fields a configuration must carry (a ``reference_handle`` for the
+    genome browser) are that modality's to require.
+    """
     from constellation.viz.sessions import write_saved
+
+    name = str(body.get("modality") or DEFAULT_MODALITY)
+    try:
+        modality = get_modality(name)
+    except KeyError as exc:
+        raise HTTPException(400, str(exc.args[0])) from exc
+    fields = asdict(validate(modality.save_request, body, where="body"))
 
     try:
         saved = write_saved(
-            label=body.label,
-            reference_handle=body.reference_handle,
-            sources=body.sources,
-            last_viewed_locus=body.last_viewed_locus,
-            track_layout=body.track_layout,
-            options=body.options,
-            slug=body.slug,
+            modality=name,
+            label=fields["label"],
+            reference_handle=fields.get("reference_handle") or "",
+            sources=fields["sources"],
+            last_viewed_locus=fields.get("last_viewed_locus"),
+            track_layout=fields.get("track_layout"),
+            options=fields.get("options"),
+            slug=fields.get("slug"),
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -122,7 +132,10 @@ def patch_saved_layout(slug: str, body: LayoutPatchRequest) -> dict[str, Any]:
         else (dict(existing.options) if existing.options else None)
     )
     try:
+        # The file is rewritten whole: every field of ``existing`` has to
+        # be passed back or it is lost.
         saved = write_saved(
+            modality=existing.modality,
             label=existing.label,
             reference_handle=existing.reference_handle,
             sources=existing.sources,

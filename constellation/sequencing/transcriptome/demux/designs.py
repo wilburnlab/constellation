@@ -40,11 +40,13 @@ from constellation.sequencing.transcriptome.demux.adapters import (
 # Defaults matching NanoporeAnalysis's hard-threshold parity settings
 # ──────────────────────────────────────────────────────────────────────
 
-# These match `NanoporeAnalysis/align.py` constants byte-for-byte —
-# changing them breaks parity validation.
+# These match `NanoporeAnalysis/align.py` constants, except the polyA
+# edge distance: upstream's merge compared run *ends*, so its `1` bridged
+# no gap at all; under the corrected gap semantics (`scoring._merge_runs`)
+# `2` bridges a tail interrupted by one or two miscalls.
 _POLYA_MIN_LEN: Final = 15
 _POLYA_MAX_LEN: Final = 40
-_POLYA_EDGE_DISTANCE: Final = 1
+_POLYA_EDGE_DISTANCE: Final = 2
 _ADAPTER_MAX_DISTANCE: Final = 2
 _BARCODE_MAX_DISTANCE: Final = 2
 _TRANSCRIPT_MIN_LEN: Final = 200

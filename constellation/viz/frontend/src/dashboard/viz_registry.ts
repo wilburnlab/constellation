@@ -13,14 +13,11 @@
 // Adding a second viz tool (spectrum viewer, structure browser, etc.)
 // is one entry; no introspect or schema changes required.
 
-import { GenomeBrowserForm } from './GenomeBrowserForm';
+import { GenomeBrowserForm } from '../modalities/genome/GenomeBrowserForm';
+import type { OpenSessionResult, SavedSessionSummary } from '../modalities/genome/types';
+import type { LayoutEntry } from '../panels/layout';
 import { DashboardState } from './state';
-import type {
-  CommandSchema,
-  OpenSessionResult,
-  SavedSessionSummary,
-  TrackLayoutEntry,
-} from './types';
+import type { CommandSchema } from './types';
 
 export type VizFieldKind = 'path' | 'dir' | 'file' | 'text';
 
@@ -88,10 +85,10 @@ const VIZ_DESCRIPTORS: VizDescriptor[] = [
         async onSubmit(
           result: OpenSessionResult,
           _saved: SavedSessionSummary | null,
-          initialLayout: TrackLayoutEntry[] | null,
+          initialLayout: LayoutEntry[] | null,
         ) {
           await ctx.transitionToWidget(async (widgetHost) => {
-            const { GenomeBrowser } = await import('../widgets/GenomeBrowser');
+            const { GenomeBrowser } = await import('../modalities/genome/GenomeBrowser');
             widgetHost.innerHTML = '';
             const browser = new GenomeBrowser({
               host: widgetHost,

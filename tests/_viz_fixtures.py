@@ -1,7 +1,7 @@
 """Shared test helpers for the reference-cache-first viz layer.
 
 Builds an end-to-end Session backed by a fake reference cache + one or
-more `transcriptome align` / `cluster` output dirs with schema-v2
+more `transcriptome align` / `cluster` output dirs with current-schema
 manifests. Used by `tests/test_viz_session.py`, the kernel tests, and
 the server endpoint tests.
 
@@ -38,7 +38,10 @@ from constellation.sequencing.transcriptome.manifest import (
     write_align_manifest,
     write_cluster_manifest,
 )
-from constellation.viz.server.session import Session
+from constellation.viz.modalities.genome.session import (
+    GenomeSession as Session,
+)
+from constellation.viz.tracks.base import TrackQuery, get_kernel
 
 
 DEFAULT_HANDLE = "test_org@local_import-20260522"
@@ -58,6 +61,37 @@ _DEFAULT_CONTIGS: list[dict[str, Any]] = [
 _DEFAULT_SEQUENCES: list[dict[str, Any]] = [
     {"contig_id": 1, "sequence": "ACGTACGTACGTACGT" * 10}
 ]
+
+
+def kernel_query(
+    kind: str, *, cluster_view: str | None = None, **fields: Any
+) -> TrackQuery:
+    """Build the query the ``kind`` kernel takes.
+
+    Tests construct queries through this rather than naming the query
+    type, so that type can become kernel-specific without touching every
+    test. ``cluster_view`` selects cluster_pileup's view.
+    """
+    if cluster_view is not None:
+        fields["cluster_view"] = cluster_view
+    return get_kernel(kind).query_model(**fields)
+
+
+def open_session(
+    *,
+    sources: list[dict[str, Any]],
+    reference_handle: str = "",
+    label: str | None = None,
+) -> Session:
+    """Open a genome session against the (monkeypatched) reference cache.
+
+    The one place tests name the session constructor.
+    """
+    return Session.open(
+        reference_handle=reference_handle or DEFAULT_HANDLE,
+        sources=sources,
+        label=label,
+    )
 
 
 def install_fake_reference(
@@ -130,7 +164,7 @@ def write_align_source(
     derived_annotation_features: list[dict[str, Any]] | None = None,
     samples: list[str] | None = None,
 ) -> Path:
-    """Write a `transcriptome align` source dir with a v4 manifest.
+    """Write a `transcriptome align` source dir with a manifest.
 
     Each ``*`` kwarg, when non-None, writes the corresponding artifact
     and records it in the manifest's ``outputs`` map. Missing artifacts
@@ -217,7 +251,13 @@ def write_cluster_source(
     clusters: list[dict[str, Any]] | None = None,
     cluster_membership: list[dict[str, Any]] | None = None,
     samples: list[str] | None = None,
+    align_dir: str = "",
 ) -> Path:
+    """Write a `transcriptome cluster` source dir with a manifest.
+
+    ``align_dir`` is the manifest's back-reference to the upstream align
+    run; set it to expose the cluster_pileup members view.
+    """
     source_dir.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, str] = {}
     if clusters is not None:
@@ -239,7 +279,7 @@ def write_cluster_source(
         reference_handle=reference_handle,
         reference_path=reference_path,
         assembly_accession=assembly_accession,
-        align_dir="",
+        align_dir=align_dir,
         demux_dir="",
         parameters={},
         stages={},
@@ -308,7 +348,7 @@ def build_viz_session(
                 {"path": str(src_dir), "kind": "cluster", "label": label_arg or f"cluster-{i}"}
             )
 
-    return Session.open(
+    return open_session(
         reference_handle=handle,
         sources=sources_payload,
         label=label,
