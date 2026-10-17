@@ -63,11 +63,14 @@ def build_result_library(
     *,
     decoy_peptides: Sequence[tuple[str, str]] = (),
     metadata: dict[str, str] | None = None,
+    source: str = SOURCE_FILE,
 ) -> Path:
     """Write ``entries`` as a single-run search result (``.elib``).
 
     ``decoy_peptides`` are ``(sequence, accession)`` pairs written to
-    ``peptidetoprotein`` and the score tables as decoys.
+    ``peptidetoprotein`` and the score tables as decoys. ``source`` is
+    the run the decoy and protein score rows name (each entry names its
+    own).
     """
     con = sqlite3.connect(path)
     con.executescript(result_library_ddl())
@@ -142,17 +145,17 @@ def build_result_library(
         links.add((sequence, 1, accession))
         con.execute(
             "INSERT INTO peptidescores VALUES (2,?,?,?,0.5,0.5,1)",
-            (sequence, sequence, SOURCE_FILE),
+            (sequence, sequence, source),
         )
         con.execute(
             "INSERT INTO proteinscores VALUES (?,?,?,0.5,0.5,1)",
-            (len(proteins) + 1000, accession, SOURCE_FILE),
+            (len(proteins) + 1000, accession, source),
         )
     con.executemany("INSERT INTO peptidetoprotein VALUES (?,?,?)", sorted(links))
     for group, accession in enumerate(sorted(proteins)):
         con.execute(
             "INSERT INTO proteinscores VALUES (?,?,?,0.001,0.001,0)",
-            (group, accession, SOURCE_FILE),
+            (group, accession, source),
         )
     con.commit()
     con.close()

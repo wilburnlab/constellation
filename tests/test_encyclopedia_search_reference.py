@@ -9,8 +9,9 @@ path can be rewritten later against a fixed target.
 
 Set all of::
 
-    CONSTELLATION_SEARCH_REFERENCE_INPUT    the file to search (.dia or .raw), in a
-                                            directory the jar may write beside
+    CONSTELLATION_SEARCH_REFERENCE_INPUT    the acquisition to search: a converted
+                                            bundle, a Thermo .raw, or a single-run
+                                            EncyclopeDIA spectra file
     CONSTELLATION_SEARCH_REFERENCE_LIBRARY  the library it was searched against
     CONSTELLATION_SEARCH_REFERENCE_FASTA    the FASTA
     CONSTELLATION_SEARCH_REFERENCE_RESULT   the result library to reproduce
@@ -29,7 +30,11 @@ from pathlib import Path
 
 import pytest
 
+from constellation.core.manifests import read_manifest
 from constellation.massspec.io.encyclopedia import compare_results
+from constellation.massspec.io.encyclopedia._mirror import count_rows, open_library
+from constellation.massspec.manifest import SearchManifest
+from constellation.massspec.workflows.encyclopedia import read_experiment_table
 
 _ENV = {
     name: os.environ.get(f"CONSTELLATION_SEARCH_REFERENCE_{name}")
@@ -49,24 +54,25 @@ MIN_OVERLAP = 0.999
 def test_search_reproduces_the_reference_result(tmp_path: Path) -> None:
     from constellation.cli.__main__ import main
 
-    out = tmp_path / "out"
+    experiment = tmp_path / "experiment"
     argv = [
         "massspec",
         "search",
-        "--mzml",
+        "--input",
         _ENV["INPUT"],
         "--library",
         _ENV["LIBRARY"],
         "--fasta",
         _ENV["FASTA"],
         "--output-dir",
-        str(out),
-        "--no-ingest",
+        str(experiment),
         "--no-progress",
         *shlex.split(os.environ.get("CONSTELLATION_SEARCH_REFERENCE_ARGS", "")),
     ]
-    assert main(argv) == 0, f"search failed; see {out / 'logs'}"
-    (result,) = out.glob("*.elib")
+    assert main(argv) == 0, f"search failed; see {experiment / 'units'}"
+    (unit,) = (experiment / "units").iterdir()
+    manifest = read_manifest(unit, expect=SearchManifest)
+    result = unit / manifest.outputs["result_library"]
 
     comparison = compare_results(_ENV["RESULT"], result)
     report = comparison.report()
@@ -75,3 +81,19 @@ def test_search_reproduces_the_reference_result(tmp_path: Path) -> None:
     # What both runs identified, they place and quantify identically.
     assert comparison.rt_abs_s["max"] < 1e-6, report
     assert comparison.intensity["frac_within_1pct"] == 1.0, report
+
+    # And the tables hold what the result library holds: every precursor,
+    # every quantity, every score row, bound to the one acquisition.
+    con = open_library(result)
+    try:
+        stored = {name: count_rows(con, name) for name in ("entries", "peptidequants", "peptidescores")}
+        total = con.execute("SELECT SUM(TotalIntensity) FROM peptidequants").fetchone()[0]
+    finally:
+        con.close()
+    quant = read_experiment_table(experiment, "precursor_quant")
+    assert read_experiment_table(experiment, "precursor").num_rows == stored["entries"]
+    assert quant.num_rows == stored["peptidequants"]
+    assert read_experiment_table(experiment, "precursor_score").num_rows == stored["peptidescores"]
+    assert sum(quant.column("intensity").to_pylist()) == pytest.approx(total, rel=1e-9)
+    assert set(quant.column("acquisition_id").to_pylist()) == set(manifest.acquisition_ids)
+    assert manifest.caveats == []

@@ -110,37 +110,41 @@ def test_pass_through_arguments_decide_the_build(affected_kernel) -> None:
 def test_search_refuses_before_starting_the_jar(
     affected_kernel, monkeypatch, tmp_path: Path, capsys
 ) -> None:
-    """``massspec search`` stops at the pre-flight: no JVM, no output files."""
-    import constellation.massspec.search.encyclopedia as enc
+    """``massspec search`` stops at the pre-flight: no JVM, no spectra
+    file written, no unit directory."""
+    import types
+
     from constellation.cli.__main__ import main
-    from constellation.thirdparty import registry
+    from constellation.massspec.workflows import encyclopedia as workflow
 
-    spec = next(s for s in registry.registered() if s.name == "encyclopedia")
-    handle = registry.ToolHandle(spec, tmp_path / "encyclopedia-6.9.23.jar", "env", "6.9.23")
-    monkeypatch.setattr(registry, "find", lambda name: handle)
+    from test_massspec_search_workflow import _bundle
 
-    def _must_not_run(**_kwargs):
+    def _must_not_run(*_args, **_kwargs):
         raise AssertionError("the jar was started despite the Percolator pre-flight")
 
-    monkeypatch.setattr(enc, "run_library_search", _must_not_run)
+    monkeypatch.setattr(workflow, "run_program", _must_not_run)
+    monkeypatch.setattr(workflow, "resolve_jar", lambda: types.SimpleNamespace(version="6.9.23"))
 
-    for name in ("run.dia", "lib.dlib", "db.fasta"):
+    bundle = _bundle(tmp_path, "run")
+    for name in ("lib.dlib", "db.fasta"):
         (tmp_path / name).touch()
     argv = [
         "massspec",
         "search",
-        "--mzml",
-        str(tmp_path / "run.dia"),
+        "--input",
+        str(bundle),
         "--library",
         str(tmp_path / "lib.dlib"),
         "--fasta",
         str(tmp_path / "db.fasta"),
         "--output-dir",
         str(tmp_path / "out"),
+        "--no-progress",
     ]
     assert main(argv) == 1
     err = capsys.readouterr().err
     assert "bundled Percolator 3.01 cannot run on this kernel" in err
+    assert not (tmp_path / "out" / "units").exists()
 
     # Choosing a build that runs here gets past the pre-flight.
     with pytest.raises(AssertionError, match="the jar was started"):

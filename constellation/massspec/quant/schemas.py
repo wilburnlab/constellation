@@ -64,6 +64,14 @@ PRECURSOR_QUANT: pa.Schema = pa.schema(
         pa.field("rt_observed", pa.float64(), nullable=False),
         pa.field("ccs_observed", pa.float64(), nullable=False),
         pa.field("score", pa.float64(), nullable=True),
+        # The retention-time window the intensity was integrated over
+        # (seconds) and the number of ions it was summed from. Null when
+        # the source does not say. ``n_quant_ions`` of 0 with intensity 0
+        # is "identified, not quantified", which is different from "not
+        # reported" and worth keeping apart.
+        pa.field("rt_start", pa.float64(), nullable=True),
+        pa.field("rt_end", pa.float64(), nullable=True),
+        pa.field("n_quant_ions", pa.int32(), nullable=True),
     ],
     metadata={b"schema_name": b"PrecursorQuant"},
 )

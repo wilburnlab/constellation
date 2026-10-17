@@ -54,6 +54,7 @@ import constellation.massspec
 import constellation.massspec.acquisition_structure
 import constellation.massspec.acquisitions
 import constellation.massspec.manifest
+import constellation.massspec.experiment
 import constellation.massspec.annotation
 import constellation.massspec.annotation.mzpaf
 import constellation.massspec.annotation.usi
@@ -108,8 +109,13 @@ import constellation.massspec.search.encyclopedia.cli_spec
 import constellation.massspec.search.novel
 import constellation.massspec.search.encyclopedia.library_export
 import constellation.massspec.search.encyclopedia.library_search
+import constellation.massspec.search.encyclopedia.outputs
+import constellation.massspec.search.encyclopedia.params
 import constellation.massspec.search.encyclopedia.percolator
 import constellation.massspec.search.encyclopedia.predict_library
+import constellation.massspec.search.encyclopedia.runner
+import constellation.massspec.workflows
+import constellation.massspec.workflows.encyclopedia
 import constellation.massspec.search.encyclopedia.process_dia
 import constellation.massspec.search.io
 import constellation.massspec.search.schemas

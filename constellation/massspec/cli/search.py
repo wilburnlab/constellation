@@ -1,17 +1,16 @@
-"""``constellation massspec search``: EncyclopeDIA library search of one acquisition."""
+"""``constellation massspec search``: EncyclopeDIA search of one acquisition."""
 
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from constellation.massspec.cli._common import (
     _add_encyclopedia_passthrough_arg,
     _add_jvm_args,
-    _add_output_dir_arg,
     _add_tolerance_args,
     _format_tolerance_summary,
-    _report_ingest_caveats,
     _resolve_tolerance_args,
 )
 
@@ -23,32 +22,96 @@ def _build_search_parser(subs: argparse._SubParsersAction) -> None:
     p = subs.add_parser(
         "search",
         help=(
-            "DIA library search via EncyclopeDIA. Runs the jar on one "
-            "input file against a .dlib/.elib library and writes the "
-            "result .elib; auto-ingests into Library/Quant/Search "
-            "ParquetDir bundles in the run dir."
+            "Search one acquisition with EncyclopeDIA and write the result as an "
+            "experiment directory: the spectra file Constellation wrote, the "
+            "search's own directory with the jar's outputs, and the "
+            "identifications, quantities and scores as Parquet tables. Takes a "
+            "converted bundle, a Thermo .raw (converted first) or an EncyclopeDIA "
+            "spectra file (.dia)."
         ),
     )
-    _add_input_args_for_search(p)
-    _add_output_dir_arg(p)
+    p.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        help=(
+            "the acquisition: a `massspec convert` bundle directory, a Thermo .raw "
+            "file, or an EncyclopeDIA spectra file (.dia, single run). mzML and "
+            "Bruker .d are not supported yet."
+        ),
+    )
+    p.add_argument(
+        "--library",
+        type=Path,
+        default=None,
+        help=(
+            "spectral library (.dlib, or an .elib chromatogram library). Required "
+            "for a peptide-centric search."
+        ),
+    )
+    p.add_argument(
+        "--fasta",
+        required=True,
+        type=Path,
+        help=(
+            "background proteome FASTA; EncyclopeDIA refuses to start without one. "
+            "Use the FASTA the library was built from."
+        ),
+    )
+    p.add_argument(
+        "--output-dir",
+        required=True,
+        type=Path,
+        help=(
+            "experiment directory. Holds manifest.json, acquisitions/, "
+            "spectra/<run>/ (the spectra file, written once per acquisition), "
+            "units/<run>-<digest>/ (this search's own directory: a link to the "
+            "spectra file with the jar's outputs beside it as <run>.dia.elib "
+            "etc., logs, a manifest, _SUCCESS) and "
+            "tables/<table>/unit=<run>-<digest>/acquisition_id=<id>/. The digest "
+            "is of the library, FASTA, settings and jar version, so an existing "
+            "experiment gains a directory for every new search, of a new "
+            "acquisition or of one searched before, and nothing in it is "
+            "replaced. Anything that is not an experiment must be new or empty."
+        ),
+    )
+    p.add_argument(
+        "--search-mode",
+        choices=["peptide-centric", "spectrum-centric"],
+        default=None,
+        help=(
+            "which engine. peptide-centric is the original EncyclopeDIA search "
+            "(DIA data, needs a library); spectrum-centric is ScribeTwo (DDA or "
+            "DIA, library optional; not available here yet). Default: what suits "
+            "the data, which Constellation infers from the acquisition."
+        ),
+    )
+    p.add_argument(
+        "--search-type",
+        choices=["auto", "dia", "dda", "dda-chimeric"],
+        default=None,
+        help="spectrum-centric only: ScribeTwo's -searchType. Default: auto.",
+    )
     p.add_argument(
         "--resume",
         action="store_true",
-        help="skip the jar invocation if <output-dir>/_SUCCESS exists",
+        help=(
+            "return at once if this very search (same acquisition, library, FASTA, "
+            "settings and jar) is already in the experiment. Without this flag it "
+            "is run again in its own directory. A search that differs in anything "
+            "has a directory of its own either way."
+        ),
     )
     p.add_argument(
-        "--no-ingest",
+        "--no-fragments",
         action="store_true",
-        help=(
-            "skip the read_encyclopedia(...) → ParquetDir auto-ingest "
-            "after the jar exits"
-        ),
+        help="do not write the fragment table (one row per stored peak)",
     )
     _add_tolerance_args(p)
     p.add_argument(
         "--acquisition",
         default=None,
-        help="EncyclopeDIA -acquisition (DIA / DDA). Default: jar default (DIA).",
+        help="EncyclopeDIA -acquisition. Default: the jar's (DIA).",
     )
     p.add_argument(
         "--enzyme",
@@ -87,10 +150,22 @@ def _build_search_parser(subs: argparse._SubParsersAction) -> None:
         "--threads",
         type=int,
         default=None,
-        help="EncyclopeDIA -numberOfThreadsUsed. Default: jar default (20).",
+        help="EncyclopeDIA -numberOfThreadsUsed. Default: the jar's (all cores).",
     )
     _add_jvm_args(p)
     _add_encyclopedia_passthrough_arg(p)
+    p.add_argument(
+        "--allow-undocumented",
+        action="append",
+        default=[],
+        metavar="FLAG",
+        help=(
+            "let --encyclopedia-arg carry this flag although the jar's help does "
+            "not list it (the jar accepts some parameters it does not print). "
+            "Repeatable. Every other flag is checked against the pinned jar's help "
+            "before Java starts."
+        ),
+    )
     p.add_argument(
         "--no-progress",
         action="store_true",
@@ -99,339 +174,124 @@ def _build_search_parser(subs: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_massspec_search)
 
 
-def _add_input_args_for_search(p: argparse.ArgumentParser) -> None:
-    p.add_argument(
-        "--mzml",
-        required=True,
-        type=Path,
-        help=(
-            "input mass-spec acquisition file (.mzML, .dia, .raw, or .d "
-            "— vendor-native ingest via the bundled MSRawJava in "
-            "EncyclopeDIA 6.5.15)"
-        ),
-    )
-    p.add_argument(
-        "--library",
-        required=True,
-        type=Path,
-        help=(
-            "spectral library (.dlib chromatogram-free or .elib "
-            "chromatogram-library)"
-        ),
-    )
-    p.add_argument(
-        "--fasta",
-        required=True,
-        type=Path,
-        help=(
-            "background proteome FASTA. REQUIRED — EncyclopeDIA 6.5.15's "
-            "default search refuses to start without -f ('You are "
-            "required to specify an input file (-i), a library file (-l), "
-            "and a fasta file (-f)'), even when the library already "
-            "carries decoys. Older versions treated it as optional. Use "
-            "the same FASTA the library was built from."
-        ),
-    )
+def _passthrough_flags(items: list[str] | None) -> dict[str, str]:
+    """``--encyclopedia-arg -flag=value`` entries as a flag mapping."""
+    out: dict[str, str] = {}
+    for raw in items or []:
+        flag, sep, value = raw.partition("=")
+        if not sep:
+            raise ValueError(
+                f"--encyclopedia-arg {raw!r}: write it as -flag=value (an empty value is "
+                f"`-flag=`); EncyclopeDIA has no bare flags"
+            )
+        if flag in out:
+            raise ValueError(f"--encyclopedia-arg sets {flag} twice")
+        out[flag] = value
+    return out
 
 
-def _cmd_massspec_search(args: argparse.Namespace) -> int:
-    """DIA library search via EncyclopeDIA's default mode.
+def _search_parameters(args: argparse.Namespace):
+    """The command's settings as :class:`SearchParameters`."""
+    from constellation.massspec.search.encyclopedia.params import SearchParameters, Tolerance
 
-    Runs the jar against an input acquisition (mzML/.dia/.raw/.d) and
-    a library (.dlib/.elib), then optionally auto-ingests the produced
-    chromatogram .elib into Library/Quant/Search ParquetDir bundles.
+    resolved = _resolve_tolerance_args(args)
 
-    EncyclopeDIA's default search writes its chromatogram .elib
-    alongside the input file as ``<input>.elib`` (a side effect we
-    can't redirect via -o, which controls only the .encyclopedia.txt
-    report). The handler locates the .elib post-run, ingests it, and
-    writes the manifest + _SUCCESS to ``--output-dir``.
-    """
-    import sys as _sys
+    def tolerance(stem: str):
+        value = resolved.get(f"{stem}_tolerance")
+        return None if value is None else Tolerance(float(value), str(resolved[f"{stem}_tolerance_unit"]))
 
-    from constellation import __version__ as constellation_version
-    from constellation.massspec.io.encyclopedia import read_encyclopedia
-    from constellation.massspec.library import save_library
-    from constellation.massspec.quant.io import save_quant
-    from constellation.massspec.search.encyclopedia import (
-        build_manifest_envelope,
-        encyclopedia_passthrough_args,
-        find_search_elib,
-        require_min_encyclopedia,
-        run_library_search,
-        write_manifest,
-    )
-    from constellation.massspec.search.encyclopedia.percolator import percolator_blocker
-    from constellation.massspec.search.io import save_search
-    from constellation.thirdparty.jvm import JvmRunError
-    from constellation.thirdparty.registry import ToolNotFoundError, find
-
-    input_file = Path(args.mzml).resolve()
-    library = Path(args.library).resolve()
-    fasta = Path(args.fasta).resolve() if args.fasta is not None else None
-    output_dir = Path(args.output_dir).resolve()
-
-    if not input_file.is_file():
-        print(f"error: --mzml not found: {input_file}", file=_sys.stderr)
-        return 1
-    if not library.is_file():
-        print(f"error: --library not found: {library}", file=_sys.stderr)
-        return 1
-    if fasta is not None and not fasta.is_file():
-        print(f"error: --fasta not found: {fasta}", file=_sys.stderr)
-        return 1
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    success_path = output_dir / "_SUCCESS"
-    if success_path.exists() and not args.resume:
-        print(
-            f"error: --output-dir already complete (touch _SUCCESS exists). "
-            f"Pass --resume to re-use it, or delete {output_dir} to start "
-            f"fresh.",
-            file=_sys.stderr,
-        )
-        return 1
-    if success_path.exists() and args.resume:
-        print(f"already complete: {output_dir}")
-        return 0
-
-    try:
-        handle = find("encyclopedia")
-    except ToolNotFoundError as exc:
-        print(f"error: {exc}", file=_sys.stderr)
-        return 1
-    if require_min_encyclopedia(handle):
-        return 1
-
-    extra_args = encyclopedia_passthrough_args(args.encyclopedia_arg)
-
-    # The jar runs Percolator only after scoring the whole run; find out
-    # now whether the selected build can start on this kernel.
-    blocker = percolator_blocker(args.percolator_version, extra_args)
-    if blocker is not None:
-        print(f"error: {blocker}", file=_sys.stderr)
-        return 1
-
-    try:
-        tolerances = _resolve_tolerance_args(args)
-    except ValueError as exc:
-        print(f"error: {exc}", file=_sys.stderr)
-        return 1
-    print(_format_tolerance_summary(tolerances), file=_sys.stderr)
-
-    # Report file lands in output_dir; the .elib itself lands beside the input
-    # (EncyclopeDIA convention — not redirectable via -o for default search).
-    report_path = output_dir / f"{input_file.stem}.encyclopedia.txt"
-
-    try:
-        result = run_library_search(
-            input_file=input_file,
-            library=library,
-            fasta=fasta,
-            report_output=report_path,
-            output_dir=output_dir,
-            **tolerances,
-            acquisition=args.acquisition,
+    extra = _passthrough_flags(args.encyclopedia_arg)
+    if args.acquisition is not None:
+        if "-acquisition" in extra:
+            raise ValueError("-acquisition is set both by --acquisition and by --encyclopedia-arg")
+        extra["-acquisition"] = args.acquisition
+    return (
+        SearchParameters(
+            precursor_tolerance=tolerance("precursor"),
+            fragment_tolerance=tolerance("fragment"),
+            library_fragment_tolerance=tolerance("library_fragment"),
             enzyme=args.enzyme,
             fragmentation=args.fragmentation,
             percolator_version=args.percolator_version,
             percolator_threshold=args.percolator_threshold,
             percolator_protein_threshold=args.percolator_protein_threshold,
             threads=args.threads,
+            extra=extra,
+        ),
+        resolved,
+    )
+
+
+def _cmd_massspec_search(args: argparse.Namespace) -> int:
+    """Search one acquisition (see ``massspec.workflows.encyclopedia``).
+
+    Exit status: 0 done (or already done, with ``--resume``); 1 the
+    search could not be started as asked (the message says why, and
+    nothing was run); 2 the jar finished without its result library;
+    otherwise the jar's own non-zero status.
+    """
+    from constellation.core.manifests import ManifestError
+    from constellation.massspec.io.encyclopedia._mirror import MirrorError
+    from constellation.massspec.search.encyclopedia.outputs import MissingOutputError
+    from constellation.massspec.search.encyclopedia.runner import UnsupportedVersionError
+    from constellation.massspec.workflows.encyclopedia import search_acquisition
+    from constellation.thirdparty.jvm import JvmRunError
+    from constellation.thirdparty.registry import ToolNotFoundError
+
+    try:
+        parameters, tolerances = _search_parameters(args)
+        print(_format_tolerance_summary(tolerances), file=sys.stderr)
+        result = search_acquisition(
+            args.input,
+            experiment_dir=args.output_dir,
+            fasta=args.fasta,
+            library=args.library,
+            parameters=parameters,
+            search_mode=args.search_mode,
+            search_type=args.search_type,
+            allow_undocumented=tuple(args.allow_undocumented),
             jvm_heap_max=args.jvm_heap_max,
             jvm_heap_min=args.jvm_heap_min,
             jvm_tmpdir=args.jvm_tmpdir,
-            extra_args=extra_args,
+            annotate_fragments=not args.no_fragments,
+            resume=args.resume,
             stream_to_stderr=not args.no_progress,
         )
     except JvmRunError as exc:
-        print(f"error: encyclopedia jar exited {exc.returncode}", file=_sys.stderr)
-        print(f"  see {exc.stderr_log} for the full log", file=_sys.stderr)
-        return exc.returncode
-
-    # Locate the .elib. 6.5.15 writes <input_stem>.elib to the runner's
-    # cwd (i.e. output_dir); older versions wrote it next to the input.
-    elib_path = find_search_elib(input_file, cwd=output_dir)
-    if elib_path is None:
-        print(
-            f"error: encyclopedia exited 0 but no .elib was found in "
-            f"{output_dir} or next to the input at {input_file.parent}; "
-            f"check {result.stderr_log}",
-            file=_sys.stderr,
-        )
+        print(f"error: encyclopedia jar exited {exc.returncode}", file=sys.stderr)
+        print(f"  see {exc.stderr_log} for the full log", file=sys.stderr)
+        return exc.returncode or 1
+    except MissingOutputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
+    except (ValueError, KeyError, FileNotFoundError, ToolNotFoundError, UnsupportedVersionError,
+            ManifestError, MirrorError) as exc:
+        message = exc.args[0] if isinstance(exc, KeyError) and exc.args else exc
+        print(f"error: {message}", file=sys.stderr)
+        return 1
 
-    # ── auto-ingest ─────────────────────────────────────────────────
-    ingest_info: dict[str, object] = {"skipped": bool(args.no_ingest)}
-    library_pqdir: Path | None = None
-    quant_pqdir: Path | None = None
-    search_pqdir: Path | None = None
-    if not args.no_ingest:
-        try:
-            ingest_result = read_encyclopedia(elib_path)
-        except Exception as exc:  # noqa: BLE001
-            ingest_info["error"] = f"{type(exc).__name__}: {exc}"
-            _write_manifest_for_search(
-                args=args,
-                input_file=input_file,
-                library=library,
-                fasta=fasta,
-                report_path=report_path,
-                elib_path=elib_path,
-                output_dir=output_dir,
-                result=result,
-                handle=handle,
-                ingest_info=ingest_info,
-                library_pqdir=None,
-                quant_pqdir=None,
-                search_pqdir=None,
-                extra_args=extra_args,
-                tolerances=tolerances,
-                build_manifest_envelope=build_manifest_envelope,
-                write_manifest=write_manifest,
-                constellation_version=constellation_version,
-            )
-            print(
-                f"error: search produced {elib_path} but auto-ingest "
-                f"failed: {exc}. Manifest written; pass --no-ingest to "
-                f"retry without ingest.",
-                file=_sys.stderr,
-            )
-            return 3
-
-        library_pqdir = output_dir / "library_pqdir"
-        save_library(ingest_result.library, library_pqdir, format="parquet_dir")
-        ingest_counts: dict[str, object] = {
-            "library": {
-                "proteins": ingest_result.library.proteins.num_rows,
-                "peptides": ingest_result.library.peptides.num_rows,
-                "precursors": ingest_result.library.precursors.num_rows,
-                "fragments": ingest_result.library.fragments.num_rows,
-            }
-        }
-        if ingest_result.quant is not None:
-            quant_pqdir = output_dir / "quant_pqdir"
-            save_quant(ingest_result.quant, quant_pqdir, format="parquet_dir")
-            ingest_counts["quant"] = {
-                "protein_quant": ingest_result.quant.protein_quant.num_rows,
-                "peptide_quant": ingest_result.quant.peptide_quant.num_rows,
-                "precursor_quant": ingest_result.quant.precursor_quant.num_rows,
-            }
-        if ingest_result.search is not None:
-            search_pqdir = output_dir / "search_pqdir"
-            save_search(ingest_result.search, search_pqdir, format="parquet_dir")
-            ingest_counts["search"] = {
-                "peptide_scores": ingest_result.search.peptide_scores.num_rows,
-                "protein_scores": ingest_result.search.protein_scores.num_rows,
-            }
-        ingest_info["counts"] = ingest_counts
-        _report_ingest_caveats(ingest_result, ingest_info)
-
-    # ── manifest + _SUCCESS ─────────────────────────────────────────
-    _write_manifest_for_search(
-        args=args,
-        input_file=input_file,
-        library=library,
-        fasta=fasta,
-        report_path=report_path,
-        elib_path=elib_path,
-        output_dir=output_dir,
-        result=result,
-        handle=handle,
-        ingest_info=ingest_info,
-        library_pqdir=library_pqdir,
-        quant_pqdir=quant_pqdir,
-        search_pqdir=search_pqdir,
-        extra_args=extra_args,
-        tolerances=tolerances,
-        build_manifest_envelope=build_manifest_envelope,
-        write_manifest=write_manifest,
-        constellation_version=constellation_version,
+    manifest = result.manifest
+    if result.reused:
+        print(f"already searched with these inputs and settings: {result.unit_dir}")
+        return 0
+    for caveat in manifest.caveats:
+        if caveat not in result.disagreements:
+            print(f"note: {caveat}", file=sys.stderr)
+    for line in result.disagreements:
+        print(f"warning: {line}", file=sys.stderr)
+    if result.disagreements:
+        print(
+            "warning: the result library does not record the settings this search was "
+            "given; check the jar's log before using it",
+            file=sys.stderr,
+        )
+    rows = manifest.runtime.get("table_rows", {})
+    print(
+        f"{manifest.search_mode} search of {result.run} (acquisition {result.acquisition_id}): "
+        f"{rows.get('precursor', 0):,} precursors, {rows.get('peptide', 0):,} peptides, "
+        f"{rows.get('protein_score', 0):,} proteins"
     )
-    success_path.write_bytes(b"")
-
-    if not args.no_progress:
-        counts = ingest_info.get("counts") if isinstance(ingest_info, dict) else None
-        if isinstance(counts, dict):
-            lib_c = counts.get("library", {})
-            srch_c = counts.get("search", {})
-            n_pep = lib_c.get("peptides") if isinstance(lib_c, dict) else None
-            n_ppt_scores = srch_c.get("peptide_scores") if isinstance(srch_c, dict) else None
-            print(
-                f"search done: {elib_path} "
-                f"({n_pep} peptides ingested, "
-                f"{n_ppt_scores or 0} peptide scores)"
-            )
-        else:
-            print(f"search done: {elib_path}")
+    print(f"experiment: {result.experiment_dir}")
+    print(f"  this search: {result.unit_dir}")
+    print(f"  tables:      {result.experiment_dir / 'tables'} (unit={result.unit})")
     return 0
-
-
-def _write_manifest_for_search(
-    *,
-    args: argparse.Namespace,
-    input_file: Path,
-    library: Path,
-    fasta: Path | None,
-    report_path: Path,
-    elib_path: Path,
-    output_dir: Path,
-    result,  # JvmResult
-    handle,  # ToolHandle
-    ingest_info: dict[str, object],
-    library_pqdir: Path | None,
-    quant_pqdir: Path | None,
-    search_pqdir: Path | None,
-    extra_args: list[str],
-    tolerances: dict[str, object],
-    build_manifest_envelope,
-    write_manifest,
-    constellation_version: str,
-) -> None:
-    import os as _os
-    import sys as _sys
-
-    inputs: dict[str, Path | None] = {
-        "input": input_file,
-        "library": library,
-        "fasta": fasta,
-    }
-    manifest = build_manifest_envelope(
-        subcommand="massspec search",
-        constellation_version=constellation_version,
-        constellation_argv=_sys.argv,
-        java_argv=result.argv,
-        tool={
-            "name": "encyclopedia",
-            "version": handle.version,
-            "jar_path": str(handle.path),
-            "jar_sha256": result.jar_sha256,
-            "source": handle.source,
-            "env_var_set": "CONSTELLATION_ENCYCLOPEDIA_HOME" in _os.environ,
-            "java_version": result.java_version,
-            "java_source": result.java_source,
-            "java_path": str(result.java_path),
-        },
-        inputs=inputs,
-        outputs={
-            "elib": elib_path,
-            "report": report_path,
-            "library_pqdir": library_pqdir,
-            "quant_pqdir": quant_pqdir,
-            "search_pqdir": search_pqdir,
-            "stdout_log": result.stdout_log,
-            "stderr_log": result.stderr_log,
-        },
-        runtime={
-            "elapsed_seconds": result.elapsed_seconds,
-            "returncode": result.returncode,
-        },
-        ingest=ingest_info,
-        encyclopedia_passthrough_args=extra_args,
-        # `extras` is a named parameter, NOT **kwargs — passing
-        # `search_params=` directly is a TypeError that only surfaces
-        # after the jar has already run to completion.
-        extras={"search_params": tolerances},
-    )
-    write_manifest(output_dir / "manifest.json", manifest)

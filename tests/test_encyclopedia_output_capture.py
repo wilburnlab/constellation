@@ -105,10 +105,10 @@ def test_peptide_centric_search_output_inventory() -> None:
     assert doc["encyclopedia_version"] == MINIMUM_VERSION
     assert doc["container_version"] == "0.1.18"
     files = {f["name"]: f for f in doc["files"]}
-    assert all(name.startswith("<run>") for name in files)
+    assert all(name.startswith("<input>") for name in files)
 
     # The result library, the Percolator input and both Percolator outputs.
-    assert files["<run>.elib"]["tables_with_rows"] == [
+    assert files["<input>.elib"]["tables_with_rows"] == [
         "entries",
         "metadata",
         "peptidequants",
@@ -116,18 +116,20 @@ def test_peptide_centric_search_output_inventory() -> None:
         "peptidetoprotein",
         "proteinscores",
     ]
-    assert len(files["<run>.features.txt"]["columns"]) == 35
-    assert files["<run>.encyclopedia.txt"]["columns"] == files[
-        "<run>.encyclopedia.decoy.txt"
+    assert len(files["<input>.features.txt"]["columns"]) == 35
+    assert files["<input>.encyclopedia.txt"]["columns"] == files[
+        "<input>.encyclopedia.decoy.txt"
     ]["columns"]
     # Two calibration passes, three fitted relations each, as a table and a plot.
     for stage in ("first", "final"):
         for fit in ("rt_fit", "ms1_fit", "ms2_fit"):
-            assert f"<run>.encyclopedia.txt.{stage}.{fit}.txt" in files
-            assert f"<run>.encyclopedia.txt.{stage}.{fit}.pdf" in files
+            assert f"<input>.encyclopedia.txt.{stage}.{fit}.txt" in files
+            assert f"<input>.encyclopedia.txt.{stage}.{fit}.pdf" in files
 
     # The metadata table names every effective parameter, including ones
-    # the help does not print; the run's own key is normalised.
+    # the help does not print; the keys named for the run are normalised,
+    # so nothing in the capture says which run it was taken from.
     keys = doc["result_metadata_keys"]
-    assert "<source file> search type" in keys
+    assert {"<source file> search type", "<source file> library", "TIC_<source file>"} <= set(keys)
+    assert not any(".raw" in key for key in keys)
     assert {"-percolatorTrainingIterations", "-percolatorVersion", "version"} <= set(keys)

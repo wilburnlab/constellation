@@ -2,10 +2,10 @@
   "encyclopedia_version": "6.9.23",
   "program": "encyclopedia",
   "container_version": "0.1.18",
-  "note": "Files a run leaves in its output directory when -o names a report there and the JVM's working directory is that directory; <run> is the input's name without its extension. Nothing is written beside the input in that arrangement.",
+  "note": "Files a search leaves beside its input when no -o is given: the jar's own naming. <input> is the input's file name, extension included (run.dia -> run.dia.elib). With -o X.encyclopedia.txt the same files are written as X.* in X's directory instead.",
   "files": [
     {
-      "name": "<run>.elib",
+      "name": "<input>.elib",
       "kind": "sqlite",
       "tables_with_rows": [
         "entries",
@@ -17,7 +17,7 @@
       ]
     },
     {
-      "name": "<run>.encyclopedia.decoy.txt",
+      "name": "<input>.encyclopedia.decoy.txt",
       "kind": "tsv",
       "columns": [
         "PSMId",
@@ -29,7 +29,7 @@
       ]
     },
     {
-      "name": "<run>.encyclopedia.txt",
+      "name": "<input>.encyclopedia.txt",
       "kind": "tsv",
       "columns": [
         "PSMId",
@@ -41,23 +41,23 @@
       ]
     },
     {
-      "name": "<run>.encyclopedia.txt.final.delta_ms1.pdf",
+      "name": "<input>.encyclopedia.txt.final.delta_ms1.pdf",
       "kind": "pdf"
     },
     {
-      "name": "<run>.encyclopedia.txt.final.delta_ms2.pdf",
+      "name": "<input>.encyclopedia.txt.final.delta_ms2.pdf",
       "kind": "pdf"
     },
     {
-      "name": "<run>.encyclopedia.txt.final.delta_rt.pdf",
+      "name": "<input>.encyclopedia.txt.final.delta_rt.pdf",
       "kind": "pdf"
     },
     {
-      "name": "<run>.encyclopedia.txt.final.ms1_fit.pdf",
+      "name": "<input>.encyclopedia.txt.final.ms1_fit.pdf",
       "kind": "pdf"
     },
     {
-      "name": "<run>.encyclopedia.txt.final.ms1_fit.txt",
+      "name": "<input>.encyclopedia.txt.final.ms1_fit.txt",
       "kind": "tsv",
       "columns": [
         "Retention Time (Min)",
@@ -70,11 +70,11 @@
       ]
     },
     {
-      "name": "<run>.encyclopedia.txt.final.ms2_fit.pdf",
+      "name": "<input>.encyclopedia.txt.final.ms2_fit.pdf",
       "kind": "pdf"
     },
     {
-      "name": "<run>.encyclopedia.txt.final.ms2_fit.txt",
+      "name": "<input>.encyclopedia.txt.final.ms2_fit.txt",
       "kind": "tsv",
       "columns": [
         "Retention Time (Min)",
@@ -87,11 +87,11 @@
       ]
     },
     {
-      "name": "<run>.encyclopedia.txt.final.rt_fit.pdf",
+      "name": "<input>.encyclopedia.txt.final.rt_fit.pdf",
       "kind": "pdf"
     },
     {
-      "name": "<run>.encyclopedia.txt.final.rt_fit.txt",
+      "name": "<input>.encyclopedia.txt.final.rt_fit.txt",
       "kind": "tsv",
       "columns": [
         "library",
@@ -104,23 +104,23 @@
       ]
     },
     {
-      "name": "<run>.encyclopedia.txt.first.delta_ms1.pdf",
+      "name": "<input>.encyclopedia.txt.first.delta_ms1.pdf",
       "kind": "pdf"
     },
     {
-      "name": "<run>.encyclopedia.txt.first.delta_ms2.pdf",
+      "name": "<input>.encyclopedia.txt.first.delta_ms2.pdf",
       "kind": "pdf"
     },
     {
-      "name": "<run>.encyclopedia.txt.first.delta_rt.pdf",
+      "name": "<input>.encyclopedia.txt.first.delta_rt.pdf",
       "kind": "pdf"
     },
     {
-      "name": "<run>.encyclopedia.txt.first.ms1_fit.pdf",
+      "name": "<input>.encyclopedia.txt.first.ms1_fit.pdf",
       "kind": "pdf"
     },
     {
-      "name": "<run>.encyclopedia.txt.first.ms1_fit.txt",
+      "name": "<input>.encyclopedia.txt.first.ms1_fit.txt",
       "kind": "tsv",
       "columns": [
         "Retention Time (Min)",
@@ -133,11 +133,11 @@
       ]
     },
     {
-      "name": "<run>.encyclopedia.txt.first.ms2_fit.pdf",
+      "name": "<input>.encyclopedia.txt.first.ms2_fit.pdf",
       "kind": "pdf"
     },
     {
-      "name": "<run>.encyclopedia.txt.first.ms2_fit.txt",
+      "name": "<input>.encyclopedia.txt.first.ms2_fit.txt",
       "kind": "tsv",
       "columns": [
         "Retention Time (Min)",
@@ -150,11 +150,11 @@
       ]
     },
     {
-      "name": "<run>.encyclopedia.txt.first.rt_fit.pdf",
+      "name": "<input>.encyclopedia.txt.first.rt_fit.pdf",
       "kind": "pdf"
     },
     {
-      "name": "<run>.encyclopedia.txt.first.rt_fit.txt",
+      "name": "<input>.encyclopedia.txt.first.rt_fit.txt",
       "kind": "tsv",
       "columns": [
         "library",
@@ -167,15 +167,15 @@
       ]
     },
     {
-      "name": "<run>.encyclopedia.txt.log",
+      "name": "<input>.encyclopedia.txt.log",
       "kind": "log"
     },
     {
-      "name": "<run>.encyclopedia.txt.model",
+      "name": "<input>.encyclopedia.txt.model",
       "kind": "model"
     },
     {
-      "name": "<run>.features.txt",
+      "name": "<input>.features.txt",
       "kind": "tsv",
       "columns": [
         "id",
@@ -267,12 +267,12 @@
     "-topNTargetsUsed",
     "-usePercolator",
     "-verifyModificationIons",
-    "261008_u2os_dia_100min-IOa_HCD26_350-1200_8mz.raw library",
+    "<source file> library",
     "<source file> search type",
     "EncyclopediaVersion",
     "PercolatorVersion",
     "RT align between samples",
-    "TIC_261008_u2os_dia_100min-IOa_HCD26_350-1200_8mz.raw",
+    "TIC_<source file>",
     "pi0",
     "sourcefile",
     "version"

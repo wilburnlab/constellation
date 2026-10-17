@@ -13,19 +13,24 @@ read off real output. It writes::
 statements of a result library (``.elib`` / ``.dlib``) and of a spectra
 file (``.dia``), so readers can be tested against the pinned version's
 layout without the jar or the data. ``outputs/<program>.json`` lists the
-files a run of that program leaves in its output directory (run name
-replaced by ``<run>``), the column headers of the tab-separated ones,
+files a run of that program leaves beside its input (the input's file
+name replaced by ``<input>``), the column headers of the tab-separated ones,
 the tables each SQLite file fills, and the keys of the result library's
 ``metadata`` table, which is where the jar records every effective
 parameter, including ones its help does not list.
 
 Nothing run-specific is kept: no row counts, no values.
 
+The directory to capture from is one search's own: a fresh directory
+holding the input (or a link to it) and nothing else before the run,
+searched without ``-o``, so that everything in it is named the jar's
+own way (``<input>.elib``, ``<input>.encyclopedia.txt``, ...).
+
 Example (the 6.9.23 capture, from a peptide-centric search)::
 
     python3 scripts/survey-encyclopedia-outputs.py \\
         --program encyclopedia \\
-        --output-dir <search output dir> \\
+        --output-dir <the search's directory> \\
         --spectra-file <any .dia written by the pinned toolchain>
 
 Run from project root.
@@ -90,8 +95,9 @@ def _write_sql(path: Path, title: str, statements: list[str]) -> None:
     path.write_text(f"-- {title}\n" + "\n".join(statements) + "\n")
 
 
-def _run_name(output_dir: Path) -> str:
-    """The run a directory's outputs are named for (the result library's stem)."""
+def _input_name(output_dir: Path) -> str:
+    """The input a directory's outputs are named for: the result library's
+    name without ``.elib`` / ``.dlib`` (``run.dia`` for ``run.dia.elib``)."""
     libraries = sorted(
         p for p in output_dir.iterdir() if p.suffix in (".elib", ".dlib") and p.is_file()
     )
@@ -103,12 +109,12 @@ def _run_name(output_dir: Path) -> str:
     return libraries[0].name.removesuffix(libraries[0].suffix)
 
 
-def _inventory(output_dir: Path, run: str) -> list[dict[str, object]]:
+def _inventory(output_dir: Path, input_name: str) -> list[dict[str, object]]:
     files: list[dict[str, object]] = []
     for path in sorted(output_dir.iterdir()):
-        if not path.is_file() or not path.name.startswith(run):
-            continue
-        name = "<run>" + path.name[len(run) :]
+        if not path.is_file() or not path.name.startswith(input_name + "."):
+            continue  # the input itself, logs directories, anything unrelated
+        name = "<input>" + path.name[len(input_name) :]
         entry: dict[str, object] = {"name": name}
         if path.suffix in _SQLITE_SUFFIXES:
             entry["kind"] = "sqlite"
@@ -143,9 +149,11 @@ def main() -> int:
     args = parser.parse_args()
 
     root = args.raw_root / args.version
-    run = _run_name(args.output_dir)
+    input_name = _input_name(args.output_dir)
     library = next(
-        p for p in args.output_dir.iterdir() if p.name in (f"{run}.elib", f"{run}.dlib")
+        p
+        for p in args.output_dir.iterdir()
+        if p.name in (f"{input_name}.elib", f"{input_name}.dlib")
     )
     metadata = _metadata(library)
     container = metadata.get("version", "unknown")
@@ -170,21 +178,29 @@ def main() -> int:
             _ddl(args.spectra_file),
         )
 
-    # One key is named for the run ("<source file> search type").
-    keys = sorted(
-        "<source file> search type" if k.endswith(" search type") else k for k in metadata
-    )
+    # Three keys are named for the run: "<source file> search type",
+    # "<source file> library" and "TIC_<source file>".
+    source = metadata.get("sourcefile")
+
+    def _generic(key: str) -> str:
+        if source and key in (f"{source} search type", f"{source} library"):
+            return "<source file>" + key[len(source) :]
+        if source and key == f"TIC_{source}":
+            return "TIC_<source file>"
+        return key
+
+    keys = sorted(_generic(k) for k in metadata)
     doc = {
         "encyclopedia_version": args.version,
         "program": args.program,
         "container_version": container,
         "note": (
-            "Files a run leaves in its output directory when -o names a report "
-            "there and the JVM's working directory is that directory; <run> is "
-            "the input's name without its extension. Nothing is written beside "
-            "the input in that arrangement."
+            "Files a search leaves beside its input when no -o is given: the "
+            "jar's own naming. <input> is the input's file name, extension "
+            "included (run.dia -> run.dia.elib). With -o X.encyclopedia.txt "
+            "the same files are written as X.* in X's directory instead."
         ),
-        "files": _inventory(args.output_dir, run),
+        "files": _inventory(args.output_dir, input_name),
         "result_metadata_keys": keys,
     }
     out = root / "outputs" / f"{args.program}.json"

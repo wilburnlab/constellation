@@ -61,6 +61,40 @@ PROTEIN_SCORE_TABLE: pa.Schema = pa.schema(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Per-precursor scores
+# ──────────────────────────────────────────────────────────────────────
+
+
+# One row per scored precursor per acquisition, decoys included. This is
+# the level a library search engine actually scores at (EncyclopeDIA's
+# ``peptidescores`` has one row per modified sequence and charge), and
+# the level at which a target/decoy analysis can be redone. The
+# peptide-level table above is a roll-up of it.
+#
+# Self-describing on purpose: ``modified_sequence`` (ProForma 2.0) and
+# ``charge`` say what was scored, so a decoy row, which has no precursor
+# in any library, still means something. ``precursor_id`` is the library
+# precursor where there is one and null otherwise.
+#
+# Primary key: ``(modified_sequence, charge, acquisition_id, engine,
+# is_decoy)``.
+PRECURSOR_SCORE_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("precursor_id", pa.int64(), nullable=True),
+        pa.field("acquisition_id", pa.int64(), nullable=True),
+        pa.field("modified_sequence", pa.string(), nullable=False),
+        pa.field("charge", pa.int32(), nullable=False),
+        pa.field("score", pa.float64(), nullable=True),
+        pa.field("qvalue", pa.float64(), nullable=True),
+        pa.field("pep", pa.float64(), nullable=True),  # posterior error probability
+        pa.field("is_decoy", pa.bool_(), nullable=False),
+        pa.field("engine", pa.string(), nullable=False),
+    ],
+    metadata={b"schema_name": b"PrecursorScoreTable"},
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Per-spectrum matches (PSMs)
 # ──────────────────────────────────────────────────────────────────────
 
@@ -219,6 +253,7 @@ NOVEL_PEPTIDE_TABLE: pa.Schema = pa.schema(
 register_schema("PeptideScoreTable", PEPTIDE_SCORE_TABLE)
 register_schema("ProteinScoreTable", PROTEIN_SCORE_TABLE)
 register_schema("PsmTable", PSM_TABLE)
+register_schema("PrecursorScoreTable", PRECURSOR_SCORE_TABLE)
 register_schema("NovelPeptideTable", NOVEL_PEPTIDE_TABLE)
 
 
@@ -226,5 +261,6 @@ __all__ = [
     "NOVEL_PEPTIDE_TABLE",
     "PEPTIDE_SCORE_TABLE",
     "PROTEIN_SCORE_TABLE",
+    "PRECURSOR_SCORE_TABLE",
     "PSM_TABLE",
 ]
