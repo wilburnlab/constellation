@@ -245,3 +245,38 @@ def test_filter_overwrites_existing_output(tmp_path: Path) -> None:
     _build_synthetic_elib(src)
     filter_elib_by_losers(src, {"BBBR"}, out)
     assert _count(out, "entries") == 3   # AAAR×2 + CCCR
+
+
+def test_filter_keeps_proteins_of_a_sequence_another_form_still_has(tmp_path: Path) -> None:
+    """A losing oxidised form must not take the unmodified form's
+    protein mapping with it (it left entries with no protein on a real
+    chromatogram library: 12 of 75,195)."""
+    src = tmp_path / "input.elib"
+    out = tmp_path / "filtered.elib"
+    _build_synthetic_elib(src)
+    con = sqlite3.connect(str(src))
+    try:
+        con.execute(
+            "INSERT INTO entries VALUES (508.0, 2, 'AAAM[+15.995]R', 'AAAMR', 1, 90.0, 0.5, 0, x'', 'f1.mzML')"
+        )
+        con.execute(
+            "INSERT INTO entries VALUES (500.0, 2, 'AAAMR', 'AAAMR', 1, 95.0, 0.5, 0, x'', 'f1.mzML')"
+        )
+        con.execute("INSERT INTO peptidetoprotein VALUES ('AAAMR', 0, 'PROT_M')")
+        con.commit()
+    finally:
+        con.close()
+    deleted = filter_elib_by_losers(src, {"AAAM[+15.995]R", "BBBR"}, out)
+    assert _count(out, "entries", "PeptideModSeq='AAAMR'") == 1
+    assert _count(out, "peptidetoprotein", "PeptideSeq='AAAMR'") == 1
+    assert _count(out, "peptidetoprotein", "PeptideSeq='BBBR'") == 0
+    assert deleted["peptidetoprotein"] == 1
+    con = sqlite3.connect(str(out))
+    try:
+        (orphans,) = con.execute(
+            "SELECT count(*) FROM entries e WHERE NOT EXISTS "
+            "(SELECT 1 FROM peptidetoprotein p WHERE p.PeptideSeq = e.PeptideSeq)"
+        ).fetchone()
+    finally:
+        con.close()
+    assert orphans == 0
