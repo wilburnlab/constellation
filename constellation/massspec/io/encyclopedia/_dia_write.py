@@ -89,7 +89,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -188,6 +188,11 @@ SCAN_MAP_SCHEMA = pa.schema(
     ],
     metadata={b"schema_name": b"DiaScanMap"},
 )
+
+
+class SpectraWriteStopped(RuntimeError):
+    """:func:`write_dia` was asked to stop (its ``should_stop`` said so)
+    before the file was complete; nothing was left under its name."""
 
 
 @dataclass(frozen=True)
@@ -559,6 +564,7 @@ def write_dia(
     workers: int | None = None,
     batch_rows: int = 1 << 20,
     chunk_scans: int = 512,
+    should_stop: Callable[[], bool] | None = None,
 ) -> DiaWriteSummary:
     """Write ``out_path`` from one bundle (single run) or several (merged).
 
@@ -570,6 +576,11 @@ def write_dia(
     ``SpectrumIndex`` no longer says which run and scan a spectrum is.
 
     ``workers`` is the zlib thread count (default: up to 8).
+
+    ``should_stop``, when given, is asked between chunks of scans; once
+    it answers true the write ends with :class:`SpectraWriteStopped`.
+    For a writer in a thread that a signal cannot interrupt (a search
+    fan-out being cancelled), so a stop does not wait for the whole file.
     """
     out_path = Path(out_path).resolve()
     if out_path.suffix.lower() != ".dia":
@@ -632,6 +643,7 @@ def write_dia(
                     ms1_bounds=(ms1_lo, ms1_hi) if merged else None,
                     batch_rows=batch_rows,
                     chunk_scans=chunk_scans,
+                    should_stop=should_stop,
                 )
                 total_precursor_tic += tic_sum
                 n_precursor += n1
@@ -694,6 +706,7 @@ def _write_fraction(
     ms1_bounds: tuple[float, float] | None,
     batch_rows: int,
     chunk_scans: int,
+    should_stop: Callable[[], bool] | None = None,
 ) -> tuple[float, dict[tuple[float, float], list[float]]]:
     """Insert one bundle's scans. Returns ``(sum of MS1 TIC, window stats)``.
 
@@ -712,6 +725,8 @@ def _write_fraction(
 
     n = rows.scan.size
     for start in range(0, n, chunk_scans):
+        if should_stop is not None and should_stop():
+            raise SpectraWriteStopped(f"stopped writing {bundle.dia_name} at scan {start} of {n}")
         stop = min(start + chunk_scans, n)
         arrays: list[tuple[np.ndarray, np.ndarray]] = []
         for i in range(start, stop):
@@ -783,5 +798,6 @@ __all__ = [
     "SCAN_MAP_SCHEMA",
     "SCAN_MAP_SUFFIX",
     "DiaWriteSummary",
+    "SpectraWriteStopped",
     "write_dia",
 ]

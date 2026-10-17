@@ -33,7 +33,11 @@ from typing import Any
 from constellation.core import stages
 from constellation.core.manifests import ManifestError, manifest_kind, read_manifest
 from constellation.massspec.acquisitions import load_acquisitions
-from constellation.massspec.manifest import ExperimentManifest, SearchManifest
+from constellation.massspec.manifest import (
+    ExperimentManifest,
+    QuantReportManifest,
+    SearchManifest,
+)
 
 #: Flags that name a search's input files; shown as inputs, not settings.
 _INPUT_FLAGS = frozenset({"-i", "-f", "-l", "-o"})
@@ -104,11 +108,15 @@ def summarize(directory: Path | str) -> dict[str, Any]:
 
         path, name, created_at, constellation_version, id_scheme
         acquisitions   [{acquisition_id, name, source_file, source_kind,
-                         acquired_at, source_sha256, aliases}]
+                         acquired_at, source_sha256, aliases, merged_from}]
         searches       [{unit, directory, status, error, ...}], one per
                        directory under units/, finished or not
-        focus          the search's key when ``directory`` was one search's,
-                       else None
+        reports        [{key, directory, status, units, acquisition_ids,
+                         found, ...}], one per directory under reports/
+        runs           [{label, state, pid, started_at, log}], the detached
+                       runs recorded under runs/
+        focus          the search's or report's key when ``directory`` was
+                       one of them, else None
 
     ``status`` is ``finished`` (its ``_SUCCESS`` marker is there),
     ``failed`` or ``cancelled`` (it said so as it stopped),
@@ -122,7 +130,7 @@ def summarize(directory: Path | str) -> dict[str, Any]:
     kind = manifest_kind(directory)
     if kind == ExperimentManifest.KIND:
         experiment_dir = directory
-    elif directory.parent.name == "units" and (
+    elif directory.parent.name in ("units", "reports") and (
         manifest_kind(directory.parent.parent) == ExperimentManifest.KIND
     ):
         experiment_dir, focus = directory.parent.parent, directory.name
@@ -143,6 +151,12 @@ def summarize(directory: Path | str) -> dict[str, Any]:
     _compare_within_acquisitions(searches)
     for search in searches:
         search.pop("_compare", None)
+    reports_dir = experiment_dir / "reports"
+    reports = [
+        _report(report_dir, registered=report_dir.name in root.reports)
+        for report_dir in sorted(reports_dir.iterdir() if reports_dir.is_dir() else ())
+        if report_dir.is_dir()
+    ]
     return {
         "path": str(experiment_dir),
         "name": root.name,
@@ -151,6 +165,8 @@ def summarize(directory: Path | str) -> dict[str, Any]:
         "id_scheme": root.id_scheme,
         "acquisitions": _acquisitions(experiment_dir, root),
         "searches": searches,
+        "reports": reports,
+        "runs": _runs(experiment_dir),
         "focus": focus,
     }
 
@@ -176,6 +192,7 @@ def _acquisitions(experiment_dir: Path, root: ExperimentManifest) -> list[dict[s
                 "acquired_at": row.get("acquisition_datetime"),
                 "source_sha256": row.get("source_sha256"),
                 "aliases": list(row.get("source_aliases") or []),
+                "merged_from": list(row["merged_from"]) if row.get("merged_from") else None,
             }
         )
     return sorted(out, key=lambda a: a["acquisition_id"])
@@ -280,6 +297,72 @@ def _fdr(threshold: str | None) -> str | None:
         return None
 
 
+def _report(report_dir: Path, *, registered: bool) -> dict[str, Any]:
+    key = report_dir.name
+    entry: dict[str, Any] = {
+        "key": key,
+        "directory": f"reports/{key}",
+        "in_experiment_manifest": registered,
+    }
+    try:
+        record = read_manifest(report_dir, expect=QuantReportManifest)
+    except ManifestError:
+        entry.update(status="no record", last_activity=_last_activity(report_dir))
+        return entry
+    finished = stages.is_done(report_dir)
+    if finished:
+        status = "finished"
+    elif record.status in ("failed", "cancelled"):
+        status = record.status
+    else:
+        status = "not finished"
+    rows = record.runtime.get("table_rows") or {}
+    entry.update(
+        status=status,
+        error=record.error or None,
+        started_at=record.created_at or None,
+        finished_at=record.runtime.get("finished_at"),
+        elapsed_seconds=record.runtime.get("elapsed_seconds"),
+        last_activity=None if finished else _last_activity(report_dir),
+        engine=record.engine,
+        engine_version=record.engine_version,
+        units=list(record.units),
+        acquisition_ids=list(record.acquisition_ids),
+        library=(record.inputs.get("library") or {}).get("path"),
+        fasta=(record.inputs.get("fasta") or {}).get("path"),
+        align=record.parameters.get("align"),
+        found=(
+            {
+                "precursors": rows.get("precursor"),
+                "proteins": rows.get("protein_score"),
+            }
+            if finished and rows
+            else None
+        ),
+        outputs={k: f"reports/{key}/{v}" for k, v in record.outputs.items()},
+        caveats=list(record.caveats),
+        command=list(record.argv),
+        logs=f"reports/{key}/logs",
+    )
+    return entry
+
+
+def _runs(experiment_dir: Path) -> list[dict[str, Any]]:
+    from constellation.core.detach import runs
+
+    return [
+        {
+            "label": run.label,
+            "state": run.state(),
+            "pid": run.pid,
+            "started_at": run.started_at,
+            "exit_code": run.exit_code(),
+            "log": str(run.log.relative_to(experiment_dir)),
+        }
+        for run in runs(experiment_dir / "runs")
+    ]
+
+
 # ──────────────────────────────────────────────────────────────────────
 # what sets searches of one acquisition apart
 # ──────────────────────────────────────────────────────────────────────
@@ -381,7 +464,8 @@ def _status_line(s: dict[str, Any]) -> str:
     status = s["status"]
     if status == "finished":
         took = _duration(s.get("elapsed_seconds"))
-        return f"finished {_when(s.get('finished_at'))}" + (f", the search took {took}" if took else "")
+        what = "the report" if "key" in s else "the search"
+        return f"finished {_when(s.get('finished_at'))}" + (f", {what} took {took}" if took else "")
     if status in ("failed", "cancelled"):
         first = (s.get("error") or "").splitlines()[0] if s.get("error") else ""
         return f"{status} {_when(s.get('finished_at'))}" + (f": {first}" if first else "")
@@ -535,9 +619,13 @@ def format_summary(summary: Mapping[str, Any]) -> str:
     lines.append("  " + made)
     focus = summary.get("focus")
     if focus is not None:
-        (search,) = [s for s in summary["searches"] if s["unit"] == focus]
+        found = [s for s in summary["searches"] if s["unit"] == focus]
         lines.append("")
-        lines += _detail_block(search, names)
+        if found:
+            lines += _detail_block(found[0], names)
+        else:
+            (report,) = [r for r in summary.get("reports", []) if r["key"] == focus]
+            lines += _report_detail(report, names)
         return "\n".join(lines) + "\n"
 
     acquisitions = summary["acquisitions"]
@@ -548,6 +636,8 @@ def format_summary(summary: Mapping[str, Any]) -> str:
             extra.append(f"acquired {str(a['acquired_at']).replace('T', ' ')[:16]}")
         if a.get("source_sha256"):
             extra.append(f"sha256 {a['source_sha256'][:12]}…")
+        if a.get("merged_from"):
+            extra.append("merged from " + ", ".join(str(i) for i in a["merged_from"]))
         lines.append(f"  {a['acquisition_id']:>3}  {a['name']}" + (f"  ({', '.join(extra)})" if extra else ""))
     searches = summary["searches"]
     counts = defaultdict(int)
@@ -557,9 +647,84 @@ def format_summary(summary: Mapping[str, Any]) -> str:
     lines += ["", f"searches ({len(searches)}{': ' + tally if tally else ''})"]
     for s in searches:
         lines += _search_block(s, names)
-    if searches:
-        lines += ["", "`constellation massspec summarize <experiment>/units/<search>` shows one search in full."]
+    reports = summary.get("reports") or []
+    if reports:
+        lines += ["", f"reports ({len(reports)})"]
+        for r in reports:
+            lines += _report_block(r)
+    runs = summary.get("runs") or []
+    if runs:
+        lines += ["", "detached runs"]
+        for run in runs:
+            lines.append(
+                f"  {run['label']:<9} {run['state']:<9} started {_when(run['started_at'])}, "
+                f"pid {run['pid']}, log {run['log']}"
+            )
+    if searches or reports:
+        lines += [
+            "",
+            "`constellation massspec summarize <experiment>/units/<search>` (or "
+            "/reports/<report>) shows one in full.",
+        ]
     return "\n".join(lines) + "\n"
+
+
+def _report_block(r: dict[str, Any]) -> list[str]:
+    lines = [f"  {r['key']}"]
+    lines += _field("status", _status_line(r))
+    if r["status"] == "no record":
+        return lines
+    ids = r.get("acquisition_ids") or []
+    lines += _field(
+        "covers",
+        f"{len(r.get('units') or [])} searches, acquisitions {', '.join(str(i) for i in ids)}"
+        + ("" if r.get("align") is None else f"; retention times {'aligned' if r['align'] else 'not aligned'}"),
+    )
+    if r.get("library"):
+        lines += _field("library", _file_name(r["library"]))
+    if r.get("found"):
+        found = r["found"]
+        lines += _field(
+            "found",
+            f"{found.get('precursors') or 0:,} precursors, {found.get('proteins') or 0:,} proteins",
+        )
+    if r["status"] in ("failed", "cancelled", "not finished"):
+        lines += _field("logs", r["logs"])
+    return lines
+
+
+def _report_detail(r: dict[str, Any], names: Mapping[int, str]) -> list[str]:
+    lines = [f"report {r['key']}"]
+    lines += _field("status", _status_line(r), indent=2)
+    if r["status"] == "no record":
+        return lines
+    if r.get("error") and "\n" in r["error"]:
+        lines += ["      " + line for line in r["error"].splitlines()[1:]]
+    lines += _field("engine", f"{r['engine']} {r['engine_version']}", indent=2)
+    for label, path in (("library", r.get("library")), ("FASTA", r.get("fasta"))):
+        if path:
+            lines += _field(label, path, indent=2)
+    lines.append("  searches")
+    for unit in r.get("units") or []:
+        lines.append(f"      {unit}")
+    lines += _field(
+        "runs",
+        "; ".join(f"acquisition {i} ({names.get(i, '?')})" for i in r.get("acquisition_ids") or []),
+        indent=2,
+    )
+    if r.get("found"):
+        found = r["found"]
+        lines += _field(
+            "found", f"{found.get('precursors') or 0:,} precursors, {found.get('proteins') or 0:,} proteins",
+            indent=2,
+        )
+    for label, path in sorted((r.get("outputs") or {}).items()):
+        lines += _field("output", path, indent=2)
+    if r.get("command"):
+        lines += _field("command", " ".join(r["command"]), indent=2)
+    for caveat in r.get("caveats") or []:
+        lines += _field("caveat", caveat, indent=2)
+    return lines
 
 
 __all__ = ["PASSED", "RECORDED", "format_summary", "summarize"]

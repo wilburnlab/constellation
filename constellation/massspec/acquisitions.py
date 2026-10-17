@@ -72,7 +72,14 @@ from constellation.core.io.schemas import (
 # (newer) metadata in, so a file read by newer code is treated as v1-shaped.
 # v2 adds ``source_sha256`` (identity across experiments) and
 # ``source_aliases`` (the other file names a run is known by).
-ACQUISITION_SCHEMA_VERSION: int = 2
+# v3 adds ``merged_from``: a spectra file made from several runs and
+# searched as one is registered as an acquisition of its own, and this
+# names the runs it was made from.
+ACQUISITION_SCHEMA_VERSION: int = 3
+
+#: ``source_kind`` of an acquisition that is several runs merged into one
+#: spectra file (gas-phase fractions, typically) and searched as one.
+MERGED_KIND = "merged_spectra_file"
 
 
 ACQUISITION_TABLE: pa.Schema = pa.schema(
@@ -94,6 +101,10 @@ ACQUISITION_TABLE: pa.Schema = pa.schema(
         # Other file names (no directories) this run is known by, beyond
         # the name in ``source_file``. Null when there are none.
         pa.field("source_aliases", pa.list_(pa.string()), nullable=True),
+        # For a merged spectra file (``source_kind == MERGED_KIND``): the
+        # acquisitions it was made from, in the order they were merged.
+        # Null for a run of the instrument.
+        pa.field("merged_from", pa.list_(pa.int64()), nullable=True),
     ],
     metadata={
         b"schema_name": b"AcquisitionTable",
@@ -360,6 +371,15 @@ class Acquisitions:
                             f"results are bound to runs by file name, so one experiment "
                             f"cannot hold both"
                         )
+            merged_from = record.get("merged_from")
+            if target is not None and merged_from is not None:
+                held_from = target.get("merged_from")
+                if list(held_from or ()) != [int(i) for i in merged_from]:  # type: ignore[union-attr]
+                    raise ValueError(
+                        f"{names[0]!r} already names acquisition {target['acquisition_id']}, "
+                        f"merged from {held_from}; it cannot also be a merge of "
+                        f"{list(merged_from)}. Give the merged file another name."  # type: ignore[arg-type]
+                    )
             if target is None:
                 row = {field.name: record.get(field.name) for field in ACQUISITION_TABLE}
                 row["acquisition_id"] = next_id
@@ -561,6 +581,7 @@ def validate_acquisitions(
 __all__ = [
     "ACQUISITIONS_FILENAME",
     "ACQUISITION_SCHEMA_VERSION",
+    "MERGED_KIND",
     "ACQUISITION_TABLE",
     "Acquisitions",
     "acquisition_record_from_bundle",

@@ -194,7 +194,7 @@ def targets_from_experiment(
     acquisitions, enough has to be given to leave one, and the error
     lists the choices.
     """
-    from constellation.massspec.manifest import open_table
+    from constellation.massspec.manifest import ALL_ACQUISITIONS, open_table
 
     root = Path(experiment_dir)
 
@@ -241,17 +241,23 @@ def targets_from_experiment(
         )
     unit, acquisition_id = wanted[0]
 
-    def of(tbl: pa.Table) -> pa.Table:
+    def of(tbl: pa.Table, *, shared: bool = False) -> pa.Table:
+        # A result across several runs (a quantitative report) keeps its
+        # precursors and peptides once, under ALL_ACQUISITIONS, not under
+        # each run.
+        ids = [acquisition_id, ALL_ACQUISITIONS] if shared else [acquisition_id]
         return tbl.filter(
             pc.and_(
                 pc.equal(tbl.column("unit"), unit),
-                pc.equal(tbl.column("acquisition_id"), acquisition_id),
+                pc.is_in(tbl.column("acquisition_id"), pa.array(ids, tbl.column("acquisition_id").type)),
             )
         )
 
     quant = of(quant).select(["precursor_id", "rt_observed", "rt_start", "rt_end"])
-    precursors = of(table("precursor")).select(["precursor_id", "peptide_id", "charge", "precursor_mz"])
-    peptides = of(table("peptide")).select(["peptide_id", "modified_sequence"])
+    precursors = of(table("precursor"), shared=True).select(
+        ["precursor_id", "peptide_id", "charge", "precursor_mz"]
+    )
+    peptides = of(table("peptide"), shared=True).select(["peptide_id", "modified_sequence"])
     joined = quant.join(precursors, keys="precursor_id", join_type="inner").join(
         peptides, keys="peptide_id", join_type="left outer"
     )

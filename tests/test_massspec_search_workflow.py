@@ -13,9 +13,12 @@ manifests, resume. A real search of real data is the opt-in
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -24,7 +27,7 @@ import pytest
 
 from constellation.core.manifests import manifest_kind, read_manifest
 from constellation.massspec.acquisitions import load_acquisitions
-from constellation.massspec.io.encyclopedia import write_dia
+from constellation.massspec.io.encyclopedia import DiaFile, write_dia
 from constellation.massspec.io.encyclopedia._modseq import parse_encyclopedia_modseq
 from constellation.massspec.library.ids import ID_SCHEME, content_id
 from constellation.massspec.manifest import ExperimentManifest, SearchManifest
@@ -85,6 +88,49 @@ def _entry(modseq: str, charge: int, total: float, source: str) -> Entry:
     )
 
 
+def _fake_libexport(flags: dict, state) -> types.SimpleNamespace:
+    """What the real -libexport does, as far as the workflow can tell: it
+    reads each run's spectra file and result from its input directory,
+    writes Percolator files into that directory, and writes a report in
+    which every peptide is an entry under one run, quantified in every
+    run, with the protein scores under the run ``global``."""
+    inputs, output = Path(str(flags["-i"])), Path(str(flags["-o"]))
+    assert "-f" in flags, "the real jar refuses a report without -f"
+    runs = sorted(p.stem for p in inputs.glob("*.dia"))
+    assert runs, "no spectra file in the report's input directory"
+    for run in runs:
+        assert (inputs / f"{run}.dia").is_symlink(), "the spectra file is linked, not copied"
+        assert (inputs / f"{run}.dia.elib").is_file(), f"{run}'s result is not beside its spectra"
+    stem = output.name.removesuffix(".elib")
+    for name in ("features", "results", "decoy"):
+        (inputs / f"{stem}_concatenated_{name}.txt").write_text("")
+    sources = [f"{run}.raw" for run in runs]
+    entries = [
+        dataclasses.replace(
+            _entry(m, z, total, sources[0]),
+            other_runs=[(other, total * (k + 2)) for k, other in enumerate(sources[1:])],
+        )
+        for m, z, total in state.peptides
+    ]
+    build_result_library(
+        output,
+        entries,
+        decoy_peptides=[("KEDITPEP", "DECOY_1")],
+        source=sources[0],
+        protein_source="global",
+        metadata={"-ftol": str(flags.get("-ftol", "10")), "-a": str(flags.get("-a"))},
+    )
+    for suffix in (".peptides.txt", ".proteins.txt", ".diffacto.csv", ".diffacto.samples.lst"):
+        output.with_name(output.name + suffix).write_text("")
+    return types.SimpleNamespace(
+        argv=["java", "-jar", "encyclopedia.jar", "-libexport"],
+        elapsed_seconds=0.5,
+        returncode=0,
+        java_version="openjdk 21",
+        jar_sha256="cafe",
+    )
+
+
 def _recorded_settings(program: str, flags: dict) -> dict[str, str]:
     """What the real jar writes into a result's ``metadata``: every
     setting it records, at its documented default unless passed."""
@@ -107,27 +153,42 @@ def jar(monkeypatch):
     exception it raises instead of finishing, and ``jar.while_running`` a
     function called with the search's directory before it writes anything."""
     state = types.SimpleNamespace(
-        calls=[], source=None, peptides=_PEPTIDES, metadata=None, fail=None, while_running=None
+        calls=[], source=None, peptides=_PEPTIDES, metadata=None, fail=None, while_running=None,
+        fail_for={}, delay={}, wait_for={},
     )
+    lock = threading.Lock()
 
     def run_program(program, flags, *, log_dir, cwd, **kwargs):
         from constellation.massspec.search.encyclopedia.runner import compose_argv
 
         argv = compose_argv(program, flags, allow_undocumented=kwargs.get("allow_undocumented", ()))
-        state.calls.append(types.SimpleNamespace(program=program, flags=dict(flags), argv=argv))
+        with lock:
+            state.calls.append(types.SimpleNamespace(program=program, flags=dict(flags), argv=argv))
         Path(log_dir).mkdir(parents=True, exist_ok=True)
         (Path(log_dir) / "stdout.log").write_text("EncyclopeDIA version 6.9.23\n")
+        if program == "libexport":
+            return _fake_libexport(flags, state)
+        given = Path(str(flags["-i"]))
+        run_name = given.stem
+        time.sleep(state.delay.get(run_name, 0.0))
+        if run_name in state.wait_for:
+            assert state.wait_for[run_name].wait(timeout=30), f"{run_name} waited in vain"
         if state.while_running is not None:
             state.while_running(Path(cwd).parent)
         if state.fail is not None:
             raise state.fail
-        given = Path(str(flags["-i"]))
+        if run_name in state.fail_for:
+            raise state.fail_for[run_name]
         assert given.is_file() and given.parent == Path(cwd), "the input is in the search's directory"
         # Beside the input, named for it. A result already there would be
         # taken for a finished search by the real jar; here the stand-in
         # refuses it, so a rerun over old outputs fails loudly.
         assert not (given.parent / f"{given.name}.elib").exists(), "a result is already there"
-        source = state.source or f"{given.stem}.raw"
+        # The real jar copies the spectra file's own record of its source:
+        # the .raw for a single run, the merged file itself for a merge.
+        with DiaFile(given) as dia:
+            recorded = str(dia.metadata.get("sourcename") or f"{given.stem}.raw")
+        source = state.source or recorded
         for name, file_name in expected_names(program, given.name).items():
             if name != "<input>.elib":
                 (given.parent / file_name).write_bytes(b"")

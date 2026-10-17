@@ -55,6 +55,9 @@ class Entry:
     quant_modseq: str | None = None
     source: str = SOURCE_FILE
     extra_quant_rows: Sequence[tuple[str, float]] = field(default_factory=tuple)
+    #: ``(run, TotalIntensity)``: quantity rows for runs other than
+    #: ``source``, as a report across runs (``-libexport``) has them.
+    other_runs: Sequence[tuple[str, float]] = field(default_factory=tuple)
 
 
 def build_result_library(
@@ -64,14 +67,17 @@ def build_result_library(
     decoy_peptides: Sequence[tuple[str, str]] = (),
     metadata: dict[str, str] | None = None,
     source: str = SOURCE_FILE,
+    protein_source: str | None = None,
 ) -> Path:
     """Write ``entries`` as a single-run search result (``.elib``).
 
     ``decoy_peptides`` are ``(sequence, accession)`` pairs written to
     ``peptidetoprotein`` and the score tables as decoys. ``source`` is
     the run the decoy and protein score rows name (each entry names its
-    own).
+    own); ``protein_source``, when given, the run the protein score rows
+    name instead (``global`` in a report across runs).
     """
+    protein_source = protein_source or source
     con = sqlite3.connect(path)
     con.executescript(result_library_ddl())
     meta = {"version": "0.1.18", "EncyclopediaVersion": MINIMUM_VERSION}
@@ -108,10 +114,11 @@ def build_result_library(
             "INSERT INTO peptidescores VALUES (?,?,?,?,?,?,0)",
             (e.charge, e.modseq, e.sequence, e.source, e.score, e.score),
         )
-        quant_rows = list(e.extra_quant_rows)
+        quant_rows = [(m, t, e.source) for m, t in e.extra_quant_rows]
         if e.total_intensity is not None:
-            quant_rows.insert(0, (e.quant_modseq or e.modseq, e.total_intensity))
-        for modseq, total in quant_rows:
+            quant_rows.insert(0, (e.quant_modseq or e.modseq, e.total_intensity, e.source))
+        quant_rows += [(e.quant_modseq or e.modseq, t, run) for run, t in e.other_runs]
+        for modseq, total, run in quant_rows:
             con.execute(
                 "INSERT INTO peptidequants (PrecursorCharge, PeptideModSeq, PeptideSeq, "
                 "SourceFile, RTInSecondsCenter, RTInSecondsStart, RTInSecondsStop, "
@@ -123,7 +130,7 @@ def build_result_library(
                     e.charge,
                     modseq,
                     e.sequence,
-                    e.source,
+                    run,
                     e.rt,
                     e.rt - 10.0,
                     e.rt + 10.0,
@@ -149,13 +156,13 @@ def build_result_library(
         )
         con.execute(
             "INSERT INTO proteinscores VALUES (?,?,?,0.5,0.5,1)",
-            (len(proteins) + 1000, accession, source),
+            (len(proteins) + 1000, accession, protein_source),
         )
     con.executemany("INSERT INTO peptidetoprotein VALUES (?,?,?)", sorted(links))
     for group, accession in enumerate(sorted(proteins)):
         con.execute(
             "INSERT INTO proteinscores VALUES (?,?,?,0.001,0.001,0)",
-            (group, accession, source),
+            (group, accession, protein_source),
         )
     con.commit()
     con.close()

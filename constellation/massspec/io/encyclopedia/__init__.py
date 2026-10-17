@@ -30,7 +30,11 @@ from constellation.massspec.io.encyclopedia import adapters as adapters  # noqa:
 from constellation.massspec.io.encyclopedia._dia import DiaFile, DiaReader
 from constellation.massspec.io.encyclopedia._dia_diff import DiaDiff, diff_dia
 from constellation.massspec.io.encyclopedia._dia_import import import_dia
-from constellation.massspec.io.encyclopedia._dia_write import DiaWriteSummary, write_dia
+from constellation.massspec.io.encyclopedia._dia_write import (
+    DiaWriteSummary,
+    SpectraWriteStopped,
+    write_dia,
+)
 from constellation.massspec.io.encyclopedia._modseq import (
     format_encyclopedia_modseq,
     parse_encyclopedia_modseq,
@@ -59,6 +63,7 @@ __all__ = [
     "DiaDiff",
     "DiaWriteSummary",
     "ResultComparison",
+    "SpectraWriteStopped",
     "compare_results",
     "diff_dia",
     "import_dia",

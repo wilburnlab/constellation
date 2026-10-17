@@ -57,7 +57,9 @@ request on, and it can only do that if it gets to run code when the
 request arrives.
 
 - **Ctrl-C** becomes ``KeyboardInterrupt``, the ``finally`` runs, and
-  the cleanup above stops the JVM.
+  the cleanup above stops the JVM. Only in the main thread, though: a
+  JVM run from a worker thread does not see the interrupt, so code that
+  fans out calls :func:`request_stop` when it catches one.
 - **SIGTERM and SIGHUP** (``kill``, ``timeout``, a batch system
   cancelling a job, a closed terminal) by default end Python at once
   with no ``finally``, which would leave the JVM running to completion,
@@ -221,12 +223,27 @@ _cancelled: int | None = None  # the signal that asked us to stop, once one has
 _main_is_launching = False
 
 
-def _on_cancel_signal(signum: int, frame: object) -> None:
-    """Pass a stop request on to every running JVM, then unwind."""
+def request_stop(signum: int = signal.SIGINT) -> None:
+    """Ask every running JVM to stop, as a SIGTERM to this process would.
+
+    For code running JVMs in worker threads that is stopped some other
+    way than the signals :func:`cancellation_scope` handles: Ctrl-C
+    reaches only the main thread (as ``KeyboardInterrupt``), and the
+    JVMs, each in a session of its own, never see it. Afterwards the
+    threads see their JVMs exit, :func:`cancellation_requested` returns
+    ``signum``, and no JVM is started until the outermost scope is
+    entered again.
+    """
     global _cancelled
     _cancelled = signum
     for proc in list(_LIVE.values()):
         _signal_group(proc.pid, signal.SIGTERM)
+
+
+def _on_cancel_signal(signum: int, frame: object) -> None:
+    """Pass a stop request on to every running JVM, then unwind."""
+    global _cancelled
+    request_stop(signum)
     previous = _PREVIOUS_HANDLERS.get(signum)
     if callable(previous):
         # The application had its own handler: it decides what happens
@@ -253,6 +270,17 @@ def _on_cancel_signal(signum: int, frame: object) -> None:
         # as soon as it is registered.
         return
     raise SystemExit(128 + signum)
+
+
+def cancellation_requested() -> int | None:
+    """The signal that asked running JVMs to stop, or ``None``.
+
+    For code running a JVM in a worker thread: a JVM that exits because
+    the run was cancelled looks, from that thread, like one that failed;
+    this tells the two apart. Reset when the outermost
+    :func:`cancellation_scope` is entered.
+    """
+    return _cancelled
 
 
 @contextlib.contextmanager
@@ -717,8 +745,10 @@ __all__ = [
     "JvmNotFoundError",
     "JvmResult",
     "JvmRunError",
+    "cancellation_requested",
     "cancellation_scope",
     "capture_jar",
     "reap_process_group",
+    "request_stop",
     "run_jar",
 ]

@@ -363,16 +363,28 @@ def _fragment_tables(
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _acquisitions_for(sources: Sequence[str], kind: str, bind: Acquisitions | None) -> tuple[Acquisitions, dict[str, int]]:
+#: How EncyclopeDIA names the run of a score computed across every run of
+#: a report (``-libexport`` writes its protein scores under it): no single
+#: acquisition. Such rows get a null ``acquisition_id``, which the score
+#: schemas define as a run-agnostic score.
+RUN_AGNOSTIC_SOURCE = "global"
+
+
+def _acquisitions_for(
+    sources: Sequence[str], kind: str, bind: Acquisitions | None
+) -> tuple[Acquisitions, dict[str, int | None]]:
     """The acquisitions a file's rows belong to, and ``SourceFile -> id``.
 
     With ``bind`` (an experiment's acquisitions) every source must be one
     of them, found by name; an unknown or ambiguous source is an error,
     not a new acquisition. Without it, the file's own sources are
     numbered in sorted order, which is all a standalone read can do.
+    :data:`RUN_AGNOSTIC_SOURCE` maps to ``None`` either way.
     """
+    agnostic = {RUN_AGNOSTIC_SOURCE: None} if RUN_AGNOSTIC_SOURCE in sources else {}
+    sources = [s for s in sources if s != RUN_AGNOSTIC_SOURCE]
     if bind is not None:
-        return bind, {s: bind.id_for_source(s) for s in sources}
+        return bind, {**{s: bind.id_for_source(s) for s in sources}, **agnostic}
     ordered = sorted(sources)
     table = pa.Table.from_pylist(
         [
@@ -381,7 +393,7 @@ def _acquisitions_for(sources: Sequence[str], kind: str, bind: Acquisitions | No
         ],
         schema=ACQUISITION_TABLE,
     )
-    return Acquisitions(table), {s: i for i, s in enumerate(ordered)}
+    return Acquisitions(table), {**{s: i for i, s in enumerate(ordered)}, **agnostic}
 
 
 def project_library_file(
@@ -590,10 +602,22 @@ def _project_quant(
     )
     if not (n_quant_rows or has_chromatogram or populated) or not len(precursor_rows):
         return None
-    present = sorted({sources[c] for c in source_code[precursor_rows] if sources[c]})
+    quants = (
+        _mirror.read_table(
+            con,
+            "peptidequants",
+            columns=["PrecursorCharge", "PeptideModSeq", "SourceFile", "RTInSecondsCenter",
+                     "RTInSecondsStart", "RTInSecondsStop", "TotalIntensity", "NumberOfQuantIons"],
+        )
+        if n_quant_rows
+        else None
+    )
+    present = {sources[c] for c in source_code[precursor_rows] if sources[c]}
+    if quants is not None:
+        present.update(s for s in pc.unique(quants.column("SourceFile")).to_pylist() if s)
     if not present:
         return None
-    acquisitions, acquisition_of = _acquisitions_for(present, "encyclopedia.entries", bind)
+    acquisitions, acquisition_of = _acquisitions_for(sorted(present), "encyclopedia.entries", bind)
 
     n = len(precursor_rows)
     precursor_ids = precursor_of_row[precursor_rows]
@@ -601,18 +625,22 @@ def _project_quant(
         [acquisition_of[sources[c]] for c in source_code[precursor_rows]], dtype=np.int64
     )
     intensity = np.zeros(n, dtype=np.float64)
+    rt_observed = rt[precursor_rows].astype(np.float64)
     rt_start = np.full(n, np.nan)
     rt_end = np.full(n, np.nan)
     n_ions = np.full(n, -1, dtype=np.int64)
     position_of = {int(pid): i for i, pid in enumerate(precursor_ids.tolist())}
 
-    if n_quant_rows:
-        quants = _mirror.read_table(
-            con,
-            "peptidequants",
-            columns=["PrecursorCharge", "PeptideModSeq", "SourceFile", "RTInSecondsStart",
-                     "RTInSecondsStop", "TotalIntensity", "NumberOfQuantIons"],
-        )
+    if quants is not None:
+        # A single-run result has one quantity row per entry, under the
+        # entry's own run. A report across runs (``-libexport``) has one
+        # entry per precursor but a quantity row per precursor PER RUN, so
+        # a row for a run the entry does not name is found by the
+        # precursor alone and becomes a row of its own.
+        by_form: dict[tuple[str, int], set[int]] = {}
+        for (form_key, charge_key, _source), ids in by_join_key.items():
+            by_form.setdefault((form_key, charge_key), set()).update(ids)
+        extra: dict[tuple[int, int], tuple[float, float, float, float, int]] = {}
         seen = np.zeros(n, dtype=bool)
         unmatched = ambiguous = repeated = 0
         rows = zip(
@@ -620,32 +648,50 @@ def _project_quant(
             quants.column("PrecursorCharge").to_pylist(),
             quants.column("SourceFile").to_pylist(),
             quants.column("TotalIntensity").to_pylist(),
+            quants.column("RTInSecondsCenter").to_pylist(),
             quants.column("RTInSecondsStart").to_pylist(),
             quants.column("RTInSecondsStop").to_pylist(),
             quants.column("NumberOfQuantIons").to_pylist(),
             strict=True,
         )
         spelled: dict[str, str] = {}
-        for modseq, charge, source, total, start, stop, ions in rows:
+        for modseq, charge, source, total, center, start, stop, ions in rows:
             form = spelled.get(modseq)
             if form is None:
                 form = spelled[modseq] = encyclopedia_residue_form(modseq)
             candidates = by_join_key.get((form, int(charge), source), ())
-            if not candidates:
-                unmatched += 1
-                continue
             if len(candidates) > 1:
                 ambiguous += 1
                 continue
-            i = position_of[candidates[0]]
-            if seen[i]:
+            if candidates:
+                i = position_of[candidates[0]]
+                if seen[i]:
+                    repeated += 1
+                    continue
+                seen[i] = True
+                intensity[i] = float(total)
+                rt_start[i] = np.nan if start is None else float(start)
+                rt_end[i] = np.nan if stop is None else float(stop)
+                n_ions[i] = -1 if ions is None else int(ions)
+                continue
+            elsewhere = by_form.get((form, int(charge)), set())
+            if not elsewhere:
+                unmatched += 1
+                continue
+            if len(elsewhere) > 1:
+                ambiguous += 1
+                continue
+            key = (next(iter(elsewhere)), acquisition_of[source])
+            if key in extra:
                 repeated += 1
                 continue
-            seen[i] = True
-            intensity[i] = float(total)
-            rt_start[i] = np.nan if start is None else float(start)
-            rt_end[i] = np.nan if stop is None else float(stop)
-            n_ions[i] = -1 if ions is None else int(ions)
+            extra[key] = (
+                float(total),
+                np.nan if center is None else float(center),
+                np.nan if start is None else float(start),
+                np.nan if stop is None else float(stop),
+                -1 if ions is None else int(ions),
+            )
         missing = int((~seen).sum())
         for count, what in (
             (unmatched, "matched no precursor of the entries table and are left out"),
@@ -660,6 +706,17 @@ def _project_quant(
                 f"{missing:,} precursors have no peptidequants row; their quantity is "
                 f"recorded as 0 with the number of quant ions unknown"
             )
+        if extra:
+            keys = list(extra)
+            values = np.array(list(extra.values()), dtype=np.float64)
+            precursor_ids = np.concatenate([precursor_ids, np.array([k[0] for k in keys], dtype=np.int64)])
+            acquisition_ids = np.concatenate([acquisition_ids, np.array([k[1] for k in keys], dtype=np.int64)])
+            intensity = np.concatenate([intensity, values[:, 0]])
+            rt_observed = np.concatenate([rt_observed, values[:, 1]])
+            rt_start = np.concatenate([rt_start, values[:, 2]])
+            rt_end = np.concatenate([rt_end, values[:, 3]])
+            n_ions = np.concatenate([n_ions, values[:, 4].astype(np.int64)])
+            n = len(precursor_ids)
     else:
         # No quantities in the file at all (a library with chromatograms):
         # the sum of the stored spectrum is the only number there is.
@@ -687,7 +744,7 @@ def _project_quant(
             "precursor_id": pa.array(precursor_ids, type=pa.int64()),
             "acquisition_id": pa.array(acquisition_ids, type=pa.int64()),
             "intensity": pa.array(intensity, type=pa.float64()),
-            "rt_observed": pa.array(rt[precursor_rows], type=pa.float64()),
+            "rt_observed": pa.array(rt_observed, type=pa.float64()),
             "ccs_observed": pa.array(np.full(n, -1.0), type=pa.float64()),
             "score": pa.nulls(n, type=pa.float64()),
             "rt_start": pa.array(rt_start, type=pa.float64(), mask=np.isnan(rt_start)),
@@ -698,7 +755,14 @@ def _project_quant(
     )
     if n_quant_rows:
         # A peptide's abundance is the sum over its charge states.
-        peptide_ids = peptide_of_row[precursor_rows]
+        peptide_of = dict(
+            zip(
+                precursor_of_row[precursor_rows].tolist(),
+                peptide_of_row[precursor_rows].tolist(),
+                strict=True,
+            )
+        )
+        peptide_ids = np.array([peptide_of[int(p)] for p in precursor_ids], dtype=np.int64)
         rollup = (
             pa.table({"peptide_id": peptide_ids, "acquisition_id": acquisition_ids, "abundance": intensity})
             .group_by(["peptide_id", "acquisition_id"], use_threads=False)

@@ -55,6 +55,11 @@ import constellation.massspec.acquisition_structure
 import constellation.massspec.acquisitions
 import constellation.massspec.manifest
 import constellation.massspec.experiment
+import constellation.core.detach
+import constellation.core.locks
+import constellation.massspec.cli.quantify
+import constellation.massspec.cli.report
+import constellation.massspec.cli.summarize
 import constellation.massspec.annotation
 import constellation.massspec.annotation.mzpaf
 import constellation.massspec.annotation.usi

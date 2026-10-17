@@ -12,7 +12,9 @@ One layout, discoverable from the ``manifest.json`` in each directory
         jar/                              the run's own directory: a link to its input,
                                           and what the engine wrote beside it
     <experiment>/tables/<table>/unit=<key>/acquisition_id=<id>/part-0.parquet
-    <experiment>/report/                  kind = massspec_quant_report
+    <experiment>/reports/<key>/           kind = massspec_quant_report: one report
+                                          across several searches (its tables
+                                          are partitioned under unit=<key> too)
 
 A standalone search is the same thing with one acquisition and one unit,
 so a tool that reads an experiment reads a single search too.
@@ -53,6 +55,11 @@ if TYPE_CHECKING:
 
 #: The partition levels of an experiment's tables, outermost first.
 TABLE_PARTITIONS = ("unit", "acquisition_id")
+
+#: The ``acquisition_id`` partition of rows that belong to no single
+#: acquisition: the library-level tables (protein, peptide, precursor,
+#: fragment) of a result that spans several runs, such as a report.
+ALL_ACQUISITIONS = -1
 
 
 def table_partition_dir(
@@ -113,8 +120,8 @@ class ExperimentManifest(Manifest):
     #: How entity ids were made (``massspec.library.ids.ID_SCHEME``), or
     #: ``None`` for sequential ids that mean nothing outside this experiment.
     id_scheme: str | None = None
-    #: Directory of the quantitative report, once one has been made.
-    report: str | None = None
+    #: Report key -> its directory (``reports/<key>``). One per report.
+    reports: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -185,25 +192,43 @@ class SearchManifest(Manifest):
 
 @dataclass(frozen=True)
 class QuantReportManifest(Manifest):
-    """A quantitative report across the experiment's acquisitions."""
+    """One quantitative report across several searches (EncyclopeDIA's
+    ``-libexport``: retention times aligned across the runs, every
+    precursor quantified in every run).
+
+    Written twice, like :class:`SearchManifest`: ``running`` when the
+    report starts and ``finished`` / ``failed`` / ``cancelled`` when it
+    ends; the directory's ``_SUCCESS`` is what says its tables can be
+    used.
+    """
 
     KIND = "massspec_quant_report"
     SCHEMA_VERSION = 1
 
+    status: str = ""
+    error: str = ""
     engine: str = ""
     engine_version: str = ""
+    program: str = ""
+    #: The acquisitions the report covers.
     acquisition_ids: list[int] = field(default_factory=list)
-    #: The search units the report was built from.
+    #: The search units it was made from.
     units: list[str] = field(default_factory=list)
+    #: Run name as the engine wrote it into the report -> acquisition id.
+    sources: dict[str, int] = field(default_factory=dict)
     stage_key: str = ""
+    inputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     parameters: dict[str, Any] = field(default_factory=dict)
     argv: list[str] = field(default_factory=list)
+    engine_flags: dict[str, str] = field(default_factory=dict)
+    engine_settings: dict[str, str] = field(default_factory=dict)
     outputs: dict[str, str] = field(default_factory=dict)
     runtime: dict[str, Any] = field(default_factory=dict)
     caveats: list[str] = field(default_factory=list)
 
 
 __all__ = [
+    "ALL_ACQUISITIONS",
     "TABLE_PARTITIONS",
     "ExperimentManifest",
     "QuantReportManifest",

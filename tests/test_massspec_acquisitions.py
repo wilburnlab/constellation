@@ -142,9 +142,10 @@ def _order_by_id(acq: Acquisitions) -> dict[int, int | None]:
 
 
 def test_schema_has_version_and_instrument_fields() -> None:
-    assert ACQUISITION_TABLE.metadata[b"schema_version"] == b"2"
-    assert ACQUISITION_SCHEMA_VERSION == 2
+    assert ACQUISITION_TABLE.metadata[b"schema_version"] == b"3"
+    assert ACQUISITION_SCHEMA_VERSION == 3
     assert ACQUISITION_TABLE.field("source_sha256").nullable
+    assert ACQUISITION_TABLE.field("merged_from").type == pa.list_(pa.int64())
     names = set(ACQUISITION_TABLE.names)
     assert {"instrument_serial", "instrument_model", "acquisition_order"} <= names
     assert ACQUISITION_TABLE.field("instrument_serial").type == pa.string()
@@ -451,3 +452,34 @@ def test_identity_columns_survive_reordering() -> None:
     ordered = acq.with_source_alias(0, "a.dia").with_acquisition_order()
     row = ordered.table.to_pylist()[0]
     assert (row["source_sha256"], row["source_aliases"], row["acquisition_order"]) == ("aa", ["a.dia"], 1)
+
+
+def test_a_merged_spectra_file_is_an_acquisition_that_names_its_runs() -> None:
+    """Searched as one, a merge of fractions is bound by its own file name
+    (the name a result reports), and records what it was made from."""
+    from constellation.massspec.acquisitions import MERGED_KIND
+
+    acq, ids = Acquisitions.empty().register(
+        [{"source_file": f"/d/gpf-{i}.raw", "source_kind": "thermo_raw"} for i in range(3)]
+    )
+    merged = {"source_file": "gpf-merged.dia", "source_kind": MERGED_KIND, "merged_from": ids}
+    acq, (m,) = acq.register([merged])
+    assert m == 3 and acq.id_for_source("gpf-merged.dia") == 3
+    assert acq.table.column("merged_from").to_pylist() == [None, None, None, [0, 1, 2]]
+    # The same merge again is the same acquisition...
+    assert acq.register([merged])[1] == [3]
+    # ...and the name cannot be reused for a different one.
+    with pytest.raises(ValueError, match="cannot also be a merge of"):
+        acq.register([{**merged, "merged_from": [0, 1]}])
+
+
+def test_a_table_from_before_merges_loads(tmp_path) -> None:
+    """Version 2 had no merged_from column; it reads back as null."""
+    import pyarrow.parquet as pq
+
+    from constellation.massspec.acquisitions import load_acquisitions
+
+    acq = Acquisitions.from_records([{"acquisition_id": 0, "source_file": "a.raw", "source_kind": "x"}])
+    pq.write_table(acq.table.drop_columns(["merged_from"]), tmp_path / "acquisitions.parquet")
+    loaded = load_acquisitions(tmp_path)
+    assert loaded.table.column("merged_from").to_pylist() == [None]

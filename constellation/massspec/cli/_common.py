@@ -166,7 +166,72 @@ def _add_jvm_args(p: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_encyclopedia_passthrough_arg(p: argparse.ArgumentParser) -> None:
+#: Set in a detached run's environment, so that it runs in the foreground
+#: whatever its command line says (an abbreviation of --detach would
+#: otherwise detach it again, without end).
+_DETACHED_ENV = "CONSTELLATION_DETACHED"
+
+
+def _add_detach_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--detach",
+        action="store_true",
+        help=(
+            "start in the background, detached from this terminal, and return at "
+            "once. Output goes to <output-dir>/runs/<time>-<command>.log; "
+            "`constellation massspec summarize <output-dir> --follow` follows it, "
+            "and `kill -TERM -<pid>` stops it in order."
+        ),
+    )
+
+
+def _detach_if_asked(args: argparse.Namespace, output_dir: Path, label: str) -> int | None:
+    """With ``--detach``: start this same command again, detached, and
+    return the exit status for this one. ``None`` to carry on here."""
+    import os
+
+    if not getattr(args, "detach", False) or os.environ.get(_DETACHED_ENV):
+        return None
+    from constellation.core.detach import launch
+
+    raw = getattr(args, "_raw_argv", None)
+    if raw is None:
+        print("error: --detach works from the `constellation` command line", file=sys.stderr)
+        return 2
+    experiment = Path(output_dir).resolve()
+    experiment.mkdir(parents=True, exist_ok=True)
+    argv = [a for a in raw if a != "--detach"]
+    run = launch(
+        [sys.executable, "-m", "constellation.cli", *argv],
+        run_dir=experiment / "runs",
+        label=label,
+        env={**os.environ, _DETACHED_ENV: "1"},
+    )
+    print(f"detached: pid {run.pid}, log {run.log}")
+    print(f"follow with: constellation massspec summarize {experiment} --follow")
+    print(f"stop with:   kill -TERM -{run.pid}")
+    return 0
+
+
+def _note_stopped(what: str) -> None:
+    """The last line a stopped run leaves in its log (Ctrl-C, or a
+    SIGTERM / SIGHUP that the JVM runner turned into an orderly stop)."""
+    print(
+        f"stopped: {what} recorded as cancelled; the same command with --resume runs "
+        f"only what did not finish",
+        file=sys.stderr,
+    )
+
+
+def _add_encyclopedia_passthrough_arg(p: argparse.ArgumentParser, *, bare_flags: bool = True) -> None:
+    """``--encyclopedia-arg``. ``bare_flags=False`` for the commands that
+    read it as a flag mapping (``search``, ``report``, ``quantify``),
+    which refuse an item without ``=``."""
+    tail = (
+        "Items without '=' pass through as bare flags."
+        if bare_flags
+        else "Every item is -flag=value; an empty value is -flag= (EncyclopeDIA has no bare flags)."
+    )
     p.add_argument(
         "--encyclopedia-arg",
         action="append",
@@ -174,8 +239,7 @@ def _add_encyclopedia_passthrough_arg(p: argparse.ArgumentParser) -> None:
         metavar="FLAG=VALUE",
         help=(
             "repeatable escape hatch for unwrapped EncyclopeDIA flags "
-            "(e.g. --encyclopedia-arg '-percolatorVersion=v3-05'). Items "
-            "without '=' pass through as bare flags."
+            f"(e.g. --encyclopedia-arg '-percolatorVersion=v3-05'). {tail}"
         ),
     )
 

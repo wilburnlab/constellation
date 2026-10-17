@@ -8,7 +8,10 @@ each holding the verb's parser and its handler:
     search             EncyclopeDIA search of one acquisition, written as
                        an experiment directory
     summarize          what an experiment directory, or one search in it,
-                       holds
+                       holds (and --follow for a detached run)
+    report             EncyclopeDIA's quantitative report across searches
+    quantify           the chromatogram-library workflow: merged fractions,
+                       run searches, report
     predict_library    FASTA -> predicted library (EncyclopeDIA or Koina)
     library_export     EncyclopeDIA's quantitative report
     novel_peptides     classify-novel-peptides
@@ -44,6 +47,8 @@ from constellation.massspec.cli.novel_peptides import (
     _build_classify_novel_peptides_parser,
 )
 from constellation.massspec.cli.predict_library import _build_predict_library_parser
+from constellation.massspec.cli.quantify import _build_quantify_parser
+from constellation.massspec.cli.report import _build_report_parser
 from constellation.massspec.cli.search import _build_search_parser
 from constellation.massspec.cli.summarize import _build_summarize_parser
 
@@ -81,6 +86,8 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     _build_convert_parser(ms_subs)
     _build_search_parser(ms_subs)
     _build_summarize_parser(ms_subs)
+    _build_report_parser(ms_subs)
+    _build_quantify_parser(ms_subs)
     _build_predict_library_parser(ms_subs)
     _build_library_export_parser(ms_subs)
     _build_classify_novel_peptides_parser(ms_subs)

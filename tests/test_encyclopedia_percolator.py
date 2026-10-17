@@ -119,7 +119,10 @@ def test_search_refuses_before_starting_the_jar(
 
     from test_massspec_search_workflow import _bundle
 
+    started = []
+
     def _must_not_run(*_args, **_kwargs):
+        started.append(True)
         raise AssertionError("the jar was started despite the Percolator pre-flight")
 
     monkeypatch.setattr(workflow, "run_program", _must_not_run)
@@ -144,8 +147,10 @@ def test_search_refuses_before_starting_the_jar(
     assert main(argv) == 1
     err = capsys.readouterr().err
     assert "bundled Percolator 3.01 cannot run on this kernel" in err
-    assert not (tmp_path / "out" / "units").exists()
+    assert not (tmp_path / "out" / "units").exists() and started == []
 
-    # Choosing a build that runs here gets past the pre-flight.
-    with pytest.raises(AssertionError, match="the jar was started"):
-        main([*argv, "--percolator-version", "v3-05"])
+    # Choosing a build that runs here gets past the pre-flight to the jar
+    # (which, standing in, fails the search; the command reports it).
+    assert main([*argv, "--percolator-version", "v3-05"]) == 1
+    assert started == [True]
+    assert "the jar was started" in capsys.readouterr().err

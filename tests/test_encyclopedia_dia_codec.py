@@ -29,6 +29,7 @@ from constellation.massspec.acquisition_structure import infer_acquisition_struc
 from constellation.massspec.io.encyclopedia import (
     DiaFile,
     DiaReader,
+    SpectraWriteStopped,
     diff_dia,
     import_dia,
     write_dia,
@@ -311,6 +312,22 @@ def test_export_is_atomic_and_refuses_to_overwrite(tmp_path: Path) -> None:
         write_dia([bundle], out)
     write_dia([bundle], out, overwrite=True)
     assert [p.name for p in tmp_path.glob(".run.dia.tmp-*")] == []  # no leftovers
+
+
+def test_export_stops_between_chunks_when_asked(tmp_path: Path) -> None:
+    bundle = _write_bundle(tmp_path, "run", _dia_scans())
+    out = tmp_path / "run.dia"
+    asked = []
+
+    def should_stop() -> bool:
+        asked.append(1)
+        return len(asked) > 2  # the third chunk
+
+    with pytest.raises(SpectraWriteStopped, match="stopped writing run.dia at scan 8 of"):
+        write_dia([bundle], out, chunk_scans=4, should_stop=should_stop)
+    assert not out.exists() and list(tmp_path.glob(".run.dia.tmp-*")) == []
+    write_dia([bundle], out, chunk_scans=4, should_stop=lambda: False)  # never asked to stop
+    assert out.is_file()
 
 
 # ── DDA ────────────────────────────────────────────────────────────────

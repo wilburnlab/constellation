@@ -6509,6 +6509,8 @@ def main(argv: list[str] | None = None) -> int:
         raw = ["dashboard"]
     parser = _build_parser()
     args = parser.parse_args(raw)
+    # Kept for commands that start themselves again (`--detach`).
+    args._raw_argv = raw
     return args.func(args)
 
 

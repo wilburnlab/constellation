@@ -34,6 +34,15 @@ def _build_summarize_parser(subs: argparse._SubParsersAction) -> None:
         action="store_true",
         help="print the summary as JSON instead of text",
     )
+    p.add_argument(
+        "--follow",
+        action="store_true",
+        help=(
+            "first follow the experiment's latest detached run (`--detach` on "
+            "search, report or quantify): stream its log until it ends, then "
+            "summarize. Exit status is the run's."
+        ),
+    )
     p.set_defaults(func=_cmd_massspec_summarize)
 
 
@@ -43,6 +52,26 @@ def _cmd_massspec_summarize(args: argparse.Namespace) -> int:
     from constellation.core.manifests import ManifestError
     from constellation.massspec.experiment import format_summary, summarize
 
+    status = 0
+    if args.follow:
+        from constellation.core.detach import follow, latest
+
+        directory = Path(args.experiment_dir).resolve()
+        if directory.parent.name in ("units", "reports"):
+            directory = directory.parent.parent
+        run = latest(directory / "runs")
+        if run is None:
+            print(f"error: no detached run is recorded under {directory / 'runs'}", file=sys.stderr)
+            return 2
+        print(f"following {run.label} (pid {run.pid}, started {run.started_at}): {run.log}",
+              file=sys.stderr)
+        code = follow(run)
+        if code is None:
+            print(f"{run.label} stopped without an exit status (killed outright?)", file=sys.stderr)
+            status = 1
+        else:
+            print(f"{run.label} ended with exit status {code}", file=sys.stderr)
+            status = code
     try:
         summary = summarize(args.experiment_dir)
     except (ValueError, ManifestError, FileNotFoundError) as exc:
@@ -52,4 +81,4 @@ def _cmd_massspec_summarize(args: argparse.Namespace) -> int:
         print(json.dumps(summary, indent=2))
     else:
         sys.stdout.write(format_summary(summary))
-    return 0
+    return status
