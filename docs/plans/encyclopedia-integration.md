@@ -139,8 +139,144 @@ Plan approved by the PI on 2026-10-10. Eight PR-sized phases (P0–P7).
     normalisation dropped the whole line. It now keeps what stood before the interruption; sixty
     consecutive captures of the affected program match the snapshot.
   - The review's two requirements for P4 are added to its acceptance criteria below.
-- **P4–P7: not started.** `process-dia` (jar-side conversion) is still a CLI verb; the plan
-  removes it in P4, once the new search path takes bundles directly.
+- **P4 (single-acquisition path): done, 2026-10-12.**
+  - **What `massspec search` is now.** `--input` is one acquisition (a `massspec convert`
+    bundle, a Thermo `.raw`, or a single-run spectra file), `--output-dir` an *experiment
+    directory*. `massspec/workflows/encyclopedia.py` registers the acquisition, writes the
+    spectra file itself (once per acquisition, `spectra/<run>/<run>.dia`), runs the jar in the
+    search's own directory on a link to it, reads the result, and writes
+    `units/<unit>/{manifest.json, _SUCCESS, jar/, logs/}` and
+    `tables/<table>/unit=<unit>/acquisition_id=<id>/part-0.parquet` under content-derived ids,
+    with the experiment manifest at the root. `<unit>` is `<run>-<8 hex digits>`: every search
+    has a directory of its own (below). The jar's files in `jar/` carry its own names
+    (`<run>.dia.elib`, `<run>.dia.encyclopedia.txt`, …). Another search into the same
+    experiment, of a new acquisition or of one searched before, adds a unit and a partition
+    beside what is there, with the same ids for whatever they share. `--search-mode` defaults
+    from the data; `spectrum-centric` is refused as not yet available (P6). `process-dia` is removed.
+    Refused before the JVM starts: mzML / `.d` / `.wiff` input, a merged spectra file,
+    peptide-centric search of DDA data, a missing library, an undocumented flag, a Percolator
+    that cannot run here.
+  - **The pieces.** `search/encyclopedia/runner.py` (any program, flags checked against the
+    captured help; also `massspec encyclopedia run` and `flags`), `params.py` (the mode
+    resolver and the typed settings), `outputs.py` (a finished run held to the captured file
+    inventory), `io/encyclopedia/_mirror.py` (SQLite → Arrow for any table, streaming) and
+    `_project.py` (the tables Constellation models). `read_encyclopedia` is a wrapper over the
+    last two; the old annotator is deleted. New: `PRECURSOR_SCORE_TABLE` (decoys included),
+    `PRECURSOR_QUANT.{rt_start, rt_end, n_quant_ions}`, `SearchManifest.sources`,
+    `quant.targets.targets_from_experiment`.
+  - **Acceptance, on the reference wide-window run through the new command**
+    (`massspec search --input <bundle> --output-dir <experiment>`, the reference parameters):
+    - Against the GUI reference result (`compare-results`): the same 31,833 precursors and
+      5,168 proteins, retention times identical, quantities identical for all 26,130 quantified
+      precursors.
+    - Tables against the jar's result library, by SQL: every row count equal (31,833
+      precursors, 1,181,711 fragment rows = stored peaks, 32,150 score rows with their 317
+      decoys, 5,168 protein scores, 35,443 protein links).
+    - Field level, with the ids recomputed independently from the `entries` spelling: all
+      31,833 precursors agree with the jar on id, m/z, retention time, quantity, integration
+      window, quantified-ion count, peak count and peak intensities; all 32,150 score rows on
+      q-value and posterior error probability.
+    - No orphan id in any of nine foreign-key directions; every quantity and score row under
+      acquisition 0, which the unit manifest records as the binding of the run name the result
+      uses; no caveats.
+    - 688 s in all: 113 s writing the 2.3 GB spectra file (once; a later search of the
+      acquisition skips it), 544 s in the jar, the rest reading the result and writing 25 MB of
+      tables. `--resume` afterwards returns in 2.4 s.
+    - These are the numbers of the final layout (below). The same run under the two earlier
+      layouts gave the same result, in 617 s and 649 s (the jar's share was 489 to 544 s
+      across the three).
+  - **From a `.raw`, and a second acquisition.** `--input <the GPF 900–1000 .raw>` converted
+    it into `<experiment>/bundles/`, searched it and wrote the tables in 212 s; the result is
+    identical to the search from the already-converted bundle (3,600 precursors, 2,524
+    proteins; retention times, scores and quantities equal). Searching the 800–900 fraction
+    into the same directory added acquisition 1 (7,308 precursors) beside it, both passing the
+    same field-level check; the 1,629 proteins the two share have the same id in both (the two
+    fractions share no peptide, being disjoint m/z ranges). The opt-in reference test
+    (`tests/test_encyclopedia_search_reference.py`) was rewritten for the new command and
+    passes on the same fraction. (These three were run under the first layout; conversion,
+    registration and the tables are the same code in the final one.)
+  - **Binding is explicit.** The unit knows which acquisition it searched; it checks that the
+    result names that run and no other, and records the pairing in its manifest. A result that
+    names a different run is an error (tested), not rows filed under the wrong acquisition.
+  - **`chromatogram extract --targets`** takes the experiment (while it holds one acquisition)
+    or a unit directory: given the unit directory of the GPF 900–1000 fraction it extracted
+    227,765 trace rows for all 3,600 identified precursors.
+  - **The reader, checked against SQL on three real results** (survey note, "The reader that
+    replaced it"): row counts and every precursor's quantity, retention time, integration
+    window and ion count agree; every stored peak is a fragment row; 9.5 s for the result the
+    old reader took 223 s over. The 2.5-million-entry predicted library reads without
+    fragments in 190 s at 4.2 GB.
+  - **Every search has its own directory (PI, 2026-10-12); what is not copied from the jar.**
+    EncyclopeDIA writes its outputs beside its input and, by design, takes a result it finds
+    there for a finished search: the result is its `_SUCCESS` flag, bound to a location, and
+    settings are not compared. I met it as a surprise (a test of re-searching with different
+    settings would not fail; the real jar, asked for 0.2 Da over a finished 0.35 Da search,
+    logged "Previously found 3600 peptides" and exited 0 in 36 s). My first two layouts each
+    kept half of that model: one unit per acquisition, emptied and searched again, so that a
+    new search *destroyed* the earlier one where the jar would have *returned* it. The PI
+    corrected both halves:
+    - **The spectra file is linked, not rewritten.** It is written once per acquisition, and
+      each search's `jar/` holds a link to it and, before the run, nothing else; the jar is
+      run on the link with no `-o`, so it writes there under its own names and always sees a
+      new search. Checked on the real jar first (survey note, "A result beside the input is
+      the jar's completion marker"): it does not follow the symlink back, so nothing is
+      written beside the target and a finished search sitting there is not seen.
+    - **A unit is a search, not an acquisition.** Its key is the run name plus a digest of the
+      spectra, library, FASTA, settings and jar version. The same acquisition searched with
+      anything changed goes into another directory and another `unit=` partition of every
+      table; nothing already there is touched. Only the very same search maps to the same
+      directory, which is what `--resume` finds; without `--resume` that one search is run
+      again in its own directory, emptied first. How the tables are written (`--no-fragments`)
+      and how many threads the jar is given are not part of the digest.
+    Consequence for readers: "the result for acquisition N" has to name the search once there
+    is more than one. `read_experiment_table(..., unit=)`, `targets_from_experiment(..., unit=)`
+    and a unit directory given to `chromatogram extract --targets` all do; the bare experiment
+    is refused with the choices listed.
+    On real data, through the command, into one experiment: the GPF 900–1000 fraction at
+    0.35 Da (3,600 precursors, 91 s) and then the same acquisition at 0.2 Da (3,583, 58 s, no
+    time spent on the spectra file). Two directories and two partitions; all 30 files of the
+    first search unchanged afterwards; each result library records its own `-ptol`; both pass
+    the field-level check against their own result; `--resume` finds either in 2.3 s; the
+    experiment as chromatogram targets is refused with both listed, and each search's
+    directory gives its own 3,600 or 3,583. A spectra file given where it lies, with a
+    finished search beside it, is searched properly through an absolute link and nothing is
+    written next to it.
+    The link is a relative symlink, falling back to a hard link and then a copy where the
+    filesystem has no symlinks. The settings a result records are still compared with the ones
+    passed (a difference is a warning and a caveat in the manifest). The output inventory was
+    re-captured from such a directory: the same 24 files as before, named `<input>.*`. The
+    four legacy wrappers pass the caller's directory straight through, so for them the jar's
+    marker remains the caller's to know (review note, "A result beside the input means the
+    search is finished").
+  - **For P6:** a ScribeTwo DDA result stores whole observed spectra (about 1,080 peaks per
+    entry, 99.6% matching no fragment at 20 ppm), so its fragment table needs the result's own
+    tolerance and probably a rule about unmatched peaks.
+  - **`massspec summarize` (PI, 2026-10-17).** The other half of naming search directories
+    `<run>-<digest>`: the name keeps searches apart and never invites an overwrite, and the
+    summary says what each one is, rather than trying to make the name informative. Given an
+    experiment it lists the acquisitions by name and every directory under `units/`, finished
+    or not, with status, library, FASTA, settings in Constellation's spelling, what it found, and
+    what sets it apart from the other searches of the same acquisition; given one search's
+    directory, every setting the jar recorded, the flags given, the command line, inputs and
+    caveats. `--json` for the data (`massspec.experiment.summarize`). To make failed and stopped
+    searches describable, the search manifest is now written when a search starts (`running`,
+    with the flags passed) as well as when it ends (`finished` / `failed` / `cancelled`, with the
+    error, and with every setting the jar recorded in its result, defaults included), and the
+    experiment's own manifest is written as soon as the acquisition is registered, so even an
+    experiment whose only search failed can be read.
+    On real data (one GPF fraction searched at 0.35 Da and at 0.2 Da into one experiment, and a
+    third search at 0.25 Da stopped with SIGTERM after 25 s): the summary lists the two
+    finished searches with their 3,600 and 3,583 precursors and the cancelled one with
+    "stopped by a signal (exit status 143)" and its settings marked as given; each search's
+    difference from the others is its precursor tolerance and nothing else (the jar's default
+    `trypsin` and its recorded `Trypsin` are not counted as a difference); no JVM or helper
+    server was left running after the cancel.
+  - **Not done in P4:** `<experiment>/library/` (nothing writes a shared library yet; each
+    acquisition's partition carries its own rows), text sidecars and the remaining result
+    tables (P7), and anything across acquisitions (P5). For P5: `-libexport` pairs each spectra
+    file with the `<file>.elib` beside it, which is what a unit's `jar/` now holds, but it has
+    not been run on symlinked `.dia` files yet.
+- **P5–P7: not started.**
 - **Naming (PI, 2026-10-11).** No command or flag is named `dia`: DIA is an acquisition method,
   and `.dia` is one tool's file extension. The P1 commands were first built as
   `massspec dia {export,import,diff}` and renamed to the `massspec encyclopedia …-spectra` group
@@ -301,8 +437,9 @@ ScribeTwo. All from a Stellar (ion trap; searched at 0.35 AMU).
   ```
   <experiment>/manifest.json          kind=massspec_experiment
   <experiment>/acquisitions/  library/
-  <experiment>/units/<key>/           manifest.json (kind=massspec_search), _SUCCESS, jar/ (.dia, .elib, sidecars, logs)
-  <experiment>/tables/<table>/acquisition_id=<id>/part-0.parquet
+  <experiment>/spectra/<run>/         <run>.dia, written once per acquisition (added in P4)
+  <experiment>/units/<key>/           manifest.json (kind=massspec_search), _SUCCESS, jar/ (a link to the .dia, .dia.elib, sidecars), logs/
+  <experiment>/tables/<table>/unit=<key>/acquisition_id=<id>/part-0.parquet   (the unit level added in P4)
   <experiment>/report/                kind=massspec_quant_report
   ```
 

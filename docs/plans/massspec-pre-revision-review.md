@@ -20,6 +20,14 @@ line is now tracked as data; see [`encyclopedia-6.9.23-survey.md`](encyclopedia-
 which replaces the 6.5.15 utilities notes this review cites. Statements below about "6.5.15" and
 about what the jar accepts describe the state at `9e42224`.
 
+**Since 2026-10-12 (phase 4 of the EncyclopeDIA integration):** `massspec search` no longer goes
+through the `run_library_search` wrapper and the ingest described below. It takes an acquisition
+(bundle, `.raw` or spectra file), writes an experiment directory, and reads the result with a new
+reader ([`encyclopedia-integration.md`](encyclopedia-integration.md), P4). The `process-dia` verb
+is gone. The four wrappers, and everything this note says about the pipeline, are unchanged:
+the pipeline still calls them directly. `read_encyclopedia`, which the pipeline's ingest helper
+and `library-export` use, is now the new reader, so defect 11 is closed for every caller.
+
 ## 1. What is in `massspec`
 
 About 28k lines: nine subpackages and one CLI module.
@@ -73,6 +81,29 @@ No mzML, Bruker `.d`, mzSpecLib, mzIdentML or mzTab reader exists. Because `.dia
 - **Java** ([`thirdparty/jvm.py`](../../constellation/thirdparty/jvm.py)): `java` on `PATH` is tried
   first and the JRE bundled with the jar is only a fallback. `environment.yml` installs `openjdk`,
   so inside the conda env the jar runs under conda's Java, not its own.
+
+### A result beside the input means the search is finished
+
+Not a defect: this is how EncyclopeDIA is designed (PI, 2026-10-12), and it is written down here
+because the wrappers and the pipeline lean on it without saying so. The jar writes its outputs
+beside its input, named for it (`run.dia` → `run.dia.elib`, `run.dia.encyclopedia.txt`, …; with
+`-o X.encyclopedia.txt`, as `X.*` beside `X`). A result already there is the jar's own `_SUCCESS`
+flag: it logs "Previously found N peptides identified at 1.0% FDR" and returns that result
+without searching, whether or not the settings match. Measured on 6.9.23: a GPF fraction searched
+at 0.35 Da and searched again into the same directory at 0.2 Da came back in 36 s with the
+0.35 Da result (3,600 precursors; a real 0.2 Da search gives 3,583).
+
+What follows from it:
+
+- Re-running into a directory with unchanged settings is the jar resuming, as intended.
+- Re-running into it with *different* settings returns the old result under the new settings'
+  name. The four wrappers pass the caller's output directory straight through and the pipeline's
+  `--resume` does not key a stage on its settings, so that is possible there: a stage directory
+  reused by hand, or stage 7 picked up after an interruption that left the jar's files but no
+  `_SUCCESS` (read, not run). Left as it is, with the rest of the pipeline.
+- `massspec search` (since 2026-10-12) gives each search a directory of its own, with the spectra
+  file linked in and nothing else, so the jar always sees a new search; see
+  [`encyclopedia-integration.md`](encyclopedia-integration.md), P4.
 
 ### Standalone verbs
 
@@ -215,6 +246,10 @@ Each is marked **run** (reproduced) or **read** (from the code only).
 3. **A Search bundle ingested from an `.elib` yields zero XIC targets** (read). `targets_from_search`
    reads only `psms`; the EncyclopeDIA reader leaves `psms` empty and the ParquetDir writer always
    writes the empty `psms.parquet`, so `load_targets` picks that path and returns nothing, silently.
+   **A way round since 2026-10-12, the defect itself unchanged:** the directory `massspec search`
+   now writes (an experiment, or one of its unit directories) is a target source: `load_targets`
+   recognises it by its manifest and returns every identified precursor at its observed retention
+   time with the engine's integration window. A Search ParquetDir on its own still yields nothing.
 4. **A Quant bundle cannot be used as XIC targets from the CLI** (read). `load_targets` needs
    `library=` for that source and `chromatogram extract` has no `--library` flag
    (`_cmd_chromatogram_extract` in [`massspec/cli/chromatogram.py`](../../constellation/massspec/cli/chromatogram.py)), so it raises. This is the
@@ -266,6 +301,15 @@ Each is marked **run** (reproduced) or **read** (from the code only).
     reports the first three points as `caveats` with counts, which the standalone commands print
     and write to their manifests (the pipeline's helper does not show them). The numbers are
     unchanged until the phase 4 reader of the EncyclopeDIA integration replaces this path.
+    **Closed 2026-10-12.** `read_encyclopedia` is rebuilt on that reader
+    (`io/encyclopedia/{_mirror,_project}.py`). On the same result: `precursor_quant.intensity`
+    equals `TotalIntensity` for every precursor and the unquantified ones are 0 with
+    `n_quant_ions` 0; every peptide has its quantity; all 1,181,605 stored peaks are fragment
+    rows (93.3% b/y, 6.7% intact precursor, none unannotated); integration boundaries and decoy
+    score rows are carried (`rt_start` / `rt_end`, `PRECURSOR_SCORE_TABLE`); it takes 9.5 s.
+    Chromatograms, correlations and quantified-ion flags are reachable through the mirror layer
+    and get their own tables in phase 7. The pipeline's Parquet numbers change accordingly
+    (accepted by the PI, 2026-10-11).
 
 ## 6. Stale docstrings, also left as they are
 
@@ -273,5 +317,7 @@ Each is marked **run** (reproduced) or **read** (from the code only).
 - `massspec/library/io.py` says the `.dlib` reader and writer are `NotImplementedError` stubs.
 - `massspec/search/collision.py` says the filter is opt-in and wired only behind
   `classify-novel-peptides`; it has its own verb and is on by default in the pipeline.
+- `transcriptome_to_proteome.py` describes stage 6 as `constellation massspec process-dia`; that
+  verb was removed on 2026-10-12 (the stage calls `run_process_dia` directly and is unaffected).
 - The `NOVEL_PEPTIDE_TABLE` header comment says one row per peptide sequence; the classifier emits
   one per `(peptide_sequence, modified_sequence)`.

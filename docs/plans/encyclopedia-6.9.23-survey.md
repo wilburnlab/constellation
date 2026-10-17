@@ -194,11 +194,13 @@ prediction; `-models`, `-url`).
 - **Peptide-centric sidecars**: `.features.txt` (Percolator input, 35 columns),
   `.encyclopedia.txt` and `.encyclopedia.decoy.txt` (Percolator output), `.encyclopedia.txt.model`,
   `first` / `final` `rt_fit`, `ms1_fit`, `ms2_fit` tables with PDFs, `.encyclopedia.txt.log`. The
-  GUI writes them all beside the input as `<input>.dia.*`. From the command line with
-  `-o <dir>/<run>.encyclopedia.txt` and the JVM's working directory set to `<dir>` (what
-  `massspec search` does), all 24 files land in `<dir>` as `<run>.*`, the result library as
-  `<run>.elib`, and nothing is written beside the input. The inventory is checked in
-  (`outputs/encyclopedia.json`).
+  GUI writes them all beside the input as `<run>.dia.*`, and so does the command line when no
+  `-o` is given: 24 files, the result library as `<run>.dia.elib`. With
+  `-o <dir>/<run>.encyclopedia.txt` the same 24 land in `<dir>` as `<run>.*` instead and nothing
+  is written beside the input (how `massspec search` ran until 2026-10-12; it now runs the jar on
+  a link in the search's own directory with no `-o`, see "A result beside the input is the jar's
+  completion marker" below). The inventory of the default arrangement is checked in
+  (`outputs/encyclopedia.json`, names as `<input>.*` where `<input>` is the input's file name).
 
 ## Running a search (first real run, 2026-10-11)
 
@@ -252,6 +254,34 @@ other three are the thread count, the Percolator path and `pi0`.
   `-Djava.awt.headless=true`, no JVM crash, nothing on stderr. (The XML limits concern mzML
   input, which was not exercised. Whether that old WSL2 segfault was really the JIT, or the
   Percolator crash below seen from further away, is not known.)
+
+### A result beside the input is the jar's completion marker
+
+By design (PI, 2026-10-12): the jar writes its outputs beside its input, named for it, and a
+result already there tells it the search is finished. It works as the jar's own `_SUCCESS` flag,
+and it does not compare settings. Noticed when a test of re-searching one acquisition with
+different settings would not fail the way it should have; then measured on a GPF fraction, first
+searched at `-ptol 0.35` (AMU):
+
+| Second search, asked for at `-ptol 0.2` | Wall | What the jar did | Precursors | `-ptol` in the result's metadata |
+|---|---|---|---|---|
+| into the directory holding the first search's files | 36 s | logged "Previously found 3600 peptides identified at 1.0% FDR", exited 0 | 3,600 | 0.35 |
+| in a fresh directory holding only a symlink to the `.dia`, no `-o`; the first search's files sit beside the link's *target* | 56 s | a full search; outputs beside the link as `<run>.dia.*`; nothing written beside the target | 3,583 | 0.2 |
+| the real `.dia` used where it is, the first search's files beside it, `-o` naming a report in another fresh directory | 52 s | a full search; outputs as the `-o` name's `.*` in that directory | 3,583 | 0.2 |
+
+So: the marker is looked for where the outputs go, which is beside the input unless `-o` moves
+them; the jar does not follow a symlink back to its target's directory; and a `.dia` opens through
+a symlink. (The frozen pipeline's notes record that a Thermo `.raw` does *not*, which is why it
+hard-links; Constellation never hands the jar a `.raw`.) The class files carry the same message
+for ScribeTwo.
+
+What Constellation does with this (PI's arrangement): every search gets a directory of its own
+holding a link to the spectra file and nothing else, and the jar is run on the link with no `-o`.
+Its outputs then carry the jar's own names (`<run>.dia.elib`), which is the layout `-libexport`
+pairs up, and the spectra file is written once per acquisition however many times it is searched.
+`outputs/encyclopedia.json` is the inventory of such a directory. As a second check the workflow
+compares the settings a result records about itself (the result library's `metadata` table lists
+most flags under their own names) with the ones it passed.
 
 ### Percolator on a `vsyscall=none` kernel (WSL2)
 
@@ -354,6 +384,35 @@ ahead of the residue's own modification if it has one (`C[+42.010565][+57.021463
 `PeptideModSeq` loses them; `compare_results` normalises to one spelling
 (`_result_diff._precursor_key`), and the phase 4 reader must do the same.
 
+### The reader that replaced it (phase 4, 2026-10-12)
+
+`read_encyclopedia` is now two layers. `io/encyclopedia/_mirror.py` copies any table of a
+`.dlib` / `.elib` to Arrow in batches, decoding the array columns from one codec map; it opens
+the file read-only and immutable. `_project.py` builds `Library` / `Quant` / `Search` from the
+tables Constellation models. Checked field by field against SQL on three real files:
+
+| File | Precursors | Result |
+|---|---|---|
+| Run A, peptide-centric result (`.elib`) | 31,830 | Row counts equal SQL. Every precursor's quantity, retention time, integration window and ion count, and every score row, equal the file's. 1,181,605 fragment rows = stored peaks: 93.3% b/y, 6.7% intact precursor (`p`, `p-H2O`, `p-NH3` at any charge to the precursor's), none unannotated. 9.5 s with fragments, 1.5 s without (the old reader: 223 s, then 37 s) |
+| GPF chromatogram library (`.elib`) | 76,448 | Same checks pass |
+| ScribeTwo DDA result (`.dia.dlib`) | 17,640 | Same checks pass; see below for its stored spectra |
+| Predicted human library (`.dlib`) | 2,499,798 | Read without fragments in 190 s at 4.2 GB; 20,597 proteins, 1,390,718 peptides. The old reader could not finish it |
+
+The five points above, in the new reader: (1) `precursor_quant.intensity` is `TotalIntensity`;
+`n_quant_ions` 0 marks identified-not-quantified. (2) Fixed in phase 3. (3) Every stored peak
+is a fragment row: b/y at any charge up to the precursor's (the nearer ion, the lower charge on
+a tie), the intact precursor as an mzPAF `p` ion, anything else kept unannotated. (4)
+Integration boundaries and decoy score rows are carried; chromatograms, correlations and the
+quantified-ion flags are reachable through the mirror and get their own tables in phase 7. (5)
+See the table.
+
+**A ScribeTwo DDA result stores whole observed spectra, not matched ions.** The reference DDA
+result holds 19.1 million peaks for 17,640 entries (about 1,080 per entry, against 37 in a
+peptide-centric result), and 99.6% of them match no b/y or precursor ion at 20 ppm. So its
+fragment table is nearly all unannotated rows, and annotating it properly means using the
+tolerance the result itself records (it is ion-trap data searched at 0.35 Da), and probably
+not writing the unmatched peaks as library fragments at all. That is phase 6's to decide.
+
 ## Open items
 
 - Whether `-libexport` needs `-f` in its default mode, and how its Percolator is selected
@@ -363,6 +422,9 @@ ahead of the residue's own modification if it has one (`C[+42.010565][+57.021463
   reference writes a sample).
 - Whether `vsyscall=emulate` in `.wslconfig` makes the bundled Percolator 3.01 run under WSL2
   (expected; untested).
+- Which of its flags the jar rewrites before recording them in a result's metadata (ScribeTwo's
+  `-adjustTolerances` does; `-predictRawSettings` might). Until that is known, a recorded
+  setting that differs from the one passed is reported as a caveat, not treated as an error.
 
 Closed on 2026-10-11: search accepts a `.raw` directly (yes, and writes no `.dia`); where the
 Thermo server's files go (`java.io.tmpdir`).
