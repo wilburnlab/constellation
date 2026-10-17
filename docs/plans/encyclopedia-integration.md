@@ -276,7 +276,107 @@ Plan approved by the PI on 2026-10-10. Eight PR-sized phases (P0–P7).
     tables (P7), and anything across acquisitions (P5). For P5: `-libexport` pairs each spectra
     file with the `<file>.elib` beside it, which is what a unit's `jar/` now holds, but it has
     not been run on symlinked `.dia` files yet.
-- **P5–P7: not started.**
+- **P5 (orchestration): done, 2026-10-17.** Decisions with the PI that day: the collision filter
+  is off unless asked for; composable steps plus one chain; the full six-fraction chromatogram
+  library as the real-data proof.
+  - **The commands.** `massspec search` takes several inputs (`--jobs N` runs N at once, each its
+    own JVM) or merges them into one search (`--merge`, for gas-phase fractions); `massspec report`
+    is EncyclopeDIA's quantitative report (`-libexport`) across finished searches; `massspec
+    quantify` chains fractions → chromatogram library → [collision filter] → each run → report.
+    `--detach` on all three runs the command in the background (`core.detach`), and `massspec
+    summarize --follow` follows it. Every step of the chain is the function the standalone
+    command calls, under the same keys, so whatever was already done, by hand or by an earlier
+    chain, is found under `--resume`.
+  - **Parallel searches share an experiment safely.** Every acquisition is registered before any
+    search runs, in the order given, so ids do not depend on which search finishes first; every
+    read-modify-write of the experiment's manifest and acquisitions table is under a file lock
+    (`core.locks`), so searches finishing at once do not lose each other's entries; two searches
+    needing one spectra file take turns writing it. A failed search does not stop the others, and
+    `--resume` reruns only what did not finish. SIGTERM stops every running search in order (the
+    cancellation scope is entered in the main thread around the fan-out) and each records itself
+    as cancelled; a worker thread tells a cancelled JVM from a failed one by
+    `jvm.cancellation_requested()`.
+  - **A merged search is bound explicitly.** The jar names a merged search's run after the merged
+    file, which is no single acquisition, so the merged file is registered as an acquisition of its
+    own (`ACQUISITION_TABLE` v3: `source_kind = merged_spectra_file`, `merged_from` = the
+    fractions' ids) and the result is filed under it. Its spectra file is written once under
+    `spectra/<merged name>/`.
+  - **What `-libexport` needed, found by running it first** (survey note): `-f` although its help
+    says otherwise; an input directory of its own, since it writes Percolator files there (it does
+    not change the linked search files: every checksum identical afterwards); no Percolator
+    pre-flight, since it re-scores with its built-in JavaPot; and a reader that understands its
+    result, which had two surprises. Its protein scores are under the run `global`, now read as a
+    run-agnostic score (null `acquisition_id`, which the schemas define). And it has one entry per
+    precursor but a quantity per precursor per run, which the phase 4 reader would have cut to the
+    entry's run alone; quantity rows for other runs now become rows of their own. Single-run
+    results are unchanged by that (every table equal, checked on two real searches). A report's
+    library-level tables and protein scores are partitioned under `acquisition_id=-1`
+    (`ALL_ACQUISITIONS`), its per-run rows under each run.
+  - **On real data, small:** two GPF fractions searched at once against the chromatogram library
+    (14,500 and 3,600 precursors; the 900–1000 fraction identical to its earlier result), and a
+    report across them in 66 s (18,059 precursors quantified, 5,491 proteins; resume 0 s).
+  - **On real data, kill and resume** (the phase's first proof): three fractions searched at once
+    against the chromatogram library, detached (`--jobs 3 --threads 2 --detach`). Once the
+    900–1000 fraction had finished (3,600 precursors, as before), `kill -TERM -<pid>` went to
+    the run's process group. Within seconds no JVM or helper server was left; the 400–500
+    search, whose JVM was running, and the 500–600 search, whose JVM the runner refused to
+    start, were both recorded `cancelled`; the detached run's status (143) was recorded. `--resume`
+    reused the finished search and all three spectra files (0 s) and ran only the two cancelled
+    searches (400–500: 14,500 precursors, as in its earlier search; 500–600: 18,678). Five
+    things found while doing this, all fixed with tests. (1) The detached run's wrapping shell
+    is in the stopped group, so it died with the command and the run read `vanished`; it now
+    traps the signal, which the command still receives. (2) A cancelled JVM was recorded as
+    "the jar exited 143; the end of its stderr:" followed by nothing; it now reads "stopped by
+    SIGTERM (the jar exited 143)". (3) The command printed nothing after a stop; its last line
+    now says `--resume` finishes the rest. (4) A worker thread writing a spectra file cannot be
+    interrupted, so a stop waited for the whole file (minutes for a merged one); the writer now
+    asks between chunks (`write_dia(should_stop=)`). (5) A writer killed outright leaves a 1–2 GB
+    temporary file beside the spectra file; the next write removes it.
+  - **A review of the phase's code, before the full chain ran:** five defects and one smaller
+    issue, all fixed with tests. (1) Ctrl-C with `--jobs > 1` stopped nothing: it reaches only the
+    main thread, and the JVMs, each in a session of its own, ran to the end while the command
+    waited for them; the fan-out now passes it on (`jvm.request_stop`) and the searches are
+    recorded as stopped by SIGINT. (2) The same search started by a second command (typically
+    the same command again with `--resume` while a detached run was still going) cleared the
+    first one's directory under its JVM, and could leave a finished marker beside a `failed`
+    record; a search or report now runs under a non-blocking lock beside its directory and the
+    second command is refused at once (`core.locks.file_lock(wait=False)`). (3) A report took one
+    acquisition twice when it had been searched under two file names (a bundle and a copied
+    spectra file of the same `.raw`, as in the P4 comparison), and failed only after the jar had
+    run; it is now refused before. (4) Extraction targets for one run of a report came back empty,
+    because a report keeps its precursors once under `acquisition_id=-1`. (5) `report --resume`
+    reused a report after one of its searches had been run again in place; the report's key now
+    includes each search's result file. The smaller issue: a failed merged search inside
+    `quantify` exited 1 instead of with the jar's status.
+  - **The collision filter on a real chromatogram library** (the GUI's, 76,448 entries, with the
+    merged spectra file): about 15 s, 1,253 entries dropped. It also showed a defect in the
+    filter itself, which phase 5 reuses from the transcriptome→proteome pipeline: a losing
+    modified form took the protein mappings of the forms that stayed, leaving 12 entries with
+    no protein. Fixed (see the pre-revision review, defect 12).
+  - **On real data, the full chain** (the phase's second proof). The six GPF fractions
+    (400–1000 m/z) merged and searched as one against the predicted library at the GUI
+    reference's settings (4 h 17 min on 12 threads; the GUI's run used 96 and took 45 min):
+    76,775 precursors at 1% FDR against the GUI's 76,448, 75,929 shared (Jaccard 0.982), with
+    identical retention times and quantities on every shared precursor and identical spectra
+    (the merged file's TIC equal to the digit). The difference is the jar's: 2,007,934 PSMs
+    went to Percolator, four times its training-set size, so it trained on a subsample that
+    follows the jar's thread count (survey note, "Reproducing a search"). Then `massspec
+    quantify --resume` from the command line found that search by its key and did not rerun
+    it, searched the wide-window run against it (8 min 37 s; 31,895 precursors and 5,214
+    proteins against the GUI chain's 31,833 and 5,168; Jaccard 0.987, identical retention times
+    and quantities on shared precursors) and made the report (20 s, the same 31,895
+    precursors), 11.6 min in all. The standalone `search --resume` and `report --resume` then
+    found the chain's results in 4 s. Two things the report showed, neither a defect: its
+    quantities are EncyclopeDIA's own re-quantification on five ions per precursor, not the
+    search's, and it records `-ptol` / `-lftol` (absent from its help) at their defaults
+    without using them (passing the searches' values changed no quantity).
+  - **Tests** (`tests/test_massspec_quantify_workflow.py`, a stand-in jar that also writes a
+    multi-run report): ids in input order when searches finish in reverse; a failure isolated and
+    resumed alone; merging, its refusals and its binding; the report's per-run rows, run-agnostic
+    scores and refusals (two libraries, settings that disagree, one run twice); the chain equal to
+    its steps; the report waiting for every run; the collision filter only when asked; the lock;
+    detach and follow; cancellation recorded as such; the commands.
+- **P6–P7: not started.**
 - **Naming (PI, 2026-10-11).** No command or flag is named `dia`: DIA is an acquisition method,
   and `.dia` is one tool's file extension. The P1 commands were first built as
   `massspec dia {export,import,diff}` and renamed to the `massspec encyclopedia …-spectra` group

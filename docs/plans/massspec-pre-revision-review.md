@@ -311,6 +311,17 @@ Each is marked **run** (reproduced) or **read** (from the code only).
     and get their own tables in phase 7. The pipeline's Parquet numbers change accordingly
     (accepted by the PI, 2026-10-11).
 
+12. **The collision filter left entries with no protein** (run, 2026-10-17, during phase 5 of the
+    EncyclopeDIA integration, on the GUI's chromatogram library: 76,448 entries, 1,253 losers).
+    `filter_elib_by_losers` deleted the `peptidetoprotein` rows of every sequence that had a
+    losing form, including sequences another form of which (unmodified, or modified differently)
+    stayed in `entries`; 12 of the 75,195 surviving entries had no protein. **Fixed the same day**
+    in [`massspec/search/collision.py`](../../constellation/massspec/search/collision.py),
+    which phase 5's `quantify --collision-filter` reuses: a sequence keeps its proteins while
+    any entry still has it (no entry is left without one; 1,465 mapping rows removed instead of
+    1,489). The pipeline calls the same function, so its filtered chromatogram library changes
+    the same way.
+
 ## 6. Stale docstrings, also left as they are
 
 - `massspec/__init__.py` lists `library/`, `chromatogram`, `scoring` and `search/` as TODO scaffolds.

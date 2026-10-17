@@ -413,10 +413,58 @@ fragment table is nearly all unannotated rows, and annotating it properly means 
 tolerance the result itself records (it is ion-trap data searched at 0.35 Da), and probably
 not writing the unmatched peaks as library fragments at all. That is phase 6's to decide.
 
+### The quantitative report (`-libexport`), first run 2026-10-17
+
+Run by hand over a directory of symlinks to two searches' files (the spectra file, `.dia.elib`,
+`.features.txt`, the Percolator reports, the fit tables; PDFs left out), every linked file
+checksummed before and after:
+
+- **`-f` is required.** Without it: "You are required to specify an input file or directory (-i),
+  an input library file (-l), a fasta database (-f), and an output library file (-o)", although
+  the help lists `-f` as needed only for the Pecan and XCorDIA exports. (The frozen pipeline had
+  noted the same of 6.5.15.)
+- **It re-scores with JavaPot.** The report's metadata says `PercolatorVersion JavaPot`; the
+  Percolator executable is not run, so a kernel the bundled Percolator cannot run on is no
+  obstacle, and `-percolatorLocation` is not needed.
+- **It writes into its input directory**: `<output stem>_concatenated_features.txt`, `_results.txt`,
+  `_decoy.txt`, `_results.txt.model`. It changed none of the linked files (all 26 checksums equal).
+- **Beside the report** it writes `<output>.peptides.txt` and `.proteins.txt` (matrices, one column
+  per run), `.diffacto.csv` and `.diffacto.samples.lst`.
+- **The report**: `entries` one row per peptide across all runs, each under one run; `peptidequants`
+  a row per peptide per run that quantified it; `peptidescores` per run, decoys included;
+  `proteinscores` under the run `global`; metadata `sourcefile` lists the runs joined by `|` and
+  records `RT align between samples true` with `-a true`.
+- 21 s for two fractions (14,507 + 3,552 entries). With no shared peptides between the two
+  fractions the alignment had nothing to fit ("Not enough points ... to compute regression between
+  samples"), as expected.
+- **Its quantities are its own, not the searches'** (measured on the full chain, one wide-window
+  run): the report re-quantifies every precursor on `-numberOfQuantitativePeaks` ions (5), the
+  same ions in every run, where the search summed every quantitative ion it found (17-22 for
+  typical peptides). Identifications, scores and retention times equal the search's; quantities
+  do not (median |log2 ratio| 1.26, log-scale Pearson r 0.66), and 765 of 31,895 precursors get
+  no quantity row at all.
+- **It records `-ptol` and `-lftol` without using them.** Neither is in its help, and the report's
+  metadata shows the jar defaults (10 ppm) whatever the searches used. Passing the searches'
+  0.35 Da (with `--allow-undocumented`) left every one of the 31,130 quantities identical, so
+  Constellation does not pass them.
+
+### Reproducing a search: Percolator's training subsample (2026-10-17)
+
+A search reproduces exactly only while Percolator trains on every PSM. The jar hands Percolator
+`-percolatorTrainingSetSize` PSMs at most (default 500,000) and Percolator draws them by their
+order in its input, which follows the jar's thread count. Measured on the six-fraction
+chromatogram library rebuilt from the lab's GPF files at the GUI reference's settings (12 threads
+here, 96 in the GUI's run): the same 2,007,934 PSMs went to Percolator, the first pass trained on
+different subsamples (291,345 vs 290,790 positives), the retention-time and mass calibrations fitted
+from that pass shifted a little, and those calibration features (`deltaRT`, `ms1MassError`,
+`ms2MassError`) are the only features that differ on the 2,007,884 PSMs both runs share. The
+result: 76,775 against 76,448 precursors at 1% FDR, 75,929 shared (Jaccard 0.982), with identical
+retention times and quantities on every shared one. The wide-window search (76,399 PSMs, no
+subsample) matched its GUI reference exactly. A search with more PSMs than the training-set size
+is reproducible only with that size raised above its PSM count.
+
 ## Open items
 
-- Whether `-libexport` needs `-f` in its default mode, and how its Percolator is selected
-  (`-percolatorLocation`).
 - What ScribeTwo writes when run from the CLI.
 - Whether ScribeTwo's DDA search reads the `ranges` table (Constellation writes every window; the
   reference writes a sample).
