@@ -9,7 +9,7 @@ Surveyed 2026-10-10. Everything in "Programs" and "Changes since 6.5.15" comes f
 jar's own `-h`. Everything in "What help does not show" comes from reading the outputs of real
 6.9.23 runs (a GUI-driven peptide-centric DIA search and a ScribeTwo DDA search on a Stellar).
 "Running a search" (2026-10-11) is the peptide-centric search reproduced from Constellation's CLI;
-ScribeTwo has not been run from the command line yet.
+"Running ScribeTwo" (2026-10-17) is the spectrum-centric search run from the command line.
 
 ## Where the facts live
 
@@ -22,6 +22,7 @@ The flag tables are data, not prose, so they are not repeated here.
 | `constellation/data/encyclopedia_cli.json` | programs and flags parsed from the help text; packaged | `scripts/build-encyclopedia-cli-json.py` (no jar needed) |
 | `constellation/data/_raw/encyclopedia/6.9.23/schema/{result_library,spectra_file}.sql` | the `CREATE` statements of a result library (`.elib` / `.dlib`, container 0.1.18) and of a spectra file (`.dia`, format 0.8.0) | `scripts/survey-encyclopedia-outputs.py` (needs a finished run) |
 | `constellation/data/_raw/encyclopedia/6.9.23/outputs/encyclopedia.json` | the files a peptide-centric search leaves behind, the columns of the tab-separated ones, the tables the result library fills, its metadata keys | same |
+| `constellation/data/_raw/encyclopedia/6.9.23/outputs/scribetwo.json` | the same for a ScribeTwo search: the result library beside the input, the reports in `<input>.scribe2/` | same (it reads a directory named for the input too) |
 
 `constellation.massspec.search.encyclopedia.cli_spec` loads the JSON and answers "is this flag
 documented for this program" (`is_known_flag`, `unknown_flags`). `tests/test_encyclopedia_cli_spec.py`
@@ -463,16 +464,121 @@ retention times and quantities on every shared one. The wide-window search (76,3
 subsample) matched its GUI reference exactly. A search with more PSMs than the training-set size
 is reproducible only with that size raised above its PSM count.
 
+## Running ScribeTwo (first command-line runs, 2026-10-17)
+
+The lab's DDA run (`261006_u2os_dda_100min-IOa_HCD26-1`, a Stellar, ion-trap MS2), from
+Constellation's spectra file, against the human FASTA with no library, at the settings the GUI
+reference result records where help documents them: carbamidomethyl fixed and protein N-terminal
+acetyl and pyro-Glu variable (`-ptm<Name>`), `-searchType dda_chimeric` (the result records
+`-chimericSearching true`), `-filterPeaklists true`, `-smoothIntegrations false`; 12 threads.
+
+**What it writes** (inventory in `outputs/scribetwo.json`). The result library beside the input,
+`<input>.dlib`, with exactly the table definitions of a peptide-centric result. Everything else in
+a directory named for the input, `<input>.scribe2/`: the results (`.scribe2.txt`, which ends with
+a one-field `pi_0=null` line) and decoys (`.scribe2.decoy.txt`), one row per precursor, its best
+match, with score, q-value and posterior error probability; the features (`.scribe2.features.txt`,
+Percolator's input layout), one row per scored match; `.scribe2.main.txt`, per identification the
+retention-time and mass calibration; the same set for the pre-alignment pass (`.prealign.*`); the
+scoring models, the log and two PDFs. A SQLite "PIN store" exists there during the run and is
+removed at the end.
+
+**With a library** (a GPF fraction searched as DIA against the chromatogram library, `.elib`):
+the result is `<input>.elib`, not `.dlib`. The log names it at the start ("Result File:"), and
+it follows the library it searched: without one, that library is the prediction cache, a
+`.dlib`. Constellation takes the result under either name. A library with no decoy entries (a
+chromatogram library has none) makes ScribeTwo predict decoys for it first ("library
+assessment: ... branch=predict, reason=decoy table is empty"): 151,706 sequences into the DIA
+prediction cache, a few minutes. Result, on the 900–1000 m/z fraction: 3,323 precursors at
+1% FDR in 14–20 min (the peptide-centric search of the same fraction against the same library:
+3,600, of which 3,187 shared, Jaccard 0.85). Its stored spectra are mostly ions (97% of 166,953
+peaks), unlike a library-free result's. Its matches each sit in a scan whose isolation window
+holds the precursor, but the retention time in a match's id is that scan's for only 84% of them
+(87% of the best ones) and seconds to minutes away for the rest; in a DDA search it is always the
+scan's.
+
+**Beside the FASTA**, too: a "permanent ScribeTwo FASTA index", `<fasta>.<enzyme>.fasdb` (400 MB
+here: 41,196 proteins and 4,388,794 modified peptides, targets and decoys), with a `.lock` file,
+and a `.tmp` file that a stopped build leaves behind. It is rebuilt (about 1.5 min) when the
+settings change it (oxidation made variable: rebuilt) or when the FASTA looks newer than it (a
+copied FASTA: rebuilt), and reused otherwise ("Using permanent ScribeTwo FASTA index"). A FASTA
+given as a symbolic link is followed: the index is written beside the link's target. So
+Constellation gives ScribeTwo a copy of the FASTA kept in the experiment (PI decision).
+
+**The prediction cache.** Without a library every peptide is predicted first (JChronologer) into
+`-predictionCache`, by default `~/.encyclopedia/`, one file per NCE, default charge and DDA/DIA
+(`scribetwo-jchronologer-nce33-z3-dda.dlib`), not per FASTA. Here 2,787,047 predictions took
+86 min and 3.1 GB, slowing from 0.7 s to 3 s per batch of 1,024 as the file grew; the next
+search found all of them cached and started searching within a minute. Even `-scribetwo -h`
+creates an empty cache file in `~/.encyclopedia/`, so the help capture (`cli_spec._run_help`)
+gives its JVMs a throwaway `user.home`. The cache saves time and changes nothing else, so it is not part of a search's key.
+
+**It adjusts its own tolerances.** A pre-alignment pass on 5% of the spectra (8,977, chosen by
+TIC) at twice the given tolerances; then the precursor and fragment tolerances become the 97.5th
+percentile of what that pass found, and the result records only those. Given nothing, the jar
+starts from 0.4 Da on this data (`-predictRawSettings` recognising an ion trap; help's default is
+10 ppm). Constellation records an adjustment as a note in the search's manifest, not as a
+disagreement, and the reader annotates the stored spectra at the recorded (adjusted) tolerance.
+
+**What is not an explanation**, measured: `-instrument` (undocumented; the command line's default
+is `Orbitrap/Orbitrap`, the GUI run recorded `Iontrap/Iontrap`) changed nothing, result identical.
+The reference spectra file and Constellation's give identical results (the scan the reference
+writer drops, and the `ranges` table, which Constellation fills with every window and the
+reference with a sample, make no difference).
+
+**Against the GUI reference result** (17,640 precursors; it records only adjusted tolerances,
+0.420 / 0.563 Da, and ran on 96 threads):
+
+| Started from (precursor / fragment) | Adjusted to | Precursors at 1% FDR | Overlap with the GUI's (Jaccard) |
+|---|---|---|---|
+| 0.35 / 0.35 Da | 0.411 / 0.437 Da | 23,729 | 0.60 |
+| the jar's choice (0.4 / 0.4 Da) | 0.516 / 0.554 Da | 16,392 | 0.60 |
+| 0.35 / 0.4 Da | 0.410 / 0.552 Da | 19,009 | 0.66 |
+| the GUI's adjusted values, adjustment off (`-adjustTolerances false`, undocumented, as a measurement) | 0.420 / 0.563 Da | 18,056 | 0.61 |
+
+The count follows the tolerances (wider, fewer), but the overlap with the GUI's result stays at
+0.60–0.66 whatever they are, including at its own final values. Two reasons it cannot be rebuilt
+from what its result records. ScribeTwo derives more than the two tolerances from its first pass,
+which it runs even with adjustment off, at twice the given values: the retention-time calibration
+and the chimeric retention-time window too (`Adjusted chimeric RT tolerance`), and the result
+records none of that, nor the starting tolerances. And it ran on 96 threads, these on 12. A given
+search is repeatable here: runs that differed only in `-instrument`, or only in which writer
+made the spectra file, gave identical results, and so did `massspec search` against the same
+search run by hand. On shared precursors the GUI's and these agree closely (retention times equal
+at the median, scores within 0.0003), so the difference is which precursors pass the FDR line.
+
+**"None" is spelled differently, and a fatal error exits 0.** The peptide-centric search takes
+`-fixed ''` for no fixed modification (the lab's ion-trap setting); ScribeTwo stops on it ("Error
+parsing fixed modifications from [], expected comma-delimited site=mass rules or '-'"), as its
+help says: `-fixed -` for none. And it reports that, like any fatal error, as `Encountered Fatal
+Error!` on stdout and exits 0, so only the missing result says it failed. Constellation refuses an
+empty `-fixed` / `-variable` for ScribeTwo before Java starts, and quotes the jar's error from its
+log when a run exits 0 without a result (`outputs.fatal_error`).
+
+**The matches.** `ScanNr` in the feature file is the spectrum's index in the spectra file, the
+raw scan number for a single run: on all 88,490 matches the retention time in the match's id is
+that scan's to 0.0002 s. `ExpMass` is the precursor's observed m/z (within 0.01 Da of the
+peptide's `precursorMz` at the median; the isolation target is 0.32 Da away). Every result row is
+a feature row (51,427 of 88,490: the best match of each precursor; the others are the same
+precursor in other scans, up to 53 of them). The best target matches at 1% FDR are exactly the
+result library's 23,729 precursors.
+
+**The stored spectra** are whole observed spectra: 25.6 million peaks for 23,729 identifications
+(about 1,080 each), 0.35% of them annotated at 20 ppm. At the recorded fragment tolerance
+(0.437 Da), with one peak kept per ion, 1.0 million are ions: 37 b/y and 5.5 intact-precursor
+ions per identification.
+
+**Time**, 12 cores, caches warm: 17–24 min per search (pre-alignment about 5, the main pass
+12–15, then the result).
+
 ## Open items
 
-- What ScribeTwo writes when run from the CLI.
-- Whether ScribeTwo's DDA search reads the `ranges` table (Constellation writes every window; the
-  reference writes a sample).
 - Whether `vsyscall=emulate` in `.wslconfig` makes the bundled Percolator 3.01 run under WSL2
   (expected; untested).
-- Which of its flags the jar rewrites before recording them in a result's metadata (ScribeTwo's
-  `-adjustTolerances` does; `-predictRawSettings` might). Until that is known, a recorded
+- Which other flags the jar rewrites before recording them in a result's metadata. ScribeTwo's
+  precursor and fragment tolerances are known (recorded as notes); for anything else, a recorded
   setting that differs from the one passed is reported as a caveat, not treated as an error.
 
 Closed on 2026-10-11: search accepts a `.raw` directly (yes, and writes no `.dia`); where the
-Thermo server's files go (`java.io.tmpdir`).
+Thermo server's files go (`java.io.tmpdir`). Closed on 2026-10-17: what ScribeTwo writes from the
+command line, and whether its DDA search reads the `ranges` table (no: same result either way);
+see "Running ScribeTwo".

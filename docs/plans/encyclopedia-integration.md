@@ -376,7 +376,62 @@ Plan approved by the PI on 2026-10-10. Eight PR-sized phases (P0–P7).
     scores and refusals (two libraries, settings that disagree, one run twice); the chain equal to
     its steps; the report waiting for every run; the collision filter only when asked; the lock;
     detach and follow; cancellation recorded as such; the commands.
-- **P6–P7: not started.**
+- **P6 (ScribeTwo): done, 2026-10-17.** Decisions with the PI that day: test the GUI run's
+  starting tolerances rather than guess them; the FASTA ScribeTwo reads is a copy inside each
+  experiment; the prediction cache stays at the jar's default with `--prediction-cache` to move
+  it; a spectrum-centric result's fragment table holds the peptide's ions only.
+  - **First, ScribeTwo from the command line** (survey note, "Running ScribeTwo"): what it writes
+    (result `<input>.dlib`, reports in `<input>.scribe2/`, inventory captured as
+    `outputs/scribetwo.json`); the 400 MB FASTA index it writes beside the FASTA, following links;
+    the prediction cache (86 min and 3.1 GB the first time for the human proteome); the tolerances
+    it adjusts and records instead of the given ones; `ScanNr` as the scan number; and what does
+    not matter (`-instrument`, the spectra file's writer, the `ranges` table).
+  - **The GUI reference run could not be rebuilt exactly.** Its result records only the adjusted
+    tolerances, so the starting ones were tested: from 0.35 / 0.35 Da, 23,729
+    precursors; from the jar's own choice (0.4 Da), 16,392; from 0.35 / 0.4 Da, 19,009; at the
+    GUI's final values with adjustment off, 18,056 (the GUI: 17,640). The overlap with the GUI's
+    stayed at 0.60–0.66 throughout, with retention times and scores of shared precursors in close
+    agreement. ScribeTwo derives more than the two tolerances from its first pass (the
+    retention-time calibration and the chimeric retention-time window), which no result records,
+    and the GUI ran on 96 threads; a given search is repeatable (identical results three times
+    over). So the plan's "lands near its 17,640" is met only in range, not as a rebuild.
+  - **What was built.** `--search-mode spectrum-centric` (the default for DDA) with `--search-type`,
+    library optional, `--ptm NAME=STATE` and `--prediction-cache DIR` (`SearchParameters.ptms` /
+    `prediction_cache`; the cache is execution-only, so it does not change a search's key). The
+    Percolator pre-flight applies to peptide-centric searches only (ScribeTwo scores with JavaPot);
+    a merged search, a report and the chromatogram-library chain stay peptide-centric and refuse
+    spectrum-centric searches. ScribeTwo reads the experiment's FASTA copy
+    (`fasta/<sha256[:16]>/<name>`, made once). The reader names a ScribeTwo result's engine
+    `scribetwo` (from its `search type` metadata), annotates its stored spectra at the tolerance it
+    records and keeps the peptide's ions only (one peak per ion, the most intense; the rest counted
+    in a caveat), and reads every scored match from its reports into `PSM_TABLE` v2 (new nullable
+    `precursor_id`, content-derived, and `qvalue`), which `read_encyclopedia` does on its own when
+    the reports are beside the result; the workflow writes them as a `psm` table. An adjusted
+    tolerance is a note in the search's manifest, not a disagreement. `massspec summarize` shows a
+    spectrum-centric search's search type, its scorer, the library as "none: predicted from the
+    FASTA", an adjusted tolerance with the value given, and the FASTA copy.
+  - **Found and fixed on the way:** the output inventory substituted `<input>` once per name, and
+    ScribeTwo's report names hold it twice; the help capture's `-scribetwo -h` created a
+    prediction cache in `~/.encyclopedia/` (its JVMs now get a throwaway home).
+  - **On real data, through `massspec search`:** (a) the DDA run, library-free, at the first
+    hand-run search's settings: 23,729 precursors, identical to that run in every precursor,
+    retention time, score and quantity; all 88,490 matches join an MS2 scan of the acquisition's
+    scan metadata (retention times within 0.0005 s); the 23,729 best target matches at 1% FDR are
+    exactly the result's precursors by content id; 1.0 million fragment rows from 25.6 million
+    stored peaks; the FASTA index built in the experiment's copy. (b) A GPF DIA fraction searched
+    spectrum-centric against the chromatogram library: 3,323 precursors (the peptide-centric
+    search of the same fraction and library: 3,600, Jaccard 0.85), every match in an MS2 scan
+    whose isolation window holds its precursor. (b) failed twice first, and both are fixed:
+    ScribeTwo stops on `-fixed ''` (its "none" is `-fixed -`) and still exits 0, so Constellation
+    now refuses the empty value before Java starts and quotes the jar's error from its log when a
+    run exits 0 without a result; and it names its result after its library (`<input>.elib` for
+    an `.elib`), so Constellation takes the result under either name.
+  - **Tests** (`tests/test_massspec_scribetwo_workflow.py`, the stand-in jar acting as ScribeTwo):
+    a DDA run searched library-free, its PSMs, their scans and their join to the precursors; the
+    FASTA copy; tolerance notes; PTMs and the cache's place outside the key; the refusals; a DIA
+    run searched spectrum-centric with a library; `read_encyclopedia` finding the reports; the
+    command; the summary.
+- **P7: not started.**
 - **Naming (PI, 2026-10-11).** No command or flag is named `dia`: DIA is an acquisition method,
   and `.dia` is one tool's file extension. The P1 commands were first built as
   `massspec dia {export,import,diff}` and renamed to the `massspec encyclopedia …-spectra` group
