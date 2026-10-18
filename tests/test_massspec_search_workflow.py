@@ -131,6 +131,68 @@ def _fake_libexport(flags: dict, state) -> types.SimpleNamespace:
     )
 
 
+#: Peaks a ScribeTwo result stores that are no ion of its peptide: it
+#: keeps the whole observed spectrum.
+_NOISE_PEAKS = (151.37, 333.91, 777.77)
+
+
+def _as_scribetwo(entries, settings, flags, source):
+    """What a ScribeTwo result looks like where it differs from a
+    peptide-centric one: whole observed spectra (here: the ions plus
+    noise), ``<source> search type`` ``ScribeTwo...``, and the precursor
+    and fragment tolerances it was given replaced by its own estimates."""
+    observed = []
+    for e in entries:
+        mz = list(e.mz) + list(_NOISE_PEAKS)
+        intensity = list(e.intensity) + [5.0] * len(_NOISE_PEAKS)
+        order = sorted(range(len(mz)), key=mz.__getitem__)
+        observed.append(dataclasses.replace(e, mz=[mz[i] for i in order],
+                                            intensity=[intensity[i] for i in order]))  # fmt: skip
+    kind = {"dia": "DIA"}.get(str(flags.get("-searchType")), "DDA")
+    settings = {**settings, f"{source} search type": f"ScribeTwo{kind}", "PercolatorVersion": "JavaPot"}
+    for flag in ("-ptol", "-ftol"):
+        if flag in flags:
+            settings[flag] = str(float(flags[flag]) * 1.2)
+    return observed, settings
+
+
+def _scribe2_reports(given: Path, entries, source: str) -> None:
+    """ScribeTwo's reports beside its result, in the captured layout:
+    every match in the features file (two per precursor, on real scans of
+    the spectra file), the best of each in the results, one decoy."""
+    import sqlite3
+
+    con = sqlite3.connect(f"file:{given}?mode=ro", uri=True)
+    try:
+        scans = con.execute(
+            "SELECT SpectrumIndex, ScanStartTime FROM spectra ORDER BY SpectrumIndex"
+        ).fetchall()
+    finally:
+        con.close()
+    reports = given.parent / f"{given.name}.scribe2"
+    reports.mkdir(exist_ok=True)
+    stem = f"{given.name}.scribe2"
+    features = ["id\tLabel\tScanNr\tscribeScore\tExpMass\tprecursorMz\tprecursorMass\tsequence\tProteins"]
+    results = ["PSMId\tscore\tq-value\tposterior_error_prob\tpeptide\tproteinIds"]
+    decoys = list(results)
+    matches = [(e, False) for e in entries] + [(entries[0], True)]
+    for k, (e, decoy) in enumerate(matches):
+        spelled = ("decoy" if decoy else "") + e.modseq
+        for j in (0, 1):  # the best match, then the same precursor in a later scan
+            scan, rt = scans[(2 * k + j) % len(scans)]
+            psm = f"{source}:{rt}:{spelled}+{e.charge}"
+            label = -1 if decoy else 1
+            mass = (e.precursor_mz - 1.007276466812) * e.charge
+            features.append(f"{psm}\t{label}\t{scan}\t0.5\t{e.precursor_mz + 0.01}\t{e.precursor_mz}"
+                            f"\t{mass}\t-.{e.sequence}.-\t{';'.join(e.proteins)}")  # fmt: skip
+            if j == 0:
+                row = f"{psm}\t{2.0 - k * 0.1}\t{0.001 * (k + 1)}\t{0.002 * (k + 1)}\t-.{e.sequence}.-\t{';'.join(e.proteins)}"
+                (decoys if decoy else results).append(row)
+    (reports / f"{stem}.features.txt").write_text("\n".join(features) + "\n")
+    (reports / f"{stem}.txt").write_text("\n".join(results) + "\npi_0=null\n")
+    (reports / f"{stem}.decoy.txt").write_text("\n".join(decoys) + "\n")
+
+
 def _recorded_settings(program: str, flags: dict) -> dict[str, str]:
     """What the real jar writes into a result's ``metadata``: every
     setting it records, at its documented default unless passed."""
@@ -154,7 +216,7 @@ def jar(monkeypatch):
     function called with the search's directory before it writes anything."""
     state = types.SimpleNamespace(
         calls=[], source=None, peptides=_PEPTIDES, metadata=None, fail=None, while_running=None,
-        fail_for={}, delay={}, wait_for={},
+        fail_for={}, delay={}, wait_for={}, fasta_seen=[], fatal=None,
     )
     lock = threading.Lock()
 
@@ -177,28 +239,48 @@ def jar(monkeypatch):
             state.while_running(Path(cwd).parent)
         if state.fail is not None:
             raise state.fail
+        if state.fatal is not None:
+            # What 6.9.23's ScribeTwo does on a bad setting: says so, exits 0.
+            log = Path(log_dir) / "stdout.log"
+            log.write_text(f"[00:00:01] Encountered Fatal Error!\n[00:00:01] {state.fatal}\n\tat x.y(Z.java:1)\n")
+            return types.SimpleNamespace(argv=["java"], elapsed_seconds=0.1, returncode=0,
+                                         java_version="openjdk 21", jar_sha256="cafe", stdout_log=log)  # fmt: skip
         if run_name in state.fail_for:
             raise state.fail_for[run_name]
         assert given.is_file() and given.parent == Path(cwd), "the input is in the search's directory"
+        scribetwo = program == "scribetwo"
+        result_name = "<input>.dlib" if scribetwo else "<input>.elib"
+        names = expected_names(program, given.name)
+        result = given.parent / names[result_name]
+        if scribetwo and str(flags.get("-l", "")).endswith(".elib"):
+            result = result.with_suffix(".elib")  # ScribeTwo's result follows its library
         # Beside the input, named for it. A result already there would be
         # taken for a finished search by the real jar; here the stand-in
         # refuses it, so a rerun over old outputs fails loudly.
-        assert not (given.parent / f"{given.name}.elib").exists(), "a result is already there"
+        assert not result.exists(), "a result is already there"
         # The real jar copies the spectra file's own record of its source:
         # the .raw for a single run, the merged file itself for a merge.
         with DiaFile(given) as dia:
             recorded = str(dia.metadata.get("sourcename") or f"{given.stem}.raw")
         source = state.source or recorded
-        for name, file_name in expected_names(program, given.name).items():
-            if name != "<input>.elib":
+        for name, file_name in names.items():
+            if name != result_name:
+                (given.parent / file_name).parent.mkdir(parents=True, exist_ok=True)
                 (given.parent / file_name).write_bytes(b"")
+        entries = [_entry(m, z, total, source) for m, z, total in state.peptides]
+        settings = {**_recorded_settings(program, flags), **(state.metadata or {})}
+        if scribetwo:
+            entries, settings = _as_scribetwo(entries, settings, flags, source)
+            state.fasta_seen.append(Path(str(flags["-f"])))
         build_result_library(
-            given.parent / f"{given.name}.elib",
-            [_entry(m, z, total, source) for m, z, total in state.peptides],
+            result,
+            entries,
             decoy_peptides=[("KEDITPEP", "DECOY_1")],
             source=source,
-            metadata={**_recorded_settings(program, flags), **(state.metadata or {})},
+            metadata=settings,
         )
+        if scribetwo:
+            _scribe2_reports(given, entries, source)
         return types.SimpleNamespace(
             argv=["java", "-jar", "encyclopedia.jar", *argv],
             elapsed_seconds=1.5,
@@ -668,13 +750,17 @@ def test_what_cannot_be_searched_is_refused_before_anything_runs(tmp_path, jar, 
             dia, experiment_dir=experiment, parameters=SearchParameters(extra={"-ptoll": "1"}), **inputs
         )
 
-    # A DDA run defaults to the spectrum-centric engine, which is not wired
-    # up yet; asking for the peptide-centric one on it is simply wrong.
+    # A DDA run defaults to the spectrum-centric engine; asking for the
+    # peptide-centric one on it is simply wrong, as are the spectrum-centric
+    # engine's own settings on a peptide-centric search.
     dda = _bundle(tmp_path, "dda_run", _dda_scans())
-    with pytest.raises(WorkflowError, match="not available through this command yet"):
-        search_acquisition(dda, experiment_dir=experiment, **inputs)
     with pytest.raises(ValueError, match="no peptide-centric search of DDA"):
         search_acquisition(dda, experiment_dir=experiment, search_mode="peptide-centric", **inputs)
+    with pytest.raises(WorkflowError, match="--ptm belong to the spectrum-centric search"):
+        search_acquisition(
+            dia, experiment_dir=experiment, parameters=SearchParameters(ptms={"Oxidation": "var"}),
+            **inputs,
+        )  # fmt: skip
 
     monkeypatch.setattr(workflow, "percolator_blocker", lambda *a, **k: "Percolator cannot run here")
     with pytest.raises(WorkflowError, match="Percolator cannot run here"):
@@ -735,8 +821,13 @@ def test_the_search_command_drives_the_workflow(tmp_path: Path, jar, inputs, cap
     assert "does not document these flags" in capsys.readouterr().err
     assert main([*argv, "--encyclopedia-arg=-o=/elsewhere/report.txt"]) == 1
     assert "-o is not passed through" in capsys.readouterr().err
-    assert main([*argv, "--search-mode", "spectrum-centric"]) == 1
-    assert "not available through this command yet" in capsys.readouterr().err
+    assert main([*argv, "--ptm", "Oxidation=var"]) == 1
+    assert "(--ptm) and -fixed / -variable do not mix" in capsys.readouterr().err
+    no_fixed = [a for a in argv if a != "--encyclopedia-arg=-fixed="]
+    assert main([*no_fixed, "--ptm", "Oxidation=var"]) == 1
+    assert "--ptm belong to the spectrum-centric search" in capsys.readouterr().err
+    assert main([*argv, "--search-mode", "spectrum-centric", "--ptm", "Oxidation"]) == 1
+    assert "write it as NAME=STATE" in capsys.readouterr().err
     assert len(jar.calls) == 1
 
     # A result that records other settings than the ones given is said so.

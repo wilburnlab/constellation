@@ -46,6 +46,31 @@ class MissingOutputError(RuntimeError):
     """A run finished without writing its result library."""
 
 
+_FATAL = "Encountered Fatal Error!"
+_OTHER_RESULT_SUFFIX = {".dlib": ".elib", ".elib": ".dlib"}
+
+
+def fatal_error(log: Path | str | None) -> str | None:
+    """The error a run's log reports, when the jar stopped on one and
+    still exited 0 (6.9.23's ScribeTwo does: ``Encountered Fatal Error!``
+    then the exception, measured 2026-10-17). The exception's message
+    line, or ``None`` when the log has no such report."""
+    if log is None:
+        return None
+    try:
+        lines = Path(log).read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    for i, line in enumerate(lines):
+        if _FATAL in line:
+            for following in lines[i + 1 : i + 6]:
+                text = following.split("] ", 1)[-1].strip()
+                if text and not text.startswith("at "):
+                    return text
+            return _FATAL
+    return None
+
+
 @lru_cache(maxsize=None)
 def output_inventory(program: str) -> dict[str, Any]:
     """The captured inventory for ``program`` of the pinned jar."""
@@ -64,7 +89,7 @@ def expected_names(program: str, input_name: str) -> dict[str, str]:
     """``inventory name -> file name`` for a search of the file called
     ``input_name`` (``"run.dia"``)."""
     return {
-        f["name"]: f["name"].replace(INPUT, input_name, 1)
+        f["name"]: f["name"].replace(INPUT, input_name)
         for f in output_inventory(program)["files"]
     }
 
@@ -109,7 +134,15 @@ def locate_outputs(
     missing: list[str] = []
     result: Path | None = None
     for entry in inventory["files"]:
-        path = directory / entry["name"].replace(INPUT, input_name, 1)
+        path = directory / entry["name"].replace(INPUT, input_name)
+        if entry.get("kind") == "sqlite" and not path.is_file():
+            # ScribeTwo names its result after the library it searched
+            # (measured 2026-10-17): <input>.dlib without one (its library
+            # is then the .dlib prediction cache), <input>.elib with an
+            # .elib. The inventory holds the first.
+            other = path.with_suffix(_OTHER_RESULT_SUFFIX.get(path.suffix, path.suffix))
+            if other.is_file():
+                path = other
         if path.is_file():
             files[entry["name"]] = path
             if entry.get("kind") == "sqlite" and result is None:
@@ -120,7 +153,7 @@ def locate_outputs(
         expected = [e["name"] for e in inventory["files"] if e.get("kind") == "sqlite"]
         raise MissingOutputError(
             f"{program} finished but wrote no result library: expected "
-            f"{', '.join(n.replace(INPUT, input_name, 1) for n in expected)} in {directory}"
+            f"{', '.join(n.replace(INPUT, input_name) for n in expected)} in {directory}"
         )
     return RunOutputs(
         directory=directory,
@@ -135,6 +168,7 @@ def locate_outputs(
 __all__ = [
     "INPUT",
     "MissingOutputError",
+    "fatal_error",
     "RunOutputs",
     "expected_names",
     "locate_outputs",

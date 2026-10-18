@@ -380,14 +380,17 @@ def _run_help(java: Path, jar: Path, argv: Sequence[str], *, timeout: float) -> 
 
     Runs in a throwaway directory with a small heap: some programs write
     incidental files to the working directory before they look at their
-    arguments.
+    arguments. The same directory is the JVM's home: ``-scribetwo -h``
+    creates an empty prediction cache in ``~/.encyclopedia/`` (measured
+    2026-10-17), which a help capture has no business leaving behind.
     """
     from constellation.thirdparty.jvm import capture_jar
 
     with tempfile.TemporaryDirectory(prefix="encyclopedia-help-") as cwd:
         out = capture_jar(
-            java, jar, [*argv, "-h"], jvm_args=["-Xmx1g"], timeout=timeout, cwd=Path(cwd)
-        )
+            java, jar, [*argv, "-h"], jvm_args=["-Xmx1g", f"-Duser.home={cwd}"],
+            timeout=timeout, cwd=Path(cwd),
+        )  # fmt: skip
     return normalize_help(out)
 
 

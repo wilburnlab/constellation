@@ -26,7 +26,16 @@ make no sense, before anything runs.
 
 **Mass tolerances.** Each of the three is a value and a unit.
 Constellation says ``ppm`` or ``Da``; the jar's enum spells the second
-``AMU`` and hard-errors on ``Da``.
+``AMU`` and hard-errors on ``Da``. ScribeTwo adjusts the precursor and
+fragment tolerances it is given (a first pass on a sample of spectra at
+twice them, then the 97.5th percentile of what it found) and records
+the adjusted values, not the given ones.
+
+**ScribeTwo without a library** predicts every peptide of the FASTA
+first (JChronologer), with the modifications ``ptms`` names as
+``-ptm<Name> off|var|fix``, into a cache shared between searches
+(``prediction_cache``; the jar's default is ``~/.encyclopedia``). The
+cache only saves time, so it is not part of what a search is.
 
 Everything a search was run with is recorded twice in the unit's
 manifest: as given (``SearchParameters.as_given``) and as the exact
@@ -55,7 +64,21 @@ _READABLE_UNITS = {"ppm": "ppm", "amu": "Da", "da": "Da"}
 #: Flags that say how a search is run, not what it is: the same search
 #: on another thread count is the same search (its directory and its
 #: digest do not change, and summaries do not count it as a difference).
-EXECUTION_ONLY_FLAGS = frozenset({"-numberOfThreadsUsed"})
+EXECUTION_ONLY_FLAGS = frozenset({"-numberOfThreadsUsed", "-predictionCache"})
+
+#: The modifications ScribeTwo's FASTA prediction takes as
+#: ``-ptm<Name> off|var|fix``. Its help gives only the pattern
+#: (``-ptm...``); these are the names a 6.9.23 ScribeTwo result records
+#: (every one, with its state, in its ``metadata``).
+CHRONOLOGER_PTMS = (
+    "Acetyl", "Carbamidomethyl", "Deamidation", "Dimethyl", "GlyGly", "HexNAc", "Methyl",
+    "Oxidation", "Phospho", "ProteinNTermAcetyl", "PyroGluQ", "Succinyl", "TMT", "Trimethyl",
+)  # fmt: skip
+PTM_STATES = ("off", "var", "fix")
+
+#: Settings only the spectrum-centric engine has (``SearchParameters``
+#: field -> what to call it in a message).
+SPECTRUM_CENTRIC_SETTINGS = {"ptms": "--ptm", "prediction_cache": "--prediction-cache"}
 
 #: The settings a summary leads with, in Constellation's spelling:
 #: ``(label, value flag, unit flag or None)``.
@@ -179,7 +202,36 @@ class SearchParameters:
     percolator_threshold: float | None = None
     percolator_protein_threshold: float | None = None
     threads: int | None = None
+    #: Spectrum-centric, without a library: modification -> off / var /
+    #: fix for the FASTA prediction (``CHRONOLOGER_PTMS``).
+    ptms: dict[str, str] = field(default_factory=dict)
+    #: Spectrum-centric: where the FASTA prediction cache lives (``None``:
+    #: the jar's default).
+    prediction_cache: Path | str | None = None
     extra: dict[str, FlagValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name, state in self.ptms.items():
+            if name not in CHRONOLOGER_PTMS:
+                raise ValueError(
+                    f"no modification {name!r} for ScribeTwo's prediction; it knows "
+                    f"{', '.join(CHRONOLOGER_PTMS)}"
+                )
+            if state not in PTM_STATES:
+                raise ValueError(
+                    f"modification {name} must be one of {', '.join(PTM_STATES)}; got {state!r}"
+                )
+        if self.ptms and {"-fixed", "-variable"} & set(self.extra):
+            raise ValueError(
+                "named modifications (--ptm) and -fixed / -variable do not mix; the jar's "
+                "help says to use one or the other"
+            )
+
+    def spectrum_centric_only(self) -> list[str]:
+        """The settings given that only the spectrum-centric engine has."""
+        return [
+            label for name, label in SPECTRUM_CENTRIC_SETTINGS.items() if getattr(self, name)
+        ]
 
     def flags(self) -> dict[str, FlagValue]:
         """The jar flags these settings become, in a fixed order."""
@@ -199,9 +251,12 @@ class SearchParameters:
             (self.percolator_threshold, "-percolatorThreshold"),
             (self.percolator_protein_threshold, "-percolatorProteinThreshold"),
             (self.threads, "-numberOfThreadsUsed"),
+            (self.prediction_cache, "-predictionCache"),
         ):
             if value is not None:
                 out[flag] = value
+        for name, state in self.ptms.items():
+            out[f"-ptm{name}"] = state
         for flag, value in self.extra.items():
             if flag in out:
                 raise ValueError(
@@ -223,6 +278,10 @@ class SearchParameters:
             value = getattr(self, name)
             if value is not None:
                 out[name] = value
+        if self.ptms:
+            out["ptms"] = dict(self.ptms)
+        if self.prediction_cache is not None:
+            out["prediction_cache"] = str(self.prediction_cache)
         if self.extra:
             out["extra"] = {k: str(v) for k, v in self.extra.items()}
         return out
@@ -269,12 +328,15 @@ def readable_settings(
 
 
 __all__ = [
+    "CHRONOLOGER_PTMS",
     "EXECUTION_ONLY_FLAGS",
     "HEADLINE_SETTINGS",
     "PEPTIDE_CENTRIC",
+    "PTM_STATES",
     "SEARCH_MODES",
     "SEARCH_TYPES",
     "SPECTRUM_CENTRIC",
+    "SPECTRUM_CENTRIC_SETTINGS",
     "ResolvedSearch",
     "SearchModeError",
     "SearchParameters",

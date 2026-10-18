@@ -13,8 +13,8 @@ given acquisition. Constellation models that with two Arrow tables:
 
 PSM-level scores (one row per spectrum) live in ``PSM_TABLE``. It is
 populated by readers whose source genuinely emits per-spectrum matches —
-MaxQuant ``msms.txt`` (via ``massspec.io.maxquant``) is the first such
-driver. Aggregating-only formats — e.g. the encyclopedia file format,
+MaxQuant ``msms.txt`` (via ``massspec.io.maxquant``) was the first such
+driver; ScribeTwo's reports (``massspec.io.encyclopedia``) the second. Aggregating-only formats — e.g. the encyclopedia file format,
 which records peptide/protein-level scores rather than per-spectrum
 matches — leave ``Search.psms`` empty rather than manufacture PSM rows
 that would invent data.
@@ -133,6 +133,11 @@ PSM_TABLE: pa.Schema = pa.schema(
         pa.field("modified_sequence", pa.string(), nullable=True),
         # engine-internal peptide index — see NOTE above (NOT a library FK).
         pa.field("peptide_id", pa.int64(), nullable=True),
+        # Content-derived precursor id (``massspec.library.ids``) of
+        # ``modified_sequence`` at ``charge``: the same id the precursor
+        # tables of a content-keyed result use, so PSMs join to them.
+        # Null for decoys and where the reader does not derive it. (v2)
+        pa.field("precursor_id", pa.int64(), nullable=True),
         pa.field("mod_peptide_id", pa.int64(), nullable=True),
         pa.field("evidence_id", pa.int64(), nullable=True),
         # ";"-delimited protein accessions, verbatim from the source.
@@ -155,6 +160,8 @@ PSM_TABLE: pa.Schema = pa.schema(
         pa.field("score", pa.float64(), nullable=True),
         pa.field("delta_score", pa.float64(), nullable=True),
         pa.field("pep", pa.float64(), nullable=True),  # posterior error probability
+        # q-value where the engine reports one for this match (v2).
+        pa.field("qvalue", pa.float64(), nullable=True),
         pa.field("is_decoy", pa.bool_(), nullable=False),
         # derived: any "CON__" accession in ``proteins`` (MaxQuant's
         # contaminant convention; there is no dedicated msms.txt column).
@@ -162,7 +169,7 @@ PSM_TABLE: pa.Schema = pa.schema(
         # engine name: "maxquant", ... (matches PEPTIDE_SCORE_TABLE.engine).
         pa.field("engine", pa.string(), nullable=False),
     ],
-    metadata={b"schema_name": b"PsmTable", b"schema_version": b"1"},
+    metadata={b"schema_name": b"PsmTable", b"schema_version": b"2"},
 )
 
 

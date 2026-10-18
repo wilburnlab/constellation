@@ -263,7 +263,19 @@ def test_missing_sidecars_are_reported_and_a_missing_result_is_an_error(tmp_path
     with pytest.raises(MissingOutputError, match="wrote no result library: expected run.dia.elib"):
         locate_outputs(tmp_path / "b", "run.dia")
     with pytest.raises(KeyError, match="no output inventory was captured"):
-        output_inventory("scribetwo")
+        output_inventory("walnut")
+
+
+def test_scribetwo_writes_its_result_beside_the_input_and_its_reports_in_a_directory() -> None:
+    """Captured from a 6.9.23 ScribeTwo run (2026-10-17): the result is
+    <input>.dlib, everything else is under <input>.scribe2/, and every
+    placeholder in a name is the input's (each name has two)."""
+    names = expected_names("scribetwo", "run.dia")
+    assert names["<input>.dlib"] == "run.dia.dlib"
+    reports = {n: f for n, f in names.items() if n != "<input>.dlib"}
+    assert reports and all(f.startswith("run.dia.scribe2/run.dia.scribe2.") for f in reports.values())
+    for wanted in (".features.txt", ".txt", ".decoy.txt"):
+        assert f"run.dia.scribe2/run.dia.scribe2{wanted}" in reports.values()
 
 
 # ── `massspec encyclopedia flags` / `run` ──────────────────────────────

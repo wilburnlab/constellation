@@ -183,7 +183,9 @@ def _build_search_parser(subs: argparse._SubParsersAction) -> None:
         default=None,
         help=(
             "spectral library (.dlib, or an .elib chromatogram library). Required "
-            "for a peptide-centric search."
+            "for a peptide-centric search; optional for a spectrum-centric one, "
+            "which without it predicts every peptide of the FASTA first (see --ptm, "
+            "--prediction-cache)."
         ),
     )
     p.add_argument(
@@ -219,8 +221,8 @@ def _build_search_parser(subs: argparse._SubParsersAction) -> None:
         help=(
             "which engine. peptide-centric is the original EncyclopeDIA search "
             "(DIA data, needs a library); spectrum-centric is ScribeTwo (DDA or "
-            "DIA, library optional; not available here yet). Default: what suits "
-            "the data, which Constellation infers from the acquisition."
+            "DIA, library optional). Default: what suits the data, which "
+            "Constellation infers from the acquisition (DDA: spectrum-centric)."
         ),
     )
     p.add_argument(
@@ -228,6 +230,32 @@ def _build_search_parser(subs: argparse._SubParsersAction) -> None:
         choices=["auto", "dia", "dda", "dda-chimeric"],
         default=None,
         help="spectrum-centric only: ScribeTwo's -searchType. Default: auto.",
+    )
+    p.add_argument(
+        "--ptm",
+        action="append",
+        default=[],
+        metavar="NAME=STATE",
+        help=(
+            "spectrum-centric, without a library: a modification for the FASTA "
+            "prediction, as ScribeTwo's -ptm<NAME> off|var|fix (e.g. Oxidation=var). "
+            "Repeatable. Names: Acetyl, Carbamidomethyl, Deamidation, Dimethyl, GlyGly, "
+            "HexNAc, Methyl, Oxidation, Phospho, ProteinNTermAcetyl, PyroGluQ, Succinyl, "
+            "TMT, Trimethyl. Not with -fixed / -variable."
+        ),
+    )
+    p.add_argument(
+        "--prediction-cache",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "spectrum-centric: where ScribeTwo keeps its FASTA predictions, shared by "
+            "every search that uses it (about 3 GB per NCE, charge and DDA/DIA for a "
+            "human proteome; the first search fills it, which took 86 min on 12 "
+            "cores). Default: the jar's, ~/.encyclopedia. Not part of what a search "
+            "is: searches in different caches are the same search."
+        ),
     )
     _add_run_controls(p)
     _add_search_settings(p)
@@ -261,6 +289,14 @@ def _search_parameters(args: argparse.Namespace):
         return None if value is None else Tolerance(float(value), str(resolved[f"{stem}_tolerance_unit"]))
 
     extra = _passthrough_flags(args.encyclopedia_arg)
+    ptms: dict[str, str] = {}
+    for raw in getattr(args, "ptm", None) or []:
+        name, sep, state = raw.partition("=")
+        if not sep:
+            raise ValueError(f"--ptm {raw!r}: write it as NAME=STATE (e.g. Oxidation=var)")
+        if name in ptms:
+            raise ValueError(f"--ptm sets {name} twice")
+        ptms[name] = state
     if args.acquisition is not None:
         if "-acquisition" in extra:
             raise ValueError("-acquisition is set both by --acquisition and by --encyclopedia-arg")
@@ -276,6 +312,8 @@ def _search_parameters(args: argparse.Namespace):
             percolator_threshold=args.percolator_threshold,
             percolator_protein_threshold=args.percolator_protein_threshold,
             threads=args.threads,
+            ptms=ptms,
+            prediction_cache=getattr(args, "prediction_cache", None),
             extra=extra,
         ),
         resolved,

@@ -118,7 +118,11 @@ from constellation.massspec.manifest import (
     table_partition_dir,
 )
 from constellation.massspec.search.encyclopedia._common import sha256_file
-from constellation.massspec.search.encyclopedia.outputs import MissingOutputError, locate_outputs
+from constellation.massspec.search.encyclopedia.outputs import (
+    MissingOutputError,
+    fatal_error,
+    locate_outputs,
+)
 from constellation.massspec.search.encyclopedia.params import (
     EXECUTION_ONLY_FLAGS,
     PEPTIDE_CENTRIC,
@@ -156,6 +160,11 @@ SPECTRA_LAYOUT = 1
 #: Where a search's collision-filtered result library goes, inside its
 #: directory (:func:`collision_filter`).
 COLLISION_DIR = "collision"
+#: The jar program of the spectrum-centric search.
+SCRIBETWO = "scribetwo"
+#: Where an experiment keeps its copies of the FASTA files ScribeTwo
+#: searches (``fasta/<digest>/<name>``).
+FASTA_DIR = "fasta"
 
 _REFUSED_INPUTS = {
     ".mzml": "mzML",
@@ -314,6 +323,9 @@ def content_keyed_tables(read: EncyclopediaReadResult) -> dict[str, pa.Table]:
         tables["precursor_score"] = rekey(read.search.precursor_scores, "precursor_id", precursor_ids)
         tables["peptide_score"] = rekey(read.search.peptide_scores, "peptide_id", peptide_ids)
         tables["protein_score"] = rekey(read.search.protein_scores, "protein_id", protein_ids)
+        if read.search.psms.num_rows:
+            # Already under content-derived precursor ids (_scribe2).
+            tables["psm"] = read.search.psms
     return tables
 
 
@@ -581,24 +593,41 @@ def plan_searches(
         for g in groups
     ]
     for r in resolved:
-        if r.mode == SPECTRUM_CENTRIC:
+        if r.mode == SPECTRUM_CENTRIC and merge:
             raise WorkflowError(
-                "spectrum-centric search (ScribeTwo) is not available through this command yet"
+                "a merged search is peptide-centric (gas-phase fractions searched as one "
+                "for a chromatogram library); search the acquisitions spectrum-centric one "
+                "by one instead"
+            )
+        if r.mode == PEPTIDE_CENTRIC and parameters.spectrum_centric_only():
+            raise WorkflowError(
+                f"{', '.join(parameters.spectrum_centric_only())} belong to the "
+                f"spectrum-centric search (ScribeTwo), and this search is peptide-centric"
             )
         if r.library_required and library is None:
             raise WorkflowError(f"a {r.mode} search needs --library")
     # Only the peptide-centric program runs the Percolator executable
-    # (ScribeTwo scores with its own), so this waits for the mode, even
-    # though for an unconverted .raw that means after the conversion.
-    extra_argv = [str(x) for pair in parameters.extra.items() for x in pair]
-    blocker = percolator_blocker(parameters.percolator_version, extra_argv)
-    if blocker is not None:
-        raise WorkflowError(blocker)
+    # (ScribeTwo scores with its own, JavaPot), so this waits for the
+    # mode, even though for an unconverted .raw that means after the
+    # conversion.
+    if any(r.mode == PEPTIDE_CENTRIC for r in resolved):
+        extra_argv = [str(x) for pair in parameters.extra.items() for x in pair]
+        blocker = percolator_blocker(parameters.percolator_version, extra_argv)
+        if blocker is not None:
+            raise WorkflowError(blocker)
     files: dict[str, FlagValue] = {"-f": fasta}
     if library is not None:
         files["-l"] = library
     for r, g in zip(resolved, groups, strict=True):
         settings = {**r.flags, **parameters.flags()}
+        if r.program == SCRIBETWO:
+            empty = [f for f in ("-fixed", "-variable") if settings.get(f) == ""]
+            if empty:
+                raise WorkflowError(
+                    f"ScribeTwo spells 'none' for {' and '.join(empty)} as '-', not an empty value "
+                    f"(its help: 'use -fixed - for none'), and stops on an empty one: "
+                    f"--encyclopedia-arg={empty[0]}=-"
+                )
         if "-o" in settings:
             raise WorkflowError(
                 "-o is not passed through: the jar's outputs belong beside its input, in the "
@@ -747,11 +776,12 @@ def _run_search(
     # What the jar is given: a name for the spectra file inside the
     # search's own directory. Its outputs go beside it, named for it.
     jar_input = jar_dir / spectra_name
-    files: dict[str, FlagValue] = {"-f": plan.fasta}
+    program = plan.resolved.program
+    fasta = _experiment_fasta(experiment_dir, plan.fasta) if program == SCRIBETWO else plan.fasta
+    files: dict[str, FlagValue] = {"-f": fasta}
     if plan.library is not None:
         files["-l"] = plan.library
     flags: dict[str, FlagValue] = {"-i": jar_input, **files, **plan.settings}
-    program = plan.resolved.program
 
     if resume and stages.is_done(unit_dir, plan.stage_key):
         # Finished by another command between the check and the lock.
@@ -769,6 +799,8 @@ def _run_search(
     # So that a search that fails or is stopped still says what it was
     # (``massspec summarize``). Rewritten when the search ends.
     inputs: dict[str, Any] = {"fasta": _file_record(plan.fasta)}
+    if fasta != plan.fasta:
+        inputs["fasta"]["copy"] = _relative(fasta, experiment_dir)
     if plan.library is not None:
         inputs["library"] = _file_record(plan.library)
     if plan.merged:
@@ -815,7 +847,13 @@ def _run_search(
             allow_undocumented=plan.allow_undocumented,
             stream_to_stderr=stream_to_stderr,
         )
-        outputs = locate_outputs(jar_dir, spectra_name, program)
+        try:
+            outputs = locate_outputs(jar_dir, spectra_name, program)
+        except MissingOutputError as exc:
+            fatal = fatal_error(getattr(run, "stdout_log", None))
+            if fatal is None:
+                raise
+            raise MissingOutputError(f"{program} stopped on an error and exited 0: {fatal}") from exc
 
         # ── the tables ──────────────────────────────────────────────
         with _experiment_lock(experiment_dir):
@@ -831,7 +869,10 @@ def _run_search(
             recorded = read_metadata(con)
         finally:
             con.close()
-        disagreements = parameter_disagreements(recorded, flags)
+        adjusted = _adjusted_tolerances(recorded, flags) if program == SCRIBETWO else []
+        disagreements = parameter_disagreements(
+            recorded, {k: v for k, v in flags.items() if k not in {a[0] for a in adjusted}}
+        )
         table_rows = _write_tables(
             experiment_dir, plan.unit, content_keyed_tables(read), acquisition_id=plan.acquisition_id
         )
@@ -863,7 +904,7 @@ def _run_search(
                 "table_rows": table_rows,
                 "missing_outputs": list(outputs.missing),
             },
-            caveats=[*read.caveats, *disagreements],
+            caveats=[*read.caveats, *(note for _, note in adjusted), *disagreements],
         ),
     )
     _update_experiment(
@@ -1247,6 +1288,61 @@ def parameter_disagreements(
     return out
 
 
+def _experiment_fasta(experiment_dir: Path, fasta: Path) -> Path:
+    """The experiment's own copy of ``fasta``, for ScribeTwo to read.
+
+    ScribeTwo writes an index of the FASTA beside it
+    (``<fasta>.<enzyme>.fasdb``: about 400 MB for a proteome, with
+    ``.lock`` and ``.tmp`` files), rebuilt whenever the settings change,
+    and it follows a symbolic link to do so. So it is given a copy inside
+    the experiment, ``fasta/<first 16 hex digits of the SHA-256>/<name>``,
+    made once per content and never touched again (the jar rebuilds an
+    index whose FASTA looks newer), and nothing is written beside the
+    user's file (PI, 2026-10-17).
+    """
+    digest = sha256_file(fasta)[:16]
+    target = experiment_dir / FASTA_DIR / digest / fasta.name
+    with file_lock(experiment_dir / FASTA_DIR / f".{digest}.lock"):
+        if not target.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            partial = target.with_name(f".{target.name}.tmp")
+            shutil.copyfile(fasta, partial)
+            partial.replace(target)
+    return target
+
+
+#: ScribeTwo adjusts these tolerances from a first pass on a sample of
+#: spectra and records the adjusted values: ``(value flag, unit flag, what)``.
+_SCRIBETWO_ADJUSTS = (
+    ("-ptol", "-ptolunits", "precursor tolerance"),
+    ("-ftol", "-ftolunits", "fragment tolerance"),
+)
+
+
+def _adjusted_tolerances(
+    recorded: Mapping[str, str], flags: Mapping[str, FlagValue]
+) -> list[tuple[str, str]]:
+    """``(flag, note)`` for each tolerance ScribeTwo was given and then
+    adjusted: not a disagreement (it does this by design) but worth
+    saying, since the result records only the adjusted value."""
+    out = []
+    for value_flag, unit_flag, what in _SCRIBETWO_ADJUSTS:
+        if value_flag not in flags or value_flag not in recorded:
+            continue
+        asked, got = format_value(flags[value_flag]), str(recorded[value_flag])
+        try:
+            same = math.isclose(float(asked), float(got), rel_tol=1e-9)
+        except ValueError:
+            same = asked == got
+        if same:
+            continue
+        unit = str(recorded.get(unit_flag, flags.get(unit_flag, ""))).upper()
+        unit = {"AMU": "Da", "PPM": "ppm"}.get(unit, unit)
+        out.append((value_flag, f"ScribeTwo adjusted the {what} from {asked} to {float(got):.4g} {unit} "
+                                f"(its first pass on a sample of spectra); the result records the adjusted value"))
+    return out
+
+
 def _relative(path: Path, base: Path) -> str:
     try:
         return str(path.relative_to(base))
@@ -1474,6 +1570,12 @@ def _choose_searches(
                 f"(`massspec summarize` lists them)"
             )
         chosen = {s: finished[s] for s in searches}
+        spectrum_centric = [s for s, r in chosen.items() if r.search_mode != PEPTIDE_CENTRIC]
+        if spectrum_centric:
+            raise WorkflowError(
+                f"a report is made from peptide-centric searches; {', '.join(spectrum_centric)} "
+                f"{'is' if len(spectrum_centric) == 1 else 'are'} spectrum-centric"
+            )
     else:
         _, acquisitions = _load_experiment(experiment_dir)
         merged = {
@@ -1674,8 +1776,11 @@ def report_searches(
                 stream_to_stderr=stream_to_stderr,
             )
             if not output.is_file():
+                fatal = fatal_error(getattr(run, "stdout_log", None))
                 raise MissingOutputError(
-                    f"{REPORT_PROGRAM} finished but wrote no {output.name}; see {report_dir / 'logs'}"
+                    f"{REPORT_PROGRAM} stopped on an error and exited 0: {fatal}"
+                    if fatal
+                    else f"{REPORT_PROGRAM} finished but wrote no {output.name}; see {report_dir / 'logs'}"
                 )
             with _experiment_lock(experiment_dir):
                 _, acquisitions = _load_experiment(experiment_dir)
@@ -1822,8 +1927,9 @@ def quantify(
     searched_against = Path(library).resolve()
     if fractions:
         merged = search_acquisitions(
-            fractions, library=library, merge=True, merged_name=merged_name, **common
-        )
+            fractions, library=library, merge=True, merged_name=merged_name,
+            search_mode=PEPTIDE_CENTRIC, **common,
+        )  # fmt: skip
         if not merged.ok:
             ((plan, exc),) = merged.failures
             # Raised as it is, so the command exits with the jar's status.
@@ -1836,7 +1942,9 @@ def quantify(
             searched_against = filtered
     elif collision is not None:
         raise WorkflowError("the collision filter applies to a chromatogram library: give fractions")
-    run_searches = search_acquisitions(runs, library=searched_against, jobs=jobs, **common)
+    run_searches = search_acquisitions(
+        runs, library=searched_against, jobs=jobs, search_mode=PEPTIDE_CENTRIC, **common
+    )
     report_result = None
     if report and run_searches.ok:
         report_result = report_searches(

@@ -258,8 +258,10 @@ def _search(experiment_dir: Path, unit_dir: Path, *, registered: bool) -> dict[s
         library_sha256=(record.inputs.get("library") or {}).get("sha256"),
         fasta=(record.inputs.get("fasta") or {}).get("path"),
         fasta_sha256=(record.inputs.get("fasta") or {}).get("sha256"),
+        fasta_copy=(record.inputs.get("fasta") or {}).get("copy"),
+        search_type=record.engine_flags.get("-searchType"),
         spectra_file=dict(record.inputs.get("spectra_file") or {}) or None,
-        settings=[list(pair) for pair in _readable(record.engine, view)],
+        settings=[list(pair) for pair in _spectrum_centric_view(record, _readable(record.engine, view))],
         settings_source=source,
         all_settings=view,
         set_explicitly={k: v for k, v in record.engine_flags.items() if k not in _INPUT_FLAGS},
@@ -288,6 +290,46 @@ def _search(experiment_dir: Path, unit_dir: Path, *, registered: bool) -> dict[s
         **{k: v for k, v in view.items() if k not in _execution_only(record.engine)},
     }
     return entry
+
+
+#: Headline settings that say nothing about a ScribeTwo search: it scores
+#: with its own JavaPot, whatever Percolator it records.
+_NOT_SCRIBETWO = frozenset({"Percolator"})
+
+
+def _spectrum_centric_view(record: SearchManifest, pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The headline settings of a ScribeTwo search: its search type first,
+    its scorer instead of a Percolator it does not run, and a tolerance it
+    adjusted shown with the value it was given."""
+    if record.program != "scribetwo":
+        return pairs
+    given = {
+        "precursor tolerance": record.engine_flags.get("-ptol"),
+        "fragment tolerance": record.engine_flags.get("-ftol"),
+    }
+    out: list[tuple[str, str]] = []
+    if record.engine_flags.get("-searchType"):
+        out.append(("search type", record.engine_flags["-searchType"]))
+    for label, value in pairs:
+        if label in _NOT_SCRIBETWO:
+            continue
+        asked = given.get(label)
+        if asked is not None and record.engine_settings and not value.startswith(f"{asked} "):
+            number, _, unit = value.partition(" ")
+            try:
+                number = f"{float(number):.4g}"
+            except ValueError:
+                pass
+            value = f"{number} {unit}".strip() + f" (adjusted by ScribeTwo; given {asked})"
+        out.append((label, value))
+    out.append(("scoring", "JavaPot (ScribeTwo's own)"))
+    return out
+
+
+def _library_line(s: dict[str, Any]) -> str:
+    if s.get("library"):
+        return _file_name(s["library"])
+    return "none: predicted from the FASTA" if s.get("program") == "scribetwo" else "none"
 
 
 def _fdr(threshold: str | None) -> str | None:
@@ -510,7 +552,7 @@ def _search_block(s: dict[str, Any], names: Mapping[int, str]) -> list[str]:
         f"{_acquisition_label(s['acquisition_ids'])}, {s['search_mode']}, "
         f"{s['engine']} {s['engine_version']}",
     )
-    lines += _field("library", _file_name(s["library"]) if s.get("library") else "none")
+    lines += _field("library", _library_line(s))
     if s.get("fasta"):
         lines += _field("FASTA", _file_name(s["fasta"]))
     source = "" if s["settings_source"] == RECORDED else " (as given, the rest at the jar's defaults)"
@@ -560,6 +602,13 @@ def _detail_block(s: dict[str, Any], names: Mapping[int, str]) -> list[str]:
     ):
         if path:
             lines += _field(label, f"{path}" + (f"  (sha256 {sha[:16]}…)" if sha else ""), indent=2)
+        elif label == "library" and s.get("program") == "scribetwo":
+            lines += _field(label, _library_line(s), indent=2)
+    if s.get("fasta_copy"):
+        lines += _field(
+            "", f"ScribeTwo read the experiment's copy, {s['fasta_copy']}, and indexed it there",
+            indent=2,
+        )  # fmt: skip
     spectra = s.get("spectra_file")
     if spectra:
         how = "written by Constellation" if spectra.get("written_by") == "constellation" else "given"

@@ -331,3 +331,36 @@ def test_commands_print_and_record_the_caveats(tmp_path: Path, capsys) -> None:
     clean = read_encyclopedia(build_result_library(tmp_path / "ok.elib", [_entry("PEPTIDEK", "PEPTIDEK", 2)]))
     _report_ingest_caveats(clean, quiet)
     assert quiet == {} and capsys.readouterr().err == ""
+
+
+# ── a ScribeTwo result: observed spectra, its own tolerance (phase 6) ───
+
+
+def test_annotation_at_a_tolerance_in_da_and_one_peak_per_ion() -> None:
+    import numpy as np
+
+    from constellation.massspec.io.encyclopedia._project import _annotate_batch, _one_peak_per_ion
+
+    # One entry; its ladder has two ions, at 300.0 and 500.0.
+    ladder = [(np.array([300.0, 500.0]), np.array([1, 4], dtype=np.int8),
+               np.array([3, 4], dtype=np.int32), np.array([1, 1], dtype=np.int32))]  # fmt: skip
+    obs = np.array([299.7, 300.2, 420.0, 500.4])
+    owner = np.zeros(len(obs), dtype=np.int64)
+    precursor = (np.array([900.0]), np.array([2]))
+    ion, pos, charge, mz, note = _annotate_batch(obs, owner, ladder, *precursor, (0.5, "da"))
+    assert ion.tolist() == [1, 1, -1, 4]  # 420.0 is no ion within 0.5 Da
+    ion_ppm, *_ = _annotate_batch(obs, owner, ladder, *precursor, (20.0, "ppm"))
+    assert ion_ppm.tolist() == [-1, -1, -1, -1]  # an observed spectrum is not exact
+
+    intensity = np.array([10.0, 50.0, 99.0, 7.0])
+    keep = _one_peak_per_ion(owner, ion, pos, charge, note, intensity, np.abs(mz - obs))
+    # Of the two peaks on the b3 ion the more intense; the y4 peak; not the noise.
+    assert keep.tolist() == [False, True, False, True]
+
+
+def test_the_engine_is_read_from_the_result() -> None:
+    from constellation.massspec.io.encyclopedia._project import engine_of
+
+    assert engine_of({"run.raw search type": "ScribeTwoDDA"}) == "scribetwo"
+    assert engine_of({"run.raw search type": "EncyclopeDIA"}) == "encyclopedia"
+    assert engine_of({}) == "encyclopedia"

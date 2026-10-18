@@ -13,12 +13,17 @@ they mean. This module is the stable entry point over them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from constellation.core.chem.modifications import UNIMOD, ModVocab
 from constellation.massspec.acquisitions import Acquisitions
-from constellation.massspec.io.encyclopedia._project import project_library_file
+from constellation.massspec.io.encyclopedia._project import (
+    SCRIBETWO_ENGINE,
+    engine_of,
+    project_library_file,
+)
+from constellation.massspec.io.encyclopedia._scribe2 import read_scribe2_psms, scribe2_reports
 from constellation.massspec.library.library import Library
 from constellation.massspec.quant.quant import Quant
 from constellation.massspec.search.search import Search
@@ -56,6 +61,7 @@ def read_encyclopedia(
     enabled_modifications: ModVocab = UNIMOD,
     include_decoys: bool = False,
     acquisitions: Acquisitions | None = None,
+    psms: bool = True,
 ) -> EncyclopediaReadResult:
     """Read an EncyclopeDIA ``.dlib`` / ``.elib`` file.
 
@@ -82,6 +88,11 @@ def read_encyclopedia(
         An experiment's acquisitions to bind the file's runs to, by
         source name. Without it the file's own source files are numbered
         in sorted order.
+    psms
+        For a ScribeTwo result with its reports beside it
+        (``run.dia.dlib`` and ``run.dia.scribe2/``): read every scored
+        peptide-spectrum match into ``Search.psms`` (:mod:`._scribe2`).
+        The result library alone has no scans.
 
     What each output column holds, and why, is in :mod:`._project`.
     """
@@ -93,10 +104,21 @@ def read_encyclopedia(
         include_decoys=include_decoys,
         acquisitions=acquisitions,
     )
+    search = projection.search
+    reports = scribe2_reports(path) if psms and search is not None else None
+    if reports is not None and engine_of(
+        projection.library.metadata_extras.get("x.encyclopedia.metadata", {})
+    ) == SCRIBETWO_ENGINE:
+        search = replace(
+            search,
+            psms=read_scribe2_psms(
+                reports, acquisitions=search.acquisitions, vocab=enabled_modifications
+            ),
+        )
     return EncyclopediaReadResult(
         library=projection.library,
         quant=projection.quant,
-        search=projection.search,
+        search=search,
         caveats=projection.caveats,
     )
 

@@ -52,6 +52,21 @@ _TEXT_TABLE_SUFFIXES = (".txt",)
 # Text files that are logs or fitted-model dumps, not tables with a header row.
 _NOT_TABLES = (".log", ".model")
 
+_NOTES = {
+    "encyclopedia": (
+        "Files a search leaves beside its input when no -o is given: the "
+        "jar's own naming. <input> is the input's file name, extension "
+        "included (run.dia -> run.dia.elib). With -o X.encyclopedia.txt "
+        "the same files are written as X.* in X's directory instead."
+    ),
+    "scribetwo": (
+        "Files a ScribeTwo search leaves when no -o is given: the result "
+        "library beside its input (<input>.dlib) and its reports in a "
+        "directory named for the input (<input>.scribe2/). <input> is the "
+        "input's file name, extension included (run.dia -> run.dia.dlib)."
+    ),
+}
+
 
 def _connect(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
@@ -109,12 +124,28 @@ def _input_name(output_dir: Path) -> str:
     return libraries[0].name.removesuffix(libraries[0].suffix)
 
 
-def _inventory(output_dir: Path, input_name: str) -> list[dict[str, object]]:
-    files: list[dict[str, object]] = []
+def _outputs(output_dir: Path, input_name: str) -> list[tuple[str, Path]]:
+    """``(inventory name, path)`` for every file the run named for its input:
+    beside the input, and inside a directory named for it (ScribeTwo keeps
+    its reports in ``<input>.scribe2/``)."""
+    prefix = input_name + "."
+    out: list[tuple[str, Path]] = []
     for path in sorted(output_dir.iterdir()):
-        if not path.is_file() or not path.name.startswith(input_name + "."):
+        if not path.name.startswith(prefix):
             continue  # the input itself, logs directories, anything unrelated
         name = "<input>" + path.name[len(input_name) :]
+        if path.is_file():
+            out.append((name, path))
+        elif path.is_dir():
+            for inner in sorted(path.iterdir()):
+                if inner.is_file() and inner.name.startswith(prefix):
+                    out.append((f"{name}/<input>{inner.name[len(input_name):]}", inner))
+    return out
+
+
+def _inventory(output_dir: Path, input_name: str) -> list[dict[str, object]]:
+    files: list[dict[str, object]] = []
+    for name, path in _outputs(output_dir, input_name):
         entry: dict[str, object] = {"name": name}
         if path.suffix in _SQLITE_SUFFIXES:
             entry["kind"] = "sqlite"
@@ -194,12 +225,7 @@ def main() -> int:
         "encyclopedia_version": args.version,
         "program": args.program,
         "container_version": container,
-        "note": (
-            "Files a search leaves beside its input when no -o is given: the "
-            "jar's own naming. <input> is the input's file name, extension "
-            "included (run.dia -> run.dia.elib). With -o X.encyclopedia.txt "
-            "the same files are written as X.* in X's directory instead."
-        ),
+        "note": _NOTES.get(args.program, _NOTES["encyclopedia"]),
         "files": _inventory(args.output_dir, input_name),
         "result_metadata_keys": keys,
     }

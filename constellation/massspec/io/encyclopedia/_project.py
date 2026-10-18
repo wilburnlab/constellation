@@ -40,6 +40,16 @@ Fragments
     columns. Anything else is kept with null ion columns and no
     annotation. Nothing is dropped and nothing is listed twice.
 
+    Except in a ScribeTwo result (spectrum-centric). Searched without a
+    library its stored spectra are observed spectra: about a thousand
+    peaks per identification, almost none of them ions of the peptide
+    (with a chromatogram library, 3% of the peaks were not). There the tolerance is the
+    one the result records (``-ftol``, after ScribeTwo's own
+    adjustment), only peaks that are ions of the peptide are kept, one
+    per ion (the most intense; on a tie the nearer), and the rest are
+    counted in a caveat (PI, 2026-10-17). The whole spectrum stays in
+    the acquisition, reached through the identification's scan.
+
 Scores
     ``precursor_scores`` holds every row of ``peptidescores``, decoys
     included. The peptide-level table is its roll-up (best q-value
@@ -90,6 +100,8 @@ from constellation.massspec.search.schemas import (
 from constellation.massspec.search.search import Search
 
 ENGINE = "encyclopedia"
+#: The engine name of a ScribeTwo (spectrum-centric) result.
+SCRIBETWO_ENGINE = "scribetwo"
 
 _PROTON = 1.007276466812
 #: Neutral losses a stored intact-precursor peak may carry, as
@@ -225,7 +237,7 @@ def _annotate_batch(
     theoretical: list[tuple[np.ndarray, ...]],
     precursor_mz: np.ndarray,
     precursor_charge: np.ndarray,
-    tolerance_ppm: float,
+    tolerance: tuple[float, str],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str | None]]:
     """Annotate the stored peaks of one batch of entries.
 
@@ -233,9 +245,11 @@ def _annotate_batch(
     belongs to; ``theoretical[i]`` is entry ``i``'s ladder. Returns, per
     peak, ``ion_type``, ``position``, ``charge`` (each -1 where the peak
     is not a b/y ion), the m/z to record, and an mzPAF annotation for
-    intact-precursor peaks.
+    intact-precursor peaks. ``tolerance`` is ``(value, "ppm" | "da")``.
     """
     n_obs = len(obs_mz)
+    value, unit = tolerance
+    window = obs_mz * value * 1e-6 if unit == "ppm" else np.full(n_obs, float(value))
     ion_type = np.full(n_obs, -1, dtype=np.int8)
     position = np.full(n_obs, -1, dtype=np.int32)
     charge = np.full(n_obs, -1, dtype=np.int32)
@@ -267,7 +281,7 @@ def _annotate_batch(
             better = error < best_error
             best = np.where(better, index, best)
             best_error = np.where(better, error, best_error)
-        matched = best_error <= obs_mz * tolerance_ppm * 1e-6
+        matched = best_error <= window
         hit = best[matched]
         ion_type[matched] = t_ion[hit]
         position[matched] = t_pos[hit]
@@ -289,7 +303,7 @@ def _annotate_batch(
                 is_it = (
                     ~found
                     & (precursor_charge[owner] >= k)
-                    & (np.abs(expected - obs_mz[rest]) <= obs_mz[rest] * tolerance_ppm * 1e-6)
+                    & (np.abs(expected - obs_mz[rest]) <= window[rest])
                 )
                 if is_it.any():
                     label = f"p{suffix}" + (f"^{k}" if k > 1 else "")
@@ -308,9 +322,15 @@ def _fragment_tables(
     precursor_mz: np.ndarray,
     precursor_charge: np.ndarray,
     ladders: _Ladders,
-    tolerance_ppm: float,
+    tolerance: tuple[float, str],
+    matched_only: bool = False,
+    dropped: list[int] | None = None,
 ) -> Iterator[pa.Table]:
-    """One LIBRARY_FRAGMENT_TABLE chunk per batch of ``entries`` rows."""
+    """One LIBRARY_FRAGMENT_TABLE chunk per batch of ``entries`` rows.
+
+    ``matched_only`` keeps only the peaks that are ions of the peptide,
+    one per ion, and adds the number of peaks left out to ``dropped[0]``.
+    """
     row = 0
     for batch in _mirror.iter_table(
         con, "entries", columns=["MassArray", "IntensityArray"], batch_rows=_FRAGMENT_BATCH
@@ -339,23 +359,90 @@ def _fragment_tables(
         ladders.ensure(wanted)
         theoretical = [ladders.get(m, z) for m, z in wanted]
         ion_type, position, charge, recorded_mz, annotation = _annotate_batch(
-            obs_mz, obs_owner, theoretical, precursor_mz[rows], charges.astype(np.int64), tolerance_ppm
+            obs_mz, obs_owner, theoretical, precursor_mz[rows], charges.astype(np.int64), tolerance
         )
         ladders.forget()
+        owner_precursor = np.repeat(precursor_of_row[rows], sizes)
+        if matched_only:
+            keep_peak = _one_peak_per_ion(
+                obs_owner, ion_type, position, charge, annotation, obs_intensity,
+                np.abs(recorded_mz - obs_mz),
+            )  # fmt: skip
+            if dropped is not None:
+                dropped[0] += int(len(keep_peak) - keep_peak.sum())
+            index = np.flatnonzero(keep_peak)
+            ion_type, position, charge = ion_type[index], position[index], charge[index]
+            recorded_mz, obs_intensity = recorded_mz[index], obs_intensity[index]
+            owner_precursor = owner_precursor[index]
+            annotation = [annotation[i] for i in index]
         unassigned = ion_type < 0
         yield pa.table(
             {
-                "precursor_id": pa.array(np.repeat(precursor_of_row[rows], sizes), type=pa.int64()),
+                "precursor_id": pa.array(owner_precursor, type=pa.int64()),
                 "ion_type": pa.array(ion_type, type=pa.int8(), mask=unassigned),
                 "position": pa.array(position, type=pa.int32(), mask=unassigned),
                 "charge": pa.array(charge, type=pa.int32(), mask=unassigned),
-                "loss_id": pa.nulls(len(obs_mz), type=pa.string()),
+                "loss_id": pa.nulls(len(recorded_mz), type=pa.string()),
                 "mz_theoretical": pa.array(recorded_mz, type=pa.float64()),
                 "intensity_predicted": pa.array(obs_intensity, type=pa.float64()),
                 "annotation": pa.array(annotation, type=pa.string()),
             },
             schema=LIBRARY_FRAGMENT_TABLE,
         )
+
+
+def _one_peak_per_ion(
+    owner: np.ndarray,
+    ion_type: np.ndarray,
+    position: np.ndarray,
+    charge: np.ndarray,
+    annotation: list[str | None],
+    intensity: np.ndarray,
+    error: np.ndarray,
+) -> np.ndarray:
+    """Which peaks to keep when only ions are kept: of the peaks one
+    entry's spectrum has for one ion (a b/y ion, or an intact-precursor
+    annotation), the most intense, and on a tie the nearer."""
+    n = len(owner)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    precursor_label = np.array([a or "" for a in annotation], dtype=object)
+    is_ion = (ion_type >= 0) | (precursor_label != "")
+    rows = np.flatnonzero(is_ion)
+    keep = np.zeros(n, dtype=bool)
+    if not len(rows):
+        return keep
+    _, label_code = np.unique(precursor_label[rows].astype(str), return_inverse=True)
+    # Most intense first, then nearest; the first row of each ion wins.
+    order = np.lexsort((error[rows], -intensity[rows], label_code, charge[rows], position[rows],
+                        ion_type[rows], owner[rows]))  # fmt: skip
+    ranked = rows[order]
+    key = np.stack(
+        [owner[ranked], ion_type[ranked], position[ranked], charge[ranked], label_code[order]],
+        axis=1,
+    )
+    first = np.ones(len(ranked), dtype=bool)
+    first[1:] = np.any(key[1:] != key[:-1], axis=1)
+    keep[ranked[first]] = True
+    return keep
+
+
+def engine_of(metadata: dict[str, str]) -> str:
+    """Which engine wrote a result: ScribeTwo records its ``search type``
+    as ``ScribeTwo...`` (``ScribeTwoDDA``), the peptide-centric search as
+    ``EncyclopeDIA``."""
+    kinds = {v for k, v in metadata.items() if k.endswith(" search type")}
+    return SCRIBETWO_ENGINE if any(str(v).startswith("ScribeTwo") for v in kinds) else ENGINE
+
+
+def _recorded_tolerance(metadata: dict[str, str], value_flag: str, unit_flag: str) -> tuple[float, str] | None:
+    """A tolerance as the result records it, ``(value, "ppm" | "da")``."""
+    try:
+        value = float(metadata[value_flag])
+    except (KeyError, ValueError):
+        return None
+    unit = str(metadata.get(unit_flag, "PPM")).strip().lower()
+    return value, "ppm" if unit == "ppm" else "da"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -528,16 +615,29 @@ def project_library_file(
         )
 
         # ── fragments ───────────────────────────────────────────────
+        engine = engine_of(metadata)
         if annotate_fragments and len(kept_rows):
+            tolerance: tuple[float, str] = (fragment_tolerance_ppm, "ppm")
+            matched_only = engine == SCRIBETWO_ENGINE
+            if matched_only:
+                tolerance = _recorded_tolerance(metadata, "-ftol", "-ftolunits") or tolerance
+            dropped = [0]
             chunks = list(
                 _fragment_tables(
                     con, keep, precursor_of_row, modseq_of_row, precursor_mz, charges,
-                    _Ladders(forms, vocab), fragment_tolerance_ppm,
+                    _Ladders(forms, vocab), tolerance, matched_only, dropped,
                 )
             )
             fragments = (
                 pa.concat_tables(chunks) if chunks else LIBRARY_FRAGMENT_TABLE.empty_table()
             )
+            if dropped[0]:
+                unit = "ppm" if tolerance[1] == "ppm" else "Da"
+                caveats.append(
+                    f"{dropped[0]:,} of the {dropped[0] + fragments.num_rows:,} peaks this ScribeTwo "
+                    f"result stores are not ions of the peptide within {tolerance[0]:g} {unit} (or "
+                    f"repeat an ion) and are not fragment rows"
+                )
         else:
             fragments = LIBRARY_FRAGMENT_TABLE.empty_table()
 
@@ -568,7 +668,7 @@ def project_library_file(
         )
         search = _project_search(
             con, tables, library, by_spelling, by_join_key, vocab, include_decoys,
-            acquisitions, caveats,
+            acquisitions, caveats, engine,
         )
     finally:
         con.close()
@@ -799,6 +899,7 @@ def _project_search(
     include_decoys: bool,
     bind: Acquisitions | None,
     caveats: list[str],
+    engine: str = ENGINE,
 ) -> Search | None:
     n_peptide_scores = _mirror.count_rows(con, "peptidescores") if "peptidescores" in tables else 0
     n_protein_scores = _mirror.count_rows(con, "proteinscores") if "proteinscores" in tables else 0
@@ -859,7 +960,7 @@ def _project_search(
                 "qvalue": peptide_scores.column("QValue"),
                 "pep": peptide_scores.column("PosteriorErrorProbability"),
                 "is_decoy": pa.array([bool(d) for d in decoy], type=pa.bool_()),
-                "engine": pa.array([ENGINE] * n, type=pa.string()),
+                "engine": pa.array([engine] * n, type=pa.string()),
             },
             schema=PRECURSOR_SCORE_TABLE,
         )
@@ -893,7 +994,7 @@ def _project_search(
                 "score": pa.nulls(len(best), type=pa.float64()),
                 "qvalue": pa.array([v[0] for v in best.values()], type=pa.float64()),
                 "pep": pa.array([v[1] for v in best.values()], type=pa.float64()),
-                "engine": pa.array([ENGINE] * len(best), type=pa.string()),
+                "engine": pa.array([engine] * len(best), type=pa.string()),
             },
             schema=PEPTIDE_SCORE_TABLE,
         )
@@ -926,7 +1027,7 @@ def _project_search(
                 "acquisition_id": pa.array([k[1] for k in best_protein], type=pa.int64()),
                 "score": pa.nulls(len(best_protein), type=pa.float64()),
                 "qvalue": pa.array(list(best_protein.values()), type=pa.float64()),
-                "engine": pa.array([ENGINE] * len(best_protein), type=pa.string()),
+                "engine": pa.array([engine] * len(best_protein), type=pa.string()),
             },
             schema=PROTEIN_SCORE_TABLE,
         )
@@ -938,4 +1039,4 @@ def _project_search(
     )
 
 
-__all__ = ["ENGINE", "Projection", "project_library_file"]
+__all__ = ["ENGINE", "SCRIBETWO_ENGINE", "Projection", "engine_of", "project_library_file"]
