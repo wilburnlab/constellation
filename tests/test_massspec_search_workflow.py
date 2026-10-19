@@ -695,8 +695,10 @@ def test_a_searched_experiment_is_a_target_list(tmp_path: Path, jar, inputs) -> 
 
 def test_a_raw_file_is_converted_into_the_experiment_once(tmp_path, jar, inputs, monkeypatch) -> None:
     """The Thermo reader is stood in for; what is checked is where the
-    bundle goes, that a finished one is not converted again, and that an
-    unfinished one (no manifest) is."""
+    bundle goes, that a finished one is not converted again, that an
+    unfinished one (no manifest) is, and that a finished one is reused
+    only for the file it was converted from."""
+    import hashlib
     import shutil
 
     from constellation.massspec.readers import thermo
@@ -707,6 +709,10 @@ def test_a_raw_file_is_converted_into_the_experiment_once(tmp_path, jar, inputs,
     def convert(source, output_dir, *, force=False, **_kwargs):
         converted.append((Path(source).name, force))
         shutil.copytree(template, output_dir, dirs_exist_ok=True)
+        # The real converter records the source's SHA-256.
+        manifest = json.loads((Path(output_dir) / "manifest.json").read_text())
+        manifest["source_sha256"] = hashlib.sha256(Path(source).read_bytes()).hexdigest()
+        (Path(output_dir) / "manifest.json").write_text(json.dumps(manifest))
 
     monkeypatch.setattr(thermo, "convert", convert)
     raw = tmp_path / "run_01.raw"
@@ -726,6 +732,19 @@ def test_a_raw_file_is_converted_into_the_experiment_once(tmp_path, jar, inputs,
     search_acquisition(raw, experiment_dir=experiment, **inputs)
     assert len(converted) == 2
 
+    # A different file under the same name is not that conversion: it is
+    # refused, not searched as the first, whether it is another
+    # directory's file or this one replaced.
+    elsewhere = tmp_path / "elsewhere" / "run_01.raw"
+    elsewhere.parent.mkdir()
+    elsewhere.write_bytes(b"another run")
+    with pytest.raises(WorkflowError, match="a conversion of a different file under that name"):
+        search_acquisition(elsewhere, experiment_dir=experiment, **inputs)
+    raw.write_bytes(b"run_01, acquired again")
+    with pytest.raises(WorkflowError, match="a conversion of a different file under that name"):
+        search_acquisition(raw, experiment_dir=experiment, resume=True, **inputs)
+    assert len(converted) == 2
+
     def no_dlls(*_args, **_kwargs):
         raise ImportError("the Thermo DLLs are not installed; run scripts/install-thermo-dlls.sh")
 
@@ -734,6 +753,28 @@ def test_a_raw_file_is_converted_into_the_experiment_once(tmp_path, jar, inputs,
     other.write_bytes(b"")
     with pytest.raises(WorkflowError, match="cannot read run_09.raw: the Thermo DLLs are not installed"):
         search_acquisition(other, experiment_dir=experiment, **inputs)
+
+
+def test_a_table_whose_columns_differ_between_searches_keeps_them_all(tmp_path: Path) -> None:
+    """Percolator's features differ between the engines, so one table's
+    files can have different columns: each search's come back, as null
+    in the files without them, and a search read alone keeps its own."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from constellation.massspec.manifest import table_partition_dir
+
+    experiment = tmp_path / "experiment"
+    for unit, columns in (("peptide-centric", {"primary": [1.0], "deltaRT": [3.0]}),
+                          ("spectrum-centric", {"primary": [2.0], "xcorr": [0.5]})):  # fmt: skip
+        directory = table_partition_dir(experiment, "percolator_feature", unit, 0)
+        directory.mkdir(parents=True)
+        pq.write_table(pa.table(columns), directory / "part-0.parquet")
+    both = read_experiment_table(experiment, "percolator_feature").sort_by("primary")
+    assert set(both.column_names) == {"primary", "deltaRT", "xcorr", "unit", "acquisition_id"}
+    assert both.column("deltaRT").to_pylist() == [3.0, None] and both.column("xcorr").to_pylist() == [None, 0.5]
+    alone = read_experiment_table(experiment, "percolator_feature", unit="spectrum-centric")
+    assert alone.column("xcorr").to_pylist() == [0.5]
 
 
 def test_a_given_spectra_file_is_linked_in_and_left_alone(tmp_path: Path, jar, inputs) -> None:

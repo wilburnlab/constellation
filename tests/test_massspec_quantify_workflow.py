@@ -253,6 +253,32 @@ def test_what_a_report_cannot_be_made_from_is_refused(tmp_path, jar, inputs) -> 
         report_searches(experiment, fasta=inputs["fasta"], searches=[one.unit, twice.results[0].unit])
 
 
+def test_a_report_is_made_from_the_library_contents_its_searches_used(tmp_path, jar, inputs) -> None:
+    """One library is one file's contents: searches made before and after
+    the file at the library's path changed are two libraries, and a
+    report is refused once the file is no longer the one searched."""
+    experiment = tmp_path / "experiment"
+    a, b = _bundles(tmp_path, "run_a", "run_b")
+    library = inputs["library"]
+    first = search_acquisitions([a], experiment_dir=experiment, **inputs).results[0]
+    library.write_bytes(library.read_bytes() + b", changed")
+    second = search_acquisitions([b], experiment_dir=experiment, **inputs).results[0]
+    with pytest.raises(WorkflowError, match="used 2"):
+        report_searches(experiment, fasta=inputs["fasta"])
+    with pytest.raises(WorkflowError, match="has changed since the searches used it"):
+        report_searches(experiment, fasta=inputs["fasta"], searches=[first.unit])
+    report = report_searches(experiment, fasta=inputs["fasta"], searches=[second.unit])
+    assert report.manifest.inputs["library"]["sha256"] == second.manifest.inputs["library"]["sha256"]
+
+
+def test_a_report_does_not_take_its_files_as_pass_through_flags(tmp_path, jar, inputs) -> None:
+    experiment = tmp_path / "experiment"
+    search_acquisitions(_bundles(tmp_path, "run_a"), experiment_dir=experiment, **inputs)
+    for flag in ("-l", "-f", "-i", "-o", "-a"):
+        with pytest.raises(WorkflowError, match=f"{flag} is not passed through"):
+            report_searches(experiment, fasta=inputs["fasta"], extra={flag: "x"})
+
+
 def test_a_report_refuses_searches_that_disagree_on_a_setting_it_takes(tmp_path, jar, inputs) -> None:
     experiment = tmp_path / "experiment"
     a, b = _bundles(tmp_path, "run_a", "run_b")

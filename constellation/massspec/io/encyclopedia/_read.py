@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 
@@ -22,6 +23,7 @@ from constellation.core.chem.modifications import UNIMOD, ModVocab
 from constellation.massspec.acquisitions import Acquisitions
 from constellation.massspec.io.encyclopedia._project import (
     SCRIBETWO_ENGINE,
+    _acquisitions_for,
     engine_of,
     project_library_file,
 )
@@ -132,13 +134,21 @@ def read_encyclopedia(
     engine = engine_of(metadata)
     vocab = enabled_modifications
     tables: dict[str, pa.Table] = {}
-    if search is not None and engine == SCRIBETWO_ENGINE:
-        reports = scribe2_reports(path)
-        if reports is not None and psms:
+    scribetwo = engine == SCRIBETWO_ENGINE
+    reports = scribe2_reports(path) if scribetwo and (psms or sidecars) else None
+    files = peptide_centric_sidecars(path) if sidecars and not scribetwo else {}
+    # A result with nothing within the FDR threshold has no score rows,
+    # and so no Search from the result library; what the jar scored is
+    # still in the files beside it.
+    files_only = search is None and (reports is not None or bool(files))
+    if files_only:
+        search = Search.empty(_result_acquisitions(metadata, projection, acquisitions))
+    if reports is not None:
+        if psms:
             search = replace(
                 search, psms=read_scribe2_psms(reports, acquisitions=search.acquisitions, vocab=vocab)
             )
-        if reports is not None and sidecars:
+        if sidecars:
             stem = reports.name
             run = _single_run(metadata, search.acquisitions)
             units = (_unit(metadata, "-ptolunits"), _unit(metadata, "-ftolunits"))
@@ -152,8 +162,7 @@ def read_encyclopedia(
                 tables["percolator_feature"] = read_features(
                     features, acquisitions=search.acquisitions, engine=engine, vocab=vocab
                 )
-    elif search is not None and sidecars:
-        files = peptide_centric_sidecars(path)
+    elif files:
         run = _single_run(metadata, search.acquisitions)
         if any(k.startswith("rt_fit:") for k in files):
             tables["rt_alignment"] = read_rt_fits(files, acquisition_id=run, engine=engine, vocab=vocab)
@@ -165,6 +174,10 @@ def read_encyclopedia(
             tables["percolator_feature"] = read_features(
                 files["features"], acquisitions=search.acquisitions, engine=engine, vocab=vocab
             )
+    if files_only and not any(
+        t.num_rows for t in (search.precursor_scores, search.peptide_scores, search.protein_scores, search.psms)
+    ):
+        search = None
     return EncyclopediaReadResult(
         library=projection.library,
         quant=projection.quant,
@@ -172,6 +185,20 @@ def read_encyclopedia(
         caveats=projection.caveats,
         sidecars={k: v for k, v in tables.items() if v.num_rows},
     )
+
+
+def _result_acquisitions(
+    metadata: dict[str, str], projection: Any, bind: Acquisitions | None
+) -> Acquisitions:
+    """The acquisitions of a result that has no score rows: the ones to
+    bind to, else the quantities', else its runs as its metadata names
+    them (``sourcefile``, ``a.raw|b.raw`` for several)."""
+    if bind is not None:
+        return bind
+    if projection.quant is not None:
+        return projection.quant.acquisitions
+    sources = [s for s in str(metadata.get("sourcefile") or "").split("|") if s]
+    return _acquisitions_for(sorted(sources), "encyclopedia.scores", None)[0]
 
 
 def _single_run(metadata: dict[str, str], acquisitions: Acquisitions) -> int | None:

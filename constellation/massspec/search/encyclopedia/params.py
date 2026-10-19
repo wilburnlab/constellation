@@ -80,6 +80,31 @@ PTM_STATES = ("off", "var", "fix")
 #: field -> what to call it in a message).
 SPECTRUM_CENTRIC_SETTINGS = {"ptms": "--ptm", "prediction_cache": "--prediction-cache"}
 
+#: The jar's flags for a search's files, which Constellation sets itself
+#: and records, hashes and keys the search by: never passed through
+#: (flag -> the option that gives it, or ``None``). Passed through, they
+#: would replace the file the manifest and the key describe.
+FILE_FLAGS: dict[str, str | None] = {"-i": "--input", "-l": "--library", "-f": "--fasta", "-o": None}
+
+
+def refuse_file_flags(flags: Mapping[str, object]) -> None:
+    """Raise ``ValueError`` for a pass-through flag that names one of a
+    search's files (:data:`FILE_FLAGS`)."""
+    for flag in flags:
+        if flag not in FILE_FLAGS:
+            continue
+        option = FILE_FLAGS[flag]
+        raise ValueError(
+            f"{flag} is not passed through: "
+            + (
+                f"give the file with {option}, so that the search records, hashes and is "
+                f"keyed by the file it searched"
+                if option
+                else "the jar's outputs belong beside its input, in the search's own "
+                "directory, where the rest of the workflow looks for them"
+            )
+        )
+
 #: The settings a summary leads with, in Constellation's spelling:
 #: ``(label, value flag, unit flag or None)``.
 HEADLINE_SETTINGS: tuple[tuple[str, str, str | None], ...] = (
@@ -221,6 +246,7 @@ class SearchParameters:
                 raise ValueError(
                     f"modification {name} must be one of {', '.join(PTM_STATES)}; got {state!r}"
                 )
+        refuse_file_flags(self.extra)
         if self.ptms and {"-fixed", "-variable"} & set(self.extra):
             raise ValueError(
                 "named modifications (--ptm) and -fixed / -variable do not mix; the jar's "
@@ -330,6 +356,7 @@ def readable_settings(
 __all__ = [
     "CHRONOLOGER_PTMS",
     "EXECUTION_ONLY_FLAGS",
+    "FILE_FLAGS",
     "HEADLINE_SETTINGS",
     "PEPTIDE_CENTRIC",
     "PTM_STATES",
@@ -342,6 +369,7 @@ __all__ = [
     "SearchParameters",
     "Tolerance",
     "readable_settings",
+    "refuse_file_flags",
     "resolve_search_mode",
     "unit_token",
 ]

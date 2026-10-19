@@ -360,3 +360,74 @@ def test_without_its_own_flags_every_peak_is_quantified(tmp_path) -> None:
     con = sqlite3.connect(tmp_path / "ours.elib")
     rows = dict(con.execute("SELECT PeptideSeq, QuantifiedIonsArray IS NOT NULL FROM entries"))
     assert rows == {"PEPTIDEK": 1, "ELVISK": 1}
+
+
+def test_quantified_ions_with_unknown_correlations_come_back_as_nulls(tmp_path) -> None:
+    """``FRAGMENT_QUANT.correlation`` is nullable and the writer leaves a
+    quantity row's correlation array NULL when its ions have none, so
+    the reader has to take a NULL array as nulls, one per ion, beside
+    rows that do have them."""
+    import dataclasses
+
+    from _encyclopedia_fixtures import Entry, build_result_library
+
+    original = build_result_library(
+        tmp_path / "jar.elib",
+        [Entry(modseq="PEPTIDEK", sequence="PEPTIDEK", charge=2, precursor_mz=465.2,
+               mz=[200.1, 300.2], intensity=[5.0, 6.0], total_intensity=150.0,
+               quant_ions=[(200.1, 100.0, 0.9), (300.2, 50.0, 0.8)]),
+         Entry(modseq="ELVISK", sequence="ELVISK", charge=2, precursor_mz=344.7,
+               mz=[250.1], intensity=[3.0], total_intensity=70.0,
+               quant_ions=[(250.1, 70.0, 0.7)])],
+    )  # fmt: skip
+    first = read_encyclopedia(original, sidecars=False)
+    ions = first.quant.fragment_quant
+    peptides, precursors = first.library.peptides, first.library.precursors
+    elvisk = peptides.filter(pa.compute.equal(peptides.column("modified_sequence"), "ELVISK"))
+    elvisk = precursors.filter(pa.compute.equal(precursors.column("peptide_id"), elvisk.column("peptide_id")[0]))
+    unknown = pa.compute.equal(ions.column("precursor_id"), elvisk.column("precursor_id")[0])
+    ions = ions.set_column(
+        ions.schema.get_field_index("correlation"), ions.schema.field("correlation"),
+        pa.compute.if_else(unknown, pa.scalar(None, pa.float64()), ions.column("correlation")),
+    )  # fmt: skip
+    quant = dataclasses.replace(first.quant, fragment_quant=ions)
+    write_encyclopedia(tmp_path / "ours.elib", first.library, quant=quant, search=first.search)
+    again = read_encyclopedia(tmp_path / "ours.elib", sidecars=False).quant.fragment_quant
+    order = [("precursor_id", "ascending"), ("mz", "ascending")]
+    assert again.sort_by(order).equals(ions.sort_by(order))
+    assert again.column("correlation").null_count == 1
+
+
+def test_a_search_with_peptide_scores_only_is_written_per_precursor(tmp_path) -> None:
+    """A ``Search`` with no precursor scores (built by hand, as here, or
+    read from a bundle written before they existed) keeps its peptide
+    scores: each under every precursor of the peptide."""
+    library, quant, search = _toy_library_quant_search()
+    assert search.precursor_scores.num_rows == 0 and search.peptide_scores.num_rows == 2
+    write_encyclopedia(tmp_path / "toy.elib", library, quant=quant, search=search)
+    back = read_encyclopedia(tmp_path / "toy.elib", sidecars=False)
+    assert sorted(back.search.peptide_scores.column("qvalue").to_pylist()) == [0.001, 0.005]
+
+
+def test_a_write_that_fails_leaves_nothing_behind(tmp_path) -> None:
+    """A scored peptide with no precursor cannot be written (the jar's
+    scores are per precursor): refused, and no file is left, nor is an
+    existing one replaced."""
+    import dataclasses
+
+    library, quant, search = _toy_library_quant_search()
+    orphan = library.precursors.column("peptide_id").to_pylist()[0]
+    keep = pa.compute.not_equal(library.precursors.column("peptide_id"), orphan)
+    precursors = library.precursors.filter(keep)
+    fragments = library.fragments.filter(
+        pa.compute.is_in(library.fragments.column("precursor_id"), precursors.column("precursor_id"))
+    )
+    library = dataclasses.replace(library, precursors=precursors, fragments=fragments)
+    out = tmp_path / "toy.elib"
+    with pytest.raises(ValueError, match="no precursor in the library"):
+        write_encyclopedia(out, library, search=search)
+    assert list(tmp_path.iterdir()) == []
+    out.write_bytes(b"what was there")
+    with pytest.raises(ValueError, match="no precursor in the library"):
+        write_encyclopedia(out, library, search=search, overwrite=True)
+    assert out.read_bytes() == b"what was there" and len(list(tmp_path.iterdir())) == 1

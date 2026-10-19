@@ -228,6 +228,31 @@ def _file_name(source: str) -> str:
     return source.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+def _is_conversion_of(bundle: Path, source: Path) -> bool:
+    """Whether ``bundle`` is a finished conversion of the file ``source``
+    (by SHA-256). ``False`` for one to make (no bundle, an unfinished
+    one, or one that recorded no hash); an error for a conversion of a
+    different file, since within an experiment a file name means one run
+    and its conversion is reused by name."""
+    try:
+        manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    recorded = manifest.get("source_sha256")
+    if not recorded:
+        return False
+    current = sha256_file(source)
+    if current != recorded:
+        raise WorkflowError(
+            f"{source.name}: this experiment has a conversion of a different file under that "
+            f"name ({_relative(bundle, bundle.parent.parent)}, from "
+            f"{manifest.get('source_file')}, SHA-256 {recorded[:12]}; this file's is "
+            f"{current[:12]}). A file name means one run in an experiment: give this file "
+            f"another name, or search it into another experiment."
+        )
+    return True
+
+
 def _classify(source: Path, experiment_dir: Path, convert_raw: bool) -> _Source:
     source = Path(source)
     suffix = source.suffix.lower()
@@ -249,8 +274,9 @@ def _classify(source: Path, experiment_dir: Path, convert_raw: bool) -> _Source:
     if suffix == ".raw":
         bundle = experiment_dir / "bundles" / source.stem
         # The converter writes the manifest last, so a bundle without
-        # one is a conversion that did not finish: do it again.
-        if not (bundle / "manifest.json").is_file():
+        # one is a conversion that did not finish: do it again. One with
+        # a manifest is reused only for the file it was converted from.
+        if not _is_conversion_of(bundle, source):
             if not convert_raw:
                 raise WorkflowError(f"{source.name} has not been converted (dry run)")
             from constellation.massspec.readers.thermo import convert
@@ -1566,6 +1592,14 @@ _REPORT_INHERITS = (
     "-localizationModification", "-percolatorThreshold", "-percolatorProteinThreshold",
 )  # fmt: skip
 
+#: A report's flags that Constellation sets and records, never passed
+#: through (flag -> what it is).
+_REPORT_FILE_FLAGS = {
+    "-i": "input directory (the searches, --search)", "-o": "output",
+    "-l": "library (the one the searches used)", "-f": "FASTA (--fasta)",
+    "-a": "alignment (--no-align)",
+}  # fmt: skip
+
 
 @dataclass(frozen=True)
 class ReportResult:
@@ -1620,24 +1654,36 @@ def _choose_searches(
             for unit, record in finished.items()
             if record.search_mode == PEPTIDE_CENTRIC
             and not set(record.acquisition_ids) & merged
-            and (library is None or Path(record.inputs.get("library", {}).get("path", "")) == library)
+            and (library is None or Path(_library_of(record)[0]) == library)
         }
         if not chosen:
             raise WorkflowError(
                 f"{experiment_dir.name} has no finished peptide-centric search of a single "
                 f"acquisition{' against ' + library.name if library else ''} to report on"
             )
-    libraries = {str(r.inputs.get("library", {}).get("path")) for r in chosen.values()}
+    # One library means one file's contents: the same path searched
+    # before and after the file changed is two libraries.
+    libraries = {_library_of(r) for r in chosen.values()}
     if len(libraries) != 1:
         counts = defaultdict(list)
         for unit, record in chosen.items():
-            counts[str(record.inputs.get("library", {}).get("path"))].append(unit)
-        listing = "; ".join(f"{Path(lib).name}: {len(units)} searches" for lib, units in counts.items())
+            counts[_library_of(record)].append(unit)
+        listing = "; ".join(
+            f"{Path(path).name} (SHA-256 {(sha or 'not recorded')[:12]}): {len(units)} searches"
+            for (path, sha), units in sorted(counts.items(), key=lambda kv: (kv[0][0], kv[0][1] or ""))
+        )
         raise WorkflowError(
             f"a report is made from searches against one library, and these used "
             f"{len(libraries)} ({listing}); choose with --library or name the searches"
         )
     return chosen
+
+
+def _library_of(record: SearchManifest) -> tuple[str, str | None]:
+    """The library a search used: its path and the SHA-256 of what was
+    there when it ran."""
+    library = record.inputs.get("library") or {}
+    return str(library.get("path")), library.get("sha256")
 
 
 def report_searches(
@@ -1688,11 +1734,27 @@ def report_searches(
     fasta = Path(fasta).resolve()
     if not fasta.is_file():
         raise WorkflowError(f"--fasta not found: {fasta}")
+    for flag in extra or {}:
+        if flag in _REPORT_FILE_FLAGS:
+            raise WorkflowError(
+                f"{flag} is not passed through: a report's {_REPORT_FILE_FLAGS[flag]} is set by "
+                f"Constellation and recorded in its manifest"
+            )
     library_filter = Path(library).resolve() if library is not None else None
     chosen = _choose_searches(experiment_dir, searches, library_filter)
-    (library_path,) = {Path(r.inputs["library"]["path"]) for r in chosen.values()}
+    ((searched_path, searched_sha),) = {_library_of(r) for r in chosen.values()}
+    library_path = Path(searched_path)
     if not library_path.is_file():
         raise WorkflowError(f"the searched library is no longer at {library_path}")
+    # The report re-reads every run against the library, so it has to be
+    # the file the searches used, not whatever is at that path now.
+    library_record = _file_record(library_path)
+    if library_record["sha256"] != searched_sha:
+        raise WorkflowError(
+            f"{library_path} has changed since the searches used it (SHA-256 now "
+            f"{library_record['sha256'][:12]}, when searched {(searched_sha or 'not recorded')[:12]}); "
+            f"a report re-reads every run against the library the searches used"
+        )
 
     runs: dict[str, str] = {}
     by_acquisition: dict[int, str] = {}
@@ -1789,7 +1851,7 @@ def report_searches(
             acquisition_ids=sorted(acquisition_ids),
             units=sorted(chosen),
             stage_key=key_digest,
-            inputs={"library": _file_record(library_path), "fasta": _file_record(fasta)},
+            inputs={"library": library_record, "fasta": _file_record(fasta)},
             parameters={"align": align, "extra": {k: format_value(v) for k, v in (extra or {}).items()}},
             argv=argv,
             engine_flags={flag: format_value(value) for flag, value in flags.items()},

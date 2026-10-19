@@ -198,3 +198,32 @@ def test_read_encyclopedia_completes_the_scores_from_the_sidecars(tmp_path) -> N
 
     plain = read_encyclopedia(library, annotate_fragments=False, sidecars=False)
     assert plain.sidecars == {} and plain.search.precursor_scores.num_rows == 2  # target + decoy
+
+
+def test_a_result_with_nothing_within_the_threshold_keeps_what_was_scored(tmp_path) -> None:
+    """No identification within the FDR threshold means no score rows in
+    the result library, but Percolator's output beside it still has
+    every precursor scored; without it, there is no Search at all."""
+    library = build_result_library(
+        tmp_path / "run.dia.elib", [], source=RUN,
+        metadata={"sourcefile": RUN, f"{RUN} search type": "EncyclopeDIA"},
+    )  # fmt: skip
+    assert read_encyclopedia(library, annotate_fragments=False).search is None
+    _write(tmp_path / "run.dia.encyclopedia.txt", [
+        SCORES_HEADER, f"{RUN}:700.0:ELVISK+2\t-0.2\t0.4\t0.8\t-.ELVISK.-\tP2", "pi_0=0.5",
+    ])  # fmt: skip
+    _write(tmp_path / "run.dia.encyclopedia.decoy.txt", [
+        SCORES_HEADER, f"{RUN}:650.0:decoyKEDITPEP+2\t-1.0\t0.5\t0.5\t-.KEDITPEP.-\tDECOY_1",
+    ])  # fmt: skip
+    _write(tmp_path / "run.dia.features.txt", [
+        "id\tLabel\tScanNr\tprimary\tsequence\tProteins",
+        f"{RUN}:700.0:ELVISK+2\t1\t20\t0.3\t-.ELVISK.-\tP2",
+    ])  # fmt: skip
+    read = read_encyclopedia(library, annotate_fragments=False)
+    scores = read.search.precursor_scores
+    assert sorted(zip(scores.column("modified_sequence").to_pylist(), scores.column("is_decoy").to_pylist())) == [
+        ("ELVISK", False), ("KEDITPEP", True),
+    ]  # fmt: skip
+    assert read.search.acquisitions.table.column("source_file").to_pylist() == [RUN]
+    assert set(scores.column("acquisition_id").to_pylist()) == {0}
+    assert read.sidecars["percolator_feature"].num_rows == 1

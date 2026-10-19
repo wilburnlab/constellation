@@ -472,6 +472,18 @@ Plan approved by the PI on 2026-10-10. Eight PR-sized phases (P0–P7).
   - **Not carried, because nothing in Constellation holds it:** ion mobility (no data with it
     yet), the jar's protein groups, and the jar's own spelling of modification masses (2e-7 Da
     from UNIMOD's).
+  - **Review (Codex, 2026-10-18), seven defects fixed, each with a test that fails without it:**
+    a `.raw` conversion was reused by file name alone, so another file of the same name was
+    searched as the first (now reused only for the file it was made from, by SHA-256, and another
+    file of that name refused); a report checked the searches' library path, not its contents (now
+    the SHA-256 each search recorded must agree, and match the file there now); `-i` / `-l` / `-f`
+    / `-o` passed through replaced the files the manifest and key describe (now refused, for
+    searches and reports, with `-a` for reports); a quantity row the writer left without
+    correlations could not be read back (a NULL array is now nulls); a `Search` with only
+    peptide-level scores lost them on writing (now written under each precursor of the peptide,
+    and a write that fails leaves no file); a table whose columns differ between searches kept
+    the first file's (now all files' columns); and a result with nothing within the FDR threshold
+    lost what Percolator scored (now read from the files beside it).
 - **Naming (PI, 2026-10-11).** No command or flag is named `dia`: DIA is an acquisition method,
   and `.dia` is one tool's file extension. The P1 commands were first built as
   `massspec dia {export,import,diff}` and renamed to the `massspec encyclopedia …-spectra` group

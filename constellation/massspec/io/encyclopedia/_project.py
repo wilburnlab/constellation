@@ -951,6 +951,25 @@ def _flat(batch: pa.RecordBatch, column: str, wanted: np.ndarray) -> tuple[np.nd
     return flat[keep_values], sizes[wanted]
 
 
+def _flat_beside(
+    batch: pa.RecordBatch, column: str, wanted: np.ndarray, sizes: np.ndarray
+) -> pa.Array:
+    """A list column that holds one value per element of another (whose
+    lengths are ``sizes``), flattened over the rows ``wanted``: a row
+    whose list is null gets nulls (the column is nullable, and
+    Constellation's writer leaves it null when the values are unknown);
+    a list of any other length is an error."""
+    values = batch.column(column).filter(pa.array(wanted))
+    missing = values.is_null().to_numpy(zero_copy_only=False)
+    lengths = pc.list_value_length(values).fill_null(0).to_numpy(zero_copy_only=False)
+    if np.any(~missing & (lengths != sizes)):
+        raise _mirror.MirrorError(f"a quantity row's ion masses and {column} differ in length")
+    out = np.full(int(sizes.sum()), np.nan)
+    present = np.repeat(~missing, sizes)
+    out[present] = values.flatten().to_numpy(zero_copy_only=False).astype(np.float64)
+    return pa.array(out, type=pa.float64(), mask=~present)
+
+
 def _quant_arrays(
     con: Any, row_precursor: np.ndarray, row_acquisition: np.ndarray
 ) -> tuple[pa.Table, pa.Table]:
@@ -975,10 +994,7 @@ def _quant_arrays(
             if not np.array_equal(sizes, intensity_sizes):
                 raise _mirror.MirrorError("a quantity row's ion masses and intensities differ in length")
             if "QuantIonCorrelationArray" in columns:
-                correlation, correlation_sizes = _flat(batch, "QuantIonCorrelationArray", wanted)
-                if not np.array_equal(sizes, correlation_sizes):
-                    raise _mirror.MirrorError("a quantity row's ion masses and correlations differ in length")
-                correlation_array = pa.array(correlation, type=pa.float64())
+                correlation_array = _flat_beside(batch, "QuantIonCorrelationArray", wanted, sizes)
             else:
                 correlation_array = pa.nulls(len(mz), type=pa.float64())
             ions.append(

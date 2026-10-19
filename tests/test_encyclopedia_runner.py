@@ -219,6 +219,13 @@ def test_parameters_refuse_what_cannot_be_meant() -> None:
         Tolerance(0.0)
     with pytest.raises(ValueError, match="set both"):
         SearchParameters(threads=4, extra={"-numberOfThreadsUsed": 8}).flags()
+    # A search's files are given by name and recorded, hashed and keyed:
+    # passed through, they would replace the file the manifest describes.
+    for flag, option in (("-l", "--library"), ("-f", "--fasta"), ("-i", "--input")):
+        with pytest.raises(ValueError, match=f"{flag} is not passed through: give the file with {option}"):
+            SearchParameters(extra={flag: "alternate.dlib"})
+    with pytest.raises(ValueError, match="-o is not passed through: the jar's outputs belong"):
+        SearchParameters(extra={"-o": "elsewhere.elib"})
 
 
 # ── outputs ────────────────────────────────────────────────────────────

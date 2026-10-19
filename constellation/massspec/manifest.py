@@ -81,6 +81,11 @@ def open_table(experiment_dir: Path | str, table: str) -> ds.Dataset:
     acquisitions, with ``unit`` and ``acquisition_id`` columns from the
     partition directories (filter on them to read one search).
 
+    The dataset's schema is every file's columns together: a table whose
+    columns depend on the search (Percolator's features differ between
+    the two engines) would otherwise take the first file's and drop the
+    rest, from every file. A file without a column reads it as null.
+
     Raises ``FileNotFoundError`` when the experiment has no such table.
     """
     import pyarrow as pa
@@ -93,10 +98,14 @@ def open_table(experiment_dir: Path | str, table: str) -> ds.Dataset:
         raise FileNotFoundError(
             f"{experiment_dir} has no table {table!r} (it has: {', '.join(known) or 'none'})"
         )
-    partitioning = ds.partitioning(
-        pa.schema([("unit", pa.string()), ("acquisition_id", pa.int64())]), flavor="hive"
-    )
-    return ds.dataset(directory, partitioning=partitioning)
+    keys = pa.schema([("unit", pa.string()), ("acquisition_id", pa.int64())])
+    partitioning = ds.partitioning(keys, flavor="hive")
+    dataset = ds.dataset(directory, partitioning=partitioning)
+    schemas = [fragment.physical_schema for fragment in dataset.get_fragments()]
+    if all(schema.equals(schemas[0]) for schema in schemas[1:]):
+        return dataset
+    unified = pa.unify_schemas([*schemas, keys], promote_options="permissive")
+    return ds.dataset(directory, partitioning=partitioning, schema=unified)
 
 
 @dataclass(frozen=True)

@@ -57,8 +57,9 @@ ion mobility and the jar's protein groups.
 
 from __future__ import annotations
 
+import os
 import zlib
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -93,30 +94,39 @@ def write_encyclopedia(
     overwrite: bool = False,
 ) -> None:
     """Write a ``Library`` (+ optional ``Quant`` / ``Search``) as a
-    ``.dlib`` / ``.elib`` (module docstring for what goes where)."""
+    ``.dlib`` / ``.elib`` (module docstring for what goes where).
+
+    Written to a temporary file beside ``path`` and moved into place
+    when complete, so a write that fails leaves nothing behind (and an
+    existing file as it was)."""
     p = Path(path)
-    if p.exists():
-        if not overwrite:
-            raise FileExistsError(f"refusing to overwrite existing {p}")
-        p.unlink()
+    if p.exists() and not overwrite:
+        raise FileExistsError(f"refusing to overwrite existing {p}")
 
     upstream = dict(library.metadata_extras.get("x.encyclopedia.metadata", {}))
-    with _sql.open_rw(p) as con:
-        for _name, ddl in LIBRARY_TABLES:
-            con.execute(ddl)
-        names = _Names(library)
-        sources = _sources(quant, search)
-        _write_entries(con, library, names, sources, quant, search, upstream)
-        _write_peptidetoprotein(con, library)
-        _write_metadata(con, upstream)
-        if search is not None:
-            _write_peptidescores(con, names, sources, search, upstream)
-            _write_proteinscores(con, library, sources, search)
-        if quant is not None:
-            _write_peptidequants(con, library, names, sources, quant)
-        for stmt in LIBRARY_INDEXES:
-            con.execute(stmt)
-        con.commit()
+    tmp = p.with_name(f".{p.name}.tmp-{os.getpid()}")
+    tmp.unlink(missing_ok=True)
+    try:
+        with _sql.open_rw(tmp) as con:
+            for _name, ddl in LIBRARY_TABLES:
+                con.execute(ddl)
+            names = _Names(library)
+            sources = _sources(quant, search)
+            _write_entries(con, library, names, sources, quant, search, upstream)
+            _write_peptidetoprotein(con, library)
+            _write_metadata(con, upstream)
+            if search is not None:
+                _write_peptidescores(con, library, names, sources, search, upstream)
+                _write_proteinscores(con, library, sources, search)
+            if quant is not None:
+                _write_peptidequants(con, library, names, sources, quant)
+            for stmt in LIBRARY_INDEXES:
+                con.execute(stmt)
+            con.commit()
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(tmp, p)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -382,16 +392,12 @@ def _threshold(upstream: dict[str, Any]) -> float | None:
 
 
 def _write_peptidescores(
-    con: Any, names: _Names, sources: dict[int, str], search: Search, upstream: dict[str, Any]
-) -> None:
-    scores = search.precursor_scores
+    con: Any, library: Library, names: _Names, sources: dict[int, str], search: Search,
+    upstream: dict[str, Any],
+) -> None:  # fmt: skip
     threshold = _threshold(upstream)
     rows: list[tuple[Any, ...]] = []
-    for proforma, charge, aid, qvalue, pep, decoy in zip(
-        scores.column("modified_sequence").to_pylist(), scores.column("charge").to_pylist(),
-        scores.column("acquisition_id").to_pylist(), scores.column("qvalue").to_pylist(),
-        scores.column("pep").to_pylist(), scores.column("is_decoy").to_pylist(), strict=True,
-    ):  # fmt: skip
+    for proforma, charge, aid, qvalue, pep, decoy in _scored_precursors(library, search):
         if threshold is not None and (qvalue is None or qvalue > threshold):
             continue
         rows.append((
@@ -405,6 +411,49 @@ def _write_peptidescores(
          "PosteriorErrorProbability", "IsDecoy"),
         rows,
     )  # fmt: skip
+
+
+def _scored_precursors(library: Library, search: Search) -> Iterator[tuple[Any, ...]]:
+    """``(modified_sequence, charge, acquisition_id, qvalue, pep,
+    is_decoy)`` per precursor score, from ``precursor_scores``; for a
+    search that has only peptide-level scores (one built by hand, or
+    read from a bundle written before precursor scores existed), each
+    peptide's score under every precursor of it in the library, since
+    the table the jar reads is per precursor."""
+    scores = search.precursor_scores
+    if scores.num_rows:
+        yield from zip(
+            scores.column("modified_sequence").to_pylist(), scores.column("charge").to_pylist(),
+            scores.column("acquisition_id").to_pylist(), scores.column("qvalue").to_pylist(),
+            scores.column("pep").to_pylist(), scores.column("is_decoy").to_pylist(), strict=True,
+        )  # fmt: skip
+        return
+    peptides = search.peptide_scores
+    if not peptides.num_rows:
+        return
+    charges: dict[int, list[int]] = {}
+    for peptide_id, charge in zip(
+        library.precursors.column("peptide_id").to_pylist(),
+        library.precursors.column("charge").to_pylist(), strict=True,
+    ):  # fmt: skip
+        charges.setdefault(peptide_id, []).append(int(charge))
+    modified = dict(
+        zip(library.peptides.column("peptide_id").to_pylist(),
+            library.peptides.column("modified_sequence").to_pylist(), strict=True)
+    )  # fmt: skip
+    without = sorted({p for p in peptides.column("peptide_id").to_pylist() if p not in charges})
+    if without:
+        raise ValueError(
+            f"{len(without)} scored peptide(s) have no precursor in the library (peptide ids "
+            f"{without[:5]}); EncyclopeDIA's scores are per precursor, so their scores could "
+            f"not be written"
+        )
+    for peptide_id, aid, qvalue, pep in zip(
+        peptides.column("peptide_id").to_pylist(), peptides.column("acquisition_id").to_pylist(),
+        peptides.column("qvalue").to_pylist(), peptides.column("pep").to_pylist(), strict=True,
+    ):  # fmt: skip
+        for charge in sorted(charges[peptide_id]):
+            yield modified[peptide_id], charge, aid, qvalue, pep, False
 
 
 def _write_proteinscores(con: Any, library: Library, sources: dict[int, str], search: Search) -> None:
