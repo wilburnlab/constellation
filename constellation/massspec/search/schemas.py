@@ -10,11 +10,15 @@ given acquisition. Constellation models that with two Arrow tables:
     PEPTIDE_SCORE_TABLE   one row per (peptide, acquisition, engine)
     PROTEIN_SCORE_TABLE   one row per (protein, acquisition, engine)
     PSM_TABLE             one row per peptide-spectrum match
+    RT_ALIGNMENT          a search's retention-time alignment, one row
+                          per peptide it was fitted on
+    MASS_CALIBRATION      a search's mass calibration, one row per
+                          identification and MS level
 
 PSM-level scores (one row per spectrum) live in ``PSM_TABLE``. It is
 populated by readers whose source genuinely emits per-spectrum matches —
-MaxQuant ``msms.txt`` (via ``massspec.io.maxquant``) is the first such
-driver. Aggregating-only formats — e.g. the encyclopedia file format,
+MaxQuant ``msms.txt`` (via ``massspec.io.maxquant``) was the first such
+driver; ScribeTwo's reports (``massspec.io.encyclopedia``) the second. Aggregating-only formats — e.g. the encyclopedia file format,
 which records peptide/protein-level scores rather than per-spectrum
 matches — leave ``Search.psms`` empty rather than manufacture PSM rows
 that would invent data.
@@ -61,6 +65,40 @@ PROTEIN_SCORE_TABLE: pa.Schema = pa.schema(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Per-precursor scores
+# ──────────────────────────────────────────────────────────────────────
+
+
+# One row per scored precursor per acquisition, decoys included. This is
+# the level a library search engine actually scores at (EncyclopeDIA's
+# ``peptidescores`` has one row per modified sequence and charge), and
+# the level at which a target/decoy analysis can be redone. The
+# peptide-level table above is a roll-up of it.
+#
+# Self-describing on purpose: ``modified_sequence`` (ProForma 2.0) and
+# ``charge`` say what was scored, so a decoy row, which has no precursor
+# in any library, still means something. ``precursor_id`` is the library
+# precursor where there is one and null otherwise.
+#
+# Primary key: ``(modified_sequence, charge, acquisition_id, engine,
+# is_decoy)``.
+PRECURSOR_SCORE_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("precursor_id", pa.int64(), nullable=True),
+        pa.field("acquisition_id", pa.int64(), nullable=True),
+        pa.field("modified_sequence", pa.string(), nullable=False),
+        pa.field("charge", pa.int32(), nullable=False),
+        pa.field("score", pa.float64(), nullable=True),
+        pa.field("qvalue", pa.float64(), nullable=True),
+        pa.field("pep", pa.float64(), nullable=True),  # posterior error probability
+        pa.field("is_decoy", pa.bool_(), nullable=False),
+        pa.field("engine", pa.string(), nullable=False),
+    ],
+    metadata={b"schema_name": b"PrecursorScoreTable"},
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Per-spectrum matches (PSMs)
 # ──────────────────────────────────────────────────────────────────────
 
@@ -99,6 +137,11 @@ PSM_TABLE: pa.Schema = pa.schema(
         pa.field("modified_sequence", pa.string(), nullable=True),
         # engine-internal peptide index — see NOTE above (NOT a library FK).
         pa.field("peptide_id", pa.int64(), nullable=True),
+        # Content-derived precursor id (``massspec.library.ids``) of
+        # ``modified_sequence`` at ``charge``: the same id the precursor
+        # tables of a content-keyed result use, so PSMs join to them.
+        # Null for decoys and where the reader does not derive it. (v2)
+        pa.field("precursor_id", pa.int64(), nullable=True),
         pa.field("mod_peptide_id", pa.int64(), nullable=True),
         pa.field("evidence_id", pa.int64(), nullable=True),
         # ";"-delimited protein accessions, verbatim from the source.
@@ -121,6 +164,8 @@ PSM_TABLE: pa.Schema = pa.schema(
         pa.field("score", pa.float64(), nullable=True),
         pa.field("delta_score", pa.float64(), nullable=True),
         pa.field("pep", pa.float64(), nullable=True),  # posterior error probability
+        # q-value where the engine reports one for this match (v2).
+        pa.field("qvalue", pa.float64(), nullable=True),
         pa.field("is_decoy", pa.bool_(), nullable=False),
         # derived: any "CON__" accession in ``proteins`` (MaxQuant's
         # contaminant convention; there is no dedicated msms.txt column).
@@ -128,7 +173,66 @@ PSM_TABLE: pa.Schema = pa.schema(
         # engine name: "maxquant", ... (matches PEPTIDE_SCORE_TABLE.engine).
         pa.field("engine", pa.string(), nullable=False),
     ],
-    metadata={b"schema_name": b"PsmTable", b"schema_version": b"1"},
+    metadata={b"schema_name": b"PsmTable", b"schema_version": b"2"},
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# A search's calibration of its library to the acquisition
+# ──────────────────────────────────────────────────────────────────────
+
+
+# How a search mapped its library's retention times onto the
+# acquisition's, from the points it fitted that map on: one row per
+# identified peptide, per pass. Times in seconds. ``fitted_rt`` is where
+# the alignment puts the peptide, ``residual`` = observed - fitted.
+# ``pass`` is the engine's own name for the fit (EncyclopeDIA:
+# ``first`` / ``final``; ScribeTwo: ``prealign`` / ``main``).
+# ``peptide_id`` is content-derived (``massspec.library.ids``), null for
+# decoys; ``charge`` where the engine says it.
+RT_ALIGNMENT: pa.Schema = pa.schema(
+    [
+        pa.field("acquisition_id", pa.int64(), nullable=True),
+        pa.field("engine", pa.string(), nullable=False),
+        pa.field("pass", pa.string(), nullable=False),
+        pa.field("modified_sequence", pa.string(), nullable=False),
+        pa.field("peptide_id", pa.int64(), nullable=True),
+        pa.field("charge", pa.int32(), nullable=True),
+        pa.field("library_rt", pa.float64(), nullable=False),
+        pa.field("observed_rt", pa.float64(), nullable=False),
+        pa.field("fitted_rt", pa.float64(), nullable=False),
+        pa.field("residual", pa.float64(), nullable=False),
+        pa.field("within_95", pa.bool_(), nullable=True),
+        pa.field("is_decoy", pa.bool_(), nullable=True),
+    ],
+    metadata={b"schema_name": b"RtAlignment"},
+)
+
+
+# How a search modelled its mass error along the run: one row per
+# identification and MS level (1: precursor, 2: fragments), per pass.
+# ``mass_error`` is what was measured, ``predicted_mass_error`` the
+# model's value at that retention time (seconds), ``corrected_mass_error``
+# the difference; all three in ``unit`` (``Da`` or ``ppm``). Peptide and
+# charge where the engine says them.
+MASS_CALIBRATION: pa.Schema = pa.schema(
+    [
+        pa.field("acquisition_id", pa.int64(), nullable=True),
+        pa.field("engine", pa.string(), nullable=False),
+        pa.field("pass", pa.string(), nullable=False),
+        pa.field("ms_level", pa.int8(), nullable=False),
+        pa.field("rt", pa.float64(), nullable=False),
+        pa.field("mass_error", pa.float64(), nullable=False),
+        pa.field("predicted_mass_error", pa.float64(), nullable=False),
+        pa.field("corrected_mass_error", pa.float64(), nullable=False),
+        pa.field("unit", pa.string(), nullable=False),
+        pa.field("within_95", pa.bool_(), nullable=True),
+        pa.field("modified_sequence", pa.string(), nullable=True),
+        pa.field("peptide_id", pa.int64(), nullable=True),
+        pa.field("charge", pa.int32(), nullable=True),
+        pa.field("is_decoy", pa.bool_(), nullable=True),
+    ],
+    metadata={b"schema_name": b"MassCalibration"},
 )
 
 
@@ -219,12 +323,18 @@ NOVEL_PEPTIDE_TABLE: pa.Schema = pa.schema(
 register_schema("PeptideScoreTable", PEPTIDE_SCORE_TABLE)
 register_schema("ProteinScoreTable", PROTEIN_SCORE_TABLE)
 register_schema("PsmTable", PSM_TABLE)
+register_schema("PrecursorScoreTable", PRECURSOR_SCORE_TABLE)
 register_schema("NovelPeptideTable", NOVEL_PEPTIDE_TABLE)
+register_schema("RtAlignment", RT_ALIGNMENT)
+register_schema("MassCalibration", MASS_CALIBRATION)
 
 
 __all__ = [
     "NOVEL_PEPTIDE_TABLE",
     "PEPTIDE_SCORE_TABLE",
     "PROTEIN_SCORE_TABLE",
+    "PRECURSOR_SCORE_TABLE",
     "PSM_TABLE",
+    "RT_ALIGNMENT",
+    "MASS_CALIBRATION",
 ]

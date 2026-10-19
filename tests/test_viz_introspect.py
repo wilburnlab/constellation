@@ -244,6 +244,20 @@ def test_arg_hints_apply_globs():
     align = _commands_by_path(schema, ["transcriptome", "align"])
     junc = _arg_by_dest(align, "junc_bed")
     assert junc["glob"] == "*.bed"
+    # An acquisition is a bundle directory or a file, so `massspec search
+    # --input` needs the "either" picker; its dest says nothing about paths.
+    search = _commands_by_path(schema, ["massspec", "search"])
+    acquisition = _arg_by_dest(search, "input")
+    # several acquisitions: a path list, each entry browsable
+    assert (acquisition["type"], acquisition["path_kind"]) == ("multi", "either")
+    assert acquisition["glob"] == "*.raw,*.dia"
+    assert _arg_by_dest(search, "library")["path_kind"] == "file"
+    assert _arg_by_dest(search, "fasta")["path_kind"] == "file"
+    quantify = _commands_by_path(schema, ["massspec", "quantify"])
+    assert _arg_by_dest(quantify, "runs")["path_kind"] == "either"
+    assert _arg_by_dest(quantify, "fractions")["path_kind"] == "either"
+    summarize = _commands_by_path(schema, ["massspec", "summarize"])
+    assert _arg_by_dest(summarize, "experiment_dir")["path_kind"] == "dir"
 
 
 def test_arg_hints_loader_shape():

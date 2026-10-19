@@ -159,3 +159,31 @@ def test_formula_only_mod_rejected():
     )
     with pytest.raises(NotImplementedError, match="[Ff]ormula"):
         format_encyclopedia_modseq(pep)
+
+
+@pytest.mark.parametrize(
+    "proforma",
+    ["PEPTIDEK", "[UNIMOD:1]-MDFQHRPGGK", "AAC[UNIMOD:4]DLVRM[UNIMOD:35]K", "[UNIMOD:28]-QLSALHR",
+     "[UNIMOD:1]-M[UNIMOD:35]K", "PEP[+79.9663]TIDE", "PEPT[Phospho]IDE"],
+)  # fmt: skip
+@pytest.mark.parametrize("terminal_first", [False, True])
+def test_the_writers_fast_path_spells_as_the_parser_does(proforma, terminal_first) -> None:
+    """The writer turns the ProForma the readers emit into EncyclopeDIA's
+    spelling without the full parser (10 ms a string); it must agree with
+    the parser, which still handles everything else."""
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.massspec.io.encyclopedia._modseq import proforma_to_encyclopedia
+
+    form = parse_proforma(proforma)
+    assert proforma_to_encyclopedia(proforma, terminal_first=terminal_first) == (
+        format_encyclopedia_modseq(form, terminal_first=terminal_first),
+        form.sequence,
+    )
+
+
+def test_an_n_terminal_modification_is_written_where_each_table_wants_it() -> None:
+    from constellation.core.sequence.proforma import parse_proforma
+
+    form = parse_proforma("[UNIMOD:1]-MDFQK")
+    assert format_encyclopedia_modseq(form) == "M[+42.0105647]DFQK"  # peptidequants
+    assert format_encyclopedia_modseq(form, terminal_first=True) == "[+42.0105647]MDFQK"  # entries

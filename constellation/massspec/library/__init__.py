@@ -9,6 +9,8 @@ composition layer that unifies all three is intentionally deferred.
     schemas       PROTEIN_TABLE / PEPTIDE_TABLE / PRECURSOR_TABLE /
                   LIBRARY_FRAGMENT_TABLE / PROTEIN_PEPTIDE_EDGE
     library       Library container + assign_ids builder
+    ids           content-derived ids (opt-in): canonical ProForma keys
+                  and ids any producer can recompute, with_content_ids
     io            LibraryReader / LibraryWriter Protocols + registry +
                   native ParquetDirReader/Writer. EncyclopeDIA
                   ``.dlib`` / ``.elib`` adapters live in

@@ -108,6 +108,20 @@ LIBRARY_FRAGMENT_TABLE: pa.Schema = pa.schema(
         # quantisation of large peaks is avoided.
         pa.field("intensity_predicted", pa.float64(), nullable=False),
         pa.field("annotation", pa.string(), nullable=True),
+        # An empirical library's word on each fragment: how well its
+        # chromatogram correlated with the precursor's in the run it was
+        # taken from, and whether the library marks it as one to quantify
+        # with (EncyclopeDIA: ``entries.CorrelationArray`` and
+        # ``QuantifiedIonsArray``, one value per stored peak). Null where
+        # the source says nothing (a predicted library has no
+        # correlations). EncyclopeDIA searches a chromatogram library with
+        # the correlations: written back without them, the lab's library
+        # gave a run 30,682 precursors, 27,035 of them among the 31,895 it
+        # gives as the jar wrote it. The flags changed nothing in that
+        # search, and the jar sets every one in every file it writes
+        # (2026-10-18).
+        pa.field("correlation", pa.float64(), nullable=True),
+        pa.field("quantified", pa.bool_(), nullable=True),
     ],
     metadata={b"schema_name": b"LibraryFragmentTable"},
 )

@@ -198,3 +198,30 @@ def test_user_cache_home_resolves(tmp_path, monkeypatch):
     assert handle.source == "user_cache"
     assert handle.path.name == "tool-6.5.15.jar"
     assert handle.version == "6.5.15"
+
+
+# ── min_version ────────────────────────────────────────────────────────
+
+
+def test_meets_min_version() -> None:
+    """A spec's declared floor is reported, not enforced, by the registry."""
+    from constellation.thirdparty.registry import ToolHandle, meets_min_version
+
+    floored = ToolSpec(name="t", env_var="_T_HOME", min_version="6.9.23")
+    assert meets_min_version(ToolHandle(floored, Path("/x/t-6.9.23.jar"), "env", "6.9.23"))
+    assert meets_min_version(ToolHandle(floored, Path("/x/t-6.10.0.jar"), "env", "6.10.0"))
+    assert not meets_min_version(ToolHandle(floored, Path("/x/t-6.5.15.jar"), "env", "6.5.15"))
+    # Un-probeable version: cannot prove it is too old, so it passes.
+    assert meets_min_version(ToolHandle(floored, Path("/x/t.jar"), "env", None))
+    # No declared floor: everything passes.
+    unfloored = ToolSpec(name="u", env_var="_U_HOME")
+    assert meets_min_version(ToolHandle(unfloored, Path("/x/u"), "path", "0.0.1"))
+
+
+def test_encyclopedia_spec_declares_floor_and_bundled_jre() -> None:
+    from constellation.thirdparty import encyclopedia as adapter
+    from constellation.thirdparty.registry import _REGISTRY
+
+    spec = _REGISTRY["encyclopedia"]
+    assert spec.min_version == adapter.MINIMUM_VERSION == "6.9.23"
+    assert spec.prefer_bundled_jre is True

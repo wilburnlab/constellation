@@ -261,30 +261,26 @@ def _run_jar_for_units(tmp_path: Path, extra: list[str]) -> str:
     Unit parsing precedes file I/O, so reaching "Can't read library file"
     proves every tolerance token was accepted.
     """
-    import subprocess
-
-    from constellation.thirdparty.jvm import _resolve_java
+    from constellation.thirdparty.jvm import _resolve_java, capture_jar
     from constellation.thirdparty.registry import find
 
     handle = find("encyclopedia")
     java_path, _source, _version = _resolve_java(handle)
-    argv = [
-        str(java_path),
-        "-Djava.awt.headless=true",
-        "-jar",
-        str(handle.path),
-        "-i",
-        str(tmp_path / "nope.mzML"),
-        "-l",
-        str(tmp_path / "nope.dlib"),
-        "-f",
-        str(tmp_path / "nope.fasta"),
-        *extra,
-    ]
-    proc = subprocess.run(
-        argv, capture_output=True, text=True, timeout=300, cwd=tmp_path
+    return capture_jar(
+        java_path,
+        handle.path,
+        [
+            "-i",
+            str(tmp_path / "nope.mzML"),
+            "-l",
+            str(tmp_path / "nope.dlib"),
+            "-f",
+            str(tmp_path / "nope.fasta"),
+            *extra,
+        ],
+        timeout=300,
+        cwd=tmp_path,
     )
-    return proc.stdout + proc.stderr
 
 
 @pytest.mark.skipif(
@@ -339,28 +335,16 @@ def test_jar_requires_fasta(tmp_path: Path) -> None:
     If this ever starts failing, the jar has relaxed the requirement and
     ``--fasta`` could go back to being optional.
     """
-    import subprocess
-
-    from constellation.thirdparty.jvm import _resolve_java
+    from constellation.thirdparty.jvm import _resolve_java, capture_jar
     from constellation.thirdparty.registry import find
 
     handle = find("encyclopedia")
     java_path, _source, _version = _resolve_java(handle)
-    proc = subprocess.run(
-        [
-            str(java_path),
-            "-Djava.awt.headless=true",
-            "-jar",
-            str(handle.path),
-            "-i",
-            str(tmp_path / "nope.mzML"),
-            "-l",
-            str(tmp_path / "nope.dlib"),
-        ],
-        capture_output=True,
-        text=True,
+    out = capture_jar(
+        java_path,
+        handle.path,
+        ["-i", str(tmp_path / "nope.mzML"), "-l", str(tmp_path / "nope.dlib")],
         timeout=300,
         cwd=tmp_path,
     )
-    out = proc.stdout + proc.stderr
     assert "required to specify" in out, out

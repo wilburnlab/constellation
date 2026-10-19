@@ -17,7 +17,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from constellation.massspec.acquisitions import ACQUISITION_TABLE, Acquisitions
-from constellation.massspec.search.schemas import PSM_TABLE
+from constellation.massspec.search.schemas import PRECURSOR_SCORE_TABLE, PSM_TABLE
 from constellation.massspec.search.search import Search
 
 
@@ -137,9 +137,11 @@ class ParquetDirWriter:
         # reader tolerates a missing psms.parquet for back-compat with
         # bundles written before the PSM table existed.
         pq.write_table(search.psms, path / "psms.parquet")
+        # Same arrangement for the per-precursor scores.
+        pq.write_table(search.precursor_scores, path / "precursor_scores.parquet")
         manifest = {
             "format": self.format_name,
-            "tables": ["acquisitions", *_PARQUET_TABLES, "psms"],
+            "tables": ["acquisitions", *_PARQUET_TABLES, "psms", "precursor_scores"],
             "metadata": search.metadata_extras,
         }
         (path / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -174,11 +176,18 @@ class ParquetDirReader:
             if psms_path.exists()
             else PSM_TABLE.empty_table()
         )
+        precursor_scores_path = path / "precursor_scores.parquet"
+        precursor_scores = (
+            pq.read_table(precursor_scores_path)
+            if precursor_scores_path.exists()
+            else PRECURSOR_SCORE_TABLE.empty_table()
+        )
         return Search(
             acquisitions=acquisitions,
             peptide_scores=tables["peptide_scores"],
             protein_scores=tables["protein_scores"],
             psms=psms,
+            precursor_scores=precursor_scores,
             metadata_extras=dict(manifest.get("metadata", {})),
         )
 

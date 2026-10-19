@@ -18,7 +18,8 @@ with ``cwd=output_dir`` and locating the produced ``.elib`` after the
 run via the CLI handler in ``massspec.cli``.
 
 Full flag surface lives in
-[docs/plans/encyclopedia-6.5.15-utilities.md]. PR 1 (this commit)
+``constellation/data/encyclopedia_cli.json`` (program ``encyclopedia``; see
+[docs/plans/encyclopedia-6.9.23-survey.md]). PR 1 (this commit)
 wraps the headline params + the common Percolator / tolerance knobs;
 the escape-hatch ``--encyclopedia-arg FLAG=VALUE`` passthrough covers
 everything else without code changes.

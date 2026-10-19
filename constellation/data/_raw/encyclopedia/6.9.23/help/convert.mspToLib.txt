@@ -1,0 +1,6 @@
+Convert Convert SPTXT/MSP to Library
+Required Parameters:
+	-i	input .msp file
+	-f	taxon .FASTA database
+Other Parameters:
+	-o	output .dlib file

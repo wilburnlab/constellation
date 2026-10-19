@@ -5,8 +5,10 @@ Sculptor (CCS/IMS) + Electrician (charge probability) predictors via
 in-process PyTorch — replaces the Prosit/Koina round-trip the lab
 previously used for library generation.
 
-See [docs/plans/encyclopedia-6.5.15-utilities.md] for the full surveyed
-flag table that this wrapper's kwargs mirror 1:1.
+The flag table this wrapper's kwargs mirror 1:1 is the captured help in
+``constellation/data/encyclopedia_cli.json`` (program
+``convert.fastaToJChronologerLibrary``); see
+[docs/plans/encyclopedia-6.9.23-survey.md].
 """
 
 from __future__ import annotations

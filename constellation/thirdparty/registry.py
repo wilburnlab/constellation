@@ -103,6 +103,13 @@ class ToolSpec:
                            error messages — e.g. ``"scripts/install-encyclopedia.sh"``.
     - ``version_probe``  — optional callable that takes the resolved path and returns a
                            version string (``"1.12.34"``) for compatibility checks.
+    - ``min_version``    — optional minimum supported version. The registry still resolves an
+                           older install (so the caller can name it in its own error), but
+                           :func:`meets_min_version` reports it and ``constellation doctor``
+                           shows it as ``too old`` instead of ``ok``.
+    - ``prefer_bundled_jre`` — JVM tools only: use ``<artifact dir>/jre/bin/java`` ahead of a
+                           ``java`` on ``$PATH``. For tools that ship the JRE they were built
+                           against and warn (or misbehave) under a different major version.
     """
 
     name: str
@@ -114,6 +121,8 @@ class ToolSpec:
     path_bin: str | None = None
     install_script: str | None = None
     version_probe: Callable[[Path], str | None] | None = field(default=None, repr=False)
+    min_version: str | None = None
+    prefer_bundled_jre: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,7 +131,7 @@ class ToolHandle:
 
     spec: ToolSpec
     path: Path
-    source: str  # "env", "versioned", or "path"
+    source: str  # "env", "user_cache", "versioned", or "path"
     version: str | None = None
 
     def __str__(self) -> str:  # pragma: no cover - trivial
@@ -276,6 +285,19 @@ def find(name: str) -> ToolHandle:
         else f"\n  set {spec.env_var} to point at an existing install"
     )
     raise ToolNotFoundError(f"third-party tool not found: {spec.name}{hint}")
+
+
+def meets_min_version(handle: ToolHandle) -> bool:
+    """``False`` only when the spec declares a minimum and the install is older.
+
+    An un-probeable version (``None``) passes: the registry cannot prove
+    it is too old, and it is usually a build someone pointed at on
+    purpose.
+    """
+    minimum = handle.spec.min_version
+    if minimum is None or handle.version is None:
+        return True
+    return version_ge(handle.version, minimum)
 
 
 def try_find(name: str) -> ToolHandle | None:

@@ -326,6 +326,8 @@ def _build_scan_meta(
     if capture_trailer_extras:
         trailer_map = [(str(k), str(v)) for k, v in trailer.items() if v is not None]
 
+    scan_window = parsed.get("scan_window")
+
     row: dict[str, Any] = {
         "scan": scan_num,
         "level": ms_level,
@@ -341,6 +343,8 @@ def _build_scan_meta(
         "faims_cv": faims_cv,
         "isolation_lower": iso_lower,
         "isolation_upper": iso_upper,
+        "scan_window_lower": scan_window[0] if scan_window else None,
+        "scan_window_upper": scan_window[1] if scan_window else None,
         "precursor_scan": precursor_scan_f,
         "precursor_mz": precursor_mz,
         "precursor_charge": precursor_charge,

@@ -40,6 +40,89 @@ def _null_log(msg: str) -> None:  # noqa: ARG001
     return None
 
 
+@pytest.fixture(autouse=True)
+def _interpreter_outside_conda(monkeypatch, tmp_path_factory):
+    """The tests below describe "the env" through ``$CONDA_PREFIX``, which
+    is what the code falls back on when the interpreter is not in a conda
+    env. Make it look that way; ``TestEnvPrefix`` covers the rule that
+    the interpreter's own env comes first.
+    """
+    import constellation.cli.__main__ as _main_mod
+
+    bare = tmp_path_factory.mktemp("not-a-conda-env")
+    monkeypatch.setattr(_main_mod, "_interpreter_prefix", lambda: bare)
+
+
+class TestEnvPrefix:
+    """Which env's ``lib`` goes first: the interpreter's, not the activated one's."""
+
+    def _in_env(self, monkeypatch, tmp_path, name="constellation"):
+        import constellation.cli.__main__ as _main_mod
+
+        env = tmp_path / "envs" / name
+        (env / "conda-meta").mkdir(parents=True)
+        (env / "lib").mkdir()
+        (env / "lib" / "libstdc++.so.6").touch()
+        monkeypatch.setattr(_main_mod, "_interpreter_prefix", lambda: env)
+        return env
+
+    def test_interpreter_env_wins_over_activated_env(self, monkeypatch, tmp_path):
+        """``constellation`` called by full path while ``base`` is active."""
+        from constellation.cli.__main__ import _env_prefix
+
+        env = self._in_env(monkeypatch, tmp_path)
+        base = tmp_path / "base"
+        (base / "lib").mkdir(parents=True)
+        (base / "lib" / "libstdc++.so.6").touch()
+        monkeypatch.setenv("CONDA_PREFIX", str(base))
+
+        assert _env_prefix() == env
+        monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+        _ensure_env_lib_on_ld_library_path(_null_log)
+        assert os.environ["LD_LIBRARY_PATH"] == str(env / "lib")
+
+    def test_own_libstdcxx_is_not_skew_when_another_env_is_active(
+        self, monkeypatch, tmp_path
+    ):
+        """The false alarm this rule removes: the interpreter's own
+        libstdc++ is mapped, another env is activated, and nothing is wrong."""
+        env = self._in_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("CONDA_PREFIX", str(tmp_path / "base"))
+        maps = tmp_path / "maps"
+        maps.write_text(
+            f"7f00-7f01 r-xp 00000000 00:00 1 {env}/lib/libstdc++.so.6.0.34\n"
+        )
+        _patch_proc_maps(monkeypatch, maps)
+        monkeypatch.setattr("ctypes.CDLL", lambda name: None)
+
+        assert _libstdcxx_loaded_outside_env(_null_log) is None
+
+    def test_falls_back_to_conda_prefix_outside_a_conda_env(self, monkeypatch, tmp_path):
+        from constellation.cli.__main__ import _env_prefix
+
+        monkeypatch.setenv("CONDA_PREFIX", str(tmp_path))
+        assert _env_prefix() == tmp_path
+        monkeypatch.delenv("CONDA_PREFIX")
+        assert _env_prefix() is None
+
+    def test_env_spelled_through_a_symlink_is_still_inside(self, monkeypatch, tmp_path):
+        """``/proc/self/maps`` shows the resolved path of a linked home."""
+        import constellation.cli.__main__ as _main_mod
+
+        real = self._in_env(monkeypatch, tmp_path / "real")
+        link = tmp_path / "link"
+        link.symlink_to(real, target_is_directory=True)
+        monkeypatch.setattr(_main_mod, "_interpreter_prefix", lambda: link)
+        maps = tmp_path / "maps"
+        maps.write_text(
+            f"7f00-7f01 r-xp 00000000 00:00 1 {real}/lib/libstdc++.so.6.0.34\n"
+        )
+        _patch_proc_maps(monkeypatch, maps)
+        monkeypatch.setattr("ctypes.CDLL", lambda name: None)
+
+        assert _libstdcxx_loaded_outside_env(_null_log) is None
+
+
 # ──────────────────────────────────────────────────────────────────────
 # _libstdcxx_loaded_outside_env
 # ──────────────────────────────────────────────────────────────────────
@@ -448,6 +531,8 @@ def test_smoke_real_host_does_not_crash():
     if result is not None:
         assert result.startswith("/")
         # Confirm it really is outside the env (probe's own postcondition).
-        conda_prefix = os.environ.get("CONDA_PREFIX")
-        if conda_prefix:
-            assert not result.startswith(str(Path(conda_prefix) / "lib"))
+        from constellation.cli.__main__ import _env_prefix
+
+        env_prefix = _env_prefix()
+        if env_prefix is not None:
+            assert not result.startswith(str(env_prefix / "lib"))

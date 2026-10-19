@@ -292,7 +292,9 @@ def filter_elib_by_losers(
 
     Plus ``peptidetoprotein`` keyed on canonical ``PeptideSeq`` —
     derived from the entries table's (PeptideModSeq → PeptideSeq)
-    projection before any deletes.
+    projection before any deletes, and only for sequences no remaining
+    entry still has: another modified form of the same sequence keeps
+    its proteins.
 
     Tables left alone:
 
@@ -367,12 +369,25 @@ def filter_elib_by_losers(
             if not _has_table(con, table):
                 deleted[table] = 0
                 continue
-            if not peptide_seqs:
-                # No entries row backed the loser modseqs — nothing to
-                # drop from the peptide-keyed tables.
+            gone = set(peptide_seqs)
+            if gone and _has_table(con, "entries"):
+                # A sequence another (unmodified, or differently
+                # modified) entry still has keeps its proteins; dropping
+                # them would leave that entry with none.
+                placeholders = ",".join("?" * len(gone))
+                gone -= {
+                    row[0]
+                    for row in con.execute(
+                        f"SELECT DISTINCT PeptideSeq FROM entries WHERE PeptideSeq IN ({placeholders})",
+                        sorted(gone),
+                    )
+                }
+            if not gone:
+                # No sequence left without an entry — nothing to drop
+                # from the peptide-keyed tables.
                 deleted[table] = 0
                 continue
-            seq_list = sorted(peptide_seqs)
+            seq_list = sorted(gone)
             placeholders = ",".join("?" * len(seq_list))
             cur = con.execute(
                 f"DELETE FROM {table} WHERE {column} IN ({placeholders})",

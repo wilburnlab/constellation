@@ -36,15 +36,33 @@ def test_all_four_subcommands_register() -> None:
     assert set(ms_subs.choices) == {
         "convert",
         "search",
+        "summarize",
+        "report",
+        "quantify",
         "predict-library",
-        "process-dia",
         "library-export",
         "classify-novel-peptides",
         "collision-filter",
+        "encyclopedia",
         "chromatogram",
         "counter",
     }
-    # chromatogram + counter are nested groups with their own sub-subcommands.
+    # encyclopedia, chromatogram + counter are nested groups with their own
+    # sub-subcommands. No verb is named for the `.dia` extension: DIA is an
+    # acquisition method, and the file holds DDA runs too.
+    enc_subs = _subparsers_action(ms_subs.choices["encyclopedia"])
+    assert set(enc_subs.choices) == {
+        "export-spectra",
+        "import-spectra",
+        "compare-spectra",
+        "compare-results",
+        "flags",
+        "run",
+    }
+    assert "dia" not in ms_subs.choices
+    # Constellation converts acquisitions itself; the verb that handed
+    # that to the jar (and through it to MSForest) is gone.
+    assert "process-dia" not in ms_subs.choices
     chrom_subs = _subparsers_action(ms_subs.choices["chromatogram"])
     assert set(chrom_subs.choices) == {"build-index", "extract"}
     counter_subs = _subparsers_action(ms_subs.choices["counter"])
@@ -57,13 +75,14 @@ def test_all_four_subcommands_register() -> None:
 @pytest.mark.parametrize(
     "subcommand, required_args",
     [
-        # --fasta IS required for search: 6.5.15's default-mode library
-        # search aborts with "You are required to specify an input file
-        # (-i), a library file (-l), and a fasta file (-f)" even when the
-        # library already carries decoys. Verified against the real jar;
-        # older versions treated -f as optional, which is what this
-        # parser (and its help text) used to claim.
-        ("search", {"--mzml", "--library", "--fasta", "--output-dir"}),
+        # --fasta IS required for search: the jar aborts with "You are
+        # required to specify an input file (-i), a library file (-l),
+        # and a fasta file (-f)" even when the library already carries
+        # decoys. --library is not required by the parser, because the
+        # spectrum-centric engine predicts one from the FASTA without
+        # it; a peptide-centric search without one is refused in the
+        # workflow.
+        ("search", {"--input", "--fasta", "--output-dir"}),
         # --fasta and --output-dlib became conditionally required when the
         # koina backend landed: koina can source precursors from
         # --peptides / --from-library instead of a FASTA, and emits a
@@ -71,7 +90,6 @@ def test_all_four_subcommands_register() -> None:
         # --backend encyclopedia, in-handler — see
         # test_predict_library_encyclopedia_still_requires_fasta_and_dlib.
         ("predict-library", {"--output-dir"}),
-        ("process-dia", {"--inputs", "--output-dia", "--output-dir"}),
         (
             "library-export",
             {"--search-dir", "--library", "--output-elib", "--output-dir"},
@@ -109,7 +127,7 @@ def test_subcommand_required_args(
 
 @pytest.mark.parametrize(
     "subcommand",
-    ["search", "predict-library", "process-dia", "library-export"],
+    ["search", "predict-library", "library-export"],
 )
 def test_subcommand_has_jvm_args(subcommand: str) -> None:
     """Every subcommand surfaces ``--jvm-heap``, ``--jvm-heap-min``,
@@ -220,11 +238,14 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
     assert sub_names == {
         "convert",
         "search",
+        "summarize",
+        "report",
+        "quantify",
         "predict-library",
-        "process-dia",
         "library-export",
         "classify-novel-peptides",
         "collision-filter",
+        "encyclopedia",
         "chromatogram",
         "counter",
     }
@@ -285,12 +306,7 @@ def test_no_stub_handlers_remain() -> None:
         ),
         (
             "search",
-            ["--mzml", "x.mzML", "--library", "x.elib", "--fasta", "x.fa",
-             "--output-dir", "/tmp/x"],
-        ),
-        (
-            "process-dia",
-            ["--inputs", "a.mzML", "--output-dia", "x.dia",
+            ["--input", "x.raw", "--library", "x.elib", "--fasta", "x.fa",
              "--output-dir", "/tmp/x"],
         ),
         (

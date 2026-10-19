@@ -70,6 +70,29 @@ from constellation.core.sequence.proforma import (
 _RE_MOD_BLOCK = re.compile(r"\[([+-]?\d+(?:\.\d+)?)\]")
 
 
+_RE_LEADING_MODS = re.compile(r"^((?:\[[^\]]*\])+)([A-Za-z])")
+
+
+def encyclopedia_residue_form(modseq: str) -> str:
+    """EncyclopeDIA's residue-attached spelling of ``modseq``.
+
+    One result file spells an N-terminal modification two ways (seen in
+    6.9.23): before the first residue in ``entries`` and
+    ``peptidescores`` (``[+42.010565]MDFQ...``), and on the first
+    residue, ahead of that residue's own modification, in
+    ``peptidequants`` (``M[+42.010565]DFQ...``,
+    ``C[+42.010565][+57.0214635]DF...``). This moves leading brackets
+    onto the first residue, so rows of the two kinds of table can be
+    joined as strings.
+
+    It is a join key, not a peptide identity: the residue-attached form
+    cannot say whether ``K[+42.010565]VERPD`` is acetylated on the
+    N-terminus or on the lysine. Identity comes from parsing the
+    ``entries`` spelling, which can.
+    """
+    return _RE_LEADING_MODS.sub(r"\2\1", modseq, count=1)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # UNIMOD lookup cache
 # ──────────────────────────────────────────────────────────────────────
@@ -156,19 +179,22 @@ def parse_encyclopedia_modseq(
         return Peptidoform(sequence="")
 
     n_term_mods: list[TaggedMod] = []
+    leading_deltas: list[float] = []
     i = 0
 
     # ── Leading bracket(s): N-terminal modifications ───────────────────
     # ``[+N.NNN]<residue>...`` — unambiguously N-terminal. Multiple
-    # leading brackets stack (rare but valid per the grammar).
+    # leading brackets stack (rare but valid per the grammar). Which
+    # modification a mass stands for can depend on the first residue
+    # (-17.026549 is pyro-Glu only on Q), so they are resolved below,
+    # once the residues have been read.
     while i < len(modseq) and modseq[i] == "[":
         m = _RE_MOD_BLOCK.match(modseq, i)
         if m is None:
             raise ValueError(
                 f"malformed leading mod block at index {i} in {modseq!r}"
             )
-        delta = float(m.group(1))
-        n_term_mods.append(_resolve_to_tagged_mod(delta, vocab, tolerance_da))
+        leading_deltas.append(float(m.group(1)))
         i = m.end()
 
     # ── Residue-by-residue parse ───────────────────────────────────────
@@ -198,6 +224,12 @@ def parse_encyclopedia_modseq(
                 f"unexpected character {c!r} at index {i} in {modseq!r}; "
                 "EncyclopeDIA modseq must start each residue with an uppercase letter"
             )
+
+    first_residue = tokens[0][0] if tokens else None
+    n_term_mods.extend(
+        _resolve_to_tagged_mod(delta, vocab, tolerance_da, first_residue)
+        for delta in leading_deltas
+    )
 
     if not tokens:
         # Only possible if the input was leading brackets with no residues
@@ -236,7 +268,7 @@ def parse_encyclopedia_modseq(
 
 
 def _resolve_to_tagged_mod(
-    delta: float, vocab: ModVocab, tolerance_da: float
+    delta: float, vocab: ModVocab, tolerance_da: float, first_residue: str | None = None
 ) -> TaggedMod:
     """Resolve a mass delta to a ``TaggedMod`` for a known-terminal slot.
 
@@ -244,11 +276,21 @@ def _resolve_to_tagged_mod(
     the bracket position itself establishes terminal placement. We still
     consult the vocab to convert the mass to a UNIMOD accession when
     unambiguous; unresolved deltas pass through as ProForma mass-deltas.
+
+    "Unambiguous" is judged against the peptide's first residue. A
+    terminal specificity names a site: UNIMOD:28 (pyro-Glu from Q) and
+    UNIMOD:385 (ammonia loss, N-terminal C) share -17.026549 and both
+    are N-terminal, but only one of them can sit on a peptide that
+    starts with Q. Asking merely "has an N-terminal specificity" found
+    two candidates and gave up, which left pyro-Glu as a bare mass.
     """
     matches = _cached_find_by_mass(vocab, delta, tolerance_da)
-    # Prefer matches that have any N-terminal specificity — these are the
-    # chemically plausible interpretations of a leading-bracket mod.
-    n_term_matches = [m for m in matches if m.has_n_term_specificity]
+    if first_residue is None:
+        n_term_matches = [m for m in matches if m.has_n_term_specificity]
+    else:
+        n_term_matches = [
+            m for m in matches if m.has_terminal_specificity_for("N-term", first_residue)
+        ]
     if len(n_term_matches) == 1:
         chosen = n_term_matches[0]
         _, _, accession = chosen.id.partition(":")
@@ -279,7 +321,7 @@ def _choose_modification(matches, residue: str, position: int):
 
     mod = compatible[0]
 
-    if position == 0 and mod.has_n_term_specificity:
+    if position == 0 and mod.has_terminal_specificity_for("N-term", residue):
         # If the residue cannot host the modification on its side chain,
         # terminal placement is the only chemically valid rendering.
         if not mod.has_residue_specificity(residue):
@@ -305,7 +347,11 @@ def _is_compatible(mod, residue: str, position: int) -> bool:
         return False
     if mod.has_residue_specificity(residue):
         return True
-    if position == 0 and mod.has_n_term_specificity:
+    # A terminal specificity names its site, so it is tested against the
+    # residue actually at the terminus (pyro-Glu from Q is N-terminal
+    # *on Q*; without the site, ammonia loss on N-terminal C looked
+    # equally possible on Q and the mass was left unresolved).
+    if position == 0 and mod.has_terminal_specificity_for("N-term", residue):
         return True
     return False
 
@@ -319,13 +365,17 @@ def format_encyclopedia_modseq(
     peptidoform: Peptidoform,
     *,
     vocab: ModVocab = UNIMOD,
+    terminal_first: bool = False,
 ) -> str:
     """Inverse of ``parse_encyclopedia_modseq`` — emit ``X[+N.NNN]`` notation.
 
-    Lossy: terminal mods (``[Mod]-X...``) collapse onto residue 0 as
-    ``X[+mass]...`` because EncyclopeDIA cannot distinguish terminal
-    placement from side-chain placement on the same residue. This is
-    documented on ``EncyclopediaWriter.lossy = True``.
+    An N-terminal modification (``[Mod]-X...``) is written on residue 0,
+    ``X[+mass]...``, the way 6.9.23 writes ``peptidequants``; with
+    ``terminal_first`` it is written before the first residue,
+    ``[+mass]X...``, the way the same jar writes ``entries`` and
+    ``peptidescores`` (measured on its results). Either way the mass is
+    the same, and ``parse_encyclopedia_modseq`` reads both back as the
+    same peptide.
 
     Rejects ProForma features that have no EncyclopeDIA equivalent —
     formula-only mods, glycans, branches, cross-links, multi-chain
@@ -356,21 +406,27 @@ def format_encyclopedia_modseq(
     if not seq:
         return ""
 
-    # Collect deltas per position. N-term mods fold onto residue 0.
+    def bracket(delta: float) -> str:
+        return f"[{'+' if delta >= 0 else '-'}{abs(delta):.7f}]"
+
+    # Collect deltas per position. N-term mods fold onto residue 0
+    # unless they are written ahead of it.
     pos_deltas: dict[int, list[float]] = {}
+    lead = ""
     for tm in peptidoform.n_term_mods:
-        pos_deltas.setdefault(0, []).append(_modref_delta(tm.mod, vocab))
+        if terminal_first:
+            lead += bracket(_modref_delta(tm.mod, vocab))
+        else:
+            pos_deltas.setdefault(0, []).append(_modref_delta(tm.mod, vocab))
     for pos, mods in peptidoform.residue_mods.items():
         for tm in mods:
             pos_deltas.setdefault(pos, []).append(_modref_delta(tm.mod, vocab))
 
-    parts: list[str] = []
+    parts: list[str] = [lead]
     for i, residue in enumerate(seq):
         parts.append(residue)
-        if i in pos_deltas:
-            for delta in pos_deltas[i]:
-                sign = "+" if delta >= 0 else "-"
-                parts.append(f"[{sign}{abs(delta):.7f}]")
+        for delta in pos_deltas.get(i, ()):
+            parts.append(bracket(delta))
     return "".join(parts)
 
 
@@ -422,7 +478,48 @@ def _modref_delta(modref: ModRef | None, vocab: ModVocab) -> float:
     )
 
 
+# The ProForma the readers emit for almost every peptide: uppercase
+# residues, an optional N-terminal accession, at most one accession per
+# residue. The full ProForma parser costs about 10 ms a string, which for a
+# library of 76,000 precursors is most of an hour, so this form is turned
+# into EncyclopeDIA's spelling directly (the same shortcut
+# ``library.ids`` takes for content keys).
+_RE_SIMPLE_PROFORMA = re.compile(r"(?:\[UNIMOD:(\d+)\]-)?((?:[A-Z](?:\[UNIMOD:\d+\])?)+)")
+_RE_RESIDUE = re.compile(r"([A-Z])(?:\[UNIMOD:(\d+)\])?")
+
+
+def proforma_to_encyclopedia(
+    proforma: str, *, terminal_first: bool = False, vocab: ModVocab = UNIMOD
+) -> tuple[str, str]:
+    """``(EncyclopeDIA modseq, plain sequence)`` of a ProForma string, as
+    :func:`format_encyclopedia_modseq` spells it, without the full parser
+    for the simple form the readers emit (anything else is parsed)."""
+    from constellation.core.sequence.proforma import parse_proforma
+
+    match = _RE_SIMPLE_PROFORMA.fullmatch(proforma)
+    if match is None:
+        form = parse_proforma(proforma)
+        return format_encyclopedia_modseq(form, vocab=vocab, terminal_first=terminal_first), form.sequence
+
+    def bracket(accession: str) -> str:
+        delta = vocab.get(f"UNIMOD:{accession}").delta_composition.mass
+        return f"[{'+' if delta >= 0 else '-'}{abs(delta):.7f}]"
+
+    n_term, body = match.group(1), match.group(2)
+    residues = _RE_RESIDUE.findall(body)
+    parts: list[str] = [bracket(n_term) if n_term and terminal_first else ""]
+    for i, (residue, accession) in enumerate(residues):
+        parts.append(residue)
+        if i == 0 and n_term and not terminal_first:
+            parts.append(bracket(n_term))
+        if accession:
+            parts.append(bracket(accession))
+    return "".join(parts), "".join(r for r, _ in residues)
+
+
 __all__ = [
+    "encyclopedia_residue_form",
     "parse_encyclopedia_modseq",
     "format_encyclopedia_modseq",
+    "proforma_to_encyclopedia",
 ]

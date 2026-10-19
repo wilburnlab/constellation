@@ -5,51 +5,39 @@ DLIB and ELIB share one SQLite container schema; the ``Quant`` and
 columns are populated. The reader is one piece of code that returns
 all three projections; ``adapters.py`` slices out whichever one a
 caller asked for via the Library / Quant / Search Reader Protocols.
+
+The work is done in two layers underneath: :mod:`._mirror` turns the
+file's tables into Arrow as they are, and :mod:`._project` says what
+they mean. This module is the stable entry point over them.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
 
 from constellation.core.chem.modifications import UNIMOD, ModVocab
-from constellation.core.sequence.proforma import format_proforma
-from constellation.massspec.acquisitions import (
-    ACQUISITION_TABLE,
-    Acquisitions,
+from constellation.massspec.acquisitions import Acquisitions
+from constellation.massspec.io.encyclopedia._project import (
+    SCRIBETWO_ENGINE,
+    _acquisitions_for,
+    engine_of,
+    project_library_file,
 )
-from constellation.massspec.io.encyclopedia import _sql
-from constellation.massspec.io.encyclopedia._annotate import annotate_peaks
-from constellation.massspec.io.encyclopedia._codec import (
-    decompress_intensity,
-    decompress_mz,
-)
-from constellation.massspec.io.encyclopedia._modseq import (
-    parse_encyclopedia_modseq,
+from constellation.massspec.io.encyclopedia._scribe2 import read_scribe2_psms, scribe2_reports
+from constellation.massspec.io.encyclopedia._sidecar import (
+    peptide_centric_sidecars,
+    read_features,
+    read_mass_fits,
+    read_rt_fits,
+    read_scored_precursors,
+    read_scribe2_fits,
 )
 from constellation.massspec.library.library import Library
-from constellation.massspec.library.schemas import (
-    LIBRARY_FRAGMENT_TABLE,
-    PEPTIDE_TABLE,
-    PRECURSOR_TABLE,
-    PROTEIN_PEPTIDE_EDGE,
-    PROTEIN_TABLE,
-)
 from constellation.massspec.quant.quant import Quant
-from constellation.massspec.quant.schemas import (
-    PEPTIDE_QUANT,
-    PRECURSOR_QUANT,
-    PROTEIN_QUANT,
-    TRANSMISSION_PEPTIDE_PRECURSOR,
-    TRANSMISSION_PROTEIN_PEPTIDE,
-)
-from constellation.massspec.search.schemas import (
-    PEPTIDE_SCORE_TABLE,
-    PROTEIN_SCORE_TABLE,
-)
 from constellation.massspec.search.search import Search
 
 
@@ -62,11 +50,25 @@ class EncyclopediaReadResult:
     ``entries`` rows, populated ``peptidequants`` / ``fragmentquants``
     / ``retentiontimes`` tables). ``search`` is populated when
     ``peptidescores`` or ``proteinscores`` carry any rows.
+
+    ``caveats`` says, in sentences with counts, where the projection is
+    not the whole file: quantity or score rows that could not be tied
+    to one precursor, precursors with no quantity row, or a file that
+    holds no quantities at all. Empty when none applies, which is the
+    normal case. Callers that write the projection to disk should show
+    them and record them.
     """
 
     library: Library
     quant: Quant | None
     search: Search | None
+    caveats: tuple[str, ...] = ()
+    #: Tables from the text files the jar wrote beside the result
+    #: (``_sidecar``): ``rt_alignment`` (RT_ALIGNMENT), ``mass_calibration``
+    #: (MASS_CALIBRATION), ``percolator_feature`` (the engine's features,
+    #: no fixed schema). Only those it found; empty for a file read on
+    #: its own.
+    sidecars: dict[str, pa.Table] = field(default_factory=dict)
 
 
 def read_encyclopedia(
@@ -76,6 +78,9 @@ def read_encyclopedia(
     fragment_tolerance_ppm: float = 20.0,
     enabled_modifications: ModVocab = UNIMOD,
     include_decoys: bool = False,
+    acquisitions: Acquisitions | None = None,
+    psms: bool = True,
+    sidecars: bool = True,
 ) -> EncyclopediaReadResult:
     """Read an EncyclopeDIA ``.dlib`` / ``.elib`` file.
 
@@ -84,445 +89,153 @@ def read_encyclopedia(
     path
         SQLite file on disk.
     annotate_fragments
-        Whether to re-annotate decoded peaks against each peptidoform's
-        theoretical b/y ladder (cheap, recommended). When ``False``,
-        the ``Library.fragments`` table is empty.
+        Whether to build the fragment table: one row per stored peak,
+        annotated as a b/y ion or an intact-precursor ion where it is
+        one. When ``False``, ``Library.fragments`` is empty, and the
+        read is several times faster.
     fragment_tolerance_ppm
-        Tolerance for the fragment annotation. 20 ppm is the default
-        EncyclopeDIA tolerance.
+        Tolerance for that annotation. Stored fragment m/z are library
+        values, so 20 ppm is generous whatever the instrument.
     enabled_modifications
         UNIMOD vocabulary used for parsing ``PeptideModSeq``. Use a
         subset to constrain modification interpretation.
     include_decoys
         When ``False`` (default), rows where ``peptidetoprotein.isDecoy``
         is true are dropped from the protein/peptide tables.
+        ``Search.precursor_scores`` keeps decoy rows either way, flagged.
+    acquisitions
+        An experiment's acquisitions to bind the file's runs to, by
+        source name. Without it the file's own source files are numbered
+        in sorted order.
+    psms
+        For a ScribeTwo result with its reports beside it
+        (``run.dia.dlib`` and ``run.dia.scribe2/``): read every scored
+        peptide-spectrum match into ``Search.psms`` (:mod:`._scribe2`).
+        The result library alone has no scans.
+    sidecars
+        Read the text files the jar wrote beside the result
+        (:mod:`._sidecar`): Percolator's scores make
+        ``Search.precursor_scores`` complete (every precursor scored, not
+        only those within the FDR threshold), and the calibration fits
+        and features land in ``EncyclopediaReadResult.sidecars``.
+
+    What each output column holds, and why, is in :mod:`._project`.
     """
-    p = Path(path)
-    with _sql.open_ro(p) as con:
-        meta = _sql.fetch_metadata(con)
-
-        # ── Phase A: Library ───────────────────────────────────────
-        library, peptide_id_for, precursor_id_for = _build_library(
-            con,
-            annotate_fragments=annotate_fragments,
-            fragment_tolerance_ppm=fragment_tolerance_ppm,
-            vocab=enabled_modifications,
-            include_decoys=include_decoys,
-            metadata_extras={"x.encyclopedia.metadata": meta},
-        )
-
-        # ── Phase B: Quant (conditional) ───────────────────────────
-        quant = _build_quant(con, peptide_id_for, precursor_id_for)
-
-        # ── Phase C: Search (conditional) ──────────────────────────
-        search = _build_search(con, library, peptide_id_for, include_decoys)
-
-    return EncyclopediaReadResult(library=library, quant=quant, search=search)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Library construction
-# ──────────────────────────────────────────────────────────────────────
-
-
-def _build_library(
-    con,
-    *,
-    annotate_fragments: bool,
-    fragment_tolerance_ppm: float,
-    vocab: ModVocab,
-    include_decoys: bool,
-    metadata_extras: dict[str, Any],
-) -> tuple[Library, dict, dict]:
-    """Build the Library + return id-mapping dicts the Quant/Search build need."""
-    # 1. peptidetoprotein → distinct accessions + edges.
-    accession_to_id: dict[str, int] = {}
-    pp_pairs: list[tuple[str, str]] = []  # (accession, peptide_seq)
-    for row in _sql.iter_peptidetoprotein(con):
-        if not include_decoys and row["isDecoy"]:
-            continue
-        acc = row["ProteinAccession"]
-        if acc not in accession_to_id:
-            accession_to_id[acc] = len(accession_to_id)
-        pp_pairs.append((acc, row["PeptideSeq"]))
-
-    proteins_table = pa.Table.from_pylist(
-        [
-            {
-                "protein_id": pid,
-                "accession": acc,
-                "sequence": None,
-                "description": None,
-            }
-            for acc, pid in sorted(accession_to_id.items(), key=lambda kv: kv[1])
-        ],
-        schema=PROTEIN_TABLE,
-    )
-
-    # 2. entries → peptides + precursors + fragments.
-    # Walk entries once, keep parsed Peptidoform objects so the fragment
-    # re-annotation step doesn't have to re-parse.
-    peptide_id_for: dict[tuple[str, str], int] = {}
-    peptidoform_for: dict[int, Any] = {}
-    peptide_rows: list[dict[str, Any]] = []
-    precursor_id_for: dict[tuple[int, int, str], int] = {}  # (peptide_id, charge, source) → precursor_id
-    precursor_rows: list[dict[str, Any]] = []
-    fragment_rows: list[dict[str, Any]] = []
-
-    valid_peptide_seqs = {seq for _acc, seq in pp_pairs}
-
-    for row in _sql.iter_entries(con):
-        seq = row["PeptideSeq"]
-        if not include_decoys and seq not in valid_peptide_seqs:
-            # Entry references a peptide that's only present as a decoy
-            # in peptidetoprotein → skip in lockstep.
-            continue
-        modseq_raw = row["PeptideModSeq"]
-        peptidoform = parse_encyclopedia_modseq(modseq_raw, vocab=vocab)
-        modseq_proforma = format_proforma(peptidoform)
-        key = (seq, modseq_proforma)
-        if key not in peptide_id_for:
-            pid = len(peptide_id_for)
-            peptide_id_for[key] = pid
-            peptidoform_for[pid] = peptidoform
-            peptide_rows.append(
-                {
-                    "peptide_id": pid,
-                    "sequence": seq,
-                    "modified_sequence": modseq_proforma,
-                }
-            )
-        peptide_id = peptide_id_for[key]
-        charge = int(row["PrecursorCharge"])
-        source_file = row["SourceFile"]
-        prec_key = (peptide_id, charge, source_file)
-        if prec_key not in precursor_id_for:
-            cid = len(precursor_id_for)
-            precursor_id_for[prec_key] = cid
-            precursor_rows.append(
-                {
-                    "precursor_id": cid,
-                    "peptide_id": peptide_id,
-                    "charge": charge,
-                    "precursor_mz": float(row["PrecursorMz"]),
-                    "rt_predicted": float(row["RTInSeconds"]),
-                    "ccs_predicted": -1.0,
-                }
-            )
-        else:
-            cid = precursor_id_for[prec_key]
-
-        if annotate_fragments:
-            mz_t = decompress_mz(row["MassArray"], int(row["MassEncodedLength"]))
-            int_t = decompress_intensity(
-                row["IntensityArray"], int(row["IntensityEncodedLength"])
-            )
-            for frag in annotate_peaks(
-                peptidoform,
-                precursor_charge=charge,
-                obs_mz=mz_t,
-                obs_intensity=int_t,
-                tolerance_ppm=fragment_tolerance_ppm,
-            ):
-                frag["precursor_id"] = cid
-                fragment_rows.append(frag)
-
-    peptides_table = pa.Table.from_pylist(peptide_rows, schema=PEPTIDE_TABLE) if peptide_rows else PEPTIDE_TABLE.empty_table()
-    precursors_table = pa.Table.from_pylist(precursor_rows, schema=PRECURSOR_TABLE) if precursor_rows else PRECURSOR_TABLE.empty_table()
-    fragments_table = pa.Table.from_pylist(fragment_rows, schema=LIBRARY_FRAGMENT_TABLE) if fragment_rows else LIBRARY_FRAGMENT_TABLE.empty_table()
-
-    # 3. Build PROTEIN_PEPTIDE_EDGE; deduplicate (acc, peptide_seq) pairs
-    # since a peptide can appear in peptidetoprotein with both decoy and
-    # target rows for the same accession.
-    edges: set[tuple[int, int]] = set()
-    for acc, seq in pp_pairs:
-        # A peptide may appear under multiple charge / modified states;
-        # protein↔peptide adjacency is at the canonical-sequence level.
-        for (pseq, _modseq), pid in peptide_id_for.items():
-            if pseq == seq:
-                edges.add((accession_to_id[acc], pid))
-    pp_table = pa.Table.from_pylist(
-        [{"protein_id": p, "peptide_id": k} for p, k in sorted(edges)],
-        schema=PROTEIN_PEPTIDE_EDGE,
-    ) if edges else PROTEIN_PEPTIDE_EDGE.empty_table()
-
-    library = Library(
-        proteins=proteins_table,
-        peptides=peptides_table,
-        precursors=precursors_table,
-        fragments=fragments_table,
-        protein_peptide=pp_table,
-        metadata_extras=metadata_extras,
-    )
-    return library, peptide_id_for, precursor_id_for
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Quant construction
-# ──────────────────────────────────────────────────────────────────────
-
-
-def _build_quant(
-    con,
-    peptide_id_for: dict[tuple[str, str], int],
-    precursor_id_for: dict[tuple[int, int, str], int],
-) -> Quant | None:
-    """Build a Quant if any sample-specific data is present, else None."""
-    has_chrom = _entries_have_chromatograms(con)
-    has_pq = _sql.has_rows(con, "peptidequants")
-    has_fq = _sql.has_rows(con, "fragmentquants")
-    has_rt = _sql.has_rows(con, "retentiontimes")
-    if not (has_chrom or has_pq or has_fq or has_rt):
-        return None
-
-    # Acquisitions: distinct entries.SourceFile values.
-    source_files = sorted(
-        {src for (_pid, _ch, src) in precursor_id_for.keys() if src}
-    )
-    if not source_files:
-        return None
-    acq_rows = [
-        {
-            "acquisition_id": i,
-            "source_file": sf,
-            "source_kind": "encyclopedia.entries",
-            "acquisition_datetime": None,
-        }
-        for i, sf in enumerate(source_files)
-    ]
-    source_to_acq: dict[str, int] = {sf: i for i, sf in enumerate(source_files)}
-    acq_table = pa.Table.from_pylist(acq_rows, schema=ACQUISITION_TABLE)
-    acquisitions = Acquisitions(acq_table)
-
-    # PRECURSOR_QUANT: one row per (precursor_id, acquisition_id),
-    # intensity = sum of decoded IntensityArray, rt_observed = RTInSeconds.
-    pq_rows: list[dict[str, Any]] = []
-    seen_pq: set[tuple[int, int]] = set()  # (precursor_id, acquisition_id)
-    for row in _sql.iter_entries(con):
-        seq = row["PeptideSeq"]
-        # Reconstruct the same peptide_id mapping: we need modseq_proforma.
-        # Re-parse here is fine — encyclopedia files are small enough that
-        # the cost is dominated by blob decompression, not modseq parsing.
-        modseq_proforma = format_proforma(parse_encyclopedia_modseq(row["PeptideModSeq"]))
-        key = (seq, modseq_proforma)
-        if key not in peptide_id_for:
-            # Decoy that we filtered out in the library build.
-            continue
-        peptide_id = peptide_id_for[key]
-        charge = int(row["PrecursorCharge"])
-        source_file = row["SourceFile"]
-        prec_key = (peptide_id, charge, source_file)
-        if prec_key not in precursor_id_for:
-            continue
-        precursor_id = precursor_id_for[prec_key]
-        acq_id = source_to_acq[source_file]
-        if (precursor_id, acq_id) in seen_pq:
-            continue
-        seen_pq.add((precursor_id, acq_id))
-        # Intensity = sum of the decoded IntensityArray (peak-list TIC).
-        int_t = decompress_intensity(
-            row["IntensityArray"], int(row["IntensityEncodedLength"])
-        )
-        pq_rows.append(
-            {
-                "precursor_id": precursor_id,
-                "acquisition_id": acq_id,
-                "intensity": float(int_t.sum().item()),
-                "rt_observed": float(row["RTInSeconds"]),
-                "ccs_observed": -1.0,
-                "score": None,
-            }
-        )
-
-    pq_table = pa.Table.from_pylist(pq_rows, schema=PRECURSOR_QUANT) if pq_rows else PRECURSOR_QUANT.empty_table()
-
-    # PEPTIDE_QUANT: from peptidequants table when populated, else
-    # rolled up from PRECURSOR_QUANT.
-    if has_pq:
-        peptide_quant_rows = []
-        seen_pkq: set[tuple[int, int]] = set()
-        for row in _sql.iter_peptidequants(con):
-            modseq_proforma = format_proforma(
-                parse_encyclopedia_modseq(row["PeptideModSeq"])
-            )
-            key = (row["PeptideSeq"], modseq_proforma)
-            if key not in peptide_id_for:
-                continue
-            peptide_id = peptide_id_for[key]
-            source_file = row["SourceFile"]
-            if source_file not in source_to_acq:
-                continue
-            acq_id = source_to_acq[source_file]
-            if (peptide_id, acq_id) in seen_pkq:
-                # peptidequants can have multiple rows per (peptide,
-                # source) when the peptide appears at multiple charge
-                # states. Sum intensities across charges.
-                # Find the existing row and accumulate.
-                for r in peptide_quant_rows:
-                    if r["peptide_id"] == peptide_id and r["acquisition_id"] == acq_id:
-                        r["abundance"] += float(row["TotalIntensity"])
-                        break
-                continue
-            seen_pkq.add((peptide_id, acq_id))
-            peptide_quant_rows.append(
-                {
-                    "peptide_id": peptide_id,
-                    "acquisition_id": acq_id,
-                    "abundance": float(row["TotalIntensity"]),
-                    "score": None,
-                }
-            )
-        peptide_quant_table = pa.Table.from_pylist(peptide_quant_rows, schema=PEPTIDE_QUANT) if peptide_quant_rows else PEPTIDE_QUANT.empty_table()
-    else:
-        peptide_quant_table = PEPTIDE_QUANT.empty_table()
-
-    return Quant(
+    projection = project_library_file(
+        path,
+        annotate_fragments=annotate_fragments,
+        fragment_tolerance_ppm=fragment_tolerance_ppm,
+        vocab=enabled_modifications,
+        include_decoys=include_decoys,
         acquisitions=acquisitions,
-        protein_quant=PROTEIN_QUANT.empty_table(),
-        peptide_quant=peptide_quant_table,
-        precursor_quant=pq_table,
-        transmission_protein_peptide=TRANSMISSION_PROTEIN_PEPTIDE.empty_table(),
-        transmission_peptide_precursor=TRANSMISSION_PEPTIDE_PRECURSOR.empty_table(),
+    )
+    search = projection.search
+    metadata = projection.library.metadata_extras.get("x.encyclopedia.metadata", {})
+    engine = engine_of(metadata)
+    vocab = enabled_modifications
+    tables: dict[str, pa.Table] = {}
+    scribetwo = engine == SCRIBETWO_ENGINE
+    reports = scribe2_reports(path) if scribetwo and (psms or sidecars) else None
+    files = peptide_centric_sidecars(path) if sidecars and not scribetwo else {}
+    # A result with nothing within the FDR threshold has no score rows,
+    # and so no Search from the result library; what the jar scored is
+    # still in the files beside it.
+    files_only = search is None and (reports is not None or bool(files))
+    if files_only:
+        search = Search.empty(_result_acquisitions(metadata, projection, acquisitions))
+    if reports is not None:
+        if psms:
+            search = replace(
+                search, psms=read_scribe2_psms(reports, acquisitions=search.acquisitions, vocab=vocab)
+            )
+        if sidecars:
+            stem = reports.name
+            run = _single_run(metadata, search.acquisitions)
+            units = (_unit(metadata, "-ptolunits"), _unit(metadata, "-ftolunits"))
+            tables["rt_alignment"], tables["mass_calibration"] = read_scribe2_fits(
+                reports, acquisition_id=run, units=units, vocab=vocab
+            )
+            scores = [reports / f"{stem}.txt", reports / f"{stem}.decoy.txt"]
+            features = reports / f"{stem}.features.txt"
+            search = _with_scores(search, [p for p in scores if p.is_file()], engine, vocab)
+            if features.is_file():
+                tables["percolator_feature"] = read_features(
+                    features, acquisitions=search.acquisitions, engine=engine, vocab=vocab
+                )
+    elif files:
+        run = _single_run(metadata, search.acquisitions)
+        if any(k.startswith("rt_fit:") for k in files):
+            tables["rt_alignment"] = read_rt_fits(files, acquisition_id=run, engine=engine, vocab=vocab)
+        if any(k.startswith("ms") for k in files):
+            tables["mass_calibration"] = read_mass_fits(files, acquisition_id=run, engine=engine)
+        scores = [files[k] for k in ("scores", "decoy_scores") if k in files]
+        search = _with_scores(search, scores, engine, vocab)
+        if "features" in files:
+            tables["percolator_feature"] = read_features(
+                files["features"], acquisitions=search.acquisitions, engine=engine, vocab=vocab
+            )
+    if files_only and not any(
+        t.num_rows for t in (search.precursor_scores, search.peptide_scores, search.protein_scores, search.psms)
+    ):
+        search = None
+    return EncyclopediaReadResult(
+        library=projection.library,
+        quant=projection.quant,
+        search=search,
+        caveats=projection.caveats,
+        sidecars={k: v for k, v in tables.items() if v.num_rows},
     )
 
 
-def _entries_have_chromatograms(con) -> bool:
-    """Cheap probe: any entries.MedianChromatogramArray non-NULL?"""
-    cur = con.execute(
-        "SELECT 1 FROM entries WHERE MedianChromatogramArray IS NOT NULL LIMIT 1"
-    )
-    return cur.fetchone() is not None
+def _result_acquisitions(
+    metadata: dict[str, str], projection: Any, bind: Acquisitions | None
+) -> Acquisitions:
+    """The acquisitions of a result that has no score rows: the ones to
+    bind to, else the quantities', else its runs as its metadata names
+    them (``sourcefile``, ``a.raw|b.raw`` for several)."""
+    if bind is not None:
+        return bind
+    if projection.quant is not None:
+        return projection.quant.acquisitions
+    sources = [s for s in str(metadata.get("sourcefile") or "").split("|") if s]
+    return _acquisitions_for(sorted(sources), "encyclopedia.scores", None)[0]
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Search construction
-# ──────────────────────────────────────────────────────────────────────
-
-
-def _build_search(
-    con,
-    library: Library,
-    peptide_id_for: dict[tuple[str, str], int],
-    include_decoys: bool,
-) -> Search | None:
-    has_pep_scores = _sql.has_rows(con, "peptidescores")
-    has_prot_scores = _sql.has_rows(con, "proteinscores")
-    if not (has_pep_scores or has_prot_scores):
+def _single_run(metadata: dict[str, str], acquisitions: Acquisitions) -> int | None:
+    """The acquisition of a single-run result (its ``sourcefile``), or
+    ``None`` for a result across runs (``a.raw|b.raw``)."""
+    source = str(metadata.get("sourcefile") or "")
+    if not source or "|" in source:
+        return None
+    try:
+        return acquisitions.id_for_source(source)
+    except KeyError:
         return None
 
-    # Gather distinct source files for Acquisitions.
-    source_files: set[str] = set()
-    pep_score_rows: list[dict[str, Any]] = []
-    prot_score_rows: list[dict[str, Any]] = []
 
-    if has_pep_scores:
-        for row in _sql.iter_peptidescores(con):
-            if not include_decoys and row["IsDecoy"]:
-                continue
-            source_files.add(row["SourceFile"])
-        # Need acquisitions before we can FK; build it after gathering.
+def _unit(metadata: dict[str, str], flag: str) -> str:
+    return "ppm" if str(metadata.get(flag, "PPM")).strip().upper() == "PPM" else "Da"
 
-    if has_prot_scores:
-        for row in _sql.iter_proteinscores(con):
-            if not include_decoys and row["IsDecoy"]:
-                continue
-            source_files.add(row["SourceFile"])
 
-    sf_list = sorted(source_files)
-    source_to_acq = {sf: i for i, sf in enumerate(sf_list)}
-    acq_table = pa.Table.from_pylist(
-        [
-            {
-                "acquisition_id": i,
-                "source_file": sf,
-                "source_kind": "encyclopedia.scores",
-                "acquisition_datetime": None,
-            }
-            for i, sf in enumerate(sf_list)
-        ],
-        schema=ACQUISITION_TABLE,
-    )
-    acquisitions = Acquisitions(acq_table)
-
-    # peptide_scores: one row per (peptide_id, acquisition_id, engine).
-    # peptidescores has one row per (peptide, charge, source) — collapse
-    # across charges by keeping the best (lowest q-value) score.
-    if has_pep_scores:
-        best: dict[tuple[int, int], dict[str, Any]] = {}
-        for row in _sql.iter_peptidescores(con):
-            if not include_decoys and row["IsDecoy"]:
-                continue
-            modseq_proforma = format_proforma(
-                parse_encyclopedia_modseq(row["PeptideModSeq"])
-            )
-            key = (row["PeptideSeq"], modseq_proforma)
-            if key not in peptide_id_for:
-                continue
-            peptide_id = peptide_id_for[key]
-            acq_id = source_to_acq[row["SourceFile"]]
-            qvalue = float(row["QValue"])
-            pep = float(row["PosteriorErrorProbability"])
-            existing = best.get((peptide_id, acq_id))
-            if existing is None or qvalue < existing["qvalue"]:
-                best[(peptide_id, acq_id)] = {
-                    "peptide_id": peptide_id,
-                    "acquisition_id": acq_id,
-                    "score": None,
-                    "qvalue": qvalue,
-                    "pep": pep,
-                    "engine": "encyclopedia",
-                }
-        pep_score_rows = list(best.values())
-
-    pep_score_table = (
-        pa.Table.from_pylist(pep_score_rows, schema=PEPTIDE_SCORE_TABLE)
-        if pep_score_rows
-        else PEPTIDE_SCORE_TABLE.empty_table()
-    )
-
-    # protein_scores: collapse across protein groups by accession; keep
-    # best q-value.
-    if has_prot_scores:
-        accession_to_id = {
-            acc: pid
-            for acc, pid in zip(
-                library.proteins.column("accession").to_pylist(),
-                library.proteins.column("protein_id").to_pylist(),
-                strict=True,
-            )
-        }
-        best_prot: dict[tuple[int, int], dict[str, Any]] = {}
-        for row in _sql.iter_proteinscores(con):
-            if not include_decoys and row["IsDecoy"]:
-                continue
-            acc = row["ProteinAccession"]
-            if acc not in accession_to_id:
-                continue
-            protein_id = accession_to_id[acc]
-            acq_id = source_to_acq[row["SourceFile"]]
-            qvalue = float(row["QValue"])
-            existing = best_prot.get((protein_id, acq_id))
-            if existing is None or qvalue < existing["qvalue"]:
-                best_prot[(protein_id, acq_id)] = {
-                    "protein_id": protein_id,
-                    "acquisition_id": acq_id,
-                    "score": None,
-                    "qvalue": qvalue,
-                    "engine": "encyclopedia",
-                }
-        prot_score_rows = list(best_prot.values())
-
-    prot_score_table = (
-        pa.Table.from_pylist(prot_score_rows, schema=PROTEIN_SCORE_TABLE)
-        if prot_score_rows
-        else PROTEIN_SCORE_TABLE.empty_table()
-    )
-
-    return Search(
-        acquisitions=acquisitions,
-        peptide_scores=pep_score_table,
-        protein_scores=prot_score_table,
-    )
+def _with_scores(search: Search, paths: list[Path], engine: str, vocab: ModVocab) -> Search:
+    """``search`` with its precursor scores made complete from the
+    Percolator-layout scores in ``paths``: every precursor scored, the
+    result library's own rows keeping their precursor ids (they agree on
+    the values: the scores, q-values and PEPs of the precursors within
+    the threshold are the same in both)."""
+    if not paths:
+        return search
+    complete = read_scored_precursors(paths, acquisitions=search.acquisitions, engine=engine, vocab=vocab)
+    keys = ["modified_sequence", "charge", "acquisition_id", "is_decoy"]
+    known = search.precursor_scores.select([*keys, "precursor_id"]).rename_columns([*keys, "_known"])
+    joined = complete.join(known, keys=keys, join_type="left outer")
+    joined = joined.set_column(
+        joined.schema.get_field_index("precursor_id"), "precursor_id", joined.column("_known")
+    ).drop_columns(["_known"])
+    # Rows of the result library the sidecar does not have (none, in the
+    # files measured) are kept as they are.
+    rest = search.precursor_scores.join(complete.select(keys), keys=keys, join_type="left anti")
+    return replace(search, precursor_scores=pa.concat_tables([joined.select(rest.column_names), rest]))
 
 
 __all__ = ["EncyclopediaReadResult", "read_encyclopedia"]

@@ -1,0 +1,5 @@
+Convert Library to BLIB
+Required Parameters:
+	-i	input library file
+Other Parameters:
+	-o	output .blib file

@@ -27,6 +27,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.compute  # noqa: F401  (pa.compute, used in validation)
 
 from constellation.core.io.schemas import cast_to_schema
 from constellation.massspec.acquisitions import (
@@ -37,6 +38,7 @@ from constellation.massspec.library.library import Library
 from constellation.massspec.search.schemas import (
     PEPTIDE_SCORE_TABLE,
     PROTEIN_SCORE_TABLE,
+    PRECURSOR_SCORE_TABLE,
     PSM_TABLE,
 )
 
@@ -51,6 +53,9 @@ class Search:
     # ``Search(acquisitions, peptide_scores, protein_scores, metadata_extras)``
     # is unchanged. Default empty: aggregating-only readers leave it be.
     psms: pa.Table = field(default_factory=PSM_TABLE.empty_table)
+    # Per-precursor scores, decoys included (PRECURSOR_SCORE_TABLE). Also
+    # appended last and default empty, for the same reason.
+    precursor_scores: pa.Table = field(default_factory=PRECURSOR_SCORE_TABLE.empty_table)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -64,6 +69,11 @@ class Search:
             cast_to_schema(self.protein_scores, PROTEIN_SCORE_TABLE),
         )
         object.__setattr__(self, "psms", cast_to_schema(self.psms, PSM_TABLE))
+        object.__setattr__(
+            self,
+            "precursor_scores",
+            cast_to_schema(self.precursor_scores, PRECURSOR_SCORE_TABLE),
+        )
         self.validate()
 
     @classmethod
@@ -81,12 +91,14 @@ class Search:
             (self.peptide_scores, "peptide_scores"),
             (self.protein_scores, "protein_scores"),
             (self.psms, "psms"),
+            (self.precursor_scores, "precursor_scores"),
         ):
             # acquisition_id is nullable for run-agnostic / pre-link rows.
             validate_acquisitions(table, self.acquisitions, nullable=True)
         _check_no_duplicates(self.peptide_scores, "peptide_scores", "peptide_id")
         _check_no_duplicates(self.protein_scores, "protein_scores", "protein_id")
         _check_no_psm_duplicates(self.psms)
+        _check_no_precursor_score_duplicates(self.precursor_scores)
 
     # ── cross-validation against a Library ──────────────────────────
     def validate_against(self, library: Library) -> None:
@@ -116,6 +128,24 @@ class Search:
 # ──────────────────────────────────────────────────────────────────────
 # Validation helpers
 # ──────────────────────────────────────────────────────────────────────
+
+
+def _check_no_precursor_score_duplicates(table: pa.Table) -> None:
+    """PK uniqueness on ``(modified_sequence, charge, acquisition_id,
+    engine, is_decoy)`` for ``precursor_scores``."""
+    if table.num_rows == 0:
+        return
+    keys = table.select(
+        ["modified_sequence", "charge", "acquisition_id", "engine", "is_decoy"]
+    )
+    counts = keys.group_by(keys.column_names, use_threads=False).aggregate([([], "count_all")])
+    repeated = counts.filter(pa.compute.greater(counts.column("count_all"), 1))
+    if repeated.num_rows:
+        sample = repeated.slice(0, 3).to_pylist()
+        raise ValueError(
+            f"precursor_scores has {repeated.num_rows} repeated "
+            f"(modified_sequence, charge, acquisition_id, engine, is_decoy) keys, e.g. {sample}"
+        )
 
 
 def _check_no_duplicates(table: pa.Table, name: str, entity_col: str) -> None:

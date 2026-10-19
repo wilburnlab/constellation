@@ -1,0 +1,44 @@
+CLI for Convert -> Create JChronologer Library From FASTA
+Required Parameters:
+	-i	input .FASTA file
+
+Other Parameters:
+	-o	output .dlib file
+	-addDecoys                   (default: true)
+	-adjustNCEForDIA             (default: true)
+	-defaultCharge               (default: 3)
+	-defaultNCE                  (default: 33)
+	-entrapmentSeed              (default: 1)
+	-enzyme                      (default: Trypsin)
+	-generateProteinEntrapments  (default: false)
+	-maxCharge                   (default: 6)
+	-maxMissedCleavage           (default: 1)
+	-maxMz                       (default: 1002.7)
+	-minCharge                   (default: 1)
+	-minMz                       (default: 396.4)
+	-predictionCache             (default: OS-specific user data directory)
+	-raggedNTerm                 (default: false)
+	-maxVariableMods             (default: 1)
+	-maxVariableForms            (default: 1000)
+	-ptmAcetyl                   (default: off, values: off|var|fix)
+	-ptmProteinNTermAcetyl       (default: var, values: off|var|fix)
+	-ptmCarbamidomethyl          (default: fix, values: off|var|fix)
+	-ptmDeamidation              (default: off, values: off|var|fix)
+	-ptmDimethyl                 (default: off, values: off|var|fix)
+	-ptmGlyGly                   (default: off, values: off|var|fix)
+	-ptmHexNAc                   (default: off, values: off|var|fix)
+	-ptmMethyl                   (default: off, values: off|var|fix)
+	-ptmOxidation                (default: off, values: off|var|fix)
+	-ptmPhospho                  (default: off, values: off|var|fix)
+	-ptmPyroGluQ                 (default: var, values: off|var|fix)
+	-ptmSuccinyl                 (default: off, values: off|var|fix)
+	-ptmTrimethyl                (default: off, values: off|var|fix)
+	-ptmTMT                      (default: off, values: off|var|fix)
+
+Notes:
+	Fixed TMT requires -ptmProteinNTermAcetyl off -ptmPyroGluQ off to avoid terminal-site conflicts.
+	Peptide length is fixed at 7-31 residues for JChronologer library prediction.
+	Charge states are selected from Electrician probabilities (>1%), then filtered by charge range and m/z range.
+	JChronologer always runs Sculptor CCS/IMS prediction and stores it in the library IonMobility column.
+	-addDecoys set to true predicts reversed decoys as normal JChronologer entries and writes them to the DLIB decoy table (roughly doubling prediction time).
+	-generateProteinEntrapments true generates one shuffled protein-level entrapment accession per target protein using -entrapmentSeed for reproducibility.

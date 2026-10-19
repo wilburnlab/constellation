@@ -739,7 +739,7 @@ def stub_external_calls(monkeypatch, tmp_path) -> dict:
     def _fake_find(name):
         # The orchestrator's pre-Stage-0 preflight resolves the encyclopedia
         # jar and version-checks it. No real jar in the test env, so hand
-        # back a fake >= 6.5.15 handle.
+        # back a fake handle at the pinned minimum (6.9.23).
         from constellation.thirdparty.registry import ToolHandle, ToolSpec
 
         assert name == "encyclopedia"
@@ -747,7 +747,7 @@ def stub_external_calls(monkeypatch, tmp_path) -> dict:
             name="encyclopedia", env_var="CONSTELLATION_ENCYCLOPEDIA_HOME"
         )
         return ToolHandle(
-            spec, tmp_path / "encyclopedia-6.5.15.jar", "env", "6.5.15"
+            spec, tmp_path / "encyclopedia-6.9.23.jar", "env", "6.9.23"
         )
 
     import constellation.transcriptome_to_proteome as t2p
@@ -1040,7 +1040,7 @@ def test_orchestrator_no_collision_filter_skips_raw(
 def test_orchestrator_preflight_rejects_old_encyclopedia(
     stub_inputs, monkeypatch, capsys
 ) -> None:
-    """A sub-6.5.15 jar hard-errors at the preflight, before Stage 0 runs."""
+    """A jar below the 6.9.23 floor hard-errors at the preflight, before Stage 0 runs."""
     from constellation.thirdparty.registry import ToolHandle, ToolSpec
     from constellation.transcriptome_to_proteome import (
         run_transcriptome_to_proteomics,
@@ -1064,7 +1064,7 @@ def test_orchestrator_preflight_rejects_old_encyclopedia(
     rc = run_transcriptome_to_proteomics(args=args, reference=stub_inputs["reference"], swissprot_reference=stub_inputs["swissprot_reference"])
     assert rc == 1
     err = capsys.readouterr().err
-    assert "2.12.30" in err and "6.5.15" in err
+    assert "2.12.30" in err and "6.9.23" in err
     # Failed at preflight — Stage 0 never created its output dir.
     assert not (stub_inputs["output_dir"] / "00_deduped_refseq").exists()
 

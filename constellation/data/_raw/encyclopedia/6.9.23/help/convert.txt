@@ -1,0 +1,13 @@
+EncyclopeDIA Converter Help
+EncyclopeDIA Converter allows to convert files from one format to another.
+Available converters:
+	-prositCSVToLibrary	Convert Prosit/Spectronaut/DIA-NN CSV to library (use -convert -prositcsvtolibrary -h for help)
+	-blibToLib	Convert Convert BLIB to Library (use -convert -blibToLib -h for help)
+	-mspToLib	Convert Convert SPTXT/MSP to Library (use -convert -mspToLib -h for help)
+	-openswathTSVToLibrary	Convert OpenSwath TSV to library (use -convert -openswathTSVToLibrary -h for help)
+	-libraryToBlib	Convert library to BLIB (use -convert -libtoblib -h for help)
+	-mergeLibraries	Merge multiple DLIB libraries into a single DLIB (use -convert -mergeLibraries -h for help)
+	-fastaToPrositCSV	Convert FASTA to Prosit CSV (use -convert -fastatoprositcsv -h for help)
+	-fastaToJChronologerLibrary	Create DLIB library predictions from FASTA with JChronologer (use -convert -fastatojchronologerlibrary -h for help)
+	-processDIA	Preprocess .MZMLs or merge .MZML or .DIA gas-phase fractions (use -convert -processDIA -h for help)
+	-adjustLibraryForPTMs	add PTMs (or SILAC masses) to library (use -convert -adjustLibraryForPTMs -h for help)

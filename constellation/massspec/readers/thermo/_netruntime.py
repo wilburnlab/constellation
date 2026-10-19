@@ -132,8 +132,13 @@ def _find_dotnet_root() -> Path | None:
     2. The ``dotnet`` binary's parent directory on ``$PATH`` (works for
        the conda-forge ``dotnet-runtime`` package, which puts ``dotnet``
        on ``$CONDA_PREFIX/bin``; the actual runtime lives alongside it).
-    3. Common conda-env layouts: ``$CONDA_PREFIX/lib/dotnet``,
-       ``$CONDA_PREFIX/share/dotnet``.
+    3. Common conda-env layouts, ``lib/dotnet`` and ``share/dotnet``,
+       under the running interpreter's own prefix (``sys.prefix``) and
+       then under ``$CONDA_PREFIX``. The interpreter's prefix comes first
+       because it is the env this process actually runs in: when
+       ``constellation`` is called by full path without ``conda
+       activate`` (an sbatch script, a wrapper), ``$CONDA_PREFIX`` is
+       unset or still names the base env, which has no runtime.
 
     Returns the resolved directory or ``None`` if .NET isn't findable.
     """
@@ -150,10 +155,11 @@ def _find_dotnet_root() -> Path | None:
         if (candidate / "dotnet").exists():
             return candidate
 
-    conda_prefix = os.environ.get("CONDA_PREFIX")
-    if conda_prefix:
+    for prefix in (sys.prefix, os.environ.get("CONDA_PREFIX")):
+        if not prefix:
+            continue
         for rel in ("lib/dotnet", "share/dotnet"):
-            p = Path(conda_prefix) / rel
+            p = Path(prefix) / rel
             if p.is_dir():
                 return p
 

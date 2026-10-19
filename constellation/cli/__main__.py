@@ -34,10 +34,37 @@ from constellation.thirdparty import (  # noqa: F401
     samtools,
     thermo,
 )
-from constellation.thirdparty.registry import registered, try_find
+from constellation.thirdparty.registry import meets_min_version, registered, try_find
 
 
 _LIBSTDCXX_REEXEC_SENTINEL = "_CONSTELLATION_LIBSTDCXX_REEXECED"
+
+
+def _interpreter_prefix() -> Path:
+    return Path(sys.prefix)
+
+
+def _env_prefix() -> Path | None:
+    """The conda env whose ``lib`` this process should resolve against.
+
+    That is the env the running interpreter lives in, not the activated
+    one. After ``conda activate`` the two are the same. They differ when
+    ``constellation`` is called by full path from another env or from
+    ``base`` (an sbatch script, a wrapper, an editor's terminal), and
+    then ``$CONDA_PREFIX/lib`` holds a *different* env's libstdc++:
+    putting it first is the skew this code exists to prevent, and judged
+    against it the interpreter's own libstdc++ looked foreign, so every
+    command printed the skew note and re-executed itself. ``$CONDA_PREFIX``
+    stays as the fallback for an interpreter that is not in a conda env
+    (a venv layered on one). ``None`` when there is no conda env at all.
+    """
+    import os
+
+    prefix = _interpreter_prefix()
+    if (prefix / "conda-meta").is_dir():
+        return prefix
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    return Path(conda_prefix) if conda_prefix else None
 
 
 def _ensure_env_libstdcxx_priority() -> None:
@@ -54,7 +81,7 @@ def _ensure_env_libstdcxx_priority() -> None:
     Three steps, in order:
 
     1. **Prep ``LD_LIBRARY_PATH`` for child processes.** Prepend
-       ``$CONDA_PREFIX/lib`` to ``os.environ["LD_LIBRARY_PATH"]`` if it
+       the env's ``lib`` (:func:`_env_prefix`) to ``os.environ["LD_LIBRARY_PATH"]`` if it
        isn't already first. This has no effect on the *parent's*
        already-resolved libstdc++ (the dynamic linker cached its lookup
        at process startup) — but :mod:`multiprocessing.spawn` workers
@@ -78,7 +105,7 @@ def _ensure_env_libstdcxx_priority() -> None:
 
     3. **Path-resolution probe.** Catches the more common case where
        Python startup *succeeds* but the libstdc++ that got mapped into
-       the process is from outside ``$CONDA_PREFIX/lib``. The dynamic
+       the process is from outside the env's ``lib`` (:func:`_env_prefix`). The dynamic
        linker registers a libstdc++.so.6 SONAME the first time anything
        in the NEEDED chain pulls one in; any later runtime ``dlopen``
        (pythonnet → CoreCLR, matplotlib's compiled extensions, ...)
@@ -123,17 +150,17 @@ def _ensure_env_libstdcxx_priority() -> None:
 
     sys.stderr.write(
         f"NOTE: detected libstdc++ ABI skew ({skew_reason}); re-launching "
-        f"python with $CONDA_PREFIX/lib first on LD_LIBRARY_PATH.\n"
+        f"python with the conda env's lib first on LD_LIBRARY_PATH.\n"
     )
     sys.stderr.flush()
     _reexec_with_env_libstdcxx_first(_log)
 
 
 def _ensure_env_lib_on_ld_library_path(log: Callable[[str], None]) -> None:
-    """Prepend ``$CONDA_PREFIX/lib`` to ``os.environ["LD_LIBRARY_PATH"]``
+    """Prepend the env's ``lib`` (:func:`_env_prefix`) to ``os.environ["LD_LIBRARY_PATH"]``
     so spawn-mode children inherit a search order that puts env libs
     first. Idempotent: no-op when already first, when no env libstdc++
-    exists at the expected location, or when ``CONDA_PREFIX`` isn't set.
+    exists at the expected location, or when there is no conda env.
 
     Mutates :data:`os.environ` only. The parent's *already-loaded*
     libraries are unaffected (the dynamic linker's cache is set in
@@ -155,11 +182,11 @@ def _ensure_env_lib_on_ld_library_path(log: Callable[[str], None]) -> None:
     """
     import os
 
-    conda_prefix = os.environ.get("CONDA_PREFIX")
-    if not conda_prefix:
-        log("LD_LIBRARY_PATH prep: no CONDA_PREFIX; skipping")
+    env_prefix = _env_prefix()
+    if env_prefix is None:
+        log("LD_LIBRARY_PATH prep: no conda env; skipping")
         return
-    env_lib = Path(conda_prefix) / "lib"
+    env_lib = env_prefix / "lib"
     if not (env_lib / "libstdc++.so.6").is_file():
         log(f"LD_LIBRARY_PATH prep: no libstdc++.so.6 in {env_lib}; skipping")
         return
@@ -211,23 +238,26 @@ def _detect_libstdcxx_skew(log: Callable[[str], None]) -> str | None:
 
 def _libstdcxx_loaded_outside_env(log: Callable[[str], None]) -> str | None:
     """Return the on-disk path of the currently-loaded ``libstdc++.so.6``
-    when that path is outside ``$CONDA_PREFIX/lib``; ``None`` otherwise.
+    when that path is outside the env's ``lib`` (:func:`_env_prefix`); ``None`` otherwise.
 
     Triggers a ``ctypes.CDLL("libstdc++.so.6")`` to ensure the SONAME is
     resolved (idempotent if already loaded — the kernel just bumps the
     refcount on the existing mapping), then scans ``/proc/self/maps``
     to find the backing file. Silent no-op on non-Linux hosts where
-    ``/proc/self/maps`` is absent, on envs without ``CONDA_PREFIX``, and
+    ``/proc/self/maps`` is absent, when there is no conda env, and
     when ``libstdc++.so.6`` isn't installed system-wide.
     """
     import ctypes
     import os
 
-    conda_prefix = os.environ.get("CONDA_PREFIX")
-    if not conda_prefix:
-        log("  no CONDA_PREFIX; path probe skipped")
+    env_prefix = _env_prefix()
+    if env_prefix is None:
+        log("  no conda env; path probe skipped")
         return None
-    env_lib_prefix = str(Path(conda_prefix) / "lib")
+    # /proc/self/maps shows resolved paths; the prefix may be spelled
+    # through a symlink (a linked home directory), so accept either.
+    env_lib = env_prefix / "lib"
+    env_lib_prefixes = tuple({str(env_lib), os.path.realpath(env_lib)})
 
     try:
         ctypes.CDLL("libstdc++.so.6")
@@ -256,7 +286,7 @@ def _libstdcxx_loaded_outside_env(log: Callable[[str], None]) -> str | None:
         path = line.rsplit(maxsplit=1)[-1]
         if not path.startswith("/"):
             continue
-        if path.startswith(env_lib_prefix):
+        if path.startswith(env_lib_prefixes):
             log(f"  libstdc++ loaded from {path} (inside env)")
             return None
         log(f"  libstdc++ loaded from {path} (OUTSIDE env)")
@@ -267,7 +297,7 @@ def _libstdcxx_loaded_outside_env(log: Callable[[str], None]) -> str | None:
 
 
 def _reexec_with_env_libstdcxx_first(debug_log) -> None:
-    """If ``$CONDA_PREFIX/lib`` isn't first on ``LD_LIBRARY_PATH``,
+    """If the env's ``lib`` (:func:`_env_prefix`) isn't first on ``LD_LIBRARY_PATH``,
     re-exec this Python process with it prepended.
 
     The dynamic linker reads ``LD_LIBRARY_PATH`` once at process
@@ -291,10 +321,8 @@ def _reexec_with_env_libstdcxx_first(debug_log) -> None:
         debug_log("  already re-exec'd this run; skipping")
         return
 
-    conda_prefix = os.environ.get("CONDA_PREFIX") or str(
-        Path(sys.executable).parent.parent
-    )
-    env_lib = str(Path(conda_prefix) / "lib")
+    env_prefix = _env_prefix() or Path(sys.executable).parent.parent
+    env_lib = str(env_prefix / "lib")
     if not (Path(env_lib) / "libstdc++.so.6").is_file():
         debug_log(f"  no libstdc++.so.6 under {env_lib}; skipping re-exec")
         return
@@ -335,12 +363,9 @@ def _pin_env_libstdcxx(debug_log) -> None:
     above is the load-bearing fix.
     """
     import ctypes
-    import os
 
-    conda_prefix = os.environ.get("CONDA_PREFIX") or str(
-        Path(sys.executable).parent.parent
-    )
-    candidate = Path(conda_prefix) / "lib" / "libstdc++.so.6"
+    env_prefix = _env_prefix() or Path(sys.executable).parent.parent
+    candidate = env_prefix / "lib" / "libstdc++.so.6"
     debug_log(f"  env libstdc++ candidate: {candidate}")
     if not candidate.is_file():
         debug_log("  candidate not present; skipping")
@@ -401,7 +426,7 @@ def _preload_matplotlib_for_reports(*, verbose: bool = False) -> None:
 
     # First attempt failed. If the error is the well-known libstdc++
     # / CXXABI skew, try the load-bearing fix: re-exec python with
-    # $CONDA_PREFIX/lib prepended to LD_LIBRARY_PATH. Other ImportError
+    # the env's lib prepended to LD_LIBRARY_PATH. Other ImportError
     # causes (e.g. matplotlib not installed) skip the re-exec and fall
     # through to the warning below.
     err_text = str(first_error)
@@ -448,6 +473,15 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
             status = "not found"
             where = f"(set {spec.env_var} or run {spec.install_script or '—'})"
             version = "—"
+        elif not meets_min_version(handle):
+            # Resolved, but below the tool's declared floor: the commands
+            # that use it will refuse to run, so don't call it "ok".
+            status = "too old"
+            where = (
+                f"{handle.source}: {handle.path} "
+                f"(needs >= {spec.min_version}; run {spec.install_script or '—'})"
+            )
+            version = handle.version or "—"
         else:
             status = "ok"
             where = f"{handle.source}: {handle.path}"
@@ -466,6 +500,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     rows.append(_doctor_taxonomy_row())
     rows.append(_doctor_catalogs_row())
     rows.append(_doctor_koina_row())
+    rows.extend(_doctor_percolator_rows())
 
     if not rows:
         print("no third-party tools or frontend bundles registered")
@@ -527,6 +562,38 @@ def _doctor_frontend_rows() -> list[tuple[str, str, str, str]]:
                 )
             )
     return rows
+
+
+def _doctor_percolator_rows() -> list[tuple[str, str, str, str]]:
+    """Whether the Percolator build an EncyclopeDIA search uses by default
+    can start here; no row when the jar is not installed.
+
+    The build is unpacked from the jar at run time, so there is nothing
+    to locate. The one thing that stops it is known and cheap to test:
+    the bundled Linux 3.01 needs the legacy vsyscall page, which a kernel
+    booted with ``vsyscall=none`` (WSL2) does not map. A search on such a
+    machine scores the whole run and then dies in Percolator.
+    """
+    if try_find("encyclopedia") is None:
+        return []
+    from constellation.massspec.search.encyclopedia.percolator import (
+        default_percolator_version,
+        percolator_blocker,
+    )
+
+    version = default_percolator_version()
+    if percolator_blocker() is None:
+        return [("percolator", "ok", version, "bundled in the encyclopedia jar")]
+    return [
+        (
+            "percolator",
+            "blocked",
+            version,
+            "the jar's default build cannot run on a vsyscall=none kernel; "
+            "`massspec search` refuses and lists the fixes "
+            "(--percolator-version v3-05 or a path, or boot with vsyscall=emulate)",
+        )
+    ]
 
 
 def _doctor_koina_row() -> tuple[str, str, str, str]:
@@ -6442,6 +6509,8 @@ def main(argv: list[str] | None = None) -> int:
         raw = ["dashboard"]
     parser = _build_parser()
     args = parser.parse_args(raw)
+    # Kept for commands that start themselves again (`--detach`).
+    args._raw_argv = raw
     return args.func(args)
 
 

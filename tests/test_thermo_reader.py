@@ -409,7 +409,7 @@ class TestSchemaRegistration:
         assert {"analyzer", "activation_type"} <= names
         assert SCAN_METADATA_TABLE.field("analyzer").type == pa.string()
         assert SCAN_METADATA_TABLE.field("activation_type").type == pa.string()
-        assert SCAN_METADATA_TABLE.metadata[b"schema_version"] == b"2"
+        assert SCAN_METADATA_TABLE.metadata[b"schema_version"] == b"3"
 
     def test_acquisition_metadata_table_has_tune_data_map(self):
         f = ACQUISITION_METADATA_TABLE.field("tune_data")
@@ -566,3 +566,27 @@ class TestRealRawConvert:
         # Sanity: peaks table is non-empty and m/z values are sorted ascending
         # within at least the first scan.
         assert peaks.num_rows > 0
+
+
+def test_find_dotnet_root_uses_interpreter_prefix_before_conda_prefix(
+    tmp_path, monkeypatch
+) -> None:
+    """The runtime is found when the env is not activated.
+
+    Calling ``constellation`` by full path (an sbatch script, a wrapper)
+    leaves ``$CONDA_PREFIX`` unset or pointing at the base env, which has
+    no .NET runtime. The interpreter's own prefix is the env that does.
+    """
+    from constellation.massspec.readers.thermo import _netruntime
+
+    env_prefix = tmp_path / "envs" / "constellation"
+    (env_prefix / "lib" / "dotnet").mkdir(parents=True)
+    base_prefix = tmp_path / "base"
+    base_prefix.mkdir()
+
+    monkeypatch.delenv("DOTNET_ROOT", raising=False)
+    monkeypatch.setenv("CONDA_PREFIX", str(base_prefix))
+    monkeypatch.setattr(_netruntime.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_netruntime.sys, "prefix", str(env_prefix))
+
+    assert _netruntime._find_dotnet_root() == env_prefix / "lib" / "dotnet"

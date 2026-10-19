@@ -122,6 +122,8 @@ _PARQUET_TABLES = (
     "precursor_quant",
     "transmission_protein_peptide",
     "transmission_peptide_precursor",
+    "precursor_chromatogram",
+    "fragment_quant",
 )
 
 
@@ -161,9 +163,11 @@ class ParquetDirReader:
             )
         acquisitions = Acquisitions(acq_table)
 
+        # A bundle written before a table existed has no file for it.
         tables: dict[str, pa.Table] = {
             name: pq.read_table(path / f"{name}.parquet")
             for name in _PARQUET_TABLES
+            if (path / f"{name}.parquet").exists()
         }
         return Quant(
             acquisitions=acquisitions,
@@ -173,6 +177,11 @@ class ParquetDirReader:
             transmission_protein_peptide=tables["transmission_protein_peptide"],
             transmission_peptide_precursor=tables["transmission_peptide_precursor"],
             metadata_extras=dict(manifest.get("metadata", {})),
+            **{
+                name: tables[name]
+                for name in ("precursor_chromatogram", "fragment_quant")
+                if name in tables
+            },
         )
 
 

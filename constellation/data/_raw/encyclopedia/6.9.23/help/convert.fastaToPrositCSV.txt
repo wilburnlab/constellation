@@ -1,0 +1,15 @@
+CLI for Convert -> Create Prosit CSV From FASTA
+Required Parameters:
+	-i	input .FASTA file
+Other Parameters:
+	-o	output .csv file
+	-addDecoys          (default: false)
+	-adjustNCEForDIA    (default: true)
+	-defaultCharge      (default: 3)
+	-defaultNCE         (default: 33)
+	-enzyme             (default: Trypsin)
+	-maxCharge          (default: 3)
+	-maxMissedCleavage  (default: 1)
+	-maxMz              (default: 1002.7)
+	-minCharge          (default: 2)
+	-minMz              (default: 396.4)

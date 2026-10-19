@@ -45,6 +45,60 @@
   ],
   "arg_hints": [
     {
+      "path": ["massspec", "search"],
+      "dest": "input",
+      "path_kind": "either",
+      "glob": "*.raw,*.dia"
+    },
+    {
+      "path": ["massspec", "search"],
+      "dest": "library",
+      "path_kind": "file",
+      "glob": "*.dlib,*.elib"
+    },
+    {
+      "path": ["massspec", "search"],
+      "dest": "fasta",
+      "path_kind": "file",
+      "glob": "*.fasta,*.fa,*.faa"
+    },
+    {
+      "path": ["massspec", "quantify"],
+      "dest": "runs",
+      "path_kind": "either",
+      "glob": "*.raw,*.dia"
+    },
+    {
+      "path": ["massspec", "quantify"],
+      "dest": "fractions",
+      "path_kind": "either",
+      "glob": "*.raw"
+    },
+    {
+      "path": ["massspec", "quantify"],
+      "dest": "library",
+      "path_kind": "file",
+      "glob": "*.dlib,*.elib"
+    },
+    {
+      "path": ["massspec", "quantify"],
+      "dest": "fasta",
+      "path_kind": "file",
+      "glob": "*.fasta,*.fa,*.faa"
+    },
+    {
+      "path": ["massspec", "report"],
+      "dest": "fasta",
+      "path_kind": "file",
+      "glob": "*.fasta,*.fa,*.faa"
+    },
+    {
+      "path": ["massspec", "report"],
+      "dest": "library",
+      "path_kind": "file",
+      "glob": "*.dlib,*.elib"
+    },
+    {
       "path": ["transcriptome", "demultiplex"],
       "dest": "samples",
       "path_kind": "file",

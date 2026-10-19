@@ -1,28 +1,50 @@
-"""Python wrappers around EncyclopeDIA jar subcommands.
+"""Running the EncyclopeDIA jar.
 
-Each wrapper translates a typed Python signature to the jar's CLI flags
-and delegates execution to :func:`constellation.thirdparty.jvm.run_jar`.
-The wrappers know about EncyclopeDIA's CLI surface (flag names,
-required vs optional, default values) — they do not know about jar
-discovery, JVM resolution, or subprocess plumbing.
+Two generations live here.
 
-Priority utilities (CLI verb → jar invocation):
+**The general path** (new code uses this):
+
+    runner    -- ``compose_argv`` + ``run_program``: any program of the
+                 jar, with every flag checked against the captured help
+                 before Java starts
+    params    -- the settings Constellation adds meaning to: the
+                 peptide-centric / spectrum-centric resolver and
+                 ``SearchParameters`` (tolerances with units, ...)
+    outputs   -- what a finished run must have left behind
+    percolator-- a pre-flight for the Percolator executable the jar runs
+    cli_spec  -- the jar's programs and flags as data
+
+``massspec search`` is built on these through
+:mod:`constellation.massspec.workflows.encyclopedia`, and
+``massspec encyclopedia run`` exposes the runner directly.
+
+**Four typed wrappers**, one per jar program, each translating a Python
+signature to flags and delegating to
+:func:`constellation.thirdparty.jvm.run_jar`:
 
 ==================  =================================================
-Constellation CLI   EncyclopeDIA 6.5.15 invocation
+Wrapper             EncyclopeDIA invocation (pinned >= 6.9.23)
 ==================  =================================================
-``search``          (default) ``-i <mzml|dia> -l <library> [...]``
-``predict-library`` ``-convert -fastaToJChronologerLibrary``
-``process-dia``     ``-convert -processDIA``
-``library-export``  ``-libexport``
+``library_search``  (default) ``-i <input> -l <library> [...]``
+``predict_library`` ``-convert -fastaToJChronologerLibrary``
+``process_dia``     ``-convert -processDIA``
+``library_export``  ``-libexport``
 ==================  =================================================
 
-Other v6.5.15 programs (``-walnut``, ``-thesaurus``, ``-xcordia``,
-``-scribe``, ``-scribetwo{dda,dia}``, ``-browser``, ``-batch``, the
-rest of ``-convert``) are deliberately not wrapped yet — they enter
-``encyclopedia.<utility>.py`` on-demand when a lab use case appears.
-The authoritative inventory lives in
-``docs/plans/encyclopedia-6.5.15-utilities.md``.
+``predict-library`` and ``library-export`` are still served by theirs.
+``library_search`` and ``process_dia`` have no command of their own any
+more and are kept because the transcriptome-to-proteome pipeline calls
+all four directly. They pass the caller's output directory straight
+through, so the caller owns one fact about the jar: a result already
+at the output path is its sign that the search is finished, and it
+returns that result whatever the settings now say (:mod:`.outputs`).
+
+The jar's programs and flags are not written down by hand: they are
+captured from the pinned jar's ``-h`` output into
+``constellation/data/encyclopedia_cli.json`` and queried through
+:mod:`.cli_spec`. ``tests/test_encyclopedia_cli_spec.py`` checks every
+flag the wrappers emit against that snapshot. The survey note is
+``docs/plans/encyclopedia-6.9.23-survey.md``.
 """
 
 from __future__ import annotations

@@ -1,0 +1,4 @@
+CLI for Convert -> Preprocess DIA files
+Required Parameters:
+	-i	input .mzML, .raw, .d, or .DIA files (merge multiple files by deliminating with ":")
+	-o	output merged .DIA file (only used for merging multiple files)

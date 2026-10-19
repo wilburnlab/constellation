@@ -1,0 +1,8 @@
+Adjust Library For PTMs
+Required Parameters:
+	-i	input library file
+	-o	output library file
+	-ptm	comma delimited modifications (for example "K=8.014199,R=10.008269")
+Other Parameters:
+	-fixed	(default: true)
+	-combineWithUnmodified	(default: false)

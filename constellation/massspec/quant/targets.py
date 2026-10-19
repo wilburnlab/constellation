@@ -18,8 +18,14 @@ operations:
   ``targets_from_table``          a bare hand-authored table validated
                                   against the contract (non-peptide m/z
                                   lists / ad-hoc targets).
+  ``targets_from_experiment``     a search experiment directory (or one
+                                  of its units): the precursors a search
+                                  identified in one acquisition, at their
+                                  observed RT with the window the engine
+                                  integrated over.
 
 ``load_targets(path)`` is the convenience used by the CLI: it sniffs a
+search experiment or unit directory (by its manifest's ``kind``), a
 ParquetDir bundle (Library / Search) or a bare ``.parquet`` / ``.tsv``
 file and dispatches to the right adapter.
 
@@ -44,6 +50,7 @@ __all__ = [
     "targets_from_search",
     "targets_from_precursor_quant",
     "targets_from_table",
+    "targets_from_experiment",
     "load_targets",
 ]
 
@@ -170,16 +177,137 @@ def targets_from_table(table: pa.Table | str | Path) -> pa.Table:
     return cast_to_schema(table, XIC_TARGET_TABLE)
 
 
+def targets_from_experiment(
+    experiment_dir: str | Path, *, unit: str | None = None, acquisition_id: int | None = None
+) -> pa.Table:
+    """The precursors one search identified in one acquisition, as targets.
+
+    ``experiment_dir`` is a search experiment
+    (:mod:`constellation.massspec.manifest`). Each precursor with a
+    quantity row becomes a target at its observed retention time, with
+    the window the engine integrated over as ``rt_start`` / ``rt_end``
+    where it reported one.
+
+    A target list is for one run as one search saw it. ``unit`` (the
+    search's key) and ``acquisition_id`` may be left out while the
+    experiment holds a single result; with several searches or several
+    acquisitions, enough has to be given to leave one, and the error
+    lists the choices.
+    """
+    from constellation.massspec.manifest import ALL_ACQUISITIONS, open_table
+
+    root = Path(experiment_dir)
+
+    def table(name: str) -> pa.Table:
+        try:
+            dataset = open_table(root, name)
+        except FileNotFoundError:
+            raise ValueError(
+                f"{root} has no {name} table; it is not a searched experiment"
+            ) from None
+        return dataset.to_table()
+
+    quant = table("precursor_quant")
+    held = sorted(
+        {
+            (u, a)
+            for u, a in zip(
+                quant.column("unit").to_pylist(),
+                quant.column("acquisition_id").to_pylist(),
+                strict=True,
+            )
+        }
+    )
+    wanted = [
+        (u, a)
+        for u, a in held
+        if (unit is None or u == unit) and (acquisition_id is None or a == acquisition_id)
+    ]
+    listing = "; ".join(f"search {u}, acquisition {a}" for u, a in held)
+    if not wanted:
+        asked = " and ".join(
+            part
+            for part in (
+                f"search {unit}" if unit is not None else "",
+                f"acquisition {acquisition_id}" if acquisition_id is not None else "",
+            )
+            if part
+        )
+        raise ValueError(f"{root} has no results for {asked} (it has: {listing})")
+    if len(wanted) > 1:
+        raise ValueError(
+            f"{root} holds {len(wanted)} results that fit ({listing}); say which one the "
+            f"targets are for, or pass that search's directory under units/"
+        )
+    unit, acquisition_id = wanted[0]
+
+    def of(tbl: pa.Table, *, shared: bool = False) -> pa.Table:
+        # A result across several runs (a quantitative report) keeps its
+        # precursors and peptides once, under ALL_ACQUISITIONS, not under
+        # each run.
+        ids = [acquisition_id, ALL_ACQUISITIONS] if shared else [acquisition_id]
+        return tbl.filter(
+            pc.and_(
+                pc.equal(tbl.column("unit"), unit),
+                pc.is_in(tbl.column("acquisition_id"), pa.array(ids, tbl.column("acquisition_id").type)),
+            )
+        )
+
+    quant = of(quant).select(["precursor_id", "rt_observed", "rt_start", "rt_end"])
+    precursors = of(table("precursor"), shared=True).select(
+        ["precursor_id", "peptide_id", "charge", "precursor_mz"]
+    )
+    peptides = of(table("peptide"), shared=True).select(["peptide_id", "modified_sequence"])
+    joined = quant.join(precursors, keys="precursor_id", join_type="inner").join(
+        peptides, keys="peptide_id", join_type="left outer"
+    )
+    out = pa.table(
+        {
+            "target_id": joined.column("precursor_id"),
+            "modified_sequence": joined.column("modified_sequence"),
+            "precursor_charge": joined.column("charge"),
+            "precursor_mz": joined.column("precursor_mz"),
+            "rt_center": _sentinel_to_null(joined.column("rt_observed")),
+            "rt_start": joined.column("rt_start"),
+            "rt_end": joined.column("rt_end"),
+            "precursor_id": joined.column("precursor_id"),
+            "peptide_id": joined.column("peptide_id"),
+        }
+    )
+    return cast_to_schema(out, XIC_TARGET_TABLE)
+
+
 def load_targets(path: str | Path, *, library: object | None = None) -> pa.Table:
     """Load a target source from disk and normalize it.
 
-    Auto-detects by what is on disk: a Library ParquetDir bundle
-    (``precursors.parquet``), a Search bundle (``psms.parquet``), a
-    ``PRECURSOR_QUANT`` bundle (``precursor_quant.parquet``, requires
-    ``library=``), or a bare ``.parquet`` / ``.tsv`` target file.
+    Auto-detects by what is on disk: a search experiment or one of its
+    unit directories (by the ``kind`` in its ``manifest.json``), a
+    Library ParquetDir bundle (``precursors.parquet``), a Search bundle
+    (``psms.parquet``), a ``PRECURSOR_QUANT`` bundle
+    (``precursor_quant.parquet``, requires ``library=``), or a bare
+    ``.parquet`` / ``.tsv`` target file.
     """
     p = Path(path)
     if p.is_dir():
+        from constellation.core.manifests import manifest_kind
+
+        kind = manifest_kind(p)
+        if kind == "massspec_experiment":
+            return targets_from_experiment(p)
+        if kind == "massspec_search":
+            from constellation.core.manifests import read_manifest
+            from constellation.massspec.manifest import SearchManifest
+
+            unit = read_manifest(p, expect=SearchManifest)
+            if len(unit.acquisition_ids) != 1:
+                raise ValueError(
+                    f"{p} searched acquisitions {unit.acquisition_ids}; a target list is "
+                    f"for one run"
+                )
+            # <experiment>/units/<unit>/
+            return targets_from_experiment(
+                p.parent.parent, unit=p.name, acquisition_id=unit.acquisition_ids[0]
+            )
         if (p / "precursors.parquet").exists():
             from constellation.massspec.library.io import load_library
 

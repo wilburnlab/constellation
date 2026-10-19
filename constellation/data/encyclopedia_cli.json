@@ -1,0 +1,3028 @@
+{
+ "encyclopedia_version": "6.9.23",
+ "programs": {
+  "batch": {
+   "argv": [
+    "-batch"
+   ],
+   "flag_patterns": {},
+   "flags": {},
+   "listed": true,
+   "notes": [
+    "at java.base/java.io.File.<init>(File.java:278)",
+    "at edu.washington.gs.maccoss.encyclopedia.Batch.main(Batch.java:28)",
+    "at edu.washington.gs.maccoss.encyclopedia.Main.main(Main.java:74)"
+   ],
+   "subprograms": {},
+   "summary": "EncyclopeDIA Batch allows to driving EncyclopeDIA with an XML file (*.encxml). These files can be created by the GUI by saving an XML driver file of a queue. Exception in thread \"main\" java.lang.NullPointerException",
+   "title": "EncyclopeDIA Batch Help"
+  },
+  "convert": {
+   "argv": [
+    "-convert"
+   ],
+   "flag_patterns": {},
+   "flags": {},
+   "listed": true,
+   "notes": [],
+   "subprograms": {
+    "-adjustLibraryForPTMs": "add PTMs (or SILAC masses) to library (use -convert -adjustLibraryForPTMs -h for help)",
+    "-blibToLib": "Convert Convert BLIB to Library (use -convert -blibToLib -h for help)",
+    "-fastaToJChronologerLibrary": "Create DLIB library predictions from FASTA with JChronologer (use -convert -fastatojchronologerlibrary -h for help)",
+    "-fastaToPrositCSV": "Convert FASTA to Prosit CSV (use -convert -fastatoprositcsv -h for help)",
+    "-libraryToBlib": "Convert library to BLIB (use -convert -libtoblib -h for help)",
+    "-mergeLibraries": "Merge multiple DLIB libraries into a single DLIB (use -convert -mergeLibraries -h for help)",
+    "-mspToLib": "Convert Convert SPTXT/MSP to Library (use -convert -mspToLib -h for help)",
+    "-openswathTSVToLibrary": "Convert OpenSwath TSV to library (use -convert -openswathTSVToLibrary -h for help)",
+    "-processDIA": "Preprocess .MZMLs or merge .MZML or .DIA gas-phase fractions (use -convert -processDIA -h for help)",
+    "-prositCSVToLibrary": "Convert Prosit/Spectronaut/DIA-NN CSV to library (use -convert -prositcsvtolibrary -h for help)"
+   },
+   "summary": "EncyclopeDIA Converter allows to convert files from one format to another.",
+   "title": "EncyclopeDIA Converter Help"
+  },
+  "convert.adjustLibraryForPTMs": {
+   "argv": [
+    "-convert",
+    "-adjustLibraryForPTMs"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-combineWithUnmodified": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-fixed": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-i": {
+     "description": "input library file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-o": {
+     "description": "output library file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-ptm": {
+     "description": "comma delimited modifications (for example \"K=8.014199,R=10.008269\")",
+     "required": true,
+     "section": "Required Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [],
+   "subprograms": {},
+   "summary": "",
+   "title": "Adjust Library For PTMs"
+  },
+  "convert.blibToLib": {
+   "argv": [
+    "-convert",
+    "-blibToLib"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-f": {
+     "description": "taxon .FASTA database",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-higherScoresAreBetter": {
+     "default": "true",
+     "required": false,
+     "section": "Required Parameters",
+     "values": [
+      "true",
+      "false"
+     ]
+    },
+    "-i": {
+     "description": "input .BLIB file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-o": {
+     "description": "output .dlib file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-r": {
+     "description": "input .IRTDB file",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [],
+   "subprograms": {},
+   "summary": "",
+   "title": "Convert Convert BLIB to Library"
+  },
+  "convert.fastaToJChronologerLibrary": {
+   "argv": [
+    "-convert",
+    "-fastaToJChronologerLibrary"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-addDecoys": {
+     "default": "true",
+     "description": "set to true predicts reversed decoys as normal JChronologer entries and writes them to the DLIB decoy table (roughly doubling prediction time).",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-adjustNCEForDIA": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-defaultCharge": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-defaultNCE": {
+     "default": "33",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-entrapmentSeed": {
+     "default": "1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-enzyme": {
+     "default": "Trypsin",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-generateProteinEntrapments": {
+     "default": "false",
+     "description": "true generates one shuffled protein-level entrapment accession per target protein using -entrapmentSeed for reproducibility.",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-i": {
+     "description": "input .FASTA file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-maxCharge": {
+     "default": "6",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxMissedCleavage": {
+     "default": "1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxMz": {
+     "default": "1002.7",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxVariableForms": {
+     "default": "1000",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxVariableMods": {
+     "default": "1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minCharge": {
+     "default": "1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minMz": {
+     "default": "396.4",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-o": {
+     "description": "output .dlib file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-predictionCache": {
+     "default": "OS-specific user data directory",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptmAcetyl": {
+     "default": "off",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-ptmCarbamidomethyl": {
+     "default": "fix",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-ptmDeamidation": {
+     "default": "off",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-ptmDimethyl": {
+     "default": "off",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-ptmGlyGly": {
+     "default": "off",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-ptmHexNAc": {
+     "default": "off",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-ptmMethyl": {
+     "default": "off",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-ptmOxidation": {
+     "default": "off",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-ptmPhospho": {
+     "default": "off",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-ptmProteinNTermAcetyl": {
+     "default": "var",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-ptmPyroGluQ": {
+     "default": "var",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-ptmSuccinyl": {
+     "default": "off",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-ptmTMT": {
+     "default": "off",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-ptmTrimethyl": {
+     "default": "off",
+     "required": false,
+     "section": "Other Parameters",
+     "values": [
+      "off",
+      "var",
+      "fix"
+     ]
+    },
+    "-raggedNTerm": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [
+    "Fixed TMT requires -ptmProteinNTermAcetyl off -ptmPyroGluQ off to avoid terminal-site conflicts.",
+    "Peptide length is fixed at 7-31 residues for JChronologer library prediction.",
+    "Charge states are selected from Electrician probabilities (>1%), then filtered by charge range and m/z range.",
+    "JChronologer always runs Sculptor CCS/IMS prediction and stores it in the library IonMobility column."
+   ],
+   "subprograms": {},
+   "summary": "",
+   "title": "CLI for Convert -> Create JChronologer Library From FASTA"
+  },
+  "convert.fastaToKoinaLibrary": {
+   "argv": [
+    "-convert",
+    "-fastaToKoinaLibrary"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-addDecoys": {
+     "default": "true",
+     "description": "true predicts reversed decoys through Koina, writes them to the DLIB decoy table for ScribeTwo, and roughly doubles prediction time.",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-adjustNCEForDIA": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-defaultCharge": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-defaultNCE": {
+     "default": "33",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-enzyme": {
+     "default": "Trypsin",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-i": {
+     "description": "input .FASTA file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-maxCharge": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxMissedCleavage": {
+     "default": "1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxMz": {
+     "default": "1002.7",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minCharge": {
+     "default": "2",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minMz": {
+     "default": "396.4",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-models": {
+     "default": "Prosit_2020_HCD;IM2Deep_CCS;Prosit_2019_iRT",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-o": {
+     "description": "output .dlib file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-url": {
+     "default": "https://koina.wilhelmlab.org:443/",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": false,
+   "notes": [
+    "Fragmentation Models:",
+    "Prosit_2020_HCD",
+    "Prosit_2020_CID",
+    "Prosit_2023_timsTOF",
+    "Prosit_2019_HCD",
+    "Prosit_2020_TMT_HCD",
+    "Prosit_2020_TMT_CID",
+    "CCS Models:",
+    "IM2Deep_CCS",
+    "AlphaPeptDeep_CCS",
+    "RT Models:",
+    "Prosit_2019_iRT",
+    "Chronologer_%ACN",
+    "DeepLC_HeLa_iRT",
+    "AlphaPeptDeep_iRT",
+    "Prosit_2020_TMT_iRT"
+   ],
+   "subprograms": {},
+   "summary": "",
+   "title": "CLI for Convert -> Create Prosit Library From FASTA using Koina"
+  },
+  "convert.fastaToPrositCSV": {
+   "argv": [
+    "-convert",
+    "-fastaToPrositCSV"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-addDecoys": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-adjustNCEForDIA": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-defaultCharge": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-defaultNCE": {
+     "default": "33",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-enzyme": {
+     "default": "Trypsin",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-i": {
+     "description": "input .FASTA file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-maxCharge": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxMissedCleavage": {
+     "default": "1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxMz": {
+     "default": "1002.7",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minCharge": {
+     "default": "2",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minMz": {
+     "default": "396.4",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-o": {
+     "description": "output .csv file",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [],
+   "subprograms": {},
+   "summary": "",
+   "title": "CLI for Convert -> Create Prosit CSV From FASTA"
+  },
+  "convert.libraryToBlib": {
+   "argv": [
+    "-convert",
+    "-libraryToBlib"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-i": {
+     "description": "input library file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-o": {
+     "description": "output .blib file",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [],
+   "subprograms": {},
+   "summary": "",
+   "title": "Convert Library to BLIB"
+  },
+  "convert.mergeDIA": {
+   "alias_of": "convert.processDIA",
+   "argv": [
+    "-convert",
+    "-mergeDIA"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-i": {
+     "description": "input .mzML, .raw, .d, or .DIA files (merge multiple files by deliminating with \":\")",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-o": {
+     "description": "output merged .DIA file (only used for merging multiple files)",
+     "required": true,
+     "section": "Required Parameters"
+    }
+   },
+   "listed": false,
+   "notes": [],
+   "subprograms": {},
+   "summary": "",
+   "title": "CLI for Convert -> Preprocess DIA files"
+  },
+  "convert.mergeLibraries": {
+   "argv": [
+    "-convert",
+    "-mergeLibraries"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-fasta": {
+     "default": "empty",
+     "description": "use to reset the peptide-protein annotations",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-higherScoresAreBetter": {
+     "default": "false",
+     "description": "only used if removeDuplicates=true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-i": {
+     "description": "input library files or directories (merge multiple files by deliminating with \":\")",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-o": {
+     "description": "output .DLIB file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-removeDuplicates": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-rtAlign": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [],
+   "subprograms": {},
+   "summary": "",
+   "title": "Merge Library Files"
+  },
+  "convert.mspToLib": {
+   "argv": [
+    "-convert",
+    "-mspToLib"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-f": {
+     "description": "taxon .FASTA database",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-i": {
+     "description": "input .msp file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-o": {
+     "description": "output .dlib file",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [],
+   "subprograms": {},
+   "summary": "",
+   "title": "Convert Convert SPTXT/MSP to Library"
+  },
+  "convert.openswathTSVToLibrary": {
+   "argv": [
+    "-convert",
+    "-openswathTSVToLibrary"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-f": {
+     "description": "taxon .FASTA database",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-i": {
+     "description": "input .TSV file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-o": {
+     "description": "output .dlib file",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [
+    "ModifiedSequence: Peptide sequence and modifications (aliases: FullPeptideName, FullUniModPeptideName, LabeledSequence, ModifiedPeptide, ModifiedPeptideSequence, PeptideSequence, Sequence, StrippedSequence, modification_sequence)",
+    "PrecursorCharge: Precursor charge (aliases: Charge, prec_z)",
+    "ProductMz: Fragment m/z (aliases: FragmentMz)",
+    "LibraryIntensity: Fragment intensity (aliases: RelativeIntensity, RelativeFragmentIntensity, RelativeFragmentIonIntensity, relative_intensity)",
+    "NormalizedRetentionTime: Retention time (aliases: RetentionTime, RetentionTimeCalculatorScore, RT_detected, Tr_recalibrated, iRT)",
+    "TransitionGroupId: Unique integer ID for each entry (optional) (aliases: ElutionGroup, transition_group_id)"
+   ],
+   "subprograms": {},
+   "summary": "",
+   "title": "Convert OpenSwath TSV to library"
+  },
+  "convert.processDIA": {
+   "argv": [
+    "-convert",
+    "-processDIA"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-i": {
+     "description": "input .mzML, .raw, .d, or .DIA files (merge multiple files by deliminating with \":\")",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-o": {
+     "description": "output merged .DIA file (only used for merging multiple files)",
+     "required": true,
+     "section": "Required Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [],
+   "subprograms": {},
+   "summary": "",
+   "title": "CLI for Convert -> Preprocess DIA files"
+  },
+  "convert.prositCSVToLibrary": {
+   "argv": [
+    "-convert",
+    "-prositCSVToLibrary"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-f": {
+     "description": "taxon .FASTA database",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-i": {
+     "description": "input .CSV file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-o": {
+     "description": "output .dlib file",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [],
+   "subprograms": {},
+   "summary": "",
+   "title": "Convert Prosit/Spectronaut/DIA-NN CSV to library"
+  },
+  "encyclopedia": {
+   "argv": [],
+   "flag_patterns": {},
+   "flags": {
+    "-acquisition": {
+     "default": "DIA",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-adjustInferredRTBoundaries": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-enzyme": {
+     "default": "trypsin",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-expectedPeakWidth": {
+     "default": "25",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-f": {
+     "description": "protein .FASTA database",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-filterPeaklists": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-fixed": {
+     "default": "C=57.0214635",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-foffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-frag": {
+     "default": "CID",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-i": {
+     "description": "input .DIA or .MZML file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-integratePrecursors": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-l": {
+     "description": "library .DLIB or .ELIB file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-lftol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-lftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-localizationModification": {
+     "default": "none",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maskBadIntegrations": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxWindowWidth": {
+     "default": "-1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensity": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensityNumIons": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minNumIntegratedRTPoints": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minNumOfQuantitativePeaks": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-normalizeByTIC": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfExtraDecoyLibrariesSearche": {
+     "default": "0.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfQuantitativePeaks": {
+     "default": "5",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfThreadsUsed": {
+     "default": "<host cores>",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-o": {
+     "default": "[input file].encyclopedia.txt",
+     "description": "output report file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-peakPickTimsIMS": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorProteinThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorTrainingFDR": {
+     "default": "0.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorTrainingSetSize": {
+     "default": "500000",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorVersion": {
+     "default": "v3-01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-poffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorIsolationMargin": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorWindowSize": {
+     "default": "-1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-predictRawSettings": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-quiet": {
+     "description": "suppress log output to stdout/stderr",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-rtWindowInMin": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-scoringBreadthType": {
+     "default": "recal",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-skipLibraryRetentionTime": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-smoothIntegrations": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-subtractBackground": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-topNTargetsUsed": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-usePercolator": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-verifyModificationIons": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "note": "the default, peptide-centric search; runs when no program flag is given, so its argv prefix is empty",
+   "notes": [],
+   "subprograms": {
+    "-browser": "run ELIB Browser (use -browser -h for ELIB Browser help)",
+    "-convert": "run files converter (use -convert -h for help)",
+    "-libexport": "run Library Export (use -libexport -h for Library Export help)",
+    "-scribe": "run Scribe (use -scribe -h for Scribe help)",
+    "-thesaurus": "run Thesaurus localization search (use -thesaurus -h for help)",
+    "-walnut": "run Walnut FASTA search (use -walnut -h for help)"
+   },
+   "summary": "EncyclopeDIA is a library search engine for DIA data. You should prefix your arguments with a high memory setting, e.g. \"-Xmx8g\" for 8gb",
+   "title": "EncyclopeDIA Help"
+  },
+  "libexport": {
+   "argv": [
+    "-libexport"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-a": {
+     "default": "true",
+     "description": "align between files",
+     "required": false,
+     "section": "Required Parameters"
+    },
+    "-blib": {
+     "default": "false",
+     "description": "write .BLIB instead of .ELIB",
+     "required": false,
+     "section": "Required Parameters"
+    },
+    "-f": {
+     "description": "original fasta file (required by Pecan/XCorDIA Export)",
+     "required": false,
+     "section": "Potentially Required Parameters"
+    },
+    "-fixed": {
+     "default": "C=57.0214635",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-foffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-i": {
+     "description": "input .DIA or .MZML file or directory",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-integratePrecursors": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-l": {
+     "description": "original searched library .DLIB or .ELIB file (required by EncyclopeDIA Export)",
+     "required": false,
+     "section": "Potentially Required Parameters"
+    },
+    "-localizationModification": {
+     "default": "none",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maskBadIntegrations": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minNumOfQuantitativePeaks": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-normalizeByTIC": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfExtraDecoyLibrariesSearche": {
+     "default": "0.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfQuantitativePeaks": {
+     "default": "5",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-o": {
+     "description": "output library .ELIB file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-percolatorLocation": {
+     "default": "internal",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorProteinThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-smoothIntegrations": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-subtractBackground": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-t": {
+     "description": "original target file (optional for Pecan/XCorDIA Export)",
+     "required": false,
+     "section": "Potentially Required Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [],
+   "subprograms": {
+    "-pecan": "run Pecanpie export (use -pecan -h for Pecan help)",
+    "-phospho": "run phospho localization export (use -phospho -h for localization help)",
+    "-xcordia": "run XCorDIA export (use -xcordia -h for XCorDIA help)"
+   },
+   "summary": "You should prefix your arguments with a high memory setting, e.g. \"-Xmx8g\" for 8gb",
+   "title": "SearchToLIB Help"
+  },
+  "main": {
+   "argv": [],
+   "flag_patterns": {},
+   "flags": {
+    "-acquisition": {
+     "default": "DIA",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-adjustInferredRTBoundaries": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-enzyme": {
+     "default": "trypsin",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-expectedPeakWidth": {
+     "default": "25",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-filterPeaklists": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-fixed": {
+     "default": "C=57.0214635",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-foffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-frag": {
+     "default": "CID",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-i": {
+     "description": "input .DIA or .MZML file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-integratePrecursors": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-l": {
+     "description": "library .ELIB file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-lftol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-lftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-localizationModification": {
+     "default": "none",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maskBadIntegrations": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxWindowWidth": {
+     "default": "-1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensity": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensityNumIons": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minNumIntegratedRTPoints": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minNumOfQuantitativePeaks": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-normalizeByTIC": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfExtraDecoyLibrariesSearche": {
+     "default": "0.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfQuantitativePeaks": {
+     "default": "5",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfThreadsUsed": {
+     "default": "<host cores>",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-o": {
+     "default": "[input file].encyclopedia.txt",
+     "description": "output report file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-peakPickTimsIMS": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorProteinThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorTrainingFDR": {
+     "default": "0.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorTrainingSetSize": {
+     "default": "500000",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorVersion": {
+     "default": "v3-01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-poffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorIsolationMargin": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorWindowSize": {
+     "default": "-1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-predictRawSettings": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-rtWindowInMin": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-scoringBreadthType": {
+     "default": "recal",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-skipLibraryRetentionTime": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-smoothIntegrations": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-subtractBackground": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-topNTargetsUsed": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-usePercolator": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-verifyModificationIons": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "note": "dispatcher help: `-h` with no program",
+   "notes": [],
+   "subprograms": {
+    "-batch": "run XML driven batch commands (use -batch -h for help)",
+    "-browser": "run ELIB Browser (use -browser -h for ELIB Browser help)",
+    "-convert": "run files converter (use -convert -h for help)",
+    "-libexport": "run Library Export (use -libexport -h for Library Export help)",
+    "-scribe": "run Scribe (use -scribe -h for Scribe help)",
+    "-scribetwo": "run ScribeTwo (use -scribetwo -h for ScribeTwo help)",
+    "-thesaurus": "run Thesaurus (use -thesaurus -h for Thesaurus help)",
+    "-walnut": "run Walnut (use -walnut -h for Walnut help)",
+    "-xcordia": "run XCorDIA (use -xcordia -h for XCorDIA help)"
+   },
+   "summary": "EncyclopeDIA is a library search engine for DIA data. You should prefix your arguments with a high memory setting, e.g. \"-Xmx8g\" for 8gb",
+   "title": "EncyclopeDIA Help"
+  },
+  "pecan": {
+   "alias_of": "walnut",
+   "argv": [
+    "-pecan"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-acquisition": {
+     "default": "DIA",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-addDecoysToBackground": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-alpha": {
+     "default": "1.8",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-beta": {
+     "default": "0.4",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-dontRunDecoys": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-enzyme": {
+     "default": "trypsin",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-expectedPeakWidth": {
+     "default": "25",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-f": {
+     "description": "background FASTA file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-filterPeaklists": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-fixed": {
+     "default": "C=57.0214635",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-foffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-frag": {
+     "default": "YONLY",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-i": {
+     "description": "input .DIA or .MZML file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-maxCharge": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxLength": {
+     "default": "100",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxMissedCleavage": {
+     "default": "1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minCharge": {
+     "default": "2",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensity": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensityNumIons": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minLength": {
+     "default": "5",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minNumOfQuantitativePeaks": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-normalizeByTIC": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfQuantitativePeaks": {
+     "default": "5",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfReportedPeaks": {
+     "default": "1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfThreadsUsed": {
+     "default": "<host cores>",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-o": {
+     "default": "[input file].pecan.txt",
+     "description": "output report file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorProteinThreshol": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorVersion": {
+     "default": "v3-01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-poffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorIsolationMargin": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorWindowSize": {
+     "default": "-1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-predictRawSettings": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-quiet": {
+     "description": "suppress log output to stdout/stderr",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-requireVariableMods": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-t": {
+     "default": "background FASTA file",
+     "description": "target FASTA file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-tp": {
+     "default": "false",
+     "description": "true/false target FASTA file contains peptides",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-usePercolator": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-variable": {
+     "default": "-",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": false,
+   "notes": [],
+   "subprograms": {},
+   "summary": "Walnut is a FASTA database search engine for DIA data that uses PECAN-style scoring. You should prefix your arguments with a high memory setting, e.g. \"-Xmx8g\" for 8gb",
+   "title": "Walnut Help"
+  },
+  "scribe": {
+   "argv": [
+    "-scribe"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-acquisition": {
+     "default": "DIA",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-adjustInferredRTBoundaries": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-enzyme": {
+     "default": "trypsin",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-expectedPeakWidth": {
+     "default": "25",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-f": {
+     "description": "protein .FASTA database",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-filterPeaklists": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-fixed": {
+     "default": "C=57.0214635",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-foffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-frag": {
+     "default": "CID",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-i": {
+     "description": "input .DIA or .MZML file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-integratePrecursors": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-l": {
+     "description": "library .DLIB or .ELIB file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-lftol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-lftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-localizationModification": {
+     "default": "none",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maskBadIntegrations": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxWindowWidth": {
+     "default": "-1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensity": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensityNumIons": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minNumIntegratedRTPoints": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minNumOfQuantitativePeaks": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-normalizeByTIC": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfExtraDecoyLibrariesSearche": {
+     "default": "0.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfQuantitativePeaks": {
+     "default": "5",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfThreadsUsed": {
+     "default": "<host cores>",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-o": {
+     "default": "[input file].scribe.txt",
+     "description": "output report file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-peakPickTimsIMS": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorProteinThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorTrainingFDR": {
+     "default": "0.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorTrainingSetSize": {
+     "default": "500000",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorVersion": {
+     "default": "v3-01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-poffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorIsolationMargin": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorWindowSize": {
+     "default": "-1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-predictRawSettings": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-quiet": {
+     "description": "suppress log output to stdout/stderr",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-rtWindowInMin": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-scoringBreadthType": {
+     "default": "recal",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-skipLibraryRetentionTime": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-smoothIntegrations": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-subtractBackground": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-topNTargetsUsed": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-usePercolator": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-verifyModificationIons": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [],
+   "subprograms": {},
+   "summary": "Scribe is a library search engine for DDA data. You should prefix your arguments with a high memory setting, e.g. \"-Xmx8g\" for 8gb",
+   "title": "Scribe Help"
+  },
+  "scribetwo": {
+   "argv": [
+    "-scribetwo"
+   ],
+   "flag_patterns": {
+    "-ptm*": "named Chronologer PTM state (off|var|fix); do not mix with -fixed/-variable"
+   },
+   "flags": {
+    "-NCE": {
+     "description": "alias for -nce",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-acquisition": {
+     "default": "DIA",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-adjustInferredRTBoundaries": {
+     "default": "false",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-defaultCharge": {
+     "default": "3",
+     "description": "default charge used for FASTA prediction NCE adjustment",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-enzyme": {
+     "default": "trypsin",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-expectedPeakWidth": {
+     "default": "25",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-f": {
+     "description": "protein .FASTA database",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-filterPeaklists": {
+     "default": "false",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-fixed": {
+     "default": "C=57.0214635",
+     "description": "fixed site masses, for example C=57.0214635; use -fixed - for none",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-foffset": {
+     "default": "0",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-frag": {
+     "default": "CID",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-ftol": {
+     "default": "10",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-ftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-i": {
+     "description": "input .DIA or .MZML file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-integratePrecursors": {
+     "default": "false",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-l": {
+     "description": "library .DLIB or .ELIB file (library mode)",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-lftol": {
+     "default": "10",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-lftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-localizationModification": {
+     "default": "none",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-maskBadIntegrations": {
+     "default": "false",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-maxCharge": {
+     "default": "1-6",
+     "description": "FASTA precursor charge range",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-maxLength": {
+     "default": "7-31",
+     "description": "FASTA peptide length range",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-maxMissedCleavage": {
+     "default": "1",
+     "description": "maximum FASTA missed cleavages; -1 allows any number",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-maxVariableForms": {
+     "default": "1000",
+     "description": "maximum variable peptide forms",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-maxVariableMods": {
+     "default": "1",
+     "description": "maximum variable modifications per peptide",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-maxWindowWidth": {
+     "default": "-1",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-minCharge": {
+     "default": "1-6",
+     "description": "FASTA precursor charge range",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-minIntensity": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-minIntensityNumIons": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-minLength": {
+     "default": "7-31",
+     "description": "FASTA peptide length range",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-minNumIntegratedRTPoints": {
+     "default": "3",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-minNumOfQuantitativePeaks": {
+     "default": "3",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-mzIdentML": {
+     "default": "false",
+     "description": "write mzIdentML 1.2.0 and converted adjusted mzML output (DDA mode only)",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-nce": {
+     "default": "33",
+     "description": "normalized collision energy for FASTA prediction",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-normalizeByTIC": {
+     "default": "true",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-numberOfExtraDecoyLibrariesSearche": {
+     "default": "0.0",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-numberOfQuantitativePeaks": {
+     "default": "5",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-numberOfThreadsUsed": {
+     "default": "<host cores>",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-o": {
+     "default": "[input file].scribe2.txt",
+     "description": "output report file",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-peakPickTimsIMS": {
+     "default": "true",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-percolatorProteinThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-percolatorThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-percolatorTrainingFDR": {
+     "default": "0.0",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-percolatorTrainingSetSize": {
+     "default": "500000",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-percolatorVersion": {
+     "default": "v3-01",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-poffset": {
+     "default": "0",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-precursorIsolationMargin": {
+     "default": "0",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-precursorWindowSize": {
+     "default": "-1",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-predictRawSettings": {
+     "default": "true",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-predictionCache": {
+     "default": "OS-specific user data directory",
+     "description": "directory for shared FASTA prediction cache",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-ptol": {
+     "default": "10",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-ptolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-quiet": {
+     "description": "suppress log output to stdout/stderr",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-requireVariableMods": {
+     "default": "false",
+     "description": "require at least one variable modification",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-rtWindowInMin": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-scoringBreadthType": {
+     "default": "recal",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-scribeTwoAstralScoringFeatures": {
+     "default": "true",
+     "description": "emit non-zero experimental Astral scoring features",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-scribeTwoEffectiveIonCountFloor": {
+     "default": "7",
+     "description": "minimum effective ion count used by the ion-count-calibrated X!Tandem feature",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-scribeTwoRelativeIntensityMinIonCount": {
+     "default": "5",
+     "description": "minimum top predicted fragment ions used for relative-intensity scoring",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-scribeTwoRelativeIntensityThreshold": {
+     "default": "0.15",
+     "description": "fraction of the predicted base fragment intensity used for relative-intensity scoring",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-scribeTwoXCorrCacheSize": {
+     "default": "4096",
+     "description": "bounded LRU cache size for ScribeTwo theoretical XCorr calculators",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-scribetwo": {
+     "description": "run ScribeTwo",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-searchType": {
+     "default": "auto",
+     "description": "search type: auto, dia, dda_chimeric, or dda",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-skipLibraryRetentionTime": {
+     "default": "false",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-smoothIntegrations": {
+     "default": "true",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-subtractBackground": {
+     "default": "true",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-topNTargetsUsed": {
+     "default": "10",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-usePercolator": {
+     "default": "true",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-variable": {
+     "description": "variable site masses, for example S=79.966331,T=79.966331; use -variable - for none",
+     "required": false,
+     "section": "Optional Parameters"
+    },
+    "-verifyModificationIons": {
+     "default": "true",
+     "required": false,
+     "section": "Optional Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [
+    "Fixed TMT requires -ptmProteinNTermAcetyl off -ptmPyroGluQ off to avoid terminal-site conflicts."
+   ],
+   "subprograms": {},
+   "summary": "ScribeTwo is a fragment-indexed library search engine for DDA and DIA data. You should prefix your arguments with a high memory setting, e.g. \"-Xmx8g\" for 8gb",
+   "title": "ScribeTwo Help"
+  },
+  "thesaurus": {
+   "argv": [
+    "-thesaurus"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-acquisition": {
+     "default": "DIA",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-adjustInferredRTBoundaries": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-enzyme": {
+     "default": "trypsin",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-expectedPeakWidth": {
+     "default": "25",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-f": {
+     "description": "protein .FASTA database",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-filterPeaklists": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-fixed": {
+     "default": "C=57.0214635",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-foffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-frag": {
+     "default": "CID",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-i": {
+     "description": "input .DIA or .MZML file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-integratePrecursors": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-l": {
+     "description": "library .ELIB file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-lftol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-lftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-localizationModification": {
+     "default": "none",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maskBadIntegrations": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxWindowWidth": {
+     "default": "-1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensity": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensityNumIons": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minNumIntegratedRTPoints": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minNumOfQuantitativePeaks": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-normalizeByTIC": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfExtraDecoyLibrariesSearche": {
+     "default": "0.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfQuantitativePeaks": {
+     "default": "5",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfThreadsUsed": {
+     "default": "<host cores>",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-o": {
+     "default": "[input file].thesaurus.txt",
+     "description": "output report file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-peakPickTimsIMS": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorProteinThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorTrainingFDR": {
+     "default": "0.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorTrainingSetSize": {
+     "default": "500000",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorVersion": {
+     "default": "v3-01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-poffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorIsolationMargin": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorWindowSize": {
+     "default": "-1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-predictRawSettings": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-quiet": {
+     "description": "suppress log output to stdout/stderr",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-rtWindowInMin": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-scoringBreadthType": {
+     "default": "recal",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-skipLibraryRetentionTime": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-smoothIntegrations": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-subtractBackground": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-topNTargetsUsed": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-usePercolator": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-verifyModificationIons": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [],
+   "subprograms": {},
+   "summary": "Thesaurus is software for detecting positional phosphopeptide isomers from DIA data. You should prefix your arguments with a high memory setting, e.g. \"-Xmx8g\" for 8gb",
+   "title": "Thesaurus Help"
+  },
+  "walnut": {
+   "argv": [
+    "-walnut"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-acquisition": {
+     "default": "DIA",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-addDecoysToBackground": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-alpha": {
+     "default": "1.8",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-beta": {
+     "default": "0.4",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-dontRunDecoys": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-enzyme": {
+     "default": "trypsin",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-expectedPeakWidth": {
+     "default": "25",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-f": {
+     "description": "background FASTA file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-filterPeaklists": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-fixed": {
+     "default": "C=57.0214635",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-foffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-frag": {
+     "default": "YONLY",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-i": {
+     "description": "input .DIA or .MZML file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-maxCharge": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxLength": {
+     "default": "100",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxMissedCleavage": {
+     "default": "1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minCharge": {
+     "default": "2",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensity": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensityNumIons": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minLength": {
+     "default": "5",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minNumOfQuantitativePeaks": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-normalizeByTIC": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfQuantitativePeaks": {
+     "default": "5",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfReportedPeaks": {
+     "default": "1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfThreadsUsed": {
+     "default": "<host cores>",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-o": {
+     "default": "[input file].pecan.txt",
+     "description": "output report file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorProteinThreshol": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorVersion": {
+     "default": "v3-01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-poffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorIsolationMargin": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorWindowSize": {
+     "default": "-1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-predictRawSettings": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-quiet": {
+     "description": "suppress log output to stdout/stderr",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-requireVariableMods": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-t": {
+     "default": "background FASTA file",
+     "description": "target FASTA file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-tp": {
+     "default": "false",
+     "description": "true/false target FASTA file contains peptides",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-usePercolator": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-variable": {
+     "default": "-",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [],
+   "subprograms": {},
+   "summary": "Walnut is a FASTA database search engine for DIA data that uses PECAN-style scoring. You should prefix your arguments with a high memory setting, e.g. \"-Xmx8g\" for 8gb",
+   "title": "Walnut Help"
+  },
+  "xcordia": {
+   "argv": [
+    "-xcordia"
+   ],
+   "flag_patterns": {},
+   "flags": {
+    "-acquisition": {
+     "default": "DIA",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-addDecoysToBackground": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-alpha": {
+     "default": "1.8",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-beta": {
+     "default": "0.4",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-dontRunDecoys": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-enzyme": {
+     "default": "trypsin",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-expectedPeakWidth": {
+     "default": "25",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-f": {
+     "description": "background FASTA file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-filterPeaklists": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-fixed": {
+     "default": "C=57.0214635",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-foffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-frag": {
+     "default": "YONLY",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ftolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-i": {
+     "description": "input .DIA or .MZML file",
+     "required": true,
+     "section": "Required Parameters"
+    },
+    "-l": {
+     "default": "search target FASTA",
+     "description": "target Library file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxCharge": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxLength": {
+     "default": "100",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-maxMissedCleavage": {
+     "default": "1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minCharge": {
+     "default": "2",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensity": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minIntensityNumIons": {
+     "default": "-1.0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minLength": {
+     "default": "5",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-minNumOfQuantitativePeaks": {
+     "default": "3",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-normalizeByTIC": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfQuantitativePeaks": {
+     "default": "5",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfReportedPeaks": {
+     "default": "1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-numberOfThreadsUsed": {
+     "default": "<host cores>",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-o": {
+     "default": "[input file].xcordia.txt",
+     "description": "output report file",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorProteinThreshol": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorThreshold": {
+     "default": "0.01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-percolatorVersion": {
+     "default": "v3-01",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-poffset": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorIsolationMargin": {
+     "default": "0",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-precursorWindowSize": {
+     "default": "-1",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-predictRawSettings": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptol": {
+     "default": "10",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-ptolunits": {
+     "default": "ppm",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-quiet": {
+     "description": "suppress log output to stdout/stderr",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-requireVariableMods": {
+     "default": "false",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-t": {
+     "default": "background FASTA file",
+     "description": "target FASTA file (not used if library specified)",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-tp": {
+     "default": "false",
+     "description": "true/false target FASTA file contains peptides",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-usePercolator": {
+     "default": "true",
+     "required": false,
+     "section": "Other Parameters"
+    },
+    "-variable": {
+     "default": "-",
+     "required": false,
+     "section": "Other Parameters"
+    }
+   },
+   "listed": true,
+   "notes": [],
+   "subprograms": {},
+   "summary": "XCorDIA is a FASTA database search engine for DIA data. You should prefix your arguments with a high memory setting, e.g. \"-Xmx8g\" for 8gb",
+   "title": "XCorDIA Help"
+  }
+ }
+}

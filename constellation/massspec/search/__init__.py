@@ -9,15 +9,17 @@ peptides and proteins it identified.
 
 This release ships peptide-level and protein-level score tables — the
 shape encyclopedia ``.dlib``/``.elib`` files aggregate to — plus a
-per-spectrum ``PSM_TABLE``, populated by readers whose source genuinely
-emits per-spectrum matches (MaxQuant ``msms.txt`` via
-``massspec.io.maxquant`` is the first driver). Aggregating-only formats
-leave ``Search.psms`` empty rather than manufacture PSM rows.
+precursor-level ``PRECURSOR_SCORE_TABLE`` (every precursor an engine
+scored, decoys included and flagged) and a per-spectrum ``PSM_TABLE``,
+populated by readers whose source genuinely emits per-spectrum matches
+(MaxQuant ``msms.txt`` via ``massspec.io.maxquant`` is the first
+driver). Aggregating-only formats leave ``Search.psms`` empty rather
+than manufacture PSM rows.
 
 Modules:
 
-    schemas  -- PEPTIDE_SCORE_TABLE, PROTEIN_SCORE_TABLE, PSM_TABLE,
-                NOVEL_PEPTIDE_TABLE
+    schemas  -- PEPTIDE_SCORE_TABLE, PROTEIN_SCORE_TABLE,
+                PRECURSOR_SCORE_TABLE, PSM_TABLE, NOVEL_PEPTIDE_TABLE
     search   -- Search container (mirrors Library / Quant)
     io       -- Reader/Writer Protocols + ParquetDirReader/Writer
     crosscheck -- cross_validate_against_scan_metadata (PSM analyzer /
