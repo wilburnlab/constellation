@@ -15,6 +15,7 @@ not sequence fragments (the intact precursor).
 from __future__ import annotations
 
 import sqlite3
+import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from importlib import resources
@@ -58,6 +59,15 @@ class Entry:
     #: ``(run, TotalIntensity)``: quantity rows for runs other than
     #: ``source``, as a report across runs (``-libexport``) has them.
     other_runs: Sequence[tuple[str, float]] = field(default_factory=tuple)
+    #: The entry's own quantity row's quantified ions, ``(m/z, intensity,
+    #: correlation)``, and its chromatogram, ``(rt, intensity)``. Empty
+    #: arrays when not given.
+    quant_ions: Sequence[tuple[float, float, float]] = field(default_factory=tuple)
+    chromatogram: Sequence[tuple[float, float]] = field(default_factory=tuple)
+    #: ``entries.CorrelationArray`` and ``QuantifiedIonsArray``, one value
+    #: per stored peak; ``None`` leaves the column NULL.
+    peak_correlation: Sequence[float] | None = None
+    peak_quantified: Sequence[bool] | None = None
 
 
 def build_result_library(
@@ -84,18 +94,27 @@ def build_result_library(
     meta.update(metadata or {})
     con.executemany("INSERT INTO metadata VALUES (?, ?)", sorted(meta.items()))
 
-    empty_f8, empty_f8_len = encode_f8(np.zeros(0))
-    empty_f4, empty_f4_len = encode_f4(np.zeros(0, dtype=np.float32))
     links: set[tuple[str, int, str]] = set()
     proteins: set[str] = set()
     for e in entries:
         mz_blob, mz_len = encode_f8(np.asarray(e.mz, dtype=np.float64))
         it_blob, it_len = encode_f4(np.asarray(e.intensity, dtype=np.float32))
+        corr_blob, corr_len = (
+            encode_f4(np.asarray(e.peak_correlation, dtype=np.float32))
+            if e.peak_correlation is not None
+            else (None, None)
+        )
+        flags = (
+            zlib.compress(np.asarray(e.peak_quantified, dtype=np.uint8).tobytes())
+            if e.peak_quantified is not None
+            else None
+        )
         con.execute(
             "INSERT INTO entries (PrecursorMz, PrecursorCharge, PeptideModSeq, PeptideSeq, "
             "Copies, RTInSeconds, Score, MassEncodedLength, MassArray, "
-            "IntensityEncodedLength, IntensityArray, SourceFile) "
-            "VALUES (?,?,?,?,1,?,?,?,?,?,?,?)",
+            "IntensityEncodedLength, IntensityArray, CorrelationEncodedLength, "
+            "CorrelationArray, QuantifiedIonsArray, SourceFile) "
+            "VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?)",
             (
                 e.precursor_mz,
                 e.charge,
@@ -107,6 +126,9 @@ def build_result_library(
                 mz_blob,
                 it_len,
                 it_blob,
+                corr_len,
+                corr_blob,
+                flags,
                 e.source,
             ),
         )
@@ -114,18 +136,27 @@ def build_result_library(
             "INSERT INTO peptidescores VALUES (?,?,?,?,?,?,0)",
             (e.charge, e.modseq, e.sequence, e.source, e.score, e.score),
         )
-        quant_rows = [(m, t, e.source) for m, t in e.extra_quant_rows]
+        quant_rows = [(m, t, e.source, False) for m, t in e.extra_quant_rows]
         if e.total_intensity is not None:
-            quant_rows.insert(0, (e.quant_modseq or e.modseq, e.total_intensity, e.source))
-        quant_rows += [(e.quant_modseq or e.modseq, t, run) for run, t in e.other_runs]
-        for modseq, total, run in quant_rows:
+            quant_rows.insert(0, (e.quant_modseq or e.modseq, e.total_intensity, e.source, True))
+        quant_rows += [(e.quant_modseq or e.modseq, t, run, False) for run, t in e.other_runs]
+        for modseq, total, run, own in quant_rows:
+            ions = list(e.quant_ions) if own else []
+            points = list(e.chromatogram) if own else []
+            ion_mz, ion_mz_len = encode_f8(np.asarray([i[0] for i in ions], dtype=np.float64))
+            ion_int, ion_int_len = encode_f4(np.asarray([i[1] for i in ions], dtype=np.float32))
+            ion_corr, ion_corr_len = encode_f4(np.asarray([i[2] for i in ions], dtype=np.float32))
+            chrom, chrom_len = encode_f4(np.asarray([c[1] for c in points], dtype=np.float32))
+            chrom_rt, chrom_rt_len = encode_f4(np.asarray([c[0] for c in points], dtype=np.float32))
             con.execute(
                 "INSERT INTO peptidequants (PrecursorCharge, PeptideModSeq, PeptideSeq, "
                 "SourceFile, RTInSecondsCenter, RTInSecondsStart, RTInSecondsStop, "
                 "TotalIntensity, NumberOfQuantIons, QuantIonMassLength, QuantIonMassArray, "
-                "BestFragmentCorrelation, BestFragmentDeltaMassPPM, "
-                "MedianChromatogramEncodedLength, MedianChromatogramArray, IdentifiedTICRatio) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "QuantIonIntensityLength, QuantIonIntensityArray, QuantIonCorrelationLength, "
+                "QuantIonCorrelationArray, BestFragmentCorrelation, BestFragmentDeltaMassPPM, "
+                "MedianChromatogramEncodedLength, MedianChromatogramArray, "
+                "MedianChromatogramRTEncodedLength, MedianChromatogramRTArray, IdentifiedTICRatio) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     e.charge,
                     modseq,
@@ -135,13 +166,19 @@ def build_result_library(
                     e.rt - 10.0,
                     e.rt + 10.0,
                     total,
-                    3 if total > 0 else 0,
-                    empty_f8_len,
-                    empty_f8,
+                    len(ions) if ions else (3 if total > 0 else 0),
+                    ion_mz_len,
+                    ion_mz,
+                    ion_int_len,
+                    ion_int,
+                    ion_corr_len,
+                    ion_corr,
                     0.9,
                     0.0,
-                    empty_f4_len,
-                    empty_f4,
+                    chrom_len,
+                    chrom,
+                    chrom_rt_len,
+                    chrom_rt,
                     0.1,
                 ),
             )

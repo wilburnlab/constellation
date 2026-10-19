@@ -116,6 +116,8 @@ def test_validate_rejects_orphan_fragment_fk() -> None:
             "mz_theoretical": [100.0],
             "intensity_predicted": pa.array([0.5], type=pa.float64()),
             "annotation": pa.array([None], type=pa.string()),
+            "correlation": pa.array([None], type=pa.float64()),
+            "quantified": pa.array([None], type=pa.bool_()),
         },
         schema=LIBRARY_FRAGMENT_TABLE,
     )

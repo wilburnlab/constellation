@@ -289,3 +289,74 @@ def test_mapped_peptide_keeps_its_real_accession(tmp_path) -> None:
     back = load_library(path)
     assert back.proteins.column("accession").to_pylist() == ["P1"]
     assert back.precursors.num_rows == 1
+
+
+def test_a_search_result_comes_back_whole(tmp_path) -> None:
+    """Phase 7: the writer carries what the reader reads, chromatograms
+    and quantified ions included, in the 0.1.18 container."""
+    import sqlite3
+
+    from _encyclopedia_fixtures import Entry, build_result_library
+
+    original = build_result_library(
+        tmp_path / "jar.elib",
+        [Entry(modseq="[+42.010565]MDFQK", sequence="MDFQK", charge=2, precursor_mz=355.1,
+               mz=[200.1, 300.2], intensity=[5.0, 6.0], total_intensity=150.0,
+               quant_ions=[(200.1, 100.0, 0.9), (300.2, 50.0, 0.8)],
+               chromatogram=[(590.0, 1.0), (600.0, 9.0)],
+               peak_correlation=[0.9, 0.25], peak_quantified=[True, False]),
+         Entry(modseq="PEPTIDEK", sequence="PEPTIDEK", charge=2, precursor_mz=465.2,
+               mz=[300.1], intensity=[1.0], total_intensity=0.0, peak_quantified=[True])],
+        metadata={"-percolatorThreshold": "0.01"},
+    )  # fmt: skip
+    first = read_encyclopedia(original, sidecars=False)
+    write_encyclopedia(tmp_path / "ours.elib", first.library, quant=first.quant, search=first.search)
+    again = read_encyclopedia(tmp_path / "ours.elib", sidecars=False)
+    for name in ("precursor_quant", "precursor_chromatogram", "fragment_quant"):
+        assert getattr(again.quant, name).equals(getattr(first.quant, name)), name
+    assert again.library.fragments.equals(first.library.fragments)
+    # The library's own per-peak values, not every peak flagged.
+    fragments = first.library.fragments.sort_by([("precursor_id", "ascending"), ("mz_theoretical", "ascending")])
+    assert fragments.column("quantified").to_pylist() == [True, False, True]
+    correlation = fragments.column("correlation").to_pylist()
+    assert correlation[:2] == pytest.approx([0.9, 0.25]) and correlation[2] is None
+    assert again.search.precursor_scores.equals(first.search.precursor_scores)
+    con = sqlite3.connect(tmp_path / "ours.elib")
+    meta = dict(con.execute("SELECT Key, Value FROM metadata"))
+    # (Value is declared "string", which SQLite gives numeric affinity.)
+    assert meta["version"] == "0.1.18" and str(meta["-percolatorThreshold"]) == "0.01"
+    # N-terminal modifications where the jar puts them in each table.
+    assert con.execute("SELECT PeptideModSeq FROM entries WHERE PeptideSeq='MDFQK'").fetchone()[0].startswith("[+42.01")
+    assert con.execute("SELECT PeptideModSeq FROM peptidequants WHERE PeptideSeq='MDFQK'").fetchone()[0].startswith("M[+42.01")
+    assert {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='index'")} >= {"Key_Metadata_index"}
+    assert con.execute("SELECT count(*) FROM sqlite_master WHERE type='index'").fetchone()[0] == 22
+
+
+def test_without_its_own_flags_every_peak_is_quantified(tmp_path) -> None:
+    """A library whose peaks carry no quantified flags is written with
+    every peak flagged, as the jar flags them in every file it writes,
+    whatever its quantity rows used; with no correlations the column
+    stays NULL, as in the jar's predicted libraries. An entry with no
+    stored peaks gets empty arrays, not NULL."""
+    import sqlite3
+
+    from _encyclopedia_fixtures import Entry, build_result_library
+
+    original = build_result_library(
+        tmp_path / "jar.elib",
+        [Entry(modseq="PEPTIDEK", sequence="PEPTIDEK", charge=2, precursor_mz=465.2,
+               mz=[200.1, 300.2], intensity=[5.0, 6.0], total_intensity=100.0,
+               quant_ions=[(300.2, 100.0, 0.9)]),
+         Entry(modseq="ELVISK", sequence="ELVISK", charge=2, precursor_mz=344.7,
+               mz=[], intensity=[], total_intensity=None,
+               peak_correlation=[], peak_quantified=[])],
+    )  # fmt: skip
+    first = read_encyclopedia(original, sidecars=False)
+    assert first.library.fragments.column("quantified").null_count == 2
+    write_encyclopedia(tmp_path / "ours.elib", first.library, quant=first.quant, search=first.search)
+    again = read_encyclopedia(tmp_path / "ours.elib", sidecars=False).library.fragments
+    assert again.sort_by("mz_theoretical").column("quantified").to_pylist() == [True, True]
+    assert again.column("correlation").null_count == 2
+    con = sqlite3.connect(tmp_path / "ours.elib")
+    rows = dict(con.execute("SELECT PeptideSeq, QuantifiedIonsArray IS NOT NULL FROM entries"))
+    assert rows == {"PEPTIDEK": 1, "ELVISK": 1}

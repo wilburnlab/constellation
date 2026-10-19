@@ -319,14 +319,46 @@ def content_keyed_tables(read: EncyclopediaReadResult) -> dict[str, pa.Table]:
     if read.quant is not None:
         tables["precursor_quant"] = rekey(read.quant.precursor_quant, "precursor_id", precursor_ids)
         tables["peptide_quant"] = rekey(read.quant.peptide_quant, "peptide_id", peptide_ids)
+        for name, table in (
+            ("precursor_chromatogram", read.quant.precursor_chromatogram),
+            ("fragment_quant", read.quant.fragment_quant),
+        ):
+            if table.num_rows:
+                tables[name] = rekey(table, "precursor_id", precursor_ids)
     if read.search is not None:
-        tables["precursor_score"] = rekey(read.search.precursor_scores, "precursor_id", precursor_ids)
+        tables["precursor_score"] = _scored_beyond_the_library(
+            rekey(read.search.precursor_scores, "precursor_id", precursor_ids)
+        )
         tables["peptide_score"] = rekey(read.search.peptide_scores, "peptide_id", peptide_ids)
         tables["protein_score"] = rekey(read.search.protein_scores, "protein_id", protein_ids)
         if read.search.psms.num_rows:
             # Already under content-derived precursor ids (_scribe2).
             tables["psm"] = read.search.psms
+    # The sidecars' tables carry content-derived ids already (_sidecar).
+    for name, table in read.sidecars.items():
+        tables[name] = table
     return tables
+
+
+def _scored_beyond_the_library(scores: pa.Table) -> pa.Table:
+    """Precursor scores with a content-derived id for every target: a
+    precursor scored beyond the FDR threshold (from Percolator's own
+    output) is in no table of the library, but is still a precursor."""
+    from constellation.core.chem.modifications import UNIMOD
+    from constellation.massspec.io.encyclopedia._sidecar import precursor_ids as content_precursor_ids
+
+    missing = pc.and_(pc.is_null(scores.column("precursor_id")), pc.invert(scores.column("is_decoy")))
+    if not pc.any(missing).as_py():
+        return scores
+    filled = content_precursor_ids(
+        scores.column("modified_sequence").to_pylist(),
+        scores.column("charge").to_numpy(),
+        skip=pc.invert(missing).to_numpy(zero_copy_only=False),
+        vocab=UNIMOD,
+    )
+    column = pc.if_else(missing, filled, scores.column("precursor_id"))
+    index = scores.schema.get_field_index("precursor_id")
+    return scores.set_column(index, scores.schema.field(index), column)
 
 
 def _write_tables(

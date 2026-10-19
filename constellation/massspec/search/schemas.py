@@ -10,6 +10,10 @@ given acquisition. Constellation models that with two Arrow tables:
     PEPTIDE_SCORE_TABLE   one row per (peptide, acquisition, engine)
     PROTEIN_SCORE_TABLE   one row per (protein, acquisition, engine)
     PSM_TABLE             one row per peptide-spectrum match
+    RT_ALIGNMENT          a search's retention-time alignment, one row
+                          per peptide it was fitted on
+    MASS_CALIBRATION      a search's mass calibration, one row per
+                          identification and MS level
 
 PSM-level scores (one row per spectrum) live in ``PSM_TABLE``. It is
 populated by readers whose source genuinely emits per-spectrum matches —
@@ -174,6 +178,65 @@ PSM_TABLE: pa.Schema = pa.schema(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# A search's calibration of its library to the acquisition
+# ──────────────────────────────────────────────────────────────────────
+
+
+# How a search mapped its library's retention times onto the
+# acquisition's, from the points it fitted that map on: one row per
+# identified peptide, per pass. Times in seconds. ``fitted_rt`` is where
+# the alignment puts the peptide, ``residual`` = observed - fitted.
+# ``pass`` is the engine's own name for the fit (EncyclopeDIA:
+# ``first`` / ``final``; ScribeTwo: ``prealign`` / ``main``).
+# ``peptide_id`` is content-derived (``massspec.library.ids``), null for
+# decoys; ``charge`` where the engine says it.
+RT_ALIGNMENT: pa.Schema = pa.schema(
+    [
+        pa.field("acquisition_id", pa.int64(), nullable=True),
+        pa.field("engine", pa.string(), nullable=False),
+        pa.field("pass", pa.string(), nullable=False),
+        pa.field("modified_sequence", pa.string(), nullable=False),
+        pa.field("peptide_id", pa.int64(), nullable=True),
+        pa.field("charge", pa.int32(), nullable=True),
+        pa.field("library_rt", pa.float64(), nullable=False),
+        pa.field("observed_rt", pa.float64(), nullable=False),
+        pa.field("fitted_rt", pa.float64(), nullable=False),
+        pa.field("residual", pa.float64(), nullable=False),
+        pa.field("within_95", pa.bool_(), nullable=True),
+        pa.field("is_decoy", pa.bool_(), nullable=True),
+    ],
+    metadata={b"schema_name": b"RtAlignment"},
+)
+
+
+# How a search modelled its mass error along the run: one row per
+# identification and MS level (1: precursor, 2: fragments), per pass.
+# ``mass_error`` is what was measured, ``predicted_mass_error`` the
+# model's value at that retention time (seconds), ``corrected_mass_error``
+# the difference; all three in ``unit`` (``Da`` or ``ppm``). Peptide and
+# charge where the engine says them.
+MASS_CALIBRATION: pa.Schema = pa.schema(
+    [
+        pa.field("acquisition_id", pa.int64(), nullable=True),
+        pa.field("engine", pa.string(), nullable=False),
+        pa.field("pass", pa.string(), nullable=False),
+        pa.field("ms_level", pa.int8(), nullable=False),
+        pa.field("rt", pa.float64(), nullable=False),
+        pa.field("mass_error", pa.float64(), nullable=False),
+        pa.field("predicted_mass_error", pa.float64(), nullable=False),
+        pa.field("corrected_mass_error", pa.float64(), nullable=False),
+        pa.field("unit", pa.string(), nullable=False),
+        pa.field("within_95", pa.bool_(), nullable=True),
+        pa.field("modified_sequence", pa.string(), nullable=True),
+        pa.field("peptide_id", pa.int64(), nullable=True),
+        pa.field("charge", pa.int32(), nullable=True),
+        pa.field("is_decoy", pa.bool_(), nullable=True),
+    ],
+    metadata={b"schema_name": b"MassCalibration"},
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Novel peptide classification output
 # ──────────────────────────────────────────────────────────────────────
 
@@ -262,6 +325,8 @@ register_schema("ProteinScoreTable", PROTEIN_SCORE_TABLE)
 register_schema("PsmTable", PSM_TABLE)
 register_schema("PrecursorScoreTable", PRECURSOR_SCORE_TABLE)
 register_schema("NovelPeptideTable", NOVEL_PEPTIDE_TABLE)
+register_schema("RtAlignment", RT_ALIGNMENT)
+register_schema("MassCalibration", MASS_CALIBRATION)
 
 
 __all__ = [
@@ -270,4 +335,6 @@ __all__ = [
     "PROTEIN_SCORE_TABLE",
     "PRECURSOR_SCORE_TABLE",
     "PSM_TABLE",
+    "RT_ALIGNMENT",
+    "MASS_CALIBRATION",
 ]

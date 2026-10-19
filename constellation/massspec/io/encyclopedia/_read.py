@@ -13,8 +13,10 @@ they mean. This module is the stable entry point over them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+
+import pyarrow as pa
 
 from constellation.core.chem.modifications import UNIMOD, ModVocab
 from constellation.massspec.acquisitions import Acquisitions
@@ -24,6 +26,14 @@ from constellation.massspec.io.encyclopedia._project import (
     project_library_file,
 )
 from constellation.massspec.io.encyclopedia._scribe2 import read_scribe2_psms, scribe2_reports
+from constellation.massspec.io.encyclopedia._sidecar import (
+    peptide_centric_sidecars,
+    read_features,
+    read_mass_fits,
+    read_rt_fits,
+    read_scored_precursors,
+    read_scribe2_fits,
+)
 from constellation.massspec.library.library import Library
 from constellation.massspec.quant.quant import Quant
 from constellation.massspec.search.search import Search
@@ -51,6 +61,12 @@ class EncyclopediaReadResult:
     quant: Quant | None
     search: Search | None
     caveats: tuple[str, ...] = ()
+    #: Tables from the text files the jar wrote beside the result
+    #: (``_sidecar``): ``rt_alignment`` (RT_ALIGNMENT), ``mass_calibration``
+    #: (MASS_CALIBRATION), ``percolator_feature`` (the engine's features,
+    #: no fixed schema). Only those it found; empty for a file read on
+    #: its own.
+    sidecars: dict[str, pa.Table] = field(default_factory=dict)
 
 
 def read_encyclopedia(
@@ -62,6 +78,7 @@ def read_encyclopedia(
     include_decoys: bool = False,
     acquisitions: Acquisitions | None = None,
     psms: bool = True,
+    sidecars: bool = True,
 ) -> EncyclopediaReadResult:
     """Read an EncyclopeDIA ``.dlib`` / ``.elib`` file.
 
@@ -93,6 +110,12 @@ def read_encyclopedia(
         (``run.dia.dlib`` and ``run.dia.scribe2/``): read every scored
         peptide-spectrum match into ``Search.psms`` (:mod:`._scribe2`).
         The result library alone has no scans.
+    sidecars
+        Read the text files the jar wrote beside the result
+        (:mod:`._sidecar`): Percolator's scores make
+        ``Search.precursor_scores`` complete (every precursor scored, not
+        only those within the FDR threshold), and the calibration fits
+        and features land in ``EncyclopediaReadResult.sidecars``.
 
     What each output column holds, and why, is in :mod:`._project`.
     """
@@ -105,22 +128,87 @@ def read_encyclopedia(
         acquisitions=acquisitions,
     )
     search = projection.search
-    reports = scribe2_reports(path) if psms and search is not None else None
-    if reports is not None and engine_of(
-        projection.library.metadata_extras.get("x.encyclopedia.metadata", {})
-    ) == SCRIBETWO_ENGINE:
-        search = replace(
-            search,
-            psms=read_scribe2_psms(
-                reports, acquisitions=search.acquisitions, vocab=enabled_modifications
-            ),
-        )
+    metadata = projection.library.metadata_extras.get("x.encyclopedia.metadata", {})
+    engine = engine_of(metadata)
+    vocab = enabled_modifications
+    tables: dict[str, pa.Table] = {}
+    if search is not None and engine == SCRIBETWO_ENGINE:
+        reports = scribe2_reports(path)
+        if reports is not None and psms:
+            search = replace(
+                search, psms=read_scribe2_psms(reports, acquisitions=search.acquisitions, vocab=vocab)
+            )
+        if reports is not None and sidecars:
+            stem = reports.name
+            run = _single_run(metadata, search.acquisitions)
+            units = (_unit(metadata, "-ptolunits"), _unit(metadata, "-ftolunits"))
+            tables["rt_alignment"], tables["mass_calibration"] = read_scribe2_fits(
+                reports, acquisition_id=run, units=units, vocab=vocab
+            )
+            scores = [reports / f"{stem}.txt", reports / f"{stem}.decoy.txt"]
+            features = reports / f"{stem}.features.txt"
+            search = _with_scores(search, [p for p in scores if p.is_file()], engine, vocab)
+            if features.is_file():
+                tables["percolator_feature"] = read_features(
+                    features, acquisitions=search.acquisitions, engine=engine, vocab=vocab
+                )
+    elif search is not None and sidecars:
+        files = peptide_centric_sidecars(path)
+        run = _single_run(metadata, search.acquisitions)
+        if any(k.startswith("rt_fit:") for k in files):
+            tables["rt_alignment"] = read_rt_fits(files, acquisition_id=run, engine=engine, vocab=vocab)
+        if any(k.startswith("ms") for k in files):
+            tables["mass_calibration"] = read_mass_fits(files, acquisition_id=run, engine=engine)
+        scores = [files[k] for k in ("scores", "decoy_scores") if k in files]
+        search = _with_scores(search, scores, engine, vocab)
+        if "features" in files:
+            tables["percolator_feature"] = read_features(
+                files["features"], acquisitions=search.acquisitions, engine=engine, vocab=vocab
+            )
     return EncyclopediaReadResult(
         library=projection.library,
         quant=projection.quant,
         search=search,
         caveats=projection.caveats,
+        sidecars={k: v for k, v in tables.items() if v.num_rows},
     )
+
+
+def _single_run(metadata: dict[str, str], acquisitions: Acquisitions) -> int | None:
+    """The acquisition of a single-run result (its ``sourcefile``), or
+    ``None`` for a result across runs (``a.raw|b.raw``)."""
+    source = str(metadata.get("sourcefile") or "")
+    if not source or "|" in source:
+        return None
+    try:
+        return acquisitions.id_for_source(source)
+    except KeyError:
+        return None
+
+
+def _unit(metadata: dict[str, str], flag: str) -> str:
+    return "ppm" if str(metadata.get(flag, "PPM")).strip().upper() == "PPM" else "Da"
+
+
+def _with_scores(search: Search, paths: list[Path], engine: str, vocab: ModVocab) -> Search:
+    """``search`` with its precursor scores made complete from the
+    Percolator-layout scores in ``paths``: every precursor scored, the
+    result library's own rows keeping their precursor ids (they agree on
+    the values: the scores, q-values and PEPs of the precursors within
+    the threshold are the same in both)."""
+    if not paths:
+        return search
+    complete = read_scored_precursors(paths, acquisitions=search.acquisitions, engine=engine, vocab=vocab)
+    keys = ["modified_sequence", "charge", "acquisition_id", "is_decoy"]
+    known = search.precursor_scores.select([*keys, "precursor_id"]).rename_columns([*keys, "_known"])
+    joined = complete.join(known, keys=keys, join_type="left outer")
+    joined = joined.set_column(
+        joined.schema.get_field_index("precursor_id"), "precursor_id", joined.column("_known")
+    ).drop_columns(["_known"])
+    # Rows of the result library the sidecar does not have (none, in the
+    # files measured) are kept as they are.
+    rest = search.precursor_scores.join(complete.select(keys), keys=keys, join_type="left anti")
+    return replace(search, precursor_scores=pa.concat_tables([joined.select(rest.column_names), rest]))
 
 
 __all__ = ["EncyclopediaReadResult", "read_encyclopedia"]

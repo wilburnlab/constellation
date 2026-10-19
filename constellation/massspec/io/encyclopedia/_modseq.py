@@ -365,13 +365,17 @@ def format_encyclopedia_modseq(
     peptidoform: Peptidoform,
     *,
     vocab: ModVocab = UNIMOD,
+    terminal_first: bool = False,
 ) -> str:
     """Inverse of ``parse_encyclopedia_modseq`` — emit ``X[+N.NNN]`` notation.
 
-    Lossy: terminal mods (``[Mod]-X...``) collapse onto residue 0 as
-    ``X[+mass]...`` because EncyclopeDIA cannot distinguish terminal
-    placement from side-chain placement on the same residue. This is
-    documented on ``EncyclopediaWriter.lossy = True``.
+    An N-terminal modification (``[Mod]-X...``) is written on residue 0,
+    ``X[+mass]...``, the way 6.9.23 writes ``peptidequants``; with
+    ``terminal_first`` it is written before the first residue,
+    ``[+mass]X...``, the way the same jar writes ``entries`` and
+    ``peptidescores`` (measured on its results). Either way the mass is
+    the same, and ``parse_encyclopedia_modseq`` reads both back as the
+    same peptide.
 
     Rejects ProForma features that have no EncyclopeDIA equivalent —
     formula-only mods, glycans, branches, cross-links, multi-chain
@@ -402,21 +406,27 @@ def format_encyclopedia_modseq(
     if not seq:
         return ""
 
-    # Collect deltas per position. N-term mods fold onto residue 0.
+    def bracket(delta: float) -> str:
+        return f"[{'+' if delta >= 0 else '-'}{abs(delta):.7f}]"
+
+    # Collect deltas per position. N-term mods fold onto residue 0
+    # unless they are written ahead of it.
     pos_deltas: dict[int, list[float]] = {}
+    lead = ""
     for tm in peptidoform.n_term_mods:
-        pos_deltas.setdefault(0, []).append(_modref_delta(tm.mod, vocab))
+        if terminal_first:
+            lead += bracket(_modref_delta(tm.mod, vocab))
+        else:
+            pos_deltas.setdefault(0, []).append(_modref_delta(tm.mod, vocab))
     for pos, mods in peptidoform.residue_mods.items():
         for tm in mods:
             pos_deltas.setdefault(pos, []).append(_modref_delta(tm.mod, vocab))
 
-    parts: list[str] = []
+    parts: list[str] = [lead]
     for i, residue in enumerate(seq):
         parts.append(residue)
-        if i in pos_deltas:
-            for delta in pos_deltas[i]:
-                sign = "+" if delta >= 0 else "-"
-                parts.append(f"[{sign}{abs(delta):.7f}]")
+        for delta in pos_deltas.get(i, ()):
+            parts.append(bracket(delta))
     return "".join(parts)
 
 
@@ -468,8 +478,48 @@ def _modref_delta(modref: ModRef | None, vocab: ModVocab) -> float:
     )
 
 
+# The ProForma the readers emit for almost every peptide: uppercase
+# residues, an optional N-terminal accession, at most one accession per
+# residue. The full ProForma parser costs about 10 ms a string, which for a
+# library of 76,000 precursors is most of an hour, so this form is turned
+# into EncyclopeDIA's spelling directly (the same shortcut
+# ``library.ids`` takes for content keys).
+_RE_SIMPLE_PROFORMA = re.compile(r"(?:\[UNIMOD:(\d+)\]-)?((?:[A-Z](?:\[UNIMOD:\d+\])?)+)")
+_RE_RESIDUE = re.compile(r"([A-Z])(?:\[UNIMOD:(\d+)\])?")
+
+
+def proforma_to_encyclopedia(
+    proforma: str, *, terminal_first: bool = False, vocab: ModVocab = UNIMOD
+) -> tuple[str, str]:
+    """``(EncyclopeDIA modseq, plain sequence)`` of a ProForma string, as
+    :func:`format_encyclopedia_modseq` spells it, without the full parser
+    for the simple form the readers emit (anything else is parsed)."""
+    from constellation.core.sequence.proforma import parse_proforma
+
+    match = _RE_SIMPLE_PROFORMA.fullmatch(proforma)
+    if match is None:
+        form = parse_proforma(proforma)
+        return format_encyclopedia_modseq(form, vocab=vocab, terminal_first=terminal_first), form.sequence
+
+    def bracket(accession: str) -> str:
+        delta = vocab.get(f"UNIMOD:{accession}").delta_composition.mass
+        return f"[{'+' if delta >= 0 else '-'}{abs(delta):.7f}]"
+
+    n_term, body = match.group(1), match.group(2)
+    residues = _RE_RESIDUE.findall(body)
+    parts: list[str] = [bracket(n_term) if n_term and terminal_first else ""]
+    for i, (residue, accession) in enumerate(residues):
+        parts.append(residue)
+        if i == 0 and n_term and not terminal_first:
+            parts.append(bracket(n_term))
+        if accession:
+            parts.append(bracket(accession))
+    return "".join(parts), "".join(r for r, _ in residues)
+
+
 __all__ = [
     "encyclopedia_residue_form",
     "parse_encyclopedia_modseq",
     "format_encyclopedia_modseq",
+    "proforma_to_encyclopedia",
 ]

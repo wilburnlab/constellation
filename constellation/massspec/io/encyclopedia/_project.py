@@ -28,13 +28,17 @@ Quantity
     precursor the jar identified but could not quantify has quantity 0
     and 0 quant ions, and stays that way. Only a file with no
     ``peptidequants`` at all falls back to the sum of the stored
-    spectrum, and says so.
+    spectrum, and says so. Each quantity row's arrays become rows of their
+    own, under the same precursor and run: the ions it was summed from
+    (``fragment_quant``: m/z, intensity, correlation) and its median
+    chromatogram (``precursor_chromatogram``: retention time, intensity).
 
 Fragments
-    One row per stored peak, no more and no fewer. A peak within
-    tolerance of a b or y ion (fragment charge up to the precursor's) is
-    annotated as that ion: the nearest one, and on a tie the lower
-    charge. A peak that is the intact precursor, with or without a water
+    One row per stored peak, no more and no fewer, at the m/z the file
+    stores (so a library written back out is the library read in; phase
+    7). A peak within tolerance of a b or y ion (fragment charge up to the
+    precursor's) is annotated as that ion: the nearest one, and on a tie
+    the lower charge. A peak that is the intact precursor, with or without a water
     or ammonia loss, at any charge up to the precursor's, is kept with an
     mzPAF precursor annotation (``p``, ``p-H2O^2``, ...) and null ion
     columns. Anything else is kept with null ion columns and no
@@ -86,7 +90,9 @@ from constellation.massspec.library.schemas import (
 from constellation.massspec.peptide.ions import IonType, fragment_ladder_indices_batch
 from constellation.massspec.quant.quant import Quant
 from constellation.massspec.quant.schemas import (
+    FRAGMENT_QUANT,
     PEPTIDE_QUANT,
+    PRECURSOR_CHROMATOGRAM,
     PRECURSOR_QUANT,
     PROTEIN_QUANT,
     TRANSMISSION_PEPTIDE_PRECURSOR,
@@ -331,9 +337,11 @@ def _fragment_tables(
     ``matched_only`` keeps only the peaks that are ions of the peptide,
     one per ion, and adds the number of peaks left out to ``dropped[0]``.
     """
+    declared = {name for name, _ in _mirror._declared(con, "entries")}
+    extras = [c for c in ("CorrelationArray", "QuantifiedIonsArray") if c in declared]
     row = 0
     for batch in _mirror.iter_table(
-        con, "entries", columns=["MassArray", "IntensityArray"], batch_rows=_FRAGMENT_BATCH
+        con, "entries", columns=["MassArray", "IntensityArray", *extras], batch_rows=_FRAGMENT_BATCH
     ):
         rows = np.arange(row, row + batch.num_rows)
         row += batch.num_rows
@@ -353,6 +361,8 @@ def _fragment_tables(
         obs_mz = masses.flatten().to_numpy(zero_copy_only=False).astype(np.float64)
         obs_intensity = intensities.flatten().to_numpy(zero_copy_only=False).astype(np.float64)
         obs_owner = np.repeat(np.arange(len(rows), dtype=np.int64), sizes)
+        correlation = _per_peak(batch, "CorrelationArray", local, sizes, np.float64)
+        quantified = _per_peak(batch, "QuantifiedIonsArray", local, sizes, np.bool_)
 
         charges = precursor_charge[rows]
         wanted = [(modseq_of_row[r], int(z)) for r, z in zip(rows, charges, strict=True)]
@@ -372,7 +382,8 @@ def _fragment_tables(
                 dropped[0] += int(len(keep_peak) - keep_peak.sum())
             index = np.flatnonzero(keep_peak)
             ion_type, position, charge = ion_type[index], position[index], charge[index]
-            recorded_mz, obs_intensity = recorded_mz[index], obs_intensity[index]
+            obs_mz, obs_intensity = obs_mz[index], obs_intensity[index]
+            correlation, quantified = correlation.take(pa.array(index)), quantified.take(pa.array(index))
             owner_precursor = owner_precursor[index]
             annotation = [annotation[i] for i in index]
         unassigned = ion_type < 0
@@ -382,13 +393,42 @@ def _fragment_tables(
                 "ion_type": pa.array(ion_type, type=pa.int8(), mask=unassigned),
                 "position": pa.array(position, type=pa.int32(), mask=unassigned),
                 "charge": pa.array(charge, type=pa.int32(), mask=unassigned),
-                "loss_id": pa.nulls(len(recorded_mz), type=pa.string()),
-                "mz_theoretical": pa.array(recorded_mz, type=pa.float64()),
+                "loss_id": pa.nulls(len(obs_mz), type=pa.string()),
+                # The file's own m/z: the library's value, or for a
+                # ScribeTwo result the observed peak. The annotation says
+                # which ion it is.
+                "mz_theoretical": pa.array(obs_mz, type=pa.float64()),
                 "intensity_predicted": pa.array(obs_intensity, type=pa.float64()),
                 "annotation": pa.array(annotation, type=pa.string()),
+                "correlation": correlation,
+                "quantified": quantified,
             },
             schema=LIBRARY_FRAGMENT_TABLE,
         )
+
+
+def _per_peak(
+    batch: pa.RecordBatch, column: str, rows: np.ndarray, sizes: np.ndarray, dtype: Any
+) -> pa.Array:
+    """A per-peak array column of the entries ``rows`` (positions in the
+    batch), aligned with their stored peaks: null for an entry that has
+    none, or whose array does not have one value per peak."""
+    arrow_type = pa.float64() if dtype is np.float64 else pa.bool_()
+    total = int(sizes.sum())
+    if column not in batch.schema.names:
+        return pa.nulls(total, type=arrow_type)
+    values = batch.column(column).take(pa.array(rows))
+    lengths = pc.list_value_length(values).fill_null(-1).to_numpy(zero_copy_only=False)
+    if np.array_equal(lengths, sizes):
+        flat = values.flatten().to_numpy(zero_copy_only=False)
+        return pa.array(flat.astype(dtype), type=arrow_type)
+    parts = []
+    for value, length, size in zip(values, lengths, sizes, strict=True):
+        if length == size:
+            parts.append(pa.array(np.asarray(value.as_py()).astype(dtype), type=arrow_type))
+        else:
+            parts.append(pa.nulls(int(size), type=arrow_type))
+    return pa.concat_arrays(parts) if parts else pa.nulls(0, type=arrow_type)
 
 
 def _one_peak_per_ion(
@@ -743,6 +783,10 @@ def _project_quant(
         extra: dict[tuple[int, int], tuple[float, float, float, float, int]] = {}
         seen = np.zeros(n, dtype=bool)
         unmatched = ambiguous = repeated = 0
+        # Which precursor and run each quantity row was given to (-1: none),
+        # for the rows of its arrays.
+        row_precursor = np.full(quants.num_rows, -1, dtype=np.int64)
+        row_acquisition = np.full(quants.num_rows, -1, dtype=np.int64)
         rows = zip(
             quants.column("PeptideModSeq").to_pylist(),
             quants.column("PrecursorCharge").to_pylist(),
@@ -755,7 +799,7 @@ def _project_quant(
             strict=True,
         )
         spelled: dict[str, str] = {}
-        for modseq, charge, source, total, center, start, stop, ions in rows:
+        for r, (modseq, charge, source, total, center, start, stop, ions) in enumerate(rows):
             form = spelled.get(modseq)
             if form is None:
                 form = spelled[modseq] = encyclopedia_residue_form(modseq)
@@ -769,6 +813,7 @@ def _project_quant(
                     repeated += 1
                     continue
                 seen[i] = True
+                row_precursor[r], row_acquisition[r] = candidates[0], acquisition_of[source]
                 intensity[i] = float(total)
                 rt_start[i] = np.nan if start is None else float(start)
                 rt_end[i] = np.nan if stop is None else float(stop)
@@ -785,6 +830,7 @@ def _project_quant(
             if key in extra:
                 repeated += 1
                 continue
+            row_precursor[r], row_acquisition[r] = key
             extra[key] = (
                 float(total),
                 np.nan if center is None else float(center),
@@ -879,6 +925,10 @@ def _project_quant(
         )
     else:
         peptide_quant = PEPTIDE_QUANT.empty_table()
+    if quants is not None:
+        chromatogram, fragment_quant = _quant_arrays(con, row_precursor, row_acquisition)
+    else:
+        chromatogram, fragment_quant = PRECURSOR_CHROMATOGRAM.empty_table(), FRAGMENT_QUANT.empty_table()
     return Quant(
         acquisitions=acquisitions,
         protein_quant=PROTEIN_QUANT.empty_table(),
@@ -886,6 +936,82 @@ def _project_quant(
         precursor_quant=precursor_quant,
         transmission_protein_peptide=TRANSMISSION_PROTEIN_PEPTIDE.empty_table(),
         transmission_peptide_precursor=TRANSMISSION_PEPTIDE_PRECURSOR.empty_table(),
+        precursor_chromatogram=chromatogram,
+        fragment_quant=fragment_quant,
+    )
+
+
+def _flat(batch: pa.RecordBatch, column: str, wanted: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``(values, sizes)`` of a list column, over the rows ``wanted``
+    (a boolean mask); a null list counts as empty."""
+    values = batch.column(column)
+    sizes = pc.list_value_length(values).fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
+    flat = values.flatten().to_numpy(zero_copy_only=False).astype(np.float64)
+    keep_values = np.repeat(wanted, sizes)
+    return flat[keep_values], sizes[wanted]
+
+
+def _quant_arrays(
+    con: Any, row_precursor: np.ndarray, row_acquisition: np.ndarray
+) -> tuple[pa.Table, pa.Table]:
+    """The quantity rows' arrays as long tables: the ions each precursor's
+    intensity was summed from, and its median chromatogram."""
+    declared = {name for name, _ in _mirror._declared(con, "peptidequants")}
+    columns = [c for c in ("QuantIonMassArray", "QuantIonIntensityArray", "QuantIonCorrelationArray",
+                           "MedianChromatogramArray", "MedianChromatogramRTArray") if c in declared]  # fmt: skip
+    chromatograms: list[pa.Table] = []
+    ions: list[pa.Table] = []
+    row = 0
+    for batch in _mirror.iter_table(con, "peptidequants", columns=columns):
+        owner = row_precursor[row : row + batch.num_rows]
+        run = row_acquisition[row : row + batch.num_rows]
+        row += batch.num_rows
+        wanted = owner >= 0
+        if not wanted.any():
+            continue
+        if "QuantIonMassArray" in columns and "QuantIonIntensityArray" in columns:
+            mz, sizes = _flat(batch, "QuantIonMassArray", wanted)
+            intensity, intensity_sizes = _flat(batch, "QuantIonIntensityArray", wanted)
+            if not np.array_equal(sizes, intensity_sizes):
+                raise _mirror.MirrorError("a quantity row's ion masses and intensities differ in length")
+            if "QuantIonCorrelationArray" in columns:
+                correlation, correlation_sizes = _flat(batch, "QuantIonCorrelationArray", wanted)
+                if not np.array_equal(sizes, correlation_sizes):
+                    raise _mirror.MirrorError("a quantity row's ion masses and correlations differ in length")
+                correlation_array = pa.array(correlation, type=pa.float64())
+            else:
+                correlation_array = pa.nulls(len(mz), type=pa.float64())
+            ions.append(
+                pa.table(
+                    {
+                        "precursor_id": pa.array(np.repeat(owner[wanted], sizes), type=pa.int64()),
+                        "acquisition_id": pa.array(np.repeat(run[wanted], sizes), type=pa.int64()),
+                        "mz": pa.array(mz, type=pa.float64()),
+                        "intensity": pa.array(intensity, type=pa.float64()),
+                        "correlation": correlation_array,
+                    },
+                    schema=FRAGMENT_QUANT,
+                )
+            )
+        if "MedianChromatogramArray" in columns and "MedianChromatogramRTArray" in columns:
+            intensity, sizes = _flat(batch, "MedianChromatogramArray", wanted)
+            rts, rt_sizes = _flat(batch, "MedianChromatogramRTArray", wanted)
+            if not np.array_equal(sizes, rt_sizes):
+                raise _mirror.MirrorError("a quantity row's chromatogram and its times differ in length")
+            chromatograms.append(
+                pa.table(
+                    {
+                        "precursor_id": pa.array(np.repeat(owner[wanted], sizes), type=pa.int64()),
+                        "acquisition_id": pa.array(np.repeat(run[wanted], sizes), type=pa.int64()),
+                        "rt": pa.array(rts, type=pa.float64()),
+                        "intensity": pa.array(intensity, type=pa.float64()),
+                    },
+                    schema=PRECURSOR_CHROMATOGRAM,
+                )
+            )
+    return (
+        pa.concat_tables(chromatograms) if chromatograms else PRECURSOR_CHROMATOGRAM.empty_table(),
+        pa.concat_tables(ions) if ions else FRAGMENT_QUANT.empty_table(),
     )
 
 
@@ -1008,25 +1134,33 @@ def _project_search(
                 strict=True,
             )
         )
-        best_protein: dict[tuple[int, int], float] = {}
-        for accession, source, qvalue, is_decoy in zip(
+        # The protein's best q-value in each run, with that row's
+        # MinimumPeptidePEP as its score (the jar's protein-level number).
+        best_protein: dict[tuple[int, int], tuple[float, float | None]] = {}
+        minimum_pep = (
+            protein_scores.column("MinimumPeptidePEP").to_pylist()
+            if "MinimumPeptidePEP" in protein_scores.column_names
+            else [None] * protein_scores.num_rows
+        )
+        for accession, source, qvalue, is_decoy, score in zip(
             protein_scores.column("ProteinAccession").to_pylist(),
             protein_scores.column("SourceFile").to_pylist(),
             protein_scores.column("QValue").to_pylist(),
             protein_scores.column("IsDecoy").to_pylist(),
+            minimum_pep,
             strict=True,
         ):
             if (is_decoy and not include_decoys) or accession not in protein_id_of:
                 continue
             key = (protein_id_of[accession], acquisition_of[source])
-            if key not in best_protein or qvalue < best_protein[key]:
-                best_protein[key] = float(qvalue)
+            if key not in best_protein or qvalue < best_protein[key][0]:
+                best_protein[key] = (float(qvalue), None if score is None else float(score))
         protein_score_table = pa.table(
             {
                 "protein_id": pa.array([k[0] for k in best_protein], type=pa.int64()),
                 "acquisition_id": pa.array([k[1] for k in best_protein], type=pa.int64()),
-                "score": pa.nulls(len(best_protein), type=pa.float64()),
-                "qvalue": pa.array(list(best_protein.values()), type=pa.float64()),
+                "score": pa.array([v[1] for v in best_protein.values()], type=pa.float64()),
+                "qvalue": pa.array([v[0] for v in best_protein.values()], type=pa.float64()),
                 "engine": pa.array([engine] * len(best_protein), type=pa.string()),
             },
             schema=PROTEIN_SCORE_TABLE,

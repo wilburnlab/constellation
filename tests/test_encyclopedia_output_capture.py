@@ -58,31 +58,18 @@ def test_result_library_capture_is_container_0_1_18(captured_library) -> None:
     assert len(_indexes(captured_library)) == 22
 
 
-def test_writer_schema_differs_from_the_capture_only_in_known_ways(captured_library) -> None:
-    """Constellation still writes the 0.1.15 layout. Everything it writes
-    exists in 0.1.18 in the same column order; what 0.1.18 adds is listed
-    here, and is what the writer has to grow to match (plan phase 7)."""
+def test_writer_schema_is_the_captures(captured_library) -> None:
+    """The result-library writer creates exactly what the pinned jar
+    does: the tables, their column order and the 22 indexes of container
+    0.1.18 (it reads them from the capture, phase 7)."""
     ours = sqlite3.connect(":memory:")
     for _name, ddl in _schema.LIBRARY_TABLES:
         ours.execute(ddl)
     for statement in _schema.LIBRARY_INDEXES:
         ours.execute(statement)
-    theirs, mine = _columns(captured_library), _columns(ours)
-
-    assert set(theirs) - set(mine) == {"decoyentries"}
-    assert set(mine) <= set(theirs)
-    added = {}
-    for table, columns in mine.items():
-        assert [c for c in theirs[table] if c in columns] == columns, table
-        extra = [c for c in theirs[table] if c not in columns]
-        if extra:
-            added[table] = extra
-    assert added == {
-        "entries": ["IonMobility"],
-        "peptidequants": ["QuantIonCorrelationLength", "QuantIonCorrelationArray"],
-    }
-    assert _indexes(ours) <= _indexes(captured_library)
-    assert len(_indexes(captured_library) - _indexes(ours)) == 16
+    assert _columns(ours) == _columns(captured_library)
+    assert _indexes(ours) == _indexes(captured_library)
+    assert _schema.LIBRARY_CONTAINER_VERSION == "0.1.18"
 
 
 def test_spectra_file_writer_matches_the_capture_exactly() -> None:

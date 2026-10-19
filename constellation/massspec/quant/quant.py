@@ -34,7 +34,9 @@ from constellation.massspec.acquisitions import (
 )
 from constellation.massspec.library.library import Library
 from constellation.massspec.quant.schemas import (
+    FRAGMENT_QUANT,
     PEPTIDE_QUANT,
+    PRECURSOR_CHROMATOGRAM,
     PRECURSOR_QUANT,
     PROTEIN_QUANT,
     TRANSMISSION_PEPTIDE_PRECURSOR,
@@ -55,6 +57,11 @@ class Quant:
     transmission_protein_peptide: pa.Table
     transmission_peptide_precursor: pa.Table
     metadata_extras: dict[str, Any] = field(default_factory=dict)
+    # Appended last, with empty defaults, so the positional signature is
+    # unchanged: per-acquisition chromatograms and the fragment ions a
+    # precursor's intensity was summed from.
+    precursor_chromatogram: pa.Table = field(default_factory=PRECURSOR_CHROMATOGRAM.empty_table)
+    fragment_quant: pa.Table = field(default_factory=FRAGMENT_QUANT.empty_table)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -87,6 +94,12 @@ class Quant:
                 TRANSMISSION_PEPTIDE_PRECURSOR,
             ),
         )
+        object.__setattr__(
+            self,
+            "precursor_chromatogram",
+            cast_to_schema(self.precursor_chromatogram, PRECURSOR_CHROMATOGRAM),
+        )
+        object.__setattr__(self, "fragment_quant", cast_to_schema(self.fragment_quant, FRAGMENT_QUANT))
         self.validate()
 
     # ── empty constructor ───────────────────────────────────────────
@@ -121,6 +134,9 @@ class Quant:
             validate_acquisitions(table, self.acquisitions, nullable=True)
             _check_no_transmission_duplicates(table, name)
             _check_efficiency_bounds(table, name)
+
+        for table in (self.precursor_chromatogram, self.fragment_quant):
+            validate_acquisitions(table, self.acquisitions, nullable=False)
 
     # ── cross-validation against a Library ──────────────────────────
     def validate_against(self, library: Library) -> None:

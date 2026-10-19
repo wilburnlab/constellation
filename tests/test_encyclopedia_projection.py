@@ -364,3 +364,32 @@ def test_the_engine_is_read_from_the_result() -> None:
     assert engine_of({"run.raw search type": "ScribeTwoDDA"}) == "scribetwo"
     assert engine_of({"run.raw search type": "EncyclopeDIA"}) == "encyclopedia"
     assert engine_of({}) == "encyclopedia"
+
+
+# ── chromatograms and quantified ions (phase 7) ────────────────────────
+
+
+def test_a_quantity_rows_arrays_become_rows_of_their_own(tmp_path: Path) -> None:
+    from _encyclopedia_fixtures import Entry, build_result_library
+
+    ions = [(300.1, 100.0, 0.99), (400.2, 50.0, 0.95), (500.3, 25.0, 0.5)]
+    chromatogram = [(590.0, 0.0), (600.0, 10.0), (610.0, 2.0)]
+    path = build_result_library(
+        tmp_path / "r.elib",
+        [Entry(modseq="PEPTIDEK", sequence="PEPTIDEK", charge=2, precursor_mz=465.2,
+               mz=[300.1, 400.2], intensity=[1.0, 2.0], total_intensity=175.0,
+               quant_ions=ions, chromatogram=chromatogram)],  # fmt: skip
+    )
+    quant = read_encyclopedia(path, annotate_fragments=False).quant
+    fq = quant.fragment_quant.to_pylist()
+    assert [(r["mz"], r["intensity"], round(r["correlation"], 2)) for r in fq] == [
+        (300.1, 100.0, 0.99), (400.2, 50.0, 0.95), (500.3, 25.0, 0.5),
+    ]  # fmt: skip
+    (precursor,) = quant.precursor_quant.to_pylist()
+    assert sum(r["intensity"] for r in fq) == precursor["intensity"]
+    assert {r["precursor_id"] for r in fq} == {precursor["precursor_id"]}
+    points = quant.precursor_chromatogram.to_pylist()
+    assert [(r["rt"], r["intensity"]) for r in points] == chromatogram
+    assert {(r["precursor_id"], r["acquisition_id"]) for r in points} == {
+        (precursor["precursor_id"], precursor["acquisition_id"])
+    }

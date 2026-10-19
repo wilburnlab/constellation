@@ -34,7 +34,7 @@ from constellation.massspec.manifest import ExperimentManifest, SearchManifest
 from constellation.massspec.peptide.ions import fragment_ladder
 from constellation.massspec.peptide.mz import precursor_mz
 from constellation.massspec.quant.targets import load_targets, targets_from_experiment
-from constellation.massspec.search.encyclopedia.outputs import expected_names
+from constellation.massspec.search.encyclopedia.outputs import expected_names, output_inventory
 from constellation.massspec.search.encyclopedia.params import SearchParameters, Tolerance
 from constellation.massspec.search.encyclopedia.runner import UnknownFlagError
 from constellation.massspec.workflows import encyclopedia as workflow
@@ -193,6 +193,32 @@ def _scribe2_reports(given: Path, entries, source: str) -> None:
     (reports / f"{stem}.decoy.txt").write_text("\n".join(decoys) + "\n")
 
 
+def _percolator_sidecars(given: Path, entries, source: str, columns: dict) -> None:
+    """A peptide-centric search's text files, as the jar lays them out:
+    Percolator's output with every entry within the threshold, one more
+    target beyond it and a decoy; its features; the final retention-time
+    fit. (The other files keep the bare header the stand-in writes.)"""
+    stem = f"{given.parent / given.name}"
+    targets = [(e.modseq, e.charge, 0.001 * (k + 1)) for k, e in enumerate(entries)] + [("ELVISK", 2, 0.4)]
+    lines = ["\t".join(columns["<input>.encyclopedia.txt"])]
+    lines += [f"{source}:{600 + k}.0:{m}+{z}\t{1.5 - k}\t{q}\t{q / 2}\t-.{m}.-\tP1" for k, (m, z, q) in enumerate(targets)]
+    Path(f"{stem}.encyclopedia.txt").write_text("\n".join(lines) + "\npi_0=0.5\n")
+    Path(f"{stem}.encyclopedia.decoy.txt").write_text(
+        "\t".join(columns["<input>.encyclopedia.decoy.txt"])
+        + f"\n{source}:650.0:decoyKEDITPEP+2\t-1.0\t0.5\t0.5\t-.KEDITPEP.-\tDECOY_1\n"
+    )
+    header = columns["<input>.features.txt"]
+    rows = []
+    for k, (m, z, _q) in enumerate(targets):
+        values = {"id": f"{source}:{600 + k}.0:{m}+{z}", "Label": "1", "ScanNr": str(k),
+                  "sequence": f"-.{m}.-", "Proteins": "P1"}  # fmt: skip
+        rows.append("\t".join(values.get(c, "0.5") for c in header))
+    Path(f"{stem}.features.txt").write_text("\n".join(["\t".join(header), *rows]) + "\n")
+    fit = ["\t".join(columns["<input>.encyclopedia.txt.final.rt_fit.txt"])]
+    fit += [f"10.0\t{10.0 + k}\t{10.0 + k}\t0.0\ttrue\tfalse\t{e.modseq}" for k, e in enumerate(entries)]
+    Path(f"{stem}.encyclopedia.txt.final.rt_fit.txt").write_text("\n".join(fit) + "\n")
+
+
 def _recorded_settings(program: str, flags: dict) -> dict[str, str]:
     """What the real jar writes into a result's ``metadata``: every
     setting it records, at its documented default unless passed."""
@@ -263,10 +289,13 @@ def jar(monkeypatch):
         with DiaFile(given) as dia:
             recorded = str(dia.metadata.get("sourcename") or f"{given.stem}.raw")
         source = state.source or recorded
+        columns = {f["name"]: f.get("columns") for f in output_inventory(program)["files"]}
         for name, file_name in names.items():
             if name != result_name:
-                (given.parent / file_name).parent.mkdir(parents=True, exist_ok=True)
-                (given.parent / file_name).write_bytes(b"")
+                # As the jar writes them: a table's header even with no rows.
+                path = given.parent / file_name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("\t".join(columns[name]) + "\n" if columns.get(name) else "")
         entries = [_entry(m, z, total, source) for m, z, total in state.peptides]
         settings = {**_recorded_settings(program, flags), **(state.metadata or {})}
         if scribetwo:
@@ -281,6 +310,8 @@ def jar(monkeypatch):
         )
         if scribetwo:
             _scribe2_reports(given, entries, source)
+        else:
+            _percolator_sidecars(given, entries, source, columns)
         return types.SimpleNamespace(
             argv=["java", "-jar", "encyclopedia.jar", *argv],
             elapsed_seconds=1.5,
@@ -341,6 +372,7 @@ def test_a_bundle_is_searched_into_an_experiment(tmp_path: Path, jar, inputs) ->
     assert set(root.tables) == {
         "protein", "peptide", "precursor", "fragment", "protein_peptide",
         "precursor_quant", "peptide_quant", "precursor_score", "peptide_score", "protein_score",
+        "rt_alignment", "percolator_feature",  # from the sidecars (phase 7)
     }  # fmt: skip
     manifest = read_manifest(unit, expect=SearchManifest)
     assert manifest == result.manifest
@@ -378,7 +410,9 @@ def test_a_bundle_is_searched_into_an_experiment(tmp_path: Path, jar, inputs) ->
     assert acquisitions.id_for_source("run_01.dia") == 0  # the file handed to the jar
 
     # ── the tables ──────────────────────────────────────────────────
-    assert result.table_rows["precursor"] == 3 and result.table_rows["precursor_score"] == 4
+    # Every precursor scored: the three identified, a decoy, and one beyond
+    # the FDR threshold that only Percolator's own output has.
+    assert result.table_rows["precursor"] == 3 and result.table_rows["precursor_score"] == 5
     precursors = read_experiment_table(experiment, "precursor")
     peptides = read_experiment_table(experiment, "peptide")
     key = dict(

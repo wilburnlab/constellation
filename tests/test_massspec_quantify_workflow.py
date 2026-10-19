@@ -629,3 +629,29 @@ def test_the_commands(tmp_path, jar, inputs, capsys) -> None:
     assert main(["massspec", "quantify", "--runs", runs[0], "--fractions", *other,
                  "--library", str(inputs["library"]), *common]) == 3  # fmt: skip
     assert "gpf-merged_y" in capsys.readouterr().err
+
+
+
+def test_a_searchs_sidecars_and_quantity_arrays_become_experiment_tables(tmp_path, jar, inputs) -> None:
+    """Phase 7: Percolator's scores make the precursor scores complete
+    (every precursor scored, content-keyed); the calibration fits and the
+    features are tables of their own."""
+    from constellation.massspec.library.ids import precursor_id
+
+    experiment = tmp_path / "experiment"
+    (result,) = search_acquisitions(_bundles(tmp_path, "run_a"), experiment_dir=experiment, **inputs).results
+    scores = read_experiment_table(experiment, "precursor_score", unit=result.unit)
+    beyond = scores.filter(pc.equal(scores.column("modified_sequence"), "ELVISK")).to_pylist()
+    assert len(beyond) == 1 and beyond[0]["qvalue"] == 0.4
+    assert beyond[0]["precursor_id"] == precursor_id("ELVISK", 2)  # in no table of the library
+    precursors = set(read_experiment_table(experiment, "precursor", unit=result.unit).column("precursor_id").to_pylist())
+    within = scores.filter(pc.less_equal(scores.column("qvalue"), 0.01))
+    targets = within.filter(pc.invert(within.column("is_decoy")))
+    assert set(targets.column("precursor_id").to_pylist()) == precursors
+    assert scores.filter(scores.column("is_decoy")).num_rows == 1
+    alignment = read_experiment_table(experiment, "rt_alignment", unit=result.unit)
+    assert alignment.num_rows == len(_PEPTIDES) and set(alignment.column("pass").to_pylist()) == {"final"}
+    assert set(alignment.column("acquisition_id").to_pylist()) == {0}
+    features = read_experiment_table(experiment, "percolator_feature", unit=result.unit)
+    assert features.num_rows == len(_PEPTIDES) + 1 and "primary" in features.column_names
+    assert result.manifest.runtime["table_rows"]["rt_alignment"] == len(_PEPTIDES)

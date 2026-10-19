@@ -15,6 +15,11 @@ transmission efficiencies for the two conversion edges in the DAG.
     TRANSMISSION_PEPTIDE_PRECURSOR calibrated efficiency for the
                                    peptide → precursor conversion;
                                    same nullable convention
+    PRECURSOR_CHROMATOGRAM         a precursor's chromatogram in one
+                                   acquisition, one row per point
+    FRAGMENT_QUANT                 the fragment ions a precursor's
+                                   intensity was summed from, per
+                                   acquisition, one row per ion
 
 ``efficiency`` is bounded ``(0, 1]`` on populated rows; ``-1.0`` is the
 "uncalibrated" sentinel and is excluded from validation.
@@ -74,6 +79,43 @@ PRECURSOR_QUANT: pa.Schema = pa.schema(
         pa.field("n_quant_ions", pa.int32(), nullable=True),
     ],
     metadata={b"schema_name": b"PrecursorQuant"},
+)
+
+
+# The chromatogram a search engine summarised a precursor's elution with,
+# in one acquisition: one row per point, in order of retention time
+# (seconds). EncyclopeDIA's is the median of the precursor's fragment
+# chromatograms over its integration window (``peptidequants.
+# MedianChromatogramArray`` with its ``...RTArray``): about 30 points in a
+# peptide-centric result, 1,000 in a ScribeTwo DDA result (PI, 2026-10-18:
+# long form, like XIC_TRACE_TABLE).
+PRECURSOR_CHROMATOGRAM: pa.Schema = pa.schema(
+    [
+        pa.field("precursor_id", pa.int64(), nullable=False),
+        pa.field("acquisition_id", pa.int64(), nullable=False),
+        pa.field("rt", pa.float64(), nullable=False),
+        pa.field("intensity", pa.float64(), nullable=False),
+    ],
+    metadata={b"schema_name": b"PrecursorChromatogram"},
+)
+
+
+# The fragment ions a precursor's quantity was summed from, in one
+# acquisition: their m/z, the intensity each contributed and how well its
+# chromatogram correlated with the precursor's (null where the source does
+# not say). The intensities of one precursor in one acquisition sum to
+# its PRECURSOR_QUANT.intensity (EncyclopeDIA: ``peptidequants.
+# QuantIon{Mass,Intensity,Correlation}Array``, summing to
+# ``TotalIntensity``).
+FRAGMENT_QUANT: pa.Schema = pa.schema(
+    [
+        pa.field("precursor_id", pa.int64(), nullable=False),
+        pa.field("acquisition_id", pa.int64(), nullable=False),
+        pa.field("mz", pa.float64(), nullable=False),
+        pa.field("intensity", pa.float64(), nullable=False),
+        pa.field("correlation", pa.float64(), nullable=True),
+    ],
+    metadata={b"schema_name": b"FragmentQuant"},
 )
 
 
@@ -220,6 +262,8 @@ register_schema("TransmissionProteinPeptide", TRANSMISSION_PROTEIN_PEPTIDE)
 register_schema("TransmissionPeptidePrecursor", TRANSMISSION_PEPTIDE_PRECURSOR)
 register_schema("XICTarget", XIC_TARGET_TABLE)
 register_schema("XICTrace", XIC_TRACE_TABLE)
+register_schema("PrecursorChromatogram", PRECURSOR_CHROMATOGRAM)
+register_schema("FragmentQuant", FRAGMENT_QUANT)
 
 
 __all__ = [
@@ -230,4 +274,6 @@ __all__ = [
     "TRANSMISSION_PEPTIDE_PRECURSOR",
     "XIC_TARGET_TABLE",
     "XIC_TRACE_TABLE",
+    "PRECURSOR_CHROMATOGRAM",
+    "FRAGMENT_QUANT",
 ]
