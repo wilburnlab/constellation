@@ -431,7 +431,47 @@ Plan approved by the PI on 2026-10-10. Eight PR-sized phases (P0–P7).
     FASTA copy; tolerance notes; PTMs and the cache's place outside the key; the refusals; a DIA
     run searched spectrum-centric with a library; `read_encyclopedia` finding the reports; the
     command; the summary.
-- **P7: not started.**
+- **P7 (the rest of a result, and write fidelity): done, 2026-10-18.** Decisions with the PI that
+  day: chromatograms in long form, one row per point (like `XIC_TRACE_TABLE`); all three kinds of
+  sidecar as tables (the calibration fits, every scored precursor, Percolator's features); the
+  proof by rewriting the GPF chromatogram library as `.elib` and `.dlib` and searching against each.
+  - **First, what real results hold** (survey note, "The rest of a result"): of the tables the plan
+    named, `fragmentquants` and `retentiontimes` are empty in every 6.9.23 result seen, as are
+    `decoyentries` (except in the jar's own predicted library) and `peptidelocalizations`, and no
+    file has ion mobility. The data was in each quantity row's arrays and in the text sidecars.
+  - **Read.** `Quant.fragment_quant` (`FRAGMENT_QUANT`) and `Quant.precursor_chromatogram`
+    (`PRECURSOR_CHROMATOGRAM`, long form) from each `peptidequants` row's arrays: on the wide-window
+    search 305,960 ions (= the result's `NumberOfQuantIons`, each precursor's summing to its
+    quantity) and 920,992 points, in 5.5 s. From the sidecars (`io.encyclopedia._sidecar`, read by
+    `read_encyclopedia` when they are beside the result): `RT_ALIGNMENT` and `MASS_CALIBRATION`
+    from the fits (`first` / `final`; ScribeTwo's `prealign` / `main`), Percolator's features as
+    written, and the precursor scores made complete from Percolator's output (on the wide-window
+    search 76,725 rows against `peptidescores`' 32,213, agreeing exactly where both have a row).
+    The workflow writes them all as experiment tables; a precursor scored beyond the FDR line gets a
+    content-derived id that no precursor table holds.
+  - **Write.** The writer is rewritten at precursor level on the captured 0.1.18 schema (its tables
+    and 22 indexes read from the capture, held to it by a test) and writes what the reader reads:
+    stored spectra with each peak's correlation and quantified flag, the run's retention time, PEP,
+    window and chromatogram, the quantified ions, scores within the threshold the metadata names,
+    each table's own spelling of an N-terminal modification. Read, written and read back, our
+    six-fraction chromatogram library is identical in every table (76,775 precursors, 2.76 million
+    fragments, 4.0 million chromatogram points), written in under a minute.
+  - **Found and fixed on the way:** the reader recorded an annotated peak at its ion's theoretical
+    m/z instead of the stored one (1% of a library's peaks moved by up to 0.025 Da; isobaric ions
+    swapped annotations on a round trip), and now keeps the stored m/z; the writer parsed every
+    peptide with the 10 ms ProForma parser (most of an hour for this library), and now converts the
+    readers' simple form directly; the reader dropped the jar's protein score, and now keeps it.
+  - **The jar reads what Constellation wrote.** The wide-window run searched against the
+    merged chromatogram library as Constellation writes it back, as `.elib` and as `.dlib`, gives
+    the original search's 31,895 precursors and 5,214 proteins, all shared, with identical
+    retention times and quantities (scores within 1.1e-5). It needed each stored peak's
+    correlation, which the jar searches a chromatogram library with: without them, 30,682
+    precursors, only 27,035 of them shared. The library's fragment table now carries each peak's
+    `correlation` and `quantified` flag; the flags changed nothing in the search, and where a
+    library has none the writer sets every one, as the jar does in every file it writes.
+  - **Not carried, because nothing in Constellation holds it:** ion mobility (no data with it
+    yet), the jar's protein groups, and the jar's own spelling of modification masses (2e-7 Da
+    from UNIMOD's).
 - **Naming (PI, 2026-10-11).** No command or flag is named `dia`: DIA is an acquisition method,
   and `.dia` is one tool's file extension. The P1 commands were first built as
   `massspec dia {export,import,diff}` and renamed to the `massspec encyclopedia …-spectra` group

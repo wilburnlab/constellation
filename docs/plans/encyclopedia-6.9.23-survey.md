@@ -404,7 +404,7 @@ The five points above, in the new reader: (1) `precursor_quant.intensity` is `To
 is a fragment row: b/y at any charge up to the precursor's (the nearer ion, the lower charge on
 a tie), the intact precursor as an mzPAF `p` ion, anything else kept unannotated. (4)
 Integration boundaries and decoy score rows are carried; chromatograms, correlations and the
-quantified-ion flags are reachable through the mirror and get their own tables in phase 7. (5)
+quantified-ion flags are reachable through the mirror; the chromatograms and quantified ions got tables of their own in phase 7 ("The rest of a result" below). (5)
 See the table.
 
 **A ScribeTwo DDA result stores whole observed spectra, not matched ions.** The reference DDA
@@ -463,6 +463,61 @@ result: 76,775 against 76,448 precursors at 1% FDR, 75,929 shared (Jaccard 0.982
 retention times and quantities on every shared one. The wide-window search (76,399 PSMs, no
 subsample) matched its GUI reference exactly. A search with more PSMs than the training-set size
 is reproducible only with that size raised above its PSM count.
+
+### The rest of a result, and writing one back (phase 7, 2026-10-18)
+
+**What 6.9.23 results hold beyond what phase 4 read.** Surveyed on six real results (a
+peptide-centric search, the merged chromatogram library, one- and two-run quantitative reports,
+ScribeTwo DDA and DIA): `fragmentquants`, `retentiontimes`, `decoyentries` and
+`peptidelocalizations` are empty in every one, and `IonMobility` is null (a Stellar has none).
+What carries data is in `peptidequants`, per precursor per run: the ions its quantity was summed
+from (`QuantIonMassArray` / `IntensityArray` / `CorrelationArray`; the intensities sum to
+`TotalIntensity`) and its median chromatogram (`MedianChromatogramArray` with its
+`...RTArray`, in seconds; the same as the entry's). About 30 points per chromatogram in a
+peptide-centric result, 1,000 in a ScribeTwo DDA result (24 million for one run). The jar's own
+predicted library is the one file with `decoyentries` filled (2,499,911, one per entry), and it
+writes `Score` 0 and `SourceFile` `JChronologer` in its entries.
+
+**The sidecars.** Percolator's output (`.encyclopedia.txt` / `.decoy.txt`) has every precursor
+scored, one row each: on the wide-window search 58,817 targets and 17,907 decoys, where
+`peptidescores` keeps the 31,895 targets and 318 decoys within 1%, and on those the q-values and
+PEPs agree exactly; it also gives the SVM score, which `peptidescores` does not. `peptidescores` is
+exactly the rows with q ≤ the threshold, decoys included. The calibration fits (`rt_fit`,
+`ms1_fit`, `ms2_fit`, after the first and the final pass) are per identified peptide, in minutes,
+the peptide as its modseq without a charge (one precursor per peptide in a peptide-centric
+result); the MS fits name their unit in the header and write `?` for peptide and decoy.
+ScribeTwo's `.prealign.txt` / `.main.txt` hold the same per identification with its charge, and
+leave a measurement's fields empty where there is none.
+
+**Writing a library back.** The writer now writes the 0.1.18 container the jar does (the captured
+schema, verbatim). Read, written and read back, the merged chromatogram library (76,775
+precursors, 2,760,581 fragments, 4,024,633 chromatogram points, 773,211 quantified ions) is
+identical in every table, in 54 s of writing; that needed the reader to keep each peak's stored
+m/z (it used to record the matched ion's theoretical m/z, which moved 1% of the library's peaks by
+more than 2e-5 Da and some by 0.025 Da, and made isobaric ions swap annotations on the way back).
+What cannot be carried: ion mobility, the jar's protein groups, and
+its spelling of modification masses (`C[+57.0214635]` from the jar's constants against
+`C[+57.0214637]` from UNIMOD's composition, 2e-7 Da). The ProForma parser takes 10 ms a string,
+which made the old writer take most of an hour on this library; the readers' simple form is now
+converted directly.
+
+**The jar searches what Constellation wrote.** The wide-window run, searched through
+`massspec search` at the original search's settings against the merged chromatogram library as
+Constellation writes it back, once as `.elib` and once as `.dlib`, gives the original search's
+31,895 precursors and 5,214 proteins, every one shared, with identical retention times and
+quantities and scores within 1.1e-5. The first attempt did not: written without each stored
+peak's correlation (`entries.CorrelationArray`), the library gave 30,682 precursors, only 27,035
+of them among the original's, with 94% of the shared quantities within 1%. Patching the
+original's per-peak arrays into that file by row gave the original result exactly, and taking
+them away one at a time showed which mattered: the jar searches a chromatogram library with the
+correlations it stores, while the quantified flags (`QuantifiedIonsArray`) changed nothing (all
+set, set only on the peaks the quantity used, or NULL: the same 30,682 each time). So a library's
+fragment table carries both (`correlation`, `quantified`, null where the source says nothing). In
+every file the jar wrote that we have (its predicted library, both chromatogram libraries, the
+peptide-centric and ScribeTwo searches, the reports) every stored peak is flagged, and the writer
+flags every peak where a library has no flags of its own; the predicted library stores no
+correlations, so a predicted library (the jar's, or Koina's through Constellation) loses nothing
+by having none. An entry with no stored peaks gets empty arrays, not NULL, as the jar writes it.
 
 ## Running ScribeTwo (first command-line runs, 2026-10-17)
 
