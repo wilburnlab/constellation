@@ -37,7 +37,7 @@ from __future__ import annotations
 # module self-registers via `@register_track` at load time). A modality
 # that is not imported here is simply absent from the registry, and the
 # server returns 404 for its kinds.
-from constellation.viz.modalities import genome  # noqa: F401
+from constellation.viz.modalities import genome, massspec  # noqa: F401
 from constellation.viz.tracks.base import (
     HYBRID_SCHEMA,
     ThresholdDecision,
