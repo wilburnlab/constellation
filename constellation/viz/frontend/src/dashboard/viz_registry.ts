@@ -13,6 +13,7 @@
 // Adding a second viz tool (spectrum viewer, structure browser, etc.)
 // is one entry; no introspect or schema changes required.
 
+import { fetchJsonMethod } from '../engine/arrow_client';
 import { GenomeBrowserForm } from '../modalities/genome/GenomeBrowserForm';
 import type { OpenSessionResult, SavedSessionSummary } from '../modalities/genome/types';
 import type { LayoutEntry } from '../panels/layout';
@@ -112,6 +113,39 @@ const VIZ_DESCRIPTORS: VizDescriptor[] = [
           form.destroy();
         },
       };
+    },
+  },
+  {
+    path: ['viz', 'massspec'],
+    label: 'Mass-spec browser',
+    helpText:
+      'Chromatograms and spectra of converted acquisitions (the directories ' +
+      '`massspec convert` or `massspec encyclopedia import-spectra` write).',
+    submitLabel: 'Open',
+    fields: [
+      { name: 'acquisition', label: 'Acquisition', kind: 'dir', required: true, remember: true },
+      {
+        name: 'more',
+        label: 'More acquisitions',
+        kind: 'text',
+        placeholder: 'other directories, separated by commas',
+        remember: true,
+      },
+    ],
+    async open(host, values) {
+      const paths = [values.acquisition, ...(values.more ?? '').split(',')]
+        .map((p) => p.trim())
+        .filter((p) => p.length > 0);
+      const session = await fetchJsonMethod<{ session_id: string; label: string }>(
+        '/api/sessions/open',
+        'POST',
+        { modality: 'massspec', sources: paths.map((path) => ({ path })) },
+      );
+      const { MassSpecBrowser } = await import('../modalities/massspec/MassSpecBrowser');
+      host.innerHTML = '';
+      const browser = new MassSpecBrowser({ host, sessionId: session.session_id });
+      await browser.mount();
+      return { title: `mass spec · ${session.label}`, dispose: () => browser.dispose() };
     },
   },
 ];

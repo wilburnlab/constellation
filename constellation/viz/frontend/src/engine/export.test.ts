@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildCompositeSvg, estimateGlyphCount } from './export';
+import { buildCompositeSvg, buildGridSvg, estimateGlyphCount } from './export';
 import { ensureSvg, svgEl } from './svg_layer';
 
 const WIDTH = 900;
@@ -116,5 +116,42 @@ describe('estimateGlyphCount', () => {
     svg.appendChild(svgEl('text'));
     svg.appendChild(svgEl('path'));
     expect(estimateGlyphCount([a, b, document.createElement('div')])).toBe(4 + 2 + 2);
+  });
+});
+
+describe('buildGridSvg', () => {
+  function cellSvg(label: string): SVGSVGElement {
+    const host = document.createElement('div');
+    host.innerHTML =
+      '<svg class="track-canvas" width="100" height="50"><defs><clipPath id="same-clip"><rect width="10" height="10"/></clipPath></defs>' +
+      `<g clip-path="url(#same-clip)"><text>${label}</text></g></svg>`;
+    return host.querySelector('svg') as SVGSVGElement;
+  }
+
+  it('places cells at their rectangles and keeps their ids apart', () => {
+    const result = buildGridSvg(
+      [
+        { svg: cellSvg('a'), x: 0, y: 0, width: 100, height: 50, title: 'MS1 chromatogram' },
+        { svg: cellSvg('b'), x: 100, y: 0, width: 100, height: 50, title: 'MS1 spectrum' },
+        { svg: cellSvg('c'), x: 0, y: 50, width: 100, height: 50 },
+      ],
+      { title: 'grid', widthPx: 200, heightPx: 100 },
+    );
+    const doc = new DOMParser().parseFromString(result.svg, 'image/svg+xml');
+    const ids = [...doc.querySelectorAll('[id]')].map((el) => el.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toContain('c0-same-clip');
+    expect(ids).toContain('c1-same-clip');
+    // References follow the renamed ids.
+    const refs = [...doc.querySelectorAll('g[clip-path]')].map((g) => g.getAttribute('clip-path'));
+    expect(refs).toContain('url(#c1-same-clip)');
+    // Two rows of cells, each under a title row.
+    const groups = [...doc.querySelectorAll('svg > g')].map((g) => g.getAttribute('transform'));
+    expect(groups).toEqual(['translate(0 16)', 'translate(100 16)', 'translate(0 82)']);
+    expect(result.totalHeightPx).toBe(132);
+    expect([...doc.querySelectorAll('text.export-cell-title')].map((t) => t.textContent)).toEqual([
+      'MS1 chromatogram',
+      'MS1 spectrum',
+    ]);
   });
 });

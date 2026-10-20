@@ -1,0 +1,18 @@
+/* Plot axes drawn by engine/axis.ts. Colours come from the page palette;
+ * an exported SVG carries the same classes. */
+
+.plot-axes .axis-line,
+.plot-axes .axis-tick {
+  stroke: var(--border-strong, #3b334b);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+.plot-axes .axis-tick-label {
+  fill: var(--fg-dim, #adacae);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.plot-axes .axis-label {
+  fill: var(--fg-dim, #adacae);
+  font-size: 10px;
+}
