@@ -32,6 +32,7 @@ import constellation.core.sequence.ops
 import constellation.core.sequence.proforma
 import constellation.core.sequence.protein
 import constellation.core.signal
+import constellation.core.signal.decimate
 import constellation.core.signal.matching
 import constellation.core.stats
 import constellation.core.stats.calibration
@@ -55,6 +56,7 @@ import constellation.massspec.acquisition_structure
 import constellation.massspec.acquisitions
 import constellation.massspec.manifest
 import constellation.massspec.experiment
+import constellation.massspec.scans
 import constellation.core.detach
 import constellation.core.locks
 import constellation.massspec.cli.quantify

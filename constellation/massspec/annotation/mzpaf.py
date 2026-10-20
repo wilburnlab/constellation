@@ -46,8 +46,8 @@ Public API:
     parse_mzpaf(s)            -> PeakAnnotation
     format_mzpaf(p)           -> str
     MzPAFError / MzPAFSyntaxError
-    fragment_row_to_mzpaf(row)            -> str
-    fragment_table_to_mzpaf(table)        -> pa.Array (vectorized)
+    fragment_row_to_mzpaf(row, length=L)        -> str
+    fragment_table_to_mzpaf(table, length=L)    -> pa.Array (vectorized)
 """
 
 from __future__ import annotations
@@ -437,28 +437,37 @@ def _format_one(a: Annotation) -> str:
 _ION_LETTERS: tuple[str, ...] = ("a", "b", "c", "x", "y", "z")
 
 
-def fragment_row_to_mzpaf(row: Mapping) -> str:
-    """Render one fragment-row (dict-like) to its canonical mzPAF string.
+def fragment_row_to_mzpaf(row: Mapping, *, length: int) -> str:
+    """Render one fragment row (dict-like) to its canonical mzPAF string.
 
     Required keys (per LIBRARY_FRAGMENT_TABLE / FRAGMENT_ION_TABLE):
         ion_type    int (0..5 → a/b/c/x/y/z)
-        position    int   (1-based)
+        position    int, the 0-based bond index the tables store
         charge      int
 
     Optional keys:
         loss_id     str | None — when present, rendered as a named
                     bracket loss (``-[H2O]``, ``-[Phospho]``).
                     Absent / None / empty → no loss decoration.
+
+    ``length`` is the peptide's residue count. A label numbers the ion
+    within its series, which for the same bond is ``position + 1`` on
+    the N-terminal side and ``length - 1 - position`` on the C-terminal
+    side, so the bond index alone cannot be printed as the number.
     """
+    # Imported here: the ion chemistry module pulls in torch, which the
+    # grammar does not otherwise need.
+    from constellation.massspec.peptide.ions import ion_number
+
     ion_type = int(row["ion_type"])
     if not 0 <= ion_type < len(_ION_LETTERS):
         raise MzPAFError(f"invalid ion_type {ion_type}; expected 0..5")
     letter = _ION_LETTERS[ion_type]
-    position = int(row["position"])
+    number = ion_number(ion_type, int(row["position"]), int(length))
     charge = int(row["charge"])
     loss = row.get("loss_id")
 
-    parts: list[str] = [f"{letter}{position}"]
+    parts: list[str] = [f"{letter}{number}"]
     if loss:
         # Constellation's LOSS_REGISTRY ids ("H2O", "NH3", "HPO3", "H3PO4")
         # are bare chemical formulae — render in the bracket-named form
@@ -470,12 +479,13 @@ def fragment_row_to_mzpaf(row: Mapping) -> str:
     return "".join(parts)
 
 
-def fragment_table_to_mzpaf(table: pa.Table) -> pa.Array:
+def fragment_table_to_mzpaf(table: pa.Table, *, length: int | Iterable[int]) -> pa.Array:
     """Vectorized projection of a fragment table to an mzPAF string column.
 
     Returns a pa.Array (string) of the same length as ``table``. The
     table must carry ``ion_type``, ``position``, ``charge`` columns;
-    ``loss_id`` is read when present.
+    ``loss_id`` is read when present. ``length`` is the peptide length,
+    one int for a table of one peptide's fragments or one per row.
     """
     ion_types = table.column("ion_type").to_pylist()
     positions = table.column("position").to_pylist()
@@ -484,12 +494,19 @@ def fragment_table_to_mzpaf(table: pa.Table) -> pa.Array:
         losses: Iterable = table.column("loss_id").to_pylist()
     else:
         losses = (None,) * len(ion_types)
+    if isinstance(length, int):
+        lengths: Iterable[int] = (length,) * len(ion_types)
+    else:
+        lengths = list(length)
+        if len(lengths) != len(ion_types):
+            raise ValueError(f"{len(lengths)} lengths for {len(ion_types)} fragment rows")
 
     out: list[str] = []
-    for it, pos, ch, loss in zip(ion_types, positions, charges, losses):
+    for it, pos, ch, loss, n in zip(ion_types, positions, charges, losses, lengths):
         out.append(
             fragment_row_to_mzpaf(
-                {"ion_type": it, "position": pos, "charge": ch, "loss_id": loss}
+                {"ion_type": it, "position": pos, "charge": ch, "loss_id": loss},
+                length=n,
             )
         )
     return pa.array(out, type=pa.string())

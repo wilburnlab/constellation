@@ -62,12 +62,16 @@ from constellation.massspec.schemas import (
 __all__ = [
     "PeakIndexManifest",
     "build_peak_index",
+    "find_peak_index",
+    "INDEX_DIRNAME",
     "MANIFEST_FILENAME",
     "DEFAULT_MAX_ISOLATION_WINDOWS",
 ]
 
 MANIFEST_FILENAME = "manifest.json"
 BUNDLE_KIND = "ms_peak_index"
+#: Where a bundle's index lives by convention: ``<bundle>/mz_index/``.
+INDEX_DIRNAME = "mz_index"
 DEFAULT_MAX_ISOLATION_WINDOWS = 512
 
 # m/z-valued axes downcast together (same physical units).
@@ -423,6 +427,19 @@ def _write_manifest(index_root: Path, manifest: PeakIndexManifest) -> None:
     (index_root / MANIFEST_FILENAME).write_text(
         json.dumps(asdict(manifest), indent=2) + "\n", encoding="utf-8"
     )
+
+
+def find_peak_index(bundle_dir: Path | str) -> Path | None:
+    """The finished peak index at ``<bundle>/mz_index``, or ``None``.
+
+    Finished means its manifest is there: the build writes it last.
+    """
+    root = Path(bundle_dir) / INDEX_DIRNAME
+    manifest = root / MANIFEST_FILENAME
+    if not manifest.is_file():
+        return None
+    kind = json.loads(manifest.read_text(encoding="utf-8")).get("kind")
+    return root if kind == BUNDLE_KIND else None
 
 
 def read_manifest(index_root: Path | str) -> PeakIndexManifest:

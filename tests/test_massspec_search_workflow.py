@@ -46,7 +46,9 @@ from constellation.massspec.workflows.encyclopedia import (
 )
 
 from _encyclopedia_fixtures import Entry, build_result_library
-from test_encyclopedia_dia_codec import _dda_scans, _dia_scans, _write_bundle
+from _massspec_fixtures import dda_scans as _dda_scans
+from _massspec_fixtures import dia_scans as _dia_scans
+from _massspec_fixtures import write_bundle as _write_bundle
 
 _PEPTIDES = [("PEPTIDEK", 2, 5.0e5), ("ELVISLIVESK", 2, 2.0e6), ("[+42.010565]MDFQHRPGGK", 3, 0.0)]
 

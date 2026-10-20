@@ -165,7 +165,7 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
         extract_xic_scan_major,
         save_xic,
     )
-    from constellation.massspec.quant.peak_index import build_peak_index
+    from constellation.massspec.quant.peak_index import INDEX_DIRNAME, build_peak_index
     from constellation.massspec.quant.targets import load_targets
 
     if not args.peaks_dir.exists():
@@ -193,7 +193,7 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
     )
 
     if use_index:
-        index_dir = args.index_dir or (args.peaks_dir / "mz_index")
+        index_dir = args.index_dir or (args.peaks_dir / INDEX_DIRNAME)
         manifest_exists = (index_dir / "manifest.json").exists()
         if args.rebuild_index or not manifest_exists:
             if not args.no_progress:

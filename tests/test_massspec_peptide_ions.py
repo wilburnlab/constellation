@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pyarrow as pa
 import pytest
 import torch
@@ -29,8 +30,10 @@ from constellation.core.sequence.proforma import (
 from constellation.massspec.peptide.ions import (
     ION_OFFSET_MASSES,
     IonType,
+    bond_position,
     fragment_ladder,
     fragment_mz,
+    ion_number,
 )
 from constellation.massspec.peptide.mz import PROTON_MASS
 
@@ -384,3 +387,50 @@ def test_modification_index_out_of_range():
     )
     with pytest.raises(IndexError):
         fragment_ladder(bad, max_fragment_charge=1)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Bond position ↔ ion number
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_ion_number_matches_the_ladder_masses():
+    """The ladder's rows, numbered by ion_number, carry the masses of b_n / y_n."""
+    table, _ = fragment_ladder(parse_proforma("PEPTIDEK"), return_tensor=False)
+    rows = table.to_pylist()
+    by_label = {
+        (IonType(r["ion_type"]).name.lower(), ion_number(r["ion_type"], r["position"], 8)): r["mz_theoretical"]
+        for r in rows
+        if r["charge"] == 1 and r["loss_id"] is None
+    }
+    # y1 = K + H2O + H+, b2 = P + E + H+.
+    assert by_label[("y", 1)] == pytest.approx(147.112804, abs=1e-5)
+    assert by_label[("b", 2)] == pytest.approx(227.102633, abs=1e-5)
+
+
+def test_bond_position_inverts_ion_number():
+    for ion_type in IonType:
+        for position in range(9):
+            number = ion_number(int(ion_type), position, 10)
+            assert bond_position(int(ion_type), number, 10) == position
+
+
+def test_conversion_takes_arrays():
+    ion_type = np.array([IonType.B, IonType.Y, IonType.Y])
+    position = np.array([0, 0, 6])
+    assert ion_number(ion_type, position, 8).tolist() == [1, 7, 1]
+    assert ion_number(ion_type, position, np.array([8, 8, 10])).tolist() == [1, 7, 3]
+
+
+@pytest.mark.parametrize("position", [-1, 7])
+def test_a_bond_outside_the_peptide_is_refused(position):
+    with pytest.raises(ValueError):
+        ion_number(IonType.Y, position, 8)
+    with pytest.raises(ValueError):
+        ion_number(np.array([IonType.Y]), np.array([position]), 8)
+
+
+@pytest.mark.parametrize("number", [0, 8])
+def test_an_ion_number_outside_the_peptide_is_refused(number):
+    with pytest.raises(ValueError):
+        bond_position(IonType.B, number, 8)

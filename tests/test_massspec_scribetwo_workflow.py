@@ -33,7 +33,7 @@ from constellation.massspec.workflows.encyclopedia import (
     search_acquisitions,
 )
 
-from test_encyclopedia_dia_codec import _dda_scans
+from _massspec_fixtures import dda_scans as _dda_scans
 from test_massspec_search_workflow import _NOISE_PEAKS, _PEPTIDES, _bundle, inputs, jar  # noqa: F401
 
 
