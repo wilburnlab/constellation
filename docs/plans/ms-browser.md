@@ -53,6 +53,31 @@
   - Axes are drawn as plain SVG rather than through d3-axis, so they render
     the same under jsdom and in an export; a seconds axis shown in minutes
     ticks on round minutes (`AxisFormat.per`).
+- **PR E (genome onto the engine):** implemented. Genome's `interactions.ts`
+  wraps `attachPanZoom1D` (`zoomLocus` is `zoomAbout` with whole-base-pair
+  rounding), `ViewportBus` is a locus on a `TypedBus`, and
+  `PanelStack.render` goes through the `RenderScheduler`: panels are fetched
+  in parallel, a panel whose data is for the current view is drawn again
+  without a request, and a late response for a view already left is dropped
+  (a new host test holds one back to check). Checked by headless-Chrome
+  screenshots of the synthetic genome session (`tests/_viz_frontend_fixtures.py`)
+  before and after, at the default view and after a Go-to plus a drag pan:
+  no pixel differs by more than one level. What changes for a user:
+  - Fewer requests. Expanding a collapsed track, showing a hidden one,
+    toggling Labels or changing one track's server-side filter used to
+    refetch every visible track; now only tracks whose data is stale are
+    fetched. Seven host tests that pinned the old refetches were updated.
+  - Panning uses pointer events with pointer capture, so no window
+    listeners are held. Presses on the browser's own controls (track
+    headers, resize handles, the overview bar, form fields) are left to
+    them: before, a drag on the overview both centred and panned the view,
+    and a resize drag could pan too. Shift-drag still pans (the engine's
+    brush is off for genome), double-click does nothing, as before.
+  - A mostly horizontal scroll with Shift held now pans; before, Shift
+    turned it into a zoom in, whatever its direction.
+  Departure: `zoomLocus` and `attachPanZoom` stay as thin genome-specific
+  wrappers rather than being removed, so their callers and tests are
+  unchanged.
 
 ## Context
 

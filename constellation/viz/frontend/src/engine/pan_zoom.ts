@@ -30,6 +30,15 @@ export interface PanZoom1DOptions {
   onHover?(value: number | null): void;
   /** A brush in progress (`null` when it ends), for drawing feedback. */
   onBrush?(range: Interval | null): void;
+  /** Presses (and double-clicks) on these targets are left alone: the
+   *  host's own controls (buttons, resize handles, a widget with its own
+   *  drag). Any other press is taken, which cancels its compatibility
+   *  mouse events. The wheel zooms everywhere on the surface. */
+  ignore?(target: EventTarget | null): boolean;
+  /** Shift-drag selects a range to zoom to (default true); off, shift-drag pans. */
+  brush?: boolean;
+  /** Double-click fits (default true). */
+  doubleClickFits?: boolean;
 }
 
 /** Movement, in pixels, below which a press is a click rather than a drag. */
@@ -65,9 +74,10 @@ export function attachPanZoom1D(opts: PanZoom1DOptions): () => void {
     opts.set(zoomAbout(opts.get(), factor, fraction(e.clientX), limits), 'wheel');
   };
 
+  const brushes = opts.brush ?? true;
   const onDown = (e: PointerEvent): void => {
-    if (e.button !== 0) return;
-    press = { pointerId: e.pointerId, x0: e.clientX, iv: opts.get(), brush: e.shiftKey, moved: false };
+    if (e.button !== 0 || opts.ignore?.(e.target)) return;
+    press = { pointerId: e.pointerId, x0: e.clientX, iv: opts.get(), brush: brushes && e.shiftKey, moved: false };
     surface.setPointerCapture?.(e.pointerId);
     e.preventDefault();
   };
@@ -125,7 +135,8 @@ export function attachPanZoom1D(opts: PanZoom1DOptions): () => void {
     if (!press) opts.onHover?.(null);
   };
 
-  const onDouble = (): void => {
+  const onDouble = (e: MouseEvent): void => {
+    if (opts.doubleClickFits === false || opts.ignore?.(e.target)) return;
     const limits = opts.limits();
     opts.set(opts.fit?.() ?? [limits.min, limits.max], 'reset');
   };

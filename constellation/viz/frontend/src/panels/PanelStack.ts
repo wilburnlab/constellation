@@ -27,6 +27,7 @@ import {
   snapshotLayout,
   visibleSorted,
 } from './layout';
+import { RenderScheduler } from './scheduler';
 import { Bag, SettingsSchema } from './settings_schema';
 
 const COLLAPSED_BODY_HEIGHT = 0;
@@ -90,6 +91,8 @@ export class PanelStack<V extends PanelView, D, O> {
   private dragSource: Panel<D> | null = null;
   /** Ends a resize drag in progress (its window listeners), if any. */
   private endResize: (() => void) | null = null;
+  /** Fetches panels in parallel; a result for a view already left is dropped. */
+  private readonly scheduler = new RenderScheduler<Panel<D>, D>();
 
   constructor(config: PanelStackConfig<V, D, O>) {
     this.config = config;
@@ -124,10 +127,8 @@ export class PanelStack<V extends PanelView, D, O> {
   /** Remove every panel (their in-flight fetches are aborted). */
   clear(): void {
     this.endResize?.();
-    for (const t of this.panelList) {
-      t.cancel?.abort();
-      t.element.remove();
-    }
+    this.scheduler.cancelAll();
+    for (const t of this.panelList) t.element.remove();
     this.panelList = [];
   }
 
@@ -138,7 +139,7 @@ export class PanelStack<V extends PanelView, D, O> {
     }
     this.closeSettings();
     this.endResize?.();
-    for (const t of this.panelList) t.cancel?.abort();
+    this.scheduler.cancelAll();
   }
 
   // --------------------------------------------------------------------
@@ -423,13 +424,16 @@ export class PanelStack<V extends PanelView, D, O> {
     }
   }
 
-  /** Fetch and draw every visible panel for the host's current view, one
-   *  after another in display order. */
+  /** Fetch and draw every visible panel for the host's current view.
+   *
+   *  Panels are fetched in parallel (requests start in display order); a
+   *  panel whose data was already fetched for this view is drawn again from
+   *  it with no request; and a response for a view that has since changed
+   *  is dropped rather than drawn over the newer one. */
   async render(): Promise<void> {
     const view = this.config.driver.view();
     if (!view) return;
-    const widthPx = view.widthPx;
-
+    const plans = [];
     for (const track of this.visibleSorted()) {
       if (track.collapsed) {
         // Collapsed panels show the header only; clear any prior SVG so
@@ -441,27 +445,44 @@ export class PanelStack<V extends PanelView, D, O> {
         track.statusEl.textContent = 'collapsed';
         continue;
       }
-      track.cancel?.abort();
-      track.cancel = new AbortController();
-      const heightPx = Math.max(MIN_PANEL_HEIGHT, Math.round(track.heightPx));
-      const svg = ensureSvg(track.bodyHost, widthPx, heightPx);
-
-      try {
-        const data = await this.config.driver.fetch(track, view, track.cancel.signal);
-        const count = this.config.driver.draw(track, data, view, svg, {
-          widthPx,
-          heightPx,
-        });
-        track.lastFetched = { data, viewKey: view.key };
-        track.statusEl.textContent =
-          count === 0
-            ? '— no data in window'
-            : `showing ${count.toLocaleString()} ${unitFor(this.config.kindOf(track.entry.kind), count)}`;
-      } catch (err) {
-        if ((err as Error).name === 'AbortError') continue;
+      plans.push({
+        target: track,
+        key: view.key,
+        fetch: (signal: AbortSignal) => this.config.driver.fetch(track, view, signal),
+      });
+    }
+    await this.scheduler.pass(plans, {
+      cached: (track) => {
+        const last = track.lastFetched;
+        return last ? { key: last.viewKey, data: last.data } : undefined;
+      },
+      store: (track, key, data) => {
+        track.lastFetched = { data, viewKey: key };
+      },
+      draw: (track, data) => this.drawPanel(track, data, view),
+      failed: (track, err) => {
         console.warn(`render failed for ${track.entry.kind}`, err);
         track.statusEl.textContent = 'render failed';
-      }
+      },
+    });
+  }
+
+  private drawPanel(track: Panel<D>, data: D, view: V): void {
+    // A panel collapsed or hidden while its data was on the way stays as it is.
+    if (!track.visible || track.collapsed) return;
+    const heightPx = Math.max(MIN_PANEL_HEIGHT, Math.round(track.heightPx));
+    const svg = ensureSvg(track.bodyHost, view.widthPx, heightPx);
+    let count: number;
+    try {
+      count = this.config.driver.draw(track, data, view, svg, { widthPx: view.widthPx, heightPx });
+    } catch (err) {
+      console.warn(`render failed for ${track.entry.kind}`, err);
+      track.statusEl.textContent = 'render failed';
+      return;
     }
+    track.statusEl.textContent =
+      count === 0
+        ? '— no data in window'
+        : `showing ${count.toLocaleString()} ${unitFor(this.config.kindOf(track.entry.kind), count)}`;
   }
 }

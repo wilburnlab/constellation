@@ -71,12 +71,11 @@ export class Panel<D = unknown> implements LayoutPanel {
   style: Record<string, unknown>;
   filter: Record<string, unknown>;
 
-  /** The last data successfully fetched and the view it was fetched for.
+  /** The last data successfully fetched and the key of what it was fetched
+   *  for (a stack's view key, a grid cell's data key).
    *  A style or client-side filter change redraws from this without a
    *  request, as long as the view has not moved. */
   lastFetched?: { data: D; viewKey: string };
-  /** Aborts this panel's in-flight fetch. */
-  cancel?: AbortController;
 
   constructor(init: PanelInit) {
     this.entry = init.entry;

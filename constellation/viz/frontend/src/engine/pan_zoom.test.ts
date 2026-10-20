@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { Interval, IntervalLimits } from './interval';
 import { attachPanZoom1D, PanZoomCause } from './pan_zoom';
 
@@ -99,10 +99,45 @@ describe('attachPanZoom1D', () => {
     r.surface.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
     expect(r.iv).toEqual([0, 1000]);
     r.detach();
-    const set = vi.fn();
     r.sets = [];
     r.surface.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
     expect(r.sets).toEqual([]);
-    expect(set).not.toHaveBeenCalled();
+  });
+});
+
+describe('options', () => {
+  it('leaves presses on ignored targets alone, and can turn off brush and fit', () => {
+    const surface = document.createElement('div');
+    const button = document.createElement('button');
+    surface.appendChild(button);
+    document.body.appendChild(surface);
+    let iv: Interval = [0, 1000];
+    const sets: Interval[] = [];
+    const detach = attachPanZoom1D({
+      surface,
+      plotRect: () => ({ left: 100, width: 200 }),
+      get: () => iv,
+      set: (next) => {
+        iv = next;
+        sets.push(next);
+      },
+      limits: () => LIMITS,
+      ignore: (t) => t instanceof HTMLButtonElement,
+      brush: false,
+      doubleClickFits: false,
+    });
+    button.dispatchEvent(pointer('pointerdown', 150));
+    button.dispatchEvent(pointer('pointermove', 100));
+    expect(sets).toEqual([]);
+    // Without the brush, shift-drag pans.
+    iv = [200, 400];
+    surface.dispatchEvent(pointer('pointerdown', 200, { shiftKey: true }));
+    surface.dispatchEvent(pointer('pointermove', 150, { shiftKey: true }));
+    surface.dispatchEvent(pointer('pointerup', 150, { shiftKey: true }));
+    expect(iv).toEqual([250, 450]);
+    surface.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+    expect(iv).toEqual([250, 450]);
+    detach();
+    surface.remove();
   });
 });
