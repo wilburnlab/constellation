@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { AXIS_FORMATS, AXIS_PRESENTATION, drawAxes, plotFrame, xAxis, yAxis } from './axis';
 import { buildCompositeSvg, buildGridSvg, estimateGlyphCount } from './export';
 import { ensureSvg, svgEl } from './svg_layer';
 
@@ -153,5 +154,19 @@ describe('buildGridSvg', () => {
       'MS1 chromatogram',
       'MS1 spectrum',
     ]);
+  });
+
+  it('carries what the axes look like without the page stylesheet', () => {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    const frame = plotFrame({ widthPx: 200, heightPx: 100 }, { top: 4, right: 4, bottom: 30, left: 40 });
+    drawAxes(svg, frame, { x: xAxis(frame, [0, 10], AXIS_FORMATS.mz), y: yAxis(frame, [0, 1], AXIS_FORMATS.intensity), xLabel: 'm/z' }, 'u');
+    const result = buildGridSvg([{ svg, x: 0, y: 0, width: 200, height: 100 }], { title: 'axes', widthPx: 200, heightPx: 100 });
+    const doc = new DOMParser().parseFromString(result.svg, 'image/svg+xml');
+    expect(doc.documentElement.getAttribute('font-family')).toBeTruthy();
+    const lines = [...doc.querySelectorAll('line.axis-line, line.axis-tick')];
+    expect(lines.length).toBeGreaterThan(2);
+    expect(lines.every((l) => l.getAttribute('stroke') === AXIS_PRESENTATION.line.stroke)).toBe(true);
+    const texts = [...doc.querySelectorAll('text.axis-tick-label, text.axis-label')];
+    expect(texts.every((t) => t.getAttribute('fill') && t.getAttribute('font-size') === '10')).toBe(true);
   });
 });

@@ -120,6 +120,25 @@ describe('PanelGrid', () => {
     expect(r.grid.cells.filter((c) => !c.panel.element.hidden).map((c) => c.id)).toEqual(['ms1/chrom', 'ms2/chrom']);
   });
 
+  it('places every header and cell explicitly, so hiding some moves none', () => {
+    const r = (current = rig());
+    r.grid.setFocus({ type: 'col', col: 'spec' });
+    const at = (el: Element) => [(el as HTMLElement).style.gridRow, (el as HTMLElement).style.gridColumn];
+    expect(r.grid.cells.map((c) => [c.id, ...at(c.panel.element)])).toEqual([
+      ['ms1/chrom', '2', '2'],
+      ['ms1/spec', '2', '3'],
+      ['ms2/chrom', '3', '2'],
+      ['ms2/spec', '3', '3'],
+    ]);
+    const root = r.grid.cells[0].panel.element.parentElement!;
+    expect(at(root.querySelector('.panel-grid-corner')!)).toEqual(['1', '1']);
+    expect(Array.from(root.querySelectorAll('.panel-grid-col-header'), at)).toEqual([['1', '2'], ['1', '3']]);
+    expect(Array.from(root.querySelectorAll('.panel-grid-row-header'), at)).toEqual([['2', '1'], ['3', '1']]);
+    // The column left out has no width, and its header is hidden too.
+    expect(r.grid.trackPx.cols.chrom).toBe(0);
+    expect((root.querySelector('.panel-grid-col-header') as HTMLElement).hidden).toBe(true);
+  });
+
   it('a collapsed column keeps a strip and its cells are not fetched', async () => {
     const r = (current = rig());
     r.grid.setColCollapsed('spec', true);

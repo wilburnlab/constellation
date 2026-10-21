@@ -150,10 +150,12 @@ def precursor(
     experiment: str,
     unit: str,
     precursor_id: int,
+    scan: int | None = Query(None, ge=0),
     top_n: int = Query(8, ge=1, le=32),
     n_isotopes: int = Query(3, ge=1, le=6),
 ) -> dict[str, Any]:
-    """One identification of this run and what a browser traces for it:
+    """One identification of this run and what a browser traces for it
+    (for a spectrum-centric search, its match in ``scan``):
     where it was measured (window, apex scans), the precursor's isotopes
     (MS1) and its most intense stored fragments (MS2), its ion ladder, the
     engine's quantified ions and median chromatogram, and its retention
@@ -177,10 +179,11 @@ def precursor(
     if unit not in link["units"]:
         raise HTTPException(404, f"search {unit!r} did not search acquisition {key!r}")
     root, aid = Path(link["experiment"]), int(link["acquisition_id"])
-    detail = precursor_detail(root, precursor_id, unit=unit, acquisition_id=aid)
+    detail = precursor_detail(root, precursor_id, unit=unit, acquisition_id=aid, scan=scan)
     found = detail["identification"]
     if found is None:
-        raise HTTPException(404, f"search {unit!r} has no identification {precursor_id}")
+        where = "" if scan is None else f" in scan {scan}"
+        raise HTTPException(404, f"search {unit!r} has no identification {precursor_id}{where}")
     modseq, charge = found["modified_sequence"], int(found["charge"])
     scans = scan_table_for(acquisition.bundle)
     located = locate_precursor(scans, precursor_mz=found["precursor_mz"], rt=found["rt"])

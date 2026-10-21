@@ -271,6 +271,28 @@ def test_xic_matches_brute_force_with_and_without_the_index(dia) -> None:
     assert indexed.equals(plain)
 
 
+def test_xic_from_a_float32_time_index_keeps_the_end_scans(tmp_path) -> None:
+    # An index built with downcast=["rt"] stores times as float32; the
+    # first MS1 scan's time rounds down, so an exact float64 bound on it
+    # would drop that scan's peak.
+    scans = with_scan_stats(dia_scans(cycles=4))
+    target = 777.0
+    for s in scans:
+        if s["level"] == 1:
+            mz, intensity = np.append(s["mz"], target), np.append(s["intensity"], 100.0)
+            order = np.argsort(mz)
+            s["mz"], s["intensity"] = mz[order], intensity[order]
+    bundle = write_bundle_manifest(write_bundle(tmp_path, "f32", scans))
+    plain = xic(bundle, [target], level=1, tolerance=0.01, tolerance_unit="Da", use_index=False)
+    assert all(v > 0 for v in plain.column("intensity").to_pylist())
+    build_peak_index(bundle, bundle / "mz_index", downcast=["rt"])
+    indexed = xic(bundle, [target], level=1, tolerance=0.01, tolerance_unit="Da")
+    assert indexed.column("intensity").to_pylist() == plain.column("intensity").to_pylist()
+    first, last = scans[0]["rt"], [s["rt"] for s in scans if s["level"] == 1][-1]
+    windowed = xic(bundle, [target], level=1, tolerance=0.01, tolerance_unit="Da", rt_range=(first, last))
+    assert windowed.column("intensity").to_pylist() == plain.column("intensity").to_pylist()
+
+
 def test_xic_zero_fills_and_respects_the_rt_window(dia) -> None:
     bundle, scans = dia
     rts = [s["rt"] for s in scans if s["level"] == 1]

@@ -166,6 +166,8 @@ export function buildGridSvg(
   // No explicit xmlns attribute: the serializer writes the namespace of an
   // element created in it, and setting it as well duplicates it in jsdom.
   const composite = document.createElementNS(SVG_NS, 'svg');
+  // Text inherits the page's typeface: a standalone file has no stylesheet.
+  composite.setAttribute('font-family', pageFontFamily());
   const titleEl = document.createElementNS(SVG_NS, 'title');
   titleEl.textContent = opts.title;
   composite.appendChild(titleEl);
@@ -194,6 +196,7 @@ export function buildGridSvg(
       text.setAttribute('y', String(y - 4));
       text.setAttribute('class', 'export-cell-title');
       text.setAttribute('font-size', '11');
+      text.setAttribute('fill', '#adacae');
       text.textContent = cell.title;
       composite.appendChild(text);
     }
@@ -214,6 +217,12 @@ export function buildGridSvg(
   composite.setAttribute('height', String(height));
   composite.setAttribute('viewBox', `0 0 ${width} ${height}`);
   return { svg: new XMLSerializer().serializeToString(composite), totalHeightPx: height };
+}
+
+/** The typeface the page draws text in. */
+function pageFontFamily(): string {
+  const family = typeof getComputedStyle === 'function' ? getComputedStyle(document.body).fontFamily : '';
+  return family || 'system-ui, sans-serif';
 }
 
 /** Title rows above a cell: one per distinct row start at or above it. */

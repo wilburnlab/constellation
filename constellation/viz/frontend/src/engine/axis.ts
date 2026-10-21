@@ -172,6 +172,14 @@ export function autoYDomain(
 
 const TICK = 4;
 
+/** Axis presentation, written onto the elements so that an exported SVG,
+ *  which carries no stylesheet, draws them the same; on the page
+ *  `plot.css` (theme colours) takes precedence over these. */
+export const AXIS_PRESENTATION = {
+  line: { stroke: '#3b334b', 'stroke-width': 1, 'shape-rendering': 'crispEdges' },
+  text: { fill: '#adacae', 'font-size': 10 },
+};
+
 /** Draw the axes into `svg` and return a group clipped to the data area,
  *  for the caller to draw into. `uid` makes the clip-path id unique
  *  among the SVGs on the page. */
@@ -189,29 +197,37 @@ export function drawAxes(
   svg.appendChild(defs);
 
   const axisGroup = svgEl('g', { class: 'plot-axes' });
+  const line = AXIS_PRESENTATION.line;
+  const type = AXIS_PRESENTATION.text;
   if (axes.x) {
     const base = iy + h;
-    axisGroup.appendChild(svgEl('line', { class: 'axis-line', x1: ix, x2: ix + w, y1: base, y2: base }));
+    axisGroup.appendChild(svgEl('line', { class: 'axis-line', x1: ix, x2: ix + w, y1: base, y2: base, ...line }));
     for (const t of axes.x.ticks) {
       const px = axes.x.scale(t);
-      axisGroup.appendChild(svgEl('line', { class: 'axis-tick', x1: px, x2: px, y1: base, y2: base + TICK }));
-      const text = svgEl('text', { class: 'axis-tick-label', x: px, y: base + TICK + 10, 'text-anchor': 'middle' });
+      axisGroup.appendChild(svgEl('line', { class: 'axis-tick', x1: px, x2: px, y1: base, y2: base + TICK, ...line }));
+      const text = svgEl('text', {
+        class: 'axis-tick-label', x: px, y: base + TICK + 10, 'text-anchor': 'middle', ...type,
+      });
       text.textContent = axes.x.format.tick(t, axes.x.step);
       axisGroup.appendChild(text);
     }
     if (axes.xLabel) {
       // Its own line under the tick labels (the margin must leave room).
-      const label = svgEl('text', { class: 'axis-label', x: ix + w / 2, y: base + TICK + 22, 'text-anchor': 'middle' });
+      const label = svgEl('text', {
+        class: 'axis-label', x: ix + w / 2, y: base + TICK + 22, 'text-anchor': 'middle', ...type,
+      });
       label.textContent = axes.xLabel;
       axisGroup.appendChild(label);
     }
   }
   if (axes.y) {
-    axisGroup.appendChild(svgEl('line', { class: 'axis-line', x1: ix, x2: ix, y1: iy, y2: iy + h }));
+    axisGroup.appendChild(svgEl('line', { class: 'axis-line', x1: ix, x2: ix, y1: iy, y2: iy + h, ...line }));
     for (const t of axes.y.ticks) {
       const py = axes.y.scale(t);
-      axisGroup.appendChild(svgEl('line', { class: 'axis-tick', x1: ix - TICK, x2: ix, y1: py, y2: py }));
-      const text = svgEl('text', { class: 'axis-tick-label', x: ix - TICK - 2, y: py + 3, 'text-anchor': 'end' });
+      axisGroup.appendChild(svgEl('line', { class: 'axis-tick', x1: ix - TICK, x2: ix, y1: py, y2: py, ...line }));
+      const text = svgEl('text', {
+        class: 'axis-tick-label', x: ix - TICK - 2, y: py + 3, 'text-anchor': 'end', ...type,
+      });
       text.textContent = axes.y.format.tick(t, axes.y.step);
       axisGroup.appendChild(text);
     }
@@ -222,6 +238,7 @@ export function drawAxes(
         y: 0,
         'text-anchor': 'middle',
         transform: `translate(10 ${iy + h / 2}) rotate(-90)`,
+        ...type,
       });
       label.textContent = axes.yLabel;
       axisGroup.appendChild(label);

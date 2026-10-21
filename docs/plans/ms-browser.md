@@ -185,6 +185,36 @@
     integration window (`peptidequants.RTInSecondsStart` / `Stop`) for
     2,731 of 31,079 precursors (the window's centre never does). The
     browser draws both as the jar recorded them.
+- **Review of steps D–G (Codex, 2026-10-21):** thirteen findings, each
+  reproduced by a test that fails on the code before the fix.
+  - `results.identifications`: a ScribeTwo match without a q-value (it
+    scores only the best match of each precursor) passed any q filter; it
+    is now accepted with its precursor's best match. A quantitative
+    report's rows were listed as the run's identifications, and could not
+    be opened; only searches are read now, unless `unit` names a report.
+  - Tolerances come from what the engine recorded running with
+    (`engine_settings`; ScribeTwo adjusts what it is given, 0.35 → 0.42 Da
+    in the stand-in), else from what was given.
+  - The precursor route takes the match's `scan`: a later match of a
+    precursor showed its own spectrum at the first match's time and q.
+  - `scans.xic` from an index with float32 times dropped the first or last
+    scan; its time bounds are widened past that rounding (scan membership
+    still decides).
+  - `PanelStack` and `PanelGrid` key a request by the panel's pushed-down
+    filter values too, so a request still running for the old value is
+    not taken for the new one (genome's MAPQ and cluster view).
+  - `PanelGrid` places every header and cell explicitly, and `[hidden]`
+    wins over their display rules: maximizing a column or cell had put
+    cells in the wrong tracks (checked in headless Chrome).
+  - Axes carry their stroke, fill and font size as attributes, and a grid
+    export sets the page's typeface on its root: an exported SVG has no
+    stylesheet, so its axis lines were not drawn.
+  - The browser drops a slower reply for an acquisition already left;
+    draws a target's DDA scan events from the whole scan table (the
+    server's reduction could drop them); fetches a reduced (profile)
+    spectrum again for the m/z window shown; restores each row's m/z
+    window with Back / Forward; and stops lighting ions once the MS2 scan
+    shown did not isolate the target.
 
 ## Context
 

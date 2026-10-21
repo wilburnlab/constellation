@@ -116,7 +116,7 @@ interface HistoryEntry {
   acquisition: string;
   target: Target | null;
   idKey: string | null;
-  rows: Record<string, { scan: number | null; window: number | null }>;
+  rows: Record<string, { scan: number | null; window: number | null; mz: Interval | null }>;
   rt: Interval;
   adhoc: Record<string, number[]>;
 }
@@ -219,8 +219,15 @@ export class MassSpecBrowser {
   private restoring = false;
   /** Bumped on every target request; a reply for an older one is dropped. */
   private targetSeq = 0;
-  /** The spectrum the Ions tab was last lit from. */
-  private ionsFrom: { target: string; table: Table } | null = null;
+  /** The same for acquisitions. */
+  private acquisitionSeq = 0;
+  /** Spectra (`acquisition|scan`) the server reduced: they are fetched
+   *  again for the m/z window shown, and their full extent kept. */
+  private reducedSpectra = new Set<string>();
+  private spectrumExtents = new Map<string, Interval>();
+  /** The spectrum the Ions tab was last lit from, or that the scan shown
+   *  did not isolate the target. */
+  private ionsFrom: { target: string; table: Table } | 'not isolated' | null = null;
   private targetScanCache: { key: string; scans: number[] } | null = null;
   private scanHeaders = new Map<string, Record<string, unknown>>();
   private scanHeaderTimer: ReturnType<typeof setTimeout> | null = null;
@@ -485,24 +492,32 @@ export class MassSpecBrowser {
   async showAcquisition(key: string, opts: { record?: boolean } = {}): Promise<void> {
     const info = this.acquisitions.find((a) => a.key === key);
     if (!info) return;
+    // Only the latest request may change the view: a slow reply for a run
+    // the user has already left is dropped.
+    const seq = ++this.acquisitionSeq;
+    const current = (): boolean => !this.disposed && seq === this.acquisitionSeq;
     this.acquisitionSelect.value = key;
     const base = this.acquisitionBase(key);
     this.setStatus('loading scans…');
     let table: Table;
+    let windows: IsolationWindow[];
     try {
-      [table, this.windows] = await Promise.all([
+      [table, windows] = await Promise.all([
         fetchArrow(`${base}/scans`),
         fetchJson<IsolationWindow[]>(`${base}/windows`),
       ]);
     } catch (err) {
-      this.setStatus(`could not load ${info.label}: ${(err as Error).message}`, true);
+      if (current()) this.setStatus(`could not load ${info.label}: ${(err as Error).message}`, true);
       return;
     }
-    if (this.disposed) return;
+    if (!current()) return;
+    this.windows = windows;
     const previous = this.view;
     this.info = info;
     this.scans = new ScanIndex(table);
     this.decimated.clear();
+    this.reducedSpectra.clear();
+    this.spectrumExtents.clear();
     this.xicCache.clear();
     this.indexBtn.hidden = info.has_index;
 
@@ -542,7 +557,8 @@ export class MassSpecBrowser {
     this.updateChips();
     this.requestRender();
 
-    await this.loadIdentifications(info);
+    await this.loadIdentifications(info, current);
+    if (!current()) return;
     // A target carries over: the same precursor where this run's searches
     // found it, otherwise as a peptide.
     const carried = previous?.target;
@@ -552,11 +568,12 @@ export class MassSpecBrowser {
         : undefined;
       if (found) await this.selectIdentification(found, { record: false });
       else this.applyTarget(asPeptide(carried), { record: false });
+      if (!current()) return;
     }
     if (opts.record !== false) this.record();
   }
 
-  private async loadIdentifications(info: AcquisitionInfo): Promise<void> {
+  private async loadIdentifications(info: AcquisitionInfo, current: () => boolean): Promise<void> {
     this.identifications = [];
     this.drawer.setIdentifications([]);
     if (!info.searches?.length) {
@@ -565,12 +582,12 @@ export class MassSpecBrowser {
     }
     try {
       const table = await fetchArrow(`${this.acquisitionBase(info.key)}/identifications?max_q=${MAX_Q}`);
-      if (this.disposed || this.info !== info) return;
+      if (!current()) return;
       this.identifications = idRows(table);
       this.drawer.setIdentifications(this.identifications);
       this.setStatus(`${this.identifications.length.toLocaleString()} identifications at q ≤ ${MAX_Q}`);
     } catch (err) {
-      this.setStatus(`could not load identifications: ${(err as Error).message}`, true);
+      if (current()) this.setStatus(`could not load identifications: ${(err as Error).message}`, true);
     }
   }
 
@@ -835,6 +852,8 @@ export class MassSpecBrowser {
       precursor_id: row.precursor_id,
       top_n: String(TARGET_FRAGMENTS),
     });
+    // A spectrum-centric match: that match, with its own time and score.
+    if (row.scan !== null) params.set('scan', String(row.scan));
     let json: Record<string, unknown>;
     try {
       json = await fetchJson<Record<string, unknown>>(`${this.acquisitionBase(acquisition)}/precursor?${params}`);
@@ -843,11 +862,7 @@ export class MassSpecBrowser {
       return;
     }
     if (seq !== this.targetSeq || this.disposed || this.view?.acquisition !== acquisition) return;
-    const target = targetFromPrecursor(json, row.precursor_id);
-    if (row.scan !== null) {
-      // A spectrum-centric match: the scan it was matched in.
-      target.apexScans = { ms2: row.scan, ms1: this.scans?.parentOf(row.scan) ?? target.apexScans.ms1 };
-    }
+    const target = targetFromPrecursor(json, row.precursor_id, row.scan);
     this.selectedIdKey = row.key;
     this.drawer.setSelected(row.key);
     this.applyTarget(target, opts);
@@ -1143,7 +1158,9 @@ export class MassSpecBrowser {
     const view = this.view;
     if (!view) return null;
     const rows: HistoryEntry['rows'] = {};
-    for (const [id, r] of Object.entries(view.rows)) rows[id] = { scan: r.scan, window: r.window };
+    for (const [id, r] of Object.entries(view.rows)) {
+      rows[id] = { scan: r.scan, window: r.window, mz: r.mz ? [...r.mz] : null };
+    }
     const adhoc: Record<string, number[]> = {};
     for (const [id, l] of Object.entries(view.adhoc)) adhoc[id] = [...l];
     return { acquisition: view.acquisition, target: view.target, idKey: this.selectedIdKey, rows, rt: [...view.rt], adhoc };
@@ -1185,11 +1202,13 @@ export class MassSpecBrowser {
     try {
       if (entry.acquisition !== this.view?.acquisition) await this.showAcquisition(entry.acquisition, { record: false });
       const view = this.view;
-      if (!view) return;
+      // Another acquisition or history step may have been asked for meanwhile.
+      if (!view || view.acquisition !== entry.acquisition || this.historyAt !== at) return;
       for (const [id, r] of Object.entries(entry.rows)) {
         if (!view.rows[id]) continue;
         view.rows[id].scan = r.scan;
         view.rows[id].window = r.window;
+        view.rows[id].mz = r.mz ? [...r.mz] : null;
         this.syncWindowSelect(id);
       }
       view.rt = [...entry.rt];
@@ -1307,7 +1326,11 @@ export class MassSpecBrowser {
         }
         if (row.scan === null) return null;
         const annotation = this.annotationOf(cell, view);
-        return `${view.acquisition}|scan${row.scan}${annotation ? `|${JSON.stringify(annotation)}` : ''}`;
+        const windowed = this.spectrumWindow(cell, view);
+        const span = windowed
+          ? `|${windowed[0].toFixed(4)}-${windowed[1].toFixed(4)}@${Math.round(this.grid?.cellSize(cell).widthPx ?? 0)}`
+          : '';
+        return `${spectrumKey(view.acquisition, row.scan)}${span}${annotation ? `|${JSON.stringify(annotation)}` : ''}`;
       },
       fetch: async (cell, view, signal) => {
         const row = view.rows[cell.row];
@@ -1338,6 +1361,7 @@ export class MassSpecBrowser {
           if (reduced) this.decimated.add(key);
           return { table: base.table, xic };
         }
+        const windowed = this.spectrumWindow(cell, view);
         const { table } = await fetchTrackData(
           'ms_spectrum',
           {
@@ -1345,10 +1369,18 @@ export class MassSpecBrowser {
             binding: `ms_spectrum:${view.acquisition}`,
             scan: row.scan ?? 0,
             viewport_px,
+            mz_start: windowed ? windowed[0] : undefined,
+            mz_end: windowed ? windowed[1] : undefined,
             ...(this.annotationOf(cell, view) ?? {}),
           },
           signal,
         );
+        const key = spectrumKey(view.acquisition, row.scan ?? 0);
+        if (table.numRows > 0 && Boolean(table.getChild('decimated')?.get(0))) this.reducedSpectra.add(key);
+        if (!windowed) {
+          if (this.spectrumExtents.size > 256) this.spectrumExtents.clear();
+          this.spectrumExtents.set(key, spectrumExtent((table.getChild('mz')?.toArray() as Float64Array) ?? []));
+        }
         return { table, xic: null };
       },
       draw: (cell, data, view, svg, size) => this.drawCell(cell, data, view, svg, size),
@@ -1390,13 +1422,23 @@ export class MassSpecBrowser {
       const overlays = data.xic ? overlaysFrom(data.xic, traces) : [];
       const showsTarget = !!t && traces.length > (view.adhoc[cell.row]?.length ?? 0);
       const sticks = this.traceOf(row) === 'scans';
-      const stickFilter = t && sticks ? (mz: number) => this.isolatesTarget(mz) : null;
+      // A target's scan events come from the whole scan table: the server
+      // may have reduced the trace and dropped them.
+      let events: { rt: Float64Array; intensity: Float64Array } | null = null;
+      if (t && sticks && this.scans) {
+        const own = this.targetScans(row.level);
+        const scans = this.scans;
+        events = {
+          rt: Float64Array.from(own, (n) => scans.rts[scans.row(n)!]),
+          intensity: Float64Array.from(own, (n) => scans.tics[scans.row(n)!]),
+        };
+      }
       return drawChromatogram(svg, size, data.table, {
         rt: view.rt,
         intensity: view.intensity,
         selectedRt,
         sticks,
-        stickFilter,
+        events,
         overlays,
         marks: t ? { start: t.rtStart, end: t.rtEnd, apex: t.rt, predicted: t.predictedRt } : null,
         median:
@@ -1441,13 +1483,21 @@ export class MassSpecBrowser {
       style: cell.panel.style,
       uid,
     });
-    if (annotated && t) this.updateIons(t, data.table);
+    if (t && row.level === 2) {
+      if (annotated) this.updateIons(t, data.table);
+      else if (this.ionsFrom !== 'not isolated') {
+        // The scan shown did not isolate the target: nothing it matched.
+        this.ionsFrom = 'not isolated';
+        this.drawer.setIons(t, new Set(), 'The MS2 scan shown did not isolate this precursor.');
+      }
+    }
     return shown;
   }
 
   /** The drawer's ion table lit with what the shown spectrum matched. */
   private updateIons(target: Target, table: Table): void {
-    if (this.ionsFrom?.target === target.key && this.ionsFrom.table === table) return;
+    const from = this.ionsFrom;
+    if (from && from !== 'not isolated' && from.target === target.key && from.table === table) return;
     this.ionsFrom = { target: target.key, table };
     const labels = table.getChild('annotation');
     const matched = new Set<string>();
@@ -1527,7 +1577,18 @@ export class MassSpecBrowser {
     return this.view?.rows[cell.row]?.mz ?? this.spectrumExtentOf(cell);
   }
 
+  /** The m/z window to fetch a spectrum for: the one shown, when the
+   *  server reduced the whole spectrum (a profile scan); else null. */
+  private spectrumWindow(cell: GridCell<CellData>, view: MsView): Interval | null {
+    const row = view.rows[cell.row];
+    if (!row || row.scan === null || !row.mz) return null;
+    return this.reducedSpectra.has(spectrumKey(view.acquisition, row.scan)) ? row.mz : null;
+  }
+
   private spectrumExtentOf(cell: GridCell<CellData>): Interval {
+    const row = this.view?.rows[cell.row];
+    const whole = row?.scan != null ? this.spectrumExtents.get(spectrumKey(this.view!.acquisition, row.scan)) : undefined;
+    if (whole) return whole;
     const table = cell.panel.lastFetched?.data.table;
     const mzs = table?.getChild('mz')?.toArray() as Float64Array | undefined;
     return spectrumExtent(mzs ?? new Float64Array(0));
@@ -1765,6 +1826,10 @@ export class MassSpecBrowser {
     this.grid?.dispose();
     this.root.remove();
   }
+}
+
+function spectrumKey(acquisition: string, scan: number): string {
+  return `${acquisition}|scan${scan}`;
 }
 
 /** A target as a peptide: what to trace, without where it was found. */

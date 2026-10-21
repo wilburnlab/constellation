@@ -15,7 +15,7 @@
 import { ensureSvg } from '../engine/svg_layer';
 import { Panel, PanelInit } from './Panel';
 import { SettingsPanel } from './SettingsPanel';
-import { PanelKind, UNKNOWN_KIND_ORDER, pushdownChanged, unitFor } from './kind';
+import { PanelKind, UNKNOWN_KIND_ORDER, encodePushdown, pushdownChanged, unitFor } from './kind';
 import {
   LayoutEntry,
   LayoutStore,
@@ -404,7 +404,7 @@ export class PanelStack<V extends PanelView, D, O> {
       return;
     }
     const view = this.config.driver.view();
-    if (!view || cached.viewKey !== view.key) {
+    if (!view || cached.viewKey !== this.dataKey(track, view)) {
       // Viewport moved since the last fetch — schedule a full render.
       this.config.requestRender();
       return;
@@ -422,6 +422,14 @@ export class PanelStack<V extends PanelView, D, O> {
         err,
       );
     }
+  }
+
+  /** What a panel's data depends on: the view, and the values of its
+   *  kind's server-side filters. A request still running for an older
+   *  filter value is then a different request, not the one wanted. */
+  private dataKey(track: Panel<D>, view: V): string {
+    const pushed = encodePushdown(this.config.kindOf(track.entry.kind), track.filter);
+    return Object.keys(pushed).length ? `${view.key}|${JSON.stringify(pushed)}` : view.key;
   }
 
   /** Fetch and draw every visible panel for the host's current view.
@@ -447,7 +455,7 @@ export class PanelStack<V extends PanelView, D, O> {
       }
       plans.push({
         target: track,
-        key: view.key,
+        key: this.dataKey(track, view),
         fetch: (signal: AbortSignal) => this.config.driver.fetch(track, view, signal),
       });
     }

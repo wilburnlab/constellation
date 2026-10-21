@@ -79,14 +79,17 @@ const LADDER = [
   { ion_type: 'y', ion_number: 4, position: 3, fragment_charge: 1, loss: null, mz: 500.3, annotation: 'y4' },
 ];
 
-function precursorJson(id: string): Record<string, unknown> {
-  const row = IDS.find((r) => r.precursor_id === id)!;
+function precursorJson(id: string, scan: number | null = null): Record<string, unknown> {
+  const found = IDS.find((r) => r.precursor_id === id)!;
+  // Asked for one match (spectrum-centric): that match's scan, time and score.
+  const row = scan === null ? found : { ...found, rt: scan, qvalue: null, scan };
   const window = row.precursor_mz > 402 ? 1 : 0;
+  const ms = scan ?? (window === 1 ? 9 : 5);
   return {
     identification: { ...row, precursor_id: Number(id), rt_start: row.rt - 1.5, rt_end: row.rt + 1.5 },
     experiment: 'src-exp',
     unit: 'run_a-1234abcd',
-    located: { window, isolation: [400, 402], ms_scan: window === 1 ? 9 : 5, parent_scan: window === 1 ? 7 : 4 },
+    located: { window, isolation: [400, 402], ms_scan: ms, parent_scan: ms - ((ms - 1) % 3) },
     ms1_targets: [
       { mz: row.precursor_mz, label: 'M' },
       { mz: row.precursor_mz + 0.5, label: 'M+1' },
@@ -192,10 +195,25 @@ interface Server {
   posted: Record<string, unknown>;
   /** What `GET /api/commands/{id}` answers. */
   job: { state: string; exit_code: number | null };
+  acquisitions: AcquisitionInfo[];
+  /** A scan table that answers only when this resolves, by acquisition key. */
+  holdScans: Record<string, Promise<void>>;
+  /** Scans a reduced chromatogram leaves out. */
+  dropScans: number[];
+  /** Spectra come back reduced. */
+  reduced: boolean;
 }
 
 function fakeServer(dda = false): Server {
-  const server: Server = { requests: [], posted: {}, job: { state: 'running', exit_code: null } };
+  const server: Server = {
+    requests: [],
+    posted: {},
+    job: { state: 'running', exit_code: null },
+    acquisitions: [dda ? DDA_ACQ : ACQ],
+    holdScans: {},
+    dropScans: [],
+    reduced: false,
+  };
   const scans = dda ? DDA_SCANS : SCANS;
   const arrow = (t: Table) =>
     new Response(tableToIPC(t, 'stream') as unknown as BodyInit, { headers: { 'X-Track-Mode': 'vector' } });
@@ -208,12 +226,18 @@ function fakeServer(dda = false): Server {
       return Response.json({ job_id: 'job-1', argv: [], started_at: '', state: 'running' });
     }
     if (p === '/api/commands/job-1') return Response.json({ job_id: 'job-1', ...server.job });
-    if (p.endsWith('/acquisitions')) return Response.json([dda ? DDA_ACQ : ACQ]);
+    if (p.endsWith('/acquisitions')) return Response.json(server.acquisitions);
     if (p.endsWith('/windows')) return Response.json(dda ? [] : WINDOWS);
-    if (p.endsWith('/scans')) return arrow(scanTable(scans));
+    if (p.endsWith('/scans')) {
+      await server.holdScans[p.split('/').at(-2)!];
+      return arrow(scanTable(scans));
+    }
     if (/\/scans\/\d+$/.test(p)) return Response.json({ scan: Number(p.split('/').pop()), filter_string: 'ITMS + c NSI d Full ms2' });
     if (p.endsWith('/identifications')) return arrow(identifications());
-    if (p.endsWith('/precursor')) return Response.json(precursorJson(url.searchParams.get('precursor_id')!));
+    if (p.endsWith('/precursor')) {
+      const scan = url.searchParams.get('scan');
+      return Response.json(precursorJson(url.searchParams.get('precursor_id')!, scan === null ? null : Number(scan)));
+    }
     if (p.endsWith('/resolve')) {
       return Response.json({
         modified_sequence: 'SAMPLER',
@@ -229,10 +253,14 @@ function fakeServer(dda = false): Server {
     if (p === '/api/tracks/ms_chromatogram/data') {
       const level = Number(url.searchParams.get('level'));
       const window = url.searchParams.get('window');
-      return arrow(trace(scans.filter((s) => s.level === level && (window === null || s.window === Number(window)))));
+      const kept = scans.filter((s) => s.level === level && (window === null || s.window === Number(window)));
+      return arrow(trace(kept.filter((s) => !server.dropScans.includes(s.scan))));
     }
     if (p === '/api/tracks/ms_spectrum/data') {
-      return arrow(spectrum(Number(url.searchParams.get('scan')), url.searchParams.has('modified_sequence')));
+      const table = spectrum(Number(url.searchParams.get('scan')), url.searchParams.has('modified_sequence'));
+      if (!server.reduced) return arrow(table);
+      const flag = vectorFromArray(Array.from({ length: table.numRows }, () => true), new Bool());
+      return arrow(new Table({ ...Object.fromEntries(table.schema.fields.map((f) => [f.name, table.getChild(f.name)!])), decimated: flag }));
     }
     return new Response('not found', { status: 404 });
   });
@@ -253,8 +281,9 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-async function open(dda = false): Promise<{ b: MassSpecBrowser; server: Server }> {
+async function open(dda = false, setup?: (server: Server) => void): Promise<{ b: MassSpecBrowser; server: Server }> {
   const server = fakeServer(dda);
+  setup?.(server);
   const b = (browser = new MassSpecBrowser({ host, sessionId: 'sess-1' }));
   await b.mount();
   // jsdom lays nothing out: give the grid the size a window would.
@@ -509,6 +538,86 @@ describe('MassSpecBrowser', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('a spectrum-centric match is shown at its own scan, time and score', async () => {
+    const { b, server } = await open();
+    await vi.waitFor(() => expect(b.identificationRows.length).toBe(2));
+    const match = { ...b.identificationRows[0], scan: 12, key: `${b.identificationRows[0].key}|12` };
+    await b.selectIdentification(match);
+    expect(server.requests.find((r) => r.includes('/precursor?'))).toContain('scan=12');
+    const t = b.currentView!.target!;
+    expect([t.rt, t.qvalue, t.apexScans.ms2, t.key.endsWith('|12')]).toEqual([12, null, 12, true]);
+    expect(b.currentView!.rows.ms2.scan).toBe(12);
+  });
+
+  it('a slow reply for a run already left does not replace the run chosen after it', async () => {
+    let release!: () => void;
+    const { b } = await open(false, (server) => {
+      server.acquisitions = [ACQ, { ...ACQ, key: 'src-b', label: 'run_b' }, { ...ACQ, key: 'src-c', label: 'run_c' }];
+      server.holdScans['src-b'] = new Promise<void>((resolve) => (release = resolve));
+    });
+    const slow = b.showAcquisition('src-b');
+    await b.showAcquisition('src-c');
+    release();
+    await slow;
+    expect(b.currentView!.acquisition).toBe('src-c');
+    expect(host.querySelector<HTMLSelectElement>('.ms-toolbar select')!.value).toBe('src-c');
+  });
+
+  it("DDA: a target's scan events are drawn even when the server's reduced trace left them out", async () => {
+    const { b } = await open(true, (server) => {
+      server.dropScans = [11];
+    });
+    await b.tracePeptide('SAMPLER', 2);
+    await b.renderNow();
+    const sticks = b.panelGrid!.cell('ms2', 'chrom')!.panel.bodyHost.querySelector('.ms-trace')!.getAttribute('d')!;
+    expect(sticks.match(/M/g)!.length).toBe(3);
+  });
+
+  it('a reduced spectrum is fetched again for the m/z window shown', async () => {
+    const { b, server } = await open();
+    // A spectrum sent whole zooms on what it has.
+    server.requests.length = 0;
+    b.currentView!.rows.ms1.mz = [250, 260];
+    await b.renderNow();
+    expect(server.requests.filter((r) => r.startsWith('/api/tracks/ms_spectrum/data'))).toEqual([]);
+    // One the server reduced is asked for again, for the window shown.
+    server.reduced = true;
+    b.selectScan(rowId(2), 12);
+    await b.renderNow();
+    server.requests.length = 0;
+    b.currentView!.rows.ms2.mz = [300, 320];
+    await b.renderNow();
+    const spec = server.requests.filter((r) => r.startsWith('/api/tracks/ms_spectrum/data'));
+    // Each reduced spectrum, for its own window (MS1 kept the one set above).
+    expect(spec.map((r) => new URL(r, 'http://x').searchParams.get('scan')).sort()).toEqual(['10', '12']);
+    expect(spec.find((r) => r.includes('scan=12'))).toContain('mz_start=300&mz_end=320');
+    expect(spec.find((r) => r.includes('scan=10'))).toContain('mz_start=250&mz_end=260');
+  });
+
+  it("back restores each row's m/z window with the target", async () => {
+    const { b } = await open();
+    await vi.waitFor(() => expect(b.identificationRows.length).toBe(2));
+    await b.selectIdentification(b.identificationRows[0]); // PEPTIDEK, 403.2
+    const first = [...b.currentView!.rows.ms1.mz!];
+    await b.selectIdentification(b.identificationRows[1]); // ELVISK, 401.1
+    expect(b.currentView!.rows.ms1.mz).not.toEqual(first);
+    await b.go(-1);
+    expect(b.currentView!.target!.label).toBe('PEPTIDEK/2');
+    expect(b.currentView!.rows.ms1.mz).toEqual(first);
+  });
+
+  it('the ions are no longer lit once the spectrum shown did not isolate the target', async () => {
+    const { b } = await open();
+    await vi.waitFor(() => expect(b.identificationRows.length).toBe(2));
+    await b.selectIdentification(b.identificationRows[0]);
+    await b.renderNow();
+    expect(host.querySelectorAll('.ms-ion-table .matched').length).toBe(1);
+    b.setWindow(rowId(2), 0); // 400-402: not PEPTIDEK's 403.2
+    await b.renderNow();
+    expect(host.querySelectorAll('.ms-ion-table .matched').length).toBe(0);
+    expect(host.querySelector('.ms-drawer-ions')!.textContent).toContain('did not isolate');
   });
 
   it('converts tolerances to m/z', () => {

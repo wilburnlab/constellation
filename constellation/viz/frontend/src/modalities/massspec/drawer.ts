@@ -234,8 +234,9 @@ export class Drawer {
     }
   }
 
-  /** The ion table of `target`, with the ions in `matched` (mzPAF labels) lit. */
-  setIons(target: Target | null, matched: Set<string>): void {
+  /** The ion table of `target`, with the ions in `matched` (mzPAF labels)
+   *  lit; `why` replaces the count under it. */
+  setIons(target: Target | null, matched: Set<string>, why?: string): void {
     const body = this.tabs.get('ions')!.body;
     body.replaceChildren();
     if (!target) {
@@ -273,7 +274,9 @@ export class Drawer {
     });
     body.appendChild(table);
     const counted = [...matched].filter((l) => !l.startsWith('p')).length;
-    body.appendChild(note(`${counted} ion${counted === 1 ? '' : 's'} matched in the spectrum shown (any charge or loss).`));
+    body.appendChild(
+      note(why ?? `${counted} ion${counted === 1 ? '' : 's'} matched in the spectrum shown (any charge or loss).`),
+    );
   }
 
   setScan(header: Record<string, unknown> | null): void {

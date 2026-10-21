@@ -142,12 +142,34 @@ def _unit_manifest(experiment_dir: Path, unit: str) -> dict[str, Any]:
 # ── searches ──────────────────────────────────────────────────────────────
 
 
+#: The jar's tolerance flags: (value flag, unit flag) by tolerance.
+_TOLERANCE_FLAGS = {"fragment_tolerance": ("-ftol", "-ftolunits"), "precursor_tolerance": ("-ptol", "-ptolunits")}
+_TOLERANCE_UNITS = {"ppm": "ppm", "amu": "Da", "da": "Da"}
+
+
+def _tolerance(manifest: dict[str, Any], name: str) -> dict[str, Any] | None:
+    """A search's ``name`` tolerance as ``{"value", "unit"}``: the one the
+    engine recorded running with when it recorded one (ScribeTwo adjusts
+    what it is given, and records the adjusted value), else as given."""
+    recorded = manifest.get("engine_settings") or {}
+    value_flag, unit_flag = _TOLERANCE_FLAGS[name]
+    unit = _TOLERANCE_UNITS.get(str(recorded.get(unit_flag, "")).lower())
+    try:
+        value = float(recorded[value_flag])
+    except (KeyError, TypeError, ValueError):
+        value = None
+    if value is not None and unit is not None:
+        return {"value": value, "unit": unit}
+    return (manifest.get("parameters") or {}).get(name)
+
+
 def search_units(experiment_dir: Path | str) -> list[dict[str, Any]]:
     """The experiment's finished searches, as plain data: ``unit``,
     ``search_mode``, ``engine``, ``program``, ``acquisition_ids``,
     ``library`` (path or None), ``fragment_tolerance`` /
-    ``precursor_tolerance`` (``{"value", "unit"}`` as given), and for a
-    merged search ``merged_from`` (the fractions' acquisition ids)."""
+    ``precursor_tolerance`` (``{"value", "unit"}``, as the engine recorded
+    running with them, else as given), and for a merged search
+    ``merged_from`` (the fractions' acquisition ids)."""
     root = Path(experiment_dir)
     out = []
     for manifest_path in sorted((root / "units").glob("*/manifest.json")):
@@ -156,7 +178,6 @@ def search_units(experiment_dir: Path | str) -> list[dict[str, Any]]:
             continue
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
         inputs = data.get("inputs") or {}
-        parameters = data.get("parameters") or {}
         merged = inputs.get("sources")
         out.append(
             {
@@ -166,8 +187,8 @@ def search_units(experiment_dir: Path | str) -> list[dict[str, Any]]:
                 "program": data.get("program") or "",
                 "acquisition_ids": [int(a) for a in data.get("acquisition_ids") or ()],
                 "library": (inputs.get("library") or {}).get("path"),
-                "fragment_tolerance": parameters.get("fragment_tolerance"),
-                "precursor_tolerance": parameters.get("precursor_tolerance"),
+                "fragment_tolerance": _tolerance(data, "fragment_tolerance"),
+                "precursor_tolerance": _tolerance(data, "precursor_tolerance"),
                 "merged_from": [int(s["acquisition_id"]) for s in merged] if merged else None,
             }
         )
@@ -238,13 +259,24 @@ def _peptide_centric(
 
 
 def _spectrum_centric(
-    root: Path, unit: str, acquisition_id: int | None, where: ds.Expression | None
+    root: Path, unit: str, acquisition_id: int | None, where: ds.Expression | None, max_qvalue: float | None
 ) -> pa.Table | None:
     psm = _read(root, "psm", unit=unit, acquisition_id=acquisition_id, where=where,
                 columns=["precursor_id", "modified_sequence", "sequence", "charge", "mz", "retention_time_s",
                          "scan", "score", "qvalue", "pep", "proteins", "is_decoy"])
     if psm is None or psm.num_rows == 0:
         return None
+    if max_qvalue is not None:
+        # ScribeTwo scores the best match of each precursor; its other
+        # matches carry no q-value and are accepted, or not, with it.
+        keys = ["unit", "acquisition_id", "precursor_id"]
+        scored = psm.filter(pc.is_valid(psm.column("qvalue")))
+        best = scored.group_by(keys, use_threads=False).aggregate([("qvalue", "min")])
+        psm = psm.join(best, keys=keys, join_type="left outer")
+        q = pc.coalesce(psm.column("qvalue"), psm.column("qvalue_min"))
+        psm = psm.filter(pc.fill_null(pc.less_equal(q, max_qvalue), False)).drop_columns(["qvalue_min"])
+        if psm.num_rows == 0:
+            return None
     precursors = _read(root, "precursor", unit=unit, acquisition_id=acquisition_id, shared=True,
                        columns=["precursor_id", "peptide_id", "precursor_mz"])
     table = psm.rename_columns(
@@ -293,10 +325,15 @@ def identifications(
     its reported apex (``rt``) and integration window. A spectrum-centric
     search gives one row per match it scored, with the matched ``scan``.
     ``unit`` and ``acquisition_id`` narrow the read; rows say which search
-    and run they belong to either way. Rows above ``max_qvalue`` are left
-    out (None keeps every row; a row without a q-value is kept), and so are
-    decoy matches unless ``include_decoys``. ``precursor_id`` reads the
-    rows of one precursor only.
+    and run they belong to either way. Only finished searches are read: a
+    quantitative report (``reports/``) re-quantifies runs under a key of
+    its own, and is read only when ``unit`` names it. Rows above
+    ``max_qvalue`` are left out (None keeps every row), and so are decoy
+    matches unless ``include_decoys``. A peptide-centric row without a
+    q-value is kept; a spectrum-centric match without one (ScribeTwo
+    scores only the best match of each precursor) is kept when its
+    precursor's best match is within ``max_qvalue``. ``precursor_id``
+    reads the rows of one precursor only.
     """
     root = Path(experiment_dir)
     where = None if precursor_id is None else ds.field("precursor_id") == precursor_id
@@ -306,11 +343,12 @@ def identifications(
     if not (unit is not None and unit in centric):
         found = _peptide_centric(root, unit, acquisition_id, where)
         if found is not None:
-            if centric:  # a spectrum-centric search's quantities are not identifications here
-                found = found.filter(pc.invert(pc.is_in(found.column("unit"), pa.array(centric))))
+            if unit is None:  # the searches' rows, not a report's
+                peptide_centric = [u for u, m in modes.items() if m != "spectrum-centric"]
+                found = found.filter(pc.is_in(found.column("unit"), pa.array(peptide_centric, pa.string())))
             parts.append(found)
     for u in centric:
-        found = _spectrum_centric(root, u, acquisition_id, where)
+        found = _spectrum_centric(root, u, acquisition_id, where, max_qvalue)
         if found is not None:
             parts.append(found)
     table = pa.concat_tables(parts) if parts else IDENTIFICATION_SCHEMA.empty_table()
@@ -420,19 +458,25 @@ def acquisition_bundles(
 
 
 def precursor_detail(
-    experiment_dir: Path | str, precursor_id: int, *, unit: str, acquisition_id: int
+    experiment_dir: Path | str, precursor_id: int, *, unit: str, acquisition_id: int, scan: int | None = None
 ) -> dict[str, Any]:
     """Everything a search recorded about one precursor in one run, as
-    plain data: its identification row (``None`` if it has none),
+    plain data: its identification row (``None`` if it has none; for a
+    spectrum-centric search, which matches a precursor in several scans,
+    the match in ``scan``, else the best-scored match),
     ``quantified_ions`` (m/z, intensity, correlation of the ions summed),
     ``chromatogram`` (the engine's median chromatogram: rt, intensity),
     and the search's ``library``, ``fragment_tolerance`` and
-    ``precursor_tolerance``."""
+    ``precursor_tolerance`` (as the engine recorded running with them,
+    else as given)."""
     root = Path(experiment_dir)
-    row = identifications(
+    rows = identifications(
         root, unit=unit, acquisition_id=acquisition_id, max_qvalue=None, include_decoys=True,
         precursor_id=precursor_id,
-    ).slice(0, 1).to_pylist()
+    ).to_pylist()
+    if scan is not None:
+        rows = [r for r in rows if r["scan"] == scan]
+    row = sorted(rows, key=lambda r: (r["qvalue"] is None, r["qvalue"] or 0.0))[:1]
     mine = ds.field("precursor_id") == precursor_id
 
     def rows_of(table: str, columns: list[str]) -> list[dict[str, Any]]:
@@ -440,14 +484,13 @@ def precursor_detail(
         return [] if t is None else t.select(columns).to_pylist()
 
     manifest = _unit_manifest(root, unit)
-    parameters = manifest.get("parameters") or {}
     return {
         "identification": row[0] if row else None,
         "quantified_ions": rows_of("fragment_quant", ["mz", "intensity", "correlation"]),
         "chromatogram": sorted(rows_of("precursor_chromatogram", ["rt", "intensity"]), key=lambda r: r["rt"]),
         "library": ((manifest.get("inputs") or {}).get("library") or {}).get("path"),
-        "fragment_tolerance": parameters.get("fragment_tolerance"),
-        "precursor_tolerance": parameters.get("precursor_tolerance"),
+        "fragment_tolerance": _tolerance(manifest, "fragment_tolerance"),
+        "precursor_tolerance": _tolerance(manifest, "precursor_tolerance"),
     }
 
 

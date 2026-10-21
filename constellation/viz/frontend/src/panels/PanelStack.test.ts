@@ -59,6 +59,8 @@ interface Harness {
   onChanged: ReturnType<typeof vi.fn>;
   view: TimeView | null;
   data: Record<string, number[] | Error>;
+  /** When set, fetches wait for it (a slow server). */
+  gate: Promise<void> | null;
 }
 
 function harness(): Harness {
@@ -77,12 +79,14 @@ function harness(): Harness {
     onChanged: vi.fn(),
     view: { key: '0-10@400', widthPx: 400, t0: 0, t1: 10 } as TimeView | null,
     data: {} as Record<string, number[] | Error>,
+    gate: null,
   } as unknown as Harness;
 
   const driver: PanelDriver<TimeView, number[]> = {
     view: () => h.view,
     fetch: async (panel, view) => {
       h.fetched.push(`${panel.entry.kind}/${panel.entry.binding_id}@${view.key}`);
+      if (h.gate) await h.gate;
       const out = h.data[panel.entry.binding_id] ?? [];
       if (out instanceof Error) throw out;
       return out;
@@ -390,6 +394,23 @@ describe('PanelStack settings', () => {
     expect(h.drawn).toEqual([]);
     expect(h.stack.panels[0].lastFetched).toBeUndefined();
     expect(h.requestRender).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reuse a request still running for an older pushdown value', async () => {
+    const h = await opened();
+    let release!: () => void;
+    h.gate = new Promise<void>((resolve) => (release = resolve));
+    h.view = { key: '5-15@400', widthPx: 400, t0: 5, t1: 15 };
+    const slow = h.stack.render(); // in flight, without smoothing
+    for (let i = 0; i < 5 && h.fetched.length === 0; i++) await Promise.resolve();
+    expect(h.fetched).toHaveLength(1);
+    setNumber('Smoothing', '3');
+    h.gate = null;
+    const fresh = h.stack.render();
+    release();
+    await Promise.all([slow, fresh]);
+    expect(h.fetched).toEqual(['trace/t0@5-15@400', 'trace/t0@5-15@400']);
+    expect(h.stack.panels[0].lastFetched!.viewKey).toBe('5-15@400|{"smoothing":"3"}');
   });
 
   it('asks for a render instead of redrawing when the view moved since the fetch', async () => {

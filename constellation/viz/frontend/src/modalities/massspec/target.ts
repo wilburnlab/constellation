@@ -65,8 +65,9 @@ function tolerance(raw: unknown): [number, ToleranceUnit] | null {
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
 /** A target from `…/acquisitions/{key}/precursor`, asked for `precursorId`
- *  (the id in the reply has been through JSON.parse and may be rounded). */
-export function targetFromPrecursor(json: Record<string, unknown>, precursorId: string): Target {
+ *  (the id in the reply has been through JSON.parse and may be rounded)
+ *  and, for a spectrum-centric match, its `scan`. */
+export function targetFromPrecursor(json: Record<string, unknown>, precursorId: string, scan: number | null = null): Target {
   const id = json.identification as Record<string, unknown>;
   const located = (json.located ?? {}) as Record<string, unknown>;
   const modseq = String(id.modified_sequence ?? '');
@@ -74,7 +75,7 @@ export function targetFromPrecursor(json: Record<string, unknown>, precursorId: 
   const ms1 = (json.ms1_targets as Array<Record<string, unknown>>) ?? [];
   const ms2 = (json.ms2_targets as Array<Record<string, unknown>>) ?? [];
   return {
-    key: `${json.experiment}|${json.unit}|${precursorId}`,
+    key: `${json.experiment}|${json.unit}|${precursorId}${scan !== null ? `|${scan}` : ''}`,
     label: `${modseq}/${charge}`,
     modifiedSequence: modseq,
     sequence: String(id.sequence ?? modseq),

@@ -318,6 +318,12 @@ def test_an_experiment_brings_its_searched_runs_and_their_identifications(client
         params={"experiment": "src-nope", "unit": unit, "precursor_id": row["precursor_id"]},
     )
     assert missing.status_code == 404
+    elsewhere = client.get(
+        f"/api/massspec/sessions/{sid}/acquisitions/{_key(bundle)}/precursor",
+        params={"experiment": search["experiment_source_id"], "unit": unit, "precursor_id": row["precursor_id"],
+                "scan": 999999},
+    )  # fmt: skip
+    assert elsewhere.status_code == 404 and "in scan 999999" in elsewhere.text
 
 
 def test_a_run_without_its_bundle_is_a_warning(client, tmp_path, jar, inputs) -> None:

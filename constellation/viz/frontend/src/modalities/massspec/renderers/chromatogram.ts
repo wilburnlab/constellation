@@ -57,8 +57,9 @@ export interface ChromatogramOptions {
   selectedRt: number | null;
   /** Draw sticks rather than a line (scan events). */
   sticks: boolean;
-  /** For sticks: draw only scans whose precursor m/z this accepts. */
-  stickFilter?: ((mz: number) => boolean) | null;
+  /** For sticks: the scan events to draw instead of the table's (a
+   *  target's, which a reduced table may not hold). */
+  events?: { rt: Float64Array; intensity: Float64Array } | null;
   overlays?: Overlay[];
   /** The integration window, apex and predicted time (seconds). */
   marks?: { start: number | null; end: number | null; apex: number | null; predicted: number | null } | null;
@@ -148,10 +149,9 @@ export function drawChromatogram(
 ): number {
   const overlays = opts.overlays ?? [];
   const traced = overlays.length > 0;
-  const xs = column(table, 'rt');
-  const values = column(table, 'intensity').map((v) => (Number.isFinite(v) ? v : 0));
-  const mzs = opts.stickFilter ? column(table, 'mz') : null;
-  const keep = (i: number): boolean => !mzs || !opts.stickFilter || opts.stickFilter(mzs[i]);
+  const events = opts.sticks ? (opts.events ?? null) : null;
+  const xs = events ? events.rt : column(table, 'rt');
+  const values = (events ? events.intensity : column(table, 'intensity')).map((v) => (Number.isFinite(v) ? v : 0));
 
   // The y axis fits what is drawn: the traces when there are any.
   let max = 0;
@@ -159,7 +159,7 @@ export function drawChromatogram(
     for (const o of overlays) max = Math.max(max, autoYDomain(o.ys, o.xs, opts.rt, 1)[1]);
   } else {
     for (let i = 0; i < xs.length; i++) {
-      if (xs[i] >= opts.rt[0] && xs[i] <= opts.rt[1] && keep(i) && values[i] > max) max = values[i];
+      if (xs[i] >= opts.rt[0] && xs[i] <= opts.rt[1] && values[i] > max) max = values[i];
     }
   }
   const rel = opts.intensity === 'rel';
@@ -224,7 +224,7 @@ export function drawChromatogram(
     let d = '';
     const [lo, hi] = span(xs, opts.rt);
     for (let i = lo; i <= hi; i++) {
-      if (!keep(i)) continue;
+      if (xs[i] < opts.rt[0] || xs[i] > opts.rt[1]) continue;
       shown++;
       d += `M${x.scale(xs[i]).toFixed(1)} ${base.toFixed(1)}V${sy(values[i]).toFixed(1)}`;
     }

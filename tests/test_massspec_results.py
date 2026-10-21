@@ -32,9 +32,10 @@ from constellation.massspec.results import (
 )
 from constellation.massspec.search.encyclopedia.params import SearchParameters, Tolerance
 from constellation.massspec.spectra.annotate import ion_ladder
-from constellation.massspec.workflows.encyclopedia import search_acquisition
+from constellation.massspec.workflows.encyclopedia import report_searches, search_acquisition
 
 from _encyclopedia_fixtures import build_result_library
+from _massspec_fixtures import dda_scans
 from test_massspec_search_workflow import _PEPTIDES, _bundle, _entry, inputs, jar  # noqa: F401
 
 PARAMS = SearchParameters(precursor_tolerance=Tolerance(0.35, "Da"), threads=1, extra={"-fixed": ""})
@@ -50,6 +51,21 @@ def searched(tmp_path: Path, jar, inputs):
     result = search_acquisition(bundle, experiment_dir=experiment, parameters=PARAMS,
                                 fasta=inputs["fasta"], library=library)  # fmt: skip
     return experiment, result.unit, bundle, library
+
+
+@pytest.fixture
+def scribed(tmp_path: Path, jar, inputs):
+    """An experiment holding one spectrum-centric (ScribeTwo) search of a
+    DDA run, given 0.35 Da tolerances that the stand-in, like ScribeTwo,
+    adjusts (to 0.42 Da) and records."""
+    params = SearchParameters(
+        precursor_tolerance=Tolerance(0.35, "Da"), fragment_tolerance=Tolerance(0.35, "Da"),
+        library_fragment_tolerance=Tolerance(0.35, "Da"),
+    )  # fmt: skip
+    experiment = tmp_path / "experiment"
+    result = search_acquisition(_bundle(tmp_path, "dda_run", dda_scans()), experiment_dir=experiment,
+                                parameters=params, fasta=inputs["fasta"])  # fmt: skip
+    return experiment, result.unit
 
 
 def _pid(modseq_proforma: str, charge: int) -> int:
@@ -94,6 +110,56 @@ def test_q_values_and_decoys_filter_rows(searched) -> None:
     q = every.column("qvalue")
     assert strict.num_rows == q.null_count  # only rows without a q-value pass a negative cut
     assert identifications(experiment).num_rows <= every.num_rows
+
+
+def test_a_spectrum_centric_match_is_accepted_with_its_precursor(scribed) -> None:
+    # ScribeTwo scores the best match of each precursor; its other matches
+    # carry no q-value and stand or fall with it.
+    experiment, _ = scribed
+    every = identifications(experiment, max_qvalue=None)
+    best = {}
+    for r in every.to_pylist():
+        if r["qvalue"] is not None:
+            best[r["precursor_id"]] = min(r["qvalue"], best.get(r["precursor_id"], 1.0))
+    assert sorted(best.values())[:2] == pytest.approx([0.001, 0.002])
+    (accepted,) = [pid for pid, q in best.items() if q < 0.0015]
+    strict = identifications(experiment, max_qvalue=0.0015)
+    assert set(strict.column("precursor_id").to_pylist()) == {accepted}
+    assert sorted(strict.column("qvalue").to_pylist(), key=lambda q: q is None) == [pytest.approx(0.001), None]
+    assert len(set(strict.column("scan").to_pylist())) == 2
+
+
+def test_tolerances_are_the_ones_the_search_ran_with(scribed) -> None:
+    experiment, unit = scribed
+    (found,) = search_units(experiment)
+    assert found["fragment_tolerance"] == {"value": 0.42, "unit": "Da"}
+    assert found["precursor_tolerance"] == {"value": 0.42, "unit": "Da"}
+    pid = identifications(experiment).column("precursor_id")[0].as_py()
+    detail = precursor_detail(experiment, pid, unit=unit, acquisition_id=0)
+    assert detail["fragment_tolerance"] == {"value": 0.42, "unit": "Da"}
+
+
+def test_a_spectrum_centric_precursor_is_detailed_at_the_match_asked_for(scribed) -> None:
+    experiment, unit = scribed
+    every = identifications(experiment, max_qvalue=None)
+    pid = every.filter(pc.equal(every.column("qvalue"), 0.001)).column("precursor_id")[0].as_py()
+    rows = every.filter(pc.equal(every.column("precursor_id"), pid)).to_pylist()
+    (best,) = [r for r in rows if r["qvalue"] is not None]
+    (other,) = [r for r in rows if r["qvalue"] is None]
+    assert precursor_detail(experiment, pid, unit=unit, acquisition_id=0)["identification"]["scan"] == best["scan"]
+    found = precursor_detail(experiment, pid, unit=unit, acquisition_id=0, scan=other["scan"])["identification"]
+    assert (found["scan"], found["rt"], found["qvalue"]) == (other["scan"], other["rt"], None)
+    assert precursor_detail(experiment, pid, unit=unit, acquisition_id=0, scan=10**6)["identification"] is None
+
+
+def test_a_report_is_not_a_search_of_the_run(searched, inputs) -> None:
+    # A quantitative report re-quantifies the runs under a key of its own;
+    # what the run's searches identified does not include it.
+    experiment, unit, _, _ = searched
+    report = report_searches(experiment, fasta=inputs["fasta"])
+    reported = pq.ParquetDataset(experiment / "tables" / "precursor_quant").read().column("unit").to_pylist()
+    assert report.key in set(map(str, reported))
+    assert set(identifications(experiment, max_qvalue=None).column("unit").to_pylist()) == {unit}
 
 
 def test_the_searched_bundle_is_found_from_the_search(searched) -> None:

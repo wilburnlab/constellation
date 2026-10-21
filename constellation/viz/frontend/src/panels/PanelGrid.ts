@@ -23,7 +23,7 @@
 
 import { ensureSvg } from '../engine/svg_layer';
 import { Panel, PanelEntry } from './Panel';
-import { PanelKind, pushdownChanged, unitFor } from './kind';
+import { PanelKind, encodePushdown, pushdownChanged, unitFor } from './kind';
 import { RenderScheduler } from './scheduler';
 import { SettingsPanel } from './SettingsPanel';
 import { Bag, SettingsSchema } from './settings_schema';
@@ -224,13 +224,21 @@ export class PanelGrid<V, D> {
     this.colHeaders.clear();
     this.root.replaceChildren();
 
+    // Every item has an explicit place: hidden items (a focused row or
+    // column hides the others) leave no hole for auto-placement to fill
+    // with the wrong cell.
+    const place = (el: HTMLElement, row: number, col: number): HTMLElement => {
+      el.style.gridRow = String(row);
+      el.style.gridColumn = String(col);
+      return el;
+    };
     const corner = document.createElement('div');
     corner.className = 'panel-grid-corner';
-    this.root.appendChild(corner);
-    this.cols.forEach((col, i) => this.root.appendChild(this.buildColHeader(col, i)));
+    this.root.appendChild(place(corner, 1, 1));
+    this.cols.forEach((col, i) => this.root.appendChild(place(this.buildColHeader(col, i), 1, i + 2)));
     this.rows.forEach((row, i) => {
-      this.root.appendChild(this.buildRowHeader(row, i));
-      for (const col of this.cols) {
+      this.root.appendChild(place(this.buildRowHeader(row, i), i + 2, 1));
+      for (const [j, col] of this.cols.entries()) {
         const entry = this.config.cellEntry(row.id, col.id);
         const id = `${row.id}/${col.id}`;
         const saved = this.state.cells[id] ?? {};
@@ -246,6 +254,7 @@ export class PanelGrid<V, D> {
           filter: saved.filter ?? {},
         });
         panel.element.classList.add('panel-grid-cell');
+        place(panel.element, i + 2, j + 2);
         panel.element.dataset.row = row.id;
         panel.element.dataset.col = col.id;
         const cell: GridCell<D> = { row: row.id, col: col.id, id, panel };
@@ -515,7 +524,11 @@ export class PanelGrid<V, D> {
         if (cell.panel.collapsed) cell.panel.statusEl.textContent = 'collapsed';
         continue;
       }
-      const key = this.config.driver.dataKey(cell, view);
+      // The kind's server-side filter values are part of what is fetched,
+      // whether or not the host's key names them.
+      const hostKey = this.config.driver.dataKey(cell, view);
+      const pushed = encodePushdown(this.config.kindOf(cell.panel.entry.kind), cell.panel.filter);
+      const key = hostKey !== null && Object.keys(pushed).length ? `${hostKey}|${JSON.stringify(pushed)}` : hostKey;
       plans.push({
         target: cell,
         key,

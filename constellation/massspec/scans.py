@@ -484,8 +484,13 @@ def xic(
         for t in range(n_t):
             lo, hi = targets[t] - half[t], targets[t] + half[t]
             if index is not None and partition is not None:
+                # An index may store times as float32 (``downcast``), which
+                # can put the first or last scan just outside exact float64
+                # bounds; the bounds are widened past that rounding, and
+                # which scans count is decided below by scan number.
+                pad = 1e-3 + 1e-6 * max(abs(lo_rt), abs(hi_rt))
                 peaks = index_slice(
-                    index, level=level, window_id=partition, mz_lo=lo, mz_hi=hi, rt_lo=lo_rt, rt_hi=hi_rt
+                    index, level=level, window_id=partition, mz_lo=lo, mz_hi=hi, rt_lo=lo_rt - pad, rt_hi=hi_rt + pad
                 )
             else:
                 peaks = _peaks(bundle).to_table(
