@@ -59,8 +59,119 @@
   color: var(--danger, #ff6767);
 }
 
+.ms-browser .ms-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+  border-color: var(--border);
+}
+.ms-browser .ms-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Search box and its suggestions. */
+.ms-browser .ms-search {
+  position: relative;
+  flex: 0 1 340px;
+  min-width: 180px;
+}
+.ms-browser .ms-search-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+.ms-browser .ms-search-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.ms-browser .ms-suggest {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 2px);
+  left: 0;
+  min-width: 100%;
+  max-width: min(640px, 90vw);
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+.ms-browser .ms-suggest-item {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 4px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ms-browser .ms-suggest-item.active,
+.ms-browser .ms-suggest-item:hover {
+  background: rgba(var(--accent-rgb, 162, 119, 255), 0.18);
+}
+.ms-browser .ms-suggest-label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--fg);
+}
+.ms-browser .ms-suggest-detail {
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Target and added-trace chips. */
+.ms-browser .ms-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.ms-browser .ms-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 4px 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elev);
+  font-variant-numeric: tabular-nums;
+}
+.ms-browser .ms-chip-target {
+  border-color: var(--accent);
+}
+.ms-browser .ms-chip-remove {
+  background: none;
+  border: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 2px;
+}
+.ms-browser .ms-chip-remove:hover {
+  color: var(--fg);
+}
+.ms-browser .ms-chip-note {
+  color: var(--fg-dim);
+}
+
+.ms-browser .ms-main {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
 .ms-browser .ms-grid-host {
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
 }
@@ -87,4 +198,184 @@
 .ms-browser .track-body {
   cursor: crosshair;
   touch-action: none;
+}
+
+/* Peak tooltip in a spectrum cell. */
+.ms-browser .ms-tooltip {
+  position: absolute;
+  top: 16px;
+  z-index: 5;
+  padding: 2px 6px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.ms-browser .ms-cell-btn {
+  font-size: 11px;
+}
+
+/* The drawer: identifications, the target's ions, the scan header. */
+.ms-browser .ms-drawer {
+  flex: 0 0 380px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+  font-size: 12px;
+}
+.ms-browser .ms-drawer[hidden] {
+  display: none;
+}
+.ms-browser .ms-drawer-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+}
+.ms-browser .ms-drawer-tab {
+  flex: 1 1 0;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--fg-dim);
+  padding: 6px 4px;
+  font: inherit;
+  cursor: pointer;
+}
+.ms-browser .ms-drawer-tab.active {
+  color: var(--fg);
+  border-bottom-color: var(--accent);
+}
+.ms-browser .ms-drawer-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 8px;
+}
+.ms-browser .ms-drawer-body[hidden] {
+  display: none;
+}
+.ms-browser .ms-drawer-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.ms-browser .ms-drawer-controls input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg-elev);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font: inherit;
+}
+.ms-browser .ms-drawer-count,
+.ms-browser .ms-drawer-note {
+  color: var(--fg-dim);
+}
+.ms-browser .ms-id-table,
+.ms-browser .ms-ion-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.ms-browser .ms-id-table th,
+.ms-browser .ms-ion-table th {
+  position: sticky;
+  top: -6px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-weight: normal;
+  text-align: left;
+  padding: 3px 4px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.ms-browser .ms-id-table th {
+  cursor: pointer;
+}
+.ms-browser .ms-id-table th.sorted {
+  color: var(--fg);
+}
+.ms-browser .ms-id-table th.sorted[data-dir='asc']::after {
+  content: ' ▲';
+  font-size: 9px;
+}
+.ms-browser .ms-id-table th.sorted[data-dir='desc']::after {
+  content: ' ▼';
+  font-size: 9px;
+}
+.ms-browser .ms-id-table td,
+.ms-browser .ms-ion-table td {
+  padding: 2px 4px;
+  white-space: nowrap;
+}
+.ms-browser .ms-id-table td:first-child {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.ms-browser .ms-id-table td:last-child {
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--fg-dim);
+}
+.ms-browser .ms-id-table tbody tr {
+  cursor: pointer;
+}
+.ms-browser .ms-id-table tbody tr:hover {
+  background: rgba(var(--accent-rgb, 162, 119, 255), 0.1);
+}
+.ms-browser .ms-id-table tbody tr.selected {
+  background: rgba(var(--accent-rgb, 162, 119, 255), 0.22);
+}
+.ms-browser .ms-ions-title {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  margin-bottom: 6px;
+}
+.ms-browser .ms-ion-table td {
+  text-align: right;
+  color: var(--fg-dim);
+}
+.ms-browser .ms-ion-table td.ms-ion-residue {
+  text-align: center;
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.ms-browser .ms-ion-table td.matched {
+  font-weight: 600;
+}
+.ms-browser .ms-coverage {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-bottom: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+.ms-browser .ms-coverage-bond {
+  display: inline-block;
+  width: 5px;
+  height: 14px;
+  margin: 0 1px;
+  border-top: 2px solid transparent;
+  border-bottom: 2px solid transparent;
+}
+.ms-browser .ms-scan-header {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 10px;
+  margin: 0;
+}
+.ms-browser .ms-scan-header dt {
+  color: var(--fg-dim);
+}
+.ms-browser .ms-scan-header dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
 }

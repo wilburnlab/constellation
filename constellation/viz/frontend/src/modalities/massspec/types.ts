@@ -21,6 +21,17 @@ export interface AcquisitionInfo {
   has_index: boolean;
   /** By level: `[value, "ppm" | "Da"]`. */
   default_tolerance: Record<string, [number, string]>;
+  /** The experiments that searched it. */
+  searches: SearchLink[];
+}
+
+/** One experiment's link to an acquisition. */
+export interface SearchLink {
+  experiment: string;
+  experiment_source_id: string;
+  experiment_label: string;
+  acquisition_id: number;
+  units: string[];
 }
 
 /** One DIA isolation window (`…/acquisitions/{key}/windows`). */

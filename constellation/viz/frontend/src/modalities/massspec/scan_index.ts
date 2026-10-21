@@ -22,6 +22,9 @@ export class ScanIndex {
   readonly parents: Int32Array;
   /** Precursor m/z; NaN for none. */
   readonly precursorMz: Float64Array;
+  /** Isolation window bounds; NaN for none. */
+  readonly isolationLower: Float64Array;
+  readonly isolationUpper: Float64Array;
   /** Total ion current; 0 when not recorded. */
   readonly tics: Float64Array;
   private readonly rowOfScan = new Map<number, number>();
@@ -36,6 +39,8 @@ export class ScanIndex {
     this.windows = new Int32Array(n).fill(NONE);
     this.parents = new Int32Array(n).fill(NONE);
     this.precursorMz = new Float64Array(n).fill(Number.NaN);
+    this.isolationLower = new Float64Array(n).fill(Number.NaN);
+    this.isolationUpper = new Float64Array(n).fill(Number.NaN);
     this.tics = new Float64Array(n);
     const col = (name: string) => table.getChild(name);
     const scan = col('scan');
@@ -45,6 +50,8 @@ export class ScanIndex {
     const parent = col('parent_scan');
     const precursor = col('precursor_mz');
     const tic = col('tic');
+    const lower = col('isolation_lower');
+    const upper = col('isolation_upper');
     for (let i = 0; i < n; i++) {
       this.scans[i] = Number(scan?.get(i));
       this.levels[i] = Number(level?.get(i));
@@ -55,6 +62,10 @@ export class ScanIndex {
       if (p !== null && p !== undefined) this.parents[i] = Number(p);
       const m = precursor?.get(i);
       if (m !== null && m !== undefined) this.precursorMz[i] = Number(m);
+      const lo = lower?.get(i);
+      if (lo !== null && lo !== undefined) this.isolationLower[i] = Number(lo);
+      const hi = upper?.get(i);
+      if (hi !== null && hi !== undefined) this.isolationUpper[i] = Number(hi);
       const t = tic?.get(i);
       if (t !== null && t !== undefined) this.tics[i] = Number(t);
       this.rowOfScan.set(this.scans[i], i);
@@ -97,6 +108,19 @@ export class ScanIndex {
   parentOf(scan: number): number | null {
     const r = this.rowOfScan.get(scan);
     return r === undefined || this.parents[r] === NONE ? null : this.parents[r];
+  }
+
+  /** Whether `scan` isolated `mz`: within its isolation window when the
+   *  scan records one, else within `slop` of its precursor m/z. Null when
+   *  the scan records neither. */
+  isolates(scan: number, mz: number, slop = 1.5): boolean | null {
+    const r = this.rowOfScan.get(scan);
+    if (r === undefined) return null;
+    const lo = this.isolationLower[r];
+    const hi = this.isolationUpper[r];
+    if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) return mz >= lo && mz <= hi;
+    const p = this.precursorMz[r];
+    return Number.isFinite(p) ? Math.abs(p - mz) <= slop : null;
   }
 
   /** The scan of `level` (and `window`) nearest `rt`. */

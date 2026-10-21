@@ -122,6 +122,69 @@
     matches, and its callers want the former.
   - `searched_library_spectrum` does not re-hash the library (gigabytes);
     a file whose size differs from what the search recorded is not read.
+- **PR G (identifications and targets):** implemented, in two commits.
+  - Server: the `ms_xic` kernel (one trace per m/z, labelled; at most 64
+    per request), annotation on `ms_spectrum` (a peptide, charge,
+    tolerance, ion series, fragment charges and losses as query fields),
+    and three routes: `…/acquisitions/{key}/identifications?max_q=`
+    (Arrow, every linked experiment's, with an `experiment` column),
+    `…/acquisitions/{key}/precursor?experiment=&unit=&precursor_id=` (what
+    to trace for one identification: window and apex scans, isotopes, the
+    most intense stored fragments with their quantified flags, the ion
+    ladder, the median chromatogram, the search's tolerances and the
+    library's retention time mapped onto the run) and `resolve?q=` (a
+    peptide typed by hand, ProForma with an optional `/charge`).
+    `viz massspec --experiment DIR` attaches searches. Measured on the
+    wide-window run: identifications 0.3 s the first time, then 30 ms;
+    the precursor route 1.2 s; an XIC 0.2–0.4 s; an annotated spectrum
+    0.13 s.
+  - Frontend: the search box with suggestions (identifications by peptide
+    or protein, a peptide to trace when nothing identified it, `scan N`,
+    `rt M`, an m/z), the identifications drawer (sortable, filterable,
+    300 rows drawn at a time) with an Ions tab (the b/y table lit with
+    what the shown spectrum matched, and a coverage line) and a Scan tab
+    (the scan's header), the target chip, back and forward, `[` / `]` to
+    step identifications, target traces with the integration window, the
+    reported retention time, the predicted time and the engine's median
+    chromatogram, annotated MS2 spectra with a mass-error strip, isotope
+    markers on MS1, a peak tooltip, traces added by clicking a peak, CSV
+    and spectrum-reference buttons on every cell, and "Build index", which
+    runs `massspec chromatogram build-index` through the dashboard's
+    command runner and polls it. Checked in headless Chrome on the
+    searched wide-window run (31,836 identifications) and on the DDA run
+    alone with a typed peptide.
+  Departures:
+  - The precursor route takes the experiment and the search as well as
+    the id, since a content-derived precursor id names the same precursor
+    in every search; the masses route moves to H1 with the ruler that
+    uses it, and the RT-mapping route to H2.
+  - Identifications are sent at q ≤ 0.01, not every scored precursor, and
+    the drawer shows q-value rather than score. Their 64-bit ids stay
+    strings on the client; a JavaScript number would round them.
+  - With a target, a row's traces replace its TIC rather than sitting on
+    a faint one. On one intensity axis the TIC (up to 1.1e9 in the
+    wide-window run) would flatten a precursor's isotopes (6.5e5 for
+    HAVSEGTK/2), and a second axis is not an option.
+  - Without a peak index, traces are extracted over the target's
+    integration window ±2 min (at most 10 min around the time shown
+    otherwise), and the chip bar says so. On a DDA MS2 row they always
+    cover only the target's time or the time shown: tracing an ion over
+    every MS2 scan of the reference DDA run took 9.7 s and 9 MB, against
+    0.25–0.5 s for 4–10 min.
+  - A row holds at most two added traces. The series palette has eight
+    colours and a target's fragments take six, so no colour is used
+    twice; a third replaces the oldest.
+  - On a DDA run the MS2 cell of a typed peptide opens on the scan that
+    isolated it (or its M+1) with the most signal, and ← / → step among
+    those scans while the target is shown, as Skyline steps through a
+    precursor's MS/MS.
+  - "Copy spectrum reference" copies `run:scan:N`; a USI waits for a
+    dataset accession.
+  - Found on the way: in the wide-window result, EncyclopeDIA's reported
+    retention time (`entries.RTInSeconds`) lies outside its own
+    integration window (`peptidequants.RTInSecondsStart` / `Stop`) for
+    2,731 of 31,079 precursors (the window's centre never does). The
+    browser draws both as the jar recorded them.
 
 ## Context
 
