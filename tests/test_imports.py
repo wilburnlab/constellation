@@ -56,6 +56,7 @@ import constellation.massspec.acquisition_structure
 import constellation.massspec.acquisitions
 import constellation.massspec.manifest
 import constellation.massspec.experiment
+import constellation.massspec.results
 import constellation.massspec.scans
 import constellation.core.detach
 import constellation.core.locks
@@ -85,6 +86,7 @@ import constellation.massspec.peptide.ions
 import constellation.massspec.peptide.match
 import constellation.massspec.peptide.mz
 import constellation.massspec.peptide.neutral_losses
+import constellation.massspec.spectra.annotate
 import constellation.massspec.counter
 import constellation.massspec.counter.attribution
 import constellation.massspec.counter.calibration

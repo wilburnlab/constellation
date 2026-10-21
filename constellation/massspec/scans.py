@@ -16,7 +16,12 @@ view needs, quickly:
   pure functions over that table;
 - :func:`spectrum` / :func:`spectra` — peaks of one or several scans, read
   through row-group pruning on the scan number (rows are in scan order, so
-  a scan sits in one or two row groups).
+  a scan sits in one or two row groups);
+- :func:`xic` — extracted-ion chromatograms of a set of m/z values in one
+  level (and DIA window), from the peak index when the bundle has one and
+  otherwise from ``peaks.parquet`` within a retention-time window;
+- :func:`locate_precursor` — the window a precursor was isolated in and
+  the scans nearest its apex.
 
 Retention times are seconds throughout, as in the bundle.
 """
@@ -40,7 +45,11 @@ from constellation.massspec.acquisition_structure import (
     AcquisitionType,
     infer_acquisition_structure,
 )
-from constellation.massspec.quant.peak_index import find_peak_index
+from constellation.massspec.quant.peak_index import (
+    find_peak_index,
+    index_partition,
+    index_slice,
+)
 
 #: The bundle kinds this module reads.
 BUNDLE_KINDS = ("thermo_acquisition", "encyclopedia_dia_acquisition")
@@ -392,6 +401,173 @@ def spectra(bundle_dir: Path | str, scans: Iterable[int]) -> pa.Table:
     return table.sort_by([("scan", "ascending"), ("mz", "ascending")])
 
 
+# ── extracted-ion chromatograms ───────────────────────────────────────
+
+#: One row per (trace, scan); every scan of the level and window in range,
+#: so a trace drops to zero where its ion is absent.
+XIC_SCHEMA = pa.schema(
+    [
+        pa.field("trace", pa.int16(), nullable=False),
+        pa.field("mz_target", pa.float64(), nullable=False),
+        pa.field("scan", pa.int32(), nullable=False),
+        pa.field("rt", pa.float64(), nullable=False),
+        #: The peak within tolerance nearest the target; 0 when there is none.
+        pa.field("intensity", pa.float64(), nullable=False),
+        #: That peak's m/z; null when there is none.
+        pa.field("mz_observed", pa.float64()),
+    ],
+    metadata={b"schema_name": b"MsXic"},
+)
+
+
+def _half_widths(mz: np.ndarray, tolerance: float, unit: str) -> np.ndarray:
+    if unit == "ppm":
+        return mz * tolerance * 1e-6
+    if unit == "Da":
+        return np.full_like(mz, tolerance)
+    raise ValueError(f"tolerance unit must be 'ppm' or 'Da', not {unit!r}")
+
+
+def xic(
+    bundle_dir: Path | str,
+    mz: Sequence[float],
+    *,
+    level: int,
+    tolerance: float,
+    tolerance_unit: Literal["ppm", "Da"],
+    window: int | None = None,
+    rt_range: tuple[float, float] | None = None,
+    scans: pa.Table | None = None,
+    use_index: bool = True,
+) -> pa.Table:
+    """Extracted-ion chromatograms of each m/z in ``mz`` (``XIC_SCHEMA``).
+
+    The traces run over every scan of ``level`` (and DIA ``window``) within
+    ``rt_range`` (seconds; the whole run when omitted). In each scan a trace
+    takes the peak within tolerance nearest its m/z (the more intense of two
+    equally near), as ``quant.chromatogram``'s extraction does. ``scans`` is
+    the bundle's :func:`scan_table`, when the caller already holds it.
+
+    With a peak index (and ``use_index``), each trace is one m/z slice of
+    its partition. Without one, the read is ``peaks.parquet`` restricted to
+    the scans in range: well under a second for a few minutes of a 100-min
+    run, several seconds for the whole of it (the browser's payload survey).
+    """
+    bundle = Path(bundle_dir)
+    targets = np.asarray(mz, dtype=np.float64)
+    half = _half_widths(targets, tolerance, tolerance_unit)
+    table = scans if scans is not None else scan_table(bundle)
+    sub = _select(table, level, window)
+    if rt_range is not None:
+        rt_col = sub.column("rt")
+        sub = sub.filter(pc.and_(pc.greater_equal(rt_col, rt_range[0]), pc.less_equal(rt_col, rt_range[1])))
+    grid_scans = sub.column("scan").to_numpy(zero_copy_only=False).astype(np.int64)
+    grid_rt = sub.column("rt").to_numpy(zero_copy_only=False).astype(np.float64)
+    order = np.argsort(grid_scans, kind="stable")
+    grid_scans, grid_rt = grid_scans[order], grid_rt[order]
+    n_t, n_s = targets.size, grid_scans.size
+    best_int = np.zeros((n_t, n_s))
+    best_mz = np.full((n_t, n_s), np.nan)
+
+    if n_t and n_s:
+        lo_rt, hi_rt = float(grid_rt.min()), float(grid_rt.max())
+        index = find_peak_index(bundle) if use_index else None
+        partition = None
+        if index is not None:
+            # The index numbers its partitions itself; find this window's by
+            # its bounds (any scan of the window carries them).
+            bounds: tuple[float | None, float | None] = (None, None)
+            if window is not None:
+                first = sub.slice(0, 1).to_pylist()[0]
+                bounds = (first["isolation_lower"], first["isolation_upper"])
+            partition = index_partition(index, level=level, isolation_lower=bounds[0], isolation_upper=bounds[1])
+        for t in range(n_t):
+            lo, hi = targets[t] - half[t], targets[t] + half[t]
+            if index is not None and partition is not None:
+                peaks = index_slice(
+                    index, level=level, window_id=partition, mz_lo=lo, mz_hi=hi, rt_lo=lo_rt, rt_hi=hi_rt
+                )
+            else:
+                peaks = _peaks(bundle).to_table(
+                    columns=["scan", "mz", "intensity"],
+                    filter=(ds.field("rt") >= lo_rt) & (ds.field("rt") <= hi_rt)
+                    & (ds.field("mz") >= lo) & (ds.field("mz") <= hi)
+                    & ds.field("scan").isin(pa.array(grid_scans, pa.int32())),
+                )
+            if peaks.num_rows == 0:
+                continue
+            p_scan = peaks.column("scan").to_numpy(zero_copy_only=False).astype(np.int64)
+            p_mz = peaks.column("mz").to_numpy(zero_copy_only=False).astype(np.float64)
+            p_int = peaks.column("intensity").to_numpy(zero_copy_only=False).astype(np.float64)
+            # The peak nearest the target in each scan (as the XIC extraction
+            # in ``quant.chromatogram`` takes it), the more intense on a tie:
+            # sort by scan, distance, then intensity descending, and keep the
+            # first of each scan.
+            o = np.lexsort((-p_int, np.abs(p_mz - targets[t]), p_scan))
+            p_scan, p_mz, p_int = p_scan[o], p_mz[o], p_int[o]
+            first = np.concatenate([[True], p_scan[1:] != p_scan[:-1]])
+            p_scan, p_mz, p_int = p_scan[first], p_mz[first], p_int[first]
+            at = np.searchsorted(grid_scans, p_scan)
+            ok = (at < n_s) & (grid_scans[np.minimum(at, n_s - 1)] == p_scan)
+            best_int[t, at[ok]] = p_int[ok]
+            best_mz[t, at[ok]] = p_mz[ok]
+
+    observed = best_mz.reshape(-1)
+    return pa.table(
+        {
+            "trace": pa.array(np.repeat(np.arange(n_t), n_s), pa.int16()),
+            "mz_target": pa.array(np.repeat(targets, n_s), pa.float64()),
+            "scan": pa.array(np.tile(grid_scans, n_t), pa.int32()),
+            "rt": pa.array(np.tile(grid_rt, n_t), pa.float64()),
+            "intensity": pa.array(best_int.reshape(-1), pa.float64()),
+            "mz_observed": pa.array(observed, pa.float64(), mask=np.isnan(observed)),
+        },
+        schema=XIC_SCHEMA,
+    )
+
+
+def locate_precursor(
+    scans: pa.Table,
+    *,
+    precursor_mz: float,
+    rt: float,
+    level: int = 2,
+) -> dict[str, object]:
+    """Where a precursor at ``precursor_mz`` eluting at ``rt`` was measured.
+
+    Returns ``window`` (the DIA window of ``level`` isolating it, the one
+    centred nearest when several do; ``None`` for DDA), ``isolation``
+    (that window's bounds, or those of the DDA scan found), ``ms_scan``
+    (the scan of ``level`` nearest ``rt`` that isolated the precursor) and
+    ``parent_scan`` (the scan of the level below nearest ``rt``). A
+    peptide-centric search reports the apex at a scan of the covering
+    window, so ``ms_scan`` is that apex scan exactly.
+    """
+    windows = isolation_window_table(scans)
+    windows = windows.filter(pc.equal(windows.column("level"), level))
+    found: dict[str, object] = {"window": None, "isolation": None, "ms_scan": None}
+    if windows.num_rows:
+        rows = [w for w in windows.to_pylist() if w["isolation_lower"] <= precursor_mz <= w["isolation_upper"]]
+        if rows:
+            w = min(rows, key=lambda r: abs(r["center"] - precursor_mz))
+            found["window"] = w["window"]
+            found["isolation"] = (w["isolation_lower"], w["isolation_upper"])
+            found["ms_scan"] = nearest_scan(scans, rt, level=level, window=w["window"])
+    else:
+        sub = _select(scans, level, None)
+        lo = sub.column("isolation_lower").to_numpy(zero_copy_only=False)
+        hi = sub.column("isolation_upper").to_numpy(zero_copy_only=False)
+        covers = (lo <= precursor_mz) & (hi >= precursor_mz)
+        if covers.any():
+            idx = np.flatnonzero(covers)
+            times = sub.column("rt").to_numpy(zero_copy_only=False)[idx]
+            best = int(idx[int(np.argmin(np.abs(times - rt)))])
+            found["ms_scan"] = int(sub.column("scan")[best].as_py())
+            found["isolation"] = (float(lo[best]), float(hi[best]))
+    found["parent_scan"] = nearest_scan(scans, rt, level=level - 1) if level > 1 else None
+    return found
+
+
 __all__ = [
     "BUNDLE_KINDS",
     "DEFAULT_TOLERANCES",
@@ -401,11 +577,14 @@ __all__ = [
     "chromatogram",
     "default_tolerance",
     "dependent_scans",
+    "XIC_SCHEMA",
     "isolation_window_table",
+    "locate_precursor",
     "nearest_scan",
     "open_acquisition",
     "parent_scan",
     "scan_table",
     "spectra",
     "spectrum",
+    "xic",
 ]

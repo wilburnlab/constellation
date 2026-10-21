@@ -78,6 +78,50 @@
   Departure: `zoomLocus` and `attachPanZoom` stay as thin genome-specific
   wrappers rather than being removed, so their callers and tests are
   unchanged.
+- **PR F (domain, slice 2):** implemented.
+  - The peak index is built streaming (`quant.peak_index`): the windows are
+    found from three columns, each batch is appended to its partition's
+    spill file, and each partition is then sorted alone. On synthetic DIA
+    and binned DDA runs it writes exactly what the in-memory build wrote
+    (manifest and every partition), reading seven peaks per batch or all at
+    once. On the reference runs: DDA, 195M peaks, 6 min and 6.8 GB peak
+    (the in-memory build was killed at 23.2 GB); wide-window DIA, 294M
+    peaks, 10 min and 9.6 GB, 3.5 GB of index. Also `index_slice` (an m/z
+    slice of one partition, row-group pruned), `index_partition` (a window's
+    partition by its bounds) and a `row_group_size` option.
+  - `scans.xic` (one zero-filled trace per m/z over a level and DIA window,
+    from the index or from `peaks.parquet` within an RT window) and
+    `scans.locate_precursor` (the covering window and the apex scans).
+  - `spectra.annotate`: `annotate_spectrum` (mzPAF labels, ion number,
+    charge, loss and error per peak; the intact precursor as `p`) and
+    `ion_ladder` (the theoretical ions, numbered as labels are).
+  - `massspec.results`: `search_units`, `identifications` (peptide-centric
+    quantities or spectrum-centric matches with their scans, joined with
+    peptides, scores and proteins; partition-filtered), `acquisition_bundles`
+    (the plan's linking rules), `precursor_detail`, `library_spectrum`,
+    `searched_library_spectrum` (EncyclopeDIA's own index on sequence and
+    charge, the entry recognised by its content-derived precursor id) and
+    `rt_mapping`.
+  - Checked on eight random identifications of the searched wide-window
+    run: the apex scan is within 0.0001 s of `rt_observed`; `xic` from the
+    index equals `xic` from `peaks.parquet` (35–50 ms against 250–340 ms
+    for ±2 min) and, on the scans `extract_xic_scan_major` reads (the
+    integration window), equals it; annotating the apex MS2 scan labels
+    12–53 peaks; and no b/y label of the stored result spectra disagrees
+    with the ion ladder. `identifications` of the run: 31,836 rows in
+    1.2 s; `precursor_detail` 0.1–0.2 s; `library_spectrum` under 0.1 s;
+    a searched-library lookup 20 ms.
+  Departures:
+  - `xic` takes, in each scan, the peak within tolerance nearest the
+    target (the more intense of two equally near), as the existing XIC
+    extraction does, so the two agree; "most intense" would pull in an
+    interferer sharing the window.
+  - `quant.targets.targets_from_experiment` was left as it is rather than
+    delegating to `identifications`: for a spectrum-centric search it lists
+    the quantified precursors, while `identifications` lists the scored
+    matches, and its callers want the former.
+  - `searched_library_spectrum` does not re-hash the library (gigabytes);
+    a file whose size differs from what the search recorded is not read.
 
 ## Context
 

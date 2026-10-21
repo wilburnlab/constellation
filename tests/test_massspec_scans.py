@@ -16,12 +16,14 @@ from constellation.massspec.scans import (
     default_tolerance,
     dependent_scans,
     isolation_window_table,
+    locate_precursor,
     nearest_scan,
     open_acquisition,
     parent_scan,
     scan_table,
     spectra,
     spectrum,
+    xic,
 )
 
 from _massspec_fixtures import (
@@ -231,3 +233,86 @@ def test_an_imported_bundle_reads_the_same_way(tmp_path: Path, dia) -> None:
     bpc = chromatogram(table, level=1, kind="bpc")
     expected = [s.get("base_peak_mz") for s in scans if s["level"] == 1]
     assert bpc.column("mz").to_pylist() == expected
+
+
+# ── extracted-ion chromatograms and precursor location ───────────────────
+
+
+def _expected_trace(scans: list[dict], target: float, half: float, keep) -> dict[int, float]:
+    """Brute force: per kept scan, the peak within tolerance nearest the
+    target (the more intense on a tie), 0 if none."""
+    out = {}
+    for s in scans:
+        if not keep(s):
+            continue
+        hits = [(abs(m - target), -i, i) for m, i in zip(s["mz"], s["intensity"]) if abs(m - target) <= half]
+        out[s["scan"]] = min(hits)[2] if hits else 0.0
+    return out
+
+
+def test_xic_matches_brute_force_with_and_without_the_index(dia) -> None:
+    bundle, scans = dia
+    ms2 = [s for s in scans if s["level"] == 2 and s["mz"].size]
+    target = float(ms2[4]["mz"][1])  # a real peak of one MS2 scan
+    table = scan_table(bundle)
+    window = table.filter(pc.equal(table.column("scan"), ms2[4]["scan"])).column("window")[0].as_py()
+    lower = round(ms2[4]["isolation_lower"], 6)
+
+    def in_window(s):
+        return s["level"] == 2 and round(s["isolation_lower"], 6) == lower
+
+    expected = _expected_trace(scans, target, 0.5, in_window)
+    plain = xic(bundle, [target], level=2, window=window, tolerance=0.5, tolerance_unit="Da")
+    assert dict(zip(plain.column("scan").to_pylist(), plain.column("intensity").to_pylist())) == expected
+    assert plain.column("mz_observed").null_count == sum(v == 0 for v in expected.values())
+
+    build_peak_index(bundle, bundle / "mz_index")
+    indexed = xic(bundle, [target], level=2, window=window, tolerance=0.5, tolerance_unit="Da")
+    assert indexed.equals(plain)
+
+
+def test_xic_zero_fills_and_respects_the_rt_window(dia) -> None:
+    bundle, scans = dia
+    rts = [s["rt"] for s in scans if s["level"] == 1]
+    out = xic(bundle, [5000.0, 123.0], level=1, tolerance=10, tolerance_unit="ppm", rt_range=(rts[2], rts[5]))
+    assert out.column("trace").to_pylist() == [0] * 4 + [1] * 4
+    assert set(out.column("intensity").to_pylist()) == {0.0}
+    assert out.column("mz_observed").null_count == 8
+    assert min(out.column("rt").to_pylist()) == rts[2] and max(out.column("rt").to_pylist()) == rts[5]
+
+
+def test_locating_a_dia_precursor(dia) -> None:
+    bundle, scans = dia
+    table = scan_table(bundle)
+    windows = isolation_window_table(table).to_pylist()
+    w = windows[1]
+    target_scan = [s for s in scans if s["level"] == 2 and round(s["isolation_lower"], 4) == round(w["isolation_lower"], 4)][3]
+    found = locate_precursor(table, precursor_mz=w["center"], rt=target_scan["rt"])
+    assert found["window"] == w["window"]
+    assert found["ms_scan"] == target_scan["scan"]
+    assert found["parent_scan"] == nearest_scan(table, target_scan["rt"], level=1)
+    nowhere = locate_precursor(table, precursor_mz=2000.0, rt=target_scan["rt"])
+    assert nowhere["window"] is None and nowhere["ms_scan"] is None
+
+
+def test_locating_a_dda_precursor(dda) -> None:
+    bundle, scans = dda
+    table = scan_table(bundle)
+    picked = [s for s in scans if s["level"] == 2][7]
+    found = locate_precursor(table, precursor_mz=picked["precursor_mz"], rt=picked["rt"])
+    assert found["window"] is None
+    assert found["ms_scan"] == picked["scan"]
+    assert found["isolation"] == pytest.approx((picked["isolation_lower"], picked["isolation_upper"]))
+
+
+def test_xic_takes_the_nearest_peak_not_the_most_intense(tmp_path) -> None:
+    scans = with_scan_stats(dia_scans(cycles=3))
+    target = 777.0
+    ms1 = scans[0]
+    ms1["mz"] = np.array([target - 0.05, target + 0.3])  # near and weak, far and strong
+    ms1["intensity"] = np.array([10.0, 1000.0])
+    bundle = write_bundle_manifest(write_bundle(tmp_path, "close", scans))
+    trace = xic(bundle, [target], level=1, tolerance=0.35, tolerance_unit="Da")
+    first = trace.slice(0, 1).to_pylist()[0]
+    assert first["scan"] == ms1["scan"]
+    assert first["intensity"] == 10.0 and first["mz_observed"] == pytest.approx(target - 0.05)
