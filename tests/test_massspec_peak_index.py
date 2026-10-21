@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import collections
+from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from constellation.massspec.quant.peak_index import build_peak_index, read_manifest
+from constellation.massspec.quant.peak_index import (
+    build_peak_index,
+    index_partition,
+    index_slice,
+    read_manifest,
+)
+
+from _massspec_fixtures import dda_scans, dia_scans, write_bundle
 
 _SCHEMA = {
     "scan": pa.int32(),
@@ -114,3 +123,48 @@ def test_empty_input(tmp_path):
     man = build_peak_index(_write(tmp_path, peaks), tmp_path / "idx")
     assert man.n_windows == 0
     assert read_manifest(tmp_path / "idx").n_windows == 0
+
+
+
+# ── streaming build ─────────────────────────────────────────────────────
+
+
+def test_the_index_does_not_depend_on_the_batch_size(tmp_path):
+    """A build reading seven peaks at a time writes what one reading
+    everything at once does: the same windows, ids, rows and order."""
+    for name, scans in (("dia", dia_scans(cycles=20)), ("dda", dda_scans(n_ms1=30, per_ms1=8))):
+        bundle = write_bundle(tmp_path, name, scans)
+        small = build_peak_index(bundle, tmp_path / f"{name}-7", max_isolation_windows=16, batch_rows=7, created_at="t")
+        whole = build_peak_index(bundle, tmp_path / f"{name}-all", max_isolation_windows=16, created_at="t")
+        assert small.partitions == whole.partitions
+        assert small.window_scheme == whole.window_scheme
+        assert small.dda_max_halfwidth_mz == whole.dda_max_halfwidth_mz
+        for part in whole.partitions:
+            rel = Path(f"ms_level={part['level']}") / f"isolation_window={part['isolation_window_id']}" / "part-00000.parquet"
+            assert pq.read_table(tmp_path / f"{name}-7" / rel).equals(pq.read_table(tmp_path / f"{name}-all" / rel))
+        assert not (tmp_path / f"{name}-7" / ".spill").exists()
+
+
+def test_row_group_size_and_slices(tmp_path):
+    bundle = write_bundle(tmp_path, "run", dia_scans(cycles=30))
+    root = tmp_path / "idx"
+    manifest = build_peak_index(bundle, root, row_group_size=10, created_at="t")
+    ms1 = index_partition(root, level=1)
+    path = root / "ms_level=1" / f"isolation_window={ms1}" / "part-00000.parquet"
+    assert pq.ParquetFile(path).metadata.row_group(0).num_rows == 10
+
+    whole = pq.read_table(path)
+    mz = whole.column("mz").to_numpy()
+    lo, hi = float(np.quantile(mz, 0.4)), float(np.quantile(mz, 0.5))
+    got = index_slice(root, level=1, window_id=ms1, mz_lo=lo, mz_hi=hi)
+    assert got.num_rows == int(((mz >= lo) & (mz <= hi)).sum())
+    assert got.column_names == ["mz", "rt", "scan", "intensity"]
+    rt = whole.column("rt").to_numpy()
+    timed = index_slice(root, level=1, window_id=ms1, mz_lo=lo, mz_hi=hi, rt_lo=float(np.median(rt)))
+    assert 0 < timed.num_rows < got.num_rows
+
+    # An MS2 window is found by its bounds; an unknown window or partition is nothing.
+    ms2 = [p for p in manifest.partitions if p["level"] == 2][0]
+    assert index_partition(root, level=2, isolation_lower=ms2["isolation_lower"], isolation_upper=ms2["isolation_upper"]) == ms2["isolation_window_id"]
+    assert index_partition(root, level=2, isolation_lower=1.0, isolation_upper=2.0) is None
+    assert index_slice(root, level=2, window_id=999, mz_lo=0, mz_hi=1e9).num_rows == 0
