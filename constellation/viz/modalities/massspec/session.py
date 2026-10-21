@@ -131,6 +131,9 @@ class MassSpecSession:
         for source in bundles:
             acquisition = _describe(source.path, label=source.label, source_id=source.source_id)
             acquisitions.setdefault(acquisition.key, acquisition)  # the same bundle attached twice
+        # One run reached by two paths (a bundle attached and the experiment's
+        # copy of it) is one acquisition: runs are told apart by content.
+        by_content = {a.info["source_sha256"]: a.key for a in acquisitions.values() if a.info.get("source_sha256")}
         warnings: list[str] = []
         for experiment in (s for s in built if s.kind == "experiment"):
             for found in acquisition_bundles(experiment.path, candidates=[b.path for b in bundles]):
@@ -151,7 +154,14 @@ class MassSpecSession:
                 bundle = Path(found["bundle"]).resolve()
                 key = derive_source_id(bundle, "acquisition")
                 if key not in acquisitions:
-                    acquisitions[key] = _describe(bundle, label=bundle.name, source_id=experiment.source_id)
+                    described = _describe(bundle, label=bundle.name, source_id=experiment.source_id)
+                    sha = described.info.get("source_sha256")
+                    if sha and sha in by_content:
+                        key = by_content[sha]
+                    else:
+                        acquisitions[key] = described
+                        if sha:
+                            by_content[sha] = key
                 link = {
                     "experiment": str(experiment.path),
                     "experiment_source_id": experiment.source_id,

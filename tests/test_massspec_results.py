@@ -170,6 +170,25 @@ def test_the_searched_bundle_is_found_from_the_search(searched) -> None:
     assert entry["units"] == [unit]
 
 
+def test_a_copied_experiment_finds_its_own_bundle(tmp_path: Path, jar, inputs) -> None:
+    import shutil
+
+    original = tmp_path / "experiment"
+    bundle = _bundle(original / "bundles", "run_01")
+    library = tmp_path / "searched.dlib"
+    build_result_library(library, [_entry(m, z, t, "lib") for m, z, t in _PEPTIDES])
+    search_acquisition(bundle, experiment_dir=original, parameters=PARAMS, fasta=inputs["fasta"], library=library)
+    copy = tmp_path / "elsewhere" / "experiment"
+    shutil.copytree(original, copy, symlinks=True)
+    # Found in the copy itself, also while the original is still there...
+    (found,) = acquisition_bundles(copy)
+    assert found["bundle"] == copy / "bundles" / "run_01" and found["via"] == "experiment bundles"
+    # ...and once it is gone.
+    shutil.rmtree(original)
+    (found,) = acquisition_bundles(copy)
+    assert found["bundle"] == copy / "bundles" / "run_01"
+
+
 def test_a_run_searched_from_a_spectra_file_needs_its_bundle_attached(tmp_path: Path, jar, inputs) -> None:
     source = _bundle(tmp_path / "src", "run_02")
     spectra = write_dia([source], tmp_path / "given" / "run_02.dia").path

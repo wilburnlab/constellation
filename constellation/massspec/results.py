@@ -382,7 +382,9 @@ def acquisition_bundles(
     ``bundle`` (a Path, or None), ``via`` (how it was found), ``units``
     (searches of it) and ``merged_from``. A bundle is found, in order:
 
-    1. as the input a search recorded, when that input was a bundle;
+    1. as the input a search recorded, when that input was a bundle (in
+       the experiment's ``bundles/`` first, so that a copied or moved
+       experiment finds its own);
     2. converted from a ``.raw`` into ``<experiment>/bundles/<name>``;
     3. among ``candidates`` (bundles attached by the caller), by the run's
        name: for a run searched from an EncyclopeDIA spectra file there is
@@ -437,6 +439,10 @@ def acquisition_bundles(
                 continue
             kind, where = source.get("kind"), Path(str(source.get("path") or ""))
             if kind == "bundle":
+                # The experiment's own copy first: a search recorded its input
+                # by absolute path, which a copied or moved experiment leaves
+                # behind (``take`` checks the run's SHA-256 either way).
+                take(int(aid), root / "bundles" / where.name, "experiment bundles")
                 take(int(aid), where, "search input")
             elif kind == "raw":
                 take(int(aid), root / "bundles" / where.stem, "experiment bundles")

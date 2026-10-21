@@ -326,6 +326,17 @@ def test_an_experiment_brings_its_searched_runs_and_their_identifications(client
     assert elsewhere.status_code == 404 and "in scan 999999" in elsewhere.text
 
 
+def test_one_run_reached_twice_is_one_acquisition(client, experiment, tmp_path) -> None:
+    import shutil
+
+    root, unit, bundle = experiment
+    copy = shutil.copytree(bundle, tmp_path / "copies" / bundle.name)
+    sid = _open_experiment(client, root, copy)
+    (acq,) = client.get(f"/api/massspec/sessions/{sid}/acquisitions").json()
+    assert acq["bundle"] == str(copy.resolve())  # the one attached
+    assert [s["units"] for s in acq["searches"]] == [[unit]]
+
+
 def test_a_run_without_its_bundle_is_a_warning(client, tmp_path, jar, inputs) -> None:
     from constellation.massspec.io.encyclopedia import write_dia
     from constellation.massspec.search.encyclopedia.params import SearchParameters, Tolerance
