@@ -3,9 +3,14 @@
 A ``MassSpecSession`` is a set of sources the user attached and the
 acquisitions they resolve to. A source is a directory: a converted
 acquisition (a *bundle*, from ``massspec convert`` or ``massspec
-encyclopedia import-spectra``). Every acquisition is described once, when
-the session opens, from its manifest and scan table, so the kernels and
-routes answer from that description.
+encyclopedia import-spectra``) or a search experiment (``massspec
+search``). An experiment brings each searched run whose bundle can be
+found (``massspec.results.acquisition_bundles``: the search's own input,
+a conversion inside the experiment, or an attached bundle of the same
+run), linked to the searches of it, which is what makes identifications
+browsable. Every acquisition is described once, when the session opens,
+from its manifest and scan table, so the kernels and routes answer from
+that description.
 
 An acquisition's ``key`` is derived from its bundle's path, so the same run
 keeps its key however it was reached and across source changes; the
@@ -19,18 +24,19 @@ These classes are the modality's implementation of the ``SessionLike`` /
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, ClassVar, Iterable, Literal
 
 from constellation.viz.server.session import derive_session_id, derive_source_id
 
-SourceKind = Literal["acquisition"]
+SourceKind = Literal["acquisition", "experiment"]
 
-#: Manifest kinds of a converted acquisition, and the source kind each is.
+#: Manifest kinds a source may have, and the source kind each is.
 _SOURCE_KINDS: dict[str, SourceKind] = {
     "thermo_acquisition": "acquisition",
     "encyclopedia_dia_acquisition": "acquisition",
+    "massspec_experiment": "experiment",
 }
 
 DEFAULT_LABEL = "mass-spec session"
@@ -64,6 +70,10 @@ class MsAcquisition:
     #: ``staggered``, ``profile_mode``, ``levels``, ``scans_per_level``,
     #: ``analyzers``, ``rt_range``, ``has_index``, ``default_tolerance``.
     info: dict[str, Any]
+    #: The experiments that searched this run, one dict each:
+    #: ``experiment`` (path), ``experiment_source_id``, ``acquisition_id``
+    #: (the run's id in that experiment) and ``units`` (its searches).
+    links: tuple[dict[str, Any], ...] = ()
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -72,7 +82,15 @@ class MsAcquisition:
             "bundle": str(self.bundle),
             "source_id": self.source_id,
             **self.info,
+            "searches": [dict(link) for link in self.links],
         }
+
+    def link(self, experiment_source_id: str) -> dict[str, Any]:
+        """This run's link to one experiment; ``KeyError`` when it has none."""
+        for link in self.links:
+            if link["experiment_source_id"] == experiment_source_id:
+                return link
+        raise KeyError(experiment_source_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,17 +119,47 @@ class MassSpecSession:
         """Build a session from ``{"path", "kind"?, "label"?}`` source dicts.
 
         Raises ``ValueError`` for a source that is not a directory, not a
-        converted acquisition, or whose stated ``kind`` its manifest
-        contradicts.
+        converted acquisition or search experiment, or whose stated
+        ``kind`` its manifest contradicts. A searched run that cannot be
+        browsed (no bundle found; fractions searched as one) is a warning.
         """
+        from constellation.massspec.results import acquisition_bundles
+
         built = [_load_source(entry) for entry in sources]
-        acquisitions: list[MsAcquisition] = []
-        seen: set[str] = set()
-        for source in built:
+        acquisitions: dict[str, MsAcquisition] = {}
+        bundles = [s for s in built if s.kind == "acquisition"]
+        for source in bundles:
             acquisition = _describe(source.path, label=source.label, source_id=source.source_id)
-            if acquisition.key not in seen:  # the same bundle attached twice
-                seen.add(acquisition.key)
-                acquisitions.append(acquisition)
+            acquisitions.setdefault(acquisition.key, acquisition)  # the same bundle attached twice
+        warnings: list[str] = []
+        for experiment in (s for s in built if s.kind == "experiment"):
+            for found in acquisition_bundles(experiment.path, candidates=[b.path for b in bundles]):
+                name = Path(str(found["source_file"])).name
+                if found["merged_from"]:
+                    warnings.append(
+                        f"{experiment.label}: {name} is fractions searched as one; browse the "
+                        f"fractions' own searches (identifications are not split by fraction)"
+                    )
+                    continue
+                if found["bundle"] is None:
+                    warnings.append(
+                        f"{experiment.label}: no converted acquisition found for {name}; attach its "
+                        f"bundle (`massspec convert`, or `massspec encyclopedia import-spectra` for a "
+                        f"spectra file) to browse its peaks"
+                    )
+                    continue
+                bundle = Path(found["bundle"]).resolve()
+                key = derive_source_id(bundle, "acquisition")
+                if key not in acquisitions:
+                    acquisitions[key] = _describe(bundle, label=bundle.name, source_id=experiment.source_id)
+                link = {
+                    "experiment": str(experiment.path),
+                    "experiment_source_id": experiment.source_id,
+                    "experiment_label": experiment.label,
+                    "acquisition_id": int(found["acquisition_id"]),
+                    "units": list(found["units"]),
+                }
+                acquisitions[key] = replace(acquisitions[key], links=(*acquisitions[key].links, link))
         resolved_label = label or (built[0].label if built else DEFAULT_LABEL)
         resolved_anchor = anchor or (str(built[0].path) if built else "massspec")
         return cls(
@@ -119,7 +167,8 @@ class MassSpecSession:
             label=resolved_label,
             anchor=resolved_anchor,
             sources=tuple(built),
-            acquisitions=tuple(acquisitions),
+            acquisitions=tuple(acquisitions.values()),
+            warnings=tuple(warnings),
             saved_as=saved_as,
         )
 
@@ -164,9 +213,10 @@ def _source_kind(path: Path) -> SourceKind:
     found = manifest_kind(path)
     if found not in _SOURCE_KINDS:
         raise ValueError(
-            f"{path} is not a converted acquisition (its manifest says "
-            f"{found!r}); convert a .raw with `massspec convert` or import an "
-            f"EncyclopeDIA spectra file with `massspec encyclopedia import-spectra`"
+            f"{path} is neither a converted acquisition nor a search experiment (its "
+            f"manifest says {found!r}); convert a .raw with `massspec convert`, import an "
+            f"EncyclopeDIA spectra file with `massspec encyclopedia import-spectra`, or "
+            f"give the directory `massspec search` wrote"
         )
     return _SOURCE_KINDS[found]
 
@@ -217,6 +267,17 @@ def _describe(bundle: Path, *, label: str, source_id: str) -> MsAcquisition:
 def inspect_source(path: Path) -> dict[str, Any]:
     """Describe a candidate source directory for the entry form."""
     kind = _source_kind(path)
+    if kind == "experiment":
+        from constellation.massspec.results import acquisition_bundles, search_units
+
+        runs = acquisition_bundles(path)
+        return {
+            "path": str(path.resolve()),
+            "kind": kind,
+            "searches": len(search_units(path)),
+            "runs": [Path(str(r["source_file"])).name for r in runs],
+            "runs_with_bundle": sum(r["bundle"] is not None for r in runs),
+        }
     acquisition = _describe(path.resolve(), label=path.name, source_id="")
     return {"path": str(path.resolve()), "kind": kind, **acquisition.info}
 

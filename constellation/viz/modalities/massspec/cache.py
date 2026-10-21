@@ -64,4 +64,21 @@ def scan_table_for(bundle: Path) -> pa.Table:
     return _SCAN_TABLES.get_or_load(_file_key(bundle / "scan_metadata.parquet"), load)
 
 
-__all__ = ["LruCache", "scan_table_for"]
+_IDENTIFICATIONS = LruCache(max_entries=16)
+
+
+def identifications_for(experiment: Path, acquisition_id: int, max_qvalue: float) -> pa.Table:
+    """``massspec.results.identifications`` of one run of an experiment,
+    read once per process. Keyed by the experiment manifest's modification
+    time, which every search added to the experiment rewrites."""
+
+    def load() -> pa.Table:
+        from constellation.massspec.results import identifications
+
+        return identifications(experiment, acquisition_id=acquisition_id, max_qvalue=max_qvalue)
+
+    key = (*_file_key(experiment / "manifest.json"), acquisition_id, max_qvalue)
+    return _IDENTIFICATIONS.get_or_load(key, load)
+
+
+__all__ = ["LruCache", "identifications_for", "scan_table_for"]

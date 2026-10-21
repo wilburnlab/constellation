@@ -15,7 +15,7 @@ reads them the way a browser asks:
 - :func:`precursor_detail`, :func:`library_spectrum`,
   :func:`searched_library_spectrum` — one precursor's quantitation, the
   spectrum the result stored for it, and the spectrum of the library that
-  was searched;
+  was searched; :func:`trace_targets`, the fragments worth tracing for it;
 - :func:`rt_mapping` — a search's alignment of the run's retention times to
   its library's.
 
@@ -570,6 +570,86 @@ def searched_library_spectrum(
     return None
 
 
+TRACE_TARGET_SCHEMA = pa.schema(
+    [
+        pa.field("mz", pa.float64(), nullable=False),
+        pa.field("label", pa.string(), nullable=False),
+        pa.field("ion_type", pa.string()),
+        pa.field("ion_number", pa.int16()),
+        pa.field("fragment_charge", pa.int8()),
+        #: The stored intensity (null for a theoretical target).
+        pa.field("intensity", pa.float64()),
+        #: Whether the engine summed this ion into the precursor's quantity.
+        pa.field("quantified", pa.bool_()),
+    ],
+    metadata={b"schema_name": b"TraceTargets"},
+)
+
+
+def trace_targets(
+    experiment_dir: Path | str,
+    precursor_id: int,
+    *,
+    unit: str,
+    acquisition_id: int,
+    top_n: int = 8,
+) -> pa.Table:
+    """The fragment ions to trace for a precursor (``TRACE_TARGET_SCHEMA``):
+    the ``top_n`` most intense b/y ions of the spectrum the search stored,
+    each flagged when the engine quantified the precursor from it. Without
+    a stored spectrum, the theoretical choice of
+    :func:`massspec.spectra.annotate.theoretical_fragment_targets`."""
+    from constellation.massspec.spectra.annotate import theoretical_fragment_targets
+
+    root = Path(experiment_dir)
+    stored = library_spectrum(root, precursor_id, unit=unit, acquisition_id=acquisition_id)
+    stored = stored.filter(pc.is_in(stored.column("ion_type"), pa.array(["b", "y"])))
+    if stored.num_rows:
+        rows = sorted(stored.to_pylist(), key=lambda r: -r["intensity"])[:top_n]
+        quant = _read(root, "fragment_quant", unit=unit, acquisition_id=acquisition_id, columns=["mz"],
+                      where=ds.field("precursor_id") == precursor_id)
+        quantified = np.sort(quant.column("mz").to_numpy()) if quant is not None and quant.num_rows else np.empty(0)
+
+        def was_quantified(mz: float) -> bool:
+            i = np.searchsorted(quantified, mz)
+            return any(0 <= j < quantified.size and abs(quantified[j] - mz) < 1e-4 for j in (i - 1, i))
+
+        return pa.Table.from_pylist(
+            [
+                {
+                    "mz": r["mz"],
+                    "label": r["annotation"],
+                    "ion_type": r["ion_type"],
+                    "ion_number": r["ion_number"],
+                    "fragment_charge": r["fragment_charge"],
+                    "intensity": r["intensity"],
+                    "quantified": was_quantified(r["mz"]),
+                }
+                for r in rows
+            ],
+            schema=TRACE_TARGET_SCHEMA,
+        )
+    peptide = _peptide_of(root, precursor_id, unit, acquisition_id)
+    if peptide is None or not peptide.get("modified_sequence"):
+        return TRACE_TARGET_SCHEMA.empty_table()
+    theoretical = theoretical_fragment_targets(peptide["modified_sequence"], top_n=top_n)
+    return pa.Table.from_pylist(
+        [
+            {
+                "mz": r["mz"],
+                "label": r["annotation"],
+                "ion_type": r["ion_type"],
+                "ion_number": r["ion_number"],
+                "fragment_charge": r["fragment_charge"],
+                "intensity": None,
+                "quantified": None,
+            }
+            for r in theoretical.to_pylist()
+        ],
+        schema=TRACE_TARGET_SCHEMA,
+    )
+
+
 # ── retention-time alignment ─────────────────────────────────────────────
 
 #: The alignment pass each engine settles on (peptide-centric EncyclopeDIA,
@@ -607,6 +687,7 @@ def rt_mapping(experiment_dir: Path | str, *, unit: str, acquisition_id: int) ->
 __all__ = [
     "IDENTIFICATION_SCHEMA",
     "LIBRARY_SPECTRUM_SCHEMA",
+    "TRACE_TARGET_SCHEMA",
     "acquisition_bundles",
     "identifications",
     "library_spectrum",
@@ -614,4 +695,5 @@ __all__ = [
     "rt_mapping",
     "search_units",
     "searched_library_spectrum",
+    "trace_targets",
 ]

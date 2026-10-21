@@ -1,3 +1,4 @@
+# ruff: noqa: F811  (the stand-in jar's fixtures are imported, then named as arguments)
 """The mass-spec viz modality over HTTP: sessions, kernels and its own routes.
 
 Converted acquisitions are built from the synthetic runs in
@@ -18,6 +19,8 @@ pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from test_massspec_search_workflow import _PEPTIDES, _bundle, _entry, inputs, jar  # noqa: E402, F401
+from _encyclopedia_fixtures import build_result_library  # noqa: E402
 from _massspec_fixtures import (  # noqa: E402
     dda_scans,
     dia_scans,
@@ -83,7 +86,7 @@ def test_a_session_lists_one_binding_per_kernel_and_acquisition(client, runs) ->
 
     tracks = client.get("/api/tracks", params={"session": sid}).json()
     assert sorted((t["kind"], t["binding_id"]) for t in tracks) == sorted(
-        (kind, f"{kind}:{_key(b)}") for kind in ("ms_chromatogram", "ms_spectrum") for b in (dia, dda)
+        (kind, f"{kind}:{_key(b)}") for kind in ("ms_chromatogram", "ms_spectrum", "ms_xic") for b in (dia, dda)
     )
 
     meta = client.get(
@@ -239,7 +242,8 @@ def test_the_cli_needs_something_to_open(capsys) -> None:
     from constellation.cli.__main__ import main
 
     assert main(["viz", "massspec", "--no-browser"]) == 2
-    assert "--acquisition" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "--acquisition" in err and "--experiment" in err
 
 
 def test_a_trace_the_bundle_cannot_give_is_refused_not_cut_short(client, tmp_path) -> None:
@@ -252,3 +256,137 @@ def test_a_trace_the_bundle_cannot_give_is_refused_not_cut_short(client, tmp_pat
     )
     assert response.status_code == 400
     assert "base peaks" in response.json()["detail"]
+
+
+
+# ── with a search experiment ─────────────────────────────────────────────
+
+
+@pytest.fixture
+def experiment(tmp_path: Path, jar, inputs):
+    """A search of one bundle against a real library file."""
+    from constellation.massspec.search.encyclopedia.params import SearchParameters, Tolerance
+    from constellation.massspec.workflows.encyclopedia import search_acquisition
+
+    library = tmp_path / "searched.dlib"
+    build_result_library(library, [_entry(m, z, t, "lib") for m, z, t in _PEPTIDES])
+    bundle = _bundle(tmp_path, "run_01")
+    root = tmp_path / "experiment"
+    params = SearchParameters(precursor_tolerance=Tolerance(0.35, "Da"), threads=1, extra={"-fixed": ""})
+    result = search_acquisition(bundle, experiment_dir=root, parameters=params, fasta=inputs["fasta"],
+                                library=library)  # fmt: skip
+    return root, result.unit, bundle
+
+
+def _open_experiment(client: TestClient, root: Path, *bundles: Path) -> str:
+    body = {"modality": "massspec", "sources": [{"path": str(root)}, *({"path": str(b)} for b in bundles)]}
+    response = client.post("/api/sessions/open", json=body)
+    assert response.status_code == 201, response.text
+    return response.json()["session_id"]
+
+
+def test_an_experiment_brings_its_searched_runs_and_their_identifications(client, experiment) -> None:
+    root, unit, bundle = experiment
+    sid = _open_experiment(client, root)
+    (acq,) = client.get(f"/api/massspec/sessions/{sid}/acquisitions").json()
+    assert acq["key"] == _key(bundle)
+    (search,) = acq["searches"]
+    assert search["units"] == [unit] and search["acquisition_id"] == 0
+
+    ids = _arrow(client.get(f"/api/massspec/sessions/{sid}/acquisitions/{_key(bundle)}/identifications",
+                            params={"max_q": 1.0}))  # fmt: skip
+    assert "ELVISLIVESK" in ids.column("modified_sequence").to_pylist()
+    assert set(ids.column("experiment").to_pylist()) == {search["experiment_source_id"]}
+
+    row = ids.filter(pa.compute.equal(ids.column("modified_sequence"), "ELVISLIVESK")).to_pylist()[0]
+    detail = client.get(
+        f"/api/massspec/sessions/{sid}/acquisitions/{_key(bundle)}/precursor",
+        params={"experiment": search["experiment_source_id"], "unit": unit, "precursor_id": row["precursor_id"]},
+    )
+    assert detail.status_code == 200, detail.text
+    found = detail.json()
+    assert found["identification"]["modified_sequence"] == "ELVISLIVESK"
+    assert [t["label"] for t in found["ms1_targets"]] == ["M", "M+1", "M+2"]
+    assert found["ms2_targets"] and all(t["ion_type"] in ("b", "y") for t in found["ms2_targets"])
+    assert found["located"]["parent_scan"] is not None
+    assert found["library_rt"] == pytest.approx(600.0)
+    assert any(r["annotation"] == "y1" for r in found["ladder"])
+    assert found["fragment_tolerance"] is None or "unit" in found["fragment_tolerance"]
+
+    missing = client.get(
+        f"/api/massspec/sessions/{sid}/acquisitions/{_key(bundle)}/precursor",
+        params={"experiment": "src-nope", "unit": unit, "precursor_id": row["precursor_id"]},
+    )
+    assert missing.status_code == 404
+
+
+def test_a_run_without_its_bundle_is_a_warning(client, tmp_path, jar, inputs) -> None:
+    from constellation.massspec.io.encyclopedia import write_dia
+    from constellation.massspec.search.encyclopedia.params import SearchParameters, Tolerance
+    from constellation.massspec.workflows.encyclopedia import search_acquisition
+
+    spectra = write_dia([_bundle(tmp_path / "src", "run_02")], tmp_path / "given" / "run_02.dia").path
+    root = tmp_path / "experiment"
+    params = SearchParameters(precursor_tolerance=Tolerance(0.35, "Da"), threads=1, extra={"-fixed": ""})
+    search_acquisition(spectra, experiment_dir=root, parameters=params, **inputs)
+    _open_experiment(client, root)
+    summary = client.get("/api/sessions").json()[0]
+    assert summary["n_acquisitions"] == 0
+    assert "no converted acquisition found for run_02" in summary["warnings"][0]
+
+
+def test_spectra_are_annotated_when_a_peptide_is_given(client, experiment) -> None:
+    root, _, bundle = experiment
+    sid = _open_experiment(client, root)
+    params = {"session": sid, "binding": f"ms_spectrum:{_key(bundle)}", "scan": 2}
+    plain = _arrow(client.get("/api/tracks/ms_spectrum/data", params=params))
+    assert plain.column("annotation").null_count == plain.num_rows
+    annotated = _arrow(client.get("/api/tracks/ms_spectrum/data", params={
+        **params, "modified_sequence": "PEPTIDEK", "charge": 2, "tolerance": 500, "tolerance_unit": "Da"}))  # fmt: skip
+    assert annotated.num_rows == plain.num_rows
+    assert annotated.column("annotation").null_count < annotated.num_rows  # a wide tolerance labels peaks
+    refused = client.get("/api/tracks/ms_spectrum/data", params={**params, "modified_sequence": "PEPTIDEK"})
+    assert refused.status_code == 400
+    nonsense = client.get("/api/tracks/ms_spectrum/data", params={
+        **params, "modified_sequence": "PEP[Nothing]TIDE", "charge": 2, "tolerance": 1, "tolerance_unit": "Da"})  # fmt: skip
+    assert nonsense.status_code == 400
+
+
+def test_xics_trace_the_m_z_values_asked_for(client, runs) -> None:
+    bundle, scans = runs["dia"]
+    sid = _open(client, bundle)
+    target = float(scans[0]["mz"][0])
+    params = {"session": sid, "binding": f"ms_xic:{_key(bundle)}", "level": 1, "mz": [target, 1999.0],
+              "label": ["a", "b"], "tolerance": 0.01, "tolerance_unit": "Da"}  # fmt: skip
+    traces = _arrow(client.get("/api/tracks/ms_xic/data", params=params))
+    assert set(traces.column("label").to_pylist()) == {"a", "b"}
+    a = traces.filter(pa.compute.equal(traces.column("label"), "a"))
+    assert a.num_rows == 12 and a.column("intensity")[0].as_py() == pytest.approx(scans[0]["intensity"][0])
+    bad = client.get("/api/tracks/ms_xic/data", params={**params, "label": ["only one"]})
+    assert bad.status_code == 400
+
+
+def test_a_peptide_typed_by_hand_is_resolved(client, runs) -> None:
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.massspec.peptide.mz import precursor_mz
+
+    bundle, _ = runs["dia"]
+    sid = _open(client, bundle)
+    one = client.get(f"/api/massspec/sessions/{sid}/resolve", params={"q": "PEPTIDEK/2"}).json()
+    assert [c["charge"] for c in one["charges"]] == [2]
+    assert one["charges"][0]["precursor_mz"] == pytest.approx(precursor_mz(parse_proforma("PEPTIDEK"), charge=2))
+    assert [t["label"] for t in one["ms1_targets"]] == ["M", "M+1", "M+2"]
+    every = client.get(f"/api/massspec/sessions/{sid}/resolve", params={"q": "EM[Oxidation]EVTSESK"}).json()
+    assert [c["charge"] for c in every["charges"]] == [1, 2, 3, 4]
+    assert client.get(f"/api/massspec/sessions/{sid}/resolve", params={"q": "PEP[Nothing]"}).status_code == 400
+
+
+def test_the_wire_schemas_restate_the_domain_ones() -> None:
+    from constellation.massspec.scans import XIC_SCHEMA
+    from constellation.massspec.spectra.annotate import ANNOTATED_PEAK_SCHEMA
+    from constellation.viz.modalities.massspec.tracks.spectrum import SPECTRUM_SCHEMA
+    from constellation.viz.modalities.massspec.tracks.xic import XIC_WIRE_SCHEMA
+
+    assert [(f.name, f.type) for f in SPECTRUM_SCHEMA][:-1] == [(f.name, f.type) for f in ANNOTATED_PEAK_SCHEMA]
+    wire = [(f.name, f.type) for f in XIC_WIRE_SCHEMA if f.name != "label"]
+    assert wire == [(f.name, f.type) for f in XIC_SCHEMA]

@@ -28,6 +28,7 @@ from constellation.massspec.results import (
     rt_mapping,
     search_units,
     searched_library_spectrum,
+    trace_targets,
 )
 from constellation.massspec.search.encyclopedia.params import SearchParameters, Tolerance
 from constellation.massspec.spectra.annotate import ion_ladder
@@ -187,3 +188,16 @@ def test_rt_mapping_takes_the_final_pass_without_decoys_in_order(searched) -> No
     assert np.all(np.diff(observed) > 0) and np.all(np.diff(library_rt) > 0)
     assert library_rt.tolist() == [100.0, 200.0, 300.0]  # 250 s folds into 200 s's fit; the decoy is out
     assert np.interp(205.0, observed, library_rt) == pytest.approx(200.0)
+
+
+def test_trace_targets_are_the_most_intense_stored_ions(searched) -> None:
+    experiment, unit, _, _ = searched
+    targets = trace_targets(experiment, _pid("ELVISLIVESK", 2), unit=unit, acquisition_id=0, top_n=3)
+    assert targets.num_rows == 3
+    intensities = targets.column("intensity").to_pylist()
+    assert intensities == sorted(intensities, reverse=True)
+    assert set(targets.column("ion_type").to_pylist()) <= {"b", "y"}
+    ladder = {r["annotation"]: r["mz"] for r in ion_ladder("ELVISLIVESK").to_pylist()}
+    for row in targets.to_pylist():
+        assert ladder[row["label"]] == pytest.approx(row["mz"], abs=0.02)
+    assert trace_targets(experiment, 12345, unit=unit, acquisition_id=0).num_rows == 0

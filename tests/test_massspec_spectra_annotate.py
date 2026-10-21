@@ -11,6 +11,8 @@ from constellation.massspec.spectra.annotate import (
     annotate_spectrum,
     default_fragment_charge,
     ion_ladder,
+    precursor_isotopes,
+    theoretical_fragment_targets,
 )
 
 
@@ -71,3 +73,20 @@ def test_empty_spectra_and_bad_input() -> None:
 @pytest.mark.parametrize(("charge", "expected"), [(1, 1), (2, 1), (3, 2), (4, 3), (6, 3)])
 def test_default_fragment_charge(charge, expected) -> None:
     assert default_fragment_charge(charge) == expected
+
+
+def test_precursor_isotopes_step_by_a_neutron_over_the_charge() -> None:
+    iso = precursor_isotopes("PEPTIDEK", charge=2, n_isotopes=3)
+    mz = iso.column("mz").to_pylist()
+    assert iso.column("label").to_pylist() == ["M", "M+1", "M+2"]
+    assert mz[0] == pytest.approx(precursor_mz(parse_proforma("PEPTIDEK"), charge=2), abs=1e-4)
+    assert mz[1] - mz[0] == pytest.approx(1.00335 / 2, abs=2e-3)
+    assert max(iso.column("abundance").to_pylist()) == 1.0
+
+
+def test_theoretical_fragment_targets_prefer_long_y_ions() -> None:
+    targets = theoretical_fragment_targets("PEPTIDEKAAR", top_n=4)
+    assert targets.column("annotation").to_pylist() == ["y10", "y9", "y8", "y7"]
+    narrow = theoretical_fragment_targets("PEPTIDEKAAR", top_n=20, mz_range=(300.0, 600.0))
+    assert all(300.0 <= m <= 600.0 for m in narrow.column("mz").to_pylist())
+    assert {r["ion_type"] for r in narrow.to_pylist()} <= {"b", "y"}

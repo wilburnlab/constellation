@@ -9,7 +9,10 @@ near several ions takes the nearest.
 
 :func:`ion_ladder` lists the theoretical ions themselves, numbered as
 labels number them, which is what an ion table or a sequence-coverage
-view draws from.
+view draws from. :func:`precursor_isotopes` and
+:func:`theoretical_fragment_targets` give the m/z values to trace for a
+peptide: its precursor's isotopes, and fragments to follow when no
+library spectrum says which are intense.
 
 Both take the peptide as a ProForma 2.0 string, the form experiment
 tables store (``PEPTIDE_TABLE.modified_sequence``).
@@ -200,10 +203,68 @@ def annotate_spectrum(
     return pa.table(columns, schema=ANNOTATED_PEAK_SCHEMA)
 
 
+PRECURSOR_ISOTOPE_SCHEMA = pa.schema(
+    [
+        pa.field("isotope", pa.int8(), nullable=False),
+        pa.field("mz", pa.float64(), nullable=False),
+        #: Relative abundance, the most abundant isotope 1.
+        pa.field("abundance", pa.float64(), nullable=False),
+        #: "M", "M+1", ...
+        pa.field("label", pa.string(), nullable=False),
+    ],
+    metadata={b"schema_name": b"PrecursorIsotopes"},
+)
+
+
+def precursor_isotopes(modified_sequence: str, *, charge: int, n_isotopes: int = 3) -> pa.Table:
+    """The precursor's first ``n_isotopes`` isotope peaks at ``charge``
+    (``PRECURSOR_ISOTOPE_SCHEMA``), from its elemental composition."""
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.massspec.peptide.envelope import peptide_envelope
+
+    mz, abundance = peptide_envelope(parse_proforma(modified_sequence), charge=charge, n_peaks=n_isotopes)
+    mz_np = mz.detach().cpu().numpy().astype(np.float64)
+    ab = abundance.detach().cpu().numpy().astype(np.float64)
+    ab = ab / ab.max() if ab.size and ab.max() > 0 else ab
+    return pa.table(
+        {
+            "isotope": pa.array(range(mz_np.size), pa.int8()),
+            "mz": mz_np,
+            "abundance": ab,
+            "label": ["M" if i == 0 else f"M+{i}" for i in range(mz_np.size)],
+        },
+        schema=PRECURSOR_ISOTOPE_SCHEMA,
+    )
+
+
+def theoretical_fragment_targets(
+    modified_sequence: str,
+    *,
+    top_n: int = 8,
+    mz_range: tuple[float, float] = (150.0, 2000.0),
+) -> pa.Table:
+    """Fragment ions worth tracing when no spectrum says which are intense
+    (``ION_LADDER_SCHEMA`` rows, singly charged, no losses): y ions from the
+    longest down, then b ions, both from ion 3 up (shorter ones are often
+    below the scan range or shared by many peptides), within ``mz_range``,
+    at most ``top_n``."""
+    ladder = ion_ladder(modified_sequence)
+    rows = [
+        r
+        for r in ladder.to_pylist()
+        if r["ion_number"] >= 3 and mz_range[0] <= r["mz"] <= mz_range[1] and r["loss"] is None
+    ]
+    rows.sort(key=lambda r: (r["ion_type"] != "y", -r["ion_number"]))
+    return pa.Table.from_pylist(rows[:top_n], schema=ION_LADDER_SCHEMA)
+
+
 __all__ = [
     "ANNOTATED_PEAK_SCHEMA",
     "ION_LADDER_SCHEMA",
+    "PRECURSOR_ISOTOPE_SCHEMA",
     "annotate_spectrum",
     "default_fragment_charge",
     "ion_ladder",
+    "precursor_isotopes",
+    "theoretical_fragment_targets",
 ]

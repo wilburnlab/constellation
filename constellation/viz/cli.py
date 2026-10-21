@@ -9,9 +9,10 @@ Subcommands:
   ``transcriptome align`` / ``cluster`` output dirs. Boots a local
   FastAPI server via uvicorn and (unless ``--no-browser``) opens the
   browser at the served URL.
-- ``constellation viz massspec --acquisition DIR [...]`` (or
-  ``--saved-session <slug>``) — mass-spec browser over converted
-  acquisitions: chromatograms and spectra by MS level.
+- ``constellation viz massspec --acquisition DIR [...] --experiment DIR
+  [...]`` (or ``--saved-session <slug>``) — mass-spec browser over
+  converted acquisitions and what searches found in them: chromatograms
+  and spectra by MS level.
 - ``constellation viz install-frontend --from <tarball>`` — extract a
   prebuilt frontend bundle into the package's ``static/<entry>/`` dir.
   Used by source-checkout / HPC installs where the JS toolchain isn't
@@ -116,6 +117,19 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
             "a converted acquisition: the directory `massspec convert` writes "
             "for a .raw, or `massspec encyclopedia import-spectra` for an "
             "EncyclopeDIA spectra file. Repeatable."
+        ),
+    )
+    p_ms.add_argument(
+        "--experiment",
+        action="append",
+        default=None,
+        type=Path,
+        metavar="DIR",
+        help=(
+            "a search experiment (the directory `massspec search` writes): its "
+            "searched runs, with what was identified in them. A run searched from "
+            "an EncyclopeDIA spectra file needs its converted acquisition given "
+            "with --acquisition too. Repeatable."
         ),
     )
     p_ms.add_argument(
@@ -507,9 +521,13 @@ def cmd_viz_massspec(args: argparse.Namespace) -> int:
     from constellation.viz.sessions import read_saved
 
     acquisitions = list(args.acquisition or [])
+    experiments = list(args.experiment or [])
     if args.saved_session is not None:
-        if acquisitions:
-            print("error: --saved-session is mutually exclusive with --acquisition", file=sys.stderr)
+        if acquisitions or experiments:
+            print(
+                "error: --saved-session is mutually exclusive with --acquisition / --experiment",
+                file=sys.stderr,
+            )
             return 2
         try:
             saved = read_saved(args.saved_session)
@@ -529,12 +547,17 @@ def cmd_viz_massspec(args: argparse.Namespace) -> int:
             print(f"error opening saved session: {exc}", file=sys.stderr)
             return 1
     else:
-        if not acquisitions:
-            print("error: pass --saved-session <slug> or at least one --acquisition DIR", file=sys.stderr)
+        if not acquisitions and not experiments:
+            print(
+                "error: pass --saved-session <slug>, or at least one --acquisition DIR "
+                "or --experiment DIR",
+                file=sys.stderr,
+            )
             return 2
         try:
             session = MassSpecSession.open(
-                sources=[{"path": str(p), "kind": "acquisition"} for p in acquisitions],
+                sources=[{"path": str(p), "kind": "experiment"} for p in experiments]
+                + [{"path": str(p), "kind": "acquisition"} for p in acquisitions],
                 label=args.label,
             )
         except ValueError as exc:
@@ -545,7 +568,10 @@ def cmd_viz_massspec(args: argparse.Namespace) -> int:
         args,
         session,
         title="massspec",
-        details=[("runs", ", ".join(a.label for a in session.acquisitions))],
+        details=[
+            ("runs", ", ".join(a.label for a in session.acquisitions) or "none"),
+            ("searched", str(sum(bool(a.links) for a in session.acquisitions))),
+        ],
         default_entry="massspec",
     )
 
