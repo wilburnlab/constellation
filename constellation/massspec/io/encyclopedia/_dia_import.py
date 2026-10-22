@@ -27,7 +27,9 @@ that a Thermo bundle states differently:
 - ``PrecursorName`` (the parent MS1 scan) → ``precursor_scan``.
 - ``PrecursorCharge`` 0 means "not reported" → null.
 - Injection time is seconds → milliseconds.
-- ``TIC`` is the sum of the stored intensities, not the instrument's.
+- ``TIC`` is the sum of the stored intensities, not the instrument's, and
+  the base peak is the most intense stored peak (the file has no column for
+  it; without it a base-peak chromatogram could not be drawn).
 
 Scan numbers come from ``SpectrumName`` (``scan=N``). A file whose names
 do not carry one (hand-built, scrubbed) falls back to ``SpectrumIndex``.
@@ -178,6 +180,17 @@ class _PeakWriter:
         self._writer.close()
 
 
+def _base_peak(scan: _Scan) -> dict[str, float | None]:
+    """The most intense stored peak; the first of equals, as an argmax gives."""
+    if scan["mz"].size == 0:
+        return {"base_peak_mz": None, "base_peak_intensity": None}
+    top = int(np.argmax(scan["intensity"]))
+    return {
+        "base_peak_mz": float(scan["mz"][top]),
+        "base_peak_intensity": float(scan["intensity"][top]),
+    }
+
+
 def _scan_metadata_row(scan: _Scan) -> dict[str, Any]:
     ms2 = scan["level"] == 2
     return {
@@ -195,6 +208,7 @@ def _scan_metadata_row(scan: _Scan) -> dict[str, Any]:
             else float(str(np.float32(scan["iit_s"]))) * 1000.0
         ),
         "peak_count": int(scan["mz"].size),
+        **_base_peak(scan),
         "isolation_lower": scan["lower"] if ms2 else None,
         "isolation_upper": scan["upper"] if ms2 else None,
         "scan_window_lower": None if ms2 else scan["lower"],

@@ -206,7 +206,13 @@ def get_data(
 
     mode = kernel.threshold(track_binding, query)
     schema = kernel.schema_for(query, mode)
-    batches = kernel.fetch(track_binding, query, mode)
+    try:
+        # A kernel that reads eagerly (returns an iterator rather than being
+        # a generator) can refuse here, before the response starts; once
+        # streaming has begun an error can only cut the stream short.
+        batches = kernel.fetch(track_binding, query, mode)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return batches_to_response(
         schema,
         batches,

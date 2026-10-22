@@ -217,35 +217,54 @@ def test_unbalanced_bracket_rejected():
 # ──────────────────────────────────────────────────────────────────────
 
 
+# Fragment tables store the 0-based bond index; a label numbers the ion in
+# its series. On a peptide of 8 residues bond 4 is b5 and y3.
+
+
 def test_fragment_row_to_mzpaf_basic():
     s = fragment_row_to_mzpaf(
-        {"ion_type": 4, "position": 3, "charge": 1, "loss_id": None}
+        {"ion_type": 4, "position": 4, "charge": 1, "loss_id": None}, length=8
     )
     assert s == "y3"
 
 
 def test_fragment_row_to_mzpaf_with_charge():
     s = fragment_row_to_mzpaf(
-        {"ion_type": 1, "position": 5, "charge": 2, "loss_id": None}
+        {"ion_type": 1, "position": 4, "charge": 2, "loss_id": None}, length=8
     )
     assert s == "b5^2"
 
 
 def test_fragment_row_to_mzpaf_with_loss():
     s = fragment_row_to_mzpaf(
-        {"ion_type": 4, "position": 3, "charge": 2, "loss_id": "H2O"}
+        {"ion_type": 4, "position": 4, "charge": 2, "loss_id": "H2O"}, length=8
     )
     assert s == "y3-[H2O]^2"
+
+
+def test_one_bond_is_named_from_both_ends():
+    """Bond p of a peptide of length L is b(p+1) and y(L-1-p)."""
+    for position in range(7):
+        b = fragment_row_to_mzpaf({"ion_type": 1, "position": position, "charge": 1}, length=8)
+        y = fragment_row_to_mzpaf({"ion_type": 4, "position": position, "charge": 1}, length=8)
+        assert (b, y) == (f"b{position + 1}", f"y{7 - position}")
+
+
+def test_a_bond_outside_the_peptide_is_refused():
+    with pytest.raises(ValueError):
+        fragment_row_to_mzpaf({"ion_type": 4, "position": 7, "charge": 1}, length=8)
 
 
 def test_fragment_row_round_trip_through_parser():
     """A row → mzPAF string → parse → the parsed annotation should
     recover the same ion_type/position/charge/loss."""
-    row = {"ion_type": 4, "position": 3, "charge": 2, "loss_id": "H2O"}
-    s = fragment_row_to_mzpaf(row)
+    from constellation.massspec.peptide.ions import bond_position
+
+    row = {"ion_type": 4, "position": 4, "charge": 2, "loss_id": "H2O"}
+    s = fragment_row_to_mzpaf(row, length=8)
     a = parse_mzpaf(s).annotations[0]
     assert a.ion_letter == "y"
-    assert a.position == 3
+    assert bond_position(4, a.position, 8) == row["position"]
     assert a.charge == 2
     assert a.losses[0].token == "H2O"
     assert a.losses[0].is_named is True
@@ -255,13 +274,26 @@ def test_fragment_table_vectorized():
     table = pa.table(
         {
             "ion_type": pa.array([1, 4, 4], type=pa.int8()),
-            "position": pa.array([2, 3, 5], type=pa.int32()),
+            "position": pa.array([1, 4, 2], type=pa.int32()),
             "charge": pa.array([1, 2, 1], type=pa.int32()),
             "loss_id": pa.array([None, "H2O", None], type=pa.string()),
         }
     )
-    arr = fragment_table_to_mzpaf(table)
+    arr = fragment_table_to_mzpaf(table, length=8)
     assert arr.to_pylist() == ["b2", "y3-[H2O]^2", "y5"]
+
+
+def test_fragment_table_takes_a_length_per_row():
+    table = pa.table(
+        {
+            "ion_type": pa.array([4, 4], type=pa.int8()),
+            "position": pa.array([4, 4], type=pa.int32()),
+            "charge": pa.array([1, 1], type=pa.int32()),
+        }
+    )
+    assert fragment_table_to_mzpaf(table, length=[8, 10]).to_pylist() == ["y3", "y5"]
+    with pytest.raises(ValueError):
+        fragment_table_to_mzpaf(table, length=[8])
 
 
 def test_fragment_table_handles_missing_loss_column():
@@ -269,11 +301,11 @@ def test_fragment_table_handles_missing_loss_column():
     table = pa.table(
         {
             "ion_type": pa.array([1, 4], type=pa.int8()),
-            "position": pa.array([2, 3], type=pa.int32()),
+            "position": pa.array([1, 4], type=pa.int32()),
             "charge": pa.array([1, 1], type=pa.int32()),
         }
     )
-    arr = fragment_table_to_mzpaf(table)
+    arr = fragment_table_to_mzpaf(table, length=8)
     assert arr.to_pylist() == ["b2", "y3"]
 
 

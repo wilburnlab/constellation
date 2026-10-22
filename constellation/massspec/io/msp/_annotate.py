@@ -41,7 +41,7 @@ from constellation.massspec.annotation.mzpaf import (
     NeutralLoss,
 )
 from constellation.massspec.annotation._grammar import IonClass
-from constellation.massspec.peptide.ions import IonType, fragment_ladder
+from constellation.massspec.peptide.ions import IonType, bond_position, fragment_ladder
 from constellation.massspec.peptide.neutral_losses import LOSS_REGISTRY
 
 
@@ -71,11 +71,8 @@ _ALL_ION_TYPES: tuple[IonType, ...] = (
 # Per project convention (encyclopedia adapter + fragment_ladder),
 # the ``position`` column in LIBRARY_FRAGMENT_TABLE is the **0-indexed
 # peptide-bond position from the N-terminus**, NOT the 1-indexed
-# Roepstorff fragment number that mzPAF uses. For a peptide of length
-# L:
-#   * b_N / a_N / c_N (mzPAF, N=1..L-1) ↔ bond_pos = N - 1
-#   * y_N / x_N / z_N (mzPAF, N=1..L-1) ↔ bond_pos = L - 1 - N
-_C_SIDE_TYPES = frozenset({IonType.X, IonType.Y, IonType.Z})
+# Roepstorff fragment number that mzPAF uses; ``peptide.ions.bond_position``
+# converts.
 
 _LOSS_IDS = frozenset(LOSS_REGISTRY.ids())
 
@@ -398,12 +395,9 @@ def _resolve_annotation(
 
     # Roepstorff (1-indexed) → bond-position (0-indexed, from N-terminus)
     roepstorff = int(ann.position)
-    if ion_type in _C_SIDE_TYPES:
-        bond_pos = seq_len - 1 - roepstorff
-    else:
-        bond_pos = roepstorff - 1
-    if bond_pos < 0 or bond_pos >= seq_len - 1:
+    if not 1 <= roepstorff <= seq_len - 1:
         return None, raw
+    bond_pos = bond_position(ion_type, roepstorff, seq_len)
 
     charge = ann.charge if ann.charge is not None else 1
     key = (int(ion_type), bond_pos, int(charge), loss_id)

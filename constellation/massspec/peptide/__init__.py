@@ -8,7 +8,8 @@ single tool's vocabulary commitments.
 
 Submodules:
     mz                m/z helpers — `precursor_mz`, `PROTON_MASS` re-export
-    ions              `IonType`, `FragmentIon`, `fragment_mz`, `fragment_ladder`
+    ions              `IonType`, `FragmentIon`, `fragment_mz`, `fragment_ladder`,
+                      `ion_number` / `bond_position` (label number ↔ bond index)
     envelope          `peptide_envelope` (charge-aware isotope envelopes)
     neutral_losses    `NeutralLoss`, `LOSS_REGISTRY`, `loss_applies`
 """
@@ -19,8 +20,10 @@ from constellation.massspec.peptide.ions import (
     ION_OFFSETS,
     FragmentIon,
     IonType,
+    bond_position,
     fragment_ladder,
     fragment_mz,
+    ion_number,
 )
 from constellation.massspec.peptide.match import (
     IonAssignment,
@@ -45,6 +48,8 @@ __all__ = [
     "FragmentIon",
     "fragment_mz",
     "fragment_ladder",
+    "ion_number",
+    "bond_position",
     "peptide_envelope",
     "NeutralLoss",
     "LossRegistry",

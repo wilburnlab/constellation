@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { buildCompositeSvg, estimateGlyphCount } from './export';
+import { AXIS_FORMATS, AXIS_PRESENTATION, drawAxes, plotFrame, xAxis, yAxis } from './axis';
+import { buildCompositeSvg, buildGridSvg, estimateGlyphCount } from './export';
 import { ensureSvg, svgEl } from './svg_layer';
 
 const WIDTH = 900;
@@ -116,5 +117,56 @@ describe('estimateGlyphCount', () => {
     svg.appendChild(svgEl('text'));
     svg.appendChild(svgEl('path'));
     expect(estimateGlyphCount([a, b, document.createElement('div')])).toBe(4 + 2 + 2);
+  });
+});
+
+describe('buildGridSvg', () => {
+  function cellSvg(label: string): SVGSVGElement {
+    const host = document.createElement('div');
+    host.innerHTML =
+      '<svg class="track-canvas" width="100" height="50"><defs><clipPath id="same-clip"><rect width="10" height="10"/></clipPath></defs>' +
+      `<g clip-path="url(#same-clip)"><text>${label}</text></g></svg>`;
+    return host.querySelector('svg') as SVGSVGElement;
+  }
+
+  it('places cells at their rectangles and keeps their ids apart', () => {
+    const result = buildGridSvg(
+      [
+        { svg: cellSvg('a'), x: 0, y: 0, width: 100, height: 50, title: 'MS1 chromatogram' },
+        { svg: cellSvg('b'), x: 100, y: 0, width: 100, height: 50, title: 'MS1 spectrum' },
+        { svg: cellSvg('c'), x: 0, y: 50, width: 100, height: 50 },
+      ],
+      { title: 'grid', widthPx: 200, heightPx: 100 },
+    );
+    const doc = new DOMParser().parseFromString(result.svg, 'image/svg+xml');
+    const ids = [...doc.querySelectorAll('[id]')].map((el) => el.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toContain('c0-same-clip');
+    expect(ids).toContain('c1-same-clip');
+    // References follow the renamed ids.
+    const refs = [...doc.querySelectorAll('g[clip-path]')].map((g) => g.getAttribute('clip-path'));
+    expect(refs).toContain('url(#c1-same-clip)');
+    // Two rows of cells, each under a title row.
+    const groups = [...doc.querySelectorAll('svg > g')].map((g) => g.getAttribute('transform'));
+    expect(groups).toEqual(['translate(0 16)', 'translate(100 16)', 'translate(0 82)']);
+    expect(result.totalHeightPx).toBe(132);
+    expect([...doc.querySelectorAll('text.export-cell-title')].map((t) => t.textContent)).toEqual([
+      'MS1 chromatogram',
+      'MS1 spectrum',
+    ]);
+  });
+
+  it('carries what the axes look like without the page stylesheet', () => {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    const frame = plotFrame({ widthPx: 200, heightPx: 100 }, { top: 4, right: 4, bottom: 30, left: 40 });
+    drawAxes(svg, frame, { x: xAxis(frame, [0, 10], AXIS_FORMATS.mz), y: yAxis(frame, [0, 1], AXIS_FORMATS.intensity), xLabel: 'm/z' }, 'u');
+    const result = buildGridSvg([{ svg, x: 0, y: 0, width: 200, height: 100 }], { title: 'axes', widthPx: 200, heightPx: 100 });
+    const doc = new DOMParser().parseFromString(result.svg, 'image/svg+xml');
+    expect(doc.documentElement.getAttribute('font-family')).toBeTruthy();
+    const lines = [...doc.querySelectorAll('line.axis-line, line.axis-tick')];
+    expect(lines.length).toBeGreaterThan(2);
+    expect(lines.every((l) => l.getAttribute('stroke') === AXIS_PRESENTATION.line.stroke)).toBe(true);
+    const texts = [...doc.querySelectorAll('text.axis-tick-label, text.axis-label')];
+    expect(texts.every((t) => t.getAttribute('fill') && t.getAttribute('font-size') === '10')).toBe(true);
   });
 });

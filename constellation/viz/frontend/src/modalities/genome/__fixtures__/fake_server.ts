@@ -107,6 +107,9 @@ export class FakeServer {
   searchHits: unknown[] = [];
   /** When set, POST …/sources fails with this detail. */
   addSourceError: string | null = null;
+  /** When set, the next data request is answered (as it is now) only once
+   *  this settles, and like a real fetch fails if aborted meanwhile. */
+  holdNextData: Promise<void> | null = null;
 
   private sources: Source[] = [SRC_ALIGN, SRC_CLUSTER];
 
@@ -123,7 +126,14 @@ export class FakeServer {
     const call: Call = { method, url: url.pathname + url.search };
     if (typeof init?.body === 'string') call.body = JSON.parse(init.body);
     this.calls.push(call);
-    return this.route(method, url, call.body) as unknown as Response;
+    const response = this.route(method, url, call.body) as unknown as Response;
+    if (this.holdNextData && /\/api\/tracks\/[^/]+\/data$/.test(url.pathname)) {
+      const hold = this.holdNextData;
+      this.holdNextData = null;
+      await hold;
+      if (init?.signal?.aborted) throw new DOMException('aborted', 'AbortError');
+    }
+    return response;
   };
 
   /** Requests recorded since `mark`, optionally narrowed by a substring. */

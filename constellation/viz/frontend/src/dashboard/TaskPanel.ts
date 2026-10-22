@@ -146,7 +146,7 @@ export class TaskPanel {
         transitionToWidget: async (mount) => {
           if (!this.host) return;
           this.active?.destroy();
-          this.host.innerHTML = '';
+          this.clearFormChrome();
           try {
             const result = await mount(this.host);
             this.setTitle(result.title);
@@ -230,6 +230,15 @@ export class TaskPanel {
     };
   }
 
+  /** Empty the host for a widget, dropping the classes the entry forms
+   *  put on it (their padding and input rules would otherwise style the
+   *  widget). */
+  private clearFormChrome(): void {
+    if (!this.host) return;
+    this.host.innerHTML = '';
+    this.host.classList.remove('viz-form', 'genome-browser-form');
+  }
+
   private async transitionToViz(
     descriptor: VizDescriptor,
     open: (
@@ -240,7 +249,7 @@ export class TaskPanel {
   ): Promise<void> {
     if (!this.host) return;
     this.active?.destroy();
-    this.host.innerHTML = '';
+    this.clearFormChrome();
     try {
       const result = await open(this.host, values);
       this.setTitle(result.title);

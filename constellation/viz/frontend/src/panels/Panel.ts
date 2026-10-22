@@ -23,8 +23,22 @@ export interface PanelEntry {
   source_id: string | null;
 }
 
+/** Which header controls a panel shows. A container that does its own
+ *  arranging (a grid) turns off the ones a stack needs. All default on. */
+export interface PanelChrome {
+  /** Drag grip, and the panel being draggable. */
+  reorder?: boolean;
+  /** Bottom-edge resize handle. */
+  resize?: boolean;
+  /** Hide (eye) button. */
+  hide?: boolean;
+  /** Collapse chevron. */
+  collapse?: boolean;
+}
+
 export interface PanelInit {
   entry: PanelEntry;
+  chrome?: PanelChrome;
   meta: Bag;
   visible: boolean;
   collapsed: boolean;
@@ -40,6 +54,7 @@ export class Panel<D = unknown> implements LayoutPanel {
 
   /** The panel's root element. */
   readonly element: HTMLElement;
+  readonly header: HTMLElement;
   readonly headerLabelEl: HTMLElement;
   readonly statusEl: HTMLElement;
   /** Holds the panel's `svg.track-canvas`. */
@@ -56,12 +71,11 @@ export class Panel<D = unknown> implements LayoutPanel {
   style: Record<string, unknown>;
   filter: Record<string, unknown>;
 
-  /** The last data successfully fetched and the view it was fetched for.
+  /** The last data successfully fetched and the key of what it was fetched
+   *  for (a stack's view key, a grid cell's data key).
    *  A style or client-side filter change redraws from this without a
    *  request, as long as the view has not moved. */
   lastFetched?: { data: D; viewKey: string };
-  /** Aborts this panel's in-flight fetch. */
-  cancel?: AbortController;
 
   constructor(init: PanelInit) {
     this.entry = init.entry;
@@ -73,11 +87,12 @@ export class Panel<D = unknown> implements LayoutPanel {
     this.style = { ...init.style };
     this.filter = { ...init.filter };
 
+    const chrome = { reorder: true, resize: true, hide: true, collapse: true, ...init.chrome };
     const panel = document.createElement('div');
     panel.className = 'track';
     panel.dataset.bindingId = init.entry.binding_id;
     panel.dataset.kind = init.entry.kind;
-    panel.draggable = true;
+    panel.draggable = chrome.reorder;
 
     const header = document.createElement('div');
     header.className = 'track-header';
@@ -111,12 +126,12 @@ export class Panel<D = unknown> implements LayoutPanel {
     hideBtn.textContent = '👁';
     hideBtn.title = 'Hide track (re-enable from the Datasets menu)';
 
-    header.appendChild(dragHandle);
-    header.appendChild(collapseBtn);
+    if (chrome.reorder) header.appendChild(dragHandle);
+    if (chrome.collapse) header.appendChild(collapseBtn);
     header.appendChild(labelEl);
     header.appendChild(statusEl);
     header.appendChild(settingsBtn);
-    header.appendChild(hideBtn);
+    if (chrome.hide) header.appendChild(hideBtn);
 
     const body = document.createElement('div');
     body.className = 'track-body';
@@ -127,9 +142,10 @@ export class Panel<D = unknown> implements LayoutPanel {
 
     panel.appendChild(header);
     panel.appendChild(body);
-    panel.appendChild(resizeHandle);
+    if (chrome.resize) panel.appendChild(resizeHandle);
 
     this.element = panel;
+    this.header = header;
     this.headerLabelEl = labelEl;
     this.statusEl = statusEl;
     this.bodyHost = body;
@@ -138,6 +154,11 @@ export class Panel<D = unknown> implements LayoutPanel {
     this.hideBtn = hideBtn;
     this.resizeHandle = resizeHandle;
     this.syncCollapseButton();
+  }
+
+  /** Add a button to the header, just before the gear. */
+  addHeaderButton(button: HTMLButtonElement): void {
+    this.header.insertBefore(button, this.settingsBtn);
   }
 
   /** Bring the collapse button in line with `collapsed`. */

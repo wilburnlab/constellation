@@ -9,6 +9,10 @@ Subcommands:
   ``transcriptome align`` / ``cluster`` output dirs. Boots a local
   FastAPI server via uvicorn and (unless ``--no-browser``) opens the
   browser at the served URL.
+- ``constellation viz massspec --acquisition DIR [...] --experiment DIR
+  [...]`` (or ``--saved-session <slug>``) — mass-spec browser over
+  converted acquisitions and what searches found in them: chromatograms
+  and spectra by MS level.
 - ``constellation viz install-frontend --from <tarball>`` — extract a
   prebuilt frontend bundle into the package's ``static/<entry>/`` dir.
   Used by source-checkout / HPC installs where the JS toolchain isn't
@@ -96,39 +100,50 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         default=None,
         help="human-readable label for the standalone session (default: reference name).",
     )
-    p_genome.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help="bind host (default 127.0.0.1 — localhost only)",
+    _add_server_arguments(p_genome)
+    p_genome.set_defaults(func=cmd_viz_genome)
+
+    p_ms = viz_subs.add_parser(
+        "massspec",
+        help="mass-spec browser over converted acquisitions (chromatograms and spectra)",
     )
-    p_genome.add_argument(
-        "--port",
-        type=int,
-        default=0,
-        help=(
-            "bind port (default 0 = pick a free ephemeral port). The "
-            "URL is printed to stdout on startup."
-        ),
-    )
-    p_genome.add_argument(
-        "--no-browser",
-        action="store_true",
-        help="don't auto-open a browser (just print the URL)",
-    )
-    p_genome.add_argument(
-        "--root",
+    p_ms.add_argument(
+        "--acquisition",
         action="append",
         default=None,
         type=Path,
         metavar="DIR",
         help=(
-            "extra directory the file picker is allowed to browse. "
-            "Repeatable. Added on top of the default roots (home + "
-            "working dir + WSL drives); paths outside every root are "
-            "refused by `/api/fs/list`."
+            "a converted acquisition: the directory `massspec convert` writes "
+            "for a .raw, or `massspec encyclopedia import-spectra` for an "
+            "EncyclopeDIA spectra file. Repeatable."
         ),
     )
-    p_genome.set_defaults(func=cmd_viz_genome)
+    p_ms.add_argument(
+        "--experiment",
+        action="append",
+        default=None,
+        type=Path,
+        metavar="DIR",
+        help=(
+            "a search experiment (the directory `massspec search` writes): its "
+            "searched runs, with what was identified in them. A run searched from "
+            "an EncyclopeDIA spectra file needs its converted acquisition given "
+            "with --acquisition too. Repeatable."
+        ),
+    )
+    p_ms.add_argument(
+        "--saved-session",
+        default=None,
+        help="open a saved session by slug (see `~/.constellation/sessions/`).",
+    )
+    p_ms.add_argument(
+        "--label",
+        default=None,
+        help="human-readable label for the session (default: the first acquisition's name).",
+    )
+    _add_server_arguments(p_ms)
+    p_ms.set_defaults(func=cmd_viz_massspec)
 
     p_install = viz_subs.add_parser(
         "install-frontend",
@@ -213,6 +228,42 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
         ),
     )
     p_install.set_defaults(func=cmd_viz_install_frontend)
+
+
+def _add_server_arguments(parser: argparse.ArgumentParser) -> None:
+    """``--host`` / ``--port`` / ``--no-browser`` / ``--root``, as every viz tool takes them."""
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="bind host (default 127.0.0.1 — localhost only)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help=(
+            "bind port (default 0 = pick a free ephemeral port). The "
+            "URL is printed to stdout on startup."
+        ),
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="don't auto-open a browser (just print the URL)",
+    )
+    parser.add_argument(
+        "--root",
+        action="append",
+        default=None,
+        type=Path,
+        metavar="DIR",
+        help=(
+            "extra directory the file picker is allowed to browse. "
+            "Repeatable. Added on top of the default roots (home + "
+            "working dir + WSL drives); paths outside every root are "
+            "refused by `/api/fs/list`."
+        ),
+    )
 
 
 def build_dashboard_parser(subs: argparse._SubParsersAction) -> None:
@@ -322,7 +373,6 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
       2. `--reference <handle> [--reference-dir <PATH>]` + at least one
          `--align-dir` / `--cluster-dir` — ad-hoc one-shot session.
     """
-    from constellation.viz.server.app import create_app
     from constellation.viz.modalities.genome.session import (
         GenomeSession,
         session_from_saved,
@@ -413,12 +463,35 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
             print(f"error opening session: {exc}", file=sys.stderr)
             return 1
 
+    return _serve(
+        args,
+        session,
+        title="genome",
+        details=[
+            ("reference", session.reference_handle),
+            ("sources", str(len(session.sources))),
+        ],
+        default_entry="genome",
+    )
+
+
+def _serve(
+    args: argparse.Namespace,
+    session,
+    *,
+    title: str,
+    details: list[tuple[str, str]],
+    default_entry: str,
+) -> int:
+    """Print where the server will be, open a browser when asked, and run it."""
+    from constellation.viz.server.app import create_app
+
     port = args.port if args.port != 0 else _free_port(args.host)
     url = f"http://{args.host}:{port}"
-    print(f"constellation viz genome — session: {session.label}")
-    print(f"  reference: {session.reference_handle}")
-    print(f"  sources:   {len(session.sources)}")
-    print(f"  url:       {url}")
+    print(f"constellation viz {title} — session: {session.label}")
+    for name, value in details:
+        print(f"  {name + ':':<10} {value}")
+    print(f"  {'url:':<10} {url}")
     for warning in session.warnings:
         print(f"  warning:  {warning}")
 
@@ -432,11 +505,75 @@ def cmd_viz_genome(args: argparse.Namespace) -> int:
 
     import uvicorn
 
-    app = create_app(session, fs_roots=_fs_roots_from_args(args))
+    app = create_app(session, default_entry=default_entry, fs_roots=_fs_roots_from_args(args))
     config = uvicorn.Config(app, host=args.host, port=port, log_level="info")
     server = uvicorn.Server(config)
     server.run()
     return 0
+
+
+def cmd_viz_massspec(args: argparse.Namespace) -> int:
+    """Handler for ``viz massspec``: a saved session, or the acquisitions given."""
+    from constellation.viz.modalities.massspec.session import (
+        MassSpecSession,
+        session_from_saved,
+    )
+    from constellation.viz.sessions import read_saved
+
+    acquisitions = list(args.acquisition or [])
+    experiments = list(args.experiment or [])
+    if args.saved_session is not None:
+        if acquisitions or experiments:
+            print(
+                "error: --saved-session is mutually exclusive with --acquisition / --experiment",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            saved = read_saved(args.saved_session)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if saved.modality != MassSpecSession.modality:
+            print(
+                f"error: saved session {args.saved_session!r} is a {saved.modality!r} "
+                f"session; `viz massspec` opens mass-spec sessions only",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            session = session_from_saved(saved)
+        except ValueError as exc:
+            print(f"error opening saved session: {exc}", file=sys.stderr)
+            return 1
+    else:
+        if not acquisitions and not experiments:
+            print(
+                "error: pass --saved-session <slug>, or at least one --acquisition DIR "
+                "or --experiment DIR",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            session = MassSpecSession.open(
+                sources=[{"path": str(p), "kind": "experiment"} for p in experiments]
+                + [{"path": str(p), "kind": "acquisition"} for p in acquisitions],
+                label=args.label,
+            )
+        except ValueError as exc:
+            print(f"error opening session: {exc}", file=sys.stderr)
+            return 1
+
+    return _serve(
+        args,
+        session,
+        title="massspec",
+        details=[
+            ("runs", ", ".join(a.label for a in session.acquisitions) or "none"),
+            ("searched", str(sum(bool(a.links) for a in session.acquisitions))),
+        ],
+        default_entry="massspec",
+    )
 
 
 def _open_browser_when_ready(host: str, port: int, url: str) -> None:

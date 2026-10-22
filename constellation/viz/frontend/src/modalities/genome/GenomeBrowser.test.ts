@@ -25,6 +25,14 @@ import {
 } from './__fixtures__/fake_server';
 import { GenomeBrowser } from './GenomeBrowser';
 
+/** A pointer event (jsdom may lack PointerEvent; a mouse event with a pointer id stands in). */
+function pointer(type: string, clientX: number): Event {
+  const Ctor = (globalThis as { PointerEvent?: typeof MouseEvent }).PointerEvent ?? MouseEvent;
+  const event = new Ctor(type, { bubbles: true, cancelable: true, clientX, button: 0 });
+  if ((event as PointerEvent).pointerId === undefined) Object.defineProperty(event, 'pointerId', { value: 1 });
+  return event;
+}
+
 const LAYOUT_KEY = `constellation.genome.layout.${SESSION_ID}`;
 const OPTIONS_KEY = `constellation.genome.options.${SESSION_ID}`;
 const LABELS_KEY = 'constellation.genome.labels';
@@ -408,7 +416,7 @@ describe('GenomeBrowser layout', () => {
     expect(svgOf(host, 'read_pileup-0')?.getAttribute('height')).toBe('800');
   });
 
-  it('collapses without fetching and refetches on expand', async () => {
+  it('collapses without fetching, and on expand fetches only a track whose data is stale', async () => {
     const { host } = await open();
     const collapseBtn = track(host, 'coverage-0').querySelector<HTMLElement>('.track-collapse-btn')!;
     let mark = server.calls.length;
@@ -434,11 +442,13 @@ describe('GenomeBrowser layout', () => {
     expect(status(host, 'coverage-0')).toBe('collapsed');
     expect(svgOf(host, 'coverage-0')).toBeNull();
 
+    // Expanding fetches only the track that was skipped while the view
+    // moved; the others are drawn again from what they already have.
     mark = server.calls.length;
     click(collapseBtn);
     expect(collapseBtn.textContent).toBe('▾');
     await settle(60);
-    expect(server.dataRequests(mark)).toHaveLength(6);
+    expect(server.dataRequests(mark).map((u) => u.split('?')[0])).toEqual(['coverage_histogram']);
     expect(status(host, 'coverage-0')).toBe('showing 5 bins');
   });
 
@@ -546,7 +556,7 @@ describe('GenomeBrowser track settings', () => {
     expect(storedLayout()[3].style).toEqual({ read_opacity: 0.5 });
   });
 
-  it('refetches every visible track when a pushdown filter changes', async () => {
+  it('refetches the track whose pushdown filter changed, and only it', async () => {
     const { host } = await open();
     click(track(host, 'read_pileup-0').querySelector('.track-settings-btn'));
     const mark = server.calls.length;
@@ -555,11 +565,7 @@ describe('GenomeBrowser track settings', () => {
     await settle(59);
     expect(server.dataRequests(mark)).toEqual([]);
     await settle(1);
-    expect(server.dataRequests(mark)).toEqual(
-      DEFAULT_ORDER.map((id) =>
-        dataUrl(id, 'chr1:0-12000', id === 'read_pileup-0' ? '&min_mapq=20' : ''),
-      ),
-    );
+    expect(server.dataRequests(mark)).toEqual([dataUrl('read_pileup-0', 'chr1:0-12000', '&min_mapq=20')]);
     await settle(200);
     expect(storedLayout()[3].filter).toEqual({ min_mapq: 20 });
   });
@@ -587,9 +593,7 @@ describe('GenomeBrowser track settings', () => {
     mark = server.calls.length;
     click(document.body.querySelector('.settings-reset-btn'));
     await settle(60);
-    expect(server.dataRequests(mark)).toEqual(
-      DEFAULT_ORDER.map((id) => dataUrl(id, 'chr1:0-12000')),
-    );
+    expect(server.dataRequests(mark)).toEqual([dataUrl('read_pileup-0', 'chr1:0-12000')]);
     expect(svgOf(host, 'read_pileup-0')?.querySelector('[data-alignment-id="2"]')).not.toBeNull();
     await settle(200);
     const read = storedLayout()[3];
@@ -683,12 +687,14 @@ describe('GenomeBrowser dataset manager', () => {
     await settle(60);
     expect(server.dataRequests(mark)).toEqual([]);
 
+    // Shown again for the same locus, it is drawn from what it had.
     mark = server.calls.length;
     box().checked = true;
     box().dispatchEvent(new Event('change', { bubbles: true }));
     expect(stack(host)).toEqual(DEFAULT_ORDER);
     await settle(60);
-    expect(server.dataRequests(mark)).toHaveLength(6);
+    expect(server.dataRequests(mark)).toEqual([]);
+    expect(status(host, 'splice_junctions-0')).toMatch(/^showing /);
   });
 
   it('adds a source and slots its tracks at the end of each kind group', async () => {
@@ -832,6 +838,23 @@ describe('GenomeBrowser navigation', () => {
     expect(locusInput(host).value).toBe('chr2:0-50000');
   });
 
+  it('draws the latest view when a response for an older one arrives late', async () => {
+    const { host } = await open();
+    let release!: () => void;
+    server.holdNextData = new Promise<void>((resolve) => (release = resolve));
+    click(host.querySelector('.btn-group .icon-btn:nth-child(2)')); // zoom in
+    await settle(60); // the reference track's request for this locus is held
+
+    server.rowLimit.reference_sequence = 0;
+    click(host.querySelector('.btn-group .icon-btn:nth-child(2)')); // zoom in again
+    await settle(60);
+    expect(status(host, 'reference_sequence')).toBe('— no data in window');
+
+    release(); // the older locus's full answer arrives now, and is dropped
+    await settle(10);
+    expect(status(host, 'reference_sequence')).toBe('— no data in window');
+  });
+
   it('zooms on vertical wheel, pans on horizontal wheel and on drag', async () => {
     const { host } = await open();
     setInput(host.querySelector<HTMLSelectElement>('.toolbar select')!, 'chr2');
@@ -848,12 +871,18 @@ describe('GenomeBrowser navigation', () => {
     );
     expect(input.value).toBe('chr2:6000-66000');
 
-    surface.dispatchEvent(new MouseEvent('mousedown', { button: 0, clientX: 600, bubbles: true }));
-    window.dispatchEvent(new MouseEvent('mousemove', { clientX: 480, bubbles: true }));
-    window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    surface.dispatchEvent(pointer('pointerdown', 600));
+    surface.dispatchEvent(pointer('pointermove', 480));
+    surface.dispatchEvent(pointer('pointerup', 480));
     expect(input.value).toBe('chr2:12000-72000');
     // Released: further movement does nothing.
-    window.dispatchEvent(new MouseEvent('mousemove', { clientX: 100, bubbles: true }));
+    surface.dispatchEvent(pointer('pointermove', 100));
+    expect(input.value).toBe('chr2:12000-72000');
+    // A press on the browser's own controls is theirs, not a pan.
+    const handle = track(host, 'coverage-0').querySelector<HTMLElement>('.track-resize-handle')!;
+    handle.dispatchEvent(pointer('pointerdown', 600));
+    surface.dispatchEvent(pointer('pointermove', 300));
+    surface.dispatchEvent(pointer('pointerup', 300));
     expect(input.value).toBe('chr2:12000-72000');
   });
 
@@ -918,7 +947,7 @@ describe('GenomeBrowser navigation', () => {
 // ----------------------------------------------------------------------
 
 describe('GenomeBrowser toolbar actions', () => {
-  it('toggles feature labels, remembers the choice and re-renders', async () => {
+  it('toggles feature labels, remembers the choice and redraws without refetching', async () => {
     const { host } = await open();
     const labels = host.querySelector<HTMLElement>('button.toggle')!;
     expect(labels.classList.contains('on')).toBe(true);
@@ -930,7 +959,7 @@ describe('GenomeBrowser toolbar actions', () => {
     expect(labels.classList.contains('on')).toBe(false);
     expect(window.localStorage.getItem(LABELS_KEY)).toBe('false');
     await settle(60);
-    expect(server.dataRequests(mark)).toHaveLength(6);
+    expect(server.dataRequests(mark)).toEqual([]);
     expect(svgOf(host, 'reference')!.querySelectorAll('text').length).toBeLessThan(before);
   });
 
@@ -1028,9 +1057,9 @@ describe('GenomeBrowser toolbar actions', () => {
         .querySelector('.track-resize-handle')!
         .dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, clientY: 100 }));
       expect(held(document).length).toBeGreaterThan(0);
-      expect(held(window)).toEqual(
-        ['mousemove', 'mousemove', 'mouseup', 'mouseup', 'pointermove', 'pointerup'].sort(),
-      );
+      // The overview's drag and the resize in progress; panning uses
+      // pointer capture and keeps no window listener.
+      expect(held(window)).toEqual(['mousemove', 'mouseup', 'pointermove', 'pointerup'].sort());
 
       browser.dispose();
       expect(held(document)).toEqual([]);

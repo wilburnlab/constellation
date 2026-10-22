@@ -72,6 +72,16 @@ export async function fetchTrackData(
   return { table, mode };
 }
 
+/** An Arrow IPC stream from any route (not only track data). */
+export async function fetchArrow(path: string, signal?: AbortSignal): Promise<Table> {
+  const response = await fetch(path, { signal });
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(`fetch ${path} failed (${response.status}): ${body || response.statusText}`);
+  }
+  return tableFromIPC(await response.arrayBuffer());
+}
+
 export async function fetchJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(path, { signal });
   if (!response.ok) {

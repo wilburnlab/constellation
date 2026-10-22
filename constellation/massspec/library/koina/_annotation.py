@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 
-from constellation.massspec.peptide.ions import IonType
+from constellation.massspec.peptide.ions import IonType, bond_position
 from constellation.massspec.peptide.neutral_losses import LOSS_REGISTRY
 
 _ANNOTATION_RE = re.compile(
@@ -37,9 +37,6 @@ _LETTER_TO_ION_TYPE: dict[str, IonType] = {
     "y": IonType.Y,
     "z": IonType.Z,
 }
-
-#: y/x/z count from the C-terminus, so their ordinal inverts.
-_C_SIDE_TYPES = frozenset({IonType.X, IonType.Y, IonType.Z})
 
 _LOSS_IDS = frozenset(LOSS_REGISTRY.ids())
 
@@ -75,13 +72,9 @@ def parse_koina_annotation(
         return None
 
     ordinal = int(match["ordinal"])
-    if ion_type in _C_SIDE_TYPES:
-        bond_pos = seq_len - 1 - ordinal
-    else:
-        bond_pos = ordinal - 1
-
-    if bond_pos < 0 or bond_pos > seq_len - 2:
+    if not 1 <= ordinal <= seq_len - 1:
         return None
+    bond_pos = bond_position(ion_type, ordinal, seq_len)
 
     return int(ion_type), bond_pos, int(match["charge"]), loss
 

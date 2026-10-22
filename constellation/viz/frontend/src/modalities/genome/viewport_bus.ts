@@ -2,10 +2,11 @@
 //
 // The genome browser's load-bearing shared state is the locus
 // (`{contig, start, end}`). Pan/zoom interactions update the locus and
-// every track re-renders against the new range. The bus is a thin
-// wrapper around the standard `EventTarget` so future cross-modality
-// panels (Vitessce-style coordination) can subscribe to the same
-// channel without depending on a frontend framework.
+// every track re-renders against the new range. The events travel on the
+// engine's `TypedBus`, the channel every browser uses; this class adds the
+// locus it carries, so setting an unchanged locus emits nothing.
+
+import { TypedBus } from '../../engine/bus';
 
 export interface Locus {
   contig: string;
@@ -19,7 +20,7 @@ export interface ViewportEvents {
 }
 
 export class ViewportBus {
-  private readonly bus = new EventTarget();
+  private readonly bus = new TypedBus<ViewportEvents>();
   private locusInternal: Locus = { contig: '', start: 0, end: 1 };
 
   get locus(): Locus {
@@ -35,26 +36,17 @@ export class ViewportBus {
       return;
     }
     this.locusInternal = next;
-    this.bus.dispatchEvent(
-      new CustomEvent('locus:changed', { detail: next }),
-    );
+    this.bus.emit('locus:changed', next);
   }
 
   emitFeatureSelection(detail: ViewportEvents['selection:feature']): void {
-    this.bus.dispatchEvent(
-      new CustomEvent('selection:feature', { detail }),
-    );
+    this.bus.emit('selection:feature', detail);
   }
 
   on<K extends keyof ViewportEvents>(
     event: K,
     handler: (detail: ViewportEvents[K]) => void,
   ): () => void {
-    const listener = (e: Event) => {
-      const ce = e as CustomEvent<ViewportEvents[K]>;
-      handler(ce.detail);
-    };
-    this.bus.addEventListener(event, listener as EventListener);
-    return () => this.bus.removeEventListener(event, listener as EventListener);
+    return this.bus.on(event, handler);
   }
 }

@@ -1,0 +1,143 @@
+/* PanelGrid — rows and columns of panels.
+ *
+ * Imported by `PanelGrid`. Track sizes are set inline by the grid (it
+ * computes them); these rules give the headers, cells, splitters and the
+ * collapsed / focused states their look. Relies on the page's palette
+ * variables, like panels.css.
+ */
+
+.panel-grid {
+  display: grid;
+  position: relative;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Headers and cells set their own display; a hidden one must still go. */
+.panel-grid > [hidden] {
+  display: none;
+}
+
+.panel-grid-corner {
+  background: var(--bg);
+}
+
+.panel-grid-col-header,
+.panel-grid-row-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  user-select: none;
+  overflow: hidden;
+}
+.panel-grid-col-header {
+  padding: 0 6px;
+  border-bottom: 1px solid var(--border);
+}
+.panel-grid-row-header {
+  flex-direction: column;
+  justify-content: flex-start;
+  padding: 4px 0;
+  border-right: 1px solid var(--border);
+}
+.panel-grid-row-header .panel-grid-header-label {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  white-space: nowrap;
+}
+.panel-grid-header-label {
+  color: var(--fg);
+  font-weight: 600;
+}
+.panel-grid-col-header .panel-grid-header-label {
+  flex: 0 1 auto;
+}
+.panel-grid-header-slot {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1 1 auto;
+  min-width: 0;
+  text-transform: none;
+  letter-spacing: normal;
+}
+.panel-grid-row-header .panel-grid-header-slot {
+  flex-direction: column;
+  flex: 0 0 auto;
+}
+.panel-grid-header-btn,
+.panel-grid-maximize {
+  background: transparent;
+  color: var(--fg-dim);
+  border: none;
+  padding: 0 3px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+.panel-grid-header-btn:hover,
+.panel-grid-maximize:hover {
+  color: var(--fg);
+}
+.panel-grid-col-header.collapsed > :not(.panel-grid-header-btn:first-child),
+.panel-grid-row-header.collapsed .panel-grid-header-slot {
+  display: none;
+}
+.panel-grid-col-header.collapsed .panel-grid-header-btn:first-child,
+.panel-grid-row-header.collapsed .panel-grid-header-btn:first-child {
+  transform: rotate(-90deg);
+}
+
+/* Cells: a panel without the stack's chrome, sized by the grid. */
+.panel-grid > .track.panel-grid-cell {
+  margin: 1px;
+  min-width: 0;
+  min-height: 0;
+}
+.panel-grid > .track.panel-grid-cell .track-header {
+  box-sizing: border-box;
+  height: 24px;
+  padding: 0 6px;
+}
+.panel-grid > .track.panel-grid-cell.collapsed-row .track-body,
+.panel-grid > .track.panel-grid-cell.collapsed-col .track-body,
+.panel-grid > .track.panel-grid-cell.collapsed-col .track-header > * {
+  display: none;
+}
+.panel-grid-placeholder {
+  padding: 16px;
+  color: var(--fg-mute, var(--fg-dim));
+  font-style: italic;
+  text-align: center;
+}
+
+/* Splitters sit on the trailing edge of a header and span the grid. */
+.panel-grid-splitter {
+  position: absolute;
+  z-index: 2;
+  background: transparent;
+}
+.panel-grid-splitter:hover,
+.panel-grid-splitter:active {
+  background: rgba(var(--accent-rgb), 0.4);
+}
+.panel-grid-splitter-col {
+  top: 0;
+  right: -3px;
+  width: 6px;
+  height: 100%;
+  cursor: ew-resize;
+}
+.panel-grid-splitter-row {
+  left: 0;
+  bottom: -3px;
+  width: 100%;
+  height: 6px;
+  cursor: ns-resize;
+}

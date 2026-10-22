@@ -32,6 +32,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 
+import numpy as np
 import pyarrow as pa
 import torch
 
@@ -125,6 +126,71 @@ class FragmentIon:
     charge: int
     loss_id: str | None
     mz: float
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Bond position ↔ ion number
+# ──────────────────────────────────────────────────────────────────────
+#
+# Fragment tables (FRAGMENT_ION_TABLE, LIBRARY_FRAGMENT_TABLE, the ladder
+# tensor) name a fragment by the peptide bond it breaks, counted from the
+# N-terminus from 0, so a peptide of length L has bonds 0..L-2. A label
+# counts residues instead: b_n / a_n / c_n hold the first n, y_n / x_n /
+# z_n the last n. One bond is therefore b_{p+1} and y_{L-1-p}, and showing
+# the bond position as the number mislabels every C-terminal ion.
+
+_C_SIDE_CODES = np.array(sorted(int(t) for t in _C_SIDE))
+_INTS = (int, np.integer)
+
+
+def _convert(ion_type, value, length, *, n_side_shift: int, low: int, high_offset: int, what: str):
+    """``length - 1 - value`` for C-terminal series, ``value + n_side_shift`` otherwise.
+
+    Shared by both directions: the C-terminal mapping is its own inverse,
+    and the N-terminal one shifts by +1 (bond → number) or -1 (number → bond).
+    ``value`` must lie in ``low..length-high_offset``.
+    """
+    if isinstance(ion_type, _INTS) and isinstance(value, _INTS) and isinstance(length, _INTS):
+        # Scalar path: readers convert one annotation at a time, millions of times.
+        if not low <= value <= length - high_offset:
+            raise ValueError(f"{what} {value} out of range for a peptide of length {length}")
+        return length - 1 - value if ion_type in _C_SIDE else value + n_side_shift
+    ion_type, value, length = np.asarray(ion_type), np.asarray(value), np.asarray(length)
+    if np.any((value < low) | (value > length - high_offset)):
+        raise ValueError(f"{what} out of range for the peptide length")
+    out = np.where(np.isin(ion_type, _C_SIDE_CODES), length - 1 - value, value + n_side_shift)
+    return int(out) if out.ndim == 0 else out
+
+
+def ion_number(
+    ion_type: int | np.ndarray,
+    position: int | np.ndarray,
+    length: int | np.ndarray,
+) -> int | np.ndarray:
+    """An ion's number in its series (the *n* of b_n or y_n) from its bond position.
+
+    ``position`` is the 0-based bond index fragment tables store and
+    ``length`` the peptide's residue count. Accepts scalars or numpy arrays
+    (broadcast together); returns the same shape. Raises ``ValueError`` for
+    a position outside ``0..length-2``.
+    """
+    return _convert(
+        ion_type, position, length, n_side_shift=1, low=0, high_offset=2, what="bond position"
+    )
+
+
+def bond_position(
+    ion_type: int | np.ndarray,
+    number: int | np.ndarray,
+    length: int | np.ndarray,
+) -> int | np.ndarray:
+    """The 0-based bond index of ion number ``number`` (the inverse of :func:`ion_number`).
+
+    Raises ``ValueError`` for a number outside ``1..length-1``.
+    """
+    return _convert(
+        ion_type, number, length, n_side_shift=-1, low=1, high_offset=1, what="ion number"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1103,8 +1169,10 @@ __all__ = [
     "ION_OFFSETS",
     "ION_OFFSET_MASSES",
     "FragmentIon",
+    "bond_position",
     "fragment_mz",
     "fragment_ladder",
     "fragment_ladders_batch",
     "fragment_ladder_indices_batch",
+    "ion_number",
 ]
