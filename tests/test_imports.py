@@ -32,12 +32,16 @@ import constellation.core.sequence.ops
 import constellation.core.sequence.proforma
 import constellation.core.sequence.protein
 import constellation.core.signal
+import constellation.core.signal.alignment
 import constellation.core.signal.decimate
 import constellation.core.signal.matching
+import constellation.core.signal.modal_path
 import constellation.core.stats
 import constellation.core.stats.calibration
+import constellation.core.stats.density
 import constellation.core.stats.distributions
 import constellation.core.stats.losses
+import constellation.core.stats.monotone
 import constellation.core.stats.parametric
 import constellation.core.stats.peaks
 import constellation.core.stats.units
@@ -57,6 +61,9 @@ import constellation.massspec.acquisitions
 import constellation.massspec.manifest
 import constellation.massspec.experiment
 import constellation.massspec.results
+import constellation.massspec.rt
+import constellation.massspec.rt.encyclopedia
+import constellation.massspec.rt.pairs
 import constellation.massspec.scans
 import constellation.core.detach
 import constellation.core.locks
