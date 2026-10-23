@@ -91,6 +91,9 @@ __all__ = [
 ]
 
 _FWHM = 2.0 * math.sqrt(2.0 * math.log(2.0))
+#: The narrowest kernel across the band, as a fraction of the bandwidth
+#: along it: what noiseless pairs (a residual spread of zero) get.
+_MIN_SPREAD = 1e-3
 _SQRT2 = math.sqrt(2.0)
 _MAD = 1.482602218505602
 
@@ -247,19 +250,30 @@ def quantile_band(residuals: torch.Tensor, coverage: float = 0.95) -> tuple[floa
 
 
 def theil_sen(
-    x: torch.Tensor, y: torch.Tensor
+    x: torch.Tensor, y: torch.Tensor, *, max_pairs: int = 1_000_000, seed: int = 0
 ) -> tuple[float, float]:
     """Median-of-pairwise-slopes line (Theil 1950, Sen 1968).
 
     The slope is the median over pairs with distinct x; the intercept
     the median of ``y − slope·x``. Robust to about 29 % wrong points and
     no least squares, which is why the small-sample fallback uses it.
+    With no spread in x the slope is 1. Above ``max_pairs`` pairs the
+    median is taken over that many pairs drawn at random (``seed``), so
+    memory stays bounded.
     """
     x = torch.as_tensor(x, dtype=torch.float64).reshape(-1)
     y = torch.as_tensor(y, dtype=torch.float64).reshape(-1)
-    if x.numel() == 0:
+    n = x.numel()
+    if n == 0:
         raise ValueError("theil_sen needs at least one point")
-    i, j = torch.triu_indices(x.numel(), x.numel(), 1)
+    if not float(x.max() - x.min()) > 0:
+        return 1.0, float(torch.median(y - x))
+    if n * (n - 1) // 2 <= max_pairs:
+        i, j = torch.triu_indices(n, n, 1)
+    else:
+        g = torch.Generator().manual_seed(seed)
+        i = torch.randint(0, n, (max_pairs,), generator=g)
+        j = torch.randint(0, n, (max_pairs,), generator=g)
     dx = x[j] - x[i]
     keep = dx != 0
     if bool(keep.any()):
@@ -278,8 +292,10 @@ def _wmad(r: torch.Tensor, w: torch.Tensor) -> float:
 
 
 def _small_fit(x: torch.Tensor, y: torch.Tensor) -> tuple[MonotoneCurve, dict]:
-    if x.numel() == 1:
-        return LinearMap(1.0, float(y[0] - x[0]), (float(x[0]), float(x[0]))), {"fallback": "offset"}
+    x0 = float(x[0])
+    if x.numel() == 1 or not float(x.max() - x.min()) > 0:
+        # One point, or one x however many points: an offset of slope 1.
+        return LinearMap(1.0, float(torch.median(y)) - x0, (x0, x0)), {"fallback": "offset"}
     slope, intercept = theil_sen(x, y)
     if not slope > 0:
         span_x = float(x.max() - x.min())
@@ -498,7 +514,10 @@ def _fit_global(x, y, w, opts: GlobalPathOptions, curve_kind: str):
         r = v - interp(u, uc, vc)
         sigma_v = spread(r, 3.0 * sigma)
         passes = 2
-    inlier = r.abs() <= opts.inlier_sigmas * max(sigma_v, 1e-12)
+    # A spread finer than the grid's rows cannot be resolved (noiseless
+    # pairs measure zero), and the refinements need it positive.
+    sigma_v = max(sigma_v, density.y_axis.step)
+    inlier = r.abs() <= opts.inlier_sigmas * sigma_v
     if int(inlier.sum()) < 2:
         inlier = torch.ones_like(inlier)
     x_in = x[inlier]
@@ -607,9 +626,12 @@ def _refine_density(model, x, y, w, frame, sigma_across, gopts, opts):
     lo, hi = model.domain
     for scale in opts.density_scales:
         sigma_u = frame.sigma * scale
-        sigma_v = min(sigma_across * scale, sigma_u)
+        sigma_v = min(max(sigma_across, _MIN_SPREAD * frame.sigma) * scale, sigma_u)
         du = sigma_u / gopts.cells_per_sigma
-        dv = min(du, sigma_v / 4.0)
+        # Rows of a quarter kernel, unless that would take more rows than
+        # the budget allows to cover the pairs.
+        half = float(v.abs().max()) + 3.0 * sigma_v
+        dv = max(min(du, sigma_v / 4.0), 2.0 * half / gopts.max_rows)
         density = _rotated_density(
             u, v, w, sigma_u=sigma_u, sigma_v=sigma_v, du=du, dv=dv, box=box, max_rows=gopts.max_rows
         )
@@ -760,7 +782,7 @@ def fit_monotone_alignment(
             r = vc - vf
             near = r.abs() < 3.0 * frame.sigma
             sigma_across = _wmad(r[near], w[near]) if int(near.sum()) >= 3 else frame.sigma
-            sigma_across = min(max(sigma_across, 1e-6), frame.sigma)
+            sigma_across = min(max(sigma_across, _MIN_SPREAD * frame.sigma), frame.sigma)
         base = _refine(base, x, y, w, frame, sigma_across, refine, gopts, refine_options or RefineOptions())
         diagnostics = {**diagnostics, "refine": refine}
 

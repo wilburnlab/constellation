@@ -76,7 +76,8 @@ def _round_half_up(v: float) -> int:
 
 
 def _to_f32(values) -> torch.Tensor:
-    return torch.as_tensor(values, dtype=torch.float64).reshape(-1).to(torch.float32)
+    """``(float) v`` for every value, keeping the shape."""
+    return torch.as_tensor(values, dtype=torch.float64).to(torch.float32)
 
 
 class _Range:
@@ -218,7 +219,7 @@ class JarLinearFunction:
         self._y = torch.as_tensor(y, dtype=torch.float64).reshape(-1)
 
     @staticmethod
-    def _evaluate(q, xs, ys, *, beyond_low_inclusive: bool) -> torch.Tensor:
+    def _evaluate(q, xs, ys) -> torch.Tensor:
         q = _to_f32(q).to(torch.float64)
         k = _binary_search(xs, q)
         k = torch.where(k < 0, -(k + 1), k)
@@ -230,18 +231,17 @@ class JarLinearFunction:
             inner = _linear_interp(xs[kk - 1], q, xs[kk], ys[kk - 1], ys[kk])
         else:
             inner = torch.full_like(q, float(lo_val))
-        low = (k <= 0) if beyond_low_inclusive else (k == 0)
-        return torch.where(low, lo_val, torch.where(k >= n, hi_val, inner))
+        return torch.where(k <= 0, lo_val, torch.where(k >= n, hi_val, inner))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``getYValue``."""
-        return self._evaluate(x, self._x, self._y, beyond_low_inclusive=True)
+        return self._evaluate(x, self._x, self._y)
 
     __call__ = forward
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         """``getXValue``."""
-        return self._evaluate(y, self._y, self._x, beyond_low_inclusive=False)
+        return self._evaluate(y, self._y, self._x)
 
     def derivative(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.as_tensor(x, dtype=torch.float64)
@@ -394,8 +394,11 @@ def fit_encyclopedia(
 
     if n < MIN_KDE_POINTS:
         if n <= 1:
+            # The jar's identity is the regression through (0, 0) and
+            # (1, 1), unclamped; its domain is where the point is, so
+            # that extrapolation tails do not cut the identity short.
             m, b, model = 1.0, 0.0, "identity"
-            dom = (0.0, 1.0)
+            dom = (float(x32[0]), float(x32[0])) if n == 1 else (0.0, 0.0)
         else:
             m, b = _regression([float(v) for v in x32.tolist()], [float(v) for v in y32.tolist()])
             model = "linear"

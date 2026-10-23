@@ -136,7 +136,8 @@ def weighted_quantile(
     Sorted values sit at the midpoints of their cumulative weight
     (``p_i = (W_i − w_i/2) / W``) and the quantile is interpolated
     linearly between them, clamped to the extreme values. With equal
-    weights this is the Hazen definition (``p_i = (i + ½)/n``).
+    weights this is the Hazen definition (``p_i = (i + ½)/n``). Values
+    of zero weight are left out.
     """
     v = values.reshape(-1).to(torch.float64)
     if v.numel() == 0:
@@ -146,6 +147,12 @@ def weighted_quantile(
         if weights is None
         else weights.reshape(-1).to(torch.float64)
     )
+    # A value without weight is not an observation; left in, it would
+    # still anchor the interpolation.
+    positive = w > 0
+    v, w = v[positive], w[positive]
+    if v.numel() == 0:
+        raise ValueError("weights must have a positive sum")
     order = torch.argsort(v)
     v, w = v[order], w[order]
     total = w.sum()

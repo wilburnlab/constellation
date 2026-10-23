@@ -161,3 +161,31 @@ def test_options_must_match_the_method() -> None:
         fit_monotone_alignment(x, y, method="greedy", options=GlobalPathOptions())
     with pytest.raises(ValueError):
         fit_monotone_alignment(x, y, method="ridge")
+
+
+@pytest.mark.parametrize("refine", [None, "modal", "density"])
+def test_noiseless_pairs_fit_without_a_zero_bandwidth(refine) -> None:
+    x = torch.linspace(0, 100, 100, dtype=torch.float64)
+    alignment = fit_monotone_alignment(x, 2 * x + 3, refine=refine)
+    with torch.no_grad():
+        assert float((alignment.forward(x[5:-5]) - (2 * x[5:-5] + 3)).abs().max()) < 0.5
+
+
+def test_one_x_however_many_pairs_is_an_offset_without_pairing(monkeypatch) -> None:
+    def no_pairs(*args, **kwargs):
+        raise AssertionError("pairs formed for x with no spread")
+
+    monkeypatch.setattr(torch, "triu_indices", no_pairs)
+    y = torch.linspace(10, 20, 5001, dtype=torch.float64)
+    alignment = fit_monotone_alignment(torch.full_like(y, 5.0), y)
+    assert alignment.diagnostics["fallback"] == "offset"
+    assert float(alignment.forward(torch.tensor([5.0]))) == pytest.approx(15.0)
+    assert theil_sen(torch.full_like(y, 5.0), y) == (1.0, pytest.approx(10.0))
+
+
+def test_theil_sen_samples_pairs_beyond_its_budget() -> None:
+    g = torch.Generator().manual_seed(3)
+    x = torch.rand(3000, generator=g, dtype=torch.float64) * 100
+    y = 2 * x + 5 + 0.1 * torch.randn(3000, generator=g, dtype=torch.float64)
+    slope, intercept = theil_sen(x, y, max_pairs=20_000)
+    assert slope == pytest.approx(2.0, abs=0.01) and intercept == pytest.approx(5.0, abs=0.3)

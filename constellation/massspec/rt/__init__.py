@@ -109,13 +109,23 @@ class RtAlignment:
         return torch.as_tensor(observed_rt, dtype=torch.float64) - self.to_observed(reference_rt)
 
     def within_band(self, reference_rt, observed_rt) -> torch.Tensor:
-        """Inside the fit's middle-95 % residual band."""
+        """Inside the fit's middle-95 % residual band.
+
+        Judged on the residual of the curve in use, tails included, so a
+        flag never contradicts :meth:`residuals`. For the EncyclopeDIA
+        replay the residual is formed in float32 as the jar forms it,
+        which inside the fitted range gives the jar's own flags.
+        """
         x = torch.as_tensor(reference_rt, dtype=torch.float64) / self.reference_scale
         y = torch.as_tensor(observed_rt, dtype=torch.float64) / self.observed_scale
-        if self.encyclopedia is not None:
-            return self.encyclopedia.within_band(x, y)
         with torch.no_grad():
-            return self.alignment.within_band(x, y)
+            fitted = self.alignment.forward(x)
+        if self.encyclopedia is not None:
+            r = (y.to(torch.float32) - fitted.to(torch.float32)).to(torch.float64)
+        else:
+            r = y - fitted
+        lo, hi = self.alignment.band
+        return torch.isfinite(r) & (r >= lo) & (r <= hi)
 
     def is_extrapolated(self, reference_rt) -> torch.Tensor:
         x = torch.as_tensor(reference_rt, dtype=torch.float64) / self.reference_scale

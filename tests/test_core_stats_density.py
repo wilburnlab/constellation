@@ -132,3 +132,10 @@ def test_weighted_quantile() -> None:
     assert float(weighted_quantile(v, 0.6, w)) == 9.0
     many = weighted_quantile(v, torch.tensor([0.25, 0.75]))
     assert many.shape == (2,)
+
+
+def test_zero_weight_values_are_not_observations() -> None:
+    v, w = torch.tensor([0.0, 10.0, 20.0]), torch.tensor([0.0, 1.0, 0.0])
+    assert weighted_quantile(v, torch.tensor([0.25, 0.75]), w).tolist() == [10.0, 10.0]
+    with pytest.raises(ValueError):
+        weighted_quantile(v, 0.5, torch.zeros(3))

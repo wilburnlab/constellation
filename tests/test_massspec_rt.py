@@ -260,3 +260,45 @@ def test_align_to_library_refits_the_engines_own_points(tmp_path: Path) -> None:
     assert fitted.n_pairs == len(x)
     with pytest.raises(ValueError):
         align_to_library(tmp_path, unit="run-0000abcd", acquisition_id=7)
+
+
+def _pairs_table(reference: list[float], observed: list[float]) -> pa.Table:
+    n = len(reference)
+    columns = {f.name: pa.nulls(n, f.type) for f in PAIR_SCHEMA}
+    columns["reference_rt"] = pa.array(reference, pa.float64())
+    columns["observed_rt"] = pa.array(observed, pa.float64())
+    return pa.table(columns, schema=PAIR_SCHEMA)
+
+
+def test_band_flags_follow_the_curve_in_use_beyond_the_fit() -> None:
+    times = [300.0 * i for i in range(21)]
+    fitted = align(_pairs_table(times, times), method="encyclopedia")
+    beyond = torch.tensor([6100.0], dtype=torch.float64)
+    assert float(fitted.to_observed(beyond)) == pytest.approx(6100.0)
+    assert float(fitted.residuals(beyond, beyond)) == pytest.approx(0.0)
+    assert bool(fitted.within_band(beyond, beyond))
+
+
+def test_band_flags_inside_the_fit_are_the_jars() -> None:
+    x, y = _outlier_fixture()
+    fitted = align(engine_pairs(_rt_alignment(x, y)), method="encyclopedia", extrapolation="clamp")
+    xt, yt = torch.tensor(x, dtype=torch.float64), torch.tensor(y, dtype=torch.float64)
+    jar = fit_encyclopedia(xt, yt).within_band(xt, yt)
+    assert torch.equal(fitted.within_band(xt * 60, yt * 60), jar)
+
+
+def test_one_pair_gives_the_jars_identity_everywhere() -> None:
+    fitted = align(_pairs_table([750.0], [840.0]), method="encyclopedia")
+    assert fitted.encyclopedia.model == "identity"
+    assert fitted.to_observed(torch.tensor([750.0, 3000.0])).tolist() == pytest.approx([750.0, 3000.0])
+
+
+@pytest.mark.parametrize("method", ["encyclopedia", "global"])
+def test_queries_keep_their_shape(method: str) -> None:
+    times = [300.0 * i for i in range(30)]
+    fitted = align(_pairs_table(times, [t + 60.0 for t in times]), method=method, refine=None if method == "global" else "auto")
+    query = torch.tensor([[600.0], [1200.0]], dtype=torch.float64)
+    out = fitted.to_observed(query)
+    assert out.shape == (2, 1)
+    assert out.reshape(-1).tolist() == pytest.approx([660.0, 1260.0], abs=1.0)
+    assert fitted.within_band(query, out).shape == (2, 1)
