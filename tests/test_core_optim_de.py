@@ -387,6 +387,7 @@ def _make_subclasses():
         Multinomial,
         NormalDistribution,
         Poisson,
+        RationalQuadraticSpline,
         Sigmoidal,
         StudentT,
     )
@@ -403,6 +404,12 @@ def _make_subclasses():
         ("Sigmoidal", Sigmoidal(), torch.linspace(-3, 3, 9, dtype=torch.float64), "forward"),
         ("Hill", Hill(), torch.linspace(0.1, 5.0, 9, dtype=torch.float64), "forward"),
         ("LogLinear", LogLinear(), torch.linspace(0.1, 5.0, 9, dtype=torch.float64), "forward"),
+        (
+            "RationalQuadraticSpline",
+            RationalQuadraticSpline(0.0, 10.0, 6, y_lo=1.0, y_hi=30.0),
+            torch.linspace(-1.0, 11.0, 9, dtype=torch.float64),
+            "forward",
+        ),
         # Multinomial / Dirichlet take vector data; skipped from the
         # smoke test until DE-friendly count-data fits land. They're
         # not blocked from DE — the user just needs a custom loss_fn

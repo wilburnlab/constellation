@@ -9,9 +9,12 @@ The in-Constellation reader is a clean rewrite.
 Imports `core` only; never cross-imports to other domain modules.
 Calibration models with explicit physics priors (Slater–Noolandi
 biased reptation, Ogston-regime small-fragment limit) live under
-``electrophoresis.physics`` once developed; the generic Sigmoidal /
-Hill / polynomial / monotonic-spline calibration families come from
-core (``core.stats.distributions`` and ``core.signal.calibration``).
+``electrophoresis.physics`` once developed; the generic calibration
+families come from core: Sigmoidal / Hill / LogLinear in
+``core.stats.calibration``, monotone curves (piecewise-linear, the
+rational-quadratic spline, extrapolation policies) in
+``core.stats.monotone``, and a robust monotone fit of one axis onto
+another in ``core.signal.alignment``.
 
 Modules (TODO; scaffolded only):
     readers/         - agilent_fa (FA + PA share the .raw format;

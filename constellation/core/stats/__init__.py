@@ -14,7 +14,7 @@ Two-tier ABC structure under one umbrella:
         |       (.log_prob/.cdf optional)
         |
         +-- (calibration models — leaf, no extra trait)
-                Sigmoidal, Hill, LogLinear
+                Sigmoidal, Hill, LogLinear, RationalQuadraticSpline
 
 Fitting drives NLL minimization (for Distributions) or MSE (for
 PeakShapes / calibration) through an external optimizer.
@@ -31,6 +31,9 @@ Submodules:
                      Spline land in the next peak-numerics session,
                      now that DE is available)
     calibration      Sigmoidal / Hill / LogLinear standard curves
+    monotone         invertible monotone curves (piecewise-linear,
+                     rational-quadratic spline) + extrapolation tails
+    density          2-D gridded kernel density (FFT) + weighted_quantile
     variational      pure-PyTorch VI — Gaussian guides + MC-ELBO + fit_vb
     intervals        credible_interval / laplace_cov / profile_interval
     hierarchical     ParameterTier (global + per-entity) + ParameterProvider
@@ -65,6 +68,27 @@ from .peaks import (
     emg_pdf,
 )
 from .calibration import Hill, LogLinear, Sigmoidal
+from .monotone import (
+    Extrapolation,
+    Knots,
+    LinearMap,
+    MonotoneCurve,
+    PiecewiseLinear,
+    RationalQuadraticSpline,
+    Tail,
+    TailedCurve,
+    interp,
+    steffen_slopes,
+)
+from .density import (
+    GridAxis,
+    GridDensity,
+    bin_2d,
+    fft_convolve2d,
+    grid_kde_2d,
+    kernel_stamp,
+    weighted_quantile,
+)
 from .variational import (
     LowRankGuide,
     MeanFieldGuide,
@@ -122,6 +146,25 @@ __all__ = [
     "Sigmoidal",
     "Hill",
     "LogLinear",
+    # Monotone curves
+    "MonotoneCurve",
+    "Knots",
+    "PiecewiseLinear",
+    "LinearMap",
+    "RationalQuadraticSpline",
+    "steffen_slopes",
+    "interp",
+    "Extrapolation",
+    "Tail",
+    "TailedCurve",
+    # Gridded densities
+    "GridAxis",
+    "GridDensity",
+    "bin_2d",
+    "kernel_stamp",
+    "fft_convolve2d",
+    "grid_kde_2d",
+    "weighted_quantile",
     # Variational inference + uncertainty
     "VariationalGuide",
     "MeanFieldGuide",
