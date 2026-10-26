@@ -99,7 +99,10 @@ register_schema("MSPeakTable", MS_PEAK_TABLE)
 # ──────────────────────────────────────────────────────────────────────
 
 # v3 (additive): scan_window_lower / scan_window_upper.
-SCAN_METADATA_SCHEMA_VERSION: int = 3
+# v4: spectrum_type / centroider (additive); peak_count is the number of
+#   peaks the bundle holds for the scan (v3 Thermo bundles held the
+#   instrument's packet count there); agc_ps_mode is signed.
+SCAN_METADATA_SCHEMA_VERSION: int = 4
 
 
 # Mirrors Cartographer's SCAN_METADATA_SCHEMA v5 column-for-column with
@@ -118,6 +121,15 @@ SCAN_METADATA_TABLE: pa.Schema = pa.schema(
         pa.field("base_peak_mz", pa.float64(), nullable=True),
         pa.field("base_peak_intensity", pa.float64(), nullable=True),
         pa.field("peak_count", pa.uint32(), nullable=True),
+        # How the scan's peaks were made. `spectrum_type` is what the
+        # peaks are: `centroid` or `profile` points. `centroider` names
+        # what centroided them: `instrument` (acquired as centroids, or
+        # the instrument's own centroid stream stored beside a profile
+        # scan), `thermo` (Thermo's centroider run on the profile scan at
+        # conversion), null for profile points. Null in bundles written
+        # before v4.
+        pa.field("spectrum_type", pa.string(), nullable=True),
+        pa.field("centroider", pa.string(), nullable=True),
         pa.field("filter_string", pa.string(), nullable=True),
         # Mass analyzer (FTMS, ITMS, ...) parsed from the filter string. Set on
         # every scan including MS1; the discriminator that separates, e.g., a
@@ -188,7 +200,9 @@ SCAN_METADATA_TABLE: pa.Schema = pa.schema(
         pa.field("agc_transm_car_factor", pa.float32(), nullable=True),
         pa.field("agc_transm_funnel_enabled", pa.bool_(), nullable=True),
         pa.field("agc_transm_funnel_factors", pa.string(), nullable=True),
-        pa.field("agc_ps_mode", pa.uint32(), nullable=True),
+        # Signed: a Q Exactive HF reports -1 (v4; uint32 before, which made
+        # such a file unconvertible).
+        pa.field("agc_ps_mode", pa.int32(), nullable=True),
         pa.field("agc_ps_diag", pa.uint32(), nullable=True),
         pa.field("agc_diag_1", pa.float32(), nullable=True),
         pa.field("agc_diag_2", pa.float32(), nullable=True),
@@ -306,6 +320,10 @@ ACQUISITION_METADATA_TABLE: pa.Schema = pa.schema(
         pa.field("n_scans", pa.uint32(), nullable=True),
         pa.field("rt_min_seconds", pa.float32(), nullable=True),
         pa.field("rt_max_seconds", pa.float32(), nullable=True),
+        # True when the bundle stores profile points for any scan (a
+        # `--profile` conversion of profile data), false when every scan's
+        # peaks are centroids. Says nothing about how the run was acquired;
+        # SCAN_METADATA_TABLE.centroider does.
         pa.field("profile_mode", pa.bool_(), nullable=True),
         pa.field(
             "tune_data",

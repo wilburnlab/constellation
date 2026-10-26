@@ -10,6 +10,10 @@ Submodules:
   Thermo CommonCore DLL pack via the standard
   ``constellation.thirdparty`` registry (env var
   ``CONSTELLATION_THERMO_HOME`` → ``third_party/thermo/current/``).
+- ``_scans`` — reads a range of scans into blocks (scan-metadata table +
+  peaks as numpy arrays); decides how each scan's peaks are made
+  (stored centroids, the instrument's centroid stream, Thermo's
+  centroider, or profile points).
 - ``_read`` — :class:`ThermoReader` (in-memory ``RawReader``) +
   :func:`convert` (streaming-to-disk writer used by the CLI).
 - ``manifest`` — :class:`ThermoAcquisitionManifest` dataclass + JSON
@@ -32,9 +36,13 @@ from ._read import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_RT_BIN_WIDTH_S,
     SOURCE_FORMAT,
+    EmptyLevelError,
     ThermoReader,
     convert,
+    describe_levels,
+    level_summary,
 )
+from ._scans import CENTROIDERS
 from .manifest import (
     MANIFEST_FILENAME,
     MANIFEST_SCHEMA_VERSION,
@@ -53,11 +61,15 @@ __all__ = [
     "SOURCE_FORMAT",
     "BatchResult",
     "BatchStatus",
+    "CENTROIDERS",
+    "EmptyLevelError",
     "ThermoAcquisitionManifest",
     "ThermoReader",
     "convert",
     "convert_batch",
+    "describe_levels",
     "is_thermo_available",
+    "level_summary",
     "load_clr",
     "parse_filter_string",
     "read_manifest",

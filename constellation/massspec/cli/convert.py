@@ -72,10 +72,23 @@ def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
         "--profile",
         action="store_true",
         help=(
-            "Force GetSegmentedScanFromScanNumber unconditionally — "
-            "preserves Thermo's raw FT profile grid. Default is centroid "
-            "(GetCentroidStream when available, with per-peak "
-            "resolution/noise/baseline)."
+            "Keep the profile points of profile-acquired scans instead of "
+            "centroiding them (scans acquired as centroids stay centroids). "
+            "By default every scan becomes centroids: the instrument's where it "
+            "stored them (with per-peak resolution/noise/baseline from an "
+            "Orbitrap's centroid stream), and Thermo's centroider on profile "
+            "scans that have none, as ion-trap profile scans do not. A profile "
+            "run is far larger: ~19,500 points per Stellar MS2 scan against "
+            "~1,200 centroids."
+        ),
+    )
+    p.add_argument(
+        "--allow-empty-levels",
+        action="store_true",
+        help=(
+            "Finish the bundle even when every scan of an MS level came out "
+            "with no peaks. Without it such a conversion fails, so that an "
+            "empty bundle is never written silently."
         ),
     )
     p.add_argument(
@@ -110,8 +123,8 @@ def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--batch-size",
         type=int,
-        default=64,
-        help="Scans per internal ScanBatch (default 64).",
+        default=512,
+        help="Scans read per block (default 512).",
     )
     p.add_argument(
         "--no-progress",
@@ -176,6 +189,7 @@ def _cmd_massspec_convert_single(
                 batch_size=args.batch_size,
                 compute_sha256=args.compute_sha256,
                 force=args.force,
+                allow_empty_levels=args.allow_empty_levels,
                 progress_cb=progress_cb,
             )
         except FileExistsError as exc:
@@ -188,7 +202,11 @@ def _cmd_massspec_convert_single(
             )
             return 5
 
+        from constellation.massspec.readers.thermo import describe_levels
+
         print(f"wrote bundle: {bundle_dir}")
+        for line in describe_levels(manifest.run_metadata.get("levels") or []):
+            print(f"  {line}")
         print(f"  manifest:                {bundle_dir / 'manifest.json'}")
         print(f"  peaks:                   {bundle_dir / manifest.outputs['peaks']}")
         print(
@@ -290,6 +308,7 @@ def _cmd_massspec_convert_batch(
         capture_trailer_extras=args.capture_trailer_extras,
         batch_size=args.batch_size,
         compute_sha256=args.compute_sha256,
+        allow_empty_levels=args.allow_empty_levels,
         progress_cb=progress_cb,
     )
 

@@ -43,6 +43,7 @@ from ._read import (
     DEFAULT_RT_BIN_WIDTH_S,
     convert as _convert_one_file,
 )
+from ._scans import THERMO
 from .manifest import MANIFEST_FILENAME
 
 
@@ -71,10 +72,12 @@ def _convert_one_worker(
     *,
     rt_bin_width_s: float,
     profile: bool,
+    centroider: str,
     capture_trailer_extras: bool,
     batch_size: int,
     compute_sha256: bool,
     force: bool,
+    allow_empty_levels: bool,
 ) -> tuple[str, BatchStatus, str | None]:
     """Top-level (picklable) worker. Runs one ``.raw`` → bundle conversion.
 
@@ -94,10 +97,12 @@ def _convert_one_worker(
             bundle_dir_str,
             rt_bin_width_s=rt_bin_width_s,
             profile=profile,
+            centroider=centroider,
             capture_trailer_extras=capture_trailer_extras,
             batch_size=batch_size,
             compute_sha256=compute_sha256,
             force=force,
+            allow_empty_levels=allow_empty_levels,
             progress_cb=None,
         )
         return bundle_dir_str, "ok", None
@@ -117,9 +122,11 @@ def convert_batch(
     force: bool = False,
     rt_bin_width_s: float = DEFAULT_RT_BIN_WIDTH_S,
     profile: bool = False,
+    centroider: str = THERMO,
     capture_trailer_extras: bool = True,
     batch_size: int = DEFAULT_BATCH_SIZE,
     compute_sha256: bool = True,
+    allow_empty_levels: bool = False,
     progress_cb: ProgressCallback | None = None,
 ) -> list[BatchResult]:
     """Convert ``N`` ``.raw`` files into ``N`` bundles, optionally in parallel.
@@ -212,10 +219,12 @@ def convert_batch(
         worker_kwargs = dict(
             rt_bin_width_s=rt_bin_width_s,
             profile=profile,
+            centroider=centroider,
             capture_trailer_extras=capture_trailer_extras,
             batch_size=batch_size,
             compute_sha256=compute_sha256,
             force=force,
+            allow_empty_levels=allow_empty_levels,
         )
 
         if n_workers_eff <= 1:

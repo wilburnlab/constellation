@@ -157,7 +157,13 @@ def open_acquisition(bundle_dir: Path | str) -> AcquisitionInfo:
     rt_range = (
         (float(pc.min(rt).as_py()), float(pc.max(rt).as_py())) if meta.num_rows else (0.0, 0.0)
     )
-    profile = bool((manifest.get("parameters") or {}).get("profile_mode", run.get("profile_mode")))
+    # The acquisition table says what the bundle stores; a Thermo manifest's
+    # `profile_mode` parameter is the flag the conversion was given, which
+    # bundles before scan-metadata v4 also wrote into the table.
+    profile = run.get("profile_mode")
+    if profile is None:
+        profile = (manifest.get("parameters") or {}).get("profile_mode")
+    profile = bool(profile)
     return AcquisitionInfo(
         bundle=bundle,
         kind=manifest["kind"],

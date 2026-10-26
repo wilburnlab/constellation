@@ -408,7 +408,8 @@ def _make_args(
         capture_trailer_extras=True,
         compute_sha256=True,
         force=force,
-        batch_size=64,
+        batch_size=512,
+        allow_empty_levels=False,
         no_progress=no_progress,
     )
 
@@ -427,6 +428,11 @@ class TestCliRouter:
                 "peaks": "peaks.parquet",
                 "scan_metadata": "scan_metadata.parquet",
                 "acquisition_metadata": "acquisition_metadata.parquet",
+            }
+            run_metadata = {
+                "levels": [
+                    {"level": 1, "n_scans": 3, "n_peaks": 30, "peaks_from": {"thermo": 3}}
+                ]
             }
 
         def fake_thermo_convert(src_arg, bundle_dir, **kwargs):
@@ -449,6 +455,8 @@ class TestCliRouter:
         captured = capsys.readouterr()
         assert rc == 0
         assert "wrote bundle:" in captured.out
+        # Every level says how its peaks were made.
+        assert "MS1: 3 scans, 30 peaks (3 centroided by Thermo's centroider)" in captured.out
         assert "batch convert:" not in captured.err
 
     def test_batch_directory_routes_through_convert_batch(

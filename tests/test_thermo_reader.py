@@ -4,13 +4,12 @@ Three tiers:
 
 1. **Pure-Python unit tests** (no pythonnet / DLL dependency) — exercise
    the filter-string parser, the declarative trailer table + coercion
-   helpers, the manifest round-trip, the schema registry, and the
-   ``_build_scan_meta`` row builder against fake CommonCore objects.
+   helpers, the manifest round-trip and the schema registry.
 
-2. **Fake-CommonCore integration test** — drive the iteration path
-   (`_iter_scan_batches`, `_PeakBuffer`, `_build_acquisition_table`)
-   against ``FakeRawFile`` mocks. Confirms the end-to-end scan-to-table
-   wiring without a real `.raw` file.
+2. **A stand-in raw file** (``_FakeRaw``, no DLLs) — drives the range
+   reader (every way a scan's peaks are made), the peak writer, and
+   ``convert`` / ``ThermoReader.read`` end to end. Thermo's centroider is
+   replaced by a stand-in (``fake_centroider``).
 
 3. **Real-`.raw` smoke test** — gated on
    ``is_thermo_available()`` AND ``$CONSTELLATION_TEST_THERMO_RAW``
@@ -19,8 +18,8 @@ Three tiers:
 
 from __future__ import annotations
 
+import hashlib
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -248,138 +247,6 @@ class TestTrailerToDict:
         assert d["Empty Field:"] is None
 
 
-# ──────────────────────────────────────────────────────────────────────
-# 2. Fake-CommonCore tier
-# ──────────────────────────────────────────────────────────────────────
-
-
-@dataclass
-class _FakeStats:
-    TIC: float = 0.0
-    BasePeakMass: float = 0.0
-    BasePeakIntensity: float = 0.0
-    PacketCount: int = 0
-
-
-class _FakeFilter:
-    """Minimal stand-in for a CommonCore Filter object."""
-
-    def __init__(self, filter_str: str, isolation_mass: float | None = None,
-                 isolation_width: float | None = None):
-        self._s = filter_str
-        self._mass = isolation_mass
-        self._width = isolation_width
-
-    def ToString(self):
-        return self._s
-
-    def GetMass(self, idx: int) -> float:  # noqa: ARG002
-        if self._mass is None:
-            raise RuntimeError("no isolation mass")
-        return self._mass
-
-    def GetIsolationWidth(self, idx: int) -> float:  # noqa: ARG002
-        if self._width is None:
-            raise RuntimeError("no width")
-        return self._width
-
-    def GetIsolationWidthOffset(self, idx: int) -> float:  # noqa: ARG002
-        return 0.0
-
-
-class TestBuildScanMeta:
-    def test_ms1_row_minimal(self):
-        from constellation.massspec.readers.thermo._read import _build_scan_meta
-
-        meta = _build_scan_meta(
-            scan_num=1,
-            rt=1.5,
-            filter_str="FTMS + p NSI Full ms [400.0-1600.0]",
-            stats=_FakeStats(TIC=1.23e7, BasePeakMass=523.45, BasePeakIntensity=4.5e5,
-                             PacketCount=200),
-            trailer={
-                "Ion Injection Time (ms):": "15.0",
-                "AGC:": "On",
-            },
-            filt=_FakeFilter("FTMS + p NSI Full ms [400.0-1600.0]"),
-            profile_mode=False,
-            capture_trailer_extras=True,
-        )
-        assert meta["scan"] == 1
-        assert meta["level"] == 1
-        assert meta["rt"] == 1.5
-        assert meta["tic"] == 1.23e7
-        assert meta["base_peak_mz"] == 523.45
-        assert meta["base_peak_intensity"] == 4.5e5
-        assert meta["peak_count"] == 200
-        assert meta["iit"] == 15.0
-        assert meta["precursor_mz"] is None
-        assert meta["precursor_charge"] is None
-        assert meta["agc_enabled"] is True
-        # MS1: analyzer set from the filter string, no activation.
-        assert meta["analyzer"] == "FTMS"
-        assert meta["activation_type"] is None
-
-    def test_ms2_row_with_precursor_and_charge(self):
-        from constellation.massspec.readers.thermo._read import _build_scan_meta
-
-        meta = _build_scan_meta(
-            scan_num=42,
-            rt=12.5,
-            filter_str=(
-                "FTMS + c NSI d Full ms2 458.7660@hcd28.00 [110.0-1000.0]"
-            ),
-            stats=_FakeStats(TIC=5.0e5, PacketCount=80),
-            trailer={
-                TRAILER_KEY_MONOISOTOPIC: "458.7660",
-                TRAILER_KEY_CHARGE: "2",
-                TRAILER_KEY_IIT: "50.0",
-                TRAILER_KEY_MASTER_SCAN: "40",
-                "MS2 Isolation Width:": "1.6",
-                "HCD Energy:": "28.0",
-            },
-            filt=_FakeFilter(
-                "FTMS + c NSI d Full ms2 458.7660@hcd28.00 [110.0-1000.0]",
-                isolation_mass=458.766,
-                isolation_width=1.6,
-            ),
-            profile_mode=False,
-            capture_trailer_extras=True,
-        )
-        assert meta["level"] == 2
-        assert meta["precursor_mz"] == 458.766
-        assert meta["precursor_charge"] == 2
-        assert meta["collision_energy"] == 28.0
-        # MS2: analyzer + activation_type are persisted per-scan columns now.
-        assert meta["analyzer"] == "FTMS"
-        assert meta["activation_type"] == "hcd"
-        assert meta["isolation_lower"] == pytest.approx(458.766 - 0.8, rel=1e-6)
-        assert meta["isolation_upper"] == pytest.approx(458.766 + 0.8, rel=1e-6)
-        # Master scan promoted to float64 in PEAK_TABLE shape.
-        assert meta["precursor_scan"] == 40.0
-        assert meta["master_scan"] == 40.0
-        assert meta["hcd_energy"] == 28.0
-        # Trailer extras present as a flat key/value list.
-        assert any(k == TRAILER_KEY_MONOISOTOPIC for k, _ in meta["trailer_extras"])
-
-    def test_master_scan_zero_collapses_to_none(self):
-        """Thermo uses ``Master Scan Number: 0`` to mean 'no parent'."""
-        from constellation.massspec.readers.thermo._read import _build_scan_meta
-
-        meta = _build_scan_meta(
-            scan_num=1,
-            rt=0.5,
-            filter_str="FTMS + p NSI Full ms [400-1600]",
-            stats=_FakeStats(),
-            trailer={TRAILER_KEY_MASTER_SCAN: "0"},
-            filt=_FakeFilter("FTMS + p NSI Full ms [400-1600]"),
-            profile_mode=False,
-            capture_trailer_extras=True,
-        )
-        assert meta["master_scan"] is None
-        assert meta["precursor_scan"] is None
-
-
 class TestSchemaRegistration:
     def test_thermo_schemas_registered(self):
         from constellation.core.io.schemas import get_schema
@@ -409,7 +276,7 @@ class TestSchemaRegistration:
         assert {"analyzer", "activation_type"} <= names
         assert SCAN_METADATA_TABLE.field("analyzer").type == pa.string()
         assert SCAN_METADATA_TABLE.field("activation_type").type == pa.string()
-        assert SCAN_METADATA_TABLE.metadata[b"schema_version"] == b"3"
+        assert SCAN_METADATA_TABLE.metadata[b"schema_version"] == b"4"
 
     def test_acquisition_metadata_table_has_tune_data_map(self):
         f = ACQUISITION_METADATA_TABLE.field("tune_data")
@@ -486,50 +353,394 @@ class TestManifestRoundTrip:
             read_manifest_dir(tmp_path)
 
 
+
 # ──────────────────────────────────────────────────────────────────────
-# 3. Fake-CommonCore iteration-level test
+# 2. A stand-in raw file: the range reader, the peak writer, convert()
 # ──────────────────────────────────────────────────────────────────────
 
 
-class TestPeakBuffer:
-    def test_rt_binned_row_groups(self, tmp_path: Path):
-        """Verify _PeakBuffer flushes a row group at every RT-bin boundary."""
-        from constellation.massspec.readers.thermo._read import _PeakBuffer, _ScanBatch
+class _Obj:
+    """Attribute bag standing in for a CommonCore object."""
 
-        # Two scans in bin 0, two in bin 1 → 2 row groups when
-        # rt_bin_width=60s. (RT in seconds: 30 + 45 in bin 0; 70 + 90 in bin 1.)
-        mz = np.asarray([100.0, 200.0, 100.5, 200.5, 110.0, 210.0, 110.5, 210.5])
-        intensity = np.asarray([1.0, 2.0, 1.5, 2.5, 3.0, 4.0, 3.5, 4.5])
-        offsets = np.asarray([0, 2, 4, 6, 8], dtype=np.int64)
-        scan_meta = [
-            {"scan": 1, "level": 1, "rt": 30.0, "precursor_scan": None,
-             "precursor_mz": None},
-            {"scan": 2, "level": 1, "rt": 45.0, "precursor_scan": None,
-             "precursor_mz": None},
-            {"scan": 3, "level": 1, "rt": 70.0, "precursor_scan": None,
-             "precursor_mz": None},
-            {"scan": 4, "level": 1, "rt": 90.0, "precursor_scan": None,
-             "precursor_mz": None},
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _FakeEvent:
+    def __init__(self, mass=None, width=None, offset=0.0):
+        self._mass, self._width, self._offset = mass, width, offset
+
+    def GetMass(self, idx):  # noqa: ARG002
+        if self._mass is None:
+            raise RuntimeError("no precursor")
+        return self._mass
+
+    def GetIsolationWidth(self, idx):  # noqa: ARG002
+        if self._width is None:
+            raise RuntimeError("no width")
+        return self._width
+
+    def GetIsolationWidthOffset(self, idx):  # noqa: ARG002
+        return self._offset
+
+
+def _scan(
+    scan_type: str,
+    *,
+    rt_min: float,
+    acquired: str = "centroid",
+    mz=(),
+    intensity=None,
+    stream=None,
+    trailer=(),
+    event=None,
+):
+    """One stand-in scan. ``acquired`` is ``centroid`` or ``profile``;
+    ``stream`` is ``None`` (no centroid stream), ``()`` (an empty one) or
+    ``(mz, intensity, resolution, noise, baseline)``."""
+    mz = np.asarray(mz, dtype=np.float64)
+    intensity = (
+        np.asarray(intensity, dtype=np.float64)
+        if intensity is not None
+        else np.arange(1, mz.size + 1, dtype=np.float64)
+    )
+    return {
+        "stats": _Obj(
+            TIC=float(intensity.sum()),
+            BasePeakMass=float(mz[np.argmax(intensity)]) if mz.size else 0.0,
+            BasePeakIntensity=float(intensity.max()) if mz.size else 0.0,
+            StartTime=rt_min,
+            ScanType=scan_type,
+            IsCentroidScan=acquired == "centroid",
+        ),
+        "mz": mz,
+        "intensity": intensity,
+        "stream": stream,
+        "trailer": _Obj(Labels=[k for k, _ in trailer], Values=[v for _, v in trailer]),
+        "event": event or _FakeEvent(),
+    }
+
+
+class _FakeRaw:
+    """The slice of IRawDataPlus the range reader calls."""
+
+    def __init__(self, scans: dict[int, dict]):
+        self.scans = scans
+        self.RunHeaderEx = _Obj(FirstSpectrum=min(scans), LastSpectrum=max(scans))
+
+    def GetScanStatsForScanNumber(self, n):
+        return self.scans[n]["stats"]
+
+    def GetScanEvents(self, lo, hi):
+        return [self.scans[n]["event"] for n in range(lo, hi + 1)]
+
+    def GetScanEventForScanNumber(self, n):
+        return self.scans[n]["event"]
+
+    def GetSegmentedScanFromScanNumber(self, n, stats):  # noqa: ARG002
+        s = self.scans[n]
+        return _Obj(Positions=s["mz"], Intensities=s["intensity"])
+
+    def GetCentroidStream(self, n, include_ref):  # noqa: ARG002
+        stream = self.scans[n]["stream"]
+        if stream is None or stream == ():
+            return _Obj(Length=0, Masses=None, Intensities=None)
+        mz, inten, res, noise, base = (np.asarray(a, dtype=np.float64) for a in stream)
+        return _Obj(
+            Length=mz.size, Masses=mz, Intensities=inten,
+            Resolutions=res, Noises=noise, Baselines=base,
+        )
+
+    def GetTrailerExtraInformation(self, n):
+        return self.scans[n]["trailer"]
+
+    def Dispose(self):
+        pass
+
+
+@pytest.fixture
+def fake_centroider(monkeypatch):
+    """Stand in for ``Scan.FromFile`` + Thermo's centroider: the "centroids"
+    of a profile scan are its points above half its maximum."""
+    from constellation.massspec.readers.thermo import _scans
+
+    def load_scan(raw, n):
+        s = raw.scans[n]
+        return _Obj(HasCentroidStream=s["stream"] is not None, mz=s["mz"], intensity=s["intensity"])
+
+    def centroider(scan):
+        keep = scan.intensity >= scan.intensity.max() / 2
+        return scan.mz[keep], scan.intensity[keep]
+
+    monkeypatch.setattr(_scans, "_load_scan", load_scan)
+    monkeypatch.setitem(_scans.CENTROIDERS, "thermo", centroider)
+
+
+_MS1 = "FTMS + p NSI Full ms [400.0000-1600.0000]"
+_MS2 = "ITMS + c NSI r Full ms2 500.2500@hcd30.00 [200.0000-1500.0000]"
+_IT_MS1 = "ITMS + p NSI r Full ms [400.0000-1200.0000]"
+
+
+def _read(raw, **options):
+    from constellation.massspec.readers.thermo._scans import ReadOptions, iter_scan_blocks
+
+    blocks = list(iter_scan_blocks(raw, raw.RunHeaderEx.FirstSpectrum,
+                                   raw.RunHeaderEx.LastSpectrum, ReadOptions(**options),
+                                   max_block_scans=2))
+    return (
+        pa.concat_tables([b.scans for b in blocks]),
+        pa.concat_tables([b.peak_table() for b in blocks]),
+    )
+
+
+class TestRangeReader:
+    def _raw(self):
+        return _FakeRaw({
+            # Orbitrap profile MS1 with the instrument's centroid stream.
+            1: _scan(_MS1, rt_min=0.5, acquired="profile", mz=[400.0, 400.1, 400.2],
+                     intensity=[1.0, 9.0, 2.0],
+                     stream=([400.1, 500.0], [9.0, 4.0], [6e4, 5e4], [1.0, 1.5], [0.1, 0.2]),
+                     trailer=[("Ion Injection Time (ms):", "15.000"), ("AGC:", "On")]),
+            # Ion-trap centroid MS2.
+            2: _scan(_MS2, rt_min=0.51, mz=[201.0, 305.5, 410.2],
+                     trailer=[("Monoisotopic M/Z:", "500.2512"), ("Charge State:", "2"),
+                              ("MS2 Isolation Width:", "2.00"), ("Master Scan Number:", "1")],
+                     event=_FakeEvent(mass=500.25, width=2.0009)),
+            # Ion-trap profile MS1: no centroid stream at all.
+            3: _scan(_IT_MS1, rt_min=1.2, acquired="profile",
+                     mz=[450.0, 450.1, 450.2, 450.3], intensity=[1.0, 8.0, 10.0, 2.0]),
+            # Orbitrap profile MS1 whose stream exists but is empty.
+            4: _scan(_MS1, rt_min=1.3, acquired="profile", mz=[400.0, 400.1],
+                     intensity=[3.0, 4.0], stream=()),
+        })
+
+    def test_how_each_scan_is_centroided(self, fake_centroider):
+        scans, peaks = _read(self._raw())
+        assert scans.column("spectrum_type").to_pylist() == ["centroid"] * 4
+        assert scans.column("centroider").to_pylist() == [
+            "instrument", "instrument", "thermo", "instrument",
         ]
-        batch = _ScanBatch(mz=mz, intensity=intensity, scan_offsets=offsets,
-                           scan_meta=scan_meta, peak_aux=None)
+        by_scan = {s: peaks.filter(pa.compute.equal(peaks["scan"], s)) for s in (1, 2, 3, 4)}
+        assert by_scan[1].column("mz").to_pylist() == [400.1, 500.0]  # the stream
+        assert by_scan[2].column("mz").to_pylist() == [201.0, 305.5, 410.2]
+        assert by_scan[3].column("mz").to_pylist() == [450.1, 450.2]  # the centroider
+        assert by_scan[4].num_rows == 0  # an empty stream is no peaks, not a reason to centroid
+        assert scans.column("peak_count").to_pylist() == [2, 3, 2, 0]
 
-        out_path = tmp_path / "peaks.parquet"
-        with pq.ParquetWriter(
-            str(out_path), MS_PEAK_TABLE, compression="zstd", use_dictionary=False
-        ) as writer:
-            buf = _PeakBuffer(MS_PEAK_TABLE, writer)
-            buf.append_batch(batch, rt_bin_width=60.0)
-            buf.flush()
+    def test_stream_values_ride_along_and_others_are_null(self, fake_centroider):
+        _, peaks = _read(self._raw())
+        assert peaks.column("peak_resolution").to_pylist() == [6e4, 5e4, None, None, None, None, None]
+        assert peaks.column("peak_noise").null_count == 5
 
-        pf = pq.ParquetFile(str(out_path))
+    def test_profile_keeps_points(self, fake_centroider):
+        scans, peaks = _read(self._raw(), profile=True)
+        assert scans.column("spectrum_type").to_pylist() == [
+            "profile", "centroid", "profile", "profile",
+        ]
+        assert scans.column("centroider").to_pylist() == [None, "instrument", None, None]
+        assert scans.column("peak_count").to_pylist() == [3, 3, 4, 2]
+        assert peaks.num_rows == 12
+
+    def test_scan_metadata(self, fake_centroider):
+        scans, peaks = _read(self._raw())
+        ms1, ms2 = scans.to_pylist()[:2]
+        assert ms1["rt"] == pytest.approx(30.0)
+        assert ms1["iit"] == 15.0
+        assert ms1["agc_enabled"] is True
+        assert ms1["level"] == 1 and ms1["analyzer"] == "FTMS"
+        assert (ms1["scan_window_lower"], ms1["scan_window_upper"]) == (400.0, 1600.0)
+        assert ms2["level"] == 2 and ms2["analyzer"] == "ITMS"
+        assert ms2["activation_type"] == "hcd" and ms2["collision_energy"] == 30.0
+        assert ms2["precursor_mz"] == 500.2512  # the trailer's monoisotopic m/z
+        assert ms2["precursor_charge"] == 2
+        assert ms2["precursor_scan"] == ms2["master_scan"] == 1.0
+        # The trailer's width, centred on the isolation target.
+        assert ms2["isolation_lower"] == pytest.approx(499.25)
+        assert ms2["isolation_upper"] == pytest.approx(501.25)
+        assert ("MS2 Isolation Width:", "2.0") in ms2["trailer_extras"]
+        # Per-scan values repeated on every peak of the scan.
+        ms2_peaks = peaks.filter(pa.compute.equal(peaks["scan"], 2))
+        assert set(ms2_peaks.column("precursor_mz").to_pylist()) == {500.2512}
+        assert set(ms2_peaks.column("level").to_pylist()) == {2}
+
+    def test_no_trailer_extras_keeps_typed_columns(self, fake_centroider):
+        scans, _ = _read(self._raw(), capture_trailer_extras=False)
+        ms1 = scans.to_pylist()[0]
+        assert ms1["trailer_extras"] is None
+        assert ms1["agc_enabled"] is True and ms1["iit"] == 15.0
+
+    def test_negative_value_in_unsigned_column_is_null(self, fake_centroider):
+        raw = _FakeRaw({1: _scan(_MS1, rt_min=0.1, mz=[400.0],
+                                 trailer=[("Master Index:", "-1"), ("AGC PS Mode:", "-1")])})
+        scans, _ = _read(raw)
+        row = scans.to_pylist()[0]
+        assert row["master_index"] is None  # uint32
+        assert row["agc_ps_mode"] == -1  # signed since scan-metadata v4
+
+    def test_peaks_sorted_within_each_scan(self, fake_centroider):
+        raw = _FakeRaw({
+            1: _scan(_MS1, rt_min=0.1, mz=[400.0, 300.0, 500.0], intensity=[1, 2, 3]),
+            2: _scan(_MS1, rt_min=0.2, mz=[100.0, 200.0], intensity=[4, 5]),
+        })
+        _, peaks = _read(raw)
+        assert peaks.column("mz").to_pylist() == [300.0, 400.0, 500.0, 100.0, 200.0]
+        assert peaks.column("intensity").to_pylist() == [2, 1, 3, 4, 5]
+
+    def test_unreadable_scan_is_skipped(self, fake_centroider):
+        raw = self._raw()
+        raw.scans[2]["stats"] = None  # attribute access fails like a broken scan
+        scans, _ = _read(raw)
+        assert scans.column("scan").to_pylist() == [1, 3, 4]
+
+    def test_unknown_centroider_is_refused(self):
+        from constellation.massspec.readers.thermo._scans import ReadOptions
+
+        with pytest.raises(ValueError, match="centroider"):
+            ReadOptions(centroider="nonesuch")
+
+
+class TestPeakWriter:
+    def _table(self, rts, scans=None):
+        from constellation.massspec.bundle import peak_rows
+
+        scans_t = pa.table({
+            "scan": pa.array(scans or list(range(1, len(rts) + 1)), pa.int32()),
+            "level": pa.array([1] * len(rts), pa.int8()),
+            "rt": pa.array(rts, pa.float64()),
+        })
+        counts = np.full(len(rts), 2)
+        mz = np.tile([100.0, 200.0], len(rts))
+        return peak_rows(scans_t, counts, mz, mz / 10)
+
+    def test_row_group_per_rt_bin(self, tmp_path: Path):
+        from constellation.massspec.bundle import PeakWriter
+
+        path = tmp_path / "peaks.parquet"
+        with PeakWriter(path, rt_bin_width_s=60.0) as w:
+            w.write(self._table([30.0, 45.0]))
+            w.write(self._table([70.0, 90.0], scans=[3, 4]))
+        pf = pq.ParquetFile(path)
         assert pf.num_row_groups == 2
-        tbl = pq.read_table(str(out_path))
-        assert tbl.num_rows == 8
+        assert pf.read().column("scan").to_pylist() == [1, 1, 2, 2, 3, 3, 4, 4]
+        assert pf.schema_arrow.equals(MS_PEAK_TABLE)
+
+    def test_bin_boundary_inside_one_write(self, tmp_path: Path):
+        from constellation.massspec.bundle import PeakWriter
+
+        path = tmp_path / "peaks.parquet"
+        with PeakWriter(path, rt_bin_width_s=60.0) as w:
+            w.write(self._table([30.0, 70.0, 130.0]))
+        assert pq.ParquetFile(path).num_row_groups == 3
+
+    def test_row_groups_capped(self, tmp_path: Path):
+        from constellation.massspec.bundle import PeakWriter
+
+        path = tmp_path / "peaks.parquet"
+        with PeakWriter(path, rt_bin_width_s=600.0, max_row_group_rows=3) as w:
+            w.write(self._table([1.0, 2.0, 3.0, 4.0]))  # 8 rows in one bin
+        pf = pq.ParquetFile(path)
+        assert [pf.metadata.row_group(i).num_rows for i in range(pf.num_row_groups)] == [3, 3, 2]
+
+    def test_peak_rows_repeats_scan_values_and_masks_aux(self):
+        from constellation.massspec.bundle import peak_rows
+
+        scans_t = pa.table({
+            "scan": pa.array([7, 8], pa.int32()),
+            "level": pa.array([1, 2], pa.int8()),
+            "rt": pa.array([1.0, 2.0]),
+            "precursor_mz": pa.array([None, 500.5]),
+        })
+        aux = {"peak_noise": (np.array([1.0, 2.0, 0.0]), np.array([True, True, False]))}
+        t = peak_rows(scans_t, np.array([2, 1]), np.array([1.0, 2.0, 3.0]), np.ones(3), aux)
+        assert t.column("scan").to_pylist() == [7, 7, 8]
+        assert t.column("precursor_mz").to_pylist() == [None, None, 500.5]
+        assert t.column("peak_noise").to_pylist() == [1.0, 2.0, None]
+        assert t.column("ion_mobility").null_count == 3
+
+
+class TestConvert:
+    @pytest.fixture
+    def raw(self, monkeypatch, fake_centroider, tmp_path):
+        from constellation.massspec.readers.thermo import _read
+
+        raw = TestRangeReader()._raw()
+        monkeypatch.setattr(_read, "_open_raw_file", lambda path: _read._RawFileHandle(raw))
+        src = tmp_path / "run.raw"
+        src.write_bytes(b"not really a raw file")
+        return raw, src
+
+    def test_bundle_and_level_summary(self, raw, tmp_path):
+        from constellation.massspec.readers.thermo import convert, describe_levels
+
+        _, src = raw
+        m = convert(src, tmp_path / "run")
+        assert {p.name for p in (tmp_path / "run").iterdir()} == {
+            "manifest.json", "peaks.parquet", "scan_metadata.parquet",
+            "acquisition_metadata.parquet",
+        }
+        assert m.parameters["peaks"] == "centroid"
+        assert m.parameters["centroider"] == "thermo"
+        assert m.source_sha256 == hashlib.sha256(src.read_bytes()).hexdigest()
+        assert describe_levels(m.run_metadata["levels"]) == [
+            "MS1: 3 scans, 4 peaks (2 centroided by the instrument, 1 centroided by "
+            "Thermo's centroider)",
+            "MS2: 1 scans, 3 peaks (1 centroided by the instrument)",
+        ]
+        acq = pq.read_table(tmp_path / "run" / "acquisition_metadata.parquet").to_pylist()[0]
+        assert acq["profile_mode"] is False  # nothing stored as profile
+        assert acq["analyzers"] == ["FTMS", "ITMS"]
+        assert pq.read_table(tmp_path / "run" / "peaks.parquet").num_rows == 7
+
+    def test_profile_bundle_says_so(self, raw, tmp_path):
+        from constellation.massspec.readers.thermo import convert
+
+        _, src = raw
+        m = convert(src, tmp_path / "run", profile=True, compute_sha256=False)
+        acq = pq.read_table(tmp_path / "run" / "acquisition_metadata.parquet").to_pylist()[0]
+        assert acq["profile_mode"] is True
+        assert m.parameters["peaks"] == "profile"
+        assert m.source_sha256 is None
+
+    def test_empty_level_fails_and_leaves_nothing(self, raw, tmp_path):
+        from constellation.massspec.readers.thermo import EmptyLevelError, convert
+
+        fake, src = raw
+        fake.scans[2]["mz"] = np.empty(0)
+        fake.scans[2]["intensity"] = np.empty(0)
+        out = tmp_path / "run"
+        with pytest.raises(EmptyLevelError, match="MS2"):
+            convert(src, out)
+        assert list(out.iterdir()) == []
+        m = convert(src, out, allow_empty_levels=True)
+        assert m.run_metadata["levels"][1]["n_peaks"] == 0
+
+    def test_force_clears_what_an_earlier_conversion_left(self, raw, tmp_path):
+        from constellation.massspec.readers.thermo import convert
+
+        _, src = raw
+        out = tmp_path / "run"
+        convert(src, out)
+        (out / "mz_index").mkdir()  # a peak index of the old peaks
+        (out / "notes.txt").write_text("mine")
+        with pytest.raises(FileExistsError):
+            convert(src, out)
+        convert(src, out, force=True)
+        assert not (out / "mz_index").exists()
+        assert (out / "notes.txt").read_text() == "mine"
+
+    def test_in_memory_reader(self, raw, monkeypatch):
+        from constellation.massspec.readers.thermo import ThermoReader
+
+        _, src = raw
+        result = ThermoReader().read(src)
+        assert result.primary.num_rows == 7
+        assert result.companions["scan_metadata"].num_rows == 4
+        assert result.run_metadata["n_scans"] == 4
+        assert "tune_data" not in result.run_metadata
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 4. Real-`.raw` integration tier (skipped without an env var)
+# 3. Real-`.raw` integration tier (skipped without an env var)
 # ──────────────────────────────────────────────────────────────────────
 
 

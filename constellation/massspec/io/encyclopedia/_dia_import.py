@@ -208,6 +208,8 @@ def _scan_metadata_row(scan: _Scan) -> dict[str, Any]:
             else float(str(np.float32(scan["iit_s"]))) * 1000.0
         ),
         "peak_count": int(scan["mz"].size),
+        # A spectra file holds centroids; it does not say what made them.
+        "spectrum_type": "centroid",
         **_base_peak(scan),
         "isolation_lower": scan["lower"] if ms2 else None,
         "isolation_upper": scan["upper"] if ms2 else None,
