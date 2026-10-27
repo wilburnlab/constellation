@@ -128,6 +128,7 @@ _SCAN_COLUMNS = (
     "scan",
     "level",
     "rt",
+    "tic",
     "iit",
     "isolation_lower",
     "isolation_upper",
@@ -485,6 +486,10 @@ def _run_start_time(creation_date: str | None) -> str | None:
     return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _present(*pairs: tuple[str, Any]) -> list[tuple[str, Any]]:
+    return [(key, value) for key, value in pairs if value is not None]
+
+
 def _single_run_metadata(
     bundle: _Bundle,
     out_path: Path,
@@ -500,10 +505,14 @@ def _single_run_metadata(
       ``filelocation``, ``runStartTime``, ``InstrumentConfigurations``,
       ``SoftwareVersion_*``;
     - provenance a bundle can state exactly: ``file.*``, ``run.*`` scan
-      and time extents, ``instrument.*``, ``acq.*``;
-    - nothing else. Keys the reference carries that a bundle cannot back
-      (instrument-method text, sample vial, integrated-intensity
-      summaries) are omitted, not guessed.
+      and time extents, ``instrument.*``, ``acq.*``, and from a Thermo
+      bundle that records them (acquisition metadata v2) the run header
+      (``thermo.run.*``, ``run.start_time_iso8601``), the sample
+      (``thermo.sample.*``), the instrument method text
+      (``thermo.instrument_method.*``, which needs RawFileReader 8.x) and
+      ``run.tic_total``, the instrument's MS1 TIC summed in scan order;
+    - nothing else. A key the reference carries that a bundle cannot back
+      is omitted, not guessed.
     """
     acq, s = bundle.acq, bundle.structure
     scans = bundle.scans
@@ -538,14 +547,44 @@ def _single_run_metadata(
         ("run.start_scan", int(scan_no.min())),
         ("run.end_scan", int(scan_no.max())),
         ("run.total_scans", int(scan_no.size)),
-        ("run.gradient_length_seconds", float(rt.max() - rt.min())),
     ]
+    md += _present(
+        ("thermo.run.expected_run_time", acq.get("expected_run_minutes")),
+        ("thermo.run.max_integrated_intensity", acq.get("max_integrated_intensity")),
+        ("thermo.run.spectra_count", acq.get("spectra_count")),
+        ("run.start_time_iso8601", acq.get("run_start_time")),
+    )
+    md.append(("run.gradient_length_seconds", float(rt.max() - rt.min())))
+    if acq.get("run_start_minutes") is not None and acq.get("run_end_minutes") is not None:
+        md.append(("thermo.run.duration_minutes", acq["run_end_minutes"] - acq["run_start_minutes"]))
+    if acq.get("source_format") == "thermo_raw" and "tic" in scans.column_names:
+        # The instrument's TIC (a Thermo bundle's), MS1 scans, in scan order.
+        ms1_tic = scans.filter(pc.equal(scans.column("level"), 1)).column("tic").to_pylist()
+        if ms1_tic and None not in ms1_tic:
+            total = 0.0
+            for value in ms1_tic:
+                total += value
+            md.append(("run.tic_total", total))
     if model:
         md += [("instrument.model", model), ("instrument.name", model)]
     if acq.get("instrument_serial"):
         md.append(("instrument.serial_number", acq["instrument_serial"]))
     if software:
         md.append(("instrument.software_version", software))
+    md += _present(
+        ("thermo.sample.injection_volume", acq.get("sample_injection_volume")),
+        ("thermo.sample.instrument_method_file", acq.get("sample_method_file")),
+        ("thermo.sample.raw_file_name", acq.get("sample_raw_file_name")),
+        ("thermo.sample.vial", acq.get("sample_vial")),
+    )
+    methods = acq.get("instrument_methods") or []
+    if methods:
+        md.append(("thermo.instrument_method.count", len(methods)))
+        for i, method in enumerate(methods):
+            md += [
+                (f"thermo.instrument_method.{i}.name", method["name"]),
+                (f"thermo.instrument_method.{i}.raw_text", method["text"]),
+            ]
     if analyzers:
         md.append(("acq.mass_analyzers", ",".join(analyzers)))
     if polarities:

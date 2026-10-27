@@ -100,10 +100,8 @@ def _resolve_method_name(source) -> str | None:
     """Return a short label naming the acquisition method.
 
     Reads ``SampleInformation.InstrumentMethodFile`` and returns only
-    the basename. Constellation deliberately does *not* decode the
-    method-text blob via ``GetInstrumentMethod(i)`` — it can come back
-    as the literal string ``"None"`` on some firmware and isn't
-    load-bearing for v1.
+    the basename (the full path is ``sample_method_file``; the method's
+    text is :func:`_instrument_methods`).
     """
     try:
         sample = source.SampleInformation
@@ -118,6 +116,62 @@ def _resolve_method_name(source) -> str | None:
     except Exception:
         logger.debug("SampleInformation.InstrumentMethodFile failed", exc_info=True)
     return None
+
+
+def _instrument_methods(source) -> list[dict[str, str]] | None:
+    """Each device's instrument method embedded in the ``.raw``: name and text.
+
+    RawFileReader 8.x reads them on Linux; CommonCore 5.0 gives no text (or
+    the string ``"None"``), and then there is nothing to record.
+    """
+    try:
+        count = int(source.InstrumentMethodsCount)
+        names = [str(n) for n in source.GetAllInstrumentNamesFromInstrumentMethod()]
+    except Exception:
+        logger.debug("instrument method names unavailable", exc_info=True)
+        return None
+    methods = []
+    for i in range(count):
+        try:
+            text = source.GetInstrumentMethod(i)
+        except Exception:
+            logger.debug("GetInstrumentMethod(%d) failed", i, exc_info=True)
+            return None
+        if text is None or str(text) in ("", "None"):
+            return None
+        methods.append({"name": names[i] if i < len(names) else None, "text": str(text)})
+    return methods or None
+
+
+def _text(value) -> str | None:
+    """A .NET string as text; null or blank is None (not ``"None"``)."""
+    return None if value is None else (str(value).strip() or None)
+
+
+def _run_and_sample(source) -> dict[str, Any]:
+    """The run header's and the sample information's values."""
+    meta: dict[str, Any] = {}
+    readers = {
+        "run_start_time": lambda: str(source.FileHeader.CreationDate.ToString("o")),
+        "run_start_minutes": lambda: float(source.RunHeaderEx.StartTime),
+        "run_end_minutes": lambda: float(source.RunHeaderEx.EndTime),
+        "expected_run_minutes": lambda: float(source.RunHeaderEx.ExpectedRunTime),
+        "max_integrated_intensity": lambda: float(source.RunHeaderEx.MaxIntegratedIntensity),
+        "spectra_count": lambda: int(source.RunHeaderEx.SpectraCount),
+        "sample_vial": lambda: _text(source.SampleInformation.Vial),
+        "sample_injection_volume": lambda: float(source.SampleInformation.InjectionVolume),
+        "sample_method_file": lambda: _text(source.SampleInformation.InstrumentMethodFile),
+        "sample_raw_file_name": lambda: _text(source.SampleInformation.RawFileName),
+    }
+    for key, read in readers.items():
+        try:
+            value = read()
+        except Exception:
+            logger.debug("%s unavailable", key, exc_info=True)
+            continue
+        if value is not None:
+            meta[key] = value
+    return meta
 
 
 def _build_run_metadata(source, path: Path) -> dict[str, Any]:
@@ -173,6 +227,11 @@ def _build_run_metadata(source, path: Path) -> dict[str, Any]:
             {"label": label, "data_type": data_type, "precision": precision}
             for label, data_type, precision in header
         ]
+
+    meta.update(_run_and_sample(source))
+    methods = _instrument_methods(source)
+    if methods is not None:
+        meta["instrument_methods"] = methods
 
     return meta
 
@@ -332,11 +391,12 @@ class ThermoReader(RawReader):
         peak_table = pa.concat_tables(peaks) if peaks else MS_PEAK_TABLE.empty_table()
         # ReadResult.run_metadata is a flat dict — the most useful fields of
         # the acquisition table for callers who don't want to open the
-        # companion. ``tune_data`` and ``trailer_header`` are left out.
+        # companion. Its bulky fields (tune data, trailer header, method
+        # text) are left out.
         run_metadata = dict(run_meta)
         run_metadata.update(_acquisition_stats(scan_table))
-        run_metadata.pop("tune_data", None)
-        run_metadata.pop("trailer_header", None)
+        for bulky in ("tune_data", "trailer_header", "instrument_methods"):
+            run_metadata.pop(bulky, None)
         return ReadResult(
             primary=peak_table,
             companions={

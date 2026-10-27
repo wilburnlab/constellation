@@ -296,7 +296,11 @@ register_schema("ScanMetadataTable", SCAN_METADATA_TABLE)
 # AcquisitionMetadataTable — one row per run. Ports cartographer ACQUISITION_METADATA_SCHEMA v5.
 # ──────────────────────────────────────────────────────────────────────
 
-# v2 (additive): trailer_header.
+# v2 (additive): trailer_header; the run header (run_start_time,
+#   run_start_minutes, run_end_minutes, expected_run_minutes,
+#   max_integrated_intensity, spectra_count); the sample information
+#   (sample_vial, sample_injection_volume, sample_method_file,
+#   sample_raw_file_name); instrument_methods.
 ACQUISITION_METADATA_SCHEMA_VERSION: int = 2
 
 
@@ -316,7 +320,30 @@ ACQUISITION_METADATA_TABLE: pa.Schema = pa.schema(
         pa.field("hardware_version", pa.string(), nullable=True),
         pa.field("software_version", pa.string(), nullable=True),
         pa.field("method_name", pa.string(), nullable=True),
-        pa.field("creation_date", pa.string(), nullable=True),  # ISO-8601
+        # As Thermo's DateTime prints it (``10/07/2026 12:15:40``); the
+        # same moment in full is run_start_time.
+        pa.field("creation_date", pa.string(), nullable=True),
+        # ── Thermo run header and sample information (v2) ──
+        # ISO 8601, to the 100 ns the file holds (2026-10-07T12:15:40.9362541Z).
+        pa.field("run_start_time", pa.string(), nullable=True),
+        pa.field("run_start_minutes", pa.float64(), nullable=True),
+        pa.field("run_end_minutes", pa.float64(), nullable=True),
+        pa.field("expected_run_minutes", pa.float64(), nullable=True),
+        pa.field("max_integrated_intensity", pa.float64(), nullable=True),
+        pa.field("spectra_count", pa.int64(), nullable=True),
+        pa.field("sample_vial", pa.string(), nullable=True),
+        pa.field("sample_injection_volume", pa.float64(), nullable=True),
+        # The full path of the method file (method_name is its base name).
+        pa.field("sample_method_file", pa.string(), nullable=True),
+        pa.field("sample_raw_file_name", pa.string(), nullable=True),
+        # Each device's section of the instrument method embedded in the
+        # .raw: the device name and the method text. Needs RawFileReader
+        # 8.x; CommonCore 5.0 returns no text on Linux, and then this is null.
+        pa.field(
+            "instrument_methods",
+            pa.list_(pa.struct([pa.field("name", pa.string()), pa.field("text", pa.string())])),
+            nullable=True,
+        ),
         pa.field("analyzers", pa.list_(pa.string()), nullable=True),
         pa.field("n_scans", pa.uint32(), nullable=True),
         pa.field("rt_min_seconds", pa.float32(), nullable=True),

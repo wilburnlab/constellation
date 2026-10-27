@@ -590,6 +590,47 @@ class TestConvert:
         assert acq["analyzers"] == ["FTMS", "ITMS"]
         assert peaks_dataset(tmp_path / "run").count_rows() == 7
 
+    def test_run_header_sample_and_method_text(self, raw, tmp_path):
+        from _thermo_fakes import Obj
+
+        from constellation.massspec.readers.thermo import convert
+
+        fake, src = raw
+        fake.RunHeaderEx = Obj(
+            FirstSpectrum=1, LastSpectrum=4, StartTime=0.5, EndTime=1.3,
+            ExpectedRunTime=107.0, MaxIntegratedIntensity=9.5e8, SpectraCount=4,
+        )
+        fake.FileHeader = Obj(CreationDate=Obj(ToString=lambda fmt: "2026-10-07T12:15:40.9362541Z"))
+        fake.SampleInformation = Obj(
+            Vial="G:B3", InjectionVolume=1.0,
+            InstrumentMethodFile="C:\\methods\\GPF.meth", RawFileName="D:\\run.raw",
+        )
+        fake.InstrumentMethodsCount = 2
+        fake.GetAllInstrumentNamesFromInstrumentMethod = lambda: ["SiiXcalibur", "TNG-Thorium"]
+        fake.GetInstrumentMethod = lambda i: ["LC method\r\n", "MS method\r\n"][i]
+
+        m = convert(src, tmp_path / "run", compute_sha256=False)
+        acq = pq.read_table(tmp_path / "run" / "acquisition_metadata.parquet").to_pylist()[0]
+        assert acq["run_start_time"] == "2026-10-07T12:15:40.9362541Z"
+        assert (acq["run_start_minutes"], acq["run_end_minutes"]) == (0.5, 1.3)
+        assert acq["expected_run_minutes"] == 107.0 and acq["spectra_count"] == 4
+        assert acq["sample_vial"] == "G:B3" and acq["sample_method_file"] == "C:\\methods\\GPF.meth"
+        assert acq["method_name"] == "GPF.meth"
+        assert acq["instrument_methods"] == [
+            {"name": "SiiXcalibur", "text": "LC method\r\n"},
+            {"name": "TNG-Thorium", "text": "MS method\r\n"},
+        ]
+        assert m.run_metadata["instrument_method_names"] == ["SiiXcalibur", "TNG-Thorium"]
+
+        # CommonCore 5.0 on Linux gives no method text: nothing is recorded.
+        # Nor is a sample field the file leaves empty.
+        fake.GetInstrumentMethod = lambda i: None
+        fake.SampleInformation.Vial = None
+        convert(src, tmp_path / "old", compute_sha256=False)
+        acq = pq.read_table(tmp_path / "old" / "acquisition_metadata.parquet").to_pylist()[0]
+        assert acq["instrument_methods"] is None and acq["sample_vial"] is None
+        assert acq["sample_raw_file_name"] == "D:\\run.raw"
+
     def test_profile_bundle_says_so(self, raw, tmp_path):
         from constellation.massspec.readers.thermo import convert
 

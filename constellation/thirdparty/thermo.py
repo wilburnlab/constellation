@@ -7,11 +7,13 @@ lives with the rest of the Thermo reader at
 :mod:`constellation.massspec.readers.thermo` — that's where the
 ``ThermoReader`` / ``convert`` entry points come from.
 
-Pins: ``scripts/install-thermo-dlls.sh`` hash-pins the **ThermoRawFileParser**
-v1.4.5 release archive, which bundles the three DLLs Constellation
-loads (``ThermoFisher.CommonCore.Data.dll``,
-``ThermoFisher.CommonCore.RawFileReader.dll``, ``OpenMcdf.dll``). The
-install script lays them down under
+Pins: ``scripts/install-thermo-dlls.sh`` installs Thermo's RawFileReader
+8.0.42 for .NET 8 from Thermo's own repository (at a fixed commit, since
+Thermo keeps no older packages there) and its two dependencies from
+nuget.org, every file SHA-256 pinned; ``--legacy-1.4.5`` installs the
+CommonCore 5.0.0.93 bundled with ThermoRawFileParser 1.4.5 instead. The
+two give identical peaks and scan values; only 8.x reads the instrument
+method text on Linux. The script lays the DLLs down under
 ``third_party/thermo/<version>/`` and repoints
 ``third_party/thermo/current`` so the registry's standard ``current/``
 lookup finds them.
@@ -31,10 +33,9 @@ from pathlib import Path
 from constellation.thirdparty.registry import ToolSpec, register
 
 
-# Version of the upstream ThermoRawFileParser release the install
-# script downloads. The DLLs themselves come from inside that archive
-# (the CommonCore family ships out-of-band of TRFP's own version).
-THERMO_DLL_PACK_VERSION = "1.4.5"
+# The RawFileReader version the install script installs by default (the
+# directory under third_party/thermo/; "1.4.5" for the legacy pack).
+THERMO_DLL_PACK_VERSION = "8.0.42"
 
 
 def _probe_version(path: Path) -> str | None:

@@ -352,6 +352,9 @@ class _Job:
                 "software_version": run_meta.get("software_version"),
                 "method_name": run_meta.get("method_name"),
                 "creation_date": run_meta.get("creation_date"),
+                "instrument_method_names": [
+                    m["name"] for m in run_meta.get("instrument_methods") or ()
+                ],
                 **stats,
                 "levels": levels,
                 "tune_data_keys": [k for k, _ in run_meta.get("tune_data") or ()],

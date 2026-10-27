@@ -50,6 +50,7 @@ from constellation.massspec.schemas import (
 from _massspec_fixtures import MS1_FILTER as _MS1_FILTER
 from _massspec_fixtures import dda_scans as _dda_scans
 from _massspec_fixtures import dia_scans as _dia_scans
+from _massspec_fixtures import with_scan_stats as _with_scan_stats
 from _massspec_fixtures import write_bundle as _write_bundle
 
 
@@ -205,6 +206,47 @@ def test_exact_values_are_written_as_thermo_displays_them(tmp_path: Path) -> Non
     # Without the header nothing is rounded: the exact bundle's own values.
     c = write_dia([_write_bundle(tmp_path / "bare", "run", exact)], tmp_path / "bare.dia")
     assert not diff_dia(a.path, c.path).identical
+
+
+def test_run_sample_and_method_metadata_written_as_msrawjava_does(tmp_path: Path) -> None:
+    """What a Thermo bundle records about the run, the sample and the
+    instrument method becomes the keys MSRawJava writes, in its order."""
+    scans = _with_scan_stats(_dia_scans())
+    acquisition = {
+        "run_start_time": "2026-10-07T12:15:40.9362541Z",
+        "run_start_minutes": 0.00011072868333333333,
+        "run_end_minutes": 107.07892674848334,
+        "expected_run_minutes": 107.0,
+        "max_integrated_intensity": 952826512.6479492,
+        "spectra_count": len(scans),
+        "sample_vial": "G:B3",
+        "sample_injection_volume": 1.0,
+        "sample_method_file": "C:\\methods\\GPF.meth",
+        "sample_raw_file_name": "D:\\run.raw",
+        "instrument_methods": [
+            {"name": "SiiXcalibur", "text": "LC method\r\n"},
+            {"name": "TNG-Thorium", "text": "MS method\r\n"},
+        ],
+    }
+    summary = write_dia(
+        [_write_bundle(tmp_path, "run", scans, acquisition=acquisition)], tmp_path / "run.dia"
+    )
+    con = sqlite3.connect(summary.path)
+    md = dict(con.execute("SELECT Key, Value FROM metadata"))
+    keys = [k for (k,) in con.execute("SELECT Key FROM metadata ORDER BY rowid")]
+    assert md["thermo.run.expected_run_time"] == 107  # stored as SQLite stores it
+    assert md["thermo.run.duration_minutes"] == 107.07892674848334 - 0.00011072868333333333
+    assert md["thermo.sample.vial"] == "G:B3" and md["thermo.sample.injection_volume"] == 1
+    assert md["thermo.instrument_method.count"] == 2
+    assert md["thermo.instrument_method.1.raw_text"] == "MS method\r\n"
+    total = 0.0  # sequentially, as MSRawJava sums (Python's sum() compensates)
+    for s in scans:
+        if s["level"] == 1:
+            total += s["tic"]
+    assert md["run.tic_total"] == total
+    assert keys.index("run.start_time_iso8601") < keys.index("run.gradient_length_seconds")
+    assert keys.index("instrument.software_version") < keys.index("thermo.sample.injection_volume")
+    assert keys.index("thermo.instrument_method.1.raw_text") < keys.index("acq.mass_analyzers")
 
 
 def test_export_reads_either_peak_layout(tmp_path: Path) -> None:
