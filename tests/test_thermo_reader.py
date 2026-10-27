@@ -54,7 +54,7 @@ from constellation.massspec.readers.thermo.manifest import (
     read_manifest_dir,
     write_manifest,
 )
-from _thermo_fakes import MS1, FakeRaw, mixed_raw, scan
+from _thermo_fakes import MS1, MS2, FakeEvent, FakeRaw, mixed_raw, scan
 from constellation.massspec.bundle import peaks_dataset
 from constellation.massspec.schemas import (
     ACQUISITION_METADATA_TABLE,
@@ -417,14 +417,44 @@ class TestRangeReader:
         assert ms2["precursor_mz"] == 500.2512  # the trailer's monoisotopic m/z
         assert ms2["precursor_charge"] == 2
         assert ms2["precursor_scan"] == ms2["master_scan"] == 1.0
-        # The trailer's width, centred on the isolation target.
-        assert ms2["isolation_lower"] == pytest.approx(499.25)
-        assert ms2["isolation_upper"] == pytest.approx(501.25)
-        assert ("MS2 Isolation Width:", "2.0") in ms2["trailer_extras"]
+        # The scan event's width (2.0009), not the trailer's display (2.00),
+        # centred on the isolation target.
+        assert ms2["isolation_lower"] == 500.25 - 2.0009 / 2
+        assert ms2["isolation_upper"] == 500.25 + 2.0009 / 2
+        # trailer_extras holds what Thermo displays.
+        assert ("MS2 Isolation Width:", "2.00") in ms2["trailer_extras"]
         # Per-scan values repeated on every peak of the scan.
         ms2_peaks = peaks.filter(pa.compute.equal(peaks["scan"], 2))
         assert set(ms2_peaks.column("precursor_mz").to_pylist()) == {500.2512}
         assert set(ms2_peaks.column("level").to_pylist()) == {2}
+
+    def test_typed_trailer_values_not_display_strings(self, fake_centroider):
+        """Thermo displays a trailer entry rounded to its header's precision;
+        the typed value is the instrument's."""
+        iit = float(np.float32(31.0431213))
+        raw = FakeRaw({
+            1: scan(MS1, rt_min=0.1, mz=[400.0],
+                    trailer=[("Ion Injection Time (ms):", "31.043", iit)]),
+            2: scan(MS2, rt_min=0.2, mz=[300.0], event=FakeEvent(mass=500.25, width=2.0009),
+                    trailer=[("Ion Injection Time (ms):", "100.000", 100.0),
+                             ("MS2 Isolation Width:", "2.00", 2.0009),
+                             ("Monoisotopic M/Z:", "500.2512", 500.25123456)]),
+        })
+        ms1, ms2 = _read(raw)[0].to_pylist()
+        assert ms1["iit"] == iit
+        assert ("Ion Injection Time (ms):", "31.043") in ms1["trailer_extras"]
+        assert ms2["ms2_isolation_width"] == 2.0009
+        assert ms2["precursor_mz"] == ms2["monoisotopic_mz_override"] == 500.25123456
+        # The header lists MS2-only entries, but an MS1 scan does not have them.
+        assert ms1["ms2_isolation_width"] is None and ms1["monoisotopic_mz_override"] is None
+
+    def test_without_a_trailer_header_the_display_strings_are_read(self, fake_centroider):
+        raw = FakeRaw(
+            {1: scan(MS1, rt_min=0.1, mz=[400.0],
+                     trailer=[("Ion Injection Time (ms):", "31.043", 31.0431213)])},
+            header=False,
+        )
+        assert _read(raw)[0].to_pylist()[0]["iit"] == pytest.approx(31.043, abs=1e-6)
 
     def test_no_trailer_extras_keeps_typed_columns(self, fake_centroider):
         scans, _ = _read(self._raw(), capture_trailer_extras=False)
@@ -554,6 +584,9 @@ class TestConvert:
         ]
         acq = pq.read_table(tmp_path / "run" / "acquisition_metadata.parquet").to_pylist()[0]
         assert acq["profile_mode"] is False  # nothing stored as profile
+        assert [h["label"] for h in acq["trailer_header"]][:2] == [
+            "Ion Injection Time (ms):", "AGC:",
+        ]
         assert acq["analyzers"] == ["FTMS", "ITMS"]
         assert peaks_dataset(tmp_path / "run").count_rows() == 7
 

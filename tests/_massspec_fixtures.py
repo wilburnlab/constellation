@@ -106,12 +106,14 @@ def write_bundle(
     profile: bool = False,
     drop_scan_window_columns: bool = False,
     layout: str = "parts",
+    acquisition: dict[str, Any] | None = None,
 ) -> Path:
     """Write ``scans`` as a bundle shaped like ``massspec convert`` output.
 
     ``layout="parts"`` writes the peaks as two parts, the scans split
     between them (``peaks/part-0000{0,1}.parquet``, manifest v2);
     ``layout="file"`` as one ``peaks.parquet`` (bundles before v2).
+    ``acquisition`` adds or replaces acquisition-metadata fields.
     """
     bundle = root / name
     bundle.mkdir(parents=True)
@@ -161,6 +163,7 @@ def write_bundle(
         "analyzers": ["ITMS"],
         "n_scans": len(scans),
         "profile_mode": profile,
+        **(acquisition or {}),
     }
     pq.write_table(
         pa.Table.from_pylist([acquisition], schema=ACQUISITION_METADATA_TABLE),

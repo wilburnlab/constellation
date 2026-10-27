@@ -38,7 +38,7 @@ from constellation.massspec.schemas import (
 )
 
 from ._netruntime import load_clr
-from ._scans import DEFAULT_BLOCK_SCANS, THERMO, ReadOptions, iter_scan_blocks
+from ._scans import DEFAULT_BLOCK_SCANS, THERMO, ReadOptions, iter_scan_blocks, trailer_header
 from ._trailer import trailer_to_dict
 
 logger = logging.getLogger(__name__)
@@ -166,6 +166,13 @@ def _build_run_metadata(source, path: Path) -> dict[str, Any]:
     tune_map = _extract_tune_data(source)
     if tune_map is not None:
         meta["tune_data"] = tune_map
+
+    header = trailer_header(source)
+    if header:
+        meta["trailer_header"] = [
+            {"label": label, "data_type": data_type, "precision": precision}
+            for label, data_type, precision in header
+        ]
 
     return meta
 
@@ -325,10 +332,11 @@ class ThermoReader(RawReader):
         peak_table = pa.concat_tables(peaks) if peaks else MS_PEAK_TABLE.empty_table()
         # ReadResult.run_metadata is a flat dict — the most useful fields of
         # the acquisition table for callers who don't want to open the
-        # companion. ``tune_data`` is left out; it can be very large.
+        # companion. ``tune_data`` and ``trailer_header`` are left out.
         run_metadata = dict(run_meta)
         run_metadata.update(_acquisition_stats(scan_table))
         run_metadata.pop("tune_data", None)
+        run_metadata.pop("trailer_header", None)
         return ReadResult(
             primary=peak_table,
             companions={

@@ -177,6 +177,36 @@ def test_export_reads_scan_range_from_filter_string_for_older_bundles(tmp_path: 
     assert diff_dia(new.path, old.path).identical
 
 
+def test_exact_values_are_written_as_thermo_displays_them(tmp_path: Path) -> None:
+    """A bundle holding the instrument's values (an isolation width of
+    2.0009, injection times in full) and the trailer header gives the file
+    a bundle of Thermo's display values gives: MSRawJava reads the display
+    strings. Ties go to even, as Thermo displays them (75.5625 -> 75.562)."""
+    displayed = _dia_scans()
+    exact = _dia_scans()
+    exact_iits = [31.0431213, 75.5625, 12.0004]
+    for i, (d, e) in enumerate(zip(displayed, exact)):
+        iit = exact_iits[i % 3]
+        e["iit"] = float(np.float32(iit))
+        d["iit"] = {31.0431213: 31.043, 75.5625: 75.562, 12.0004: 12.0}[iit]
+        if e["level"] == 2:
+            centre = (e["isolation_lower"] + e["isolation_upper"]) / 2
+            e["isolation_lower"], e["isolation_upper"] = centre - 1.00045, centre + 1.00045
+    header = {"trailer_header": [
+        {"label": "Ion Injection Time (ms):", "data_type": "FLOAT", "precision": 3},
+        {"label": "MS2 Isolation Width:", "data_type": "FLOAT", "precision": 2},
+    ]}
+    a = write_dia([_write_bundle(tmp_path / "shown", "run", displayed)], tmp_path / "shown.dia")
+    b = write_dia(
+        [_write_bundle(tmp_path / "exact", "run", exact, acquisition=header)],
+        tmp_path / "exact.dia",
+    )
+    assert diff_dia(a.path, b.path).identical
+    # Without the header nothing is rounded: the exact bundle's own values.
+    c = write_dia([_write_bundle(tmp_path / "bare", "run", exact)], tmp_path / "bare.dia")
+    assert not diff_dia(a.path, c.path).identical
+
+
 def test_export_reads_either_peak_layout(tmp_path: Path) -> None:
     """Peaks as parts (bundle manifest v2) and as one file (v1) give one file."""
     scans = _dia_scans(empty_scan=7)

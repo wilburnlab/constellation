@@ -61,6 +61,15 @@ same ``.raw`` inputs, and is what ``_dia_diff`` compares against:
     lands one unit off for ~15% of scans, so the millisecond value is
     first read back as the short decimal the instrument reported
     (``31.043``), which is what the reference divides.
+  - The reference reads injection time and MS2 isolation width as Thermo
+    displays them, rounded to the precision the trailer header declares
+    (3 and 2 decimals: an isolation width of 2.0009 is 2.00, so its
+    windows are centre ± 1.000). Bundles since scan-metadata v4 hold the
+    instrument's full values and record that header
+    (``acquisition_metadata.trailer_header``); for them both are rounded
+    here as Thermo displays them, ties to even. Bundles without
+    the header (older ones, imported ones) already hold what they hold
+    and are not rounded.
 
 **DDA ``ranges`` differ from the reference, on purpose.** For a DDA run
 the reference lists fewer windows than the run has (134,180 rows for
@@ -93,6 +102,7 @@ from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -283,6 +293,27 @@ def _f32(x: float) -> float:
     return float(np.float32(x))
 
 
+_IIT_LABEL = "Ion Injection Time (ms):"
+_MS2_WIDTH_LABEL = "MS2 Isolation Width:"
+
+
+def _display_precision(acq: dict[str, Any]) -> dict[str, int] | None:
+    """Label -> the precision Thermo displays it with, or None when the
+    bundle records no trailer header (its values are not to be rounded)."""
+    header = acq.get("trailer_header")
+    if not header:
+        return None
+    return {h["label"]: int(h["precision"]) for h in header}
+
+
+def _as_displayed(x: float, places: int) -> float:
+    """``x`` rounded to ``places`` decimals as Thermo displays it: the exact
+    binary value, ties to even (an injection time of 75.5625 ms shows as
+    ``75.562``; 2 of 81,850 scans of a Stellar run are such ties)."""
+    exact = Decimal(x).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_EVEN)
+    return float(exact)
+
+
 def _shortest(x: float) -> float:
     """A float32-held value as the shortest decimal that round-trips to it.
 
@@ -315,9 +346,16 @@ def _scan_rows(bundle: _Bundle) -> _ScanRows:
     level = t.column("level").to_numpy().astype(np.int8)
     rt_exact = t.column("rt").to_numpy().astype(np.float64)
     rt = rt_exact.astype(np.float32).astype(np.float64)
-    iit = [None if v is None else _f32(_shortest(v) / 1000.0) for v in t.column("iit").to_pylist()]
+    displayed = _display_precision(bundle.acq)
+    if displayed is None:
+        iit_ms = _shortest
+    else:
+        iit_places = displayed.get(_IIT_LABEL, 3)
+        iit_ms = lambda v: _as_displayed(float(np.float32(v)), iit_places)  # noqa: E731
+    iit = [None if v is None else _f32(iit_ms(v) / 1000.0) for v in t.column("iit").to_pylist()]
     lower = t.column("isolation_lower").to_numpy(zero_copy_only=False).astype(np.float64)
     upper = t.column("isolation_upper").to_numpy(zero_copy_only=False).astype(np.float64)
+    width_places = None if displayed is None else displayed.get(_MS2_WIDTH_LABEL, 2)
     target = np.full(scan.shape, np.nan)
     charge_raw = t.column("precursor_charge").to_pylist()
     charge = np.array([0 if c is None else int(c) for c in charge_raw], dtype=np.int64)
@@ -366,6 +404,10 @@ def _scan_rows(bundle: _Bundle) -> _ScanRows:
                 # the instrument's full-precision isolation m/z, so the
                 # centre less the offset gives that m/z back.
                 target[i] = (lower[i] + upper[i]) / 2.0 - (offset[i] or 0.0)
+                if width_places is not None:
+                    half = _as_displayed(upper[i] - lower[i], width_places) / 2.0
+                    centre = target[i] + (offset[i] or 0.0)
+                    lower[i], upper[i] = centre - half, centre + half
     f32 = lambda a: a.astype(np.float32).astype(np.float64)  # noqa: E731
     return _ScanRows(
         scan, level, rt, rt_exact, iit, f32(lower), f32(upper), f32(target), charge, parent

@@ -72,7 +72,26 @@
       - The machine's earlier notes record the same kind of transient read errors.
     - **To check before relying on it:** a run on reliable hardware (OSC) comparing the
       worker run with a single-process run.
-- **Phases 3–5:** not started.
+- **Phase 3** (exact values): done.
+  - **What the bundle now holds:**
+    - Isolation width comes from the scan event.
+    - Typed trailer columns come from `GetTrailerExtraValues`, aligned with the trailer header.
+      Which entries a scan has still comes from its own display list.
+    - `trailer_extras` keeps Thermo's display strings. It used to re-format them: `100.000`
+      became `100.0`.
+    - The header (label, type, display precision) is in `acquisition_metadata.trailer_header`
+      (v2).
+  - **The `.dia` writer** rounds injection time and MS2 isolation width as Thermo displays them,
+    for bundles that record the header.
+    - The rounding is ties to even, as Thermo's is. The first try rounded half away from zero,
+      and `diff_dia` caught 2 of 81,850 scans whose injection time was an exact tie (75.5625 ms
+      shown as `75.562`).
+  - **Parity:** GPF 900–1000 identical to MSRawJava. Stellar DDA identical in every per-scan
+    value; its only differences are the two documented departures (every DDA window listed; one
+    MS2 scan MSRawJava drops).
+  - **Orbitrap runs:** monoisotopic m/z gains up to 0.05 mDa, injection times up to 0.0005 ms,
+    and isolation widths are the instrument's float32 values. Peaks are unchanged.
+- **Phases 4–5:** not started.
 
 ## Why
 

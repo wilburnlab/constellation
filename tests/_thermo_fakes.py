@@ -50,7 +50,9 @@ def scan(
 ):
     """One stand-in scan. ``acquired`` is ``centroid`` or ``profile``;
     ``stream`` is ``None`` (no centroid stream), ``()`` (an empty one) or
-    ``(mz, intensity, resolution, noise, baseline)``."""
+    ``(mz, intensity, resolution, noise, baseline)``. ``trailer`` entries
+    are ``(label, display string)`` or ``(label, display string, typed
+    value)``; without a typed value the display string is its value."""
     mz = np.asarray(mz, dtype=np.float64)
     intensity = (
         np.asarray(intensity, dtype=np.float64)
@@ -69,17 +71,34 @@ def scan(
         "mz": mz,
         "intensity": intensity,
         "stream": stream,
-        "trailer": Obj(Labels=[k for k, _ in trailer], Values=[v for _, v in trailer]),
+        "trailer": Obj(Labels=[t[0] for t in trailer], Values=[t[1] for t in trailer]),
+        "typed": {t[0]: (t[2] if len(t) > 2 else _typed(t[1])) for t in trailer},
         "event": event or FakeEvent(),
     }
 
 
-class FakeRaw:
-    """The slice of IRawDataPlus the range reader calls."""
+def _typed(display: str):
+    try:
+        return float(display) if "." in display else int(display)
+    except ValueError:
+        return display
 
-    def __init__(self, scans: dict[int, dict]):
+
+class FakeRaw:
+    """The slice of IRawDataPlus the range reader calls.
+
+    The trailer header is every label any scan has, in first-seen order;
+    ``header=False`` stands in for a file that gives no header (or no
+    typed values), so only the display strings are there to read.
+    """
+
+    def __init__(self, scans: dict[int, dict], *, header: bool = True):
         self.scans = scans
         self.RunHeaderEx = Obj(FirstSpectrum=min(scans), LastSpectrum=max(scans))
+        labels: dict[str, None] = {}
+        for s in scans.values():
+            labels.update(dict.fromkeys(s["trailer"].Labels))
+        self.header = list(labels) if header else None
 
     def GetScanStatsForScanNumber(self, n):
         return self.scans[n]["stats"]
@@ -106,6 +125,16 @@ class FakeRaw:
 
     def GetTrailerExtraInformation(self, n):
         return self.scans[n]["trailer"]
+
+    def GetTrailerExtraHeaderInformation(self):
+        if self.header is None:
+            raise RuntimeError("no trailer header")
+        return [Obj(Label=label, DataType="FLOAT", StringLengthOrPrecision=3) for label in self.header]
+
+    def GetTrailerExtraValues(self, n):
+        typed = self.scans[n]["typed"]
+        # Every header entry, the ones this scan does not have included.
+        return [typed.get(label, 0) for label in self.header]
 
     def Dispose(self):
         pass

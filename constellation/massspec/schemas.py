@@ -296,7 +296,8 @@ register_schema("ScanMetadataTable", SCAN_METADATA_TABLE)
 # AcquisitionMetadataTable — one row per run. Ports cartographer ACQUISITION_METADATA_SCHEMA v5.
 # ──────────────────────────────────────────────────────────────────────
 
-ACQUISITION_METADATA_SCHEMA_VERSION: int = 1
+# v2 (additive): trailer_header.
+ACQUISITION_METADATA_SCHEMA_VERSION: int = 2
 
 
 # Single-row run-level metadata: instrument identity + Thermo
@@ -328,6 +329,25 @@ ACQUISITION_METADATA_TABLE: pa.Schema = pa.schema(
         pa.field(
             "tune_data",
             pa.map_(pa.string(), pa.string()),
+            nullable=True,
+        ),
+        # The Thermo trailer's header: each entry's label, data type and
+        # the precision Thermo displays it with (an isolation width to 2
+        # decimals, an injection time to 3). Scan metadata holds the full
+        # values; a writer that has to reproduce what other software read
+        # from the display strings (the .dia writer, for MSRawJava) rounds
+        # with these. Null for other sources and bundles before v2.
+        pa.field(
+            "trailer_header",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("label", pa.string()),
+                        pa.field("data_type", pa.string()),
+                        pa.field("precision", pa.int32()),
+                    ]
+                )
+            ),
             nullable=True,
         ),
     ],

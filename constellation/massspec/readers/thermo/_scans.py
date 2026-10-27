@@ -24,14 +24,20 @@ profile    centroid                               stored centroids     instrumen
 on profile scans. ``CENTROIDERS`` maps a centroider's name to the function
 that runs it, so another centroider is one more entry.
 
+Values are the instrument's, at full precision: the isolation width is the
+scan event's, and the typed trailer columns take the typed trailer values
+(``GetTrailerExtraValues``), not the display strings, which Thermo rounds
+to the precision its header declares (an isolation width of 2.0009 shows as
+``2.00``). ``trailer_extras`` keeps the display strings.
+
 The DLL calls per scan were chosen by measurement (2026-10-26, Stellar DIA,
 CommonCore 5.0.0.93): the filter string is ``ScanStatistics.ScanType`` and
 the retention time ``ScanStatistics.StartTime``, both on the statistics
 already fetched, where ``GetFilterForScanNumber(...).ToString()`` cost 52 µs
 a scan; scan events come in one ``GetScanEvents`` call per range; and the
-trailer's labels and values are each joined inside .NET into one string,
-because marshalling them element by element cost more than the rest of the
-trailer work together.
+trailer's labels and display strings are each joined inside .NET into one
+string, because marshalling them element by element cost more than the rest
+of the trailer work together.
 """
 
 from __future__ import annotations
@@ -196,6 +202,9 @@ class _Layout:
     promoted: tuple[tuple[str, tuple[int, ...], Callable[[Any], Any]], ...]
     # unique labels in first-seen order, each with the position of its value
     extras: tuple[tuple[str, int], ...]
+    # for each position, where its typed value is in the trailer header's
+    # order (None: no typed value, so the display string is parsed)
+    typed: tuple[int | None, ...]
 
 
 _UNSIGNED: frozenset[str] = frozenset(
@@ -223,7 +232,7 @@ def _non_negative(column: str, coerce: Callable[[Any], Any]) -> Callable[[Any], 
     return checked
 
 
-def _layout(labels: list[str]) -> _Layout:
+def _layout(labels: list[str], header_index: dict[str, int] | None = None) -> _Layout:
     index: dict[str, int] = {}
     for position, label in enumerate(labels):
         index[label] = position
@@ -236,17 +245,19 @@ def _layout(labels: list[str]) -> _Layout:
         for f in _TRAILER_FIELDS
         if any(k in index for k in f.keys)
     )
-    return _Layout(len(labels), index, promoted, tuple(index.items()))
+    typed = tuple(header_index.get(label) if header_index else None for label in labels)
+    return _Layout(len(labels), index, promoted, tuple(index.items()), typed)
 
 
 class _Trailer:
-    """One scan's trailer: values typed as :func:`try_number` types them."""
+    """One scan's trailer: its values typed, and the strings Thermo displays."""
 
-    __slots__ = ("layout", "values")
+    __slots__ = ("layout", "values", "display")
 
-    def __init__(self, layout: _Layout, values: list[Any]):
+    def __init__(self, layout: _Layout, values: list[Any], display: list[str]):
         self.layout = layout
         self.values = values
+        self.display = display
 
     def get(self, label: str) -> Any:
         position = self.layout.index.get(label)
@@ -263,11 +274,12 @@ class _Trailer:
         return out
 
     def extras(self) -> list[tuple[str, str]]:
-        values = self.values
-        return [(label, str(values[p])) for label, p in self.layout.extras if values[p] is not None]
+        """Every entry as Thermo displays it (padding removed, empty ones left out)."""
+        display = self.display
+        return [(label, display[p]) for label, p in self.layout.extras if display[p]]
 
 
-_NO_TRAILER = _Trailer(_layout([]), [])
+_NO_TRAILER = _Trailer(_layout([]), [], [])
 
 
 def _python_join(sep: str, items) -> str:
@@ -275,40 +287,82 @@ def _python_join(sep: str, items) -> str:
 
 
 class _TrailerDecoder:
-    """Decode trailers, caching the work that repeats from scan to scan."""
+    """Decode trailers, caching the work that repeats from scan to scan.
 
-    def __init__(self) -> None:
+    A trailer comes two ways: ``GetTrailerExtraInformation`` gives the
+    entries that apply to the scan as display strings, rounded to the
+    precision the header declares (an isolation width of 2.0009 shows as
+    ``2.00``, an injection time to 3 decimals); ``GetTrailerExtraValues``
+    gives every header entry typed, at full precision, including ones that
+    do not apply. The first says which entries a scan has, the second what
+    they are. ``header`` is the trailer header's labels in order; without
+    it (or without typed values) the display strings are parsed.
+    """
+
+    def __init__(self, header: list[str] | None = None) -> None:
         try:
             from System import String
         except ImportError:  # no CLR loaded: a stand-in source (tests)
             self._join = _python_join
         else:
             self._join = String.Join
+        # A label the header lists twice maps to its last place.
+        self._header_index = {label: i for i, label in enumerate(header)} if header else None
         self._layouts: dict[str, _Layout] = {}
-        self._typed: dict[str, Any] = {}
+        self._parsed: dict[str, Any] = {}
 
-    def decode(self, info) -> _Trailer:
+    def decode(self, info, typed: list[Any] | None = None) -> _Trailer:
         if info is None:
             return _NO_TRAILER
         joined = self._join(_SEP, info.Labels)
         layout = self._layouts.get(joined)
         if layout is None:
-            layout = self._layouts[joined] = _layout(joined.split(_SEP) if joined else [])
+            layout = self._layouts[joined] = _layout(
+                joined.split(_SEP) if joined else [], self._header_index
+            )
         if layout.n == 0:
-            return _Trailer(layout, [])
-        raw = self._join(_SEP, info.Values).split(_SEP)
-        if len(raw) != layout.n:  # a value held the separator
-            raw = [str(v) for v in info.Values]
-        typed = self._typed
-        if len(typed) > 200_000:
-            typed.clear()
+            return _NO_TRAILER
+        display = self._join(_SEP, info.Values).split(_SEP)
+        if len(display) != layout.n:  # a value held the separator
+            display = [str(v) for v in info.Values]
+        display = [text.strip() for text in display]
+        parsed = self._parsed
+        if len(parsed) > 200_000:
+            parsed.clear()
         values = []
-        for text in raw:
-            value = typed.get(text, typed)
-            if value is typed:
-                value = typed[text] = try_number(text)
+        for text, h in zip(display, layout.typed):
+            if h is not None and typed is not None and h < len(typed):
+                value = typed[h]
+                if isinstance(value, str):
+                    value = value.strip() or None
+            else:
+                value = parsed.get(text, parsed)
+                if value is parsed:
+                    value = parsed[text] = try_number(text)
             values.append(value)
-        return _Trailer(layout, values)
+        return _Trailer(layout, values, display)
+
+
+def trailer_header(raw) -> list[tuple[str, str, int]] | None:
+    """The trailer header: ``(label, data type, display precision)`` per entry."""
+    try:
+        items = raw.GetTrailerExtraHeaderInformation()
+    except Exception:
+        logger.debug("GetTrailerExtraHeaderInformation failed", exc_info=True)
+        return None
+    if items is None:
+        return None
+    return [
+        (str(h.Label), str(h.DataType), int(h.StringLengthOrPrecision)) for h in items
+    ]
+
+
+def _typed_trailer(raw, scan_number: int) -> list[Any] | None:
+    try:
+        values = raw.GetTrailerExtraValues(scan_number)
+    except Exception:
+        return None
+    return None if values is None else list(values)
 
 
 # ── scan rows ─────────────────────────────────────────────────────────
@@ -358,16 +412,19 @@ def _scan_row(
         if charge and charge > 0:
             precursor_charge = charge
 
-        iso_width = safe_float(trailer.get(f"MS{ms_level} Isolation Width:"))
+        # The scan event's width is the instrument's (2.0009); the trailer's
+        # only stands in when the event has none.
+        iso_width: float | None = None
+        try:
+            iso_width = float(event.GetIsolationWidth(ms_level - 2)) or None
+        except Exception:
+            pass
+        if iso_width is None:
+            iso_width = safe_float(trailer.get(f"MS{ms_level} Isolation Width:"))
         try:
             iso_offset = float(event.GetIsolationWidthOffset(ms_level - 2))
         except Exception:
             iso_offset = 0.0
-        if iso_width is None:
-            try:
-                iso_width = float(event.GetIsolationWidth(ms_level - 2))
-            except Exception:
-                iso_width = None
         if iso_target is not None and iso_width is not None:
             half = iso_width / 2.0
             iso_lower = iso_target + iso_offset - half
@@ -531,7 +588,8 @@ def iter_scan_blocks(
     if last < first:
         return
     events = _scan_events(raw, first, last)
-    trailers = _TrailerDecoder()
+    header = trailer_header(raw)
+    trailers = _TrailerDecoder([label for label, _, _ in header] if header else None)
     filters: dict[str, dict[str, Any]] = {}
     block = _BlockBuilder()
     for i, scan_number in enumerate(range(first, last + 1)):
@@ -543,7 +601,10 @@ def iter_scan_blocks(
             if parsed is None:
                 parsed = filters[filter_str] = parse_filter_string(filter_str)
             peaks = _read_peaks(raw, scan_number, stats, options)
-            trailer = trailers.decode(raw.GetTrailerExtraInformation(scan_number))
+            trailer = trailers.decode(
+                raw.GetTrailerExtraInformation(scan_number),
+                _typed_trailer(raw, scan_number) if header else None,
+            )
             row = _scan_row(
                 scan_number, stats, event, filter_str, parsed, trailer, peaks,
                 capture_trailer_extras=options.capture_trailer_extras,
@@ -568,4 +629,5 @@ __all__ = [
     "ReadOptions",
     "ScanBlock",
     "iter_scan_blocks",
+    "trailer_header",
 ]
