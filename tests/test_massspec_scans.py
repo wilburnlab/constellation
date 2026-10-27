@@ -217,6 +217,20 @@ def test_several_spectra_in_one_read(dia) -> None:
     assert table.num_rows == sum(scans[i]["mz"].size for i in (3, 20))
 
 
+def test_a_single_file_bundle_reads_the_same(tmp_path: Path, dia) -> None:
+    """A bundle from before manifest v2 holds its peaks in one peaks.parquet."""
+    parts, scans = dia
+    single = write_bundle_manifest(write_bundle(tmp_path / "v1", "dia_run", scans, layout="file"))
+    assert (single / "peaks.parquet").is_file() and (parts / "peaks").is_dir()
+    for s in (scans[0], scans[25]):
+        assert spectrum(single, s["scan"]).equals(spectrum(parts, s["scan"]))
+    targets = [s["mz"][0] for s in scans[1:4] if s["mz"].size]
+    common = dict(level=2, window=0, tolerance=0.01, tolerance_unit="Da")
+    assert xic(single, targets, **common).equals(xic(parts, targets, **common))
+    build_peak_index(single, single / "mz_index")
+    assert xic(single, targets, **common).equals(xic(parts, targets, **common))
+
+
 # ── a bundle imported from a spectra file ─────────────────────────────────
 
 

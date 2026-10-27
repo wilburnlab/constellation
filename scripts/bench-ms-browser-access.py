@@ -47,6 +47,8 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
+from constellation.massspec.bundle import peak_paths, peaks_dataset
+
 NAV_COLUMNS = [
     "scan",
     "level",
@@ -139,7 +141,7 @@ def windows_of(scans: pa.Table, level: int) -> np.ndarray:
 
 def survey_bundle(bundle: Path, *, samples: int, rng: np.random.Generator) -> dict:
     manifest = json.loads((bundle / "manifest.json").read_text())
-    peaks_path = bundle / "peaks.parquet"
+    peak_files = peak_paths(bundle)  # one peaks.parquet, or peaks/part-*.parquet
     meta_path = bundle / "scan_metadata.parquet"
     files = bundle_files(bundle)
     out: dict[str, Any] = {
@@ -148,24 +150,24 @@ def survey_bundle(bundle: Path, *, samples: int, rng: np.random.Generator) -> di
         "profile_mode": (manifest.get("parameters") or {}).get("profile_mode"),
         "rt_bin_width_s": (manifest.get("parameters") or {}).get("rt_bin_width_s"),
         "bytes": {p.name: p.stat().st_size for p in files if p.parent == bundle},
+        "peak_bytes": sum(p.stat().st_size for p in peak_files),
     }
 
-    # Layout of peaks.parquet.
-    pmeta = pq.ParquetFile(peaks_path).metadata
-    rt_idx = pmeta.schema.to_arrow_schema().get_field_index("rt")
-    spans = []
-    for i in range(pmeta.num_row_groups):
-        st = pmeta.row_group(i).column(rt_idx).statistics
-        if st is not None and st.has_min_max:
-            spans.append(st.max - st.min)
+    # Layout of the peaks.
+    metas = [pq.ParquetFile(p).metadata for p in peak_files]
+    spans, rows = [], []
+    for pmeta in metas:
+        rt_idx = pmeta.schema.to_arrow_schema().get_field_index("rt")
+        for i in range(pmeta.num_row_groups):
+            rows.append(pmeta.row_group(i).num_rows)
+            st = pmeta.row_group(i).column(rt_idx).statistics
+            if st is not None and st.has_min_max:
+                spans.append(st.max - st.min)
     out["peaks_parquet"] = {
-        "rows": pmeta.num_rows,
-        "row_groups": pmeta.num_row_groups,
-        "rows_per_row_group_median": int(
-            statistics.median(
-                pmeta.row_group(i).num_rows for i in range(pmeta.num_row_groups)
-            )
-        ),
+        "files": len(peak_files),
+        "rows": sum(m.num_rows for m in metas),
+        "row_groups": len(rows),
+        "rows_per_row_group_median": int(statistics.median(rows)) if rows else 0,
         "row_group_rt_span_s_median": round(statistics.median(spans), 2) if spans else None,
     }
 
@@ -224,7 +226,7 @@ def survey_bundle(bundle: Path, *, samples: int, rng: np.random.Generator) -> di
     out["ms1_cycle_s_median"] = round(float(np.median(np.diff(ms1_rt))), 3) if ms1_rt.size > 1 else None
 
     # Spectrum by scan number.
-    dataset = ds.dataset(peaks_path)
+    dataset = peaks_dataset(bundle)
     spectrum_ms: dict[str, Any] = {}
     for level in levels:
         pool = scans.filter(pc.equal(scans.column("level"), level)).column("scan").to_numpy()
@@ -234,7 +236,7 @@ def survey_bundle(bundle: Path, *, samples: int, rng: np.random.Generator) -> di
             fn = lambda s=int(scan): dataset.to_table(  # noqa: E731
                 columns=["mz", "intensity"], filter=ds.field("scan") == s
             )
-            evict([peaks_path])
+            evict(peak_files)
             t, tbl = timed(fn)
             cold.append(t)
             sizes.append(tbl.num_rows)
@@ -246,7 +248,7 @@ def survey_bundle(bundle: Path, *, samples: int, rng: np.random.Generator) -> di
         }
     out["spectrum_by_scan"] = spectrum_ms
 
-    # MS1 XIC from peaks.parquet: ±2 min window and full run.
+    # MS1 XIC from the peaks: ±2 min window and full run.
     ms1_scans = ms1.column("scan").to_numpy()
     xic_pm2, xic_full, rg_pm2 = [], [], []
     for scan in rng.choice(ms1_scans, size=min(samples, ms1_scans.size), replace=False):
@@ -266,12 +268,12 @@ def survey_bundle(bundle: Path, *, samples: int, rng: np.random.Generator) -> di
             & (ds.field("mz") >= lo)
             & (ds.field("mz") <= hi)
         )
-        evict([peaks_path])
+        evict(peak_files)
         xic_pm2.append(timed(lambda f=window: dataset.to_table(columns=["scan", "intensity"], filter=f))[0])
-        rg_pm2.append(row_groups_touched(peaks_path, "rt", rt - 120, rt + 120))
+        rg_pm2.append(sum(row_groups_touched(p, "rt", rt - 120, rt + 120) for p in peak_files))
         if len(xic_full) < 3:
             full = (ds.field("level") == 1) & (ds.field("mz") >= lo) & (ds.field("mz") <= hi)
-            evict([peaks_path])
+            evict(peak_files)
             xic_full.append(timed(lambda f=full: dataset.to_table(columns=["scan", "intensity"], filter=f))[0])
     out["ms1_xic_from_peaks"] = {
         "rt_pm_2min_cold_ms": summary(xic_pm2),

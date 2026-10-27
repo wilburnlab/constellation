@@ -1,33 +1,16 @@
-"""Parallel batch conversion for Thermo ``.raw`` files.
+"""Batch conversion of Thermo ``.raw`` files.
 
-Owns parent-process fan-out + aggregation for converting N ``.raw``
-files into N independent bundle directories. Stays out of
-:mod:`constellation.massspec.readers.thermo._read` (the CLR-aware streaming
-converter) so the split between "what happens inside one .raw" and
-"how many .raws run in parallel" stays clean.
-
-Each ``.raw`` is one self-contained task — no within-file chunking is
-needed because each file already produces an independent bundle
-directory. We do NOT import from :mod:`constellation.sequencing.parallel`
-because the project DAG forbids cross-domain imports; the per-file
-granularity here also doesn't need the heavyweight in-flight queue +
-shard-per-worker writes + ``_SUCCESS`` markers that ``run_batched``
-provides.
-
-Spawn safety: pythonnet's CoreCLR is documented to deadlock if a
-process inherits a partially-initialised CLR via fork. The parent
-intentionally stays CLR-free (the CLI calls ``require_thermo()`` —
-a pure file-existence check — but never ``load_clr()``); workers
-lazy-load CLR inside their own ``_open_raw_file`` call. We additionally
-force ``mp_context="spawn"`` so even import-time CLR side effects in
-the parent can't propagate into workers.
+Converts N ``.raw`` files into N independent bundle directories. The work
+itself is :mod:`._convert`'s: every file is planned as ranges of scans and
+all of them go to one pool of worker processes, so the workers stay busy
+whether the batch is a directory of small files or one large file. This
+module adds what a batch needs on top: one bundle per input stem, skipping
+inputs already converted, and a per-file outcome instead of an exception.
 """
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
-from multiprocessing import get_context
 from pathlib import Path
 from typing import Literal
 
@@ -37,13 +20,10 @@ from constellation.core.progress import (
     emit_progress,
     emit_start,
 )
+from constellation.massspec.bundle import DEFAULT_RT_BIN_WIDTH_S
 
-from ._read import (
-    DEFAULT_BATCH_SIZE,
-    DEFAULT_RT_BIN_WIDTH_S,
-    convert as _convert_one_file,
-)
-from ._scans import THERMO
+from ._convert import DEFAULT_BATCH_SIZE, ConvertOptions, _Job, _run_jobs
+from ._scans import THERMO, ReadOptions
 from .manifest import MANIFEST_FILENAME
 
 
@@ -66,50 +46,6 @@ class BatchResult:
     detail: str | None = None
 
 
-def _convert_one_worker(
-    src_str: str,
-    bundle_dir_str: str,
-    *,
-    rt_bin_width_s: float,
-    profile: bool,
-    centroider: str,
-    capture_trailer_extras: bool,
-    batch_size: int,
-    compute_sha256: bool,
-    force: bool,
-    allow_empty_levels: bool,
-) -> tuple[str, BatchStatus, str | None]:
-    """Top-level (picklable) worker. Runs one ``.raw`` → bundle conversion.
-
-    ``progress_cb`` is intentionally ``None`` here — per-scan
-    ``StreamProgress`` events from N workers would interleave on stderr
-    and be unreadable. The parent emits one batch-level event per file
-    completion instead.
-
-    Exceptions are stringified inside the worker (some pythonnet
-    ``.NET`` exception subclasses don't pickle cleanly across
-    processes); the worker returns ``(bundle_dir, 'error', detail)``
-    rather than re-raising.
-    """
-    try:
-        _convert_one_file(
-            src_str,
-            bundle_dir_str,
-            rt_bin_width_s=rt_bin_width_s,
-            profile=profile,
-            centroider=centroider,
-            capture_trailer_extras=capture_trailer_extras,
-            batch_size=batch_size,
-            compute_sha256=compute_sha256,
-            force=force,
-            allow_empty_levels=allow_empty_levels,
-            progress_cb=None,
-        )
-        return bundle_dir_str, "ok", None
-    except Exception as exc:  # noqa: BLE001
-        return bundle_dir_str, "error", f"{type(exc).__name__}: {exc}"
-
-
 def _bundle_dir_for(path: Path, output_parent: Path) -> Path:
     return output_parent / path.stem
 
@@ -129,7 +65,7 @@ def convert_batch(
     allow_empty_levels: bool = False,
     progress_cb: ProgressCallback | None = None,
 ) -> list[BatchResult]:
-    """Convert ``N`` ``.raw`` files into ``N`` bundles, optionally in parallel.
+    """Convert ``N`` ``.raw`` files into ``N`` bundles, in ``n_workers`` processes.
 
     Steps:
 
@@ -137,18 +73,14 @@ def convert_batch(
        per input stem) must be pairwise distinct.
     2. Pre-filter — when ``force=False``, any path whose
        ``<output_parent>/<stem>/manifest.json`` already exists is
-       marked ``'skipped'`` and never dispatched to a worker.
-    3. Clamp ``n_workers`` to ``max(1, min(n_workers, len(remaining)))``.
-    4. Fan out remaining paths. When ``n_workers <= 1`` the call runs
-       inline (no subprocess) to keep one-file batches cheap and to
-       give tests a CLR-free path that doesn't need real ``.raw``
-       fixtures. Otherwise: spawn-mode :class:`ProcessPoolExecutor`.
-    5. Aggregate. Returns one :class:`BatchResult` per input in the
-       original ``paths`` order.
+       marked ``'skipped'`` and never converted.
+    3. Convert the rest, their scan ranges sharing one pool (in this
+       process when ``n_workers <= 1``).
+    4. Aggregate. Returns one :class:`BatchResult` per input in the
+       original ``paths`` order; a file that fails does not stop the others.
 
-    ``progress_cb`` here is the *batch-level* progress callback; workers
-    receive ``progress_cb=None`` unconditionally (see
-    :func:`_convert_one_worker`).
+    ``progress_cb`` is the *batch-level* progress callback: one event per
+    file finished.
     """
     if not paths:
         raise ValueError("convert_batch: paths is empty")
@@ -170,139 +102,70 @@ def convert_batch(
     output_parent.mkdir(parents=True, exist_ok=True)
 
     # Pre-filter: skip paths whose bundle already has a manifest.json
-    # (the last file convert() writes — its presence is a strong
+    # (the last file a conversion writes — its presence is a strong
     # "completed" signal). --force re-converts unconditionally.
-    skipped: list[BatchResult] = []
+    results: dict[Path, BatchResult] = {}
     pending: list[tuple[Path, Path]] = []
     for path, bundle in zip(paths, bundle_dirs):
         if not force and (bundle / MANIFEST_FILENAME).is_file():
-            skipped.append(
-                BatchResult(
-                    input_path=path,
-                    bundle_dir=bundle,
-                    status="skipped",
-                    detail=None,
-                )
-            )
+            results[path] = BatchResult(path, bundle, "skipped")
         else:
             pending.append((path, bundle))
 
     total = len(paths)
-    n_pending = len(pending)
     emit_start(
         progress_cb,
         _STAGE,
         total=total,
-        message=(
-            f"{n_pending} to convert, {len(skipped)} skipped "
-            f"({total} total)"
-        ),
+        message=f"{len(pending)} to convert, {total - len(pending)} skipped ({total} total)",
     )
-
-    # Emit progress events for the skipped paths up front so the
-    # running total stays meaningful from the user's perspective.
     completed = 0
-    for r in skipped:
+    for r in results.values():
         completed += 1
         emit_progress(
-            progress_cb,
-            _STAGE,
-            completed=completed,
-            total=total,
+            progress_cb, _STAGE, completed=completed, total=total,
             message=f"skipped {r.input_path.name}",
         )
 
-    results_by_path: dict[Path, BatchResult] = {r.input_path: r for r in skipped}
+    options = ConvertOptions(
+        read=ReadOptions(
+            profile=profile, centroider=centroider, capture_trailer_extras=capture_trailer_extras
+        ),
+        rt_bin_width_s=rt_bin_width_s,
+        batch_size=batch_size,
+        compute_sha256=compute_sha256,
+        allow_empty_levels=allow_empty_levels,
+    )
+    jobs = {_Job(path, bundle, options, force=force): path for path, bundle in pending}
 
-    if pending:
-        n_workers_eff = max(1, min(n_workers, n_pending))
-        worker_kwargs = dict(
-            rt_bin_width_s=rt_bin_width_s,
-            profile=profile,
-            centroider=centroider,
-            capture_trailer_extras=capture_trailer_extras,
-            batch_size=batch_size,
-            compute_sha256=compute_sha256,
-            force=force,
-            allow_empty_levels=allow_empty_levels,
+    def on_done(job: _Job) -> None:
+        nonlocal completed
+        path = jobs[job]
+        if job.error is None:
+            results[path] = BatchResult(path, job.out_dir, "ok")
+        else:
+            results[path] = BatchResult(
+                path, job.out_dir, "error", f"{type(job.error).__name__}: {job.error}"
+            )
+        completed += 1
+        emit_progress(
+            progress_cb, _STAGE, completed=completed, total=total,
+            message=f"{path.name} → {results[path].status}",
         )
 
-        if n_workers_eff <= 1:
-            # Inline path — no subprocess. Used for single-file batches
-            # AND for tests (the spawn child process re-imports the
-            # module fresh, so parent-side monkeypatching of
-            # _convert_one_file would not propagate).
-            for path, bundle in pending:
-                bundle_str, status, detail = _convert_one_worker(
-                    str(path), str(bundle), **worker_kwargs
-                )
-                results_by_path[path] = BatchResult(
-                    input_path=path,
-                    bundle_dir=Path(bundle_str),
-                    status=status,
-                    detail=detail,
-                )
-                completed += 1
-                emit_progress(
-                    progress_cb,
-                    _STAGE,
-                    completed=completed,
-                    total=total,
-                    message=f"{path.name} → {status}",
-                )
-        else:
-            ctx = get_context("spawn")
-            with ProcessPoolExecutor(
-                max_workers=n_workers_eff, mp_context=ctx
-            ) as ex:
-                future_to_path: dict = {}
-                for path, bundle in pending:
-                    fut = ex.submit(
-                        _convert_one_worker,
-                        str(path),
-                        str(bundle),
-                        **worker_kwargs,
-                    )
-                    future_to_path[fut] = path
-                for fut in as_completed(future_to_path):
-                    path = future_to_path[fut]
-                    try:
-                        bundle_str, status, detail = fut.result()
-                    except Exception as exc:  # noqa: BLE001
-                        # Worker process crashed before returning — e.g.
-                        # killed by OOM. Surface as a per-file error so
-                        # the rest of the batch still completes.
-                        bundle_str = str(_bundle_dir_for(path, output_parent))
-                        status = "error"
-                        detail = f"{type(exc).__name__}: {exc}"
-                    results_by_path[path] = BatchResult(
-                        input_path=path,
-                        bundle_dir=Path(bundle_str),
-                        status=status,
-                        detail=detail,
-                    )
-                    completed += 1
-                    emit_progress(
-                        progress_cb,
-                        _STAGE,
-                        completed=completed,
-                        total=total,
-                        message=f"{path.name} → {status}",
-                    )
+    if jobs:
+        _run_jobs(list(jobs), workers=max(1, n_workers), on_done=on_done)
 
-    n_ok = sum(1 for r in results_by_path.values() if r.status == "ok")
-    n_skip = sum(1 for r in results_by_path.values() if r.status == "skipped")
-    n_err = sum(1 for r in results_by_path.values() if r.status == "error")
+    n_ok = sum(1 for r in results.values() if r.status == "ok")
+    n_skip = sum(1 for r in results.values() if r.status == "skipped")
+    n_err = sum(1 for r in results.values() if r.status == "error")
     emit_done(
-        progress_cb,
-        _STAGE,
-        completed=completed,
-        total=total,
+        progress_cb, _STAGE, completed=completed, total=total,
         message=f"{n_ok} succeeded, {n_skip} skipped, {n_err} failed",
     )
 
     # Return in original input order — callers and tests depend on this.
-    return [results_by_path[p] for p in paths]
+    return [results[p] for p in paths]
 
 
 __all__ = [

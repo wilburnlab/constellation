@@ -11,11 +11,12 @@ A single converted ``.raw`` produces a directory containing
   tune-data keys present) so a consumer can decide which bundles to
   open without paying parquet-read cost on every one.
 
-Schema v1 is the initial Constellation port. Manifests bump
-``schema_version`` on any additive change. The reader rejects manifests
-whose version it doesn't recognise — the bundle producer's command
-should be re-run rather than the reader hand-coerced into an older
-shape.
+Schema v1 is the initial Constellation port, with the peaks in one
+``peaks.parquet``. v2 (2026-10-26) writes them as ``peaks/part-NNNNN.parquet``
+(``outputs.peaks`` names whichever; ``massspec.bundle`` reads both) and
+adds the parameters ``peaks``, ``centroider`` and ``workers``. The reader
+accepts both and rejects any other version — the bundle producer's command
+should be re-run rather than the reader hand-coerced into an older shape.
 
 Modelled on :mod:`constellation.sequencing.transcriptome.manifest` —
 same JSON layout + dataclass dispatch + ISO-8601 ``created_at`` so
@@ -32,7 +33,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 MANIFEST_FILENAME = "manifest.json"
 BUNDLE_KIND = "thermo_acquisition"
 
@@ -47,15 +49,16 @@ class ThermoAcquisitionManifest:
     source_file: str
     source_sha256: str | None
     # Convert-time parameters: ``rt_bin_width_s`` (the parquet row-group
-    # chunking knob), ``profile_mode`` (Thermo segmented-scan flag),
+    # chunking knob), ``profile_mode`` (the ``--profile`` flag), ``peaks``
+    # (``centroid`` / ``profile``), ``centroider``, ``workers``,
     # ``dll_version`` (e.g. ``"1.4.5"`` from ``third_party/thermo/<v>/``),
-    # ``dotnet_runtime`` (e.g. ``"net8.0"``), plus anything else worth
-    # recording (input flags the user passed at the CLI).
+    # plus anything else worth recording (input flags the user passed at
+    # the CLI).
     parameters: dict[str, Any]
-    # Path mappings from semantic name → relative filename inside the
-    # bundle directory. v1 keys: ``peaks``, ``scan_metadata``,
-    # ``acquisition_metadata``. Future readers add keys without breaking
-    # existing consumers.
+    # Path mappings from semantic name → relative path inside the bundle
+    # directory: ``peaks`` (``peaks`` in v2, ``peaks.parquet`` in v1),
+    # ``scan_metadata``, ``acquisition_metadata``. Future readers add keys
+    # without breaking existing consumers.
     outputs: dict[str, str]
     # Small instrument/run summary so the dashboard / cross-bundle
     # walker can sort and filter without opening parquets. ``tune_data``
@@ -102,10 +105,11 @@ def read_manifest(path: Path) -> ThermoAcquisitionManifest:
     """
     raw = json.loads(path.read_text(encoding="utf-8"))
     schema_version = raw.get("schema_version")
-    if schema_version != MANIFEST_SCHEMA_VERSION:
+    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
         raise ValueError(
             f"manifest at {path} has schema_version={schema_version!r}; "
-            f"this constellation supports v{MANIFEST_SCHEMA_VERSION}. "
+            f"this constellation supports "
+            f"{', '.join(f'v{v}' for v in SUPPORTED_SCHEMA_VERSIONS)}. "
             "Re-run `constellation massspec convert` to refresh the bundle."
         )
     kind = raw.get("kind")

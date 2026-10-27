@@ -2,8 +2,9 @@
 
 A bundle (``massspec convert`` from a Thermo ``.raw``, or ``massspec
 encyclopedia import-spectra`` from an EncyclopeDIA spectra file) is a
-directory of ``peaks.parquet`` (one row per peak, in scan order),
-``scan_metadata.parquet`` (one row per scan) and a manifest. The batch code
+directory of peaks (one row per peak, in scan order, found through
+``massspec.bundle``), ``scan_metadata.parquet`` (one row per scan) and a
+manifest. The batch code
 in ``quant`` reads it whole; this module reads the pieces an interactive
 view needs, quickly:
 
@@ -19,7 +20,7 @@ view needs, quickly:
   a scan sits in one or two row groups);
 - :func:`xic` — extracted-ion chromatograms of a set of m/z values in one
   level (and DIA window), from the peak index when the bundle has one and
-  otherwise from ``peaks.parquet`` within a retention-time window;
+  otherwise from the peaks within a retention-time window;
 - :func:`locate_precursor` — the window a precursor was isolated in and
   the scans nearest its apex.
 
@@ -45,6 +46,7 @@ from constellation.massspec.acquisition_structure import (
     AcquisitionType,
     infer_acquisition_structure,
 )
+from constellation.massspec.bundle import peaks_dataset
 from constellation.massspec.quant.peak_index import (
     find_peak_index,
     index_partition,
@@ -383,7 +385,7 @@ def dependent_scans(scans: pa.Table, scan: int) -> list[int]:
 
 
 def _peaks(bundle_dir: Path | str) -> ds.Dataset:
-    return ds.dataset(Path(bundle_dir) / "peaks.parquet")
+    return peaks_dataset(bundle_dir)
 
 
 def spectrum(bundle_dir: Path | str, scan: int) -> pa.Table:
@@ -455,7 +457,7 @@ def xic(
     the bundle's :func:`scan_table`, when the caller already holds it.
 
     With a peak index (and ``use_index``), each trace is one m/z slice of
-    its partition. Without one, the read is ``peaks.parquet`` restricted to
+    its partition. Without one, the read is the bundle's peaks restricted to
     the scans in range: well under a second for a few minutes of a 100-min
     run, several seconds for the whole of it (the browser's payload survey).
     """

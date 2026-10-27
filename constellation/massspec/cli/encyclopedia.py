@@ -42,8 +42,9 @@ def _build_encyclopedia_parser(subs: argparse._SubParsersAction) -> None:
         ),
     )
     e.add_argument("--peaks-dir", type=Path, nargs="+", required=True,
-                   help="Convert bundle(s): directories holding peaks.parquet + "
-                        "scan_metadata.parquet + acquisition_metadata.parquet.")
+                   help="Convert bundle(s): directories `massspec convert` or "
+                        "`import-spectra` wrote (peaks, scan_metadata.parquet, "
+                        "acquisition_metadata.parquet).")
     e.add_argument("--output-file", type=Path, required=True,
                    help="The spectra file to write; must end in .dia, the extension "
                         "EncyclopeDIA expects. A scan map (<name>.dia.scans.parquet) "
@@ -69,7 +70,7 @@ def _build_encyclopedia_parser(subs: argparse._SubParsersAction) -> None:
     i.add_argument("-o", "--output-dir", type=Path, required=True,
                    help="Parent directory; each bundle is <output-dir>/<run name>/.")
     i.add_argument("--rt-bin-width", type=float, default=60.0, dest="rt_bin_width_s",
-                   help="Row-group RT chunking of peaks.parquet, seconds (default 60).")
+                   help="Row-group RT chunking of the peaks, seconds (default 60).")
     i.add_argument("--force", action="store_true",
                    help="Replace existing bundles.")
     i.add_argument("--no-progress", action="store_true",

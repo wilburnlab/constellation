@@ -26,6 +26,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from constellation.massspec.acquisition_structure import infer_acquisition_structure
+from constellation.massspec.bundle import peaks_dataset
 from constellation.massspec.io.encyclopedia import (
     DiaFile,
     DiaReader,
@@ -174,6 +175,17 @@ def test_export_reads_scan_range_from_filter_string_for_older_bundles(tmp_path: 
         tmp_path / "v2.dia",
     )
     assert diff_dia(new.path, old.path).identical
+
+
+def test_export_reads_either_peak_layout(tmp_path: Path) -> None:
+    """Peaks as parts (bundle manifest v2) and as one file (v1) give one file."""
+    scans = _dia_scans(empty_scan=7)
+    parts = write_dia([_write_bundle(tmp_path / "parts", "run", scans)], tmp_path / "parts.dia")
+    single = write_dia(
+        [_write_bundle(tmp_path / "file", "run", scans, layout="file")], tmp_path / "file.dia"
+    )
+    assert (tmp_path / "parts" / "run" / "peaks" / "part-00001.parquet").is_file()
+    assert diff_dia(parts.path, single.path).identical
 
 
 def test_export_is_atomic_and_refuses_to_overwrite(tmp_path: Path) -> None:
@@ -364,7 +376,8 @@ def test_import_round_trip_single_run(tmp_path: Path) -> None:
     assert bundle.name == "run_a"
 
     # The bundle has the shape `massspec convert` writes.
-    peaks = pq.read_table(bundle / "peaks.parquet")
+    assert [p.name for p in (bundle / "peaks").iterdir()] == ["part-00000.parquet"]
+    peaks = peaks_dataset(bundle).to_table()
     meta = pq.read_table(bundle / "scan_metadata.parquet")
     assert peaks.schema.equals(MS_PEAK_TABLE) and meta.schema.equals(SCAN_METADATA_TABLE)
     assert peaks.num_rows == sum(s["mz"].size for s in scans)

@@ -1,6 +1,6 @@
 """``ms_spectrum`` — the peaks of one scan, annotated when a peptide is given.
 
-Read from ``peaks.parquet`` through row-group pruning on the scan number
+Read from the bundle's peaks through row-group pruning on the scan number
 (rows are in scan order). A centroided scan is sent whole; a profile scan
 long enough to need it is reduced to what the requested width shows.
 With a peptide (``modified_sequence`` and ``charge``) each peak carries the

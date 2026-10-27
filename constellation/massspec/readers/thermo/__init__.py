@@ -14,8 +14,10 @@ Submodules:
   peaks as numpy arrays); decides how each scan's peaks are made
   (stored centroids, the instrument's centroid stream, Thermo's
   centroider, or profile points).
-- ``_read`` — :class:`ThermoReader` (in-memory ``RawReader``) +
-  :func:`convert` (streaming-to-disk writer used by the CLI).
+- ``_read`` — :class:`ThermoReader` (in-memory ``RawReader``), run
+  metadata and the per-level summary.
+- ``_convert`` — :func:`convert`: scan ranges read in worker processes,
+  one peak part per range, the bundle finished in the parent.
 - ``manifest`` — :class:`ThermoAcquisitionManifest` dataclass + JSON
   reader/writer for the per-bundle ``manifest.json``.
 
@@ -32,13 +34,13 @@ from __future__ import annotations
 from ._batch import BatchResult, BatchStatus, convert_batch
 from ._filter import parse_filter_string
 from ._netruntime import is_thermo_available, load_clr, require_thermo
+from constellation.massspec.bundle import DEFAULT_RT_BIN_WIDTH_S
+
+from ._convert import DEFAULT_BATCH_SIZE, convert, default_workers, plan_ranges
 from ._read import (
-    DEFAULT_BATCH_SIZE,
-    DEFAULT_RT_BIN_WIDTH_S,
     SOURCE_FORMAT,
     EmptyLevelError,
     ThermoReader,
-    convert,
     describe_levels,
     level_summary,
 )
@@ -67,11 +69,13 @@ __all__ = [
     "ThermoReader",
     "convert",
     "convert_batch",
+    "default_workers",
     "describe_levels",
     "is_thermo_available",
     "level_summary",
     "load_clr",
     "parse_filter_string",
+    "plan_ranges",
     "read_manifest",
     "read_manifest_dir",
     "require_thermo",

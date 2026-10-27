@@ -105,8 +105,14 @@ def write_bundle(
     *,
     profile: bool = False,
     drop_scan_window_columns: bool = False,
+    layout: str = "parts",
 ) -> Path:
-    """Write ``scans`` as a bundle shaped like ``massspec convert`` output."""
+    """Write ``scans`` as a bundle shaped like ``massspec convert`` output.
+
+    ``layout="parts"`` writes the peaks as two parts, the scans split
+    between them (``peaks/part-0000{0,1}.parquet``, manifest v2);
+    ``layout="file"`` as one ``peaks.parquet`` (bundles before v2).
+    """
     bundle = root / name
     bundle.mkdir(parents=True)
     peak_rows: dict[str, list[Any]] = {f.name: [] for f in MS_PEAK_TABLE}
@@ -125,14 +131,20 @@ def write_bundle(
         if s["level"] == 1 and not drop_scan_window_columns:
             row["scan_window_lower"], row["scan_window_upper"] = 350.0, 1250.0
         meta_rows.append(row)
-    pq.write_table(
-        pa.table(
-            {k: pa.array(v, MS_PEAK_TABLE.field(k).type) for k, v in peak_rows.items()},
-            schema=MS_PEAK_TABLE,
-        ),
-        bundle / "peaks.parquet",
-        row_group_size=17,  # scans straddle row groups
+    peaks = pa.table(
+        {k: pa.array(v, MS_PEAK_TABLE.field(k).type) for k, v in peak_rows.items()},
+        schema=MS_PEAK_TABLE,
     )
+    if layout == "file":
+        pq.write_table(peaks, bundle / "peaks.parquet", row_group_size=17)
+    else:
+        # Split at a scan boundary near the middle; within each part, scans
+        # still straddle row groups.
+        scan_col = peaks.column("scan").to_numpy()
+        cut = int(np.searchsorted(scan_col, scan_col[len(scan_col) // 2])) if len(scan_col) else 0
+        (bundle / "peaks").mkdir()
+        for i, part in enumerate((peaks.slice(0, cut), peaks.slice(cut))):
+            pq.write_table(part, bundle / "peaks" / f"part-{i:05d}.parquet", row_group_size=17)
     scan_table = pa.Table.from_pylist(meta_rows, schema=SCAN_METADATA_TABLE)
     if drop_scan_window_columns:  # a bundle written before schema v3
         scan_table = scan_table.drop_columns(["scan_window_lower", "scan_window_upper"])
@@ -171,14 +183,20 @@ def with_scan_stats(scans: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def write_bundle_manifest(bundle: Path, *, kind: str = "thermo_acquisition") -> Path:
     """Give a :func:`write_bundle` directory the manifest a real bundle has."""
     name = bundle.name
+    parts = (bundle / "peaks").is_dir()
     (bundle / "manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2 if parts else 1,
                 "kind": kind,
                 "source_file": f"/data/{name}.raw",
                 "source_sha256": f"sha-of-{name}",
                 "parameters": {"rt_bin_width_s": 60.0, "profile_mode": False},
+                "outputs": {
+                    "peaks": "peaks" if parts else "peaks.parquet",
+                    "scan_metadata": "scan_metadata.parquet",
+                    "acquisition_metadata": "acquisition_metadata.parquet",
+                },
                 "run_metadata": {
                     "instrument_model": "Stellar",
                     "instrument_serial": "QLT-S-10199",

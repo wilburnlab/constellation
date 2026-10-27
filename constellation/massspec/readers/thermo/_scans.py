@@ -79,11 +79,18 @@ _EMPTY = np.empty(0, dtype=np.float64)
 
 
 def _as_numpy(net_array) -> np.ndarray:
-    """A .NET ``Double[]`` as a float64 numpy array (empty for None)."""
+    """A copy of a .NET ``Double[]`` as a float64 numpy array (empty for None).
+
+    A copy, not a view: a view pins the .NET array for as long as it lives,
+    and a block's worth of pinned arrays (512 scans) made every collection
+    of the .NET heap slower and more frequent. On ion-trap profile scans,
+    whose centroiding allocates large arrays, holding views cost 6.5 ms a
+    scan against 1.1 ms copying (2026-10-26).
+    """
     if net_array is None:
         return _EMPTY
     try:
-        return np.frombuffer(net_array, dtype=np.float64)
+        return np.frombuffer(net_array, dtype=np.float64).copy()
     except TypeError:  # pythonnet without the buffer protocol on arrays
         return np.fromiter(net_array, dtype=np.float64, count=len(net_array))
 

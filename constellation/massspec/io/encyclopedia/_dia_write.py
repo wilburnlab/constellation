@@ -1,8 +1,8 @@
 """Write an EncyclopeDIA ``.dia`` (format 0.8.0) from Constellation peak bundles.
 
 The input is one or more bundles as written by ``massspec convert``
-(``peaks.parquet`` + ``scan_metadata.parquet`` +
-``acquisition_metadata.parquet`` + ``manifest.json``). One bundle gives a
+(the peaks, ``scan_metadata.parquet``, ``acquisition_metadata.parquet``
+and ``manifest.json``; the peaks are read through ``massspec.bundle``). One bundle gives a
 single-run ``.dia``; several give a merged one with each bundle as a
 ``Fraction``, which is how gas-phase fractions are searched together.
 
@@ -105,6 +105,7 @@ from constellation.massspec.acquisition_structure import (
     AcquisitionStructure,
     infer_acquisition_structure,
 )
+from constellation.massspec.bundle import has_peaks, iter_peak_batches
 from constellation.massspec.io.encyclopedia._codec import encode_f4, encode_f8
 from constellation.massspec.io.encyclopedia._schema import (
     DIA_FORMAT_VERSION,
@@ -230,12 +231,17 @@ class _Bundle:
 
 def _load_bundle(path: Path) -> _Bundle:
     path = Path(path)
-    for name in ("peaks.parquet", "scan_metadata.parquet", "acquisition_metadata.parquet"):
-        if not (path / name).is_file():
-            raise FileNotFoundError(
-                f"{path} is not a peak bundle: missing {name} "
-                f"(expected the directory `massspec convert` writes)"
-            )
+    missing = [
+        name for name in ("scan_metadata.parquet", "acquisition_metadata.parquet")
+        if not (path / name).is_file()
+    ]
+    if not has_peaks(path):
+        missing.insert(0, "its peaks")
+    if missing:
+        raise FileNotFoundError(
+            f"{path} is not a peak bundle: missing {', '.join(missing)} "
+            f"(expected the directory `massspec convert` writes)"
+        )
     acq = pq.read_table(path / "acquisition_metadata.parquet").to_pylist()[0]
     if acq.get("profile_mode"):
         raise ValueError(
@@ -372,20 +378,22 @@ def _scan_rows(bundle: _Bundle) -> _ScanRows:
 
 
 def _iter_scan_peaks(
-    peaks_path: Path, batch_rows: int
+    bundle_path: Path, batch_rows: int
 ) -> Iterator[tuple[int, np.ndarray, np.ndarray]]:
     """Yield ``(scan, mz, intensity)`` for each scan that has peaks.
 
-    ``peaks.parquet`` is one row per peak, scan-major. A scan can straddle
-    two record batches (row groups are cut on RT bins and on pyarrow's
-    own size limit, neither of which respects scan boundaries), so the
-    trailing scan of each batch is carried into the next.
+    A bundle's peaks are one row per peak, scan-major, across its peak
+    files in order. A scan can straddle two record batches (row groups
+    are cut on RT bins and on pyarrow's own size limit, neither of which
+    respects scan boundaries), so the trailing scan of each batch is
+    carried into the next.
     """
     carry_scan: int | None = None
     carry_mz: list[np.ndarray] = []
     carry_int: list[np.ndarray] = []
-    pf = pq.ParquetFile(peaks_path)
-    for batch in pf.iter_batches(batch_size=batch_rows, columns=["scan", "mz", "intensity"]):
+    for batch in iter_peak_batches(
+        bundle_path, columns=["scan", "mz", "intensity"], batch_rows=batch_rows
+    ):
         scan = batch.column(0).to_numpy()
         mz = batch.column(1).to_numpy()
         inten = batch.column(2).to_numpy()
@@ -711,11 +719,11 @@ def _write_fraction(
     """Insert one bundle's scans. Returns ``(sum of MS1 TIC, window stats)``.
 
     Scan metadata drives the loop, not the peak table: a scan with no
-    peaks has no rows in ``peaks.parquet`` but still exists, and is
+    peaks has no peak rows but still exists, and is
     written with empty arrays.
     """
     empty = np.empty(0)
-    peaks = _iter_scan_peaks(bundle.path / "peaks.parquet", batch_rows)
+    peaks = _iter_scan_peaks(bundle.path, batch_rows)
     pending = next(peaks, None)
     tic_sum = 0.0
     # (lower, upper) → [n scans, first rt, last rt, first exact rt, last exact rt]
@@ -733,7 +741,7 @@ def _write_fraction(
             sc = int(rows.scan[i])
             if pending is not None and pending[0] < sc:
                 raise ValueError(
-                    f"{bundle.path}: peaks.parquet has scan {pending[0]}, which "
+                    f"{bundle.path}: the peaks have scan {pending[0]}, which "
                     f"scan_metadata.parquet does not list"
                 )
             if pending is not None and pending[0] == sc:
@@ -776,7 +784,7 @@ def _write_fraction(
             con.executemany(insert_ms2, ms2_rows)
     if pending is not None:
         raise ValueError(
-            f"{bundle.path}: peaks.parquet has scan {pending[0]}, which "
+            f"{bundle.path}: the peaks have scan {pending[0]}, which "
             f"scan_metadata.parquet does not list"
         )
     return tic_sum, windows

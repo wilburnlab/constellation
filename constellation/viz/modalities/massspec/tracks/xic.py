@@ -2,7 +2,7 @@
 
 One trace per m/z over one MS level (and DIA window) within an RT window,
 zero where the ion is absent (``massspec.scans.xic``): from the bundle's
-peak index when it has one, otherwise from ``peaks.parquet`` restricted to
+peak index when it has one, otherwise from the bundle's peaks restricted to
 the window, which takes a fraction of a second for a few minutes of a run
 and several seconds for all of it. The m/z values say what to trace — a
 precursor's isotopes, a peptide's fragments, a peak a user clicked — so

@@ -65,6 +65,7 @@ from constellation.core.io.schemas import cast_to_schema
 from constellation.core.sequence.proforma import Peptidoform, parse_proforma
 from constellation.core.signal import bounds_within_tolerance, nearest_within_tolerance
 from constellation.core.stats.units import ISOTOPE_MASS_DIFF
+from constellation.massspec.bundle import open_peaks
 from constellation.massspec.peptide.envelope import peptide_envelope
 from constellation.massspec.peptide.ions import IonType, fragment_ladder_indices_batch
 from constellation.massspec.quant.peak_index import read_manifest as read_index_manifest
@@ -1114,12 +1115,7 @@ def _enrich_exact_error(table: pa.Table, peaks_dir: Path | str, level: int) -> p
     if not pc.any(matched).as_py():
         return table
     src = peaks_dir
-    p = Path(peaks_dir)
-    dataset = (
-        ds.dataset(p / "peaks.parquet")
-        if (p / "peaks.parquet").exists()
-        else ds.dataset(p)
-    )
+    dataset = open_peaks(peaks_dir)
     canon = dataset.to_table(
         columns=["scan", "level", "mz", "intensity"],
         filter=ds.field("level") == level,

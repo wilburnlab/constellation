@@ -8,10 +8,9 @@ Two surfaces:
   acquisition-level metadata tables. Suitable for small files in
   notebooks; full read fits in RAM.
 
-- :func:`convert` is the streaming-to-disk entry point used by
-  ``constellation massspec convert``. It produces a directory bundle
-  (``manifest.json`` + ``peaks.parquet`` + ``scan_metadata.parquet`` +
-  ``acquisition_metadata.parquet``) with bounded RAM.
+- The run-level metadata, the scan-table summaries and the file opening
+  that :func:`._convert.convert` (``constellation massspec convert``,
+  streaming to a bundle with bounded RAM) builds on.
 
 Peaks are centroids by default: the instrument's where it stored them, and
 Thermo's centroider (``Scan.ToCentroid``) run on profile scans that have no
@@ -22,23 +21,15 @@ keeps profile points instead. Each scan records which in
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import shutil
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.parquet as pq
 
 from constellation.core.io.bundle import Bundle
 from constellation.core.io.readers import RawReader, ReadResult, register_reader
-from constellation.core.progress import ProgressCallback, emit_done, emit_progress, emit_start
-
-from constellation.massspec.bundle import DEFAULT_RT_BIN_WIDTH_S, PeakWriter
 from constellation.massspec.schemas import (
     ACQUISITION_METADATA_SCHEMA_VERSION,
     ACQUISITION_METADATA_TABLE,
@@ -55,21 +46,6 @@ logger = logging.getLogger(__name__)
 
 SOURCE_FORMAT = "thermo_raw"
 DEFAULT_BATCH_SIZE = DEFAULT_BLOCK_SCANS
-_SHA256_CHUNK_SIZE = 1 << 20  # 1 MiB
-
-PEAKS_FILENAME = "peaks.parquet"
-SCAN_METADATA_FILENAME = "scan_metadata.parquet"
-ACQUISITION_METADATA_FILENAME = "acquisition_metadata.parquet"
-# What a conversion writes into a bundle directory, and what a forced
-# re-conversion clears first (a peak index built from the old peaks too).
-_BUNDLE_OUTPUTS = (
-    "manifest.json",
-    PEAKS_FILENAME,
-    "peaks",
-    SCAN_METADATA_FILENAME,
-    ACQUISITION_METADATA_FILENAME,
-    "mz_index",
-)
 
 # How a level's peaks were made, as the conversion summary says it.
 _MADE_BY = {
@@ -422,199 +398,11 @@ def _scan_range(raw) -> tuple[int, int]:
     return int(header.FirstSpectrum), int(header.LastSpectrum)
 
 
-# ── streaming convert ─────────────────────────────────────────────────
-
-
-def _sha256_file(path: Path, stop: threading.Event | None = None) -> str | None:
-    """The file's SHA-256, or None if ``stop`` was set before it finished."""
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        while chunk := f.read(_SHA256_CHUNK_SIZE):
-            if stop is not None and stop.is_set():
-                return None
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _clear_outputs(out_dir: Path) -> None:
-    for name in _BUNDLE_OUTPUTS:
-        target = out_dir / name
-        if target.is_dir() and not target.is_symlink():
-            shutil.rmtree(target)
-        elif target.exists() or target.is_symlink():
-            target.unlink()
-
-
-def _dll_version() -> str | None:
-    from constellation.thirdparty import registry as _registry
-
-    handle = _registry.try_find("thermo")
-    return handle.version if handle is not None else None
-
-
-def convert(
-    source: "str | Path",
-    output_dir: "str | Path",
-    *,
-    rt_bin_width_s: float = DEFAULT_RT_BIN_WIDTH_S,
-    profile: bool = False,
-    centroider: str = THERMO,
-    capture_trailer_extras: bool = True,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    compute_sha256: bool = True,
-    force: bool = False,
-    allow_empty_levels: bool = False,
-    progress_cb: ProgressCallback | None = None,
-):
-    """Stream a Thermo ``.raw`` into a directory bundle.
-
-    Produces ``<output_dir>/manifest.json`` + ``peaks.parquet`` +
-    ``scan_metadata.parquet`` + ``acquisition_metadata.parquet``. The
-    peak table is written in scan order with a row group per
-    ``rt_bin_width_s`` of retention time; the manifest is written last, so
-    a bundle without one is unfinished.
-
-    ``profile`` keeps profile points; otherwise profile scans are
-    centroided, by ``centroider`` where the instrument stored no centroids.
-    A level whose scans all come out without peaks fails the conversion
-    unless ``allow_empty_levels``. A failed conversion removes what it
-    wrote. ``batch_size`` is the number of scans read per block.
-
-    ``progress_cb`` receives ``stage_start`` / ``stage_progress`` /
-    ``stage_done`` events tagged with stage ``"thermo_convert"``.
-    """
-    from .manifest import MANIFEST_FILENAME, write_manifest
-
-    options = ReadOptions(
-        profile=profile, centroider=centroider, capture_trailer_extras=capture_trailer_extras
-    )
-    src = Path(source)
-    out_dir = Path(output_dir)
-
-    if not src.exists():
-        raise FileNotFoundError(f"Thermo .raw not found: {src}")
-    if not src.is_file():
-        raise IsADirectoryError(f"expected a .raw file, got directory: {src}")
-
-    if out_dir.exists():
-        if any(out_dir.iterdir()):
-            if not force:
-                raise FileExistsError(
-                    f"bundle dir is non-empty: {out_dir}\n"
-                    f"  pass --force to overwrite, or choose a different output dir"
-                )
-            _clear_outputs(out_dir)
-    else:
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-    emit_start(progress_cb, "thermo_convert", message=f"opening {src.name}")
-
-    peaks_path = out_dir / PEAKS_FILENAME
-    scan_meta_path = out_dir / SCAN_METADATA_FILENAME
-    acq_path = out_dir / ACQUISITION_METADATA_FILENAME
-
-    # The file is hashed in a thread while it is converted; hashlib releases
-    # the GIL on large updates.
-    hasher = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sha256")
-    stop_hashing = threading.Event()
-    try:
-        sha_future = (
-            hasher.submit(_sha256_file, src.resolve(), stop_hashing) if compute_sha256 else None
-        )
-        scan_tables: list[pa.Table] = []
-        with _open_raw_file(src) as raw:
-            run_meta = _build_run_metadata(raw, src)
-            first, last = _scan_range(raw)
-            n_total = max(last - first + 1, 0)
-            emit_progress(
-                progress_cb, "thermo_convert", completed=0, total=n_total,
-                message=f"{n_total} scans",
-            )
-            done = 0
-            with PeakWriter(peaks_path, rt_bin_width_s=rt_bin_width_s) as writer:
-                for block in iter_scan_blocks(
-                    raw, first, last, options, max_block_scans=batch_size
-                ):
-                    writer.write(block.peak_table())
-                    scan_tables.append(block.scans)
-                    done += block.scans.num_rows
-                    emit_progress(progress_cb, "thermo_convert", completed=done, total=n_total)
-
-        scan_meta_table = _concat_scans(scan_tables)
-        levels = level_summary(scan_meta_table)
-        for line in describe_levels(levels):
-            logger.info("%s: %s", src.name, line)
-        if not allow_empty_levels:
-            _check_levels(levels, scan_meta_table)
-
-        pq.write_table(scan_meta_table, str(scan_meta_path), compression="zstd")
-        acq_table = _build_acquisition_table(run_meta, scan_meta_table)
-        pq.write_table(acq_table, str(acq_path), compression="zstd")
-        sha = sha_future.result() if sha_future is not None else None
-    except BaseException:
-        stop_hashing.set()
-        hasher.shutdown(wait=True, cancel_futures=True)
-        _clear_outputs(out_dir)
-        raise
-    hasher.shutdown(wait=True)
-
-    # Manifest carries an instrument-summary view of run metadata plus
-    # the convert parameters used. tune_data is omitted (full values
-    # live in the acquisition table); we record the key list so
-    # consumers can tell which tune fields were captured.
-    stats = _acquisition_stats(scan_meta_table)
-    summary_run_meta: dict[str, Any] = {
-        "instrument_model": run_meta.get("instrument_model"),
-        "instrument_serial": run_meta.get("instrument_serial"),
-        "hardware_version": run_meta.get("hardware_version"),
-        "software_version": run_meta.get("software_version"),
-        "method_name": run_meta.get("method_name"),
-        "creation_date": run_meta.get("creation_date"),
-        **stats,
-        "levels": levels,
-        "tune_data_keys": [k for k, _ in run_meta.get("tune_data") or ()],
-    }
-
-    parameters = {
-        "rt_bin_width_s": rt_bin_width_s,
-        "profile_mode": profile,
-        "peaks": "profile" if profile else "centroid",
-        "centroider": centroider,
-        "capture_trailer_extras": capture_trailer_extras,
-        "batch_size": batch_size,
-        "dll_version": _dll_version(),
-    }
-
-    manifest = write_manifest(
-        out_dir / MANIFEST_FILENAME,
-        source_file=str(src.resolve()),
-        source_sha256=sha,
-        parameters=parameters,
-        outputs={
-            "peaks": peaks_path.name,
-            "scan_metadata": scan_meta_path.name,
-            "acquisition_metadata": acq_path.name,
-        },
-        run_metadata=summary_run_meta,
-    )
-
-    emit_done(
-        progress_cb,
-        "thermo_convert",
-        completed=stats["n_scans"],
-        total=stats["n_scans"],
-        message=f"{stats['n_scans']} scans → {out_dir}",
-    )
-    return manifest
-
-
 __all__ = [
     "DEFAULT_BATCH_SIZE",
-    "DEFAULT_RT_BIN_WIDTH_S",
     "SOURCE_FORMAT",
     "EmptyLevelError",
     "ThermoReader",
-    "convert",
     "describe_levels",
     "level_summary",
 ]

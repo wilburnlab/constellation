@@ -36,7 +36,43 @@
   - **One exit hang:** once, under memory pressure, a finished conversion spent 2.5 h at
     21 GB in pythonnet's shutdown (`pythonnet.unload` at exit). On a quiet machine that
     shutdown takes about 6 s.
-- **Phases 2–5:** not started.
+- **Phase 2** (peak parts, `massspec/bundle.py`, workers): done. Measured 2026-10-26 on the
+  workstation (i7-8700: 6 cores, 12 threads):
+  - **What it does.**
+    - The driver plans contiguous scan ranges: at least 2,000 scans, about 4 per worker.
+      They run in spawned worker processes, one part per range.
+    - Every worker is started, and opens the file, while the probe runs. CommonCore's first
+      `GetScanEvents` call costs about 1.5 s in every process.
+    - Workers skip pythonnet's CLR shutdown at exit.
+    - `convert_batch` gives every file's ranges to one pool.
+    - `--threads` defaults to the cores, up to 8. The search workflow converts a `.raw` with
+      workers too.
+  - **GPF 900–1000:** 145 s → 20–25 s with 4–8 workers (single process: 30–48 s; this
+    machine's timings vary run to run).
+    - Eight workers are no faster than four here: total CPU time triples at 8, the cost of
+      hyperthreading.
+    - The 8-worker bundle equals the old reader's in every peak (17 parts, 172 row groups
+      against 167).
+  - **Kirby RF30** (18.7 GB, profile ion trap, 236,340 scans): 134–147 s with 8 workers,
+    476 s in one process.
+    - The first attempt took 613 s. The cause was NumPy views over .NET arrays, which pin
+      them: a block of pinned arrays made every .NET collection slower and more frequent, and
+      on these scans Thermo's centroider allocates large arrays. Arrays are now copied out at
+      once: 6.5 → 1.1 ms per scan.
+    - **Per-scan agreement:** an 8-worker run equals the single-process run on every scan
+      (count, sum of m/z, sum of intensity).
+    - **Other runs differed in one or two scans** (±1–3 peaks). The cause is this
+      workstation's memory, not the reader:
+      - The local copy of the file hashed to `7e8a668a…` once and to the original's
+        `41af474e…` three times later. `cmp` finds no differing byte.
+      - A scan's profile points hashed differently at different times, and Thermo's
+        centroider followed its input.
+      - On the same input bytes it gives the same peaks in every process. That held with
+        tiered compilation, dynamic PGO and hardware intrinsics each turned off.
+      - The machine's earlier notes record the same kind of transient read errors.
+    - **To check before relying on it:** a run on reliable hardware (OSC) comparing the
+      worker run with a single-process run.
+- **Phases 3–5:** not started.
 
 ## Why
 
