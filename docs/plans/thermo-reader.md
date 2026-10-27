@@ -91,7 +91,27 @@
     MS2 scan MSRawJava drops).
   - **Orbitrap runs:** monoisotopic m/z gains up to 0.05 mDa, injection times up to 0.0005 ms,
     and isolation widths are the instrument's float32 values. Peaks are unchanged.
-- **Phases 4–5:** not started.
+- **Phase 4** (RawFileReader 8.0.42, instrument metadata): done.
+  - **The installer** fetches Thermo's three nupkgs at commit `cd0a429a` and OpenMcdf 3.1.4 /
+    CommandLineParser 2.9.1 from nuget.org, all SHA-256 pinned. `--legacy-1.4.5` keeps the old
+    pack; `--keep-current` installs beside it.
+  - **Checks:**
+    - 8.0.42 gives identical values to 5.0.0.93 on 9,000 sampled scans of three files.
+    - The GPF bundle is identical in every table under the two versions.
+    - 8.0.42 formats filter strings at 63 µs a scan, close to 5.0's 52 (8.0.6 took 173).
+    - GPF converts in 28 s with 8 workers.
+  - **New acquisition metadata:** the run header, the sample information and each device's
+    instrument-method text.
+  - **The `.dia` writer** writes MSRawJava's `thermo.run.*`, `thermo.sample.*`,
+    `thermo.instrument_method.*`, `run.start_time_iso8601` and `run.tic_total` (the instrument's
+    MS1 TIC summed in scan order). GPF's `.dia` is identical to MSRawJava's with every metadata
+    key compared (`metadata_keys="all"`); DDA's metadata is too.
+- **Phase 5** (documentation): done.
+- **Final timings, 2026-10-27** (final code, 8.0.42, defaults):
+  - **Kirby RF30** (18.7 GB profile): converts in 125 s with its SHA-256, both instrument
+    methods recorded.
+  - **MSRawJava 26.7.31** (EncyclopeDIA 6.9.23's converter) did not finish the same file in
+    60 minutes. On the 1 GB GPF run it takes 101 s, against our 20–28 s.
 
 ## Why
 
