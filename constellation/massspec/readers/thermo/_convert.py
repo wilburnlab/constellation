@@ -21,11 +21,15 @@ worker busy.
 Spawn safety: pythonnet's CoreCLR is documented to deadlock if a process
 inherits a partially-initialised CLR via fork, so the pool always spawns.
 A worker skips pythonnet's CLR shutdown at exit: it only frees memory the
-process is about to give back, and it once took 2.5 h at 21 GB.
+process is about to give back, and it once took 2.5 h at 21 GB. No .NET
+exception leaves a task: its class lives in a CLR namespace the parent
+cannot import, so unpickling it there would break the pool and fail every
+file in it. A task raises :class:`RawFileReaderError` in its place.
 """
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 import os
@@ -117,6 +121,40 @@ def plan_ranges(first: int, last: int, workers: int) -> list[tuple[int, int]]:
 # ── tasks (run in a worker, or inline) ────────────────────────────────
 
 
+class RawFileReaderError(RuntimeError):
+    """An exception Thermo's RawFileReader (.NET) raised, named in the message."""
+
+
+def _dotnet_name(exc: BaseException) -> str | None:
+    """The .NET type of ``exc`` if the CLR raised it, else None."""
+    try:
+        import System
+    except ImportError:  # no CLR loaded here, so nothing raised is .NET
+        return None
+    if not isinstance(exc, System.Exception):
+        return None
+    return f"{type(exc).__module__}.{type(exc).__name__}"
+
+
+def _portable(task):
+    """Run ``task`` with a .NET exception it raises turned into a
+    :class:`RawFileReaderError`, which the parent can unpickle. The .NET
+    exception stays as its cause (in a pool, in the remote traceback)."""
+
+    @functools.wraps(task)
+    def run(*args, **kwargs):
+        try:
+            return task(*args, **kwargs)
+        except Exception as exc:
+            name = _dotnet_name(exc)
+            if name is None:
+                raise
+            message = getattr(exc, "Message", None) or str(exc)
+            raise RawFileReaderError(f"{name}: {message}") from exc
+
+    return run
+
+
 # Open files of this process: path -> (handle, raw). At most two, so a
 # worker moving through a directory of files does not keep them all open.
 _OPEN: OrderedDict[str, tuple[Any, Any]] = OrderedDict()
@@ -156,10 +194,18 @@ def _close_open_files() -> None:
 
 def _warm(path: str) -> None:
     """Start a worker on ``path``: open it and pay CommonCore's first-call
-    setup (about 1.5 s in ``GetScanEvents``) while the probe runs."""
-    raw = _raw_for(path)
-    first, _ = _read._scan_range(raw)
-    raw.GetScanEvents(first, first)
+    setup (about 1.5 s in ``GetScanEvents``) while the probe runs.
+
+    Only a head start, so it never fails: the range reader fetches events
+    one by one where ``GetScanEvents`` does not work, and a file that will
+    not open is reported by its probe.
+    """
+    try:
+        raw = _raw_for(path)
+        first, _ = _read._scan_range(raw)
+        raw.GetScanEvents(first, first)
+    except Exception:
+        logger.debug("warming a worker on %s failed", path, exc_info=True)
 
 
 @dataclass(frozen=True)
@@ -169,6 +215,7 @@ class _Probe:
     run_metadata: dict[str, Any]
 
 
+@_portable
 def _probe(path: str) -> _Probe:
     raw = _raw_for(path)
     first, last = _read._scan_range(raw)
@@ -184,6 +231,7 @@ class _RangeTask:
     options: ConvertOptions
 
 
+@_portable
 def _run_range(task: _RangeTask, on_scans: Callable[[int], None] | None = None) -> pa.Table:
     """Read one range, write its peak part, return its scan metadata."""
     raw = _raw_for(task.path)
@@ -204,13 +252,18 @@ def _run_range(task: _RangeTask, on_scans: Callable[[int], None] | None = None) 
 
 
 class _InlineExecutor(Executor):
-    """Runs each task as it is submitted, in this process."""
+    """Runs each task as it is submitted, in this process.
+
+    A task's error goes into its future, as a pool's would. An interrupt
+    (KeyboardInterrupt, SystemExit) is raised from ``submit`` at once, so
+    the driver cleans up instead of running the tasks queued behind it.
+    """
 
     def submit(self, fn, /, *args, **kwargs) -> Future:
         future: Future = Future()
         try:
             future.set_result(fn(*args, **kwargs))
-        except BaseException as exc:  # noqa: BLE001 - handed to the caller
+        except Exception as exc:  # noqa: BLE001 - handed to the caller
             future.set_exception(exc)
         return future
 
@@ -543,6 +596,7 @@ __all__ = [
     "MIN_RANGE_SCANS",
     "RANGES_PER_WORKER",
     "ConvertOptions",
+    "RawFileReaderError",
     "convert",
     "default_workers",
     "plan_ranges",

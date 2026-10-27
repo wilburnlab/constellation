@@ -36,7 +36,13 @@ from ._filter import parse_filter_string
 from ._netruntime import is_thermo_available, load_clr, require_thermo
 from constellation.massspec.bundle import DEFAULT_RT_BIN_WIDTH_S
 
-from ._convert import DEFAULT_BATCH_SIZE, convert, default_workers, plan_ranges
+from ._convert import (
+    DEFAULT_BATCH_SIZE,
+    RawFileReaderError,
+    convert,
+    default_workers,
+    plan_ranges,
+)
 from ._read import (
     SOURCE_FORMAT,
     EmptyLevelError,
@@ -65,6 +71,7 @@ __all__ = [
     "BatchStatus",
     "CENTROIDERS",
     "EmptyLevelError",
+    "RawFileReaderError",
     "ThermoAcquisitionManifest",
     "ThermoReader",
     "convert",

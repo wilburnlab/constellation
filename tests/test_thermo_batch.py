@@ -6,8 +6,10 @@ Two tiers:
    range planning; ranges written as parts by an executor that sends every
    task and result through pickle, as a process pool does, compared with
    one range in this process; ``convert_batch``'s skip / force / per-file
-   errors; an interrupt clearing what it wrote; an existing bundle left
-   alone when a conversion is refused.
+   errors; an interrupt clearing what it wrote, and in one process
+   stopping the files behind it; an existing bundle left alone when a
+   conversion is refused; a .NET error in a spawned worker failing only
+   its own file.
 
 2. **CLI integration** — drive ``_cmd_massspec_convert`` end-to-end with
    ``convert`` / ``convert_batch`` monkeypatched to canned results. Covers
@@ -23,16 +25,18 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
-from concurrent.futures import Executor, Future
+from concurrent.futures import Executor, Future, ProcessPoolExecutor
+from multiprocessing import get_context
 from pathlib import Path
 
 import pyarrow.parquet as pq
 import pytest
 
-from _thermo_fakes import long_raw, mixed_raw
+from _thermo_fakes import long_raw, mixed_raw, refusing_worker
 from constellation.massspec.bundle import peaks_dataset
 from constellation.massspec.readers.thermo import (
     BatchResult,
+    RawFileReaderError,
     convert,
     convert_batch,
     plan_ranges,
@@ -157,6 +161,51 @@ class TestDriver:
                 executor_factory=lambda n: PicklingExecutor(interrupt_on="_run_range"),
             )
         assert list((tmp_path / "out").iterdir()) == []
+
+    def test_an_interrupt_in_one_process_stops_the_files_behind_it(
+        self, tmp_path, raws, monkeypatch
+    ):
+        paths = _make_raw_inputs(tmp_path, ["a", "b", "c", "d"])
+        for path in paths:
+            raws[path.stem] = long_raw(30)
+        read = []
+
+        def interrupted(raw, *args, **kwargs):
+            read.append(raw)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(_convert, "iter_scan_blocks", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            convert_batch(paths, tmp_path / "out", n_workers=1)
+        assert len(read) == 1
+        assert not [p for p in (tmp_path / "out").rglob("*") if p.is_file()]
+
+    def test_a_dotnet_error_in_a_worker_fails_only_its_file(self, tmp_path):
+        # Every file refuses GetScanEvents, which warms each worker and
+        # which the range reader replaces with one event per scan; "bad"
+        # refuses to open, which its probe reports.
+        files = {"a": 3000, "bad": 3000, "c": 3000}
+        paths = _make_raw_inputs(tmp_path, list(files))
+        jobs = [
+            _convert._Job(p, tmp_path / "out" / p.stem, _convert.ConvertOptions(), force=False)
+            for p in paths
+        ]
+
+        def pool(n):
+            return ProcessPoolExecutor(
+                n, mp_context=get_context("spawn"),
+                initializer=refusing_worker, initargs=(files, ("bad",)),
+            )
+
+        _convert._run_jobs(jobs, workers=2, executor_factory=pool)
+        a, bad, c = jobs
+        assert a.error is None and c.error is None
+        assert peaks_dataset(a.out_dir).count_rows() == peaks_dataset(c.out_dir).count_rows() == 9000
+        assert isinstance(bad.error, RawFileReaderError)
+        assert str(bad.error) == (
+            "System.NotSupportedException: Specified method is not supported."
+        )
+        assert not [p for p in bad.out_dir.rglob("*") if p.is_file()]
 
     def test_a_refused_conversion_leaves_an_existing_bundle(self, tmp_path, raws):
         raws["run"] = mixed_raw()

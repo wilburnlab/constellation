@@ -179,3 +179,42 @@ def long_raw(n: int, *, first: int = 1) -> "FakeRaw":
             event=None if ms1 else FakeEvent(mass=500.25, width=2.0),
         )
     return FakeRaw(scans)
+
+
+def refusing_worker(files: dict[str, int], broken: tuple[str, ...] = ()) -> None:
+    """A pool initializer in place of ``_convert._init_worker``: stand-in
+    raw files whose stand-in CLR raises.
+
+    ``files`` maps a ``.raw``'s stem to its number of scans (``long_raw``).
+    Every file refuses ``GetScanEvents`` with a ``NotSupportedException``,
+    and a stem in ``broken`` refuses to open with one. The exception's
+    class lives in a ``System`` module only the worker has, so, like a real
+    .NET exception, it cannot be unpickled in the parent.
+    """
+    import sys
+    import types
+    from pathlib import Path
+
+    from constellation.massspec.readers.thermo import _read
+
+    system = types.ModuleType("System")
+    system.Exception = type(
+        "Exception", (Exception,),
+        {"__module__": "System", "Message": property(lambda self: self.args[0])},
+    )
+    system.NotSupportedException = type(
+        "NotSupportedException", (system.Exception,), {"__module__": "System"}
+    )
+    sys.modules["System"] = system
+
+    def refuse(*_):
+        raise system.NotSupportedException("Specified method is not supported.")
+
+    def open_raw(path):
+        if Path(path).stem in broken:
+            refuse()
+        raw = long_raw(files[Path(path).stem])
+        raw.GetScanEvents = refuse
+        return _read._RawFileHandle(raw)
+
+    _read._open_raw_file = open_raw
