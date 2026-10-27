@@ -1,37 +1,47 @@
-"""Tests for ``constellation.massspec.readers.thermo._batch``.
+"""Tests for the Thermo conversion driver (``_convert``) and ``convert_batch``.
 
 Two tiers:
 
-1. **Unit tests** that monkeypatch ``_convert_one_file`` to a no-op
-   marker writer. The ``n_workers <= 1`` inline path is exercised
-   directly. Spawn-mode (``n_workers > 1``) is exercised by intercepting
-   the ``ProcessPoolExecutor`` constructor — the spawn child re-imports
-   the module fresh so parent-side monkeypatching does not propagate,
-   making real spawn-driven tests impractical without a real ``.raw``.
+1. **The driver on stand-in raw files** (``_thermo_fakes``, no DLLs):
+   range planning; ranges written as parts by an executor that sends every
+   task and result through pickle, as a process pool does, compared with
+   one range in this process; ``convert_batch``'s skip / force / per-file
+   errors; an interrupt clearing what it wrote, and in one process
+   stopping the files behind it; an existing bundle left alone when a
+   conversion is refused; a .NET error in a spawned worker failing only
+   its own file.
 
 2. **CLI integration** — drive ``_cmd_massspec_convert`` end-to-end with
-   ``convert_batch`` monkeypatched to canned results. Covers the
-   directory-glob path, summary line, and exit codes.
+   ``convert`` / ``convert_batch`` monkeypatched to canned results. Covers
+   the routing, the summary lines and exit codes.
 
-The real-fixture smoke (gated on ``$CONSTELLATION_TEST_THERMO_RAW``) is
-in ``test_thermo_reader.py``; adding a multi-file smoke here would
-require the user to maintain two .raw fixtures, which isn't worth it
-when the unit + CLI tests already pin every code path that's not the
-``.NET CLR`` itself.
+Real spawned workers on a real ``.raw`` are exercised by
+``test_thermo_reader.py``'s real-file tier (gated on
+``$CONSTELLATION_TEST_THERMO_RAW``).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import pickle
+from concurrent.futures import Executor, Future, ProcessPoolExecutor
+from multiprocessing import get_context
 from pathlib import Path
 
+import pyarrow.parquet as pq
 import pytest
 
+from _thermo_fakes import long_raw, mixed_raw, refusing_worker
+from constellation.massspec.bundle import peaks_dataset
 from constellation.massspec.readers.thermo import (
     BatchResult,
+    RawFileReaderError,
+    convert,
     convert_batch,
+    plan_ranges,
 )
+from constellation.massspec.readers.thermo import _convert, _read
 from constellation.massspec.readers.thermo.manifest import MANIFEST_FILENAME
 
 
@@ -47,342 +57,226 @@ def _make_raw_inputs(tmp_path: Path, stems: list[str]) -> list[Path]:
     paths: list[Path] = []
     for stem in stems:
         p = in_dir / f"{stem}.raw"
-        p.write_bytes(b"")
+        p.write_bytes(stem.encode())
         paths.append(p)
     return paths
 
 
-def _write_marker_manifest(bundle_dir: Path, source: str) -> None:
-    """Write a stub ``manifest.json`` so the skip-check sees a complete bundle."""
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-    (bundle_dir / MANIFEST_FILENAME).write_text(
-        json.dumps({"source_file": source})
-    )
+@pytest.fixture
+def raws(monkeypatch, fake_centroider):
+    """Map a ``.raw``'s stem to the stand-in raw file it opens as.
+
+    A stem missing from the map fails to open, as a corrupt file would.
+    """
+    files: dict[str, object] = {}
+
+    def open_raw(path):
+        stem = Path(path).stem
+        if stem not in files:
+            raise OSError(f"Thermo RawFileReader could not open {path}")
+        return _read._RawFileHandle(files[stem])
+
+    monkeypatch.setattr(_read, "_open_raw_file", open_raw)
+    yield files
+    _convert._close_open_files()
+
+
+class PicklingExecutor(Executor):
+    """Runs tasks here, but sends each task and result through pickle."""
+
+    def __init__(self, interrupt_on: str | None = None):
+        self.calls: list[str] = []
+        self.interrupt_on = interrupt_on
+
+    def submit(self, fn, /, *args, **kwargs) -> Future:
+        self.calls.append(fn.__name__)
+        future: Future = Future()
+        if fn.__name__ == self.interrupt_on:
+            raise KeyboardInterrupt
+        fn, args = pickle.loads(pickle.dumps((fn, args)))
+        try:
+            future.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
+        except Exception as exc:  # noqa: BLE001
+            future.set_exception(exc)
+        return future
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 1. Unit tier — inline (n_workers <= 1) and intercept-only spawn
+# 1. The driver on stand-in raw files
 # ──────────────────────────────────────────────────────────────────────
 
 
-class TestConvertBatchInline:
-    """The ``n_workers <= 1`` inline path. Real Python calls, no IPC."""
+class TestPlanRanges:
+    def test_one_worker_one_range(self):
+        assert plan_ranges(1, 81850, 1) == [(1, 81850)]
 
-    def test_dispatches_each_path(self, tmp_path, monkeypatch):
-        paths = _make_raw_inputs(tmp_path, ["a", "b", "c"])
-        out_parent = tmp_path / "out"
+    def test_ranges_cover_the_file_in_order(self):
+        ranges = plan_ranges(5, 81854, 8)
+        assert ranges[0][0] == 5 and ranges[-1][1] == 81854
+        assert all(b[0] == a[1] + 1 for a, b in zip(ranges, ranges[1:]))
+        assert len(ranges) == 8 * _convert.RANGES_PER_WORKER
 
-        calls: list[tuple[str, str]] = []
+    def test_ranges_not_shorter_than_the_minimum(self):
+        ranges = plan_ranges(1, 5000, 8)
+        assert len(ranges) == 2
+        assert min(hi - lo + 1 for lo, hi in ranges) >= _convert.MIN_RANGE_SCANS
 
-        def fake_convert(src, out_dir, **kwargs):
-            calls.append((str(src), str(out_dir)))
-            Path(out_dir).mkdir(parents=True, exist_ok=True)
-            (Path(out_dir) / MANIFEST_FILENAME).write_text("{}")
-            return None
+    def test_no_scans_no_ranges(self):
+        assert plan_ranges(1, 0, 4) == []
 
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch._convert_one_file",
-            fake_convert,
+
+class TestDriver:
+    def test_parts_equal_one_range(self, tmp_path, raws):
+        raws["run"] = long_raw(25_000)
+        src = _make_raw_inputs(tmp_path, ["run"])[0]
+
+        one = convert(src, tmp_path / "one", workers=1)
+        executor = PicklingExecutor()
+        job = _convert._Job(src, tmp_path / "many", _convert.ConvertOptions(), force=False)
+        _convert._run_jobs([job], workers=4, executor_factory=lambda n: executor)
+        assert job.error is None
+
+        parts = sorted((tmp_path / "many" / "peaks").iterdir())
+        assert len(parts) == len(plan_ranges(1, 25_000, 4)) == 12
+        assert executor.calls.count("_run_range") == 12
+        assert executor.calls[:4] == ["_warm"] * 4  # every worker started first
+        for table in ("scan_metadata.parquet", "acquisition_metadata.parquet"):
+            a = pq.read_table(tmp_path / "one" / table).drop_columns(["source_path"] if "acq" in table else [])
+            b = pq.read_table(tmp_path / "many" / table).drop_columns(["source_path"] if "acq" in table else [])
+            assert a.equals(b), table
+        assert peaks_dataset(tmp_path / "one").to_table().equals(
+            peaks_dataset(tmp_path / "many").to_table()
         )
+        assert job.manifest.parameters["workers"] == 4
+        assert one.parameters["workers"] == 1
+        assert one.source_sha256 == job.manifest.source_sha256
 
-        results = convert_batch(paths, out_parent, n_workers=1)
+    def test_interrupt_clears_what_was_written(self, tmp_path, raws):
+        raws["run"] = long_raw(9_000)
+        src = _make_raw_inputs(tmp_path, ["run"])[0]
+        job = _convert._Job(src, tmp_path / "out", _convert.ConvertOptions(), force=False)
+        with pytest.raises(KeyboardInterrupt):
+            _convert._run_jobs(
+                [job], workers=2,
+                executor_factory=lambda n: PicklingExecutor(interrupt_on="_run_range"),
+            )
+        assert list((tmp_path / "out").iterdir()) == []
 
-        assert [r.status for r in results] == ["ok", "ok", "ok"]
-        assert [r.input_path for r in results] == paths
-        assert [r.bundle_dir for r in results] == [
-            out_parent / "a",
-            out_parent / "b",
-            out_parent / "c",
-        ]
-        assert len(calls) == 3
+    def test_an_interrupt_in_one_process_stops_the_files_behind_it(
+        self, tmp_path, raws, monkeypatch
+    ):
+        paths = _make_raw_inputs(tmp_path, ["a", "b", "c", "d"])
         for path in paths:
-            assert (out_parent / path.stem / MANIFEST_FILENAME).is_file()
+            raws[path.stem] = long_raw(30)
+        read = []
 
-    def test_skips_existing_manifest(self, tmp_path, monkeypatch):
-        paths = _make_raw_inputs(tmp_path, ["a", "b"])
-        out_parent = tmp_path / "out"
-        _write_marker_manifest(out_parent / "a", str(paths[0]))
+        def interrupted(raw, *args, **kwargs):
+            read.append(raw)
+            raise KeyboardInterrupt
 
-        calls: list[str] = []
+        monkeypatch.setattr(_convert, "iter_scan_blocks", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            convert_batch(paths, tmp_path / "out", n_workers=1)
+        assert len(read) == 1
+        assert not [p for p in (tmp_path / "out").rglob("*") if p.is_file()]
 
-        def fake_convert(src, out_dir, **kwargs):
-            calls.append(str(src))
-            Path(out_dir).mkdir(parents=True, exist_ok=True)
-            (Path(out_dir) / MANIFEST_FILENAME).write_text("{}")
-            return None
+    def test_a_dotnet_error_in_a_worker_fails_only_its_file(self, tmp_path):
+        # Every file refuses GetScanEvents, which warms each worker and
+        # which the range reader replaces with one event per scan; "bad"
+        # refuses to open, which its probe reports.
+        files = {"a": 3000, "bad": 3000, "c": 3000}
+        paths = _make_raw_inputs(tmp_path, list(files))
+        jobs = [
+            _convert._Job(p, tmp_path / "out" / p.stem, _convert.ConvertOptions(), force=False)
+            for p in paths
+        ]
 
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch._convert_one_file",
-            fake_convert,
+        def pool(n):
+            return ProcessPoolExecutor(
+                n, mp_context=get_context("spawn"),
+                initializer=refusing_worker, initargs=(files, ("bad",)),
+            )
+
+        _convert._run_jobs(jobs, workers=2, executor_factory=pool)
+        a, bad, c = jobs
+        assert a.error is None and c.error is None
+        assert peaks_dataset(a.out_dir).count_rows() == peaks_dataset(c.out_dir).count_rows() == 9000
+        assert isinstance(bad.error, RawFileReaderError)
+        assert str(bad.error) == (
+            "System.NotSupportedException: Specified method is not supported."
         )
+        assert not [p for p in bad.out_dir.rglob("*") if p.is_file()]
 
-        results = convert_batch(paths, out_parent, n_workers=1, force=False)
+    def test_a_refused_conversion_leaves_an_existing_bundle(self, tmp_path, raws):
+        raws["run"] = mixed_raw()
+        src = _make_raw_inputs(tmp_path, ["run"])[0]
+        convert(src, tmp_path / "out")
+        before = sorted(p.name for p in (tmp_path / "out").iterdir())
+        with pytest.raises(FileExistsError):
+            convert(src, tmp_path / "out")
+        assert sorted(p.name for p in (tmp_path / "out").iterdir()) == before
 
+
+class TestConvertBatch:
+    def test_each_file_its_own_bundle_and_outcome(self, tmp_path, raws):
+        paths = _make_raw_inputs(tmp_path, ["a", "bad", "c"])
+        raws["a"], raws["c"] = mixed_raw(), long_raw(30)
+        out = tmp_path / "out"
+        results = convert_batch(paths, out)
+
+        assert [r.status for r in results] == ["ok", "error", "ok"]
+        assert [r.input_path for r in results] == paths
+        assert "could not open" in results[1].detail
+        assert not any((out / "bad").iterdir())  # a failed file leaves nothing behind
+        assert peaks_dataset(out / "a").count_rows() == 7
+        assert json.loads((out / "c" / MANIFEST_FILENAME).read_text())["run_metadata"]["n_scans"] == 30
+
+    def test_skips_finished_bundles_unless_forced(self, tmp_path, raws):
+        paths = _make_raw_inputs(tmp_path, ["a", "b"])
+        raws["a"], raws["b"] = mixed_raw(), mixed_raw()
+        out = tmp_path / "out"
+        convert_batch(paths[:1], out)
+        stamp = (out / "a" / MANIFEST_FILENAME).read_text()
+
+        results = convert_batch(paths, out)
         assert [r.status for r in results] == ["skipped", "ok"]
-        # Worker invoked only for the un-skipped path.
-        assert calls == [str(paths[1])]
+        assert (out / "a" / MANIFEST_FILENAME).read_text() == stamp
 
-    def test_force_overrides_skip(self, tmp_path, monkeypatch):
-        paths = _make_raw_inputs(tmp_path, ["a", "b"])
-        out_parent = tmp_path / "out"
-        _write_marker_manifest(out_parent / "a", str(paths[0]))
-
-        calls: list[str] = []
-
-        def fake_convert(src, out_dir, **kwargs):
-            calls.append(str(src))
-            assert kwargs["force"] is True
-            return None
-
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch._convert_one_file",
-            fake_convert,
-        )
-
-        results = convert_batch(paths, out_parent, n_workers=1, force=True)
-
+        results = convert_batch(paths, out, force=True)
         assert [r.status for r in results] == ["ok", "ok"]
-        assert sorted(calls) == sorted(str(p) for p in paths)
 
-    def test_aggregates_errors(self, tmp_path, monkeypatch):
-        paths = _make_raw_inputs(tmp_path, ["good1", "bad", "good2"])
-        out_parent = tmp_path / "out"
-
-        def fake_convert(src, out_dir, **kwargs):
-            if Path(src).stem == "bad":
-                raise RuntimeError("synthetic failure")
-            return None
-
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch._convert_one_file",
-            fake_convert,
-        )
-
-        results = convert_batch(paths, out_parent, n_workers=1)
-
-        statuses = [r.status for r in results]
-        assert statuses == ["ok", "error", "ok"]
-        bad = results[1]
-        assert bad.detail is not None
-        assert "RuntimeError" in bad.detail
-        assert "synthetic failure" in bad.detail
-
-    def test_propagates_capture_trailer_extras_false(self, tmp_path, monkeypatch):
-        """``--no-trailer-extras`` flips this to False; must reach the worker."""
+    def test_all_skipped_converts_nothing(self, tmp_path, raws, monkeypatch):
         paths = _make_raw_inputs(tmp_path, ["a"])
-        out_parent = tmp_path / "out"
-
-        captured: dict[str, object] = {}
-
-        def fake_convert(src, out_dir, **kwargs):
-            captured.update(kwargs)
-            return None
-
+        raws["a"] = mixed_raw()
+        convert_batch(paths, tmp_path / "out")
         monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch._convert_one_file",
-            fake_convert,
+            "constellation.massspec.readers.thermo._batch._run_jobs",
+            lambda *a, **k: pytest.fail("nothing should be converted"),
         )
+        assert [r.status for r in convert_batch(paths, tmp_path / "out")] == ["skipped"]
 
-        convert_batch(
-            paths,
-            out_parent,
-            n_workers=1,
-            capture_trailer_extras=False,
-            compute_sha256=False,
-        )
-
-        assert captured["capture_trailer_extras"] is False
-        assert captured["compute_sha256"] is False
+    def test_options_reach_every_file(self, tmp_path, raws):
+        paths = _make_raw_inputs(tmp_path, ["a"])
+        raws["a"] = mixed_raw()
+        convert_batch(paths, tmp_path / "out", profile=True, capture_trailer_extras=False,
+                      compute_sha256=False)
+        manifest = json.loads((tmp_path / "out" / "a" / MANIFEST_FILENAME).read_text())
+        assert manifest["parameters"]["peaks"] == "profile"
+        assert manifest["parameters"]["capture_trailer_extras"] is False
+        assert manifest["source_sha256"] is None
 
     def test_duplicate_stem_raises(self, tmp_path):
-        d1 = tmp_path / "d1"
-        d2 = tmp_path / "d2"
-        d1.mkdir()
-        d2.mkdir()
-        (d1 / "same.raw").write_bytes(b"")
-        (d2 / "same.raw").write_bytes(b"")
-        paths = [d1 / "same.raw", d2 / "same.raw"]
-
-        with pytest.raises(ValueError, match="duplicate output bundle dirs"):
-            convert_batch(paths, tmp_path / "out", n_workers=1)
+        a = tmp_path / "x" / "run.raw"
+        b = tmp_path / "y" / "run.raw"
+        for p in (a, b):
+            p.parent.mkdir()
+            p.write_bytes(b"")
+        with pytest.raises(ValueError, match="duplicate output bundle"):
+            convert_batch([a, b], tmp_path / "out")
 
     def test_empty_paths_raises(self, tmp_path):
-        with pytest.raises(ValueError, match="paths is empty"):
-            convert_batch([], tmp_path / "out", n_workers=1)
-
-    def test_all_skipped_no_workers_invoked(self, tmp_path, monkeypatch):
-        paths = _make_raw_inputs(tmp_path, ["a", "b"])
-        out_parent = tmp_path / "out"
-        for p in paths:
-            _write_marker_manifest(out_parent / p.stem, str(p))
-
-        called = False
-
-        def fake_convert(*a, **kw):
-            nonlocal called
-            called = True
-            return None
-
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch._convert_one_file",
-            fake_convert,
-        )
-
-        results = convert_batch(paths, out_parent, n_workers=4)
-        assert [r.status for r in results] == ["skipped", "skipped"]
-        assert called is False
-
-
-class TestConvertBatchSpawn:
-    """Spawn-mode (n_workers > 1) — intercept the executor constructor."""
-
-    def test_uses_spawn_context(self, tmp_path, monkeypatch):
-        """Verify ProcessPoolExecutor is constructed with mp_context=spawn."""
-        paths = _make_raw_inputs(tmp_path, ["a", "b"])
-        out_parent = tmp_path / "out"
-
-        seen: dict[str, object] = {}
-
-        # Stub the executor so we can verify constructor kwargs without
-        # actually spawning subprocesses (which would try to import the
-        # real _convert_one_file and need pythonnet).
-        class _FakeFuture:
-            def __init__(self, result):
-                self._result = result
-
-            def result(self):
-                return self._result
-
-        class _FakeExecutor:
-            def __init__(self, max_workers, mp_context):
-                seen["max_workers"] = max_workers
-                seen["mp_context"] = mp_context
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return None
-
-            def submit(self, fn, *args, **kwargs):
-                # Run the function inline so the result aggregation
-                # path is exercised end-to-end.
-                return _FakeFuture(fn(*args, **kwargs))
-
-        def fake_as_completed(futures):
-            return list(futures)
-
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch.ProcessPoolExecutor",
-            _FakeExecutor,
-        )
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch.as_completed",
-            fake_as_completed,
-        )
-        # The inline worker still needs the underlying convert stubbed.
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch._convert_one_file",
-            lambda *a, **kw: None,
-        )
-
-        results = convert_batch(paths, out_parent, n_workers=2)
-
-        assert seen["max_workers"] == 2
-        ctx = seen["mp_context"]
-        # multiprocessing.get_context("spawn") returns a SpawnContext;
-        # its _name is "spawn".
-        assert getattr(ctx, "_name", None) == "spawn" or "spawn" in repr(ctx).lower()
-        assert all(r.status == "ok" for r in results)
-
-    def test_clamps_n_workers_to_pending_count(self, tmp_path, monkeypatch):
-        """One pending file + n_workers=8 → max_workers=1."""
-        paths = _make_raw_inputs(tmp_path, ["only"])
-        out_parent = tmp_path / "out"
-
-        seen: dict[str, object] = {}
-
-        class _FakeExecutor:
-            def __init__(self, max_workers, mp_context):
-                seen["max_workers"] = max_workers
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return None
-
-            def submit(self, fn, *args, **kwargs):
-                class _F:
-                    def result(self_inner):
-                        return fn(*args, **kwargs)
-
-                return _F()
-
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch.ProcessPoolExecutor",
-            _FakeExecutor,
-        )
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch.as_completed",
-            lambda fs: list(fs),
-        )
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch._convert_one_file",
-            lambda *a, **kw: None,
-        )
-
-        # n_workers=8 but only 1 pending → should clamp inline (n=1
-        # uses the inline branch, NOT the executor).
-        convert_batch(paths, out_parent, n_workers=8)
-
-        # With 1 pending, the inline branch fires and the executor
-        # is never constructed.
-        assert "max_workers" not in seen
-
-    def test_uses_executor_when_pending_geq_two_and_threads_geq_two(
-        self, tmp_path, monkeypatch
-    ):
-        """Two pending files + n_workers=2 → executor is used."""
-        paths = _make_raw_inputs(tmp_path, ["a", "b"])
-        out_parent = tmp_path / "out"
-
-        seen: dict[str, object] = {}
-
-        class _FakeExecutor:
-            def __init__(self, max_workers, mp_context):
-                seen["max_workers"] = max_workers
-                seen["mp_context"] = mp_context
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return None
-
-            def submit(self, fn, *args, **kwargs):
-                class _F:
-                    def result(self_inner):
-                        return fn(*args, **kwargs)
-
-                return _F()
-
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch.ProcessPoolExecutor",
-            _FakeExecutor,
-        )
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch.as_completed",
-            lambda fs: list(fs),
-        )
-        monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._batch._convert_one_file",
-            lambda *a, **kw: None,
-        )
-
-        convert_batch(paths, out_parent, n_workers=2)
-
-        assert seen["max_workers"] == 2
+        with pytest.raises(ValueError, match="empty"):
+            convert_batch([], tmp_path / "out")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -394,7 +288,7 @@ def _make_args(
     *,
     input_path: Path,
     output_dir: Path | None = None,
-    threads: int = 1,
+    threads: int | None = 1,
     force: bool = False,
     no_progress: bool = True,
 ) -> argparse.Namespace:
@@ -408,14 +302,15 @@ def _make_args(
         capture_trailer_extras=True,
         compute_sha256=True,
         force=force,
-        batch_size=64,
+        batch_size=512,
+        allow_empty_levels=False,
         no_progress=no_progress,
     )
 
 
 class TestCliRouter:
-    def test_legacy_single_file_unchanged(self, tmp_path, monkeypatch, capsys):
-        """Single file + --threads 1 → legacy path emits 'wrote bundle:'."""
+    def test_single_file(self, tmp_path, monkeypatch, capsys):
+        """A single file emits 'wrote bundle:' and the per-level summary."""
         from constellation.massspec import cli as ms_cli
 
         src = tmp_path / "sample.raw"
@@ -427,6 +322,11 @@ class TestCliRouter:
                 "peaks": "peaks.parquet",
                 "scan_metadata": "scan_metadata.parquet",
                 "acquisition_metadata": "acquisition_metadata.parquet",
+            }
+            run_metadata = {
+                "levels": [
+                    {"level": 1, "n_scans": 3, "n_peaks": 30, "peaks_from": {"thermo": 3}}
+                ]
             }
 
         def fake_thermo_convert(src_arg, bundle_dir, **kwargs):
@@ -449,6 +349,8 @@ class TestCliRouter:
         captured = capsys.readouterr()
         assert rc == 0
         assert "wrote bundle:" in captured.out
+        # Every level says how its peaks were made.
+        assert "MS1: 3 scans, 30 peaks (3 centroided by Thermo's centroider)" in captured.out
         assert "batch convert:" not in captured.err
 
     def test_batch_directory_routes_through_convert_batch(
@@ -556,47 +458,41 @@ class TestCliRouter:
         assert rc == 2
         assert "input not found" in captured.err
 
-    def test_single_file_with_threads_gt_1_uses_batch(
-        self, tmp_path, monkeypatch, capsys
+    @pytest.mark.parametrize("threads, expected", [(3, 3), (None, "default")])
+    def test_single_file_threads_are_workers(
+        self, tmp_path, monkeypatch, capsys, threads, expected
     ):
-        """A single .raw file under --threads 2 routes through batch."""
+        """A single .raw is converted by --threads worker processes (the
+        cores, up to 8, by default); it is not routed through the batch."""
         from constellation.massspec import cli as ms_cli
+        from constellation.massspec.readers.thermo import default_workers
 
         src = tmp_path / "solo.raw"
         src.write_bytes(b"")
+        seen: dict[str, object] = {}
 
-        called_with: dict[str, object] = {}
+        class _Manifest:
+            outputs = {"peaks": "peaks", "scan_metadata": "scan_metadata.parquet",
+                       "acquisition_metadata": "acquisition_metadata.parquet"}
+            run_metadata = {"levels": []}
 
-        def fake_convert_batch(paths, output_parent, **kwargs):
-            called_with["paths"] = paths
-            called_with["output_parent"] = output_parent
-            return [
-                BatchResult(
-                    input_path=paths[0],
-                    bundle_dir=output_parent / paths[0].stem,
-                    status="ok",
-                )
-            ]
+        def fake_thermo_convert(src_arg, bundle_dir, **kwargs):
+            seen.update(kwargs)
+            return _Manifest()
 
         monkeypatch.setattr(
-            "constellation.massspec.readers.thermo._netruntime.require_thermo",
-            lambda: None,
+            "constellation.massspec.readers.thermo._netruntime.require_thermo", lambda: None
         )
+        monkeypatch.setattr("constellation.massspec.readers.thermo.convert", fake_thermo_convert)
         monkeypatch.setattr(
             "constellation.massspec.readers.thermo.convert_batch",
-            fake_convert_batch,
+            lambda *a, **k: pytest.fail("a single file is not a batch"),
         )
 
-        args = _make_args(input_path=src, threads=2)
-        rc = ms_cli._cmd_massspec_convert(args)
-
-        captured = capsys.readouterr()
-        assert rc == 0
-        assert called_with["paths"] == [src]
-        # When -o is omitted on single-file-via-batch, output parent
-        # defaults to the file's parent dir (matches legacy semantics).
-        assert called_with["output_parent"] == src.parent
-        assert "batch convert: 1 succeeded" in captured.err
+        args = _make_args(input_path=src, threads=threads)
+        assert ms_cli._cmd_massspec_convert(args) == 0
+        assert seen["workers"] == (default_workers() if expected == "default" else expected)
+        assert "wrote bundle:" in capsys.readouterr().out
 
     def test_directory_glob_case_insensitive_and_deduped(
         self, tmp_path, monkeypatch

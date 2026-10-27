@@ -26,6 +26,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from constellation.massspec.acquisition_structure import infer_acquisition_structure
+from constellation.massspec.bundle import peaks_dataset
 from constellation.massspec.io.encyclopedia import (
     DiaFile,
     DiaReader,
@@ -49,6 +50,7 @@ from constellation.massspec.schemas import (
 from _massspec_fixtures import MS1_FILTER as _MS1_FILTER
 from _massspec_fixtures import dda_scans as _dda_scans
 from _massspec_fixtures import dia_scans as _dia_scans
+from _massspec_fixtures import with_scan_stats as _with_scan_stats
 from _massspec_fixtures import write_bundle as _write_bundle
 
 
@@ -174,6 +176,88 @@ def test_export_reads_scan_range_from_filter_string_for_older_bundles(tmp_path: 
         tmp_path / "v2.dia",
     )
     assert diff_dia(new.path, old.path).identical
+
+
+def test_exact_values_are_written_as_thermo_displays_them(tmp_path: Path) -> None:
+    """A bundle holding the instrument's values (an isolation width of
+    2.0009, injection times in full) and the trailer header gives the file
+    a bundle of Thermo's display values gives: MSRawJava reads the display
+    strings. Ties go to even, as Thermo displays them (75.5625 -> 75.562)."""
+    displayed = _dia_scans()
+    exact = _dia_scans()
+    exact_iits = [31.0431213, 75.5625, 12.0004]
+    for i, (d, e) in enumerate(zip(displayed, exact)):
+        iit = exact_iits[i % 3]
+        e["iit"] = float(np.float32(iit))
+        d["iit"] = {31.0431213: 31.043, 75.5625: 75.562, 12.0004: 12.0}[iit]
+        if e["level"] == 2:
+            centre = (e["isolation_lower"] + e["isolation_upper"]) / 2
+            e["isolation_lower"], e["isolation_upper"] = centre - 1.00045, centre + 1.00045
+    header = {"trailer_header": [
+        {"label": "Ion Injection Time (ms):", "data_type": "FLOAT", "precision": 3},
+        {"label": "MS2 Isolation Width:", "data_type": "FLOAT", "precision": 2},
+    ]}
+    a = write_dia([_write_bundle(tmp_path / "shown", "run", displayed)], tmp_path / "shown.dia")
+    b = write_dia(
+        [_write_bundle(tmp_path / "exact", "run", exact, acquisition=header)],
+        tmp_path / "exact.dia",
+    )
+    assert diff_dia(a.path, b.path).identical
+    # Without the header nothing is rounded: the exact bundle's own values.
+    c = write_dia([_write_bundle(tmp_path / "bare", "run", exact)], tmp_path / "bare.dia")
+    assert not diff_dia(a.path, c.path).identical
+
+
+def test_run_sample_and_method_metadata_written_as_msrawjava_does(tmp_path: Path) -> None:
+    """What a Thermo bundle records about the run, the sample and the
+    instrument method becomes the keys MSRawJava writes, in its order."""
+    scans = _with_scan_stats(_dia_scans())
+    acquisition = {
+        "run_start_time": "2026-10-07T12:15:40.9362541Z",
+        "run_start_minutes": 0.00011072868333333333,
+        "run_end_minutes": 107.07892674848334,
+        "expected_run_minutes": 107.0,
+        "max_integrated_intensity": 952826512.6479492,
+        "spectra_count": len(scans),
+        "sample_vial": "G:B3",
+        "sample_injection_volume": 1.0,
+        "sample_method_file": "C:\\methods\\GPF.meth",
+        "sample_raw_file_name": "D:\\run.raw",
+        "instrument_methods": [
+            {"name": "SiiXcalibur", "text": "LC method\r\n"},
+            {"name": "TNG-Thorium", "text": "MS method\r\n"},
+        ],
+    }
+    summary = write_dia(
+        [_write_bundle(tmp_path, "run", scans, acquisition=acquisition)], tmp_path / "run.dia"
+    )
+    con = sqlite3.connect(summary.path)
+    md = dict(con.execute("SELECT Key, Value FROM metadata"))
+    keys = [k for (k,) in con.execute("SELECT Key FROM metadata ORDER BY rowid")]
+    assert md["thermo.run.expected_run_time"] == 107  # stored as SQLite stores it
+    assert md["thermo.run.duration_minutes"] == 107.07892674848334 - 0.00011072868333333333
+    assert md["thermo.sample.vial"] == "G:B3" and md["thermo.sample.injection_volume"] == 1
+    assert md["thermo.instrument_method.count"] == 2
+    assert md["thermo.instrument_method.1.raw_text"] == "MS method\r\n"
+    total = 0.0  # sequentially, as MSRawJava sums (Python's sum() compensates)
+    for s in scans:
+        if s["level"] == 1:
+            total += s["tic"]
+    assert md["run.tic_total"] == total
+    assert keys.index("run.start_time_iso8601") < keys.index("run.gradient_length_seconds")
+    assert keys.index("instrument.software_version") < keys.index("thermo.sample.injection_volume")
+    assert keys.index("thermo.instrument_method.1.raw_text") < keys.index("acq.mass_analyzers")
+
+
+def test_export_reads_either_peak_layout(tmp_path: Path) -> None:
+    """Peaks as parts (bundle manifest v2) and as one file (v1) give one file."""
+    scans = _dia_scans(empty_scan=7)
+    parts = write_dia([_write_bundle(tmp_path / "parts", "run", scans)], tmp_path / "parts.dia")
+    single = write_dia(
+        [_write_bundle(tmp_path / "file", "run", scans, layout="file")], tmp_path / "file.dia"
+    )
+    assert (tmp_path / "parts" / "run" / "peaks" / "part-00001.parquet").is_file()
+    assert diff_dia(parts.path, single.path).identical
 
 
 def test_export_is_atomic_and_refuses_to_overwrite(tmp_path: Path) -> None:
@@ -364,7 +448,8 @@ def test_import_round_trip_single_run(tmp_path: Path) -> None:
     assert bundle.name == "run_a"
 
     # The bundle has the shape `massspec convert` writes.
-    peaks = pq.read_table(bundle / "peaks.parquet")
+    assert [p.name for p in (bundle / "peaks").iterdir()] == ["part-00000.parquet"]
+    peaks = peaks_dataset(bundle).to_table()
     meta = pq.read_table(bundle / "scan_metadata.parquet")
     assert peaks.schema.equals(MS_PEAK_TABLE) and meta.schema.equals(SCAN_METADATA_TABLE)
     assert peaks.num_rows == sum(s["mz"].size for s in scans)

@@ -40,7 +40,7 @@ def _build_chromatogram_build_index_parser(subs: argparse._SubParsersAction) -> 
         ),
     )
     p.add_argument("--peaks-dir", type=Path, required=True,
-                   help="Convert bundle (contains peaks.parquet) or a shard dir / parquet file.")
+                   help="Convert bundle, or a directory of peak parts / one parquet file.")
     p.add_argument("-o", "--output-dir", type=Path, required=True,
                    help="Index output root.")
     p.add_argument("--downcast", default="",
@@ -158,8 +158,6 @@ def _resolve_ion_types(spec: str):
 
 
 def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
-    import pyarrow.parquet as pq
-
     from constellation.massspec.quant.chromatogram import (
         extract_xic_indexed,
         extract_xic_scan_major,
@@ -203,8 +201,9 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
             index_dir, targets, exact_error=args.exact_error, peaks_dir=args.peaks_dir, **common
         )
     else:
-        peaks_file = args.peaks_dir / "peaks.parquet"
-        peaks = pq.read_table(peaks_file if peaks_file.exists() else args.peaks_dir)
+        from constellation.massspec.bundle import open_peaks
+
+        peaks = open_peaks(args.peaks_dir).to_table()
         table = extract_xic_scan_major(peaks, targets, **common)
 
     save_xic(table, args.output_dir, metadata={

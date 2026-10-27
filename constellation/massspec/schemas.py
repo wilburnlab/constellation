@@ -99,7 +99,10 @@ register_schema("MSPeakTable", MS_PEAK_TABLE)
 # ──────────────────────────────────────────────────────────────────────
 
 # v3 (additive): scan_window_lower / scan_window_upper.
-SCAN_METADATA_SCHEMA_VERSION: int = 3
+# v4: spectrum_type / centroider (additive); peak_count is the number of
+#   peaks the bundle holds for the scan (v3 Thermo bundles held the
+#   instrument's packet count there); agc_ps_mode is signed.
+SCAN_METADATA_SCHEMA_VERSION: int = 4
 
 
 # Mirrors Cartographer's SCAN_METADATA_SCHEMA v5 column-for-column with
@@ -118,6 +121,15 @@ SCAN_METADATA_TABLE: pa.Schema = pa.schema(
         pa.field("base_peak_mz", pa.float64(), nullable=True),
         pa.field("base_peak_intensity", pa.float64(), nullable=True),
         pa.field("peak_count", pa.uint32(), nullable=True),
+        # How the scan's peaks were made. `spectrum_type` is what the
+        # peaks are: `centroid` or `profile` points. `centroider` names
+        # what centroided them: `instrument` (acquired as centroids, or
+        # the instrument's own centroid stream stored beside a profile
+        # scan), `thermo` (Thermo's centroider run on the profile scan at
+        # conversion), null for profile points. Null in bundles written
+        # before v4.
+        pa.field("spectrum_type", pa.string(), nullable=True),
+        pa.field("centroider", pa.string(), nullable=True),
         pa.field("filter_string", pa.string(), nullable=True),
         # Mass analyzer (FTMS, ITMS, ...) parsed from the filter string. Set on
         # every scan including MS1; the discriminator that separates, e.g., a
@@ -188,7 +200,9 @@ SCAN_METADATA_TABLE: pa.Schema = pa.schema(
         pa.field("agc_transm_car_factor", pa.float32(), nullable=True),
         pa.field("agc_transm_funnel_enabled", pa.bool_(), nullable=True),
         pa.field("agc_transm_funnel_factors", pa.string(), nullable=True),
-        pa.field("agc_ps_mode", pa.uint32(), nullable=True),
+        # Signed: a Q Exactive HF reports -1 (v4; uint32 before, which made
+        # such a file unconvertible).
+        pa.field("agc_ps_mode", pa.int32(), nullable=True),
         pa.field("agc_ps_diag", pa.uint32(), nullable=True),
         pa.field("agc_diag_1", pa.float32(), nullable=True),
         pa.field("agc_diag_2", pa.float32(), nullable=True),
@@ -282,7 +296,12 @@ register_schema("ScanMetadataTable", SCAN_METADATA_TABLE)
 # AcquisitionMetadataTable — one row per run. Ports cartographer ACQUISITION_METADATA_SCHEMA v5.
 # ──────────────────────────────────────────────────────────────────────
 
-ACQUISITION_METADATA_SCHEMA_VERSION: int = 1
+# v2 (additive): trailer_header; the run header (run_start_time,
+#   run_start_minutes, run_end_minutes, expected_run_minutes,
+#   max_integrated_intensity, spectra_count); the sample information
+#   (sample_vial, sample_injection_volume, sample_method_file,
+#   sample_raw_file_name); instrument_methods.
+ACQUISITION_METADATA_SCHEMA_VERSION: int = 2
 
 
 # Single-row run-level metadata: instrument identity + Thermo
@@ -301,15 +320,61 @@ ACQUISITION_METADATA_TABLE: pa.Schema = pa.schema(
         pa.field("hardware_version", pa.string(), nullable=True),
         pa.field("software_version", pa.string(), nullable=True),
         pa.field("method_name", pa.string(), nullable=True),
-        pa.field("creation_date", pa.string(), nullable=True),  # ISO-8601
+        # As Thermo's DateTime prints it (``10/07/2026 12:15:40``); the
+        # same moment in full is run_start_time.
+        pa.field("creation_date", pa.string(), nullable=True),
+        # ── Thermo run header and sample information (v2) ──
+        # ISO 8601, to the 100 ns the file holds (2026-10-07T12:15:40.9362541Z).
+        pa.field("run_start_time", pa.string(), nullable=True),
+        pa.field("run_start_minutes", pa.float64(), nullable=True),
+        pa.field("run_end_minutes", pa.float64(), nullable=True),
+        pa.field("expected_run_minutes", pa.float64(), nullable=True),
+        pa.field("max_integrated_intensity", pa.float64(), nullable=True),
+        pa.field("spectra_count", pa.int64(), nullable=True),
+        pa.field("sample_vial", pa.string(), nullable=True),
+        pa.field("sample_injection_volume", pa.float64(), nullable=True),
+        # The full path of the method file (method_name is its base name).
+        pa.field("sample_method_file", pa.string(), nullable=True),
+        pa.field("sample_raw_file_name", pa.string(), nullable=True),
+        # Each device's section of the instrument method embedded in the
+        # .raw: the device name and the method text. Needs RawFileReader
+        # 8.x; CommonCore 5.0 returns no text on Linux, and then this is null.
+        pa.field(
+            "instrument_methods",
+            pa.list_(pa.struct([pa.field("name", pa.string()), pa.field("text", pa.string())])),
+            nullable=True,
+        ),
         pa.field("analyzers", pa.list_(pa.string()), nullable=True),
         pa.field("n_scans", pa.uint32(), nullable=True),
         pa.field("rt_min_seconds", pa.float32(), nullable=True),
         pa.field("rt_max_seconds", pa.float32(), nullable=True),
+        # True when the bundle stores profile points for any scan (a
+        # `--profile` conversion of profile data), false when every scan's
+        # peaks are centroids. Says nothing about how the run was acquired;
+        # SCAN_METADATA_TABLE.centroider does.
         pa.field("profile_mode", pa.bool_(), nullable=True),
         pa.field(
             "tune_data",
             pa.map_(pa.string(), pa.string()),
+            nullable=True,
+        ),
+        # The Thermo trailer's header: each entry's label, data type and
+        # the precision Thermo displays it with (an isolation width to 2
+        # decimals, an injection time to 3). Scan metadata holds the full
+        # values; a writer that has to reproduce what other software read
+        # from the display strings (the .dia writer, for MSRawJava) rounds
+        # with these. Null for other sources and bundles before v2.
+        pa.field(
+            "trailer_header",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("label", pa.string()),
+                        pa.field("data_type", pa.string()),
+                        pa.field("precision", pa.int32()),
+                    ]
+                )
+            ),
             nullable=True,
         ),
     ],

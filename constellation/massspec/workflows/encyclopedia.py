@@ -279,10 +279,12 @@ def _classify(source: Path, experiment_dir: Path, convert_raw: bool) -> _Source:
         if not _is_conversion_of(bundle, source):
             if not convert_raw:
                 raise WorkflowError(f"{source.name} has not been converted (dry run)")
-            from constellation.massspec.readers.thermo import convert
+            from constellation.massspec.readers.thermo import convert, default_workers
 
             try:
-                convert(source, bundle, force=True)
+                # Worker processes read the file, so this process never
+                # loads the .NET runtime.
+                convert(source, bundle, force=True, workers=default_workers())
             except ImportError as exc:
                 raise WorkflowError(f"cannot read {source.name}: {exc}") from exc
         return _bundle_source(bundle)

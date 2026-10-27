@@ -1,8 +1,8 @@
 """Write an EncyclopeDIA ``.dia`` (format 0.8.0) from Constellation peak bundles.
 
 The input is one or more bundles as written by ``massspec convert``
-(``peaks.parquet`` + ``scan_metadata.parquet`` +
-``acquisition_metadata.parquet`` + ``manifest.json``). One bundle gives a
+(the peaks, ``scan_metadata.parquet``, ``acquisition_metadata.parquet``
+and ``manifest.json``; the peaks are read through ``massspec.bundle``). One bundle gives a
 single-run ``.dia``; several give a merged one with each bundle as a
 ``Fraction``, which is how gas-phase fractions are searched together.
 
@@ -61,6 +61,15 @@ same ``.raw`` inputs, and is what ``_dia_diff`` compares against:
     lands one unit off for ~15% of scans, so the millisecond value is
     first read back as the short decimal the instrument reported
     (``31.043``), which is what the reference divides.
+  - The reference reads injection time and MS2 isolation width as Thermo
+    displays them, rounded to the precision the trailer header declares
+    (3 and 2 decimals: an isolation width of 2.0009 is 2.00, so its
+    windows are centre ± 1.000). Bundles since scan-metadata v4 hold the
+    instrument's full values and record that header
+    (``acquisition_metadata.trailer_header``); for them both are rounded
+    here as Thermo displays them, ties to even. Bundles without
+    the header (older ones, imported ones) already hold what they hold
+    and are not rounded.
 
 **DDA ``ranges`` differ from the reference, on purpose.** For a DDA run
 the reference lists fewer windows than the run has (134,180 rows for
@@ -93,6 +102,7 @@ from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +115,7 @@ from constellation.massspec.acquisition_structure import (
     AcquisitionStructure,
     infer_acquisition_structure,
 )
+from constellation.massspec.bundle import has_peaks, iter_peak_batches
 from constellation.massspec.io.encyclopedia._codec import encode_f4, encode_f8
 from constellation.massspec.io.encyclopedia._schema import (
     DIA_FORMAT_VERSION,
@@ -117,6 +128,7 @@ _SCAN_COLUMNS = (
     "scan",
     "level",
     "rt",
+    "tic",
     "iit",
     "isolation_lower",
     "isolation_upper",
@@ -230,12 +242,17 @@ class _Bundle:
 
 def _load_bundle(path: Path) -> _Bundle:
     path = Path(path)
-    for name in ("peaks.parquet", "scan_metadata.parquet", "acquisition_metadata.parquet"):
-        if not (path / name).is_file():
-            raise FileNotFoundError(
-                f"{path} is not a peak bundle: missing {name} "
-                f"(expected the directory `massspec convert` writes)"
-            )
+    missing = [
+        name for name in ("scan_metadata.parquet", "acquisition_metadata.parquet")
+        if not (path / name).is_file()
+    ]
+    if not has_peaks(path):
+        missing.insert(0, "its peaks")
+    if missing:
+        raise FileNotFoundError(
+            f"{path} is not a peak bundle: missing {', '.join(missing)} "
+            f"(expected the directory `massspec convert` writes)"
+        )
     acq = pq.read_table(path / "acquisition_metadata.parquet").to_pylist()[0]
     if acq.get("profile_mode"):
         raise ValueError(
@@ -277,6 +294,27 @@ def _f32(x: float) -> float:
     return float(np.float32(x))
 
 
+_IIT_LABEL = "Ion Injection Time (ms):"
+_MS2_WIDTH_LABEL = "MS2 Isolation Width:"
+
+
+def _display_precision(acq: dict[str, Any]) -> dict[str, int] | None:
+    """Label -> the precision Thermo displays it with, or None when the
+    bundle records no trailer header (its values are not to be rounded)."""
+    header = acq.get("trailer_header")
+    if not header:
+        return None
+    return {h["label"]: int(h["precision"]) for h in header}
+
+
+def _as_displayed(x: float, places: int) -> float:
+    """``x`` rounded to ``places`` decimals as Thermo displays it: the exact
+    binary value, ties to even (an injection time of 75.5625 ms shows as
+    ``75.562``; 2 of 81,850 scans of a Stellar run are such ties)."""
+    exact = Decimal(x).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_EVEN)
+    return float(exact)
+
+
 def _shortest(x: float) -> float:
     """A float32-held value as the shortest decimal that round-trips to it.
 
@@ -309,9 +347,16 @@ def _scan_rows(bundle: _Bundle) -> _ScanRows:
     level = t.column("level").to_numpy().astype(np.int8)
     rt_exact = t.column("rt").to_numpy().astype(np.float64)
     rt = rt_exact.astype(np.float32).astype(np.float64)
-    iit = [None if v is None else _f32(_shortest(v) / 1000.0) for v in t.column("iit").to_pylist()]
+    displayed = _display_precision(bundle.acq)
+    if displayed is None:
+        iit_ms = _shortest
+    else:
+        iit_places = displayed.get(_IIT_LABEL, 3)
+        iit_ms = lambda v: _as_displayed(float(np.float32(v)), iit_places)  # noqa: E731
+    iit = [None if v is None else _f32(iit_ms(v) / 1000.0) for v in t.column("iit").to_pylist()]
     lower = t.column("isolation_lower").to_numpy(zero_copy_only=False).astype(np.float64)
     upper = t.column("isolation_upper").to_numpy(zero_copy_only=False).astype(np.float64)
+    width_places = None if displayed is None else displayed.get(_MS2_WIDTH_LABEL, 2)
     target = np.full(scan.shape, np.nan)
     charge_raw = t.column("precursor_charge").to_pylist()
     charge = np.array([0 if c is None else int(c) for c in charge_raw], dtype=np.int64)
@@ -360,6 +405,10 @@ def _scan_rows(bundle: _Bundle) -> _ScanRows:
                 # the instrument's full-precision isolation m/z, so the
                 # centre less the offset gives that m/z back.
                 target[i] = (lower[i] + upper[i]) / 2.0 - (offset[i] or 0.0)
+                if width_places is not None:
+                    half = _as_displayed(upper[i] - lower[i], width_places) / 2.0
+                    centre = target[i] + (offset[i] or 0.0)
+                    lower[i], upper[i] = centre - half, centre + half
     f32 = lambda a: a.astype(np.float32).astype(np.float64)  # noqa: E731
     return _ScanRows(
         scan, level, rt, rt_exact, iit, f32(lower), f32(upper), f32(target), charge, parent
@@ -372,20 +421,22 @@ def _scan_rows(bundle: _Bundle) -> _ScanRows:
 
 
 def _iter_scan_peaks(
-    peaks_path: Path, batch_rows: int
+    bundle_path: Path, batch_rows: int
 ) -> Iterator[tuple[int, np.ndarray, np.ndarray]]:
     """Yield ``(scan, mz, intensity)`` for each scan that has peaks.
 
-    ``peaks.parquet`` is one row per peak, scan-major. A scan can straddle
-    two record batches (row groups are cut on RT bins and on pyarrow's
-    own size limit, neither of which respects scan boundaries), so the
-    trailing scan of each batch is carried into the next.
+    A bundle's peaks are one row per peak, scan-major, across its peak
+    files in order. A scan can straddle two record batches (row groups
+    are cut on RT bins and on pyarrow's own size limit, neither of which
+    respects scan boundaries), so the trailing scan of each batch is
+    carried into the next.
     """
     carry_scan: int | None = None
     carry_mz: list[np.ndarray] = []
     carry_int: list[np.ndarray] = []
-    pf = pq.ParquetFile(peaks_path)
-    for batch in pf.iter_batches(batch_size=batch_rows, columns=["scan", "mz", "intensity"]):
+    for batch in iter_peak_batches(
+        bundle_path, columns=["scan", "mz", "intensity"], batch_rows=batch_rows
+    ):
         scan = batch.column(0).to_numpy()
         mz = batch.column(1).to_numpy()
         inten = batch.column(2).to_numpy()
@@ -435,6 +486,10 @@ def _run_start_time(creation_date: str | None) -> str | None:
     return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _present(*pairs: tuple[str, Any]) -> list[tuple[str, Any]]:
+    return [(key, value) for key, value in pairs if value is not None]
+
+
 def _single_run_metadata(
     bundle: _Bundle,
     out_path: Path,
@@ -450,10 +505,14 @@ def _single_run_metadata(
       ``filelocation``, ``runStartTime``, ``InstrumentConfigurations``,
       ``SoftwareVersion_*``;
     - provenance a bundle can state exactly: ``file.*``, ``run.*`` scan
-      and time extents, ``instrument.*``, ``acq.*``;
-    - nothing else. Keys the reference carries that a bundle cannot back
-      (instrument-method text, sample vial, integrated-intensity
-      summaries) are omitted, not guessed.
+      and time extents, ``instrument.*``, ``acq.*``, and from a Thermo
+      bundle that records them (acquisition metadata v2) the run header
+      (``thermo.run.*``, ``run.start_time_iso8601``), the sample
+      (``thermo.sample.*``), the instrument method text
+      (``thermo.instrument_method.*``, which needs RawFileReader 8.x) and
+      ``run.tic_total``, the instrument's MS1 TIC summed in scan order;
+    - nothing else. A key the reference carries that a bundle cannot back
+      is omitted, not guessed.
     """
     acq, s = bundle.acq, bundle.structure
     scans = bundle.scans
@@ -488,14 +547,44 @@ def _single_run_metadata(
         ("run.start_scan", int(scan_no.min())),
         ("run.end_scan", int(scan_no.max())),
         ("run.total_scans", int(scan_no.size)),
-        ("run.gradient_length_seconds", float(rt.max() - rt.min())),
     ]
+    md += _present(
+        ("thermo.run.expected_run_time", acq.get("expected_run_minutes")),
+        ("thermo.run.max_integrated_intensity", acq.get("max_integrated_intensity")),
+        ("thermo.run.spectra_count", acq.get("spectra_count")),
+        ("run.start_time_iso8601", acq.get("run_start_time")),
+    )
+    md.append(("run.gradient_length_seconds", float(rt.max() - rt.min())))
+    if acq.get("run_start_minutes") is not None and acq.get("run_end_minutes") is not None:
+        md.append(("thermo.run.duration_minutes", acq["run_end_minutes"] - acq["run_start_minutes"]))
+    if acq.get("source_format") == "thermo_raw" and "tic" in scans.column_names:
+        # The instrument's TIC (a Thermo bundle's), MS1 scans, in scan order.
+        ms1_tic = scans.filter(pc.equal(scans.column("level"), 1)).column("tic").to_pylist()
+        if ms1_tic and None not in ms1_tic:
+            total = 0.0
+            for value in ms1_tic:
+                total += value
+            md.append(("run.tic_total", total))
     if model:
         md += [("instrument.model", model), ("instrument.name", model)]
     if acq.get("instrument_serial"):
         md.append(("instrument.serial_number", acq["instrument_serial"]))
     if software:
         md.append(("instrument.software_version", software))
+    md += _present(
+        ("thermo.sample.injection_volume", acq.get("sample_injection_volume")),
+        ("thermo.sample.instrument_method_file", acq.get("sample_method_file")),
+        ("thermo.sample.raw_file_name", acq.get("sample_raw_file_name")),
+        ("thermo.sample.vial", acq.get("sample_vial")),
+    )
+    methods = acq.get("instrument_methods") or []
+    if methods:
+        md.append(("thermo.instrument_method.count", len(methods)))
+        for i, method in enumerate(methods):
+            md += [
+                (f"thermo.instrument_method.{i}.name", method["name"]),
+                (f"thermo.instrument_method.{i}.raw_text", method["text"]),
+            ]
     if analyzers:
         md.append(("acq.mass_analyzers", ",".join(analyzers)))
     if polarities:
@@ -711,11 +800,11 @@ def _write_fraction(
     """Insert one bundle's scans. Returns ``(sum of MS1 TIC, window stats)``.
 
     Scan metadata drives the loop, not the peak table: a scan with no
-    peaks has no rows in ``peaks.parquet`` but still exists, and is
+    peaks has no peak rows but still exists, and is
     written with empty arrays.
     """
     empty = np.empty(0)
-    peaks = _iter_scan_peaks(bundle.path / "peaks.parquet", batch_rows)
+    peaks = _iter_scan_peaks(bundle.path, batch_rows)
     pending = next(peaks, None)
     tic_sum = 0.0
     # (lower, upper) → [n scans, first rt, last rt, first exact rt, last exact rt]
@@ -733,7 +822,7 @@ def _write_fraction(
             sc = int(rows.scan[i])
             if pending is not None and pending[0] < sc:
                 raise ValueError(
-                    f"{bundle.path}: peaks.parquet has scan {pending[0]}, which "
+                    f"{bundle.path}: the peaks have scan {pending[0]}, which "
                     f"scan_metadata.parquet does not list"
                 )
             if pending is not None and pending[0] == sc:
@@ -776,7 +865,7 @@ def _write_fraction(
             con.executemany(insert_ms2, ms2_rows)
     if pending is not None:
         raise ValueError(
-            f"{bundle.path}: peaks.parquet has scan {pending[0]}, which "
+            f"{bundle.path}: the peaks have scan {pending[0]}, which "
             f"scan_metadata.parquet does not list"
         )
     return tic_sum, windows

@@ -20,14 +20,14 @@ conda-installed runtime when the user hasn't set it explicitly.
 Call ``load_clr()`` before importing any ``ThermoFisher.CommonCore.*``
 namespace. It is idempotent.
 
-A subtlety: ``OpenMcdf.dll`` is **bundled and AddReference'd** but
-Constellation never decodes a method blob through it. CommonCore.RawFileReader
-lazy-loads OpenMcdf internally to back its compound-document
-method-storage path — without OpenMcdf on disk you get a missing-assembly
-error inside a later API call, even from code paths that look unrelated.
-We read only ``SampleInformation.InstrumentMethodFile`` (the bare
-filename); the in-``.raw`` method-text decode via ``GetInstrumentMethod(i)``
-returns the literal string ``"None"`` on some firmware and isn't wired.
+A subtlety: ``OpenMcdf.dll`` is **bundled and AddReference'd** because
+CommonCore.RawFileReader lazy-loads it to read the instrument method
+stored in a ``.raw`` (a compound document) — without OpenMcdf on disk you
+get a missing-assembly error inside a later API call, even from code paths
+that look unrelated. RawFileReader 8.x returns that method's text on
+Linux; CommonCore 5.0.0.93 returns None. 8.x also depends on
+``CommandLine.dll`` and ships ``ThermoFisher.CommonCore.RandomAccessReaderPlugin.dll``;
+both are resolved from the DLL directory as they are needed.
 """
 
 from __future__ import annotations
@@ -41,11 +41,9 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-# CommonCore DLL names actually loaded by the reader. Matches
-# ms_deisotope's minimum surface. Other CommonCore DLLs
-# (BackgroundSubtraction, MassPrecisionEstimator) are unused by the
-# scan-iteration path and not shipped in the upstream
-# ThermoRawFileParser artifact we fetch.
+# CommonCore DLL names loaded by the reader, present in both supported
+# packs (RawFileReader 8.x and the legacy CommonCore 5.0). Other CommonCore
+# DLLs (BackgroundSubtraction, MassPrecisionEstimator) are unused.
 REQUIRED_DLLS: tuple[str, ...] = (
     "ThermoFisher.CommonCore.Data.dll",
     "ThermoFisher.CommonCore.RawFileReader.dll",

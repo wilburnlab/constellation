@@ -58,6 +58,7 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from constellation.core.io.schemas import pack_metadata
+from constellation.massspec.bundle import open_peaks
 from constellation.massspec.schemas import (
     MS_PEAK_INDEX_SCHEMA_VERSION,
     MS_PEAK_INDEX_TABLE,
@@ -140,12 +141,9 @@ def _now_iso() -> str:
 
 
 def _open_peaks(peaks_dir: Path) -> ds.Dataset:
-    """Open a peaks source: a convert bundle (peaks.parquet), a shard
-    directory, or a direct parquet file."""
-    p = Path(peaks_dir)
-    if p.is_dir() and (p / "peaks.parquet").exists():
-        return ds.dataset(p / "peaks.parquet")
-    return ds.dataset(p)
+    """Open a peaks source: a convert bundle, a shard directory, or a
+    direct parquet file."""
+    return open_peaks(peaks_dir)
 
 
 def _index_schema(downcast: frozenset[str]) -> pa.Schema:

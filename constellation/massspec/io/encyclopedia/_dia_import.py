@@ -4,7 +4,7 @@ The reverse of :mod:`._dia_write`. A ``.dia`` from anywhere (MSRawJava,
 MSForest, EncyclopeDIA's own converter, another lab) becomes the same
 on-disk shape ``massspec convert`` produces from a ``.raw``::
 
-    <out>/<name>/peaks.parquet                 MS_PEAK_TABLE, one row per peak
+    <out>/<name>/peaks/part-00000.parquet      MS_PEAK_TABLE, one row per peak
     <out>/<name>/scan_metadata.parquet         SCAN_METADATA_TABLE
     <out>/<name>/acquisition_metadata.parquet  ACQUISITION_METADATA_TABLE
     <out>/<name>/manifest.json
@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import shutil
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,17 +49,24 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from constellation.massspec.bundle import (
+    LEGACY_PEAKS_FILE,
+    PEAKS_DIR,
+    PeakWriter,
+    part_name,
+    peak_rows,
+)
 from constellation.massspec.io.encyclopedia._dia import DiaFile, scan_number
 from constellation.massspec.schemas import (
     ACQUISITION_METADATA_SCHEMA_VERSION,
     ACQUISITION_METADATA_TABLE,
-    MS_PEAK_TABLE,
     SCAN_METADATA_TABLE,
 )
 
 SOURCE_FORMAT = "encyclopedia_dia"
 BUNDLE_KIND = "encyclopedia_dia_acquisition"
-MANIFEST_SCHEMA_VERSION = 1
+# v2: the peaks are `peaks/part-00000.parquet` (v1: `peaks.parquet`).
+MANIFEST_SCHEMA_VERSION = 2
 
 # One scan, as the merge and the two writers pass it around.
 _Scan = dict[str, Any]
@@ -113,71 +121,58 @@ def _parent_scan(precursor_name: str | None) -> int | None:
 
 
 class _PeakWriter:
-    """Buffer scans and flush one row group per RT bin, as ``convert`` does."""
+    """Collect scans and write their peak rows, as ``convert`` does."""
+
+    _BLOCK_SCANS = 512
+    _BLOCK_PEAKS = 1 << 20
 
     def __init__(self, path: Path, rt_bin_width_s: float):
-        self._writer = pq.ParquetWriter(
-            str(path), MS_PEAK_TABLE, compression="zstd", use_dictionary=False
-        )
-        self._width = rt_bin_width_s
-        self._bin: int | None = None
+        self._writer = PeakWriter(path, rt_bin_width_s=rt_bin_width_s)
         self._scans: list[_Scan] = []
+        self._n_peaks = 0
 
     def add(self, scan: _Scan) -> None:
         if scan["mz"].size == 0:
             return
-        this = int(scan["rt"] // self._width)
-        if self._bin is not None and this != self._bin:
-            self.flush()
-        self._bin = this
         self._scans.append(scan)
+        self._n_peaks += scan["mz"].size
+        if len(self._scans) >= self._BLOCK_SCANS or self._n_peaks >= self._BLOCK_PEAKS:
+            self._write_block()
 
-    def flush(self) -> None:
+    def _write_block(self) -> None:
         if not self._scans:
             return
-        sizes = np.array([s["mz"].size for s in self._scans])
-        n = int(sizes.sum())
+        ms2 = [s["level"] == 2 for s in self._scans]
 
-        def repeat(key: str, dtype: pa.DataType, ms2_only: bool = False) -> pa.Array:
-            values = [
-                None if (ms2_only and s["level"] != 2) else s[key] for s in self._scans
-            ]
-            return pa.array(values, type=dtype).take(
-                pa.array(np.repeat(np.arange(len(values)), sizes), pa.int64())
-            )
+        def ms2_only(key: str, dtype: pa.DataType) -> pa.Array:
+            return pa.array([s[key] if m else None for s, m in zip(self._scans, ms2)], dtype)
 
-        charge = [
-            None if (s["level"] != 2 or not s["charge"]) else s["charge"] for s in self._scans
-        ]
-        index = pa.array(np.repeat(np.arange(len(self._scans)), sizes), pa.int64())
-        columns: dict[str, pa.Array] = {
-            "scan": repeat("scan", pa.int32()),
-            "level": repeat("level", pa.int8()),
-            "rt": repeat("rt", pa.float64()),
-            "mz": pa.array(np.concatenate([s["mz"] for s in self._scans]), pa.float64()),
-            "intensity": pa.array(
-                np.concatenate([s["intensity"] for s in self._scans]).astype(np.float64),
-                pa.float64(),
+        scans = pa.table({
+            "scan": pa.array([s["scan"] for s in self._scans], pa.int32()),
+            "level": pa.array([s["level"] for s in self._scans], pa.int8()),
+            "rt": pa.array([s["rt"] for s in self._scans], pa.float64()),
+            "isolation_lower": ms2_only("lower", pa.float64()),
+            "isolation_upper": ms2_only("upper", pa.float64()),
+            "precursor_scan": ms2_only("parent", pa.float64()),
+            "precursor_mz": ms2_only("target", pa.float64()),
+            "precursor_charge": pa.array(
+                [(s["charge"] or None) if m else None for s, m in zip(self._scans, ms2)],
+                pa.int8(),
             ),
-            "isolation_lower": repeat("lower", pa.float64(), ms2_only=True),
-            "isolation_upper": repeat("upper", pa.float64(), ms2_only=True),
-            "precursor_scan": repeat("parent", pa.float64(), ms2_only=True),
-            "precursor_mz": repeat("target", pa.float64(), ms2_only=True),
-            "precursor_charge": pa.array(charge, pa.int8()).take(index),
-        }
-        table = pa.table(
-            {
-                f.name: columns.get(f.name, pa.nulls(n, f.type))
-                for f in MS_PEAK_TABLE
-            },
-            schema=MS_PEAK_TABLE,
-        )
-        self._writer.write_table(table)
+        })
+        counts = np.array([s["mz"].size for s in self._scans], dtype=np.int64)
+        mz = np.concatenate([s["mz"] for s in self._scans]).astype(np.float64)
+        intensity = np.concatenate([s["intensity"] for s in self._scans]).astype(np.float64)
+        self._writer.write(peak_rows(scans, counts, mz, intensity))
         self._scans = []
+        self._n_peaks = 0
 
     def close(self) -> None:
-        self.flush()
+        self._write_block()
         self._writer.close()
+
+    def abort(self) -> None:
+        self._writer.abort()
 
 
 def _base_peak(scan: _Scan) -> dict[str, float | None]:
@@ -208,6 +203,8 @@ def _scan_metadata_row(scan: _Scan) -> dict[str, Any]:
             else float(str(np.float32(scan["iit_s"]))) * 1000.0
         ),
         "peak_count": int(scan["mz"].size),
+        # A spectra file holds centroids; it does not say what made them.
+        "spectrum_type": "centroid",
         **_base_peak(scan),
         "isolation_lower": scan["lower"] if ms2 else None,
         "isolation_upper": scan["upper"] if ms2 else None,
@@ -261,8 +258,14 @@ def import_dia(
             bundle = targets[fraction]
             bundle.mkdir(parents=True, exist_ok=True)
             # Remove the manifest first: it is written last, so its
-            # absence marks a bundle that is not complete.
+            # absence marks a bundle that is not complete. Then the peaks
+            # (either layout) and any peak index built from them.
             (bundle / "manifest.json").unlink(missing_ok=True)
+            (bundle / LEGACY_PEAKS_FILE).unlink(missing_ok=True)
+            for stale in (bundle / PEAKS_DIR, bundle / "mz_index"):
+                if stale.is_dir():
+                    shutil.rmtree(stale)
+            (bundle / PEAKS_DIR).mkdir()
             # Within a fraction both tables are in scan order, so a
             # two-way merge restores the acquisition order.
             merged = heapq.merge(
@@ -270,7 +273,7 @@ def import_dia(
                 _scans(dia.iter_spectra(fraction=fraction), 2),
                 key=lambda s: s["scan"],
             )
-            peaks = _PeakWriter(bundle / "peaks.parquet", rt_bin_width_s)
+            peaks = _PeakWriter(bundle / PEAKS_DIR / part_name(0), rt_bin_width_s)
             rows: list[dict[str, Any]] = []
             previous: int | None = None
             try:
@@ -284,8 +287,10 @@ def import_dia(
                     previous = scan["scan"]
                     peaks.add(scan)
                     rows.append(_scan_metadata_row(scan))
-            finally:
-                peaks.close()
+            except BaseException:
+                peaks.abort()
+                raise
+            peaks.close()
 
             scan_table = pa.Table.from_pylist(rows, schema=SCAN_METADATA_TABLE)
             pq.write_table(scan_table, bundle / "scan_metadata.parquet", compression="zstd")
@@ -337,7 +342,7 @@ def import_dia(
                     "fraction": fraction,
                 },
                 "outputs": {
-                    "peaks": "peaks.parquet",
+                    "peaks": PEAKS_DIR,
                     "scan_metadata": "scan_metadata.parquet",
                     "acquisition_metadata": "acquisition_metadata.parquet",
                 },

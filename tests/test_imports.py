@@ -65,6 +65,7 @@ import constellation.massspec.rt
 import constellation.massspec.rt.encyclopedia
 import constellation.massspec.rt.pairs
 import constellation.massspec.scans
+import constellation.massspec.bundle
 import constellation.core.detach
 import constellation.core.locks
 import constellation.massspec.cli.quantify
@@ -86,6 +87,9 @@ import constellation.massspec.readers.thermo._filter
 import constellation.massspec.readers.thermo._trailer
 import constellation.massspec.readers.thermo._netruntime
 import constellation.massspec.readers.thermo._read
+import constellation.massspec.readers.thermo._scans
+import constellation.massspec.readers.thermo._convert
+import constellation.massspec.readers.thermo._batch
 import constellation.massspec.readers.thermo.manifest
 import constellation.massspec.peptide
 import constellation.massspec.peptide.envelope
