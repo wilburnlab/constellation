@@ -47,6 +47,7 @@ from ._read import (
     SOURCE_FORMAT,
     EmptyLevelError,
     ThermoReader,
+    UnreadableScansError,
     describe_levels,
     level_summary,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "RawFileReaderError",
     "ThermoAcquisitionManifest",
     "ThermoReader",
+    "UnreadableScansError",
     "convert",
     "convert_batch",
     "default_workers",

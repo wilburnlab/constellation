@@ -360,6 +360,7 @@ class _Job:
             with PeakWriter(self.out_dir / PEAKS_DIR / part_name(0)):
                 pass
         scans = _read._concat_scans([self.results[i] for i in range(len(self.ranges))])
+        _read._check_scans_read(self.n_scans, scans)
         levels = _read.level_summary(scans)
         for line in _read.describe_levels(levels):
             logger.info("%s: %s", self.src.name, line)
@@ -555,8 +556,8 @@ def convert(
     ``profile`` keeps profile points; otherwise profile scans are
     centroided, by ``centroider`` where the instrument stored no centroids.
     A level whose scans all come out without peaks fails the conversion
-    unless ``allow_empty_levels``. A failed conversion removes what it
-    wrote. ``workers`` > 1 reads ranges of scans in that many processes.
+    unless ``allow_empty_levels``; a file none of whose scans can be read
+    fails it always. A failed conversion removes what it wrote. ``workers`` > 1 reads ranges of scans in that many processes.
     ``batch_size`` is the number of scans read per block.
 
     ``progress_cb`` receives ``stage_start`` / ``stage_progress`` /

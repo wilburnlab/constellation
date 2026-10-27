@@ -59,6 +59,10 @@ class EmptyLevelError(ValueError):
     """A conversion found an MS level whose scans have no peaks at all."""
 
 
+class UnreadableScansError(RuntimeError):
+    """A file has scans, but none of them could be read."""
+
+
 def _constellation_version() -> str:
     """Resolve the installed constellation package version (fallback to dev sentinel)."""
     from importlib.metadata import PackageNotFoundError, version
@@ -343,6 +347,20 @@ def _check_levels(summary: list[dict[str, Any]], scans: pa.Table) -> None:
     )
 
 
+def _check_scans_read(n_scans: int, scans: pa.Table) -> None:
+    """Refuse a file whose every scan failed to read.
+
+    The range reader leaves out a scan it cannot read; without this, a
+    file it can read none of would give an empty bundle, as if the run had
+    recorded nothing.
+    """
+    if n_scans and scans.num_rows == 0:
+        raise UnreadableScansError(
+            f"none of the file's {n_scans:,} scans could be read; the warning "
+            "logged for each says why"
+        )
+
+
 # ── reader ────────────────────────────────────────────────────────────
 
 
@@ -388,6 +406,7 @@ class ThermoReader(RawReader):
                 peaks.append(block.peak_table())
                 scans.append(block.scans)
         scan_table = _concat_scans(scans)
+        _check_scans_read(max(last - first + 1, 0), scan_table)
         peak_table = pa.concat_tables(peaks) if peaks else MS_PEAK_TABLE.empty_table()
         # ReadResult.run_metadata is a flat dict — the most useful fields of
         # the acquisition table for callers who don't want to open the

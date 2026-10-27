@@ -654,6 +654,26 @@ class TestConvert:
         m = convert(src, out, allow_empty_levels=True)
         assert m.run_metadata["levels"][1]["n_peaks"] == 0
 
+    def test_a_file_whose_scans_cannot_be_read_fails(self, raw, tmp_path):
+        from constellation.massspec.readers.thermo import (
+            ThermoReader,
+            UnreadableScansError,
+            convert,
+        )
+
+        fake, src = raw
+
+        def refuse(n):
+            raise RuntimeError(f"scan {n} is damaged")
+
+        fake.GetScanStatsForScanNumber = refuse
+        out = tmp_path / "run"
+        with pytest.raises(UnreadableScansError, match="none of the file's 4 scans"):
+            convert(src, out, allow_empty_levels=True)
+        assert list(out.iterdir()) == []
+        with pytest.raises(UnreadableScansError):
+            ThermoReader().read(src)
+
     def test_force_clears_what_an_earlier_conversion_left(self, raw, tmp_path):
         from constellation.massspec.readers.thermo import convert
 
