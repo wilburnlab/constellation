@@ -292,9 +292,9 @@ class TestManifestRoundTrip:
             path,
             source_file="/data/run42.raw",
             source_sha256="deadbeef" * 8,
-            parameters={"rt_bin_width_s": 60.0, "profile_mode": False},
+            parameters={"rt_bin_width_s": 60.0},
             outputs={
-                "peaks": "peaks.parquet",
+                "peaks": "peaks",
                 "scan_metadata": "scan_metadata.parquet",
                 "acquisition_metadata": "acquisition_metadata.parquet",
             },
@@ -308,7 +308,7 @@ class TestManifestRoundTrip:
         assert rt.source_file == "/data/run42.raw"
         assert rt.source_sha256 == "deadbeef" * 8
         assert rt.parameters["rt_bin_width_s"] == 60.0
-        assert rt.outputs["peaks"] == "peaks.parquet"
+        assert rt.outputs["peaks"] == "peaks"
         assert rt.run_metadata["n_scans"] == 4242
 
         rt2 = read_manifest_dir(tmp_path)
@@ -395,14 +395,87 @@ class TestRangeReader:
         assert peaks.column("peak_resolution").to_pylist() == [6e4, 5e4, None, None, None, None, None]
         assert peaks.column("peak_noise").null_count == 5
 
-    def test_profile_keeps_points(self, fake_centroider):
-        scans, peaks = _read(self._raw(), profile=True)
-        assert scans.column("spectrum_type").to_pylist() == [
+    def test_stored_points_come_with_the_peaks(self, fake_centroider):
+        from constellation.massspec.readers.thermo._scans import ReadOptions, iter_scan_blocks
+
+        raw = self._raw()
+        blocks = list(iter_scan_blocks(raw, 1, 4, ReadOptions(keep_profile=True), max_block_scans=2))
+        scans = pa.concat_tables([b.scans for b in blocks])
+        points = pa.concat_tables([b.point_scans() for b in blocks])
+        # `scans` says what the peaks are; `point_scans` what the points are.
+        assert scans.column("peak_count").to_pylist() == [2, 3, 2, 0]
+        assert scans.column("centroider").to_pylist() == [
+            "instrument", "instrument", "thermo", "instrument",
+        ]
+        assert points.column("spectrum_type").to_pylist() == [
             "profile", "centroid", "profile", "profile",
         ]
-        assert scans.column("centroider").to_pylist() == [None, "instrument", None, None]
+        assert points.column("centroider").to_pylist() == [None, "instrument", None, None]
+        assert points.column("peak_count").to_pylist() == [3, 3, 4, 2]
+        assert sum(b.point_table().num_rows for b in blocks) == 12
+        assert sum(b.peak_table().num_rows for b in blocks) == 7
+
+    def test_no_centroider_gives_the_points_alone(self, fake_centroider):
+        from constellation.massspec.readers.thermo._scans import ReadOptions, iter_scan_blocks
+
+        raw = self._raw()
+        options = ReadOptions(keep_profile=True, centroider=None)
+        blocks = list(iter_scan_blocks(raw, 1, 4, options))
+        assert all(b.peaks is None for b in blocks)
+        scans = pa.concat_tables([b.scans for b in blocks])
         assert scans.column("peak_count").to_pylist() == [3, 3, 4, 2]
-        assert peaks.num_rows == 12
+        assert scans.column("centroider").to_pylist() == [None, "instrument", None, None]
+
+    def test_one_load_gives_both_lists_of_an_ion_trap_scan(self, fake_centroider, monkeypatch):
+        from constellation.massspec.readers.thermo import _scans
+
+        raw = self._raw()
+        loads: list[int] = []
+        original = _scans._load_scan
+        monkeypatch.setattr(_scans, "_load_scan", lambda r, n: loads.append(n) or original(r, n))
+        segmented: list[int] = []
+        read = raw.GetSegmentedScanFromScanNumber
+        raw.GetSegmentedScanFromScanNumber = lambda n, s: segmented.append(n) or read(n, s)
+        list(_scans.iter_scan_blocks(raw, 3, 3, _scans.ReadOptions(keep_profile=True)))
+        assert loads == [3] and segmented == []
+
+    def test_blank_trailer_is_null_and_its_display_is_kept(self, fake_centroider):
+        """A blank trailer's zeros are not measurements (ledger #20)."""
+        blank = [
+            ("Micro Scan Count:", "0"), ("Ion Injection Time (ms):", "0.000"),
+            ("Elapsed Scan Time (sec):", "0.000"), ("Master Scan Number:", "0"),
+            ("Monoisotopic M/Z:", "0.0000"), ("Charge State:", "0"),
+            ("MS2 Isolation Width:", "0.00"), ("MS2 Isolation Offset:", "0.00"),
+            ("FAIMS Voltage On:", "No"), ("HCD Energy:", "0.0"),
+        ]
+        normal = [
+            ("Micro Scan Count:", "1"), ("Ion Injection Time (ms):", "39.591"),
+            ("Elapsed Scan Time (sec):", "0.038"), ("HCD Energy:", "24.0"),
+        ]
+        event = FakeEvent(mass=500.25, width=8.0036)
+        raw = FakeRaw({
+            1: scan(MS2, rt_min=0.1, mz=[300.0, 400.0], trailer=normal, event=event),
+            2: scan(MS2, rt_min=0.2, mz=[300.0, 400.0], trailer=blank, event=event),
+        })
+        ok, gone = _read(raw)[0].to_pylist()
+        assert ok["iit"] == pytest.approx(39.591) and ok["microscan_count"] == 1
+        for column in ("iit", "microscan_count", "ms2_isolation_width", "ms2_isolation_offset",
+                       "hcd_energy", "faims_voltage_on", "master_scan", "precursor_scan",
+                       "precursor_charge", "monoisotopic_mz_override"):
+            assert gone[column] is None, column
+        # The spectrum and the scan event's values are intact...
+        assert gone["peak_count"] == 2 and gone["precursor_mz"] == 500.25
+        assert gone["isolation_upper"] - gone["isolation_lower"] == pytest.approx(8.0036)
+        # ...and the file's own strings stay readable.
+        assert ("Ion Injection Time (ms):", "0.000") in gone["trailer_extras"]
+
+    def test_a_zero_injection_time_alone_is_not_a_blank_trailer(self, fake_centroider):
+        raw = FakeRaw({1: scan(MS1, rt_min=0.1, mz=[400.0], trailer=[
+            ("Micro Scan Count:", "1"), ("Ion Injection Time (ms):", "0.000"),
+            ("Elapsed Scan Time (sec):", "0.021"),
+        ])})
+        row = _read(raw)[0].to_pylist()[0]
+        assert row["iit"] == 0.0 and row["microscan_count"] == 1
 
     def test_scan_metadata(self, fake_centroider):
         scans, peaks = _read(self._raw())
@@ -572,7 +645,7 @@ class TestConvert:
             "acquisition_metadata.parquet",
         }
         assert [p.name for p in (tmp_path / "run" / "peaks").iterdir()] == ["part-00000.parquet"]
-        assert m.schema_version == 2
+        assert m.schema_version == 3
         assert m.outputs["peaks"] == "peaks"
         assert m.parameters["peaks"] == "centroid"
         assert m.parameters["centroider"] == "thermo"
@@ -583,7 +656,6 @@ class TestConvert:
             "MS2: 1 scans, 3 peaks (1 centroided by the instrument)",
         ]
         acq = pq.read_table(tmp_path / "run" / "acquisition_metadata.parquet").to_pylist()[0]
-        assert acq["profile_mode"] is False  # nothing stored as profile
         assert [h["label"] for h in acq["trailer_header"]][:2] == [
             "Ion Injection Time (ms):", "AGC:",
         ]
@@ -630,16 +702,6 @@ class TestConvert:
         acq = pq.read_table(tmp_path / "old" / "acquisition_metadata.parquet").to_pylist()[0]
         assert acq["instrument_methods"] is None and acq["sample_vial"] is None
         assert acq["sample_raw_file_name"] == "D:\\run.raw"
-
-    def test_profile_bundle_says_so(self, raw, tmp_path):
-        from constellation.massspec.readers.thermo import convert
-
-        _, src = raw
-        m = convert(src, tmp_path / "run", profile=True, compute_sha256=False)
-        acq = pq.read_table(tmp_path / "run" / "acquisition_metadata.parquet").to_pylist()[0]
-        assert acq["profile_mode"] is True
-        assert m.parameters["peaks"] == "profile"
-        assert m.source_sha256 is None
 
     def test_empty_level_fails_and_leaves_nothing(self, raw, tmp_path):
         from constellation.massspec.readers.thermo import EmptyLevelError, convert

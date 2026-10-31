@@ -37,6 +37,7 @@ from constellation.massspec.quant.targets import load_targets, targets_from_expe
 from constellation.massspec.search.encyclopedia.outputs import expected_names, output_inventory
 from constellation.massspec.search.encyclopedia.params import SearchParameters, Tolerance
 from constellation.massspec.search.encyclopedia.runner import UnknownFlagError
+from constellation.massspec.bundle import BUNDLE_SCHEMA_VERSION
 from constellation.massspec.workflows import encyclopedia as workflow
 from constellation.massspec.experiment import summarize
 from constellation.massspec.workflows.encyclopedia import (
@@ -59,7 +60,7 @@ def _bundle(root: Path, name: str, scans=None) -> Path:
     (bundle / "manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": BUNDLE_SCHEMA_VERSION,
                 "kind": "thermo_acquisition",
                 "source_file": f"/data/{name}.raw",
                 "source_sha256": f"sha-of-{name}",
@@ -398,6 +399,8 @@ def test_a_bundle_is_searched_into_an_experiment(tmp_path: Path, jar, inputs) ->
         "written_by": "constellation",
         "link": "jar/run_01.dia",
         "linked_as": "symlink",
+        "peak_list": None,
+        "mz_axis": None,
     }
     assert manifest.outputs["result_library"] == "jar/run_01.dia.elib"
     assert manifest.outputs["<input>.features.txt"] == "jar/run_01.dia.features.txt"
@@ -802,6 +805,8 @@ def test_a_given_spectra_file_is_linked_in_and_left_alone(tmp_path: Path, jar, i
         "written_by": "given",
         "link": "jar/run_01.dia",
         "linked_as": "symlink",
+        "peak_list": None,
+        "mz_axis": None,
     }
     assert result.table_rows["precursor"] == 3
     (row,) = load_acquisitions(experiment / "acquisitions").table.to_pylist()
@@ -913,3 +918,162 @@ def test_the_search_command_drives_the_workflow(tmp_path: Path, jar, inputs, cap
     err = capsys.readouterr().err
     assert "warning: the result records -ptol '10' but the search asked for '0.35'" in err
     assert "check the jar's log before using it" in err
+
+
+# ── other peak lists of a run, and corrected m/z ─────────────────────────
+
+
+def _derived(root: Path, source: Path, name: str, *, sha: str = "sha-of-run_01") -> Path:
+    """A peak list made from the same run as ``source``: same hash, its own
+    directory, and a manifest that says what made it."""
+    bundle = _write_bundle(root, name, _dia_scans(seed=7))
+    manifest = json.loads((source / "manifest.json").read_text())
+    (bundle / "manifest.json").write_text(
+        json.dumps(
+            {
+                **manifest,
+                "source_sha256": sha,
+                "derived_from": {"name": "apex-1a2b3c4d", "source": "run_01.profile", "algorithm": "apex"},
+            }
+        )
+    )
+    return bundle
+
+
+def _with_shared_hash(bundle: Path, sha: str = "sha-of-run_01") -> Path:
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    (bundle / "manifest.json").write_text(json.dumps({**manifest, "source_sha256": sha}))
+    return bundle
+
+
+def test_two_peak_lists_of_a_run_are_two_searches_of_one_acquisition(tmp_path, jar, inputs) -> None:
+    experiment = tmp_path / "exp"
+    converted = _bundle(tmp_path, "run_01")
+    derived = _derived(tmp_path, converted, "run_01.apex-1a2b3c4d")
+    first = search_acquisition(converted, experiment_dir=experiment, **inputs)
+    before = (first.unit_dir / "jar" / "run_01.dia").resolve()
+    size = before.stat().st_mtime_ns
+    second = search_acquisition(derived, experiment_dir=experiment, **inputs)
+
+    assert first.unit != second.unit
+    assert first.manifest.acquisition_ids == second.manifest.acquisition_ids
+    # Each read its own file, under the name the jar and the run binding expect.
+    after = (second.unit_dir / "jar" / "run_01.dia").resolve()
+    assert before != after and after.name == "run_01.dia"
+    assert after.parent == experiment / "spectra" / "run_01" / "apex-1a2b3c4d"
+    # The first search's file was not rewritten beneath it.
+    assert (first.unit_dir / "jar" / "run_01.dia").resolve() == before
+    assert before.stat().st_mtime_ns == size
+    assert second.manifest.inputs["spectra_file"]["peak_list"] == "apex-1a2b3c4d"
+    assert first.manifest.inputs["spectra_file"]["peak_list"] is None
+
+
+def test_summarize_says_two_peak_lists_differ(tmp_path, jar, inputs) -> None:
+    experiment = tmp_path / "exp"
+    converted = _bundle(tmp_path, "run_01")
+    search_acquisition(converted, experiment_dir=experiment, **inputs)
+    search_acquisition(_derived(tmp_path, converted, "run_01.apex-1a2b3c4d"), experiment_dir=experiment, **inputs)
+    searches = summarize(experiment)["searches"]
+    assert len(searches) == 2
+    assert all(dict(map(tuple, s["differs_by"])).get("peaks") for s in searches)
+    assert {dict(map(tuple, s["differs_by"]))["peaks"] for s in searches} == {"as converted", "apex-1a2b3c4d"}
+
+
+def test_results_say_which_peak_list_a_search_read(tmp_path, jar, inputs) -> None:
+    from constellation.massspec.results import search_units
+
+    experiment = tmp_path / "exp"
+    converted = _bundle(tmp_path, "run_01")
+    first = search_acquisition(converted, experiment_dir=experiment, **inputs)
+    second = search_acquisition(_derived(tmp_path, converted, "run_01.apex-1a2b3c4d"), experiment_dir=experiment, **inputs)
+    lists = {u["unit"]: u["peak_list"] for u in search_units(experiment)}
+    assert lists == {first.unit: None, second.unit: "apex-1a2b3c4d"}
+
+
+def test_a_default_search_keeps_the_spectra_key_it_always_had(tmp_path, jar, inputs) -> None:
+    """Nothing new enters the key when nothing new is asked for, so `--resume`
+    of an experiment made before finds what it made."""
+    from constellation.core import stages
+    from constellation.massspec.workflows.encyclopedia import SPECTRA_LAYOUT, _bundle_source, _spectra_key
+
+    bundle = _bundle(tmp_path, "run_01")
+    src = _bundle_source(bundle)
+    assert _spectra_key(tmp_path, (src,), src.run) == stages.stage_key(
+        layout=SPECTRA_LAYOUT,
+        sources=[
+            {
+                "bundle": stages.input_identity([bundle / "manifest.json"]),
+                "sha256": "sha-of-run_01",
+            }
+        ],
+    )
+    assert _spectra_key(tmp_path, (src,), src.run, ("abcd1234",)) != _spectra_key(tmp_path, (src,), src.run)
+
+
+def _bundle_with_axis(root: Path, name: str) -> tuple[Path, str]:
+    import pyarrow as pa
+
+    from constellation.massspec.mz_axis import MZ_AXIS_TABLE, MzAxis, save_mz_axis
+
+    bundle = _bundle(root, name)
+    table = pa.Table.from_pylist(
+        [
+            {"level": level, "mz": mz, "shift_th": -0.1, "se_th": 0.001, "coherence": 0.5, "half_window_th": 20.0}
+            for level in (1, 2)
+            for mz in (300.0, 1200.0)
+        ],
+        schema=MZ_AXIS_TABLE,
+    )
+    axis = MzAxis(key="abcd1234", table=table, parameters={"method": "test"})
+    save_mz_axis(bundle, axis)
+    return bundle, axis.key
+
+
+def test_a_stored_curve_changes_no_search_until_it_is_named(tmp_path, jar, inputs) -> None:
+    plain_bundle = _bundle(tmp_path / "a", "run_01")
+    curved_bundle, key = _bundle_with_axis(tmp_path / "b", "run_01")
+    plain = search_acquisition(plain_bundle, experiment_dir=tmp_path / "e1", **inputs)
+    curved = search_acquisition(curved_bundle, experiment_dir=tmp_path / "e2", **inputs)
+    assert curved.manifest.inputs["spectra_file"]["mz_axis"] is None
+    from constellation.massspec.io.encyclopedia import diff_dia
+
+    a = (plain.unit_dir / "jar" / "run_01.dia").resolve()
+    b = (curved.unit_dir / "jar" / "run_01.dia").resolve()
+    assert diff_dia(a, b).identical
+    assert b.parent == tmp_path / "e2" / "spectra" / "run_01"
+
+
+def test_a_named_curve_gets_a_spectra_file_and_a_search_of_its_own(tmp_path, jar, inputs) -> None:
+    from constellation.massspec.io.encyclopedia import DiaFile
+
+    bundle, key = _bundle_with_axis(tmp_path, "run_01")
+    experiment = tmp_path / "exp"
+    plain = search_acquisition(bundle, experiment_dir=experiment, **inputs)
+    corrected = search_acquisition(bundle, experiment_dir=experiment, mz_axis="latest", **inputs)
+
+    assert corrected.unit != plain.unit
+    assert corrected.manifest.acquisition_ids == plain.manifest.acquisition_ids
+    a = (plain.unit_dir / "jar" / "run_01.dia").resolve()
+    b = (corrected.unit_dir / "jar" / "run_01.dia").resolve()
+    assert b.parent == experiment / "spectra" / "run_01" / f"as-converted+{key}"
+    assert corrected.manifest.inputs["spectra_file"]["mz_axis"] == [key]
+    with DiaFile(a) as x, DiaFile(b) as y:
+        assert "constellation.mz_axis" not in x.metadata
+        assert y.metadata["constellation.mz_axis"] == key
+        p = next(x.iter_spectra())
+        q = next(y.iter_spectra())
+    mz_p = p.column("mz_list").to_pylist()[0]
+    mz_q = q.column("mz_list").to_pylist()[0]
+    # Shift of -0.1 subtracted: the corrected m/z read 0.1 higher.
+    assert [round(m2 - m1, 4) for m1, m2 in zip(mz_p, mz_q)][:3] == [0.1, 0.1, 0.1]
+    # And again it finds that file, not the plain one.
+    again = search_acquisition(bundle, experiment_dir=experiment, mz_axis="latest", resume=True, **inputs)
+    assert again.unit == corrected.unit
+
+
+def test_a_curve_a_bundle_lacks_is_refused_before_anything_runs(tmp_path, jar, inputs) -> None:
+    bundle = _bundle(tmp_path, "run_01")
+    with pytest.raises(WorkflowError, match="massspec mz-axis"):
+        search_acquisition(bundle, experiment_dir=tmp_path / "exp", mz_axis="latest", **inputs)
+    with pytest.raises(WorkflowError, match="no m/z axis"):
+        search_acquisition(bundle, experiment_dir=tmp_path / "exp2", mz_axis="deadbeef", **inputs)

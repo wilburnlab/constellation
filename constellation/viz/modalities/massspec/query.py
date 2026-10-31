@@ -54,7 +54,10 @@ class ChromatogramQuery(TrackQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class SpectrumQuery(TrackQuery):
-    """The peaks of one scan, optionally within ``mz_start``..``mz_end``.
+    """One scan's points, optionally within ``mz_start``..``mz_end``, from
+    the run's list named ``peak_list`` (from the acquisition's ``peak_lists``;
+    its main one when omitted). With ``corrected``, m/z has the list's newest
+    measured m/z curve subtracted (a list with no curve stays as stored).
 
     With ``modified_sequence`` (ProForma 2.0) and ``charge``, the peaks are
     annotated with that peptide's ions at ``tolerance`` / ``tolerance_unit``:
@@ -64,6 +67,8 @@ class SpectrumQuery(TrackQuery):
     """
 
     scan: int = field(metadata={"ge": 0})
+    peak_list: str | None = None
+    corrected: bool = False
     mz_start: float | None = None
     mz_end: float | None = None
     modified_sequence: str | None = None

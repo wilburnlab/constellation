@@ -355,6 +355,7 @@ def test_record_from_a_converted_bundle(tmp_path) -> None:
     (tmp_path / "manifest.json").write_text(
         json.dumps(
             {
+                "schema_version": 3,
                 "kind": "thermo_acquisition",
                 "source_file": "/data/run_01.raw",
                 "source_sha256": "a5766964",

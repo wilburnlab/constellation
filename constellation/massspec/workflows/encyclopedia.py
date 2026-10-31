@@ -104,6 +104,12 @@ from constellation.massspec.acquisitions import (
     load_acquisitions,
     save_acquisitions,
 )
+from constellation.massspec.bundle import (
+    OutdatedBundleError,
+    is_profile_bundle,
+    peak_list_name,
+    read_bundle_manifest,
+)
 from constellation.massspec.io.encyclopedia import DiaFile, read_encyclopedia, write_dia
 from constellation.massspec.io.encyclopedia._mirror import open_library, read_metadata
 from constellation.massspec.io.encyclopedia._project import RUN_AGNOSTIC_SOURCE
@@ -215,7 +221,15 @@ class _Source:
 
 
 def _bundle_source(bundle: Path) -> _Source:
-    record = acquisition_record_from_bundle(bundle)
+    if is_profile_bundle(bundle):
+        raise WorkflowError(
+            f"{bundle} is a profile bundle, and a search reads peaks. Give the run's "
+            f"peak bundle, or make a peak list with `constellation massspec centroid`."
+        )
+    try:
+        record = acquisition_record_from_bundle(bundle)
+    except OutdatedBundleError as exc:
+        raise WorkflowError(str(exc)) from exc
     scans = pq.read_table(
         bundle / "scan_metadata.parquet", columns=["level", "isolation_lower", "isolation_upper"]
     )
@@ -235,8 +249,12 @@ def _is_conversion_of(bundle: Path, source: Path) -> bool:
     different file, since within an experiment a file name means one run
     and its conversion is reused by name."""
     try:
-        manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
-    except FileNotFoundError:
+        manifest = read_bundle_manifest(bundle)
+    except OutdatedBundleError:  # an older format, which has to be made again
+        return False
+    except ValueError:
+        if (bundle / "manifest.json").is_file():
+            raise
         return False
     recorded = manifest.get("source_sha256")
     if not recorded:
@@ -253,7 +271,9 @@ def _is_conversion_of(bundle: Path, source: Path) -> bool:
     return True
 
 
-def _classify(source: Path, experiment_dir: Path, convert_raw: bool) -> _Source:
+def _classify(
+    source: Path, experiment_dir: Path, convert_raw: bool, keep_profile: bool = True
+) -> _Source:
     source = Path(source)
     suffix = source.suffix.lower()
     if suffix in _REFUSED_INPUTS:
@@ -284,7 +304,9 @@ def _classify(source: Path, experiment_dir: Path, convert_raw: bool) -> _Source:
             try:
                 # Worker processes read the file, so this process never
                 # loads the .NET runtime.
-                convert(source, bundle, force=True, workers=default_workers())
+                convert(
+                    source, bundle, force=True, workers=default_workers(), keep_profile=keep_profile
+                )
             except ImportError as exc:
                 raise WorkflowError(f"cannot read {source.name}: {exc}") from exc
         return _bundle_source(bundle)
@@ -559,10 +581,23 @@ class SearchPlan:
     engine_version: str
     allow_undocumented: tuple[str, ...]
     annotate_fragments: bool
+    #: A derived peak list being searched; None for a conversion's own.
+    peak_list: str | None = None
+    #: The m/z curve asked for, as named, and what that came to per bundle.
+    mz_axis: str | None = None
+    axis_keys: tuple[str, ...] = ()
 
     @property
     def merged(self) -> bool:
         return bool(self.merged_from)
+
+    @property
+    def spectra_variant(self) -> str | None:
+        """The directory of this plan's spectra file under its run's, if not
+        the run's own: a derived peak list, or corrected m/z."""
+        if self.axis_keys:
+            return f"{self.peak_list or 'as-converted'}+{'+'.join(self.axis_keys)}"
+        return self.peak_list
 
 
 def _merged_name(runs: Sequence[str]) -> str:
@@ -593,6 +628,8 @@ def plan_searches(
     annotate_fragments: bool = True,
     merge: bool = False,
     merged_name: str | None = None,
+    keep_profile: bool = True,
+    mz_axis: str | None = None,
 ) -> list[SearchPlan]:
     """Settle the searches of ``sources`` and register their acquisitions.
 
@@ -626,7 +663,10 @@ def plan_searches(
     experiment_dir.mkdir(parents=True, exist_ok=True)
     with _experiment_lock(experiment_dir):
         _load_experiment(experiment_dir)  # refuse a foreign directory before converting anything
-    srcs = [_classify(Path(s).resolve(), experiment_dir, convert_raw=True) for s in sources]
+    srcs = [
+        _classify(Path(s).resolve(), experiment_dir, convert_raw=True, keep_profile=keep_profile)
+        for s in sources
+    ]
     seen: dict[str, Path] = {}
     for src in srcs:
         if src.run in seen:
@@ -726,7 +766,8 @@ def plan_searches(
     plans = []
     for group, r, (run, acquisition_id, members) in zip(groups, resolved, bound, strict=True):
         settings = {**r.flags, **parameters.flags()}
-        spectra_key = _spectra_key(experiment_dir, group, run)
+        axis_keys = _axis_keys(group, mz_axis)
+        spectra_key = _spectra_key(experiment_dir, group, run, axis_keys)
         search_key = stages.stage_key(
             engine=ENGINE,
             engine_version=handle.version,
@@ -759,6 +800,9 @@ def plan_searches(
                 engine_version=str(handle.version),
                 allow_undocumented=tuple(allow_undocumented),
                 annotate_fragments=annotate_fragments,
+                peak_list=_peak_list(group),
+                mz_axis=mz_axis,
+                axis_keys=axis_keys,
             )
         )
     return plans
@@ -874,6 +918,8 @@ def _run_search(
         "written_by": "constellation" if plan.spectra_key is not None else "given",
         "link": _relative(jar_input, unit_dir),
         "linked_as": linked_as,
+        "peak_list": plan.peak_list,
+        "mz_axis": list(plan.axis_keys) or None,
     }
     record = SearchManifest(
         created_at=_utc_now(),
@@ -1018,11 +1064,17 @@ def search_acquisition(
     annotate_fragments: bool = True,
     resume: bool = False,
     stream_to_stderr: bool = True,
+    keep_profile: bool = True,
+    mz_axis: str | None = None,
 ) -> SearchResult:
     """Search one acquisition and write the result into ``experiment_dir``.
 
     ``source`` is a converted bundle directory, a Thermo ``.raw`` (it is
-    converted into ``<experiment>/bundles/``), or a single-run ``.dia``.
+    converted into ``<experiment>/bundles/``, keeping its profile as a
+    conversion does unless ``keep_profile`` is false), or a single-run ``.dia``.
+    Any peak list is a bundle, and is searched by giving it. ``mz_axis`` names a
+    measured m/z curve of the bundle (``massspec.mz_axis``) to subtract in the
+    spectra file; that file is one of its own, so nothing searched before moves.
     ``search_mode`` defaults to what suits the data (module
     :mod:`constellation.massspec.search.encyclopedia.params`). The
     refusals before anything runs are :func:`plan_searches`'s.
@@ -1037,6 +1089,8 @@ def search_acquisition(
         search_type=search_type,
         allow_undocumented=allow_undocumented,
         annotate_fragments=annotate_fragments,
+        keep_profile=keep_profile,
+        mz_axis=mz_axis,
     )
     return run_search(
         plan,
@@ -1095,6 +1149,8 @@ def search_acquisitions(
     resume: bool = False,
     stream_to_stderr: bool = True,
     progress: SearchProgress | None = None,
+    keep_profile: bool = True,
+    mz_axis: str | None = None,
 ) -> FanOutResult:
     """Search several acquisitions into one experiment, ``jobs`` at a time.
 
@@ -1124,6 +1180,8 @@ def search_acquisitions(
         annotate_fragments=annotate_fragments,
         merge=merge,
         merged_name=merged_name,
+        keep_profile=keep_profile,
+        mz_axis=mz_axis,
     )
     jobs = max(1, min(int(jobs), len(plans)))
     stream = stream_to_stderr and jobs == 1
@@ -1209,11 +1267,56 @@ def _describe_failure(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {message}"
 
 
-def _spectra_dir(experiment_dir: Path, run: str) -> Path:
-    return experiment_dir / "spectra" / run
+def _spectra_dir(experiment_dir: Path, run: str, variant: str | None = None) -> Path:
+    """Where a run's spectra file is. Peak lists other than the conversion's
+    and corrected m/z each have a file of their own under the run's directory,
+    named as the jar expects, because finished searches link to theirs."""
+    directory = experiment_dir / "spectra" / run
+    return directory if variant is None else directory / variant
 
 
-def _spectra_key(experiment_dir: Path, sources: tuple[_Source, ...], run: str) -> str | None:
+def _peak_list(sources: tuple[_Source, ...]) -> str | None:
+    """The name of a derived peak list being searched; None for what a
+    conversion made, whose spectra file has always lain directly under its run."""
+    names = sorted(
+        {
+            peak_list_name(read_bundle_manifest(s.bundle))
+            for s in sources
+            if s.bundle is not None and read_bundle_manifest(s.bundle).get("derived_from")
+        }
+    )
+    return "+".join(names) or None
+
+
+def _axis_keys(sources: tuple[_Source, ...], mz_axis: str | None) -> tuple[str, ...]:
+    """The curves ``mz_axis`` names in these sources, one per bundle. Refused
+    for a spectra file given as input, whose m/z are already what they are."""
+    if mz_axis is None:
+        return ()
+    from constellation.massspec.mz_axis import load_mz_axis
+
+    keys = []
+    for source in sources:
+        if source.bundle is None:
+            raise WorkflowError(
+                f"{source.path.name} is a spectra file: an m/z axis applies when one is "
+                f"written from a bundle"
+            )
+        try:
+            axis = load_mz_axis(source.bundle, mz_axis)
+        except ValueError as exc:
+            raise WorkflowError(str(exc)) from exc
+        if axis is None:
+            raise WorkflowError(
+                f"{source.bundle} has no m/z axis; measure one with `constellation massspec mz-axis`"
+            )
+        keys.append(axis.key)
+    return tuple(keys)
+
+
+def _spectra_key(
+    experiment_dir: Path, sources: tuple[_Source, ...], run: str, axis_keys: tuple[str, ...] = ()
+) -> str | None:
     """What identifies the spectra file Constellation writes for a
     bundle, or merges from several: the bundles it comes from, in order,
     and how it is written.
@@ -1225,6 +1328,9 @@ def _spectra_key(experiment_dir: Path, sources: tuple[_Source, ...], run: str) -
     the file itself.
     """
     if all(s.bundle is not None for s in sources):
+        # A curve enters the key only when one is named, so that a search
+        # with none keeps the key it has always had.
+        corrected = {"mz_axis": list(axis_keys)} if axis_keys else {}
         return stages.stage_key(
             layout=SPECTRA_LAYOUT,
             sources=[
@@ -1234,11 +1340,12 @@ def _spectra_key(experiment_dir: Path, sources: tuple[_Source, ...], run: str) -
                 }
                 for s in sources
             ],
+            **corrected,
         )
     (src,) = sources  # a merge is always of bundles
     own = _spectra_dir(experiment_dir, run)
-    if src.path.parent == own:
-        return stages.recorded_key(own) or None
+    if src.path.parent == own or own in src.path.parents:
+        return stages.recorded_key(src.path.parent) or None
     return None
 
 
@@ -1248,12 +1355,15 @@ def _spectra_file(experiment_dir: Path, plan: SearchPlan) -> tuple[Path, float]:
 
     Written once, under ``<experiment>/spectra/<run>/``, and reused by
     every later search of the same acquisition (0.0 seconds then): it
-    depends on the bundles alone, not on any search setting. Two
+    depends on the bundles alone, not on any search setting. Another peak
+    list of the run, or corrected m/z, is a file of its own beneath that
+    one, because earlier searches link to theirs. Two
     searches that need the same file at once take turns; the second
     finds it written.
     """
-    directory = _spectra_dir(experiment_dir, plan.run)
+    directory = _spectra_dir(experiment_dir, plan.run, plan.spectra_variant)
     path = directory / f"{plan.run}.dia"
+    directory.parent.mkdir(parents=True, exist_ok=True)
     with file_lock(directory.parent / f".{plan.run}.lock"):
         if stages.is_done(directory, plan.spectra_key) and path.is_file():
             return path, 0.0
@@ -1271,6 +1381,7 @@ def _spectra_file(experiment_dir: Path, plan: SearchPlan) -> tuple[Path, float]:
             overwrite=True,
             # A worker thread is not interrupted by a signal; it asks.
             should_stop=lambda: cancellation_requested() is not None,
+            mz_axis=plan.mz_axis,
         )
         stages.mark_done(directory, plan.spectra_key)
         return path, time.perf_counter() - started
@@ -1982,6 +2093,8 @@ def quantify(
     resume: bool = False,
     stream_to_stderr: bool = True,
     progress: SearchProgress | None = None,
+    keep_profile: bool = True,
+    mz_axis: str | None = None,
 ) -> QuantifyResult:
     """The chromatogram-library workflow, end to end, into one experiment.
 
@@ -2015,6 +2128,8 @@ def quantify(
         resume=resume,
         stream_to_stderr=stream_to_stderr,
         progress=progress,
+        keep_profile=keep_profile,
+        mz_axis=mz_axis,
     )
     if not runs:
         raise WorkflowError("nothing to quantify: give at least one run")

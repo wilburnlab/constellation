@@ -25,6 +25,8 @@ export interface LadderRow {
 export interface Target {
   /** Identifies what is shown (an identification of a search, or a peptide). */
   key: string;
+  /** The derived peak list its search read, which is the one to annotate. */
+  peakList?: string | null;
   /** "PEPTIDEK/2". */
   label: string;
   modifiedSequence: string;
@@ -75,6 +77,7 @@ export function targetFromPrecursor(json: Record<string, unknown>, precursorId: 
   const ms1 = (json.ms1_targets as Array<Record<string, unknown>>) ?? [];
   const ms2 = (json.ms2_targets as Array<Record<string, unknown>>) ?? [];
   return {
+    peakList: (json.peak_list as string | null | undefined) ?? null,
     key: `${json.experiment}|${json.unit}|${precursorId}${scan !== null ? `|${scan}` : ''}`,
     label: `${modseq}/${charge}`,
     modifiedSequence: modseq,

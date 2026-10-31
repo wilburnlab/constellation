@@ -167,17 +167,6 @@ def test_export_single_run_conventions(tmp_path: Path) -> None:
     assert {m["source_name"] for m in scan_map} == {"run_a.raw"}
 
 
-def test_export_reads_scan_range_from_filter_string_for_older_bundles(tmp_path: Path) -> None:
-    """Bundles from before SCAN_METADATA_TABLE v3 have no scan_window columns."""
-    scans = _dia_scans()
-    new = write_dia([_write_bundle(tmp_path / "v3", "run", scans)], tmp_path / "v3.dia")
-    old = write_dia(
-        [_write_bundle(tmp_path / "v2", "run", scans, drop_scan_window_columns=True)],
-        tmp_path / "v2.dia",
-    )
-    assert diff_dia(new.path, old.path).identical
-
-
 def test_exact_values_are_written_as_thermo_displays_them(tmp_path: Path) -> None:
     """A bundle holding the instrument's values (an isolation width of
     2.0009, injection times in full) and the trailer header gives the file
@@ -249,15 +238,15 @@ def test_run_sample_and_method_metadata_written_as_msrawjava_does(tmp_path: Path
     assert keys.index("thermo.instrument_method.1.raw_text") < keys.index("acq.mass_analyzers")
 
 
-def test_export_reads_either_peak_layout(tmp_path: Path) -> None:
-    """Peaks as parts (bundle manifest v2) and as one file (v1) give one file."""
-    scans = _dia_scans(empty_scan=7)
-    parts = write_dia([_write_bundle(tmp_path / "parts", "run", scans)], tmp_path / "parts.dia")
-    single = write_dia(
-        [_write_bundle(tmp_path / "file", "run", scans, layout="file")], tmp_path / "file.dia"
-    )
-    assert (tmp_path / "parts" / "run" / "peaks" / "part-00001.parquet").is_file()
-    assert diff_dia(parts.path, single.path).identical
+def test_export_writes_a_blank_trailers_injection_time_as_the_file_shows_it(tmp_path: Path) -> None:
+    """Null in a Thermo bundle, 0.000 in the .raw, and 0 in the reference file."""
+    zero = _dia_scans()
+    blank = _dia_scans()
+    zero[5]["iit"] = 0.0
+    blank[5]["iit"] = None
+    a = write_dia([_write_bundle(tmp_path / "zero", "run", zero)], tmp_path / "zero.dia")
+    b = write_dia([_write_bundle(tmp_path / "blank", "run", blank)], tmp_path / "blank.dia")
+    assert diff_dia(a.path, b.path).identical
 
 
 def test_export_is_atomic_and_refuses_to_overwrite(tmp_path: Path) -> None:
@@ -409,7 +398,7 @@ def test_export_rejects_duplicate_fraction_names(tmp_path: Path) -> None:
 
 
 def test_export_refusals(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="profile-mode"):
+    with pytest.raises(ValueError, match="profile bundle"):
         write_dia([_write_bundle(tmp_path, "prof", _dia_scans(), profile=True)], tmp_path / "p.dia")
 
     ms3 = _dia_scans()

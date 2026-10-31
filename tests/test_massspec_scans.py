@@ -9,6 +9,7 @@ import numpy as np
 import pyarrow.compute as pc
 import pytest
 
+from constellation.massspec.bundle import OutdatedBundleError
 from constellation.massspec.io.encyclopedia import import_dia, write_dia
 from constellation.massspec.quant.peak_index import build_peak_index
 from constellation.massspec.scans import (
@@ -217,18 +218,28 @@ def test_several_spectra_in_one_read(dia) -> None:
     assert table.num_rows == sum(scans[i]["mz"].size for i in (3, 20))
 
 
-def test_a_single_file_bundle_reads_the_same(tmp_path: Path, dia) -> None:
-    """A bundle from before manifest v2 holds its peaks in one peaks.parquet."""
-    parts, scans = dia
-    single = write_bundle_manifest(write_bundle(tmp_path / "v1", "dia_run", scans, layout="file"))
-    assert (single / "peaks.parquet").is_file() and (parts / "peaks").is_dir()
-    for s in (scans[0], scans[25]):
-        assert spectrum(single, s["scan"]).equals(spectrum(parts, s["scan"]))
-    targets = [s["mz"][0] for s in scans[1:4] if s["mz"].size]
-    common = dict(level=2, window=0, tolerance=0.01, tolerance_unit="Da")
-    assert xic(single, targets, **common).equals(xic(parts, targets, **common))
-    build_peak_index(single, single / "mz_index")
-    assert xic(single, targets, **common).equals(xic(parts, targets, **common))
+def test_a_bundle_in_an_older_format_is_refused(tmp_path: Path, dia) -> None:
+    """Never read as if it were current: what its files mean has changed."""
+    bundle, scans = dia
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    (bundle / "manifest.json").write_text(json.dumps({**manifest, "schema_version": 2}))
+    for read in (
+        lambda: open_acquisition(bundle),
+        lambda: spectrum(bundle, scans[0]["scan"]),
+    ):
+        with pytest.raises(OutdatedBundleError, match="massspec convert"):
+            read()
+
+
+def test_a_profile_bundle_reads_as_its_points(tmp_path: Path, dia) -> None:
+    _, scans = dia
+    bundle = write_bundle_manifest(write_bundle(tmp_path, "run.profile", scans, profile=True))
+    assert open_acquisition(bundle).holds_profile
+    s = scans[3]
+    assert spectrum(bundle, s["scan"]).column("mz").to_pylist() == s["mz"].tolist()
+    targets = [s["mz"][0]]
+    common = dict(level=s["level"], tolerance=0.01, tolerance_unit="Da")
+    assert xic(bundle, targets, window=0, **common).num_rows > 0
 
 
 # ── a bundle imported from a spectra file ─────────────────────────────────

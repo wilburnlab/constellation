@@ -130,7 +130,7 @@ function span(xs: Float64Array, iv: Interval): [number, number] {
   return [Math.max(0, first - 1), Math.min(xs.length - 1, last + 1)];
 }
 
-function linePath(xs: Float64Array, ys: Float64Array, iv: Interval, sx: (v: number) => number, sy: (v: number) => number): string {
+export function linePath(xs: Float64Array, ys: Float64Array, iv: Interval, sx: (v: number) => number, sy: (v: number) => number): string {
   const [lo, hi] = span(xs, iv);
   let d = '';
   for (let i = lo; i <= hi; i++) {

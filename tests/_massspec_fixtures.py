@@ -2,9 +2,9 @@
 
 Small DIA and DDA runs shaped like real ones (scan order, isolation
 windows, precursor links, filter strings), and a writer that lays them out
-as ``massspec convert`` does: ``peaks.parquet``, ``scan_metadata.parquet``,
-``acquisition_metadata.parquet`` and, with :func:`write_bundle_manifest`, the
-manifest that makes the directory a bundle.
+as ``massspec convert`` does: ``peaks/`` (or ``profile/``),
+``scan_metadata.parquet``, ``acquisition_metadata.parquet`` and, with
+:func:`write_bundle_manifest`, the manifest that makes the directory a bundle.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from constellation.massspec.bundle import BUNDLE_SCHEMA_VERSION, PROFILE_BUNDLE_KIND
 from constellation.massspec.schemas import (
     ACQUISITION_METADATA_TABLE,
     MS_PEAK_TABLE,
@@ -104,15 +105,13 @@ def write_bundle(
     scans: list[dict[str, Any]],
     *,
     profile: bool = False,
-    drop_scan_window_columns: bool = False,
-    layout: str = "parts",
     acquisition: dict[str, Any] | None = None,
+    row_group_size: int = 17,
 ) -> Path:
     """Write ``scans`` as a bundle shaped like ``massspec convert`` output.
 
-    ``layout="parts"`` writes the peaks as two parts, the scans split
-    between them (``peaks/part-0000{0,1}.parquet``, manifest v2);
-    ``layout="file"`` as one ``peaks.parquet`` (bundles before v2).
+    The points go in two parts, the scans split between them, under
+    ``peaks/``, or with ``profile`` under ``profile/`` (a profile bundle).
     ``acquisition`` adds or replaces acquisition-metadata fields.
     """
     bundle = root / name
@@ -130,26 +129,24 @@ def write_bundle(
                 peak_rows[f.name].extend([s.get(f.name)] * n)
         row = {k: v for k, v in s.items() if k not in ("mz", "intensity")}
         row["peak_count"] = n
-        if s["level"] == 1 and not drop_scan_window_columns:
+        if profile:
+            row["spectrum_type"] = "profile"
+        if s["level"] == 1:
             row["scan_window_lower"], row["scan_window_upper"] = 350.0, 1250.0
         meta_rows.append(row)
     peaks = pa.table(
         {k: pa.array(v, MS_PEAK_TABLE.field(k).type) for k, v in peak_rows.items()},
         schema=MS_PEAK_TABLE,
     )
-    if layout == "file":
-        pq.write_table(peaks, bundle / "peaks.parquet", row_group_size=17)
-    else:
-        # Split at a scan boundary near the middle; within each part, scans
-        # still straddle row groups.
-        scan_col = peaks.column("scan").to_numpy()
-        cut = int(np.searchsorted(scan_col, scan_col[len(scan_col) // 2])) if len(scan_col) else 0
-        (bundle / "peaks").mkdir()
-        for i, part in enumerate((peaks.slice(0, cut), peaks.slice(cut))):
-            pq.write_table(part, bundle / "peaks" / f"part-{i:05d}.parquet", row_group_size=17)
+    # Split at a scan boundary near the middle; within each part, scans
+    # still straddle row groups.
+    scan_col = peaks.column("scan").to_numpy()
+    cut = int(np.searchsorted(scan_col, scan_col[len(scan_col) // 2])) if len(scan_col) else 0
+    listing = bundle / ("profile" if profile else "peaks")
+    listing.mkdir()
+    for i, part in enumerate((peaks.slice(0, cut), peaks.slice(cut))):
+        pq.write_table(part, listing / f"part-{i:05d}.parquet", row_group_size=row_group_size)
     scan_table = pa.Table.from_pylist(meta_rows, schema=SCAN_METADATA_TABLE)
-    if drop_scan_window_columns:  # a bundle written before schema v3
-        scan_table = scan_table.drop_columns(["scan_window_lower", "scan_window_upper"])
     pq.write_table(scan_table, bundle / "scan_metadata.parquet")
     acquisition = {
         "source_format": "thermo_raw",
@@ -162,7 +159,6 @@ def write_bundle(
         "creation_date": "10/07/2026 12:15:40",
         "analyzers": ["ITMS"],
         "n_scans": len(scans),
-        "profile_mode": profile,
         **(acquisition or {}),
     }
     pq.write_table(
@@ -183,20 +179,30 @@ def with_scan_stats(scans: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return scans
 
 
-def write_bundle_manifest(bundle: Path, *, kind: str = "thermo_acquisition") -> Path:
-    """Give a :func:`write_bundle` directory the manifest a real bundle has."""
-    name = bundle.name
-    parts = (bundle / "peaks").is_dir()
+def write_bundle_manifest(
+    bundle: Path,
+    *,
+    kind: str | None = None,
+    sha256: str | None = None,
+    run: str | None = None,
+) -> Path:
+    """Give a :func:`write_bundle` directory the manifest a real bundle has.
+
+    ``run`` is the run's name when it is not the directory's (a profile
+    bundle, a derived peak list); ``sha256`` what ties a run's bundles.
+    """
+    name = run or bundle.name
+    profile = (bundle / "profile").is_dir()
     (bundle / "manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": 2 if parts else 1,
-                "kind": kind,
+                "schema_version": BUNDLE_SCHEMA_VERSION,
+                "kind": kind or (PROFILE_BUNDLE_KIND if profile else "thermo_acquisition"),
                 "source_file": f"/data/{name}.raw",
-                "source_sha256": f"sha-of-{name}",
-                "parameters": {"rt_bin_width_s": 60.0, "profile_mode": False},
+                "source_sha256": sha256 or f"sha-of-{name}",
+                "parameters": {"rt_bin_width_s": 60.0},
                 "outputs": {
-                    "peaks": "peaks" if parts else "peaks.parquet",
+                    "profile" if profile else "peaks": "profile" if profile else "peaks",
                     "scan_metadata": "scan_metadata.parquet",
                     "acquisition_metadata": "acquisition_metadata.parquet",
                 },

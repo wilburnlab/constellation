@@ -11,13 +11,13 @@ Submodules:
   ``constellation.thirdparty`` registry (env var
   ``CONSTELLATION_THERMO_HOME`` → ``third_party/thermo/current/``).
 - ``_scans`` — reads a range of scans into blocks (scan-metadata table +
-  peaks as numpy arrays); decides how each scan's peaks are made
-  (stored centroids, the instrument's centroid stream, Thermo's
-  centroider, or profile points).
+  peaks and stored points as numpy arrays); decides how each scan's peaks
+  are made (stored centroids, the instrument's centroid stream, Thermo's
+  centroider).
 - ``_read`` — :class:`ThermoReader` (in-memory ``RawReader``), run
   metadata and the per-level summary.
 - ``_convert`` — :func:`convert`: scan ranges read in worker processes,
-  one peak part per range, the bundle finished in the parent.
+  a part of each bundle per range, the bundles finished in the parent.
 - ``manifest`` — :class:`ThermoAcquisitionManifest` dataclass + JSON
   reader/writer for the per-bundle ``manifest.json``.
 
@@ -38,6 +38,8 @@ from constellation.massspec.bundle import DEFAULT_RT_BIN_WIDTH_S
 
 from ._convert import (
     DEFAULT_BATCH_SIZE,
+    DEFAULT_CENTROID_ALGO,
+    NO_CENTROIDING,
     RawFileReaderError,
     convert,
     default_workers,
@@ -64,9 +66,11 @@ from .manifest import (
 
 __all__ = [
     "DEFAULT_BATCH_SIZE",
+    "DEFAULT_CENTROID_ALGO",
     "DEFAULT_RT_BIN_WIDTH_S",
     "MANIFEST_FILENAME",
     "MANIFEST_SCHEMA_VERSION",
+    "NO_CENTROIDING",
     "SOURCE_FORMAT",
     "BatchResult",
     "BatchStatus",

@@ -37,6 +37,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
+from constellation.massspec.bundle import PEAK_BUNDLE_KINDS, read_bundle_manifest
 from constellation.massspec.manifest import ALL_ACQUISITIONS, open_table
 
 IDENTIFICATION_SCHEMA = pa.schema(
@@ -166,7 +167,9 @@ def _tolerance(manifest: dict[str, Any], name: str) -> dict[str, Any] | None:
 def search_units(experiment_dir: Path | str) -> list[dict[str, Any]]:
     """The experiment's finished searches, as plain data: ``unit``,
     ``search_mode``, ``engine``, ``program``, ``acquisition_ids``,
-    ``library`` (path or None), ``fragment_tolerance`` /
+    ``library`` (path or None), ``peak_list`` (a derived peak list searched;
+    None for what a conversion made), ``mz_axis`` (the curves subtracted, or
+    None), ``fragment_tolerance`` /
     ``precursor_tolerance`` (``{"value", "unit"}``, as the engine recorded
     running with them, else as given), and for a merged search
     ``merged_from`` (the fractions' acquisition ids)."""
@@ -187,6 +190,8 @@ def search_units(experiment_dir: Path | str) -> list[dict[str, Any]]:
                 "program": data.get("program") or "",
                 "acquisition_ids": [int(a) for a in data.get("acquisition_ids") or ()],
                 "library": (inputs.get("library") or {}).get("path"),
+                "peak_list": (inputs.get("spectra_file") or {}).get("peak_list"),
+                "mz_axis": (inputs.get("spectra_file") or {}).get("mz_axis"),
                 "fragment_tolerance": _tolerance(data, "fragment_tolerance"),
                 "precursor_tolerance": _tolerance(data, "precursor_tolerance"),
                 "merged_from": [int(s["acquisition_id"]) for s in merged] if merged else None,
@@ -364,11 +369,13 @@ def identifications(
 
 
 def _bundle_manifest(path: Path) -> dict[str, Any] | None:
+    """A peak bundle's manifest; None for anything else, so a bundle in an
+    older format reads as not found and is reported as such, not opened."""
     try:
-        data = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    except (FileNotFoundError, NotADirectoryError, json.JSONDecodeError):
+        data = read_bundle_manifest(path)
+    except (FileNotFoundError, NotADirectoryError, ValueError):
         return None
-    if data.get("kind") not in ("thermo_acquisition", "encyclopedia_dia_acquisition"):
+    if data.get("kind") not in PEAK_BUNDLE_KINDS:
         return None
     return data
 

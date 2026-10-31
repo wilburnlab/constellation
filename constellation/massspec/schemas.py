@@ -301,7 +301,10 @@ register_schema("ScanMetadataTable", SCAN_METADATA_TABLE)
 #   max_integrated_intensity, spectra_count); the sample information
 #   (sample_vial, sample_injection_volume, sample_method_file,
 #   sample_raw_file_name); instrument_methods.
-ACQUISITION_METADATA_SCHEMA_VERSION: int = 2
+# v3: profile_mode removed. A profile bundle is its own kind of bundle, so
+#   what a bundle stores is no longer a flag on it; per scan,
+#   SCAN_METADATA_TABLE.spectrum_type says what it holds.
+ACQUISITION_METADATA_SCHEMA_VERSION: int = 3
 
 
 # Single-row run-level metadata: instrument identity + Thermo
@@ -348,11 +351,6 @@ ACQUISITION_METADATA_TABLE: pa.Schema = pa.schema(
         pa.field("n_scans", pa.uint32(), nullable=True),
         pa.field("rt_min_seconds", pa.float32(), nullable=True),
         pa.field("rt_max_seconds", pa.float32(), nullable=True),
-        # True when the bundle stores profile points for any scan (a
-        # `--profile` conversion of profile data), false when every scan's
-        # peaks are centroids. Says nothing about how the run was acquired;
-        # SCAN_METADATA_TABLE.centroider does.
-        pa.field("profile_mode", pa.bool_(), nullable=True),
         pa.field(
             "tune_data",
             pa.map_(pa.string(), pa.string()),

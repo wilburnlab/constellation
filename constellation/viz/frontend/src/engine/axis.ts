@@ -186,7 +186,14 @@ export const AXIS_PRESENTATION = {
 export function drawAxes(
   svg: SVGSVGElement,
   frame: PlotFrame,
-  axes: { x?: ContinuousAxis; y?: ContinuousAxis; xLabel?: string; yLabel?: string },
+  axes: {
+    x?: ContinuousAxis;
+    y?: ContinuousAxis;
+    xLabel?: string;
+    yLabel?: string;
+    /** A second y axis on the right, for a series in other units. */
+    yRight?: ContinuousAxis;
+  },
   uid: string,
 ): SVGGElement {
   const { x: ix, y: iy, w, h } = frame.inner;
@@ -242,6 +249,19 @@ export function drawAxes(
       });
       label.textContent = axes.yLabel;
       axisGroup.appendChild(label);
+    }
+  }
+  if (axes.yRight) {
+    const edge = ix + w;
+    axisGroup.appendChild(svgEl('line', { class: 'axis-line', x1: edge, x2: edge, y1: iy, y2: iy + h, ...line }));
+    for (const t of axes.yRight.ticks) {
+      const py = axes.yRight.scale(t);
+      axisGroup.appendChild(svgEl('line', { class: 'axis-tick', x1: edge, x2: edge + TICK, y1: py, y2: py, ...line }));
+      const text = svgEl('text', {
+        class: 'axis-tick-label axis-tick-label-right', x: edge + TICK + 2, y: py + 3, 'text-anchor': 'start', ...type,
+      });
+      text.textContent = axes.yRight.format.tick(t, axes.yRight.step);
+      axisGroup.appendChild(text);
     }
   }
   svg.appendChild(axisGroup);

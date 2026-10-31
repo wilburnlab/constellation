@@ -58,7 +58,7 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from constellation.core.io.schemas import pack_metadata
-from constellation.massspec.bundle import open_peaks
+from constellation.massspec.bundle import is_profile_bundle, open_peaks, points_dataset
 from constellation.massspec.schemas import (
     MS_PEAK_INDEX_SCHEMA_VERSION,
     MS_PEAK_INDEX_TABLE,
@@ -143,6 +143,8 @@ def _now_iso() -> str:
 def _open_peaks(peaks_dir: Path) -> ds.Dataset:
     """Open a peaks source: a convert bundle, a shard directory, or a
     direct parquet file."""
+    if is_profile_bundle(peaks_dir):
+        return points_dataset(peaks_dir)
     return open_peaks(peaks_dir)
 
 
@@ -333,8 +335,8 @@ def build_peak_index(
     Parameters
     ----------
     peaks_dir : Path | str
-        A convert bundle (containing ``peaks.parquet``), a shard
-        directory, or a direct parquet file of MS_PEAK_TABLE rows.
+        A convert bundle (naming a profile bundle indexes its points), a
+        shard directory, or a direct parquet file of MS_PEAK_TABLE rows.
     index_root : Path | str
         Output root; partitions land at
         ``<root>/ms_level=<L>/isolation_window=<W>/part-00000.parquet``.

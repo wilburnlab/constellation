@@ -2,7 +2,8 @@
 
 Every mass-spec kernel has one binding per acquisition of the session.
 The binding carries what ``fetch`` needs (``fetch`` never sees the
-session): the bundle path and the acquisition's description.
+session): the bundle path, each of the run's peak lists by name and the
+acquisition's description.
 """
 
 from __future__ import annotations
@@ -17,6 +18,10 @@ from constellation.viz.tracks.base import (
     TrackKernel,
     TrackQuery,
 )
+
+
+#: A binding's path for the peak list of that name.
+PEAK_LIST_PREFIX = "peak_list:"
 
 
 class MassSpecTrackKernel(TrackKernel):
@@ -38,7 +43,10 @@ class MassSpecTrackKernel(TrackKernel):
                 kind=self.kind,
                 binding_id=f"{self.kind}:{acquisition.key}",
                 label=acquisition.label,
-                paths={"bundle": acquisition.bundle},
+                paths={
+                    "bundle": acquisition.bundle,
+                    **{f"{PEAK_LIST_PREFIX}{name}": path for name, path in acquisition.lists},
+                },
                 config={
                     "source_id": acquisition.source_id,
                     "acquisition": acquisition.key,
@@ -82,4 +90,4 @@ def reduce_trace(
     return table.take(pa.array(keep.numpy())), True
 
 
-__all__ = ["MassSpecTrackKernel", "reduce_trace"]
+__all__ = ["PEAK_LIST_PREFIX", "MassSpecTrackKernel", "reduce_trace"]

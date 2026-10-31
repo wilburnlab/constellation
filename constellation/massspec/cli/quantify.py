@@ -138,6 +138,8 @@ def _cmd_massspec_quantify(args: argparse.Namespace) -> int:
             resume=args.resume,
             stream_to_stderr=not args.no_progress and args.jobs <= 1,
             progress=_progress_printer(True),
+            keep_profile=args.keep_profile,
+            mz_axis=args.mz_axis,
         )
     except _refusals() as exc:
         print(f"error: {_describe(exc)}", file=sys.stderr)

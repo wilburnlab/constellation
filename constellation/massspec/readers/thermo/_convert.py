@@ -2,10 +2,17 @@
 
 A file's conversion is planned as contiguous ranges of scans. Each range is
 one task: it reads its scans (:mod:`._scans`), writes their peaks as one
-part (``peaks/part-NNNNN.parquet``) and returns their scan metadata. The
-parent concatenates the scan metadata in range order and writes it, the
-acquisition metadata and, last, the manifest, so a bundle without a
-manifest is unfinished.
+part of the peak bundle (``<run>/peaks/part-NNNNN.parquet``) and their stored
+points as one part of the profile bundle
+(``<run>.profile/profile/part-NNNNN.parquet``), and returns their scan
+metadata. The parent concatenates the scan metadata in range order and writes
+it, the acquisition metadata and, last, the manifest of each bundle, so a
+bundle without a manifest is unfinished.
+
+Profile data is kept by default, with centroiding as a view of it, because
+later work wants the points and a conversion should not throw data away. A
+run with no profile scans gets no profile bundle, ``keep_profile=False`` writes
+none, and ``centroid_algo="none"`` writes the profile bundle alone.
 
 Tasks run in a pool of spawned processes, one CommonCore handle per file
 per process, or in this process when ``workers`` is 1. pythonnet holds the
@@ -44,10 +51,11 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     wait,
 )
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from multiprocessing import get_context
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -55,18 +63,24 @@ import pyarrow.parquet as pq
 from constellation.core.progress import ProgressCallback, emit_done, emit_progress, emit_start
 from constellation.massspec.bundle import (
     DEFAULT_RT_BIN_WIDTH_S,
-    LEGACY_PEAKS_FILE,
     PEAKS_DIR,
+    PROFILE_BUNDLE_KIND,
+    PROFILE_DIR,
+    PROFILE_SUFFIX,
     PeakWriter,
     part_name,
 )
 
 from . import _read
-from ._scans import DEFAULT_BLOCK_SCANS, THERMO, ReadOptions, iter_scan_blocks
+from ._scans import CENTROIDERS, DEFAULT_BLOCK_SCANS, THERMO, ReadOptions, iter_scan_blocks
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = DEFAULT_BLOCK_SCANS
+#: ``centroid_algo`` for what a conversion centroids with by default, and for
+#: making no peak list at all.
+DEFAULT_CENTROID_ALGO = THERMO
+NO_CENTROIDING = "none"
 #: A range is at least this many scans; a file is cut into about
 #: ``RANGES_PER_WORKER`` ranges per worker so that a slow one does not
 #: hold up the rest, nor the last round run on few workers.
@@ -80,11 +94,13 @@ ACQUISITION_METADATA_FILENAME = "acquisition_metadata.parquet"
 # re-conversion clears first (a peak index built from the old peaks too).
 _BUNDLE_OUTPUTS = (
     "manifest.json",
-    LEGACY_PEAKS_FILE,
+    "peaks.parquet",  # what bundles before format v2 held
     PEAKS_DIR,
+    PROFILE_DIR,
     SCAN_METADATA_FILENAME,
     ACQUISITION_METADATA_FILENAME,
     "mz_index",
+    "mz_axes",
 )
 
 
@@ -102,6 +118,20 @@ class ConvertOptions:
     batch_size: int = DEFAULT_BATCH_SIZE
     compute_sha256: bool = True
     allow_empty_levels: bool = False
+
+
+def read_options(
+    *,
+    keep_profile: bool = True,
+    centroid_algo: str = DEFAULT_CENTROID_ALGO,
+    capture_trailer_extras: bool = True,
+) -> ReadOptions:
+    """The options for what a conversion was asked to keep and to make."""
+    return ReadOptions(
+        keep_profile=keep_profile,
+        centroider=None if centroid_algo == NO_CENTROIDING else centroid_algo,
+        capture_trailer_extras=capture_trailer_extras,
+    )
 
 
 def plan_ranges(first: int, last: int, workers: int) -> list[tuple[int, int]]:
@@ -213,13 +243,17 @@ class _Probe:
     first: int
     last: int
     run_metadata: dict[str, Any]
+    has_profile: bool
 
 
 @_portable
 def _probe(path: str) -> _Probe:
     raw = _raw_for(path)
     first, last = _read._scan_range(raw)
-    return _Probe(first, last, _read._build_run_metadata(raw, Path(path)))
+    return _Probe(
+        first, last, _read._build_run_metadata(raw, Path(path)),
+        _read.has_profile_scans(raw, first, last),
+    )
 
 
 @dataclass(frozen=True)
@@ -227,28 +261,63 @@ class _RangeTask:
     path: str
     first: int
     last: int
-    part: str
+    part: str | None  # of the peak bundle; None when no peak list is made
+    point_part: str | None  # of the profile bundle; None when none is kept
     options: ConvertOptions
 
 
+@dataclass(frozen=True)
+class _RangeResult:
+    """A range's scan metadata, as each list it wrote describes its scans."""
+
+    scans: pa.Table | None
+    point_scans: pa.Table | None
+    n_scans: int
+
+
+@contextmanager
+def _part_writer(part: str | None, rt_bin_width_s: float, **kwargs) -> Iterator[PeakWriter | None]:
+    """A writer for one part, moved into place once it is finished."""
+    if part is None:
+        yield None
+        return
+    final = Path(part)
+    tmp = final.with_name(f".{final.name}.tmp")
+    with PeakWriter(tmp, rt_bin_width_s=rt_bin_width_s, **kwargs) as writer:
+        yield writer
+    os.replace(tmp, final)
+
+
 @_portable
-def _run_range(task: _RangeTask, on_scans: Callable[[int], None] | None = None) -> pa.Table:
-    """Read one range, write its peak part, return its scan metadata."""
+def _run_range(task: _RangeTask, on_scans: Callable[[int], None] | None = None) -> _RangeResult:
+    """Read one range, write its parts, return its scan metadata."""
     raw = _raw_for(task.path)
-    part = Path(task.part)
-    tmp = part.with_name(f".{part.name}.tmp")
+    width = task.options.rt_bin_width_s
     scans: list[pa.Table] = []
-    with PeakWriter(tmp, rt_bin_width_s=task.options.rt_bin_width_s) as writer:
+    point_scans: list[pa.Table] = []
+    n_scans = 0
+    with (
+        _part_writer(task.part, width) as peaks,
+        _part_writer(task.point_part, width, byte_stream_split=True) as points,
+    ):
         for block in iter_scan_blocks(
             raw, task.first, task.last, task.options.read,
             max_block_scans=task.options.batch_size,
         ):
-            writer.write(block.peak_table())
-            scans.append(block.scans)
+            if peaks is not None:
+                peaks.write(block.peak_table())
+                scans.append(block.scans)
+            if points is not None:
+                points.write(block.point_table())
+                point_scans.append(block.point_scans())
+            n_scans += block.scans.num_rows
             if on_scans is not None:
                 on_scans(block.scans.num_rows)
-    os.replace(tmp, part)
-    return _read._concat_scans(scans)
+    return _RangeResult(
+        _read._concat_scans(scans) if peaks is not None else None,
+        _read._concat_scans(point_scans) if points is not None else None,
+        n_scans,
+    )
 
 
 class _InlineExecutor(Executor):
@@ -298,22 +367,33 @@ def _dll_version() -> str | None:
     return handle.version if handle is not None else None
 
 
+def _refuse_existing(directory: Path) -> None:
+    if directory.exists() and any(directory.iterdir()):
+        raise FileExistsError(
+            f"bundle dir is non-empty: {directory}\n"
+            f"  pass --force to overwrite, or choose a different output dir"
+        )
+
+
 class _Job:
-    """One file's conversion: its output, its ranges, what came back."""
+    """One file's conversion: its outputs, its ranges, what came back."""
 
     def __init__(self, src: Path, out_dir: Path, options: ConvertOptions, *, force: bool):
         self.src = Path(src)
         self.out_dir = Path(out_dir)
+        self.profile_dir = self.out_dir.with_name(self.out_dir.name + PROFILE_SUFFIX)
         self.options = options
+        self.read = options.read  # what is asked, until the probe settles it
         self.force = force
         self.ranges: list[tuple[int, int]] = []
-        self.results: dict[int, pa.Table] = {}
+        self.results: dict[int, _RangeResult] = {}
         self.probe: _Probe | None = None
         self.sha: Future | None = None
+        # The peak bundle's manifest, or the profile bundle's if it is alone.
         self.manifest = None
         self.error: BaseException | None = None
         self.n_scans = 0
-        self._wrote = False  # whether anything of ours is in out_dir
+        self._claimed: list[Path] = []  # directories this conversion has written to
 
     @property
     def done(self) -> bool:
@@ -324,26 +404,60 @@ class _Job:
             raise FileNotFoundError(f"Thermo .raw not found: {self.src}")
         if not self.src.is_file():
             raise IsADirectoryError(f"expected a .raw file, got directory: {self.src}")
-        if self.out_dir.exists():
-            if any(self.out_dir.iterdir()):
-                if not self.force:
-                    raise FileExistsError(
-                        f"bundle dir is non-empty: {self.out_dir}\n"
-                        f"  pass --force to overwrite, or choose a different output dir"
-                    )
-                _clear_outputs(self.out_dir)
-        self._wrote = True
-        (self.out_dir / PEAKS_DIR).mkdir(parents=True, exist_ok=True)
+        if not self.force:
+            if self.read.centroider is not None:
+                _refuse_existing(self.out_dir)
+            if self.read.keep_profile:
+                _refuse_existing(self.profile_dir)
         if self.options.compute_sha256:
             self.sha = hasher.submit(_sha256_file, self.src.resolve(), stop)
 
+    def _settle(self, probe: _Probe) -> ReadOptions:
+        """What to write, now that the file says whether it has profile scans."""
+        read = self.options.read
+        if probe.has_profile:
+            if read.centroider is None and not read.keep_profile:
+                raise ValueError(
+                    f"{self.src.name} has profile scans, and keeping no profile with no "
+                    f"centroiding would write nothing: drop --no-profile, or name a "
+                    f"--centroid-algo."
+                )
+            return read
+        if read.centroider is None or not read.keep_profile:
+            logger.info(
+                "%s has no profile scans: its stored centroids are its peaks, so "
+                "--no-profile and --centroid-algo have no effect",
+                self.src.name,
+            )
+        return replace(read, keep_profile=False, centroider=read.centroider or THERMO)
+
+    def _claim(self, directory: Path, listing: str) -> None:
+        if self.force:
+            if directory.exists():
+                _clear_outputs(directory)
+        else:
+            _refuse_existing(directory)
+        (directory / listing).mkdir(parents=True, exist_ok=True)
+        self._claimed.append(directory)
+
     def tasks(self, probe: _Probe, workers: int) -> list[_RangeTask]:
         self.probe = probe
+        self.read = self._settle(probe)
+        writes_peaks = self.read.centroider is not None
+        if writes_peaks:
+            self._claim(self.out_dir, PEAKS_DIR)
+        if self.read.keep_profile:
+            self._claim(self.profile_dir, PROFILE_DIR)
         self.n_scans = max(probe.last - probe.first + 1, 0)
         self.ranges = plan_ranges(probe.first, probe.last, workers)
+        options = replace(self.options, read=self.read)
         return [
             _RangeTask(
-                str(self.src), lo, hi, str(self.out_dir / PEAKS_DIR / part_name(i)), self.options
+                str(self.src), lo, hi,
+                str(self.out_dir / PEAKS_DIR / part_name(i)) if writes_peaks else None,
+                str(self.profile_dir / PROFILE_DIR / part_name(i))
+                if self.read.keep_profile else None,
+                options,
             )
             for i, (lo, hi) in enumerate(self.ranges)
         ]
@@ -351,51 +465,48 @@ class _Job:
     def complete(self) -> bool:
         return self.probe is not None and len(self.results) == len(self.ranges)
 
-    def finish(self, workers: int):
-        """Write the scan and acquisition metadata, then the manifest."""
+    def _write_bundle(
+        self,
+        directory: Path,
+        scans: pa.Table,
+        *,
+        noun: str,
+        parameters: dict[str, Any],
+        outputs: dict[str, str],
+        sha: str | None,
+        **manifest_kwargs,
+    ):
+        """Write a bundle's scan and acquisition metadata, then its manifest."""
         from .manifest import MANIFEST_FILENAME, write_manifest
 
         assert self.probe is not None
-        if not self.ranges:  # a file with no scans still gets a (schema-only) part
-            with PeakWriter(self.out_dir / PEAKS_DIR / part_name(0)):
-                pass
-        scans = _read._concat_scans([self.results[i] for i in range(len(self.ranges))])
-        _read._check_scans_read(self.n_scans, scans)
         levels = _read.level_summary(scans)
-        for line in _read.describe_levels(levels):
-            logger.info("%s: %s", self.src.name, line)
-        if not self.options.allow_empty_levels:
-            _read._check_levels(levels, scans)
-        pq.write_table(scans, self.out_dir / SCAN_METADATA_FILENAME, compression="zstd")
+        for line in _read.describe_levels(levels, noun=noun):
+            logger.info("%s: %s", directory.name, line)
+        pq.write_table(scans, directory / SCAN_METADATA_FILENAME, compression="zstd")
         run_meta = self.probe.run_metadata
         pq.write_table(
             _read._build_acquisition_table(run_meta, scans),
-            self.out_dir / ACQUISITION_METADATA_FILENAME,
+            directory / ACQUISITION_METADATA_FILENAME,
             compression="zstd",
         )
-        sha = self.sha.result() if self.sha is not None else None
-
-        stats = _read._acquisition_stats(scans)
-        read = self.options.read
+        read = self.read
         # The manifest carries a summary of the run metadata plus the
         # parameters used. tune_data is omitted (its values are in the
         # acquisition table); its key list says which fields were captured.
-        self.manifest = write_manifest(
-            self.out_dir / MANIFEST_FILENAME,
+        return write_manifest(
+            directory / MANIFEST_FILENAME,
             source_file=str(self.src.resolve()),
             source_sha256=sha,
             parameters={
                 "rt_bin_width_s": self.options.rt_bin_width_s,
-                "profile_mode": read.profile,
-                "peaks": "profile" if read.profile else "centroid",
-                "centroider": read.centroider,
+                **parameters,
                 "capture_trailer_extras": read.capture_trailer_extras,
                 "batch_size": self.options.batch_size,
-                "workers": workers,
                 "dll_version": _dll_version(),
             },
             outputs={
-                "peaks": PEAKS_DIR,
+                **outputs,
                 "scan_metadata": SCAN_METADATA_FILENAME,
                 "acquisition_metadata": ACQUISITION_METADATA_FILENAME,
             },
@@ -409,30 +520,86 @@ class _Job:
                 "instrument_method_names": [
                     m["name"] for m in run_meta.get("instrument_methods") or ()
                 ],
-                **stats,
+                **_read._acquisition_stats(scans),
+                "n_scans_without_injection_time": _read.scans_without_injection_time(scans),
                 "levels": levels,
                 "tune_data_keys": [k for k, _ in run_meta.get("tune_data") or ()],
             },
+            **manifest_kwargs,
         )
+
+    def finish(self, workers: int):
+        """Write each bundle's metadata and manifest, the profile bundle first."""
+        assert self.probe is not None
+        read = self.read
+        writes_peaks = read.centroider is not None
+        ordered = [self.results[i] for i in range(len(self.ranges))]
+        peak_scans = _read._concat_scans([r.scans for r in ordered]) if writes_peaks else None
+        point_scans = (
+            _read._concat_scans([r.point_scans for r in ordered]) if read.keep_profile else None
+        )
+        scans = peak_scans if peak_scans is not None else point_scans
+        assert scans is not None
+        if writes_peaks and not self.ranges:  # no scans: still a (schema-only) part
+            with PeakWriter(self.out_dir / PEAKS_DIR / part_name(0)):
+                pass
+        _read._check_scans_read(self.n_scans, scans)
+        if not self.options.allow_empty_levels:
+            _read._check_levels(_read.level_summary(scans), scans)
+        missing = _read.scans_without_injection_time(scans)
+        if missing:
+            logger.warning(
+                "%s: %d of %d scans have no injection time (a blank trailer, or none "
+                "recorded); their injection time, AGC and microscans are null",
+                self.src.name, missing, scans.num_rows,
+            )
+        sha = self.sha.result() if self.sha is not None else None
+        manifest = None
+        if point_scans is not None:
+            manifest = self._write_bundle(
+                self.profile_dir, point_scans, noun="points", sha=sha,
+                kind=PROFILE_BUNDLE_KIND,
+                parameters={
+                    "workers": workers,
+                    "peak_bundle": self.out_dir.name if writes_peaks else None,
+                },
+                outputs={"profile": PROFILE_DIR},
+            )
+        if peak_scans is not None:
+            manifest = self._write_bundle(
+                self.out_dir, peak_scans, noun="peaks", sha=sha,
+                parameters={
+                    "peaks": "centroid",
+                    "centroider": read.centroider,
+                    "workers": workers,
+                    "profile_bundle": self.profile_dir.name if read.keep_profile else None,
+                },
+                outputs={"peaks": PEAKS_DIR},
+            )
         self.results.clear()
-        return self.manifest
+        self.manifest = manifest
+        return manifest
 
     def fail(self, error: BaseException) -> None:
         """Record ``error`` and remove what this conversion wrote.
 
-        Before :meth:`prepare` succeeds nothing is removed: the directory
-        may hold an earlier bundle that was not to be replaced.
+        A directory it has not written to is left alone: it may hold an
+        earlier bundle that was not to be replaced.
         """
         self.error = error
         self.results.clear()
         if self.sha is not None:
             self.sha.cancel()
-        if not self._wrote:
-            return
-        try:
-            _clear_outputs(self.out_dir)
-        except OSError:
-            logger.warning("could not clear %s after a failed conversion", self.out_dir)
+        for directory in self._claimed:
+            try:
+                _clear_outputs(directory)
+            except OSError:
+                logger.warning("could not clear %s after a failed conversion", directory)
+        if self.profile_dir in self._claimed:
+            try:
+                self.profile_dir.rmdir()  # named for the run: nothing asked for it to stay
+            except OSError:
+                pass
 
 
 # ── the driver ────────────────────────────────────────────────────────
@@ -506,7 +673,7 @@ def _run_jobs(
                     else:
                         job.results[index] = value
                         if on_scans is not None and not inline:
-                            on_scans(job, value.num_rows)
+                            on_scans(job, value.n_scans)
                     if job.complete():
                         job.finish(workers)
                         finished(job)
@@ -531,13 +698,47 @@ def _run_jobs(
         _close_open_files()
 
 
+def _is_own_algorithm(centroid_algo: str) -> bool:
+    if centroid_algo in (NO_CENTROIDING, *CENTROIDERS):
+        return False
+    from constellation.massspec.centroiding import ALGORITHMS
+
+    if centroid_algo not in ALGORITHMS:
+        known = sorted({NO_CENTROIDING, *CENTROIDERS, *ALGORITHMS})
+        raise ValueError(f"unknown centroid_algo {centroid_algo!r}; choose from {', '.join(known)}")
+    return True
+
+
+def finish_own_algorithm(job: _Job, centroid_algo: str, keep_profile: bool, workers: int):
+    """Make ``job``'s peak list with an algorithm of Constellation's own, from
+    the profile bundle it just wrote. A run with no profile scans already has
+    its stored centroids as its peaks."""
+    from constellation.massspec.centroiding import centroid_bundle
+
+    from .manifest import read_manifest_dir
+
+    if job.read.centroider is not None:
+        return job.manifest
+    try:
+        centroid_bundle(
+            job.profile_dir, centroid_algo, output_dir=job.out_dir, workers=workers, force=job.force
+        )
+    except BaseException:
+        if not keep_profile:
+            shutil.rmtree(job.profile_dir, ignore_errors=True)
+        raise
+    if not keep_profile:
+        shutil.rmtree(job.profile_dir, ignore_errors=True)
+    return read_manifest_dir(job.out_dir)
+
+
 def convert(
     source: "str | Path",
     output_dir: "str | Path",
     *,
     rt_bin_width_s: float = DEFAULT_RT_BIN_WIDTH_S,
-    profile: bool = False,
-    centroider: str = THERMO,
+    keep_profile: bool = True,
+    centroid_algo: str = DEFAULT_CENTROID_ALGO,
     capture_trailer_extras: bool = True,
     batch_size: int = DEFAULT_BATCH_SIZE,
     compute_sha256: bool = True,
@@ -546,26 +747,38 @@ def convert(
     workers: int = 1,
     progress_cb: ProgressCallback | None = None,
 ):
-    """Convert a Thermo ``.raw`` into a directory bundle; return its manifest.
+    """Convert a Thermo ``.raw`` into bundles; return the manifest of the peak
+    bundle, or of the profile bundle if it is the only one written.
 
-    Produces ``<output_dir>/manifest.json``, ``peaks/part-NNNNN.parquet``,
-    ``scan_metadata.parquet`` and ``acquisition_metadata.parquet``. Peaks
-    are in scan order across the parts, with a row group per
-    ``rt_bin_width_s`` of retention time; the manifest is written last.
+    Produces the peak bundle ``<output_dir>/``: ``manifest.json``,
+    ``peaks/part-NNNNN.parquet``, ``scan_metadata.parquet`` and
+    ``acquisition_metadata.parquet``, with peaks in scan order across the
+    parts, a row group per ``rt_bin_width_s`` of retention time, and the
+    manifest written last. Where the run has profile scans, also the profile
+    bundle ``<output_dir>.profile/`` beside it, the same with ``profile/``,
+    unless ``keep_profile`` is false.
 
-    ``profile`` keeps profile points; otherwise profile scans are
-    centroided, by ``centroider`` where the instrument stored no centroids.
-    A level whose scans all come out without peaks fails the conversion
-    unless ``allow_empty_levels``; a file none of whose scans can be read
-    fails it always. A failed conversion removes what it wrote. ``workers`` > 1 reads ranges of scans in that many processes.
-    ``batch_size`` is the number of scans read per block.
+    ``centroid_algo`` makes the peaks of profile scans with no stored
+    centroids; ``"none"`` makes no peak list. An algorithm of
+    :mod:`constellation.massspec.centroiding` runs on the profile bundle once
+    the worker pass is done, and without ``keep_profile`` the profile is removed
+    when it succeeds. A file with no profile scans
+    has only stored centroids, and they are its peaks whatever these say. A
+    level whose scans all come out empty fails the conversion unless
+    ``allow_empty_levels``; a file none of whose scans can be read fails it
+    always. A failed conversion removes what it wrote. ``workers`` > 1 reads
+    ranges of scans in that many processes. ``batch_size`` is the number of
+    scans read per block.
 
     ``progress_cb`` receives ``stage_start`` / ``stage_progress`` /
     ``stage_done`` events tagged with stage ``"thermo_convert"``.
     """
+    own = _is_own_algorithm(centroid_algo)
     options = ConvertOptions(
-        read=ReadOptions(
-            profile=profile, centroider=centroider, capture_trailer_extras=capture_trailer_extras
+        read=read_options(
+            keep_profile=keep_profile or own,
+            centroid_algo=NO_CENTROIDING if own else centroid_algo,
+            capture_trailer_extras=capture_trailer_extras,
         ),
         rt_bin_width_s=rt_bin_width_s,
         batch_size=batch_size,
@@ -584,6 +797,8 @@ def convert(
     _run_jobs([job], workers=workers, on_scans=on_scans)
     if job.error is not None:
         raise job.error
+    if own:
+        job.manifest = finish_own_algorithm(job, centroid_algo, keep_profile, workers)
     n = job.manifest.run_metadata["n_scans"]
     emit_done(
         progress_cb, "thermo_convert", completed=n, total=n,
@@ -594,7 +809,9 @@ def convert(
 
 __all__ = [
     "DEFAULT_BATCH_SIZE",
+    "DEFAULT_CENTROID_ALGO",
     "MIN_RANGE_SCANS",
+    "NO_CENTROIDING",
     "RANGES_PER_WORKER",
     "ConvertOptions",
     "RawFileReaderError",

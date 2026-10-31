@@ -51,6 +51,10 @@ def _build_encyclopedia_parser(subs: argparse._SubParsersAction) -> None:
                         "is written beside it.")
     e.add_argument("--workers", type=int, default=None,
                    help="zlib compression threads (default: up to 8).")
+    e.add_argument("--mz-axis", default=None,
+                   help="Subtract this measured m/z curve of each bundle from its peaks "
+                        "(a key from `massspec mz-axis`, or 'latest'). Without it the file "
+                        "holds the instrument's values.")
     e.add_argument("--force", action="store_true",
                    help="Replace an existing output file.")
     e.add_argument("--no-progress", action="store_true",
@@ -161,7 +165,8 @@ def _cmd_encyclopedia_export_spectra(args: argparse.Namespace) -> int:
 
     try:
         summary = write_dia(
-            args.peaks_dir, args.output_file, overwrite=args.force, workers=args.workers
+            args.peaks_dir, args.output_file, overwrite=args.force, workers=args.workers,
+            mz_axis=args.mz_axis,
         )
     except (FileNotFoundError, FileExistsError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

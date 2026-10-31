@@ -141,7 +141,7 @@ def windows_of(scans: pa.Table, level: int) -> np.ndarray:
 
 def survey_bundle(bundle: Path, *, samples: int, rng: np.random.Generator) -> dict:
     manifest = json.loads((bundle / "manifest.json").read_text())
-    peak_files = peak_paths(bundle)  # one peaks.parquet, or peaks/part-*.parquet
+    peak_files = peak_paths(bundle)
     meta_path = bundle / "scan_metadata.parquet"
     files = bundle_files(bundle)
     out: dict[str, Any] = {

@@ -6,7 +6,8 @@ decimation for drawing (``decimate``); monotone paths through the mode
 of a gridded density (``modal_path``: EncyclopeDIA's greedy walk and a
 globally optimal dynamic-programming path); and monotone alignment of
 one axis onto another through their joint density (``alignment``), the
-retention-time alignment's generic core. Baseline
+retention-time alignment's generic core; and the phase of one periodic
+component of a signal (``phase``), the m/z axis's generic core. Baseline
 correction / smoothing / prominence peak-picking / calibration land here
 as they are ported. Torch-native; imports ``core.stats`` for ppm/Da
 conversions (and, later, ``Parametric`` peak fits).
@@ -30,6 +31,7 @@ from constellation.core.signal.matching import (
     tolerance_window,
 )
 from constellation.core.signal.modal_path import PathPosterior, greedy_walk, monotone_path
+from constellation.core.signal.phase import PhaseFold, WindowPhase
 
 __all__ = [
     "decimate_trace",
@@ -46,4 +48,6 @@ __all__ = [
     "RefineOptions",
     "quantile_band",
     "theil_sen",
+    "PhaseFold",
+    "WindowPhase",
 ]

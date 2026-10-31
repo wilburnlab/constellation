@@ -21,6 +21,7 @@ from constellation.massspec.cli._common import (
     _note_stopped,
     _resolve_tolerance_args,
 )
+from constellation.massspec.cli.convert import DEFAULT_ALGO
 
 # ── shared argument groups ──────────────────────────────────────────────
 
@@ -29,6 +30,28 @@ def _add_search_settings(p: argparse.ArgumentParser) -> None:
     """The settings a search runs with: tolerances, enzyme, Percolator,
     threads, the JVM, and the pass-through for any other documented flag."""
     _add_tolerance_args(p)
+    p.add_argument(
+        "--no-profile",
+        dest="keep_profile",
+        action="store_false",
+        help=(
+            "A .raw is converted into the experiment as `massspec convert` does by "
+            f"default: peaks made by --centroid-algo {DEFAULT_ALGO}, profile points "
+            "kept in bundles/<run>.profile/. With this flag the profile points are not "
+            "kept; they take about 12 GiB for a 100-min Stellar run, and the .raw still "
+            "has them. No effect on a given bundle. To search another peak list, give "
+            "its bundle."
+        ),
+    )
+    p.add_argument(
+        "--mz-axis",
+        default=None,
+        help=(
+            "Subtract this measured m/z curve of each bundle from its peaks in the "
+            "spectra file (a key from `massspec mz-axis`, or 'latest'). That file is "
+            "one of its own, so searches already made are untouched."
+        ),
+    )
     p.add_argument(
         "--acquisition",
         default=None,
@@ -430,6 +453,8 @@ def _cmd_massspec_search(args: argparse.Namespace) -> int:
             resume=args.resume,
             stream_to_stderr=not args.no_progress,
             progress=_progress_printer(len(args.input) > 1 and not args.merge),
+            keep_profile=args.keep_profile,
+            mz_axis=args.mz_axis,
         )
     except _refusals() as exc:
         print(f"error: {_describe(exc)}", file=sys.stderr)
