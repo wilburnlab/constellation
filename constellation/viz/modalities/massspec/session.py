@@ -12,7 +12,15 @@ browsable. Every acquisition is described once, when the session opens,
 from its manifest and scan table, so the kernels and routes answer from
 that description.
 
-An acquisition's ``key`` is derived from its bundle's path, so the same run
+An acquisition is one run, and a run can have several bundles: its profile
+bundle and any number of peak lists. Those attached or lying beside an attached
+one are grouped by ``source_sha256`` into one acquisition, so the browser can
+draw them over each other. ``bundle`` is the one its chromatograms and traces
+read: a peak list if there is one, else the profile. A peak list made after the
+session opened appears when the session is opened again. Bundles with no hash
+(unless they name each other) stay separate acquisitions.
+
+An acquisition's ``key`` is derived from that bundle's path, so the same run
 keeps its key however it was reached and across source changes; the
 client keys per-acquisition state by it. The session's own id is derived
 from an *anchor* fixed when the session first opens, so removing the
@@ -35,6 +43,7 @@ SourceKind = Literal["acquisition", "experiment"]
 #: Manifest kinds a source may have, and the source kind each is.
 _SOURCE_KINDS: dict[str, SourceKind] = {
     "thermo_acquisition": "acquisition",
+    "thermo_profile": "acquisition",
     "encyclopedia_dia_acquisition": "acquisition",
     "massspec_experiment": "experiment",
 }
@@ -67,9 +76,14 @@ class MsAcquisition:
     source_id: str
     #: ``massspec.scans.open_acquisition`` as plain data: ``bundle_kind``,
     #: ``source_file``, ``source_sha256``, ``acquisition_type``,
-    #: ``staggered``, ``profile_mode``, ``levels``, ``scans_per_level``,
-    #: ``analyzers``, ``rt_range``, ``has_index``, ``default_tolerance``.
+    #: ``staggered``, ``holds_profile``, ``levels``, ``scans_per_level``,
+    #: ``analyzers``, ``rt_range``, ``has_index``, ``default_tolerance``, and
+    #: ``peak_lists``: this run's lists of points (``name``, ``kind``
+    #: ``profile`` or ``peaks``, ``has_mz_axis``), the profile first.
     info: dict[str, Any]
+    #: Each peak list's bundle, by name. What a request's ``peak_list`` is
+    #: looked up in; a name from a request never becomes a path.
+    lists: tuple[tuple[str, Path], ...] = ()
     #: The experiments that searched this run, one dict each:
     #: ``experiment`` (path), ``experiment_source_id``, ``acquisition_id``
     #: (the run's id in that experiment) and ``units`` (its searches).
@@ -126,14 +140,28 @@ class MassSpecSession:
         from constellation.massspec.results import acquisition_bundles
 
         built = [_load_source(entry) for entry in sources]
+        # By the first key each run had, so that the order runs are listed
+        # in holds. One run reached by several paths (its bundles attached, the
+        # experiment's copy of one) is one acquisition: runs are told apart by
+        # content.
         acquisitions: dict[str, MsAcquisition] = {}
+        by_content: dict[str, str] = {}
+
+        def add(described: MsAcquisition) -> str:
+            sha = described.info.get("source_sha256")
+            slot = by_content.get(sha) if sha else None
+            if slot is not None:
+                acquisitions[slot] = _merged(acquisitions[slot], described)
+                return slot
+            slot = described.key
+            acquisitions.setdefault(slot, described)  # the same bundle attached twice
+            if sha:
+                by_content[sha] = slot
+            return slot
+
         bundles = [s for s in built if s.kind == "acquisition"]
         for source in bundles:
-            acquisition = _describe(source.path, label=source.label, source_id=source.source_id)
-            acquisitions.setdefault(acquisition.key, acquisition)  # the same bundle attached twice
-        # One run reached by two paths (a bundle attached and the experiment's
-        # copy of it) is one acquisition: runs are told apart by content.
-        by_content = {a.info["source_sha256"]: a.key for a in acquisitions.values() if a.info.get("source_sha256")}
+            add(_describe(source.path, label=source.label, source_id=source.source_id))
         warnings: list[str] = []
         for experiment in (s for s in built if s.kind == "experiment"):
             for found in acquisition_bundles(experiment.path, candidates=[b.path for b in bundles]):
@@ -152,16 +180,7 @@ class MassSpecSession:
                     )
                     continue
                 bundle = Path(found["bundle"]).resolve()
-                key = derive_source_id(bundle, "acquisition")
-                if key not in acquisitions:
-                    described = _describe(bundle, label=bundle.name, source_id=experiment.source_id)
-                    sha = described.info.get("source_sha256")
-                    if sha and sha in by_content:
-                        key = by_content[sha]
-                    else:
-                        acquisitions[key] = described
-                        if sha:
-                            by_content[sha] = key
+                key = add(_describe(bundle, label=bundle.name, source_id=experiment.source_id))
                 link = {
                     "experiment": str(experiment.path),
                     "experiment_source_id": experiment.source_id,
@@ -245,9 +264,35 @@ def _load_source(entry: dict[str, Any]) -> MsSource:
     return MsSource(path=path, kind=kind, label=str(entry.get("label") or path.name))
 
 
-def _describe(bundle: Path, *, label: str, source_id: str) -> MsAcquisition:
+def _list_order(entry: dict[str, Any]) -> tuple[int, str]:
+    """The profile, then what a conversion made, then derived lists by name."""
+    if entry["holds_profile"]:
+        return (0, entry["name"])
+    return (2 if "-" in entry["name"] else 1, entry["name"])
+
+
+def _family(members: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each bundle once, each name once (a name two bundles share gets its
+    directory's parent added: two conversions kept apart by directory)."""
+    family: dict[Path, dict[str, Any]] = {}
+    for member in sorted(members, key=_list_order):
+        family.setdefault(Path(member["bundle"]).resolve(), dict(member))
+    taken: set[str] = set()
+    for path, member in family.items():
+        if member["name"] in taken:
+            member["name"] = f"{member['name']} ({path.parent.name})"
+        taken.add(member["name"])
+    return list(family.values())
+
+
+def _assembled(family: list[dict[str, Any]], *, label: str, source_id: str, links=()) -> MsAcquisition:
+    """The acquisition of a family of bundles, described from the one its
+    chromatograms read: the first peak list, else the profile."""
     from constellation.massspec.scans import default_tolerance, open_acquisition
 
+    bundle = next(
+        (Path(m["bundle"]) for m in family if not m["holds_profile"]), Path(family[0]["bundle"])
+    ).resolve()
     info = open_acquisition(bundle)
     tolerance = {
         str(level): list(default_tolerance(analyzers)) for level, analyzers in info.analyzers.items()
@@ -257,20 +302,65 @@ def _describe(bundle: Path, *, label: str, source_id: str) -> MsAcquisition:
         label=label,
         bundle=bundle,
         source_id=source_id,
+        links=tuple(links),
+        lists=tuple((m["name"], Path(m["bundle"]).resolve()) for m in family),
         info={
             "bundle_kind": info.kind,
             "source_file": info.source_file,
             "source_sha256": info.source_sha256,
             "acquisition_type": info.acquisition_type,
             "staggered": info.staggered,
-            "profile_mode": info.profile_mode,
+            "holds_profile": info.holds_profile,
             "levels": list(info.levels),
             "scans_per_level": {str(k): v for k, v in info.scans_per_level.items()},
             "analyzers": {str(k): list(v) for k, v in info.analyzers.items()},
             "rt_range": list(info.rt_range),
             "has_index": info.index is not None,
             "default_tolerance": tolerance,
+            "peak_lists": [
+                {
+                    "name": m["name"],
+                    "kind": "profile" if m["holds_profile"] else "peaks",
+                    "has_mz_axis": bool(m.get("mz_axes")),
+                }
+                for m in family
+            ],
         },
+    )
+
+
+def _describe(bundle: Path, *, label: str, source_id: str) -> MsAcquisition:
+    from constellation.massspec.scans import open_acquisition
+
+    info = open_acquisition(bundle)
+    own = {
+        "name": info.peak_list,
+        "bundle": bundle,
+        "holds_profile": info.holds_profile,
+        "mz_axes": list(info.mz_axes),
+    }
+    return _assembled(_family([own, *info.related]), label=label, source_id=source_id)
+
+
+def _merged(first: MsAcquisition, second: MsAcquisition) -> MsAcquisition:
+    """One run reached twice: every bundle of both, under the first's label."""
+    def members(acquisition: MsAcquisition) -> list[dict[str, Any]]:
+        listed = {p["name"]: p for p in acquisition.info["peak_lists"]}
+        return [
+            {
+                "name": name,
+                "bundle": path,
+                "holds_profile": listed[name]["kind"] == "profile",
+                "mz_axes": ["known"] if listed[name]["has_mz_axis"] else [],
+            }
+            for name, path in acquisition.lists
+        ]
+
+    return _assembled(
+        _family([*members(first), *members(second)]),
+        label=first.label,
+        source_id=first.source_id,
+        links=first.links,
     )
 
 

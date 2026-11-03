@@ -5,6 +5,7 @@
 - **Plan approved** by the PI on 2026-10-26. The approved original is
   `~/.claude/plans/effervescent-conjuring-raven.md`. Work is on `feat/thermo-reader`.
 - **Decisions (PI, 2026-10-26):**
+  - (Superseded 2026-10-31 by [profile-and-peak-lists.md](profile-and-peak-lists.md): the profile is now kept by default in a bundle of its own, and `--profile` is gone.)
   - Profile data is centroided with Thermo's algorithm by default; `--profile` keeps the
     profile points; a Constellation centroider comes later (Stellar bench ledger #15).
   - Peaks become a directory of part files (`peaks/part-NNNNN.parquet`).

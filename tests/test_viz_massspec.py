@@ -202,6 +202,124 @@ def test_a_spectrum_and_an_m_z_window_of_it(client, runs) -> None:
 # ── the modality's own routes ─────────────────────────────────────────────
 
 
+@pytest.fixture
+def family(tmp_path: Path) -> dict[str, Path]:
+    """One run converted the default way: its peaks and its profile, tied by
+    their source's hash, and a stranger of the same directory."""
+    scans = dia_scans(cycles=2)
+    profile_scans = [
+        {**s, "mz": np.linspace(200.0, 300.0, 40), "intensity": np.arange(1.0, 41.0)} for s in scans
+    ]
+    return {
+        "peaks": write_bundle_manifest(write_bundle(tmp_path, "run", scans), sha256="abc", run="run"),
+        "profile": write_bundle_manifest(
+            write_bundle(tmp_path, "run.profile", profile_scans, profile=True), sha256="abc", run="run"
+        ),
+        "other": write_bundle_manifest(write_bundle(tmp_path, "run2", scans), sha256="def", run="run2"),
+    }
+
+
+def test_a_runs_bundles_are_one_acquisition_with_its_peak_lists(client, family) -> None:
+    sid = _open(client, family["peaks"], family["profile"])
+    (run,) = client.get(f"/api/massspec/sessions/{sid}/acquisitions").json()
+    assert run["bundle"] == str(family["peaks"])  # chromatograms and traces read a peak list
+    assert [(p["name"], p["kind"]) for p in run["peak_lists"]] == [
+        ("profile", "profile"), ("imported", "peaks"),
+    ]
+
+
+def test_opening_any_of_a_runs_bundles_finds_the_others_beside_it(client, family) -> None:
+    for attached in ("peaks", "profile"):
+        sid = _open(client, family[attached])
+        (run,) = client.get(f"/api/massspec/sessions/{sid}/acquisitions").json()
+        assert run["key"] == _key(family["peaks"])  # the same run, however it was opened
+        assert len(run["peak_lists"]) == 2
+
+
+def test_a_run_with_one_list_has_only_that_one(client, family) -> None:
+    sid = _open(client, family["other"])
+    (run,) = client.get(f"/api/massspec/sessions/{sid}/acquisitions").json()
+    assert [p["name"] for p in run["peak_lists"]] == ["imported"]
+    assert run["holds_profile"] is False
+
+
+def test_a_spectrum_comes_from_the_list_asked_for(client, family) -> None:
+    sid = _open(client, family["peaks"])
+    peaks = _data(client, sid, "ms_spectrum", family["peaks"], scan=2)
+    assert set(peaks.column("profile").to_pylist()) == {False}
+    points = _data(client, sid, "ms_spectrum", family["peaks"], scan=2, peak_list="profile")
+    assert points.num_rows == 40 and set(points.column("profile").to_pylist()) == {True}
+    assert _data(client, sid, "ms_spectrum", family["peaks"], scan=2, peak_list="imported").equals(peaks)
+
+
+def _store_curve(bundle: Path, shift: float) -> None:
+    """A curve reading ``shift`` Th everywhere, at both levels."""
+    from constellation.massspec.mz_axis import MZ_AXIS_TABLE, MzAxis, save_mz_axis
+
+    rows = [
+        {"level": level, "mz": mz, "shift_th": shift, "se_th": 0.01, "coherence": 0.5, "half_window_th": 20.0}
+        for level in (1, 2)
+        for mz in (50.0, 3000.0)
+    ]
+    table = pa.Table.from_pylist(rows, schema=MZ_AXIS_TABLE)
+    save_mz_axis(bundle, MzAxis(key="flat", table=table, parameters={"method": "mass_lattice"}))
+
+
+def test_corrected_subtracts_each_list_s_own_curve(client, family) -> None:
+    _store_curve(family["peaks"], -0.13)
+    _store_curve(family["profile"], -0.10)
+    sid = _open(client, family["peaks"])
+    run = client.get(f"/api/massspec/sessions/{sid}/acquisitions").json()[0]
+    assert {p["name"]: p["has_mz_axis"] for p in run["peak_lists"]} == {"profile": True, "imported": True}
+
+    for name, shift in (("imported", -0.13), ("profile", -0.10)):
+        raw = _data(client, sid, "ms_spectrum", family["peaks"], scan=2, peak_list=name)
+        fixed = _data(client, sid, "ms_spectrum", family["peaks"], scan=2, peak_list=name, corrected="true")
+        np.testing.assert_allclose(
+            fixed.column("mz").to_numpy() - raw.column("mz").to_numpy(), -shift, atol=1e-9
+        )
+        assert fixed.column("intensity").equals(raw.column("intensity"))
+
+
+def test_corrected_leaves_a_list_with_no_curve_as_it_is(client, family) -> None:
+    sid = _open(client, family["peaks"])
+    run = client.get(f"/api/massspec/sessions/{sid}/acquisitions").json()[0]
+    assert not any(p["has_mz_axis"] for p in run["peak_lists"])
+    raw = _data(client, sid, "ms_spectrum", family["peaks"], scan=2)
+    assert _data(client, sid, "ms_spectrum", family["peaks"], scan=2, corrected="true").equals(raw)
+
+
+def test_a_peak_list_is_looked_up_never_made_into_a_path(client, family) -> None:
+    sid = _open(client, family["peaks"])
+    for name in ("nonesuch", "../run2", str(family["other"])):
+        response = client.get(
+            "/api/tracks/ms_spectrum/data",
+            params={"session": sid, "binding": f"ms_spectrum:{_key(family['peaks'])}", "scan": 2, "peak_list": name},
+        )
+        assert response.status_code == 400, name
+
+
+def test_a_profile_window_keeps_a_point_beyond_each_edge(client, family) -> None:
+    """So the line reaches the plot's edges; peaks are cut at the window."""
+    sid = _open(client, family["peaks"])
+    points = _data(
+        client, sid, "ms_spectrum", family["peaks"], scan=2, peak_list="profile", mz_start=240.0, mz_end=260.0
+    ).column("mz").to_pylist()
+    assert min(points) < 240.0 and max(points) > 260.0
+    assert sum(1 for m in points if m < 240.0) == 1 and sum(1 for m in points if m > 260.0) == 1
+    peaks = _data(client, sid, "ms_spectrum", family["peaks"], scan=2, mz_start=240.0, mz_end=260.0)
+    assert all(240.0 <= m <= 260.0 for m in peaks.column("mz").to_pylist())
+
+
+def test_a_profile_bundle_alone_can_be_browsed(client, tmp_path) -> None:
+    scans = dia_scans(cycles=2)
+    bundle = write_bundle_manifest(write_bundle(tmp_path, "solo.profile", scans, profile=True), run="solo")
+    sid = _open(client, bundle)
+    (run,) = client.get(f"/api/massspec/sessions/{sid}/acquisitions").json()
+    assert run["holds_profile"] is True
+    assert _data(client, sid, "ms_spectrum", bundle, scan=2).column("profile")[0].as_py() is True
+
+
 def test_acquisitions_windows_and_scans(client, runs) -> None:
     bundle, scans = runs["dia"]
     sid = _open(client, bundle)
@@ -404,6 +522,6 @@ def test_the_wire_schemas_restate_the_domain_ones() -> None:
     from constellation.viz.modalities.massspec.tracks.spectrum import SPECTRUM_SCHEMA
     from constellation.viz.modalities.massspec.tracks.xic import XIC_WIRE_SCHEMA
 
-    assert [(f.name, f.type) for f in SPECTRUM_SCHEMA][:-1] == [(f.name, f.type) for f in ANNOTATED_PEAK_SCHEMA]
+    assert [(f.name, f.type) for f in SPECTRUM_SCHEMA][:-2] == [(f.name, f.type) for f in ANNOTATED_PEAK_SCHEMA]
     wire = [(f.name, f.type) for f in XIC_WIRE_SCHEMA if f.name != "label"]
     assert wire == [(f.name, f.type) for f in XIC_SCHEMA]

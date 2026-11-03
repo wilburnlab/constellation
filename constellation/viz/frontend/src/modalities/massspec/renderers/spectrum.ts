@@ -23,9 +23,10 @@ import { svgEl } from '../../../engine/svg_layer';
 import type { PanelKind } from '../../../panels/kind';
 import { pickBool, pickNumber, pickPaletteColor, pickString } from '../../../panels/style';
 import { ionColor } from '../palette';
-import type { IntensityMode } from './chromatogram';
+import { linePath, type IntensityMode } from './chromatogram';
 
-export const SPECTRUM_MARGIN: Margins = { top: 14, right: 12, bottom: 32, left: 58 };
+// The right margin holds the area axis of sticks drawn over a profile.
+export const SPECTRUM_MARGIN: Margins = { top: 14, right: 46, bottom: 32, left: 58 };
 /** Height of the mass-error strip, when drawn. */
 export const ERROR_STRIP_PX = 46;
 
@@ -36,7 +37,26 @@ export const SPECTRUM_DEFAULTS = {
   labels: 8,
 };
 
+/** A list of peaks drawn as sticks over the spectrum. */
+export interface SpectrumOverlay {
+  name: string;
+  table: Table;
+  color: string;
+}
+
 export interface SpectrumOptions {
+  /** More lists of peaks to draw over this one; the last is on top, and is
+   *  the one labelled and annotated. */
+  overlays?: SpectrumOverlay[];
+  /** The name of the base list, for the legend when there are overlays. */
+  baseName?: string;
+  /** Peak area per unit of profile height, for sticks over a profile. Fixed
+   *  per scan by the caller (see `areaPerHeight`), so zooming does not
+   *  rescale them. */
+  perHeight?: number;
+  /** Draw sticks over a profile at the height of the profile under them,
+   *  rather than by their area on the right-hand axis. */
+  anchored?: boolean;
   /** m/z window; the data's own extent when null. */
   mz: Interval | null;
   intensity: IntensityMode;
@@ -225,38 +245,117 @@ function strings(table: Table, name: string): Array<string | null> {
   return out;
 }
 
-/** Draw the spectrum; returns how many peaks were in view. */
+/** The height of a profile near `mz`: its highest of the nearest points. */
+function heightNear(mzs: Float64Array, ys: Float64Array, mz: number): number {
+  let lo = 0;
+  let hi = mzs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (mzs[mid] < mz) lo = mid + 1;
+    else hi = mid;
+  }
+  let best = 0;
+  for (let i = Math.max(0, lo - 2); i <= Math.min(mzs.length - 1, lo + 1); i++) best = Math.max(best, ys[i]);
+  return best;
+}
+
+/** How much peak area one unit of profile height stands for in this scan:
+ *  the median over its strongest sticks of area over the profile's height
+ *  there. Peak intensities are areas (they sum a peak's points) and profile
+ *  intensities heights, so on one axis sticks stand about six times too tall.
+ *  1 when nothing can be measured. */
+export function areaPerHeight(profile: Table, peaks: Table, strongest = 20): number {
+  const mzs = profile.getChild('mz')?.toArray() as Float64Array | undefined;
+  const ys = profile.getChild('intensity')?.toArray() as Float64Array | undefined;
+  const peakMz = peaks.getChild('mz')?.toArray() as Float64Array | undefined;
+  const area = peaks.getChild('intensity')?.toArray() as Float64Array | undefined;
+  if (!mzs || !ys || !peakMz || !area || !mzs.length) return 1;
+  const order = Array.from(area.keys()).sort((a, b) => area[b] - area[a]).slice(0, strongest);
+  const ratios = order.flatMap((i) => {
+    const height = heightNear(mzs, ys, peakMz[i]);
+    return height > 0 && area[i] > 0 ? [area[i] / height] : [];
+  });
+  if (!ratios.length) return 1;
+  ratios.sort((a, b) => a - b);
+  return ratios[Math.floor(ratios.length / 2)];
+}
+
+interface SpectrumPoints {
+  table: Table;
+  mzs: Float64Array;
+  raw: Float64Array;
+  labels: (string | null)[];
+  ionTypes: (string | null)[];
+}
+
+function pointsOf(table: Table): SpectrumPoints {
+  return {
+    table,
+    mzs: (table.getChild('mz')?.toArray() as Float64Array | undefined) ?? new Float64Array(0),
+    raw: (table.getChild('intensity')?.toArray() as Float64Array | undefined) ?? new Float64Array(0),
+    labels: strings(table, 'annotation'),
+    ionTypes: strings(table, 'ion_type'),
+  };
+}
+
+function indicesIn(points: SpectrumPoints, domain: Interval): number[] {
+  const inView: number[] = [];
+  for (let i = 0; i < points.mzs.length; i++) {
+    if (points.mzs[i] >= domain[0] && points.mzs[i] <= domain[1]) inView.push(i);
+  }
+  return inView;
+}
+
+/** Draw the spectrum: profile points as a line, peaks as sticks, and any
+ *  overlays as sticks over them. Returns how many peaks of the top list
+ *  were in view. */
 export function drawSpectrum(
   svg: SVGSVGElement,
   size: { widthPx: number; heightPx: number },
   table: Table,
   opts: SpectrumOptions,
 ): number {
-  const mzs = (table.getChild('mz')?.toArray() as Float64Array | undefined) ?? new Float64Array(0);
-  const raw = (table.getChild('intensity')?.toArray() as Float64Array | undefined) ?? new Float64Array(0);
-  const labels = strings(table, 'annotation');
-  const ionTypes = strings(table, 'ion_type');
-  const annotated = labels.some((l) => l !== null);
+  const base = pointsOf(table);
+  const overlays = (opts.overlays ?? []).map((o) => ({ ...o, points: pointsOf(o.table) }));
+  // What is labelled and annotated: the top list.
+  const top = overlays.length ? overlays[overlays.length - 1].points : base;
+  const profile = table.numRows > 0 && Boolean(table.getChild('profile')?.get(0));
+  const overProfile = profile && overlays.length > 0;
+  const annotated = top.labels.some((l) => l !== null);
   const strip = annotated && opts.errorStrip && pickBool(opts.style, 'error_strip', true) ? opts.errorStrip : null;
-  const domain = opts.mz ?? spectrumExtent(mzs);
+  const domain = opts.mz ?? spectrumExtent(base.mzs);
   const mainSize = { widthPx: size.widthPx, heightPx: strip ? size.heightPx - ERROR_STRIP_PX : size.heightPx };
   const frame = plotFrame(mainSize, strip ? { ...SPECTRUM_MARGIN, bottom: 6 } : SPECTRUM_MARGIN);
 
-  const inView: number[] = [];
+  // A stick's height in the base list's units.
+  const perHeight = overProfile ? (opts.perHeight ?? 1) : 1;
+  const stickHeight = (mz: number, area: number): number =>
+    overProfile && opts.anchored ? heightNear(base.mzs, base.raw, mz) : area / perHeight;
+
+  const inView = indicesIn(base, domain);
   let max = 0;
-  for (let i = 0; i < mzs.length; i++) {
-    if (mzs[i] < domain[0] || mzs[i] > domain[1]) continue;
-    inView.push(i);
-    if (raw[i] > max) max = raw[i];
-  }
+  for (const i of inView) if (base.raw[i] > max) max = base.raw[i];
+  const overlayViews = overlays.map((o) => indicesIn(o.points, domain));
+  overlays.forEach((o, k) => {
+    for (const i of overlayViews[k]) {
+      const h = stickHeight(o.points.mzs[i], o.points.raw[i]);
+      if (h > max) max = h;
+    }
+  });
   const rel = opts.intensity === 'rel';
   const scaleBy = rel && max > 0 ? 100 / max : 1;
-  const top = rel ? 108 : max > 0 ? max * 1.12 : 1;
+  const topValue = rel ? 108 : max > 0 ? max * 1.12 : 1;
   const x = xAxis(frame, domain, AXIS_FORMATS.mz);
-  const y = yAxis(frame, [0, top], rel ? AXIS_FORMATS.percent : AXIS_FORMATS.intensity, {
+  const y = yAxis(frame, [0, topValue], rel ? AXIS_FORMATS.percent : AXIS_FORMATS.intensity, {
     log: opts.intensity === 'log',
   });
-  const plot = drawAxes(svg, frame, strip ? { y } : { x, y, xLabel: AXIS_FORMATS.mz.label }, opts.uid);
+  // Areas on the right: linear, so not on a log plot, and nothing to say when
+  // the sticks are anchored to the profile.
+  const yRight =
+    overProfile && !opts.anchored && opts.intensity !== 'log'
+      ? yAxis(frame, [0, (topValue / scaleBy) * perHeight], { label: 'Area', tick: AXIS_FORMATS.intensity.tick })
+      : undefined;
+  const plot = drawAxes(svg, frame, strip ? { y, yRight } : { x, y, yRight, xLabel: AXIS_FORMATS.mz.label }, opts.uid);
   const isolationColor = pickPaletteColor(opts.style, 'isolation', SPECTRUM_DEFAULTS.isolation);
 
   if (opts.isolation) {
@@ -285,43 +384,108 @@ export function drawSpectrum(
     }));
   }
 
-  // Unannotated peaks in one path, annotated ones one path per series.
-  const base = y.scale(0);
-  const byColor = new Map<string, string>();
   const neutral = pickPaletteColor(opts.style, 'stick', SPECTRUM_DEFAULTS.stick);
-  const px: number[] = new Array(mzs.length);
-  for (const i of inView) {
-    px[i] = x.scale(mzs[i]);
-    const c = labels[i] !== null ? (ionColor(ionTypes[i]) ?? neutral) : neutral;
-    byColor.set(c, (byColor.get(c) ?? '') + `M${px[i].toFixed(1)} ${base.toFixed(1)}V${y.scale(raw[i] * scaleBy).toFixed(1)}`);
-  }
-  // Neutral first, so annotated sticks sit on top.
-  for (const [c, d] of [...byColor.entries()].sort(([a], [b]) => (a === neutral ? -1 : b === neutral ? 1 : 0))) {
+  const zero = y.scale(0);
+  const px: number[] = new Array(top.mzs.length);
+  const stickTop: number[] = new Array(top.mzs.length);
+
+  /** One list as sticks: unannotated in `color`, annotated by ion series,
+   *  those on top. `only` leaves out what is not annotated. */
+  const drawSticks = (
+    points: SpectrumPoints,
+    view: number[],
+    color: string,
+    height: (i: number) => number,
+    cls: string,
+    only?: 'annotated',
+  ): void => {
+    const byColor = new Map<string, string>();
+    for (const i of view) {
+      const isAnnotated = points.labels[i] !== null;
+      if (only && !isAnnotated) continue;
+      const c = isAnnotated ? (ionColor(points.ionTypes[i]) ?? color) : color;
+      const sx = x.scale(points.mzs[i]);
+      const sy = y.scale(height(i) * scaleBy);
+      if (points === top) {
+        px[i] = sx;
+        stickTop[i] = sy;
+      }
+      byColor.set(c, (byColor.get(c) ?? '') + `M${sx.toFixed(1)} ${zero.toFixed(1)}V${sy.toFixed(1)}`);
+    }
+    for (const [c, d] of [...byColor.entries()].sort(([a], [b]) => (a === color ? -1 : b === color ? 1 : 0))) {
+      plot.appendChild(svgEl('path', {
+        d, stroke: c, 'stroke-width': c === color && !overlays.length ? 1 : 1.5, fill: 'none',
+        class: c === color ? cls : 'ms-peaks-annotated',
+      }));
+    }
+  };
+
+  if (profile) {
     plot.appendChild(svgEl('path', {
-      d, stroke: c, 'stroke-width': c === neutral ? 1 : 1.5, fill: 'none', class: c === neutral ? 'ms-peaks' : 'ms-peaks-annotated',
+      d: linePath(base.mzs, base.raw, domain, (v) => x.scale(v), (v) => y.scale(v * scaleBy)),
+      stroke: neutral, 'stroke-width': 1, fill: 'none', 'stroke-linejoin': 'round', class: 'ms-profile',
     }));
+    // A peptide's ions on the points they fell on.
+    drawSticks(base, inView, neutral, (i) => base.raw[i], 'ms-peaks', 'annotated');
+    if (top === base) {
+      for (const i of inView) {
+        px[i] = x.scale(base.mzs[i]);
+        stickTop[i] = y.scale(base.raw[i] * scaleBy);
+      }
+    }
+  } else {
+    drawSticks(base, inView, neutral, (i) => base.raw[i], 'ms-peaks');
   }
+  overlays.forEach((o, k) => {
+    drawSticks(o.points, overlayViews[k], o.color, (i) => stickHeight(o.points.mzs[i], o.points.raw[i]), 'ms-overlay-peaks');
+  });
 
   // Labels: annotations (most intense first), then m/z of the rest.
+  const topView = overlays.length ? overlayViews[overlayViews.length - 1] : inView;
   const decimals = Math.max(2, Math.min(4, Math.ceil(-Math.log10(Math.max(1e-6, (domain[1] - domain[0]) / 2000)))));
-  const textOf = (i: number): string => labels[i] ?? mzs[i].toFixed(decimals);
-  const byIntensity = [...inView].sort((a, b) => raw[b] - raw[a]);
-  const annotatedOrder = byIntensity.filter((i) => labels[i] !== null);
-  const restOrder = byIntensity.filter((i) => labels[i] === null);
+  const textOf = (i: number): string => top.labels[i] ?? top.mzs[i].toFixed(decimals);
+  const byIntensity = [...topView].sort((a, b) => top.raw[b] - top.raw[a]);
+  const annotatedOrder = byIntensity.filter((i) => top.labels[i] !== null);
+  const restOrder = byIntensity.filter((i) => top.labels[i] === null);
   const limit = annotatedOrder.length + pickNumber(opts.style, 'labels', SPECTRUM_DEFAULTS.labels);
   const labelColor = pickPaletteColor(opts.style, 'label', SPECTRUM_DEFAULTS.label);
   for (const i of chooseLabels([...annotatedOrder, ...restOrder], px, limit, (k) => textOf(k).length * 5.6)) {
     const text = svgEl('text', {
-      x: px[i], y: Math.max(frame.inner.y + 9, y.scale(raw[i] * scaleBy) - 3), 'text-anchor': 'middle',
-      fill: labelColor, 'font-size': 9, class: labels[i] !== null ? 'ms-ion-label' : 'ms-peak-label',
+      x: px[i], y: Math.max(frame.inner.y + 9, stickTop[i] - 3), 'text-anchor': 'middle',
+      fill: labelColor, 'font-size': 9, class: top.labels[i] !== null ? 'ms-ion-label' : 'ms-peak-label',
     });
     text.textContent = textOf(i);
     plot.appendChild(text);
   }
 
-  if (strip) drawErrorStrip(svg, size, frame, domain, table, inView, strip, opts.uid);
+  if (overlays.length) {
+    drawListLegend(svg, frame.inner, [
+      { label: opts.baseName ?? (profile ? 'profile' : 'peaks'), color: neutral },
+      ...overlays.map((o) => ({ label: o.name, color: o.color })),
+    ], labelColor);
+  }
+  if (strip) drawErrorStrip(svg, size, frame, domain, top.table, topView, strip, opts.uid);
   svg.dataset.naturalHeight = String(size.heightPx);
-  return inView.length;
+  return topView.length;
+}
+
+/** Which list is which, in the plot's top-right corner. */
+function drawListLegend(
+  svg: SVGSVGElement,
+  inner: { x: number; y: number; w: number; h: number },
+  entries: Array<{ label: string; color: string }>,
+  textColor: string,
+): void {
+  const g = svgEl('g', { class: 'ms-legend' });
+  entries.forEach((entry, i) => {
+    const yy = inner.y + 8 + i * 12;
+    const xx = inner.x + inner.w - 110;
+    g.appendChild(svgEl('line', { x1: xx, x2: xx + 14, y1: yy - 3, y2: yy - 3, stroke: entry.color, 'stroke-width': 2 }));
+    const text = svgEl('text', { x: xx + 18, y: yy, class: 'ms-legend-label', 'font-size': 10, fill: textColor });
+    text.textContent = entry.label;
+    g.appendChild(text);
+  });
+  svg.appendChild(g);
 }
 
 /** The matched peaks' mass errors against m/z, in a strip under the plot

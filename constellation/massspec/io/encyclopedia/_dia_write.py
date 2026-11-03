@@ -95,7 +95,6 @@ beyond MS2, and multi-CV FAIMS runs.
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 from collections.abc import Callable, Iterator, Sequence
@@ -115,7 +114,12 @@ from constellation.massspec.acquisition_structure import (
     AcquisitionStructure,
     infer_acquisition_structure,
 )
-from constellation.massspec.bundle import has_peaks, iter_peak_batches
+from constellation.massspec.bundle import (
+    has_peaks,
+    is_profile_bundle,
+    iter_peak_batches,
+    read_bundle_manifest,
+)
 from constellation.massspec.io.encyclopedia._codec import encode_f4, encode_f8
 from constellation.massspec.io.encyclopedia._schema import (
     DIA_FORMAT_VERSION,
@@ -140,8 +144,6 @@ _SCAN_COLUMNS = (
     "faims_cv",
     "activation_type",
 )
-# Added to SCAN_METADATA_TABLE in schema v3; older bundles lack them and
-# the MS1 scan range is then read out of the filter string.
 _SCAN_WINDOW_COLUMNS = ("scan_window_lower", "scan_window_upper")
 
 # Thermo activation tokens (as they appear in a filter string) → the
@@ -234,6 +236,8 @@ class _Bundle:
     acq: dict[str, Any]
     scans: pa.Table
     structure: AcquisitionStructure
+    #: A measured m/z curve to subtract from the peaks, when one was named.
+    mz_axis: Any = None
 
     @property
     def dia_name(self) -> str:
@@ -242,6 +246,12 @@ class _Bundle:
 
 def _load_bundle(path: Path) -> _Bundle:
     path = Path(path)
+    if is_profile_bundle(path):
+        raise ValueError(
+            f"{path} is a profile bundle; a .dia holds centroided spectra. Make a peak "
+            f"list from it with `constellation massspec centroid`, or give the run's "
+            f"peak bundle."
+        )
     missing = [
         name for name in ("scan_metadata.parquet", "acquisition_metadata.parquet")
         if not (path / name).is_file()
@@ -254,20 +264,20 @@ def _load_bundle(path: Path) -> _Bundle:
             f"(expected the directory `massspec convert` writes)"
         )
     acq = pq.read_table(path / "acquisition_metadata.parquet").to_pylist()[0]
-    if acq.get("profile_mode"):
-        raise ValueError(
-            f"{path} is a profile-mode bundle; a .dia holds centroided spectra. "
-            f"Re-run `massspec convert` without --profile."
-        )
     source_path = str(acq["source_path"])
     manifest_path = path / "manifest.json"
     if manifest_path.is_file():
-        source_path = str(json.loads(manifest_path.read_text()).get("source_file") or source_path)
+        manifest = read_bundle_manifest(path)
+        source_path = str(manifest.get("source_file") or source_path)
+        if (manifest.get("parameters") or {}).get("partial"):
+            raise ValueError(
+                f"{path} is a partial peak list, made for looking at some scans; in a "
+                f".dia its other scans would be empty and a search would quietly lose "
+                f"what they hold. Make a whole peak list."
+            )
 
     scan_file = pq.ParquetFile(path / "scan_metadata.parquet")
-    have = set(scan_file.schema_arrow.names)
-    columns = [*_SCAN_COLUMNS, *(c for c in _SCAN_WINDOW_COLUMNS if c in have)]
-    scans = scan_file.read(columns=columns).sort_by("scan")
+    scans = scan_file.read(columns=[*_SCAN_COLUMNS, *_SCAN_WINDOW_COLUMNS]).sort_by("scan")
     levels = set(pc.unique(scans.column("level")).to_pylist())
     if not levels <= {1, 2}:
         raise ValueError(
@@ -353,7 +363,13 @@ def _scan_rows(bundle: _Bundle) -> _ScanRows:
     else:
         iit_places = displayed.get(_IIT_LABEL, 3)
         iit_ms = lambda v: _as_displayed(float(np.float32(v)), iit_places)  # noqa: E731
-    iit = [None if v is None else _f32(iit_ms(v) / 1000.0) for v in t.column("iit").to_pylist()]
+    # A blank trailer's injection time is null in a Thermo bundle; the file
+    # shows it as 0.000, and that is what the reference writer reads.
+    blank_iit = 0.0 if bundle.acq.get("source_format") == "thermo_raw" else None
+    iit = [
+        blank_iit if v is None else _f32(iit_ms(v) / 1000.0)
+        for v in t.column("iit").to_pylist()
+    ]
     lower = t.column("isolation_lower").to_numpy(zero_copy_only=False).astype(np.float64)
     upper = t.column("isolation_upper").to_numpy(zero_copy_only=False).astype(np.float64)
     width_places = None if displayed is None else displayed.get(_MS2_WIDTH_LABEL, 2)
@@ -366,11 +382,8 @@ def _scan_rows(bundle: _Bundle) -> _ScanRows:
         [0 if v is None else int(v) for v in t.column("precursor_scan").to_pylist()],
         dtype=np.int64,
     )
-    if set(_SCAN_WINDOW_COLUMNS) <= set(t.column_names):
-        window_lo = t.column("scan_window_lower").to_pylist()
-        window_hi = t.column("scan_window_upper").to_pylist()
-    else:
-        window_lo = window_hi = [None] * scan.size
+    window_lo = t.column("scan_window_lower").to_pylist()
+    window_hi = t.column("scan_window_upper").to_pylist()
 
     # Filter strings repeat heavily (one per window in DIA), so parse each
     # distinct one once.
@@ -654,6 +667,7 @@ def write_dia(
     batch_rows: int = 1 << 20,
     chunk_scans: int = 512,
     should_stop: Callable[[], bool] | None = None,
+    mz_axis: str | None = None,
 ) -> DiaWriteSummary:
     """Write ``out_path`` from one bundle (single run) or several (merged).
 
@@ -670,6 +684,11 @@ def write_dia(
     it answers true the write ends with :class:`SpectraWriteStopped`.
     For a writer in a thread that a signal cannot interrupt (a search
     fan-out being cancelled), so a stop does not wait for the whole file.
+
+    ``mz_axis`` names a measured m/z curve of each bundle (``massspec.mz_axis``,
+    ``latest`` for its newest) to subtract from every peak. Only then does the
+    file differ from the reference writer's; it says so in its metadata
+    (``constellation.mz_axis``).
     """
     out_path = Path(out_path).resolve()
     if out_path.suffix.lower() != ".dia":
@@ -679,6 +698,15 @@ def write_dia(
     if out_path.exists() and not overwrite:
         raise FileExistsError(f"{out_path} exists (pass overwrite=True to replace it)")
     loaded = [_load_bundle(Path(b)) for b in bundles]
+    if mz_axis is not None:
+        from constellation.massspec.mz_axis import load_mz_axis
+
+        for bundle in loaded:
+            bundle.mz_axis = load_mz_axis(bundle.path, mz_axis)
+            if bundle.mz_axis is None:
+                raise ValueError(
+                    f"{bundle.path} has no m/z axis; measure one with `constellation massspec mz-axis`"
+                )
     names = [b.dia_name for b in loaded]
     if len(set(names)) != len(names):
         raise ValueError(f"bundles share a source name; fractions must be distinct: {names}")
@@ -762,6 +790,9 @@ def write_dia(
                 loaded[0], out_path, total_precursor_tic=total_precursor_tic
             )
         )
+        if mz_axis is not None:
+            keys = ",".join(b.mz_axis.key for b in loaded)
+            metadata = [*metadata, ("constellation.mz_axis", keys)]
         con.executemany("INSERT INTO metadata (Key, Value) VALUES (?, ?)", metadata)
         for ddl in DIA_INDEXES_V08:
             con.execute(ddl)
@@ -826,7 +857,10 @@ def _write_fraction(
                     f"scan_metadata.parquet does not list"
                 )
             if pending is not None and pending[0] == sc:
-                arrays.append((pending[1], pending[2]))
+                mz = pending[1]
+                if bundle.mz_axis is not None:
+                    mz = bundle.mz_axis.corrected(int(rows.level[i]), mz)
+                arrays.append((mz, pending[2]))
                 pending = next(peaks, None)
             else:
                 arrays.append((empty, empty))

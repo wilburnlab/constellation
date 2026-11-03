@@ -36,7 +36,7 @@ const ACQ: AcquisitionInfo = {
   source_sha256: null,
   acquisition_type: 'DIA',
   staggered: false,
-  profile_mode: false,
+  holds_profile: false,
   levels: [1, 2],
   scans_per_level: { '1': 4, '2': 8 },
   analyzers: { '1': ['ITMS'], '2': ['ITMS'] },
@@ -318,6 +318,124 @@ describe('MassSpecBrowser', () => {
     expect(ms1.querySelector('.ms-isolation')).not.toBeNull();
     expect(ms1.querySelector('.ms-target')).not.toBeNull();
     expect(ms1.querySelectorAll('.ms-peak-label').length).toBe(3);
+  });
+
+  describe('peak lists', () => {
+    const lists = (server: Server): void => {
+      server.acquisitions = [
+        {
+          ...ACQ,
+          peak_lists: [
+            { name: 'profile', kind: 'profile' },
+            { name: 'thermo', kind: 'peaks' },
+            { name: 'apex-1a2b3c4d', kind: 'peaks' },
+          ],
+        },
+      ];
+    };
+    const named = (server: Server, list: string): string[] =>
+      server.requests.filter((r) => r.startsWith('/api/tracks/ms_spectrum/data') && r.includes(`peak_list=${list}`));
+
+    describe('the m/z correction', () => {
+      const toggle = (): HTMLButtonElement =>
+        host.querySelector<HTMLButtonElement>('button[title^="Subtract each list"]')!;
+      const measured = (server: Server): void => {
+        server.acquisitions = [
+          {
+            ...ACQ,
+            peak_lists: [
+              { name: 'profile', kind: 'profile', has_mz_axis: true },
+              { name: 'thermo', kind: 'peaks', has_mz_axis: true },
+            ],
+          },
+        ];
+      };
+      const corrected = (server: Server, list: string): string[] =>
+        named(server, list).filter((r) => r.includes('corrected=true'));
+
+      it('is not offered until a list has a curve', async () => {
+        await open(false, lists);
+        expect(toggle().hidden).toBe(true);
+      });
+
+      it('asks for every shown list corrected, and back again', async () => {
+        const { b, server } = await open(false, measured);
+        expect(toggle().hidden).toBe(false);
+        expect(corrected(server, 'profile').length).toBe(0);
+        expect(corrected(server, 'thermo').length).toBe(0);
+
+        toggle().click();
+        await b.renderNow();
+        expect(toggle().classList.contains('active')).toBe(true);
+        expect(corrected(server, 'profile').length).toBeGreaterThan(0);
+        expect(corrected(server, 'thermo').length).toBeGreaterThan(0);
+
+        const requests = server.requests.length;
+        toggle().click();
+        await b.renderNow();
+        expect(toggle().classList.contains('active')).toBe(false);
+        expect(server.requests.slice(requests).some((r) => r.includes('corrected=true'))).toBe(false);
+      });
+    });
+
+    it('names no list for a run with one', async () => {
+      const { server } = await open();
+      expect(server.requests.some((r) => r.includes('peak_list='))).toBe(false);
+      expect(host.querySelector<HTMLButtonElement>('button[title^="Choose which"]')!.hidden).toBe(true);
+    });
+
+    it('opens on the profile and the first peak list, and asks for each', async () => {
+      const { b, server } = await open(false, lists);
+      expect(b.currentView!.lists).toEqual(['profile', 'thermo']);
+      expect(named(server, 'profile').length).toBeGreaterThan(0);
+      expect(named(server, 'thermo').length).toBeGreaterThan(0);
+      expect(named(server, 'apex-1a2b3c4d').length).toBe(0);
+      const cell = b.panelGrid!.cell('ms1', 'spec')!.panel.bodyHost;
+      expect([...cell.querySelectorAll('.ms-legend-label')].map((t) => t.textContent)).toEqual(['profile', 'thermo']);
+    });
+
+    it('asks only for the view s lists, and a scan s sticks only once', async () => {
+      const { b, server } = await open(false, lists);
+      const before = named(server, 'thermo').length;
+      b.currentView!.rows.ms1.mz = [205, 206];
+      b.requestRender();
+      await b.renderNow();
+      // A zoom of unreduced data fetches nothing more.
+      expect(named(server, 'thermo').length).toBe(before);
+    });
+
+    it('remembers the choice per run, and what the run no longer has is dropped', async () => {
+      window.localStorage.setItem('constellation.massspec.lists.v1.src-run', JSON.stringify(['thermo', 'gone']));
+      const { b } = await open(false, lists);
+      expect(b.currentView!.lists).toEqual(['thermo']);
+    });
+
+    it('the picker changes what spectra show, and always leaves one', async () => {
+      const { b, server } = await open(false, lists);
+      host.querySelector<HTMLButtonElement>('button[title^="Choose which"]')!.click();
+      const box = (name: string): HTMLInputElement =>
+        host.querySelector<HTMLInputElement>(`input[data-list="${name}"]`)!;
+      expect(box('profile').checked).toBe(true);
+      expect(box('apex-1a2b3c4d').checked).toBe(false);
+      box('apex-1a2b3c4d').click();
+      await b.renderNow();
+      expect(b.currentView!.lists).toEqual(['profile', 'thermo', 'apex-1a2b3c4d']);
+      expect(named(server, 'apex-1a2b3c4d').length).toBeGreaterThan(0);
+      expect(JSON.parse(window.localStorage.getItem('constellation.massspec.lists.v1.src-run')!)).toEqual([
+        'profile', 'thermo', 'apex-1a2b3c4d',
+      ]);
+      for (const name of ['profile', 'thermo', 'apex-1a2b3c4d']) box(name).click();
+      expect(b.currentView!.lists).toEqual(['apex-1a2b3c4d']);
+      expect(box('apex-1a2b3c4d').checked).toBe(true);
+    });
+
+    it('a CSV of a cell says which list each row is from', async () => {
+      const { b } = await open(false, lists);
+      const csv = b.cellCsv(b.panelGrid!.cell('ms1', 'spec')!)!;
+      const rows = csv.trim().split('\n');
+      expect(rows[0].startsWith('peak_list,mz,intensity')).toBe(true);
+      expect(new Set(rows.slice(1).map((r) => r.split(',')[0]))).toEqual(new Set(['profile', 'thermo']));
+    });
   });
 
   it('a scan picked on MS2 brings its parent MS1 scan along', async () => {

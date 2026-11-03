@@ -165,6 +165,7 @@ def precursor(
     from constellation.massspec.results import (
         precursor_detail,
         rt_mapping,
+        search_units,
         searched_library_spectrum,
         trace_targets,
     )
@@ -199,10 +200,14 @@ def precursor(
             predicted_rt = float(
                 np.interp(library_rt, mapping.column("library_rt").to_numpy(), mapping.column("observed_rt").to_numpy())
             )
+    searched_list = next((u["peak_list"] for u in search_units(root) if u["unit"] == unit), None)
     return {
         "identification": {k: _plain(v) for k, v in found.items()},
         "experiment": experiment,
         "unit": unit,
+        # The list this search read, so it is the one annotated; null for what
+        # the conversion made, which is the run's main list.
+        "peak_list": searched_list,
         "located": {k: list(v) if isinstance(v, tuple) else v for k, v in located.items()},
         "ms1_targets": precursor_isotopes(modseq, charge=charge, n_isotopes=n_isotopes).to_pylist(),
         "ms2_targets": _plain_rows(

@@ -35,6 +35,9 @@ TRAILER_KEY_MONOISOTOPIC = "Monoisotopic M/Z:"
 TRAILER_KEY_CHARGE = "Charge State:"
 TRAILER_KEY_MASTER_SCAN = "Master Scan Number:"
 TRAILER_KEY_IIT = "Ion Injection Time (ms):"
+# Both zero mark a blank trailer (see ``_scans``).
+TRAILER_KEY_MICROSCANS = "Micro Scan Count:"
+TRAILER_KEY_ELAPSED_TIME = "Elapsed Scan Time (sec):"
 
 
 # ── coercion helpers ──────────────────────────────────────────────────
@@ -341,8 +344,10 @@ def trailer_to_dict(trailer) -> dict[str, Any]:
 
 __all__ = [
     "TRAILER_KEY_CHARGE",
+    "TRAILER_KEY_ELAPSED_TIME",
     "TRAILER_KEY_IIT",
     "TRAILER_KEY_MASTER_SCAN",
+    "TRAILER_KEY_MICROSCANS",
     "TRAILER_KEY_MONOISOTOPIC",
     "TrailerField",
     "_TRAILER_FIELDS",

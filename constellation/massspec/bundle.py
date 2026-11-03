@@ -1,18 +1,28 @@
-"""The peaks of a converted acquisition (a ``massspec convert`` bundle).
+"""What a converted acquisition is on disk (a ``massspec convert`` bundle).
 
 A bundle is a directory holding ``manifest.json``, ``scan_metadata.parquet``,
-``acquisition_metadata.parquet`` and the peaks, one row per peak
-(:data:`MS_PEAK_TABLE`) in scan order. The peaks are either
+``acquisition_metadata.parquet`` and one set of points, one row per point
+(:data:`MS_PEAK_TABLE`) in scan order, as parts whose names sort in scan
+order, each a contiguous range of scans. There are two kinds:
 
-- ``peaks/part-NNNNN.parquet``: parts whose names sort in scan order, each a
-  contiguous range of scans (bundles written since manifest v2), or
-- ``peaks.parquet``: one file (earlier bundles).
+- a **peak bundle** holds ``peaks/part-NNNNN.parquet``: centroids, always. A
+  run can have any number of them, one per way of centroiding it;
+- a **profile bundle** holds ``profile/part-NNNNN.parquet``: what each scan
+  stored, kept so that peak lists can be made from it later. Its manifest's
+  kind is ``thermo_profile``.
 
-This module is the one definition of where a bundle's peaks are and how
-peak rows are made and written. Code that reads peaks goes through
+They are separate directories, and every consumer treats a bundle as one
+list of points, so nothing has to ask which layer it was given. Bundles of
+one run are tied together by the ``source_sha256`` their manifests record.
+
+This module is the one definition of what a bundle holds and how its rows
+are made and written. Code that reads peaks goes through
 :func:`peaks_dataset` / :func:`iter_peak_batches` (or :func:`open_peaks` for
-"a bundle, a directory of parts, or a Parquet file") rather than naming
-files:
+"a bundle, a directory of parts, or a Parquet file"), which refuse a profile
+bundle; code that reads either kind goes through :func:`points_dataset`.
+Neither names files. Only the current format opens: an older bundle is
+refused with :class:`OutdatedBundleError` rather than read as if it were
+current, because what its files mean has changed.
 
 - :func:`peak_rows` turns one block of scans (their metadata as an Arrow
   table, their peaks as numpy arrays) into peak rows, repeating each scan's
@@ -23,10 +33,12 @@ files:
 
 from __future__ import annotations
 
+import functools
+import json
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Iterator, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 import pyarrow as pa
@@ -36,7 +48,20 @@ import pyarrow.parquet as pq
 from constellation.massspec.schemas import MS_PEAK_TABLE
 
 PEAKS_DIR = "peaks"
-LEGACY_PEAKS_FILE = "peaks.parquet"
+PROFILE_DIR = "profile"
+#: Where a bundle keeps its measured m/z curves (``massspec.mz_axis``).
+MZ_AXES_DIR = "mz_axes"
+MANIFEST_FILENAME = "manifest.json"
+#: A run's profile bundle sits beside its peak bundle, named by this suffix.
+PROFILE_SUFFIX = ".profile"
+PEAK_BUNDLE_KINDS = ("thermo_acquisition", "encyclopedia_dia_acquisition")
+PROFILE_BUNDLE_KIND = "thermo_profile"
+BUNDLE_KINDS = (*PEAK_BUNDLE_KINDS, PROFILE_BUNDLE_KIND)
+#: The only format that opens. v3 (2026-10-31): ``peaks/`` always means
+#: centroids and profile points have their own bundle; a blank trailer is
+#: null rather than zero; ``profile_mode`` is gone. Before that, ``peaks/``
+#: could hold either, so an older bundle cannot be read as a current one.
+BUNDLE_SCHEMA_VERSION = 3
 DEFAULT_RT_BIN_WIDTH_S = 60.0
 # pyarrow's own ceiling on a row group when write_table is given none.
 MAX_ROW_GROUP_ROWS = 1 << 20
@@ -48,45 +73,191 @@ _SCAN_COLUMNS: tuple[str, ...] = tuple(
 )
 
 
-# ── where a bundle's peaks are ────────────────────────────────────────
+# ── what a bundle is ──────────────────────────────────────────────────
+
+
+class OutdatedBundleError(ValueError):
+    """A bundle written in a format that no longer opens."""
+
+
+def _refuse_outdated(bundle: Path, manifest: Mapping[str, Any]) -> None:
+    version = manifest.get("schema_version")
+    if version != BUNDLE_SCHEMA_VERSION:
+        raise OutdatedBundleError(
+            f"{bundle} was written by an older Constellation (bundle format {version!r}; "
+            f"this one reads {BUNDLE_SCHEMA_VERSION}). Convert the run again with "
+            f"`constellation massspec convert`."
+        )
+
+
+def read_bundle_manifest(bundle_dir: Path | str) -> dict[str, Any]:
+    """A bundle's manifest, checked to be a bundle in the current format.
+
+    Everything that takes a bundle reads its manifest through this.
+    """
+    bundle = Path(bundle_dir)
+    path = bundle / MANIFEST_FILENAME
+    if not path.is_file():
+        raise ValueError(f"{bundle} is not a converted acquisition (no {MANIFEST_FILENAME})")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("kind") not in BUNDLE_KINDS:
+        raise ValueError(
+            f"{bundle} holds a {manifest.get('kind')!r}, not a converted acquisition "
+            f"({' or '.join(BUNDLE_KINDS)})"
+        )
+    _refuse_outdated(bundle, manifest)
+    return manifest
+
+
+@functools.lru_cache(maxsize=512)
+def _manifest_version(path: str, mtime_ns: int) -> Any:
+    # A Thermo manifest runs to 100 KB and every spectrum read checks it.
+    return json.loads(Path(path).read_text(encoding="utf-8")).get("schema_version")
+
+
+def _check_current(bundle: Path) -> None:
+    """Refuse a bundle in an older format. A directory with no manifest has
+    no format to check: an unfinished conversion, or a directory of parts."""
+    path = bundle / MANIFEST_FILENAME
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    _refuse_outdated(bundle, {"schema_version": _manifest_version(str(path), mtime_ns)})
+
+
+def list_mz_axes(bundle_dir: Path | str) -> list[str]:
+    """The keys of a bundle's measured m/z curves, oldest first."""
+    directory = Path(bundle_dir) / MZ_AXES_DIR
+    if not directory.is_dir():
+        return []
+    files = sorted(directory.glob("*.parquet"), key=lambda p: (p.stat().st_mtime_ns, p.name))
+    return [p.stem for p in files]
+
+
+def peak_list_name(manifest: Mapping[str, Any]) -> str:
+    """What to call a bundle's list of points: ``profile``, the name a derived
+    peak list was given, or else what made it (``thermo``, ``imported``)."""
+    if manifest.get("kind") == PROFILE_BUNDLE_KIND:
+        return PROFILE_DIR
+    derived = manifest.get("derived_from") or {}
+    if derived.get("name"):
+        return str(derived["name"])
+    return str((manifest.get("parameters") or {}).get("centroider") or "imported")
+
+
+def _names_each_other(a: Path, a_manifest: Mapping[str, Any], b: Path, b_manifest: Mapping[str, Any]) -> bool:
+    for source, manifest, other in ((a, a_manifest, b), (b, b_manifest, a)):
+        parameters = manifest.get("parameters") or {}
+        if other.name in (parameters.get("profile_bundle"), parameters.get("peak_bundle")):
+            return True
+        derived_from = (manifest.get("derived_from") or {}).get("source")
+        if derived_from and (source.parent / str(derived_from)).resolve() == other.resolve():
+            return True
+    return False
+
+
+def related_bundles(bundle_dir: Path | str) -> list[dict[str, Any]]:
+    """The run's other bundles beside this one, without recursing: directories
+    named for the run whose manifest has the same ``source_sha256``, or which
+    are tied to this bundle by naming each other, directly or through another
+    of the run's bundles (a conversion with no hash: a derived list names the
+    profile, and the profile names the conversion's peak list). Each is
+    ``name``, ``bundle``, ``holds_profile`` and ``mz_axes``. A bundle in an
+    older format is passed over."""
+    bundle = Path(bundle_dir).resolve()
+    manifest = read_bundle_manifest(bundle)
+    source = str(manifest.get("source_file") or bundle.name).replace("\\", "/").rsplit("/", 1)[-1]
+    run = Path(source).stem
+    sha = manifest.get("source_sha256")
+    candidates: dict[Path, Mapping[str, Any]] = {}
+    for candidate in sorted(bundle.parent.iterdir()):
+        if candidate == bundle or not candidate.is_dir():
+            continue
+        if candidate.name != run and not candidate.name.startswith(run + "."):
+            continue
+        try:
+            candidates[candidate] = read_bundle_manifest(candidate)
+        except (ValueError, OSError):
+            continue
+
+    tied = {c for c, other in candidates.items() if sha and other.get("source_sha256") == sha}
+    reached = [(bundle, manifest), *((c, candidates[c]) for c in tied)]
+    while reached:
+        member, member_manifest = reached.pop()
+        for candidate, other in candidates.items():
+            if candidate not in tied and _names_each_other(member, member_manifest, candidate, other):
+                tied.add(candidate)
+                reached.append((candidate, other))
+    return [
+        {
+            "name": peak_list_name(candidates[c]),
+            "bundle": c,
+            "holds_profile": is_profile_bundle(c),
+            "mz_axes": list_mz_axes(c),
+        }
+        for c in sorted(tied)
+    ]
 
 
 def part_name(index: int) -> str:
-    """The file name of a bundle's ``index``-th peak part."""
+    """The file name of a bundle's ``index``-th part."""
     return f"part-{index:05d}.parquet"
 
 
-def peak_paths(bundle_dir: Path | str) -> list[Path]:
-    """A bundle's peak files, in scan order.
+def is_profile_bundle(bundle_dir: Path | str) -> bool:
+    """Whether ``bundle_dir`` holds profile points rather than peaks."""
+    return (Path(bundle_dir) / PROFILE_DIR).is_dir()
 
-    Raises ``FileNotFoundError`` for a directory with neither layout.
+
+def peak_paths(bundle_dir: Path | str) -> list[Path]:
+    """A peak bundle's files, in scan order.
+
+    Raises ``ValueError`` for a profile bundle, whose points are not peaks,
+    and ``FileNotFoundError`` for a directory with neither.
     """
     bundle = Path(bundle_dir)
+    _check_current(bundle)
     parts = bundle / PEAKS_DIR
     if parts.is_dir():
         return sorted(parts.glob("part-*.parquet"))
-    legacy = bundle / LEGACY_PEAKS_FILE
-    if legacy.is_file():
-        return [legacy]
-    raise FileNotFoundError(
-        f"{bundle} holds no peaks (neither {PEAKS_DIR}/ nor {LEGACY_PEAKS_FILE})"
-    )
+    if is_profile_bundle(bundle):
+        raise ValueError(
+            f"{bundle} is a profile bundle: it holds profile points, not peaks. Make a "
+            f"peak list from it with `constellation massspec centroid`."
+        )
+    raise FileNotFoundError(f"{bundle} holds no peaks (no {PEAKS_DIR}/)")
+
+
+def point_paths(bundle_dir: Path | str) -> list[Path]:
+    """A bundle's files of either kind, in scan order: for reading a scan as
+    it is, whatever the bundle holds."""
+    bundle = Path(bundle_dir)
+    if is_profile_bundle(bundle):
+        _check_current(bundle)
+        return sorted((bundle / PROFILE_DIR).glob("part-*.parquet"))
+    return peak_paths(bundle)
 
 
 def has_peaks(bundle_dir: Path | str) -> bool:
-    """Whether ``bundle_dir`` holds peaks in either layout."""
-    bundle = Path(bundle_dir)
-    return (bundle / PEAKS_DIR).is_dir() or (bundle / LEGACY_PEAKS_FILE).is_file()
+    """Whether ``bundle_dir`` holds peaks."""
+    return (Path(bundle_dir) / PEAKS_DIR).is_dir()
+
+
+def _dataset_of(paths: Sequence[Path]) -> ds.Dataset:
+    # Built from the file list, so nothing else in the bundle directory
+    # (scan metadata, a peak index) is mistaken for points.
+    return ds.dataset([str(p) for p in paths], schema=_schema_of(paths), format="parquet")
 
 
 def peaks_dataset(bundle_dir: Path | str) -> ds.Dataset:
-    """A bundle's peaks as one dataset, its files in scan order.
+    """A peak bundle's peaks as one dataset, its files in scan order."""
+    return _dataset_of(peak_paths(bundle_dir))
 
-    Built from the file list, so nothing else in the bundle directory
-    (scan metadata, a peak index) is mistaken for peaks.
-    """
-    paths = peak_paths(bundle_dir)
-    return ds.dataset([str(p) for p in paths], schema=_schema_of(paths), format="parquet")
+
+def points_dataset(bundle_dir: Path | str) -> ds.Dataset:
+    """A bundle's points of either kind as one dataset, in scan order."""
+    return _dataset_of(point_paths(bundle_dir))
 
 
 def _schema_of(paths: Sequence[Path]) -> pa.Schema:
@@ -96,7 +267,7 @@ def _schema_of(paths: Sequence[Path]) -> pa.Schema:
 def open_peaks(path: Path | str) -> ds.Dataset:
     """Peaks from a bundle, a directory of peak parts, or one Parquet file."""
     p = Path(path)
-    if p.is_dir() and has_peaks(p):
+    if p.is_dir() and (has_peaks(p) or is_profile_bundle(p)):
         return peaks_dataset(p)
     return ds.dataset(p)
 
@@ -162,7 +333,9 @@ class PeakWriter:
     one retention-time window touches few row groups. Rows must arrive in
     scan order. Encoding and compression run in a background thread, which
     pyarrow lets run without the GIL, so the caller goes on reading scans
-    while a row group is written.
+    while a row group is written. ``byte_stream_split`` stores ``mz`` and
+    ``intensity`` with that encoding, which on Stellar profile points gave
+    3.13 against 4.90 MiB per million rows.
     """
 
     def __init__(
@@ -171,11 +344,16 @@ class PeakWriter:
         *,
         rt_bin_width_s: float = DEFAULT_RT_BIN_WIDTH_S,
         max_row_group_rows: int = MAX_ROW_GROUP_ROWS,
+        byte_stream_split: bool = False,
     ):
         if rt_bin_width_s <= 0:
             raise ValueError(f"rt_bin_width_s must be positive, got {rt_bin_width_s}")
         self._writer = pq.ParquetWriter(
-            str(path), MS_PEAK_TABLE, compression="zstd", use_dictionary=False
+            str(path),
+            MS_PEAK_TABLE,
+            compression="zstd",
+            use_dictionary=False,
+            use_byte_stream_split=["mz", "intensity"] if byte_stream_split else False,
         )
         self._width = float(rt_bin_width_s)
         self._max_rows = int(max_row_group_rows)
@@ -251,16 +429,31 @@ class PeakWriter:
 
 
 __all__ = [
+    "BUNDLE_KINDS",
+    "BUNDLE_SCHEMA_VERSION",
     "DEFAULT_RT_BIN_WIDTH_S",
-    "LEGACY_PEAKS_FILE",
+    "MANIFEST_FILENAME",
     "MAX_ROW_GROUP_ROWS",
+    "MZ_AXES_DIR",
+    "OutdatedBundleError",
     "PEAKS_DIR",
+    "PEAK_BUNDLE_KINDS",
+    "PROFILE_BUNDLE_KIND",
+    "PROFILE_DIR",
+    "PROFILE_SUFFIX",
     "PeakWriter",
     "has_peaks",
+    "is_profile_bundle",
     "iter_peak_batches",
+    "list_mz_axes",
     "open_peaks",
     "part_name",
+    "peak_list_name",
     "peak_paths",
     "peak_rows",
     "peaks_dataset",
+    "point_paths",
+    "points_dataset",
+    "read_bundle_manifest",
+    "related_bundles",
 ]

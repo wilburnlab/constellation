@@ -285,6 +285,10 @@ def _search(experiment_dir: Path, unit_dir: Path, *, registered: bool) -> dict[s
     entry["_compare"] = {
         "library": entry["library"] or "none",
         "FASTA": entry["fasta"] or "none",
+        # Always present, so that two peak lists of a run read as a difference:
+        # a key one side lacks is passed over.
+        "peaks": (record.inputs.get("spectra_file") or {}).get("peak_list") or "as converted",
+        "m/z axis": ",".join((record.inputs.get("spectra_file") or {}).get("mz_axis") or ()) or "none",
         "engine": f"{record.engine} {record.engine_version}".strip(),
         "search mode": record.search_mode,
         **{k: v for k, v in view.items() if k not in _execution_only(record.engine)},
@@ -419,7 +423,7 @@ def _same(a: object, b: object) -> bool:
         return str(a).casefold() == str(b).casefold()
 
 
-_INPUT_KEYS = ("library", "FASTA", "engine", "search mode")
+_INPUT_KEYS = ("library", "FASTA", "peaks", "m/z axis", "engine", "search mode")
 
 
 def _compare_within_acquisitions(searches: list[dict[str, Any]]) -> None:

@@ -1,22 +1,21 @@
 """Typed manifest for the Thermo ``.raw`` → directory-bundle conversion.
 
-A single converted ``.raw`` produces a directory containing
-``peaks.parquet`` + ``scan_metadata.parquet`` +
-``acquisition_metadata.parquet`` plus a ``manifest.json`` that records:
+A converted ``.raw`` produces a peak bundle, a profile bundle or both (see
+:mod:`constellation.massspec.bundle`), each a directory with
+``scan_metadata.parquet`` + ``acquisition_metadata.parquet`` plus a
+``manifest.json`` that records:
 
 - which source file the bundle came from (path + optional sha256),
 - which convert-time parameters produced the parquets (rt-bin-width,
-  profile-mode flag, DLL pack version, .NET runtime),
+  centroider, DLL pack version, .NET runtime),
 - a small run-summary (instrument identity, n_scans, RT range, list of
   tune-data keys present) so a consumer can decide which bundles to
   open without paying parquet-read cost on every one.
 
-Schema v1 is the initial Constellation port, with the peaks in one
-``peaks.parquet``. v2 (2026-10-26) writes them as ``peaks/part-NNNNN.parquet``
-(``outputs.peaks`` names whichever; ``massspec.bundle`` reads both) and
-adds the parameters ``peaks``, ``centroider`` and ``workers``. The reader
-accepts both and rejects any other version — the bundle producer's command
-should be re-run rather than the reader hand-coerced into an older shape.
+The schema version is the bundle format's,
+:data:`~constellation.massspec.bundle.BUNDLE_SCHEMA_VERSION`, and the reader
+accepts only that one: the bundle producer's command should be re-run rather
+than the reader hand-coerced into an older shape.
 
 Modelled on :mod:`constellation.sequencing.transcriptome.manifest` —
 same JSON layout + dataclass dispatch + ISO-8601 ``created_at`` so
@@ -32,11 +31,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from constellation.massspec.bundle import (
+    BUNDLE_SCHEMA_VERSION,
+    MANIFEST_FILENAME,
+    PROFILE_BUNDLE_KIND,
+)
 
-MANIFEST_SCHEMA_VERSION = 2
-SUPPORTED_SCHEMA_VERSIONS = (1, 2)
-MANIFEST_FILENAME = "manifest.json"
+MANIFEST_SCHEMA_VERSION = BUNDLE_SCHEMA_VERSION
 BUNDLE_KIND = "thermo_acquisition"
+_KINDS = (BUNDLE_KIND, PROFILE_BUNDLE_KIND)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,21 +47,21 @@ class ThermoAcquisitionManifest:
     """Manifest for one ``.raw`` → bundle conversion."""
 
     schema_version: int
-    kind: Literal["thermo_acquisition"]
+    kind: Literal["thermo_acquisition", "thermo_profile"]
     created_at: str
     source_file: str
     source_sha256: str | None
     # Convert-time parameters: ``rt_bin_width_s`` (the parquet row-group
-    # chunking knob), ``profile_mode`` (the ``--profile`` flag), ``peaks``
-    # (``centroid`` / ``profile``), ``centroider``, ``workers``,
-    # ``dll_version`` (e.g. ``"1.4.5"`` from ``third_party/thermo/<v>/``),
-    # plus anything else worth recording (input flags the user passed at
-    # the CLI).
+    # chunking knob), ``centroider``, ``workers``, ``dll_version`` (e.g.
+    # ``"1.4.5"`` from ``third_party/thermo/<v>/``), the directory name of
+    # the run's other bundle from the same conversion (``profile_bundle`` /
+    # ``peak_bundle``), plus anything else worth recording (input flags the
+    # user passed at the CLI).
     parameters: dict[str, Any]
     # Path mappings from semantic name → relative path inside the bundle
-    # directory: ``peaks`` (``peaks`` in v2, ``peaks.parquet`` in v1),
-    # ``scan_metadata``, ``acquisition_metadata``. Future readers add keys
-    # without breaking existing consumers.
+    # directory: ``peaks`` or ``profile``, ``scan_metadata``,
+    # ``acquisition_metadata``. Future readers add keys without breaking
+    # existing consumers.
     outputs: dict[str, str]
     # Small instrument/run summary so the dashboard / cross-bundle
     # walker can sort and filter without opening parquets. ``tune_data``
@@ -80,11 +83,12 @@ def write_manifest(
     outputs: dict[str, str],
     run_metadata: dict[str, Any],
     created_at: str | None = None,
+    kind: str = BUNDLE_KIND,
 ) -> ThermoAcquisitionManifest:
     """Write a Thermo-bundle manifest to ``path`` and return the dataclass."""
     manifest = ThermoAcquisitionManifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
-        kind=BUNDLE_KIND,
+        kind=kind,
         created_at=created_at or _now_iso(),
         source_file=source_file,
         source_sha256=source_sha256,
@@ -105,21 +109,20 @@ def read_manifest(path: Path) -> ThermoAcquisitionManifest:
     """
     raw = json.loads(path.read_text(encoding="utf-8"))
     schema_version = raw.get("schema_version")
-    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+    if schema_version != MANIFEST_SCHEMA_VERSION:
         raise ValueError(
             f"manifest at {path} has schema_version={schema_version!r}; "
-            f"this constellation supports "
-            f"{', '.join(f'v{v}' for v in SUPPORTED_SCHEMA_VERSIONS)}. "
+            f"this constellation reads v{MANIFEST_SCHEMA_VERSION}. "
             "Re-run `constellation massspec convert` to refresh the bundle."
         )
     kind = raw.get("kind")
-    if kind != BUNDLE_KIND:
+    if kind not in _KINDS:
         raise ValueError(
-            f"manifest at {path} has kind={kind!r}; expected {BUNDLE_KIND!r}"
+            f"manifest at {path} has kind={kind!r}; expected one of {_KINDS}"
         )
     return ThermoAcquisitionManifest(
         schema_version=schema_version,
-        kind=BUNDLE_KIND,
+        kind=kind,
         created_at=str(raw.get("created_at", "")),
         source_file=str(raw.get("source_file", "")),
         source_sha256=raw.get("source_sha256"),

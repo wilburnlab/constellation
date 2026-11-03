@@ -29,7 +29,7 @@ Retention times are seconds throughout, as in the bundle.
 
 from __future__ import annotations
 
-import json
+import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,15 +46,22 @@ from constellation.massspec.acquisition_structure import (
     AcquisitionType,
     infer_acquisition_structure,
 )
-from constellation.massspec.bundle import peaks_dataset
+from constellation.massspec.bundle import (
+    BUNDLE_KINDS,
+    is_profile_bundle,
+    list_mz_axes,
+    peak_list_name,
+    points_dataset,
+    read_bundle_manifest,
+    related_bundles,
+)
 from constellation.massspec.quant.peak_index import (
     find_peak_index,
     index_partition,
     index_slice,
 )
 
-#: The bundle kinds this module reads.
-BUNDLE_KINDS = ("thermo_acquisition", "encyclopedia_dia_acquisition")
+logger = logging.getLogger(__name__)
 
 #: Scan-metadata columns :func:`scan_table` reads by default: enough to draw
 #: total-ion and base-peak chromatograms and to move between scans.
@@ -70,6 +77,7 @@ NAV_COLUMNS = (
     "precursor_mz",
     "precursor_charge",
     "precursor_scan",
+    "spectrum_type",
 )
 
 #: The match tolerance to assume for a scan when nothing better is known (a
@@ -101,7 +109,14 @@ class AcquisitionInfo:
     #: ``None`` for a run with no MS2 scans.
     acquisition_type: AcquisitionType | None
     staggered: bool
-    profile_mode: bool
+    #: Whether the bundle holds profile points rather than peaks.
+    holds_profile: bool
+    #: What to call this bundle's list of points (``profile``, ``thermo``, ...).
+    peak_list: str
+    #: The run's other bundles beside this one (``bundle.related_bundles``).
+    related: tuple[dict, ...]
+    #: This bundle's measured m/z curves, oldest first.
+    mz_axes: tuple[str, ...]
     levels: tuple[int, ...]
     scans_per_level: dict[int, int]
     #: Analyzers per MS level. A bundle imported from a spectra file records
@@ -110,26 +125,13 @@ class AcquisitionInfo:
     rt_range: tuple[float, float]
 
 
-def _manifest(bundle: Path) -> dict:
-    path = bundle / "manifest.json"
-    if not path.is_file():
-        raise ValueError(f"{bundle} is not a converted acquisition (no manifest.json)")
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("kind") not in BUNDLE_KINDS:
-        raise ValueError(
-            f"{bundle} holds a {manifest.get('kind')!r}, not a converted acquisition "
-            f"({' or '.join(BUNDLE_KINDS)})"
-        )
-    return manifest
-
-
 def open_acquisition(bundle_dir: Path | str) -> AcquisitionInfo:
     """Describe the converted acquisition in ``bundle_dir``.
 
     Raises ``ValueError`` for a directory that is not one.
     """
     bundle = Path(bundle_dir)
-    manifest = _manifest(bundle)
+    manifest = read_bundle_manifest(bundle)
     meta = pq.read_table(
         bundle / "scan_metadata.parquet",
         columns=["scan", "level", "rt", "analyzer", "isolation_lower", "isolation_upper"],
@@ -159,13 +161,6 @@ def open_acquisition(bundle_dir: Path | str) -> AcquisitionInfo:
     rt_range = (
         (float(pc.min(rt).as_py()), float(pc.max(rt).as_py())) if meta.num_rows else (0.0, 0.0)
     )
-    # The acquisition table says what the bundle stores; a Thermo manifest's
-    # `profile_mode` parameter is the flag the conversion was given, which
-    # bundles before scan-metadata v4 also wrote into the table.
-    profile = run.get("profile_mode")
-    if profile is None:
-        profile = (manifest.get("parameters") or {}).get("profile_mode")
-    profile = bool(profile)
     return AcquisitionInfo(
         bundle=bundle,
         kind=manifest["kind"],
@@ -174,7 +169,10 @@ def open_acquisition(bundle_dir: Path | str) -> AcquisitionInfo:
         index=find_peak_index(bundle),
         acquisition_type=acquisition_type,
         staggered=staggered,
-        profile_mode=profile,
+        holds_profile=is_profile_bundle(bundle),
+        peak_list=peak_list_name(manifest),
+        related=tuple(related_bundles(bundle)),
+        mz_axes=tuple(list_mz_axes(bundle)),
         levels=levels,
         scans_per_level=counts,
         analyzers=analyzers,
@@ -384,26 +382,45 @@ def dependent_scans(scans: pa.Table, scan: int) -> list[int]:
 # ── peaks ─────────────────────────────────────────────────────────────────
 
 
-def _peaks(bundle_dir: Path | str) -> ds.Dataset:
-    return peaks_dataset(bundle_dir)
+def _points(bundle_dir: Path | str) -> ds.Dataset:
+    return points_dataset(bundle_dir)
 
 
-def spectrum(bundle_dir: Path | str, scan: int) -> pa.Table:
-    """The peaks of one scan: ``mz`` and ``intensity``, in m/z order.
+def _axis(bundle_dir: Path | str, mz_axis: str):
+    from constellation.massspec.mz_axis import load_mz_axis
 
-    A scan with no peaks gives an empty table (bundles keep such scans in
-    the scan table but have no peak rows for them).
+    return load_mz_axis(bundle_dir, mz_axis)
+
+
+def spectrum(bundle_dir: Path | str, scan: int, *, mz_axis: str | None = None) -> pa.Table:
+    """One scan's points: ``mz`` and ``intensity``, in m/z order. Its peaks
+    from a peak bundle, its stored points from a profile bundle.
+
+    A scan with none gives an empty table (bundles keep such scans in the
+    scan table but have no rows for them). ``mz_axis`` names a measured curve
+    of this bundle (``massspec.mz_axis``, ``latest`` for its newest) to
+    subtract from m/z; with ``latest`` and no curve, m/z stays as stored.
     """
-    table = _peaks(bundle_dir).to_table(
-        columns=["mz", "intensity"], filter=ds.field("scan") == int(scan)
-    )
-    return table.sort_by("mz")
+    columns = ["mz", "intensity"]
+    if mz_axis is not None:
+        columns.append("level")
+    table = _points(bundle_dir).to_table(columns=columns, filter=ds.field("scan") == int(scan))
+    table = table.sort_by("mz")
+    if mz_axis is None:
+        return table
+    axis = _axis(bundle_dir, mz_axis)
+    points = table.select(["mz", "intensity"])
+    if axis is None or table.num_rows == 0:
+        return points
+    level = int(table.column("level")[0].as_py())
+    corrected = axis.corrected(level, table.column("mz").to_numpy())
+    return points.set_column(0, points.schema.field("mz"), pa.array(corrected, pa.float64()))
 
 
 def spectra(bundle_dir: Path | str, scans: Iterable[int]) -> pa.Table:
-    """The peaks of several scans in one read: ``scan``, ``mz``, ``intensity``."""
+    """Several scans' points in one read: ``scan``, ``mz``, ``intensity``."""
     wanted = pa.array(sorted({int(s) for s in scans}), pa.int32())
-    table = _peaks(bundle_dir).to_table(
+    table = _points(bundle_dir).to_table(
         columns=["scan", "mz", "intensity"], filter=ds.field("scan").isin(wanted)
     )
     return table.sort_by([("scan", "ascending"), ("mz", "ascending")])
@@ -428,6 +445,9 @@ XIC_SCHEMA = pa.schema(
 )
 
 
+_warned_profile_xic: set[str] = set()
+
+
 def _half_widths(mz: np.ndarray, tolerance: float, unit: str) -> np.ndarray:
     if unit == "ppm":
         return mz * tolerance * 1e-6
@@ -447,6 +467,7 @@ def xic(
     rt_range: tuple[float, float] | None = None,
     scans: pa.Table | None = None,
     use_index: bool = True,
+    mz_axis: str | None = None,
 ) -> pa.Table:
     """Extracted-ion chromatograms of each m/z in ``mz`` (``XIC_SCHEMA``).
 
@@ -460,10 +481,29 @@ def xic(
     its partition. Without one, the read is the bundle's peaks restricted to
     the scans in range: well under a second for a few minutes of a 100-min
     run, several seconds for the whole of it (the browser's payload survey).
+
+    On a profile bundle the nearest point in tolerance is one point of a
+    peak, not the ion's signal (one of about 10 at 0.35 Da on a 1/15 Th
+    grid), so this warns, once per bundle.
+
+    ``mz_axis`` names a measured curve of this bundle (as :func:`spectrum`):
+    the targets are then true m/z, looked for where the instrument reads them
+    (an index keeps instrument values), and ``mz_observed`` comes back corrected.
     """
     bundle = Path(bundle_dir)
+    if is_profile_bundle(bundle) and str(bundle) not in _warned_profile_xic:
+        _warned_profile_xic.add(str(bundle))
+        logger.warning(
+            "%s holds profile points: an XIC from it takes one point of each peak, "
+            "not the ion's signal; use a peak list for quantities",
+            bundle.name,
+        )
     targets = np.asarray(mz, dtype=np.float64)
     half = _half_widths(targets, tolerance, tolerance_unit)
+    axis = _axis(bundle, mz_axis) if mz_axis is not None else None
+    asked = targets
+    if axis is not None:
+        targets = axis.observed(level, targets)
     table = scans if scans is not None else scan_table(bundle)
     sub = _select(table, level, window)
     if rt_range is not None:
@@ -501,7 +541,7 @@ def xic(
                     index, level=level, window_id=partition, mz_lo=lo, mz_hi=hi, rt_lo=lo_rt - pad, rt_hi=hi_rt + pad
                 )
             else:
-                peaks = _peaks(bundle).to_table(
+                peaks = _points(bundle).to_table(
                     columns=["scan", "mz", "intensity"],
                     filter=(ds.field("rt") >= lo_rt) & (ds.field("rt") <= hi_rt)
                     & (ds.field("mz") >= lo) & (ds.field("mz") <= hi)
@@ -525,11 +565,13 @@ def xic(
             best_int[t, at[ok]] = p_int[ok]
             best_mz[t, at[ok]] = p_mz[ok]
 
+    if axis is not None:
+        best_mz = axis.corrected(level, best_mz)
     observed = best_mz.reshape(-1)
     return pa.table(
         {
             "trace": pa.array(np.repeat(np.arange(n_t), n_s), pa.int16()),
-            "mz_target": pa.array(np.repeat(targets, n_s), pa.float64()),
+            "mz_target": pa.array(np.repeat(asked, n_s), pa.float64()),
             "scan": pa.array(np.tile(grid_scans, n_t), pa.int32()),
             "rt": pa.array(np.tile(grid_rt, n_t), pa.float64()),
             "intensity": pa.array(best_int.reshape(-1), pa.float64()),

@@ -4,11 +4,14 @@ Mounted on the root ``constellation`` parser by
 ``constellation/cli/__main__.py``. One module per verb or verb group,
 each holding the verb's parser and its handler:
 
-    convert            Thermo .raw -> peak / scan-metadata parquet bundle
+    convert            Thermo .raw -> a peak bundle and a profile bundle
+    centroid           a peak list from a profile bundle
+    mz_axis            how far a bundle's m/z axis reads high or low
     search             EncyclopeDIA search of one acquisition, written as
                        an experiment directory
-    summarize          what an experiment directory, or one search in it,
-                       holds (and --follow for a detached run)
+    summarize          what an experiment directory, one search in it, or a
+                       converted acquisition holds (and --follow for a
+                       detached run)
     report             EncyclopeDIA's quantitative report across searches
     quantify           the chromatogram-library workflow: merged fractions,
                        run searches, report
@@ -37,12 +40,14 @@ from __future__ import annotations
 
 import argparse
 
+from constellation.massspec.cli.centroid import _build_centroid_parser
 from constellation.massspec.cli.chromatogram import _build_chromatogram_parser
 from constellation.massspec.cli.collision_filter import _build_collision_filter_parser
 from constellation.massspec.cli.convert import _build_convert_parser
 from constellation.massspec.cli.counter import _build_counter_parser
 from constellation.massspec.cli.encyclopedia import _build_encyclopedia_parser
 from constellation.massspec.cli.library_export import _build_library_export_parser
+from constellation.massspec.cli.mz_axis import _build_mz_axis_parser
 from constellation.massspec.cli.novel_peptides import (
     _build_classify_novel_peptides_parser,
 )
@@ -84,12 +89,14 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     ms_subs = p_ms.add_subparsers(dest="ms_subcommand", required=True)
 
     _build_convert_parser(ms_subs)
+    _build_centroid_parser(ms_subs)
     _build_search_parser(ms_subs)
     _build_summarize_parser(ms_subs)
     _build_report_parser(ms_subs)
     _build_quantify_parser(ms_subs)
     _build_predict_library_parser(ms_subs)
     _build_library_export_parser(ms_subs)
+    _build_mz_axis_parser(ms_subs)
     _build_classify_novel_peptides_parser(ms_subs)
     _build_collision_filter_parser(ms_subs)
     _build_encyclopedia_parser(ms_subs)

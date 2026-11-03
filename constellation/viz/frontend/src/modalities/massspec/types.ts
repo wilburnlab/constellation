@@ -1,6 +1,13 @@
 // Wire shapes of the mass-spec session routes (viz/modalities/massspec/endpoints.py).
 
 /** One acquisition, as `GET /api/massspec/sessions/{sid}/acquisitions` describes it. */
+export interface PeakListInfo {
+  name: string;
+  kind: 'profile' | 'peaks';
+  /** Whether an m/z curve has been measured for it. */
+  has_mz_axis?: boolean;
+}
+
 export interface AcquisitionInfo {
   key: string;
   label: string;
@@ -11,7 +18,9 @@ export interface AcquisitionInfo {
   source_sha256: string | null;
   acquisition_type: 'DIA' | 'DDA' | null;
   staggered: boolean;
-  profile_mode: boolean;
+  holds_profile: boolean;
+  /** The run's lists of points, the profile first. */
+  peak_lists?: PeakListInfo[];
   levels: number[];
   /** By level, as a string. */
   scans_per_level: Record<string, number>;

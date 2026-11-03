@@ -25,7 +25,10 @@ def fake_centroider(monkeypatch):
 
     def load_scan(raw, n):
         s = raw.scans[n]
-        return Obj(HasCentroidStream=s["stream"] is not None, mz=s["mz"], intensity=s["intensity"])
+        return Obj(
+            HasCentroidStream=s["stream"] is not None, mz=s["mz"], intensity=s["intensity"],
+            SegmentedScan=Obj(Positions=s["mz"], Intensities=s["intensity"]),
+        )
 
     def centroider(scan):
         keep = scan.intensity >= scan.intensity.max() / 2

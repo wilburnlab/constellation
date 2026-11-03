@@ -1,4 +1,9 @@
-"""``constellation massspec convert``: Thermo ``.raw`` to a peak / scan-metadata parquet bundle."""
+"""``constellation massspec convert``: Thermo ``.raw`` to Parquet bundles.
+
+A profile run comes out as its profile bundle and a peak list made from it by
+``DEFAULT_ALGO``; ``--no-profile`` and ``--centroid-algo`` adjust that. A centroid
+run comes out as its peaks, and neither flag has anything to do.
+"""
 
 from __future__ import annotations
 
@@ -6,23 +11,34 @@ import argparse
 import sys
 from pathlib import Path
 
+# Restated: importing the reader package for its names would slow every
+# command's parser. A test holds these equal to the reader's and the registry's.
+DEFAULT_ALGO = "thermo"
+NO_ALGO = "none"
+OWN_ALGOS = ("apex",)
+
+# ``help`` is what `massspec -h` lists and ``description`` what `massspec convert -h`
+# opens with; argparse shows neither in the other's place.
+_SUMMARY = (
+    "Convert Thermo .raw file(s) into directory bundles. By default a run with "
+    "profile scans gives two: <run>.profile/ holds its profile points, and <run>/ "
+    f"holds peaks made from them by --centroid-algo (default: {DEFAULT_ALGO}), so "
+    "other peak lists can be made later. A run acquired as centroids gives <run>/ "
+    "with the instrument's centroids, and --no-profile and --centroid-algo do "
+    "nothing to it. Each bundle has manifest.json, scan_metadata.parquet and "
+    "acquisition_metadata.parquet beside its points. Accepts a single .raw file OR "
+    "a directory of .raw files; --threads worker processes read ranges of scans of "
+    "one file or many. Dispatches on the input suffix; .raw routes to "
+    "constellation.massspec.readers.thermo.convert. Future mzML / Bruker / Sciex "
+    "converters slot in transparently."
+)
+
 
 # ── convert ─────────────────────────────────────────────────────────────
 
 
 def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
-    p = subs.add_parser(
-        "convert",
-        help=(
-            "Convert Thermo .raw file(s) into directory bundles "
-            "(manifest.json + peaks/ + scan_metadata.parquet + "
-            "acquisition_metadata.parquet). Accepts a single .raw file "
-            "OR a directory of .raw files; --threads worker processes read "
-            "ranges of scans of one file or many. Dispatches on the input "
-            "suffix; .raw routes to constellation.massspec.readers.thermo.convert. "
-            "Future mzML / Bruker / Sciex converters slot in transparently."
-        ),
-    )
+    p = subs.add_parser("convert", help=_SUMMARY, description=_SUMMARY)
     p.add_argument(
         "input",
         type=Path,
@@ -37,8 +53,9 @@ def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
         type=Path,
         default=None,
         help=(
-            "Parent directory for the output bundle(s). Each bundle dir "
-            "is <output-dir>/<input-stem>/. Defaults to the input file's "
+            "Parent directory for the output bundle(s): "
+            "<output-dir>/<input-stem>/ and, for profile data, "
+            "<output-dir>/<input-stem>.profile/. Defaults to the input file's "
             "parent directory (single-file mode) or the input directory "
             "itself (directory mode)."
         ),
@@ -69,19 +86,33 @@ def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
         ),
     )
     p.add_argument(
-        "--profile",
-        action="store_true",
+        "--no-profile",
+        dest="keep_profile",
+        action="store_false",
         help=(
-            "Keep the profile points of profile-acquired scans instead of "
-            "centroiding them (scans acquired as centroids stay centroids). "
-            "By default every scan becomes centroids: the instrument's where it "
-            "stored them (with per-peak resolution/noise/baseline from an "
-            "Orbitrap's centroid stream), and Thermo's centroider on profile "
-            "scans that have none, as ion-trap profile scans do not. A profile "
-            "run is far larger: ~19,500 points per Stellar MS2 scan against "
-            "~1,200 centroids."
+            "Do not keep the profile points of profile-acquired scans. By "
+            "default they go into <run>.profile/ beside the peak list, so the "
+            "run can be centroided again later (~19,500 points per Stellar MS2 "
+            "scan against ~1,200 centroids, and it can be deleted at any time). "
+            "No effect on a run with no profile scans."
         ),
     )
+    p.add_argument(
+        "--centroid-algo",
+        choices=(DEFAULT_ALGO, NO_ALGO, *OWN_ALGOS),
+        default=DEFAULT_ALGO,
+        help=(
+            f"How to make peaks from profile scans. Default: {DEFAULT_ALGO}. "
+            "'thermo' is Thermo's centroider, Scan.ToCentroid, as "
+            "ThermoRawFileParser and msconvert run it. 'none' makes no peak list, "
+            "only <run>.profile/, for centroiding later with `massspec centroid`. "
+            "'apex' is the profile's local maxima, a cheap baseline. This applies "
+            "to profile scans with no stored centroids, as ion-trap profile scans "
+            "have none; an Orbitrap's centroid stream and a run's stored centroids "
+            "stay the instrument's whatever this says."
+        ),
+    )
+    p.add_argument("--profile", action="store_true", help=argparse.SUPPRESS)
     p.add_argument(
         "--allow-empty-levels",
         action="store_true",
@@ -114,9 +145,9 @@ def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
         "--force",
         action="store_true",
         help=(
-            "Overwrite an existing non-empty bundle directory. Without "
-            "this, single-file mode refuses to clobber and exits with "
-            "an error; batch mode (directory input or --threads > 1) "
+            "Overwrite the run's existing bundles (a peak list made later "
+            "with `massspec centroid` is left alone). Without this, a single "
+            "file refuses to clobber and exits with an error; a directory "
             "treats existing bundles as skipped instead."
         ),
     )
@@ -141,6 +172,14 @@ def _cmd_massspec_convert(args: argparse.Namespace) -> int:
     path; both run ``--threads`` worker processes (one runs in this one).
     """
     input_path: Path = args.input
+    if args.profile:
+        print(
+            "error: --profile was removed: the profile is now kept by default, in "
+            "<run>.profile/ beside the peak list. --centroid-algo none keeps it "
+            "without making peaks.",
+            file=sys.stderr,
+        )
+        return 2
     if not input_path.exists():
         print(f"error: input not found: {input_path}", file=sys.stderr)
         return 2
@@ -184,7 +223,8 @@ def _cmd_massspec_convert_single(
                 input_path,
                 bundle_dir,
                 rt_bin_width_s=args.rt_bin_width_s,
-                profile=args.profile,
+                keep_profile=args.keep_profile,
+                centroid_algo=args.centroid_algo,
                 capture_trailer_extras=args.capture_trailer_extras,
                 batch_size=args.batch_size,
                 compute_sha256=args.compute_sha256,
@@ -203,21 +243,23 @@ def _cmd_massspec_convert_single(
             )
             return 5
 
+        from constellation.massspec.bundle import PROFILE_BUNDLE_KIND, PROFILE_SUFFIX
         from constellation.massspec.readers.thermo import describe_levels
 
-        print(f"wrote bundle: {bundle_dir}")
-        for line in describe_levels(manifest.run_metadata.get("levels") or []):
-            print(f"  {line}")
-        print(f"  manifest:                {bundle_dir / 'manifest.json'}")
-        print(f"  peaks:                   {bundle_dir / manifest.outputs['peaks']}")
-        print(
-            f"  scan_metadata:           "
-            f"{bundle_dir / manifest.outputs['scan_metadata']}"
-        )
-        print(
-            f"  acquisition_metadata:    "
-            f"{bundle_dir / manifest.outputs['acquisition_metadata']}"
-        )
+        levels = manifest.run_metadata.get("levels") or []
+        missing = manifest.run_metadata.get("n_scans_without_injection_time") or 0
+        if manifest.kind == PROFILE_BUNDLE_KIND:
+            print(f"wrote profile bundle: {parent / (input_path.stem + PROFILE_SUFFIX)}")
+            for line in describe_levels(levels, noun="points"):
+                print(f"  {line}")
+        else:
+            print(f"wrote bundle: {bundle_dir}")
+            for line in describe_levels(levels):
+                print(f"  {line}")
+            profile = manifest.parameters.get("profile_bundle")
+            print(f"  profile bundle: {parent / profile}" if profile else "  profile bundle: none")
+        if missing:
+            print(f"  {missing:,} scans have no injection time (a blank trailer, or none recorded)")
         return 0
 
     print(
@@ -290,7 +332,8 @@ def _cmd_massspec_convert_batch(
         n_workers=args.threads,
         force=args.force,
         rt_bin_width_s=args.rt_bin_width_s,
-        profile=args.profile,
+        keep_profile=args.keep_profile,
+        centroid_algo=args.centroid_algo,
         capture_trailer_extras=args.capture_trailer_extras,
         batch_size=args.batch_size,
         compute_sha256=args.compute_sha256,

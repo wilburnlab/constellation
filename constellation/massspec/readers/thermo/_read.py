@@ -12,11 +12,13 @@ Two surfaces:
   that :func:`._convert.convert` (``constellation massspec convert``,
   streaming to a bundle with bounded RAM) builds on.
 
-Peaks are centroids by default: the instrument's where it stored them, and
-Thermo's centroider (``Scan.ToCentroid``) run on profile scans that have no
-centroid stream, as ion-trap profile acquisitions do not. ``profile=True``
-keeps profile points instead. Each scan records which in
-``spectrum_type`` / ``centroider``; the table is in :mod:`._scans`.
+Peaks are centroids: the instrument's where it stored them, and Thermo's
+centroider (``Scan.ToCentroid``) run on profile scans that have no centroid
+stream, as ion-trap profile acquisitions do not. A conversion also keeps each
+scan's stored points by default, in a bundle of their own; the in-memory
+reader returns one list, with ``profile=True`` the points instead of the
+peaks. Each scan records which in ``spectrum_type`` / ``centroider``; the table
+is in :mod:`._scans`.
 """
 
 from __future__ import annotations
@@ -183,8 +185,8 @@ def _build_run_metadata(source, path: Path) -> dict[str, Any]:
 
     Populates the ``ACQUISITION_METADATA_TABLE`` fields that don't
     require iterating scans (instrument identity, method name, creation
-    date, tune data). Fields that do (n_scans, RT range, profile flag,
-    analyzers) come from the scan table, :func:`_acquisition_stats`.
+    date, tune data). Fields that do (n_scans, RT range, analyzers) come
+    from the scan table, :func:`_acquisition_stats`.
     """
     meta: dict[str, Any] = {
         "source_format": SOURCE_FORMAT,
@@ -247,18 +249,15 @@ def _acquisition_stats(scans: pa.Table) -> dict[str, Any]:
             "n_scans": 0,
             "rt_min_seconds": None,
             "rt_max_seconds": None,
-            "profile_mode": None,
             "analyzers": None,
         }
     rt = pc.min_max(scans.column("rt")).as_py()
     # unique() keeps first-seen order.
     analyzers = [a for a in pc.unique(scans.column("analyzer")).to_pylist() if a]
-    profile = pc.any(pc.equal(scans.column("spectrum_type"), "profile")).as_py()
     return {
         "n_scans": scans.num_rows,
         "rt_min_seconds": rt["min"],
         "rt_max_seconds": rt["max"],
-        "profile_mode": bool(profile),
         "analyzers": analyzers or None,
     }
 
@@ -316,7 +315,7 @@ def level_summary(scans: pa.Table) -> list[dict[str, Any]]:
     return [levels[k] for k in sorted(levels)]
 
 
-def describe_levels(summary: list[dict[str, Any]]) -> list[str]:
+def describe_levels(summary: list[dict[str, Any]], *, noun: str = "peaks") -> list[str]:
     """One line per level saying what it holds and how its peaks were made."""
     lines = []
     for entry in summary:
@@ -326,7 +325,7 @@ def describe_levels(summary: list[dict[str, Any]]) -> list[str]:
         )
         lines.append(
             f"MS{entry['level']}: {entry['n_scans']:,} scans, "
-            f"{entry['n_peaks']:,} peaks ({made})"
+            f"{entry['n_peaks']:,} {noun} ({made})"
         )
     return lines
 
@@ -345,6 +344,11 @@ def _check_levels(summary: list[dict[str, Any]], scans: pa.Table) -> None:
         "no peaks at " + "; ".join(parts) + ". Nothing was written. If the run "
         "really has no signal there, convert with --allow-empty-levels."
     )
+
+
+def scans_without_injection_time(scans: pa.Table) -> int:
+    """How many scans have none: a blank trailer, or none recorded."""
+    return scans.num_rows - int(pc.count(scans.column("iit")).as_py())
 
 
 def _check_scans_read(n_scans: int, scans: pa.Table) -> None:
@@ -385,9 +389,10 @@ class ThermoReader(RawReader):
         capture_trailer_extras: bool = True,
         batch_size: int = DEFAULT_BATCH_SIZE,
     ):
+        self.profile = profile
         self.options = ReadOptions(
-            profile=profile,
-            centroider=centroider,
+            keep_profile=profile,
+            centroider=None if profile else centroider,
             capture_trailer_extras=capture_trailer_extras,
         )
         self.batch_size = batch_size
@@ -403,7 +408,7 @@ class ThermoReader(RawReader):
             for block in iter_scan_blocks(
                 raw, first, last, self.options, max_block_scans=self.batch_size
             ):
-                peaks.append(block.peak_table())
+                peaks.append(block.point_table() if self.profile else block.peak_table())
                 scans.append(block.scans)
         scan_table = _concat_scans(scans)
         _check_scans_read(max(last - first + 1, 0), scan_table)
@@ -485,11 +490,27 @@ def _scan_range(raw) -> tuple[int, int]:
     return int(header.FirstSpectrum), int(header.LastSpectrum)
 
 
+def has_profile_scans(raw, first: int, last: int) -> bool:
+    """Whether any scan was acquired as profile: the flag the range reader
+    goes by, stopping at the first such scan. 10-18 us a scan, so about 2 s
+    for a run of 190,000 centroid scans (2026-10-31). A scan that cannot be
+    read is passed over here and reported by the range reader."""
+    for scan_number in range(first, last + 1):
+        try:
+            if not raw.GetScanStatsForScanNumber(scan_number).IsCentroidScan:
+                return True
+        except Exception:
+            logger.debug("no statistics for scan %d", scan_number, exc_info=True)
+    return False
+
+
 __all__ = [
     "DEFAULT_BATCH_SIZE",
     "SOURCE_FORMAT",
     "EmptyLevelError",
     "ThermoReader",
     "describe_levels",
+    "has_profile_scans",
     "level_summary",
+    "scans_without_injection_time",
 ]

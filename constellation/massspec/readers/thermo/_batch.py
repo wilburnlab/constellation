@@ -20,10 +20,19 @@ from constellation.core.progress import (
     emit_progress,
     emit_start,
 )
-from constellation.massspec.bundle import DEFAULT_RT_BIN_WIDTH_S
+from constellation.massspec.bundle import DEFAULT_RT_BIN_WIDTH_S, PROFILE_SUFFIX
 
-from ._convert import DEFAULT_BATCH_SIZE, ConvertOptions, _Job, _run_jobs
-from ._scans import THERMO, ReadOptions
+from ._convert import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_CENTROID_ALGO,
+    NO_CENTROIDING,
+    ConvertOptions,
+    _is_own_algorithm,
+    _Job,
+    _run_jobs,
+    finish_own_algorithm,
+    read_options,
+)
 from .manifest import MANIFEST_FILENAME
 
 
@@ -37,7 +46,8 @@ class BatchResult:
     """Per-file outcome from :func:`convert_batch`.
 
     ``detail`` is the exception ``type+message`` string for
-    ``status='error'`` and ``None`` otherwise (``'ok'`` / ``'skipped'``).
+    ``status='error'``, the bundle already there for ``status='skipped'``, and
+    ``None`` for ``'ok'``.
     """
 
     input_path: Path
@@ -50,6 +60,13 @@ def _bundle_dir_for(path: Path, output_parent: Path) -> Path:
     return output_parent / path.stem
 
 
+def _already_converted(bundle: Path, centroid_algo: str) -> Path | None:
+    """The finished bundle that says this input has been converted, if any:
+    the peak bundle, or the profile bundle when no peak list is asked for."""
+    finished = bundle if centroid_algo != NO_CENTROIDING else bundle.with_name(bundle.name + PROFILE_SUFFIX)
+    return finished if (finished / MANIFEST_FILENAME).is_file() else None
+
+
 def convert_batch(
     paths: list[Path],
     output_parent: Path,
@@ -57,8 +74,8 @@ def convert_batch(
     n_workers: int = 1,
     force: bool = False,
     rt_bin_width_s: float = DEFAULT_RT_BIN_WIDTH_S,
-    profile: bool = False,
-    centroider: str = THERMO,
+    keep_profile: bool = True,
+    centroid_algo: str = DEFAULT_CENTROID_ALGO,
     capture_trailer_extras: bool = True,
     batch_size: int = DEFAULT_BATCH_SIZE,
     compute_sha256: bool = True,
@@ -72,8 +89,9 @@ def convert_batch(
     1. Validate input — ``paths`` must be non-empty; bundle dirs (one
        per input stem) must be pairwise distinct.
     2. Pre-filter — when ``force=False``, any path whose
-       ``<output_parent>/<stem>/manifest.json`` already exists is
-       marked ``'skipped'`` and never converted.
+       ``<output_parent>/<stem>/manifest.json`` already exists (with
+       ``centroid_algo="none"``, ``<stem>.profile/manifest.json``) is marked
+       ``'skipped'`` and never converted, its ``detail`` naming that bundle.
     3. Convert the rest, their scan ranges sharing one pool (in this
        process when ``n_workers <= 1``).
     4. Aggregate. Returns one :class:`BatchResult` per input in the
@@ -107,8 +125,9 @@ def convert_batch(
     results: dict[Path, BatchResult] = {}
     pending: list[tuple[Path, Path]] = []
     for path, bundle in zip(paths, bundle_dirs):
-        if not force and (bundle / MANIFEST_FILENAME).is_file():
-            results[path] = BatchResult(path, bundle, "skipped")
+        finished = None if force else _already_converted(bundle, centroid_algo)
+        if finished is not None:
+            results[path] = BatchResult(path, bundle, "skipped", f"already converted: {finished.name}")
         else:
             pending.append((path, bundle))
 
@@ -124,12 +143,15 @@ def convert_batch(
         completed += 1
         emit_progress(
             progress_cb, _STAGE, completed=completed, total=total,
-            message=f"skipped {r.input_path.name}",
+            message=f"skipped {r.input_path.name} ({r.detail})",
         )
 
+    own = _is_own_algorithm(centroid_algo)
     options = ConvertOptions(
-        read=ReadOptions(
-            profile=profile, centroider=centroider, capture_trailer_extras=capture_trailer_extras
+        read=read_options(
+            keep_profile=keep_profile or own,
+            centroid_algo=NO_CENTROIDING if own else centroid_algo,
+            capture_trailer_extras=capture_trailer_extras,
         ),
         rt_bin_width_s=rt_bin_width_s,
         batch_size=batch_size,
@@ -141,6 +163,11 @@ def convert_batch(
     def on_done(job: _Job) -> None:
         nonlocal completed
         path = jobs[job]
+        if job.error is None and own:
+            try:
+                finish_own_algorithm(job, centroid_algo, keep_profile, 1)
+            except Exception as exc:  # noqa: BLE001 - reported per file
+                job.error = exc
         if job.error is None:
             results[path] = BatchResult(path, job.out_dir, "ok")
         else:

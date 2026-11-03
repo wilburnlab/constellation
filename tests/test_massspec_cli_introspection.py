@@ -35,6 +35,8 @@ def test_all_four_subcommands_register() -> None:
     ms_subs = _subparsers_action(ms_parser)
     assert set(ms_subs.choices) == {
         "convert",
+        "centroid",
+        "mz-axis",
         "search",
         "summarize",
         "report",
@@ -237,6 +239,8 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
     sub_names = {s["name"] for s in massspec_node["subcommands"]}
     assert sub_names == {
         "convert",
+        "centroid",
+        "mz-axis",
         "search",
         "summarize",
         "report",

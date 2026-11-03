@@ -379,3 +379,35 @@
   font-variant-numeric: tabular-nums;
   word-break: break-all;
 }
+
+/* Which lists of points spectra show. */
+.ms-browser .ms-lists-popover {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 200px;
+  padding: 8px 10px;
+  background: var(--bg-elev, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.ms-browser .ms-lists-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.ms-browser .ms-lists-swatch {
+  width: 12px;
+  height: 3px;
+  flex: none;
+}
+
+.ms-browser .ms-lists-anchor {
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}

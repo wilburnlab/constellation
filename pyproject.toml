@@ -109,7 +109,7 @@ fallback_version = "0.0.0"
 # `constellation viz` startup pointing at `python -m constellation.viz.frontend.build`.
 [tool.setuptools.package-data]
 "constellation.viz" = ["static/**/*"]
-"constellation.data" = ["*.json", "_raw/**/*"]
+"constellation.data" = ["*.json", "*.parquet", "_raw/**/*"]
 
 # ---------------------------------------------------------------------------
 # pytest

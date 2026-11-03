@@ -3,32 +3,45 @@
 :func:`iter_scan_blocks` walks scans ``first..last`` of a file opened by
 :func:`._read._open_raw_file` and yields :class:`ScanBlock` objects: a
 block's scans as an Arrow table (:data:`SCAN_METADATA_TABLE`) and their
-peaks as numpy arrays, with no Python object per peak.
-:meth:`ScanBlock.peak_table` makes the block's peak rows.
+peaks and stored points as numpy arrays, with no Python object per peak.
+:meth:`ScanBlock.peak_table` and :meth:`ScanBlock.point_table` make the
+block's rows.
 
-How each scan's peaks are made (``ReadOptions.profile`` is ``--profile``):
+A scan yields up to two lists. Its **peaks** are centroids, and its **points**
+are what it stored, kept when ``ReadOptions.keep_profile`` is set:
 
-=========  =====================================  ===================  ============
-mode       scan acquired as                       peaks                centroider
-=========  =====================================  ===================  ============
-centroid   centroid                               stored centroids     instrument
-centroid   profile, with a centroid stream        the stream           instrument
-           (Orbitrap label data)
-centroid   profile, no centroid stream            ``Scan.ToCentroid``  thermo
-           (ion trap)
-profile    profile                                profile points       (null)
-profile    centroid                               stored centroids     instrument
-=========  =====================================  ===================  ============
+=====================================  ===================  ============  ================
+scan acquired as                       peaks                centroider    points
+=====================================  ===================  ============  ================
+centroid                               stored centroids     instrument    stored centroids
+profile, with a centroid stream        the stream           instrument    profile points
+(Orbitrap label data)
+profile, no centroid stream            ``Scan.ToCentroid``  thermo        profile points
+(ion trap)
+=====================================  ===================  ============  ================
 
-``Scan.ToCentroid`` is the centroider ThermoRawFileParser and msconvert run
-on profile scans. ``CENTROIDERS`` maps a centroider's name to the function
-that runs it, so another centroider is one more entry.
+With no centroider (``ReadOptions.centroider`` is None) a scan yields its
+points alone. ``Scan.ToCentroid`` is the centroider ThermoRawFileParser and
+msconvert run on profile scans. ``CENTROIDERS`` maps a centroider's name to
+the function that runs it, so another centroider is one more entry.
+
+Both lists of an ion-trap scan come from one ``Scan.FromFile``: its
+``SegmentedScan`` equalled ``GetSegmentedScanFromScanNumber`` on 300 of 300
+Stellar scans, and reading it left the centroider's output unchanged on 50 of
+50, at 0.69 ms a scan against 1.42 ms for loading the scan twice (2026-10-30).
 
 Values are the instrument's, at full precision: the isolation width is the
 scan event's, and the typed trailer columns take the typed trailer values
 (``GetTrailerExtraValues``), not the display strings, which Thermo rounds
 to the precision its header declares (an isolation width of 2.0009 shows as
 ``2.00``). ``trailer_extras`` keeps the display strings.
+
+Some scans carry a blank trailer: no microscans, no scan time, an injection
+time of 0.000 and no AGC, with spectrum, TIC, filter and scan event intact
+(31,300 of 236,340 scans of one Stellar run, in blocks of minutes; none in
+others). Its typed columns are null rather than the zeros it holds, because a
+zero injection time silently zeroes anything computed in ions;
+``trailer_extras`` still shows what the file says.
 
 The DLL calls per scan were chosen by measurement (2026-10-26, Stellar DIA,
 CommonCore 5.0.0.93): the filter string is ``ScanStatistics.ScanType`` and
@@ -44,7 +57,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Sequence
 
 import numpy as np
 import pyarrow as pa
@@ -56,8 +69,10 @@ from ._filter import parse_filter_string
 from ._trailer import (
     _TRAILER_FIELDS,
     TRAILER_KEY_CHARGE,
+    TRAILER_KEY_ELAPSED_TIME,
     TRAILER_KEY_IIT,
     TRAILER_KEY_MASTER_SCAN,
+    TRAILER_KEY_MICROSCANS,
     TRAILER_KEY_MONOISOTOPIC,
     safe_float,
     safe_int,
@@ -102,7 +117,14 @@ def _as_numpy(net_array) -> np.ndarray:
 
 
 def _thermo_centroids(scan) -> tuple[np.ndarray, np.ndarray]:
-    """Thermo's centroider on a profile ``Scan`` (``Scan.ToCentroid``)."""
+    """Thermo's centroider on a profile ``Scan`` (``Scan.ToCentroid``).
+
+    On Stellar profile scans it centres an exactly symmetric peak about one
+    grid step low (median -0.066 Th at 67 kTh/s, with a spread of +-0.001 Th
+    over sub-grid phases on a clean 1,000-ion peak), and it does so in
+    TRFP and msconvert too. Measured at one scan rate; that the offset is a
+    grid step rather than a fixed amount in Th is still to be tested.
+    """
     from ThermoFisher.CommonCore.Data.Business import Scan
 
     centroided = Scan.ToCentroid(scan)
@@ -120,14 +142,16 @@ CENTROIDERS: dict[str, Callable[[Any], tuple[np.ndarray, np.ndarray]]] = {
 
 @dataclass(frozen=True)
 class ReadOptions:
-    """What to read. ``profile`` keeps profile points instead of centroiding."""
+    """What to read: each scan's peaks, made by ``centroider`` where the
+    instrument stored none (None: no peaks), and with ``keep_profile`` its
+    stored points as well."""
 
-    profile: bool = False
-    centroider: str = THERMO
+    keep_profile: bool = False
+    centroider: str | None = THERMO
     capture_trailer_extras: bool = True
 
     def __post_init__(self) -> None:
-        if self.centroider not in CENTROIDERS:
+        if self.centroider is not None and self.centroider not in CENTROIDERS:
             raise ValueError(
                 f"unknown centroider {self.centroider!r}; "
                 f"choose from {', '.join(sorted(CENTROIDERS))}"
@@ -163,27 +187,42 @@ def _load_scan(raw, scan_number: int):
     return Scan.FromFile(raw, scan_number)
 
 
-def _read_peaks(raw, scan_number: int, stats, options: ReadOptions) -> _Peaks:
+def _segmented_peaks(segmented, spectrum_type: str, centroider: str | None) -> _Peaks:
+    return _Peaks(
+        _as_numpy(segmented.Positions), _as_numpy(segmented.Intensities),
+        None, spectrum_type, centroider,
+    )
+
+
+def _read_peaks(
+    raw, scan_number: int, stats, options: ReadOptions
+) -> tuple[_Peaks | None, _Peaks | None]:
+    """One scan's peaks and its stored points; None for a list not asked for."""
     if stats.IsCentroidScan:
-        segmented = raw.GetSegmentedScanFromScanNumber(scan_number, stats)
-        return _Peaks(
-            _as_numpy(segmented.Positions), _as_numpy(segmented.Intensities),
-            None, CENTROID, INSTRUMENT,
+        stored = _segmented_peaks(
+            raw.GetSegmentedScanFromScanNumber(scan_number, stats), CENTROID, INSTRUMENT
         )
-    if options.profile:
-        segmented = raw.GetSegmentedScanFromScanNumber(scan_number, stats)
-        return _Peaks(
-            _as_numpy(segmented.Positions), _as_numpy(segmented.Intensities),
-            None, PROFILE, None,
+        return (
+            stored if options.centroider is not None else None,
+            stored if options.keep_profile else None,
         )
+    if options.centroider is None:
+        segmented = raw.GetSegmentedScanFromScanNumber(scan_number, stats)
+        return None, _segmented_peaks(segmented, PROFILE, None)
     stream = raw.GetCentroidStream(scan_number, False)
     if stream is not None and stream.Length > 0:
-        return _stream_peaks(stream)
+        points = None
+        if options.keep_profile:
+            points = _segmented_peaks(
+                raw.GetSegmentedScanFromScanNumber(scan_number, stats), PROFILE, None
+            )
+        return _stream_peaks(stream), points
     scan = _load_scan(raw, scan_number)
+    points = _segmented_peaks(scan.SegmentedScan, PROFILE, None) if options.keep_profile else None
     if scan.HasCentroidStream:  # the instrument's stream, empty for this scan
-        return _Peaks(_EMPTY, _EMPTY, None, CENTROID, INSTRUMENT)
+        return _Peaks(_EMPTY, _EMPTY, None, CENTROID, INSTRUMENT), points
     mz, intensity = CENTROIDERS[options.centroider](scan)
-    return _Peaks(mz, intensity, None, CENTROID, options.centroider)
+    return _Peaks(mz, intensity, None, CENTROID, options.centroider), points
 
 
 # ── trailer ───────────────────────────────────────────────────────────
@@ -263,6 +302,10 @@ class _Trailer:
         position = self.layout.index.get(label)
         return None if position is None else self.values[position]
 
+    def is_blank(self) -> bool:
+        """No microscans and no scan time: the file recorded nothing here."""
+        return self.get(TRAILER_KEY_MICROSCANS) == 0 and self.get(TRAILER_KEY_ELAPSED_TIME) == 0
+
     def promoted(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for column, positions, coerce in self.layout.promoted:
@@ -340,7 +383,10 @@ class _TrailerDecoder:
                 if value is parsed:
                     value = parsed[text] = try_number(text)
             values.append(value)
-        return _Trailer(layout, values, display)
+        trailer = _Trailer(layout, values, display)
+        if trailer.is_blank():  # its zeros are not measurements
+            return _Trailer(layout, [None] * layout.n, display)
+        return trailer
 
 
 def trailer_header(raw) -> list[tuple[str, str, int]] | None:
@@ -378,7 +424,7 @@ def _scan_row(
     filter_str: str,
     parsed: dict[str, Any],
     trailer: _Trailer,
-    peaks: _Peaks,
+    peaks: _Peaks,  # the list this row's per-list columns describe
     *,
     capture_trailer_extras: bool,
 ) -> dict[str, Any]:
@@ -473,52 +519,101 @@ def _scan_row(
 
 
 @dataclass(frozen=True)
-class ScanBlock:
-    """Consecutive scans: their metadata and their peaks."""
+class ScanList:
+    """One list of a block's scans (their peaks, or their stored points):
+    the scans' values one after another, and what the list says of each."""
 
-    scans: pa.Table  # SCAN_METADATA_TABLE, one row per scan
-    counts: np.ndarray  # int64, peaks per scan
-    mz: np.ndarray  # float64, the scans' peaks one after another
+    counts: np.ndarray  # int64, values per scan
+    mz: np.ndarray  # float64
     intensity: np.ndarray
     # peak_* column -> (values, valid), as long as mz; None when no scan had any
     aux: dict[str, tuple[np.ndarray, np.ndarray]] | None
+    spectrum_type: list[str]
+    centroider: list[str | None]
+
+
+@dataclass(frozen=True)
+class ScanBlock:
+    """Consecutive scans: their metadata, their peaks, their stored points."""
+
+    scans: pa.Table  # SCAN_METADATA_TABLE: per-list columns as for peaks, if any
+    peaks: ScanList | None
+    points: ScanList | None
 
     def peak_table(self) -> pa.Table:
-        return peak_rows(self.scans, self.counts, self.mz, self.intensity, self.aux)
+        assert self.peaks is not None
+        p = self.peaks
+        return peak_rows(self.scans, p.counts, p.mz, p.intensity, p.aux)
+
+    def point_table(self) -> pa.Table:
+        assert self.points is not None
+        p = self.points
+        return peak_rows(self.scans, p.counts, p.mz, p.intensity, p.aux)
+
+    def point_scans(self) -> pa.Table:
+        """:attr:`scans` with its per-list columns saying what the points are."""
+        assert self.points is not None
+        return _describing(self.scans, self.points)
+
+
+def _describing(scans: pa.Table, listed: ScanList) -> pa.Table:
+    for name, values in (
+        ("peak_count", listed.counts),
+        ("spectrum_type", listed.spectrum_type),
+        ("centroider", listed.centroider),
+    ):
+        i = scans.schema.get_field_index(name)
+        field = scans.schema.field(i)
+        scans = scans.set_column(i, field, pa.array(values, field.type))
+    return scans
+
+
+def _stack(peaks: Sequence[_Peaks]) -> ScanList:
+    counts = np.fromiter((p.mz.size for p in peaks), dtype=np.int64, count=len(peaks))
+    mz = np.concatenate([p.mz for p in peaks]) if peaks else _EMPTY
+    intensity = np.concatenate([p.intensity for p in peaks]) if peaks else _EMPTY
+    aux: dict[str, tuple[np.ndarray, np.ndarray]] | None = None
+    if any(p.aux for p in peaks):
+        aux = {}
+        for _, column in _STREAM_AUX:
+            parts, valid = [], []
+            for p in peaks:
+                values = p.aux.get(column) if p.aux else None
+                if values is None:
+                    parts.append(np.zeros(p.mz.size))
+                    valid.append(np.zeros(p.mz.size, dtype=bool))
+                else:
+                    parts.append(values)
+                    valid.append(np.ones(p.mz.size, dtype=bool))
+            aux[column] = (np.concatenate(parts), np.concatenate(valid))
+    _sort_within_scans(counts, mz, intensity, aux)
+    return ScanList(
+        counts, mz, intensity, aux,
+        [p.spectrum_type for p in peaks], [p.centroider for p in peaks],
+    )
 
 
 class _BlockBuilder:
     def __init__(self) -> None:
         self.rows: list[dict[str, Any]] = []
         self.peaks: list[_Peaks] = []
-        self.n_peaks = 0
+        self.points: list[_Peaks] = []
+        self.n_values = 0
 
-    def add(self, row: dict[str, Any], peaks: _Peaks) -> None:
+    def add(self, row: dict[str, Any], peaks: _Peaks | None, points: _Peaks | None) -> None:
         self.rows.append(row)
-        self.peaks.append(peaks)
-        self.n_peaks += int(peaks.mz.size)
+        for listed, into in ((peaks, self.peaks), (points, self.points)):
+            if listed is not None:
+                into.append(listed)
+                self.n_values += int(listed.mz.size)
 
     def finish(self) -> ScanBlock:
-        counts = np.fromiter((p.mz.size for p in self.peaks), dtype=np.int64, count=len(self.peaks))
-        mz = np.concatenate([p.mz for p in self.peaks]) if self.peaks else _EMPTY
-        intensity = np.concatenate([p.intensity for p in self.peaks]) if self.peaks else _EMPTY
-        aux: dict[str, tuple[np.ndarray, np.ndarray]] | None = None
-        if any(p.aux for p in self.peaks):
-            aux = {}
-            for _, column in _STREAM_AUX:
-                parts, valid = [], []
-                for p in self.peaks:
-                    values = p.aux.get(column) if p.aux else None
-                    if values is None:
-                        parts.append(np.zeros(p.mz.size))
-                        valid.append(np.zeros(p.mz.size, dtype=bool))
-                    else:
-                        parts.append(values)
-                        valid.append(np.ones(p.mz.size, dtype=bool))
-                aux[column] = (np.concatenate(parts), np.concatenate(valid))
-        _sort_within_scans(counts, mz, intensity, aux)
         scans = pa.Table.from_pylist(self.rows, schema=SCAN_METADATA_TABLE)
-        return ScanBlock(scans, counts, mz, intensity, aux)
+        return ScanBlock(
+            scans,
+            _stack(self.peaks) if self.peaks else None,
+            _stack(self.points) if self.points else None,
+        )
 
 
 def _sort_within_scans(
@@ -582,8 +677,8 @@ def iter_scan_blocks(
 ) -> Iterator[ScanBlock]:
     """Blocks of scans ``first..last`` (inclusive), in scan order.
 
-    A block closes at ``max_block_scans`` scans or ``max_block_peaks`` peaks.
-    A scan that cannot be read is logged and left out.
+    A block closes at ``max_block_scans`` scans or ``max_block_peaks`` values
+    across its lists. A scan that cannot be read is logged and left out.
     """
     if last < first:
         return
@@ -600,20 +695,21 @@ def iter_scan_blocks(
             parsed = filters.get(filter_str)
             if parsed is None:
                 parsed = filters[filter_str] = parse_filter_string(filter_str)
-            peaks = _read_peaks(raw, scan_number, stats, options)
+            peaks, points = _read_peaks(raw, scan_number, stats, options)
             trailer = trailers.decode(
                 raw.GetTrailerExtraInformation(scan_number),
                 _typed_trailer(raw, scan_number) if header else None,
             )
             row = _scan_row(
-                scan_number, stats, event, filter_str, parsed, trailer, peaks,
+                scan_number, stats, event, filter_str, parsed, trailer,
+                peaks if peaks is not None else points,
                 capture_trailer_extras=options.capture_trailer_extras,
             )
         except Exception:
             logger.warning("Skipping Thermo scan %d: extraction failed", scan_number, exc_info=True)
             continue
-        block.add(row, peaks)
-        if len(block.rows) >= max_block_scans or block.n_peaks >= max_block_peaks:
+        block.add(row, peaks, points)
+        if len(block.rows) >= max_block_scans or block.n_values >= max_block_peaks:
             yield block.finish()
             block = _BlockBuilder()
     if block.rows:
@@ -628,6 +724,7 @@ __all__ = [
     "THERMO",
     "ReadOptions",
     "ScanBlock",
+    "ScanList",
     "iter_scan_blocks",
     "trailer_header",
 ]

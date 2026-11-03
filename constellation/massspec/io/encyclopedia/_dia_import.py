@@ -50,7 +50,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from constellation.massspec.bundle import (
-    LEGACY_PEAKS_FILE,
+    BUNDLE_SCHEMA_VERSION,
     PEAKS_DIR,
     PeakWriter,
     part_name,
@@ -65,8 +65,6 @@ from constellation.massspec.schemas import (
 
 SOURCE_FORMAT = "encyclopedia_dia"
 BUNDLE_KIND = "encyclopedia_dia_acquisition"
-# v2: the peaks are `peaks/part-00000.parquet` (v1: `peaks.parquet`).
-MANIFEST_SCHEMA_VERSION = 2
 
 # One scan, as the merge and the two writers pass it around.
 _Scan = dict[str, Any]
@@ -259,10 +257,10 @@ def import_dia(
             bundle.mkdir(parents=True, exist_ok=True)
             # Remove the manifest first: it is written last, so its
             # absence marks a bundle that is not complete. Then the peaks
-            # (either layout) and any peak index built from them.
+            # and anything built from them.
             (bundle / "manifest.json").unlink(missing_ok=True)
-            (bundle / LEGACY_PEAKS_FILE).unlink(missing_ok=True)
-            for stale in (bundle / PEAKS_DIR, bundle / "mz_index"):
+            (bundle / "peaks.parquet").unlink(missing_ok=True)  # bundles before format v2
+            for stale in (bundle / PEAKS_DIR, bundle / "mz_index", bundle / "mz_axes"):
                 if stale.is_dir():
                     shutil.rmtree(stale)
             (bundle / PEAKS_DIR).mkdir()
@@ -320,7 +318,6 @@ def import_dia(
                 "n_scans": len(rows),
                 "rt_min_seconds": min(rts) if rts else None,
                 "rt_max_seconds": max(rts) if rts else None,
-                "profile_mode": False,
             }
             pq.write_table(
                 pa.Table.from_pylist([acquisition], schema=ACQUISITION_METADATA_TABLE),
@@ -328,7 +325,7 @@ def import_dia(
                 compression="zstd",
             )
             manifest = {
-                "schema_version": MANIFEST_SCHEMA_VERSION,
+                "schema_version": BUNDLE_SCHEMA_VERSION,
                 "kind": BUNDLE_KIND,
                 "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 # The run this bundle stands for: the name the .dia records
@@ -356,7 +353,6 @@ def import_dia(
                         "n_scans",
                         "rt_min_seconds",
                         "rt_max_seconds",
-                        "profile_mode",
                         "analyzers",
                     )
                 },

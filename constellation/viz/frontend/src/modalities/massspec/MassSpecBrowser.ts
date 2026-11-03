@@ -38,12 +38,13 @@ import type { Table } from 'apache-arrow';
 import { fetchArrow, fetchJson, fetchJsonMethod, fetchTrackData } from '../../engine/arrow_client';
 import { buildGridSvg, downloadSvg } from '../../engine/export';
 import { Interval, IntervalLimits, sameInterval } from '../../engine/interval';
+import { attachDismiss, positionBelowRight } from '../../engine/popover';
 import { attachPanZoom1D } from '../../engine/pan_zoom';
 import { PanelKind } from '../../panels/kind';
 import { GridAxisSpec, GridCell, GridDriver, PanelGrid } from '../../panels/PanelGrid';
 import { SettingsSchema } from '../../panels/settings_schema';
 import { Drawer, IdRow, idRows } from './drawer';
-import { ISOTOPES, SERIES, seriesColor } from './palette';
+import { ISOTOPES, SERIES, seriesColor, UNANNOTATED } from './palette';
 import {
   CHROMATOGRAM_KIND,
   CHROM_MARGIN,
@@ -54,7 +55,9 @@ import {
 import {
   SPECTRUM_KIND,
   SPECTRUM_MARGIN,
+  type SpectrumOverlay,
   annotationSettings,
+  areaPerHeight,
   drawSpectrum,
   nearestPeak,
   spectrumExtent,
@@ -91,12 +94,22 @@ export interface MsView {
   /** Retention times the traces are extracted over; null for the whole
    *  run (with a peak index, which makes that cheap). */
   xicRt: Interval | null;
+  /** The run's lists of points shown in spectra, in the order of its
+   *  `peak_lists`: the first is the base and the rest are sticks over it.
+   *  Empty for a run with one list, whose requests then name none. */
+  lists: string[];
+  /** Sticks over a profile at the profile's height, not by area. */
+  anchored: boolean;
+  /** m/z with each list's measured curve subtracted. */
+  corrected: boolean;
 }
 
-/** What a cell holds: its kernel's table, and a chromatogram's traces. */
+/** What a cell holds: its kernel's table, a chromatogram's traces, and a
+ *  spectrum's other lists of peaks. */
 export interface CellData {
   table: Table;
   xic: Table | null;
+  overlays: SpectrumOverlay[];
 }
 
 export interface MassSpecBrowserOptions {
@@ -134,6 +147,8 @@ const KINDS: Record<string, PanelKind> = {
 const FALLBACK_SETTINGS: SettingsSchema = { sections: [] };
 const GRID_STORAGE_KEY = 'constellation.massspec.grid.v1';
 const DRAWER_STORAGE_KEY = 'constellation.massspec.drawer.v1';
+/** Which lists are shown, per run: which a run has depends on the run. */
+const LISTS_STORAGE_KEY = 'constellation.massspec.lists.v1';
 const COLUMNS: GridAxisSpec[] = [
   { id: 'chrom', label: 'Chromatogram', weight: 3 },
   { id: 'spec', label: 'Spectrum', weight: 2 },
@@ -193,6 +208,8 @@ export class MassSpecBrowser {
   private backBtn!: HTMLButtonElement;
   private forwardBtn!: HTMLButtonElement;
   private indexBtn!: HTMLButtonElement;
+  private listsBtn!: HTMLButtonElement;
+  private correctedBtn!: HTMLButtonElement;
   private drawerBtn!: HTMLButtonElement;
   private rtLabel!: HTMLElement;
   private scanLabel!: HTMLElement;
@@ -212,6 +229,13 @@ export class MassSpecBrowser {
   /** Traces fetched, by request, so a chromatogram whose base trace is
    *  refetched on zoom does not extract its traces again. */
   private xicCache = new Map<string, Table>();
+  /** Lists drawn over a spectrum, by request; a zoom refetches only the
+   *  reduced profile under them. */
+  private overlayCache = new Map<string, Table>();
+  /** Peak area per unit of profile height, by scan: fixed for a scan, so
+   *  that zooming does not rescale its sticks. */
+  private perHeight = new Map<string, number>();
+  private listsPopover: { root: HTMLElement; close: () => void } | null = null;
   private suggestions: Suggestion[] = [];
   private suggestAt = 0;
   private history: HistoryEntry[] = [];
@@ -385,6 +409,16 @@ export class MassSpecBrowser {
     this.scanLabel.className = 'ms-readout';
     this.indexBtn = button('Build index', 'Build a peak index, so traces cover the whole run', () => void this.buildIndex());
     this.indexBtn.hidden = true;
+    this.listsBtn = button('Peak lists', "Choose which of this run's lists spectra show", () => this.toggleListsPopover());
+    this.listsBtn.hidden = true;
+    this.correctedBtn = button('Corrected m/z', "Subtract each list's measured m/z curve (massspec mz-axis)", () => {
+      if (!this.view) return;
+      this.view.corrected = !this.view.corrected;
+      this.correctedBtn.classList.toggle('active', this.view.corrected);
+      this.overlayCache.clear();
+      this.requestRender();
+    });
+    this.correctedBtn.hidden = true;
     this.drawerBtn = button('Identifications', 'Show or hide the drawer', () => this.toggleDrawer());
     this.drawerBtn.classList.toggle('active', !this.drawer.element.hidden);
 
@@ -407,6 +441,8 @@ export class MassSpecBrowser {
       spacer,
       this.statusEl,
       this.indexBtn,
+      this.listsBtn,
+      this.correctedBtn,
       this.drawerBtn,
       button('Save SVG', 'Export the panels shown', () => this.exportSvg()),
     );
@@ -519,6 +555,12 @@ export class MassSpecBrowser {
     this.reducedSpectra.clear();
     this.spectrumExtents.clear();
     this.xicCache.clear();
+    this.overlayCache.clear();
+    this.perHeight.clear();
+    this.listsPopover?.close();
+    this.listsBtn.hidden = (info.peak_lists?.length ?? 0) < 2;
+    this.correctedBtn.hidden = !(info.peak_lists ?? []).some((l) => l.has_mz_axis);
+    this.correctedBtn.classList.remove('active');
     this.indexBtn.hidden = info.has_index;
 
     const rows: Record<string, RowState> = {};
@@ -540,6 +582,9 @@ export class MassSpecBrowser {
       target: null,
       adhoc: {},
       xicRt: null,
+      lists: this.storedLists(key, info),
+      anchored: previous?.anchored ?? false,
+      corrected: false,
     };
     const rowSpecs = info.levels.map((level) => ({ id: rowId(level), label: `MS${level}`, weight: 1 }));
     if (!this.grid) this.grid = this.createGrid(rowSpecs);
@@ -1311,6 +1356,138 @@ export class MassSpecBrowser {
     };
   }
 
+  // ── which lists spectra show ─────────────────────────────────────────
+
+  /** What was last shown for this run; at first its profile and first peak
+   *  list. Names the run no longer has are dropped. */
+  private storedLists(key: string, info: AcquisitionInfo): string[] {
+    const lists = info.peak_lists ?? [];
+    if (lists.length < 2) return [];
+    let stored: unknown = null;
+    try {
+      stored = JSON.parse(readStored(`${LISTS_STORAGE_KEY}.${key}`) ?? 'null');
+    } catch {
+      /* a value not ours: as if none were stored */
+    }
+    const names = lists.map((l) => l.name);
+    const kept = Array.isArray(stored) ? names.filter((n) => stored.includes(n)) : [];
+    if (kept.length) return kept;
+    const firstPeaks = lists.find((l) => l.kind === 'peaks')?.name;
+    const profile = lists.find((l) => l.kind === 'profile')?.name;
+    return names.filter((n) => n === profile || n === firstPeaks);
+  }
+
+  /** A list's colour: follows its place among the run's peak lists, so it
+   *  does not change with what else is shown. */
+  private listColor(name: string): string {
+    const peaks = (this.info?.peak_lists ?? []).filter((l) => l.kind === 'peaks');
+    return seriesColor(Math.max(0, peaks.findIndex((l) => l.name === name)));
+  }
+
+  private toggleListsPopover(): void {
+    if (this.listsPopover) {
+      this.listsPopover.close();
+      return;
+    }
+    const view = this.view;
+    const lists = this.info?.peak_lists ?? [];
+    if (!view || lists.length < 2) return;
+    const root = document.createElement('div');
+    root.className = 'ms-lists-popover';
+    for (const list of lists) {
+      const row = document.createElement('label');
+      row.className = 'ms-lists-row';
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = view.lists.includes(list.name);
+      box.dataset.list = list.name;
+      box.addEventListener('change', () => {
+        const chosen = lists.map((l) => l.name).filter((n) => (n === list.name ? box.checked : view.lists.includes(n)));
+        if (!chosen.length) {
+          box.checked = true; // a spectrum always shows something
+          return;
+        }
+        view.lists = chosen;
+        writeStored(`${LISTS_STORAGE_KEY}.${view.acquisition}`, JSON.stringify(chosen));
+        this.requestRender();
+      });
+      const swatch = document.createElement('span');
+      swatch.className = 'ms-lists-swatch';
+      swatch.style.background = list.kind === 'profile' ? UNANNOTATED : this.listColor(list.name);
+      const name = document.createElement('span');
+      name.textContent = list.name;
+      row.append(box, swatch, name);
+      root.appendChild(row);
+    }
+    const anchored = document.createElement('label');
+    anchored.className = 'ms-lists-row ms-lists-anchor';
+    const anchoredBox = document.createElement('input');
+    anchoredBox.type = 'checkbox';
+    anchoredBox.checked = view.anchored;
+    anchoredBox.addEventListener('change', () => {
+      view.anchored = anchoredBox.checked;
+      this.requestRender();
+    });
+    const anchoredText = document.createElement('span');
+    anchoredText.textContent = "Sticks at the profile's height, not by area";
+    anchored.append(anchoredBox, anchoredText);
+    root.appendChild(anchored);
+    this.root.appendChild(root);
+    positionBelowRight(root, this.listsBtn);
+    const detach = attachDismiss(root, this.listsBtn, () => this.listsPopover?.close());
+    this.listsPopover = {
+      root,
+      close: () => {
+        detach();
+        root.remove();
+        this.listsPopover = null;
+      },
+    };
+  }
+
+  /** The lists a spectrum draws, bottom to top. The top one is labelled and
+   *  annotated, so it is the list the target's search read, when it is shown. */
+  private shownLists(view: MsView): string[] {
+    const wanted = view.target?.peakList;
+    if (!wanted || !view.lists.includes(wanted)) return view.lists;
+    return [...view.lists.filter((n) => n !== wanted), wanted];
+  }
+
+  /** The table a spectrum's annotation is on: the top list's. */
+  private annotatedTable(data: CellData): Table {
+    return data.overlays.length ? data.overlays[data.overlays.length - 1].table : data.table;
+  }
+
+  private async fetchOverlay(
+    view: MsView,
+    scan: number,
+    name: string,
+    annotation: Record<string, unknown> | null,
+    viewport_px: number,
+    signal: AbortSignal,
+  ): Promise<SpectrumOverlay> {
+    const key = `${spectrumKey(view.acquisition, scan)}|${name}|${view.corrected}|${JSON.stringify(annotation)}`;
+    let table = this.overlayCache.get(key);
+    if (!table) {
+      ({ table } = await fetchTrackData(
+        'ms_spectrum',
+        {
+          session: this.opts.sessionId,
+          binding: `ms_spectrum:${view.acquisition}`,
+          scan,
+          peak_list: name,
+          corrected: view.corrected ? 'true' : undefined,
+          viewport_px,
+          ...((annotation ?? {}) as Record<string, string | number | string[] | undefined>),
+        },
+        signal,
+      ));
+      if (this.overlayCache.size >= 64) this.overlayCache.delete(this.overlayCache.keys().next().value as string);
+      this.overlayCache.set(key, table);
+    }
+    return { name, table, color: this.listColor(name) };
+  }
+
   private driver(): GridDriver<MsView, CellData> {
     return {
       view: () => this.view,
@@ -1330,7 +1507,9 @@ export class MassSpecBrowser {
         const span = windowed
           ? `|${windowed[0].toFixed(4)}-${windowed[1].toFixed(4)}@${Math.round(this.grid?.cellSize(cell).widthPx ?? 0)}`
           : '';
-        return `${spectrumKey(view.acquisition, row.scan)}${span}${annotation ? `|${JSON.stringify(annotation)}` : ''}`;
+        const lists = view.lists.length ? `|${this.shownLists(view).join(',')}` : '';
+        const axis = view.corrected ? '|corrected' : '';
+        return `${spectrumKey(view.acquisition, row.scan)}${span}${annotation ? `|${JSON.stringify(annotation)}` : ''}${lists}${axis}`;
       },
       fetch: async (cell, view, signal) => {
         const row = view.rows[cell.row];
@@ -1359,29 +1538,45 @@ export class MassSpecBrowser {
           ]);
           const reduced = base.table.numRows > 0 && Boolean(base.table.getChild('decimated')?.get(0));
           if (reduced) this.decimated.add(key);
-          return { table: base.table, xic };
+          return { table: base.table, xic, overlays: [] };
         }
         const windowed = this.spectrumWindow(cell, view);
-        const { table } = await fetchTrackData(
-          'ms_spectrum',
-          {
-            session,
-            binding: `ms_spectrum:${view.acquisition}`,
-            scan: row.scan ?? 0,
-            viewport_px,
-            mz_start: windowed ? windowed[0] : undefined,
-            mz_end: windowed ? windowed[1] : undefined,
-            ...(this.annotationOf(cell, view) ?? {}),
-          },
-          signal,
-        );
+        const annotation = this.annotationOf(cell, view);
+        const [baseList, ...others] = this.shownLists(view);
+        const [{ table }, overlays] = await Promise.all([
+          fetchTrackData(
+            'ms_spectrum',
+            {
+              session,
+              binding: `ms_spectrum:${view.acquisition}`,
+              scan: row.scan ?? 0,
+              peak_list: baseList,
+              corrected: view.corrected ? 'true' : undefined,
+              viewport_px,
+              mz_start: windowed ? windowed[0] : undefined,
+              mz_end: windowed ? windowed[1] : undefined,
+              ...(others.length ? {} : (annotation ?? {})),
+            },
+            signal,
+          ),
+          Promise.all(
+            others.map((name, i) =>
+              this.fetchOverlay(view, row.scan ?? 0, name, i === others.length - 1 ? annotation : null, viewport_px, signal),
+            ),
+          ),
+        ]);
         const key = spectrumKey(view.acquisition, row.scan ?? 0);
         if (table.numRows > 0 && Boolean(table.getChild('decimated')?.get(0))) this.reducedSpectra.add(key);
         if (!windowed) {
           if (this.spectrumExtents.size > 256) this.spectrumExtents.clear();
           this.spectrumExtents.set(key, spectrumExtent((table.getChild('mz')?.toArray() as Float64Array) ?? []));
         }
-        return { table, xic: null };
+        // Fixed from the first look at the scan, for every zoom after it.
+        if (overlays.length && !this.perHeight.has(key)) {
+          if (this.perHeight.size >= 256) this.perHeight.clear();
+          this.perHeight.set(key, areaPerHeight(table, overlays[0].table));
+        }
+        return { table, xic: null, overlays };
       },
       draw: (cell, data, view, svg, size) => this.drawCell(cell, data, view, svg, size),
       placeholder: () => 'Click a chromatogram to pick a scan.',
@@ -1474,6 +1669,10 @@ export class MassSpecBrowser {
     const annotated = this.annotationOf(cell, view) !== null;
     const tol = this.tolerance(row.level, 'fragment');
     const shown = drawSpectrum(svg, size, data.table, {
+      overlays: data.overlays,
+      baseName: this.shownLists(view)[0],
+      perHeight: row.scan !== null ? this.perHeight.get(spectrumKey(view.acquisition, row.scan)) : undefined,
+      anchored: view.anchored,
       mz: row.mz,
       intensity: view.intensity,
       isolation,
@@ -1484,7 +1683,7 @@ export class MassSpecBrowser {
       uid,
     });
     if (t && row.level === 2) {
-      if (annotated) this.updateIons(t, data.table);
+      if (annotated) this.updateIons(t, this.annotatedTable(data));
       else if (this.ionsFrom !== 'not isolated') {
         // The scan shown did not isolate the target: nothing it matched.
         this.ionsFrom = 'not isolated';
@@ -1596,7 +1795,9 @@ export class MassSpecBrowser {
 
   /** The peak of a spectrum cell under the pointer at `mz`. */
   private peakAt(cell: GridCell<CellData>, mz: number): { index: number; mz: number; table: Table } | null {
-    const table = cell.panel.lastFetched?.data.table;
+    // Sticks, when there are any over the base list: what a peak means here.
+    const data = cell.panel.lastFetched?.data;
+    const table = data ? this.annotatedTable(data) : undefined;
     const mzs = table?.getChild('mz')?.toArray() as Float64Array | undefined;
     if (!table || !mzs || !this.grid) return null;
     const domain = this.mzWindowOf(cell);
@@ -1785,6 +1986,13 @@ export class MassSpecBrowser {
       cell.col === 'chrom'
         ? ['rt', 'intensity', 'scan', 'mz']
         : ['mz', 'intensity', 'annotation', 'ion_type', 'ion_number', 'fragment_charge', 'loss', 'mz_theoretical', 'error_ppm'];
+    if (data.overlays.length) {
+      const lists = this.view ? this.shownLists(this.view) : [];
+      return listsCsv(
+        [{ name: lists[0] ?? 'base', table: data.table }, ...data.overlays],
+        columns,
+      );
+    }
     return tableCsv(data.table, columns);
   }
 
@@ -1823,6 +2031,7 @@ export class MassSpecBrowser {
     if (this.scanHeaderTimer) clearTimeout(this.scanHeaderTimer);
     if (this.indexPoll) clearTimeout(this.indexPoll);
     this.resizeObserver?.disconnect();
+    this.listsPopover?.close();
     this.grid?.dispose();
     this.root.remove();
   }
@@ -1875,6 +2084,20 @@ function csvCell(v: unknown): string {
   if (v === null || v === undefined) return '';
   const s = typeof v === 'bigint' ? v.toString() : String(v);
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/** Several lists of one scan as one CSV, a `peak_list` column saying whose
+ *  each row is. */
+function listsCsv(lists: Array<{ name: string; table: Table }>, columns: string[]): string {
+  const present = columns.filter((c) => lists.some((l) => l.table.getChild(c)));
+  const lines = [['peak_list', ...present].join(',')];
+  for (const { name, table } of lists) {
+    const cols = present.map((c) => table.getChild(c));
+    for (let i = 0; i < table.numRows; i++) {
+      lines.push([csvCell(name), ...cols.map((c) => csvCell(c?.get(i)))].join(','));
+    }
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 function tableCsv(table: Table, columns: string[]): string {

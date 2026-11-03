@@ -227,7 +227,7 @@ class TestConvertBatch:
         assert [r.status for r in results] == ["ok", "error", "ok"]
         assert [r.input_path for r in results] == paths
         assert "could not open" in results[1].detail
-        assert not any((out / "bad").iterdir())  # a failed file leaves nothing behind
+        assert not (out / "bad").exists()  # a failed file leaves nothing behind
         assert peaks_dataset(out / "a").count_rows() == 7
         assert json.loads((out / "c" / MANIFEST_FILENAME).read_text())["run_metadata"]["n_scans"] == 30
 
@@ -258,10 +258,11 @@ class TestConvertBatch:
     def test_options_reach_every_file(self, tmp_path, raws):
         paths = _make_raw_inputs(tmp_path, ["a"])
         raws["a"] = mixed_raw()
-        convert_batch(paths, tmp_path / "out", profile=True, capture_trailer_extras=False,
+        convert_batch(paths, tmp_path / "out", keep_profile=False, capture_trailer_extras=False,
                       compute_sha256=False)
+        assert not (tmp_path / "out" / "a.profile").exists()
         manifest = json.loads((tmp_path / "out" / "a" / MANIFEST_FILENAME).read_text())
-        assert manifest["parameters"]["peaks"] == "profile"
+        assert manifest["parameters"]["profile_bundle"] is None
         assert manifest["parameters"]["capture_trailer_extras"] is False
         assert manifest["source_sha256"] is None
 
@@ -299,6 +300,8 @@ def _make_args(
         threads=threads,
         rt_bin_width_s=60.0,
         profile=False,
+        keep_profile=True,
+        centroid_algo="thermo",
         capture_trailer_extras=True,
         compute_sha256=True,
         force=force,
@@ -318,8 +321,10 @@ class TestCliRouter:
         out = tmp_path / "out"
 
         class _Manifest:
+            kind = "thermo_acquisition"
+            parameters = {"profile_bundle": "sample.profile"}
             outputs = {
-                "peaks": "peaks.parquet",
+                "peaks": "peaks",
                 "scan_metadata": "scan_metadata.parquet",
                 "acquisition_metadata": "acquisition_metadata.parquet",
             }
@@ -472,6 +477,8 @@ class TestCliRouter:
         seen: dict[str, object] = {}
 
         class _Manifest:
+            kind = "thermo_acquisition"
+            parameters = {"profile_bundle": None}
             outputs = {"peaks": "peaks", "scan_metadata": "scan_metadata.parquet",
                        "acquisition_metadata": "acquisition_metadata.parquet"}
             run_metadata = {"levels": []}

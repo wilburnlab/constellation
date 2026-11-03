@@ -43,7 +43,6 @@ manifest.
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -515,16 +514,16 @@ def acquisition_record_from_bundle(bundle_dir: Path | str) -> dict[str, object]:
     the source file, its hash (when it was computed) and the instrument.
     Feed the result to :meth:`Acquisitions.register`.
     """
-    manifest_path = Path(bundle_dir) / "manifest.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+    from constellation.massspec.bundle import read_bundle_manifest
+
+    if not (Path(bundle_dir) / "manifest.json").is_file():
         raise FileNotFoundError(
             f"{Path(bundle_dir)} has no manifest.json: not a converted acquisition bundle"
-        ) from None
+        )
+    manifest = read_bundle_manifest(bundle_dir)
     source = manifest.get("source_file")
     if not source:
-        raise ValueError(f"{manifest_path} names no source_file")
+        raise ValueError(f"{Path(bundle_dir) / 'manifest.json'} names no source_file")
     run = manifest.get("run_metadata") or {}
     return {
         "source_file": str(source),
