@@ -5,10 +5,17 @@ and observed m/z, carrying the observed intensity + the scan's retention
 time through. Two modes share the ``core.signal`` matching kernel and the
 same target contract / output schema:
 
-  ``extract_xic_scan_major`` — Mode A (default). Sweeps the canonical
-  scan-major peaks: per candidate scan, a batched nearest-within-tolerance
-  match of the target's query ions against that scan's mz-sorted peaks.
-  Reads the canonical f64 table directly, so it is always f64-exact.
+  ``extract_xic_scan_major`` — Mode A (default). One pass over the
+  canonical scan-major peaks through ``massspec.sweep``: every target is
+  compiled into a query, and each scan is matched against all the queries
+  active in it at once, then the matches are reduced to trace rows by
+  :class:`XicTraceReducer`. Reads the canonical f64 peaks (a bundle is
+  streamed, a table is taken whole), so it is always f64-exact. Its rows
+  are those the earlier target-by-target implementation gave, bit for bit,
+  except where that implementation was wrong: a target with a sequence and
+  a charge but no precursor m/z has one computed, so its fragments are
+  gated by isolation window, and the assigned-scan restriction applies to
+  MS2 only (an MS1 scan never has an MS2 scan's number).
 
   ``extract_xic_indexed`` — Mode B. Slices a derived mass-sorted peak
   index (``massspec.quant.peak_index``): per query, a window bound-search
@@ -37,22 +44,19 @@ no-peptide m/z case), MS2 fragment ladders via the batched
 ``fragment_ladder_indices_batch``. Mass error is conventional (observed -
 theoretical), signed, preserved so probabilistic scoring stays downstream.
 
-NOTE (v1): per-target processing builds candidate scan matrices / reads
-index partitions per target. Correct and fine at typical
-identified-peptide scale; the documented scale path is Mode B + the
-streaming refactor. MS1 ``peptide_envelope`` is called per (target, charge)
-rather than batched — a future optimization, not a correctness issue.
+NOTE: Mode B still reads index partitions per target. MS1
+``peptide_envelope`` is called per (sequence, charge) rather than batched —
+a future optimization, not a correctness issue.
 """
 
 from __future__ import annotations
 
-import bisect
 import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pyarrow as pa
@@ -63,7 +67,7 @@ import torch
 
 from constellation.core.io.schemas import cast_to_schema
 from constellation.core.sequence.proforma import Peptidoform, parse_proforma
-from constellation.core.signal import bounds_within_tolerance, nearest_within_tolerance
+from constellation.core.signal import bounds_within_tolerance
 from constellation.core.stats.units import ISOTOPE_MASS_DIFF
 from constellation.massspec.bundle import open_peaks
 from constellation.massspec.peptide.envelope import peptide_envelope
@@ -71,7 +75,22 @@ from constellation.massspec.peptide.ions import IonType, fragment_ladder_indices
 from constellation.massspec.quant.peak_index import read_manifest as read_index_manifest
 from constellation.massspec.quant.schemas import XIC_TRACE_TABLE
 
-__all__ = ["extract_xic_scan_major", "extract_xic_indexed", "save_xic", "load_xic"]
+if TYPE_CHECKING:
+    from constellation.massspec.sweep import IonSettings
+    from constellation.massspec.sweep.engine import SweepResult
+    from constellation.massspec.sweep.evidence import EvidenceGate
+    from constellation.massspec.sweep.reduce import QueryBatch
+
+__all__ = [
+    "extract_xic",
+    "extraction_tolerance_metadata",
+    "extract_xic_scan_major",
+    "extract_xic_indexed",
+    "XicTraceReducer",
+    "save_xic",
+    "write_xic_manifest",
+    "load_xic",
+]
 
 _XIC_MANIFEST = "manifest.json"
 _XIC_TABLE_FILE = "xic_trace.parquet"
@@ -349,6 +368,24 @@ _EXTRACTION_TOL_KEY = b"x.massspec.extraction_tolerance"
 _EXTRACTION_TOL_UNIT_KEY = b"x.massspec.extraction_tolerance_unit"
 
 
+def extraction_tolerance_metadata(tolerances: dict[int, tuple[float, str]]) -> dict[bytes, bytes]:
+    """Schema metadata recording the tolerances a trace was extracted at:
+    ``x.massspec.extraction_tolerance`` (and its unit) when every level used
+    one, and ``x.massspec.extraction_tolerance.ms<L>`` per level when the
+    trace spans more than one level."""
+    meta: dict[bytes, bytes] = {}
+    distinct = {(float(t), str(u)) for t, u in tolerances.values()}
+    if len(distinct) == 1:
+        tol, unit = distinct.pop()
+        meta[_EXTRACTION_TOL_KEY] = repr(tol).encode("utf-8")
+        meta[_EXTRACTION_TOL_UNIT_KEY] = unit.encode("utf-8")
+    if len(tolerances) > 1:
+        for level, (tol, unit) in sorted(tolerances.items()):
+            meta[_EXTRACTION_TOL_KEY + f".ms{level}".encode()] = repr(float(tol)).encode("utf-8")
+            meta[_EXTRACTION_TOL_UNIT_KEY + f".ms{level}".encode()] = str(unit).encode("utf-8")
+    return meta
+
+
 def _stamp_extraction_tolerance(
     table: pa.Table, tolerance: float, tolerance_unit: str
 ) -> pa.Table:
@@ -374,6 +411,13 @@ def save_xic(
     p = Path(path)
     p.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, p / _XIC_TABLE_FILE)
+    return write_xic_manifest(p, metadata=metadata)
+
+
+def write_xic_manifest(path: Path | str, *, metadata: dict[str, Any] | None = None) -> Path:
+    """Write the ``manifest.json`` that makes ``path`` (holding
+    ``xic_trace.parquet``) an XIC trace bundle."""
+    p = Path(path)
     manifest = {
         "format": "xic_trace",
         "schema_version": 1,
@@ -402,122 +446,203 @@ def load_xic(path: Path | str) -> pa.Table:
 # ──────────────────────────────────────────────────────────────────────
 
 
-@dataclass(slots=True)
-class _ScanIndex:
-    """Per-scan peak store for one MS level: scans in RT order, peaks
-    mz-sorted within each scan, addressed by offsets."""
+@dataclass(frozen=True)
+class XicTraceReducer:
+    """Sweep matches as ``XIC_TRACE_TABLE`` rows, in Mode A's order: target
+    input order, then (rt, scan), then the target's ions in the order its
+    queries list them, then peak. With ``drop_unmatched=False`` every cell
+    the sweep could have matched is a row, intensity 0.0 and NaN m/z and
+    errors where nothing was within tolerance (NaN, not null, as always).
+    A rule that can match several peaks per cell (``all``) gives matches
+    only."""
 
-    scan_ids: np.ndarray
-    rts: np.ndarray
-    iso_lo: np.ndarray
-    iso_hi: np.ndarray
-    flat_mz: np.ndarray
-    flat_int: np.ndarray
-    offsets: np.ndarray  # (n_scans + 1,)
+    drop_unmatched: bool = True
+    name: str = "xic_trace"
+    schema: pa.Schema = XIC_TRACE_TABLE
+    #: Only the queries the sweep's evidence gate passed.
+    gated: bool = False
+
+    def reduce(self, batch: "QueryBatch") -> pa.Table:
+        plan, s, m = batch.plan, batch.scans, batch.matches
+        rows = batch.match_rows()
+        fill = not self.drop_unmatched and batch.settings.rule.name != "all"
+        parts = []
+        for level in plan.levels:
+            ions = plan.ions_for_level(level)
+            if ions is None:
+                continue
+            at = np.flatnonzero(m.level == level)
+            q, r, ion = m.query[at], rows[at], m.ion[at]
+            peak, obs, inten = m.peak_index[at], m.mz[at], m.intensity[at]
+            matched = np.ones(at.size, dtype=bool)
+            if fill:
+                q, r, ion, idx = _left_join_cells(batch, level, q, r, ion)
+                matched = idx >= 0
+                peak, obs, inten = (
+                    np.where(matched, np.r_[v, fallback][idx], fallback)
+                    for v, fallback in ((peak, -1), (obs, np.nan), (inten, 0.0))
+                )
+            parts.append((level, ions, q, r, ion, peak, obs, inten, matched))
+        return _trace_table(plan, s, batch.scan_order, parts, batch.settings.acquisition_id)
 
 
-def _build_scan_index(peaks: pa.Table, level: int) -> _ScanIndex:
-    ms = peaks.filter(pc.equal(peaks["level"], level))
-    ms = ms.sort_by([("rt", "ascending"), ("scan", "ascending"), ("mz", "ascending")])
-    if ms.num_rows == 0:
-        empty = np.array([], dtype=np.float64)
-        return _ScanIndex(
-            np.array([], np.int64),
-            empty,
-            empty,
-            empty,
-            empty,
-            empty,
-            np.array([0], np.int64),
-        )
-    scan = ms.column("scan").to_numpy(zero_copy_only=False).astype(np.int64)
-    rt = ms.column("rt").to_numpy(zero_copy_only=False)
-    mz = ms.column("mz").to_numpy(zero_copy_only=False)
-    inten = ms.column("intensity").to_numpy(zero_copy_only=False)
-    iso_lo = ms.column("isolation_lower").to_numpy(zero_copy_only=False)
-    iso_hi = ms.column("isolation_upper").to_numpy(zero_copy_only=False)
+def _left_join_cells(batch, level, q, r, ion):
+    """Every eligible cell of ``level`` in output order, with the index of
+    its match among ``(q, r, ion)`` (-1 where none)."""
+    cq, cr, ci = batch.eligible_cells(level)
+    order = batch.scan_order
+    by_cell = np.lexsort((ci, order[cr], cq))
+    by_match = np.lexsort((ion, order[r], q))
+    key_c = np.stack([cq[by_cell], order[cr][by_cell], ci[by_cell]], axis=1)
+    key_m = np.stack([q[by_match], order[r][by_match], ion[by_match]], axis=1)
+    idx = np.full(cq.size, -1, dtype=np.int64)
+    if key_m.size:
+        # Both sides sorted on the same key; a match is one of the cells.
+        view = np.dtype([("q", np.int64), ("s", np.int64), ("i", np.int64)])
+        kc = np.ascontiguousarray(key_c).view(view).reshape(-1)
+        km = np.ascontiguousarray(key_m).view(view).reshape(-1)
+        pos = np.searchsorted(kc, km)
+        idx[by_cell[pos]] = by_match
+    return cq, cr, ci, idx
 
-    # Scan boundaries on the rt-then-scan sort.
-    change = np.flatnonzero(scan[1:] != scan[:-1]) + 1
-    starts = np.concatenate(([0], change))
-    offsets = np.concatenate((starts, [scan.shape[0]])).astype(np.int64)
-    return _ScanIndex(
-        scan_ids=scan[starts],
-        rts=rt[starts],
-        iso_lo=iso_lo[starts],
-        iso_hi=iso_hi[starts],
-        flat_mz=mz,
-        flat_int=inten,
-        offsets=offsets,
+
+def _trace_table(plan, s, scan_order, parts, acquisition_id) -> pa.Table:
+    if not parts:
+        return cast_to_schema(XIC_TRACE_TABLE.empty_table(), XIC_TRACE_TABLE)
+    cols: dict[str, list] = {k: [] for k in (
+        "query", "level", "row", "ion_order", "peak", "charge", "isotope", "ion_type",
+        "position", "fragment_charge", "loss_id", "theo", "obs", "intensity", "matched",
+    )}  # fmt: skip
+    for level, ions, q, r, ion, peak, obs, inten, matched in parts:
+        g = ions.offsets[q] + ion
+        n = q.size
+        frag = level != 1
+        cols["query"].append(q)
+        cols["level"].append(np.full(n, level, np.int8))
+        cols["row"].append(r)
+        cols["ion_order"].append(ion)
+        cols["peak"].append(peak)
+        cols["charge"].append(ions.precursor_charge[g])
+        cols["isotope"].append(np.ma.masked_array(ions.isotope[g], mask=np.full(n, frag)))
+        for name, values in (("ion_type", ions.ion_type), ("position", ions.position),
+                             ("fragment_charge", ions.fragment_charge)):  # fmt: skip
+            cols[name].append(np.ma.masked_array(values[g], mask=np.full(n, not frag)))
+        names = np.array([None, *ions.loss_ids], dtype=object)
+        cols["loss_id"].append(names[ions.loss[g]] if frag else np.full(n, None, dtype=object))
+        cols["theo"].append(ions.mz[g])
+        cols["obs"].append(obs)
+        cols["intensity"].append(inten)
+        cols["matched"].append(matched)
+    c = {k: (np.ma.concatenate(v) if isinstance(v[0], np.ma.MaskedArray) else np.concatenate(v))
+         for k, v in cols.items()}  # fmt: skip
+    by = np.lexsort((c["peak"], c["ion_order"], scan_order[c["row"]], c["level"], c["query"]))
+    c = {k: v[by] for k, v in c.items()}
+    row = c["row"]
+    matched = c["matched"]
+    theo = c["theo"]
+    obs = np.where(matched, c["obs"], np.nan)
+    err = np.where(matched, obs - theo, np.nan)
+    query = pa.array(c["query"])
+    targets = plan.targets
+    n = int(c["query"].size)
+
+    def masked(v, dtype):
+        return pa.array(np.asarray(v.filled(0), dtype=dtype), mask=np.ma.getmaskarray(v))
+
+    table = pa.table(
+        {
+            "acquisition_id": pa.array(np.full(n, acquisition_id, np.int64)),
+            "target_id": targets.column("target_id").take(query),
+            "modified_sequence": targets.column("modified_sequence").take(query),
+            "precursor_charge": pa.array(c["charge"].astype(np.int8)),
+            "level": pa.array(c["level"]),
+            "scan": pa.array(s.scan[row].astype(np.int32)),
+            "rt": pa.array(s.rt[row]),
+            "isolation_lower": pa.array(s.lower[row]),
+            "isolation_upper": pa.array(s.upper[row]),
+            "isotope": masked(c["isotope"], np.int8),
+            "ion_type": masked(c["ion_type"], np.int8),
+            "position": masked(c["position"], np.int32),
+            "fragment_charge": masked(c["fragment_charge"], np.int32),
+            "loss_id": pa.array(c["loss_id"], pa.string()),
+            "mz_theoretical": pa.array(theo),
+            "mz_observed": pa.array(obs),
+            "intensity": pa.array(np.where(matched, c["intensity"], 0.0)),
+            "mz_error_da": pa.array(err),
+            "mz_error_ppm": pa.array(np.where(matched, err / theo * 1e6, np.nan)),
+        }
     )
+    return cast_to_schema(table, XIC_TRACE_TABLE)
 
 
-def _candidate_scans(
-    idx: _ScanIndex,
-    t: _Target,
-    level: int,
-    rt_window: float | None,
-    assigned_scans_only: bool,
-) -> np.ndarray:
-    """Indices (into idx.scan_ids) of scans gating in for this target."""
-    if idx.scan_ids.size == 0:
-        return np.array([], dtype=np.int64)
-    lo, hi = _rt_bounds(t, rt_window)
-    left = bisect.bisect_left(idx.rts.tolist(), lo)
-    right = bisect.bisect_right(idx.rts.tolist(), hi)
-    cand = np.arange(left, right, dtype=np.int64)
-    if cand.size == 0:
-        return cand
-    # MS2 isolation-window gating: keep scans whose window covers the precursor.
-    if level != 1 and t.precursor_mz is not None:
-        clo = idx.iso_lo[cand]
-        chi = idx.iso_hi[cand]
-        covers = (
-            ~(np.isnan(clo) | np.isnan(chi))
-            & (clo <= t.precursor_mz)
-            & (t.precursor_mz <= chi)
-        )
-        # null bounds pass-all
-        passall = np.isnan(clo) | np.isnan(chi)
-        cand = cand[covers | passall]
-    if assigned_scans_only and t.scan is not None:
-        cand = cand[idx.scan_ids[cand] == t.scan]
-    return cand
+def extract_xic(
+    peaks: pa.Table | Path | str,
+    targets: pa.Table,
+    *,
+    acquisition_id: int,
+    levels: Sequence[int],
+    tolerances: dict[int, tuple[float, ToleranceUnit]],
+    ions: "IonSettings | None" = None,
+    rt_window: float | None = None,
+    rule: str = "nearest",
+    assigned_scans_only: bool = False,
+    drop_unmatched: bool = True,
+    mz_axis: str | None = None,
+    gate: "EvidenceGate | None" = None,
+    only_passing: bool = False,
+    claims: bool = False,
+    summary: bool = False,
+    workers: int = 1,
+    work_dir: Path | str | None = None,
+    progress=None,
+) -> "SweepResult":
+    """Extract XIC traces for ``targets`` at every MS level in ``levels`` in
+    one sweep of ``peaks`` (a bundle, streamed, or a peak table), each level
+    at its own tolerance. The trace is the result's ``xic_trace`` output:
+    ``.table("xic_trace")`` for it in memory, ``.write("xic_trace", path)``
+    to stream it to a file. ``rule`` is ``nearest`` (Mode A's), ``all`` (every
+    peak within tolerance) or ``sum`` (their sum, as one row).
 
+    With a ``gate``, ``only_passing`` keeps only the targets it passed in
+    the trace. ``claims`` adds the ``peak_claims`` output (peaks matched by
+    more than one target or ion) and ``summary`` the ``query_summary``
+    output (per target: the gate's verdict, scans eligible, ions matched)."""
+    from constellation.massspec.sweep import IonSettings, compile_queries
+    from constellation.massspec.sweep.engine import SweepSettings, sweep
+    from constellation.massspec.sweep.reduce import QuerySummaryReducer
+    from constellation.massspec.sweep.rules import rule_named
 
-def _match_grid(
-    idx: _ScanIndex,
-    cand: np.ndarray,
-    query_mz: np.ndarray,
-    tolerance: float,
-    tolerance_unit: ToleranceUnit,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Nearest-within-tolerance match of queries against each candidate
-    scan. Returns (observed_mz, intensity, within) each (n_cand, n_q)."""
-    n_cand = cand.shape[0]
-    counts = (idx.offsets[cand + 1] - idx.offsets[cand]).astype(np.int64)
-    max_p = int(counts.max()) if n_cand else 0
-    obs_mz = np.full((n_cand, max_p), np.inf, dtype=np.float64)
-    obs_int = np.zeros((n_cand, max_p), dtype=np.float64)
-    for j, s in enumerate(cand):
-        a, b = int(idx.offsets[s]), int(idx.offsets[s] + counts[j])
-        obs_mz[j, : counts[j]] = idx.flat_mz[a:b]
-        obs_int[j, : counts[j]] = idx.flat_int[a:b]
+    if only_passing and gate is None:
+        raise ValueError("only_passing needs a gate to pass targets")
 
-    q = torch.from_numpy(query_mz)
-    axis = torch.from_numpy(obs_mz)
-    queries = q.unsqueeze(0).expand(n_cand, -1)
-    best_idx, within, signed = nearest_within_tolerance(
-        axis, queries, tolerance, tolerance_unit
+    plan = compile_queries(
+        targets,
+        levels=levels,
+        ions=ions if ions is not None else IonSettings(),
+        rt_window=rt_window,
+        assigned_scans_only=assigned_scans_only,
     )
-    inten = torch.from_numpy(obs_int).gather(1, best_idx)
-    # observed mz = query - signed_delta (signed_delta = query - observed)
-    observed = (queries.to(torch.float64) - signed).numpy()
-    return observed, inten.numpy(), within.numpy()
+    settings = SweepSettings(
+        tolerances=dict(tolerances),
+        rule=rule_named(rule),
+        mz_axis=mz_axis,
+        acquisition_id=acquisition_id,
+        gate=gate,
+        claims=claims,
+    )
+    if not isinstance(peaks, pa.Table):
+        path = Path(peaks)
+        if not (path / "manifest.json").is_file():
+            peaks = open_peaks(path).to_table()
+    reducers = [XicTraceReducer(drop_unmatched=drop_unmatched, gated=only_passing)]
+    if summary:
+        reducers.append(QuerySummaryReducer())
+    return sweep(peaks, plan, settings, reducers=reducers, workers=workers, work_dir=work_dir,
+                 progress=progress)  # fmt: skip
 
 
 def extract_xic_scan_major(
-    peaks: pa.Table,
+    peaks: pa.Table | Path | str,
     targets: pa.Table,
     *,
     acquisition_id: int,
@@ -533,145 +658,44 @@ def extract_xic_scan_major(
     all_in_window: bool = False,
     assigned_scans_only: bool = False,
     drop_unmatched: bool = True,
+    mz_axis: str | None = None,
+    workers: int = 1,
     output_path: Path | str | None = None,
 ) -> pa.Table | Path:
     """Mode A scan-major XIC extraction. See module docstring.
 
-    ``all_in_window=True`` returns every peak within tolerance per
-    (scan, ion) instead of the nearest (interference / chimeric work).
+    ``peaks`` is a converted acquisition (a bundle directory, streamed) or
+    a peak table. ``all_in_window=True`` returns every peak within tolerance
+    per (scan, ion) instead of the nearest (interference / chimeric work).
+    ``mz_axis`` (a bundle's measured m/z axis key, or ``latest``) corrects
+    the observed m/z before matching. ``workers > 1`` sweeps a bundle's scan
+    ranges in that many processes; the rows are the same.
     """
-    records = _targets_to_records(targets)
-    idx = _build_scan_index(peaks, level)
-    builder = _TraceBuilder()
+    from constellation.massspec.sweep import IonSettings
 
-    ms2_queries = (
-        _ms2_queries_batch(
-            records,
-            ion_types=ion_types,
-            max_fragment_charge=max_fragment_charge,
-            neutral_losses=neutral_losses,
-        )
-        if level != 1
-        else {}
-    )
-
-    for i, t in enumerate(records):
-        ions = (
-            ms2_queries[i]
-            if level != 1
-            else _ms1_queries(t, n_isotopes=n_isotopes, charge_range=charge_range)
-        )
-        if not ions:
-            continue
-        cand = _candidate_scans(idx, t, level, rt_window, assigned_scans_only)
-        if cand.size == 0:
-            continue
-        if all_in_window:
-            _emit_all_scan_major(
-                builder,
-                acquisition_id,
-                t,
-                level,
-                ions,
-                idx,
-                cand,
-                tolerance,
-                tolerance_unit,
-            )
-            continue
-        query_mz = np.array([ion.mz for ion in ions], dtype=np.float64)
-        observed, inten, within = _match_grid(
-            idx, cand, query_mz, tolerance, tolerance_unit
-        )
-        _emit_grid(
-            builder,
-            acquisition_id=acquisition_id,
-            target=t,
-            level=level,
-            ions=ions,
-            scan_ids=idx.scan_ids[cand],
-            rts=idx.rts[cand],
-            iso_lo=idx.iso_lo[cand],
-            iso_hi=idx.iso_hi[cand],
-            observed_mz=observed,
-            intensity=inten,
-            within=within,
-            drop_unmatched=drop_unmatched,
-        )
-    return _finalize(
-        _stamp_extraction_tolerance(builder.table(), tolerance, tolerance_unit),
-        output_path,
-    )
-
-
-def _build_obs_matrices(
-    idx: _ScanIndex, cand: np.ndarray
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    counts = (idx.offsets[cand + 1] - idx.offsets[cand]).astype(np.int64)
-    max_p = int(counts.max()) if cand.size else 0
-    obs_mz = np.full((cand.shape[0], max_p), np.inf, dtype=np.float64)
-    obs_int = np.zeros((cand.shape[0], max_p), dtype=np.float64)
-    for j, s in enumerate(cand):
-        a, b = int(idx.offsets[s]), int(idx.offsets[s] + counts[j])
-        obs_mz[j, : counts[j]] = idx.flat_mz[a:b]
-        obs_int[j, : counts[j]] = idx.flat_int[a:b]
-    return obs_mz, obs_int, counts
-
-
-def _emit_all_scan_major(
-    builder, acquisition_id, t, level, ions, idx, cand, tolerance, tolerance_unit
-) -> None:
-    """All-peaks-in-window emit for one target (scan-major)."""
-    obs_mz, obs_int, _ = _build_obs_matrices(idx, cand)
-    query_mz = np.array([ion.mz for ion in ions], dtype=np.float64)
-    queries = torch.from_numpy(query_mz).unsqueeze(0).expand(cand.shape[0], -1)
-    lo, hi = bounds_within_tolerance(
-        torch.from_numpy(obs_mz), queries, tolerance, tolerance_unit
-    )
-    lo, hi = lo.numpy(), hi.numpy()
-    o_scan, o_rt, o_lo, o_hi, o_obs, o_int, o_qi = ([] for _ in range(7))
-    for j in range(cand.shape[0]):
-        s = cand[j]
-        for q in range(len(ions)):
-            for pk in range(int(lo[j, q]), int(hi[j, q])):
-                m = obs_mz[j, pk]
-                if not np.isfinite(m):
-                    continue
-                o_scan.append(idx.scan_ids[s])
-                o_rt.append(idx.rts[s])
-                o_lo.append(idx.iso_lo[s])
-                o_hi.append(idx.iso_hi[s])
-                o_obs.append(m)
-                o_int.append(obs_int[j, pk])
-                o_qi.append(q)
-    if not o_qi:
-        return
-    qi = np.array(o_qi, dtype=np.int64)
-    obs = np.array(o_obs, dtype=np.float64)
-    theo = query_mz[qi]
-    err = obs - theo
-    builder.add(
+    result = extract_xic(
+        peaks,
+        targets,
         acquisition_id=acquisition_id,
-        target_id=t.target_id,
-        modified_sequence=t.modified_sequence,
-        precursor_charge=np.array(
-            [ions[q].precursor_charge for q in qi], dtype=np.int64
+        levels=[level],
+        tolerances={level: (tolerance, tolerance_unit)},
+        ions=IonSettings(
+            n_isotopes=n_isotopes,
+            charge_range=charge_range,
+            ion_types=tuple(ion_types),
+            max_fragment_charge=max_fragment_charge,
+            neutral_losses=tuple(neutral_losses) if neutral_losses else None,
         ),
-        level=level,
-        scan=np.array(o_scan),
-        rt=np.array(o_rt),
-        isolation_lower=np.array(o_lo),
-        isolation_upper=np.array(o_hi),
-        isotope=[ions[q].isotope for q in qi],
-        ion_type=[ions[q].ion_type for q in qi],
-        position=[ions[q].position for q in qi],
-        fragment_charge=[ions[q].fragment_charge for q in qi],
-        loss_id=[ions[q].loss_id for q in qi],
-        mz_theoretical=theo,
-        mz_observed=obs,
-        intensity=np.array(o_int),
-        mz_error_da=err,
-        mz_error_ppm=err / theo * 1e6,
+        rt_window=rt_window,
+        rule="all" if all_in_window else "nearest",
+        assigned_scans_only=assigned_scans_only,
+        drop_unmatched=drop_unmatched,
+        mz_axis=mz_axis,
+        workers=workers,
+    )
+    return _finalize(
+        _stamp_extraction_tolerance(result.table("xic_trace"), tolerance, tolerance_unit),
+        output_path,
     )
 
 

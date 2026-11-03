@@ -1031,6 +1031,100 @@ def fragment_ladder_indices_batch(
     return [r if r is not None else {} for r in results]
 
 
+@dataclass(frozen=True, slots=True)
+class LadderArrays:
+    """Many peptides' fragment ladders as flat arrays.
+
+    Peptide ``i``'s ions are rows ``offsets[i]:offsets[i + 1]``, in the
+    order :func:`fragment_ladder_indices_batch` lists them (position, then
+    ion type in the order asked, then charge, then no loss before each loss).
+    ``loss`` is 0 for no loss and ``k`` for ``loss_ids[k - 1]``.
+    """
+
+    offsets: np.ndarray  # (n_peptides + 1,) int64
+    mz: np.ndarray  # float64
+    ion_type: np.ndarray  # int8, IonType values
+    position: np.ndarray  # int32
+    charge: np.ndarray  # int32
+    loss: np.ndarray  # int16
+    loss_ids: tuple[str, ...]
+
+
+def fragment_ladder_arrays_batch(
+    peptidoforms: Sequence[Peptidoform],
+    *,
+    ion_types: Sequence[IonType] = (IonType.B, IonType.Y),
+    max_fragment_charge: int = 1,
+    neutral_losses: Sequence[str] | None = None,
+    vocab: ModVocab = UNIMOD,
+) -> LadderArrays:
+    """:func:`fragment_ladder_indices_batch` as flat arrays, for callers
+    that hold many peptides' ions at once (a search's query plan). The same
+    tensor math and the same values, without a Python object per ion.
+    Linear peptidoforms only."""
+    if max_fragment_charge < 1:
+        raise ValueError(
+            f"max_fragment_charge must be ≥ 1; got {max_fragment_charge}"
+        )
+    if not ion_types:
+        raise ValueError("ion_types must be non-empty")
+    loss_ids: tuple[str, ...] = tuple(neutral_losses) if neutral_losses else ()
+    type_codes = np.array([int(t) for t in ion_types], dtype=np.int8)
+
+    groups: dict[tuple[int, tuple[str, ...]], list[tuple[int, _LinearInputs]]] = {}
+    for idx, p in enumerate(peptidoforms):
+        if not isinstance(p, Peptidoform):
+            raise TypeError(
+                "fragment_ladder_arrays_batch supports only linear Peptidoform "
+                f"inputs; got {type(p).__name__}"
+            )
+        if _has_crosslinks(p) or _has_branches(p):
+            raise ValueError(
+                "fragment_ladder_arrays_batch supports only linear peptidoforms "
+                "(no cross-links / branches)"
+            )
+        inp = _prepare_linear_inputs(p, vocab=vocab)
+        groups.setdefault((len(inp.seq), inp.isotopes), []).append((idx, inp))
+
+    # Each group's rows come out peptide-major from torch.where; they are
+    # placed at their peptides' offsets once every group's counts are known.
+    n = len(peptidoforms)
+    counts = np.zeros(n, dtype=np.int64)
+    parts = []
+    for items in groups.values():
+        indices = np.array([i for i, _ in items], dtype=np.int64)
+        mz_batch = _run_linear_batch(
+            [inp for _, inp in items],
+            ion_types=ion_types,
+            max_fragment_charge=max_fragment_charge,
+            loss_ids=loss_ids,
+        )
+        finite = torch.isfinite(mz_batch)
+        b, p, t, c, lo = (x.numpy() for x in torch.where(finite))
+        mz = mz_batch[finite].numpy().astype(np.float64, copy=False)
+        counts[indices] = np.bincount(b, minlength=len(items))
+        parts.append((indices[b], b, mz, t, p, c, lo))
+    offsets = np.zeros(n + 1, dtype=np.int64)
+    np.cumsum(counts, out=offsets[1:])
+    total = int(offsets[-1])
+    out_mz = np.empty(total, np.float64)
+    out_type = np.empty(total, np.int8)
+    out_pos = np.empty(total, np.int32)
+    out_charge = np.empty(total, np.int32)
+    out_loss = np.empty(total, np.int16)
+    for peptide, b, mz, t, p, c, lo in parts:
+        # Rank of each row within its peptide: rows of one peptide are contiguous.
+        first = np.flatnonzero(np.r_[True, b[1:] != b[:-1]])
+        rank = np.arange(b.size) - np.repeat(first, np.diff(np.r_[first, b.size]))
+        dest = offsets[peptide] + rank
+        out_mz[dest] = mz
+        out_type[dest] = type_codes[t]
+        out_pos[dest] = p
+        out_charge[dest] = c + 1
+        out_loss[dest] = lo
+    return LadderArrays(offsets, out_mz, out_type, out_pos, out_charge, out_loss, loss_ids)
+
+
 def fragment_ladders_batch(
     peptidoforms: Sequence[ProFormaResult],
     *,
@@ -1174,5 +1268,7 @@ __all__ = [
     "fragment_ladder",
     "fragment_ladders_batch",
     "fragment_ladder_indices_batch",
+    "fragment_ladder_arrays_batch",
+    "LadderArrays",
     "ion_number",
 ]

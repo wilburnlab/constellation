@@ -10,6 +10,8 @@ as ``massspec convert`` does: ``peaks/`` (or ``profile/``),
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -215,3 +217,183 @@ def write_bundle_manifest(
         )
     )
     return bundle
+
+
+# ── a run with peptides planted in it ─────────────────────────────────
+
+#: Planted by default: a pair one missed cleavage apart, a peptide and its
+#: oxidised form, and two unrelated peptides, each at its own apex (s).
+PLANTED_PEPTIDES: tuple[tuple[str, int, float], ...] = (
+    ("LVNELTEFAK", 2, 60.0),
+    ("LVNELTEFAKTCVADESHAGCEK", 3, 64.0),
+    ("PEPTMIDEK", 2, 90.0),
+    ("PEPTM[Oxidation]IDEK", 2, 84.0),
+    ("HLVDEPQNLIK", 2, 120.0),
+    ("YICDNQDTISSK", 2, 61.0),
+)
+
+
+@dataclass
+class PlantedRun:
+    """A synthetic run and the targets for what was planted in it."""
+
+    scans: list[dict[str, Any]]
+    targets: pa.Table
+    #: (scan, m/z) of a scan holding two peaks at exactly the same m/z.
+    duplicate: tuple[int, float]
+    #: (scan, m/z, theoretical m/z) of a peak placed exactly 20 ppm from an ion.
+    edge: tuple[int, float, float]
+
+
+def _gauss(rt: float, apex: float, sigma: float) -> float:
+    return float(np.exp(-0.5 * ((rt - apex) / sigma) ** 2))
+
+
+def planted_run(
+    *,
+    acquisition: str = "dia",
+    peptides: Sequence[tuple[str, int, float]] = PLANTED_PEPTIDES,
+    cycles: int = 60,
+    cycle_s: float = 3.0,
+    sigma_s: float = 5.0,
+    window_width: float = 50.0,
+    window_range: tuple[float, float] = (350.0, 1250.0),
+    staggered: bool = False,
+    noise_peaks: int = 25,
+    error_ppm: float = 2.0,
+    seed: int = 0,
+) -> PlantedRun:
+    """A DIA or DDA run in which ``peptides`` (modseq, charge, apex RT) elute
+    as Gaussians: precursor isotopes in MS1, b/y fragments in the MS2 scans
+    that isolate them, each peak ``error_ppm`` from theory, over uniform
+    noise. One scan carries a duplicated peak and one a peak exactly 20 ppm
+    from an ion, so tie and tolerance-edge handling are exercised. DIA
+    windows tile ``window_range``; ``staggered`` offsets alternate cycles by
+    half a window. DDA isolates each peptide in the cycles near its apex,
+    plus one off-target MS2 per cycle."""
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.massspec.peptide.envelope import peptide_envelope
+    from constellation.massspec.peptide.ions import fragment_ladder
+    from constellation.massspec.peptide.mz import precursor_mz
+    from constellation.massspec.quant.schemas import XIC_TARGET_TABLE
+
+    rng = np.random.default_rng(seed)
+    planted = []
+    for modseq, z, apex in peptides:
+        pf = parse_proforma(modseq)
+        iso_mz, iso_ab = peptide_envelope(pf, charge=z, n_peaks=3)
+        ladder, _ = fragment_ladder(pf, max_fragment_charge=min(2, z), return_tensor=False)
+        frag_mz = np.asarray(ladder.column("mz_theoretical").to_numpy(), dtype=np.float64)
+        frag_mz = frag_mz[(frag_mz > 200.0) & (frag_mz < 1500.0)]
+        planted.append(
+            {
+                "modseq": modseq,
+                "z": z,
+                "apex": apex,
+                "pmz": precursor_mz(pf, charge=z),
+                "iso_mz": iso_mz.numpy().astype(np.float64),
+                "iso_ab": iso_ab.numpy().astype(np.float64),
+                "frag_mz": frag_mz,
+                "frag_ab": rng.uniform(0.1, 1.0, frag_mz.size),
+                "scale": float(rng.uniform(2e5, 2e6)),
+            }
+        )
+
+    lo_mz, hi_mz = window_range
+    edges = np.arange(lo_mz, hi_mz + 1e-9, window_width)
+    base = list(zip(edges[:-1], edges[1:]))
+
+    def peaks(rt, ions):
+        mz = [rng.uniform(200.0, 1500.0, noise_peaks)]
+        inten = [rng.uniform(1e2, 3e3, noise_peaks)]
+        if ions:
+            theo, ab, scale = (np.asarray(v, dtype=np.float64) for v in zip(*ions))
+            mz.append(theo * (1.0 + error_ppm * 1e-6))
+            inten.append(ab * scale)
+        mz_a, int_a = np.concatenate(mz), np.concatenate(inten)
+        keep = int_a > 50.0
+        order = np.argsort(mz_a[keep], kind="stable")
+        return mz_a[keep][order], int_a[keep][order]
+
+    scans: list[dict[str, Any]] = []
+    number = 0
+
+    def add(level, rt, ions, window=None, target=None, charge=None):
+        nonlocal number
+        number += 1
+        mz, inten = peaks(rt, ions)
+        scan = {"scan": number, "level": level, "rt": rt, "iit": 10.0, "mz": mz,
+                "intensity": inten, "filter_string": MS1_FILTER}  # fmt: skip
+        if level == 2:
+            lo, hi = window
+            scan.update(
+                isolation_lower=lo, isolation_upper=hi, precursor_mz=target,
+                precursor_charge=charge, ms2_isolation_offset=0.0, activation_type="cid",
+                filter_string=f"ITMS + c NSI r Full ms2 {target:.4f}@cid30.00 [200.0000-1500.0000]",
+            )  # fmt: skip
+        scans.append(scan)
+
+    for cycle in range(cycles):
+        t0 = cycle * cycle_s
+        ms1_ions = []
+        for p in planted:
+            g = _gauss(t0, p["apex"], sigma_s)
+            if g > 1e-3:
+                ms1_ions.extend(zip(p["iso_mz"], p["iso_ab"], [p["scale"] * g] * 3))
+        add(1, t0 + 0.0123456789, ms1_ions)
+        if acquisition == "dia":
+            shift = window_width / 2.0 if staggered and cycle % 2 else 0.0
+            for k, (lo, hi) in enumerate(base):
+                lo, hi = lo + shift, hi + shift
+                rt = t0 + (k + 1) * cycle_s / (len(base) + 2)
+                ions = []
+                for p in planted:
+                    if lo <= p["pmz"] <= hi:
+                        g = _gauss(rt, p["apex"], sigma_s)
+                        if g > 1e-3:
+                            ions.extend(zip(p["frag_mz"], p["frag_ab"], [p["scale"] * g] * p["frag_mz"].size))
+                add(2, rt, ions, (lo, hi), (lo + hi) / 2.0)
+        else:
+            chosen = [p for p in planted if abs(t0 - p["apex"]) < 2.5 * sigma_s]
+            for k, p in enumerate(chosen):
+                rt = t0 + (k + 1) * cycle_s / (len(chosen) + 3)
+                g = _gauss(rt, p["apex"], sigma_s)
+                ions = list(zip(p["frag_mz"], p["frag_ab"], [p["scale"] * g] * p["frag_mz"].size))
+                add(2, rt, ions, (p["pmz"] - 0.8, p["pmz"] + 0.8), p["pmz"], p["z"])
+            off = float(rng.uniform(400.0, 1000.0))
+            add(2, t0 + cycle_s * 0.95, [], (off - 0.8, off + 0.8), off, 2)
+
+    # A duplicated peak, and a peak exactly 20 ppm above a fragment, in the
+    # MS2 scan nearest the first peptide's apex that isolates it.
+    first = planted[0]
+    ms2 = [s for s in scans if s["level"] == 2
+           and s["isolation_lower"] <= first["pmz"] <= s["isolation_upper"]]  # fmt: skip
+    host = min(ms2, key=lambda s: abs(s["rt"] - first["apex"]))
+    dup = float(host["mz"][host["mz"].size // 2])
+    theo = float(first["frag_mz"][first["frag_mz"].size // 2])
+    edge_mz = theo + 20.0 * theo * 1e-6
+    mz = np.concatenate((host["mz"], [dup, edge_mz]))
+    inten = np.concatenate((host["intensity"], [7.5e4, 3.3e4]))
+    order = np.argsort(mz, kind="stable")
+    host["mz"], host["intensity"] = mz[order], inten[order]
+
+    targets = pa.Table.from_pylist(
+        [
+            {
+                "target_id": 1000 + i,
+                "modified_sequence": p["modseq"],
+                "precursor_charge": p["z"],
+                "precursor_mz": p["pmz"],
+                "rt_center": p["apex"],
+                "precursor_id": 5000 + i,
+            }
+            for i, p in enumerate(planted)
+        ],
+        schema=XIC_TARGET_TABLE,
+    )
+    return PlantedRun(
+        scans=scans,
+        targets=targets,
+        duplicate=(host["scan"], dup),
+        edge=(host["scan"], edge_mz, theo),
+    )

@@ -225,7 +225,8 @@ XIC_TRACE_TABLE: pa.Schema = pa.schema(
         # Join keys back to MS_PEAK_TABLE / SCAN_METADATA_TABLE.
         pa.field("scan", pa.int32(), nullable=False),
         pa.field("rt", pa.float64(), nullable=False),
-        # MS2 isolation-window provenance (null for MS1).
+        # MS2 isolation-window provenance (NaN for MS1: written as numbers
+        # from the scans' arrays, not as nulls).
         pa.field("isolation_lower", pa.float64(), nullable=True),
         pa.field("isolation_upper", pa.float64(), nullable=True),
         # MS1 coordinate (null on MS2 rows).
@@ -239,7 +240,8 @@ XIC_TRACE_TABLE: pa.Schema = pa.schema(
         pa.field("mz_observed", pa.float64(), nullable=True),
         # 0.0 for kept-unmatched rows (drop_unmatched=False).
         pa.field("intensity", pa.float64(), nullable=False),
-        # Signed (observed - theoretical); null on unmatched rows.
+        # Signed (observed - theoretical); NaN, like `mz_observed`, on kept
+        # unmatched rows.
         pa.field("mz_error_da", pa.float64(), nullable=True),
         pa.field("mz_error_ppm", pa.float64(), nullable=True),
     ],
