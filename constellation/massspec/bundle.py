@@ -20,7 +20,9 @@ are made and written. Code that reads peaks goes through
 :func:`peaks_dataset` / :func:`iter_peak_batches` (or :func:`open_peaks` for
 "a bundle, a directory of parts, or a Parquet file"), which refuse a profile
 bundle; code that reads either kind goes through :func:`points_dataset`.
-Neither names files. Only the current format opens: an older bundle is
+:func:`iter_scan_blocks` streams either kind as blocks of whole scans, and
+:func:`scan_range_shards` cuts a bundle into scan ranges for workers to
+stream separately. None of them names files. Only the current format opens: an older bundle is
 refused with :class:`OutdatedBundleError` rather than read as if it were
 current, because what its files mean has changed.
 
@@ -37,6 +39,7 @@ import functools
 import json
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -283,6 +286,150 @@ def iter_peak_batches(
         yield from pq.ParquetFile(path).iter_batches(
             batch_size=batch_rows, columns=list(columns) if columns is not None else None
         )
+
+
+# ── whole scans, in blocks ────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class ScanBlock:
+    """Consecutive whole scans in stored order. Scan ``scan[i]``'s points are
+    ``columns[name][offsets[i]:offsets[i + 1]]``, in the order they are stored."""
+
+    scan: np.ndarray  # (n_scans,) int64
+    offsets: np.ndarray  # (n_scans + 1,) int64
+    columns: dict[str, np.ndarray]
+
+    @property
+    def n_scans(self) -> int:
+        return int(self.scan.size)
+
+    @property
+    def n_points(self) -> int:
+        return int(self.offsets[-1])
+
+
+def _scan_column_index(file: pq.ParquetFile) -> int:
+    return file.schema_arrow.get_field_index("scan")
+
+
+def _row_group_scan_bounds(file: pq.ParquetFile) -> list[tuple[int, int] | None]:
+    """Each row group's (min, max) scan number from the footer, None where the
+    footer has no statistics for it."""
+    column = _scan_column_index(file)
+    bounds: list[tuple[int, int] | None] = []
+    for i in range(file.metadata.num_row_groups):
+        stats = file.metadata.row_group(i).column(column).statistics
+        if stats is None or not stats.has_min_max:
+            bounds.append(None)
+        else:
+            bounds.append((int(stats.min), int(stats.max)))
+    return bounds
+
+
+def _row_groups_in(file: pq.ParquetFile, lo: int, hi: int) -> list[int]:
+    """Row groups that can hold scans in ``[lo, hi)``."""
+    return [
+        i
+        for i, b in enumerate(_row_group_scan_bounds(file))
+        if b is None or (b[1] >= lo and b[0] < hi)
+    ]
+
+
+def iter_scan_blocks(
+    bundle_dir: Path | str,
+    *,
+    columns: Sequence[str] = ("mz", "intensity"),
+    block_rows: int = 1 << 20,
+    scan_range: tuple[int, int] | None = None,
+    points: bool = False,
+) -> Iterator[ScanBlock]:
+    """A bundle's points as blocks of whole scans, in stored order.
+
+    Row groups are cut on retention-time bins and on a row cap, neither of
+    which respects scan boundaries, so the trailing scan of each record batch
+    is carried into the next. Blocks hold about ``block_rows`` points; a
+    scan larger than that is still yielded whole. ``scan_range=(lo, hi)``
+    keeps scans ``lo <= scan < hi``, reading only the row groups whose footer
+    statistics allow such scans. A scan with no points has none to yield.
+    ``points=True`` reads a profile bundle's points as well as peaks.
+    """
+    paths = point_paths(bundle_dir) if points else peak_paths(bundle_dir)
+    wanted = ["scan", *(c for c in columns if c != "scan")]
+    lo, hi = scan_range if scan_range is not None else (None, None)
+    carry: dict[str, np.ndarray] | None = None
+
+    def block_of(rows: dict[str, np.ndarray]) -> ScanBlock:
+        scan = rows["scan"]
+        starts = np.concatenate(([0], np.flatnonzero(np.diff(scan)) + 1))
+        offsets = np.append(starts, scan.size).astype(np.int64)
+        return ScanBlock(
+            scan=scan[starts].astype(np.int64),
+            offsets=offsets,
+            columns={c: rows[c] for c in wanted[1:]},
+        )
+
+    for path in paths:
+        file = pq.ParquetFile(path)
+        groups = (
+            list(range(file.metadata.num_row_groups))
+            if scan_range is None
+            else _row_groups_in(file, lo, hi)
+        )
+        if not groups:
+            continue
+        for batch in file.iter_batches(batch_size=block_rows, row_groups=groups, columns=wanted):
+            rows = {c: batch.column(i).to_numpy(zero_copy_only=False) for i, c in enumerate(wanted)}
+            if scan_range is not None:
+                scan = rows["scan"]
+                a, b = np.searchsorted(scan, lo, "left"), np.searchsorted(scan, hi, "left")
+                if a or b < scan.size:
+                    rows = {c: v[a:b] for c, v in rows.items()}
+            if rows["scan"].size == 0:
+                continue
+            if carry is not None:
+                rows = {c: np.concatenate((carry[c], rows[c])) for c in wanted}
+            scan = rows["scan"]
+            last = int(np.searchsorted(scan, scan[-1], "left"))
+            if last == 0:  # one scan so far, not known to be complete
+                carry = rows
+                continue
+            carry = {c: v[last:] for c, v in rows.items()}
+            yield block_of({c: v[:last] for c, v in rows.items()})
+    if carry is not None and carry["scan"].size:
+        yield block_of(carry)
+
+
+def scan_range_shards(
+    bundle_dir: Path | str,
+    *,
+    target_rows: int = 16 << 20,
+    points: bool = False,
+) -> list[tuple[int, int]]:
+    """Cut a bundle into contiguous scan ranges ``[lo, hi)`` of about
+    ``target_rows`` points each, at row-group starts, from footer statistics
+    alone. The cut depends on the data, not on how many workers will read it.
+    A bundle whose footers lack scan statistics is one range."""
+    paths = point_paths(bundle_dir) if points else peak_paths(bundle_dir)
+    starts: list[tuple[int, int]] = []  # (first scan, rows) per row group
+    for path in paths:
+        file = pq.ParquetFile(path)
+        for i, b in enumerate(_row_group_scan_bounds(file)):
+            if b is None:
+                return [(np.iinfo(np.int32).min, np.iinfo(np.int32).max)]
+            starts.append((b[0], file.metadata.row_group(i).num_rows))
+    if not starts:
+        return []
+    cuts = [starts[0][0]]
+    rows = 0
+    for first, n in starts:
+        if rows >= target_rows and first > cuts[-1]:
+            cuts.append(first)
+            rows = 0
+        rows += n
+    last_file = pq.ParquetFile(paths[-1])
+    end = max(b[1] for b in _row_group_scan_bounds(last_file) if b is not None) + 1
+    return list(zip(cuts, [*cuts[1:], end]))
 
 
 # ── making and writing peak rows ──────────────────────────────────────
