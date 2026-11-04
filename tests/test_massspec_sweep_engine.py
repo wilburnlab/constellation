@@ -82,8 +82,8 @@ def test_block_size_and_kernel_change_nothing(tmp_root, rule):
     plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
     base = _traces(bundle, plan, rule=rule)
     assert base.num_rows > 0
-    for kw in (dict(block_rows=50), dict(block_rows=777), dict(kernel="cells"), dict(kernel="peaks"),
-               dict(kernel="cells", kernel_elements=64), dict(block_rows=1, kernel="peaks")):  # fmt: skip
+    for kw in (dict(block_rows=50), dict(block_rows=777), dict(kernel="channel"), dict(kernel="point"),
+               dict(kernel="channel", kernel_elements=64), dict(block_rows=1, kernel="point")):  # fmt: skip
         oracle.assert_traces_identical(_traces(bundle, plan, rule=rule, **kw), base)
 
 
@@ -179,8 +179,8 @@ def test_the_ledger_holds_peakless_scans(tmp_path):
     plan = compile_queries(targets, levels=[1])
     result = sweep(bundle, plan, SweepSettings(tolerances={1: (20.0, "ppm")}))
     assert result.scans.n == len(scans)
-    assert result.scans.n_peaks[result.scans.scan == 6].tolist() == [0]
-    assert (result.scans.n_peaks[result.scans.scan != 6] > 0).all()
+    assert result.scans.n_points[result.scans.scan == 6].tolist() == [0]
+    assert (result.scans.n_points[result.scans.scan != 6] > 0).all()
 
 
 def test_sum_rule_adds_the_peaks_in_a_window(tmp_root):

@@ -139,8 +139,8 @@ def _cmd_run_one(args) -> None:
             else sum(pq.ParquetFile(p).metadata.num_rows for p in result.parts["xic_trace"]))  # fmt: skip
     print(json.dumps({
         "bundle": Path(args.bundle).name, "targets": Path(args.targets).name, "queries": plan.n_queries,
-        "isotope_ions": 0 if plan.isotopes is None else plan.isotopes.n,
-        "fragment_ions": 0 if plan.fragments is None else plan.fragments.n,
+        "isotope_channels": 0 if plan.isotopes is None else plan.isotopes.n,
+        "fragment_channels": 0 if plan.fragments is None else plan.fragments.n,
         "levels": args.levels, "rule": args.rule, "kernel": args.kernel, "workers": args.workers,
         "rt_window": args.rt_window, "block_rows": args.block_rows, "torch_threads": torch.get_num_threads(),
         "compile_s": round(t_compile, 3), "sweep_s": round(t_sweep, 3), "rows": rows,
@@ -240,11 +240,11 @@ class _GridReducer:
         plan = batch.plan
         decoy = plan.targets.column("target_id").to_numpy()[batch.queries] >= DECOY_OFFSET
         has = plan.fragments.counts()[batch.queries] > 0
-        cells = batch.eligible(2)
+        pairs = batch.eligible(2)
         rows = []
         for k, run in itertools.product(self.ks, self.runs):
             gate = EvidenceGate(min_fragments=k, min_consecutive=run, top_peaks=self.top_peaks)
-            d = decide(gate, batch.queries, has, lambda: cells, lambda: (np.empty(0, np.int64),) * 2,
+            d = decide(gate, batch.queries, has, lambda: pairs, lambda: (np.empty(0, np.int64),) * 2,
                        batch.evidence, batch.scans)  # fmt: skip
             rows.append(dict(min_fragments=k, min_consecutive=run,
                              targets_passed=int((d.passed & ~decoy).sum()),
@@ -351,7 +351,7 @@ def main() -> None:
         tolerances(r)
         if name == "time":
             r.add_argument("--workers", type=int, nargs="+", default=[1])
-            r.add_argument("--kernels", nargs="+", default=["auto"])
+            r.add_argument("--kernels", nargs="+", default=["auto"], choices=["auto", "channel", "point"])
             r.add_argument("--rules", nargs="+", default=["nearest"])
             r.add_argument("--rt-windows", type=float, nargs="+", default=[0.0])
             r.add_argument("--max-rss-gb", type=float, default=20.0,
@@ -361,7 +361,7 @@ def main() -> None:
             r.add_argument("--out", required=True)
         else:
             r.add_argument("--workers", type=int, default=1)
-            r.add_argument("--kernel", default="auto")
+            r.add_argument("--kernel", default="auto", choices=["auto", "channel", "point"])
             r.add_argument("--rule", default="nearest")
             r.add_argument("--rt-window", type=float, default=None)
         r.set_defaults(func=func)

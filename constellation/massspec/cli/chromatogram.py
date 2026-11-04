@@ -110,11 +110,12 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
                         help="Where the workers' matches go (default <output-dir>/.sweep, "
                              "removed when done).")
     sweepg.add_argument("--claims", action="store_true",
-                        help="Also write peak_claims.parquet: every peak matched by more than "
-                             "one target or ion, with each of them.")
+                        help="Also write point_claims.parquet: every peak matched by more than "
+                             "one target, or by two channels of one, with each of them.")
     sweepg.add_argument("--summary", action="store_true",
                         help="Also write query_summary.parquet: per target, the evidence gate's "
-                             "verdict, the scans it could be matched in and the ions matched.")
+                             "verdict, the scans it could be matched in and the cells (a channel "
+                             "in a scan) matched.")
 
     gateg = p.add_argument_group(
         "evidence gate (sweep; any of these turns it on)",
@@ -228,7 +229,7 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
     )
     from constellation.massspec.quant.peak_index import INDEX_DIRNAME, build_peak_index
     from constellation.massspec.quant.targets import load_targets
-    from constellation.massspec.sweep import IonSettings
+    from constellation.massspec.sweep import ChannelSettings
 
     if not args.peaks_dir.exists():
         print(f"error: peaks not found: {args.peaks_dir}", file=sys.stderr)
@@ -319,8 +320,9 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
     result = extract_xic(
         args.peaks_dir, targets, acquisition_id=args.acquisition_id, levels=levels,
         tolerances=tolerances,
-        ions=IonSettings(n_isotopes=args.n_isotopes, charge_range=charge_range, ion_types=ion_types,
-                         max_fragment_charge=args.max_fragment_charge, neutral_losses=neutral_losses),
+        channels=ChannelSettings(n_isotopes=args.n_isotopes, charge_range=charge_range,
+                                 ion_types=ion_types, max_fragment_charge=args.max_fragment_charge,
+                                 neutral_losses=neutral_losses),
         rt_window=args.rt_window, rule=rule, assigned_scans_only=args.assigned_scans_only,
         drop_unmatched=args.drop_unmatched, mz_axis=args.mz_axis, gate=gate,
         only_passing=args.only_passing, claims=args.claims, summary=args.summary,
@@ -329,7 +331,7 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
     stamp = extraction_tolerance_metadata(tolerances)
     out = result.write("xic_trace", args.output_dir / "xic_trace.parquet", metadata=stamp)
     tables = ["xic_trace.parquet"]
-    for name, flag in (("peak_claims", args.claims), ("query_summary", args.summary)):
+    for name, flag in (("point_claims", args.claims), ("query_summary", args.summary)):
         if flag:
             result.write(name, args.output_dir / f"{name}.parquet", metadata=stamp)
             tables.append(f"{name}.parquet")

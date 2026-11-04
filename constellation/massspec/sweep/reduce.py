@@ -19,7 +19,7 @@ import pyarrow as pa
 
 from constellation.massspec.sweep.evidence import Decision, Evidence
 from constellation.massspec.sweep.queries import QueryPlan
-from constellation.massspec.sweep.schedule import cell_eligible, isolation_groups, ragged_arange
+from constellation.massspec.sweep.schedule import isolation_groups, pair_eligible, ragged_arange
 from constellation.massspec.sweep.schemas import (
     SWEEP_MATCH_TABLE,
     SWEEP_QUERY_SUMMARY_TABLE,
@@ -34,14 +34,14 @@ __all__ = ["Ledger", "Matches", "QueryBatch", "Reducer", "QuerySummaryReducer"]
 
 @dataclass(frozen=True)
 class Ledger:
-    """The scans the sweep read, in stored order, peakless ones included."""
+    """The scans the sweep read, in stored order, those without points included."""
 
     scan: np.ndarray  # int64
     level: np.ndarray  # int8
     rt: np.ndarray  # float64
     lower: np.ndarray  # float64, NaN without bounds
     upper: np.ndarray
-    n_peaks: np.ndarray  # int64
+    n_points: np.ndarray  # int64
 
     @property
     def n(self) -> int:
@@ -67,29 +67,30 @@ class Ledger:
                 "rt": pa.array(self.rt),
                 "isolation_lower": pa.array(self.lower, mask=np.isnan(self.lower)),
                 "isolation_upper": pa.array(self.upper, mask=np.isnan(self.upper)),
-                "n_peaks": pa.array(self.n_peaks.astype(np.int32)),
+                "n_points": pa.array(self.n_points.astype(np.int32)),
             },
             schema=SWEEP_SCAN_TABLE,
         )
 
 
-_MATCH_FIELDS = ("query", "level", "scan", "ion", "peak_index", "mz", "intensity", "n_peaks")
+_MATCH_FIELDS = ("query", "level", "scan", "channel", "point_index", "mz", "intensity", "n_points")
 
 
 @dataclass(frozen=True)
 class Matches:
-    """Matched (query ion, scan) cells. ``ion`` is the ion's position among
-    its query's ions of the level's kind; ``peak_index`` the peak's position
-    in its scan's stored order, -1 when a rule aggregated several."""
+    """Matched cells, one row per (cell, point). ``channel`` is the channel's
+    position among its query's channels of the level's kind; ``point_index``
+    the point's position in its scan's stored order, -1 when a rule
+    aggregated several."""
 
     query: np.ndarray  # int64
     level: np.ndarray  # int8
     scan: np.ndarray  # int64
-    ion: np.ndarray  # int64
-    peak_index: np.ndarray  # int64
+    channel: np.ndarray  # int64
+    point_index: np.ndarray  # int64
     mz: np.ndarray  # float64
     intensity: np.ndarray  # float64
-    n_peaks: np.ndarray  # int64
+    n_points: np.ndarray  # int64
 
     @property
     def n(self) -> int:
@@ -113,9 +114,9 @@ class Matches:
         return Matches(*(getattr(self, f)[idx] for f in _MATCH_FIELDS))
 
     def sorted(self, scan_order: np.ndarray) -> Matches:
-        """Sorted by (query, level, scan order, ion, peak); ``scan_order`` is
-        each match's scan's rank."""
-        by = np.lexsort((self.peak_index, self.ion, scan_order, self.level, self.query))
+        """Sorted by (query, level, scan order, channel, point); ``scan_order``
+        is each match's scan's rank."""
+        by = np.lexsort((self.point_index, self.channel, scan_order, self.level, self.query))
         return self.take(by)
 
     def table(self) -> pa.Table:
@@ -124,11 +125,11 @@ class Matches:
                 "query": pa.array(self.query.astype(np.int32)),
                 "level": pa.array(self.level.astype(np.int8)),
                 "scan": pa.array(self.scan.astype(np.int32)),
-                "ion": pa.array(self.ion.astype(np.int32)),
-                "peak_index": pa.array(self.peak_index.astype(np.int32), mask=self.peak_index < 0),
+                "channel": pa.array(self.channel.astype(np.int32)),
+                "point_index": pa.array(self.point_index.astype(np.int32), mask=self.point_index < 0),
                 "mz_observed": pa.array(self.mz),
                 "intensity": pa.array(self.intensity),
-                "n_peaks": pa.array(self.n_peaks.astype(np.int32)),
+                "n_points": pa.array(self.n_points.astype(np.int32)),
             },
             schema=SWEEP_MATCH_TABLE,
         )
@@ -145,18 +146,18 @@ class Matches:
             query=col("query", np.int64),
             level=col("level", np.int8),
             scan=col("scan", np.int64),
-            ion=col("ion", np.int64),
-            peak_index=col("peak_index", np.int64, -1),
+            channel=col("channel", np.int64),
+            point_index=col("point_index", np.int64, -1),
             mz=col("mz_observed", np.float64),
             intensity=col("intensity", np.float64),
-            n_peaks=col("n_peaks", np.int64),
+            n_points=col("n_points", np.int64),
         )
 
 
 @dataclass(frozen=True)
 class QueryBatch:
     """A contiguous range of queries and everything the sweep matched for
-    them, sorted by (query, level, scan order, ion, peak)."""
+    them, sorted by (query, level, scan order, channel, point)."""
 
     plan: QueryPlan
     queries: np.ndarray  # the batch's queries, ascending
@@ -166,7 +167,7 @@ class QueryBatch:
     settings: SweepSettings
     #: Evidence counts of these queries, sorted by (query, scan); with a gate.
     evidence: Evidence | None = None
-    #: Per query, its matches whose peak another query claimed; with claims.
+    #: Per query, its matches whose point another query claimed; with claims.
     shared: np.ndarray | None = None
     #: The gate's verdict per query; with a gate.
     decision: Decision | None = None
@@ -196,16 +197,17 @@ class QueryBatch:
         return self.scans.rows_of(self.matches.scan)
 
     def eligible(self, level: int) -> tuple[np.ndarray, np.ndarray]:
-        """(query, ledger row) of every cell the sweep matched for this
-        batch at ``level``, whether or not anything was found: scans of the
-        level with peaks, inside the query's interval and isolation window,
-        and its assigned scan for fragments. Sorted by (query, scan order)."""
-        ions = self.plan.ions_for_level(level)
-        if ions is None:
+        """(query, ledger row) of every (scan, query) pair the sweep matched
+        for this batch at ``level``, whether or not anything was found: scans
+        of the level with points, inside the query's interval and isolation
+        window, and its assigned scan for fragments. Sorted by (query, scan
+        order). Each pair stands for the query's cells in that scan."""
+        channels = self.plan.channels_for_level(level)
+        if channels is None:
             return np.empty(0, np.int64), np.empty(0, np.int64)
         s = self.scans
-        rows = np.flatnonzero((s.level == level) & (s.n_peaks > 0))
-        queries = self.queries[ions.counts()[self.queries] > 0]
+        rows = np.flatnonzero((s.level == level) & (s.n_points > 0))
+        queries = self.queries[channels.counts()[self.queries] > 0]
         groups = isolation_groups(
             queries, self.plan.precursor_mz, s.lower[rows], s.upper[rows], rows, gate=level > 1
         )
@@ -213,7 +215,7 @@ class QueryBatch:
         for g in groups:
             q = np.tile(g.queries, g.rows.size)
             r = np.repeat(g.rows, g.queries.size)
-            ok = cell_eligible(
+            ok = pair_eligible(
                 q, s.rt[r], s.scan[r], self.plan.rt_lo, self.plan.rt_hi,
                 self.plan.assigned_scan if level > 1 else None,
             )  # fmt: skip
@@ -227,13 +229,13 @@ class QueryBatch:
         return q[by], r[by]
 
     def eligible_cells(self, level: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """(query, ledger row, ion) of every eligible cell, in output order:
-        query, scan order, ion."""
+        """(query, ledger row, channel) of every eligible cell, in output
+        order: query, scan order, channel."""
         q, r = self.eligible(level)
-        ions = self.plan.ions_for_level(level)
-        n = ions.counts()[q]
-        ion = ragged_arange(np.zeros(q.size, np.int64), n)
-        return np.repeat(q, n), np.repeat(r, n), ion
+        channels = self.plan.channels_for_level(level)
+        n = channels.counts()[q]
+        channel = ragged_arange(np.zeros(q.size, np.int64), n)
+        return np.repeat(q, n), np.repeat(r, n), channel
 
 
 class Reducer(Protocol):
@@ -250,8 +252,8 @@ class Reducer(Protocol):
 @dataclass(frozen=True)
 class QuerySummaryReducer:
     """One row per query: the gate's verdict, the scans each level could
-    have matched it in, the ion cells it matched, and how many of its
-    matches another query claimed too."""
+    have matched it in, the cells it matched, and how many of its matches
+    another query claimed too."""
 
     name: str = "query_summary"
     schema: pa.Schema = SWEEP_QUERY_SUMMARY_TABLE

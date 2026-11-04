@@ -2,7 +2,7 @@
 
 The map counts, for every scan and query, how many of the query's
 fragment bonds (an ion type and position, whatever its charge or loss)
-have an ion within tolerance of one of the scan's evidence peaks, its
+have a channel within tolerance of one of the scan's evidence peaks, its
 ``top_peaks`` most intense (or all of them), never counting more bonds
 than the distinct peaks that matched them. A scan with at least
 ``min_fragments`` such bonds is evidence. The reduce then decides, over
@@ -14,9 +14,14 @@ otherwise.
 
 A bare count is a weak filter on low-resolution fragments: at 0.35 Da a
 scan of about a thousand peaks puts a peak within tolerance of a given
-m/z nearly half the time, so two of twenty theoretical ions match by
+m/z nearly half the time, so two of twenty fragment channels match by
 chance in most scans. That is what ``top_peaks`` and ``min_consecutive``
 are for; how they should be set is measured, not assumed.
+
+The gate is defined on peaks, centroids, which is why it says peaks where
+the rest of the sweep says points: its evidence is a scan's most intense
+peaks. On profile points it would take the tops of a few profile peaks
+instead, which is a question for the profile rule, not settled here.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from constellation.massspec.sweep.kernel import match_group
-from constellation.massspec.sweep.queries import Ions
+from constellation.massspec.sweep.queries import Channels
 from constellation.massspec.sweep.rules import AllWithin
 from constellation.massspec.sweep.schedule import ragged_arange
 
@@ -66,7 +71,7 @@ class Evidence:
     scan: np.ndarray  # int64
     n_keys: np.ndarray  # int64
     n_peaks: np.ndarray  # int64
-    n_ions: np.ndarray  # int64
+    n_channels: np.ndarray  # int64
     #: Summed intensity of the distinct evidence peaks matched.
     intensity: np.ndarray  # float64
 
@@ -94,7 +99,7 @@ class Evidence:
         return Evidence(*(getattr(self, f)[idx] for f in _FIELDS))
 
 
-_FIELDS = ("query", "group", "scan", "n_keys", "n_peaks", "n_ions", "intensity")
+_FIELDS = ("query", "group", "scan", "n_keys", "n_peaks", "n_channels", "intensity")
 
 
 def _evidence_peaks(offsets: np.ndarray, rows: np.ndarray, intensity: np.ndarray, top: int | None):
@@ -121,9 +126,9 @@ def count_evidence(
     offsets: np.ndarray,
     rows: np.ndarray,
     scan_id: np.ndarray,
-    ions: Ions,
-    ion_at: np.ndarray,
-    ion_query: np.ndarray,
+    channels: Channels,
+    channel_at: np.ndarray,
+    channel_query: np.ndarray,
     eligible,
     tolerance: float,
     unit: str,
@@ -132,45 +137,47 @@ def count_evidence(
     by_charge: bool,
 ) -> Evidence:
     """Evidence of one group of scans: its rows of the block, against the
-    ions ``ion_at`` (of queries ``ion_query``). ``eligible(query, rows)``
-    says which (scan, query) cells may count. ``by_charge`` counts isotopes
-    separately for each precursor charge."""
-    points, sub_offsets = _evidence_peaks(offsets, rows, intensity, top_peaks)
-    if points.size == 0:
+    channels ``channel_at`` (of queries ``channel_query``).
+    ``eligible(query, rows)`` says which (scan, query) pairs may count.
+    ``by_charge`` counts isotopes separately for each precursor charge."""
+    picked, sub_offsets = _evidence_peaks(offsets, rows, intensity, top_peaks)
+    if picked.size == 0:
         return Evidence.empty()
     sub_rows = np.arange(rows.size, dtype=np.int64)
-    m = match_group(mz[points], intensity[points], sub_offsets, sub_rows, ions.mz[ion_at],
+    m = match_group(mz[picked], intensity[picked], sub_offsets, sub_rows, channels.mz[channel_at],
                     AllWithin(), tolerance, unit)  # fmt: skip
     if m.n == 0:
         return Evidence.empty()
     row = rows[m.row]
-    query = ion_query[m.ion]
+    query = channel_query[m.channel]
     ok = eligible(query, row)
     if not ok.any():
         return Evidence.empty()
-    row, query, ion, peak = row[ok], query[ok], ion_at[m.ion][ok], m.peak[ok]
+    row, query, channel, peak = row[ok], query[ok], channel_at[m.channel][ok], m.point[ok]
     peak_intensity = m.intensity[ok]
-    key = ions.evidence_key[ion].astype(np.int64)
-    group = ions.precursor_charge[ion].astype(np.int64) if by_charge else np.zeros(row.size, np.int64)
-    # Cells and (cell, value) pairs as single integers: one-dimensional
-    # uniques are far quicker than row-wise ones.
+    key = channels.evidence_key[channel].astype(np.int64)
+    group = (
+        channels.precursor_charge[channel].astype(np.int64) if by_charge else np.zeros(row.size, np.int64)
+    )
+    # (query, group, scan) entries and (entry, value) pairs as single
+    # integers: one-dimensional uniques are far quicker than row-wise ones.
     n_rows = int(rows.max()) + 1
-    cell = (query * 16 + group) * n_rows + row
-    cells, inverse = np.unique(cell, return_inverse=True)
+    entry = (query * 16 + group) * n_rows + row
+    entries, inverse = np.unique(entry, return_inverse=True)
 
     def distinct(values: np.ndarray, weights: np.ndarray | None = None) -> np.ndarray:
         width = int(values.max()) + 1
         _, first = np.unique(inverse.astype(np.int64) * width + values, return_index=True)
         w = None if weights is None else weights[first]
-        return np.bincount(inverse[first], weights=w, minlength=cells.size)
+        return np.bincount(inverse[first], weights=w, minlength=entries.size)
 
     return Evidence(
-        query=cells // (16 * n_rows),
-        group=((cells // n_rows) % 16).astype(np.int8),
-        scan=scan_id[cells % n_rows],
+        query=entries // (16 * n_rows),
+        group=((entries // n_rows) % 16).astype(np.int8),
+        scan=scan_id[entries % n_rows],
         n_keys=distinct(key).astype(np.int64),
         n_peaks=distinct(peak).astype(np.int64),
-        n_ions=distinct(ion).astype(np.int64),
+        n_channels=distinct(channel).astype(np.int64),
         intensity=distinct(peak, peak_intensity),
     )
 
@@ -197,8 +204,8 @@ def decide(
     evidence: Evidence,
     ledger,
 ) -> Decision:
-    """Apply ``gate`` to ``queries``. ``eligible_*()`` give (query, ledger
-    row) of the cells each query could be matched in at that kind's level,
+    """Apply ``gate`` to ``queries``. ``eligible_*()`` give the (query,
+    ledger row) pairs each query could be matched in at that kind's level,
     in scan order; ``evidence`` holds the map's counts for these queries."""
     n = queries.size
     applicable = has_fragments.copy()
@@ -247,13 +254,13 @@ def decide(
             signal[hit] = best_i[at[hit]]
         is_ev = count >= threshold
         p = np.searchsorted(queries, q)
-        # Runs of evidence scans in each query's sequence of cells.
+        # Runs of evidence scans in each query's sequence of eligible scans.
         rt = ledger.rt[r]
         new_query = np.r_[True, q[1:] != q[:-1]]
         step_ok = np.r_[False, ~new_query[1:]]
         if gate.max_gap_s is not None:
             step_ok &= np.r_[False, np.diff(rt) <= gate.max_gap_s]
-        # A run continues where this cell and the one before are evidence and
+        # A run continues where this scan and the one before are evidence and
         # the step between them is allowed; run lengths by counting.
         cont = is_ev & np.r_[False, is_ev[:-1]] & step_ok
         start = is_ev & ~cont

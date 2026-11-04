@@ -1,11 +1,12 @@
 """Which queries a scan is matched against.
 
 Per block of scans, the active queries are those whose retention-time
-interval overlaps the block and that have ions at the level. Within the
-block, scans are grouped by isolation window: every scan of a group is
-matched against one set of queries, the active ones whose precursor m/z
-the window covers, and each cell is then held to its own scan's
-retention time (and, for fragments, the assigned scan) after matching.
+interval overlaps the block and that have channels at the level. Within
+the block, scans are grouped by isolation window (a window group): every
+scan of a group is matched against one set of queries, the active ones
+whose precursor m/z the window covers, and each (scan, query) pair is then
+held to its own scan's retention time (and, for fragments, the assigned
+scan) after matching; a pair's verdict holds for each of its cells.
 
 The isolation test is the scan-major extractor's, inclusive at both ends
 on the scan's own float64 bounds: ``lower <= precursor_mz <= upper``,
@@ -13,7 +14,7 @@ computed as two ``searchsorted`` calls over the active queries sorted by
 precursor m/z. A scan without bounds is matched against every active
 query, and so is a query without a precursor m/z. Pure numpy, shared by
 the map (to match) and the reduce (to know which cells a match could have
-filled, for zero-filling).
+filled, for zero-filling). Terms as in ``docs/plans/sweep.md``.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ __all__ = [
     "active_queries",
     "ScanGroup",
     "isolation_groups",
-    "cell_eligible",
+    "pair_eligible",
 ]
 
 
@@ -44,16 +45,16 @@ def ragged_arange(starts: np.ndarray, counts: np.ndarray) -> np.ndarray:
 
 
 def active_queries(
-    rt_lo: np.ndarray, rt_hi: np.ndarray, has_ions: np.ndarray, t0: float, t1: float
+    rt_lo: np.ndarray, rt_hi: np.ndarray, has_channels: np.ndarray, t0: float, t1: float
 ) -> np.ndarray:
     """Queries whose inclusive interval overlaps ``[t0, t1]`` and that have
-    ions at the level, in query order."""
-    return np.flatnonzero((rt_lo <= t1) & (rt_hi >= t0) & has_ions)
+    channels at the level, in query order."""
+    return np.flatnonzero((rt_lo <= t1) & (rt_hi >= t0) & has_channels)
 
 
 @dataclass(frozen=True)
 class ScanGroup:
-    """Scans of a block matched against one set of queries."""
+    """A window group: scans of a block matched against one set of queries."""
 
     rows: np.ndarray  # the scans' rows in the block, in stored order
     queries: np.ndarray  # the queries, in query order
@@ -102,7 +103,7 @@ def isolation_groups(
     return groups
 
 
-def cell_eligible(
+def pair_eligible(
     query: np.ndarray,
     scan_rt: np.ndarray,
     scan_id: np.ndarray,
@@ -110,7 +111,7 @@ def cell_eligible(
     rt_hi: np.ndarray,
     assigned_scan: np.ndarray | None,
 ) -> np.ndarray:
-    """Whether each (scan, query) cell may be matched: the scan's retention
+    """Whether each (scan, query) pair may be matched: the scan's retention
     time inside the query's inclusive interval and, when ``assigned_scan``
     is given (fragments), the scan the query is assigned to if it has one."""
     ok = (rt_lo[query] <= scan_rt) & (scan_rt <= rt_hi[query])

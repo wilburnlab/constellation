@@ -1,8 +1,8 @@
 """Compiling extraction targets into a sweep's queries (`massspec.sweep.queries`).
 
-The ions must be the scan-major extractor's, value for value and in the
-same order, so they are checked against the frozen copy of its query
-builders in `tests/_xic_scan_major_oracle.py`.
+The channels must be the m/z values the scan-major extractor queried, value
+for value and in the same order, so they are checked against the frozen copy of its
+query builders in `tests/_xic_scan_major_oracle.py`.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from constellation.core.stats.units import ISOTOPE_MASS_DIFF
 from constellation.massspec.peptide.ions import IonType
 from constellation.massspec.peptide.mz import precursor_mz
 from constellation.massspec.quant.schemas import XIC_TARGET_TABLE
-from constellation.massspec.sweep import FRAGMENTS, ISOTOPES, IonSettings, QueryPlan, compile_queries
+from constellation.massspec.sweep import FRAGMENTS, ISOTOPES, ChannelSettings, QueryPlan, compile_queries
 
 _SEQS = ["PEPTIDEK", "LVNELTEFAK", "PEPTM[Oxidation]IDEK", "<13C><15N>ACDEFGHIK",
          "HLVDEPQNLIK", "PEPTIDEK"]  # fmt: skip
@@ -43,10 +43,10 @@ def _bits(x):
 
 
 def _isotope_rows(plan, q):
-    ions = plan.isotopes
-    a, b = ions.offsets[q], ions.offsets[q + 1]
-    return list(zip(_bits(ions.mz[a:b]).tolist(), ions.precursor_charge[a:b].tolist(),
-                    ions.isotope[a:b].tolist()))  # fmt: skip
+    iso = plan.isotopes
+    a, b = iso.offsets[q], iso.offsets[q + 1]
+    return list(zip(_bits(iso.mz[a:b]).tolist(), iso.precursor_charge[a:b].tolist(),
+                    iso.isotope[a:b].tolist()))  # fmt: skip
 
 
 @pytest.mark.parametrize("charge_range", [(1, 4), None, (2, 3)])
@@ -54,7 +54,7 @@ def _isotope_rows(plan, q):
 def test_isotopes_match_the_extractor(charge_range, n_isotopes):
     targets = _peptide_targets()
     plan = compile_queries(
-        targets, levels=[1], ions=IonSettings(n_isotopes=n_isotopes, charge_range=charge_range)
+        targets, levels=[1], channels=ChannelSettings(n_isotopes=n_isotopes, charge_range=charge_range)
     )
     for q, rec in enumerate(oracle._targets_to_records(targets)):
         want = oracle._ms1_queries(rec, n_isotopes=n_isotopes, charge_range=charge_range)
@@ -74,14 +74,14 @@ def test_bare_mz_isotopes_match_the_extractor(charge):
 @pytest.mark.parametrize(
     "settings",
     [
-        IonSettings(),
-        IonSettings(ion_types=(IonType.A, IonType.B, IonType.Y), max_fragment_charge=1),
-        IonSettings(max_fragment_charge=3, neutral_losses=("H2O", "NH3")),
+        ChannelSettings(),
+        ChannelSettings(ion_types=(IonType.A, IonType.B, IonType.Y), max_fragment_charge=1),
+        ChannelSettings(max_fragment_charge=3, neutral_losses=("H2O", "NH3")),
     ],
 )
 def test_fragments_match_the_extractor(settings):
     targets = _peptide_targets()
-    plan = compile_queries(targets, levels=[2], ions=settings)
+    plan = compile_queries(targets, levels=[2], channels=settings)
     want = oracle._ms2_queries_batch(
         oracle._targets_to_records(targets), ion_types=settings.ion_types,
         max_fragment_charge=settings.max_fragment_charge, neutral_losses=settings.neutral_losses,
@@ -101,7 +101,7 @@ def test_fragments_match_the_extractor(settings):
 
 
 def test_evidence_keys_count_bonds_not_charges():
-    plan = compile_queries(_peptide_targets(), levels=[2], ions=IonSettings(max_fragment_charge=2,
+    plan = compile_queries(_peptide_targets(), levels=[2], channels=ChannelSettings(max_fragment_charge=2,
                            neutral_losses=("H2O",)))  # fmt: skip
     f = plan.fragments
     for q in range(plan.n_queries):
@@ -121,7 +121,7 @@ def test_errors_are_the_extractors():
     with pytest.raises(ValueError, match="needs a charge"):
         compile_queries(
             _targets([dict(target_id=1, modified_sequence="PEPTIDEK")]), levels=[1],
-            ions=IonSettings(charge_range=None),
+            channels=ChannelSettings(charge_range=None),
         )  # fmt: skip
     with pytest.raises(ValueError, match="needs modified_sequence or precursor_mz"):
         compile_queries(_targets([dict(target_id=1)]), levels=[1])
@@ -190,7 +190,7 @@ def test_heavy_labels_shift_isotopes_and_fragments():
     light, heavy = "PEPTIDEK", "<13C><15N>PEPTIDEK"
     targets = _targets([dict(target_id=i, modified_sequence=s, precursor_charge=2)
                         for i, s in enumerate((light, heavy))])  # fmt: skip
-    plan = compile_queries(targets, levels=[1, 2], ions=IonSettings(charge_range=None))
+    plan = compile_queries(targets, levels=[1, 2], channels=ChannelSettings(charge_range=None))
     atoms = peptide_composition(parse_proforma(light)).atoms
     shift = atoms["C"] * (ELEMENTS["C"].isotope_mass(13) - ELEMENTS["C"].monoisotopic_mass) + atoms[
         "N"
@@ -206,7 +206,7 @@ def test_heavy_labels_shift_isotopes_and_fragments():
 def test_negative_isotope_offsets_for_labelled_peptides():
     targets = _targets([dict(target_id=1, modified_sequence="<13C><15N>PEPTIDEK", precursor_charge=2)])
     plan = compile_queries(
-        targets, levels=[1], ions=IonSettings(isotope_offsets=(-2, -1, 0, 1), charge_range=None)
+        targets, levels=[1], channels=ChannelSettings(isotope_offsets=(-2, -1, 0, 1), charge_range=None)
     )
     iso = plan.isotopes
     assert iso.isotope.tolist() == [-2, -1, 0, 1]
@@ -217,11 +217,11 @@ def test_negative_isotope_offsets_for_labelled_peptides():
 
 
 def test_plan_round_trips_through_its_tables():
-    settings = IonSettings(max_fragment_charge=3, neutral_losses=("H2O",))
+    settings = ChannelSettings(max_fragment_charge=3, neutral_losses=("H2O",))
     targets = _peptide_targets(rt_center=100.0, scan=7)
-    plan = compile_queries(targets, levels=[1, 2], ions=settings, rt_window=5.0, assigned_scans_only=True)
-    queries, ions = plan.to_tables()
-    back = QueryPlan.from_tables(queries, ions)
+    plan = compile_queries(targets, levels=[1, 2], channels=settings, rt_window=5.0, assigned_scans_only=True)
+    queries, channels = plan.to_tables()
+    back = QueryPlan.from_tables(queries, channels)
     assert back.levels == plan.levels
     for name in ("precursor_charge", "precursor_mz", "precursor_mz_derived", "rt_lo", "rt_hi",
                  "assigned_scan"):  # fmt: skip

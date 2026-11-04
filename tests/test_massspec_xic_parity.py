@@ -269,7 +269,7 @@ def test_cli_gate_claims_and_summary(tmp_root, tmp_path):
     assert rc == 0
     trace = pq.read_table(out / "xic_trace.parquet")
     summary = pq.read_table(out / "query_summary.parquet")
-    claims = pq.read_table(out / "peak_claims.parquet")
+    claims = pq.read_table(out / "point_claims.parquet")
     planted = set(run.targets["target_id"].to_pylist())
     assert set(trace["target_id"].to_pylist()) == planted
     passed = {t for t, p in zip(summary["target_id"].to_pylist(), summary["passed"].to_pylist()) if p}
@@ -277,7 +277,7 @@ def test_cli_gate_claims_and_summary(tmp_root, tmp_path):
     assert claims.num_rows > 0
     manifest = json.loads((out / "manifest.json").read_text())["metadata"]
     assert manifest["gate"]["min_fragments"] == 4 and manifest["gate"]["only_passing"]
-    assert manifest["tables"] == ["xic_trace.parquet", "peak_claims.parquet", "query_summary.parquet"]
+    assert manifest["tables"] == ["xic_trace.parquet", "point_claims.parquet", "query_summary.parquet"]
     assert _cli(["massspec", "chromatogram", "extract", "--peaks-dir", str(bundle), "--targets",
                  str(path), "-o", str(tmp_path / "y"), "--level", "2", "--only-passing",
                  "--no-progress"]) == 2  # fmt: skip

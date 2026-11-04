@@ -1,15 +1,16 @@
-"""What a sweep looks for: extraction targets compiled into queries and ions.
+"""What a sweep looks for: extraction targets compiled into queries and their channels.
 
 A query is one row of an :data:`~constellation.massspec.quant.schemas.XIC_TARGET_TABLE`
 as the sweep resolves it: its retention-time interval, the precursor m/z
 that decides which isolation windows it is matched in, and the scan its
-fragments are restricted to, if any. Its ions are the m/z values it is
-matched at: precursor isotopes in MS1 scans, fragments in MS2 and higher.
-Both are held as flat arrays in compressed-row form (query ``q``'s ions
-are rows ``offsets[q]:offsets[q + 1]``), in the order output lists them,
-so nothing exists per ion as a Python object.
+fragments are restricted to, if any. Its channels are the m/z values it
+expects signal at, each with what it is: precursor isotopes in MS1 scans,
+fragment ions in MS2 and higher. Both are held as flat arrays in
+compressed-row form (query ``q``'s channels are rows
+``offsets[q]:offsets[q + 1]``), in the order output lists them, so nothing
+exists per channel as a Python object.
 
-The ions are those the scan-major extractor always made, value for value:
+The channels are the m/z values the scan-major extractor always queried, value for value:
 isotopes from the binned :func:`~constellation.massspec.peptide.envelope.peptide_envelope`
 at each charge of ``charge_range`` (or the target's own charge), or spaced
 off a bare precursor m/z; fragments from the batched ladder, up to the
@@ -37,7 +38,7 @@ from constellation.massspec.peptide.envelope import envelope_mz, neutral_envelop
 from constellation.massspec.peptide.ions import IonType, fragment_ladder_arrays_batch
 from constellation.massspec.peptide.mz import precursor_mz as _precursor_mz
 from constellation.massspec.quant.schemas import XIC_TARGET_TABLE
-from constellation.massspec.sweep.schemas import SWEEP_ION_TABLE, SWEEP_QUERY_TABLE
+from constellation.massspec.sweep.schemas import SWEEP_CHANNEL_TABLE, SWEEP_QUERY_TABLE
 
 if TYPE_CHECKING:
     import torch
@@ -45,20 +46,21 @@ if TYPE_CHECKING:
 __all__ = [
     "ISOTOPES",
     "FRAGMENTS",
-    "IonSettings",
-    "Ions",
+    "ChannelSettings",
+    "Channels",
     "QueryPlan",
     "compile_queries",
 ]
 
-#: Ion kinds: precursor isotopes are matched in MS1 scans, fragments in the rest.
+#: Channel kinds: precursor isotopes are matched in MS1 scans, fragments in the rest.
 ISOTOPES = 1
 FRAGMENTS = 2
 
 
 @dataclass(frozen=True)
-class IonSettings:
-    """Which ions a query is matched at."""
+class ChannelSettings:
+    """Which channels a query is matched at: the isotopes and charges of its
+    precursor in MS1, the fragment ions in MS2."""
 
     n_isotopes: int = 3
     #: Isotope offsets to use instead of ``range(n_isotopes)``. Negative
@@ -78,8 +80,8 @@ class IonSettings:
 
 
 @dataclass(frozen=True)
-class Ions:
-    """One kind of ion for every query, in compressed-row form."""
+class Channels:
+    """One kind of channel for every query, in compressed-row form."""
 
     kind: int
     offsets: np.ndarray  # (n_queries + 1,) int64
@@ -102,18 +104,18 @@ class Ions:
         return np.diff(self.offsets)
 
     def query_of(self) -> np.ndarray:
-        """The query each ion belongs to."""
+        """The query each channel belongs to."""
         return np.repeat(np.arange(self.offsets.size - 1, dtype=np.int64), self.counts())
 
     def ordinal(self) -> np.ndarray:
-        """Each ion's position among its query's ions of this kind."""
+        """Each channel's position among its query's channels of this kind."""
         return np.arange(self.n, dtype=np.int64) - np.repeat(self.offsets[:-1], self.counts())
 
 
 @dataclass(frozen=True)
 class QueryPlan:
     """Compiled queries: per-query arrays (index = position in the input)
-    and their ions by kind, for the levels the sweep matches."""
+    and their channels by kind, for the levels the sweep matches."""
 
     targets: pa.Table  # the input, cast to XIC_TARGET_TABLE
     levels: tuple[int, ...]
@@ -123,19 +125,19 @@ class QueryPlan:
     rt_lo: np.ndarray  # float64
     rt_hi: np.ndarray  # float64
     assigned_scan: np.ndarray  # int64, -1 for none
-    isotopes: Ions | None
-    fragments: Ions | None
-    settings: IonSettings = field(default_factory=IonSettings)
+    isotopes: Channels | None
+    fragments: Channels | None
+    settings: ChannelSettings = field(default_factory=ChannelSettings)
 
     @property
     def n_queries(self) -> int:
         return int(self.rt_lo.size)
 
-    def ions_for_level(self, level: int) -> Ions | None:
+    def channels_for_level(self, level: int) -> Channels | None:
         return self.isotopes if level == 1 else self.fragments
 
     def to_tables(self) -> tuple[pa.Table, pa.Table]:
-        """The plan as :data:`SWEEP_QUERY_TABLE` and :data:`SWEEP_ION_TABLE`."""
+        """The plan as :data:`SWEEP_QUERY_TABLE` and :data:`SWEEP_CHANNEL_TABLE`."""
         t = self.targets
         charge = self.precursor_charge
         queries = pa.table(
@@ -156,21 +158,21 @@ class QueryPlan:
             },
             schema=SWEEP_QUERY_TABLE,
         )
-        tables = [_ions_table(i) for i in (self.isotopes, self.fragments) if i is not None]
-        ions = (
-            pa.concat_tables(tables) if tables else SWEEP_ION_TABLE.empty_table()
+        tables = [_channel_table(c) for c in (self.isotopes, self.fragments) if c is not None]
+        channels = (
+            pa.concat_tables(tables) if tables else SWEEP_CHANNEL_TABLE.empty_table()
         )  # two small in-memory tables of one plan, not a stage hand-off
-        meta = dict(ions.schema.metadata or {})
+        meta = dict(channels.schema.metadata or {})
         meta[b"x.massspec.sweep.levels"] = ",".join(map(str, self.levels)).encode()
         meta[b"x.massspec.sweep.loss_ids"] = ",".join(
             self.fragments.loss_ids if self.fragments is not None else ()
         ).encode()
-        return queries, ions.replace_schema_metadata(meta)
+        return queries, channels.replace_schema_metadata(meta)
 
     @classmethod
-    def from_tables(cls, queries: pa.Table, ions: pa.Table) -> QueryPlan:
+    def from_tables(cls, queries: pa.Table, channels: pa.Table) -> QueryPlan:
         """Rebuild a plan written by :meth:`to_tables`."""
-        meta = ions.schema.metadata or {}
+        meta = channels.schema.metadata or {}
         levels = tuple(int(x) for x in meta[b"x.massspec.sweep.levels"].decode().split(",") if x)
         loss_text = meta.get(b"x.massspec.sweep.loss_ids", b"").decode()
         loss_ids = tuple(x for x in loss_text.split(",") if x)
@@ -188,10 +190,10 @@ class QueryPlan:
             ),
             XIC_TARGET_TABLE,
         )
-        kinds = ions.column("kind").to_numpy()
+        kinds = channels.column("kind").to_numpy()
 
-        def of(kind: int, ids: tuple[str, ...]) -> Ions:
-            return _ions_from_table(kind, ions.filter(pa.array(kinds == kind)), n, ids)
+        def of(kind: int, ids: tuple[str, ...]) -> Channels:
+            return _channels_from_table(kind, channels.filter(pa.array(kinds == kind)), n, ids)
 
         return cls(
             targets=targets,
@@ -207,31 +209,31 @@ class QueryPlan:
         )
 
 
-def _ions_table(ions: Ions) -> pa.Table:
-    frag = ions.kind == FRAGMENTS
-    n = ions.n
+def _channel_table(c: Channels) -> pa.Table:
+    frag = c.kind == FRAGMENTS
+    n = c.n
     none = np.ones(n, dtype=bool)
-    loss_names = np.array([None, *ions.loss_ids], dtype=object)
+    loss_names = np.array([None, *c.loss_ids], dtype=object)
     return pa.table(
         {
-            "kind": pa.array(np.full(n, ions.kind, np.int8)),
-            "query": pa.array(ions.query_of().astype(np.int32)),
-            "ion": pa.array(ions.ordinal().astype(np.int32)),
-            "mz_theoretical": pa.array(ions.mz),
-            "precursor_charge": pa.array(ions.precursor_charge),
-            "isotope": pa.array(ions.isotope, mask=none if frag else None),
-            "ion_type": pa.array(ions.ion_type, mask=None if frag else none),
-            "position": pa.array(ions.position, mask=None if frag else none),
-            "fragment_charge": pa.array(ions.fragment_charge, mask=None if frag else none),
-            "loss_id": pa.array(loss_names[ions.loss] if frag else [None] * n, pa.string()),
-            "abundance": pa.array(ions.abundance, mask=np.isnan(ions.abundance)),
-            "evidence_key": pa.array(ions.evidence_key),
+            "kind": pa.array(np.full(n, c.kind, np.int8)),
+            "query": pa.array(c.query_of().astype(np.int32)),
+            "channel": pa.array(c.ordinal().astype(np.int32)),
+            "mz_theoretical": pa.array(c.mz),
+            "precursor_charge": pa.array(c.precursor_charge),
+            "isotope": pa.array(c.isotope, mask=none if frag else None),
+            "ion_type": pa.array(c.ion_type, mask=None if frag else none),
+            "position": pa.array(c.position, mask=None if frag else none),
+            "fragment_charge": pa.array(c.fragment_charge, mask=None if frag else none),
+            "loss_id": pa.array(loss_names[c.loss] if frag else [None] * n, pa.string()),
+            "abundance": pa.array(c.abundance, mask=np.isnan(c.abundance)),
+            "evidence_key": pa.array(c.evidence_key),
         },
-        schema=SWEEP_ION_TABLE,
+        schema=SWEEP_CHANNEL_TABLE,
     )
 
 
-def _ions_from_table(kind: int, rows: pa.Table, n_queries: int, loss_ids: tuple[str, ...]) -> Ions:
+def _channels_from_table(kind: int, rows: pa.Table, n_queries: int, loss_ids: tuple[str, ...]) -> Channels:
     def col(name, dtype, fill):
         return rows.column(name).fill_null(fill).to_numpy().astype(dtype)
 
@@ -240,7 +242,7 @@ def _ions_from_table(kind: int, rows: pa.Table, n_queries: int, loss_ids: tuple[
     np.cumsum(np.bincount(query, minlength=n_queries), out=offsets[1:])
     names = rows.column("loss_id").to_pylist()
     lookup = {name: k + 1 for k, name in enumerate(loss_ids)}
-    return Ions(
+    return Channels(
         kind=kind,
         offsets=offsets,
         mz=rows.column("mz_theoretical").to_numpy(),
@@ -299,7 +301,7 @@ def compile_queries(
     targets: pa.Table,
     *,
     levels: Sequence[int],
-    ions: IonSettings = IonSettings(),
+    channels: ChannelSettings = ChannelSettings(),
     rt_window: float | None = None,
     assigned_scans_only: bool = False,
     derive_precursor_mz: bool = True,
@@ -307,7 +309,8 @@ def compile_queries(
     """Compile extraction targets into a sweep's queries.
 
     ``levels`` are the MS levels to match at: 1 for precursor isotopes,
-    2 (or higher) for fragments. A target that can define no ions of a
+    2 (or higher) for fragments; ``channels`` says which isotopes and
+    fragment ions they are. A target that can define no channels of a
     level asked for is an error when it would then be matched at nothing,
     as the scan-major extractor's were (a bare m/z at MS2 alone, a sequence
     with no charge); otherwise it simply has none of that kind.
@@ -369,9 +372,9 @@ def compile_queries(
         dtype=np.int64,
     )
 
-    isotopes = _isotopes(d, n, ions, pf) if want_ms1 else None
+    isotopes = _isotopes(d, n, channels, pf) if want_ms1 else None
     fragments = (
-        _fragments(d, n, frag_targets, precursor_charge, ions, pf) if want_frag else None
+        _fragments(d, n, frag_targets, precursor_charge, channels, pf) if want_frag else None
     )
     return QueryPlan(
         targets=t,
@@ -384,11 +387,11 @@ def compile_queries(
         assigned_scan=assigned,
         isotopes=isotopes,
         fragments=fragments,
-        settings=ions,
+        settings=channels,
     )
 
 
-def _isotopes(d: dict, n: int, settings: IonSettings, pf) -> Ions:
+def _isotopes(d: dict, n: int, settings: ChannelSettings, pf) -> Channels:
     offsets_k = settings.offsets()
     n_peaks = max(max(offsets_k) + 1, 1)
     neutral: dict[str, tuple[torch.Tensor, np.ndarray]] = {}
@@ -454,7 +457,7 @@ def _isotopes(d: dict, n: int, settings: IonSettings, pf) -> Ions:
         return np.concatenate(parts).astype(dtype) if parts else np.empty(0, dtype)
 
     isotope = cat(k_l, np.int8)
-    return Ions(
+    return Channels(
         kind=ISOTOPES,
         offsets=offsets,
         mz=cat(mz_l, np.float64),
@@ -474,9 +477,9 @@ def _fragments(
     n: int,
     frag_targets: list[int],
     precursor_charge: np.ndarray,
-    settings: IonSettings,
+    settings: ChannelSettings,
     pf,
-) -> Ions:
+) -> Channels:
     # One ladder per distinct sequence; targets sharing a sequence share it.
     seqs = list(dict.fromkeys(d["modified_sequence"][i] for i in frag_targets))
     ladder = fragment_ladder_arrays_batch(
@@ -507,7 +510,7 @@ def _fragments(
     distinct, key = np.unique(bond, return_inverse=True)
     first = np.searchsorted(distinct, np.arange(n, dtype=np.int64) << 24)
     evidence = (key - first[query]).astype(np.int32)
-    return Ions(
+    return Channels(
         kind=FRAGMENTS,
         offsets=offsets,
         mz=ladder.mz[take],

@@ -47,14 +47,14 @@ def _with_decoys(run) -> pa.Table:
 def test_a_bond_seen_at_two_charges_counts_once():
     from constellation.core.sequence.proforma import parse_proforma
     from constellation.massspec.peptide.mz import precursor_mz
-    from constellation.massspec.sweep import IonSettings
+    from constellation.massspec.sweep import ChannelSettings
 
     targets = pa.Table.from_pylist(
         [dict(target_id=1, modified_sequence="PEPTIDEK", precursor_charge=3,
               precursor_mz=precursor_mz(parse_proforma("PEPTIDEK"), charge=3))],
         schema=XIC_TARGET_TABLE,
     )  # fmt: skip
-    plan = compile_queries(targets, levels=[2], ions=IonSettings(max_fragment_charge=2))
+    plan = compile_queries(targets, levels=[2], channels=ChannelSettings(max_fragment_charge=2))
     f = plan.fragments
     # One scan holding y5 at charges 1 and 2, and b3 at charge 1.
     want = [(int(t), int(p), int(c)) for t, p, c in zip(f.ion_type, f.position, f.fragment_charge)]
@@ -66,8 +66,8 @@ def test_a_bond_seen_at_two_charges_counts_once():
         by_charge=False,
     )  # fmt: skip
     assert ev.n == 1
-    assert ev.n_ions.tolist() == [len(pick)]
-    assert ev.count().tolist() == [2]  # two bonds, though three ions matched
+    assert ev.n_channels.tolist() == [len(pick)]
+    assert ev.count().tolist() == [2]  # two bonds, though three channels matched
 
 
 @pytest.mark.parametrize("rule", [Nearest(), SumWithin()])
@@ -128,7 +128,7 @@ def test_claims_record_near_neighbours_and_duplicates(tmp_root):
     claims = result.table(CLAIMS)
     assert claims.num_rows > 0
     by_peak = {}
-    for scan, peak, tid in zip(claims["scan"].to_pylist(), claims["peak_index"].to_pylist(),
+    for scan, peak, tid in zip(claims["scan"].to_pylist(), claims["point_index"].to_pylist(),
                                claims["target_id"].to_pylist()):  # fmt: skip
         by_peak.setdefault((scan, peak), set()).add(tid)
     # Every peak the duplicate matched is claimed by both copies.
