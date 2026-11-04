@@ -462,6 +462,11 @@ class XicTraceReducer:
     #: Only the queries the sweep's evidence gate passed.
     gated: bool = False
 
+    @property
+    def zero_fills(self) -> bool:
+        """A row for every eligible cell (the sweep sizes buckets by them)."""
+        return not self.drop_unmatched
+
     def reduce(self, batch: "QueryBatch") -> pa.Table:
         plan, s, m = batch.plan, batch.scans, batch.matches
         rows = batch.match_rows()
@@ -609,7 +614,9 @@ def extract_xic(
     the trace. ``claims`` adds the ``point_claims`` output (points matched
     by more than one target, or by two channels of one) and ``summary`` the
     ``query_summary`` output (per target: the gate's verdict, scans
-    eligible, cells matched)."""
+    eligible, cells matched). Every output carries ``tolerances`` in its
+    schema metadata (:func:`extraction_tolerance_metadata`), in memory and
+    when written."""
     from constellation.massspec.sweep import ChannelSettings, compile_queries
     from constellation.massspec.sweep.engine import SweepSettings, sweep
     from constellation.massspec.sweep.reduce import QuerySummaryReducer
@@ -640,8 +647,14 @@ def extract_xic(
     reducers = [XicTraceReducer(drop_unmatched=drop_unmatched, gated=only_passing)]
     if summary:
         reducers.append(QuerySummaryReducer())
-    return sweep(peaks, plan, settings, reducers=reducers, workers=workers, work_dir=work_dir,
-                 progress=progress)  # fmt: skip
+    result = sweep(peaks, plan, settings, reducers=reducers, workers=workers, work_dir=work_dir,
+                   progress=progress)  # fmt: skip
+    # The tolerances go with every output, read or written: Counter bounds
+    # its collision grouping by the trace's.
+    stamp = extraction_tolerance_metadata(dict(tolerances))
+    for name in result.schemas:
+        result.metadata[name] = dict(stamp)
+    return result
 
 
 def extract_xic_scan_major(
@@ -697,10 +710,7 @@ def extract_xic_scan_major(
         mz_axis=mz_axis,
         workers=workers,
     )
-    return _finalize(
-        _stamp_extraction_tolerance(result.table("xic_trace"), tolerance, tolerance_unit),
-        output_path,
-    )
+    return _finalize(result.table("xic_trace"), output_path)
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -176,3 +176,74 @@ def test_queries_without_fragments_can_be_gated_on_isotopes(tmp_root):
         s = sweep(bundle, plan, SweepSettings(tolerances=_TOL, gate=gate),
                   reducers=[QuerySummaryReducer()]).table("query_summary")  # fmt: skip
         assert s["passed"].to_pylist() == want
+
+
+def _ms1_table(scans: list[np.ndarray]) -> pa.Table:
+    """MS1 scans (one second apart) holding the given points, intensity 1000."""
+    rows = [(i + 1, 10.0 + i, float(m)) for i, mz in enumerate(scans) for m in np.sort(mz)]
+    return pa.table({
+        "scan": pa.array([r[0] for r in rows], pa.int32()), "level": pa.array([1] * len(rows), pa.int8()),
+        "rt": pa.array([r[1] for r in rows]), "mz": pa.array([r[2] for r in rows]),
+        "intensity": pa.array([1000.0] * len(rows)),
+    })  # fmt: skip
+
+
+def _isotope_gate_summary(targets, channels, scans_of, gate, **settings) -> list[dict]:
+    plan = compile_queries(pa.Table.from_pylist(targets, schema=XIC_TARGET_TABLE), levels=[1],
+                           channels=channels)  # fmt: skip
+    points = _ms1_table(scans_of(plan))
+    s = SweepSettings(tolerances={1: (20.0, "ppm")}, gate=gate, **settings)
+    return sweep(points, plan, s, reducers=[QuerySummaryReducer()]).table("query_summary").to_pylist()
+
+
+def test_negative_isotope_keys_count_the_same_in_any_block():
+    """Isotope offsets below zero are evidence keys below zero; packed with
+    a stride of max + 1 they collided between scans of one block, so the
+    same scans passed one at a time and failed together."""
+    from constellation.massspec.sweep import ChannelSettings
+
+    def scans_of(plan):
+        return [plan.isotopes.mz.copy() for _ in range(3)]  # every isotope, three scans
+
+    targets = [dict(target_id=1, precursor_mz=650.0, precursor_charge=2)]
+    channels = ChannelSettings(isotope_offsets=(-2, -1, 0, 1), charge_range=None)
+    gate = EvidenceGate(min_isotopes=4, min_consecutive=3, top_peaks=None)
+    together = _isotope_gate_summary(targets, channels, scans_of, gate)
+    apart = _isotope_gate_summary(targets, channels, scans_of, gate, block_rows=1)
+    assert together == apart
+    assert together[0]["passed"] and together[0]["best_n_keys"] == 4
+
+
+def test_evidence_at_a_high_charge_stays_with_its_query():
+    """Entries were packed as query * 16 + charge, so evidence at charge 17
+    went to the next query: the target seen failed and the one after it,
+    with nothing matched, passed."""
+    from constellation.massspec.sweep import ChannelSettings
+
+    def scans_of(plan):
+        iso = plan.isotopes
+        return [iso.mz[iso.offsets[0]:iso.offsets[1]].copy() for _ in range(3)]  # the first target's
+
+    targets = [dict(target_id=1, precursor_mz=900.0, precursor_charge=17),
+               dict(target_id=2, precursor_mz=1500.0, precursor_charge=1)]  # fmt: skip
+    gate = EvidenceGate(min_isotopes=3, min_consecutive=3, top_peaks=None)
+    summary = _isotope_gate_summary(targets, ChannelSettings(n_isotopes=3, charge_range=None), scans_of,
+                                    gate)  # fmt: skip
+    assert [r["passed"] for r in summary] == [True, False]
+    assert [r["n_matched_ms1"] for r in summary] == [9, 0]
+
+
+@pytest.mark.parametrize("rule,matched", [(Nearest(), 1), (AllWithin(), 3), (SumWithin(), 1)])
+def test_shared_matches_are_counted_as_matches(rule, matched):
+    """Two identical targets on three points: each target's matches are all
+    shared, whether a match is one point (nearest, all) or a sum of three."""
+    from constellation.massspec.sweep import ChannelSettings
+
+    targets = pa.Table.from_pylist([dict(target_id=t, precursor_mz=500.0, precursor_charge=2) for t in (1, 2)],
+                                   schema=XIC_TARGET_TABLE)  # fmt: skip
+    plan = compile_queries(targets, levels=[1], channels=ChannelSettings(n_isotopes=1, charge_range=None))
+    points = _ms1_table([np.array([500.0 - 1e-4, 500.0, 500.0 + 1e-4])])
+    s = SweepSettings(tolerances={1: (20.0, "ppm")}, rule=rule, claims=True)
+    summary = sweep(points, plan, s, reducers=[QuerySummaryReducer()]).table("query_summary")
+    assert summary["n_matched_ms1"].to_pylist() == [matched, matched]
+    assert summary["n_shared_matches"].to_pylist() == [matched, matched]

@@ -137,7 +137,27 @@ the gate, claims, a summary and workers. `extract_xic_scan_major` (Mode A) is on
   verdict in the reduce. Gated reducers see only passing queries, with their whole traces.
 - **Per-level tolerances** go in the trace's schema metadata as `x.massspec.extraction_tolerance.ms<L>`
   when a trace spans levels. The unqualified key appears when one tolerance was used, so single-level
-  output is unchanged, and Counter reads the MS1 key first.
+  output is unchanged, and Counter reads the MS1 key first. `extract_xic` stamps them on every output
+  itself (`SweepResult.metadata`), so a trace written from a notebook carries them as the CLI's does.
+- **The reduce builds only what is eligible, and its buckets are cut by what it builds.** Eligible
+  (scan, query) pairs come from per-query ranges over each window group's scans in time order, never
+  a queries × scans product filtered afterwards; the summary takes their counts without building
+  them, and the gate builds pairs only for queries with evidence (a query without any decides the same
+  on none). Buckets on disk weigh each query by its matches, plus its pairs when a gate walks them and
+  every eligible cell when a reducer zero-fills (`Reducer.zero_fills`), so unmatched queries no longer
+  pile into one bucket.
+- **Review of the branch (2026-11-04), nine defects fixed**, each with a test that fails without it:
+  the queries × scans product above (139,067 unmatched targets over 2,242 scans asked for 311M
+  entries); evidence keys packed with a `max + 1` stride, which collided once isotope offsets went
+  negative, so the same scans passed in separate blocks and failed in one; `query * 16 + charge`,
+  which gave a charge-17 query's evidence to the next query; `n_shared_matches` counting a `sum`
+  match once per point it summed; a sweep on disk of an acquisition with no points failing; the Python
+  API leaving the tolerances out of its outputs, so Counter clamped to 20 ppm instead of a trace's 8;
+  `--use-index` returning success while ignoring the gate, `--only-passing`, `--mz-axis`, `--claims`,
+  `--summary` and `--work-dir` (now refused); `--ms1-tolerance 0` read as 20 ppm through `or` (and
+  `--min-consecutive-scans 0` as 3; it is now refused, as is a negative tolerance); and
+  `bench-sweep.py gate` reporting a spilled sweep's grid bucket by bucket. The gate measurements below
+  are whole: every row of the grid they come from counts all 1,745 targets and 442 decoys.
 
 ## Measurements (2026-11-03, this machine: 12 cores, WSL2; inputs copied into scratch)
 

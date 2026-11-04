@@ -281,3 +281,41 @@ def test_cli_gate_claims_and_summary(tmp_root, tmp_path):
     assert _cli(["massspec", "chromatogram", "extract", "--peaks-dir", str(bundle), "--targets",
                  str(path), "-o", str(tmp_path / "y"), "--level", "2", "--only-passing",
                  "--no-progress"]) == 2  # fmt: skip
+
+
+@pytest.mark.parametrize("extra", [
+    ["--gate"], ["--min-fragments", "3"], ["--only-passing", "--gate"], ["--mz-axis", "nonexistent"],
+    ["--claims"], ["--summary"], ["--work-dir", "WORK"],
+])  # fmt: skip
+def test_cli_refuses_sweep_options_with_the_index(tmp_root, tmp_path, extra, capsys):
+    """The mass index applied none of these and said nothing; now it says no."""
+    run, bundle, _ = _run("dia", tmp_root)
+    path = tmp_path / "targets.parquet"
+    pq.write_table(run.targets, path)
+    extra = [str(tmp_path / "w") if a == "WORK" else a for a in extra]
+    rc = _cli(["massspec", "chromatogram", "extract", "--peaks-dir", str(bundle), "--targets",
+               str(path), "-o", str(tmp_path / "x"), "--level", "1", "--use-index",
+               "--index-dir", str(tmp_path / "index"), "--no-progress", *extra])  # fmt: skip
+    assert rc == 2
+    assert "belong to the sweep" in capsys.readouterr().err
+    assert not (tmp_path / "x").exists() and not (tmp_path / "index").exists()
+
+
+def test_cli_takes_a_zero_tolerance_as_given(tmp_root, tmp_path):
+    """`--ms1-tolerance 0` fell back to `--tolerance` (20 ppm) through `or`."""
+    run, bundle, peaks = _run("dia", tmp_root)
+    targets = _targets(run, level=1, name="dia")
+    path = tmp_path / "targets.parquet"
+    pq.write_table(targets, path)
+    common = ["massspec", "chromatogram", "extract", "--peaks-dir", str(bundle), "--targets", str(path),
+              "--level", "1", "--rt-window", "12", "--no-progress"]  # fmt: skip
+    assert _cli([*common, "-o", str(tmp_path / "x"), "--ms1-tolerance", "0"]) == 0
+    got = pq.read_table(tmp_path / "x" / "xic_trace.parquet")
+    assert got.schema.metadata[b"x.massspec.extraction_tolerance"] == b"0.0"
+    want = oracle.extract_xic_scan_major(peaks, targets, acquisition_id=0, level=1, tolerance=0.0,
+                                         rt_window=12.0)  # fmt: skip
+    oracle.assert_traces_identical(got, want)
+    wide = oracle.extract_xic_scan_major(peaks, targets, acquisition_id=0, level=1, rt_window=12.0)
+    assert wide.num_rows > want.num_rows
+    assert _cli([*common, "-o", str(tmp_path / "y"), "--ms1-tolerance", "-1"]) == 2
+    assert _cli([*common, "-o", str(tmp_path / "z"), "--gate", "--min-consecutive-scans", "0"]) == 2

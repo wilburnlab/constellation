@@ -244,3 +244,144 @@ def test_too_many_matches_for_memory_go_to_disk(tmp_root):
     del spilled
     gc.collect()
     assert not tmp.exists()
+
+
+# ── eligibility and the reduce's buckets ─────────────────────────────
+
+
+def _brute_pairs(plan, s, level, queries):
+    """Every (query, ledger row) pair by the definition, one at a time."""
+    channels = plan.channels_for_level(level)
+    out = []
+    for q in queries:
+        if channels.counts()[q] == 0:
+            continue
+        for r in range(s.n):
+            if s.level[r] != level or s.n_points[r] == 0:
+                continue
+            if not plan.rt_lo[q] <= s.rt[r] <= plan.rt_hi[q]:
+                continue
+            if level > 1:
+                lo, hi, p = s.lower[r], s.upper[r], plan.precursor_mz[q]
+                if not (np.isnan(lo) or np.isnan(hi) or np.isnan(p) or lo <= p <= hi):
+                    continue
+                a = plan.assigned_scan[q]
+                if a >= 0 and a != s.scan[r]:
+                    continue
+            out.append((int(q), int(r)))
+    order = s.order()
+    return sorted(out, key=lambda qr: (qr[0], order[qr[1]]))
+
+
+@pytest.mark.parametrize("name", ["staggered", "dda"])
+def test_eligible_pairs_are_the_definitions(tmp_root, name):
+    """The reduce's pairs, built from per-query ranges of scans in time
+    order rather than a queries × scans product filtered, are exactly the
+    pairs the definition gives, and their counts are their sizes."""
+    from constellation.massspec.sweep.reduce import Matches, QueryBatch
+
+    run, bundle, _ = _run(name, tmp_root)
+    rows = _targets(run, nan_rt=True).to_pylist()
+    ms2 = [s for s in run.scans if s["level"] == 2]
+    for i, r in enumerate(rows):
+        if i % 3 == 1:  # an explicit interval, edges on scans' own times
+            r["rt_start"], r["rt_end"] = ms2[5 + i]["rt"], ms2[40 + i]["rt"]
+        if i % 4 == 2:  # an assigned scan, inside or outside its window and interval
+            r["scan"] = ms2[(7 * i) % len(ms2)]["scan"]
+    rows.append(dict(rows[0], target_id=900, rt_center=None, rt_start=None, rt_end=None))  # global
+    targets = pa.Table.from_pylist(rows, schema=XIC_TARGET_TABLE)
+    tol = {1: (20.0, "ppm"), 2: (0.35, "Da")}
+    for assigned in (False, True):
+        plan = compile_queries(targets, levels=[1, 2], rt_window=15.0, assigned_scans_only=assigned)
+        settings = SweepSettings(tolerances=tol)
+        ledger = sweep(bundle, plan, settings).scans
+        every = np.arange(plan.n_queries, dtype=np.int64)
+        batch = QueryBatch(plan=plan, queries=every, matches=Matches.empty(), scans=ledger,
+                           scan_order=ledger.order(), settings=settings)  # fmt: skip
+        some = every[::2]
+        for level in (1, 2):
+            want = _brute_pairs(plan, ledger, level, every)
+            assert want
+            q, r = batch.eligible(level)
+            assert list(zip(q.tolist(), r.tolist())) == want
+            counts = np.bincount([p[0] for p in want], minlength=plan.n_queries)
+            assert batch.eligible_counts(level).tolist() == counts.tolist()
+            q, r = batch.eligible(level, some)
+            assert list(zip(q.tolist(), r.tolist())) == [p for p in want if p[0] in set(some.tolist())]
+
+
+def test_reduce_buckets_are_bounded_by_the_rows_they_build(tmp_root, tmp_path):
+    """Buckets were cut by matches alone, so unmatched queries piled into
+    one; their zero-filled rows, or the pairs a gate walks, now weigh too."""
+    from constellation.massspec.sweep.engine import _reduce_weights
+    from constellation.massspec.sweep.evidence import EvidenceGate
+
+    run, bundle, _ = _run("dia", tmp_root)
+    far = [dict(target_id=1000 + i, precursor_mz=1900.0 + i, precursor_charge=2) for i in range(40)]
+    targets = pa.Table.from_pylist(run.targets.to_pylist() + far, schema=XIC_TARGET_TABLE)
+    plan = compile_queries(targets, levels=[1])  # global XICs
+    tol = {1: (20.0, "ppm")}
+    fill = XicTraceReducer(drop_unmatched=False)
+    base = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[fill])
+    matches = np.bincount(base.matches.query, minlength=plan.n_queries)
+    unmatched = matches == 0
+    assert unmatched.sum() == len(far)
+    plain = _reduce_weights(plan, base.scans, SweepSettings(tolerances=tol), [XicTraceReducer()], matches)
+    assert plain.tolist() == matches.tolist()
+    gated = _reduce_weights(plan, base.scans, SweepSettings(tolerances=tol, gate=EvidenceGate()), [], matches)
+    assert (gated[unmatched] == 0).all() and (gated[~unmatched] > matches[~unmatched]).all()
+    filled = _reduce_weights(plan, base.scans, SweepSettings(tolerances=tol), [fill], matches)
+    assert (filled[unmatched] > 0).all()
+    small = SweepSettings(tolerances=tol, reduce_rows=400, shard_rows=4000)
+    got = sweep(bundle, plan, small, reducers=[fill], work_dir=tmp_path / "w")
+    sizes = [pq.ParquetFile(p).metadata.num_rows for p in got.parts["xic_trace"]]
+    assert max(sizes) <= small.reduce_rows + int(filled.max())
+    oracle.assert_traces_identical(got.table("xic_trace"), base.table("xic_trace"))
+
+
+def test_an_acquisition_without_points_sweeps_on_disk_too(tmp_path):
+    from constellation.massspec.sweep.evidence import EvidenceGate
+    from constellation.massspec.sweep.reduce import QuerySummaryReducer
+
+    scans = [dict(s, mz=np.empty(0), intensity=np.empty(0)) for s in dia_scans(cycles=3)]
+    bundle = write_bundle(tmp_path, "empty", scans)
+    write_bundle_manifest(bundle)
+    targets = pa.Table.from_pylist([dict(target_id=1, precursor_mz=500.0, precursor_charge=2)],
+                                   schema=XIC_TARGET_TABLE)  # fmt: skip
+    plan = compile_queries(targets, levels=[1])
+    settings = SweepSettings(tolerances={1: (20.0, "ppm")}, claims=True, gate=EvidenceGate(min_isotopes=2))
+    reducers = [XicTraceReducer(), QuerySummaryReducer()]
+    for i, kw in enumerate(({}, dict(work_dir=tmp_path / "w"), dict(workers=2))):
+        result = sweep(bundle, plan, settings, reducers=reducers, **kw)
+        assert result.table("xic_trace").num_rows == 0
+        assert result.table("query_summary")["passed"].to_pylist() == [False]
+        assert pq.read_table(result.write("point_claims", tmp_path / f"c{i}.parquet")).num_rows == 0
+
+
+@pytest.mark.parametrize("on_disk", [False, True])
+def test_extract_xic_records_its_tolerances_in_memory_and_written(tmp_root, tmp_path, on_disk):
+    """The Python API stamps the tolerances itself, so Counter clamps to a
+    trace's own whether the CLI wrote it or a notebook did."""
+    import argparse
+
+    from constellation.massspec.cli.counter import _resolve_collide_ppm
+    from constellation.massspec.quant.chromatogram import extract_xic
+
+    run, bundle, _ = _run("dia", tmp_root)
+    kw = dict(acquisition_id=0, rt_window=15.0, summary=True, claims=True)
+    if on_disk:
+        kw["work_dir"] = tmp_path / "w"
+    one = extract_xic(bundle, run.targets, levels=[1], tolerances={1: (8.0, "ppm")}, **kw)
+    two = extract_xic(bundle, run.targets, levels=[1, 2], tolerances={1: (8.0, "ppm"), 2: (0.35, "Da")}, **kw)
+    for name in ("xic_trace", "query_summary", "point_claims"):
+        meta = one.table(name).schema.metadata
+        assert meta[b"x.massspec.extraction_tolerance"] == b"8.0", name
+        assert meta[b"x.massspec.extraction_tolerance_unit"] == b"ppm", name
+        written = pq.read_schema(one.write(name, tmp_path / f"{name}.parquet")).metadata
+        assert written[b"x.massspec.extraction_tolerance"] == b"8.0", name
+    meta = pq.read_schema(two.write("xic_trace", tmp_path / "two.parquet")).metadata
+    assert meta[b"x.massspec.extraction_tolerance.ms1"] == b"8.0"
+    assert meta[b"x.massspec.extraction_tolerance.ms2"] == b"0.35"
+    args = argparse.Namespace(extraction_tolerance_ppm=None, trace=tmp_path / "xic_trace.parquet",
+                              collide_ppm=20.0, no_progress=True)  # fmt: skip
+    assert _resolve_collide_ppm(args) == 8.0

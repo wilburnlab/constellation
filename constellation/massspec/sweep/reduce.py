@@ -154,6 +154,57 @@ class Matches:
         )
 
 
+def _eligible_ranges(plan: QueryPlan, s: Ledger, level: int, queries: np.ndarray):
+    """The (scan, query) pairs ``level`` could match ``queries`` in, as
+    ranges: per window group of the level's scans with points, the group's
+    queries, its ledger rows in (retention time, scan) order, and for each
+    query the first of those rows inside its interval and how many are. A
+    query with an assigned scan (fragments) has that one row or none. So
+    the pairs are never built as a queries × scans product: what is built
+    is only what is eligible, and counting needs nothing built at all.
+
+    The interval test is :func:`pair_eligible`'s, inclusive at both ends:
+    on rows sorted by time, ``searchsorted`` left of the lower bound and
+    right of the upper one take exactly the rows with ``lo <= rt <= hi``
+    (bounds are never NaN; a scan without a time sorts last and is never
+    inside)."""
+    channels = plan.channels_for_level(level)
+    if channels is None or queries.size == 0:
+        return
+    queries = queries[channels.counts()[queries] > 0]
+    rows = np.flatnonzero((s.level == level) & (s.n_points > 0))
+    groups = isolation_groups(queries, plan.precursor_mz, s.lower[rows], s.upper[rows], rows, gate=level > 1)
+    for g in groups:
+        r = g.rows[np.lexsort((s.scan[g.rows], s.rt[g.rows]))]
+        rt = s.rt[r]
+        q = g.queries
+        start = np.searchsorted(rt, plan.rt_lo[q], side="left").astype(np.int64)
+        stop = np.searchsorted(rt, plan.rt_hi[q], side="right").astype(np.int64)
+        count = np.maximum(stop - start, 0)
+        if level > 1:
+            assigned = plan.assigned_scan[q]
+            fixed = np.flatnonzero(assigned >= 0)
+            if fixed.size:
+                scans = s.scan[r]
+                by = np.argsort(scans, kind="stable")
+                pos = np.searchsorted(scans[by], assigned[fixed])
+                at = by[np.minimum(pos, by.size - 1)]
+                found = (pos < by.size) & (scans[at] == assigned[fixed])
+                inside = (start[fixed] <= at) & (at < stop[fixed])
+                start[fixed] = at
+                count[fixed] = (found & inside).astype(np.int64)
+        yield q, r, start, count
+
+
+def eligible_counts(plan: QueryPlan, s: Ledger, level: int, queries: np.ndarray) -> np.ndarray:
+    """Per query of ``queries`` (ascending), how many (scan, query) pairs
+    ``level`` could match it in, without building them."""
+    out = np.zeros(queries.size, np.int64)
+    for q, _, _, count in _eligible_ranges(plan, s, level, queries):
+        np.add.at(out, np.searchsorted(queries, q), count)
+    return out
+
+
 @dataclass(frozen=True)
 class QueryBatch:
     """A contiguous range of queries and everything the sweep matched for
@@ -196,37 +247,36 @@ class QueryBatch:
         """Ledger row of each match's scan."""
         return self.scans.rows_of(self.matches.scan)
 
-    def eligible(self, level: int) -> tuple[np.ndarray, np.ndarray]:
+    def eligible(self, level: int, queries: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         """(query, ledger row) of every (scan, query) pair the sweep matched
-        for this batch at ``level``, whether or not anything was found: scans
-        of the level with points, inside the query's interval and isolation
-        window, and its assigned scan for fragments. Sorted by (query, scan
-        order). Each pair stands for the query's cells in that scan."""
-        channels = self.plan.channels_for_level(level)
-        if channels is None:
-            return np.empty(0, np.int64), np.empty(0, np.int64)
+        for this batch at ``level`` (or for ``queries``, an ascending subset
+        of it), whether or not anything was found: scans of the level with
+        points, inside the query's interval and isolation window, and its
+        assigned scan for fragments. Sorted by (query, scan order). Each pair
+        stands for the query's cells in that scan. Only eligible pairs are
+        built, so the cost is theirs, not the batch's queries × scans."""
         s = self.scans
-        rows = np.flatnonzero((s.level == level) & (s.n_points > 0))
-        queries = self.queries[channels.counts()[self.queries] > 0]
-        groups = isolation_groups(
-            queries, self.plan.precursor_mz, s.lower[rows], s.upper[rows], rows, gate=level > 1
-        )
+        qs = self.queries if queries is None else queries
         q_parts, r_parts = [], []
-        for g in groups:
-            q = np.tile(g.queries, g.rows.size)
-            r = np.repeat(g.rows, g.queries.size)
-            ok = pair_eligible(
-                q, s.rt[r], s.scan[r], self.plan.rt_lo, self.plan.rt_hi,
-                self.plan.assigned_scan if level > 1 else None,
-            )  # fmt: skip
-            q_parts.append(q[ok])
-            r_parts.append(r[ok])
+        for q, r, start, count in _eligible_ranges(self.plan, s, level, qs):
+            qq = np.repeat(q, count)
+            rr = r[ragged_arange(start, count)]
+            # The ranges are the map's test; held to it rather than trusted.
+            ok = pair_eligible(qq, s.rt[rr], s.scan[rr], self.plan.rt_lo, self.plan.rt_hi,
+                               self.plan.assigned_scan if level > 1 else None)  # fmt: skip
+            q_parts.append(qq[ok])
+            r_parts.append(rr[ok])
         if not q_parts:
             return np.empty(0, np.int64), np.empty(0, np.int64)
         q = np.concatenate(q_parts)
         r = np.concatenate(r_parts)
         by = np.lexsort((self.scan_order[r], q))
         return q[by], r[by]
+
+    def eligible_counts(self, level: int) -> np.ndarray:
+        """Per query of the batch, how many (scan, query) pairs ``level``
+        could match it in: the sizes of :meth:`eligible`, without building it."""
+        return eligible_counts(self.plan, self.scans, level, self.queries)
 
     def eligible_cells(self, level: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(query, ledger row, channel) of every eligible cell, in output
@@ -240,7 +290,10 @@ class QueryBatch:
 
 class Reducer(Protocol):
     """Turns a bucket of queries' matches into a table. ``gated`` reducers
-    see only the queries that passed the evidence gate."""
+    see only the queries that passed the evidence gate. A reducer that
+    builds a row for every eligible cell (zero-filling) says so with a true
+    ``zero_fills`` attribute, so that a sweep on disk sizes its buckets by
+    those rows rather than by matches alone."""
 
     name: str
     schema: pa.Schema
@@ -270,7 +323,7 @@ class QuerySummaryReducer:
         def eligible(level: int | None) -> np.ndarray:
             if level is None or level not in plan.levels:
                 return np.zeros(n, np.int32)
-            return per_query(batch.eligible(level)[0])
+            return batch.eligible_counts(level).astype(np.int32)
 
         m = batch.matches
         matched = {

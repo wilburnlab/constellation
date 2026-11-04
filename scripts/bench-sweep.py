@@ -240,7 +240,7 @@ class _GridReducer:
         plan = batch.plan
         decoy = plan.targets.column("target_id").to_numpy()[batch.queries] >= DECOY_OFFSET
         has = plan.fragments.counts()[batch.queries] > 0
-        pairs = batch.eligible(2)
+        pairs = batch.eligible(2, np.unique(batch.evidence.query))  # a query without evidence has no run
         rows = []
         for k, run in itertools.product(self.ks, self.runs):
             gate = EvidenceGate(min_fragments=k, min_consecutive=run, top_peaks=self.top_peaks)
@@ -251,6 +251,21 @@ class _GridReducer:
                              decoys_passed=int((d.passed & decoy).sum()),
                              targets=int((~decoy).sum()), decoys=int(decoy.sum())))  # fmt: skip
         return pa.Table.from_pylist(rows, schema=self.schema)
+
+
+def _grid_totals(rows: list[dict]) -> list[dict]:
+    """One row per gate configuration. A sweep that went to disk reduced its
+    queries in buckets, each with its own grid, so a configuration's counts
+    are the sum of its buckets' rows."""
+    totals: dict[tuple[int, int], dict] = {}
+    for row in rows:
+        key = (row["min_fragments"], row["min_consecutive"])
+        if key not in totals:
+            totals[key] = dict(row)
+        else:
+            for k in ("targets_passed", "decoys_passed", "targets", "decoys"):
+                totals[key][k] += row[k]
+    return list(totals.values())
 
 
 def _cmd_gate(args) -> None:
@@ -268,7 +283,7 @@ def _cmd_gate(args) -> None:
                                  gate=EvidenceGate(min_fragments=1, top_peaks=top_peaks))  # fmt: skip
         result = sweep(args.bundle, plan, settings,
                        reducers=[_GridReducer(args.min_fragments, args.min_consecutive, top_peaks)])  # fmt: skip
-        grid = result.table("gate_grid").to_pylist()
+        grid = _grid_totals(result.table("gate_grid").to_pylist())
         for row in grid:
             row["top_peaks"] = top_peaks
             row["sweep_s"] = round(time.perf_counter() - t0, 2)

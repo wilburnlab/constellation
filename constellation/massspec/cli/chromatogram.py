@@ -223,7 +223,6 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
     from constellation.massspec.quant.chromatogram import (
         extract_xic,
         extract_xic_indexed,
-        extraction_tolerance_metadata,
         save_xic,
         write_xic_manifest,
     )
@@ -242,13 +241,30 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
         print(f"error: --all-in-window is --rule all; it contradicts --rule {args.rule}", file=sys.stderr)
         return 2
     rule = args.rule or ("all" if args.all_in_window else "nearest")
+    def given(value, default):
+        return default if value is None else value  # an explicit 0 is a tolerance
+
     tolerances = {
         level: (
-            getattr(args, f"ms{level}_tolerance") or args.tolerance,
-            getattr(args, f"ms{level}_tolerance_unit") or args.tolerance_unit,
+            given(getattr(args, f"ms{level}_tolerance"), args.tolerance),
+            given(getattr(args, f"ms{level}_tolerance_unit"), args.tolerance_unit),
         )
         for level in levels
     }
+    bad = [f"MS{lv} {tol:g}" for lv, (tol, _) in tolerances.items() if tol < 0]
+    if bad:
+        print(f"error: a tolerance cannot be negative ({', '.join(bad)})", file=sys.stderr)
+        return 2
+    if args.min_consecutive_scans is not None and args.min_consecutive_scans < 1:
+        print("error: --min-consecutive-scans is at least 1 (a run of none would pass every target)",
+              file=sys.stderr)  # fmt: skip
+        return 2
+    gate_flags = {
+        "--gate": args.gate, "--min-fragments": args.min_fragments is not None,
+        "--evidence-top-peaks": args.evidence_top_peaks is not None,
+        "--min-consecutive-scans": args.min_consecutive_scans is not None,
+        "--max-gap-s": args.max_gap_s is not None, "--min-isotopes": args.min_isotopes is not None,
+    }  # fmt: skip
 
     _warn_level_flag_mismatch(args)
     targets = load_targets(args.targets)
@@ -261,6 +277,14 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
         if len(levels) > 1 or rule == "sum":
             print("error: the mass index (--use-index) extracts one level at a time, by the "
                   "nearest peak or all peaks in a window", file=sys.stderr)  # fmt: skip
+            return 2
+        sweep_only = [flag for flag, on in {
+            **gate_flags, "--only-passing": args.only_passing, "--mz-axis": args.mz_axis is not None,
+            "--claims": args.claims, "--summary": args.summary, "--work-dir": args.work_dir is not None,
+        }.items() if on]  # fmt: skip
+        if sweep_only:
+            print(f"error: {', '.join(sweep_only)} belong to the sweep; the mass index "
+                  "(--use-index) does not apply them", file=sys.stderr)  # fmt: skip
             return 2
         level = levels[0]
         tolerance, tolerance_unit = tolerances[level]
@@ -293,17 +317,15 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
         print("error: --mz-axis needs a converted bundle as --peaks-dir", file=sys.stderr)
         return 2
     gate = None
-    if args.gate or any(v is not None for v in (args.min_fragments, args.evidence_top_peaks,
-                                                args.min_consecutive_scans, args.max_gap_s,
-                                                args.min_isotopes)):  # fmt: skip
+    if any(gate_flags.values()):
         from constellation.massspec.sweep.evidence import EvidenceGate
 
         default = EvidenceGate()
         top = args.evidence_top_peaks
         gate = EvidenceGate(
-            min_fragments=args.min_fragments if args.min_fragments is not None else default.min_fragments,
+            min_fragments=given(args.min_fragments, default.min_fragments),
             top_peaks=default.top_peaks if top is None else (top or None),
-            min_consecutive=args.min_consecutive_scans or default.min_consecutive,
+            min_consecutive=given(args.min_consecutive_scans, default.min_consecutive),
             max_gap_s=args.max_gap_s,
             min_isotopes=args.min_isotopes,
         )
@@ -328,12 +350,12 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
         only_passing=args.only_passing, claims=args.claims, summary=args.summary,
         workers=args.workers if on_disk else 1, work_dir=work, progress=progress,
     )  # fmt: skip
-    stamp = extraction_tolerance_metadata(tolerances)
-    out = result.write("xic_trace", args.output_dir / "xic_trace.parquet", metadata=stamp)
+    # The result stamps each output with the tolerances (Counter reads the trace's).
+    out = result.write("xic_trace", args.output_dir / "xic_trace.parquet")
     tables = ["xic_trace.parquet"]
     for name, flag in (("point_claims", args.claims), ("query_summary", args.summary)):
         if flag:
-            result.write(name, args.output_dir / f"{name}.parquet", metadata=stamp)
+            result.write(name, args.output_dir / f"{name}.parquet")
             tables.append(f"{name}.parquet")
     metadata = {
         "levels": levels, "mode": "scan_major", "engine": "sweep", "rule": rule,

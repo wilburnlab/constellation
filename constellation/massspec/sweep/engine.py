@@ -48,7 +48,7 @@ from constellation.massspec.sweep.claims import Claims, claims_table, find_claim
 from constellation.massspec.sweep.evidence import Evidence, EvidenceGate, count_evidence, decide
 from constellation.massspec.sweep.kernel import match_group
 from constellation.massspec.sweep.queries import QueryPlan
-from constellation.massspec.sweep.reduce import Ledger, Matches, QueryBatch, Reducer
+from constellation.massspec.sweep.reduce import Ledger, Matches, QueryBatch, Reducer, eligible_counts
 from constellation.massspec.sweep.rules import AllWithin, MatchRule, Nearest
 from constellation.massspec.sweep.schemas import SWEEP_EVIDENCE_TABLE, SWEEP_POINT_CLAIM_TABLE
 from constellation.massspec.sweep.schedule import (
@@ -121,6 +121,9 @@ class SweepResult:
     parts: dict[str, list[Path]] = field(default_factory=dict)
     schemas: dict[str, pa.Schema] = field(default_factory=dict)
     mz_axis: str | None = None
+    #: Schema metadata of an output beyond its schema's own (such as the
+    #: tolerances a trace was extracted at), carried by ``table`` and ``write``.
+    metadata: dict[str, dict[bytes, bytes]] = field(default_factory=dict)
 
     def table(self, name: str) -> pa.Table:
         """A reducer's whole output, read into memory from its parts if the
@@ -133,11 +136,15 @@ class SweepResult:
                 else pa.concat_tables([pq.read_table(f) for f in files])
                 if files else schema.empty_table()
             )  # fmt: skip
-        return self.tables[name]
+        table = self.tables[name]
+        if self.metadata.get(name):
+            table = table.replace_schema_metadata({**(table.schema.metadata or {}), **self.metadata[name]})
+        return table
 
     def write(self, name: str, path: Path | str, *, metadata: Mapping[bytes, bytes] | None = None) -> Path:
         """Write a reducer's output to one Parquet file, part by part, with
-        ``metadata`` added to its schema's."""
+        the result's metadata for it and then ``metadata`` added to its
+        schema's."""
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         if name in self.tables or not self.parts.get(name):
@@ -147,7 +154,9 @@ class SweepResult:
             pq.write_table(table, out)
             return out
         schema = self.schemas[name]
-        schema = schema.with_metadata({**(schema.metadata or {}), **(metadata or {})})
+        schema = schema.with_metadata(
+            {**(schema.metadata or {}), **self.metadata.get(name, {}), **(metadata or {})}
+        )
         tmp = out.with_name(f".{out.name}.tmp")
         with pq.ParquetWriter(tmp, schema) as writer:
             for f in self.parts[name]:
@@ -421,10 +430,14 @@ def _batch(plan, queries, out: _MapOut, ledger, order, settings, shared) -> Quer
         else np.zeros(queries.size, dtype=bool)
     )
     empty = (np.empty(0, np.int64), np.empty(0, np.int64))
+    # Only a query with evidence has a run to find; the rest decide on
+    # nothing, so their pairs are not built (a global query's are every scan).
+    with_fragments = np.unique(evidence.query[evidence.group == 0])
+    with_isotopes = np.unique(evidence.query[evidence.group != 0])
     decision = decide(
         settings.gate, queries, has,
-        (lambda: batch.eligible(frag)) if frag is not None else (lambda: empty),
-        (lambda: batch.eligible(1)) if 1 in plan.levels else (lambda: empty),
+        (lambda: batch.eligible(frag, with_fragments)) if frag is not None else (lambda: empty),
+        (lambda: batch.eligible(1, with_isotopes)) if 1 in plan.levels else (lambda: empty),
         evidence, ledger,
     )  # fmt: skip
     return replace(batch, decision=decision)
@@ -507,16 +520,27 @@ def _on_temporary_disk(bundle, plan, settings, reducers, workers, progress, resu
     return result
 
 
-def _shared_counts(claims: Claims, n_queries: int) -> np.ndarray:
-    """Per query, its matches whose point another query also claimed."""
-    shared = claims.n_queries >= 2
-    return np.bincount(claims.query[shared], minlength=n_queries).astype(np.int64)
+def _shared_counts(claims: Claims, n_queries: int, *, per_cell: bool) -> np.ndarray:
+    """Per query, its matches whose point another query also claimed. A
+    claim is a (point, cell) pair, which is one match under ``nearest`` and
+    ``all``; under ``sum`` (``per_cell``) a match is a cell over several
+    points, and counts once however many of them are shared. A scan's
+    claims are made together, so every claim of a cell is in ``claims``."""
+    shared = claims.take(np.flatnonzero(claims.n_queries >= 2))
+    query = shared.query
+    if per_cell and shared.n:
+        by = np.lexsort((shared.channel, shared.query, shared.scan, shared.level))
+        key = [v[by] for v in (shared.level, shared.scan, shared.query, shared.channel)]
+        first = np.r_[True, np.any([k[1:] != k[:-1] for k in key], axis=0)]
+        query = key[2][first]
+    return np.bincount(query, minlength=n_queries).astype(np.int64)
 
 
 def _reduce_in_memory(out: _MapOut, plan, ledger, settings, reducers, axis) -> SweepResult:
     order = ledger.order()
     queries = np.arange(plan.n_queries, dtype=np.int64)
-    shared = _shared_counts(out.claims, plan.n_queries) if settings.claims else None
+    shared = (_shared_counts(out.claims, plan.n_queries, per_cell=settings.rule.name == "sum")
+              if settings.claims else None)  # fmt: skip
     batch = _batch(plan, queries, out, ledger, order, settings, shared)
     result = SweepResult(scans=ledger, matches=batch.matches, mz_axis=None if axis is None else axis.key)
     for reducer, table in zip(reducers, _reduce(batch, reducers)):
@@ -662,7 +686,7 @@ def _map_stream(
                    w / "evidence" / name, row_group_size=1 << 18)  # fmt: skip
         if settings.claims:
             _write(out.claims.sorted().table(), w / "claims" / name, row_group_size=1 << 18)
-            shared[:] += _shared_counts(out.claims, plan.n_queries)
+            shared[:] += _shared_counts(out.claims, plan.n_queries, per_cell=settings.rule.name == "sum")
 
     for block in blocks:
         pending.append(_map_block(block, plan, settings))
@@ -717,7 +741,8 @@ def _reduce_bucket(
     def shards(kind: str) -> list[Path]:
         return sorted((w / kind).glob("shard-*.parquet"))
 
-    matches = Matches.from_table(_read_range(shards("matches"), q0, q1))
+    m = _read_range(shards("matches"), q0, q1)
+    matches = Matches.from_table(m) if m is not None else Matches.empty()  # no shard matched anything
     ev = _read_range(shards("evidence"), q0, q1)
     evidence = _evidence_from(ev) if ev is not None else Evidence.empty()
     shared = None
@@ -751,13 +776,37 @@ def _claims_part(work: str, index: int, acquisition_id: int) -> list[str]:
     return out
 
 
-def _buckets(counts: np.ndarray, target: int) -> list[tuple[int, int]]:
-    """Contiguous query ranges of about ``target`` matches each (at least one
-    query each), from per-query match counts."""
-    n = counts.size
+def _reduce_weights(plan: QueryPlan, ledger: Ledger, settings: SweepSettings, reducers, matches: np.ndarray) -> np.ndarray:
+    """Per query, the rows reducing it builds: its matches; with a gate, the
+    (scan, query) pairs of a query with matches, whose evidence is walked
+    over them; with a reducer that zero-fills, every eligible cell. So a
+    bucket is bounded by what is built, not only by what matched: a
+    thousand unmatched global queries cost nothing to gate, and their
+    zero-filled trace is sized as the trace it is."""
+    weight = matches.astype(np.int64).copy()
+    fills = any(getattr(r, "zero_fills", False) for r in reducers)
+    if settings.gate is None and not fills:
+        return weight
+    every = np.arange(plan.n_queries, dtype=np.int64)
+    for level in plan.levels:
+        channels = plan.channels_for_level(level)
+        if channels is None:
+            continue
+        pairs = eligible_counts(plan, ledger, level, every)
+        if settings.gate is not None:
+            weight += np.where(matches > 0, pairs, 0)
+        if fills:
+            weight += pairs * channels.counts()
+    return weight
+
+
+def _buckets(weights: np.ndarray, target: int) -> list[tuple[int, int]]:
+    """Contiguous query ranges of about ``target`` rows each (at least one
+    query each), from per-query row counts (:func:`_reduce_weights`)."""
+    n = weights.size
     if n == 0:
         return []
-    weight = counts.astype(np.int64) + 1
+    weight = weights.astype(np.int64) + 1
     cum = np.cumsum(weight)
     edges = [0]
     while edges[-1] < n:
@@ -829,7 +878,7 @@ def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progre
         for f in sorted((work / "matches").glob("shard-*.parquet")):
             q = pq.read_table(f, columns=["query"]).column("query").to_numpy()
             counts += np.bincount(q, minlength=plan.n_queries)
-        buckets = _buckets(counts, settings.reduce_rows)
+        buckets = _buckets(_reduce_weights(plan, ledger, settings, reducers, counts), settings.reduce_rows)
         paths = _run(executor, _reduce_bucket,
                      [(str(work), i, q0, q1, tuple(reducers), settings) for i, (q0, q1) in enumerate(buckets)],
                      progress, "sweep: reducing")  # fmt: skip

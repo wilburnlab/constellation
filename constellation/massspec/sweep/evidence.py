@@ -161,19 +161,24 @@ def count_evidence(
     )
     # (query, group, scan) entries and (entry, value) pairs as single
     # integers: one-dimensional uniques are far quicker than row-wise ones.
+    # Each stride is one past the largest value packed under it, and values
+    # are shifted to start at 0 first (isotope keys run negative for
+    # labelled peptides), so no two pairs can share an integer.
     n_rows = int(rows.max()) + 1
-    entry = (query * 16 + group) * n_rows + row
+    n_groups = int(group.max()) + 1
+    entry = (query * n_groups + group) * n_rows + row
     entries, inverse = np.unique(entry, return_inverse=True)
 
     def distinct(values: np.ndarray, weights: np.ndarray | None = None) -> np.ndarray:
+        values = values - values.min()
         width = int(values.max()) + 1
         _, first = np.unique(inverse.astype(np.int64) * width + values, return_index=True)
         w = None if weights is None else weights[first]
         return np.bincount(inverse[first], weights=w, minlength=entries.size)
 
     return Evidence(
-        query=entries // (16 * n_rows),
-        group=((entries // n_rows) % 16).astype(np.int8),
+        query=entries // (n_groups * n_rows),
+        group=((entries // n_rows) % n_groups).astype(np.int8),
         scan=scan_id[entries % n_rows],
         n_keys=distinct(key).astype(np.int64),
         n_peaks=distinct(peak).astype(np.int64),
@@ -206,7 +211,9 @@ def decide(
 ) -> Decision:
     """Apply ``gate`` to ``queries``. ``eligible_*()`` give the (query,
     ledger row) pairs each query could be matched in at that kind's level,
-    in scan order; ``evidence`` holds the map's counts for these queries."""
+    in scan order, for at least every query with evidence of that kind (one
+    without has no run, and decides the same with or without its pairs);
+    ``evidence`` holds the map's counts for these queries."""
     n = queries.size
     applicable = has_fragments.copy()
     if gate.min_isotopes is not None:
