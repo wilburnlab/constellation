@@ -49,7 +49,8 @@ the gate, claims, a summary and workers. `extract_xic_scan_major` (Mode A) is on
     a scan present together (claims now, mixture fits later), and it works for profile points.
   - Inside, a group of scans that share their queries (one DIA window in a block, or every MS1 scan of it)
     is matched ions → peaks when its ions are fewer than `crossover` × its peaks per scan, and peaks → ions
-    otherwise. The peak-major kernel takes candidates in a window widened by one part per million of the
+    otherwise. `crossover` is 0.25, measured (below): peaks → ions is never slower above that, and 2–11×
+    faster at proteome DIA ratios. The peak-major kernel takes candidates in a window widened by one part per million of the
     tolerance and then applies the exact test, including `nearest_within_tolerance`'s left-neighbour tie
     and duplicate-m/z handling, so the two give the same rows bit for bit (tested on random blocks with
     ties, duplicates and edge peaks).
@@ -70,15 +71,19 @@ the gate, claims, a summary and workers. `extract_xic_scan_major` (Mode A) is on
   order within a scan, every sort has a total key, and workers use one torch thread. Output is
   byte-identical for any worker count, block size, shard size or kernel (tested).
 - **Memory is bounded on both paths.** A map shard writes its matches (and evidence and claims) out in
-  sorted runs of `run_rows` (4M by default) instead of holding the shard. A sweep run in memory stops holding
-  past `memory_rows` matches (32M) and carries on on disk: what it holds becomes the first run of a single
-  shard, and the rest of the scans follow, inline, in a temporary directory that lives as long as its
-  result, so outputs are read part by part. The first measurement session ended when WSL's OOM killer took
+  sorted runs of `run_rows` (4M by default) instead of holding the shard; a worker peaks near 3 GB. A sweep
+  run in memory stops holding past `memory_rows` matches (8M) and carries on on disk: what it holds becomes
+  the first run of a single shard (and is freed once written), and the rest of the scans follow, inline, in
+  a temporary directory that lives as long as its result, so outputs are read part by part. `memory_rows`
+  was 32M until the timing table below showed a held match costing 200–500 bytes at peak, not the 57 of
+  its arrays (sorting copies them, and the reducers build their tables beside them): one process reached
+  7–11 GB. The first measurement session ended when WSL's OOM killer took
   a process holding 29.4 GB, every match of 139,067 targets across the wide-window run, on a 31 GB VM;
   neither guard existed then. `scripts/bench-sweep.py time` also kills a configuration whose processes
   together pass `--max-rss-gb`. The second session ended in a host crash (Windows Kernel-Power 41) with
-  each run at about 3.4 GB and no OOM, which points at the machine rather than the sweep; the full timing
-  table waits on a decision about where to run it.
+  each run at about 3.4 GB and no OOM, which points at the machine rather than the sweep. The timing table
+  below was then run at a lighter load (at most 4 workers and 4 torch threads, 30 s between
+  configurations, the 20 GB guard) and finished.
 - **Isolation gating.** The test is `lower <= precursor_mz <= upper` on each scan's float64 bounds, via
   two `searchsorted` calls over the active queries sorted by precursor m/z. A scan without bounds, or a
   query without a precursor m/z, passes. Float32 window ids are for reporting only.
@@ -160,17 +165,65 @@ scan (rows) and scans in a row (columns), on the purified run:
   because every nearest match of every query in every scan is held. Counting with one-dimensional keys
   halved it from 177 s. On disk (`workers > 1`) memory is bounded by a shard.
 
+**Timing and memory.** Nearest rule, Mode A's tolerances, inputs on the local disk. Seconds of sweep
+(compile apart), and the peak resident memory of all the run's processes together.
+
+| run | queries | ions (MS1 + MS2) | levels, RT | matches | workers | cells | peaks | memory |
+|---|---|---|---|---|---|---|---|---|
+| purified | 2,187 | 155,540 | MS2, global | 51.4M | 1 | 174 | 151 | 7.4 GB |
+| | | | | | 2 | 90 | 91 | 6.4 GB |
+| | | | | | 4 | 83 | 63 | 11.8 GB |
+| GPF 900–1000 | 1,719 | 20,628 + 119,676 | both, global | 129.5M | 1 | 394 | 360 | 7.5 GB |
+| | | | | | 4 | 178 | 180 | 12.2 GB |
+| GPF 900–1000 | 6,435 | 77,220 + 447,314 | both, ±120 s | 20.4M | 1 | 44 | 44 | 10.6 GB |
+| | | | | | 4 | 32 | 32 | 11.7 GB |
+| wide window | 139,067 | 1.67M + 6.84M | both, ±120 s | 476.2M | 4 | 545 | 541 | 15.8 GB |
+
+- **The kernel matters less than the rows.** Peaks → ions was never slower, but whole sweeps move by at
+  most 25 %, because matching is a minority of the time. At proteome scale the three kernel settings
+  are within 3 % of each other, at 476M matches. The time follows the matches written, which is what
+  the two-pass gate is for.
+- **The crossover, from the kernels alone** (one group of 4 or 16 scans, random peaks, Nearest):
+  peaks → ions is 1.0–1.5× faster from 0.25 to 1 ion per peak, 1.4–2.1× at 2–4 for 0.35 Da, and 2–11×
+  at 2–17 for 20 ppm. Below a quarter of an ion per peak cells → peaks is up to 1.2× faster, at under
+  0.6 ms a group either way. `crossover` went from a guessed 4 to 0.25. With 4, `auto` had been choosing
+  cells → peaks on the purified run (180 s, against 151 s forced to peaks).
+- **Workers.** Four sweep a whole run 2.0–2.8× faster than one (purified 151 → 63 s, GPF 360 → 180 s),
+  and a short RT-gated sweep 1.4×. Each worker peaks near 3 GB, so four use 12–16 GB together. The CLI's
+  default went from the cores up to 8 (about 25 GB) to the cores up to 4. The library default stays one
+  process.
+- **One process held too much.** With `memory_rows` at 32M one process reached 7–11 GB, and the
+  purified run's move to disk kept the 32M matches it had held for the rest of the sweep. After both
+  fixes:
+
+  | run, one process | before | after |
+  |---|---|---|
+  | purified, MS2 global (`auto`) | 180 s, 7.4 GB | 125 s, 3.0 GB |
+  | GPF ±120 s, both levels | 44 s, 10.6 GB (in memory) | 54 s, 3.0 GB (moves to disk at 8M) |
+
+- **Compiling the queries took longer than sweeping them.** The 139,067 wide-window targets took
+  1,677 s to compile against a 545 s sweep, nearly all of it MS1 isotope envelopes. Each peptide's
+  envelope was built once per charge in `charge_range`, and each element's polynomial power (FFT
+  repeated squaring) once per peptide. `peptide.envelope.neutral_envelope` + `envelope_mz` now build
+  a peptide's envelope once and put it at each charge, and `core.chem.isotopes` caches each
+  (element, count) power. The plan is bit-identical, NaN abundances included, on real targets (the
+  purified and GPF sets, natural and with negative isotope offsets), and tests hold both to the
+  uncached computation. 180 s and 1.7 GB now, 9.3×; the GPF set 92 → 9 s.
+
 ## Still to do
 
 - P7, only if the measurements call for it:
-  - the two-pass gate at proteome scale (evidence only, then traces for the survivors);
-  - query compilation without Python per target (`peptide_envelope` is called per sequence and charge).
-    Most of it was ProForma parsing: 2,187 purified-run targets took 10 s, nearly all of it lark's Earley
-    parser at about 10 ms a string. `parse_proforma` now reads the simple form (labels, residues with
-    UNIMOD accessions, signed masses or plain names, terminal mods, a charge) with a regular expression
-    into identical objects, about 200 times faster, and leaves the rest to the grammar
-    (`tests/test_proforma_fast_path.py`);
-  - the bucket index layout.
+  - the two-pass gate at proteome scale (evidence only, then traces for the survivors). The timing table
+    calls for it: at 139k queries the sweep's time follows the 476M matches it writes;
+  - query compilation without Python per target. Two steps are done, both exact: ProForma parsing
+    (2,187 purified-run targets took 10 s, nearly all of it lark's Earley parser at about 10 ms a string;
+    `parse_proforma` now reads the simple form — labels, residues with UNIMOD accessions, signed masses
+    or plain names, terminal mods, a charge — with a regular expression into identical objects, about
+    200 times faster, and leaves the rest to the grammar, `tests/test_proforma_fast_path.py`), and the
+    isotope envelopes above. What is left, 1.3 ms a target at proteome scale, is the per-target loop
+    itself;
+  - the bucket index layout, if a profile shows the per-group index build mattering. Not measured on
+    its own yet; the kernel is a minority of a sweep's time.
 - The purified-sample scorer (elution peaks, co-elution evidence, a verdict rule) as a gated reducer,
   and output as an experiment directory the browser reads: the next plan.
 - Profile-points rule; isolation gating by the whole isotope envelope; mixture fits on a scan's

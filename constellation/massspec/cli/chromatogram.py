@@ -105,7 +105,7 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
                              "(or `latest`) before matching.")
     sweepg.add_argument("--workers", type=int, default=_default_workers(),
                         help="Processes sweeping a bundle's scan ranges (default: the cores, "
-                             "up to 8; 1 sweeps in this process).")
+                             "up to 4, about 3 GB each; 1 sweeps in this process).")
     sweepg.add_argument("--work-dir", type=Path, default=None,
                         help="Where the workers' matches go (default <output-dir>/.sweep, "
                              "removed when done).")
@@ -172,9 +172,11 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
 
 
 def _default_workers() -> int:
+    """Four at most: each worker holds about 3 GB at peak, and four sweep
+    a whole run 2.4–2.8× faster than one (docs/plans/sweep.md)."""
     import os
 
-    return max(1, min(8, os.cpu_count() or 1))
+    return max(1, min(4, os.cpu_count() or 1))
 
 
 def _parse_downcast(s: str) -> tuple[str, ...]:

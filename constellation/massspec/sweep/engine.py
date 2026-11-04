@@ -76,9 +76,11 @@ class SweepSettings:
     #: Record peaks claimed by more than one cell (the ``peak_claims`` output).
     claims: bool = False
     #: ``cells`` (ions → peaks), ``peaks`` (peaks → ions) or ``auto``: peaks
-    #: once a group's ions outnumber its scans' peaks ``crossover`` times.
+    #: once a group's ions exceed ``crossover`` times its scans' mean peaks.
+    #: Measured (docs/plans/sweep.md): peaks → ions is as fast or faster
+    #: from a quarter of an ion per peak up, 2–11× at proteome DIA ratios.
     kernel: Literal["auto", "cells", "peaks"] = "auto"
-    crossover: float = 4.0
+    crossover: float = 0.25
     #: A measured m/z axis of the bundle to correct observed m/z with.
     mz_axis: str | None = None
     acquisition_id: int = 0
@@ -91,8 +93,10 @@ class SweepSettings:
     reduce_rows: int = 1 << 22
     #: Matches a map shard holds before writing them out as a sorted run.
     run_rows: int = 4 << 20
-    #: Matches a sweep in memory holds before it starts again on disk.
-    memory_rows: int = 32 << 20
+    #: Matches a sweep in memory holds before it carries on on disk. A held
+    #: match costs some 200–500 bytes at peak (sorting, the reducers' tables),
+    #: so this keeps an in-memory sweep near a disk worker's 3 GB.
+    memory_rows: int = 8 << 20
 
     def tolerance(self, level: int) -> Tolerance:
         if level in self.tolerances:
@@ -630,16 +634,19 @@ def _map_stream(
     ``index``, starting from ``pending`` matches already made, and write the
     shard's runs and scans."""
     shared = np.zeros(plan.n_queries, dtype=np.int64) if settings.claims else None
-    pending = list(pending or [])
+    # The caller's list is emptied as it is written, so what was held in
+    # memory is freed rather than kept for the rest of the shard.
+    pending = pending if pending is not None else []
     held = total = sum(p.matches.n for p in pending)
     run = 0
 
     def flush() -> None:
-        nonlocal pending, held, run
+        nonlocal held, run
         if not pending:
             return
         out = _MapOut.concat(pending)
-        pending, held = [], 0
+        pending.clear()
+        held = 0
         name = _run_name(index, run)
         run += 1
         m = out.matches

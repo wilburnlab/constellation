@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pyarrow as pa
@@ -32,11 +33,14 @@ import pyarrow as pa
 from constellation.core.io.schemas import cast_to_schema
 from constellation.core.sequence.proforma import Peptidoform, parse_proforma
 from constellation.core.stats.units import ISOTOPE_MASS_DIFF
-from constellation.massspec.peptide.envelope import peptide_envelope
+from constellation.massspec.peptide.envelope import envelope_mz, neutral_envelope
 from constellation.massspec.peptide.ions import IonType, fragment_ladder_arrays_batch
 from constellation.massspec.peptide.mz import precursor_mz as _precursor_mz
 from constellation.massspec.quant.schemas import XIC_TARGET_TABLE
 from constellation.massspec.sweep.schemas import SWEEP_ION_TABLE, SWEEP_QUERY_TABLE
+
+if TYPE_CHECKING:
+    import torch
 
 __all__ = [
     "ISOTOPES",
@@ -387,6 +391,7 @@ def compile_queries(
 def _isotopes(d: dict, n: int, settings: IonSettings, pf) -> Ions:
     offsets_k = settings.offsets()
     n_peaks = max(max(offsets_k) + 1, 1)
+    neutral: dict[str, tuple[torch.Tensor, np.ndarray]] = {}
     envelopes: dict[tuple[str, int], tuple[np.ndarray, np.ndarray]] = {}
     mz_l: list[np.ndarray] = []
     z_l: list[np.ndarray] = []
@@ -409,8 +414,13 @@ def _isotopes(d: dict, n: int, settings: IonSettings, pf) -> Ions:
             for z in charges:
                 key = (modseq, z)
                 if key not in envelopes:
-                    mz_e, ab_e = peptide_envelope(pf(modseq), charge=z, n_peaks=n_peaks)
-                    envelopes[key] = (mz_e.numpy(), ab_e.numpy())
+                    # One envelope per peptide, put at each charge (what
+                    # peptide_envelope does at one charge).
+                    if modseq not in neutral:
+                        masses, ab_e = neutral_envelope(pf(modseq), n_peaks=n_peaks)
+                        neutral[modseq] = (masses, ab_e.numpy())
+                    masses, ab_np = neutral[modseq]
+                    envelopes[key] = (envelope_mz(masses, z).numpy(), ab_np)
                 mz_e, ab_e = envelopes[key]
                 mz = np.empty(len(offsets_k))
                 ab = np.full(len(offsets_k), np.nan, dtype=np.float32)

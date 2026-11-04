@@ -116,6 +116,8 @@ def _cmd_run_one(args) -> None:
     """One configuration, in this process; prints one JSON line."""
     import torch
 
+    if args.torch_threads:
+        torch.set_num_threads(args.torch_threads)
     from constellation.massspec.quant.chromatogram import XicTraceReducer
     from constellation.massspec.sweep import compile_queries
     from constellation.massspec.sweep.engine import SweepSettings, sweep
@@ -198,7 +200,8 @@ def _cmd_time(args) -> None:
                "--levels", *map(str, args.levels), "--rule", rule, "--kernel", kernel,
                "--workers", str(workers), "--work-dir", args.work_dir, "--block-rows", str(args.block_rows),
                "--ms1-tolerance", str(args.ms1_tolerance), "--ms1-unit", args.ms1_unit,
-               "--ms2-tolerance", str(args.ms2_tolerance), "--ms2-unit", args.ms2_unit]  # fmt: skip
+               "--ms2-tolerance", str(args.ms2_tolerance), "--ms2-unit", args.ms2_unit,
+               "--torch-threads", str(args.torch_threads)]  # fmt: skip
         if rt_window > 0:
             cmd += ["--rt-window", str(rt_window)]
         code, stdout, stderr, peak = _run_guarded(cmd, args.max_rss_gb)
@@ -212,6 +215,7 @@ def _cmd_time(args) -> None:
         print(line, flush=True)
         out.write(line + "\n")
         out.flush()
+        time.sleep(args.pause_s)
 
 
 # ── gate grid ─────────────────────────────────────────────────────────
@@ -342,6 +346,8 @@ def main() -> None:
         r.add_argument("--levels", type=int, nargs="+", default=[1, 2])
         r.add_argument("--block-rows", type=int, default=1 << 20)
         r.add_argument("--work-dir", default="/tmp/sweep-bench-work")
+        r.add_argument("--torch-threads", type=int, default=0,
+                       help="Threads for torch in a one-process run (default: torch's own).")
         tolerances(r)
         if name == "time":
             r.add_argument("--workers", type=int, nargs="+", default=[1])
@@ -350,6 +356,8 @@ def main() -> None:
             r.add_argument("--rt-windows", type=float, nargs="+", default=[0.0])
             r.add_argument("--max-rss-gb", type=float, default=20.0,
                            help="Kill a configuration whose processes together pass this (default 20).")
+            r.add_argument("--pause-s", type=float, default=0.0,
+                           help="Rest between configurations, to keep a long run's load moderate.")
             r.add_argument("--out", required=True)
         else:
             r.add_argument("--workers", type=int, default=1)

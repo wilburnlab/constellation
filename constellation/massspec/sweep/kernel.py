@@ -262,11 +262,11 @@ def match_group(
     unit: ToleranceUnit,
     *,
     kernel: Literal["auto", "cells", "peaks"] = "auto",
-    crossover: float = 4.0,
+    crossover: float = 0.25,
     max_elements: int = 1 << 21,
 ) -> GroupMatches:
     """Match a group with the cheaper kernel: peaks → ions once the ions
-    outnumber a scan's peaks ``crossover`` times over, else ions → peaks."""
+    exceed ``crossover`` times a scan's mean peaks, else ions → peaks."""
     if kernel == "auto":
         counts = offsets[rows + 1] - offsets[rows]
         mean_peaks = float(counts.mean()) if counts.size else 0.0

@@ -33,6 +33,8 @@ Both APIs accept `Composition` objects or raw count tensors.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 from constellation.core.chem.elements import ELEMENT_SYMBOLS, ELEMENTS, ISOTOPE_MASS_DIFF
@@ -62,6 +64,7 @@ def _poly_pow(base: torch.Tensor, exponent: int) -> torch.Tensor:
     return result
 
 
+@functools.lru_cache(maxsize=None)
 def _binned_abundances(symbol: str) -> torch.Tensor:
     """Per-element abundance polynomial keyed by mass-number offset from
     the lightest isotope. Empty for symbols with no isotopes.
@@ -83,6 +86,15 @@ def _binned_abundances(symbol: str) -> torch.Tensor:
     for i in natural:
         poly[i.mass_number - base_mn] = i.abundance
     return poly
+
+
+@functools.lru_cache(maxsize=1 << 13)
+def _element_distribution(symbol: str, n: int) -> torch.Tensor:
+    """``symbol``'s abundance polynomial to the ``n``th power: the binned
+    distribution of ``n`` atoms of it. Peptides share element counts, so
+    each power is computed once (the values are those `_poly_pow` gives;
+    callers only read the tensor)."""
+    return _poly_pow(_binned_abundances(symbol), n)
 
 
 def _coerce_counts_dict(
@@ -121,12 +133,10 @@ def isotope_distribution(
     for sym, n in counts.items():
         if n <= 0:
             continue
-        element_abun = _binned_abundances(sym)
-        if len(element_abun) == 1:
+        if len(_binned_abundances(sym)) == 1:
             # mono-isotopic element (P, F, I, Na, ...) — no convolution needed
             continue
-        element_dist = _poly_pow(element_abun, n)
-        result = _poly_mul(result, element_dist)
+        result = _poly_mul(result, _element_distribution(sym, n))
     result = result[:n_peaks]
     result = result.clamp(min=0.0)  # numerical noise can produce tiny negatives
     s = result.sum()
