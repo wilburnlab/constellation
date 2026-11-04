@@ -72,6 +72,9 @@ import constellation.massspec.centroiding
 import constellation.massspec.centroiding.apex
 import constellation.massspec.centroiding.driver
 import constellation.massspec.mz_axis
+import constellation.massspec.sweep
+import constellation.massspec.sweep.queries
+import constellation.massspec.sweep.schemas
 import constellation.massspec.cli.centroid
 import constellation.massspec.cli.mz_axis
 import constellation.core.detach

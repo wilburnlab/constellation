@@ -9,7 +9,12 @@ authoritative parser and renderer for modseq strings inside constellation;
 The grammar lives in [constellation/data/proforma.lark](data/proforma.lark)
 (hand-translated from the upstream EBNF; refresh via
 ``scripts/build-proforma-grammar.py``). The parser is built via lark with
-the Earley algorithm.
+the Earley algorithm, which takes about 10 ms a string. The common simple
+form (global isotope labels, then residues each carrying any number of
+UNIMOD accessions, signed masses or plain names, with terminal mods and a
+charge) is read by a regular expression first, about 200 times faster,
+into exactly the objects the grammar would give; anything else goes to the
+grammar.
 
 Per CLAUDE.md, this module deliberately does NOT import pyteomics — the
 parser is independently implemented from the upstream grammar so that the
@@ -59,6 +64,7 @@ Out of scope this session:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 from functools import cache
 from importlib import resources
@@ -760,6 +766,53 @@ def _to_tagged(item) -> TaggedMod:
 # ──────────────────────────────────────────────────────────────────────
 
 
+# The simple form, read without the grammar. A mod here is a UNIMOD
+# accession, a signed mass or a plain name (letters, digits, '_' and '-');
+# anything else in brackets, lowercase residues, labels, ranges, CV-tagged
+# names and signed charges fall through to the grammar.
+_SIMPLE_MOD = r"\[(?:UNIMOD:\d+|[+-]\d+(?:\.\d+)?|[A-Za-z][A-Za-z0-9_-]*)\]"
+_SIMPLE = re.compile(
+    rf"((?:<(?:\d+[CNOHS]|[DT])>)*)((?:{_SIMPLE_MOD})+-)?((?:[A-Z](?:{_SIMPLE_MOD})*)+)"
+    rf"(-(?:{_SIMPLE_MOD})+)?(?:/([1-9]\d*))?"
+)
+_SIMPLE_RESIDUE = re.compile(rf"([A-Z])((?:{_SIMPLE_MOD})*)")
+_SIMPLE_INNER = re.compile(r"\[([^\]]+)\]")
+_SIMPLE_LABEL = re.compile(r"<([^>]+)>")
+
+
+def _simple_modref(text: str) -> ModRef:
+    if text.startswith("UNIMOD:"):
+        return ModRef(cv="UNIMOD", accession=text[7:])
+    if text[0] in "+-":
+        return ModRef(cv=None, mass_delta=float(text))
+    return ModRef(cv=None, name=text)
+
+
+def _simple_mods(block: str) -> tuple[TaggedMod, ...]:
+    return tuple(TaggedMod(mod=_simple_modref(t)) for t in _SIMPLE_INNER.findall(block))
+
+
+def _parse_simple(s: str) -> Peptidoform | None:
+    """The simple form as the grammar would give it; None for anything else."""
+    m = _SIMPLE.fullmatch(s)
+    if m is None:
+        return None
+    isotopes, nterm, body, cterm, charge = m.groups()
+    sequence, residue_mods = [], {}
+    for i, r in enumerate(_SIMPLE_RESIDUE.finditer(body)):
+        sequence.append(r.group(1))
+        if r.group(2):
+            residue_mods[i] = _simple_mods(r.group(2))
+    return Peptidoform(
+        sequence="".join(sequence),
+        residue_mods=residue_mods,
+        n_term_mods=_simple_mods(nterm[:-1]) if nterm else (),
+        c_term_mods=_simple_mods(cterm[1:]) if cterm else (),
+        global_isotopes=tuple(_SIMPLE_LABEL.findall(isotopes)),
+        charge=int(charge) if charge else None,
+    )
+
+
 def parse_proforma(s: str) -> ProFormaResult:
     """Parse a ProForma 2.0 string into a Peptidoform or MultiPeptidoform.
 
@@ -771,6 +824,16 @@ def parse_proforma(s: str) -> ProFormaResult:
     """
     if not s:
         raise ProFormaSyntaxError("empty input")
+    simple = _parse_simple(s)
+    if simple is not None:
+        _validate(simple)
+        return simple
+    return _parse_with_grammar(s)
+
+
+def _parse_with_grammar(s: str) -> ProFormaResult:
+    """Parse through the full grammar (what :func:`parse_proforma` does for
+    anything but the simple form)."""
     try:
         tree = _parser().parse(s)
     except LarkError as e:

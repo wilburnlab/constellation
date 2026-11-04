@@ -202,3 +202,22 @@ def test_isotopologue_distribution_requires_composition():
     c = Composition.from_formula("CN")
     with pytest.raises(TypeError):
         isotopologue_distribution(c.counts)  # type: ignore[arg-type]
+
+
+def test_cached_element_powers_give_the_uncached_distribution():
+    """Each element's power is computed once and reused; the distribution
+    must be what multiplying fresh powers gives, bit for bit."""
+    from constellation.core.chem.isotopes import _binned_abundances, _poly_mul, _poly_pow
+
+    for formula in ("C43H70N12O13S1", "C100H160N28O30", "C5H9N1O2S2", "C200H320N60O60S4P1"):
+        comp = Composition.from_formula(formula)
+        fresh = torch.ones(1)
+        for sym, n in comp.atoms.items():
+            abun = _binned_abundances.__wrapped__(sym)
+            if n > 0 and len(abun) > 1:
+                fresh = _poly_mul(fresh, _poly_pow(abun, n))
+        fresh = fresh[:5].clamp(min=0.0)
+        fresh = fresh / fresh.sum()
+        for _ in range(2):  # the second call reads the cache
+            got = isotope_distribution(comp, n_peaks=5)
+            assert torch.equal(got, fresh)

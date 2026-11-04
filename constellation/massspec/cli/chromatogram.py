@@ -60,10 +60,11 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
     p = subs.add_parser(
         "extract",
         help=(
-            "Extract XIC traces. --level selects MS1 (precursor isotopes) "
-            "or MS2 (fragments); it is the MS-level selector, NOT a scan "
-            "filter — scan selection is derived from each target's RT / "
-            "isolation / assigned scan."
+            "Extract XIC traces. --level selects MS1 (precursor isotopes), "
+            "MS2 (fragments) or both in one pass; it is the MS-level selector, "
+            "NOT a scan filter — scan selection is derived from each target's "
+            "RT / isolation / assigned scan. A bundle is swept once, every "
+            "target matched against each scan together."
         ),
     )
     common = p.add_argument_group("common")
@@ -73,20 +74,71 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
                         help="Target list: a Library / Search / PRECURSOR_QUANT bundle, "
                              "or a bare XIC_TARGET_TABLE .parquet/.tsv (auto-detected).")
     common.add_argument("-o", "--output-dir", type=Path, required=True)
-    common.add_argument("--level", type=int, choices=(1, 2), required=True,
-                        help="MS level to extract from (1 = precursor isotopes, 2 = fragments).")
+    common.add_argument("--level", choices=("1", "2", "both"), required=True,
+                        help="MS level to extract from (1 = precursor isotopes, 2 = fragments, "
+                             "both = the two in one sweep).")
     common.add_argument("--acquisition-id", type=int, default=0,
                         help="acquisition_id stamped on output rows (FK; default 0).")
-    common.add_argument("--tolerance", type=float, default=20.0)
+    common.add_argument("--tolerance", type=float, default=20.0,
+                        help="Match tolerance at every level without its own (default 20).")
     common.add_argument("--tolerance-unit", choices=("ppm", "Da"), default="ppm")
+    for level in (1, 2):
+        common.add_argument(f"--ms{level}-tolerance", type=float, default=None,
+                            help=f"MS{level} match tolerance (default --tolerance).")
+        common.add_argument(f"--ms{level}-tolerance-unit", choices=("ppm", "Da"), default=None,
+                            help=f"Unit of --ms{level}-tolerance (default --tolerance-unit).")
     common.add_argument("--rt-window", type=float, default=None,
                         help="Half-width (s) around each target's rt_center; explicit "
                              "rt_start/rt_end in the target override it; absent → all-RT.")
+    common.add_argument("--rule", choices=("nearest", "all", "sum"), default=None,
+                        help="What a tolerance window gives: the nearest peak (default), every "
+                             "peak in it, or their summed intensity as one row.")
     common.add_argument("--all-in-window", action="store_true",
-                        help="Return every peak within tolerance per (scan, ion), not just nearest.")
+                        help="Same as --rule all.")
     common.add_argument("--no-drop-unmatched", dest="drop_unmatched", action="store_false",
                         help="Keep unmatched query rows (intensity 0) instead of dropping.")
     common.add_argument("--no-progress", action="store_true")
+
+    sweepg = p.add_argument_group("sweep (default mode)")
+    sweepg.add_argument("--mz-axis", default=None, metavar="KEY",
+                        help="Correct observed m/z with the bundle's measured m/z axis KEY "
+                             "(or `latest`) before matching.")
+    sweepg.add_argument("--workers", type=int, default=_default_workers(),
+                        help="Processes sweeping a bundle's scan ranges (default: the cores, "
+                             "up to 4, about 3 GB each; 1 sweeps in this process).")
+    sweepg.add_argument("--work-dir", type=Path, default=None,
+                        help="Where the workers' matches go (default <output-dir>/.sweep, "
+                             "removed when done).")
+    sweepg.add_argument("--claims", action="store_true",
+                        help="Also write point_claims.parquet: every peak matched by more than "
+                             "one target, or by two channels of one, with each of them.")
+    sweepg.add_argument("--summary", action="store_true",
+                        help="Also write query_summary.parquet: per target, the evidence gate's "
+                             "verdict, the scans it could be matched in and the cells (a channel "
+                             "in a scan) matched.")
+
+    gateg = p.add_argument_group(
+        "evidence gate (sweep; any of these turns it on)",
+        "A target counts as seen when a run of its MS2 scans each match enough distinct "
+        "fragment bonds among the scan's most intense peaks. At low-resolution tolerances "
+        "a bare count passes almost anything; see the summary's counts to set it.",
+    )
+    gateg.add_argument("--gate", action="store_true",
+                       help="Turn the gate on with its defaults (6 bonds among each scan's 50 most "
+                            "intense peaks, 3 scans in a row).")
+    gateg.add_argument("--min-fragments", type=int, default=None,
+                       help="Distinct fragment bonds a scan must show (default 6).")
+    gateg.add_argument("--evidence-top-peaks", type=int, default=None,
+                       help="Count only each scan's most intense N peaks; 0 for all (default 50).")
+    gateg.add_argument("--min-consecutive-scans", type=int, default=None,
+                       help="Evidence scans in a row a target must show (default 3).")
+    gateg.add_argument("--max-gap-s", type=float, default=None,
+                       help="Longest RT step (s) within such a run (default none).")
+    gateg.add_argument("--min-isotopes", type=int, default=None,
+                       help="Gate targets without fragments on this many isotopes per MS1 scan "
+                            "(default: they pass).")
+    gateg.add_argument("--only-passing", action="store_true",
+                       help="Write only the targets the gate passed into the trace.")
 
     idxg = p.add_argument_group("index (Mode B)")
     idxg.add_argument("--use-index", action="store_true",
@@ -101,14 +153,14 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
                       help="Mode B + f32-m/z index: re-derive f64 mz error for survivors "
                            "from --peaks-dir.")
 
-    ms1g = p.add_argument_group("MS1 precursor-isotope options (with --level 1)")
+    ms1g = p.add_argument_group("MS1 precursor-isotope options (with --level 1 or both)")
     ms1g.add_argument("--n-isotopes", type=int, default=_DEFAULT_N_ISOTOPES,
                       help="Isotope peaks M+0..M+(n-1) (default 3).")
     ms1g.add_argument("--charge-range", type=int, nargs=2, metavar=("LO", "HI"),
                       default=list(_DEFAULT_CHARGE_RANGE),
                       help="Precursor charge sweep (default 1 4).")
 
-    ms2g = p.add_argument_group("MS2 fragment options (with --level 2)")
+    ms2g = p.add_argument_group("MS2 fragment options (with --level 2 or both)")
     ms2g.add_argument("--ion-types", default="b,y",
                       help="Comma-separated fragment ion types (default b,y).")
     ms2g.add_argument("--max-fragment-charge", type=int, default=_DEFAULT_MAX_FRAG_CHARGE,
@@ -118,6 +170,14 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
     ms2g.add_argument("--assigned-scans-only", action="store_true",
                       help="Restrict MS2 to each target's assigned scan (requires a scan column).")
     p.set_defaults(func=_cmd_chromatogram_extract)
+
+
+def _default_workers() -> int:
+    """Four at most: each worker holds about 3 GB at peak, and four sweep
+    a whole run 2.4–2.8× faster than one (docs/plans/sweep.md)."""
+    import os
+
+    return max(1, min(4, os.cpu_count() or 1))
 
 
 def _parse_downcast(s: str) -> tuple[str, ...]:
@@ -158,13 +218,17 @@ def _resolve_ion_types(spec: str):
 
 
 def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
+    import shutil
+
     from constellation.massspec.quant.chromatogram import (
+        extract_xic,
         extract_xic_indexed,
-        extract_xic_scan_major,
         save_xic,
+        write_xic_manifest,
     )
     from constellation.massspec.quant.peak_index import INDEX_DIRNAME, build_peak_index
     from constellation.massspec.quant.targets import load_targets
+    from constellation.massspec.sweep import ChannelSettings
 
     if not args.peaks_dir.exists():
         print(f"error: peaks not found: {args.peaks_dir}", file=sys.stderr)
@@ -172,6 +236,35 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
     if not args.targets.exists():
         print(f"error: targets not found: {args.targets}", file=sys.stderr)
         return 2
+    levels = [1, 2] if args.level == "both" else [int(args.level)]
+    if args.all_in_window and args.rule not in (None, "all"):
+        print(f"error: --all-in-window is --rule all; it contradicts --rule {args.rule}", file=sys.stderr)
+        return 2
+    rule = args.rule or ("all" if args.all_in_window else "nearest")
+    def given(value, default):
+        return default if value is None else value  # an explicit 0 is a tolerance
+
+    tolerances = {
+        level: (
+            given(getattr(args, f"ms{level}_tolerance"), args.tolerance),
+            given(getattr(args, f"ms{level}_tolerance_unit"), args.tolerance_unit),
+        )
+        for level in levels
+    }
+    bad = [f"MS{lv} {tol:g}" for lv, (tol, _) in tolerances.items() if tol < 0]
+    if bad:
+        print(f"error: a tolerance cannot be negative ({', '.join(bad)})", file=sys.stderr)
+        return 2
+    if args.min_consecutive_scans is not None and args.min_consecutive_scans < 1:
+        print("error: --min-consecutive-scans is at least 1 (a run of none would pass every target)",
+              file=sys.stderr)  # fmt: skip
+        return 2
+    gate_flags = {
+        "--gate": args.gate, "--min-fragments": args.min_fragments is not None,
+        "--evidence-top-peaks": args.evidence_top_peaks is not None,
+        "--min-consecutive-scans": args.min_consecutive_scans is not None,
+        "--max-gap-s": args.max_gap_s is not None, "--min-isotopes": args.min_isotopes is not None,
+    }  # fmt: skip
 
     _warn_level_flag_mismatch(args)
     targets = load_targets(args.targets)
@@ -180,17 +273,21 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
     neutral_losses = _parse_downcast(args.neutral_losses) if args.neutral_losses else None
 
     use_index = args.use_index or args.rebuild_index
-    common = dict(
-        acquisition_id=args.acquisition_id, level=args.level,
-        n_isotopes=args.n_isotopes, ion_types=ion_types,
-        max_fragment_charge=args.max_fragment_charge, neutral_losses=neutral_losses,
-        charge_range=charge_range, rt_window=args.rt_window,
-        tolerance=args.tolerance, tolerance_unit=args.tolerance_unit,
-        all_in_window=args.all_in_window, assigned_scans_only=args.assigned_scans_only,
-        drop_unmatched=args.drop_unmatched,
-    )
-
     if use_index:
+        if len(levels) > 1 or rule == "sum":
+            print("error: the mass index (--use-index) extracts one level at a time, by the "
+                  "nearest peak or all peaks in a window", file=sys.stderr)  # fmt: skip
+            return 2
+        sweep_only = [flag for flag, on in {
+            **gate_flags, "--only-passing": args.only_passing, "--mz-axis": args.mz_axis is not None,
+            "--claims": args.claims, "--summary": args.summary, "--work-dir": args.work_dir is not None,
+        }.items() if on]  # fmt: skip
+        if sweep_only:
+            print(f"error: {', '.join(sweep_only)} belong to the sweep; the mass index "
+                  "(--use-index) does not apply them", file=sys.stderr)  # fmt: skip
+            return 2
+        level = levels[0]
+        tolerance, tolerance_unit = tolerances[level]
         index_dir = args.index_dir or (args.peaks_dir / INDEX_DIRNAME)
         manifest_exists = (index_dir / "manifest.json").exists()
         if args.rebuild_index or not manifest_exists:
@@ -198,29 +295,117 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
                 print(f"building peak index at {index_dir}", file=sys.stderr)
             build_peak_index(args.peaks_dir, index_dir, downcast=_parse_downcast(args.downcast))
         table = extract_xic_indexed(
-            index_dir, targets, exact_error=args.exact_error, peaks_dir=args.peaks_dir, **common
+            index_dir, targets, exact_error=args.exact_error, peaks_dir=args.peaks_dir,
+            acquisition_id=args.acquisition_id, level=level, n_isotopes=args.n_isotopes,
+            ion_types=ion_types, max_fragment_charge=args.max_fragment_charge,
+            neutral_losses=neutral_losses, charge_range=charge_range, rt_window=args.rt_window,
+            tolerance=tolerance, tolerance_unit=tolerance_unit,
+            all_in_window=rule == "all", assigned_scans_only=args.assigned_scans_only,
+            drop_unmatched=args.drop_unmatched,
+        )  # fmt: skip
+        save_xic(table, args.output_dir, metadata={
+            "level": level, "mode": "indexed", "tolerance": tolerance, "tolerance_unit": tolerance_unit,
+        })  # fmt: skip
+        if not args.no_progress:
+            print(f"extracted {table.num_rows} XIC rows → {args.output_dir}", file=sys.stderr)
+        return 0
+
+    bundle = (args.peaks_dir / "manifest.json").is_file()
+    if bundle:
+        _warn_tolerance_against_analyzer(args.peaks_dir, tolerances)
+    elif args.mz_axis is not None:
+        print("error: --mz-axis needs a converted bundle as --peaks-dir", file=sys.stderr)
+        return 2
+    gate = None
+    if any(gate_flags.values()):
+        from constellation.massspec.sweep.evidence import EvidenceGate
+
+        default = EvidenceGate()
+        top = args.evidence_top_peaks
+        gate = EvidenceGate(
+            min_fragments=given(args.min_fragments, default.min_fragments),
+            top_peaks=default.top_peaks if top is None else (top or None),
+            min_consecutive=given(args.min_consecutive_scans, default.min_consecutive),
+            max_gap_s=args.max_gap_s,
+            min_isotopes=args.min_isotopes,
         )
-    else:
-        from constellation.massspec.bundle import open_peaks
-
-        peaks = open_peaks(args.peaks_dir).to_table()
-        table = extract_xic_scan_major(peaks, targets, **common)
-
-    save_xic(table, args.output_dir, metadata={
-        "level": args.level, "mode": "indexed" if use_index else "scan_major",
-        "tolerance": args.tolerance, "tolerance_unit": args.tolerance_unit,
-    })
+    if args.only_passing and gate is None:
+        print("error: --only-passing needs a gate (--gate, or --min-fragments and friends)", file=sys.stderr)
+        return 2
+    on_disk = bundle and (args.workers > 1 or args.work_dir is not None)
+    work = (args.work_dir or args.output_dir / ".sweep") if on_disk else None
+    progress = None
     if not args.no_progress:
-        print(f"extracted {table.num_rows} XIC rows → {args.output_dir}", file=sys.stderr)
+        from constellation.core.progress import StreamProgress
+
+        progress = StreamProgress()
+    result = extract_xic(
+        args.peaks_dir, targets, acquisition_id=args.acquisition_id, levels=levels,
+        tolerances=tolerances,
+        channels=ChannelSettings(n_isotopes=args.n_isotopes, charge_range=charge_range,
+                                 ion_types=ion_types, max_fragment_charge=args.max_fragment_charge,
+                                 neutral_losses=neutral_losses),
+        rt_window=args.rt_window, rule=rule, assigned_scans_only=args.assigned_scans_only,
+        drop_unmatched=args.drop_unmatched, mz_axis=args.mz_axis, gate=gate,
+        only_passing=args.only_passing, claims=args.claims, summary=args.summary,
+        workers=args.workers if on_disk else 1, work_dir=work, progress=progress,
+    )  # fmt: skip
+    # The result stamps each output with the tolerances (Counter reads the trace's).
+    out = result.write("xic_trace", args.output_dir / "xic_trace.parquet")
+    tables = ["xic_trace.parquet"]
+    for name, flag in (("point_claims", args.claims), ("query_summary", args.summary)):
+        if flag:
+            result.write(name, args.output_dir / f"{name}.parquet")
+            tables.append(f"{name}.parquet")
+    metadata = {
+        "levels": levels, "mode": "scan_major", "engine": "sweep", "rule": rule,
+        "tolerances": {str(lv): {"value": t, "unit": u} for lv, (t, u) in tolerances.items()},
+        "mz_axis": result.mz_axis, "tables": tables,
+        "gate": None if gate is None else {
+            "min_fragments": gate.min_fragments, "top_peaks": gate.top_peaks,
+            "min_consecutive": gate.min_consecutive, "max_gap_s": gate.max_gap_s,
+            "min_isotopes": gate.min_isotopes, "only_passing": args.only_passing,
+        },
+    }  # fmt: skip
+    if len(levels) == 1:
+        metadata.update(level=levels[0], tolerance=tolerances[levels[0]][0],
+                        tolerance_unit=tolerances[levels[0]][1])  # fmt: skip
+    write_xic_manifest(args.output_dir, metadata=metadata)
+    if work is not None and args.work_dir is None:
+        shutil.rmtree(work, ignore_errors=True)
+    if not args.no_progress:
+        import pyarrow.parquet as pq
+
+        rows = pq.ParquetFile(out).metadata.num_rows
+        print(f"extracted {rows} XIC rows → {args.output_dir}", file=sys.stderr)
     return 0
+
+
+def _warn_tolerance_against_analyzer(bundle: Path, tolerances: dict[int, tuple[float, str]]) -> None:
+    """Warn when a level's tolerance is in the other unit from what its scans'
+    analyzer reads to (ion traps in Da, Orbitraps and TOFs in ppm)."""
+    from constellation.massspec.scans import default_tolerance, open_acquisition
+
+    analyzers = open_acquisition(bundle).analyzers
+    for level, (tol, unit) in tolerances.items():
+        found = analyzers.get(level)
+        if not found:
+            continue
+        usual, usual_unit = default_tolerance(found)
+        if usual_unit != unit:
+            print(
+                f"warning: MS{level} scans were read by {', '.join(found)}, usually matched "
+                f"within {usual:g} {usual_unit}; the tolerance given is {tol:g} {unit}",
+                file=sys.stderr,
+            )
 
 
 def _warn_level_flag_mismatch(args: argparse.Namespace) -> None:
     """Warn when a flag from the inactive level's group was set."""
-    if args.level == 1:
+    if args.level == "1":
         if args.ion_types != "b,y" or args.max_fragment_charge != _DEFAULT_MAX_FRAG_CHARGE \
                 or args.neutral_losses or args.assigned_scans_only:
             print("warning: MS2 fragment options ignored with --level 1", file=sys.stderr)
-    elif args.level == 2:
+    elif args.level == "2":
         if args.n_isotopes != _DEFAULT_N_ISOTOPES or tuple(args.charge_range) != _DEFAULT_CHARGE_RANGE:
             print("warning: MS1 isotope options ignored with --level 2", file=sys.stderr)

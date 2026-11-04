@@ -362,9 +362,15 @@ def _resolve_collide_ppm(args: argparse.Namespace) -> float:
             meta = pq.read_schema(schema_path).metadata or {}
         except Exception:  # noqa: BLE001 — unreadable footer → treat as unrecorded
             meta = {}
-        tol_b = meta.get(b"x.massspec.extraction_tolerance")
-        if tol_b is not None and meta.get(b"x.massspec.extraction_tolerance_unit") == b"ppm":
-            extraction_tol = float(tol_b.decode("utf-8"))
+        # A trace spanning MS levels records each level's tolerance; Counter
+        # works on MS1, so its own comes first.
+        for suffix in (b".ms1", b""):
+            tol_b = meta.get(b"x.massspec.extraction_tolerance" + suffix)
+            unit_b = meta.get(b"x.massspec.extraction_tolerance_unit" + suffix)
+            if tol_b is not None:
+                if unit_b == b"ppm":
+                    extraction_tol = float(tol_b.decode("utf-8"))
+                break
     if extraction_tol is None:
         if not args.no_progress:
             print(

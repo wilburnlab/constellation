@@ -68,6 +68,25 @@ def peptide_envelope(
         )
     if z <= 0:
         raise ValueError(f"charge must be positive; got {z}")
+
+    masses_neutral, intensities = neutral_envelope(
+        peptidoform, n_peaks=n_peaks, mode=mode, bin_width_da=bin_width_da, vocab=vocab
+    )
+    return envelope_mz(masses_neutral, z), intensities
+
+
+@requires_canonical
+def neutral_envelope(
+    peptidoform: Peptidoform,
+    *,
+    n_peaks: int = 5,
+    mode: EnvelopeMode = "binned",
+    bin_width_da: float = 1e-3,
+    vocab: ModVocab = UNIMOD,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A peptidoform's isotope envelope as neutral masses and intensities,
+    before any charge: what `peptide_envelope` puts at each charge with
+    `envelope_mz`, so the envelope of several charges is computed once."""
     if peptidoform.global_isotopes and mode == "exact":
         raise NotImplementedError(
             "global isotope labels (<13C>, <15N>, ...) in exact-envelope "
@@ -75,7 +94,6 @@ def peptide_envelope(
             "core.chem.isotopes layer; deferred until a concrete consumer "
             "drives the design"
         )
-
     composition = peptide_composition(peptidoform, vocab=vocab)
 
     if mode == "binned":
@@ -96,11 +114,12 @@ def peptide_envelope(
     offset = canonical_neutral - skeleton_neutral
     if offset != 0.0:
         masses_neutral = masses_neutral + offset
-
-    masses_mz = (
-        masses_neutral.to(torch.float64) + z * PROTON_MASS
-    ) / z
-    return masses_mz, intensities
+    return masses_neutral, intensities
 
 
-__all__ = ["peptide_envelope", "EnvelopeMode"]
+def envelope_mz(masses_neutral: torch.Tensor, charge: int) -> torch.Tensor:
+    """Neutral envelope masses as m/z at ``charge`` (protonated)."""
+    return (masses_neutral.to(torch.float64) + charge * PROTON_MASS) / charge
+
+
+__all__ = ["peptide_envelope", "neutral_envelope", "envelope_mz", "EnvelopeMode"]
