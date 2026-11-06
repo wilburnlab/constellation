@@ -20,7 +20,6 @@ read-ingest pathway and is still stubbed pending Phase 2 (it targets
 
 from __future__ import annotations
 
-import gzip
 import json
 from collections.abc import Iterator
 from pathlib import Path
@@ -30,9 +29,9 @@ from urllib.parse import quote, unquote
 import pyarrow as pa
 
 from constellation.core.io.readers import RawReader, ReadResult, register_reader
+from constellation.core.io.text import open_text
 from constellation.sequencing.annotation.annotation import Annotation
 from constellation.sequencing.reference.reference import GenomeReference
-
 
 _PHASE = "Phase 2 (readers/gff RawReader subclass)"
 
@@ -43,10 +42,8 @@ _RESERVED_ATTRS: frozenset[str] = frozenset(
 )
 
 
-def _open_text(path: Path) -> Any:
-    if path.suffix == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8")
-    return path.open("r", encoding="utf-8")
+#: gzip-aware text opener, shared (``constellation.core.io.text``).
+_open_text = open_text
 
 
 def _parse_attributes(attr_col: str) -> dict[str, str | list[str]]:

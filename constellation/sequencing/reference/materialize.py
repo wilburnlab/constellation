@@ -18,6 +18,8 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from constellation.core.io.fasta import write_fasta
+
 if TYPE_CHECKING:
     from constellation.sequencing.reference.reference import GenomeReference
 
@@ -86,11 +88,7 @@ def materialise_genome_fasta(
     fasta_path.parent.mkdir(parents=True, exist_ok=True)
     contig_ids = genome.contigs.column("contig_id").to_pylist()
     names = genome.contigs.column("name").to_pylist()
-    with fasta_path.open("w", encoding="utf-8") as fh:
-        for contig_id, name in zip(contig_ids, names):
-            fh.write(f">{name}\n")
-            fh.write(genome.sequence_of(int(contig_id)))
-            fh.write("\n")
+    write_fasta(fasta_path, (genome.sequence_of(int(c)) for c in contig_ids), names)
     meta_path.write_text(
         json.dumps(
             {

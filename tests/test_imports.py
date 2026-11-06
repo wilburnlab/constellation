@@ -18,8 +18,10 @@ import constellation.core.graph
 import constellation.core.graph.network
 import constellation.core.io
 import constellation.core.io.bundle
+import constellation.core.io.fasta
 import constellation.core.io.readers
 import constellation.core.io.schemas
+import constellation.core.io.text
 import constellation.core.progress
 import constellation.core.manifests
 import constellation.core.stages

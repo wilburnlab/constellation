@@ -38,13 +38,13 @@ to support it (``Reference.load_genome()`` returns the same
 
 from __future__ import annotations
 
-import gzip
 import json as _json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from constellation.core.io.text import open_text
 from constellation.sequencing.reference.handle import (
     Handle,
     ReferenceNotInstalledError,
@@ -52,7 +52,6 @@ from constellation.sequencing.reference.handle import (
     read_meta_toml,
     resolve,
 )
-
 
 __all__ = ["Reference"]
 
@@ -363,6 +362,7 @@ def _gene_map_from_parquet(annotation_dir: Path) -> dict[str, str]:
     attributes land in the JSON blob (not promoted to columns).
     """
     import pyarrow.compute as pc
+
     from constellation.sequencing.annotation.io import load_annotation
 
     annotation = load_annotation(annotation_dir)
@@ -467,9 +467,5 @@ def _gene_map_from_gbff(path: Path) -> dict[str, str]:
     return out
 
 
-def _open_text(path: Path):
-    """Open a FASTA / GBFF / GFF3 for text reading, transparently
-    handling gzip."""
-    if path.suffix == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8")
-    return path.open("r", encoding="utf-8")
+#: gzip-aware text opener, shared (``constellation.core.io.text``).
+_open_text = open_text

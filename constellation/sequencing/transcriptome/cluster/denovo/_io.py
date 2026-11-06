@@ -15,6 +15,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+# Aliased: the writers below take a ``write_fasta`` flag.
+from constellation.core.io.fasta import write_fasta as _write_fasta
 from constellation.sequencing.align.map import (
     _iter_demux_read_batches,
     transcript_window_buffers,
@@ -143,14 +145,6 @@ def load_demux_windows(
     return reads.take(order), stats
 
 
-def _write_fasta(path: Path, ids: list[str], seqs: list[str]) -> None:
-    with path.open("w", encoding="utf-8") as fh:
-        for name, seq in zip(ids, seqs):
-            if not seq:
-                continue
-            fh.write(f">{name}\n{seq}\n")
-
-
 def _sample_name_map(samples: Any | None) -> dict[int, str]:
     if samples is None:
         return {}
@@ -267,7 +261,7 @@ def write_outputs(
         cids = result.clusters.column("cluster_id").to_pylist()
         cons = result.clusters.column("consensus_sequence").to_pylist()
         fa_path = output_dir / "cluster.fa"
-        _write_fasta(fa_path, [f"cluster_{c}" for c in cids], [s or "" for s in cons])
+        _write_fasta(fa_path, [s or "" for s in cons], [f"cluster_{c}" for c in cids], skip_empty=True)
         outputs["cluster_fa"] = "cluster.fa"
         paths["fasta"] = fa_path
         if predict_orfs:
@@ -275,7 +269,7 @@ def write_outputs(
             prot_ids = [f"cluster_{c}" for c, p in zip(cids, prot) if p]
             prot_seqs = [p for p in prot if p]
             prot_path = output_dir / "proteins.fasta"
-            _write_fasta(prot_path, prot_ids, prot_seqs)
+            _write_fasta(prot_path, prot_seqs, prot_ids, skip_empty=True)
             outputs["proteins_fasta"] = "proteins.fasta"
             paths["proteins"] = prot_path
 

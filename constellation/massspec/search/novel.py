@@ -743,45 +743,30 @@ def build_gene_map_from_fasta_headers(
     ``combined.fasta``) and pass the dict in to
     :func:`classify_novel_peptides`.
     """
+    from constellation.core.io.fasta import iter_fasta, parse_header
+
     out: dict[str, str] = {}
     for fasta_path in fasta_paths:
         p = Path(fasta_path)
         if not p.is_file():
             continue
-        with p.open() as fh:
-            for line in fh:
-                if not line.startswith(">"):
-                    continue
-                header = line[1:].rstrip("\n")
-                tokens = header.split()
-                if not tokens:
-                    continue
-                accession = tokens[0]
-                gene: str | None = None
-                for token in tokens[1:]:
-                    # Strip surrounding brackets so '[gene=SYMBOL]' and
-                    # 'gene=SYMBOL' both match.
-                    bare = token.strip("[]")
-                    if bare.startswith("gene="):
-                        gene = bare[len("gene="):]
-                        break
-                    if bare.startswith("GN="):
-                        gene = bare[len("GN="):]
-                        break
-                # Skip the literal "unknown" sentinel — Constellation's
-                # ``build_combined_fasta`` emits ``[gene=unknown]`` for
-                # every entry without a known gene so the tag structure
-                # stays uniform; trusting that as a real gene symbol
-                # would corrupt the map.
-                if gene and gene.lower() != "unknown":
-                    out[accession] = gene
-                    # UniProt sp|ACC|NAME — register bare ACC as alias
-                    # so lookups by the bare accession (what mmseqs2
-                    # reports for SwissProt targets) succeed.
-                    if "|" in accession:
-                        parts = accession.split("|")
-                        if len(parts) >= 2 and parts[1]:
-                            out.setdefault(parts[1], gene)
+        for record in iter_fasta(p):
+            header = parse_header(record.header)
+            if not header.id:
+                continue
+            gene = header.gene
+            # Skip the literal "unknown" sentinel — Constellation's
+            # ``build_combined_fasta`` emits ``[gene=unknown]`` for
+            # every entry without a known gene so the tag structure
+            # stays uniform; trusting that as a real gene symbol
+            # would corrupt the map.
+            if gene and gene.lower() != "unknown":
+                out[header.id] = gene
+                # UniProt sp|ACC|NAME — register bare ACC as alias
+                # so lookups by the bare accession (what mmseqs2
+                # reports for SwissProt targets) succeed.
+                if header.accession != header.id:
+                    out.setdefault(header.accession, gene)
     return out
 
 
@@ -812,27 +797,19 @@ def protein_to_gene_from_swissprot(fasta_path: "Path | str") -> dict[str, str]:
         :func:`build_combined_fasta`'s ``reference_gene_map`` argument
         (merged with the RefSeq ``.gbff`` map for full coverage).
     """
-    import re as _re
+    from constellation.core.io.fasta import iter_fasta, parse_header
 
     mapping: dict[str, str] = {}
     p = Path(fasta_path)
     if not p.is_file():
         return mapping
-    with p.open() as fh:
-        for line in fh:
-            if not line.startswith(">"):
-                continue
-            header = line[1:].rstrip("\n")
-            parts = header.split("|")
-            if len(parts) >= 2 and parts[1]:
-                key = parts[1]
-            else:
-                key = header.split()[0] if header.split() else ""
-            if not key:
-                continue
-            m = _re.search(r"\bGN=(\S+)", header)
-            if m:
-                mapping[key] = m.group(1)
+    for record in iter_fasta(p):
+        header = parse_header(record.header)
+        if not header.accession:
+            continue
+        gene = header.tag("GN")
+        if gene:
+            mapping[header.accession] = gene.split()[0]
     return mapping
 
 
@@ -842,29 +819,17 @@ def read_fasta_proteins(path: "Path | str") -> pa.Table:
     Convenience reader for the CLI handler: yields a
     ``(protein_id: string, sequence: string)`` table where ``protein_id``
     is the first whitespace-delimited token of each header line and
-    ``sequence`` is the concatenated uppercase AA sequence.
+    ``sequence`` is the concatenated uppercase AA sequence. Parsing is
+    :func:`constellation.core.io.fasta.iter_fasta` (gzip, CRLF, ``;``
+    comments, whitespace inside sequences removed).
     """
-    p = Path(path)
+    from constellation.core.io.fasta import iter_fasta, split_header
+
     protein_ids: list[str] = []
     sequences: list[str] = []
-    current_id: str | None = None
-    current_seq: list[str] = []
-    with p.open() as fh:
-        for line in fh:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            if line.startswith(">"):
-                if current_id is not None:
-                    protein_ids.append(current_id)
-                    sequences.append("".join(current_seq).upper())
-                current_id = line[1:].split()[0] if len(line) > 1 else ""
-                current_seq = []
-            else:
-                current_seq.append(line)
-        if current_id is not None:
-            protein_ids.append(current_id)
-            sequences.append("".join(current_seq).upper())
+    for record in iter_fasta(path):
+        protein_ids.append(split_header(record.header)[0])
+        sequences.append(record.sequence.upper())
     return pa.table(
         {
             "protein_id": pa.array(protein_ids, type=pa.string()),
