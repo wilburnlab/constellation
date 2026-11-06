@@ -75,6 +75,12 @@ class RtModel:
     scale: str = "irt"
     max_length: int | None = None
     supported_mods: frozenset[str] | None = None
+    #: Write pyro-Glu (UNIMOD:27/28) on the first residue, ``Q[UNIMOD:28]…``,
+    #: not on the N-terminus. Koina's Chronologer_RT gives JChronologer's
+    #: retention time only that way (measured 2026-11-06: QTALVELLK 1247.45 s
+    #: both, against 1073.44 s for ``[UNIMOD:28]-QTALVELLK``; EAC…K 672.40 s);
+    #: Chronologer was trained on residue-attached pyro-Glu.
+    pyro_glu_on_first_residue: bool = False
     registered: bool = True
 
 
@@ -115,7 +121,7 @@ RT_MODELS: dict[str, RtModel] = {
         # Chronologer emits minutes on its own gradient; everything else
         # emits unitless iRT. Both are calibrated to an observed gradient
         # downstream — the conversion here only fixes the unit.
-        RtModel("Chronologer_RT", to_seconds=60.0, scale="minutes"),
+        RtModel("Chronologer_RT", to_seconds=60.0, scale="minutes", pyro_glu_on_first_residue=True),
         RtModel("Prosit_2019_irt"),
         RtModel("Prosit_2024_irt_cit"),
         RtModel("AlphaPept_rt_generic"),

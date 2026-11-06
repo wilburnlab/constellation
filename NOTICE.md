@@ -18,3 +18,18 @@ The relevant files are
 and
 [`constellation/viz/frontend/index.genome.html`](constellation/viz/frontend/index.genome.html)
 (`:root` CSS variable blocks).
+
+## Mass-spectrometry models
+
+Constellation runs the TorchScript models of **JChronologer**
+(<https://github.com/searlelab/jchronologer>, Apache-2.0, Searle lab),
+the library predictor EncyclopeDIA ships, by reading them from the
+user's installed EncyclopeDIA; it does not redistribute the models. The
+tokenizer in
+[`constellation/massspec/tokenize/jchronologer.py`](constellation/massspec/tokenize/jchronologer.py)
+ports JChronologer's preprocessing rules. Four of its model
+preprocessing files (`*.preprocessing.json`) are copied unmodified under
+[`tests/data/jchronologer/`](tests/data/jchronologer/) as test fixtures,
+under the Apache License 2.0
+(<https://www.apache.org/licenses/LICENSE-2.0>); copyright remains with
+their authors.

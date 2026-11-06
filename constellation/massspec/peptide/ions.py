@@ -544,17 +544,75 @@ def _validate_linear_peptidoform(peptidoform: Peptidoform) -> None:
             )
 
 
+#: ``global isotopes -> {residue: mass with the labels' shift}``, made
+#: once per labelling. ``Composition.mass`` is a torch reduction (about
+#: 13 µs a call), and the ladder used to pay it for every residue of every
+#: peptide: 275 µs a tryptic peptide, 11 minutes for a proteome's 2.5M
+#: (2026-11-05). The standard residues' compositions never change, so the
+#: values are the same floats as before.
+_RESIDUE_MASSES: dict[tuple[str, ...], dict[str, float]] = {}
+
+#: The residues the ladder takes, for a fast check before ``validate``.
+_AA_RESIDUES: frozenset[str] | None = None
+
+
+def _residue_masses(isotopes: tuple[str, ...]) -> dict[str, float]:
+    masses = _RESIDUE_MASSES.get(isotopes)
+    if masses is None:
+        assert AA.compositions is not None
+        masses = _RESIDUE_MASSES[isotopes] = {
+            r: c.mass + _isotope_shift_for_composition(c, isotopes)
+            for r, c in AA.compositions.items()
+        }
+    return masses
+
+
+def _check_residues(seq: str) -> None:
+    """``validate(seq, AA)``, skipped when every residue is a known one
+    (the common case); ``validate`` still raises on anything else."""
+    global _AA_RESIDUES
+    if _AA_RESIDUES is None:
+        assert AA.compositions is not None
+        _AA_RESIDUES = frozenset(AA.compositions)
+    if not _AA_RESIDUES.issuperset(seq):
+        validate(seq, AA)
+
+
+def _modref_extra(
+    modref: ModRef, vocab: ModVocab, isotopes: tuple[str, ...], cache: dict | None
+) -> tuple[float, str | None]:
+    """A modification's mass contribution (with the labels' shift on the
+    atoms it removes) and its canonical id. ``cache`` holds them for one
+    call over a batch (one vocab), keyed by the ModRef and the labels."""
+    key = (modref, isotopes)
+    if cache is not None:
+        try:
+            hit = cache.get(key)
+        except TypeError:  # an unhashable ModRef: compute it every time
+            cache = None
+        else:
+            if hit is not None:
+                return hit
+    d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=True)
+    value = (d_comp.mass + d_mass + _mod_isotope_shift(d_comp, isotopes), _modref_canonical_id(modref, vocab))
+    if cache is not None:
+        cache[key] = value
+    return value
+
+
 def _prepare_linear_inputs(
-    peptidoform: Peptidoform, *, vocab: ModVocab
+    peptidoform: Peptidoform, *, vocab: ModVocab, cache: dict | None = None
 ) -> _LinearInputs:
     """Pure-Python prep: compute per-residue mass + mod-id lists + terminal extras.
 
     Mirrors the prep block at the top of ``_linear_fragment_ladder``;
     factored out so ``fragment_ladders_batch`` can call it once per
     peptidoform and then run the heavy tensor math in batched form.
+    A batch passes one ``cache`` dict to every call (see
+    :func:`_modref_extra`).
     """
     seq = peptidoform.sequence
-    validate(seq, AA)
+    _check_residues(seq)
     L = len(seq)
     if L < 2:
         raise ValueError(
@@ -568,62 +626,38 @@ def _prepare_linear_inputs(
             )
     isotopes = peptidoform.global_isotopes
 
-    assert AA.compositions is not None
-    residue_comps = [AA.compositions[r] for r in seq]
-    pos_mass: list[float] = [
-        c.mass + _isotope_shift_for_composition(c, isotopes)
-        for c in residue_comps
-    ]
+    masses = _residue_masses(isotopes)
+    pos_mass: list[float] = [masses[r] for r in seq]
     pos_mod_ids: list[list[str]] = [[] for _ in range(L)]
-
-    def _add_modref_at(pos: int, modref: ModRef) -> None:
-        d_comp, d_mass = _modref_contribution(
-            modref, vocab, monoisotopic=True
-        )
-        pos_mass[pos] += (
-            d_comp.mass
-            + d_mass
-            + _mod_isotope_shift(d_comp, isotopes)
-        )
-        cid = _modref_canonical_id(modref, vocab)
-        if cid is not None:
-            pos_mod_ids[pos].append(cid)
 
     for pos, taggedmods in peptidoform.residue_mods.items():
         for tm in taggedmods:
             if tm.mod is None:
                 continue
-            _add_modref_at(pos, tm.mod)
+            extra, cid = _modref_extra(tm.mod, vocab, isotopes, cache)
+            pos_mass[pos] += extra
+            if cid is not None:
+                pos_mod_ids[pos].append(cid)
 
     n_term_extra = 0.0
     c_term_extra = 0.0
     for tm in peptidoform.n_term_mods:
         if tm.mod is None:
             continue
-        d_comp, d_mass = _modref_contribution(tm.mod, vocab, monoisotopic=True)
-        n_term_extra += (
-            d_comp.mass + d_mass + _mod_isotope_shift(d_comp, isotopes)
-        )
-        cid = _modref_canonical_id(tm.mod, vocab)
+        extra, cid = _modref_extra(tm.mod, vocab, isotopes, cache)
+        n_term_extra += extra
         if cid is not None:
             pos_mod_ids[0].append(cid)
     for tm in peptidoform.c_term_mods:
         if tm.mod is None:
             continue
-        d_comp, d_mass = _modref_contribution(tm.mod, vocab, monoisotopic=True)
-        c_term_extra += (
-            d_comp.mass + d_mass + _mod_isotope_shift(d_comp, isotopes)
-        )
-        cid = _modref_canonical_id(tm.mod, vocab)
+        extra, cid = _modref_extra(tm.mod, vocab, isotopes, cache)
+        c_term_extra += extra
         if cid is not None:
             pos_mod_ids[L - 1].append(cid)
 
     for modref, locations in peptidoform.fixed_mods:
-        d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=True)
-        single_extra = (
-            d_comp.mass + d_mass + _mod_isotope_shift(d_comp, isotopes)
-        )
-        cid = _modref_canonical_id(modref, vocab)
+        single_extra, cid = _modref_extra(modref, vocab, isotopes, cache)
         for loc in locations:
             if loc == "N-term":
                 count = _count_fixed_mod_locations(seq, loc, peptidoform)
@@ -657,14 +691,16 @@ def _run_linear_batch(
     ion_types: Sequence[IonType],
     max_fragment_charge: int,
     loss_ids: Sequence[str],
+    loss_rules: bool = True,
 ) -> torch.Tensor:
     """Compute a batched theoretical ladder m/z tensor.
 
     All peptidoforms must share the same sequence length and global
     isotope labels (callers group by these). Returns a
     ``(B, n_pos, n_types, n_charges, n_losses)`` ``float64`` tensor
-    with NaN-masked invalid (position, ion_type, loss) combinations.
-    The Arrow-table emission per peptide happens upstream.
+    with NaN-masked invalid (position, ion_type, loss) combinations
+    (with ``loss_rules=False`` nothing is masked: every loss at every
+    bond). The Arrow-table emission per peptide happens upstream.
     """
     if not inputs:
         raise ValueError("inputs must be non-empty")
@@ -741,6 +777,8 @@ def _run_linear_batch(
         + charges_t[None, None, None, :, None] * PROTON_MASS
     ) / charges_t[None, None, None, :, None]
 
+    if not loss_rules:
+        return mz_tensor
     # Batched biochem mask — (B, n_pos, n_types, n_losses)
     loss_mask = _biochem_mask_batched(
         seqs=[inp.seq for inp in inputs],
@@ -982,6 +1020,7 @@ def fragment_ladder_indices_batch(
     inputs_by_group: dict[
         tuple[int, tuple[str, ...]], list[tuple[int, _LinearInputs]]
     ] = {}
+    mod_cache: dict = {}  # one vocab for the whole batch (_modref_extra)
     for idx, p in enumerate(peptidoforms):
         if not isinstance(p, Peptidoform):
             raise TypeError(
@@ -995,7 +1034,7 @@ def fragment_ladder_indices_batch(
                 "peptidoforms (no cross-links / branches); route those "
                 "through fragment_ladder per-spectrum"
             )
-        inp = _prepare_linear_inputs(p, vocab=vocab)
+        inp = _prepare_linear_inputs(p, vocab=vocab, cache=mod_cache)
         key = (len(inp.seq), inp.isotopes)
         inputs_by_group.setdefault(key, []).append((idx, inp))
 
@@ -1067,12 +1106,19 @@ def fragment_ladder_arrays_batch(
     ion_types: Sequence[IonType] = (IonType.B, IonType.Y),
     max_fragment_charge: int = 1,
     neutral_losses: Sequence[str] | None = None,
+    loss_rules: bool = True,
     vocab: ModVocab = UNIMOD,
 ) -> LadderArrays:
     """:func:`fragment_ladder_indices_batch` as flat arrays, for callers
     that hold many peptides' ions at once (a search's query plan). The same
     tensor math and the same values, without a Python object per ion.
-    Linear peptidoforms only."""
+    Linear peptidoforms only.
+
+    ``loss_rules=False`` gives every loss in ``neutral_losses`` at every
+    bond and ion type, whatever residues and modifications the rules ask
+    for: the m/z of a loss ion someone else has named (a predictor's), so
+    each peptide's rows are a full grid of position × ion type × charge ×
+    loss."""
     if max_fragment_charge < 1:
         raise ValueError(
             f"max_fragment_charge must be ≥ 1; got {max_fragment_charge}"
@@ -1083,6 +1129,7 @@ def fragment_ladder_arrays_batch(
     type_codes = np.array([int(t) for t in ion_types], dtype=np.int8)
 
     groups: dict[tuple[int, tuple[str, ...]], list[tuple[int, _LinearInputs]]] = {}
+    mod_cache: dict = {}  # one vocab for the whole batch (_modref_extra)
     for idx, p in enumerate(peptidoforms):
         if not isinstance(p, Peptidoform):
             raise TypeError(
@@ -1094,7 +1141,7 @@ def fragment_ladder_arrays_batch(
                 "fragment_ladder_arrays_batch supports only linear peptidoforms "
                 "(no cross-links / branches)"
             )
-        inp = _prepare_linear_inputs(p, vocab=vocab)
+        inp = _prepare_linear_inputs(p, vocab=vocab, cache=mod_cache)
         groups.setdefault((len(inp.seq), inp.isotopes), []).append((idx, inp))
 
     # Each group's rows come out peptide-major from torch.where; they are
@@ -1109,6 +1156,7 @@ def fragment_ladder_arrays_batch(
             ion_types=ion_types,
             max_fragment_charge=max_fragment_charge,
             loss_ids=loss_ids,
+            loss_rules=loss_rules,
         )
         finite = torch.isfinite(mz_batch)
         b, p, t, c, lo = (x.numpy() for x in torch.where(finite))
@@ -1193,6 +1241,7 @@ def fragment_ladders_batch(
         tuple[int, tuple[str, ...]], list[tuple[int, _LinearInputs]]
     ] = {}
 
+    mod_cache: dict = {}  # one vocab for the whole batch (_modref_extra)
     for idx, p in enumerate(peptidoforms):
         if isinstance(p, MultiPeptidoform) or _has_crosslinks(p) or _has_branches(p):
             tbl, _ = fragment_ladder(
@@ -1207,7 +1256,7 @@ def fragment_ladders_batch(
             )
             results[idx] = tbl
             continue
-        inp = _prepare_linear_inputs(p, vocab=vocab)
+        inp = _prepare_linear_inputs(p, vocab=vocab, cache=mod_cache)
         key = (len(inp.seq), inp.isotopes)
         linear_inputs_by_group.setdefault(key, []).append((idx, inp))
 

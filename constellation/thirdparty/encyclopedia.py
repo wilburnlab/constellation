@@ -43,7 +43,9 @@ jar-backed command calls before starting the JVM.
 from __future__ import annotations
 
 import re
+import zipfile
 from pathlib import Path
+from urllib.parse import unquote
 
 from constellation.thirdparty.registry import ToolSpec, register
 
@@ -68,6 +70,40 @@ def _probe_version(path: Path) -> str | None:
     """
     m = _VERSION_RE.match(path.name)
     return m.group(1) if m else None
+
+
+def manifest_class_path(jar: Path) -> list[Path]:
+    """The jars an EncyclopeDIA jar's manifest ``Class-Path`` names,
+    resolved against the directory the jar is in.
+
+    These are the jars the JVM actually loads with it. ``lib/`` can hold
+    others: the 6.9.23 install has ``jchronologer-1.0.9.jar`` left beside
+    the ``jchronologer-1.0.10.jar`` its manifest names.
+    """
+    with zipfile.ZipFile(jar) as archive:
+        text = archive.read("META-INF/MANIFEST.MF").decode("utf-8")
+    # A manifest line continues on the next line when that one starts
+    # with a single space.
+    joined = re.sub(r"\r?\n ", "", text)
+    for line in joined.splitlines():
+        name, _, value = line.partition(":")
+        if name.strip().lower() == "class-path":
+            return [jar.parent / unquote(entry) for entry in value.split()]
+    return []
+
+
+def jchronologer_jar(encyclopedia_jar: Path) -> Path:
+    """The JChronologer jar (EncyclopeDIA's library predictor and its
+    TorchScript models) that ``encyclopedia_jar`` loads."""
+    named = [p for p in manifest_class_path(encyclopedia_jar) if p.name.startswith("jchronologer-")]
+    if len(named) != 1:
+        raise FileNotFoundError(
+            f"{encyclopedia_jar} names {len(named)} JChronologer jars in its manifest Class-Path "
+            f"({', '.join(p.name for p in named) or 'none'}); expected one"
+        )
+    if not named[0].is_file():
+        raise FileNotFoundError(f"{encyclopedia_jar} names {named[0]}, which is not there")
+    return named[0]
 
 
 register(

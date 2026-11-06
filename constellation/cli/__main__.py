@@ -501,6 +501,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     rows.append(_doctor_catalogs_row())
     rows.append(_doctor_koina_row())
     rows.extend(_doctor_percolator_rows())
+    rows.extend(_doctor_jchronologer_rows())
 
     if not rows:
         print("no third-party tools or frontend bundles registered")
@@ -594,6 +595,46 @@ def _doctor_percolator_rows() -> list[tuple[str, str, str, str]]:
             "(--percolator-version v3-05 or a path, or boot with vsyscall=emulate)",
         )
     ]
+
+
+def _doctor_jchronologer_rows() -> list[tuple[str, str, str, str]]:
+    """Whether JChronologer's models (EncyclopeDIA's predictor, run by
+    ``predict-library --backend jchronologer``) can be read from the
+    installed EncyclopeDIA; no row when EncyclopeDIA is not installed.
+
+    Reads the jar's member list and hashes the members, but loads no
+    model: ``ok`` means every model is the one Constellation was checked
+    against; ``unverified`` a JChronologer it was not checked against (or a
+    member whose hash differs); ``missing`` no JChronologer jar where the
+    EncyclopeDIA manifest says.
+    """
+    handle = try_find("encyclopedia")
+    if handle is None:
+        return []
+    from constellation.massspec.library.jchronologer import locate_bundle
+    from constellation.massspec.tokenize.jchronologer import UnknownModelError
+    from constellation.thirdparty.encyclopedia import MINIMUM_VERSION
+    from constellation.thirdparty.registry import meets_min_version
+
+    # The install the encyclopedia row reports on, not a second lookup.
+    if not meets_min_version(handle):
+        return [(
+            "jchronologer", "missing", "-",
+            f"EncyclopeDIA {handle.version} is older than {MINIMUM_VERSION}, the first to ship JChronologer's models",
+        )]
+    try:
+        bundle = locate_bundle(encyclopedia=handle)
+    except FileNotFoundError as exc:
+        return [("jchronologer", "missing", "-", str(exc))]
+    except UnknownModelError as exc:
+        return [("jchronologer", "unverified", "-", str(exc))]
+    try:
+        for role in bundle.models:
+            bundle.read(role, "model")
+            bundle.read(role, "preprocessing")
+    except UnknownModelError as exc:
+        return [("jchronologer", "unverified", bundle.version, str(exc))]
+    return [("jchronologer", "ok", bundle.version, f"{bundle.jar} ({len(bundle.models)} models)")]
 
 
 def _doctor_koina_row() -> tuple[str, str, str, str]:

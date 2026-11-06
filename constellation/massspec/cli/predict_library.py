@@ -1,4 +1,4 @@
-"""``constellation massspec predict-library``: a predicted spectral library from a FASTA (EncyclopeDIA or Koina)."""
+"""``constellation massspec predict-library``: a predicted spectral library (EncyclopeDIA's jar, JChronologer in PyTorch, or Koina)."""
 
 from __future__ import annotations
 
@@ -11,6 +11,9 @@ from constellation.massspec.cli._common import (
     _add_output_dir_arg,
     _camel_to_kebab,
     _report_ingest_caveats,
+)
+from constellation.massspec.cli._predict_jchronologer import (
+    add_jchronologer_arguments as _add_jchronologer_arguments,
 )
 from constellation.massspec.search.encyclopedia.ptm_defaults import (
     PTM_NAMES as _PTM_NAMES,
@@ -25,16 +28,18 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
     p = subs.add_parser(
         "predict-library",
         help=(
-            "FASTA → predicted spectral library. --backend encyclopedia "
-            "(default) runs EncyclopeDIA 6.5.15's bundled JChronologer "
-            "(RT) + Sculptor (CCS/IMS) + Electrician (charge) in-process; "
-            "--backend koina calls the Koina model server, which adds CID "
-            "models and HCD at arbitrary collision energy."
+            "a predicted spectral library. --backend encyclopedia (default) "
+            "runs the EncyclopeDIA jar on a FASTA (its JChronologer models, "
+            "in the JVM) and writes a .dlib; --backend jchronologer runs "
+            "those same models in PyTorch, read from the installed "
+            "EncyclopeDIA, onto a search space (--from-library) or a peptide "
+            "list; --backend koina calls the Koina model server, which adds "
+            "CID models."
         ),
     )
     p.add_argument(
         "--backend",
-        choices=["encyclopedia", "koina"],
+        choices=["encyclopedia", "jchronologer", "koina"],
         default="encyclopedia",
         help="prediction backend (default: encyclopedia)",
     )
@@ -51,12 +56,13 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
             "encyclopedia; optional extra output for --backend koina)"
         ),
     )
-    # ── koina backend ───────────────────────────────────────────────
-    koina = p.add_argument_group(
-        "koina backend",
-        "Only meaningful with --backend koina.",
+    # ── what to predict, for the in-Python backends ─────────────────
+    given = p.add_argument_group(
+        "jchronologer and koina backends",
+        "What to predict instead of a FASTA (--from-library is how "
+        "--backend jchronologer predicts a search space).",
     )
-    koina.add_argument(
+    given.add_argument(
         "--peptides",
         type=Path,
         default=None,
@@ -66,7 +72,7 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
             "digesting a FASTA — no m/z or length filtering is applied"
         ),
     )
-    koina.add_argument(
+    given.add_argument(
         "--from-library",
         type=Path,
         default=None,
@@ -78,17 +84,39 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
             "and modifications) are kept"
         ),
     )
+    given.add_argument(
+        "--min-intensity",
+        type=float,
+        default=None,
+        help=(
+            "drop predicted fragments below this intensity (default: 0.01, "
+            "JChronologer's, for jchronologer; 1e-4 for koina)"
+        ),
+    )
+    _add_jchronologer_arguments(p)
+    # ── koina backend ───────────────────────────────────────────────
+    koina = p.add_argument_group(
+        "koina backend",
+        "Only meaningful with --backend koina.",
+    )
     koina.add_argument(
         "--ms2-model",
-        default="Prosit_2020_intensity_HCD",
-        help="Koina fragment-intensity model (default: %(default)s)",
+        default=None,
+        help=(
+            "fragment-intensity model: a Koina model name with --backend koina "
+            "(default: Prosit_2020_intensity_HCD); backend:model or none with "
+            "--backend jchronologer (default: jchronologer:cartographer; e.g. "
+            "koina:Prosit_2020_intensity_HCD)"
+        ),
     )
     koina.add_argument(
         "--rt-model",
-        default="Chronologer_RT",
+        default=None,
         help=(
-            "Koina retention-time model, or 'none' to skip RT prediction "
-            "(default: %(default)s)"
+            "retention-time model, or 'none' to skip RT: a Koina model name with "
+            "--backend koina (default: Chronologer_RT); backend:model with "
+            "--backend jchronologer (default: jchronologer:chronologer; e.g. "
+            "koina:Chronologer_RT)"
         ),
     )
     koina.add_argument(
@@ -111,6 +139,18 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
         ),
     )
     koina.add_argument(
+        "--collision-energy-by-charge",
+        default=None,
+        metavar="Z=NCE,...",
+        help=(
+            "a collision energy for each precursor charge, e.g. "
+            "'1=28,2=31,3=33,4=35' (tuned for an instrument), used as given "
+            "instead of one energy scaled from --default-charge. Every charge "
+            "predicted must be in it. Not with --collision-energy, "
+            "--default-charge or --no-adjust-nce-for-dia."
+        ),
+    )
+    koina.add_argument(
         "--output-library",
         type=Path,
         default=None,
@@ -126,12 +166,6 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
             "what to do with precursors the model cannot represent "
             "(default: error)"
         ),
-    )
-    koina.add_argument(
-        "--min-intensity",
-        type=float,
-        default=1e-4,
-        help="drop predicted fragments below this intensity (default: %(default)s)",
     )
     _add_output_dir_arg(p)
     p.add_argument(
@@ -189,7 +223,11 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--no-adjust-nce-for-dia",
         action="store_true",
-        help="skip the DIA-mode NCE adjustment EncyclopeDIA applies by default",
+        help=(
+            "predict every charge at the collision energy as given, instead of "
+            "scaling it from --default-charge to each precursor charge "
+            "(EncyclopeDIA's DIA rule, NCE·f(default)/f(z))"
+        ),
     )
     p.add_argument(
         "--default-nce",
@@ -200,8 +238,11 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--default-charge",
         type=int,
-        default=3,
-        help="default charge used for NCE adjustment",
+        default=None,
+        help=(
+            "the method's default charge, at which the collision energy "
+            "applies unchanged; other charges are scaled from it (default: 3)"
+        ),
     )
     p.add_argument(
         "--max-variable-mods",
@@ -283,7 +324,24 @@ _ENCYCLOPEDIA_ONLY_ARGS: tuple[tuple[str, str, object], ...] = (
 
 def _cmd_massspec_predict_library(args: argparse.Namespace) -> int:
     """Dispatch predict-library onto the selected backend."""
-    if getattr(args, "backend", "encyclopedia") == "koina":
+    backend = getattr(args, "backend", "encyclopedia")
+    if backend == "jchronologer":
+        from constellation.massspec.cli._predict_jchronologer import run
+
+        return run(args)
+    from constellation.massspec.cli._predict_jchronologer import JCHRONOLOGER_ONLY_ARGS, used_flags
+
+    foreign = used_flags(args, JCHRONOLOGER_ONLY_ARGS)
+    if foreign:
+        import sys as _sys
+
+        print(
+            f"error: these flags are --backend jchronologer's and have no effect with "
+            f"--backend {backend}: {', '.join(foreign)}",
+            file=_sys.stderr,
+        )
+        return 1
+    if backend == "koina":
         return _cmd_predict_library_koina(args)
     return _cmd_predict_library_encyclopedia(args)
 
@@ -304,6 +362,14 @@ def _cmd_predict_library_encyclopedia(args: argparse.Namespace) -> int:
     if args.output_dlib is None:
         print(
             "error: --output-dlib is required for --backend encyclopedia",
+            file=_sys.stderr,
+        )
+        return 1
+    if getattr(args, "collision_energy_by_charge", None) is not None:
+        print(
+            "error: --collision-energy-by-charge is not available with --backend "
+            "encyclopedia: the jar takes one energy (--default-nce) and scales it "
+            "from --default-charge itself",
             file=_sys.stderr,
         )
         return 1
@@ -389,7 +455,7 @@ def _cmd_predict_library_encyclopedia(args: argparse.Namespace) -> int:
             add_decoys=not args.no_decoys,
             adjust_nce_for_dia=not args.no_adjust_nce_for_dia,
             default_nce=args.default_nce,
-            default_charge=args.default_charge,
+            default_charge=_reference_charge(args),
             max_variable_mods=args.max_variable_mods,
             max_variable_forms=args.max_variable_forms,
             generate_protein_entrapments=args.generate_protein_entrapments,
@@ -500,6 +566,50 @@ def _parse_collision_energies(raw: str | None) -> list[float | None]:
     return out or [None]
 
 
+def _reference_charge(args: argparse.Namespace) -> int:
+    """``--default-charge``, or EncyclopeDIA's 3 when it was not given."""
+    from constellation.massspec.library.prediction import DEFAULT_REFERENCE_CHARGE
+
+    given = getattr(args, "default_charge", None)
+    return DEFAULT_REFERENCE_CHARGE if given is None else int(given)
+
+
+def _energy_table(args: argparse.Namespace) -> dict[int, float] | None:
+    """``--collision-energy-by-charge`` parsed, or ``None``. It sets every
+    charge's energy, so the flags that make one energy and scale it are
+    refused beside it rather than silently overridden."""
+    from constellation.massspec.library.prediction import parse_energy_table
+
+    raw = getattr(args, "collision_energy_by_charge", None)
+    if raw is None:
+        return None
+    conflicts = [
+        flag
+        for flag, given in (
+            ("--collision-energy", getattr(args, "collision_energy", None) is not None),
+            ("--default-charge", getattr(args, "default_charge", None) is not None),
+            ("--no-adjust-nce-for-dia", bool(getattr(args, "no_adjust_nce_for_dia", False))),
+        )
+        if given
+    ]
+    if conflicts:
+        raise ValueError(
+            "--collision-energy-by-charge gives every charge its energy, so it "
+            f"cannot be combined with {', '.join(conflicts)}"
+        )
+    return parse_energy_table(raw)
+
+
+def _scalar_energy(energy: float, args: argparse.Namespace):
+    """One energy, scaled from ``--default-charge`` to each charge unless
+    ``--no-adjust-nce-for-dia``."""
+    from constellation.massspec.library.prediction import CollisionEnergy
+
+    if getattr(args, "no_adjust_nce_for_dia", False):
+        return CollisionEnergy.uniform(energy)
+    return CollisionEnergy.scaled_from_reference(energy, _reference_charge(args))
+
+
 def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
     """FASTA / peptide list / existing library → predicted Library via Koina.
 
@@ -527,6 +637,9 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
     from constellation.massspec.library.koina.api import predict_library
     from constellation.massspec.library.koina.client import make_client
 
+    # The model flags default per backend; a koina: prefix is the same model.
+    args.ms2_model = str(args.ms2_model or "Prosit_2020_intensity_HCD").removeprefix("koina:")
+    args.rt_model = str(args.rt_model or "Chronologer_RT").removeprefix("koina:")
     used = [
         flag
         for attr, flag, default in _ENCYCLOPEDIA_ONLY_ARGS
@@ -556,26 +669,60 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
         )
         return 1
 
+    from constellation.core.stages import invalidate, mark_done, recorded_key, stage_key
+
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    success_path = output_dir / "_SUCCESS"
-    if success_path.exists():
+    key = stage_key(**_koina_key_parts(args))
+    recorded = recorded_key(output_dir)
+    # A run replaces its own exports and refuses to replace anything else,
+    # before anything is predicted (a sweep writes each energy's export
+    # inside its own directory).
+    from constellation.massspec.cli._predict_jchronologer import foreign_export, recorded_exports
+
+    try:
+        sweep = len(_parse_collision_energies(args.collision_energy)) > 1
+    except ValueError:
+        sweep = False  # refused below, with the reason
+    if args.output_dlib is not None and not sweep:
+        refusal = foreign_export(Path(args.output_dlib).resolve(), output_dir, recorded_exports(output_dir))
+        if refusal:
+            print(f"error: {refusal}", file=_sys.stderr)
+            return 1
+    if recorded is not None:
+        # A marker without a key was written before runs were keyed
+        # (2026-11-06); it is trusted as it always was, and said so.
+        if recorded in (key, ""):
+            if not args.resume:
+                print(
+                    f"error: --output-dir already complete (_SUCCESS exists). "
+                    f"Pass --resume to re-use it, or delete {output_dir} to "
+                    f"start fresh.",
+                    file=_sys.stderr,
+                )
+                return 1
+            if recorded == "":
+                print(f"note: {output_dir}/_SUCCESS records no key (an older run); reusing it unchecked")
+            print(f"already complete: {output_dir}")
+            return 0
         if not args.resume:
             print(
-                f"error: --output-dir already complete (_SUCCESS exists). "
-                f"Pass --resume to re-use it, or delete {output_dir} to "
-                f"start fresh.",
+                f"error: {output_dir} holds a prediction of other inputs or settings; pick another "
+                f"--output-dir, or pass --resume to replace it",
                 file=_sys.stderr,
             )
             return 1
-        print(f"already complete: {output_dir}")
-        return 0
+        invalidate(output_dir)
 
     try:
         energies = _parse_collision_energies(args.collision_energy)
+        energy_table = _energy_table(args)
     except ValueError as exc:
         print(f"error: {exc}", file=_sys.stderr)
         return 1
+    from constellation.massspec.cli._predict_jchronologer import DEFAULT_MIN_INTENSITY
+
+    min_intensity = args.min_intensity if args.min_intensity is not None else DEFAULT_MIN_INTENSITY["koina"]
 
     server = resolve_server(args.koina_url)
     rt_model_name = None if str(args.rt_model).lower() == "none" else args.rt_model
@@ -616,6 +763,15 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
     if not specs:
         print("error: no precursors to predict", file=_sys.stderr)
         return 1
+    if energy_table is not None:
+        missing = sorted({s.charge for s in specs} - set(energy_table))
+        if missing:
+            print(
+                f"error: --collision-energy-by-charge has no energy for charge "
+                f"{', '.join(map(str, missing))}, which the precursors include",
+                file=_sys.stderr,
+            )
+            return 1
 
     # ── reject a sweep the model would silently collapse ────────────
     try:
@@ -626,6 +782,14 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
         return 1
 
     takes_energy = "collision_energies" in declared
+    if energy_table is not None and not takes_energy:
+        print(
+            f"error: {args.ms2_model} declares no collision-energy input, so "
+            f"--collision-energy-by-charge would change nothing. Drop it, or "
+            f"pick a model that accepts one.",
+            file=_sys.stderr,
+        )
+        return 1
     if len(energies) > 1 and not takes_energy:
         print(
             f"error: {args.ms2_model} declares no collision-energy input, so "
@@ -640,13 +804,26 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
     if not takes_energy:
         energies = [None]
 
-    multi = len(energies) > 1
+    # Each run's energy as a property of each charge: an explicit table,
+    # or one energy scaled from the reference charge.
+    if energy_table is not None:
+        from constellation.massspec.library.prediction import CollisionEnergy
+
+        plans = [CollisionEnergy.explicit(energy_table)]
+    else:
+        plans = [None if e is None else _scalar_energy(e, args) for e in energies]
+    charges_present = sorted({s.charge for s in specs})
+
+    multi = len(plans) > 1
     summaries: list[dict[str, object]] = []
 
-    for energy in energies:
-        run_dir = output_dir / f"ce_{energy:g}" if multi else output_dir
+    for energy in plans:
+        run_dir = output_dir / f"ce_{energy.label}" if multi else output_dir
         run_dir.mkdir(parents=True, exist_ok=True)
         marker = run_dir / "_SUCCESS" if multi else None
+        run_key = stage_key(run=key, energy=energy.describe(charges_present) if energy is not None else None)
+        if marker is not None and recorded_key(run_dir) not in (None, "", run_key):
+            invalidate(run_dir)  # an energy run of other settings: redo it
         if marker is not None and marker.exists() and args.resume:
             # Restore the completed run's summary. Skipping without it
             # drops finished energies from the aggregate manifest —
@@ -664,7 +841,7 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
                 )
                 return 1
             summaries.append(json.loads(prior.read_text()))
-            print(f"  ce={energy:g}: already complete, restored from manifest")
+            print(f"  ce={energy.label}: already complete, restored from manifest")
             continue
 
         try:
@@ -674,9 +851,8 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
                 ms2_model_name=args.ms2_model,
                 rt_model_name=rt_model_name,
                 collision_energy=energy,
-                adjust_nce_for_dia=not args.no_adjust_nce_for_dia,
                 server=args.koina_url,
-                min_intensity=args.min_intensity,
+                min_intensity=min_intensity,
                 on_unsupported=args.on_unsupported_mod,
                 metadata={"x.koina.server_url": server, "x.koina.source": source},
             )
@@ -702,10 +878,14 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
                 else run_dir / Path(args.output_dlib).name
             )
             dlib_path.parent.mkdir(parents=True, exist_ok=True)
-            save_library(library, dlib_path, format="encyclopedia.dlib")
+            # This run's own export, from an earlier prediction (checked above).
+            save_library(library, dlib_path, format="encyclopedia.dlib", overwrite=True)
 
         summary = {
-            "collision_energy": energy,
+            "collision_energy": energy.nce if energy is not None else None,
+            "collision_energy_by_charge": (
+                energy.describe(charges_present) if energy is not None else None
+            ),
             "library_pqdir": str(pqdir),
             "output_dlib": str(dlib_path) if dlib_path else None,
             "counts": {
@@ -719,9 +899,9 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
         summaries.append(summary)
         if marker is not None:
             (run_dir / "manifest.json").write_text(json.dumps(summary, indent=2))
-            marker.write_bytes(b"")
+            mark_done(run_dir, run_key)
         if not args.no_progress:
-            label = f"ce={energy:g}: " if multi else ""
+            label = f"ce={energy.label}: " if multi else ""
             print(
                 f"  {label}{library.precursors.num_rows} precursors, "
                 f"{library.fragments.num_rows} fragments "
@@ -731,27 +911,78 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
             if dropped:
                 print(f"  {label}{dropped} of the library's precursors could not be predicted and are left out")
 
-    manifest = {
-        "tool": "constellation massspec predict-library",
+    from constellation.massspec.search.encyclopedia._common import build_manifest_envelope
+
+    body = {
         "backend": "koina",
-        "constellation_version": constellation_version,
+        "stage_key": key,
         "source": source,
         "n_precursors_requested": len(specs),
         "koina": {
             "server": server,
             "ms2_model": args.ms2_model,
             "rt_model": rt_model_name,
-            "adjust_nce_for_dia": not args.no_adjust_nce_for_dia,
-            "min_intensity": args.min_intensity,
+            "adjust_nce_for_dia": energy_table is None and not args.no_adjust_nce_for_dia,
+            "nce_reference_charge": (
+                _reference_charge(args)
+                if energy_table is None and not args.no_adjust_nce_for_dia
+                else None
+            ),
+            "collision_energy_by_charge": energy_table,
+            "min_intensity": min_intensity,
         },
         "runs": summaries,
     }
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    success_path.write_bytes(b"")
+    source_path = Path(source)
+    manifest = build_manifest_envelope(
+        subcommand="massspec predict-library",
+        constellation_version=constellation_version,
+        constellation_argv=_sys.argv,
+        java_argv=None,
+        tool={"name": "koina", "server": server},
+        inputs={"source": source_path} if source_path.is_file() else {},
+        outputs={"output_dir": output_dir},
+        extras=body,
+    )
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
+    mark_done(output_dir, key)
 
     if not args.no_progress:
         print(f"predict-library done ({len(summaries)} library/libraries): {output_dir}")
     return 0
+
+
+def _koina_key_parts(args: argparse.Namespace) -> dict[str, object]:
+    """What a Koina run's output depends on: the source (its SHA-256, or
+    the search space's own key), the digestion, the models and server, the
+    energies and the settings."""
+    from constellation.core.stages import file_sha256
+    from constellation.massspec.cli._predict_jchronologer import _library_key
+
+    def identity(path) -> object:
+        p = Path(path)
+        if p.is_dir():
+            return _library_key(p)
+        return file_sha256(p) if p.is_file() else f"{p}:missing"
+
+    from constellation.massspec.library.koina import resolve_server
+
+    return {
+        "stage": "massspec predict-library koina",
+        "fasta": identity(args.fasta) if args.fasta is not None else None,
+        "peptides": identity(args.peptides) if args.peptides is not None else None,
+        "library": identity(args.from_library) if args.from_library is not None else None,
+        "digest": [args.enzyme, args.max_missed_cleavage, args.min_mz, args.max_mz, args.min_charge,
+                   args.max_charge, args.max_variable_mods],
+        "models": [args.ms2_model, args.rt_model],
+        "server": resolve_server(args.koina_url),
+        "energy": [args.collision_energy, args.collision_energy_by_charge, args.default_nce,
+                   args.default_charge, args.no_adjust_nce_for_dia],
+        "min_intensity": args.min_intensity,
+        "on_unsupported": args.on_unsupported_mod,
+        "outputs": [str(args.output_dlib) if args.output_dlib else None,
+                    str(args.output_library) if args.output_library else None],
+    }
 
 
 def _write_manifest_for_predict_library(

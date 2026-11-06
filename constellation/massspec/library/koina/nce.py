@@ -1,30 +1,40 @@
-"""Charge-dependent normalised-collision-energy adjustment.
+"""Charge-dependent normalised-collision-energy adjustment (kept for callers).
 
-Instrument NCE is calibrated at a reference charge, so the *effective*
-energy a precursor experiences falls as its charge rises. Searle et al.
-(2020) published the per-charge factors below; EncyclopeDIA applies the
-same correction by default when building DIA libraries, which is what
-``--no-adjust-nce-for-dia`` disables. Cartographer's Koina integration
-carries an identical table, so predictions stay comparable across all
-three code paths.
+New code uses :class:`~constellation.massspec.library.prediction.CollisionEnergy`,
+which treats the energy as a property of each precursor charge and can
+also take a table given charge by charge.
+
+Until 2026-11-05 this module scaled an energy by ``f(z)`` alone, as if
+every method's default charge were 1, and said EncyclopeDIA did the
+same. EncyclopeDIA scales by ``f(z_ref) / f(z)``, ``z_ref`` the method's
+default charge (3 in its library builds): at NCE 33 a 3+ precursor is
+predicted at 33, where this module gave 28.05. :func:`adjust_nce` now
+applies EncyclopeDIA's rule; libraries predicted before then were made
+at the lower energies and record ``x.koina.adjust_nce_for_dia`` without
+a reference charge.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-#: Searle et al. 2020. Charges above the table clamp to the last entry
-#: rather than extrapolating a factor nobody measured.
-NCE_CHARGE_FACTORS: dict[int, float] = {1: 1.0, 2: 0.9, 3: 0.85, 4: 0.8, 5: 0.75}
+from constellation.massspec.library.prediction.collision_energy import (
+    DEFAULT_REFERENCE_CHARGE,
+    OUTSIDE_FACTOR,
+    SEARLE_2020_FACTORS,
+    CollisionEnergy,
+)
 
-_MAX_TABULATED = max(NCE_CHARGE_FACTORS)
+#: Searle et al. 2020, as EncyclopeDIA holds them. Charges above the
+#: table take the last entry rather than an extrapolated factor.
+NCE_CHARGE_FACTORS: dict[int, float] = dict(SEARLE_2020_FACTORS)
 
 
 def nce_factor(charge: int) -> float:
-    """Multiplicative NCE factor for one precursor charge."""
+    """The Searle 2020 factor of one precursor charge."""
     if charge < 1:
         raise ValueError(f"charge must be >= 1, got {charge}")
-    return NCE_CHARGE_FACTORS[min(charge, _MAX_TABULATED)]
+    return NCE_CHARGE_FACTORS.get(charge, OUTSIDE_FACTOR)
 
 
 def adjust_nce(
@@ -32,22 +42,26 @@ def adjust_nce(
     charges: np.ndarray,
     *,
     enabled: bool = True,
+    reference_charge: int = DEFAULT_REFERENCE_CHARGE,
 ) -> np.ndarray:
-    """Apply the per-charge factor to a scalar or per-precursor energy.
-
-    With ``enabled=False`` the energy is broadcast unchanged, so callers
-    need no branch of their own.
-    """
+    """``collision_energy`` scaled to each charge by EncyclopeDIA's rule,
+    ``f(reference_charge) / f(z)``, as float32 in the shape of ``charges``;
+    with ``enabled=False`` the energy is broadcast unchanged. A per-
+    precursor array of energies is scaled element by element."""
     charges = np.asarray(charges)
-    energies = np.broadcast_to(
-        np.asarray(collision_energy, dtype=np.float32), charges.shape
-    ).astype(np.float32)
+    energies = np.broadcast_to(np.asarray(collision_energy, dtype=np.float32), charges.shape)
     if not enabled:
-        return energies
-    factors = np.array(
-        [nce_factor(int(z)) for z in charges.ravel()], dtype=np.float32
-    ).reshape(charges.shape)
-    return energies * factors
+        return energies.astype(np.float32)
+    if np.ndim(collision_energy) == 0:
+        return CollisionEnergy.scaled_from_reference(
+            float(collision_energy), reference_charge
+        ).resolve(charges)
+    out = np.empty(charges.shape, dtype=np.float32)
+    for index in np.ndindex(charges.shape):
+        out[index] = CollisionEnergy.scaled_from_reference(
+            float(energies[index]), reference_charge
+        ).resolve(np.array([charges[index]]))[0]
+    return out
 
 
 __all__ = ["NCE_CHARGE_FACTORS", "adjust_nce", "nce_factor"]

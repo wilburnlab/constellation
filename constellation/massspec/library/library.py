@@ -324,39 +324,46 @@ class Library:
         )
 
 
+#: The precursor values a prediction carries onto a library, each unset
+#: at −1 or null (a predictor that did not predict one leaves the source's).
+_PREDICTED_PRECURSOR_VALUES = ("rt_predicted", "ccs_predicted", "charge_probability")
+
+
 def attach_predictions(source: Library, predicted: Library) -> tuple[Library, dict[str, int]]:
-    """``source`` with ``predicted``'s fragments and retention times.
+    """``source`` with ``predicted``'s fragments, retention times, CCS and
+    charge probabilities.
 
     What a prediction of a library's own precursors should return: the
     source library, with everything it says about them (which are decoys
     and of what, the spans that make each peptide, each modification and
     why), not the flat library a predictor rebuilds from bare
     (sequence, charge) pairs. Precursors are matched on (modified
-    sequence, charge); a predicted retention time replaces the source's
-    unless it is unset (−1). A source precursor the predictor did not
-    return (a modification the model cannot take, skipped) is left out,
+    sequence, charge); a predicted retention time, CCS or charge
+    probability replaces the source's unless it is unset (−1 or null). A source precursor the predictor did
+    not return (a modification the model cannot take, skipped) is left out,
     with what only it needed (:meth:`Library.subset_precursors`), and
     counted. Returns the library and the counts.
     """
+    values = list(_PREDICTED_PRECURSOR_VALUES)
 
     def keyed(lib: Library) -> pa.Table:
-        return lib.precursors.select(["precursor_id", "peptide_id", "charge", "rt_predicted"]).join(
+        return lib.precursors.select(["precursor_id", "peptide_id", "charge", *values]).join(
             lib.peptides.select(["peptide_id", "modified_sequence"]), keys="peptide_id"
         )
 
     src = keyed(source).select(["precursor_id", "modified_sequence", "charge"])
-    got = keyed(predicted).select(["precursor_id", "modified_sequence", "charge", "rt_predicted"])
-    got = got.rename_columns(["predicted_id", "modified_sequence", "charge", "predicted_rt"])
+    got = keyed(predicted).select(["precursor_id", "modified_sequence", "charge", *values])
+    got = got.rename_columns(["predicted_id", "modified_sequence", "charge", *(f"predicted_{v}" for v in values)])
     pairs = src.join(got, keys=["modified_sequence", "charge"], join_type="inner")
     out = source.subset_precursors(pairs.column("precursor_id"))
 
     at = pc.index_in(out.precursors.column("precursor_id"), value_set=pairs.column("precursor_id").combine_chunks())
-    new_rt = pc.take(pairs.column("predicted_rt"), at)
-    old_rt = out.precursors.column("rt_predicted")
-    rt = pc.if_else(pc.greater_equal(pc.fill_null(new_rt, -1.0), 0.0), new_rt, old_rt)
-    precursors = out.precursors.set_column(
-        out.precursors.schema.get_field_index("rt_predicted"), "rt_predicted", rt
-    )
+    precursors = out.precursors
+    for name in values:
+        new = pc.take(pairs.column(f"predicted_{name}"), at)
+        old = precursors.column(name)
+        merged_values = pc.if_else(pc.greater_equal(pc.fill_null(new, -1.0), 0.0), new, old)
+        precursors = precursors.set_column(precursors.schema.get_field_index(name), name, merged_values)
     fragments = predicted.fragments
     to = pc.index_in(fragments.column("precursor_id"), value_set=pairs.column("predicted_id").combine_chunks())
     fragments = fragments.set_column(

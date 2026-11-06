@@ -179,3 +179,36 @@ def test_model_limits_still_hold(hcd_client):
     assert not try_predict("A" * 30 + "K", 2), "31-mer should be rejected"
     assert try_predict("LVNELTEFAK", 6), "charge 6 should be accepted"
     assert not try_predict("LVNELTEFAK", 7), "charge 7 should be rejected"
+
+
+def test_koinas_chronologer_against_jchronologers():
+    """Is Koina's Chronologer_RT the checkpoint EncyclopeDIA ships? Both
+    through the prediction contract, on the same requests.
+
+    It is (2026-11-06): the same seconds to 1e-4, pyro-Glu included once
+    it is written on its residue (``RtModel.pyro_glu_on_first_residue``).
+    Two forms differ and are left out here: TMT (LVNELTEFAK with TMT6plex on
+    the N-terminus and K, 1180.20 s on Koina against 1144.29 s in the jar)
+    and S-carbamoylmethylcysteine (577.50 s in the jar; no spelling tried
+    on Koina gives it)."""
+    from constellation.massspec.library.prediction.base import Requests
+    from constellation.massspec.library.prediction.registry import predictor
+    from constellation.massspec.library.prediction.requests import unlabelled_sites
+    from constellation.massspec.tokenize.jchronologer import UnknownModelError
+    from constellation.thirdparty.registry import ToolNotFoundError
+
+    try:
+        ours = predictor("jchronologer:chronologer")
+    except (ToolNotFoundError, FileNotFoundError, UnknownModelError) as e:
+        pytest.skip(f"JChronologer is not installed here: {e}")
+    theirs = predictor("koina:Chronologer_RT")
+    peptides = PEPTIDES + ["[UNIMOD:28]-QTALVELLK", "[UNIMOD:27]-EAC[UNIMOD:4]FAVEGPK",
+                           "[UNIMOD:1]-ADEEKLPPGWEK", "TVM[UNIMOD:35]ENFVAFVDK"]
+    requests = Requests(
+        tuple(unlabelled_sites(p)[0] for p in peptides),
+        np.arange(len(peptides)), np.full(len(peptides), 2, np.int32), np.full(len(peptides), np.nan, np.float32),
+    )
+    a = ours.predict(requests).values
+    b = theirs.predict(requests).values
+    print("seconds, in-process vs Koina:", list(zip(a.round(2).tolist(), b.round(2).tolist())))
+    assert np.max(np.abs(a - b)) < 1e-2
