@@ -53,11 +53,22 @@ What each table holds:
 
 Not carried, because nothing in Constellation holds them: a precursor's
 ion mobility and the jar's protein groups.
+
+**Decoys are left out.** A library's decoy peptides (``is_decoy``, a
+search space's) are not written: ``entries`` and ``peptidetoprotein``
+hold targets, and the jar makes its own decoys of what it reads, so a
+decoy written there would be searched as a target and get a decoy of its
+own. Until 2026-11-05 they were written, with ``isDecoy`` false. The
+quantities of the precursors left out go with them; the precursor scores
+(``peptidescores``) are the search's own and keep their decoys. A
+``UserWarning`` says how many were left out. Writing them to
+``decoyentries`` is a later step.
 """
 
 from __future__ import annotations
 
 import os
+import warnings
 import zlib
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
@@ -66,6 +77,7 @@ from typing import Any
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from constellation.massspec.io.encyclopedia import _sql
 from constellation.massspec.io.encyclopedia._codec import encode_f4, encode_f8
@@ -103,6 +115,14 @@ def write_encyclopedia(
     if p.exists() and not overwrite:
         raise FileExistsError(f"refusing to overwrite existing {p}")
 
+    library, n_decoy_peptides, decoy_precursors = _without_decoys(library)
+    if n_decoy_peptides:
+        warnings.warn(
+            f"{n_decoy_peptides} decoy peptide(s) ({len(decoy_precursors)} precursors) left out "
+            f"of {p.name}: entries hold a library's targets, and EncyclopeDIA makes its own decoys",
+            UserWarning,
+            stacklevel=2,
+        )
     upstream = dict(library.metadata_extras.get("x.encyclopedia.metadata", {}))
     tmp = p.with_name(f".{p.name}.tmp-{os.getpid()}")
     tmp.unlink(missing_ok=True)
@@ -119,7 +139,7 @@ def write_encyclopedia(
                 _write_peptidescores(con, library, names, sources, search, upstream)
                 _write_proteinscores(con, library, sources, search)
             if quant is not None:
-                _write_peptidequants(con, library, names, sources, quant)
+                _write_peptidequants(con, library, names, sources, quant, skip=decoy_precursors)
             for stmt in LIBRARY_INDEXES:
                 con.execute(stmt)
             con.commit()
@@ -127,6 +147,20 @@ def write_encyclopedia(
         tmp.unlink(missing_ok=True)
         raise
     os.replace(tmp, p)
+
+
+def _without_decoys(library: Library) -> tuple[Library, int, frozenset[int]]:
+    """The library without its decoy peptides (and their precursors,
+    fragments and edges), how many peptides that was, and the precursor
+    ids left out. A library with none is returned as it is."""
+    is_decoy = library.peptides.column("is_decoy").fill_null(False)
+    if not pc.any(is_decoy).as_py():
+        return library, 0, frozenset()
+    decoy_peptides = library.peptides.filter(is_decoy).column("peptide_id").combine_chunks()
+    of_decoy = pc.is_in(library.precursors.column("peptide_id"), value_set=decoy_peptides)
+    left_out = frozenset(library.precursors.filter(of_decoy).column("precursor_id").to_pylist())
+    targets = library.precursors.filter(pc.invert(of_decoy)).column("precursor_id")
+    return library.subset_precursors(targets.to_pylist()), len(decoy_peptides), left_out
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -493,8 +527,9 @@ _PEPTIDEQUANTS_COLUMNS = (
 
 
 def _write_peptidequants(
-    con: Any, library: Library, names: _Names, sources: dict[int, str], quant: Quant
-) -> None:
+    con: Any, library: Library, names: _Names, sources: dict[int, str], quant: Quant,
+    *, skip: frozenset[int] = frozenset(),
+) -> None:  # fmt: skip
     if not quant.precursor_quant.num_rows:
         return
     of_precursor = dict(
@@ -515,6 +550,8 @@ def _write_peptidequants(
     rows: list[tuple[Any, ...]] = []
     for row in quant.precursor_quant.to_pylist():
         pid, aid = row["precursor_id"], row["acquisition_id"]
+        if pid in skip:  # a decoy left out of the library
+            continue
         peptide_id, charge = of_precursor[pid]
         i0, i1 = ion_slices.get((pid, aid), (0, 0))
         mz_blob, mz_len = encode_f8(ion_mz[i0:i1])

@@ -92,6 +92,8 @@ import constellation.massspec.library.decoys
 import constellation.massspec.library.ids
 import constellation.massspec.library.io
 import constellation.massspec.library.library
+import constellation.massspec.library.prediction
+import constellation.massspec.library.prediction.collision_energy
 import constellation.massspec.library.schemas
 import constellation.massspec.library.search_space
 import constellation.massspec.cli.search_space

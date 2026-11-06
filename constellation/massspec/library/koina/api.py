@@ -48,8 +48,11 @@ from constellation.massspec.library.koina.models import (
     ms2_model,
     rt_model,
 )
-from constellation.massspec.library.koina.nce import adjust_nce
 from constellation.massspec.library.library import Library, attach_predictions
+from constellation.massspec.library.prediction.collision_energy import (
+    DEFAULT_REFERENCE_CHARGE,
+    CollisionEnergy,
+)
 from constellation.core.sequence.proforma import parse_proforma
 
 Inputs = Mapping[str, Any] | pa.Table | Sequence[Mapping[str, Any]]
@@ -206,12 +209,30 @@ def _validate_specs(specs: Sequence[PrecursorSpec], model: Ms2Model) -> list[str
     return modseqs
 
 
+def collision_energy_for(
+    collision_energy: float | CollisionEnergy | None,
+    *,
+    adjust_nce_for_dia: bool = True,
+    nce_reference_charge: int = DEFAULT_REFERENCE_CHARGE,
+) -> CollisionEnergy | None:
+    """The per-charge energy a call asks for. A :class:`CollisionEnergy`
+    is taken as it is; a number is scaled from ``nce_reference_charge``
+    by EncyclopeDIA's rule, or used for every charge when
+    ``adjust_nce_for_dia`` is false."""
+    if collision_energy is None or isinstance(collision_energy, CollisionEnergy):
+        return collision_energy
+    if adjust_nce_for_dia:
+        return CollisionEnergy.scaled_from_reference(float(collision_energy), nce_reference_charge)
+    return CollisionEnergy.uniform(float(collision_energy))
+
+
 def predict_fragments(
     specs: Sequence[PrecursorSpec],
     *,
     model: str = "Prosit_2020_intensity_HCD",
-    collision_energy: float | None = None,
+    collision_energy: float | CollisionEnergy | None = None,
     adjust_nce_for_dia: bool = True,
+    nce_reference_charge: int = DEFAULT_REFERENCE_CHARGE,
     server: str | None = None,
     min_intensity: float = 1e-4,
     on_unsupported: str = "error",
@@ -225,7 +246,17 @@ def predict_fragments(
     matters because ``on_unsupported="skip"`` drops precursors the model
     can't handle, and the response rows align with what was *sent*, not
     with what was asked for.
+
+    ``collision_energy`` is a :class:`CollisionEnergy` (an energy per
+    charge) or a number, which ``adjust_nce_for_dia`` and
+    ``nce_reference_charge`` turn into one (:func:`collision_energy_for`);
+    those two do not apply to a :class:`CollisionEnergy`.
     """
+    energy = collision_energy_for(
+        collision_energy,
+        adjust_nce_for_dia=adjust_nce_for_dia,
+        nce_reference_charge=nce_reference_charge,
+    )
     overlay = ms2_model(model)
     cl = client or make_client(model, server=server)
     declared = set(cl.model_inputs)
@@ -250,14 +281,15 @@ def predict_fragments(
         "precursor_charges": charges,
     }
     if "collision_energies" in declared:
-        if collision_energy is None:
+        if energy is None:
             raise KoinaInputError(
                 f"{model} requires a collision energy; pass collision_energy=..."
             )
-        arrays["collision_energies"] = adjust_nce(
-            collision_energy, charges, enabled=adjust_nce_for_dia
-        )
-    elif collision_energy is not None:
+        try:
+            arrays["collision_energies"] = energy.resolve(charges)
+        except ValueError as exc:
+            raise KoinaInputError(str(exc)) from exc
+    elif energy is not None:
         raise KoinaInputError(
             f"{model} does not accept a collision energy — it declares inputs "
             f"{sorted(declared)}. Supplying one would be silently ignored and "
@@ -323,8 +355,9 @@ def predict_library(
     library: Library | None = None,
     ms2_model_name: str = "Prosit_2020_intensity_HCD",
     rt_model_name: str | None = "Chronologer_RT",
-    collision_energy: float | None = 30.0,
+    collision_energy: float | CollisionEnergy | None = 30.0,
     adjust_nce_for_dia: bool = True,
+    nce_reference_charge: int = DEFAULT_REFERENCE_CHARGE,
     server: str | None = None,
     min_intensity: float = 1e-4,
     on_unsupported: str = "error",
@@ -343,7 +376,12 @@ def predict_library(
     it (:func:`~constellation.massspec.library.library.attach_predictions`):
     its decoys, spans and modification provenance survive, and a precursor
     the model could not take is left out and counted in the metadata
-    (``x.koina.precursors_not_predicted``)."""
+    (``x.koina.precursors_not_predicted``).
+
+    The energy each charge was predicted at is recorded as
+    ``x.massspec.prediction.collision_energy``
+    (:meth:`CollisionEnergy.describe` over the charges predicted), absent
+    for a model that takes no energy."""
     if sum(x is not None for x in (specs, fasta, library)) != 1:
         raise ValueError("pass exactly one of specs=, fasta= or library=")
     if library is not None:
@@ -355,6 +393,7 @@ def predict_library(
             rt_model_name=rt_model_name,
             collision_energy=collision_energy,
             adjust_nce_for_dia=adjust_nce_for_dia,
+            nce_reference_charge=nce_reference_charge,
             server=server,
             min_intensity=min_intensity,
             on_unsupported=on_unsupported,
@@ -380,11 +419,15 @@ def predict_library(
         raise ValueError("no precursors to predict")
 
     overlay = ms2_model(ms2_model_name)
+    energy = collision_energy_for(
+        collision_energy,
+        adjust_nce_for_dia=adjust_nce_for_dia,
+        nce_reference_charge=nce_reference_charge,
+    )
     sent, response = predict_fragments(
         specs,
         model=ms2_model_name,
-        collision_energy=collision_energy,
-        adjust_nce_for_dia=adjust_nce_for_dia,
+        collision_energy=energy,
         server=server,
         min_intensity=min_intensity,
         on_unsupported=on_unsupported,
@@ -405,12 +448,16 @@ def predict_library(
     meta = {
         "x.koina.ms2_model": ms2_model_name,
         "x.koina.rt_model": rt_model_name or "",
-        "x.koina.collision_energy": collision_energy,
+        "x.koina.collision_energy": energy.nce if energy is not None else None,
         "x.koina.instrument": instrument,
-        "x.koina.adjust_nce_for_dia": adjust_nce_for_dia,
+        "x.koina.adjust_nce_for_dia": energy is not None and energy.origin == "scaled_from_reference",
         "x.koina.rt_scale": rt_model(rt_model_name).scale if rt_model_name else "",
         **(metadata or {}),
     }
+    if energy is not None:
+        meta["x.massspec.prediction.collision_energy"] = energy.describe(
+            sorted({s.charge for s in sent})
+        )
     return assemble_library(
         sent,
         response,
@@ -422,6 +469,7 @@ def predict_library(
 
 
 __all__ = [
+    "collision_energy_for",
     "predict",
     "predict_fragments",
     "predict_library",

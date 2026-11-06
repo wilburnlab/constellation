@@ -45,7 +45,8 @@ def _args(**overrides):
         no_decoys=False,
         no_adjust_nce_for_dia=False,
         default_nce=33,
-        default_charge=3,
+        default_charge=None,
+        collision_energy_by_charge=None,
         generate_protein_entrapments=False,
         entrapment_seed=1,
         prediction_cache=None,
@@ -196,9 +197,11 @@ def _sweep_stubs(monkeypatch, tmp_path, *, calls):
         "constellation.massspec.library.koina.client.make_client",
         lambda *a, **k: _Probe(),
     )
+    from constellation.massspec.library.digest import PrecursorSpec
+
     monkeypatch.setattr(
         "constellation.massspec.library.digest.precursors_from_peptide_list",
-        lambda *a, **k: ["spec"],
+        lambda *a, **k: [PrecursorSpec("LVNELTEFAK", "LVNELTEFAK", 2, 582.32)],
     )
     monkeypatch.setattr(
         "constellation.massspec.library.save_library", lambda *a, **k: None
@@ -236,7 +239,8 @@ def test_resume_restores_completed_energies_into_the_manifest(
         )
     )
     assert rc == 0
-    assert calls == [30.0], "the completed energy should not be recomputed"
+    assert [c.nce for c in calls] == [30.0], "the completed energy should not be recomputed"
+    assert calls[0].origin == "scaled_from_reference" and calls[0].reference_charge == 3
 
     manifest = json.loads((out / "manifest.json").read_text())
     energies = sorted(r["collision_energy"] for r in manifest["runs"])
@@ -289,3 +293,119 @@ def test_resume_errors_when_a_completed_run_has_no_manifest(
     )
     assert rc == 1
     assert "no manifest.json" in capsys.readouterr().err
+
+
+# ── collision energy per charge ────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("override", "flag"),
+    [
+        ({"collision_energy": "30"}, "--collision-energy"),
+        ({"default_charge": 2}, "--default-charge"),
+        ({"no_adjust_nce_for_dia": True}, "--no-adjust-nce-for-dia"),
+    ],
+)
+def test_energy_table_refuses_the_flags_it_replaces(tmp_path, capsys, override, flag):
+    rc = _cmd_massspec_predict_library(
+        _args(output_dir=tmp_path, peptides=tmp_path / "p.txt",
+              collision_energy_by_charge="2=28,3=31", **override)
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--collision-energy-by-charge" in err and flag in err
+
+
+def test_energy_table_refuses_garbage(tmp_path, capsys):
+    rc = _cmd_massspec_predict_library(
+        _args(output_dir=tmp_path, peptides=tmp_path / "p.txt",
+              collision_energy_by_charge="2=28,three=31")
+    )
+    assert rc == 1
+    assert "bad entry" in capsys.readouterr().err
+
+
+def test_energy_table_must_cover_every_charge_predicted(tmp_path, monkeypatch, capsys):
+    calls: list = []
+    peptides, _json = _sweep_stubs(monkeypatch, tmp_path, calls=calls)
+    rc = _cmd_massspec_predict_library(
+        _args(output_dir=tmp_path / "out", peptides=peptides,
+              collision_energy_by_charge="3=31,4=33")
+    )
+    assert rc == 1
+    assert "no energy for charge 2" in capsys.readouterr().err
+    assert calls == []
+
+
+def test_energy_table_is_passed_as_given_and_recorded(tmp_path, monkeypatch):
+    calls: list = []
+    peptides, json = _sweep_stubs(monkeypatch, tmp_path, calls=calls)
+    out = tmp_path / "out"
+    rc = _cmd_massspec_predict_library(
+        _args(output_dir=out, peptides=peptides, collision_energy_by_charge="2=27.5,3=31")
+    )
+    assert rc == 0
+    (energy,) = calls
+    assert energy.origin == "explicit"
+    assert energy.by_charge() == {2: 27.5, 3: 31.0}
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["koina"]["collision_energy_by_charge"] == {"2": 27.5, "3": 31.0}
+    assert manifest["koina"]["adjust_nce_for_dia"] is False
+    (run,) = manifest["runs"]
+    assert run["collision_energy"] is None
+    assert run["collision_energy_by_charge"]["table"] == {"2": 27.5}
+
+
+def test_energy_table_is_refused_for_a_model_without_an_energy_input(tmp_path, monkeypatch, capsys):
+    calls: list = []
+    peptides, _json = _sweep_stubs(monkeypatch, tmp_path, calls=calls)
+
+    class _NoEnergy:
+        model_inputs = {"peptide_sequences": None}
+
+    monkeypatch.setattr(
+        "constellation.massspec.library.koina.client.make_client", lambda *a, **k: _NoEnergy()
+    )
+    rc = _cmd_massspec_predict_library(
+        _args(output_dir=tmp_path / "out", peptides=peptides, collision_energy_by_charge="2=28")
+    )
+    assert rc == 1
+    assert "declares no collision-energy input" in capsys.readouterr().err
+    assert calls == []
+
+
+def test_default_charge_reaches_koina_as_the_reference(tmp_path, monkeypatch):
+    calls: list = []
+    peptides, json = _sweep_stubs(monkeypatch, tmp_path, calls=calls)
+    out = tmp_path / "out"
+    rc = _cmd_massspec_predict_library(
+        _args(output_dir=out, peptides=peptides, collision_energy="30", default_charge=2)
+    )
+    assert rc == 0
+    (energy,) = calls
+    assert energy.origin == "scaled_from_reference" and energy.reference_charge == 2
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["koina"]["nce_reference_charge"] == 2
+    assert manifest["runs"][0]["collision_energy_by_charge"]["table"]["2"] == 30.0
+
+
+def test_no_adjust_makes_one_energy_for_every_charge(tmp_path, monkeypatch):
+    calls: list = []
+    peptides, json = _sweep_stubs(monkeypatch, tmp_path, calls=calls)
+    out = tmp_path / "out"
+    rc = _cmd_massspec_predict_library(
+        _args(output_dir=out, peptides=peptides, collision_energy="30", no_adjust_nce_for_dia=True)
+    )
+    assert rc == 0
+    (energy,) = calls
+    assert energy.origin == "uniform"
+    assert json.loads((out / "manifest.json").read_text())["koina"]["nce_reference_charge"] is None
+
+
+def test_encyclopedia_backend_refuses_an_energy_table(tmp_path, capsys):
+    rc = _cmd_massspec_predict_library(
+        _args(backend="encyclopedia", output_dir=tmp_path, fasta=tmp_path / "a.fasta",
+              output_dlib=tmp_path / "a.dlib", collision_energy_by_charge="2=28")
+    )
+    assert rc == 1
+    assert "not available with --backend encyclopedia" in capsys.readouterr().err

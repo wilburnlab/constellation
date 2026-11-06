@@ -111,6 +111,18 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
         ),
     )
     koina.add_argument(
+        "--collision-energy-by-charge",
+        default=None,
+        metavar="Z=NCE,...",
+        help=(
+            "a collision energy for each precursor charge, e.g. "
+            "'1=28,2=31,3=33,4=35' (tuned for an instrument), used as given "
+            "instead of one energy scaled from --default-charge. Every charge "
+            "predicted must be in it. Not with --collision-energy, "
+            "--default-charge or --no-adjust-nce-for-dia."
+        ),
+    )
+    koina.add_argument(
         "--output-library",
         type=Path,
         default=None,
@@ -189,7 +201,11 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--no-adjust-nce-for-dia",
         action="store_true",
-        help="skip the DIA-mode NCE adjustment EncyclopeDIA applies by default",
+        help=(
+            "predict every charge at the collision energy as given, instead of "
+            "scaling it from --default-charge to each precursor charge "
+            "(EncyclopeDIA's DIA rule, NCE·f(default)/f(z))"
+        ),
     )
     p.add_argument(
         "--default-nce",
@@ -200,8 +216,11 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--default-charge",
         type=int,
-        default=3,
-        help="default charge used for NCE adjustment",
+        default=None,
+        help=(
+            "the method's default charge, at which the collision energy "
+            "applies unchanged; other charges are scaled from it (default: 3)"
+        ),
     )
     p.add_argument(
         "--max-variable-mods",
@@ -307,6 +326,14 @@ def _cmd_predict_library_encyclopedia(args: argparse.Namespace) -> int:
             file=_sys.stderr,
         )
         return 1
+    if getattr(args, "collision_energy_by_charge", None) is not None:
+        print(
+            "error: --collision-energy-by-charge is not available with --backend "
+            "encyclopedia: the jar takes one energy (--default-nce) and scales it "
+            "from --default-charge itself",
+            file=_sys.stderr,
+        )
+        return 1
 
     from constellation import __version__ as constellation_version
     from constellation.massspec.io.encyclopedia import read_encyclopedia
@@ -389,7 +416,7 @@ def _cmd_predict_library_encyclopedia(args: argparse.Namespace) -> int:
             add_decoys=not args.no_decoys,
             adjust_nce_for_dia=not args.no_adjust_nce_for_dia,
             default_nce=args.default_nce,
-            default_charge=args.default_charge,
+            default_charge=_reference_charge(args),
             max_variable_mods=args.max_variable_mods,
             max_variable_forms=args.max_variable_forms,
             generate_protein_entrapments=args.generate_protein_entrapments,
@@ -500,6 +527,50 @@ def _parse_collision_energies(raw: str | None) -> list[float | None]:
     return out or [None]
 
 
+def _reference_charge(args: argparse.Namespace) -> int:
+    """``--default-charge``, or EncyclopeDIA's 3 when it was not given."""
+    from constellation.massspec.library.prediction import DEFAULT_REFERENCE_CHARGE
+
+    given = getattr(args, "default_charge", None)
+    return DEFAULT_REFERENCE_CHARGE if given is None else int(given)
+
+
+def _energy_table(args: argparse.Namespace) -> dict[int, float] | None:
+    """``--collision-energy-by-charge`` parsed, or ``None``. It sets every
+    charge's energy, so the flags that make one energy and scale it are
+    refused beside it rather than silently overridden."""
+    from constellation.massspec.library.prediction import parse_energy_table
+
+    raw = getattr(args, "collision_energy_by_charge", None)
+    if raw is None:
+        return None
+    conflicts = [
+        flag
+        for flag, given in (
+            ("--collision-energy", getattr(args, "collision_energy", None) is not None),
+            ("--default-charge", getattr(args, "default_charge", None) is not None),
+            ("--no-adjust-nce-for-dia", bool(getattr(args, "no_adjust_nce_for_dia", False))),
+        )
+        if given
+    ]
+    if conflicts:
+        raise ValueError(
+            "--collision-energy-by-charge gives every charge its energy, so it "
+            f"cannot be combined with {', '.join(conflicts)}"
+        )
+    return parse_energy_table(raw)
+
+
+def _scalar_energy(energy: float, args: argparse.Namespace):
+    """One energy, scaled from ``--default-charge`` to each charge unless
+    ``--no-adjust-nce-for-dia``."""
+    from constellation.massspec.library.prediction import CollisionEnergy
+
+    if getattr(args, "no_adjust_nce_for_dia", False):
+        return CollisionEnergy.uniform(energy)
+    return CollisionEnergy.scaled_from_reference(energy, _reference_charge(args))
+
+
 def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
     """FASTA / peptide list / existing library → predicted Library via Koina.
 
@@ -573,6 +644,7 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
 
     try:
         energies = _parse_collision_energies(args.collision_energy)
+        energy_table = _energy_table(args)
     except ValueError as exc:
         print(f"error: {exc}", file=_sys.stderr)
         return 1
@@ -616,6 +688,15 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
     if not specs:
         print("error: no precursors to predict", file=_sys.stderr)
         return 1
+    if energy_table is not None:
+        missing = sorted({s.charge for s in specs} - set(energy_table))
+        if missing:
+            print(
+                f"error: --collision-energy-by-charge has no energy for charge "
+                f"{', '.join(map(str, missing))}, which the precursors include",
+                file=_sys.stderr,
+            )
+            return 1
 
     # ── reject a sweep the model would silently collapse ────────────
     try:
@@ -626,6 +707,14 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
         return 1
 
     takes_energy = "collision_energies" in declared
+    if energy_table is not None and not takes_energy:
+        print(
+            f"error: {args.ms2_model} declares no collision-energy input, so "
+            f"--collision-energy-by-charge would change nothing. Drop it, or "
+            f"pick a model that accepts one.",
+            file=_sys.stderr,
+        )
+        return 1
     if len(energies) > 1 and not takes_energy:
         print(
             f"error: {args.ms2_model} declares no collision-energy input, so "
@@ -640,11 +729,21 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
     if not takes_energy:
         energies = [None]
 
-    multi = len(energies) > 1
+    # Each run's energy as a property of each charge: an explicit table,
+    # or one energy scaled from the reference charge.
+    if energy_table is not None:
+        from constellation.massspec.library.prediction import CollisionEnergy
+
+        plans = [CollisionEnergy.explicit(energy_table)]
+    else:
+        plans = [None if e is None else _scalar_energy(e, args) for e in energies]
+    charges_present = sorted({s.charge for s in specs})
+
+    multi = len(plans) > 1
     summaries: list[dict[str, object]] = []
 
-    for energy in energies:
-        run_dir = output_dir / f"ce_{energy:g}" if multi else output_dir
+    for energy in plans:
+        run_dir = output_dir / f"ce_{energy.label}" if multi else output_dir
         run_dir.mkdir(parents=True, exist_ok=True)
         marker = run_dir / "_SUCCESS" if multi else None
         if marker is not None and marker.exists() and args.resume:
@@ -664,7 +763,7 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
                 )
                 return 1
             summaries.append(json.loads(prior.read_text()))
-            print(f"  ce={energy:g}: already complete, restored from manifest")
+            print(f"  ce={energy.label}: already complete, restored from manifest")
             continue
 
         try:
@@ -674,7 +773,6 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
                 ms2_model_name=args.ms2_model,
                 rt_model_name=rt_model_name,
                 collision_energy=energy,
-                adjust_nce_for_dia=not args.no_adjust_nce_for_dia,
                 server=args.koina_url,
                 min_intensity=args.min_intensity,
                 on_unsupported=args.on_unsupported_mod,
@@ -705,7 +803,10 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
             save_library(library, dlib_path, format="encyclopedia.dlib")
 
         summary = {
-            "collision_energy": energy,
+            "collision_energy": energy.nce if energy is not None else None,
+            "collision_energy_by_charge": (
+                energy.describe(charges_present) if energy is not None else None
+            ),
             "library_pqdir": str(pqdir),
             "output_dlib": str(dlib_path) if dlib_path else None,
             "counts": {
@@ -721,7 +822,7 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
             (run_dir / "manifest.json").write_text(json.dumps(summary, indent=2))
             marker.write_bytes(b"")
         if not args.no_progress:
-            label = f"ce={energy:g}: " if multi else ""
+            label = f"ce={energy.label}: " if multi else ""
             print(
                 f"  {label}{library.precursors.num_rows} precursors, "
                 f"{library.fragments.num_rows} fragments "
@@ -741,7 +842,13 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
             "server": server,
             "ms2_model": args.ms2_model,
             "rt_model": rt_model_name,
-            "adjust_nce_for_dia": not args.no_adjust_nce_for_dia,
+            "adjust_nce_for_dia": energy_table is None and not args.no_adjust_nce_for_dia,
+            "nce_reference_charge": (
+                _reference_charge(args)
+                if energy_table is None and not args.no_adjust_nce_for_dia
+                else None
+            ),
+            "collision_energy_by_charge": energy_table,
             "min_intensity": args.min_intensity,
         },
         "runs": summaries,

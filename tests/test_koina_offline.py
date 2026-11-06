@@ -238,19 +238,82 @@ def test_cid_fixture_declares_no_collision_energy():
 # ── NCE ───────────────────────────────────────────────────────────────
 
 
-def test_adjust_nce_matches_searle_table():
+def test_adjust_nce_is_encyclopedias_rule_from_charge_3():
+    """NCE·f(3)/f(z), as EncyclopeDIA scales it (it used to be NCE·f(z))."""
     charges = np.array([[1], [2], [3], [4], [5]])
     got = adjust_nce(30.0, charges).ravel()
-    assert got == pytest.approx([30.0, 27.0, 25.5, 24.0, 22.5])
+    assert got == pytest.approx([25.5, 28.333334, 30.0, 31.875, 34.0])
 
 
-def test_adjust_nce_clamps_above_table():
-    assert adjust_nce(30.0, np.array([[9]])).ravel()[0] == pytest.approx(22.5)
+def test_adjust_nce_takes_another_reference_charge():
+    got = adjust_nce(30.0, np.array([[1], [2], [3]]), reference_charge=2).ravel()
+    assert got == pytest.approx([27.0, 30.0, 31.764706])
+
+
+def test_adjust_nce_gives_charges_above_the_table_the_last_factor():
+    assert adjust_nce(30.0, np.array([[9]])).ravel()[0] == pytest.approx(34.0)
 
 
 def test_adjust_nce_disabled_is_passthrough():
     got = adjust_nce(30.0, np.array([[2], [3]]), enabled=False).ravel()
     assert got == pytest.approx([30.0, 30.0])
+
+
+def test_adjust_nce_scales_a_per_precursor_energy_element_by_element():
+    got = adjust_nce(np.array([[30.0], [33.0]]), np.array([[3], [3]])).ravel()
+    assert got == pytest.approx([30.0, 33.0])
+
+
+def test_hcd_receives_each_charges_energy_and_the_library_records_the_table():
+    from constellation.massspec.library.koina.api import predict_library
+    from constellation.massspec.library.prediction import CollisionEnergy
+
+    client = FakeKoinaClient(HCD)
+    specs = fixture_specs(HCD)
+    lib, _ = predict_library(
+        specs=specs, ms2_model_name=HCD, rt_model_name=None,
+        collision_energy=33.0, ms2_client=client,
+    )
+    want = CollisionEnergy.scaled_from_reference(33.0, 3)
+    sent = client.last_request["collision_energies"].ravel()
+    charges = client.last_request["precursor_charges"].ravel()
+    assert sent.tobytes() == want.resolve(charges).tobytes()
+    recorded = lib.metadata_extras["x.massspec.prediction.collision_energy"]
+    assert recorded["origin"] == "scaled_from_reference"
+    assert recorded["reference_charge"] == 3
+    assert set(recorded["table"]) == {str(z) for z in {s.charge for s in specs}}
+    assert lib.metadata_extras["x.koina.adjust_nce_for_dia"] is True
+
+
+def test_hcd_takes_an_explicit_table_as_given():
+    from constellation.massspec.library.koina.api import predict_library
+    from constellation.massspec.library.prediction import CollisionEnergy
+
+    client = FakeKoinaClient(HCD)
+    specs = fixture_specs(HCD)
+    table = {z: 25.0 + z for z in {s.charge for s in specs}}
+    lib, _ = predict_library(
+        specs=specs, ms2_model_name=HCD, rt_model_name=None,
+        collision_energy=CollisionEnergy.explicit(table), ms2_client=client,
+    )
+    sent = client.last_request["collision_energies"].ravel()
+    charges = client.last_request["precursor_charges"].ravel()
+    assert sent.tolist() == [table[int(z)] for z in charges]
+    assert lib.metadata_extras["x.massspec.prediction.collision_energy"]["origin"] == "explicit"
+    assert lib.metadata_extras["x.koina.collision_energy"] is None
+    assert lib.metadata_extras["x.koina.adjust_nce_for_dia"] is False
+
+
+def test_an_explicit_table_missing_a_charge_is_refused_before_the_model():
+    from constellation.massspec.library.koina.api import predict_fragments
+    from constellation.massspec.library.prediction import CollisionEnergy
+
+    with pytest.raises(KoinaInputError, match="no collision energy for charge"):
+        predict_fragments(
+            fixture_specs(HCD), model=HCD,
+            collision_energy=CollisionEnergy.explicit({99: 30.0}),
+            client=FakeKoinaClient(HCD),
+        )
 
 
 # ── assembly ──────────────────────────────────────────────────────────

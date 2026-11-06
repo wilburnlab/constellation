@@ -316,6 +316,65 @@ def test_prediction_roundtrip_preserves_decoy_flags_and_spans(tmp_path):
     assert len(precursors_from_library(path)) == lib.n_precursors
 
 
+def test_attach_predictions_carries_ccs_and_keeps_unset_values_from_the_source(tmp_path):
+    """attach_predictions copied RT and dropped CCS (fixed 2026-11-05)."""
+    from constellation.massspec.library.library import assign_ids, attach_predictions
+
+    lib = _build(tmp_path, "PEPTIDEKMAGICSEQR", decoys=(DecoySet(),))
+    rows = lib.precursors.join(lib.peptides.select(["peptide_id", "modified_sequence"]), keys="peptide_id")
+    rows = sorted(rows.to_pylist(), key=lambda r: (r["modified_sequence"], r["charge"]))
+    predicted_rows = [
+        {"modified_sequence": r["modified_sequence"], "charge": r["charge"], "precursor_mz": r["precursor_mz"],
+         "rt_predicted": 100.0 + i, "ccs_predicted": -1.0 if i % 2 else 400.0 + i}
+        for i, r in enumerate(rows)
+    ]
+    predicted = assign_ids(
+        proteins=[], peptides=[{"modified_sequence": m} for m in {r["modified_sequence"] for r in rows}],
+        precursors=predicted_rows,
+    )
+    merged, counts = attach_predictions(lib, predicted)
+    assert counts["precursors_not_predicted"] == 0
+    got = merged.precursors.join(merged.peptides.select(["peptide_id", "modified_sequence"]), keys="peptide_id")
+    got = {(r["modified_sequence"], r["charge"]): r for r in got.to_pylist()}
+    for want in predicted_rows:
+        row = got[(want["modified_sequence"], want["charge"])]
+        assert row["rt_predicted"] == want["rt_predicted"]
+        # an unset predicted CCS leaves the source's (also unset here)
+        assert row["ccs_predicted"] == (want["ccs_predicted"] if want["ccs_predicted"] >= 0 else -1.0)
+
+
+def test_a_dlib_holds_the_targets_and_leaves_decoys_out(tmp_path):
+    """The writer wrote decoys into entries with isDecoy false, so the jar
+    searched them as targets and made decoys of them (fixed 2026-11-05)."""
+    import sqlite3
+
+    lib = _build(tmp_path, "PEPTIDEKMAGICSEQR", decoys=(DecoySet(),))
+    peptides = lib.peptides.to_pylist()
+    targets = {p["sequence"] for p in peptides if not p["is_decoy"]}
+    decoys = {p["sequence"] for p in peptides if p["is_decoy"]}
+    target_ids = {p["peptide_id"] for p in peptides if not p["is_decoy"]}
+    n_target_precursors = sum(1 for r in lib.precursors.to_pylist() if r["peptide_id"] in target_ids)
+    assert decoys and not decoys & targets
+
+    with pytest.warns(UserWarning, match=rf"{len(decoys)} decoy peptide\(s\)"):
+        save_library(lib, tmp_path / "space.dlib", format="encyclopedia.dlib")
+    con = sqlite3.connect(f"file:{tmp_path / 'space.dlib'}?mode=ro", uri=True)
+    entries = {r[0] for r in con.execute("select PeptideSeq from entries")}
+    mapped = {r[0] for r in con.execute("select PeptideSeq from peptidetoprotein")}
+    assert con.execute("select count(*) from entries").fetchone()[0] == n_target_precursors
+    assert entries == targets and mapped == targets
+    assert con.execute("select count(*) from peptidetoprotein where isDecoy").fetchone()[0] == 0
+
+
+def test_a_dlib_of_a_library_without_decoys_warns_of_nothing(tmp_path):
+    import warnings
+
+    lib = _build(tmp_path, "PEPTIDEKMAGICSEQR")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        save_library(lib, tmp_path / "space.dlib", format="encyclopedia.dlib")
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 def test_conflicting_fixed_terminal_aliases_are_rejected(tmp_path, reverse):
     rules = (ModRule.parse("Acetyl@Protein N-term", "fixed"), ModRule.parse("Dimethyl@N-term", "fixed"))
