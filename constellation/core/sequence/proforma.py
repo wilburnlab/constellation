@@ -65,6 +65,7 @@ Out of scope this session:
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from functools import cache
 from importlib import resources
@@ -1130,6 +1131,33 @@ def parse_isotope_label(label: str) -> tuple[int, str]:
 # ──────────────────────────────────────────────────────────────────────
 
 
+def permute_peptidoform(peptidoform: Peptidoform, order: Sequence[int]) -> Peptidoform:
+    """The peptidoform with its residues rearranged, each carrying its own
+    modifications: residue ``j`` of the result is residue ``order[j]`` of
+    the input, with that residue's mods. Terminal modifications, labile
+    and unknown-position mods, global isotope labels, fixed-mod
+    declarations, charge and adducts stay as they are (they belong to the
+    termini or to the whole molecule, not to a residue), so the result has
+    the same composition. This is what a decoy made by reversing or
+    shuffling a peptide needs.
+
+    Refused: ``order`` that is not a permutation of the positions, and a
+    peptidoform with ranges (a range's mod has no single residue to follow).
+    """
+    n = len(peptidoform.sequence)
+    if sorted(order) != list(range(n)):
+        raise ValueError(f"order must be a permutation of range({n}), got {list(order)}")
+    if peptidoform.ranges:
+        raise ValueError("a peptidoform with ranges cannot be permuted residue by residue")
+    where = {old: new for new, old in enumerate(order)}
+    return replace(
+        peptidoform,
+        sequence="".join(peptidoform.sequence[i] for i in order),
+        residue_mods={where[pos]: mods for pos, mods in sorted(peptidoform.residue_mods.items())},
+        name=None,
+    )
+
+
 __all__ = [
     "ProFormaError",
     "ProFormaSyntaxError",
@@ -1143,6 +1171,7 @@ __all__ = [
     "parse_proforma",
     "format_proforma",
     "parse_isotope_label",
+    "permute_peptidoform",
     "_has_crosslinks",
     "_has_branches",
 ]
