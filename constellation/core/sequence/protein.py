@@ -20,16 +20,20 @@ envelopes, and Hill-formula formatting for free.
 
 from __future__ import annotations
 
+import bisect
+import functools
 import itertools
 import json
-import math
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import resources
+from operator import itemgetter
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import regex
+import torch
 
 from constellation.core.chem.composition import Composition
 from constellation.core.chem.elements import ELEMENTS
@@ -190,14 +194,42 @@ PROTEASES: ProteaseRegistry = _load_proteases()
 # ──────────────────────────────────────────────────────────────────────
 
 
+#: How a span's end was made: by the protease's rule, at one of the
+#: protein's own termini (its first or last residue, after an initiator Met,
+#: or a declared mature-chain end), or by neither (semi- / unspecific).
+TerminusKind = Literal["enzyme", "protein", "nonspecific"]
+TERMINUS_KINDS: tuple[str, ...] = ("enzyme", "protein", "nonspecific")
+
+#: Digestion specificity: both ends by the rule, at least one, or neither.
+CleavageSpecificity = Literal["specific", "semi", "unspecific"]
+
+
 @dataclass(frozen=True, slots=True)
 class Peptide:
-    """A peptide span within a parent protein."""
+    """A peptide span within a parent protein.
+
+    ``n_missed`` counts the protease's cut sites strictly inside the span.
+    ``n_term`` / ``c_term`` say how each end was made (:data:`TerminusKind`);
+    ``preceding`` / ``following`` are the residues either side of the span,
+    ``"-"`` at a protein end (the flanking notation search engines use).
+    """
 
     sequence: str
     start: int  # 0-indexed inclusive
     end: int  # 0-indexed exclusive
     n_missed: int
+    n_term: TerminusKind = "enzyme"
+    c_term: TerminusKind = "enzyme"
+    preceding: str = ""
+    following: str = ""
+
+    @property
+    def is_protein_n_terminal(self) -> bool:
+        return self.n_term == "protein"
+
+    @property
+    def is_protein_c_terminal(self) -> bool:
+        return self.c_term == "protein"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -253,106 +285,138 @@ def cleave(
     min_length: int = 6,
     max_length: int | None = 50,
     semi_specific: bool = False,
+    specificity: CleavageSpecificity | None = None,
     excise_initiator_met: bool = False,
+    extra_n_termini: Sequence[int] = (),
+    extra_c_termini: Sequence[int] = (),
     validate_alphabet: bool = True,
     return_spans: bool = False,
 ) -> list[str] | list[Peptide]:
     """Enzymatically cleave `seq` into peptides.
 
-    Iterates the protease's cut sites, then enumerates spans across
-    0..missed_cleavages consecutive cuts. With `semi_specific=True`,
-    additionally emits all suffixes of each fully-specific peptide
-    (the C-terminal cut is preserved; the N-terminus floats) — the
-    standard "semi-tryptic" search-engine option.
+    A span's two ends are each one of: a cut site of the protease, one of
+    the protein's termini, or (semi- / unspecific digestion) neither.
+    ``missed_cleavages`` bounds the cut sites strictly inside a span.
 
-    With `excise_initiator_met=True`, for every N-terminal peptide
-    (a span starting at protein position 0) whose first residue is the
-    initiator methionine, ALSO emit the Met-clipped form (`peptide[1:]`)
-    — keeping both. This is the initiator-Met-excision behaviour search
-    engines apply (verified against EncyclopeDIA 6.5.15's predicted
-    library: ~87% of protein N-termini carry both the Met-intact and
-    Met-clipped precursor). The clipping is **unconditional** (not gated
-    on the second residue / biological Met-aminopeptidase rule — the
-    library shows clipped forms for every second residue), applies to
-    all N-terminal spans (0-missed and missed-cleavage variants), and
-    the clipped form is subject to the same length filter independently
-    (so a clipped form that drops below `min_length` is omitted while
-    its intact partner survives).
+    ``specificity`` (default ``"specific"``):
 
-    Output ordering: peptides are sorted by `(start ASC, end ASC)`,
-    so along the protein you read the 0-missed peptide first, then
-    the 1-missed, then 2-missed at each starting cut. Pyteomics
-    returns a `set` (random); we explicitly sort.
+    - ``"specific"``: both ends are cut sites or protein termini — the
+      spans across 0..``missed_cleavages`` consecutive cuts;
+    - ``"semi"``: at least one end is, the other anywhere within the
+      length bounds (both the N-terminus and the C-terminus may float);
+    - ``"unspecific"``: every span within the length bounds, whatever the
+      protease (which then only names how ends were made and counts the
+      cut sites inside; ``missed_cleavages`` does not apply).
+      ``max_length`` is required.
 
-    Duplicate sequences (same residue content, different positions)
-    are de-duplicated by keeping the first occurrence under the
-    `(start, end)` ordering.
+    ``semi_specific=True`` is the old spelling of ``specificity="semi"``.
+    Until 2026-11-05 it floated only the N-terminus (suffixes of each
+    specific span); it now floats either end.
+
+    Protein termini: position 0 and ``len(seq)``, plus ``extra_n_termini``
+    / ``extra_c_termini`` (0-based start / exclusive end positions; a
+    mature chain after a signal peptide, say). With
+    ``excise_initiator_met=True`` and a sequence starting with M, position
+    1 is a protein N-terminus too: every N-terminal span also has its
+    Met-clipped form, each under the length filter on its own. The
+    clipping is **unconditional** (not gated on the second residue): the
+    behaviour verified against EncyclopeDIA 6.5.15's predicted library,
+    where ~87% of protein N-termini carry both forms. A span starting at a
+    protein N-terminus has ``n_term="protein"`` (which is what licenses a
+    Protein N-term modification on it), and likewise at the C-terminus.
+
+    Output ordering: sorted by ``(start, end)``. With ``return_spans=True``
+    the records are :class:`Peptide` spans with protein coordinates, one
+    per ``(start, end)``; otherwise the sequences, de-duplicated keeping
+    the first occurrence (a sequence occurring twice is returned once).
 
     With `validate_alphabet=False`, the canonical-AA check is skipped so
     sequences carrying non-canonical residues (selenocysteine ``U``,
     pyrrolysine ``O``, ambiguity codes ``B``/``Z``/``X``/``J``) digest
-    normally instead of raising. The cut sites only depend on K/R, so
-    peptides not containing the odd residue come out exactly as they
-    would for a clean sequence — important when digesting whole
-    proteomes, where one selenoprotein must not cost you all of its
-    (otherwise canonical) tryptic peptides.
-
-    With `return_spans=True`, returns `list[Peptide]` with the
-    parent-protein coordinates intact (no de-duplication on sequence).
+    normally instead of raising. The cut sites only depend on the
+    protease's residues, so peptides not containing the odd residue come
+    out exactly as they would for a clean sequence — important when
+    digesting whole proteomes, where one selenoprotein must not cost you
+    all of its (otherwise canonical) tryptic peptides.
     """
     if validate_alphabet:
         validate(seq, AA)
     if missed_cleavages < 0:
         raise ValueError(f"missed_cleavages must be ≥ 0; got {missed_cleavages}")
+    if specificity is None:
+        specificity = "semi" if semi_specific else "specific"
+    elif semi_specific and specificity != "semi":
+        raise ValueError(f"semi_specific=True contradicts specificity={specificity!r}")
+    if specificity not in ("specific", "semi", "unspecific"):
+        raise ValueError(f"unknown specificity {specificity!r}")
+    if specificity == "unspecific" and max_length is None:
+        raise ValueError("unspecific digestion needs a max_length")
+    n = len(seq)
+    for pos in (*extra_n_termini, *extra_c_termini):
+        if not 0 <= pos <= n:
+            raise ValueError(f"protein terminus {pos} outside a length-{n} sequence")
 
     sites = cleave_sites(seq, protease, validate_alphabet=validate_alphabet)
-    # `sites` includes 0 and len(seq); spans are between consecutive
-    # cuts plus extensions across `missed_cleavages` interior cuts.
-    spans: list[Peptide] = []
-    n_sites = len(sites)
-    for i in range(n_sites - 1):
-        for k in range(missed_cleavages + 1):
-            j = i + 1 + k
-            if j >= n_sites:
-                break
-            start = sites[i]
-            end = sites[j]
-            peptide = seq[start:end]
-            if not _length_ok(peptide, min_length, max_length):
-                continue
-            spans.append(Peptide(peptide, start, end, n_missed=k))
+    cuts = sites[1:-1]  # the protease's own interior cuts
+    cut_set = set(cuts)
+    n_termini = {0, *extra_n_termini}
+    if excise_initiator_met and seq.startswith("M") and n > 1:
+        n_termini.add(1)
+    c_termini = {n, *extra_c_termini}
+    starts = sorted(n_termini | cut_set)  # where a specific span may start
+    ends = sorted(c_termini | cut_set)  # and end
+    cut_arr = cuts  # ascending
 
-    if semi_specific:
-        # Add all suffixes of each span — N-terminus floats, C-terminus
-        # is a real cut. Implemented as: for each span (s, e), add
-        # (s+1..e), (s+2..e), ... down to min_length.
-        extras: list[Peptide] = []
-        for sp in spans:
-            for new_start in range(sp.start + 1, sp.end):
-                sub = seq[new_start : sp.end]
-                if not _length_ok(sub, min_length, max_length):
-                    continue
-                extras.append(Peptide(sub, new_start, sp.end, n_missed=sp.n_missed))
-        spans.extend(extras)
+    def inside(start: int, end: int) -> int:
+        """Cut sites strictly inside [start, end)."""
+        return bisect.bisect_left(cut_arr, end) - bisect.bisect_right(cut_arr, start)
 
-    if excise_initiator_met:
-        # For every N-terminal peptide (span at protein position 0)
-        # starting with the initiator Met, also emit the Met-clipped
-        # form. Only full spans start at 0 (semi suffixes start ≥ 1), so
-        # iterating `spans` after the semi block still picks exactly the
-        # N-terminal peptides.
-        met_clipped: list[Peptide] = []
-        for sp in spans:
-            if sp.start == 0 and sp.sequence.startswith("M"):
-                clipped = sp.sequence[1:]
-                if _length_ok(clipped, min_length, max_length):
-                    met_clipped.append(
-                        Peptide(clipped, 1, sp.end, n_missed=sp.n_missed)
-                    )
-        spans.extend(met_clipped)
+    def kind(pos: int, termini: set[int]) -> str:
+        if pos in termini:
+            return "protein"
+        if pos in cut_set:
+            return "enzyme"
+        return "nonspecific"
 
-    spans.sort(key=lambda p: (p.start, p.end))
+    max_len = n if max_length is None else max_length
+    keep: set[tuple[int, int]] = set()
+    if specificity == "unspecific":
+        for start in range(n):
+            for end in range(start + max(min_length, 1), min(n, start + max_len) + 1):
+                keep.add((start, end))
+    else:
+        for start in starts:
+            # ends after `start` with at most `missed_cleavages` cuts inside
+            for end in ends[bisect.bisect_right(ends, start):]:
+                if inside(start, end) > missed_cleavages:
+                    break
+                if _length_ok_span(end - start, min_length, max_length):
+                    keep.add((start, end))
+        if specificity == "semi":
+            for start in starts:  # specific start, floating end
+                for end in range(start + max(min_length, 1), min(n, start + max_len) + 1):
+                    if inside(start, end) > missed_cleavages:
+                        break
+                    keep.add((start, end))
+            for end in ends:  # floating start, specific end
+                for start in range(end - max(min_length, 1), max(0, end - max_len) - 1, -1):
+                    if inside(start, end) > missed_cleavages:
+                        break
+                    keep.add((start, end))
 
+    spans = [
+        Peptide(
+            seq[start:end],
+            start,
+            end,
+            n_missed=inside(start, end),
+            n_term=kind(start, n_termini),  # type: ignore[arg-type]
+            c_term=kind(end, c_termini),  # type: ignore[arg-type]
+            preceding=seq[start - 1] if start > 0 else "-",
+            following=seq[end] if end < n else "-",
+        )
+        for start, end in sorted(keep)
+    ]
     if return_spans:
         return spans
 
@@ -368,7 +432,10 @@ def cleave(
 
 
 def _length_ok(peptide: str, min_length: int, max_length: int | None) -> bool:
-    n = len(peptide)
+    return _length_ok_span(len(peptide), min_length, max_length)
+
+
+def _length_ok_span(n: int, min_length: int, max_length: int | None) -> bool:
     if n < min_length:
         return False
     if max_length is not None and n > max_length:
@@ -382,6 +449,39 @@ def _length_ok(peptide: str, min_length: int, max_length: int | None) -> bool:
 
 N_TERM = "N-term"
 C_TERM = "C-term"
+#: Site sentinels for a modification UNIMOD places on the protein's own
+#: terminus: offered only on a span at that terminus (``SiteContext``).
+PROTEIN_N_TERM = "Protein N-term"
+PROTEIN_C_TERM = "Protein C-term"
+_TERMINAL_SITES = {N_TERM: N_TERM, C_TERM: C_TERM, PROTEIN_N_TERM: N_TERM, PROTEIN_C_TERM: C_TERM}
+
+#: Where a modification of an enumerated form came from.
+ModOrigin = Literal["fixed", "variable"]
+
+
+@dataclass(frozen=True, slots=True)
+class SiteContext:
+    """Where in its protein the peptide being modified sits: whether its
+    N-terminus is the protein's own (position 0, after an initiator Met, or
+    a declared mature start) and likewise its C-terminus. This is what lets
+    a Protein N-term modification be placed only where it can occur."""
+
+    protein_n_term: bool = False
+    protein_c_term: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PlacedMod:
+    """One modification of an enumerated form, and why it is there.
+
+    ``slot`` is a 0-based residue index, or ``"N-term"`` / ``"C-term"``;
+    ``site`` is the key of the ``fixed`` / ``variable`` mapping that placed
+    it (a residue letter, ``N-term``, ``Protein N-term``, ...)."""
+
+    slot: int | str
+    key: str
+    origin: ModOrigin
+    site: str
 
 
 def _normalize_mod_spec(
@@ -394,27 +494,53 @@ def _normalize_mod_spec(
     return out
 
 
-def _slots_for_site(site: str, seq: str) -> list[int | str]:
+def _slots_for_site(site: str, seq: str, context: SiteContext | None = None) -> list[int | str]:
     """Positions in `seq` a site specifier applies to.
 
     Residue sites yield 0-indexed offsets; ``N-term`` / ``C-term`` yield
-    themselves as sentinel slots.
+    themselves as sentinel slots, and ``Protein N-term`` / ``Protein
+    C-term`` the same sentinels when ``context`` puts the peptide at that
+    terminus of its protein (none otherwise).
     """
     if site in (N_TERM, C_TERM):
         return [site]
+    if site == PROTEIN_N_TERM:
+        return [N_TERM] if context is not None and context.protein_n_term else []
+    if site == PROTEIN_C_TERM:
+        return [C_TERM] if context is not None and context.protein_c_term else []
     return [i for i, aa in enumerate(seq) if aa == site]
 
 
-def _check_specificity(key: str, site: str, vocab: ModVocab, peptide: str) -> None:
+def _licensed(
+    key: str, site: str, slot: int | str, vocab: ModVocab, peptide: str, context: SiteContext | None
+) -> bool:
+    """Whether UNIMOD (shown or hidden placements) lists ``key`` at ``slot``.
+    Without a context the protein terminus is unknown and not held against
+    a placement (what ``enumerate_modforms`` always did)."""
     mod = vocab[key]
-    if site == N_TERM:
-        ok = bool(peptide) and mod.has_terminal_specificity_for(N_TERM, peptide[0])
-        detail = f" for a peptide starting with {peptide[:1]!r}" if peptide else ""
-    elif site == C_TERM:
-        ok = bool(peptide) and mod.has_terminal_specificity_for(C_TERM, peptide[-1])
-        detail = f" for a peptide ending with {peptide[-1:]!r}" if peptide else ""
+    if slot == N_TERM:
+        protein = context is None or context.protein_n_term
+        return bool(peptide) and mod.licenses(N_TERM, terminal_residue=peptide[0], protein_terminus=protein)
+    if slot == C_TERM:
+        protein = context is None or context.protein_c_term
+        return bool(peptide) and mod.licenses(C_TERM, terminal_residue=peptide[-1], protein_terminus=protein)
+    return mod.licenses(site)
+
+
+def _check_specificity(
+    key: str, site: str, vocab: ModVocab, peptide: str, context: SiteContext | None = None
+) -> None:
+    mod = vocab[key]
+    slot = _TERMINAL_SITES.get(site, site)
+    if slot in (N_TERM, C_TERM):
+        if site in (PROTEIN_N_TERM, PROTEIN_C_TERM) and not _slots_for_site(site, peptide, context):
+            return  # not at the protein's terminus: nothing to place, nothing to check
+        ok = _licensed(key, site, slot, vocab, peptide, context)
+        end = peptide[:1] if slot == N_TERM else peptide[-1:]
+        word = "starting" if slot == N_TERM else "ending"
+        detail = f" for a peptide {word} with {end!r}" if peptide else ""
     else:
-        ok = mod.has_residue_specificity(site)
+        ok = mod.licenses(site)
         detail = ""
     if not ok:
         raise ValueError(
@@ -423,9 +549,292 @@ def _check_specificity(key: str, site: str, vocab: ModVocab, peptide: str) -> No
         )
 
 
+@functools.cache
 def _tagged(key: str) -> TaggedMod:
+    """The TaggedMod of a canonical key; frozen, so one per key is shared."""
     cv, _, acc = key.partition(":")
     return TaggedMod(mod=ModRef(cv=cv, accession=acc))
+
+
+#: N-terminal cyclizations UNIMOD defines from the *unmodified* residue,
+#: which take that residue's side chain into the ring: S-carbamoylmethyl-
+#: cysteine cyclization from C (UNIMOD:26 is the carbamidomethyl and the
+#: loss of ammonia together), pyro-Glu from E and from Q. A chemical
+#: modification already on that residue is replaced by the cyclization, not
+#: added to it: a fixed carbamidomethyl on C with UNIMOD:26 at the
+#: N-terminus is ``[UNIMOD:26]-C...``, not ``[UNIMOD:26]-C[UNIMOD:4]...``,
+#: which would count the carbamidomethyl twice; a deamidated Q cannot also
+#: be Gln->pyro-Glu. An isotopic substitution on the residue stays.
+SIDE_CHAIN_CYCLIZATIONS = frozenset({"UNIMOD:26", "UNIMOD:27", "UNIMOD:28"})
+
+# A slot is (layer, position): position a 0-based residue index or the
+# ``N-term`` / ``C-term`` sentinel; layer 0 the chemical modification there,
+# layer 1 an isotopic substitution of the residue's own atoms (SILAC), which
+# leaves its reactive groups free and so stacks with a chemical one.
+_CHEM, _LABEL = 0, 1
+_Slot = tuple[int, int | str]
+_N_SLOT: _Slot = (_CHEM, N_TERM)
+_R0_SLOT: _Slot = (_CHEM, 0)
+
+
+def _slot_order(slot: _Slot) -> tuple:
+    """Residues in order, then ``C-term``, ``N-term`` (the order the slots
+    were always enumerated in), the chemical layer before the label layer."""
+    layer, pos = slot
+    return (layer, isinstance(pos, str), pos if isinstance(pos, int) else str(pos))
+
+
+def _place_order(pos: int | str, length: int) -> int:
+    return -1 if pos == N_TERM else length if pos == C_TERM else int(pos)
+
+
+def _where(pos: int | str) -> str:
+    return f"the {pos}" if isinstance(pos, str) else f"residue {pos + 1}"
+
+
+@dataclass(frozen=True, slots=True)
+class _ModPlan:
+    """One peptide's modification spec laid out as slots: the fixed
+    assignment, each variable slot's candidates (mod key, site) in their
+    order, the slot order, how many may be occupied, the per-key limits,
+    and whether a cyclization candidate at the N-terminus excludes a
+    variable modification of residue 0 (``guard``)."""
+
+    fixed: dict[_Slot, tuple[str, str]]
+    candidates: dict[_Slot, list[tuple[str, str]]]
+    ordered: list[_Slot]
+    k_max: int
+    limits: dict[str, int]
+    guard: bool
+
+
+def _plan_modforms(
+    peptide: str,
+    *,
+    fixed: Mapping[str, str | Sequence[str]] | None,
+    variable: Mapping[str, str | Sequence[str]] | None,
+    max_variable: int,
+    vocab: ModVocab,
+    validate_specificity: bool,
+    validate_alphabet: bool,
+    context: SiteContext | None,
+    max_per_mod: Mapping[str, int] | None,
+    skip_unlicensed: bool,
+) -> _ModPlan:
+    """Validate a modification spec against one peptide and lay out its
+    slots. Shared by :func:`enumerate_modforms` and :func:`count_modforms`."""
+    if validate_alphabet:
+        validate(peptide, AA)
+    if max_variable < 0:
+        raise ValueError(f"max_variable must be >= 0, got {max_variable}")
+
+    fixed_spec = _normalize_mod_spec(fixed)
+    var_spec = _normalize_mod_spec(variable)
+    limits = dict(max_per_mod or {})
+    for key, limit in limits.items():
+        if limit < 0:
+            raise ValueError(f"max_per_mod[{key!r}] must be >= 0, got {limit}")
+
+    for site, keys in (*fixed_spec.items(), *var_spec.items()):
+        if site in (PROTEIN_N_TERM, PROTEIN_C_TERM) and context is None:
+            raise ValueError(f"site {site!r} needs a context saying where the peptide sits in its protein")
+        for key in keys:
+            if key not in vocab:
+                raise ValueError(f"unknown modification key {key!r} for site {site!r}")
+            if validate_specificity and not skip_unlicensed:
+                _check_specificity(key, site, vocab, peptide, context)
+
+    layer_cache: dict[str, int] = {}
+
+    def layer_of(key: str) -> int:
+        layer = layer_cache.get(key)
+        if layer is None:
+            layer = layer_cache[key] = _LABEL if vocab[key].is_isotopic_substitution else _CHEM
+        return layer
+
+    for site, keys in fixed_spec.items():
+        layers = [layer_of(k) for k in keys]
+        if not keys or layers.count(_CHEM) > 1 or layers.count(_LABEL) > 1:
+            raise ValueError(
+                f"fixed site {site!r} takes one modification (and at most one "
+                f"isotopic substitution beside it), got {list(keys)}"
+            )
+
+    def licensed(key: str, site: str, pos: int | str) -> bool:
+        return not (validate_specificity and skip_unlicensed) or _licensed(
+            key, site, pos, vocab, peptide, context
+        )
+
+    # Fixed application — every matching slot, always. Two different fixed
+    # modifications landing on one slot (N-term and Protein N-term rules at
+    # a protein's N-terminus) is a contradiction, not a precedence.
+    fixed_slots: dict[_Slot, tuple[str, str]] = {}
+    for site, keys in fixed_spec.items():
+        for key in keys:
+            for pos in _slots_for_site(site, peptide, context):
+                if not licensed(key, site, pos):
+                    continue
+                slot = (layer_of(key), pos)
+                have = fixed_slots.get(slot)
+                if have is not None and have[0] != key:
+                    raise ValueError(
+                        f"{peptide}: two fixed modifications on {_where(pos)}: "
+                        f"{have[0]} (site {have[1]!r}) and {key} (site {site!r})"
+                    )
+                if have is None:
+                    fixed_slots[slot] = (key, site)
+    n_fixed = fixed_slots.get(_N_SLOT)
+    fixed_cyclized = n_fixed is not None and n_fixed[0] in SIDE_CHAIN_CYCLIZATIONS
+    if fixed_cyclized:
+        fixed_slots.pop(_R0_SLOT, None)
+
+    # Variable candidates — slot → the (mod key, site) pairs that may occupy it.
+    candidates: dict[_Slot, list[tuple[str, str]]] = {}
+    for site, keys in var_spec.items():
+        for pos in _slots_for_site(site, peptide, context):
+            for key in keys:
+                slot = (layer_of(key), pos)
+                if slot in fixed_slots or (fixed_cyclized and slot == _R0_SLOT):
+                    continue
+                if not licensed(key, site, pos):
+                    continue
+                have = candidates.setdefault(slot, [])
+                if all(key != k for k, _ in have):
+                    have.append((key, site))
+    candidates = {slot: c for slot, c in candidates.items() if c}
+
+    ordered = sorted(candidates, key=_slot_order)
+    guard = _R0_SLOT in candidates and any(
+        k in SIDE_CHAIN_CYCLIZATIONS for k, _ in candidates.get(_N_SLOT, ())
+    )
+    return _ModPlan(
+        fixed=fixed_slots,
+        candidates=candidates,
+        ordered=ordered,
+        k_max=min(max_variable, len(ordered)),
+        limits=limits,
+        guard=guard,
+    )
+
+
+def _count_planned(plan: _ModPlan) -> int:
+    """How many variable assignments a plan has: up to ``k_max`` slots
+    occupied, each by one of its candidates, no limited key over its limit,
+    no cyclization beside a variable modification of residue 0. A DP over
+    the slots, polynomial in their number: states are (occupied, counts of
+    the limited keys, residue 0 occupied)."""
+    limited = sorted(plan.limits)
+    index = {key: j for j, key in enumerate(limited)}
+    states: dict[tuple[int, tuple[int, ...], bool], int] = {(0, (0,) * len(limited), False): 1}
+    for slot in plan.ordered:
+        nxt = dict(states)  # the slot left empty
+        cyclizes = plan.guard and slot == _N_SLOT
+        marks_r0 = plan.guard and slot == _R0_SLOT
+        for (k, counts, r0), ways in states.items():
+            if k == plan.k_max:
+                continue
+            for key, _site in plan.candidates[slot]:
+                if cyclizes and r0 and key in SIDE_CHAIN_CYCLIZATIONS:
+                    continue
+                j = index.get(key)
+                if j is None:
+                    c = counts
+                elif counts[j] == plan.limits[key]:
+                    continue
+                else:
+                    c = (*counts[:j], counts[j] + 1, *counts[j + 1 :])
+                state = (k + 1, c, r0 or marks_r0)
+                nxt[state] = nxt.get(state, 0) + ways
+        states = nxt
+    return sum(states.values())
+
+
+def _assignments(plan: _ModPlan) -> Iterator[tuple[tuple[int, ...], tuple[int, ...]]]:
+    """Every valid variable assignment as (indices of the occupied slots in
+    ``plan.ordered``, index of each one's candidate), ordered by number of
+    modifications, then slots, then candidates: what
+    ``itertools.combinations`` over the slots and ``product`` over their
+    candidates give, which is how they are made when nothing can rule a
+    combination out. With limits or a cyclization guard, a depth-first walk
+    refuses a choice the moment it breaks one, so the work is proportional
+    to what is returned (leaving the remaining slots empty is always valid,
+    so every node of the walk is an assignment), and its result is sorted
+    into the same order."""
+    ordered, cands, limits, k_max = plan.ordered, plan.candidates, plan.limits, plan.k_max
+    n = len(ordered)
+    if not limits and not plan.guard:
+        sizes = [range(len(cands[slot])) for slot in ordered]
+        for k in range(k_max + 1):
+            for combo in itertools.combinations(range(n), k):
+                for picks in itertools.product(*(sizes[i] for i in combo)):
+                    yield combo, picks
+        return
+    n_index = ordered.index(_N_SLOT) if plan.guard else -1
+    r0_index = ordered.index(_R0_SLOT) if plan.guard else -1
+    used = dict.fromkeys(limits, 0)
+    slots: list[int] = []
+    picks_now: list[int] = []
+    out: list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
+
+    def walk(start: int) -> None:
+        out.append((len(slots), tuple(slots), tuple(picks_now)))
+        if len(slots) == k_max:
+            return
+        for i in range(start, n):
+            for j, (key, _site) in enumerate(cands[ordered[i]]):
+                if i == n_index and key in SIDE_CHAIN_CYCLIZATIONS and r0_index in slots:
+                    continue
+                limit = limits.get(key)
+                if limit is not None:
+                    if used[key] == limit:
+                        continue
+                    used[key] += 1
+                slots.append(i)
+                picks_now.append(j)
+                walk(i + 1)
+                slots.pop()
+                picks_now.pop()
+                if limit is not None:
+                    used[key] -= 1
+
+    walk(0)
+    out.sort()
+    for _k, combo, picks in out:
+        yield combo, picks
+
+
+@requires_canonical
+def count_modforms(
+    peptide: str,
+    *,
+    fixed: Mapping[str, str | Sequence[str]] | None = None,
+    variable: Mapping[str, str | Sequence[str]] | None = None,
+    max_variable: int = 3,
+    vocab: ModVocab = UNIMOD,
+    validate_specificity: bool = True,
+    validate_alphabet: bool = True,
+    context: SiteContext | None = None,
+    max_per_mod: Mapping[str, int] | None = None,
+    skip_unlicensed: bool = False,
+) -> int:
+    """How many forms :func:`enumerate_modforms` would return with these
+    arguments, without building them (so a budget can be checked first).
+    Polynomial in the number of sites: thirty methionines with oxidation
+    variable count to 2**30 at once."""
+    return _count_planned(
+        _plan_modforms(
+            peptide,
+            fixed=fixed,
+            variable=variable,
+            max_variable=max_variable,
+            vocab=vocab,
+            validate_specificity=validate_specificity,
+            validate_alphabet=validate_alphabet,
+            context=context,
+            max_per_mod=max_per_mod,
+            skip_unlicensed=skip_unlicensed,
+        )
+    )
 
 
 @requires_canonical
@@ -439,99 +848,136 @@ def enumerate_modforms(
     vocab: ModVocab = UNIMOD,
     validate_specificity: bool = True,
     validate_alphabet: bool = True,
-) -> list[Peptidoform]:
+    context: SiteContext | None = None,
+    max_per_mod: Mapping[str, int] | None = None,
+    skip_unlicensed: bool = False,
+    return_origin: bool = False,
+) -> list[Peptidoform] | list[tuple[Peptidoform, tuple[PlacedMod, ...]]]:
     """Enumerate the modified forms of one peptide.
 
     ``fixed`` mods are applied to **every** matching site and are not
     enumerated. ``variable`` mods are enumerated over all combinations of
     0..``max_variable`` simultaneously-modified sites. Both map a *site*
-    — a residue letter, or the ``N-term`` / ``C-term`` sentinels — to one
-    mod key (``"UNIMOD:35"``) or several (``["UNIMOD:21", "UNIMOD:35"]``),
-    the latter meaning "any one of these may occupy this site".
+    — a residue letter, the ``N-term`` / ``C-term`` sentinels (the
+    peptide's ends), or ``Protein N-term`` / ``Protein C-term`` (its ends
+    only where they are its protein's, per ``context``) — to one mod key
+    (``"UNIMOD:35"``) or several (``["UNIMOD:21", "UNIMOD:35"]``), the
+    latter meaning "any one of these may occupy this site". A fixed site
+    takes one modification, and beside it at most one isotopic
+    substitution.
 
-    A site already carrying a fixed mod is not offered to the variable
-    enumeration, so ``fixed={"C": "UNIMOD:4"}`` and
-    ``variable={"C": ...}`` do not stack on the same cysteine.
+    A residue carries at most one chemical modification and at most one
+    isotopic substitution (``Modification.is_isotopic_substitution``:
+    SILAC lysine and arginine, which make the residue's own atoms heavier
+    and leave its reactive groups free): ``fixed={"K": "UNIMOD:259"}`` with
+    ``variable={"K": "UNIMOD:1"}`` gives heavy lysine and heavy acetylated
+    lysine. A slot already carrying a fixed mod of its kind is not offered
+    to the variable enumeration, so ``fixed={"C": "UNIMOD:4"}`` and
+    ``variable={"C": ...}`` do not stack on the same cysteine; two
+    different fixed mods on one slot (an ``N-term`` and a ``Protein
+    N-term`` rule at a protein's N-terminus) raise. An N-terminal
+    cyclization of the first residue's side chain
+    (:data:`SIDE_CHAIN_CYCLIZATIONS`) replaces that residue's chemical
+    modification rather than adding to it. ``max_per_mod`` limits how many
+    sites one variable key occupies in a form (``{"UNIMOD:21": 2}``),
+    within the overall ``max_variable``.
 
     Returns forms ordered by increasing variable-mod count, the
     fixed-only form first. Mod keys are validated against ``vocab``, and
-    against each mod's UNIMOD specificity unless
-    ``validate_specificity=False`` — the latter is the escape hatch for
-    deliberately non-canonical placements.
+    against each mod's UNIMOD placements (shown and hidden) unless
+    ``validate_specificity=False`` — the escape hatch for deliberately
+    non-canonical placements. With ``skip_unlicensed=True`` a placement
+    UNIMOD does not list is left out instead of raising, which is what
+    applying one rule set across many peptides wants (pyro-Glu at the
+    N-terminus where it starts with Q, and nowhere else). ``context``
+    says where the peptide sits in its protein; without one, protein
+    termini are neither offered (``Protein N-term`` sites raise) nor
+    held against a placement.
 
-    Raises ``ValueError`` if the enumeration would exceed ``max_forms``
-    (when set) rather than silently truncating, since a truncated set
-    reads downstream as a complete one.
+    With ``return_origin=True`` each form comes with the
+    :class:`PlacedMod` of every modification it carries, fixed and
+    variable, in slot order.
+
+    The work is proportional to the forms returned: a limit prunes a
+    choice before it is extended. Raises ``ValueError`` if the
+    enumeration would exceed ``max_forms`` (when set, counted first)
+    rather than silently truncating, since a truncated set reads
+    downstream as a complete one.
     """
-    if validate_alphabet:
-        validate(peptide, AA)
-    if max_variable < 0:
-        raise ValueError(f"max_variable must be >= 0, got {max_variable}")
-
-    fixed_spec = _normalize_mod_spec(fixed)
-    var_spec = _normalize_mod_spec(variable)
-
-    for site, keys in (*fixed_spec.items(), *var_spec.items()):
-        for key in keys:
-            if key not in vocab:
-                raise ValueError(f"unknown modification key {key!r} for site {site!r}")
-            if validate_specificity:
-                _check_specificity(key, site, vocab, peptide)
-
-    for site, keys in fixed_spec.items():
-        if len(keys) != 1:
-            raise ValueError(
-                f"fixed site {site!r} takes exactly one modification, got {list(keys)}"
-            )
-
-    # Fixed application — every matching slot, always.
-    fixed_slots: dict[int | str, TaggedMod] = {}
-    for site, keys in fixed_spec.items():
-        for slot in _slots_for_site(site, peptide):
-            fixed_slots[slot] = _tagged(keys[0])
-
-    # Variable candidates — slot → the mod keys that may occupy it.
-    candidates: dict[int | str, list[str]] = {}
-    for site, keys in var_spec.items():
-        for slot in _slots_for_site(site, peptide):
-            if slot in fixed_slots:
-                continue
-            candidates.setdefault(slot, []).extend(keys)
-
-    ordered = sorted(
-        candidates, key=lambda s: (isinstance(s, str), s if isinstance(s, int) else str(s))
+    plan = _plan_modforms(
+        peptide,
+        fixed=fixed,
+        variable=variable,
+        max_variable=max_variable,
+        vocab=vocab,
+        validate_specificity=validate_specificity,
+        validate_alphabet=validate_alphabet,
+        context=context,
+        max_per_mod=max_per_mod,
+        skip_unlicensed=skip_unlicensed,
     )
-    k_max = min(max_variable, len(ordered))
-
     if max_forms is not None:
-        total = sum(
-            math.prod(len(candidates[s]) for s in combo)
-            for k in range(k_max + 1)
-            for combo in itertools.combinations(ordered, k)
-        )
+        total = _count_planned(plan)
         if total > max_forms:
             raise ValueError(
                 f"{peptide} would yield {total} modforms, exceeding max_forms="
                 f"{max_forms}; lower max_variable or narrow the variable mods"
             )
 
-    forms: list[Peptidoform] = []
-    for k in range(k_max + 1):
-        for combo in itertools.combinations(ordered, k):
-            for choice in itertools.product(*(candidates[s] for s in combo)):
-                assigned = dict(fixed_slots)
-                assigned.update(zip(combo, (_tagged(c) for c in choice), strict=True))
-                residue_mods = {
-                    slot: (tag,) for slot, tag in assigned.items() if isinstance(slot, int)
-                }
-                forms.append(
-                    Peptidoform(
-                        sequence=peptide,
-                        residue_mods=residue_mods,
-                        n_term_mods=(assigned[N_TERM],) if N_TERM in assigned else (),
-                        c_term_mods=(assigned[C_TERM],) if C_TERM in assigned else (),
-                    )
-                )
+    length = len(peptide)
+
+    def entry(slot: _Slot, key: str, site: str, origin: ModOrigin) -> tuple:
+        # (position, layer, tag, its PlacedMod, where it is listed, key)
+        layer, pos = slot
+        placed = PlacedMod(pos, key, origin, site) if return_origin else None
+        return (pos, layer, _tagged(key), placed, (_place_order(pos, length), layer), key)
+
+    entries = [[entry(slot, key, site, "variable") for key, site in plan.candidates[slot]] for slot in plan.ordered]
+    fixed_entries = [entry(slot, key, site, "fixed") for slot, (key, site) in plan.fixed.items()]
+    # One modification per position and nothing replaced: the common case,
+    # built without sorting or merging.
+    simple = (
+        all(layer == _CHEM for layer, _ in (*plan.fixed, *plan.candidates))
+        and not plan.guard
+        and not any(k in SIDE_CHAIN_CYCLIZATIONS for k, _ in plan.candidates.get(_N_SLOT, ()))
+    )
+    fixed_res = {e[0]: (e[2],) for e in fixed_entries if isinstance(e[0], int)}
+    fixed_n = tuple(e[2] for e in fixed_entries if e[0] == N_TERM)
+    fixed_c = tuple(e[2] for e in fixed_entries if e[0] == C_TERM)
+    by_listing = itemgetter(4)
+
+    forms: list = []
+    for slot_index, picks in _assignments(plan):
+        chosen = [entries[i][j] for i, j in zip(slot_index, picks, strict=True)]
+        if simple:
+            residue_mods = dict(fixed_res)
+            n_term, c_term = fixed_n, fixed_c
+            for pos, _layer, t, _pm, _at, _key in chosen:
+                if pos == N_TERM:
+                    n_term = (t,)
+                elif pos == C_TERM:
+                    c_term = (t,)
+                else:
+                    residue_mods[pos] = (t,)
+            listed = sorted([*fixed_entries, *chosen], key=by_listing) if return_origin else ()
+        else:
+            here = [*fixed_entries, *chosen]
+            if any(e[0] == N_TERM and e[1] == _CHEM and e[5] in SIDE_CHAIN_CYCLIZATIONS for e in here):
+                # the cyclization takes residue 0's side chain and what was on it
+                here = [e for e in here if not (e[0] == 0 and e[1] == _CHEM)]
+            listed = sorted(here, key=by_listing)
+            at: dict[int | str, tuple[TaggedMod, ...]] = {}
+            for e in listed:
+                at[e[0]] = (*at.get(e[0], ()), e[2])
+            residue_mods = {pos: t for pos, t in at.items() if isinstance(pos, int)}
+            n_term, c_term = at.get(N_TERM, ()), at.get(C_TERM, ())
+        form = Peptidoform(
+            sequence=peptide, residue_mods=residue_mods, n_term_mods=n_term, c_term_mods=c_term
+        )
+        if return_origin:
+            forms.append((form, tuple(e[3] for e in listed)))
+        else:
+            forms.append(form)
     return forms
 
 
@@ -678,6 +1124,222 @@ def _residue_index_check(p: Peptidoform) -> None:
             )
 
 
+# ── batched composition and mass ──────────────────────────────────────
+#
+# One implementation, batched: the single-peptidoform functions below are
+# its one-item case. A residue's composition is counted, not added one
+# residue at a time (the old loop did one torch add per residue, ~100 us a
+# peptide), and each distinct ModRef is resolved once per call. The mass is
+# ``batched_mass`` of the composition plus the Python-float corrections in
+# the order the scalar code made them, so the result is the same bits.
+
+_AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
+_RESIDUE_INDEX = np.full(256, -1, dtype=np.int64)
+for _i, _aa in enumerate(_AA_ORDER):
+    _RESIDUE_INDEX[ord(_aa)] = _i
+del _i, _aa
+_RESIDUE_COMPOSITIONS: np.ndarray | None = None
+_H2O_COUNTS: np.ndarray | None = None
+
+
+def _residue_matrix() -> tuple[np.ndarray, np.ndarray]:
+    """(20, E) int64 compositions of the canonical residues and H2O's (E,)
+    counts, built once."""
+    global _RESIDUE_COMPOSITIONS, _H2O_COUNTS
+    if _RESIDUE_COMPOSITIONS is None:
+        assert AA.compositions is not None  # canonical alphabet always carries them
+        _RESIDUE_COMPOSITIONS = np.stack(
+            [AA.compositions[aa].counts.numpy().astype(np.int64) for aa in _AA_ORDER]
+        )
+        _H2O_COUNTS = _H2O.counts.numpy().astype(np.int64)
+    assert _H2O_COUNTS is not None
+    return _RESIDUE_COMPOSITIONS, _H2O_COUNTS
+
+
+def _check_peptidoform(peptidoform: Peptidoform, what: str) -> None:
+    if isinstance(peptidoform, MultiPeptidoform):
+        plural = "compositions" if what == "composition" else "masses"
+        raise NotImplementedError(
+            f"joint multi-chain {what} is not yet supported; iterate "
+            f"peptidoform.chains for per-chain {plural}"
+        )
+
+
+def _batched(
+    peptidoforms: Sequence[Peptidoform],
+    vocab: ModVocab,
+    *,
+    monoisotopic: bool,
+    for_mass: bool,
+    labelled: bool = False,
+) -> tuple[np.ndarray, list[float], np.ndarray | None]:
+    """(N, E) int64 compositions; per peptidoform, the mass the composition
+    does not carry (``mass_override`` corrections and bare mass deltas),
+    accumulated in the scalar code's order; and with ``labelled``, the
+    (N, E) atoms a global isotope label covers (:func:`labelled_compositions`)."""
+    what = "mass" if for_mass else "composition"
+    n = len(peptidoforms)
+    seqs: list[str] = []
+    for pf in peptidoforms:
+        _check_peptidoform(pf, what)
+        seqs.append(pf.sequence)
+    residue_comp, h2o = _residue_matrix()
+    joined = "".join(seqs)
+    residues = _RESIDUE_INDEX[np.frombuffer(joined.encode("latin-1", "replace"), dtype=np.uint8)]
+    if (residues < 0).any():
+        lengths = np.fromiter((len(q) for q in seqs), dtype=np.int64, count=n)
+        first = int(np.flatnonzero(residues < 0)[0])
+        validate(seqs[int(np.searchsorted(np.cumsum(lengths), first, side="right"))], AA)  # raises
+    if n == 1:
+        counts = np.bincount(residues, minlength=20).reshape(1, 20)
+    else:
+        lengths = np.fromiter((len(q) for q in seqs), dtype=np.int64, count=n)
+        form = np.repeat(np.arange(n, dtype=np.int64), lengths)
+        counts = np.bincount(form * 20 + residues, minlength=n * 20).reshape(n, 20)
+    comp = counts @ residue_comp
+    comp += h2o
+    # The chain (residues and termini) before any modification: what a
+    # global isotope label covers, less what modifications take off it.
+    chain = comp.copy() if labelled else None
+
+    resolved: dict[ModRef, tuple[np.ndarray, float]] = {}
+    extra = [0.0] * n
+
+    def resolve(modref: ModRef) -> tuple[np.ndarray, float]:
+        hit = resolved.get(modref)
+        if hit is None:
+            d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=monoisotopic)
+            hit = resolved[modref] = (d_comp.counts.numpy(), d_mass)  # int32 view
+        return hit
+
+    for i, pf in enumerate(peptidoforms):
+        _residue_index_check(pf)
+        if not (pf.residue_mods or pf.n_term_mods or pf.c_term_mods or pf.labile_mods
+                or pf.unknown_pos_mods or pf.ranges or pf.fixed_mods):
+            continue
+        row = comp[i]
+        acc = 0.0
+        for modref in _walk_modrefs(pf):
+            if not for_mass and _is_bare_mass_delta(modref):
+                raise ValueError(
+                    f"cannot derive composition from bare mass-delta ModRef "
+                    f"({modref.mass_delta:+f}) — peptide_mass accepts mass-only "
+                    "mods, but peptide_composition needs a UNIMOD/name/formula "
+                    "payload to determine element counts"
+                )
+            d_comp, d_mass = resolve(modref)
+            row += d_comp
+            acc += d_mass
+            if chain is not None:
+                chain[i] += np.minimum(d_comp, 0)
+        for modref, locations in pf.fixed_mods:
+            d_comp, d_mass = resolve(modref)
+            for loc in locations:
+                count = _count_fixed_mod_locations(pf.sequence, loc, pf)
+                if count:
+                    row += d_comp * count
+                    acc += d_mass * count
+                    if chain is not None:
+                        chain[i] += np.minimum(d_comp, 0) * count
+        extra[i] = acc
+    return comp, extra, chain
+
+
+@requires_canonical
+def peptide_compositions(
+    peptidoforms: Sequence[Peptidoform],
+    *,
+    vocab: ModVocab = UNIMOD,
+) -> torch.Tensor:
+    """The compositions of many peptidoforms at once: an ``(N, E)`` int32
+    tensor, row ``i`` being ``peptide_composition(peptidoforms[i]).counts``
+    (same rules, same errors)."""
+    comp, _, _ = _batched(peptidoforms, vocab, monoisotopic=True, for_mass=False)
+    return torch.from_numpy(comp.astype(np.int32))
+
+
+@requires_canonical
+def labelled_compositions(
+    peptidoforms: Sequence[Peptidoform],
+    *,
+    vocab: ModVocab = UNIMOD,
+) -> torch.Tensor:
+    """The atoms each peptidoform's global isotope labels cover: an
+    ``(N, E)`` int32 tensor holding, for every element a label of that
+    peptidoform names (``<13C>`` → C), how many of its atoms are the
+    label's isotope; zero elsewhere, and zero for a peptidoform with no
+    global label.
+
+    A global label (ProForma 2.0 §4.6.1, "13C on all residues") covers the
+    peptide chain, its residues and termini. A modification's own atoms
+    are natural (an atom with no isotope stated takes the natural
+    distribution, Formula Rule 3): carbamidomethyl from light
+    iodoacetamide on a ¹³C/¹⁵N-labelled protein adds two ¹²C and one
+    ¹⁴N. Atoms a modification removes come off the labelled chain
+    (deamidation and pyro-Glu lose a ¹⁵N). A PTM made in vivo from
+    labelled metabolites is therefore computed light; write its heavy
+    atoms explicitly (a formula with isotopes) to say otherwise.
+    """
+    comp, _, chain = _batched(peptidoforms, vocab, monoisotopic=True, for_mass=True, labelled=True)
+    assert chain is not None
+    out = np.zeros_like(comp)
+    for i, pf in enumerate(peptidoforms):
+        for label in pf.global_isotopes:
+            _, sym = parse_isotope_label(label)
+            e = ELEMENTS.index(sym)
+            out[i, e] = chain[i, e]
+    return torch.from_numpy(out.astype(np.int32))
+
+
+def _masses(peptidoforms: Sequence[Peptidoform], vocab: ModVocab, monoisotopic: bool) -> np.ndarray:
+    labelled = any(getattr(pf, "global_isotopes", ()) for pf in peptidoforms)
+    comp, extra, chain = _batched(
+        peptidoforms, vocab, monoisotopic=monoisotopic, for_mass=True, labelled=labelled
+    )
+    if monoisotopic:
+        # The reduction Composition.mass and batched_mass make (counts as
+        # float64 times the element masses, summed by torch), so the same bits.
+        base = (torch.from_numpy(comp.astype(np.float64)) * ELEMENTS.mass_tensor).sum(dim=-1).numpy()
+    else:
+        # Composition.average_mass sums element by element in Python; kept
+        # as it is so an average mass is the same bits too (a rare path).
+        rows = torch.from_numpy(comp.astype(np.int32))
+        base = np.array([Composition(row).average_mass for row in rows], dtype=np.float64)
+    for i, pf in enumerate(peptidoforms):
+        if not pf.global_isotopes:
+            continue
+        if not monoisotopic:
+            raise ValueError(
+                "global isotope labels are only meaningful in monoisotopic "
+                "mode — pass monoisotopic=True or strip global_isotopes"
+            )
+        acc = extra[i]
+        assert chain is not None
+        for label in pf.global_isotopes:
+            mass_n, sym = parse_isotope_label(label)
+            # the chain's atoms of the element (labelled_compositions)
+            atom_count = int(chain[i, ELEMENTS.index(sym)])
+            if atom_count == 0:
+                continue
+            elem = ELEMENTS[sym]
+            acc += (elem.isotope_mass(mass_n) - elem.monoisotopic_mass) * atom_count
+        extra[i] = acc
+    return base + np.asarray(extra, dtype=np.float64)
+
+
+@requires_canonical
+def peptide_masses(
+    peptidoforms: Sequence[Peptidoform],
+    *,
+    monoisotopic: bool = True,
+    vocab: ModVocab = UNIMOD,
+) -> torch.Tensor:
+    """The masses of many peptidoforms at once: an ``(N,)`` float64 tensor,
+    element ``i`` being ``peptide_mass(peptidoforms[i])`` to the bit (same
+    rules, same errors)."""
+    return torch.from_numpy(_masses(peptidoforms, vocab, monoisotopic))
+
+
 @requires_canonical
 def peptide_composition(
     peptidoform: Peptidoform,
@@ -708,42 +1370,11 @@ def peptide_composition(
     - ``IndexError`` for residue-mod positions outside the sequence.
     - ``NotImplementedError`` for ``MultiPeptidoform`` inputs (iterate
       ``.chains`` for per-chain compositions) and for glycan-payload mods.
+
+    The one-item case of :func:`peptide_compositions`.
     """
-    if isinstance(peptidoform, MultiPeptidoform):
-        raise NotImplementedError(
-            "joint multi-chain composition is not yet supported; iterate "
-            "peptidoform.chains for per-chain compositions"
-        )
-
-    seq = peptidoform.sequence
-    validate(seq, AA)
-    assert AA.compositions is not None  # canonical alphabet always carries them
-    _residue_index_check(peptidoform)
-
-    comp = Composition.zeros()
-    for residue in seq:
-        comp = comp + AA.compositions[residue]
-    comp = comp + _H2O
-
-    for modref in _walk_modrefs(peptidoform):
-        if _is_bare_mass_delta(modref):
-            raise ValueError(
-                f"cannot derive composition from bare mass-delta ModRef "
-                f"({modref.mass_delta:+f}) — peptide_mass accepts mass-only "
-                "mods, but peptide_composition needs a UNIMOD/name/formula "
-                "payload to determine element counts"
-            )
-        d_comp, _ = _modref_contribution(modref, vocab, monoisotopic=True)
-        comp = comp + d_comp
-
-    for modref, locations in peptidoform.fixed_mods:
-        d_comp, _ = _modref_contribution(modref, vocab, monoisotopic=True)
-        for loc in locations:
-            count = _count_fixed_mod_locations(seq, loc, peptidoform)
-            if count:
-                comp = comp + d_comp * count
-
-    return comp
+    comp, _, _ = _batched([peptidoform], vocab, monoisotopic=True, for_mass=False)
+    return Composition(torch.from_numpy(comp[0].astype(np.int32)))
 
 
 @requires_canonical
@@ -756,61 +1387,20 @@ def peptide_mass(
     """Monoisotopic (default) or standard-weight mass of a peptidoform.
 
     Aggregates: residue + terminal-water masses + every modification's
-    canonical mass contribution + global-isotope label corrections.
+    canonical mass contribution + global-isotope label corrections. A
+    global label covers the chain's atoms, not those a modification adds
+    (:func:`labelled_compositions`): ``<13C><15N>AC[UNIMOD:4]DEK`` is a
+    labelled peptide alkylated with light iodoacetamide.
 
     Heavy-isotope modifications (``mass_override``) and global isotope
     labels (``<13C>``) only adjust the result in ``monoisotopic=True``
     mode — average-mass calculations operate on standard atomic weights,
     where these distinctions are not meaningful.
+
+    The one-item case of :func:`peptide_masses`; for many peptidoforms call
+    that, about ten times faster per peptidoform.
     """
-    if isinstance(peptidoform, MultiPeptidoform):
-        raise NotImplementedError(
-            "joint multi-chain mass is not yet supported; iterate "
-            "peptidoform.chains for per-chain masses"
-        )
-
-    seq = peptidoform.sequence
-    validate(seq, AA)
-    assert AA.compositions is not None
-    _residue_index_check(peptidoform)
-
-    comp = Composition.zeros()
-    for residue in seq:
-        comp = comp + AA.compositions[residue]
-    comp = comp + _H2O
-
-    extra_mass = 0.0
-    for modref in _walk_modrefs(peptidoform):
-        d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=monoisotopic)
-        comp = comp + d_comp
-        extra_mass += d_mass
-
-    for modref, locations in peptidoform.fixed_mods:
-        d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=monoisotopic)
-        for loc in locations:
-            count = _count_fixed_mod_locations(seq, loc, peptidoform)
-            if count:
-                comp = comp + d_comp * count
-                extra_mass += d_mass * count
-
-    base = comp.mass if monoisotopic else comp.average_mass
-
-    if peptidoform.global_isotopes:
-        if not monoisotopic:
-            raise ValueError(
-                "global isotope labels are only meaningful in monoisotopic "
-                "mode — pass monoisotopic=True or strip global_isotopes"
-            )
-        atoms = comp.atoms
-        for label in peptidoform.global_isotopes:
-            mass_n, sym = parse_isotope_label(label)
-            atom_count = atoms.get(sym, 0)
-            if atom_count == 0:
-                continue
-            elem = ELEMENTS[sym]
-            extra_mass += (elem.isotope_mass(mass_n) - elem.monoisotopic_mass) * atom_count
-
-    return base + extra_mass
+    return float(_masses([peptidoform], vocab, monoisotopic)[0])
 
 
 @requires_canonical
@@ -829,9 +1419,19 @@ __all__ = [
     "cleave",
     "cleave_sites",
     "enumerate_modforms",
+    "count_modforms",
     "N_TERM",
     "C_TERM",
+    "PROTEIN_N_TERM",
+    "PROTEIN_C_TERM",
+    "PlacedMod",
+    "SiteContext",
+    "TERMINUS_KINDS",
     "peptide_composition",
+    "peptide_compositions",
+    "SIDE_CHAIN_CYCLIZATIONS",
+    "labelled_compositions",
     "peptide_mass",
+    "peptide_masses",
     "protein_composition",
 ]

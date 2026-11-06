@@ -299,6 +299,10 @@ scan (rows) and scans in a row (columns), on the purified run:
     its own yet; the kernel is a minority of a sweep's time.
 - The purified-sample scorer (elution peaks, co-elution evidence, a verdict rule) as a gated reducer,
   and output as an experiment directory the browser reads: the next plan.
+- Targets from FASTA files are built (2026-11-05): `massspec search-space`
+  ([search-space.md](search-space.md)) writes a library `chromatogram extract --targets` reads, with
+  decoys flagged `is_decoy` through the queries and the query summary (schemas v3) instead of the
+  bench's `target_id` offset, and `--own-charge` for one MS1 query per precursor.
 - Profile-points rule, and with it a kernel choice that sees the points within tolerance of a channel
   (above) and an evidence gate for scans without peaks; isolation gating by the whole isotope envelope;
   mixture fits on a scan's competing queries.

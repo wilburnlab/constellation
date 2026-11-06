@@ -44,8 +44,8 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from constellation.core.io.fasta import format_fasta
 from constellation.sequencing.samples import Samples
-
 
 # Per-row count record. Shape mirrors FEATURE_QUANT but specialised to
 # the cDNA workflow: feature_id is the protein label (P0, P1, ...);
@@ -449,7 +449,7 @@ def fasta_records_to_text(records: list[FastaRecord]) -> str:
     line (no wrapping) — matches the format NanoporeAnalysis writes
     via ``write_fastx``.
     """
-    return "".join(f">{r.label}\n{r.sequence}\n" for r in records)
+    return format_fasta([r.sequence for r in records], [r.label for r in records])
 
 
 # ──────────────────────────────────────────────────────────────────────

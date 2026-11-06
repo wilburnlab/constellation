@@ -3497,16 +3497,20 @@ def _cmd_transcriptome_cluster(args: argparse.Namespace) -> int:
                 strict=True,
             )
         }
+        from constellation.core.io.fasta import write_fasta
+
         fasta_path = output_dir / "cluster.fa"
-        with fasta_path.open("w") as fh:
-            for row in clusters.to_pylist():
-                cid = row["cluster_id"]
-                rep = row["representative_read_id"]
-                consensus = row.get("consensus_sequence")
-                seq = consensus if consensus else rep_lookup.get(rep, "")
-                if not seq:
-                    continue
-                fh.write(f">cluster_{cid} representative={rep}\n{seq}\n")
+        rows = clusters.to_pylist()
+        write_fasta(
+            fasta_path,
+            [
+                r.get("consensus_sequence") or rep_lookup.get(r["representative_read_id"], "")
+                for r in rows
+            ],
+            [f"cluster_{r['cluster_id']}" for r in rows],
+            descriptions=[f"representative={r['representative_read_id']}" for r in rows],
+            skip_empty=True,
+        )
         cluster_outputs["cluster_fa"] = str(fasta_path)
         _log("wrote cluster.fa")
 
@@ -5575,11 +5579,12 @@ def _cmd_reference_fetch(args: argparse.Namespace) -> int:
 
 def _count_fasta_records(path: Path | None) -> int:
     """Count FASTA records by ``>`` header lines; 0 if unreadable."""
+    from constellation.core.io.fasta import count_fasta_records
+
     if path is None or not path.is_file():
         return 0
     try:
-        with path.open("r", encoding="utf-8") as fh:
-            return sum(1 for line in fh if line.startswith(">"))
+        return count_fasta_records(path)
     except OSError:
         return 0
 

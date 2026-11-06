@@ -15,6 +15,8 @@ each holding the verb's parser and its handler:
     report             EncyclopeDIA's quantitative report across searches
     quantify           the chromatogram-library workflow: merged fractions,
                        run searches, report
+    search_space       FASTA -> every precursor to look for, with how each
+                       was made, and decoys (a library directory)
     predict_library    FASTA -> predicted library (EncyclopeDIA or Koina)
     library_export     EncyclopeDIA's quantitative report
     novel_peptides     classify-novel-peptides
@@ -55,6 +57,7 @@ from constellation.massspec.cli.predict_library import _build_predict_library_pa
 from constellation.massspec.cli.quantify import _build_quantify_parser
 from constellation.massspec.cli.report import _build_report_parser
 from constellation.massspec.cli.search import _build_search_parser
+from constellation.massspec.cli.search_space import _build_search_space_parser
 from constellation.massspec.cli.summarize import _build_summarize_parser
 
 # Re-exported for importers outside this package (see the docstring).
@@ -94,6 +97,7 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     _build_summarize_parser(ms_subs)
     _build_report_parser(ms_subs)
     _build_quantify_parser(ms_subs)
+    _build_search_space_parser(ms_subs)
     _build_predict_library_parser(ms_subs)
     _build_library_export_parser(ms_subs)
     _build_mz_axis_parser(ms_subs)

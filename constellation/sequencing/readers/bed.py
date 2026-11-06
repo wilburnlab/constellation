@@ -14,21 +14,18 @@ Public surface:
 
 from __future__ import annotations
 
-import gzip
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
 
+from constellation.core.io.text import open_text
 from constellation.sequencing.annotation.annotation import Annotation
 from constellation.sequencing.schemas.reference import FEATURE_TABLE
 
-
-def _open_text(path: Path) -> Any:
-    if path.suffix == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8")
-    return path.open("r", encoding="utf-8")
+#: gzip-aware text opener, shared (``constellation.core.io.text``).
+_open_text = open_text
 
 
 def read_bed(

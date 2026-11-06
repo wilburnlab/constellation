@@ -7,16 +7,26 @@ observations, no calibrated transmission efficiencies — those live in
 
 Construction shape:
     Library(
-        proteins,            # PROTEIN_TABLE
-        peptides,            # PEPTIDE_TABLE
-        precursors,          # PRECURSOR_TABLE
-        fragments,           # LIBRARY_FRAGMENT_TABLE
-        protein_peptide,     # PROTEIN_PEPTIDE_EDGE
+        proteins,                 # PROTEIN_TABLE
+        peptides,                 # PEPTIDE_TABLE
+        precursors,               # PRECURSOR_TABLE
+        fragments,                # LIBRARY_FRAGMENT_TABLE
+        protein_peptide,          # PROTEIN_PEPTIDE_EDGE
+        peptide_spans=...,        # PEPTIDE_SPAN_TABLE         (optional)
+        span_peptide=...,         # SPAN_PEPTIDE_EDGE          (optional)
+        peptide_modifications=...,# PEPTIDE_MODIFICATION_TABLE (optional)
     )
 
+The last three record how a peptide was made when the library was built
+from a FASTA (``massspec.library.search_space``) and are empty otherwise.
+
 Validation enforces PK uniqueness on each tier table and FK closure
-across the four FK columns (peptide → protein, precursor → peptide,
-fragment → precursor, protein_peptide → both endpoints).
+across the FK columns (precursor → peptide, fragment → precursor,
+protein_peptide → both endpoints; span → protein, span_peptide → span
+and peptide with the span's sequence the peptide's, modification →
+peptide, decoy_of → a target peptide), with Arrow compute rather than
+Python sets so that it costs little at a proteome's size. When spans are
+present, ``protein_peptide`` must be their projection.
 
 ``to_network`` projects to ``core.graph.Network`` using prefixed string
 node ids (``"P:<id>"`` / ``"K:<id>"`` / ``"C:<id>"``) so a single graph
@@ -44,11 +54,17 @@ from constellation.core.sequence.proforma import (
 )
 from constellation.massspec.library.schemas import (
     LIBRARY_FRAGMENT_TABLE,
+    PEPTIDE_MODIFICATION_TABLE,
+    PEPTIDE_SPAN_TABLE,
     PEPTIDE_TABLE,
     PRECURSOR_TABLE,
     PROTEIN_PEPTIDE_EDGE,
     PROTEIN_TABLE,
+    SPAN_PEPTIDE_EDGE,
 )
+
+#: The span key: a span is where it is in which protein.
+SPAN_KEY = ("protein_id", "start", "end")
 
 # ──────────────────────────────────────────────────────────────────────
 # Container
@@ -66,6 +82,9 @@ class Library:
     fragments: pa.Table
     protein_peptide: pa.Table
     metadata_extras: dict[str, Any] = field(default_factory=dict)
+    peptide_spans: pa.Table = field(default_factory=PEPTIDE_SPAN_TABLE.empty_table)
+    span_peptide: pa.Table = field(default_factory=SPAN_PEPTIDE_EDGE.empty_table)
+    peptide_modifications: pa.Table = field(default_factory=PEPTIDE_MODIFICATION_TABLE.empty_table)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "proteins", cast_to_schema(self.proteins, PROTEIN_TABLE))
@@ -81,6 +100,12 @@ class Library:
             "protein_peptide",
             cast_to_schema(self.protein_peptide, PROTEIN_PEPTIDE_EDGE),
         )
+        for name, schema in (
+            ("peptide_spans", PEPTIDE_SPAN_TABLE),
+            ("span_peptide", SPAN_PEPTIDE_EDGE),
+            ("peptide_modifications", PEPTIDE_MODIFICATION_TABLE),
+        ):
+            object.__setattr__(self, name, cast_to_schema(getattr(self, name), schema))
         self.validate()
 
     # ── validation ──────────────────────────────────────────────────
@@ -89,9 +114,9 @@ class Library:
         _check_unique(self.peptides, "peptide_id")
         _check_unique(self.precursors, "precursor_id")
 
-        protein_ids = set(self.proteins.column("protein_id").to_pylist())
-        peptide_ids = set(self.peptides.column("peptide_id").to_pylist())
-        precursor_ids = set(self.precursors.column("precursor_id").to_pylist())
+        protein_ids = self.proteins.column("protein_id")
+        peptide_ids = self.peptides.column("peptide_id")
+        precursor_ids = self.precursors.column("precursor_id")
 
         _check_fk(self.precursors, "peptide_id", peptide_ids, "PEPTIDE_TABLE")
         _check_fk(self.fragments, "precursor_id", precursor_ids, "PRECURSOR_TABLE")
@@ -101,6 +126,52 @@ class Library:
         _check_fk(
             self.protein_peptide, "peptide_id", peptide_ids, "PEPTIDE_TABLE"
         )
+        self._validate_provenance(protein_ids, peptide_ids)
+
+    def _validate_provenance(self, protein_ids: pa.ChunkedArray, peptide_ids: pa.ChunkedArray) -> None:
+        """The span, edge, modification and decoy tables (all in Arrow)."""
+        spans, edges = self.peptide_spans, self.span_peptide
+        decoys = self.peptides.filter(pc.is_valid(self.peptides.column("decoy_of")))
+        if decoys.num_rows:
+            _check_fk(decoys, "decoy_of", peptide_ids, "PEPTIDE_TABLE")
+            targets = self.peptides.filter(pc.is_in(peptide_ids, value_set=decoys.column("decoy_of").combine_chunks()))
+            if pc.any(pc.fill_null(targets.column("is_decoy"), False)).as_py():
+                raise ValueError("decoy_of names a peptide that is itself a decoy")
+        if self.peptide_modifications.num_rows:
+            _check_fk(self.peptide_modifications, "peptide_id", peptide_ids, "PEPTIDE_TABLE")
+        if not (spans.num_rows or edges.num_rows):
+            return
+        _check_unique_key(spans, SPAN_KEY, "PEPTIDE_SPAN_TABLE")
+        _check_fk(spans, "protein_id", protein_ids, "PROTEIN_TABLE")
+        _check_fk(edges, "peptide_id", peptide_ids, "PEPTIDE_TABLE")
+        _check_unique_key(edges, (*SPAN_KEY, "peptide_id"), "SPAN_PEPTIDE_EDGE")
+        # Every edge names a span, and the span's sequence is the peptide's.
+        joined = edges.join(
+            spans.select([*SPAN_KEY, "sequence"]), keys=list(SPAN_KEY), join_type="left outer"
+        ).join(
+            self.peptides.select(["peptide_id", "sequence"]).rename_columns(["peptide_id", "peptide_sequence"]),
+            keys="peptide_id",
+            join_type="left outer",
+        )
+        orphan = pc.is_null(joined.column("sequence"))
+        if pc.any(orphan).as_py():
+            sample = joined.filter(orphan).select(list(SPAN_KEY)).slice(0, 3).to_pylist()
+            raise ValueError(f"SPAN_PEPTIDE_EDGE names spans not in PEPTIDE_SPAN_TABLE: {sample}")
+        differ = pc.not_equal(joined.column("sequence"), joined.column("peptide_sequence"))
+        if pc.any(differ).as_py():
+            sample = joined.filter(differ).select(["peptide_id", "sequence", "peptide_sequence"]).slice(0, 3).to_pylist()
+            raise ValueError(f"a span's sequence is not its peptide's: {sample}")
+        projected = _sorted_pairs(
+            edges.select(["protein_id", "peptide_id"]).group_by(["protein_id", "peptide_id"]).aggregate([])
+        )
+        stated = _sorted_pairs(
+            self.protein_peptide.group_by(["protein_id", "peptide_id"]).aggregate([])
+        )
+        if not projected.equals(stated):
+            raise ValueError(
+                "PROTEIN_PEPTIDE_EDGE is not the projection of SPAN_PEPTIDE_EDGE "
+                f"({stated.num_rows} pairs stated, {projected.num_rows} from the spans)"
+            )
 
     # ── views ───────────────────────────────────────────────────────
     @property
@@ -168,9 +239,14 @@ class Library:
         )
         new_pp_edges = self.protein_peptide.filter(edge_mask)
 
-        keep_peptides = pa.array(
-            sorted(set(new_pp_edges.column("peptide_id").to_pylist())),
-            type=pa.int64(),
+        targets = pc.unique(new_pp_edges.column("peptide_id").combine_chunks())
+        # A peptide-level decoy has no protein of its own; it follows its target.
+        decoy_mask = pc.is_in(self.peptides.column("decoy_of"), value_set=targets)
+        keep_peptides = pc.unique(
+            pa.chunked_array(
+                [targets, self.peptides.filter(pc.fill_null(decoy_mask, False)).column("peptide_id").combine_chunks()],
+                type=pa.int64(),
+            ).combine_chunks()
         )
         peptide_mask = pc.is_in(
             self.peptides.column("peptide_id"), value_set=keep_peptides
@@ -182,9 +258,7 @@ class Library:
         )
         new_precursors = self.precursors.filter(precursor_mask)
 
-        keep_precursors = pa.array(
-            new_precursors.column("precursor_id").to_pylist(), type=pa.int64()
-        )
+        keep_precursors = new_precursors.column("precursor_id").combine_chunks()
         fragment_mask = pc.is_in(
             self.fragments.column("precursor_id"), value_set=keep_precursors
         )
@@ -197,7 +271,104 @@ class Library:
             precursors=new_precursors,
             fragments=new_fragments,
             protein_peptide=new_pp_edges,
+            peptide_spans=self.peptide_spans.filter(
+                pc.is_in(self.peptide_spans.column("protein_id"), value_set=keep_proteins)
+            ),
+            span_peptide=self.span_peptide.filter(
+                pc.is_in(self.span_peptide.column("protein_id"), value_set=keep_proteins)
+            ),
+            peptide_modifications=self.peptide_modifications.filter(
+                pc.is_in(self.peptide_modifications.column("peptide_id"), value_set=keep_peptides)
+            ),
         )
+
+    def subset_precursors(self, precursor_ids: Iterable[int] | pa.Array | pa.ChunkedArray) -> Library:
+        """The library holding only these precursors and what they need:
+        their fragments; the peptides left with a precursor, a decoy only
+        with its target; those peptides' modification rows, span edges and
+        protein edges, and the spans still making one. Proteins are kept."""
+        if isinstance(precursor_ids, pa.ChunkedArray):
+            precursor_ids = precursor_ids.combine_chunks()
+        elif not isinstance(precursor_ids, pa.Array):
+            precursor_ids = pa.array(list(precursor_ids), type=pa.int64())
+        precursors = self.precursors.filter(pc.is_in(self.precursors.column("precursor_id"), value_set=precursor_ids))
+        with_precursor = pc.unique(precursors.column("peptide_id").combine_chunks())
+        peptides = self.peptides.filter(pc.is_in(self.peptides.column("peptide_id"), value_set=with_precursor))
+        # A decoy goes with its target: decoy_of must name a kept peptide.
+        orphan = pc.and_(
+            pc.is_valid(peptides.column("decoy_of")),
+            pc.invert(pc.fill_null(pc.is_in(peptides.column("decoy_of"), value_set=peptides.column("peptide_id").combine_chunks()), False)),
+        )
+        peptides = peptides.filter(pc.invert(orphan))
+        keep = peptides.column("peptide_id").combine_chunks()
+        precursors = precursors.filter(pc.is_in(precursors.column("peptide_id"), value_set=keep))
+        span_peptide = self.span_peptide.filter(pc.is_in(self.span_peptide.column("peptide_id"), value_set=keep))
+        spans = self.peptide_spans
+        if spans.num_rows:
+            used = span_peptide.select(list(SPAN_KEY)).group_by(list(SPAN_KEY)).aggregate([])
+            spans = spans.join(used, keys=list(SPAN_KEY), join_type="left semi")
+            spans = spans.take(pc.sort_indices(spans, sort_keys=[(k, "ascending") for k in SPAN_KEY]))
+        return replace(
+            self,
+            peptides=peptides,
+            precursors=precursors,
+            fragments=self.fragments.filter(
+                pc.is_in(self.fragments.column("precursor_id"), value_set=precursors.column("precursor_id").combine_chunks())
+            ),
+            protein_peptide=self.protein_peptide.filter(pc.is_in(self.protein_peptide.column("peptide_id"), value_set=keep)),
+            peptide_spans=spans,
+            span_peptide=span_peptide,
+            peptide_modifications=self.peptide_modifications.filter(
+                pc.is_in(self.peptide_modifications.column("peptide_id"), value_set=keep)
+            ),
+        )
+
+
+def attach_predictions(source: Library, predicted: Library) -> tuple[Library, dict[str, int]]:
+    """``source`` with ``predicted``'s fragments and retention times.
+
+    What a prediction of a library's own precursors should return: the
+    source library, with everything it says about them (which are decoys
+    and of what, the spans that make each peptide, each modification and
+    why), not the flat library a predictor rebuilds from bare
+    (sequence, charge) pairs. Precursors are matched on (modified
+    sequence, charge); a predicted retention time replaces the source's
+    unless it is unset (−1). A source precursor the predictor did not
+    return (a modification the model cannot take, skipped) is left out,
+    with what only it needed (:meth:`Library.subset_precursors`), and
+    counted. Returns the library and the counts.
+    """
+
+    def keyed(lib: Library) -> pa.Table:
+        return lib.precursors.select(["precursor_id", "peptide_id", "charge", "rt_predicted"]).join(
+            lib.peptides.select(["peptide_id", "modified_sequence"]), keys="peptide_id"
+        )
+
+    src = keyed(source).select(["precursor_id", "modified_sequence", "charge"])
+    got = keyed(predicted).select(["precursor_id", "modified_sequence", "charge", "rt_predicted"])
+    got = got.rename_columns(["predicted_id", "modified_sequence", "charge", "predicted_rt"])
+    pairs = src.join(got, keys=["modified_sequence", "charge"], join_type="inner")
+    out = source.subset_precursors(pairs.column("precursor_id"))
+
+    at = pc.index_in(out.precursors.column("precursor_id"), value_set=pairs.column("precursor_id").combine_chunks())
+    new_rt = pc.take(pairs.column("predicted_rt"), at)
+    old_rt = out.precursors.column("rt_predicted")
+    rt = pc.if_else(pc.greater_equal(pc.fill_null(new_rt, -1.0), 0.0), new_rt, old_rt)
+    precursors = out.precursors.set_column(
+        out.precursors.schema.get_field_index("rt_predicted"), "rt_predicted", rt
+    )
+    fragments = predicted.fragments
+    to = pc.index_in(fragments.column("precursor_id"), value_set=pairs.column("predicted_id").combine_chunks())
+    fragments = fragments.set_column(
+        fragments.schema.get_field_index("precursor_id"), "precursor_id", pc.take(pairs.column("precursor_id"), to)
+    ).filter(pc.is_valid(to))
+    counts = {
+        "precursors": out.precursors.num_rows,
+        "precursors_not_predicted": source.precursors.num_rows - out.precursors.num_rows,
+        "fragments": fragments.num_rows,
+    }
+    merged = {**source.metadata_extras, **predicted.metadata_extras}
+    return replace(out, precursors=precursors, fragments=fragments, metadata_extras=merged), counts
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -206,35 +377,48 @@ class Library:
 
 
 def _check_unique(table: pa.Table, column: str) -> None:
-    values = table.column(column).to_pylist()
-    if len(set(values)) != len(values):
-        seen: set[Any] = set()
-        dups: list[Any] = []
-        for v in values:
-            if v in seen:
-                dups.append(v)
-            else:
-                seen.add(v)
-        raise ValueError(
-            f"{column} contains duplicate values: "
-            f"{dups[:5]}{'...' if len(dups) > 5 else ''}"
-        )
+    col = table.column(column)
+    if pc.count_distinct(col, mode="all").as_py() == len(col):
+        return
+    counts = table.select([column]).group_by(column).aggregate([([], "count_all")])
+    dups = counts.filter(pc.greater(counts.column("count_all"), 1)).column(column).to_pylist()
+    raise ValueError(
+        f"{column} contains duplicate values: "
+        f"{dups[:5]}{'...' if len(dups) > 5 else ''}"
+    )
+
+
+def _check_unique_key(table: pa.Table, columns: Sequence[str], name: str) -> None:
+    counts = table.select(list(columns)).group_by(list(columns)).aggregate([([], "count_all")])
+    if counts.num_rows == table.num_rows:
+        return
+    dups = counts.filter(pc.greater(counts.column("count_all"), 1)).select(list(columns)).slice(0, 5)
+    raise ValueError(f"{name} has duplicate {tuple(columns)}: {dups.to_pylist()}")
 
 
 def _check_fk(
     table: pa.Table,
     column: str,
-    valid_ids: set[Any],
+    valid_ids: pa.Array | pa.ChunkedArray,
     target_name: str,
 ) -> None:
-    values = table.column(column).to_pylist()
-    missing = {v for v in values if v not in valid_ids}
-    if missing:
-        sample = sorted(missing)[:5]
-        raise ValueError(
-            f"{column} references ids not present in {target_name}: "
-            f"{sample}{'...' if len(missing) > 5 else ''}"
-        )
+    values = table.column(column)
+    if isinstance(valid_ids, pa.ChunkedArray):
+        valid_ids = valid_ids.combine_chunks()
+    present = pc.is_in(values, value_set=valid_ids)
+    if pc.all(present).as_py() in (True, None):
+        return
+    missing = pc.unique(values.filter(pc.invert(present))).to_pylist()
+    sample = sorted(missing)[:5]
+    raise ValueError(
+        f"{column} references ids not present in {target_name}: "
+        f"{sample}{'...' if len(missing) > 5 else ''}"
+    )
+
+
+def _sorted_pairs(t: pa.Table) -> pa.Table:
+    t = t.select(["protein_id", "peptide_id"])
+    return t.take(pc.sort_indices(t, sort_keys=[("protein_id", "ascending"), ("peptide_id", "ascending")])).combine_chunks()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -451,4 +635,4 @@ def _to_table(rows: Sequence[dict[str, Any]], schema: pa.Schema) -> pa.Table:
     return pa.Table.from_pylist(list(rows), schema=schema)
 
 
-__all__ = ["Library", "assign_ids"]
+__all__ = ["Library", "assign_ids", "attach_predictions"]

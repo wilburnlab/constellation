@@ -2,33 +2,32 @@
 
 Two classes of consumer share this module:
 
-1. **Reads-as-input** — basecalled reads in FASTA/FASTQ form flowing into
-   ``READ_TABLE``. ``FastaReader`` / ``FastqReader`` (RawReader
-   subclasses) target this path; full implementation pending Phase 2.
+1. **Reads-as-input** — basecalled reads in FASTQ form flowing into
+   ``READ_TABLE``. ``FastqReader`` (a RawReader subclass) targets this
+   path; full implementation pending Phase 2.
 
 2. **Reference-as-input** — FASTA files holding a genome, transcriptome,
    or genetic-tools panel that flow into ``GenomeReference`` /
    ``TranscriptReference`` / ``GeneticTools``. The ``read_fasta_*``
    functions below cover this path.
 
-Both groups share a common streaming parser :func:`_iter_fasta` that
-yields ``(record_id, description, sequence)`` per record. Gzip-aware
-via stdlib ``gzip.open``. No external dependencies — pysam.FastaFile
-would only earn its keep on huge (human-scale) genomes that need
-``.fai``-indexed random contig access; we do full one-pass reads, so a
-streaming parser is simpler and consistent with the GFF3/BED hand-rolled
-philosophy.
+FASTA parsing is :mod:`constellation.core.io.fasta`, the package's one
+FASTA reader; :func:`_iter_fasta` adapts its records to the
+``(record_id, description, sequence)`` tuples the readers here walk. A
+FASTA file is reference data, not instrument output, so it has no
+``RawReader`` (the two stubs that claimed ``.fa`` / ``.fasta`` / ``.fna``
+/ ``.faa`` were removed on 2026-11-05).
 """
 
 from __future__ import annotations
 
-import gzip
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pyarrow as pa
 
+from constellation.core.io.fasta import iter_fasta, split_header
 from constellation.core.io.readers import RawReader, ReadResult, register_reader
 from constellation.sequencing.genetic_tools import GeneticTools
 from constellation.sequencing.reference.reference import GenomeReference
@@ -42,7 +41,6 @@ from constellation.sequencing.schemas.reference import (
 )
 from constellation.sequencing.transcripts.transcripts import TranscriptReference
 
-
 _PHASE = "Phase 2 (readers/fastx)"
 
 
@@ -51,50 +49,12 @@ _PHASE = "Phase 2 (readers/fastx)"
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _open_text(path: Path) -> Any:
-    """Open a file for text reading, transparently handling gzip."""
-    if path.suffix == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8")
-    return path.open("r", encoding="utf-8")
-
-
 def _iter_fasta(path: Path) -> Iterator[tuple[str, str, str]]:
-    """Yield ``(record_id, description, sequence)`` per record.
-
-    Header is parsed by splitting on first whitespace. Sequence lines
-    are concatenated with whitespace stripped (handles tab-padded or
-    line-wrapped sequences). Blank lines are skipped. Lines beginning
-    with ``;`` are treated as comments per the legacy FASTA convention.
-    """
-    header: str | None = None
-    seq_chunks: list[str] = []
-    with _open_text(path) as fh:
-        for raw in fh:
-            line = raw.rstrip("\r\n")
-            if not line or line.startswith(";"):
-                continue
-            if line.startswith(">"):
-                if header is not None:
-                    rec_id, desc = _split_header(header)
-                    yield rec_id, desc, "".join(seq_chunks).replace(" ", "").replace(
-                        "\t", ""
-                    )
-                header = line[1:].rstrip()
-                seq_chunks = []
-            else:
-                seq_chunks.append(line.strip())
-    if header is not None:
-        rec_id, desc = _split_header(header)
-        yield rec_id, desc, "".join(seq_chunks).replace(" ", "").replace("\t", "")
-
-
-def _split_header(header: str) -> tuple[str, str]:
-    parts = header.split(None, 1)
-    if not parts:
-        return "", ""
-    if len(parts) == 1:
-        return parts[0], ""
-    return parts[0], parts[1]
+    """Yield ``(record_id, description, sequence)`` per record
+    (:func:`constellation.core.io.fasta.iter_fasta`)."""
+    for record in iter_fasta(path):
+        rec_id, desc = split_header(record.header)
+        yield rec_id, desc, record.sequence
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -257,26 +217,6 @@ def read_fasta_genetic_tools(
 
 
 @register_reader
-class FastaReader(RawReader):
-    suffixes: ClassVar[tuple[str, ...]] = (".fa", ".fasta", ".fna", ".faa")
-    modality: ClassVar[str | None] = "nanopore"
-
-    def read(self, source) -> ReadResult:
-        raise NotImplementedError(f"FastaReader.read pending {_PHASE}")
-
-
-@register_reader
-class FastaGzReader(RawReader):
-    """Gzipped FASTA. Suffix-list covers the common combinations."""
-
-    suffixes: ClassVar[tuple[str, ...]] = (".fa.gz", ".fasta.gz", ".fna.gz")
-    modality: ClassVar[str | None] = "nanopore"
-
-    def read(self, source) -> ReadResult:
-        raise NotImplementedError(f"FastaGzReader.read pending {_PHASE}")
-
-
-@register_reader
 class FastqReader(RawReader):
     suffixes: ClassVar[tuple[str, ...]] = (".fq", ".fastq")
     modality: ClassVar[str | None] = "nanopore"
@@ -295,8 +235,6 @@ class FastqGzReader(RawReader):
 
 
 __all__ = [
-    "FastaReader",
-    "FastaGzReader",
     "FastqReader",
     "FastqGzReader",
     "read_fasta_genome",

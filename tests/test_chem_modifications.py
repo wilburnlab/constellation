@@ -271,3 +271,91 @@ def test_modification_default_specificities_is_empty_tuple():
     assert mod.has_n_term_specificity is False
     assert mod.has_c_term_specificity is False
     assert mod.has_only_terminal_specificity is False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Every UNIMOD placement (2026-11-05): hidden ones kept apart, with their
+# classification and neutral losses
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_shown_specificities_are_what_they_were():
+    """``specificities`` is still UNIMOD's shown set (what the EncyclopeDIA
+    reader disambiguates with); the hidden ones are beside it."""
+    shown = [s for m in UNIMOD for s in m.specificities]
+    hidden = [s for m in UNIMOD for s in m.hidden_specificities]
+    assert (len(shown), len(hidden)) == (79, 2747)
+    assert sum(1 for m in UNIMOD if m.specificities) == 43
+    assert not any(s.hidden for s in shown) and all(s.hidden for s in hidden)
+    assert all(m.all_specificities == m.specificities + m.hidden_specificities for m in UNIMOD)
+    # every modification now names somewhere it goes
+    assert all(m.all_specificities for m in UNIMOD)
+
+
+def test_hidden_placements_carry_their_chemistry():
+    silac = UNIMOD["UNIMOD:259"]  # Label:13C(6)15N(2), on K
+    assert silac.specificities == ()
+    assert [(s.site, s.classification) for s in silac.hidden_specificities] == [("K", "Isotopic label")]
+    phospho_s = next(s for s in UNIMOD["UNIMOD:21"].all_specificities if s.site == "S")
+    assert [loss.mono_mass for loss in phospho_s.neutral_losses] == [0.0, 97.976896]
+    h3po4 = phospho_s.neutral_losses[1].composition
+    assert h3po4 is not None and h3po4.atoms == {"H": 3, "O": 4, "P": 1}
+    assert {s.classification for m in UNIMOD for s in m.all_specificities} >= {
+        "Post-translational", "Artefact", "Chemical derivative", "Isotopic label",
+    }
+
+
+def test_licenses_separates_protein_from_peptide_termini():
+    # Acetyl lists both "Protein N-term" and "Any N-term": any N-terminus.
+    acetyl = UNIMOD["UNIMOD:1"]
+    assert acetyl.licenses("N-term", terminal_residue="A")
+    assert acetyl.licenses("K") and acetyl.licenses("S")  # S is a hidden placement
+    assert not acetyl.licenses("S", include_hidden=False)
+    # A protein-terminal-only placement needs the protein's terminus.
+    only_protein = Modification(
+        id="CUSTOM:pnt",
+        name="protein N-terminal only",
+        delta_composition=Composition.from_formula("C2H2O"),
+        specificities=(Specificity(position="Protein N-term", site="N-term"),),
+    )
+    assert not only_protein.licenses("N-term", terminal_residue="M")
+    assert only_protein.licenses("N-term", terminal_residue="M", protein_terminus=True)
+    assert Specificity(position="Protein N-term", site="N-term").is_protein_terminal
+    # A terminal placement that names its residue (pyro-Glu from Q).
+    pyro = UNIMOD["UNIMOD:28"]
+    assert pyro.licenses("N-term", terminal_residue="Q")
+    assert not pyro.licenses("N-term", terminal_residue="E")
+    assert not pyro.licenses("Q")  # a terminal modification, not a side chain
+
+
+def test_save_load_keeps_every_placement(tmp_path):
+    sub = UNIMOD.subset(["UNIMOD:1", "UNIMOD:21", "UNIMOD:259"])
+    out = tmp_path / "vocab.json"
+    sub.save(out)
+    reloaded = ModVocab.load(out)
+    for mid in ("UNIMOD:1", "UNIMOD:21", "UNIMOD:259"):
+        assert reloaded[mid].specificities == sub[mid].specificities
+        assert reloaded[mid].hidden_specificities == sub[mid].hidden_specificities
+
+
+def test_schema_1_vocab_files_still_load(tmp_path):
+    """A vocab saved before 2026-11-05 lists shown placements only, with no
+    hidden flag: they load as shown."""
+    import json
+
+    doc = {
+        "schema_version": "1",
+        "modifications": [
+            {
+                "id": "CUSTOM:x",
+                "name": "x",
+                "delta_composition": {"C": 1},
+                "specificities": [{"position": "Anywhere", "site": "K"}],
+            }
+        ],
+    }
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps(doc))
+    mod = ModVocab.load(path)["CUSTOM:x"]
+    assert mod.specificities == (Specificity(position="Anywhere", site="K"),)
+    assert mod.hidden_specificities == ()

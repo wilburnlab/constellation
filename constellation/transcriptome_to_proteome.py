@@ -26,13 +26,14 @@ candidates: ``asterism/``, ``confluence/``, ``weft/``, ``synthesis/``,
 
 from __future__ import annotations
 
-import gzip
 import hashlib
 from collections.abc import Mapping
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.compute as pc
+
+from constellation.core.io.fasta import iter_fasta, split_header
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -57,43 +58,17 @@ def _seq_hash(sequence: str) -> str:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _open_text(path: Path):
-    """Open a FASTA / GBFF / GFF3 for text reading, transparently
-    handling gzip."""
-    if path.suffix == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8")
-    return path.open("r", encoding="utf-8")
-
-
 def _iter_fasta(path: Path):
-    """Yield ``(header, sequence)`` per record. Lifted from
-    ``sequencing.readers.fastx._iter_fasta`` to keep this module
-    self-contained — that function is private upstream.
-    """
-    header: str | None = None
-    seq_chunks: list[str] = []
-    with _open_text(path) as fh:
-        for raw in fh:
-            line = raw.rstrip("\r\n")
-            if not line or line.startswith(";"):
-                continue
-            if line.startswith(">"):
-                if header is not None:
-                    yield header, "".join(seq_chunks).replace(" ", "").replace(
-                        "\t", ""
-                    )
-                header = line[1:].rstrip()
-                seq_chunks = []
-            else:
-                seq_chunks.append(line.strip())
-    if header is not None:
-        yield header, "".join(seq_chunks).replace(" ", "").replace("\t", "")
+    """Yield ``(header, sequence)`` per record
+    (:func:`constellation.core.io.fasta.iter_fasta`, the package's one
+    FASTA parser)."""
+    for record in iter_fasta(path):
+        yield record.header, record.sequence
 
 
 def _header_id(header: str) -> str:
     """First whitespace-delimited token of a FASTA header."""
-    parts = header.split(None, 1)
-    return parts[0] if parts else ""
+    return split_header(header)[0]
 
 
 def deduplicate_fasta(

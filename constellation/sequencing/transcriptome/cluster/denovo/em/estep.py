@@ -65,6 +65,7 @@ from typing import Iterable, Iterator, Literal
 import numpy as np
 import pyarrow as pa
 
+from constellation.core.io.fasta import write_fasta
 from constellation.core.io.schemas import register_schema
 from constellation.sequencing.transcriptome.cluster.denovo._cigar import (
     base_codes,
@@ -73,7 +74,6 @@ from constellation.sequencing.transcriptome.cluster.denovo._cigar import (
 from constellation.sequencing.transcriptome.cluster.denovo.haplotypes import (
     member_allele_row,
 )
-
 
 READ_ASSIGNMENT_TABLE: pa.Schema = pa.schema(
     [
@@ -575,9 +575,7 @@ def write_template_fasta(templates: TemplateSet, path) -> "object":
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as fh:
-        for name, seq in zip(templates.name, templates.sequence):
-            fh.write(f">{name}\n{seq}\n")
+    write_fasta(path, templates.sequence, templates.name)
     return path
 
 

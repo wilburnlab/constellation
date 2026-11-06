@@ -5,10 +5,11 @@ Four subcommands; each reads only its inputs and writes only ``--out``.
 ``targets``  makes an XIC target table: from an EncyclopeDIA library
              (``--library``, its precursors at their library retention
              times, optionally one m/z range and a sample) or from FASTA
-             files (``--fasta``, digested; ``--heavy-fasta`` digested and
-             labelled ``<13C><15N>``). ``--decoys`` adds each peptide
-             reversed (C-terminal residue kept) at the same charge, with
-             ``target_id`` offset by ``DECOY_OFFSET``.
+             files through ``massspec.library.search_space`` (``--fasta``;
+             ``--heavy-fasta`` labelled ``<13C><15N>``). ``--decoys`` adds
+             EncyclopeDIA-style decoys (first and last residue kept, the
+             interior reversed, modifications moving with their residues)
+             at the same charges, flagged ``is_decoy``.
 ``time``     sweeps one bundle for those targets under each configuration
              asked for (workers, levels, rule, kernel, RT window), each in
              a fresh process so its peak memory is its own, and records
@@ -44,65 +45,72 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-DECOY_OFFSET = 1 << 40
-
-
 # ── targets ───────────────────────────────────────────────────────────
 
 
-def _reverse(modseq: str) -> str | None:
-    """A peptide reversed with its C-terminal residue kept; None for one
-    that carries modifications (reversing ProForma text would misplace them)."""
-    if "[" in modseq or "<" in modseq or len(modseq) < 3:
-        return None
-    return modseq[-2::-1] + modseq[-1]
-
-
 def _cmd_targets(args) -> None:
-    from constellation.core.sequence.proforma import parse_proforma
-    from constellation.massspec.peptide.mz import precursor_mz
-    from constellation.massspec.quant.schemas import XIC_TARGET_TABLE
+    """Targets from a library (its precursors) or from FASTA files through
+    the search space, the package's one enumerator: decoys and labelled
+    forms are made there, so a modified or labelled target has its decoy
+    as an unmodified light one does."""
+    from constellation.massspec.library.decoys import DecoySet
+    from constellation.massspec.library.search_space import (
+        Digestion,
+        ModRule,
+        SearchSpaceSettings,
+        build_search_space,
+    )
+    from constellation.massspec.quant.targets import targets_from_library
 
-    rows: list[dict] = []
     if args.library:
         from constellation.massspec.io.encyclopedia import read_encyclopedia
-        from constellation.massspec.quant.targets import targets_from_library
 
         lib = read_encyclopedia(args.library, annotate_fragments=False, psms=False, sidecars=False).library
-        t = targets_from_library(lib)
+        table = targets_from_library(lib)
         if args.mz_range:
-            mz = t.column("precursor_mz")
-            t = t.filter(pc.and_(pc.greater_equal(mz, args.mz_range[0]), pc.less_equal(mz, args.mz_range[1])))
-        rows = t.to_pylist()
-    for path, heavy in [(f, False) for f in args.fasta or []] + [(f, True) for f in args.heavy_fasta or []]:
-        from constellation.massspec.library.digest import precursors_from_fasta
-
-        specs = precursors_from_fasta(
-            path, missed_cleavages=args.missed_cleavages, charges=tuple(args.charges),
-            variable_mods={"M": "UNIMOD:35", "C": "UNIMOD:4"}, max_variable_mods=2, min_mz=args.min_mz, max_mz=args.max_mz,
-        )  # fmt: skip
-        for s in specs:
-            modseq = f"<13C><15N>{s.modified_sequence}" if heavy else s.modified_sequence
-            pmz = precursor_mz(parse_proforma(modseq), charge=s.charge) if heavy else s.precursor_mz
-            rows.append(dict(target_id=len(rows) + 1, modified_sequence=modseq, precursor_charge=s.charge,
-                             precursor_mz=pmz))  # fmt: skip
-    if args.sample and len(rows) > args.sample:
+            mz = table.column("precursor_mz")
+            table = table.filter(pc.and_(pc.greater_equal(mz, args.mz_range[0]), pc.less_equal(mz, args.mz_range[1])))
+        if args.decoys:
+            table = _with_library_decoys(table)
+    else:
+        fastas = list(args.fasta or []) + list(args.heavy_fasta or [])
+        settings = SearchSpaceSettings(
+            digestion=Digestion(missed_cleavages=args.missed_cleavages),
+            rules=(ModRule.parse("Oxidation@M", "variable"), ModRule.parse("Carbamidomethyl@C", "variable")),
+            max_variable=2,
+            labels=tuple((f, ("13C", "15N")) for f in args.heavy_fasta or []),
+            charges=tuple(args.charges),
+            min_mz=args.min_mz,
+            max_mz=args.max_mz,
+            decoys=(DecoySet(),) if args.decoys else (),
+        )
+        table = targets_from_library(build_search_space(fastas, settings))
+    if args.sample and table.num_rows > args.sample:
         rng = np.random.default_rng(args.seed)
-        rows = [rows[i] for i in sorted(rng.choice(len(rows), args.sample, replace=False))]
-    if args.decoys:
-        decoys = []
-        for r in rows:
-            rev = _reverse(r["modified_sequence"] or "")
-            if rev is None:
-                continue
-            decoys.append(dict(r, target_id=r["target_id"] + DECOY_OFFSET, modified_sequence=rev,
-                               precursor_mz=precursor_mz(parse_proforma(rev), charge=r["precursor_charge"]),
-                               precursor_id=None, peptide_id=None))  # fmt: skip
-        rows += decoys
-    table = pa.Table.from_pylist(rows, schema=XIC_TARGET_TABLE)
+        table = table.take(np.sort(rng.choice(table.num_rows, args.sample, replace=False)))
     pq.write_table(table, args.out)
-    n_decoy = pc.sum(pc.greater_equal(table["target_id"], DECOY_OFFSET)).as_py() or 0
+    n_decoy = pc.sum(pc.fill_null(table["is_decoy"], False)).as_py() or 0
     print(f"{table.num_rows} targets ({n_decoy} decoys) → {args.out}")
+
+
+def _with_library_decoys(targets: pa.Table) -> pa.Table:
+    """A library's targets with a decoy each, from the search space's decoy
+    engine: same composition, so the same precursor m/z and charge."""
+    from constellation.core.sequence.proforma import format_proforma, parse_proforma
+    from constellation.massspec.library.decoys import DecoySet, il_key, peptide_decoys
+    from constellation.massspec.library.ids import canonical_peptide_key, content_id
+
+    rows = targets.to_pylist()
+    forms = [parse_proforma(r["modified_sequence"]) for r in rows]
+    taken = {il_key(f.sequence) for f in forms}
+    out = peptide_decoys(forms, DecoySet(), taken=taken, key=lambda f: canonical_peptide_key(format_proforma(f)))
+    decoys = []
+    for i, form in zip(out.target, out.decoy, strict=True):
+        key = canonical_peptide_key(format_proforma(form))
+        r = rows[i]
+        decoys.append(dict(r, target_id=content_id(f"{key}/{r['precursor_charge']}"), modified_sequence=key,
+                           precursor_id=None, peptide_id=None, is_decoy=True))  # fmt: skip
+    return pa.concat_tables([targets, pa.Table.from_pylist(decoys, schema=targets.schema)])
 
 
 # ── timing ────────────────────────────────────────────────────────────
@@ -238,7 +246,7 @@ class _GridReducer:
         from constellation.massspec.sweep.evidence import EvidenceGate, decide
 
         plan = batch.plan
-        decoy = plan.targets.column("target_id").to_numpy()[batch.queries] >= DECOY_OFFSET
+        decoy = plan.targets.column("is_decoy").fill_null(False).to_numpy(zero_copy_only=False)[batch.queries]
         has = plan.fragments.counts()[batch.queries] > 0
         pairs = batch.eligible(2, np.unique(batch.evidence.query))  # a query without evidence has no run
         rows = []

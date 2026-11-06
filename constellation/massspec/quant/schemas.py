@@ -153,7 +153,8 @@ TRANSMISSION_PEPTIDE_PRECURSOR: pa.Schema = pa.schema(
 # ──────────────────────────────────────────────────────────────────────
 
 
-XIC_TARGET_SCHEMA_VERSION: int = 1
+#: 2 (2026-11-05): ``is_decoy``.
+XIC_TARGET_SCHEMA_VERSION: int = 2
 
 
 # The normalized extraction-target contract: the single thing the
@@ -187,6 +188,9 @@ XIC_TARGET_TABLE: pa.Schema = pa.schema(
         # FK passthrough into library tiers.
         pa.field("precursor_id", pa.int64(), nullable=True),
         pa.field("peptide_id", pa.int64(), nullable=True),
+        # A decoy target (from a search space's decoys); null where the
+        # source does not say. Carried into the sweep's queries and summary.
+        pa.field("is_decoy", pa.bool_(), nullable=True),
     ],
     metadata={
         b"schema_name": b"XICTarget",

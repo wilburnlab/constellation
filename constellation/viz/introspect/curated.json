@@ -93,6 +93,17 @@
       "glob": "*.fasta,*.fa,*.faa"
     },
     {
+      "path": ["massspec", "search-space"],
+      "dest": "fasta",
+      "path_kind": "file",
+      "glob": "*.fasta,*.fa,*.faa,*.gz"
+    },
+    {
+      "path": ["massspec", "search-space"],
+      "dest": "output_dir",
+      "path_kind": "dir"
+    },
+    {
       "path": ["massspec", "report"],
       "dest": "library",
       "path_kind": "file",

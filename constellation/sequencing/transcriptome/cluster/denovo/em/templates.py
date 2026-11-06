@@ -29,6 +29,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from constellation.core.io.fasta import write_fasta
 
 TEMPLATE_TABLE: pa.Schema = pa.schema(
     [
@@ -289,13 +290,8 @@ def write_templates(table: pa.Table, directory: Path) -> tuple[Path, Path]:
             writer.write_table(table.combine_chunks())
 
     fasta_path = directory / TEMPLATES_FASTA
-    seq_col = table.column("sequence")
-    row = 0
-    with fasta_path.open("w", encoding="utf-8") as fh:
-        for lo in range(0, table.num_rows, 50_000):
-            for seq in seq_col.slice(lo, 50_000).to_pylist():
-                fh.write(f">{row}\n{seq}\n")
-                row += 1
+    # Named by row index, which is how the E-step reads them back.
+    write_fasta(fasta_path, table.column("sequence"))
     return arrow_path, fasta_path
 
 

@@ -21,18 +21,17 @@ to the draft contig id. Stdlib-only, gzip-aware, pure → unit-testable.
 
 from __future__ import annotations
 
-import gzip
 from pathlib import Path
 from typing import Any
+
+from constellation.core.io.text import open_text
 
 # AGP gap component-type → SCAFFOLD_TABLE.gap_type vocabulary.
 _GAP_TYPE = {"N": "estimated", "U": "unknown"}
 
 
-def _open_text(path: Path) -> Any:
-    if path.suffix == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8")
-    return path.open("r", encoding="utf-8")
+#: gzip-aware text opener, shared (``constellation.core.io.text``).
+_open_text = open_text
 
 
 def parse_agp(

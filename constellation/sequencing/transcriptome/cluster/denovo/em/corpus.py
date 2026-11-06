@@ -38,6 +38,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from constellation.core.io.fasta import write_fasta
 from constellation.sequencing.align.map import _iter_demux_read_batches
 from constellation.sequencing.transcriptome.cluster.denovo._io import (
     _READS_SCHEMA,
@@ -330,7 +331,9 @@ def _sort_into(unsorted_path: Path, arrow_path: Path, fasta_path: Path) -> int:
                 )
                 last_id = _check_sorted(block.column("read_id"), last_id)
                 writer.write_table(block)
-                row = _write_fasta_rows(fh, block, start_row=row)
+                row += write_fasta(
+                    fh, block.column("sequence"), start_row=row, chunk_rows=_FASTA_CHUNK_ROWS
+                )
     return n
 
 
@@ -516,24 +519,6 @@ def _check_resume_settings(settings_path: Path, settings: dict) -> None:
         f"this run's settings ({detail}). Use a different --output-dir, or "
         f"delete {settings_path.parent} to rebuild it."
     )
-
-
-def _write_fasta_rows(fh, table: pa.Table, *, start_row: int) -> int:
-    """Append ``table``'s windows as ``>{row}`` records. Returns the next row.
-
-    Deliberately a Python loop over ``to_pylist()`` slices rather than numpy
-    buffer surgery: a fully vectorised emitter measures **10x slower** here
-    (7.18 s vs 0.70 s for 200k x 1.5 kb), because the ``np.repeat`` int64
-    intermediates over the concatenated sequence dominate. The slicing is what
-    bounds the transient — one chunk of strings at a time, not a batch.
-    """
-    row = start_row
-    seq_col = table.column("sequence")
-    for lo in range(0, table.num_rows, _FASTA_CHUNK_ROWS):
-        for seq in seq_col.slice(lo, _FASTA_CHUNK_ROWS).to_pylist():
-            fh.write(f">{row}\n{seq}\n")
-            row += 1
-    return row
 
 
 __all__ = [

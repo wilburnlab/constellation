@@ -23,6 +23,24 @@ search scores — lives in ``massspec.quant`` and ``massspec.search``.
                                calibrated efficiencies live in
                                ``massspec.quant``.
 
+A library built from a FASTA (``massspec.library.search_space``) also
+records how each peptide was made, in three tables a library read from a
+file leaves empty (2026-11-05):
+
+    PEPTIDE_SPAN_TABLE         one row per place a peptide sequence was cut
+                               from a protein: coordinates, missed
+                               cleavages, how each end was made, flanks
+    SPAN_PEPTIDE_EDGE          which spans can make which peptidoform (a
+                               Protein N-term form only from a span at the
+                               protein's N-terminus)
+    PEPTIDE_MODIFICATION_TABLE each modification of a peptidoform and why it
+                               is there (fixed, variable, label; the rule)
+
+``PROTEIN_PEPTIDE_EDGE`` is then the projection of ``SPAN_PEPTIDE_EDGE``
+onto (protein, peptide). ``is_decoy`` on proteins and peptides, and a
+peptide's ``decoy_of`` / ``decoy_set``, are null where a source says
+nothing about decoys.
+
 Sentinel ``-1.0`` for unset float fields (rt_predicted, ccs_predicted,
 intensity_predicted) — same convention as the rest of the package.
 """
@@ -47,6 +65,9 @@ PROTEIN_TABLE: pa.Schema = pa.schema(
         # populates it whenever available; downstream code must tolerate null.
         pa.field("sequence", pa.string(), nullable=True),
         pa.field("description", pa.string(), nullable=True),
+        # True for a decoy protein (reversed before digestion); null where
+        # the source does not say.
+        pa.field("is_decoy", pa.bool_(), nullable=True),
     ],
     metadata={b"schema_name": b"ProteinTable"},
 )
@@ -61,6 +82,13 @@ PEPTIDE_TABLE: pa.Schema = pa.schema(
         # via core.sequence.proforma.parse_proforma / format_proforma. Equals
         # ``sequence`` when unmodified.
         pa.field("modified_sequence", pa.string(), nullable=False),
+        # Decoys: whether this peptidoform is one, the target peptidoform a
+        # peptide-level decoy was made from, and which decoy set it belongs
+        # to (0 the set that competes with the targets, 1.. extra sets such
+        # as entrapment). Null where the source does not say.
+        pa.field("is_decoy", pa.bool_(), nullable=True),
+        pa.field("decoy_of", pa.int64(), nullable=True),
+        pa.field("decoy_set", pa.int16(), nullable=True),
     ],
     metadata={b"schema_name": b"PeptideTable"},
 )
@@ -136,6 +164,61 @@ PROTEIN_PEPTIDE_EDGE: pa.Schema = pa.schema(
 )
 
 
+# One row per place a peptide sequence was cut from a protein. Coordinates
+# are 0-based, end exclusive. ``n_term`` / ``c_term`` say how each end was
+# made: "enzyme" (the protease's rule), "protein" (the protein's own
+# terminus: its first residue, after an initiator Met, or a declared mature
+# chain; its last residue), "nonspecific" (semi- or unspecific digestion).
+# ``preceding`` / ``following`` are the flanking residues, "-" at a protein
+# end.
+PEPTIDE_SPAN_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("protein_id", pa.int64(), nullable=False),
+        pa.field("start", pa.int32(), nullable=False),
+        pa.field("end", pa.int32(), nullable=False),
+        pa.field("sequence", pa.string(), nullable=False),
+        pa.field("missed_cleavages", pa.int16(), nullable=False),
+        pa.field("n_term", pa.string(), nullable=False),
+        pa.field("c_term", pa.string(), nullable=False),
+        pa.field("preceding", pa.string(), nullable=False),
+        pa.field("following", pa.string(), nullable=False),
+    ],
+    metadata={b"schema_name": b"PeptideSpanTable"},
+)
+
+
+# Which spans can make which peptidoform: the span's sequence is the
+# peptidoform's, and its context licenses the peptidoform's modifications.
+SPAN_PEPTIDE_EDGE: pa.Schema = pa.schema(
+    [
+        pa.field("protein_id", pa.int64(), nullable=False),
+        pa.field("start", pa.int32(), nullable=False),
+        pa.field("end", pa.int32(), nullable=False),
+        pa.field("peptide_id", pa.int64(), nullable=False),
+    ],
+    metadata={b"schema_name": b"SpanPeptideEdge"},
+)
+
+
+# Each modification of a peptidoform and why it is there. ``position`` is the
+# 0-based residue for a side chain; ``terminus`` is "N" / "C" for a terminal
+# modification (position null); both are null for a global isotope label.
+# ``modification`` is the UNIMOD accession ("UNIMOD:35") or the isotope
+# ("13C"). ``origin`` is "fixed", "variable" or "label"; ``rule`` is the rule
+# that placed it, as given ("Oxidation@M", "Acetyl@Protein N-term").
+PEPTIDE_MODIFICATION_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("peptide_id", pa.int64(), nullable=False),
+        pa.field("position", pa.int32(), nullable=True),
+        pa.field("terminus", pa.string(), nullable=True),
+        pa.field("modification", pa.string(), nullable=False),
+        pa.field("origin", pa.string(), nullable=False),
+        pa.field("rule", pa.string(), nullable=True),
+    ],
+    metadata={b"schema_name": b"PeptideModificationTable"},
+)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Registration
 # ──────────────────────────────────────────────────────────────────────
@@ -146,6 +229,9 @@ register_schema("PeptideTable", PEPTIDE_TABLE)
 register_schema("PrecursorTable", PRECURSOR_TABLE)
 register_schema("LibraryFragmentTable", LIBRARY_FRAGMENT_TABLE)
 register_schema("ProteinPeptideEdge", PROTEIN_PEPTIDE_EDGE)
+register_schema("PeptideSpanTable", PEPTIDE_SPAN_TABLE)
+register_schema("SpanPeptideEdge", SPAN_PEPTIDE_EDGE)
+register_schema("PeptideModificationTable", PEPTIDE_MODIFICATION_TABLE)
 
 
 __all__ = [
@@ -154,4 +240,7 @@ __all__ = [
     "PRECURSOR_TABLE",
     "LIBRARY_FRAGMENT_TABLE",
     "PROTEIN_PEPTIDE_EDGE",
+    "PEPTIDE_SPAN_TABLE",
+    "SPAN_PEPTIDE_EDGE",
+    "PEPTIDE_MODIFICATION_TABLE",
 ]

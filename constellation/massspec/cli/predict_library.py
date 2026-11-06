@@ -73,7 +73,9 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
         help=(
             "re-predict an existing library's exact precursors under a "
             "different model/energy (e.g. an HCD-built panel under a CID "
-            "model)"
+            "model); the result is that library with the predictions put "
+            "onto it, so its decoys and provenance (a search space's spans "
+            "and modifications) are kept"
         ),
     )
     koina.add_argument(
@@ -511,7 +513,7 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
     import sys as _sys
 
     from constellation import __version__ as constellation_version
-    from constellation.massspec.library import save_library
+    from constellation.massspec.library import load_library, save_library
     from constellation.massspec.library.digest import (
         precursors_from_fasta,
         precursors_from_library,
@@ -544,6 +546,7 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
         )
         return 1
 
+    source_library = None
     sources = [args.fasta, args.peptides, args.from_library]
     if sum(s is not None for s in sources) != 1:
         print(
@@ -603,7 +606,8 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
             )
             source = str(Path(args.peptides).resolve())
         else:
-            specs = precursors_from_library(args.from_library)
+            source_library = load_library(args.from_library)
+            specs = precursors_from_library(source_library)
             source = str(Path(args.from_library).resolve())
     except (OSError, ValueError) as exc:
         print(f"error: could not build precursor list: {exc}", file=_sys.stderr)
@@ -665,7 +669,8 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
 
         try:
             library, stats = predict_library(
-                specs=specs,
+                specs=specs if source_library is None else None,
+                library=source_library,
                 ms2_model_name=args.ms2_model,
                 rt_model_name=rt_model_name,
                 collision_energy=energy,
@@ -722,6 +727,9 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
                 f"{library.fragments.num_rows} fragments "
                 f"(max m/z deviation {stats.max_abs_ppm_deviation:.3f} ppm)"
             )
+            dropped = getattr(library, "metadata_extras", {}).get("x.koina.precursors_not_predicted")
+            if dropped:
+                print(f"  {label}{dropped} of the library's precursors could not be predicted and are left out")
 
     manifest = {
         "tool": "constellation massspec predict-library",

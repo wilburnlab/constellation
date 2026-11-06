@@ -18,10 +18,11 @@ applied one layer up in :mod:`sequencing.assembly.hifiasm`.
 
 from __future__ import annotations
 
-import gzip
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from constellation.core.io.text import open_text
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,11 +37,8 @@ class GfaContig:
     circular: bool | None
 
 
-def _open_text(path: Path) -> Any:
-    """Open a (optionally gzipped) text file — mirrors readers/fastx.py."""
-    if path.suffix == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8")
-    return path.open("r", encoding="utf-8")
+#: gzip-aware text opener, shared (``constellation.core.io.text``).
+_open_text = open_text
 
 
 def _parse_tags(fields: list[str]) -> dict[str, Any]:

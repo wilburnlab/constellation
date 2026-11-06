@@ -26,6 +26,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+# Aliased: the writers below take a ``write_fasta`` flag.
+from constellation.core.io.fasta import write_fasta as _write_fasta
 from constellation.sequencing.schemas.transcriptome import (
     CLUSTER_MEMBERSHIP_TABLE,
     TRANSCRIPT_CLUSTER_TABLE,
@@ -341,14 +343,14 @@ def write_em_outputs(
         cids = clusters.column("cluster_id").to_pylist()
         cons = clusters.column("consensus_sequence").to_pylist()
         paths["fasta"] = output_dir / "cluster.fa"
-        _write_fasta(paths["fasta"], [f"cluster_{c}" for c in cids], cons)
+        _write_fasta(paths["fasta"], cons, [f"cluster_{c}" for c in cids], skip_empty=True)
 
         prot = clusters.column("predicted_protein").to_pylist()
         named = [(f"cluster_{c}", p) for c, p in zip(cids, prot) if p]
         if named:
             paths["proteins"] = output_dir / "proteins.fasta"
             _write_fasta(
-                paths["proteins"], [n for n, _ in named], [p for _, p in named]
+                paths["proteins"], [p for _, p in named], [n for n, _ in named], skip_empty=True
             )
     return paths
 
@@ -469,13 +471,6 @@ def write_em_manifest(
         samples=samples,
     )
     return Path(output_dir) / "manifest.json"
-
-
-def _write_fasta(path: Path, names, seqs) -> None:
-    with Path(path).open("w", encoding="utf-8") as fh:
-        for name, seq in zip(names, seqs):
-            if seq:
-                fh.write(f">{name}\n{seq}\n")
 
 
 __all__ = [

@@ -124,10 +124,6 @@ def test_a_neutral_envelope_put_at_a_charge_is_the_charged_envelope(mode, modseq
     from constellation.massspec.peptide.envelope import envelope_mz, neutral_envelope
 
     pf = parse_proforma(modseq)
-    if pf.global_isotopes and mode == "exact":
-        with pytest.raises(NotImplementedError):
-            neutral_envelope(pf, mode=mode)
-        return
     masses, ab = neutral_envelope(pf, n_peaks=4, mode=mode)
     for z in (1, 2, 3, 4):
         mz, ab_z = peptide_envelope(pf, charge=z, n_peaks=4, mode=mode)
