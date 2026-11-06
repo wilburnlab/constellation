@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -63,13 +64,21 @@ def _sentinel_to_null(
 
 
 def _attach_modseq(precursors: pa.Table, peptides: pa.Table | None) -> pa.Table:
-    """Left-join ``modified_sequence`` from a peptide table onto precursors."""
+    """Left-join ``modified_sequence`` (and ``is_decoy`` where the peptide
+    table has it) from a peptide table onto precursors, keeping the
+    precursors' order: query numbers downstream are row positions, and
+    ``Table.join`` does not promise an order."""
     if peptides is None or "modified_sequence" not in peptides.column_names:
         return precursors.append_column(
             "modified_sequence", pa.nulls(precursors.num_rows, pa.string())
         )
-    pep = peptides.select(["peptide_id", "modified_sequence"])
-    return precursors.join(pep, keys="peptide_id", join_type="left outer")
+    cols = ["peptide_id", "modified_sequence"] + (["is_decoy"] if "is_decoy" in peptides.column_names else [])
+    pep = peptides.select(cols)
+    row = "__row__"
+    joined = precursors.append_column(row, pa.array(np.arange(precursors.num_rows, dtype=np.int64))).join(
+        pep, keys="peptide_id", join_type="left outer"
+    )
+    return joined.take(pc.sort_indices(joined.column(row))).drop_columns([row])
 
 
 def targets_from_library(library: object) -> pa.Table:
@@ -91,6 +100,7 @@ def targets_from_library(library: object) -> pa.Table:
             "rt_center": _sentinel_to_null(joined.column("rt_predicted")),
             "precursor_id": joined.column("precursor_id"),
             "peptide_id": joined.column("peptide_id"),
+            **({"is_decoy": joined.column("is_decoy")} if "is_decoy" in joined.column_names else {}),
         }
     )
     return cast_to_schema(out, XIC_TARGET_TABLE)

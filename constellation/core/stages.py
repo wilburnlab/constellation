@@ -64,6 +64,17 @@ def input_identity(paths: Iterable[Path | str]) -> list[str]:
     return out
 
 
+def file_sha256(path: Path | str) -> str:
+    """The SHA-256 of a file's bytes, read in 1 MiB blocks: what identifies
+    an input (a FASTA, a library) across machines, where ``input_identity``
+    only notices a change on this one."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 def recorded_key(stage_dir: Path | str) -> str | None:
     """The key a finished stage recorded: ``None`` when the stage has no
     marker, ``""`` when it has one that carries no key."""
@@ -101,6 +112,7 @@ def mark_done(stage_dir: Path | str, key: str | None = None) -> None:
 
 __all__ = [
     "SUCCESS_MARKER",
+    "file_sha256",
     "input_identity",
     "invalidate",
     "is_done",

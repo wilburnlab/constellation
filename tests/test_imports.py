@@ -88,10 +88,13 @@ import constellation.massspec.annotation
 import constellation.massspec.annotation.mzpaf
 import constellation.massspec.annotation.usi
 import constellation.massspec.library
+import constellation.massspec.library.decoys
 import constellation.massspec.library.ids
 import constellation.massspec.library.io
 import constellation.massspec.library.library
 import constellation.massspec.library.schemas
+import constellation.massspec.library.search_space
+import constellation.massspec.cli.search_space
 import constellation.massspec.io
 import constellation.massspec.io.encyclopedia
 import constellation.massspec.io.maxquant

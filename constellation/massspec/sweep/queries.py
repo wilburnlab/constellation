@@ -155,6 +155,7 @@ class QueryPlan:
                 ),
                 "precursor_id": t.column("precursor_id"),
                 "peptide_id": t.column("peptide_id"),
+                "is_decoy": t.column("is_decoy"),
             },
             schema=SWEEP_QUERY_TABLE,
         )
@@ -186,6 +187,7 @@ class QueryPlan:
                     "precursor_mz": queries.column("precursor_mz"),
                     "precursor_id": queries.column("precursor_id"),
                     "peptide_id": queries.column("peptide_id"),
+                    "is_decoy": queries.column("is_decoy"),
                 }
             ),
             XIC_TARGET_TABLE,

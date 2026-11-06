@@ -138,6 +138,7 @@ def test_validate_rejects_duplicate_protein_id() -> None:
             "accession": ["A", "B"],
             "sequence": ["M", "M"],
             "description": pa.array([None, None], type=pa.string()),
+            "is_decoy": pa.array([None, None], type=pa.bool_()),
         },
         schema=PROTEIN_TABLE,
     )

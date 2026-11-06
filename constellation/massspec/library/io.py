@@ -130,6 +130,16 @@ _PARQUET_TABLES = (
     "protein_peptide",
 )
 
+#: How a library built from a FASTA records how each peptide was made.
+#: Written only when not empty, and read as empty when absent, so a
+#: directory from before 2026-11-05 (or of a library read from a file)
+#: is what it was.
+_OPTIONAL_TABLES = (
+    "peptide_spans",
+    "span_peptide",
+    "peptide_modifications",
+)
+
 
 # Sentinel embedded into manifest.json in place of a pa.Table value —
 # the reader recognises this shape and rehydrates the table from the
@@ -191,11 +201,20 @@ class ParquetDirWriter:
 
     def write(self, library: Library, path: Path, **opts: Any) -> None:
         path.mkdir(parents=True, exist_ok=True)
+        written = list(_PARQUET_TABLES)
         for name in _PARQUET_TABLES:
             pq.write_table(getattr(library, name), path / f"{name}.parquet")
+        for name in _OPTIONAL_TABLES:
+            table = getattr(library, name)
+            target = path / f"{name}.parquet"
+            if table.num_rows:
+                pq.write_table(table, target)
+                written.append(name)
+            else:
+                target.unlink(missing_ok=True)  # not a stale one from a rewrite
         manifest = {
             "format": self.format_name,
-            "tables": list(_PARQUET_TABLES),
+            "tables": written,
             "metadata": _encode_metadata_for_manifest(
                 library.metadata_extras, path
             ),
@@ -216,12 +235,18 @@ class ParquetDirReader:
             name: pq.read_table(path / f"{name}.parquet")
             for name in _PARQUET_TABLES
         }
+        optional = {
+            name: pq.read_table(path / f"{name}.parquet")
+            for name in _OPTIONAL_TABLES
+            if (path / f"{name}.parquet").exists()
+        }
         return Library(
             proteins=tables["proteins"],
             peptides=tables["peptides"],
             precursors=tables["precursors"],
             fragments=tables["fragments"],
             protein_peptide=tables["protein_peptide"],
+            **optional,
             metadata_extras=_decode_metadata_from_manifest(
                 manifest.get("metadata", {}), path
             ),

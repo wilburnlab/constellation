@@ -19,7 +19,8 @@ import pyarrow as pa
 from constellation.core.io.schemas import register_schema
 
 #: 2 (2026-11-04): the vocabulary renames (ion → channel, peak → point).
-SWEEP_SCHEMA_VERSION: int = 2
+#: 3 (2026-11-05): ``is_decoy`` on queries and the query summary.
+SWEEP_SCHEMA_VERSION: int = 3
 
 
 def _meta(name: str) -> dict[bytes, bytes]:
@@ -46,6 +47,8 @@ SWEEP_QUERY_TABLE: pa.Schema = pa.schema(
         pa.field("assigned_scan", pa.int32(), nullable=True),
         pa.field("precursor_id", pa.int64(), nullable=True),
         pa.field("peptide_id", pa.int64(), nullable=True),
+        # The target's decoy flag; null where its source did not say.
+        pa.field("is_decoy", pa.bool_(), nullable=True),
     ],
     metadata=_meta("SweepQuery"),
 )
@@ -153,6 +156,8 @@ SWEEP_QUERY_SUMMARY_TABLE: pa.Schema = pa.schema(
         pa.field("query", pa.int32(), nullable=False),
         pa.field("modified_sequence", pa.string(), nullable=True),
         pa.field("precursor_charge", pa.int8(), nullable=True),
+        # Null where the target's source did not say (a decoy rate needs it).
+        pa.field("is_decoy", pa.bool_(), nullable=True),
         # The evidence gate's verdict; null without a gate.
         pa.field("gate_applicable", pa.bool_(), nullable=True),
         pa.field("passed", pa.bool_(), nullable=True),

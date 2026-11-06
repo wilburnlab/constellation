@@ -156,9 +156,15 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
     ms1g = p.add_argument_group("MS1 precursor-isotope options (with --level 1 or both)")
     ms1g.add_argument("--n-isotopes", type=int, default=_DEFAULT_N_ISOTOPES,
                       help="Isotope peaks M+0..M+(n-1) (default 3).")
-    ms1g.add_argument("--charge-range", type=int, nargs=2, metavar=("LO", "HI"),
-                      default=list(_DEFAULT_CHARGE_RANGE),
-                      help="Precursor charge sweep (default 1 4).")
+    ms1g.add_argument("--charge-range", type=int, nargs=2, metavar=("LO", "HI"), default=None,
+                      help="Precursor charge sweep: every target is matched in MS1 at each "
+                           "charge LO..HI (default 1 4). Counter models a peptide across "
+                           "charges and wants this.")
+    ms1g.add_argument("--own-charge", action="store_true",
+                      help="Match each target in MS1 at its own charge only: one query per "
+                           "precursor and no copies of a peptide's MS1 channels across its "
+                           "precursors (what a search space's targets want). Every target "
+                           "needs a charge.")
 
     ms2g = p.add_argument_group("MS2 fragment options (with --level 2 or both)")
     ms2g.add_argument("--ion-types", default="b,y",
@@ -268,7 +274,16 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
 
     _warn_level_flag_mismatch(args)
     targets = load_targets(args.targets)
-    charge_range = tuple(args.charge_range)
+    if args.own_charge and args.charge_range is not None:
+        print("error: --own-charge and --charge-range contradict each other", file=sys.stderr)
+        return 2
+    charge_range = None if args.own_charge else tuple(args.charge_range or _DEFAULT_CHARGE_RANGE)
+    if args.own_charge and 1 in levels:
+        missing = targets.column("precursor_charge").null_count
+        if missing:
+            print(f"error: --own-charge needs every target's charge; {missing} have none",
+                  file=sys.stderr)  # fmt: skip
+            return 2
     ion_types = _resolve_ion_types(args.ion_types)
     neutral_losses = _parse_downcast(args.neutral_losses) if args.neutral_losses else None
 
@@ -407,5 +422,5 @@ def _warn_level_flag_mismatch(args: argparse.Namespace) -> None:
                 or args.neutral_losses or args.assigned_scans_only:
             print("warning: MS2 fragment options ignored with --level 1", file=sys.stderr)
     elif args.level == "2":
-        if args.n_isotopes != _DEFAULT_N_ISOTOPES or tuple(args.charge_range) != _DEFAULT_CHARGE_RANGE:
+        if args.n_isotopes != _DEFAULT_N_ISOTOPES or args.charge_range is not None or args.own_charge:
             print("warning: MS1 isotope options ignored with --level 2", file=sys.stderr)

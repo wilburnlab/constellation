@@ -72,6 +72,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from constellation.core.chem.modifications import UNIMOD, ModVocab
+from constellation.core.io.schemas import cast_to_schema
 from constellation.core.sequence.proforma import Peptidoform, format_proforma
 from constellation.massspec.acquisitions import ACQUISITION_TABLE, Acquisitions
 from constellation.massspec.io.encyclopedia import _mirror
@@ -557,14 +558,16 @@ def project_library_file(
         accession_code, accessions = _codes(links.column("ProteinAccession"))
         protein_of_link, first_link = _first_occurrence_ids(accession_code)
         accessions_in_order = [accessions[accession_code[i]] for i in first_link]
-        proteins = pa.table(
-            {
-                "protein_id": pa.array(np.arange(len(accessions_in_order)), type=pa.int64()),
-                "accession": pa.array(accessions_in_order, type=pa.string()),
-                "sequence": pa.nulls(len(accessions_in_order), type=pa.string()),
-                "description": pa.nulls(len(accessions_in_order), type=pa.string()),
-            },
-            schema=PROTEIN_TABLE,
+        proteins = cast_to_schema(
+            pa.table(
+                {
+                    "protein_id": pa.array(np.arange(len(accessions_in_order)), type=pa.int64()),
+                    "accession": pa.array(accessions_in_order, type=pa.string()),
+                    "sequence": pa.nulls(len(accessions_in_order), type=pa.string()),
+                    "description": pa.nulls(len(accessions_in_order), type=pa.string()),
+                }
+            ),
+            PROTEIN_TABLE,
         )
 
         # ── entries: peptides and precursors ────────────────────────
@@ -596,15 +599,17 @@ def project_library_file(
         peptide_of_row[kept_rows] = peptide_of_kept
         peptide_rows = kept_rows[first_peptide]
         sequences = entries.column("PeptideSeq").to_pylist()
-        peptides = pa.table(
-            {
-                "peptide_id": pa.array(np.arange(len(peptide_rows)), type=pa.int64()),
-                "sequence": pa.array([sequences[r] for r in peptide_rows], type=pa.string()),
-                "modified_sequence": pa.array(
-                    [proforma_of[modseq_of_row[r]] for r in peptide_rows], type=pa.string()
-                ),
-            },
-            schema=PEPTIDE_TABLE,
+        peptides = cast_to_schema(
+            pa.table(
+                {
+                    "peptide_id": pa.array(np.arange(len(peptide_rows)), type=pa.int64()),
+                    "sequence": pa.array([sequences[r] for r in peptide_rows], type=pa.string()),
+                    "modified_sequence": pa.array(
+                        [proforma_of[modseq_of_row[r]] for r in peptide_rows], type=pa.string()
+                    ),
+                }
+            ),
+            PEPTIDE_TABLE,
         )
 
         charges = entries.column("PrecursorCharge").to_numpy(zero_copy_only=False).astype(np.int64)

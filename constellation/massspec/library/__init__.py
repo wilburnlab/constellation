@@ -33,10 +33,13 @@ from constellation.massspec.library.io import (
 from constellation.massspec.library.library import Library, assign_ids
 from constellation.massspec.library.schemas import (
     LIBRARY_FRAGMENT_TABLE,
+    PEPTIDE_MODIFICATION_TABLE,
+    PEPTIDE_SPAN_TABLE,
     PEPTIDE_TABLE,
     PRECURSOR_TABLE,
     PROTEIN_PEPTIDE_EDGE,
     PROTEIN_TABLE,
+    SPAN_PEPTIDE_EDGE,
 )
 
 __all__ = [
@@ -47,6 +50,9 @@ __all__ = [
     "PRECURSOR_TABLE",
     "LIBRARY_FRAGMENT_TABLE",
     "PROTEIN_PEPTIDE_EDGE",
+    "PEPTIDE_SPAN_TABLE",
+    "SPAN_PEPTIDE_EDGE",
+    "PEPTIDE_MODIFICATION_TABLE",
     "LibraryReader",
     "LibraryWriter",
     "LIBRARY_READERS",

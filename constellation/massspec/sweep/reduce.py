@@ -346,6 +346,7 @@ class QuerySummaryReducer:
                 "query": pa.array(q.astype(np.int32)),
                 "modified_sequence": plan.targets.column("modified_sequence").take(query),
                 "precursor_charge": pa.array(charge.astype(np.int8), mask=charge < 0),
+                "is_decoy": plan.targets.column("is_decoy").take(query),
                 "gate_applicable": pa.array(d.applicable if d is not None else np.zeros(n, bool),
                                             mask=none if d is None else None),  # fmt: skip
                 "passed": pa.array(d.passed if d is not None else np.zeros(n, bool),

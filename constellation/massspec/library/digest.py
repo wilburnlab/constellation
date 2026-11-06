@@ -5,14 +5,17 @@ inside ``koina/`` because an in-process PyTorch predictor, or any future
 prediction backend, needs exactly the same enumeration. Nothing here
 knows a network service exists.
 
-The heavy lifting is delegated, not reimplemented — ``cleave`` for
-digestion, ``enumerate_modforms`` for the fixed/variable mod grid, and
-``precursor_mz`` for the charge sweep.
+A FASTA is enumerated by :mod:`constellation.massspec.library.search_space`,
+the package's one enumerator (2026-11-05); :func:`precursors_from_fasta` is
+a projection of the :class:`~constellation.massspec.library.Library` it
+builds into the flat ``PrecursorSpec`` list a predictor works from. The
+peptide-list and library paths parse what they are given and compute m/z
+with ``precursor_mz``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,7 +23,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from constellation.core.chem.modifications import UNIMOD, ModVocab
-from constellation.core.sequence.protein import cleave, enumerate_modforms
 from constellation.core.sequence.proforma import format_proforma, parse_proforma
 from constellation.massspec.peptide.mz import precursor_mz
 
@@ -39,34 +41,6 @@ class PrecursorSpec:
     charge: int
     precursor_mz: float
     proteins: tuple[str, ...] = ()  # accessions; empty for orphan peptides
-
-
-def _specs_for_modforms(
-    modforms: Iterable,
-    charges: Sequence[int],
-    *,
-    min_mz: float,
-    max_mz: float,
-    proteins: tuple[str, ...],
-    vocab: ModVocab,
-) -> list[PrecursorSpec]:
-    out: list[PrecursorSpec] = []
-    for form in modforms:
-        modseq = format_proforma(form)
-        for z in charges:
-            mz = precursor_mz(form, charge=z, vocab=vocab)
-            if not (min_mz <= mz <= max_mz):
-                continue
-            out.append(
-                PrecursorSpec(
-                    modified_sequence=modseq,
-                    sequence=form.sequence,
-                    charge=z,
-                    precursor_mz=mz,
-                    proteins=proteins,
-                )
-            )
-    return out
 
 
 def precursors_from_fasta(
@@ -91,47 +65,70 @@ def precursors_from_fasta(
     parent accession, matching ``PROTEIN_PEPTIDE_EDGE``'s M:N semantics —
     predicting the same peptidoform once per protein would be wasted
     inference and would break the Library's PK uniqueness.
+
+    The search space of ``fasta`` with no decoys and no budget
+    (:func:`~constellation.massspec.library.search_space.build_search_space`),
+    flattened: one spec per precursor, in the order the search space holds
+    them, ``proteins`` each peptide's accessions in FASTA order. A
+    modification is placed only where UNIMOD lists it, and a peptide with a
+    residue outside the 20 is left out (it has no mass).
     """
-    from constellation.massspec.search.novel import read_fasta_proteins
+    from constellation.massspec.library.search_space import (
+        Digestion,
+        SearchSpaceSettings,
+        build_search_space,
+        rules_from_mapping,
+    )
 
-    table = read_fasta_proteins(fasta)
-    accessions = table.column("protein_id").to_pylist()
-    sequences = table.column("sequence").to_pylist()
-
-    # peptide sequence → the accessions it came from, first-seen order.
-    peptide_proteins: dict[str, list[str]] = {}
-    for accession, protein_seq in zip(accessions, sequences, strict=True):
-        peptides = cleave(
-            protein_seq,
-            protease,
+    settings = SearchSpaceSettings(
+        digestion=Digestion(
+            protease=protease,
             missed_cleavages=missed_cleavages,
             min_length=min_length,
             max_length=max_length,
             excise_initiator_met=excise_initiator_met,
-            validate_alphabet=False,
-        )
-        for peptide in peptides:
-            owners = peptide_proteins.setdefault(peptide, [])
-            if accession not in owners:
-                owners.append(accession)
+        ),
+        rules=rules_from_mapping(fixed_mods, variable_mods, vocab=vocab),
+        max_variable=max_variable_mods,
+        charges=tuple(charges),
+        min_mz=min_mz,
+        max_mz=max_mz,
+        decoys=(),
+        max_peptidoforms=None,
+        max_precursors=None,
+    )
+    library = build_search_space([fasta], settings, vocab=vocab)
+    assert not isinstance(library, dict)
+    return _specs_from_library(library)
 
+
+def _specs_from_library(library) -> list[PrecursorSpec]:
+    accession_of = dict(
+        zip(library.proteins.column("protein_id").to_pylist(), library.proteins.column("accession").to_pylist(), strict=True)
+    )
+    proteins_of: dict[int, list[str]] = {}
+    for protein, peptide in zip(
+        library.protein_peptide.column("protein_id").to_pylist(),
+        library.protein_peptide.column("peptide_id").to_pylist(),
+        strict=True,
+    ):
+        owners = proteins_of.setdefault(peptide, [])
+        acc = accession_of[protein]
+        if acc not in owners:
+            owners.append(acc)
+    peptide_rows = {
+        r["peptide_id"]: r for r in library.peptides.select(["peptide_id", "sequence", "modified_sequence"]).to_pylist()
+    }
     specs: list[PrecursorSpec] = []
-    for peptide, owners in peptide_proteins.items():
-        modforms = enumerate_modforms(
-            peptide,
-            fixed=fixed_mods,
-            variable=variable_mods,
-            max_variable=max_variable_mods,
-            vocab=vocab,
-        )
-        specs.extend(
-            _specs_for_modforms(
-                modforms,
-                charges,
-                min_mz=min_mz,
-                max_mz=max_mz,
-                proteins=tuple(owners),
-                vocab=vocab,
+    for r in library.precursors.select(["peptide_id", "charge", "precursor_mz"]).to_pylist():
+        pep = peptide_rows[r["peptide_id"]]
+        specs.append(
+            PrecursorSpec(
+                modified_sequence=pep["modified_sequence"],
+                sequence=pep["sequence"],
+                charge=int(r["charge"]),
+                precursor_mz=float(r["precursor_mz"]),
+                proteins=tuple(proteins_of.get(r["peptide_id"], ())),
             )
         )
     return specs
