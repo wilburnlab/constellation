@@ -34,7 +34,7 @@ behind `constellation massspec search-space`. The output is a library directory 
 | digestion | `PEPTIDE_SPAN_TABLE` (new) | (protein_id, start, end) | sequence, missed cleavages, `n_term` / `c_term` ∈ {enzyme, protein, nonspecific}, flanking residues |
 | modification | `SPAN_PEPTIDE_EDGE` (new) | (span, peptide_id) | which spans can make which peptidoform |
 | | `PEPTIDE_TABLE` (+ `is_decoy`, `decoy_of`, `decoy_set`) | canonical ProForma (content id) | sequence, modified_sequence |
-| | `PEPTIDE_MODIFICATION_TABLE` (new) | (peptide_id, site, modification) | position or terminus, UNIMOD accession or isotope, origin (fixed / variable / label), the rule |
+| | `PEPTIDE_MODIFICATION_TABLE` (new) | (peptide_id, site, modification, origin, rule) | position or terminus, UNIMOD accession or isotope, origin (fixed / variable / label), the rule; a form two paths make by different rules has a row for each |
 | charge | `PRECURSOR_TABLE` | peptide key + charge (content id) | charge, m/z |
 | fragment | none | — | compiled by the sweep (`compile_queries`) into `SWEEP_CHANNEL_TABLE` |
 
@@ -46,7 +46,9 @@ serves any fragmentation settings.
   protein's first residue, the residue after an initiator Met, or a declared mature-chain start
   (`--protein-terminus P02769=25-607`).
 - Isotope labels are a modification axis: light and heavy forms of a protein's peptides are
-  linked to the same spans.
+  linked to the same spans. A label (`<13C><15N>`) covers the peptide chain, its residues and
+  termini: atoms a modification adds are natural (light iodoacetamide on a labelled protein) and
+  atoms it removes come off the labelled chain (PI, 2026-11-05; "Review by Codex" below).
 
 ### Rules
 
@@ -58,7 +60,26 @@ serves any fragmentation settings.
 - **Placement:** a rule places its modification only where UNIMOD lists it
   (`enumerate_modforms(skip_unlicensed=True)`), so one rule set applies across every peptide:
   pyro-Glu goes on an N-terminal Q and nowhere else.
-- **Refusals:** a rule naming a site UNIMOD never lists (`Oxidation@A`) is refused.
+- **One modification per slot, and what may share one:** a residue carries one chemical
+  modification and, beside it, at most one isotopic substitution (SILAC lysine or arginine, which
+  makes the residue's own atoms heavier and leaves its amine free), so heavy lysine has its
+  acetylated form. An N-terminal cyclization of the first residue's side chain (UNIMOD:26 from C,
+  27 from E, 28 from Q, each defined from the unmodified residue) replaces that residue's chemical
+  modification rather than adding to it: with carbamidomethyl fixed, the cyclized form is
+  `[UNIMOD:26]-C…`, not `[UNIMOD:26]-C[UNIMOD:4]…`.
+- **Refusals:**
+  - a rule naming a site UNIMOD never lists (`Oxidation@A`);
+  - two fixed rules that would put different modifications on one slot of some peptide (an
+    `N-term` and a `Protein N-term` rule both licensed for its first residue), which is a
+    contradiction, not a precedence; rules on different residues pass (pyro-Glu from Q and from E);
+  - a modification that is one end of a link between residues (half a disulfide, UNIMOD:374; an
+    intact crosslinker, "Intact … crosslinker"), since a search space holds linear peptidoforms
+    and linked species are not generated; quenched monolinks pass;
+  - isotopic-substitution rules together with whole-protein labels, which would label one
+    residue's atoms twice;
+  - a label with two isotopes of one element (`33S,34S`) or an isotope the element lacks; `D`
+    and `2H` are one label (written `2H`);
+  - a `--protein-terminus` naming no protein given.
 
 ### Decoys (`massspec.library.decoys`, `DECOY_METHODS`)
 
@@ -75,8 +96,9 @@ the target's composition, precursor m/z and isolation windows.
 
 **Collisions and seeding.** A candidate whose I/L-normalised sequence is a target's falls back as
 EncyclopeDIA does: to seeded terminal-preserving shuffles, and the pair is dropped if none
-qualifies. Seeding by sequence makes a set independent of input order and gives all forms of a
-peptide one decoy sequence.
+qualifies. Seeding by sequence, and settling sequences in sorted order (two can propose one
+decoy), make a set independent of input order and give all forms of a peptide one decoy sequence.
+A reversed protein's peptide that is a target's under I/L is dropped too, and counted.
 
 **Sets.** Set 0 competes with the targets; sets 1 and up are extra or entrapment sets.
 `--decoys METHOD[:sets=N][:seed=S]` is repeatable.
@@ -88,7 +110,10 @@ which gave modified and labelled targets no decoys.
 ### Budgets
 
 - The number of peptidoforms is counted before any is built (`count_modforms`, a DP over the
-  enumeration's slots; an upper bound, since a form made by two contexts counts twice).
+  enumeration's slots, polynomial in their number: thirty methionines with oxidation count to
+  2^30 at once; an upper bound, since a form made by two contexts counts twice). Enumeration
+  under a per-modification limit refuses a choice before extending it, so its work is
+  proportional to what it returns.
 - The number of precursors is counted before any table is built.
 - Over either budget, the build raises with the counts rather than truncating.
 - `--count` prints every stage's count and writes nothing.
@@ -204,6 +229,36 @@ through unchanged.
 - **The frozen pipeline's own FASTA writers** in `transcriptome_to_proteome.py` are left to its
   revision.
 
+## Review by Codex (2026-11-05), and what was done
+
+The branch was reviewed independently ([docs/reviews/search-space-2026-11-05.md](../reviews/search-space-2026-11-05.md)),
+with a regression suite of 125 cases (`tests/test_search_space_review.py`), 21 of them strict
+expected failures reproducing twelve defects and one inherited limitation. All 21 are fixed and the
+markers removed.
+
+| | Finding | Done |
+|---|---|---|
+| R1 | A protein's ¹³C/¹⁵N label also labelled the atoms a reagent added (light carbamidomethyl came out 3.0037 Da heavy per cysteine) | A global label covers the chain (the PI's choice of three options, 2026-11-05). ProForma 2.0 §4.6 reads `<13C>` as "13C on all residues" and Formula Rule 3 gives an atom with no isotope stated the natural distribution, so a modification's added atoms are natural; the atoms it removes come off the labelled chain (deamidation and pyro-Glu lose a ¹⁵N). `core.sequence.protein.labelled_compositions` says which atoms a label covers, and precursor mass, fragment ladders (neutral losses included: an NH₃ lost from a ¹⁵N fragment is ¹⁵NH₃) and envelopes all use it. Limitation: a PTM made in vivo from labelled metabolites is computed light; such a form would need an explicit labelled formula. |
+| R2 | Fixed SILAC lysine hid variable lysine modifications | `Modification.is_isotopic_substitution` (a mass override over an empty skeleton): a residue holds one chemical modification and one isotopic substitution beside it |
+| R3 | Fixed carbamidomethyl plus UNIMOD:26 counted the carbamidomethyl twice | `SIDE_CHAIN_CYCLIZATIONS` (UNIMOD:26, 27, 28) replace the first residue's chemical modification; a deamidated Q is no longer also Gln→pyro-Glu |
+| R4 | Half disulfides and intact crosslinkers were placed as one-residue modifications | Refused at the rule, monolinks kept |
+| R5 | Counting without limits visited every combination (2^30 for thirty methionines); a limit filtered after enumerating | The count is always the DP; enumeration under a limit (or a cyclization guard) is a depth-first walk that refuses a choice before extending it, sorted into the old order; with neither it is `itertools` as before. The same speed per form as before on BSA (4.6 µs at two modifications), and whole builds take the same time |
+| R6 | `predict-library --from-library` rebuilt a flat library, losing decoy flags and provenance | `predict_library(library=...)` and the CLI put the predictions onto the source library (`library.attach_predictions`, `Library.subset_precursors`): decoys, spans and modification rows survive; a precursor the model cannot take is left out with what only it needed (a decoy with its target), and counted |
+| R7 | `Acetyl@Protein N-term` and `Dimethyl@N-term`, both fixed, overwrote each other in rule order | Refused where both are licensed for a residue; refused in `enumerate_modforms` too if two fixed modifications meet on a slot |
+| R8 | Reversed-protein decoys could equal targets under I/L | Dropped and counted, as peptide-level collisions are |
+| R9 | Shuffle collisions were resolved in FASTA order | Settled in sorted sequence order |
+| R10 | An unmatched `--protein-terminus` was ignored | Refused |
+| R11 | `D,2H` applied deuterium twice; `33S,34S` both applied | Labels normalised (`D` → `2H`), deduplicated, one isotope per element, checked against the element's isotopes |
+| R12 | A form two paths make by different rules kept only the first path's origin | A modification row per (site, modification, origin, rule) |
+| G1 | A labelled molecule's envelope gave its labelled atoms natural variance | The envelope varies over the unlabelled atoms only and is moved to the labelled mass, in binned and exact mode (exact mode used to refuse labels) |
+
+Also from the review: the comment calling UNIMOD:259 the ¹³C₆-only label is corrected (that is
+UNIMOD:188; 259 is ¹³C₆¹⁵N₂ lysine). The review's remaining-coverage list (partial incorporation,
+modification-dependent cleavage, linked species, non-canonical residues, adducts, empirical
+small-panel controls) is carried into "Still to do". Found while fixing it, not fixed: the
+canonical peptide key keeps `<D>` and `<2H>` apart, so one molecule spelled both ways gets two
+ids (the search space now writes `2H`).
+
 ## Measurements (2026-11-05, this machine)
 
 - **Per form, after this work:**
@@ -243,6 +298,12 @@ process.
   pseudo-reverse with the C-terminus fixed. Every target now has its EncyclopeDIA-style decoy, and
   modified and labelled decoys pass at about the rate unmodified ones do.
 
+*After the review's fixes* (same command, 2 min 48 s, at most 3.0 GB a process): the search space
+has the same counts, and 231 targets and 34 decoys pass. Seven verdicts changed, all on labelled
+lysin peptides with a carbamidomethylated cysteine, which are now 3.0037 Da lighter per cysteine
+(R1): one target (`<13C><15N>KLLVLC[UNIMOD:4]IFAMMATLAM[UNIMOD:35]SR/3`, from lysin's signal
+peptide) newly passes, and three decoys pass in place of three others. Nothing else moved.
+
 *Both levels with `--own-charge`* (MS1 at 0.5 Da): 5 min 33 s.
 - It gives the same verdicts, since the gate reads MS2 only.
 - MS1 adds 10.8M trace rows, one charge per precursor. With the default `charge_range` (1, 4),
@@ -267,7 +328,13 @@ process.
   carried into the protein table.
 - **Open searches:** unlocalised mass-offset targets (`[+Δ]?SEQ`, MS1 only); precursor-level losses
   and adducts.
-- **Predict-library:** carry the graph tables through `predict-library --from-library`.
+- **Linked species:** intrachain disulfides (pairs of UNIMOD:374 within one peptide), cross-links
+  and linked chains, each with its fragmentation. Refused until then.
+- **Partial isotope incorporation** (a distribution of labelled atoms; ProForma 2.0 §5.6 does not
+  represent it either), and SILAC's heavy atoms taken out of an envelope's variance (UNIMOD stores
+  no per-atom isotopes for them).
+- **Modification-dependent cleavage** (an acetylated lysine trypsin does not cut): digestion
+  precedes modification, and missed cleavages count unmodified sites.
 - **Proteome scale:** partitioned search-space output, a change to `Library`'s storage contract,
   wanted together with the sweep's P7 (query compilation without the per-target loop, which could
   read these tables directly).
