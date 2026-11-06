@@ -66,6 +66,19 @@ class OneIonClient:
         }
 
 
+class LossClient(OneIonClient):
+    """A fragment model whose answers include neutral losses."""
+
+    def predict(self, arrays, *, min_intensity=1e-4, **_):
+        self.calls += 1
+        n = len(np.asarray(arrays["peptide_sequences"]).ravel())
+        return {
+            "intensities": np.tile([1.0, 0.5, 0.25], (n, 1)),
+            "mz": np.zeros((n, 3)),
+            "annotation": np.tile(np.array(["y1+1", "y3-H2O+1", "b2-NH3+1"], dtype=object), (n, 1)),
+        }
+
+
 def _requests(specs) -> Requests:
     peptides = sorted({s.modified_sequence for s in specs})
     index = {p: i for i, p in enumerate(peptides)}
@@ -152,6 +165,29 @@ def test_a_labelled_search_space_goes_through_koina(tmp_path):
     assert heavy and all(f["mz_theoretical"] > light[(peptides[f["peptide_id"]][10:], f["ion_type"])] for f in heavy
                          if (peptides[f["peptide_id"]][10:], f["ion_type"]) in light)
     assert stats.n_fragments == out.fragments.num_rows == 2 * out.precursors.num_rows
+
+
+def test_fragments_with_neutral_losses_are_assembled(tmp_path):
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.massspec.peptide.ions import fragment_ladder_arrays_batch
+    from constellation.massspec.peptide.neutral_losses import LOSS_REGISTRY
+
+    lib = _search_space(tmp_path, labels=(("P1", ()), ("P1", ("13C", "15N"))))
+    out, stats = predict_library(library=lib, ms2_client=LossClient(), rt_model_name=None, collision_energy=30.0)
+    assert out.precursors.num_rows == lib.precursors.num_rows
+    frags = out.fragments.join(out.precursors.select(["precursor_id", "peptide_id"]), keys="precursor_id")
+    frags = frags.join(out.peptides.select(["peptide_id", "modified_sequence"]), keys="peptide_id").to_pylist()
+    assert {f["loss_id"] for f in frags} == {None, "H2O", "NH3"}
+    shift = {"H2O": 0.0, "NH3": 0.997034886}  # what a 13C/15N chain adds to the loss
+    for f in frags:
+        if f["loss_id"] is None:
+            continue
+        ladder = fragment_ladder_arrays_batch([parse_proforma(f["modified_sequence"])], max_fragment_charge=1)
+        intact = ladder.mz[(ladder.ion_type == f["ion_type"]) & (ladder.position == f["position"])][0]
+        heavy = f["modified_sequence"].startswith("<13C><15N>")
+        lost = LOSS_REGISTRY.get(f["loss_id"]).delta_mass + (shift[f["loss_id"]] if heavy else 0.0)
+        assert f["mz_theoretical"] == pytest.approx(intact - lost, abs=1e-6)
+    assert stats.n_fragments == out.fragments.num_rows == 3 * out.precursors.num_rows
 
 
 def test_error_mode_refuses_before_any_request_and_skip_drops_pairs(tmp_path):
@@ -247,3 +283,23 @@ def test_the_cli_mixes_models(offline, tmp_path):
 def test_the_cli_refuses_unclear_model_choices(offline, tmp_path, capsys, argv, message):
     assert _run("--backend", "jchronologer", "--from-library", str(tmp_path), "--output-dir", str(tmp_path / "o"), *argv) == 1
     assert message in capsys.readouterr().err
+
+
+def test_the_koina_backend_replaces_only_its_own_export(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(koina_client, "_CLIENT_FACTORY", lambda model, **_: OneIonClient())
+    path = tmp_path / "ss"
+    save_library(_search_space(tmp_path), path, format="parquet_dir")
+    out, dlib = tmp_path / "out", tmp_path / "lib.dlib"
+    base = ("--backend", "koina", "--from-library", str(path), "--output-dir", str(out), "--no-progress",
+            "--rt-model", "none")
+    assert _run(*base, "--output-dlib", str(dlib)) == 0
+    # Other settings, resumed: its own export is replaced (it used to stop at the end on FileExistsError).
+    assert _run(*base, "--output-dlib", str(dlib), "--collision-energy", "25", "--resume") == 0
+    assert load_library(dlib).precursors.num_rows > 0
+    # A file it did not write is refused before anything is predicted, and left alone.
+    foreign = tmp_path / "foreign.dlib"
+    foreign.write_bytes(b"not ours")
+    key = (out / "_SUCCESS").read_text()
+    assert _run(*base, "--output-dlib", str(foreign), "--collision-energy", "27", "--resume") == 1
+    assert "was not exported from" in capsys.readouterr().err
+    assert foreign.read_bytes() == b"not ours" and (out / "_SUCCESS").read_text() == key

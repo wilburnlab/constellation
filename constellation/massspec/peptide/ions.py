@@ -691,14 +691,16 @@ def _run_linear_batch(
     ion_types: Sequence[IonType],
     max_fragment_charge: int,
     loss_ids: Sequence[str],
+    loss_rules: bool = True,
 ) -> torch.Tensor:
     """Compute a batched theoretical ladder m/z tensor.
 
     All peptidoforms must share the same sequence length and global
     isotope labels (callers group by these). Returns a
     ``(B, n_pos, n_types, n_charges, n_losses)`` ``float64`` tensor
-    with NaN-masked invalid (position, ion_type, loss) combinations.
-    The Arrow-table emission per peptide happens upstream.
+    with NaN-masked invalid (position, ion_type, loss) combinations
+    (with ``loss_rules=False`` nothing is masked: every loss at every
+    bond). The Arrow-table emission per peptide happens upstream.
     """
     if not inputs:
         raise ValueError("inputs must be non-empty")
@@ -775,6 +777,8 @@ def _run_linear_batch(
         + charges_t[None, None, None, :, None] * PROTON_MASS
     ) / charges_t[None, None, None, :, None]
 
+    if not loss_rules:
+        return mz_tensor
     # Batched biochem mask — (B, n_pos, n_types, n_losses)
     loss_mask = _biochem_mask_batched(
         seqs=[inp.seq for inp in inputs],
@@ -1102,12 +1106,19 @@ def fragment_ladder_arrays_batch(
     ion_types: Sequence[IonType] = (IonType.B, IonType.Y),
     max_fragment_charge: int = 1,
     neutral_losses: Sequence[str] | None = None,
+    loss_rules: bool = True,
     vocab: ModVocab = UNIMOD,
 ) -> LadderArrays:
     """:func:`fragment_ladder_indices_batch` as flat arrays, for callers
     that hold many peptides' ions at once (a search's query plan). The same
     tensor math and the same values, without a Python object per ion.
-    Linear peptidoforms only."""
+    Linear peptidoforms only.
+
+    ``loss_rules=False`` gives every loss in ``neutral_losses`` at every
+    bond and ion type, whatever residues and modifications the rules ask
+    for: the m/z of a loss ion someone else has named (a predictor's), so
+    each peptide's rows are a full grid of position × ion type × charge ×
+    loss."""
     if max_fragment_charge < 1:
         raise ValueError(
             f"max_fragment_charge must be ≥ 1; got {max_fragment_charge}"
@@ -1145,6 +1156,7 @@ def fragment_ladder_arrays_batch(
             ion_types=ion_types,
             max_fragment_charge=max_fragment_charge,
             loss_ids=loss_ids,
+            loss_rules=loss_rules,
         )
         finite = torch.isfinite(mz_batch)
         b, p, t, c, lo = (x.numpy() for x in torch.where(finite))

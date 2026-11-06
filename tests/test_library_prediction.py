@@ -35,6 +35,7 @@ from constellation.massspec.library.prediction.base import (
     merge_refusals,
     sites_key,
 )
+from constellation.massspec.library.prediction.assemble import Ladders
 from constellation.massspec.library.prediction.collision_energy import CollisionEnergy
 from constellation.massspec.library.prediction.requests import build_requests, unlabelled_sites
 from constellation.massspec.library.prediction.run import predict_onto
@@ -46,6 +47,7 @@ from constellation.massspec.library.search_space import (
     build_search_space,
 )
 from constellation.massspec.peptide.ions import IonType, fragment_ladder_arrays_batch
+from constellation.massspec.peptide.neutral_losses import LOSS_REGISTRY
 from _jchronologer_fixtures import FakeBundle
 
 
@@ -406,3 +408,37 @@ def test_the_registry_names_and_refuses():
     got = registry.default_predictors("jchronologer", ("fragments", "ccs"), bundle=bundle, threads=2)
     assert set(got) == {"fragments", "ccs"} and got["fragments"].threads == 2
     assert got["ccs"].name == "jchronologer:sculptor"
+
+
+def test_a_named_loss_gets_its_mz_from_the_source_peptide():
+    # y3 of LVNELTEFAK is FAK (bond 6), b2 is LV (bond 1): neither has the
+    # residues the loss rules ask for, and a predictor's loss is kept anyway.
+    ladders = Ladders(["<13C><15N>LVNELTEFAK", "LVNELTEFAK"], (IonType.B, IonType.Y), 2)
+    peptide, ion_type = np.array([0, 0, 1, 1]), np.array([IonType.Y, IonType.B, IonType.Y, IonType.B], np.int8)
+    position, charge = np.array([6, 1, 6, 1]), np.array([1, 1, 2, 1])
+    intact = ladders.mz(peptide, ion_type, position, charge)
+    lossy = ladders.mz(peptide, ion_type, position, charge, np.array([1, 2, 1, 0]), ("H2O", "NH3"))
+    water, ammonia = LOSS_REGISTRY.get("H2O").delta_mass, LOSS_REGISTRY.get("NH3").delta_mass
+    assert lossy[0] == pytest.approx(intact[0] - water, abs=1e-9)  # no C or N in water
+    assert lossy[1] == pytest.approx(intact[1] - ammonia - 0.997034886, abs=1e-6)  # a 15N chain loses 15NH3
+    assert lossy[2] == pytest.approx(intact[2] - water / 2, abs=1e-9)
+    assert lossy[3] == intact[3]
+
+
+def test_predicting_one_property_keeps_the_record_of_the_others(tmp_path):
+    lib = _search_space(tmp_path, PROTEINS)
+    first, _ = predict_onto(lib, {"fragments": FakePredictor("fragments")}, collision_energy=CollisionEnergy.uniform(30.0))
+    second, report = predict_onto(first, {"retention_time": FakePredictor("retention_time")})
+    meta = second.metadata_extras
+    assert meta["x.massspec.prediction.predictors"] == {
+        "fragments": {"backend": "fake", "model": "fragments"},
+        "retention_time": {"backend": "fake", "model": "retention_time"},
+    }
+    assert meta["x.massspec.prediction.collision_energy"]["origin"] == "uniform"
+    assert meta["x.massspec.prediction.rt_scale"] == "fake_seconds"
+    assert second.fragments.equals(first.fragments)
+    assert set(report.predictors) == {"retention_time"}  # the report is this run's
+    # Fragments predicted again, at no energy: the earlier energy no longer describes them.
+    third, _ = predict_onto(second, {"fragments": FakePredictor("fragments")})
+    assert "x.massspec.prediction.collision_energy" not in third.metadata_extras
+    assert third.metadata_extras["x.massspec.prediction.rt_scale"] == "fake_seconds"

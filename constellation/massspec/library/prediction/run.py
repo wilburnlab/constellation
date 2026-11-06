@@ -26,7 +26,8 @@
    place of the source's. A value a predictor did not give (NaN) leaves
    the source's. The library's metadata records which predictor made each
    property, the collision energy per charge, the retention-time scale and
-   the counts (``x.massspec.prediction.*``).
+   the counts (``x.massspec.prediction.*``); a property not predicted here
+   keeps the record of whatever predicted it before.
 
 Deuterium shifts retention time and no model here knows it; such a
 peptide is predicted as its light form (a caveat the report carries when
@@ -43,7 +44,6 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from constellation.core.sequence.proforma import parse_proforma
 from constellation.massspec.library.library import Library
 from constellation.massspec.library.prediction.assemble import Ladders, fragment_table, reported_mz_error_ppm
 from constellation.massspec.library.prediction.base import (
@@ -293,16 +293,36 @@ def predict_onto(
             else []
         ),
     )
-    extras = {
-        **out.metadata_extras,
-        "x.massspec.prediction.predictors": report.predictors,
-        "x.massspec.prediction.report": {k: v for k, v in report.to_dict().items() if k not in ("predictors", "examples")},
-    }
-    if report.collision_energy is not None:
-        extras["x.massspec.prediction.collision_energy"] = report.collision_energy
-    if report.rt_scale is not None:
-        extras["x.massspec.prediction.rt_scale"] = report.rt_scale
+    extras = _metadata(out.metadata_extras, report, predictors)
     return replace(out, precursors=precursors, fragments=fragments, metadata_extras=extras), report
+
+
+def _metadata(source: Mapping[str, Any], report: PredictionReport, predictors: Mapping[str, Predictor]) -> dict[str, Any]:
+    """The source library's metadata with this prediction's added. What
+    made each property is kept property by property: a property predicted
+    here takes this run's predictor (and its collision energy or time
+    scale, or none), one left alone keeps whatever made it before, as its
+    values do."""
+    extras = dict(source)
+    made_by = extras.get("x.massspec.prediction.predictors")
+    extras["x.massspec.prediction.predictors"] = {
+        **(made_by if isinstance(made_by, dict) else {}),
+        **report.predictors,
+    }
+    extras["x.massspec.prediction.report"] = {
+        k: v for k, v in report.to_dict().items() if k not in ("predictors", "examples")
+    }
+    for prop, key, value in (
+        ("fragments", "x.massspec.prediction.collision_energy", report.collision_energy),
+        ("retention_time", "x.massspec.prediction.rt_scale", report.rt_scale),
+    ):
+        if prop not in predictors:
+            continue
+        if value is None:
+            extras.pop(key, None)
+        else:
+            extras[key] = value
+    return extras
 
 
 def _refuse_unlikely_charges(plan: RequestPlan, predictor: Predictor, minimum: float, refused: np.ndarray, note) -> None:
@@ -346,5 +366,5 @@ def _source_ladders(
     at = pc.index_in(pa.array(unique_ids, type=pa.int64()), value_set=peptides.column("peptide_id").combine_chunks())
     sequences = pc.take(peptides.column("modified_sequence"), at).to_pylist()
     caps = predictor.capabilities
-    ladders = Ladders([parse_proforma(s) for s in sequences], caps.ion_types, caps.max_fragment_charge)
+    ladders = Ladders(sequences, caps.ion_types, caps.max_fragment_charge)
     return ladders, local.astype(np.int64)

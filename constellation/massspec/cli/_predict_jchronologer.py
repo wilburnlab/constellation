@@ -18,7 +18,10 @@ recorded key, else the SHA-256 of its files), each predictor's identity
 (model files and their SHA-256, batch size, minimum intensity), the
 collision energy per charge and the settings that change the result.
 Threads and device are recorded, not keyed: the runner's output does not
-depend on the thread count.
+depend on the thread count. An export (``--output-dlib``) is not keyed
+either: the manifest records which prediction each export holds
+(``exports``), so ``--resume`` writes one that is missing or holds an
+earlier prediction, and a run replaces its own exports and no other file.
 """
 
 from __future__ import annotations
@@ -130,6 +133,43 @@ def _library_key(path: Path) -> dict[str, object]:
         return {"stage_key": recorded}
     files = sorted(p for p in (path.rglob("*") if path.is_dir() else [path]) if p.is_file() and p.name != "_SUCCESS")
     return {"files": {str(p.relative_to(path) if path.is_dir() else p.name): file_sha256(p) for p in files}}
+
+
+def recorded_exports(output_dir: Path) -> dict[str, str | None]:
+    """The library files a prediction directory's runs exported
+    (``--output-dlib``), with the stage key each was written for (None
+    where the run did not record it), read from the manifests in it:
+    this backend's ``exports``, and the Koina backend's ``runs`` and
+    per-energy manifests."""
+    found: dict[str, str | None] = {}
+    manifests = [output_dir / "manifest.json", *sorted(output_dir.glob("ce_*/manifest.json"))]
+    for path in manifests:
+        try:
+            manifest = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        outputs = manifest.get("outputs")
+        if isinstance(outputs, dict) and outputs.get("dlib"):
+            found.setdefault(str(outputs["dlib"]), None)
+        for item in [manifest, *(manifest.get("runs") or [])]:
+            if isinstance(item, dict) and item.get("output_dlib"):
+                found.setdefault(str(item["output_dlib"]), None)
+        exports = manifest.get("exports")
+        if isinstance(exports, dict):
+            found.update({str(k): v for k, v in exports.items()})
+    return found
+
+
+def foreign_export(path: Path | None, output_dir: Path, recorded: dict[str, str | None]) -> str | None:
+    """Why ``path`` may not be written, or None. A prediction replaces its
+    own exports (ones its manifests record, or inside its directory) and
+    nothing else; asked before anything is predicted, so a run is not
+    lost to a name clash at its end."""
+    if path is None or not path.exists():
+        return None
+    if str(path) in recorded or path.is_relative_to(output_dir):
+        return None
+    return f"{path} exists and was not exported from {output_dir}; delete it or choose another --output-dlib"
 
 
 def _peptide_list_library(path: Path, charges: tuple[int, ...]):
@@ -286,9 +326,21 @@ def run(args: argparse.Namespace) -> int:
         collision_energy=energy.describe(charges) if energy is not None else None,
         min_charge_probability=args.min_charge_probability,
     )
+    pqdir = output_dir / "library_pqdir"
+    dlib = Path(args.output_dlib).resolve() if args.output_dlib is not None else None
+    exports = recorded_exports(output_dir)
     if is_done(output_dir, key):
         if not args.resume:
             return fail(f"{output_dir} already holds this prediction; pass --resume to reuse it, or delete it")
+        if dlib is not None and (exports.get(str(dlib)) != key or not dlib.is_file()):
+            # The prediction is done; the export asked for now is not (a
+            # new --output-dlib, or a file of an earlier prediction).
+            refusal = foreign_export(dlib, output_dir, exports)
+            if refusal:
+                return fail(refusal)
+            _export_dlib(pqdir, dlib)
+            _record_export(output_dir, dlib, key)
+            print(f"exported {dlib} from the completed prediction")
         print(f"already complete: {output_dir}")
         return 0
     if recorded_key(output_dir) is not None and not args.resume:
@@ -296,39 +348,47 @@ def run(args: argparse.Namespace) -> int:
             f"{output_dir} holds a prediction of other inputs or settings; pick another --output-dir, "
             "or pass --resume to replace it"
         )
+    refusal = foreign_export(dlib, output_dir, exports)
+    if refusal:
+        return fail(refusal)
     invalidate(output_dir)
 
     # ── predict, streaming fragments ────────────────────────────────
+    import contextlib
+
     import pyarrow.parquet as pq
 
     from constellation.massspec.library.schemas import LIBRARY_FRAGMENT_TABLE
 
-    pqdir = output_dir / "library_pqdir"
     pqdir.mkdir(parents=True, exist_ok=True)
-    # Fragments go to disk chunk by chunk, beside the library; the library
-    # is then written (with an empty fragment table) and the streamed file
-    # put in its place.
-    streamed = pqdir / "fragments.streaming.parquet"
+    # Predicted fragments go to disk chunk by chunk, beside the library;
+    # the library is then written (with an empty fragment table) and the
+    # streamed file put in its place. Without a fragment model the
+    # library keeps the fragments it came with, and they are written with it.
+    streamed = pqdir / "fragments.streaming.parquet" if "fragments" in predictors else None
     started = time.perf_counter()
     try:
-        with pq.ParquetWriter(streamed, LIBRARY_FRAGMENT_TABLE) as writer:
+        with (
+            pq.ParquetWriter(streamed, LIBRARY_FRAGMENT_TABLE) if streamed is not None else contextlib.nullcontext()
+        ) as writer:
             predicted, report = predict_onto(
                 library,
                 predictors,
                 collision_energy=energy,
                 min_charge_probability=args.min_charge_probability,
-                fragments_sink=writer.write_table,
+                fragments_sink=writer.write_table if writer is not None else None,
             )
-    except ValueError as exc:
-        streamed.unlink(missing_ok=True)
-        return fail(str(exc))
+    except BaseException as exc:
+        if streamed is not None:
+            streamed.unlink(missing_ok=True)
+        if isinstance(exc, ValueError):
+            return fail(str(exc))
+        raise
     save_library(predicted, pqdir, format="parquet_dir")
-    streamed.replace(pqdir / "fragments.parquet")
-    dlib = None
-    if args.output_dlib is not None:
-        dlib = Path(args.output_dlib).resolve()
-        dlib.parent.mkdir(parents=True, exist_ok=True)
-        save_library(load_library(pqdir), dlib, format="encyclopedia.dlib")
+    if streamed is not None:
+        streamed.replace(pqdir / "fragments.parquet")
+    if dlib is not None:
+        _export_dlib(pqdir, dlib)
     elapsed = time.perf_counter() - started
 
     import torch
@@ -361,6 +421,10 @@ def run(args: argparse.Namespace) -> int:
             "stage_key": key,
             "library": _library_key(source),
             "prediction": report.to_dict(),
+            # Every library file exported from this directory, with the
+            # prediction (stage key) it holds; earlier ones are kept so
+            # they stay this directory's to replace.
+            "exports": {**exports, **({str(dlib): key} if dlib is not None else {})},
         },
     )
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
@@ -369,6 +433,24 @@ def run(args: argparse.Namespace) -> int:
     if not args.no_progress:
         _print_summary(report, energy, charges, output_dir)
     return 0
+
+
+def _export_dlib(pqdir: Path, dlib: Path) -> None:
+    """The library as an EncyclopeDIA ``.dlib`` (its targets: the writer
+    leaves decoys out), replacing an earlier export at that path."""
+    from constellation.massspec.library import load_library, save_library
+
+    dlib.parent.mkdir(parents=True, exist_ok=True)
+    save_library(load_library(pqdir), dlib, format="encyclopedia.dlib", overwrite=True)
+
+
+def _record_export(output_dir: Path, dlib: Path, key: str) -> None:
+    """Add an export made from a completed prediction to its manifest."""
+    path = output_dir / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest.setdefault("outputs", {})["dlib"] = str(dlib)
+    manifest["exports"] = {**(manifest.get("exports") or {}), str(dlib): key}
+    path.write_text(json.dumps(manifest, indent=2, default=str))
 
 
 def _print_summary(report, energy, charges, output_dir: Path) -> None:

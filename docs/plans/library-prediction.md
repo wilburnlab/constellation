@@ -426,3 +426,16 @@ Later:
 - **Not done here.** The FASTA path of `--backend koina` still digests through `library.digest` and
   assembles with `assemble_library`; `massspec search-space` plus `--from-library` is the path that
   keeps provenance.
+
+## Review by Codex (2026-11-06), and what was done
+
+The PR (#107) was reviewed independently by Codex. It found five defects, all fixed in a commit after
+P4, each with a test that fails on the code before it.
+
+| | Finding | Done |
+|---|---|---|
+| C1 (P1) | With `--ms2-model none`, `predict-library --backend jchronologer` replaced the library's fragments with an empty streamed file, so predicting only RT, CCS or charge states onto a predicted library deleted its spectra, and emptied any `.dlib` export | Fragments are streamed only when a fragment model runs; otherwise the library is written with the fragments it came with |
+| C2 (P2) | Resuming with changed settings replaced the Parquet library, then stopped at the `.dlib` export on `FileExistsError` (the export writer does not overwrite by default), leaving the new library beside the old `.dlib`. The Koina backend did the same once its resume was keyed (P4) | A run replaces its own exports (ones its manifests record, or inside its directory) and refuses any other file at that path. The check comes before anything is predicted and before `_SUCCESS` is removed, so a clash leaves the finished run as it was |
+| C3 (P2) | `--resume` of a finished prediction with a new `--output-dlib` said "already complete" without writing it, since the export path is not part of the key | Each export records the stage key of the prediction it holds (`exports` in the manifest). Resuming a finished prediction writes an export that is missing or holds an earlier prediction, and leaves a current one alone. The Koina backend keys its output paths, so a new path there is a new run, as before |
+| C4 (P2) | A Koina model returning a neutral loss (`y3-H2O+1`) crashed `predict_library(library=...)` with `NotImplementedError` in the new assembler; the old path had kept such ions | Loss-aware assembly: a loss ion is a typed row with its `loss_id`, its m/z the source peptide's own ion less the loss (labels included: a ¹⁵N chain loses ¹⁵NH₃), looked up by index in a ladder of only the peptides with one (`fragment_ladder_arrays_batch(loss_rules=False)`, every loss at every bond). The loss rules are not applied to a loss a model names: they say which losses to expect where nobody has said. `reported_mz_error_ppm` checks loss ions too. The old path kept such ions as partial-ID rows (no ion identity, Koina's m/z), wrong for a labelled precursor. No model the overlay registers today returns losses |
+| C5 (P2) | Predicting one property onto a predicted library (fragments, then RT alone) replaced the record of which predictor made each property, so the spectra lost their model and settings | `x.massspec.prediction.predictors` is merged property by property. A property predicted again takes this run's collision energy or time scale, or drops the old one if the new model has none; one left alone keeps its record, as its values are kept |

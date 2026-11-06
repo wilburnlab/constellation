@@ -675,6 +675,20 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     key = stage_key(**_koina_key_parts(args))
     recorded = recorded_key(output_dir)
+    # A run replaces its own exports and refuses to replace anything else,
+    # before anything is predicted (a sweep writes each energy's export
+    # inside its own directory).
+    from constellation.massspec.cli._predict_jchronologer import foreign_export, recorded_exports
+
+    try:
+        sweep = len(_parse_collision_energies(args.collision_energy)) > 1
+    except ValueError:
+        sweep = False  # refused below, with the reason
+    if args.output_dlib is not None and not sweep:
+        refusal = foreign_export(Path(args.output_dlib).resolve(), output_dir, recorded_exports(output_dir))
+        if refusal:
+            print(f"error: {refusal}", file=_sys.stderr)
+            return 1
     if recorded is not None:
         # A marker without a key was written before runs were keyed
         # (2026-11-06); it is trusted as it always was, and said so.
@@ -864,7 +878,8 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
                 else run_dir / Path(args.output_dlib).name
             )
             dlib_path.parent.mkdir(parents=True, exist_ok=True)
-            save_library(library, dlib_path, format="encyclopedia.dlib")
+            # This run's own export, from an earlier prediction (checked above).
+            save_library(library, dlib_path, format="encyclopedia.dlib", overwrite=True)
 
         summary = {
             "collision_energy": energy.nce if energy is not None else None,

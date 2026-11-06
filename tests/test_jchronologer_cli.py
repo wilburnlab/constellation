@@ -115,6 +115,57 @@ def test_resume_reuses_only_the_same_prediction(fake, search_space, tmp_path, ca
     assert "already complete" in capsys.readouterr().out
 
 
+def test_resume_keeps_the_export_current(fake, search_space, tmp_path, capsys):
+    out, dlib = tmp_path / "out", tmp_path / "lib.dlib"
+
+    def exports() -> dict:
+        return json.loads((out / "manifest.json").read_text())["exports"]
+
+    def key() -> str:
+        return (out / "_SUCCESS").read_text()
+
+    assert _jc(search_space, out, "--output-dlib", str(dlib)) == 0
+    assert exports() == {str(dlib): key()}
+    # Other settings, resumed: the export is replaced with the prediction
+    # (it used to stop at the end on FileExistsError, beside the new library).
+    assert _jc(search_space, out, "--collision-energy", "25", "--resume", "--output-dlib", str(dlib)) == 0
+    assert exports() == {str(dlib): key()}
+    capsys.readouterr()
+    # A finished prediction makes the export asked for now ...
+    other = tmp_path / "other.dlib"
+    assert _jc(search_space, out, "--collision-energy", "25", "--resume", "--output-dlib", str(other)) == 0
+    assert "exported" in capsys.readouterr().out and other.is_file()
+    assert exports() == {str(dlib): key(), str(other): key()}
+    # ... and again when the file holds an earlier prediction, but not while it is current.
+    assert _jc(search_space, out, "--resume") == 0
+    assert exports()[str(dlib)] != key()
+    capsys.readouterr()
+    assert _jc(search_space, out, "--resume", "--output-dlib", str(dlib)) == 0
+    assert "exported" in capsys.readouterr().out and exports()[str(dlib)] == key()
+    assert _jc(search_space, out, "--resume", "--output-dlib", str(dlib)) == 0
+    assert "exported" not in capsys.readouterr().out
+    # A file it did not write is refused before anything runs, and left alone.
+    foreign = tmp_path / "foreign.dlib"
+    foreign.write_bytes(b"not ours")
+    before = key()
+    assert _jc(search_space, out, "--collision-energy", "27", "--resume", "--output-dlib", str(foreign)) == 1
+    assert "was not exported from" in capsys.readouterr().err
+    assert foreign.read_bytes() == b"not ours" and key() == before
+    assert _jc(search_space, out, "--resume", "--output-dlib", str(foreign)) == 1
+
+
+def test_a_property_alone_keeps_the_librarys_own_fragments(fake, search_space, tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    assert _jc(search_space, first) == 0
+    assert _jc(first / "library_pqdir", second, "--ms2-model", "none", "--rt-model", "none", "--no-charge-states") == 0
+    before, after = load_library(first / "library_pqdir"), load_library(second / "library_pqdir")
+    assert after.fragments.num_rows == before.fragments.num_rows > 0
+    assert after.fragments.equals(before.fragments)
+    made_by = after.metadata_extras["x.massspec.prediction.predictors"]
+    assert made_by["fragments"]["model"] == "cartographer" and made_by["ccs"]["model"] == "sculptor"
+    assert after.metadata_extras["x.massspec.prediction.collision_energy"]["origin"] == "scaled_from_reference"
+
+
 def test_an_energy_table_must_cover_every_charge(fake, search_space, tmp_path, capsys):
     assert _jc(search_space, tmp_path / "a", "--collision-energy-by-charge", "2=25") == 1
     assert "no energy for charge 3" in capsys.readouterr().err
