@@ -103,6 +103,10 @@ PRECURSOR_TABLE: pa.Schema = pa.schema(
         # -1.0 sentinel = no prediction available
         pa.field("rt_predicted", pa.float64(), nullable=False),
         pa.field("ccs_predicted", pa.float64(), nullable=False),
+        # Predicted probability that the peptide is seen at this charge
+        # (a charge-state model's share for it); null where none was
+        # predicted (2026-11-06, library prediction P2).
+        pa.field("charge_probability", pa.float64(), nullable=True),
     ],
     metadata={b"schema_name": b"PrecursorTable"},
 )

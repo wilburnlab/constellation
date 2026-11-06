@@ -93,7 +93,16 @@ import constellation.massspec.library.ids
 import constellation.massspec.library.io
 import constellation.massspec.library.library
 import constellation.massspec.library.prediction
+import constellation.massspec.library.prediction.assemble
+import constellation.massspec.library.prediction.base
 import constellation.massspec.library.prediction.collision_energy
+import constellation.massspec.library.prediction.registry
+import constellation.massspec.library.prediction.requests
+import constellation.massspec.library.prediction.run
+import constellation.massspec.library.prediction.torch_runner
+import constellation.massspec.library.jchronologer
+import constellation.massspec.library.jchronologer.bundle
+import constellation.massspec.library.jchronologer.models
 import constellation.massspec.library.schemas
 import constellation.massspec.library.search_space
 import constellation.massspec.cli.search_space

@@ -325,20 +325,21 @@ class Library:
 
 
 #: The precursor values a prediction carries onto a library, each unset
-#: at −1 (a predictor that did not predict one leaves the source's).
-_PREDICTED_PRECURSOR_VALUES = ("rt_predicted", "ccs_predicted")
+#: at −1 or null (a predictor that did not predict one leaves the source's).
+_PREDICTED_PRECURSOR_VALUES = ("rt_predicted", "ccs_predicted", "charge_probability")
 
 
 def attach_predictions(source: Library, predicted: Library) -> tuple[Library, dict[str, int]]:
-    """``source`` with ``predicted``'s fragments, retention times and CCS.
+    """``source`` with ``predicted``'s fragments, retention times, CCS and
+    charge probabilities.
 
     What a prediction of a library's own precursors should return: the
     source library, with everything it says about them (which are decoys
     and of what, the spans that make each peptide, each modification and
     why), not the flat library a predictor rebuilds from bare
     (sequence, charge) pairs. Precursors are matched on (modified
-    sequence, charge); a predicted retention time or CCS replaces the
-    source's unless it is unset (−1). A source precursor the predictor did
+    sequence, charge); a predicted retention time, CCS or charge
+    probability replaces the source's unless it is unset (−1 or null). A source precursor the predictor did
     not return (a modification the model cannot take, skipped) is left out,
     with what only it needed (:meth:`Library.subset_precursors`), and
     counted. Returns the library and the counts.

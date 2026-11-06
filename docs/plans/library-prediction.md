@@ -248,3 +248,81 @@ Later:
   - encoding takes 3.2–3.9 µs a peptide per model;
   - a million peptides through all three models take about 15 s, against the 30 s aimed for.
 
+
+### P2 (2026-11-06)
+
+- **The contract** (`library.prediction.base`). A predictor has `check(requests) -> Refusals` (no model
+  run) and `predict(requests) -> FragmentArrays | ValueArray`. Requests are unique (unlabelled
+  `Sites`, charge, float32 energy). Fragments are named by ion type, ion number and fragment charge;
+  the orchestration adds bonds, m/z and precursor ids. Refusal reasons are the tokenizer's four plus
+  `charge_out_of_range` and `collision_energy_out_of_range`.
+- **Requests** (`requests.build_requests`).
+  - Labels come off: global labels and isotopic-substitution modifications; TMT stays. Heavy and
+    light precursors share a request.
+  - Requests are sorted by the peptide's canonical string, then charge, so they do not depend on the
+    library's row order (tested by shuffling it).
+  - Groups are a target and every decoy of it (`decoy_of`) at one charge. A decoy with no `decoy_of`
+    stands alone.
+  - A peptide with no reading as sites (a modification named by mass, say) is refused for every
+    predictor, under the property `input`.
+- **Orchestration** (`run.predict_onto`).
+  - Every check runs first. A refused precursor drops with its whole group: counted by property and
+    reason, with partners counted apart (`dropped_with_partner`, which also takes decoys left
+    without a target by `subset_precursors`).
+  - Kept requests are predicted in chunks of 100,000.
+  - Values go onto `rt_predicted`, `ccs_predicted` and the new nullable
+    `PRECURSOR_TABLE.charge_probability` (also carried by `attach_predictions`); NaN keeps the
+    source's value. Fragments replace the source's.
+  - Metadata: `x.massspec.prediction.{predictors, collision_energy, rt_scale, report}`. The report
+    carries the deuterium caveat whenever labels were removed.
+- **Assembly** (`assemble`).
+  - Each fragment's m/z is the source peptide's own (labelled) ladder entry, found by index (bond,
+    type, charge order) without a join. A labelled precursor gets labelled m/z beside its light form's
+    intensities (tested).
+  - A backend's reported m/z can be checked against the peptide sent (`reported_mz_error_ppm`, for
+    Koina in P4).
+- **Runner** (`torch_runner`). Fixed batches, each on one intra-op thread, parallel across batches. One
+  thread and four give the same bits (tested), so the batch size is a setting to record and the
+  thread count is not.
+- **JChronologer** (`library.jchronologer`). `bundle` locates the jar the manifest names and checks
+  each member's SHA-256 against the snapshot on read. `models` holds the four predictors with the
+  jar's float32 arithmetic and its decoder. CI tests them on a fake bundle (the real preprocessing
+  files and stand-in models): their inputs (tokens, charge one-hot, NCE/100) and their decoding.
+- **Golden test, changed from the plan.** The plan had EncyclopeDIA predict a crafted FASTA through
+  `run_predict_library`. JChronologer's public API (`ChronologerLibraryPredictor.predict` on explicit
+  (peptide, charges, NCE) requests, or its automatic charge selection) gives the jar's predictions for
+  chosen peptides directly, with CCS and charge probabilities, and no digestion or EncyclopeDIA
+  wrapping in between. `scripts/jchronologer/PredictionOracle.java` runs it (on the manifest's
+  classpath) and `scripts/survey-jchronologer-predictions.py` keeps 80 requests (292 entries, 3
+  refused) in `tests/data/jchronologer/1.0.10/predictions.tsv`. `tests/test_jchronologer_golden.py`
+  (skipped without EncyclopeDIA) runs the real models on them:
+
+  | Property | Agreement with the jar |
+  |---|---|
+  | RT | within 0.14 ms |
+  | Fragments | the same 4,601 ions; intensities within 3.4e-6; m/z within 8e-7 Da |
+  | CCS | within 6e-5 Å²; none exactly where the jar gives none (TMT) |
+  | Charge probabilities | within 9e-8 |
+
+  The jar refuses deamidation, HexNAc and oxidised Trp; so does Chronologer here. EncyclopeDIA's own
+  wrapping (energy conversion and charge selection) is checked by the bench instead, against a library
+  it made.
+- **Bench** (`scripts/bench-jchronologer.py`, the 2.5M-entry human `.dlib`, 3,000 entries):
+  - every entry agrees within 1e-5 of max-normalised intensity, with every stored peak matched (48
+    peaks ambiguous, two ions within 10 ppm). The 18 "misses" of the first check were the checker's;
+  - RT agrees within 0.6 ms;
+  - throughput at 8 threads, tokenizing included: fragments 4,100 requests/s, RT 9,000, CCS 10,000,
+    charge states 46,000. A 5M-precursor search space would take about 20 min for fragments, against
+    EncyclopeDIA's 86 min for 2.79M predictions.
+- **JChronologer's own rules, read from its source.**
+  - Its automatic charge selection keeps charges 1–6 with `p ≥` the request's minimum. The two-best
+    rule above is EncyclopeDIA's.
+  - In the jar, a peptide Sculptor cannot tokenize (TMT) gets no CCS and stays in the library.
+- **Open: TMT and CCS by default.** Sculptor has no TMT tokens. With CCS on by default and the PI's
+  drop-paired rule, every TMT precursor would be dropped unless CCS is turned off. P3's CLI needs a
+  choice: keep the rule and point to `--no-ccs` in the summary, or let CCS (and charge state) leave the
+  value unset instead of dropping, as the jar does.
+- **Risks.** torch 2.12 deprecates `torch.jit.load`. JChronologer ships TorchScript, so the warning is
+  silenced at the one load site; if TorchScript loading is removed, the models will need converting.
+  `predict_onto` builds the whole fragment table in memory (about 150M rows for 5M precursors); P3
+  streams it.

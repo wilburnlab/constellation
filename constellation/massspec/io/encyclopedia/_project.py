@@ -637,6 +637,7 @@ def project_library_file(
                 "precursor_mz": pa.array(precursor_mz[precursor_rows], type=pa.float64()),
                 "rt_predicted": pa.array(rt[precursor_rows], type=pa.float64()),
                 "ccs_predicted": pa.array(np.full(n_precursors, -1.0), type=pa.float64()),
+                "charge_probability": pa.nulls(n_precursors, type=pa.float64()),
             },
             schema=PRECURSOR_TABLE,
         )

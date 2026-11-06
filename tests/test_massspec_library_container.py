@@ -91,6 +91,7 @@ def test_validate_rejects_orphan_peptide_fk() -> None:
             "precursor_mz": [400.0],
             "rt_predicted": [-1.0],
             "ccs_predicted": [-1.0],
+            "charge_probability": pa.nulls(1, pa.float64()),
         },
         schema=PRECURSOR_TABLE,
     )
