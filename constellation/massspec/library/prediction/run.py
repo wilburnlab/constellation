@@ -45,7 +45,7 @@ import pyarrow.compute as pc
 
 from constellation.core.sequence.proforma import parse_proforma
 from constellation.massspec.library.library import Library
-from constellation.massspec.library.prediction.assemble import Ladders, fragment_table
+from constellation.massspec.library.prediction.assemble import Ladders, fragment_table, reported_mz_error_ppm
 from constellation.massspec.library.prediction.base import (
     PROPERTIES,
     FragmentArrays,
@@ -58,7 +58,7 @@ from constellation.massspec.library.prediction.collision_energy import Collision
 from constellation.massspec.library.prediction.requests import RequestPlan, build_requests
 from constellation.massspec.library.schemas import LIBRARY_FRAGMENT_TABLE
 
-__all__ = ["DEFAULT_CHUNK", "PredictionReport", "predict_onto"]
+__all__ = ["DEFAULT_CHUNK", "PredictionRefused", "PredictionReport", "predict_onto"]
 
 #: Requests predicted at a time: bounds the memory of a chunk's model
 #: outputs and fragments, not the result.
@@ -86,6 +86,9 @@ class PredictionReport:
     predictors: dict[str, dict[str, Any]]
     collision_energy: dict[str, Any] | None
     rt_scale: str | None
+    #: The worst disagreement between the m/z a backend reported and the
+    #: peptide sent (None when the backend reports none).
+    max_reported_mz_error_ppm: float | None = None
     caveats: list[str] = field(default_factory=list)
 
     @property
@@ -107,8 +110,23 @@ class PredictionReport:
             "predictors": self.predictors,
             "collision_energy": self.collision_energy,
             "rt_scale": self.rt_scale,
+            "max_reported_mz_error_ppm": self.max_reported_mz_error_ppm,
             "caveats": list(self.caveats),
         }
+
+
+class PredictionRefused(ValueError):
+    """Precursors a predictor cannot take, under ``strict``."""
+
+    def __init__(self, refused: dict[str, dict[str, int]], examples: dict[str, dict[str, list[str]]]) -> None:
+        self.refused = refused
+        self.examples = examples
+        lines = [
+            f"{prop} ({reason}): {n} precursor(s), e.g. {'; '.join(examples.get(prop, {}).get(reason, [])[:3])}"
+            for prop, reasons in refused.items()
+            for reason, n in reasons.items()
+        ]
+        super().__init__("precursors the predictors cannot take:\n  " + "\n  ".join(lines))
 
 
 def _check_predictors(predictors: Mapping[str, Predictor], collision_energy: CollisionEnergy | None) -> None:
@@ -131,6 +149,7 @@ def predict_onto(
     min_charge_probability: float | None = None,
     chunk: int = DEFAULT_CHUNK,
     fragments_sink: Callable[[pa.Table], None] | None = None,
+    strict: bool = False,
 ) -> tuple[Library, PredictionReport]:
     """``library`` with ``predictors``' properties put on its precursors
     (module docstring). Returns the library and the report.
@@ -142,6 +161,8 @@ def predict_onto(
     ``fragments_sink`` receives the fragment table chunk by chunk instead
     of the result holding it (the returned library's fragments are then
     empty): what a command writing millions of precursors streams to disk.
+    With ``strict``, a refusal raises :class:`PredictionRefused` (naming
+    the reasons and examples) before any model runs, instead of dropping.
     """
     _check_predictors(predictors, collision_energy)
     if min_charge_probability is not None and "charge_state" not in predictors:
@@ -178,6 +199,9 @@ def predict_onto(
     if min_charge_probability is not None:
         _refuse_unlikely_charges(plan, predictors["charge_state"], float(min_charge_probability), refused, note)
 
+    if strict and refused.any():
+        raise PredictionRefused(counts, examples)
+
     # A refused precursor takes its group; the library then drops a decoy
     # whose target peptide has no precursor left, so the kept set is read
     # back from it before anything is predicted.
@@ -190,6 +214,7 @@ def predict_onto(
     values = {prop: np.full(len(kept_requests), np.nan) for prop in predictors if prop != "fragments"}
     fragment_parts: list[pa.Table] = []
     n_fragments = 0
+    worst_ppm: float | None = None
     fragments_predictor = predictors.get("fragments")
     ladders: Ladders | None = None
     source_peptide = np.zeros(0, np.int64)
@@ -211,6 +236,12 @@ def predict_onto(
                     ladders,
                 )
                 n_fragments += part.num_rows
+                predicted = _as_fragments(answer, predictor.name)
+                if predicted.mz_reported is not None:
+                    caps = predictor.capabilities
+                    worst_ppm = max(
+                        worst_ppm or 0.0, reported_mz_error_ppm(predicted, sub, caps.ion_types, caps.max_fragment_charge)
+                    )
                 if fragments_sink is not None:
                     fragments_sink(part)
                 else:
@@ -254,6 +285,7 @@ def predict_onto(
             else None
         ),
         rt_scale=rt_predictor.capabilities.rt_scale if rt_predictor is not None else None,
+        max_reported_mz_error_ppm=worst_ppm,
         caveats=(
             ["isotope labels were removed before prediction: fragment m/z are the labelled peptide's, "
              "intensities and retention times its light form's (deuterium's retention shift is not modelled)"]

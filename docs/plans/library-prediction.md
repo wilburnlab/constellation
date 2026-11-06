@@ -1,6 +1,6 @@
 # Library prediction with interchangeable predictors
 
-Status: approved 2026-11-05 (PI); being built on `feat/library-prediction`, one PR per phase.
+Status: approved 2026-11-05 (PI); P0–P4 built on `feat/library-prediction` (2026-11-06), one commit per phase in one PR (PI).
 
 ## Why
 
@@ -375,3 +375,54 @@ Later:
   settings (about 9.9M precursors) that extrapolates to about 63 min and 16 GB. Not run: the
   in-memory search space would add about 10 GB at that size (proteome-scale search-space output is
   still to do), and long full-machine runs have crashed this machine before.
+
+### P4 (2026-11-06)
+
+- **Koina as predictors** (`library.koina.predictor`).
+  - `KoinaFragments(model)` and `KoinaRetentionTime(model)` meet the contract. Construction reads the
+    model's declared inputs from the server, or from a client given, so whether it takes an energy is
+    known up front.
+  - `check` is local. Koina's sequence is written from the request's unlabelled sites, and the
+    overlay refuses the rest with a reason before any request is sent: N-terminal modifications for
+    the 2020 models, modifications outside the model's set, length, charge, a missing energy, and
+    non-standard residues.
+  - `predict` parses each distinct annotation once and leaves out Koina's padding. A fragment the
+    peptide cannot have (an ion number at or beyond its length) is left out and counted, where the
+    old assembly kept it as a partial-ID row. Koina's m/z ride as `mz_reported`; `predict_onto` checks
+    them against the peptide sent (`max_reported_mz_error_ppm` in the report) and never uses them.
+- **Registry.** `koina:<model>` builds any Koina model. The property comes from the overlay, or is
+  given (`property=`) for a model the overlay does not know, and is checked against it.
+- **`koina.api.predict_library(library=...)`** goes through `predict_onto`.
+  - Labelled precursors are predicted as their light form, with labelled m/z, instead of refused.
+  - `on_unsupported="error"` refuses before any request (`predict_onto(strict=True)`, which raises
+    `PredictionRefused`); `"skip"` drops refused precursors with their partners.
+  - The FASTA / specs path is unchanged. Retention time is now sent Koina's dialect on both paths;
+    `predict_rt` had been sent canonical ProForma.
+- **Koina's Chronologer against JChronologer's** (live, `tests/test_koina_live.py`). It is the same
+  checkpoint: the same seconds to 1e-4 on seven peptides, N-terminal acetyl and both pyro-Glu forms
+  included, once pyro-Glu is written on its residue.
+  - `Q[UNIMOD:28]TALVELLK` gives 1247.45 s, as the jar does; `[UNIMOD:28]-QTALVELLK` gives 1073.44 s.
+    `RtModel.pyro_glu_on_first_residue` records this, and `KoinaRetentionTime` sends pyro-Glu that way
+    for `Chronologer_RT`.
+  - Two forms differ in every spelling tried and are left as measured: TMT (LVNELTEFAK with TMT6plex
+    on the N-terminus and K: Koina 1180.20 s, jar 1144.29 s) and S-carbamoylmethylcysteine (jar
+    577.50 s; Koina 310–758 s).
+- **CLI.** With `--backend jchronologer`, each property's model is a flag (`--ms2-model`,
+  `--rt-model`, `--charge-model`, `--ccs-model`) taking `backend:model` or `none`, defaulting to
+  JChronologer's.
+  - A bare model name is refused there, `--koina-url` only applies when a Koina model is chosen, and
+    `--no-ccs` / `--no-charge-states` contradict an explicit model for the same property.
+  - `--ms2-model` / `--rt-model` default to nothing in the parser and resolve per backend.
+    `--backend koina` still defaults to `Prosit_2020_intensity_HCD` / `Chronologer_RT` and accepts a
+    `koina:` prefix.
+- **The Koina backend's run directory.**
+  - `manifest.json` is the shared envelope (`build_manifest_envelope`), with its `koina` block and
+    `runs` unchanged.
+  - `_SUCCESS` carries a `core.stages` key over the source (SHA-256, or a search space's key), the
+    digestion, the models and server, the energies and the settings. Each energy of a sweep is keyed
+    under it.
+  - `--resume` reuses only a matching key and redoes another. A marker with no key, written before
+    keys, is still reused, with a note saying so.
+- **Not done here.** The FASTA path of `--backend koina` still digests through `library.digest` and
+  assembles with `assemble_library`; `massspec search-space` plus `--from-library` is the path that
+  keeps provenance.

@@ -103,6 +103,8 @@ import constellation.massspec.library.prediction.torch_runner
 import constellation.massspec.library.jchronologer
 import constellation.massspec.library.jchronologer.bundle
 import constellation.massspec.library.jchronologer.models
+import constellation.massspec.library.koina
+import constellation.massspec.library.koina.predictor
 import constellation.massspec.library.schemas
 import constellation.massspec.library.search_space
 import constellation.massspec.cli.search_space

@@ -101,15 +101,22 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
     )
     koina.add_argument(
         "--ms2-model",
-        default="Prosit_2020_intensity_HCD",
-        help="Koina fragment-intensity model (default: %(default)s)",
+        default=None,
+        help=(
+            "fragment-intensity model: a Koina model name with --backend koina "
+            "(default: Prosit_2020_intensity_HCD); backend:model or none with "
+            "--backend jchronologer (default: jchronologer:cartographer; e.g. "
+            "koina:Prosit_2020_intensity_HCD)"
+        ),
     )
     koina.add_argument(
         "--rt-model",
-        default="Chronologer_RT",
+        default=None,
         help=(
-            "Koina retention-time model, or 'none' to skip RT prediction "
-            "(default: %(default)s)"
+            "retention-time model, or 'none' to skip RT: a Koina model name with "
+            "--backend koina (default: Chronologer_RT); backend:model with "
+            "--backend jchronologer (default: jchronologer:chronologer; e.g. "
+            "koina:Chronologer_RT)"
         ),
     )
     koina.add_argument(
@@ -630,6 +637,9 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
     from constellation.massspec.library.koina.api import predict_library
     from constellation.massspec.library.koina.client import make_client
 
+    # The model flags default per backend; a koina: prefix is the same model.
+    args.ms2_model = str(args.ms2_model or "Prosit_2020_intensity_HCD").removeprefix("koina:")
+    args.rt_model = str(args.rt_model or "Chronologer_RT").removeprefix("koina:")
     used = [
         flag
         for attr, flag, default in _ENCYCLOPEDIA_ONLY_ARGS
@@ -659,20 +669,36 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
         )
         return 1
 
+    from constellation.core.stages import invalidate, mark_done, recorded_key, stage_key
+
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    success_path = output_dir / "_SUCCESS"
-    if success_path.exists():
+    key = stage_key(**_koina_key_parts(args))
+    recorded = recorded_key(output_dir)
+    if recorded is not None:
+        # A marker without a key was written before runs were keyed
+        # (2026-11-06); it is trusted as it always was, and said so.
+        if recorded in (key, ""):
+            if not args.resume:
+                print(
+                    f"error: --output-dir already complete (_SUCCESS exists). "
+                    f"Pass --resume to re-use it, or delete {output_dir} to "
+                    f"start fresh.",
+                    file=_sys.stderr,
+                )
+                return 1
+            if recorded == "":
+                print(f"note: {output_dir}/_SUCCESS records no key (an older run); reusing it unchecked")
+            print(f"already complete: {output_dir}")
+            return 0
         if not args.resume:
             print(
-                f"error: --output-dir already complete (_SUCCESS exists). "
-                f"Pass --resume to re-use it, or delete {output_dir} to "
-                f"start fresh.",
+                f"error: {output_dir} holds a prediction of other inputs or settings; pick another "
+                f"--output-dir, or pass --resume to replace it",
                 file=_sys.stderr,
             )
             return 1
-        print(f"already complete: {output_dir}")
-        return 0
+        invalidate(output_dir)
 
     try:
         energies = _parse_collision_energies(args.collision_energy)
@@ -781,6 +807,9 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
         run_dir = output_dir / f"ce_{energy.label}" if multi else output_dir
         run_dir.mkdir(parents=True, exist_ok=True)
         marker = run_dir / "_SUCCESS" if multi else None
+        run_key = stage_key(run=key, energy=energy.describe(charges_present) if energy is not None else None)
+        if marker is not None and recorded_key(run_dir) not in (None, "", run_key):
+            invalidate(run_dir)  # an energy run of other settings: redo it
         if marker is not None and marker.exists() and args.resume:
             # Restore the completed run's summary. Skipping without it
             # drops finished energies from the aggregate manifest —
@@ -855,7 +884,7 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
         summaries.append(summary)
         if marker is not None:
             (run_dir / "manifest.json").write_text(json.dumps(summary, indent=2))
-            marker.write_bytes(b"")
+            mark_done(run_dir, run_key)
         if not args.no_progress:
             label = f"ce={energy.label}: " if multi else ""
             print(
@@ -867,10 +896,11 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
             if dropped:
                 print(f"  {label}{dropped} of the library's precursors could not be predicted and are left out")
 
-    manifest = {
-        "tool": "constellation massspec predict-library",
+    from constellation.massspec.search.encyclopedia._common import build_manifest_envelope
+
+    body = {
         "backend": "koina",
-        "constellation_version": constellation_version,
+        "stage_key": key,
         "source": source,
         "n_precursors_requested": len(specs),
         "koina": {
@@ -888,12 +918,56 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
         },
         "runs": summaries,
     }
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    success_path.write_bytes(b"")
+    source_path = Path(source)
+    manifest = build_manifest_envelope(
+        subcommand="massspec predict-library",
+        constellation_version=constellation_version,
+        constellation_argv=_sys.argv,
+        java_argv=None,
+        tool={"name": "koina", "server": server},
+        inputs={"source": source_path} if source_path.is_file() else {},
+        outputs={"output_dir": output_dir},
+        extras=body,
+    )
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
+    mark_done(output_dir, key)
 
     if not args.no_progress:
         print(f"predict-library done ({len(summaries)} library/libraries): {output_dir}")
     return 0
+
+
+def _koina_key_parts(args: argparse.Namespace) -> dict[str, object]:
+    """What a Koina run's output depends on: the source (its SHA-256, or
+    the search space's own key), the digestion, the models and server, the
+    energies and the settings."""
+    from constellation.core.stages import file_sha256
+    from constellation.massspec.cli._predict_jchronologer import _library_key
+
+    def identity(path) -> object:
+        p = Path(path)
+        if p.is_dir():
+            return _library_key(p)
+        return file_sha256(p) if p.is_file() else f"{p}:missing"
+
+    from constellation.massspec.library.koina import resolve_server
+
+    return {
+        "stage": "massspec predict-library koina",
+        "fasta": identity(args.fasta) if args.fasta is not None else None,
+        "peptides": identity(args.peptides) if args.peptides is not None else None,
+        "library": identity(args.from_library) if args.from_library is not None else None,
+        "digest": [args.enzyme, args.max_missed_cleavage, args.min_mz, args.max_mz, args.min_charge,
+                   args.max_charge, args.max_variable_mods],
+        "models": [args.ms2_model, args.rt_model],
+        "server": resolve_server(args.koina_url),
+        "energy": [args.collision_energy, args.collision_energy_by_charge, args.default_nce,
+                   args.default_charge, args.no_adjust_nce_for_dia],
+        "min_intensity": args.min_intensity,
+        "on_unsupported": args.on_unsupported_mod,
+        "outputs": [str(args.output_dlib) if args.output_dlib else None,
+                    str(args.output_library) if args.output_library else None],
+    }
 
 
 def _write_manifest_for_predict_library(

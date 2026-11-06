@@ -1,5 +1,10 @@
 """``massspec predict-library --backend jchronologer``: JChronologer's models onto a library.
 
+Each property's model can be swapped (``--ms2-model``, ``--rt-model``,
+``--charge-model``, ``--ccs-model``: ``backend:model`` or ``none``), so
+JChronologer's fragments can go beside Koina's retention times, or any
+other mix the registry (``library.prediction.registry``) can build.
+
 The library comes from ``massspec search-space`` (``--from-library``) or a
 peptide list (``--peptides``); a FASTA is refused, since the search space
 is the package's one FASTA enumerator and keeps how each precursor was
@@ -24,21 +29,28 @@ import sys
 import time
 from pathlib import Path
 
-#: Flags only another backend implements, with their parser defaults.
+#: Koina's flags that mean nothing here (a refused precursor always drops
+#: with its partners), with their parser defaults.
 KOINA_ONLY_ARGS: tuple[tuple[str, str, object], ...] = (
-    ("ms2_model", "--ms2-model", "Prosit_2020_intensity_HCD"),
-    ("rt_model", "--rt-model", "Chronologer_RT"),
-    ("koina_url", "--koina-url", None),
     ("on_unsupported_mod", "--on-unsupported-mod", "error"),
 )
 #: Flags only this backend implements, with their parser defaults.
 JCHRONOLOGER_ONLY_ARGS: tuple[tuple[str, str, object], ...] = (
     ("no_charge_states", "--no-charge-states", False),
     ("no_ccs", "--no-ccs", False),
+    ("charge_model", "--charge-model", None),
+    ("ccs_model", "--ccs-model", None),
     ("min_charge_probability", "--min-charge-probability", None),
     ("threads", "--threads", None),
     ("batch_size", "--batch-size", None),
     ("device", "--device", "cpu"),
+)
+#: Each property's flag and the model this backend uses when it is not given.
+MODEL_FLAGS: tuple[tuple[str, str, str], ...] = (
+    ("ms2_model", "fragments", "jchronologer:cartographer"),
+    ("rt_model", "retention_time", "jchronologer:chronologer"),
+    ("charge_model", "charge_state", "jchronologer:electrician"),
+    ("ccs_model", "ccs", "jchronologer:sculptor"),
 )
 #: ``--min-intensity`` when not given: each backend's own floor.
 DEFAULT_MIN_INTENSITY = {"jchronologer": 0.01, "koina": 1e-4}
@@ -46,6 +58,34 @@ DEFAULT_MIN_INTENSITY = {"jchronologer": 0.01, "koina": 1e-4}
 
 def used_flags(args: argparse.Namespace, table) -> list[str]:
     return [flag for attr, flag, default in table if getattr(args, attr, default) != default]
+
+
+def model_specs(args: argparse.Namespace) -> dict[str, str]:
+    """``{property: "backend:model"}`` for a run: each property's flag
+    (``backend:model`` or ``none``), JChronologer's model where none is
+    given, less what ``--no-charge-states`` / ``--no-ccs`` turn off."""
+    out: dict[str, str] = {}
+    for attr, prop, own in MODEL_FLAGS:
+        value = getattr(args, attr, None)
+        flag = "--" + attr.replace("_", "-")
+        if value is None:
+            out[prop] = own
+        elif str(value).lower() == "none":
+            continue
+        elif ":" not in str(value):
+            raise ValueError(
+                f"{flag} takes backend:model under --backend jchronologer (e.g. koina:{value}, {own}) or none"
+            )
+        else:
+            out[prop] = str(value)
+    for off, prop, flag in (("no_charge_states", "charge_state", "--charge-model"), ("no_ccs", "ccs", "--ccs-model")):
+        if getattr(args, off, False):
+            if getattr(args, flag[2:].replace("-", "_"), None) not in (None, "none"):
+                raise ValueError(f"--{off.replace('_', '-')} and {flag} contradict each other")
+            out.pop(prop, None)
+    if not out:
+        raise ValueError("every property is turned off; nothing to predict")
+    return out
 
 
 def add_jchronologer_arguments(p: argparse.ArgumentParser) -> None:
@@ -64,6 +104,14 @@ def add_jchronologer_arguments(p: argparse.ArgumentParser) -> None:
             "keep a target precursor only if Electrician gives its charge at least P; its decoys "
             "follow it (default: keep every charge)"
         ),
+    )
+    group.add_argument(
+        "--charge-model", default=None, metavar="BACKEND:MODEL",
+        help="charge-state model, or none (default: jchronologer:electrician)",
+    )
+    group.add_argument(
+        "--ccs-model", default=None, metavar="BACKEND:MODEL",
+        help="CCS model, or none (default: jchronologer:sculptor)",
     )
     group.add_argument("--threads", type=int, default=None,
                        help="batches run at once, one inference thread each (default: all cores)")
@@ -138,8 +186,15 @@ def run(args: argparse.Namespace) -> int:
         return fail("pass exactly one of --from-library (a search space) or --peptides")
     if args.output_library is not None:
         return fail("--output-library is not used with --backend jchronologer; the library is <output-dir>/library_pqdir")
+    try:
+        specs = model_specs(args)
+    except ValueError as exc:
+        return fail(str(exc))
+    uses_koina = any(spec.startswith("koina:") for spec in specs.values())
+    if args.koina_url is not None and not uses_koina:
+        return fail("--koina-url has no effect: no koina:<model> is chosen")
     if args.min_charge_probability is not None:
-        if args.no_charge_states:
+        if "charge_state" not in specs:
             return fail("--min-charge-probability needs charge states; drop --no-charge-states")
         if not 0.0 <= args.min_charge_probability <= 1.0:
             return fail("--min-charge-probability must be between 0 and 1")
@@ -189,29 +244,46 @@ def run(args: argparse.Namespace) -> int:
     from constellation.massspec.tokenize.jchronologer import UnknownModelError
     from constellation.thirdparty.registry import ToolNotFoundError
 
-    try:
-        bundle = locate_bundle()
-    except (ToolNotFoundError, FileNotFoundError, UnknownModelError) as exc:
-        return fail(f"JChronologer is not available: {exc}")
+    bundle = None
+    if any(spec.startswith("jchronologer:") for spec in specs.values()):
+        try:
+            bundle = locate_bundle()
+        except (ToolNotFoundError, FileNotFoundError, UnknownModelError) as exc:
+            return fail(f"JChronologer is not available: {exc}")
     threads = args.threads or os.cpu_count() or 1
     batch_size = args.batch_size or DEFAULT_BATCH_SIZE
-    runtime = {"bundle": bundle, "threads": threads, "batch_size": batch_size, "device": args.device}
-    min_intensity = args.min_intensity if args.min_intensity is not None else DEFAULT_MIN_INTENSITY["jchronologer"]
-    predictors = {
-        "fragments": predictor("jchronologer:cartographer", min_intensity=min_intensity, **runtime),
-        "retention_time": predictor("jchronologer:chronologer", **runtime),
-    }
-    if not args.no_charge_states:
-        predictors["charge_state"] = predictor("jchronologer:electrician", **runtime)
-    if not args.no_ccs:
-        predictors["ccs"] = predictor("jchronologer:sculptor", **runtime)
+    predictors = {}
+    for prop, spec in specs.items():
+        backend = spec.partition(":")[0]
+        options: dict = (
+            {"bundle": bundle, "threads": threads, "batch_size": batch_size, "device": args.device}
+            if backend == "jchronologer"
+            else {"server": args.koina_url}
+            if backend == "koina"
+            else {}
+        )
+        if prop == "fragments":
+            options["min_intensity"] = (
+                args.min_intensity if args.min_intensity is not None else DEFAULT_MIN_INTENSITY.get(backend, 0.01)
+            )
+        try:
+            predictors[prop] = predictor(spec, property=prop, **options)
+        except ValueError as exc:
+            return fail(str(exc))
+        except Exception as exc:  # a Koina model the server does not serve, or no network
+            return fail(f"could not set up {spec}: {exc}")
+    fragments = predictors.get("fragments")
+    if fragments is not None and not fragments.capabilities.needs_collision_energy:
+        if table is not None or len(energies) and energies[0] is not None:
+            return fail(f"{fragments.name} takes no collision energy; drop the energy flags")
+        energy = None
 
     key = stage_key(
         stage="massspec predict-library jchronologer",
         library=_library_key(source),
         peptide_charges=None if args.from_library is not None else [args.min_charge, args.max_charge],
         predictors={prop: p.identity() for prop, p in predictors.items()},
-        collision_energy=energy.describe(charges),
+        collision_energy=energy.describe(charges) if energy is not None else None,
         min_charge_probability=args.min_charge_probability,
     )
     if is_done(output_dir, key):
@@ -271,7 +343,9 @@ def run(args: argparse.Namespace) -> int:
             "version": bundle.version,
             "jar_path": str(bundle.jar),
             "jar_sha256": bundle.jar_sha256,
-        },
+        }
+        if bundle is not None
+        else {"name": "koina"},
         inputs={"peptides": source} if source.is_file() else {},
         outputs={"library_pqdir": pqdir, "dlib": dlib},
         runtime={
@@ -298,11 +372,17 @@ def run(args: argparse.Namespace) -> int:
 
 
 def _print_summary(report, energy, charges, output_dir: Path) -> None:
-    table = ", ".join(f"{z}+ {e:g}" for z, e in energy.by_charge(charges).items())
+    table = (
+        "NCE by charge: " + ", ".join(f"{z}+ {e:g}" for z, e in energy.by_charge(charges).items())
+        if energy is not None
+        else "no collision energy"
+    )
     print(
         f"predicted {report.precursors_kept} of {report.precursors} precursors "
-        f"({report.requests_predicted} requests, {report.fragments} fragments); NCE by charge: {table}"
+        f"({report.requests_predicted} requests, {report.fragments} fragments); {table}"
     )
+    for prop, identity in report.predictors.items():
+        print(f"  {prop}: {identity.get('backend')}:{identity.get('model')}")
     for prop, reasons in report.refused.items():
         for reason, n in reasons.items():
             shown = "; ".join(report.examples.get(prop, {}).get(reason, [])[:3])

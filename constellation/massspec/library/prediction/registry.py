@@ -1,5 +1,11 @@
 """Predictors by name: ``backend:model`` → a predictor, imported lazily.
 
+``jchronologer:{chronologer,cartographer,electrician,sculptor}`` are
+EncyclopeDIA's models in PyTorch; ``koina:<model>`` is any model the
+Koina server serves (``koina:Prosit_2020_intensity_HCD``,
+``koina:Chronologer_RT``), its property read from the overlay
+(``koina.models``) or given.
+
 ``predictor("jchronologer:cartographer", threads=8)`` builds one;
 ``default_predictors("jchronologer")`` builds a backend's default set,
 one per property asked for. Nothing here imports torch, a model or
@@ -28,20 +34,52 @@ BACKENDS: dict[str, dict[str, tuple[str, str, Property]]] = {
 }
 
 
-def _entry(spec: str) -> tuple[str, str, tuple[str, str, Property]]:
+#: Koina serves any model by name: the class for each property it can predict.
+KOINA = {
+    "fragments": ("constellation.massspec.library.koina.predictor", "KoinaFragments"),
+    "retention_time": ("constellation.massspec.library.koina.predictor", "KoinaRetentionTime"),
+}
+
+
+def _koina_property(model: str, prop: Property | None) -> Property:
+    from constellation.massspec.library.koina.models import MS2_MODELS, RT_MODELS
+
+    known = "fragments" if model in MS2_MODELS else "retention_time" if model in RT_MODELS else None
+    if prop is not None:
+        if prop not in KOINA:
+            raise ValueError(f"Koina predictors here give {', '.join(KOINA)}, not {prop}")
+        if known is not None and known != prop:
+            raise ValueError(f"koina:{model} predicts {known}, not {prop}")
+        return prop
+    if known is None:
+        raise ValueError(f"koina:{model} is not in the overlay (koina.models); say which property it predicts")
+    return known
+
+
+def _entry(spec: str, prop: Property | None = None) -> tuple[str, str, tuple[str, str, Property]]:
     backend, sep, model = spec.partition(":")
+    if sep and backend == "koina" and model:
+        found = _koina_property(model, prop)
+        return backend, model, (*KOINA[found], found)
     if not sep or backend not in BACKENDS or model not in BACKENDS[backend]:
         known = ", ".join(f"{b}:{m}" for b, models in BACKENDS.items() for m in models)
-        raise ValueError(f"unknown predictor {spec!r} (known: {known})")
-    return backend, model, BACKENDS[backend][model]
+        raise ValueError(f"unknown predictor {spec!r} (known: {known}, or koina:<model>)")
+    entry = BACKENDS[backend][model]
+    if prop is not None and entry[2] != prop:
+        raise ValueError(f"{spec} predicts {entry[2]}, not {prop}")
+    return backend, model, entry
 
 
-def predictor(spec: str, **options: Any) -> Predictor:
-    """The predictor ``backend:model``, built with ``options`` (runtime
-    settings such as ``threads``, ``batch_size``, ``device``; a shared
-    ``bundle`` for JChronologer)."""
-    _, _, (module, name, _) = _entry(spec)
-    return getattr(import_module(module), name)(**options)
+def predictor(spec: str, *, property: Property | None = None, **options: Any) -> Predictor:
+    """The predictor ``backend:model`` (``koina:<any model>`` too), built
+    with ``options``: runtime settings such as ``threads``,
+    ``batch_size``, ``device`` and a shared ``bundle`` for JChronologer;
+    ``server`` / ``client`` / ``min_intensity`` for Koina. ``property``
+    says what a Koina model the overlay does not know predicts, and is
+    checked against the model otherwise."""
+    backend, model, (module, name, _) = _entry(spec, property)
+    cls = getattr(import_module(module), name)
+    return cls(model, **options) if backend == "koina" else cls(**options)
 
 
 def property_of(spec: str) -> Property:

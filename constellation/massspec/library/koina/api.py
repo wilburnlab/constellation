@@ -27,7 +27,6 @@ import pyarrow as pa
 from constellation.massspec.library.digest import (
     PrecursorSpec,
     precursors_from_fasta,
-    precursors_from_library,
 )
 from constellation.massspec.library.koina._modseq import (
     KoinaModSeqError,
@@ -48,7 +47,7 @@ from constellation.massspec.library.koina.models import (
     ms2_model,
     rt_model,
 )
-from constellation.massspec.library.library import Library, attach_predictions
+from constellation.massspec.library.library import Library
 from constellation.massspec.library.prediction.collision_energy import (
     DEFAULT_REFERENCE_CHARGE,
     CollisionEnergy,
@@ -371,12 +370,17 @@ def predict_library(
     """FASTA (or an explicit precursor grid, or a library) → a predicted
     ``Library``.
 
-    Given ``library``, its own precursors are predicted and the result is
-    that library with the predicted fragments and retention times put onto
-    it (:func:`~constellation.massspec.library.library.attach_predictions`):
-    its decoys, spans and modification provenance survive, and a precursor
-    the model could not take is left out and counted in the metadata
-    (``x.koina.precursors_not_predicted``).
+    Given ``library``, its own precursors are predicted through
+    :func:`~constellation.massspec.library.prediction.predict_onto` with
+    :class:`~constellation.massspec.library.koina.predictor.KoinaFragments`
+    (and :class:`KoinaRetentionTime`): isotope labels are taken off for the
+    request and the m/z come from each precursor's own peptide; its decoys,
+    spans and modification provenance survive. With ``on_unsupported=
+    "error"`` a precursor the model cannot take raises before any request;
+    with ``"skip"`` it is left out with its target/decoy partners and
+    counted (``x.koina.precursors_not_predicted``). A fragment the model
+    names that the peptide cannot have is left out and counted
+    (``n_unparseable_annotations``).
 
     The energy each charge was predicted at is recorded as
     ``x.massspec.prediction.collision_energy``
@@ -387,13 +391,13 @@ def predict_library(
     if library is not None:
         if digest_kwargs:
             raise TypeError(f"unexpected keyword argument(s) {sorted(digest_kwargs)} with library=")
-        predicted, stats = predict_library(
-            specs=precursors_from_library(library),
+        return _predict_onto_library(
+            library,
             ms2_model_name=ms2_model_name,
             rt_model_name=rt_model_name,
-            collision_energy=collision_energy,
-            adjust_nce_for_dia=adjust_nce_for_dia,
-            nce_reference_charge=nce_reference_charge,
+            energy=collision_energy_for(
+                collision_energy, adjust_nce_for_dia=adjust_nce_for_dia, nce_reference_charge=nce_reference_charge
+            ),
             server=server,
             min_intensity=min_intensity,
             on_unsupported=on_unsupported,
@@ -403,8 +407,6 @@ def predict_library(
             ms2_client=ms2_client,
             rt_client=rt_client,
         )
-        merged, counts = attach_predictions(library, predicted)
-        return merged.with_metadata({"x.koina.precursors_not_predicted": counts["precursors_not_predicted"]}), stats
     if specs is None:
         specs = precursors_from_fasta(fasta, **digest_kwargs)
     elif digest_kwargs:
@@ -438,12 +440,20 @@ def predict_library(
 
     rt_seconds: dict[str, float] = {}
     if rt_model_name:
-        rt_seconds = predict_rt(
-            [s.modified_sequence for s in sent],
-            model=rt_model_name,
-            server=server,
-            client=rt_client,
-        )
+        # Koina's RT models read the same dialect as its fragment models;
+        # the seconds are keyed back by the spec's own sequence.
+        from constellation.massspec.library.koina.predictor import koina_sequence
+        from constellation.massspec.tokenize.vocabulary import Sites
+
+        on_residue = rt_model(rt_model_name).pyro_glu_on_first_residue
+        koina_form = {
+            s.modified_sequence: koina_sequence(
+                Sites.from_peptidoform(s.modified_sequence), pyro_glu_on_first_residue=on_residue
+            )
+            for s in sent
+        }
+        by_koina = predict_rt(list(dict.fromkeys(koina_form.values())), model=rt_model_name, server=server, client=rt_client)
+        rt_seconds = {m: by_koina[k] for m, k in koina_form.items()}
 
     meta = {
         "x.koina.ms2_model": ms2_model_name,
@@ -466,6 +476,69 @@ def predict_library(
         min_intensity=min_intensity,
         metadata=meta,
     )
+
+
+def _predict_onto_library(
+    library: Library,
+    *,
+    ms2_model_name: str,
+    rt_model_name: str | None,
+    energy: CollisionEnergy | None,
+    server: str | None,
+    min_intensity: float,
+    on_unsupported: str,
+    fragmentation: str | None,
+    instrument: str,
+    metadata: Mapping[str, Any] | None,
+    ms2_client: PredictClient | None,
+    rt_client: PredictClient | None,
+) -> tuple[Library, AssemblyStats]:
+    """``predict_library(library=...)``: the library's own precursors,
+    through the prediction contract."""
+    from constellation.massspec.library.koina.predictor import KoinaFragments, KoinaRetentionTime
+    from constellation.massspec.library.prediction.run import PredictionRefused, predict_onto
+
+    if on_unsupported not in ("error", "skip"):
+        raise ValueError(f"on_unsupported must be 'error' or 'skip', not {on_unsupported!r}")
+    fragments = KoinaFragments(
+        ms2_model_name, server=server, client=ms2_client, min_intensity=min_intensity,
+        fragmentation=fragmentation, instrument=instrument,
+    )
+    takes_energy = fragments.capabilities.needs_collision_energy
+    if takes_energy and energy is None:
+        raise KoinaInputError(f"{ms2_model_name} requires a collision energy; pass collision_energy=...")
+    if not takes_energy and energy is not None:
+        raise KoinaInputError(
+            f"{ms2_model_name} does not accept a collision energy — it declares inputs "
+            f"{sorted(fragments.declared)}. Supplying one would be silently ignored and "
+            f"every energy would yield an identical prediction."
+        )
+    predictors: dict[str, Any] = {"fragments": fragments}
+    if rt_model_name:
+        predictors["retention_time"] = KoinaRetentionTime(rt_model_name, server=server, client=rt_client)
+    try:
+        predicted, report = predict_onto(library, predictors, collision_energy=energy, strict=on_unsupported == "error")
+    except PredictionRefused as exc:
+        raise KoinaInputError(f"{exc}\nFilter them out, or pass on_unsupported='skip'.") from exc
+    except ValueError as exc:
+        raise KoinaInputError(str(exc)) from exc
+    meta = {
+        "x.koina.ms2_model": ms2_model_name,
+        "x.koina.rt_model": rt_model_name or "",
+        "x.koina.collision_energy": energy.nce if energy is not None else None,
+        "x.koina.instrument": instrument,
+        "x.koina.adjust_nce_for_dia": energy is not None and energy.origin == "scaled_from_reference",
+        "x.koina.rt_scale": rt_model(rt_model_name).scale if rt_model_name else "",
+        "x.koina.precursors_not_predicted": report.dropped,
+        **(metadata or {}),
+    }
+    stats = AssemblyStats(
+        n_precursors=report.precursors_kept,
+        n_fragments=report.fragments,
+        n_unparseable_annotations=fragments.unparsed,
+        max_abs_ppm_deviation=report.max_reported_mz_error_ppm or 0.0,
+    )
+    return predicted.with_metadata(meta), stats
 
 
 __all__ = [
