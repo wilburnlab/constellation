@@ -14,6 +14,7 @@ from constellation.core.sequence.protein import (
     PROTEASES,
     SiteContext,
     cleave,
+    count_modforms,
     enumerate_modforms,
     peptide_mass,
 )
@@ -164,6 +165,90 @@ def test_return_origin() -> None:
         (0, "UNIMOD:35", "variable", "M"),
         (1, "UNIMOD:4", "fixed", "C"),
     ]
+
+
+def _texts(forms) -> list[str]:
+    return [format_proforma(f) for f in forms]
+
+
+def test_an_isotopic_substitution_stacks_with_a_chemical_modification() -> None:
+    # heavy lysine (UNIMOD:259) leaves the amine free for an acetyl
+    fixed_label = enumerate_modforms("PEPKK", fixed={"K": "UNIMOD:259"}, variable={"K": "UNIMOD:1"}, max_variable=2)
+    assert "PEPK[UNIMOD:1][UNIMOD:259]K[UNIMOD:1][UNIMOD:259]" in {canonical(f) for f in fixed_label}
+    assert len(fixed_label) == 4
+    both_variable = enumerate_modforms("PEPK", variable={"K": ["UNIMOD:259", "UNIMOD:1"]}, max_variable=2)
+    assert {canonical(f) for f in both_variable} == {
+        "PEPK", "PEPK[UNIMOD:259]", "PEPK[UNIMOD:1]", "PEPK[UNIMOD:1][UNIMOD:259]"
+    }
+    # a fixed label and a fixed chemical modification share the residue
+    assert _texts(enumerate_modforms("PEPK", fixed={"K": ["UNIMOD:259", "UNIMOD:36"]})) == [
+        "PEPK[UNIMOD:36][UNIMOD:259]"
+    ]
+    with pytest.raises(ValueError, match="fixed site"):
+        enumerate_modforms("PEPK", fixed={"K": ["UNIMOD:259", "UNIMOD:188"]})
+
+
+def canonical(form) -> str:
+    from constellation.massspec.library.ids import canonical_peptide_key
+
+    return canonical_peptide_key(form)
+
+
+def test_a_side_chain_cyclization_replaces_the_residue_modification() -> None:
+    # fixed CAM: the pyro-carbamidomethyl form carries no CAM on its C
+    forms = _texts(enumerate_modforms("CPEK", fixed={"C": "UNIMOD:4"}, variable={"N-term": "UNIMOD:26"}))
+    assert forms == ["C[UNIMOD:4]PEK", "[UNIMOD:26]-CPEK"]
+    # a deamidated Q is not also Gln->pyro-Glu
+    kw = dict(variable={"Q": "UNIMOD:7", "N-term": "UNIMOD:28"}, max_variable=3, skip_unlicensed=True)
+    forms = _texts(enumerate_modforms("QPQK", **kw))
+    assert "[UNIMOD:28]-QPQ[UNIMOD:7]K" in forms
+    assert not any(f.startswith("[UNIMOD:28]-Q[UNIMOD:7]") for f in forms)
+    assert count_modforms("QPQK", **kw) == len(forms) == 6  # 2**3, less the 2 with both on Q1
+
+
+def test_two_fixed_modifications_on_one_slot_raise() -> None:
+    ctx = SiteContext(protein_n_term=True)
+    with pytest.raises(ValueError, match="two fixed modifications"):
+        enumerate_modforms("APEK", fixed={"Protein N-term": "UNIMOD:1", "N-term": "UNIMOD:36"}, context=ctx,
+                           validate_specificity=False)
+    # inside the protein only one of them applies
+    assert _texts(enumerate_modforms(
+        "APEK", fixed={"Protein N-term": "UNIMOD:1", "N-term": "UNIMOD:36"}, context=SiteContext(),
+        validate_specificity=False,
+    )) == ["[UNIMOD:36]-APEK"]
+
+
+def test_counts_are_what_enumeration_returns() -> None:
+    """The DP count and the pruned walk agree on random specs mixing
+    limits, labels, cyclizations and fixed slots; the order is by number
+    of variable modifications, no form twice."""
+    rng = random.Random(29)
+    pool = {
+        "M": ["UNIMOD:35"], "S": ["UNIMOD:21"], "T": ["UNIMOD:21"], "Q": ["UNIMOD:7"], "N": ["UNIMOD:7"],
+        "K": ["UNIMOD:1", "UNIMOD:259"], "C": ["UNIMOD:4"], "N-term": ["UNIMOD:1", "UNIMOD:26", "UNIMOD:28"],
+    }
+    for _ in range(300):
+        seq = rng.choice("CQEMSK") + "".join(rng.choice("ACDEKMNQST") for _ in range(rng.randint(1, 10)))
+        variable = {site: keys for site, keys in pool.items() if rng.random() < 0.6}
+        fixed = {"C": "UNIMOD:4"} if rng.random() < 0.5 else {}
+        variable.pop("C", None) if fixed else None
+        limits = {"UNIMOD:21": rng.randint(0, 2)} if rng.random() < 0.5 else None
+        kw = dict(fixed=fixed, variable=variable, max_variable=rng.randint(0, 4), max_per_mod=limits,
+                  skip_unlicensed=True)
+        forms = enumerate_modforms(seq, **kw)
+        assert len(forms) == count_modforms(seq, **kw)
+        texts = [canonical(f) for f in forms]
+        assert len(set(texts)) == len(texts)
+
+
+def test_a_limit_prunes_the_walk() -> None:
+    import time
+
+    start = time.perf_counter()
+    forms = enumerate_modforms("M" * 40, variable={"M": "UNIMOD:35"}, max_variable=40, max_per_mod={"UNIMOD:35": 2})
+    assert len(forms) == 1 + 40 + 40 * 39 // 2
+    assert count_modforms("M" * 60, variable={"M": "UNIMOD:35"}, max_variable=60) == 2**60
+    assert time.perf_counter() - start < 2.0
 
 
 # ── permutation ───────────────────────────────────────────────────────

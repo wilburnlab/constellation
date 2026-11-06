@@ -282,6 +282,94 @@ class Library:
             ),
         )
 
+    def subset_precursors(self, precursor_ids: Iterable[int] | pa.Array | pa.ChunkedArray) -> Library:
+        """The library holding only these precursors and what they need:
+        their fragments; the peptides left with a precursor, a decoy only
+        with its target; those peptides' modification rows, span edges and
+        protein edges, and the spans still making one. Proteins are kept."""
+        if isinstance(precursor_ids, pa.ChunkedArray):
+            precursor_ids = precursor_ids.combine_chunks()
+        elif not isinstance(precursor_ids, pa.Array):
+            precursor_ids = pa.array(list(precursor_ids), type=pa.int64())
+        precursors = self.precursors.filter(pc.is_in(self.precursors.column("precursor_id"), value_set=precursor_ids))
+        with_precursor = pc.unique(precursors.column("peptide_id").combine_chunks())
+        peptides = self.peptides.filter(pc.is_in(self.peptides.column("peptide_id"), value_set=with_precursor))
+        # A decoy goes with its target: decoy_of must name a kept peptide.
+        orphan = pc.and_(
+            pc.is_valid(peptides.column("decoy_of")),
+            pc.invert(pc.fill_null(pc.is_in(peptides.column("decoy_of"), value_set=peptides.column("peptide_id").combine_chunks()), False)),
+        )
+        peptides = peptides.filter(pc.invert(orphan))
+        keep = peptides.column("peptide_id").combine_chunks()
+        precursors = precursors.filter(pc.is_in(precursors.column("peptide_id"), value_set=keep))
+        span_peptide = self.span_peptide.filter(pc.is_in(self.span_peptide.column("peptide_id"), value_set=keep))
+        spans = self.peptide_spans
+        if spans.num_rows:
+            used = span_peptide.select(list(SPAN_KEY)).group_by(list(SPAN_KEY)).aggregate([])
+            spans = spans.join(used, keys=list(SPAN_KEY), join_type="left semi")
+            spans = spans.take(pc.sort_indices(spans, sort_keys=[(k, "ascending") for k in SPAN_KEY]))
+        return replace(
+            self,
+            peptides=peptides,
+            precursors=precursors,
+            fragments=self.fragments.filter(
+                pc.is_in(self.fragments.column("precursor_id"), value_set=precursors.column("precursor_id").combine_chunks())
+            ),
+            protein_peptide=self.protein_peptide.filter(pc.is_in(self.protein_peptide.column("peptide_id"), value_set=keep)),
+            peptide_spans=spans,
+            span_peptide=span_peptide,
+            peptide_modifications=self.peptide_modifications.filter(
+                pc.is_in(self.peptide_modifications.column("peptide_id"), value_set=keep)
+            ),
+        )
+
+
+def attach_predictions(source: Library, predicted: Library) -> tuple[Library, dict[str, int]]:
+    """``source`` with ``predicted``'s fragments and retention times.
+
+    What a prediction of a library's own precursors should return: the
+    source library, with everything it says about them (which are decoys
+    and of what, the spans that make each peptide, each modification and
+    why), not the flat library a predictor rebuilds from bare
+    (sequence, charge) pairs. Precursors are matched on (modified
+    sequence, charge); a predicted retention time replaces the source's
+    unless it is unset (−1). A source precursor the predictor did not
+    return (a modification the model cannot take, skipped) is left out,
+    with what only it needed (:meth:`Library.subset_precursors`), and
+    counted. Returns the library and the counts.
+    """
+
+    def keyed(lib: Library) -> pa.Table:
+        return lib.precursors.select(["precursor_id", "peptide_id", "charge", "rt_predicted"]).join(
+            lib.peptides.select(["peptide_id", "modified_sequence"]), keys="peptide_id"
+        )
+
+    src = keyed(source).select(["precursor_id", "modified_sequence", "charge"])
+    got = keyed(predicted).select(["precursor_id", "modified_sequence", "charge", "rt_predicted"])
+    got = got.rename_columns(["predicted_id", "modified_sequence", "charge", "predicted_rt"])
+    pairs = src.join(got, keys=["modified_sequence", "charge"], join_type="inner")
+    out = source.subset_precursors(pairs.column("precursor_id"))
+
+    at = pc.index_in(out.precursors.column("precursor_id"), value_set=pairs.column("precursor_id").combine_chunks())
+    new_rt = pc.take(pairs.column("predicted_rt"), at)
+    old_rt = out.precursors.column("rt_predicted")
+    rt = pc.if_else(pc.greater_equal(pc.fill_null(new_rt, -1.0), 0.0), new_rt, old_rt)
+    precursors = out.precursors.set_column(
+        out.precursors.schema.get_field_index("rt_predicted"), "rt_predicted", rt
+    )
+    fragments = predicted.fragments
+    to = pc.index_in(fragments.column("precursor_id"), value_set=pairs.column("predicted_id").combine_chunks())
+    fragments = fragments.set_column(
+        fragments.schema.get_field_index("precursor_id"), "precursor_id", pc.take(pairs.column("precursor_id"), to)
+    ).filter(pc.is_valid(to))
+    counts = {
+        "precursors": out.precursors.num_rows,
+        "precursors_not_predicted": source.precursors.num_rows - out.precursors.num_rows,
+        "fragments": fragments.num_rows,
+    }
+    merged = {**source.metadata_extras, **predicted.metadata_extras}
+    return replace(out, precursors=precursors, fragments=fragments, metadata_extras=merged), counts
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Validation helpers
@@ -547,4 +635,4 @@ def _to_table(rows: Sequence[dict[str, Any]], schema: pa.Schema) -> pa.Table:
     return pa.Table.from_pylist(list(rows), schema=schema)
 
 
-__all__ = ["Library", "assign_ids"]
+__all__ = ["Library", "assign_ids", "attach_predictions"]

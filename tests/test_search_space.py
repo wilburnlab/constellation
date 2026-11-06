@@ -259,6 +259,69 @@ def test_rule_parsing() -> None:
         SearchSpaceSettings(rules=(ModRule.parse("Carbamidomethyl@C", "fixed"), ModRule.parse("Propionamide@C", "fixed")))
 
 
+def test_fixed_rules_conflict_only_where_both_apply() -> None:
+    # Gln->pyro-Glu and Glu->pyro-Glu are both N-terminal, on different residues
+    SearchSpaceSettings(rules=(ModRule.parse("UNIMOD:28", "fixed"), ModRule.parse("UNIMOD:27", "fixed")))
+    # SILAC lysine and a chemical modification of lysine share the residue
+    SearchSpaceSettings(rules=(ModRule.parse("UNIMOD:259@K", "fixed"), ModRule.parse("Dimethyl@K", "fixed")))
+    with pytest.raises(ValueError, match="two fixed"):
+        SearchSpaceSettings(rules=(ModRule.parse("UNIMOD:259@K", "fixed"), ModRule.parse("UNIMOD:188@K", "fixed")))
+    with pytest.raises(ValueError, match="two fixed"):
+        SearchSpaceSettings(rules=(ModRule.parse("Amidated@Protein C-term", "fixed"), ModRule.parse("Methyl@C-term", "fixed")))
+
+
+def test_links_are_refused_and_monolinks_are_not() -> None:
+    for linked in ("UNIMOD:374@C", "UNIMOD:1898@K", "UNIMOD:1896@K"):
+        with pytest.raises(ValueError, match="links two residues"):
+            ModRule.parse(linked, "variable")
+    assert ModRule.parse("UNIMOD:1020@K", "variable").sites == ("K",)  # water-quenched DSS monolink
+    assert ModRule.parse("UNIMOD:824@C", "variable").sites == ("C",)  # BMOE: intact or monolink
+
+
+def test_label_spellings_are_one_state() -> None:
+    assert parse_label("P=D,2H,15N") == ("P", ("15N", "2H"))
+    for bad in ("P=33S,34S", "P=99C", "P=13C,12C", "P=Cx"):
+        with pytest.raises(ValueError):
+            parse_label(bad)
+    s = SearchSpaceSettings(labels=(("P", ("D",)), ("P", ("2H",))))
+    assert s.labels == (("P", ("2H",)),)
+
+
+def test_labels_and_isotopic_substitutions_do_not_mix(fasta: Path) -> None:
+    with pytest.raises(ValueError, match="label one residue's atoms twice"):
+        build_search_space(
+            [fasta], _settings(labels=(("P1", ("13C",)),), rules=(ModRule.parse("UNIMOD:259@K", "fixed"),))
+        )
+
+
+def test_unmatched_termini_are_refused(fasta: Path) -> None:
+    with pytest.raises(ValueError, match="protein termini name no protein"):
+        build_search_space([fasta], _settings(protein_termini=(("P9", 3, None),)))
+
+
+def test_heavy_lysine_keeps_its_acetylated_forms(fasta: Path) -> None:
+    lib = build_search_space(
+        [fasta], _settings(rules=(ModRule.parse("UNIMOD:259@K", "fixed"), ModRule.parse("Acetyl@K", "variable")))
+    )
+    texts = set(lib.peptides.column("modified_sequence").to_pylist())
+    assert "AVNEMTEFAK[UNIMOD:259]" in texts and "AVNEMTEFAK[UNIMOD:1][UNIMOD:259]" in texts
+    rows = lib.peptide_modifications.to_pylist()
+    assert {(r["modification"], r["origin"]) for r in rows} >= {("UNIMOD:259", "fixed"), ("UNIMOD:1", "variable")}
+
+
+def test_subsetting_precursors_takes_decoys_with_their_targets(fasta: Path) -> None:
+    lib = build_search_space([fasta], _settings(decoys=(DecoySet(),)))
+    peptides = lib.peptides.to_pylist()
+    target = next(r for r in peptides if not r["is_decoy"] and any(d["decoy_of"] == r["peptide_id"] for d in peptides))
+    drop = pc.equal(lib.precursors.column("peptide_id"), target["peptide_id"])
+    sub = lib.subset_precursors(lib.precursors.filter(pc.invert(drop)).column("precursor_id"))
+    left = set(sub.peptides.column("peptide_id").to_pylist())
+    assert target["peptide_id"] not in left
+    assert not any(r["decoy_of"] == target["peptide_id"] for r in sub.peptides.to_pylist())
+    assert sub.peptide_spans.num_rows <= lib.peptide_spans.num_rows
+    assert set(sub.span_peptide.column("peptide_id").to_pylist()) <= left
+
+
 # ── digest.precursors_from_fasta, as a projection ──────────────────────
 
 

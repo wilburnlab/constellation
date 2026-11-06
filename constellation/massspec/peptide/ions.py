@@ -246,6 +246,15 @@ def _isotope_shift_for_composition(
     return total
 
 
+def _mod_isotope_shift(d_comp: Composition, isotopes: tuple[str, ...]) -> float:
+    """The label shift of a modification: a global label covers the chain,
+    so the atoms a modification removes are labelled and those it adds are
+    natural (``core.sequence.protein.labelled_compositions``)."""
+    if not isotopes:
+        return 0.0
+    return _isotope_shift_for_composition(Composition(d_comp.counts.clamp(max=0)), isotopes)
+
+
 def _modref_canonical_id(modref: ModRef, vocab: ModVocab) -> str | None:
     """Canonical mod id used by ``loss_applies`` triggering checks.
 
@@ -574,7 +583,7 @@ def _prepare_linear_inputs(
         pos_mass[pos] += (
             d_comp.mass
             + d_mass
-            + _isotope_shift_for_composition(d_comp, isotopes)
+            + _mod_isotope_shift(d_comp, isotopes)
         )
         cid = _modref_canonical_id(modref, vocab)
         if cid is not None:
@@ -593,7 +602,7 @@ def _prepare_linear_inputs(
             continue
         d_comp, d_mass = _modref_contribution(tm.mod, vocab, monoisotopic=True)
         n_term_extra += (
-            d_comp.mass + d_mass + _isotope_shift_for_composition(d_comp, isotopes)
+            d_comp.mass + d_mass + _mod_isotope_shift(d_comp, isotopes)
         )
         cid = _modref_canonical_id(tm.mod, vocab)
         if cid is not None:
@@ -603,7 +612,7 @@ def _prepare_linear_inputs(
             continue
         d_comp, d_mass = _modref_contribution(tm.mod, vocab, monoisotopic=True)
         c_term_extra += (
-            d_comp.mass + d_mass + _isotope_shift_for_composition(d_comp, isotopes)
+            d_comp.mass + d_mass + _mod_isotope_shift(d_comp, isotopes)
         )
         cid = _modref_canonical_id(tm.mod, vocab)
         if cid is not None:
@@ -612,7 +621,7 @@ def _prepare_linear_inputs(
     for modref, locations in peptidoform.fixed_mods:
         d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=True)
         single_extra = (
-            d_comp.mass + d_mass + _isotope_shift_for_composition(d_comp, isotopes)
+            d_comp.mass + d_mass + _mod_isotope_shift(d_comp, isotopes)
         )
         cid = _modref_canonical_id(modref, vocab)
         for loc in locations:
@@ -717,7 +726,9 @@ def _run_linear_batch(
 
     loss_deltas = torch.zeros(n_losses, dtype=torch.float64)
     for i, lid in enumerate(loss_ids, start=1):
-        loss_deltas[i] = LOSS_REGISTRY.get(lid).delta_mass
+        loss = LOSS_REGISTRY.get(lid)
+        # what is lost comes off the (labelled) chain
+        loss_deltas[i] = loss.delta_mass + _isotope_shift_for_composition(loss.delta_composition, isotopes)
     # (B, n_pos, n_types, n_losses)
     neutral_with_loss = (
         neutral_no_loss[:, :, :, None] - loss_deltas[None, None, None, :]

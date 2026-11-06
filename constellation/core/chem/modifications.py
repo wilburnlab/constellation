@@ -98,7 +98,8 @@ class Modification:
     """A named composition delta — e.g. UNIMOD:35 (Oxidation).
 
     `delta_composition` is the *light-atom skeleton*. For heavy-isotope
-    mods (UNIMOD:737 TMT10, UNIMOD:259 SILAC ¹³C₆), the skeleton's mass
+    mods (UNIMOD:737 TMT6plex/10plex, UNIMOD:259 SILAC ¹³C₆¹⁵N₂ lysine,
+    UNIMOD:188 SILAC ¹³C₆), the skeleton's mass
     differs from the canonical mono mass by the heavy-isotope offset;
     `mass_override` then holds the canonical mass and
     `is_canonical_decomposition` returns False.
@@ -181,6 +182,16 @@ class Modification:
         """True iff the delta's mass equals the light-skeleton's mass —
         i.e. the modification carries no heavy isotopes."""
         return self.mass_override is None
+
+    @property
+    def is_isotopic_substitution(self) -> bool:
+        """True iff the modification adds and removes no atoms and only
+        makes some of the residue's own atoms heavier (SILAC lysine and
+        arginine, UNIMOD's ``Label:`` entries): a ``mass_override`` over an
+        empty skeleton. Such a label leaves the residue's reactive groups
+        free, so it can sit on a residue beside a chemical modification
+        (heavy lysine, acetylated)."""
+        return self.mass_override is not None and not self.delta_composition.atoms
 
     @property
     def has_n_term_specificity(self) -> bool:

@@ -34,9 +34,11 @@ sequence, with I and L made equal, is a target's (or a decoy already made
 in the same build) gives way to the next one: after a method's own
 candidate, terminal-preserving shuffles seeded by the target's sequence;
 if none qualifies, the target goes without a decoy in that set and is
-counted. Seeding by the sequence, not by row, makes a set independent of
-the order targets come in, and gives all modified forms of one peptide
-the same decoy sequence.
+counted. Seeding by the sequence, not by row, and settling the sequences
+in sorted order (so that, when two propose the same decoy, which keeps it
+is decided the same way every time) make a set independent of the order
+targets come in, and give all modified forms of one peptide the same
+decoy sequence.
 
 A set is a method, a seed and an index: index 0 is the set that competes
 with the targets, 1 and up are extra sets (entrapment). Every decoy
@@ -206,25 +208,27 @@ def peptide_decoys(
     method = DECOY_METHODS[decoy_set.method]
     if method.level != "peptide" or method.orders is None:
         raise ValueError(f"{decoy_set.method} is not a peptide-level method")
+    # Each target sequence's order is decided once, in sorted sequence order:
+    # two sequences can propose the same decoy, and which keeps it must not
+    # depend on the order the FASTA listed them in.
     chosen: dict[str, list[int] | None] = {}  # target sequence → order (None: dropped)
+    n_fallback = n_dropped = 0
+    for seq in sorted({pf.sequence for pf in targets}):
+        pick = None
+        for attempt, order in enumerate(method.orders(seq, decoy_set.index, decoy_set.seed)):
+            candidate = il_key("".join(seq[k] for k in order))
+            if candidate not in taken:
+                pick = order
+                n_fallback += attempt > 0
+                taken.add(candidate)
+                break
+        chosen[seq] = pick
     made: set[str] = set()
     target: list[int] = []
     decoy: list[Peptidoform] = []
     orders: list[list[int]] = []
-    n_fallback = n_dropped = 0
     for i, pf in enumerate(targets):
-        seq = pf.sequence
-        if seq not in chosen:
-            pick = None
-            for attempt, order in enumerate(method.orders(seq, decoy_set.index, decoy_set.seed)):
-                candidate = il_key("".join(seq[k] for k in order))
-                if candidate not in taken:
-                    pick = order
-                    n_fallback += attempt > 0
-                    taken.add(candidate)
-                    break
-            chosen[seq] = pick
-        order = chosen[seq]
+        order = chosen[pf.sequence]
         if order is None:
             n_dropped += 1
             continue

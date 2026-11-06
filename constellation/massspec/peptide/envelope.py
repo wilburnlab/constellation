@@ -13,12 +13,14 @@ Use:
                Required for Orbitrap-class resolution and labelled samples.
 
 Heavy-isotope mods (`mass_override` on TMT / SILAC) shift the centerline
-uniformly via `peptide_mass`. Global ProForma isotope labels (``<13C>``,
-``<15N>``) shift the centerline through the same path; the binned-mode
-envelope shape is unaffected (¹³C-spacing approximation brackets the
-labeled centerline). Exact-mode global isotope labeling is deferred —
-it would require swapping the natural-abundance distribution with a
-labeled distribution at the `core.chem.isotopes` layer.
+uniformly via `peptide_mass`; their heavy atoms are still given natural
+variance (UNIMOD stores no per-atom isotopes for them). Global ProForma
+isotope labels (``<13C>``, ``<15N>``) are taken as full incorporation: the
+atoms a label covers (`core.sequence.protein.labelled_compositions`, the
+chain's) are each exactly that isotope, so they move the envelope without
+widening it, and the envelope's shape comes from the remaining atoms only,
+in both modes. Partial incorporation (a distribution of labelled atoms) is
+not represented, as ProForma 2.0 does not represent it either (§5.6).
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from typing import Literal
 
 import torch
 
+from constellation.core.chem.composition import Composition
 from constellation.core.chem.isotopes import (
     isotope_envelope,
     isotope_envelope_exact,
@@ -34,7 +37,11 @@ from constellation.core.chem.isotopes import (
 from constellation.core.chem.modifications import UNIMOD, ModVocab
 from constellation.core.sequence.alphabets import requires_canonical
 from constellation.core.sequence.proforma import Peptidoform
-from constellation.core.sequence.protein import peptide_composition, peptide_mass
+from constellation.core.sequence.protein import (
+    labelled_compositions,
+    peptide_composition,
+    peptide_mass,
+)
 from constellation.massspec.peptide.mz import PROTON_MASS
 
 EnvelopeMode = Literal["binned", "exact"]
@@ -87,14 +94,11 @@ def neutral_envelope(
     """A peptidoform's isotope envelope as neutral masses and intensities,
     before any charge: what `peptide_envelope` puts at each charge with
     `envelope_mz`, so the envelope of several charges is computed once."""
-    if peptidoform.global_isotopes and mode == "exact":
-        raise NotImplementedError(
-            "global isotope labels (<13C>, <15N>, ...) in exact-envelope "
-            "mode require a labeled isotope distribution at the "
-            "core.chem.isotopes layer; deferred until a concrete consumer "
-            "drives the design"
-        )
     composition = peptide_composition(peptidoform, vocab=vocab)
+    if peptidoform.global_isotopes:
+        # Labelled atoms are one isotope each: no variance, only mass.
+        labelled = labelled_compositions([peptidoform], vocab=vocab)[0]
+        composition = Composition(composition.counts - labelled)
 
     if mode == "binned":
         masses_neutral, intensities = isotope_envelope(composition, n_peaks=n_peaks)
@@ -106,9 +110,9 @@ def neutral_envelope(
         raise ValueError(f"unknown mode {mode!r}; expected 'binned' or 'exact'")
 
     # Centerline correction: peptide_mass already accounts for heavy-isotope
-    # `mass_override` and global isotope labeling. The skeleton mass from
-    # composition.mass underestimates by exactly that delta, so we shift
-    # the entire envelope uniformly.
+    # `mass_override` and global isotope labeling (and the labelled atoms
+    # left out of the composition above). The composition's mass falls
+    # short by exactly that, so the whole envelope is shifted.
     canonical_neutral = peptide_mass(peptidoform, vocab=vocab)
     skeleton_neutral = composition.mass
     offset = canonical_neutral - skeleton_neutral

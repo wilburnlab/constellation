@@ -30,7 +30,7 @@ from constellation.massspec.library.io import (
     register_writer,
     save_library,
 )
-from constellation.massspec.library.library import Library, assign_ids
+from constellation.massspec.library.library import Library, assign_ids, attach_predictions
 from constellation.massspec.library.schemas import (
     LIBRARY_FRAGMENT_TABLE,
     PEPTIDE_MODIFICATION_TABLE,
@@ -45,6 +45,7 @@ from constellation.massspec.library.schemas import (
 __all__ = [
     "Library",
     "assign_ids",
+    "attach_predictions",
     "PROTEIN_TABLE",
     "PEPTIDE_TABLE",
     "PRECURSOR_TABLE",

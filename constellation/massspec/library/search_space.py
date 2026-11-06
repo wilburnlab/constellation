@@ -52,11 +52,11 @@ from typing import Any, Literal
 import numpy as np
 import pyarrow as pa
 
-from constellation.core.chem.elements import PROTON_MASS
-from constellation.core.chem.modifications import UNIMOD, ModVocab
+from constellation.core.chem.elements import ELEMENTS, PROTON_MASS
+from constellation.core.chem.modifications import UNIMOD, Modification, ModVocab
 from constellation.core.io.fasta import iter_fasta, parse_header
-from constellation.core.stages import file_sha256
-from constellation.core.sequence.proforma import Peptidoform, format_proforma
+from constellation.core.sequence.alphabets import AA
+from constellation.core.sequence.proforma import Peptidoform, format_proforma, parse_isotope_label
 from constellation.core.sequence.protein import (
     C_TERM,
     N_TERM,
@@ -69,6 +69,7 @@ from constellation.core.sequence.protein import (
     enumerate_modforms,
     peptide_masses,
 )
+from constellation.core.stages import file_sha256
 from constellation.massspec.library.decoys import DecoySet, il_key, peptide_decoys, reverse_protein
 from constellation.massspec.library.library import Library
 from constellation.massspec.library.schemas import LIBRARY_FRAGMENT_TABLE
@@ -83,6 +84,7 @@ __all__ = [
     "SearchSpaceSettings",
     "build_search_space",
     "count_search_space",
+    "normalize_isotopes",
     "parse_label",
     "parse_protein_terminus",
     "rules_from_mapping",
@@ -188,9 +190,29 @@ class ModRule:
                     )
         if not sites:
             raise ValueError(f"rule {text!r} names no site")
+        _refuse_links(mod, text)
         if kind == "fixed" and limit is not None:
             raise ValueError(f"a fixed rule takes no max= ({text!r})")
         return cls(mod.id, tuple(dict.fromkeys(sites)), kind, limit, text.strip())
+
+
+#: Modifications that are one end of a link between two residues: placed on
+#: one residue of a linear peptide, they describe no molecule (a lone half
+#: disulfide; an intact crosslinker counted once per lysine it could reach).
+#: Linked species are not generated yet, so a rule naming one is refused.
+#: Quenched and hydrolysed monolinks, which are whole molecules on one
+#: residue, are not links.
+_HALF_LINKS = frozenset({"UNIMOD:374"})  # Dehydro: half of a disulfide bridge
+_INTACT_CROSSLINKER = re.compile(r"^Intact (?!or monolink).*cross-?link", re.IGNORECASE)
+
+
+def _refuse_links(mod: Modification, rule: str) -> None:
+    if mod.id in _HALF_LINKS or _INTACT_CROSSLINKER.match(mod.name):
+        raise ValueError(
+            f"{mod.id} ({mod.name}) links two residues (rule {rule!r}); a search space "
+            "holds linear peptidoforms, and linked species (disulfides, cross-links) "
+            "are not generated yet"
+        )
 
 
 def _site(token: str, rule: str) -> str:
@@ -243,11 +265,32 @@ def parse_label(text: str) -> tuple[str, tuple[str, ...]]:
     value = value.strip()
     if value.lower() == "light":
         return target.strip(), ()
-    isotopes = tuple(sorted(dict.fromkeys(v.strip().lstrip("<").rstrip(">") for v in value.split(",") if v.strip())))
+    raw = [v.strip().lstrip("<").rstrip(">") for v in value.split(",") if v.strip()]
+    return target.strip(), normalize_isotopes(raw, where=text)
+
+
+def normalize_isotopes(isotopes: Sequence[str], *, where: str = "") -> tuple[str, ...]:
+    """A label state's isotopes as ``<mass number><element>`` (``D`` →
+    ``2H``, ``T`` → ``3H``), each once, sorted: one spelling per state, so
+    that one molecule gets one key. An isotope the element does not have,
+    or two isotopes of one element (``33S,34S``: a whole-element label
+    makes every atom one isotope), is refused."""
+    out: dict[str, str] = {}  # element -> label
+    context = f" in {where!r}" if where else ""
     for iso in isotopes:
         if not re.fullmatch(r"\d+[A-Z][a-z]?|D|T", iso):
-            raise ValueError(f"not an isotope label: {iso!r} in {text!r}")
-    return target.strip(), isotopes
+            raise ValueError(f"not an isotope label: {iso!r}{context}")
+        mass_number, symbol = parse_isotope_label(iso)
+        try:
+            ELEMENTS[symbol].isotope_mass(mass_number)
+        except KeyError as exc:
+            raise ValueError(f"no such isotope: {iso!r}{context} ({exc})") from None
+        label = f"{mass_number}{symbol}"
+        have = out.get(symbol)
+        if have is not None and have != label:
+            raise ValueError(f"two isotopes of {symbol} in one label state: {have} and {label}{context}")
+        out[symbol] = label
+    return tuple(sorted(out.values()))
 
 
 def parse_protein_terminus(text: str) -> tuple[str, int | None, int | None]:
@@ -263,6 +306,54 @@ def parse_protein_terminus(text: str) -> tuple[str, int | None, int | None]:
     if start is not None and start < 1 or end is not None and end < 1 or (start and end and end < start):
         raise ValueError(f"bad terminus positions in {text!r}")
     return acc.strip(), start, end
+
+
+def _fixed_overlap(a: ModRule, site_a: str, b: ModRule, site_b: str) -> str | None:
+    """Where two fixed placements land on the same slot of some peptide,
+    as words, or None. Residue sites meet on the residue; terminal sites
+    (``N-term`` and ``Protein N-term`` both being the N-terminal slot of a
+    protein-terminal peptide) meet where both are licensed for some first
+    (last) residue, since a rule is placed only where UNIMOD licenses it."""
+    end_a, end_b = _TERMINUS_OF.get(site_a), _TERMINUS_OF.get(site_b)
+    if end_a is None or end_b is None:
+        return f"residue {site_a}" if site_a == site_b else None
+    if end_a != end_b:
+        return None
+    if a.modification not in UNIMOD or b.modification not in UNIMOD:
+        return f"the {end_a}"
+    mod_a, mod_b = UNIMOD[a.modification], UNIMOD[b.modification]
+    for residue in AA.tokens:
+        if mod_a.licenses(end_a, terminal_residue=residue, protein_terminus=True) and mod_b.licenses(
+            end_b, terminal_residue=residue, protein_terminus=True
+        ):
+            return f"the {end_a} of a protein-terminal peptide with {residue} there"
+    return None
+
+
+_TERMINUS_OF = {N_TERM: N_TERM, PROTEIN_N_TERM: N_TERM, C_TERM: C_TERM, PROTEIN_C_TERM: C_TERM}
+
+
+def _check_fixed_rules(rules: Sequence[ModRule]) -> None:
+    """Two fixed rules may not put different modifications on one slot:
+    which would win is a contradiction, not a precedence. An isotopic
+    substitution (SILAC) and a chemical modification share a residue."""
+    fixed = [r for r in rules if r.kind == "fixed"]
+
+    def layer(rule: ModRule) -> bool:
+        return rule.modification in UNIMOD and UNIMOD[rule.modification].is_isotopic_substitution
+
+    for i, a in enumerate(fixed):
+        for b in fixed[i + 1 :]:
+            if a.modification == b.modification or layer(a) != layer(b):
+                continue
+            for site_a in a.sites:
+                for site_b in b.sites:
+                    where = _fixed_overlap(a, site_a, b, site_b)
+                    if where is not None:
+                        raise ValueError(
+                            f"two fixed rules, {a.name or a.modification!r} and {b.name or b.modification!r}, "
+                            f"both place a modification on {where}; make one of them variable"
+                        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,14 +382,15 @@ class SearchSpaceSettings:
             raise ValueError(f"charges must be positive, got {self.charges}")
         if self.min_mz > self.max_mz:
             raise ValueError(f"min_mz {self.min_mz} > max_mz {self.max_mz}")
-        fixed_sites: dict[str, str] = {}
+        labels = tuple(
+            (target, normalize_isotopes(isotopes, where=f"{target}={','.join(isotopes)}"))
+            for target, isotopes in self.labels
+        )
+        object.__setattr__(self, "labels", tuple(dict.fromkeys(labels)))
         for rule in self.rules:
-            if rule.kind != "fixed":
-                continue
-            for site in rule.sites:
-                if site in fixed_sites and fixed_sites[site] != rule.modification:
-                    raise ValueError(f"two fixed modifications on {site!r}: {fixed_sites[site]} and {rule.modification}")
-                fixed_sites[site] = rule.modification
+            if rule.modification in UNIMOD:
+                _refuse_links(UNIMOD[rule.modification], rule.name or rule.modification)
+        _check_fixed_rules(self.rules)
         seen: set[tuple[int, str]] = set()
         for d in self.decoys:
             if (d.index, d.method) in seen:
@@ -382,7 +474,7 @@ def _termini(protein: _Protein, termini) -> tuple[list[int], list[int]]:
 def _enumeration_args(rules: Sequence[ModRule]) -> tuple[dict, dict, dict, dict]:
     """``enumerate_modforms`` arguments from the rules, and a map from what
     a placement records back to the rule that made it."""
-    fixed: dict[str, str] = {}
+    fixed: dict[str, list[str]] = {}
     variable: dict[str, list[str]] = {}
     limits: dict[str, int] = {}
     rule_of: dict[tuple[str, str, str], str] = {}
@@ -390,7 +482,9 @@ def _enumeration_args(rules: Sequence[ModRule]) -> tuple[dict, dict, dict, dict]
         for site in rule.sites:
             rule_of.setdefault((rule.kind, site, rule.modification), rule.name)
             if rule.kind == "fixed":
-                fixed[site] = rule.modification
+                keys = fixed.setdefault(site, [])
+                if rule.modification not in keys:
+                    keys.append(rule.modification)
             else:
                 keys = variable.setdefault(site, [])
                 if rule.modification not in keys:
@@ -429,6 +523,18 @@ def build_search_space(
     unmatched = [t for t, _ in s.labels if not any(t in {q.accession, parse_header(q.accession).accession, *q.sources} for q in proteins)]
     if unmatched:
         raise ValueError(f"labels name no FASTA or protein given: {unmatched}")
+    unmatched = [
+        acc for acc, _, _ in s.protein_termini
+        if not any(acc in {q.accession, parse_header(q.accession).accession} for q in proteins)
+    ]
+    if unmatched:
+        raise ValueError(f"protein termini name no protein given: {sorted(set(unmatched))}")
+    substitutions = [r.name or r.modification for r in s.rules if r.modification in vocab and vocab[r.modification].is_isotopic_substitution]
+    if substitutions and any(any(state) for p in proteins for state in p.states):
+        raise ValueError(
+            f"isotopic substitutions ({', '.join(substitutions)}) and whole-protein labels would "
+            "label one residue's atoms twice; give the labelled proteins their own search space"
+        )
     targets = list(proteins)
     for ds in s.decoys:
         if ds.level != "protein":
@@ -502,7 +608,10 @@ def build_search_space(
     forms: list[Peptidoform] = []
     keys: list[str] = []
     index_of: dict[str, int] = {}
-    mod_rows: list[tuple[int, int | None, str | None, str, str, str | None]] = []
+    # One row per (peptidoform, site, modification, origin, rule): a form two
+    # paths make (fixed Protein N-term acetyl at one protein's start, variable
+    # N-term acetyl inside another) keeps both origins.
+    mod_rows: dict[tuple[int, int | None, str | None, str, str, str | None], None] = {}
     edges: list[tuple[int, int]] = []  # (span index, peptide index)
     enumerated: dict[tuple[str, bool, bool], list] = {}
     for (seq, pn, pc_, state), span_ids in groups.items():
@@ -520,12 +629,12 @@ def build_search_space(
                 k = index_of[key] = len(forms)
                 forms.append(form)
                 keys.append(key)
-                for pm in placed:
-                    position = pm.slot if isinstance(pm.slot, int) else None
-                    terminus = None if position is not None else ("N" if pm.slot == N_TERM else "C")
-                    mod_rows.append((k, position, terminus, pm.key, pm.origin, rule_of.get((pm.origin, pm.site, pm.key))))
-                for iso in state:
-                    mod_rows.append((k, None, None, iso, "label", ",".join(state)))
+            for pm in placed:
+                position = pm.slot if isinstance(pm.slot, int) else None
+                terminus = None if position is not None else ("N" if pm.slot == N_TERM else "C")
+                mod_rows[(k, position, terminus, pm.key, pm.origin, rule_of.get((pm.origin, pm.site, pm.key)))] = None
+            for iso in state:
+                mod_rows[(k, None, None, iso, "label", ",".join(state))] = None
             for si in span_ids:
                 edges.append((si, k))
 
@@ -534,10 +643,8 @@ def build_search_space(
     charges = np.asarray(sorted(set(int(z) for z in s.charges)), dtype=np.int64)
     mz = (masses[:, None] + charges[None, :] * PROTON_MASS) / charges[None, :]
     in_range = (mz >= s.min_mz) & (mz <= s.max_mz)
-    keep_peptide = in_range.any(axis=1)
-    n_precursors = int(in_range.sum())
     counts["peptidoforms_enumerated"] = len(forms)
-    counts["peptidoforms_out_of_mz_range"] = int((~keep_peptide).sum())
+    counts["peptidoforms_out_of_mz_range"] = int((~in_range.any(axis=1)).sum())
 
     # target vs decoy: a peptidoform is a decoy when every span making it is
     # from a decoy protein (a sequence a target protein also makes is a target)
@@ -549,6 +656,15 @@ def build_search_space(
             decoy_set_of[k] = min(decoy_set_of[k], p.decoy_set)
         else:
             from_target[k] = True
+    # A reversed protein's peptide that is a target's with I and L made equal
+    # has the target's masses and fragments: it is dropped, as a
+    # peptide-level decoy colliding with a target is.
+    target_il = {il_key(sp.sequence) for pi, sp in span_rows if not proteins[pi].is_decoy}
+    collides = np.array(
+        [not from_target[k] and il_key(forms[k].sequence) in target_il for k in range(len(forms))], dtype=bool
+    )
+    keep_peptide = in_range.any(axis=1) & ~collides
+    n_precursors = int(in_range[keep_peptide].sum())
 
     # ── peptide-level decoys ─────────────────────────────────────────
     target_peptides = [k for k in range(len(forms)) if keep_peptide[k] and from_target[k]]
@@ -579,8 +695,11 @@ def build_search_space(
             )
     for ds in s.decoys:
         if ds.level == "protein":
-            n = int(((~from_target) & keep_peptide & (decoy_set_of == ds.index)).sum())
-            decoy_counts.append({"set": ds.index, "method": ds.method, "seed": ds.seed, "made": n})
+            in_set = (~from_target) & (decoy_set_of == ds.index) & in_range.any(axis=1)
+            decoy_counts.append(
+                {"set": ds.index, "method": ds.method, "seed": ds.seed,
+                 "made": int((in_set & keep_peptide).sum()), "dropped": int((in_set & collides).sum())}
+            )
     n_decoy_precursors = sum(int(in_range[t].sum()) for _f, _k, t, _s, _o in decoy_peptides)
     counts["peptidoforms"] = int(keep_peptide.sum())
     counts["precursors"] = n_precursors

@@ -199,46 +199,26 @@ def precursors_from_peptide_list(
     return specs
 
 
-def precursors_from_library(path: Path | str) -> list[PrecursorSpec]:
-    """Take an existing Library's exact precursors, for re-prediction.
+def precursors_from_library(library) -> list[PrecursorSpec]:
+    """An existing Library's exact precursors (a ``Library`` or a path to
+    one), for re-prediction.
 
     The point of this path is swapping the *model* while holding the
     peptide set fixed — e.g. re-predicting an EncyclopeDIA-built HCD
     library's precursors under a CID model, which is the only way to get
     CID reference spectra for a panel that was defined under HCD.
+
+    A ``PrecursorSpec`` is what a predictor needs and no more: it does not
+    say which precursors are decoys, nor how they were made. To get a
+    predicted library that keeps that, predict with the library itself
+    (``koina.api.predict_library(library=...)``), which puts the
+    predictions onto it (``library.attach_predictions``).
     """
-    from constellation.massspec.library.io import load_library
+    if not hasattr(library, "precursors"):
+        from constellation.massspec.library.io import load_library
 
-    lib = load_library(path)
-    peptides = {
-        row["peptide_id"]: row["modified_sequence"]
-        for row in lib.peptides.select(["peptide_id", "modified_sequence"]).to_pylist()
-    }
-    edges: dict[int, list[str]] = {}
-    accession_by_id = {
-        row["protein_id"]: row["accession"]
-        for row in lib.proteins.select(["protein_id", "accession"]).to_pylist()
-    }
-    for row in lib.protein_peptide.to_pylist():
-        edges.setdefault(row["peptide_id"], []).append(
-            accession_by_id[row["protein_id"]]
-        )
-
-    specs: list[PrecursorSpec] = []
-    for row in lib.precursors.select(
-        ["peptide_id", "charge", "precursor_mz"]
-    ).to_pylist():
-        modseq = peptides[row["peptide_id"]]
-        specs.append(
-            PrecursorSpec(
-                modified_sequence=modseq,
-                sequence=parse_proforma(modseq).sequence,
-                charge=int(row["charge"]),
-                precursor_mz=float(row["precursor_mz"]),
-                proteins=tuple(edges.get(row["peptide_id"], ())),
-            )
-        )
-    return specs
+        library = load_library(library)
+    return _specs_from_library(library)
 
 
 def specs_to_table(specs: Sequence[PrecursorSpec]) -> pa.Table:

@@ -27,6 +27,7 @@ import pyarrow as pa
 from constellation.massspec.library.digest import (
     PrecursorSpec,
     precursors_from_fasta,
+    precursors_from_library,
 )
 from constellation.massspec.library.koina._modseq import (
     KoinaModSeqError,
@@ -48,7 +49,7 @@ from constellation.massspec.library.koina.models import (
     rt_model,
 )
 from constellation.massspec.library.koina.nce import adjust_nce
-from constellation.massspec.library.library import Library
+from constellation.massspec.library.library import Library, attach_predictions
 from constellation.core.sequence.proforma import parse_proforma
 
 Inputs = Mapping[str, Any] | pa.Table | Sequence[Mapping[str, Any]]
@@ -319,6 +320,7 @@ def predict_library(
     *,
     specs: Sequence[PrecursorSpec] | None = None,
     fasta: Path | str | None = None,
+    library: Library | None = None,
     ms2_model_name: str = "Prosit_2020_intensity_HCD",
     rt_model_name: str | None = "Chronologer_RT",
     collision_energy: float | None = 30.0,
@@ -333,9 +335,37 @@ def predict_library(
     rt_client: PredictClient | None = None,
     **digest_kwargs: Any,
 ) -> tuple[Library, AssemblyStats]:
-    """FASTA (or an explicit precursor grid) → a predicted ``Library``."""
-    if (specs is None) == (fasta is None):
-        raise ValueError("pass exactly one of specs= or fasta=")
+    """FASTA (or an explicit precursor grid, or a library) → a predicted
+    ``Library``.
+
+    Given ``library``, its own precursors are predicted and the result is
+    that library with the predicted fragments and retention times put onto
+    it (:func:`~constellation.massspec.library.library.attach_predictions`):
+    its decoys, spans and modification provenance survive, and a precursor
+    the model could not take is left out and counted in the metadata
+    (``x.koina.precursors_not_predicted``)."""
+    if sum(x is not None for x in (specs, fasta, library)) != 1:
+        raise ValueError("pass exactly one of specs=, fasta= or library=")
+    if library is not None:
+        if digest_kwargs:
+            raise TypeError(f"unexpected keyword argument(s) {sorted(digest_kwargs)} with library=")
+        predicted, stats = predict_library(
+            specs=precursors_from_library(library),
+            ms2_model_name=ms2_model_name,
+            rt_model_name=rt_model_name,
+            collision_energy=collision_energy,
+            adjust_nce_for_dia=adjust_nce_for_dia,
+            server=server,
+            min_intensity=min_intensity,
+            on_unsupported=on_unsupported,
+            fragmentation=fragmentation,
+            instrument=instrument,
+            metadata=metadata,
+            ms2_client=ms2_client,
+            rt_client=rt_client,
+        )
+        merged, counts = attach_predictions(library, predicted)
+        return merged.with_metadata({"x.koina.precursors_not_predicted": counts["precursors_not_predicted"]}), stats
     if specs is None:
         specs = precursors_from_fasta(fasta, **digest_kwargs)
     elif digest_kwargs:
