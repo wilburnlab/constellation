@@ -326,3 +326,52 @@ Later:
   silenced at the one load site; if TorchScript loading is removed, the models will need converting.
   `predict_onto` builds the whole fragment table in memory (about 150M rows for 5M precursors); P3
   streams it.
+
+### P3 (2026-11-06)
+
+- **`massspec predict-library --backend jchronologer`** (`cli/_predict_jchronologer.py`).
+  - Input is `--from-library` (a search space) or `--peptides`. `--fasta` is refused with the
+    `search-space` command to run instead.
+  - Collision energy: one per run, `--collision-energy` (default `--default-nce`) scaled from
+    `--default-charge`, or `--collision-energy-by-charge`, which must cover every charge in the
+    library. A sweep is refused.
+  - Fragments and RT are always predicted. Charge states and CCS are predicted unless
+    `--no-charge-states` / `--no-ccs`.
+  - `--min-charge-probability P` runs Electrician first and refuses target precursors below P,
+    counted as `below_min_charge_probability`; their decoys follow by group.
+  - `--threads` (default all cores), `--batch-size` (default 2048) and `--device {cpu,cuda}`.
+    `--min-intensity` now defaults per backend (0.01 here, 1e-4 for Koina).
+  - Each backend refuses the others' flags: Koina's and EncyclopeDIA's here, and `--threads` and the
+    rest of this backend's flags there.
+  - The `--backend encyclopedia` help no longer names 6.5.15.
+- **Output.** `<output-dir>/library_pqdir`: fragments are streamed chunk by chunk
+  (`predict_onto(fragments_sink=)`) to a side file, which replaces the empty table the library writer
+  leaves. With `--output-dlib`, a `.dlib` too. Beside it:
+  - `manifest.json` (`build_manifest_envelope`): the prediction report, every model's identity and
+    SHA-256, the upstream library's identity, and the runtime (threads, batch size, device, torch);
+  - `_SUCCESS` carrying a `core.stages` key over the upstream library (its recorded key, else its
+    files' SHA-256), the predictors' identities (batch size and minimum intensity among them), the
+    energy per charge and `--min-charge-probability`. Threads and device are not keyed.
+  - `--resume` reuses only the same prediction. A different one in the directory is refused without
+    `--resume`, and redone with it.
+- **`doctor`:** a `jchronologer` row (`ok` / `unverified` / `missing`; none without EncyclopeDIA). It
+  reads and hashes the jar's members without loading a model.
+- **End to end on the purified run.** The BSA + ¹³C¹⁵N lysin search space (the search-space plan's
+  settings: 1,756 targets, 1,756 decoys) predicts in 6.6 s at 1.2 GB peak: 3,512 precursors and
+  110,292 fragments, none dropped. `chromatogram extract --targets` on the predicted library (MS2,
+  0.35 Da, the gate, 4 workers; 3 min 38 s, at most 3.0 GB) passes 231 of 1,756 targets (33 of 479
+  lysin) and 34 decoys, as the search space alone did (230 / 32 / 34). The gate counts fragments and
+  does not read intensities yet, so this checks the wiring, not the predictions.
+- **Scale** (human UniProt, the first 1,000 and 2,000 proteins; trypsin, one missed cleavage,
+  charges 2–4, fixed carbamidomethyl, variable oxidation, interior-reversal decoys; 12 threads):
+
+  | proteins | precursors (targets + decoys) | fragments | wall | peak memory |
+  |---|---|---|---|---|
+  | 1,000 | 471,908 | 11.5M | 3 min 0 s | 4.9 GB |
+  | 2,000 | 963,700 | 23.6M | 6 min 4 s | 5.4 GB |
+
+  That is about 2,650 precursors a second through all four models, assembly and writing included;
+  memory is about 4.3 GB fixed plus about 1.2 KB a precursor. For all 20,652 proteins at these
+  settings (about 9.9M precursors) that extrapolates to about 63 min and 16 GB. Not run: the
+  in-memory search space would add about 10 GB at that size (proteome-scale search-space output is
+  still to do), and long full-machine runs have crashed this machine before.

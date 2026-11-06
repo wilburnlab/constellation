@@ -1,4 +1,4 @@
-"""``constellation massspec predict-library``: a predicted spectral library from a FASTA (EncyclopeDIA or Koina)."""
+"""``constellation massspec predict-library``: a predicted spectral library (EncyclopeDIA's jar, JChronologer in PyTorch, or Koina)."""
 
 from __future__ import annotations
 
@@ -11,6 +11,9 @@ from constellation.massspec.cli._common import (
     _add_output_dir_arg,
     _camel_to_kebab,
     _report_ingest_caveats,
+)
+from constellation.massspec.cli._predict_jchronologer import (
+    add_jchronologer_arguments as _add_jchronologer_arguments,
 )
 from constellation.massspec.search.encyclopedia.ptm_defaults import (
     PTM_NAMES as _PTM_NAMES,
@@ -25,16 +28,18 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
     p = subs.add_parser(
         "predict-library",
         help=(
-            "FASTA → predicted spectral library. --backend encyclopedia "
-            "(default) runs EncyclopeDIA 6.5.15's bundled JChronologer "
-            "(RT) + Sculptor (CCS/IMS) + Electrician (charge) in-process; "
-            "--backend koina calls the Koina model server, which adds CID "
-            "models and HCD at arbitrary collision energy."
+            "a predicted spectral library. --backend encyclopedia (default) "
+            "runs the EncyclopeDIA jar on a FASTA (its JChronologer models, "
+            "in the JVM) and writes a .dlib; --backend jchronologer runs "
+            "those same models in PyTorch, read from the installed "
+            "EncyclopeDIA, onto a search space (--from-library) or a peptide "
+            "list; --backend koina calls the Koina model server, which adds "
+            "CID models."
         ),
     )
     p.add_argument(
         "--backend",
-        choices=["encyclopedia", "koina"],
+        choices=["encyclopedia", "jchronologer", "koina"],
         default="encyclopedia",
         help="prediction backend (default: encyclopedia)",
     )
@@ -51,12 +56,13 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
             "encyclopedia; optional extra output for --backend koina)"
         ),
     )
-    # ── koina backend ───────────────────────────────────────────────
-    koina = p.add_argument_group(
-        "koina backend",
-        "Only meaningful with --backend koina.",
+    # ── what to predict, for the in-Python backends ─────────────────
+    given = p.add_argument_group(
+        "jchronologer and koina backends",
+        "What to predict instead of a FASTA (--from-library is how "
+        "--backend jchronologer predicts a search space).",
     )
-    koina.add_argument(
+    given.add_argument(
         "--peptides",
         type=Path,
         default=None,
@@ -66,7 +72,7 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
             "digesting a FASTA — no m/z or length filtering is applied"
         ),
     )
-    koina.add_argument(
+    given.add_argument(
         "--from-library",
         type=Path,
         default=None,
@@ -77,6 +83,21 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
             "onto it, so its decoys and provenance (a search space's spans "
             "and modifications) are kept"
         ),
+    )
+    given.add_argument(
+        "--min-intensity",
+        type=float,
+        default=None,
+        help=(
+            "drop predicted fragments below this intensity (default: 0.01, "
+            "JChronologer's, for jchronologer; 1e-4 for koina)"
+        ),
+    )
+    _add_jchronologer_arguments(p)
+    # ── koina backend ───────────────────────────────────────────────
+    koina = p.add_argument_group(
+        "koina backend",
+        "Only meaningful with --backend koina.",
     )
     koina.add_argument(
         "--ms2-model",
@@ -138,12 +159,6 @@ def _build_predict_library_parser(subs: argparse._SubParsersAction) -> None:
             "what to do with precursors the model cannot represent "
             "(default: error)"
         ),
-    )
-    koina.add_argument(
-        "--min-intensity",
-        type=float,
-        default=1e-4,
-        help="drop predicted fragments below this intensity (default: %(default)s)",
     )
     _add_output_dir_arg(p)
     p.add_argument(
@@ -302,7 +317,24 @@ _ENCYCLOPEDIA_ONLY_ARGS: tuple[tuple[str, str, object], ...] = (
 
 def _cmd_massspec_predict_library(args: argparse.Namespace) -> int:
     """Dispatch predict-library onto the selected backend."""
-    if getattr(args, "backend", "encyclopedia") == "koina":
+    backend = getattr(args, "backend", "encyclopedia")
+    if backend == "jchronologer":
+        from constellation.massspec.cli._predict_jchronologer import run
+
+        return run(args)
+    from constellation.massspec.cli._predict_jchronologer import JCHRONOLOGER_ONLY_ARGS, used_flags
+
+    foreign = used_flags(args, JCHRONOLOGER_ONLY_ARGS)
+    if foreign:
+        import sys as _sys
+
+        print(
+            f"error: these flags are --backend jchronologer's and have no effect with "
+            f"--backend {backend}: {', '.join(foreign)}",
+            file=_sys.stderr,
+        )
+        return 1
+    if backend == "koina":
         return _cmd_predict_library_koina(args)
     return _cmd_predict_library_encyclopedia(args)
 
@@ -648,6 +680,9 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=_sys.stderr)
         return 1
+    from constellation.massspec.cli._predict_jchronologer import DEFAULT_MIN_INTENSITY
+
+    min_intensity = args.min_intensity if args.min_intensity is not None else DEFAULT_MIN_INTENSITY["koina"]
 
     server = resolve_server(args.koina_url)
     rt_model_name = None if str(args.rt_model).lower() == "none" else args.rt_model
@@ -774,7 +809,7 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
                 rt_model_name=rt_model_name,
                 collision_energy=energy,
                 server=args.koina_url,
-                min_intensity=args.min_intensity,
+                min_intensity=min_intensity,
                 on_unsupported=args.on_unsupported_mod,
                 metadata={"x.koina.server_url": server, "x.koina.source": source},
             )
@@ -849,7 +884,7 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
                 else None
             ),
             "collision_energy_by_charge": energy_table,
-            "min_intensity": args.min_intensity,
+            "min_intensity": min_intensity,
         },
         "runs": summaries,
     }

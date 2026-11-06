@@ -11,7 +11,13 @@
    and decoys stay matched for scoring and calibration. Each drop is
    counted by property and reason; a precursor dropped only because its
    partner was refused is counted apart.
-3. **Predictions**, in chunks of requests in canonical order.
+   With ``min_charge_probability``, the charge-state predictor runs
+   first and a target precursor whose charge it makes less likely than
+   that is refused the same way (``below_min_charge_probability``), its
+   decoys with it.
+3. **Predictions**, in chunks of requests in canonical order; with
+   ``fragments_sink`` each chunk's fragments go to it (a file being
+   written) rather than into the result.
 4. **One library**: the source library (its decoy pairing, spans,
    modification provenance) less the dropped precursors, with each
    predicted value put on the precursors that asked it: ``rt_predicted``
@@ -29,7 +35,7 @@ labels were removed).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -46,6 +52,7 @@ from constellation.massspec.library.prediction.base import (
     Predictor,
     Property,
     ValueArray,
+    sites_key,
 )
 from constellation.massspec.library.prediction.collision_energy import CollisionEnergy
 from constellation.massspec.library.prediction.requests import RequestPlan, build_requests
@@ -121,11 +128,24 @@ def predict_onto(
     predictors: Mapping[Property, Predictor],
     *,
     collision_energy: CollisionEnergy | None = None,
+    min_charge_probability: float | None = None,
     chunk: int = DEFAULT_CHUNK,
+    fragments_sink: Callable[[pa.Table], None] | None = None,
 ) -> tuple[Library, PredictionReport]:
     """``library`` with ``predictors``' properties put on its precursors
-    (module docstring). Returns the library and the report."""
+    (module docstring). Returns the library and the report.
+
+    ``min_charge_probability`` keeps a target precursor only if the
+    ``charge_state`` predictor gives its charge at least that probability
+    (decoys follow their target, by group); it is predicted before
+    anything else, so dropped precursors cost nothing more.
+    ``fragments_sink`` receives the fragment table chunk by chunk instead
+    of the result holding it (the returned library's fragments are then
+    empty): what a command writing millions of precursors streams to disk.
+    """
     _check_predictors(predictors, collision_energy)
+    if min_charge_probability is not None and "charge_state" not in predictors:
+        raise ValueError("min_charge_probability needs a charge_state predictor")
     plan = build_requests(library, collision_energy)
     n = len(plan.precursor_id)
 
@@ -155,14 +175,21 @@ def predict_onto(
             note(prop, refusals.reasons[r], refusals.details[r])
         refused[hit] = True
 
+    if min_charge_probability is not None:
+        _refuse_unlikely_charges(plan, predictors["charge_state"], float(min_charge_probability), refused, note)
+
+    # A refused precursor takes its group; the library then drops a decoy
+    # whose target peptide has no precursor left, so the kept set is read
+    # back from it before anything is predicted.
     bad_groups = np.unique(plan.group[refused])
-    dropped = np.isin(plan.group, bad_groups)
-    kept_rows = np.flatnonzero(~dropped)
+    out = library.subset_precursors(pa.array(plan.precursor_id[~np.isin(plan.group, bad_groups)], type=pa.int64()))
+    kept_rows = np.flatnonzero(np.isin(plan.precursor_id, out.precursors.column("precursor_id").to_numpy()))
 
     # ── predictions, chunk by chunk ─────────────────────────────────
     kept_requests = np.unique(plan.request[kept_rows])
     values = {prop: np.full(len(kept_requests), np.nan) for prop in predictors if prop != "fragments"}
     fragment_parts: list[pa.Table] = []
+    n_fragments = 0
     fragments_predictor = predictors.get("fragments")
     ladders: Ladders | None = None
     source_peptide = np.zeros(0, np.int64)
@@ -173,23 +200,25 @@ def predict_onto(
         stop = min(start + int(chunk), len(kept_requests))
         sub = plan.requests.take(kept_requests[start:stop])
         for prop, predictor in predictors.items():
-            out = predictor.predict(sub)
+            answer = predictor.predict(sub)
             if prop == "fragments":
                 rows = np.flatnonzero((kept_request_of_row >= start) & (kept_request_of_row < stop))
-                fragment_parts.append(
-                    fragment_table(
-                        _as_fragments(out, predictor.name),
-                        kept_request_of_row[rows] - start,
-                        plan.precursor_id[kept_rows[rows]],
-                        source_peptide[rows],
-                        ladders,
-                    )
+                part = fragment_table(
+                    _as_fragments(answer, predictor.name),
+                    kept_request_of_row[rows] - start,
+                    plan.precursor_id[kept_rows[rows]],
+                    source_peptide[rows],
+                    ladders,
                 )
+                n_fragments += part.num_rows
+                if fragments_sink is not None:
+                    fragments_sink(part)
+                else:
+                    fragment_parts.append(part)
             else:
-                values[prop][start:stop] = _as_values(out, predictor.name, len(sub)).values
+                values[prop][start:stop] = _as_values(answer, predictor.name, len(sub)).values
 
     # ── one library ────────────────────────────────────────────────
-    out = library.subset_precursors(pa.array(plan.precursor_id[kept_rows], type=pa.int64()))
     precursors = out.precursors
     at = pc.index_in(precursors.column("precursor_id"), value_set=pa.array(plan.precursor_id[kept_rows]))
     at = at.to_numpy(zero_copy_only=False).astype(np.int64)
@@ -203,11 +232,9 @@ def predict_onto(
         precursors = precursors.set_column(precursors.schema.get_field_index(column), column, merged)
     if fragments_predictor is not None:
         fragments = pa.concat_tables(fragment_parts) if fragment_parts else LIBRARY_FRAGMENT_TABLE.empty_table()
-        fragments = fragments.filter(
-            pc.is_in(fragments.column("precursor_id"), value_set=precursors.column("precursor_id").combine_chunks())
-        )
     else:
         fragments = out.fragments
+        n_fragments = fragments.num_rows
 
     rt_predictor = predictors.get("retention_time")
     report = PredictionReport(
@@ -215,7 +242,7 @@ def predict_onto(
         precursors_kept=precursors.num_rows,
         requests=len(plan.requests),
         requests_predicted=len(kept_requests),
-        fragments=fragments.num_rows,
+        fragments=n_fragments,
         refused=counts,
         examples=examples,
         dropped_with_partner=int(n - precursors.num_rows - refused.sum()),
@@ -244,6 +271,24 @@ def predict_onto(
     if report.rt_scale is not None:
         extras["x.massspec.prediction.rt_scale"] = report.rt_scale
     return replace(out, precursors=precursors, fragments=fragments, metadata_extras=extras), report
+
+
+def _refuse_unlikely_charges(plan: RequestPlan, predictor: Predictor, minimum: float, refused: np.ndarray, note) -> None:
+    """Refuse target precursors whose charge ``predictor`` makes less
+    likely than ``minimum`` (decoys are not judged: they follow their
+    target's group)."""
+    judged = np.flatnonzero(~refused & ~plan.is_decoy & (plan.request >= 0))
+    if not len(judged):
+        return
+    requests = np.unique(plan.request[judged])
+    probability = _as_values(predictor.predict(plan.requests.take(requests)), predictor.name, len(requests)).values
+    p = probability[np.searchsorted(requests, plan.request[judged])]
+    low = judged[~(p >= minimum)]
+    for row, value in zip(low.tolist(), p[~(p >= minimum)].tolist()):
+        request = plan.request[row]
+        key = sites_key(plan.requests.peptides[plan.requests.peptide[request]])
+        note("charge_state", "below_min_charge_probability", f"{key}/{plan.requests.charge[request]}: {value:.3g}")
+    refused[low] = True
 
 
 def _as_fragments(out: Any, name: str) -> FragmentArrays:

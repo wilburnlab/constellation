@@ -1,9 +1,9 @@
 """Predictions put onto a library: the contract, requests, orchestration,
 assembly and JChronologer's decoders, without the jar.
 
-JChronologer's predictors run here on a fake bundle: the real
-preprocessing files (``tests/data/jchronologer/1.0.10/``) with small
-stand-ins for the TorchScript models, so their inputs and decoding are
+JChronologer's predictors run here on a fake bundle
+(``_jchronologer_fixtures.FakeBundle``: the real preprocessing files with
+stand-ins for the TorchScript models), so their inputs and decoding are
 tested in CI. ``tests/test_jchronologer_golden.py`` runs the real models
 against the jar's own predictions where EncyclopeDIA is installed.
 """
@@ -46,33 +46,10 @@ from constellation.massspec.library.search_space import (
     build_search_space,
 )
 from constellation.massspec.peptide.ions import IonType, fragment_ladder_arrays_batch
-from constellation.massspec.tokenize.jchronologer import tokenizers_from_files
-
-DATA = Path(__file__).parent / "data" / "jchronologer" / "1.0.10"
-ROLES = ("chronologer", "cartographer", "electrician", "sculptor")
+from _jchronologer_fixtures import FakeBundle
 
 
-# ── a fake JChronologer bundle ───────────────────────────────────────
-
-
-class FakeBundle:
-    """The real preprocessing files, stand-in models (``models[role]``)."""
-
-    version = "1.0.10"
-
-    def __init__(self, models: dict) -> None:
-        self.files = {r: next(DATA.glob(f"{r.capitalize()}_*.preprocessing.json")).read_bytes() for r in ROLES}
-        self.tokenizers = tokenizers_from_files(self.version, self.files)
-        self.models = models
-
-    def preprocessing(self, role: str) -> dict:
-        return json.loads(self.files[role])
-
-    def identity(self, role: str) -> dict:
-        return {"backend": "jchronologer", "model": role, "version": self.version, "fake": True}
-
-    def load_model(self, role: str, device: str = "cpu"):
-        return self.models[role]
+# ── stand-in models ─────────────────────────────────────────────────
 
 
 class Recorder:
