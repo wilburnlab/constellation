@@ -608,13 +608,22 @@ def _doctor_jchronologer_rows() -> list[tuple[str, str, str, str]]:
     member whose hash differs); ``missing`` no JChronologer jar where the
     EncyclopeDIA manifest says.
     """
-    if try_find("encyclopedia") is None:
+    handle = try_find("encyclopedia")
+    if handle is None:
         return []
     from constellation.massspec.library.jchronologer import locate_bundle
     from constellation.massspec.tokenize.jchronologer import UnknownModelError
+    from constellation.thirdparty.encyclopedia import MINIMUM_VERSION
+    from constellation.thirdparty.registry import meets_min_version
 
+    # The install the encyclopedia row reports on, not a second lookup.
+    if not meets_min_version(handle):
+        return [(
+            "jchronologer", "missing", "-",
+            f"EncyclopeDIA {handle.version} is older than {MINIMUM_VERSION}, the first to ship JChronologer's models",
+        )]
     try:
-        bundle = locate_bundle()
+        bundle = locate_bundle(encyclopedia=handle)
     except FileNotFoundError as exc:
         return [("jchronologer", "missing", "-", str(exc))]
     except UnknownModelError as exc:

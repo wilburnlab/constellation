@@ -217,23 +217,38 @@ def test_the_real_models_on_a_search_space(search_space, tmp_path):
     assert replace(library, fragments=library.fragments).n_precursors == library.precursors.num_rows
 
 
-def test_doctor_says_whether_the_models_can_be_read(monkeypatch):
+def test_doctor_says_whether_the_models_can_be_read(monkeypatch, tmp_path):
     import constellation.cli.__main__ as cli
     import constellation.massspec.library.jchronologer as package
     from constellation.massspec.tokenize.jchronologer import UnknownModelError
+    from constellation.thirdparty.registry import ToolHandle, registered
+
+    spec = next(s for s in registered() if s.name == "encyclopedia")
+
+    def install(version: str) -> ToolHandle:
+        return ToolHandle(spec, tmp_path / f"encyclopedia-{version}.jar", "env", version)
 
     monkeypatch.setattr(cli, "try_find", lambda name: None)
     assert cli._doctor_jchronologer_rows() == []
-    monkeypatch.setattr(cli, "try_find", lambda name: object())
+    # The row reads the install the encyclopedia row found, never a second
+    # lookup (which, with no EncyclopeDIA on the machine, raised).
+    asked: list = []
 
-    def unknown(jar=None):
+    def unknown(jar=None, *, encyclopedia=None):
+        asked.append(encyclopedia)
         raise UnknownModelError("JChronologer 9.9 is not one Constellation was checked against")
 
+    monkeypatch.setattr(cli, "try_find", lambda name: install("6.9.23"))
     monkeypatch.setattr(package, "locate_bundle", unknown)
     assert cli._doctor_jchronologer_rows()[0][:2] == ("jchronologer", "unverified")
+    assert asked[0].path == tmp_path / "encyclopedia-6.9.23.jar"
 
-    def missing(jar=None):
+    def missing(jar=None, *, encyclopedia=None):
         raise FileNotFoundError("names 0 JChronologer jars")
 
     monkeypatch.setattr(package, "locate_bundle", missing)
     assert cli._doctor_jchronologer_rows()[0][:2] == ("jchronologer", "missing")
+
+    monkeypatch.setattr(cli, "try_find", lambda name: install("6.5.15"))
+    row = cli._doctor_jchronologer_rows()[0]
+    assert row[:2] == ("jchronologer", "missing") and "older than 6.9.23" in row[3]

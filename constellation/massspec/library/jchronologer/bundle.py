@@ -98,13 +98,15 @@ class JChronologerBundle:
         return load_model(self, role, device)
 
 
-def locate_bundle(jar: Path | str | None = None) -> JChronologerBundle:
-    """The JChronologer the installed EncyclopeDIA loads (or ``jar``)."""
+def locate_bundle(jar: Path | str | None = None, *, encyclopedia=None) -> JChronologerBundle:
+    """The JChronologer an EncyclopeDIA install loads: ``encyclopedia`` (a
+    ``thirdparty.registry.ToolHandle``, as ``doctor`` has), else the one the
+    registry finds; or ``jar`` itself."""
     if jar is None:
         from constellation.thirdparty.encyclopedia import MINIMUM_VERSION, jchronologer_jar
         from constellation.thirdparty.registry import find, meets_min_version
 
-        handle = find("encyclopedia")
+        handle = encyclopedia if encyclopedia is not None else find("encyclopedia")
         if not meets_min_version(handle):
             raise UnknownModelError(
                 f"EncyclopeDIA {handle.version} at {handle.path} is older than {MINIMUM_VERSION}, "
