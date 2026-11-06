@@ -1,0 +1,326 @@
+{
+  "model_file": "/Users/searle.brian/Documents/projects/cartographer/models/Sculptor_20260311095327.pt",
+  "model_family": "sculptor",
+  "residues": [
+    "A",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "K",
+    "L",
+    "M",
+    "N",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "V",
+    "W",
+    "Y",
+    "c",
+    "m",
+    "d",
+    "e",
+    "s",
+    "t",
+    "y",
+    "a",
+    "b",
+    "u",
+    "n",
+    "o",
+    "p",
+    "q",
+    "r",
+    "x",
+    "z",
+    "w",
+    "f",
+    "g",
+    "h",
+    "i",
+    "j",
+    "k",
+    "l",
+    "v",
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "-",
+    "^",
+    "(",
+    ")",
+    "&",
+    "*",
+    "_"
+  ],
+  "aa_to_int": {
+    "&": 61,
+    "(": 59,
+    ")": 60,
+    "*": 62,
+    "-": 57,
+    "0": 47,
+    "1": 48,
+    "2": 49,
+    "3": 50,
+    "4": 51,
+    "5": 52,
+    "6": 53,
+    "7": 54,
+    "8": 55,
+    "9": 56,
+    "A": 1,
+    "C": 2,
+    "D": 3,
+    "E": 4,
+    "F": 5,
+    "G": 6,
+    "H": 7,
+    "I": 8,
+    "K": 9,
+    "L": 10,
+    "M": 11,
+    "N": 12,
+    "P": 13,
+    "Q": 14,
+    "R": 15,
+    "S": 16,
+    "T": 17,
+    "V": 18,
+    "W": 19,
+    "Y": 20,
+    "^": 58,
+    "_": 63,
+    "a": 28,
+    "b": 29,
+    "c": 21,
+    "d": 23,
+    "e": 24,
+    "f": 39,
+    "g": 40,
+    "h": 41,
+    "i": 42,
+    "j": 43,
+    "k": 44,
+    "l": 45,
+    "m": 22,
+    "n": 31,
+    "o": 32,
+    "p": 33,
+    "q": 34,
+    "r": 35,
+    "s": 25,
+    "t": 26,
+    "u": 30,
+    "v": 46,
+    "w": 38,
+    "x": 36,
+    "y": 27,
+    "z": 37
+  },
+  "padding_index": 0,
+  "max_peptide_len": 50,
+  "charge_dist_len": 6,
+  "input_names": [
+    "tokens",
+    "charge_onehot"
+  ],
+  "input_shapes": [
+    [
+      "batch",
+      52
+    ],
+    [
+      "batch",
+      6
+    ]
+  ],
+  "input_dtypes": [
+    "int64",
+    "float32"
+  ],
+  "output_name": "ccs_norm",
+  "output_shape": [
+    "batch",
+    1
+  ],
+  "output_dtype": "float32",
+  "train_ccs_mean": 490.40022836690935,
+  "train_ccs_std": 126.1480333943971,
+  "nterm_unimod_map": {
+    "UNIMOD:1": "^",
+    "UNIMOD:27": ")",
+    "UNIMOD:28": "(",
+    "UNIMOD:58": "9"
+  },
+  "residue_unimod_map": [
+    {
+      "residue": "C",
+      "unimod": "UNIMOD:312",
+      "token": "v"
+    },
+    {
+      "residue": "C",
+      "unimod": "UNIMOD:4",
+      "token": "c"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:1",
+      "token": "a"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:121",
+      "token": "u"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:122",
+      "token": "4"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:1289",
+      "token": "2"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:1363",
+      "token": "3"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:1848",
+      "token": "0"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:1849",
+      "token": "1"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:3",
+      "token": "6"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:34",
+      "token": "n"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:36",
+      "token": "o"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:37",
+      "token": "p"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:58",
+      "token": "8"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:64",
+      "token": "b"
+    },
+    {
+      "residue": "K",
+      "unimod": "UNIMOD:747",
+      "token": "l"
+    },
+    {
+      "residue": "M",
+      "unimod": "UNIMOD:35",
+      "token": "m"
+    },
+    {
+      "residue": "N",
+      "unimod": "UNIMOD:43",
+      "token": "h"
+    },
+    {
+      "residue": "N",
+      "unimod": "UNIMOD:7",
+      "token": "f"
+    },
+    {
+      "residue": "P",
+      "unimod": "UNIMOD:408",
+      "token": "7"
+    },
+    {
+      "residue": "Q",
+      "unimod": "UNIMOD:7",
+      "token": "g"
+    },
+    {
+      "residue": "R",
+      "unimod": "UNIMOD:34",
+      "token": "q"
+    },
+    {
+      "residue": "R",
+      "unimod": "UNIMOD:36",
+      "token": "r"
+    },
+    {
+      "residue": "R",
+      "unimod": "UNIMOD:7",
+      "token": "k"
+    },
+    {
+      "residue": "S",
+      "unimod": "UNIMOD:21",
+      "token": "s"
+    },
+    {
+      "residue": "S",
+      "unimod": "UNIMOD:43",
+      "token": "i"
+    },
+    {
+      "residue": "T",
+      "unimod": "UNIMOD:21",
+      "token": "t"
+    },
+    {
+      "residue": "T",
+      "unimod": "UNIMOD:43",
+      "token": "j"
+    },
+    {
+      "residue": "W",
+      "unimod": "UNIMOD:35",
+      "token": "w"
+    },
+    {
+      "residue": "Y",
+      "unimod": "UNIMOD:21",
+      "token": "y"
+    },
+    {
+      "residue": "Y",
+      "unimod": "UNIMOD:354",
+      "token": "5"
+    }
+  ]
+}

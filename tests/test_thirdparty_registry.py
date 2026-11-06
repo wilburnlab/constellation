@@ -225,3 +225,36 @@ def test_encyclopedia_spec_declares_floor_and_bundled_jre() -> None:
     spec = _REGISTRY["encyclopedia"]
     assert spec.min_version == adapter.MINIMUM_VERSION == "6.9.23"
     assert spec.prefer_bundled_jre is True
+
+
+def test_jchronologer_jar_is_the_one_the_manifest_names(tmp_path: Path) -> None:
+    import zipfile
+
+    import pytest
+
+    from constellation.thirdparty.encyclopedia import jchronologer_jar, manifest_class_path
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    for name in ("jchronologer-1.0.9.jar", "jchronologer-1.0.10.jar", "msraw java.jar"):
+        (lib / name).write_bytes(b"")
+    jar = tmp_path / "encyclopedia-6.9.23.jar"
+    # Manifest lines wrap at 72 bytes; a continuation starts with one space.
+    manifest = (
+        "Manifest-Version: 1.0\r\n"
+        "Class-Path: lib/msraw%20java.jar lib/jchronol\r\n"
+        " oger-1.0.10.jar\r\n"
+        "Main-Class: x\r\n"
+    )
+    with zipfile.ZipFile(jar, "w") as archive:
+        archive.writestr("META-INF/MANIFEST.MF", manifest)
+    assert manifest_class_path(jar) == [lib / "msraw java.jar", lib / "jchronologer-1.0.10.jar"]
+    assert jchronologer_jar(jar) == lib / "jchronologer-1.0.10.jar"
+
+    (lib / "jchronologer-1.0.10.jar").unlink()
+    with pytest.raises(FileNotFoundError, match="not there"):
+        jchronologer_jar(jar)
+    with zipfile.ZipFile(jar, "w") as archive:
+        archive.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\n")
+    with pytest.raises(FileNotFoundError, match="0 JChronologer jars"):
+        jchronologer_jar(jar)

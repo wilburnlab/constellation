@@ -79,12 +79,23 @@ called Cartographer.
 - EncyclopeDIA calls it with the library's default charge (3), widens the result to double, and
   JChronologer divides by 100.0 before the model takes it as float32.
 
+**JChronologer's source.** searlelab/jchronologer is public (Apache-2.0); its HEAD is 1.0.10 (pom
+version; last commit 2026-09-21, "small fix to handle pyroglu in Sculptor correctly"), the version
+EncyclopeDIA 6.9.23 loads. What follows was read from it, and the tokens were checked against the
+jar's own preprocessing code (P1).
+
 **Charge selection** (`JChronologerLibraryPredictionClient`; to be confirmed against the golden
 data before it is coded):
 - A charge is eligible when it lies in the charge range and its m/z falls in the m/z window.
 - Among eligible charges, those above 1% are kept, and so is any charge whose probability is at least
   the second-highest eligible probability (the highest, when two tie for it). So at least the two
   most likely eligible charges survive.
+- That rule is EncyclopeDIA's. JChronologer's own automatic selection
+  (`DefaultChronologerLibraryPredictor.predict`) keeps every charge 1–6 with `p ≥` the request's
+  minimum; its distribution is Electrician's finite positive outputs divided by their sum (a double
+  sum, each quotient cast to float).
+- In the jar, RT seconds are `float32(pred_hi × 60f)` and CCS is `out × (float)std + (float)mean`. A
+  peptide Sculptor cannot tokenize gets no CCS; it is not refused.
 
 **Threads.** The jar runs one inference thread per worker. In torch 2.12, the same thread count and
 batch size give bit-identical output; thread count alone moves values by up to 4.5e-6, batch size
@@ -108,11 +119,14 @@ The tokenizer is `constellation/massspec/tokenize/`:
 - `vocabulary.Vocabulary`: characters ↔ ids, `(residue, accession) → char`, N-terminal map, vectorised `encode`;
 - `jchronologer`: one vocabulary per model, plus the terminal rules.
 
-Maps are keyed by UNIMOD accession. A jar mass prefix that would admit a second modification is
-refused rather than guessed. They are generated, with every jar member's SHA-256, into
-`constellation/data/jchronologer_models.json` by `scripts/build-jchronologer-models-json.py`: the
-captured-not-transcribed rule the jar CLI follows. A model member whose hash is not in the snapshot
-is refused.
+Input is keyed by UNIMOD accession: a modification outside JChronologer's fifteen (or, for Sculptor,
+outside its file's map) is refused, never matched by mass, so Ethyl-K is not taken for dimethyl-K.
+The regular-expression models apply the file's rules to the jar's mass spelling, cached per (residue,
+modification set), which reproduces the jar exactly, including sums at one position; a derived table
+would only have been a second copy of the rules, so the snapshot holds hashes, not maps.
+`constellation/data/jchronologer_models.json` (`scripts/build-jchronologer-models-json.py`) records
+the SHA-256 of the jar and every model member by version and role, and a preprocessing file whose
+hash is not in it is refused.
 
 `constellation/massspec/library/jchronologer/`:
 - `bundle`: locate through `thirdparty.registry.find("encyclopedia")` and the manifest Class-Path;
@@ -190,3 +204,47 @@ Later:
     590 → 30–38 µs on a modification-heavy mix. That misses the 30 µs aimed for. What remains is
     per-peptide Python preparation and the numpy scatter of each group's ions, which scales with the
     ions.
+
+### P1 (2026-11-06)
+
+- **`massspec.tokenize`.**
+  - `vocabulary`: `Sites` (residues plus the sorted UNIMOD accessions at the N-terminus, each residue
+    and the C-terminus), `SiteTokens` (the accession-keyed spelling) and `Vocabulary` (characters to
+    ids; `encode` pads spellings into int64 rows with a lookup table, in a few numpy operations).
+    Refusals carry one of four stable reasons (`length_out_of_range`, `unknown_residue`,
+    `unsupported_modification`, `unsupported_form`) and a detail.
+  - `jchronologer`: a port of the jar's three tokenization paths. Chronologer gets
+    `unimodToMassEncoded`, then `ChronologerPreprocessor`; Cartographer gets the mass spelling
+    `predict` rebuilds after `foldFirstResiduePyrogluToNterm`; Sculptor gets `SculptorTokenizer`.
+    Electrician reads Cartographer's tokens, as in the jar, and its file must agree with
+    Cartographer's.
+  - Constellation's `[UNIMOD:26]-C` (S-carbamoylmethylcysteine cyclization) is not one of the jar's
+    fifteen. It is given to the models the way the jar writes that molecule: UNIMOD:28 on the
+    N-terminus of a carbamidomethyl C (Chronologer `)d`, Cartographer and Sculptor `(c`).
+- **Checked against the jar.** `scripts/survey-jchronologer-tokens.py` compiles
+  `scripts/jchronologer/TokenOracle.java` and runs it on EncyclopeDIA's own classpath. The corpus is
+  274 peptides: every (residue, accession) Scout or Sculptor names, the N-terminal forms, length
+  limits, refusals and 200 random peptidoforms. The jar's tokens are in
+  `tests/data/jchronologer/1.0.10/tokens.tsv`, beside the four preprocessing files.
+  - Constellation's tokens equal the jar's on 804 of 822 rows.
+  - The other 18 fall into four deliberate departures, each pinned by the test:
+    1. Sculptor takes accessions in its own map that the jar cannot name, so never sends it (13 rows).
+    2. Pyro-Glu written on the first residue goes to the N-terminus for every model; the jar does this
+       for Cartographer only, so its Sculptor gives such a peptide no CCS (2 rows).
+    3. A side-chain acetyl lysine at residue 0 stays `a`. The jar's `patchModSequence` moves any
+       residue-0 `[+42.010565]` to the N-terminus, so it tells Chronologer and Cartographer the
+       peptide is N-terminally acetylated (2 rows).
+    4. A C-terminal modification is refused. The jar leaves it out of Cartographer's tokens; its
+       Chronologer path refuses it (1 row).
+- **Which jar.** The first oracle run used a `lib/*` classpath and loaded classes from the leftover
+  `jchronologer-1.0.9.jar`: Chronologer refused N-terminal pyro-Glu and Sculptor gave it no tokens.
+  Anything run on the jar must use the jars EncyclopeDIA's manifest `Class-Path` names
+  (`thirdparty.encyclopedia.manifest_class_path` / `jchronologer_jar`). P2 reads members from the
+  named jar with `zipfile`, so it is not exposed.
+- **Speed** (200,000 random tryptic peptides, carbamidomethyl C, some oxidised M, phospho and
+  N-terminal acetyl):
+  - canonical ProForma to `Sites` takes 5.5 µs a peptide, read without building a `Peptidoform`
+    (`parse_proforma` takes 14 µs), and equals the parser's result on the whole corpus;
+  - encoding takes 3.2–3.9 µs a peptide per model;
+  - a million peptides through all three models take about 15 s, against the 30 s aimed for.
+

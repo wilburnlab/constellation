@@ -1,20 +1,50 @@
-"""Per-model peptide tokenizers (scaffold).
+"""Per-model peptide tokenizers.
 
-Encoding peptide sequences into integer-token tensors is a per-model
-decision: each downstream MS model (Prosit-style intensity predictors,
-Chronologer-style RT, future PSM scorers) commits to a vocabulary tied
-to a specific checkpoint. The vocab is a `core.chem.modifications.UNIMOD`
-subset plus terminal-token / padding conventions; the tokenizer pairs
-with the model.
+Encoding peptides into integer-token tensors is a per-model decision:
+each model commits to the characters it reads, the id of each, how a
+modified residue or terminus is spelled, and a fixed width. This package
+holds those conventions, apart from the chemistry: ``peptide/`` is
+unconditional physics, ``tokenize/`` ties it to a model's input contract.
 
-Lives sibling to `peptide/` rather than inside it because tokenization
-is a layered concern above the chemistry — `peptide/` is unconditional
-physics, `tokenize/` ties physics to a specific model's input contract.
+Modules:
+    vocabulary    - ``Sites`` (a peptidoform as residues and the UNIMOD
+                    accessions at each position, refusing what has no
+                    such reading), ``SiteTokens`` (the plain
+                    accession-keyed spelling), ``Vocabulary`` (characters
+                    to ids, vectorised ``encode`` into padded int64 rows)
+                    and the refusal reasons.
+    jchronologer  - the tokens JChronologer (EncyclopeDIA's predictor)
+                    gives its Chronologer, Cartographer, Electrician and
+                    Sculptor models, ported from jchronologer 1.0.10 and
+                    checked against the jar's own tokens; built from the
+                    models' preprocessing files, which must match the
+                    snapshot ``data/jchronologer_models.json``.
 
-Modules (TODO):
-    vocabulary       - Vocabulary class wrapping a `ModVocab.subset(...)`
-                       plus terminal / pad / unknown token policy.
-    tokenizer        - Tokenizer base + sequence_to_tensor / tensor_to_sequence.
-    prosit_2020      - Vocab + tokenizer paired with Prosit_2020_intensity_HCD.
-    chronologer      - Vocab + tokenizer paired with Chronologer_RT.
+Nothing here imports torch.
 """
+
+from constellation.massspec.tokenize.vocabulary import (
+    LENGTH_OUT_OF_RANGE,
+    REASONS,
+    UNKNOWN_RESIDUE,
+    UNSUPPORTED_FORM,
+    UNSUPPORTED_MODIFICATION,
+    Sites,
+    SiteTokens,
+    TokenizationRefused,
+    TokenizedBatch,
+    Vocabulary,
+)
+
+__all__ = [
+    "LENGTH_OUT_OF_RANGE",
+    "REASONS",
+    "UNKNOWN_RESIDUE",
+    "UNSUPPORTED_FORM",
+    "UNSUPPORTED_MODIFICATION",
+    "SiteTokens",
+    "Sites",
+    "TokenizationRefused",
+    "TokenizedBatch",
+    "Vocabulary",
+]
