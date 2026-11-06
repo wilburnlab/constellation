@@ -56,10 +56,41 @@ class Specificity:
 
     position: str
     site: str
+    #: UNIMOD's ``hidden="1"``: a Mascot display flag, not a judgement on
+    #: the chemistry (SILAC K/R and GlyGly-K are hidden).
+    hidden: bool = False
+    #: UNIMOD's classification of this placement ("Post-translational",
+    #: "Artefact", "Chemical derivative", "Isotopic label", ...).
+    classification: str = ""
+    #: The neutral losses UNIMOD lists for this placement.
+    neutral_losses: tuple["NeutralLoss", ...] = ()
+
+    @property
+    def is_protein_terminal(self) -> bool:
+        """True for "Protein N-term" / "Protein C-term": the placement needs
+        the protein's own terminus, not any peptide's."""
+        return self.position in _PROTEIN_TERM_POSITIONS
+
+
+@dataclass(frozen=True, slots=True)
+class NeutralLoss:
+    """One <umod:NeutralLoss> of a specificity. ``mono_mass == 0`` is
+    UNIMOD's "no loss" entry, kept as UNIMOD lists it. ``flag`` is UNIMOD's
+    attribute of that name (a loss to be expected alongside the intact
+    fragment)."""
+
+    mono_mass: float
+    avge_mass: float = 0.0
+    flag: bool = False
+    composition: Composition | None = None
 
 
 _N_TERM_POSITIONS = frozenset({"Any N-term", "Protein N-term"})
 _C_TERM_POSITIONS = frozenset({"Any C-term", "Protein C-term"})
+_PROTEIN_TERM_POSITIONS = frozenset({"Protein N-term", "Protein C-term"})
+
+#: The site sentinels a placement can name besides a residue letter.
+TERMINI = ("N-term", "C-term")
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,12 +111,60 @@ class Modification:
     """
 
     id: str  # canonical "UNIMOD:35"
-    name: str  # full UNIMOD name (e.g. "Oxidation")
+    name: str  # UNIMOD's full name (e.g. "Oxidation or Hydroxylation")
     delta_composition: Composition
     aliases: tuple[str, ...] = ()
     mass_override: float | None = None
     specificities: tuple[Specificity, ...] = ()
     description: str = ""
+    #: The placements UNIMOD lists as hidden. Kept apart from
+    #: ``specificities`` so that what the readers disambiguate with is
+    #: unchanged; :attr:`all_specificities` has both.
+    hidden_specificities: tuple[Specificity, ...] = ()
+
+    @property
+    def all_specificities(self) -> tuple[Specificity, ...]:
+        """Every placement UNIMOD lists, shown and hidden."""
+        return self.specificities + self.hidden_specificities
+
+    def licenses(
+        self,
+        site: str,
+        *,
+        terminal_residue: str | None = None,
+        protein_terminus: bool = False,
+        include_hidden: bool = True,
+    ) -> bool:
+        """Whether UNIMOD lists a placement of this modification at ``site``.
+
+        ``site`` is a residue letter (a side chain) or ``"N-term"`` /
+        ``"C-term"`` (the terminus itself). For a terminus,
+        ``terminal_residue`` is the residue there, which a terminal
+        specificity may name ("Any N-term" on Q for pyro-Glu), and
+        ``protein_terminus`` says whether it is the protein's own terminus:
+        a "Protein N-term" / "Protein C-term" placement is licensed only
+        there, an "Any" one anywhere. A side-chain site is licensed by an
+        "Anywhere" placement on that residue; a terminal placement that
+        names a residue is a terminal modification, asked about with
+        ``site="N-term"`` / ``"C-term"`` and ``terminal_residue``.
+        """
+        specs = self.all_specificities if include_hidden else self.specificities
+        if site in TERMINI:
+            positions = _N_TERM_POSITIONS if site == "N-term" else _C_TERM_POSITIONS
+            for spec in specs:
+                if spec.position not in positions:
+                    continue
+                if spec.is_protein_terminal and not protein_terminus:
+                    continue
+                if spec.site == site or (terminal_residue is not None and spec.site == terminal_residue):
+                    return True
+            return False
+        for spec in specs:
+            if spec.site != site:
+                continue
+            if spec.position == "Anywhere":
+                return True
+        return False
 
     @property
     def delta_mass(self) -> float:
@@ -298,18 +377,16 @@ class ModVocab:
         out = cls()
         for rec in doc["modifications"]:
             comp = Composition.from_dict(rec["delta_composition"])
-            specs = tuple(
-                Specificity(position=s["position"], site=s["site"])
-                for s in rec.get("specificities", ())
-            )
+            specs = [_specificity_from(s) for s in rec.get("specificities", ())]
             mod = Modification(
                 id=rec["id"],
                 name=rec.get("name", rec["id"]),
                 delta_composition=comp,
                 aliases=tuple(rec.get("aliases", ())),
                 mass_override=rec.get("mass_override"),
-                specificities=specs,
+                specificities=tuple(s for s in specs if not s.hidden),
                 description=rec.get("description", ""),
+                hidden_specificities=tuple(s for s in specs if s.hidden),
             )
             out.add(mod)
         return out
@@ -317,7 +394,7 @@ class ModVocab:
     def save(self, path: str | Path) -> None:
         path = Path(path)
         doc = {
-            "schema_version": "1",
+            "schema_version": "2",
             "source": {"generator": "ModVocab.save"},
             "modifications": [
                 {
@@ -326,16 +403,53 @@ class ModVocab:
                     "delta_composition": m.delta_composition.atoms,
                     "mass_override": m.mass_override,
                     "aliases": list(m.aliases),
-                    "specificities": [
-                        {"position": s.position, "site": s.site}
-                        for s in m.specificities
-                    ],
+                    "specificities": [_specificity_doc(s) for s in m.all_specificities],
                     "description": m.description,
                 }
                 for m in self
             ],
         }
         path.write_text(json.dumps(doc, indent=1) + "\n")
+
+
+def _specificity_from(rec: Mapping) -> Specificity:
+    """A specificity record of a vocab JSON (schema 1 had only position and
+    site, and listed shown placements only)."""
+    return Specificity(
+        position=rec["position"],
+        site=rec["site"],
+        hidden=bool(rec.get("hidden", False)),
+        classification=rec.get("classification", ""),
+        neutral_losses=tuple(
+            NeutralLoss(
+                mono_mass=float(loss["mono_mass"]),
+                avge_mass=float(loss.get("avge_mass", 0.0)),
+                flag=bool(loss.get("flag", False)),
+                composition=Composition.from_dict(loss["composition"])
+                if loss.get("composition")
+                else None,
+            )
+            for loss in rec.get("neutral_losses", ())
+        ),
+    )
+
+
+def _specificity_doc(s: Specificity) -> dict:
+    return {
+        "position": s.position,
+        "site": s.site,
+        "hidden": s.hidden,
+        "classification": s.classification,
+        "neutral_losses": [
+            {
+                "mono_mass": loss.mono_mass,
+                "avge_mass": loss.avge_mass,
+                "flag": loss.flag,
+                "composition": loss.composition.atoms if loss.composition is not None else {},
+            }
+            for loss in s.neutral_losses
+        ],
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -352,4 +466,4 @@ def _load_unimod() -> ModVocab:
 UNIMOD: ModVocab = _load_unimod()
 
 
-__all__ = ["Modification", "ModVocab", "Specificity", "UNIMOD"]
+__all__ = ["TERMINI", "Modification", "ModVocab", "NeutralLoss", "Specificity", "UNIMOD"]

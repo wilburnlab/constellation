@@ -28,16 +28,27 @@ Each modification record carries:
     description        empty by default; filled where UNIMOD ships notes.
 
 Each modification also carries:
-    specificities      list of {position, site} pairs lifted from
-                       <umod:specificity>. Position is one of Anywhere,
+    specificities      every <umod:specificity>, as
+                       {position, site, hidden, classification,
+                        neutral_losses}. Position is one of Anywhere,
                        Any N-term, Any C-term, Protein N-term,
                        Protein C-term. Site is a residue letter or one
                        of "N-term" / "C-term". This drives N-terminal
                        vs. side-chain mod localization in PSI / EncyclopeDIA
-                       readers (cf. K[Acetyl] vs [Acetyl]-K). Hidden
-                       specificities (hidden="1") are skipped — they're
-                       suppressed in the upstream UNIMOD UI and represent
-                       speculative or artefact placements.
+                       readers (cf. K[Acetyl] vs [Acetyl]-K) and the
+                       sites a search space may place a modification on.
+                       ``hidden`` is UNIMOD's flag (hidden="1"), which is a
+                       Mascot display setting, not a judgement on the
+                       chemistry: 2,747 of 2,826 specificities carry it,
+                       SILAC K/R and GlyGly-K among them. Until 2026-11-05
+                       they were dropped here; ``ModVocab`` still exposes
+                       only the shown ones as ``Modification.specificities``
+                       and the rest as ``hidden_specificities``.
+                       ``classification`` is UNIMOD's (Post-translational,
+                       Artefact, Chemical derivative, Isotopic label, ...).
+                       ``neutral_losses`` lists each <umod:NeutralLoss>
+                       ({mono_mass, avge_mass, flag, composition}), the
+                       zero-mass "no loss" entries included.
 
 xrefs are dropped — those are out of scope for the chemistry layer.
 
@@ -219,15 +230,37 @@ def _parse_one(elem: ET.Element, atom_masses: dict[str, float]) -> dict | None:
     if title and title not in aliases:
         aliases = (title, *aliases)
 
-    specs: list[dict[str, str]] = []
+    specs: list[dict] = []
     for spec in elem.findall(f"{_NS}specificity"):
-        if spec.get("hidden") == "1":
-            continue
         position = spec.get("position", "")
         site = spec.get("site", "")
         if not position or not site:
             continue
-        specs.append({"position": position, "site": site})
+        losses = []
+        for loss in spec.findall(f"{_NS}NeutralLoss"):
+            loss_comp: dict[str, int] = {}
+            for child in loss.findall(f"{_NS}element"):
+                sym = child.get("symbol", "")
+                n = int(child.get("number", "0"))
+                if sym and n:
+                    _add_into(loss_comp, _resolve_element(sym), n)
+            losses.append(
+                {
+                    "mono_mass": float(loss.get("mono_mass", "0")),
+                    "avge_mass": float(loss.get("avge_mass", "0")),
+                    "flag": loss.get("flag") == "true",
+                    "composition": loss_comp,
+                }
+            )
+        specs.append(
+            {
+                "position": position,
+                "site": site,
+                "hidden": spec.get("hidden") == "1",
+                "classification": html.unescape(spec.get("classification", "")),
+                "neutral_losses": losses,
+            }
+        )
 
     return {
         "id": f"UNIMOD:{record_id}",
@@ -257,7 +290,8 @@ def build(repo_root: Path) -> dict:
         if rec is not None:
             mods.append(rec)
     return {
-        "schema_version": "1",
+        # 2: every specificity, with hidden / classification / neutral_losses.
+        "schema_version": "2",
         "source": {
             "xml": "https://www.unimod.org/xml/unimod.xml",
             "vendored_at": "constellation/data/_raw/unimod.xml",
