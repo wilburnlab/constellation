@@ -536,7 +536,9 @@ def sweep(
     ``workers``), each range's matches are written to ``work_dir`` in sorted
     runs of at most ``settings.run_rows``, and each bucket of queries is
     reduced from them, ``workers`` processes at a time for both. The outputs
-    are the same either way, byte for byte, whatever the number of workers.
+    are the same tables either way, and the same bytes whatever the number
+    of workers; a file written from a sweep on disk keeps its parts' row
+    groups, so it differs from an in-memory sweep's file in those alone.
     Without a ``work_dir`` a temporary one is used, kept while the result
     is, so its outputs are read as asked. With ``settings.claims`` the
     claims table is the ``point_claims`` output. A reducer gives one output

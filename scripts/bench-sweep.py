@@ -281,8 +281,23 @@ def _cmd_gate(args) -> None:
     from constellation.massspec.sweep.engine import SweepSettings, sweep
     from constellation.massspec.sweep.evidence import EvidenceGate
 
-    targets = pq.read_table(args.targets)
-    plan = compile_queries(targets, levels=[2], rt_window=args.rt_window)
+    if args.targets.endswith(".parquet"):
+        targets = pq.read_table(args.targets)
+    else:
+        from constellation.massspec.quant.targets import load_targets
+
+        targets = load_targets(args.targets)
+    abundance, channels = None, None
+    if args.fragment_library or args.top_fragments:
+        from constellation.massspec.library.fragment_abundance import LibraryFragments
+        from constellation.massspec.sweep import ChannelSettings
+
+        abundance = LibraryFragments.from_directory(args.fragment_library or args.targets)
+        coverage = abundance.coverage or {}
+        channels = ChannelSettings(top_fragments=args.top_fragments,
+                                   max_fragment_charge=int(coverage.get("max_fragment_charge") or 2))  # fmt: skip
+    kw = {} if abundance is None else dict(channels=channels, fragment_abundance=abundance)
+    plan = compile_queries(targets, levels=[2], rt_window=args.rt_window, **kw)
     report = []
     for top in args.top_peaks:
         top_peaks = top or None
@@ -414,6 +429,10 @@ def main() -> None:
     g.add_argument("--top-peaks", type=int, nargs="+", default=[0, 150, 50, 20])
     g.add_argument("--min-fragments", type=int, nargs="+", default=[2, 3, 4, 5, 6, 8])
     g.add_argument("--min-consecutive", type=int, nargs="+", default=[1, 2, 3, 5])
+    g.add_argument("--fragment-library", default=None,
+                   help="Take fragment channels' abundances from this library (default: --targets).")
+    g.add_argument("--top-fragments", type=int, default=None,
+                   help="Keep each target's N most abundant fragment ions (needs a fragment library).")
     tolerances(g)
     g.add_argument("--out", required=True)
     g.set_defaults(func=_cmd_gate)

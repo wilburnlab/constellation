@@ -217,12 +217,14 @@ through unchanged.
   - a terminal modification is treated as residue 0's side chain by loss triggers;
   - a bare-mass phospho never triggers H3PO4.
 - **Sweep and library internals:**
-  - `isotope_offsets=()` crashes;
-  - the gate counts (ion type, position), not bonds;
+  - `isotope_offsets=()` crashes (refused with a message since 2026-11-07);
+  - the gate counts (ion type, position), not bonds (2026-11-07: a wording error, since b and y of one
+    bond match at different m/z and are separate evidence; the words now say fragment ions);
   - `assign_ids` mishandles duplicates;
   - `Network` claims a CSR index it does not build.
 - **Channel generation exists five times:** the sweep, Mode B, `spectra.annotate`, Counter
-  candidates and `results.trace_targets`. The search space adds no sixth.
+  candidates and `results.trace_targets`. The search space adds no sixth. (2026-11-07: one generator,
+  `massspec.peptide.channels`, for all but Counter, which keeps its own until its revision.)
 - **SHA-256 of a file is written eight times** across the package; `core.stages.file_sha256` is
   the one new code should use.
 - **The FASTQ readers and writers** are the next candidate for the FASTA treatment.
@@ -320,9 +322,10 @@ peptide) newly passes, and three decoys pass in place of three others. Nothing e
   - a 400 instead of a 500 for unparseable mass deltas;
   - then a protein box: accession or sequence → digest → pick a peptide → trace.
 - **Scoring:**
-  - predicted intensities (`LIBRARY_FRAGMENT_TABLE`) → channel `abundance`;
+  - predicted intensities (`LIBRARY_FRAGMENT_TABLE`) → channel `abundance`: done 2026-11-07
+    (`library.fragment_abundance`, top-N; [sweep.md](sweep.md));
   - a channel-overlap graph over the compiled plan;
-  - a scorer as a gated reducer.
+  - a scorer as a reducer over `QueryBatch.cells`.
 - **UNIMOD neutral losses → `LOSS_REGISTRY`**, and which site licensed a loss.
 - **Sequence variants and isoforms** as protein rows with a parent link; PEFF, and UniProt headers
   carried into the protein table.
