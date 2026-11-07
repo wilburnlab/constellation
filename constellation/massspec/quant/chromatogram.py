@@ -520,6 +520,7 @@ def extract_xic(
     workers: int = 1,
     work_dir: Path | str | None = None,
     progress=None,
+    fragment_abundance=None,
 ) -> "SweepResult":
     """Extract XIC traces for ``targets`` at every MS level in ``levels`` in
     one sweep of ``peaks`` (a bundle, streamed, or a peak table), each level
@@ -534,7 +535,10 @@ def extract_xic(
     the trace. ``claims`` adds the ``point_claims`` output (points matched
     by more than one target, or by two channels of one) and ``summary`` the
     ``query_summary`` output (per target: the gate's verdict, scans
-    eligible, cells matched). Every output carries ``tolerances`` in its
+    eligible, cells matched). ``fragment_abundance`` says where fragment
+    channels' abundances come from (``massspec.peptide.channels``; a
+    library's with ``library.fragment_abundance.LibraryFragments``), which
+    ``channels.top_fragments`` selects on. Every output carries ``tolerances`` in its
     schema metadata (:func:`extraction_tolerance_metadata`), in memory and
     when written."""
     from constellation.massspec.sweep import ChannelSettings, compile_queries
@@ -545,12 +549,15 @@ def extract_xic(
     if only_passing and gate is None:
         raise ValueError("only_passing needs a gate to pass targets")
 
+    from constellation.massspec.peptide.channels import UNMODELLED
+
     plan = compile_queries(
         targets,
         levels=levels,
         channels=channels if channels is not None else ChannelSettings(),
         rt_window=rt_window,
         assigned_scans_only=assigned_scans_only,
+        fragment_abundance=fragment_abundance if fragment_abundance is not None else UNMODELLED,
     )
     settings = SweepSettings(
         tolerances=dict(tolerances),

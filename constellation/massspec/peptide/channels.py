@@ -44,7 +44,7 @@ import numpy as np
 from constellation.core.sequence.proforma import Peptidoform
 from constellation.core.stats.units import ISOTOPE_MASS_DIFF
 from constellation.massspec.peptide.envelope import neutral_envelopes
-from constellation.massspec.peptide.ions import IonType, fragment_ladder_arrays_batch
+from constellation.massspec.peptide.ions import IonType, LadderArrays, fragment_ladder_arrays_batch
 from constellation.massspec.peptide.mz import PROTON_MASS
 
 __all__ = [
@@ -372,6 +372,10 @@ class CandidateIons:
     loss: np.ndarray
     mz: np.ndarray
     loss_ids: tuple[str, ...]
+    #: The settings the candidates were made under: the ion series asked
+    #: (IonType values) and, per query, its highest fragment charge.
+    ion_types: tuple[int, ...] = ()
+    charge_ceiling: np.ndarray | None = None
 
     def query_of(self) -> np.ndarray:
         return np.repeat(np.arange(self.offsets.size - 1, dtype=np.int64), np.diff(self.offsets))
@@ -491,12 +495,16 @@ def fragment_channels(
             f"abundances do not"
         )
     used = np.unique(peptide[peptide >= 0])
+    peptides = [peptidoforms[p] for p in used.tolist()]
     ladder = fragment_ladder_arrays_batch(
-        [peptidoforms[p] for p in used.tolist()],
+        peptides,
         ion_types=settings.ion_types,
         max_fragment_charge=settings.max_fragment_charge,
         neutral_losses=settings.neutral_losses,
     )
+    model = tuple(dict.fromkeys(abundance.model_losses()))
+    if model and peptides:
+        ladder = _with_model_losses(peptides, ladder, settings, model)
     lengths_used = np.fromiter((len(peptidoforms[p].sequence) for p in used.tolist()), np.int64, used.size)
     has = peptide >= 0
     which = np.where(has, np.searchsorted(used, np.where(has, peptide, used[0] if used.size else 0)), 0)
@@ -520,6 +528,8 @@ def fragment_channels(
         loss=ladder.loss[take],
         mz=ladder.mz[take],
         loss_ids=ladder.loss_ids,
+        ion_types=tuple(int(t) for t in settings.ion_types),
+        charge_ceiling=ceiling,
     )
     values = np.asarray(abundance.abundance(ions), dtype=np.float64)
     if top is not None:
@@ -554,6 +564,42 @@ def fragment_channels(
         abundance=values.astype(np.float32),
         evidence_key=evidence,
         loss_ids=ladder.loss_ids,
+    )
+
+
+def _with_model_losses(peptides, ladder: LadderArrays, settings: ChannelSettings, model: tuple[str, ...]) -> LadderArrays:
+    """``ladder`` with every ion carrying one of ``model``'s losses, at every
+    bond, whatever the loss rules say: where an abundance source (a
+    prediction) names its losses, the source, not the rules, says where
+    they are (``prediction.assemble``). Rows stay in ladder order."""
+    free = fragment_ladder_arrays_batch(peptides, ion_types=settings.ion_types,
+                                        max_fragment_charge=settings.max_fragment_charge, neutral_losses=model,
+                                        loss_rules=False)  # fmt: skip
+    loss_ids = ladder.loss_ids + tuple(m for m in model if m not in ladder.loss_ids)
+    remap = np.array([0] + [loss_ids.index(name) + 1 for name in free.loss_ids], dtype=np.int64)
+    pep_r = np.repeat(np.arange(len(peptides), dtype=np.int64), np.diff(ladder.offsets))
+    pep_f = np.repeat(np.arange(len(peptides), dtype=np.int64), np.diff(free.offsets))
+    sel = free.loss > 0
+    order_of = np.zeros(max(int(t) for t in IonType) + 1, dtype=np.int64)
+    for i, t in enumerate(settings.ion_types):
+        order_of[int(t)] = i
+    pep = np.concatenate([pep_r, pep_f[sel]])
+    position = np.concatenate([ladder.position, free.position[sel]]).astype(np.int64)
+    ion_type = np.concatenate([ladder.ion_type, free.ion_type[sel]])
+    charge = np.concatenate([ladder.charge, free.charge[sel]]).astype(np.int64)
+    loss = np.concatenate([ladder.loss.astype(np.int64), remap[free.loss[sel].astype(np.int64)]])
+    mz = np.concatenate([ladder.mz, free.mz[sel]])
+    # Ladder order packed in one key; a row in both keeps the ruled ladder's.
+    key = (pep << 40) | (position << 24) | (order_of[ion_type.astype(np.int64)] << 20) | (charge << 16) | loss
+    _, first = np.unique(key, return_index=True)
+    return LadderArrays(
+        offsets=np.searchsorted(pep[first], np.arange(len(peptides) + 1)).astype(np.int64),
+        mz=mz[first],
+        ion_type=ion_type[first].astype(np.int8),
+        position=position[first].astype(np.int32),
+        charge=charge[first].astype(np.int32),
+        loss=loss[first].astype(np.int16),
+        loss_ids=loss_ids,
     )
 
 

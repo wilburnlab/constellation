@@ -226,7 +226,13 @@ class ParquetDirReader:
     extension: ClassVar[str] = "/"
     format_name: ClassVar[str] = "parquet_dir"
 
-    def read(self, path: Path, **opts: Any) -> Library:
+    def read(self, path: Path, *, fragments: bool = True, **opts: Any) -> Library:
+        """The library in ``path``. With ``fragments=False`` its fragment
+        table is left empty: what a reader of precursors needs (extraction
+        targets), without the bulk of a predicted proteome (about 24 rows a
+        precursor), which ``library.fragment_abundance`` streams instead."""
+        from constellation.massspec.library.schemas import LIBRARY_FRAGMENT_TABLE
+
         manifest_path = path / "manifest.json"
         manifest: dict[str, Any] = {}
         if manifest_path.exists():
@@ -234,7 +240,10 @@ class ParquetDirReader:
         tables: dict[str, pa.Table] = {
             name: pq.read_table(path / f"{name}.parquet")
             for name in _PARQUET_TABLES
+            if fragments or name != "fragments"
         }
+        if not fragments:
+            tables["fragments"] = LIBRARY_FRAGMENT_TABLE.empty_table()
         optional = {
             name: pq.read_table(path / f"{name}.parquet")
             for name in _OPTIONAL_TABLES

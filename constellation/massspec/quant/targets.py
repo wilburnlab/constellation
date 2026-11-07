@@ -323,7 +323,9 @@ def load_targets(path: str | Path, *, library: object | None = None) -> pa.Table
 
     Auto-detects by what is on disk: a search experiment or one of its
     unit directories (by the ``kind`` in its ``manifest.json``), a
-    Library ParquetDir bundle (``precursors.parquet``), a Search bundle
+    Library ParquetDir bundle (``precursors.parquet``, read without its
+    fragments) or a ``predict-library`` output directory holding one
+    (``library_pqdir/``), a Search bundle
     (``psms.parquet``), a ``PRECURSOR_QUANT`` bundle
     (``precursor_quant.parquet``, requires ``library=``), or a bare
     ``.parquet`` / ``.tsv`` target file.
@@ -349,10 +351,14 @@ def load_targets(path: str | Path, *, library: object | None = None) -> pa.Table
             return targets_from_experiment(
                 p.parent.parent, unit=p.name, acquisition_id=unit.acquisition_ids[0]
             )
+        if not (p / "precursors.parquet").exists() and (p / "library_pqdir" / "precursors.parquet").exists():
+            p = p / "library_pqdir"  # a predict-library output directory
         if (p / "precursors.parquet").exists():
             from constellation.massspec.library.io import load_library
 
-            return targets_from_library(load_library(p, format="parquet_dir"))
+            # Targets are precursors: the fragments (the bulk of a predicted
+            # library) are not read (library.fragment_abundance streams them).
+            return targets_from_library(load_library(p, format="parquet_dir", fragments=False))
         if (p / "psms.parquet").exists():
             from constellation.massspec.search.io import load_search
 
