@@ -11,7 +11,7 @@ the same schedule the map did.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
@@ -19,7 +19,13 @@ import pyarrow as pa
 
 from constellation.massspec.sweep.evidence import Decision, Evidence
 from constellation.massspec.sweep.queries import QueryPlan
-from constellation.massspec.sweep.schedule import isolation_groups, pair_eligible, ragged_arange
+from constellation.massspec.sweep.schedule import (
+    WindowIndex,
+    eligible_pairs,
+    pair_eligible,
+    ragged_arange,
+    window_index,
+)
 from constellation.massspec.sweep.schemas import (
     SWEEP_MATCH_TABLE,
     SWEEP_QUERY_SUMMARY_TABLE,
@@ -42,10 +48,35 @@ class Ledger:
     lower: np.ndarray  # float64, NaN without bounds
     upper: np.ndarray
     n_points: np.ndarray  # int64
+    #: Built on first use: each level's WindowIndex (eligibility is
+    #: decided on it at every call, so it is built once, not regrouped).
+    _cache: dict = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def n(self) -> int:
         return int(self.scan.size)
+
+    def window_index(self, level: int) -> WindowIndex:
+        """The level's scans with points and a time, by isolation window
+        (MS1 as one unbounded window). Keyed by the points the map has
+        recorded, so an index is never used before they are all in."""
+        key = ("windows", int(level), int(self.n_points.sum()), self.n)
+        found = self._cache.get(key)
+        if found is None:
+            found = window_index(self.scan, self.level, self.rt, self.lower, self.upper, self.n_points,
+                                 int(level), gate=level > 1)  # fmt: skip
+            self._cache[key] = found
+        return found
+
+    def scan_rows(self, scans: np.ndarray) -> np.ndarray:
+        """Ledger row of each scan number, -1 for one not in the ledger or
+        negative (no scan)."""
+        scans = np.asarray(scans, dtype=np.int64)
+        by = np.argsort(self.scan, kind="stable")
+        pos = np.searchsorted(self.scan[by], scans)
+        at = by[np.minimum(pos, max(by.size - 1, 0))] if by.size else np.zeros(scans.size, np.int64)
+        found = (scans >= 0) & (pos < by.size) & (self.scan[at] == scans) if by.size else np.zeros(scans.size, bool)
+        return np.where(found, at, -1).astype(np.int64)
 
     def order(self) -> np.ndarray:
         """Each scan's rank by (retention time, scan number): the order a
@@ -156,44 +187,29 @@ class Matches:
 
 def _eligible_ranges(plan: QueryPlan, s: Ledger, level: int, queries: np.ndarray):
     """The (scan, query) pairs ``level`` could match ``queries`` in, as
-    ranges: per window group of the level's scans with points, the group's
-    queries, its ledger rows in (retention time, scan) order, and for each
-    query the first of those rows inside its interval and how many are. A
-    query with an assigned scan (fragments) has that one row or none. So
-    the pairs are never built as a queries × scans product: what is built
-    is only what is eligible, and counting needs nothing built at all.
+    ranges: the level's ledger rows by window and (retention time, scan)
+    (:meth:`Ledger.window_index`), and for each (window, query) pair its
+    query, the first of those rows inside its interval and how many are.
+    A query with an assigned scan (fragments) has that one row or none.
+    So the pairs are never built as a queries × scans product: what is
+    built is only what is eligible, and counting needs nothing built at
+    all. Until 2026-11-07 the windows were regrouped at every call, which
+    cost windows × scans (5.4 s a call on a 100,000-scan DDA run).
 
-    The interval test is :func:`pair_eligible`'s, inclusive at both ends:
-    on rows sorted by time, ``searchsorted`` left of the lower bound and
-    right of the upper one take exactly the rows with ``lo <= rt <= hi``
-    (bounds are never NaN; a scan without a time sorts last and is never
-    inside)."""
+    The interval test is :func:`pair_eligible`'s, inclusive at both ends
+    (bounds are never NaN; a scan without a time is not in the index)."""
     channels = plan.channels_for_level(level)
     if channels is None or queries.size == 0:
         return
     queries = queries[channels.counts()[queries] > 0]
-    rows = np.flatnonzero((s.level == level) & (s.n_points > 0))
-    groups = isolation_groups(queries, plan.precursor_mz, s.lower[rows], s.upper[rows], rows, gate=level > 1)
-    for g in groups:
-        r = g.rows[np.lexsort((s.scan[g.rows], s.rt[g.rows]))]
-        rt = s.rt[r]
-        q = g.queries
-        start = np.searchsorted(rt, plan.rt_lo[q], side="left").astype(np.int64)
-        stop = np.searchsorted(rt, plan.rt_hi[q], side="right").astype(np.int64)
-        count = np.maximum(stop - start, 0)
-        if level > 1:
-            assigned = plan.assigned_scan[q]
-            fixed = np.flatnonzero(assigned >= 0)
-            if fixed.size:
-                scans = s.scan[r]
-                by = np.argsort(scans, kind="stable")
-                pos = np.searchsorted(scans[by], assigned[fixed])
-                at = by[np.minimum(pos, by.size - 1)]
-                found = (pos < by.size) & (scans[at] == assigned[fixed])
-                inside = (start[fixed] <= at) & (at < stop[fixed])
-                start[fixed] = at
-                count[fixed] = (found & inside).astype(np.int64)
-        yield q, r, start, count
+    index = s.window_index(level)
+    fragments = level > 1
+    assigned = plan.assigned_scan if fragments else None
+    scan_rows = s.scan_rows(plan.assigned_scan) if fragments and (plan.assigned_scan >= 0).any() else None
+    q, start, count = eligible_pairs(index, queries, plan.precursor_mz, plan.rt_lo, plan.rt_hi, assigned,
+                                     gate=fragments, scan_rows=scan_rows)  # fmt: skip
+    if q.size:
+        yield q, index.rows, start, count
 
 
 def eligible_counts(plan: QueryPlan, s: Ledger, level: int, queries: np.ndarray) -> np.ndarray:
@@ -201,7 +217,7 @@ def eligible_counts(plan: QueryPlan, s: Ledger, level: int, queries: np.ndarray)
     ``level`` could match it in, without building them."""
     out = np.zeros(queries.size, np.int64)
     for q, _, _, count in _eligible_ranges(plan, s, level, queries):
-        np.add.at(out, np.searchsorted(queries, q), count)
+        out += np.bincount(np.searchsorted(queries, q), weights=count, minlength=queries.size).astype(np.int64)
     return out
 
 

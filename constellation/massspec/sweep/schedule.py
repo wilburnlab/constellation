@@ -29,6 +29,9 @@ __all__ = [
     "ScanGroup",
     "isolation_groups",
     "pair_eligible",
+    "WindowIndex",
+    "window_index",
+    "eligible_pairs",
 ]
 
 
@@ -89,9 +92,14 @@ def isolation_groups(
     key_hi = np.where(unbounded, -np.inf, upper)
     pairs, inverse = np.unique(np.stack([key_lo, key_hi], axis=1), axis=0, return_inverse=True)
     inverse = inverse.reshape(-1)
+    # Each window's members in stored order, by one stable sort (selecting
+    # them window by window cost windows × scans: quadratic on DDA, where
+    # nearly every scan is a window of its own).
+    by_window = np.argsort(inverse, kind="stable")
+    bounds = np.searchsorted(inverse[by_window], np.arange(len(pairs) + 1))
     groups = []
     for g, (lo, hi) in enumerate(pairs):
-        members = rows[inverse == g]
+        members = rows[by_window[bounds[g]:bounds[g + 1]]]
         if lo == -np.inf and hi == -np.inf:
             queries = active
         else:
@@ -119,3 +127,131 @@ def pair_eligible(
         assigned = assigned_scan[query]
         ok &= (assigned < 0) | (assigned == scan_id)
     return ok
+
+
+@dataclass(frozen=True)
+class WindowIndex:
+    """A level's scans that can be matched (with points and a retention
+    time), by isolation window: what eligibility is decided on, built once
+    per ledger and level instead of regrouped at every call.
+
+    ``rows`` are ledger rows sorted by (window, retention time, scan), the
+    rows of window ``w`` being ``rows[starts[w]:starts[w + 1]]``. Windows
+    are compared exactly on their float64 bounds; a scan without bounds is
+    in an unbounded window (as is every MS1 scan, ``gate=False``)."""
+
+    rows: np.ndarray  # int64 ledger rows, sorted
+    window: np.ndarray  # int64, each sorted row's window
+    rt: np.ndarray  # float64, each sorted row's retention time
+    starts: np.ndarray  # (n_windows + 1,) offsets into rows
+    lower: np.ndarray  # per window
+    upper: np.ndarray
+    unbounded: np.ndarray  # per window
+    position: np.ndarray  # per ledger row, its place in rows; -1 if not in it
+
+    @property
+    def n_windows(self) -> int:
+        return int(self.starts.size - 1)
+
+
+def window_index(
+    scan: np.ndarray, level_of: np.ndarray, rt: np.ndarray, lower: np.ndarray, upper: np.ndarray,
+    n_points: np.ndarray, level: int, *, gate: bool,
+) -> WindowIndex:
+    """The :class:`WindowIndex` of ``level``'s scans (ledger columns)."""
+    rows = np.flatnonzero((level_of == level) & (n_points > 0) & ~np.isnan(rt)).astype(np.int64)
+    if gate:
+        unbounded_row = np.isnan(lower[rows]) | np.isnan(upper[rows])
+        key = np.stack([np.where(unbounded_row, -np.inf, lower[rows]),
+                        np.where(unbounded_row, -np.inf, upper[rows])], axis=1)  # fmt: skip
+        if rows.size:
+            pairs, inverse = np.unique(key, axis=0, return_inverse=True)
+            inverse = inverse.reshape(-1)
+        else:
+            pairs, inverse = np.empty((0, 2)), np.empty(0, np.int64)
+    else:
+        pairs = np.array([[-np.inf, -np.inf]]) if rows.size else np.empty((0, 2))
+        inverse = np.zeros(rows.size, np.int64)
+    order = np.lexsort((scan[rows], rt[rows], inverse))
+    rows, window = rows[order], inverse[order].astype(np.int64)
+    starts = np.searchsorted(window, np.arange(len(pairs) + 1)).astype(np.int64)
+    position = np.full(scan.size, -1, np.int64)
+    position[rows] = np.arange(rows.size, dtype=np.int64)
+    unbounded = (pairs[:, 0] == -np.inf) & (pairs[:, 1] == -np.inf) if len(pairs) else np.zeros(0, bool)
+    return WindowIndex(rows=rows, window=window, rt=rt[rows].astype(np.float64), starts=starts,
+                       lower=pairs[:, 0].astype(np.float64), upper=pairs[:, 1].astype(np.float64),
+                       unbounded=unbounded, position=position)  # fmt: skip
+
+
+def eligible_pairs(
+    index: WindowIndex,
+    queries: np.ndarray,
+    precursor_mz: np.ndarray,
+    rt_lo: np.ndarray,
+    rt_hi: np.ndarray,
+    assigned_scan: np.ndarray | None,
+    *,
+    gate: bool,
+    scan_rows: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Every (window, query) pair of ``queries`` and, for each, the first
+    of the window's ``index.rows`` inside the query's interval and how
+    many are: ``(query, start, count)``, ``start`` an offset into
+    ``index.rows``. The interval test is :func:`pair_eligible`'s,
+    inclusive at both ends. A window holds the queries whose precursor
+    m/z it covers, with those that have none; an unbounded window (and
+    every scan when not ``gate``) holds every query. With
+    ``assigned_scan`` (fragments), a query with one has that scan's row or
+    none: ``scan_rows`` gives each query's assigned scan as a ledger row
+    (-1 where it has none or it is not in the ledger). Vectorized: no work
+    per window or per query in Python."""
+    empty = np.empty(0, np.int64)
+    queries = np.asarray(queries, dtype=np.int64)
+    if queries.size == 0 or index.n_windows == 0:
+        return empty, empty, empty
+    if not gate:
+        pair_w = np.zeros(queries.size, np.int64)
+        pair_q = queries
+    else:
+        pmz = precursor_mz[queries]
+        finite = ~np.isnan(pmz)
+        by_mz = np.argsort(pmz[finite], kind="stable")
+        gated, gated_pmz = queries[finite][by_mz], pmz[finite][by_mz]
+        passall = queries[~finite]
+        bounded = np.flatnonzero(~index.unbounded)
+        a = np.searchsorted(gated_pmz, index.lower[bounded], side="left")
+        b = np.searchsorted(gated_pmz, index.upper[bounded], side="right")
+        n = np.maximum(b - a, 0)
+        free = np.flatnonzero(index.unbounded)
+        parts_w = [np.repeat(bounded, n), np.repeat(bounded, passall.size), np.repeat(free, queries.size)]
+        parts_q = [gated[ragged_arange(a, n)], np.tile(passall, bounded.size), np.tile(queries, free.size)]
+        pair_w = np.concatenate(parts_w).astype(np.int64)
+        pair_q = np.concatenate(parts_q).astype(np.int64)
+    # Only windows whose scans' times overlap the query's interval can
+    # hold a pair; the rest are dropped before any search.
+    first, last = index.starts[pair_w], index.starts[pair_w + 1] - 1
+    keep = (last >= first) & (rt_lo[pair_q] <= index.rt[np.maximum(last, 0)]) & (
+        rt_hi[pair_q] >= index.rt[np.minimum(first, max(index.rt.size - 1, 0))]
+    )
+    pair_w, pair_q = pair_w[keep], pair_q[keep]
+    # Exact integer keys: a row's time as its rank among the distinct
+    # times, after its window, so one search over all windows finds each
+    # pair's range with the float comparisons of pair_eligible, inclusive
+    # at both ends.
+    times = np.unique(index.rt)
+    span = np.int64(times.size + 1)
+    keys = index.window * span + np.searchsorted(times, index.rt, side="left")
+    lo = pair_w * span + np.searchsorted(times, rt_lo[pair_q], side="left")
+    hi = pair_w * span + np.searchsorted(times, rt_hi[pair_q], side="right")
+    start = np.searchsorted(keys, lo, side="left").astype(np.int64)
+    stop = np.searchsorted(keys, hi, side="left").astype(np.int64)
+    count = np.maximum(stop - start, 0)
+    if assigned_scan is not None and scan_rows is not None:
+        fixed = np.flatnonzero(assigned_scan[pair_q] >= 0)
+        if fixed.size:
+            row = scan_rows[pair_q[fixed]]
+            at = np.where(row >= 0, index.position[np.maximum(row, 0)], -1)
+            ok = (at >= 0) & (index.window[np.maximum(at, 0)] == pair_w[fixed]) & (start[fixed] <= at) & (at < stop[fixed])
+            start[fixed] = np.maximum(at, 0)
+            count[fixed] = ok.astype(np.int64)
+    return pair_q, start, count

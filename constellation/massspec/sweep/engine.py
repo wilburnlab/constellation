@@ -96,6 +96,12 @@ class SweepSettings:
     reduce_rows: int = 1 << 22
     #: Matches a map shard holds before writing them out as a sorted run.
     run_rows: int = 4 << 20
+    #: Rows per row group of a sorted run. A bucket reads, from every run,
+    #: the row groups its query range overlaps: whole 2^18-row groups made
+    #: each bucket decode far more than its own rows, growing with the
+    #: square of the matches (an estimated 8-15x at 476M; review of
+    #: 2026-11-06).
+    run_row_group_rows: int = 1 << 15
     #: Matches a sweep in memory holds before it carries on on disk. A held
     #: match costs some 200–500 bytes at peak (sorting, the reducers' tables),
     #: so this keeps an in-memory sweep near a disk worker's 3 GB.
@@ -713,11 +719,11 @@ def _map_stream(
         run += 1
         m = out.matches
         m = m.take(np.lexsort((m.point_index, m.channel, m.scan, m.level, m.query)))
-        _write(m.table(), w / "matches" / name, row_group_size=1 << 18)
+        _write(m.table(), w / "matches" / name, row_group_size=settings.run_row_group_rows)
         if settings.gate is not None:
             e = out.evidence
             _write(_evidence_table(e.take(np.lexsort((e.scan, e.group, e.query)))),
-                   w / "evidence" / name, row_group_size=1 << 18)  # fmt: skip
+                   w / "evidence" / name, row_group_size=settings.run_row_group_rows)  # fmt: skip
         if settings.claims:
             _write(out.claims.sorted().table(), w / "claims" / name, row_group_size=1 << 18)
             shared[:] += _shared_counts(out.claims, plan.n_queries, per_cell=settings.rule.name == "sum")
@@ -753,14 +759,42 @@ def _write(table: pa.Table, path: Path, **kw) -> None:
     tmp.replace(path)
 
 
-def _read_range(files: list[Path], q0: int, q1: int) -> pa.Table | None:
-    import pyarrow.dataset as ds
+#: Rows a reduce has decoded from sorted runs, in this process (for tests
+#: and benchmarks of how much more than its own rows a bucket reads).
+READ_STATS = {"rows_decoded": 0}
 
+
+def _footer(path: Path):
+    """A run's footer, read once per process."""
+    key = f"footer:{path}"
+    if key not in _WORKER:
+        _WORKER[key] = pq.read_metadata(path)
+    return _WORKER[key]
+
+
+def _read_range(files: list[Path], q0: int, q1: int) -> pa.Table | None:
+    """The rows of queries ``[q0, q1)`` from sorted runs: in each run, only
+    the row groups whose ``query`` statistics overlap the range are read."""
     if not files:
         return None
-    return ds.dataset([str(f) for f in files], format="parquet").to_table(
-        filter=(ds.field("query") >= q0) & (ds.field("query") < q1)
-    )
+    parts = []
+    schema = None
+    for f in files:
+        meta = _footer(f)
+        schema = schema or meta.schema.to_arrow_schema()
+        column = meta.schema.to_arrow_schema().get_field_index("query")
+        groups = []
+        for i in range(meta.num_row_groups):
+            stats = meta.row_group(i).column(column).statistics
+            if stats is None or not stats.has_min_max or (stats.max >= q0 and stats.min < q1):
+                groups.append(i)
+        if groups:
+            table = pq.ParquetFile(f, metadata=meta).read_row_groups(groups)
+            READ_STATS["rows_decoded"] += table.num_rows
+            q = table.column("query")
+            parts.append(table.filter(pc.and_(pc.greater_equal(q, q0), pc.less(q, q1))))
+    # One bucket's rows, for one reducer call: not a hand-off between stages.
+    return pa.concat_tables(parts) if parts else schema.empty_table()
 
 
 def _reduce_bucket(

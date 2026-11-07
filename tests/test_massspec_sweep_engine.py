@@ -495,3 +495,102 @@ def test_a_table_of_points_past_memory_rows_is_refused(tmp_root):
     with pytest.raises(MemoryError, match="write it as a bundle"):
         sweep(peaks, plan, SweepSettings(tolerances={2: (0.35, "Da")}, memory_rows=5, block_rows=200),
               reducers=[XicTraceReducer()])  # fmt: skip
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_eligibility_on_random_ledgers_is_the_definition(seed):
+    """Random ledgers with what real runs mix: shared DIA windows, one
+    window per DDA scan, scans without bounds or without a time or points,
+    queries without a precursor m/z, assigned scans in and out of reach.
+    The vectorized index must give exactly the definition's pairs (it
+    replaced a regrouping that cost windows × scans per call)."""
+    from constellation.massspec.sweep.reduce import Ledger, Matches, QueryBatch
+
+    rng = np.random.default_rng(seed)
+    n = 400
+    level = np.where(rng.random(n) < 0.15, 1, 2).astype(np.int8)
+    dia = rng.integers(0, 6, n)
+    dda = rng.random(n) < 0.4
+    centre = np.where(dda, rng.uniform(400, 1000, n), 400 + 100 * dia + 50)
+    width = np.where(dda, 0.7, 50.0)
+    lower, upper = centre - width, centre + width
+    unbounded = rng.random(n) < 0.05
+    lower[(level == 1) | unbounded], upper[(level == 1) | unbounded] = np.nan, np.nan
+    rt = np.sort(rng.uniform(0, 600, n))
+    rt[rng.random(n) < 0.03] = np.nan
+    points = np.where(rng.random(n) < 0.05, 0, 100).astype(np.int64)
+    ledger = Ledger(scan=np.arange(n, dtype=np.int64) * 3 + 11, level=level, rt=rt, lower=lower, upper=upper,
+                    n_points=points)  # fmt: skip
+    m = 60
+    rows = []
+    for i in range(m):
+        row = dict(target_id=i, modified_sequence="PEPTIDEK", precursor_charge=2)
+        if i % 7 != 3:
+            row["precursor_mz"] = float(rng.uniform(380, 1020))
+        if i % 3 == 0:
+            row["rt_center"] = float(rng.uniform(0, 600))
+        elif i % 3 == 1:
+            t0 = float(rng.uniform(0, 500))
+            row["rt_start"], row["rt_end"] = t0, t0 + float(rng.uniform(0, 120))
+        if i % 5 == 0:
+            row["scan"] = int(ledger.scan[rng.integers(0, n)]) if i % 10 else 999_999  # one not in the ledger
+        rows.append(row)
+    targets = pa.Table.from_pylist(rows, schema=XIC_TARGET_TABLE)
+    settings = SweepSettings(tolerances={1: (20.0, "ppm"), 2: (0.35, "Da")})
+    for assigned in (False, True):
+        plan = compile_queries(targets, levels=[1, 2], rt_window=40.0, assigned_scans_only=assigned)
+        every = np.arange(plan.n_queries, dtype=np.int64)
+        batch = QueryBatch(plan=plan, queries=every, matches=Matches.empty(), scans=ledger,
+                           scan_order=ledger.order(), settings=settings)  # fmt: skip
+        for lv in (1, 2):
+            want = _brute_pairs(plan, ledger, lv, every)
+            q, r = batch.eligible(lv)
+            assert list(zip(q.tolist(), r.tolist())) == want, (seed, assigned, lv)
+            counts = np.bincount([p[0] for p in want], minlength=plan.n_queries)
+            assert batch.eligible_counts(lv).tolist() == counts.tolist()
+
+
+def test_the_window_index_is_built_once_per_ledger_and_level(tmp_root, monkeypatch):
+    from constellation.massspec.sweep import reduce as reduce_module
+    from constellation.massspec.sweep.reduce import Matches, QueryBatch
+
+    calls = []
+    real = reduce_module.window_index
+    monkeypatch.setattr(reduce_module, "window_index", lambda *a, **k: calls.append(a[-1]) or real(*a, **k))
+    run, bundle, _ = _run("dda", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2], rt_window=15.0)
+    settings = SweepSettings(tolerances={1: (20.0, "ppm"), 2: (0.35, "Da")})
+    ledger = sweep(bundle, plan, settings).scans
+    calls.clear()
+    every = np.arange(plan.n_queries, dtype=np.int64)
+    batch = QueryBatch(plan=plan, queries=every, matches=Matches.empty(), scans=ledger,
+                       scan_order=ledger.order(), settings=settings)  # fmt: skip
+    for _ in range(3):
+        batch.eligible(2)
+        batch.eligible_counts(2)
+        batch.eligible_cells(1)
+    assert sorted(calls) == [1, 2]
+
+
+def test_a_bucket_reads_about_its_own_rows_from_the_runs(tmp_root, tmp_path):
+    """Each bucket decoded whole 2^18-row groups of every run, which grows
+    with the square of the matches (review of 2026-11-06): rows decoded are
+    now bounded by the matches plus two row groups per run and bucket."""
+    from constellation.massspec.sweep import engine
+
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
+    tol = {1: (20.0, "ppm"), 2: (0.35, "Da")}
+    small = dict(run_rows=300, reduce_rows=200, shard_rows=4000, run_row_group_rows=16)
+    engine.READ_STATS["rows_decoded"] = 0
+    work = tmp_path / "w"
+    got = sweep(bundle, plan, SweepSettings(tolerances=tol, **small), reducers=[XicTraceReducer()],
+                workers=1, work_dir=work)  # fmt: skip
+    runs = sorted((work / "matches").glob("*.parquet"))
+    matches = sum(pq.read_metadata(f).num_rows for f in runs)
+    buckets = len(got.parts["xic_trace"])
+    assert len(runs) > 3 and buckets > 3
+    decoded = engine.READ_STATS["rows_decoded"]
+    assert matches <= decoded <= matches + 2 * len(runs) * buckets * small["run_row_group_rows"]
+    want = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[XicTraceReducer()]).table("xic_trace")
+    oracle.assert_traces_identical(got.table("xic_trace"), want)
