@@ -712,3 +712,59 @@ def test_output_names_are_unique_across_reducers(tmp_root):
     clash.outputs = {"xic_trace": _TWO_A, "intensity": _TWO_B}
     with pytest.raises(ValueError, match="both name an output 'xic_trace'"):
         sweep(bundle, plan, SweepSettings(tolerances={2: (0.35, "Da")}), reducers=[XicTraceReducer(), clash])
+
+
+# ── part of a run (2026-11-07) ──────────────────────────────────────
+
+
+def _unranged(table: pa.Table) -> pa.Table:
+    """A trace without the range stamp a ranged sweep adds to its metadata."""
+    meta = {k: v for k, v in (table.schema.metadata or {}).items() if not k.startswith(b"x.massspec.sweep.")}
+    return table.replace_schema_metadata(meta)
+
+
+def test_a_scan_range_sweeps_exactly_those_scans(tmp_root, tmp_path):
+    """Only the scans read are eligible: the zero-filled trace and the
+    summary's counts cover them alone, in memory and on disk alike."""
+    from constellation.massspec.sweep.reduce import QuerySummaryReducer
+
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2])  # global: every scan
+    tol = {1: (20.0, "ppm"), 2: (0.35, "Da")}
+    scans = sorted(s["scan"] for s in run.scans)
+    first, last = scans[len(scans) // 4], scans[len(scans) // 2]
+    reducers = [XicTraceReducer(drop_unmatched=False), QuerySummaryReducer()]
+    full = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=reducers).table("xic_trace")
+    inside = pc.and_(pc.greater_equal(full.column("scan"), first), pc.less_equal(full.column("scan"), last))
+    want = full.filter(inside)
+    runs = [sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=reducers, scan_range=(first, last))]
+    for workers in (1, 3):
+        runs.append(sweep(bundle, plan, SweepSettings(tolerances=tol, shard_rows=3000, reduce_rows=500),
+                          reducers=reducers, scan_range=(first, last), workers=workers,
+                          work_dir=tmp_path / f"w{workers}"))  # fmt: skip
+    for got in runs:
+        trace = got.table("xic_trace")
+        oracle.assert_traces_identical(_unranged(trace), want)
+        assert trace.schema.metadata[b"x.massspec.sweep.scan_range"] == f"{first},{last}".encode()
+        summary = got.table("query_summary")
+        ms2 = sum(1 for s in run.scans if s["level"] == 2 and first <= s["scan"] <= last)
+        assert max(summary.column("n_eligible_ms2").to_pylist()) <= ms2
+
+
+def test_an_rt_range_is_the_scans_it_spans(tmp_root):
+    run, bundle, peaks = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2])
+    settings = SweepSettings(tolerances={2: (0.35, "Da")})
+    times = sorted((s["rt"], s["scan"]) for s in run.scans)
+    t0, t1 = times[10][0], times[60][0]
+    in_range = [scan for t, scan in times if t0 <= t <= t1]
+    by_rt = sweep(bundle, plan, settings, reducers=[XicTraceReducer()], rt_range=(t0, t1)).table("xic_trace")
+    by_scan = sweep(bundle, plan, settings, reducers=[XicTraceReducer()],
+                    scan_range=(min(in_range), max(in_range))).table("xic_trace")  # fmt: skip
+    oracle.assert_traces_identical(_unranged(by_rt), _unranged(by_scan))
+    on_table = sweep(peaks, plan, settings, reducers=[XicTraceReducer()], rt_range=(t0, t1)).table("xic_trace")
+    oracle.assert_traces_identical(_unranged(on_table), _unranged(by_rt))
+    empty = sweep(bundle, plan, settings, reducers=[XicTraceReducer()], rt_range=(1e9, 2e9)).table("xic_trace")
+    assert empty.num_rows == 0
+    with pytest.raises(ValueError, match="not both"):
+        sweep(bundle, plan, settings, scan_range=(1, 2), rt_range=(0.0, 1.0))

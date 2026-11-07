@@ -525,6 +525,8 @@ def sweep(
     workers: int = 1,
     work_dir: Path | str | None = None,
     progress: ProgressCallback | None = None,
+    scan_range: tuple[int, int] | None = None,
+    rt_range: tuple[float, float] | None = None,
 ) -> SweepResult:
     """Sweep ``source`` for ``plan``'s queries and reduce the matches.
 
@@ -541,9 +543,55 @@ def sweep(
     (``name``, ``schema``) or several (``outputs``, a name → schema mapping,
     with ``reduce`` returning a name → table mapping); output names are
     unique across reducers.
+
+    ``scan_range=(first, last)`` or ``rt_range=(t0, t1)`` (inclusive) sweeps
+    part of the run: only those scans are read, so only they are eligible
+    (zero-filled, gated, counted); an RT range reads the scans between the
+    first and last whose time falls in it. The range is recorded in every
+    output's metadata (``x.massspec.sweep.scan_range``).
     """
     _check_outputs(reducers, settings)
+    if scan_range is not None and rt_range is not None:
+        raise ValueError("give a scan_range or an rt_range, not both")
+    window = _window(source, scan_range, rt_range)
+    result = _sweep(source, plan, settings, reducers, workers, work_dir, progress, window)
+    if window is not None:
+        stamp = {b"x.massspec.sweep.scan_range": f"{window[0]},{window[1] - 1}".encode()}
+        if rt_range is not None:
+            stamp[b"x.massspec.sweep.rt_range"] = f"{float(rt_range[0])!r},{float(rt_range[1])!r}".encode()
+        for name in result.schemas:
+            result.metadata[name] = {**result.metadata.get(name, {}), **stamp}
+    return result
+
+
+def _window(source, scan_range, rt_range) -> tuple[int, int] | None:
+    """The half-open scan range ``[lo, hi)`` a sweep reads, or None for all."""
+    if scan_range is None and rt_range is None:
+        return None
+    if scan_range is not None:
+        first, last = (int(x) for x in scan_range)
+        if last < first:
+            raise ValueError(f"scan_range must be (first, last) with first <= last; got {scan_range!r}")
+        return first, last + 1
+    t0, t1 = (float(x) for x in rt_range)
+    if t1 < t0:
+        raise ValueError(f"rt_range must be (start, end) with start <= end; got {rt_range!r}")
     if isinstance(source, pa.Table):
+        scan, rt = source.column("scan").to_numpy(), _f64(source.column("rt"))
+    else:
+        meta = pq.read_table(Path(source) / "scan_metadata.parquet", columns=["scan", "rt"])
+        scan, rt = meta.column("scan").to_numpy(), _f64(meta.column("rt"))
+    inside = scan[(rt >= t0) & (rt <= t1)]
+    if inside.size == 0:
+        return 0, 0
+    return int(inside.min()), int(inside.max()) + 1
+
+
+def _sweep(source, plan, settings, reducers, workers, work_dir, progress, window) -> SweepResult:
+    if isinstance(source, pa.Table):
+        if window is not None:
+            scans = source.column("scan")
+            source = source.filter(pc.and_(pc.greater_equal(scans, window[0]), pc.less(scans, window[1])))
         if settings.mz_axis is not None:
             raise ValueError("an m/z axis belongs to a bundle; a table of points has none to apply")
         if workers > 1 or work_dir is not None:
@@ -568,7 +616,12 @@ def sweep(
         ledger = _scan_metadata(bundle)
         emit_start(progress, "sweep", total=0, message=bundle.name)
         parts, held = [], 0
-        blocks = _bundle_blocks(bundle, ledger, settings, axis)
+        stream = (
+            iter_scan_blocks(bundle, columns=("mz", "intensity"), block_rows=settings.block_rows, scan_range=window)
+            if window is not None
+            else None
+        )
+        blocks = _bundle_blocks(bundle, ledger, settings, axis, blocks=stream)
         for b in blocks:
             parts.append(_map_block(b, plan, settings))
             held += parts[-1].matches.n
@@ -577,24 +630,24 @@ def sweep(
                 # sweep on disk, which carries on from the next block.
                 emit_done(progress, "sweep", message=f"over {settings.memory_rows} matches; on disk")
                 return _on_temporary_disk(bundle, plan, settings, reducers, 1, progress,
-                                          resume=(ledger, blocks, parts))  # fmt: skip
+                                          resume=(ledger, blocks, parts), window=window)  # fmt: skip
         out = _MapOut.concat(parts)
         result = _reduce_in_memory(out, plan, ledger, settings, reducers, axis)
         emit_done(progress, "sweep", message=f"{out.matches.n} matches")
         return result
     if work_dir is None:
-        return _on_temporary_disk(bundle, plan, settings, reducers, workers, progress)
-    return _sweep_on_disk(bundle, plan, settings, reducers, workers, Path(work_dir), progress)
+        return _on_temporary_disk(bundle, plan, settings, reducers, workers, progress, window=window)
+    return _sweep_on_disk(bundle, plan, settings, reducers, workers, Path(work_dir), progress, window=window)
 
 
-def _on_temporary_disk(bundle, plan, settings, reducers, workers, progress, resume=None) -> SweepResult:
+def _on_temporary_disk(bundle, plan, settings, reducers, workers, progress, resume=None, window=None) -> SweepResult:
     """A sweep on disk in a temporary directory, which lives as long as its
     result: outputs are read from it as asked, and it is removed after.
     ``resume`` is (ledger, the rest of the block stream, matches held) of an
     in-memory sweep to carry on, as one shard."""
     tmp = Path(tempfile.mkdtemp(prefix="sweep-"))
     try:
-        result = _sweep_on_disk(bundle, plan, settings, reducers, workers, tmp, progress, resume=resume)
+        result = _sweep_on_disk(bundle, plan, settings, reducers, workers, tmp, progress, resume=resume, window=window)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -956,7 +1009,8 @@ class _Inline:
         return False
 
 
-def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progress, resume=None) -> SweepResult:
+def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progress, resume=None,
+                   window=None) -> SweepResult:  # fmt: skip
     _WORKER.clear()  # an inline sweep reads its plan through the same cache
     for sub in ("matches", "evidence", "claims", "shared", "scans", "reduce"):
         if (work / sub).exists():
@@ -964,6 +1018,10 @@ def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progre
     plan.write(work / "plan")
     axis = _load_axis(bundle, settings)
     shards = scan_range_shards(bundle, target_rows=settings.shard_rows) if resume is None else [None]
+    if window is not None and resume is None:
+        # Each shard cut to the range; one that lies outside it reads nothing.
+        shards = [(max(lo, window[0]), min(hi, window[1])) for lo, hi in shards]
+        shards = [(lo, hi) for lo, hi in shards if lo < hi]
     pool = (
         ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn"), initializer=_init_worker)
         if workers > 1

@@ -550,7 +550,7 @@ def extract_xic(
     # its collision grouping by the trace's.
     stamp = extraction_tolerance_metadata(dict(tolerances))
     for name in result.schemas:
-        result.metadata[name] = dict(stamp)
+        result.metadata[name] = {**result.metadata.get(name, {}), **stamp}
     return result
 
 
