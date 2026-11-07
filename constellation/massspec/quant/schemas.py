@@ -212,8 +212,10 @@ XIC_TRACE_SCHEMA_VERSION: int = 1
 # precision guarantee: extracted against an f32-m/z peak index, the
 # *realized* precision of `mz_observed` / `mz_error_*` is f32 unless the
 # extractor's `exact_error` path re-derives them from the canonical
-# table. `mz_error_*` are SIGNED, conventional (observed - theoretical) —
-# derived from the matching kernel's `signed_delta` — so downstream
+# table. `mz_error_*` are SIGNED, conventional (observed - theoretical),
+# computed from the matched point and the channel's m/z (the matching
+# kernel's own `signed_delta` is query − axis, the other way round, and the
+# sweep does not use it), so downstream
 # probabilistic scoring stays re-extraction-free. This is the terminal artifact;
 # trace → PRECURSOR_QUANT reduction is a separate downstream step.
 XIC_TRACE_TABLE: pa.Schema = pa.schema(

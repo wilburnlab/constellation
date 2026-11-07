@@ -267,3 +267,88 @@ def test_spectral_entropy_similarity_symmetric():
     b = losses.spectral_entropy_similarity(q, p).item()
     assert math.isclose(a, b, abs_tol=1e-12)
     assert 0.0 <= a <= 1.0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Scale-free similarities and one masking rule (review of 2026-11-06)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_cosine_and_pearson_are_scale_invariant_at_small_magnitude():
+    """The norm used to be floored at sqrt(eps) on the *squared* norm, so
+    identical [3e-5, 4e-5] vectors scored cosine 0.025."""
+    x = torch.tensor([3e-5, 4e-5], dtype=torch.float64)
+    assert math.isclose(losses.cosine_similarity(x, x).item(), 1.0, abs_tol=1e-12)
+    trace = torch.tensor([1.0, 1.001, 1.002, 1.001, 1.0], dtype=torch.float64) * 1e-3
+    assert math.isclose(losses.pearson_correlation(trace, trace).item(), 1.0, abs_tol=1e-9)
+    p = torch.tensor([1.0, 2.0, 3.0, 0.5], dtype=torch.float64)
+    t = torch.tensor([2.0, 1.0, 4.0, 1.5], dtype=torch.float64)
+    for f in (losses.cosine_similarity, losses.pearson_correlation, losses.spectral_entropy_similarity):
+        base = f(p, t).item()
+        for scale in (1e-6, 1e6):
+            assert math.isclose(f(p * scale, t).item(), base, abs_tol=1e-9), f.__name__
+            assert math.isclose(f(p, t * scale).item(), base, abs_tol=1e-9), f.__name__
+    base = losses.kld(p, t, reduce="sum").item()
+    assert math.isclose(losses.kld(p * 1e-6, t * 1e6, reduce="sum").item(), base, abs_tol=1e-9)
+
+
+def test_a_vector_with_nothing_in_it_scores_zero():
+    """An empty observed scan scored entropy similarity 0.80 against a
+    prediction, better than a scan with one wrong peak (0.008)."""
+    pred = torch.tensor([0.5, 0.3, 0.2, 0.0], dtype=torch.float64)
+    empty = torch.zeros(4, dtype=torch.float64)
+    wrong = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float64)
+    assert losses.spectral_entropy_similarity(pred, empty).item() == 0.0
+    assert losses.spectral_entropy_similarity(pred, wrong).item() >= 0.0
+    assert losses.cosine_similarity(pred, empty).item() == 0.0
+    assert losses.pearson_correlation(pred, torch.full((4,), 3.0, dtype=torch.float64)).item() == 0.0
+    assert math.isnan(losses.kld(pred, empty, reduce="sum").item())
+
+
+def test_spectral_entropy_loss_keeps_input_unit_pseudocount():
+    """The training loss keeps Cartographer's raw-unit pseudocount."""
+    pred = torch.tensor([0.4, 0.3, 0.2, 0.1])
+    target = torch.tensor([0.25, 0.35, 0.25, 0.15])
+    logit = torch.tensor(0.3)
+    pc = 0.05
+    signal = target * torch.sigmoid(logit)
+    pm, sm = pred + pc, signal + pc
+    pn, sn = pm / pm.sum(), sm / sm.sum()
+    signal_kl = (sn * (sn / pn).log()).sum()
+    inter = target - signal + pc
+    inter_n = inter / inter.sum()
+    entropy = -(inter_n * inter_n.log()).sum()
+    frac = (signal.sum() + 1e-7) / (target.sum() + 1e-7)
+    want = frac * signal_kl + (1 - frac) * entropy
+    got = losses.spectral_entropy_loss(pred, target, logit, pseudocount=pc)
+    assert torch.allclose(got, want, atol=1e-6)
+
+
+def test_spectral_angle_refuses_a_batch_without_batch_dim():
+    p = torch.ones(2, 3, dtype=torch.float64)
+    with pytest.raises(ValueError, match="batch_dim"):
+        losses.spectral_angle(p, p)
+
+
+def test_a_negative_or_nan_channel_is_dropped_alike_by_every_comparison():
+    """One rule: a channel negative or NaN in either vector is left out."""
+    from constellation.massspec.spectra.similarity import compare_spectra
+
+    q = torch.tensor([4.0, 2.0, 3.0, 1.0], dtype=torch.float64)
+    r = torch.tensor([3.0, 1.0, 4.0, 2.0], dtype=torch.float64)
+    keep = [0, 1, 3]
+    for method in ("cosine", "dot", "pearson", "spectral_angle", "spectral_entropy", "kld"):
+        want = compare_spectra(q[keep], r[keep], method=method).item()
+        for bad_q, bad_r in ((-1.0, None), (None, -1.0), (float("nan"), None), (None, float("nan"))):
+            qq, rr = q.clone(), r.clone()
+            if bad_q is not None:
+                qq[2] = bad_q
+            if bad_r is not None:
+                rr[2] = bad_r
+            got = compare_spectra(qq, rr, method=method).item()
+            assert math.isclose(got, want, abs_tol=1e-12), (method, bad_q, bad_r)
+    counts = torch.tensor([40.0, 20.0, 30.0, 10.0], dtype=torch.float64)
+    want = compare_spectra(counts[keep], r[keep], method="multinomial_deviance", as_counts=True).item()
+    counts[2] = -1.0
+    got = compare_spectra(counts, r, method="multinomial_deviance", as_counts=True).item()
+    assert math.isclose(got, want, abs_tol=1e-12)

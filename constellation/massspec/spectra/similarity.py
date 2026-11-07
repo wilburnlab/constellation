@@ -71,15 +71,19 @@ def multinomial_deviance(
     — unlike a naive ``kld`` call). Set ``0.0`` for the exact likelihood
     identity with strictly-positive references. Inputs are ``(..., K)``;
     returns ``obs_counts.shape[:-1]``. Lower is more similar (it is a
-    divergence, not a similarity)."""
+    divergence, not a similarity). A channel negative or NaN in either
+    input (the ``-1`` sentinel) is dropped, as in ``core.stats.losses``."""
     x = obs_counts.to(torch.float64)
     p = p_ref.to(torch.float64)
+    valid = (x >= 0) & (p >= 0)
+    x = torch.where(valid, x, torch.zeros_like(x))
+    p = torch.where(valid, p, torch.zeros_like(p))
     n = x.sum(dim=-1, keepdim=True)
     p_hat = x / n.clamp(min=_EPS)
     p_ref_n = p / p.sum(dim=-1, keepdim=True).clamp(min=_EPS)
     if pseudocount > 0.0:
-        k = p_ref_n.shape[-1]
-        p_ref_n = (p_ref_n + pseudocount) / (1.0 + pseudocount * k)
+        k = valid.to(torch.float64).sum(dim=-1, keepdim=True)
+        p_ref_n = torch.where(valid, (p_ref_n + pseudocount) / (1.0 + pseudocount * k), torch.zeros_like(p_ref_n))
     # ``x_k = 0`` ⇒ term 0 regardless of the log (0·finite); ``p_hat`` and
     # ``p_ref_n`` are clamped only to keep the logs finite. This is exactly
     # ``2·N·KL(p̂ ‖ p_ref)`` with the standard 0-count convention.

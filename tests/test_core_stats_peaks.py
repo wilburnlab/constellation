@@ -385,3 +385,30 @@ def test_hyper_emg_recovers_synthetic_via_de():
         fitted = fit.forward(t)
     rmse = (fitted - clean).pow(2).mean().sqrt().item()
     assert rmse < 0.05 * clean.max().item()
+
+
+@pytest.mark.parametrize("sigma", [0.1, 0.3, 1.0, 3.0, 10.0])
+@pytest.mark.parametrize("tau", [0.1, 0.3, 1.0, 3.0, 10.0])
+def test_emg_peak_maximum_is_at_t_apex(sigma, tau):
+    """t_apex is the curve's maximum. The first-order correction
+    μ = t_apex − σ²/τ put it up to 6σ away (review of 2026-11-06)."""
+    p = EMGPeak(N_max=2.0, t_apex=5.0, sigma=sigma, tau=tau)
+    grid = torch.linspace(5.0 - 6 * sigma, 5.0 + 6 * sigma + 6 * tau, 200_001, dtype=torch.float64)
+    with torch.no_grad():
+        values = p(grid)
+    step = float(grid[1] - grid[0])
+    assert abs(float(grid[int(torch.argmax(values))]) - 5.0) <= 1.5 * step
+    assert float(values.max()) <= 2.0 * (1 + 1e-9)
+
+
+def test_emg_peak_mode_is_differentiable_and_vmap_safe():
+    from torch.func import functional_call, vmap
+
+    p = EMGPeak(N_max=1.0, t_apex=0.0, sigma=0.7, tau=1.3)
+    p.mu.backward()
+    assert torch.isfinite(p.log_sigma.grad) and torch.isfinite(p.log_tau.grad)
+    params = {k: v.detach().unsqueeze(0).repeat(3) for k, v in p.named_parameters()}
+    params["log_tau"] = torch.log(torch.tensor([0.2, 1.0, 5.0], dtype=torch.float64))
+    t = torch.linspace(-2, 6, 50, dtype=torch.float64)
+    out = vmap(lambda ps: functional_call(p, ps, (t,)))(params)
+    assert out.shape == (3, 50) and torch.isfinite(out).all()
