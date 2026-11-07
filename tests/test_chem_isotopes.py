@@ -221,3 +221,28 @@ def test_cached_element_powers_give_the_uncached_distribution():
         for _ in range(2):  # the second call reads the cache
             got = isotope_distribution(comp, n_peaks=5)
             assert torch.equal(got, fresh)
+
+
+def test_batched_distributions_are_the_single_ones_as_shares_of_the_whole():
+    """isotope_distributions (one Fourier transform for many compositions)
+    gives what isotope_distribution(normalize="full") gives one at a time,
+    and a peak's share does not depend on how many peaks are kept."""
+    import numpy as np
+
+    from constellation.core.chem.composition import Composition
+    from constellation.core.chem.elements import ELEMENT_SYMBOLS
+    from constellation.core.chem.isotopes import isotope_distribution, isotope_distributions
+
+    rng = np.random.default_rng(3)
+    idx = {s: i for i, s in enumerate(ELEMENT_SYMBOLS)}
+    counts = np.zeros((40, len(ELEMENT_SYMBOLS)), dtype=np.int64)
+    for row in counts:
+        for sym, hi in (("C", 300), ("H", 500), ("N", 90), ("O", 100), ("S", 6), ("P", 3), ("Se", 1)):
+            row[idx[sym]] = rng.integers(0, hi)
+    got = isotope_distributions(counts, 8)
+    for i in range(counts.shape[0]):
+        comp = Composition(torch.from_numpy(counts[i].astype(np.int32)))
+        want = isotope_distribution(comp, 8, normalize="full").numpy()
+        assert np.abs(got[i] - want).max() < 1e-6
+    assert np.allclose(isotope_distributions(counts, 3), got[:, :3], atol=1e-15)
+    assert (got.sum(axis=1) <= 1 + 1e-12).all()

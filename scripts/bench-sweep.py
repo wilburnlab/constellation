@@ -300,6 +300,24 @@ def _cmd_gate(args) -> None:
     Path(args.out).write_text(json.dumps(report, indent=1) + "\n")
 
 
+# ── compiling queries ─────────────────────────────────────────────────
+
+
+def _cmd_compile(args) -> None:
+    """Time compile_queries on a target file, level set by level set."""
+    from constellation.massspec.sweep import compile_queries
+
+    targets = pq.read_table(args.targets)
+    for levels in args.levels:
+        lv = [int(x) for x in levels.split(",")]
+        t0 = time.perf_counter()
+        plan = compile_queries(targets, levels=lv)
+        dt = time.perf_counter() - t0
+        n_channels = sum(c.n for c in (plan.isotopes, plan.fragments) if c is not None)
+        print(json.dumps({"levels": lv, "targets": targets.num_rows, "channels": n_channels, "seconds": round(dt, 3),
+                          "ms_per_target": round(1e3 * dt / max(targets.num_rows, 1), 4)}), flush=True)  # fmt: skip
+
+
 # ── against the old extractor ─────────────────────────────────────────
 
 
@@ -399,6 +417,12 @@ def main() -> None:
     tolerances(g)
     g.add_argument("--out", required=True)
     g.set_defaults(func=_cmd_gate)
+
+    k = subs.add_parser("compile")
+    k.add_argument("--targets", required=True)
+    k.add_argument("--levels", nargs="+", default=["1", "2", "1,2"],
+                   help="Level sets to compile, each comma-separated (default: 1 2 1,2).")
+    k.set_defaults(func=_cmd_compile)
 
     c = subs.add_parser("compare-old")
     c.add_argument("--bundle", required=True)

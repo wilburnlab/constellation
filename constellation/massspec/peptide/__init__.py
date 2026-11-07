@@ -10,7 +10,11 @@ Submodules:
     mz                m/z helpers — `precursor_mz`, `PROTON_MASS` re-export
     ions              `IonType`, `FragmentIon`, `fragment_mz`, `fragment_ladder`,
                       `ion_number` / `bond_position` (label number ↔ bond index)
-    envelope          `peptide_envelope` (charge-aware isotope envelopes)
+    envelope          `peptide_envelope` (charge-aware isotope envelopes),
+                      `neutral_envelopes` (many at once, the same masses)
+    channels          the m/z a query expects signal at, at every MS level:
+                      `ChannelSettings`, `Channels`, `isotope_channels`,
+                      `fragment_channels`, fragment abundance sources
     neutral_losses    `NeutralLoss`, `LOSS_REGISTRY`, `loss_applies`
 """
 

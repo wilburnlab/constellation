@@ -641,3 +641,22 @@ def test_save_load_xic_roundtrip(tmp_path):
     assert (
         back.column("mz_error_da").to_pylist() == out.column("mz_error_da").to_pylist()
     )
+
+
+def test_mode_b_takes_its_channels_from_the_sweeps_generator(tmp_path):
+    """The index extraction built its own MS1 and MS2 ions; it now takes
+    the sweep's ChannelSettings and the channels the one generator makes."""
+    from constellation.massspec.sweep import ChannelSettings
+
+    peaks, mz2 = _ms1_dataset()
+    tgt = _target(prec_mz=mz2[0], rt_center=102.0)
+    src = tmp_path / "bundle"
+    src.mkdir()
+    pq.write_table(peaks, src / "peaks.parquet")
+    build_peak_index(src, tmp_path / "idx")
+    kw = dict(acquisition_id=0, level=1, rt_window=2.0, tolerance=_TOL_PPM)
+    by_keywords = extract_xic_indexed(tmp_path / "idx", tgt, n_isotopes=3, **kw)
+    by_settings = extract_xic_indexed(tmp_path / "idx", tgt, channels=ChannelSettings(n_isotopes=3), **kw)
+    assert _sortkey(by_keywords) == _sortkey(by_settings)
+    two = extract_xic_indexed(tmp_path / "idx", tgt, channels=ChannelSettings(n_isotopes=2), **kw)
+    assert set(two.column("isotope").to_pylist()) == {0, 1}

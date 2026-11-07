@@ -25,26 +25,30 @@ number of the MS2 scan a match was made in.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
-
-import json
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from constellation.core.io.schemas import cast_to_schema
 from constellation.core.sequence.proforma import Peptidoform, parse_proforma
-from constellation.core.stats.units import ISOTOPE_MASS_DIFF
-from constellation.massspec.peptide.envelope import envelope_mz, neutral_envelope
-from constellation.massspec.peptide.ions import IonType, fragment_ladder_arrays_batch
-from constellation.massspec.peptide.mz import precursor_mz as _precursor_mz
+from constellation.core.sequence.protein import peptide_masses
+from constellation.massspec.peptide.channels import (
+    FRAGMENTS,
+    ISOTOPES,
+    UNMODELLED,
+    Channels,
+    ChannelSettings,
+    FragmentAbundance,
+    fragment_channels,
+    isotope_channels,
+)
+from constellation.massspec.peptide.mz import PROTON_MASS
 from constellation.massspec.quant.schemas import XIC_TARGET_TABLE
 from constellation.massspec.sweep.schemas import SWEEP_CHANNEL_TABLE, SWEEP_QUERY_TABLE
-
-if TYPE_CHECKING:
-    import torch
 
 __all__ = [
     "ISOTOPES",
@@ -56,115 +60,10 @@ __all__ = [
     "compile_queries",
 ]
 
-#: Channel kinds: precursor isotopes are matched in MS1 scans, fragments in the rest.
-ISOTOPES = 1
-FRAGMENTS = 2
-
 #: Where a written plan keeps its ``ChannelSettings`` (channel table metadata).
 _SETTINGS_KEY = b"x.massspec.sweep.channel_settings"
-
-
-@dataclass(frozen=True)
-class ChannelSettings:
-    """Which channels a query is matched at: the isotopes and charges of its
-    precursor in MS1, the fragment ions in MS2."""
-
-    n_isotopes: int = 3
-    #: Isotope offsets to use instead of ``range(n_isotopes)``. Negative
-    #: offsets (M−1, M−2) are for labelled peptides, whose incomplete
-    #: labelling puts intensity below the fully labelled mass.
-    isotope_offsets: tuple[int, ...] | None = None
-    #: Charges to look for every target at in MS1, for the evidence of an
-    #: analyte across its charge states (a peptide's precursors then share
-    #: their MS1 channels). None (the default) is each target's own charge
-    #: (PI, 2026-11-07; until then (1, 4) was the default for every target).
-    charge_range: tuple[int, int] | None = None
-    #: The charges a target with no charge of its own is looked for at in
-    #: MS1, when ``charge_range`` is not given.
-    fallback_charge_range: tuple[int, int] = (1, 4)
-    ion_types: tuple[IonType, ...] = (IonType.B, IonType.Y)
-    max_fragment_charge: int = 2
-    neutral_losses: tuple[str, ...] | None = None
-
-    def __post_init__(self) -> None:
-        if self.offsets() == ():
-            raise ValueError(
-                "the isotope selection is empty (n_isotopes < 1 or no isotope_offsets): MS1 would have no "
-                "channels; leave level 1 out of the levels instead"
-            )
-        for name in ("charge_range", "fallback_charge_range"):
-            value = getattr(self, name)
-            if value is not None and not (len(value) == 2 and 1 <= int(value[0]) <= int(value[1])):
-                raise ValueError(f"{name} must be (low, high) with 1 <= low <= high; got {value!r}")
-        if int(self.max_fragment_charge) < 1:
-            raise ValueError(f"max_fragment_charge must be >= 1; got {self.max_fragment_charge}")
-        if not self.ion_types:
-            raise ValueError("ion_types must name at least one ion series")
-
-    def offsets(self) -> tuple[int, ...]:
-        if self.isotope_offsets is not None:
-            return tuple(sorted(set(int(k) for k in self.isotope_offsets)))
-        return tuple(range(int(self.n_isotopes)))
-
-    def to_dict(self) -> dict:
-        """The settings as plain data (JSON), for a plan written to disk."""
-        return {
-            "n_isotopes": int(self.n_isotopes),
-            "isotope_offsets": None if self.isotope_offsets is None else [int(k) for k in self.isotope_offsets],
-            "charge_range": None if self.charge_range is None else [int(z) for z in self.charge_range],
-            "fallback_charge_range": [int(z) for z in self.fallback_charge_range],
-            "ion_types": [IonType(t).name for t in self.ion_types],
-            "max_fragment_charge": int(self.max_fragment_charge),
-            "neutral_losses": None if self.neutral_losses is None else list(self.neutral_losses),
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict) -> ChannelSettings:
-        def pair(v):
-            return None if v is None else (int(v[0]), int(v[1]))
-
-        return cls(
-            n_isotopes=int(d["n_isotopes"]),
-            isotope_offsets=None if d["isotope_offsets"] is None else tuple(int(k) for k in d["isotope_offsets"]),
-            charge_range=pair(d["charge_range"]),
-            fallback_charge_range=pair(d["fallback_charge_range"]),
-            ion_types=tuple(IonType[name] for name in d["ion_types"]),
-            max_fragment_charge=int(d["max_fragment_charge"]),
-            neutral_losses=None if d["neutral_losses"] is None else tuple(d["neutral_losses"]),
-        )
-
-
-@dataclass(frozen=True)
-class Channels:
-    """One kind of channel for every query, in compressed-row form."""
-
-    kind: int
-    offsets: np.ndarray  # (n_queries + 1,) int64
-    mz: np.ndarray  # float64
-    precursor_charge: np.ndarray  # int8
-    isotope: np.ndarray  # int8; isotopes only
-    ion_type: np.ndarray  # int8 IonType value; fragments only
-    position: np.ndarray  # int32; fragments only
-    fragment_charge: np.ndarray  # int32; fragments only
-    loss: np.ndarray  # int16: 0 for none, k for loss_ids[k - 1]; fragments only
-    abundance: np.ndarray  # float32; NaN where not modelled
-    evidence_key: np.ndarray  # int32
-    loss_ids: tuple[str, ...] = ()
-
-    @property
-    def n(self) -> int:
-        return int(self.mz.size)
-
-    def counts(self) -> np.ndarray:
-        return np.diff(self.offsets)
-
-    def query_of(self) -> np.ndarray:
-        """The query each channel belongs to."""
-        return np.repeat(np.arange(self.offsets.size - 1, dtype=np.int64), self.counts())
-
-    def ordinal(self) -> np.ndarray:
-        """Each channel's position among its query's channels of this kind."""
-        return np.arange(self.n, dtype=np.int64) - np.repeat(self.offsets[:-1], self.counts())
+#: And what its fragment abundances came from.
+_ABUNDANCE_KEY = b"x.massspec.sweep.fragment_abundance"
 
 
 @dataclass(frozen=True)
@@ -183,6 +82,8 @@ class QueryPlan:
     isotopes: Channels | None
     fragments: Channels | None
     settings: ChannelSettings = field(default_factory=ChannelSettings)
+    #: What the fragment abundances came from (``FragmentAbundance.describe``).
+    fragment_abundance: dict = field(default_factory=lambda: dict(UNMODELLED.describe()))
 
     @property
     def n_queries(self) -> int:
@@ -224,6 +125,7 @@ class QueryPlan:
             self.fragments.loss_ids if self.fragments is not None else ()
         ).encode()
         meta[_SETTINGS_KEY] = json.dumps(self.settings.to_dict()).encode()
+        meta[_ABUNDANCE_KEY] = json.dumps(self.fragment_abundance).encode()
         return queries, channels.replace_schema_metadata(meta)
 
     def write(self, directory) -> None:
@@ -310,6 +212,9 @@ class QueryPlan:
             isotopes=of(ISOTOPES, ()) if 1 in levels else None,
             fragments=of(FRAGMENTS, loss_ids) if any(level >= 2 for level in levels) else None,
             settings=settings,
+            fragment_abundance=(
+                json.loads(meta[_ABUNDANCE_KEY].decode()) if _ABUNDANCE_KEY in meta else dict(UNMODELLED.describe())
+            ),
         )
 
 
@@ -436,79 +341,96 @@ def compile_queries(
     rt_window: float | None = None,
     assigned_scans_only: bool = False,
     derive_precursor_mz: bool = True,
+    fragment_abundance: FragmentAbundance = UNMODELLED,
 ) -> QueryPlan:
     """Compile extraction targets into a sweep's queries.
 
     ``levels`` are the MS levels to match at: 1 for precursor isotopes,
     2 (or higher) for fragments; ``channels`` says which isotopes and
-    fragment ions they are. A target that can define no channels of a
-    level asked for is an error when it would then be matched at nothing,
-    as the scan-major extractor's were (a bare m/z at MS2 alone, a sequence
-    with no charge); otherwise it simply has none of that kind.
+    fragment ions they are (``massspec.peptide.channels``), and
+    ``fragment_abundance`` where fragment abundances come from (looked up
+    by each target's ``precursor_id``). A target that can define no
+    channels of a level asked for is an error when it would then be
+    matched at nothing, as the scan-major extractor's were (a bare m/z at
+    MS2 alone, a sequence with no charge); otherwise it simply has none of
+    that kind.
+
+    Vectorized over targets: each distinct sequence is parsed once and
+    its envelope and ladder built once; nothing else runs per target in
+    Python (1.3 ms a target at proteome scale until 2026-11-07).
     """
     levels = tuple(sorted(set(int(x) for x in levels)))
     if not levels or min(levels) < 1:
         raise ValueError(f"levels must be MS levels ≥ 1; got {levels!r}")
     t = cast_to_schema(targets, XIC_TARGET_TABLE)
-    d = t.to_pydict()
     n = t.num_rows
     want_ms1 = 1 in levels
     want_frag = any(level >= 2 for level in levels)
+    target_ids = t.column("target_id").to_pylist()
 
-    modseq = d["modified_sequence"]
-    charge_in = d["precursor_charge"]
-    pmz_in = d["precursor_mz"]
-    parsed: dict[str, Peptidoform] = {}
-
-    def pf(s: str) -> Peptidoform:
-        p = parsed.get(s)
-        if p is None:
-            p = parsed[s] = _peptidoform(s)
-        return p
+    # Each distinct sequence once, in order of first appearance.
+    modseq = t.column("modified_sequence")
+    present = np.asarray(pc.fill_null(pc.not_equal(modseq, ""), False).to_numpy(zero_copy_only=False), dtype=bool)
+    distinct = pc.unique(modseq.filter(pa.array(present))).to_pylist() if present.any() else []
+    peptide = np.full(n, -1, dtype=np.int64)
+    if distinct:
+        at = pc.index_in(modseq, value_set=pa.array(distinct, pa.string())).to_numpy(zero_copy_only=False)
+        peptide = np.where(present, np.nan_to_num(np.asarray(at, dtype=np.float64), nan=-1), -1).astype(np.int64)
+    charge_col = t.column("precursor_charge")
+    precursor_charge = charge_col.fill_null(-1).to_numpy().astype(np.int16)
+    has_charge = precursor_charge >= 0
 
     # Fragments are checked first and in target order, as the extractor did
     # before matching anything; they are the only errors raised before MS1's.
-    frag_targets: list[int] = []
+    frag = np.zeros(n, dtype=bool)
     if want_frag:
-        for i in range(n):
-            if not modseq[i]:
-                if not want_ms1:
+        if not want_ms1:
+            bad = np.flatnonzero(~present | ~has_charge)
+            if bad.size:
+                i = int(bad[0])
+                if not present[i]:
                     raise ValueError(
-                        f"target {d['target_id'][i]}: MS2 fragment extraction requires "
+                        f"target {target_ids[i]}: MS2 fragment extraction requires "
                         "modified_sequence (a bare-m/z target cannot define fragments)"
                     )
-                continue
-            if charge_in[i] is None:
-                if not want_ms1:
-                    raise ValueError(
-                        f"target {d['target_id'][i]}: MS2 extraction requires precursor_charge"
-                    )
-                continue
-            pf(modseq[i])
-            frag_targets.append(i)
+                raise ValueError(f"target {target_ids[i]}: MS2 extraction requires precursor_charge")
+        frag = present & has_charge
+    parsed = [_peptidoform(m) for m in distinct]
 
-    precursor_charge = np.array([-1 if z is None else int(z) for z in charge_in], dtype=np.int16)
-    pmz = np.array([np.nan if m is None else float(m) for m in pmz_in], dtype=np.float64)
+    pmz = t.column("precursor_mz").fill_null(np.nan).to_numpy().astype(np.float64)
     derived = np.zeros(n, dtype=bool)
     if derive_precursor_mz:
-        for i in range(n):
-            if pmz_in[i] is None and modseq[i] and charge_in[i] is not None:
-                pmz[i] = _precursor_mz(pf(modseq[i]), charge=int(charge_in[i]))
-                derived[i] = True
+        want = np.flatnonzero(np.isnan(pmz) & present & has_charge)
+        if want.size:
+            used = np.unique(peptide[want])
+            masses = peptide_masses([parsed[p] for p in used.tolist()]).numpy()
+            z = precursor_charge[want].astype(np.int64)
+            # precursor_mz's (mass + z·proton) / z, elementwise.
+            pmz[want] = (masses[np.searchsorted(used, peptide[want])] + z * PROTON_MASS) / z.astype(np.float64)
+            derived[want] = True
 
     if rt_window is not None:
         check_rt_window(t)
     rt_lo, rt_hi = _rt_bounds(t, rt_window)
-    scan_in = d["scan"]
-    assigned = np.array(
-        [-1 if (not assigned_scans_only or s is None) else int(s) for s in scan_in],
-        dtype=np.int64,
+    assigned = (
+        t.column("scan").fill_null(-1).to_numpy().astype(np.int64)
+        if assigned_scans_only
+        else np.full(n, -1, dtype=np.int64)
     )
 
-    isotopes = _isotopes(d, n, channels, pf) if want_ms1 else None
-    fragments = (
-        _fragments(d, n, frag_targets, precursor_charge, channels, pf) if want_frag else None
+    isotopes = (
+        isotope_channels(parsed, peptide, precursor_charge.astype(np.int64), pmz, channels,
+                         target_ids=target_ids)  # fmt: skip
+        if want_ms1
+        else None
     )
+    fragments = None
+    if want_frag:
+        key = t.column("precursor_id").fill_null(-1).to_numpy().astype(np.int64)
+        fragments = fragment_channels(
+            parsed, np.where(frag, peptide, -1), precursor_charge.astype(np.int64), channels, fragment_abundance,
+            key=key, target_ids=target_ids,
+        )  # fmt: skip
     return QueryPlan(
         targets=t,
         levels=levels,
@@ -521,137 +443,5 @@ def compile_queries(
         isotopes=isotopes,
         fragments=fragments,
         settings=channels,
-    )
-
-
-def _isotopes(d: dict, n: int, settings: ChannelSettings, pf) -> Channels:
-    offsets_k = settings.offsets()
-    n_peaks = max(max(offsets_k) + 1, 1)
-    neutral: dict[str, tuple[torch.Tensor, np.ndarray]] = {}
-    envelopes: dict[tuple[str, int], tuple[np.ndarray, np.ndarray]] = {}
-    mz_l: list[np.ndarray] = []
-    z_l: list[np.ndarray] = []
-    k_l: list[np.ndarray] = []
-    ab_l: list[np.ndarray] = []
-    counts = np.zeros(n, dtype=np.int64)
-    for i in range(n):
-        modseq = d["modified_sequence"][i]
-        charge = d["precursor_charge"][i]
-        if modseq:
-            if settings.charge_range is not None:
-                charges = list(range(settings.charge_range[0], settings.charge_range[1] + 1))
-            elif charge is not None:
-                charges = [int(charge)]
-            else:
-                lo, hi = settings.fallback_charge_range
-                charges = list(range(lo, hi + 1))
-            for z in charges:
-                key = (modseq, z)
-                if key not in envelopes:
-                    # One envelope per peptide, put at each charge (what
-                    # peptide_envelope does at one charge).
-                    if modseq not in neutral:
-                        masses, ab_e = neutral_envelope(pf(modseq), n_peaks=n_peaks)
-                        neutral[modseq] = (masses, ab_e.numpy())
-                    masses, ab_np = neutral[modseq]
-                    envelopes[key] = (envelope_mz(masses, z).numpy(), ab_np)
-                mz_e, ab_e = envelopes[key]
-                mz = np.empty(len(offsets_k))
-                ab = np.full(len(offsets_k), np.nan, dtype=np.float32)
-                for j, k in enumerate(offsets_k):
-                    if 0 <= k < mz_e.size:
-                        mz[j] = mz_e[k]
-                        ab[j] = ab_e[k]
-                    else:
-                        mz[j] = mz_e[0] + k * ISOTOPE_MASS_DIFF / z
-                mz_l.append(mz)
-                z_l.append(np.full(len(offsets_k), z, np.int8))
-                k_l.append(np.array(offsets_k, np.int8))
-                ab_l.append(ab)
-                counts[i] += len(offsets_k)
-            continue
-        pmz = d["precursor_mz"][i]
-        if pmz is None:
-            raise ValueError(f"target {d['target_id'][i]}: needs modified_sequence or precursor_mz")
-        z = int(charge) if charge is not None else 1
-        ks = offsets_k if charge is not None else (0,)
-        mz_l.append(np.array([pmz + k * ISOTOPE_MASS_DIFF / z for k in ks], dtype=np.float64))
-        z_l.append(np.full(len(ks), z, np.int8))
-        k_l.append(np.array(ks, np.int8))
-        ab_l.append(np.full(len(ks), np.nan, np.float32))
-        counts[i] += len(ks)
-    offsets = np.zeros(n + 1, dtype=np.int64)
-    np.cumsum(counts, out=offsets[1:])
-    total = int(offsets[-1])
-
-    def cat(parts, dtype):
-        return np.concatenate(parts).astype(dtype) if parts else np.empty(0, dtype)
-
-    isotope = cat(k_l, np.int8)
-    return Channels(
-        kind=ISOTOPES,
-        offsets=offsets,
-        mz=cat(mz_l, np.float64),
-        precursor_charge=cat(z_l, np.int8),
-        isotope=isotope,
-        ion_type=np.full(total, -1, np.int8),
-        position=np.full(total, -1, np.int32),
-        fragment_charge=np.full(total, -1, np.int32),
-        loss=np.zeros(total, np.int16),
-        abundance=cat(ab_l, np.float32),
-        evidence_key=isotope.astype(np.int32),
-    )
-
-
-def _fragments(
-    d: dict,
-    n: int,
-    frag_targets: list[int],
-    precursor_charge: np.ndarray,
-    settings: ChannelSettings,
-    pf,
-) -> Channels:
-    # One ladder per distinct sequence; targets sharing a sequence share it.
-    seqs = list(dict.fromkeys(d["modified_sequence"][i] for i in frag_targets))
-    ladder = fragment_ladder_arrays_batch(
-        [pf(s) for s in seqs],
-        ion_types=settings.ion_types,
-        max_fragment_charge=settings.max_fragment_charge,
-        neutral_losses=settings.neutral_losses,
-    )
-    which = {s: k for k, s in enumerate(seqs)}
-    rows: list[np.ndarray] = []
-    counts = np.zeros(n, dtype=np.int64)
-    for i in frag_targets:
-        k = which[d["modified_sequence"][i]]
-        a, b = ladder.offsets[k], ladder.offsets[k + 1]
-        ceiling = min(settings.max_fragment_charge, int(precursor_charge[i]))
-        keep = a + np.flatnonzero(ladder.charge[a:b] <= ceiling)
-        rows.append(keep)
-        counts[i] = keep.size
-    take = np.concatenate(rows) if rows else np.empty(0, np.int64)
-    offsets = np.zeros(n + 1, dtype=np.int64)
-    np.cumsum(counts, out=offsets[1:])
-    query = np.repeat(np.arange(n, dtype=np.int64), counts)
-    ion_type = ladder.ion_type[take]
-    position = ladder.position[take]
-    # Rank of (ion type, position) within each query: one fragment ion seen
-    # at two charges or with a loss is one piece of evidence.
-    ion = (query << 24) | (ion_type.astype(np.int64) << 16) | position.astype(np.int64)
-    distinct, key = np.unique(ion, return_inverse=True)
-    first = np.searchsorted(distinct, np.arange(n, dtype=np.int64) << 24)
-    evidence = (key - first[query]).astype(np.int32)
-    return Channels(
-        kind=FRAGMENTS,
-        offsets=offsets,
-        mz=ladder.mz[take],
-        precursor_charge=np.repeat(precursor_charge.astype(np.int8), counts),
-        isotope=np.zeros(take.size, np.int8),
-        ion_type=ion_type,
-        position=position,
-        fragment_charge=ladder.charge[take],
-        loss=ladder.loss[take],
-        abundance=np.full(take.size, np.nan, np.float32),
-        evidence_key=evidence,
-        loss_ids=ladder.loss_ids,
+        fragment_abundance=dict(fragment_abundance.describe()),
     )

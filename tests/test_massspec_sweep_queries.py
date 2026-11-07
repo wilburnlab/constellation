@@ -288,3 +288,83 @@ def test_an_rt_window_is_refused_around_a_model_clock():
     observed = [dict(target_id=2, modified_sequence="PEPTIDEK", precursor_charge=2, rt_center=900.0,
                      rt_library=900.0, rt_scale="observed")]  # fmt: skip
     assert compile_queries(_targets(observed), levels=[2], rt_window=60.0).rt_lo.tolist() == [840.0]
+
+
+# ── one generator, one abundance convention (2026-11-07) ──────────────
+
+
+def test_isotope_abundance_is_the_share_of_the_whole_envelope():
+    """An isotope's abundance was its share of the peaks kept, so it changed
+    with n_isotopes; it is now its share of the whole envelope."""
+    targets = _peptide_targets()
+    three = compile_queries(targets, levels=[1], channels=ChannelSettings(n_isotopes=3)).isotopes
+    five = compile_queries(targets, levels=[1], channels=ChannelSettings(n_isotopes=5)).isotopes
+    for q in range(targets.num_rows):
+        a = three.abundance[three.offsets[q]:three.offsets[q + 1]]
+        b = five.abundance[five.offsets[q]:five.offsets[q + 1]]
+        assert np.allclose(a, b[:3], rtol=1e-6) and b.sum() <= 1 + 1e-6 and a.sum() < b.sum()
+
+
+def test_the_top_isotopes_of_a_heavy_peptide_can_leave_out_m0():
+    long = "HLVDEPQNLIKQNCDQFEKLGEYGFQNALIVRYTRKVPQVSTPTLVEVSR"
+    targets = _targets([dict(target_id=1, modified_sequence=long, precursor_charge=4),
+                        dict(target_id=2, modified_sequence="PEPTIDEK", precursor_charge=2)])  # fmt: skip
+    iso = compile_queries(targets, levels=[1], channels=ChannelSettings(top_isotopes=2)).isotopes
+    heavy = iso.isotope[iso.offsets[0]:iso.offsets[1]].tolist()
+    light = iso.isotope[iso.offsets[1]:iso.offsets[2]].tolist()
+    assert 0 not in heavy and len(heavy) == 2 and heavy == sorted(heavy)
+    assert light == [0, 1]
+    full = compile_queries(targets, levels=[1], channels=ChannelSettings(n_isotopes=8)).isotopes
+    ab = full.abundance[full.offsets[0]:full.offsets[1]]
+    assert sorted(np.argsort(-ab)[:2].tolist()) == heavy
+
+
+def test_top_fragments_needs_abundances_that_rank_ions():
+    from constellation.massspec.peptide.channels import UNMODELLED, Uniform
+
+    for source in (UNMODELLED, Uniform()):
+        with pytest.raises(ValueError, match="top_fragments needs abundances that rank"):
+            compile_queries(_peptide_targets(), levels=[2], channels=ChannelSettings(top_fragments=10),
+                            fragment_abundance=source)  # fmt: skip
+
+
+def test_uniform_fragment_abundance_is_the_classic_equal_series():
+    """Equal intensity for every ion of the series asked, as the pre-Prosit
+    DDA scores assume: each query's abundances sum to 1; weights tilt it."""
+    from constellation.massspec.peptide.channels import Uniform
+
+    settings = ChannelSettings(ion_types=(IonType.A, IonType.B, IonType.Y), neutral_losses=("H2O",))
+    plain = compile_queries(_peptide_targets(), levels=[2], channels=settings, fragment_abundance=Uniform())
+    f = plain.fragments
+    for q in range(plain.n_queries):
+        a = f.abundance[f.offsets[q]:f.offsets[q + 1]]
+        assert np.isclose(a.sum(), 1.0) and np.allclose(a, a[0])
+    tilted = compile_queries(_peptide_targets(), levels=[2], channels=settings,
+                             fragment_abundance=Uniform(ion_type_weights={IonType.A: 0.1}, loss_weight=0.2)).fragments  # fmt: skip
+    a = tilted.abundance
+    plain_ion = (tilted.ion_type == IonType.B) & (tilted.loss == 0)
+    a_ions = (tilted.ion_type == IonType.A) & (tilted.loss == 0)
+    for q in range(tilted.offsets.size - 1):
+        sl = slice(tilted.offsets[q], tilted.offsets[q + 1])
+        assert np.isclose(a[sl].sum(), 1.0)
+        assert np.allclose(a[sl][a_ions[sl]] / a[sl][plain_ion[sl]].max(), 0.1, rtol=1e-5)
+    assert (a[a_ions].max() < a[plain_ion].min())
+    assert (a[tilted.loss > 0].max() < a[plain_ion].min())
+    assert plain.fragment_abundance["source"] == "uniform"
+
+
+def test_compiling_many_targets_gives_each_its_own_channels():
+    """Vectorized over targets: compiling them together gives each target
+    the channels compiling it alone gives (no per-target loop to lean on)."""
+    targets = _peptide_targets()
+    together = compile_queries(targets, levels=[1, 2])
+    for q in range(targets.num_rows):
+        alone = compile_queries(targets.slice(q, 1), levels=[1, 2])
+        for kind in ("isotopes", "fragments"):
+            a, b = getattr(together, kind), getattr(alone, kind)
+            sl = slice(a.offsets[q], a.offsets[q + 1])
+            for name in ("mz", "precursor_charge", "isotope", "ion_type", "position", "fragment_charge", "loss",
+                         "evidence_key"):  # fmt: skip
+                np.testing.assert_array_equal(getattr(a, name)[sl], getattr(b, name), err_msg=f"{kind}.{name}")
+            np.testing.assert_allclose(a.abundance[sl], b.abundance, rtol=1e-6)
+        assert together.precursor_mz[q] == alone.precursor_mz[0]

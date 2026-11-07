@@ -29,11 +29,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
+import numpy as np
 import torch
 
 from constellation.core.chem.modifications import UNIMOD, ModVocab
 from constellation.core.sequence.proforma import ProFormaResult
-from constellation.massspec.peptide.ions import IonType, fragment_ladder
+from constellation.massspec.peptide.ions import IonType
 from constellation.massspec.peptide.match import match_mz
 from constellation.massspec.spectra.similarity import multinomial_deviance
 
@@ -102,24 +103,23 @@ def fragment_basis(
     vocab: ModVocab = UNIMOD,
 ) -> FragmentBasis:
     """Build the fixed channel basis for ``peptidoform`` from its theoretical
-    fragment ladder. Channel order is ``fragment_ladder`` row order (stable
-    for a given peptidoform + ion-type/charge/loss configuration)."""
-    table, _ = fragment_ladder(
-        peptidoform,
-        ion_types=ion_types,
-        max_fragment_charge=max_fragment_charge,
-        neutral_losses=neutral_losses,
-        return_tensor=False,
-        vocab=vocab,
-    )
+    fragment ladder: the channels the sweep would trace, from the one
+    generator (``massspec.peptide.channels``), in its order (position, ion
+    type, charge, loss)."""
+    from constellation.massspec.peptide.channels import ChannelSettings, fragment_channels
+
+    settings = ChannelSettings(
+        ion_types=tuple(ion_types), max_fragment_charge=max_fragment_charge,
+        neutral_losses=tuple(neutral_losses) if neutral_losses else None,
+    )  # fmt: skip
+    channels = fragment_channels([peptidoform], np.array([0]), np.array([-1]), settings)
+    names = [None, *channels.loss_ids]
     return FragmentBasis(
-        ion_type=torch.tensor(table.column("ion_type").to_pylist(), dtype=torch.int8),
-        position=torch.tensor(table.column("position").to_pylist(), dtype=torch.int32),
-        charge=torch.tensor(table.column("charge").to_pylist(), dtype=torch.int32),
-        loss_id=tuple(table.column("loss_id").to_pylist()),
-        mz_theoretical=torch.tensor(
-            table.column("mz_theoretical").to_pylist(), dtype=torch.float64
-        ),
+        ion_type=torch.from_numpy(channels.ion_type.astype(np.int8)),
+        position=torch.from_numpy(channels.position.astype(np.int32)),
+        charge=torch.from_numpy(channels.fragment_charge.astype(np.int32)),
+        loss_id=tuple(names[int(k)] for k in channels.loss),
+        mz_theoretical=torch.from_numpy(channels.mz.astype(np.float64)),
     )
 
 

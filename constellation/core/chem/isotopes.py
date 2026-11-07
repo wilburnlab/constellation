@@ -33,8 +33,11 @@ Both APIs accept `Composition` objects or raw count tensors.
 
 from __future__ import annotations
 
+from typing import Literal
+
 import functools
 
+import numpy as np
 import torch
 
 from constellation.core.chem.elements import ELEMENT_SYMBOLS, ELEMENTS, ISOTOPE_MASS_DIFF
@@ -119,6 +122,8 @@ def _coerce_counts_dict(
 def isotope_distribution(
     composition: Composition | torch.Tensor,
     n_peaks: int = 5,
+    *,
+    normalize: Literal["kept", "full"] = "kept",
 ) -> torch.Tensor:
     """Binned (M+0, M+1, ..., M+n_peaks-1) abundance distribution.
 
@@ -126,7 +131,10 @@ def isotope_distribution(
     polynomials); peak *masses* are not returned here — see
     `isotope_envelope` for the matching mass tensor.
 
-    Returns float32 of shape `(n_peaks,)`, normalized to sum to 1.0.
+    Returns float32 of shape `(n_peaks,)`. ``normalize="kept"`` makes the
+    kept peaks sum to 1.0, so a peak's value depends on how many are kept;
+    ``"full"`` gives each peak's share of the whole envelope, the same
+    whatever ``n_peaks`` is.
     """
     counts = _coerce_counts_dict(composition)
     result = torch.ones(1)
@@ -137,9 +145,9 @@ def isotope_distribution(
             # mono-isotopic element (P, F, I, Na, ...) — no convolution needed
             continue
         result = _poly_mul(result, _element_distribution(sym, n))
-    result = result[:n_peaks]
-    result = result.clamp(min=0.0)  # numerical noise can produce tiny negatives
-    s = result.sum()
+    full = result.clamp(min=0.0)  # numerical noise can produce tiny negatives
+    result = full[:n_peaks]
+    s = full.sum() if normalize == "full" else result.sum()
     if s.item() <= 0:
         return result
     return result / s
@@ -148,6 +156,8 @@ def isotope_distribution(
 def isotope_envelope(
     composition: Composition | torch.Tensor,
     n_peaks: int = 5,
+    *,
+    normalize: Literal["kept", "full"] = "kept",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Binned envelope as `(masses, intensities)`, both shape `(n_peaks,)`.
 
@@ -161,7 +171,7 @@ def isotope_envelope(
         [mono + k * ISOTOPE_MASS_DIFF for k in range(n_peaks)],
         dtype=torch.float64,
     )
-    intensities = isotope_distribution(composition, n_peaks)
+    intensities = isotope_distribution(composition, n_peaks, normalize=normalize)
     return masses, intensities
 
 
@@ -345,7 +355,53 @@ def average_mass(composition: Composition) -> float:
     return composition.average_mass
 
 
+def isotope_distributions(counts: np.ndarray, n_peaks: int) -> np.ndarray:
+    """Binned isotope distributions of many compositions at once: an
+    ``(N, n_peaks)`` float64 array, row ``i`` the share of the *whole*
+    envelope of ``counts[i]`` (an ``(N, E)`` array of element counts in
+    ``ELEMENT_SYMBOLS`` order) at M+0, M+1, ... — what
+    ``isotope_distribution(..., normalize="full")`` gives one at a time, to
+    float32 rounding.
+
+    Every element's abundance polynomial is raised to its count in the
+    Fourier domain (``F^n = exp(n·log F)``, exact for integer ``n``),
+    the elements multiplied, and transformed back once, so no work is done
+    per composition in Python. The transform is long enough that the
+    distribution's tail (40 standard deviations past its mean) cannot wrap
+    round onto the peaks kept."""
+    counts = np.asarray(counts, dtype=np.int64)
+    n = counts.shape[0]
+    out = np.zeros((n, n_peaks), dtype=np.float64)
+    if n == 0:
+        return out
+    columns = [
+        e for e in np.flatnonzero((counts > 0).any(axis=0)).tolist()
+        if len(_binned_abundances(ELEMENT_SYMBOLS[e])) > 1
+    ]
+    if not columns:
+        out[:, 0] = 1.0
+        return out
+    polys = [_binned_abundances(ELEMENT_SYMBOLS[e]).numpy().astype(np.float64) for e in columns]
+    polys = [a / a.sum() for a in polys]
+    mean = sum(counts[:, e] * float((np.arange(a.size) * a).sum()) for e, a in zip(columns, polys))
+    var = sum(
+        counts[:, e] * float((np.arange(a.size) ** 2 * a).sum() - (np.arange(a.size) * a).sum() ** 2)
+        for e, a in zip(columns, polys)
+    )
+    reach = float(np.max(mean + 40.0 * np.sqrt(var))) + 8.0
+    length = 1 << int(np.ceil(np.log2(max(reach, 2 * n_peaks, 16))))
+    logs = np.stack([np.log(np.fft.rfft(a, n=length)) for a in polys])  # (n_elements, length/2 + 1)
+    for lo in range(0, n, 1 << 15):
+        hi = min(n, lo + (1 << 15))
+        spectrum = np.exp(counts[lo:hi][:, columns].astype(np.float64) @ logs)
+        dist = np.clip(np.fft.irfft(spectrum, n=length, axis=1), 0.0, None)
+        total = dist.sum(axis=1, keepdims=True)
+        out[lo:hi] = dist[:, :n_peaks] / np.where(total > 0, total, 1.0)
+    return out
+
+
 __all__ = [
+    "isotope_distributions",
     "isotope_distribution",
     "isotope_envelope",
     "isotopologue_distribution",
