@@ -342,6 +342,21 @@ def test_locating_a_dia_precursor(dia) -> None:
     assert nowhere["window"] is None and nowhere["ms_scan"] is None
 
 
+def test_locating_a_precursor_without_a_retention_time(dia, dda) -> None:
+    """An identification with no apex used to raise inside the route
+    (``times - None``), an HTTP 500 in the browser."""
+    bundle, _ = dia
+    table = scan_table(bundle)
+    w = isolation_window_table(table).filter(pc.equal(isolation_window_table(table).column("level"), 2)).to_pylist()[0]
+    found = locate_precursor(table, precursor_mz=w["center"], rt=None)
+    assert found["window"] == w["window"] and found["isolation"] is not None
+    assert found["ms_scan"] is None and found["parent_scan"] is None
+    bundle, scans = dda
+    picked = [s for s in scans if s["level"] == 2][7]
+    found = locate_precursor(scan_table(bundle), precursor_mz=picked["precursor_mz"], rt=None)
+    assert found["ms_scan"] is None and found["parent_scan"] is None
+
+
 def test_locating_a_dda_precursor(dda) -> None:
     bundle, scans = dda
     table = scan_table(bundle)

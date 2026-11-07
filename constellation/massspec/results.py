@@ -233,10 +233,17 @@ def _peptide_centric(
         return None
     precursors = _read(root, "precursor", unit=unit, acquisition_id=acquisition_id, shared=True, where=where,
                        columns=["precursor_id", "peptide_id", "charge", "precursor_mz"])
+    if precursors is None:
+        # Quantities with no precursors to name them identify nothing.
+        return None
     peptides = _read(root, "peptide", unit=unit, acquisition_id=acquisition_id, shared=True,
-                     columns=["peptide_id", "sequence", "modified_sequence"])
+                     columns=["peptide_id", "sequence", "modified_sequence", "is_decoy"])
     scores = _read(root, "precursor_score", unit=unit, acquisition_id=acquisition_id, where=where,
-                   columns=["precursor_id", "score", "qvalue", "pep"])
+                   columns=["precursor_id", "score", "qvalue", "pep", "is_decoy"])
+    if peptides is not None and "is_decoy" in peptides.column_names:
+        peptides = peptides.rename_columns(["peptide_is_decoy" if c == "is_decoy" else c for c in peptides.column_names])
+    if scores is not None and "is_decoy" in scores.column_names:
+        scores = scores.rename_columns(["score_is_decoy" if c == "is_decoy" else c for c in scores.column_names])
     joined = quant.join(
         _first_per(precursors.drop_columns(["acquisition_id"]), ["unit", "precursor_id"]),
         keys=["unit", "precursor_id"],
@@ -260,7 +267,14 @@ def _peptide_centric(
         joined = joined.join(proteins, keys=["unit", "peptide_id"], join_type="left outer")
     rt = joined.column("rt_observed")
     rt = pc.if_else(pc.less(rt, 0), pa.scalar(None, pa.float64()), rt)  # -1 = not observed
-    return _shape(joined.drop_columns(["rt_observed"]).append_column("rt", rt), is_decoy=False)
+    # What the score says, else what the peptide is, else a target: the
+    # jar's quantities are of targets only, but a search that quantifies
+    # its decoys too must not show them as targets (it was hard-coded
+    # False until 2026-11-07).
+    flags = [joined.column(c) for c in ("score_is_decoy", "peptide_is_decoy") if c in joined.column_names]
+    is_decoy = pc.coalesce(*flags, pa.scalar(False)) if flags else pa.array([False] * joined.num_rows)
+    joined = joined.drop_columns([c for c in ("score_is_decoy", "peptide_is_decoy") if c in joined.column_names])
+    return _shape(joined.drop_columns(["rt_observed"]).append_column("rt", rt).append_column("is_decoy", is_decoy))
 
 
 def _spectrum_centric(

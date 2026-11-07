@@ -286,3 +286,79 @@ def test_trace_targets_are_the_most_intense_stored_ions(searched) -> None:
     for row in targets.to_pylist():
         assert ladder[row["label"]] == pytest.approx(row["mz"], abs=0.02)
     assert trace_targets(experiment, 12345, unit=unit, acquisition_id=0).num_rows == 0
+
+
+# ── a search's tables without the jar (review of 2026-11-06) ─────────────
+
+
+def _native_experiment(root: Path, *, decoy_quantified: bool = True, with_precursors: bool = True) -> Path:
+    """A finished peptide-centric unit written through the workflow's own
+    table writer, with no jar: one target and one decoy quantified."""
+    import json
+
+    from constellation.massspec.workflows.encyclopedia import _write_tables
+
+    unit = "native-unit"
+    unit_dir = root / "units" / unit
+    unit_dir.mkdir(parents=True)
+    (unit_dir / "manifest.json").write_text(json.dumps(
+        {"kind": "massspec_search", "search_mode": "peptide-centric", "engine": "constellation",
+         "acquisition_ids": [0]}
+    ))  # fmt: skip
+    (unit_dir / "_SUCCESS").write_text("")
+    ids = [11, 22] if decoy_quantified else [11]
+    tables = {
+        "precursor_quant": pa.table({
+            "acquisition_id": pa.array([0] * len(ids), pa.int64()), "precursor_id": pa.array(ids, pa.int64()),
+            "intensity": [1e5] * len(ids), "rt_observed": [600.0] * len(ids), "rt_start": [590.0] * len(ids),
+            "rt_end": [610.0] * len(ids), "n_quant_ions": pa.array([5] * len(ids), pa.int32()),
+        }),  # fmt: skip
+        "peptide": pa.table({
+            "peptide_id": pa.array([1, 2], pa.int64()), "sequence": ["PEPTIDEK", "PDITPEEK"],
+            "modified_sequence": ["PEPTIDEK", "PDITPEEK"], "is_decoy": [False, True],
+        }),  # fmt: skip
+        "precursor_score": pa.table({
+            "precursor_id": pa.array([11, 22], pa.int64()), "acquisition_id": pa.array([0, 0], pa.int64()),
+            "modified_sequence": ["PEPTIDEK", "PDITPEEK"], "charge": pa.array([2, 2], pa.int32()),
+            "score": [9.0, 1.0], "qvalue": [0.001, 0.005], "pep": [0.01, 0.4], "is_decoy": [False, True],
+            "engine": ["constellation"] * 2,
+        }),  # fmt: skip
+    }
+    if with_precursors:
+        tables["precursor"] = pa.table({
+            "precursor_id": pa.array([11, 22], pa.int64()), "peptide_id": pa.array([1, 2], pa.int64()),
+            "charge": pa.array([2, 2], pa.int32()), "precursor_mz": [465.2, 465.2],
+        })  # fmt: skip
+    _write_tables(root, unit, tables, acquisition_id=0)
+    return root
+
+
+def test_peptide_centric_decoys_are_flagged_and_droppable(tmp_path: Path) -> None:
+    """`is_decoy` was hard-coded False for peptide-centric rows, so a
+    search that quantifies its decoys showed them as targets."""
+    root = _native_experiment(tmp_path / "exp")
+    shown = identifications(root, include_decoys=True)
+    assert dict(zip(shown.column("modified_sequence").to_pylist(), shown.column("is_decoy").to_pylist())) == {
+        "PEPTIDEK": False, "PDITPEEK": True}  # fmt: skip
+    assert identifications(root).column("modified_sequence").to_pylist() == ["PEPTIDEK"]
+
+
+def test_no_precursor_table_means_no_peptide_centric_identifications(tmp_path: Path) -> None:
+    root = _native_experiment(tmp_path / "exp", with_precursors=False)
+    assert identifications(root, include_decoys=True).num_rows == 0
+
+
+def test_unbound_and_bound_rows_of_one_partition_are_written_together(tmp_path: Path) -> None:
+    """A run-agnostic row (null acquisition) goes to the unit's own
+    partition; rows bound to that same acquisition then replaced it."""
+    from constellation.massspec.workflows.encyclopedia import _write_tables, read_experiment_table
+
+    table = pa.table({
+        "acquisition_id": pa.array([None, None, 3, 3, 3], pa.int64()), "protein_id": pa.array(range(5), pa.int64()),
+    })  # fmt: skip
+    _write_tables(tmp_path, "one-run", {"protein_score": table}, acquisition_id=3)
+    back = read_experiment_table(tmp_path, "protein_score")
+    assert sorted(back.column("protein_id").to_pylist()) == [0, 1, 2, 3, 4]
+    _write_tables(tmp_path, "report", {"protein_score": table}, acquisition_id=-1)
+    back = read_experiment_table(tmp_path, "protein_score", unit="report")
+    assert sorted(back.column("acquisition_id").to_pylist()) == [-1, -1, 3, 3, 3]
