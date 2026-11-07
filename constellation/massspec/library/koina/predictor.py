@@ -138,6 +138,8 @@ class KoinaFragments(_KoinaPredictor):
             max_fragment_charge=self.overlay.max_fragment_charge,
             losses=self.overlay.neutral_losses,
             fragmentation=self.fragmentation,
+            min_intensity=self.min_intensity,
+            intensity_floor="above",
         )
         self.unparsed = 0
 

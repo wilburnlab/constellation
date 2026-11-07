@@ -705,3 +705,27 @@ def test_undeclared_loss_channel_is_reported_not_swallowed() -> None:
     stats = AssemblyStats()
     stats.undeclared_loss_ids.add("H2O")
     assert stats.as_dict()["undeclared_loss_ids"] == ["H2O"]
+
+
+class _FakeIrtClient:
+    """An iRT model's client: one value per sequence, on no run's clock."""
+
+    model_inputs = {"peptide_sequences": ((-1, 1), "BYTES")}
+    model_outputs = {"irt": "FP32"}
+
+    def predict(self, arrays, **_):
+        n = np.asarray(arrays["peptide_sequences"]).shape[0]
+        return {"irt": np.linspace(-15.0, 60.0, n, dtype=np.float32).reshape(-1, 1)}
+
+
+def test_the_fasta_path_says_what_clock_its_retention_times_are_on():
+    """It wrote only Koina's own rt_scale key, which nothing reads, so an
+    iRT library looked like run seconds (review of 2026-11-06)."""
+    from constellation.massspec.library.koina.api import predict_library
+
+    lib, _ = predict_library(
+        specs=fixture_specs(HCD), ms2_model_name=HCD, rt_model_name="Prosit_2019_irt",
+        collision_energy=30.0, ms2_client=FakeKoinaClient(HCD), rt_client=_FakeIrtClient(),
+    )  # fmt: skip
+    assert lib.metadata_extras["x.massspec.prediction.rt_scale"] == "koina:Prosit_2019_irt:irt"
+    assert (lib.precursors.column("rt_predicted").to_numpy() < 0).any()  # a negative iRT is a value

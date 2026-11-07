@@ -6,19 +6,21 @@
    and charge, asked once (``prediction.requests``).
 2. **Checks before anything runs.** Every predictor says which requests
    it cannot take (``Predictor.check``). A precursor any of them refuses
-   is dropped, and so is the rest of its group: the target precursor and
-   every decoy made from it at that charge (PI, 2026-11-05), so targets
-   and decoys stay matched for scoring and calibration. Each drop is
-   counted by property and reason; a precursor dropped only because its
-   partner was refused is counted apart.
+   is dropped, by itself: target or decoy, each precursor is judged on
+   its own prediction by the same rule (PI, 2026-11-07). False-discovery
+   rates are estimated against a decoy population, not target by target,
+   so a target is not lost because its decoy was refused, and a decoy
+   with no target in the library is judged like any other (until then a
+   target and its decoys at one charge were kept or dropped together,
+   and a decoy was judged only through its target). Each drop is counted
+   by property and reason, and by targets and decoys.
    With ``min_charge_probability``, the charge-state predictor runs
-   first and a target precursor whose charge it makes less likely than
-   that is refused the same way (``below_min_charge_probability``), its
-   decoys with it.
+   first and a precursor whose charge it makes less likely than that is
+   refused the same way (``below_min_charge_probability``).
 3. **Predictions**, in chunks of requests in canonical order; with
    ``fragments_sink`` each chunk's fragments go to it (a file being
    written) rather than into the result.
-4. **One library**: the source library (its decoy pairing, spans,
+4. **One library**: the source library (its decoys' provenance, spans,
    modification provenance) less the dropped precursors, with each
    predicted value put on the precursors that asked it: ``rt_predicted``
    (seconds on the predictor's scale, recorded), ``ccs_predicted`` (Å²),
@@ -26,8 +28,11 @@
    place of the source's. A value a predictor did not give (NaN) leaves
    the source's. The library's metadata records which predictor made each
    property, the collision energy per charge, the retention-time scale and
-   the counts (``x.massspec.prediction.*``); a property not predicted here
-   keeps the record of whatever predicted it before.
+   the counts, and what the fragment model covers (ion types, charges,
+   ion numbers, intensity floor: ``x.massspec.prediction.fragment_coverage``,
+   so an ion it covers and left out is known to be predicted below its
+   floor, not unmodelled) (``x.massspec.prediction.*``); a property not
+   predicted here keeps the record of whatever predicted it before.
 
 Deuterium shifts retention time and no model here knows it; such a
 peptide is predicted as its light form (a caveat the report carries when
@@ -81,7 +86,8 @@ class PredictionReport:
     fragments: int
     refused: dict[str, dict[str, int]]
     examples: dict[str, dict[str, list[str]]]
-    dropped_with_partner: int
+    dropped_targets: int
+    dropped_decoys: int
     labelled_peptides: int
     predictors: dict[str, dict[str, Any]]
     collision_energy: dict[str, Any] | None
@@ -100,7 +106,8 @@ class PredictionReport:
             "precursors": self.precursors,
             "precursors_kept": self.precursors_kept,
             "dropped": self.dropped,
-            "dropped_with_partner": self.dropped_with_partner,
+            "dropped_targets": self.dropped_targets,
+            "dropped_decoys": self.dropped_decoys,
             "requests": self.requests,
             "requests_predicted": self.requests_predicted,
             "fragments": self.fragments,
@@ -154,10 +161,10 @@ def predict_onto(
     """``library`` with ``predictors``' properties put on its precursors
     (module docstring). Returns the library and the report.
 
-    ``min_charge_probability`` keeps a target precursor only if the
-    ``charge_state`` predictor gives its charge at least that probability
-    (decoys follow their target, by group); it is predicted before
-    anything else, so dropped precursors cost nothing more.
+    ``min_charge_probability`` keeps a precursor, target or decoy, only
+    if the ``charge_state`` predictor gives its charge at least that
+    probability; it is predicted before anything else, so dropped
+    precursors cost nothing more.
     ``fragments_sink`` receives the fragment table chunk by chunk instead
     of the result holding it (the returned library's fragments are then
     empty): what a command writing millions of precursors streams to disk.
@@ -202,12 +209,11 @@ def predict_onto(
     if strict and refused.any():
         raise PredictionRefused(counts, examples)
 
-    # A refused precursor takes its group; the library then drops a decoy
-    # whose target peptide has no precursor left, so the kept set is read
-    # back from it before anything is predicted.
-    bad_groups = np.unique(plan.group[refused])
-    out = library.subset_precursors(pa.array(plan.precursor_id[~np.isin(plan.group, bad_groups)], type=pa.int64()))
-    kept_rows = np.flatnonzero(np.isin(plan.precursor_id, out.precursors.column("precursor_id").to_numpy()))
+    # A refused precursor goes alone.
+    kept_rows = np.flatnonzero(~refused)
+    out = library.subset_precursors(pa.array(plan.precursor_id[kept_rows], type=pa.int64()))
+    if out.precursors.num_rows != kept_rows.size:
+        raise AssertionError("the library kept other precursors than the ones not refused")
 
     # ── predictions, chunk by chunk ─────────────────────────────────
     kept_requests = np.unique(plan.request[kept_rows])
@@ -276,7 +282,8 @@ def predict_onto(
         fragments=n_fragments,
         refused=counts,
         examples=examples,
-        dropped_with_partner=int(n - precursors.num_rows - refused.sum()),
+        dropped_targets=int((refused & ~plan.is_decoy).sum()),
+        dropped_decoys=int((refused & plan.is_decoy).sum()),
         labelled_peptides=plan.labelled_peptides,
         predictors={prop: p.identity() for prop, p in predictors.items()},
         collision_energy=(
@@ -312,8 +319,14 @@ def _metadata(source: Mapping[str, Any], report: PredictionReport, predictors: M
     extras["x.massspec.prediction.report"] = {
         k: v for k, v in report.to_dict().items() if k not in ("predictors", "examples")
     }
+    fragments = predictors.get("fragments")
     for prop, key, value in (
         ("fragments", "x.massspec.prediction.collision_energy", report.collision_energy),
+        (
+            "fragments",
+            "x.massspec.prediction.fragment_coverage",
+            fragments.capabilities.fragment_coverage() if fragments is not None else None,
+        ),
         ("retention_time", "x.massspec.prediction.rt_scale", report.rt_scale),
     ):
         if prop not in predictors:
@@ -326,10 +339,12 @@ def _metadata(source: Mapping[str, Any], report: PredictionReport, predictors: M
 
 
 def _refuse_unlikely_charges(plan: RequestPlan, predictor: Predictor, minimum: float, refused: np.ndarray, note) -> None:
-    """Refuse target precursors whose charge ``predictor`` makes less
-    likely than ``minimum`` (decoys are not judged: they follow their
-    target's group)."""
-    judged = np.flatnonzero(~refused & ~plan.is_decoy & (plan.request >= 0))
+    """Refuse precursors, targets and decoys alike, whose charge
+    ``predictor`` makes less likely than ``minimum``. A decoy is judged on
+    its own sequence's prediction: until 2026-11-07 decoys were never
+    judged and followed their target, so a decoy without one (a reversed
+    protein) was always kept, at any charge."""
+    judged = np.flatnonzero(~refused & (plan.request >= 0))
     if not len(judged):
         return
     requests = np.unique(plan.request[judged])

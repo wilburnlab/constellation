@@ -598,6 +598,9 @@ def read_msp_library(
         "x.msp.n_entries": n_entries,
         "x.msp.unparseable_annotations": counters.unparseable_annotations,
         "x.msp.dropped_peaks": counters.dropped_peaks,
+        # rt_predicted holds the entries' iRT (a unitless scale), not a
+        # run's seconds: what the library's clock is, for whatever reads it.
+        "x.massspec.prediction.rt_scale": "irt",
     }
     if unresolved_mods:
         metadata_extras["x.msp.unresolved_mods"] = unresolved_mods

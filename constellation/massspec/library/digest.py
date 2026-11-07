@@ -212,7 +212,7 @@ def precursors_from_library(library) -> list[PrecursorSpec]:
     say which precursors are decoys, nor how they were made. To get a
     predicted library that keeps that, predict with the library itself
     (``koina.api.predict_library(library=...)``), which puts the
-    predictions onto it (``library.attach_predictions``).
+    predictions onto it (``library.prediction.predict_onto``).
     """
     if not hasattr(library, "precursors"):
         from constellation.massspec.library.io import load_library

@@ -341,3 +341,59 @@ def test_every_sample_modified_sequence_has_a_stable_key() -> None:
         assert format_proforma(parse_proforma(key)) == key, keys[key]
         assert canonical_peptide_key(parse_proforma(key)) == key, keys[key]
     content_ids(list(keys))  # raises on a collision
+
+
+def test_content_ids_follow_decoy_of_and_the_provenance_tables(tmp_path) -> None:
+    """decoy_of, the spans, their edges and the modification rows kept
+    their old ids (review of 2026-11-06): a search space read from
+    sequential ids pointed its decoys at peptides that were not there."""
+    from dataclasses import replace
+
+    import pyarrow.compute as pc
+
+    from constellation.massspec.library.search_space import Digestion, SearchSpaceSettings, build_search_space
+    from constellation.massspec.library.decoys import DecoySet
+
+    fasta = tmp_path / "p.fa"
+    fasta.write_text(">P1\nMPEPTIDEKLVNELTEFAKSAMPLERHLVDEPQNLIK\n")
+    space = build_search_space([fasta], SearchSpaceSettings(
+        digestion=Digestion(missed_cleavages=0, min_length=6, max_length=30, excise_initiator_met=False),
+        charges=(2,), min_mz=0, max_mz=1e6, decoys=(DecoySet(),),
+    ))  # fmt: skip
+    # The same library under sequential ids, then re-keyed by content.
+    seq = {old: i for i, old in enumerate(space.peptides.column("peptide_id").to_pylist())}
+    prot = {old: i for i, old in enumerate(space.proteins.column("protein_id").to_pylist())}
+
+    def renumber(table, column, mapping):
+        values = [None if v is None else mapping[v] for v in table.column(column).to_pylist()]
+        return table.set_column(table.schema.get_field_index(column), column, pa.array(values, pa.int64()))
+
+    peptides = renumber(renumber(space.peptides, "peptide_id", seq), "decoy_of", seq)
+    sequential = replace(
+        space,
+        proteins=renumber(space.proteins, "protein_id", prot),
+        peptides=peptides,
+        precursors=renumber(space.precursors, "peptide_id", seq),
+        protein_peptide=renumber(renumber(space.protein_peptide, "peptide_id", seq), "protein_id", prot),
+        peptide_spans=renumber(space.peptide_spans, "protein_id", prot),
+        span_peptide=renumber(renumber(space.span_peptide, "peptide_id", seq), "protein_id", prot),
+        peptide_modifications=renumber(space.peptide_modifications, "peptide_id", seq),
+        metadata_extras={k: v for k, v in space.metadata_extras.items() if k != ID_SCHEME_METADATA_KEY},
+    )
+    back = with_content_ids(sequential)
+    assert sorted(back.peptides.column("decoy_of").drop_null().to_pylist()) == sorted(
+        space.peptides.column("decoy_of").drop_null().to_pylist())  # fmt: skip
+    assert set(back.span_peptide.column("peptide_id").to_pylist()) <= set(back.peptides.column("peptide_id").to_pylist())
+    assert set(back.peptide_spans.column("protein_id").to_pylist()) == set(back.proteins.column("protein_id").to_pylist())
+    back.validate()
+    # A decoy whose target this library does not hold cannot be re-keyed
+    # from sequential ids, and is refused; under content ids it is kept.
+    target = space.peptides.filter(pc.is_valid(space.peptides.column("decoy_of"))).column("decoy_of")[0].as_py()
+    keep = pc.invert(pc.equal(space.precursors.column("peptide_id"), target))
+    lone = space.subset_precursors(space.precursors.filter(keep).column("precursor_id"))
+    assert with_content_ids(lone).peptides.column("decoy_of").drop_null().to_pylist()
+    lone_seq = replace(sequential.subset_precursors(
+        sequential.precursors.filter(pc.invert(pc.equal(sequential.precursors.column("peptide_id"), seq[target])))
+        .column("precursor_id")))  # fmt: skip
+    with pytest.raises(ValueError, match="decoy_of names peptides"):
+        with_content_ids(lone_seq)

@@ -148,8 +148,16 @@ def test_predict_library_encyclopedia_still_requires_fasta_and_dlib(tmp_path, ca
 # ── run-dir contract ──────────────────────────────────────────────────
 
 
+def _completed(tmp_path, **over):
+    """Mark ``tmp_path`` finished with the key the arguments make."""
+    from constellation.core.stages import mark_done, stage_key
+    from constellation.massspec.cli.predict_library import _koina_key_parts
+
+    mark_done(tmp_path, stage_key(**_koina_key_parts(_args(output_dir=tmp_path, fasta=tmp_path / "a.fasta", **over))))
+
+
 def test_refuses_a_completed_output_dir(tmp_path, capsys):
-    (tmp_path / "_SUCCESS").write_bytes(b"")
+    _completed(tmp_path)
     rc = _cmd_massspec_predict_library(
         _args(output_dir=tmp_path, fasta=tmp_path / "a.fasta")
     )
@@ -158,12 +166,33 @@ def test_refuses_a_completed_output_dir(tmp_path, capsys):
 
 
 def test_resume_short_circuits_a_completed_dir(tmp_path, capsys):
-    (tmp_path / "_SUCCESS").write_bytes(b"")
+    _completed(tmp_path, resume=True)
     rc = _cmd_massspec_predict_library(
         _args(output_dir=tmp_path, fasta=tmp_path / "a.fasta", resume=True)
     )
     assert rc == 0
     assert "already complete" in capsys.readouterr().out
+
+
+def test_a_keyless_success_marker_is_not_trusted(tmp_path, capsys):
+    """A marker written before runs were keyed cannot say what it holds;
+    it was reused unchecked until 2026-11-07."""
+    (tmp_path / "_SUCCESS").write_bytes(b"")
+    rc = _cmd_massspec_predict_library(_args(output_dir=tmp_path, fasta=tmp_path / "a.fasta"))
+    assert rc == 1
+    assert "holds a prediction of other inputs or settings" in capsys.readouterr().err
+
+
+def test_a_prediction_of_another_layout_is_not_resumed(tmp_path, capsys, monkeypatch):
+    """The key carries PREDICTION_LAYOUT, so output written under an older
+    rule for which precursors to keep is not taken for finished."""
+    import constellation.massspec.library.prediction as prediction
+
+    _completed(tmp_path)
+    monkeypatch.setattr(prediction, "PREDICTION_LAYOUT", prediction.PREDICTION_LAYOUT + 1)
+    rc = _cmd_massspec_predict_library(_args(output_dir=tmp_path, fasta=tmp_path / "a.fasta"))
+    assert rc == 1
+    assert "other inputs or settings" in capsys.readouterr().err
 
 
 # ── energy-sweep resume ────────────────────────────────────────────────

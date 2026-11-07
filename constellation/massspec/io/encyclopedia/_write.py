@@ -134,7 +134,7 @@ def write_encyclopedia(
             sources = _sources(quant, search)
             _write_entries(con, library, names, sources, quant, search, upstream)
             _write_peptidetoprotein(con, library)
-            _write_metadata(con, upstream)
+            _write_metadata(con, upstream, library.metadata_extras.get(RT_SCALE_KEY))
             if search is not None:
                 _write_peptidescores(con, library, names, sources, search, upstream)
                 _write_proteinscores(con, library, sources, search)
@@ -398,15 +398,23 @@ def _write_peptidetoprotein(con: Any, library: Library) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 
-_OWN_KEYS = ("version", "constellation_writer_version", "created_iso")
+#: The library's ``x.massspec.prediction.rt_scale``, and the row of the
+#: file's metadata table it is kept in, so a library written and read back
+#: still says what clock its retention times are on.
+RT_SCALE_KEY = "x.massspec.prediction.rt_scale"
+RT_SCALE_ROW = "constellation_rt_scale"
+
+_OWN_KEYS = ("version", "constellation_writer_version", "created_iso", RT_SCALE_ROW)
 
 
-def _write_metadata(con: Any, upstream: dict[str, Any]) -> None:
+def _write_metadata(con: Any, upstream: dict[str, Any], rt_scale: Any = None) -> None:
     rows: list[tuple[str, str]] = [
         ("version", LIBRARY_CONTAINER_VERSION),
         ("constellation_writer_version", WRITER_VERSION),
         ("created_iso", datetime.now(timezone.utc).isoformat()),
     ]
+    if rt_scale:
+        rows.append((RT_SCALE_ROW, str(rt_scale)))
     # The metadata of the file the library was read from (the settings a
     # search recorded, among them), kept as it was.
     rows += [(str(k), str(v)) for k, v in upstream.items() if k not in _OWN_KEYS]
