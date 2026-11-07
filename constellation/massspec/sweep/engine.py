@@ -196,10 +196,9 @@ def _f64(col: pa.ChunkedArray) -> np.ndarray:
 
 
 def _scan_metadata(bundle: Path) -> Ledger:
-    t = pq.read_table(
-        bundle / "scan_metadata.parquet",
-        columns=["scan", "level", "rt", "isolation_lower", "isolation_upper"],
-    ).sort_by("scan")
+    path = bundle / "scan_metadata.parquet"
+    context = [c for c in ("tic", "iit") if c in pq.read_schema(path).names]
+    t = pq.read_table(path, columns=["scan", "level", "rt", "isolation_lower", "isolation_upper", *context]).sort_by("scan")
     n = t.num_rows
     return Ledger(
         scan=t.column("scan").to_numpy().astype(np.int64),
@@ -208,6 +207,8 @@ def _scan_metadata(bundle: Path) -> Ledger:
         lower=_f64(t.column("isolation_lower")),
         upper=_f64(t.column("isolation_upper")),
         n_points=np.zeros(n, dtype=np.int64),
+        tic=_f64(t.column("tic").fill_null(np.nan)) if "tic" in context else None,
+        iit=_f64(t.column("iit").cast(pa.float64()).fill_null(np.nan)) if "iit" in context else None,
     )
 
 
@@ -476,9 +477,43 @@ def _conform(table: pa.Table, schema: pa.Schema, who: str) -> pa.Table:
         raise ValueError(f"reducer {who!r} returned columns its schema does not take: {exc}") from exc
 
 
-def _reduce(batch: QueryBatch, reducers: Sequence[Reducer]) -> list[pa.Table]:
+def outputs_of(reducer: Reducer) -> dict[str, pa.Schema]:
+    """A reducer's outputs, by name: its ``outputs``, or the one named
+    ``name`` of ``schema`` (a reducer of one table)."""
+    outputs = getattr(reducer, "outputs", None)
+    if outputs is not None:
+        return dict(outputs)
+    return {reducer.name: reducer.schema}
+
+
+def _reduce(batch: QueryBatch, reducers: Sequence[Reducer]) -> list[dict[str, pa.Table]]:
+    """Each reducer's output tables by name, each held to its schema."""
     passing = batch.passing() if any(r.gated for r in reducers) else None
-    return [_conform(r.reduce(passing if r.gated else batch), r.schema, r.name) for r in reducers]
+    out = []
+    for r in reducers:
+        got = r.reduce(passing if r.gated else batch)
+        schemas = outputs_of(r)
+        if isinstance(got, pa.Table):
+            if len(schemas) != 1:
+                raise ValueError(f"reducer {r.name!r} declares outputs {sorted(schemas)} but returned one table")
+            got = {next(iter(schemas)): got}
+        if set(got) != set(schemas):
+            raise ValueError(f"reducer {r.name!r} returned outputs {sorted(got)}, not its {sorted(schemas)}")
+        out.append({name: _conform(got[name], schemas[name], f"{r.name}:{name}" if name != r.name else name)
+                    for name in schemas})  # fmt: skip
+    return out
+
+
+def _check_outputs(reducers: Sequence[Reducer], settings: SweepSettings) -> None:
+    """Output names are unique across reducers, and not the claims'."""
+    seen: dict[str, str] = {}
+    for r in reducers:
+        for name in outputs_of(r):
+            if name == CLAIMS and settings.claims:
+                raise ValueError(f"reducer {r.name!r} names an output {CLAIMS!r}, the claims' own")
+            if name in seen:
+                raise ValueError(f"reducers {seen[name]!r} and {r.name!r} both name an output {name!r}")
+            seen[name] = r.name
 
 
 def sweep(
@@ -502,8 +537,12 @@ def sweep(
     are the same either way, byte for byte, whatever the number of workers.
     Without a ``work_dir`` a temporary one is used, kept while the result
     is, so its outputs are read as asked. With ``settings.claims`` the
-    claims table is the ``point_claims`` output.
+    claims table is the ``point_claims`` output. A reducer gives one output
+    (``name``, ``schema``) or several (``outputs``, a name → schema mapping,
+    with ``reduce`` returning a name → table mapping); output names are
+    unique across reducers.
     """
+    _check_outputs(reducers, settings)
     if isinstance(source, pa.Table):
         if settings.mz_axis is not None:
             raise ValueError("an m/z axis belongs to a bundle; a table of points has none to apply")
@@ -586,9 +625,11 @@ def _reduce_in_memory(out: _MapOut, plan, ledger, settings, reducers, axis) -> S
               if settings.claims else None)  # fmt: skip
     batch = _batch(plan, queries, out, ledger, order, settings, shared)
     result = SweepResult(scans=ledger, matches=batch.matches, mz_axis=None if axis is None else axis.key)
-    for reducer, table in zip(reducers, _reduce(batch, reducers)):
-        result.tables[reducer.name] = table
-        result.schemas[reducer.name] = reducer.schema
+    for reducer, tables in zip(reducers, _reduce(batch, reducers)):
+        schemas = outputs_of(reducer)
+        for name, table in tables.items():
+            result.tables[name] = table
+            result.schemas[name] = schemas[name]
     if settings.claims:
         result.tables[CLAIMS] = claims_table(out.claims, plan, ledger, settings.acquisition_id)
         result.schemas[CLAIMS] = SWEEP_POINT_CLAIM_TABLE
@@ -632,6 +673,8 @@ def _read_ledger(path: Path) -> Ledger:
         lower=_f64(t.column("isolation_lower")),
         upper=_f64(t.column("isolation_upper")),
         n_points=t.column("n_points").to_numpy().astype(np.int64),
+        tic=_f64(t.column("tic").fill_null(np.nan)),
+        iit=_f64(t.column("iit").fill_null(np.nan)),
     )
 
 
@@ -822,11 +865,12 @@ def _reduce_bucket(
     queries = np.arange(q0, q1, dtype=np.int64)
     batch = _batch(plan, queries, _MapOut(matches, evidence, Claims.empty()), ledger, order, settings,
                    shared)  # fmt: skip
-    out = []
-    for reducer, table in zip(reducers, _reduce(batch, reducers)):
-        path = w / "reduce" / reducer.name / f"part-{index:05d}.parquet"
-        _write(table, path)
-        out.append(str(path))
+    out: dict[str, str] = {}
+    for tables in _reduce(batch, reducers):
+        for name, table in tables.items():
+            path = w / "reduce" / name / f"part-{index:05d}.parquet"
+            _write(table, path)
+            out[name] = str(path)
     return out
 
 
@@ -957,9 +1001,10 @@ def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progre
         )
     _WORKER.clear()
     result = SweepResult(scans=ledger, matches=None, mz_axis=None if axis is None else axis.key)
-    for k, reducer in enumerate(reducers):
-        result.parts[reducer.name] = [Path(p[k]) for p in paths]
-        result.schemas[reducer.name] = reducer.schema
+    for reducer in reducers:
+        for name, schema in outputs_of(reducer).items():
+            result.parts[name] = [Path(p[name]) for p in paths]
+            result.schemas[name] = schema
     if settings.claims:
         result.parts[CLAIMS] = [Path(p) for part in claim_parts for p in part]
         result.schemas[CLAIMS] = SWEEP_POINT_CLAIM_TABLE

@@ -388,47 +388,17 @@ class XicTraceReducer:
         return not self.drop_unmatched
 
     def reduce(self, batch: "QueryBatch") -> pa.Table:
-        plan, s, m = batch.plan, batch.scans, batch.matches
-        rows = batch.match_rows()
+        plan, s = batch.plan, batch.scans
         fill = not self.drop_unmatched and batch.settings.rule.name != "all"
         parts = []
         for level in plan.levels:
             channels = plan.channels_for_level(level)
             if channels is None:
                 continue
-            at = np.flatnonzero(m.level == level)
-            q, r, ch = m.query[at], rows[at], m.channel[at]
-            point, obs, inten = m.point_index[at], m.mz[at], m.intensity[at]
-            matched = np.ones(at.size, dtype=bool)
-            if fill:
-                q, r, ch, idx = _left_join_cells(batch, level, q, r, ch)
-                matched = idx >= 0
-                point, obs, inten = (
-                    np.where(matched, np.r_[v, fallback][idx], fallback)
-                    for v, fallback in ((point, -1), (obs, np.nan), (inten, 0.0))
-                )
-            parts.append((level, channels, q, r, ch, point, obs, inten, matched))
+            c = batch.cells(level, fill=fill)
+            parts.append((level, channels, c.query, c.row, c.channel, c.point_index, c.mz_observed, c.intensity,
+                          c.matched))  # fmt: skip
         return _trace_table(plan, s, batch.scan_order, parts, batch.settings.acquisition_id)
-
-
-def _left_join_cells(batch, level, q, r, ch):
-    """Every eligible cell of ``level`` in output order, with the index of
-    its match among ``(q, r, ch)`` (-1 where none)."""
-    cq, cr, ci = batch.eligible_cells(level)
-    order = batch.scan_order
-    by_cell = np.lexsort((ci, order[cr], cq))
-    by_match = np.lexsort((ch, order[r], q))
-    key_c = np.stack([cq[by_cell], order[cr][by_cell], ci[by_cell]], axis=1)
-    key_m = np.stack([q[by_match], order[r][by_match], ch[by_match]], axis=1)
-    idx = np.full(cq.size, -1, dtype=np.int64)
-    if key_m.size:
-        # Both sides sorted on the same key; a match is one of the cells.
-        view = np.dtype([("q", np.int64), ("s", np.int64), ("i", np.int64)])
-        kc = np.ascontiguousarray(key_c).view(view).reshape(-1)
-        km = np.ascontiguousarray(key_m).view(view).reshape(-1)
-        pos = np.searchsorted(kc, km)
-        idx[by_cell[pos]] = by_match
-    return cq, cr, ci, idx
 
 
 def _trace_table(plan, s, scan_order, parts, acquisition_id) -> pa.Table:

@@ -594,3 +594,121 @@ def test_a_bucket_reads_about_its_own_rows_from_the_runs(tmp_root, tmp_path):
     assert matches <= decoded <= matches + 2 * len(runs) * buckets * small["run_row_group_rows"]
     want = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[XicTraceReducer()]).table("xic_trace")
     oracle.assert_traces_identical(got.table("xic_trace"), want)
+
+
+# ── what a reducer reads: cells, scan context, several outputs (2026-11-07) ──
+
+
+def _batch_of(bundle, plan, settings):
+    """The whole plan as one batch, in memory."""
+    from constellation.massspec.sweep.reduce import QueryBatch
+
+    result = sweep(bundle, plan, settings)
+    every = np.arange(plan.n_queries, dtype=np.int64)
+    return QueryBatch(plan=plan, queries=every, matches=result.matches, scans=result.scans,
+                      scan_order=result.scans.order(), settings=settings)  # fmt: skip
+
+
+@pytest.mark.parametrize("name", ["dia", "dda"])
+def test_cells_are_every_eligible_cell_with_what_matched_there(tmp_root, name):
+    """A cell view for scorers: every channel in every scan a query was
+    eligible in, matched or not, errors signed observed − theoretical."""
+    run, bundle, _ = _run(name, tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
+    settings = SweepSettings(tolerances={1: (20.0, "ppm"), 2: (0.35, "Da")})
+    batch = _batch_of(bundle, plan, settings)
+    for level in (1, 2):
+        cells = batch.cells(level)
+        cq, cr, ci = batch.eligible_cells(level)
+        assert cells.n == cq.size  # nearest: one row per eligible cell
+        assert sorted(zip(cells.query.tolist(), cells.row.tolist(), cells.channel.tolist())) == sorted(
+            zip(cq.tolist(), cr.tolist(), ci.tolist()))  # fmt: skip
+        m = batch.matches
+        assert int(cells.matched.sum()) == int((m.level == level).sum())
+        hit = cells.matched
+        assert np.allclose(cells.mz_error_da[hit], cells.mz_observed[hit] - cells.mz_theoretical[hit])
+        assert np.isnan(cells.mz_error_ppm[~hit]).all() and (cells.intensity[~hit] == 0).all()
+        assert np.array_equal(cells.scan, batch.scans.scan[cells.row])
+        table = cells.table()
+        assert table.num_rows == cells.n and table.schema.names[0] == "query"
+
+
+def test_cells_keep_every_match_of_a_cell_under_rule_all(tmp_root):
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    settings = SweepSettings(tolerances={2: (0.35, "Da")}, rule=AllWithin())
+    batch = _batch_of(bundle, plan, settings)
+    cells = batch.cells(2, fill=False)
+    assert cells.n == batch.matches.n and cells.matched.all()
+    filled = batch.cells(2)
+    key = list(zip(filled.query.tolist(), filled.row.tolist(), filled.channel.tolist()))
+    assert len(key) > len(set(key))  # some cell holds several matches
+    eligible = batch.eligible_cells(2)
+    assert set(key) == set(zip(*(a.tolist() for a in eligible)))
+
+
+def test_the_ledger_carries_each_scans_tic_and_injection_time(tmp_path):
+    """What a score against the whole scan needs (the share of the TIC a
+    query explains, ion counts from injection time), from the bundle."""
+    scans = dia_scans(cycles=3)
+    for i, s in enumerate(scans):
+        s["tic"], s["iit"] = 1000.0 + i, (10.0 if i % 2 else None)
+    bundle = write_bundle_manifest(write_bundle(tmp_path, "ctx", scans))
+    run = planted_run(acquisition="dia", cycles=3, window_width=100.0)
+    plan = compile_queries(run.targets, levels=[1])
+    result = sweep(bundle, plan, SweepSettings(tolerances={1: (20.0, "ppm")}))
+    ledger = result.scans
+    by_scan = {s["scan"]: s for s in scans}
+    assert ledger.tic.tolist() == [by_scan[int(x)]["tic"] for x in ledger.scan]
+    want = [by_scan[int(x)]["iit"] for x in ledger.scan]
+    assert [None if np.isnan(v) else v for v in ledger.iit.tolist()] == want
+    assert ledger.table().column("tic").to_pylist() == ledger.tic.tolist()
+    table_run = sweep(open_peaks(bundle).to_table(), plan, SweepSettings(tolerances={1: (20.0, "ppm")}))
+    assert np.isnan(table_run.scans.tic).all()  # a table of points records none
+
+
+_TWO_A = pa.schema([("query", pa.int64()), ("n", pa.int64())])
+_TWO_B = pa.schema([("query", pa.int64()), ("total", pa.float64())])
+
+
+class _TwoOutputs:
+    """One pass, two tables: per query, its cells, and its summed intensity."""
+
+    name = "two"
+    gated = False
+    outputs = {"cell_counts": _TWO_A, "intensity": _TWO_B}
+
+    def reduce(self, batch):
+        cells = batch.cells(2)
+        q = batch.queries
+        at = np.searchsorted(q, cells.query)
+        return {
+            "cell_counts": pa.table({"query": q, "n": np.bincount(at, minlength=q.size)}, schema=_TWO_A),
+            "intensity": pa.table({"query": q, "total": np.bincount(at, weights=cells.intensity, minlength=q.size)},
+                                  schema=_TWO_B),  # fmt: skip
+        }
+
+
+def test_a_reducer_of_several_outputs_is_the_same_in_memory_and_in_workers(tmp_root, tmp_path):
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    tol = {2: (0.35, "Da")}
+    base = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[_TwoOutputs(), XicTraceReducer()])
+    assert set(base.schemas) == {"cell_counts", "intensity", "xic_trace"}
+    assert base.table("cell_counts").column("n").to_numpy().sum() > 0
+    for workers in (1, 3):
+        got = sweep(bundle, plan, SweepSettings(tolerances=tol, reduce_rows=100), reducers=[_TwoOutputs()],
+                    workers=workers, work_dir=tmp_path / f"w{workers}")  # fmt: skip
+        assert len(got.parts["intensity"]) > 1
+        for name in ("cell_counts", "intensity"):
+            assert got.table(name).equals(base.table(name))
+            assert pq.read_table(got.write(name, tmp_path / f"{name}{workers}.parquet")).equals(base.table(name))
+
+
+def test_output_names_are_unique_across_reducers(tmp_root):
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    clash = _TwoOutputs()
+    clash.outputs = {"xic_trace": _TWO_A, "intensity": _TWO_B}
+    with pytest.raises(ValueError, match="both name an output 'xic_trace'"):
+        sweep(bundle, plan, SweepSettings(tolerances={2: (0.35, "Da")}), reducers=[XicTraceReducer(), clash])
