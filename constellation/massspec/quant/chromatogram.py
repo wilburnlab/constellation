@@ -180,10 +180,8 @@ def _ms1_queries(
         elif t.precursor_charge is not None:
             charges = [int(t.precursor_charge)]
         else:
-            raise ValueError(
-                f"target {t.target_id}: MS1 extraction needs a charge "
-                "(charge_range or precursor_charge)"
-            )
+            # The sweep's rule (ChannelSettings.fallback_charge_range).
+            charges = [1, 2, 3, 4]
         out: list[_QueryIon] = []
         for z in charges:
             mz_iso, _ = peptide_envelope(pf, charge=z, n_peaks=n_isotopes)
@@ -667,7 +665,7 @@ def extract_xic_scan_major(
     ion_types: Sequence[IonType] = _DEFAULT_ION_TYPES,
     max_fragment_charge: int = 2,
     neutral_losses: Sequence[str] | None = None,
-    charge_range: tuple[int, int] | None = (1, 4),
+    charge_range: tuple[int, int] | None = None,
     rt_window: float | None = None,
     tolerance: float = 20.0,
     tolerance_unit: ToleranceUnit = "ppm",
@@ -773,7 +771,7 @@ def extract_xic_indexed(
     ion_types: Sequence[IonType] = _DEFAULT_ION_TYPES,
     max_fragment_charge: int = 2,
     neutral_losses: Sequence[str] | None = None,
-    charge_range: tuple[int, int] | None = (1, 4),
+    charge_range: tuple[int, int] | None = None,
     rt_window: float | None = None,
     tolerance: float = 20.0,
     tolerance_unit: ToleranceUnit = "ppm",
@@ -793,6 +791,10 @@ def extract_xic_indexed(
             "canonical peak table on an f32-downcast index"
         )
     dda_width = float(manifest.parameters.get("dda_window_width_mz", 10.0))
+    if rt_window is not None:
+        from constellation.massspec.sweep.queries import check_rt_window
+
+        check_rt_window(targets)
     records = _targets_to_records(targets)
     builder = _TraceBuilder()
 

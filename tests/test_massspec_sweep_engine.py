@@ -62,6 +62,7 @@ def test_a_streamed_bundle_gives_what_its_table_gives_the_oracle(tmp_root, name,
     kw = dict(
         acquisition_id=3, level=level, rt_window=15.0, tolerance=0.35, tolerance_unit="Da",
         all_in_window=mode == "all_in_window", drop_unmatched=mode != "keep_unmatched",
+        charge_range=(1, 4),  # the oracle's default; the sweep's is each target's own charge
     )  # fmt: skip
     want = oracle.extract_xic_scan_major(peaks, targets, **kw)
     assert want.num_rows > 0
@@ -385,3 +386,112 @@ def test_extract_xic_records_its_tolerances_in_memory_and_written(tmp_root, tmp_
     args = argparse.Namespace(extraction_tolerance_ppm=None, trace=tmp_path / "xic_trace.parquet",
                               collide_ppm=20.0, no_progress=True)  # fmt: skip
     assert _resolve_collide_ppm(args) == 8.0
+
+
+# ── the same plan on disk; outputs bound by name (review of 2026-11-06) ──
+
+
+_PROBE_SCHEMA = pa.schema([("query", pa.int64()), ("rt_center", pa.float64()), ("scan", pa.int32()),
+                           ("settings", pa.string())])  # fmt: skip
+
+
+class _PlanProbe:
+    """What a reducer sees of its plan: the targets' columns and settings."""
+
+    name = "probe"
+    schema = _PROBE_SCHEMA
+    gated = False
+
+    def reduce(self, batch):
+        import json
+
+        t = batch.plan.targets.take(pa.array(batch.queries))
+        return pa.table({
+            "query": pa.array(batch.queries, pa.int64()), "rt_center": t.column("rt_center"),
+            "scan": t.column("scan"),
+            "settings": [json.dumps(batch.plan.settings.to_dict())] * batch.queries.size,
+        }, schema=_PROBE_SCHEMA)  # fmt: skip
+
+
+class _Swapped:
+    """Returns its schema's columns in another order."""
+
+    name = "swapped"
+    schema = pa.schema([("a", pa.float64()), ("b", pa.float64())])
+    gated = False
+
+    def reduce(self, batch):
+        n = batch.queries.size
+        return pa.table({"b": np.full(n, 2.0), "a": np.full(n, 1.0)})
+
+
+class _Wrong:
+    name = "wrong"
+    schema = pa.schema([("a", pa.float64())])
+    gated = False
+
+    def reduce(self, batch):
+        return pa.table({"z": np.zeros(batch.queries.size)})
+
+
+def test_reducers_see_the_same_plan_in_memory_spilled_and_in_workers(tmp_root, tmp_path):
+    """On disk the plan was rebuilt from the query table, without the
+    targets' other columns and with default settings."""
+    from constellation.massspec.sweep import ChannelSettings
+
+    run, bundle, _ = _run("dia", tmp_root)
+    targets = _targets(run).set_column(
+        _targets(run).schema.get_field_index("scan"), "scan", pa.array(range(run.targets.num_rows), pa.int32())
+    )
+    settings = ChannelSettings(n_isotopes=2, charge_range=(2, 3), max_fragment_charge=1)
+    plan = compile_queries(targets, levels=[1, 2], channels=settings, rt_window=20.0)
+    tol = {1: (20.0, "ppm"), 2: (0.35, "Da")}
+    base = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[_PlanProbe()]).table("probe")
+    assert base.column("scan").null_count == 0 and base.column("rt_center").null_count == 0
+    spilled = sweep(bundle, plan, SweepSettings(tolerances=tol, memory_rows=10, run_rows=50),
+                    reducers=[_PlanProbe()])  # fmt: skip
+    assert spilled.matches is None
+    assert spilled.table("probe").equals(base)
+    for workers in (1, 3):
+        got = sweep(bundle, plan, SweepSettings(tolerances=tol, reduce_rows=50), reducers=[_PlanProbe()],
+                    workers=workers, work_dir=tmp_path / f"w{workers}")  # fmt: skip
+        assert got.table("probe").equals(base)
+
+
+def test_outputs_are_bound_to_their_schema_by_name(tmp_root, tmp_path):
+    """Columns returned in another order were written swapped, on disk."""
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    tol = {2: (0.35, "Da")}
+    for kw in ({}, dict(workers=2, work_dir=tmp_path / "w")):
+        result = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[_Swapped()], **kw)
+        for table in (result.table("swapped"), pq.read_table(result.write("swapped", tmp_path / "out.parquet"))):
+            assert set(table.column("a").to_pylist()) == {1.0} and set(table.column("b").to_pylist()) == {2.0}
+    with pytest.raises(ValueError, match="reducer 'wrong'.*missing \\['a'\\].*not in its schema \\['z'\\]"):
+        sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[_Wrong()])
+
+
+def test_a_scan_without_a_retention_time_leaves_the_others_matched(tmp_root):
+    """One NaN retention time made the block's min/max NaN, and no query
+    was active at that level for the whole block."""
+    run, _, peaks = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
+    base = _traces(peaks, plan)
+    rt = peaks.column("rt").to_numpy().copy()
+    first_ms2 = int(np.flatnonzero(peaks.column("level").to_numpy() == 2)[0])
+    lost_scan = peaks.column("scan")[first_ms2].as_py()
+    rt[peaks.column("scan").to_numpy() == lost_scan] = np.nan
+    with_nan = peaks.set_column(peaks.schema.get_field_index("rt"), "rt", pa.array(rt))
+    got = _traces(with_nan, plan, block_rows=1 << 30)
+    keep = pc.not_equal(base.column("scan"), lost_scan)
+    assert got.num_rows == base.filter(keep).num_rows > 0
+
+
+def test_a_table_of_points_past_memory_rows_is_refused(tmp_root):
+    """A table of points is swept in memory and has no disk path to spill
+    to; it grew without bound."""
+    run, _, peaks = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    with pytest.raises(MemoryError, match="write it as a bundle"):
+        sweep(peaks, plan, SweepSettings(tolerances={2: (0.35, "Da")}, memory_rows=5, block_rows=200),
+              reducers=[XicTraceReducer()])  # fmt: skip

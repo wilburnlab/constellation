@@ -12,8 +12,9 @@ exists per channel as a Python object.
 
 The channels are the m/z values the scan-major extractor always queried, value for value:
 isotopes from the binned :func:`~constellation.massspec.peptide.envelope.peptide_envelope`
-at each charge of ``charge_range`` (or the target's own charge), or spaced
-off a bare precursor m/z; fragments from the batched ladder, up to the
+at the target's own charge (or at each charge of ``charge_range`` when one
+is asked for, and of ``fallback_charge_range`` for a target with no
+charge), or spaced off a bare precursor m/z; fragments from the batched ladder, up to the
 lower of ``max_fragment_charge`` and the precursor's charge. Two things
 differ from that extractor, both on purpose: a target with a sequence and a
 charge but no precursor m/z has one computed, so its fragments are gated by
@@ -27,6 +28,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+
+import json
 
 import numpy as np
 import pyarrow as pa
@@ -49,12 +52,16 @@ __all__ = [
     "ChannelSettings",
     "Channels",
     "QueryPlan",
+    "check_rt_window",
     "compile_queries",
 ]
 
 #: Channel kinds: precursor isotopes are matched in MS1 scans, fragments in the rest.
 ISOTOPES = 1
 FRAGMENTS = 2
+
+#: Where a written plan keeps its ``ChannelSettings`` (channel table metadata).
+_SETTINGS_KEY = b"x.massspec.sweep.channel_settings"
 
 
 @dataclass(frozen=True)
@@ -67,16 +74,64 @@ class ChannelSettings:
     #: offsets (M−1, M−2) are for labelled peptides, whose incomplete
     #: labelling puts intensity below the fully labelled mass.
     isotope_offsets: tuple[int, ...] | None = None
-    #: Charges to look for each sequence at in MS1; None for the target's own.
-    charge_range: tuple[int, int] | None = (1, 4)
+    #: Charges to look for every target at in MS1, for the evidence of an
+    #: analyte across its charge states (a peptide's precursors then share
+    #: their MS1 channels). None (the default) is each target's own charge
+    #: (PI, 2026-11-07; until then (1, 4) was the default for every target).
+    charge_range: tuple[int, int] | None = None
+    #: The charges a target with no charge of its own is looked for at in
+    #: MS1, when ``charge_range`` is not given.
+    fallback_charge_range: tuple[int, int] = (1, 4)
     ion_types: tuple[IonType, ...] = (IonType.B, IonType.Y)
     max_fragment_charge: int = 2
     neutral_losses: tuple[str, ...] | None = None
 
+    def __post_init__(self) -> None:
+        if self.offsets() == ():
+            raise ValueError(
+                "the isotope selection is empty (n_isotopes < 1 or no isotope_offsets): MS1 would have no "
+                "channels; leave level 1 out of the levels instead"
+            )
+        for name in ("charge_range", "fallback_charge_range"):
+            value = getattr(self, name)
+            if value is not None and not (len(value) == 2 and 1 <= int(value[0]) <= int(value[1])):
+                raise ValueError(f"{name} must be (low, high) with 1 <= low <= high; got {value!r}")
+        if int(self.max_fragment_charge) < 1:
+            raise ValueError(f"max_fragment_charge must be >= 1; got {self.max_fragment_charge}")
+        if not self.ion_types:
+            raise ValueError("ion_types must name at least one ion series")
+
     def offsets(self) -> tuple[int, ...]:
         if self.isotope_offsets is not None:
             return tuple(sorted(set(int(k) for k in self.isotope_offsets)))
-        return tuple(range(self.n_isotopes))
+        return tuple(range(int(self.n_isotopes)))
+
+    def to_dict(self) -> dict:
+        """The settings as plain data (JSON), for a plan written to disk."""
+        return {
+            "n_isotopes": int(self.n_isotopes),
+            "isotope_offsets": None if self.isotope_offsets is None else [int(k) for k in self.isotope_offsets],
+            "charge_range": None if self.charge_range is None else [int(z) for z in self.charge_range],
+            "fallback_charge_range": [int(z) for z in self.fallback_charge_range],
+            "ion_types": [IonType(t).name for t in self.ion_types],
+            "max_fragment_charge": int(self.max_fragment_charge),
+            "neutral_losses": None if self.neutral_losses is None else list(self.neutral_losses),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ChannelSettings:
+        def pair(v):
+            return None if v is None else (int(v[0]), int(v[1]))
+
+        return cls(
+            n_isotopes=int(d["n_isotopes"]),
+            isotope_offsets=None if d["isotope_offsets"] is None else tuple(int(k) for k in d["isotope_offsets"]),
+            charge_range=pair(d["charge_range"]),
+            fallback_charge_range=pair(d["fallback_charge_range"]),
+            ion_types=tuple(IonType[name] for name in d["ion_types"]),
+            max_fragment_charge=int(d["max_fragment_charge"]),
+            neutral_losses=None if d["neutral_losses"] is None else tuple(d["neutral_losses"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -168,30 +223,76 @@ class QueryPlan:
         meta[b"x.massspec.sweep.loss_ids"] = ",".join(
             self.fragments.loss_ids if self.fragments is not None else ()
         ).encode()
+        meta[_SETTINGS_KEY] = json.dumps(self.settings.to_dict()).encode()
         return queries, channels.replace_schema_metadata(meta)
 
+    def write(self, directory) -> None:
+        """Write the plan as ``queries.parquet``, ``channels.parquet`` and
+        ``targets.parquet`` (the whole target table, every column a
+        reducer may read) in ``directory``: what a sweep on disk hands its
+        worker processes, so they see the plan a sweep in memory does."""
+        from pathlib import Path
+
+        import pyarrow.parquet as pq
+
+        d = Path(directory)
+        d.mkdir(parents=True, exist_ok=True)
+        queries, channels = self.to_tables()
+        for name, table in (("queries", queries), ("channels", channels), ("targets", self.targets)):
+            tmp = d / f".{name}.parquet.tmp"
+            pq.write_table(table, tmp)
+            tmp.replace(d / f"{name}.parquet")
+
     @classmethod
-    def from_tables(cls, queries: pa.Table, channels: pa.Table) -> QueryPlan:
-        """Rebuild a plan written by :meth:`to_tables`."""
+    def read(cls, directory) -> QueryPlan:
+        """A plan written by :meth:`write`."""
+        from pathlib import Path
+
+        import pyarrow.parquet as pq
+
+        d = Path(directory)
+        return cls.from_tables(
+            pq.read_table(d / "queries.parquet"),
+            pq.read_table(d / "channels.parquet"),
+            pq.read_table(d / "targets.parquet"),
+        )
+
+    @classmethod
+    def from_tables(cls, queries: pa.Table, channels: pa.Table, targets: pa.Table | None = None) -> QueryPlan:
+        """Rebuild a plan written by :meth:`to_tables`, with its targets
+        (``plan.targets``) when given. Without them the targets are what
+        the query table holds, which leaves out their retention-time
+        columns, scan and anything else a reducer may read (as a plan on
+        disk did until 2026-11-07, so reducers there saw another plan)."""
         meta = channels.schema.metadata or {}
         levels = tuple(int(x) for x in meta[b"x.massspec.sweep.levels"].decode().split(",") if x)
         loss_text = meta.get(b"x.massspec.sweep.loss_ids", b"").decode()
         loss_ids = tuple(x for x in loss_text.split(",") if x)
-        n = queries.num_rows
-        targets = cast_to_schema(
-            pa.table(
-                {
-                    "target_id": queries.column("target_id"),
-                    "modified_sequence": queries.column("modified_sequence"),
-                    "precursor_charge": queries.column("precursor_charge"),
-                    "precursor_mz": queries.column("precursor_mz"),
-                    "precursor_id": queries.column("precursor_id"),
-                    "peptide_id": queries.column("peptide_id"),
-                    "is_decoy": queries.column("is_decoy"),
-                }
-            ),
-            XIC_TARGET_TABLE,
+        settings = (
+            ChannelSettings.from_dict(json.loads(meta[_SETTINGS_KEY].decode()))
+            if _SETTINGS_KEY in meta
+            else ChannelSettings()
         )
+        n = queries.num_rows
+        if targets is not None:
+            if targets.num_rows != n:
+                raise ValueError(f"{targets.num_rows} targets for a plan of {n} queries")
+            targets = cast_to_schema(targets, XIC_TARGET_TABLE)
+        else:
+            targets = cast_to_schema(
+                pa.table(
+                    {
+                        "target_id": queries.column("target_id"),
+                        "modified_sequence": queries.column("modified_sequence"),
+                        "precursor_charge": queries.column("precursor_charge"),
+                        "precursor_mz": queries.column("precursor_mz"),
+                        "precursor_id": queries.column("precursor_id"),
+                        "peptide_id": queries.column("peptide_id"),
+                        "is_decoy": queries.column("is_decoy"),
+                    }
+                ),
+                XIC_TARGET_TABLE,
+            )
         kinds = channels.column("kind").to_numpy()
 
         def of(kind: int, ids: tuple[str, ...]) -> Channels:
@@ -208,6 +309,7 @@ class QueryPlan:
             assigned_scan=queries.column("assigned_scan").fill_null(-1).to_numpy().astype(np.int64),
             isotopes=of(ISOTOPES, ()) if 1 in levels else None,
             fragments=of(FRAGMENTS, loss_ids) if any(level >= 2 for level in levels) else None,
+            settings=settings,
         )
 
 
@@ -299,6 +401,33 @@ def _rt_bounds(t: pa.Table, rt_window: float | None) -> tuple[np.ndarray, np.nda
     return np.where(np.isnan(lo), -np.inf, lo), np.where(np.isnan(hi), np.inf, hi)
 
 
+def check_rt_window(targets: pa.Table) -> None:
+    """Raise ``ValueError`` when an RT window cannot be drawn for these
+    targets. A window is drawn around ``rt_center``, which is in the
+    run's own seconds; a target whose only time is a library's on a
+    model's scale (``rt_library`` on ``rt_scale``) has none, and
+    windowing it would gate on the wrong clock. Refused rather than done,
+    or silently widened to the whole run."""
+    import pyarrow.compute as pc
+
+    t = cast_to_schema(targets, XIC_TARGET_TABLE)
+    scale = t.column("rt_scale")
+    model = pc.and_(
+        pc.and_(pc.is_valid(scale), pc.not_equal(pc.fill_null(scale, ""), "observed")),
+        pc.and_(pc.is_valid(t.column("rt_library")), pc.is_null(t.column("rt_center"))),
+    )
+    explicit = pc.and_(pc.is_valid(t.column("rt_start")), pc.is_valid(t.column("rt_end")))
+    model = pc.and_(model, pc.invert(explicit))
+    n = pc.sum(model).as_py() or 0
+    if n:
+        scales = sorted(set(scale.filter(model).to_pylist()))
+        raise ValueError(
+            f"{n} targets carry retention times on {', '.join(scales)}, not this run's seconds: an "
+            f"RT window cannot be drawn around them until they are mapped onto the run (calibration "
+            f"comes with the search); drop the RT window, or give rt_start / rt_end"
+        )
+
+
 def compile_queries(
     targets: pa.Table,
     *,
@@ -367,6 +496,8 @@ def compile_queries(
                 pmz[i] = _precursor_mz(pf(modseq[i]), charge=int(charge_in[i]))
                 derived[i] = True
 
+    if rt_window is not None:
+        check_rt_window(t)
     rt_lo, rt_hi = _rt_bounds(t, rt_window)
     scan_in = d["scan"]
     assigned = np.array(
@@ -412,10 +543,8 @@ def _isotopes(d: dict, n: int, settings: ChannelSettings, pf) -> Channels:
             elif charge is not None:
                 charges = [int(charge)]
             else:
-                raise ValueError(
-                    f"target {d['target_id'][i]}: MS1 extraction needs a charge "
-                    "(charge_range or precursor_charge)"
-                )
+                lo, hi = settings.fallback_charge_range
+                charges = list(range(lo, hi + 1))
             for z in charges:
                 key = (modseq, z)
                 if key not in envelopes:
@@ -506,10 +635,10 @@ def _fragments(
     query = np.repeat(np.arange(n, dtype=np.int64), counts)
     ion_type = ladder.ion_type[take]
     position = ladder.position[take]
-    # Rank of (ion type, position) within each query: one bond seen at two
-    # charges or with a loss is one piece of evidence.
-    bond = (query << 24) | (ion_type.astype(np.int64) << 16) | position.astype(np.int64)
-    distinct, key = np.unique(bond, return_inverse=True)
+    # Rank of (ion type, position) within each query: one fragment ion seen
+    # at two charges or with a loss is one piece of evidence.
+    ion = (query << 24) | (ion_type.astype(np.int64) << 16) | position.astype(np.int64)
+    distinct, key = np.unique(ion, return_inverse=True)
     first = np.searchsorted(distinct, np.arange(n, dtype=np.int64) << 24)
     evidence = (key - first[query]).astype(np.int32)
     return Channels(

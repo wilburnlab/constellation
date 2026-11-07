@@ -10,7 +10,8 @@ from pathlib import Path
 # ── chromatogram (XIC extraction) ────────────────────────────────────────
 
 
-_DEFAULT_CHARGE_RANGE = (1, 4)
+#: The charges a target with no charge of its own is looked for at in MS1.
+_FALLBACK_CHARGE_RANGE = (1, 4)
 _DEFAULT_N_ISOTOPES = 3
 _DEFAULT_MAX_FRAG_CHARGE = 2
 
@@ -120,14 +121,15 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
     gateg = p.add_argument_group(
         "evidence gate (sweep; any of these turns it on)",
         "A target counts as seen when a run of its MS2 scans each match enough distinct "
-        "fragment bonds among the scan's most intense peaks. At low-resolution tolerances "
+        "fragment ions among the scan's most intense peaks. At low-resolution tolerances "
         "a bare count passes almost anything; see the summary's counts to set it.",
     )
     gateg.add_argument("--gate", action="store_true",
-                       help="Turn the gate on with its defaults (6 bonds among each scan's 50 most "
+                       help="Turn the gate on with its defaults (6 fragment ions among each scan's 50 most "
                             "intense peaks, 3 scans in a row).")
     gateg.add_argument("--min-fragments", type=int, default=None,
-                       help="Distinct fragment bonds a scan must show (default 6).")
+                       help="Distinct fragment ions (type and number, any charge or loss) a scan "
+                            "must show (default 6).")
     gateg.add_argument("--evidence-top-peaks", type=int, default=None,
                        help="Count only each scan's most intense N peaks; 0 for all (default 50).")
     gateg.add_argument("--min-consecutive-scans", type=int, default=None,
@@ -157,14 +159,15 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
     ms1g.add_argument("--n-isotopes", type=int, default=_DEFAULT_N_ISOTOPES,
                       help="Isotope peaks M+0..M+(n-1) (default 3).")
     ms1g.add_argument("--charge-range", type=int, nargs=2, metavar=("LO", "HI"), default=None,
-                      help="Precursor charge sweep: every target is matched in MS1 at each "
-                           "charge LO..HI (default 1 4). Counter models a peptide across "
-                           "charges and wants this.")
+                      help="Match every target in MS1 at each charge LO..HI: the evidence for an "
+                           "analyte across its charge states, as when one precursor of a "
+                           "peptide was identified and its others are wanted too (a peptide's "
+                           "precursors then share their MS1 channels). Counter models a peptide "
+                           "across charges and wants --charge-range 1 4. Default: each target "
+                           "at its own charge, and 1-4 for a target with none.")
     ms1g.add_argument("--own-charge", action="store_true",
-                      help="Match each target in MS1 at its own charge only: one query per "
-                           "precursor and no copies of a peptide's MS1 channels across its "
-                           "precursors (what a search space's targets want). Every target "
-                           "needs a charge.")
+                      help="Match each target in MS1 at its own charge (the default since "
+                           "2026-11-07; accepted for scripts that pass it).")
 
     ms2g = p.add_argument_group("MS2 fragment options (with --level 2 or both)")
     ms2g.add_argument("--ion-types", default="b,y",
@@ -274,16 +277,26 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
 
     _warn_level_flag_mismatch(args)
     targets = load_targets(args.targets)
+    if args.rt_window is not None:
+        from constellation.massspec.sweep.queries import check_rt_window
+
+        try:
+            check_rt_window(targets)
+        except ValueError as exc:
+            print(f"error: --rt-window: {exc}", file=sys.stderr)
+            return 2
     if args.own_charge and args.charge_range is not None:
         print("error: --own-charge and --charge-range contradict each other", file=sys.stderr)
         return 2
-    charge_range = None if args.own_charge else tuple(args.charge_range or _DEFAULT_CHARGE_RANGE)
-    if args.own_charge and 1 in levels:
-        missing = targets.column("precursor_charge").null_count
-        if missing:
-            print(f"error: --own-charge needs every target's charge; {missing} have none",
-                  file=sys.stderr)  # fmt: skip
-            return 2
+    charge_range = tuple(args.charge_range) if args.charge_range is not None else None
+    if 1 in levels and not args.no_progress:
+        if charge_range is not None:
+            print(f"MS1: every target at charges {charge_range[0]}-{charge_range[1]}", file=sys.stderr)
+        else:
+            none = targets.column("precursor_charge").null_count
+            lo, hi = _FALLBACK_CHARGE_RANGE
+            print(f"MS1: {targets.num_rows - none} targets at their own charge"
+                  + (f", {none} without one at charges {lo}-{hi}" if none else ""), file=sys.stderr)  # fmt: skip
     ion_types = _resolve_ion_types(args.ion_types)
     neutral_losses = _parse_downcast(args.neutral_losses) if args.neutral_losses else None
 

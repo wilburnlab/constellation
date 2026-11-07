@@ -161,7 +161,10 @@ class SweepResult:
         with pq.ParquetWriter(tmp, schema) as writer:
             for f in self.parts[name]:
                 for batch in pq.ParquetFile(f).iter_batches():
-                    writer.write_batch(pa.RecordBatch.from_arrays(batch.columns, schema=schema))
+                    # By name, not position.
+                    writer.write_batch(
+                        pa.RecordBatch.from_arrays([batch.column(c.name).cast(c.type) for c in schema], schema=schema)
+                    )
         tmp.replace(out)
         return out
 
@@ -336,12 +339,16 @@ def _map_block(block: _Block, plan: QueryPlan, settings: SweepSettings) -> _MapO
         if channels is None or channels.n == 0:
             continue
         rows = np.flatnonzero(block.level == level)
-        if rows.size == 0:
+        timed = rows[~np.isnan(block.rt[rows])]
+        if timed.size == 0:
+            # A scan without a retention time is never eligible
+            # (pair_eligible); one of them used to make min/max NaN and
+            # leave every scan of the level in the block unmatched.
             continue
         tolerance, unit = settings.tolerance(level)
         counts = channels.counts()
         active = active_queries(
-            plan.rt_lo, plan.rt_hi, counts > 0, float(block.rt[rows].min()), float(block.rt[rows].max())
+            plan.rt_lo, plan.rt_hi, counts > 0, float(block.rt[timed].min()), float(block.rt[timed].max())
         )
         groups = isolation_groups(
             active, plan.precursor_mz, block.lower[rows], block.upper[rows], rows, gate=level > 1
@@ -443,9 +450,29 @@ def _batch(plan, queries, out: _MapOut, ledger, order, settings, shared) -> Quer
     return replace(batch, decision=decision)
 
 
+def _conform(table: pa.Table, schema: pa.Schema, who: str) -> pa.Table:
+    """``table`` as ``schema``: the same column names, in its order and
+    types. A missing or extra column is the reducer's mistake and is
+    refused, naming it; columns are matched by name, never by position
+    (a reducer returning two columns in another order had them written
+    swapped until 2026-11-07)."""
+    names, want = set(table.column_names), set(schema.names)
+    if names != want:
+        missing, extra = sorted(want - names), sorted(names - want)
+        raise ValueError(
+            f"reducer {who!r} returned a table that is not its schema"
+            + (f"; missing {missing}" if missing else "")
+            + (f"; not in its schema {extra}" if extra else "")
+        )
+    try:
+        return pa.table([table.column(f.name).cast(f.type) for f in schema], schema=schema)
+    except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError) as exc:
+        raise ValueError(f"reducer {who!r} returned columns its schema does not take: {exc}") from exc
+
+
 def _reduce(batch: QueryBatch, reducers: Sequence[Reducer]) -> list[pa.Table]:
     passing = batch.passing() if any(r.gated for r in reducers) else None
-    return [r.reduce(passing if r.gated else batch) for r in reducers]
+    return [_conform(r.reduce(passing if r.gated else batch), r.schema, r.name) for r in reducers]
 
 
 def sweep(
@@ -477,7 +504,17 @@ def sweep(
         if workers > 1 or work_dir is not None:
             raise ValueError("a table of points is swept in memory; give a bundle to use workers")
         blocks, ledger = _table_blocks(source, settings.block_rows, plan.levels)
-        out = _MapOut.concat([_map_block(b, plan, settings) for b in blocks])
+        parts, held = [], 0
+        for b in blocks:
+            parts.append(_map_block(b, plan, settings))
+            held += parts[-1].matches.n
+            if held > settings.memory_rows:
+                # A table of points has no disk path to carry on along.
+                raise MemoryError(
+                    f"over {settings.memory_rows} matches from a table of points, which is swept in memory: "
+                    f"write it as a bundle to sweep it on disk, or raise memory_rows"
+                )
+        out = _MapOut.concat(parts)
         return _reduce_in_memory(out, plan, ledger, settings, reducers, None)
     bundle = Path(source)
     read_bundle_manifest(bundle)
@@ -576,10 +613,7 @@ def _worker_plan(work: Path) -> QueryPlan:
     key = f"plan:{work}"
     if key not in _WORKER:
         _WORKER.clear()
-        _WORKER[key] = QueryPlan.from_tables(
-            pq.read_table(work / "plan" / "queries.parquet"),
-            pq.read_table(work / "plan" / "channels.parquet"),
-        )
+        _WORKER[key] = QueryPlan.read(work / "plan")
     return _WORKER[key]  # type: ignore[return-value]
 
 
@@ -849,9 +883,7 @@ def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progre
     for sub in ("matches", "evidence", "claims", "shared", "scans", "reduce"):
         if (work / sub).exists():
             shutil.rmtree(work / sub)
-    queries, channels = plan.to_tables()
-    _write(queries, work / "plan" / "queries.parquet")
-    _write(channels, work / "plan" / "channels.parquet")
+    plan.write(work / "plan")
     axis = _load_axis(bundle, settings)
     shards = scan_range_shards(bundle, target_rows=settings.shard_rows) if resume is None else [None]
     pool = (

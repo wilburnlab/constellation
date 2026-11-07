@@ -72,7 +72,7 @@ SWEEP_CHANNEL_TABLE: pa.Schema = pa.schema(
         pa.field("abundance", pa.float32(), nullable=True),
         # What a match counts as evidence for: the isotope, or the rank of
         # the fragment's (ion type, position) within the query, so that one
-        # bond seen at two charges counts once.
+        # fragment ion seen at two charges or with a loss counts once.
         pa.field("evidence_key", pa.int32(), nullable=False),
     ],
     metadata=_meta("SweepChannel"),
@@ -165,7 +165,7 @@ SWEEP_QUERY_SUMMARY_TABLE: pa.Schema = pa.schema(
         pa.field("longest_run", pa.int32(), nullable=True),
         pa.field("best_scan", pa.int32(), nullable=True),
         pa.field("best_rt", pa.float64(), nullable=True),
-        # Distinct bonds (or isotopes) at the best scan.
+        # Distinct fragment ions (or isotopes) at the best scan.
         pa.field("best_n_keys", pa.int32(), nullable=True),
         # Scans each level could have matched it in, and cells matched.
         pa.field("n_eligible_ms1", pa.int32(), nullable=False),

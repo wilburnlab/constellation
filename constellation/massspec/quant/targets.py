@@ -47,6 +47,9 @@ from constellation.core.io.schemas import cast_to_schema
 from constellation.massspec.quant.schemas import XIC_TARGET_TABLE
 
 __all__ = [
+    "OBSERVED",
+    "RT_SCALE_KEY",
+    "library_rt_scale",
     "targets_from_library",
     "targets_from_search",
     "targets_from_precursor_quant",
@@ -81,26 +84,54 @@ def _attach_modseq(precursors: pa.Table, peptides: pa.Table | None) -> pa.Table:
     return joined.take(pc.sort_indices(joined.column(row))).drop_columns([row])
 
 
+#: Where a library states the clock of its ``rt_predicted``.
+RT_SCALE_KEY = "x.massspec.prediction.rt_scale"
+#: The scale of a run's own seconds (a chromatogram library's times).
+OBSERVED = "observed"
+
+
+def library_rt_scale(metadata: dict) -> str | None:
+    """The clock a library's ``rt_predicted`` is on, as it says: a model's
+    scale (``chronologer_hi_seconds``, ``koina:<model>:irt``, ``irt``),
+    ``observed`` (seconds of the runs a chromatogram library came from),
+    or None when it does not say (taken as run seconds, which is what the
+    libraries that say nothing hold). Koina's older key is read too."""
+    scale = metadata.get(RT_SCALE_KEY)
+    if scale:
+        return str(scale)
+    legacy = metadata.get("x.koina.rt_scale")
+    return f"koina:{metadata.get('x.koina.rt_model', '')}:{legacy}" if legacy else None
+
+
 def targets_from_library(library: object) -> pa.Table:
     """Normalize a ``Library`` (its precursors + peptides) into targets.
 
     The general theoretical-target path: each precursor becomes a target
-    keyed by ``precursor_id``, anchored on ``precursor_mz`` with predicted
-    RT as the gating center.
+    keyed by ``precursor_id``, anchored on ``precursor_mz``. Its library
+    retention time is ``rt_library``, on the library's ``rt_scale``; it is
+    also the gating centre (``rt_center``) only when that scale is a run's
+    own seconds (``observed``, or unstated). A model's time is no run's
+    clock: until 2026-11-07 it was used as one, so a window around it
+    gated scans in the wrong place.
     """
     precursors: pa.Table = library.precursors  # type: ignore[attr-defined]
     peptides: pa.Table = library.peptides  # type: ignore[attr-defined]
     joined = _attach_modseq(precursors, peptides)
+    scale = library_rt_scale(getattr(library, "metadata_extras", {}) or {})
+    rt = _sentinel_to_null(joined.column("rt_predicted"))
+    on_run_clock = scale in (None, OBSERVED)
     out = pa.table(
         {
             "target_id": joined.column("precursor_id"),
             "modified_sequence": joined.column("modified_sequence"),
             "precursor_charge": joined.column("charge"),
             "precursor_mz": joined.column("precursor_mz"),
-            "rt_center": _sentinel_to_null(joined.column("rt_predicted")),
+            "rt_center": rt if on_run_clock else pa.nulls(joined.num_rows, pa.float64()),
             "precursor_id": joined.column("precursor_id"),
             "peptide_id": joined.column("peptide_id"),
             **({"is_decoy": joined.column("is_decoy")} if "is_decoy" in joined.column_names else {}),
+            "rt_library": rt,
+            "rt_scale": pa.array([scale] * joined.num_rows, pa.string()),
         }
     )
     return cast_to_schema(out, XIC_TARGET_TABLE)
