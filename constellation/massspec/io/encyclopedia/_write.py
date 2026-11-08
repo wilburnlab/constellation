@@ -44,8 +44,11 @@ What each table holds:
     Every peptide's proteins; a peptide with none gets an accession of
     its own (``UNMAPPED_<sequence>``).
 ``metadata``
-    The container version, this writer, and the metadata the library
-    carries from the file it was read from.
+    The container version, this writer, the metadata the library
+    carries from the file it was read from, and the clock the entries'
+    retention times are on (``constellation_rt_scale``: ``observed`` when
+    every entry holds a run's time, the library's scale when none does,
+    ``mixed:observed+<scale>`` when both, with a warning).
 ``decoyentries``, ``fragmentquants``, ``retentiontimes``,
 ``peptidelocalizations``
     Created and left empty: Constellation has nothing that fills them
@@ -132,9 +135,9 @@ def write_encyclopedia(
                 con.execute(ddl)
             names = _Names(library)
             sources = _sources(quant, search)
-            _write_entries(con, library, names, sources, quant, search, upstream)
+            n_observed, n_library = _write_entries(con, library, names, sources, quant, search, upstream)
             _write_peptidetoprotein(con, library)
-            _write_metadata(con, upstream, library.metadata_extras.get(RT_SCALE_KEY))
+            _write_metadata(con, upstream, _written_rt_scale(library, n_observed, n_library, p.name))
             if search is not None:
                 _write_peptidescores(con, library, names, sources, search, upstream)
                 _write_proteinscores(con, library, sources, search)
@@ -147,6 +150,28 @@ def write_encyclopedia(
         tmp.unlink(missing_ok=True)
         raise
     os.replace(tmp, p)
+
+
+def _written_rt_scale(library: Library, n_observed: int, n_library: int, name: str) -> str | None:
+    """The clock of the ``RTInSeconds`` written: ``observed`` when every
+    entry took a run's time, the library's own scale when none did, and
+    when some did over a library on a model's clock, a label naming both
+    (``mixed:observed+<scale>``), which nothing reads as either. Until
+    2026-11-07 the library's scale was written whatever the entries held,
+    so observed times read back as a model's."""
+    scale = library.metadata_extras.get(RT_SCALE_KEY)
+    if n_observed == 0:
+        return scale
+    if n_library == 0 or scale in (None, "", OBSERVED_RT_SCALE):
+        return OBSERVED_RT_SCALE
+    warnings.warn(
+        f"{name}: {n_observed} entries hold observed retention times and {n_library} the library's "
+        f"({scale}); a file on both clocks is labelled mixed:{OBSERVED_RT_SCALE}+{scale} and is read as "
+        f"neither (quantify every precursor, or write the library alone)",
+        UserWarning,
+        stacklevel=3,
+    )
+    return f"mixed:{OBSERVED_RT_SCALE}+{scale}"
 
 
 def _without_decoys(library: Library) -> tuple[Library, int, frozenset[int]]:
@@ -254,7 +279,9 @@ _ENTRIES_COLUMNS = (
 def _write_entries(
     con: Any, library: Library, names: _Names, sources: dict[int, str],
     quant: Quant | None, search: Search | None, upstream: dict[str, Any],
-) -> None:  # fmt: skip
+) -> tuple[int, int]:  # fmt: skip
+    """Write ``entries``; how many took an observed time and how many the
+    library's."""
     fragments = _sorted(library.fragments, ["precursor_id", "mz_theoretical"])
     frag_slices = _groups([fragments.column("precursor_id").to_numpy()])
     frag_mz = fragments.column("mz_theoretical").to_numpy(zero_copy_only=False).astype(np.float64)
@@ -290,6 +317,7 @@ def _write_entries(
 
     precursors = library.precursors
     rows: list[tuple[Any, ...]] = []
+    n_observed = 0
     for pid, peptide_id, charge, mz, rt in zip(
         precursors.column("precursor_id").to_pylist(), precursors.column("peptide_id").to_pylist(),
         precursors.column("charge").to_pylist(), precursors.column("precursor_mz").to_pylist(),
@@ -320,7 +348,8 @@ def _write_entries(
         if q is not None:
             aid = q["acquisition_id"]
             source = _source_name(sources, aid)
-            rt_seconds = q["rt_observed"] if q["rt_observed"] is not None and q["rt_observed"] >= 0 else rt
+            observed = q["rt_observed"] is not None and q["rt_observed"] >= 0
+            rt_seconds = q["rt_observed"] if observed else rt
             window = (q.get("rt_start"), q.get("rt_end"))
             c0, c1 = chrom_slices.get((pid, aid), (0, 0))
             chrom_blob, chrom_len = encode_f4(chrom_intensity[c0:c1].astype(np.float32)) if c1 > c0 else (None, None)
@@ -329,6 +358,8 @@ def _write_entries(
             source, rt_seconds, window = library_source, rt, (None, None)
             chrom_blob = chrom_len = None
             score = 0.0
+            observed = False
+        n_observed += observed
         rows.append((
             float(mz), int(charge), names.of(peptide_id, True), names.sequence[peptide_id], 1,
             float(rt_seconds), float(score), int(mz_len), mz_blob, int(intensity_len), intensity_blob,
@@ -336,6 +367,7 @@ def _write_entries(
             source,
         ))  # fmt: skip
     _sql.insert_many(con, "entries", _ENTRIES_COLUMNS, rows)
+    return n_observed, len(rows) - n_observed
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -402,6 +434,8 @@ def _write_peptidetoprotein(con: Any, library: Library) -> None:
 #: file's metadata table it is kept in, so a library written and read back
 #: still says what clock its retention times are on.
 RT_SCALE_KEY = "x.massspec.prediction.rt_scale"
+#: The scale of a run's own seconds (``massspec.quant.targets.OBSERVED``).
+OBSERVED_RT_SCALE = "observed"
 RT_SCALE_ROW = "constellation_rt_scale"
 
 _OWN_KEYS = ("version", "constellation_writer_version", "created_iso", RT_SCALE_ROW)

@@ -41,6 +41,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from constellation.core.chem.modifications import UNIMOD, ModVocab
 from constellation.core.sequence.proforma import Peptidoform
 from constellation.core.stats.units import ISOTOPE_MASS_DIFF
 from constellation.massspec.peptide.envelope import neutral_envelopes
@@ -247,6 +248,7 @@ def isotope_channels(
     settings: ChannelSettings,
     *,
     target_ids: Sequence[Any] | None = None,
+    vocab: ModVocab = UNIMOD,
 ) -> Channels:
     """Each query's precursor isotopes: for a query with a peptide
     (``peptide[q]`` an index into ``peptidoforms``, -1 for none), its
@@ -254,7 +256,7 @@ def isotope_channels(
     charge of ``settings.charge_range``, or of ``fallback_charge_range``
     for a query without one; for a bare m/z (``precursor_mz[q]``), isotopes
     spaced off it (only M+0 without a charge). ``target_ids`` name queries
-    in errors.
+    in errors; modifications are read from ``vocab``.
 
     The m/z are the binned envelope's, value for value what
     :func:`~constellation.massspec.peptide.envelope.peptide_envelope`
@@ -292,7 +294,7 @@ def isotope_channels(
 
     # One envelope per distinct peptide, all at once, put at each of its charges.
     used = np.unique(pair_peptide)
-    masses, shares = neutral_envelopes([peptidoforms[p] for p in used.tolist()], n_peaks=width)
+    masses, shares = neutral_envelopes([peptidoforms[p] for p in used.tolist()], n_peaks=width, vocab=vocab)
     env = np.searchsorted(used, pair_peptide)
     z = pair_z.astype(np.float64)
     # (mass + z·proton) / z, the envelope_mz arithmetic, elementwise.
@@ -474,6 +476,7 @@ def fragment_channels(
     *,
     key: np.ndarray | None = None,
     target_ids: Sequence[Any] | None = None,
+    vocab: ModVocab = UNIMOD,
 ) -> Channels:
     """Each query's fragment ions: for a query with a peptide
     (``peptide[q]`` into ``peptidoforms``, -1 for none), its ladder of the
@@ -483,7 +486,8 @@ def fragment_channels(
     from ``abundance`` (looked up by ``key[q]``, such as the precursor
     id); with ``settings.top_fragments`` only each query's most abundant,
     in ladder order. Ladder order is position, then ion type as given,
-    then charge, then no loss before each loss."""
+    then charge, then no loss before each loss. Modifications are read
+    from ``vocab``."""
     peptide = np.asarray(peptide, dtype=np.int64)
     charge = np.asarray(charge, dtype=np.int64)
     n = peptide.size
@@ -501,10 +505,11 @@ def fragment_channels(
         ion_types=settings.ion_types,
         max_fragment_charge=settings.max_fragment_charge,
         neutral_losses=settings.neutral_losses,
+        vocab=vocab,
     )
     model = tuple(dict.fromkeys(abundance.model_losses()))
     if model and peptides:
-        ladder = _with_model_losses(peptides, ladder, settings, model)
+        ladder = _with_model_losses(peptides, ladder, settings, model, vocab=vocab)
     lengths_used = np.fromiter((len(peptidoforms[p].sequence) for p in used.tolist()), np.int64, used.size)
     has = peptide >= 0
     which = np.where(has, np.searchsorted(used, np.where(has, peptide, used[0] if used.size else 0)), 0)
@@ -567,14 +572,16 @@ def fragment_channels(
     )
 
 
-def _with_model_losses(peptides, ladder: LadderArrays, settings: ChannelSettings, model: tuple[str, ...]) -> LadderArrays:
+def _with_model_losses(
+    peptides, ladder: LadderArrays, settings: ChannelSettings, model: tuple[str, ...], *, vocab: ModVocab = UNIMOD
+) -> LadderArrays:
     """``ladder`` with every ion carrying one of ``model``'s losses, at every
     bond, whatever the loss rules say: where an abundance source (a
     prediction) names its losses, the source, not the rules, says where
     they are (``prediction.assemble``). Rows stay in ladder order."""
     free = fragment_ladder_arrays_batch(peptides, ion_types=settings.ion_types,
                                         max_fragment_charge=settings.max_fragment_charge, neutral_losses=model,
-                                        loss_rules=False)  # fmt: skip
+                                        loss_rules=False, vocab=vocab)  # fmt: skip
     loss_ids = ladder.loss_ids + tuple(m for m in model if m not in ladder.loss_ids)
     remap = np.array([0] + [loss_ids.index(name) + 1 for name in free.loss_ids], dtype=np.int64)
     pep_r = np.repeat(np.arange(len(peptides), dtype=np.int64), np.diff(ladder.offsets))

@@ -169,3 +169,36 @@ def test_consensus_invalid_aggregate_raises():
     b = _basis()
     with pytest.raises(ValueError, match="aggregate"):
         build_consensus([_spectrum_on(b, {0: 1.0})], b, aggregate="mean")  # type: ignore[arg-type]
+
+
+def test_fragment_basis_reads_modifications_from_the_vocabulary_given():
+    """The basis moved to the shared channel generator without passing the
+    vocabulary on, so a registered custom modification raised KeyError
+    where the ladder it replaced read it (Codex review, 2026-11-07)."""
+    from constellation.core.chem.composition import Composition
+    from constellation.core.chem.modifications import UNIMOD
+    from constellation.massspec.peptide.ions import fragment_ladder
+
+    vocab = UNIMOD.subset(["UNIMOD:4", "UNIMOD:35"])
+    vocab.register_custom(id="CUSTOM:tag", name="Tag", delta_composition=Composition.from_formula("C2H3N"))
+    peptide = parse_proforma("PEPT[CUSTOM:tag]IDEK")
+    basis = fragment_basis(peptide, vocab=vocab)
+    table, _ = fragment_ladder(peptide, max_fragment_charge=2, return_tensor=False, vocab=vocab)
+    assert sorted(basis.mz_theoretical.tolist()) == sorted(table.column("mz_theoretical").to_pylist())
+
+
+def test_the_channel_generator_reads_modifications_from_the_vocabulary_given():
+    import numpy as np
+
+    from constellation.core.chem.composition import Composition
+    from constellation.core.chem.modifications import UNIMOD
+    from constellation.massspec.peptide.channels import ChannelSettings, isotope_channels
+    from constellation.massspec.peptide.envelope import peptide_envelope
+
+    vocab = UNIMOD.subset(["UNIMOD:4"])
+    vocab.register_custom(id="CUSTOM:tag", name="Tag", delta_composition=Composition.from_formula("C2H3N"))
+    peptide = parse_proforma("PEPT[CUSTOM:tag]IDEK")
+    channels = isotope_channels([peptide], np.array([0]), np.array([2]), np.array([np.nan]),
+                                ChannelSettings(), vocab=vocab)  # fmt: skip
+    mz, _ = peptide_envelope(peptide, charge=2, n_peaks=channels.n, vocab=vocab)
+    assert channels.mz.tolist() == pytest.approx(mz.tolist(), abs=0)

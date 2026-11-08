@@ -50,16 +50,26 @@ def _safe_divide(x: torch.Tensor, denom: torch.Tensor, zero: torch.Tensor) -> to
     return torch.where(ok, x / torch.where(ok, denom, torch.ones_like(denom)), torch.zeros_like(x))
 
 
+def _root(squared: torch.Tensor) -> torch.Tensor:
+    """``sqrt`` of a sum of squares, 0 where it is 0 with a gradient of 0
+    there: the square root's own gradient is infinite at 0, and a
+    ``where`` after it passes ``inf · 0 = NaN`` back (so a zero vector's
+    similarity had a NaN gradient)."""
+    positive = squared > 0
+    return torch.where(positive, torch.where(positive, squared, torch.ones_like(squared)).sqrt(),
+                       torch.zeros_like(squared))  # fmt: skip
+
+
 def _unit_lastaxis(x: torch.Tensor, reference: torch.Tensor | None = None) -> torch.Tensor:
     """``x`` divided by its L2 norm over the last axis. A norm below
     ``_RTOL`` machine epsilons of ``reference``'s norm (default ``x``'s
     own, so only an exactly zero vector) counts as zero, and the vector
     is returned as zeros."""
-    norm = x.square().sum(dim=-1, keepdim=True).sqrt()
+    norm = _root(x.square().sum(dim=-1, keepdim=True))
     if reference is None:
         zero = torch.zeros_like(norm)
     else:
-        ref = reference.square().sum(dim=-1, keepdim=True).sqrt()
+        ref = _root(reference.square().sum(dim=-1, keepdim=True))
         zero = ref * (_RTOL * torch.finfo(x.dtype).eps)
     return _safe_divide(x, norm, zero)
 
@@ -101,9 +111,9 @@ def l2_normalize(
     x_masked = x if mask is None else torch.where(mask.bool(), x, torch.zeros_like(x))
     if batch_dim:
         new_shape = [x_masked.shape[0]] + [1] * (x_masked.ndim - 1)
-        norm = x_masked.square().flatten(1).sum(1).sqrt().reshape(new_shape)
+        norm = _root(x_masked.square().flatten(1).sum(1)).reshape(new_shape)
     else:
-        norm = x_masked.square().sum().sqrt()
+        norm = _root(x_masked.square().sum())
     return _safe_divide(x_masked, norm, torch.zeros_like(norm))
 
 
@@ -367,7 +377,10 @@ def spectral_entropy_similarity(
     m = 0.5 * (a + b)
 
     def _entropy(p: torch.Tensor) -> torch.Tensor:
-        return -(p * p.clamp(min=1e-300).log()).sum(dim=-1)
+        # 0·log 0 = 0 at any dtype, gradient included (a clamp at 1e-300
+        # is 0 in float32, which made a masked or empty channel NaN).
+        some = p > 0
+        return -torch.where(some, p * torch.where(some, p, torch.ones_like(p)).log(), torch.zeros_like(p)).sum(dim=-1)
 
     sim = 1.0 - (2.0 * _entropy(m) - _entropy(a) - _entropy(b)) / math.log(4.0)
     return torch.where(a_mass & b_mass, sim, torch.zeros_like(sim))

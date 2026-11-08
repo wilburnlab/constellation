@@ -431,3 +431,60 @@ def test_a_write_that_fails_leaves_nothing_behind(tmp_path) -> None:
     with pytest.raises(ValueError, match="no precursor in the library"):
         write_encyclopedia(out, library, search=search, overwrite=True)
     assert out.read_bytes() == b"what was there" and len(list(tmp_path.iterdir())) == 1
+
+
+# ──────────────────────────────────────────────────────────────────────
+# The clock of the times written (Codex review, 2026-11-07)
+# ──────────────────────────────────────────────────────────────────────
+#
+# An entry's RTInSeconds is its observed time when the quantities give one
+# and the library's otherwise; the file was labelled with the library's
+# scale either way, so a predicted library exported with a search's
+# observed times read back as model times and lost every rt_center.
+
+_SCALE = "x.massspec.prediction.rt_scale"
+
+
+def _predicted(library):
+    from dataclasses import replace
+
+    return replace(library, metadata_extras={**library.metadata_extras, _SCALE: "chronologer_hi_seconds"})
+
+
+def _rt_centers(path):
+    from constellation.massspec.quant.targets import targets_from_library
+
+    return targets_from_library(read_encyclopedia(path).library).column("rt_center").to_pylist()
+
+
+def test_observed_times_written_over_a_predicted_library_are_labelled_observed(tmp_path: Path):
+    library, quant, _search = _toy_library_quant_search()
+    out = tmp_path / "observed.elib"
+    write_encyclopedia(out, _predicted(library), quant=quant)
+    back = read_encyclopedia(out).library
+    assert back.metadata_extras[_SCALE] == "observed"
+    assert sorted(_rt_centers(out)) == [100.0, 105.0, 200.0]
+
+
+def test_a_file_of_both_clocks_is_not_read_as_either(tmp_path: Path):
+    from constellation.massspec.quant.quant import assemble_quant
+
+    library, quant, _search = _toy_library_quant_search()
+    one = assemble_quant(
+        acquisitions=quant.acquisitions,
+        precursor_quant=[{"precursor_id": 0, "acquisition_id": 0, "intensity": 1.0, "rt_observed": 100.0,
+                          "ccs_observed": -1.0, "score": None}],  # fmt: skip
+    )
+    out = tmp_path / "mixed.elib"
+    with pytest.warns(UserWarning, match="both clocks"):
+        write_encyclopedia(out, _predicted(library), quant=one)
+    scale = read_encyclopedia(out).library.metadata_extras[_SCALE]
+    assert scale not in ("observed", "chronologer_hi_seconds") and "chronologer_hi_seconds" in scale
+    assert _rt_centers(out) == [None, None, None]
+
+
+def test_a_library_written_alone_keeps_its_own_clock(tmp_path: Path):
+    library, _quant, _search = _toy_library_quant_search()
+    out = tmp_path / "predicted.dlib"
+    write_encyclopedia(out, _predicted(library))
+    assert read_encyclopedia(out).library.metadata_extras[_SCALE] == "chronologer_hi_seconds"

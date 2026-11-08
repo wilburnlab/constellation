@@ -112,7 +112,7 @@ def fragment_basis(
         ion_types=tuple(ion_types), max_fragment_charge=max_fragment_charge,
         neutral_losses=tuple(neutral_losses) if neutral_losses else None,
     )  # fmt: skip
-    channels = fragment_channels([peptidoform], np.array([0]), np.array([-1]), settings)
+    channels = fragment_channels([peptidoform], np.array([0]), np.array([-1]), settings, vocab=vocab)
     names = [None, *channels.loss_ids]
     return FragmentBasis(
         ion_type=torch.from_numpy(channels.ion_type.astype(np.int8)),

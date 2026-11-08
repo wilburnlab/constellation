@@ -352,3 +352,49 @@ def test_a_negative_or_nan_channel_is_dropped_alike_by_every_comparison():
     counts[2] = -1.0
     got = compare_spectra(counts, r, method="multinomial_deviance", as_counts=True).item()
     assert math.isclose(got, want, abs_tol=1e-12)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_entropy_similarity_is_finite_at_every_dtype(dtype):
+    """A probability clamped at 1e-300 is 0 in float32, so a masked or
+    empty channel gave 0·log 0 = NaN there (Codex review, 2026-11-07)."""
+    masked = losses.spectral_entropy_similarity(
+        torch.tensor([1.0, 2.0, -1.0], dtype=dtype), torch.tensor([1.0, 2.0, 5.0], dtype=dtype)
+    )
+    assert masked.item() == pytest.approx(1.0, abs=1e-6)
+    sparse = torch.tensor([1.0, 0.0, 3.0], dtype=dtype)
+    assert losses.spectral_entropy_similarity(sparse, sparse, pseudocount=0.0).item() == pytest.approx(1.0, abs=1e-6)
+    assert losses.spectral_entropy_similarity(
+        sparse, torch.tensor([0.0, 2.0, 0.0], dtype=dtype), pseudocount=0.0
+    ).item() == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("name", "fn", "x", "other"),
+    [
+        ("cosine of a zero vector", losses.cosine_similarity, [0.0, 0.0, 0.0], [1.0, 2.0, 3.0]),
+        ("Pearson of a constant vector", losses.pearson_correlation, [1.0, 1.0, 1.0], [1.0, 2.0, 3.0]),
+        ("spectral angle of a zero vector", losses.spectral_angle, [0.0, 0.0, 0.0], [1.0, 2.0, 3.0]),
+        ("entropy of an unsmoothed sparse vector", lambda a, b: losses.spectral_entropy_similarity(
+            a, b, pseudocount=0.0), [1.0, 0.0, 3.0], [1.0, 2.0, 3.0]),
+    ],
+)
+def test_similarities_have_finite_gradients_at_their_degenerate_points(name, fn, x, other):
+    """The norm took sqrt(0) before the division was protected, so the
+    value was 0 and its gradient NaN (Codex review, 2026-11-07)."""
+    for dtype in (torch.float32, torch.float64):
+        a = torch.tensor(x, dtype=dtype, requires_grad=True)
+        out = fn(a, torch.tensor(other, dtype=dtype))
+        out.sum().backward()
+        assert torch.isfinite(out).all(), name
+        assert torch.isfinite(a.grad).all(), f"{name}: {a.grad}"
+
+
+def test_l2_normalize_has_a_finite_gradient_at_zero():
+    for batch_dim, shape in ((False, (3,)), (True, (2, 3))):
+        x = torch.zeros(shape, requires_grad=True)
+        losses.l2_normalize(x, batch_dim=batch_dim).sum().backward()
+        assert torch.isfinite(x.grad).all()
+    # Away from zero the gradient is the normalization's own.
+    x = torch.tensor([3.0, 4.0], dtype=torch.float64, requires_grad=True)
+    assert torch.autograd.gradcheck(lambda v: losses.l2_normalize(v), (x,))

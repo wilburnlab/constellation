@@ -473,6 +473,15 @@ def predict_library(
         meta["x.massspec.prediction.collision_energy"] = energy.describe(
             sorted({s.charge for s in sent})
         )
+    # Which ions the model speaks for, as predict_onto records it: an ion
+    # inside it with no row was predicted below the floor (abundance 0),
+    # and its charge ceiling is extraction's default (until 2026-11-07
+    # this path recorded none, so every such ion read as unknown).
+    from constellation.massspec.library.koina.predictor import fragment_capabilities
+
+    meta["x.massspec.prediction.fragment_coverage"] = fragment_capabilities(
+        overlay, min_intensity=min_intensity, fragmentation=fragmentation
+    ).fragment_coverage()
     return assemble_library(
         sent,
         response,

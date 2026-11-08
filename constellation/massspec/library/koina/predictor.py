@@ -53,7 +53,7 @@ from constellation.massspec.tokenize.vocabulary import (
     Sites,
 )
 
-__all__ = ["KoinaFragments", "KoinaRetentionTime", "koina_sequence"]
+__all__ = ["KoinaFragments", "KoinaRetentionTime", "fragment_capabilities", "koina_sequence"]
 
 _STANDARD = frozenset("ACDEFGHIKLMNPQRSTVWY")
 
@@ -112,6 +112,31 @@ class _KoinaPredictor:
         return {row: per[k] for row, k in enumerate(inverse.tolist()) if per[k] is not None}
 
 
+def fragment_capabilities(
+    overlay: Any,
+    *,
+    min_intensity: float,
+    fragmentation: str | None = None,
+    needs_collision_energy: bool = False,
+) -> Capabilities:
+    """What a Koina fragment model speaks for, from its overlay: its ion
+    series, fragment charges and losses, and its floor (an ion is kept
+    only above ``min_intensity``, ``assemble``'s rule). One record for
+    both ways Koina predicts a library, through the prediction contract
+    and ``predict_library``'s own specs path."""
+    return Capabilities(
+        property="fragments",
+        needs_charge=True,
+        needs_collision_energy=needs_collision_energy,
+        ion_types=overlay.ion_types,
+        max_fragment_charge=overlay.max_fragment_charge,
+        losses=overlay.neutral_losses,
+        fragmentation=fragmentation or overlay.fragmentation,
+        min_intensity=float(min_intensity),
+        intensity_floor="above",
+    )
+
+
 class KoinaFragments(_KoinaPredictor):
     """A Koina fragment-intensity model."""
 
@@ -130,16 +155,11 @@ class KoinaFragments(_KoinaPredictor):
         self.min_intensity = float(min_intensity)
         self.fragmentation = fragmentation or self.overlay.fragmentation
         self.instrument = instrument
-        self.capabilities = Capabilities(
-            property="fragments",
-            needs_charge=True,
-            needs_collision_energy="collision_energies" in self.declared,
-            ion_types=self.overlay.ion_types,
-            max_fragment_charge=self.overlay.max_fragment_charge,
-            losses=self.overlay.neutral_losses,
-            fragmentation=self.fragmentation,
+        self.capabilities = fragment_capabilities(
+            self.overlay,
             min_intensity=self.min_intensity,
-            intensity_floor="above",
+            fragmentation=self.fragmentation,
+            needs_collision_energy="collision_energies" in self.declared,
         )
         self.unparsed = 0
 

@@ -822,8 +822,11 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
         run_dir.mkdir(parents=True, exist_ok=True)
         marker = run_dir / "_SUCCESS" if multi else None
         run_key = stage_key(run=key, energy=energy.describe(charges_present) if energy is not None else None)
-        if marker is not None and recorded_key(run_dir) not in (None, "", run_key):
-            invalidate(run_dir)  # an energy run of other settings: redo it
+        if marker is not None and recorded_key(run_dir) not in (None, run_key):
+            # An energy run of other settings, or one whose marker carries
+            # no key and so cannot say what it holds: redo it (a keyless
+            # one was restored under this sweep's key until 2026-11-07).
+            invalidate(run_dir)
         if marker is not None and marker.exists() and args.resume:
             # Restore the completed run's summary. Skipping without it
             # drops finished energies from the aggregate manifest —
