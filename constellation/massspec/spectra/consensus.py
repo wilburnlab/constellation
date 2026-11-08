@@ -11,10 +11,12 @@ This is the shared substrate for the Part-I MS2 experiments:
     the ``Var[p̂_k] = p_k(1−p_k)/N`` mean–variance law.
 
 The builder makes **no blind-inlier assumption**: it keeps the full
-``(R, K)`` replicate matrix and reports a per-replicate *deviance-from-bulk*
-(``2·N·KL(p̂_r ‖ p̄)``, the multinomial statistic) so a screening / robust
-refinement pass can flag replicates that do not look like multinomial draws
-from the bulk. First-scope robustness comes from the ``median`` aggregate;
+``(R, K)`` replicate matrix and reports each replicate's
+*divergence-from-bulk* (``KL(p̂_r ‖ p̄)``, scale-free) and, when the
+replicates are ion counts, its *deviance-from-bulk* (``2·N·KL``, the
+multinomial G² statistic, which is only meaningful in counts) so a
+screening / robust refinement pass can flag replicates that do not look
+like multinomial draws from the bulk. First-scope robustness comes from the ``median`` aggregate;
 the iterative refinement is a separate (deferred) routine.
 
 All chemistry is reused from ``massspec.peptide`` (``fragment_ladder`` for
@@ -27,11 +29,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
+import numpy as np
 import torch
 
 from constellation.core.chem.modifications import UNIMOD, ModVocab
 from constellation.core.sequence.proforma import ProFormaResult
-from constellation.massspec.peptide.ions import IonType, fragment_ladder
+from constellation.massspec.peptide.ions import IonType
 from constellation.massspec.peptide.match import match_mz
 from constellation.massspec.spectra.similarity import multinomial_deviance
 
@@ -76,7 +79,13 @@ class ConsensusSpectrum:
     dispersion: torch.Tensor  # (K,) across-replicate std of per-replicate proportions
     n_replicates: int
     per_replicate: torch.Tensor  # (R, K) aligned replicate intensities
-    deviance_from_bulk: torch.Tensor  # (R,) 2·N·KL(p̂_r ‖ p̄) — the outlier signal
+    #: (R,) KL(p̂_r ‖ p̄): how far each replicate's proportions are from the
+    #: bulk's, in any intensity units. NaN for a replicate with no signal.
+    divergence_from_bulk: torch.Tensor
+    #: (R,) 2·N·KL(p̂_r ‖ p̄), the multinomial G² outlier statistic. It scales
+    #: with N, so it means something only when the replicates are ion counts
+    #: (``build_consensus(..., counts=True)``); None otherwise.
+    deviance_from_bulk: torch.Tensor | None
 
     @property
     def proportions(self) -> torch.Tensor:
@@ -94,24 +103,23 @@ def fragment_basis(
     vocab: ModVocab = UNIMOD,
 ) -> FragmentBasis:
     """Build the fixed channel basis for ``peptidoform`` from its theoretical
-    fragment ladder. Channel order is ``fragment_ladder`` row order (stable
-    for a given peptidoform + ion-type/charge/loss configuration)."""
-    table, _ = fragment_ladder(
-        peptidoform,
-        ion_types=ion_types,
-        max_fragment_charge=max_fragment_charge,
-        neutral_losses=neutral_losses,
-        return_tensor=False,
-        vocab=vocab,
-    )
+    fragment ladder: the channels the sweep would trace, from the one
+    generator (``massspec.peptide.channels``), in its order (position, ion
+    type, charge, loss)."""
+    from constellation.massspec.peptide.channels import ChannelSettings, fragment_channels
+
+    settings = ChannelSettings(
+        ion_types=tuple(ion_types), max_fragment_charge=max_fragment_charge,
+        neutral_losses=tuple(neutral_losses) if neutral_losses else None,
+    )  # fmt: skip
+    channels = fragment_channels([peptidoform], np.array([0]), np.array([-1]), settings, vocab=vocab)
+    names = [None, *channels.loss_ids]
     return FragmentBasis(
-        ion_type=torch.tensor(table.column("ion_type").to_pylist(), dtype=torch.int8),
-        position=torch.tensor(table.column("position").to_pylist(), dtype=torch.int32),
-        charge=torch.tensor(table.column("charge").to_pylist(), dtype=torch.int32),
-        loss_id=tuple(table.column("loss_id").to_pylist()),
-        mz_theoretical=torch.tensor(
-            table.column("mz_theoretical").to_pylist(), dtype=torch.float64
-        ),
+        ion_type=torch.from_numpy(channels.ion_type.astype(np.int8)),
+        position=torch.from_numpy(channels.position.astype(np.int32)),
+        charge=torch.from_numpy(channels.fragment_charge.astype(np.int32)),
+        loss_id=tuple(names[int(k)] for k in channels.loss),
+        mz_theoretical=torch.from_numpy(channels.mz.astype(np.float64)),
     )
 
 
@@ -175,6 +183,7 @@ def build_consensus(
     tolerance: float = 20.0,
     tolerance_unit: Literal["ppm", "Da"] = "ppm",
     deviance_pseudocount: float = 0.0,
+    counts: bool = False,
 ) -> ConsensusSpectrum:
     """Align every replicate ``(obs_mz, obs_intensity)`` to ``basis`` and
     aggregate per channel.
@@ -190,9 +199,13 @@ def build_consensus(
     ``proportions`` property gives the simplex regardless of this flag.
 
     Returns the aggregate plus the retained ``per_replicate`` ``(R, K)``
-    matrix and the per-replicate ``deviance_from_bulk`` ``(R,)`` (the
-    multinomial outlier signal vs the bulk consensus proportions). No
-    replicate is screened here — that is a deliberate downstream choice."""
+    matrix and the per-replicate ``divergence_from_bulk`` ``(R,)`` (each
+    replicate's proportions against the bulk consensus's). With
+    ``counts=True`` — the spectra are ion counts, not intensities — it also
+    gives ``deviance_from_bulk``, the multinomial G² statistic, which
+    scales with the counts and so would be arbitrary on intensities (it
+    was computed on whatever was passed until 2026-11-07). No replicate
+    is screened here — that is a deliberate downstream choice."""
     if len(spectra) == 0:
         raise ValueError("build_consensus needs at least one spectrum")
 
@@ -219,17 +232,23 @@ def build_consensus(
     rep_props = per_replicate / rep_totals  # (R, K)
     dispersion = rep_props.std(dim=0, unbiased=False)
 
-    # Per-replicate deviance from the bulk consensus proportions — the
-    # outlier-from-bulk signal a screening pass would threshold. Default
+    # Per-replicate divergence from the bulk consensus proportions — the
+    # outlier-from-bulk signal a screening pass would threshold. G² is
+    # 2·N·KL, so KL is G²/(2N) whatever the units. Default
     # ``deviance_pseudocount=0`` so identical replicates score exactly 0
     # (the eps-clamp inside ``multinomial_deviance`` keeps it NaN-free even
     # when a replicate carries signal on a channel the bulk leaves empty).
     bulk_prop = intensity / intensity.sum().clamp(min=1e-12)
-    deviance_from_bulk = multinomial_deviance(
+    g2 = multinomial_deviance(
         per_replicate,
         bulk_prop.expand_as(per_replicate),
         pseudocount=deviance_pseudocount,
     )
+    totals = per_replicate.sum(dim=1)
+    divergence_from_bulk = torch.where(
+        totals > 0, g2 / (2.0 * totals.clamp(min=1e-300)), torch.full_like(g2, float("nan"))
+    )
+    deviance_from_bulk = g2 if counts else None
 
     if normalize:
         intensity = intensity / intensity.sum().clamp(min=1e-12)
@@ -240,5 +259,6 @@ def build_consensus(
         dispersion=dispersion,
         n_replicates=r,
         per_replicate=per_replicate,
+        divergence_from_bulk=divergence_from_bulk,
         deviance_from_bulk=deviance_from_bulk,
     )

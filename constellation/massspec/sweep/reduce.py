@@ -2,25 +2,35 @@
 
 The sweep's map reads scans and writes matches; once it is done, each
 query's matches are complete, whichever scans (and workers) they came
-from, and a :class:`Reducer` turns a :class:`QueryBatch` of them into a
-table. This is the hook the scorer plugs into. A reducer that needs to
-know which cells could have matched but did not (to zero-fill a trace,
-or to count a non-detection) asks :meth:`QueryBatch.eligible`, which uses
-the same schedule the map did.
+from, and a :class:`Reducer` turns a :class:`QueryBatch` of them into one
+table or several. This is the hook the scorer plugs into. What a reducer
+reads: :meth:`QueryBatch.cells`, every cell a query could have matched in
+(its channels in each scan it was eligible for) with what matched there,
+each channel's identity and abundance, and each scan's time, TIC and
+injection time; :meth:`QueryBatch.eligible` for the (scan, query) pairs
+alone, from the same schedule the map used.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 import pyarrow as pa
 
 from constellation.massspec.sweep.evidence import Decision, Evidence
-from constellation.massspec.sweep.queries import QueryPlan
-from constellation.massspec.sweep.schedule import isolation_groups, pair_eligible, ragged_arange
+from constellation.massspec.sweep.queries import Channels, QueryPlan
+from constellation.massspec.sweep.schedule import (
+    WindowIndex,
+    eligible_pairs,
+    pair_eligible,
+    ragged_arange,
+    window_index,
+)
 from constellation.massspec.sweep.schemas import (
+    SWEEP_CELL_TABLE,
     SWEEP_MATCH_TABLE,
     SWEEP_QUERY_SUMMARY_TABLE,
     SWEEP_SCAN_TABLE,
@@ -29,7 +39,7 @@ from constellation.massspec.sweep.schemas import (
 if TYPE_CHECKING:
     from constellation.massspec.sweep.engine import SweepSettings
 
-__all__ = ["Ledger", "Matches", "QueryBatch", "Reducer", "QuerySummaryReducer"]
+__all__ = ["Cells", "Ledger", "Matches", "QueryBatch", "Reducer", "QuerySummaryReducer"]
 
 
 @dataclass(frozen=True)
@@ -42,10 +52,44 @@ class Ledger:
     lower: np.ndarray  # float64, NaN without bounds
     upper: np.ndarray
     n_points: np.ndarray  # int64
+    #: Each scan's total ion current and ion injection time (ms), NaN where
+    #: the bundle records none (and for a table of points).
+    tic: np.ndarray | None = None
+    iit: np.ndarray | None = None
+    #: Built on first use: each level's WindowIndex (eligibility is
+    #: decided on it at every call, so it is built once, not regrouped).
+    _cache: dict = field(default_factory=dict, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        for name in ("tic", "iit"):
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, np.full(self.scan.size, np.nan))
 
     @property
     def n(self) -> int:
         return int(self.scan.size)
+
+    def window_index(self, level: int) -> WindowIndex:
+        """The level's scans with points and a time, by isolation window
+        (MS1 as one unbounded window). Keyed by the points the map has
+        recorded, so an index is never used before they are all in."""
+        key = ("windows", int(level), int(self.n_points.sum()), self.n)
+        found = self._cache.get(key)
+        if found is None:
+            found = window_index(self.scan, self.level, self.rt, self.lower, self.upper, self.n_points,
+                                 int(level), gate=level > 1)  # fmt: skip
+            self._cache[key] = found
+        return found
+
+    def scan_rows(self, scans: np.ndarray) -> np.ndarray:
+        """Ledger row of each scan number, -1 for one not in the ledger or
+        negative (no scan)."""
+        scans = np.asarray(scans, dtype=np.int64)
+        by = np.argsort(self.scan, kind="stable")
+        pos = np.searchsorted(self.scan[by], scans)
+        at = by[np.minimum(pos, max(by.size - 1, 0))] if by.size else np.zeros(scans.size, np.int64)
+        found = (scans >= 0) & (pos < by.size) & (self.scan[at] == scans) if by.size else np.zeros(scans.size, bool)
+        return np.where(found, at, -1).astype(np.int64)
 
     def order(self) -> np.ndarray:
         """Each scan's rank by (retention time, scan number): the order a
@@ -68,6 +112,8 @@ class Ledger:
                 "isolation_lower": pa.array(self.lower, mask=np.isnan(self.lower)),
                 "isolation_upper": pa.array(self.upper, mask=np.isnan(self.upper)),
                 "n_points": pa.array(self.n_points.astype(np.int32)),
+                "tic": pa.array(self.tic, mask=np.isnan(self.tic)),
+                "iit": pa.array(self.iit, mask=np.isnan(self.iit)),
             },
             schema=SWEEP_SCAN_TABLE,
         )
@@ -156,44 +202,29 @@ class Matches:
 
 def _eligible_ranges(plan: QueryPlan, s: Ledger, level: int, queries: np.ndarray):
     """The (scan, query) pairs ``level`` could match ``queries`` in, as
-    ranges: per window group of the level's scans with points, the group's
-    queries, its ledger rows in (retention time, scan) order, and for each
-    query the first of those rows inside its interval and how many are. A
-    query with an assigned scan (fragments) has that one row or none. So
-    the pairs are never built as a queries × scans product: what is built
-    is only what is eligible, and counting needs nothing built at all.
+    ranges: the level's ledger rows by window and (retention time, scan)
+    (:meth:`Ledger.window_index`), and for each (window, query) pair its
+    query, the first of those rows inside its interval and how many are.
+    A query with an assigned scan (fragments) has that one row or none.
+    So the pairs are never built as a queries × scans product: what is
+    built is only what is eligible, and counting needs nothing built at
+    all. Until 2026-11-07 the windows were regrouped at every call, which
+    cost windows × scans (5.4 s a call on a 100,000-scan DDA run).
 
-    The interval test is :func:`pair_eligible`'s, inclusive at both ends:
-    on rows sorted by time, ``searchsorted`` left of the lower bound and
-    right of the upper one take exactly the rows with ``lo <= rt <= hi``
-    (bounds are never NaN; a scan without a time sorts last and is never
-    inside)."""
+    The interval test is :func:`pair_eligible`'s, inclusive at both ends
+    (bounds are never NaN; a scan without a time is not in the index)."""
     channels = plan.channels_for_level(level)
     if channels is None or queries.size == 0:
         return
     queries = queries[channels.counts()[queries] > 0]
-    rows = np.flatnonzero((s.level == level) & (s.n_points > 0))
-    groups = isolation_groups(queries, plan.precursor_mz, s.lower[rows], s.upper[rows], rows, gate=level > 1)
-    for g in groups:
-        r = g.rows[np.lexsort((s.scan[g.rows], s.rt[g.rows]))]
-        rt = s.rt[r]
-        q = g.queries
-        start = np.searchsorted(rt, plan.rt_lo[q], side="left").astype(np.int64)
-        stop = np.searchsorted(rt, plan.rt_hi[q], side="right").astype(np.int64)
-        count = np.maximum(stop - start, 0)
-        if level > 1:
-            assigned = plan.assigned_scan[q]
-            fixed = np.flatnonzero(assigned >= 0)
-            if fixed.size:
-                scans = s.scan[r]
-                by = np.argsort(scans, kind="stable")
-                pos = np.searchsorted(scans[by], assigned[fixed])
-                at = by[np.minimum(pos, by.size - 1)]
-                found = (pos < by.size) & (scans[at] == assigned[fixed])
-                inside = (start[fixed] <= at) & (at < stop[fixed])
-                start[fixed] = at
-                count[fixed] = (found & inside).astype(np.int64)
-        yield q, r, start, count
+    index = s.window_index(level)
+    fragments = level > 1
+    assigned = plan.assigned_scan if fragments else None
+    scan_rows = s.scan_rows(plan.assigned_scan) if fragments and (plan.assigned_scan >= 0).any() else None
+    q, start, count = eligible_pairs(index, queries, plan.precursor_mz, plan.rt_lo, plan.rt_hi, assigned,
+                                     gate=fragments, scan_rows=scan_rows)  # fmt: skip
+    if q.size:
+        yield q, index.rows, start, count
 
 
 def eligible_counts(plan: QueryPlan, s: Ledger, level: int, queries: np.ndarray) -> np.ndarray:
@@ -201,7 +232,7 @@ def eligible_counts(plan: QueryPlan, s: Ledger, level: int, queries: np.ndarray)
     ``level`` could match it in, without building them."""
     out = np.zeros(queries.size, np.int64)
     for q, _, _, count in _eligible_ranges(plan, s, level, queries):
-        np.add.at(out, np.searchsorted(queries, q), count)
+        out += np.bincount(np.searchsorted(queries, q), weights=count, minlength=queries.size).astype(np.int64)
     return out
 
 
@@ -287,19 +318,190 @@ class QueryBatch:
         channel = ragged_arange(np.zeros(q.size, np.int64), n)
         return np.repeat(q, n), np.repeat(r, n), channel
 
+    def cells(self, level: int, *, fill: bool = True, queries: np.ndarray | None = None) -> Cells:
+        """The batch's cells at ``level`` (:class:`Cells`), for its queries
+        or ``queries`` (an ascending subset): one row per match, and with
+        ``fill`` one per eligible cell that nothing matched, so a trace is
+        dense over the scans each query could have been matched in. A rule
+        that gives several points a cell (``all``) gives several rows."""
+        channels = self.plan.channels_for_level(level)
+        if channels is None:
+            raise ValueError(f"the plan has no channels at MS{level}")
+        m = self.matches
+        sel = m.level == level
+        if queries is not None:
+            sel &= np.isin(m.query, queries)
+        at = np.flatnonzero(sel)
+        mq, mr, mc = m.query[at], self.scans.rows_of(m.scan[at]), m.channel[at]
+        parts = dict(query=mq, row=mr, channel=mc, matched=np.ones(at.size, dtype=bool),
+                     point_index=m.point_index[at], n_points=m.n_points[at], mz_observed=m.mz[at],
+                     intensity=m.intensity[at])  # fmt: skip
+        order = self.scan_order
+        if fill:
+            sub = self.queries if queries is None else queries
+            cq, cr, ci = self.eligible_cells_of(level, sub)
+            # The cells nothing matched: merge both on (query, scan order,
+            # channel), matches before the cell they belong to.
+            key_q = np.concatenate([mq, cq])
+            key_s = np.concatenate([order[mr], order[cr]])
+            key_c = np.concatenate([mc, ci])
+            is_cell = np.concatenate([np.zeros(mq.size, bool), np.ones(cq.size, bool)])
+            by = np.lexsort((is_cell, key_c, key_s, key_q))
+            kq, ks, kc, flag = key_q[by], key_s[by], key_c[by], is_cell[by]
+            new = np.r_[True, (kq[1:] != kq[:-1]) | (ks[1:] != ks[:-1]) | (kc[1:] != kc[:-1])] if by.size else by.astype(bool)
+            group = np.cumsum(new) - 1
+            has_match = np.zeros(int(new.sum()), dtype=bool)
+            np.logical_or.at(has_match, group[~flag], True)
+            empty = flag & ~has_match[group]
+            take = by[empty] - mq.size
+            parts = {
+                "query": np.concatenate([mq, cq[take]]), "row": np.concatenate([mr, cr[take]]),
+                "channel": np.concatenate([mc, ci[take]]),
+                "matched": np.concatenate([parts["matched"], np.zeros(take.size, bool)]),
+                "point_index": np.concatenate([parts["point_index"], np.full(take.size, -1, np.int64)]),
+                "n_points": np.concatenate([parts["n_points"], np.zeros(take.size, np.int64)]),
+                "mz_observed": np.concatenate([parts["mz_observed"], np.full(take.size, np.nan)]),
+                "intensity": np.concatenate([parts["intensity"], np.zeros(take.size)]),
+            }  # fmt: skip
+        by = np.lexsort((parts["point_index"], parts["channel"], order[parts["row"]], parts["query"]))
+        return Cells(level=int(level), channels=channels, scans=self.scans,
+                     **{k: np.asarray(v)[by] for k, v in parts.items()})  # fmt: skip
+
+    def eligible_cells_of(self, level: int, queries: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """:meth:`eligible_cells` for ``queries``, an ascending subset."""
+        q, r = self.eligible(level, queries)
+        channels = self.plan.channels_for_level(level)
+        n = channels.counts()[q]
+        channel = ragged_arange(np.zeros(q.size, np.int64), n)
+        return np.repeat(q, n), np.repeat(r, n), channel
+
+
+@dataclass(frozen=True)
+class Cells:
+    """A batch's cells at one level (:meth:`QueryBatch.cells`): one row per
+    match of a cell, and, with ``fill``, one per eligible cell with none
+    (``matched`` false). Rows in output order: query, scan order, channel,
+    point. What is stored is what the sweep found; the rest (the channel's
+    identity and abundance, the scan's time and context, the m/z error) is
+    looked up as asked."""
+
+    level: int
+    query: np.ndarray  # int64
+    row: np.ndarray  # int64, ledger row of the scan
+    channel: np.ndarray  # int64, ordinal among the query's channels of this kind
+    matched: np.ndarray  # bool
+    point_index: np.ndarray  # int64, -1 when unmatched or aggregated
+    n_points: np.ndarray  # int64, points the match stands for (0 unmatched)
+    mz_observed: np.ndarray  # float64, NaN unmatched
+    intensity: np.ndarray  # float64, 0 unmatched
+    channels: Channels
+    scans: Ledger
+
+    @property
+    def n(self) -> int:
+        return int(self.query.size)
+
+    @property
+    def channel_index(self) -> np.ndarray:
+        """Each row's channel as an index into :attr:`channels`' arrays."""
+        return self.channels.offsets[self.query] + self.channel
+
+    def _of(self, name: str) -> np.ndarray:
+        return getattr(self.channels, name)[self.channel_index]
+
+    @property
+    def mz_theoretical(self) -> np.ndarray:
+        return self._of("mz")
+
+    @property
+    def abundance(self) -> np.ndarray:
+        return self._of("abundance")
+
+    @property
+    def evidence_key(self) -> np.ndarray:
+        return self._of("evidence_key")
+
+    @property
+    def mz_error_da(self) -> np.ndarray:
+        """Observed − theoretical, NaN where unmatched."""
+        return np.where(self.matched, self.mz_observed - self.mz_theoretical, np.nan)
+
+    @property
+    def mz_error_ppm(self) -> np.ndarray:
+        theo = self.mz_theoretical
+        return np.where(self.matched, (self.mz_observed - theo) / theo * 1e6, np.nan)
+
+    @property
+    def scan(self) -> np.ndarray:
+        return self.scans.scan[self.row]
+
+    @property
+    def rt(self) -> np.ndarray:
+        return self.scans.rt[self.row]
+
+    @property
+    def tic(self) -> np.ndarray:
+        return self.scans.tic[self.row]
+
+    @property
+    def iit(self) -> np.ndarray:
+        return self.scans.iit[self.row]
+
+    def table(self) -> pa.Table:
+        """The cells as :data:`SWEEP_CELL_TABLE` rows."""
+        g = self.channel_index
+        c = self.channels
+        frag = self.level > 1
+        none = np.ones(self.n, dtype=bool)
+        names = np.array([None, *c.loss_ids], dtype=object)
+        tic, iit = self.tic, self.iit
+        return pa.table(
+            {
+                "query": pa.array(self.query.astype(np.int32)),
+                "level": pa.array(np.full(self.n, self.level, np.int8)),
+                "scan": pa.array(self.scan.astype(np.int32)),
+                "rt": pa.array(self.rt),
+                "tic": pa.array(tic, mask=np.isnan(tic)),
+                "iit": pa.array(iit, mask=np.isnan(iit)),
+                "channel": pa.array(self.channel.astype(np.int32)),
+                "precursor_charge": pa.array(c.precursor_charge[g].astype(np.int8)),
+                "isotope": pa.array(c.isotope[g], mask=none if frag else None),
+                "ion_type": pa.array(c.ion_type[g], mask=None if frag else none),
+                "position": pa.array(c.position[g], mask=None if frag else none),
+                "fragment_charge": pa.array(c.fragment_charge[g], mask=None if frag else none),
+                "loss_id": pa.array(names[c.loss[g]] if frag else [None] * self.n, pa.string()),
+                "abundance": pa.array(c.abundance[g], mask=np.isnan(c.abundance[g])),
+                "evidence_key": pa.array(c.evidence_key[g].astype(np.int32)),
+                "mz_theoretical": pa.array(c.mz[g]),
+                "matched": pa.array(self.matched),
+                "point_index": pa.array(self.point_index.astype(np.int32), mask=self.point_index < 0),
+                "n_points": pa.array(self.n_points.astype(np.int32)),
+                "mz_observed": pa.array(self.mz_observed),
+                "intensity": pa.array(self.intensity),
+                "mz_error_da": pa.array(self.mz_error_da),
+                "mz_error_ppm": pa.array(self.mz_error_ppm),
+            },
+            schema=SWEEP_CELL_TABLE,
+        )
+
 
 class Reducer(Protocol):
-    """Turns a bucket of queries' matches into a table. ``gated`` reducers
-    see only the queries that passed the evidence gate. A reducer that
-    builds a row for every eligible cell (zero-filling) says so with a true
-    ``zero_fills`` attribute, so that a sweep on disk sizes its buckets by
-    those rows rather than by matches alone."""
+    """Turns a bucket of queries' matches into a table, or several: a
+    reducer of one output has ``name`` and ``schema`` and returns a table;
+    one of several also has ``outputs`` (output name → schema) and returns
+    a mapping of output name → table (one pass of a scorer can write its
+    candidates, its per-ion quantities and its verdicts). Every table is
+    held to its schema by column name. ``gated`` reducers see only the
+    queries that passed the evidence gate. A reducer that builds a row for
+    every eligible cell (zero-filling) says so with a true ``zero_fills``
+    attribute, so that a sweep on disk sizes its buckets by those rows
+    rather than by matches alone."""
 
     name: str
     schema: pa.Schema
     gated: bool
 
-    def reduce(self, batch: QueryBatch) -> pa.Table: ...
+    def reduce(self, batch: QueryBatch) -> pa.Table | Mapping[str, pa.Table]: ...
 
 
 @dataclass(frozen=True)

@@ -438,13 +438,15 @@ def _write_tables(
         if "acquisition_id" not in table.column_names:
             write(name, table, acquisition_id)
             continue
-        column = table.column("acquisition_id")
-        unbound = table.filter(pc.is_null(column))
-        ids = [i for i in pc.unique(column).to_pylist() if i is not None]
-        if unbound.num_rows or not ids:
-            write(name, unbound.drop_columns(["acquisition_id"]), acquisition_id)
-        for value in sorted(ids):
-            part = table.filter(pc.equal(column, value))
+        # A run-agnostic row goes to the unit's own partition, which may
+        # also be some rows' own acquisition (a single-run unit): each
+        # partition is written once, with all of its rows. Until
+        # 2026-11-07 the bound rows were written second and replaced the
+        # run-agnostic ones in the same file.
+        partition = pc.fill_null(table.column("acquisition_id"), acquisition_id)
+        ids = sorted(pc.unique(partition).to_pylist()) or [acquisition_id]
+        for value in ids:
+            part = table.filter(pc.equal(partition, value))
             write(name, part.drop_columns(["acquisition_id"]), int(value))
     return rows
 
@@ -1606,6 +1608,20 @@ def _unit_record(experiment_dir: Path, unit: str) -> tuple[Path, SearchManifest]
     return unit_dir, read_manifest(unit_dir, expect=SearchManifest)
 
 
+def _result_library(unit_dir: Path, record: SearchManifest, use: str) -> Path:
+    """The result library EncyclopeDIA wrote for a search. A search run by
+    another engine has none, and is refused for ``use`` by name rather than
+    failing on a missing key."""
+    name = record.outputs.get("result_library") if record.engine == ENGINE else None
+    if not name:
+        engine = record.engine or "an unrecorded engine"
+        raise WorkflowError(
+            f"search {unit_dir.name} was run by {engine}, not EncyclopeDIA: it has no "
+            f"result library for {use}"
+        )
+    return unit_dir / name
+
+
 def _input_path(experiment_dir: Path, recorded: str) -> Path:
     """A path a manifest records relative to the experiment, or absolute."""
     path = Path(recorded)
@@ -1636,7 +1652,7 @@ def collision_filter(
     experiment_dir = Path(experiment_dir).resolve()
     settings = settings or CollisionSettings()
     unit_dir, record = _unit_record(experiment_dir, unit)
-    library = unit_dir / record.outputs["result_library"]
+    library = _result_library(unit_dir, record, "the collision filter")
     spectra = _input_path(experiment_dir, record.inputs["spectra_file"]["path"])
     out_dir = unit_dir / COLLISION_DIR
     out = out_dir / f"{library.name.removesuffix('.elib')}.collision-filtered.elib"
@@ -1749,6 +1765,8 @@ def _choose_searches(
                 f"(`massspec summarize` lists them)"
             )
         chosen = {s: finished[s] for s in searches}
+        for s, r in chosen.items():
+            _result_library(experiment_dir / "units" / s, r, "EncyclopeDIA's report")
         spectrum_centric = [s for s, r in chosen.items() if r.search_mode != PEPTIDE_CENTRIC]
         if spectrum_centric:
             raise WorkflowError(
@@ -1765,7 +1783,9 @@ def _choose_searches(
         chosen = {
             unit: record
             for unit, record in finished.items()
-            if record.search_mode == PEPTIDE_CENTRIC
+            if record.engine == ENGINE
+            and record.outputs.get("result_library")
+            and record.search_mode == PEPTIDE_CENTRIC
             and not set(record.acquisition_ids) & merged
             and (library is None or Path(_library_of(record)[0]) == library)
         }
@@ -1912,7 +1932,7 @@ def report_searches(
         # A search run again under the same key (without --resume) is a
         # new result in the same place; the result file tells them apart.
         searches=sorted(
-            (r.stage_key, stages.input_identity([experiment_dir / "units" / u / r.outputs["result_library"]]))
+            (r.stage_key, stages.input_identity([_result_library(experiment_dir / "units" / u, r, "a report")]))
             for u, r in chosen.items()
         ),
         settings={k: format_value(v) for k, v in sorted(settings.items())},

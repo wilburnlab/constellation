@@ -38,15 +38,14 @@ downstream step). Match semantics default to nearest-peak (one row per
 (target, scan, ion); rectangular). ``all_in_window=True`` returns every
 peak within tolerance (interference / chimeric / DIA work).
 
-Query m/z come from the existing peptide chemistry: MS1 isotope envelopes
-via ``peptide_envelope`` (or isotopes off a bare ``precursor_mz`` for the
-no-peptide m/z case), MS2 fragment ladders via the batched
-``fragment_ladder_indices_batch``. Mass error is conventional (observed -
+Both take their channels (the m/z extracted at, with what each is) from
+one generator, ``massspec.peptide.channels`` through ``sweep.compile_queries``:
+MS1 isotope envelopes from composition (or isotopes off a bare
+``precursor_mz`` for the no-peptide m/z case), MS2 fragment ladders, with
+abundances and top-N selection. Mass error is conventional (observed -
 theoretical), signed, preserved so probabilistic scoring stays downstream.
 
-NOTE: Mode B still reads index partitions per target. MS1
-``peptide_envelope`` is called per (sequence, charge) rather than batched —
-a future optimization, not a correctness issue.
+NOTE: Mode B still reads index partitions per target.
 """
 
 from __future__ import annotations
@@ -66,12 +65,9 @@ import pyarrow.parquet as pq
 import torch
 
 from constellation.core.io.schemas import cast_to_schema
-from constellation.core.sequence.proforma import Peptidoform, parse_proforma
 from constellation.core.signal import bounds_within_tolerance
-from constellation.core.stats.units import ISOTOPE_MASS_DIFF
 from constellation.massspec.bundle import open_peaks
-from constellation.massspec.peptide.envelope import peptide_envelope
-from constellation.massspec.peptide.ions import IonType, fragment_ladder_indices_batch
+from constellation.massspec.peptide.ions import IonType
 from constellation.massspec.quant.peak_index import read_manifest as read_index_manifest
 from constellation.massspec.quant.schemas import XIC_TRACE_TABLE
 
@@ -157,100 +153,24 @@ def _rt_bounds(t: _Target, rt_window: float | None) -> tuple[float, float]:
     return -np.inf, np.inf
 
 
-def _peptidoform(modseq: str) -> Peptidoform:
-    p = parse_proforma(modseq)
-    if not isinstance(p, Peptidoform):
-        raise ValueError(
-            f"XIC extraction supports linear peptidoforms; {modseq!r} parsed to "
-            f"{type(p).__name__}"
-        )
-    return p
-
-
-def _ms1_queries(
-    t: _Target,
-    *,
-    n_isotopes: int,
-    charge_range: tuple[int, int] | None,
-) -> list[_QueryIon]:
-    if t.modified_sequence:
-        pf = _peptidoform(t.modified_sequence)
-        if charge_range is not None:
-            charges = list(range(charge_range[0], charge_range[1] + 1))
-        elif t.precursor_charge is not None:
-            charges = [int(t.precursor_charge)]
-        else:
-            raise ValueError(
-                f"target {t.target_id}: MS1 extraction needs a charge "
-                "(charge_range or precursor_charge)"
-            )
-        out: list[_QueryIon] = []
-        for z in charges:
-            mz_iso, _ = peptide_envelope(pf, charge=z, n_peaks=n_isotopes)
-            for k, mz in enumerate(mz_iso.tolist()):
-                out.append(_QueryIon(mz=mz, precursor_charge=z, isotope=k))
-        return out
-    # No-peptide m/z target: isotopes off the bare precursor m/z.
-    if t.precursor_mz is None:
-        raise ValueError(
-            f"target {t.target_id}: needs modified_sequence or precursor_mz"
-        )
-    z = int(t.precursor_charge) if t.precursor_charge is not None else 1
-    n = n_isotopes if t.precursor_charge is not None else 1
+def _query_ions(channels, level: int, q: int) -> list[_QueryIon]:
+    """Query ``q``'s channels (``massspec.peptide.channels``) as the ions
+    the index extraction walks (it once built its own: the sweep's
+    generator is the one source of channels)."""
+    a, b = int(channels.offsets[q]), int(channels.offsets[q + 1])
+    names = [None, *channels.loss_ids]
+    if level == 1:
+        return [
+            _QueryIon(mz=float(channels.mz[j]), precursor_charge=int(channels.precursor_charge[j]),
+                      isotope=int(channels.isotope[j]))
+            for j in range(a, b)
+        ]  # fmt: skip
     return [
-        _QueryIon(
-            mz=t.precursor_mz + k * ISOTOPE_MASS_DIFF / z, precursor_charge=z, isotope=k
-        )
-        for k in range(n)
-    ]
-
-
-def _ms2_queries_batch(
-    targets: list[_Target],
-    *,
-    ion_types: Sequence[IonType],
-    max_fragment_charge: int,
-    neutral_losses: Sequence[str] | None,
-) -> dict[int, list[_QueryIon]]:
-    """Build MS2 fragment queries for all targets in one batched ladder call."""
-    idxs, peptidoforms = [], []
-    for i, t in enumerate(targets):
-        if not t.modified_sequence:
-            raise ValueError(
-                f"target {t.target_id}: MS2 fragment extraction requires "
-                "modified_sequence (a bare-m/z target cannot define fragments)"
-            )
-        if t.precursor_charge is None:
-            raise ValueError(
-                f"target {t.target_id}: MS2 extraction requires precursor_charge"
-            )
-        idxs.append(i)
-        peptidoforms.append(_peptidoform(t.modified_sequence))
-
-    ladders = fragment_ladder_indices_batch(
-        peptidoforms,
-        ion_types=ion_types,
-        max_fragment_charge=max_fragment_charge,
-        neutral_losses=neutral_losses,
-    )
-    out: dict[int, list[_QueryIon]] = {}
-    for i, ladder in zip(idxs, ladders):
-        t = targets[i]
-        ceiling = min(max_fragment_charge, int(t.precursor_charge))
-        ions = [
-            _QueryIon(
-                mz=mz,
-                precursor_charge=int(t.precursor_charge),
-                ion_type=ion_type,
-                position=pos,
-                fragment_charge=ch,
-                loss_id=loss_id,
-            )
-            for (ion_type, pos, ch, loss_id), mz in ladder.items()
-            if ch <= ceiling
-        ]
-        out[i] = ions
-    return out
+        _QueryIon(mz=float(channels.mz[j]), precursor_charge=int(channels.precursor_charge[j]),
+                  ion_type=int(channels.ion_type[j]), position=int(channels.position[j]),
+                  fragment_charge=int(channels.fragment_charge[j]), loss_id=names[int(channels.loss[j])])
+        for j in range(a, b)
+    ]  # fmt: skip
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -468,47 +388,17 @@ class XicTraceReducer:
         return not self.drop_unmatched
 
     def reduce(self, batch: "QueryBatch") -> pa.Table:
-        plan, s, m = batch.plan, batch.scans, batch.matches
-        rows = batch.match_rows()
+        plan, s = batch.plan, batch.scans
         fill = not self.drop_unmatched and batch.settings.rule.name != "all"
         parts = []
         for level in plan.levels:
             channels = plan.channels_for_level(level)
             if channels is None:
                 continue
-            at = np.flatnonzero(m.level == level)
-            q, r, ch = m.query[at], rows[at], m.channel[at]
-            point, obs, inten = m.point_index[at], m.mz[at], m.intensity[at]
-            matched = np.ones(at.size, dtype=bool)
-            if fill:
-                q, r, ch, idx = _left_join_cells(batch, level, q, r, ch)
-                matched = idx >= 0
-                point, obs, inten = (
-                    np.where(matched, np.r_[v, fallback][idx], fallback)
-                    for v, fallback in ((point, -1), (obs, np.nan), (inten, 0.0))
-                )
-            parts.append((level, channels, q, r, ch, point, obs, inten, matched))
+            c = batch.cells(level, fill=fill)
+            parts.append((level, channels, c.query, c.row, c.channel, c.point_index, c.mz_observed, c.intensity,
+                          c.matched))  # fmt: skip
         return _trace_table(plan, s, batch.scan_order, parts, batch.settings.acquisition_id)
-
-
-def _left_join_cells(batch, level, q, r, ch):
-    """Every eligible cell of ``level`` in output order, with the index of
-    its match among ``(q, r, ch)`` (-1 where none)."""
-    cq, cr, ci = batch.eligible_cells(level)
-    order = batch.scan_order
-    by_cell = np.lexsort((ci, order[cr], cq))
-    by_match = np.lexsort((ch, order[r], q))
-    key_c = np.stack([cq[by_cell], order[cr][by_cell], ci[by_cell]], axis=1)
-    key_m = np.stack([q[by_match], order[r][by_match], ch[by_match]], axis=1)
-    idx = np.full(cq.size, -1, dtype=np.int64)
-    if key_m.size:
-        # Both sides sorted on the same key; a match is one of the cells.
-        view = np.dtype([("q", np.int64), ("s", np.int64), ("i", np.int64)])
-        kc = np.ascontiguousarray(key_c).view(view).reshape(-1)
-        km = np.ascontiguousarray(key_m).view(view).reshape(-1)
-        pos = np.searchsorted(kc, km)
-        idx[by_cell[pos]] = by_match
-    return cq, cr, ci, idx
 
 
 def _trace_table(plan, s, scan_order, parts, acquisition_id) -> pa.Table:
@@ -600,6 +490,7 @@ def extract_xic(
     workers: int = 1,
     work_dir: Path | str | None = None,
     progress=None,
+    fragment_abundance=None,
 ) -> "SweepResult":
     """Extract XIC traces for ``targets`` at every MS level in ``levels`` in
     one sweep of ``peaks`` (a bundle, streamed, or a peak table), each level
@@ -614,7 +505,10 @@ def extract_xic(
     the trace. ``claims`` adds the ``point_claims`` output (points matched
     by more than one target, or by two channels of one) and ``summary`` the
     ``query_summary`` output (per target: the gate's verdict, scans
-    eligible, cells matched). Every output carries ``tolerances`` in its
+    eligible, cells matched). ``fragment_abundance`` says where fragment
+    channels' abundances come from (``massspec.peptide.channels``; a
+    library's with ``library.fragment_abundance.LibraryFragments``), which
+    ``channels.top_fragments`` selects on. Every output carries ``tolerances`` in its
     schema metadata (:func:`extraction_tolerance_metadata`), in memory and
     when written."""
     from constellation.massspec.sweep import ChannelSettings, compile_queries
@@ -625,12 +519,15 @@ def extract_xic(
     if only_passing and gate is None:
         raise ValueError("only_passing needs a gate to pass targets")
 
+    from constellation.massspec.peptide.channels import UNMODELLED
+
     plan = compile_queries(
         targets,
         levels=levels,
         channels=channels if channels is not None else ChannelSettings(),
         rt_window=rt_window,
         assigned_scans_only=assigned_scans_only,
+        fragment_abundance=fragment_abundance if fragment_abundance is not None else UNMODELLED,
     )
     settings = SweepSettings(
         tolerances=dict(tolerances),
@@ -653,7 +550,7 @@ def extract_xic(
     # its collision grouping by the trace's.
     stamp = extraction_tolerance_metadata(dict(tolerances))
     for name in result.schemas:
-        result.metadata[name] = dict(stamp)
+        result.metadata[name] = {**result.metadata.get(name, {}), **stamp}
     return result
 
 
@@ -667,7 +564,7 @@ def extract_xic_scan_major(
     ion_types: Sequence[IonType] = _DEFAULT_ION_TYPES,
     max_fragment_charge: int = 2,
     neutral_losses: Sequence[str] | None = None,
-    charge_range: tuple[int, int] | None = (1, 4),
+    charge_range: tuple[int, int] | None = None,
     rt_window: float | None = None,
     tolerance: float = 20.0,
     tolerance_unit: ToleranceUnit = "ppm",
@@ -773,7 +670,7 @@ def extract_xic_indexed(
     ion_types: Sequence[IonType] = _DEFAULT_ION_TYPES,
     max_fragment_charge: int = 2,
     neutral_losses: Sequence[str] | None = None,
-    charge_range: tuple[int, int] | None = (1, 4),
+    charge_range: tuple[int, int] | None = None,
     rt_window: float | None = None,
     tolerance: float = 20.0,
     tolerance_unit: ToleranceUnit = "ppm",
@@ -783,8 +680,15 @@ def extract_xic_indexed(
     exact_error: bool = False,
     peaks_dir: Path | str | None = None,
     output_path: Path | str | None = None,
+    channels: "ChannelSettings | None" = None,
+    fragment_abundance=None,
 ) -> pa.Table | Path:
-    """Mode B mass-index XIC extraction. See module docstring."""
+    """Mode B mass-index XIC extraction. See module docstring.
+
+    ``channels`` (``ChannelSettings``) says which isotopes and fragment
+    ions to extract, in place of the separate keywords, and
+    ``fragment_abundance`` where their abundances come from (top-N
+    selection); the channels are the sweep's, from one generator."""
     index_root = Path(index_root)
     manifest = read_index_manifest(index_root)
     if exact_error and _index_mz_is_f32(manifest) and peaks_dir is None:
@@ -793,6 +697,10 @@ def extract_xic_indexed(
             "canonical peak table on an f32-downcast index"
         )
     dda_width = float(manifest.parameters.get("dda_window_width_mz", 10.0))
+    if rt_window is not None:
+        from constellation.massspec.sweep.queries import check_rt_window
+
+        check_rt_window(targets)
     records = _targets_to_records(targets)
     builder = _TraceBuilder()
 
@@ -821,23 +729,21 @@ def extract_xic_indexed(
         part_cache[key] = cols
         return cols
 
-    ms2_queries = (
-        _ms2_queries_batch(
-            records,
-            ion_types=ion_types,
-            max_fragment_charge=max_fragment_charge,
-            neutral_losses=neutral_losses,
-        )
-        if level != 1
-        else {}
-    )
+    from constellation.massspec.peptide.channels import UNMODELLED
+    from constellation.massspec.sweep import ChannelSettings, compile_queries
+
+    settings = channels if channels is not None else ChannelSettings(
+        n_isotopes=n_isotopes, charge_range=charge_range, ion_types=tuple(ion_types),
+        max_fragment_charge=max_fragment_charge, neutral_losses=tuple(neutral_losses) if neutral_losses else None,
+    )  # fmt: skip
+    # The index selects partitions by the precursor m/z given, so none is
+    # derived (a target without one is read from every window).
+    plan = compile_queries(targets, levels=[level], channels=settings, derive_precursor_mz=False,
+                           fragment_abundance=fragment_abundance if fragment_abundance is not None else UNMODELLED)  # fmt: skip
+    level_channels = plan.channels_for_level(level)
 
     for i, t in enumerate(records):
-        ions = (
-            ms2_queries[i]
-            if level != 1
-            else _ms1_queries(t, n_isotopes=n_isotopes, charge_range=charge_range)
-        )
+        ions = _query_ions(level_channels, level, i)
         if not ions:
             continue
         rt_lo, rt_hi = _rt_bounds(t, rt_window)

@@ -129,3 +129,22 @@ def test_a_neutral_envelope_put_at_a_charge_is_the_charged_envelope(mode, modseq
         mz, ab_z = peptide_envelope(pf, charge=z, n_peaks=4, mode=mode)
         assert torch.equal(envelope_mz(masses, z), mz)
         assert torch.equal(ab, ab_z)
+
+
+def test_batched_envelopes_are_the_single_ones_to_the_bit():
+    """neutral_envelopes repeats neutral_envelope's arithmetic (the
+    compensated sum Python makes of a composition's mass) so its masses
+    are the same bits, for labelled, SILAC and modified peptides too."""
+    import numpy as np
+
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.massspec.peptide.envelope import neutral_envelope, neutral_envelopes
+
+    texts = ["PEPTIDEK", "LVNELTEFAK", "<13C><15N>ACDEFGHIK", "PEPTK[UNIMOD:259]IDEK", "C[UNIMOD:4]PEPM[UNIMOD:35]TIDER",
+             "<15N>PEPTIDEKR", "[UNIMOD:1]-SAMPLER", "HLVDEPQNLIKQNCDQFEKLGEYGFQNALIVRYTRK"]  # fmt: skip
+    peptides = [parse_proforma(t) for t in texts]
+    masses, shares = neutral_envelopes(peptides, n_peaks=6)
+    for i, p in enumerate(peptides):
+        m, a = neutral_envelope(p, n_peaks=6, normalize="full")
+        assert np.array_equal(m.numpy().view(np.int64), masses[i].view(np.int64)), texts[i]
+        assert np.abs(a.numpy() - shares[i]).max() < 1e-6

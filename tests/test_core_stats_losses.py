@@ -267,3 +267,134 @@ def test_spectral_entropy_similarity_symmetric():
     b = losses.spectral_entropy_similarity(q, p).item()
     assert math.isclose(a, b, abs_tol=1e-12)
     assert 0.0 <= a <= 1.0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Scale-free similarities and one masking rule (review of 2026-11-06)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_cosine_and_pearson_are_scale_invariant_at_small_magnitude():
+    """The norm used to be floored at sqrt(eps) on the *squared* norm, so
+    identical [3e-5, 4e-5] vectors scored cosine 0.025."""
+    x = torch.tensor([3e-5, 4e-5], dtype=torch.float64)
+    assert math.isclose(losses.cosine_similarity(x, x).item(), 1.0, abs_tol=1e-12)
+    trace = torch.tensor([1.0, 1.001, 1.002, 1.001, 1.0], dtype=torch.float64) * 1e-3
+    assert math.isclose(losses.pearson_correlation(trace, trace).item(), 1.0, abs_tol=1e-9)
+    p = torch.tensor([1.0, 2.0, 3.0, 0.5], dtype=torch.float64)
+    t = torch.tensor([2.0, 1.0, 4.0, 1.5], dtype=torch.float64)
+    for f in (losses.cosine_similarity, losses.pearson_correlation, losses.spectral_entropy_similarity):
+        base = f(p, t).item()
+        for scale in (1e-6, 1e6):
+            assert math.isclose(f(p * scale, t).item(), base, abs_tol=1e-9), f.__name__
+            assert math.isclose(f(p, t * scale).item(), base, abs_tol=1e-9), f.__name__
+    base = losses.kld(p, t, reduce="sum").item()
+    assert math.isclose(losses.kld(p * 1e-6, t * 1e6, reduce="sum").item(), base, abs_tol=1e-9)
+
+
+def test_a_vector_with_nothing_in_it_scores_zero():
+    """An empty observed scan scored entropy similarity 0.80 against a
+    prediction, better than a scan with one wrong peak (0.008)."""
+    pred = torch.tensor([0.5, 0.3, 0.2, 0.0], dtype=torch.float64)
+    empty = torch.zeros(4, dtype=torch.float64)
+    wrong = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float64)
+    assert losses.spectral_entropy_similarity(pred, empty).item() == 0.0
+    assert losses.spectral_entropy_similarity(pred, wrong).item() >= 0.0
+    assert losses.cosine_similarity(pred, empty).item() == 0.0
+    assert losses.pearson_correlation(pred, torch.full((4,), 3.0, dtype=torch.float64)).item() == 0.0
+    assert math.isnan(losses.kld(pred, empty, reduce="sum").item())
+
+
+def test_spectral_entropy_loss_keeps_input_unit_pseudocount():
+    """The training loss keeps Cartographer's raw-unit pseudocount."""
+    pred = torch.tensor([0.4, 0.3, 0.2, 0.1])
+    target = torch.tensor([0.25, 0.35, 0.25, 0.15])
+    logit = torch.tensor(0.3)
+    pc = 0.05
+    signal = target * torch.sigmoid(logit)
+    pm, sm = pred + pc, signal + pc
+    pn, sn = pm / pm.sum(), sm / sm.sum()
+    signal_kl = (sn * (sn / pn).log()).sum()
+    inter = target - signal + pc
+    inter_n = inter / inter.sum()
+    entropy = -(inter_n * inter_n.log()).sum()
+    frac = (signal.sum() + 1e-7) / (target.sum() + 1e-7)
+    want = frac * signal_kl + (1 - frac) * entropy
+    got = losses.spectral_entropy_loss(pred, target, logit, pseudocount=pc)
+    assert torch.allclose(got, want, atol=1e-6)
+
+
+def test_spectral_angle_refuses_a_batch_without_batch_dim():
+    p = torch.ones(2, 3, dtype=torch.float64)
+    with pytest.raises(ValueError, match="batch_dim"):
+        losses.spectral_angle(p, p)
+
+
+def test_a_negative_or_nan_channel_is_dropped_alike_by_every_comparison():
+    """One rule: a channel negative or NaN in either vector is left out."""
+    from constellation.massspec.spectra.similarity import compare_spectra
+
+    q = torch.tensor([4.0, 2.0, 3.0, 1.0], dtype=torch.float64)
+    r = torch.tensor([3.0, 1.0, 4.0, 2.0], dtype=torch.float64)
+    keep = [0, 1, 3]
+    for method in ("cosine", "dot", "pearson", "spectral_angle", "spectral_entropy", "kld"):
+        want = compare_spectra(q[keep], r[keep], method=method).item()
+        for bad_q, bad_r in ((-1.0, None), (None, -1.0), (float("nan"), None), (None, float("nan"))):
+            qq, rr = q.clone(), r.clone()
+            if bad_q is not None:
+                qq[2] = bad_q
+            if bad_r is not None:
+                rr[2] = bad_r
+            got = compare_spectra(qq, rr, method=method).item()
+            assert math.isclose(got, want, abs_tol=1e-12), (method, bad_q, bad_r)
+    counts = torch.tensor([40.0, 20.0, 30.0, 10.0], dtype=torch.float64)
+    want = compare_spectra(counts[keep], r[keep], method="multinomial_deviance", as_counts=True).item()
+    counts[2] = -1.0
+    got = compare_spectra(counts, r, method="multinomial_deviance", as_counts=True).item()
+    assert math.isclose(got, want, abs_tol=1e-12)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_entropy_similarity_is_finite_at_every_dtype(dtype):
+    """A probability clamped at 1e-300 is 0 in float32, so a masked or
+    empty channel gave 0·log 0 = NaN there (Codex review, 2026-11-07)."""
+    masked = losses.spectral_entropy_similarity(
+        torch.tensor([1.0, 2.0, -1.0], dtype=dtype), torch.tensor([1.0, 2.0, 5.0], dtype=dtype)
+    )
+    assert masked.item() == pytest.approx(1.0, abs=1e-6)
+    sparse = torch.tensor([1.0, 0.0, 3.0], dtype=dtype)
+    assert losses.spectral_entropy_similarity(sparse, sparse, pseudocount=0.0).item() == pytest.approx(1.0, abs=1e-6)
+    assert losses.spectral_entropy_similarity(
+        sparse, torch.tensor([0.0, 2.0, 0.0], dtype=dtype), pseudocount=0.0
+    ).item() == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("name", "fn", "x", "other"),
+    [
+        ("cosine of a zero vector", losses.cosine_similarity, [0.0, 0.0, 0.0], [1.0, 2.0, 3.0]),
+        ("Pearson of a constant vector", losses.pearson_correlation, [1.0, 1.0, 1.0], [1.0, 2.0, 3.0]),
+        ("spectral angle of a zero vector", losses.spectral_angle, [0.0, 0.0, 0.0], [1.0, 2.0, 3.0]),
+        ("entropy of an unsmoothed sparse vector", lambda a, b: losses.spectral_entropy_similarity(
+            a, b, pseudocount=0.0), [1.0, 0.0, 3.0], [1.0, 2.0, 3.0]),
+    ],
+)
+def test_similarities_have_finite_gradients_at_their_degenerate_points(name, fn, x, other):
+    """The norm took sqrt(0) before the division was protected, so the
+    value was 0 and its gradient NaN (Codex review, 2026-11-07)."""
+    for dtype in (torch.float32, torch.float64):
+        a = torch.tensor(x, dtype=dtype, requires_grad=True)
+        out = fn(a, torch.tensor(other, dtype=dtype))
+        out.sum().backward()
+        assert torch.isfinite(out).all(), name
+        assert torch.isfinite(a.grad).all(), f"{name}: {a.grad}"
+
+
+def test_l2_normalize_has_a_finite_gradient_at_zero():
+    for batch_dim, shape in ((False, (3,)), (True, (2, 3))):
+        x = torch.zeros(shape, requires_grad=True)
+        losses.l2_normalize(x, batch_dim=batch_dim).sum().backward()
+        assert torch.isfinite(x.grad).all()
+    # Away from zero the gradient is the normalization's own.
+    x = torch.tensor([3.0, 4.0], dtype=torch.float64, requires_grad=True)
+    assert torch.autograd.gradcheck(lambda v: losses.l2_normalize(v), (x,))

@@ -213,3 +213,30 @@ def test_the_command(tmp_path: Path, jar, inputs, capsys) -> None:
     (tmp_path / "plain").mkdir()
     assert main(["massspec", "summarize", str(tmp_path / "plain")]) == 2
     assert "is not an experiment directory" in capsys.readouterr().err
+
+
+def test_a_finished_search_without_recorded_settings_is_not_called_unfinished(tmp_path: Path) -> None:
+    """Settings the engine did not record were always explained as "the
+    search did not finish", finished or not."""
+    from constellation.core.manifests import write_manifest
+    from constellation.core.stages import mark_done
+    from constellation.massspec.experiment import format_summary
+    from constellation.massspec.manifest import ExperimentManifest, SearchManifest
+
+    root = tmp_path / "exp"
+    for unit, status, engine in (("done-00000001", "finished", "encyclopedia"),
+                                 ("gone-00000002", "running", "encyclopedia"),
+                                 ("other-0000003", "finished", "constellation")):  # fmt: skip
+        unit_dir = root / "units" / unit
+        unit_dir.mkdir(parents=True)
+        write_manifest(unit_dir, SearchManifest(status=status, engine=engine, program="encyclopedia",
+                                                search_mode="peptide-centric", acquisition_ids=[0]))  # fmt: skip
+        if status == "finished":
+            mark_done(unit_dir)
+    write_manifest(root, ExperimentManifest(name="exp"))
+    done = format_summary(summarize(root / "units" / "done-00000001"))
+    assert "the engine recorded none in its result" in done and "did not finish" not in done
+    gone = format_summary(summarize(root / "units" / "gone-00000002"))
+    assert "the search did not finish" in gone
+    other = format_summary(summarize(root / "units" / "other-0000003"))
+    assert "jar" not in other.split("settings (", 1)[1].split(")", 1)[0]

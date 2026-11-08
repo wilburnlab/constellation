@@ -14,11 +14,10 @@ precursors into :class:`~constellation.massspec.library.prediction.base.Requests
   the peptide's canonical string, then charge, so the requests (and the
   batches they are run in) do not depend on the library's row order. A
   heavy and a light precursor of one peptide share a request.
-* **Each source precursor keeps its request and its group**: a target
-  precursor and every decoy precursor made from it (``decoy_of``) at the
-  same charge are one group, which ``prediction.run`` keeps or drops
-  whole. A decoy with no ``decoy_of`` (a reversed protein) is a group of
-  its own.
+* **Each source precursor keeps its request**, and whether its peptide
+  is a decoy. A target and the decoys made from it are not linked here:
+  each precursor is kept or dropped on its own (PI, 2026-11-07; until
+  then a target and its decoys at one charge were dropped together).
 
 A peptide that has no reading as sites (a modification named by mass or
 name, a localisation group) gets no request; its precursors are refused
@@ -85,9 +84,9 @@ class RequestPlan:
     """A library's precursors as requests, and the way back.
 
     Per source precursor (the library's precursor rows, in order):
-    ``precursor_id``, ``peptide_id``, ``is_decoy``, its ``request`` (−1 if
-    it has none) and its pairing ``group``. ``unrequestable`` names the
-    precursor rows with no request and why.
+    ``precursor_id``, ``peptide_id``, ``is_decoy`` and its ``request`` (−1
+    if it has none). ``unrequestable`` names the precursor rows with no
+    request and why.
     """
 
     requests: Requests
@@ -95,7 +94,6 @@ class RequestPlan:
     peptide_id: np.ndarray
     is_decoy: np.ndarray
     request: np.ndarray
-    group: np.ndarray
     unrequestable: dict[int, tuple[str, str]]
     labelled_peptides: int
     collision_energy: CollisionEnergy | None
@@ -119,7 +117,6 @@ def build_requests(library: Library, collision_energy: CollisionEnergy | None = 
     at = at.to_numpy(zero_copy_only=False)
     sequences = peptides.column("modified_sequence").to_pylist()
     is_decoy_peptide = pc.fill_null(peptides.column("is_decoy"), False).to_numpy(zero_copy_only=False)
-    decoy_of = pc.fill_null(peptides.column("decoy_of"), -1).to_numpy(zero_copy_only=False)
 
     # Unlabelled sites, once per peptide row.
     peptide_sites: list[Sites | None] = []
@@ -165,15 +162,7 @@ def build_requests(library: Library, collision_energy: CollisionEnergy | None = 
         collision_energy=energies.astype(np.float32),
     )
 
-    # Groups: a target and its decoys at one charge.
     is_decoy = is_decoy_peptide[at].astype(bool)
-    from_decoy = decoy_of[at].astype(np.int64)
-    paired = is_decoy & (from_decoy >= 0)
-    target = np.where(paired, from_decoy, peptide_id).astype(np.int64)
-    # A decoy of nothing stands alone: key it by its own id, apart from targets.
-    alone = is_decoy & ~paired
-    group_key = np.stack([alone.astype(np.int64), target, charge.astype(np.int64)], axis=1)
-    _, group = np.unique(group_key, axis=0, return_inverse=True) if n else (None, np.zeros(0, np.int64))
 
     return RequestPlan(
         requests=requests,
@@ -181,7 +170,6 @@ def build_requests(library: Library, collision_energy: CollisionEnergy | None = 
         peptide_id=peptide_id,
         is_decoy=is_decoy,
         request=request,
-        group=np.asarray(group, dtype=np.int64).reshape(-1),
         unrequestable=unrequestable,
         labelled_peptides=labelled_peptides,
         collision_energy=collision_energy,

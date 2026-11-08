@@ -1,7 +1,11 @@
 # The sweep: matching queries against an acquisition in one pass
 
 Status: P0–P6 built on `feat/sweep` (2026-11-03; vocabulary renamed 2026-11-04); P7 (the two-pass
-gate at proteome scale) is what the measurements below call for.
+gate at proteome scale) is what the measurements below call for. Plumbing for a scorer
+(2026-11-07, `feat/query-plumbing`): channels from one generator with abundances (a library's
+predictions, or a uniform series) and top-N, MS1 at each target's own charge, the reducer's cell view
+and scan context, reducers of several outputs, sweeping a scan or RT range, and the review's sweep
+defects ("Plumbing for a scorer" below).
 
 ## Why
 
@@ -130,9 +134,12 @@ the gate, claims, a summary and workers. `extract_xic_scan_major` (Mode A) is on
   (`tests/_xic_scan_major_oracle.py`) over planted DIA, staggered-DIA and DDA runs and every option. That
   includes NaN, not null, on unmatched values and MS1 isolation bounds, and a NaN RT bound gating nothing
   (Mode A bisected on it).
-- **The gate counts bonds, not channels.** A scan's evidence for a query is the number of distinct
-  (ion type, position) pairs with a channel within tolerance of one of the scan's `top_peaks` most
-  intense peaks, capped by the distinct peaks that matched them. A query passes with a run of `min_consecutive`
+- **The gate counts distinct fragment ions, not channels.** A scan's evidence for a query is the
+  number of distinct (ion type, position) pairs, an ion at any charge or with any loss counting once,
+  with a channel within tolerance of one of the scan's `top_peaks` most intense peaks, capped by the
+  distinct peaks that matched them. Complementary b and y ions of one bond count twice: they sit at
+  different m/z, so each is a match of its own (these words said "bonds" until 2026-11-07; the
+  behaviour was always this). A query passes with a run of `min_consecutive`
   such scans, each with at least `min_fragments`, within `max_gap_s`. Counting runs in the map, the
   verdict in the reduce. Gated reducers see only passing queries, with their whole traces.
 - **Per-level tolerances** go in the trace's schema metadata as `x.massspec.extraction_tolerance.ms<L>`
@@ -283,26 +290,169 @@ scan (rows) and scans in a row (columns), on the purified run:
   purified and GPF sets, natural and with negative isotope offsets), and tests hold both to the
   uncached computation. 180 s and 1.7 GB now, 9.3×; the GPF set 92 → 9 s.
 
+## Plumbing for a scorer (2026-11-07, `feat/query-plumbing`)
+
+Built before any scoring, because a scorer is a reducer and would have inherited what it reads.
+Scoring, FDR and retention-time calibration are the next plans.
+
+### What a reducer gets
+
+- **The cell view.** `QueryBatch.cells(level, fill=True, queries=None)` gives every cell a query
+  could have matched: its channels in each scan it was eligible for. Each cell has one row per match,
+  plus one row (`matched=False`, intensity 0) for an eligible cell with none. Rows are in output order:
+  query, scan, channel, point. Stored on each row: the ledger row, the channel, the point and its m/z
+  and intensity. Derived from them: the channel's theoretical m/z, abundance, identity and evidence
+  key, the error signed observed − theoretical in Da and ppm, and the scan's number, time, TIC and
+  injection time. `Cells.table()` is `SWEEP_CELL_TABLE`. Under the `all` rule a cell keeps every
+  point it was given; the private join the trace reducer used kept only the last, and the trace
+  reducer is now built on the cell view, its output unchanged byte for byte.
+- **Scan context.** The ledger carries each scan's TIC and injection time from the bundle's scan
+  metadata (NaN where there is none, and for a table of points).
+- **Several outputs.** A reducer either declares `outputs` (name → schema) and returns a mapping, or
+  keeps `name` + `schema` and returns one table. On disk each output is `reduce/<name>/`. Every output
+  is held to its schema by name at reduce time: a missing or extra column is refused, naming the
+  reducer. Until now a disk write bound columns by position, so two float columns returned in
+  another order were written swapped. Two reducers may not share an output name.
+- **The same plan on disk as in memory.** A plan on disk (a spilled sweep, or workers) was rebuilt
+  from the query table alone: the targets lost every column but the query's, and `ChannelSettings`
+  went back to their defaults. `QueryPlan.write` / `read` now keep the whole target table, the
+  settings and the abundance source's record.
+- **Part of a run.** `sweep(..., scan_range=(first, last))` or `rt_range=(t0, t1)`, inclusive. Only
+  the scans read are eligible, so zero-filled traces, the gate and the summary cover them alone, and
+  every output records the range (`x.massspec.sweep.scan_range`). A general feature (PI); the
+  calibration pass is expected to use calibrant queries rather than a range.
+
+### Channels: one generator, one abundance convention
+
+- **`massspec.peptide.channels`** makes the channels for every consumer: the sweep's queries, the
+  indexed extraction (Mode B), `spectra.annotate` (the browser's ladders, annotation and trace
+  targets) and the consensus basis. Each used to build its own, with its own defaults. Isotopes are
+  matched at MS1 and fragment ions at MS2 and above; a per-level mapping is where MS3 (reporter ions,
+  say) would go. Counter keeps its own, frozen for its revision.
+- **Abundance is a channel's share of its group's whole modelled distribution**, computed before any
+  selection. A group is a (query, charge) for isotopes and the query for fragments. 0 means modelled and
+  predicted absent; NaN means not modelled. An isotope's abundance is its share of the full envelope,
+  so `n_isotopes` no longer changes it.
+- **Fragment sources.** `UNMODELLED` (NaN, the default); `Uniform`, the classic equal-intensity b/y
+  series of pre-Prosit scoring, with optional weights per ion type, charge and loss; and
+  `library.fragment_abundance.LibraryFragments`, a predicted or empirical library's intensities:
+  - joined exactly on (precursor, ion type, bond, charge, loss);
+  - 0 for an ion inside the coverage the predictor recorded (`x.massspec.prediction.fragment_coverage`)
+    that it did not report, NaN outside it;
+  - streamed from a library directory, keeping only the precursors compiled;
+  - a loss the model covers gets a channel at every bond: the model, not the loss rules, says where
+    its losses are;
+  - a row's m/z must be the ladder's (1e-9 relative for our own libraries, 5 ppm otherwise), and an
+    intact ion inside the settings that matches no channel is refused, since the library and the query
+    then describe different molecules.
+- **Top-N** (`top_isotopes`, `top_fragments`) keeps a group's N most abundant channels in the group's
+  own order, and never changes an abundance. The top isotopes of a heavy peptide need not include
+  M+0. Top fragments need a source that ranks them, so they are refused under `UNMODELLED` or
+  `Uniform` (the browser's "longest y ions first" stays a display rule in `spectra.annotate`).
+- **MS1 at each target's own charge by default** (PI). `charge_range` asks for every target at each
+  charge in a range, the evidence for an analyte across its charges, which is what Counter wants. The
+  old default, (1, 4) for every target, replaced a target's own charge: a 5+ precursor had no MS1 at
+  5+, and a peptide's 2+ and 3+ precursors shared their channels. A target with no charge falls back
+  to 1–4.
+- **Times on a model's clock.** `XIC_TARGET_TABLE` v3 carries `rt_library` and `rt_scale`.
+  `rt_center` is set only on the run's own clock (`observed`, or unstated), and an `rt_window` around
+  model-scale times is refused until calibration lands.
+
+### Defects fixed (from the 2026-11-06 review)
+
+The plan on disk and outputs by name (above); NaN retention times (one scan without a time made a
+block's bounds NaN and left every query of its level inactive for the block; now `nanmin` / `nanmax`,
+and a scan without a time is never eligible); an empty isotope selection or a fragment charge ceiling
+below 1 refused at `ChannelSettings`; a table of points too large for memory refused ("write it as a
+bundle"); the gate's wording (it counts distinct fragment ions, not bonds; above); and the two costs
+below.
+
+### Measurements
+
+- **Compiling queries is vectorized.** Distinct sequences are parsed once, envelopes and ladders
+  built once, and nothing is done per target in Python. Envelopes come many at a time from one
+  Fourier transform (`core.chem.isotopes.isotope_distributions`), with masses identical to the
+  single-peptide function's to the bit: Python 3.12's `sum` is compensated, and the batched mass
+  repeats that sum. On 209,952 targets of 1,000 human proteins (`bench-sweep.py compile`):
+
+  | Levels | Before | After |
+  |---|---|---|
+  | MS1 | 174 s | 4.8 s |
+  | MS2 | 8.9 s | 7.4 s |
+  | both | — | 9.4 s |
+
+- **The reduce reads its own row groups.** Every bucket of a sweep on disk decoded whole 2¹⁸-row
+  groups of every sorted run, growing with the square of the matches. Runs are now written in
+  groups of `run_row_group_rows` (2¹⁵), and a bucket reads only the groups whose query statistics
+  overlap it. On a test sweep of 7 runs and 6 buckets, 1.1× the matches are decoded, against 5.8×.
+- **Eligibility is indexed once.** Grouping scans by isolation window at every call was windows ×
+  scans, quadratic on DDA. A `WindowIndex` is built once per ledger and level, and eligibility is one
+  vectorized search over it with exact integer keys. On a 100,000-scan DDA ledger, 5.5 s a call
+  becomes 0.35 s (0.17 s once built), with the same pairs.
+- **Real data: the full ladder against the top 10 predicted fragments.** The purified BSA/lysin run
+  (bovine serum albumin and *Haliotis* egg lysin; CID, ion trap, 0.35 Da) against its search space as JChronologer predicts it: 3,512 precursors,
+  1,756 targets and as many interior-reversed decoys. `chromatogram extract --level 2 --gate`, 4 workers:
+
+  | Channels | Sweep | Trace | Default gate (50 peaks / 6 ions / 3 scans) |
+  |---|---|---|---|
+  | full b/y ladder, fragment charge ≤ 2 | 237 s | 83.1M rows, 3.2 GB | 231 targets, 34 decoys |
+  | top 10 predicted (`--fragment-abundance library --top-fragments 10`), charge ≤ 3 | 60 s | 17.7M rows, 676 MB | 96 targets, 0 decoys |
+
+  Every query the top-10 gate passed, the ladder's passed too. The top-10 output is the same bytes from
+  one process as from 4 workers, and the same tables, value for value, as a sweep held wholly in
+  memory (whose file differs in its row groups alone).
+
+  Both levels (`--level both`, top 10) took 62 s, adding 9.45M MS1 matches to the 17.7M of MS2, with
+  the same verdicts (the gate reads MS2); each target's MS1 sat at its own charge, one M+0 channel per
+  target at its precursor m/z.
+
+  The gate grid (`bench-sweep.py gate`, targets / decoys passing, of 1,756 each; 1,589 of each are
+  eligible in some MS2 scan):
+
+  | Gate (top peaks / ions / scans) | Full ladder | Top 10 |
+  |---|---|---|
+  | 50 / 6 / 3 (the default) | 231 / 34 | 96 / 0 |
+  | 50 / 8 / 2 | 161 / 2 | 47 / 0 |
+  | 50 / 6 / 2 | 306 / 71 | 118 / 0 |
+  | 50 / 5 / 3 | 374 / 171 | 137 / 0 |
+  | 50 / 5 / 2 | 533 / 354 | 161 / 0 |
+  | 50 / 4 / 3 | 804 / 685 | 177 / 10 |
+  | 50 / 4 / 2 | 1,057 / 974 | 230 / 25 |
+  | 150 / 6 / 3 | 1,471 / 1,424 | 201 / 9 |
+  | 150 / 5 / 3 | 1,574 / 1,568 | 318 / 76 |
+  | 150 / 6 / 1 | 1,589 / 1,587 | 404 / 140 |
+  | 20 / 6 / 2 | 88 / 1 | 47 / 0 |
+  | 20 / 5 / 3 | 101 / 4 | 51 / 0 |
+  | 20 / 4 / 3 | 171 / 34 | 89 / 1 |
+  | 20 / 3 / 3 | 458 / 304 | 140 / 6 |
+
+  With no peak cap every target and decoy passes the ladder's gate, and nearly every one the top 10's.
+
+  Ranking the ions by the prediction separates targets from decoys at least as well as the whole
+  ladder, at a quarter of the sweep's time and a fifth of its trace. But six of ten is a stricter bar
+  than six of a ladder: the default gate passes 96 targets under top 10 against 231. At two decoys or
+  fewer, top 10 at 50 / 5 / 2 passes as many targets (161, none of the decoys) as the ladder does at
+  its best (50 / 8 / 2, 161 and 2). Targets less decoys, the estimate of the true passes, is best
+  under top 10 at 150 / 6 / 1 (264, against the ladder's best 235 at 50 / 6 / 1–2). The defaults are
+  unchanged: this is one run of a two-protein sample, the gate is a pre-filter whose job (P7) is to be
+  settled on a complex sample, and the fragment charge ceilings differ between the two columns. Under
+  top 10, five ions is the place to start.
+
 ## Still to do
 
 - P7, only if the measurements call for it:
   - the two-pass gate at proteome scale (evidence only, then traces for the survivors). The timing table
     calls for it: at 139k queries the sweep's time follows the 476M matches it writes;
-  - query compilation without Python per target. Two steps are done, both exact: ProForma parsing
-    (2,187 purified-run targets took 10 s, nearly all of it lark's Earley parser at about 10 ms a string;
-    `parse_proforma` now reads the simple form — labels, residues with UNIMOD accessions, signed masses
-    or plain names, terminal mods, a charge — with a regular expression into identical objects, about
-    200 times faster, and leaves the rest to the grammar, `tests/test_proforma_fast_path.py`), and the
-    isotope envelopes above. What is left, 1.3 ms a target at proteome scale, is the per-target loop
-    itself;
   - the bucket index layout, if a profile shows the per-group index build mattering. Not measured on
     its own yet; the kernel is a minority of a sweep's time.
-- The purified-sample scorer (elution peaks, co-elution evidence, a verdict rule) as a gated reducer,
-  and output as an experiment directory the browser reads: the next plan.
+- The scorer (elution peaks, co-elution evidence, library similarity, a verdict rule) as a reducer of
+  several outputs over `QueryBatch.cells`, FDR, and output as an experiment directory the browser
+  reads: the next plans.
 - Targets from FASTA files are built (2026-11-05): `massspec search-space`
   ([search-space.md](search-space.md)) writes a library `chromatogram extract --targets` reads, with
   decoys flagged `is_decoy` through the queries and the query summary (schemas v3) instead of the
-  bench's `target_id` offset, and `--own-charge` for one MS1 query per precursor.
+  bench's `target_id` offset. One MS1 query per precursor at its own charge is the default since
+  2026-11-07 (`--charge-range` asks for a range).
 - Profile-points rule, and with it a kernel choice that sees the points within tolerance of a channel
   (above) and an evidence gate for scans without peaks; isolation gating by the whole isotope envelope;
   mixture fits on a scan's competing queries.

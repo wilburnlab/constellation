@@ -96,6 +96,12 @@ class SweepSettings:
     reduce_rows: int = 1 << 22
     #: Matches a map shard holds before writing them out as a sorted run.
     run_rows: int = 4 << 20
+    #: Rows per row group of a sorted run. A bucket reads, from every run,
+    #: the row groups its query range overlaps: whole 2^18-row groups made
+    #: each bucket decode far more than its own rows, growing with the
+    #: square of the matches (an estimated 8-15x at 476M; review of
+    #: 2026-11-06).
+    run_row_group_rows: int = 1 << 15
     #: Matches a sweep in memory holds before it carries on on disk. A held
     #: match costs some 200–500 bytes at peak (sorting, the reducers' tables),
     #: so this keeps an in-memory sweep near a disk worker's 3 GB.
@@ -161,7 +167,10 @@ class SweepResult:
         with pq.ParquetWriter(tmp, schema) as writer:
             for f in self.parts[name]:
                 for batch in pq.ParquetFile(f).iter_batches():
-                    writer.write_batch(pa.RecordBatch.from_arrays(batch.columns, schema=schema))
+                    # By name, not position.
+                    writer.write_batch(
+                        pa.RecordBatch.from_arrays([batch.column(c.name).cast(c.type) for c in schema], schema=schema)
+                    )
         tmp.replace(out)
         return out
 
@@ -187,10 +196,9 @@ def _f64(col: pa.ChunkedArray) -> np.ndarray:
 
 
 def _scan_metadata(bundle: Path) -> Ledger:
-    t = pq.read_table(
-        bundle / "scan_metadata.parquet",
-        columns=["scan", "level", "rt", "isolation_lower", "isolation_upper"],
-    ).sort_by("scan")
+    path = bundle / "scan_metadata.parquet"
+    context = [c for c in ("tic", "iit") if c in pq.read_schema(path).names]
+    t = pq.read_table(path, columns=["scan", "level", "rt", "isolation_lower", "isolation_upper", *context]).sort_by("scan")
     n = t.num_rows
     return Ledger(
         scan=t.column("scan").to_numpy().astype(np.int64),
@@ -199,6 +207,8 @@ def _scan_metadata(bundle: Path) -> Ledger:
         lower=_f64(t.column("isolation_lower")),
         upper=_f64(t.column("isolation_upper")),
         n_points=np.zeros(n, dtype=np.int64),
+        tic=_f64(t.column("tic").fill_null(np.nan)) if "tic" in context else None,
+        iit=_f64(t.column("iit").cast(pa.float64()).fill_null(np.nan)) if "iit" in context else None,
     )
 
 
@@ -336,12 +346,16 @@ def _map_block(block: _Block, plan: QueryPlan, settings: SweepSettings) -> _MapO
         if channels is None or channels.n == 0:
             continue
         rows = np.flatnonzero(block.level == level)
-        if rows.size == 0:
+        timed = rows[~np.isnan(block.rt[rows])]
+        if timed.size == 0:
+            # A scan without a retention time is never eligible
+            # (pair_eligible); one of them used to make min/max NaN and
+            # leave every scan of the level in the block unmatched.
             continue
         tolerance, unit = settings.tolerance(level)
         counts = channels.counts()
         active = active_queries(
-            plan.rt_lo, plan.rt_hi, counts > 0, float(block.rt[rows].min()), float(block.rt[rows].max())
+            plan.rt_lo, plan.rt_hi, counts > 0, float(block.rt[timed].min()), float(block.rt[timed].max())
         )
         groups = isolation_groups(
             active, plan.precursor_mz, block.lower[rows], block.upper[rows], rows, gate=level > 1
@@ -443,9 +457,63 @@ def _batch(plan, queries, out: _MapOut, ledger, order, settings, shared) -> Quer
     return replace(batch, decision=decision)
 
 
-def _reduce(batch: QueryBatch, reducers: Sequence[Reducer]) -> list[pa.Table]:
+def _conform(table: pa.Table, schema: pa.Schema, who: str) -> pa.Table:
+    """``table`` as ``schema``: the same column names, in its order and
+    types. A missing or extra column is the reducer's mistake and is
+    refused, naming it; columns are matched by name, never by position
+    (a reducer returning two columns in another order had them written
+    swapped until 2026-11-07)."""
+    names, want = set(table.column_names), set(schema.names)
+    if names != want:
+        missing, extra = sorted(want - names), sorted(names - want)
+        raise ValueError(
+            f"reducer {who!r} returned a table that is not its schema"
+            + (f"; missing {missing}" if missing else "")
+            + (f"; not in its schema {extra}" if extra else "")
+        )
+    try:
+        return pa.table([table.column(f.name).cast(f.type) for f in schema], schema=schema)
+    except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError) as exc:
+        raise ValueError(f"reducer {who!r} returned columns its schema does not take: {exc}") from exc
+
+
+def outputs_of(reducer: Reducer) -> dict[str, pa.Schema]:
+    """A reducer's outputs, by name: its ``outputs``, or the one named
+    ``name`` of ``schema`` (a reducer of one table)."""
+    outputs = getattr(reducer, "outputs", None)
+    if outputs is not None:
+        return dict(outputs)
+    return {reducer.name: reducer.schema}
+
+
+def _reduce(batch: QueryBatch, reducers: Sequence[Reducer]) -> list[dict[str, pa.Table]]:
+    """Each reducer's output tables by name, each held to its schema."""
     passing = batch.passing() if any(r.gated for r in reducers) else None
-    return [r.reduce(passing if r.gated else batch) for r in reducers]
+    out = []
+    for r in reducers:
+        got = r.reduce(passing if r.gated else batch)
+        schemas = outputs_of(r)
+        if isinstance(got, pa.Table):
+            if len(schemas) != 1:
+                raise ValueError(f"reducer {r.name!r} declares outputs {sorted(schemas)} but returned one table")
+            got = {next(iter(schemas)): got}
+        if set(got) != set(schemas):
+            raise ValueError(f"reducer {r.name!r} returned outputs {sorted(got)}, not its {sorted(schemas)}")
+        out.append({name: _conform(got[name], schemas[name], f"{r.name}:{name}" if name != r.name else name)
+                    for name in schemas})  # fmt: skip
+    return out
+
+
+def _check_outputs(reducers: Sequence[Reducer], settings: SweepSettings) -> None:
+    """Output names are unique across reducers, and not the claims'."""
+    seen: dict[str, str] = {}
+    for r in reducers:
+        for name in outputs_of(r):
+            if name == CLAIMS and settings.claims:
+                raise ValueError(f"reducer {r.name!r} names an output {CLAIMS!r}, the claims' own")
+            if name in seen:
+                raise ValueError(f"reducers {seen[name]!r} and {r.name!r} both name an output {name!r}")
+            seen[name] = r.name
 
 
 def sweep(
@@ -457,6 +525,8 @@ def sweep(
     workers: int = 1,
     work_dir: Path | str | None = None,
     progress: ProgressCallback | None = None,
+    scan_range: tuple[int, int] | None = None,
+    rt_range: tuple[float, float] | None = None,
 ) -> SweepResult:
     """Sweep ``source`` for ``plan``'s queries and reduce the matches.
 
@@ -466,18 +536,80 @@ def sweep(
     ``workers``), each range's matches are written to ``work_dir`` in sorted
     runs of at most ``settings.run_rows``, and each bucket of queries is
     reduced from them, ``workers`` processes at a time for both. The outputs
-    are the same either way, byte for byte, whatever the number of workers.
+    are the same tables either way, and the same bytes whatever the number
+    of workers; a file written from a sweep on disk keeps its parts' row
+    groups, so it differs from an in-memory sweep's file in those alone.
     Without a ``work_dir`` a temporary one is used, kept while the result
     is, so its outputs are read as asked. With ``settings.claims`` the
-    claims table is the ``point_claims`` output.
+    claims table is the ``point_claims`` output. A reducer gives one output
+    (``name``, ``schema``) or several (``outputs``, a name → schema mapping,
+    with ``reduce`` returning a name → table mapping); output names are
+    unique across reducers.
+
+    ``scan_range=(first, last)`` or ``rt_range=(t0, t1)`` (inclusive) sweeps
+    part of the run: only those scans are read, so only they are eligible
+    (zero-filled, gated, counted); an RT range reads the scans between the
+    first and last whose time falls in it. The range is recorded in every
+    output's metadata (``x.massspec.sweep.scan_range``).
     """
+    _check_outputs(reducers, settings)
+    if scan_range is not None and rt_range is not None:
+        raise ValueError("give a scan_range or an rt_range, not both")
+    window = _window(source, scan_range, rt_range)
+    result = _sweep(source, plan, settings, reducers, workers, work_dir, progress, window)
+    if window is not None:
+        stamp = {b"x.massspec.sweep.scan_range": f"{window[0]},{window[1] - 1}".encode()}
+        if rt_range is not None:
+            stamp[b"x.massspec.sweep.rt_range"] = f"{float(rt_range[0])!r},{float(rt_range[1])!r}".encode()
+        for name in result.schemas:
+            result.metadata[name] = {**result.metadata.get(name, {}), **stamp}
+    return result
+
+
+def _window(source, scan_range, rt_range) -> tuple[int, int] | None:
+    """The half-open scan range ``[lo, hi)`` a sweep reads, or None for all."""
+    if scan_range is None and rt_range is None:
+        return None
+    if scan_range is not None:
+        first, last = (int(x) for x in scan_range)
+        if last < first:
+            raise ValueError(f"scan_range must be (first, last) with first <= last; got {scan_range!r}")
+        return first, last + 1
+    t0, t1 = (float(x) for x in rt_range)
+    if t1 < t0:
+        raise ValueError(f"rt_range must be (start, end) with start <= end; got {rt_range!r}")
     if isinstance(source, pa.Table):
+        scan, rt = source.column("scan").to_numpy(), _f64(source.column("rt"))
+    else:
+        meta = pq.read_table(Path(source) / "scan_metadata.parquet", columns=["scan", "rt"])
+        scan, rt = meta.column("scan").to_numpy(), _f64(meta.column("rt"))
+    inside = scan[(rt >= t0) & (rt <= t1)]
+    if inside.size == 0:
+        return 0, 0
+    return int(inside.min()), int(inside.max()) + 1
+
+
+def _sweep(source, plan, settings, reducers, workers, work_dir, progress, window) -> SweepResult:
+    if isinstance(source, pa.Table):
+        if window is not None:
+            scans = source.column("scan")
+            source = source.filter(pc.and_(pc.greater_equal(scans, window[0]), pc.less(scans, window[1])))
         if settings.mz_axis is not None:
             raise ValueError("an m/z axis belongs to a bundle; a table of points has none to apply")
         if workers > 1 or work_dir is not None:
             raise ValueError("a table of points is swept in memory; give a bundle to use workers")
         blocks, ledger = _table_blocks(source, settings.block_rows, plan.levels)
-        out = _MapOut.concat([_map_block(b, plan, settings) for b in blocks])
+        parts, held = [], 0
+        for b in blocks:
+            parts.append(_map_block(b, plan, settings))
+            held += parts[-1].matches.n
+            if held > settings.memory_rows:
+                # A table of points has no disk path to carry on along.
+                raise MemoryError(
+                    f"over {settings.memory_rows} matches from a table of points, which is swept in memory: "
+                    f"write it as a bundle to sweep it on disk, or raise memory_rows"
+                )
+        out = _MapOut.concat(parts)
         return _reduce_in_memory(out, plan, ledger, settings, reducers, None)
     bundle = Path(source)
     read_bundle_manifest(bundle)
@@ -486,7 +618,12 @@ def sweep(
         ledger = _scan_metadata(bundle)
         emit_start(progress, "sweep", total=0, message=bundle.name)
         parts, held = [], 0
-        blocks = _bundle_blocks(bundle, ledger, settings, axis)
+        stream = (
+            iter_scan_blocks(bundle, columns=("mz", "intensity"), block_rows=settings.block_rows, scan_range=window)
+            if window is not None
+            else None
+        )
+        blocks = _bundle_blocks(bundle, ledger, settings, axis, blocks=stream)
         for b in blocks:
             parts.append(_map_block(b, plan, settings))
             held += parts[-1].matches.n
@@ -495,24 +632,24 @@ def sweep(
                 # sweep on disk, which carries on from the next block.
                 emit_done(progress, "sweep", message=f"over {settings.memory_rows} matches; on disk")
                 return _on_temporary_disk(bundle, plan, settings, reducers, 1, progress,
-                                          resume=(ledger, blocks, parts))  # fmt: skip
+                                          resume=(ledger, blocks, parts), window=window)  # fmt: skip
         out = _MapOut.concat(parts)
         result = _reduce_in_memory(out, plan, ledger, settings, reducers, axis)
         emit_done(progress, "sweep", message=f"{out.matches.n} matches")
         return result
     if work_dir is None:
-        return _on_temporary_disk(bundle, plan, settings, reducers, workers, progress)
-    return _sweep_on_disk(bundle, plan, settings, reducers, workers, Path(work_dir), progress)
+        return _on_temporary_disk(bundle, plan, settings, reducers, workers, progress, window=window)
+    return _sweep_on_disk(bundle, plan, settings, reducers, workers, Path(work_dir), progress, window=window)
 
 
-def _on_temporary_disk(bundle, plan, settings, reducers, workers, progress, resume=None) -> SweepResult:
+def _on_temporary_disk(bundle, plan, settings, reducers, workers, progress, resume=None, window=None) -> SweepResult:
     """A sweep on disk in a temporary directory, which lives as long as its
     result: outputs are read from it as asked, and it is removed after.
     ``resume`` is (ledger, the rest of the block stream, matches held) of an
     in-memory sweep to carry on, as one shard."""
     tmp = Path(tempfile.mkdtemp(prefix="sweep-"))
     try:
-        result = _sweep_on_disk(bundle, plan, settings, reducers, workers, tmp, progress, resume=resume)
+        result = _sweep_on_disk(bundle, plan, settings, reducers, workers, tmp, progress, resume=resume, window=window)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -543,9 +680,11 @@ def _reduce_in_memory(out: _MapOut, plan, ledger, settings, reducers, axis) -> S
               if settings.claims else None)  # fmt: skip
     batch = _batch(plan, queries, out, ledger, order, settings, shared)
     result = SweepResult(scans=ledger, matches=batch.matches, mz_axis=None if axis is None else axis.key)
-    for reducer, table in zip(reducers, _reduce(batch, reducers)):
-        result.tables[reducer.name] = table
-        result.schemas[reducer.name] = reducer.schema
+    for reducer, tables in zip(reducers, _reduce(batch, reducers)):
+        schemas = outputs_of(reducer)
+        for name, table in tables.items():
+            result.tables[name] = table
+            result.schemas[name] = schemas[name]
     if settings.claims:
         result.tables[CLAIMS] = claims_table(out.claims, plan, ledger, settings.acquisition_id)
         result.schemas[CLAIMS] = SWEEP_POINT_CLAIM_TABLE
@@ -576,10 +715,7 @@ def _worker_plan(work: Path) -> QueryPlan:
     key = f"plan:{work}"
     if key not in _WORKER:
         _WORKER.clear()
-        _WORKER[key] = QueryPlan.from_tables(
-            pq.read_table(work / "plan" / "queries.parquet"),
-            pq.read_table(work / "plan" / "channels.parquet"),
-        )
+        _WORKER[key] = QueryPlan.read(work / "plan")
     return _WORKER[key]  # type: ignore[return-value]
 
 
@@ -592,6 +728,8 @@ def _read_ledger(path: Path) -> Ledger:
         lower=_f64(t.column("isolation_lower")),
         upper=_f64(t.column("isolation_upper")),
         n_points=t.column("n_points").to_numpy().astype(np.int64),
+        tic=_f64(t.column("tic").fill_null(np.nan)),
+        iit=_f64(t.column("iit").fill_null(np.nan)),
     )
 
 
@@ -679,11 +817,11 @@ def _map_stream(
         run += 1
         m = out.matches
         m = m.take(np.lexsort((m.point_index, m.channel, m.scan, m.level, m.query)))
-        _write(m.table(), w / "matches" / name, row_group_size=1 << 18)
+        _write(m.table(), w / "matches" / name, row_group_size=settings.run_row_group_rows)
         if settings.gate is not None:
             e = out.evidence
             _write(_evidence_table(e.take(np.lexsort((e.scan, e.group, e.query)))),
-                   w / "evidence" / name, row_group_size=1 << 18)  # fmt: skip
+                   w / "evidence" / name, row_group_size=settings.run_row_group_rows)  # fmt: skip
         if settings.claims:
             _write(out.claims.sorted().table(), w / "claims" / name, row_group_size=1 << 18)
             shared[:] += _shared_counts(out.claims, plan.n_queries, per_cell=settings.rule.name == "sum")
@@ -719,14 +857,42 @@ def _write(table: pa.Table, path: Path, **kw) -> None:
     tmp.replace(path)
 
 
-def _read_range(files: list[Path], q0: int, q1: int) -> pa.Table | None:
-    import pyarrow.dataset as ds
+#: Rows a reduce has decoded from sorted runs, in this process (for tests
+#: and benchmarks of how much more than its own rows a bucket reads).
+READ_STATS = {"rows_decoded": 0}
 
+
+def _footer(path: Path):
+    """A run's footer, read once per process."""
+    key = f"footer:{path}"
+    if key not in _WORKER:
+        _WORKER[key] = pq.read_metadata(path)
+    return _WORKER[key]
+
+
+def _read_range(files: list[Path], q0: int, q1: int) -> pa.Table | None:
+    """The rows of queries ``[q0, q1)`` from sorted runs: in each run, only
+    the row groups whose ``query`` statistics overlap the range are read."""
     if not files:
         return None
-    return ds.dataset([str(f) for f in files], format="parquet").to_table(
-        filter=(ds.field("query") >= q0) & (ds.field("query") < q1)
-    )
+    parts = []
+    schema = None
+    for f in files:
+        meta = _footer(f)
+        schema = schema or meta.schema.to_arrow_schema()
+        column = meta.schema.to_arrow_schema().get_field_index("query")
+        groups = []
+        for i in range(meta.num_row_groups):
+            stats = meta.row_group(i).column(column).statistics
+            if stats is None or not stats.has_min_max or (stats.max >= q0 and stats.min < q1):
+                groups.append(i)
+        if groups:
+            table = pq.ParquetFile(f, metadata=meta).read_row_groups(groups)
+            READ_STATS["rows_decoded"] += table.num_rows
+            q = table.column("query")
+            parts.append(table.filter(pc.and_(pc.greater_equal(q, q0), pc.less(q, q1))))
+    # One bucket's rows, for one reducer call: not a hand-off between stages.
+    return pa.concat_tables(parts) if parts else schema.empty_table()
 
 
 def _reduce_bucket(
@@ -754,11 +920,12 @@ def _reduce_bucket(
     queries = np.arange(q0, q1, dtype=np.int64)
     batch = _batch(plan, queries, _MapOut(matches, evidence, Claims.empty()), ledger, order, settings,
                    shared)  # fmt: skip
-    out = []
-    for reducer, table in zip(reducers, _reduce(batch, reducers)):
-        path = w / "reduce" / reducer.name / f"part-{index:05d}.parquet"
-        _write(table, path)
-        out.append(str(path))
+    out: dict[str, str] = {}
+    for tables in _reduce(batch, reducers):
+        for name, table in tables.items():
+            path = w / "reduce" / name / f"part-{index:05d}.parquet"
+            _write(table, path)
+            out[name] = str(path)
     return out
 
 
@@ -844,16 +1011,19 @@ class _Inline:
         return False
 
 
-def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progress, resume=None) -> SweepResult:
+def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progress, resume=None,
+                   window=None) -> SweepResult:  # fmt: skip
     _WORKER.clear()  # an inline sweep reads its plan through the same cache
     for sub in ("matches", "evidence", "claims", "shared", "scans", "reduce"):
         if (work / sub).exists():
             shutil.rmtree(work / sub)
-    queries, channels = plan.to_tables()
-    _write(queries, work / "plan" / "queries.parquet")
-    _write(channels, work / "plan" / "channels.parquet")
+    plan.write(work / "plan")
     axis = _load_axis(bundle, settings)
     shards = scan_range_shards(bundle, target_rows=settings.shard_rows) if resume is None else [None]
+    if window is not None and resume is None:
+        # Each shard cut to the range; one that lies outside it reads nothing.
+        shards = [(max(lo, window[0]), min(hi, window[1])) for lo, hi in shards]
+        shards = [(lo, hi) for lo, hi in shards if lo < hi]
     pool = (
         ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn"), initializer=_init_worker)
         if workers > 1
@@ -891,9 +1061,10 @@ def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progre
         )
     _WORKER.clear()
     result = SweepResult(scans=ledger, matches=None, mz_axis=None if axis is None else axis.key)
-    for k, reducer in enumerate(reducers):
-        result.parts[reducer.name] = [Path(p[k]) for p in paths]
-        result.schemas[reducer.name] = reducer.schema
+    for reducer in reducers:
+        for name, schema in outputs_of(reducer).items():
+            result.parts[name] = [Path(p[name]) for p in paths]
+            result.schemas[name] = schema
     if settings.claims:
         result.parts[CLAIMS] = [Path(p) for part in claim_parts for p in part]
         result.schemas[CLAIMS] = SWEEP_POINT_CLAIM_TABLE

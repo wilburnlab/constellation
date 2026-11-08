@@ -377,7 +377,7 @@ def predict_library(
     request and the m/z come from each precursor's own peptide; its decoys,
     spans and modification provenance survive. With ``on_unsupported=
     "error"`` a precursor the model cannot take raises before any request;
-    with ``"skip"`` it is left out with its target/decoy partners and
+    with ``"skip"`` it is left out, on its own, and
     counted (``x.koina.precursors_not_predicted``). A fragment the model
     names that the peptide cannot have is left out and counted
     (``n_unparseable_annotations``).
@@ -464,10 +464,24 @@ def predict_library(
         "x.koina.rt_scale": rt_model(rt_model_name).scale if rt_model_name else "",
         **(metadata or {}),
     }
+    if rt_model_name:
+        # The scale every library states its rt_predicted on, as
+        # predict_onto writes it (until 2026-11-07 this path wrote only
+        # Koina's own key, which nothing else reads).
+        meta["x.massspec.prediction.rt_scale"] = f"koina:{rt_model_name}:{rt_model(rt_model_name).scale}"
     if energy is not None:
         meta["x.massspec.prediction.collision_energy"] = energy.describe(
             sorted({s.charge for s in sent})
         )
+    # Which ions the model speaks for, as predict_onto records it: an ion
+    # inside it with no row was predicted below the floor (abundance 0),
+    # and its charge ceiling is extraction's default (until 2026-11-07
+    # this path recorded none, so every such ion read as unknown).
+    from constellation.massspec.library.koina.predictor import fragment_capabilities
+
+    meta["x.massspec.prediction.fragment_coverage"] = fragment_capabilities(
+        overlay, min_intensity=min_intensity, fragmentation=fragmentation
+    ).fragment_coverage()
     return assemble_library(
         sent,
         response,

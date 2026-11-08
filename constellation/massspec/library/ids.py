@@ -333,14 +333,18 @@ def with_content_ids(library: Library, *, vocab: ModVocab = UNIMOD) -> Library:
 
     ``protein_id``, ``peptide_id`` and ``precursor_id`` are recomputed
     from the accession, the modified sequence, and the modified sequence
-    plus charge; the foreign keys in ``precursors``, ``fragments`` and
-    ``protein_peptide`` follow. ``modified_sequence`` is rewritten to
-    its canonical key, so a reader of the tables can check an id against
-    the row it sits on. The scheme is recorded in the metadata.
+    plus charge; every table naming them follows (``precursors``,
+    ``fragments``, ``protein_peptide``, the spans and their edges, the
+    modification rows, and ``decoy_of``). ``modified_sequence`` is
+    rewritten to its canonical key, so a reader of the tables can check
+    an id against the row it sits on. The scheme is recorded in the
+    metadata.
 
     Raises ``ValueError`` when two rows turn out to be the same entity
     (two spellings of one peptide; the same peptide and charge twice),
-    since the result could not have unique ids.
+    since the result could not have unique ids, and when ``decoy_of``
+    names a peptide the library does not hold under ids that are not
+    already content ids.
     """
     accessions = library.proteins.column("accession").to_pylist()
     protein_keys = [canonical_protein_key(a) for a in accessions]
@@ -396,6 +400,34 @@ def with_content_ids(library: Library, *, vocab: ModVocab = UNIMOD) -> Library:
         "peptide_id",
         _remap(library.protein_peptide.column("peptide_id"), old_peptide, new_peptide),
     )
+    # ``decoy_of`` names the peptide a decoy was made from, which a library
+    # need not hold (a subset may keep a decoy without its target): one it
+    # holds is re-keyed with it; one it does not can be kept only if it is
+    # already a content id. Until 2026-11-07 decoy_of, the spans, their
+    # edges and the modification rows kept their old ids.
+    decoy_of = library.peptides.column("decoy_of")
+    held = pc.fill_null(pc.is_in(decoy_of, value_set=old_peptide), False)
+    dangling = pc.and_(pc.is_valid(decoy_of), pc.invert(held))
+    if pc.any(dangling).as_py() and library.metadata_extras.get(ID_SCHEME_METADATA_KEY) != ID_SCHEME:
+        raise ValueError(
+            "decoy_of names peptides this library does not hold, and its ids are not content ids, "
+            "so theirs cannot be computed"
+        )
+    peptides = _set(
+        peptides, "decoy_of", pc.if_else(dangling, decoy_of, _remap(decoy_of, old_peptide, new_peptide))
+    )
+    spans = library.peptide_spans
+    if spans.num_rows:
+        spans = _set(spans, "protein_id", _remap(spans.column("protein_id"), old_protein, new_protein))
+    span_edges = library.span_peptide
+    if span_edges.num_rows:
+        span_edges = _set(span_edges, "protein_id", _remap(span_edges.column("protein_id"), old_protein, new_protein))
+        span_edges = _set(span_edges, "peptide_id", _remap(span_edges.column("peptide_id"), old_peptide, new_peptide))
+    modifications = library.peptide_modifications
+    if modifications.num_rows:
+        modifications = _set(
+            modifications, "peptide_id", _remap(modifications.column("peptide_id"), old_peptide, new_peptide)
+        )
     return replace(
         library,
         proteins=proteins,
@@ -403,6 +435,9 @@ def with_content_ids(library: Library, *, vocab: ModVocab = UNIMOD) -> Library:
         precursors=precursors,
         fragments=fragments,
         protein_peptide=edges,
+        peptide_spans=spans,
+        span_peptide=span_edges,
+        peptide_modifications=modifications,
         metadata_extras={**library.metadata_extras, ID_SCHEME_METADATA_KEY: ID_SCHEME},
     )
 

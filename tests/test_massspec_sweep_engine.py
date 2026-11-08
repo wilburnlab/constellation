@@ -62,6 +62,7 @@ def test_a_streamed_bundle_gives_what_its_table_gives_the_oracle(tmp_root, name,
     kw = dict(
         acquisition_id=3, level=level, rt_window=15.0, tolerance=0.35, tolerance_unit="Da",
         all_in_window=mode == "all_in_window", drop_unmatched=mode != "keep_unmatched",
+        charge_range=(1, 4),  # the oracle's default; the sweep's is each target's own charge
     )  # fmt: skip
     want = oracle.extract_xic_scan_major(peaks, targets, **kw)
     assert want.num_rows > 0
@@ -385,3 +386,385 @@ def test_extract_xic_records_its_tolerances_in_memory_and_written(tmp_root, tmp_
     args = argparse.Namespace(extraction_tolerance_ppm=None, trace=tmp_path / "xic_trace.parquet",
                               collide_ppm=20.0, no_progress=True)  # fmt: skip
     assert _resolve_collide_ppm(args) == 8.0
+
+
+# ── the same plan on disk; outputs bound by name (review of 2026-11-06) ──
+
+
+_PROBE_SCHEMA = pa.schema([("query", pa.int64()), ("rt_center", pa.float64()), ("scan", pa.int32()),
+                           ("settings", pa.string())])  # fmt: skip
+
+
+class _PlanProbe:
+    """What a reducer sees of its plan: the targets' columns and settings."""
+
+    name = "probe"
+    schema = _PROBE_SCHEMA
+    gated = False
+
+    def reduce(self, batch):
+        import json
+
+        t = batch.plan.targets.take(pa.array(batch.queries))
+        return pa.table({
+            "query": pa.array(batch.queries, pa.int64()), "rt_center": t.column("rt_center"),
+            "scan": t.column("scan"),
+            "settings": [json.dumps(batch.plan.settings.to_dict())] * batch.queries.size,
+        }, schema=_PROBE_SCHEMA)  # fmt: skip
+
+
+class _Swapped:
+    """Returns its schema's columns in another order."""
+
+    name = "swapped"
+    schema = pa.schema([("a", pa.float64()), ("b", pa.float64())])
+    gated = False
+
+    def reduce(self, batch):
+        n = batch.queries.size
+        return pa.table({"b": np.full(n, 2.0), "a": np.full(n, 1.0)})
+
+
+class _Wrong:
+    name = "wrong"
+    schema = pa.schema([("a", pa.float64())])
+    gated = False
+
+    def reduce(self, batch):
+        return pa.table({"z": np.zeros(batch.queries.size)})
+
+
+def test_reducers_see_the_same_plan_in_memory_spilled_and_in_workers(tmp_root, tmp_path):
+    """On disk the plan was rebuilt from the query table, without the
+    targets' other columns and with default settings."""
+    from constellation.massspec.sweep import ChannelSettings
+
+    run, bundle, _ = _run("dia", tmp_root)
+    targets = _targets(run).set_column(
+        _targets(run).schema.get_field_index("scan"), "scan", pa.array(range(run.targets.num_rows), pa.int32())
+    )
+    settings = ChannelSettings(n_isotopes=2, charge_range=(2, 3), max_fragment_charge=1)
+    plan = compile_queries(targets, levels=[1, 2], channels=settings, rt_window=20.0)
+    tol = {1: (20.0, "ppm"), 2: (0.35, "Da")}
+    base = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[_PlanProbe()]).table("probe")
+    assert base.column("scan").null_count == 0 and base.column("rt_center").null_count == 0
+    spilled = sweep(bundle, plan, SweepSettings(tolerances=tol, memory_rows=10, run_rows=50),
+                    reducers=[_PlanProbe()])  # fmt: skip
+    assert spilled.matches is None
+    assert spilled.table("probe").equals(base)
+    for workers in (1, 3):
+        got = sweep(bundle, plan, SweepSettings(tolerances=tol, reduce_rows=50), reducers=[_PlanProbe()],
+                    workers=workers, work_dir=tmp_path / f"w{workers}")  # fmt: skip
+        assert got.table("probe").equals(base)
+
+
+def test_outputs_are_bound_to_their_schema_by_name(tmp_root, tmp_path):
+    """Columns returned in another order were written swapped, on disk."""
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    tol = {2: (0.35, "Da")}
+    for kw in ({}, dict(workers=2, work_dir=tmp_path / "w")):
+        result = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[_Swapped()], **kw)
+        for table in (result.table("swapped"), pq.read_table(result.write("swapped", tmp_path / "out.parquet"))):
+            assert set(table.column("a").to_pylist()) == {1.0} and set(table.column("b").to_pylist()) == {2.0}
+    with pytest.raises(ValueError, match="reducer 'wrong'.*missing \\['a'\\].*not in its schema \\['z'\\]"):
+        sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[_Wrong()])
+
+
+def test_a_scan_without_a_retention_time_leaves_the_others_matched(tmp_root):
+    """One NaN retention time made the block's min/max NaN, and no query
+    was active at that level for the whole block."""
+    run, _, peaks = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
+    base = _traces(peaks, plan)
+    rt = peaks.column("rt").to_numpy().copy()
+    first_ms2 = int(np.flatnonzero(peaks.column("level").to_numpy() == 2)[0])
+    lost_scan = peaks.column("scan")[first_ms2].as_py()
+    rt[peaks.column("scan").to_numpy() == lost_scan] = np.nan
+    with_nan = peaks.set_column(peaks.schema.get_field_index("rt"), "rt", pa.array(rt))
+    got = _traces(with_nan, plan, block_rows=1 << 30)
+    keep = pc.not_equal(base.column("scan"), lost_scan)
+    assert got.num_rows == base.filter(keep).num_rows > 0
+
+
+def test_a_table_of_points_past_memory_rows_is_refused(tmp_root):
+    """A table of points is swept in memory and has no disk path to spill
+    to; it grew without bound."""
+    run, _, peaks = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    with pytest.raises(MemoryError, match="write it as a bundle"):
+        sweep(peaks, plan, SweepSettings(tolerances={2: (0.35, "Da")}, memory_rows=5, block_rows=200),
+              reducers=[XicTraceReducer()])  # fmt: skip
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_eligibility_on_random_ledgers_is_the_definition(seed):
+    """Random ledgers with what real runs mix: shared DIA windows, one
+    window per DDA scan, scans without bounds or without a time or points,
+    queries without a precursor m/z, assigned scans in and out of reach.
+    The vectorized index must give exactly the definition's pairs (it
+    replaced a regrouping that cost windows × scans per call)."""
+    from constellation.massspec.sweep.reduce import Ledger, Matches, QueryBatch
+
+    rng = np.random.default_rng(seed)
+    n = 400
+    level = np.where(rng.random(n) < 0.15, 1, 2).astype(np.int8)
+    dia = rng.integers(0, 6, n)
+    dda = rng.random(n) < 0.4
+    centre = np.where(dda, rng.uniform(400, 1000, n), 400 + 100 * dia + 50)
+    width = np.where(dda, 0.7, 50.0)
+    lower, upper = centre - width, centre + width
+    unbounded = rng.random(n) < 0.05
+    lower[(level == 1) | unbounded], upper[(level == 1) | unbounded] = np.nan, np.nan
+    rt = np.sort(rng.uniform(0, 600, n))
+    rt[rng.random(n) < 0.03] = np.nan
+    points = np.where(rng.random(n) < 0.05, 0, 100).astype(np.int64)
+    ledger = Ledger(scan=np.arange(n, dtype=np.int64) * 3 + 11, level=level, rt=rt, lower=lower, upper=upper,
+                    n_points=points)  # fmt: skip
+    m = 60
+    rows = []
+    for i in range(m):
+        row = dict(target_id=i, modified_sequence="PEPTIDEK", precursor_charge=2)
+        if i % 7 != 3:
+            row["precursor_mz"] = float(rng.uniform(380, 1020))
+        if i % 3 == 0:
+            row["rt_center"] = float(rng.uniform(0, 600))
+        elif i % 3 == 1:
+            t0 = float(rng.uniform(0, 500))
+            row["rt_start"], row["rt_end"] = t0, t0 + float(rng.uniform(0, 120))
+        if i % 5 == 0:
+            row["scan"] = int(ledger.scan[rng.integers(0, n)]) if i % 10 else 999_999  # one not in the ledger
+        rows.append(row)
+    targets = pa.Table.from_pylist(rows, schema=XIC_TARGET_TABLE)
+    settings = SweepSettings(tolerances={1: (20.0, "ppm"), 2: (0.35, "Da")})
+    for assigned in (False, True):
+        plan = compile_queries(targets, levels=[1, 2], rt_window=40.0, assigned_scans_only=assigned)
+        every = np.arange(plan.n_queries, dtype=np.int64)
+        batch = QueryBatch(plan=plan, queries=every, matches=Matches.empty(), scans=ledger,
+                           scan_order=ledger.order(), settings=settings)  # fmt: skip
+        for lv in (1, 2):
+            want = _brute_pairs(plan, ledger, lv, every)
+            q, r = batch.eligible(lv)
+            assert list(zip(q.tolist(), r.tolist())) == want, (seed, assigned, lv)
+            counts = np.bincount([p[0] for p in want], minlength=plan.n_queries)
+            assert batch.eligible_counts(lv).tolist() == counts.tolist()
+
+
+def test_the_window_index_is_built_once_per_ledger_and_level(tmp_root, monkeypatch):
+    from constellation.massspec.sweep import reduce as reduce_module
+    from constellation.massspec.sweep.reduce import Matches, QueryBatch
+
+    calls = []
+    real = reduce_module.window_index
+    monkeypatch.setattr(reduce_module, "window_index", lambda *a, **k: calls.append(a[-1]) or real(*a, **k))
+    run, bundle, _ = _run("dda", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2], rt_window=15.0)
+    settings = SweepSettings(tolerances={1: (20.0, "ppm"), 2: (0.35, "Da")})
+    ledger = sweep(bundle, plan, settings).scans
+    calls.clear()
+    every = np.arange(plan.n_queries, dtype=np.int64)
+    batch = QueryBatch(plan=plan, queries=every, matches=Matches.empty(), scans=ledger,
+                       scan_order=ledger.order(), settings=settings)  # fmt: skip
+    for _ in range(3):
+        batch.eligible(2)
+        batch.eligible_counts(2)
+        batch.eligible_cells(1)
+    assert sorted(calls) == [1, 2]
+
+
+def test_a_bucket_reads_about_its_own_rows_from_the_runs(tmp_root, tmp_path):
+    """Each bucket decoded whole 2^18-row groups of every run, which grows
+    with the square of the matches (review of 2026-11-06): rows decoded are
+    now bounded by the matches plus two row groups per run and bucket."""
+    from constellation.massspec.sweep import engine
+
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
+    tol = {1: (20.0, "ppm"), 2: (0.35, "Da")}
+    small = dict(run_rows=300, reduce_rows=200, shard_rows=4000, run_row_group_rows=16)
+    engine.READ_STATS["rows_decoded"] = 0
+    work = tmp_path / "w"
+    got = sweep(bundle, plan, SweepSettings(tolerances=tol, **small), reducers=[XicTraceReducer()],
+                workers=1, work_dir=work)  # fmt: skip
+    runs = sorted((work / "matches").glob("*.parquet"))
+    matches = sum(pq.read_metadata(f).num_rows for f in runs)
+    buckets = len(got.parts["xic_trace"])
+    assert len(runs) > 3 and buckets > 3
+    decoded = engine.READ_STATS["rows_decoded"]
+    assert matches <= decoded <= matches + 2 * len(runs) * buckets * small["run_row_group_rows"]
+    want = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[XicTraceReducer()]).table("xic_trace")
+    oracle.assert_traces_identical(got.table("xic_trace"), want)
+
+
+# ── what a reducer reads: cells, scan context, several outputs (2026-11-07) ──
+
+
+def _batch_of(bundle, plan, settings):
+    """The whole plan as one batch, in memory."""
+    from constellation.massspec.sweep.reduce import QueryBatch
+
+    result = sweep(bundle, plan, settings)
+    every = np.arange(plan.n_queries, dtype=np.int64)
+    return QueryBatch(plan=plan, queries=every, matches=result.matches, scans=result.scans,
+                      scan_order=result.scans.order(), settings=settings)  # fmt: skip
+
+
+@pytest.mark.parametrize("name", ["dia", "dda"])
+def test_cells_are_every_eligible_cell_with_what_matched_there(tmp_root, name):
+    """A cell view for scorers: every channel in every scan a query was
+    eligible in, matched or not, errors signed observed − theoretical."""
+    run, bundle, _ = _run(name, tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
+    settings = SweepSettings(tolerances={1: (20.0, "ppm"), 2: (0.35, "Da")})
+    batch = _batch_of(bundle, plan, settings)
+    for level in (1, 2):
+        cells = batch.cells(level)
+        cq, cr, ci = batch.eligible_cells(level)
+        assert cells.n == cq.size  # nearest: one row per eligible cell
+        assert sorted(zip(cells.query.tolist(), cells.row.tolist(), cells.channel.tolist())) == sorted(
+            zip(cq.tolist(), cr.tolist(), ci.tolist()))  # fmt: skip
+        m = batch.matches
+        assert int(cells.matched.sum()) == int((m.level == level).sum())
+        hit = cells.matched
+        assert np.allclose(cells.mz_error_da[hit], cells.mz_observed[hit] - cells.mz_theoretical[hit])
+        assert np.isnan(cells.mz_error_ppm[~hit]).all() and (cells.intensity[~hit] == 0).all()
+        assert np.array_equal(cells.scan, batch.scans.scan[cells.row])
+        table = cells.table()
+        assert table.num_rows == cells.n and table.schema.names[0] == "query"
+
+
+def test_cells_keep_every_match_of_a_cell_under_rule_all(tmp_root):
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    settings = SweepSettings(tolerances={2: (0.35, "Da")}, rule=AllWithin())
+    batch = _batch_of(bundle, plan, settings)
+    cells = batch.cells(2, fill=False)
+    assert cells.n == batch.matches.n and cells.matched.all()
+    filled = batch.cells(2)
+    key = list(zip(filled.query.tolist(), filled.row.tolist(), filled.channel.tolist()))
+    assert len(key) > len(set(key))  # some cell holds several matches
+    eligible = batch.eligible_cells(2)
+    assert set(key) == set(zip(*(a.tolist() for a in eligible)))
+
+
+def test_the_ledger_carries_each_scans_tic_and_injection_time(tmp_path):
+    """What a score against the whole scan needs (the share of the TIC a
+    query explains, ion counts from injection time), from the bundle."""
+    scans = dia_scans(cycles=3)
+    for i, s in enumerate(scans):
+        s["tic"], s["iit"] = 1000.0 + i, (10.0 if i % 2 else None)
+    bundle = write_bundle_manifest(write_bundle(tmp_path, "ctx", scans))
+    run = planted_run(acquisition="dia", cycles=3, window_width=100.0)
+    plan = compile_queries(run.targets, levels=[1])
+    result = sweep(bundle, plan, SweepSettings(tolerances={1: (20.0, "ppm")}))
+    ledger = result.scans
+    by_scan = {s["scan"]: s for s in scans}
+    assert ledger.tic.tolist() == [by_scan[int(x)]["tic"] for x in ledger.scan]
+    want = [by_scan[int(x)]["iit"] for x in ledger.scan]
+    assert [None if np.isnan(v) else v for v in ledger.iit.tolist()] == want
+    assert ledger.table().column("tic").to_pylist() == ledger.tic.tolist()
+    table_run = sweep(open_peaks(bundle).to_table(), plan, SweepSettings(tolerances={1: (20.0, "ppm")}))
+    assert np.isnan(table_run.scans.tic).all()  # a table of points records none
+
+
+_TWO_A = pa.schema([("query", pa.int64()), ("n", pa.int64())])
+_TWO_B = pa.schema([("query", pa.int64()), ("total", pa.float64())])
+
+
+class _TwoOutputs:
+    """One pass, two tables: per query, its cells, and its summed intensity."""
+
+    name = "two"
+    gated = False
+    outputs = {"cell_counts": _TWO_A, "intensity": _TWO_B}
+
+    def reduce(self, batch):
+        cells = batch.cells(2)
+        q = batch.queries
+        at = np.searchsorted(q, cells.query)
+        return {
+            "cell_counts": pa.table({"query": q, "n": np.bincount(at, minlength=q.size)}, schema=_TWO_A),
+            "intensity": pa.table({"query": q, "total": np.bincount(at, weights=cells.intensity, minlength=q.size)},
+                                  schema=_TWO_B),  # fmt: skip
+        }
+
+
+def test_a_reducer_of_several_outputs_is_the_same_in_memory_and_in_workers(tmp_root, tmp_path):
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    tol = {2: (0.35, "Da")}
+    base = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[_TwoOutputs(), XicTraceReducer()])
+    assert set(base.schemas) == {"cell_counts", "intensity", "xic_trace"}
+    assert base.table("cell_counts").column("n").to_numpy().sum() > 0
+    for workers in (1, 3):
+        got = sweep(bundle, plan, SweepSettings(tolerances=tol, reduce_rows=100), reducers=[_TwoOutputs()],
+                    workers=workers, work_dir=tmp_path / f"w{workers}")  # fmt: skip
+        assert len(got.parts["intensity"]) > 1
+        for name in ("cell_counts", "intensity"):
+            assert got.table(name).equals(base.table(name))
+            assert pq.read_table(got.write(name, tmp_path / f"{name}{workers}.parquet")).equals(base.table(name))
+
+
+def test_output_names_are_unique_across_reducers(tmp_root):
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    clash = _TwoOutputs()
+    clash.outputs = {"xic_trace": _TWO_A, "intensity": _TWO_B}
+    with pytest.raises(ValueError, match="both name an output 'xic_trace'"):
+        sweep(bundle, plan, SweepSettings(tolerances={2: (0.35, "Da")}), reducers=[XicTraceReducer(), clash])
+
+
+# ── part of a run (2026-11-07) ──────────────────────────────────────
+
+
+def _unranged(table: pa.Table) -> pa.Table:
+    """A trace without the range stamp a ranged sweep adds to its metadata."""
+    meta = {k: v for k, v in (table.schema.metadata or {}).items() if not k.startswith(b"x.massspec.sweep.")}
+    return table.replace_schema_metadata(meta)
+
+
+def test_a_scan_range_sweeps_exactly_those_scans(tmp_root, tmp_path):
+    """Only the scans read are eligible: the zero-filled trace and the
+    summary's counts cover them alone, in memory and on disk alike."""
+    from constellation.massspec.sweep.reduce import QuerySummaryReducer
+
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2])  # global: every scan
+    tol = {1: (20.0, "ppm"), 2: (0.35, "Da")}
+    scans = sorted(s["scan"] for s in run.scans)
+    first, last = scans[len(scans) // 4], scans[len(scans) // 2]
+    reducers = [XicTraceReducer(drop_unmatched=False), QuerySummaryReducer()]
+    full = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=reducers).table("xic_trace")
+    inside = pc.and_(pc.greater_equal(full.column("scan"), first), pc.less_equal(full.column("scan"), last))
+    want = full.filter(inside)
+    runs = [sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=reducers, scan_range=(first, last))]
+    for workers in (1, 3):
+        runs.append(sweep(bundle, plan, SweepSettings(tolerances=tol, shard_rows=3000, reduce_rows=500),
+                          reducers=reducers, scan_range=(first, last), workers=workers,
+                          work_dir=tmp_path / f"w{workers}"))  # fmt: skip
+    for got in runs:
+        trace = got.table("xic_trace")
+        oracle.assert_traces_identical(_unranged(trace), want)
+        assert trace.schema.metadata[b"x.massspec.sweep.scan_range"] == f"{first},{last}".encode()
+        summary = got.table("query_summary")
+        ms2 = sum(1 for s in run.scans if s["level"] == 2 and first <= s["scan"] <= last)
+        assert max(summary.column("n_eligible_ms2").to_pylist()) <= ms2
+
+
+def test_an_rt_range_is_the_scans_it_spans(tmp_root):
+    run, bundle, peaks = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2])
+    settings = SweepSettings(tolerances={2: (0.35, "Da")})
+    times = sorted((s["rt"], s["scan"]) for s in run.scans)
+    t0, t1 = times[10][0], times[60][0]
+    in_range = [scan for t, scan in times if t0 <= t <= t1]
+    by_rt = sweep(bundle, plan, settings, reducers=[XicTraceReducer()], rt_range=(t0, t1)).table("xic_trace")
+    by_scan = sweep(bundle, plan, settings, reducers=[XicTraceReducer()],
+                    scan_range=(min(in_range), max(in_range))).table("xic_trace")  # fmt: skip
+    oracle.assert_traces_identical(_unranged(by_rt), _unranged(by_scan))
+    on_table = sweep(peaks, plan, settings, reducers=[XicTraceReducer()], rt_range=(t0, t1)).table("xic_trace")
+    oracle.assert_traces_identical(_unranged(on_table), _unranged(by_rt))
+    empty = sweep(bundle, plan, settings, reducers=[XicTraceReducer()], rt_range=(1e9, 2e9)).table("xic_trace")
+    assert empty.num_rows == 0
+    with pytest.raises(ValueError, match="not both"):
+        sweep(bundle, plan, settings, scan_range=(1, 2), rt_range=(0.0, 1.0))

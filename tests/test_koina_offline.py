@@ -705,3 +705,73 @@ def test_undeclared_loss_channel_is_reported_not_swallowed() -> None:
     stats = AssemblyStats()
     stats.undeclared_loss_ids.add("H2O")
     assert stats.as_dict()["undeclared_loss_ids"] == ["H2O"]
+
+
+class _FakeIrtClient:
+    """An iRT model's client: one value per sequence, on no run's clock."""
+
+    model_inputs = {"peptide_sequences": ((-1, 1), "BYTES")}
+    model_outputs = {"irt": "FP32"}
+
+    def predict(self, arrays, **_):
+        n = np.asarray(arrays["peptide_sequences"]).shape[0]
+        return {"irt": np.linspace(-15.0, 60.0, n, dtype=np.float32).reshape(-1, 1)}
+
+
+def test_the_fasta_path_says_what_clock_its_retention_times_are_on():
+    """It wrote only Koina's own rt_scale key, which nothing reads, so an
+    iRT library looked like run seconds (review of 2026-11-06)."""
+    from constellation.massspec.library.koina.api import predict_library
+
+    lib, _ = predict_library(
+        specs=fixture_specs(HCD), ms2_model_name=HCD, rt_model_name="Prosit_2019_irt",
+        collision_energy=30.0, ms2_client=FakeKoinaClient(HCD), rt_client=_FakeIrtClient(),
+    )  # fmt: skip
+    assert lib.metadata_extras["x.massspec.prediction.rt_scale"] == "koina:Prosit_2019_irt:irt"
+    assert (lib.precursors.column("rt_predicted").to_numpy() < 0).any()  # a negative iRT is a value
+
+
+# ── fragment coverage on every path (Codex review, 2026-11-07) ─────────
+#
+# The specs / FASTA path assembled its library outside the prediction
+# contract that records which ions a model speaks for, so an ion Prosit
+# predicted below its floor read as unknown, and extraction fell back to
+# fragment charge 2 where Prosit predicts 3.
+
+
+def test_the_specs_path_records_its_fragment_coverage():
+    from constellation.massspec.library.fragment_abundance import COVERAGE_KEY
+
+    lib, _ = _library_from_fixture()
+    assert lib.metadata_extras[COVERAGE_KEY] == {
+        "ion_types": ["b", "y"],
+        "max_fragment_charge": 3,
+        "fragment_charge_at_most_precursor": True,
+        "max_ion_number": None,
+        "losses": [],
+        "min_intensity": 1e-4,
+        "intensity_floor": "above",
+    }
+
+
+def test_a_specs_path_library_gives_every_covered_ion_an_abundance():
+    import numpy as np
+
+    from constellation.massspec.library.fragment_abundance import LibraryFragments
+    from constellation.massspec.peptide.channels import ChannelSettings
+    from constellation.massspec.peptide.ions import IonType
+    from constellation.massspec.quant.targets import targets_from_library
+    from constellation.massspec.sweep.queries import compile_queries
+
+    lib, _ = _library_from_fixture()
+    source = LibraryFragments.from_library(lib)
+    # What chromatogram extract takes from the coverage by default.
+    settings = ChannelSettings(
+        ion_types=tuple(IonType[t.upper()] for t in source.coverage["ion_types"]),
+        max_fragment_charge=source.coverage["max_fragment_charge"],
+    )
+    plan = compile_queries(targets_from_library(lib), levels=[2], channels=settings, fragment_abundance=source)
+    abundance = plan.channels_for_level(2).abundance
+    assert abundance.size and not np.isnan(abundance).any()
+    report = plan.fragment_abundance["report"]
+    assert report["matched"] == lib.fragments.num_rows and not report["outside_settings"]

@@ -1,11 +1,14 @@
 """The evidence gate: whether a query showed enough of itself to be worth scoring.
 
 The map counts, for every scan and query, how many of the query's
-fragment bonds (an ion type and position, whatever its charge or loss)
-have a channel within tolerance of one of the scan's evidence peaks, its
-``top_peaks`` most intense (or all of them), never counting more bonds
+distinct fragment ions (an ion type and number, whatever its charge or
+loss) have a channel within tolerance of one of the scan's evidence peaks,
+its ``top_peaks`` most intense (or all of them), never counting more ions
 than the distinct peaks that matched them. A scan with at least
-``min_fragments`` such bonds is evidence. The reduce then decides, over
+``min_fragments`` such ions is evidence. Complementary b and y ions of one
+bond count twice: they sit at different m/z, so each is a match of its
+own; one ion at another charge or with a loss does not (until 2026-11-07
+these words said "bonds" for what was always ion type and number). The reduce then decides, over
 the scans the query could have been matched in, in order: the query
 passes when they hold a run of ``min_consecutive`` evidence scans, each
 within ``max_gap_s`` of the last. A query without fragments is gated on
@@ -45,10 +48,11 @@ class EvidenceGate:
     The defaults were measured on an ion-trap DIA run of a BSA and labelled
     lysin digest (0.35 Da, about 710 peaks a scan; ``docs/plans/sweep.md``):
     they pass 2.5 % of reversed-sequence queries and the digest's known
-    peptides. With every peak as evidence, or two bonds in one scan, 87 %
+    peptides. With every peak as evidence, or two fragment ions in one scan, 87 %
     of reversed queries pass there."""
 
-    #: Distinct fragment bonds a scan must show.
+    #: Distinct fragment ions (ion type and number, any charge or loss) a
+    #: scan must show.
     min_fragments: int = 6
     #: Evidence peaks per scan: the most intense this many; None for all.
     top_peaks: int | None = 50
@@ -80,7 +84,8 @@ class Evidence:
         return int(self.query.size)
 
     def count(self) -> np.ndarray:
-        """Evidence per row: bonds (or isotopes), never more than peaks."""
+        """Evidence per row: distinct fragment ions (or isotopes), never
+        more than peaks."""
         return np.minimum(self.n_keys, self.n_peaks)
 
     @classmethod

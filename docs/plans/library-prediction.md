@@ -109,10 +109,10 @@ by up to 2.2e-5.
 |---|---|
 | `base` | `Property`, `Capabilities` (only what the orchestration reads), and the `Predictor` protocol: `name`, `provides`, `capabilities`, `identity()`, `check(batch)` (a reason or None per row, no model call) and `predict(batch)`, whose outputs are plain numpy dataclasses |
 | `collision_energy` | `CollisionEnergy`: a resolved charge → NCE table and how it was made (`uniform`, `scaled_from_reference`, `explicit`); `resolve(charges)` in float32; `describe()` for metadata and stage keys |
-| `requests` | `build_requests(library, settings)`: label stripping (global isotopes plus isotopic-substitution modifications; TMT kept), dedup on (stripped canonical key, charge) in sorted order, fan-out to every source precursor, the pairing map on (`decoy_of`, charge) |
+| `requests` | `build_requests(library, settings)`: label stripping (global isotopes plus isotopic-substitution modifications; TMT kept), dedup on (stripped canonical key, charge) in sorted order, fan-out to every source precursor (each precursor on its own since 2026-11-07; there was a pairing map on (`decoy_of`, charge)) |
 | `torch_runner` | fixed batches over the canonical order under `inference_mode`, one intra-op thread per worker, parallel across batches; reused by the in-house model |
 | `assemble` | vectorised: ion number → bond (`bond_position`); m/z from the *labelled* source ladder; a backend's own m/z checked against the stripped peptide that was sent; fragments under the source `precursor_id` with `annotation` null; RecordBatches for streaming |
-| `run` | `predict_onto(library, {property: predictor}, settings) -> (Library, PredictionReport)`: every `check` first; a rejection drops the precursor and its partner; one Library build |
+| `run` | `predict_onto(library, {property: predictor}, settings) -> (Library, PredictionReport)`: every `check` first; a rejection drops that precursor alone (and its partner, until 2026-11-07); one Library build |
 | `registry` | `backend:model` → predictor, imported lazily |
 
 The tokenizer is `constellation/massspec/tokenize/`:
@@ -439,3 +439,50 @@ P4, each with a test that fails on the code before it.
 | C3 (P2) | `--resume` of a finished prediction with a new `--output-dlib` said "already complete" without writing it, since the export path is not part of the key | Each export records the stage key of the prediction it holds (`exports` in the manifest). Resuming a finished prediction writes an export that is missing or holds an earlier prediction, and leaves a current one alone. The Koina backend keys its output paths, so a new path there is a new run, as before |
 | C4 (P2) | A Koina model returning a neutral loss (`y3-H2O+1`) crashed `predict_library(library=...)` with `NotImplementedError` in the new assembler; the old path had kept such ions | Loss-aware assembly: a loss ion is a typed row with its `loss_id`, its m/z the source peptide's own ion less the loss (labels included: a ¹⁵N chain loses ¹⁵NH₃), looked up by index in a ladder of only the peptides with one (`fragment_ladder_arrays_batch(loss_rules=False)`, every loss at every bond). The loss rules are not applied to a loss a model names: they say which losses to expect where nobody has said. `reported_mz_error_ppm` checks loss ions too. The old path kept such ions as partial-ID rows (no ion identity, Koina's m/z), wrong for a labelled precursor. No model the overlay registers today returns losses |
 | C5 (P2) | Predicting one property onto a predicted library (fragments, then RT alone) replaced the record of which predictor made each property, so the spectra lost their model and settings | `x.massspec.prediction.predictors` is merged property by property. A property predicted again takes this run's collision energy or time scale, or drops the old one if the new model has none; one left alone keeps its record, as its values are kept |
+
+## Each precursor judged on its own; coverage and layout recorded (2026-11-07)
+
+**The PI's rule.** False-discovery rates are estimated against a decoy *population*, made similar in
+composition and mass, not target by target. Nothing about a target and the decoy made from it is
+special to that estimate. `decoy_of` is a record of how a decoy was made, not a link.
+
+**What changed in `predict_onto`:**
+- **No coupling.** A refused precursor is dropped alone. A target is no longer lost because its decoy
+  was refused, nor a decoy because of its target.
+- **Decoys judged too.** `--min-charge-probability` judges targets and decoys alike, each on its own
+  sequence's prediction. Decoys used to follow their target and were never judged, so a decoy with no
+  target (a reversed protein's) was kept at every charge: on BSA, decoys outnumbered targets 107:1
+  at 1+.
+- **Reporting and plumbing.** The report counts dropped targets and decoys, and
+  `RequestPlan.group` is gone.
+- **The library side.** `decoy_of` is no longer a foreign key. `subset_precursors` keeps a decoy
+  without its target. `subset_proteins` still takes peptide-level decoys with their targets: that is
+  how the decoy population of a protein subset is built. `with_content_ids` re-keys `decoy_of` and the
+  provenance tables.
+- **Comparisons with EncyclopeDIA.** Its peptide-centric search competes each target with its own
+  decoy (`trim(1)`). A comparison with it can rebuild that pairing after scoring by joining on
+  `decoy_of`.
+
+**Coverage.** A fragment predictor states what it covers:
+- `Capabilities.max_ion_number`, `min_intensity` and `intensity_floor`, beside its ion types, charge
+  ceiling and losses.
+- JChronologer: b/y, ions 1–29, charge ≤ min(3, z), intensity ≥ 0.01.
+- Koina: the overlay's series, > its floor.
+
+`predict_onto` writes this as `x.massspec.prediction.fragment_coverage`, outside `identity()`, so
+no stage key changes because of it. An ion the model covers and did not report was predicted below
+its floor, an abundance of 0. An ion it does not cover was never predicted. Query channels are
+built on that distinction (`massspec.library.fragment_abundance`, `docs/plans/sweep.md`).
+
+**Layout.** Both `predict-library` resume keys carry `PREDICTION_LAYOUT` (2), so a prediction made
+under the old refusal rule is not resumed. A keyless `_SUCCESS` is no longer reused unchecked.
+
+**RT scale.** Every library states the clock of `rt_predicted` in `x.massspec.prediction.rt_scale`:
+- JChronologer: `chronologer_hi_seconds`.
+- Koina's FASTA path: `koina:<model>:<scale>`; it used to write only its own key.
+- `.msp`: `irt`.
+- EncyclopeDIA files: `observed` for one holding run quantities, `chronologer_hi_seconds` for the
+  jar's own JChronologer prediction, and `encyclopedia_library` for any other run-less library. The
+  `.dlib` writer keeps the scale through a write and read-back.
+
+Extraction draws an RT window only around a run's own seconds (`docs/plans/sweep.md`).

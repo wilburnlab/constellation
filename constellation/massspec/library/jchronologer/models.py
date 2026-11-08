@@ -30,6 +30,7 @@ tokenizes the distinct peptides of its requests once (``check`` and
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -165,6 +166,13 @@ class CartographerFragments(JChronologerPredictor):
     def __init__(self, bundle: JChronologerBundle | None = None, *, min_intensity: float = DEFAULT_MIN_INTENSITY, **kw: Any) -> None:
         super().__init__(bundle, **kw)
         self.min_intensity = float(min_intensity)
+        # The floor is this instance's, so its coverage is too.
+        self.capabilities = replace(
+            type(self).capabilities,
+            max_ion_number=_MAX_ION_NUMBER,
+            min_intensity=self.min_intensity,
+            intensity_floor="at_least",
+        )
         self.min_charge = int(self.preprocessing["min_precursor_charge"])
         self.max_charge = int(self.preprocessing["max_precursor_charge"])
 

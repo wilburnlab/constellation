@@ -100,12 +100,17 @@ def test_protein_peptide_must_be_the_projection() -> None:
 
 def test_decoy_of_must_be_a_target() -> None:
     peptides = _library().peptides.to_pydict()
+    # decoy_of is a record of what a decoy was made from, not a foreign
+    # key: a library may hold the decoy without it (PI, 2026-11-07).
     peptides["decoy_of"][2] = 99
-    with pytest.raises(ValueError, match="references ids not present"):
-        _library(peptides=pa.table(peptides))
+    _library(peptides=pa.table(peptides))
     peptides["decoy_of"] = [None, 12, 10]
     peptides["is_decoy"] = [False, True, True]
     with pytest.raises(ValueError, match="itself a decoy"):
+        _library(peptides=pa.table(peptides))
+    peptides["decoy_of"] = [None, None, 10]
+    peptides["is_decoy"] = [False, False, False]
+    with pytest.raises(ValueError, match="not a decoy"):
         _library(peptides=pa.table(peptides))
 
 

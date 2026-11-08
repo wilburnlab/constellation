@@ -360,3 +360,8 @@ def test_proteome_tools_smoke() -> None:
     ]
     assert rts, "expected some numeric iRT values in ProteomeTools file"
     assert -60.0 < min(rts) < max(rts) < 200.0
+
+
+def test_msp_libraries_say_their_retention_times_are_irt() -> None:
+    """``rt_predicted`` holds the entries' iRT, not a run's seconds."""
+    assert read_msp_library(FIXTURE).metadata_extras["x.massspec.prediction.rt_scale"] == "irt"

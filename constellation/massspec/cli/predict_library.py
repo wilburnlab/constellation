@@ -691,8 +691,10 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
             return 1
     if recorded is not None:
         # A marker without a key was written before runs were keyed
-        # (2026-11-06); it is trusted as it always was, and said so.
-        if recorded in (key, ""):
+        # (2026-11-06), so it cannot say what it holds: like any other
+        # prediction, it is replaced only with --resume and never reused
+        # (it was reused unchecked until 2026-11-07).
+        if recorded == key:
             if not args.resume:
                 print(
                     f"error: --output-dir already complete (_SUCCESS exists). "
@@ -701,8 +703,6 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
                     file=_sys.stderr,
                 )
                 return 1
-            if recorded == "":
-                print(f"note: {output_dir}/_SUCCESS records no key (an older run); reusing it unchecked")
             print(f"already complete: {output_dir}")
             return 0
         if not args.resume:
@@ -822,8 +822,11 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
         run_dir.mkdir(parents=True, exist_ok=True)
         marker = run_dir / "_SUCCESS" if multi else None
         run_key = stage_key(run=key, energy=energy.describe(charges_present) if energy is not None else None)
-        if marker is not None and recorded_key(run_dir) not in (None, "", run_key):
-            invalidate(run_dir)  # an energy run of other settings: redo it
+        if marker is not None and recorded_key(run_dir) not in (None, run_key):
+            # An energy run of other settings, or one whose marker carries
+            # no key and so cannot say what it holds: redo it (a keyless
+            # one was restored under this sweep's key until 2026-11-07).
+            invalidate(run_dir)
         if marker is not None and marker.exists() and args.resume:
             # Restore the completed run's summary. Skipping without it
             # drops finished energies from the aggregate manifest —
@@ -966,9 +969,11 @@ def _koina_key_parts(args: argparse.Namespace) -> dict[str, object]:
         return file_sha256(p) if p.is_file() else f"{p}:missing"
 
     from constellation.massspec.library.koina import resolve_server
+    from constellation.massspec.library.prediction import PREDICTION_LAYOUT
 
     return {
         "stage": "massspec predict-library koina",
+        "layout": PREDICTION_LAYOUT,
         "fasta": identity(args.fasta) if args.fasta is not None else None,
         "peptides": identity(args.peptides) if args.peptides is not None else None,
         "library": identity(args.from_library) if args.from_library is not None else None,

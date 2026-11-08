@@ -681,3 +681,24 @@ def test_a_searchs_sidecars_and_quantity_arrays_become_experiment_tables(tmp_pat
     features = read_experiment_table(experiment, "percolator_feature", unit=result.unit)
     assert features.num_rows == len(_PEPTIDES) + 1 and "primary" in features.column_names
     assert result.manifest.runtime["table_rows"]["rt_alignment"] == len(_PEPTIDES)
+
+
+def test_report_and_collision_filter_refuse_a_search_without_a_result_library(tmp_path) -> None:
+    """A finished search by another engine has no EncyclopeDIA result
+    library: the steps that read one refuse it by name, not with a
+    KeyError, and the report's default choice passes over it."""
+    from constellation.core.manifests import write_manifest
+    from constellation.core.stages import mark_done
+    from constellation.massspec.manifest import ExperimentManifest, SearchManifest
+
+    root = tmp_path / "exp"
+    unit_dir = root / "units" / "native-0123abcd"
+    unit_dir.mkdir(parents=True)
+    write_manifest(unit_dir, SearchManifest(status="finished", engine="constellation", search_mode="peptide-centric",
+                                            acquisition_ids=[0]))  # fmt: skip
+    mark_done(unit_dir)
+    write_manifest(root, ExperimentManifest(name="exp", units={"native-0123abcd": "units/native-0123abcd"}))
+    with pytest.raises(WorkflowError, match="not EncyclopeDIA"):
+        workflow.collision_filter(root, "native-0123abcd")
+    with pytest.raises(WorkflowError, match="not EncyclopeDIA"):
+        workflow._choose_searches(root, ["native-0123abcd"], None)

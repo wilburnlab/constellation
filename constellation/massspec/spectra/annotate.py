@@ -78,6 +78,22 @@ def default_fragment_charge(precursor_charge: int) -> int:
     return max(1, min(3, precursor_charge - 1))
 
 
+def _one_peptide_fragments(modified_sequence: str, *, ion_types, max_fragment_charge: int,
+                            neutral_losses, precursor_charge: int = -1):
+    """One peptide's fragment channels from the shared generator
+    (``massspec.peptide.channels``), and the peptide."""
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.massspec.peptide.channels import ChannelSettings, fragment_channels
+
+    peptide = parse_proforma(modified_sequence)
+    settings = ChannelSettings(
+        ion_types=_ion_types(ion_types), max_fragment_charge=max_fragment_charge,
+        neutral_losses=tuple(neutral_losses) if neutral_losses else None,
+    )  # fmt: skip
+    channels = fragment_channels([peptide], np.array([0]), np.array([precursor_charge]), settings)
+    return channels, peptide
+
+
 def ion_ladder(
     modified_sequence: str,
     *,
@@ -86,22 +102,20 @@ def ion_ladder(
     neutral_losses: Sequence[str] | None = None,
 ) -> pa.Table:
     """The peptide's theoretical fragment ions (``ION_LADDER_SCHEMA``),
-    sorted by series, number and charge."""
-    from constellation.core.sequence.proforma import parse_proforma
+    sorted by series, number and charge: the channels the sweep would
+    trace, from the same generator."""
     from constellation.massspec.annotation.mzpaf import fragment_row_to_mzpaf
-    from constellation.massspec.peptide.ions import fragment_ladder, ion_number
+    from constellation.massspec.peptide.ions import ion_number
 
-    peptide = parse_proforma(modified_sequence)
+    channels, peptide = _one_peptide_fragments(modified_sequence, ion_types=ion_types,
+                                               max_fragment_charge=max_fragment_charge,
+                                               neutral_losses=neutral_losses)  # fmt: skip
     length = len(peptide.sequence)
-    table, _ = fragment_ladder(
-        peptide,
-        ion_types=_ion_types(ion_types),
-        max_fragment_charge=max_fragment_charge,
-        neutral_losses=neutral_losses,
-        return_tensor=False,
-    )
+    names = [None, *channels.loss_ids]
     rows = []
-    for r in table.to_pylist():
+    for j in range(channels.n):
+        r = {"ion_type": int(channels.ion_type[j]), "position": int(channels.position[j]),
+             "charge": int(channels.fragment_charge[j]), "loss_id": names[int(channels.loss[j])]}  # fmt: skip
         rows.append(
             {
                 "ion_type": _LETTERS[r["ion_type"]],
@@ -109,7 +123,7 @@ def ion_ladder(
                 "position": r["position"],
                 "fragment_charge": r["charge"],
                 "loss": r["loss_id"],
-                "mz": r["mz_theoretical"],
+                "mz": float(channels.mz[j]),
                 "annotation": fragment_row_to_mzpaf(r, length=length),
             }
         )
@@ -138,10 +152,9 @@ def annotate_spectrum(
     """
     import torch
 
-    from constellation.core.sequence.proforma import parse_proforma
     from constellation.massspec.annotation.mzpaf import fragment_row_to_mzpaf
     from constellation.massspec.peptide.ions import ion_number
-    from constellation.massspec.peptide.match import assign_fragments, match_mz
+    from constellation.massspec.peptide.match import match_mz
     from constellation.massspec.peptide.mz import precursor_mz
 
     obs_mz = np.asarray(mz, dtype=np.float64)
@@ -155,33 +168,36 @@ def annotate_spectrum(
     if n == 0:
         return pa.table(columns, schema=ANNOTATED_PEAK_SCHEMA)
 
-    peptide = parse_proforma(modified_sequence)
-    length = len(peptide.sequence)
-    assignments = assign_fragments(
-        peptide,
-        torch.from_numpy(obs_mz.copy()),
-        torch.from_numpy(obs_int.copy()),
-        tolerance=tolerance,
-        tolerance_unit=tolerance_unit,
-        ion_types=_ion_types(ion_types),
+    channels, peptide = _one_peptide_fragments(
+        modified_sequence, ion_types=ion_types,
         max_fragment_charge=max_fragment_charge or default_fragment_charge(charge),
         neutral_losses=neutral_losses,
+    )  # fmt: skip
+    length = len(peptide.sequence)
+    names = [None, *channels.loss_ids]
+    matches = (
+        match_mz(torch.from_numpy(obs_mz.copy()), torch.from_numpy(channels.mz.copy()), tolerance=tolerance,
+                 tolerance_unit=tolerance_unit, query_intensity=torch.from_numpy(obs_int.copy()))  # fmt: skip
+        if channels.n
+        else []
     )
     best: dict[int, object] = {}
-    for a in assignments:  # nearest ion for each peak
-        held = best.get(a.obs_idx)
-        if held is None or abs(a.error_da) < abs(held.error_da):  # type: ignore[attr-defined]
-            best[a.obs_idx] = a
-    for i, a in best.items():
-        row = {"ion_type": int(a.ion_type), "position": a.position, "charge": a.charge, "loss_id": a.loss_id}
+    for m in matches:  # nearest ion for each peak
+        held = best.get(m.query_idx)
+        if held is None or abs(m.error_da) < abs(held.error_da):  # type: ignore[attr-defined]
+            best[m.query_idx] = m
+    for i, m in best.items():
+        j = m.ref_idx
+        row = {"ion_type": int(channels.ion_type[j]), "position": int(channels.position[j]),
+               "charge": int(channels.fragment_charge[j]), "loss_id": names[int(channels.loss[j])]}  # fmt: skip
         columns["annotation"][i] = fragment_row_to_mzpaf(row, length=length)
-        columns["ion_type"][i] = _LETTERS[int(a.ion_type)]
-        columns["ion_number"][i] = ion_number(int(a.ion_type), a.position, length)
-        columns["fragment_charge"][i] = a.charge
-        columns["loss"][i] = a.loss_id
-        columns["mz_theoretical"][i] = a.theo_mz
-        columns["error_da"][i] = a.error_da
-        columns["error_ppm"][i] = a.error_ppm
+        columns["ion_type"][i] = _LETTERS[row["ion_type"]]
+        columns["ion_number"][i] = ion_number(row["ion_type"], row["position"], length)
+        columns["fragment_charge"][i] = row["charge"]
+        columns["loss"][i] = row["loss_id"]
+        columns["mz_theoretical"][i] = float(channels.mz[j])
+        columns["error_da"][i] = m.error_da
+        columns["error_ppm"][i] = m.error_ppm
 
     if include_precursor:
         target = precursor_mz(peptide, charge=charge)
@@ -220,11 +236,16 @@ def precursor_isotopes(modified_sequence: str, *, charge: int, n_isotopes: int =
     """The precursor's first ``n_isotopes`` isotope peaks at ``charge``
     (``PRECURSOR_ISOTOPE_SCHEMA``), from its elemental composition."""
     from constellation.core.sequence.proforma import parse_proforma
-    from constellation.massspec.peptide.envelope import peptide_envelope
+    from constellation.massspec.peptide.channels import ChannelSettings, isotope_channels
 
-    mz, abundance = peptide_envelope(parse_proforma(modified_sequence), charge=charge, n_peaks=n_isotopes)
-    mz_np = mz.detach().cpu().numpy().astype(np.float64)
-    ab = abundance.detach().cpu().numpy().astype(np.float64)
+    if charge is None or int(charge) <= 0:
+        raise ValueError(f"charge must be positive; got {charge}")
+    channels = isotope_channels([parse_proforma(modified_sequence)], np.array([0]), np.array([int(charge)]),
+                                np.array([np.nan]), ChannelSettings(n_isotopes=n_isotopes))  # fmt: skip
+    mz_np = channels.mz.astype(np.float64)
+    # Shares of the whole envelope from the generator, shown with the most
+    # abundant isotope as 1.
+    ab = channels.abundance.astype(np.float64)
     ab = ab / ab.max() if ab.size and ab.max() > 0 else ab
     return pa.table(
         {

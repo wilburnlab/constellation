@@ -148,8 +148,16 @@ def test_predict_library_encyclopedia_still_requires_fasta_and_dlib(tmp_path, ca
 # ── run-dir contract ──────────────────────────────────────────────────
 
 
+def _completed(tmp_path, **over):
+    """Mark ``tmp_path`` finished with the key the arguments make."""
+    from constellation.core.stages import mark_done, stage_key
+    from constellation.massspec.cli.predict_library import _koina_key_parts
+
+    mark_done(tmp_path, stage_key(**_koina_key_parts(_args(output_dir=tmp_path, fasta=tmp_path / "a.fasta", **over))))
+
+
 def test_refuses_a_completed_output_dir(tmp_path, capsys):
-    (tmp_path / "_SUCCESS").write_bytes(b"")
+    _completed(tmp_path)
     rc = _cmd_massspec_predict_library(
         _args(output_dir=tmp_path, fasta=tmp_path / "a.fasta")
     )
@@ -158,12 +166,33 @@ def test_refuses_a_completed_output_dir(tmp_path, capsys):
 
 
 def test_resume_short_circuits_a_completed_dir(tmp_path, capsys):
-    (tmp_path / "_SUCCESS").write_bytes(b"")
+    _completed(tmp_path, resume=True)
     rc = _cmd_massspec_predict_library(
         _args(output_dir=tmp_path, fasta=tmp_path / "a.fasta", resume=True)
     )
     assert rc == 0
     assert "already complete" in capsys.readouterr().out
+
+
+def test_a_keyless_success_marker_is_not_trusted(tmp_path, capsys):
+    """A marker written before runs were keyed cannot say what it holds;
+    it was reused unchecked until 2026-11-07."""
+    (tmp_path / "_SUCCESS").write_bytes(b"")
+    rc = _cmd_massspec_predict_library(_args(output_dir=tmp_path, fasta=tmp_path / "a.fasta"))
+    assert rc == 1
+    assert "holds a prediction of other inputs or settings" in capsys.readouterr().err
+
+
+def test_a_prediction_of_another_layout_is_not_resumed(tmp_path, capsys, monkeypatch):
+    """The key carries PREDICTION_LAYOUT, so output written under an older
+    rule for which precursors to keep is not taken for finished."""
+    import constellation.massspec.library.prediction as prediction
+
+    _completed(tmp_path)
+    monkeypatch.setattr(prediction, "PREDICTION_LAYOUT", prediction.PREDICTION_LAYOUT + 1)
+    rc = _cmd_massspec_predict_library(_args(output_dir=tmp_path, fasta=tmp_path / "a.fasta"))
+    assert rc == 1
+    assert "other inputs or settings" in capsys.readouterr().err
 
 
 # ── energy-sweep resume ────────────────────────────────────────────────
@@ -218,6 +247,22 @@ def _sweep_stubs(monkeypatch, tmp_path, *, calls):
     return peptides, json
 
 
+def _interrupted_sweep(out, peptides, calls, *, keep):
+    """A 20,30 sweep run to the end, then undone but for the energies in
+    ``keep``, as a sweep stopped after them leaves it: each kept energy has
+    its manifest and its keyed _SUCCESS, the sweep has none."""
+    import shutil
+
+    rc = _cmd_massspec_predict_library(_args(output_dir=out, peptides=peptides, collision_energy="20,30"))
+    assert rc == 0
+    (out / "_SUCCESS").unlink()
+    (out / "manifest.json").unlink()
+    for run in ("ce_20", "ce_30"):
+        if run not in keep:
+            shutil.rmtree(out / run)
+    calls.clear()
+
+
 def test_resume_restores_completed_energies_into_the_manifest(
     tmp_path, monkeypatch
 ) -> None:
@@ -225,12 +270,7 @@ def test_resume_restores_completed_energies_into_the_manifest(
     peptides, json = _sweep_stubs(monkeypatch, tmp_path, calls=calls)
 
     out = tmp_path / "out"
-    done = out / "ce_20"
-    done.mkdir(parents=True)
-    (done / "manifest.json").write_text(
-        json.dumps({"collision_energy": 20.0, "library_pqdir": str(done)})
-    )
-    (done / "_SUCCESS").write_bytes(b"")
+    _interrupted_sweep(out, peptides, calls, keep=("ce_20",))
 
     rc = _cmd_massspec_predict_library(
         _args(
@@ -255,11 +295,7 @@ def test_resume_after_every_energy_completed_still_reports_them(
     peptides, json = _sweep_stubs(monkeypatch, tmp_path, calls=calls)
 
     out = tmp_path / "out"
-    for ce in (20, 30):
-        d = out / f"ce_{ce}"
-        d.mkdir(parents=True)
-        (d / "manifest.json").write_text(json.dumps({"collision_energy": float(ce)}))
-        (d / "_SUCCESS").write_bytes(b"")
+    _interrupted_sweep(out, peptides, calls, keep=("ce_20", "ce_30"))
 
     rc = _cmd_massspec_predict_library(
         _args(
@@ -281,9 +317,8 @@ def test_resume_errors_when_a_completed_run_has_no_manifest(
     peptides, _json = _sweep_stubs(monkeypatch, tmp_path, calls=calls)
 
     out = tmp_path / "out"
-    done = out / "ce_20"
-    done.mkdir(parents=True)
-    (done / "_SUCCESS").write_bytes(b"")  # no manifest.json
+    _interrupted_sweep(out, peptides, calls, keep=("ce_20",))
+    (out / "ce_20" / "manifest.json").unlink()
 
     rc = _cmd_massspec_predict_library(
         _args(
@@ -293,6 +328,32 @@ def test_resume_errors_when_a_completed_run_has_no_manifest(
     )
     assert rc == 1
     assert "no manifest.json" in capsys.readouterr().err
+
+
+def test_a_keyless_energy_run_is_recomputed_on_resume(tmp_path, monkeypatch) -> None:
+    """A per-energy _SUCCESS without a key cannot say what it holds, so a
+    resumed sweep predicts that energy again instead of restoring it under
+    the sweep's key (Codex review, 2026-11-07; the sweep's own marker was
+    held to its key already)."""
+    import json
+
+    calls: list = []
+    peptides, _json = _sweep_stubs(monkeypatch, tmp_path, calls=calls)
+
+    out = tmp_path / "out"
+    _interrupted_sweep(out, peptides, calls, keep=("ce_20", "ce_30"))
+    (out / "ce_20" / "_SUCCESS").write_bytes(b"")
+    (out / "ce_30" / "_SUCCESS").write_text("some-other-key\n")
+
+    rc = _cmd_massspec_predict_library(
+        _args(output_dir=out, peptides=peptides, resume=True, collision_energy="20,30")
+    )
+    assert rc == 0
+    assert sorted(c.nce for c in calls) == [20.0, 30.0]
+    from constellation.core.stages import recorded_key
+
+    assert recorded_key(out / "ce_20") not in (None, "")
+    assert len(json.loads((out / "manifest.json").read_text())["runs"]) == 2
 
 
 # ── collision energy per charge ────────────────────────────────────────

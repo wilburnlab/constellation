@@ -309,7 +309,9 @@ def test_heavy_lysine_keeps_its_acetylated_forms(fasta: Path) -> None:
     assert {(r["modification"], r["origin"]) for r in rows} >= {("UNIMOD:259", "fixed"), ("UNIMOD:1", "variable")}
 
 
-def test_subsetting_precursors_takes_decoys_with_their_targets(fasta: Path) -> None:
+def test_subsetting_precursors_keeps_a_decoy_without_its_target(fasta: Path) -> None:
+    """A decoy stands on its own: dropping its target's precursors keeps it
+    (until 2026-11-07 it went with its target), its decoy_of a record."""
     lib = build_search_space([fasta], _settings(decoys=(DecoySet(),)))
     peptides = lib.peptides.to_pylist()
     target = next(r for r in peptides if not r["is_decoy"] and any(d["decoy_of"] == r["peptide_id"] for d in peptides))
@@ -317,7 +319,7 @@ def test_subsetting_precursors_takes_decoys_with_their_targets(fasta: Path) -> N
     sub = lib.subset_precursors(lib.precursors.filter(pc.invert(drop)).column("precursor_id"))
     left = set(sub.peptides.column("peptide_id").to_pylist())
     assert target["peptide_id"] not in left
-    assert not any(r["decoy_of"] == target["peptide_id"] for r in sub.peptides.to_pylist())
+    assert any(r["decoy_of"] == target["peptide_id"] for r in sub.peptides.to_pylist())
     assert sub.peptide_spans.num_rows <= lib.peptide_spans.num_rows
     assert set(sub.span_peptide.column("peptide_id").to_pylist()) <= left
 

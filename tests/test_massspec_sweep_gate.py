@@ -44,7 +44,7 @@ def _with_decoys(run) -> pa.Table:
     return pa.Table.from_pylist(rows + decoys, schema=XIC_TARGET_TABLE)
 
 
-def test_a_bond_seen_at_two_charges_counts_once():
+def test_a_fragment_ion_seen_at_two_charges_counts_once():
     from constellation.core.sequence.proforma import parse_proforma
     from constellation.massspec.peptide.mz import precursor_mz
     from constellation.massspec.sweep import ChannelSettings
@@ -67,7 +67,7 @@ def test_a_bond_seen_at_two_charges_counts_once():
     )  # fmt: skip
     assert ev.n == 1
     assert ev.n_channels.tolist() == [len(pick)]
-    assert ev.count().tolist() == [2]  # two bonds, though three channels matched
+    assert ev.count().tolist() == [2]  # two fragment ions, though three channels matched
 
 
 @pytest.mark.parametrize("rule", [Nearest(), SumWithin()])

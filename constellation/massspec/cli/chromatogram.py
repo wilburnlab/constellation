@@ -10,7 +10,8 @@ from pathlib import Path
 # ── chromatogram (XIC extraction) ────────────────────────────────────────
 
 
-_DEFAULT_CHARGE_RANGE = (1, 4)
+#: The charges a target with no charge of its own is looked for at in MS1.
+_FALLBACK_CHARGE_RANGE = (1, 4)
 _DEFAULT_N_ISOTOPES = 3
 _DEFAULT_MAX_FRAG_CHARGE = 2
 
@@ -120,14 +121,15 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
     gateg = p.add_argument_group(
         "evidence gate (sweep; any of these turns it on)",
         "A target counts as seen when a run of its MS2 scans each match enough distinct "
-        "fragment bonds among the scan's most intense peaks. At low-resolution tolerances "
+        "fragment ions among the scan's most intense peaks. At low-resolution tolerances "
         "a bare count passes almost anything; see the summary's counts to set it.",
     )
     gateg.add_argument("--gate", action="store_true",
-                       help="Turn the gate on with its defaults (6 bonds among each scan's 50 most "
+                       help="Turn the gate on with its defaults (6 fragment ions among each scan's 50 most "
                             "intense peaks, 3 scans in a row).")
     gateg.add_argument("--min-fragments", type=int, default=None,
-                       help="Distinct fragment bonds a scan must show (default 6).")
+                       help="Distinct fragment ions (type and number, any charge or loss) a scan "
+                            "must show (default 6).")
     gateg.add_argument("--evidence-top-peaks", type=int, default=None,
                        help="Count only each scan's most intense N peaks; 0 for all (default 50).")
     gateg.add_argument("--min-consecutive-scans", type=int, default=None,
@@ -154,23 +156,42 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
                            "from --peaks-dir.")
 
     ms1g = p.add_argument_group("MS1 precursor-isotope options (with --level 1 or both)")
-    ms1g.add_argument("--n-isotopes", type=int, default=_DEFAULT_N_ISOTOPES,
+    ms1g.add_argument("--n-isotopes", type=int, default=None,
                       help="Isotope peaks M+0..M+(n-1) (default 3).")
+    ms1g.add_argument("--top-isotopes", type=int, default=None, metavar="N",
+                      help="Each precursor's N most abundant isotopes, from its envelope (for a "
+                           "heavy peptide these need not include M+0); instead of --n-isotopes.")
     ms1g.add_argument("--charge-range", type=int, nargs=2, metavar=("LO", "HI"), default=None,
-                      help="Precursor charge sweep: every target is matched in MS1 at each "
-                           "charge LO..HI (default 1 4). Counter models a peptide across "
-                           "charges and wants this.")
+                      help="Match every target in MS1 at each charge LO..HI: the evidence for an "
+                           "analyte across its charge states, as when one precursor of a "
+                           "peptide was identified and its others are wanted too (a peptide's "
+                           "precursors then share their MS1 channels). Counter models a peptide "
+                           "across charges and wants --charge-range 1 4. Default: each target "
+                           "at its own charge, and 1-4 for a target with none.")
     ms1g.add_argument("--own-charge", action="store_true",
-                      help="Match each target in MS1 at its own charge only: one query per "
-                           "precursor and no copies of a peptide's MS1 channels across its "
-                           "precursors (what a search space's targets want). Every target "
-                           "needs a charge.")
+                      help="Match each target in MS1 at its own charge (the default since "
+                           "2026-11-07; accepted for scripts that pass it).")
 
     ms2g = p.add_argument_group("MS2 fragment options (with --level 2 or both)")
-    ms2g.add_argument("--ion-types", default="b,y",
-                      help="Comma-separated fragment ion types (default b,y).")
-    ms2g.add_argument("--max-fragment-charge", type=int, default=_DEFAULT_MAX_FRAG_CHARGE,
-                      help="Max fragment charge, capped by precursor charge (default 2).")
+    ms2g.add_argument("--ion-types", default=None,
+                      help="Comma-separated fragment ion types (default b,y, or the fragment "
+                           "library's).")
+    ms2g.add_argument("--max-fragment-charge", type=int, default=None,
+                      help="Max fragment charge, capped by precursor charge (default 2, or the "
+                           "fragment library's).")
+    ms2g.add_argument("--fragment-abundance", choices=("none", "uniform", "library"), default="none",
+                      help="Where fragment channels' abundances come from: none; uniform (equal "
+                           "intensity for every ion asked, the classic pre-Prosit assumption); "
+                           "or library (a predicted or empirical library's intensities, by "
+                           "precursor id; see --fragment-library). Default none.")
+    ms2g.add_argument("--fragment-library", type=Path, default=None, metavar="DIR",
+                      help="The library (a library directory, or a predict-library output) to take "
+                           "fragment abundances from (default: --targets, when it is one).")
+    ms2g.add_argument("--top-fragments", type=int, default=None, metavar="N",
+                      help="Keep each target's N most abundant fragment ions (EncyclopeDIA traces "
+                           "10); needs --fragment-abundance library.")
+    ms2g.add_argument("--ion-weights", default=None, metavar="TYPE=W,...",
+                      help="With --fragment-abundance uniform, weights per ion type, e.g. a=0.1.")
     ms2g.add_argument("--neutral-losses", default=None,
                       help="Comma-separated neutral-loss ids (default none).")
     ms2g.add_argument("--assigned-scans-only", action="store_true",
@@ -274,18 +295,53 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
 
     _warn_level_flag_mismatch(args)
     targets = load_targets(args.targets)
+    if args.rt_window is not None:
+        from constellation.massspec.sweep.queries import check_rt_window
+
+        try:
+            check_rt_window(targets)
+        except ValueError as exc:
+            print(f"error: --rt-window: {exc}", file=sys.stderr)
+            return 2
     if args.own_charge and args.charge_range is not None:
         print("error: --own-charge and --charge-range contradict each other", file=sys.stderr)
         return 2
-    charge_range = None if args.own_charge else tuple(args.charge_range or _DEFAULT_CHARGE_RANGE)
-    if args.own_charge and 1 in levels:
-        missing = targets.column("precursor_charge").null_count
-        if missing:
-            print(f"error: --own-charge needs every target's charge; {missing} have none",
-                  file=sys.stderr)  # fmt: skip
-            return 2
-    ion_types = _resolve_ion_types(args.ion_types)
+    charge_range = tuple(args.charge_range) if args.charge_range is not None else None
+    if 1 in levels and not args.no_progress:
+        if charge_range is not None:
+            print(f"MS1: every target at charges {charge_range[0]}-{charge_range[1]}", file=sys.stderr)
+        else:
+            none = targets.column("precursor_charge").null_count
+            lo, hi = _FALLBACK_CHARGE_RANGE
+            print(f"MS1: {targets.num_rows - none} targets at their own charge"
+                  + (f", {none} without one at charges {lo}-{hi}" if none else ""), file=sys.stderr)  # fmt: skip
     neutral_losses = _parse_downcast(args.neutral_losses) if args.neutral_losses else None
+    try:
+        source = _fragment_abundance(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    coverage = getattr(source, "coverage", None) or {}
+    # A library's model says which ions it speaks for: unless told
+    # otherwise, its ion series and charge ceiling are the channels'.
+    ion_types = _resolve_ion_types(args.ion_types or ",".join(coverage.get("ion_types") or ["b", "y"]))
+    max_fragment_charge = (
+        args.max_fragment_charge if args.max_fragment_charge is not None
+        else int(coverage.get("max_fragment_charge") or _DEFAULT_MAX_FRAG_CHARGE)
+    )  # fmt: skip
+    try:
+        settings = ChannelSettings(
+            n_isotopes=args.n_isotopes if args.n_isotopes is not None else _DEFAULT_N_ISOTOPES,
+            top_isotopes=args.top_isotopes, charge_range=charge_range, ion_types=ion_types,
+            max_fragment_charge=max_fragment_charge, neutral_losses=neutral_losses,
+            top_fragments=args.top_fragments,
+        )  # fmt: skip
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.top_isotopes is not None and args.n_isotopes is not None:
+        print("error: --top-isotopes and --n-isotopes choose the isotopes two ways; give one", file=sys.stderr)
+        return 2
 
     use_index = args.use_index or args.rebuild_index
     if use_index:
@@ -311,15 +367,14 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
             build_peak_index(args.peaks_dir, index_dir, downcast=_parse_downcast(args.downcast))
         table = extract_xic_indexed(
             index_dir, targets, exact_error=args.exact_error, peaks_dir=args.peaks_dir,
-            acquisition_id=args.acquisition_id, level=level, n_isotopes=args.n_isotopes,
-            ion_types=ion_types, max_fragment_charge=args.max_fragment_charge,
-            neutral_losses=neutral_losses, charge_range=charge_range, rt_window=args.rt_window,
+            acquisition_id=args.acquisition_id, level=level, rt_window=args.rt_window,
             tolerance=tolerance, tolerance_unit=tolerance_unit,
             all_in_window=rule == "all", assigned_scans_only=args.assigned_scans_only,
-            drop_unmatched=args.drop_unmatched,
+            drop_unmatched=args.drop_unmatched, channels=settings, fragment_abundance=source,
         )  # fmt: skip
         save_xic(table, args.output_dir, metadata={
             "level": level, "mode": "indexed", "tolerance": tolerance, "tolerance_unit": tolerance_unit,
+            "channels": settings.to_dict(), "fragment_abundance": source.describe(),
         })  # fmt: skip
         if not args.no_progress:
             print(f"extracted {table.num_rows} XIC rows → {args.output_dir}", file=sys.stderr)
@@ -357,9 +412,7 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
     result = extract_xic(
         args.peaks_dir, targets, acquisition_id=args.acquisition_id, levels=levels,
         tolerances=tolerances,
-        channels=ChannelSettings(n_isotopes=args.n_isotopes, charge_range=charge_range,
-                                 ion_types=ion_types, max_fragment_charge=args.max_fragment_charge,
-                                 neutral_losses=neutral_losses),
+        channels=settings, fragment_abundance=source,
         rt_window=args.rt_window, rule=rule, assigned_scans_only=args.assigned_scans_only,
         drop_unmatched=args.drop_unmatched, mz_axis=args.mz_axis, gate=gate,
         only_passing=args.only_passing, claims=args.claims, summary=args.summary,
@@ -376,6 +429,7 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
         "levels": levels, "mode": "scan_major", "engine": "sweep", "rule": rule,
         "tolerances": {str(lv): {"value": t, "unit": u} for lv, (t, u) in tolerances.items()},
         "mz_axis": result.mz_axis, "tables": tables,
+        "channels": settings.to_dict(), "fragment_abundance": source.describe(),
         "gate": None if gate is None else {
             "min_fragments": gate.min_fragments, "top_peaks": gate.top_peaks,
             "min_consecutive": gate.min_consecutive, "max_gap_s": gate.max_gap_s,
@@ -415,12 +469,47 @@ def _warn_tolerance_against_analyzer(bundle: Path, tolerances: dict[int, tuple[f
             )
 
 
+def _fragment_abundance(args: argparse.Namespace):
+    """The fragment abundance source the flags ask for (raises ValueError)."""
+    from constellation.massspec.peptide.channels import UNMODELLED, Uniform
+
+    choice = args.fragment_abundance
+    if args.ion_weights is not None and choice != "uniform":
+        raise ValueError("--ion-weights weigh the uniform series: give --fragment-abundance uniform")
+    if args.fragment_library is not None and choice != "library":
+        raise ValueError("--fragment-library is read with --fragment-abundance library")
+    if args.top_fragments is not None and choice != "library":
+        raise ValueError(
+            "--top-fragments keeps the most abundant ions, which needs abundances that rank them: "
+            "give --fragment-abundance library"
+        )
+    if choice == "uniform":
+        weights = None
+        if args.ion_weights:
+            from constellation.massspec.peptide.ions import IonType
+
+            weights = {}
+            for item in args.ion_weights.split(","):
+                name, _, value = item.partition("=")
+                try:
+                    weights[IonType[name.strip().upper()]] = float(value)
+                except (KeyError, ValueError):
+                    raise ValueError(f"--ion-weights: {item!r} is not TYPE=WEIGHT (a, b, c, x, y, z)") from None
+        return Uniform(ion_type_weights=weights)
+    if choice == "library":
+        from constellation.massspec.library.fragment_abundance import LibraryFragments
+
+        return LibraryFragments.from_directory(args.fragment_library or args.targets)
+    return UNMODELLED
+
+
 def _warn_level_flag_mismatch(args: argparse.Namespace) -> None:
     """Warn when a flag from the inactive level's group was set."""
     if args.level == "1":
-        if args.ion_types != "b,y" or args.max_fragment_charge != _DEFAULT_MAX_FRAG_CHARGE \
+        if args.ion_types is not None or args.max_fragment_charge is not None \
                 or args.neutral_losses or args.assigned_scans_only:
             print("warning: MS2 fragment options ignored with --level 1", file=sys.stderr)
     elif args.level == "2":
-        if args.n_isotopes != _DEFAULT_N_ISOTOPES or args.charge_range is not None or args.own_charge:
+        if args.n_isotopes is not None or args.top_isotopes is not None or args.charge_range is not None \
+                or args.own_charge:
             print("warning: MS1 isotope options ignored with --level 2", file=sys.stderr)

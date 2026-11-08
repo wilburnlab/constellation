@@ -131,9 +131,14 @@ class Library:
     def _validate_provenance(self, protein_ids: pa.ChunkedArray, peptide_ids: pa.ChunkedArray) -> None:
         """The span, edge, modification and decoy tables (all in Arrow)."""
         spans, edges = self.peptide_spans, self.span_peptide
+        # ``decoy_of`` records the peptide a decoy was made from. It is not
+        # a foreign key: a decoy stands on its own (PI, 2026-11-07), and a
+        # library may keep it without its target. What it names, if held,
+        # is not itself a decoy, and only a decoy names one.
         decoys = self.peptides.filter(pc.is_valid(self.peptides.column("decoy_of")))
         if decoys.num_rows:
-            _check_fk(decoys, "decoy_of", peptide_ids, "PEPTIDE_TABLE")
+            if not pc.all(pc.fill_null(decoys.column("is_decoy"), False)).as_py():
+                raise ValueError("decoy_of is set on a peptide that is not a decoy")
             targets = self.peptides.filter(pc.is_in(peptide_ids, value_set=decoys.column("decoy_of").combine_chunks()))
             if pc.any(pc.fill_null(targets.column("is_decoy"), False)).as_py():
                 raise ValueError("decoy_of names a peptide that is itself a decoy")
@@ -284,9 +289,11 @@ class Library:
 
     def subset_precursors(self, precursor_ids: Iterable[int] | pa.Array | pa.ChunkedArray) -> Library:
         """The library holding only these precursors and what they need:
-        their fragments; the peptides left with a precursor, a decoy only
-        with its target; those peptides' modification rows, span edges and
-        protein edges, and the spans still making one. Proteins are kept."""
+        their fragments; the peptides left with a precursor; those
+        peptides' modification rows, span edges and protein edges, and the
+        spans still making one. Proteins are kept. A decoy is kept without
+        its target (``decoy_of`` is a record, not a link; until 2026-11-07
+        a decoy whose target had no precursor left was dropped)."""
         if isinstance(precursor_ids, pa.ChunkedArray):
             precursor_ids = precursor_ids.combine_chunks()
         elif not isinstance(precursor_ids, pa.Array):
@@ -294,12 +301,6 @@ class Library:
         precursors = self.precursors.filter(pc.is_in(self.precursors.column("precursor_id"), value_set=precursor_ids))
         with_precursor = pc.unique(precursors.column("peptide_id").combine_chunks())
         peptides = self.peptides.filter(pc.is_in(self.peptides.column("peptide_id"), value_set=with_precursor))
-        # A decoy goes with its target: decoy_of must name a kept peptide.
-        orphan = pc.and_(
-            pc.is_valid(peptides.column("decoy_of")),
-            pc.invert(pc.fill_null(pc.is_in(peptides.column("decoy_of"), value_set=peptides.column("peptide_id").combine_chunks()), False)),
-        )
-        peptides = peptides.filter(pc.invert(orphan))
         keep = peptides.column("peptide_id").combine_chunks()
         precursors = precursors.filter(pc.is_in(precursors.column("peptide_id"), value_set=keep))
         span_peptide = self.span_peptide.filter(pc.is_in(self.span_peptide.column("peptide_id"), value_set=keep))
@@ -339,7 +340,10 @@ def attach_predictions(source: Library, predicted: Library) -> tuple[Library, di
     why), not the flat library a predictor rebuilds from bare
     (sequence, charge) pairs. Precursors are matched on (modified
     sequence, charge); a predicted retention time, CCS or charge
-    probability replaces the source's unless it is unset (−1 or null). A source precursor the predictor did
+    probability replaces the source's unless it is unset (null, NaN or
+    exactly the −1.0 sentinel; a negative iRT is a value, and until
+    2026-11-07 every negative value was taken as unset). An iRT of exactly
+    −1.0 cannot be told from unset. A source precursor the predictor did
     not return (a modification the model cannot take, skipped) is left out,
     with what only it needed (:meth:`Library.subset_precursors`), and
     counted. Returns the library and the counts.
@@ -362,7 +366,8 @@ def attach_predictions(source: Library, predicted: Library) -> tuple[Library, di
     for name in values:
         new = pc.take(pairs.column(f"predicted_{name}"), at)
         old = precursors.column(name)
-        merged_values = pc.if_else(pc.greater_equal(pc.fill_null(new, -1.0), 0.0), new, old)
+        unset = pc.or_(pc.is_null(new, nan_is_null=True), pc.fill_null(pc.equal(new, -1.0), True))
+        merged_values = pc.if_else(unset, old, new)
         precursors = precursors.set_column(precursors.schema.get_field_index(name), name, merged_values)
     fragments = predicted.fragments
     to = pc.index_in(fragments.column("precursor_id"), value_set=pairs.column("predicted_id").combine_chunks())

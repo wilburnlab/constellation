@@ -32,8 +32,8 @@ import sys
 import time
 from pathlib import Path
 
-#: Koina's flags that mean nothing here (a refused precursor always drops
-#: with its partners), with their parser defaults.
+#: Koina's flags that mean nothing here (a refused precursor is always
+#: dropped), with their parser defaults.
 KOINA_ONLY_ARGS: tuple[tuple[str, str, object], ...] = (
     ("on_unsupported_mod", "--on-unsupported-mod", "error"),
 )
@@ -104,8 +104,8 @@ def add_jchronologer_arguments(p: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--min-charge-probability", type=float, default=None, metavar="P",
         help=(
-            "keep a target precursor only if Electrician gives its charge at least P; its decoys "
-            "follow it (default: keep every charge)"
+            "keep a precursor, target or decoy, only if Electrician gives its charge at least P, "
+            "each judged on its own (default: keep every charge)"
         ),
     )
     group.add_argument(
@@ -318,8 +318,11 @@ def run(args: argparse.Namespace) -> int:
             return fail(f"{fragments.name} takes no collision energy; drop the energy flags")
         energy = None
 
+    from constellation.massspec.library.prediction import PREDICTION_LAYOUT
+
     key = stage_key(
         stage="massspec predict-library jchronologer",
+        layout=PREDICTION_LAYOUT,
         library=_library_key(source),
         peptide_charges=None if args.from_library is not None else [args.min_charge, args.max_charge],
         predictors={prop: p.identity() for prop, p in predictors.items()},
@@ -469,8 +472,8 @@ def _print_summary(report, energy, charges, output_dir: Path) -> None:
         for reason, n in reasons.items():
             shown = "; ".join(report.examples.get(prop, {}).get(reason, [])[:3])
             print(f"  refused by {prop} ({reason}): {n} precursors, e.g. {shown}")
-    if report.dropped_with_partner:
-        print(f"  dropped with a refused target or decoy: {report.dropped_with_partner} precursors")
+    if report.dropped:
+        print(f"  dropped: {report.dropped_targets} target and {report.dropped_decoys} decoy precursors")
     ccs = report.examples.get("ccs", {}).get("unsupported_modification", [])
     if any("UNIMOD:737" in d or "UNIMOD:739" in d for d in ccs):
         print("  Sculptor has no TMT tokens: pass --no-ccs to keep TMT precursors")

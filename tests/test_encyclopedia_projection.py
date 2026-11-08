@@ -393,3 +393,39 @@ def test_a_quantity_rows_arrays_become_rows_of_their_own(tmp_path: Path) -> None
     assert {(r["precursor_id"], r["acquisition_id"]) for r in points} == {
         (precursor["precursor_id"], precursor["acquisition_id"])
     }
+
+
+# ── what clock the retention times are on ──────────────────────────────
+
+
+def test_a_library_says_what_clock_its_retention_times_are_on(result: Path, tmp_path: Path) -> None:
+    """A search result's RTInSeconds are its runs' seconds; a library the
+    jar predicted holds JChronologer's scale, any other run-less library
+    its own. Nothing said so, so extraction gated on a model's clock as
+    if it were the run's (review of 2026-11-06)."""
+    from dataclasses import replace
+
+    from constellation.massspec.library.io import load_library, save_library
+
+    scale = "x.massspec.prediction.rt_scale"
+    assert read_encyclopedia(result).library.metadata_extras[scale] == "observed"
+    predicted = [_entry("PEPTIDEK", "PEPTIDEK", 2, proteins=("P1",), source="JChronologer")]
+    path = build_result_library(tmp_path / "predicted.dlib", predicted, source="JChronologer")
+    con = sqlite3.connect(path)
+    con.execute("DELETE FROM peptidequants")
+    con.commit()
+    con.close()
+    lib = read_encyclopedia(path).library
+    assert lib.metadata_extras[scale] == "chronologer_hi_seconds"
+    other = build_result_library(tmp_path / "other.dlib", [_entry("PEPTIDEK", "PEPTIDEK", 2, proteins=("P1",),
+                                                                  source="Prosit")], source="Prosit")  # fmt: skip
+    con = sqlite3.connect(other)
+    con.execute("DELETE FROM peptidequants")
+    con.commit()
+    con.close()
+    assert read_encyclopedia(other).library.metadata_extras[scale] == "encyclopedia_library"
+    # Written by Constellation and read back, a library keeps its own scale.
+    irt = replace(lib, metadata_extras={**lib.metadata_extras, scale: "koina:Prosit_2019_irt:irt"})
+    save_library(irt, tmp_path / "irt.dlib", format="encyclopedia.dlib")
+    assert load_library(tmp_path / "irt.dlib", format="encyclopedia.dlib").metadata_extras[scale] == (
+        "koina:Prosit_2019_irt:irt")  # fmt: skip

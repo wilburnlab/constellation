@@ -524,6 +524,35 @@ def _acquisitions_for(
     return Acquisitions(table), {**{s: i for i, s in enumerate(ordered)}, **agnostic}
 
 
+#: The ``SourceFile`` EncyclopeDIA 6.9.23 writes on the entries of a library
+#: it predicted from a FASTA file with its bundled JChronologer models.
+JCHRONOLOGER_SOURCE = "JChronologer"
+
+
+def _rt_scale(con, tables: set[str], sources: Sequence[str], metadata: dict[str, Any]) -> str:
+    """What clock a file's ``RTInSeconds`` (``rt_predicted``) is on.
+
+    A file Constellation wrote says so in its metadata table (the scale
+    of the library it was written from); otherwise:
+
+    A chromatogram library or search result holds quantities from runs, so
+    its retention times are seconds of those runs (``observed``). A
+    library without any (a ``.dlib`` predicted from a FASTA file) holds a
+    model's times: the jar's own JChronologer prediction is on
+    ``chronologer_hi_seconds``, the scale Constellation's JChronologer
+    predictor reproduces; anything else is ``encyclopedia_library``, a
+    library's own scale, which is not a run's clock either."""
+    from constellation.massspec.io.encyclopedia._write import RT_SCALE_ROW
+
+    if metadata.get(RT_SCALE_ROW):
+        return str(metadata[RT_SCALE_ROW])
+    if "peptidequants" in tables and _mirror.count_rows(con, "peptidequants"):
+        return "observed"
+    if list(sources) == [JCHRONOLOGER_SOURCE]:
+        return "chronologer_hi_seconds"
+    return "encyclopedia_library"
+
+
 def project_library_file(
     path: Path | str,
     *,
@@ -693,7 +722,10 @@ def project_library_file(
             precursors=precursors,
             fragments=fragments,
             protein_peptide=protein_peptide,
-            metadata_extras={"x.encyclopedia.metadata": metadata},
+            metadata_extras={
+                "x.encyclopedia.metadata": metadata,
+                "x.massspec.prediction.rt_scale": _rt_scale(con, tables, sources, metadata),
+            },
         )
 
         # ── join key of every precursor, for the tables that use it ──

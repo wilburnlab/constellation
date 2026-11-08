@@ -20,7 +20,11 @@ from constellation.core.io.schemas import register_schema
 
 #: 2 (2026-11-04): the vocabulary renames (ion → channel, peak → point).
 #: 3 (2026-11-05): ``is_decoy`` on queries and the query summary.
-SWEEP_SCHEMA_VERSION: int = 3
+#: 4 (2026-11-07): channel abundance is a share of the group's whole modelled
+#: distribution and channels may be a top-N selection; the scan ledger
+#: carries each scan's TIC and injection time; the cell view
+#: (:data:`SWEEP_CELL_TABLE`).
+SWEEP_SCHEMA_VERSION: int = 4
 
 
 def _meta(name: str) -> dict[bytes, bytes]:
@@ -72,7 +76,7 @@ SWEEP_CHANNEL_TABLE: pa.Schema = pa.schema(
         pa.field("abundance", pa.float32(), nullable=True),
         # What a match counts as evidence for: the isotope, or the rank of
         # the fragment's (ion type, position) within the query, so that one
-        # bond seen at two charges counts once.
+        # fragment ion seen at two charges or with a loss counts once.
         pa.field("evidence_key", pa.int32(), nullable=False),
     ],
     metadata=_meta("SweepChannel"),
@@ -87,6 +91,10 @@ SWEEP_SCAN_TABLE: pa.Schema = pa.schema(
         pa.field("isolation_lower", pa.float64(), nullable=True),
         pa.field("isolation_upper", pa.float64(), nullable=True),
         pa.field("n_points", pa.int32(), nullable=False),
+        # The scan's total ion current and ion injection time (ms), from the
+        # bundle's scan metadata; null where it records none.
+        pa.field("tic", pa.float64(), nullable=True),
+        pa.field("iit", pa.float64(), nullable=True),
     ],
     metadata=_meta("SweepScan"),
 )
@@ -165,7 +173,7 @@ SWEEP_QUERY_SUMMARY_TABLE: pa.Schema = pa.schema(
         pa.field("longest_run", pa.int32(), nullable=True),
         pa.field("best_scan", pa.int32(), nullable=True),
         pa.field("best_rt", pa.float64(), nullable=True),
-        # Distinct bonds (or isotopes) at the best scan.
+        # Distinct fragment ions (or isotopes) at the best scan.
         pa.field("best_n_keys", pa.int32(), nullable=True),
         # Scans each level could have matched it in, and cells matched.
         pa.field("n_eligible_ms1", pa.int32(), nullable=False),
@@ -206,7 +214,40 @@ SWEEP_POINT_CLAIM_TABLE: pa.Schema = pa.schema(
 )
 
 
+# The cell view a reducer reads (`QueryBatch.cells`): one row per match of a
+# cell, and one per eligible cell with none (`matched` false: intensity 0,
+# m/z and errors NaN). Errors are signed observed − theoretical.
+SWEEP_CELL_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("query", pa.int32(), nullable=False),
+        pa.field("level", pa.int8(), nullable=False),
+        pa.field("scan", pa.int32(), nullable=False),
+        pa.field("rt", pa.float64(), nullable=False),
+        pa.field("tic", pa.float64(), nullable=True),
+        pa.field("iit", pa.float64(), nullable=True),
+        pa.field("channel", pa.int32(), nullable=False),
+        pa.field("precursor_charge", pa.int8(), nullable=False),
+        pa.field("isotope", pa.int8(), nullable=True),
+        pa.field("ion_type", pa.int8(), nullable=True),
+        pa.field("position", pa.int32(), nullable=True),
+        pa.field("fragment_charge", pa.int32(), nullable=True),
+        pa.field("loss_id", pa.string(), nullable=True),
+        pa.field("abundance", pa.float32(), nullable=True),
+        pa.field("evidence_key", pa.int32(), nullable=False),
+        pa.field("mz_theoretical", pa.float64(), nullable=False),
+        pa.field("matched", pa.bool_(), nullable=False),
+        pa.field("point_index", pa.int32(), nullable=True),
+        pa.field("n_points", pa.int32(), nullable=False),
+        pa.field("mz_observed", pa.float64(), nullable=False),
+        pa.field("intensity", pa.float64(), nullable=False),
+        pa.field("mz_error_da", pa.float64(), nullable=False),
+        pa.field("mz_error_ppm", pa.float64(), nullable=False),
+    ],
+    metadata=_meta("SweepCell"),
+)
+
 register_schema("SweepQuery", SWEEP_QUERY_TABLE)
+register_schema("SweepCell", SWEEP_CELL_TABLE)
 register_schema("SweepChannel", SWEEP_CHANNEL_TABLE)
 register_schema("SweepScan", SWEEP_SCAN_TABLE)
 register_schema("SweepMatch", SWEEP_MATCH_TABLE)
@@ -217,6 +258,7 @@ register_schema("SweepPointClaim", SWEEP_POINT_CLAIM_TABLE)
 
 __all__ = [
     "SWEEP_SCHEMA_VERSION",
+    "SWEEP_CELL_TABLE",
     "SWEEP_QUERY_TABLE",
     "SWEEP_CHANNEL_TABLE",
     "SWEEP_SCAN_TABLE",

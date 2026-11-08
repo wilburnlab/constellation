@@ -103,6 +103,46 @@ def _log_erfcx(x: torch.Tensor) -> torch.Tensor:
     return torch.where(x >= 0.0, log_pos, log_neg)
 
 
+def _emg_mode_offset(sigma: torch.Tensor, tau: torch.Tensor, *, iterations: int = 40) -> torch.Tensor:
+    """Where the right-tailed EMG peaks, in units of σ from the Gaussian
+    centre: ``(t_mode − μ) / σ``.
+
+    With ``z = (t − μ)/σ``, ``r = σ/τ`` and ``w = (r − z)/√2`` the log
+    density is ``−z²/2 + log erfcx(w)`` up to a constant, and setting its
+    derivative to zero reduces to ``erfcx(w*) = √(2/π)/r``. ``erfcx`` is
+    strictly decreasing, so the root is unique; the mode is
+    ``z* = r − √2·w*``. It goes to ``1/r`` (μ + τ) as τ → 0 and to 0 as
+    τ → ∞.
+
+    Newton's method on ``g(w) = log erfcx(w) − log c`` (convex and
+    decreasing, so once left of the root it closes in from the left)
+    runs a fixed number of steps without gradients; one more step with
+    gradients gives the implicit-function derivative. Stays finite for
+    any ``w`` through :func:`_log_erfcx` and is ``vmap``-safe.
+    """
+    r = sigma / tau
+    log_c = 0.5 * math.log(2.0 / math.pi) - torch.log(r)
+
+    def step(w: torch.Tensor) -> torch.Tensor:
+        log_e = _log_erfcx(w)
+        # d/dw log erfcx(w) = 2w − 2/(√π·erfcx(w)), with 1/erfcx from its log.
+        slope = 2.0 * w - (2.0 / math.sqrt(math.pi)) * torch.exp(-log_e)
+        return w - (log_e - log_c) / slope
+
+    with torch.no_grad():
+        c = torch.exp(log_c)
+        # Large w: erfcx(w) ≈ 1/(w√π); very negative w: erfcx(w) ≈ 2·exp(w²).
+        w = torch.where(
+            c < 1.0,
+            1.0 / (c.clamp(min=1e-300) * math.sqrt(math.pi)),
+            -torch.sqrt(torch.log((c / 2.0).clamp(min=1.0))),
+        )
+        for _ in range(iterations):
+            w = step(w)
+    w = step(w.detach())
+    return r - _SQRT2 * w
+
+
 def emg_pdf(
     t: torch.Tensor,
     mu: torch.Tensor,
@@ -247,9 +287,9 @@ class EMGPeak(PeakShape):
     Params: `log_N_max`, `t_apex`, `log_sigma`, `log_tau`.
 
     `t_apex` is the *observed peak maximum* (where `N` reaches `N_max`),
-    not the underlying Gaussian centroid `μ` — they differ by `σ²/τ`
-    in the high-`σ/τ` regime. We parameterize on the observable apex
-    and solve back to `μ` internally so fits stay well-conditioned.
+    not the underlying Gaussian centroid `μ`. We parameterize on the
+    observable apex and solve back to `μ` internally (the exact mode,
+    :func:`_emg_mode_offset`) so fits stay well-conditioned.
     """
 
     def __init__(
@@ -285,9 +325,11 @@ class EMGPeak(PeakShape):
 
     @property
     def mu(self) -> torch.Tensor:
-        """Underlying Gaussian centroid (first-order mode correction:
-        `μ = t_apex - σ²/τ`)."""
-        return self.t_apex - self.sigma**2 / self.tau
+        """Underlying Gaussian centroid: ``t_apex`` less the exact distance
+        from centre to mode (:func:`_emg_mode_offset`). Until 2026-11-07
+        this was ``t_apex − σ²/τ``, which put the curve's maximum away
+        from ``t_apex`` (by several σ when τ ≪ σ)."""
+        return self.t_apex - self.sigma * _emg_mode_offset(self.sigma, self.tau)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         sigma = self.sigma

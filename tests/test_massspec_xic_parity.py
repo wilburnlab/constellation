@@ -184,6 +184,7 @@ def test_cli_extract_matches_the_oracle(tmp_root, tmp_path, level):
         "massspec", "chromatogram", "extract", "--peaks-dir", str(bundle), "--targets", str(path),
         "-o", str(out), "--level", str(level), "--acquisition-id", "7",
         "--tolerance", "0.35", "--tolerance-unit", "Da", "--rt-window", "12", "--no-progress",
+        *(["--charge-range", "1", "4"] if level == 1 else []),  # the oracle's default
     ])  # fmt: skip
     assert rc == 0
     got = pq.read_table(out / "xic_trace.parquet")
@@ -192,6 +193,31 @@ def test_cli_extract_matches_the_oracle(tmp_root, tmp_path, level):
         rt_window=12.0,
     )  # fmt: skip
     oracle.assert_traces_identical(got, want)
+
+
+def test_cli_matches_ms1_at_each_targets_own_charge_by_default(tmp_root, tmp_path):
+    """A charged target is matched in MS1 at its own charge unless a range
+    is asked for (PI, 2026-11-07); the default was every charge 1-4."""
+    run, bundle, peaks = _run("dia", tmp_root)
+    targets = _targets(run, level=1, name="dia")
+    assert targets.column("precursor_charge").null_count == 0
+    path = tmp_path / "targets.parquet"
+    pq.write_table(targets, path)
+    out = tmp_path / "xic"
+    rc = _cli([
+        "massspec", "chromatogram", "extract", "--peaks-dir", str(bundle), "--targets", str(path),
+        "-o", str(out), "--level", "1", "--acquisition-id", "7",
+        "--tolerance", "0.35", "--tolerance-unit", "Da", "--rt-window", "12", "--no-progress",
+    ])  # fmt: skip
+    assert rc == 0
+    got = pq.read_table(out / "xic_trace.parquet")
+    want = oracle.extract_xic_scan_major(
+        peaks, targets, acquisition_id=7, level=1, tolerance=0.35, tolerance_unit="Da",
+        rt_window=12.0, charge_range=None,
+    )  # fmt: skip
+    oracle.assert_traces_identical(got, want)
+    assert set(zip(got.column("target_id").to_pylist(), got.column("precursor_charge").to_pylist())) <= set(
+        zip(targets.column("target_id").to_pylist(), targets.column("precursor_charge").to_pylist()))  # fmt: skip
 
 
 def test_cli_both_levels_in_one_sweep(tmp_root, tmp_path, capsys):

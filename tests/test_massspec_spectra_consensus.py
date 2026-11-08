@@ -93,7 +93,7 @@ def _spectrum_on(b, channel_intensities: dict[int, float]):
 def test_consensus_identical_replicates():
     b = _basis()
     spec = _spectrum_on(b, {0: 6.0, 1: 4.0, 2: 2.0})
-    cons = build_consensus([spec, spec, spec], b, aggregate="sum")
+    cons = build_consensus([spec, spec, spec], b, aggregate="sum", counts=True)
     assert cons.n_replicates == 3
     assert cons.per_replicate.shape == (3, b.K)
     # sum aggregate = 3× the single spectrum
@@ -104,6 +104,7 @@ def test_consensus_identical_replicates():
     assert torch.allclose(
         cons.deviance_from_bulk, torch.zeros(3, dtype=torch.float64), atol=1e-9
     )
+    assert torch.allclose(cons.divergence_from_bulk, torch.zeros(3, dtype=torch.float64), atol=1e-12)
 
 
 def test_consensus_median_and_normalize():
@@ -131,18 +132,31 @@ def test_consensus_outlier_has_high_deviance_from_bulk():
     b = _basis()
     inlier = _spectrum_on(b, {0: 8.0, 1: 1.0, 2: 1.0})
     outlier = _spectrum_on(b, {0: 1.0, 1: 1.0, 2: 8.0})  # mass shifted to channel 2
-    cons = build_consensus([inlier, inlier, inlier, outlier], b, aggregate="median")
-    dev = cons.deviance_from_bulk
-    assert dev[3].item() > 5.0 * max(dev[0].item(), 1e-6)
+    cons = build_consensus([inlier, inlier, inlier, outlier], b, aggregate="median", counts=True)
+    for dev in (cons.deviance_from_bulk, cons.divergence_from_bulk):
+        assert dev[3].item() > 5.0 * max(dev[0].item(), 1e-6)
 
 
 def test_consensus_single_replicate_is_nan_free():
     b = _basis()
-    cons = build_consensus([_spectrum_on(b, {0: 5.0, 3: 5.0})], b)
+    cons = build_consensus([_spectrum_on(b, {0: 5.0, 3: 5.0})], b, counts=True)
     assert cons.n_replicates == 1
     assert torch.isfinite(cons.dispersion).all()
     assert torch.allclose(cons.dispersion, torch.zeros(b.K, dtype=torch.float64))
     assert torch.isfinite(cons.deviance_from_bulk).all()
+    assert torch.isfinite(cons.divergence_from_bulk).all()
+
+
+def test_divergence_from_bulk_is_scale_free_and_g2_needs_counts():
+    """G² = 2·N·KL scales with N, so on intensities it was arbitrary; the
+    divergence is the same at any scale (review of 2026-11-06)."""
+    b = _basis()
+    a = _spectrum_on(b, {0: 8.0, 1: 1.0, 2: 1.0})
+    c = _spectrum_on(b, {0: 1.0, 1: 1.0, 2: 8.0})
+    small = build_consensus([a, a, c], b)
+    big = build_consensus([(m, i * 1e6) for m, i in (a, a, c)], b)
+    assert small.deviance_from_bulk is None
+    assert torch.allclose(small.divergence_from_bulk, big.divergence_from_bulk, rtol=1e-9)
 
 
 def test_consensus_empty_raises():
@@ -155,3 +169,36 @@ def test_consensus_invalid_aggregate_raises():
     b = _basis()
     with pytest.raises(ValueError, match="aggregate"):
         build_consensus([_spectrum_on(b, {0: 1.0})], b, aggregate="mean")  # type: ignore[arg-type]
+
+
+def test_fragment_basis_reads_modifications_from_the_vocabulary_given():
+    """The basis moved to the shared channel generator without passing the
+    vocabulary on, so a registered custom modification raised KeyError
+    where the ladder it replaced read it (Codex review, 2026-11-07)."""
+    from constellation.core.chem.composition import Composition
+    from constellation.core.chem.modifications import UNIMOD
+    from constellation.massspec.peptide.ions import fragment_ladder
+
+    vocab = UNIMOD.subset(["UNIMOD:4", "UNIMOD:35"])
+    vocab.register_custom(id="CUSTOM:tag", name="Tag", delta_composition=Composition.from_formula("C2H3N"))
+    peptide = parse_proforma("PEPT[CUSTOM:tag]IDEK")
+    basis = fragment_basis(peptide, vocab=vocab)
+    table, _ = fragment_ladder(peptide, max_fragment_charge=2, return_tensor=False, vocab=vocab)
+    assert sorted(basis.mz_theoretical.tolist()) == sorted(table.column("mz_theoretical").to_pylist())
+
+
+def test_the_channel_generator_reads_modifications_from_the_vocabulary_given():
+    import numpy as np
+
+    from constellation.core.chem.composition import Composition
+    from constellation.core.chem.modifications import UNIMOD
+    from constellation.massspec.peptide.channels import ChannelSettings, isotope_channels
+    from constellation.massspec.peptide.envelope import peptide_envelope
+
+    vocab = UNIMOD.subset(["UNIMOD:4"])
+    vocab.register_custom(id="CUSTOM:tag", name="Tag", delta_composition=Composition.from_formula("C2H3N"))
+    peptide = parse_proforma("PEPT[CUSTOM:tag]IDEK")
+    channels = isotope_channels([peptide], np.array([0]), np.array([2]), np.array([np.nan]),
+                                ChannelSettings(), vocab=vocab)  # fmt: skip
+    mz, _ = peptide_envelope(peptide, charge=2, n_peaks=channels.n, vocab=vocab)
+    assert channels.mz.tolist() == pytest.approx(mz.tolist(), abs=0)

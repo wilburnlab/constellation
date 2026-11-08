@@ -183,11 +183,15 @@ def test_properties_can_be_left_out_and_charges_filtered(fake, search_space, tmp
     assert _jc(search_space, tmp_path / "b", "--min-charge-probability", "0.3") == 0
     filtered = load_library(tmp_path / "b" / "library_pqdir")
     report = json.loads((tmp_path / "b" / "manifest.json").read_text())["prediction"]
-    targets = filtered.precursors.join(filtered.peptides.select(["peptide_id", "is_decoy"]), keys="peptide_id")
-    targets = targets.filter(pc.invert(targets.column("is_decoy")))
-    assert pc.min(targets.column("charge_probability")).as_py() >= 0.3
+    kept = filtered.precursors.join(filtered.peptides.select(["peptide_id", "is_decoy"]), keys="peptide_id")
+    # Targets and decoys alike are judged on their own predictions (until
+    # 2026-11-07 decoys were never judged and followed their targets).
+    for decoy in (False, True):
+        part = kept.filter(pc.equal(kept.column("is_decoy"), decoy))
+        assert part.num_rows and pc.min(part.column("charge_probability")).as_py() >= 0.3
     assert report["refused"]["charge_state"]["below_min_charge_probability"] > 0
-    assert report["dropped_with_partner"] > 0  # decoys follow their target
+    assert report["dropped_targets"] > 0 and report["dropped_decoys"] > 0
+    assert "dropped_with_partner" not in report
 
 
 def test_a_peptide_list(fake, tmp_path):

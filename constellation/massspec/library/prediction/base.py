@@ -11,8 +11,8 @@ in two steps:
 * ``check(requests)`` — which requests it cannot take and why, without
   running a model (a peptide its tokenizer refuses, a charge or energy
   outside its range). The orchestration (``prediction.run``) drops a
-  precursor any requested predictor refuses, with its target/decoy
-  partners, before anything is predicted;
+  precursor any requested predictor refuses, on its own, before anything
+  is predicted;
 * ``predict(requests)`` — the property for requests it accepted, as plain
   numpy arrays: :class:`FragmentArrays` or :class:`ValueArray`.
 
@@ -73,9 +73,34 @@ class Capabilities:
     losses: tuple[str, ...] = ()
     #: Fragments: the fragmentation it was trained on ("HCD").
     fragmentation: str | None = None
+    #: Fragments: the highest ion number (the n of b_n) it predicts, None for
+    #: every ion the peptide has (up to its length − 1).
+    max_ion_number: int | None = None
+    #: Fragments: the intensity below which it reports no ion, and whether
+    #: an ion at exactly that value is reported (``"at_least"``) or not
+    #: (``"above"``). An ion it covers and did not report was predicted
+    #: below this floor, which is not the same as not predicted.
+    min_intensity: float | None = None
+    intensity_floor: Literal["at_least", "above"] | None = None
     #: Retention time: the scale its seconds are on. A model's scale, not a
     #: run's; mapping it onto a run is ``massspec.rt``'s.
     rt_scale: str | None = None
+
+    def fragment_coverage(self) -> dict[str, Any]:
+        """Which fragment ions this predictor speaks for, as plain data:
+        an ion inside it with no predicted row was predicted below the
+        floor (an abundance of 0), an ion outside it was never predicted
+        (unknown). Fragment charges run to ``min(max_fragment_charge, z)``
+        for a precursor of charge z."""
+        return {
+            "ion_types": [IonType(t).name.lower() for t in self.ion_types],
+            "max_fragment_charge": self.max_fragment_charge,
+            "fragment_charge_at_most_precursor": True,
+            "max_ion_number": self.max_ion_number,
+            "losses": list(self.losses),
+            "min_intensity": self.min_intensity,
+            "intensity_floor": self.intensity_floor,
+        }
 
 
 @dataclass(frozen=True)

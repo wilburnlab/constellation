@@ -585,7 +585,7 @@ def locate_precursor(
     scans: pa.Table,
     *,
     precursor_mz: float,
-    rt: float,
+    rt: float | None,
     level: int = 2,
 ) -> dict[str, object]:
     """Where a precursor at ``precursor_mz`` eluting at ``rt`` was measured.
@@ -596,7 +596,9 @@ def locate_precursor(
     (the scan of ``level`` nearest ``rt`` that isolated the precursor) and
     ``parent_scan`` (the scan of the level below nearest ``rt``). A
     peptide-centric search reports the apex at a scan of the covering
-    window, so ``ms_scan`` is that apex scan exactly.
+    window, so ``ms_scan`` is that apex scan exactly. Without ``rt`` (an
+    identification with no apex) the window and its isolation are found
+    from the m/z alone, and the scans are None.
     """
     windows = isolation_window_table(scans)
     windows = windows.filter(pc.equal(windows.column("level"), level))
@@ -607,7 +609,10 @@ def locate_precursor(
             w = min(rows, key=lambda r: abs(r["center"] - precursor_mz))
             found["window"] = w["window"]
             found["isolation"] = (w["isolation_lower"], w["isolation_upper"])
-            found["ms_scan"] = nearest_scan(scans, rt, level=level, window=w["window"])
+            if rt is not None:
+                found["ms_scan"] = nearest_scan(scans, rt, level=level, window=w["window"])
+    elif rt is None:
+        pass  # a DDA scan is found by its time; with none there is nothing to find
     else:
         sub = _select(scans, level, None)
         lo = sub.column("isolation_lower").to_numpy(zero_copy_only=False)
@@ -619,7 +624,7 @@ def locate_precursor(
             best = int(idx[int(np.argmin(np.abs(times - rt)))])
             found["ms_scan"] = int(sub.column("scan")[best].as_py())
             found["isolation"] = (float(lo[best]), float(hi[best]))
-    found["parent_scan"] = nearest_scan(scans, rt, level=level - 1) if level > 1 else None
+    found["parent_scan"] = nearest_scan(scans, rt, level=level - 1) if level > 1 and rt is not None else None
     return found
 
 

@@ -98,3 +98,46 @@ def test_from_table_rejects_missing_target_id():
     bad = pa.table({"precursor_mz": pa.array([700.1], pa.float64())})
     with pytest.raises(ValueError):
         targets_from_table(bad)
+
+
+@pytest.mark.parametrize(
+    ("scale", "centred"),
+    [(None, True), ("observed", True), ("chronologer_hi_seconds", False), ("koina:Prosit_2019_irt:irt", False),
+     ("irt", False), ("encyclopedia_library", False)],  # fmt: skip
+)
+def test_a_library_time_is_a_window_centre_only_on_the_runs_clock(scale, centred):
+    """A predicted library's rt_predicted (a model's scale, or iRT) was used
+    as run seconds, so --rt-window gated on the wrong clock (review of
+    2026-11-06). It is carried as rt_library with its scale instead."""
+    lib = _library()
+    lib.metadata_extras = {} if scale is None else {"x.massspec.prediction.rt_scale": scale}
+    t = targets_from_library(lib)
+    assert t.column("rt_library").to_pylist() == [1800.0, None]
+    assert t.column("rt_scale").to_pylist() == [scale, scale]
+    assert t.column("rt_center").to_pylist() == ([1800.0, None] if centred else [None, None])
+
+
+def test_an_older_koina_library_states_its_scale_by_its_own_key():
+    lib = _library()
+    lib.metadata_extras = {"x.koina.rt_scale": "irt", "x.koina.rt_model": "Prosit_2019_irt"}
+    t = targets_from_library(lib)
+    assert set(t.column("rt_scale").to_pylist()) == {"koina:Prosit_2019_irt:irt"}
+    assert t.column("rt_center").null_count == t.num_rows
+
+
+def test_the_cli_refuses_an_rt_window_around_a_model_clock(tmp_path, capsys):
+    """`chromatogram extract --rt-window` on a predicted library is an
+    error naming the scale, in the sweep and through the mass index."""
+    from constellation.cli.__main__ import main
+
+    lib = _library()
+    lib.metadata_extras = {"x.massspec.prediction.rt_scale": "chronologer_hi_seconds"}
+    path = tmp_path / "targets.parquet"
+    import pyarrow.parquet as pq
+
+    pq.write_table(targets_from_library(lib), path)
+    for extra in ([], ["--use-index"]):
+        rc = main(["massspec", "chromatogram", "extract", "--peaks-dir", str(tmp_path), "--targets", str(path),
+                   "-o", str(tmp_path / "out"), "--level", "2", "--rt-window", "60", "--no-progress", *extra])  # fmt: skip
+        assert rc == 2
+        assert "chronologer_hi_seconds, not this run's seconds" in capsys.readouterr().err

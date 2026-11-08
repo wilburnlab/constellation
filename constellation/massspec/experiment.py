@@ -546,6 +546,21 @@ def _acquisition_label(ids: list[int]) -> str:
     return f"{word} " + ", ".join(str(i) for i in ids)
 
 
+def _passed_settings(s: dict[str, Any], *, short: bool) -> str:
+    """Where settings the engine did not record come from, and why there
+    are none recorded: an unfinished search has no result yet, while a
+    finished one simply recorded none (until 2026-11-07 every case was
+    called unfinished)."""
+    jar = s.get("engine") == "encyclopedia"
+    text = "as given, the rest at the jar's defaults" if jar else "as given"
+    if short:
+        return text
+    if jar:
+        text = "as given, the rest at the jar's documented defaults"
+    why = "the search did not finish" if s.get("status") != "finished" else "the engine recorded none in its result"
+    return f"{text}: {why}"
+
+
 def _search_block(s: dict[str, Any], names: Mapping[int, str]) -> list[str]:
     lines = [f"  {s['unit']}"]
     lines += _field("status", _status_line(s))
@@ -559,7 +574,7 @@ def _search_block(s: dict[str, Any], names: Mapping[int, str]) -> list[str]:
     lines += _field("library", _library_line(s))
     if s.get("fasta"):
         lines += _field("FASTA", _file_name(s["fasta"]))
-    source = "" if s["settings_source"] == RECORDED else " (as given, the rest at the jar's defaults)"
+    source = "" if s["settings_source"] == RECORDED else f" ({_passed_settings(s, short=True)})"
     lines += _field("settings", _pairs(s["settings"]) + source)
     found = _found(s)
     if found:
@@ -631,7 +646,7 @@ def _detail_block(s: dict[str, Any], names: Mapping[int, str]) -> list[str]:
     source = (
         "as the engine recorded them in its result"
         if s["settings_source"] == RECORDED
-        else "as given, the rest at the jar's documented defaults: the search did not finish"
+        else _passed_settings(s, short=False)
     )
     lines.append(f"  settings ({source})")
     headline = [tuple(p) for p in s["settings"]]

@@ -212,18 +212,14 @@ def test_silac_labels_come_off_and_chemical_modifications_stay():
     assert not labelled and sites.n_term == ("UNIMOD:737",)
 
 
-def test_a_target_and_its_decoys_at_one_charge_are_one_group(tmp_path):
+def test_each_precursor_has_its_own_request_and_no_partner(tmp_path):
+    """Targets and their decoys are not grouped (PI, 2026-11-07): the plan
+    says which precursors are decoys and nothing about which target."""
     lib = _search_space(tmp_path, PROTEINS)
     plan = build_requests(lib)
+    assert not hasattr(plan, "group")
     peptides = {r["peptide_id"]: r for r in lib.peptides.to_pylist()}
-    charges = lib.precursors.column("charge").to_pylist()
-    for row, pid in enumerate(plan.peptide_id.tolist()):
-        target = peptides[pid]["decoy_of"] if peptides[pid]["is_decoy"] else pid
-        same = [
-            r for r, p in enumerate(plan.peptide_id.tolist())
-            if (peptides[p]["decoy_of"] if peptides[p]["is_decoy"] else p) == target and charges[r] == charges[row]
-        ]
-        assert set(np.flatnonzero(plan.group == plan.group[row]).tolist()) == set(same)
+    assert plan.is_decoy.tolist() == [bool(peptides[p]["is_decoy"]) for p in plan.peptide_id.tolist()]
     assert plan.is_decoy.any() and (~plan.is_decoy).any()
 
 
@@ -282,7 +278,9 @@ def _decoy_and_target_of(lib: Library) -> tuple[str, str]:
 
 
 @pytest.mark.parametrize("which", ["target", "decoy"])
-def test_a_refused_precursor_takes_its_partner_with_it(tmp_path, which):
+def test_a_refused_precursor_goes_alone(tmp_path, which):
+    """A target is not lost because its decoy was refused, nor the other
+    way round (until 2026-11-07 both went)."""
     lib = _search_space(tmp_path, PROTEINS)
     target, decoy = _decoy_and_target_of(lib)
     refused = target if which == "target" else decoy
@@ -290,10 +288,11 @@ def test_a_refused_precursor_takes_its_partner_with_it(tmp_path, which):
     predictors["ccs"] = FakePredictor("ccs", refuse={refused})
     out, report = predict_onto(lib, predictors)
     left = set(out.peptides.column("modified_sequence").to_pylist())
-    assert target not in left and decoy not in left
+    assert refused not in left and ({target, decoy} - {refused}) <= left
     assert report.refused == {"ccs": {"unsupported_modification": 2}}  # the peptide at 2+ and 3+
-    assert report.dropped_with_partner == 2 and report.dropped == 4
-    assert report.precursors_kept == lib.precursors.num_rows - 4
+    assert report.dropped == 2
+    assert (report.dropped_targets, report.dropped_decoys) == ((2, 0) if which == "target" else (0, 2))
+    assert report.precursors_kept == lib.precursors.num_rows - 2
     assert out.precursors.num_rows == report.precursors_kept
 
 
@@ -442,3 +441,65 @@ def test_predicting_one_property_keeps_the_record_of_the_others(tmp_path):
     third, _ = predict_onto(second, {"fragments": FakePredictor("fragments")})
     assert "x.massspec.prediction.collision_energy" not in third.metadata_extras
     assert third.metadata_extras["x.massspec.prediction.rt_scale"] == "fake_seconds"
+
+
+# ── each precursor on its own (PI, 2026-11-07) ──────────────────────
+
+
+class _ChargeTwoLikely(FakePredictor):
+    """P(z) of 0.9 at 2+ and 0.1 otherwise, for any peptide."""
+
+    def __init__(self) -> None:
+        super().__init__("charge_state")
+
+    def predict(self, requests: Requests):
+        return ValueArray(np.where(requests.charge == 2, 0.9, 0.1))
+
+
+def test_charge_probability_judges_every_precursor_on_its_own(tmp_path):
+    """Decoys were never judged and followed their target, so a decoy with
+    none (a reversed protein's) was kept at every charge: on BSA decoys
+    outnumbered targets 107:1 at 1+."""
+    lib = _search_space(tmp_path, PROTEINS, decoys=(DecoySet(), DecoySet(method="reverse-protein", index=1)))
+    lone = pc.and_(pc.fill_null(lib.peptides.column("is_decoy"), False), pc.is_null(lib.peptides.column("decoy_of")))
+    assert pc.any(lone).as_py()  # reverse-protein decoys have no decoy_of
+    out, report = predict_onto(lib, {"charge_state": _ChargeTwoLikely()}, min_charge_probability=0.5)
+    assert set(out.precursors.column("charge").to_pylist()) == {2}
+    kept = out.precursors.join(out.peptides.select(["peptide_id", "is_decoy", "decoy_of"]), keys="peptide_id")
+    lone_kept = kept.filter(pc.and_(kept.column("is_decoy"), pc.is_null(kept.column("decoy_of"))))
+    assert lone_kept.num_rows and set(lone_kept.column("charge").to_pylist()) == {2}
+    threes = pc.sum(pc.equal(lib.precursors.column("charge"), 3)).as_py()
+    assert report.dropped == threes and report.dropped_decoys > 0 and report.dropped_targets > 0
+
+
+def test_fragment_coverage_is_recorded_beside_the_predictors(tmp_path):
+    lib = _search_space(tmp_path, PROTEINS, decoys=())
+    out, _ = predict_onto(lib, {"fragments": FakePredictor("fragments")})
+    coverage = out.metadata_extras["x.massspec.prediction.fragment_coverage"]
+    assert coverage["ion_types"] == ["b", "y"] and coverage["max_fragment_charge"] == 2
+    assert coverage["fragment_charge_at_most_precursor"] is True
+    # A JChronologer model states its own: ions to 29, its floor, inclusive.
+    caps = jm.CartographerFragments(FakeBundle({}), min_intensity=0.02).capabilities.fragment_coverage()
+    assert (caps["max_ion_number"], caps["min_intensity"], caps["intensity_floor"]) == (29, 0.02, "at_least")
+    # A property predicted later keeps the record of the fragments it left alone.
+    again, _ = predict_onto(out, {"retention_time": FakePredictor("retention_time")})
+    assert again.metadata_extras["x.massspec.prediction.fragment_coverage"] == coverage
+
+
+def test_attach_predictions_keeps_a_negative_irt(tmp_path):
+    """Every negative value was taken as unset, so an iRT below zero (and a
+    negative CCS, should a model give one) was replaced by the source's."""
+    lib = _search_space(tmp_path, PROTEINS, decoys=())
+    predicted, _ = predict_onto(lib, {"retention_time": FakePredictor("retention_time")})
+    n = predicted.precursors.num_rows
+    values = np.linspace(-20.0, 40.0, n)
+    values[0] = -1.0  # the sentinel: unset
+    idx = predicted.precursors.schema.get_field_index("rt_predicted")
+    predicted = replace(predicted, precursors=predicted.precursors.set_column(idx, "rt_predicted", pa.array(values)))
+    merged, _ = attach_predictions(lib, predicted)
+    got = dict(zip(merged.precursors.column("precursor_id").to_pylist(), merged.precursors.column("rt_predicted").to_pylist()))
+    want = dict(zip(predicted.precursors.column("precursor_id").to_pylist(), values.tolist()))
+    first = predicted.precursors.column("precursor_id")[0].as_py()
+    assert got[first] == -1.0  # the source's own (unset) value
+    assert all(got[k] == v for k, v in want.items() if k != first)
+    assert any(v < 0 for k, v in got.items() if k != first)

@@ -154,7 +154,8 @@ TRANSMISSION_PEPTIDE_PRECURSOR: pa.Schema = pa.schema(
 
 
 #: 2 (2026-11-05): ``is_decoy``.
-XIC_TARGET_SCHEMA_VERSION: int = 2
+#: 3 (2026-11-07): ``rt_library`` and ``rt_scale``.
+XIC_TARGET_SCHEMA_VERSION: int = 3
 
 
 # The normalized extraction-target contract: the single thing the
@@ -170,6 +171,10 @@ XIC_TARGET_SCHEMA_VERSION: int = 2
 # modseq+charge pair (required for MS2 fragment ladders). The extractor
 # enforces that, not the schema. RT gating: explicit `[rt_start, rt_end]`
 # overrides `rt_center ± rt_window`; all-null → all-RT (untargeted).
+# `rt_center` is a time in the run's own seconds; a library's time on a
+# model's scale (`rt_scale`: `chronologer_hi_seconds`, `irt`, ...) is
+# carried as `rt_library` and gates nothing until it has been mapped onto
+# the run (`massspec.rt`).
 XIC_TARGET_TABLE: pa.Schema = pa.schema(
     [
         # Caller's id for output join-back (precursor_id / psm_id / row index).
@@ -191,6 +196,12 @@ XIC_TARGET_TABLE: pa.Schema = pa.schema(
         # A decoy target (from a search space's decoys); null where the
         # source does not say. Carried into the sweep's queries and summary.
         pa.field("is_decoy", pa.bool_(), nullable=True),
+        # The source library's own retention time and the clock it is on
+        # (`x.massspec.prediction.rt_scale`): `observed` (a run's seconds,
+        # which is then also `rt_center`) or a model's scale, for the
+        # calibration that maps it onto this run.
+        pa.field("rt_library", pa.float64(), nullable=True),
+        pa.field("rt_scale", pa.string(), nullable=True),
     ],
     metadata={
         b"schema_name": b"XICTarget",
@@ -212,8 +223,10 @@ XIC_TRACE_SCHEMA_VERSION: int = 1
 # precision guarantee: extracted against an f32-m/z peak index, the
 # *realized* precision of `mz_observed` / `mz_error_*` is f32 unless the
 # extractor's `exact_error` path re-derives them from the canonical
-# table. `mz_error_*` are SIGNED, conventional (observed - theoretical) —
-# derived from the matching kernel's `signed_delta` — so downstream
+# table. `mz_error_*` are SIGNED, conventional (observed - theoretical),
+# computed from the matched point and the channel's m/z (the matching
+# kernel's own `signed_delta` is query − axis, the other way round, and the
+# sweep does not use it), so downstream
 # probabilistic scoring stays re-extraction-free. This is the terminal artifact;
 # trace → PRECURSOR_QUANT reduction is a separate downstream step.
 XIC_TRACE_TABLE: pa.Schema = pa.schema(
