@@ -87,10 +87,40 @@ class QueryPlan:
     settings: ChannelSettings = field(default_factory=ChannelSettings)
     #: What the fragment abundances came from (``FragmentAbundance.describe``).
     fragment_abundance: dict = field(default_factory=lambda: dict(UNMODELLED.describe()))
+    #: For a plan taken from another (:meth:`take`), each query's number in
+    #: that plan, which is what outputs name it by; None: its own numbers.
+    query_ids: np.ndarray | None = None
 
     @property
     def n_queries(self) -> int:
         return int(self.rt_lo.size)
+
+    def global_query(self, queries: np.ndarray) -> np.ndarray:
+        """The number each of ``queries`` has in the plan this one was taken
+        from (its own number for a whole plan)."""
+        queries = np.asarray(queries, dtype=np.int64)
+        return queries if self.query_ids is None else self.query_ids[queries]
+
+    def take(self, queries: np.ndarray) -> QueryPlan:
+        """The plan of ``queries`` alone (positions, in the order given), as
+        queries 0, 1, ... that remember their numbers here: what a unit of
+        work is sent, so no worker holds the whole plan."""
+        queries = np.asarray(queries, dtype=np.int64)
+        return QueryPlan(
+            targets=self.targets.take(pa.array(queries)),
+            levels=self.levels,
+            precursor_charge=self.precursor_charge[queries],
+            precursor_mz=self.precursor_mz[queries],
+            precursor_mz_derived=self.precursor_mz_derived[queries],
+            rt_lo=self.rt_lo[queries],
+            rt_hi=self.rt_hi[queries],
+            assigned_scan=self.assigned_scan[queries],
+            isotopes=None if self.isotopes is None else self.isotopes.take(queries),
+            fragments=None if self.fragments is None else self.fragments.take(queries),
+            settings=self.settings,
+            fragment_abundance=self.fragment_abundance,
+            query_ids=self.global_query(queries),
+        )
 
     @cached_property
     def precursor_order(self) -> np.ndarray:

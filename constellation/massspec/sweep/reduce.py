@@ -272,8 +272,10 @@ def _windows_per_query(plan: QueryPlan, s: Ledger, level: int, queries: np.ndarr
 
 @dataclass(frozen=True)
 class QueryBatch:
-    """A contiguous range of queries and everything the sweep matched for
-    them, sorted by (query, level, scan order, channel, point)."""
+    """Queries, ascending, and everything the sweep matched for them, sorted
+    by (query, level, scan order, channel, point). Its plan may be one
+    taken for the batch (``QueryPlan.take``): the queries are then that
+    plan's, and an output names them by ``plan.global_query``."""
 
     plan: QueryPlan
     queries: np.ndarray  # the batch's queries, ascending
@@ -410,14 +412,14 @@ class QueryBatch:
                     "mz_observed": np.concatenate([parts["mz_observed"], np.full(empty.size, np.nan)]),
                     "intensity": np.concatenate([parts["intensity"], np.zeros(empty.size)]),
                 }  # fmt: skip
-                return Cells(level=int(level), channels=channels, scans=self.scans,
+                return Cells(level=int(level), channels=channels, scans=self.scans, query_ids=self.plan.query_ids,
                              **{k: np.asarray(v)[src] for k, v in columns.items()})  # fmt: skip
             return self._cells_by_sort(level, channels, parts, cq, cr, ci)
         if in_order:
-            return Cells(level=int(level), channels=channels, scans=self.scans,
+            return Cells(level=int(level), channels=channels, scans=self.scans, query_ids=self.plan.query_ids,
                          **{k: np.asarray(v) for k, v in parts.items()})  # fmt: skip
         by = np.lexsort((parts["point_index"], parts["channel"], order[parts["row"]], parts["query"]))
-        return Cells(level=int(level), channels=channels, scans=self.scans,
+        return Cells(level=int(level), channels=channels, scans=self.scans, query_ids=self.plan.query_ids,
                      **{k: np.asarray(v)[by] for k, v in parts.items()})  # fmt: skip
 
     def _cells_by_sort(self, level, channels, parts, cq, cr, ci) -> Cells:
@@ -447,7 +449,7 @@ class QueryBatch:
             "intensity": np.concatenate([parts["intensity"], np.zeros(take.size)]),
         }  # fmt: skip
         by = np.lexsort((parts["point_index"], parts["channel"], order[parts["row"]], parts["query"]))
-        return Cells(level=int(level), channels=channels, scans=self.scans,
+        return Cells(level=int(level), channels=channels, scans=self.scans, query_ids=self.plan.query_ids,
                      **{k: np.asarray(v)[by] for k, v in parts.items()})  # fmt: skip
 
     def eligible_cells_of(self, level: int, queries: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -479,10 +481,18 @@ class Cells:
     intensity: np.ndarray  # float64, 0 unmatched
     channels: Channels
     scans: Ledger
+    #: Each query's number in the whole plan, for a batch of a plan taken
+    #: from it (``QueryPlan.query_ids``); None: the numbers are the plan's.
+    query_ids: np.ndarray | None = None
 
     @property
     def n(self) -> int:
         return int(self.query.size)
+
+    @property
+    def global_query(self) -> np.ndarray:
+        """Each row's query by its number in the whole plan."""
+        return self.query if self.query_ids is None else self.query_ids[self.query]
 
     @property
     def channel_index(self) -> np.ndarray:
@@ -540,7 +550,7 @@ class Cells:
         tic, iit = self.tic, self.iit
         return pa.table(
             {
-                "query": pa.array(self.query.astype(np.int32)),
+                "query": pa.array(self.global_query.astype(np.int32)),
                 "level": pa.array(np.full(self.n, self.level, np.int8)),
                 "scan": pa.array(self.scan.astype(np.int32)),
                 "rt": pa.array(self.rt),
@@ -578,7 +588,12 @@ class Reducer(Protocol):
     queries that passed the evidence gate. A reducer that builds a row for
     every eligible cell (zero-filling) says so with a true ``zero_fills``
     attribute, so that a sweep on disk sizes its buckets by those rows
-    rather than by matches alone."""
+    rather than by matches alone.
+
+    A query's rows may depend only on that query (and the scans), never on
+    which other queries share its batch: batches are cut by size, and a
+    precursor-major sweep cuts them by precursor m/z. Name queries in an
+    output by ``batch.plan.global_query`` (or a target column)."""
 
     name: str
     schema: pa.Schema
@@ -628,7 +643,7 @@ class QuerySummaryReducer:
             {
                 "acquisition_id": pa.array(np.full(n, batch.settings.acquisition_id, np.int64)),
                 "target_id": plan.targets.column("target_id").take(query),
-                "query": pa.array(q.astype(np.int32)),
+                "query": pa.array(plan.global_query(q).astype(np.int32)),
                 "modified_sequence": plan.targets.column("modified_sequence").take(query),
                 "precursor_charge": pa.array(charge.astype(np.int8), mask=charge < 0),
                 "is_decoy": plan.targets.column("is_decoy").take(query),

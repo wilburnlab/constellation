@@ -58,7 +58,13 @@ from constellation.massspec.sweep.schedule import (
     ragged_arange,
 )
 
-__all__ = ["SweepSettings", "SweepResult", "sweep", "CLAIMS"]
+__all__ = ["SweepSettings", "SweepResult", "sweep", "CLAIMS", "LAYOUTS"]
+
+#: How a sweep reads a bundle: ``scan_major`` (its scan-ordered peaks in
+#: scan ranges, every match written and shuffled to the reducers) or
+#: ``precursor_major`` (its precursor-major layout a unit of queries at a
+#: time, reduced where read; ``sweep.precursor_major``).
+LAYOUTS = ("scan_major", "precursor_major")
 
 #: The name of the claims output, beside the reducers'.
 CLAIMS = "point_claims"
@@ -106,6 +112,13 @@ class SweepSettings:
     #: match costs some 200–500 bytes at peak (sorting, the reducers' tables),
     #: so this keeps an in-memory sweep near a disk worker's 3 GB.
     memory_rows: int = 8 << 20
+    #: Eligible cells per unit of a precursor-major sweep: a run of queries
+    #: in precursor m/z order, read and reduced in one task. Bounds the
+    #: queries a task holds; what it reads is the scans they can match in.
+    unit_cells: int = 1 << 28
+    #: Eligible cells per batch inside a unit: what bounds a task's matches
+    #: and the reducers' input at once.
+    batch_cells: int = 1 << 22
 
     def tolerance(self, level: int) -> Tolerance:
         if level in self.tolerances:
@@ -244,30 +257,38 @@ def _bundle_blocks(
             )
         counts = np.diff(b.offsets)
         meta.n_points[at] = counts
-        mz = b.columns["mz"].astype(np.float64, copy=False)
-        intensity = b.columns["intensity"].astype(np.float64, copy=False)
-        level = meta.level[at]
-        if axis is not None:
-            point_level = np.repeat(level, counts)
-            mz = mz.copy()
-            for lvl in np.unique(level):
-                sel = point_level == lvl
-                mz[sel] = axis.corrected(int(lvl), mz[sel])
-        point_index = ragged_arange(np.zeros(b.n_scans, np.int64), counts)
-        perm = _sorted_within_scans(b.offsets, mz)
-        if perm is not None:
-            mz, intensity, point_index = mz[perm], intensity[perm], point_index[perm]
-        yield _Block(
-            scan=b.scan,
-            level=level,
-            rt=meta.rt[at],
-            lower=meta.lower[at],
-            upper=meta.upper[at],
-            offsets=b.offsets,
-            mz=mz,
-            intensity=intensity,
-            point_index=point_index,
-        )
+        yield _make_block(meta, at, b.scan, b.offsets, b.columns["mz"], b.columns["intensity"],
+                          ragged_arange(np.zeros(b.n_scans, np.int64), counts), axis)  # fmt: skip
+
+
+def _make_block(meta: Ledger, at: np.ndarray, scan: np.ndarray, offsets: np.ndarray, mz: np.ndarray,
+                intensity: np.ndarray, point_index: np.ndarray, axis) -> _Block:  # fmt: skip
+    """A block of whole scans (ledger rows ``at``), each scan's points in
+    stored order: the m/z axis corrected and each scan's points sorted by
+    the corrected m/z, each keeping its stored position."""
+    mz = mz.astype(np.float64, copy=False)
+    intensity = intensity.astype(np.float64, copy=False)
+    level = meta.level[at]
+    if axis is not None:
+        point_level = np.repeat(level, np.diff(offsets))
+        mz = mz.copy()
+        for lvl in np.unique(level):
+            sel = point_level == lvl
+            mz[sel] = axis.corrected(int(lvl), mz[sel])
+    perm = _sorted_within_scans(offsets, mz)
+    if perm is not None:
+        mz, intensity, point_index = mz[perm], intensity[perm], point_index[perm]
+    return _Block(
+        scan=scan,
+        level=level,
+        rt=meta.rt[at],
+        lower=meta.lower[at],
+        upper=meta.upper[at],
+        offsets=offsets,
+        mz=mz,
+        intensity=intensity,
+        point_index=point_index,
+    )
 
 
 def _table_blocks(table: pa.Table, block_rows: int, levels: Sequence[int]) -> tuple[list[_Block], Ledger]:
@@ -553,6 +574,7 @@ def sweep(
     progress: ProgressCallback | None = None,
     scan_range: tuple[int, int] | None = None,
     rt_range: tuple[float, float] | None = None,
+    layout: str = "scan_major",
 ) -> SweepResult:
     """Sweep ``source`` for ``plan``'s queries and reduce the matches.
 
@@ -577,13 +599,28 @@ def sweep(
     (zero-filled, gated, counted); an RT range reads the scans between the
     first and last whose time falls in it. The range is recorded in every
     output's metadata (``x.massspec.sweep.scan_range``).
+
+    ``layout='precursor_major'`` reads the bundle's precursor-major layout
+    a unit of queries at a time and reduces each unit where it is read
+    (``sweep.precursor_major``): no match is written, so a search's sweep
+    costs its reducers' rows and not its matches. A query's rows are the
+    ones the scan-major sweep gives it; an output's parts come in units of
+    queries in precursor m/z order (``x.massspec.sweep.layout`` in its
+    metadata), and the in-memory matches are not kept (``matches`` None).
     """
     _check_outputs(reducers, settings)
     _check_gate(plan, settings)
+    if layout not in LAYOUTS:
+        raise ValueError(f"layout must be one of {LAYOUTS}, not {layout!r}")
     if scan_range is not None and rt_range is not None:
         raise ValueError("give a scan_range or an rt_range, not both")
     window = _window(source, scan_range, rt_range)
-    result = _sweep(source, plan, settings, reducers, workers, work_dir, progress, window)
+    if layout == "precursor_major":
+        from constellation.massspec.sweep.precursor_major import sweep_precursor_major
+
+        result = sweep_precursor_major(source, plan, settings, reducers, workers, work_dir, progress, window)
+    else:
+        result = _sweep(source, plan, settings, reducers, workers, work_dir, progress, window)
     if window is not None:
         stamp = {b"x.massspec.sweep.scan_range": f"{window[0]},{window[1] - 1}".encode()}
         if rt_range is not None:

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import functools
+
+import numpy as np
 from pathlib import Path
 
 import pyarrow as pa
@@ -345,3 +347,53 @@ def test_cli_takes_a_zero_tolerance_as_given(tmp_root, tmp_path):
     assert wide.num_rows > want.num_rows
     assert _cli([*common, "-o", str(tmp_path / "y"), "--ms1-tolerance", "-1"]) == 2
     assert _cli([*common, "-o", str(tmp_path / "z"), "--gate", "--min-consecutive-scans", "0"]) == 2
+
+
+# ── the same oracle, read precursor-major (2026-11-09) ───────────────
+
+
+@functools.lru_cache(maxsize=None)
+def _with_layout(name: str, tmp_root: str):
+    from constellation.massspec.precursor_major import build_precursor_major
+
+    run, bundle, peaks = _run(name, tmp_root)
+    build_precursor_major(bundle)
+    return run, bundle, peaks
+
+
+def _by_target(table: pa.Table) -> pa.Table:
+    t = table.take(pa.array(np.argsort(table.column("target_id").to_numpy(), kind="stable")))
+    meta = {k: v for k, v in (t.schema.metadata or {}).items() if k != b"x.massspec.sweep.layout"}
+    return t.replace_schema_metadata(meta)
+
+
+def _precursor_major(bundle, targets, *, level, rt_window, tolerance, tolerance_unit, all_in_window, drop_unmatched,
+                     charge_range=None):  # fmt: skip
+    from constellation.massspec.quant.chromatogram import _DEFAULT_ION_TYPES, extract_xic
+    from constellation.massspec.sweep import ChannelSettings
+
+    result = extract_xic(
+        bundle, targets, acquisition_id=7, levels=[level], tolerances={level: (tolerance, tolerance_unit)},
+        channels=ChannelSettings(n_isotopes=3, charge_range=charge_range, ion_types=tuple(_DEFAULT_ION_TYPES),
+                                 max_fragment_charge=2),
+        rt_window=rt_window, rule="all" if all_in_window else "nearest", drop_unmatched=drop_unmatched,
+        layout="precursor_major", workers=1,
+    )  # fmt: skip
+    return result.table("xic_trace")
+
+
+@pytest.mark.parametrize("name", list(_RUNS))
+@pytest.mark.parametrize("level", [1, 2])
+@pytest.mark.parametrize("rt_window", [None, 12.0])
+@pytest.mark.parametrize("tolerance", _TOLERANCES)
+@pytest.mark.parametrize("mode", ["nearest", "keep_unmatched", "all_in_window"])
+def test_parity_read_precursor_major(tmp_root, name, level, rt_window, tolerance, mode):
+    run, bundle, peaks = _with_layout(name, tmp_root)
+    targets = _targets(run, level=level, name=name)
+    kw = dict(level=level, rt_window=rt_window, tolerance=tolerance[0], tolerance_unit=tolerance[1],
+              all_in_window=mode == "all_in_window", drop_unmatched=mode != "keep_unmatched",
+              charge_range=(1, 4) if level == 1 else None)  # fmt: skip
+    want = oracle.extract_xic_scan_major(peaks, targets, acquisition_id=7, **kw)
+    got = _precursor_major(bundle, targets, **kw)
+    assert want.num_rows > 0
+    oracle.assert_traces_identical(_by_target(got), _by_target(want))
