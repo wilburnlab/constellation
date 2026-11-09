@@ -114,6 +114,17 @@ def _build_convert_parser(subs: argparse._SubParsersAction) -> None:
     )
     p.add_argument("--profile", action="store_true", help=argparse.SUPPRESS)
     p.add_argument(
+        "--no-precursor-major",
+        dest="precursor_major",
+        action="store_false",
+        help=(
+            "Do not also write the peaks ordered by isolation window "
+            "(<run>/precursor_major/, about the size of peaks/), which a "
+            "search reads one window at a time. It can be written later with "
+            "`massspec precursor-major BUNDLE`."
+        ),
+    )
+    p.add_argument(
         "--allow-empty-levels",
         action="store_true",
         help=(
@@ -230,6 +241,7 @@ def _cmd_massspec_convert_single(
                 compute_sha256=args.compute_sha256,
                 force=args.force,
                 allow_empty_levels=args.allow_empty_levels,
+                precursor_major=getattr(args, "precursor_major", True),
                 workers=args.threads,
                 progress_cb=progress_cb,
             )
@@ -338,6 +350,7 @@ def _cmd_massspec_convert_batch(
         batch_size=args.batch_size,
         compute_sha256=args.compute_sha256,
         allow_empty_levels=args.allow_empty_levels,
+        precursor_major=getattr(args, "precursor_major", True),
         progress_cb=progress_cb,
     )
 

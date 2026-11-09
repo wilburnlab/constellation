@@ -47,6 +47,7 @@ from constellation.massspec.bundle import (
     read_bundle_manifest,
 )
 from constellation.massspec.centroiding.apex import pick_apex
+from constellation.massspec.precursor_major import PRECURSOR_MAJOR_DIR, build_precursor_major
 
 SCAN_METADATA_FILENAME = "scan_metadata.parquet"
 ACQUISITION_METADATA_FILENAME = "acquisition_metadata.parquet"
@@ -234,8 +235,11 @@ def centroid_bundle(
     workers: int = 1,
     force: bool = False,
     rt_bin_width_s: float = 60.0,
+    precursor_major: bool = True,
 ) -> Path:
-    """Make a peak list from ``profile_bundle``; returns the new bundle's path."""
+    """Make a peak list from ``profile_bundle``; returns the new bundle's path.
+    With ``precursor_major`` its peaks are also written ordered by isolation
+    window (``massspec.precursor_major``), before its manifest."""
     source = Path(profile_bundle)
     if algorithm not in ALGORITHMS:
         raise ValueError(f"unknown algorithm {algorithm!r}; choose from {', '.join(sorted(ALGORITHMS))}")
@@ -308,6 +312,7 @@ def centroid_bundle(
             },
             "outputs": {
                 "peaks": PEAKS_DIR,
+                **({"precursor_major": PRECURSOR_MAJOR_DIR} if precursor_major else {}),
                 "scan_metadata": SCAN_METADATA_FILENAME,
                 "acquisition_metadata": ACQUISITION_METADATA_FILENAME,
             },
@@ -324,6 +329,8 @@ def centroid_bundle(
                 "parameters": parameters,
             },
         }
+        if precursor_major:
+            build_precursor_major(out, workers=workers)
         (out / MANIFEST_FILENAME).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     except BaseException:
         shutil.rmtree(out, ignore_errors=True)

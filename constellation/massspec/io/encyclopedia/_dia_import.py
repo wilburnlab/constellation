@@ -57,6 +57,7 @@ from constellation.massspec.bundle import (
     peak_rows,
 )
 from constellation.massspec.io.encyclopedia._dia import DiaFile, scan_number
+from constellation.massspec.precursor_major import PRECURSOR_MAJOR_DIR, build_precursor_major
 from constellation.massspec.schemas import (
     ACQUISITION_METADATA_SCHEMA_VERSION,
     ACQUISITION_METADATA_TABLE,
@@ -260,7 +261,7 @@ def import_dia(
             # and anything built from them.
             (bundle / "manifest.json").unlink(missing_ok=True)
             (bundle / "peaks.parquet").unlink(missing_ok=True)  # bundles before format v2
-            for stale in (bundle / PEAKS_DIR, bundle / "mz_index", bundle / "mz_axes"):
+            for stale in (bundle / PEAKS_DIR, bundle / "mz_index", bundle / "mz_axes", bundle / PRECURSOR_MAJOR_DIR):
                 if stale.is_dir():
                     shutil.rmtree(stale)
             (bundle / PEAKS_DIR).mkdir()
@@ -340,6 +341,7 @@ def import_dia(
                 },
                 "outputs": {
                     "peaks": PEAKS_DIR,
+                    "precursor_major": PRECURSOR_MAJOR_DIR,
                     "scan_metadata": "scan_metadata.parquet",
                     "acquisition_metadata": "acquisition_metadata.parquet",
                 },
@@ -357,6 +359,9 @@ def import_dia(
                     )
                 },
             }
+            # The peaks by isolation window, for a search, before the
+            # manifest that says the bundle is complete.
+            build_precursor_major(bundle)
             (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
             bundles.append(bundle)
     return bundles

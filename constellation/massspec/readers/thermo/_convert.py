@@ -70,6 +70,11 @@ from constellation.massspec.bundle import (
     PeakWriter,
     part_name,
 )
+from constellation.massspec.precursor_major import (
+    PRECURSOR_MAJOR_DIR,
+    PrecursorMajorWriter,
+    finish_precursor_major,
+)
 
 from . import _read
 from ._scans import CENTROIDERS, DEFAULT_BLOCK_SCANS, THERMO, ReadOptions, iter_scan_blocks
@@ -101,6 +106,7 @@ _BUNDLE_OUTPUTS = (
     ACQUISITION_METADATA_FILENAME,
     "mz_index",
     "mz_axes",
+    PRECURSOR_MAJOR_DIR,
 )
 
 
@@ -118,6 +124,9 @@ class ConvertOptions:
     batch_size: int = DEFAULT_BATCH_SIZE
     compute_sha256: bool = True
     allow_empty_levels: bool = False
+    #: Write the peaks precursor-major too (``massspec.precursor_major``),
+    #: as each range is read, for a search to read by isolation window.
+    precursor_major: bool = True
 
 
 def read_options(
@@ -264,6 +273,8 @@ class _RangeTask:
     part: str | None  # of the peak bundle; None when no peak list is made
     point_part: str | None  # of the profile bundle; None when none is kept
     options: ConvertOptions
+    precursor_major: str | None = None  # the peak bundle's precursor-major directory
+    index: int = 0
 
 
 @dataclass(frozen=True)
@@ -273,6 +284,7 @@ class _RangeResult:
     scans: pa.Table | None
     point_scans: pa.Table | None
     n_scans: int
+    precursor_major: pa.Table | None = None  # per-scan point counts of its part
 
 
 @contextmanager
@@ -296,6 +308,11 @@ def _run_range(task: _RangeTask, on_scans: Callable[[int], None] | None = None) 
     scans: list[pa.Table] = []
     point_scans: list[pa.Table] = []
     n_scans = 0
+    by_precursor = (
+        PrecursorMajorWriter(task.precursor_major, task.index)
+        if task.precursor_major is not None and task.part is not None
+        else None
+    )
     with (
         _part_writer(task.part, width) as peaks,
         _part_writer(task.point_part, width, byte_stream_split=True) as points,
@@ -305,18 +322,23 @@ def _run_range(task: _RangeTask, on_scans: Callable[[int], None] | None = None) 
             max_block_scans=task.options.batch_size,
         ):
             if peaks is not None:
-                peaks.write(block.peak_table())
+                table = block.peak_table()
+                peaks.write(table)
                 scans.append(block.scans)
+                if by_precursor is not None:
+                    by_precursor.write(table, block.scans)
             if points is not None:
                 points.write(block.point_table())
                 point_scans.append(block.point_scans())
             n_scans += block.scans.num_rows
             if on_scans is not None:
                 on_scans(block.scans.num_rows)
+        counts = by_precursor.close() if by_precursor is not None else None
     return _RangeResult(
         _read._concat_scans(scans) if peaks is not None else None,
         _read._concat_scans(point_scans) if points is not None else None,
         n_scans,
+        counts,
     )
 
 
@@ -446,6 +468,8 @@ class _Job:
         writes_peaks = self.read.centroider is not None
         if writes_peaks:
             self._claim(self.out_dir, PEAKS_DIR)
+            if self.options.precursor_major:
+                (self.out_dir / PRECURSOR_MAJOR_DIR).mkdir(exist_ok=True)
         if self.read.keep_profile:
             self._claim(self.profile_dir, PROFILE_DIR)
         self.n_scans = max(probe.last - probe.first + 1, 0)
@@ -458,6 +482,8 @@ class _Job:
                 str(self.profile_dir / PROFILE_DIR / part_name(i))
                 if self.read.keep_profile else None,
                 options,
+                str(self.out_dir / PRECURSOR_MAJOR_DIR) if writes_peaks and options.precursor_major else None,
+                i,
             )
             for i, (lo, hi) in enumerate(self.ranges)
         ]
@@ -474,9 +500,11 @@ class _Job:
         parameters: dict[str, Any],
         outputs: dict[str, str],
         sha: str | None,
+        before_manifest: Callable[[], None] | None = None,
         **manifest_kwargs,
     ):
-        """Write a bundle's scan and acquisition metadata, then its manifest."""
+        """Write a bundle's scan and acquisition metadata, then (after
+        ``before_manifest``, for what depends on the metadata) its manifest."""
         from .manifest import MANIFEST_FILENAME, write_manifest
 
         assert self.probe is not None
@@ -490,6 +518,8 @@ class _Job:
             directory / ACQUISITION_METADATA_FILENAME,
             compression="zstd",
         )
+        if before_manifest is not None:
+            before_manifest()
         read = self.read
         # The manifest carries a summary of the run metadata plus the
         # parameters used. tune_data is omitted (its values are in the
@@ -566,6 +596,8 @@ class _Job:
                 outputs={"profile": PROFILE_DIR},
             )
         if peak_scans is not None:
+            by_precursor = self.options.precursor_major
+            counts = [r.precursor_major for r in ordered if r.precursor_major is not None]
             manifest = self._write_bundle(
                 self.out_dir, peak_scans, noun="peaks", sha=sha,
                 parameters={
@@ -574,7 +606,8 @@ class _Job:
                     "workers": workers,
                     "profile_bundle": self.profile_dir.name if read.keep_profile else None,
                 },
-                outputs={"peaks": PEAKS_DIR},
+                outputs={"peaks": PEAKS_DIR, **({"precursor_major": PRECURSOR_MAJOR_DIR} if by_precursor else {})},
+                before_manifest=(lambda: finish_precursor_major(self.out_dir, counts)) if by_precursor else None,
             )
         self.results.clear()
         self.manifest = manifest
@@ -721,7 +754,8 @@ def finish_own_algorithm(job: _Job, centroid_algo: str, keep_profile: bool, work
         return job.manifest
     try:
         centroid_bundle(
-            job.profile_dir, centroid_algo, output_dir=job.out_dir, workers=workers, force=job.force
+            job.profile_dir, centroid_algo, output_dir=job.out_dir, workers=workers, force=job.force,
+            precursor_major=job.options.precursor_major,
         )
     except BaseException:
         if not keep_profile:
@@ -746,6 +780,7 @@ def convert(
     allow_empty_levels: bool = False,
     workers: int = 1,
     progress_cb: ProgressCallback | None = None,
+    precursor_major: bool = True,
 ):
     """Convert a Thermo ``.raw`` into bundles; return the manifest of the peak
     bundle, or of the profile bundle if it is the only one written.
@@ -768,7 +803,9 @@ def convert(
     ``allow_empty_levels``; a file none of whose scans can be read fails it
     always. A failed conversion removes what it wrote. ``workers`` > 1 reads
     ranges of scans in that many processes. ``batch_size`` is the number of
-    scans read per block.
+    scans read per block. ``precursor_major`` also writes the peaks ordered
+    by isolation window (``precursor_major/``, what a search reads), as the
+    ranges are read.
 
     ``progress_cb`` receives ``stage_start`` / ``stage_progress`` /
     ``stage_done`` events tagged with stage ``"thermo_convert"``.
@@ -784,6 +821,7 @@ def convert(
         batch_size=batch_size,
         compute_sha256=compute_sha256,
         allow_empty_levels=allow_empty_levels,
+        precursor_major=precursor_major,
     )
     job = _Job(Path(source), Path(output_dir), options, force=force)
     emit_start(progress_cb, "thermo_convert", message=f"opening {job.src.name}")

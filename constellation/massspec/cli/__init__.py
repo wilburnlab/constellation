@@ -7,6 +7,7 @@ each holding the verb's parser and its handler:
     convert            Thermo .raw -> a peak bundle and a profile bundle
     centroid           a peak list from a profile bundle
     mz_axis            how far a bundle's m/z axis reads high or low
+    precursor_major    a bundle's peaks ordered by isolation window, for a search
     search             EncyclopeDIA search of one acquisition, written as
                        an experiment directory
     summarize          what an experiment directory, one search in it, or a
@@ -53,6 +54,7 @@ from constellation.massspec.cli.mz_axis import _build_mz_axis_parser
 from constellation.massspec.cli.novel_peptides import (
     _build_classify_novel_peptides_parser,
 )
+from constellation.massspec.cli.precursor_major import _build_precursor_major_parser
 from constellation.massspec.cli.predict_library import _build_predict_library_parser
 from constellation.massspec.cli.quantify import _build_quantify_parser
 from constellation.massspec.cli.report import _build_report_parser
@@ -101,6 +103,7 @@ def build_parser(subs: argparse._SubParsersAction) -> None:
     _build_predict_library_parser(ms_subs)
     _build_library_export_parser(ms_subs)
     _build_mz_axis_parser(ms_subs)
+    _build_precursor_major_parser(ms_subs)
     _build_classify_novel_peptides_parser(ms_subs)
     _build_collision_filter_parser(ms_subs)
     _build_encyclopedia_parser(ms_subs)
