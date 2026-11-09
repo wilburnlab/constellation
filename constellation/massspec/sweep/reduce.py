@@ -25,6 +25,7 @@ from constellation.massspec.sweep.queries import Channels, QueryPlan
 from constellation.massspec.sweep.schedule import (
     WindowIndex,
     eligible_pairs,
+    order_by,
     pair_eligible,
     ragged_arange,
     window_index,
@@ -162,7 +163,7 @@ class Matches:
     def sorted(self, scan_order: np.ndarray) -> Matches:
         """Sorted by (query, level, scan order, channel, point); ``scan_order``
         is each match's scan's rank."""
-        by = np.lexsort((self.point_index, self.channel, scan_order, self.level, self.query))
+        by = order_by(self.query, self.level, scan_order, self.channel, self.point_index)
         return self.take(by)
 
     def table(self) -> pa.Table:
@@ -337,7 +338,7 @@ class QueryBatch:
             return np.empty(0, np.int64), np.empty(0, np.int64)
         q = np.concatenate(q_parts)
         r = np.concatenate(r_parts)
-        by = np.lexsort((self.scan_order[r], q))
+        by = order_by(q, self.scan_order[r])
         return q[by], r[by]
 
     def eligible_counts(self, level: int) -> np.ndarray:
@@ -418,7 +419,7 @@ class QueryBatch:
         if in_order:
             return Cells(level=int(level), channels=channels, scans=self.scans, query_ids=self.plan.query_ids,
                          **{k: np.asarray(v) for k, v in parts.items()})  # fmt: skip
-        by = np.lexsort((parts["point_index"], parts["channel"], order[parts["row"]], parts["query"]))
+        by = order_by(parts["query"], order[parts["row"]], parts["channel"], parts["point_index"])
         return Cells(level=int(level), channels=channels, scans=self.scans, query_ids=self.plan.query_ids,
                      **{k: np.asarray(v)[by] for k, v in parts.items()})  # fmt: skip
 
@@ -431,7 +432,7 @@ class QueryBatch:
         key_s = np.concatenate([order[mr], order[cr]])
         key_c = np.concatenate([mc, ci])
         is_cell = np.concatenate([np.zeros(mq.size, bool), np.ones(cq.size, bool)])
-        by = np.lexsort((is_cell, key_c, key_s, key_q))
+        by = order_by(key_q, key_s, key_c, is_cell)
         kq, ks, kc, flag = key_q[by], key_s[by], key_c[by], is_cell[by]
         new = np.r_[True, (kq[1:] != kq[:-1]) | (ks[1:] != ks[:-1]) | (kc[1:] != kc[:-1])] if by.size else by.astype(bool)
         group = np.cumsum(new) - 1
@@ -448,7 +449,7 @@ class QueryBatch:
             "mz_observed": np.concatenate([parts["mz_observed"], np.full(take.size, np.nan)]),
             "intensity": np.concatenate([parts["intensity"], np.zeros(take.size)]),
         }  # fmt: skip
-        by = np.lexsort((parts["point_index"], parts["channel"], order[parts["row"]], parts["query"]))
+        by = order_by(parts["query"], order[parts["row"]], parts["channel"], parts["point_index"])
         return Cells(level=int(level), channels=channels, scans=self.scans, query_ids=self.plan.query_ids,
                      **{k: np.asarray(v)[by] for k, v in parts.items()})  # fmt: skip
 

@@ -25,11 +25,12 @@ queries is eligible in, so the cut only decides how often a window is read
   correction the m/z axis makes, so every point that could be matched, or
   could be the nearer of two, is there.
 
-A unit's queries are matched and reduced in batches of ascending query
+A unit's queries are matched and reduced in batches in precursor m/z order
 (``SweepSettings.batch_cells``) by the scan-major sweep's own code
 (``_map_block``, ``_batch``, ``_reduce``) on a plan taken for the batch
 (``QueryPlan.take``), so a query's rows are the rows the scan-major sweep
-gives it; each output is one part per unit, rows in query order within it.
+gives it; each output is one part per unit, its queries in precursor m/z
+order (query order, when the targets came in precursor m/z order).
 Refused here: claims (a point is claimed by every unit whose queries
 matched it, MS1 points by every unit), the gate's MS1 isotope evidence
 (it ranks a whole scan's points, of which a unit reads a slice), a table
@@ -63,6 +64,8 @@ __all__ = ["LAYOUT_KEY", "sweep_precursor_major", "precursor_units"]
 LAYOUT_KEY = b"x.massspec.sweep.layout"
 
 _CACHE: dict[str, Any] = {}
+#: What the last units in this process did (for measurement and tests).
+_STATS: dict[str, int] = {}
 
 
 def _refuse(source, plan: QueryPlan, settings) -> PrecursorMajor:
@@ -111,7 +114,9 @@ def precursor_units(plan: QueryPlan, ledger: Ledger, unit_cells: int) -> list[np
     """The plan's queries in units: runs in (precursor m/z, query) order of
     about ``unit_cells`` eligible cells each, cut at a window bound where
     one lies in the last half of a unit; queries without a precursor m/z
-    after the rest. Each unit's queries ascending. Every query is in one."""
+    after the rest. Each unit's queries in (precursor m/z, query) order,
+    which a unit's batches keep, so a batch touches a window or two. Every
+    query is in one."""
     n = plan.n_queries
     if n == 0:
         return []
@@ -145,7 +150,7 @@ def precursor_units(plan: QueryPlan, ledger: Ledger, unit_cells: int) -> list[np
                 changes = np.flatnonzero(segment[half + 1:end + 1] != segment[half:end]) + half + 1
                 if changes.size:
                     end = int(changes[-1])
-            units.append(np.sort(order[start:end]))
+            units.append(order[start:end])
             start = end
     return units
 
@@ -359,10 +364,23 @@ def _unit_task(bundle: str, work: str, index: int, unit: QueryPlan, settings, re
         for name, path in paths.items():
             path.parent.mkdir(parents=True, exist_ok=True)
             writers[name] = pq.ParquetWriter(path.with_name(f".{path.name}.tmp"), schemas[name])
+        gate_first = settings.gate is not None and settings.gate_first and all(r.gated for r in reducers)
         for q0, q1 in _buckets(cells, settings.batch_cells):
             batch_plan = unit.take(np.arange(q0, q1, dtype=np.int64))
-            out = _MapOut.concat([_map_block(block, batch_plan, settings) for block in blocks])
             queries = np.arange(batch_plan.n_queries, dtype=np.int64)
+            if gate_first:
+                # Every reducer sees only the queries the gate passes: decide
+                # it from the evidence, then match those queries alone.
+                ev = _MapOut.concat([_map_block(block, batch_plan, settings, matches=False) for block in blocks])
+                decided = _batch(batch_plan, queries, ev, ledger, order, settings, None)
+                passing = np.zeros(batch_plan.n_queries, dtype=bool)
+                passing[queries[decided.decision.passed]] = True
+                _STATS["gate_first_matched"] = _STATS.get("gate_first_matched", 0) + int(passing.sum())
+                found = _MapOut.concat([_map_block(block, batch_plan, settings, evidence=False, only=passing)
+                                        for block in blocks]) if passing.any() else _MapOut.concat([])  # fmt: skip
+                out = _MapOut(found.matches, ev.evidence, ev.claims)
+            else:
+                out = _MapOut.concat([_map_block(block, batch_plan, settings) for block in blocks])
             batch = _batch(batch_plan, queries, out, ledger, order, settings, None)
             for tables in _reduce(batch, reducers):
                 for name, table in tables.items():

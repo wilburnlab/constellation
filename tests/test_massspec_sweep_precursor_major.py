@@ -250,3 +250,30 @@ def test_what_a_precursor_major_sweep_refuses(tmp_root, tmp_path):
         sweep(bare, plan, SweepSettings(tolerances=_TOL), layout="precursor_major")
     with pytest.raises(ValueError, match="layout must be"):
         sweep(bundle, plan, SweepSettings(tolerances=_TOL), layout="window")
+
+
+# ── the gate first ───────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("name", list(_RUNS))
+def test_the_gate_decided_first_changes_no_output_and_matches_only_what_passed(tmp_root, name):
+    """With every reducer gated, a batch counts its evidence, decides, and
+    matches only the queries that passed: the two-pass gate in one pass."""
+    from constellation.massspec.sweep import precursor_major as pm
+
+    run, bundle = _run(name, tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
+    gate = EvidenceGate(min_fragments=3, min_consecutive=2)
+    reducers = [XicTraceReducer(drop_unmatched=False, gated=True)]
+    on = SweepSettings(tolerances=_TOL, gate=gate, unit_cells=300, batch_cells=120)
+    pm._STATS.clear()
+    first = sweep(bundle, plan, on, reducers=reducers, layout="precursor_major")
+    matched = pm._STATS.get("gate_first_matched", 0)
+    later = sweep(bundle, plan, replace(on, gate_first=False), reducers=reducers, layout="precursor_major")
+    oracle.assert_traces_identical(first.table("xic_trace"), later.table("xic_trace"))
+    _same_rows(first.table("xic_trace"),
+               sweep(bundle, plan, on, reducers=reducers).table("xic_trace"), "target_id")  # fmt: skip
+    summary = sweep(bundle, plan, on, reducers=[QuerySummaryReducer()], layout="precursor_major").table("query_summary")
+    passed = int(np.sum(summary.column("passed").to_numpy(zero_copy_only=False)))
+    assert 0 < passed < plan.n_queries
+    assert matched == passed  # only what passed was matched

@@ -217,3 +217,47 @@ def test_auto_is_point_driven_when_channels_outnumber_points():
         match_group(points, intensity, offsets, rows, channels, Nearest(), 20.0, "ppm", kernel="cells")
     with pytest.raises(ValueError, match="unknown match rule"):
         rule_named("best")
+
+
+def test_order_by_is_lexsort_row_for_row():
+    """The combined-key sort the match path uses is lexsort's order exactly,
+    ties and negative keys included, and falls back when keys do not fit."""
+    from constellation.massspec.sweep.schedule import order_by
+
+    rng = np.random.default_rng(11)
+    for n in (0, 1, 7, 5000):
+        keys = [rng.integers(-3, 4, n), rng.integers(0, 2, n), rng.integers(-1, 900, n), rng.integers(0, 3, n)]
+        np.testing.assert_array_equal(order_by(*keys), np.lexsort(keys[::-1]))
+    wide = [rng.integers(0, 2**40, 300), rng.integers(0, 2**40, 300)]
+    np.testing.assert_array_equal(order_by(*wide), np.lexsort(wide[::-1]))
+    floats = [rng.random(50), rng.integers(0, 3, 50)]
+    np.testing.assert_array_equal(order_by(*floats), np.lexsort(floats[::-1]))
+
+
+@pytest.mark.parametrize("unit,tol", [("Da", 0.25), ("ppm", 400.0)])
+def test_nearest_without_a_sort_decides_ties_and_duplicates_as_before(unit, tol):
+    """The point-driven ``nearest`` reads each candidate's two neighbours
+    instead of sorting candidates into cells: duplicated m/z, channels
+    exactly between two points and exactly at the tolerance must come out
+    as the channel-driven kernel (the definition) has them."""
+    from constellation.massspec.sweep.kernel import match_by_channel, match_by_point
+    from constellation.massspec.sweep.rules import Nearest
+
+    rng = np.random.default_rng(4)
+    grid = np.round(rng.uniform(500.0, 503.0, 40), 2)
+    scans = []
+    for _ in range(30):
+        mz = np.sort(rng.choice(grid, int(rng.integers(0, 12))))  # duplicates on purpose
+        scans.append(mz)
+    offsets = np.r_[0, np.cumsum([s.size for s in scans])].astype(np.int64)
+    points = np.concatenate(scans)
+    intensity = rng.uniform(1, 9, points.size)
+    mids = (grid[:-1] + grid[1:]) / 2
+    edges = grid + (tol if unit == "Da" else grid * tol * 1e-6)
+    channels = np.concatenate([grid, mids, edges, rng.uniform(499.5, 503.5, 60)])
+    rows = np.arange(len(scans), dtype=np.int64)
+    a = match_by_point(points, intensity, offsets, rows, channels, Nearest(), tol, unit)
+    b = match_by_channel(points, intensity, offsets, rows, channels, Nearest(), tol, unit)
+    for name in ("row", "channel", "point", "n_points", "mz", "intensity"):
+        np.testing.assert_array_equal(getattr(a, name), getattr(b, name), err_msg=name)
+    assert a.n > 50

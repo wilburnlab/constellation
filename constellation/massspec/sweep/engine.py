@@ -54,6 +54,7 @@ from constellation.massspec.sweep.schemas import SWEEP_EVIDENCE_TABLE, SWEEP_POI
 from constellation.massspec.sweep.schedule import (
     active_queries,
     isolation_groups,
+    order_by,
     pair_eligible,
     ragged_arange,
 )
@@ -119,6 +120,11 @@ class SweepSettings:
     #: Eligible cells per batch inside a unit: what bounds a task's matches
     #: and the reducers' input at once.
     batch_cells: int = 1 << 22
+    #: In a precursor-major sweep whose reducers are all gated, count each
+    #: batch's evidence and decide the gate first, then match only the
+    #: queries it passed (the two-pass gate, in one pass over the points it
+    #: has in memory). The outputs are the same either way.
+    gate_first: bool = True
 
     def tolerance(self, level: int) -> Tolerance:
         if level in self.tolerances:
@@ -359,17 +365,24 @@ class _MapOut:
         )
 
 
-def _map_block(block: _Block, plan: QueryPlan, settings: SweepSettings) -> _MapOut:
+def _map_block(block: _Block, plan: QueryPlan, settings: SweepSettings, *, matches: bool = True,
+               evidence: bool = True, only: np.ndarray | None = None) -> _MapOut:  # fmt: skip
     """A block's matches, evidence and claims, all its window groups at once."""
-    return _MapOut.concat(list(_map_block_parts(block, plan, settings)))
+    return _MapOut.concat(list(_map_block_parts(block, plan, settings, matches=matches, evidence=evidence,
+                                                only=only)))  # fmt: skip
 
 
-def _map_block_parts(block: _Block, plan: QueryPlan, settings: SweepSettings) -> Iterator[_MapOut]:
+def _map_block_parts(block: _Block, plan: QueryPlan, settings: SweepSettings, *, matches: bool = True,
+                     evidence: bool = True, only: np.ndarray | None = None) -> Iterator[_MapOut]:  # fmt: skip
     """A block's matches, evidence and claims one window group at a time, so
     a caller can write them out before the next group's are made: a block
     is sized in points, and at proteome scale its matches (61 per point on
-    a GPF run) outgrew any run size until 2026-11-09."""
-    gate = settings.gate
+    a GPF run) outgrew any run size until 2026-11-09. ``matches`` and
+    ``evidence`` say which to make (claims come with matches); ``only`` (a
+    mask over the plan's queries) matches those queries alone, as when the
+    gate has already been decided."""
+    gate = settings.gate if evidence else None
+    want_matches = matches
     for level in plan.levels:
         channels = plan.channels_for_level(level)
         if channels is None or channels.n == 0:
@@ -384,8 +397,9 @@ def _map_block_parts(block: _Block, plan: QueryPlan, settings: SweepSettings) ->
         tolerance, unit = settings.tolerance(level)
         counts = channels.counts()
         active = active_queries(
-            plan.rt_lo, plan.rt_hi, counts > 0, float(block.rt[timed].min()), float(block.rt[timed].max())
-        )
+            plan.rt_lo, plan.rt_hi, counts > 0 if only is None else (counts > 0) & only,
+            float(block.rt[timed].min()), float(block.rt[timed].max()),
+        )  # fmt: skip
         groups = isolation_groups(
             active, plan.precursor_mz, block.lower[rows], block.upper[rows], rows, gate=level > 1,
             order=plan.precursor_order if level > 1 else None,
@@ -400,16 +414,16 @@ def _map_block_parts(block: _Block, plan: QueryPlan, settings: SweepSettings) ->
             return np.where(point >= 0, block.point_index[at], -1)
 
         for g in groups:
-            matches, evidence, claims = [], [], []
+            matches_out, evidence_out, claims = [], [], []
             n = counts[g.queries]
             channel_at = ragged_arange(channels.offsets[g.queries], n)
             channel_query = np.repeat(g.queries, n)
             channel_mz = channels.mz[channel_at]
             kw = dict(kernel=settings.kernel, crossover=settings.crossover,
                       max_elements=settings.kernel_elements)  # fmt: skip
-            m = match_group(block.mz, block.intensity, block.offsets, g.rows, channel_mz, settings.rule,
-                            tolerance, unit, **kw)  # fmt: skip
-            if m.n:
+            m = (match_group(block.mz, block.intensity, block.offsets, g.rows, channel_mz, settings.rule,
+                             tolerance, unit, **kw) if want_matches else None)  # fmt: skip
+            if m is not None and m.n:
                 row = g.rows[m.row]
                 query = channel_query[m.channel]
                 ok = eligible(query, row)
@@ -417,7 +431,7 @@ def _map_block_parts(block: _Block, plan: QueryPlan, settings: SweepSettings) ->
                     row, query, sel = row[ok], query[ok], np.flatnonzero(ok)
                     channel = channel_at[m.channel[sel]] - channels.offsets[query]
                     point = stored(row, m.point[sel])
-                    matches.append(
+                    matches_out.append(
                         Matches(query=query, level=np.full(sel.size, level, np.int8),
                                 scan=block.scan[row], channel=channel, point_index=point, mz=m.mz[sel],
                                 intensity=m.intensity[sel], n_points=m.n_points[sel])  # fmt: skip
@@ -425,7 +439,7 @@ def _map_block_parts(block: _Block, plan: QueryPlan, settings: SweepSettings) ->
                     if settings.claims and settings.rule.name != "sum":
                         claims.append(find_claims(level, block.scan[row], point, query, channel,
                                                   m.mz[sel], m.intensity[sel]))  # fmt: skip
-            if settings.claims and settings.rule.name == "sum":
+            if want_matches and settings.claims and settings.rule.name == "sum":
                 # A sum is one match per window; its claims are the window's points.
                 a = match_group(block.mz, block.intensity, block.offsets, g.rows, channel_mz,
                                 AllWithin(), tolerance, unit, **kw)  # fmt: skip
@@ -437,12 +451,12 @@ def _map_block_parts(block: _Block, plan: QueryPlan, settings: SweepSettings) ->
                                           channel_at[a.channel[sel]] - channels.offsets[query], a.mz[sel],
                                           a.intensity[sel]))  # fmt: skip
             if gate is not None and (level > 1 or gate.min_isotopes is not None):
-                evidence.append(
+                evidence_out.append(
                     count_evidence(block.mz, block.intensity, block.offsets, g.rows, block.scan, channels,
                                    channel_at, channel_query, eligible, tolerance, unit, gate.top_peaks,
                                    by_charge=level == 1)  # fmt: skip
                 )
-            yield _MapOut(Matches.concat(matches), Evidence.concat(evidence), Claims.concat(claims))
+            yield _MapOut(Matches.concat(matches_out), Evidence.concat(evidence_out), Claims.concat(claims))
 
 
 def _load_axis(bundle: Path, settings: SweepSettings):
@@ -463,7 +477,7 @@ def _fragment_level(plan: QueryPlan) -> int | None:
 def _batch(plan, queries, out: _MapOut, ledger, order, settings, shared) -> QueryBatch:
     """A bucket's batch: matches sorted for reducers, and the gate decided."""
     matches = out.matches.sorted(order[ledger.rows_of(out.matches.scan)])
-    evidence = out.evidence.take(np.lexsort((out.evidence.scan, out.evidence.query)))
+    evidence = out.evidence.take(order_by(out.evidence.query, out.evidence.scan))
     batch = QueryBatch(plan=plan, queries=queries, matches=matches, scans=ledger, scan_order=order,
                        settings=settings, evidence=evidence, shared=shared)  # fmt: skip
     if settings.gate is None:
@@ -879,7 +893,7 @@ def _map_stream(
         held = 0
         name = _run_name(index, run)
         m = out.matches
-        m = m.take(np.lexsort((m.point_index, m.channel, m.scan, m.level, m.query)))
+        m = m.take(order_by(m.query, m.level, m.scan, m.channel, m.point_index))
         # Sorted runs of at most run_rows each (one window group can hold more).
         for start in range(0, max(m.n, 1), settings.run_rows):
             stop = min(start + settings.run_rows, m.n)
@@ -888,7 +902,7 @@ def _map_stream(
             run += 1
         if settings.gate is not None:
             e = out.evidence
-            _write(_evidence_table(e.take(np.lexsort((e.scan, e.group, e.query)))),
+            _write(_evidence_table(e.take(order_by(e.query, e.group, e.scan))),
                    w / "evidence" / name, row_group_size=settings.run_row_group_rows)  # fmt: skip
         if settings.claims:
             _write(out.claims.sorted().table(), w / "claims" / name, row_group_size=1 << 18)

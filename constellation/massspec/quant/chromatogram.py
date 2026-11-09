@@ -402,6 +402,8 @@ class XicTraceReducer:
 
 
 def _trace_table(plan, s, scan_order, parts, acquisition_id) -> pa.Table:
+    from constellation.massspec.sweep.schedule import order_by
+
     if not parts:
         return cast_to_schema(XIC_TRACE_TABLE.empty_table(), XIC_TRACE_TABLE)
     cols: dict[str, list] = {k: [] for k in (
@@ -430,7 +432,7 @@ def _trace_table(plan, s, scan_order, parts, acquisition_id) -> pa.Table:
         cols["matched"].append(matched)
     c = {k: (np.ma.concatenate(v) if isinstance(v[0], np.ma.MaskedArray) else np.concatenate(v))
          for k, v in cols.items()}  # fmt: skip
-    by = np.lexsort((c["point"], c["channel"], scan_order[c["row"]], c["level"], c["query"]))
+    by = order_by(c["query"], c["level"], scan_order[c["row"]], c["channel"], c["point"])
     c = {k: v[by] for k, v in c.items()}
     row = c["row"]
     matched = c["matched"]
