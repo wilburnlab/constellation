@@ -71,21 +71,28 @@ def isolation_groups(
     rows: np.ndarray,
     *,
     gate: bool,
+    order: np.ndarray | None = None,
 ) -> list[ScanGroup]:
     """Group a level's scans (``rows`` of the block, with isolation bounds
     ``lower`` / ``upper``) by window, each with the active queries the window
     covers. With ``gate`` false (MS1) every scan is in one group with every
-    active query."""
+    active query. ``order`` is every query by precursor m/z (a stable sort,
+    NaN last: ``QueryPlan.precursor_order``), so the active ones need no
+    sort of their own; until 2026-11-09 they were sorted at every block,
+    about 2 s a block at 9.56M queries."""
     if rows.size == 0 or active.size == 0:
         return []
     if not gate:
         return [ScanGroup(rows=rows, queries=active)]
-    pmz = precursor_mz[active]
-    finite = ~np.isnan(pmz)
-    order = np.argsort(pmz[finite], kind="stable")
-    gated = active[finite][order]
-    gated_pmz = pmz[finite][order]
-    passall = active[~finite]
+    if order is None:
+        order = np.argsort(precursor_mz, kind="stable")
+    is_active = np.zeros(precursor_mz.size, dtype=bool)
+    is_active[active] = True
+    by_mz = order[is_active[order]]
+    pmz_sorted = precursor_mz[by_mz]
+    n_finite = int(np.count_nonzero(~np.isnan(pmz_sorted)))
+    gated, gated_pmz = by_mz[:n_finite], pmz_sorted[:n_finite]
+    passall = np.sort(by_mz[n_finite:])
     unbounded = np.isnan(lower) | np.isnan(upper)
     # Windows compared exactly: group scans whose float64 bounds are equal.
     key_lo = np.where(unbounded, -np.inf, lower)

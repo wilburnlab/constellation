@@ -768,3 +768,96 @@ def test_an_rt_range_is_the_scans_it_spans(tmp_root):
     assert empty.num_rows == 0
     with pytest.raises(ValueError, match="not both"):
         sweep(bundle, plan, settings, scan_range=(1, 2), rt_range=(0.0, 1.0))
+
+
+# ── at scale (2026-11-09): runs capped, ranges sharded, pairs chunked, cells merged ──
+
+
+def test_no_run_file_holds_more_than_run_rows(tmp_root, tmp_path):
+    """A block's matches are flushed group by group and written in runs of
+    at most run_rows, however many one block makes."""
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2])
+    tol = {1: (20.0, "ppm"), 2: (0.35, "Da")}
+    base = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[XicTraceReducer()]).table("xic_trace")
+    capped = SweepSettings(tolerances=tol, run_rows=97, block_rows=1 << 20)
+    got = sweep(bundle, plan, capped, reducers=[XicTraceReducer()], workers=1, work_dir=tmp_path / "w")
+    oracle.assert_traces_identical(got.table("xic_trace"), base)
+    runs = sorted((tmp_path / "w" / "matches").glob("*.parquet"))
+    assert len(runs) > 1
+    assert max(pq.read_metadata(f).num_rows for f in runs) <= 97
+
+
+def test_a_scan_range_is_cut_into_shards_of_its_own(tmp_root, tmp_path):
+    from constellation.massspec.bundle import scan_range_shards
+
+    run, bundle, _ = _run("dia", tmp_root)
+    whole = scan_range_shards(bundle)
+    scans = sorted(s["scan"] for s in run.scans)
+    lo, hi = scans[len(scans) // 3], scans[len(scans) // 3 + 40]
+    assert sum(1 for a, b in whole if a < hi and b > lo) == 1  # trimmed shards: one process
+    shards = scan_range_shards(bundle, scan_range=(lo, hi))
+    assert len(shards) > 1
+    assert shards[0][0] == lo and shards[-1][1] == hi
+    assert all(a < b for a, b in shards) and all(b == c for (_, b), (c, _) in zip(shards, shards[1:]))
+    plan = compile_queries(_targets(run), levels=[2])
+    settings = SweepSettings(tolerances={2: (0.35, "Da")})
+    want = sweep(bundle, plan, settings, reducers=[XicTraceReducer()], scan_range=(lo, hi - 1)).table("xic_trace")
+    got = sweep(bundle, plan, settings, reducers=[XicTraceReducer()], scan_range=(lo, hi - 1), workers=2,
+                work_dir=tmp_path / "w")  # fmt: skip
+    oracle.assert_traces_identical(got.table("xic_trace"), want)
+    assert len(list((tmp_path / "w" / "scans").glob("*.parquet"))) > 1
+
+
+def test_eligible_pairs_are_counted_in_chunks_bounded_by_the_pairs_they_build(tmp_root, monkeypatch):
+    """On DDA every scan is a window of its own: the parent counts a query's
+    pairs without building every (window, query) pair at once."""
+    from constellation.massspec.sweep import reduce as reduce_mod
+
+    run, bundle, _ = _run("dda", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2])
+    result = sweep(bundle, plan, SweepSettings(tolerances={2: (0.35, "Da")}))
+    every = np.arange(plan.n_queries, dtype=np.int64)
+    want = reduce_mod.eligible_counts(plan, result.scans, 2, every)
+    built: list[int] = []
+    real = reduce_mod.eligible_pairs
+
+    def recording(*args, **kwargs):
+        out = real(*args, **kwargs)
+        built.append(int(out[0].size))
+        return out
+
+    monkeypatch.setattr(reduce_mod, "eligible_pairs", recording)
+    monkeypatch.setattr(reduce_mod, "PAIR_BUDGET", 1)
+    got = reduce_mod.eligible_counts(plan, result.scans, 2, every)
+    np.testing.assert_array_equal(got, want)
+    assert len(built) > 1
+    windows = reduce_mod._windows_per_query(plan, result.scans, 2, every)
+    assert max(built) <= 1 + int(windows.max())
+
+
+@pytest.mark.parametrize("rule", [Nearest(), AllWithin(), SumWithin()])
+@pytest.mark.parametrize("name", ["dia", "dda"])
+def test_cells_merge_is_the_sort_it_replaced(tmp_root, name, rule):
+    """The merge of matches and unmatched cells gives what sorting both on
+    four keys gave, row for row."""
+    run, bundle, _ = _run(name, tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
+    batch = _batch_of(bundle, plan, SweepSettings(tolerances={1: (20.0, "ppm"), 2: (0.35, "Da")}, rule=rule))
+    batch = type(batch)(**{**batch.__dict__, "matches": batch.matches.sorted(batch.scan_order[batch.match_rows()])})
+    for level in (1, 2):
+        for subset in (None, batch.queries[::3]):
+            for fill in (True, False):
+                got = batch.cells(level, fill=fill, queries=subset)
+                m = batch.matches
+                sel = (m.level == level) & (np.ones(m.n, bool) if subset is None else np.isin(m.query, subset))
+                at = np.flatnonzero(sel)
+                parts = dict(query=m.query[at], row=batch.scans.rows_of(m.scan[at]), channel=m.channel[at],
+                             matched=np.ones(at.size, bool), point_index=m.point_index[at], n_points=m.n_points[at],
+                             mz_observed=m.mz[at], intensity=m.intensity[at])  # fmt: skip
+                cq, cr, ci = (batch.eligible_cells_of(level, batch.queries if subset is None else subset) if fill
+                              else (np.empty(0, np.int64),) * 3)  # fmt: skip
+                want = batch._cells_by_sort(level, plan.channels_for_level(level), parts, cq, cr, ci)
+                for column in ("query", "row", "channel", "matched", "point_index", "n_points", "mz_observed",
+                               "intensity"):  # fmt: skip
+                    np.testing.assert_array_equal(getattr(got, column), getattr(want, column), err_msg=column)

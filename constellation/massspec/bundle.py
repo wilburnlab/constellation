@@ -400,29 +400,44 @@ def iter_scan_blocks(
         yield block_of(carry)
 
 
+#: A scan range is cut into at least this many shards when it holds the
+#: points for them (a data-dependent number, so the cut never depends on
+#: how many workers read it).
+RANGE_SHARDS = 16
+
+
 def scan_range_shards(
     bundle_dir: Path | str,
     *,
     target_rows: int = 16 << 20,
     points: bool = False,
+    scan_range: tuple[int, int] | None = None,
 ) -> list[tuple[int, int]]:
     """Cut a bundle into contiguous scan ranges ``[lo, hi)`` of about
     ``target_rows`` points each, at row-group starts, from footer statistics
     alone. The cut depends on the data, not on how many workers will read it.
-    A bundle whose footers lack scan statistics is one range."""
+    A bundle whose footers lack scan statistics is one range.
+
+    With ``scan_range`` only that range is cut, by the points of the row
+    groups it overlaps, into pieces of at most ``target_rows`` and at most
+    1/:data:`RANGE_SHARDS` of the range; a row group is split at scans
+    interpolated by its rows where it alone holds more than a piece."""
     paths = point_paths(bundle_dir) if points else peak_paths(bundle_dir)
-    starts: list[tuple[int, int]] = []  # (first scan, rows) per row group
+    groups: list[tuple[int, int, int]] = []  # (first scan, last scan, rows) per row group
     for path in paths:
         file = pq.ParquetFile(path)
         for i, b in enumerate(_row_group_scan_bounds(file)):
             if b is None:
-                return [(np.iinfo(np.int32).min, np.iinfo(np.int32).max)]
-            starts.append((b[0], file.metadata.row_group(i).num_rows))
-    if not starts:
+                whole = (np.iinfo(np.int32).min, np.iinfo(np.int32).max)
+                return [scan_range if scan_range is not None else whole]
+            groups.append((b[0], b[1], file.metadata.row_group(i).num_rows))
+    if not groups:
         return []
-    cuts = [starts[0][0]]
+    if scan_range is not None:
+        return _cut_range(groups, target_rows, scan_range)
+    cuts = [groups[0][0]]
     rows = 0
-    for first, n in starts:
+    for first, _last, n in groups:
         if rows >= target_rows and first > cuts[-1]:
             cuts.append(first)
             rows = 0
@@ -430,6 +445,40 @@ def scan_range_shards(
     last_file = pq.ParquetFile(paths[-1])
     end = max(b[1] for b in _row_group_scan_bounds(last_file) if b is not None) + 1
     return list(zip(cuts, [*cuts[1:], end]))
+
+
+def _cut_range(groups: list[tuple[int, int, int]], target_rows: int, scan_range: tuple[int, int]) -> list[tuple[int, int]]:
+    lo, hi = int(scan_range[0]), int(scan_range[1])
+    # Each overlapping row group's share of the range, as (first, end, rows),
+    # rows taken in proportion to the scans of it inside the range.
+    pieces = []
+    for first, last, n in groups:
+        a, b = max(first, lo), min(last + 1, hi)
+        if a >= b:
+            continue
+        pieces.append((a, b, n * (b - a) / max(last + 1 - first, 1)))
+    if not pieces:
+        return []
+    total = sum(r for _, _, r in pieces)
+    piece = max(1.0, min(float(target_rows), total / RANGE_SHARDS))
+    cuts = [lo]
+    rows = 0.0
+    for a, b, r in pieces:
+        if rows >= piece and a > cuts[-1]:
+            cuts.append(a)
+            rows = 0.0
+        # A row group holding more than a piece is split at scans by its rows.
+        while rows + r > piece and b - a > 1:
+            step = max(1, int((piece - rows) / r * (b - a)))
+            at = a + step
+            if at >= b:
+                break
+            if at > cuts[-1]:
+                cuts.append(at)
+            r -= r * step / (b - a)
+            a, rows = at, 0.0
+        rows += r
+    return list(zip(cuts, [*cuts[1:], hi]))
 
 
 # ── making and writing peak rows ──────────────────────────────────────

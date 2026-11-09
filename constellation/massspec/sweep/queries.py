@@ -29,6 +29,7 @@ import json
 from typing import Any
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from functools import cached_property
 
 import numpy as np
 import pyarrow as pa
@@ -90,6 +91,12 @@ class QueryPlan:
     @property
     def n_queries(self) -> int:
         return int(self.rt_lo.size)
+
+    @cached_property
+    def precursor_order(self) -> np.ndarray:
+        """Every query by precursor m/z (a stable sort, those with none
+        last): computed once per plan, not per block."""
+        return np.argsort(self.precursor_mz, kind="stable")
 
     def channels_for_level(self, level: int) -> Channels | None:
         return self.isotopes if level == 1 else self.fragments

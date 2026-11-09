@@ -339,7 +339,15 @@ class _MapOut:
 
 
 def _map_block(block: _Block, plan: QueryPlan, settings: SweepSettings) -> _MapOut:
-    matches, evidence, claims = [], [], []
+    """A block's matches, evidence and claims, all its window groups at once."""
+    return _MapOut.concat(list(_map_block_parts(block, plan, settings)))
+
+
+def _map_block_parts(block: _Block, plan: QueryPlan, settings: SweepSettings) -> Iterator[_MapOut]:
+    """A block's matches, evidence and claims one window group at a time, so
+    a caller can write them out before the next group's are made: a block
+    is sized in points, and at proteome scale its matches (61 per point on
+    a GPF run) outgrew any run size until 2026-11-09."""
     gate = settings.gate
     for level in plan.levels:
         channels = plan.channels_for_level(level)
@@ -358,7 +366,8 @@ def _map_block(block: _Block, plan: QueryPlan, settings: SweepSettings) -> _MapO
             plan.rt_lo, plan.rt_hi, counts > 0, float(block.rt[timed].min()), float(block.rt[timed].max())
         )
         groups = isolation_groups(
-            active, plan.precursor_mz, block.lower[rows], block.upper[rows], rows, gate=level > 1
+            active, plan.precursor_mz, block.lower[rows], block.upper[rows], rows, gate=level > 1,
+            order=plan.precursor_order if level > 1 else None,
         )
         assigned = plan.assigned_scan if level > 1 else None
 
@@ -370,6 +379,7 @@ def _map_block(block: _Block, plan: QueryPlan, settings: SweepSettings) -> _MapO
             return np.where(point >= 0, block.point_index[at], -1)
 
         for g in groups:
+            matches, evidence, claims = [], [], []
             n = counts[g.queries]
             channel_at = ragged_arange(channels.offsets[g.queries], n)
             channel_query = np.repeat(g.queries, n)
@@ -411,7 +421,7 @@ def _map_block(block: _Block, plan: QueryPlan, settings: SweepSettings) -> _MapO
                                    channel_at, channel_query, eligible, tolerance, unit, gate.top_peaks,
                                    by_charge=level == 1)  # fmt: skip
                 )
-    return _MapOut(Matches.concat(matches), Evidence.concat(evidence), Claims.concat(claims))
+            yield _MapOut(Matches.concat(matches), Evidence.concat(evidence), Claims.concat(claims))
 
 
 def _load_axis(bundle: Path, settings: SweepSettings):
@@ -831,10 +841,14 @@ def _map_stream(
         pending.clear()
         held = 0
         name = _run_name(index, run)
-        run += 1
         m = out.matches
         m = m.take(np.lexsort((m.point_index, m.channel, m.scan, m.level, m.query)))
-        _write(m.table(), w / "matches" / name, row_group_size=settings.run_row_group_rows)
+        # Sorted runs of at most run_rows each (one window group can hold more).
+        for start in range(0, max(m.n, 1), settings.run_rows):
+            stop = min(start + settings.run_rows, m.n)
+            _write(m.take(np.arange(start, stop)).table(), w / "matches" / _run_name(index, run),
+                   row_group_size=settings.run_row_group_rows)  # fmt: skip
+            run += 1
         if settings.gate is not None:
             e = out.evidence
             _write(_evidence_table(e.take(np.lexsort((e.scan, e.group, e.query)))),
@@ -844,11 +858,12 @@ def _map_stream(
             shared[:] += _shared_counts(out.claims, plan.n_queries, per_cell=settings.rule.name == "sum")
 
     for block in blocks:
-        pending.append(_map_block(block, plan, settings))
-        held += pending[-1].matches.n
-        total += pending[-1].matches.n
-        if held >= settings.run_rows:
-            flush()
+        for part in _map_block_parts(block, plan, settings):
+            pending.append(part)
+            held += part.matches.n
+            total += part.matches.n
+            if held >= settings.run_rows:
+                flush()
     flush()
     if settings.claims:
         at = np.flatnonzero(shared)
@@ -1036,11 +1051,11 @@ def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progre
             shutil.rmtree(work / sub)
     plan.write(work / "plan")
     axis = _load_axis(bundle, settings)
-    shards = scan_range_shards(bundle, target_rows=settings.shard_rows) if resume is None else [None]
-    if window is not None and resume is None:
-        # Each shard cut to the range; one that lies outside it reads nothing.
-        shards = [(max(lo, window[0]), min(hi, window[1])) for lo, hi in shards]
-        shards = [(lo, hi) for lo, hi in shards if lo < hi]
+    # A range is cut into shards of its own (until 2026-11-09 the whole run's
+    # shards were trimmed to it, so a range inside one shard ran in one process).
+    shards = (
+        scan_range_shards(bundle, target_rows=settings.shard_rows, scan_range=window) if resume is None else [None]
+    )
     pool = (
         ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn"), initializer=_init_worker)
         if workers > 1
