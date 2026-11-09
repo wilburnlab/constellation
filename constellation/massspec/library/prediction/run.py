@@ -222,23 +222,32 @@ def predict_onto(
     n_fragments = 0
     worst_ppm: float | None = None
     fragments_predictor = predictors.get("fragments")
-    ladders: Ladders | None = None
-    source_peptide = np.zeros(0, np.int64)
-    if fragments_predictor is not None and len(kept_rows):
-        ladders, source_peptide = _source_ladders(library, plan, kept_rows, fragments_predictor)
     kept_request_of_row = np.searchsorted(kept_requests, plan.request[kept_rows])
+    # Kept rows by request chunk, each chunk's in precursor id order: a
+    # chunk's fragments come out sorted by precursor, and its peptides'
+    # ladders are built for it alone (all of them at once did not fit at
+    # proteome scale, 2026-11-09). Requests are still predicted in their
+    # canonical order and batches, so no predicted value moves.
+    rows_by_request = np.argsort(kept_request_of_row, kind="stable")
+    peptide_ids = library.peptides.column("peptide_id").to_numpy()
+    peptide_order = np.argsort(peptide_ids, kind="stable")
     for start in range(0, len(kept_requests), max(1, int(chunk))):
         stop = min(start + int(chunk), len(kept_requests))
         sub = plan.requests.take(kept_requests[start:stop])
         for prop, predictor in predictors.items():
             answer = predictor.predict(sub)
             if prop == "fragments":
-                rows = np.flatnonzero((kept_request_of_row >= start) & (kept_request_of_row < stop))
+                lo = np.searchsorted(kept_request_of_row[rows_by_request], start, side="left")
+                hi = np.searchsorted(kept_request_of_row[rows_by_request], stop, side="left")
+                rows = rows_by_request[lo:hi]
+                rows = rows[np.argsort(plan.precursor_id[kept_rows[rows]], kind="stable")]
+                ladders, source_peptide = _source_ladders(library, plan, kept_rows[rows], predictor,
+                                                          (peptide_ids, peptide_order))  # fmt: skip
                 part = fragment_table(
                     _as_fragments(answer, predictor.name),
                     kept_request_of_row[rows] - start,
                     plan.precursor_id[kept_rows[rows]],
-                    source_peptide[rows],
+                    source_peptide,
                     ladders,
                 )
                 n_fragments += part.num_rows
@@ -269,6 +278,9 @@ def predict_onto(
         precursors = precursors.set_column(precursors.schema.get_field_index(column), column, merged)
     if fragments_predictor is not None:
         fragments = pa.concat_tables(fragment_parts) if fragment_parts else LIBRARY_FRAGMENT_TABLE.empty_table()
+        # By precursor across chunks too (stable: a precursor's rows keep
+        # their ion order), as a streamed prediction is written.
+        fragments = fragments.take(pc.sort_indices(fragments, sort_keys=[("precursor_id", "ascending")]))
     else:
         fragments = out.fragments
         n_fragments = fragments.num_rows
@@ -371,15 +383,21 @@ def _as_values(out: Any, name: str, n: int) -> ValueArray:
 
 
 def _source_ladders(
-    library: Library, plan: RequestPlan, kept_rows: np.ndarray, predictor: Predictor
+    library: Library, plan: RequestPlan, kept_rows: np.ndarray, predictor: Predictor,
+    lookup: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[Ladders, np.ndarray]:
-    """Ladders of the kept precursors' own (labelled) peptides, and each
-    kept precursor's index into them."""
+    """Ladders of the given precursors' own (labelled) peptides, and each
+    precursor's index into them. ``lookup`` is the library's peptide ids
+    and their sort order, found once for every chunk."""
     peptide_ids = plan.peptide_id[kept_rows]
     unique_ids, local = np.unique(peptide_ids, return_inverse=True)
     peptides = library.peptides
-    at = pc.index_in(pa.array(unique_ids, type=pa.int64()), value_set=peptides.column("peptide_id").combine_chunks())
-    sequences = pc.take(peptides.column("modified_sequence"), at).to_pylist()
+    if lookup is None:
+        ids = peptides.column("peptide_id").to_numpy()
+        lookup = (ids, np.argsort(ids, kind="stable"))
+    ids, order = lookup
+    at = order[np.searchsorted(ids[order], unique_ids)]
+    sequences = pc.take(peptides.column("modified_sequence"), pa.array(at)).to_pylist()
     caps = predictor.capabilities
     ladders = Ladders(sequences, caps.ion_types, caps.max_fragment_charge)
     return ladders, local.astype(np.int64)

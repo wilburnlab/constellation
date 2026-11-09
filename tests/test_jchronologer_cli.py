@@ -95,6 +95,15 @@ def test_a_search_space_is_predicted_and_written(fake, search_space, tmp_path):
     assert prediction["collision_energy"]["nce"] == 27.0
     assert set(prediction["predictors"]) == {"fragments", "retention_time", "charge_state", "ccs"}
     assert (out / "_SUCCESS").read_text() == manifest["stage_key"]
+    # Written sorted by precursor, so a compile reads a range of them from a few row groups.
+    import pyarrow.parquet as pq
+
+    from constellation.massspec.library.fragment_abundance import _sorted_by_precursor
+
+    written = pq.read_table(out / "library_pqdir" / "fragments.parquet")
+    ids = written.column("precursor_id").to_numpy()
+    assert (ids[1:] >= ids[:-1]).all()
+    assert _sorted_by_precursor(pq.ParquetFile(out / "library_pqdir" / "fragments.parquet"))
 
 
 def test_resume_reuses_only_the_same_prediction(fake, search_space, tmp_path, capsys):

@@ -361,3 +361,58 @@ def test_the_library_join_agrees_with_a_brute_force_join_and_its_fallback():
         assert list(zip(i.tolist(), j.tolist(), strict=True)) == want
         a, b = _arrow_join(left, np.flatnonzero(usable), right, np.arange(m))
         assert list(zip(a.tolist(), b.tolist(), strict=True)) == want
+
+
+# ── prediction at proteome scale (P8) ───────────────────────────────
+
+
+@pytest.mark.parametrize("chunk", [1, 3])
+def test_prediction_in_chunks_is_the_prediction_at_once(tmp_path, chunk, monkeypatch):
+    """Ladders are built per chunk of requests, and fragments come out in
+    precursor order, whatever the chunk; a chunk's ladders cover its own
+    precursors alone."""
+    from constellation.massspec.library.prediction import run as run_mod
+
+    lib = _search_space(tmp_path, PROTEINS, decoys=(DecoySet(),))
+    predictors = {"fragments": FakePredictor("fragments"), "retention_time": FakePredictor("retention_time")}
+    whole, _ = predict_onto(lib, predictors, chunk=10**6)
+    seen: list[int] = []
+    real = run_mod._source_ladders
+
+    def counting(library, plan, rows, predictor, lookup=None):
+        seen.append(len(rows))
+        return real(library, plan, rows, predictor, lookup)
+
+    monkeypatch.setattr(run_mod, "_source_ladders", counting)
+    parts, _ = predict_onto(lib, predictors, chunk=chunk)
+    assert parts.precursors.equals(whole.precursors)
+    assert parts.fragments.equals(whole.fragments)
+    ids = parts.fragments.column("precursor_id").to_numpy()
+    assert (ids[1:] >= ids[:-1]).all()
+    assert len(seen) > 1 and max(seen) <= 2 * chunk  # a request is at most a heavy and a light precursor
+
+
+def test_streamed_fragments_are_written_sorted_by_precursor(tmp_path):
+    import pyarrow.parquet as pq
+
+    from constellation.massspec.library.fragment_abundance import _sorted_by_precursor
+    from constellation.massspec.library.prediction.assemble import SortedFragmentWriter
+    from constellation.massspec.library.schemas import LIBRARY_FRAGMENT_TABLE
+
+    rng = np.random.default_rng(2)
+    ids = rng.integers(0, 2**62, 300)
+    rows = [{"precursor_id": int(i), "ion_type": 2, "position": k, "charge": 1, "loss_id": None,
+             "mz_theoretical": 100.0 + k, "intensity_predicted": float(k)}
+            for i in ids for k in range(int(rng.integers(1, 5)))]  # fmt: skip
+    table = pa.Table.from_pylist(rows, schema=LIBRARY_FRAGMENT_TABLE)
+    chunks = [table.slice(a, 97) for a in range(0, table.num_rows, 97)]
+    with SortedFragmentWriter(tmp_path / "f.parquet", buckets=8, row_group_size=50) as writer:
+        for part in chunks[::-1]:
+            writer.write_table(part)
+    got = pq.read_table(tmp_path / "f.parquet")
+    want = pa.concat_tables(chunks[::-1])
+    want = want.take(pc.sort_indices(want, sort_keys=[("precursor_id", "ascending")]))
+    assert got.equals(want)
+    f = pq.ParquetFile(tmp_path / "f.parquet")
+    assert f.metadata.num_row_groups > 1 and _sorted_by_precursor(f)
+    assert not any(p.name.startswith(".fragments-") for p in tmp_path.iterdir())

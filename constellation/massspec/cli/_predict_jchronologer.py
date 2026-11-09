@@ -359,9 +359,8 @@ def run(args: argparse.Namespace) -> int:
     # ── predict, streaming fragments ────────────────────────────────
     import contextlib
 
-    import pyarrow.parquet as pq
 
-    from constellation.massspec.library.schemas import LIBRARY_FRAGMENT_TABLE
+    from constellation.massspec.library.prediction.assemble import SortedFragmentWriter
 
     pqdir.mkdir(parents=True, exist_ok=True)
     # Predicted fragments go to disk chunk by chunk, beside the library;
@@ -371,8 +370,10 @@ def run(args: argparse.Namespace) -> int:
     streamed = pqdir / "fragments.streaming.parquet" if "fragments" in predictors else None
     started = time.perf_counter()
     try:
+        # Sorted by precursor as it is written, so a compile reads a range
+        # of precursors from a few row groups (LibraryFragments).
         with (
-            pq.ParquetWriter(streamed, LIBRARY_FRAGMENT_TABLE) if streamed is not None else contextlib.nullcontext()
+            SortedFragmentWriter(streamed) if streamed is not None else contextlib.nullcontext()
         ) as writer:
             predicted, report = predict_onto(
                 library,
