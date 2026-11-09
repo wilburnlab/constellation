@@ -127,7 +127,7 @@ def test_an_older_koina_library_states_its_scale_by_its_own_key():
 
 def test_the_cli_refuses_an_rt_window_around_a_model_clock(tmp_path, capsys):
     """`chromatogram extract --rt-window` on a predicted library is an
-    error naming the scale, in the sweep and through the mass index."""
+    error naming the scale, read either way."""
     from constellation.cli.__main__ import main
 
     lib = _library()
@@ -136,7 +136,7 @@ def test_the_cli_refuses_an_rt_window_around_a_model_clock(tmp_path, capsys):
     import pyarrow.parquet as pq
 
     pq.write_table(targets_from_library(lib), path)
-    for extra in ([], ["--use-index"]):
+    for extra in ([], ["--layout", "precursor-major"]):
         rc = main(["massspec", "chromatogram", "extract", "--peaks-dir", str(tmp_path), "--targets", str(path),
                    "-o", str(tmp_path / "out"), "--level", "2", "--rt-window", "60", "--no-progress", *extra])  # fmt: skip
         assert rc == 2

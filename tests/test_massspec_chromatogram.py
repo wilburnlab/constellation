@@ -1,4 +1,4 @@
-"""Tests for XIC extraction (Mode A scan-major + Mode B mass-index)."""
+"""Tests for XIC extraction (the sweep; Mode B, the mass index, was retired on 2026-11-09)."""
 
 from __future__ import annotations
 
@@ -14,12 +14,10 @@ from constellation.massspec.peptide.envelope import peptide_envelope
 from constellation.massspec.peptide.ions import IonType, fragment_ladder_indices_batch
 from constellation.massspec.peptide.mz import precursor_mz
 from constellation.massspec.quant.chromatogram import (
-    extract_xic_indexed,
     extract_xic_scan_major,
     load_xic,
     save_xic,
 )
-from constellation.massspec.quant.peak_index import build_peak_index
 from constellation.massspec.quant.schemas import XIC_TRACE_TABLE
 
 _PK = {
@@ -342,64 +340,6 @@ def test_ms2_assigned_scans_only():
     assert set(out.column("scan").to_pylist()) == {10}
 
 
-def test_mode_a_vs_mode_b_parity_binned_ms2_wide_window(tmp_path):
-    """A binned (DDA) MS2 level where a wide-window covering scan lands 2+
-    bins from the target's precursor bin must still be found by Mode B —
-    the bin-neighbor span derives from the manifest's max isolation
-    half-width, not a hardcoded ±1."""
-    pf = parse_proforma(_PEP)
-    P = precursor_mz(pf, charge=2)
-    ladder = fragment_ladder_indices_batch([pf], max_fragment_charge=1)[0]
-    frags = [(c, m) for c, m in ladder.items() if c[2] == 1][:4]
-    rows = []
-    # Many narrow windows centered far from P → force binning + none cover P.
-    for i in range(6):
-        c = 600.0 + i * 0.5
-        rows.append(_pk(200 + i, 2, float(i), 123.0 + i, 10.0, c - 0.5, c + 0.5, c))
-    # Covering scan: wide window [P-5, P+5] covers P, but its precursor m/z
-    # (the bin value) is P-4 → bins ~2 cells away from floor(P / 2).
-    for _c, m in frags:
-        rows.append(
-            _pk(
-                300,
-                2,
-                50.0,
-                m * (1 + _NOISE_PPM / 1e6),
-                500.0,
-                P - 5.0,
-                P + 5.0,
-                P - 4.0,
-            )
-        )
-    peaks = _peaks(rows)
-    tgt = _target(charge=2, prec_mz=P, rt_center=50.0)
-    kw = dict(
-        acquisition_id=0,
-        level=2,
-        rt_window=100.0,
-        max_fragment_charge=1,
-        tolerance=_TOL_PPM,
-    )
-
-    a = extract_xic_scan_major(peaks, tgt, **kw)
-    src = tmp_path / "bundle"
-    src.mkdir()
-    pq.write_table(peaks, src / "peaks.parquet")
-    man = build_peak_index(
-        src, tmp_path / "idx", max_isolation_windows=2, dda_window_width_mz=2.0
-    )
-    assert man.window_scheme.get("2") == "binned"
-    assert man.dda_max_halfwidth_mz.get("2") == 5.0
-    b = extract_xic_indexed(tmp_path / "idx", tgt, **kw)
-
-    assert a.num_rows == b.num_rows == len(frags)
-    assert set(a.column("scan").to_pylist()) == {300}
-    assert set(b.column("scan").to_pylist()) == {300}
-    assert sorted(round(x, 6) for x in a.column("mz_observed").to_pylist()) == sorted(
-        round(x, 6) for x in b.column("mz_observed").to_pylist()
-    )
-
-
 # ── all_in_window ─────────────────────────────────────────────────────
 
 
@@ -418,179 +358,6 @@ def test_all_in_window_emits_multiple_peaks():
     )
     assert nearest.num_rows == 1
     assert allwin.num_rows == 2
-
-
-# ── Mode A vs Mode B parity ───────────────────────────────────────────
-
-
-def _sortkey(t):
-    d = t.sort_by(
-        [
-            ("precursor_charge", "ascending"),
-            ("scan", "ascending"),
-            ("isotope", "ascending"),
-        ]
-    )
-    return list(
-        zip(
-            d["scan"].to_pylist(),
-            d["isotope"].to_pylist(),
-            [round(x, 6) for x in d["intensity"].to_pylist()],
-            [round(x, 6) for x in d["mz_observed"].to_pylist()],
-        )
-    )
-
-
-def test_mode_a_vs_mode_b_parity_ms1(tmp_path):
-    peaks, mz2 = _ms1_dataset()
-    tgt = _target(prec_mz=mz2[0], rt_center=102.0)
-    a = _charge2(
-        extract_xic_scan_major(
-            peaks,
-            tgt,
-            acquisition_id=0,
-            level=1,
-            n_isotopes=3,
-            rt_window=2.0,
-            tolerance=_TOL_PPM,
-        )
-    )
-    src = tmp_path / "bundle"
-    src.mkdir()
-    pq.write_table(peaks, src / "peaks.parquet")
-    build_peak_index(src, tmp_path / "idx")
-    b = _charge2(
-        extract_xic_indexed(
-            tmp_path / "idx",
-            tgt,
-            acquisition_id=0,
-            level=1,
-            n_isotopes=3,
-            rt_window=2.0,
-            tolerance=_TOL_PPM,
-        )
-    )
-    assert a.num_rows == b.num_rows == 9
-    assert _sortkey(a) == _sortkey(b)
-
-
-def test_mode_a_vs_mode_b_parity_drop_unmatched_false(tmp_path):
-    """Mode B must honour drop_unmatched=False: the rectangular grid of
-    unmatched (charge × isotope × scan) zero rows that Mode A emits."""
-    peaks, mz2 = _ms1_dataset(signal_scans=(1, 2, 3))
-    tgt = _target(prec_mz=mz2[0], rt_center=102.0)
-    kw = dict(
-        acquisition_id=0,
-        level=1,
-        n_isotopes=3,
-        charge_range=(1, 4),
-        rt_window=2.0,
-        tolerance=_TOL_PPM,
-        drop_unmatched=False,
-    )
-    a = extract_xic_scan_major(peaks, tgt, **kw)
-    src = tmp_path / "bundle"
-    src.mkdir()
-    pq.write_table(peaks, src / "peaks.parquet")
-    build_peak_index(src, tmp_path / "idx")
-    b = extract_xic_indexed(tmp_path / "idx", tgt, **kw)
-    # rt window [100,104] gates all 5 scans (each carries a noise peak):
-    # 4 charges × 3 isotopes × 5 candidate scans = 60 rectangular cells.
-    assert a.num_rows == b.num_rows == 60
-
-    def _full_key(t):
-        d = t.sort_by(
-            [
-                ("precursor_charge", "ascending"),
-                ("isotope", "ascending"),
-                ("scan", "ascending"),
-            ]
-        )
-        obs = d["mz_observed"].to_pylist()
-        return list(
-            zip(
-                d["precursor_charge"].to_pylist(),
-                d["isotope"].to_pylist(),
-                d["scan"].to_pylist(),
-                [round(x, 6) for x in d["intensity"].to_pylist()],
-                [None if o is None or o != o else round(o, 6) for o in obs],
-            )
-        )
-
-    assert _full_key(a) == _full_key(b)
-    # 9 matched cells (charge 2 × 3 isotopes × 3 signal scans); the rest zero.
-    assert pc.sum(pc.equal(a["intensity"], 0.0)).as_py() == 51
-    assert pc.sum(pc.equal(b["intensity"], 0.0)).as_py() == 51
-
-
-def test_use_index_exact_error_restores_f64(tmp_path):
-    peaks, mz2 = _ms1_dataset()
-    tgt = _target(prec_mz=mz2[0], rt_center=102.0)
-    src = tmp_path / "bundle"
-    src.mkdir()
-    pq.write_table(peaks, src / "peaks.parquet")
-    build_peak_index(src, tmp_path / "idx32", downcast=["mz"])
-    default = _charge2(
-        extract_xic_indexed(
-            tmp_path / "idx32",
-            tgt,
-            acquisition_id=0,
-            level=1,
-            n_isotopes=3,
-            rt_window=2.0,
-            tolerance=_TOL_PPM,
-        )
-    )
-    exact = _charge2(
-        extract_xic_indexed(
-            tmp_path / "idx32",
-            tgt,
-            acquisition_id=0,
-            level=1,
-            n_isotopes=3,
-            rt_window=2.0,
-            tolerance=_TOL_PPM,
-            exact_error=True,
-            peaks_dir=src,
-        )
-    )
-    a = _charge2(
-        extract_xic_scan_major(
-            peaks,
-            tgt,
-            acquisition_id=0,
-            level=1,
-            n_isotopes=3,
-            rt_window=2.0,
-            tolerance=_TOL_PPM,
-        )
-    )
-    # f32-index reported mz differs from the f64 truth; exact_error restores it
-    f32_obs = sorted(default.column("mz_observed").to_pylist())
-    exact_obs = sorted(exact.column("mz_observed").to_pylist())
-    truth = sorted(a.column("mz_observed").to_pylist())
-    assert exact_obs == pytest.approx(truth, abs=1e-9)
-    assert f32_obs != pytest.approx(truth, abs=1e-9)
-
-
-def test_exact_error_without_peaks_dir_raises_on_f32_index(tmp_path):
-    peaks, mz2 = _ms1_dataset()
-    src = tmp_path / "bundle"
-    src.mkdir()
-    pq.write_table(peaks, src / "peaks.parquet")
-    build_peak_index(src, tmp_path / "idx32", downcast=["mz"])
-    with pytest.raises(ValueError, match="peaks_dir"):
-        extract_xic_indexed(
-            tmp_path / "idx32",
-            _target(prec_mz=mz2[0], rt_center=102.0),
-            acquisition_id=0,
-            level=1,
-            n_isotopes=3,
-            rt_window=2.0,
-            tolerance=_TOL_PPM,
-            exact_error=True,
-            peaks_dir=None,
-        )
 
 
 # ── integration-readiness (Phase 8 guard) ─────────────────────────────
@@ -643,20 +410,3 @@ def test_save_load_xic_roundtrip(tmp_path):
     )
 
 
-def test_mode_b_takes_its_channels_from_the_sweeps_generator(tmp_path):
-    """The index extraction built its own MS1 and MS2 ions; it now takes
-    the sweep's ChannelSettings and the channels the one generator makes."""
-    from constellation.massspec.sweep import ChannelSettings
-
-    peaks, mz2 = _ms1_dataset()
-    tgt = _target(prec_mz=mz2[0], rt_center=102.0)
-    src = tmp_path / "bundle"
-    src.mkdir()
-    pq.write_table(peaks, src / "peaks.parquet")
-    build_peak_index(src, tmp_path / "idx")
-    kw = dict(acquisition_id=0, level=1, rt_window=2.0, tolerance=_TOL_PPM)
-    by_keywords = extract_xic_indexed(tmp_path / "idx", tgt, n_isotopes=3, **kw)
-    by_settings = extract_xic_indexed(tmp_path / "idx", tgt, channels=ChannelSettings(n_isotopes=3), **kw)
-    assert _sortkey(by_keywords) == _sortkey(by_settings)
-    two = extract_xic_indexed(tmp_path / "idx", tgt, channels=ChannelSettings(n_isotopes=2), **kw)
-    assert set(two.column("isotope").to_pylist()) == {0, 1}
