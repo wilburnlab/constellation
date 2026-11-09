@@ -210,3 +210,154 @@ def test_the_command_line_refuses_a_library_with_no_coverage_unless_told_the_ion
     assert "records no coverage" in capsys.readouterr().err
     assert main([*args, "-o", str(tmp_path / "b"), "--ion-types", "b,y", "--max-fragment-charge", "3"]) == 0
     assert pc.sum(pc.is_valid(load_library(tmp_path / "lib", format="parquet_dir").fragments.column("ion_type"))).as_py()
+
+
+# ── (h) a precursor with no predicted fragment ─────────────────────
+
+
+def test_a_precursor_with_no_positive_fragment_keeps_none_and_is_counted(predicted):
+    targets = targets_from_library(predicted)
+    silent = targets.column("precursor_id")[0].as_py()
+    f = predicted.fragments
+    zero = pc.equal(f.column("precursor_id"), silent)
+    f = f.set_column(f.schema.get_field_index("intensity_predicted"), "intensity_predicted",
+                     pc.if_else(zero, 0.0, f.column("intensity_predicted")))  # fmt: skip
+    lib = replace(predicted, fragments=f)
+    plan = compile_queries(targets, levels=[2], channels=ChannelSettings(top_fragments=2),
+                           fragment_abundance=LibraryFragments.from_library(lib))  # fmt: skip
+    counts = plan.fragments.counts()
+    assert counts[0] == 0 and (counts[1:] == 2).all()
+    report = plan.fragment_abundance["report"]
+    assert report["no_positive_fragment"] == 1
+    assert report["no_positive_fragment_examples"] == [targets.column("target_id")[0].as_py()]
+
+
+# ── (i) compile in chunks ───────────────────────────────────────────
+
+
+def _plans_equal(a: QueryPlan, b: QueryPlan) -> None:
+    assert a.targets.equals(b.targets)
+    for name in ("precursor_charge", "precursor_mz", "precursor_mz_derived", "rt_lo", "rt_hi", "assigned_scan"):
+        np.testing.assert_array_equal(getattr(a, name), getattr(b, name), err_msg=name)
+    for kind in ("isotopes", "fragments"):
+        x, y = getattr(a, kind), getattr(b, kind)
+        assert (x is None) == (y is None)
+        if x is None:
+            continue
+        assert x.loss_ids == y.loss_ids
+        for name in ("offsets", "mz", "precursor_charge", "isotope", "ion_type", "position", "fragment_charge",
+                     "loss", "abundance", "evidence_key"):  # fmt: skip
+            got, want = getattr(x, name), getattr(y, name)
+            assert got.dtype == want.dtype, (kind, name)
+            np.testing.assert_array_equal(got, want, err_msg=f"{kind}.{name}")
+    assert a.to_tables()[1].equals(b.to_tables()[1])
+    assert a.fragment_abundance == b.fragment_abundance
+
+
+@pytest.mark.parametrize("chunk", [1, 7, None])
+def test_a_compile_in_chunks_is_the_compile_at_once_bit_for_bit(tmp_path, chunk):
+    lib = _search_space(tmp_path, PROTEINS, decoys=(DecoySet(),))
+    pred, _ = predict_onto(lib, {"fragments": FakePredictor("fragments")})
+    targets = targets_from_library(pred)
+    for settings in (ChannelSettings(top_fragments=2), ChannelSettings(neutral_losses=("H2O",))):
+        whole = compile_queries(targets, levels=[1, 2], channels=settings,
+                                fragment_abundance=LibraryFragments.from_library(pred), chunk_targets=None)  # fmt: skip
+        parts = compile_queries(targets, levels=[1, 2], channels=settings,
+                                fragment_abundance=LibraryFragments.from_library(pred),
+                                chunk_targets=chunk or targets.num_rows)  # fmt: skip
+        _plans_equal(parts, whole)
+
+
+# ── (j) the fragment file, read by precursor ───────────────────────
+
+
+def _fragment_file(predicted, path, *, sort: bool):
+    import pyarrow.parquet as pq
+
+    f = predicted.fragments
+    f = f.sort_by("precursor_id") if sort else f.take(pa.array(np.random.default_rng(1).permutation(f.num_rows)))
+    pq.write_table(f, path, row_group_size=4)
+    return LibraryFragments(source=path, coverage=predicted.metadata_extras[COVERAGE_KEY],
+                            predicted=predicted.precursors.column("precursor_id").to_numpy())  # fmt: skip
+
+
+def test_a_fragment_file_sorted_by_precursor_is_read_a_few_row_groups_per_chunk(predicted, tmp_path):
+    import pyarrow.parquet as pq
+
+    targets = targets_from_library(predicted)
+    whole = compile_queries(targets, levels=[2], fragment_abundance=LibraryFragments.from_library(predicted))
+    source = _fragment_file(predicted, tmp_path / "sorted.parquet", sort=True)
+    groups = pq.ParquetFile(tmp_path / "sorted.parquet").metadata.num_row_groups
+    plan = compile_queries(targets, levels=[2], fragment_abundance=source, chunk_targets=3)
+    np.testing.assert_array_equal(plan.fragments.abundance, whole.fragments.abundance)
+    # Each row group is read by the chunk(s) whose precursors it holds: about once.
+    assert source.row_groups_read <= groups + targets.num_rows // 3 + 1
+
+    unsorted = _fragment_file(predicted, tmp_path / "unsorted.parquet", sort=False)
+    plan = compile_queries(targets, levels=[2], fragment_abundance=unsorted, chunk_targets=3)
+    np.testing.assert_array_equal(plan.fragments.abundance, whole.fragments.abundance)
+    # An unsorted file is read once for the whole compile, not once per chunk.
+    assert unsorted.row_groups_read == groups
+    assert unsorted._cache is None
+
+
+def test_the_library_join_is_exact_not_a_packed_key():
+    """Under the old packing, position 2**20 at ion type t was the same
+    integer as position 0 at ion type t + 1."""
+    from constellation.massspec.library.fragment_abundance import _join
+
+    rows = (np.array([5, 5]), np.array([1, 2]), np.array([1 << 20, 0]), np.array([1, 1]), np.array([0, 0]))
+    cands = (np.array([5, 5]), np.array([2, 1]), np.array([0, 1 << 20]), np.array([1, 1]), np.array([0, 0]))
+    i, j = _join(rows, np.ones(2, bool), cands)
+    assert list(zip(i.tolist(), j.tolist(), strict=True)) == [(0, 1), (1, 0)]
+    big = (np.array([(1 << 23) + 7]), np.array([1]), np.array([3]), np.array([2]), np.array([0]))
+    assert _join(big, np.ones(1, bool), big)[0].tolist() == [0]
+
+
+# ── (m) the plan's loss ids ─────────────────────────────────────────
+
+
+def test_a_plan_with_losses_reads_back_bit_for_bit(predicted, tmp_path):
+    plan = compile_queries(targets_from_library(predicted), levels=[2],
+                           channels=ChannelSettings(neutral_losses=("H2O", "NH3")))  # fmt: skip
+    assert plan.fragments.loss_ids and (plan.fragments.loss > 0).any()
+    plan.write(tmp_path / "plan")
+    back = QueryPlan.read(tmp_path / "plan")
+    np.testing.assert_array_equal(back.fragments.loss, plan.fragments.loss)
+    assert back.fragments.loss_ids == plan.fragments.loss_ids
+    assert back.to_tables()[1].equals(plan.to_tables()[1])
+
+
+# ── (p) Counter's detection floor ───────────────────────────────────
+
+
+def test_counters_censored_term_takes_a_floor_per_cell():
+    import torch
+
+    from constellation.massspec.counter.channels import censored_log_prob
+
+    lam = torch.tensor([[1.0, 5.0], [2.0, 8.0]], requires_grad=True)
+    floor = torch.tensor([[2.0, 3.0], [2.0, 3.0]])
+    got = censored_log_prob(lam, floor)
+    want = torch.stack([censored_log_prob(lam[:, c], float(floor[0, c])) for c in range(2)], dim=1)
+    torch.testing.assert_close(got, want)
+    got.sum().backward()
+    assert lam.grad is not None and torch.isfinite(lam.grad).all()
+
+
+def test_the_library_join_agrees_with_a_brute_force_join_and_its_fallback():
+    from constellation.massspec.library.fragment_abundance import _arrow_join, _join
+
+    rng = np.random.default_rng(3)
+    for _ in range(5):
+        n, m = int(rng.integers(0, 60)), int(rng.integers(0, 60))
+        ids = rng.choice(np.array([3, 1 << 40, (1 << 62) + 5, 17]), 4, replace=False)
+        left = (ids[rng.integers(0, 4, n)], *(rng.integers(0, 3, n) for _ in range(4)))
+        right = (ids[rng.integers(0, 4, m)], *(rng.integers(0, 3, m) for _ in range(4)))
+        usable = rng.random(n) < 0.8
+        want = sorted((i, j) for i in range(n) if usable[i] for j in range(m)
+                      if all(left[c][i] == right[c][j] for c in range(5)))  # fmt: skip
+        i, j = _join(left, usable, right)
+        assert list(zip(i.tolist(), j.tolist(), strict=True)) == want
+        a, b = _arrow_join(left, np.flatnonzero(usable), right, np.arange(m))
+        assert list(zip(a.tolist(), b.tolist(), strict=True)) == want

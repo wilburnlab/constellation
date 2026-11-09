@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 import numpy as np
@@ -61,6 +61,7 @@ __all__ = [
     "isotope_channels",
     "fragment_channels",
     "select_top",
+    "concat_channels",
 ]
 
 #: Channel kinds: precursor isotopes are matched in MS1 scans, fragments in the rest.
@@ -206,6 +207,47 @@ class Channels:
         """Each channel's position among its query's channels of this kind."""
         return np.arange(self.n, dtype=np.int64) - np.repeat(self.offsets[:-1], self.counts())
 
+    def take(self, queries: np.ndarray) -> Channels:
+        """The channels of ``queries`` (positions, in the order given), as
+        queries 0, 1, ... of a new set."""
+        queries = np.asarray(queries, dtype=np.int64)
+        counts = self.counts()[queries]
+        rows = _ragged(self.offsets[queries], counts)
+        return replace(
+            self,
+            offsets=_offsets(counts),
+            **{name: getattr(self, name)[rows] for name in _PER_CHANNEL},
+        )
+
+
+#: The per-channel arrays of :class:`Channels`.
+_PER_CHANNEL = ("mz", "precursor_charge", "isotope", "ion_type", "position", "fragment_charge", "loss", "abundance",
+                "evidence_key")  # fmt: skip
+
+
+def concat_channels(parts: Sequence[Channels]) -> Channels:
+    """Several sets of channels of one kind as one, queries in the order
+    given; loss ids are united in order of first appearance."""
+    parts = list(parts)
+    if not parts:
+        raise ValueError("no channels to join")
+    kinds = {c.kind for c in parts}
+    if len(kinds) != 1:
+        raise ValueError(f"channels of several kinds: {sorted(kinds)}")
+    loss_ids = tuple(dict.fromkeys(name for c in parts for name in c.loss_ids))
+    losses = []
+    for c in parts:
+        remap = np.array([0] + [loss_ids.index(name) + 1 for name in c.loss_ids], dtype=np.int16)
+        losses.append(remap[c.loss.astype(np.int64)])
+    counts = np.concatenate([c.counts() for c in parts])
+    return replace(
+        parts[0],
+        offsets=_offsets(counts),
+        loss_ids=loss_ids,
+        loss=np.concatenate(losses).astype(np.int16) if losses else parts[0].loss,
+        **{name: np.concatenate([getattr(c, name) for c in parts]) for name in _PER_CHANNEL if name != "loss"},
+    )
+
 
 def _ragged(starts: np.ndarray, counts: np.ndarray) -> np.ndarray:
     counts = np.asarray(counts, dtype=np.int64)
@@ -226,9 +268,9 @@ def select_top(group: np.ndarray, abundance: np.ndarray, n: int) -> np.ndarray:
     """Which rows to keep: each group's ``n`` most abundant (NaN last,
     ties in row order), as a boolean mask in row order. ``group`` is
     non-decreasing (rows grouped)."""
-    rows = np.arange(group.size, dtype=np.int64)
     key = np.where(np.isnan(abundance), -np.inf, abundance)
-    order = np.lexsort((rows, -key, group))
+    # lexsort is stable, so ties stay in row order without a third key.
+    order = np.lexsort((-key, group))
     g = group[order]
     starts = np.flatnonzero(np.r_[True, g[1:] != g[:-1]]) if g.size else np.empty(0, np.int64)
     rank = np.arange(g.size) - np.repeat(starts, np.diff(np.r_[starts, g.size]))
@@ -539,12 +581,15 @@ def fragment_channels(
     values = np.asarray(abundance.abundance(ions), dtype=np.float64)
     if top is not None:
         keep = select_top(row_query, values, int(top)) & (values > 0)
+        # A precursor with no fragment predicted above its model's floor (a
+        # source's NaN or 0 for every ion) keeps no fragment channel and is
+        # counted; until 2026-11-09 one such precursor aborted the compile,
+        # and the full human space holds about 20.
         empty = np.flatnonzero((counts > 0) & (np.bincount(row_query[keep], minlength=n) == 0))
-        if empty.size:
-            raise ValueError(
-                f"target {ids[int(empty[0])]} (and {empty.size - 1} more) has no fragment ion with a positive "
-                f"abundance to keep"
-            )
+        report = getattr(abundance, "report", None)
+        if isinstance(report, dict):
+            report["no_positive_fragment"] = int(empty.size)
+            report["no_positive_fragment_examples"] = [ids[int(i)] for i in empty[:5]]
         take, row_query, values = take[keep], row_query[keep], values[keep]
         counts = np.bincount(row_query, minlength=n).astype(np.int64)
         offsets = _offsets(counts)
@@ -596,9 +641,15 @@ def _with_model_losses(
     charge = np.concatenate([ladder.charge, free.charge[sel]]).astype(np.int64)
     loss = np.concatenate([ladder.loss.astype(np.int64), remap[free.loss[sel].astype(np.int64)]])
     mz = np.concatenate([ladder.mz, free.mz[sel]])
-    # Ladder order packed in one key; a row in both keeps the ruled ladder's.
-    key = (pep << 40) | (position << 24) | (order_of[ion_type.astype(np.int64)] << 20) | (charge << 16) | loss
-    _, first = np.unique(key, return_index=True)
+    # Ladder order; a row in both keeps the ruled ladder's (the first). The
+    # columns are sorted together, not packed into one integer, which
+    # overflowed past 2**23 peptides in one call.
+    by = np.lexsort((loss, charge, order_of[ion_type.astype(np.int64)], position, pep))
+    sorted_cols = [c[by] for c in (pep, position, order_of[ion_type.astype(np.int64)], charge, loss)]
+    new = np.ones(by.size, dtype=bool)
+    if by.size:
+        new[1:] = np.logical_or.reduce([c[1:] != c[:-1] for c in sorted_cols])
+    first = by[new]
     return LadderArrays(
         offsets=np.searchsorted(pep[first], np.arange(len(peptides) + 1)).astype(np.int64),
         mz=mz[first],

@@ -161,8 +161,11 @@ def censored_log_prob(
     # count==floor to both detection and censoring. This complements
     # poisson_count_log_prob's detection normalizer P(count >= floor) over the
     # same threshold.
+    # A floor may vary by scan or channel (a tensor that broadcasts against
+    # the counts): ``float()`` refused one of more than one element and cut
+    # the gradient (until 2026-11-09).
     a = torch.broadcast_to(
-        torch.as_tensor(float(floor_count), dtype=n_pred_count.dtype),
+        torch.as_tensor(floor_count, dtype=n_pred_count.dtype, device=n_pred_count.device),
         n_pred_count.shape,
     )
     p = torch.special.gammaincc(a, n_pred_count).clamp(min=1e-30)
