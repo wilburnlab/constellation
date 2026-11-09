@@ -186,7 +186,7 @@ def _source(tmp_path: Path, stem: str) -> Path:
     return p
 
 
-def test_convert_writes_the_layout_a_later_build_would(tmp_path, raws):
+def test_convert_writes_the_layout_a_build_afterwards_would(tmp_path, raws):
     from _thermo_fakes import FakeRaw  # noqa: F401
     from constellation.massspec.readers.thermo import _convert
     from test_thermo_batch import PicklingExecutor
@@ -227,10 +227,10 @@ def test_a_failed_convert_leaves_no_finished_layout(tmp_path, raws, monkeypatch)
 
     raws["run"] = _dia_raw(30)
 
-    def broken(bundle, counts):
+    def broken(*args, **kwargs):
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(_convert, "finish_precursor_major", broken)
+    monkeypatch.setattr(_convert, "build_precursor_major", broken)
     with pytest.raises(RuntimeError, match="disk full"):
         convert(_source(tmp_path, "run"), tmp_path / "run")
     assert not (tmp_path / "run" / PRECURSOR_MAJOR_DIR).exists()
@@ -257,3 +257,33 @@ def test_the_command_builds_it_and_says_when_it_is_current(tmp_path, capsys):
     assert main(["massspec", "precursor-major", str(bundle)]) == 0
     assert "current" in capsys.readouterr().out
     assert main(["massspec", "precursor-major", str(tmp_path / "nothing")]) == 2
+
+
+def test_convert_builds_the_layout_after_its_readers_and_before_its_manifest(tmp_path, raws, monkeypatch):
+    """The reading pool (whose workers hold the .NET runtime) is shut before
+    the layout is built, and the manifest that says the bundle is complete
+    is written after it."""
+    from constellation.massspec.readers.thermo import _convert
+    from test_thermo_batch import PicklingExecutor
+
+    events: list[str] = []
+
+    class Recording(PicklingExecutor):
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            events.append("readers shut")
+
+    real = _convert.build_precursor_major
+
+    def build(bundle, **kwargs):
+        events.append("built" if not (bundle / "manifest.json").exists() else "built after the manifest")
+        assert kwargs["workers"] <= _convert.MAX_BUILD_WORKERS
+        return real(bundle, **kwargs)
+
+    monkeypatch.setattr(_convert, "build_precursor_major", build)
+    raws["run"] = _dia_raw(900)
+    done: list[bool] = []
+    job = _convert._Job(_source(tmp_path, "run"), tmp_path / "run", _convert.ConvertOptions(), force=False)
+    _convert._run_jobs([job], workers=8, executor_factory=lambda n: Recording(),
+                       on_done=lambda j: done.append((j.out_dir / "manifest.json").exists()))  # fmt: skip
+    assert job.error is None and events == ["readers shut", "built"]
+    assert done == [True] and find_precursor_major(tmp_path / "run") is not None

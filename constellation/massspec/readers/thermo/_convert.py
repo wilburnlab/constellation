@@ -70,11 +70,7 @@ from constellation.massspec.bundle import (
     PeakWriter,
     part_name,
 )
-from constellation.massspec.precursor_major import (
-    PRECURSOR_MAJOR_DIR,
-    PrecursorMajorWriter,
-    finish_precursor_major,
-)
+from constellation.massspec.precursor_major import MAX_BUILD_WORKERS, PRECURSOR_MAJOR_DIR, build_precursor_major
 
 from . import _read
 from ._scans import CENTROIDERS, DEFAULT_BLOCK_SCANS, THERMO, ReadOptions, iter_scan_blocks
@@ -125,7 +121,9 @@ class ConvertOptions:
     compute_sha256: bool = True
     allow_empty_levels: bool = False
     #: Write the peaks precursor-major too (``massspec.precursor_major``),
-    #: as each range is read, for a search to read by isolation window.
+    #: for a search to read by isolation window: built from the peak parts
+    #: once they are written, by the same build ``massspec precursor-major``
+    #: runs.
     precursor_major: bool = True
 
 
@@ -273,8 +271,6 @@ class _RangeTask:
     part: str | None  # of the peak bundle; None when no peak list is made
     point_part: str | None  # of the profile bundle; None when none is kept
     options: ConvertOptions
-    precursor_major: str | None = None  # the peak bundle's precursor-major directory
-    index: int = 0
 
 
 @dataclass(frozen=True)
@@ -284,7 +280,6 @@ class _RangeResult:
     scans: pa.Table | None
     point_scans: pa.Table | None
     n_scans: int
-    precursor_major: pa.Table | None = None  # per-scan point counts of its part
 
 
 @contextmanager
@@ -308,11 +303,6 @@ def _run_range(task: _RangeTask, on_scans: Callable[[int], None] | None = None) 
     scans: list[pa.Table] = []
     point_scans: list[pa.Table] = []
     n_scans = 0
-    by_precursor = (
-        PrecursorMajorWriter(task.precursor_major, task.index)
-        if task.precursor_major is not None and task.part is not None
-        else None
-    )
     with (
         _part_writer(task.part, width) as peaks,
         _part_writer(task.point_part, width, byte_stream_split=True) as points,
@@ -322,23 +312,18 @@ def _run_range(task: _RangeTask, on_scans: Callable[[int], None] | None = None) 
             max_block_scans=task.options.batch_size,
         ):
             if peaks is not None:
-                table = block.peak_table()
-                peaks.write(table)
+                peaks.write(block.peak_table())
                 scans.append(block.scans)
-                if by_precursor is not None:
-                    by_precursor.write(table, block.scans)
             if points is not None:
                 points.write(block.point_table())
                 point_scans.append(block.point_scans())
             n_scans += block.scans.num_rows
             if on_scans is not None:
                 on_scans(block.scans.num_rows)
-        counts = by_precursor.close() if by_precursor is not None else None
     return _RangeResult(
         _read._concat_scans(scans) if peaks is not None else None,
         _read._concat_scans(point_scans) if points is not None else None,
         n_scans,
-        counts,
     )
 
 
@@ -413,13 +398,15 @@ class _Job:
         self.sha: Future | None = None
         # The peak bundle's manifest, or the profile bundle's if it is alone.
         self.manifest = None
+        #: The peak bundle's manifest writer while its layout waits to be built.
+        self.pending: Callable[[], Any] | None = None
         self.error: BaseException | None = None
         self.n_scans = 0
         self._claimed: list[Path] = []  # directories this conversion has written to
 
     @property
     def done(self) -> bool:
-        return self.manifest is not None or self.error is not None
+        return (self.manifest is not None and self.pending is None) or self.error is not None
 
     def prepare(self, hasher: ThreadPoolExecutor, stop: threading.Event) -> None:
         if not self.src.exists():
@@ -468,8 +455,6 @@ class _Job:
         writes_peaks = self.read.centroider is not None
         if writes_peaks:
             self._claim(self.out_dir, PEAKS_DIR)
-            if self.options.precursor_major:
-                (self.out_dir / PRECURSOR_MAJOR_DIR).mkdir(exist_ok=True)
         if self.read.keep_profile:
             self._claim(self.profile_dir, PROFILE_DIR)
         self.n_scans = max(probe.last - probe.first + 1, 0)
@@ -482,8 +467,6 @@ class _Job:
                 str(self.profile_dir / PROFILE_DIR / part_name(i))
                 if self.read.keep_profile else None,
                 options,
-                str(self.out_dir / PRECURSOR_MAJOR_DIR) if writes_peaks and options.precursor_major else None,
-                i,
             )
             for i, (lo, hi) in enumerate(self.ranges)
         ]
@@ -500,12 +483,16 @@ class _Job:
         parameters: dict[str, Any],
         outputs: dict[str, str],
         sha: str | None,
-        before_manifest: Callable[[], None] | None = None,
+        defer_manifest: bool = False,
         **manifest_kwargs,
     ):
-        """Write a bundle's scan and acquisition metadata, then (after
-        ``before_manifest``, for what depends on the metadata) its manifest."""
+        """Write a bundle's scan and acquisition metadata, then its manifest;
+        with ``defer_manifest``, return what writes the manifest instead,
+        for what has to be written first and depends on the metadata."""
+        import functools
+
         from .manifest import MANIFEST_FILENAME, write_manifest
+
 
         assert self.probe is not None
         levels = _read.level_summary(scans)
@@ -518,13 +505,12 @@ class _Job:
             directory / ACQUISITION_METADATA_FILENAME,
             compression="zstd",
         )
-        if before_manifest is not None:
-            before_manifest()
         read = self.read
         # The manifest carries a summary of the run metadata plus the
         # parameters used. tune_data is omitted (its values are in the
         # acquisition table); its key list says which fields were captured.
-        return write_manifest(
+        write = functools.partial(
+            write_manifest,
             directory / MANIFEST_FILENAME,
             source_file=str(self.src.resolve()),
             source_sha256=sha,
@@ -557,9 +543,13 @@ class _Job:
             },
             **manifest_kwargs,
         )
+        return write if defer_manifest else write()
 
     def finish(self, workers: int):
-        """Write each bundle's metadata and manifest, the profile bundle first."""
+        """Write each bundle's metadata and manifest, the profile bundle first.
+        With a precursor-major layout to build, the peak bundle's manifest
+        waits for it (:meth:`finish_layout`, once the reading pool is shut:
+        its workers hold the .NET runtime, some 1.3 GB each)."""
         assert self.probe is not None
         read = self.read
         writes_peaks = read.centroider is not None
@@ -597,8 +587,7 @@ class _Job:
             )
         if peak_scans is not None:
             by_precursor = self.options.precursor_major
-            counts = [r.precursor_major for r in ordered if r.precursor_major is not None]
-            manifest = self._write_bundle(
+            written = self._write_bundle(
                 self.out_dir, peak_scans, noun="peaks", sha=sha,
                 parameters={
                     "peaks": "centroid",
@@ -607,11 +596,26 @@ class _Job:
                     "profile_bundle": self.profile_dir.name if read.keep_profile else None,
                 },
                 outputs={"peaks": PEAKS_DIR, **({"precursor_major": PRECURSOR_MAJOR_DIR} if by_precursor else {})},
-                before_manifest=(lambda: finish_precursor_major(self.out_dir, counts)) if by_precursor else None,
+                defer_manifest=by_precursor,
             )
+            if by_precursor:
+                self.pending = written
+            else:
+                manifest = written
         self.results.clear()
         self.manifest = manifest
         return manifest
+
+    def finish_layout(self, workers: int):
+        """Build the peak bundle's precursor-major layout from its parts, then
+        write the manifest that says the bundle is complete. Built from the
+        parts after the reading pool is shut, not by the range workers as
+        they read (until 2026-11-09): as fast, and the readers no longer
+        hold their ranges' points to sort them."""
+        build_precursor_major(self.out_dir, workers=min(max(workers, 1), MAX_BUILD_WORKERS), force=True)
+        write, self.pending = self.pending, None
+        self.manifest = write()
+        return self.manifest
 
     def fail(self, error: BaseException) -> None:
         """Record ``error`` and remove what this conversion wrote.
@@ -709,7 +713,8 @@ def _run_jobs(
                             on_scans(job, value.n_scans)
                     if job.complete():
                         job.finish(workers)
-                        finished(job)
+                        if job.pending is None:
+                            finished(job)
                 except Exception as exc:  # noqa: BLE001 - recorded per job
                     job.fail(exc)
                     finished(job)
@@ -729,6 +734,21 @@ def _run_jobs(
     hasher.shutdown(wait=True)
     if inline:
         _close_open_files()
+    # Layouts are built with the reading pool gone, one job at a time.
+    try:
+        for job in jobs:
+            if job.pending is None or job.error is not None:
+                continue
+            try:
+                job.finish_layout(workers)
+            except Exception as exc:  # noqa: BLE001 - recorded per job
+                job.fail(exc)
+            finished(job)
+    except BaseException:
+        for job in jobs:
+            if not job.done:
+                job.fail(RuntimeError("interrupted"))
+        raise
 
 
 def _is_own_algorithm(centroid_algo: str) -> bool:
@@ -804,8 +824,8 @@ def convert(
     always. A failed conversion removes what it wrote. ``workers`` > 1 reads
     ranges of scans in that many processes. ``batch_size`` is the number of
     scans read per block. ``precursor_major`` also writes the peaks ordered
-    by isolation window (``precursor_major/``, what a search reads), as the
-    ranges are read.
+    by isolation window (``precursor_major/``, what a search reads), built
+    from the peak parts in ``workers`` processes once they are written.
 
     ``progress_cb`` receives ``stage_start`` / ``stage_progress`` /
     ``stage_done`` events tagged with stage ``"thermo_convert"``.

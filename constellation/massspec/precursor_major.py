@@ -33,11 +33,14 @@ DDA, native windows or bins) has to be decided:
   changes). :func:`find_precursor_major` returns the layout only while that
   key still holds.
 
-``massspec convert`` writes it as it writes ``peaks/`` (:class:`PrecursorMajorWriter`
-in each range worker); :func:`build_precursor_major` makes it for a bundle
-that has none (an older one, a centroided or imported peak list), from the
-same writer, so the two are the same bytes. Values are the bundle's own:
-no m/z correction is applied (a curve applies where named, as everywhere).
+:func:`build_precursor_major` writes it from a bundle's peak parts, one
+process per part at a time: ``massspec convert`` runs it as its last step
+(unless ``--no-precursor-major``), as do ``centroid`` and the spectra-file
+import, and ``massspec precursor-major BUNDLE`` runs it for any other
+bundle. (Convert's range workers wrote it as they read until 2026-11-09:
+no faster, and each held its range's points to sort them.) Values are the
+bundle's own: no m/z correction is applied (a curve applies where named,
+as everywhere).
 """
 
 from __future__ import annotations
@@ -62,6 +65,7 @@ from constellation.massspec.bundle import peak_paths
 
 __all__ = [
     "LAYOUT_VERSION",
+    "MAX_BUILD_WORKERS",
     "MAX_GROUP_ROWS",
     "MIN_GROUP_ROWS",
     "PRECURSOR_MAJOR_DIR",
@@ -74,6 +78,10 @@ __all__ = [
 ]
 
 PRECURSOR_MAJOR_DIR = "precursor_major"
+#: Processes ``convert`` builds the layout in: on the wide-window run 8 were
+#: no faster than 4 (memory bandwidth), and each holds a peak part's points
+#: (about 1.6 GB for a 9M-point part).
+MAX_BUILD_WORKERS = 4
 LAYOUT_VERSION = 1
 MIN_GROUP_ROWS = 1 << 13
 MAX_GROUP_ROWS = 1 << 16
@@ -91,25 +99,20 @@ def level_dir(level: int) -> str:
 
 class PrecursorMajorWriter:
     """One peak part's points, precursor-major. Fed the part's peaks in
-    stored order (whole scans, ascending), it holds them and writes each
-    level's file sorted on :meth:`close`, which returns every scan's point
-    count (scans without points included, from the scans it was given)."""
+    stored order (scans ascending), it holds them and writes each level's
+    file sorted on :meth:`close`, which returns each scan's point count, a
+    row per run of a scan's points (summed by :func:`finish_precursor_major`)."""
 
     def __init__(self, root: Path | str, index: int) -> None:
         self.root = Path(root)
         self.index = int(index)
         self._rows: dict[int, list[dict[str, np.ndarray]]] = {}
         self._types: dict[str, pa.DataType] = {}
-        self._scans: list[tuple[np.ndarray, np.ndarray]] = []
         self._counts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
-    def write(self, peaks: pa.Table, scans: pa.Table | None = None) -> None:
+    def write(self, peaks: pa.Table) -> None:
         """``peaks``: rows with ``scan``, ``level``, ``mz``, ``intensity``
-        and ``isolation_lower``, in stored order. ``scans``: the scans they
-        come from (``scan``, ``level``), with those that have no points."""
-        if scans is not None:
-            self._scans.append((scans.column("scan").to_numpy().astype(np.int64),
-                                scans.column("level").to_numpy().astype(np.int8)))  # fmt: skip
+        and ``isolation_lower``, in stored order."""
         if peaks.num_rows == 0:
             return
         scan = peaks.column("scan").to_numpy().astype(np.int64)
@@ -144,10 +147,9 @@ class PrecursorMajorWriter:
         return self._count_table()
 
     def _count_table(self) -> pa.Table:
-        """Rows to be summed by (scan, level): each scan given, with 0, and
-        each run of a scan's points, with its rows."""
-        given = [(s, lv, np.zeros(s.size, np.int64)) for s, lv in self._scans]
-        parts = given + self._counts
+        """Rows to be summed by (scan, level): each run of a scan's points,
+        with its rows."""
+        parts = self._counts
         if not parts:
             return pa.table({"scan": pa.array([], pa.int32()), "level": pa.array([], pa.int8()),
                              "n_points": pa.array([], pa.int32())})  # fmt: skip

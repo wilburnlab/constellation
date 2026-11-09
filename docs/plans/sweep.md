@@ -462,8 +462,11 @@ together in stored order) and `ms1/part-RRRRR.parquet` (`mz`, `intensity`, `scan
 m/z), one file per peak part, so no DIA/DDA scheme is decided; `scans.parquet` (every scan's point
 count); a stage key over the peak parts' names, sizes and footers and the scan metadata's. A copy, not
 an index into `peaks/`: Parquet reads pages, and every row group of `peaks/` holds every window.
-`convert` writes it from its range workers (`--no-precursor-major` to skip); `centroid`, the spectra-file
-import and `massspec precursor-major BUNDLE` build it, byte-identical.
+One build writes it (`build_precursor_major`, one process per peak part at a time): `convert` runs it as
+its last step, on by default (`--no-precursor-major` to skip, as `--no-profile` skips the profile), and
+`centroid`, the spectra-file import and `massspec precursor-major BUNDLE` run the same build. It was first
+written by convert's range workers as they read; built afterwards it is as fast and holds far less
+(measurements below; PI, 2026-11-09).
 
 **The sweep** (`sweep(..., layout='precursor_major')`, `sweep.precursor_major`). A unit is a run of
 queries in (precursor m/z, query) order: whole window segments while its cells stay within
@@ -497,7 +500,7 @@ queries, 105M matches): the same summaries.
 | GPF 900–1000 × full human space (526,013 queries, top 10, 0.35 Th, no RT window, MS2, summary) | scan-major estimate ≈ 2.8 h, ≈ 104 GB of matches | 21.7 min on 4 workers, 7.6 GB peak, 27 MB written; 6,490,106,805 matches (the cells holding a peak, as counted independently); 0.61 µs per cell per worker |
 | One unit of that (a 2-minute slice, 105M matches, one process) | 108 s | 42 s: the five-key match sort (57 %) became one combined-key sort (`order_by`), and the point-driven nearest no longer sorts its candidates |
 | Scan-major map on the same slice, 4 workers | 10.5–11 GB per worker | 2.3 GB per worker (flushed per window group, runs capped at `run_rows`) |
-| `convert`, GPF / wide-window, 8 workers | 23–25 s / 49–75 s | 33–36 s / 87–110 s with the layout (the same size as `peaks/`); peak memory about 11 → 17 GB on the wide run |
+| `convert`, GPF / wide-window, 8 workers (two rounds, alternated) | 28–29 s / 60–67 s, 8.6–8.9 / 10.9–11.2 GB | with the layout (the same size as `peaks/`): built afterwards 45–46 s / 101–105 s at 8.5 / 11.0 GB; written by the range workers as they read (first version) 41–43 s / 94–96 s at 10.4–10.6 / 16.8–17.7 GB; byte-identical |
 | The layout built afterwards, 4 workers | `mz_index`: 2 / 12 min | 11 s / about 30 s |
 | Compile of the GPF prediction (526k targets, MS2 top 10) | 76 s (chunked by hand; the compile itself aborted on unpredicted precursors) | 72 s, 3.9 GB from an unsorted file; 56 s, 2.9 GB from one sorted by precursor |
 | Prediction of the GPF library (JChronologer, 4 threads) | 300 s, 7.9 GB | 332 s, 4.8 GB; the same predictions bit for bit, written sorted by precursor |
