@@ -13,6 +13,8 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute  # noqa: F401
+import pyarrow.parquet as pq
 import pytest
 
 import _xic_scan_major_oracle as oracle
@@ -299,3 +301,70 @@ def test_a_plan_of_few_cells_is_still_spread_over_units_by_window(tmp_root):
         assert len(windows) <= 2
     assert pm._block_span(plan) == pytest.approx(20.0)  # half of ±20 s
     assert pm._block_span(compile_queries(_targets(run), levels=[2])) is None
+
+
+# ── review by Codex (2026-11-09) ─────────────────────────────────────
+
+
+def _axis(key: str, shift: float) -> MzAxis:
+    return MzAxis(key=key, table=pa.table({"level": pa.array([1, 1, 2, 2], pa.int8()),
+                                           "mz": [100.0, 2000.0, 100.0, 2000.0],
+                                           "shift_th": [shift] * 4}), parameters={})  # fmt: skip
+
+
+def test_a_later_sweep_in_the_same_process_uses_the_latest_curve(tmp_path):
+    """Workers keep what they read for one sweep only: a curve saved between
+    two sweeps of `latest` is the one the second sweep uses and names."""
+    import os
+
+    run = planted_run(acquisition="dia", cycles=30, window_width=100.0, seed=7)
+    bundle = _bundle(tmp_path, "axes", run.scans)
+    plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
+    settings = SweepSettings(tolerances={1: (0.02, "Da"), 2: (0.02, "Da")}, mz_axis="latest")
+    path = save_mz_axis(bundle, _axis("none", 0.0))
+    first = sweep(bundle, plan, settings, reducers=[XicTraceReducer()], layout="precursor_major")
+    assert first.mz_axis == "none" and first.table("xic_trace").num_rows > 0
+    later = save_mz_axis(bundle, _axis("shifted", 0.3))
+    os.utime(later, ns=(path.stat().st_mtime_ns + 10**9,) * 2)
+    got = sweep(bundle, plan, settings, reducers=[XicTraceReducer()], layout="precursor_major")
+    want = sweep(bundle, plan, settings, reducers=[XicTraceReducer()])
+    assert got.mz_axis == want.mz_axis == "shifted"
+    _same_rows(got.table("xic_trace"), want.table("xic_trace"), "target_id")
+    assert got.table("xic_trace").num_rows != first.table("xic_trace").num_rows
+
+
+def test_a_scan_missing_only_its_upper_bound_is_unbounded_in_both_layouts(tmp_path):
+    """The sweep takes a scan missing either bound as unbounded; the layout
+    must too, or that scan's points are never read for any query."""
+    from constellation.massspec.precursor_major import find_precursor_major
+
+    run = planted_run(acquisition="dia", cycles=30, window_width=100.0, seed=8)
+    scans = [dict(s) for s in run.scans]
+    ms2 = [s for s in scans if s["level"] == 2]
+    for s in ms2[10:14]:
+        s["isolation_upper"] = None  # the lower bound stays
+    bundle = _bundle(tmp_path, "half", scans)
+    lower = pa.concat_tables([pq.read_table(f) for f in find_precursor_major(bundle).files(2)])
+    unbounded = set(lower.filter(pa.compute.is_inf(lower.column("lower"))).column("scan").to_pylist())
+    assert {s["scan"] for s in ms2[10:14]} <= unbounded
+    plan = compile_queries(_targets(run), levels=[2], rt_window=None)
+    got = _check(bundle, plan, SweepSettings(tolerances=_TOL), [XicTraceReducer(), QuerySummaryReducer()])
+    assert got.table("xic_trace").filter(pa.compute.is_in(got.table("xic_trace").column("scan"),
+                                                          value_set=pa.array([s["scan"] for s in ms2[10:14]]))).num_rows > 0  # fmt: skip
+
+
+@pytest.mark.parametrize("layout", ["scan_major", "precursor_major"])
+def test_a_taken_plan_names_its_queries_the_same_on_disk_and_in_memory(tmp_root, tmp_path, layout):
+    run, bundle = _run("dia", tmp_root)
+    whole = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
+    taken = whole.take(np.array([3, 1]))
+    settings = SweepSettings(tolerances=_TOL)
+    names = []
+    for kw in ({}, {"work_dir": tmp_path / "w", "workers": 2}):
+        summary = sweep(bundle, taken, settings, reducers=[QuerySummaryReducer()], layout=layout, **kw)
+        names.append(sorted(summary.table("query_summary").column("query").to_pylist()))
+    assert names == [[1, 3], [1, 3]]
+    taken.write(tmp_path / "plan")
+    from constellation.massspec.sweep.queries import QueryPlan
+
+    np.testing.assert_array_equal(QueryPlan.read(tmp_path / "plan").query_ids, [3, 1])

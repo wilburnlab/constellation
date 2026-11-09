@@ -416,3 +416,19 @@ def test_streamed_fragments_are_written_sorted_by_precursor(tmp_path):
     f = pq.ParquetFile(tmp_path / "f.parquet")
     assert f.metadata.num_row_groups > 1 and _sorted_by_precursor(f)
     assert not any(p.name.startswith(".fragments-") for p in tmp_path.iterdir())
+
+
+def test_a_tolerance_recorded_in_lowercase_daltons_is_daltons(predicted):
+    """EncyclopeDIA's results record `da`: a library annotated at 0.35 da
+    is held to 0.35 Da, not 0.35 ppm (review by Codex)."""
+    shifted = _empirical(predicted, 0.0)
+    f = shifted.fragments
+    mz = f.column("mz_theoretical").to_numpy() + 0.01
+    f = f.set_column(f.schema.get_field_index("mz_theoretical"), "mz_theoretical", pa.array(mz))
+    for unit in ("da", "Da", "DA", "amu"):
+        lib = replace(shifted, fragments=f,
+                      metadata_extras={**shifted.metadata_extras, ANNOTATION_TOLERANCE_KEY: {"value": 0.35, "unit": unit}})  # fmt: skip
+        compile_queries(targets_from_library(lib), levels=[2], fragment_abundance=LibraryFragments.from_library(lib))
+    with pytest.raises(ValueError, match="ppm or Da"):
+        LibraryFragments.from_library(replace(shifted, metadata_extras={
+            **shifted.metadata_extras, ANNOTATION_TOLERANCE_KEY: {"value": 0.35, "unit": "furlongs"}}))

@@ -742,7 +742,8 @@ def project_library_file(
                 "x.massspec.prediction.rt_scale": _rt_scale(con, tables, sources, metadata),
                 **_written_coverage(metadata),
                 # An annotated peak keeps its stored m/z, up to this far from its ion's.
-                **({ANNOTATION_TOLERANCE_KEY: {"value": float(tolerance[0]), "unit": str(tolerance[1])}}
+                **({ANNOTATION_TOLERANCE_KEY: {"value": float(tolerance[0]),
+                                               "unit": "ppm" if str(tolerance[1]).lower() == "ppm" else "Da"}}
                    if annotated else {}),  # fmt: skip
             },
         )

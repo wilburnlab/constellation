@@ -67,15 +67,29 @@ ANNOTATION_TOLERANCE_KEY = "x.massspec.library.annotation_tolerance"
 DEFAULT_ANNOTATION_TOLERANCE: tuple[float, str] = (20.0, "ppm")
 
 
+def _unit(unit: Any) -> str:
+    """``ppm`` or ``Da``, however a source spells it (EncyclopeDIA's results
+    record ``da``; until 2026-11-09 anything but ``Da`` was taken as ppm,
+    so a 0.35 Da annotation was held to 0.35 ppm; review by Codex)."""
+    text = str(unit).strip().lower()
+    if text == "ppm":
+        return "ppm"
+    if text in ("da", "th", "amu"):
+        return "Da"
+    raise ValueError(f"a tolerance unit is ppm or Da, not {unit!r}")
+
+
 def _tolerance(value: Any) -> tuple[float, str] | None:
     if not value:
         return None
     if isinstance(value, str):
         value = json.loads(value)
     if isinstance(value, dict):
-        return float(value["value"]), str(value["unit"])
+        return float(value["value"]), _unit(value["unit"])
     v, unit = value
-    return float(v), str(unit)
+    return float(v), _unit(unit)
+
+
 _COLUMNS = ["precursor_id", "ion_type", "position", "charge", "loss_id", "mz_theoretical", "intensity_predicted"]
 _N_TERMINAL = (int(IonType.A), int(IonType.B), int(IonType.C))
 
@@ -253,7 +267,7 @@ class LibraryFragments:
         if self.coverage:  # computed from the ions: 1e-9 relative is 1e-3 ppm
             excess, limit_text = np.abs(err_ppm) - 1e-3, "1e-3 ppm"
         else:
-            value, unit = self.annotation_tolerance or DEFAULT_ANNOTATION_TOLERANCE
+            value, unit = _tolerance(self.annotation_tolerance or DEFAULT_ANNOTATION_TOLERANCE)
             # The annotation's own test was against the stored m/z; allow the
             # float rounding between that and this ladder.
             excess = (np.abs(err_da) - value * (1 + 1e-9)) if unit == "Da" else (np.abs(err_ppm) - value - 1e-6)

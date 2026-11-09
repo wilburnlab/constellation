@@ -42,7 +42,9 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import uuid
 import weakref
+from dataclasses import replace
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from multiprocessing import get_context
 from pathlib import Path
@@ -53,6 +55,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from constellation.core import stages
 from constellation.core.progress import emit_done, emit_progress, emit_start
 from constellation.massspec.precursor_major import PrecursorMajor, find_precursor_major
 from constellation.massspec.sweep.queries import QueryPlan
@@ -392,27 +395,34 @@ def _block_span(plan: QueryPlan) -> float | None:
 # ── a unit, in a worker ──────────────────────────────────────────────
 
 
-def _worker_state(bundle: str, window, settings):
+def _worker_state(bundle: str, window, settings, sweep_id: str, layout: PrecursorMajor):
+    """What every unit of one sweep shares, read once per process: the
+    ledger, its order and the m/z axis. Kept for one sweep only (its id),
+    with the layout and the curve the parent resolved: until 2026-11-09 it
+    was kept by bundle, range and the literal ``mz_axis``, so a later sweep
+    in the same process with ``latest`` after a new curve was saved used
+    the old curve and named the new one (review by Codex)."""
     from constellation.massspec.sweep.engine import _load_axis
 
-    key = (bundle, window, settings.mz_axis)
-    if _CACHE.get("key") != key:
+    if _CACHE.get("sweep") != sweep_id:
         _CACHE.clear()
         b = Path(bundle)
-        layout = find_precursor_major(b)
-        if layout is None:
-            raise ValueError(f"{b}: its precursor-major layout went stale during the sweep")
+        # The parent checked the layout against the peaks; a layout rebuilt
+        # since then has another key in its marker.
+        if not stages.is_done(layout.root, layout.key):
+            raise ValueError(f"{b}: its precursor-major layout changed during the sweep")
         ledger = _ledger(b, layout, window)
-        _CACHE.update(key=key, layout=layout, ledger=ledger, order=ledger.order(), axis=_load_axis(b, settings))
-    return _CACHE["layout"], _CACHE["ledger"], _CACHE["order"], _CACHE["axis"]
+        _CACHE.update(sweep=sweep_id, ledger=ledger, order=ledger.order(), axis=_load_axis(b, settings))
+    return _CACHE["ledger"], _CACHE["order"], _CACHE["axis"]
 
 
-def _unit_task(bundle: str, work: str, index: int, unit: QueryPlan, settings, reducers, window) -> dict[str, str]:
+def _unit_task(bundle: str, work: str, index: int, unit: QueryPlan, settings, reducers, window, sweep_id: str,
+               layout: PrecursorMajor) -> dict[str, str]:  # fmt: skip
     """Match and reduce one unit; write each output as one part, a row
     group per batch. Returns each output's part."""
     from constellation.massspec.sweep.engine import _batch, _buckets, _map_block, _MapOut, _reduce, outputs_of
 
-    layout, ledger, order, axis = _worker_state(bundle, window, settings)
+    ledger, order, axis = _worker_state(bundle, window, settings, sweep_id, layout)
     blocks = []
     for level in unit.levels:
         channels = unit.channels_for_level(level)
@@ -476,6 +486,10 @@ def sweep_precursor_major(source, plan: QueryPlan, settings, reducers: Sequence,
     bundle = Path(source)
     read_bundle_manifest(bundle)
     axis = _load_axis(bundle, settings)
+    # Workers use the curve resolved here (``latest`` named once), and keep
+    # what they read for this sweep only.
+    settings = replace(settings, mz_axis=None if axis is None else axis.key)
+    sweep_id = uuid.uuid4().hex
     ledger = _ledger(bundle, layout, window)
     units = precursor_units(plan, ledger, settings.unit_cells)
     if work_dir is None:
@@ -502,7 +516,7 @@ def sweep_precursor_major(source, plan: QueryPlan, settings, reducers: Sequence,
             while next_unit < len(units) or pending:
                 while next_unit < len(units) and len(pending) < ahead:
                     future = executor.submit(_unit_task, str(bundle), str(work), next_unit, plan.take(units[next_unit]),
-                                             settings, tuple(reducers), window)  # fmt: skip
+                                             settings, tuple(reducers), window, sweep_id, layout)  # fmt: skip
                     pending[future] = next_unit
                     next_unit += 1
                 finished, _ = wait(list(pending), return_when=FIRST_COMPLETED)

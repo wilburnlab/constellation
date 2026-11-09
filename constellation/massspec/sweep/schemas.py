@@ -24,7 +24,7 @@ from constellation.core.io.schemas import register_schema
 #: distribution and channels may be a top-N selection; the scan ledger
 #: carries each scan's TIC and injection time; the cell view
 #: (:data:`SWEEP_CELL_TABLE`).
-#: 5 (2026-11-09): ``decoy_set`` on queries and the query summary.
+#: 5 (2026-11-09): ``decoy_set`` on queries and the query summary; ``source_query`` on queries.
 SWEEP_SCHEMA_VERSION: int = 5
 
 
@@ -38,6 +38,10 @@ def _meta(name: str) -> dict[bytes, bytes]:
 SWEEP_QUERY_TABLE: pa.Schema = pa.schema(
     [
         pa.field("query", pa.int32(), nullable=False),
+        # The query's number in the plan this one was taken from
+        # (``QueryPlan.take``), which outputs name it by; ``query`` for a
+        # whole plan.
+        pa.field("source_query", pa.int32(), nullable=False),
         pa.field("target_id", pa.int64(), nullable=False),
         pa.field("modified_sequence", pa.string(), nullable=True),
         pa.field("precursor_charge", pa.int8(), nullable=True),

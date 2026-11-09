@@ -287,3 +287,31 @@ def test_convert_builds_the_layout_after_its_readers_and_before_its_manifest(tmp
                        on_done=lambda j: done.append((j.out_dir / "manifest.json").exists()))  # fmt: skip
     assert job.error is None and events == ["readers shut", "built"]
     assert done == [True] and find_precursor_major(tmp_path / "run") is not None
+
+
+def test_the_layout_goes_stale_when_values_move_inside_a_page(tmp_path):
+    """Two intensities swapped inside a page keep a file's size and footer;
+    the layout's key must still change (review by Codex)."""
+    import hashlib
+    import shutil
+
+    scans = dia_scans(cycles=6)
+    bundle = _bundle(tmp_path, "run", scans)
+    build_precursor_major(bundle)
+    swapped = [dict(s) for s in scans]
+    it = swapped[1]["intensity"].copy()
+    it[[1, 2]] = it[[2, 1]]
+    swapped[1]["intensity"] = it
+    other = _bundle(tmp_path / "other", "run", swapped)
+
+    def footer(path):
+        data = path.read_bytes()
+        n = int.from_bytes(data[-8:-4], "little")
+        return len(data), hashlib.sha256(data[-8 - n:]).hexdigest()
+
+    part = sorted((bundle / "peaks").glob("*.parquet"))[0]
+    replacement = sorted((other / "peaks").glob("*.parquet"))[0]
+    assert footer(replacement) == footer(part)  # what the old key saw is the same
+    assert replacement.read_bytes() != part.read_bytes()
+    shutil.copyfile(replacement, part)
+    assert find_precursor_major(bundle) is None

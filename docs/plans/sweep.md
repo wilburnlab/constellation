@@ -460,7 +460,7 @@ ordered by the precursor m/z each can be evidence for: `precursor_major/ms<L>/pa
 `lower`, `scan`, `mz`, `intensity`, sorted by the scan's isolation lower bound, so a scan's points stay
 together in stored order) and `ms1/part-RRRRR.parquet` (`mz`, `intensity`, `scan`, `point`, sorted by
 m/z), one file per peak part, so no DIA/DDA scheme is decided; `scans.parquet` (every scan's point
-count); a stage key over the peak parts' names, sizes and footers and the scan metadata's. A copy, not
+count); a stage key over a digest of every byte of the peak parts and the scan metadata. A copy, not
 an index into `peaks/`: Parquet reads pages, and every row group of `peaks/` holds every window.
 One build writes it (`build_precursor_major`, one process per peak part at a time): `convert` runs it as
 its last step, on by default (`--no-precursor-major` to skip, as `--no-profile` skips the profile), and
@@ -511,6 +511,16 @@ for the scorer would avoid (deferred to the scorer, which decides their shape; P
 wide-window run against the full space unscheduled (about 177B cells, estimated 45–60 min on 4–8
 workers) and the full space predicted (9.56M precursors, about 100 min at 4 threads), both beyond this
 machine's run budget; nothing measured suggests either would not fit in memory.
+
+**Review by Codex (2026-11-09).** Five defects, each fixed with a test that fails on the code before:
+a precursor-major sweep's workers kept what they read by bundle, range and the literal `mz_axis`, so a
+second sweep in the same process with `latest` used an older curve and named the newer one (now kept
+for one sweep, with the curve and layout the parent resolved); the layout's key hashed each peak part's
+size and footer, which two values swapped inside a page keep (now xxh3-128 of every byte, about 1 s for
+the wide-window run's 2 GB); a scan missing only its upper isolation bound kept a finite `lower`, so its
+points were never read for the queries the sweep holds it eligible for (layout version 2: either bound
+missing is unbounded); a library's annotation tolerance recorded as `da` was read as ppm; and a plan
+taken from another lost its query numbers on disk (`source_query` on `SWEEP_QUERY_TABLE`).
 
 ## Still to do
 

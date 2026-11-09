@@ -15,7 +15,8 @@ scans), so the build is the conversion's ranges and no scheme (DIA or
 DDA, native windows or bins) has to be decided:
 
 - ``ms<L>/part-RRRRR.parquet`` for L ≥ 2: ``lower`` (the scan's isolation
-  lower bound; -inf for a scan with none), ``scan``, ``mz``, ``intensity``,
+  lower bound; -inf for a scan missing either bound, which the sweep
+  treats as unbounded), ``scan``, ``mz``, ``intensity``,
   stably sorted by ``lower``, so each scan's points stay together and in
   stored order (a point's position among its scan's rows is its stored
   position). A row group closes where ``lower`` changes once it holds
@@ -27,11 +28,12 @@ DDA, native windows or bins) has to be decided:
 - ``scans.parquet``: every scan's ``scan``, ``level`` and ``n_points``,
   scans without points included.
 - ``manifest.json`` and ``_SUCCESS``, whose stage key covers the layout
-  version and each peak part's name, size and footer, and
-  ``scan_metadata.parquet``'s (not the source's SHA-256, which every peak
+  version and a digest (xxh3-128) of every byte of each peak part and of
+  ``scan_metadata.parquet`` (not the source's SHA-256, which every peak
   list of one ``.raw`` shares, nor modification times, which a copy
-  changes). :func:`find_precursor_major` returns the layout only while that
-  key still holds.
+  changes; a file's size and footer were not enough, as two values swapped
+  inside a page keep both). :func:`find_precursor_major` returns the
+  layout only while that key still holds.
 
 :func:`build_precursor_major` writes it from a bundle's peak parts, one
 process per part at a time: ``massspec convert`` runs it as its last step
@@ -45,7 +47,6 @@ as everywhere).
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from collections.abc import Iterable
@@ -82,7 +83,11 @@ PRECURSOR_MAJOR_DIR = "precursor_major"
 #: no faster than 4 (memory bandwidth), and each holds a peak part's points
 #: (about 1.6 GB for a 9M-point part).
 MAX_BUILD_WORKERS = 4
-LAYOUT_VERSION = 1
+#: 2 (2026-11-09): a scan missing either isolation bound is stored as
+#: unbounded (``lower`` -inf), as the sweep treats it; version 1 kept a
+#: finite ``lower`` when only the upper bound was missing, and its points
+#: were never read for that scan's queries.
+LAYOUT_VERSION = 2
 MIN_GROUP_ROWS = 1 << 13
 MAX_GROUP_ROWS = 1 << 16
 SCANS_FILENAME = "scans.parquet"
@@ -111,8 +116,8 @@ class PrecursorMajorWriter:
         self._counts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
     def write(self, peaks: pa.Table) -> None:
-        """``peaks``: rows with ``scan``, ``level``, ``mz``, ``intensity``
-        and ``isolation_lower``, in stored order."""
+        """``peaks``: rows with ``scan``, ``level``, ``mz``, ``intensity``,
+        ``isolation_lower`` and ``isolation_upper``, in stored order."""
         if peaks.num_rows == 0:
             return
         scan = peaks.column("scan").to_numpy().astype(np.int64)
@@ -122,11 +127,14 @@ class PrecursorMajorWriter:
         # one list per level.
         for name in ("mz", "intensity"):
             self._types.setdefault(name, peaks.schema.field(name).type)
+        lower = peaks.column("isolation_lower").to_numpy(zero_copy_only=False).astype(np.float64)
+        upper = peaks.column("isolation_upper").to_numpy(zero_copy_only=False).astype(np.float64)
         cols = {
             "scan": scan.astype(np.int32),
             "mz": peaks.column("mz").to_numpy(),
             "intensity": peaks.column("intensity").to_numpy(),
-            "lower": peaks.column("isolation_lower").to_numpy(zero_copy_only=False).astype(np.float64),
+            # Missing either bound is unbounded, as the sweep's schedule has it.
+            "lower": np.where(np.isnan(lower) | np.isnan(upper), -np.inf, lower),
         }
         levels = np.unique(level)
         for lv in levels.tolist():
@@ -177,7 +185,7 @@ def _replace_into(table_writes, path: Path, schema: pa.Schema) -> None:
 
 
 def _write_fragments(rows: dict[str, np.ndarray], path: Path, types: dict[str, pa.DataType]) -> None:
-    lower = np.where(np.isnan(rows["lower"]), -np.inf, rows["lower"])
+    lower = rows["lower"]
     # A run's scans have few distinct windows: sort their codes, which a
     # stable sort of small integers does in linear time.
     windows, code = np.unique(lower, return_inverse=True)
@@ -228,26 +236,31 @@ def _write_ms1(rows: dict[str, np.ndarray], path: Path, types: dict[str, pa.Data
 # ── the whole layout ─────────────────────────────────────────────────
 
 
-def _footer_digest(path: Path) -> str:
-    """A Parquet file's footer (its row groups' sizes, offsets and statistics)
-    and size, digested: what changes when its content does."""
-    size = path.stat().st_size
+def _content_digest(path: Path) -> str:
+    """xxh3-128 of a file's bytes: the project's digest of content too large
+    for 64 bits (CLAUDE.md, "Content-derived ids"); about 2 GB/s here, where
+    SHA-256 ran at 350 MB/s (7 s for the wide-window run's peaks, at every
+    sweep's start)."""
+    import xxhash
+
+    digest = xxhash.xxh3_128()
     with open(path, "rb") as f:
-        f.seek(max(size - 8, 0))
-        tail = f.read(8)
-        footer_len = int.from_bytes(tail[:4], "little") if len(tail) == 8 else 0
-        f.seek(max(size - 8 - footer_len, 0))
-        footer = f.read()
-    return f"{size}:{hashlib.blake2b(footer, digest_size=16).hexdigest()}"
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            digest.update(chunk)
+    return f"{path.stat().st_size}:{digest.hexdigest()}"
 
 
 def layout_key(bundle: Path | str) -> str:
     """The stage key of a bundle's precursor-major layout: the layout
-    version, each peak part (name, size, footer) and the scan metadata."""
+    version and a digest of every byte of each peak part and of the scan
+    metadata. Until 2026-11-09 each file's size and Parquet footer stood in
+    for its bytes, and two intensities swapped inside a page kept both, so
+    an obsolete layout passed as current (review by Codex). About a second
+    for 2 GB of peaks, paid once by a sweep's parent and once by a build."""
     bundle = Path(bundle)
-    parts = [[p.name, _footer_digest(p)] for p in peak_paths(bundle)]
+    parts = [[p.name, _content_digest(p)] for p in peak_paths(bundle)]
     return stages.stage_key(
-        layout=LAYOUT_VERSION, peaks=parts, scan_metadata=_footer_digest(bundle / "scan_metadata.parquet")
+        layout=LAYOUT_VERSION, peaks=parts, scan_metadata=_content_digest(bundle / "scan_metadata.parquet")
     )
 
 
@@ -327,7 +340,7 @@ def find_precursor_major(bundle: Path | str) -> PrecursorMajor | None:
 
 # ── building one for an existing bundle ──────────────────────────────
 
-_COLUMNS = ["scan", "level", "mz", "intensity", "isolation_lower"]
+_COLUMNS = ["scan", "level", "mz", "intensity", "isolation_lower", "isolation_upper"]
 
 
 def _build_part(part: str, root: str, index: int) -> pa.Table:

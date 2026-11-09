@@ -138,6 +138,7 @@ class QueryPlan:
         queries = pa.table(
             {
                 "query": pa.array(np.arange(self.n_queries, dtype=np.int32)),
+                "source_query": pa.array(self.global_query(np.arange(self.n_queries)).astype(np.int32)),
                 "target_id": t.column("target_id"),
                 "modified_sequence": t.column("modified_sequence"),
                 "precursor_charge": pa.array(charge.astype(np.int8), mask=charge < 0),
@@ -259,7 +260,19 @@ class QueryPlan:
             fragment_abundance=(
                 json.loads(meta[_ABUNDANCE_KEY].decode()) if _ABUNDANCE_KEY in meta else dict(UNMODELLED.describe())
             ),
+            query_ids=_source_queries(queries),
         )
+
+
+def _source_queries(queries: pa.Table) -> np.ndarray | None:
+    """A plan taken from another's query numbers there (None when they are
+    its own). Until 2026-11-09 a plan on disk forgot them, so a taken plan
+    swept on disk named its queries 0, 1, ... and in memory by their
+    numbers in the whole plan (review by Codex)."""
+    if "source_query" not in queries.column_names:
+        return None
+    ids = queries.column("source_query").to_numpy().astype(np.int64)
+    return None if np.array_equal(ids, np.arange(ids.size)) else ids
 
 
 def _channel_table(c: Channels) -> pa.Table:
