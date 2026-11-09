@@ -516,6 +516,22 @@ def _check_outputs(reducers: Sequence[Reducer], settings: SweepSettings) -> None
             seen[name] = r.name
 
 
+def _check_gate(plan: QueryPlan, settings: SweepSettings) -> None:
+    """Refuse a gate no query could pass: the gate counts distinct fragment
+    ions, so a plan keeping fewer than ``min_fragments`` channels per query
+    passes nothing (until 2026-11-09 a top 5 passed 0 of 1,756 targets
+    with no word)."""
+    gate = settings.gate
+    top = getattr(plan.settings, "top_fragments", None)
+    if gate is None or top is None or not any(level > 1 for level in plan.levels):
+        return
+    if top < gate.min_fragments:
+        raise ValueError(
+            f"the plan keeps the top {top} fragments of each query, fewer than the gate's min_fragments "
+            f"{gate.min_fragments}: no query could pass"
+        )
+
+
 def sweep(
     source: Path | str | pa.Table,
     plan: QueryPlan,
@@ -553,6 +569,7 @@ def sweep(
     output's metadata (``x.massspec.sweep.scan_range``).
     """
     _check_outputs(reducers, settings)
+    _check_gate(plan, settings)
     if scan_range is not None and rt_range is not None:
         raise ValueError("give a scan_range or an rt_range, not both")
     window = _window(source, scan_range, rt_range)

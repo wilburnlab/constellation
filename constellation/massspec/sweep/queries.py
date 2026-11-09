@@ -112,6 +112,7 @@ class QueryPlan:
                 "precursor_id": t.column("precursor_id"),
                 "peptide_id": t.column("peptide_id"),
                 "is_decoy": t.column("is_decoy"),
+                "decoy_set": t.column("decoy_set"),
             },
             schema=SWEEP_QUERY_TABLE,
         )
@@ -191,6 +192,10 @@ class QueryPlan:
                         "precursor_id": queries.column("precursor_id"),
                         "peptide_id": queries.column("peptide_id"),
                         "is_decoy": queries.column("is_decoy"),
+                        **(
+                            {"decoy_set": queries.column("decoy_set")}
+                            if "decoy_set" in queries.column_names else {}
+                        ),
                     }
                 ),
                 XIC_TARGET_TABLE,
@@ -378,7 +383,11 @@ def compile_queries(
         peptide = np.where(present, np.nan_to_num(np.asarray(at, dtype=np.float64), nan=-1), -1).astype(np.int64)
     charge_col = t.column("precursor_charge")
     precursor_charge = charge_col.fill_null(-1).to_numpy().astype(np.int16)
-    has_charge = precursor_charge >= 0
+    # A charge below 1 is no charge (-1 here, null on disk). Until 2026-11-09
+    # charge 0 counted as one: its precursor m/z came out infinite and the
+    # query was never matched at MS2, with no word.
+    precursor_charge[precursor_charge < 1] = -1
+    has_charge = precursor_charge >= 1
 
     # Fragments are checked first and in target order, as the extractor did
     # before matching anything; they are the only errors raised before MS1's.

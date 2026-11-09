@@ -322,6 +322,18 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     coverage = getattr(source, "coverage", None) or {}
+    if args.fragment_abundance == "library" and not coverage and 2 in levels and (
+        args.ion_types is None or args.max_fragment_charge is None
+    ):
+        # Until 2026-11-09 this fell back to b/y at fragment charge 2, which
+        # cost 13-16 % of 3+/4+ precursors an ion of their top 10.
+        print(
+            "error: the fragment library records no coverage (which ion series and fragment charges its "
+            "spectra speak for; an empirical library's do not say): give --ion-types and "
+            "--max-fragment-charge",
+            file=sys.stderr,
+        )
+        return 2
     # A library's model says which ions it speaks for: unless told
     # otherwise, its ion series and charge ceiling are the channels'.
     ion_types = _resolve_ion_types(args.ion_types or ",".join(coverage.get("ion_types") or ["b", "y"]))
@@ -399,6 +411,14 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
             max_gap_s=args.max_gap_s,
             min_isotopes=args.min_isotopes,
         )
+    if gate is not None and 2 in levels and settings.top_fragments is not None \
+            and settings.top_fragments < gate.min_fragments:  # fmt: skip
+        print(
+            f"error: --top-fragments {settings.top_fragments} keeps fewer ions than the gate's "
+            f"--min-fragments {gate.min_fragments}, so no query could pass",
+            file=sys.stderr,
+        )
+        return 2
     if args.only_passing and gate is None:
         print("error: --only-passing needs a gate (--gate, or --min-fragments and friends)", file=sys.stderr)
         return 2

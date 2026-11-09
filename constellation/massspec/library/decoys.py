@@ -208,12 +208,20 @@ def peptide_decoys(
     method = DECOY_METHODS[decoy_set.method]
     if method.level != "peptide" or method.orders is None:
         raise ValueError(f"{decoy_set.method} is not a peptide-level method")
-    # Each target sequence's order is decided once, in sorted sequence order:
-    # two sequences can propose the same decoy, and which keeps it must not
-    # depend on the order the FASTA listed them in.
+    # The order is decided once per I/L class of target sequences, in sorted
+    # order: two sequences can propose the same decoy, and which keeps it
+    # must not depend on the order the FASTA listed them in. Targets that
+    # differ only by I/L have one mass and one spectrum, so their decoys
+    # take one order and are I/L twins too; until 2026-11-09 the second
+    # twin's proposal collided with the first's and fell back to a shuffle,
+    # so one signal counted for two targets against two unrelated decoys.
+    classes: dict[str, list[str]] = {}
+    for seq in sorted({pf.sequence for pf in targets}):
+        classes.setdefault(il_key(seq), []).append(seq)
     chosen: dict[str, list[int] | None] = {}  # target sequence → order (None: dropped)
     n_fallback = n_dropped = 0
-    for seq in sorted({pf.sequence for pf in targets}):
+    for members in classes.values():
+        seq = members[0]
         pick = None
         for attempt, order in enumerate(method.orders(seq, decoy_set.index, decoy_set.seed)):
             candidate = il_key("".join(seq[k] for k in order))
@@ -222,7 +230,8 @@ def peptide_decoys(
                 n_fallback += attempt > 0
                 taken.add(candidate)
                 break
-        chosen[seq] = pick
+        for member in members:
+            chosen[member] = pick
     made: set[str] = set()
     target: list[int] = []
     decoy: list[Peptidoform] = []

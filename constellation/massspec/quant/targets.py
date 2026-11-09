@@ -67,15 +67,17 @@ def _sentinel_to_null(
 
 
 def _attach_modseq(precursors: pa.Table, peptides: pa.Table | None) -> pa.Table:
-    """Left-join ``modified_sequence`` (and ``is_decoy`` where the peptide
-    table has it) from a peptide table onto precursors, keeping the
+    """Left-join ``modified_sequence`` (and ``is_decoy`` / ``decoy_set``
+    where the peptide table has them) from a peptide table onto precursors, keeping the
     precursors' order: query numbers downstream are row positions, and
     ``Table.join`` does not promise an order."""
     if peptides is None or "modified_sequence" not in peptides.column_names:
         return precursors.append_column(
             "modified_sequence", pa.nulls(precursors.num_rows, pa.string())
         )
-    cols = ["peptide_id", "modified_sequence"] + (["is_decoy"] if "is_decoy" in peptides.column_names else [])
+    cols = ["peptide_id", "modified_sequence"] + [
+        c for c in ("is_decoy", "decoy_set") if c in peptides.column_names
+    ]
     pep = peptides.select(cols)
     row = "__row__"
     joined = precursors.append_column(row, pa.array(np.arange(precursors.num_rows, dtype=np.int64))).join(
@@ -129,7 +131,7 @@ def targets_from_library(library: object) -> pa.Table:
             "rt_center": rt if on_run_clock else pa.nulls(joined.num_rows, pa.float64()),
             "precursor_id": joined.column("precursor_id"),
             "peptide_id": joined.column("peptide_id"),
-            **({"is_decoy": joined.column("is_decoy")} if "is_decoy" in joined.column_names else {}),
+            **{c: joined.column(c) for c in ("is_decoy", "decoy_set") if c in joined.column_names},
             "rt_library": rt,
             "rt_scale": pa.array([scale] * joined.num_rows, pa.string()),
         }

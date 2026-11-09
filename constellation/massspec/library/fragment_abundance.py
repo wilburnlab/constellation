@@ -50,10 +50,32 @@ import pyarrow.parquet as pq
 from constellation.massspec.peptide.channels import CandidateIons
 from constellation.massspec.peptide.ions import IonType
 
-__all__ = ["COVERAGE_KEY", "LibraryFragments"]
+__all__ = ["ANNOTATION_TOLERANCE_KEY", "COVERAGE_KEY", "DEFAULT_ANNOTATION_TOLERANCE", "LibraryFragments"]
 
 #: Where ``predict-library`` records what its fragment model covers.
 COVERAGE_KEY = "x.massspec.prediction.fragment_coverage"
+#: Where a library read from a file of observed spectra records the
+#: tolerance its peaks were annotated at (``{"value": ..., "unit": "ppm"|"Da"}``):
+#: an annotated peak's m/z is its stored one, so it differs from the ion's
+#: by up to that much.
+ANNOTATION_TOLERANCE_KEY = "x.massspec.library.annotation_tolerance"
+#: What an EncyclopeDIA library's peaks are annotated at
+#: (``io.encyclopedia``'s ``fragment_tolerance_ppm``), and so the check on a
+#: library that records neither a coverage nor its own tolerance. Until
+#: 2026-11-09 it was 5 ppm, which refused the lab's chromatogram library
+#: (62 rows up to 19.6 ppm).
+DEFAULT_ANNOTATION_TOLERANCE: tuple[float, str] = (20.0, "ppm")
+
+
+def _tolerance(value: Any) -> tuple[float, str] | None:
+    if not value:
+        return None
+    if isinstance(value, str):
+        value = json.loads(value)
+    if isinstance(value, dict):
+        return float(value["value"]), str(value["unit"])
+    v, unit = value
+    return float(v), str(unit)
 _COLUMNS = ["precursor_id", "ion_type", "position", "charge", "loss_id", "mz_theoretical", "intensity_predicted"]
 _N_TERMINAL = (int(IonType.A), int(IonType.B), int(IonType.C))
 
@@ -64,29 +86,36 @@ class LibraryFragments:
     docstring). ``source`` is a ``LIBRARY_FRAGMENT_TABLE`` or the path of
     a Parquet file of one; ``coverage`` the model's coverage record (None
     for an empirical library); ``predicted`` the precursor ids the library
-    speaks for (None: those with a fragment row)."""
+    speaks for (None: those with a fragment row); ``annotation_tolerance``
+    how far an empirical library's annotated m/z may sit from the ion's
+    (``(value, 'ppm'|'Da')``; None: what the library records, else
+    :data:`DEFAULT_ANNOTATION_TOLERANCE`). A predicted library (one with a
+    coverage) computed its m/z from the ions and is held to 1e-3 ppm."""
 
     source: pa.Table | Path
     coverage: dict[str, Any] | None = None
     predicted: np.ndarray | None = None
-    mz_tolerance_ppm: float = 5.0
+    annotation_tolerance: tuple[float, str] | None = None
     label: str = ""
     report: dict[str, Any] = field(default_factory=dict)
     ranks: bool = field(default=True, init=False)
 
     @classmethod
-    def from_library(cls, library, *, mz_tolerance_ppm: float = 5.0) -> LibraryFragments:
+    def from_library(cls, library, *, annotation_tolerance: tuple[float, str] | None = None) -> LibraryFragments:
         """From a ``Library`` held in memory."""
+        extras = library.metadata_extras or {}
         return cls(
             source=library.fragments,
-            coverage=(library.metadata_extras or {}).get(COVERAGE_KEY),
+            coverage=extras.get(COVERAGE_KEY),
             predicted=library.precursors.column("precursor_id").to_numpy(),
-            mz_tolerance_ppm=mz_tolerance_ppm,
+            annotation_tolerance=annotation_tolerance or _tolerance(extras.get(ANNOTATION_TOLERANCE_KEY)),
             label="library",
         )
 
     @classmethod
-    def from_directory(cls, path: Path | str, *, mz_tolerance_ppm: float = 5.0) -> LibraryFragments:
+    def from_directory(
+        cls, path: Path | str, *, annotation_tolerance: tuple[float, str] | None = None
+    ) -> LibraryFragments:
         """From a library directory (``parquet_dir``, what ``predict-library``
         writes as ``library_pqdir``, or the prediction directory holding
         one), reading its fragments only for the precursors asked about."""
@@ -101,7 +130,8 @@ class LibraryFragments:
         if pq.read_metadata(root / "fragments.parquet").num_rows == 0:
             raise ValueError(f"{root}/fragments.parquet is empty: the library has no fragment intensities")
         return cls(source=root / "fragments.parquet", coverage=metadata.get(COVERAGE_KEY),
-                   predicted=precursors.to_numpy(), mz_tolerance_ppm=mz_tolerance_ppm, label=str(root))  # fmt: skip
+                   predicted=precursors.to_numpy(), label=str(root),
+                   annotation_tolerance=annotation_tolerance or _tolerance(metadata.get(ANNOTATION_TOLERANCE_KEY)))  # fmt: skip
 
     # ── the FragmentAbundance contract ────────────────────────────────
 
@@ -185,14 +215,24 @@ class LibraryFragments:
         cand = order[_ragged(first, counts)]
         row_of = np.repeat(np.flatnonzero(hit), counts)
         theo = ions.mz[cand]
-        err_ppm = (r_mz[row_of] - theo) / theo * 1e6
+        err_da = r_mz[row_of] - theo
+        err_ppm = err_da / theo * 1e6
         worst = float(np.abs(err_ppm).max()) if err_ppm.size else 0.0
         report["max_mz_error_ppm"] = worst
-        limit = 1e-3 if self.coverage else float(self.mz_tolerance_ppm)  # 1e-9 relative is 1e-3 ppm
-        if worst > limit:
-            bad = int(np.argmax(np.abs(err_ppm)))
+        if self.coverage:  # computed from the ions: 1e-9 relative is 1e-3 ppm
+            excess, limit_text = np.abs(err_ppm) - 1e-3, "1e-3 ppm"
+        else:
+            value, unit = self.annotation_tolerance or DEFAULT_ANNOTATION_TOLERANCE
+            # The annotation's own test was against the stored m/z; allow the
+            # float rounding between that and this ladder.
+            excess = (np.abs(err_da) - value * (1 + 1e-9)) if unit == "Da" else (np.abs(err_ppm) - value - 1e-6)
+            limit_text = f"{value:g} {unit}"
+        report["annotation_tolerance"] = limit_text
+        if excess.size and float(excess.max()) > 0:
+            bad = int(np.argmax(excess))
             raise ValueError(
-                f"library fragment m/z differs from the query's ladder by {worst:.3g} ppm (precursor "
+                f"library fragment m/z differs from the query's ladder by {abs(float(err_ppm[bad])):.3g} ppm, "
+                f"beyond the library's {limit_text} (precursor "
                 f"{int(r_key[row_of[bad]])}, ion type {IonType(int(r_type[row_of[bad]])).name.lower()}, position "
                 f"{int(r_pos[row_of[bad]])}, charge {int(r_charge[row_of[bad]])}): the library and the query "
                 f"describe different molecules (labels, modifications)"

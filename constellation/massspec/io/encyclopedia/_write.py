@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import os
 import warnings
+import json
 import zlib
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
@@ -90,6 +91,7 @@ from constellation.massspec.io.encyclopedia._schema import (
     LIBRARY_INDEXES,
     LIBRARY_TABLES,
 )
+from constellation.massspec.library.fragment_abundance import COVERAGE_KEY
 from constellation.massspec.library.library import Library
 from constellation.massspec.quant.quant import Quant
 from constellation.massspec.search.search import Search
@@ -137,7 +139,10 @@ def write_encyclopedia(
             sources = _sources(quant, search)
             n_observed, n_library = _write_entries(con, library, names, sources, quant, search, upstream)
             _write_peptidetoprotein(con, library)
-            _write_metadata(con, upstream, _written_rt_scale(library, n_observed, n_library, p.name))
+            _write_metadata(
+                con, upstream, _written_rt_scale(library, n_observed, n_library, p.name),
+                (library.metadata_extras or {}).get(COVERAGE_KEY),
+            )
             if search is not None:
                 _write_peptidescores(con, library, names, sources, search, upstream)
                 _write_proteinscores(con, library, sources, search)
@@ -437,11 +442,17 @@ RT_SCALE_KEY = "x.massspec.prediction.rt_scale"
 #: The scale of a run's own seconds (``massspec.quant.targets.OBSERVED``).
 OBSERVED_RT_SCALE = "observed"
 RT_SCALE_ROW = "constellation_rt_scale"
+#: The library's ``x.massspec.prediction.fragment_coverage`` (JSON), so a
+#: predicted library written and read back still tells an ion its model
+#: covers and did not report (abundance 0) from one it does not cover
+#: (NaN). Until 2026-11-09 it was lost, and a round trip turned 91,008 of
+#: 132,644 channels of a predicted library from 0 to NaN.
+COVERAGE_ROW = "constellation_fragment_coverage"
 
-_OWN_KEYS = ("version", "constellation_writer_version", "created_iso", RT_SCALE_ROW)
+_OWN_KEYS = ("version", "constellation_writer_version", "created_iso", RT_SCALE_ROW, COVERAGE_ROW)
 
 
-def _write_metadata(con: Any, upstream: dict[str, Any], rt_scale: Any = None) -> None:
+def _write_metadata(con: Any, upstream: dict[str, Any], rt_scale: Any = None, coverage: Any = None) -> None:
     rows: list[tuple[str, str]] = [
         ("version", LIBRARY_CONTAINER_VERSION),
         ("constellation_writer_version", WRITER_VERSION),
@@ -449,6 +460,8 @@ def _write_metadata(con: Any, upstream: dict[str, Any], rt_scale: Any = None) ->
     ]
     if rt_scale:
         rows.append((RT_SCALE_ROW, str(rt_scale)))
+    if coverage:
+        rows.append((COVERAGE_ROW, coverage if isinstance(coverage, str) else json.dumps(coverage, sort_keys=True)))
     # The metadata of the file the library was read from (the settings a
     # search recorded, among them), kept as it was.
     rows += [(str(k), str(v)) for k, v in upstream.items() if k not in _OWN_KEYS]
