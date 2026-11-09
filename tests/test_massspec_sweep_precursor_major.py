@@ -277,3 +277,25 @@ def test_the_gate_decided_first_changes_no_output_and_matches_only_what_passed(t
     passed = int(np.sum(summary.column("passed").to_numpy(zero_copy_only=False)))
     assert 0 < passed < plan.n_queries
     assert matched == passed  # only what passed was matched
+
+
+def test_a_plan_of_few_cells_is_still_spread_over_units_by_window(tmp_root):
+    """RT-windowed targets hold few cells: they must not become one task.
+    A unit stops at a window bound once its windows hold enough points,
+    and its blocks span about half a target's RT window."""
+    from constellation.massspec.sweep import precursor_major as pm
+
+    run, bundle = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
+    ledger = pm._ledger(bundle, pm.find_precursor_major(bundle), None)
+    one = pm.precursor_units(plan, ledger, 1 << 40, unit_points=1 << 40)
+    by_window = pm.precursor_units(plan, ledger, 1 << 40, unit_points=1)
+    assert len(by_window) > len(one) >= 1
+    index = ledger.window_index(2)
+    for unit in by_window:
+        pmz = plan.precursor_mz[unit]
+        windows = {w for w, (lo, hi) in enumerate(zip(index.lower, index.upper, strict=True))
+                   if ((lo <= pmz) & (pmz <= hi)).any()}  # fmt: skip
+        assert len(windows) <= 2
+    assert pm._block_span(plan) == pytest.approx(20.0)  # half of ±20 s
+    assert pm._block_span(compile_queries(_targets(run), levels=[2])) is None

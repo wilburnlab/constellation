@@ -110,13 +110,29 @@ def _ledger(bundle: Path, layout: PrecursorMajor, window: tuple[int, int] | None
 # ── units ─────────────────────────────────────────────────────────────
 
 
-def precursor_units(plan: QueryPlan, ledger: Ledger, unit_cells: int) -> list[np.ndarray]:
-    """The plan's queries in units: runs in (precursor m/z, query) order of
-    about ``unit_cells`` eligible cells each, cut at a window bound where
-    one lies in the last half of a unit; queries without a precursor m/z
-    after the rest. Each unit's queries in (precursor m/z, query) order,
-    which a unit's batches keep, so a batch touches a window or two. Every
-    query is in one."""
+#: A unit's cell budget is at most the plan's cells over this, so a plan
+#: of few cells (RT-windowed targets) is still spread over units (and so
+#: workers), never one task; at least ``_MIN_UNIT_CELLS``.
+UNIT_SPLIT = 16
+_MIN_UNIT_CELLS = 1 << 20
+#: The points a unit's windows may hold before it stops at a window bound:
+#: a batch's point-side work is its windows' points, so a unit grows by
+#: whole windows only while that stays small (one DIA window, or thousands
+#: of DDA windows).
+UNIT_POINTS = 1 << 22
+
+
+def precursor_units(plan: QueryPlan, ledger: Ledger, unit_cells: int,
+                    unit_points: int = UNIT_POINTS) -> list[np.ndarray]:  # fmt: skip
+    """The plan's queries in units, in (precursor m/z, query) order: each
+    unit a run of whole window segments (the queries between two
+    consecutive window bounds) while its cells stay within the budget
+    (``unit_cells``, or the plan's cells over :data:`UNIT_SPLIT` when that
+    is less) and its segments' windows' points within ``unit_points``; a
+    segment over the budget is cut by cells alone. Queries without a
+    precursor m/z come after the rest, cut by cells. The cut depends on
+    the plan and the run, never on the workers. A unit's batches keep its
+    order, so a batch touches a window or two. Every query is in one."""
     n = plan.n_queries
     if n == 0:
         return []
@@ -126,33 +142,68 @@ def precursor_units(plan: QueryPlan, ledger: Ledger, unit_cells: int) -> list[np
         channels = plan.channels_for_level(level)
         if channels is not None:
             cells += eligible_counts(plan, ledger, level, every) * channels.counts()
+    budget = int(min(unit_cells, max(-(-int(cells.sum()) // UNIT_SPLIT), _MIN_UNIT_CELLS)))
     order = plan.precursor_order
     pmz = plan.precursor_mz[order]
     finite = int(np.count_nonzero(~np.isnan(pmz)))
+    weight = cells[order] + 1
     frag = next((lv for lv in plan.levels if lv > 1), None)
-    bounds = np.empty(0)
+    segment = np.zeros(finite, np.int64)
+    points = np.zeros(finite, np.float64)
     if frag is not None:
         index = ledger.window_index(frag)
         bounded = ~index.unbounded
-        bounds = np.unique(np.concatenate([index.lower[bounded], index.upper[bounded]]))
-    # Which side of every window bound a query lies on: a cut between two
-    # queries of different segments is a cut at a bound.
-    segment = np.searchsorted(bounds, pmz[:finite], side="right")
-    weight = np.cumsum(cells[order] + 1)
-    units = []
-    for lo, hi, snap in ((0, finite, True), (finite, n, False)):
-        start = lo
-        while start < hi:
-            base = weight[start - 1] if start else 0
-            end = min(max(int(np.searchsorted(weight, base + unit_cells, side="right")), start + 1), hi)
-            if snap and end < hi:
-                half = start + (end - start) // 2
-                changes = np.flatnonzero(segment[half + 1:end + 1] != segment[half:end]) + half + 1
-                if changes.size:
-                    end = int(changes[-1])
-            units.append(order[start:end])
-            start = end
+        lower, upper = index.lower[bounded], index.upper[bounded]
+        held = np.add.reduceat(ledger.n_points[index.rows], index.starts[:-1]) if index.rows.size else np.zeros(0)
+        held = held[bounded] if held.size == index.n_windows else np.zeros(bounded.sum())
+        bounds = np.unique(np.concatenate([lower, upper]))
+        segment = np.searchsorted(bounds, pmz[:finite], side="right")
+        # Points of the windows holding each query's precursor: those with
+        # lower <= pmz, less those with upper < pmz (prefix sums over each).
+        by_lower, by_upper = np.argsort(lower), np.argsort(upper)
+        cum_lower = np.r_[0.0, np.cumsum(held[by_lower])]
+        cum_upper = np.r_[0.0, np.cumsum(held[by_upper])]
+        p = pmz[:finite]
+        points = (cum_lower[np.searchsorted(lower[by_lower], p, side="right")]
+                  - cum_upper[np.searchsorted(upper[by_upper], p, side="left")])  # fmt: skip
+    units: list[np.ndarray] = []
+    # Segments, in m/z order: [starts[k], starts[k + 1]).
+    starts = np.flatnonzero(np.r_[True, segment[1:] != segment[:-1]]) if finite else np.empty(0, np.int64)
+    seg_end = np.r_[starts[1:], finite].astype(np.int64)
+    seg_cells = np.add.reduceat(weight[:finite], starts) if finite else np.empty(0)
+    unit_start, unit_cells_held, unit_points_held = 0, 0, 0.0
+
+    def close(at: int) -> None:
+        nonlocal unit_start, unit_cells_held, unit_points_held
+        if at > unit_start:
+            units.append(order[unit_start:at])
+        unit_start, unit_cells_held, unit_points_held = at, 0, 0.0
+
+    for k in range(starts.size):
+        a, b = int(starts[k]), int(seg_end[k])
+        c, pts = int(seg_cells[k]), float(points[a])
+        if unit_start < a and (unit_cells_held + c > budget or unit_points_held + pts > unit_points):
+            close(a)
+        if c > budget:  # a segment of its own, cut by cells
+            close(a)
+            _cut_by_cells(order, weight, a, b, budget, units)
+            unit_start = b
+            continue
+        unit_cells_held += c
+        unit_points_held += pts
+    close(finite)
+    _cut_by_cells(order, weight, finite, n, budget, units)
     return units
+
+
+def _cut_by_cells(order, weight, lo: int, hi: int, budget: int, units: list) -> None:
+    cum = np.cumsum(weight[lo:hi])
+    start = 0
+    while start < hi - lo:
+        base = cum[start - 1] if start else 0
+        end = min(max(int(np.searchsorted(cum, base + budget, side="right")), start + 1), hi - lo)
+        units.append(order[lo + start:lo + end])
+        start = end
 
 
 # ── reading a unit's points ──────────────────────────────────────────
@@ -296,8 +347,13 @@ def _read_ms1(layout: PrecursorMajor, plan: QueryPlan, ledger: Ledger, settings,
     return scan[by], t.column("mz").to_numpy()[by], t.column("intensity").to_numpy()[by], point[by]
 
 
-def _blocks(rows, ledger: Ledger, axis, block_rows: int):
-    """Blocks of whole scans from a level's points (``_make_block``)."""
+def _blocks(rows, ledger: Ledger, axis, block_rows: int, rt_span: float | None = None):
+    """Blocks of whole scans from a level's points (``_make_block``), of at
+    most ``block_rows`` points and, with ``rt_span``, at most that many
+    seconds: a unit holds one window over the whole gradient, and a block
+    spanning much more than its queries' retention-time windows matches
+    every query in every scan of it, only for the matches to be dropped as
+    ineligible (the scan-major sweep's blocks are a few minutes of a run)."""
     from constellation.massspec.sweep.engine import _make_block
 
     if rows is None:
@@ -309,14 +365,28 @@ def _blocks(rows, ledger: Ledger, axis, block_rows: int):
     edges = np.r_[starts, scan.size]
     numbers = scan[starts]
     at = ledger.rows_of(numbers)
+    rt = ledger.rt[at]
     first = 0
     while first < numbers.size:
         last = int(np.searchsorted(edges, edges[first] + block_rows, side="right")) - 1
+        if rt_span is not None and np.isfinite(rt[first]):
+            # Scans are in scan order, which is time order within a run.
+            last = min(last, int(np.searchsorted(rt, rt[first] + rt_span, side="right")))
         last = min(max(last, first + 1), numbers.size)
         a, b = int(edges[first]), int(edges[last])
         yield _make_block(ledger, at[first:last], numbers[first:last], edges[first:last + 1] - a,
                           mz[a:b], intensity[a:b], point[a:b], axis)  # fmt: skip
         first = last
+
+
+def _block_span(plan: QueryPlan) -> float | None:
+    """Seconds a block may span: half the unit's typical retention-time
+    window, when its queries have finite ones (none otherwise)."""
+    width = plan.rt_hi - plan.rt_lo
+    finite = width[np.isfinite(width)]
+    if finite.size < max(1, plan.n_queries // 2):
+        return None
+    return max(float(np.median(finite)) / 2.0, 1.0)
 
 
 # ── a unit, in a worker ──────────────────────────────────────────────
@@ -350,7 +420,7 @@ def _unit_task(bundle: str, work: str, index: int, unit: QueryPlan, settings, re
             continue
         rows = (_read_ms1(layout, unit, ledger, settings, axis, window) if level == 1
                 else _read_fragment_level(layout, unit, ledger, level, window))  # fmt: skip
-        blocks.extend(_blocks(rows, ledger, axis, settings.block_rows))
+        blocks.extend(_blocks(rows, ledger, axis, settings.block_rows, _block_span(unit)))
     every = np.arange(unit.n_queries, dtype=np.int64)
     cells = np.zeros(unit.n_queries, np.int64)
     for level in unit.levels:
