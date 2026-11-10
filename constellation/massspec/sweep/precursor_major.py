@@ -14,9 +14,12 @@ reducers' rows (``docs/plans/sweep.md``, "Precursor-major layout").
 
 A unit is a run of queries in (precursor m/z, query) order, cut by the
 cells its queries are eligible for (``SweepSettings.unit_cells``), and at
-a window bound where one is near. What it reads is every scan any of its
-queries is eligible in, so the cut only decides how often a window is read
-(at most twice), never what a query is matched against:
+a window bound where one is near. A segment (the queries between two
+window bounds) too large for one unit is cut into several, which read the
+same points: they are one task, read once and reduced one after another
+(halved into more tasks only to give every worker work). What a task reads
+is every scan any of its queries is eligible in, so the cuts only decide
+how often a window is read, never what a query is matched against:
 
 - at MS2 and above, the scans of each window that holds a query's
   precursor m/z (inclusive, as the scan-major sweep's test), every scan
@@ -136,9 +139,21 @@ def precursor_units(plan: QueryPlan, ledger: Ledger, unit_cells: int,
     precursor m/z come after the rest, cut by cells. The cut depends on
     the plan and the run, never on the workers. A unit's batches keep its
     order, so a batch touches a window or two. Every query is in one."""
+    return _units_and_groups(plan, ledger, unit_cells, unit_points)[0]
+
+
+def _units_and_groups(plan: QueryPlan, ledger: Ledger, unit_cells: int,
+                      unit_points: int = UNIT_POINTS) -> tuple[list[np.ndarray], list[list[int]]]:  # fmt: skip
+    """:func:`precursor_units`, and the units in groups that read the same
+    points: the pieces one segment was cut into by cells (or the queries
+    without a precursor m/z were), each group a run of consecutive units.
+    A group is read once and its units reduced one after another, so a
+    window is read once per task (until 2026-11-10, once per unit: a
+    segment cut in ten was read ten times, and units of queries without a
+    precursor m/z each read every MS2 point of the run)."""
     n = plan.n_queries
     if n == 0:
-        return []
+        return [], []
     every = np.arange(n, dtype=np.int64)
     cells = np.zeros(n, np.int64)
     for level in plan.levels:
@@ -170,6 +185,7 @@ def precursor_units(plan: QueryPlan, ledger: Ledger, unit_cells: int,
         points = (cum_lower[np.searchsorted(lower[by_lower], p, side="right")]
                   - cum_upper[np.searchsorted(upper[by_upper], p, side="left")])  # fmt: skip
     units: list[np.ndarray] = []
+    groups: list[list[int]] = []
     # Segments, in m/z order: [starts[k], starts[k + 1]).
     starts = np.flatnonzero(np.r_[True, segment[1:] != segment[:-1]]) if finite else np.empty(0, np.int64)
     seg_end = np.r_[starts[1:], finite].astype(np.int64)
@@ -179,8 +195,15 @@ def precursor_units(plan: QueryPlan, ledger: Ledger, unit_cells: int,
     def close(at: int) -> None:
         nonlocal unit_start, unit_cells_held, unit_points_held
         if at > unit_start:
+            groups.append([len(units)])
             units.append(order[unit_start:at])
         unit_start, unit_cells_held, unit_points_held = at, 0, 0.0
+
+    def cut(lo: int, hi: int) -> None:
+        first = len(units)
+        _cut_by_cells(order, weight, lo, hi, budget, units)
+        if len(units) > first:
+            groups.append(list(range(first, len(units))))
 
     for k in range(starts.size):
         a, b = int(starts[k]), int(seg_end[k])
@@ -189,14 +212,14 @@ def precursor_units(plan: QueryPlan, ledger: Ledger, unit_cells: int,
             close(a)
         if c > budget:  # a segment of its own, cut by cells
             close(a)
-            _cut_by_cells(order, weight, a, b, budget, units)
+            cut(a, b)
             unit_start = b
             continue
         unit_cells_held += c
         unit_points_held += pts
     close(finite)
-    _cut_by_cells(order, weight, finite, n, budget, units)
-    return units
+    cut(finite, n)
+    return units, groups
 
 
 def _cut_by_cells(order, weight, lo: int, hi: int, budget: int, units: list) -> None:
@@ -207,6 +230,23 @@ def _cut_by_cells(order, weight, lo: int, hi: int, budget: int, units: list) -> 
         end = min(max(int(np.searchsorted(cum, base + budget, side="right")), start + 1), hi - lo)
         units.append(order[lo + start:lo + end])
         start = end
+
+
+def _tasks(groups: list[list[int]], workers: int) -> list[list[int]]:
+    """Groups of units as tasks, in order. With fewer tasks than about two
+    per worker, the largest groups are halved until there are enough (or
+    none has two units): reading a window twice is cheaper than leaving
+    workers idle."""
+    tasks = [list(g) for g in groups]
+    if workers <= 1:
+        return tasks
+    while len(tasks) < 2 * workers:
+        i = max(range(len(tasks)), key=lambda t: len(tasks[t]), default=None)
+        if i is None or len(tasks[i]) < 2:
+            break
+        g = tasks[i]
+        tasks[i:i + 1] = [g[: len(g) // 2], g[len(g) // 2:]]
+    return tasks
 
 
 # ── reading a unit's points ──────────────────────────────────────────
@@ -259,8 +299,15 @@ def _read_fragment_level(layout: PrecursorMajor, plan: QueryPlan, ledger: Ledger
     scans = _eligible_scans(plan, ledger, level, window, rows)
     if scans.size == 0:
         return None
-    lowers = np.where(index.unbounded[windows], -np.inf, index.lower[windows])
-    lo_min, lo_max = float(lowers.min()), float(lowers.max())
+    _STATS["fragment_reads"] = _STATS.get("fragment_reads", 0) + 1
+    # The bounded windows' range of lower bounds, and apart from it the
+    # scans without bounds, stored with lower = -inf (first in the layout):
+    # with them in the range, its minimum was -inf and every row group
+    # below the unit's windows was decoded only to be dropped (9.8× the
+    # rows on a test; until 2026-11-10).
+    bounded = windows[~index.unbounded[windows]]
+    lo_min = float(index.lower[bounded].min()) if bounded.size else np.inf
+    lo_max = float(index.lower[bounded].max()) if bounded.size else -np.inf
     wanted = pa.array(scans)
     parts = []
     for path in layout.files(level):
@@ -269,7 +316,7 @@ def _read_fragment_level(layout: PrecursorMajor, plan: QueryPlan, ledger: Ledger
         scan_ranges = _row_group_ranges(f, "scan")
         groups = []
         for g, ((a, b), (s0, s1)) in enumerate(zip(lower_ranges, scan_ranges, strict=True)):
-            if a is not None and (b < lo_min or a > lo_max):
+            if a is not None and a != -np.inf and (b < lo_min or a > lo_max):
                 continue
             if s0 is not None and np.searchsorted(scans, s1, "right") == np.searchsorted(scans, s0, "left"):
                 continue
@@ -277,6 +324,7 @@ def _read_fragment_level(layout: PrecursorMajor, plan: QueryPlan, ledger: Ledger
         if not groups:
             continue
         t = f.read_row_groups(groups, columns=["scan", "mz", "intensity"])
+        _STATS["fragment_rows_decoded"] = _STATS.get("fragment_rows_decoded", 0) + t.num_rows
         t = t.filter(pc.is_in(t.column("scan"), value_set=wanted))
         if t.num_rows:
             parts.append(t)
@@ -371,10 +419,19 @@ def _blocks(rows, ledger: Ledger, axis, block_rows: int, rt_span: float | None =
     rt = ledger.rt[at]
     first = 0
     while first < numbers.size:
-        last = int(np.searchsorted(edges, edges[first] + block_rows, side="right")) - 1
+        by_rows = int(np.searchsorted(edges, edges[first] + block_rows, side="right")) - 1
+        last = by_rows
         if rt_span is not None and np.isfinite(rt[first]):
             # Scans are in scan order, which is time order within a run.
             last = min(last, int(np.searchsorted(rt, rt[first] + rt_span, side="right")))
+            # At least MIN_BLOCK_POINTS points (within block_rows): a unit
+            # reads a window or two, whose scans are a cycle apart, so a floor
+            # of one second held one scan a block, and narrow windows ran 8×
+            # slower than scan-major on the cost of each block (until
+            # 2026-11-10). A floor in points, not scans, is the same work per
+            # block whatever a scan holds.
+            enough = int(np.searchsorted(edges, edges[first] + MIN_BLOCK_POINTS, side="left"))
+            last = max(last, min(enough, by_rows))
         last = min(max(last, first + 1), numbers.size)
         a, b = int(edges[first]), int(edges[last])
         yield _make_block(ledger, at[first:last], numbers[first:last], edges[first:last + 1] - a,
@@ -382,14 +439,21 @@ def _blocks(rows, ledger: Ledger, axis, block_rows: int, rt_span: float | None =
         first = last
 
 
+#: The fewest points a block of a unit holds when its span is cut by time
+#: (``_blocks``): about 64 scans of a Stellar run's MS2, where a block's
+#: own cost is small beside its matching.
+MIN_BLOCK_POINTS = 1 << 16
+
+
 def _block_span(plan: QueryPlan) -> float | None:
     """Seconds a block may span: half the unit's typical retention-time
-    window, when its queries have finite ones (none otherwise)."""
+    window, when its queries have finite ones (none otherwise); ``_blocks``
+    widens a block to :data:`MIN_BLOCK_POINTS`."""
     width = plan.rt_hi - plan.rt_lo
     finite = width[np.isfinite(width)]
     if finite.size < max(1, plan.n_queries // 2):
         return None
-    return max(float(np.median(finite)) / 2.0, 1.0)
+    return float(np.median(finite)) / 2.0
 
 
 # ── a unit, in a worker ──────────────────────────────────────────────
@@ -416,21 +480,43 @@ def _worker_state(bundle: str, window, settings, sweep_id: str, layout: Precurso
     return _CACHE["ledger"], _CACHE["order"], _CACHE["axis"]
 
 
-def _unit_task(bundle: str, work: str, index: int, unit: QueryPlan, settings, reducers, window, sweep_id: str,
-               layout: PrecursorMajor) -> dict[str, str]:  # fmt: skip
-    """Match and reduce one unit; write each output as one part, a row
-    group per batch. Returns each output's part."""
-    from constellation.massspec.sweep.engine import _batch, _buckets, _map_block, _MapOut, _reduce, outputs_of
-
-    ledger, order, axis = _worker_state(bundle, window, settings, sweep_id, layout)
+def _read_blocks(layout: PrecursorMajor, plan: QueryPlan, ledger: Ledger, settings, axis, window) -> list:
+    """The blocks of every point ``plan``'s queries can be matched against,
+    at each of its levels."""
     blocks = []
-    for level in unit.levels:
-        channels = unit.channels_for_level(level)
+    for level in plan.levels:
+        channels = plan.channels_for_level(level)
         if channels is None or channels.n == 0:
             continue
-        rows = (_read_ms1(layout, unit, ledger, settings, axis, window) if level == 1
-                else _read_fragment_level(layout, unit, ledger, level, window))  # fmt: skip
-        blocks.extend(_blocks(rows, ledger, axis, settings.block_rows, _block_span(unit)))
+        rows = (_read_ms1(layout, plan, ledger, settings, axis, window) if level == 1
+                else _read_fragment_level(layout, plan, ledger, level, window))  # fmt: skip
+        blocks.extend(_blocks(rows, ledger, axis, settings.block_rows, _block_span(plan)))
+    return blocks
+
+
+def _group_task(bundle: str, work: str, first: int, group: QueryPlan, cuts: list[tuple[int, int]], settings,
+                reducers, window, sweep_id: str, layout: PrecursorMajor) -> list[dict[str, str]]:  # fmt: skip
+    """Read once what a group of units can be matched against (``group``,
+    the plan of all their queries), then match and reduce each unit
+    (``group``'s queries ``cuts[k]``, unit ``first + k``) on it. A unit is
+    matched against the group's points, a superset of its own, which gives
+    the same rows: a match outside a query's interval or windows is not
+    eligible. Returns each unit's parts."""
+    ledger, order, axis = _worker_state(bundle, window, settings, sweep_id, layout)
+    blocks = _read_blocks(layout, group, ledger, settings, axis, window)
+    return [
+        _unit_task(work, first + k, group.take(np.arange(a, b, dtype=np.int64)), blocks, ledger, order, settings,
+                   reducers)  # fmt: skip
+        for k, (a, b) in enumerate(cuts)
+    ]
+
+
+def _unit_task(work: str, index: int, unit: QueryPlan, blocks: list, ledger: Ledger, order, settings,
+               reducers) -> dict[str, str]:  # fmt: skip
+    """Match and reduce one unit on ``blocks``; write each output as one
+    part, a row group per batch. Returns each output's part."""
+    from constellation.massspec.sweep.engine import _batch, _buckets, _map_block, _MapOut, _reduce, outputs_of
+
     every = np.arange(unit.n_queries, dtype=np.int64)
     cells = np.zeros(unit.n_queries, np.int64)
     for level in unit.levels:
@@ -498,7 +584,8 @@ def sweep_precursor_major(source, plan: QueryPlan, settings, reducers: Sequence,
     settings = replace(settings, mz_axis=None if axis is None else axis.key)
     sweep_id = uuid.uuid4().hex
     ledger = _ledger(bundle, layout, window)
-    units = precursor_units(plan, ledger, settings.unit_cells)
+    units, groups = _units_and_groups(plan, ledger, settings.unit_cells)
+    tasks = _tasks(groups, workers)
     if work_dir is None:
         # Only the reducers' outputs are written, so no room is estimated.
         where = Path(spill_dir) if spill_dir is not None else Path(tempfile.gettempdir())
@@ -519,20 +606,26 @@ def sweep_precursor_major(source, plan: QueryPlan, settings, reducers: Sequence,
         done: dict[int, dict[str, str]] = {}
         emit_start(progress, "sweep: precursor-major", total=len(units))
         with pool as executor:
-            # Units are taken from the plan as they are sent, a few ahead of
+            # Tasks are taken from the plan as they are sent, a few ahead of
             # the workers, so the parent never holds the plan twice.
-            pending: dict[Any, int] = {}
+            pending: dict[Any, list[int]] = {}
             ahead = max(2 * workers, 1)
-            next_unit = 0
-            while next_unit < len(units) or pending:
-                while next_unit < len(units) and len(pending) < ahead:
-                    future = executor.submit(_unit_task, str(bundle), str(work), next_unit, plan.take(units[next_unit]),
-                                             settings, tuple(reducers), window, sweep_id, layout)  # fmt: skip
-                    pending[future] = next_unit
-                    next_unit += 1
+            next_task = 0
+            while next_task < len(tasks) or pending:
+                while next_task < len(tasks) and len(pending) < ahead:
+                    members = tasks[next_task]
+                    sizes = np.array([units[i].size for i in members], np.int64)
+                    edges = np.r_[0, np.cumsum(sizes)]
+                    group = plan.take(np.concatenate([units[i] for i in members]))
+                    future = executor.submit(_group_task, str(bundle), str(work), members[0], group,
+                                             list(zip(edges[:-1].tolist(), edges[1:].tolist())), settings,
+                                             tuple(reducers), window, sweep_id, layout)  # fmt: skip
+                    pending[future] = members
+                    next_task += 1
                 finished, _ = wait(list(pending), return_when=FIRST_COMPLETED)
                 for future in finished:
-                    done[pending.pop(future)] = future.result()
+                    for i, parts in zip(pending.pop(future), future.result(), strict=True):
+                        done[i] = parts
                     emit_progress(progress, "sweep: precursor-major", len(done), len(units))
         emit_done(progress, "sweep: precursor-major", completed=len(done), total=len(units))
     except BaseException:
