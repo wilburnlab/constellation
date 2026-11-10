@@ -57,14 +57,24 @@ class Ledger:
     #: the bundle records none (and for a table of points).
     tic: np.ndarray | None = None
     iit: np.ndarray | None = None
+    #: Each scan's acquired m/z range (``scan_window_lower/upper`` of the
+    #: bundle's scan metadata), NaN where it records none: a channel outside
+    #: it was never measured, which is not the same as measured and empty.
+    scan_lower: np.ndarray | None = None
+    scan_upper: np.ndarray | None = None
+    #: The ledger row of the scan one level down each scan was taken from
+    #: (``acquisition_structure.parent_scans``), -1 for none.
+    parent: np.ndarray | None = None
     #: Built on first use: each level's WindowIndex (eligibility is
     #: decided on it at every call, so it is built once, not regrouped).
     _cache: dict = field(default_factory=dict, compare=False, repr=False)
 
     def __post_init__(self) -> None:
-        for name in ("tic", "iit"):
+        for name in ("tic", "iit", "scan_lower", "scan_upper"):
             if getattr(self, name) is None:
                 object.__setattr__(self, name, np.full(self.scan.size, np.nan))
+        if self.parent is None:
+            object.__setattr__(self, "parent", np.full(self.scan.size, -1, np.int64))
 
     @property
     def n(self) -> int:
@@ -105,6 +115,7 @@ class Ledger:
         return by[np.searchsorted(self.scan[by], scans)]
 
     def table(self) -> pa.Table:
+        parent = np.where(self.parent >= 0, self.scan[np.maximum(self.parent, 0)], -1) if self.n else self.parent
         return pa.table(
             {
                 "scan": pa.array(self.scan.astype(np.int32)),
@@ -115,9 +126,19 @@ class Ledger:
                 "n_points": pa.array(self.n_points.astype(np.int32)),
                 "tic": pa.array(self.tic, mask=np.isnan(self.tic)),
                 "iit": pa.array(self.iit, mask=np.isnan(self.iit)),
+                "scan_window_lower": pa.array(self.scan_lower, mask=np.isnan(self.scan_lower)),
+                "scan_window_upper": pa.array(self.scan_upper, mask=np.isnan(self.scan_upper)),
+                "parent_scan": pa.array(parent.astype(np.int32), mask=parent < 0),
             },
             schema=SWEEP_SCAN_TABLE,
         )
+
+    def acquired(self, rows: np.ndarray, mz: np.ndarray) -> np.ndarray:
+        """Whether each m/z lies inside its scan's (ledger ``rows``)
+        acquired range, inclusive; a scan with no recorded range counts as
+        having acquired everything."""
+        lo, hi = self.scan_lower[rows], self.scan_upper[rows]
+        return ~((mz < lo) | (mz > hi))
 
 
 _MATCH_FIELDS = ("query", "level", "scan", "channel", "point_index", "mz", "intensity", "n_points")
@@ -347,19 +368,32 @@ class QueryBatch:
         return eligible_counts(self.plan, self.scans, level, self.queries)
 
     def eligible_cells(self, level: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """(query, ledger row, channel) of every eligible cell, in output
-        order: query, scan order, channel."""
+        """(query, ledger row, channel) of every eligible cell its scan
+        acquired, in output order: query, scan order, channel. A cell whose
+        channel lies outside its scan's acquired m/z range was never
+        measured, so it is not a cell to fill with a zero (until
+        2026-11-10 it was: 31% of the MS1 cells at charges 1–4 of a
+        350–1250 scan); one with no recorded range counts as acquired."""
         q, r = self.eligible(level)
+        return self._acquired_cells(level, q, r)
+
+    def _acquired_cells(self, level: int, q: np.ndarray, r: np.ndarray):
         channels = self.plan.channels_for_level(level)
         n = channels.counts()[q]
         channel = ragged_arange(np.zeros(q.size, np.int64), n)
-        return np.repeat(q, n), np.repeat(r, n), channel
+        cq, cr = np.repeat(q, n), np.repeat(r, n)
+        keep = self.scans.acquired(cr, channels.mz[channels.offsets[cq] + channel])
+        if keep.all():
+            return cq, cr, channel
+        return cq[keep], cr[keep], channel[keep]
 
     def cells(self, level: int, *, fill: bool = True, queries: np.ndarray | None = None) -> Cells:
         """The batch's cells at ``level`` (:class:`Cells`), for its queries
         or ``queries`` (an ascending subset): one row per match, and with
         ``fill`` one per eligible cell that nothing matched, so a trace is
-        dense over the scans each query could have been matched in. A rule
+        dense over the scans each query could have been matched in (a cell
+        outside its scan's acquired m/z range is not one: it was never
+        measured; :meth:`eligible_cells`). A rule
         that gives several points a cell (``all``) gives several rows."""
         channels = self.plan.channels_for_level(level)
         if channels is None:
@@ -456,10 +490,7 @@ class QueryBatch:
     def eligible_cells_of(self, level: int, queries: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """:meth:`eligible_cells` for ``queries``, an ascending subset."""
         q, r = self.eligible(level, queries)
-        channels = self.plan.channels_for_level(level)
-        n = channels.counts()[q]
-        channel = ragged_arange(np.zeros(q.size, np.int64), n)
-        return np.repeat(q, n), np.repeat(r, n), channel
+        return self._acquired_cells(level, q, r)
 
 
 @dataclass(frozen=True)
@@ -587,9 +618,9 @@ class Reducer(Protocol):
     candidates, its per-ion quantities and its verdicts). Every table is
     held to its schema by column name. ``gated`` reducers see only the
     queries that passed the evidence gate. A reducer that builds a row for
-    every eligible cell (zero-filling) says so with a true ``zero_fills``
-    attribute, so that a sweep on disk sizes its buckets by those rows
-    rather than by matches alone.
+    every eligible cell (zero-filling, or the dense view) says so with a
+    true ``zero_fills`` attribute, so that a sweep sizes its buckets by
+    those rows rather than by matches alone, in memory and on disk.
 
     A query's rows may depend only on that query (and the scans), never on
     which other queries share its batch: batches are cut by size, and a

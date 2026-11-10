@@ -133,7 +133,7 @@ def write_bundle(
         row["peak_count"] = n
         if profile:
             row["spectrum_type"] = "profile"
-        if s["level"] == 1:
+        if s["level"] == 1 and "scan_window_lower" not in s:
             row["scan_window_lower"], row["scan_window_upper"] = 350.0, 1250.0
         meta_rows.append(row)
     peaks = pa.table(
@@ -243,6 +243,24 @@ class PlantedRun:
     duplicate: tuple[int, float]
     #: (scan, m/z, theoretical m/z) of a peak placed exactly 20 ppm from an ion.
     edge: tuple[int, float, float]
+
+
+def drop_unacquired(trace: pa.Table, bundle: Path) -> pa.Table:
+    """An XIC trace (``XIC_TRACE_TABLE``) without its zero-filled rows of
+    channels outside their scan's acquired m/z range, as a sweep of
+    ``bundle`` gives it (trace v2, 2026-11-10): the frozen oracle's output
+    held to that rule. A matched row is always kept."""
+    meta = pq.read_table(Path(bundle) / "scan_metadata.parquet",
+                         columns=["scan", "scan_window_lower", "scan_window_upper"])  # fmt: skip
+    scans = meta.column("scan").to_numpy().astype(np.int64)
+    lo = meta.column("scan_window_lower").to_numpy(zero_copy_only=False).astype(np.float64)
+    hi = meta.column("scan_window_upper").to_numpy(zero_copy_only=False).astype(np.float64)
+    by = np.argsort(scans)
+    at = by[np.searchsorted(scans[by], trace.column("scan").to_numpy().astype(np.int64))]
+    mz = trace.column("mz_theoretical").to_numpy().astype(np.float64)
+    observed = trace.column("mz_observed").to_numpy(zero_copy_only=False).astype(np.float64)
+    outside = (mz < lo[at]) | (mz > hi[at])
+    return trace.filter(pa.array(~(np.isnan(observed) & outside)))
 
 
 def _gauss(rt: float, apex: float, sigma: float) -> float:

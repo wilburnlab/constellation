@@ -25,7 +25,9 @@ from constellation.core.io.schemas import register_schema
 #: carries each scan's TIC and injection time; the cell view
 #: (:data:`SWEEP_CELL_TABLE`).
 #: 5 (2026-11-09): ``decoy_set`` on queries and the query summary; ``source_query`` on queries.
-SWEEP_SCHEMA_VERSION: int = 5
+#: 6 (2026-11-10): the scan ledger carries each scan's acquired m/z range and
+#: its parent scan; a cell outside its scan's range is not zero-filled.
+SWEEP_SCHEMA_VERSION: int = 6
 
 
 def _meta(name: str) -> dict[bytes, bytes]:
@@ -102,6 +104,13 @@ SWEEP_SCAN_TABLE: pa.Schema = pa.schema(
         # bundle's scan metadata; null where it records none.
         pa.field("tic", pa.float64(), nullable=True),
         pa.field("iit", pa.float64(), nullable=True),
+        # The m/z range the scan acquired, from the bundle's scan metadata;
+        # null where it records none.
+        pa.field("scan_window_lower", pa.float64(), nullable=True),
+        pa.field("scan_window_upper", pa.float64(), nullable=True),
+        # The scan one level down it was taken from (recorded, or derived:
+        # ``acquisition_structure.parent_scans``); null for none.
+        pa.field("parent_scan", pa.int32(), nullable=True),
     ],
     metadata=_meta("SweepScan"),
 )

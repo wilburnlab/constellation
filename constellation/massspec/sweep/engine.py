@@ -231,21 +231,67 @@ def _f64(col: pa.ChunkedArray) -> np.ndarray:
     return col.to_numpy(zero_copy_only=False).astype(np.float64)
 
 
+#: Scan metadata the ledger carries beyond its own columns, when a bundle has them.
+_SCAN_CONTEXT = ("tic", "iit", "scan_window_lower", "scan_window_upper", "precursor_scan", "faims_cv")
+
+
+def _refuse_several_voltages(where: str, cv: np.ndarray | None) -> None:
+    """A run of several FAIMS compensation voltages is refused: the sweep
+    keys a scan's window by its isolation bounds alone, so both voltages'
+    scans would be one window, and a peptide transmitted at one shows
+    evidence in every other scan of it (the gate passed 0 of 6 planted
+    peptides with two voltages, 6 of 6 with one; review of 2026-11-09, A1).
+    Keying windows by voltage would not be enough: a query stays eligible
+    at both, and its evidence runs would still interleave."""
+    if cv is None:
+        return
+    seen = np.unique(cv[~np.isnan(cv)])
+    if seen.size > 1:
+        raise ValueError(
+            f"{where} is a multi-CV FAIMS run (compensation voltages {', '.join(f'{v:g}' for v in seen)}); "
+            f"the sweep does not separate voltages yet. Split it by CV first."
+        )
+
+
 def _scan_metadata(bundle: Path) -> Ledger:
     path = bundle / "scan_metadata.parquet"
-    context = [c for c in ("tic", "iit") if c in pq.read_schema(path).names]
+    context = [c for c in _SCAN_CONTEXT if c in pq.read_schema(path).names]
     t = pq.read_table(path, columns=["scan", "level", "rt", "isolation_lower", "isolation_upper", *context]).sort_by("scan")
     n = t.num_rows
-    return Ledger(
-        scan=t.column("scan").to_numpy().astype(np.int64),
-        level=t.column("level").to_numpy().astype(np.int8),
+
+    def opt(name):
+        return _f64(t.column(name).cast(pa.float64()).fill_null(np.nan)) if name in context else None
+
+    cv = opt("faims_cv")
+    _refuse_several_voltages(str(bundle), cv)
+    scan = t.column("scan").to_numpy().astype(np.int64)
+    level = t.column("level").to_numpy().astype(np.int8)
+    ledger = Ledger(
+        scan=scan,
+        level=level,
         rt=_f64(t.column("rt")),
         lower=_f64(t.column("isolation_lower")),
         upper=_f64(t.column("isolation_upper")),
         n_points=np.zeros(n, dtype=np.int64),
-        tic=_f64(t.column("tic").fill_null(np.nan)) if "tic" in context else None,
-        iit=_f64(t.column("iit").cast(pa.float64()).fill_null(np.nan)) if "iit" in context else None,
+        tic=opt("tic"),
+        iit=opt("iit"),
+        scan_lower=opt("scan_window_lower"),
+        scan_upper=opt("scan_window_upper"),
+        parent=_parent_rows(scan, level, opt("precursor_scan"), cv),
     )
+    return ledger
+
+
+def _parent_rows(scan: np.ndarray, level: np.ndarray, recorded, cv) -> np.ndarray:
+    """Each scan's parent (``parent_scans``) as a row of a ledger of
+    ``scan`` (in scan order), -1 for none or one not in it."""
+    from constellation.massspec.acquisition_structure import parent_scans
+
+    parent = parent_scans(scan, level, recorded, cv)
+    pos = np.searchsorted(scan, parent)
+    pos_c = np.minimum(pos, max(scan.size - 1, 0))
+    found = (parent >= 0) & (pos < scan.size) & (scan[pos_c] == parent) if scan.size else parent >= 0
+    return np.where(found, pos_c, -1).astype(np.int64)
 
 
 def _sorted_within_scans(offsets: np.ndarray, mz: np.ndarray) -> np.ndarray | None:
@@ -330,13 +376,22 @@ def _table_blocks(table: pa.Table, block_rows: int, levels: Sequence[int]) -> tu
     nan = np.full(n, np.nan)
     lower = _f64(t.column("isolation_lower")) if "isolation_lower" in names else nan
     upper = _f64(t.column("isolation_upper")) if "isolation_upper" in names else nan
+    cv = _f64(t.column("faims_cv").cast(pa.float64()).fill_null(np.nan))[starts] if "faims_cv" in names else None
+    _refuse_several_voltages("the table of points", cv)
+    level = t.column("level").to_numpy(zero_copy_only=False).astype(np.int8)[starts]
+    # The table's scans are in time order; the parent rule wants scan order.
+    by_scan = np.argsort(scan[starts], kind="stable")
+    parent = np.full(starts.size, -1, np.int64)
+    rows = _parent_rows(scan[starts][by_scan], level[by_scan], None, None if cv is None else cv[by_scan])
+    parent[by_scan] = np.where(rows >= 0, by_scan[np.maximum(rows, 0)], -1)
     ledger = Ledger(
         scan=scan[starts],
-        level=t.column("level").to_numpy(zero_copy_only=False).astype(np.int8)[starts],
+        level=level,
         rt=_f64(t.column("rt"))[starts],
         lower=lower[starts],
         upper=upper[starts],
         n_points=np.diff(offsets),
+        parent=parent,
     )
     mz = _f64(t.column("mz"))
     intensity = _f64(t.column("intensity"))
@@ -928,8 +983,9 @@ def _worker_plan(work: Path) -> QueryPlan:
 
 def _read_ledger(path: Path) -> Ledger:
     t = pq.read_table(path)
-    return Ledger(
-        scan=t.column("scan").to_numpy().astype(np.int64),
+    scan = t.column("scan").to_numpy().astype(np.int64)
+    ledger = Ledger(
+        scan=scan,
         level=t.column("level").to_numpy().astype(np.int8),
         rt=t.column("rt").to_numpy(),
         lower=_f64(t.column("isolation_lower")),
@@ -937,7 +993,13 @@ def _read_ledger(path: Path) -> Ledger:
         n_points=t.column("n_points").to_numpy().astype(np.int64),
         tic=_f64(t.column("tic").fill_null(np.nan)),
         iit=_f64(t.column("iit").fill_null(np.nan)),
+        scan_lower=_f64(t.column("scan_window_lower").fill_null(np.nan)),
+        scan_upper=_f64(t.column("scan_window_upper").fill_null(np.nan)),
     )
+    parent = t.column("parent_scan").fill_null(-1).to_numpy().astype(np.int64)
+    rows = ledger.scan_rows(parent)
+    object.__setattr__(ledger, "parent", np.where(parent >= 0, rows, -1).astype(np.int64))
+    return ledger
 
 
 def _worker_ledger(work: Path) -> tuple[Ledger, np.ndarray]:
@@ -1240,6 +1302,9 @@ def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progre
     # one): nothing in it to clear, and nothing of another sweep's to touch.
     plan.write(work / "plan")
     axis = _load_axis(bundle, settings)
+    # Read (and checked: a multi-CV run is refused) before any worker starts;
+    # its point counts are the shards', filled in after the map.
+    ledger = _scan_metadata(bundle)
     # A range is cut into shards of its own (until 2026-11-09 the whole run's
     # shards were trimmed to it, so a range inside one shard ran in one process).
     shards = (
@@ -1258,7 +1323,6 @@ def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progre
         else:
             meta, blocks, held = resume
             _map_stream(work, 0, plan, meta, blocks, settings, pending=held)
-        ledger = _scan_metadata(bundle)
         for f in sorted((work / "scans").glob("shard-*.parquet")):
             t = pq.read_table(f)
             ledger.n_points[ledger.rows_of(t.column("scan").to_numpy().astype(np.int64))] = t.column(

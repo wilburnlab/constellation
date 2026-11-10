@@ -18,7 +18,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import _xic_scan_major_oracle as oracle
-from _massspec_fixtures import dia_scans, planted_run, write_bundle, write_bundle_manifest
+from _massspec_fixtures import dia_scans, drop_unacquired, planted_run, write_bundle, write_bundle_manifest
 from constellation.massspec.bundle import open_peaks
 from constellation.massspec.quant.chromatogram import XicTraceReducer, extract_xic_scan_major
 from constellation.massspec.quant.schemas import XIC_TARGET_TABLE
@@ -66,7 +66,9 @@ def test_a_streamed_bundle_gives_what_its_table_gives_the_oracle(tmp_root, name,
     )  # fmt: skip
     want = oracle.extract_xic_scan_major(peaks, targets, **kw)
     assert want.num_rows > 0
-    oracle.assert_traces_identical(extract_xic_scan_major(bundle, targets, **kw), want)
+    # A bundle records each scan's acquired range, and a channel outside it
+    # is not zero-filled (trace v2); a table of points records none.
+    oracle.assert_traces_identical(extract_xic_scan_major(bundle, targets, **kw), drop_unacquired(want, bundle))
     oracle.assert_traces_identical(extract_xic_scan_major(peaks, targets, **kw), want)
 
 

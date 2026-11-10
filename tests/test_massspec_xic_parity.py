@@ -24,7 +24,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import _xic_scan_major_oracle as oracle
-from _massspec_fixtures import planted_run, write_bundle, write_bundle_manifest
+from _massspec_fixtures import drop_unacquired, planted_run, write_bundle, write_bundle_manifest
 from constellation.massspec.bundle import open_peaks
 from constellation.massspec.cli import build_parser
 from constellation.massspec.peptide.ions import IonType
@@ -402,7 +402,7 @@ def test_parity_read_precursor_major(tmp_root, name, level, rt_window, tolerance
     kw = dict(level=level, rt_window=rt_window, tolerance=tolerance[0], tolerance_unit=tolerance[1],
               all_in_window=mode == "all_in_window", drop_unmatched=mode != "keep_unmatched",
               charge_range=(1, 4) if level == 1 else None)  # fmt: skip
-    want = oracle.extract_xic_scan_major(peaks, targets, acquisition_id=7, **kw)
+    want = drop_unacquired(oracle.extract_xic_scan_major(peaks, targets, acquisition_id=7, **kw), bundle)
     got = _precursor_major(bundle, targets, **kw)
     assert want.num_rows > 0
     oracle.assert_traces_identical(_by_target(got), _by_target(want))

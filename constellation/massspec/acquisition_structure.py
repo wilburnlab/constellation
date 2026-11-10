@@ -98,10 +98,61 @@ def infer_acquisition_structure(scan_metadata: pa.Table) -> AcquisitionStructure
     )
 
 
+def parent_scans(
+    scan: np.ndarray,
+    level: np.ndarray,
+    recorded: np.ndarray | None = None,
+    faims_cv: np.ndarray | None = None,
+) -> np.ndarray:
+    """Each scan's parent: the scan one level down it was taken from, as a
+    scan number, -1 for none (an MS1 scan, or one with no lower-level scan
+    before it).
+
+    ``scan`` and ``level`` are in scan order. The parent is the scan the
+    instrument records (``recorded``, the trailer's master scan; 0, NaN or
+    negative is none), else the last scan of the level below before it.
+    Where FAIMS compensation voltages are recorded (``faims_cv``, NaN for
+    none), that is the last such scan *at the same voltage*: in a method
+    alternating voltages, the scan just before is the other voltage's.
+    The one rule for the browser (``massspec.scans``) and the sweep.
+
+    Not every instrument records the master scan: the lab's Stellar DIA run
+    RF30 records none for any of its 234,000 MS2 scans, which come exactly
+    100 to an MS1 scan, so the derived parent is the usual case.
+    """
+    scan = np.asarray(scan, dtype=np.int64)
+    level = np.asarray(level, dtype=np.int64)
+    parent = np.full(scan.size, -1, dtype=np.int64)
+    if faims_cv is None:
+        cv_group = np.zeros(scan.size, np.int64)
+    else:
+        cv = np.asarray(faims_cv, dtype=np.float64)
+        # NaN (no voltage) is a group of its own.
+        _, cv_group = np.unique(np.where(np.isnan(cv), np.inf, cv), return_inverse=True)
+        cv_group = cv_group.reshape(-1)
+    for group in np.unique(cv_group):
+        in_group = cv_group == group
+        for lvl in np.unique(level[(level > 1) & in_group]):
+            below = np.flatnonzero((level == lvl - 1) & in_group)
+            at = np.flatnonzero((level == lvl) & in_group)
+            if below.size:
+                # Rows are in scan order, so the last lower-level row before
+                # each scan is found by position.
+                before = np.searchsorted(below, at, side="left") - 1
+                ok = before >= 0
+                parent[at[ok]] = scan[below[before[ok]]]
+    if recorded is not None:
+        given = np.asarray(recorded, dtype=np.float64)
+        ok = (level > 1) & ~np.isnan(given) & (given > 0)
+        parent[ok] = given[ok].astype(np.int64)
+    return parent
+
+
 __all__ = [
     "MIN_VISITS_PER_DIA_WINDOW",
     "AcquisitionStructure",
     "AcquisitionType",
     "infer_acquisition_structure",
     "isolation_windows",
+    "parent_scans",
 ]

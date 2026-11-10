@@ -45,6 +45,7 @@ from constellation.massspec.acquisition_structure import (
     MIN_VISITS_PER_DIA_WINDOW,
     AcquisitionType,
     infer_acquisition_structure,
+    parent_scans,
 )
 from constellation.massspec.bundle import (
     BUNDLE_KINDS,
@@ -205,13 +206,14 @@ def scan_table(
     file stores them; it is null for MS1 and for a level whose windows are
     not revisited (DDA, where nearly every scan has its own). ``parent_scan``
     (int32) is the scan a higher-level scan was taken from: its recorded
-    precursor scan, else the last scan of the level below before it. Columns
-    a bundle predates are null.
+    precursor scan, else the last scan of the level below before it, at the
+    same FAIMS voltage (``acquisition_structure.parent_scans``). Columns a
+    bundle predates are null.
     """
     path = Path(bundle_dir) / "scan_metadata.parquet"
     available = set(pq.read_schema(path).names)
     wanted = list(dict.fromkeys(["scan", "level", "rt", "isolation_lower", "isolation_upper",
-                                 "precursor_scan", *columns]))  # fmt: skip
+                                 "precursor_scan", "faims_cv", *columns]))  # fmt: skip
     table = pq.read_table(path, columns=[c for c in wanted if c in available])
     for name in wanted:
         if name not in available:
@@ -247,20 +249,15 @@ def _window_ids(table: pa.Table, level: np.ndarray) -> pa.Array:
 
 
 def _parent_scans(table: pa.Table, level: np.ndarray) -> pa.Array:
-    scan = table.column("scan").to_numpy(zero_copy_only=False).astype(np.int64)
-    recorded = table.column("precursor_scan").to_numpy(zero_copy_only=False)
-    parent = np.full(scan.size, -1, dtype=np.int64)
-    for lvl in np.unique(level[level > 1]):
-        below = np.flatnonzero(level == lvl - 1)
-        at = np.flatnonzero(level == lvl)
-        if below.size:
-            # Rows are in scan order, so the last lower-level row before each
-            # scan is found by position.
-            before = np.searchsorted(below, at, side="left") - 1
-            ok = before >= 0
-            parent[at[ok]] = scan[below[before[ok]]]
-        given = ~np.isnan(recorded[at]) & (recorded[at] > 0)
-        parent[at[given]] = recorded[at[given]].astype(np.int64)
+    """Each scan's parent (``acquisition_structure.parent_scans``: the
+    recorded master scan, else the last scan of the level below before it,
+    at the same FAIMS voltage)."""
+    parent = parent_scans(
+        table.column("scan").to_numpy(zero_copy_only=False),
+        level,
+        table.column("precursor_scan").to_numpy(zero_copy_only=False),
+        table.column("faims_cv").to_numpy(zero_copy_only=False),
+    )
     return pa.array(parent.astype(np.int32), pa.int32(), mask=parent < 0)
 
 
