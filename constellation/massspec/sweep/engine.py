@@ -253,6 +253,22 @@ def _refuse_several_voltages(where: str, cv: np.ndarray | None) -> None:
         )
 
 
+def _refuse_multiplexed(bundle: Path, path: Path) -> None:
+    """A run with multiplexed isolation (MSX: several precursors isolated
+    for one scan) is refused: a scan's window is one isolation pair, so the
+    reader keeps its first reaction's, and the queries in its others would
+    never be matched there (review of 2026-11-09, A4)."""
+    if "filter_string" not in pq.read_schema(path).names:
+        return
+    filters = pq.read_table(path, columns=["filter_string"]).column("filter_string")
+    msx = pc.fill_null(pc.match_substring_regex(filters, r"(^|\s)msx(\s|$)"), False)
+    if pc.any(msx).as_py():
+        raise ValueError(
+            f"{bundle} has {pc.sum(msx).as_py():,} multiplexed (MSX) scans, each isolating several precursors; "
+            f"the sweep holds one isolation window a scan, so they cannot be swept yet"
+        )
+
+
 def _scan_metadata(bundle: Path) -> Ledger:
     path = bundle / "scan_metadata.parquet"
     context = [c for c in _SCAN_CONTEXT if c in pq.read_schema(path).names]
@@ -264,6 +280,7 @@ def _scan_metadata(bundle: Path) -> Ledger:
 
     cv = opt("faims_cv")
     _refuse_several_voltages(str(bundle), cv)
+    _refuse_multiplexed(bundle, path)
     scan = t.column("scan").to_numpy().astype(np.int64)
     level = t.column("level").to_numpy().astype(np.int8)
     ledger = Ledger(
@@ -729,6 +746,12 @@ def sweep(
     if scan_range is not None and rt_range is not None:
         raise ValueError("give a scan_range or an rt_range, not both")
     window = _window(source, scan_range, rt_range)
+    if settings.mz_axis is not None and not isinstance(source, pa.Table):
+        # A curve that cannot be applied at a level the plan matches is refused
+        # here, before any work, not from inside a worker.
+        axis = _load_axis(Path(source), settings)
+        for level in plan.levels:
+            axis.check_level(level)
     if layout == "precursor_major":
         from constellation.massspec.sweep.precursor_major import sweep_precursor_major
 

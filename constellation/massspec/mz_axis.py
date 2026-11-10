@@ -132,11 +132,25 @@ class MzAxis:
     def shift(self, level: int, mz: np.ndarray) -> np.ndarray:
         """How far the instrument reads high at each ``mz`` of this level:
         interpolated between knots, flat past the last. Zero for a level
-        with no curve."""
+        with no curve. A level whose branch the measurement left undetermined
+        (``ambiguous_levels``: MS1 with no MS2 curve to take it from, so its
+        shift is known only to within half a period, ±0.25 Th) is refused:
+        until 2026-11-10 it was applied without a word, and could move every
+        point by half a Th."""
+        self.check_level(level)
         xs, ys = self.knots(level)
         if xs.size == 0:
             return np.zeros_like(np.asarray(mz, dtype=np.float64))
         return np.interp(np.asarray(mz, dtype=np.float64), xs, ys)
+
+    def check_level(self, level: int) -> None:
+        """Refuse a level whose branch is undetermined (see :meth:`shift`)."""
+        if int(level) in {int(v) for v in self.parameters.get("ambiguous_levels", ())}:
+            raise ValueError(
+                f"m/z axis {self.key!r}: its MS{level} curve's branch is undetermined (no MS2 curve to take it "
+                f"from, so its shift is known only to within half a period, ±0.25 Th); it cannot be applied "
+                f"at MS{level}. Measure the axis on a run with MS2, or apply it to MS2 only"
+            )
 
     def corrected(self, level: int, mz: np.ndarray) -> np.ndarray:
         """Instrument m/z of this level to what it should have read."""

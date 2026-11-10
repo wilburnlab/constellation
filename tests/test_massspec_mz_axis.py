@@ -218,6 +218,13 @@ class TestEstimate:
         axis = estimate_mz_axis(bundle, settings=MzAxisSettings(min_scans={1: 12, 2: 0}, n_blocks=8, target_se_th=0.02), reference=_reference())
         assert axis.parameters["ambiguous_levels"] == [1]
         assert any("half a period" in line for line in describe(axis))
+        # Applying it at MS1 is refused, in every form (it was applied without
+        # a word; review of 2026-11-09, A5); a level with no curve is not.
+        mz = np.array([500.0, 900.0])
+        for apply in (axis.shift, axis.corrected, axis.observed):
+            with pytest.raises(ValueError, match="branch is undetermined"):
+                apply(1, mz)
+        np.testing.assert_array_equal(axis.corrected(2, mz), mz)
 
     def test_a_window_with_nothing_to_say_is_left_out_and_interpolated(self, tmp_path):
         """Noise above 1000 m/z has no phase to read."""

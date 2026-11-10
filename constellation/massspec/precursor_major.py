@@ -80,8 +80,8 @@ __all__ = [
 
 PRECURSOR_MAJOR_DIR = "precursor_major"
 #: Processes ``convert`` builds the layout in: on the wide-window run 8 were
-#: no faster than 4 (memory bandwidth), and each holds a peak part's points
-#: (about 1.6 GB for a 9M-point part).
+#: no faster than 4 (memory bandwidth), and each holds at most
+#: ``MAX_HELD_POINTS`` of a part's points at once (about 0.8 GB).
 MAX_BUILD_WORKERS = 4
 #: 2 (2026-11-09): a scan missing either isolation bound is stored as
 #: unbounded (``lower`` -inf), as the sweep treats it; version 1 kept a
@@ -102,25 +102,62 @@ def level_dir(level: int) -> str:
 # ── writing ───────────────────────────────────────────────────────────
 
 
+#: Points a layout writer holds before it writes what it has as files of
+#: their own (``part-NNNNN-CCC.parquet``), at a scan's end: about 0.8 GB at
+#: the ~100 bytes a held point costs while it is sorted. Until 2026-11-10 a
+#: writer held its whole peak part, and a writer of one part a run
+#: (``convert(workers=1)``, a ``.dia`` import) held the whole run.
+MAX_HELD_POINTS = 1 << 23
+
+
 class PrecursorMajorWriter:
     """One peak part's points, precursor-major. Fed the part's peaks in
-    stored order (scans ascending), it holds them and writes each level's
-    file sorted on :meth:`close`, which returns each scan's point count, a
-    row per run of a scan's points (summed by :func:`finish_precursor_major`)."""
+    stored order (scans ascending, each scan's points together), it holds
+    them and writes each level's file sorted on :meth:`close`, which returns
+    each scan's point count, a row per run of a scan's points (summed by
+    :func:`finish_precursor_major`). Past ``max_points`` held it writes what
+    it holds, whole scans only, as files of their own: the sweep reads each
+    file on its own, so a part's layout may be any number of them."""
 
-    def __init__(self, root: Path | str, index: int) -> None:
+    def __init__(self, root: Path | str, index: int, *, max_points: int | None = None) -> None:
         self.root = Path(root)
         self.index = int(index)
+        self.max_points = MAX_HELD_POINTS if max_points is None else int(max_points)
         self._rows: dict[int, list[dict[str, np.ndarray]]] = {}
         self._types: dict[str, pa.DataType] = {}
         self._counts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        self._held = 0
+        self._chunks = 0
+        self._last_scan: int | None = None
+        #: The most points held at once (for tests and measurement).
+        self.peak_held = 0
 
     def write(self, peaks: pa.Table) -> None:
         """``peaks``: rows with ``scan``, ``level``, ``mz``, ``intensity``,
         ``isolation_lower`` and ``isolation_upper``, in stored order."""
         if peaks.num_rows == 0:
             return
+        if self._held >= self.max_points:
+            # Write out at a scan's end: the rows that finish the last scan
+            # held go with it.
+            scan = peaks.column("scan").to_numpy()
+            if self._last_scan is not None and scan[0] == self._last_scan:
+                other = scan != self._last_scan
+                k = int(np.argmax(other)) if other.any() else scan.size
+                self._hold(peaks.slice(0, k))
+                peaks = peaks.slice(k)
+            self._flush(final=False)
+            if peaks.num_rows == 0:
+                return
+        self._hold(peaks)
+
+    def _hold(self, peaks: pa.Table) -> None:
+        if peaks.num_rows == 0:
+            return
         scan = peaks.column("scan").to_numpy().astype(np.int64)
+        self._last_scan = int(scan[-1])
+        self._held += peaks.num_rows
+        self.peak_held = max(self.peak_held, self._held)
         level = peaks.column("level").to_numpy().astype(np.int8)
         self._counts.append(_runs(scan, level))
         # Held as numpy columns (the bundle's own m/z and intensity types),
@@ -142,17 +179,28 @@ class PrecursorMajorWriter:
             self._rows.setdefault(int(lv), []).append(cols if sel is None else {k: v[sel] for k, v in cols.items()})
 
     def close(self) -> pa.Table:
+        self._flush(final=True)
+        return self._count_table()
+
+    def _flush(self, *, final: bool) -> None:
+        """Write what is held, each level sorted, as one file a level: the
+        part's own name when it is all of the part, else a numbered piece."""
+        name = (f"part-{self.index:05d}.parquet" if final and self._chunks == 0
+                else f"part-{self.index:05d}-{self._chunks:03d}.parquet")  # fmt: skip
         for level, parts in sorted(self._rows.items()):
-            # One part's rows: what the range holds.
+            if not parts:
+                continue
+            # Whole scans of one part: what it holds since the last piece.
             rows = {k: np.concatenate([p[k] for p in parts]) for k in ("scan", "mz", "intensity", "lower")}
             self._rows[level] = []
-            path = self.root / level_dir(level) / f"part-{self.index:05d}.parquet"
+            path = self.root / level_dir(level) / name
             path.parent.mkdir(parents=True, exist_ok=True)
             if level == 1:
                 _write_ms1(rows, path, self._types)
             else:
                 _write_fragments(rows, path, self._types)
-        return self._count_table()
+        self._held = 0
+        self._chunks += 1
 
     def _count_table(self) -> pa.Table:
         """Rows to be summed by (scan, level): each run of a scan's points,
@@ -343,10 +391,14 @@ def find_precursor_major(bundle: Path | str) -> PrecursorMajor | None:
 _COLUMNS = ["scan", "level", "mz", "intensity", "isolation_lower", "isolation_upper"]
 
 
+#: Rows a build reads of a peak part at a time.
+BUILD_BATCH_ROWS = 1 << 20
+
+
 def _build_part(part: str, root: str, index: int) -> pa.Table:
     writer = PrecursorMajorWriter(root, index)
     f = pq.ParquetFile(part)
-    for batch in f.iter_batches(columns=_COLUMNS, batch_size=1 << 20):
+    for batch in f.iter_batches(columns=_COLUMNS, batch_size=BUILD_BATCH_ROWS):
         writer.write(pa.Table.from_batches([batch]))
     return writer.close()
 

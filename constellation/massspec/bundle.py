@@ -442,8 +442,10 @@ def scan_range_shards(
             cuts.append(first)
             rows = 0
         rows += n
-    last_file = pq.ParquetFile(paths[-1])
-    end = max(b[1] for b in _row_group_scan_bounds(last_file) if b is not None) + 1
+    # The last scan of any row group: the last part's, unless it is empty
+    # (a centroid of a partial scan list, or a range with no peaks), which
+    # has no row group and raised (until 2026-11-10).
+    end = max(last for _first, last, _n in groups) + 1
     return list(zip(cuts, [*cuts[1:], end]))
 
 

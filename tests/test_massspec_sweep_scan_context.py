@@ -178,6 +178,21 @@ def test_a_run_of_several_faims_voltages_is_refused(tmp_path, layout):
               workers=2, work_dir=tmp_path / "w")  # fmt: skip
 
 
+@pytest.mark.parametrize("layout", ["scan_major", "precursor_major"])
+def test_a_run_of_multiplexed_isolation_is_refused(tmp_path, layout):
+    """An MSX scan isolates several precursors and its window holds one
+    (review of 2026-11-09, A4)."""
+    scans = [dict(s) for s in dia_scans(cycles=4)]
+    for s in scans:
+        if s["level"] == 2:
+            s["filter_string"] = s["filter_string"].replace("Full ms2", "Full msx ms2")
+    bundle = _bundle(tmp_path, "msx", scans)
+    targets = pa.Table.from_pylist([dict(target_id=1, precursor_mz=401.4324, precursor_charge=2)],
+                                   schema=XIC_TARGET_TABLE)  # fmt: skip
+    with pytest.raises(ValueError, match="multiplexed"):
+        sweep(bundle, compile_queries(targets, levels=[1]), SweepSettings(tolerances=_TOL), layout=layout)
+
+
 def test_a_table_of_points_of_several_voltages_is_refused():
     from _massspec_fixtures import MS1_FILTER  # noqa: F401  (the fixture's peaks carry faims_cv)
     from constellation.massspec.schemas import MS_PEAK_TABLE

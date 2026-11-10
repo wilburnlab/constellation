@@ -441,13 +441,20 @@ def _scan_row(
     if ms_level >= 2:
         activations = parsed.get("activations", [])
         if activations:
-            _, activation_type, energy = activations[0]
+            # The reaction that made this scan: an MS2 scan's is the first, an
+            # MS3 scan's the second (until 2026-11-10 an MS3 scan recorded its
+            # MS2 parent's activation and energy).
+            _, activation_type, energy = activations[min(ms_level - 2, len(activations) - 1)]
             if energy is not None:
                 ce = float(energy)
 
+        # The isolation that selected the precursor (the peptide's), which is
+        # reaction 0 at every level: the sweep matches a scan to the queries
+        # whose precursor its window holds. Until 2026-11-10 an MS3 scan took
+        # reaction 1's, the MS2 fragment's.
         iso_target: float | None = None
         try:
-            iso_target = float(event.GetMass(ms_level - 2))
+            iso_target = float(event.GetMass(0))
         except Exception:
             iso_target = activations[0][0] if activations else None
 
@@ -462,13 +469,13 @@ def _scan_row(
         # only stands in when the event has none.
         iso_width: float | None = None
         try:
-            iso_width = float(event.GetIsolationWidth(ms_level - 2)) or None
+            iso_width = float(event.GetIsolationWidth(0)) or None
         except Exception:
             pass
         if iso_width is None:
-            iso_width = safe_float(trailer.get(f"MS{ms_level} Isolation Width:"))
+            iso_width = safe_float(trailer.get("MS2 Isolation Width:"))
         try:
-            iso_offset = float(event.GetIsolationWidthOffset(ms_level - 2))
+            iso_offset = float(event.GetIsolationWidthOffset(0))
         except Exception:
             iso_offset = 0.0
         if iso_target is not None and iso_width is not None:

@@ -501,6 +501,23 @@ class TestRangeReader:
         assert set(ms2_peaks.column("precursor_mz").to_pylist()) == {500.2512}
         assert set(ms2_peaks.column("level").to_pylist()) == {2}
 
+    def test_an_ms3_scan_isolates_its_precursor_and_records_its_own_activation(self, fake_centroider):
+        """An MS3 scan's window was its MS2 fragment's (reaction 1) and its
+        activation its MS2 parent's (review of 2026-11-09, A4): the sweep
+        matches a scan to the queries whose precursor its window holds."""
+        ms3 = "FTMS + p NSI Full ms3 600.3000@cid35.00 300.1500@hcd65.00 [100.0000-1000.0000]"
+        raw = FakeRaw({
+            1: scan(MS1, rt_min=0.1, mz=[400.0]),
+            2: scan(ms3, rt_min=0.2, mz=[126.1, 127.1],
+                    event=FakeEvent(mass=(600.30, 300.15), width=(0.7, 2.0), offset=(0.0, 0.0)),
+                    trailer=[("Master Scan Number:", "1")]),
+        })
+        row = _read(raw)[0].to_pylist()[1]
+        assert row["level"] == 3
+        assert row["activation_type"] == "hcd" and row["collision_energy"] == 65.0
+        assert (row["isolation_lower"], row["isolation_upper"]) == (600.30 - 0.35, 600.30 + 0.35)
+        assert row["precursor_mz"] == 600.30
+
     def test_typed_trailer_values_not_display_strings(self, fake_centroider):
         """Thermo displays a trailer entry rounded to its header's precision;
         the typed value is the instrument's."""
