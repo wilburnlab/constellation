@@ -78,8 +78,9 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
     common.add_argument("--level", choices=("1", "2", "both"), required=True,
                         help="MS level to extract from (1 = precursor isotopes, 2 = fragments, "
                              "both = the two in one sweep).")
-    common.add_argument("--acquisition-id", type=int, default=0,
-                        help="acquisition_id stamped on output rows (FK; default 0).")
+    common.add_argument("--acquisition-id", type=int, default=None,
+                        help="acquisition_id stamped on output rows (FK; default 0), and the run whose "
+                             "targets are taken from a source of several (an experiment, PSMs).")
     common.add_argument("--tolerance", type=float, default=20.0,
                         help="Match tolerance at every level without its own (default 20).")
     common.add_argument("--tolerance-unit", choices=("ppm", "Da"), default="ppm")
@@ -305,7 +306,7 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
     }  # fmt: skip
 
     _warn_level_flag_mismatch(args)
-    targets = load_targets(args.targets)
+    targets = load_targets(args.targets, acquisition_id=args.acquisition_id)
     if args.rt_window is not None:
         from constellation.massspec.sweep.queries import check_rt_window
 
@@ -418,7 +419,8 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
         progress = StreamProgress()
     try:
         result = extract_xic(
-            args.peaks_dir, targets, acquisition_id=args.acquisition_id, levels=levels,
+            args.peaks_dir, targets, acquisition_id=0 if args.acquisition_id is None else args.acquisition_id,
+            levels=levels,
             tolerances=tolerances,
             channels=settings, fragment_abundance=source,
             rt_window=args.rt_window, rule=rule, assigned_scans_only=args.assigned_scans_only,

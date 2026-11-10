@@ -286,7 +286,14 @@ class LibraryFragments:
         share = np.full(row_of.size, np.nan)
         has = whole > 0
         share[has] = np.maximum(r_int[row_of][has], 0.0) / whole[has]
-        out[cand] = share
+        # Two rows naming one ion (a chromatogram library annotates each
+        # stored peak as its nearest ion, so two peaks can name one): the ion
+        # is the most intense of them, whatever the rows' order; until
+        # 2026-11-10 the last row won. The whole stays every row's: each is a
+        # peak of the spectrum.
+        by = np.lexsort((np.nan_to_num(share, nan=-np.inf), cand))
+        out[cand[by]] = share[by]
+        report["duplicate_ions"] = int(cand.size - np.unique(cand).size)
         report["matched"] = int(hit.sum())
 
         # Rows matching no channel: outside the settings (counted), or a

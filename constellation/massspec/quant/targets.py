@@ -139,17 +139,58 @@ def targets_from_library(library: object) -> pa.Table:
     return cast_to_schema(out, XIC_TARGET_TABLE)
 
 
-def targets_from_search(search: object) -> pa.Table:
-    """Normalize a ``Search``'s ``psms`` (PSM_TABLE) into targets.
+def _one_run(table: pa.Table, what: str, acquisition_id: int | None, *, raw_file: bool = False) -> pa.Table:
+    """``table``'s rows of one run: the one it holds, or ``acquisition_id``.
+    A run is its ``acquisition_id``, or (``raw_file``, for PSMs not yet
+    linked to an acquisition) its raw file. A target list is for one run:
+    rows of another run's scans, swept against this one, are matched at
+    the wrong times and pinned to the wrong scans."""
+    ids = table.column("acquisition_id")
+    linked = pc.any(pc.is_valid(ids)).as_py() if table.num_rows else False
+    if acquisition_id is not None:
+        if not linked:
+            raise ValueError(f"the {what} are not linked to acquisitions, so none can be chosen by its id")
+        out = table.filter(pc.fill_null(pc.equal(ids, acquisition_id), False))
+        if out.num_rows == 0:
+            held = sorted(set(pc.drop_null(ids).to_pylist()))
+            raise ValueError(f"the {what} hold no rows of acquisition {acquisition_id} (they hold {held})")
+        return out
+    runs = sorted(set(pc.drop_null(ids).to_pylist())) if linked else (
+        sorted(set(table.column("raw_file").to_pylist())) if raw_file else [])  # fmt: skip
+    if len(runs) > 1:
+        kind = "acquisitions" if linked else "raw files"
+        listing = ", ".join(str(r) for r in runs[:6]) + (", ..." if len(runs) > 6 else "")
+        raise ValueError(
+            f"the {what} are of {len(runs)} {kind} ({listing}); a target list is for one run: "
+            f"pass acquisition_id (--acquisition-id) to say which"
+        )
+    return table
+
+
+def targets_from_search(search: object, *, acquisition_id: int | None = None) -> pa.Table:
+    """Normalize a ``Search``'s ``psms`` (PSM_TABLE) into targets of one run.
 
     The identification-anchored path: each PSM becomes a target keyed by
     ``psm_id``, anchored on the measured precursor ``mz`` at its scan +
     retention time. ``scan`` is carried (the only source that does), so
-    ``assigned_scans_only`` extraction is available. NOTE the PSM
+    ``assigned_scans_only`` extraction is available. Its ``is_decoy`` and
+    ``precursor_id`` are carried (a decoy has ``decoy_set`` 0, the search's
+    own decoys), so a decoy stays a decoy and a library's abundances reach
+    the targets; until 2026-11-10 they were dropped, and a search's decoys
+    came back as targets. The PSMs must be of one run, or ``acquisition_id``
+    says which (``psm_id`` is unique only within one). NOTE the PSM
     ``peptide_id`` is engine-internal — NOT a library FK — so it is
     deliberately dropped.
     """
     psms: pa.Table = search.psms  # type: ignore[attr-defined]
+    # The columns a run, a decoy and a precursor are read from, null where a
+    # table (a hand-made one, a reader of an engine without them) has none.
+    for name, kind in (("acquisition_id", pa.int64()), ("raw_file", pa.string()), ("precursor_id", pa.int64()),
+                       ("is_decoy", pa.bool_())):  # fmt: skip
+        if name not in psms.column_names:
+            psms = psms.append_column(name, pa.nulls(psms.num_rows, kind))
+    psms = _one_run(psms, "PSMs", acquisition_id, raw_file=True)
+    decoy = psms.column("is_decoy")
     out = pa.table(
         {
             "target_id": psms.column("psm_id"),
@@ -158,27 +199,42 @@ def targets_from_search(search: object) -> pa.Table:
             "precursor_mz": psms.column("mz"),
             "rt_center": psms.column("retention_time_s"),
             "scan": psms.column("scan"),
+            "precursor_id": psms.column("precursor_id"),
+            "is_decoy": decoy,
+            "decoy_set": pc.if_else(pc.fill_null(decoy, False), pa.scalar(0, pa.int16()),
+                                    pa.scalar(None, pa.int16())),  # fmt: skip
         }
     )
     return cast_to_schema(out, XIC_TARGET_TABLE)
 
 
-def targets_from_precursor_quant(quant: object, library: object) -> pa.Table:
-    """Normalize ``PRECURSOR_QUANT`` (joined to a Library) into targets.
+def targets_from_precursor_quant(quant: object, library: object, *, acquisition_id: int | None = None) -> pa.Table:
+    """Normalize ``PRECURSOR_QUANT`` (joined to a Library) into targets of one run.
 
-    Re-extract already-quantified precursors at their *observed* RT. The
-    library supplies m/z + charge + modseq (quant rows carry only the
-    ``precursor_id`` FK + observed RT).
+    Re-extract already-quantified precursors at their *observed* RT, inside
+    the window the quantity was integrated over (``rt_start`` / ``rt_end``)
+    where it says one. The library supplies m/z + charge + modseq and the
+    decoy flags (quant rows carry only the ``precursor_id`` FK + observed
+    RT). The quantities must be of one run, or ``acquisition_id`` says which:
+    a table over several runs made one target per run under one id (until
+    2026-11-10), and dropped the window and the decoy flags. Rows come in
+    the quantities' order.
     """
     pq_tbl: pa.Table = quant.precursor_quant  # type: ignore[attr-defined]
+    for name, kind in (("acquisition_id", pa.int64()), ("rt_start", pa.float64()), ("rt_end", pa.float64())):
+        if name not in pq_tbl.column_names:
+            pq_tbl = pq_tbl.append_column(name, pa.nulls(pq_tbl.num_rows, kind))
+    pq_tbl = _one_run(pq_tbl, "quantities", acquisition_id)
     precursors: pa.Table = library.precursors  # type: ignore[attr-defined]
     peptides: pa.Table = library.peptides  # type: ignore[attr-defined]
-    prec = _attach_modseq(precursors, peptides).select(
-        ["precursor_id", "peptide_id", "charge", "precursor_mz", "modified_sequence"]
-    )
-    joined = pq_tbl.select(["precursor_id", "rt_observed"]).join(
-        prec, keys="precursor_id", join_type="left outer"
-    )
+    prec = _attach_modseq(precursors, peptides)
+    keep = ["precursor_id", "peptide_id", "charge", "precursor_mz", "modified_sequence"]
+    keep += [c for c in ("is_decoy", "decoy_set") if c in prec.column_names]
+    row = "__row__"
+    rows = pq_tbl.select(["precursor_id", "rt_observed", "rt_start", "rt_end"])
+    rows = rows.append_column(row, pa.array(np.arange(rows.num_rows, dtype=np.int64)))
+    joined = rows.join(prec.select(keep), keys="precursor_id", join_type="left outer")
+    joined = joined.take(pc.sort_indices(joined.column(row)))  # a join promises no order
     out = pa.table(
         {
             "target_id": joined.column("precursor_id"),
@@ -186,8 +242,11 @@ def targets_from_precursor_quant(quant: object, library: object) -> pa.Table:
             "precursor_charge": joined.column("charge"),
             "precursor_mz": joined.column("precursor_mz"),
             "rt_center": _sentinel_to_null(joined.column("rt_observed")),
+            "rt_start": _sentinel_to_null(joined.column("rt_start")),
+            "rt_end": _sentinel_to_null(joined.column("rt_end")),
             "precursor_id": joined.column("precursor_id"),
             "peptide_id": joined.column("peptide_id"),
+            **{c: joined.column(c) for c in ("is_decoy", "decoy_set") if c in joined.column_names},
         }
     )
     return cast_to_schema(out, XIC_TARGET_TABLE)
@@ -320,7 +379,7 @@ def targets_from_experiment(
     return cast_to_schema(out, XIC_TARGET_TABLE)
 
 
-def load_targets(path: str | Path, *, library: object | None = None) -> pa.Table:
+def load_targets(path: str | Path, *, library: object | None = None, acquisition_id: int | None = None) -> pa.Table:
     """Load a target source from disk and normalize it.
 
     Auto-detects by what is on disk: a search experiment or one of its
@@ -330,7 +389,8 @@ def load_targets(path: str | Path, *, library: object | None = None) -> pa.Table
     (``library_pqdir/``), a Search bundle
     (``psms.parquet``), a ``PRECURSOR_QUANT`` bundle
     (``precursor_quant.parquet``, requires ``library=``), or a bare
-    ``.parquet`` / ``.tsv`` target file.
+    ``.parquet`` / ``.tsv`` target file. ``acquisition_id`` chooses the run
+    of a source that holds several (an experiment, PSMs, quantities).
     """
     p = Path(path)
     if p.is_dir():
@@ -338,7 +398,7 @@ def load_targets(path: str | Path, *, library: object | None = None) -> pa.Table
 
         kind = manifest_kind(p)
         if kind == "massspec_experiment":
-            return targets_from_experiment(p)
+            return targets_from_experiment(p, acquisition_id=acquisition_id)
         if kind == "massspec_search":
             from constellation.core.manifests import read_manifest
             from constellation.massspec.manifest import SearchManifest
@@ -364,7 +424,7 @@ def load_targets(path: str | Path, *, library: object | None = None) -> pa.Table
         if (p / "psms.parquet").exists():
             from constellation.massspec.search.io import load_search
 
-            return targets_from_search(load_search(p, format="parquet_dir"))
+            return targets_from_search(load_search(p, format="parquet_dir"), acquisition_id=acquisition_id)
         if (p / "precursor_quant.parquet").exists():
             if library is None:
                 raise ValueError(
@@ -373,7 +433,7 @@ def load_targets(path: str | Path, *, library: object | None = None) -> pa.Table
             from constellation.massspec.quant.io import load_quant
 
             return targets_from_precursor_quant(
-                load_quant(p, format="parquet_dir"), library
+                load_quant(p, format="parquet_dir"), library, acquisition_id=acquisition_id
             )
         raise ValueError(f"unrecognized target bundle at {p}")
     return targets_from_table(p)

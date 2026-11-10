@@ -612,11 +612,19 @@ def _compile(
     )
     fragments = None
     if want_frag:
-        key = t.column("precursor_id").fill_null(-1).to_numpy().astype(np.int64)
+        # A target with no sequence or no charge has no fragment candidates,
+        # so it asks the library for nothing: until 2026-11-10 its precursor
+        # id was still asked, its library rows matched no candidate, and the
+        # whole compile was refused as "the library and the query describe
+        # different molecules".
+        key = np.where(frag, t.column("precursor_id").fill_null(-1).to_numpy().astype(np.int64), -1)
         fragments = fragment_channels(
             parsed, np.where(frag, peptide, -1), precursor_charge.astype(np.int64), channels, fragment_abundance,
             key=key, target_ids=target_ids,
         )  # fmt: skip
+        report = getattr(fragment_abundance, "report", None)
+        if isinstance(report, dict):  # the abundance source's report of this compile
+            report["no_fragment_candidates"] = int((~frag).sum())
     return QueryPlan(
         targets=t,
         levels=levels,
