@@ -542,8 +542,10 @@ with a test that fails on the code before. The plan was the PI's, 2026-11-10; tr
   A spill is refused first if its estimated size does not fit the directory.
 - **A directory per sweep (E1).** Each sweep writes `work_dir/sweep-<id>/` (`SweepResult.work`), so a
   later sweep into one `work_dir` no longer rewrites an earlier result's parts.
-- **Claims on disk (D2).** A shard's claims are sorted as one, so the on-disk `point_claims` is the
-  in-memory table under any run size.
+- **Claims on disk (D2).** Claims are written for whole blocks only (a block's window groups
+  interleave scan numbers), so runs follow in scan order, are made into the table one at a time, and the
+  on-disk `point_claims` is the in-memory table under any run size. (Sorting a shard's claims as one,
+  the first fix, held them all at once, which a spilled sweep's single shard made unbounded; Codex.)
 - **The ledger's scan context (E2).** Each scan's acquired m/z range and its parent scan one level down
   (`acquisition_structure.parent_scans`, the browser's rule too: the recorded master scan, else the last
   scan of the level below, at the same FAIMS voltage); `SWEEP_SCAN_TABLE`, sweep schemas v6. A cell
@@ -574,8 +576,9 @@ with a test that fails on the code before. The plan was the PI's, 2026-11-10; tr
   of lower bounds read. One-window units decoded 9.8× the layout's rows and now decode 1.5× (that
   scan's rows, which every unit needs).
 - **E4 and E5.** The units a segment is cut into, and those of queries without a precursor m/z, read
-  the same points. They are now one task, read once, halved only to give every worker work; each unit
-  still writes its own parts.
+  the same points at MS2 and above. They are now one task, its fragment levels read once, halved only
+  to give every worker work; each unit still writes its own parts, and reads its own MS1, which is read
+  by m/z (an MS1-only plan is one segment, and a group read of it held every unit's slices; Codex).
 - **E6.** A block cut by time holds at least `MIN_BLOCK_POINTS` (2^16) points. The one-second floor
   held one scan of a window a block, and ±0.4 s windows ran 8× slower than scan-major; they are now at
   parity.

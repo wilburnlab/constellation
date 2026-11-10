@@ -597,9 +597,11 @@ class _ModPlan:
     """One peptide's modification spec laid out as slots: the fixed
     assignment, each variable slot's candidates (mod key, site) in their
     order, the slot order, how many may be occupied, the limits (one per
-    group of placements) and the groups each candidate counts toward, and
-    whether a cyclization candidate at the N-terminus excludes a variable
-    modification of residue 0 (``guard``)."""
+    group of placements) and the groups each candidate counts toward,
+    whether a cyclization at the N-terminus excludes a variable
+    modification of residue 0 (``guard``), and whether the N-terminus left
+    as it is holds a fixed cyclization (``fixed_cyclized``: residue 0 is
+    then free only in forms where a variable modification replaces it)."""
 
     fixed: dict[_Slot, tuple[str, str]]
     candidates: dict[_Slot, list[tuple[str, str]]]
@@ -608,6 +610,7 @@ class _ModPlan:
     limits: tuple[int, ...]
     groups: dict[_Slot, list[tuple[int, ...]]]
     guard: bool
+    fixed_cyclized: bool = False
 
 
 def _plan_modforms(
@@ -690,10 +693,13 @@ def _plan_modforms(
                     )
                 if have is None:
                     fixed_slots[slot] = (key, site)
+    # A fixed cyclization takes residue 0's side chain and what was on it,
+    # in the forms that keep it; residue 0's fixed modification stays in the
+    # plan, so a form whose N-terminus a variable modification takes instead
+    # has it (until 2026-11-10 it was dropped from every form: [UNIMOD:1]-C
+    # without the cysteine's carbamidomethyl, Codex).
     n_fixed = fixed_slots.get(_N_SLOT)
     fixed_cyclized = n_fixed is not None and n_fixed[0] in SIDE_CHAIN_CYCLIZATIONS
-    if fixed_cyclized:
-        fixed_slots.pop(_R0_SLOT, None)
 
     # Variable candidates — slot → the (mod key, site) pairs that may occupy
     # it. On a slot a fixed modification holds, a variable one is an
@@ -703,27 +709,39 @@ def _plan_modforms(
     # 2026-11-10 the fixed one shadowed the variable one, which was never
     # applied. The fixed modification itself is not offered again.
     candidates: dict[_Slot, list[tuple[str, str]]] = {}
+    # Every site through which each candidate reaches its slot: N-term and
+    # Protein N-term name one slot at a protein's N-terminus, and a placement
+    # counts toward the limit of each rule that reaches it (until 2026-11-10,
+    # only the first rule's, so the forms depended on the rules' order).
+    reached: dict[tuple[_Slot, str], list[str]] = {}
     for site, keys in var_spec.items():
         for pos in _slots_for_site(site, peptide, context):
             for key in keys:
                 slot = (layer_of(key), pos)
-                if (fixed_cyclized and slot == _R0_SLOT) or fixed_slots.get(slot, ("",))[0] == key:
+                if fixed_slots.get(slot, ("",))[0] == key:
                     continue
                 if not licensed(key, site, pos):
                     continue
                 have = candidates.setdefault(slot, [])
                 if all(key != k for k, _ in have):
                     have.append((key, site))
+                sites_here = reached.setdefault((slot, key), [])
+                if site not in sites_here:
+                    sites_here.append(site)
+    if fixed_cyclized and all(k in SIDE_CHAIN_CYCLIZATIONS for k, _ in candidates.get(_N_SLOT, ())):
+        # Every form keeps a cyclization, which takes residue 0.
+        candidates.pop(_R0_SLOT, None)
     candidates = {slot: c for slot, c in candidates.items() if c}
     groups = {
-        slot: [tuple(g for g, (k, sites, _limit) in enumerate(limit_specs) if k == key and (sites is None or site in sites))
-               for key, site in c]
+        slot: [tuple(g for g, (k, sites, _limit) in enumerate(limit_specs)
+                     if k == key and (sites is None or any(s in sites for s in reached[(slot, key)])))
+               for key, _site in c]
         for slot, c in candidates.items()
     }  # fmt: skip
 
     ordered = sorted(candidates, key=_slot_order)
-    guard = _R0_SLOT in candidates and any(
-        k in SIDE_CHAIN_CYCLIZATIONS for k, _ in candidates.get(_N_SLOT, ())
+    guard = _R0_SLOT in candidates and (
+        fixed_cyclized or any(k in SIDE_CHAIN_CYCLIZATIONS for k, _ in candidates.get(_N_SLOT, ()))
     )
     return _ModPlan(
         fixed=fixed_slots,
@@ -733,6 +751,7 @@ def _plan_modforms(
         limits=tuple(limit for _k, _s, limit in limit_specs),
         groups=groups,
         guard=guard,
+        fixed_cyclized=fixed_cyclized,
     )
 
 
@@ -741,12 +760,17 @@ def _count_planned(plan: _ModPlan) -> int:
     occupied, each by one of its candidates, no group of placements over
     its limit, no cyclization beside a variable modification of residue 0.
     A DP over the slots, polynomial in their number: states are (occupied,
-    counts of the limited groups, residue 0 occupied)."""
+    counts of the limited groups, residue 0 occupied). Residue 0 comes
+    before the N-terminus in the slot order."""
     limits = plan.limits
     states: dict[tuple[int, tuple[int, ...], bool], int] = {(0, (0,) * len(limits), False): 1}
     for slot in plan.ordered:
-        nxt = dict(states)  # the slot left empty
         cyclizes = plan.guard and slot == _N_SLOT
+        if cyclizes and plan.fixed_cyclized:
+            # Left empty, the N-terminus keeps its fixed cyclization.
+            nxt = {state: ways for state, ways in states.items() if not state[2]}
+        else:
+            nxt = dict(states)  # the slot left empty
         marks_r0 = plan.guard and slot == _R0_SLOT
         for (k, counts, r0), ways in states.items():
             if k == plan.k_max:
@@ -773,9 +797,10 @@ def _assignments(plan: _ModPlan) -> Iterator[tuple[tuple[int, ...], tuple[int, .
     candidates give, which is how they are made when nothing can rule a
     combination out. With limits or a cyclization guard, a depth-first walk
     refuses a choice the moment it breaks one, so the work is proportional
-    to what is returned (leaving the remaining slots empty is always valid,
-    so every node of the walk is an assignment), and its result is sorted
-    into the same order."""
+    to what is returned (leaving the remaining slots empty is valid, so
+    every node of the walk is an assignment, except one with residue 0
+    taken and an N-terminus still to be taken from a fixed cyclization),
+    and its result is sorted into the same order."""
     ordered, cands, limits, k_max = plan.ordered, plan.candidates, plan.limits, plan.k_max
     groups = plan.groups
     n = len(ordered)
@@ -788,13 +813,17 @@ def _assignments(plan: _ModPlan) -> Iterator[tuple[tuple[int, ...], tuple[int, .
         return
     n_index = ordered.index(_N_SLOT) if plan.guard else -1
     r0_index = ordered.index(_R0_SLOT) if plan.guard else -1
+    # Residue 0 occupied needs the N-terminus taken by a variable
+    # modification when, left empty, it keeps a fixed cyclization.
+    needs_n = plan.guard and plan.fixed_cyclized
     used = [0] * len(limits)
     slots: list[int] = []
     picks_now: list[int] = []
     out: list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
 
     def walk(start: int) -> None:
-        out.append((len(slots), tuple(slots), tuple(picks_now)))
+        if not (needs_n and r0_index in slots and n_index not in slots):
+            out.append((len(slots), tuple(slots), tuple(picks_now)))
         if len(slots) == k_max:
             return
         for i in range(start, n):
@@ -965,6 +994,7 @@ def enumerate_modforms(
     simple = (
         all(layer == _CHEM for layer, _ in (*plan.fixed, *plan.candidates))
         and not plan.guard
+        and not plan.fixed_cyclized
         and not any(k in SIDE_CHAIN_CYCLIZATIONS for k, _ in plan.candidates.get(_N_SLOT, ()))
     )
     fixed_res = {e[0]: (e[2],) for e in fixed_entries if isinstance(e[0], int)}

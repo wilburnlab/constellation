@@ -333,7 +333,7 @@ def test_an_in_memory_reduce_is_bucketed_as_one_on_disk_is(tmp_root, tmp_path):
 def test_claims_on_disk_are_the_in_memory_table(tmp_root, tmp_path):
     """A run can end inside a block, whose window groups interleave scan
     numbers, so claims written run by run came out of scan order on disk
-    (review of 2026-11-09, D2). A shard's claims are now sorted as one."""
+    (review of 2026-11-09, D2). Claims are now written for whole blocks."""
     from constellation.massspec.sweep.engine import CLAIMS
     from constellation.massspec.sweep.reduce import QuerySummaryReducer
 
@@ -349,8 +349,32 @@ def test_claims_on_disk_are_the_in_memory_table(tmp_root, tmp_path):
         settings = SweepSettings(tolerances=tol, rule=AllWithin(), claims=True, block_rows=block_rows,
                                  run_rows=run_rows)  # fmt: skip
         got = sweep(bundle, plan, settings, reducers=[QuerySummaryReducer()], work_dir=tmp_path / "w")
-        assert len(list((got.work / "claims").glob("*.parquet"))) > 1  # several runs
+        assert len(list((got.work / "matches").glob("*.parquet"))) > 1  # runs end inside blocks
         assert got.table(CLAIMS).equals(want)
+
+
+def test_claims_are_made_into_their_table_a_run_at_a_time(tmp_root, tmp_path):
+    """Sorting a shard's claims as one held them all at once, and a sweep
+    spilled to disk is one shard, so its claims undid the bound that made
+    it spill (Codex, 2026-11-10: 1,600 held where main held 160)."""
+    from constellation.massspec.sweep import engine
+    from constellation.massspec.sweep.engine import CLAIMS
+    from constellation.massspec.sweep.reduce import QuerySummaryReducer
+
+    run, bundle, _ = _run("dia", tmp_root)
+    rows = run.targets.to_pylist()
+    rows.append(dict(rows[4], target_id=4444))
+    plan = compile_queries(pa.Table.from_pylist(rows, schema=XIC_TARGET_TABLE), levels=[1, 2], rt_window=20.0)
+    tol = {1: (20.0, "ppm"), 2: (20.0, "ppm")}
+    want = sweep(bundle, plan, SweepSettings(tolerances=tol, rule=AllWithin(), claims=True),
+                 reducers=[QuerySummaryReducer()]).table(CLAIMS)  # fmt: skip
+    engine.READ_STATS["claims_held"] = 0
+    settings = SweepSettings(tolerances=tol, rule=AllWithin(), claims=True, block_rows=100, run_rows=5)
+    got = sweep(bundle, plan, settings, reducers=[QuerySummaryReducer()], work_dir=tmp_path / "w")
+    assert got.table(CLAIMS).equals(want)
+    runs = [pq.read_metadata(f).num_rows for f in (got.work / "claims").glob("*.parquet")]
+    assert len(runs) > 10
+    assert engine.READ_STATS["claims_held"] == max(runs) < want.num_rows / 5
 
 
 def test_a_spill_with_no_room_is_refused_before_it_starts(tmp_root, tmp_path, monkeypatch):

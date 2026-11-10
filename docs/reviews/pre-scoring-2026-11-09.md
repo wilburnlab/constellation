@@ -253,3 +253,16 @@ In rough dependency order.
 5. **Statistics:** TDC q-values and PEP with `decoy_set`, then semi-supervised rescoring.
 6. **Two-pass calibration**, using the pieces in §6.1.
 7. **A native engine writer and verb**, then quantities, protein inference and the multi-run work.
+
+## 8. Review of the fixes (Codex, 2026-11-10)
+
+An independent review of `fix/pre-scoring` found six defects the fixes had made. Each is fixed with a test that fails on the code before.
+
+| # | Severity | What | Where | Status |
+|---|---|---|---|---|
+| R1 | P1 | Claims were sorted as one shard to put them in scan order, and a sweep spilled to disk is one shard, so its claims undid the bound that made it spill (1,600 held where main held 160) | `sweep/engine.py` `_claims_part` | fixed: claims are written for whole blocks only, so runs follow in scan order and are made into the table one at a time, as on main (835 claims, at most 64 held) |
+| R2 | P1 | A group of units read MS1 for the whole group, and an MS1-only plan is one segment, so every unit read all the units' m/z slices (40 units: 800 points where each needed 20) | `sweep/precursor_major.py` `_group_task` | fixed: fragment levels are read once per group, MS1 per unit |
+| R3 | P2 | A limit counted only the first rule that reached a slot, so N-term and Protein N-term rules gave forms that depended on their order, and one order broke a limit | `core/sequence/protein.py` `_plan_modforms` | fixed: a placement counts toward every rule that reaches it |
+| R4 | P2 | A fixed cyclization removed residue 0's fixed modification from every form, also where a variable N-terminal modification replaced the cyclization (`[UNIMOD:1]-C` without its carbamidomethyl) | `core/sequence/protein.py` | fixed: residue 0 is the cyclization's only in the forms that keep it, and its variable modifications are offered in the forms that free it |
+| R5 | P2 | Scan-major corrected the m/z of every level it read, the plan's or not, so a curve undetermined at MS1 refused a sweep of MS2 alone | `sweep/engine.py` `_make_block` | fixed: only the plan's levels are corrected |
+| R6 | P2 | Two decoy methods under one set index gave two decoy proteins one accession | `library/search_space.py` | refused: a set is one method's decoys, and two under index 0 would also double the decoys competing with the targets; the CLI numbers its sets apart |

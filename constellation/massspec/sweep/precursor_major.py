@@ -480,11 +480,12 @@ def _worker_state(bundle: str, window, settings, sweep_id: str, layout: Precurso
     return _CACHE["ledger"], _CACHE["order"], _CACHE["axis"]
 
 
-def _read_blocks(layout: PrecursorMajor, plan: QueryPlan, ledger: Ledger, settings, axis, window) -> list:
+def _read_blocks(layout: PrecursorMajor, plan: QueryPlan, ledger: Ledger, settings, axis, window,
+                 levels=None) -> list:  # fmt: skip
     """The blocks of every point ``plan``'s queries can be matched against,
-    at each of its levels."""
+    at each of its levels (or of ``levels``)."""
     blocks = []
-    for level in plan.levels:
+    for level in plan.levels if levels is None else levels:
         channels = plan.channels_for_level(level)
         if channels is None or channels.n == 0:
             continue
@@ -496,19 +497,26 @@ def _read_blocks(layout: PrecursorMajor, plan: QueryPlan, ledger: Ledger, settin
 
 def _group_task(bundle: str, work: str, first: int, group: QueryPlan, cuts: list[tuple[int, int]], settings,
                 reducers, window, sweep_id: str, layout: PrecursorMajor) -> list[dict[str, str]]:  # fmt: skip
-    """Read once what a group of units can be matched against (``group``,
-    the plan of all their queries), then match and reduce each unit
-    (``group``'s queries ``cuts[k]``, unit ``first + k``) on it. A unit is
-    matched against the group's points, a superset of its own, which gives
-    the same rows: a match outside a query's interval or windows is not
-    eligible. Returns each unit's parts."""
+    """Read once what a group of units can be matched against at MS2 and
+    above (``group``, the plan of all their queries: one window segment, so
+    the same scans for each), then match and reduce each unit (``group``'s
+    queries ``cuts[k]``, unit ``first + k``) on it and on its own MS1 read.
+    A unit is matched against the group's points, a superset of its own,
+    which gives the same rows: a match outside a query's interval or
+    windows is not eligible. MS1 is read unit by unit because it is read
+    by m/z, each unit its own slices: an MS1-only plan is one segment, and
+    read for the group its 40 units' slices were 40 times the points each
+    unit needed (Codex, 2026-11-10). Returns each unit's parts."""
     ledger, order, axis = _worker_state(bundle, window, settings, sweep_id, layout)
-    blocks = _read_blocks(layout, group, ledger, settings, axis, window)
-    return [
-        _unit_task(work, first + k, group.take(np.arange(a, b, dtype=np.int64)), blocks, ledger, order, settings,
-                   reducers)  # fmt: skip
-        for k, (a, b) in enumerate(cuts)
-    ]
+    shared = _read_blocks(layout, group, ledger, settings, axis, window, levels=[v for v in group.levels if v > 1])
+    out = []
+    for k, (a, b) in enumerate(cuts):
+        unit = group.take(np.arange(a, b, dtype=np.int64))
+        own = _read_blocks(layout, unit, ledger, settings, axis, window, levels=[v for v in unit.levels if v == 1])
+        _STATS["ms1_points_read"] = max(_STATS.get("ms1_points_read", 0), sum(len(blk.mz) for blk in own))
+        out.append(_unit_task(work, first + k, unit, shared + own, ledger, order, settings, reducers))
+        del own
+    return out
 
 
 def _unit_task(work: str, index: int, unit: QueryPlan, blocks: list, ledger: Ledger, order, settings,

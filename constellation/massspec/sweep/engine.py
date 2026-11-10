@@ -329,7 +329,8 @@ def _sorted_within_scans(offsets: np.ndarray, mz: np.ndarray) -> np.ndarray | No
 
 
 def _bundle_blocks(
-    bundle: Path, meta: Ledger, settings: SweepSettings, axis, *, blocks: Iterable[ScanBlock] | None = None
+    bundle: Path, meta: Ledger, settings: SweepSettings, axis, *, blocks: Iterable[ScanBlock] | None = None,
+    levels: Sequence[int] | None = None,
 ) -> Iterator[_Block]:
     if blocks is None:
         blocks = iter_scan_blocks(bundle, columns=("mz", "intensity"), block_rows=settings.block_rows)
@@ -344,14 +345,18 @@ def _bundle_blocks(
         counts = np.diff(b.offsets)
         meta.n_points[at] = counts
         yield _make_block(meta, at, b.scan, b.offsets, b.columns["mz"], b.columns["intensity"],
-                          ragged_arange(np.zeros(b.n_scans, np.int64), counts), axis)  # fmt: skip
+                          ragged_arange(np.zeros(b.n_scans, np.int64), counts), axis, levels)  # fmt: skip
 
 
 def _make_block(meta: Ledger, at: np.ndarray, scan: np.ndarray, offsets: np.ndarray, mz: np.ndarray,
-                intensity: np.ndarray, point_index: np.ndarray, axis) -> _Block:  # fmt: skip
+                intensity: np.ndarray, point_index: np.ndarray, axis,
+                levels: Sequence[int] | None = None) -> _Block:  # fmt: skip
     """A block of whole scans (ledger rows ``at``), each scan's points in
     stored order: the m/z axis corrected and each scan's points sorted by
-    the corrected m/z, each keeping its stored position."""
+    the corrected m/z, each keeping its stored position. Only ``levels``
+    (all, when not given) are corrected, the levels a plan matches: the
+    others are never matched, and correcting them refused a sweep of MS2
+    whose curve could not be applied at MS1 (Codex, 2026-11-10)."""
     mz = mz.astype(np.float64, copy=False)
     intensity = intensity.astype(np.float64, copy=False)
     level = meta.level[at]
@@ -359,6 +364,8 @@ def _make_block(meta: Ledger, at: np.ndarray, scan: np.ndarray, offsets: np.ndar
         point_level = np.repeat(level, np.diff(offsets))
         mz = mz.copy()
         for lvl in np.unique(level):
+            if levels is not None and int(lvl) not in levels:
+                continue
             sel = point_level == lvl
             mz[sel] = axis.corrected(int(lvl), mz[sel])
     perm = _sorted_within_scans(offsets, mz)
@@ -444,6 +451,8 @@ class _MapOut:
     matches: Matches
     evidence: Evidence
     claims: Claims
+    #: The marker that follows a block's last window group (an empty part).
+    ends_block: bool = False
 
     @classmethod
     def concat(cls, parts: list[_MapOut]) -> _MapOut:
@@ -473,6 +482,10 @@ def _map_parts(blocks: Iterable[_Block], plan: QueryPlan, settings: SweepSetting
     block in memory first."""
     for block in blocks:
         yield from _map_block_parts(block, plan, settings)
+        yield _BLOCK_END
+
+
+_BLOCK_END = _MapOut(Matches.concat([]), Evidence.concat([]), Claims.empty(), ends_block=True)
 
 
 def _map_block_parts(block: _Block, plan: QueryPlan, settings: SweepSettings, *, matches: bool = True,
@@ -825,7 +838,8 @@ def _sweep(source, plan, settings, reducers, workers, work_dir, progress, window
             if window is not None
             else None
         )
-        mapped = _map_parts(_bundle_blocks(bundle, ledger, settings, axis, blocks=stream), plan, settings)
+        mapped = _map_parts(_bundle_blocks(bundle, ledger, settings, axis, blocks=stream, levels=plan.levels),
+                            plan, settings)  # fmt: skip
         for part in mapped:
             parts.append(part)
             held += part.rows
@@ -1076,8 +1090,8 @@ def _map_shard(bundle: str, work: str, index: int, scan_range: tuple[int, int], 
     blocks = iter_scan_blocks(
         b, columns=("mz", "intensity"), block_rows=settings.block_rows, scan_range=scan_range
     )
-    return _map_stream(w, index, plan, meta, _map_parts(_bundle_blocks(b, meta, settings, axis, blocks=blocks),
-                                                        plan, settings), settings)  # fmt: skip
+    parts = _map_parts(_bundle_blocks(b, meta, settings, axis, blocks=blocks, levels=plan.levels), plan, settings)
+    return _map_stream(w, index, plan, meta, parts, settings)
 
 
 def _map_stream(
@@ -1093,22 +1107,44 @@ def _map_stream(
     counts the points of, as they are read) as shard ``index``, starting
     from ``pending`` parts already made, and the shard's scans. A run is
     written once ``run_rows`` rows are held (matches, evidence and claims
-    alike). Returns the number of matches."""
+    alike). Returns the number of matches.
+
+    Claims are written only for whole blocks: a block's window groups
+    interleave scan numbers, so a claims run ending inside a block would
+    be out of scan order with the next, and putting them back in order
+    then needed the whole shard's claims at once (2026-11-10). A block's
+    claims are held until it ends, so runs follow one another in scan
+    order and are made into the table one at a time."""
     shared = np.zeros(plan.n_queries, dtype=np.int64) if settings.claims else None
     # The caller's list is emptied as it is written, so what was held in
     # memory is freed rather than kept for the rest of the shard.
-    pending = pending if pending is not None else []
-    held = sum(p.rows for p in pending)
-    total = sum(p.matches.n for p in pending)
-    run = 0
+    given = pending if pending is not None else []
+    pending: list[_MapOut] = []
+    reading: list[Claims] = []  # the claims of the block being read
+    finished: list[Claims] = []  # the claims of whole blocks, not yet written
+    held = total = run = 0
+
+    def take(part: _MapOut) -> None:
+        nonlocal held, total
+        held += part.rows  # its claims are held too, until their block is written
+        total += part.matches.n
+        if part.claims.n:
+            reading.append(part.claims)
+            part = replace(part, claims=Claims.empty())
+        if part.ends_block:
+            finished.extend(reading)
+            reading.clear()
+        pending.append(part)
 
     def flush() -> None:
         nonlocal held, run
-        if not pending:
+        if not pending and not finished:
             return
         out = _MapOut.concat(pending)
+        claims = Claims.concat(finished)
         pending.clear()
-        held = 0
+        finished.clear()
+        held = sum(c.n for c in reading)
         name = _run_name(index, run)
         m = out.matches
         m = m.take(order_by(m.query, m.level, m.scan, m.channel, m.point_index))
@@ -1122,16 +1158,19 @@ def _map_stream(
             e = out.evidence
             _write(_evidence_table(e.take(order_by(e.query, e.group, e.scan))),
                    w / "evidence" / name, row_group_size=settings.run_row_group_rows)  # fmt: skip
-        if settings.claims:
-            _write(out.claims.sorted().table(), w / "claims" / name, row_group_size=1 << 18)
-            shared[:] += _shared_counts(out.claims, plan.n_queries, per_cell=settings.rule.name == "sum")
+        if settings.claims and claims.n:
+            _write(claims.sorted().table(), w / "claims" / name, row_group_size=1 << 18)
+            shared[:] += _shared_counts(claims, plan.n_queries, per_cell=settings.rule.name == "sum")
 
+    for part in given:
+        take(part)
+    given.clear()
     for part in parts:
-        pending.append(part)
-        held += part.rows
-        total += part.matches.n
+        take(part)
         if held >= settings.run_rows:
             flush()
+    finished.extend(reading)  # a stream that ended inside a block
+    reading.clear()
     flush()
     if settings.claims:
         at = np.flatnonzero(shared)
@@ -1159,7 +1198,7 @@ def _write(table: pa.Table, path: Path, **kw) -> None:
 
 #: Rows a reduce has decoded from sorted runs, in this process (for tests
 #: and benchmarks of how much more than its own rows a bucket reads).
-READ_STATS = {"rows_decoded": 0}
+READ_STATS = {"rows_decoded": 0, "claims_held": 0}
 
 
 def _footer(path: Path):
@@ -1230,24 +1269,29 @@ def _reduce_bucket(
 
 
 def _claims_part(work: str, index: int, acquisition_id: int) -> list[str]:
-    """A shard's claims with their claimants, as one part in scan order.
+    """A shard's claims with their claimants, run by run, in scan order.
 
-    Its runs are read together and sorted as one (``claims_table``): since
-    the map flushes per window group (2026-11-09), a run can end inside a
-    block, whose window groups interleave scan numbers, so runs written one
-    after another were out of scan order, and the on-disk table differed
-    from the in-memory one (until 2026-11-10). Shards are scan ranges in
-    order, so their parts concatenate into the whole table's order."""
+    Each run holds whole blocks, sorted (``_map_stream``), and the runs
+    follow one another in scan order, so a run at a time is enough: holding
+    them all to sort them as one (2026-11-10, briefly) undid the memory
+    bound of a sweep spilled to disk, which is one shard. Runs are taken in
+    the order written, by number (by name, a run past 9,999 came first)."""
     w = Path(work)
     plan = _worker_plan(w)
     ledger, _ = _worker_ledger(w)
-    runs = list((w / "claims").glob(f"shard-{index:05d}-*.parquet"))
-    if not runs:
-        return []
-    claims = Claims.concat([Claims.from_table(pq.read_table(f)) for f in runs])
-    path = w / "reduce" / CLAIMS / f"part-{index:05d}.parquet"
-    _write(claims_table(claims, plan, ledger, acquisition_id), path)
-    return [str(path)]
+    out = []
+    for f in _shard_runs(w / "claims", index):
+        claims = Claims.from_table(pq.read_table(f))
+        READ_STATS["claims_held"] = max(READ_STATS["claims_held"], claims.n)
+        path = w / "reduce" / CLAIMS / f"part-{f.stem.removeprefix('shard-')}.parquet"
+        _write(claims_table(claims, plan, ledger, acquisition_id), path)
+        out.append(str(path))
+    return out
+
+
+def _shard_runs(directory: Path, index: int) -> list[Path]:
+    """A shard's runs in ``directory``, in the order they were written."""
+    return sorted(directory.glob(f"shard-{index:05d}-*.parquet"), key=lambda f: int(f.stem.rsplit("-", 1)[1]))
 
 
 def _reduce_weights(plan: QueryPlan, ledger: Ledger, settings: SweepSettings, reducers, matches: np.ndarray) -> np.ndarray:

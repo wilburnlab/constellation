@@ -227,6 +227,21 @@ def test_a_second_set_of_an_unseeded_method_is_refused():
     _settings(decoys=(DecoySet("reverse-interior", 0), DecoySet("shuffle-interior", 1), DecoySet("shuffle-interior", 2)))
 
 
+def test_two_methods_under_one_set_index_are_refused_and_apart_are_built(tmp_path):
+    """Two methods at index 0 were one set of twice the decoys, and since
+    peptide-level decoys have proteins, two proteins under one accession
+    (Codex, 2026-11-10). Each set is one method's; numbered apart, the two
+    build, every protein id once."""
+    with pytest.raises(ValueError, match="decoy set 0 given twice"):
+        _settings(decoys=(DecoySet("reverse-protein"), DecoySet("reverse-interior")))
+    fasta = _fasta(tmp_path, {"P1": P1, "P2": P2})
+    lib = build_search_space([fasta], _settings(decoys=(DecoySet("reverse-protein", 0), DecoySet("reverse-interior", 1))))
+    ids = lib.proteins.column("protein_id").to_pylist()
+    assert len(ids) == len(set(ids))
+    accessions = lib.proteins.column("accession").to_pylist()
+    assert {"DECOY_P1", "DECOY_P2", "DECOY1_P1", "DECOY1_P2"} <= set(accessions)
+
+
 def test_the_cli_refuses_reverse_protein_sets_of_two(tmp_path, capsys):
     fasta = _fasta(tmp_path, {"P1": P1})
     assert _cli("--fasta", str(fasta), "--output-dir", str(tmp_path / "o"), "--decoys", "reverse-protein:sets=2") == 2

@@ -262,6 +262,31 @@ def test_a_segment_cut_into_units_is_read_once(tmp_root):
     assert len(tasks) >= min(8, len(units)) and [u for t in tasks for u in t] == list(range(len(units)))
 
 
+def test_ms1_is_read_unit_by_unit_within_a_group(tmp_root):
+    """An MS1-only plan is one segment, so all its units are one group, and
+    reading the group's MS1 at once read every unit's m/z slices for each
+    (Codex, 2026-11-10: 40 units, 800 points held where each needed 20).
+    MS1 is read per unit; the rows are scan-major's."""
+    from constellation.massspec.sweep import precursor_major as pm
+
+    run, bundle = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1], rt_window=None)
+    settings = SweepSettings(tolerances=_TOL, unit_cells=80, batch_cells=40)
+    layout = pm.find_precursor_major(bundle)
+    ledger = pm._ledger(bundle, layout, None)
+    units, groups = pm._units_and_groups(plan, ledger, settings.unit_cells)
+    assert len(groups) == 1 and len(units) > 4
+
+    def points(p):
+        return sum(len(b.mz) for b in pm._read_blocks(layout, p, ledger, settings, None, None))
+
+    own = max(points(plan.take(u)) for u in units)
+    assert own < points(plan) / 2  # the slices differ, unit to unit
+    pm._STATS["ms1_points_read"] = 0
+    _check(bundle, plan, settings, [XicTraceReducer(drop_unmatched=False), QuerySummaryReducer()])
+    assert pm._STATS["ms1_points_read"] == own
+
+
 def test_narrow_windows_make_blocks_of_many_points(tmp_root, monkeypatch):
     """A block of a unit spanned at least a second, which on one window is
     one scan: narrow RT windows ran 8× slower than scan-major (review of
@@ -302,6 +327,26 @@ def test_a_large_m_z_correction_is_read_around(tmp_root, tmp_path):
         settings = SweepSettings(tolerances=tol, mz_axis="synthetic", unit_cells=300)
         got = _check(bundle, plan, settings, [XicTraceReducer()])
         assert got.mz_axis == "synthetic"
+
+
+def test_a_curve_undetermined_at_ms1_does_not_stop_a_sweep_of_ms2(tmp_path):
+    """A curve that cannot be applied at MS1 is refused for a plan matching
+    MS1, but scan-major corrected every level it read, the plan's or not,
+    so a sweep of MS2 alone was refused too (Codex, 2026-11-10); the
+    precursor-major read gave it. Both give it, and agree."""
+    run = planted_run(acquisition="dia", cycles=30, window_width=100.0, seed=9)
+    bundle = _bundle(tmp_path, "ambiguous", run.scans)
+    axis = MzAxis(key="ms1-undetermined", table=pa.table({"level": pa.array([1, 1, 2, 2], pa.int8()),
+                                                          "mz": [100.0, 2000.0, 100.0, 2000.0],
+                                                          "shift_th": [0.2, 0.2, 0.1, 0.1]}),
+                  parameters={"ambiguous_levels": [1]})  # fmt: skip
+    save_mz_axis(bundle, axis)
+    settings = SweepSettings(tolerances=_TOL, mz_axis="ms1-undetermined", unit_cells=300)
+    got = _check(bundle, compile_queries(_targets(run), levels=[2], rt_window=20.0), settings, [XicTraceReducer()])
+    assert got.mz_axis == "ms1-undetermined" and got.table("xic_trace").num_rows > 0
+    with pytest.raises(ValueError, match="branch is undetermined"):
+        sweep(bundle, compile_queries(_targets(run), levels=[1, 2], rt_window=20.0), settings,
+              reducers=[XicTraceReducer()])  # fmt: skip
 
 
 def test_every_eligible_scan_is_in_its_units_read_set(tmp_root):

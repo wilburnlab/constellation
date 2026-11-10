@@ -241,6 +241,82 @@ def test_counts_are_what_enumeration_returns() -> None:
         assert len(set(texts)) == len(texts)
 
 
+def test_a_placement_counts_toward_every_rule_that_reaches_it() -> None:
+    """N-term and Protein N-term are one slot at a protein's N-terminus; the
+    limit was taken from the first rule that reached it, so the forms
+    depended on the rules' order, and one order broke the second rule's
+    limit (Codex, 2026-11-10: four forms of PEPTIDEK, three reversed)."""
+    context = SiteContext(protein_n_term=True)
+    limit = [("UNIMOD:1", ["Protein N-term", "K"], 1)]
+    orders = (
+        {"N-term": ["UNIMOD:1"], "Protein N-term": ["UNIMOD:1"], "K": ["UNIMOD:1"]},
+        {"Protein N-term": ["UNIMOD:1"], "K": ["UNIMOD:1"], "N-term": ["UNIMOD:1"]},
+    )
+    for variable in orders:
+        kw = dict(variable=variable, context=context, limit_groups=limit)
+        forms = sorted(canonical(f) for f in enumerate_modforms("PEPTIDEK", **kw))
+        assert forms == ["PEPTIDEK", "PEPTIDEK[UNIMOD:1]", "[UNIMOD:1]-PEPTIDEK"]
+        assert count_modforms("PEPTIDEK", **kw) == 3
+
+
+def test_a_variable_modification_replacing_a_fixed_cyclization_frees_residue_0() -> None:
+    """A fixed cyclization took residue 0's fixed modification away in every
+    form, also where a variable N-terminal one replaced the cyclization:
+    [UNIMOD:1]-CPEPTIDEK without its carbamidomethyl (Codex, 2026-11-10).
+    Residue 0 is the cyclization's only in the forms that keep it."""
+    kw = dict(fixed={"N-term": "UNIMOD:26", "C": "UNIMOD:4"}, variable={"N-term": ["UNIMOD:1"]})
+    forms = enumerate_modforms("CPEPTIDEK", **kw)
+    assert [canonical(f) for f in forms] == ["[UNIMOD:26]-CPEPTIDEK", "[UNIMOD:1]-C[UNIMOD:4]PEPTIDEK"]
+    assert peptide_mass(forms[1]) == pytest.approx(peptide_mass(parse_proforma("[Acetyl]-C[Carbamidomethyl]PEPTIDEK")))
+    # Residue 0's variable modifications go with the forms that free it.
+    kw = dict(fixed={"N-term": "UNIMOD:28"}, variable={"N-term": ["UNIMOD:1"], "Q": ["UNIMOD:7"]})
+    forms = sorted(canonical(f) for f in enumerate_modforms("QPEPTIDEKQ", **kw))
+    assert forms == sorted([
+        "[UNIMOD:28]-QPEPTIDEKQ", "[UNIMOD:28]-QPEPTIDEKQ[UNIMOD:7]", "[UNIMOD:1]-QPEPTIDEKQ",
+        "[UNIMOD:1]-Q[UNIMOD:7]PEPTIDEKQ", "[UNIMOD:1]-QPEPTIDEKQ[UNIMOD:7]", "[UNIMOD:1]-Q[UNIMOD:7]PEPTIDEKQ[UNIMOD:7]",
+    ])  # fmt: skip
+    assert count_modforms("QPEPTIDEKQ", **kw) == 6
+
+
+def test_counts_and_forms_with_fixed_cyclizations_terminal_contexts_and_rules_in_any_order() -> None:
+    """Random specs with a fixed N-terminal cyclization, a protein terminus
+    and limits over sites two rules reach: the count is the enumeration,
+    the forms do not depend on the order of the rules, and residue 0
+    carries a chemical modification only where no cyclization holds the
+    N-terminus."""
+    from constellation.core.sequence.protein import SIDE_CHAIN_CYCLIZATIONS
+
+    rng = random.Random(31)
+    pool = {"N-term": ["UNIMOD:1", "UNIMOD:28"], "Protein N-term": ["UNIMOD:1"], "K": ["UNIMOD:1"],
+            "Q": ["UNIMOD:7"], "M": ["UNIMOD:35"], "C": ["UNIMOD:4"]}  # fmt: skip
+    for _ in range(300):
+        seq = rng.choice("CQK") + "".join(rng.choice("ACKMQ") for _ in range(rng.randint(1, 8)))
+        variable = {site: keys for site, keys in pool.items() if rng.random() < 0.6}
+        fixed = {}
+        if rng.random() < 0.5:
+            fixed["N-term"] = rng.choice(["UNIMOD:26", "UNIMOD:28"])
+        if rng.random() < 0.5:
+            fixed["C"] = "UNIMOD:4"
+            variable.pop("C", None)
+        limits = [("UNIMOD:1", ["Protein N-term", "K"], rng.randint(0, 2))] if rng.random() < 0.6 else None
+        context = SiteContext(protein_n_term=rng.random() < 0.7)
+        k = rng.randint(0, 4)
+        seen = []
+        for spec in (variable, dict(reversed(list(variable.items())))):
+            kw = dict(fixed=fixed, variable=spec, max_variable=k, context=context, limit_groups=limits,
+                      skip_unlicensed=True)  # fmt: skip
+            forms = enumerate_modforms(seq, **kw)
+            assert len(forms) == count_modforms(seq, **kw)
+            texts = [canonical(f) for f in forms]
+            assert len(set(texts)) == len(texts)
+            for f in forms:
+                n_term = {t.mod.accession for t in f.n_term_mods}
+                if n_term & {k.split(":")[1] for k in SIDE_CHAIN_CYCLIZATIONS}:
+                    assert 0 not in f.residue_mods, texts
+            seen.append(sorted(texts))
+        assert seen[0] == seen[1], (seq, fixed, variable, limits)
+
+
 def test_a_limit_prunes_the_walk() -> None:
     import time
 

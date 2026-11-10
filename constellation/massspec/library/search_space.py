@@ -426,11 +426,20 @@ class SearchSpaceSettings:
                 _refuse_links(UNIMOD[rule.modification], rule.name or rule.modification)
         _check_fixed_rules(self.rules)
         _check_rule_limits(self.rules)
-        seen: set[tuple[int, str]] = set()
+        # A set is one method's decoys: its index is what an FDR names it by
+        # (0 competes with the targets), so two methods under one index
+        # would be one population of twice the decoys, and their decoy
+        # proteins one accession each (until 2026-11-10 two methods at index
+        # 0 were accepted, and gave duplicate protein ids; Codex). The CLI
+        # numbers its sets apart.
+        seen: dict[int, str] = {}
         for d in self.decoys:
-            if (d.index, d.method) in seen:
-                raise ValueError(f"decoy set {d.index} given twice for {d.method}")
-            seen.add((d.index, d.method))
+            if d.index in seen:
+                raise ValueError(
+                    f"decoy set {d.index} given twice ({seen[d.index]}, {d.method}): a set is one method's "
+                    f"decoys; give each set its own index"
+                )
+            seen[d.index] = d.method
         # A method whose decoys depend on neither the set nor the seed makes
         # the same decoys every time, so a second set of it is a copy of the
         # first (reverse-protein:sets=2 made DECOY1_ proteins identical to
