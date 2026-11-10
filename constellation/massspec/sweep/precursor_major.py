@@ -477,10 +477,17 @@ def _unit_task(bundle: str, work: str, index: int, unit: QueryPlan, settings, re
 
 
 def sweep_precursor_major(source, plan: QueryPlan, settings, reducers: Sequence, workers: int,
-                          work_dir, progress, window):  # fmt: skip
+                          work_dir, progress, window, *, spill_dir=None):  # fmt: skip
     """The sweep, read precursor-major (module docstring)."""
     from constellation.massspec.bundle import read_bundle_manifest
-    from constellation.massspec.sweep.engine import SweepResult, _Inline, _init_worker, _load_axis, outputs_of
+    from constellation.massspec.sweep.engine import (
+        SweepResult,
+        _Inline,
+        _init_worker,
+        _load_axis,
+        outputs_of,
+        own_dir,
+    )
 
     layout = _refuse(source, plan, settings)
     bundle = Path(source)
@@ -493,12 +500,16 @@ def sweep_precursor_major(source, plan: QueryPlan, settings, reducers: Sequence,
     ledger = _ledger(bundle, layout, window)
     units = precursor_units(plan, ledger, settings.unit_cells)
     if work_dir is None:
-        work = Path(tempfile.mkdtemp(prefix="sweep-"))
+        # Only the reducers' outputs are written, so no room is estimated.
+        where = Path(spill_dir) if spill_dir is not None else Path(tempfile.gettempdir())
+        where.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="sweep-", dir=where))
         temporary = True
     else:
-        work, temporary = Path(work_dir), False
-        if (work / "reduce").exists():
-            shutil.rmtree(work / "reduce")
+        # A directory of this sweep's own: until 2026-11-10 a later sweep
+        # cleared ``work_dir/reduce`` and wrote its parts where an earlier
+        # result read its own.
+        work, temporary = own_dir(work_dir), False
     try:
         pool = (
             ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn"), initializer=_init_worker)
@@ -528,7 +539,7 @@ def sweep_precursor_major(source, plan: QueryPlan, settings, reducers: Sequence,
         if temporary:
             shutil.rmtree(work, ignore_errors=True)
         raise
-    result = SweepResult(scans=ledger, matches=None, mz_axis=None if axis is None else axis.key)
+    result = SweepResult(scans=ledger, matches=None, mz_axis=None if axis is None else axis.key, work=work)
     for reducer in reducers:
         for name, schema in outputs_of(reducer).items():
             result.parts[name] = [Path(done[i][name]) for i in range(len(units))]

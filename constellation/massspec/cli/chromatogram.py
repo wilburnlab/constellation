@@ -425,6 +425,9 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
             drop_unmatched=args.drop_unmatched, mz_axis=args.mz_axis, gate=gate,
             only_passing=args.only_passing, claims=args.claims, summary=args.summary,
             workers=args.workers if on_disk else 1, work_dir=work, progress=progress, layout=layout,
+            # A sweep that outgrows memory carries on beside the outputs, as
+            # one on disk does, rather than in the system's temporary directory.
+            spill_dir=args.output_dir,
         )  # fmt: skip
     except ValueError as exc:
         if layout != "precursor_major":

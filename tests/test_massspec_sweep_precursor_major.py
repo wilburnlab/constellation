@@ -118,6 +118,27 @@ def test_options_change_nothing_between_layouts(tmp_root, name):
         _check(bundle, plan, settings, reducers, **sweep_kw)
 
 
+@pytest.mark.parametrize("layout", ["scan_major", "precursor_major"])
+def test_a_later_sweep_into_the_same_work_dir_leaves_an_earlier_result_alone(tmp_root, tmp_path, layout):
+    """Both layouts cleared and reused ``work_dir``, so an earlier result
+    whose table was not yet read gave the later sweep's rows (review of
+    2026-11-09, E1). Each sweep now writes a directory of its own."""
+    run, bundle = _run("dia", tmp_root)
+    work = tmp_path / "w"
+    targets = _targets(run)
+    reducers = [QuerySummaryReducer(), XicTraceReducer()]
+    plan_a = compile_queries(targets, levels=[1, 2], rt_window=20.0)
+    plan_b = compile_queries(targets.slice(0, 2), levels=[1, 2], rt_window=20.0)
+    want = sweep(bundle, plan_a, SweepSettings(tolerances=_TOL), reducers=reducers, layout=layout)
+    a = sweep(bundle, plan_a, SweepSettings(tolerances=_TOL), reducers=reducers, layout=layout, work_dir=work)
+    b = sweep(bundle, plan_b, SweepSettings(tolerances={1: (20.0, "ppm"), 2: (0.5, "Da")}), reducers=reducers,
+              layout=layout, work_dir=work)  # fmt: skip
+    assert a.work != b.work and a.work.parent == b.work.parent == work
+    for name in want.schemas:
+        oracle.assert_traces_identical(a.table(name), want.table(name))
+    assert b.table("query_summary").num_rows == 2
+
+
 def test_workers_and_batches_change_no_byte(tmp_root, tmp_path):
     run, bundle = _run("staggered", tmp_root)
     plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
