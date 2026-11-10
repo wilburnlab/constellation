@@ -36,9 +36,14 @@ What "canonical" settles
 
 Two strings for one molecule must give one key:
 
+- residues are upper case: ProForma is case-insensitive (spec 2.0 and
+  2.1), so ``pepTIDEK`` is ``PEPTIDEK`` (the parser reads it so; a
+  ``Peptidoform`` built by hand is upper-cased here);
 - a modification is written by accession (``[UNIMOD:35]``), whether it
-  arrived as an accession or as a name the vocabulary knows
-  (``[Oxidation]``); names the vocabulary does not know are kept;
+  arrived as an accession, with its prefix in any case
+  (``[unimod:35]``), or as a name the vocabulary knows in any case
+  (``[Oxidation]``, ``[oxidation]``); names the vocabulary does not know
+  are kept;
 - a bare mass is rounded to ``MASS_DECIMALS`` places, so ``+57.02146``
   and ``+57.0214635`` agree (it is still not *resolved*: deciding which
   modification a mass stands for needs the residue and belongs to the
@@ -175,7 +180,7 @@ def _canonical_peptidoform(peptide: Peptidoform, vocab: ModVocab) -> Peptidoform
     except ValueError as exc:
         raise NoCanonicalKeyError(str(exc)) from None
     return Peptidoform(
-        sequence=peptide.sequence,
+        sequence=peptide.sequence.upper(),
         residue_mods={
             position: _canonical_site(mods, vocab)
             for position, mods in sorted(peptide.residue_mods.items())

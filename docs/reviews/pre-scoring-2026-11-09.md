@@ -46,7 +46,7 @@ Severity is for a scorer and FDR built on this path. Paths are relative to `cons
 | A6 | low | `scan_range_shards` raises when the last peak part is empty | `bundle.py:445-446` | confirmed; fixed (P7) |
 | B5 | low | A `:max=` limit is pooled across rules for the same modification | `library/search_space.py:492-493` | confirmed; fixed (P5) |
 | B6 | low | `reverse-protein:sets=2` duplicates set 0; `--count` books its decoys as targets | `library/search_space.py:538-548, 700-707` | confirmed; fixed (P5) |
-| B7 | low | `<D>` and `<2H>` give different content ids for one molecule | `library/ids.py:189-199` | confirmed; fixed (P5) |
+| B7 | low | `<D>` and `<2H>` give different content ids for one molecule | `library/ids.py:189-199` | confirmed; fixed (P5); with it, ProForma read case-insensitively, as its spec says (residues, CV prefixes, names, labels) |
 | C3 | low | `targets_from_precursor_quant` makes duplicate `target_id`s across runs and drops the integration window | `quant/targets.py:166-193` | confirmed; fixed (P6) |
 | C4 | low | Two library rows naming one ion: the last overwrites, both count in the denominator | `library/fragment_abundance.py:289` | mechanism confirmed; fixed in `LibraryFragments` (P6); the MSP half did not reproduce |
 | E4 | low (I/O) | A window is re-read once per cell-cut unit, not "at most twice" as documented | `sweep/precursor_major.py:18-19, 190-194` | confirmed; fixed (P2) |

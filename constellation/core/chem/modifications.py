@@ -268,10 +268,19 @@ class ModVocab:
     ModVocab is mutable (you can `add` / `register_custom`), but the
     `subset` operation returns a fresh ModVocab — subsetting never
     mutates the source.
+
+    A key is looked up as written first, then with case ignored, which
+    ProForma 2.1 asks of readers ("Readers SHOULD allow case insensitive
+    lookups in cases where the capitalisation does not clash between
+    entries"): ``phospho`` is Phospho. A spelling that two modifications
+    share once case is ignored is refused rather than guessed; UNIMOD has
+    none.
     """
 
     _by_id: dict[str, Modification] = field(default_factory=dict)
     _by_alias: dict[str, str] = field(default_factory=dict)  # alias → id
+    # casefolded id or alias → id, or None where two modifications share it
+    _by_folded: dict[str, str | None] = field(default_factory=dict)
 
     # ── core registry ────────────────────────────────────────────
     def add(self, mod: Modification) -> None:
@@ -283,16 +292,31 @@ class ModVocab:
             # share a short label). Last-write-wins is the simplest
             # contract; tools that care should disambiguate by id.
             self._by_alias[a] = mod.id
+        for key in (mod.id, *mod.aliases):
+            folded = key.casefold()
+            if self._by_folded.setdefault(folded, mod.id) != mod.id:
+                self._by_folded[folded] = None
+
+    def _resolve(self, key: str) -> str | None:
+        if key in self._by_id:
+            return key
+        if key in self._by_alias:
+            return self._by_alias[key]
+        return self._by_folded.get(key.casefold())
 
     def get(self, key: str) -> Modification:
-        if key in self._by_id:
-            return self._by_id[key]
-        if key in self._by_alias:
-            return self._by_id[self._by_alias[key]]
+        found = self._resolve(key)
+        if found is not None:
+            return self._by_id[found]
+        if key.casefold() in self._by_folded:
+            raise KeyError(
+                f"{key!r} names more than one modification once case is ignored; "
+                "spell it as the vocabulary does"
+            )
         raise KeyError(f"unknown modification: {key!r}")
 
     def __contains__(self, key: object) -> bool:
-        return isinstance(key, str) and (key in self._by_id or key in self._by_alias)
+        return isinstance(key, str) and self._resolve(key) is not None
 
     def __getitem__(self, key: str) -> Modification:
         return self.get(key)

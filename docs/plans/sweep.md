@@ -616,9 +616,13 @@ the cell view, 2.2M cells in the in-memory run.
 - **Matched cells.** 79% of the 62.6M acquired MS2 cells were matched at 0.35 Da.
 
 **Left open**
-- **Residue case.** Whether ProForma residues are case-insensitive (`pepTIDEK` ≠ `PEPTIDEK` in the
-  key) waits on reading the spec. The local grammar allows lowercase letters and says nothing of their
-  meaning.
+- **Residue case: settled the same day.** The spec says "ProForma is case insensitive" (2.0 and 2.1;
+  2.1 excepts CV names, written as the CV writes them but looked up in any case, and element symbols).
+  Read as written, `pepTIDEK` parsed and then failed every mass, `[unimod:21]` and `[phospho]` were
+  unknown modifications, and `<[Carbamidomethyl]@c>` modified nothing (57 Da light, silently). The
+  parser now holds residues, residue locations, CV prefixes and group labels in one spelling,
+  `ModVocab.get` finds a name in any case unless two clash (UNIMOD has none), and the id key upper-cases
+  a hand-built `Peptidoform`. No producer here wrote another case, so no id on disk changes.
 - **MS3 and MSX** are tested on fakes only, since no such file is on this machine.
 
 ## Still to do
