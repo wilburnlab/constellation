@@ -26,6 +26,7 @@ Run from the project root, for example::
 
     python3 scripts/bench-sweep.py targets --library L.elib --mz-range 900 1000 --decoys --out t.parquet
     python3 scripts/bench-sweep.py time --bundle RUN --targets t.parquet --workers 1 4 --out time.jsonl
+    python3 scripts/bench-sweep.py time --bundle RUN --targets t.parquet --workers 4 --layouts scan_major precursor_major --out time.jsonl
     python3 scripts/bench-sweep.py gate --bundle RUN --targets t.parquet --top-peaks 0 150 50 --out gate.json
 """
 
@@ -138,10 +139,11 @@ def _cmd_run_one(args) -> None:
     tol = {lv: _tolerances(args)[min(lv, 2)] for lv in args.levels}
     settings = SweepSettings(tolerances=tol, rule=rule_named(args.rule), kernel=args.kernel,
                              block_rows=args.block_rows)  # fmt: skip
-    work = Path(args.work_dir) / f"w{args.workers}-{args.kernel}-{args.rule}" if args.workers > 1 else None
+    work = (Path(args.work_dir) / f"w{args.workers}-{args.kernel}-{args.rule}-{args.layout}"
+            if args.workers > 1 or args.layout == "precursor_major" else None)  # fmt: skip
     t0 = time.perf_counter()
     result = sweep(args.bundle, plan, settings, reducers=[XicTraceReducer()], workers=args.workers,
-                   work_dir=work)  # fmt: skip
+                   work_dir=work, layout=args.layout)  # fmt: skip
     t_sweep = time.perf_counter() - t0
     rows = (result.table("xic_trace").num_rows if not result.parts
             else sum(pq.ParquetFile(p).metadata.num_rows for p in result.parts["xic_trace"]))  # fmt: skip
@@ -149,7 +151,7 @@ def _cmd_run_one(args) -> None:
         "bundle": Path(args.bundle).name, "targets": Path(args.targets).name, "queries": plan.n_queries,
         "isotope_channels": 0 if plan.isotopes is None else plan.isotopes.n,
         "fragment_channels": 0 if plan.fragments is None else plan.fragments.n,
-        "levels": args.levels, "rule": args.rule, "kernel": args.kernel, "workers": args.workers,
+        "levels": args.levels, "rule": args.rule, "kernel": args.kernel, "workers": args.workers, "layout": args.layout,
         "rt_window": args.rt_window, "block_rows": args.block_rows, "torch_threads": torch.get_num_threads(),
         "compile_s": round(t_compile, 3), "sweep_s": round(t_sweep, 3), "rows": rows,
         "peak_rss_gb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6, 3),
@@ -202,10 +204,10 @@ def _run_guarded(cmd: list[str], max_rss_gb: float) -> tuple[int, str, str, floa
 
 def _cmd_time(args) -> None:
     out = open(args.out, "a")
-    for workers, kernel, rule, rt_window in itertools.product(args.workers, args.kernels, args.rules,
-                                                              args.rt_windows):  # fmt: skip
+    for workers, kernel, rule, rt_window, layout in itertools.product(args.workers, args.kernels, args.rules,
+                                                                      args.rt_windows, args.layouts):  # fmt: skip
         cmd = [sys.executable, __file__, "run-one", "--bundle", args.bundle, "--targets", args.targets,
-               "--levels", *map(str, args.levels), "--rule", rule, "--kernel", kernel,
+               "--levels", *map(str, args.levels), "--rule", rule, "--kernel", kernel, "--layout", layout,
                "--workers", str(workers), "--work-dir", args.work_dir, "--block-rows", str(args.block_rows),
                "--ms1-tolerance", str(args.ms1_tolerance), "--ms1-unit", args.ms1_unit,
                "--ms2-tolerance", str(args.ms2_tolerance), "--ms2-unit", args.ms2_unit,
@@ -219,7 +221,8 @@ def _cmd_time(args) -> None:
             line = json.dumps(row)
         else:
             line = json.dumps({"error": stderr[-2000:], "returncode": code, "group_peak_rss_gb": peak,
-                               "workers": workers, "kernel": kernel, "rule": rule, "rt_window": rt_window})  # fmt: skip
+                               "workers": workers, "kernel": kernel, "rule": rule, "rt_window": rt_window,
+                               "layout": layout})  # fmt: skip
         print(line, flush=True)
         out.write(line + "\n")
         out.flush()
@@ -410,6 +413,8 @@ def main() -> None:
             r.add_argument("--kernels", nargs="+", default=["auto"], choices=["auto", "channel", "point"])
             r.add_argument("--rules", nargs="+", default=["nearest"])
             r.add_argument("--rt-windows", type=float, nargs="+", default=[0.0])
+            r.add_argument("--layouts", nargs="+", default=["scan_major"], choices=["scan_major", "precursor_major"],
+                           help="How the bundle is read; precursor_major needs its precursor_major/ layout.")
             r.add_argument("--max-rss-gb", type=float, default=20.0,
                            help="Kill a configuration whose processes together pass this (default 20).")
             r.add_argument("--pause-s", type=float, default=0.0,
@@ -420,6 +425,7 @@ def main() -> None:
             r.add_argument("--kernel", default="auto", choices=["auto", "channel", "point"])
             r.add_argument("--rule", default="nearest")
             r.add_argument("--rt-window", type=float, default=None)
+            r.add_argument("--layout", default="scan_major", choices=["scan_major", "precursor_major"])
         r.set_defaults(func=func)
 
     g = subs.add_parser("gate")

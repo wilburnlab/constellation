@@ -26,8 +26,10 @@ number of the MS2 scan a match was made in.
 from __future__ import annotations
 
 import json
+from typing import Any
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from functools import cached_property
 
 import numpy as np
 import pyarrow as pa
@@ -43,6 +45,7 @@ from constellation.massspec.peptide.channels import (
     Channels,
     ChannelSettings,
     FragmentAbundance,
+    concat_channels,
     fragment_channels,
     isotope_channels,
 )
@@ -84,10 +87,46 @@ class QueryPlan:
     settings: ChannelSettings = field(default_factory=ChannelSettings)
     #: What the fragment abundances came from (``FragmentAbundance.describe``).
     fragment_abundance: dict = field(default_factory=lambda: dict(UNMODELLED.describe()))
+    #: For a plan taken from another (:meth:`take`), each query's number in
+    #: that plan, which is what outputs name it by; None: its own numbers.
+    query_ids: np.ndarray | None = None
 
     @property
     def n_queries(self) -> int:
         return int(self.rt_lo.size)
+
+    def global_query(self, queries: np.ndarray) -> np.ndarray:
+        """The number each of ``queries`` has in the plan this one was taken
+        from (its own number for a whole plan)."""
+        queries = np.asarray(queries, dtype=np.int64)
+        return queries if self.query_ids is None else self.query_ids[queries]
+
+    def take(self, queries: np.ndarray) -> QueryPlan:
+        """The plan of ``queries`` alone (positions, in the order given), as
+        queries 0, 1, ... that remember their numbers here: what a unit of
+        work is sent, so no worker holds the whole plan."""
+        queries = np.asarray(queries, dtype=np.int64)
+        return QueryPlan(
+            targets=self.targets.take(pa.array(queries)),
+            levels=self.levels,
+            precursor_charge=self.precursor_charge[queries],
+            precursor_mz=self.precursor_mz[queries],
+            precursor_mz_derived=self.precursor_mz_derived[queries],
+            rt_lo=self.rt_lo[queries],
+            rt_hi=self.rt_hi[queries],
+            assigned_scan=self.assigned_scan[queries],
+            isotopes=None if self.isotopes is None else self.isotopes.take(queries),
+            fragments=None if self.fragments is None else self.fragments.take(queries),
+            settings=self.settings,
+            fragment_abundance=self.fragment_abundance,
+            query_ids=self.global_query(queries),
+        )
+
+    @cached_property
+    def precursor_order(self) -> np.ndarray:
+        """Every query by precursor m/z (a stable sort, those with none
+        last): computed once per plan, not per block."""
+        return np.argsort(self.precursor_mz, kind="stable")
 
     def channels_for_level(self, level: int) -> Channels | None:
         return self.isotopes if level == 1 else self.fragments
@@ -99,6 +138,7 @@ class QueryPlan:
         queries = pa.table(
             {
                 "query": pa.array(np.arange(self.n_queries, dtype=np.int32)),
+                "source_query": pa.array(self.global_query(np.arange(self.n_queries)).astype(np.int32)),
                 "target_id": t.column("target_id"),
                 "modified_sequence": t.column("modified_sequence"),
                 "precursor_charge": pa.array(charge.astype(np.int8), mask=charge < 0),
@@ -112,6 +152,7 @@ class QueryPlan:
                 "precursor_id": t.column("precursor_id"),
                 "peptide_id": t.column("peptide_id"),
                 "is_decoy": t.column("is_decoy"),
+                "decoy_set": t.column("decoy_set"),
             },
             schema=SWEEP_QUERY_TABLE,
         )
@@ -191,6 +232,10 @@ class QueryPlan:
                         "precursor_id": queries.column("precursor_id"),
                         "peptide_id": queries.column("peptide_id"),
                         "is_decoy": queries.column("is_decoy"),
+                        **(
+                            {"decoy_set": queries.column("decoy_set")}
+                            if "decoy_set" in queries.column_names else {}
+                        ),
                     }
                 ),
                 XIC_TARGET_TABLE,
@@ -215,14 +260,26 @@ class QueryPlan:
             fragment_abundance=(
                 json.loads(meta[_ABUNDANCE_KEY].decode()) if _ABUNDANCE_KEY in meta else dict(UNMODELLED.describe())
             ),
+            query_ids=_source_queries(queries),
         )
+
+
+def _source_queries(queries: pa.Table) -> np.ndarray | None:
+    """A plan taken from another's query numbers there (None when they are
+    its own). Until 2026-11-09 a plan on disk forgot them, so a taken plan
+    swept on disk named its queries 0, 1, ... and in memory by their
+    numbers in the whole plan (review by Codex)."""
+    if "source_query" not in queries.column_names:
+        return None
+    ids = queries.column("source_query").to_numpy().astype(np.int64)
+    return None if np.array_equal(ids, np.arange(ids.size)) else ids
 
 
 def _channel_table(c: Channels) -> pa.Table:
     frag = c.kind == FRAGMENTS
     n = c.n
     none = np.ones(n, dtype=bool)
-    loss_names = np.array([None, *c.loss_ids], dtype=object)
+    loss_names = pa.array([None, *c.loss_ids], pa.string())
     return pa.table(
         {
             "kind": pa.array(np.full(n, c.kind, np.int8)),
@@ -234,7 +291,7 @@ def _channel_table(c: Channels) -> pa.Table:
             "ion_type": pa.array(c.ion_type, mask=None if frag else none),
             "position": pa.array(c.position, mask=None if frag else none),
             "fragment_charge": pa.array(c.fragment_charge, mask=None if frag else none),
-            "loss_id": pa.array(loss_names[c.loss] if frag else [None] * n, pa.string()),
+            "loss_id": loss_names.take(pa.array(c.loss.astype(np.int64))) if frag else pa.nulls(n, pa.string()),
             "abundance": pa.array(c.abundance, mask=np.isnan(c.abundance)),
             "evidence_key": pa.array(c.evidence_key),
         },
@@ -249,8 +306,13 @@ def _channels_from_table(kind: int, rows: pa.Table, n_queries: int, loss_ids: tu
     query = rows.column("query").to_numpy()
     offsets = np.zeros(n_queries + 1, dtype=np.int64)
     np.cumsum(np.bincount(query, minlength=n_queries), out=offsets[1:])
-    names = rows.column("loss_id").to_pylist()
-    lookup = {name: k + 1 for k, name in enumerate(loss_ids)}
+    names = rows.column("loss_id")
+    found = pc.index_in(names, value_set=pa.array(list(loss_ids), pa.string()))
+    unknown = pc.and_(names.is_valid(), found.is_null())
+    if pc.any(unknown).as_py():
+        raise ValueError(f"channels name losses the plan does not list ({loss_ids}): "
+                         f"{pc.unique(names.filter(unknown)).to_pylist()[:5]}")  # fmt: skip
+    loss = found.fill_null(-1).to_numpy(zero_copy_only=False).astype(np.int16) + 1
     return Channels(
         kind=kind,
         offsets=offsets,
@@ -260,7 +322,7 @@ def _channels_from_table(kind: int, rows: pa.Table, n_queries: int, loss_ids: tu
         ion_type=col("ion_type", np.int8, -1),
         position=col("position", np.int32, -1),
         fragment_charge=col("fragment_charge", np.int32, -1),
-        loss=np.array([0 if x is None else lookup[x] for x in names], dtype=np.int16),
+        loss=loss,
         abundance=rows.column("abundance").to_numpy(zero_copy_only=False).astype(np.float32),
         evidence_key=col("evidence_key", np.int32, 0),
         loss_ids=loss_ids,
@@ -333,6 +395,13 @@ def check_rt_window(targets: pa.Table) -> None:
         )
 
 
+#: Targets compiled at once. What a compile holds per target (its parsed
+#: peptide, its whole candidate ladder of some 80 ions before the top N are
+#: kept) is bounded by this, not by the number of targets: at 964k targets
+#: the ladder alone took over 10 GB before 2026-11-09.
+COMPILE_CHUNK = 1 << 16
+
+
 def compile_queries(
     targets: pa.Table,
     *,
@@ -342,6 +411,7 @@ def compile_queries(
     assigned_scans_only: bool = False,
     derive_precursor_mz: bool = True,
     fragment_abundance: FragmentAbundance = UNMODELLED,
+    chunk_targets: int | None = COMPILE_CHUNK,
 ) -> QueryPlan:
     """Compile extraction targets into a sweep's queries.
 
@@ -357,12 +427,126 @@ def compile_queries(
 
     Vectorized over targets: each distinct sequence is parsed once and
     its envelope and ladder built once; nothing else runs per target in
-    Python (1.3 ms a target at proteome scale until 2026-11-07).
+    Python (1.3 ms a target at proteome scale until 2026-11-07). Targets
+    are compiled ``chunk_targets`` at a time, in order of precursor id (so
+    a fragment library sorted by precursor is read a few row groups per
+    chunk), and the plan is the same, bit for bit, whatever the chunk.
     """
     levels = tuple(sorted(set(int(x) for x in levels)))
     if not levels or min(levels) < 1:
         raise ValueError(f"levels must be MS levels ≥ 1; got {levels!r}")
     t = cast_to_schema(targets, XIC_TARGET_TABLE)
+    n = t.num_rows
+    if rt_window is not None:
+        check_rt_window(t)
+    want_frag = any(level >= 2 for level in levels)
+    if want_frag and 1 not in levels:
+        _check_fragment_targets(t)
+    key = t.column("precursor_id").fill_null(np.iinfo(np.int64).max).to_numpy().astype(np.int64)
+    prepare = getattr(fragment_abundance, "prepare", None) if want_frag else None
+    if prepare is not None:
+        prepare(key[key != np.iinfo(np.int64).max])
+    try:
+        kwargs = dict(levels=levels, channels=channels, rt_window=rt_window, assigned_scans_only=assigned_scans_only,
+                      derive_precursor_mz=derive_precursor_mz, fragment_abundance=fragment_abundance)  # fmt: skip
+        if chunk_targets is None or n <= chunk_targets:
+            return _compile(t, **kwargs)
+        if chunk_targets < 1:
+            raise ValueError(f"chunk_targets must be at least 1, got {chunk_targets}")
+        order = np.argsort(key, kind="stable")
+        plans = [_compile(t.take(pa.array(order[i:i + chunk_targets])), **kwargs) for i in range(0, n, chunk_targets)]
+        return _join_plans(t, order, plans)
+    finally:
+        release = getattr(fragment_abundance, "release", None)
+        if prepare is not None and release is not None:
+            release()
+
+
+def _check_fragment_targets(t: pa.Table) -> None:
+    """At MS2 alone, a target that can define no fragments is an error, the
+    first in target order named (as the extractor did before matching)."""
+    modseq = t.column("modified_sequence")
+    present = np.asarray(pc.fill_null(pc.not_equal(modseq, ""), False).to_numpy(zero_copy_only=False), dtype=bool)
+    charge = t.column("precursor_charge").fill_null(-1).to_numpy().astype(np.int64)
+    bad = np.flatnonzero(~present | (charge < 1))
+    if bad.size:
+        i = int(bad[0])
+        target = t.column("target_id")[i].as_py()
+        if not present[i]:
+            raise ValueError(
+                f"target {target}: MS2 fragment extraction requires "
+                "modified_sequence (a bare-m/z target cannot define fragments)"
+            )
+        raise ValueError(f"target {target}: MS2 extraction requires precursor_charge")
+
+
+def _join_plans(t: pa.Table, order: np.ndarray, plans: list[QueryPlan]) -> QueryPlan:
+    """Plans compiled from ``t.take(order)`` chunk by chunk, as one plan of
+    ``t`` in its own order."""
+    inverse = np.empty(order.size, dtype=np.int64)
+    inverse[order] = np.arange(order.size, dtype=np.int64)
+
+    def per_query(name: str) -> np.ndarray:
+        return np.concatenate([getattr(p, name) for p in plans])[inverse]
+
+    def channels(name: str) -> Channels | None:
+        parts = [getattr(p, name) for p in plans]
+        return None if parts[0] is None else concat_channels(parts).take(inverse)
+
+    described = dict(plans[0].fragment_abundance)
+    if "report" in described:
+        report: dict[str, Any] = {}
+        for p in plans:
+            _merge_report(report, p.fragment_abundance.get("report") or {})
+        described["report"] = report
+    first = plans[0]
+    return QueryPlan(
+        targets=t,
+        levels=first.levels,
+        precursor_charge=per_query("precursor_charge"),
+        precursor_mz=per_query("precursor_mz"),
+        precursor_mz_derived=per_query("precursor_mz_derived"),
+        rt_lo=per_query("rt_lo"),
+        rt_hi=per_query("rt_hi"),
+        assigned_scan=per_query("assigned_scan"),
+        isotopes=channels("isotopes"),
+        fragments=channels("fragments"),
+        settings=first.settings,
+        fragment_abundance=described,
+    )
+
+
+def _merge_report(into: dict[str, Any], part: dict[str, Any]) -> None:
+    """Add one chunk's abundance report to the whole compile's: counts
+    sum, a ``max_`` value is the largest, examples gather (up to 5), and
+    anything else keeps its first value."""
+    for name, value in part.items():
+        have = into.get(name)
+        if have is None:
+            into[name] = dict(value) if isinstance(value, dict) else list(value) if isinstance(value, list) else value
+        elif isinstance(value, dict):
+            _merge_report(have, value)
+        elif isinstance(value, list):
+            have.extend(value[: max(0, 5 - len(have))])
+        elif isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        elif name.startswith("max_"):
+            into[name] = max(have, value)
+        else:
+            into[name] = have + value
+
+
+def _compile(
+    t: pa.Table,
+    *,
+    levels: tuple[int, ...],
+    channels: ChannelSettings,
+    rt_window: float | None,
+    assigned_scans_only: bool,
+    derive_precursor_mz: bool,
+    fragment_abundance: FragmentAbundance,
+) -> QueryPlan:
+    """:func:`compile_queries` on one chunk of cast targets."""
     n = t.num_rows
     want_ms1 = 1 in levels
     want_frag = any(level >= 2 for level in levels)
@@ -378,7 +562,11 @@ def compile_queries(
         peptide = np.where(present, np.nan_to_num(np.asarray(at, dtype=np.float64), nan=-1), -1).astype(np.int64)
     charge_col = t.column("precursor_charge")
     precursor_charge = charge_col.fill_null(-1).to_numpy().astype(np.int16)
-    has_charge = precursor_charge >= 0
+    # A charge below 1 is no charge (-1 here, null on disk). Until 2026-11-09
+    # charge 0 counted as one: its precursor m/z came out infinite and the
+    # query was never matched at MS2, with no word.
+    precursor_charge[precursor_charge < 1] = -1
+    has_charge = precursor_charge >= 1
 
     # Fragments are checked first and in target order, as the extractor did
     # before matching anything; they are the only errors raised before MS1's.
@@ -409,8 +597,6 @@ def compile_queries(
             pmz[want] = (masses[np.searchsorted(used, peptide[want])] + z * PROTON_MASS) / z.astype(np.float64)
             derived[want] = True
 
-    if rt_window is not None:
-        check_rt_window(t)
     rt_lo, rt_hi = _rt_bounds(t, rt_window)
     assigned = (
         t.column("scan").fill_null(-1).to_numpy().astype(np.int64)

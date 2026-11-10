@@ -155,7 +155,8 @@ TRANSMISSION_PEPTIDE_PRECURSOR: pa.Schema = pa.schema(
 
 #: 2 (2026-11-05): ``is_decoy``.
 #: 3 (2026-11-07): ``rt_library`` and ``rt_scale``.
-XIC_TARGET_SCHEMA_VERSION: int = 3
+#: 4 (2026-11-09): ``decoy_set``.
+XIC_TARGET_SCHEMA_VERSION: int = 4
 
 
 # The normalized extraction-target contract: the single thing the
@@ -196,6 +197,12 @@ XIC_TARGET_TABLE: pa.Schema = pa.schema(
         # A decoy target (from a search space's decoys); null where the
         # source does not say. Carried into the sweep's queries and summary.
         pa.field("is_decoy", pa.bool_(), nullable=True),
+        # Which set of decoys a decoy belongs to (`PEPTIDE_TABLE.decoy_set`:
+        # 0 the search's own decoys, 1, 2, ... extra or entrapment sets);
+        # null for a target and where the source does not say. Which sets
+        # compete in an FDR estimate is the estimate's decision, not this
+        # table's, so every set is carried as it is.
+        pa.field("decoy_set", pa.int16(), nullable=True),
         # The source library's own retention time and the clock it is on
         # (`x.massspec.prediction.rt_scale`): `observed` (a run's seconds,
         # which is then also `rt_center`) or a model's scale, for the

@@ -641,10 +641,11 @@ class TestConvert:
         _, src = raw
         m = convert(src, tmp_path / "run")
         assert {p.name for p in (tmp_path / "run").iterdir()} == {
-            "manifest.json", "peaks", "scan_metadata.parquet",
+            "manifest.json", "peaks", "precursor_major", "scan_metadata.parquet",
             "acquisition_metadata.parquet",
         }
         assert [p.name for p in (tmp_path / "run" / "peaks").iterdir()] == ["part-00000.parquet"]
+        assert m.outputs["precursor_major"] == "precursor_major"
         assert m.schema_version == 3
         assert m.outputs["peaks"] == "peaks"
         assert m.parameters["peaks"] == "centroid"

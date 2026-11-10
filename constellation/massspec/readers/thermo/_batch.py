@@ -81,6 +81,7 @@ def convert_batch(
     compute_sha256: bool = True,
     allow_empty_levels: bool = False,
     progress_cb: ProgressCallback | None = None,
+    precursor_major: bool = True,
 ) -> list[BatchResult]:
     """Convert ``N`` ``.raw`` files into ``N`` bundles, in ``n_workers`` processes.
 
@@ -157,6 +158,7 @@ def convert_batch(
         batch_size=batch_size,
         compute_sha256=compute_sha256,
         allow_empty_levels=allow_empty_levels,
+        precursor_major=precursor_major,
     )
     jobs = {_Job(path, bundle, options, force=force): path for path, bundle in pending}
 

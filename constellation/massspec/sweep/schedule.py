@@ -47,6 +47,30 @@ def ragged_arange(starts: np.ndarray, counts: np.ndarray) -> np.ndarray:
     )
 
 
+def order_by(*keys: np.ndarray) -> np.ndarray:
+    """The stable order that sorts rows by ``keys``, the first the most
+    significant: ``np.lexsort(keys[::-1])``, row for row. Integer keys are
+    combined in mixed radix over the ranges they hold into one int64 when
+    that fits in 62 bits, which sorts about six times faster than a
+    lexsort of five keys (the match sort cost more than matching did on a
+    real run, 2026-11-09); otherwise it is the lexsort."""
+    keys = tuple(np.asarray(k) for k in keys)
+    n = keys[0].size if keys else 0
+    if n == 0:
+        return np.empty(0, dtype=np.int64)
+    if any(k.dtype.kind not in "iub" for k in keys):
+        return np.lexsort(keys[::-1])
+    lows = [int(k.min()) for k in keys]
+    bases = [int(k.max()) - lo + 1 for k, lo in zip(keys, lows, strict=True)]
+    if float(np.prod([float(b) for b in bases])) >= 2.0**62:
+        return np.lexsort(keys[::-1])
+    combined = np.zeros(n, dtype=np.int64)
+    for k, lo, base in zip(keys, lows, bases, strict=True):
+        combined *= base
+        combined += k.astype(np.int64) - lo
+    return np.argsort(combined, kind="stable")
+
+
 def active_queries(
     rt_lo: np.ndarray, rt_hi: np.ndarray, has_channels: np.ndarray, t0: float, t1: float
 ) -> np.ndarray:
@@ -71,21 +95,28 @@ def isolation_groups(
     rows: np.ndarray,
     *,
     gate: bool,
+    order: np.ndarray | None = None,
 ) -> list[ScanGroup]:
     """Group a level's scans (``rows`` of the block, with isolation bounds
     ``lower`` / ``upper``) by window, each with the active queries the window
     covers. With ``gate`` false (MS1) every scan is in one group with every
-    active query."""
+    active query. ``order`` is every query by precursor m/z (a stable sort,
+    NaN last: ``QueryPlan.precursor_order``), so the active ones need no
+    sort of their own; until 2026-11-09 they were sorted at every block,
+    about 2 s a block at 9.56M queries."""
     if rows.size == 0 or active.size == 0:
         return []
     if not gate:
         return [ScanGroup(rows=rows, queries=active)]
-    pmz = precursor_mz[active]
-    finite = ~np.isnan(pmz)
-    order = np.argsort(pmz[finite], kind="stable")
-    gated = active[finite][order]
-    gated_pmz = pmz[finite][order]
-    passall = active[~finite]
+    if order is None:
+        order = np.argsort(precursor_mz, kind="stable")
+    is_active = np.zeros(precursor_mz.size, dtype=bool)
+    is_active[active] = True
+    by_mz = order[is_active[order]]
+    pmz_sorted = precursor_mz[by_mz]
+    n_finite = int(np.count_nonzero(~np.isnan(pmz_sorted)))
+    gated, gated_pmz = by_mz[:n_finite], pmz_sorted[:n_finite]
+    passall = np.sort(by_mz[n_finite:])
     unbounded = np.isnan(lower) | np.isnan(upper)
     # Windows compared exactly: group scans whose float64 bounds are equal.
     key_lo = np.where(unbounded, -np.inf, lower)

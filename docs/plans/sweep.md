@@ -1,11 +1,14 @@
 # The sweep: matching queries against an acquisition in one pass
 
-Status: P0–P6 built on `feat/sweep` (2026-11-03; vocabulary renamed 2026-11-04); P7 (the two-pass
-gate at proteome scale) is what the measurements below call for. Plumbing for a scorer
+Status: P0–P6 built on `feat/sweep` (2026-11-03; vocabulary renamed 2026-11-04). Plumbing for a scorer
 (2026-11-07, `feat/query-plumbing`): channels from one generator with abundances (a library's
 predictions, or a uniform series) and top-N, MS1 at each target's own charge, the reducer's cell view
 and scan context, reducers of several outputs, sweeping a scan or RT range, and the review's sweep
-defects ("Plumbing for a scorer" below).
+defects ("Plumbing for a scorer" below). The sweep read precursor-major (2026-11-09,
+`feat/precursor-major-sweep`): a bundle's points also stored by isolation window, a unit of queries
+read and reduced at a time with nothing shuffled, the two-pass gate (P7) inside a unit, and the match
+path's sorts and nearest rule made cheaper ("Precursor-major" below); for a DIA search this replaces
+the map/reduce below.
 
 ## Why
 
@@ -98,8 +101,12 @@ the gate, claims, a summary and workers. `extract_xic_scan_major` (Mode A) is on
   rebuild for DIA) with exact comparisons at window edges, and its build is amortized over the block's
   visits of the window. The bucket layout stays the option if measurements show the index build
   dominating.
-- **Map/reduce, not finalizing a query when it leaves the active set.** A global XIC never leaves; a
-  query's trace crosses shards; claims are per scan. So shards (contiguous scan ranges cut from the
+- **Map/reduce, not finalizing a query when it leaves the active set.** (Superseded for DIA search on
+  2026-11-09, "Precursor-major" below: the reason given here, that a query's trace crosses shards "in
+  any parallel scheme", holds for scan-range shards, not for DIA MS2, where a window over the whole
+  gradient holds every scan a query can be matched in; the cost of the shuffle at proteome scale was
+  about 16 bytes on disk per match, some 100 GB for one GPF fraction against the human proteome.)
+  A global XIC never leaves; a query's trace crosses shards; claims are per scan. So shards (contiguous scan ranges cut from the
   footers) write their matches sorted by query, and the reduce takes contiguous ranges of queries sized
   by match counts. Determinism: shard and bucket boundaries depend on the data alone, sums run in m/z
   order within a scan, every sort has a total key, and workers use one torch thread. Output is
@@ -438,13 +445,90 @@ below.
   settled on a complex sample, and the fragment charge ceilings differ between the two columns. Under
   top 10, five ions is the place to start.
 
+## Precursor-major (2026-11-09, `feat/precursor-major-sweep`)
+
+Why: at proteome scale with no retention-time window, three quarters of a GPF run's cells hold a
+peak within 0.35 Th, so the scan-major sweep's map wrote every one of them (6.5 billion matches for one
+GPF fraction against the human proteome: about 104 GB and an estimated 2.8 h), and its workers held
+10.5–11 GB. A DIA query is only matched in scans of the windows holding its precursor, so read by
+window the trace crosses nothing, and a unit of queries can be read, matched and reduced in one task,
+writing the reducers' rows only (EncyclopeDIA's design). A scratch prototype of that (dense traces by
+`bincount`, a stand-in scorer) ran the GPF fraction in 7.3 min and 16 MB.
+
+**The layout** (`massspec.precursor_major`; named to pair with scan-major, PI). The same points again,
+ordered by the precursor m/z each can be evidence for: `precursor_major/ms<L>/part-RRRRR.parquet` (L ≥ 2:
+`lower`, `scan`, `mz`, `intensity`, sorted by the scan's isolation lower bound, so a scan's points stay
+together in stored order) and `ms1/part-RRRRR.parquet` (`mz`, `intensity`, `scan`, `point`, sorted by
+m/z), one file per peak part, so no DIA/DDA scheme is decided; `scans.parquet` (every scan's point
+count); a stage key over a digest of every byte of the peak parts and the scan metadata. A copy, not
+an index into `peaks/`: Parquet reads pages, and every row group of `peaks/` holds every window.
+One build writes it (`build_precursor_major`, one process per peak part at a time): `convert` runs it as
+its last step, on by default (`--no-precursor-major` to skip, as `--no-profile` skips the profile), and
+`centroid`, the spectra-file import and `massspec precursor-major BUNDLE` run the same build. It was first
+written by convert's range workers as they read; built afterwards it is as fast and holds far less
+(measurements below; PI, 2026-11-09).
+
+**The sweep** (`sweep(..., layout='precursor_major')`, `sweep.precursor_major`). A unit is a run of
+queries in (precursor m/z, query) order: whole window segments while its cells stay within
+`unit_cells` (or the plan's over 16, so a small plan is still spread) and its windows within 4M points,
+a segment over the budget cut by cells. It reads every scan any of its queries is eligible in (their
+windows, inclusive; unbounded scans; every scan for a query without a precursor m/z) and at MS1 each
+isotope channel's m/z ± its tolerance and the m/z axis's largest correction, so where units are cut
+never changes what a query is matched against. Its blocks span at most half its queries' typical RT
+window. Inside, batches in m/z order (`batch_cells`) run the scan-major sweep's own `_map_block`,
+`_batch` and `_reduce` on a plan taken for the batch (`QueryPlan.take`, numbering queries as in the
+whole plan), one part per unit and output. With every reducer gated the batch decides the gate first
+and matches only what it passed (`gate_first`, P7's intent). Refused: claims (a point is claimed across
+units), the gate's MS1 isotope evidence (a unit reads a slice of each MS1 scan), a table of points.
+
+**Held to scan-major.** For every query the same rows, bit for bit: 41 synthetic cases (DIA, staggered,
+DDA; both levels; every rule; RT windows, ppm and Da, the gate, ranges, a 0.3 Th m/z correction,
+windows overlapping by 1 Th, a precursor on a bound, scans without bounds, queries without a precursor
+m/z, tiny units and batches, two workers) and the XIC parity oracle (72 more). On real data:
+the GPF fraction with the chromatogram library's 7,540 targets and decoys at ±120 s, both levels,
+0.35 Da: the same 36,052,672 zero-filled trace rows and the same summaries (precursor-major 21.6 s and
+23.0 s against 13.8–24.7 s and 24.2 s scan-major on 4 workers; it took 65.7 s before units were spread
+and blocks bounded in time); the wide-window run with the library's 152,895 targets and decoys, the
+same way: the same summaries (418M MS2 matches; precursor-major 103 s against 172 s) and the same
+33,716,272 trace rows for 10,000 of them; the full human space on a 2-minute slice of the GPF run (526k
+queries, 105M matches): the same summaries.
+
+**Measured** (this machine, 12 logical cores, WSL2; scratch inputs):
+
+| | before | now |
+|---|---|---|
+| GPF 900–1000 × full human space (526,013 queries, top 10, 0.35 Th, no RT window, MS2, summary) | scan-major estimate ≈ 2.8 h, ≈ 104 GB of matches | 21.7 min on 4 workers, 7.6 GB peak, 27 MB written; 6,490,106,805 matches (the cells holding a peak, as counted independently); 0.61 µs per cell per worker |
+| One unit of that (a 2-minute slice, 105M matches, one process) | 108 s | 42 s: the five-key match sort (57 %) became one combined-key sort (`order_by`), and the point-driven nearest no longer sorts its candidates |
+| Scan-major map on the same slice, 4 workers | 10.5–11 GB per worker | 2.3 GB per worker (flushed per window group, runs capped at `run_rows`) |
+| `convert`, GPF / wide-window, 8 workers (two rounds, alternated) | 28–29 s / 60–67 s, 8.6–8.9 / 10.9–11.2 GB | with the layout (the same size as `peaks/`): built afterwards 45–46 s / 101–105 s at 8.5 / 11.0 GB; written by the range workers as they read (first version) 41–43 s / 94–96 s at 10.4–10.6 / 16.8–17.7 GB; byte-identical |
+| The layout built afterwards, 4 workers | `mz_index`: 2 / 12 min | 11 s / about 30 s |
+| Compile of the GPF prediction (526k targets, MS2 top 10) | 76 s (chunked by hand; the compile itself aborted on unpredicted precursors) | 72 s, 3.9 GB from an unsorted file; 56 s, 2.9 GB from one sorted by precursor |
+| Prediction of the GPF library (JChronologer, 4 threads) | 300 s, 7.9 GB | 332 s, 4.8 GB; the same predictions bit for bit, written sorted by precursor |
+
+The prototype's 7.3 min had a lighter workload (no RT test, the sum rule, no explicit match rows); the
+remaining factor of three is the long-format match rows and their sort, which a dense kernel and view
+for the scorer would avoid (deferred to the scorer, which decides their shape; PI). Not run: the
+wide-window run against the full space unscheduled (about 177B cells, estimated 45–60 min on 4–8
+workers) and the full space predicted (9.56M precursors, about 100 min at 4 threads), both beyond this
+machine's run budget; nothing measured suggests either would not fit in memory.
+
+**Review by Codex (2026-11-09).** Five defects, each fixed with a test that fails on the code before:
+a precursor-major sweep's workers kept what they read by bundle, range and the literal `mz_axis`, so a
+second sweep in the same process with `latest` used an older curve and named the newer one (now kept
+for one sweep, with the curve and layout the parent resolved); the layout's key hashed each peak part's
+size and footer, which two values swapped inside a page keep (now xxh3-128 of every byte, about 1 s for
+the wide-window run's 2 GB); a scan missing only its upper isolation bound kept a finite `lower`, so its
+points were never read for the queries the sweep holds it eligible for (layout version 2: either bound
+missing is unbounded); a library's annotation tolerance recorded as `da` was read as ppm; and a plan
+taken from another lost its query numbers on disk (`source_query` on `SWEEP_QUERY_TABLE`).
+
 ## Still to do
 
-- P7, only if the measurements call for it:
-  - the two-pass gate at proteome scale (evidence only, then traces for the survivors). The timing table
-    calls for it: at 139k queries the sweep's time follows the 476M matches it writes;
-  - the bucket index layout, if a profile shows the per-group index build mattering. Not measured on
-    its own yet; the kernel is a minority of a sweep's time.
+- P7: the two-pass gate is built inside a precursor-major unit (`gate_first`, above); the scan-major
+  sweep still writes every match. The bucket index layout, if a profile shows the per-group index
+  build mattering.
+- Precursor-major: claims across units, units cut by retention time as well (for calibrated windows),
+  and the dense kernel and `QueryBatch.dense` view, all with the scorer.
 - The scorer (elution peaks, co-elution evidence, library similarity, a verdict rule) as a reducer of
   several outputs over `QueryBatch.cells`, FDR, and output as an experiment directory the browser
   reads: the next plans.

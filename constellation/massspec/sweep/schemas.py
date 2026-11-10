@@ -24,7 +24,8 @@ from constellation.core.io.schemas import register_schema
 #: distribution and channels may be a top-N selection; the scan ledger
 #: carries each scan's TIC and injection time; the cell view
 #: (:data:`SWEEP_CELL_TABLE`).
-SWEEP_SCHEMA_VERSION: int = 4
+#: 5 (2026-11-09): ``decoy_set`` on queries and the query summary; ``source_query`` on queries.
+SWEEP_SCHEMA_VERSION: int = 5
 
 
 def _meta(name: str) -> dict[bytes, bytes]:
@@ -37,6 +38,10 @@ def _meta(name: str) -> dict[bytes, bytes]:
 SWEEP_QUERY_TABLE: pa.Schema = pa.schema(
     [
         pa.field("query", pa.int32(), nullable=False),
+        # The query's number in the plan this one was taken from
+        # (``QueryPlan.take``), which outputs name it by; ``query`` for a
+        # whole plan.
+        pa.field("source_query", pa.int32(), nullable=False),
         pa.field("target_id", pa.int64(), nullable=False),
         pa.field("modified_sequence", pa.string(), nullable=True),
         pa.field("precursor_charge", pa.int8(), nullable=True),
@@ -53,6 +58,8 @@ SWEEP_QUERY_TABLE: pa.Schema = pa.schema(
         pa.field("peptide_id", pa.int64(), nullable=True),
         # The target's decoy flag; null where its source did not say.
         pa.field("is_decoy", pa.bool_(), nullable=True),
+        # The decoy's set (`XIC_TARGET_TABLE.decoy_set`); null for a target.
+        pa.field("decoy_set", pa.int16(), nullable=True),
     ],
     metadata=_meta("SweepQuery"),
 )
@@ -166,6 +173,8 @@ SWEEP_QUERY_SUMMARY_TABLE: pa.Schema = pa.schema(
         pa.field("precursor_charge", pa.int8(), nullable=True),
         # Null where the target's source did not say (a decoy rate needs it).
         pa.field("is_decoy", pa.bool_(), nullable=True),
+        # Which set a decoy belongs to; which sets compete is FDR's choice.
+        pa.field("decoy_set", pa.int16(), nullable=True),
         # The evidence gate's verdict; null without a gate.
         pa.field("gate_applicable", pa.bool_(), nullable=True),
         pa.field("passed", pa.bool_(), nullable=True),

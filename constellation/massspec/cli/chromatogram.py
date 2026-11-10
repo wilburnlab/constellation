@@ -100,7 +100,14 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
                         help="Keep unmatched query rows (intensity 0) instead of dropping.")
     common.add_argument("--no-progress", action="store_true")
 
-    sweepg = p.add_argument_group("sweep (default mode)")
+    sweepg = p.add_argument_group("sweep")
+    sweepg.add_argument("--layout", choices=("scan-major", "precursor-major"), default="scan-major",
+                        help="How the bundle is read: scan-major (its peaks in scan ranges, every match "
+                             "shuffled to the targets; output in target order) or precursor-major (its "
+                             "precursor_major/ layout a unit of targets at a time, nothing shuffled; the "
+                             "same rows per target, in units of targets by precursor m/z). "
+                             "Precursor-major scales with the targets, not their matches: the layout for "
+                             "a search at proteome scale.")
     sweepg.add_argument("--mz-axis", default=None, metavar="KEY",
                         help="Correct observed m/z with the bundle's measured m/z axis KEY "
                              "(or `latest`) before matching.")
@@ -142,18 +149,10 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
     gateg.add_argument("--only-passing", action="store_true",
                        help="Write only the targets the gate passed into the trace.")
 
-    idxg = p.add_argument_group("index (Mode B)")
-    idxg.add_argument("--use-index", action="store_true",
-                      help="Use the mass index (Mode B); build it in-line if absent.")
-    idxg.add_argument("--index-dir", type=Path, default=None,
-                      help="Index location override (default <peaks-dir>/mz_index/).")
-    idxg.add_argument("--rebuild-index", action="store_true",
-                      help="Force-rebuild the index (implies --use-index).")
-    idxg.add_argument("--downcast", default="",
-                      help="f32 axes when building the index (subset of {mz,rt,intensity}).")
-    idxg.add_argument("--exact-error", action="store_true",
-                      help="Mode B + f32-m/z index: re-derive f64 mz error for survivors "
-                           "from --peaks-dir.")
+    # Mode B (the m/z-sorted index, target by target) was retired on
+    # 2026-11-09; its flags stay to say what replaces them.
+    for flag in _REMOVED_EXTRACT_FLAGS:
+        p.add_argument(flag, default=None, nargs="?", const=True, help=argparse.SUPPRESS)
 
     ms1g = p.add_argument_group("MS1 precursor-isotope options (with --level 1 or both)")
     ms1g.add_argument("--n-isotopes", type=int, default=None,
@@ -207,6 +206,20 @@ def _default_workers() -> int:
     return max(1, min(4, os.cpu_count() or 1))
 
 
+#: Flags of the retired Mode B, and what to say when one is given.
+_REMOVED_EXTRACT_FLAGS = {
+    "--use-index": "--use-index was removed (Mode B, retired 2026-11-09): read a bundle by isolation "
+                   "window with --layout precursor-major, which gives each target the rows the default "
+                   "sweep gives it",
+    "--rebuild-index": "--rebuild-index was removed with Mode B: --layout precursor-major reads "
+                       "<bundle>/precursor_major/ (`massspec precursor-major BUNDLE` writes it)",
+    "--index-dir": "--index-dir was removed with Mode B: --layout precursor-major reads the bundle's own "
+                   "precursor_major/",
+    "--downcast": "--downcast was removed with Mode B: traces are always the bundle's f64 values",
+    "--exact-error": "--exact-error was removed with Mode B: traces are always the bundle's f64 values",
+}
+
+
 def _parse_downcast(s: str) -> tuple[str, ...]:
     return tuple(x.strip() for x in s.split(",") if x.strip())
 
@@ -247,16 +260,14 @@ def _resolve_ion_types(spec: str):
 def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
     import shutil
 
-    from constellation.massspec.quant.chromatogram import (
-        extract_xic,
-        extract_xic_indexed,
-        save_xic,
-        write_xic_manifest,
-    )
-    from constellation.massspec.quant.peak_index import INDEX_DIRNAME, build_peak_index
+    from constellation.massspec.quant.chromatogram import extract_xic, write_xic_manifest
     from constellation.massspec.quant.targets import load_targets
     from constellation.massspec.sweep import ChannelSettings
 
+    for flag, message in _REMOVED_EXTRACT_FLAGS.items():
+        if getattr(args, flag.lstrip("-").replace("-", "_"), None) is not None:
+            print(f"error: {message}", file=sys.stderr)
+            return 2
     if not args.peaks_dir.exists():
         print(f"error: peaks not found: {args.peaks_dir}", file=sys.stderr)
         return 2
@@ -322,6 +333,18 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     coverage = getattr(source, "coverage", None) or {}
+    if args.fragment_abundance == "library" and not coverage and 2 in levels and (
+        args.ion_types is None or args.max_fragment_charge is None
+    ):
+        # Until 2026-11-09 this fell back to b/y at fragment charge 2, which
+        # cost 13-16 % of 3+/4+ precursors an ion of their top 10.
+        print(
+            "error: the fragment library records no coverage (which ion series and fragment charges its "
+            "spectra speak for; an empirical library's do not say): give --ion-types and "
+            "--max-fragment-charge",
+            file=sys.stderr,
+        )
+        return 2
     # A library's model says which ions it speaks for: unless told
     # otherwise, its ion series and charge ceiling are the channels'.
     ion_types = _resolve_ion_types(args.ion_types or ",".join(coverage.get("ion_types") or ["b", "y"]))
@@ -343,43 +366,15 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
         print("error: --top-isotopes and --n-isotopes choose the isotopes two ways; give one", file=sys.stderr)
         return 2
 
-    use_index = args.use_index or args.rebuild_index
-    if use_index:
-        if len(levels) > 1 or rule == "sum":
-            print("error: the mass index (--use-index) extracts one level at a time, by the "
-                  "nearest peak or all peaks in a window", file=sys.stderr)  # fmt: skip
+    layout = args.layout.replace("-", "_")
+    if layout == "precursor_major":
+        refused = [flag for flag, on in {"--claims": args.claims, "--min-isotopes": args.min_isotopes is not None}.items()
+                   if on]  # fmt: skip
+        if refused:
+            print(f"error: {', '.join(refused)} need the scan-major sweep (claims need every target that matched "
+                  "a point; MS1 isotope evidence ranks a whole MS1 scan): drop --layout precursor-major",
+                  file=sys.stderr)  # fmt: skip
             return 2
-        sweep_only = [flag for flag, on in {
-            **gate_flags, "--only-passing": args.only_passing, "--mz-axis": args.mz_axis is not None,
-            "--claims": args.claims, "--summary": args.summary, "--work-dir": args.work_dir is not None,
-        }.items() if on]  # fmt: skip
-        if sweep_only:
-            print(f"error: {', '.join(sweep_only)} belong to the sweep; the mass index "
-                  "(--use-index) does not apply them", file=sys.stderr)  # fmt: skip
-            return 2
-        level = levels[0]
-        tolerance, tolerance_unit = tolerances[level]
-        index_dir = args.index_dir or (args.peaks_dir / INDEX_DIRNAME)
-        manifest_exists = (index_dir / "manifest.json").exists()
-        if args.rebuild_index or not manifest_exists:
-            if not args.no_progress:
-                print(f"building peak index at {index_dir}", file=sys.stderr)
-            build_peak_index(args.peaks_dir, index_dir, downcast=_parse_downcast(args.downcast))
-        table = extract_xic_indexed(
-            index_dir, targets, exact_error=args.exact_error, peaks_dir=args.peaks_dir,
-            acquisition_id=args.acquisition_id, level=level, rt_window=args.rt_window,
-            tolerance=tolerance, tolerance_unit=tolerance_unit,
-            all_in_window=rule == "all", assigned_scans_only=args.assigned_scans_only,
-            drop_unmatched=args.drop_unmatched, channels=settings, fragment_abundance=source,
-        )  # fmt: skip
-        save_xic(table, args.output_dir, metadata={
-            "level": level, "mode": "indexed", "tolerance": tolerance, "tolerance_unit": tolerance_unit,
-            "channels": settings.to_dict(), "fragment_abundance": source.describe(),
-        })  # fmt: skip
-        if not args.no_progress:
-            print(f"extracted {table.num_rows} XIC rows → {args.output_dir}", file=sys.stderr)
-        return 0
-
     bundle = (args.peaks_dir / "manifest.json").is_file()
     if bundle:
         _warn_tolerance_against_analyzer(args.peaks_dir, tolerances)
@@ -399,25 +394,43 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
             max_gap_s=args.max_gap_s,
             min_isotopes=args.min_isotopes,
         )
+    if gate is not None and 2 in levels and settings.top_fragments is not None \
+            and settings.top_fragments < gate.min_fragments:  # fmt: skip
+        print(
+            f"error: --top-fragments {settings.top_fragments} keeps fewer ions than the gate's "
+            f"--min-fragments {gate.min_fragments}, so no query could pass",
+            file=sys.stderr,
+        )
+        return 2
     if args.only_passing and gate is None:
         print("error: --only-passing needs a gate (--gate, or --min-fragments and friends)", file=sys.stderr)
         return 2
     on_disk = bundle and (args.workers > 1 or args.work_dir is not None)
     work = (args.work_dir or args.output_dir / ".sweep") if on_disk else None
+    if layout == "precursor_major" and not bundle:
+        print("error: --layout precursor-major reads a converted bundle's precursor_major/; give a bundle as "
+              "--peaks-dir", file=sys.stderr)  # fmt: skip
+        return 2
     progress = None
     if not args.no_progress:
         from constellation.core.progress import StreamProgress
 
         progress = StreamProgress()
-    result = extract_xic(
-        args.peaks_dir, targets, acquisition_id=args.acquisition_id, levels=levels,
-        tolerances=tolerances,
-        channels=settings, fragment_abundance=source,
-        rt_window=args.rt_window, rule=rule, assigned_scans_only=args.assigned_scans_only,
-        drop_unmatched=args.drop_unmatched, mz_axis=args.mz_axis, gate=gate,
-        only_passing=args.only_passing, claims=args.claims, summary=args.summary,
-        workers=args.workers if on_disk else 1, work_dir=work, progress=progress,
-    )  # fmt: skip
+    try:
+        result = extract_xic(
+            args.peaks_dir, targets, acquisition_id=args.acquisition_id, levels=levels,
+            tolerances=tolerances,
+            channels=settings, fragment_abundance=source,
+            rt_window=args.rt_window, rule=rule, assigned_scans_only=args.assigned_scans_only,
+            drop_unmatched=args.drop_unmatched, mz_axis=args.mz_axis, gate=gate,
+            only_passing=args.only_passing, claims=args.claims, summary=args.summary,
+            workers=args.workers if on_disk else 1, work_dir=work, progress=progress, layout=layout,
+        )  # fmt: skip
+    except ValueError as exc:
+        if layout != "precursor_major":
+            raise
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     # The result stamps each output with the tolerances (Counter reads the trace's).
     out = result.write("xic_trace", args.output_dir / "xic_trace.parquet")
     tables = ["xic_trace.parquet"]
@@ -426,7 +439,7 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
             result.write(name, args.output_dir / f"{name}.parquet")
             tables.append(f"{name}.parquet")
     metadata = {
-        "levels": levels, "mode": "scan_major", "engine": "sweep", "rule": rule,
+        "levels": levels, "mode": layout, "engine": "sweep", "rule": rule,
         "tolerances": {str(lv): {"value": t, "unit": u} for lv, (t, u) in tolerances.items()},
         "mz_axis": result.mz_axis, "tables": tables,
         "channels": settings.to_dict(), "fragment_abundance": source.describe(),

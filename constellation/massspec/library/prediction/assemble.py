@@ -29,16 +29,19 @@ Everything is numpy over whole arrays. A backend that also returns m/z
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 
 from constellation.core.sequence.proforma import Peptidoform, parse_proforma
 from constellation.massspec.library.prediction.base import FragmentArrays, Requests, sites_key
 from constellation.massspec.library.schemas import LIBRARY_FRAGMENT_TABLE
 from constellation.massspec.peptide.ions import IonType, LadderArrays, bond_position, fragment_ladder_arrays_batch
 
-__all__ = ["Ladders", "fragment_table", "ladders_for", "reported_mz_error_ppm"]
+__all__ = ["Ladders", "SortedFragmentWriter", "fragment_table", "ladders_for", "reported_mz_error_ppm"]
 
 
 class Ladders:
@@ -214,3 +217,78 @@ def reported_mz_error_ppm(fragments: FragmentArrays, requests: Requests, ion_typ
     position = np.asarray(bond_position(fragments.ion_type, fragments.ion_number.astype(np.int64), length))
     ours = ladders.mz(local, fragments.ion_type, position, fragments.fragment_charge, fragments.loss, fragments.loss_ids)
     return float(np.max(np.abs(fragments.mz_reported - ours) / ours) * 1e6)
+
+
+class SortedFragmentWriter:
+    """Fragment tables written as they come, out as one file sorted by
+    precursor (a stable sort: a precursor's rows keep their order), in
+    bounded memory: rows go to one of ``buckets`` files by their precursor
+    id's top bits (ids are xxh64, so the buckets come out even), and each
+    bucket is sorted alone and appended in order at :meth:`close`. Row
+    groups of ``row_group_size``, so a reader of a range of precursors
+    (``LibraryFragments``) reads a few of them. A prediction streamed
+    before 2026-11-09 was in request order, and every compile decoded all
+    of it."""
+
+    def __init__(self, path: Path | str, *, buckets: int = 64, row_group_size: int = 1 << 17) -> None:
+        import tempfile
+
+        self.path = Path(path)
+        self.buckets = int(buckets)
+        self.row_group_size = int(row_group_size)
+        self._dir = Path(tempfile.mkdtemp(prefix=".fragments-", dir=self.path.parent))
+        self._writers: dict[int, pq.ParquetWriter] = {}
+        self.rows = 0
+
+    def _bucket(self, ids: np.ndarray) -> np.ndarray:
+        # Content ids are non-negative int64: their top bits are uniform.
+        shift = max(63 - int(np.log2(self.buckets)), 0)
+        return np.clip(ids >> shift, 0, self.buckets - 1)
+
+    def write_table(self, table: pa.Table) -> None:
+        if table.num_rows == 0:
+            return
+        table = table.cast(LIBRARY_FRAGMENT_TABLE)
+        bucket = self._bucket(table.column("precursor_id").to_numpy())
+        order = np.argsort(bucket, kind="stable")
+        edges = np.searchsorted(bucket[order], np.arange(self.buckets + 1))
+        for b in np.flatnonzero(np.diff(edges)).tolist():
+            part = table.take(pa.array(order[edges[b]:edges[b + 1]]))
+            if b not in self._writers:
+                self._writers[b] = pq.ParquetWriter(self._dir / f"{b:04d}.parquet", LIBRARY_FRAGMENT_TABLE)
+            self._writers[b].write_table(part)
+        self.rows += table.num_rows
+
+    def close(self) -> Path:
+        import shutil
+
+        for w in self._writers.values():
+            w.close()
+        tmp = self.path.with_name(f".{self.path.name}.tmp")
+        try:
+            with pq.ParquetWriter(tmp, LIBRARY_FRAGMENT_TABLE) as out:
+                for b in sorted(self._writers):
+                    part = pq.read_table(self._dir / f"{b:04d}.parquet")  # one bucket: 1/buckets of the rows
+                    part = part.take(pc.sort_indices(part, sort_keys=[("precursor_id", "ascending")]))
+                    out.write_table(part, row_group_size=self.row_group_size)
+            tmp.replace(self.path)
+        finally:
+            shutil.rmtree(self._dir, ignore_errors=True)
+            tmp.unlink(missing_ok=True)
+        return self.path
+
+    def abort(self) -> None:
+        import shutil
+
+        for w in self._writers.values():
+            w.close()
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def __enter__(self) -> SortedFragmentWriter:
+        return self
+
+    def __exit__(self, kind, *_) -> None:
+        if kind is None:
+            self.close()
+        else:
+            self.abort()

@@ -80,6 +80,7 @@ from constellation.massspec.io.encyclopedia._modseq import (
     encyclopedia_residue_form,
     parse_encyclopedia_modseq,
 )
+from constellation.massspec.library.fragment_abundance import ANNOTATION_TOLERANCE_KEY, COVERAGE_KEY
 from constellation.massspec.library.library import Library
 from constellation.massspec.library.schemas import (
     LIBRARY_FRAGMENT_TABLE,
@@ -553,6 +554,19 @@ def _rt_scale(con, tables: set[str], sources: Sequence[str], metadata: dict[str,
     return "encyclopedia_library"
 
 
+def _written_coverage(metadata: dict[str, Any]) -> dict[str, Any]:
+    """The fragment coverage a library Constellation wrote recorded (a
+    predicted library's), as ``x.massspec.prediction.fragment_coverage``."""
+    import json
+
+    from constellation.massspec.io.encyclopedia._write import COVERAGE_ROW
+
+    value = metadata.get(COVERAGE_ROW)
+    if not value:
+        return {}
+    return {COVERAGE_KEY: json.loads(value) if isinstance(value, str) else value}
+
+
 def project_library_file(
     path: Path | str,
     *,
@@ -691,8 +705,9 @@ def project_library_file(
 
         # ── fragments ───────────────────────────────────────────────
         engine = engine_of(metadata)
-        if annotate_fragments and len(kept_rows):
-            tolerance: tuple[float, str] = (fragment_tolerance_ppm, "ppm")
+        tolerance: tuple[float, str] = (fragment_tolerance_ppm, "ppm")
+        annotated = bool(annotate_fragments and len(kept_rows))
+        if annotated:
             matched_only = engine == SCRIBETWO_ENGINE
             if matched_only:
                 tolerance = _recorded_tolerance(metadata, "-ftol", "-ftolunits") or tolerance
@@ -725,6 +740,11 @@ def project_library_file(
             metadata_extras={
                 "x.encyclopedia.metadata": metadata,
                 "x.massspec.prediction.rt_scale": _rt_scale(con, tables, sources, metadata),
+                **_written_coverage(metadata),
+                # An annotated peak keeps its stored m/z, up to this far from its ion's.
+                **({ANNOTATION_TOLERANCE_KEY: {"value": float(tolerance[0]),
+                                               "unit": "ppm" if str(tolerance[1]).lower() == "ppm" else "Da"}}
+                   if annotated else {}),  # fmt: skip
             },
         )
 

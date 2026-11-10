@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import functools
+
+import numpy as np
 from pathlib import Path
 
 import pyarrow as pa
@@ -253,14 +255,19 @@ def test_cli_both_levels_in_one_sweep(tmp_root, tmp_path, capsys):
         assert part["mz_observed"].to_pylist() == want["mz_observed"].to_pylist()
 
 
-def test_cli_refuses_both_levels_from_the_index(tmp_root, tmp_path):
+@pytest.mark.parametrize("flag", [["--use-index"], ["--rebuild-index"], ["--index-dir", "IDX"],
+                                  ["--downcast", "mz"], ["--exact-error"]])  # fmt: skip
+def test_cli_names_what_replaced_each_mode_b_flag(tmp_root, tmp_path, flag, capsys):
     run, bundle, _ = _run("dia", tmp_root)
     path = tmp_path / "targets.parquet"
     pq.write_table(run.targets, path)
+    flag = [str(tmp_path / "index") if a == "IDX" else a for a in flag]
     rc = _cli(["massspec", "chromatogram", "extract", "--peaks-dir", str(bundle), "--targets",
-               str(path), "-o", str(tmp_path / "x"), "--level", "both", "--use-index",
-               "--no-progress"])  # fmt: skip
+               str(path), "-o", str(tmp_path / "x"), "--level", "1", "--no-progress", *flag])  # fmt: skip
     assert rc == 2
+    err = capsys.readouterr().err
+    assert "was removed" in err and ("precursor-major" in err or "f64" in err)
+    assert not (tmp_path / "x").exists() and not (tmp_path / "index").exists()
 
 
 def test_counter_reads_the_ms1_tolerance_of_a_two_level_trace(tmp_path):
@@ -309,22 +316,26 @@ def test_cli_gate_claims_and_summary(tmp_root, tmp_path):
                  "--no-progress"]) == 2  # fmt: skip
 
 
-@pytest.mark.parametrize("extra", [
-    ["--gate"], ["--min-fragments", "3"], ["--only-passing", "--gate"], ["--mz-axis", "nonexistent"],
-    ["--claims"], ["--summary"], ["--work-dir", "WORK"],
-])  # fmt: skip
-def test_cli_refuses_sweep_options_with_the_index(tmp_root, tmp_path, extra, capsys):
-    """The mass index applied none of these and said nothing; now it says no."""
-    run, bundle, _ = _run("dia", tmp_root)
+def test_cli_reads_precursor_major_into_the_same_trace(tmp_root, tmp_path, capsys):
+    from constellation.massspec.precursor_major import build_precursor_major
+
+    run, bundle, _ = _run("staggered", tmp_root)
+    targets = _targets(run, level=2, name="staggered")
     path = tmp_path / "targets.parquet"
-    pq.write_table(run.targets, path)
-    extra = [str(tmp_path / "w") if a == "WORK" else a for a in extra]
-    rc = _cli(["massspec", "chromatogram", "extract", "--peaks-dir", str(bundle), "--targets",
-               str(path), "-o", str(tmp_path / "x"), "--level", "1", "--use-index",
-               "--index-dir", str(tmp_path / "index"), "--no-progress", *extra])  # fmt: skip
-    assert rc == 2
-    assert "belong to the sweep" in capsys.readouterr().err
-    assert not (tmp_path / "x").exists() and not (tmp_path / "index").exists()
+    pq.write_table(targets, path)
+    common = ["massspec", "chromatogram", "extract", "--peaks-dir", str(bundle), "--targets", str(path),
+              "--level", "both", "--rt-window", "12", "--no-progress", "--summary"]  # fmt: skip
+    build_precursor_major(bundle)
+    assert _cli([*common, "-o", str(tmp_path / "a")]) == 0
+    assert _cli([*common, "-o", str(tmp_path / "b"), "--layout", "precursor-major", "--workers", "2"]) == 0
+    a, b = pq.read_table(tmp_path / "a" / "xic_trace.parquet"), pq.read_table(tmp_path / "b" / "xic_trace.parquet")
+    oracle.assert_traces_identical(_by_target(b), _by_target(a))
+    import json
+
+    assert json.loads((tmp_path / "b" / "manifest.json").read_text())["metadata"]["mode"] == "precursor_major"
+    for refused in (["--claims"], ["--min-isotopes", "2"]):
+        assert _cli([*common, "-o", str(tmp_path / "c"), "--layout", "precursor-major", *refused]) == 2
+        assert "need the scan-major sweep" in capsys.readouterr().err
 
 
 def test_cli_takes_a_zero_tolerance_as_given(tmp_root, tmp_path):
@@ -345,3 +356,53 @@ def test_cli_takes_a_zero_tolerance_as_given(tmp_root, tmp_path):
     assert wide.num_rows > want.num_rows
     assert _cli([*common, "-o", str(tmp_path / "y"), "--ms1-tolerance", "-1"]) == 2
     assert _cli([*common, "-o", str(tmp_path / "z"), "--gate", "--min-consecutive-scans", "0"]) == 2
+
+
+# ── the same oracle, read precursor-major (2026-11-09) ───────────────
+
+
+@functools.lru_cache(maxsize=None)
+def _with_layout(name: str, tmp_root: str):
+    from constellation.massspec.precursor_major import build_precursor_major
+
+    run, bundle, peaks = _run(name, tmp_root)
+    build_precursor_major(bundle)
+    return run, bundle, peaks
+
+
+def _by_target(table: pa.Table) -> pa.Table:
+    t = table.take(pa.array(np.argsort(table.column("target_id").to_numpy(), kind="stable")))
+    meta = {k: v for k, v in (t.schema.metadata or {}).items() if k != b"x.massspec.sweep.layout"}
+    return t.replace_schema_metadata(meta)
+
+
+def _precursor_major(bundle, targets, *, level, rt_window, tolerance, tolerance_unit, all_in_window, drop_unmatched,
+                     charge_range=None):  # fmt: skip
+    from constellation.massspec.quant.chromatogram import _DEFAULT_ION_TYPES, extract_xic
+    from constellation.massspec.sweep import ChannelSettings
+
+    result = extract_xic(
+        bundle, targets, acquisition_id=7, levels=[level], tolerances={level: (tolerance, tolerance_unit)},
+        channels=ChannelSettings(n_isotopes=3, charge_range=charge_range, ion_types=tuple(_DEFAULT_ION_TYPES),
+                                 max_fragment_charge=2),
+        rt_window=rt_window, rule="all" if all_in_window else "nearest", drop_unmatched=drop_unmatched,
+        layout="precursor_major", workers=1,
+    )  # fmt: skip
+    return result.table("xic_trace")
+
+
+@pytest.mark.parametrize("name", list(_RUNS))
+@pytest.mark.parametrize("level", [1, 2])
+@pytest.mark.parametrize("rt_window", [None, 12.0])
+@pytest.mark.parametrize("tolerance", _TOLERANCES)
+@pytest.mark.parametrize("mode", ["nearest", "keep_unmatched", "all_in_window"])
+def test_parity_read_precursor_major(tmp_root, name, level, rt_window, tolerance, mode):
+    run, bundle, peaks = _with_layout(name, tmp_root)
+    targets = _targets(run, level=level, name=name)
+    kw = dict(level=level, rt_window=rt_window, tolerance=tolerance[0], tolerance_unit=tolerance[1],
+              all_in_window=mode == "all_in_window", drop_unmatched=mode != "keep_unmatched",
+              charge_range=(1, 4) if level == 1 else None)  # fmt: skip
+    want = oracle.extract_xic_scan_major(peaks, targets, acquisition_id=7, **kw)
+    got = _precursor_major(bundle, targets, **kw)
+    assert want.num_rows > 0
+    oracle.assert_traces_identical(_by_target(got), _by_target(want))

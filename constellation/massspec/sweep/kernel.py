@@ -54,7 +54,7 @@ from constellation.core.signal import (
     tolerance_window,
 )
 from constellation.massspec.sweep.rules import MatchRule
-from constellation.massspec.sweep.schedule import ragged_arange
+from constellation.massspec.sweep.schedule import order_by, ragged_arange
 
 __all__ = ["GroupMatches", "match_by_channel", "match_by_point", "match_group"]
 
@@ -210,10 +210,14 @@ def match_by_point(
     rule: MatchRule,
     tolerance: float,
     unit: ToleranceUnit,
+    *,
+    sort: bool = True,
 ) -> GroupMatches:
     """Point-driven: every point of the group looked up in the channels
     sorted by m/z, giving (point, channel) candidates, then held to the
-    rule's exact test."""
+    rule's exact test. Rows by (row, channel, point), or for ``nearest``
+    in no particular order with ``sort=False`` (a caller that sorts its
+    matches itself, as the sweep does)."""
     if rows.size == 0 or channel_mz.size == 0:
         return GroupMatches.empty()
     order = np.argsort(channel_mz, kind="stable")
@@ -223,51 +227,72 @@ def match_by_point(
     i0 = np.searchsorted(sorted_mz, lo_w, side="left")
     i1 = np.searchsorted(sorted_mz, hi_w, side="right")
     n = i1 - i0
+    if rule.name == "nearest":
+        return _nearest_by_point(points_mz, points_intensity, offsets, rows, flat, row_of, at, i0, n, order,
+                                 sorted_mz, tolerance, unit, sort)  # fmt: skip
     flat_c = np.repeat(flat, n)
     row = np.repeat(row_of, n)
     pk = np.repeat(at, n)
     ch = order[ragged_arange(i0, n)]
-    by = np.lexsort((pk, ch, row))
+    by = order_by(row, ch, pk)
     flat_c, row, pk, ch = flat_c[by], row[by], pk[by], ch[by]
     q = channel_mz[ch]
     a = points_mz[flat_c]
     half = tolerance_window(torch.from_numpy(q), tolerance, unit).numpy()
-    if rule.name in ("all", "sum"):
-        keep = (a >= q - half) & (a <= q + half)
-        row, ch, pk, flat_c = row[keep], ch[keep], pk[keep], flat_c[keep]
-        mz, it = points_mz[flat_c], points_intensity[flat_c]
-        if rule.name == "all":
-            return GroupMatches(row, ch, pk, np.ones(row.size, np.int64), mz, it)
-        return _aggregate(row, ch, pk, mz, it)
+    keep = (a >= q - half) & (a <= q + half)
+    row, ch, pk, flat_c = row[keep], ch[keep], pk[keep], flat_c[keep]
+    mz, it = points_mz[flat_c], points_intensity[flat_c]
+    if rule.name == "all":
+        return GroupMatches(row, ch, pk, np.ones(row.size, np.int64), mz, it)
+    return _aggregate(row, ch, pk, mz, it)
 
-    # nearest: per cell, the candidates either side of the channel.
-    if row.size == 0:
+
+def _nearest_by_point(points_mz, points_intensity, offsets, rows, flat, row_of, at, i0, n, order, sorted_mz,
+                      tolerance, unit, sort=True) -> GroupMatches:  # fmt: skip
+    """``nearest`` from (point, channel) candidates with no sort: a cell's
+    nearest point is ``R``, its scan's first point at or above the channel,
+    or ``L``, the last below it, whichever is nearer (``L`` on a tie), as
+    ``core.signal.nearest_within_tolerance`` decides; so a candidate wins
+    when it is its channel's ``R`` (its scan's previous point is below the
+    channel) and its ``L`` is farther, or its ``L`` and its ``R`` is no
+    nearer, both read off the point's two neighbours in the scan. Those
+    outside the tolerance cannot change a decision the tolerance then
+    accepts. Until 2026-11-09 every candidate was sorted into cells first,
+    which cost more than finding them on a proteome-scale run."""
+    total = int(n.sum())
+    if total == 0:
         return GroupMatches.empty()
-    starts = np.flatnonzero(np.r_[True, (row[1:] != row[:-1]) | (ch[1:] != ch[:-1])])
-    ends = np.r_[starts[1:], row.size]
-    below = a < q
-    # Candidates of a cell are in point order, so those below the channel come first.
-    n_below = np.add.reduceat(below.astype(np.int64), starts)
-    has_left = n_below > 0
-    has_right = n_below < (ends - starts)
-    left = starts + n_below - 1
-    right = starts + n_below
-    left_c = np.where(has_left, left, starts)
-    right_c = np.where(has_right, right, ends - 1)
-    q_cell = q[starts]
-    d_left = np.abs(q_cell - a[left_c])
-    d_right = np.abs(q_cell - a[right_c])
-    use_left = has_left & (~has_right | (d_left <= d_right))
-    best = np.where(use_left, left_c, right_c)
-    within = np.abs(q_cell - a[best]) <= half[starts]
-    best = best[within]
+    flat_c = np.repeat(flat, n)
+    pk = np.repeat(at, n)
+    row = np.repeat(row_of, n)
+    pos = ragged_arange(i0, n)
+    c = sorted_mz[pos]
+    a = points_mz[flat_c]
+    size = (offsets[rows + 1] - offsets[rows])[row]
+    has_prev = pk > 0
+    has_next = pk < size - 1
+    last = points_mz.size - 1
+    prev = points_mz[np.maximum(flat_c - 1, 0)]
+    nxt = points_mz[np.minimum(flat_c + 1, last)]
+    at_or_above = a >= c
+    is_right = at_or_above & (~has_prev | (prev < c))
+    is_left = ~at_or_above & (~has_next | (nxt >= c))
+    wins = (is_right & (~has_prev | ((a - c) < (c - prev)))) | (is_left & (~has_next | ((c - a) <= (nxt - c))))
+    best = np.flatnonzero(wins)
+    q = c[best]
+    half = tolerance_window(torch.from_numpy(q), tolerance, unit).numpy()
+    best = best[np.abs(q - a[best]) <= half]
+    row, ch, pk, flat_c = row[best], order[pos[best]], pk[best], flat_c[best]
+    if sort:
+        by = order_by(row, ch, pk)
+        row, ch, pk, flat_c = row[by], ch[by], pk[by], flat_c[by]
     return GroupMatches(
-        row=row[best],
-        channel=ch[best],
-        point=pk[best],
-        n_points=np.ones(best.size, np.int64),
-        mz=points_mz[flat_c[best]],
-        intensity=points_intensity[flat_c[best]],
+        row=row,
+        channel=ch,
+        point=pk,
+        n_points=np.ones(row.size, np.int64),
+        mz=points_mz[flat_c],
+        intensity=points_intensity[flat_c],
     )
 
 
@@ -284,6 +309,7 @@ def match_group(
     kernel: Literal["auto", "channel", "point"] = "auto",
     crossover: float = 0.25,
     max_elements: int = 1 << 21,
+    sort: bool = True,
 ) -> GroupMatches:
     """Match a group with the cheaper kernel: point-driven once the
     channels exceed ``crossover`` times a scan's mean points, else
@@ -300,7 +326,8 @@ def match_group(
         mean_points = float(counts.mean()) if counts.size else 0.0
         kernel = "point" if channel_mz.size > crossover * max(mean_points, 1.0) else "channel"
     if kernel == "point":
-        return match_by_point(points_mz, points_intensity, offsets, rows, channel_mz, rule, tolerance, unit)
+        return match_by_point(points_mz, points_intensity, offsets, rows, channel_mz, rule, tolerance, unit,
+                              sort=sort)  # fmt: skip
     if kernel == "channel":
         return match_by_channel(
             points_mz, points_intensity, offsets, rows, channel_mz, rule, tolerance, unit,
@@ -321,5 +348,5 @@ def _concat(parts: list[GroupMatches]) -> GroupMatches:
 def _sorted(m: GroupMatches) -> GroupMatches:
     if m.n == 0:
         return m
-    by = np.lexsort((m.point, m.channel, m.row))
+    by = order_by(m.row, m.channel, m.point)
     return GroupMatches(m.row[by], m.channel[by], m.point[by], m.n_points[by], m.mz[by], m.intensity[by])
