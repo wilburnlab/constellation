@@ -5,10 +5,13 @@ query's matches are complete, whichever scans (and workers) they came
 from, and a :class:`Reducer` turns a :class:`QueryBatch` of them into one
 table or several. This is the hook the scorer plugs into. What a reducer
 reads: :meth:`QueryBatch.cells`, every cell a query could have matched in
-(its channels in each scan it was eligible for) with what matched there,
-each channel's identity and abundance, and each scan's time, TIC and
-injection time; :meth:`QueryBatch.eligible` for the (scan, query) pairs
-alone, from the same schedule the map used.
+(its channels in each scan it was eligible for and that acquired them)
+with what matched there, each channel's identity and abundance, and each
+scan's time, TIC and injection time; :meth:`QueryBatch.dense`, the same
+cells as padded ``[queries, scans, channels]`` tensors with masks, each
+MS2 scan linked to its parent MS1 scan (``sweep.dense``);
+:meth:`QueryBatch.eligible` for the (scan, query) pairs alone, from the
+same schedule the map used.
 """
 
 from __future__ import annotations
@@ -366,6 +369,27 @@ class QueryBatch:
         """Per query of the batch, how many (scan, query) pairs ``level``
         could match it in: the sizes of :meth:`eligible`, without building it."""
         return eligible_counts(self.plan, self.scans, level, self.queries)
+
+    def dense(self, level: int, *, queries: np.ndarray | None = None, dtype=None):
+        """The batch's queries (or ``queries``, an ascending subset) at
+        ``level`` as padded ``[queries, scans, channels]`` tensors with
+        masks (``sweep.dense.Dense``): the same cells as :meth:`cells`, laid
+        out for a scorer. A reducer that builds it declares ``zero_fills``,
+        so buckets are sized by the cells it holds; :meth:`dense_chunks`
+        cuts a batch into runs of queries under a budget."""
+        import torch
+
+        from constellation.massspec.sweep.dense import dense_view
+
+        return dense_view(self, level, queries=queries, dtype=torch.float32 if dtype is None else dtype)
+
+    def dense_chunks(self, max_cells: int, levels=None):
+        """The batch's queries in contiguous ascending runs whose dense views
+        (padded, summed over ``levels``) hold at most ``max_cells`` cells
+        each (``sweep.dense.dense_chunks``)."""
+        from constellation.massspec.sweep.dense import dense_chunks
+
+        return dense_chunks(self, max_cells, levels)
 
     def eligible_cells(self, level: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(query, ledger row, channel) of every eligible cell its scan
