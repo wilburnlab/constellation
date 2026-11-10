@@ -69,6 +69,9 @@ def test_the_id_recipe_is_pinned() -> None:
         ("PEPC[+57.0214635]TIDEK", "PEPC[+57.0215]TIDEK"),  # at one precision
         ("PEPQ[-17.026549]K", "PEPQ[-17.0265]K"),
         ("<13C>PEPTIDEK", "<13C>PEPTIDEK"),
+        ("<D>PEPTIDEK", "<2H>PEPTIDEK"),  # one label, two spellings (until 2026-11-10, two keys)
+        ("<T>PEPTIDEK", "<3H>PEPTIDEK"),
+        ("<15N><13C>PEPTIDEK", "<13C><15N>PEPTIDEK"),
     ],
 )
 def test_spellings_of_one_peptide_share_a_key(spelling: str, key: str) -> None:
@@ -100,6 +103,7 @@ def test_terminal_and_side_chain_placement_are_different_molecules() -> None:
         "<[Carbamidomethyl]@C>PEPCK",  # global fixed modification
         "PEPTIDEK//KEDITPEP",  # two chains
         "PEPT[INFO:odd]IDEK",
+        "<33S><34S>PEPTIDEK",  # two isotopes of one element: no whole-element label
     ],
 )
 def test_what_names_no_single_molecule_has_no_key(spelling: str) -> None:

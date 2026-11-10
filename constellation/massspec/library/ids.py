@@ -73,6 +73,7 @@ from constellation.core.sequence.proforma import (
     Peptidoform,
     TaggedMod,
     format_proforma,
+    normalize_isotopes,
     parse_proforma,
 )
 from constellation.massspec.library.library import Library
@@ -163,6 +164,16 @@ def _canonical_peptidoform(peptide: Peptidoform, vocab: ModVocab) -> Peptidoform
         (_canonical_modref(m, vocab) for m in peptide.labile_mods),
         key=lambda m: format_proforma(Peptidoform("A", labile_mods=(m,))),
     )
+    # One spelling of a label: <D> and <2H> are one molecule (until
+    # 2026-11-10 they had two keys). No producer here wrote <D> or <T> (search
+    # spaces normalise their labels), so no id on disk changes, and the
+    # scheme keeps its name: ``ID_SCHEME`` is part of the EncyclopeDIA
+    # workflow's stage keys, so a new name would make every finished search
+    # look unfinished.
+    try:
+        isotopes = normalize_isotopes(peptide.global_isotopes)
+    except ValueError as exc:
+        raise NoCanonicalKeyError(str(exc)) from None
     return Peptidoform(
         sequence=peptide.sequence,
         residue_mods={
@@ -173,7 +184,7 @@ def _canonical_peptidoform(peptide: Peptidoform, vocab: ModVocab) -> Peptidoform
         n_term_mods=_canonical_site(peptide.n_term_mods, vocab),
         c_term_mods=_canonical_site(peptide.c_term_mods, vocab),
         labile_mods=tuple(labile),
-        global_isotopes=tuple(sorted(peptide.global_isotopes)),
+        global_isotopes=isotopes,
     )
 
 

@@ -596,15 +596,17 @@ def _where(pos: int | str) -> str:
 class _ModPlan:
     """One peptide's modification spec laid out as slots: the fixed
     assignment, each variable slot's candidates (mod key, site) in their
-    order, the slot order, how many may be occupied, the per-key limits,
-    and whether a cyclization candidate at the N-terminus excludes a
-    variable modification of residue 0 (``guard``)."""
+    order, the slot order, how many may be occupied, the limits (one per
+    group of placements) and the groups each candidate counts toward, and
+    whether a cyclization candidate at the N-terminus excludes a variable
+    modification of residue 0 (``guard``)."""
 
     fixed: dict[_Slot, tuple[str, str]]
     candidates: dict[_Slot, list[tuple[str, str]]]
     ordered: list[_Slot]
     k_max: int
-    limits: dict[str, int]
+    limits: tuple[int, ...]
+    groups: dict[_Slot, list[tuple[int, ...]]]
     guard: bool
 
 
@@ -620,6 +622,7 @@ def _plan_modforms(
     context: SiteContext | None,
     max_per_mod: Mapping[str, int] | None,
     skip_unlicensed: bool,
+    limit_groups: Sequence[tuple[str, Sequence[str], int]] | None = None,
 ) -> _ModPlan:
     """Validate a modification spec against one peptide and lay out its
     slots. Shared by :func:`enumerate_modforms` and :func:`count_modforms`."""
@@ -630,10 +633,14 @@ def _plan_modforms(
 
     fixed_spec = _normalize_mod_spec(fixed)
     var_spec = _normalize_mod_spec(variable)
-    limits = dict(max_per_mod or {})
-    for key, limit in limits.items():
+    # A limit is on a group of placements: one key at every site
+    # (``max_per_mod``) or at the sites of one rule (``limit_groups``).
+    limit_specs: list[tuple[str, frozenset[str] | None, int]] = [
+        (key, None, int(limit)) for key, limit in (max_per_mod or {}).items()
+    ] + [(key, frozenset(sites), int(limit)) for key, sites, limit in (limit_groups or ())]
+    for key, _sites, limit in limit_specs:
         if limit < 0:
-            raise ValueError(f"max_per_mod[{key!r}] must be >= 0, got {limit}")
+            raise ValueError(f"the limit on {key!r} must be >= 0, got {limit}")
 
     for site, keys in (*fixed_spec.items(), *var_spec.items()):
         if site in (PROTEIN_N_TERM, PROTEIN_C_TERM) and context is None:
@@ -688,13 +695,19 @@ def _plan_modforms(
     if fixed_cyclized:
         fixed_slots.pop(_R0_SLOT, None)
 
-    # Variable candidates — slot → the (mod key, site) pairs that may occupy it.
+    # Variable candidates — slot → the (mod key, site) pairs that may occupy
+    # it. On a slot a fixed modification holds, a variable one is an
+    # alternative to it, replacing it in the forms that carry it: TMT on
+    # every lysine with acetyl variable gives lysines TMT-labelled or
+    # acetylated, never both (an acetylated amine cannot take the TMT); until
+    # 2026-11-10 the fixed one shadowed the variable one, which was never
+    # applied. The fixed modification itself is not offered again.
     candidates: dict[_Slot, list[tuple[str, str]]] = {}
     for site, keys in var_spec.items():
         for pos in _slots_for_site(site, peptide, context):
             for key in keys:
                 slot = (layer_of(key), pos)
-                if slot in fixed_slots or (fixed_cyclized and slot == _R0_SLOT):
+                if (fixed_cyclized and slot == _R0_SLOT) or fixed_slots.get(slot, ("",))[0] == key:
                     continue
                 if not licensed(key, site, pos):
                     continue
@@ -702,6 +715,11 @@ def _plan_modforms(
                 if all(key != k for k, _ in have):
                     have.append((key, site))
     candidates = {slot: c for slot, c in candidates.items() if c}
+    groups = {
+        slot: [tuple(g for g, (k, sites, _limit) in enumerate(limit_specs) if k == key and (sites is None or site in sites))
+               for key, site in c]
+        for slot, c in candidates.items()
+    }  # fmt: skip
 
     ordered = sorted(candidates, key=_slot_order)
     guard = _R0_SLOT in candidates and any(
@@ -712,20 +730,20 @@ def _plan_modforms(
         candidates=candidates,
         ordered=ordered,
         k_max=min(max_variable, len(ordered)),
-        limits=limits,
+        limits=tuple(limit for _k, _s, limit in limit_specs),
+        groups=groups,
         guard=guard,
     )
 
 
 def _count_planned(plan: _ModPlan) -> int:
     """How many variable assignments a plan has: up to ``k_max`` slots
-    occupied, each by one of its candidates, no limited key over its limit,
-    no cyclization beside a variable modification of residue 0. A DP over
-    the slots, polynomial in their number: states are (occupied, counts of
-    the limited keys, residue 0 occupied)."""
-    limited = sorted(plan.limits)
-    index = {key: j for j, key in enumerate(limited)}
-    states: dict[tuple[int, tuple[int, ...], bool], int] = {(0, (0,) * len(limited), False): 1}
+    occupied, each by one of its candidates, no group of placements over
+    its limit, no cyclization beside a variable modification of residue 0.
+    A DP over the slots, polynomial in their number: states are (occupied,
+    counts of the limited groups, residue 0 occupied)."""
+    limits = plan.limits
+    states: dict[tuple[int, tuple[int, ...], bool], int] = {(0, (0,) * len(limits), False): 1}
     for slot in plan.ordered:
         nxt = dict(states)  # the slot left empty
         cyclizes = plan.guard and slot == _N_SLOT
@@ -733,16 +751,14 @@ def _count_planned(plan: _ModPlan) -> int:
         for (k, counts, r0), ways in states.items():
             if k == plan.k_max:
                 continue
-            for key, _site in plan.candidates[slot]:
+            for (key, _site), in_groups in zip(plan.candidates[slot], plan.groups[slot], strict=True):
                 if cyclizes and r0 and key in SIDE_CHAIN_CYCLIZATIONS:
                     continue
-                j = index.get(key)
-                if j is None:
-                    c = counts
-                elif counts[j] == plan.limits[key]:
+                if any(counts[g] == limits[g] for g in in_groups):
                     continue
-                else:
-                    c = (*counts[:j], counts[j] + 1, *counts[j + 1 :])
+                c = counts
+                if in_groups:
+                    c = tuple(n + (g in in_groups) for g, n in enumerate(counts))
                 state = (k + 1, c, r0 or marks_r0)
                 nxt[state] = nxt.get(state, 0) + ways
         states = nxt
@@ -761,6 +777,7 @@ def _assignments(plan: _ModPlan) -> Iterator[tuple[tuple[int, ...], tuple[int, .
     so every node of the walk is an assignment), and its result is sorted
     into the same order."""
     ordered, cands, limits, k_max = plan.ordered, plan.candidates, plan.limits, plan.k_max
+    groups = plan.groups
     n = len(ordered)
     if not limits and not plan.guard:
         sizes = [range(len(cands[slot])) for slot in ordered]
@@ -771,7 +788,7 @@ def _assignments(plan: _ModPlan) -> Iterator[tuple[tuple[int, ...], tuple[int, .
         return
     n_index = ordered.index(_N_SLOT) if plan.guard else -1
     r0_index = ordered.index(_R0_SLOT) if plan.guard else -1
-    used = dict.fromkeys(limits, 0)
+    used = [0] * len(limits)
     slots: list[int] = []
     picks_now: list[int] = []
     out: list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
@@ -784,18 +801,18 @@ def _assignments(plan: _ModPlan) -> Iterator[tuple[tuple[int, ...], tuple[int, .
             for j, (key, _site) in enumerate(cands[ordered[i]]):
                 if i == n_index and key in SIDE_CHAIN_CYCLIZATIONS and r0_index in slots:
                     continue
-                limit = limits.get(key)
-                if limit is not None:
-                    if used[key] == limit:
-                        continue
-                    used[key] += 1
+                in_groups = groups[ordered[i]][j]
+                if any(used[g] == limits[g] for g in in_groups):
+                    continue
+                for g in in_groups:
+                    used[g] += 1
                 slots.append(i)
                 picks_now.append(j)
                 walk(i + 1)
                 slots.pop()
                 picks_now.pop()
-                if limit is not None:
-                    used[key] -= 1
+                for g in in_groups:
+                    used[g] -= 1
 
     walk(0)
     out.sort()
@@ -816,6 +833,7 @@ def count_modforms(
     context: SiteContext | None = None,
     max_per_mod: Mapping[str, int] | None = None,
     skip_unlicensed: bool = False,
+    limit_groups: Sequence[tuple[str, Sequence[str], int]] | None = None,
 ) -> int:
     """How many forms :func:`enumerate_modforms` would return with these
     arguments, without building them (so a budget can be checked first).
@@ -833,6 +851,7 @@ def count_modforms(
             context=context,
             max_per_mod=max_per_mod,
             skip_unlicensed=skip_unlicensed,
+            limit_groups=limit_groups,
         )
     )
 
@@ -852,6 +871,7 @@ def enumerate_modforms(
     max_per_mod: Mapping[str, int] | None = None,
     skip_unlicensed: bool = False,
     return_origin: bool = False,
+    limit_groups: Sequence[tuple[str, Sequence[str], int]] | None = None,
 ) -> list[Peptidoform] | list[tuple[Peptidoform, tuple[PlacedMod, ...]]]:
     """Enumerate the modified forms of one peptide.
 
@@ -871,16 +891,21 @@ def enumerate_modforms(
     SILAC lysine and arginine, which make the residue's own atoms heavier
     and leave its reactive groups free): ``fixed={"K": "UNIMOD:259"}`` with
     ``variable={"K": "UNIMOD:1"}`` gives heavy lysine and heavy acetylated
-    lysine. A slot already carrying a fixed mod of its kind is not offered
-    to the variable enumeration, so ``fixed={"C": "UNIMOD:4"}`` and
-    ``variable={"C": ...}`` do not stack on the same cysteine; two
-    different fixed mods on one slot (an ``N-term`` and a ``Protein
-    N-term`` rule at a protein's N-terminus) raise. An N-terminal
+    lysine. On a slot carrying a fixed mod of its kind a variable mod is an
+    alternative to it, replacing it in the forms that carry it, never
+    stacked: ``fixed={"K": TMT}`` with ``variable={"K": acetyl}`` gives each
+    lysine TMT-labelled or acetylated (until 2026-11-10 the variable mod was
+    never applied there); two different fixed mods on one slot (an
+    ``N-term`` and a ``Protein N-term`` rule at a protein's N-terminus)
+    raise. An N-terminal
     cyclization of the first residue's side chain
     (:data:`SIDE_CHAIN_CYCLIZATIONS`) replaces that residue's chemical
     modification rather than adding to it. ``max_per_mod`` limits how many
     sites one variable key occupies in a form (``{"UNIMOD:21": 2}``),
-    within the overall ``max_variable``.
+    within the overall ``max_variable``; ``limit_groups`` limits a key at
+    some of its sites only (``[("UNIMOD:35", ["W"], 1)]``: one oxidized
+    tryptophan, any number of methionines), as one rule of a search space
+    does. A placement counts toward every limit that covers it.
 
     Returns forms ordered by increasing variable-mod count, the
     fixed-only form first. Mod keys are validated against ``vocab``, and
@@ -915,6 +940,7 @@ def enumerate_modforms(
         context=context,
         max_per_mod=max_per_mod,
         skip_unlicensed=skip_unlicensed,
+        limit_groups=limit_groups,
     )
     if max_forms is not None:
         total = _count_planned(plan)
@@ -945,10 +971,16 @@ def enumerate_modforms(
     fixed_n = tuple(e[2] for e in fixed_entries if e[0] == N_TERM)
     fixed_c = tuple(e[2] for e in fixed_entries if e[0] == C_TERM)
     by_listing = itemgetter(4)
+    # A variable modification may stand in for a fixed one on its slot.
+    replaces = any(slot in plan.fixed for slot in plan.candidates)
+    fixed_all = fixed_entries
 
     forms: list = []
     for slot_index, picks in _assignments(plan):
         chosen = [entries[i][j] for i, j in zip(slot_index, picks, strict=True)]
+        if replaces:
+            taken = {(e[1], e[0]) for e in chosen}
+            fixed_entries = [e for e in fixed_all if (e[1], e[0]) not in taken]
         if simple:
             residue_mods = dict(fixed_res)
             n_term, c_term = fixed_n, fixed_c

@@ -1126,6 +1126,32 @@ def parse_isotope_label(label: str) -> tuple[int, str]:
     return (int(label[:i]), sym)
 
 
+def normalize_isotopes(isotopes: Sequence[str], *, where: str = "") -> tuple[str, ...]:
+    """A label state's isotopes as ``<mass number><element>`` (``D`` →
+    ``2H``, ``T`` → ``3H``), each once, sorted: one spelling per state, so
+    that one molecule gets one key. An isotope the element does not have,
+    or two isotopes of one element (``33S,34S``: a whole-element label
+    makes every atom one isotope), is refused (``ValueError``)."""
+    from constellation.core.chem.elements import ELEMENTS
+
+    out: dict[str, str] = {}  # element -> label
+    context = f" in {where!r}" if where else ""
+    for iso in isotopes:
+        if not re.fullmatch(r"\d+[A-Z][a-z]?|D|T", iso):
+            raise ValueError(f"not an isotope label: {iso!r}{context}")
+        mass_number, symbol = parse_isotope_label(iso)
+        try:
+            ELEMENTS[symbol].isotope_mass(mass_number)
+        except KeyError as exc:
+            raise ValueError(f"no such isotope: {iso!r}{context} ({exc})") from None
+        label = f"{mass_number}{symbol}"
+        have = out.get(symbol)
+        if have is not None and have != label:
+            raise ValueError(f"two isotopes of {symbol} in one label state: {have} and {label}{context}")
+        out[symbol] = label
+    return tuple(sorted(out.values()))
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Public re-exports
 # ──────────────────────────────────────────────────────────────────────
@@ -1170,6 +1196,7 @@ __all__ = [
     "ProFormaResult",
     "parse_proforma",
     "format_proforma",
+    "normalize_isotopes",
     "parse_isotope_label",
     "permute_peptidoform",
     "_has_crosslinks",

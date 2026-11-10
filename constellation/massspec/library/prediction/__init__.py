@@ -49,8 +49,10 @@ from constellation.massspec.library.prediction.run import PredictionReport, pred
 #: Bumped when what a prediction writes changes (which precursors are kept,
 #: what is recorded beside them), so that a prediction made by older code
 #: is not taken for finished by newer code (the ``UNIT_LAYOUT``
-#: convention; not ``__version__``, which changes with every commit and
-#: would discard a prediction that took an hour and a half).
+#: convention). Not ``__version__``: in an editable install it is written
+#: once at install and never again, so it changes with nothing (it read a
+#: version from 2026-05-28 in November); and a key that did change with
+#: every commit would discard a prediction that took an hour and a half.
 #:
 #: 1: until 2026-11-07; a refused precursor took its target/decoy partners.
 #: 2: each precursor judged on its own; fragment coverage recorded.

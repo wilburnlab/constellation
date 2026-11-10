@@ -54,7 +54,16 @@ from typing import Literal
 
 import numpy as np
 
-from constellation.core.sequence.proforma import Peptidoform, permute_peptidoform
+from constellation.core.sequence.proforma import Peptidoform, TaggedMod, permute_peptidoform
+from constellation.core.sequence.protein import SIDE_CHAIN_CYCLIZATIONS
+
+
+def _ring_key(tagged: TaggedMod) -> str | None:
+    """A terminal modification's UNIMOD key, as SIDE_CHAIN_CYCLIZATIONS holds them."""
+    mod = tagged.mod
+    if mod is None or mod.accession is None:
+        return None
+    return f"{mod.cv or 'UNIMOD'}:{mod.accession}"
 
 __all__ = [
     "DECOY_METHODS",
@@ -104,10 +113,16 @@ def _reverse_c_fixed(n: int) -> list[int]:
 
 
 def _with_fallback(first: Callable[[int], list[int]] | None):
-    def orders(sequence: str, set_index: int, seed: int) -> Iterator[list[int]]:
+    def orders(sequence: str, set_index: int, seed: int, keep_first: bool = False) -> Iterator[list[int]]:
         n = len(sequence)
         if first is not None:
-            yield first(n)
+            order = first(n)
+            if keep_first and order and order[0] != 0:
+                # The first residue's side chain is in an N-terminal ring
+                # (pyro-Glu from Q or E): it cannot move, or the decoy would
+                # carry the ring on a residue that cannot make it.
+                order = _reverse_interior(n)
+            yield order
         for attempt in range(MAX_ATTEMPTS):
             yield _interior_shuffle(n, _rng(sequence, set_index, seed, attempt))
 
@@ -123,6 +138,9 @@ class DecoyMethod:
     level: DecoyLevel
     description: str
     orders: Callable[[str, int, int], Iterator[list[int]]] | None = None
+    #: Its decoys depend on the set's index and seed: only such a method can
+    #: make a second set that is not a copy of the first.
+    seeded: bool = False
 
 
 DECOY_METHODS: dict[str, DecoyMethod] = {
@@ -139,6 +157,7 @@ DECOY_METHODS: dict[str, DecoyMethod] = {
             "peptide",
             "first and last residue kept, the interior shuffled (seeded; for entrapment sets)",
             _with_fallback(None),
+            seeded=True,
         ),
         DecoyMethod(
             "reverse-c-fixed",
@@ -218,12 +237,19 @@ def peptide_decoys(
     classes: dict[str, list[str]] = {}
     for seq in sorted({pf.sequence for pf in targets}):
         classes.setdefault(il_key(seq), []).append(seq)
+    # Sequences some form of which closes its first residue's side chain into
+    # an N-terminal ring: their first residue stays where it is. Under
+    # reverse-c-fixed it moved and the ring stayed at the N-terminus, on a
+    # residue that cannot make it, so the predictor refused those decoys and
+    # no target (437 of them on one test; until 2026-11-10).
+    ringed = {pf.sequence for pf in targets if any(_ring_key(t) in SIDE_CHAIN_CYCLIZATIONS for t in pf.n_term_mods)}
     chosen: dict[str, list[int] | None] = {}  # target sequence → order (None: dropped)
     n_fallback = n_dropped = 0
     for members in classes.values():
         seq = members[0]
         pick = None
-        for attempt, order in enumerate(method.orders(seq, decoy_set.index, decoy_set.seed)):
+        keep_first = any(m in ringed for m in members)
+        for attempt, order in enumerate(method.orders(seq, decoy_set.index, decoy_set.seed, keep_first)):
             candidate = il_key("".join(seq[k] for k in order))
             if candidate not in taken:
                 pick = order

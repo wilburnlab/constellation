@@ -51,12 +51,13 @@ from typing import Any, Literal
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 
-from constellation.core.chem.elements import ELEMENTS, PROTON_MASS
+from constellation.core.chem.elements import PROTON_MASS
 from constellation.core.chem.modifications import UNIMOD, Modification, ModVocab
 from constellation.core.io.fasta import iter_fasta, parse_header
 from constellation.core.sequence.alphabets import AA
-from constellation.core.sequence.proforma import Peptidoform, format_proforma, parse_isotope_label
+from constellation.core.sequence.proforma import Peptidoform, format_proforma, normalize_isotopes
 from constellation.core.sequence.protein import (
     C_TERM,
     N_TERM,
@@ -92,6 +93,48 @@ __all__ = [
 
 #: The library metadata key under which a search space records how it was made.
 SEARCH_SPACE_METADATA_KEY = "x.constellation.search_space"
+
+#: Bumped when what a search space holds changes for the same FASTA files
+#: and settings, so that one built by older code is not taken for finished
+#: (``--resume``) by newer code (the ``PREDICTION_LAYOUT`` convention). With
+#: the modification vocabulary's digest and the id scheme, it is what the
+#: resume key holds besides the inputs and settings (:func:`search_space_key`).
+#: Until 2026-11-10 the key held ``__version__``, which an editable install
+#: never rewrites (it read ``0.0.1a2.dev123`` from 2026-05-28, before this
+#: module existed), so a search space made before any fix passed as current,
+#: and so did a prediction keyed on it.
+#:
+#: 1 (2026-11-10): first keyed so. Peptide-level decoys on decoy proteins; a
+#: variable modification replacing a fixed one on its site; a ``:max=``
+#: limit per rule; reverse-c-fixed keeping a cyclized first residue in place;
+#: protein-level decoys counted as decoys.
+SEARCH_SPACE_LAYOUT = 1
+
+
+def search_space_key(fasta: Sequence[Path | str], settings: SearchSpaceSettings) -> str:
+    """The stage key of a search space built from ``fasta`` with
+    ``settings``: the inputs' SHA-256, the settings, :data:`SEARCH_SPACE_LAYOUT`,
+    the SHA-256 of the UNIMOD vocabulary the modifications were read from,
+    and the content-id scheme."""
+    from constellation.core.stages import stage_key
+    from constellation.massspec.library.ids import ID_SCHEME
+
+    return stage_key(
+        settings=settings.as_dict(),
+        inputs=[file_sha256(Path(f)) for f in fasta],
+        layout=SEARCH_SPACE_LAYOUT,
+        unimod=_vocabulary_digest(),
+        id_scheme=ID_SCHEME,
+    )
+
+
+def _vocabulary_digest() -> str:
+    """The SHA-256 of the packaged UNIMOD vocabulary (``unimod.json``):
+    the file carries no release of its own, so its bytes are its identity."""
+    import hashlib
+    from importlib import resources
+
+    return hashlib.sha256(resources.files("constellation.data").joinpath("unimod.json").read_bytes()).hexdigest()
 
 #: Wide enough for the MS1 scan range of most methods; narrow it to the
 #: isolation windows for a DIA run if the extra precursors are not wanted.
@@ -269,30 +312,6 @@ def parse_label(text: str) -> tuple[str, tuple[str, ...]]:
     return target.strip(), normalize_isotopes(raw, where=text)
 
 
-def normalize_isotopes(isotopes: Sequence[str], *, where: str = "") -> tuple[str, ...]:
-    """A label state's isotopes as ``<mass number><element>`` (``D`` →
-    ``2H``, ``T`` → ``3H``), each once, sorted: one spelling per state, so
-    that one molecule gets one key. An isotope the element does not have,
-    or two isotopes of one element (``33S,34S``: a whole-element label
-    makes every atom one isotope), is refused."""
-    out: dict[str, str] = {}  # element -> label
-    context = f" in {where!r}" if where else ""
-    for iso in isotopes:
-        if not re.fullmatch(r"\d+[A-Z][a-z]?|D|T", iso):
-            raise ValueError(f"not an isotope label: {iso!r}{context}")
-        mass_number, symbol = parse_isotope_label(iso)
-        try:
-            ELEMENTS[symbol].isotope_mass(mass_number)
-        except KeyError as exc:
-            raise ValueError(f"no such isotope: {iso!r}{context} ({exc})") from None
-        label = f"{mass_number}{symbol}"
-        have = out.get(symbol)
-        if have is not None and have != label:
-            raise ValueError(f"two isotopes of {symbol} in one label state: {have} and {label}{context}")
-        out[symbol] = label
-    return tuple(sorted(out.values()))
-
-
 def parse_protein_terminus(text: str) -> tuple[str, int | None, int | None]:
     """``ACCESSION=START[-END]`` or ``ACCESSION=-END``: a mature chain's
     first and last residue, 1-based inclusive as UniProt numbers them (BSA's
@@ -331,6 +350,21 @@ def _fixed_overlap(a: ModRule, site_a: str, b: ModRule, site_b: str) -> str | No
 
 
 _TERMINUS_OF = {N_TERM: N_TERM, PROTEIN_N_TERM: N_TERM, C_TERM: C_TERM, PROTEIN_C_TERM: C_TERM}
+
+
+def _check_rule_limits(rules: Sequence[ModRule]) -> None:
+    """Refuse two variable rules of one modification on a shared site with
+    different limits: a placement there would count toward both, and which
+    was meant cannot be told."""
+    variable = [r for r in rules if r.kind == "variable"]
+    for i, a in enumerate(variable):
+        for b in variable[i + 1:]:
+            shared = set(a.sites) & set(b.sites)
+            if a.modification == b.modification and shared and a.max_per_peptide != b.max_per_peptide:
+                raise ValueError(
+                    f"variable rules {a.name or a.modification!r} and {b.name or b.modification!r} place "
+                    f"{a.modification} at {sorted(shared)} with different limits; give one rule there"
+                )
 
 
 def _check_fixed_rules(rules: Sequence[ModRule]) -> None:
@@ -391,11 +425,26 @@ class SearchSpaceSettings:
             if rule.modification in UNIMOD:
                 _refuse_links(UNIMOD[rule.modification], rule.name or rule.modification)
         _check_fixed_rules(self.rules)
+        _check_rule_limits(self.rules)
         seen: set[tuple[int, str]] = set()
         for d in self.decoys:
             if (d.index, d.method) in seen:
                 raise ValueError(f"decoy set {d.index} given twice for {d.method}")
             seen.add((d.index, d.method))
+        # A method whose decoys depend on neither the set nor the seed makes
+        # the same decoys every time, so a second set of it is a copy of the
+        # first (reverse-protein:sets=2 made DECOY1_ proteins identical to
+        # DECOY_ ones and set 1 no peptide; a second reverse-interior set
+        # would be the first's fallback shuffles under its name).
+        from constellation.massspec.library.decoys import DECOY_METHODS
+
+        methods = [d.method for d in self.decoys]
+        for method in dict.fromkeys(methods):
+            if methods.count(method) > 1 and not DECOY_METHODS[method].seeded:
+                raise ValueError(
+                    f"{method} makes the same decoys for every set and seed, so a second set of it would copy "
+                    f"the first: give it once, and shuffle-interior (seeded) for more sets"
+                )
 
     def as_dict(self) -> dict[str, Any]:
         """The settings as plain data, for a manifest."""
@@ -447,6 +496,36 @@ def _read_proteins(fastas: Sequence[str | Path]) -> tuple[list[_Protein], list[d
     return list(by_acc.values()), inputs
 
 
+#: Accession prefixes other tools give decoys: a FASTA entry named so is
+#: almost surely one, and would be searched as a target.
+_DECOY_LIKE = re.compile(r"^(decoy\d*_|rev_|reverse_|xxx_|shuffle[d]?_)", re.IGNORECASE)
+
+
+def _check_decoy_accessions(targets: Sequence[_Protein], decoys: Sequence[_Protein], counts: dict) -> None:
+    """Refuse a FASTA entry that has the accession of a decoy made here (two
+    proteins, one id), and warn of entries named as other tools name decoys
+    (``DECOY_P1``, ``rev_P2``), which are read as targets: a decoy-bearing
+    FASTA searched again would double its decoys and count them as targets
+    (until 2026-11-10, with no word)."""
+    import warnings
+
+    made = {p.accession for p in decoys}
+    clash = sorted(p.accession for p in targets if p.accession in made)
+    if clash:
+        raise ValueError(
+            f"FASTA entries have the accessions of the decoys made for this search space ({', '.join(clash[:3])}"
+            f"{', ...' if len(clash) > 3 else ''}): remove the decoys from the FASTA, which are made here"
+        )
+    named = [p.accession for p in targets if _DECOY_LIKE.match(p.accession)]
+    counts["decoy_named_targets"] = len(named)
+    if named:
+        warnings.warn(
+            f"{len(named)} FASTA entries are named as decoys are ({', '.join(named[:3])}"
+            f"{', ...' if len(named) > 3 else ''}) and are read as targets; give the FASTA without its decoys",
+            stacklevel=3,
+        )
+
+
 def _states(protein: _Protein, labels: Sequence[tuple[str, tuple[str, ...]]]) -> tuple[tuple[str, ...], ...]:
     names = {protein.accession, parse_header(protein.accession).accession, *protein.sources}
     found = [iso for target, iso in labels if target in names]
@@ -476,7 +555,7 @@ def _enumeration_args(rules: Sequence[ModRule]) -> tuple[dict, dict, dict, dict]
     a placement records back to the rule that made it."""
     fixed: dict[str, list[str]] = {}
     variable: dict[str, list[str]] = {}
-    limits: dict[str, int] = {}
+    limits: list[tuple[str, tuple[str, ...], int]] = []
     rule_of: dict[tuple[str, str, str], str] = {}
     for rule in rules:
         for site in rule.sites:
@@ -489,8 +568,11 @@ def _enumeration_args(rules: Sequence[ModRule]) -> tuple[dict, dict, dict, dict]
                 keys = variable.setdefault(site, [])
                 if rule.modification not in keys:
                     keys.append(rule.modification)
+        # A rule's limit is on its own placements (its modification at its
+        # sites): until 2026-11-10 limits were pooled by modification, so
+        # Oxidation@M with Oxidation@W:max=1 allowed one oxidation in all.
         if rule.kind == "variable" and rule.max_per_peptide is not None:
-            limits[rule.modification] = min(limits.get(rule.modification, rule.max_per_peptide), rule.max_per_peptide)
+            limits.append((rule.modification, tuple(rule.sites), int(rule.max_per_peptide)))
     return fixed, variable, limits, rule_of
 
 
@@ -585,7 +667,7 @@ def build_search_space(
         max_variable=s.max_variable,
         vocab=vocab,
         skip_unlicensed=True,
-        max_per_mod=limits or None,
+        limit_groups=limits or None,
     )
     planned = 0
     # one count per (sequence, context): the label does not change the forms
@@ -664,7 +746,6 @@ def build_search_space(
         [not from_target[k] and il_key(forms[k].sequence) in target_il for k in range(len(forms))], dtype=bool
     )
     keep_peptide = in_range.any(axis=1) & ~collides
-    n_precursors = int(in_range[keep_peptide].sum())
 
     # ── peptide-level decoys ─────────────────────────────────────────
     target_peptides = [k for k in range(len(forms)) if keep_peptide[k] and from_target[k]]
@@ -700,17 +781,55 @@ def build_search_space(
                 {"set": ds.index, "method": ds.method, "seed": ds.seed,
                  "made": int((in_set & keep_peptide).sum()), "dropped": int((in_set & collides).sum())}
             )
-    n_decoy_precursors = sum(int(in_range[t].sum()) for _f, _k, t, _s, _o in decoy_peptides)
-    counts["peptidoforms"] = int(keep_peptide.sum())
-    counts["precursors"] = n_precursors
-    counts["decoy_peptidoforms"] = len(decoy_peptides)
+    # Peptide-level decoys on decoy proteins. Each decoy takes the spans of
+    # the target form it was made from (on target proteins), with its own
+    # sequence, on that protein's decoy of its set (DECOY_<accession>,
+    # DECOY<n>_<accession>, as protein-level sets are named), so a
+    # protein-level FDR has a decoy population of proteins with the targets'
+    # structure: a peptide shared by two proteins gives a decoy shared by
+    # their decoys. Built from ``decoy_of`` at construction, the use the PI
+    # allows ("building or subsetting the population"); nothing downstream
+    # pairs on it. Until 2026-11-10 no peptide-level decoy had a protein, and
+    # one whose target was filtered away was lost to subset_proteins.
+    target_spans: dict[int, list[int]] = {}
+    for si, k in edges:
+        if keep_peptide[k] and not proteins[span_rows[si][0]].is_decoy:
+            target_spans.setdefault(k, []).append(si)
+    decoy_protein_of: dict[tuple[int, int], int] = {}
+    decoy_spans: dict[tuple[int, int, int], tuple[Any, str]] = {}  # (decoy protein, start, end) → (span, sequence)
+    decoy_edges: dict[tuple[int, int, int, int], None] = {}  # (decoy protein, start, end, decoy j)
+    for j, (form, _key, t, ds_index, _order) in enumerate(decoy_peptides):
+        for si in dict.fromkeys(target_spans.get(t, [])):
+            pi, sp = span_rows[si]
+            dp = decoy_protein_of.get((pi, ds_index))
+            if dp is None:
+                dp = decoy_protein_of[(pi, ds_index)] = len(proteins)
+                prefix = "DECOY_" if ds_index == 0 else f"DECOY{ds_index}_"
+                proteins.append(_Protein(f"{prefix}{proteins[pi].accession}", None, "", [], True, ds_index,
+                                         proteins[pi].states))  # fmt: skip
+            decoy_spans.setdefault((dp, sp.start, sp.end), (sp, form.sequence))
+            decoy_edges[(dp, sp.start, sp.end, j)] = None
+    counts["decoy_proteins"] = len(proteins) - len(targets)
+    _check_decoy_accessions(targets, proteins[len(targets):], counts)
+    # Targets and decoys apart: the forms a reversed protein makes are decoys
+    # too (until 2026-11-10 they were counted with the targets, and a
+    # reverse-protein space showed no decoys at all).
+    target_kept = keep_peptide & from_target
+    protein_decoys = keep_peptide & ~from_target
+    n_target_precursors = int(in_range[target_kept].sum())
+    n_decoy_precursors = int(in_range[protein_decoys].sum()) + sum(
+        int(in_range[t].sum()) for _f, _k, t, _s, _o in decoy_peptides
+    )
+    counts["peptidoforms"] = int(target_kept.sum())
+    counts["precursors"] = n_target_precursors
+    counts["decoy_peptidoforms"] = int(protein_decoys.sum()) + len(decoy_peptides)
     counts["decoy_precursors"] = n_decoy_precursors
     counts["decoy_sets"] = decoy_counts
-    total_precursors = n_precursors + n_decoy_precursors
+    total_precursors = n_target_precursors + n_decoy_precursors
     if s.max_precursors is not None and total_precursors > s.max_precursors:
         raise SearchSpaceBudgetError(
-            f"the search space would hold {total_precursors:,} precursors ({n_precursors:,} from "
-            f"{counts['peptidoforms']:,} peptidoforms, {n_decoy_precursors:,} decoys), over the budget "
+            f"the search space would hold {total_precursors:,} precursors ({n_target_precursors:,} from "
+            f"{counts['peptidoforms']:,} target peptidoforms, {n_decoy_precursors:,} decoys), over the budget "
             f"of {s.max_precursors:,}; narrow it or raise max_precursors"
         )
     if count_only:
@@ -770,30 +889,37 @@ def build_search_space(
     # spans that make a kept peptidoform, and their edges
     kept_edges = [(si, int(new_index[k])) for si, k in edges if keep_peptide[k]]
     used_spans = sorted({si for si, _ in kept_edges})
-    span_proteins = [span_rows[si][0] for si in used_spans]
-    spans = [span_rows[si][1] for si in used_spans]
+    # Target (and protein-level decoy) spans, then the peptide-level decoys'
+    # spans on their decoy proteins: (protein index, span, its sequence).
+    span_list = [(span_rows[si][0], span_rows[si][1], span_rows[si][1].sequence) for si in used_spans]
+    span_list += [(dp, sp, sequence) for (dp, _s, _e), (sp, sequence) in decoy_spans.items()]
     peptide_spans = pa.table(
         {
-            "protein_id": pa.array(protein_ids[span_proteins] if spans else [], pa.int64()),
-            "start": pa.array([sp.start for sp in spans], pa.int32()),
-            "end": pa.array([sp.end for sp in spans], pa.int32()),
-            "sequence": pa.array([sp.sequence for sp in spans], pa.string()),
-            "missed_cleavages": pa.array([sp.n_missed for sp in spans], pa.int16()),
-            "n_term": pa.array([sp.n_term for sp in spans], pa.string()),
-            "c_term": pa.array([sp.c_term for sp in spans], pa.string()),
-            "preceding": pa.array([sp.preceding for sp in spans], pa.string()),
-            "following": pa.array([sp.following for sp in spans], pa.string()),
+            "protein_id": pa.array(protein_ids[[p for p, _, _ in span_list]] if span_list else [], pa.int64()),
+            "start": pa.array([sp.start for _, sp, _ in span_list], pa.int32()),
+            "end": pa.array([sp.end for _, sp, _ in span_list], pa.int32()),
+            "sequence": pa.array([seq for _, _, seq in span_list], pa.string()),
+            "missed_cleavages": pa.array([sp.n_missed for _, sp, _ in span_list], pa.int16()),
+            "n_term": pa.array([sp.n_term for _, sp, _ in span_list], pa.string()),
+            "c_term": pa.array([sp.c_term for _, sp, _ in span_list], pa.string()),
+            "preceding": pa.array([sp.preceding for _, sp, _ in span_list], pa.string()),
+            "following": pa.array([sp.following for _, sp, _ in span_list], pa.string()),
         }
     )
-    e_span = [si for si, _ in kept_edges]
-    e_pep = np.asarray([k for _, k in kept_edges], dtype=np.int64)
-    e_prot = [span_rows[si][0] for si in e_span]
+    # In key order, as Library.subset_precursors leaves them.
+    peptide_spans = peptide_spans.take(
+        pc.sort_indices(peptide_spans, sort_keys=[(k, "ascending") for k in ("protein_id", "start", "end")])
+    )
+    e_prot = [span_rows[si][0] for si, _ in kept_edges] + [dp for dp, _s, _e, _j in decoy_edges]
+    e_start = [span_rows[si][1].start for si, _ in kept_edges] + [s_ for _dp, s_, _e, _j in decoy_edges]
+    e_end = [span_rows[si][1].end for si, _ in kept_edges] + [e_ for _dp, _s, e_, _j in decoy_edges]
+    e_pep = np.asarray([k for _, k in kept_edges] + [n_kept + j for _dp, _s, _e, j in decoy_edges], dtype=np.int64)
     span_peptide = pa.table(
         {
-            "protein_id": pa.array(protein_ids[e_prot] if e_span else [], pa.int64()),
-            "start": pa.array([span_rows[si][1].start for si in e_span], pa.int32()),
-            "end": pa.array([span_rows[si][1].end for si in e_span], pa.int32()),
-            "peptide_id": pa.array(peptide_ids[e_pep] if e_span else [], pa.int64()),
+            "protein_id": pa.array(protein_ids[e_prot] if e_prot else [], pa.int64()),
+            "start": pa.array(e_start, pa.int32()),
+            "end": pa.array(e_end, pa.int32()),
+            "peptide_id": pa.array(peptide_ids[e_pep] if e_prot else [], pa.int64()),
         }
     )
     pairs = list(dict.fromkeys(zip(span_peptide.column("protein_id").to_pylist(),
@@ -846,6 +972,7 @@ def build_search_space(
         }
     )
     counts["spans_used"] = len(used_spans)
+    counts["decoy_spans"] = len(decoy_spans)
     metadata = {
         ID_SCHEME_METADATA_KEY: ID_SCHEME,
         SEARCH_SPACE_METADATA_KEY: {
