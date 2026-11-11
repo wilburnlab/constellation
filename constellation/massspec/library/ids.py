@@ -42,8 +42,9 @@ Two strings for one molecule must give one key:
 - a modification is written by accession (``[UNIMOD:35]``), whether it
   arrived as an accession, with its prefix in any case
   (``[unimod:35]``), or as a name the vocabulary knows in any case
-  (``[Oxidation]``, ``[oxidation]``); names the vocabulary does not know
-  are kept;
+  (``[Oxidation]``, ``[oxidation]``, ``[U:Oxidation]``); names the
+  vocabulary does not know are kept, and so is a name under another CV's
+  prefix (``[M:phospho]`` is PSI-MOD's to define, not UNIMOD:21);
 - a bare mass is rounded to ``MASS_DECIMALS`` places, so ``+57.02146``
   and ``+57.0214635`` agree (it is still not *resolved*: deciding which
   modification a mass stands for needs the residue and belongs to the
@@ -98,6 +99,10 @@ MASS_DECIMALS = 4
 
 _ID_MASK = (1 << 63) - 1
 
+#: The CVs a modification name is UNIMOD's under: none given, or UNIMOD's
+#: own prefix in either spelling.
+_UNIMOD_NAME_CVS = frozenset({None, "UNIMOD", "U"})
+
 # A string that is already canonical and needs no parsing: uppercase
 # residues, at most one accession-form UNIMOD modification per site.
 # This is what the readers emit for almost every peptide, and the full
@@ -129,7 +134,13 @@ def _canonical_modref(mod: ModRef, vocab: ModVocab) -> ModRef:
     if mod.accession is not None:
         return ModRef(cv=mod.cv, accession=mod.accession)
     if mod.name is not None:
-        for candidate in (f"{mod.cv}:{mod.name}" if mod.cv else None, mod.name):
+        # The bare name is looked up in the vocabulary only for a name of no
+        # CV or of UNIMOD's: a name under another CV's prefix (PSI-MOD
+        # ``M:``, RESID ``R:``, XLMOD ``X:``, GNO ``G:``) is that CV's to
+        # define, and is kept. Until 2026-11-11 it was found in UNIMOD too,
+        # so ``[M:phospho]`` became UNIMOD:21 (review of 2026-11-10, B13).
+        unimod_name = mod.cv in _UNIMOD_NAME_CVS
+        for candidate in (f"{mod.cv}:{mod.name}" if mod.cv else None, mod.name if unimod_name else None):
             if candidate is not None and candidate in vocab:
                 cv, _, accession = vocab.get(candidate).id.partition(":")
                 return ModRef(cv=cv, accession=accession)

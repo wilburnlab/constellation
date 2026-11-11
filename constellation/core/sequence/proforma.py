@@ -423,6 +423,12 @@ class _ProFormaTransformer(Transformer):
 
     # ── labile ───────────────────────────────────────────────────────
     def labile_mod(self, items):
+        # `{Glycan:…}`, `{Formula:…}` and `{INFO:…}` are those payloads, the
+        # prefix in any case, as in brackets. Until 2026-11-11 a glycan or
+        # formula's text ran past the closing brace, so only the name reading
+        # was left: `{glycan:Hex}` kept its spelling and a key of its own, and
+        # `{Formula:HPO3}` had no mass (review of 2026-11-10, B14; the
+        # grammar's FORMULA_TEXT / GLYCAN_TEXT).
         mod_internal = items[0]
         return _LabileMod(mod=mod_internal.first_modref())
 

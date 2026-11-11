@@ -80,6 +80,9 @@ def test_the_id_recipe_is_pinned() -> None:
         ("PEPM[oxidation]TIDEK", "PEPM[UNIMOD:35]TIDEK"),
         ("PEPM[u:OXIDATION]TIDEK", "PEPM[UNIMOD:35]TIDEK"),
         ("[acetyl]-PEPTIDEK", "[UNIMOD:1]-PEPTIDEK"),
+        # A labile glycan's prefix too (until 2026-11-11, two keys; B14).
+        ("{glycan:Hex}PEPTIDEK", "{Glycan:Hex}PEPTIDEK"),
+        ("{Glycan:Hex}PEPTIDEK", "{Glycan:Hex}PEPTIDEK"),
     ],
 )
 def test_spellings_of_one_peptide_share_a_key(spelling: str, key: str) -> None:
@@ -88,6 +91,27 @@ def test_spellings_of_one_peptide_share_a_key(spelling: str, key: str) -> None:
     assert canonical_peptide_key(key) == key
     assert canonical_peptide_key(parse_proforma(spelling)) == key
     assert format_proforma(parse_proforma(key)) == key
+
+
+@pytest.mark.parametrize(
+    ("spelling", "key"),
+    [
+        ("PEPTS[M:phospho]IDEK", "PEPTS[M:phospho]IDEK"),  # PSI-MOD's, not UNIMOD:21
+        ("PEPTK[m:Biotin]IDEK", "PEPTK[M:Biotin]IDEK"),
+        ("PEPTK[R:biotin]IDEK", "PEPTK[R:biotin]IDEK"),
+        ("PEPTK[X:Biotin]IDEK", "PEPTK[X:Biotin]IDEK"),
+        ("PEPTN[G:Hex]IDEK", "PEPTN[G:Hex]IDEK"),
+    ],
+)
+def test_a_name_under_another_cvs_prefix_is_not_looked_up_in_unimod(spelling: str, key: str) -> None:
+    """Until 2026-11-11 the bare name was looked up in UNIMOD whatever its
+    CV, so `[M:phospho]` became UNIMOD:21 and shared its id (review of
+    2026-11-10, B13). UNIMOD's own prefix (`U:`) is still looked up."""
+    assert canonical_peptide_key(spelling) == key
+    assert canonical_peptide_key(key) == key
+    assert "UNIMOD" not in key
+    assert canonical_peptide_key("PEPTS[U:phospho]IDEK") == "PEPTS[UNIMOD:21]IDEK"
+    assert peptide_id("PEPTS[M:phospho]IDEK") != peptide_id("PEPTS[UNIMOD:21]IDEK")
 
 
 def test_modifications_on_one_site_have_a_fixed_order() -> None:

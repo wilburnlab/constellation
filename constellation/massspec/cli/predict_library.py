@@ -753,7 +753,11 @@ def _cmd_predict_library_koina(args: argparse.Namespace) -> int:
             )
             source = str(Path(args.peptides).resolve())
         else:
+            from constellation.massspec.library.search_space import check_search_space_layout
+
             source_library = load_library(args.from_library)
+            # warned about since 2026-11-11 (review of 2026-11-10, B8)
+            check_search_space_layout(source_library)
             specs = precursors_from_library(source_library)
             source = str(Path(args.from_library).resolve())
     except (OSError, ValueError) as exc:

@@ -476,12 +476,18 @@ class PlacedMod:
 
     ``slot`` is a 0-based residue index, or ``"N-term"`` / ``"C-term"``;
     ``site`` is the key of the ``fixed`` / ``variable`` mapping that placed
-    it (a residue letter, ``N-term``, ``Protein N-term``, ...)."""
+    it (a residue letter, ``N-term``, ``Protein N-term``, ...), the first
+    in the mapping's order; ``sites`` is every key through which it reaches
+    its slot, sorted (``N-term`` and ``Protein N-term`` both reach a
+    protein's N-terminus), so that provenance can name each rule behind a
+    placement whatever order the rules came in (since 2026-11-11; review
+    of 2026-11-10, B11)."""
 
     slot: int | str
     key: str
     origin: ModOrigin
     site: str
+    sites: tuple[str, ...] = ()
 
 
 def _normalize_mod_spec(
@@ -601,7 +607,9 @@ class _ModPlan:
     whether a cyclization at the N-terminus excludes a variable
     modification of residue 0 (``guard``), and whether the N-terminus left
     as it is holds a fixed cyclization (``fixed_cyclized``: residue 0 is
-    then free only in forms where a variable modification replaces it)."""
+    then free only in forms where a variable modification replaces it).
+    ``reached`` gives, for each (slot, mod key) placed, every site of the
+    spec through which it reaches the slot, sorted."""
 
     fixed: dict[_Slot, tuple[str, str]]
     candidates: dict[_Slot, list[tuple[str, str]]]
@@ -611,6 +619,7 @@ class _ModPlan:
     groups: dict[_Slot, list[tuple[int, ...]]]
     guard: bool
     fixed_cyclized: bool = False
+    reached: dict[tuple[_Slot, str], tuple[str, ...]] = field(default_factory=dict)
 
 
 def _plan_modforms(
@@ -679,6 +688,11 @@ def _plan_modforms(
     # modifications landing on one slot (N-term and Protein N-term rules at
     # a protein's N-terminus) is a contradiction, not a precedence.
     fixed_slots: dict[_Slot, tuple[str, str]] = {}
+    # Every site through which each placement reaches its slot, fixed and
+    # variable: provenance names each rule behind it (since 2026-11-11; the
+    # first site in the spec's order alone made the provenance depend on the
+    # order of the rules, review of 2026-11-10, B11).
+    reached: dict[tuple[_Slot, str], list[str]] = {}
     for site, keys in fixed_spec.items():
         for key in keys:
             for pos in _slots_for_site(site, peptide, context):
@@ -693,6 +707,9 @@ def _plan_modforms(
                     )
                 if have is None:
                     fixed_slots[slot] = (key, site)
+                sites_here = reached.setdefault((slot, key), [])
+                if site not in sites_here:
+                    sites_here.append(site)
     # A fixed cyclization takes residue 0's side chain and what was on it,
     # in the forms that keep it; residue 0's fixed modification stays in the
     # plan, so a form whose N-terminus a variable modification takes instead
@@ -713,7 +730,6 @@ def _plan_modforms(
     # Protein N-term name one slot at a protein's N-terminus, and a placement
     # counts toward the limit of each rule that reaches it (until 2026-11-10,
     # only the first rule's, so the forms depended on the rules' order).
-    reached: dict[tuple[_Slot, str], list[str]] = {}
     for site, keys in var_spec.items():
         for pos in _slots_for_site(site, peptide, context):
             for key in keys:
@@ -752,6 +768,7 @@ def _plan_modforms(
         groups=groups,
         guard=guard,
         fixed_cyclized=fixed_cyclized,
+        reached={k: tuple(sorted(v)) for k, v in reached.items()},
     )
 
 
@@ -950,7 +967,7 @@ def enumerate_modforms(
 
     With ``return_origin=True`` each form comes with the
     :class:`PlacedMod` of every modification it carries, fixed and
-    variable, in slot order.
+    variable, in slot order, each with every site that reaches it.
 
     The work is proportional to the forms returned: a limit prunes a
     choice before it is extended. Raises ``ValueError`` if the
@@ -984,7 +1001,7 @@ def enumerate_modforms(
     def entry(slot: _Slot, key: str, site: str, origin: ModOrigin) -> tuple:
         # (position, layer, tag, its PlacedMod, where it is listed, key)
         layer, pos = slot
-        placed = PlacedMod(pos, key, origin, site) if return_origin else None
+        placed = PlacedMod(pos, key, origin, site, plan.reached.get((slot, key), (site,))) if return_origin else None
         return (pos, layer, _tagged(key), placed, (_place_order(pos, length), layer), key)
 
     entries = [[entry(slot, key, site, "variable") for key, site in plan.candidates[slot]] for slot in plan.ordered]
@@ -1123,6 +1140,16 @@ def _walk_modrefs(p: Peptidoform) -> Iterator[ModRef]:
     one chemical entity across all anchor positions, so the contribution
     counts once. Bare label references (``mod=None``) are skipped.
 
+    An ambiguity group (any label but ``XL…`` and ``BRANCH``) whose
+    modification is declared on more than one of its members raises
+    ``ValueError``: whether it is one modification over several positions
+    or several is not said, and since group labels are read in any case
+    (2026-11-10) ``#G1`` and ``#g1`` are one group. Until 2026-11-11 the
+    second declaration was dropped from the mass
+    (``PEPT[Phospho#g1]S[#g1]IDEK[Phospho#G1]``: 1094.45, one phospho;
+    review of 2026-11-10, B12). A cross-link or branch may carry its
+    modification on both ends and counts it once, as before.
+
     Excludes ``fixed_mods`` because their location-rule expansion depends
     on per-residue overrides (handled separately at the call site).
     """
@@ -1133,6 +1160,13 @@ def _walk_modrefs(p: Peptidoform) -> Iterator[ModRef]:
             return
         if tm.group_id is not None:
             if tm.group_id in seen:
+                label = tm.group_id.upper()
+                if not (label.startswith("XL") or label == "BRANCH"):
+                    raise ValueError(
+                        f"ambiguity group #{tm.group_id} declares its modification on more than one "
+                        "member, so whether it holds one modification or several is not said; write "
+                        "the modification on one member and the bare label on the others"
+                    )
                 return
             seen.add(tm.group_id)
         yield tm.mod
@@ -1418,7 +1452,8 @@ def peptide_composition(
       contribute their ``delta_composition``.
     - Cross-link / ambiguity / branch groups (TaggedMod ``group_id``)
       contribute exactly once across all anchor positions — the chemistry
-      is shared between participants.
+      is shared between participants. An ambiguity group declaring its
+      modification on more than one member raises ``ValueError``.
     - Heavy-isotope modifications (``mass_override``) contribute the
       *light-atom skeleton*; ``peptide_mass`` resolves the canonical mass.
     - Global isotope labels (``<13C>``, ``<15N>``, ...) contribute zero

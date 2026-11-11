@@ -106,6 +106,23 @@ def test_a_search_space_is_predicted_and_written(fake, search_space, tmp_path):
     assert _sorted_by_precursor(pq.ParquetFile(out / "library_pqdir" / "fragments.parquet"))
 
 
+def test_a_search_space_older_code_made_is_predicted_with_a_warning(fake, search_space, tmp_path):
+    """Until 2026-11-11 one with no layout (built before PR #110, with no
+    decoy proteins) was predicted without a word (review of 2026-11-10, B8)."""
+    import warnings
+
+    source = load_library(search_space)
+    record = {k: v for k, v in source.metadata["x.constellation.search_space"].items() if k != "layout"}
+    old = tmp_path / "old_space"
+    save_library(source.with_metadata({"x.constellation.search_space": record}), old, format="parquet_dir")
+    with pytest.warns(UserWarning, match=r"search space records no layout.*rebuild it with `massspec search-space`"):
+        assert _jc(old, tmp_path / "old_out") == 0
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        assert _jc(search_space, tmp_path / "out") == 0
+    assert not [w for w in seen if "layout" in str(w.message)]
+
+
 def test_resume_reuses_only_the_same_prediction(fake, search_space, tmp_path, capsys):
     out = tmp_path / "out"
     assert _jc(search_space, out) == 0

@@ -167,6 +167,32 @@ def test_return_origin() -> None:
     ]
 
 
+def test_a_placement_names_every_site_that_reaches_it_whatever_their_order() -> None:
+    """Until 2026-11-11 a placement two sites reached (N-term and Protein
+    N-term at a protein's N-terminus) named only the first in the spec's
+    order, so the provenance built on it followed the rules' order (review
+    of 2026-11-10, B11). The forms do not change."""
+    out = {}
+    for fixed, variable in (
+        ({"C": "UNIMOD:4", "H": "UNIMOD:4"}, {"N-term": "UNIMOD:1", "Protein N-term": "UNIMOD:1", "M": "UNIMOD:35"}),
+        ({"H": "UNIMOD:4", "C": "UNIMOD:4"}, {"M": "UNIMOD:35", "Protein N-term": "UNIMOD:1", "N-term": "UNIMOD:1"}),
+    ):
+        forms = enumerate_modforms("MCHK", fixed=fixed, variable=variable, context=SiteContext(protein_n_term=True),
+                                   return_origin=True, validate_specificity=False)  # fmt: skip
+        out[tuple(variable)] = {format_proforma(f): {(p.slot, p.key, p.origin, p.sites) for p in placed} for f, placed in forms}
+    first, second = out.values()
+    assert first == second
+    assert first["[UNIMOD:1]-MC[UNIMOD:4]H[UNIMOD:4]K"] == {
+        ("N-term", "UNIMOD:1", "variable", ("N-term", "Protein N-term")),
+        (1, "UNIMOD:4", "fixed", ("C",)),
+        (2, "UNIMOD:4", "fixed", ("H",)),
+    }
+    # A fixed modification two sites reach: both named.
+    ((_form, placed),) = enumerate_modforms("MCK", fixed={"N-term": "UNIMOD:1", "Protein N-term": "UNIMOD:1"},
+                                            context=SiteContext(protein_n_term=True), return_origin=True)  # fmt: skip
+    assert [p.sites for p in placed] == [("N-term", "Protein N-term")]
+
+
 def _texts(forms) -> list[str]:
     return [format_proforma(f) for f in forms]
 
