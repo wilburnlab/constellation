@@ -95,11 +95,20 @@ class Ledger:
             self._cache[key] = found
         return found
 
+    def _by_scan(self) -> np.ndarray:
+        """The ledger rows sorted by scan number, built once (every search
+        by scan number sorted the whole ledger again; review V7)."""
+        found = self._cache.get("by_scan")
+        if found is None:
+            found = np.argsort(self.scan, kind="stable")
+            self._cache["by_scan"] = found
+        return found
+
     def scan_rows(self, scans: np.ndarray) -> np.ndarray:
         """Ledger row of each scan number, -1 for one not in the ledger or
         negative (no scan)."""
         scans = np.asarray(scans, dtype=np.int64)
-        by = np.argsort(self.scan, kind="stable")
+        by = self._by_scan()
         pos = np.searchsorted(self.scan[by], scans)
         at = by[np.minimum(pos, max(by.size - 1, 0))] if by.size else np.zeros(scans.size, np.int64)
         found = (scans >= 0) & (pos < by.size) & (self.scan[at] == scans) if by.size else np.zeros(scans.size, bool)
@@ -108,13 +117,17 @@ class Ledger:
     def order(self) -> np.ndarray:
         """Each scan's rank by (retention time, scan number): the order a
         query's rows come in."""
-        rank = np.empty(self.n, dtype=np.int64)
-        rank[np.lexsort((self.scan, self.rt))] = np.arange(self.n, dtype=np.int64)
-        return rank
+        found = self._cache.get("order")
+        if found is None:
+            found = np.empty(self.n, dtype=np.int64)
+            found[np.lexsort((self.scan, self.rt))] = np.arange(self.n, dtype=np.int64)
+            found.setflags(write=False)
+            self._cache["order"] = found
+        return found
 
     def rows_of(self, scans: np.ndarray) -> np.ndarray:
         """Ledger rows of scan numbers (all of which must be in it)."""
-        by = np.argsort(self.scan, kind="stable")
+        by = self._by_scan()
         return by[np.searchsorted(self.scan[by], scans)]
 
     def table(self) -> pa.Table:
@@ -314,6 +327,14 @@ class QueryBatch:
     shared: np.ndarray | None = None
     #: The gate's verdict per query; with a gate.
     decision: Decision | None = None
+    #: Whether the sweep sized this batch by its cells (some reducer
+    #: declares ``zero_fills``), as a dense or filled view needs: without
+    #: it a bucket is sized by matches alone and its dense views can be
+    #: many times larger (5× in a test; review V6).
+    sized_for_cells: bool = True
+    #: Built on first use (not copied by ``replace``): facts about the
+    #: matches a dense view asks again at every call.
+    _cache: dict = field(default_factory=dict, init=False, compare=False, repr=False)
 
     def passing(self) -> QueryBatch:
         """The batch narrowed to the queries the gate passed (all of them
@@ -381,7 +402,32 @@ class QueryBatch:
 
         from constellation.massspec.sweep.dense import dense_view
 
+        self._check_sized_for_cells("dense")
         return dense_view(self, level, queries=queries, dtype=torch.float32 if dtype is None else dtype)
+
+    def _check_sized_for_cells(self, what: str) -> None:
+        if not self.sized_for_cells:
+            raise ValueError(
+                f"QueryBatch.{what}() builds every cell, but no reducer of this sweep declares zero_fills, "
+                "so its buckets were sized by matches alone: set zero_fills = True on the reducer that builds it"
+            )
+
+    def _match_rows(self, queries: np.ndarray, level: int) -> np.ndarray:
+        """Rows of ``matches`` of ``queries`` (ascending) at ``level``: the
+        matches are sorted by (query, level, ...), so each query's at a
+        level is one range, found by a search."""
+        m = self.matches
+        if m.n == 0 or queries.size == 0:
+            return np.empty(0, np.int64)
+        ordered = self._cache.get("matches_by_query")
+        if ordered is None:
+            ordered = self._cache["matches_by_query"] = bool((np.diff(m.query) >= 0).all())
+        if not ordered:  # not sorted: the general form
+            return np.flatnonzero((m.level == level) & np.isin(m.query, queries))
+        lo = np.searchsorted(m.query, queries, side="left")
+        hi = np.searchsorted(m.query, queries, side="right")
+        rows = np.repeat(lo, hi - lo) + ragged_arange(np.zeros(lo.size, np.int64), hi - lo)
+        return rows[m.level[rows] == level]
 
     def dense_chunks(self, max_cells: int, levels=None):
         """The batch's queries in contiguous ascending runs whose dense views
@@ -389,6 +435,7 @@ class QueryBatch:
         each (``sweep.dense.dense_chunks``)."""
         from constellation.massspec.sweep.dense import dense_chunks
 
+        self._check_sized_for_cells("dense_chunks")
         return dense_chunks(self, max_cells, levels)
 
     def eligible_cells(self, level: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

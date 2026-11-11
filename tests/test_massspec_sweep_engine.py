@@ -8,6 +8,8 @@ the two behaviours changed on purpose are pinned here.
 
 from __future__ import annotations
 
+import dataclasses
+
 import functools
 from pathlib import Path
 
@@ -991,7 +993,7 @@ def test_cells_merge_is_the_sort_it_replaced(tmp_root, name, rule):
     run, bundle, _ = _run(name, tmp_root)
     plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
     batch = _batch_of(bundle, plan, SweepSettings(tolerances={1: (20.0, "ppm"), 2: (0.35, "Da")}, rule=rule))
-    batch = type(batch)(**{**batch.__dict__, "matches": batch.matches.sorted(batch.scan_order[batch.match_rows()])})
+    batch = dataclasses.replace(batch, matches=batch.matches.sorted(batch.scan_order[batch.match_rows()]))
     for level in (1, 2):
         for subset in (None, batch.queries[::3]):
             for fill in (True, False):

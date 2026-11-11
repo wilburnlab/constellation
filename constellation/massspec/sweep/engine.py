@@ -590,17 +590,21 @@ def _fragment_level(plan: QueryPlan) -> int | None:
     return next((lv for lv in plan.levels if lv > 1), None)
 
 
-def _batch(plan, queries, out: _MapOut, ledger, order, settings, shared, *, presorted: bool = False) -> QueryBatch:
+def _batch(plan, queries, out: _MapOut, ledger, order, settings, shared, *, presorted: bool = False,
+           sized_for_cells: bool = True) -> QueryBatch:  # fmt: skip
     """A bucket's batch: matches sorted for reducers, and the gate decided.
     ``presorted``: the matches and evidence already are (a slice of a
-    sweep's sorted whole), so they are not sorted again."""
+    sweep's sorted whole), so they are not sorted again.
+    ``sized_for_cells``: whether the bucket was sized by its cells
+    (``QueryBatch.sized_for_cells``)."""
     if presorted:
         matches, evidence = out.matches, out.evidence
     else:
         matches = out.matches.sorted(order[ledger.rows_of(out.matches.scan)])
         evidence = out.evidence.take(order_by(out.evidence.query, out.evidence.scan))
     batch = QueryBatch(plan=plan, queries=queries, matches=matches, scans=ledger, scan_order=order,
-                       settings=settings, evidence=evidence, shared=shared)  # fmt: skip
+                       settings=settings, evidence=evidence, shared=shared,
+                       sized_for_cells=sized_for_cells)  # fmt: skip
     if settings.gate is None:
         return batch
     frag = _fragment_level(plan)
@@ -971,7 +975,8 @@ def _reduce_in_memory(out: _MapOut, plan, ledger, settings, reducers, axis) -> S
         e0, e1 = np.searchsorted(evidence.query, [q0, q1], side="left")
         part = _MapOut(matches.take(np.arange(m0, m1)), evidence.take(np.arange(e0, e1)), Claims.empty())
         batch = _batch(plan, np.arange(q0, q1, dtype=np.int64), part, ledger, order, settings,
-                       None if shared is None else shared[q0:q1], presorted=True)  # fmt: skip
+                       None if shared is None else shared[q0:q1], presorted=True,
+                       sized_for_cells=_fills(reducers))  # fmt: skip
         for into, tables in zip(collected, _reduce(batch, reducers)):
             for name, table in tables.items():
                 into[name].append(table)
@@ -1258,7 +1263,7 @@ def _reduce_bucket(
             np.add.at(shared, t.column("query").to_numpy() - q0, t.column("n").to_numpy())
     queries = np.arange(q0, q1, dtype=np.int64)
     batch = _batch(plan, queries, _MapOut(matches, evidence, Claims.empty()), ledger, order, settings,
-                   shared)  # fmt: skip
+                   shared, sized_for_cells=_fills(reducers))  # fmt: skip
     out: dict[str, str] = {}
     for tables in _reduce(batch, reducers):
         for name, table in tables.items():
@@ -1294,6 +1299,11 @@ def _shard_runs(directory: Path, index: int) -> list[Path]:
     return sorted(directory.glob(f"shard-{index:05d}-*.parquet"), key=lambda f: int(f.stem.rsplit("-", 1)[1]))
 
 
+def _fills(reducers) -> bool:
+    """Whether a reducer of the sweep builds every cell (declares ``zero_fills``)."""
+    return any(getattr(r, "zero_fills", False) for r in reducers)
+
+
 def _reduce_weights(plan: QueryPlan, ledger: Ledger, settings: SweepSettings, reducers, matches: np.ndarray) -> np.ndarray:
     """Per query, the rows reducing it builds: its matches; with a gate, the
     (scan, query) pairs of a query with matches, whose evidence is walked
@@ -1302,7 +1312,7 @@ def _reduce_weights(plan: QueryPlan, ledger: Ledger, settings: SweepSettings, re
     thousand unmatched global queries cost nothing to gate, and their
     zero-filled trace is sized as the trace it is."""
     weight = matches.astype(np.int64).copy()
-    fills = any(getattr(r, "zero_fills", False) for r in reducers)
+    fills = _fills(reducers)
     if settings.gate is None and not fills:
         return weight
     every = np.arange(plan.n_queries, dtype=np.int64)
