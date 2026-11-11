@@ -74,7 +74,7 @@ class FragmentationNoiseModel(Distribution):
         c = self.concentration
         return c / c.sum()
 
-    def log_prob(self, v: torch.Tensor) -> torch.Tensor:
+    def log_prob(self, v: torch.Tensor, *, mask: torch.Tensor | None = None) -> torch.Tensor:
         """Per-spectrum log-density of intensity vectors ``v`` (B, K).
 
         With counts ``x = v/g`` and ``v = g·x``, this is the Dirichlet-multinomial
@@ -84,11 +84,19 @@ class FragmentationNoiseModel(Distribution):
         so a trainable gain diverges instead of being identified by how the
         per-proportion variance shrinks with intensity. ``g`` is still only weakly
         identified from MS2 alone (it trades off against ``α₀`` through the effective
-        N) — constrain it with the MS1 gain when precision matters."""
-        return (
-            dirichlet_multinomial_log_prob(v / self.g, self.concentration)
-            - self.K * self.log_g
-        )
+        N) — constrain it with the MS1 gain when precision matters.
+
+        A channel that is NaN or negative (the ``-1`` "unobserved" sentinel)
+        is left out, together with any outside ``mask``: the density is then
+        the kept channels' given their own total, and the Jacobian counts the
+        kept channels only. Until 2026-11-11 a NaN gave NaN and a sentinel a
+        finite, wrong value."""
+        keep = v >= 0  # NaN fails it
+        if mask is not None:
+            keep = keep & mask.bool()
+        counts = torch.where(keep, v, torch.zeros_like(v)) / self.g
+        k_kept = keep.to(torch.float64).sum(dim=-1)
+        return dirichlet_multinomial_log_prob(counts, self.concentration, mask=keep) - k_kept * self.log_g
 
     def cdf(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError("FragmentationNoiseModel has no closed-form CDF.")

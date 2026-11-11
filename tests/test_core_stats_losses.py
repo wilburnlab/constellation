@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 import torch
 
@@ -417,3 +418,82 @@ def test_l2_normalize_has_a_finite_gradient_at_zero():
     # Away from zero the gradient is the normalization's own.
     x = torch.tensor([3.0, 4.0], dtype=torch.float64, requires_grad=True)
     assert torch.autograd.gradcheck(lambda v: losses.l2_normalize(v), (x,))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Masks for signed vectors, and scale extremes (review 2026-11-10, S2/V1/S9)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _signed_pair(seed: int = 3) -> tuple[torch.Tensor, torch.Tensor]:
+    """A 41-point elution trace after background subtraction (a third of it
+    below zero) and a noisy, offset copy of it."""
+    g = torch.Generator().manual_seed(seed)
+    t = torch.linspace(-3.0, 3.0, 41, dtype=torch.float64)
+    a = torch.exp(-t * t) - 0.3 + 0.05 * torch.randn(41, generator=g, dtype=torch.float64)
+    b = 1.7 * a - 0.2 + 0.15 * torch.randn(41, generator=g, dtype=torch.float64)
+    return a, b
+
+
+def test_a_masked_pearson_of_signed_traces_is_the_correlation() -> None:
+    """Without a mask the sentinel rule drops every negative value, so a
+    correlation of signed traces came out wrong (0.339 for 0.795 in the
+    review); with a mask, nothing is dropped for its sign."""
+    a, b = _signed_pair()
+    assert (a < 0).sum() >= 10
+    every = torch.ones(41, dtype=torch.bool)
+    expected = float(np.corrcoef(a.numpy(), b.numpy())[0, 1])
+    assert losses.pearson_correlation(a, b, mask=every).item() == pytest.approx(expected, abs=1e-12)
+    anti = float(np.corrcoef(a.numpy(), (-b).numpy())[0, 1])
+    assert losses.pearson_correlation(a, -b, mask=every).item() == pytest.approx(anti, abs=1e-12)
+    # The default (sentinel) rule is unchanged.
+    assert losses.pearson_correlation(a, b).item() != pytest.approx(expected, abs=1e-3)
+
+
+def test_a_mask_drops_exactly_its_channels_in_every_similarity() -> None:
+    g = torch.Generator().manual_seed(5)
+    x = torch.rand(4, 9, generator=g, dtype=torch.float64)
+    y = torch.rand(4, 9, generator=g, dtype=torch.float64)
+    mask = torch.rand(4, 9, generator=g) > 0.3
+    poisoned_x = torch.where(mask, x, torch.full_like(x, float("nan")))
+    poisoned_y = torch.where(mask, y, torch.full_like(y, -5.0))
+    for fn in (
+        losses.cosine_similarity,
+        losses.normalized_dot,
+        losses.pearson_correlation,
+        losses.spectral_entropy_similarity,
+    ):
+        masked = fn(poisoned_x, poisoned_y, mask=mask)
+        for row in range(4):
+            keep = mask[row]
+            alone = fn(x[row][keep], y[row][keep], mask=torch.ones(int(keep.sum()), dtype=torch.bool))
+            assert masked[row].item() == pytest.approx(alone.item(), abs=1e-12), fn.__name__
+    angle = losses.spectral_angle(poisoned_x[0], poisoned_y[0], mask=mask[0])
+    assert angle.item() == pytest.approx(
+        losses.spectral_angle(x[0][mask[0]], y[0][mask[0]]).item(), abs=1e-12
+    )
+
+
+def test_a_masked_cosine_of_a_dense_view_ignores_unacquired_zeros() -> None:
+    """The dense view stores 0 where a cell was not acquired (V1): passed
+    unmasked, that 0 is an observation; masked, it is not."""
+    library = torch.tensor([0.4, 0.3, 0.2, 0.1], dtype=torch.float64)
+    observed = torch.tensor([4.0, 3.0, 2.0, 0.0], dtype=torch.float64)  # last never acquired
+    acquired = torch.tensor([True, True, True, False])
+    assert losses.cosine_similarity(library, observed).item() < 0.99
+    assert losses.cosine_similarity(library, observed, mask=acquired).item() == pytest.approx(1.0, abs=1e-12)
+
+
+@pytest.mark.parametrize("scale", [1e-24, 1e-30, 2e19, 1e30])
+def test_float32_similarities_are_scale_free_at_the_extremes(scale: float) -> None:
+    """The squares were taken of the raw values, so a float32 cosine was 0
+    near 1e-24 (underflow) and from 2e19 (overflow)."""
+    g = torch.Generator().manual_seed(11)
+    x = torch.rand(3, 10, generator=g)
+    y = torch.rand(3, 10, generator=g)
+    for fn in (losses.cosine_similarity, losses.pearson_correlation):
+        base = fn(x, y)
+        assert torch.allclose(fn(x * scale, y), base, atol=1e-6), fn.__name__
+        assert torch.allclose(fn(x * scale, y * scale), base, atol=1e-6), fn.__name__
+    unit = losses.l2_normalize(x * scale, batch_dim=True)
+    assert torch.allclose(unit, losses.l2_normalize(x, batch_dim=True), atol=1e-6)

@@ -434,7 +434,7 @@ class Dirichlet(Distribution):
 
 
 def dirichlet_multinomial_log_prob(
-    x: torch.Tensor, concentration: torch.Tensor
+    x: torch.Tensor, concentration: torch.Tensor, *, mask: torch.Tensor | None = None
 ) -> torch.Tensor:
     """Log-PMF of the Dirichlet-multinomial at counts `x` with Dirichlet
     `concentration` `a` (shape `(..., K)`, broadcast over `x`).
@@ -444,15 +444,32 @@ def dirichlet_multinomial_log_prob(
     with ``n = Σx_k`` and ``A = Σa_k = α₀``. Counts may be non-integer
     (lgamma is continuous) — used by the fragmentation fit where observed
     intensities are scaled into effective counts. Reduces to the multinomial
-    log-PMF as ``A → ∞`` at fixed ``p = a/A``."""
+    log-PMF as ``A → ∞`` at fixed ``p = a/A``.
+
+    ``mask`` (broadcast against ``x``) keeps a subset of the categories: the
+    result is the Dirichlet-multinomial of the kept counts given their own
+    total, whose concentration is the kept ``a`` (the aggregation property).
+    A masked category's value is never read, so a NaN there changes nothing,
+    gradients included."""
     x_f = x.to(torch.float64)
     a = concentration.to(torch.float64)
+    if mask is not None:
+        keep = torch.broadcast_to(mask.bool(), torch.broadcast_shapes(x_f.shape, a.shape))
+        x_f = torch.where(keep, x_f, torch.zeros_like(x_f))
+        a_kept = torch.where(keep, a, torch.zeros_like(x_f))
+        a_safe = torch.where(keep, a, torch.ones_like(x_f))
+    else:
+        keep = None
+        a_kept = a
+        a_safe = a
     n = x_f.sum(dim=-1)
-    big_a = a.sum(dim=-1)
-    term_n = torch.lgamma(n + 1.0) - torch.lgamma(x_f + 1.0).sum(dim=-1)
+    big_a = a_kept.sum(dim=-1)
+    per_k = torch.lgamma(x_f + a_safe) - torch.lgamma(a_safe) - torch.lgamma(x_f + 1.0)
+    if keep is not None:
+        per_k = torch.where(keep, per_k, torch.zeros_like(per_k))
+    term_n = torch.lgamma(n + 1.0)
     term_beta = torch.lgamma(big_a) - torch.lgamma(n + big_a)
-    term_k = (torch.lgamma(x_f + a) - torch.lgamma(a)).sum(dim=-1)
-    return term_n + term_beta + term_k
+    return term_n + term_beta + per_k.sum(dim=-1)
 
 
 class DirichletMultinomial(Distribution):

@@ -5,10 +5,16 @@ Free functions only — Cartographer's `nn.Module` wrappers (`KLD`,
 PascalCase invariant, and functions compose more cleanly into
 `Parametric.fit`'s `loss_fn` parameter.
 
-Masking convention (from Cartographer's sentinel): a negative value — the
-`-1` "unobserved" sentinel — or a NaN in either vector removes that
-channel from the comparison, the same way in every function here
-(:func:`_valid`). A `mask` keyword, where offered, is combined with it.
+Masking convention. Without a ``mask``, Cartographer's sentinel rule
+applies: a negative value — the ``-1`` "unobserved" sentinel — or a NaN in
+either vector removes that channel from the comparison, the same way in
+every function here (:func:`_valid`). That rule suits spectrum vectors,
+which are never negative. With a ``mask``, the mask says which channels
+are observed and the sign rule is off: a channel is kept where the mask is
+true and both values are finite, so signed vectors (background-subtracted,
+centred, log or derivative traces) compare correctly. ``kld`` and the
+proportion-based scores (entropy similarity) still clamp negative values to
+0 inside the kept channels, since a proportion cannot be negative.
 
 Every similarity is scale-free: multiplying either vector by a positive
 constant leaves it unchanged, at any magnitude. Normalization divides by
@@ -38,6 +44,29 @@ def _valid(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (pred >= 0) & (target >= 0)
 
 
+def _keep(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    """The channels a similarity compares: the sentinel rule (:func:`_valid`)
+    without a ``mask``; with one, the masked channels that are finite in both
+    vectors, whatever their sign."""
+    if mask is None:
+        return _valid(pred, target)
+    return mask.bool() & torch.isfinite(pred) & torch.isfinite(target)
+
+
+def _max_abs(x: torch.Tensor) -> torch.Tensor:
+    """The largest magnitude over the last axis, without a gradient: a
+    scale to divide by before squaring, so neither underflow (values near
+    1e-24 in float32) nor overflow (near 2e19) reaches the squares. A unit
+    vector does not depend on it, so detaching it changes no gradient."""
+    return x.detach().abs().amax(dim=-1, keepdim=True)
+
+
+def _rescaled(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``x`` over its largest magnitude (zeros stay zeros) and that scale."""
+    scale = _max_abs(x)
+    return _safe_divide(x, scale, torch.zeros_like(scale)), scale
+
+
 def _masked(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """``x`` with masked channels set to 0 (``where``, so a NaN there does
     not leak through as it would through ``x * mask``)."""
@@ -64,14 +93,25 @@ def _unit_lastaxis(x: torch.Tensor, reference: torch.Tensor | None = None) -> to
     """``x`` divided by its L2 norm over the last axis. A norm below
     ``_RTOL`` machine epsilons of ``reference``'s norm (default ``x``'s
     own, so only an exactly zero vector) counts as zero, and the vector
-    is returned as zeros."""
-    norm = _root(x.square().sum(dim=-1, keepdim=True))
+    is returned as zeros.
+
+    The squares are taken of ``x`` over its largest magnitude, so the
+    result is the same at any scale the dtype can hold. Until 2026-11-11
+    they were taken of ``x`` itself, and a float32 cosine was 0 for vectors
+    near 1e-24 (the squares underflowed) and for vectors near 2e19 (they
+    overflowed)."""
+    xs, scale = _rescaled(x)
+    root = _root(xs.square().sum(dim=-1, keepdim=True))
     if reference is None:
-        zero = torch.zeros_like(norm)
-    else:
-        ref = _root(reference.square().sum(dim=-1, keepdim=True))
-        zero = ref * (_RTOL * torch.finfo(x.dtype).eps)
-    return _safe_divide(x, norm, zero)
+        zero = torch.zeros_like(root)
+        return _safe_divide(xs, root, zero)
+    rs, ref_scale = _rescaled(reference)
+    ref_root = _root(rs.square().sum(dim=-1, keepdim=True))
+    # Compare the true norms, scale · root, without forming either square.
+    norm = scale * root
+    zero = ref_scale * ref_root * (_RTOL * torch.finfo(x.dtype).eps)
+    keep = norm > zero
+    return torch.where(keep, _safe_divide(xs, root, torch.zeros_like(root)), torch.zeros_like(xs))
 
 
 def l1_normalize(
@@ -115,12 +155,17 @@ def l2_normalize(
     norm, which made every comparison of small-magnitude vectors
     (intensities around 1e-4 and below) scale-dependent."""
     x_masked = x if mask is None else torch.where(mask.bool(), x, torch.zeros_like(x))
+    # Squares of x over its largest magnitude, as in ``_unit_lastaxis``.
     if batch_dim:
         new_shape = [x_masked.shape[0]] + [1] * (x_masked.ndim - 1)
-        norm = _root(x_masked.square().flatten(1).sum(1)).reshape(new_shape)
+        scale = x_masked.detach().abs().flatten(1).amax(1).reshape(new_shape)
+        xs = _safe_divide(x_masked, scale, torch.zeros_like(scale))
+        norm = _root(xs.square().flatten(1).sum(1)).reshape(new_shape)
     else:
-        norm = _root(x_masked.square().sum())
-    return _safe_divide(x_masked, norm, torch.zeros_like(norm))
+        scale = x_masked.detach().abs().amax() if x_masked.numel() else torch.zeros((), dtype=x.dtype)
+        xs = _safe_divide(x_masked, scale, torch.zeros_like(scale))
+        norm = _root(xs.square().sum())
+    return _safe_divide(xs, norm, torch.zeros_like(norm))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -211,12 +256,15 @@ def spectral_angle(
     *,
     eps: float = 1e-7,
     batch_dim: bool = False,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Spectral angle similarity in `[0, 1]`. `1.0` for identical
     (parallel) intensity vectors, `0.0` for orthogonal ones or when
     either has nothing in it.
 
-    Channels negative or NaN in either vector are dropped. A single
+    Channels negative or NaN in either vector are dropped; with ``mask``,
+    the masked channels finite in both are kept instead (module docstring).
+    A single
     spectrum is a 1-D vector; a batch needs `batch_dim=True` (axis 0 is
     the batch, trailing dims flattened per spectrum) and is refused
     without it, where it used to be scored as one long vector. For
@@ -229,7 +277,7 @@ def spectral_angle(
             f"spectral_angle got a {tuple(pred.shape)} tensor without batch_dim=True; "
             "pass batch_dim=True to score each row, or use cosine_similarity over the last axis"
         )
-    valid = _valid(pred, target)
+    valid = _keep(pred, target, mask)
     if batch_dim:
         p = _masked(pred, valid).flatten(1)
         t = _masked(target, valid).flatten(1)
@@ -294,8 +342,9 @@ def spectral_entropy_loss(
 # ``(B,)`` for a ``(B, K)`` batch). For a 1-D pair, and row by row for
 # ``spectral_angle(..., batch_dim=True)`` on a 2-D batch, the identity
 # ``spectral_angle = 1 - 2·arccos(cosine_similarity)/π`` holds exactly.
-# Channels negative or NaN in either vector are dropped (``_valid``),
-# the same rule as ``spectral_angle`` and ``kld``.
+# Without a ``mask``, channels negative or NaN in either vector are
+# dropped (``_valid``), the same rule as ``spectral_angle`` and ``kld``;
+# with one, the masked channels finite in both are kept (``_keep``).
 
 
 def cosine_similarity(
@@ -303,6 +352,7 @@ def cosine_similarity(
     target: torch.Tensor,
     *,
     eps: float = 1e-7,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cosine similarity over the last axis. ``1.0`` for parallel vectors;
     non-negative intensity vectors give ``[0, 1]``; ``0`` when either has
@@ -310,8 +360,10 @@ def cosine_similarity(
 
     The raw dot product of the L2-normalized vectors — the quantity
     ``spectral_angle`` feeds to ``arccos``. Scale-free at any magnitude.
-    Returns ``input.shape[:-1]``."""
-    valid = _valid(pred, target)
+    ``mask`` (broadcast against the inputs) names the observed channels;
+    without it the sentinel rule applies (module docstring). Returns
+    ``input.shape[:-1]``."""
+    valid = _keep(pred, target, mask)
     pn = _unit_lastaxis(_masked(pred, valid))
     tn = _unit_lastaxis(_masked(target, valid))
     return (pn * tn).sum(dim=-1).clamp(min=-1.0, max=1.0)
@@ -322,13 +374,14 @@ def normalized_dot(
     target: torch.Tensor,
     *,
     eps: float = 1e-7,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The "normalized dot product" library-search score — identical to
     :func:`cosine_similarity` (dot product of L2-normalized intensity
     vectors). Exposed under its spectral-library name for the scoring
     comparison; its L2 geometry over-weights intense-ion shot noise (the
     Part-I point)."""
-    return cosine_similarity(pred, target, eps=eps)
+    return cosine_similarity(pred, target, eps=eps, mask=mask)
 
 
 def pearson_correlation(
@@ -336,16 +389,27 @@ def pearson_correlation(
     target: torch.Tensor,
     *,
     eps: float = 1e-7,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pearson correlation over the last axis = cosine of the mean-centered
     vectors. ``+1`` for ``pred = a·target + b`` (a > 0), ``-1`` for
     anti-correlation, ``0`` when either is constant over the channels
     kept (its centred residue is rounding, taken as zero). The mean is
     over the channels both vectors observe. Scale-free at any magnitude.
-    Returns ``input.shape[:-1]``."""
-    valid = _valid(pred, target)
+
+    Pass ``mask`` for signed vectors (traces centred, background-subtracted,
+    logged or differentiated): without it the sentinel rule drops every
+    negative value, and a correlation of signed traces is wrong (until
+    2026-11-11 that was the only rule; a trace with 15 of 41 points below
+    zero gave 0.339 where the correlation is 0.795). Returns
+    ``input.shape[:-1]``."""
+    valid = _keep(pred, target, mask)
     w = valid.to(pred.dtype)
     n = w.sum(dim=-1, keepdim=True)
+    # Each vector over its largest magnitude first (scale-free, and no
+    # overflow in the sums or the squares).
+    pred, _ = _rescaled(_masked(pred, valid))
+    target, _ = _rescaled(_masked(target, valid))
     pm, tm = _masked(pred, valid), _masked(target, valid)
     pred_mean = _safe_divide(pm.sum(dim=-1, keepdim=True), n, torch.zeros_like(n))
     target_mean = _safe_divide(tm.sum(dim=-1, keepdim=True), n, torch.zeros_like(n))
@@ -362,6 +426,7 @@ def spectral_entropy_similarity(
     *,
     pseudocount: float = 1e-3,
     eps: float = 1e-7,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Spectral-entropy similarity in ``[0, 1]`` (Li et al., Nat. Methods
     2021) over the last axis. ``1.0`` for identical spectra, ``0.0`` for
@@ -375,9 +440,10 @@ def spectral_entropy_similarity(
     intensity reweighting from the paper is omitted — this is the core
     similarity.) Each vector is normalized first and then smoothed by
     ``pseudocount`` in probability units, so the score is scale-free.
-    Channels negative or NaN in either are dropped. Returns
-    ``input.shape[:-1]``."""
-    valid = _valid(pred, target)
+    Channels negative or NaN in either are dropped; with ``mask``, the
+    masked channels finite in both are kept, negative values counting as 0.
+    Returns ``input.shape[:-1]``."""
+    valid = _keep(pred, target, mask)
     a, a_mass = _proportions(pred, valid, pseudocount)
     b, b_mass = _proportions(target, valid, pseudocount)
     m = 0.5 * (a + b)
