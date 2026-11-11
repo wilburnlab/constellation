@@ -18,7 +18,13 @@ Recognised tokens:
                    tuples — one entry per ``@`` cluster, so EThcD / sa /
                    supplemental-activation acquisitions produce ≥2 entries
                    all carrying the leading cluster's isolation target
-- ``scan_window`` ``(lo, hi)`` tuple in m/z
+- ``reactions``  list of ``(isolation_mz, [(activation_type, energy | None), ...])``,
+                 one per isolation (``mz@act...``), its activations in order: an
+                 MSn scan's own reaction is the last, whatever supplemental
+                 activation the ones before it carried
+- ``scan_window`` ``(lo, hi)`` tuple in m/z: the scan's range, or the
+                 envelope of its ranges when it has several
+- ``scan_windows`` list of ``(lo, hi)`` when the scan has several ranges
 
 Patterns lifted from ms_deisotope's ``_thermo_helper.py``; ported here as
 a clean rewrite so Constellation never depends on the upstream
@@ -43,8 +49,11 @@ _ACTIVATION_LEAD_RE = re.compile(
 )
 # Follow-on "@activation_energy" clusters (EThcD / sa / supplemental activation).
 _ACTIVATION_FOLLOW_RE = re.compile(r"@(?P<activation>[a-zA-Z]+)(?P<energy>\d*\.?\d*)")
-# Scan window: "[400.0-1600.0]"
-_SCAN_WINDOW_RE = re.compile(r"\[(?P<lo>[0-9.]+)-(?P<hi>[0-9.]+)\]")
+# Scan window: "[400.0-1600.0]", or several: "[200.0-700.0, 800.0-1500.0]"
+_SCAN_WINDOW_RE = re.compile(r"\[(?P<ranges>[0-9.]+-[0-9.]+(?:\s*,\s*[0-9.]+-[0-9.]+)*)\]")
+_RANGE_RE = re.compile(r"(?P<lo>[0-9.]+)-(?P<hi>[0-9.]+)")
+# One isolation and its activations: "600.0000@etd20.00@hcd15.00"
+_REACTION_RE = re.compile(r"(?P<isolation_mz>\d+\.\d*)(?P<activations>(?:@[a-zA-Z]+\d*\.?\d*)+)")
 
 
 def parse_filter_string(filter_str: str) -> dict[str, Any]:
@@ -104,10 +113,24 @@ def parse_filter_string(filter_str: str) -> dict[str, Any]:
             )
     if activations:
         out["activations"] = activations
+        reactions = []
+        for rm in _REACTION_RE.finditer(filter_str):
+            acts = [
+                (am.group("activation").lower(), float(am.group("energy")) if am.group("energy") else None)
+                for am in _ACTIVATION_FOLLOW_RE.finditer(rm.group("activations"))
+            ]
+            reactions.append((float(rm.group("isolation_mz")), acts))
+        if reactions:
+            out["reactions"] = reactions
 
     m = _SCAN_WINDOW_RE.search(filter_str)
     if m:
-        out["scan_window"] = (float(m.group("lo")), float(m.group("hi")))
+        ranges = [(float(r.group("lo")), float(r.group("hi"))) for r in _RANGE_RE.finditer(m.group("ranges"))]
+        # A scan of several ranges: their envelope here, each in scan_windows
+        # (until 2026-11-11 such a filter parsed to no range at all; review A7).
+        out["scan_window"] = (min(lo for lo, _ in ranges), max(hi for _, hi in ranges))
+        if len(ranges) > 1:
+            out["scan_windows"] = sorted(ranges)
 
     return out
 

@@ -141,6 +141,35 @@ def test_library_pairs_keep_confident_targets_with_a_library_time() -> None:
     assert sorted(by_precursor.column("precursor_id").to_pylist()) == [2, 3, 4]
 
 
+def test_a_librarys_clock_goes_with_its_pairs_and_a_models_is_not_fitted_as_seconds() -> None:
+    """Review of 2026-11-10, S11: pairs and RT_ALIGNMENT recorded no clock,
+    so a JChronologer library's model-scale times were fitted, and written,
+    as seconds."""
+    from types import SimpleNamespace
+
+    from constellation.massspec.rt import reference_scale
+
+    x, y = _outlier_fixture()
+    ids = _ids([{"precursor_id": i, "peptide_id": 100 + i, "rt": v} for i, v in enumerate(y)])
+    precursors = pa.table({"precursor_id": pa.array(range(len(x)), pa.int64()), "rt_predicted": list(x)})
+    library = SimpleNamespace(precursors=precursors,
+                              metadata_extras={"x.massspec.prediction.rt_scale": "chronologer_hi_seconds"})  # fmt: skip
+    pairs = library_pairs(ids, library)
+    assert reference_scale(pairs) == "chronologer_hi_seconds" and pairs.num_rows == len(x)
+    with pytest.raises(ValueError, match="a model's clock, not seconds"):
+        align(pairs, method="global", refine=None, reference_unit="s")
+    fitted = align(pairs, method="global", refine=None)  # the pairs' own clock
+    assert fitted.reference_unit == "chronologer_hi_seconds" and fitted.reference_rt_scale == "chronologer_hi_seconds"
+    with pytest.raises(ValueError):
+        to_rt_alignment_table(fitted, pairs, acquisition_id=0)
+    # Times on a run's own clock are seconds, and the table says so.
+    observed = library_pairs(ids, precursors, rt_scale="observed")
+    table = to_rt_alignment_table(align(observed, method="global", refine=None), observed, acquisition_id=0)
+    assert reference_scale(table) == "observed" and reference_scale(engine_pairs(table)) == "observed"
+    assert reference_scale(run_pairs(ids, ids)) == "observed"
+    assert reference_scale(library_pairs(ids, precursors)) is None  # a library that says nothing, as before
+
+
 def test_run_pairs_join_two_runs_on_the_peptide() -> None:
     reference = _ids([
         {"precursor_id": 1, "peptide_id": 10, "rt": 100.0},

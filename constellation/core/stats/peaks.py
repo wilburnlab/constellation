@@ -32,6 +32,8 @@ Numerical conventions:
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -46,6 +48,12 @@ __all__ = [
     "emg_log_pdf",
     "emg_left_pdf",
     "emg_left_log_pdf",
+    "emg_cdf",
+    "emg_left_cdf",
+    "gaussian_peak",
+    "emg_peak",
+    "PeakForm",
+    "PEAK_FORMS",
 ]
 
 _SQRT2 = math.sqrt(2.0)
@@ -116,30 +124,34 @@ def _emg_mode_offset(sigma: torch.Tensor, tau: torch.Tensor, *, iterations: int 
 
     Newton's method on ``g(w) = log erfcx(w) − log c`` (convex and
     decreasing, so once left of the root it closes in from the left)
-    runs a fixed number of steps without gradients; one more step with
-    gradients gives the implicit-function derivative. Stays finite for
+    runs a fixed number of steps on detached inputs; one more step on the
+    live inputs gives the implicit-function derivative, in either mode. Stays finite for
     any ``w`` through :func:`_log_erfcx` and is ``vmap``-safe.
     """
     r = sigma / tau
     log_c = 0.5 * math.log(2.0 / math.pi) - torch.log(r)
 
-    def step(w: torch.Tensor) -> torch.Tensor:
+    def step(w: torch.Tensor, log_c: torch.Tensor) -> torch.Tensor:
         log_e = _log_erfcx(w)
         # d/dw log erfcx(w) = 2w − 2/(√π·erfcx(w)), with 1/erfcx from its log.
         slope = 2.0 * w - (2.0 / math.sqrt(math.pi)) * torch.exp(-log_e)
         return w - (log_e - log_c) / slope
 
-    with torch.no_grad():
-        c = torch.exp(log_c)
-        # Large w: erfcx(w) ≈ 1/(w√π); very negative w: erfcx(w) ≈ 2·exp(w²).
-        w = torch.where(
-            c < 1.0,
-            1.0 / (c.clamp(min=1e-300) * math.sqrt(math.pi)),
-            -torch.sqrt(torch.log((c / 2.0).clamp(min=1.0))),
-        )
-        for _ in range(iterations):
-            w = step(w)
-    w = step(w.detach())
+    # The iterations run on detached inputs, so no derivative of either
+    # mode (backward, or forward through ``torch.func.jvp``) is carried
+    # through them; the last step, on the live ``log_c``, carries the
+    # implicit-function derivative.
+    log_c_fixed = log_c.detach()
+    c = torch.exp(log_c_fixed)
+    # Large w: erfcx(w) ≈ 1/(w√π); very negative w: erfcx(w) ≈ 2·exp(w²).
+    w = torch.where(
+        c < 1.0,
+        1.0 / (c.clamp(min=1e-300) * math.sqrt(math.pi)),
+        -torch.sqrt(torch.log((c / 2.0).clamp(min=1.0))),
+    )
+    for _ in range(iterations):
+        w = step(w, log_c_fixed)
+    w = step(w.detach(), log_c)
     return r - _SQRT2 * w
 
 
@@ -204,6 +216,163 @@ def emg_left_log_pdf(
     return -math.log(2.0) - torch.log(tau) - 0.5 * z * z + _log_erfcx(b)
 
 
+def _normal_cdf(z: torch.Tensor) -> torch.Tensor:
+    """Standard normal CDF Φ(z), from ``erfc`` so the lower tail keeps its
+    relative precision."""
+    return 0.5 * torch.erfc(-z / _SQRT2)
+
+
+def emg_cdf(
+    t: torch.Tensor,
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    tau: torch.Tensor,
+) -> torch.Tensor:
+    """CDF of the right-tailed EMG density :func:`emg_pdf`, exactly:
+    ``F(t) = Φ(z) − τ·f(t)`` with ``z = (t − μ)/σ``. The density is taken
+    from its stable log form, so the CDF is finite into both tails, and it
+    broadcasts and is ``vmap``-safe like the densities. ``t = ±inf`` gives
+    0 and 1."""
+    t = torch.as_tensor(t, dtype=torch.as_tensor(mu).dtype)
+    finite = torch.isfinite(t)
+    t_safe = torch.where(finite, t, torch.zeros_like(t))
+    z = (t_safe - mu) / sigma
+    value = _normal_cdf(z) - tau * emg_pdf(t_safe, mu, sigma, tau)
+    value = value.clamp(min=0.0, max=1.0)
+    limit = torch.where(t > 0, torch.ones_like(value), torch.zeros_like(value))
+    return torch.where(finite, value, limit)
+
+
+def emg_left_cdf(
+    t: torch.Tensor,
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    tau: torch.Tensor,
+) -> torch.Tensor:
+    """CDF of the left-tailed (fronting) EMG density :func:`emg_left_pdf`:
+    the mirror of :func:`emg_cdf`, ``F(t) = Φ(z) + τ·f_L(t)``."""
+    t = torch.as_tensor(t, dtype=torch.as_tensor(mu).dtype)
+    finite = torch.isfinite(t)
+    t_safe = torch.where(finite, t, torch.zeros_like(t))
+    z = (t_safe - mu) / sigma
+    value = _normal_cdf(z) + tau * emg_left_pdf(t_safe, mu, sigma, tau)
+    value = value.clamp(min=0.0, max=1.0)
+    limit = torch.where(t > 0, torch.ones_like(value), torch.zeros_like(value))
+    return torch.where(finite, value, limit)
+
+
+def _limits(
+    t_lo: float | torch.Tensor | None, t_hi: float | torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Integration limits as float64 tensors, a missing one as ``∓inf``."""
+    lo = torch.tensor(-math.inf, dtype=torch.float64) if t_lo is None else torch.as_tensor(t_lo, dtype=torch.float64)
+    hi = torch.tensor(math.inf, dtype=torch.float64) if t_hi is None else torch.as_tensor(t_hi, dtype=torch.float64)
+    return lo, hi
+
+
+def gaussian_peak(t: torch.Tensor, height: torch.Tensor, center: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    """A Gaussian peak of ``height`` at ``center``: ``height·exp(−½((t − center)/σ)²)``.
+    The one formula ``GaussianPeak`` and the batched ``gaussian`` form use."""
+    z = (t - center) / sigma
+    return height * torch.exp(-0.5 * z * z)
+
+
+def emg_peak(t: torch.Tensor, height: torch.Tensor, apex: torch.Tensor, sigma: torch.Tensor,
+             tau: torch.Tensor) -> torch.Tensor:  # fmt: skip
+    """A right-tailed EMG peak whose maximum is ``height`` at ``apex`` (the
+    exact mode, :func:`_emg_mode_offset`), its ratio to the apex taken in
+    log space so the far tail stays finite. The one formula ``EMGPeak`` and
+    the batched ``emg`` form use."""
+    mu = apex - sigma * _emg_mode_offset(sigma, tau)
+    return height * torch.exp(emg_log_pdf(t, mu, sigma, tau) - emg_log_pdf(apex, mu, sigma, tau))
+
+
+def _moments(x: torch.Tensor, y: torch.Tensor, valid: torch.Tensor):
+    """Per row: the positive part's centroid and spread, the height and the
+    smallest sample spacing (for starting values and bounds)."""
+    w = torch.where(valid, y.clamp(min=0), torch.zeros_like(y))
+    total = w.sum(-1).clamp(min=1e-300)
+    xs = torch.where(valid, x, torch.zeros_like(x))
+    center = (w * xs).sum(-1) / total
+    spread = torch.sqrt(((w * (xs - center.unsqueeze(-1)) ** 2).sum(-1) / total).clamp(min=0))
+    height = torch.where(valid, y, torch.full_like(y, float("-inf"))).amax(-1).clamp(min=0)
+    big = torch.full_like(x, float("inf"))
+    gaps = torch.where(valid[..., 1:] & valid[..., :-1], (x[..., 1:] - x[..., :-1]).abs(), big[..., 1:])
+    step = gaps.amin(-1) if gaps.shape[-1] else torch.ones_like(center)
+    step = torch.where(torch.isfinite(step) & (step > 0), step, torch.ones_like(step))
+    lo = torch.where(valid, x, big).amin(-1)
+    hi = torch.where(valid, x, -big).amax(-1)
+    return center, spread.clamp(min=step), height, step, lo, hi
+
+
+@dataclass(frozen=True)
+class PeakForm:
+    """A peak shape as functions of batched parameters ``theta [B, P]``, for
+    fitting many peaks at once (``core.signal.peak_fit``): its value at
+    ``x [B, N]``, its whole area, its apex position, starting values and
+    box bounds from the data of each row. Named in :data:`PEAK_FORMS`."""
+
+    name: str
+    version: int
+    parameters: tuple[str, ...]
+    evaluate: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+    area: Callable[[torch.Tensor], torch.Tensor]
+    apex: Callable[[torch.Tensor], torch.Tensor]
+    initial: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+    bounds: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
+
+
+def _gauss_init(x, y, valid):
+    center, spread, height, _, _, _ = _moments(x, y, valid)
+    return torch.stack([height, center, spread], -1)
+
+
+def _gauss_bounds(x, y, valid):
+    _, _, height, step, lo, hi = _moments(x, y, valid)
+    lower = torch.stack([torch.zeros_like(lo), lo, step / 4], -1)
+    upper = torch.stack([10 * height.clamp(min=1e-300), hi, (hi - lo).clamp(min=step)], -1)
+    return lower, upper
+
+
+def _emg_init(x, y, valid):
+    center, spread, height, _, _, _ = _moments(x, y, valid)
+    apex = torch.gather(x, -1, torch.where(valid, y, torch.full_like(y, float("-inf"))).argmax(-1, keepdim=True))
+    return torch.stack([height, apex.squeeze(-1), spread / 1.5, spread / 2], -1)
+
+
+def _emg_bounds(x, y, valid):
+    _, _, height, step, lo, hi = _moments(x, y, valid)
+    span = (hi - lo).clamp(min=step)
+    lower = torch.stack([torch.zeros_like(lo), lo, step / 4, step / 20], -1)
+    upper = torch.stack([10 * height.clamp(min=1e-300), hi, span, 2 * span], -1)
+    return lower, upper
+
+
+def _emg_area(theta):
+    h, apex, s, tau = theta.unbind(-1)
+    mu = apex - s * _emg_mode_offset(s, tau)
+    return h * torch.exp(-emg_log_pdf(apex, mu, s, tau))
+
+
+#: The batched peak forms, by name.
+PEAK_FORMS: dict[str, PeakForm] = {
+    "gaussian": PeakForm(
+        name="gaussian", version=1, parameters=("height", "center", "sigma"),
+        evaluate=lambda x, th: gaussian_peak(x, th[..., 0:1], th[..., 1:2], th[..., 2:3]),
+        area=lambda th: th[..., 0] * th[..., 2] * _SQRT2PI,
+        apex=lambda th: th[..., 1],
+        initial=_gauss_init, bounds=_gauss_bounds,
+    ),
+    "emg": PeakForm(
+        name="emg", version=1, parameters=("height", "apex", "sigma", "tau"),
+        evaluate=lambda x, th: emg_peak(x, th[..., 0:1], th[..., 1:2], th[..., 2:3], th[..., 3:4]),
+        area=_emg_area,
+        apex=lambda th: th[..., 1],
+        initial=_emg_init, bounds=_emg_bounds,
+    ),
+}  # fmt: skip
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Peak shapes
 # ──────────────────────────────────────────────────────────────────────
@@ -238,8 +407,7 @@ class GaussianPeak(PeakShape):
         return self.log_sigma.exp()
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        z = (t - self.t_apex) / self.sigma
-        return self.N_max * torch.exp(-0.5 * z * z)
+        return gaussian_peak(t, self.N_max, self.t_apex, self.sigma)
 
     def integrate(
         self,
@@ -247,29 +415,29 @@ class GaussianPeak(PeakShape):
         t_hi: float | torch.Tensor | None = None,
         n_points: int = 500,
     ) -> torch.Tensor:
+        """Area over ``[t_lo, t_hi]`` through the Gaussian CDF, a missing
+        limit ``∓inf``; differentiable in the parameters and the limits.
+        An infinite limit's CDF (0 or 1) is set before any arithmetic with
+        the parameters, as :func:`emg_cdf` does. Until 2026-11-11
+        ``(±inf − t_apex)/σ`` was formed first, so with one limit missing
+        the value was right and the gradient in ``log_sigma`` NaN."""
         # Closed form when no limits are given: ∫ N_max·exp(-½z²) dt = N_max·σ·√(2π)
         if t_lo is None and t_hi is None:
             return self.N_max * self.sigma * _SQRT2PI
-        # Bounded integral via the Gaussian CDF.
-        lo, hi = self._resolve_limits(t_lo, t_hi)
+        lo, hi = _limits(t_lo, t_hi)
         sigma = self.sigma
-        cdf_hi = 0.5 * (1.0 + torch.erf((hi - self.t_apex) / (sigma * _SQRT2)))
-        cdf_lo = 0.5 * (1.0 + torch.erf((lo - self.t_apex) / (sigma * _SQRT2)))
-        return self.N_max * sigma * _SQRT2PI * (cdf_hi - cdf_lo)
+
+        def cdf(t: torch.Tensor) -> torch.Tensor:
+            finite = torch.isfinite(t)
+            z = (torch.where(finite, t, torch.zeros_like(t)) - self.t_apex) / sigma
+            limit = torch.where(t > 0, torch.ones_like(z), torch.zeros_like(z))
+            return torch.where(finite, _normal_cdf(z), limit)
+
+        return self.N_max * sigma * _SQRT2PI * (cdf(hi) - cdf(lo))
 
     def bounds(self, n_sigma: float = 4.0) -> tuple[torch.Tensor, torch.Tensor]:
         sigma = self.sigma
         return (self.t_apex - n_sigma * sigma, self.t_apex + n_sigma * sigma)
-
-    def _resolve_limits(
-        self,
-        t_lo: float | torch.Tensor | None,
-        t_hi: float | torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        b_lo, b_hi = self.bounds()
-        lo = b_lo if t_lo is None else torch.as_tensor(t_lo, dtype=torch.float64)
-        hi = b_hi if t_hi is None else torch.as_tensor(t_hi, dtype=torch.float64)
-        return lo, hi
 
     def parameters_dict(self) -> dict[str, torch.Tensor]:
         return {
@@ -332,14 +500,9 @@ class EMGPeak(PeakShape):
         return self.t_apex - self.sigma * _emg_mode_offset(self.sigma, self.tau)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        sigma = self.sigma
-        tau = self.tau
-        mu = self.mu
-        # Normalize so that the peak max equals N_max. The unnormalized
-        # `emg_pdf` integrates to 1; we scale by the value at t_apex.
-        pdf_t = emg_pdf(t, mu, sigma, tau)
-        pdf_apex = emg_pdf(self.t_apex, mu, sigma, tau)
-        return self.N_max * pdf_t / pdf_apex.clamp(min=1e-30)
+        # N_max at t_apex: the density over its value there, in log space
+        # (emg_peak; until 2026-11-11 a ratio of densities clamped at 1e-30).
+        return emg_peak(t, self.N_max, self.t_apex, self.sigma, self.tau)
 
     def integrate(
         self,
@@ -347,19 +510,20 @@ class EMGPeak(PeakShape):
         t_hi: float | torch.Tensor | None = None,
         n_points: int = 500,
     ) -> torch.Tensor:
-        # Trapezoidal integration over the resolved limits — the closed
-        # form for the bounded integral pulls in the EMG CDF, which is
-        # itself an erfcx call; the trapezoidal route is just as accurate
-        # at n_points=500 and avoids re-deriving the CDF.
-        lo, hi = self._resolve_limits(t_lo, t_hi)
-        grid = torch.linspace(
-            lo.item() if torch.is_tensor(lo) else lo,
-            hi.item() if torch.is_tensor(hi) else hi,
-            n_points,
-            dtype=torch.float64,
-        )
-        values = self.forward(grid)
-        return torch.trapezoid(values, grid)
+        """Area under the peak over ``[t_lo, t_hi]``, exactly: the EMG
+        density integrates to 1, so the whole area is ``N_max / f(t_apex)``
+        and a bounded one that times the CDF difference (:func:`emg_cdf`).
+        A missing limit is ``∓inf``. Differentiable in the parameters and
+        the limits; ``n_points`` is unused. Until 2026-11-11 this was a
+        500-point trapezoid over ``bounds()`` by default, which cut the
+        tail off (−1.7 % of the area at τ = 5σ, −3.7 % at 20σ) and, through
+        ``.item()``, stopped gradients through the limits."""
+        sigma, tau, mu = self.sigma, self.tau, self.mu
+        area = self.N_max / emg_pdf(self.t_apex, mu, sigma, tau).clamp(min=1e-300)
+        if t_lo is None and t_hi is None:
+            return area
+        lo, hi = _limits(t_lo, t_hi)
+        return area * (emg_cdf(hi, mu, sigma, tau) - emg_cdf(lo, mu, sigma, tau))
 
     def bounds(self, n_sigma: float = 4.0) -> tuple[torch.Tensor, torch.Tensor]:
         sigma = self.sigma
@@ -370,16 +534,6 @@ class EMGPeak(PeakShape):
             self.t_apex - n_sigma * sigma,
             self.t_apex + n_sigma * sigma + 3.0 * tau,
         )
-
-    def _resolve_limits(
-        self,
-        t_lo: float | torch.Tensor | None,
-        t_hi: float | torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        b_lo, b_hi = self.bounds()
-        lo = b_lo if t_lo is None else torch.as_tensor(t_lo, dtype=torch.float64)
-        hi = b_hi if t_hi is None else torch.as_tensor(t_hi, dtype=torch.float64)
-        return lo, hi
 
     def parameters_dict(self) -> dict[str, torch.Tensor]:
         return {
@@ -400,8 +554,9 @@ class HyperEMGPeak(PeakShape):
     Both mixture components are proper PDFs (integrate to 1), so
     `∫ N(t) dt = N_total` for *any* shape — the integrated ion count is a direct
     parameter (contrast `EMGPeak`, which parameterizes the apex height `N_max`).
-    With `η → 1` and a small `τ_l` this reduces to a right-tailing EMG. There is
-    no closed-form CDF; the η mixture is multimodal, so fit with
+    With `η → 1` and a small `τ_l` this reduces to a right-tailing EMG. Its CDF
+    is the η mixture of :func:`emg_cdf` and :func:`emg_left_cdf`; the η mixture
+    is multimodal, so fit with
     `core.optim.DifferentialEvolution` (+ optional LBFGS polish), not LBFGS
     alone.
 
@@ -475,19 +630,23 @@ class HyperEMGPeak(PeakShape):
         t_hi: float | torch.Tensor | None = None,
         n_points: int = 500,
     ) -> torch.Tensor:
-        # The mixture components are normalized PDFs, so the unbounded integral
-        # is exactly N_total. Bounded integrals go trapezoidal (mirrors
-        # EMGPeak — avoids re-deriving the two-sided EMG CDF).
+        """Area over ``[t_lo, t_hi]``, exactly: the mixture components are
+        normalized densities, so the whole area is ``N_total`` and a
+        bounded one is ``N_total`` times the mixture's CDF difference
+        (:func:`emg_cdf`, :func:`emg_left_cdf`). A missing limit is
+        ``∓inf``; ``n_points`` is unused. Until 2026-11-11 a bounded area
+        was a trapezoid, with a missing limit taken from ``bounds()``."""
         if t_lo is None and t_hi is None:
             return self.N_total
-        lo, hi = self._resolve_limits(t_lo, t_hi)
-        grid = torch.linspace(
-            lo.item() if torch.is_tensor(lo) else lo,
-            hi.item() if torch.is_tensor(hi) else hi,
-            n_points,
-            dtype=torch.float64,
-        )
-        return torch.trapezoid(self.forward(grid), grid)
+        lo, hi = _limits(t_lo, t_hi)
+        eta = self.eta
+
+        def cdf(t: torch.Tensor) -> torch.Tensor:
+            return eta * emg_cdf(t, self.mu, self.sigma, self.tau_r) + (1.0 - eta) * emg_left_cdf(
+                t, self.mu, self.sigma, self.tau_l
+            )
+
+        return self.N_total * (cdf(hi) - cdf(lo))
 
     def bounds(self, n_sigma: float = 4.0) -> tuple[torch.Tensor, torch.Tensor]:
         sigma = self.sigma
@@ -497,16 +656,6 @@ class HyperEMGPeak(PeakShape):
             self.mu - n_sigma * sigma - 3.0 * self.tau_l,
             self.mu + n_sigma * sigma + 3.0 * self.tau_r,
         )
-
-    def _resolve_limits(
-        self,
-        t_lo: float | torch.Tensor | None,
-        t_hi: float | torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        b_lo, b_hi = self.bounds()
-        lo = b_lo if t_lo is None else torch.as_tensor(t_lo, dtype=torch.float64)
-        hi = b_hi if t_hi is None else torch.as_tensor(t_hi, dtype=torch.float64)
-        return lo, hi
 
     def parameters_dict(self) -> dict[str, torch.Tensor]:
         return {

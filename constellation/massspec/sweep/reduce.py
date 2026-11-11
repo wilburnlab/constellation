@@ -43,7 +43,32 @@ from constellation.massspec.sweep.schemas import (
 if TYPE_CHECKING:
     from constellation.massspec.sweep.engine import SweepSettings
 
-__all__ = ["Cells", "Ledger", "Matches", "QueryBatch", "Reducer", "QuerySummaryReducer"]
+__all__ = ["Cells", "Ledger", "Matches", "QueryBatch", "Reducer", "QuerySummaryReducer",
+           "FLOOR_NONE", "FLOOR_RECORDED", "FLOOR_MAP", "gaps_from_windows"]
+
+#: Where a scan's floor came from (``Ledger.floor_source``).
+FLOOR_NONE, FLOOR_RECORDED, FLOOR_MAP = 0, 1, 2
+
+
+def gaps_from_windows(windows: list) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
+    """``Ledger`` gaps (offsets, lower, upper) from each scan's list of
+    ``(lower, upper)`` ranges (None, or a list of one, for a scan of one
+    range): None offsets when no scan has several."""
+    if not any(w is not None and len(w) > 1 for w in windows):
+        return None, np.empty(0), np.empty(0)
+    offsets = [0]
+    lower: list[float] = []
+    upper: list[float] = []
+    for w in windows:
+        if w is not None and len(w) > 1:
+            ranges = sorted((float(r["lower"] if isinstance(r, dict) else r[0]),
+                             float(r["upper"] if isinstance(r, dict) else r[1])) for r in w)  # fmt: skip
+            for (_, hi), (lo, _) in zip(ranges[:-1], ranges[1:]):
+                if lo > hi:
+                    lower.append(hi)
+                    upper.append(lo)
+        offsets.append(len(lower))
+    return np.asarray(offsets, np.int64), np.asarray(lower, np.float64), np.asarray(upper, np.float64)
 
 
 @dataclass(frozen=True)
@@ -68,6 +93,32 @@ class Ledger:
     #: The ledger row of the scan one level down each scan was taken from
     #: (``acquisition_structure.parent_scans``), -1 for none.
     parent: np.ndarray | None = None
+    #: How many points the bundle holds for each scan (scan metadata's
+    #: ``peak_count``), -1 where it does not say; and whether the sweep read
+    #: the scan (inside its ``scan_range`` / ``rt_range``). A scan read and
+    #: holding no points was measured and found nothing, so it is a slot of
+    #: zeros on its queries' axes; one not read is no slot (review V3).
+    peak_count: np.ndarray | None = None
+    read: np.ndarray | None = None
+    #: Which injection times were estimated, not recorded
+    #: (``acquisition_structure.impute_injection_times``).
+    iit_imputed: np.ndarray | None = None
+    #: Each scan's lowest stored intensity (NaN unknown), and where it came
+    #: from: :data:`FLOOR_NONE`, :data:`FLOOR_RECORDED` (scan metadata's
+    #: ``intensity_floor``) or :data:`FLOOR_MAP` (found by the map in the
+    #: points it read whole).
+    floor: np.ndarray | None = None
+    floor_source: np.ndarray | None = None
+    #: What made each scan's peaks, as a code into ``centroiders`` (-1 not
+    #: recorded): scan metadata's ``centroider``.
+    centroider: np.ndarray | None = None
+    centroiders: tuple[str, ...] = ()
+    #: The gaps of scans acquired over several ranges, ragged: scan ``i``'s
+    #: gaps are ``gap_lower/upper[gap_offsets[i]:gap_offsets[i + 1]]``, open
+    #: intervals between its ranges (None when no scan has several).
+    gap_offsets: np.ndarray | None = None
+    gap_lower: np.ndarray | None = None
+    gap_upper: np.ndarray | None = None
     #: Built on first use: each level's WindowIndex (eligibility is
     #: decided on it at every call, so it is built once, not regrouped).
     _cache: dict = field(default_factory=dict, compare=False, repr=False)
@@ -78,28 +129,95 @@ class Ledger:
                 object.__setattr__(self, name, np.full(self.scan.size, np.nan))
         if self.parent is None:
             object.__setattr__(self, "parent", np.full(self.scan.size, -1, np.int64))
+        if self.peak_count is None:
+            object.__setattr__(self, "peak_count", np.full(self.scan.size, -1, np.int64))
+        if self.read is None:
+            object.__setattr__(self, "read", np.ones(self.scan.size, bool))
+        if self.iit_imputed is None:
+            object.__setattr__(self, "iit_imputed", np.zeros(self.scan.size, bool))
+        if self.floor is None:
+            object.__setattr__(self, "floor", np.full(self.scan.size, np.nan))
+        if self.floor_source is None:
+            source = np.where(np.isnan(self.floor), FLOOR_NONE, FLOOR_RECORDED).astype(np.int8)
+            object.__setattr__(self, "floor_source", source)
+        if self.centroider is None:
+            object.__setattr__(self, "centroider", np.full(self.scan.size, -1, np.int16))
+
+    @property
+    def range_known(self) -> np.ndarray:
+        """Whether each scan records the m/z range it acquired (one that
+        does not counts as having acquired every m/z)."""
+        return ~(np.isnan(self.scan_lower) | np.isnan(self.scan_upper))
+
+    def fill_floor(self, rows: np.ndarray, floor: np.ndarray) -> None:
+        """Floors the map found (``FLOOR_MAP``) for scans with none recorded."""
+        rows = np.asarray(rows, np.int64)
+        todo = self.floor_source[rows] == FLOOR_NONE
+        self.floor[rows[todo]] = np.asarray(floor, np.float64)[todo]
+        self.floor_source[rows[todo]] = FLOOR_MAP
+
+    def in_gap(self, rows: np.ndarray, mz: np.ndarray) -> np.ndarray:
+        """Whether each m/z falls between two of its scan's (``rows``)
+        acquired ranges: never measured, though inside the envelope."""
+        rows = np.asarray(rows, np.int64)
+        mz = np.asarray(mz, np.float64)
+        out = np.zeros(mz.shape, bool)
+        if self.gap_offsets is None or mz.size == 0:
+            return out
+        flat_rows = np.broadcast_to(rows, mz.shape).reshape(-1)
+        flat_mz = mz.reshape(-1)
+        count = self.gap_offsets[flat_rows + 1] - self.gap_offsets[flat_rows]
+        has = np.flatnonzero(count > 0)
+        if has.size == 0:
+            return out
+        n = count[has]
+        element = np.repeat(has, n)
+        gap = np.repeat(self.gap_offsets[flat_rows[has]], n) + ragged_arange(np.zeros(has.size, np.int64), n)
+        inside = (flat_mz[element] > self.gap_lower[gap]) & (flat_mz[element] < self.gap_upper[gap])
+        hit = np.zeros(flat_mz.size, bool)
+        np.logical_or.at(hit, element[inside], True)
+        return hit.reshape(mz.shape)
+
+    @property
+    def present(self) -> np.ndarray:
+        """Each scan can be a slot: it has points, or it was read and holds
+        none (an empty scan, a measured zero). Until 2026-11-11 only scans
+        with points were, so an empty scan was a gap in every trace and an
+        MS2 slot whose parent was empty had none."""
+        return (self.n_points > 0) | (self.read & (self.peak_count == 0))
 
     @property
     def n(self) -> int:
         return int(self.scan.size)
 
     def window_index(self, level: int) -> WindowIndex:
-        """The level's scans with points and a time, by isolation window
-        (MS1 as one unbounded window). Keyed by the points the map has
-        recorded, so an index is never used before they are all in."""
-        key = ("windows", int(level), int(self.n_points.sum()), self.n)
+        """The level's scans that can be slots (:attr:`present`) and have a
+        time, by isolation window (MS1 as one unbounded window). Keyed by
+        the points the map has recorded, so an index is never used before
+        they are all in."""
+        present = self.present
+        key = ("windows", int(level), int(self.n_points.sum()), int(present.sum()), self.n)
         found = self._cache.get(key)
         if found is None:
-            found = window_index(self.scan, self.level, self.rt, self.lower, self.upper, self.n_points,
+            found = window_index(self.scan, self.level, self.rt, self.lower, self.upper, present,
                                  int(level), gate=level > 1)  # fmt: skip
             self._cache[key] = found
+        return found
+
+    def _by_scan(self) -> np.ndarray:
+        """The ledger rows sorted by scan number, built once (every search
+        by scan number sorted the whole ledger again; review V7)."""
+        found = self._cache.get("by_scan")
+        if found is None:
+            found = np.argsort(self.scan, kind="stable")
+            self._cache["by_scan"] = found
         return found
 
     def scan_rows(self, scans: np.ndarray) -> np.ndarray:
         """Ledger row of each scan number, -1 for one not in the ledger or
         negative (no scan)."""
         scans = np.asarray(scans, dtype=np.int64)
-        by = np.argsort(self.scan, kind="stable")
+        by = self._by_scan()
         pos = np.searchsorted(self.scan[by], scans)
         at = by[np.minimum(pos, max(by.size - 1, 0))] if by.size else np.zeros(scans.size, np.int64)
         found = (scans >= 0) & (pos < by.size) & (self.scan[at] == scans) if by.size else np.zeros(scans.size, bool)
@@ -108,13 +226,17 @@ class Ledger:
     def order(self) -> np.ndarray:
         """Each scan's rank by (retention time, scan number): the order a
         query's rows come in."""
-        rank = np.empty(self.n, dtype=np.int64)
-        rank[np.lexsort((self.scan, self.rt))] = np.arange(self.n, dtype=np.int64)
-        return rank
+        found = self._cache.get("order")
+        if found is None:
+            found = np.empty(self.n, dtype=np.int64)
+            found[np.lexsort((self.scan, self.rt))] = np.arange(self.n, dtype=np.int64)
+            found.setflags(write=False)
+            self._cache["order"] = found
+        return found
 
     def rows_of(self, scans: np.ndarray) -> np.ndarray:
         """Ledger rows of scan numbers (all of which must be in it)."""
-        by = np.argsort(self.scan, kind="stable")
+        by = self._by_scan()
         return by[np.searchsorted(self.scan[by], scans)]
 
     def table(self) -> pa.Table:
@@ -132,16 +254,46 @@ class Ledger:
                 "scan_window_lower": pa.array(self.scan_lower, mask=np.isnan(self.scan_lower)),
                 "scan_window_upper": pa.array(self.scan_upper, mask=np.isnan(self.scan_upper)),
                 "parent_scan": pa.array(parent.astype(np.int32), mask=parent < 0),
+                "peak_count": pa.array(self.peak_count.astype(np.int64), mask=self.peak_count < 0),
+                "read": pa.array(self.read.astype(bool)),
+                "iit_imputed": pa.array(self.iit_imputed.astype(bool)),
+                "intensity_floor": pa.array(self.floor, mask=np.isnan(self.floor)),
+                "floor_source": pa.array(self.floor_source.astype(np.int8)),
+                "centroider": pa.array(
+                    [self.centroiders[c] if c >= 0 else None for c in self.centroider.tolist()], pa.string()
+                ),
+                "scan_windows": self._windows_column(),
             },
             schema=SWEEP_SCAN_TABLE,
         )
 
+    def _windows_column(self) -> pa.Array:
+        """Each scan's ranges when it has several (null otherwise), from its
+        envelope and gaps."""
+        windows_type = SWEEP_SCAN_TABLE.field("scan_windows").type
+        if self.gap_offsets is None:
+            return pa.nulls(self.n, windows_type)
+        out = []
+        for i in range(self.n):
+            a, b = int(self.gap_offsets[i]), int(self.gap_offsets[i + 1])
+            if a == b:
+                out.append(None)
+                continue
+            edges = [self.scan_lower[i], *np.ravel(np.stack([self.gap_lower[a:b], self.gap_upper[a:b]], 1)),
+                     self.scan_upper[i]]  # fmt: skip
+            out.append([{"lower": float(lo), "upper": float(hi)} for lo, hi in zip(edges[0::2], edges[1::2])])
+        return pa.array(out, windows_type)
+
     def acquired(self, rows: np.ndarray, mz: np.ndarray) -> np.ndarray:
         """Whether each m/z lies inside its scan's (ledger ``rows``)
-        acquired range, inclusive; a scan with no recorded range counts as
-        having acquired everything."""
+        acquired range, inclusive, and not between two of its ranges; a
+        scan with no recorded range counts as having acquired everything
+        (:attr:`range_known` says which do)."""
         lo, hi = self.scan_lower[rows], self.scan_upper[rows]
-        return ~((mz < lo) | (mz > hi))
+        inside = ~((mz < lo) | (mz > hi))
+        if self.gap_offsets is not None:
+            inside &= ~self.in_gap(rows, mz)
+        return inside
 
 
 _MATCH_FIELDS = ("query", "level", "scan", "channel", "point_index", "mz", "intensity", "n_points")
@@ -314,6 +466,14 @@ class QueryBatch:
     shared: np.ndarray | None = None
     #: The gate's verdict per query; with a gate.
     decision: Decision | None = None
+    #: Whether the sweep sized this batch by its cells (some reducer
+    #: declares ``zero_fills``), as a dense or filled view needs: without
+    #: it a bucket is sized by matches alone and its dense views can be
+    #: many times larger (5× in a test; review V6).
+    sized_for_cells: bool = True
+    #: Built on first use (not copied by ``replace``): facts about the
+    #: matches a dense view asks again at every call.
+    _cache: dict = field(default_factory=dict, init=False, compare=False, repr=False)
 
     def passing(self) -> QueryBatch:
         """The batch narrowed to the queries the gate passed (all of them
@@ -381,7 +541,32 @@ class QueryBatch:
 
         from constellation.massspec.sweep.dense import dense_view
 
+        self._check_sized_for_cells("dense")
         return dense_view(self, level, queries=queries, dtype=torch.float32 if dtype is None else dtype)
+
+    def _check_sized_for_cells(self, what: str) -> None:
+        if not self.sized_for_cells:
+            raise ValueError(
+                f"QueryBatch.{what}() builds every cell, but no reducer of this sweep declares zero_fills, "
+                "so its buckets were sized by matches alone: set zero_fills = True on the reducer that builds it"
+            )
+
+    def _match_rows(self, queries: np.ndarray, level: int) -> np.ndarray:
+        """Rows of ``matches`` of ``queries`` (ascending) at ``level``: the
+        matches are sorted by (query, level, ...), so each query's at a
+        level is one range, found by a search."""
+        m = self.matches
+        if m.n == 0 or queries.size == 0:
+            return np.empty(0, np.int64)
+        ordered = self._cache.get("matches_by_query")
+        if ordered is None:
+            ordered = self._cache["matches_by_query"] = bool((np.diff(m.query) >= 0).all())
+        if not ordered:  # not sorted: the general form
+            return np.flatnonzero((m.level == level) & np.isin(m.query, queries))
+        lo = np.searchsorted(m.query, queries, side="left")
+        hi = np.searchsorted(m.query, queries, side="right")
+        rows = np.repeat(lo, hi - lo) + ragged_arange(np.zeros(lo.size, np.int64), hi - lo)
+        return rows[m.level[rows] == level]
 
     def dense_chunks(self, max_cells: int, levels=None):
         """The batch's queries in contiguous ascending runs whose dense views
@@ -389,6 +574,7 @@ class QueryBatch:
         each (``sweep.dense.dense_chunks``)."""
         from constellation.massspec.sweep.dense import dense_chunks
 
+        self._check_sized_for_cells("dense_chunks")
         return dense_chunks(self, max_cells, levels)
 
     def eligible_cells(self, level: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

@@ -83,8 +83,16 @@ def test_a_dda_run_is_searched_spectrum_centric_without_a_library(tmp_path, jar,
     assert all(q is not None for q in targets.column("qvalue").to_pylist())
     other = psms.filter(pc.equal(psms.column("psm_type"), "other"))
     assert other.column("qvalue").null_count == other.num_rows
+    # A decoy match carries the content id of its own sequence (null until
+    # 2026-11-11, review C5; the stand-in spells its decoy as a target's
+    # sequence, so here the two share an id).
+    from constellation.massspec.library.ids import precursor_id
+
     decoys = psms.filter(psms.column("is_decoy"))
-    assert decoys.column("precursor_id").null_count == decoys.num_rows
+    assert decoys.num_rows and decoys.column("precursor_id").to_pylist() == [
+        precursor_id(m, z) for m, z in zip(decoys.column("modified_sequence").to_pylist(),
+                                           decoys.column("charge").to_pylist(), strict=True)
+    ]  # fmt: skip
     # The scans are the acquisition's: they join its scan metadata.
     scans = pq.read_table(bundle / "scan_metadata.parquet", columns=["scan", "rt"]).to_pylist()
     rt_of = {r["scan"]: r["rt"] for r in scans}
@@ -312,3 +320,32 @@ def test_fatal_error_reads_the_jars_report(tmp_path) -> None:
     )
     log.write_text("[00:00:01] Finished analysis!\n")
     assert fatal_error(log) is None
+
+
+def test_scribetwo_decoy_matches_carry_their_own_precursor_ids(tmp_path) -> None:
+    """Review of 2026-11-10, C5: a decoy match was written with no
+    precursor id, so it found no library abundances when swept, while its
+    targets did. Its id is its own sequence's, as a library holding the
+    decoys keys it; reports written as the captured layout, no jar."""
+    from constellation.massspec.acquisitions import Acquisitions
+    from constellation.massspec.io.encyclopedia._scribe2 import read_scribe2_psms
+    from constellation.massspec.library.ids import precursor_id
+
+    reports = tmp_path / "run.dia.scribe2"
+    reports.mkdir()
+    header = "id\tLabel\tScanNr\tExpMass\tprecursorMz\tprecursorMass\tProteins\n"
+    (reports / "run.dia.scribe2.features.txt").write_text(
+        header
+        + "run.raw:600.5:PEPTIDEK+2\t1\t101\t465.2341\t465.2340\t928.4534\tsp|P1|A\n"
+        + "run.raw:610.2:decoyKEDITPEP+2\t-1\t102\t465.2342\t465.2340\t928.4534\tDECOY_sp|P1|A\n"
+    )
+    (reports / "run.dia.scribe2.txt").write_text(
+        "PSMId\tscore\tq-value\tposterior_error_prob\nrun.raw:600.5:PEPTIDEK+2\t3.1\t0.001\t0.01\npi_0=null\n"
+    )
+    (reports / "run.dia.scribe2.decoy.txt").write_text(
+        "PSMId\tscore\tq-value\tposterior_error_prob\nrun.raw:610.2:decoyKEDITPEP+2\t-0.4\t0.6\t0.9\n"
+    )
+    acquisitions, _ = Acquisitions.empty().register([{"source_file": "/data/run.raw", "source_kind": "thermo_raw"}])
+    psms = read_scribe2_psms(reports, acquisitions=acquisitions)
+    assert psms.column("is_decoy").to_pylist() == [False, True]
+    assert psms.column("precursor_id").to_pylist() == [precursor_id("PEPTIDEK", 2), precursor_id("KEDITPEP", 2)]

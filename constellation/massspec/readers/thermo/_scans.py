@@ -440,11 +440,20 @@ def _scan_row(
 
     if ms_level >= 2:
         activations = parsed.get("activations", [])
-        if activations:
-            # The reaction that made this scan: an MS2 scan's is the first, an
-            # MS3 scan's the second (until 2026-11-10 an MS3 scan recorded its
-            # MS2 parent's activation and energy).
-            _, activation_type, energy = activations[min(ms_level - 2, len(activations) - 1)]
+        reactions = parsed.get("reactions", [])
+        if reactions:
+            # The reaction that made this scan, its first activation: an MS2
+            # scan's is reaction 0, an MS3 scan's reaction 1. Counted by
+            # isolation, not by activation: an MS2 reaction with a
+            # supplemental activation (EThcD) counts once (until 2026-11-11
+            # the MS3 scan took that supplemental activation; review A11).
+            _, acts = reactions[min(ms_level - 2, len(reactions) - 1)]
+            if acts:
+                activation_type, energy = acts[0]
+                if energy is not None:
+                    ce = float(energy)
+        elif activations:
+            _, activation_type, energy = activations[0]
             if energy is not None:
                 ce = float(energy)
 
@@ -500,6 +509,7 @@ def _scan_row(
         "base_peak_mz": safe_float(stats.BasePeakMass),
         "base_peak_intensity": safe_float(stats.BasePeakIntensity),
         "peak_count": int(peaks.mz.size),
+        "intensity_floor": float(np.min(peaks.intensity)) if peaks.intensity.size else None,
         "spectrum_type": peaks.spectrum_type,
         "centroider": peaks.centroider,
         "filter_string": filter_str or None,
@@ -511,6 +521,9 @@ def _scan_row(
         "isolation_upper": iso_upper,
         "scan_window_lower": scan_window[0] if scan_window else None,
         "scan_window_upper": scan_window[1] if scan_window else None,
+        "scan_windows": (
+            [{"lower": lo, "upper": hi} for lo, hi in parsed["scan_windows"]] if "scan_windows" in parsed else None
+        ),
         "precursor_scan": master_scan_f,
         "precursor_mz": precursor_mz,
         "precursor_charge": precursor_charge,

@@ -257,8 +257,13 @@ def run(args: argparse.Namespace) -> int:
     # ── the library to predict ───────────────────────────────────────
     try:
         if args.from_library is not None:
+            from constellation.massspec.library.search_space import check_search_space_layout
+
             source = Path(args.from_library).resolve()
             library = load_library(source)
+            # A search space older code made is predicted as it is, with a
+            # warning (since 2026-11-11, review of 2026-11-10, B8: silently).
+            check_search_space_layout(library)
         else:
             source = Path(args.peptides).resolve()
             library = _peptide_list_library(source, tuple(range(args.min_charge, args.max_charge + 1)))

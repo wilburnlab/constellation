@@ -57,6 +57,7 @@ from constellation.massspec.bundle import (
     peak_rows,
 )
 from constellation.massspec.io.encyclopedia._dia import DiaFile, scan_number
+from constellation.massspec.readers.thermo._method import scan_ranges_from_method
 from constellation.massspec.precursor_major import PRECURSOR_MAJOR_DIR, build_precursor_major
 from constellation.massspec.schemas import (
     ACQUISITION_METADATA_SCHEMA_VERSION,
@@ -185,8 +186,19 @@ def _base_peak(scan: _Scan) -> dict[str, float | None]:
     }
 
 
-def _scan_metadata_row(scan: _Scan) -> dict[str, Any]:
+def _scan_metadata_row(scan: _Scan, ranges: dict[int, tuple[float, float]] | None = None) -> dict[str, Any]:
+    """One scan's metadata row. ``ranges``: each level's acquired m/z range
+    from the file's instrument-method text (:func:`scan_ranges_from_method`),
+    which is where an MS2 scan's comes from: a ``.dia`` stores an MS1 scan's
+    range as its isolation bounds and an MS2 scan's nowhere (until
+    2026-11-11 an imported MS2 scan had none, so every channel counted as
+    acquired; review A7)."""
     ms2 = scan["level"] == 2
+    method_range = (ranges or {}).get(int(scan["level"]))
+    if ms2:
+        window = method_range
+    else:
+        window = (scan["lower"], scan["upper"])
     return {
         "scan": scan["scan"],
         "level": scan["level"],
@@ -202,13 +214,14 @@ def _scan_metadata_row(scan: _Scan) -> dict[str, Any]:
             else float(str(np.float32(scan["iit_s"]))) * 1000.0
         ),
         "peak_count": int(scan["mz"].size),
+        "intensity_floor": float(np.min(scan["intensity"])) if scan["intensity"].size else None,
         # A spectra file holds centroids; it does not say what made them.
         "spectrum_type": "centroid",
         **_base_peak(scan),
         "isolation_lower": scan["lower"] if ms2 else None,
         "isolation_upper": scan["upper"] if ms2 else None,
-        "scan_window_lower": None if ms2 else scan["lower"],
-        "scan_window_upper": None if ms2 else scan["upper"],
+        "scan_window_lower": None if window is None else window[0],
+        "scan_window_upper": None if window is None else window[1],
         "precursor_scan": scan["parent"] if ms2 else None,
         "precursor_mz": scan["target"] if ms2 else None,
         "precursor_charge": (scan["charge"] or None) if ms2 else None,
@@ -273,6 +286,10 @@ def import_dia(
                 key=lambda s: s["scan"],
             )
             peaks = _PeakWriter(bundle / PEAKS_DIR / part_name(0), rt_bin_width_s)
+            ranges = scan_ranges_from_method(
+                v for k, v in dia.metadata.items()
+                if str(k).startswith("thermo.instrument_method.") and str(k).endswith(".raw_text")
+            )  # fmt: skip
             rows: list[dict[str, Any]] = []
             previous: int | None = None
             try:
@@ -285,7 +302,7 @@ def import_dia(
                         )
                     previous = scan["scan"]
                     peaks.add(scan)
-                    rows.append(_scan_metadata_row(scan))
+                    rows.append(_scan_metadata_row(scan, ranges))
             except BaseException:
                 peaks.abort()
                 raise

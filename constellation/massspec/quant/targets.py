@@ -37,6 +37,7 @@ window.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -49,7 +50,10 @@ from constellation.massspec.quant.schemas import XIC_TARGET_TABLE
 __all__ = [
     "OBSERVED",
     "RT_SCALE_KEY",
+    "TARGET_RUN_KEY",
     "library_rt_scale",
+    "same_run",
+    "target_run",
     "targets_from_library",
     "targets_from_search",
     "targets_from_precursor_quant",
@@ -84,6 +88,51 @@ def _attach_modseq(precursors: pa.Table, peptides: pa.Table | None) -> pa.Table:
         pep, keys="peptide_id", join_type="left outer"
     )
     return joined.take(pc.sort_indices(joined.column(row))).drop_columns([row])
+
+
+#: Where an adapter records, in the target table's schema metadata, the run
+#: a target list was made from (a PSM table's raw file, an experiment's
+#: acquisition source file): a source of one run's identifications is for
+#: that run's bundle (:func:`target_run`).
+TARGET_RUN_KEY = "x.massspec.targets.run"
+
+
+def target_run(targets: pa.Table) -> str | None:
+    """The run ``targets`` were made from, as its source names it (a file
+    name or path), or None for a source of no run (a library, a bare
+    table). Read raw, so a run named by digits stays a string."""
+    value = (targets.schema.metadata or {}).get(TARGET_RUN_KEY.encode())
+    return value.decode("utf-8") if value else None
+
+
+def _with_run(targets: pa.Table, run: str | None) -> pa.Table:
+    if not run:
+        return targets
+    meta = dict(targets.schema.metadata or {})
+    meta[TARGET_RUN_KEY.encode()] = str(run).encode("utf-8")
+    return targets.replace_schema_metadata(meta)
+
+
+def same_run(a: str, b: str) -> bool:
+    """Whether two names of runs (file names or paths, as tools report them)
+    name one run: the same file name, or the same name once its extensions
+    are taken off (``run.raw``, ``run.dia``, ``run`` and ``/data/run.raw``
+    are one run; ``run_2.raw`` is another), for POSIX and Windows paths."""
+
+    def file_name(name: str) -> str:
+        return re.split(r"[\\/]", str(name))[-1]
+
+    def bare(name: str) -> str:
+        out = file_name(name)
+        while "." in out and out.rsplit(".", 1)[1].lower() in _RUN_EXTENSIONS:
+            out = out.rsplit(".", 1)[0]
+        return out
+
+    return file_name(a) == file_name(b) or bare(a) == bare(b)
+
+
+#: Extensions a run's files carry, taken off when two names are compared.
+_RUN_EXTENSIONS = frozenset({"raw", "dia", "mzml", "mzxml", "mgf", "d", "wiff", "wiff2", "elib", "dlib", "gz"})
 
 
 #: Where a library states the clock of its ``rt_predicted``.
@@ -144,17 +193,40 @@ def _one_run(table: pa.Table, what: str, acquisition_id: int | None, *, raw_file
     A run is its ``acquisition_id``, or (``raw_file``, for PSMs not yet
     linked to an acquisition) its raw file. A target list is for one run:
     rows of another run's scans, swept against this one, are matched at
-    the wrong times and pinned to the wrong scans."""
+    the wrong times and pinned to the wrong scans. A table linked in part
+    (ids beside nulls) is refused unless ``acquisition_id`` chooses the
+    run: its unlinked rows may be any run's, and until 2026-11-11 they
+    passed as the linked run's (review of 2026-11-10, C9). An unlinked
+    table of one raw file is that run's whatever ``acquisition_id`` says:
+    the id then names the acquisition it is swept as (which is how
+    ``chromatogram extract`` accepts one run's identifications against
+    another run's bundle; C7)."""
     ids = table.column("acquisition_id")
     linked = pc.any(pc.is_valid(ids)).as_py() if table.num_rows else False
     if acquisition_id is not None:
         if not linked:
+            files = set(table.column("raw_file").to_pylist()) if raw_file and table.num_rows else set()
+            if len(files) == 1:
+                # One run's rows, named by their raw file: the id says which
+                # acquisition they are swept as, and chooses nothing.
+                return table
             raise ValueError(f"the {what} are not linked to acquisitions, so none can be chosen by its id")
         out = table.filter(pc.fill_null(pc.equal(ids, acquisition_id), False))
         if out.num_rows == 0:
             held = sorted(set(pc.drop_null(ids).to_pylist()))
             raise ValueError(f"the {what} hold no rows of acquisition {acquisition_id} (they hold {held})")
         return out
+    unlinked = ids.null_count
+    if linked and unlinked:
+        listing = ""
+        if raw_file and "raw_file" in table.column_names:
+            files = sorted(set(pc.drop_null(table.column("raw_file").filter(pc.is_null(ids))).to_pylist()))
+            listing = f" (raw files {', '.join(files[:6])}{', ...' if len(files) > 6 else ''})" if files else ""
+        raise ValueError(
+            f"{unlinked} of the {table.num_rows} {what} are linked to no acquisition{listing}, beside rows that "
+            f"are: they may be another run's. Link every row, or pass acquisition_id (--acquisition-id) to take "
+            f"the rows of one acquisition"
+        )
     runs = sorted(set(pc.drop_null(ids).to_pylist())) if linked else (
         sorted(set(table.column("raw_file").to_pylist())) if raw_file else [])  # fmt: skip
     if len(runs) > 1:
@@ -177,10 +249,14 @@ def targets_from_search(search: object, *, acquisition_id: int | None = None) ->
     ``precursor_id`` are carried (a decoy has ``decoy_set`` 0, the search's
     own decoys), so a decoy stays a decoy and a library's abundances reach
     the targets; until 2026-11-10 they were dropped, and a search's decoys
-    came back as targets. The PSMs must be of one run, or ``acquisition_id``
-    says which (``psm_id`` is unique only within one). NOTE the PSM
-    ``peptide_id`` is engine-internal — NOT a library FK — so it is
-    deliberately dropped.
+    came back as targets. A row with no ``precursor_id`` (a reader that
+    derives none, a decoy of a reader before 2026-11-11) gets the
+    content-derived id of its ``modified_sequence`` at its charge, so a
+    decoy finds a library's decoy rows as its target finds its own (review
+    of 2026-11-10, C5). The PSMs must be of one run, or ``acquisition_id``
+    says which (``psm_id`` is unique only within one); the run's raw file is
+    recorded (:func:`target_run`). NOTE the PSM ``peptide_id`` is
+    engine-internal — NOT a library FK — so it is deliberately dropped.
     """
     psms: pa.Table = search.psms  # type: ignore[attr-defined]
     # The columns a run, a decoy and a precursor are read from, null where a
@@ -199,13 +275,41 @@ def targets_from_search(search: object, *, acquisition_id: int | None = None) ->
             "precursor_mz": psms.column("mz"),
             "rt_center": psms.column("retention_time_s"),
             "scan": psms.column("scan"),
-            "precursor_id": psms.column("precursor_id"),
+            "precursor_id": _derived_precursor_ids(psms),
             "is_decoy": decoy,
             "decoy_set": pc.if_else(pc.fill_null(decoy, False), pa.scalar(0, pa.int16()),
                                     pa.scalar(None, pa.int16())),  # fmt: skip
         }
     )
-    return cast_to_schema(out, XIC_TARGET_TABLE)
+    files = sorted(set(pc.drop_null(psms.column("raw_file")).to_pylist())) if psms.num_rows else []
+    return _with_run(cast_to_schema(out, XIC_TARGET_TABLE), files[0] if len(files) == 1 else None)
+
+
+def _derived_precursor_ids(psms: pa.Table) -> pa.Array:
+    """``psms.precursor_id``, a null filled with the content-derived id of
+    the row's ``modified_sequence`` at its charge where it has both (each
+    distinct pair keyed once); a sequence that has no key stays null."""
+    from constellation.core.sequence.proforma import ProFormaError
+    from constellation.massspec.library.ids import canonical_precursor_key, content_ids
+
+    ids = psms.column("precursor_id").combine_chunks() if psms.num_rows else pa.array([], pa.int64())
+    if ids.null_count == 0:
+        return ids
+    modseq = psms.column("modified_sequence").to_pylist()
+    charge = psms.column("charge").to_pylist()
+    values = ids.to_pylist()
+    keys: dict[tuple[str, int], int | None] = {}
+    for i, value in enumerate(values):
+        if value is not None or not modseq[i] or charge[i] is None or int(charge[i]) < 1:
+            continue
+        pair = (modseq[i], int(charge[i]))
+        if pair not in keys:
+            try:
+                keys[pair] = content_ids([canonical_precursor_key(pair[0], pair[1])])[0].as_py()
+            except (ValueError, KeyError, ProFormaError):  # an unparsable or adduct form has no key
+                keys[pair] = None
+        values[i] = keys[pair]
+    return pa.array(values, pa.int64())
 
 
 def targets_from_precursor_quant(quant: object, library: object, *, acquisition_id: int | None = None) -> pa.Table:
@@ -376,7 +480,20 @@ def targets_from_experiment(
             "peptide_id": joined.column("peptide_id"),
         }
     )
-    return cast_to_schema(out, XIC_TARGET_TABLE)
+    return _with_run(cast_to_schema(out, XIC_TARGET_TABLE), _source_file(root, acquisition_id))
+
+
+def _source_file(experiment_dir: Path, acquisition_id: int) -> str | None:
+    """The source file the experiment registered ``acquisition_id`` as, or
+    None when it records none."""
+    from constellation.massspec.acquisitions import load_acquisitions
+
+    try:
+        acquisitions = load_acquisitions(experiment_dir / "acquisitions")
+    except FileNotFoundError:
+        return None
+    rows = acquisitions.table.filter(pc.equal(acquisitions.table.column("acquisition_id"), acquisition_id))
+    return rows.column("source_file")[0].as_py() if rows.num_rows else None
 
 
 def load_targets(path: str | Path, *, library: object | None = None, acquisition_id: int | None = None) -> pa.Table:
@@ -390,7 +507,11 @@ def load_targets(path: str | Path, *, library: object | None = None, acquisition
     (``psms.parquet``), a ``PRECURSOR_QUANT`` bundle
     (``precursor_quant.parquet``, requires ``library=``), or a bare
     ``.parquet`` / ``.tsv`` target file. ``acquisition_id`` chooses the run
-    of a source that holds several (an experiment, PSMs, quantities).
+    of a source that holds several (an experiment, PSMs, quantities). A
+    source of one run's identifications (PSMs, an experiment) says which
+    run in the table's metadata (:func:`target_run`), so a caller can hold
+    it to the bundle swept (``chromatogram extract`` does; review of
+    2026-11-10, C7).
     """
     p = Path(path)
     if p.is_dir():

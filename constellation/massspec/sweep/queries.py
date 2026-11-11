@@ -25,6 +25,7 @@ number of the MS2 scan a match was made in.
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any
 from collections.abc import Sequence
@@ -412,6 +413,7 @@ def compile_queries(
     derive_precursor_mz: bool = True,
     fragment_abundance: FragmentAbundance = UNMODELLED,
     chunk_targets: int | None = COMPILE_CHUNK,
+    acquired_ranges: Any = None,
 ) -> QueryPlan:
     """Compile extraction targets into a sweep's queries.
 
@@ -425,12 +427,34 @@ def compile_queries(
     MS2 alone, a sequence with no charge); otherwise it simply has none of
     that kind.
 
+    ``acquired_ranges`` is the m/z range the MS2 scans acquire: a table of
+    ranges by isolation window
+    (:func:`~constellation.massspec.acquisition_structure.acquired_ranges`,
+    ``isolation_lower`` / ``isolation_upper`` / ``scan_window_lower`` /
+    ``scan_window_upper``), a mapping ``{(isolation_lower,
+    isolation_upper): (lower, upper)}``, or one ``(lower, upper)`` for every
+    MS2 scan. A fragment channel outside the range of every window its
+    query is matched in is not made, and the top N are chosen among the
+    rest (review of 2026-11-10, C6); a window that records no range
+    restricts nothing. None (the default) makes every channel.
+
     Vectorized over targets: each distinct sequence is parsed once and
     its envelope and ladder built once; nothing else runs per target in
     Python (1.3 ms a target at proteome scale until 2026-11-07). Targets
     are compiled ``chunk_targets`` at a time, in order of precursor id (so
     a fragment library sorted by precursor is read a few row groups per
     chunk), and the plan is the same, bit for bit, whatever the chunk.
+    The abundance source's ``report`` is the whole compile's, every
+    chunk's counts summed; until 2026-11-11 it held the last chunk's
+    (review of 2026-11-10, C11).
+
+    A compile in which decoys have no fragment of positive abundance far
+    more often than targets (at least 5 % of decoys, and 10 times the
+    targets' rate) is refused: the decoys have lost their library link (a
+    PSM decoy without its precursor id, a library without decoys), and
+    target-decoy competition on such queries passes nearly every target
+    (review of 2026-11-10, C5). Nothing is dropped; scattered precursors
+    without a fragment compile as before.
     """
     levels = tuple(sorted(set(int(x) for x in levels)))
     if not levels or min(levels) < 1:
@@ -442,24 +466,153 @@ def compile_queries(
     want_frag = any(level >= 2 for level in levels)
     if want_frag and 1 not in levels:
         _check_fragment_targets(t)
+    ranges = _ranges_table(acquired_ranges) if want_frag and acquired_ranges is not None else None
     key = t.column("precursor_id").fill_null(np.iinfo(np.int64).max).to_numpy().astype(np.int64)
+    report = getattr(fragment_abundance, "report", None)
+    if want_frag and isinstance(report, dict):
+        report.clear()  # this compile's, from its first chunk
     prepare = getattr(fragment_abundance, "prepare", None) if want_frag else None
     if prepare is not None:
         prepare(key[key != np.iinfo(np.int64).max])
     try:
         kwargs = dict(levels=levels, channels=channels, rt_window=rt_window, assigned_scans_only=assigned_scans_only,
-                      derive_precursor_mz=derive_precursor_mz, fragment_abundance=fragment_abundance)  # fmt: skip
+                      derive_precursor_mz=derive_precursor_mz, fragment_abundance=fragment_abundance,
+                      acquired_ranges=ranges)  # fmt: skip
         if chunk_targets is None or n <= chunk_targets:
-            return _compile(t, **kwargs)
-        if chunk_targets < 1:
-            raise ValueError(f"chunk_targets must be at least 1, got {chunk_targets}")
-        order = np.argsort(key, kind="stable")
-        plans = [_compile(t.take(pa.array(order[i:i + chunk_targets])), **kwargs) for i in range(0, n, chunk_targets)]
-        return _join_plans(t, order, plans)
+            plan = _compile(t, **kwargs)
+        else:
+            if chunk_targets < 1:
+                raise ValueError(f"chunk_targets must be at least 1, got {chunk_targets}")
+            order = np.argsort(key, kind="stable")
+            plans = [_compile(t.take(pa.array(order[i:i + chunk_targets])), **kwargs)
+                     for i in range(0, n, chunk_targets)]  # fmt: skip
+            plan = _join_plans(t, order, plans)
+            whole = plan.fragment_abundance.get("report")
+            current = getattr(fragment_abundance, "report", None)
+            if isinstance(whole, dict) and isinstance(current, dict):
+                current.clear()
+                current.update(copy.deepcopy(whole))
     finally:
         release = getattr(fragment_abundance, "release", None)
         if prepare is not None and release is not None:
             release()
+    _refuse_lopsided_decoys(plan.fragment_abundance.get("report"))
+    return plan
+
+
+#: A compile is refused when at least this share of its decoys has no
+#: fragment of positive abundance, and that is at least
+#: :data:`LOPSIDED_DECOY_RATIO` times the targets' share (C5).
+LOPSIDED_DECOY_SHARE = 0.05
+LOPSIDED_DECOY_RATIO = 10.0
+
+
+def _refuse_lopsided_decoys(report: dict | None) -> None:
+    """Raise when the decoys of a compile have lost their library link
+    (:func:`compile_queries`): a report's ``no_positive_fragment`` split by
+    target and decoy is lopsided."""
+    if not report:
+        return
+    decoys = int(report.get("fragment_queries_decoys") or 0)
+    targets = int(report.get("fragment_queries_targets") or 0)
+    if decoys == 0 or targets == 0:
+        return
+    decoy_rate = int(report.get("no_positive_fragment_decoys") or 0) / decoys
+    target_rate = int(report.get("no_positive_fragment_targets") or 0) / targets
+    if decoy_rate >= LOPSIDED_DECOY_SHARE and decoy_rate >= LOPSIDED_DECOY_RATIO * target_rate:
+        raise ValueError(
+            f"{decoy_rate:.1%} of decoys ({report.get('no_positive_fragment_decoys')} of {decoys}) have no fragment "
+            f"the library gives a positive abundance, against {target_rate:.1%} of targets: the decoys have lost "
+            f"their library link (decoy targets without their precursor ids, or a library that holds no decoys), "
+            f"and competition between targets and such decoys passes nearly every target"
+        )
+
+
+#: The columns of a table of acquired ranges by isolation window.
+_RANGE_COLUMNS = ("isolation_lower", "isolation_upper", "scan_window_lower", "scan_window_upper")
+
+
+def _ranges_table(ranges: Any) -> pa.Table:
+    """``compile_queries``'s ``acquired_ranges`` as one table of
+    :data:`_RANGE_COLUMNS` (null isolation bounds: every query's window;
+    a null range: unknown)."""
+    if isinstance(ranges, pa.Table):
+        missing = [c for c in _RANGE_COLUMNS if c not in ranges.column_names]
+        if missing:
+            raise ValueError(f"acquired_ranges needs the columns {', '.join(_RANGE_COLUMNS)}; missing {missing}")
+        return ranges.select(list(_RANGE_COLUMNS)).cast(pa.schema([(c, pa.float64()) for c in _RANGE_COLUMNS]))
+    if isinstance(ranges, dict):
+        rows = [(float(w[0]), float(w[1]), r[0], r[1]) for w, r in ranges.items()]
+    else:
+        lo, hi = ranges
+        rows = [(None, None, lo, hi)]
+    cols = list(zip(*rows)) if rows else [[], [], [], []]
+    return pa.table({c: pa.array([None if v is None else float(v) for v in col], pa.float64())
+                     for c, col in zip(_RANGE_COLUMNS, cols, strict=True)})  # fmt: skip
+
+
+def _query_ranges(ranges: pa.Table, precursor_mz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Each query's acquired m/z range at MS2: the envelope of the ranges of
+    the windows it is matched in (a window covering its precursor m/z, as
+    the sweep decides it, inclusive at both ends; every window for a query
+    with no precursor m/z, and every window without bounds for any query).
+    ``(-inf, inf)`` where one of them records no range, or none holds it."""
+    def col(name: str) -> np.ndarray:
+        return ranges.column(name).fill_null(np.nan).to_numpy(zero_copy_only=False).astype(np.float64)
+
+    ilo, ihi, slo, shi = (col(c) for c in _RANGE_COLUMNS)
+    n = precursor_mz.size
+    lo = np.full(n, np.inf)
+    hi = np.full(n, -np.inf)
+    unknown = np.zeros(n, dtype=bool)
+    seen = np.zeros(n, dtype=bool)
+    unknown_w = np.isnan(slo) | np.isnan(shi)
+    # An unknown range is flagged, not compared: no NaN enters a minimum.
+    slo, shi = np.where(unknown_w, np.inf, slo), np.where(unknown_w, -np.inf, shi)
+    free = np.isnan(ilo) | np.isnan(ihi)
+    gated = np.flatnonzero(~np.isnan(precursor_mz))
+    everyone = np.flatnonzero(np.isnan(precursor_mz))
+
+    def apply(windows: np.ndarray, queries: np.ndarray) -> None:
+        if windows.size == 0 or queries.size == 0:
+            return
+        np.minimum.at(lo, queries, slo[windows])
+        np.maximum.at(hi, queries, shi[windows])
+        np.logical_or.at(unknown, queries, unknown_w[windows])
+        seen[queries] = True
+
+    # A window without bounds holds every query, and a query without a
+    # precursor m/z is in every window: the envelope of them all.
+    for w in np.flatnonzero(free):
+        apply(np.full(n, w, np.int64), np.arange(n, dtype=np.int64))
+    if everyone.size and slo.size:
+        np.minimum.at(lo, everyone, np.min(slo))
+        np.maximum.at(hi, everyone, np.max(shi))
+        unknown[everyone] |= bool(unknown_w.any())
+        seen[everyone] = True
+    if gated.size:
+        by = np.argsort(precursor_mz[gated], kind="stable")
+        sorted_q, sorted_mz = gated[by], precursor_mz[gated][by]
+        bounded = np.flatnonzero(~free)
+        a = np.searchsorted(sorted_mz, ilo[bounded], side="left")
+        b = np.searchsorted(sorted_mz, ihi[bounded], side="right")
+        count = np.maximum(b - a, 0)
+        # In blocks of windows, so a DDA run's many narrow windows never
+        # make one huge array of pairs.
+        limit = 1 << 22
+        start = 0
+        cum = np.cumsum(count)
+        while start < bounded.size:
+            stop = int(np.searchsorted(cum, (cum[start - 1] if start else 0) + limit, side="right"))
+            stop = max(stop, start + 1)
+            block = slice(start, stop)
+            c = count[block]
+            windows = np.repeat(bounded[block], c)
+            offsets = np.repeat(a[block] - np.concatenate([[0], np.cumsum(c)[:-1]]), c)
+            apply(windows, sorted_q[np.arange(int(c.sum()), dtype=np.int64) + offsets])
+            start = stop
+    unrestricted = unknown | ~seen
+    return np.where(unrestricted, -np.inf, lo), np.where(unrestricted, np.inf, hi)
 
 
 def _check_fragment_targets(t: pa.Table) -> None:
@@ -545,6 +698,7 @@ def _compile(
     assigned_scans_only: bool,
     derive_precursor_mz: bool,
     fragment_abundance: FragmentAbundance,
+    acquired_ranges: pa.Table | None,
 ) -> QueryPlan:
     """:func:`compile_queries` on one chunk of cast targets."""
     n = t.num_rows
@@ -618,9 +772,11 @@ def _compile(
         # whole compile was refused as "the library and the query describe
         # different molecules".
         key = np.where(frag, t.column("precursor_id").fill_null(-1).to_numpy().astype(np.int64), -1)
+        decoy = np.asarray(t.column("is_decoy").fill_null(False).to_numpy(zero_copy_only=False), dtype=bool)
         fragments = fragment_channels(
             parsed, np.where(frag, peptide, -1), precursor_charge.astype(np.int64), channels, fragment_abundance,
-            key=key, target_ids=target_ids,
+            key=key, target_ids=target_ids, precursor_mz=pmz, decoy=decoy,
+            acquired=None if acquired_ranges is None else _query_ranges(acquired_ranges, pmz),
         )  # fmt: skip
         report = getattr(fragment_abundance, "report", None)
         if isinstance(report, dict):  # the abundance source's report of this compile

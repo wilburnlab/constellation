@@ -336,8 +336,10 @@ class PeakShape(Parametric, abc.ABC):
         t_hi: float | torch.Tensor | None = None,
         n_points: int = 500,
     ) -> torch.Tensor:
-        """Integrated area under the peak over [t_lo, t_hi].
-        Defaults to the peak's `.bounds()` when limits are None."""
+        """Integrated area under the peak over [t_lo, t_hi]. A missing
+        limit is ``∓inf``, so ``integrate()`` is the whole area. (Until
+        2026-11-11 a missing limit was the peak's `.bounds()`, which cut
+        an EMG's tail off.)"""
 
     @abc.abstractmethod
     def bounds(self, n_sigma: float = 4.0) -> tuple[torch.Tensor, torch.Tensor]:

@@ -103,3 +103,72 @@ def test_a_labelled_envelope_is_the_natural_atoms_envelope_moved(mode):
     assert float(ab[1]) < float(ab_light[1])  # fewer atoms vary
     comp = peptide_composition(labelled)
     assert comp.atoms["C"] == 23  # the composition itself is unchanged
+
+
+# PEPC[CAM]K: 24 C and 6 N in the chain, carbamidomethyl adds C2 N; SILAC's
+# heavy atoms (UNIMOD:259 13C6 15N2, 188 13C6) are lysine's own, TMT6plex's
+# (UNIMOD:737, 13C4 15N, twice) atoms it adds.
+@pytest.mark.parametrize(
+    "text, natural",
+    [
+        ("PEPC[UNIMOD:4]K", {"C": 26, "N": 7}),  # nothing labelled
+        ("<13C>PEPC[UNIMOD:4]K", {"C": 2, "N": 7}),  # the global label alone: the chain's C
+        ("PEPC[UNIMOD:4]K[UNIMOD:259]", {"C": 20, "N": 5}),  # SILAC alone
+        ("<13C>[UNIMOD:737]-PEPC[UNIMOD:4]K[UNIMOD:737]", {"C": 18, "N": 9}),  # TMT's heavy atoms are not the chain's
+    ],
+)
+def test_an_atom_a_label_and_a_heavy_modification_both_fix_counts_once(text, natural):
+    """Codex review of the scorer: a global label, SILAC and carbamidomethyl
+    together took SILAC's heavy atoms off twice (once as the label's chain,
+    once as the modification's), and the clamp at zero took the deficit from
+    carbamidomethyl's natural carbons, so the envelope varied over none. A
+    substitution's heavy atoms are its residue's own: of a labelled element,
+    the label covers them already."""
+    import numpy as np
+
+    from constellation.core.chem.composition import Composition
+    from constellation.core.chem.isotopes import isotope_envelope
+    from constellation.core.sequence.protein import natural_abundance_compositions
+    from constellation.massspec.peptide.envelope import neutral_envelopes
+
+    pf = parse_proforma(text)
+    batched = natural_abundance_compositions([parse_proforma("LVNELTEFAK"), pf])[1]
+    single = natural_abundance_compositions([pf])[0]
+    assert torch.equal(batched, single)
+    for symbol, n in natural.items():
+        assert int(single[ELEMENTS.index(symbol)]) == n, symbol
+    comp = peptide_composition(pf).counts  # what is fixed is left out; the composition is not changed
+    assert torch.equal(single[ELEMENTS.index("H")], comp[ELEMENTS.index("H")])
+    # The envelope, one and batched, varies over those atoms and sits at the peptide's mass.
+    masses, shares = neutral_envelope(pf, n_peaks=4, normalize="full")
+    _, want = isotope_envelope(Composition(single), n_peaks=4, normalize="full")
+    np.testing.assert_allclose(shares.numpy(), want.numpy(), rtol=1e-12)
+    assert float(masses[0]) == pytest.approx(peptide_mass(pf), abs=1e-9)
+    many_masses, many_shares = neutral_envelopes([parse_proforma("LVNELTEFAK"), pf], n_peaks=4)
+    assert np.array_equal(many_masses[1], masses.numpy())
+    np.testing.assert_allclose(many_shares[1], shares.numpy(), atol=1e-6)
+
+
+@pytest.mark.parametrize("modseq", ["<13C>PEPK[UNIMOD:259]", "<15N>PEPK[UNIMOD:259]", "<13C>PEPK[UNIMOD:864]",
+                                    "<13C>PEPK[Label:13C(6)15N(2)]", "<13C><[UNIMOD:259]@K>PEPC[UNIMOD:4]K",
+                                    "<15N>PEPC[UNIMOD:4]K[UNIMOD:188]"])
+def test_a_global_label_with_a_heavy_residue_label_is_refused(modseq) -> None:
+    """``<13C>`` with 13C6 lysine shifted the lysine's carbons twice, and a
+    combined label (SILAC + GlyGly) cannot say which heavy atoms are the
+    residue's: refused, not computed (2026-11-11)."""
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.core.sequence.protein import peptide_composition, peptide_mass, peptide_masses
+
+    pf = parse_proforma(modseq)
+    for fn in (peptide_mass, peptide_composition, lambda p: peptide_masses([p])):
+        with pytest.raises(ValueError, match="global isotope label"):
+            fn(pf)
+
+
+def test_a_global_label_with_tmt_or_silac_alone_still_computes() -> None:
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.core.sequence.protein import peptide_mass
+
+    assert peptide_mass(parse_proforma("<13C>PEPK[UNIMOD:737]")) > 0  # TMT's heavy atoms are its own
+    assert peptide_mass(parse_proforma("PEPK[UNIMOD:259]")) > 0
+    assert peptide_mass(parse_proforma("<13C>PEPK")) > 0

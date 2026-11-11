@@ -62,6 +62,8 @@ from .peaks import (
     EMGPeak,
     GaussianPeak,
     HyperEMGPeak,
+    emg_cdf,
+    emg_left_cdf,
     emg_left_log_pdf,
     emg_left_pdf,
     emg_log_pdf,
@@ -142,6 +144,8 @@ __all__ = [
     "emg_log_pdf",
     "emg_left_pdf",
     "emg_left_log_pdf",
+    "emg_cdf",
+    "emg_left_cdf",
     # Calibration
     "Sigmoidal",
     "Hill",

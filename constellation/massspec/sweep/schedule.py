@@ -162,8 +162,8 @@ def pair_eligible(
 
 @dataclass(frozen=True)
 class WindowIndex:
-    """A level's scans that can be matched (with points and a retention
-    time), by isolation window: what eligibility is decided on, built once
+    """A level's scans that can be slots (with points, or read and empty,
+    and a retention time), by isolation window: what eligibility is decided on, built once
     per ledger and level instead of regrouped at every call.
 
     ``rows`` are ledger rows sorted by (window, retention time, scan), the
@@ -187,10 +187,11 @@ class WindowIndex:
 
 def window_index(
     scan: np.ndarray, level_of: np.ndarray, rt: np.ndarray, lower: np.ndarray, upper: np.ndarray,
-    n_points: np.ndarray, level: int, *, gate: bool,
+    present: np.ndarray, level: int, *, gate: bool,
 ) -> WindowIndex:
-    """The :class:`WindowIndex` of ``level``'s scans (ledger columns)."""
-    rows = np.flatnonzero((level_of == level) & (n_points > 0) & ~np.isnan(rt)).astype(np.int64)
+    """The :class:`WindowIndex` of ``level``'s scans (ledger columns) that
+    can be slots (``present``, ``Ledger.present``)."""
+    rows = np.flatnonzero((level_of == level) & present & ~np.isnan(rt)).astype(np.int64)
     if gate:
         unbounded_row = np.isnan(lower[rows]) | np.isnan(upper[rows])
         key = np.stack([np.where(unbounded_row, -np.inf, lower[rows]),

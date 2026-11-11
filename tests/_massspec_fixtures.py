@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -243,6 +243,9 @@ class PlantedRun:
     duplicate: tuple[int, float]
     #: (scan, m/z, theoretical m/z) of a peak placed exactly 20 ppm from an ion.
     edge: tuple[int, float, float]
+    #: What was planted, per peptide (in ``targets`` order): ``frag_mz`` and
+    #: ``frag_ab``, its fragments and their relative abundances, and the rest.
+    planted: list[dict[str, Any]] = field(default_factory=list)
 
 
 def drop_unacquired(trace: pa.Table, bundle: Path) -> pa.Table:
@@ -414,4 +417,5 @@ def planted_run(
         targets=targets,
         duplicate=(host["scan"], dup),
         edge=(host["scan"], edge_mz, theo),
+        planted=planted,
     )

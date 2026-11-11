@@ -143,6 +143,11 @@ class MzAxis:
             return np.zeros_like(np.asarray(mz, dtype=np.float64))
         return np.interp(np.asarray(mz, dtype=np.float64), xs, ys)
 
+    def is_determined(self, level: int) -> bool:
+        """Whether the level's curve can be applied: its branch was not
+        left undetermined by the measurement (:meth:`shift`)."""
+        return int(level) not in {int(v) for v in self.parameters.get("ambiguous_levels", ())}
+
     def check_level(self, level: int) -> None:
         """Refuse a level whose branch is undetermined (see :meth:`shift`)."""
         if int(level) in {int(v) for v in self.parameters.get("ambiguous_levels", ())}:

@@ -246,7 +246,13 @@ class Library:
         protein (until 2026-11-10 a peptide-level decoy had no protein and
         followed its target through ``decoy_of``, so it was lost with it);
         a decoy with no protein edge at all (a library made otherwise) still
-        follows the target it was made from."""
+        follows the target it was made from. A search space made by older
+        code, whose decoys may have no proteins, is warned about
+        (``search_space.check_search_space_layout``; since 2026-11-11, review
+        of 2026-11-10, B8: it was subset without a word, losing decoys)."""
+        from constellation.massspec.library.search_space import check_search_space_layout
+
+        check_search_space_layout(self)
         named = pa.array(list(protein_ids), type=pa.int64())
         proteins = self.proteins
         chosen = proteins.filter(pc.is_in(proteins.column("protein_id"), value_set=named))

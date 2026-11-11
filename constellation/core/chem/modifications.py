@@ -122,6 +122,15 @@ class Modification:
     #: ``specificities`` so that what the readers disambiguate with is
     #: unchanged; :attr:`all_specificities` has both.
     hidden_specificities: tuple[Specificity, ...] = ()
+    #: The heavy isotopes the modification's formula names, by isotope
+    #: (``{"13C": 6, "15N": 2}`` for SILAC ¹³C₆¹⁵N₂ lysine; TMT's ``13C(4)
+    #: 15N``), each also counted under its light element in
+    #: ``delta_composition``. They are fixed isotopes, not natural ones, so
+    #: an isotope envelope leaves them out of the atoms it distributes
+    #: (``massspec.peptide.envelope``). A negative count is a heavy atom the
+    #: modification removes (UNIMOD:1419). Empty for a modification with
+    #: none (added 2026-11-11; review of 2026-11-10, C8).
+    heavy_atoms: Mapping[str, int] = field(default_factory=dict, hash=False)
 
     @property
     def all_specificities(self) -> tuple[Specificity, ...]:
@@ -381,11 +390,13 @@ class ModVocab:
         mass_override: float | None = None,
         aliases: tuple[str, ...] = (),
         description: str = "",
+        heavy_atoms: Mapping[str, int] | None = None,
     ) -> Modification:
         """Add a non-UNIMOD modification. Convention: `id` should start
         with `"CUSTOM:"` to make non-UNIMOD provenance obvious in logs.
         Typical use is in notebooks or per-project init scripts —
-        constellation never auto-loads custom mods at import time."""
+        constellation never auto-loads custom mods at import time.
+        ``heavy_atoms`` names its heavy isotopes (:attr:`Modification.heavy_atoms`)."""
         mod = Modification(
             id=id,
             name=name,
@@ -393,6 +404,7 @@ class ModVocab:
             aliases=aliases,
             mass_override=mass_override,
             description=description,
+            heavy_atoms=dict(heavy_atoms or {}),
         )
         self.add(mod)
         return mod
@@ -422,6 +434,8 @@ class ModVocab:
                 specificities=tuple(s for s in specs if not s.hidden),
                 description=rec.get("description", ""),
                 hidden_specificities=tuple(s for s in specs if s.hidden),
+                # Absent before schema 3 (2026-11-11).
+                heavy_atoms={str(k): int(v) for k, v in (rec.get("heavy_atoms") or {}).items()},
             )
             out.add(mod)
         return out
@@ -429,7 +443,7 @@ class ModVocab:
     def save(self, path: str | Path) -> None:
         path = Path(path)
         doc = {
-            "schema_version": "2",
+            "schema_version": "3",
             "source": {"generator": "ModVocab.save"},
             "modifications": [
                 {
@@ -437,6 +451,7 @@ class ModVocab:
                     "name": m.name,
                     "delta_composition": m.delta_composition.atoms,
                     "mass_override": m.mass_override,
+                    "heavy_atoms": dict(m.heavy_atoms),
                     "aliases": list(m.aliases),
                     "specificities": [_specificity_doc(s) for s in m.all_specificities],
                     "description": m.description,

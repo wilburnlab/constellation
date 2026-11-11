@@ -130,21 +130,25 @@ class Search:
 # ──────────────────────────────────────────────────────────────────────
 
 
+#: ``PRECURSOR_SCORE_TABLE``'s primary key. ``decoy_set``, ``pass`` and
+#: ``role`` joined it on 2026-11-11 (review of 2026-11-10, S7): a
+#: calibrant pass and the search of one engine score one precursor twice.
+PRECURSOR_SCORE_KEY = ("modified_sequence", "charge", "acquisition_id", "engine", "is_decoy", "decoy_set", "pass",
+                       "role")  # fmt: skip
+
+
 def _check_no_precursor_score_duplicates(table: pa.Table) -> None:
-    """PK uniqueness on ``(modified_sequence, charge, acquisition_id,
-    engine, is_decoy)`` for ``precursor_scores``."""
+    """PK uniqueness on :data:`PRECURSOR_SCORE_KEY` for ``precursor_scores``
+    (a null is one value of its column here, as in any group)."""
     if table.num_rows == 0:
         return
-    keys = table.select(
-        ["modified_sequence", "charge", "acquisition_id", "engine", "is_decoy"]
-    )
+    keys = table.select([c for c in PRECURSOR_SCORE_KEY if c in table.column_names])
     counts = keys.group_by(keys.column_names, use_threads=False).aggregate([([], "count_all")])
     repeated = counts.filter(pa.compute.greater(counts.column("count_all"), 1))
     if repeated.num_rows:
         sample = repeated.slice(0, 3).to_pylist()
         raise ValueError(
-            f"precursor_scores has {repeated.num_rows} repeated "
-            f"(modified_sequence, charge, acquisition_id, engine, is_decoy) keys, e.g. {sample}"
+            f"precursor_scores has {repeated.num_rows} repeated ({', '.join(keys.column_names)}) keys, e.g. {sample}"
         )
 
 

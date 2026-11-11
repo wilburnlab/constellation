@@ -34,8 +34,12 @@ The best match of each precursor (``psm_type`` ``"best"``) carries its
 score, q-value and posterior error probability; the precursor's other
 matches (``"other"``: the same precursor matched in other scans) carry
 none, since ScribeTwo reports none for them. ``precursor_id`` is the
-content-derived id of the target's precursor, the one the precursor
-tables of a content-keyed result use.
+content-derived id of the matched precursor, the one the precursor
+tables of a content-keyed result use: a target's, and a decoy's of the
+decoy's own sequence (the id a library holding the decoys keys it by).
+Until 2026-11-11 a decoy had none, so it reached the queries without a
+library's abundances, and under top-N without fragment channels, while
+its targets had both (review of 2026-11-10, C5).
 """
 
 from __future__ import annotations
@@ -151,11 +155,10 @@ def read_scribe2_psms(
     modified = [proforma_of[m] for m in spelled]
     plain = [forms[m].sequence for m in spelled]
 
-    # Content-derived precursor ids, for targets.
-    precursor_id = np.zeros(n, dtype=np.int64)
-    targets = np.flatnonzero(~is_decoy)
-    keys = [canonical_precursor_key(modified[i], int(charges[i]), vocab=vocab) for i in targets]
-    precursor_id[targets] = content_ids(keys).to_numpy(zero_copy_only=False)
+    # Content-derived precursor ids, for targets and decoys alike (a decoy's
+    # of its own sequence, which ScribeTwo spells after its prefix).
+    keys = [canonical_precursor_key(modified[i], int(charges[i]), vocab=vocab) for i in range(n)]
+    precursor_id = content_ids(keys).to_numpy(zero_copy_only=False).astype(np.int64)
 
     by_source = {s: acquisitions.id_for_source(s) for s in set(sources)}
     best = [scored.get(psm) for psm in ids]
@@ -170,7 +173,7 @@ def read_scribe2_psms(
             "scan": features.column("ScanNr").cast(pa.int32()),
             "sequence": pa.array(plain, type=pa.string()),
             "modified_sequence": pa.array(modified, type=pa.string()),
-            "precursor_id": pa.array(precursor_id, type=pa.int64(), mask=is_decoy),
+            "precursor_id": pa.array(precursor_id, type=pa.int64()),
             "proteins": proteins.cast(pa.string()),
             "charge": pa.array(charges, type=pa.int8()),
             "mz": pa.array(observed, type=pa.float64()),

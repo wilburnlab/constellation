@@ -278,7 +278,7 @@ class TestSchemaRegistration:
         assert {"analyzer", "activation_type"} <= names
         assert SCAN_METADATA_TABLE.field("analyzer").type == pa.string()
         assert SCAN_METADATA_TABLE.field("activation_type").type == pa.string()
-        assert SCAN_METADATA_TABLE.metadata[b"schema_version"] == b"4"
+        assert SCAN_METADATA_TABLE.metadata[b"schema_version"] == b"5"
 
     def test_acquisition_metadata_table_has_tune_data_map(self):
         f = ACQUISITION_METADATA_TABLE.field("tune_data")
@@ -841,3 +841,32 @@ def test_find_dotnet_root_uses_interpreter_prefix_before_conda_prefix(
     monkeypatch.setattr(_netruntime.sys, "prefix", str(env_prefix))
 
     assert _netruntime._find_dotnet_root() == env_prefix / "lib" / "dotnet"
+
+
+class TestReviewSecondPass:
+    """Review 2026-11-10: A7 (several ranges), A11 (MS3 after EThcD), S5 (floor)."""
+
+    def test_an_ms3_after_supplemental_activation_records_its_own(self, fake_centroider):
+        """The MS3 scan took its MS2 reaction's supplemental activation (hcd
+        15), counting activations instead of isolations (A11)."""
+        ms3 = "ITMS + c NSI r d Full ms3 600.0000@etd20.00@hcd15.00 300.0000@hcd35.00 [100.0000-1000.0000]"
+        raw = FakeRaw({
+            1: scan(MS1, rt_min=0.1, mz=[400.0]),
+            2: scan(ms3, rt_min=0.2, mz=[126.1, 127.1],
+                    event=FakeEvent(mass=(600.0, 300.0), width=(0.7, 2.0), offset=(0.0, 0.0)),
+                    trailer=[("Master Scan Number:", "1")]),
+        })
+        row = _read(raw)[0].to_pylist()[1]
+        assert row["level"] == 3
+        assert row["activation_type"] == "hcd" and row["collision_energy"] == 35.0
+
+    def test_a_scan_of_several_ranges_keeps_each(self, fake_centroider):
+        """A filter of several ranges parsed to none (A7)."""
+        multi = "FTMS + p NSI Full ms [200.0000-700.0000, 800.0000-1500.0000]"
+        raw = FakeRaw({1: scan(multi, rt_min=0.1, mz=[400.0, 900.0], intensity=[5.0, 3.0])})
+        row = _read(raw)[0].to_pylist()[0]
+        assert (row["scan_window_lower"], row["scan_window_upper"]) == (200.0, 1500.0)
+        assert row["scan_windows"] == [{"lower": 200.0, "upper": 700.0}, {"lower": 800.0, "upper": 1500.0}]
+        assert row["intensity_floor"] == 3.0  # the lowest stored intensity (S5)
+        one = _read(FakeRaw({1: scan(MS1, rt_min=0.1, mz=[400.0])}))[0].to_pylist()[0]
+        assert one["scan_windows"] is None

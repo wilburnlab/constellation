@@ -476,12 +476,18 @@ class PlacedMod:
 
     ``slot`` is a 0-based residue index, or ``"N-term"`` / ``"C-term"``;
     ``site`` is the key of the ``fixed`` / ``variable`` mapping that placed
-    it (a residue letter, ``N-term``, ``Protein N-term``, ...)."""
+    it (a residue letter, ``N-term``, ``Protein N-term``, ...), the first
+    in the mapping's order; ``sites`` is every key through which it reaches
+    its slot, sorted (``N-term`` and ``Protein N-term`` both reach a
+    protein's N-terminus), so that provenance can name each rule behind a
+    placement whatever order the rules came in (since 2026-11-11; review
+    of 2026-11-10, B11)."""
 
     slot: int | str
     key: str
     origin: ModOrigin
     site: str
+    sites: tuple[str, ...] = ()
 
 
 def _normalize_mod_spec(
@@ -601,7 +607,9 @@ class _ModPlan:
     whether a cyclization at the N-terminus excludes a variable
     modification of residue 0 (``guard``), and whether the N-terminus left
     as it is holds a fixed cyclization (``fixed_cyclized``: residue 0 is
-    then free only in forms where a variable modification replaces it)."""
+    then free only in forms where a variable modification replaces it).
+    ``reached`` gives, for each (slot, mod key) placed, every site of the
+    spec through which it reaches the slot, sorted."""
 
     fixed: dict[_Slot, tuple[str, str]]
     candidates: dict[_Slot, list[tuple[str, str]]]
@@ -611,6 +619,7 @@ class _ModPlan:
     groups: dict[_Slot, list[tuple[int, ...]]]
     guard: bool
     fixed_cyclized: bool = False
+    reached: dict[tuple[_Slot, str], tuple[str, ...]] = field(default_factory=dict)
 
 
 def _plan_modforms(
@@ -679,6 +688,11 @@ def _plan_modforms(
     # modifications landing on one slot (N-term and Protein N-term rules at
     # a protein's N-terminus) is a contradiction, not a precedence.
     fixed_slots: dict[_Slot, tuple[str, str]] = {}
+    # Every site through which each placement reaches its slot, fixed and
+    # variable: provenance names each rule behind it (since 2026-11-11; the
+    # first site in the spec's order alone made the provenance depend on the
+    # order of the rules, review of 2026-11-10, B11).
+    reached: dict[tuple[_Slot, str], list[str]] = {}
     for site, keys in fixed_spec.items():
         for key in keys:
             for pos in _slots_for_site(site, peptide, context):
@@ -693,6 +707,9 @@ def _plan_modforms(
                     )
                 if have is None:
                     fixed_slots[slot] = (key, site)
+                sites_here = reached.setdefault((slot, key), [])
+                if site not in sites_here:
+                    sites_here.append(site)
     # A fixed cyclization takes residue 0's side chain and what was on it,
     # in the forms that keep it; residue 0's fixed modification stays in the
     # plan, so a form whose N-terminus a variable modification takes instead
@@ -713,7 +730,6 @@ def _plan_modforms(
     # Protein N-term name one slot at a protein's N-terminus, and a placement
     # counts toward the limit of each rule that reaches it (until 2026-11-10,
     # only the first rule's, so the forms depended on the rules' order).
-    reached: dict[tuple[_Slot, str], list[str]] = {}
     for site, keys in var_spec.items():
         for pos in _slots_for_site(site, peptide, context):
             for key in keys:
@@ -752,6 +768,7 @@ def _plan_modforms(
         groups=groups,
         guard=guard,
         fixed_cyclized=fixed_cyclized,
+        reached={k: tuple(sorted(v)) for k, v in reached.items()},
     )
 
 
@@ -950,7 +967,7 @@ def enumerate_modforms(
 
     With ``return_origin=True`` each form comes with the
     :class:`PlacedMod` of every modification it carries, fixed and
-    variable, in slot order.
+    variable, in slot order, each with every site that reaches it.
 
     The work is proportional to the forms returned: a limit prunes a
     choice before it is extended. Raises ``ValueError`` if the
@@ -984,7 +1001,7 @@ def enumerate_modforms(
     def entry(slot: _Slot, key: str, site: str, origin: ModOrigin) -> tuple:
         # (position, layer, tag, its PlacedMod, where it is listed, key)
         layer, pos = slot
-        placed = PlacedMod(pos, key, origin, site) if return_origin else None
+        placed = PlacedMod(pos, key, origin, site, plan.reached.get((slot, key), (site,))) if return_origin else None
         return (pos, layer, _tagged(key), placed, (_place_order(pos, length), layer), key)
 
     entries = [[entry(slot, key, site, "variable") for key, site in plan.candidates[slot]] for slot in plan.ordered]
@@ -1123,6 +1140,16 @@ def _walk_modrefs(p: Peptidoform) -> Iterator[ModRef]:
     one chemical entity across all anchor positions, so the contribution
     counts once. Bare label references (``mod=None``) are skipped.
 
+    An ambiguity group (any label but ``XL…`` and ``BRANCH``) whose
+    modification is declared on more than one of its members raises
+    ``ValueError``: whether it is one modification over several positions
+    or several is not said, and since group labels are read in any case
+    (2026-11-10) ``#G1`` and ``#g1`` are one group. Until 2026-11-11 the
+    second declaration was dropped from the mass
+    (``PEPT[Phospho#g1]S[#g1]IDEK[Phospho#G1]``: 1094.45, one phospho;
+    review of 2026-11-10, B12). A cross-link or branch may carry its
+    modification on both ends and counts it once, as before.
+
     Excludes ``fixed_mods`` because their location-rule expansion depends
     on per-residue overrides (handled separately at the call site).
     """
@@ -1133,6 +1160,13 @@ def _walk_modrefs(p: Peptidoform) -> Iterator[ModRef]:
             return
         if tm.group_id is not None:
             if tm.group_id in seen:
+                label = tm.group_id.upper()
+                if not (label.startswith("XL") or label == "BRANCH"):
+                    raise ValueError(
+                        f"ambiguity group #{tm.group_id} declares its modification on more than one "
+                        "member, so whether it holds one modification or several is not said; write "
+                        "the modification on one member and the bare label on the others"
+                    )
                 return
             seen.add(tm.group_id)
         yield tm.mod
@@ -1218,13 +1252,43 @@ def _residue_matrix() -> tuple[np.ndarray, np.ndarray]:
     return _RESIDUE_COMPOSITIONS, _H2O_COUNTS
 
 
-def _check_peptidoform(peptidoform: Peptidoform, what: str) -> None:
+def _check_peptidoform(peptidoform: Peptidoform, what: str, vocab: ModVocab = UNIMOD) -> None:
     if isinstance(peptidoform, MultiPeptidoform):
         plural = "compositions" if what == "composition" else "masses"
         raise NotImplementedError(
             f"joint multi-chain {what} is not yet supported; iterate "
             f"peptidoform.chains for per-chain {plural}"
         )
+    if getattr(peptidoform, "global_isotopes", ()):
+        _refuse_label_with_heavy_modification(peptidoform, vocab)
+
+
+def _refuse_label_with_heavy_modification(peptidoform: Peptidoform, vocab: ModVocab) -> None:
+    """A global isotope label with a modification that makes the residue's
+    own atoms heavy is refused: an isotopic substitution (SILAC,
+    ``Modification.is_isotopic_substitution``) or a combination of one with
+    another modification (UNIMOD's ``Label:...+GG``, ``Label:...+Acetyl``,
+    ...). Which atoms the label covers and which the modification makes
+    heavy is not settled there: ``<13C>`` with 13C6 lysine shifted the
+    lysine's carbons twice in the mass, and a combined modification's
+    formula does not say which of its heavy atoms are the residue's (review
+    of 2026-11-11). Isotope labelling with SILAC is not in use yet; the
+    search space refuses the combination too. A modification whose heavy
+    atoms are its own added atoms (TMT) is fine: a label never covers them."""
+    fixed = (modref for modref, _ in getattr(peptidoform, "fixed_mods", ()))
+    for modref in (*_walk_modrefs(peptidoform), *fixed):
+        if modref.cv == "INFO" or modref.formula is not None or (modref.accession is None and modref.name is None):
+            continue
+        try:
+            mod = vocab.get(_modref_lookup_key(modref))
+        except KeyError:
+            continue  # the walk refuses an unknown key itself
+        if mod.heavy_atoms and (mod.is_isotopic_substitution or any(a.startswith("Label:") for a in mod.aliases)):
+            raise ValueError(
+                f"a global isotope label ({', '.join(peptidoform.global_isotopes)}) with {mod.id} "
+                f"({mod.aliases[0] if mod.aliases else mod.name}), which makes the residue's own atoms heavy, "
+                "is not supported: both would claim the same atoms"
+            )
 
 
 def _batched(
@@ -1234,16 +1298,23 @@ def _batched(
     monoisotopic: bool,
     for_mass: bool,
     labelled: bool = False,
+    heavy: np.ndarray | None = None,
+    substituted: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[float], np.ndarray | None]:
     """(N, E) int64 compositions; per peptidoform, the mass the composition
     does not carry (``mass_override`` corrections and bare mass deltas),
     accumulated in the scalar code's order; and with ``labelled``, the
-    (N, E) atoms a global isotope label covers (:func:`labelled_compositions`)."""
+    (N, E) atoms a global isotope label covers (:func:`labelled_compositions`).
+    ``heavy``, an (N, E) int64 array of zeros, is filled in the same walk
+    with the heavy atoms modifications name (:func:`heavy_atom_compositions`),
+    and ``substituted`` (with ``heavy``) with those of them that are the
+    residue's own atoms: the heavy atoms of isotopic substitutions
+    (``Modification.is_isotopic_substitution``: SILAC), part of the chain."""
     what = "mass" if for_mass else "composition"
     n = len(peptidoforms)
     seqs: list[str] = []
     for pf in peptidoforms:
-        _check_peptidoform(pf, what)
+        _check_peptidoform(pf, what, vocab)
         seqs.append(pf.sequence)
     residue_comp, h2o = _residue_matrix()
     joined = "".join(seqs)
@@ -1264,14 +1335,15 @@ def _batched(
     # global isotope label covers, less what modifications take off it.
     chain = comp.copy() if labelled else None
 
-    resolved: dict[ModRef, tuple[np.ndarray, float]] = {}
+    resolved: dict[ModRef, tuple[np.ndarray, float, np.ndarray | None, bool]] = {}
     extra = [0.0] * n
 
-    def resolve(modref: ModRef) -> tuple[np.ndarray, float]:
+    def resolve(modref: ModRef) -> tuple[np.ndarray, float, np.ndarray | None, bool]:
         hit = resolved.get(modref)
         if hit is None:
             d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=monoisotopic)
-            hit = resolved[modref] = (d_comp.counts.numpy(), d_mass)  # int32 view
+            atoms, own = _modref_heavy_atoms(modref, vocab) if heavy is not None else (None, False)
+            hit = resolved[modref] = (d_comp.counts.numpy(), d_mass, atoms, own)  # int32 view
         return hit
 
     for i, pf in enumerate(peptidoforms):
@@ -1289,13 +1361,17 @@ def _batched(
                     "mods, but peptide_composition needs a UNIMOD/name/formula "
                     "payload to determine element counts"
                 )
-            d_comp, d_mass = resolve(modref)
+            d_comp, d_mass, h, own = resolve(modref)
             row += d_comp
             acc += d_mass
             if chain is not None:
                 chain[i] += np.minimum(d_comp, 0)
+            if h is not None:
+                heavy[i] += h  # type: ignore[index]
+                if own and substituted is not None:
+                    substituted[i] += h
         for modref, locations in pf.fixed_mods:
-            d_comp, d_mass = resolve(modref)
+            d_comp, d_mass, h, own = resolve(modref)
             for loc in locations:
                 count = _count_fixed_mod_locations(pf.sequence, loc, pf)
                 if count:
@@ -1303,8 +1379,31 @@ def _batched(
                     acc += d_mass * count
                     if chain is not None:
                         chain[i] += np.minimum(d_comp, 0) * count
+                    if h is not None:
+                        heavy[i] += h * count
+                        if own and substituted is not None:
+                            substituted[i] += h * count
         extra[i] = acc
     return comp, extra, chain
+
+
+def _modref_heavy_atoms(modref: ModRef, vocab: ModVocab) -> tuple[np.ndarray | None, bool]:
+    """The heavy atoms a modification names (``Modification.heavy_atoms``),
+    counted under each light element, those it adds only; None for none (a
+    formula, a mass, a modification without heavy atoms). And whether they
+    are the residue's own atoms made heavy (an isotopic substitution: SILAC)
+    rather than atoms the modification adds (TMT's)."""
+    if modref.cv == "INFO" or modref.formula is not None or (modref.accession is None and modref.name is None):
+        return None, False
+    mod = vocab.get(_modref_lookup_key(modref))
+    atoms = mod.heavy_atoms
+    if not atoms:
+        return None, False
+    out = np.zeros(len(ELEMENTS), dtype=np.int64)
+    for label, count in atoms.items():
+        if int(count) > 0:
+            out[ELEMENTS.index(parse_isotope_label(label)[1])] += int(count)
+    return (out, mod.is_isotopic_substitution) if out.any() else (None, False)
 
 
 @requires_canonical
@@ -1351,6 +1450,69 @@ def labelled_compositions(
             e = ELEMENTS.index(sym)
             out[i, e] = chain[i, e]
     return torch.from_numpy(out.astype(np.int32))
+
+
+@requires_canonical
+def heavy_atom_compositions(
+    peptidoforms: Sequence[Peptidoform],
+    *,
+    vocab: ModVocab = UNIMOD,
+) -> torch.Tensor:
+    """The atoms each peptidoform's modifications make fixed heavy isotopes:
+    an ``(N, E)`` int32 tensor counting, under each light element, the heavy
+    atoms its modifications' formulas name (``Modification.heavy_atoms``:
+    SILAC's ¹³C₆¹⁵N₂ is 6 C and 2 N, TMT's ¹³C₄¹⁵N 4 C and 1 N), each
+    modification as often as it is placed. Those atoms are counted in
+    :func:`peptide_composition` under their light element and carry their
+    mass through ``mass_override``; they are one isotope each, so an isotope
+    envelope distributes only the rest. A modification that removes heavy
+    atoms (a negative count) adds none here: it can only take them off a
+    labelled chain, which :func:`labelled_compositions` already accounts for.
+
+    Until 2026-11-11 nothing said which atoms these were, and the MS1
+    envelope gave them natural variance: M+0's share 7-9 % low, M+2's
+    11-16 % high on SILAC and TMT peptides (review of 2026-11-10, C8)."""
+    out = np.zeros((len(peptidoforms), len(ELEMENTS)), dtype=np.int64)
+    _batched(peptidoforms, vocab, monoisotopic=True, for_mass=True, heavy=out)
+    return torch.from_numpy(out.astype(np.int32))
+
+
+@requires_canonical
+def natural_abundance_compositions(
+    peptidoforms: Sequence[Peptidoform],
+    *,
+    vocab: ModVocab = UNIMOD,
+) -> torch.Tensor:
+    """The atoms of each peptidoform whose isotopes follow natural
+    abundance: an ``(N, E)`` int32 tensor, its composition
+    (:func:`peptide_compositions`, same rules and errors) less the atoms
+    that are one isotope each, each atom once: those a global label covers
+    (:func:`labelled_compositions`, the chain's atoms of its element) and
+    the heavy atoms its modifications name (:func:`heavy_atom_compositions`)
+    that the label does not cover. What an isotope envelope distributes;
+    the others carry only mass. One walk of the modifications for all.
+
+    An isotopic substitution's heavy atoms (SILAC's) are its residue's own,
+    so of an element a global label names they are among the chain's atoms
+    the label covers already; the heavy atoms a modification adds (TMT's)
+    are not. Until 2026-11-11 a substitution's atoms of a labelled element
+    were taken off twice, and the clamp at zero took the deficit from atoms
+    that are natural: ``<13C>`` with SILAC lysine lost carbamidomethyl's two
+    carbons (Codex review of the scorer). The clamp stays for a substitution
+    placed on a residue that lacks the atoms it names."""
+    labelled = any(getattr(pf, "global_isotopes", ()) for pf in peptidoforms)
+    heavy = np.zeros((len(peptidoforms), len(ELEMENTS)), dtype=np.int64)
+    substituted = np.zeros_like(heavy) if labelled else None
+    comp, _, chain = _batched(peptidoforms, vocab, monoisotopic=True, for_mass=False, labelled=labelled, heavy=heavy,
+                              substituted=substituted)  # fmt: skip
+    fixed = heavy
+    if labelled:
+        assert chain is not None and substituted is not None
+        for i, pf in enumerate(peptidoforms):
+            for e in {ELEMENTS.index(parse_isotope_label(label)[1]) for label in pf.global_isotopes}:
+                # The chain's atoms of e, of which a substitution's are in ``heavy`` already.
+                fixed[i, e] += chain[i, e] - substituted[i, e]
+    return torch.from_numpy(np.maximum(comp - fixed, 0).astype(np.int32))
 
 
 def _masses(peptidoforms: Sequence[Peptidoform], vocab: ModVocab, monoisotopic: bool) -> np.ndarray:
@@ -1418,7 +1580,8 @@ def peptide_composition(
       contribute their ``delta_composition``.
     - Cross-link / ambiguity / branch groups (TaggedMod ``group_id``)
       contribute exactly once across all anchor positions — the chemistry
-      is shared between participants.
+      is shared between participants. An ambiguity group declaring its
+      modification on more than one member raises ``ValueError``.
     - Heavy-isotope modifications (``mass_override``) contribute the
       *light-atom skeleton*; ``peptide_mass`` resolves the canonical mass.
     - Global isotope labels (``<13C>``, ``<15N>``, ...) contribute zero
@@ -1492,7 +1655,9 @@ __all__ = [
     "peptide_composition",
     "peptide_compositions",
     "SIDE_CHAIN_CYCLIZATIONS",
+    "heavy_atom_compositions",
     "labelled_compositions",
+    "natural_abundance_compositions",
     "peptide_mass",
     "peptide_masses",
     "protein_composition",

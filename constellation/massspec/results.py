@@ -239,7 +239,7 @@ def _peptide_centric(
     peptides = _read(root, "peptide", unit=unit, acquisition_id=acquisition_id, shared=True,
                      columns=["peptide_id", "sequence", "modified_sequence", "is_decoy"])
     scores = _read(root, "precursor_score", unit=unit, acquisition_id=acquisition_id, where=where,
-                   columns=["precursor_id", "score", "qvalue", "pep", "is_decoy"])
+                   columns=["precursor_id", "score", "qvalue", "pep", "is_decoy", "pass", "role"])
     if peptides is not None and "is_decoy" in peptides.column_names:
         peptides = peptides.rename_columns(["peptide_is_decoy" if c == "is_decoy" else c for c in peptides.column_names])
     if scores is not None and "is_decoy" in scores.column_names:
@@ -256,7 +256,7 @@ def _peptide_centric(
             join_type="left outer",
         )
     if scores is not None and scores.num_rows:
-        scores = scores.filter(pc.is_valid(scores.column("precursor_id")))
+        scores = _final_scores(scores.filter(pc.is_valid(scores.column("precursor_id"))))
         joined = joined.join(
             _first_per(scores, ["unit", "acquisition_id", "precursor_id"]),
             keys=["unit", "acquisition_id", "precursor_id"],
@@ -275,6 +275,27 @@ def _peptide_centric(
     is_decoy = pc.coalesce(*flags, pa.scalar(False)) if flags else pa.array([False] * joined.num_rows)
     joined = joined.drop_columns([c for c in ("score_is_decoy", "peptide_is_decoy") if c in joined.column_names])
     return _shape(joined.drop_columns(["rt_observed"]).append_column("rt", rt).append_column("is_decoy", is_decoy))
+
+
+def _final_scores(scores: pa.Table) -> pa.Table:
+    """The rows that are a search's result, ordered so that each precursor's
+    first row is its result: a calibrant pass's rows are left out
+    (calibrants are not targets; PI, 2026-11-07), and the latest pass comes
+    first, a row without a pass last. ``pass`` and ``role`` are dropped. Until
+    2026-11-11 a calibrant pass and the search of one engine collided, and
+    the first row of either was kept (review of 2026-11-10, S7). A table
+    without the columns (written before them) is left as it is."""
+    from constellation.massspec.search.schemas import CALIBRANT_ROLE
+
+    if "role" in scores.column_names:
+        role = scores.column("role")
+        scores = scores.filter(pc.invert(pc.fill_null(pc.equal(role, CALIBRANT_ROLE), False)))
+    if "pass" in scores.column_names:
+        order = pa.array(np.arange(scores.num_rows, dtype=np.int64))
+        scores = scores.append_column("__row__", order).sort_by(
+            [("pass", "descending"), ("__row__", "ascending")], null_placement="at_end"
+        ).drop_columns(["__row__"])
+    return scores.drop_columns([c for c in ("pass", "role") if c in scores.column_names])
 
 
 def _spectrum_centric(

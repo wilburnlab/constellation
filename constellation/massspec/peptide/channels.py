@@ -105,6 +105,28 @@ class ChannelSettings:
     #: Keep each query's N most abundant fragment ions (needs abundances
     #: that rank: a library's).
     top_fragments: int | None = None
+    #: No fragment channel below this m/z (Th), and none within this many Th
+    #: of the query's precursor m/z: applied before ``top_fragments``, so the
+    #: top N are chosen among the rest (EncyclopeDIA leaves out the precursor
+    #: ± 10 Th in its XCorr). None makes every channel (added 2026-11-11,
+    #: review of 2026-11-10, D11).
+    min_fragment_mz: float | None = None
+    precursor_exclusion_th: float | None = None
+
+    @classmethod
+    def for_scoring(cls) -> ChannelSettings:
+        """The channels a scorer sees (review of 2026-11-10, D11): fragment
+        charges below the precursor's (EncyclopeDIA's rule), no fragment
+        below 200 Th or within ± 10 Th of the precursor, a library's 10 most
+        abundant fragments, and the isotopes M−1 to M+2 at MS1 (M−1 for the
+        isotope dot). The dataclass's own defaults are unchanged."""
+        return cls(
+            isotope_offsets=(-1, 0, 1, 2),
+            fragment_charge_below_precursor=1,
+            min_fragment_mz=200.0,
+            precursor_exclusion_th=10.0,
+            top_fragments=10,
+        )
 
     def __post_init__(self) -> None:
         if self.isotope_offsets is not None and self.top_isotopes is not None:
@@ -126,6 +148,10 @@ class ChannelSettings:
             raise ValueError(f"max_fragment_charge must be >= 1; got {self.max_fragment_charge}")
         if int(self.fragment_charge_below_precursor) < 0:
             raise ValueError("fragment_charge_below_precursor must be >= 0")
+        for name in ("min_fragment_mz", "precursor_exclusion_th"):
+            value = getattr(self, name)
+            if value is not None and not (np.isfinite(float(value)) and float(value) >= 0):
+                raise ValueError(f"{name} must be a finite m/z >= 0; got {value}")
         if not self.ion_types:
             raise ValueError("ion_types must name at least one ion series")
 
@@ -154,6 +180,8 @@ class ChannelSettings:
             "fragment_charge_below_precursor": int(self.fragment_charge_below_precursor),
             "neutral_losses": None if self.neutral_losses is None else list(self.neutral_losses),
             "top_fragments": self.top_fragments,
+            "min_fragment_mz": None if self.min_fragment_mz is None else float(self.min_fragment_mz),
+            "precursor_exclusion_th": None if self.precursor_exclusion_th is None else float(self.precursor_exclusion_th),
         }
 
     @classmethod
@@ -172,6 +200,9 @@ class ChannelSettings:
             fragment_charge_below_precursor=int(d.get("fragment_charge_below_precursor", 0)),
             neutral_losses=None if d["neutral_losses"] is None else tuple(d["neutral_losses"]),
             top_fragments=d.get("top_fragments"),
+            # Absent from plans written before 2026-11-11: no such filter.
+            min_fragment_mz=d.get("min_fragment_mz"),
+            precursor_exclusion_th=d.get("precursor_exclusion_th"),
         )
 
 
@@ -519,6 +550,9 @@ def fragment_channels(
     key: np.ndarray | None = None,
     target_ids: Sequence[Any] | None = None,
     vocab: ModVocab = UNIMOD,
+    precursor_mz: np.ndarray | None = None,
+    acquired: tuple[np.ndarray, np.ndarray] | None = None,
+    decoy: np.ndarray | None = None,
 ) -> Channels:
     """Each query's fragment ions: for a query with a peptide
     (``peptide[q]`` into ``peptidoforms``, -1 for none), its ladder of the
@@ -526,10 +560,23 @@ def fragment_channels(
     for its precursor charge (``charge[q]``; -1 for no cap but
     ``max_fragment_charge``). One ladder per distinct peptide. Abundance
     from ``abundance`` (looked up by ``key[q]``, such as the precursor
-    id); with ``settings.top_fragments`` only each query's most abundant,
-    in ladder order. Ladder order is position, then ion type as given,
-    then charge, then no loss before each loss. Modifications are read
-    from ``vocab``."""
+    id), computed over every candidate ion; then no channel is made for
+    an ion below ``settings.min_fragment_mz``, within
+    ``settings.precursor_exclusion_th`` of the query's ``precursor_mz[q]``,
+    or outside the m/z range its MS2 scans acquire (``acquired``: per query
+    ``(lower, upper)``, ±inf where unknown); and with
+    ``settings.top_fragments`` only each query's most abundant of the rest,
+    in ladder order. Until 2026-11-11 the top N were chosen among every
+    ion, 42 % of a GPF run's queries losing a channel of their top 10 to
+    m/z never acquired (review of 2026-11-10, C6). Ladder order is
+    position, then ion type as given, then charge, then no loss before
+    each loss. Modifications are read from ``vocab``.
+
+    An abundance source with a ``report`` gets the counts: ions not made,
+    by reason (``not_made``), and the queries with no fragment of positive
+    abundance (``no_positive_fragment``), split into targets and decoys by
+    ``decoy`` beside how many of each had candidates
+    (``fragment_queries_targets`` / ``_decoys``)."""
     peptide = np.asarray(peptide, dtype=np.int64)
     charge = np.asarray(charge, dtype=np.int64)
     n = peptide.size
@@ -579,17 +626,54 @@ def fragment_channels(
         charge_ceiling=ceiling,
     )
     values = np.asarray(abundance.abundance(ions), dtype=np.float64)
+    report = getattr(abundance, "report", None)
+    report = report if isinstance(report, dict) else None
+
+    # Which candidates become channels: abundances are computed over every
+    # candidate first, so leaving an ion out changes no other's share.
+    mz = ladder.mz[take]
+    made = np.ones(take.size, dtype=bool)
+    not_made: dict[str, int] = {}
+    reasons = []
+    if settings.min_fragment_mz is not None:
+        reasons.append(("below_min_fragment_mz", mz < float(settings.min_fragment_mz)))
+    if settings.precursor_exclusion_th is not None and precursor_mz is not None:
+        pmz = np.asarray(precursor_mz, dtype=np.float64)[row_query]
+        reasons.append(("near_precursor", np.abs(mz - pmz) <= float(settings.precursor_exclusion_th)))
+    if acquired is not None:
+        lo, hi = (np.asarray(a, dtype=np.float64)[row_query] for a in acquired)
+        reasons.append(("not_acquired", (mz < lo) | (mz > hi)))
+    for reason, out in reasons:
+        not_made[reason] = int((made & out).sum())
+        made &= ~out
+
+    # A precursor with no fragment of positive abundance (a source's NaN or
+    # 0 for every ion) is counted, by target and decoy; under top-N it keeps
+    # no fragment channel. Until 2026-11-09 one such precursor aborted the
+    # compile, and the full human space holds about 20.
+    has_candidates = counts > 0
+    positive = np.bincount(row_query[values > 0], minlength=n) > 0
+    empty = np.flatnonzero(has_candidates & ~positive)
     if top is not None:
-        keep = select_top(row_query, values, int(top)) & (values > 0)
-        # A precursor with no fragment predicted above its model's floor (a
-        # source's NaN or 0 for every ion) keeps no fragment channel and is
-        # counted; until 2026-11-09 one such precursor aborted the compile,
-        # and the full human space holds about 20.
-        empty = np.flatnonzero((counts > 0) & (np.bincount(row_query[keep], minlength=n) == 0))
-        report = getattr(abundance, "report", None)
-        if isinstance(report, dict):
-            report["no_positive_fragment"] = int(empty.size)
-            report["no_positive_fragment_examples"] = [ids[int(i)] for i in empty[:5]]
+        sub = np.flatnonzero(made)
+        chosen = select_top(row_query[sub], values[sub], int(top)) & (values[sub] > 0)
+        keep = np.zeros(made.size, dtype=bool)
+        keep[sub[chosen]] = True
+    else:
+        keep = made
+    if report is not None and abundance.ranks:
+        is_decoy = np.zeros(n, bool) if decoy is None else np.asarray(decoy, dtype=bool)
+        report["no_positive_fragment"] = int(empty.size)
+        report["no_positive_fragment_examples"] = [ids[int(i)] for i in empty[:5]]
+        report["no_positive_fragment_targets"] = int((~is_decoy[empty]).sum())
+        report["no_positive_fragment_decoys"] = int(is_decoy[empty].sum())
+        report["fragment_queries_targets"] = int((has_candidates & ~is_decoy).sum())
+        report["fragment_queries_decoys"] = int((has_candidates & is_decoy).sum())
+        # Queries with a fragment of positive abundance, none of them left.
+        report["no_fragment_made"] = int((positive & (np.bincount(row_query[keep], minlength=n) == 0)).sum())
+    if report is not None and not_made:
+        report["not_made"] = not_made
+    if not keep.all():
         take, row_query, values = take[keep], row_query[keep], values[keep]
         counts = np.bincount(row_query, minlength=n).astype(np.int64)
         offsets = _offsets(counts)

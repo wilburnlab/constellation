@@ -100,6 +100,34 @@ def test_gaussian_peak_integrate_bounded():
     assert math.isclose(one_sigma / full, 0.6826895, abs_tol=1e-5)
 
 
+@pytest.mark.parametrize(("t_lo", "t_hi"), [(None, 3.0), (1.0, None)])
+def test_a_one_sided_gaussian_area_has_finite_gradients(t_lo, t_hi) -> None:
+    """A missing limit is ∓inf; until 2026-11-11 ``(±inf − t_apex)/σ`` was
+    formed before the CDF and the gradient in ``log_sigma`` was NaN."""
+    from torch.func import functional_call
+
+    p = GaussianPeak(N_max=2.0, t_apex=2.0, sigma=1.5)
+
+    class Area(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.p = p
+
+        def forward(self) -> torch.Tensor:
+            return self.p.integrate(t_lo, t_hi)
+
+    def area(log_n, t_apex, log_sigma):
+        return functional_call(Area(), {"p.log_N_max": log_n, "p.t_apex": t_apex, "p.log_sigma": log_sigma}, ())
+
+    inputs = tuple(v.detach().clone().requires_grad_(True) for v in (p.log_N_max, p.t_apex, p.log_sigma))
+    assert torch.autograd.gradcheck(area, inputs)
+    far = GaussianPeak(N_max=2.0, t_apex=2.0, sigma=1.5)
+    far.integrate(-1e3 if t_lo is None else t_lo, 1e3 if t_hi is None else t_hi).backward()
+    p.integrate(t_lo, t_hi).backward()
+    for name, value in p.named_parameters():
+        assert value.grad.item() == pytest.approx(dict(far.named_parameters())[name].grad.item(), rel=1e-12)
+
+
 def test_gaussian_peak_bounds():
     p = GaussianPeak(N_max=1.0, t_apex=10.0, sigma=2.0)
     lo, hi = p.bounds(n_sigma=3.0)
@@ -412,3 +440,80 @@ def test_emg_peak_mode_is_differentiable_and_vmap_safe():
     t = torch.linspace(-2, 6, 50, dtype=torch.float64)
     out = vmap(lambda ps: functional_call(p, ps, (t,)))(params)
     assert out.shape == (3, 50) and torch.isfinite(out).all()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Exact EMG areas (review 2026-11-10, S6)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("tau_over_sigma", [0.05, 1.0, 5.0, 20.0, 100.0])
+def test_emg_area_is_exact_whatever_the_tail(tau_over_sigma: float) -> None:
+    """The area was a 500-point trapezoid over bounds(), which cut the tail
+    off (−1.7 % at τ = 5σ, −3.7 % at 20σ)."""
+    from scipy import integrate
+
+    p = EMGPeak(N_max=3.0, t_apex=2.0, sigma=0.5, tau=0.5 * tau_over_sigma)
+
+    def f(t: float) -> float:
+        return p.forward(torch.tensor(t, dtype=torch.float64)).item()
+
+    whole, _ = integrate.quad(f, -math.inf, math.inf, limit=800, epsabs=0, epsrel=1e-13)
+    assert p.integrate().item() == pytest.approx(whole, rel=1e-9)
+    part, _ = integrate.quad(f, 1.0, 6.0, limit=800, epsabs=0, epsrel=1e-13)
+    assert p.integrate(t_lo=1.0, t_hi=6.0).item() == pytest.approx(part, rel=1e-9)
+    left, _ = integrate.quad(f, -math.inf, 3.0, limit=800, epsabs=0, epsrel=1e-13)
+    assert p.integrate(t_hi=3.0).item() == pytest.approx(left, rel=1e-9)
+
+
+def test_hyper_emg_bounded_area_is_exact() -> None:
+    from scipy import integrate
+
+    p = HyperEMGPeak(N_total=10.0, mu=0.0, sigma=1.0, tau_r=1.5, tau_l=1.0, eta=0.6)
+
+    def f(t: float) -> float:
+        return p.forward(torch.tensor(t, dtype=torch.float64)).item()
+
+    part, _ = integrate.quad(f, -3.0, 3.0, epsabs=0, epsrel=1e-13)
+    assert p.integrate(t_lo=-3.0, t_hi=3.0).item() == pytest.approx(part, rel=1e-10)
+    upper, _ = integrate.quad(f, 1.0, math.inf, epsabs=0, epsrel=1e-13)
+    assert p.integrate(t_lo=1.0).item() == pytest.approx(upper, rel=1e-10)
+
+
+def test_emg_cdf_is_differentiable_through_parameters_and_limits() -> None:
+    from constellation.core.stats import emg_cdf, emg_left_cdf
+
+    def area(mu, sigma, tau, lo, hi):
+        return (emg_cdf(hi, mu, sigma, tau) - emg_cdf(lo, mu, sigma, tau)) + (
+            emg_left_cdf(hi, mu, sigma, tau) - emg_left_cdf(lo, mu, sigma, tau)
+        )
+
+    args = tuple(
+        torch.tensor(v, dtype=torch.float64, requires_grad=True) for v in (0.3, 0.7, 2.0, -1.0, 4.0)
+    )
+    assert torch.autograd.gradcheck(area, args)
+    lo = torch.tensor(-1.0, dtype=torch.float64, requires_grad=True)
+    p = EMGPeak(N_max=2.0, t_apex=0.0, sigma=0.5, tau=1.0)
+    p.integrate(t_lo=lo, t_hi=3.0).backward()
+    assert lo.grad is not None and lo.grad.item() < 0  # a lower limit further left adds area
+
+
+def test_emg_forward_mode_derivative_sees_the_mode_through_the_newton_solve() -> None:
+    """A guard for the batched fits' forward-mode Jacobians: jvp through the
+    mode offset's Newton solve agrees with a finite difference."""
+    from torch.func import functional_call, jvp
+
+    p = EMGPeak(N_max=1.0, t_apex=0.0, sigma=0.5, tau=1.0)
+    params = {k: v.detach() for k, v in p.named_parameters()}
+    t = torch.linspace(-2.0, 5.0, 11, dtype=torch.float64)
+    for name in ("log_sigma", "log_tau"):
+
+        def f(value, name=name):
+            moved = dict(params)
+            moved[name] = value
+            return functional_call(p, moved, (t,))
+
+        _, tangent = jvp(f, (params[name],), (torch.tensor(1.0, dtype=torch.float64),))
+        h = 1e-6
+        fd = (f(params[name] + h) - f(params[name] - h)) / (2 * h)
+        assert torch.allclose(tangent, fd, atol=1e-7), name

@@ -21,7 +21,11 @@ Masks, not sentinels, say what a value means: ``slot_valid`` (a scan on the
 query's axis, not padding), ``channel_valid`` (a channel of the query, not
 padding), ``acquired`` (a cell the long view has: eligible, and inside its
 scan's acquired m/z range or matched) and ``matched``. ``intensity`` is 0
-and ``mz_error_da`` NaN wherever nothing matched, acquired or not.
+and ``mz_error_da`` NaN wherever nothing matched, acquired or not; so a
+zero is a measurement only where ``acquired`` says so. Hand a comparison
+:meth:`Dense.observed` (NaN where not acquired), or ``intensity`` with
+``mask=acquired``: passed bare, a never-measured cell counts as a measured
+zero (review 2026-11-10, V1).
 
 The view is built from the batch's matches, not from the long cells: a
 query's scan axis is its eligible pairs (:meth:`QueryBatch.eligible`, the
@@ -33,7 +37,7 @@ cell: a sweep under the ``all`` rule (several points a cell) is refused.
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -44,7 +48,24 @@ from constellation.massspec.sweep.schedule import ragged_arange
 if TYPE_CHECKING:
     from constellation.massspec.sweep.reduce import QueryBatch
 
-__all__ = ["Dense", "dense_view", "dense_chunks"]
+__all__ = [
+    "Dense",
+    "dense_view",
+    "dense_chunks",
+    "PARENT_FOUND",
+    "PARENT_NONE",
+    "PARENT_UNREAD",
+    "PARENT_OFF_AXIS",
+]
+
+#: Why :meth:`Dense.parent_slots` gives a slot its parent or not (with
+#: ``reasons=True``; -1 for a padding slot): found on the query's MS1 axis;
+#: the scan has no parent recorded or derived; its parent scan is no slot
+#: (the sweep did not read it, or it holds no points and the bundle does
+#: not say it holds none; an empty scan read is a slot of zeros); its
+#: parent is a slot but not on this query's MS1 axis (outside the query's
+#: interval there).
+PARENT_FOUND, PARENT_NONE, PARENT_UNREAD, PARENT_OFF_AXIS = 0, 1, 2, 3
 
 #: The ``Channels`` columns a dense view carries per (query, channel), with
 #: the value a padding channel gets.
@@ -82,6 +103,20 @@ class Dense:
     iit: torch.Tensor
     window: torch.Tensor  # the slot's isolation window (the ledger's window index), -1 padding
     parent_row: torch.Tensor  # the ledger row of the slot's parent scan, -1 none
+    #: [Q, S]: whether the slot's injection time was estimated from its TIC
+    #: (``Ledger.iit_imputed``); its scan's lowest stored intensity (NaN
+    #: unknown; ``Ledger.floor``), and what made its peaks, a code into
+    #: ``centroiders`` (-1 not recorded); and whether the scan records the
+    #: m/z range it acquired (where not, every channel counts as acquired).
+    iit_imputed: torch.Tensor
+    floor: torch.Tensor
+    centroider: torch.Tensor
+    range_known: torch.Tensor
+    #: [Q, S, C] int32: the matched point's position in its scan's stored
+    #: order (``Matches.point_index``), -1 where nothing matched or a rule
+    #: aggregated several points (``sum``). Two channels holding one point,
+    #: or two queries sharing one, show here (review S10).
+    point_index: torch.Tensor
     # [Q, C]
     channel_valid: torch.Tensor
     mz: torch.Tensor  # theoretical, NaN padding
@@ -92,6 +127,15 @@ class Dense:
     loss: torch.Tensor
     isotope: torch.Tensor
     precursor_charge: torch.Tensor
+    #: [Q, C] int64: channels of a query whose tolerance windows overlap
+    #: (chained in m/z order) share a group, named by its first channel;
+    #: such channels can match the same point. -1 for padding.
+    overlap_group: torch.Tensor
+    #: Whether each ledger row can be a slot (``Ledger.present``: to tell an
+    #: unread parent scan).
+    _ledger_present: np.ndarray | None = field(default=None, repr=False, compare=False)
+    #: The names ``centroider`` codes index.
+    centroiders: tuple[str, ...] = ()
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -108,15 +152,63 @@ class Dense:
         """Observed − theoretical in ppm, NaN where unmatched."""
         return self.mz_error_da / self.mz.unsqueeze(1).to(self.mz_error_da.dtype) * 1e6
 
-    def parent_slots(self, ms1: Dense) -> torch.Tensor:
-        """``[Q, S]``: for each slot of this view (MS2 or above), the slot of
-        its parent scan on the same query's axis in ``ms1`` (the level
-        below, built for the same queries), -1 where it has none or the
-        parent is not on that axis (outside the query's interval there)."""
+    @property
+    def n_slots(self) -> torch.Tensor:
+        """``[Q]``: each query's axis length (its valid slots)."""
+        return self.slot_valid.sum(dim=1)
+
+    def observed(self) -> torch.Tensor:
+        """``intensity`` with NaN wherever the cell was not acquired (and in
+        padding): a zero left is a measured zero. What to hand a
+        comparison that drops NaN channels (module docstring)."""
+        return torch.where(self.acquired, self.intensity, torch.full_like(self.intensity, float("nan")))
+
+    def brackets(self, ms1: Dense):
+        """For each slot of this view (MS2 or above), the slots of the
+        query's MS1 axis just before and after it in time, and the linear
+        weight between them (``core.signal.interpolate.Bracket``, slots
+        ``[Q, S]`` on ``ms1``'s axis, -1 for none): the interpolation an
+        MS1 trace needs to be read at MS2 times. ``ms1`` is the level below,
+        built for the same queries."""
+        from constellation.core.signal.interpolate import bracket
+
+        self._check_below(ms1)
+        rt = torch.where(self.slot_valid, self.rt, torch.full_like(self.rt, float("nan")))
+        return bracket(ms1.rt, rt, valid=ms1.slot_valid)
+
+    def _check_below(self, ms1: Dense) -> None:
         if not np.array_equal(self.queries, ms1.queries):
             raise ValueError("parent_slots needs the level below built for the same queries")
         if ms1.level != self.level - 1:
             raise ValueError(f"the parents of MS{self.level} scans are MS{self.level - 1} scans, not MS{ms1.level}")
+
+    def parent_slots(self, ms1: Dense, *, reasons: bool = False):
+        """``[Q, S]``: for each slot of this view (MS2 or above), the slot of
+        its parent scan on the same query's axis in ``ms1`` (the level
+        below, built for the same queries), -1 where it has none or the
+        parent is not on that axis (outside the query's interval there).
+
+        With ``reasons``, also ``[Q, S]`` codes saying why
+        (:data:`PARENT_FOUND`, :data:`PARENT_NONE`, :data:`PARENT_UNREAD`,
+        :data:`PARENT_OFF_AXIS`; -1 for padding): the four ways a slot has
+        no parent are different evidence (review V8). The nearest MS1 slot
+        on either side in time is :meth:`brackets`."""
+        self._check_below(ms1)
+        slots = self._parent_slots(ms1)
+        if not reasons:
+            return slots
+        parent = self.parent_row.numpy()
+        code = np.full(parent.shape, PARENT_OFF_AXIS, np.int64)
+        code[slots.numpy() >= 0] = PARENT_FOUND
+        code[parent < 0] = PARENT_NONE
+        present = self._ledger_present
+        if present is not None and present.size:
+            unread = (parent >= 0) & ~present[np.maximum(parent, 0)]
+            code[unread & (slots.numpy() < 0)] = PARENT_UNREAD
+        code[~self.slot_valid.numpy()] = -1
+        return slots, torch.from_numpy(code)
+
+    def _parent_slots(self, ms1: Dense) -> torch.Tensor:
         q, s = self.parent_row.shape
         out = np.full((q, s), -1, np.int64)
         rows1 = ms1.row.numpy()
@@ -137,11 +229,45 @@ class Dense:
         return torch.from_numpy(out)
 
 
+def _overlap_groups(mz: np.ndarray, c_valid: np.ndarray, tolerance) -> np.ndarray:
+    """``[Q, C]``: each channel's overlap group (``Dense.overlap_group``):
+    channels taken in m/z order, a new group wherever a channel's window
+    and the previous one's do not overlap; named by the group's first
+    channel. -1 for padding."""
+    n_q, n_c = mz.shape
+    out = np.full((n_q, n_c), -1, np.int64)
+    if n_q == 0 or n_c == 0:
+        return out
+    value, unit = tolerance
+    key = np.where(c_valid, mz, np.inf)
+    by = np.argsort(key, axis=1, kind="stable")
+    smz = np.take_along_axis(key, by, axis=1)
+    half = smz * float(value) * 1e-6 if unit == "ppm" else np.full_like(smz, float(value))
+    ok = np.isfinite(smz)
+    with np.errstate(invalid="ignore"):  # padding is inf, and inf − inf is NaN
+        gap = np.diff(smz, axis=1)
+        reach = half[:, 1:] + half[:, :-1]
+    new = np.ones((n_q, n_c), bool)
+    new[:, 1:] = ~(ok[:, 1:] & ok[:, :-1] & (gap <= reach))
+    group = np.cumsum(new, axis=1) - 1  # per query, 0..g in m/z order
+    # Name each group by its lowest channel index.
+    first = np.full((n_q, n_c), n_c, np.int64)
+    rows = np.repeat(np.arange(n_q), n_c)
+    np.minimum.at(first, (rows, group.reshape(-1)), by.reshape(-1))
+    named = np.take_along_axis(first, group, axis=1)
+    np.put_along_axis(out, by, np.where(ok, named, -1), axis=1)
+    return out
+
+
 def dense_view(batch: QueryBatch, level: int, *, queries: np.ndarray | None = None,
                dtype: torch.dtype = torch.float32) -> Dense:  # fmt: skip
     """The dense view of ``batch``'s queries (or ``queries``, an ascending
     subset) at ``level`` (module docstring). ``dtype`` is that of
-    ``intensity`` and ``mz_error_da``; times, TIC and m/z stay float64."""
+    ``intensity`` and ``mz_error_da`` (float32 or float64); times, TIC and
+    m/z stay float64."""
+    if dtype not in (torch.float32, torch.float64):
+        # float16 turned every intensity above 65,504 into inf (review V5).
+        raise ValueError(f"the dense view's values are float32 or float64, not {dtype}")
     plan, scans = batch.plan, batch.scans
     channels = plan.channels_for_level(level)
     if channels is None:
@@ -152,6 +278,14 @@ def dense_view(batch: QueryBatch, level: int, *, queries: np.ndarray | None = No
             "tolerance: use the cell view (QueryBatch.cells), or sweep with 'nearest' or 'sum'"
         )
     qs = np.asarray(batch.queries if queries is None else queries, dtype=np.int64)
+    if queries is not None and qs.size:
+        # Unsorted queries raised an obscure error and a repeated one came
+        # back empty (review V4).
+        if qs.ndim != 1 or (qs.size > 1 and not (np.diff(qs) > 0).all()):
+            raise ValueError("dense(queries=...) takes the batch's queries in strictly ascending order")
+        at = np.searchsorted(batch.queries, qs)
+        if (at >= batch.queries.size).any() or (batch.queries[np.minimum(at, batch.queries.size - 1)] != qs).any():
+            raise ValueError("dense(queries=...) takes queries of the batch only")
     n_q = qs.size
     # The scan axis: each query's eligible pairs, in (query, scan order).
     pq_, pr = batch.eligible(level, qs)
@@ -191,15 +325,18 @@ def dense_view(batch: QueryBatch, level: int, *, queries: np.ndarray | None = No
     window_of_row[index.rows] = index.window
     parent = per_slot(scans.parent, -1, np.int64)
 
-    # Matches, laid onto (query, slot, channel).
+    # Matches, laid onto (query, slot, channel). The batch's matches are
+    # sorted by query, so each query's are one range, found by a search
+    # (``np.isin`` over every match cost each chunk the whole batch's; V7).
     m = batch.matches
-    sel = np.flatnonzero((m.level == level) & np.isin(m.query, qs)) if m is not None and m.n else np.empty(0, np.int64)
+    sel = batch._match_rows(qs, level) if m is not None and m.n else np.empty(0, np.int64)
     # Made in the asked type at once: a float64 copy cast down would double
     # the view's peak memory.
     values = torch.empty(0, dtype=dtype).numpy().dtype
     intensity = np.zeros((n_q, n_s, n_c), values)
     error = np.full((n_q, n_s, n_c), np.nan, values)
     matched = np.zeros((n_q, n_s, n_c), bool)
+    point = np.full((n_q, n_s, n_c), -1, np.int32)
     if sel.size:
         mq = np.searchsorted(qs, m.query[sel])
         mr = scans.rows_of(m.scan[sel])
@@ -213,11 +350,17 @@ def dense_view(batch: QueryBatch, level: int, *, queries: np.ndarray | None = No
             raise AssertionError("a match outside its query's eligible scans")
         ms, mc = slot[p_c], m.channel[sel]
         cell = (mq.astype(np.int64) * n_s + ms) * n_c + mc
-        if np.unique(cell).size != cell.size:
+        # The matches come sorted by (query, scan order, channel), so their
+        # cells ascend and a repeat is a zero step; ``np.unique`` was 74 %
+        # of the build (review V2) and stays only for matches out of order.
+        step = np.diff(cell)
+        repeated = (step == 0).any() if (step >= 0).all() else np.unique(cell).size != cell.size
+        if repeated:
             raise ValueError("several matches of one cell: the dense view holds one value per cell")
         intensity[mq, ms, mc] = m.intensity[sel]
         error[mq, ms, mc] = m.mz[sel] - mz[mq, mc]
         matched[mq, ms, mc] = True
+        point[mq, ms, mc] = m.point_index[sel]
 
     # Acquired: the cells the long view has (eligible; inside the scan's
     # range, or matched, which proves it was measured).
@@ -228,6 +371,12 @@ def dense_view(batch: QueryBatch, level: int, *, queries: np.ndarray | None = No
     np.logical_not(acquired, out=acquired)
     acquired &= valid[:, :, None]
     acquired &= c_valid[:, None, :]
+    if scans.gap_offsets is not None:
+        # A scan of several ranges did not acquire between them.
+        gapped = valid & (np.diff(scans.gap_offsets)[at] > 0)
+        qi, si = np.nonzero(gapped)
+        if qi.size:
+            acquired[qi, si] &= ~scans.in_gap(row[qi, si][:, None], mz[qi])
     acquired |= matched
 
     def t(a: np.ndarray, dtype_: torch.dtype | None = None) -> torch.Tensor:
@@ -250,10 +399,18 @@ def dense_view(batch: QueryBatch, level: int, *, queries: np.ndarray | None = No
         iit=t(per_slot(scans.iit, np.nan, np.float64)),
         window=t(per_slot(window_of_row, -1, np.int64)),
         parent_row=t(parent),
+        iit_imputed=t(per_slot(scans.iit_imputed, False, bool)),
+        floor=t(per_slot(scans.floor, np.nan, np.float64)),
+        centroider=t(per_slot(scans.centroider.astype(np.int64), -1, np.int64)),
+        range_known=t(per_slot(scans.range_known, False, bool)),
+        point_index=t(point),
         channel_valid=t(c_valid),
         mz=t(mz),
         abundance=t(abundance),
         **{name: t(per_channel(getattr(channels, name), pad, np.int64)) for name, pad in _CHANNEL_COLUMNS.items()},
+        overlap_group=t(_overlap_groups(mz, c_valid, batch.settings.tolerance(level))),
+        _ledger_present=scans.present,
+        centroiders=scans.centroiders,
     )
 
 

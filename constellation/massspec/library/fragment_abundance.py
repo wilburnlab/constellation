@@ -16,7 +16,8 @@ empirical one (a chromatogram library, an ``.msp``) both work.
   library's units. An ion the library's model covers and did not report
   was predicted below its floor: 0. An ion outside what it covers (an ion
   number above its last, a charge above its ceiling, a loss it does not
-  predict), or of a precursor it did not predict: NaN. The coverage is the
+  predict), or of a precursor it did not predict, or a row with a null
+  intensity (an ion named with no value): NaN. The coverage is the
   one ``predict-library`` records (``x.massspec.prediction.fragment_coverage``);
   a library without one (an empirical library) leaves absent ions NaN.
 * **Model losses**: the losses the model covers get channels at every
@@ -219,9 +220,12 @@ class LibraryFragments:
         rows = self._rows(wanted)
         report["rows"] = rows.num_rows
 
-        # Each precursor's total intensity, over every row it has.
+        # Each precursor's total intensity, over every row it has. A row
+        # with no intensity names an ion the library has no value for: not
+        # modelled (NaN), and nothing towards the total; until 2026-11-11
+        # it was 0, predicted absent (review of 2026-11-10, C10).
         r_key = rows.column("precursor_id").to_numpy()
-        r_int = rows.column("intensity_predicted").fill_null(-1.0).to_numpy(zero_copy_only=False).astype(np.float64)
+        r_int = rows.column("intensity_predicted").fill_null(np.nan).to_numpy(zero_copy_only=False).astype(np.float64)
         dense, r_dense = np.unique(r_key, return_inverse=True)
         total = np.bincount(r_dense, weights=np.where(r_int > 0, r_int, 0.0), minlength=dense.size)
 
@@ -284,7 +288,7 @@ class LibraryFragments:
             )
         whole = total[r_dense[row_of]]
         share = np.full(row_of.size, np.nan)
-        has = whole > 0
+        has = (whole > 0) & ~np.isnan(r_int[row_of])
         share[has] = np.maximum(r_int[row_of][has], 0.0) / whole[has]
         # Two rows naming one ion (a chromatogram library annotates each
         # stored peak as its nearest ion, so two peaks can name one): the ion

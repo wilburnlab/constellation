@@ -128,10 +128,15 @@ occurrence_spec: "^" INT
 // ']' and '|' (the latter is the modSingle separator) but allows any other
 // printable char including spaces. Whitespace inside payloads is preserved
 // (e.g. mass-delta '+ 0.984'); leading/trailing trim happens in the
-// transformer for name comparisons.
+// transformer for name comparisons. A formula or glycan also stops at '}',
+// which closes a labile modification: until 2026-11-11 it ran past it, so
+// '{Glycan:Hex}' and '{Formula:HPO3}' could only be read as names, kept in
+// the case they were written ('{glycan:Hex}' a different key from
+// '{Glycan:Hex}', where '[glycan:Hex]' is '[Glycan:Hex]'; review of
+// 2026-11-10, B14).
 MOD_INNER_TEXT: /[^\]\|#@\[\{\}\<\>][^\]\|#@\[\{\}\<\>]*/
-FORMULA_TEXT:   /[^\]\|][^\]\|]*/
-GLYCAN_TEXT:    /[^\]\|][^\]\|]*/
+FORMULA_TEXT:   /[^\]\|\}][^\]\|\}]*/
+GLYCAN_TEXT:    /[^\]\|\}][^\]\|\}]*/
 CHARGE_SUFFIX:  /:z[+-]?[0-9]+/i
 NAMETEXT:       /[^\)]+/
 

@@ -15,7 +15,9 @@ finds by chance. The methods (``DECOY_METHODS``):
     grow a decoy database past one decoy per target, for entrapment.
 ``reverse-c-fixed``
     The classic pseudo-reverse: everything but the C-terminal residue
-    reversed. For comparison.
+    reversed. For comparison. A sequence with an N-terminal modification
+    tied to its first residue (a side-chain ring, or any modification UNIMOD
+    places at an N-terminus only on a residue) keeps that residue first too.
 ``reverse-protein``
     Whole protein sequences reversed before digestion, as FragPipe-style
     analyses do; the decoy proteins are then digested and modified like
@@ -48,12 +50,14 @@ records its set (``PEPTIDE_TABLE.decoy_set``) and its target
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 
+from constellation.core.chem.modifications import TERMINI, UNIMOD
 from constellation.core.sequence.proforma import Peptidoform, TaggedMod, permute_peptidoform
 from constellation.core.sequence.protein import SIDE_CHAIN_CYCLIZATIONS
 
@@ -64,6 +68,34 @@ def _ring_key(tagged: TaggedMod) -> str | None:
     if mod is None or mod.accession is None:
         return None
     return f"{mod.cv or 'UNIMOD'}:{mod.accession}"
+
+
+_N_TERM_POSITIONS = ("Any N-term", "Protein N-term")
+
+
+@functools.cache
+def _residue_specific_n_term(key: str) -> bool:
+    """Whether UNIMOD places the modification ``key`` at an N-terminus only
+    on a residue: it has an N-terminal placement (``Any N-term`` /
+    ``Protein N-term``), and every one names a residue site, none the
+    ``N-term`` site itself. Such a modification is the first residue's
+    chemistry (UNIMOD:385, ammonia loss: Any N-term on C, Protein N-term on
+    S and T), so it cannot move to another residue. False for a key UNIMOD
+    does not hold."""
+    if not key.startswith("UNIMOD:") or key not in UNIMOD:
+        return False
+    placements = [s for s in UNIMOD[key].all_specificities if s.position in _N_TERM_POSITIONS]
+    return bool(placements) and all(s.site not in TERMINI for s in placements)
+
+
+def _anchors_first_residue(tagged: TaggedMod) -> bool:
+    """Whether an N-terminal modification holds the first residue in place:
+    a side-chain cyclization (:data:`SIDE_CHAIN_CYCLIZATIONS`) or any other
+    residue-specific N-terminal modification. One with no accession, or not
+    UNIMOD's, does not."""
+    key = _ring_key(tagged)
+    return key is not None and (key in SIDE_CHAIN_CYCLIZATIONS or _residue_specific_n_term(key))
+
 
 __all__ = [
     "DECOY_METHODS",
@@ -118,9 +150,10 @@ def _with_fallback(first: Callable[[int], list[int]] | None):
         if first is not None:
             order = first(n)
             if keep_first and order and order[0] != 0:
-                # The first residue's side chain is in an N-terminal ring
-                # (pyro-Glu from Q or E): it cannot move, or the decoy would
-                # carry the ring on a residue that cannot make it.
+                # An N-terminal modification is tied to the first residue (a
+                # side-chain ring, pyro-Glu from Q or E; ammonia loss from
+                # C): it cannot move, or the decoy would carry the
+                # modification on a residue that cannot make it.
                 order = _reverse_interior(n)
             yield order
         for attempt in range(MAX_ATTEMPTS):
@@ -237,18 +270,22 @@ def peptide_decoys(
     classes: dict[str, list[str]] = {}
     for seq in sorted({pf.sequence for pf in targets}):
         classes.setdefault(il_key(seq), []).append(seq)
-    # Sequences some form of which closes its first residue's side chain into
-    # an N-terminal ring: their first residue stays where it is. Under
-    # reverse-c-fixed it moved and the ring stayed at the N-terminus, on a
-    # residue that cannot make it, so the predictor refused those decoys and
-    # no target (437 of them on one test; until 2026-11-10).
-    ringed = {pf.sequence for pf in targets if any(_ring_key(t) in SIDE_CHAIN_CYCLIZATIONS for t in pf.n_term_mods)}
+    # Sequences some form of which has an N-terminal modification tied to its
+    # first residue: that residue stays where it is. Under reverse-c-fixed it
+    # moved and the modification stayed at the N-terminus, on a residue that
+    # cannot carry it, so the predictor refused those decoys and no target
+    # (437 of them on one test, until 2026-11-10, when the side-chain
+    # cyclizations were kept in place; until 2026-11-11 every other
+    # residue-specific one still moved, UNIMOD:385 on C among them, the
+    # EncyclopeDIA reader's pyro-carbamidomethyl, in 524 of 32,683 decoys:
+    # review of 2026-11-10, B10).
+    anchored = {pf.sequence for pf in targets if any(_anchors_first_residue(t) for t in pf.n_term_mods)}
     chosen: dict[str, list[int] | None] = {}  # target sequence → order (None: dropped)
     n_fallback = n_dropped = 0
     for members in classes.values():
         seq = members[0]
         pick = None
-        keep_first = any(m in ringed for m in members)
+        keep_first = any(m in anchored for m in members)
         for attempt, order in enumerate(method.orders(seq, decoy_set.index, decoy_set.seed, keep_first)):
             candidate = il_key("".join(seq[k] for k in order))
             if candidate not in taken:

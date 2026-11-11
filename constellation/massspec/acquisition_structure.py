@@ -119,40 +119,207 @@ def parent_scans(
     Not every instrument records the master scan: the lab's Stellar DIA run
     RF30 records none for any of its 234,000 MS2 scans, which come exactly
     100 to an MS1 scan, so the derived parent is the usual case.
+
+    A recorded master scan is taken only if it is a scan of the run, earlier,
+    one level down and at the same voltage; otherwise the derived parent
+    stands (until 2026-11-11 any number above 0 was taken: the scan itself,
+    a later one, one not in the run). Voltages group scans only when there
+    are several; a scan recorded without one serves every group, so a run
+    that records its voltage on MS2 alone still finds MS1 parents (it found
+    none; review A10).
     """
     scan = np.asarray(scan, dtype=np.int64)
     level = np.asarray(level, dtype=np.int64)
     parent = np.full(scan.size, -1, dtype=np.int64)
-    if faims_cv is None:
+    if scan.size == 0:
+        return parent
+    cv = None if faims_cv is None else np.asarray(faims_cv, dtype=np.float64)
+    voltages = np.unique(cv[~np.isnan(cv)]) if cv is not None else np.empty(0)
+    if voltages.size <= 1:
         cv_group = np.zeros(scan.size, np.int64)
+        free = np.zeros(scan.size, bool)
     else:
-        cv = np.asarray(faims_cv, dtype=np.float64)
-        # NaN (no voltage) is a group of its own.
-        _, cv_group = np.unique(np.where(np.isnan(cv), np.inf, cv), return_inverse=True)
-        cv_group = cv_group.reshape(-1)
-    for group in np.unique(cv_group):
-        in_group = cv_group == group
+        free = np.isnan(cv)
+        cv_group = np.where(free, -1, np.searchsorted(voltages, np.where(free, voltages[0], cv)))
+    groups = np.unique(cv_group[~free]) if (~free).any() else np.array([0])
+    for group in groups:
+        in_group = (cv_group == group) | free
         for lvl in np.unique(level[(level > 1) & in_group]):
             below = np.flatnonzero((level == lvl - 1) & in_group)
-            at = np.flatnonzero((level == lvl) & in_group)
-            if below.size:
+            at = np.flatnonzero((level == lvl) & (cv_group == group) if voltages.size > 1 else (level == lvl))
+            if below.size and at.size:
                 # Rows are in scan order, so the last lower-level row before
                 # each scan is found by position.
+                before = np.searchsorted(below, at, side="left") - 1
+                ok = before >= 0
+                parent[at[ok]] = scan[below[before[ok]]]
+    if voltages.size > 1 and free.any():
+        # A higher-level scan without a voltage: the last scan below at all.
+        for lvl in np.unique(level[(level > 1) & free]):
+            below = np.flatnonzero(level == lvl - 1)
+            at = np.flatnonzero((level == lvl) & free)
+            if below.size:
                 before = np.searchsorted(below, at, side="left") - 1
                 ok = before >= 0
                 parent[at[ok]] = scan[below[before[ok]]]
     if recorded is not None:
         given = np.asarray(recorded, dtype=np.float64)
         ok = (level > 1) & ~np.isnan(given) & (given > 0)
-        parent[ok] = given[ok].astype(np.int64)
+        claimed = np.where(ok, given, 0).astype(np.int64)
+        # Rows are in scan order: find each recorded scan among them.
+        pos = np.searchsorted(scan, claimed)
+        pos_c = np.minimum(pos, max(scan.size - 1, 0))
+        exists = ok & (pos < scan.size) & (scan[pos_c] == claimed) if scan.size else ok
+        exists &= claimed < scan
+        exists &= level[pos_c] == level - 1
+        if voltages.size > 1:
+            same = (cv_group[pos_c] == cv_group) | free[pos_c] | free
+            exists &= same
+        parent[exists] = claimed[exists]
     return parent
+
+
+def unsupported(scan_metadata: pa.Table) -> list[str]:
+    """Why a run cannot be read scan by scan as one acquisition, as
+    sentences (none: it can): several FAIMS compensation voltages, whose
+    scans a window keyed by isolation bounds would mix; multiplexed (MSX)
+    isolation, several precursors a scan where a scan holds one window.
+    The one test for the sweep, the browser and the ``.dia`` export
+    (review A13: the export did not test MSX, the browser neither)."""
+    out = []
+    names = set(scan_metadata.column_names)
+    if "faims_cv" in names:
+        cv = scan_metadata.column("faims_cv").cast(pa.float64()).fill_null(np.nan).to_numpy(zero_copy_only=False)
+        seen = np.unique(cv[~np.isnan(cv)])
+        if seen.size > 1:
+            out.append(
+                f"it is a multi-CV FAIMS run (compensation voltages {', '.join(f'{v:g}' for v in seen)}), "
+                "which is not separated by voltage yet; split it by CV first"
+            )
+    if "filter_string" in names:
+        filters = scan_metadata.column("filter_string")
+        msx = pc.fill_null(pc.match_substring_regex(filters, r"(^|\s)msx(\s|$)"), False)
+        if pc.any(msx).as_py():
+            out.append(
+                f"it has {pc.sum(msx).as_py():,} multiplexed (MSX) scans, each isolating several precursors, "
+                "where a scan holds one isolation window"
+            )
+    return out
+
+
+def refuse_unsupported(scan_metadata: pa.Table, where: str) -> None:
+    """Raise if the run is one :func:`unsupported` names a reason for."""
+    reasons = unsupported(scan_metadata)
+    if reasons:
+        raise ValueError(f"{where}: " + "; and ".join(reasons))
+
+
+def impute_injection_times(
+    level: np.ndarray, iit: np.ndarray, tic: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Injection times (ms) with the ones a run did not record estimated,
+    and which were (``(iit, imputed)``).
+
+    A scan's injection time is about the time its ion target took to fill:
+    ``IIT = 1000 · N / TIC``, with ``N`` the level's median of
+    ``IIT × TIC / 1000`` over the scans that record both, capped at the
+    level's longest recorded time (the method's maximum). A scan with no TIC
+    keeps NaN and is not flagged; so does a level with nothing to take ``N``
+    from. On RF30, hiding the recorded times gave back estimates within
+    25 % on 86 % of MS1 and 84 % of MS2 scans (island spec, decision E,
+    ``docs/plans/profile-and-peak-lists.md``). 13.2 % of RF30's scans record
+    none, and a count term was NaN on all of them (review S4)."""
+    level = np.asarray(level)
+    iit = np.asarray(iit, dtype=np.float64).copy()
+    tic = np.asarray(tic, dtype=np.float64)
+    imputed = np.zeros(iit.size, bool)
+    for lvl in np.unique(level):
+        at = level == lvl
+        both = at & np.isfinite(iit) & np.isfinite(tic) & (tic > 0) & (iit > 0)
+        missing = at & ~np.isfinite(iit) & np.isfinite(tic) & (tic > 0)
+        if not both.any() or not missing.any():
+            continue
+        n = float(np.median(iit[both] * tic[both] / 1000.0))
+        cap = float(iit[both].max())
+        iit[missing] = np.minimum(1000.0 * n / tic[missing], cap)
+        imputed[missing] = True
+    return iit, imputed
+
+
+def acquired_ranges(scan_metadata: pa.Table, *, level: int = 2) -> pa.Table:
+    """The m/z range each isolation window of ``level`` acquired: one row
+    per window (``isolation_lower`` / ``isolation_upper``, compared exactly,
+    as the sweep keys windows; both null for scans without bounds) with
+    ``scan_window_lower`` / ``scan_window_upper``: the range its scans
+    record when they all agree, else their envelope (``agree`` says which),
+    and null when any of its scans records none (a bundle before scan
+    metadata v3, an import that wrote none). ``n_scans`` counts them. What
+    ``sweep.compile_queries`` chooses fragment channels within
+    (``acquired_ranges=``; review of 2026-11-10, C6)."""
+    names = set(scan_metadata.column_names)
+    rows = scan_metadata.filter(pc.equal(scan_metadata.column("level"), level))
+
+    def col(name: str) -> np.ndarray:
+        if name not in names:
+            return np.full(rows.num_rows, np.nan)
+        return rows.column(name).cast(pa.float64()).fill_null(np.nan).to_numpy(zero_copy_only=False)
+
+    ilo, ihi = col("isolation_lower"), col("isolation_upper")
+    slo, shi = col("scan_window_lower"), col("scan_window_upper")
+    free = np.isnan(ilo) | np.isnan(ihi)
+    key = np.stack([np.where(free, -np.inf, ilo), np.where(free, -np.inf, ihi)], axis=1)
+    if rows.num_rows:
+        pairs, inverse = np.unique(key, axis=0, return_inverse=True)
+        inverse = inverse.reshape(-1)
+    else:
+        pairs, inverse = np.empty((0, 2)), np.empty(0, np.int64)
+    w = len(pairs)
+    known = ~(np.isnan(slo) | np.isnan(shi))
+    n_scans = np.bincount(inverse, minlength=w)
+    all_known = np.bincount(inverse, weights=known.astype(np.float64), minlength=w) == n_scans
+    lo_min, lo_max = np.full(w, np.inf), np.full(w, -np.inf)
+    hi_min, hi_max = np.full(w, np.inf), np.full(w, -np.inf)
+    np.minimum.at(lo_min, inverse[known], slo[known])
+    np.maximum.at(lo_max, inverse[known], slo[known])
+    np.minimum.at(hi_min, inverse[known], shi[known])
+    np.maximum.at(hi_max, inverse[known], shi[known])
+    unbounded = pairs[:, 0] == -np.inf if w else np.zeros(0, bool)
+    return pa.table(
+        {
+            "isolation_lower": pa.array(np.where(unbounded, np.nan, pairs[:, 0] if w else []), pa.float64(),
+                                        mask=unbounded),  # fmt: skip
+            "isolation_upper": pa.array(np.where(unbounded, np.nan, pairs[:, 1] if w else []), pa.float64(),
+                                        mask=unbounded),  # fmt: skip
+            "scan_window_lower": pa.array(lo_min, pa.float64(), mask=~all_known),
+            "scan_window_upper": pa.array(hi_max, pa.float64(), mask=~all_known),
+            "agree": pa.array(all_known & (lo_min == lo_max) & (hi_min == hi_max), pa.bool_()),
+            "n_scans": pa.array(n_scans.astype(np.int64), pa.int64()),
+        }
+    )
+
+
+def read_acquired_ranges(bundle, *, level: int = 2) -> pa.Table:
+    """:func:`acquired_ranges` of a converted bundle's scan metadata."""
+    from pathlib import Path
+
+    import pyarrow.parquet as pq
+
+    path = Path(bundle) / "scan_metadata.parquet"
+    wanted = ["level", "isolation_lower", "isolation_upper", "scan_window_lower", "scan_window_upper"]
+    present = [c for c in wanted if c in pq.read_schema(path).names]
+    return acquired_ranges(pq.read_table(path, columns=present), level=level)
 
 
 __all__ = [
     "MIN_VISITS_PER_DIA_WINDOW",
     "AcquisitionStructure",
     "AcquisitionType",
+    "acquired_ranges",
+    "impute_injection_times",
     "infer_acquisition_structure",
     "isolation_windows",
     "parent_scans",
+    "read_acquired_ranges",
+    "refuse_unsupported",
+    "unsupported",
 ]

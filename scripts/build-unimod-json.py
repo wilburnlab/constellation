@@ -24,6 +24,16 @@ Each modification record carries:
     avge_mass          XML's umod:delta @avge_mass.
     mass_override      mono_mass when it disagrees with the light-skeleton
                        composition mass beyond LIGHT_HEAVY_TOL Da; else None.
+    heavy_atoms        {isotope: int_count} — the heavy isotopes the XML
+                       lists (``13C(6) 15N(2)`` → {"13C": 6, "15N": 2};
+                       ``D`` spelled ``2H``), each also counted under its
+                       light element in delta_composition. They are fixed
+                       isotopes, not distributed, so an isotope envelope
+                       leaves them out of the natural-abundance atoms.
+                       Empty for a modification with none. Added
+                       2026-11-11 (schema 3): until then the envelope gave
+                       SILAC / TMT atoms natural variance (review of
+                       2026-11-10, C8).
     aliases            (title,) plus any hand-curated short-codes.
     description        empty by default; filled where UNIMOD ships notes.
 
@@ -213,14 +223,19 @@ def _parse_one(elem: ET.Element, atom_masses: dict[str, float]) -> dict | None:
     mono = float(mono)
     avge = float(avge) if avge is not None else None
 
-    # Build the light-skeleton composition from <umod:element> children.
+    # Build the light-skeleton composition from <umod:element> children,
+    # keeping the heavy isotopes apart as well.
     comp: dict[str, int] = {}
+    heavy: dict[str, int] = {}
     for child in delta.findall(f"{_NS}element"):
         sym = child.get("symbol", "")
         n = int(child.get("number", "0"))
         if not sym or n == 0:
             continue
         _add_into(comp, _resolve_element(sym), n)
+        if sym in _HEAVY_TO_LIGHT:
+            label = "2H" if sym == "D" else sym
+            heavy[label] = heavy.get(label, 0) + n
 
     light_mass = sum(atom_masses.get(s, 0.0) * c for s, c in comp.items())
     is_heavy = abs(light_mass - mono) > LIGHT_HEAVY_TOL
@@ -270,6 +285,7 @@ def _parse_one(elem: ET.Element, atom_masses: dict[str, float]) -> dict | None:
         "mono_mass": mono,
         "avge_mass": avge,
         "mass_override": mass_override,
+        "heavy_atoms": {label: count for label, count in heavy.items() if count},
         "aliases": list(aliases),
         "specificities": specs,
         "description": "",
@@ -291,7 +307,8 @@ def build(repo_root: Path) -> dict:
             mods.append(rec)
     return {
         # 2: every specificity, with hidden / classification / neutral_losses.
-        "schema_version": "2",
+        # 3: each modification's heavy_atoms.
+        "schema_version": "3",
         "source": {
             "xml": "https://www.unimod.org/xml/unimod.xml",
             "vendored_at": "constellation/data/_raw/unimod.xml",

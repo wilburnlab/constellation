@@ -256,3 +256,157 @@ def test_a_gated_reducer_gets_the_dense_view_of_the_queries_it_sees(tmp_root):
     assert 0 < len(kept) < len(set(every.column("query").to_pylist()))
     sub = every.filter(pc.is_in(every.column("query"), pa.array(sorted(kept), pa.int64())))
     assert _sorted(got.rename_columns(sub.column_names)).equals(_sorted(sub))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Review 2026-11-10: V1, V2, V4–V8, S10, D11
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _probe(bundle, plan, settings=None, **kw):
+    """Run one sweep with a reducer that keeps its batches."""
+    seen: list = []
+
+    class Probe:
+        name, schema, gated, zero_fills = "probe", pa.schema([("n", pa.int64())]), False, True
+
+        def reduce(self, batch):
+            seen.append(batch)
+            return pa.table({"n": [0]}, schema=self.schema)
+
+    sweep(bundle, plan, settings or SweepSettings(tolerances=_TOL), reducers=[Probe()], **kw)
+    return seen
+
+
+def test_observed_is_nan_wherever_nothing_was_measured(tmp_root):
+    run, bundle = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    batch = _probe(bundle, plan)[0]
+    d = batch.dense(2)
+    obs = d.observed()
+    acquired = d.acquired
+    assert (~acquired).any() and acquired.any()
+    assert torch.isnan(obs[~acquired]).all()
+    assert torch.equal(obs[acquired], d.intensity[acquired])  # a zero that was measured stays zero
+    assert (obs[acquired & ~d.matched] == 0).all()
+
+
+def test_dense_refuses_queries_out_of_order_repeated_or_foreign_and_odd_dtypes(tmp_root):
+    run, bundle = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    batch = _probe(bundle, plan)[0]
+    qs = batch.queries
+    assert qs.size >= 3
+    for bad in (qs[[2, 0]], qs[[0, 0]], np.array([qs.max() + 1000])):
+        with pytest.raises(ValueError, match="dense\\(queries"):
+            batch.dense(2, queries=bad)
+    with pytest.raises(ValueError, match="float32 or float64"):
+        batch.dense(2, dtype=torch.float16)
+
+
+def test_a_query_at_a_time_gives_the_same_tensors(tmp_root):
+    """Selecting a chunk's matches by search (V7) changes nothing."""
+    run, bundle = _run("staggered", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
+    batch = _probe(bundle, plan)[0]
+    for level in (1, 2):
+        whole = batch.dense(level, dtype=torch.float64)
+        for i, q in enumerate(batch.queries):
+            one = batch.dense(level, queries=np.array([q]), dtype=torch.float64)
+            n = int(one.n_slots[0])
+            assert n == int(whole.n_slots[i])
+            for name in ("intensity", "matched", "acquired", "point_index"):
+                a, b = getattr(one, name)[0, :n], getattr(whole, name)[i, :n, : one.shape[2]]
+                assert torch.equal(torch.nan_to_num(a.to(torch.float64)), torch.nan_to_num(b.to(torch.float64))), name
+
+
+def test_point_index_is_the_matched_points_position(tmp_root):
+    run, bundle = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    batch = _probe(bundle, plan)[0]
+    d = batch.dense(2)
+    cells = batch.cells(2, fill=False)
+    pi = d.point_index.numpy()
+    assert (pi[~d.matched.numpy()] == -1).all()
+    assert (pi[d.matched.numpy()] >= 0).all()
+    assert sorted(pi[d.matched.numpy()].tolist()) == sorted(cells.point_index.tolist())
+    summed = _probe(bundle, plan, SweepSettings(tolerances=_TOL, rule=SumWithin()))[0].dense(2)
+    assert (summed.point_index.numpy()[summed.matched.numpy()] >= -1).all()
+
+
+def test_a_reducer_that_builds_dense_views_must_declare_zero_fills(tmp_root):
+    """Its buckets are sized by matches alone otherwise (V6)."""
+    run, bundle = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+
+    class Undeclared:
+        name, schema, gated = "undeclared", pa.schema([("n", pa.int64())]), False
+
+        def reduce(self, batch):
+            batch.dense(2)
+            return pa.table({"n": [0]}, schema=self.schema)
+
+    with pytest.raises(ValueError, match="zero_fills"):
+        sweep(bundle, plan, SweepSettings(tolerances=_TOL), reducers=[Undeclared()])
+
+
+def test_parent_reasons_and_brackets(tmp_path):
+    """Why a slot has no parent (V8), and the MS1 slots either side of it."""
+    from constellation.massspec.sweep.dense import PARENT_FOUND, PARENT_OFF_AXIS, PARENT_UNREAD
+
+    run = planted_run(acquisition="dia", cycles=30, window_width=100.0)
+    scans = [dict(s) for s in run.scans]
+    ms1 = [i for i, s in enumerate(scans) if s["level"] == 1]
+    emptied = scans[ms1[len(ms1) // 2]]
+    emptied["mz"], emptied["intensity"] = np.empty(0), np.empty(0)
+    bundle = write_bundle_manifest(write_bundle(tmp_path, "reasons", scans))
+    rows = _targets(run).to_pylist()
+    # One query whose interval opens just after an MS1 scan: its first MS2
+    # slots' parent is in the run but not on its MS1 axis.
+    opens = scans[ms1[5]]["rt"] + 1e-3
+    rows.append(dict(rows[0], target_id=777, rt_center=None, rt_start=opens, rt_end=opens + 40.0))
+    plan = compile_queries(pa.Table.from_pylist(rows, schema=XIC_TARGET_TABLE), levels=[1, 2], rt_window=20.0)
+    batch = _probe(bundle, plan)[0]
+    d1, d2 = batch.dense(1), batch.dense(2)
+    slots, why = d2.parent_slots(d1, reasons=True)
+    valid = d2.slot_valid.numpy()
+    why = why.numpy()
+    assert (why[~valid] == -1).all()
+    assert ((why == PARENT_FOUND) == (slots.numpy() >= 0)).all()
+    # An empty MS1 scan is a slot of zeros: the MS2 scans after it find it.
+    emptied_slots = d1.scan.numpy() == emptied["scan"]
+    assert emptied_slots.any()
+    children = d2.parent_row.numpy() == batch.scans.rows_of(np.array([emptied["scan"]]))[0]
+    assert children.any() and (why[children] == PARENT_FOUND).all()
+    assert (why == PARENT_OFF_AXIS).any()  # at the edges of a query's interval
+    b = d2.brackets(d1)
+    rt1, rt2 = d1.rt.numpy(), d2.rt.numpy()
+    qi, si = np.nonzero(b.inside.numpy())
+    left, right = b.left.numpy()[qi, si], b.right.numpy()[qi, si]
+    assert (rt1[qi, left] <= rt2[qi, si]).all() and (rt2[qi, si] <= rt1[qi, right]).all()
+    w = b.weight.numpy()[qi, si]
+    assert ((w >= 0) & (w <= 1)).all()
+    # A sweep of part of the run: the first MS2 scans' parents were not read.
+    first_ms2 = next(i for i, s in enumerate(scans) if s["level"] == 2 and i > ms1[len(ms1) // 2 + 2])
+    ranged = _probe(bundle, plan, scan_range=(scans[first_ms2]["scan"], scans[-1]["scan"]))[0]
+    _, why_r = ranged.dense(2).parent_slots(ranged.dense(1), reasons=True)
+    assert (why_r.numpy() == PARENT_UNREAD).any()
+
+
+def test_overlapping_channels_share_a_group(tmp_root):
+    run, bundle = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[2], rt_window=20.0)
+    wide = SweepSettings(tolerances={1: (20.0, "ppm"), 2: (5.0, "Da")})
+    batch = _probe(bundle, plan, wide)[0]
+    d = batch.dense(2)
+    group, mz, ok = d.overlap_group.numpy(), d.mz.numpy(), d.channel_valid.numpy()
+    assert (group[~ok] == -1).all()
+    for q in range(group.shape[0]):
+        idx = np.flatnonzero(ok[q])
+        by = idx[np.argsort(mz[q, idx], kind="stable")]
+        for a, b in zip(by[:-1], by[1:]):
+            same = abs(mz[q, b] - mz[q, a]) <= 10.0
+            assert (group[q, a] == group[q, b]) == same
+        for g in np.unique(group[q, idx]):
+            assert g == idx[group[q, idx] == g].min()
+    assert (group[ok] != np.nonzero(ok)[1]).any()  # some channels are not alone at 5 Da

@@ -27,7 +27,13 @@ from constellation.core.io.schemas import register_schema
 #: 5 (2026-11-09): ``decoy_set`` on queries and the query summary; ``source_query`` on queries.
 #: 6 (2026-11-10): the scan ledger carries each scan's acquired m/z range and
 #: its parent scan; a cell outside its scan's range is not zero-filled.
-SWEEP_SCHEMA_VERSION: int = 6
+#: 7 (2026-11-11): the scan ledger carries each scan's stored point count and
+#: whether the sweep read it; a scan read with no points is a slot of zeros
+#: (it was a gap). It also carries each scan's injection time imputed or not,
+#: its intensity floor and where that came from, its centroider, and the
+#: ranges of a scan acquired over several (a cell between them is not
+#: acquired).
+SWEEP_SCHEMA_VERSION: int = 7
 
 
 def _meta(name: str) -> dict[bytes, bytes]:
@@ -111,6 +117,25 @@ SWEEP_SCAN_TABLE: pa.Schema = pa.schema(
         # The scan one level down it was taken from (recorded, or derived:
         # ``acquisition_structure.parent_scans``); null for none.
         pa.field("parent_scan", pa.int32(), nullable=True),
+        # The points the bundle holds for the scan (scan metadata's
+        # ``peak_count``); null where it does not say.
+        pa.field("peak_count", pa.int64(), nullable=True),
+        # Whether the sweep read the scan (inside its scan or RT range).
+        pa.field("read", pa.bool_(), nullable=False),
+        # Whether ``iit`` was estimated from the TIC, not recorded.
+        pa.field("iit_imputed", pa.bool_(), nullable=False),
+        # The scan's lowest stored intensity; null where unknown. Its source:
+        # 0 none, 1 recorded in the bundle, 2 found by the map.
+        pa.field("intensity_floor", pa.float64(), nullable=True),
+        pa.field("floor_source", pa.int8(), nullable=False),
+        # What made the scan's peaks (scan metadata's ``centroider``).
+        pa.field("centroider", pa.string(), nullable=True),
+        # Every range of a scan acquired over several; null for one range.
+        pa.field(
+            "scan_windows",
+            pa.list_(pa.struct([pa.field("lower", pa.float64()), pa.field("upper", pa.float64())])),
+            nullable=True,
+        ),
     ],
     metadata=_meta("SweepScan"),
 )

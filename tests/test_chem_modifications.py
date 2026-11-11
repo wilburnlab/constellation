@@ -388,3 +388,20 @@ def test_schema_1_vocab_files_still_load(tmp_path):
     mod = ModVocab.load(path)["CUSTOM:x"]
     assert mod.specificities == (Specificity(position="Anywhere", site="K"),)
     assert mod.hidden_specificities == ()
+    assert dict(mod.heavy_atoms) == {}  # schema 3's field, absent before
+
+
+def test_unimod_keeps_the_heavy_isotopes_each_modification_names(tmp_path):
+    """Review of 2026-11-10, C8: the build folded 13C / 15N into C / N and
+    kept no record of them, so an envelope gave them natural variance.
+    Every modification whose mass is not its skeleton's names them, and
+    no other does."""
+    assert dict(UNIMOD["UNIMOD:259"].heavy_atoms) == {"13C": 6, "15N": 2}  # SILAC K +8
+    assert dict(UNIMOD["UNIMOD:737"].heavy_atoms) == {"13C": 4, "15N": 1}  # TMT6plex
+    assert dict(UNIMOD["UNIMOD:4"].heavy_atoms) == {}
+    assert all(bool(m.heavy_atoms) == (m.mass_override is not None) for m in UNIMOD)
+    sub = UNIMOD.subset(["UNIMOD:259", "UNIMOD:35"])
+    sub.save(tmp_path / "vocab.json")
+    reloaded = ModVocab.load(tmp_path / "vocab.json")
+    assert reloaded["UNIMOD:259"].heavy_atoms == sub["UNIMOD:259"].heavy_atoms
+    assert reloaded["UNIMOD:259"] == sub["UNIMOD:259"] and hash(reloaded["UNIMOD:259"]) == hash(sub["UNIMOD:259"])

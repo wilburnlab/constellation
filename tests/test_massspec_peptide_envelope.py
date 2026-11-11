@@ -148,3 +148,40 @@ def test_batched_envelopes_are_the_single_ones_to_the_bit():
         m, a = neutral_envelope(p, n_peaks=6, normalize="full")
         assert np.array_equal(m.numpy().view(np.int64), masses[i].view(np.int64)), texts[i]
         assert np.abs(a.numpy() - shares[i]).max() < 1e-6
+
+
+@pytest.mark.parametrize("mode", ["binned", "exact"])
+@pytest.mark.parametrize(
+    "text, heavy",
+    [("LVNELTEFAK[UNIMOD:259]", {"C": 6, "N": 2}),  # SILAC 13C(6) 15N(2) lysine
+     ("[UNIMOD:737]-PEPTIDEK[UNIMOD:737]", {"C": 8, "N": 2})],  # TMT6plex 13C(4) 15N, twice
+)  # fmt: skip
+def test_the_heavy_atoms_of_silac_and_tmt_are_one_isotope_each(mode, text, heavy):
+    """Review of 2026-11-10, C8: the envelope gave a SILAC or TMT label's
+    heavy atoms natural variance (M+0's share 7-9 % low, M+2's 11-16 %
+    high). They are fixed isotopes: the shape is the other atoms', the m/z
+    as before."""
+    import numpy as np
+
+    from constellation.core.chem.composition import Composition
+    from constellation.core.chem.elements import ELEMENTS
+    from constellation.core.chem.isotopes import isotope_envelope_exact
+    from constellation.core.sequence.protein import peptide_mass
+    from constellation.massspec.peptide.envelope import neutral_envelope, neutral_envelopes
+
+    p = parse_proforma(text)
+    counts = peptide_composition(p).counts.clone()
+    for symbol, n in heavy.items():
+        counts[ELEMENTS.index(symbol)] -= n
+    natural = Composition(counts)
+    masses, shares = neutral_envelope(p, n_peaks=4, mode=mode)
+    _, want = isotope_envelope(natural, n_peaks=4) if mode == "binned" else isotope_envelope_exact(natural, n_peaks=4)
+    np.testing.assert_allclose(shares.numpy(), want.numpy(), rtol=1e-12)
+    _, as_natural = (isotope_envelope(peptide_composition(p), n_peaks=4) if mode == "binned"
+                     else isotope_envelope_exact(peptide_composition(p), n_peaks=4))  # fmt: skip
+    assert float(shares[0]) > float(as_natural[0]) * 1.05  # what it was: M+0 several per cent low
+    assert math.isclose(float(masses[0]), peptide_mass(p), abs_tol=1e-9)
+    if mode == "binned":
+        _, batched = neutral_envelopes([p], n_peaks=4)
+        _, full = neutral_envelope(p, n_peaks=4, normalize="full")
+        np.testing.assert_allclose(batched[0], full.numpy(), atol=1e-6)

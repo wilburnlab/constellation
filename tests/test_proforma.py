@@ -151,12 +151,64 @@ def test_parse_global_fixed_mod():
 def test_parse_labile_mod():
     p = parse_proforma("{Glycan:Hex}PEPTIDE")
     assert len(p.labile_mods) == 1
-    # The current parser captures `Glycan:Hex` as the labile mod payload;
-    # the discriminated union splits at the colon-prefix stage of the
-    # name. Validate that *something* was captured rather than asserting
-    # the exact field — the exact glycan-payload routing is a follow-up.
+    # A glycan payload, as in brackets (until 2026-11-11 the name `Glycan:Hex`).
     mref = p.labile_mods[0]
-    assert mref.name == "Glycan:Hex" or mref.glycan == "Hex"
+    assert (mref.cv, mref.glycan) == ("Glycan", "Hex")
+
+
+@pytest.mark.parametrize(
+    ("spelling", "canonical"),
+    [
+        ("{glycan:Hex}PEPTIDE", "{Glycan:Hex}PEPTIDE"),
+        ("{GLYCAN:Hex}PEPTIDE", "{Glycan:Hex}PEPTIDE"),
+        ("{formula:HPO3}PEPTIDE", "{Formula:HPO3}PEPTIDE"),
+        ("{info:in source}PEPTIDE", "{INFO:in source}PEPTIDE"),
+        ("{Hex}PEPTIDE", "{Hex}PEPTIDE"),  # a name is kept as it is
+    ],
+)
+def test_a_labile_modifications_prefix_is_read_in_any_case_as_in_brackets(spelling, canonical):
+    """Until 2026-11-11 a formula or glycan in braces ran past the closing
+    brace, so `{Glycan:Hex}` and `{glycan:Hex}` were two names, not one
+    glycan, where `[glycan:Hex]` is `[Glycan:Hex]` (review of 2026-11-10,
+    B14)."""
+    assert parse_proforma(spelling) == parse_proforma(canonical)
+    assert format_proforma(parse_proforma(spelling)) == canonical
+
+
+def test_a_labile_formula_counts_in_the_mass_as_one_in_brackets():
+    (formula,) = parse_proforma("{Formula:HPO3}PEPTIDE").labile_mods
+    assert (formula.cv, formula.formula) == ("Formula", "HPO3")
+    assert peptide_mass(parse_proforma("{formula:HPO3}PEPTIDE")) == pytest.approx(
+        peptide_mass(parse_proforma("PEPT[Formula:HPO3]IDE")), abs=1e-9
+    )
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "PEPT[Phospho#G1]S[#g1]IDEK[Phospho#g1]",  # #G1 is #g1 since case folding
+        "PEPT[Phospho#g1]S[#g1]IDEK[Phospho#g1]",
+        "PEPT[Phospho#g1]S[Oxidation#g1]IDEK",
+    ],
+)
+def test_an_ambiguity_group_declaring_its_modification_twice_has_no_mass(spelling):
+    """Until 2026-11-11 the second declaration was dropped from the mass
+    (1094.45 Da, one phosphate, where the string could mean two; review of
+    2026-11-10, B12). The string is still read and written as it is."""
+    p = parse_proforma(spelling)
+    assert parse_proforma(format_proforma(p)) == p
+    with pytest.raises(ValueError, match="ambiguity group #g1 declares its modification on more than one member"):
+        peptide_mass(p)
+    with pytest.raises(ValueError, match="#g1"):
+        peptide_composition(p)
+
+
+def test_a_group_declaring_its_modification_once_or_a_cross_link_on_both_ends_counts_it_once():
+    one = peptide_mass(parse_proforma("PEPT[Phospho]SIDEK"))
+    assert peptide_mass(parse_proforma("PEPT[Phospho#g1]S[#g1]IDEK")) == pytest.approx(one, abs=1e-9)
+    assert peptide_mass(parse_proforma("PEPT[Phospho#G1]S[#g1]IDEK")) == pytest.approx(one, abs=1e-9)
+    acetyl = peptide_mass(parse_proforma("PEPK[Acetyl#XL1]TIDEK[#XL1]"))
+    assert peptide_mass(parse_proforma("PEPK[Acetyl#XL1]TIDEK[Acetyl#XL1]")) == acetyl
 
 
 def test_parse_info_tag():

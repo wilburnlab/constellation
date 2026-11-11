@@ -102,7 +102,7 @@ def _ledger(bundle: Path, layout: PrecursorMajor, window: tuple[int, int] | None
     the sweep reads (all levels, in the range when there is one)."""
     from constellation.massspec.sweep.engine import _scan_metadata
 
-    ledger = _scan_metadata(bundle)
+    ledger = _scan_metadata(bundle, window)
     counts = layout.scans()
     scan = counts.column("scan").to_numpy().astype(np.int64)
     n = counts.column("n_points").to_numpy().astype(np.int64)
@@ -263,11 +263,12 @@ def _row_group_ranges(f: pq.ParquetFile, column: str) -> list[tuple[Any, Any]]:
 
 
 def _eligible_scans(plan: QueryPlan, ledger: Ledger, level: int, window, scans_of_windows=None) -> np.ndarray:
-    """Scan numbers of ``level`` the unit can be matched in: with points and
-    a time, in the range, inside the span of its queries' intervals, and
-    (when given) in one of ``scans_of_windows`` (ledger rows)."""
+    """Scan numbers of ``level`` the unit can be matched in: slots (with
+    points, or read and empty) with a time, in the range, inside the span
+    of its queries' intervals, and (when given) in one of
+    ``scans_of_windows`` (ledger rows)."""
     has = plan.channels_for_level(level).counts() > 0
-    rows = np.flatnonzero((ledger.level == level) & (ledger.n_points > 0) & ~np.isnan(ledger.rt)) \
+    rows = np.flatnonzero((ledger.level == level) & ledger.present & ~np.isnan(ledger.rt)) \
         if scans_of_windows is None else scans_of_windows  # fmt: skip
     if not has.any():
         return np.empty(0, np.int64)
@@ -334,7 +335,11 @@ def _read_fragment_level(layout: PrecursorMajor, plan: QueryPlan, ledger: Ledger
     scan = t.column("scan").to_numpy().astype(np.int64)
     starts = np.flatnonzero(np.r_[True, scan[1:] != scan[:-1]])
     point = np.arange(scan.size, dtype=np.int64) - np.repeat(starts, np.diff(np.r_[starts, scan.size]))
-    return scan, t.column("mz").to_numpy(), t.column("intensity").to_numpy(), point
+    intensity = t.column("intensity").to_numpy()
+    # A fragment scan is read whole: its lowest point is its floor, where
+    # the bundle records none (MS1 is read in m/z slices, so has none here).
+    ledger.fill_floor(ledger.rows_of(scan[starts]), np.minimum.reduceat(intensity.astype(np.float64), starts))
+    return scan, t.column("mz").to_numpy(), intensity, point
 
 
 def _ms1_intervals(plan: QueryPlan, settings, axis) -> np.ndarray:
@@ -579,6 +584,7 @@ def sweep_precursor_major(source, plan: QueryPlan, settings, reducers: Sequence,
         _Inline,
         _init_worker,
         _load_axis,
+        stop_pool,
         outputs_of,
         own_dir,
     )
@@ -614,31 +620,36 @@ def sweep_precursor_major(source, plan: QueryPlan, settings, reducers: Sequence,
         done: dict[int, dict[str, str]] = {}
         emit_start(progress, "sweep: precursor-major", total=len(units))
         with pool as executor:
-            # Tasks are taken from the plan as they are sent, a few ahead of
-            # the workers, so the parent never holds the plan twice.
-            pending: dict[Any, list[int]] = {}
-            ahead = max(2 * workers, 1)
-            next_task = 0
-            while next_task < len(tasks) or pending:
-                while next_task < len(tasks) and len(pending) < ahead:
-                    members = tasks[next_task]
-                    sizes = np.array([units[i].size for i in members], np.int64)
-                    edges = np.r_[0, np.cumsum(sizes)]
-                    group = plan.take(np.concatenate([units[i] for i in members]))
-                    future = executor.submit(_group_task, str(bundle), str(work), members[0], group,
-                                             list(zip(edges[:-1].tolist(), edges[1:].tolist())), settings,
-                                             tuple(reducers), window, sweep_id, layout)  # fmt: skip
-                    pending[future] = members
-                    next_task += 1
-                finished, _ = wait(list(pending), return_when=FIRST_COMPLETED)
-                for future in finished:
-                    for i, parts in zip(pending.pop(future), future.result(), strict=True):
-                        done[i] = parts
-                    emit_progress(progress, "sweep: precursor-major", len(done), len(units))
+            try:
+                # Tasks are taken from the plan as they are sent, a few ahead of
+                # the workers, so the parent never holds the plan twice.
+                pending: dict[Any, list[int]] = {}
+                ahead = max(2 * workers, 1)
+                next_task = 0
+                while next_task < len(tasks) or pending:
+                    while next_task < len(tasks) and len(pending) < ahead:
+                        members = tasks[next_task]
+                        sizes = np.array([units[i].size for i in members], np.int64)
+                        edges = np.r_[0, np.cumsum(sizes)]
+                        group = plan.take(np.concatenate([units[i] for i in members]))
+                        future = executor.submit(_group_task, str(bundle), str(work), members[0], group,
+                                                 list(zip(edges[:-1].tolist(), edges[1:].tolist())), settings,
+                                                 tuple(reducers), window, sweep_id, layout)  # fmt: skip
+                        pending[future] = members
+                        next_task += 1
+                    finished, _ = wait(list(pending), return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        for i, parts in zip(pending.pop(future), future.result(), strict=True):
+                            done[i] = parts
+                        emit_progress(progress, "sweep: precursor-major", len(done), len(units))
+            except BaseException:
+                stop_pool(executor)
+                raise
         emit_done(progress, "sweep: precursor-major", completed=len(done), total=len(units))
     except BaseException:
-        if temporary:
-            shutil.rmtree(work, ignore_errors=True)
+        # Nothing will read a failed sweep's directory, temporary or its own
+        # ``sweep-<id>/`` (kept until 2026-11-11; review E12).
+        shutil.rmtree(work, ignore_errors=True)
         raise
     result = SweepResult(scans=ledger, matches=None, mz_axis=None if axis is None else axis.key, work=work)
     for reducer in reducers:

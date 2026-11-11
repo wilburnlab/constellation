@@ -59,7 +59,9 @@ def _binned_curve(axis: MzAxis, level: int, profile: MzAxis | None) -> dict[floa
     shift = axis.table.column("shift_th").to_numpy()[at]
     coherence = axis.table.column("coherence").to_numpy()[at]
     bias = np.full(mz.shape, np.nan)
-    if profile is not None:
+    # A profile curve whose branch is undetermined at this level has no shift
+    # to compare with (``summarize`` raised there; review A9).
+    if profile is not None and profile.is_determined(level):
         knots, _ = profile.knots(level)
         if knots.size:
             inside = (mz >= knots.min()) & (mz <= knots.max())

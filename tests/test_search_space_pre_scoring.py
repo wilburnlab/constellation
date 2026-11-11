@@ -3,7 +3,11 @@
 that fails on the code before: a resume keyed on the code that made it,
 decoys on decoy proteins, a variable modification replacing a fixed one,
 reverse-c-fixed and N-terminal rings, a limit per rule, decoy sets and
-their counts, and one key per molecule."""
+their counts, and one key per molecule. And those of the second review
+(``docs/reviews/pre-scoring-2026-11-10.md``, B8-B11): the layout in the
+metadata, the packaged tables in the resume key, reverse-c-fixed under any
+residue-specific N-terminal modification, and provenance whatever the
+rules' order."""
 
 from __future__ import annotations
 
@@ -259,3 +263,126 @@ def test_protein_level_decoys_are_counted_as_decoys(tmp_path):
     n_decoy_precursors = lib.precursors.filter(pc.is_in(lib.precursors.column("peptide_id"), value_set=decoy_ids)).num_rows
     assert counts["decoy_precursors"] == n_decoy_precursors
     assert counts["precursors"] == lib.n_precursors - n_decoy_precursors
+
+
+# ── the second review (2026-11-10), B8-B11 ──────────────────────────
+
+
+def _without_layout(lib, layout=None):
+    """``lib`` as older code wrote it: its search-space record with no
+    layout, or with ``layout``."""
+    record = {k: v for k, v in lib.metadata["x.constellation.search_space"].items() if k != "layout"}
+    if layout is not None:
+        record["layout"] = layout
+    return lib.with_metadata({"x.constellation.search_space": record})
+
+
+def test_a_search_space_records_its_layout_and_one_older_code_made_is_warned_about(tmp_path):
+    """B8: the layout was only in the resume key, so a search space built
+    before PR #110 (no decoy proteins) was predicted and subset silently."""
+    from constellation.massspec.library import load_library, save_library
+    from constellation.massspec.library.search_space import SEARCH_SPACE_LAYOUT, check_search_space_layout
+
+    lib = build_search_space([_fasta(tmp_path, {"P1": P1, "P2": P2})], _settings())
+    assert lib.metadata["x.constellation.search_space"]["layout"] == SEARCH_SPACE_LAYOUT == 2
+    p1 = lib.proteins.filter(pc.equal(lib.proteins.column("accession"), "P1")).column("protein_id").to_pylist()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # a current one passes without a word
+        check_search_space_layout(lib)
+        lib.subset_proteins(p1)
+        # and so does a library that is no search space (a jar's, a .dlib)
+        check_search_space_layout(replace(lib, metadata_extras={}))
+    with pytest.warns(UserWarning, match=r"records no layout, and the current layout is 2.*massspec search-space"):
+        _without_layout(lib).subset_proteins(p1)
+    with pytest.warns(UserWarning, match=r"has layout 1, and the current layout is 2"):
+        check_search_space_layout(_without_layout(lib, 1))
+    # Written and read back, the record survives.
+    save_library(lib, tmp_path / "space", format="parquet_dir")
+    assert load_library(tmp_path / "space").metadata["x.constellation.search_space"]["layout"] == 2
+
+
+def test_the_resume_key_covers_the_protease_and_element_tables(tmp_path, monkeypatch):
+    """B9: proteases.json and elements.json change what a search space
+    holds, and were not in its key."""
+    import importlib.resources as resources
+
+    from constellation.massspec.library.search_space import search_space_key
+
+    fasta, settings = _fasta(tmp_path, {"P1": P1}), _settings()
+    key = search_space_key([fasta], settings)
+    packaged, real_files = resources.files("constellation.data"), resources.files
+
+    def data_with(edited: str | None) -> Path:
+        copy = tmp_path / f"data-{edited}"
+        copy.mkdir()
+        for name in ("unimod.json", "proteases.json", "elements.json"):
+            (copy / name).write_bytes(packaged.joinpath(name).read_bytes() + (b"\n" if name == edited else b""))
+        return copy
+
+    for edited, same in ((None, True), ("proteases.json", False), ("elements.json", False)):
+        copy = data_with(edited)
+        monkeypatch.setattr(
+            resources, "files", lambda package, copy=copy: copy if package == "constellation.data" else real_files(package)
+        )
+        assert (search_space_key([fasta], settings) == key) is same, edited
+
+
+def test_reverse_c_fixed_keeps_the_first_residue_under_any_residue_specific_n_terminal_modification(tmp_path):
+    """B10: only the side-chain cyclizations (UNIMOD:26/27/28) kept residue
+    0 in place; UNIMOD:385 (ammonia loss, at an N-terminus only on C, S or
+    T) moved with the rest, leaving the loss on a residue that cannot make
+    it."""
+    from constellation.core.sequence.proforma import ModRef, Peptidoform, TaggedMod
+    from constellation.massspec.library.decoys import peptide_decoys
+
+    fasta = _fasta(tmp_path, {"P1": "CAVNEMTEFAKCLLTEMQRYCAKEPEPTIDERLVNELTEFAK"})
+    lib = build_search_space([fasta], _settings(rules=(ModRule.parse("Ammonia-loss@N-term", "variable"),),
+                                                decoys=(DecoySet("reverse-c-fixed"),)))  # fmt: skip
+    decoys = [parse_proforma(s) for s in lib.peptides.filter(lib.peptides.column("is_decoy")).column("modified_sequence").to_pylist()]
+    lost = [p for p in decoys if any(t.mod.accession == "385" for t in p.n_term_mods)]
+    assert lost and all(p.sequence[0] == "C" for p in lost)
+    # Every form of the sequence shares its decoy's order, the bare one too.
+    assert "CAFETMENVAK" in {p.sequence for p in decoys}
+    # A sequence that cannot take one (no C, S or T first) is reversed as before.
+    assert "AFETLENVLK" in {p.sequence for p in decoys}
+
+    def first_residue(n_term: ModRef) -> str:
+        target = Peptidoform("CAVNEMTEFAK", n_term_mods=(TaggedMod(mod=n_term),))
+        out = peptide_decoys([target], DecoySet("reverse-c-fixed"), taken=set(), key=repr)
+        return out.decoy[0].sequence[0]
+
+    assert first_residue(ModRef(cv="UNIMOD", accession="385")) == "C"
+    assert first_residue(ModRef(cv="UNIMOD", accession="28")) == "C"  # a ring, kept as before
+    # On the N-term site itself (acetyl), with no accession, or not UNIMOD's: moved, as before.
+    assert first_residue(ModRef(cv="UNIMOD", accession="1")) == "A"
+    assert first_residue(ModRef(name="Ammonia-loss")) == "A"
+    assert first_residue(ModRef(cv="MOD", accession="00040")) == "A"
+
+
+def test_the_provenance_of_a_placement_does_not_depend_on_the_rules_order(tmp_path):
+    """B11: a placement two rules reached was recorded under whichever rule
+    came first; now it has a row for each, so permuting the rules gives the
+    same forms and the same modification table."""
+    import itertools
+
+    rules = (ModRule.parse("Acetyl@N-term:max=1", "variable"), ModRule.parse("Acetyl@Protein N-term:max=1", "variable"),
+             ModRule.parse("Oxidation@M", "variable"), ModRule.parse("Oxidation@M,W", "variable"),
+             ModRule.parse("Carbamidomethyl@C", "fixed"), ModRule.parse("Carbamidomethyl@C,H", "fixed"))  # fmt: skip
+    fasta = _fasta(tmp_path, {"P1": P1, "P2": "MWHEMTEFAKCLLTEMQRYCAK"})
+    seen = set()
+    for order in itertools.islice(itertools.permutations(range(len(rules))), 0, None, 37):
+        lib = build_search_space([fasta], _settings(rules=tuple(rules[i] for i in order)))
+        forms = tuple(sorted(lib.peptides.column("modified_sequence").to_pylist()))
+        rows = tuple(sorted((tuple(r.values()) for r in lib.peptide_modifications.to_pylist()), key=repr))
+        seen.add((forms, rows))
+    assert len(seen) == 1
+    ((_forms, rows),) = seen
+    by_placement: dict[tuple, set[str]] = {}
+    for pid, position, terminus, mod, origin, rule in rows:
+        by_placement.setdefault((pid, position, terminus, mod, origin), set()).add(rule)
+    # The protein's N-terminal acetyl is both N-term rules'; a methionine's
+    # oxidation both oxidation rules'; a cysteine's carbamidomethyl both fixed rules'.
+    assert {"Acetyl@N-term:max=1", "Acetyl@Protein N-term:max=1"} in by_placement.values()
+    assert {"Oxidation@M", "Oxidation@M,W"} in by_placement.values()
+    assert {"Carbamidomethyl@C", "Carbamidomethyl@C,H"} in by_placement.values()
+    assert {"Oxidation@M,W"} in by_placement.values()  # a tryptophan's: one rule's

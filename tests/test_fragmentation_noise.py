@@ -6,6 +6,7 @@ rises without bound as ``g → ∞`` (``v/g → 0``, ``DM_log_prob(0) = 0``) and
 trainable gain runs away.
 """
 
+import pytest
 import torch
 
 from constellation.core.stats.distributions import dirichlet_multinomial_log_prob
@@ -56,3 +57,33 @@ def test_gain_does_not_run_away():
     big = [g_true * f for f in (1.0, 10.0, 1e2, 1e3, 1e4, 1e6)]
     nlls = [nll(g) for g in big]
     assert all(nlls[i + 1] > nlls[i] for i in range(len(nlls) - 1)), nlls
+
+
+def test_an_unobserved_channel_is_left_out_not_scored() -> None:
+    """A NaN gave NaN and the −1 sentinel a finite, wrong value (review
+    2026-11-10, S8); either is now the same as dropping the channel."""
+    four = FragmentationNoiseModel(4, concentration_init=torch.tensor([2.0, 3.0, 4.0, 5.0]))
+    three = FragmentationNoiseModel(3, concentration_init=torch.tensor([2.0, 3.0, 5.0]))
+    with torch.no_grad():
+        three.log_g.copy_(four.log_g)
+    dropped = three.log_prob(torch.tensor([[100.0, 200.0, 400.0]], dtype=torch.float64))
+    for hole in (float("nan"), -1.0):
+        v = torch.tensor([[100.0, 200.0, hole, 400.0]], dtype=torch.float64)
+        assert torch.allclose(four.log_prob(v), dropped, rtol=0, atol=1e-12)
+    v = torch.tensor([[100.0, 200.0, 300.0, 400.0]], dtype=torch.float64)
+    masked = four.log_prob(v, mask=torch.tensor([True, True, False, True]))
+    assert torch.allclose(masked, dropped, rtol=0, atol=1e-12)
+
+
+def test_a_masked_dirichlet_multinomial_has_finite_gradients_past_a_nan() -> None:
+    from constellation.core.stats.distributions import dirichlet_multinomial_log_prob
+
+    x = torch.tensor([3.0, float("nan"), 5.0], dtype=torch.float64, requires_grad=True)
+    a = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64, requires_grad=True)
+    keep = torch.tensor([True, False, True])
+    out = dirichlet_multinomial_log_prob(x, a, mask=keep)
+    out.backward()
+    assert torch.isfinite(out) and torch.isfinite(x.grad).all() and torch.isfinite(a.grad).all()
+    alone = dirichlet_multinomial_log_prob(torch.tensor([3.0, 5.0], dtype=torch.float64),
+                                           torch.tensor([1.0, 3.0], dtype=torch.float64))
+    assert out.item() == pytest.approx(alone.item(), abs=1e-12)

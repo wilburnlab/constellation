@@ -80,10 +80,12 @@ __all__ = [
     "DEFAULT_MIN_MZ",
     "Digestion",
     "ModRule",
+    "SEARCH_SPACE_LAYOUT",
     "SEARCH_SPACE_METADATA_KEY",
     "SearchSpaceBudgetError",
     "SearchSpaceSettings",
     "build_search_space",
+    "check_search_space_layout",
     "count_search_space",
     "normalize_isotopes",
     "parse_label",
@@ -108,14 +110,28 @@ SEARCH_SPACE_METADATA_KEY = "x.constellation.search_space"
 #: variable modification replacing a fixed one on its site; a ``:max=``
 #: limit per rule; reverse-c-fixed keeping a cyclized first residue in place;
 #: protein-level decoys counted as decoys.
-SEARCH_SPACE_LAYOUT = 1
+#:
+#: 2 (2026-11-11, review of 2026-11-10, B8-B11): the layout is written into
+#: the library's metadata too (``x.constellation.search_space["layout"]``),
+#: so that a reader can tell a search space older code made
+#: (:func:`check_search_space_layout`); reverse-c-fixed keeps residue 0 in
+#: place under any residue-specific N-terminal modification, not only the
+#: three side-chain cyclizations (UNIMOD:385, ammonia loss on C, among
+#: them), which changes those decoys and their ids; a placement two rules
+#: reach has a provenance row for each rule, not for whichever came first;
+#: and the key covers the protease and element tables.
+SEARCH_SPACE_LAYOUT = 2
 
 
 def search_space_key(fasta: Sequence[Path | str], settings: SearchSpaceSettings) -> str:
     """The stage key of a search space built from ``fasta`` with
     ``settings``: the inputs' SHA-256, the settings, :data:`SEARCH_SPACE_LAYOUT`,
-    the SHA-256 of the UNIMOD vocabulary the modifications were read from,
-    and the content-id scheme."""
+    the SHA-256 of the packaged data it was made with (the UNIMOD
+    vocabulary the modifications were read from, the protease rules the
+    proteins were cut by, and the element masses every m/z comes from), and
+    the content-id scheme. Until 2026-11-11 the protease and element tables
+    were not in it, so a search space made under other cleavage rules or
+    masses passed ``--resume`` as current (review of 2026-11-10, B9)."""
     from constellation.core.stages import stage_key
     from constellation.massspec.library.ids import ID_SCHEME
 
@@ -124,17 +140,55 @@ def search_space_key(fasta: Sequence[Path | str], settings: SearchSpaceSettings)
         inputs=[file_sha256(Path(f)) for f in fasta],
         layout=SEARCH_SPACE_LAYOUT,
         unimod=_vocabulary_digest(),
+        proteases=_data_digest("proteases.json"),
+        elements=_data_digest("elements.json"),
         id_scheme=ID_SCHEME,
     )
 
 
-def _vocabulary_digest() -> str:
-    """The SHA-256 of the packaged UNIMOD vocabulary (``unimod.json``):
-    the file carries no release of its own, so its bytes are its identity."""
+def _data_digest(name: str) -> str:
+    """The SHA-256 of a file packaged in ``constellation.data``: such files
+    carry no release of their own, so their bytes are their identity."""
     import hashlib
     from importlib import resources
 
-    return hashlib.sha256(resources.files("constellation.data").joinpath("unimod.json").read_bytes()).hexdigest()
+    return hashlib.sha256(resources.files("constellation.data").joinpath(name).read_bytes()).hexdigest()
+
+
+def _vocabulary_digest() -> str:
+    """The SHA-256 of the packaged UNIMOD vocabulary (``unimod.json``)."""
+    return _data_digest("unimod.json")
+
+
+def check_search_space_layout(library: Library) -> None:
+    """Warn when ``library`` is a search space (it carries
+    :data:`SEARCH_SPACE_METADATA_KEY`) made by code older than this
+    module's: one that records no layout, or an older one than
+    :data:`SEARCH_SPACE_LAYOUT`. What such a space holds is not what this
+    code builds (before layout 1, no decoy proteins, so ``subset_proteins``
+    lost decoys whose target was filtered away), and nothing else says so.
+    A library that is no search space (a jar's prediction, an EncyclopeDIA
+    ``.dlib``) is not warned about. Until 2026-11-11 the layout was only in
+    the resume key, so ``predict-library --from-library`` and
+    ``subset_proteins`` took an old space without a word (review of
+    2026-11-10, B8)."""
+    import warnings
+
+    record = library.metadata.get(SEARCH_SPACE_METADATA_KEY)
+    if not isinstance(record, Mapping):
+        return
+    layout = record.get("layout")
+    if isinstance(layout, int) and layout >= SEARCH_SPACE_LAYOUT:
+        return
+    found = "records no layout" if layout is None else f"has layout {layout!r}"
+    warnings.warn(
+        f"this search space {found}, and the current layout is {SEARCH_SPACE_LAYOUT}: it was made by "
+        "older code, and what it holds (decoys, their proteins, provenance) is not what this code "
+        "builds; rebuild it with `massspec search-space`",
+        UserWarning,
+        stacklevel=2,
+    )
+
 
 #: Wide enough for the MS1 scan range of most methods; narrow it to the
 #: isolation windows for a DIA run if the extra precursors are not wanted.
@@ -559,16 +613,20 @@ def _termini(protein: _Protein, termini) -> tuple[list[int], list[int]]:
     return n_extra, c_extra
 
 
-def _enumeration_args(rules: Sequence[ModRule]) -> tuple[dict, dict, dict, dict]:
+def _enumeration_args(rules: Sequence[ModRule]) -> tuple[dict, dict, list, dict]:
     """``enumerate_modforms`` arguments from the rules, and a map from what
-    a placement records back to the rule that made it."""
+    a placement records, (kind, site, modification), to every rule that
+    places it there (until 2026-11-11 the first rule given alone, so the
+    provenance depended on the rules' order; review of 2026-11-10, B11)."""
     fixed: dict[str, list[str]] = {}
     variable: dict[str, list[str]] = {}
     limits: list[tuple[str, tuple[str, ...], int]] = []
-    rule_of: dict[tuple[str, str, str], str] = {}
+    rules_of: dict[tuple[str, str, str], list[str]] = {}
     for rule in rules:
         for site in rule.sites:
-            rule_of.setdefault((rule.kind, site, rule.modification), rule.name)
+            names = rules_of.setdefault((rule.kind, site, rule.modification), [])
+            if rule.name not in names:
+                names.append(rule.name)
             if rule.kind == "fixed":
                 keys = fixed.setdefault(site, [])
                 if rule.modification not in keys:
@@ -582,7 +640,7 @@ def _enumeration_args(rules: Sequence[ModRule]) -> tuple[dict, dict, dict, dict]
         # Oxidation@M with Oxidation@W:max=1 allowed one oxidation in all.
         if rule.kind == "variable" and rule.max_per_peptide is not None:
             limits.append((rule.modification, tuple(rule.sites), int(rule.max_per_peptide)))
-    return fixed, variable, limits, rule_of
+    return fixed, variable, limits, rules_of
 
 
 def build_search_space(
@@ -664,7 +722,7 @@ def build_search_space(
     counts["spans_noncanonical_skipped"] = n_noncanonical
 
     # ── groups: one enumeration per (sequence, protein-terminal context, label) ──
-    fixed, variable, limits, rule_of = _enumeration_args(s.rules)
+    fixed, variable, limits, rules_of = _enumeration_args(s.rules)
     groups: dict[tuple[str, bool, bool, tuple[str, ...]], list[int]] = {}
     for si, (pi, sp) in enumerate(span_rows):
         for state in proteins[pi].states:
@@ -703,6 +761,20 @@ def build_search_space(
     # paths make (fixed Protein N-term acetyl at one protein's start, variable
     # N-term acetyl inside another) keeps both origins.
     mod_rows: dict[tuple[int, int | None, str | None, str, str, str | None], None] = {}
+    # A placement two rules reach (Acetyl@N-term and Acetyl@Protein N-term at
+    # a protein's start; Oxidation@M beside Oxidation@M,W) has a row for each,
+    # in sorted order, so the table does not depend on the rules' order
+    # (until 2026-11-11 the first rule given took it; review of 2026-11-10,
+    # B11).
+    behind: dict[tuple[str, tuple[str, ...], str], tuple[str | None, ...]] = {}
+
+    def rules_behind(pm) -> tuple[str | None, ...]:
+        found = behind.get((pm.origin, pm.sites, pm.key))
+        if found is None:
+            names = {n for site in pm.sites for n in rules_of.get((pm.origin, site, pm.key), ())}
+            found = behind[(pm.origin, pm.sites, pm.key)] = tuple(sorted(names)) or (None,)
+        return found
+
     edges: list[tuple[int, int]] = []  # (span index, peptide index)
     enumerated: dict[tuple[str, bool, bool], list] = {}
     for (seq, pn, pc_, state), span_ids in groups.items():
@@ -723,7 +795,8 @@ def build_search_space(
             for pm in placed:
                 position = pm.slot if isinstance(pm.slot, int) else None
                 terminus = None if position is not None else ("N" if pm.slot == N_TERM else "C")
-                mod_rows[(k, position, terminus, pm.key, pm.origin, rule_of.get((pm.origin, pm.site, pm.key)))] = None
+                for rule in rules_behind(pm):
+                    mod_rows[(k, position, terminus, pm.key, pm.origin, rule)] = None
             for iso in state:
                 mod_rows[(k, None, None, iso, "label", ",".join(state))] = None
             for si in span_ids:
@@ -985,6 +1058,7 @@ def build_search_space(
     metadata = {
         ID_SCHEME_METADATA_KEY: ID_SCHEME,
         SEARCH_SPACE_METADATA_KEY: {
+            "layout": SEARCH_SPACE_LAYOUT,
             "settings": s.as_dict(),
             "inputs": inputs,
             "counts": counts,
