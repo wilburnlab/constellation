@@ -54,16 +54,18 @@ __all__ = [
     "dense_chunks",
     "PARENT_FOUND",
     "PARENT_NONE",
-    "PARENT_EMPTY",
+    "PARENT_UNREAD",
     "PARENT_OFF_AXIS",
 ]
 
 #: Why :meth:`Dense.parent_slots` gives a slot its parent or not (with
 #: ``reasons=True``; -1 for a padding slot): found on the query's MS1 axis;
-#: the scan has no parent recorded or derived; its parent scan holds no
-#: points (or was not read); its parent is in the run but not on this
-#: query's MS1 axis (outside the query's interval there).
-PARENT_FOUND, PARENT_NONE, PARENT_EMPTY, PARENT_OFF_AXIS = 0, 1, 2, 3
+#: the scan has no parent recorded or derived; its parent scan is no slot
+#: (the sweep did not read it, or it holds no points and the bundle does
+#: not say it holds none; an empty scan read is a slot of zeros); its
+#: parent is a slot but not on this query's MS1 axis (outside the query's
+#: interval there).
+PARENT_FOUND, PARENT_NONE, PARENT_UNREAD, PARENT_OFF_AXIS = 0, 1, 2, 3
 
 #: The ``Channels`` columns a dense view carries per (query, channel), with
 #: the value a padding channel gets.
@@ -120,8 +122,9 @@ class Dense:
     #: (chained in m/z order) share a group, named by its first channel;
     #: such channels can match the same point. -1 for padding.
     overlap_group: torch.Tensor
-    #: Each ledger row's point count (to tell an empty parent scan).
-    _ledger_points: np.ndarray | None = field(default=None, repr=False, compare=False)
+    #: Whether each ledger row can be a slot (``Ledger.present``: to tell an
+    #: unread parent scan).
+    _ledger_present: np.ndarray | None = field(default=None, repr=False, compare=False)
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -175,7 +178,7 @@ class Dense:
         parent is not on that axis (outside the query's interval there).
 
         With ``reasons``, also ``[Q, S]`` codes saying why
-        (:data:`PARENT_FOUND`, :data:`PARENT_NONE`, :data:`PARENT_EMPTY`,
+        (:data:`PARENT_FOUND`, :data:`PARENT_NONE`, :data:`PARENT_UNREAD`,
         :data:`PARENT_OFF_AXIS`; -1 for padding): the four ways a slot has
         no parent are different evidence (review V8). The nearest MS1 slot
         on either side in time is :meth:`brackets`."""
@@ -187,10 +190,10 @@ class Dense:
         code = np.full(parent.shape, PARENT_OFF_AXIS, np.int64)
         code[slots.numpy() >= 0] = PARENT_FOUND
         code[parent < 0] = PARENT_NONE
-        points = self._ledger_points
-        if points is not None and points.size:
-            empty = (parent >= 0) & (points[np.maximum(parent, 0)] <= 0)
-            code[empty & (slots.numpy() < 0)] = PARENT_EMPTY
+        present = self._ledger_present
+        if present is not None and present.size:
+            unread = (parent >= 0) & ~present[np.maximum(parent, 0)]
+            code[unread & (slots.numpy() < 0)] = PARENT_UNREAD
         code[~self.slot_valid.numpy()] = -1
         return slots, torch.from_numpy(code)
 
@@ -385,7 +388,7 @@ def dense_view(batch: QueryBatch, level: int, *, queries: np.ndarray | None = No
         abundance=t(abundance),
         **{name: t(per_channel(getattr(channels, name), pad, np.int64)) for name, pad in _CHANNEL_COLUMNS.items()},
         overlap_group=t(_overlap_groups(mz, c_valid, batch.settings.tolerance(level))),
-        _ledger_points=scans.n_points,
+        _ledger_present=scans.present,
     )
 
 

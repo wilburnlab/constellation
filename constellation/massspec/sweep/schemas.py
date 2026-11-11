@@ -27,7 +27,10 @@ from constellation.core.io.schemas import register_schema
 #: 5 (2026-11-09): ``decoy_set`` on queries and the query summary; ``source_query`` on queries.
 #: 6 (2026-11-10): the scan ledger carries each scan's acquired m/z range and
 #: its parent scan; a cell outside its scan's range is not zero-filled.
-SWEEP_SCHEMA_VERSION: int = 6
+#: 7 (2026-11-11): the scan ledger carries each scan's stored point count and
+#: whether the sweep read it; a scan read with no points is a slot of zeros
+#: (it was a gap).
+SWEEP_SCHEMA_VERSION: int = 7
 
 
 def _meta(name: str) -> dict[bytes, bytes]:
@@ -111,6 +114,11 @@ SWEEP_SCAN_TABLE: pa.Schema = pa.schema(
         # The scan one level down it was taken from (recorded, or derived:
         # ``acquisition_structure.parent_scans``); null for none.
         pa.field("parent_scan", pa.int32(), nullable=True),
+        # The points the bundle holds for the scan (scan metadata's
+        # ``peak_count``); null where it does not say.
+        pa.field("peak_count", pa.int64(), nullable=True),
+        # Whether the sweep read the scan (inside its scan or RT range).
+        pa.field("read", pa.bool_(), nullable=False),
     ],
     metadata=_meta("SweepScan"),
 )

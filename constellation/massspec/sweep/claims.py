@@ -164,7 +164,9 @@ def claims_table(claims: Claims, plan, ledger, acquisition_id: int) -> pa.Table:
             "n_queries": pa.array(c.n_queries.astype(np.int32)),
             "n_pairs": pa.array(c.n_pairs.astype(np.int32)),
             "target_id": plan.targets.column("target_id").take(query),
-            "query": pa.array(c.query.astype(np.int32)),
+            # The plan's own numbering, as every other output names queries
+            # (a taken plan's local numbers until 2026-11-11; review E11).
+            "query": pa.array(np.asarray(plan.global_query(c.query)).astype(np.int32)),
             "modified_sequence": plan.targets.column("modified_sequence").take(query),
             "precursor_charge": pa.array(charge),
             "isotope": pa.array(isotope, mask=~iso),

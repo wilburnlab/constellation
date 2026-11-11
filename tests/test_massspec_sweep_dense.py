@@ -352,7 +352,7 @@ def test_a_reducer_that_builds_dense_views_must_declare_zero_fills(tmp_root):
 
 def test_parent_reasons_and_brackets(tmp_path):
     """Why a slot has no parent (V8), and the MS1 slots either side of it."""
-    from constellation.massspec.sweep.dense import PARENT_EMPTY, PARENT_FOUND, PARENT_OFF_AXIS
+    from constellation.massspec.sweep.dense import PARENT_FOUND, PARENT_OFF_AXIS, PARENT_UNREAD
 
     run = planted_run(acquisition="dia", cycles=30, window_width=100.0)
     scans = [dict(s) for s in run.scans]
@@ -373,7 +373,11 @@ def test_parent_reasons_and_brackets(tmp_path):
     why = why.numpy()
     assert (why[~valid] == -1).all()
     assert ((why == PARENT_FOUND) == (slots.numpy() >= 0)).all()
-    assert (why == PARENT_EMPTY).any()  # the MS2 scans after the emptied MS1
+    # An empty MS1 scan is a slot of zeros: the MS2 scans after it find it.
+    emptied_slots = d1.scan.numpy() == emptied["scan"]
+    assert emptied_slots.any()
+    children = d2.parent_row.numpy() == batch.scans.rows_of(np.array([emptied["scan"]]))[0]
+    assert children.any() and (why[children] == PARENT_FOUND).all()
     assert (why == PARENT_OFF_AXIS).any()  # at the edges of a query's interval
     b = d2.brackets(d1)
     rt1, rt2 = d1.rt.numpy(), d2.rt.numpy()
@@ -382,6 +386,11 @@ def test_parent_reasons_and_brackets(tmp_path):
     assert (rt1[qi, left] <= rt2[qi, si]).all() and (rt2[qi, si] <= rt1[qi, right]).all()
     w = b.weight.numpy()[qi, si]
     assert ((w >= 0) & (w <= 1)).all()
+    # A sweep of part of the run: the first MS2 scans' parents were not read.
+    first_ms2 = next(i for i, s in enumerate(scans) if s["level"] == 2 and i > ms1[len(ms1) // 2 + 2])
+    ranged = _probe(bundle, plan, scan_range=(scans[first_ms2]["scan"], scans[-1]["scan"]))[0]
+    _, why_r = ranged.dense(2).parent_slots(ranged.dense(1), reasons=True)
+    assert (why_r.numpy() == PARENT_UNREAD).any()
 
 
 def test_overlapping_channels_share_a_group(tmp_root):

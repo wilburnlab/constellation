@@ -232,7 +232,7 @@ def _f64(col: pa.ChunkedArray) -> np.ndarray:
 
 
 #: Scan metadata the ledger carries beyond its own columns, when a bundle has them.
-_SCAN_CONTEXT = ("tic", "iit", "scan_window_lower", "scan_window_upper", "precursor_scan", "faims_cv")
+_SCAN_CONTEXT = ("tic", "iit", "scan_window_lower", "scan_window_upper", "precursor_scan", "faims_cv", "peak_count")
 
 
 def _refuse_several_voltages(where: str, cv: np.ndarray | None) -> None:
@@ -269,7 +269,10 @@ def _refuse_multiplexed(bundle: Path, path: Path) -> None:
         )
 
 
-def _scan_metadata(bundle: Path) -> Ledger:
+def _scan_metadata(bundle: Path, window: tuple[int, int] | None = None) -> Ledger:
+    """The bundle's scans as a ledger, with no points counted yet; a scan
+    outside ``window`` (the half-open scan range a sweep reads) is marked
+    not read."""
     path = bundle / "scan_metadata.parquet"
     context = [c for c in _SCAN_CONTEXT if c in pq.read_schema(path).names]
     t = pq.read_table(path, columns=["scan", "level", "rt", "isolation_lower", "isolation_upper", *context]).sort_by("scan")
@@ -295,6 +298,9 @@ def _scan_metadata(bundle: Path) -> Ledger:
         scan_lower=opt("scan_window_lower"),
         scan_upper=opt("scan_window_upper"),
         parent=_parent_rows(scan, level, opt("precursor_scan"), cv),
+        peak_count=(t.column("peak_count").cast(pa.int64()).fill_null(-1).to_numpy().astype(np.int64)
+                    if "peak_count" in context else None),
+        read=None if window is None else (scan >= window[0]) & (scan < window[1]),
     )
     return ledger
 
@@ -453,6 +459,10 @@ class _MapOut:
     claims: Claims
     #: The marker that follows a block's last window group (an empty part).
     ends_block: bool = False
+    #: The cells this part's window group could match: its queries'
+    #: channels times its scans, ignoring retention-time intervals (the
+    #: spill's estimate scales by them; :func:`_cells_by_window`).
+    cells: int = 0
 
     @classmethod
     def concat(cls, parts: list[_MapOut]) -> _MapOut:
@@ -460,6 +470,7 @@ class _MapOut:
             Matches.concat([p.matches for p in parts]),
             Evidence.concat([p.evidence for p in parts]),
             Claims.concat([p.claims for p in parts]),
+            cells=sum(p.cells for p in parts),
         )
 
     @property
@@ -572,7 +583,8 @@ def _map_block_parts(block: _Block, plan: QueryPlan, settings: SweepSettings, *,
                                    channel_at, channel_query, eligible, tolerance, unit, gate.top_peaks,
                                    by_charge=level == 1)  # fmt: skip
                 )
-            yield _MapOut(Matches.concat(matches_out), Evidence.concat(evidence_out), Claims.concat(claims))
+            yield _MapOut(Matches.concat(matches_out), Evidence.concat(evidence_out), Claims.concat(claims),
+                          cells=int(counts[g.queries].sum()) * int(g.rows.size))  # fmt: skip
 
 
 def _load_axis(bundle: Path, settings: SweepSettings):
@@ -769,6 +781,11 @@ def sweep(
         axis = _load_axis(Path(source), settings)
         for level in plan.levels:
             axis.check_level(level)
+        # Resolved once, here: every worker of either layout and the result
+        # name the same curve. Scan-major resolved ``latest`` again in each
+        # worker, so a curve saved mid-sweep was named on a result corrected
+        # with the older one (until 2026-11-11; review E10).
+        settings = replace(settings, mz_axis=axis.key)
     if layout == "precursor_major":
         from constellation.massspec.sweep.precursor_major import sweep_precursor_major
 
@@ -829,14 +846,14 @@ def _sweep(source, plan, settings, reducers, workers, work_dir, progress, window
                     f"which is swept in memory: write it as a bundle to sweep it on disk, or raise memory_rows"
                 )
         out = _MapOut.concat(parts)
-        return _reduce_in_memory(out, plan, ledger, settings, reducers, None)
+        return _reduce_in_memory(out, plan, ledger, settings, reducers, None, spill_dir=spill_dir)
     bundle = Path(source)
     read_bundle_manifest(bundle)
     if workers <= 1 and work_dir is None:
         axis = _load_axis(bundle, settings)
-        ledger = _scan_metadata(bundle)
+        ledger = _scan_metadata(bundle, window)
         emit_start(progress, "sweep", total=0, message=bundle.name)
-        parts, held = [], 0
+        parts, held, matched_cells = [], 0, 0
         stream = (
             iter_scan_blocks(bundle, columns=("mz", "intensity"), block_rows=settings.block_rows, scan_range=window)
             if window is not None
@@ -847,17 +864,18 @@ def _sweep(source, plan, settings, reducers, workers, work_dir, progress, window
         for part in mapped:
             parts.append(part)
             held += part.rows
+            matched_cells += part.cells
             if held > settings.memory_rows:
                 # Too much to hold: what is held becomes the first run of a
                 # sweep on disk, which carries on from the next window group
                 # (until 2026-11-10, from the next whole block).
-                need = _spill_estimate(bundle, ledger, held, window)
+                need = _spill_estimate(bundle, ledger, held, window, matched_cells, plan)
                 emit_done(progress, "sweep", message=f"over {settings.memory_rows} rows; on disk")
                 return _on_temporary_disk(bundle, plan, settings, reducers, 1, progress,
                                           resume=(ledger, mapped, parts), window=window, spill_dir=spill_dir,
                                           need=need)  # fmt: skip
         out = _MapOut.concat(parts)
-        result = _reduce_in_memory(out, plan, ledger, settings, reducers, axis)
+        result = _reduce_in_memory(out, plan, ledger, settings, reducers, axis, spill_dir=spill_dir)
         emit_done(progress, "sweep", message=f"{out.matches.n} matches")
         return result
     if work_dir is None:
@@ -877,12 +895,55 @@ def own_dir(work_dir: Path | str) -> Path:
     return work
 
 
-def _spill_estimate(bundle: Path, ledger: Ledger, held: int, window) -> int:
+def _cells_by_window(plan: QueryPlan, ledger: Ledger, rows: np.ndarray) -> int:
+    """The cells the plan could match in ledger ``rows`` (a mask): per level
+    and isolation window, its queries' channels times its scans, retention
+    -time intervals ignored. A rough measure of the matches a stretch of
+    the run will give, for the spill's estimates: matches follow the queries
+    a window holds, not its points (scaling by points put a spill at 300×
+    what it wrote where most windows held no query)."""
+    total = 0
+    for level in plan.levels:
+        channels = plan.channels_for_level(level)
+        if channels is None:
+            continue
+        counts = channels.counts().astype(np.int64)
+        at = np.flatnonzero(rows & (ledger.level == level) & ~np.isnan(ledger.rt))
+        if at.size == 0:
+            continue
+        if level == 1:
+            total += int(counts.sum()) * int(at.size)
+            continue
+        lo, hi = ledger.lower[at], ledger.upper[at]
+        free = np.isnan(lo) | np.isnan(hi)
+        total += int(counts.sum()) * int(free.sum())
+        if (~free).any():
+            pairs, n_scans = np.unique(np.stack([lo[~free], hi[~free]], axis=1), axis=0, return_counts=True)
+            pmz = plan.precursor_mz
+            known = ~np.isnan(pmz)
+            order = np.argsort(pmz[known])
+            cum = np.r_[0, np.cumsum(counts[known][order])]
+            sorted_mz = pmz[known][order]
+            a = np.searchsorted(sorted_mz, pairs[:, 0], side="left")
+            b = np.searchsorted(sorted_mz, pairs[:, 1], side="right")
+            per_window = cum[b] - cum[a] + int(counts[~known].sum())
+            total += int((per_window * n_scans).sum())
+    return total
+
+
+def _spill_estimate(bundle: Path, ledger: Ledger, held: int, window, matched_cells: int | None = None,
+                    plan: QueryPlan | None = None) -> int:  # fmt: skip
     """Bytes a spilled sweep is likely to write: the rows held so far, scaled
-    by the points still to read (each scan's ``peak_count`` where the bundle
-    records it, its peak files' rows otherwise), at
-    :data:`SPILL_BYTES_PER_ROW`. An estimate for a free-space check, not a
-    bound."""
+    by the cells the plan could match in the scans read (:func:`_cells_by_window`)
+    against those of the window groups matched so far (``matched_cells``),
+    at :data:`SPILL_BYTES_PER_ROW`. An estimate for a free-space check, not
+    a bound. Until 2026-11-11 it scaled by the points read, which a whole
+    block counts before its window groups are matched and which include
+    levels the plan does not match: a spill early in a block was estimated
+    at 0.16 of what it wrote (review E9)."""
+    if matched_cells and plan is not None:
+        total = _cells_by_window(plan, ledger, ledger.read)
+        return int(held * max(total / matched_cells, 1.0) * SPILL_BYTES_PER_ROW)
     read = int(ledger.n_points.sum())
     total = None
     path = bundle / "scan_metadata.parquet"
@@ -899,6 +960,25 @@ def _spill_estimate(bundle: Path, ledger: Ledger, held: int, window) -> int:
         total = sum(pq.read_metadata(p).num_rows for p in peak_paths(bundle))
     scale = max(total / max(read, 1), 1.0)
     return int(held * scale * SPILL_BYTES_PER_ROW)
+
+
+def _check_room_on_disk(work: Path, ledger: Ledger, shards, done: int, plan: QueryPlan) -> None:
+    """A sweep on disk, once its first shard has written: the bytes written
+    so far, scaled by the cells the plan could match in the run against
+    those in that shard (:func:`_cells_by_window`), checked against the
+    room left (until 2026-11-11 a sweep on disk was never checked; review
+    E9)."""
+    if shards[done] is None:
+        return
+    lo, hi = shards[done]
+    in_shard = ledger.read & (ledger.scan >= lo) & (ledger.scan < hi)
+    shard_cells = _cells_by_window(plan, ledger, in_shard)
+    total = _cells_by_window(plan, ledger, ledger.read)
+    written = sum(f.stat().st_size for kind in ("matches", "evidence", "claims")
+                  for f in (work / kind).glob("*.parquet"))  # fmt: skip
+    if shard_cells == 0 or written == 0:
+        return
+    _check_room(work, int(written * total / shard_cells) - written)
 
 
 def _check_room(where: Path, need: int) -> None:
@@ -953,14 +1033,21 @@ def _shared_counts(claims: Claims, n_queries: int, *, per_cell: bool) -> np.ndar
     return np.bincount(query, minlength=n_queries).astype(np.int64)
 
 
-def _reduce_in_memory(out: _MapOut, plan, ledger, settings, reducers, axis) -> SweepResult:
+def _reduce_in_memory(out: _MapOut, plan, ledger, settings, reducers, axis, *, spill_dir=None) -> SweepResult:
     """Reduce what an in-memory sweep matched, in buckets of queries of about
     ``settings.reduce_rows`` built rows (:func:`_reduce_weights`), as a
     sweep on disk does. Buckets are contiguous ascending query ranges and a
     query's rows depend only on that query, so each output is the one call's
     over the whole plan, row for row; what a call builds is bounded. Until
     2026-11-10 the whole plan went to the reducers at once (1,962,000 cells
-    in one call where the disk path's largest was 48,000)."""
+    in one call where the disk path's largest was 48,000).
+
+    The outputs are held while they fit ``settings.memory_rows`` rows in
+    all; past it they are written as parts to a temporary directory (in
+    ``spill_dir``, else the system's), which lives as long as the result,
+    and every later bucket's are written there too. Until 2026-11-11 they
+    were held whole, so a per-cell output outgrew the bound the map is held
+    to (1.11 GB held at 5 % of ``memory_rows`` on real data; review E7)."""
     order = ledger.order()
     shared = (_shared_counts(out.claims, plan.n_queries, per_cell=settings.rule.name == "sum")
               if settings.claims else None)  # fmt: skip
@@ -970,6 +1057,7 @@ def _reduce_in_memory(out: _MapOut, plan, ledger, settings, reducers, axis) -> S
     buckets = _buckets(_reduce_weights(plan, ledger, settings, reducers, counts), settings.reduce_rows)
     result = SweepResult(scans=ledger, matches=matches, mz_axis=None if axis is None else axis.key)
     collected: list[dict[str, list[pa.Table]]] = [{name: [] for name in outputs_of(r)} for r in reducers]
+    spill = _OutputSpill(settings.memory_rows, spill_dir)
     for q0, q1 in buckets or [(0, 0)]:
         m0, m1 = np.searchsorted(matches.query, [q0, q1], side="left")
         e0, e1 = np.searchsorted(evidence.query, [q0, q1], side="left")
@@ -980,17 +1068,57 @@ def _reduce_in_memory(out: _MapOut, plan, ledger, settings, reducers, axis) -> S
         for into, tables in zip(collected, _reduce(batch, reducers)):
             for name, table in tables.items():
                 into[name].append(table)
+        spill.offer(collected)
     for reducer, tables in zip(reducers, collected):
         schemas = outputs_of(reducer)
         for name, parts in tables.items():
+            result.schemas[name] = schemas[name]
+            if spill.directory is not None:
+                result.parts[name] = spill.parts[name]
+                continue
             # The caller's in-memory result: a terminal table, made of one
             # bucket's table after another.
             result.tables[name] = parts[0] if len(parts) == 1 else pa.concat_tables(parts)
-            result.schemas[name] = schemas[name]
+    if spill.directory is not None:
+        result.work = spill.directory
+        weakref.finalize(result, shutil.rmtree, spill.directory, True)
     if settings.claims:
         result.tables[CLAIMS] = claims_table(out.claims, plan, ledger, settings.acquisition_id)
         result.schemas[CLAIMS] = SWEEP_POINT_CLAIM_TABLE
     return result
+
+
+class _OutputSpill:
+    """The reducers' outputs of an in-memory sweep, held until they pass
+    ``limit`` rows in all and then written as parts (``_reduce_in_memory``)."""
+
+    def __init__(self, limit: int, spill_dir) -> None:
+        self.limit = int(limit)
+        self.spill_dir = spill_dir
+        self.directory: Path | None = None
+        self.parts: dict[str, list[Path]] = {}
+        self._n = 0
+
+    def offer(self, collected: list[dict[str, list[pa.Table]]]) -> None:
+        """After a bucket: write what is held, if it is too much or the
+        outputs are already being written."""
+        held = sum(t.num_rows for tables in collected for ts in tables.values() for t in ts)
+        if self.directory is None and held <= self.limit:
+            return
+        if self.directory is None:
+            where = Path(self.spill_dir) if self.spill_dir is not None else Path(tempfile.gettempdir())
+            where.mkdir(parents=True, exist_ok=True)
+            self.directory = Path(tempfile.mkdtemp(prefix="sweep-outputs-", dir=where))
+            _LOG.info("sweep outputs over %d rows; written to %s", self.limit, self.directory)
+        for tables in collected:
+            for name, ts in tables.items():
+                if not ts:
+                    continue
+                path = self.directory / name / f"part-{self._n:05d}.parquet"
+                _write(ts[0] if len(ts) == 1 else pa.concat_tables(ts), path)
+                self.parts.setdefault(name, []).append(path)
+                ts.clear()
+        self._n += 1
 
 
 # ── on disk ───────────────────────────────────────────────────────────
@@ -1013,6 +1141,43 @@ def _init_worker() -> None:
     import torch
 
     torch.set_num_threads(1)
+    _die_with_parent()
+
+
+def _die_with_parent() -> None:
+    """Have the kernel stop this worker if the sweep's process dies (Linux
+    ``PR_SET_PDEATHSIG``): a sweep killed outright left its spawned workers
+    running (until 2026-11-11; review E12). Elsewhere a no-op."""
+    import signal
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        pr_set_pdeathsig = 1
+        libc.prctl(pr_set_pdeathsig, signal.SIGTERM, 0, 0, 0)
+    except OSError:  # no libc to ask: the parent's own cleanup still runs
+        pass
+
+
+def stop_pool(executor) -> None:
+    """Stop a pool now, on a failure or an interrupt: queued work is
+    cancelled and running workers are terminated, so nothing keeps working
+    for a sweep that will not use it (until 2026-11-11 the pool's exit
+    waited for every running task, and a KeyboardInterrupt left the workers
+    running; review E12). An inline pool has nothing to stop."""
+    if not isinstance(executor, ProcessPoolExecutor):
+        return
+    processes = list((getattr(executor, "_processes", None) or {}).values())
+    executor.shutdown(wait=False, cancel_futures=True)
+    for p in processes:
+        if p.is_alive():
+            p.terminate()
+    for p in processes:
+        p.join(timeout=10)
 
 
 def _worker_plan(work: Path) -> QueryPlan:
@@ -1037,6 +1202,8 @@ def _read_ledger(path: Path) -> Ledger:
         iit=_f64(t.column("iit").fill_null(np.nan)),
         scan_lower=_f64(t.column("scan_window_lower").fill_null(np.nan)),
         scan_upper=_f64(t.column("scan_window_upper").fill_null(np.nan)),
+        peak_count=t.column("peak_count").fill_null(-1).to_numpy().astype(np.int64),
+        read=t.column("read").to_numpy(zero_copy_only=False).astype(bool),
     )
     parent = t.column("parent_scan").fill_null(-1).to_numpy().astype(np.int64)
     rows = ledger.scan_rows(parent)
@@ -1114,42 +1281,33 @@ def _map_stream(
     written once ``run_rows`` rows are held (matches, evidence and claims
     alike). Returns the number of matches.
 
-    Claims are written only for whole blocks: a block's window groups
-    interleave scan numbers, so a claims run ending inside a block would
-    be out of scan order with the next, and putting them back in order
-    then needed the whole shard's claims at once (2026-11-10). A block's
-    claims are held until it ends, so runs follow one another in scan
-    order and are made into the table one at a time."""
+    Claims are written with the rest, as sorted runs. A block's window
+    groups interleave scan numbers, so runs are not in scan order with one
+    another: the claims stage merges them (:func:`_claims_part`). Every
+    claim of a point comes in one window group, so each run's shared
+    counts are whole. Until 2026-11-11 a whole block's claims were held,
+    whatever ``run_rows`` said (14.9× it in a test; review E8)."""
     shared = np.zeros(plan.n_queries, dtype=np.int64) if settings.claims else None
     # The caller's list is emptied as it is written, so what was held in
     # memory is freed rather than kept for the rest of the shard.
     given = pending if pending is not None else []
     pending: list[_MapOut] = []
-    reading: list[Claims] = []  # the claims of the block being read
-    finished: list[Claims] = []  # the claims of whole blocks, not yet written
     held = total = run = 0
 
     def take(part: _MapOut) -> None:
         nonlocal held, total
-        held += part.rows  # its claims are held too, until their block is written
+        held += part.rows
         total += part.matches.n
-        if part.claims.n:
-            reading.append(part.claims)
-            part = replace(part, claims=Claims.empty())
-        if part.ends_block:
-            finished.extend(reading)
-            reading.clear()
         pending.append(part)
 
     def flush() -> None:
         nonlocal held, run
-        if not pending and not finished:
+        if not pending:
             return
         out = _MapOut.concat(pending)
-        claims = Claims.concat(finished)
+        claims = out.claims
         pending.clear()
-        finished.clear()
-        held = sum(c.n for c in reading)
+        held = 0
         name = _run_name(index, run)
         m = out.matches
         m = m.take(order_by(m.query, m.level, m.scan, m.channel, m.point_index))
@@ -1174,8 +1332,6 @@ def _map_stream(
         take(part)
         if held >= settings.run_rows:
             flush()
-    finished.extend(reading)  # a stream that ended inside a block
-    reading.clear()
     flush()
     if settings.claims:
         at = np.flatnonzero(shared)
@@ -1273,25 +1429,65 @@ def _reduce_bucket(
     return out
 
 
-def _claims_part(work: str, index: int, acquisition_id: int) -> list[str]:
-    """A shard's claims with their claimants, run by run, in scan order.
+#: Rows a claims run is read in, while the runs are merged.
+CLAIMS_MERGE_ROWS = 1 << 16
 
-    Each run holds whole blocks, sorted (``_map_stream``), and the runs
-    follow one another in scan order, so a run at a time is enough: holding
-    them all to sort them as one (2026-11-10, briefly) undid the memory
-    bound of a sweep spilled to disk, which is one shard. Runs are taken in
-    the order written, by number (by name, a run past 9,999 came first)."""
+
+def _claims_part(work: str, index: int, acquisition_id: int) -> list[str]:
+    """A shard's claims with their claimants, in scan order, a part per
+    merged chunk.
+
+    Each run is sorted (``_map_stream``) but runs interleave scans, so they
+    are merged: each run is read :data:`CLAIMS_MERGE_ROWS` rows at a time,
+    and every row up to the lowest (scan, point) any run's batch ends on is
+    taken, sorted and written. So what is held is a batch per run, never a
+    run or the shard (holding them all to sort them as one undid the
+    memory bound of a sweep spilled to disk, 2026-11-10). A point's claims
+    are all in one run, so the merge on (scan, point) is the full order."""
     w = Path(work)
     plan = _worker_plan(w)
     ledger, _ = _worker_ledger(w)
     out = []
-    for f in _shard_runs(w / "claims", index):
-        claims = Claims.from_table(pq.read_table(f))
+    for n, claims in enumerate(_merged_claims(_shard_runs(w / "claims", index))):
         READ_STATS["claims_held"] = max(READ_STATS["claims_held"], claims.n)
-        path = w / "reduce" / CLAIMS / f"part-{f.stem.removeprefix('shard-')}.parquet"
+        path = w / "reduce" / CLAIMS / f"part-{index:05d}-{n:04d}.parquet"
         _write(claims_table(claims, plan, ledger, acquisition_id), path)
         out.append(str(path))
     return out
+
+
+def _merged_claims(files: Sequence[Path]) -> Iterator[Claims]:
+    """Claims runs (each sorted, ``Claims.sorted``) merged into one sorted
+    stream of chunks (:func:`_claims_part`)."""
+    readers = [pq.ParquetFile(f).iter_batches(batch_size=CLAIMS_MERGE_ROWS) for f in files]
+    buffers: list[Claims | None] = [None] * len(readers)
+
+    def refill(i: int) -> None:
+        while buffers[i] is None or buffers[i].n == 0:
+            batch = next(readers[i], None)
+            if batch is None:
+                buffers[i] = None
+                return
+            buffers[i] = Claims.from_table(pa.Table.from_batches([batch]))
+
+    def key(c: Claims) -> np.ndarray:
+        return (c.scan.astype(np.int64) << 32) | c.point_index.astype(np.int64)
+
+    for i in range(len(readers)):
+        refill(i)
+    while any(b is not None for b in buffers):
+        frontier = min(int(key(b)[-1]) for b in buffers if b is not None)
+        taken = []
+        for i, b in enumerate(buffers):
+            if b is None:
+                continue
+            k = key(b)
+            cut = int(np.searchsorted(k, frontier, side="right"))
+            if cut:
+                taken.append(b.take(np.arange(cut)))
+                buffers[i] = b.take(np.arange(cut, b.n))
+                refill(i)
+        yield Claims.concat(taken).sorted()
 
 
 def _shard_runs(directory: Path, index: int) -> list[Path]:
@@ -1344,10 +1540,14 @@ def _buckets(weights: np.ndarray, target: int) -> list[tuple[int, int]]:
     return list(zip(edges[:-1], edges[1:]))
 
 
-def _run(executor, fn, jobs, progress, stage) -> list:
+def _run(executor, fn, jobs, progress, stage, *, first=None) -> list:
+    """Run ``jobs`` in ``executor``; ``first`` (if given) is called with the
+    first job to finish's index and result, before the rest are waited on."""
     futures = [executor.submit(fn, *job) for job in jobs]
     emit_start(progress, stage, total=len(futures))
-    for done, _ in enumerate(as_completed(futures), 1):
+    for done, future in enumerate(as_completed(futures), 1):
+        if done == 1 and first is not None:
+            first(futures.index(future), future.result())
         emit_progress(progress, stage, done, len(futures))
     results = [f.result() for f in futures]
     emit_done(progress, stage, completed=len(futures), total=len(futures))
@@ -1381,7 +1581,7 @@ def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progre
     axis = _load_axis(bundle, settings)
     # Read (and checked: a multi-CV run is refused) before any worker starts;
     # its point counts are the shards', filled in after the map.
-    ledger = _scan_metadata(bundle)
+    ledger = _scan_metadata(bundle, window)
     # A range is cut into shards of its own (until 2026-11-09 the whole run's
     # shards were trimmed to it, so a range inside one shard ran in one process).
     shards = (
@@ -1392,35 +1592,19 @@ def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progre
         if workers > 1
         else _Inline()
     )
-    with pool as executor:
-        if resume is None:
-            _run(executor, _map_shard,
-                 [(str(bundle), str(work), i, r, settings) for i, r in enumerate(shards)],
-                 progress, "sweep: matching")  # fmt: skip
-        else:
-            meta, blocks, held = resume
-            _map_stream(work, 0, plan, meta, blocks, settings, pending=held)
-        for f in sorted((work / "scans").glob("shard-*.parquet")):
-            t = pq.read_table(f)
-            ledger.n_points[ledger.rows_of(t.column("scan").to_numpy().astype(np.int64))] = t.column(
-                "n_points"
-            ).to_numpy()
-        _write(ledger.table(), work / "scans.parquet")
-        counts = np.zeros(plan.n_queries, dtype=np.int64)
-        for f in sorted((work / "matches").glob("shard-*.parquet")):
-            q = pq.read_table(f, columns=["query"]).column("query").to_numpy()
-            counts += np.bincount(q, minlength=plan.n_queries)
-        buckets = _buckets(_reduce_weights(plan, ledger, settings, reducers, counts), settings.reduce_rows)
-        paths = _run(executor, _reduce_bucket,
-                     [(str(work), i, q0, q1, tuple(reducers), settings) for i, (q0, q1) in enumerate(buckets)],
-                     progress, "sweep: reducing")  # fmt: skip
-        claim_parts = (
-            _run(executor, _claims_part,
-                 [(str(work), i, settings.acquisition_id) for i in range(len(shards))],
-                 progress, "sweep: claims")  # fmt: skip
-            if settings.claims
-            else []
-        )
+    try:
+        with pool as executor:
+            try:
+                paths, claim_parts = _on_disk_stages(executor, bundle, plan, settings, reducers, work, progress,
+                                                     resume, ledger, shards)  # fmt: skip
+            except BaseException:
+                stop_pool(executor)
+                raise
+    except BaseException:
+        # Nothing will read a failed sweep's directory: it is this sweep's
+        # own (``own_dir``, or a temporary one), so it is removed.
+        shutil.rmtree(work, ignore_errors=True)
+        raise
     _WORKER.clear()
     result = SweepResult(scans=ledger, matches=None, mz_axis=None if axis is None else axis.key, work=work)
     for reducer in reducers:
@@ -1431,3 +1615,37 @@ def _sweep_on_disk(bundle, plan, settings, reducers, workers, work: Path, progre
         result.parts[CLAIMS] = [Path(p) for part in claim_parts for p in part]
         result.schemas[CLAIMS] = SWEEP_POINT_CLAIM_TABLE
     return result
+
+
+def _on_disk_stages(executor, bundle, plan, settings, reducers, work: Path, progress, resume, ledger, shards):
+    """The on-disk sweep's map, reduce and claims stages, in ``executor``:
+    each reducer's part paths per bucket, and the claims' parts."""
+    if resume is None:
+        _run(executor, _map_shard,
+             [(str(bundle), str(work), i, r, settings) for i, r in enumerate(shards)],
+             progress, "sweep: matching", first=lambda i, _: _check_room_on_disk(work, ledger, shards, i, plan))  # fmt: skip
+    else:
+        meta, blocks, held = resume
+        _map_stream(work, 0, plan, meta, blocks, settings, pending=held)
+    for f in sorted((work / "scans").glob("shard-*.parquet")):
+        t = pq.read_table(f)
+        ledger.n_points[ledger.rows_of(t.column("scan").to_numpy().astype(np.int64))] = t.column(
+            "n_points"
+        ).to_numpy()
+    _write(ledger.table(), work / "scans.parquet")
+    counts = np.zeros(plan.n_queries, dtype=np.int64)
+    for f in sorted((work / "matches").glob("shard-*.parquet")):
+        q = pq.read_table(f, columns=["query"]).column("query").to_numpy()
+        counts += np.bincount(q, minlength=plan.n_queries)
+    buckets = _buckets(_reduce_weights(plan, ledger, settings, reducers, counts), settings.reduce_rows)
+    paths = _run(executor, _reduce_bucket,
+                 [(str(work), i, q0, q1, tuple(reducers), settings) for i, (q0, q1) in enumerate(buckets)],
+                 progress, "sweep: reducing")  # fmt: skip
+    claim_parts = (
+        _run(executor, _claims_part,
+             [(str(work), i, settings.acquisition_id) for i in range(len(shards))],
+             progress, "sweep: claims")  # fmt: skip
+        if settings.claims
+        else []
+    )
+    return paths, claim_parts

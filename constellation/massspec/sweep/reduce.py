@@ -68,6 +68,13 @@ class Ledger:
     #: The ledger row of the scan one level down each scan was taken from
     #: (``acquisition_structure.parent_scans``), -1 for none.
     parent: np.ndarray | None = None
+    #: How many points the bundle holds for each scan (scan metadata's
+    #: ``peak_count``), -1 where it does not say; and whether the sweep read
+    #: the scan (inside its ``scan_range`` / ``rt_range``). A scan read and
+    #: holding no points was measured and found nothing, so it is a slot of
+    #: zeros on its queries' axes; one not read is no slot (review V3).
+    peak_count: np.ndarray | None = None
+    read: np.ndarray | None = None
     #: Built on first use: each level's WindowIndex (eligibility is
     #: decided on it at every call, so it is built once, not regrouped).
     _cache: dict = field(default_factory=dict, compare=False, repr=False)
@@ -78,19 +85,33 @@ class Ledger:
                 object.__setattr__(self, name, np.full(self.scan.size, np.nan))
         if self.parent is None:
             object.__setattr__(self, "parent", np.full(self.scan.size, -1, np.int64))
+        if self.peak_count is None:
+            object.__setattr__(self, "peak_count", np.full(self.scan.size, -1, np.int64))
+        if self.read is None:
+            object.__setattr__(self, "read", np.ones(self.scan.size, bool))
+
+    @property
+    def present(self) -> np.ndarray:
+        """Each scan can be a slot: it has points, or it was read and holds
+        none (an empty scan, a measured zero). Until 2026-11-11 only scans
+        with points were, so an empty scan was a gap in every trace and an
+        MS2 slot whose parent was empty had none."""
+        return (self.n_points > 0) | (self.read & (self.peak_count == 0))
 
     @property
     def n(self) -> int:
         return int(self.scan.size)
 
     def window_index(self, level: int) -> WindowIndex:
-        """The level's scans with points and a time, by isolation window
-        (MS1 as one unbounded window). Keyed by the points the map has
-        recorded, so an index is never used before they are all in."""
-        key = ("windows", int(level), int(self.n_points.sum()), self.n)
+        """The level's scans that can be slots (:attr:`present`) and have a
+        time, by isolation window (MS1 as one unbounded window). Keyed by
+        the points the map has recorded, so an index is never used before
+        they are all in."""
+        present = self.present
+        key = ("windows", int(level), int(self.n_points.sum()), int(present.sum()), self.n)
         found = self._cache.get(key)
         if found is None:
-            found = window_index(self.scan, self.level, self.rt, self.lower, self.upper, self.n_points,
+            found = window_index(self.scan, self.level, self.rt, self.lower, self.upper, present,
                                  int(level), gate=level > 1)  # fmt: skip
             self._cache[key] = found
         return found
@@ -145,6 +166,8 @@ class Ledger:
                 "scan_window_lower": pa.array(self.scan_lower, mask=np.isnan(self.scan_lower)),
                 "scan_window_upper": pa.array(self.scan_upper, mask=np.isnan(self.scan_upper)),
                 "parent_scan": pa.array(parent.astype(np.int32), mask=parent < 0),
+                "peak_count": pa.array(self.peak_count.astype(np.int64), mask=self.peak_count < 0),
+                "read": pa.array(self.read.astype(bool)),
             },
             schema=SWEEP_SCAN_TABLE,
         )

@@ -1010,3 +1010,224 @@ def test_cells_merge_is_the_sort_it_replaced(tmp_root, name, rule):
                 for column in ("query", "row", "channel", "matched", "point_index", "n_points", "mz_observed",
                                "intensity"):  # fmt: skip
                     np.testing.assert_array_equal(getattr(got, column), getattr(want, column), err_msg=column)
+
+
+# ── review 2026-11-10: V3, E7–E12 ─────────────────────────────────────
+
+
+class _Fails:
+    """A reducer that fails at its first call (to stop a sweep part way)."""
+
+    name, schema, gated = "fails", pa.schema([("n", pa.int64())]), False
+
+    def reduce(self, batch):
+        raise RuntimeError("stop here")
+
+
+def _emptied_run(tmp_path: Path, name: str):
+    """A planted DIA run with one MS1 and one MS2 scan holding no points."""
+    from constellation.massspec.precursor_major import build_precursor_major
+
+    run = planted_run(acquisition="dia", cycles=30, window_width=100.0)
+    scans = [dict(s) for s in run.scans]
+    target_mz = float(compile_queries(_targets(run), levels=[2]).precursor_mz[0])
+    middle = len(scans) // 2
+    ms1 = next(i for i in range(middle, len(scans)) if scans[i]["level"] == 1)
+    ms2 = next(i for i in range(ms1, len(scans)) if scans[i]["level"] == 2
+               and scans[i]["isolation_lower"] <= target_mz <= scans[i]["isolation_upper"])  # fmt: skip
+    for i in (ms1, ms2):
+        scans[i]["mz"], scans[i]["intensity"] = np.empty(0), np.empty(0)
+    bundle = write_bundle_manifest(write_bundle(tmp_path, name, scans))
+    build_precursor_major(bundle)
+    return run, bundle, scans[ms1]["scan"], scans[ms2]["scan"]
+
+
+def test_an_empty_scan_is_a_slot_of_zeros_on_every_path(tmp_path):
+    """A scan read and holding no points was measured and found nothing:
+    it is on its queries' axes, zero-filled, where it was a gap (V3)."""
+    run, bundle, ms1_scan, ms2_scan = _emptied_run(tmp_path, "emptied")
+    plan = compile_queries(_targets(run), levels=[1, 2])
+    tol = {1: (20.0, "ppm"), 2: (0.35, "Da")}
+    reducer = XicTraceReducer(drop_unmatched=False)
+    base = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[reducer]).table("xic_trace")
+    scans = set(base.column("scan").to_pylist())
+    assert ms1_scan in scans and ms2_scan in scans
+    empty = base.filter(pc.is_in(base.column("scan"), pa.array([ms1_scan, ms2_scan], pa.int32())))
+    assert empty.num_rows > 0 and np.isnan(empty.column("mz_observed").to_numpy()).all()
+    small = SweepSettings(tolerances=tol, shard_rows=3000, reduce_rows=500)
+    for kw in (dict(settings=small, workers=2, work_dir=tmp_path / "w"),
+               dict(settings=SweepSettings(tolerances=tol), layout="precursor_major")):  # fmt: skip
+        settings = kw.pop("settings")
+        got = sweep(bundle, plan, settings, reducers=[reducer], **kw).table("xic_trace")
+        meta = {k: v for k, v in (got.schema.metadata or {}).items() if k != b"x.massspec.sweep.layout"}
+        got = got.replace_schema_metadata(meta)
+        if kw.get("layout") == "precursor_major":  # its parts come in units of queries by precursor m/z
+            order = pc.sort_indices(got, sort_keys=[("target_id", "ascending")])  # stable: rows keep their order
+            got = got.take(order)
+            base_sorted = base.take(pc.sort_indices(base, sort_keys=[("target_id", "ascending")]))
+            oracle.assert_traces_identical(got, base_sorted)
+        else:
+            oracle.assert_traces_identical(got, base)
+    # A scan the sweep did not read is no slot, empty or not.
+    first = min(s["scan"] for s in run.scans)
+    ranged = sweep(bundle, plan, SweepSettings(tolerances=tol), reducers=[reducer],
+                   scan_range=(first, ms1_scan - 1)).table("xic_trace")  # fmt: skip
+    assert ms1_scan not in set(ranged.column("scan").to_pylist())
+
+
+def test_an_in_memory_sweep_writes_its_outputs_past_memory_rows(tmp_root, tmp_path):
+    """The outputs were held whole, so a per-cell output outgrew the bound
+    the map is held to (E7)."""
+    import gc
+
+    from constellation.massspec.sweep.reduce import QuerySummaryReducer
+
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2])
+    tol = {1: (20.0, "ppm"), 2: (0.35, "Da")}
+    reducers = [XicTraceReducer(drop_unmatched=False), QuerySummaryReducer()]
+    base = sweep(bundle, plan, SweepSettings(tolerances=tol, reduce_rows=2000), reducers=reducers)
+    trace_rows = base.table("xic_trace").num_rows
+    held = base.matches.n
+    assert trace_rows > 4 * held  # the zero-filled trace outgrows the map
+    limit = 2 * held
+    got = sweep(bundle, plan, SweepSettings(tolerances=tol, reduce_rows=2000, memory_rows=limit),
+                reducers=reducers, spill_dir=tmp_path)  # fmt: skip
+    assert got.matches is not None  # the map stayed in memory
+    assert got.parts["xic_trace"] and got.work.parent == tmp_path
+    assert max(pq.read_metadata(p).num_rows for p in got.parts["xic_trace"]) <= limit + 2000 * 4
+    oracle.assert_traces_identical(got.table("xic_trace"), base.table("xic_trace"))
+    assert got.table("query_summary").equals(base.table("query_summary"))
+    work = got.work
+    del got
+    gc.collect()
+    assert not work.exists()
+
+
+def test_map_side_claims_are_written_in_runs_not_whole_blocks(tmp_root, tmp_path):
+    """A whole block's claims were held, whatever run_rows said (E8)."""
+    from constellation.massspec.sweep.engine import CLAIMS
+    from constellation.massspec.sweep.reduce import QuerySummaryReducer
+
+    run, bundle, _ = _run("dia", tmp_root)
+    rows = run.targets.to_pylist()
+    rows += [dict(r, target_id=r["target_id"] + 9000) for r in rows]  # every point claimed twice
+    plan = compile_queries(pa.Table.from_pylist(rows, schema=XIC_TARGET_TABLE), levels=[1, 2], rt_window=20.0)
+    tol = {1: (20.0, "ppm"), 2: (20.0, "ppm")}
+    want = sweep(bundle, plan, SweepSettings(tolerances=tol, rule=AllWithin(), claims=True),
+                 reducers=[QuerySummaryReducer()])  # fmt: skip
+    settings = SweepSettings(tolerances=tol, rule=AllWithin(), claims=True, block_rows=1 << 22, run_rows=200)
+    got = sweep(bundle, plan, settings, reducers=[QuerySummaryReducer()], work_dir=tmp_path / "w")
+    assert got.table(CLAIMS).equals(want.table(CLAIMS))
+    assert got.table("query_summary").equals(want.table("query_summary"))
+    runs = [pq.read_metadata(f).num_rows for f in (got.work / "claims").glob("*.parquet")]
+    total = want.table(CLAIMS).num_rows
+    assert len(runs) > 3 and max(runs) < total / 3  # one block, many runs
+
+
+def test_the_spill_estimate_follows_the_points_matched(tmp_path, monkeypatch):
+    """The estimate scaled by the points read, which a whole block counts
+    before its window groups are matched: 0.16 of what a spill wrote (E9)."""
+    from constellation.massspec.sweep import engine
+
+    run = planted_run(acquisition="dia", cycles=80, window_width=50.0, noise_peaks=150, seed=41)
+    bundle = write_bundle_manifest(write_bundle(tmp_path, "dia", run.scans, row_group_size=200))
+    rows = run.targets.to_pylist()
+    # Many global queries, so matches pile up far faster than in a run's first scans.
+    rows += [dict(r, target_id=50_000 + 100 * k + i, rt_center=None)
+             for k in range(150) for i, r in enumerate(run.targets.to_pylist())]  # fmt: skip
+    plan = compile_queries(pa.Table.from_pylist(rows, schema=XIC_TARGET_TABLE), levels=[2])
+    seen = {}
+    real = engine._spill_estimate
+
+    def spy(*args, **kw):
+        seen["need"] = real(*args, **kw)
+        return seen["need"]
+
+    monkeypatch.setattr(engine, "_spill_estimate", spy)
+    s = SweepSettings(tolerances={2: (0.35, "Da")}, memory_rows=20_000, run_rows=50_000, block_rows=200_000)
+    got = sweep(bundle, plan, s, reducers=[XicTraceReducer()], spill_dir=tmp_path / "spill")
+    # In rows: synthetic runs compress far better than real ones, so the
+    # bytes a row takes on disk is not what is tested.
+    written = sum(pq.read_metadata(f).num_rows for kind in ("matches", "evidence", "claims")
+                  if (got.work / kind).exists() for f in (got.work / kind).glob("*.parquet"))  # fmt: skip
+    assert 0.5 < seen["need"] / engine.SPILL_BYTES_PER_ROW / written < 2.0
+
+
+def test_a_sweep_on_disk_is_checked_for_room_after_its_first_shard(tmp_root, tmp_path, monkeypatch):
+    from collections import namedtuple
+
+    from constellation.massspec.sweep import engine
+
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2])
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(engine.shutil, "disk_usage", lambda path: usage(10, 10, 0))
+    with pytest.raises(OSError, match="GB free"):
+        sweep(bundle, plan, SweepSettings(tolerances={1: (20.0, "ppm"), 2: (0.35, "Da")}, shard_rows=3000),
+              reducers=[XicTraceReducer()], work_dir=tmp_path / "w")  # fmt: skip
+    assert not list((tmp_path / "w").glob("sweep-*"))  # a failed sweep's own directory is removed
+
+
+@pytest.mark.parametrize("layout", ["scan_major", "precursor_major"])
+def test_a_failed_sweep_stops_its_workers_and_removes_its_directory(tmp_path, layout):
+    """The pool's exit waited for every running task, and the sweep's own
+    directory was left behind (E12)."""
+    import multiprocessing
+
+    run, bundle, _, _ = _emptied_run(tmp_path, "fails")
+    plan = compile_queries(_targets(run), levels=[2])
+    settings = SweepSettings(tolerances={2: (0.35, "Da")}, shard_rows=2000, reduce_rows=300, unit_cells=500)
+    with pytest.raises(RuntimeError, match="stop here"):
+        sweep(bundle, plan, settings, reducers=[_Fails()], workers=2, work_dir=tmp_path / "w", layout=layout)
+    assert not list((tmp_path / "w").glob("sweep-*"))
+    assert not [p for p in multiprocessing.active_children() if p.is_alive()]
+
+
+def test_latest_is_resolved_once_for_every_worker(tmp_path, monkeypatch):
+    """Scan-major resolved mz_axis='latest' again in each worker (E10)."""
+    from constellation.massspec import mz_axis as mz_axis_mod
+    from constellation.massspec.mz_axis import MZ_AXIS_TABLE, MzAxis, save_mz_axis
+
+    run = planted_run(acquisition="dia", cycles=20, window_width=100.0)
+    bundle = write_bundle_manifest(write_bundle(tmp_path, "axis", run.scans))
+    table = pa.Table.from_pylist(
+        [dict(level=lv, mz=float(m), shift_th=0.0, se_th=1e-4, coherence=0.9, half_window_th=10.0)
+         for lv in (1, 2) for m in np.arange(100.0, 2100.0, 20.0)],
+        schema=MZ_AXIS_TABLE,
+    )  # fmt: skip
+    save_mz_axis(bundle, MzAxis(key="first", table=table, parameters={"method": "test"}))
+    asked = []
+    real = mz_axis_mod.load_mz_axis
+
+    def spy(bundle_dir, key=mz_axis_mod.LATEST):
+        asked.append(key)
+        return real(bundle_dir, key)
+
+    monkeypatch.setattr(mz_axis_mod, "load_mz_axis", spy)
+    plan = compile_queries(_targets(run), levels=[2])
+    got = sweep(bundle, plan, SweepSettings(tolerances={2: (0.35, "Da")}, mz_axis="latest"),
+                reducers=[XicTraceReducer()], work_dir=tmp_path / "w")  # fmt: skip
+    assert got.mz_axis == "first"
+    assert asked[0] == "latest" and all(k == "first" for k in asked[1:])
+
+
+def test_claims_name_queries_by_the_whole_plan(tmp_root):
+    """A taken plan's claims named its local query numbers (E11)."""
+    from constellation.massspec.sweep.engine import CLAIMS
+    from constellation.massspec.sweep.reduce import QuerySummaryReducer
+
+    run, bundle, _ = _run("dia", tmp_root)
+    rows = run.targets.to_pylist()
+    rows += [dict(r, target_id=r["target_id"] + 9000) for r in rows]
+    plan = compile_queries(pa.Table.from_pylist(rows, schema=XIC_TARGET_TABLE), levels=[2], rt_window=20.0)
+    taken = plan.take(np.arange(2, plan.n_queries))
+    got = sweep(bundle, taken, SweepSettings(tolerances={2: (0.35, "Da")}, rule=AllWithin(), claims=True),
+                reducers=[QuerySummaryReducer()])  # fmt: skip
+    claims = got.table(CLAIMS)
+    assert claims.num_rows > 0
+    summary = got.table("query_summary")
+    by_target = dict(zip(summary.column("target_id").to_pylist(), summary.column("query").to_pylist()))
+    for t, q in zip(claims.column("target_id").to_pylist(), claims.column("query").to_pylist()):
+        assert by_target[t] == q
+    assert min(claims.column("query").to_pylist()) >= 2
