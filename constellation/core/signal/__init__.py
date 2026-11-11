@@ -7,14 +7,26 @@ of a gridded density (``modal_path``: EncyclopeDIA's greedy walk and a
 globally optimal dynamic-programming path); and monotone alignment of
 one axis onto another through their joint density (``alignment``), the
 retention-time alignment's generic core; and the phase of one periodic
-component of a signal (``phase``), the m/z axis's generic core. Baseline
-correction / smoothing / prominence peak-picking / calibration land here
-as they are ported. Torch-native; imports ``core.stats`` for ppm/Da
-conversions (and, later, ``Parametric`` peak fits).
+component of a signal (``phase``), the m/z axis's generic core.
+
+Batched, masked trace operations (2026-11-11; rows of ``[..., N]`` with a
+validity mask, irregular axes allowed): ``smooth`` (moving average,
+Gaussian, an exact masked Savitzky–Golay), ``baseline`` (rolling quantile,
+morphological opening, SNIP), ``noise`` (robust MADs), ``consensus``
+(several traces made one), ``interpolate`` (brackets and per-row
+interpolation), and ``peaks``, peak detection as interchangeable stages
+composed by a ``PeakPicker`` (``docs/plans/peak-detection.md``).
+Torch-native; imports ``core.stats`` for ppm/Da conversions and peak forms,
+and ``core.optim`` for fits.
 """
 
 from __future__ import annotations
 
+from constellation.core.signal.baseline import opening, rolling_quantile, snip
+from constellation.core.signal.consensus import collapse
+from constellation.core.signal.interpolate import Bracket, bracket, interp_rows
+from constellation.core.signal.noise import diff_mad, residual_mad, rolling_mad
+from constellation.core.signal.smooth import gaussian, moving_average, savitzky_golay
 from constellation.core.signal.alignment import (
     GlobalPathOptions,
     GreedyOptions,
@@ -50,4 +62,17 @@ __all__ = [
     "theil_sen",
     "PhaseFold",
     "WindowPhase",
+    "moving_average",
+    "gaussian",
+    "savitzky_golay",
+    "rolling_quantile",
+    "opening",
+    "snip",
+    "diff_mad",
+    "residual_mad",
+    "rolling_mad",
+    "collapse",
+    "bracket",
+    "Bracket",
+    "interp_rows",
 ]
