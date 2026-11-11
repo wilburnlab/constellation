@@ -17,17 +17,69 @@ reference is a predicted scale):
 ``per="peptide"`` keeps one pair per peptide, its best-scoring
 precursor's (EncyclopeDIA fits one point per peptide); ``"precursor"``
 keeps charge states apart.
+
+**The reference's clock.** Pairs say what clock ``reference_rt`` is on,
+in their schema metadata (:data:`REFERENCE_SCALE_KEY`, read by
+:func:`reference_scale`): a library's ``x.massspec.prediction.rt_scale``
+(``chronologer_hi_seconds``, ``koina:<model>:irt``, ``irt``, or
+``observed`` for a chromatogram library), ``observed`` for another run's
+times, and nothing where the source does not say (taken as seconds, as
+before). Until 2026-11-11 pairs recorded none, so a JChronologer library's
+times entered an alignment as seconds (review of 2026-11-10, S11);
+:func:`~constellation.massspec.rt.align` now refuses to fit a model's
+clock as seconds.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-__all__ = ["PAIR_SCHEMA", "library_pairs", "run_pairs", "engine_pairs", "FINAL_PASSES"]
+__all__ = [
+    "PAIR_SCHEMA",
+    "REFERENCE_SCALE_KEY",
+    "library_pairs",
+    "run_pairs",
+    "engine_pairs",
+    "FINAL_PASSES",
+    "on_model_clock",
+    "reference_scale",
+    "with_reference_scale",
+]
+
+#: Where pairs, and the tables made from them, record the clock their
+#: reference times are on.
+REFERENCE_SCALE_KEY = "x.massspec.rt.reference_scale"
+#: A run's own seconds (a library's ``rt_scale`` for observed times).
+OBSERVED = "observed"
+#: Where a library records the clock of its ``rt_predicted``.
+_LIBRARY_SCALE_KEY = "x.massspec.prediction.rt_scale"
+
+
+def reference_scale(table: pa.Table) -> str | None:
+    """The clock ``table``'s reference times are on (pairs, an
+    ``RT_ALIGNMENT`` table), as recorded; None when it records none."""
+    value = (table.schema.metadata or {}).get(REFERENCE_SCALE_KEY.encode())
+    return value.decode("utf-8") if value else None
+
+
+def with_reference_scale(table: pa.Table, scale: str | None) -> pa.Table:
+    """``table`` recording ``scale`` as its reference's clock (unchanged for
+    None)."""
+    if not scale:
+        return table
+    meta = dict(table.schema.metadata or {})
+    meta[REFERENCE_SCALE_KEY.encode()] = str(scale).encode("utf-8")
+    return table.replace_schema_metadata(meta)
+
+
+def on_model_clock(scale: str | None) -> bool:
+    """Whether a clock is a model's (or mixes one in): not a run's seconds,
+    which ``observed`` and an unstated clock are."""
+    return bool(scale) and scale != OBSERVED
 
 PAIR_SCHEMA = pa.schema(
     [
@@ -87,30 +139,50 @@ def _best_per(table: pa.Table, key: str) -> pa.Table:
     return table.drop_columns(["_row"])
 
 
-def _pairs(columns: dict) -> pa.Table:
-    return pa.table({f.name: columns.get(f.name, pa.nulls(len(columns["reference_rt"]), f.type)) for f in PAIR_SCHEMA},
-                    schema=PAIR_SCHEMA)
+def _pairs(columns: dict, scale: str | None = None) -> pa.Table:
+    table = pa.table({f.name: columns.get(f.name, pa.nulls(len(columns["reference_rt"]), f.type))
+                      for f in PAIR_SCHEMA}, schema=PAIR_SCHEMA)  # fmt: skip
+    return with_reference_scale(table, scale)
+
+
+def _library_scale(precursors: Any, given: str | None) -> tuple[pa.Table, str | None]:
+    """The precursor table of ``precursors`` (a table, or a ``Library``) and
+    the clock of its times: ``given``, else what the library or the table's
+    metadata records."""
+    if not isinstance(precursors, pa.Table) and hasattr(precursors, "precursors"):
+        extras = getattr(precursors, "metadata_extras", None) or {}
+        found = extras.get(_LIBRARY_SCALE_KEY)
+        if not found and extras.get("x.koina.rt_scale"):  # Koina's older key
+            found = f"koina:{extras.get('x.koina.rt_model', '')}:{extras['x.koina.rt_scale']}"
+        return precursors.precursors, given or (str(found) if found else None)
+    meta = precursors.schema.metadata or {}
+    found = meta.get(_LIBRARY_SCALE_KEY.encode())
+    return precursors, given or (found.decode("utf-8") if found else None)
 
 
 def library_pairs(
     identifications: pa.Table,
-    precursors: pa.Table,
+    precursors: Any,
     *,
     max_qvalue: float | None = 0.01,
     include_decoys: bool = False,
     per: Per = "peptide",
     min_length: int | None = None,
     max_length: int | None = None,
+    rt_scale: str | None = None,
 ) -> pa.Table:
     """A library's retention times against a run's identifications.
 
     ``identifications`` is ``results.identifications`` for one run;
     ``precursors`` a ``PRECURSOR_TABLE`` (``precursor_id`` and
-    ``rt_predicted``) keyed by the same content-derived ids. Precursors
-    the library has no time for are dropped. ``min_length`` /
-    ``max_length`` bound the bare sequence (Chronologer-era pipelines
-    aligned 7–30 residues only).
+    ``rt_predicted``) keyed by the same content-derived ids, or the
+    ``Library`` itself. Precursors the library has no time for are
+    dropped. ``min_length`` / ``max_length`` bound the bare sequence
+    (Chronologer-era pipelines aligned 7–30 residues only). The pairs
+    record the library's clock (``rt_scale``, else the library's
+    ``x.massspec.prediction.rt_scale``; module docstring).
     """
+    precursors, scale = _library_scale(precursors, rt_scale)
     ids = _confident(identifications, max_qvalue, include_decoys)
     ids = _length_filter(ids, min_length, max_length)
     lib = precursors.select(["precursor_id", "rt_predicted"])
@@ -128,7 +200,8 @@ def library_pairs(
             "observed_rt": joined.column("rt"),
             "qvalue": joined.column("qvalue"),
             "is_decoy": joined.column("is_decoy"),
-        }
+        },
+        scale,
     )
 
 
@@ -162,7 +235,8 @@ def run_pairs(
             "observed_rt": joined.column("rt"),
             "qvalue": q,
             "is_decoy": joined.column("is_decoy"),
-        }
+        },
+        OBSERVED,
     )
 
 
@@ -176,10 +250,13 @@ def engine_pairs(
 
     One pass: ``pass_name``, or the engine's final one (``final``, then
     ``main``, then the last by name). Rows keep their order, which the
-    engine's own fit depends on, and its decoys, which it fitted with.
+    engine's own fit depends on, and its decoys, which it fitted with. The
+    clock the table records for its library times (``to_rt_alignment_table``
+    records it) goes with them.
     """
+    scale = reference_scale(rt_alignment)
     if rt_alignment.num_rows == 0:
-        return PAIR_SCHEMA.empty_table()
+        return with_reference_scale(PAIR_SCHEMA.empty_table(), scale)
     passes = set(rt_alignment.column("pass").to_pylist())
     chosen = pass_name or next((p for p in FINAL_PASSES if p in passes), sorted(passes)[-1])
     rows = rt_alignment.filter(pc.equal(rt_alignment.column("pass"), chosen))
@@ -196,5 +273,6 @@ def engine_pairs(
             "reference_rt": rows.column("library_rt"),
             "observed_rt": rows.column("observed_rt"),
             "is_decoy": rows.column("is_decoy"),
-        }
+        },
+        scale,
     )

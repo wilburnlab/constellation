@@ -80,7 +80,8 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
                              "both = the two in one sweep).")
     common.add_argument("--acquisition-id", type=int, default=None,
                         help="acquisition_id stamped on output rows (FK; default 0), and the run whose "
-                             "targets are taken from a source of several (an experiment, PSMs).")
+                             "targets are taken from a source of several (an experiment, PSMs). Targets "
+                             "identified in another run than --peaks-dir's are refused without it.")
     common.add_argument("--tolerance", type=float, default=20.0,
                         help="Match tolerance at every level without its own (default 20).")
     common.add_argument("--tolerance-unit", choices=("ppm", "Da"), default="ppm")
@@ -179,6 +180,19 @@ def _build_chromatogram_extract_parser(subs: argparse._SubParsersAction) -> None
     ms2g.add_argument("--max-fragment-charge", type=int, default=None,
                       help="Max fragment charge, capped by precursor charge (default 2, or the "
                            "fragment library's).")
+    ms2g.add_argument("--fragment-charge-below-precursor", type=int, default=None, metavar="K",
+                      help="Fragment charges below the precursor's by at least K: up to z - K for a precursor "
+                           "of charge z, at least 1 (EncyclopeDIA: 1; default 0, up to z).")
+    ms2g.add_argument("--min-fragment-mz", type=float, default=None, metavar="MZ",
+                      help="Make no fragment channel below this m/z, before --top-fragments chooses "
+                           "(default none).")
+    ms2g.add_argument("--precursor-exclusion", type=float, default=None, metavar="TH",
+                      help="Make no fragment channel within this many Th of the precursor m/z, before "
+                           "--top-fragments chooses (EncyclopeDIA's XCorr leaves out 10; default none).")
+    ms2g.add_argument("--no-acquired-ranges", dest="acquired_ranges", action="store_false",
+                      help="Make fragment channels outside the m/z range the MS2 scans acquired too. By "
+                           "default a bundle's ranges (by isolation window) are read and no channel is made "
+                           "outside them, so --top-fragments chooses among ions that can be measured.")
     ms2g.add_argument("--fragment-abundance", choices=("none", "uniform", "library"), default="none",
                       help="Where fragment channels' abundances come from: none; uniform (equal "
                            "intensity for every ion asked, the classic pre-Prosit assumption); "
@@ -307,6 +321,15 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
 
     _warn_level_flag_mismatch(args)
     targets = load_targets(args.targets, acquisition_id=args.acquisition_id)
+    mismatch = _other_run(targets, args.peaks_dir)
+    if mismatch is not None:
+        # Until 2026-11-11 one run's identifications were swept against any
+        # bundle, stamped acquisition 0 (review of 2026-11-10, C7).
+        if args.acquisition_id is None:
+            print(f"error: {mismatch}; pass --acquisition-id to sweep them against this run anyway",
+                  file=sys.stderr)  # fmt: skip
+            return 2
+        print(f"warning: {mismatch}; swept against it as --acquisition-id says", file=sys.stderr)
     if args.rt_window is not None:
         from constellation.massspec.sweep.queries import check_rt_window
 
@@ -359,6 +382,8 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
             top_isotopes=args.top_isotopes, charge_range=charge_range, ion_types=ion_types,
             max_fragment_charge=max_fragment_charge, neutral_losses=neutral_losses,
             top_fragments=args.top_fragments,
+            fragment_charge_below_precursor=given(args.fragment_charge_below_precursor, 0),
+            min_fragment_mz=args.min_fragment_mz, precursor_exclusion_th=args.precursor_exclusion,
         )  # fmt: skip
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -430,6 +455,7 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
             # A sweep that outgrows memory carries on beside the outputs, as
             # one on disk does, rather than in the system's temporary directory.
             spill_dir=args.output_dir,
+            acquired_ranges="bundle" if args.acquired_ranges else None,
         )  # fmt: skip
     except ValueError as exc:
         if layout != "precursor_major":
@@ -448,6 +474,7 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
         "tolerances": {str(lv): {"value": t, "unit": u} for lv, (t, u) in tolerances.items()},
         "mz_axis": result.mz_axis, "tables": tables,
         "channels": settings.to_dict(), "fragment_abundance": source.describe(),
+        "acquired_ranges": "bundle" if args.acquired_ranges and bundle and 2 in levels else None,
         "gate": None if gate is None else {
             "min_fragments": gate.min_fragments, "top_peaks": gate.top_peaks,
             "min_consecutive": gate.min_consecutive, "max_gap_s": gate.max_gap_s,
@@ -466,6 +493,27 @@ def _cmd_chromatogram_extract(args: argparse.Namespace) -> int:
         rows = pq.ParquetFile(out).metadata.num_rows
         print(f"extracted {rows} XIC rows → {args.output_dir}", file=sys.stderr)
     return 0
+
+
+def _other_run(targets, peaks_dir: Path) -> str | None:
+    """What is wrong when ``targets`` are one run's identifications and
+    ``peaks_dir`` is a bundle of another (by the source file each names),
+    else None (a source of no run, or a bundle that names none)."""
+    from constellation.massspec.quant.targets import same_run, target_run
+
+    run = target_run(targets)
+    if run is None or not (peaks_dir / "manifest.json").is_file():
+        return None
+    from constellation.massspec.acquisitions import acquisition_record_from_bundle
+
+    try:
+        swept = str(acquisition_record_from_bundle(peaks_dir)["source_file"])
+    except (FileNotFoundError, ValueError):
+        return None
+    if same_run(run, swept):
+        return None
+    return (f"the targets are identifications in run {run!r} and --peaks-dir is a bundle of {swept!r}: their "
+            f"retention times and scans are the other run's")  # fmt: skip
 
 
 def _warn_tolerance_against_analyzer(bundle: Path, tolerances: dict[int, tuple[float, str]]) -> None:
@@ -525,7 +573,9 @@ def _warn_level_flag_mismatch(args: argparse.Namespace) -> None:
     """Warn when a flag from the inactive level's group was set."""
     if args.level == "1":
         if args.ion_types is not None or args.max_fragment_charge is not None \
-                or args.neutral_losses or args.assigned_scans_only:
+                or args.neutral_losses or args.assigned_scans_only \
+                or args.fragment_charge_below_precursor is not None or args.min_fragment_mz is not None \
+                or args.precursor_exclusion is not None:
             print("warning: MS2 fragment options ignored with --level 1", file=sys.stderr)
     elif args.level == "2":
         if args.n_isotopes is not None or args.top_isotopes is not None or args.charge_range is not None \

@@ -482,6 +482,7 @@ def extract_xic(
     fragment_abundance=None,
     layout: str = "scan_major",
     spill_dir: Path | str | None = None,
+    acquired_ranges: Any = "bundle",
 ) -> "SweepResult":
     """Extract XIC traces for ``targets`` at every MS level in ``levels`` in
     one sweep of ``peaks`` (a bundle, streamed, or a peak table), each level
@@ -505,7 +506,13 @@ def extract_xic(
     precursor-major layout instead of its scan-ordered peaks (the same rows
     per target, in units of targets by precursor m/z; ``sweep``).
     ``spill_dir`` is where a sweep that outgrows memory carries on on disk
-    (the system's temporary directory by default; ``sweep``)."""
+    (the system's temporary directory by default; ``sweep``).
+    ``acquired_ranges`` is the MS2 acquired m/z range fragment channels are
+    made within (``sweep.compile_queries``): ``"bundle"`` (the default) reads
+    it from a bundle's scan metadata by isolation window, None makes every
+    channel, and anything else is given to the compile as it is. Until
+    2026-11-11 every channel was made, so the top N fragments counted ions
+    the scans never acquired (review of 2026-11-10, C6)."""
     from constellation.massspec.sweep import ChannelSettings, compile_queries
     from constellation.massspec.sweep.engine import SweepSettings, sweep
     from constellation.massspec.sweep.reduce import QuerySummaryReducer
@@ -516,6 +523,10 @@ def extract_xic(
 
     from constellation.massspec.peptide.channels import UNMODELLED
 
+    if isinstance(acquired_ranges, str):
+        if acquired_ranges != "bundle":
+            raise ValueError(f"acquired_ranges is 'bundle', None or the ranges; got {acquired_ranges!r}")
+        acquired_ranges = _bundle_ranges(peaks) if any(int(lv) >= 2 for lv in levels) else None
     plan = compile_queries(
         targets,
         levels=levels,
@@ -523,6 +534,7 @@ def extract_xic(
         rt_window=rt_window,
         assigned_scans_only=assigned_scans_only,
         fragment_abundance=fragment_abundance if fragment_abundance is not None else UNMODELLED,
+        acquired_ranges=acquired_ranges,
     )
     settings = SweepSettings(
         tolerances=dict(tolerances),
@@ -547,6 +559,19 @@ def extract_xic(
     for name in result.schemas:
         result.metadata[name] = {**result.metadata.get(name, {}), **stamp}
     return result
+
+
+def _bundle_ranges(peaks) -> pa.Table | None:
+    """A bundle's MS2 acquired ranges by isolation window, or None for a
+    peak table or a directory that is no bundle."""
+    if isinstance(peaks, pa.Table):
+        return None
+    path = Path(peaks)
+    if not ((path / "manifest.json").is_file() and (path / "scan_metadata.parquet").is_file()):
+        return None
+    from constellation.massspec.acquisition_structure import read_acquired_ranges
+
+    return read_acquired_ranges(path)
 
 
 def extract_xic_scan_major(

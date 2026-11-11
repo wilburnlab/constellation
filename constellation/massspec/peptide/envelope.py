@@ -1,7 +1,8 @@
 """Peptide isotope envelopes — charge-aware wrappers over `core.chem.isotopes`.
 
-`peptide_envelope` builds the elemental composition of a peptidoform
-via `core.sequence.protein.peptide_composition`, runs it through either
+`peptide_envelope` builds the composition of a peptidoform's atoms whose
+isotopes are distributed
+(`core.sequence.protein.natural_abundance_compositions`), runs it through either
 the binned (`isotope_envelope`) or exact (`isotope_envelope_exact`) path
 in `core.chem.isotopes`, then converts neutral masses to m/z at the
 requested charge.
@@ -13,8 +14,12 @@ Use:
                Required for Orbitrap-class resolution and labelled samples.
 
 Heavy-isotope mods (`mass_override` on TMT / SILAC) shift the centerline
-uniformly via `peptide_mass`; their heavy atoms are still given natural
-variance (UNIMOD stores no per-atom isotopes for them). Global ProForma
+uniformly via `peptide_mass`, and their heavy atoms (UNIMOD's formula,
+`Modification.heavy_atoms`; `core.sequence.protein.heavy_atom_compositions`)
+are one isotope each, so they are left out of the atoms the envelope
+distributes, in both modes. Until 2026-11-11 they were given natural
+variance: M+0's share 7–9 % low and M+2's 11–16 % high on SILAC and TMT
+peptides, the m/z exact (review of 2026-11-10, C8). Global ProForma
 isotope labels (``<13C>``, ``<15N>``) are taken as full incorporation: the
 atoms a label covers (`core.sequence.protein.labelled_compositions`, the
 chain's) are each exactly that isotope, so they move the envelope without
@@ -42,9 +47,7 @@ from constellation.core.chem.modifications import UNIMOD, ModVocab
 from constellation.core.sequence.alphabets import requires_canonical
 from constellation.core.sequence.proforma import Peptidoform
 from constellation.core.sequence.protein import (
-    labelled_compositions,
-    peptide_composition,
-    peptide_compositions,
+    natural_abundance_compositions,
     peptide_mass,
     peptide_masses,
 )
@@ -103,11 +106,9 @@ def neutral_envelope(
     `envelope_mz`, so the envelope of several charges is computed once.
     ``normalize="full"`` (binned) gives each peak's share of the whole
     envelope rather than of the peaks kept."""
-    composition = peptide_composition(peptidoform, vocab=vocab)
-    if peptidoform.global_isotopes:
-        # Labelled atoms are one isotope each: no variance, only mass.
-        labelled = labelled_compositions([peptidoform], vocab=vocab)[0]
-        composition = Composition(composition.counts - labelled)
+    # Labelled atoms and a modification's heavy atoms are one isotope each:
+    # no variance, only mass.
+    composition = Composition(natural_abundance_compositions([peptidoform], vocab=vocab)[0])
 
     if mode == "binned":
         masses_neutral, intensities = isotope_envelope(composition, n_peaks=n_peaks, normalize=normalize)
@@ -148,7 +149,7 @@ def neutral_envelopes(
     of the whole envelope (``normalize="full"``), to float32 rounding.
 
     No work is done per peptidoform in Python: compositions and masses are
-    batched (``peptide_compositions``, ``peptide_masses``), the
+    batched (``natural_abundance_compositions``, ``peptide_masses``), the
     distributions are one Fourier transform (``isotope_distributions``),
     and the monoisotopic mass repeats, element column by element column,
     the compensated summation Python's ``sum`` makes of the single
@@ -157,10 +158,9 @@ def neutral_envelopes(
     n = len(peptidoforms)
     if n == 0:
         return np.zeros((0, n_peaks)), np.zeros((0, n_peaks))
-    counts = peptide_compositions(peptidoforms, vocab=vocab).numpy().astype(np.int64)
-    if any(getattr(pf, "global_isotopes", ()) for pf in peptidoforms):
-        # Labelled atoms are one isotope each: no variance, only mass.
-        counts = counts - labelled_compositions(peptidoforms, vocab=vocab).numpy().astype(np.int64)
+    # Labelled atoms and a modification's heavy atoms are one isotope each:
+    # no variance, only mass.
+    counts = natural_abundance_compositions(peptidoforms, vocab=vocab).numpy().astype(np.int64)
     element_mono = np.array([ELEMENTS[s].monoisotopic_mass for s in ELEMENT_SYMBOLS], dtype=np.float64)
     # sum(n * m for each element present) as Python 3.12 sums floats
     # (Neumaier's compensated summation), element by element in

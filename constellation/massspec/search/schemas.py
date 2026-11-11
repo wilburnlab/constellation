@@ -80,8 +80,18 @@ PROTEIN_SCORE_TABLE: pa.Schema = pa.schema(
 # in any library, still means something. ``precursor_id`` is the library
 # precursor where there is one and null otherwise.
 #
+# A search that scores in passes says which row is which (added
+# 2026-11-11; review of 2026-11-10, S7): ``pass`` (1, 2, ...; the last is the result),
+# ``role`` (``calibrant`` for a pass that chose calibrants, ``search`` for
+# the search itself) and ``decoy_set`` (which decoy population a decoy is
+# of, 0 the search's own; null for targets). All three are null for an
+# engine that scores once (EncyclopeDIA, ScribeTwo), and in tables written
+# before them, which read as before. Until then a calibrant pass and the
+# search of one engine collided on the key below, and ``results`` kept
+# whichever row came first.
+#
 # Primary key: ``(modified_sequence, charge, acquisition_id, engine,
-# is_decoy)``.
+# is_decoy, decoy_set, pass, role)``.
 PRECURSOR_SCORE_TABLE: pa.Schema = pa.schema(
     [
         pa.field("precursor_id", pa.int64(), nullable=True),
@@ -93,9 +103,19 @@ PRECURSOR_SCORE_TABLE: pa.Schema = pa.schema(
         pa.field("pep", pa.float64(), nullable=True),  # posterior error probability
         pa.field("is_decoy", pa.bool_(), nullable=False),
         pa.field("engine", pa.string(), nullable=False),
+        pa.field("pass", pa.int8(), nullable=True),
+        pa.field("role", pa.string(), nullable=True),
+        pa.field("decoy_set", pa.int16(), nullable=True),
     ],
     metadata={b"schema_name": b"PrecursorScoreTable"},
 )
+
+#: ``PRECURSOR_SCORE_TABLE.role`` of a pass that chose calibrants, whose
+#: rows are not the search's result (pass-1 calibrants are not targets; PI,
+#: 2026-11-07).
+CALIBRANT_ROLE = "calibrant"
+#: ``PRECURSOR_SCORE_TABLE.role`` of the search itself.
+SEARCH_ROLE = "search"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -139,8 +159,10 @@ PSM_TABLE: pa.Schema = pa.schema(
         pa.field("peptide_id", pa.int64(), nullable=True),
         # Content-derived precursor id (``massspec.library.ids``) of
         # ``modified_sequence`` at ``charge``: the same id the precursor
-        # tables of a content-keyed result use, so PSMs join to them.
-        # Null for decoys and where the reader does not derive it. (v2)
+        # tables of a content-keyed result use, so PSMs join to them. A
+        # decoy's is its own sequence's (a library holding the decoys keys
+        # them so; until 2026-11-11 decoys had none, review C5). Null where
+        # the reader does not derive it. (v2)
         pa.field("precursor_id", pa.int64(), nullable=True),
         pa.field("mod_peptide_id", pa.int64(), nullable=True),
         pa.field("evidence_id", pa.int64(), nullable=True),
@@ -408,6 +430,8 @@ register_schema("CandidateFragmentTable", CANDIDATE_FRAGMENT_TABLE)
 
 
 __all__ = [
+    "CALIBRANT_ROLE",
+    "SEARCH_ROLE",
     "NOVEL_PEPTIDE_TABLE",
     "PEPTIDE_SCORE_TABLE",
     "PROTEIN_SCORE_TABLE",

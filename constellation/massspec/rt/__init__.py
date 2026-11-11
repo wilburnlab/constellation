@@ -51,9 +51,13 @@ from constellation.core.stats.monotone import Extrapolation, TailedCurve
 from constellation.massspec.rt.encyclopedia import EncyclopediaFit, fit_encyclopedia
 from constellation.massspec.rt.pairs import (
     PAIR_SCHEMA,
+    REFERENCE_SCALE_KEY,
     engine_pairs,
     library_pairs,
+    on_model_clock,
+    reference_scale,
     run_pairs,
+    with_reference_scale,
 )
 
 __all__ = [
@@ -63,6 +67,8 @@ __all__ = [
     "align_runs",
     "to_rt_alignment_table",
     "PAIR_SCHEMA",
+    "REFERENCE_SCALE_KEY",
+    "reference_scale",
     "library_pairs",
     "run_pairs",
     "engine_pairs",
@@ -78,9 +84,11 @@ class RtAlignment:
     ``alignment`` is the fit in its own units: reference and observed
     times divided by ``reference_scale`` / ``observed_scale`` (60 for the
     EncyclopeDIA replay, which fits in minutes as the jar does).
-    ``reference_unit`` is ``"s"``, or ``"iRT"`` for a predicted scale with
-    no unit. ``encyclopedia`` holds the replay's own record (its float32
-    band, kernel and apex) when that method was used.
+    ``reference_unit`` is ``"s"``, or a model's scale (``"iRT"``, a
+    library's ``rt_scale``) for predicted times. ``reference_rt_scale`` is
+    the clock the pairs recorded for their reference times (``.pairs``;
+    None where they recorded none). ``encyclopedia`` holds the replay's own
+    record (its float32 band, kernel and apex) when that method was used.
     """
 
     alignment: MonotoneAlignment
@@ -91,6 +99,7 @@ class RtAlignment:
     n_pairs: int
     encyclopedia: EncyclopediaFit | None = None
     diagnostics: Mapping[str, object] = field(default_factory=dict)
+    reference_rt_scale: str | None = None
 
     def to_observed(self, reference_rt) -> torch.Tensor:
         """Where each reference time falls in the run (seconds)."""
@@ -155,7 +164,7 @@ def align(
     extrapolation: Extrapolation | Literal["soft", "linear", "clamp"] = "soft",
     coverage: float = 0.95,
     weight_column: str | None = None,
-    reference_unit: str = "s",
+    reference_unit: str | None = None,
     options: GreedyOptions | GlobalPathOptions | None = None,
     refine_options: RefineOptions | None = None,
 ) -> RtAlignment:
@@ -165,10 +174,24 @@ def align(
     module docstring for the methods. ``pairs`` has ``reference_rt`` and ``observed_rt`` (seconds; see
     :mod:`.pairs`), in the order the fit should see them — the
     EncyclopeDIA replay is order-sensitive, as the jar is.
-    ``reference_unit="iRT"`` marks a reference on a predicted scale (it is
-    then not converted). ``weight_column`` weights each pair's
-    contribution to the density (not for ``encyclopedia``).
+    ``reference_unit`` is ``"s"`` for a reference in seconds, or a
+    predicted scale (``"iRT"``, a library's ``rt_scale``; then not
+    converted); None (the default) takes the clock the pairs record
+    (:func:`.pairs.reference_scale`): seconds for a run's times or an
+    unstated clock, else the model's. A model's clock is refused as
+    seconds: until 2026-11-11 the pairs recorded none, and a JChronologer
+    library's times were fitted and labelled as seconds (review of
+    2026-11-10, S11). ``weight_column`` weights each pair's contribution
+    to the density (not for ``encyclopedia``).
     """
+    scale = reference_scale(pairs)
+    if reference_unit is None:
+        reference_unit = scale if on_model_clock(scale) else "s"
+    elif reference_unit == "s" and on_model_clock(scale):
+        raise ValueError(
+            f"the pairs' reference times are on {scale}, a model's clock, not seconds: they cannot be fitted as "
+            f"seconds (leave reference_unit out, or give the model's scale)"
+        )
     policy = Extrapolation.coerce(extrapolation)
     ref = torch.from_numpy(pairs.column("reference_rt").to_numpy(zero_copy_only=False).astype(np.float64))
     obs = torch.from_numpy(pairs.column("observed_rt").to_numpy(zero_copy_only=False).astype(np.float64))
@@ -177,7 +200,8 @@ def align(
             raise ValueError("method='encyclopedia' is the jar's fit and takes no curve, refine, weights or options")
         ref_scale = 60.0 if reference_unit == "s" else 1.0
         alignment, fit = _encyclopedia_alignment(ref / ref_scale, obs / 60.0, policy, coverage)
-        return RtAlignment(alignment, method, reference_unit, ref_scale, 60.0, pairs.num_rows, fit)
+        return RtAlignment(alignment, method, reference_unit, ref_scale, 60.0, pairs.num_rows, fit,
+                           reference_rt_scale=scale)  # fmt: skip
     weights = None
     if weight_column is not None:
         weights = torch.from_numpy(pairs.column(weight_column).to_numpy(zero_copy_only=False).astype(np.float64))
@@ -193,7 +217,7 @@ def align(
         options=options,
         refine_options=refine_options,
     )
-    return RtAlignment(alignment, method, reference_unit, 1.0, 1.0, pairs.num_rows)
+    return RtAlignment(alignment, method, reference_unit, 1.0, 1.0, pairs.num_rows, reference_rt_scale=scale)
 
 
 def _read_rt_alignment(experiment_dir: Path, *, unit: str, acquisition_id: int) -> pa.Table:
@@ -215,7 +239,7 @@ def align_to_library(
     precursors: pa.Table | None = None,
     max_qvalue: float | None = 0.01,
     per: Literal["peptide", "precursor"] = "peptide",
-    reference_unit: str = "s",
+    reference_unit: str | None = None,
     **fit,
 ) -> RtAlignment:
     """A search's library → run alignment.
@@ -225,8 +249,9 @@ def align_to_library(
     final pass), so ``method="encyclopedia"`` reproduces the engine's fit
     and the other methods are compared on the engine's own evidence.
     With ``precursors`` (a ``PRECURSOR_TABLE`` with content-derived ids,
-    e.g. a predicted library), pairs its times with the run's
-    identifications at ``max_qvalue``.
+    or a ``Library``, e.g. a predicted one, whose clock the pairs then
+    record), pairs its times with the run's identifications at
+    ``max_qvalue``. ``reference_unit`` is :func:`align`'s.
     """
     root = Path(experiment_dir)
     if precursors is None:
@@ -278,18 +303,26 @@ def to_rt_alignment_table(
     """``RT_ALIGNMENT`` rows for a library → run fit (``engine="constellation"``).
 
     ``pass`` is ``pass_name`` or the method. A reference that is not in
-    seconds is refused: the table's times are seconds.
+    seconds is refused: the table's times are seconds. So is one on a
+    model's clock, by the alignment's or the pairs' record (until
+    2026-11-11 neither recorded one, and JChronologer times were written
+    as seconds; review of 2026-11-10, S11). The table records the clock
+    (:data:`.pairs.REFERENCE_SCALE_KEY`) where the pairs did.
     """
     from constellation.massspec.search.schemas import RT_ALIGNMENT
 
     if alignment.reference_unit != "s":
         raise ValueError(f"RT_ALIGNMENT holds seconds; this alignment's reference is {alignment.reference_unit!r}")
+    scale = alignment.reference_rt_scale or reference_scale(pairs)
+    if on_model_clock(scale) or on_model_clock(reference_scale(pairs)):
+        raise ValueError(f"RT_ALIGNMENT holds seconds; this alignment's reference times are on {scale}, a model's "
+                         f"clock")  # fmt: skip
     ref = pairs.column("reference_rt").to_numpy(zero_copy_only=False).astype(np.float64)
     obs = pairs.column("observed_rt").to_numpy(zero_copy_only=False).astype(np.float64)
     fitted = alignment.to_observed(torch.from_numpy(ref)).numpy()
     within = alignment.within_band(torch.from_numpy(ref), torch.from_numpy(obs)).numpy()
     n = pairs.num_rows
-    return pa.table(
+    return with_reference_scale(pa.table(
         {
             "acquisition_id": pa.array([acquisition_id] * n, pa.int64()),
             "engine": pa.array(["constellation"] * n, pa.string()),
@@ -305,5 +338,5 @@ def to_rt_alignment_table(
             "is_decoy": pairs.column("is_decoy"),
         },
         schema=RT_ALIGNMENT,
-    )
+    ), scale)
 

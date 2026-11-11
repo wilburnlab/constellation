@@ -246,14 +246,80 @@ def impute_injection_times(
     return iit, imputed
 
 
+def acquired_ranges(scan_metadata: pa.Table, *, level: int = 2) -> pa.Table:
+    """The m/z range each isolation window of ``level`` acquired: one row
+    per window (``isolation_lower`` / ``isolation_upper``, compared exactly,
+    as the sweep keys windows; both null for scans without bounds) with
+    ``scan_window_lower`` / ``scan_window_upper``: the range its scans
+    record when they all agree, else their envelope (``agree`` says which),
+    and null when any of its scans records none (a bundle before scan
+    metadata v3, an import that wrote none). ``n_scans`` counts them. What
+    ``sweep.compile_queries`` chooses fragment channels within
+    (``acquired_ranges=``; review of 2026-11-10, C6)."""
+    names = set(scan_metadata.column_names)
+    rows = scan_metadata.filter(pc.equal(scan_metadata.column("level"), level))
+
+    def col(name: str) -> np.ndarray:
+        if name not in names:
+            return np.full(rows.num_rows, np.nan)
+        return rows.column(name).cast(pa.float64()).fill_null(np.nan).to_numpy(zero_copy_only=False)
+
+    ilo, ihi = col("isolation_lower"), col("isolation_upper")
+    slo, shi = col("scan_window_lower"), col("scan_window_upper")
+    free = np.isnan(ilo) | np.isnan(ihi)
+    key = np.stack([np.where(free, -np.inf, ilo), np.where(free, -np.inf, ihi)], axis=1)
+    if rows.num_rows:
+        pairs, inverse = np.unique(key, axis=0, return_inverse=True)
+        inverse = inverse.reshape(-1)
+    else:
+        pairs, inverse = np.empty((0, 2)), np.empty(0, np.int64)
+    w = len(pairs)
+    known = ~(np.isnan(slo) | np.isnan(shi))
+    n_scans = np.bincount(inverse, minlength=w)
+    all_known = np.bincount(inverse, weights=known.astype(np.float64), minlength=w) == n_scans
+    lo_min, lo_max = np.full(w, np.inf), np.full(w, -np.inf)
+    hi_min, hi_max = np.full(w, np.inf), np.full(w, -np.inf)
+    np.minimum.at(lo_min, inverse[known], slo[known])
+    np.maximum.at(lo_max, inverse[known], slo[known])
+    np.minimum.at(hi_min, inverse[known], shi[known])
+    np.maximum.at(hi_max, inverse[known], shi[known])
+    unbounded = pairs[:, 0] == -np.inf if w else np.zeros(0, bool)
+    return pa.table(
+        {
+            "isolation_lower": pa.array(np.where(unbounded, np.nan, pairs[:, 0] if w else []), pa.float64(),
+                                        mask=unbounded),  # fmt: skip
+            "isolation_upper": pa.array(np.where(unbounded, np.nan, pairs[:, 1] if w else []), pa.float64(),
+                                        mask=unbounded),  # fmt: skip
+            "scan_window_lower": pa.array(lo_min, pa.float64(), mask=~all_known),
+            "scan_window_upper": pa.array(hi_max, pa.float64(), mask=~all_known),
+            "agree": pa.array(all_known & (lo_min == lo_max) & (hi_min == hi_max), pa.bool_()),
+            "n_scans": pa.array(n_scans.astype(np.int64), pa.int64()),
+        }
+    )
+
+
+def read_acquired_ranges(bundle, *, level: int = 2) -> pa.Table:
+    """:func:`acquired_ranges` of a converted bundle's scan metadata."""
+    from pathlib import Path
+
+    import pyarrow.parquet as pq
+
+    path = Path(bundle) / "scan_metadata.parquet"
+    wanted = ["level", "isolation_lower", "isolation_upper", "scan_window_lower", "scan_window_upper"]
+    present = [c for c in wanted if c in pq.read_schema(path).names]
+    return acquired_ranges(pq.read_table(path, columns=present), level=level)
+
+
 __all__ = [
     "MIN_VISITS_PER_DIA_WINDOW",
     "AcquisitionStructure",
     "AcquisitionType",
+    "acquired_ranges",
     "impute_injection_times",
     "infer_acquisition_structure",
     "isolation_windows",
     "parent_scans",
+    "read_acquired_ranges",
     "refuse_unsupported",
     "unsupported",
 ]

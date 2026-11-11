@@ -291,9 +291,12 @@ def test_trace_targets_are_the_most_intense_stored_ions(searched) -> None:
 # ── a search's tables without the jar (review of 2026-11-06) ─────────────
 
 
-def _native_experiment(root: Path, *, decoy_quantified: bool = True, with_precursors: bool = True) -> Path:
+def _native_experiment(
+    root: Path, *, decoy_quantified: bool = True, with_precursors: bool = True, scores: pa.Table | None = None
+) -> Path:
     """A finished peptide-centric unit written through the workflow's own
-    table writer, with no jar: one target and one decoy quantified."""
+    table writer, with no jar: one target and one decoy quantified
+    (``scores`` in place of their one score row each)."""
     import json
 
     from constellation.massspec.workflows.encyclopedia import _write_tables
@@ -324,6 +327,8 @@ def _native_experiment(root: Path, *, decoy_quantified: bool = True, with_precur
             "engine": ["constellation"] * 2,
         }),  # fmt: skip
     }
+    if scores is not None:
+        tables["precursor_score"] = scores
     if with_precursors:
         tables["precursor"] = pa.table({
             "precursor_id": pa.array([11, 22], pa.int64()), "peptide_id": pa.array([1, 2], pa.int64()),
@@ -341,6 +346,44 @@ def test_peptide_centric_decoys_are_flagged_and_droppable(tmp_path: Path) -> Non
     assert dict(zip(shown.column("modified_sequence").to_pylist(), shown.column("is_decoy").to_pylist())) == {
         "PEPTIDEK": False, "PDITPEEK": True}  # fmt: skip
     assert identifications(root).column("modified_sequence").to_pylist() == ["PEPTIDEK"]
+
+
+def test_a_calibrant_pass_and_the_search_of_one_engine_are_told_apart(tmp_path: Path) -> None:
+    """Review of 2026-11-10, S7: the score table had no pass, role or decoy
+    set, so a calibrant pass and the search collided, and the first row was
+    shown. The final non-calibrant pass is the result."""
+    from constellation.massspec.search.search import Search
+
+    rows = [  # the calibrant pass first, as a two-pass search writes it
+        (11, "PEPTIDEK", 0.5, False, 1, "calibrant"), (11, "PEPTIDEK", 0.001, False, 2, "search"),
+        (22, "PDITPEEK", 0.6, True, 1, "calibrant"), (22, "PDITPEEK", 0.005, True, 2, "search"),
+    ]  # fmt: skip
+    pid, seq, q, decoy, passes, role = zip(*rows, strict=True)
+    scores = pa.table({
+        "precursor_id": pa.array(pid, pa.int64()), "acquisition_id": pa.array([0] * 4, pa.int64()),
+        "modified_sequence": list(seq), "charge": pa.array([2] * 4, pa.int32()), "score": [1.0] * 4,
+        "qvalue": list(q), "pep": [0.1] * 4, "is_decoy": list(decoy), "engine": ["constellation"] * 4,
+        "pass": pa.array(passes, pa.int8()), "role": list(role),
+        "decoy_set": pa.array([None, None, 0, 0], pa.int16()),
+    })  # fmt: skip
+    root = _native_experiment(tmp_path / "exp", scores=scores)
+    shown = identifications(root, include_decoys=True)
+    assert dict(zip(shown.column("modified_sequence").to_pylist(), shown.column("qvalue").to_pylist())) == {
+        "PEPTIDEK": 0.001, "PDITPEEK": 0.005}  # fmt: skip
+    # One precursor scored in two passes is two rows of the table, not a
+    # repeated key; the same pass twice still is.
+    from dataclasses import replace
+
+    from constellation.core.io.schemas import cast_to_schema
+    from constellation.massspec.acquisitions import Acquisitions
+    from constellation.massspec.search.schemas import PRECURSOR_SCORE_TABLE
+
+    acquisitions, _ = Acquisitions.empty().register([{"source_file": "run.raw", "source_kind": "thermo_raw"}])
+    empty = Search.empty(acquisitions)
+    scores = cast_to_schema(scores, PRECURSOR_SCORE_TABLE)
+    assert replace(empty, precursor_scores=scores).precursor_scores.num_rows == 4
+    with pytest.raises(ValueError, match="repeated"):
+        replace(empty, precursor_scores=pa.concat_tables([scores, scores.slice(1, 1)]))
 
 
 def test_no_precursor_table_means_no_peptide_centric_identifications(tmp_path: Path) -> None:

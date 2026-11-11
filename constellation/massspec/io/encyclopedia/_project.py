@@ -1150,7 +1150,8 @@ def _project_search(
                 f"carry no precursor_id (their modified_sequence and charge identify them)"
             )
         n = len(modseqs)
-        precursor_score_table = pa.table(
+        # The jar scores once: no pass, role or decoy set (null).
+        precursor_score_table = cast_to_schema(pa.table(
             {
                 "precursor_id": pa.array(precursor_ids, type=pa.int64()),
                 "acquisition_id": pa.array([acquisition_of[s] for s in row_sources], type=pa.int64()),
@@ -1161,9 +1162,8 @@ def _project_search(
                 "pep": peptide_scores.column("PosteriorErrorProbability"),
                 "is_decoy": pa.array([bool(d) for d in decoy], type=pa.bool_()),
                 "engine": pa.array([engine] * n, type=pa.string()),
-            },
-            schema=PRECURSOR_SCORE_TABLE,
-        )
+            }
+        ), PRECURSOR_SCORE_TABLE)
         # Peptide level: the best q-value across charge states, over the
         # rows that have a precursor in the library.
         peptide_of_precursor = dict(

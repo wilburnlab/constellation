@@ -1268,11 +1268,14 @@ def _batched(
     monoisotopic: bool,
     for_mass: bool,
     labelled: bool = False,
+    heavy: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[float], np.ndarray | None]:
     """(N, E) int64 compositions; per peptidoform, the mass the composition
     does not carry (``mass_override`` corrections and bare mass deltas),
     accumulated in the scalar code's order; and with ``labelled``, the
-    (N, E) atoms a global isotope label covers (:func:`labelled_compositions`)."""
+    (N, E) atoms a global isotope label covers (:func:`labelled_compositions`).
+    ``heavy``, an (N, E) int64 array of zeros, is filled in the same walk
+    with the heavy atoms modifications name (:func:`heavy_atom_compositions`)."""
     what = "mass" if for_mass else "composition"
     n = len(peptidoforms)
     seqs: list[str] = []
@@ -1298,14 +1301,15 @@ def _batched(
     # global isotope label covers, less what modifications take off it.
     chain = comp.copy() if labelled else None
 
-    resolved: dict[ModRef, tuple[np.ndarray, float]] = {}
+    resolved: dict[ModRef, tuple[np.ndarray, float, np.ndarray | None]] = {}
     extra = [0.0] * n
 
-    def resolve(modref: ModRef) -> tuple[np.ndarray, float]:
+    def resolve(modref: ModRef) -> tuple[np.ndarray, float, np.ndarray | None]:
         hit = resolved.get(modref)
         if hit is None:
             d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=monoisotopic)
-            hit = resolved[modref] = (d_comp.counts.numpy(), d_mass)  # int32 view
+            atoms = _modref_heavy_atoms(modref, vocab) if heavy is not None else None
+            hit = resolved[modref] = (d_comp.counts.numpy(), d_mass, atoms)  # int32 view
         return hit
 
     for i, pf in enumerate(peptidoforms):
@@ -1323,13 +1327,15 @@ def _batched(
                     "mods, but peptide_composition needs a UNIMOD/name/formula "
                     "payload to determine element counts"
                 )
-            d_comp, d_mass = resolve(modref)
+            d_comp, d_mass, h = resolve(modref)
             row += d_comp
             acc += d_mass
             if chain is not None:
                 chain[i] += np.minimum(d_comp, 0)
+            if h is not None:
+                heavy[i] += h  # type: ignore[index]
         for modref, locations in pf.fixed_mods:
-            d_comp, d_mass = resolve(modref)
+            d_comp, d_mass, h = resolve(modref)
             for loc in locations:
                 count = _count_fixed_mod_locations(pf.sequence, loc, pf)
                 if count:
@@ -1337,8 +1343,26 @@ def _batched(
                     acc += d_mass * count
                     if chain is not None:
                         chain[i] += np.minimum(d_comp, 0) * count
+                    if h is not None:
+                        heavy[i] += h * count
         extra[i] = acc
     return comp, extra, chain
+
+
+def _modref_heavy_atoms(modref: ModRef, vocab: ModVocab) -> np.ndarray | None:
+    """The heavy atoms a modification names (``Modification.heavy_atoms``),
+    counted under each light element, those it adds only; None for none (a
+    formula, a mass, a modification without heavy atoms)."""
+    if modref.cv == "INFO" or modref.formula is not None or (modref.accession is None and modref.name is None):
+        return None
+    atoms = vocab.get(_modref_lookup_key(modref)).heavy_atoms
+    if not atoms:
+        return None
+    out = np.zeros(len(ELEMENTS), dtype=np.int64)
+    for label, count in atoms.items():
+        if int(count) > 0:
+            out[ELEMENTS.index(parse_isotope_label(label)[1])] += int(count)
+    return out if out.any() else None
 
 
 @requires_canonical
@@ -1385,6 +1409,59 @@ def labelled_compositions(
             e = ELEMENTS.index(sym)
             out[i, e] = chain[i, e]
     return torch.from_numpy(out.astype(np.int32))
+
+
+@requires_canonical
+def heavy_atom_compositions(
+    peptidoforms: Sequence[Peptidoform],
+    *,
+    vocab: ModVocab = UNIMOD,
+) -> torch.Tensor:
+    """The atoms each peptidoform's modifications make fixed heavy isotopes:
+    an ``(N, E)`` int32 tensor counting, under each light element, the heavy
+    atoms its modifications' formulas name (``Modification.heavy_atoms``:
+    SILAC's ¹³C₆¹⁵N₂ is 6 C and 2 N, TMT's ¹³C₄¹⁵N 4 C and 1 N), each
+    modification as often as it is placed. Those atoms are counted in
+    :func:`peptide_composition` under their light element and carry their
+    mass through ``mass_override``; they are one isotope each, so an isotope
+    envelope distributes only the rest. A modification that removes heavy
+    atoms (a negative count) adds none here: it can only take them off a
+    labelled chain, which :func:`labelled_compositions` already accounts for.
+
+    Until 2026-11-11 nothing said which atoms these were, and the MS1
+    envelope gave them natural variance: M+0's share 7-9 % low, M+2's
+    11-16 % high on SILAC and TMT peptides (review of 2026-11-10, C8)."""
+    out = np.zeros((len(peptidoforms), len(ELEMENTS)), dtype=np.int64)
+    _batched(peptidoforms, vocab, monoisotopic=True, for_mass=True, heavy=out)
+    return torch.from_numpy(out.astype(np.int32))
+
+
+@requires_canonical
+def natural_abundance_compositions(
+    peptidoforms: Sequence[Peptidoform],
+    *,
+    vocab: ModVocab = UNIMOD,
+) -> torch.Tensor:
+    """The atoms of each peptidoform whose isotopes follow natural
+    abundance: an ``(N, E)`` int32 tensor, its composition
+    (:func:`peptide_compositions`, same rules and errors) less the atoms a
+    global label covers (:func:`labelled_compositions`) and the heavy atoms
+    its modifications name (:func:`heavy_atom_compositions`), which are one
+    isotope each. What an isotope envelope distributes; the others carry
+    only mass. Clamped at zero, where a label also covers a heavy
+    modification's atoms (which then count twice). One walk of the
+    modifications for all three."""
+    labelled = any(getattr(pf, "global_isotopes", ()) for pf in peptidoforms)
+    heavy = np.zeros((len(peptidoforms), len(ELEMENTS)), dtype=np.int64)
+    comp, _, chain = _batched(peptidoforms, vocab, monoisotopic=True, for_mass=False, labelled=labelled, heavy=heavy)
+    fixed = heavy
+    if labelled:
+        assert chain is not None
+        for i, pf in enumerate(peptidoforms):
+            for label in pf.global_isotopes:
+                e = ELEMENTS.index(parse_isotope_label(label)[1])
+                fixed[i, e] += chain[i, e]
+    return torch.from_numpy(np.maximum(comp - fixed, 0).astype(np.int32))
 
 
 def _masses(peptidoforms: Sequence[Peptidoform], vocab: ModVocab, monoisotopic: bool) -> np.ndarray:
@@ -1527,7 +1604,9 @@ __all__ = [
     "peptide_composition",
     "peptide_compositions",
     "SIDE_CHAIN_CYCLIZATIONS",
+    "heavy_atom_compositions",
     "labelled_compositions",
+    "natural_abundance_compositions",
     "peptide_mass",
     "peptide_masses",
     "protein_composition",
