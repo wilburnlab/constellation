@@ -22,6 +22,7 @@ shape via `isinstance(opt, PopulationOptimizer)`.
 
 from ._adam import AdamOptimizer
 from ._bounds import bounds_in_natural_units
+from .batched_lsq import LeastSquaresResult, batched_least_squares
 from ._de import DifferentialEvolution
 from ._layout import (
     ParamLayout,
@@ -45,6 +46,8 @@ from .registry import OPTIMIZER_REGISTRY, make_optimizer
 InitMethod = str  # public alias matching the runtime kwargs
 
 __all__ = [
+    "batched_least_squares",
+    "LeastSquaresResult",
     "Optimizer",
     "PopulationOptimizer",
     "ScalarClosure",

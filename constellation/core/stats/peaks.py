@@ -32,6 +32,8 @@ Numerical conventions:
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -48,6 +50,10 @@ __all__ = [
     "emg_left_log_pdf",
     "emg_cdf",
     "emg_left_cdf",
+    "gaussian_peak",
+    "emg_peak",
+    "PeakForm",
+    "PEAK_FORMS",
 ]
 
 _SQRT2 = math.sqrt(2.0)
@@ -264,6 +270,109 @@ def _limits(
     return lo, hi
 
 
+def gaussian_peak(t: torch.Tensor, height: torch.Tensor, center: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    """A Gaussian peak of ``height`` at ``center``: ``height·exp(−½((t − center)/σ)²)``.
+    The one formula ``GaussianPeak`` and the batched ``gaussian`` form use."""
+    z = (t - center) / sigma
+    return height * torch.exp(-0.5 * z * z)
+
+
+def emg_peak(t: torch.Tensor, height: torch.Tensor, apex: torch.Tensor, sigma: torch.Tensor,
+             tau: torch.Tensor) -> torch.Tensor:  # fmt: skip
+    """A right-tailed EMG peak whose maximum is ``height`` at ``apex`` (the
+    exact mode, :func:`_emg_mode_offset`), its ratio to the apex taken in
+    log space so the far tail stays finite. The one formula ``EMGPeak`` and
+    the batched ``emg`` form use."""
+    mu = apex - sigma * _emg_mode_offset(sigma, tau)
+    return height * torch.exp(emg_log_pdf(t, mu, sigma, tau) - emg_log_pdf(apex, mu, sigma, tau))
+
+
+def _moments(x: torch.Tensor, y: torch.Tensor, valid: torch.Tensor):
+    """Per row: the positive part's centroid and spread, the height and the
+    smallest sample spacing (for starting values and bounds)."""
+    w = torch.where(valid, y.clamp(min=0), torch.zeros_like(y))
+    total = w.sum(-1).clamp(min=1e-300)
+    xs = torch.where(valid, x, torch.zeros_like(x))
+    center = (w * xs).sum(-1) / total
+    spread = torch.sqrt(((w * (xs - center.unsqueeze(-1)) ** 2).sum(-1) / total).clamp(min=0))
+    height = torch.where(valid, y, torch.full_like(y, float("-inf"))).amax(-1).clamp(min=0)
+    big = torch.full_like(x, float("inf"))
+    gaps = torch.where(valid[..., 1:] & valid[..., :-1], (x[..., 1:] - x[..., :-1]).abs(), big[..., 1:])
+    step = gaps.amin(-1) if gaps.shape[-1] else torch.ones_like(center)
+    step = torch.where(torch.isfinite(step) & (step > 0), step, torch.ones_like(step))
+    lo = torch.where(valid, x, big).amin(-1)
+    hi = torch.where(valid, x, -big).amax(-1)
+    return center, spread.clamp(min=step), height, step, lo, hi
+
+
+@dataclass(frozen=True)
+class PeakForm:
+    """A peak shape as functions of batched parameters ``theta [B, P]``, for
+    fitting many peaks at once (``core.signal.peak_fit``): its value at
+    ``x [B, N]``, its whole area, its apex position, starting values and
+    box bounds from the data of each row. Named in :data:`PEAK_FORMS`."""
+
+    name: str
+    version: int
+    parameters: tuple[str, ...]
+    evaluate: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+    area: Callable[[torch.Tensor], torch.Tensor]
+    apex: Callable[[torch.Tensor], torch.Tensor]
+    initial: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+    bounds: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
+
+
+def _gauss_init(x, y, valid):
+    center, spread, height, _, _, _ = _moments(x, y, valid)
+    return torch.stack([height, center, spread], -1)
+
+
+def _gauss_bounds(x, y, valid):
+    _, _, height, step, lo, hi = _moments(x, y, valid)
+    lower = torch.stack([torch.zeros_like(lo), lo, step / 4], -1)
+    upper = torch.stack([10 * height.clamp(min=1e-300), hi, (hi - lo).clamp(min=step)], -1)
+    return lower, upper
+
+
+def _emg_init(x, y, valid):
+    center, spread, height, _, _, _ = _moments(x, y, valid)
+    apex = torch.gather(x, -1, torch.where(valid, y, torch.full_like(y, float("-inf"))).argmax(-1, keepdim=True))
+    return torch.stack([height, apex.squeeze(-1), spread / 1.5, spread / 2], -1)
+
+
+def _emg_bounds(x, y, valid):
+    _, _, height, step, lo, hi = _moments(x, y, valid)
+    span = (hi - lo).clamp(min=step)
+    lower = torch.stack([torch.zeros_like(lo), lo, step / 4, step / 20], -1)
+    upper = torch.stack([10 * height.clamp(min=1e-300), hi, span, 2 * span], -1)
+    return lower, upper
+
+
+def _emg_area(theta):
+    h, apex, s, tau = theta.unbind(-1)
+    mu = apex - s * _emg_mode_offset(s, tau)
+    return h * torch.exp(-emg_log_pdf(apex, mu, s, tau))
+
+
+#: The batched peak forms, by name.
+PEAK_FORMS: dict[str, PeakForm] = {
+    "gaussian": PeakForm(
+        name="gaussian", version=1, parameters=("height", "center", "sigma"),
+        evaluate=lambda x, th: gaussian_peak(x, th[..., 0:1], th[..., 1:2], th[..., 2:3]),
+        area=lambda th: th[..., 0] * th[..., 2] * _SQRT2PI,
+        apex=lambda th: th[..., 1],
+        initial=_gauss_init, bounds=_gauss_bounds,
+    ),
+    "emg": PeakForm(
+        name="emg", version=1, parameters=("height", "apex", "sigma", "tau"),
+        evaluate=lambda x, th: emg_peak(x, th[..., 0:1], th[..., 1:2], th[..., 2:3], th[..., 3:4]),
+        area=_emg_area,
+        apex=lambda th: th[..., 1],
+        initial=_emg_init, bounds=_emg_bounds,
+    ),
+}  # fmt: skip
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Peak shapes
 # ──────────────────────────────────────────────────────────────────────
@@ -298,8 +407,7 @@ class GaussianPeak(PeakShape):
         return self.log_sigma.exp()
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        z = (t - self.t_apex) / self.sigma
-        return self.N_max * torch.exp(-0.5 * z * z)
+        return gaussian_peak(t, self.N_max, self.t_apex, self.sigma)
 
     def integrate(
         self,
@@ -382,14 +490,9 @@ class EMGPeak(PeakShape):
         return self.t_apex - self.sigma * _emg_mode_offset(self.sigma, self.tau)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        sigma = self.sigma
-        tau = self.tau
-        mu = self.mu
-        # Normalize so that the peak max equals N_max. The unnormalized
-        # `emg_pdf` integrates to 1; we scale by the value at t_apex.
-        pdf_t = emg_pdf(t, mu, sigma, tau)
-        pdf_apex = emg_pdf(self.t_apex, mu, sigma, tau)
-        return self.N_max * pdf_t / pdf_apex.clamp(min=1e-30)
+        # N_max at t_apex: the density over its value there, in log space
+        # (emg_peak; until 2026-11-11 a ratio of densities clamped at 1e-30).
+        return emg_peak(t, self.N_max, self.t_apex, self.sigma, self.tau)
 
     def integrate(
         self,
