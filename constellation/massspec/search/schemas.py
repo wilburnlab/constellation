@@ -319,6 +319,82 @@ NOVEL_PEPTIDE_TABLE: pa.Schema = pa.schema(
     metadata={b"schema_name": b"NovelPeptideTable"},
 )
 
+# ──────────────────────────────────────────────────────────────────────
+# Candidates of a native search: every elution peak a scorer considered
+# for a precursor in an acquisition, with its features (scorer v1, the KL
+# trace: `massspec.search.score`). Wide and typed: one column per feature,
+# which features they are in the table's `x.massspec.feature_set`.
+# Keys: (acquisition_id, query | precursor_id, pass, role, rank).
+# A query with no candidate has one row, rank -1, null features, so both
+# population sizes are known.
+# ──────────────────────────────────────────────────────────────────────
+
+CANDIDATE_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("acquisition_id", pa.int64(), nullable=False),
+        pa.field("query", pa.int64(), nullable=False),
+        pa.field("target_id", pa.int64(), nullable=False),
+        pa.field("precursor_id", pa.int64(), nullable=True),
+        pa.field("peptide_id", pa.int64(), nullable=True),
+        pa.field("modified_sequence", pa.string(), nullable=True),
+        pa.field("precursor_charge", pa.int8(), nullable=True),
+        pa.field("is_decoy", pa.bool_(), nullable=True),
+        pa.field("decoy_set", pa.int16(), nullable=True),
+        # Which pass of a search made it, and for what (``calibrant`` rows
+        # are kept apart from ``search`` rows before any statistics).
+        pa.field("pass", pa.int8(), nullable=False),
+        pa.field("role", pa.string(), nullable=False),
+        pa.field("rank", pa.int32(), nullable=False),
+        pa.field("chosen", pa.bool_(), nullable=False),
+        pa.field("n_candidates", pa.int32(), nullable=False),
+        # The scorer's score (higher is better) and its detector's.
+        pa.field("score", pa.float64(), nullable=True),
+        pa.field("detector_score", pa.float64(), nullable=True),
+        pa.field("kl_apex", pa.float64(), nullable=True),
+        pa.field("kl_apex_h0", pa.float64(), nullable=True),
+        pa.field("kl_apex_smoothed", pa.float64(), nullable=True),
+        pa.field("kl_integrated", pa.float64(), nullable=True),
+        # Seconds.
+        pa.field("rt_apex", pa.float64(), nullable=True),
+        pa.field("rt_left", pa.float64(), nullable=True),
+        pa.field("rt_right", pa.float64(), nullable=True),
+        pa.field("apex_scan", pa.int64(), nullable=True),
+        pa.field("rt_library", pa.float64(), nullable=True),
+        pa.field("height", pa.float64(), nullable=True),
+        pa.field("prominence", pa.float64(), nullable=True),
+        pa.field("snr", pa.float64(), nullable=True),
+        pa.field("width", pa.float64(), nullable=True),
+        pa.field("area", pa.float64(), nullable=True),
+        pa.field("n_channels", pa.int32(), nullable=False),
+        pa.field("n_observed", pa.int32(), nullable=True),
+        pa.field("n_coeluting", pa.int32(), nullable=True),
+        # Abundance-weighted signed fragment mass error at the apex, ppm.
+        pa.field("ms2_ppm", pa.float64(), nullable=True),
+    ],
+    metadata={b"schema_name": b"CandidateTable", b"schema_version": b"1"},
+)
+
+# The chosen candidate's fragments: each channel's intensity at the apex and
+# summed over the candidate's extent.
+CANDIDATE_FRAGMENT_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("acquisition_id", pa.int64(), nullable=False),
+        pa.field("query", pa.int64(), nullable=False),
+        pa.field("target_id", pa.int64(), nullable=False),
+        pa.field("channel", pa.int32(), nullable=False),
+        pa.field("mz_theoretical", pa.float64(), nullable=False),
+        pa.field("ion_type", pa.int8(), nullable=True),
+        pa.field("position", pa.int32(), nullable=True),
+        pa.field("fragment_charge", pa.int32(), nullable=True),
+        pa.field("abundance", pa.float32(), nullable=True),
+        pa.field("modelled", pa.bool_(), nullable=False),
+        pa.field("intensity_apex", pa.float64(), nullable=False),
+        pa.field("intensity_summed", pa.float64(), nullable=False),
+    ],
+    metadata={b"schema_name": b"CandidateFragmentTable", b"schema_version": b"1"},
+)
+
+
 
 register_schema("PeptideScoreTable", PEPTIDE_SCORE_TABLE)
 register_schema("ProteinScoreTable", PROTEIN_SCORE_TABLE)
@@ -327,6 +403,8 @@ register_schema("PrecursorScoreTable", PRECURSOR_SCORE_TABLE)
 register_schema("NovelPeptideTable", NOVEL_PEPTIDE_TABLE)
 register_schema("RtAlignment", RT_ALIGNMENT)
 register_schema("MassCalibration", MASS_CALIBRATION)
+register_schema("CandidateTable", CANDIDATE_TABLE)
+register_schema("CandidateFragmentTable", CANDIDATE_FRAGMENT_TABLE)
 
 
 __all__ = [
@@ -337,4 +415,6 @@ __all__ = [
     "PSM_TABLE",
     "RT_ALIGNMENT",
     "MASS_CALIBRATION",
+    "CANDIDATE_TABLE",
+    "CANDIDATE_FRAGMENT_TABLE",
 ]
