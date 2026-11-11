@@ -419,3 +419,12 @@ def test_plateau_widths_are_scipys_at_every_relative_height(rel_height) -> None:
         np.testing.assert_allclose(c.extras["width_samples"][0][c.valid[0]].numpy()[order], w)
         np.testing.assert_allclose(c.extras["left_ip"][0][c.valid[0]].numpy()[order], left_ip)
         np.testing.assert_allclose(c.extras["right_ip"][0][c.valid[0]].numpy()[order], right_ip)
+
+
+def test_a_batch_with_no_samples_or_no_rows_has_no_peaks() -> None:
+    """A zero-length axis raised a reshape error (the scorer met it for a
+    query with no scans; Codex review, 2026-11-11)."""
+    picker = PeakPicker(detect=LocalMaxima(), boundaries=WalkOut())
+    for shape in ((3, 0), (0, 12), (2, 4, 0)):
+        p = picker(torch.zeros(shape, dtype=torch.float64))
+        assert p.valid.shape == (*shape[:-1], 0) and p.apex_x.shape == (*shape[:-1], 0)

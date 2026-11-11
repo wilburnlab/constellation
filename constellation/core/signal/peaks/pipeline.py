@@ -115,6 +115,8 @@ class PeakPicker:
         boundary_valid: torch.Tensor | None = None,
     ) -> Peaks:
         lead, n = tuple(y.shape[:-1]), y.shape[-1]
+        if n == 0 or y.numel() == 0:
+            return _no_peaks(lead)
         y2 = y.reshape(-1, n).to(torch.float64)
         ok = torch.isfinite(y2) if valid is None else (valid.reshape(-1, n).bool() & torch.isfinite(y2))
         if x is None:
@@ -187,6 +189,24 @@ class PeakPicker:
             components=None if components is None else shaped(components),
             form=None if components is None else getattr(self.refine, "form", None),
         )
+
+
+def _no_peaks(lead: tuple[int, ...]) -> Peaks:
+    """``Peaks [..., 0]``: what a batch with no samples (or no rows) has."""
+    from dataclasses import fields
+
+    shape = (*lead, 0)
+    out = {}
+    for f in fields(Peaks):
+        if f.name == "valid":
+            out[f.name] = torch.zeros(shape, dtype=torch.bool)
+        elif f.name in ("apex", "boundary_apex", "left", "right", "left_base", "right_base"):
+            out[f.name] = torch.zeros(shape, dtype=torch.int64)
+        elif f.name in ("extras", "components", "form"):
+            continue
+        else:
+            out[f.name] = torch.zeros(shape, dtype=torch.float64)
+    return Peaks(**out)
 
 
 def _recenter(trace: Trace, apex: torch.Tensor, reach: int) -> torch.Tensor:
