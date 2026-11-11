@@ -628,6 +628,68 @@ the cell view, 2.2M cells in the in-memory run.
   a hand-built `Peptidoform`. No producer here wrote another case, so no id on disk changes.
 - **MS3 and MSX** are tested on fakes only, since no such file is on this machine.
 
+## The second review's fixes, the peak layer and scorer v1 (2026-11-11, `feat/kl-scorer`)
+
+The second pre-scoring review ([../reviews/pre-scoring-2026-11-10.md](../reviews/pre-scoring-2026-11-10.md))
+found about 40 defects; every one is fixed except S3 (Counter's censored term: Counter is revised on
+its own), each with a test that fails on the code before (the review's §9 lists where). Then §8's
+steps 2 and 3, with scorer v1 redefined by the PI as a KL trace over MS2 whose peaks a picker finds.
+
+**What changed under a reducer.**
+- The dense view: `Dense.observed()` (NaN where not acquired), `point_index`, `overlap_group`,
+  `n_slots`, why a slot has no parent (`parent_slots(reasons=True)`) and the MS1 slots either side
+  (`brackets`), injection times imputed from the TIC (`iit_imputed`), each scan's floor and
+  centroider, and whether its range is known; a 74 % duplicate check gone, per-call sorting cached.
+- Ledger and schemas: an empty scan read is a slot of zeros (XIC trace v3, sweep schemas v7);
+  outputs of an in-memory sweep spill past `memory_rows`; claims are bounded runs merged in scan
+  order; the spill estimate scales by cells; a failed sweep stops its workers and removes its
+  directory; `mz_axis='latest'` is resolved once.
+- Scan context: several scan ranges, MS2 ranges of an imported `.dia` from its method text (the
+  imported GPF run now gives the converted run's cells exactly), scan metadata v5's
+  `intensity_floor` / `scan_windows`, validated parents, one test of unsupported runs.
+- Queries: decoy PSMs with content ids and a guard against decoys without fragments; top-N among the
+  acquirable ions (`compile_queries(acquired_ranges=)`, on by default in `extract`);
+  `ChannelSettings.for_scoring()`; heavy atoms out of the MS1 envelope.
+
+**The peak layer** (`core.signal`; [peak-detection.md](peak-detection.md)): masked, batched smoothing
+(an exact masked Savitzky–Golay), baselines, noise, a multi-trace consensus and range tables, and
+`core.signal.peaks`: detectors (`LocalMaxima`, which is `find_peaks` batched; `MatchedFilter`;
+`RobustZ`), boundary rules, refiners and a `PeakPicker` of interchangeable, registered stages with a
+provenance key; `core.optim.batched_least_squares` and `core.stats.peaks.PEAK_FORMS` for shape fits.
+
+**Scorer v1** (`massspec.search.score`, `KlScorer`, `score_acquisition`): KL(observed fragment shares
+‖ library shares) at every MS2 slot, `exp(−KL)` as the trace, peaks by `PeakPicker`, bounded on the
+k-th largest intensity over share; `CANDIDATE_TABLE` / `CANDIDATE_FRAGMENT_TABLE`. The score is the
+negative KL at the apex on the picker's smoothed trace.
+
+**Defaults from the GPF bench** (`scripts/bench-scorer-v1.py`; the review's subsets: 1,200 of
+EncyclopeDIA's 1 % identifications in the 900–1000 fraction, 300 other targets, 1,500 decoys sampled
+by charge and m/z; library top 10, 0.35 Da, precursor-major, 4 workers). One factor at a time from a
+base, with and without the calibrated RT window (26 runs): a sliding sum over slots hurt (AUC 0.80 →
+0.72 at ±1), as did `−KL` against `exp(−KL)`; `min_observed` 2–4 changed little; a Gaussian
+smoother (σ = 1 slot) placed apexes best, Savitzky–Golay rang on flat-topped stretches; the
+matched-filter and robust-z detectors ranked candidates by response or z and chose the wrong peak
+without an RT window (median apex error 480–560 s); walk-out boundaries beat a height fraction; and
+the KL on the smoothed trace separated better than the raw KL in every setting, so it is the score.
+Final settings, with `for_scoring()` channels and top-N among acquired ions:
+
+| | No RT window | Calibrated window (±234.5 s) |
+|---|---|---|
+| AUC, found targets vs decoys (score) | 0.848 | 0.890 |
+| Found targets' apex within 30 s of EncyclopeDIA's (median) | 84.1 % (3.1 s) | 81.1 % (3.2 s) |
+| Apex inside EncyclopeDIA's boundaries | 74.6 % | 71.8 % |
+| Crude target–decoy count at 1 % / 5 % | 339 / 523 | 413 / 731 |
+| Wall, largest process | 78.5 s, 1.70 GB | 20.6 s, 0.89 GB |
+
+Against the review's toy scorer (smoothed cosine, co-elution, a combined score) on the same subsets:
+its AUCs were higher (0.877 / 0.915) and its apexes closer (91 % within 30 s), but it found 0 / 91 and
+202 / 414 at 1 % / 5%; this finds several times that, without a window too. The counts are sampling,
+not FDR: most targets are EncyclopeDIA's own, and the decoys a sample. The apex misses are a
+different peak chosen, not a misplaced one: the KL is blind to intensity, so a clean match on a
+peak's tail or a neighbour's can win (planted runs show it for two peptides that share most
+fragments). Co-elution (`n_coeluting`, AUC 0.87–0.89) is the strongest single column; combining
+columns is the rescoring step.
+
 ## Still to do
 
 - P7: the two-pass gate is built inside a precursor-major unit (`gate_first`, above); the scan-major
@@ -637,9 +699,9 @@ the cell view, 2.2M cells in the in-memory run.
   and the dense match kernel, with the scorer. (The dense view is in: 2026-11-10, above.)
 - FAIMS runs of several voltages (refused since 2026-11-10): windows keyed by voltage, and evidence
   runs counted per (query, voltage). MSX scans (refused): several isolation windows a scan.
-- The scorer (trace operations on the dense view: smoothing, background, peaks, boundaries; then
-  candidates, features, a verdict rule) as a reducer of several outputs, FDR, and output as an
-  experiment directory the browser reads: the next plans.
+- After scorer v1 (2026-11-11, above): FDR (q-values with π₀ = 1, PAVA PEP, sets and entrapment),
+  two passes (calibrants, `rt.align`, ppm(RT), windows cut by RT), the native engine writer and verb,
+  rescoring over the candidate columns, and the review's §7 decisions D4–D8 and D10–D13.
 - Targets from FASTA files are built (2026-11-05): `massspec search-space`
   ([search-space.md](search-space.md)) writes a library `chromatogram extract --targets` reads, with
   decoys flagged `is_decoy` through the queries and the query summary (schemas v3) instead of the

@@ -376,11 +376,16 @@ CANDIDATE_TABLE: pa.Schema = pa.schema(
         pa.field("kl_apex_h0", pa.float64(), nullable=True),
         pa.field("kl_apex_smoothed", pa.float64(), nullable=True),
         pa.field("kl_integrated", pa.float64(), nullable=True),
-        # Seconds.
+        # Seconds. The elution apex (the intensity consensus's highest slot
+        # near the KL trace's peak: where quantities and retention times come
+        # from) and its extent; and the KL trace's own apex, where the KL
+        # features are taken.
         pa.field("rt_apex", pa.float64(), nullable=True),
         pa.field("rt_left", pa.float64(), nullable=True),
         pa.field("rt_right", pa.float64(), nullable=True),
         pa.field("apex_scan", pa.int64(), nullable=True),
+        pa.field("rt_kl_apex", pa.float64(), nullable=True),
+        pa.field("kl_apex_scan", pa.int64(), nullable=True),
         pa.field("rt_library", pa.float64(), nullable=True),
         pa.field("height", pa.float64(), nullable=True),
         pa.field("prominence", pa.float64(), nullable=True),

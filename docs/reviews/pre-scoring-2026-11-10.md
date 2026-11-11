@@ -414,3 +414,27 @@ Recommend B, with C as the feature form. Decide it before the features are fixed
 6. **A native engine writer and verb**, one pass then two, read by `summarize` and the browser (D9). Validate on BSA/lysin and on a GPF fraction against the jar (D10).
 7. **Rescoring:** the JavaPot port, checked on the jar's own feature file (D7).
 8. **v2:** competition after the sweep (D4), the count likelihood once floor and gain are calibrated (D2), protein inference once the PI rules on the pairing (D6), several runs.
+
+## 9. Outcome (2026-11-11, `feat/kl-scorer`)
+
+The PI approved every §1 fix but Counter's (S3 is left to Counter's own revision; S4 and S5 were made generic ledger and dense-view fields, Counter unchanged), then §8's steps 2 and 3 with scorer v1 redefined as a KL trace over MS2. One commit per phase; each fix has a test that fails on `b051506`.
+
+| Phase | Fixed |
+|---|---|
+| P1 `core.stats` | S2, V1 (`mask=` on the similarities), S9, S6 (exact EMG areas), S8 |
+| P2 dense view | V1 (`Dense.observed`), V2, V4, V5, V6, V7, V8, S10, D11's overlap groups |
+| P3 sweep engine | V3, E7, E8, E9, E10, E11, E12 |
+| P4 scan context | S4, S5, A7, A8, A9, A10, A11, A12, A13, A14 |
+| P5 search space, ProForma | B8 (layout 2), B9, B10, B11, B12 (refused at mass time), B13, B14 (the grammar's labile prefixes) |
+| P6 targets, channels, scores | C5 (and a guard), C6 (on by default in `extract`), C7, C8 (`heavy_atoms`, unimod.json schema 3), C9, C10, C11, D11 (`for_scoring()`), S7, S11 |
+| P7–P9 `core.signal`, `core.optim` | §8 step 2: trace operations, the peak layer ([../plans/peak-detection.md](../plans/peak-detection.md)), batched fits |
+| P10–P11 | §8 step 3: scorer v1 and its bench ([../plans/sweep.md](../plans/sweep.md)) |
+
+Left, as the phases found them:
+- **C6:** the query summary does not count unacquirable channels (the report does).
+- **Multi-range scans:** the acquired ranges are one envelope per window (the ledger itself knows the gaps).
+- **S11:** RT alignments the jar writes are not stamped with the library's clock.
+- **B12:** the group is refused when its mass is computed, not when it is parsed.
+- **B13:** `peptide_mass` still resolves a name under another CV through UNIMOD.
+- **C5:** the guard has no minimum count.
+- **V7:** one query at a time still costs about 3× one build (chunks cost 1×).

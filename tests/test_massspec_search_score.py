@@ -187,10 +187,10 @@ def test_the_kl_at_an_apex_is_the_slots_kl_of_observed_and_library_shares(plante
     by = {(q, s): k for q, s, k in zip(probe.column("query").to_pylist(), probe.column("scan").to_pylist(),
                                         probe.column("kl").to_pylist())}  # fmt: skip
     t = result.table("candidates")
-    rows = t.filter(pc.is_valid(t.column("apex_scan"))).to_pylist()
+    rows = t.filter(pc.is_valid(t.column("kl_apex_scan"))).to_pylist()
     assert rows
     for r in rows:
-        assert r["kl_apex"] == pytest.approx(by[(r["query"], r["apex_scan"])], abs=1e-9)
+        assert r["kl_apex"] == pytest.approx(by[(r["query"], r["kl_apex_scan"])], abs=1e-9)
         assert r["kl_apex_h0"] == pytest.approx(r["kl_apex"], abs=1e-12)  # no sliding sum by default
 
 

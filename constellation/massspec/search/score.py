@@ -21,7 +21,8 @@ For each precursor query, on its MS2 dense view (``QueryBatch.dense``,
    the query's strongest or more: k fragments must co-elute for the
    consensus to rise).
 
-Every candidate gets a row of :data:`CANDIDATE_TABLE`: its KL at the apex
+Every candidate gets a row of :data:`CANDIDATE_TABLE`, its ``score`` the
+negative KL at the apex on the picker's smoothed trace: its KL at the apex
 (with and without the sliding sum, and on the picker's smoothed trace), the
 KL of the spectrum summed over its extent, the picker's measures, its
 retention times and apex scan, its ions and mass error. The best by the
@@ -255,9 +256,15 @@ class KlScorer:
         kl_apex = torch.gather(kl, 1, apex)
         kl_apex0 = torch.gather(kl0, 1, apex)
         n_obs_apex = torch.gather(n_obs, 1, apex)
-        scan_apex = torch.gather(d.scan, 1, apex)
+        kl_scan = torch.gather(d.scan, 1, apex)
+        scan_apex = torch.gather(d.scan, 1, b_apex)
+        rt_elution = torch.gather(torch.nan_to_num(d.rt, nan=float("nan")), 1, b_apex)
         detector_score = peaks.score
-        score = -kl_apex
+        # The score is the KL on the picker's smoothed trace at the apex: on
+        # the GPF bench it separated EncyclopeDIA's identifications from
+        # decoys better than the raw KL there in every setting (AUC 0.825
+        # against 0.797 without an RT window, 0.874 against 0.867 with one).
+        score = -kl_smooth
         n_model = model.sum(-1, keepdim=True).expand(q, m)
         rt_library = targets.column("rt_library").take(take).to_numpy(zero_copy_only=False).astype(np.float64)
         col = {
@@ -281,10 +288,12 @@ class KlScorer:
             "kl_apex_h0": nullable(cand(kl_apex0)),
             "kl_apex_smoothed": nullable(cand(kl_smooth)),
             "kl_integrated": nullable(cand(kl_ext)),
-            "rt_apex": nullable(cand(peaks.apex_x)),
+            "rt_apex": nullable(cand(rt_elution)),
             "rt_left": nullable(cand(peaks.left_x)),
             "rt_right": nullable(cand(peaks.right_x)),
             "apex_scan": nullable(cand(scan_apex, np.int64), pa.int64()),
+            "rt_kl_apex": nullable(cand(peaks.apex_x)),
+            "kl_apex_scan": nullable(cand(kl_scan, np.int64), pa.int64()),
             "rt_library": pa.array(rt_library[rows_q], pa.float64(), mask=np.isnan(rt_library[rows_q])),
             "height": nullable(cand(peaks.height)),
             "prominence": nullable(cand(peaks.prominence)),
@@ -346,7 +355,8 @@ def score_acquisition(
 ):
     """Score ``targets`` in one acquisition (module docstring): compile their
     MS2 queries with ``channels`` (``ChannelSettings.for_scoring()`` by
-    default) and the library's ``fragment_abundance``, sweep ``bundle`` with
+    default), the library's ``fragment_abundance`` and the bundle's acquired
+    m/z range per window (top-N among the ions acquired), sweep ``bundle`` with
     :class:`KlScorer`, and return the ``SweepResult`` whose ``candidates``
     and ``candidate_fragments`` carry the feature set, the picker and the
     scorer's settings (and a ``core.stages`` key over them) in their metadata."""
@@ -356,11 +366,16 @@ def score_acquisition(
     from constellation.massspec.sweep.engine import SweepSettings, sweep
     from constellation.massspec.sweep.rules import Nearest
 
+    from constellation.massspec.acquisition_structure import read_acquired_ranges
+
     settings = settings or ScorerSettings()
     channels = channels or ChannelSettings.for_scoring()
     rule = rule or Nearest()
+    # Top-N among the ions each window acquired (review C6): a channel never
+    # measured would take a library slot and give the KL nothing.
     plan = compile_queries(targets, levels=[2], channels=channels, rt_window=rt_window,
-                           fragment_abundance=fragment_abundance)  # fmt: skip
+                           fragment_abundance=fragment_abundance,
+                           acquired_ranges=read_acquired_ranges(bundle))  # fmt: skip
     sweep_settings = SweepSettings(tolerances={2: tuple(tolerance)}, rule=rule, acquisition_id=acquisition_id)
     scorer = KlScorer(settings=settings, acquisition_id=acquisition_id, pass_=pass_, role=role)
     result = sweep(bundle, plan, sweep_settings, reducers=[scorer], layout=layout, workers=workers,
