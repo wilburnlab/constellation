@@ -18,7 +18,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import _xic_scan_major_oracle as oracle
-from _massspec_fixtures import dia_scans, planted_run, write_bundle, write_bundle_manifest
+from _massspec_fixtures import dia_scans, drop_unacquired, planted_run, write_bundle, write_bundle_manifest
 from constellation.massspec.bundle import open_peaks
 from constellation.massspec.quant.chromatogram import XicTraceReducer, extract_xic_scan_major
 from constellation.massspec.quant.schemas import XIC_TARGET_TABLE
@@ -66,7 +66,9 @@ def test_a_streamed_bundle_gives_what_its_table_gives_the_oracle(tmp_root, name,
     )  # fmt: skip
     want = oracle.extract_xic_scan_major(peaks, targets, **kw)
     assert want.num_rows > 0
-    oracle.assert_traces_identical(extract_xic_scan_major(bundle, targets, **kw), want)
+    # A bundle records each scan's acquired range, and a channel outside it
+    # is not zero-filled (trace v2); a table of points records none.
+    oracle.assert_traces_identical(extract_xic_scan_major(bundle, targets, **kw), drop_unacquired(want, bundle))
     oracle.assert_traces_identical(extract_xic_scan_major(peaks, targets, **kw), want)
 
 
@@ -214,7 +216,7 @@ def test_workers_and_shards_change_nothing(tmp_root, tmp_path, mode):
         work = tmp_path / f"work{i}"
         got = sweep(bundle, plan, settings, reducers=[reducer], workers=workers, work_dir=work)
         assert len(got.parts["xic_trace"]) > 1  # several buckets
-        runs = sorted(p.name for p in (work / "matches").glob("*.parquet"))
+        runs = sorted(p.name for p in (got.work / "matches").glob("*.parquet"))
         assert len({r[:11] for r in runs}) > 1 and len(runs) > len({r[:11] for r in runs})  # shards, runs
         oracle.assert_traces_identical(got.table("xic_trace"), base)
         out = got.write("xic_trace", tmp_path / f"out{i}.parquet")
@@ -245,6 +247,151 @@ def test_too_many_matches_for_memory_go_to_disk(tmp_root):
     del spilled
     gc.collect()
     assert not tmp.exists()
+
+
+def test_an_in_memory_sweep_spills_after_the_window_group_that_passes_its_limit(tmp_root, monkeypatch, tmp_path):
+    """The limit was tested after a whole block of points, counting matches
+    only: with the run in one block, 942 matches were held at a limit of
+    100 (review of 2026-11-09, E3). Now it is tested after every window
+    group, on everything held, and the rest of the block goes on on disk."""
+    from constellation.massspec.sweep import engine
+    from constellation.massspec.sweep.evidence import EvidenceGate
+    from constellation.massspec.sweep.reduce import QuerySummaryReducer
+
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2])  # no RT window
+    tol = {1: (20.0, "ppm"), 2: (0.35, "Da")}
+    reducers = [QuerySummaryReducer(), XicTraceReducer()]
+    gate = EvidenceGate(min_fragments=2, min_consecutive=1)
+    base = sweep(bundle, plan, SweepSettings(tolerances=tol, gate=gate), reducers=reducers)
+    seen = []
+    real = engine._on_temporary_disk
+
+    def spy(*args, resume=None, **kw):
+        if resume is not None:
+            seen.append([p.rows for p in resume[2]])
+        return real(*args, resume=resume, **kw)
+
+    monkeypatch.setattr(engine, "_on_temporary_disk", spy)
+    tight = SweepSettings(tolerances=tol, gate=gate, memory_rows=100, block_rows=1 << 20)
+    got = sweep(bundle, plan, tight, reducers=reducers, spill_dir=tmp_path)
+    assert got.matches is None and len(seen) == 1
+    held = seen[0]
+    assert sum(held[:-1]) <= tight.memory_rows < sum(held)  # spilled after the part that passed it
+    assert got.work.parent == tmp_path
+    for name in base.schemas:
+        oracle.assert_traces_identical(got.table(name), base.table(name))
+
+
+class _CellCounter:
+    """A reducer that zero-fills and records the cells each call builds."""
+
+    name = "cells_per_call"
+    schema = pa.schema([("cells", pa.int64()), ("first", pa.int64()), ("last", pa.int64())])
+    gated = False
+    zero_fills = True
+
+    def reduce(self, batch):
+        n = sum(batch.cells(level).n for level in batch.plan.levels)
+        q = batch.plan.global_query(batch.queries)
+        first, last = (int(q[0]), int(q[-1])) if q.size else (-1, -1)
+        return pa.table({"cells": [n], "first": [first], "last": [last]}, schema=self.schema)
+
+
+def test_an_in_memory_reduce_is_bucketed_as_one_on_disk_is(tmp_root, tmp_path):
+    """The in-memory reduce handed the whole plan to one call: 1,962,000
+    cells where the disk path's largest call was 48,000 (review of
+    2026-11-09, E3). Both now cut the same buckets, by the rows built."""
+    from constellation.massspec.sweep.engine import _reduce_weights
+    from constellation.massspec.sweep.evidence import EvidenceGate
+    from constellation.massspec.sweep.reduce import QuerySummaryReducer
+
+    run, bundle, _ = _run("dia", tmp_root)
+    rows = run.targets.to_pylist()
+    many = [dict(r, target_id=r["target_id"] + 1000 * k) for k in range(20) for r in rows]
+    plan = compile_queries(pa.Table.from_pylist(many, schema=XIC_TARGET_TABLE), levels=[1, 2])
+    tol = {1: (20.0, "ppm"), 2: (0.35, "Da")}
+    gate = EvidenceGate(min_fragments=2, min_consecutive=1)
+    settings = SweepSettings(tolerances=tol, gate=gate, claims=True, reduce_rows=20_000)
+    reducers = [_CellCounter(), QuerySummaryReducer(), XicTraceReducer(drop_unmatched=False),
+                XicTraceReducer(gated=True, name="passing_trace")]  # fmt: skip
+    mem = sweep(bundle, plan, settings, reducers=reducers)
+    disk = sweep(bundle, plan, settings, reducers=reducers, work_dir=tmp_path / "w")
+    assert mem.matches is not None  # in memory
+    calls = mem.table("cells_per_call")
+    assert calls.num_rows > 5
+    counts = np.bincount(mem.matches.query, minlength=plan.n_queries)
+    weights = _reduce_weights(plan, mem.scans, settings, reducers, counts)
+    assert max(calls.column("cells").to_pylist()) <= settings.reduce_rows + int(weights.max())
+    # Contiguous ascending ranges that cover every query once.
+    first, last = calls.column("first").to_numpy(), calls.column("last").to_numpy()
+    assert first[0] == 0 and last[-1] == plan.n_queries - 1 and (first[1:] == last[:-1] + 1).all()
+    for name in disk.schemas:
+        oracle.assert_traces_identical(mem.table(name), disk.table(name))
+
+
+def test_claims_on_disk_are_the_in_memory_table(tmp_root, tmp_path):
+    """A run can end inside a block, whose window groups interleave scan
+    numbers, so claims written run by run came out of scan order on disk
+    (review of 2026-11-09, D2). Claims are now written for whole blocks."""
+    from constellation.massspec.sweep.engine import CLAIMS
+    from constellation.massspec.sweep.reduce import QuerySummaryReducer
+
+    run, bundle, _ = _run("dia", tmp_root)
+    rows = run.targets.to_pylist()
+    rows.append(dict(rows[4], target_id=4444))  # a duplicate: every one of its points claimed twice
+    plan = compile_queries(pa.Table.from_pylist(rows, schema=XIC_TARGET_TABLE), levels=[1, 2], rt_window=20.0)
+    tol = {1: (20.0, "ppm"), 2: (20.0, "ppm")}
+    want = sweep(bundle, plan, SweepSettings(tolerances=tol, rule=AllWithin(), claims=True),
+                 reducers=[QuerySummaryReducer()]).table(CLAIMS)  # fmt: skip
+    assert want.num_rows > 0
+    for block_rows, run_rows in ((1 << 20, 20), (1 << 20, 5), (300, 20)):
+        settings = SweepSettings(tolerances=tol, rule=AllWithin(), claims=True, block_rows=block_rows,
+                                 run_rows=run_rows)  # fmt: skip
+        got = sweep(bundle, plan, settings, reducers=[QuerySummaryReducer()], work_dir=tmp_path / "w")
+        assert len(list((got.work / "matches").glob("*.parquet"))) > 1  # runs end inside blocks
+        assert got.table(CLAIMS).equals(want)
+
+
+def test_claims_are_made_into_their_table_a_run_at_a_time(tmp_root, tmp_path):
+    """Sorting a shard's claims as one held them all at once, and a sweep
+    spilled to disk is one shard, so its claims undid the bound that made
+    it spill (Codex, 2026-11-10: 1,600 held where main held 160)."""
+    from constellation.massspec.sweep import engine
+    from constellation.massspec.sweep.engine import CLAIMS
+    from constellation.massspec.sweep.reduce import QuerySummaryReducer
+
+    run, bundle, _ = _run("dia", tmp_root)
+    rows = run.targets.to_pylist()
+    rows.append(dict(rows[4], target_id=4444))
+    plan = compile_queries(pa.Table.from_pylist(rows, schema=XIC_TARGET_TABLE), levels=[1, 2], rt_window=20.0)
+    tol = {1: (20.0, "ppm"), 2: (20.0, "ppm")}
+    want = sweep(bundle, plan, SweepSettings(tolerances=tol, rule=AllWithin(), claims=True),
+                 reducers=[QuerySummaryReducer()]).table(CLAIMS)  # fmt: skip
+    engine.READ_STATS["claims_held"] = 0
+    settings = SweepSettings(tolerances=tol, rule=AllWithin(), claims=True, block_rows=100, run_rows=5)
+    got = sweep(bundle, plan, settings, reducers=[QuerySummaryReducer()], work_dir=tmp_path / "w")
+    assert got.table(CLAIMS).equals(want)
+    runs = [pq.read_metadata(f).num_rows for f in (got.work / "claims").glob("*.parquet")]
+    assert len(runs) > 10
+    assert engine.READ_STATS["claims_held"] == max(runs) < want.num_rows / 5
+
+
+def test_a_spill_with_no_room_is_refused_before_it_starts(tmp_root, tmp_path, monkeypatch):
+    import shutil
+    from collections import namedtuple
+
+    from constellation.massspec.sweep import engine
+
+    run, bundle, _ = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1, 2])
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(engine.shutil, "disk_usage", lambda path: usage(10, 10, 0))
+    with pytest.raises(OSError, match=str(tmp_path)):
+        sweep(bundle, plan, SweepSettings(tolerances={1: (20.0, "ppm"), 2: (0.35, "Da")}, memory_rows=100),
+              reducers=[XicTraceReducer()], spill_dir=tmp_path)  # fmt: skip
+    assert not list(tmp_path.glob("sweep-*"))
+    monkeypatch.setattr(engine.shutil, "disk_usage", shutil.disk_usage)
 
 
 # ── eligibility and the reduce's buckets ─────────────────────────────
@@ -586,7 +733,7 @@ def test_a_bucket_reads_about_its_own_rows_from_the_runs(tmp_root, tmp_path):
     work = tmp_path / "w"
     got = sweep(bundle, plan, SweepSettings(tolerances=tol, **small), reducers=[XicTraceReducer()],
                 workers=1, work_dir=work)  # fmt: skip
-    runs = sorted((work / "matches").glob("*.parquet"))
+    runs = sorted((got.work / "matches").glob("*.parquet"))
     matches = sum(pq.read_metadata(f).num_rows for f in runs)
     buckets = len(got.parts["xic_trace"])
     assert len(runs) > 3 and buckets > 3
@@ -783,7 +930,7 @@ def test_no_run_file_holds_more_than_run_rows(tmp_root, tmp_path):
     capped = SweepSettings(tolerances=tol, run_rows=97, block_rows=1 << 20)
     got = sweep(bundle, plan, capped, reducers=[XicTraceReducer()], workers=1, work_dir=tmp_path / "w")
     oracle.assert_traces_identical(got.table("xic_trace"), base)
-    runs = sorted((tmp_path / "w" / "matches").glob("*.parquet"))
+    runs = sorted((got.work / "matches").glob("*.parquet"))
     assert len(runs) > 1
     assert max(pq.read_metadata(f).num_rows for f in runs) <= 97
 
@@ -806,7 +953,7 @@ def test_a_scan_range_is_cut_into_shards_of_its_own(tmp_root, tmp_path):
     got = sweep(bundle, plan, settings, reducers=[XicTraceReducer()], scan_range=(lo, hi - 1), workers=2,
                 work_dir=tmp_path / "w")  # fmt: skip
     oracle.assert_traces_identical(got.table("xic_trace"), want)
-    assert len(list((tmp_path / "w" / "scans").glob("*.parquet"))) > 1
+    assert len(list((got.work / "scans").glob("*.parquet"))) > 1
 
 
 def test_eligible_pairs_are_counted_in_chunks_bounded_by_the_pairs_they_build(tmp_root, monkeypatch):

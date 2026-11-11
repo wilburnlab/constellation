@@ -94,6 +94,57 @@ def test_every_point_is_there_once_with_its_scan_together_and_in_stored_order(tm
     assert dict(zip(counts.column("scan").to_pylist(), counts.column("n_points").to_pylist(), strict=True)) == want
 
 
+def test_a_part_too_large_to_hold_is_written_in_pieces_of_whole_scans(tmp_path, monkeypatch):
+    """A writer held its whole peak part, and a writer of one part a run held
+    the whole run (review of 2026-11-09, A2). It now writes what it holds,
+    at a scan's end, past MAX_HELD_POINTS; the layout holds the same points,
+    and a sweep of it gives the same rows."""
+    from constellation.massspec.quant.chromatogram import XicTraceReducer
+    from constellation.massspec.quant.schemas import XIC_TARGET_TABLE
+    from constellation.massspec.sweep import compile_queries
+    from constellation.massspec.sweep.engine import SweepSettings, sweep
+
+    held = []
+    real = pm.PrecursorMajorWriter.close
+
+    def recording_close(self):
+        held.append((self.peak_held, self.max_points))
+        return real(self)
+
+    run = planted_run(**_RUNS["dia"])
+    whole = _bundle(tmp_path, "whole", run.scans)
+    build_precursor_major(whole)
+    monkeypatch.setattr(pm, "MAX_HELD_POINTS", 300)
+    monkeypatch.setattr(pm, "BUILD_BATCH_ROWS", 53)
+    monkeypatch.setattr(pm.PrecursorMajorWriter, "close", recording_close)
+    pieces = _bundle(tmp_path, "pieces", run.scans)
+    build_precursor_major(pieces)
+    layout = find_precursor_major(pieces)
+    assert layout is not None
+    assert len(layout.files(2)) > len(find_precursor_major(whole).files(2))
+    assert all(peak <= limit + 53 for peak, limit in held)
+    # Every point once; each scan's points in one file, in stored order.
+    for level in (1, 2):
+        mine = _layout_rows(layout.root, level).sort_by([("scan", "ascending"), ("mz", "ascending")])
+        theirs = _layout_rows(whole / PRECURSOR_MAJOR_DIR, level).sort_by([("scan", "ascending"), ("mz", "ascending")])
+        assert mine.equals(theirs)
+        seen: dict[int, str] = {}
+        for f in layout.files(level):
+            for s in set(pq.read_table(f, columns=["scan"]).column("scan").to_pylist()):
+                assert s not in seen, f"scan {s} in {seen[s]} and {f.name}"
+                seen[s] = f.name
+    targets = pa.Table.from_pylist(run.targets.to_pylist(), schema=XIC_TARGET_TABLE)
+    plan = compile_queries(targets, levels=[1, 2])
+    settings = SweepSettings(tolerances={1: (20.0, "ppm"), 2: (0.35, "Da")})
+    a = sweep(whole, plan, settings, reducers=[XicTraceReducer(drop_unmatched=False)], layout="precursor_major")
+    b = sweep(pieces, plan, settings, reducers=[XicTraceReducer(drop_unmatched=False)], layout="precursor_major")
+    assert a.table("xic_trace").num_rows > 0
+    import _xic_scan_major_oracle as oracle
+
+    # Bit for bit (unmatched rows hold NaN, which Table.equals never equals).
+    oracle.assert_traces_identical(b.table("xic_trace"), a.table("xic_trace"))
+
+
 def test_a_window_is_read_from_a_few_row_groups(tmp_path, monkeypatch):
     monkeypatch.setattr(pm, "MIN_GROUP_ROWS", 8)
     monkeypatch.setattr(pm, "MAX_GROUP_ROWS", 64)

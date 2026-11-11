@@ -72,6 +72,35 @@ def test_unknown_modification_raises():
         UNIMOD["nonsense"]
 
 
+@pytest.mark.parametrize("key", ["phospho", "PHOSPHO", "unimod:21", "Unimod:21"])
+def test_a_name_or_id_is_found_in_any_case(key):
+    """ProForma 2.1: readers SHOULD look CV names up case-insensitively
+    where no two entries clash (none known), so `[phospho]` is Phospho."""
+    assert key in UNIMOD
+    assert UNIMOD[key] is UNIMOD["UNIMOD:21"]
+
+
+def test_unimod_has_no_names_that_clash_once_case_is_ignored():
+    folded = {}
+    for mod in UNIMOD:
+        for key in (mod.id, *mod.aliases):
+            folded.setdefault(key.casefold(), set()).add(mod.id)
+    assert not {k: ids for k, ids in folded.items() if len(ids) > 1}
+
+
+def test_a_spelling_two_modifications_share_once_case_is_ignored_is_refused():
+    vocab = ModVocab()
+    vocab.register_custom("CUSTOM:a", "a", Composition.from_formula("C"), aliases=("Tag",))
+    vocab.register_custom("CUSTOM:b", "b", Composition.from_formula("N"), aliases=("TAG",))
+    # As written, each is its own.
+    assert vocab["Tag"].id == "CUSTOM:a" and vocab["TAG"].id == "CUSTOM:b"
+    assert "tag" not in vocab
+    with pytest.raises(KeyError, match="more than one modification"):
+        vocab["tag"]
+    # A subset holding one of them finds it in any case.
+    assert vocab.subset(["CUSTOM:a"])["tag"].id == "CUSTOM:a"
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Subsetting — first-class API for per-tool enablement
 # ──────────────────────────────────────────────────────────────────────

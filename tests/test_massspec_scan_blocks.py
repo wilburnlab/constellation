@@ -118,6 +118,23 @@ def test_shards_partition_the_run(tmp_path, target_rows):
         assert len(shards) > 2
 
 
+def test_an_empty_last_part_ends_where_the_peaks_do(tmp_path):
+    """A part with no row group (``centroid --scans`` for a part none of
+    whose scans was chosen) made the cut raise (review of 2026-11-09, A6)."""
+    from constellation.massspec.bundle import PeakWriter
+
+    scans = dia_scans(cycles=6)
+    bundle = _bundle(tmp_path, scans)
+    last = bundle / "peaks" / "part-00001.parquet"
+    kept = pq.read_table(last).column("scan").to_numpy()
+    last.unlink()
+    with PeakWriter(last):
+        pass
+    shards = scan_range_shards(bundle)
+    first_part = pq.read_table(bundle / "peaks" / "part-00000.parquet").column("scan").to_numpy()
+    assert shards[-1][1] == int(first_part.max()) + 1 and int(kept.min()) >= shards[-1][1]
+
+
 def test_shards_do_not_depend_on_block_size(tmp_path):
     bundle = _bundle(tmp_path, dia_scans(cycles=12), row_group_size=17)
     assert scan_range_shards(bundle, target_rows=40) == scan_range_shards(bundle, target_rows=40)

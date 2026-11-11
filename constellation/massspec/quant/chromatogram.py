@@ -481,6 +481,7 @@ def extract_xic(
     progress=None,
     fragment_abundance=None,
     layout: str = "scan_major",
+    spill_dir: Path | str | None = None,
 ) -> "SweepResult":
     """Extract XIC traces for ``targets`` at every MS level in ``levels`` in
     one sweep of ``peaks`` (a bundle, streamed, or a peak table), each level
@@ -502,7 +503,9 @@ def extract_xic(
     schema metadata (:func:`extraction_tolerance_metadata`), in memory and
     when written. ``layout='precursor_major'`` reads the bundle's
     precursor-major layout instead of its scan-ordered peaks (the same rows
-    per target, in units of targets by precursor m/z; ``sweep``)."""
+    per target, in units of targets by precursor m/z; ``sweep``).
+    ``spill_dir`` is where a sweep that outgrows memory carries on on disk
+    (the system's temporary directory by default; ``sweep``)."""
     from constellation.massspec.sweep import ChannelSettings, compile_queries
     from constellation.massspec.sweep.engine import SweepSettings, sweep
     from constellation.massspec.sweep.reduce import QuerySummaryReducer
@@ -537,7 +540,7 @@ def extract_xic(
     if summary:
         reducers.append(QuerySummaryReducer())
     result = sweep(peaks, plan, settings, reducers=reducers, workers=workers, work_dir=work_dir,
-                   progress=progress, layout=layout)  # fmt: skip
+                   progress=progress, layout=layout, spill_dir=spill_dir)  # fmt: skip
     # The tolerances go with every output, read or written: Counter bounds
     # its collision grouping by the trace's.
     stamp = extraction_tolerance_metadata(dict(tolerances))

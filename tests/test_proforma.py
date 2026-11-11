@@ -166,6 +166,57 @@ def test_parse_info_tag():
     assert tm.mod.info_text == "test_info"
 
 
+# ProForma is case-insensitive (spec 2.0 and 2.1, "The Basic Form"); 2.1
+# excepts CV names (written as the CV writes them, looked up in any case)
+# and element symbols. Until 2026-11-10 these were held as written:
+# `pepTIDEK` parsed and then failed every mass, `[unimod:21]` was an
+# unknown modification, and `<[...]@c>` modified nothing.
+@pytest.mark.parametrize(
+    ("spelling", "canonical"),
+    [
+        ("pepTIDEK", "PEPTIDEK"),
+        ("pepTIDEk/2", "PEPTIDEK/2"),
+        ("PEPT[unimod:21]IDEK", "PEPT[UNIMOD:21]IDEK"),
+        ("PEPS[mod:00046]TIDE", "PEPS[MOD:00046]TIDE"),
+        ("PEP[u:+15.995]TIDE", "PEP[U:+15.995]TIDE"),
+        ("PEP[obs:+15.995]TIDE", "PEP[Obs:+15.995]TIDE"),
+        ("PEPM[u:Oxidation]TIDE", "PEPM[U:Oxidation]TIDE"),
+        ("<[Carbamidomethyl]@c>PEPCTIDE", "<[Carbamidomethyl]@C>PEPCTIDE"),
+        ("<[Acetyl]@n-term:k>KPEPTIDE", "<[Acetyl]@N-term:K>KPEPTIDE"),
+        ("PEPT[Phospho#G1]IDES[#g1]K", "PEPT[Phospho#g1]IDES[#g1]K"),
+        ("EMEVTK[XLMOD:02001#xl1]SESPEK[#XL1]", "EMEVTK[XLMOD:02001#XL1]SESPEK[#XL1]"),
+    ],
+)
+def test_proforma_is_read_case_insensitively(spelling, canonical):
+    assert parse_proforma(spelling) == parse_proforma(canonical)
+    assert format_proforma(parse_proforma(spelling)) == canonical
+
+
+@pytest.mark.parametrize(
+    ("spelling", "canonical"),
+    [
+        ("pepTIDEK", "PEPTIDEK"),
+        ("PEPT[unimod:21]IDEK", "PEPT[UNIMOD:21]IDEK"),
+        ("PEPT[phospho]IDEK", "PEPT[Phospho]IDEK"),
+        ("PEPT[u:PHOSPHO]IDEK", "PEPT[UNIMOD:21]IDEK"),
+        ("<[Carbamidomethyl]@c>PEPCTIDE", "<[Carbamidomethyl]@C>PEPCTIDE"),
+        ("<[carbamidomethyl]@C>PEPCTIDE", "<[Carbamidomethyl]@C>PEPCTIDE"),
+    ],
+)
+def test_a_spelling_in_another_case_has_the_same_mass(spelling, canonical):
+    assert peptide_mass(parse_proforma(spelling)) == peptide_mass(parse_proforma(canonical))
+
+
+def test_names_formulas_and_isotope_labels_are_kept_as_written():
+    """The CV's spelling of a name is the CV's (2.1); element symbols are
+    case-sensitive, so `Formula:NH` is not `Formula:Nh` (nihonium)."""
+    (tm,) = parse_proforma("PEPT[phospho]IDEK").residue_mods[3]
+    assert tm.mod.name == "phospho"
+    (tm,) = parse_proforma("PEPTIDEK[Formula:C2H2O]").residue_mods[7]
+    assert tm.mod.formula == "C2H2O"
+    assert parse_proforma("<13C>PEPTIDEK").global_isotopes == ("13C",)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # K[Ac]VERPD chemistry fidelity — load-bearing
 # ──────────────────────────────────────────────────────────────────────

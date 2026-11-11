@@ -175,13 +175,13 @@ def _print_counts(counts: dict) -> None:
 
 
 def _cmd_search_space(args: argparse.Namespace) -> int:
-    from constellation import __version__
-    from constellation.core.stages import file_sha256, invalidate, is_done, mark_done, stage_key
+    from constellation.core.stages import invalidate, is_done, mark_done
     from constellation.massspec.library.io import save_library
     from constellation.massspec.library.search_space import (
         SEARCH_SPACE_METADATA_KEY,
         SearchSpaceBudgetError,
         build_search_space,
+        search_space_key,
     )
 
     for fasta in args.fasta:
@@ -203,11 +203,9 @@ def _cmd_search_space(args: argparse.Namespace) -> int:
         _print_counts(counts)
         return 0
 
-    key = stage_key(
-        settings=settings.as_dict(),
-        inputs=[file_sha256(f) for f in args.fasta],
-        version=__version__,
-    )
+    # Not ``__version__``: an editable install never rewrites it, so it let a
+    # search space made by older code pass as current (until 2026-11-10).
+    key = search_space_key(args.fasta, settings)
     out = args.output_dir
     if is_done(out):
         if is_done(out, key) and args.resume:

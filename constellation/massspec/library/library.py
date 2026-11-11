@@ -39,6 +39,7 @@ synthesises sequential int64 ids.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
@@ -65,6 +66,10 @@ from constellation.massspec.library.schemas import (
 
 #: The span key: a span is where it is in which protein.
 SPAN_KEY = ("protein_id", "start", "end")
+
+#: How a search space names the decoys of a protein (``DECOY_<accession>``,
+#: ``DECOY<n>_<accession>`` for decoy set n).
+_DECOY_PREFIX = re.compile(r"^DECOY\d*_")
 
 # ──────────────────────────────────────────────────────────────────────
 # Container
@@ -233,7 +238,26 @@ class Library:
         )
 
     def subset_proteins(self, protein_ids: Iterable[int]) -> Library:
-        keep_proteins = pa.array(list(protein_ids), type=pa.int64())
+        """The library of these proteins, their decoy proteins (the decoys a
+        search space made of them, named ``DECOY_<accession>`` or
+        ``DECOY<n>_<accession>``), and the peptides with an edge to one of
+        them, with what those peptides need. A decoy is kept by its own
+        edges, so one whose target was filtered away is kept with its
+        protein (until 2026-11-10 a peptide-level decoy had no protein and
+        followed its target through ``decoy_of``, so it was lost with it);
+        a decoy with no protein edge at all (a library made otherwise) still
+        follows the target it was made from."""
+        named = pa.array(list(protein_ids), type=pa.int64())
+        proteins = self.proteins
+        chosen = proteins.filter(pc.is_in(proteins.column("protein_id"), value_set=named))
+        accessions = set(chosen.column("accession").to_pylist())
+        decoy_rows = proteins.filter(pc.fill_null(proteins.column("is_decoy"), False))
+        theirs = [
+            pid for pid, acc in zip(decoy_rows.column("protein_id").to_pylist(),
+                                    decoy_rows.column("accession").to_pylist(), strict=True)  # fmt: skip
+            if _DECOY_PREFIX.sub("", acc, count=1) in accessions
+        ]
+        keep_proteins = pc.unique(pa.concat_arrays([named, pa.array(theirs, pa.int64())]))
         protein_mask = pc.is_in(
             self.proteins.column("protein_id"), value_set=keep_proteins
         )
@@ -244,12 +268,14 @@ class Library:
         )
         new_pp_edges = self.protein_peptide.filter(edge_mask)
 
-        targets = pc.unique(new_pp_edges.column("peptide_id").combine_chunks())
-        # A peptide-level decoy has no protein of its own; it follows its target.
-        decoy_mask = pc.is_in(self.peptides.column("decoy_of"), value_set=targets)
+        with_edges = pc.unique(new_pp_edges.column("peptide_id").combine_chunks())
+        # A decoy with no protein edge at all follows the target it was made from.
+        edged = pc.unique(self.protein_peptide.column("peptide_id").combine_chunks())
+        unedged = pc.invert(pc.is_in(self.peptides.column("peptide_id"), value_set=edged))
+        follows = pc.and_(unedged, pc.fill_null(pc.is_in(self.peptides.column("decoy_of"), value_set=with_edges), False))
         keep_peptides = pc.unique(
             pa.chunked_array(
-                [targets, self.peptides.filter(pc.fill_null(decoy_mask, False)).column("peptide_id").combine_chunks()],
+                [with_edges, self.peptides.filter(follows).column("peptide_id").combine_chunks()],
                 type=pa.int64(),
             ).combine_chunks()
         )

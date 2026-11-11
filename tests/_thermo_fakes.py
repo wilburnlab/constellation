@@ -20,21 +20,31 @@ class Obj:
 
 
 class FakeEvent:
+    """A scan event. ``mass``, ``width`` and ``offset`` are one value for
+    every reaction, or a sequence of one per reaction (an MS3 scan's
+    reaction 0 isolates the precursor, reaction 1 the MS2 fragment)."""
+
     def __init__(self, mass=None, width=None, offset=0.0):
         self._mass, self._width, self._offset = mass, width, offset
 
-    def GetMass(self, idx):  # noqa: ARG002
-        if self._mass is None:
+    @staticmethod
+    def _at(value, idx):
+        return value[idx] if isinstance(value, (list, tuple)) else value
+
+    def GetMass(self, idx):
+        mass = self._at(self._mass, idx)
+        if mass is None:
             raise RuntimeError("no precursor")
-        return self._mass
+        return mass
 
-    def GetIsolationWidth(self, idx):  # noqa: ARG002
-        if self._width is None:
+    def GetIsolationWidth(self, idx):
+        width = self._at(self._width, idx)
+        if width is None:
             raise RuntimeError("no width")
-        return self._width
+        return width
 
-    def GetIsolationWidthOffset(self, idx):  # noqa: ARG002
-        return self._offset
+    def GetIsolationWidthOffset(self, idx):
+        return self._at(self._offset, idx)
 
 
 def scan(

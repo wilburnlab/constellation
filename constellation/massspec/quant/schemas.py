@@ -217,7 +217,9 @@ XIC_TARGET_TABLE: pa.Schema = pa.schema(
 )
 
 
-XIC_TRACE_SCHEMA_VERSION: int = 1
+#: 2 (2026-11-10): with zero-filling (``drop_unmatched=False``), a channel outside
+#: its scan's acquired m/z range gets no zero row: it was never measured.
+XIC_TRACE_SCHEMA_VERSION: int = 2
 
 
 # Long-form XIC extraction output — one row per matched (target, scan,

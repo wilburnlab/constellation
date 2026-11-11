@@ -69,6 +69,17 @@ def test_the_id_recipe_is_pinned() -> None:
         ("PEPC[+57.0214635]TIDEK", "PEPC[+57.0215]TIDEK"),  # at one precision
         ("PEPQ[-17.026549]K", "PEPQ[-17.0265]K"),
         ("<13C>PEPTIDEK", "<13C>PEPTIDEK"),
+        ("<D>PEPTIDEK", "<2H>PEPTIDEK"),  # one label, two spellings (until 2026-11-10, two keys)
+        ("<T>PEPTIDEK", "<3H>PEPTIDEK"),
+        ("<15N><13C>PEPTIDEK", "<13C><15N>PEPTIDEK"),
+        # ProForma is case-insensitive (2.0 and 2.1); until 2026-11-10 each
+        # of these was a key of its own, or a name left unresolved.
+        ("pepTIDEK", "PEPTIDEK"),
+        ("pepm[Oxidation]tidek/2", "PEPM[UNIMOD:35]TIDEK"),
+        ("PEPM[unimod:35]TIDEK", "PEPM[UNIMOD:35]TIDEK"),
+        ("PEPM[oxidation]TIDEK", "PEPM[UNIMOD:35]TIDEK"),
+        ("PEPM[u:OXIDATION]TIDEK", "PEPM[UNIMOD:35]TIDEK"),
+        ("[acetyl]-PEPTIDEK", "[UNIMOD:1]-PEPTIDEK"),
     ],
 )
 def test_spellings_of_one_peptide_share_a_key(spelling: str, key: str) -> None:
@@ -83,6 +94,13 @@ def test_modifications_on_one_site_have_a_fixed_order() -> None:
     a = canonical_peptide_key("C[UNIMOD:4][UNIMOD:35]PEPK")
     b = canonical_peptide_key("C[UNIMOD:35][UNIMOD:4]PEPK")
     assert a == b
+
+
+def test_a_peptidoform_built_with_lower_case_residues_has_the_upper_case_key() -> None:
+    from constellation.core.sequence.proforma import Peptidoform
+
+    assert canonical_peptide_key(Peptidoform("pepTIDEK")) == "PEPTIDEK"
+    assert peptide_id(Peptidoform("pepTIDEK")) == peptide_id("PEPTIDEK")
 
 
 def test_terminal_and_side_chain_placement_are_different_molecules() -> None:
@@ -100,6 +118,7 @@ def test_terminal_and_side_chain_placement_are_different_molecules() -> None:
         "<[Carbamidomethyl]@C>PEPCK",  # global fixed modification
         "PEPTIDEK//KEDITPEP",  # two chains
         "PEPT[INFO:odd]IDEK",
+        "<33S><34S>PEPTIDEK",  # two isotopes of one element: no whole-element label
     ],
 )
 def test_what_names_no_single_molecule_has_no_key(spelling: str) -> None:

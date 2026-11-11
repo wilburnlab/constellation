@@ -16,6 +16,16 @@ charge) is read by a regular expression first, about 200 times faster,
 into exactly the objects the grammar would give; anything else goes to the
 grammar.
 
+ProForma is case-insensitive (spec 2.0 and 2.1, "The Basic Form"), with
+two exceptions 2.1 states: CV names are written as the CV writes them
+(readers SHOULD still find them in any case where no two clash), and
+element symbols in formulas are case-sensitive. So residues, residue
+locations, CV prefixes and group labels are read in any case and held in
+one spelling (``pepTIDEK`` is ``PEPTIDEK``, ``[unimod:21]`` is
+``[UNIMOD:21]``), names are kept as written and found by
+``ModVocab.get`` in any case, and formulas and isotope labels are taken
+as written.
+
 Per CLAUDE.md, this module deliberately does NOT import pyteomics — the
 parser is independently implemented from the upstream grammar so that the
 two implementations cross-check each other in tests. Pyteomics is only
@@ -477,7 +487,7 @@ class _ProFormaTransformer(Transformer):
 
     def sequence_element(self, items):
         # AMINOACID + 0+ mod_or_label
-        aa = _str(items[0])
+        aa = _str(items[0]).upper()
         mods: list[TaggedMod] = []
         for it in items[1:]:
             if it is None:
@@ -556,10 +566,10 @@ class _ProFormaTransformer(Transformer):
         if len(items) == 1:
             return ModRef(cv=None, mass_delta=float(_str(items[0])))
         cv, signed_num = items
-        return ModRef(cv=_str(cv), mass_delta=float(_str(signed_num)))
+        return ModRef(cv=_cv(cv), mass_delta=float(_str(signed_num)))
 
     def mod_accession(self, items):
-        cv = _str(items[0])
+        cv = _cv(items[0])
         accession = _str(items[1])
         return ModRef(cv=cv, accession=accession)
 
@@ -571,12 +581,12 @@ class _ProFormaTransformer(Transformer):
         if len(items) == 1:
             return ModRef(cv=None, name=_str(items[0]).strip())
         cv, name_token = items
-        return ModRef(cv=_str(cv), name=_str(name_token).strip())
+        return ModRef(cv=_cv(cv), name=_str(name_token).strip())
 
     # ── Labels ───────────────────────────────────────────────────────
     def mod_label(self, items):
         # "#" LABEL_NAME LABEL_SCORE?
-        name = _str(items[0])
+        name = _label(items[0])
         score = None
         if len(items) > 1 and items[1] is not None:
             score_str = _str(items[1])
@@ -604,16 +614,16 @@ class _ProFormaTransformer(Transformer):
     def cterm_loc(self, items):
         # ("C-term" (":" AMINOACID)?)
         if items and items[0] is not None:
-            return f"C-term:{_str(items[0])}"
+            return f"C-term:{_str(items[0]).upper()}"
         return "C-term"
 
     def nterm_loc(self, items):
         if items and items[0] is not None:
-            return f"N-term:{_str(items[0])}"
+            return f"N-term:{_str(items[0]).upper()}"
         return "N-term"
 
     def aa_loc(self, items):
-        return _str(items[0])
+        return _str(items[0]).upper()
 
     # ── Charge ───────────────────────────────────────────────────────
     def peptidoform_charge(self, items):
@@ -750,6 +760,32 @@ def _str(tok: Token | str) -> str:
     return str(tok)
 
 
+# ProForma is case-insensitive (spec 2.0 and 2.1, "The Basic Form"), so a
+# CV prefix, a residue and a group label are each held in one spelling:
+# `[unimod:21]` is `[UNIMOD:21]`, `pepTIDEK` is `PEPTIDEK`, `#xl1` is
+# `#XL1`. Kept as written: what follows a prefix (names are the CV's to
+# spell; 2.1 asks readers to look them up case-insensitively, which
+# `ModVocab.get` does), formulas and isotope labels (element symbols are
+# case-sensitive, 2.1), INFO text.
+_CV_SPELLINGS = {
+    cv.upper(): cv
+    for cv in ("UNIMOD", "MOD", "RESID", "XLMOD", "GNO", "U", "M", "R", "X", "G", "Obs")
+}
+
+
+def _cv(tok: Token | str) -> str:
+    text = str(tok)
+    return _CV_SPELLINGS.get(text.upper(), text)
+
+
+def _label(tok: Token | str) -> str:
+    """A group label in one spelling: the spec's keywords (`XL…`, `BRANCH`)
+    upper case, any other label lower case."""
+    text = str(tok)
+    upper = text.upper()
+    return upper if upper.startswith("XL") or upper == "BRANCH" else text.lower()
+
+
 def _to_tagged(item) -> TaggedMod:
     """Convert a `mod` (i.e. _ModInternal) or `bare_label` into a TaggedMod."""
     if isinstance(item, _ModInternal):
@@ -769,8 +805,9 @@ def _to_tagged(item) -> TaggedMod:
 
 # The simple form, read without the grammar. A mod here is a UNIMOD
 # accession, a signed mass or a plain name (letters, digits, '_' and '-');
-# anything else in brackets, lowercase residues, labels, ranges, CV-tagged
-# names and signed charges fall through to the grammar.
+# anything else in brackets, lowercase residues (which the grammar reads
+# as upper case), labels, ranges, CV-tagged names and signed charges fall
+# through to the grammar.
 _SIMPLE_MOD = r"\[(?:UNIMOD:\d+|[+-]\d+(?:\.\d+)?|[A-Za-z][A-Za-z0-9_-]*)\]"
 _SIMPLE = re.compile(
     rf"((?:<(?:\d+[CNOHS]|[DT])>)*)((?:{_SIMPLE_MOD})+-)?((?:[A-Z](?:{_SIMPLE_MOD})*)+)"
@@ -1126,6 +1163,32 @@ def parse_isotope_label(label: str) -> tuple[int, str]:
     return (int(label[:i]), sym)
 
 
+def normalize_isotopes(isotopes: Sequence[str], *, where: str = "") -> tuple[str, ...]:
+    """A label state's isotopes as ``<mass number><element>`` (``D`` →
+    ``2H``, ``T`` → ``3H``), each once, sorted: one spelling per state, so
+    that one molecule gets one key. An isotope the element does not have,
+    or two isotopes of one element (``33S,34S``: a whole-element label
+    makes every atom one isotope), is refused (``ValueError``)."""
+    from constellation.core.chem.elements import ELEMENTS
+
+    out: dict[str, str] = {}  # element -> label
+    context = f" in {where!r}" if where else ""
+    for iso in isotopes:
+        if not re.fullmatch(r"\d+[A-Z][a-z]?|D|T", iso):
+            raise ValueError(f"not an isotope label: {iso!r}{context}")
+        mass_number, symbol = parse_isotope_label(iso)
+        try:
+            ELEMENTS[symbol].isotope_mass(mass_number)
+        except KeyError as exc:
+            raise ValueError(f"no such isotope: {iso!r}{context} ({exc})") from None
+        label = f"{mass_number}{symbol}"
+        have = out.get(symbol)
+        if have is not None and have != label:
+            raise ValueError(f"two isotopes of {symbol} in one label state: {have} and {label}{context}")
+        out[symbol] = label
+    return tuple(sorted(out.values()))
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Public re-exports
 # ──────────────────────────────────────────────────────────────────────
@@ -1170,6 +1233,7 @@ __all__ = [
     "ProFormaResult",
     "parse_proforma",
     "format_proforma",
+    "normalize_isotopes",
     "parse_isotope_label",
     "permute_peptidoform",
     "_has_crosslinks",

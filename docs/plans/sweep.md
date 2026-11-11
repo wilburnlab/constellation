@@ -522,16 +522,124 @@ points were never read for the queries the sweep holds it eligible for (layout v
 missing is unbounded); a library's annotation tolerance recorded as `da` was read as ppm; and a plan
 taken from another lost its query numbers on disk (`source_query` on `SWEEP_QUERY_TABLE`).
 
+## Pre-scoring fixes and the dense view (2026-11-10, `fix/pre-scoring`)
+
+The review of 2026-11-09 ([../reviews/pre-scoring-2026-11-09.md](../reviews/pre-scoring-2026-11-09.md))
+found 25 defects on the path a scorer reads. All are fixed or refused here, one commit per phase, each
+with a test that fails on the code before. The plan was the PI's, 2026-11-10; trace operations
+(smoothing, peaks, boundaries) wait for a scorer session of their own.
+
+**What a reducer gets**
+- **Bounded in memory (E3).** An in-memory sweep tests `memory_rows` after every window group, on
+  everything it holds (matches, evidence, claims), and carries on on disk from the next window group;
+  it used to test after a whole block, on matches only (942 held at a limit of 100). Its reduce is
+  bucketed by `_reduce_weights` and `reduce_rows`, as on disk, where it handed the whole plan to one
+  call (1,962,000 cells against the disk path's largest, 48,000). Outputs are the one call's, row for
+  row, and stay held: the review had also suggested spilling on the weights, but `table()` loads an
+  output whole anyway, so that spill would cost disk time and save nothing. `zero_fills` now means
+  "builds every eligible cell" (the dense view's reducers declare it).
+- **Where it spills.** `spill_dir=` on `sweep()` and `extract_xic()`; the CLI spills beside its outputs.
+  A spill is refused first if its estimated size does not fit the directory.
+- **A directory per sweep (E1).** Each sweep writes `work_dir/sweep-<id>/` (`SweepResult.work`), so a
+  later sweep into one `work_dir` no longer rewrites an earlier result's parts.
+- **Claims on disk (D2).** Claims are written for whole blocks only (a block's window groups
+  interleave scan numbers), so runs follow in scan order, are made into the table one at a time, and the
+  on-disk `point_claims` is the in-memory table under any run size. (Sorting a shard's claims as one,
+  the first fix, held them all at once, which a spilled sweep's single shard made unbounded; Codex.)
+- **The ledger's scan context (E2).** Each scan's acquired m/z range and its parent scan one level down
+  (`acquisition_structure.parent_scans`, the browser's rule too: the recorded master scan, else the last
+  scan of the level below, at the same FAIMS voltage); `SWEEP_SCAN_TABLE`, sweep schemas v6. A cell
+  whose channel lies outside its scan's range is not zero-filled, since it was never measured (PI: left
+  out, not flagged). A matched cell is always kept. XIC trace schema v2; the frozen oracle's output is
+  held to the rule in the tests (`drop_unacquired`), not edited.
+- **Refused.** A run of several FAIMS compensation voltages (A1; PI: refuse for now). Keying windows by
+  voltage alone would not fix the gate, because a query stays eligible at both and its evidence runs
+  interleave. Also refused: a run of multiplexed (MSX) isolation (A4), and an m/z curve at a level whose
+  branch is undetermined (A5).
+
+**The dense view (`sweep.dense`, `QueryBatch.dense(level)`)**
+- **Layout.** A batch's cells at one level as padded `[queries, scans, channels]` torch tensors:
+  intensity, signed m/z error, `matched` and `acquired` (exactly the cells `cells()` gives).
+- **Per slot:** row, scan, time, TIC, injection time, isolation window and parent row; padding is
+  marked by `slot_valid`.
+- **Per channel:** m/z, abundance and identity; padding is marked by `channel_valid`.
+- **One scan axis per level** (PI: per-level axes with interpolation along RT, not one cycle axis).
+  `Dense.parent_slots` finds each MS2 slot's parent on the query's MS1 axis.
+- **Built from the matches and the eligible pairs**, not the long cells. A 600-query synthetic batch
+  (15.8M padded cells) builds in 0.34 s, where its cell view takes 2.1 s.
+- **Chunked.** `dense_chunks` cuts a batch under a cell budget.
+- **One value per cell.** The `all` rule is refused.
+- **Not yet:** the dense match kernel, which would write matches straight into tensors.
+
+**Precursor-major reads**
+- **A3.** A scan without isolation bounds is read by its own row groups, and no longer widens the range
+  of lower bounds read. One-window units decoded 9.8× the layout's rows and now decode 1.5× (that
+  scan's rows, which every unit needs).
+- **E4 and E5.** The units a segment is cut into, and those of queries without a precursor m/z, read
+  the same points at MS2 and above. They are now one task, its fragment levels read once, halved only
+  to give every worker work; each unit still writes its own parts, and reads its own MS1, which is read
+  by m/z (an MS1-only plan is one segment, and a group read of it held every unit's slices; Codex).
+- **E6.** A block cut by time holds at least `MIN_BLOCK_POINTS` (2^16) points. The one-second floor
+  held one scan of a window a block, and ±0.4 s windows ran 8× slower than scan-major; they are now at
+  parity.
+
+**Elsewhere**
+- **Search space (B1–B7).** Resume keyed by `SEARCH_SPACE_LAYOUT`, the vocabulary's SHA-256 and the
+  id scheme, not `__version__`. Peptide-level decoys on decoy proteins (`DECOY_<accession>`), so
+  `subset_proteins` keeps a decoy whose target was filtered. A variable modification replaces a fixed
+  one on its site (PI). `reverse-c-fixed` keeps a ringed first residue. A `:max=` limit per rule. A
+  second set of an unseeded decoy method is refused, and protein-level decoys are counted as decoys.
+  `<D>` and `<2H>` share one key. The scheme keeps its name, `content-v1`: no id written here changes,
+  and the name is in the EncyclopeDIA workflow's stage keys.
+- **Targets (C1–C4).** PSM targets keep `is_decoy`, `decoy_set` and `precursor_id`, and are of one
+  run. Quantity targets are of one run and keep their windows. A target without fragment candidates
+  asks the library for nothing. An ion named twice in a library takes its most intense row. The
+  EncyclopeDIA projection keeps one row per stored peak, as round-tripping needs, and the MSP reader
+  already gave isotope peaks no ion key.
+- **Conversion (A2, A6).** The layout writer writes what it holds past `MAX_HELD_POINTS` (2^23), at a
+  scan's end, as files of their own. A 30M-point part peaked at 3.4 GB and took 11.7 s; it now peaks
+  at 1.6 GB and takes 6.4 s. `scan_range_shards` copes with an empty last part.
+- **S1.** `l1_normalize` follows the losses module's masking rule.
+
+**Measured on RF30.** Stellar DIA: 100 windows of 8 Th, 280M points, 234,000 MS2 scans, no recorded
+master scan. A copy of the bundle in scratch, with its layout built in 66 s on 4 workers. The plan was
+3,000 JChronologer-predicted precursors of 100 human proteins (targets and decoys): MS1 + MS2 top 10,
+no RT window, 0.35 Da, with a query summary and a dense probe that held each process's first batch to
+the cell view, 2.2M cells in the in-memory run.
+
+| Path | Time | Peak RSS | Outputs |
+|---|---|---|---|
+| In memory (one worker, no `work_dir`; spilled past 8M rows, as it should) | 146 s | 2.6 GB | — |
+| Scan-major on disk, 4 workers | 92 s | 1.8 GB (largest process) | identical to in memory |
+| Precursor-major, 4 workers | 66 s | 1.6 GB (largest process) | identical to in memory |
+
+- **Parent links.** Every one of the 7,015,320 MS2 slots found its parent on its query's MS1 axis.
+- **Lags.** The parent comes 0.022 to 10.27 s earlier: cycles run 2.46 s median and up to 10.29 s,
+  since the method allows 100 ms of injection a scan.
+- **Matched cells.** 79% of the 62.6M acquired MS2 cells were matched at 0.35 Da.
+
+**Left open**
+- **Residue case: settled the same day.** The spec says "ProForma is case insensitive" (2.0 and 2.1;
+  2.1 excepts CV names, written as the CV writes them but looked up in any case, and element symbols).
+  Read as written, `pepTIDEK` parsed and then failed every mass, `[unimod:21]` and `[phospho]` were
+  unknown modifications, and `<[Carbamidomethyl]@c>` modified nothing (57 Da light, silently). The
+  parser now holds residues, residue locations, CV prefixes and group labels in one spelling,
+  `ModVocab.get` finds a name in any case unless two clash (UNIMOD has none), and the id key upper-cases
+  a hand-built `Peptidoform`. No producer here wrote another case, so no id on disk changes.
+- **MS3 and MSX** are tested on fakes only, since no such file is on this machine.
+
 ## Still to do
 
 - P7: the two-pass gate is built inside a precursor-major unit (`gate_first`, above); the scan-major
   sweep still writes every match. The bucket index layout, if a profile shows the per-group index
   build mattering.
 - Precursor-major: claims across units, units cut by retention time as well (for calibrated windows),
-  and the dense kernel and `QueryBatch.dense` view, all with the scorer.
-- The scorer (elution peaks, co-elution evidence, library similarity, a verdict rule) as a reducer of
-  several outputs over `QueryBatch.cells`, FDR, and output as an experiment directory the browser
-  reads: the next plans.
+  and the dense match kernel, with the scorer. (The dense view is in: 2026-11-10, above.)
+- FAIMS runs of several voltages (refused since 2026-11-10): windows keyed by voltage, and evidence
+  runs counted per (query, voltage). MSX scans (refused): several isolation windows a scan.
+- The scorer (trace operations on the dense view: smoothing, background, peaks, boundaries; then
+  candidates, features, a verdict rule) as a reducer of several outputs, FDR, and output as an
+  experiment directory the browser reads: the next plans.
 - Targets from FASTA files are built (2026-11-05): `massspec search-space`
   ([search-space.md](search-space.md)) writes a library `chromatogram extract --targets` reads, with
   decoys flagged `is_decoy` through the queries and the query summary (schemas v3) instead of the

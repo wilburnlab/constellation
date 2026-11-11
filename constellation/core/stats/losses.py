@@ -81,16 +81,22 @@ def l1_normalize(
     pseudocount: float = 0.0,
     eps: float = 1e-7,
 ) -> torch.Tensor:
-    """L1-normalize along the last axis. With `pseudocount > 0`, adds
-    a flat smoothing prior before normalization (Laplace-style), in the
-    input's own units. ``eps`` only guards the division of an all-zero
-    row (which stays zero)."""
-    if mask is None:
-        x_masked = x + pseudocount
-    else:
-        x_masked = (x + pseudocount) * mask
-    denom = x_masked.sum(dim=-1, keepdim=True).clamp(min=eps)
-    return x_masked / denom
+    """L1-normalize along the last axis, over the channels the module's
+    masking rule keeps (non-negative and not NaN) and ``mask`` keeps where
+    given; a dropped channel comes out 0. With `pseudocount > 0`, adds a
+    flat smoothing prior to every kept channel before normalization
+    (Laplace-style), in the input's own units. The total is exact, so the
+    result does not depend on scale, and a row with nothing in it stays
+    zero. ``eps`` is kept for the signature: it floored the total, so a row
+    summing under 1e-7 was divided by 1e-7. Until 2026-11-10 a masked NaN
+    poisoned its whole row (``NaN · 0`` is NaN), and with no ``mask`` a
+    negative sentinel or a NaN was summed in."""
+    keep = x >= 0  # NaN fails it
+    if mask is not None:
+        keep = keep & mask.bool()
+    x_masked = torch.where(keep, x + pseudocount, torch.zeros_like(x))
+    total = x_masked.sum(dim=-1, keepdim=True)
+    return _safe_divide(x_masked, total, torch.zeros_like(total))
 
 
 def l2_normalize(

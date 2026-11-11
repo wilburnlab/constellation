@@ -36,9 +36,14 @@ What "canonical" settles
 
 Two strings for one molecule must give one key:
 
+- residues are upper case: ProForma is case-insensitive (spec 2.0 and
+  2.1), so ``pepTIDEK`` is ``PEPTIDEK`` (the parser reads it so; a
+  ``Peptidoform`` built by hand is upper-cased here);
 - a modification is written by accession (``[UNIMOD:35]``), whether it
-  arrived as an accession or as a name the vocabulary knows
-  (``[Oxidation]``); names the vocabulary does not know are kept;
+  arrived as an accession, with its prefix in any case
+  (``[unimod:35]``), or as a name the vocabulary knows in any case
+  (``[Oxidation]``, ``[oxidation]``); names the vocabulary does not know
+  are kept;
 - a bare mass is rounded to ``MASS_DECIMALS`` places, so ``+57.02146``
   and ``+57.0214635`` agree (it is still not *resolved*: deciding which
   modification a mass stands for needs the residue and belongs to the
@@ -73,6 +78,7 @@ from constellation.core.sequence.proforma import (
     Peptidoform,
     TaggedMod,
     format_proforma,
+    normalize_isotopes,
     parse_proforma,
 )
 from constellation.massspec.library.library import Library
@@ -163,8 +169,18 @@ def _canonical_peptidoform(peptide: Peptidoform, vocab: ModVocab) -> Peptidoform
         (_canonical_modref(m, vocab) for m in peptide.labile_mods),
         key=lambda m: format_proforma(Peptidoform("A", labile_mods=(m,))),
     )
+    # One spelling of a label: <D> and <2H> are one molecule (until
+    # 2026-11-10 they had two keys). No producer here wrote <D> or <T> (search
+    # spaces normalise their labels), so no id on disk changes, and the
+    # scheme keeps its name: ``ID_SCHEME`` is part of the EncyclopeDIA
+    # workflow's stage keys, so a new name would make every finished search
+    # look unfinished.
+    try:
+        isotopes = normalize_isotopes(peptide.global_isotopes)
+    except ValueError as exc:
+        raise NoCanonicalKeyError(str(exc)) from None
     return Peptidoform(
-        sequence=peptide.sequence,
+        sequence=peptide.sequence.upper(),
         residue_mods={
             position: _canonical_site(mods, vocab)
             for position, mods in sorted(peptide.residue_mods.items())
@@ -173,7 +189,7 @@ def _canonical_peptidoform(peptide: Peptidoform, vocab: ModVocab) -> Peptidoform
         n_term_mods=_canonical_site(peptide.n_term_mods, vocab),
         c_term_mods=_canonical_site(peptide.c_term_mods, vocab),
         labile_mods=tuple(labile),
-        global_isotopes=tuple(sorted(peptide.global_isotopes)),
+        global_isotopes=isotopes,
     )
 
 

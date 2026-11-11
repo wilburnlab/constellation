@@ -118,6 +118,27 @@ def test_options_change_nothing_between_layouts(tmp_root, name):
         _check(bundle, plan, settings, reducers, **sweep_kw)
 
 
+@pytest.mark.parametrize("layout", ["scan_major", "precursor_major"])
+def test_a_later_sweep_into_the_same_work_dir_leaves_an_earlier_result_alone(tmp_root, tmp_path, layout):
+    """Both layouts cleared and reused ``work_dir``, so an earlier result
+    whose table was not yet read gave the later sweep's rows (review of
+    2026-11-09, E1). Each sweep now writes a directory of its own."""
+    run, bundle = _run("dia", tmp_root)
+    work = tmp_path / "w"
+    targets = _targets(run)
+    reducers = [QuerySummaryReducer(), XicTraceReducer()]
+    plan_a = compile_queries(targets, levels=[1, 2], rt_window=20.0)
+    plan_b = compile_queries(targets.slice(0, 2), levels=[1, 2], rt_window=20.0)
+    want = sweep(bundle, plan_a, SweepSettings(tolerances=_TOL), reducers=reducers, layout=layout)
+    a = sweep(bundle, plan_a, SweepSettings(tolerances=_TOL), reducers=reducers, layout=layout, work_dir=work)
+    b = sweep(bundle, plan_b, SweepSettings(tolerances={1: (20.0, "ppm"), 2: (0.5, "Da")}), reducers=reducers,
+              layout=layout, work_dir=work)  # fmt: skip
+    assert a.work != b.work and a.work.parent == b.work.parent == work
+    for name in want.schemas:
+        oracle.assert_traces_identical(a.table(name), want.table(name))
+    assert b.table("query_summary").num_rows == 2
+
+
 def test_workers_and_batches_change_no_byte(tmp_root, tmp_path):
     run, bundle = _run("staggered", tmp_root)
     plan = compile_queries(_targets(run), levels=[1, 2], rt_window=20.0)
@@ -176,6 +197,121 @@ def test_queries_without_a_precursor_mz_are_matched_in_every_window(tmp_root):
     _check(bundle, plan, SweepSettings(tolerances=_TOL, unit_cells=500, batch_cells=100), [XicTraceReducer()])
 
 
+def test_a_scan_without_bounds_does_not_widen_what_a_unit_reads(tmp_path, monkeypatch):
+    """A scan without bounds is stored with lower = -inf, first; with it in
+    the range of lower bounds read, every row group below a unit's windows
+    was decoded and dropped (9.8× the rows; review of 2026-11-09, A3)."""
+    from constellation.massspec import precursor_major as layout_module
+    from constellation.massspec.precursor_major import find_precursor_major
+    from constellation.massspec.sweep import precursor_major as pm
+
+    monkeypatch.setattr(layout_module, "MIN_GROUP_ROWS", 64)
+    monkeypatch.setattr(layout_module, "MAX_GROUP_ROWS", 4096)
+    run = planted_run(acquisition="dia", cycles=30, window_width=50.0)
+    centres = np.arange(375.0, 1250.0, 50.0)
+    targets = pa.Table.from_pylist(
+        [dict(target_id=i, modified_sequence="LVNELTEFAK", precursor_charge=2, precursor_mz=float(c))
+         for i, c in enumerate(centres)], schema=XIC_TARGET_TABLE)  # fmt: skip
+    plan = compile_queries(targets, levels=[2])
+    decoded = {}
+    for name, unbounded in (("bounded", False), ("unbounded", True)):
+        scans = [dict(s) for s in run.scans]
+        if unbounded:
+            ms2 = [i for i, s in enumerate(scans) if s["level"] == 2]
+            scans[ms2[len(ms2) // 2]]["isolation_lower"] = None
+        bundle = _bundle(tmp_path, name, scans)
+        layout = find_precursor_major(bundle)
+        ledger = pm._ledger(bundle, layout, None)
+        pm._STATS["fragment_rows_decoded"] = 0
+        for q in range(plan.n_queries):
+            pm._read_fragment_level(layout, plan.take(np.array([q])), ledger, 2, None)
+        decoded[name] = pm._STATS["fragment_rows_decoded"]
+        if unbounded:
+            # The rows of row groups holding the scan without bounds, which
+            # every unit has to read.
+            free = 0
+            for path in layout.files(2):
+                f = pq.ParquetFile(path)
+                for g, (a, _) in enumerate(pm._row_group_ranges(f, "lower")):
+                    free += f.metadata.row_group(g).num_rows if a == -np.inf else 0
+    assert decoded["unbounded"] <= decoded["bounded"] + plan.n_queries * free
+
+
+def test_a_segment_cut_into_units_is_read_once(tmp_root):
+    """Pieces of one segment read the same points; each was read once per
+    unit (review of 2026-11-09, E4), and units of queries without a
+    precursor m/z each read every MS2 point of the run (E5). They are now
+    one task, read once, with the same rows."""
+    from constellation.massspec.sweep import precursor_major as pm
+
+    run, bundle = _run("dia", tmp_root)
+    first = run.targets.to_pylist()[0]
+    many = [dict(first, target_id=30000 + k) for k in range(200)]
+    many += [dict(r, target_id=40000 + i, precursor_mz=None) for i, r in enumerate(run.targets.to_pylist())]
+    targets = pa.Table.from_pylist(many, schema=XIC_TARGET_TABLE)
+    plan = compile_queries(targets, levels=[2], rt_window=None, derive_precursor_mz=False)
+    settings = SweepSettings(tolerances=_TOL, unit_cells=2000, batch_cells=500)
+    ledger = pm._ledger(bundle, pm.find_precursor_major(bundle), None)
+    units, groups = pm._units_and_groups(plan, ledger, settings.unit_cells)
+    assert len(units) > 4 and len(groups) == 2  # one segment, and the queries without a precursor m/z
+    pm._STATS["fragment_reads"] = 0
+    _check(bundle, plan, settings, [XicTraceReducer(drop_unmatched=False), QuerySummaryReducer()])
+    assert pm._STATS["fragment_reads"] == len(groups)
+    # More workers than tasks: groups are halved so that every worker has work.
+    tasks = pm._tasks(groups, workers=4)
+    assert len(tasks) >= min(8, len(units)) and [u for t in tasks for u in t] == list(range(len(units)))
+
+
+def test_ms1_is_read_unit_by_unit_within_a_group(tmp_root):
+    """An MS1-only plan is one segment, so all its units are one group, and
+    reading the group's MS1 at once read every unit's m/z slices for each
+    (Codex, 2026-11-10: 40 units, 800 points held where each needed 20).
+    MS1 is read per unit; the rows are scan-major's."""
+    from constellation.massspec.sweep import precursor_major as pm
+
+    run, bundle = _run("dia", tmp_root)
+    plan = compile_queries(_targets(run), levels=[1], rt_window=None)
+    settings = SweepSettings(tolerances=_TOL, unit_cells=80, batch_cells=40)
+    layout = pm.find_precursor_major(bundle)
+    ledger = pm._ledger(bundle, layout, None)
+    units, groups = pm._units_and_groups(plan, ledger, settings.unit_cells)
+    assert len(groups) == 1 and len(units) > 4
+
+    def points(p):
+        return sum(len(b.mz) for b in pm._read_blocks(layout, p, ledger, settings, None, None))
+
+    own = max(points(plan.take(u)) for u in units)
+    assert own < points(plan) / 2  # the slices differ, unit to unit
+    pm._STATS["ms1_points_read"] = 0
+    _check(bundle, plan, settings, [XicTraceReducer(drop_unmatched=False), QuerySummaryReducer()])
+    assert pm._STATS["ms1_points_read"] == own
+
+
+def test_narrow_windows_make_blocks_of_many_points(tmp_root, monkeypatch):
+    """A block of a unit spanned at least a second, which on one window is
+    one scan: narrow RT windows ran 8× slower than scan-major (review of
+    2026-11-09, E6). A block now holds at least MIN_BLOCK_POINTS points."""
+    from constellation.massspec.sweep import precursor_major as pm
+
+    monkeypatch.setattr(pm, "MIN_BLOCK_POINTS", 2000)  # this run's MS2 holds a few times that
+    run, bundle = _run("dia", tmp_root)
+    rows = run.targets.to_pylist()
+    for r in rows:
+        r["rt_start"], r["rt_end"] = r["rt_center"] - 0.4, r["rt_center"] + 0.4
+    targets = pa.Table.from_pylist(rows, schema=XIC_TARGET_TABLE)
+    plan = compile_queries(targets, levels=[2])
+    layout = pm.find_precursor_major(bundle)
+    ledger = pm._ledger(bundle, layout, None)
+    unit = plan.take(np.arange(plan.n_queries))
+    every = pm._read_fragment_level(layout, unit, ledger, 2, None)
+    span = pm._block_span(unit)
+    assert span is not None and span < 1.0
+    blocks = list(pm._blocks(every, ledger, None, 1 << 20, span))
+    points = [b.mz.size for b in blocks]
+    assert len(blocks) > 1 and min(points[:-1]) >= pm.MIN_BLOCK_POINTS
+    _check(bundle, plan, SweepSettings(tolerances=_TOL), [XicTraceReducer(drop_unmatched=False)])
+
+
 def test_a_large_m_z_correction_is_read_around(tmp_root, tmp_path):
     """At MS1 a unit reads its channels' m/z plus the tolerance plus the
     largest correction: a 0.3 Th shift must lose nothing."""
@@ -191,6 +327,26 @@ def test_a_large_m_z_correction_is_read_around(tmp_root, tmp_path):
         settings = SweepSettings(tolerances=tol, mz_axis="synthetic", unit_cells=300)
         got = _check(bundle, plan, settings, [XicTraceReducer()])
         assert got.mz_axis == "synthetic"
+
+
+def test_a_curve_undetermined_at_ms1_does_not_stop_a_sweep_of_ms2(tmp_path):
+    """A curve that cannot be applied at MS1 is refused for a plan matching
+    MS1, but scan-major corrected every level it read, the plan's or not,
+    so a sweep of MS2 alone was refused too (Codex, 2026-11-10); the
+    precursor-major read gave it. Both give it, and agree."""
+    run = planted_run(acquisition="dia", cycles=30, window_width=100.0, seed=9)
+    bundle = _bundle(tmp_path, "ambiguous", run.scans)
+    axis = MzAxis(key="ms1-undetermined", table=pa.table({"level": pa.array([1, 1, 2, 2], pa.int8()),
+                                                          "mz": [100.0, 2000.0, 100.0, 2000.0],
+                                                          "shift_th": [0.2, 0.2, 0.1, 0.1]}),
+                  parameters={"ambiguous_levels": [1]})  # fmt: skip
+    save_mz_axis(bundle, axis)
+    settings = SweepSettings(tolerances=_TOL, mz_axis="ms1-undetermined", unit_cells=300)
+    got = _check(bundle, compile_queries(_targets(run), levels=[2], rt_window=20.0), settings, [XicTraceReducer()])
+    assert got.mz_axis == "ms1-undetermined" and got.table("xic_trace").num_rows > 0
+    with pytest.raises(ValueError, match="branch is undetermined"):
+        sweep(bundle, compile_queries(_targets(run), levels=[1, 2], rt_window=20.0), settings,
+              reducers=[XicTraceReducer()])  # fmt: skip
 
 
 def test_every_eligible_scan_is_in_its_units_read_set(tmp_root):

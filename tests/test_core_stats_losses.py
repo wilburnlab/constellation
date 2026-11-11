@@ -34,6 +34,25 @@ def test_l1_normalize_with_pseudocount():
     assert torch.allclose(out, torch.full((4,), 0.25))
 
 
+def test_l1_normalize_follows_the_masking_rule():
+    """A masked NaN poisoned its whole row, and without a mask a negative
+    sentinel or a NaN was summed in (review of 2026-11-09, S1)."""
+    x = torch.tensor([[1.0, float("nan"), 3.0, -1.0], [2.0, 2.0, 0.0, 4.0]])
+    out = losses.l1_normalize(x)
+    assert torch.allclose(out[0], torch.tensor([0.25, 0.0, 0.75, 0.0]))
+    assert torch.allclose(out[1], torch.tensor([0.25, 0.25, 0.0, 0.5]))
+    masked = losses.l1_normalize(x, mask=torch.tensor([True, False, True, True]))
+    assert torch.isfinite(masked).all() and torch.allclose(masked[0], torch.tensor([0.25, 0.0, 0.75, 0.0]))
+    assert torch.allclose(masked[1], torch.tensor([1 / 3, 0.0, 0.0, 2 / 3]))
+
+
+def test_l1_normalize_is_scale_free_at_any_magnitude():
+    x = torch.tensor([1.0, 3.0], dtype=torch.float64)
+    for scale in (1e-12, 1e-8, 1.0, 1e9):
+        assert torch.allclose(losses.l1_normalize(x * scale), torch.tensor([0.25, 0.75], dtype=torch.float64))
+    assert (losses.l1_normalize(torch.zeros(3)) == 0).all()
+
+
 def test_l2_normalize_unit_norm():
     x = torch.tensor([3.0, 4.0])
     out = losses.l2_normalize(x)
