@@ -132,16 +132,22 @@ def widths(table: RangeTable, y: torch.Tensor, peak: torch.Tensor, prominence: t
            left_base: torch.Tensor, right_base: torch.Tensor, rel_height: float = 0.5):  # fmt: skip
     """``scipy.signal.peak_widths``: each peak's width in samples at
     ``rel_height`` of its prominence below it, and the interpolated left and
-    right crossing positions (fractional indices)."""
+    right crossing positions (fractional indices).
+
+    As scipy's, the walk out starts at the peak itself, so a peak no higher
+    than the level (``rel_height`` 0) has width 0. Until 2026-11-11 it
+    started beside the peak, which gave a flat top ``[0, 1, 1, 1, 0]`` a
+    width of 2 at ``rel_height`` 0."""
     p = peak.clamp(min=0)
     h = torch.gather(y, -1, p)
     level = h - prominence * rel_height
     # The first sample at or below the level, walking out, not past a base.
     at_most = torch.nextafter(level, torch.full_like(level, float("inf")))
+    walks = level < h
     li = table.nearest_left(p, at_most, above=False, limit=left_base)
-    li = torch.where(li >= 0, li, left_base)
+    li = torch.where(walks, torch.where(li >= 0, li, left_base), p)
     ri = table.nearest_right(p, at_most, above=False, limit=right_base)
-    ri = torch.where(ri >= 0, ri, right_base)
+    ri = torch.where(walks, torch.where(ri >= 0, ri, right_base), p)
     yl, yl1 = torch.gather(y, -1, li), torch.gather(y, -1, (li + 1).clamp(max=y.shape[-1] - 1))
     yr, yr1 = torch.gather(y, -1, ri), torch.gather(y, -1, (ri - 1).clamp(min=0))
     left_ip = li.to(torch.float64) + torch.where(yl < level, (level - yl) / (yl1 - yl), torch.zeros_like(yl))
@@ -149,41 +155,60 @@ def widths(table: RangeTable, y: torch.Tensor, peak: torch.Tensor, prominence: t
     return right_ip - left_ip, left_ip, right_ip
 
 
-def select_by_distance(position: torch.Tensor, priority: torch.Tensor, valid: torch.Tensor, distance: float,
-                       *, max_elements: int = 1 << 26) -> torch.Tensor:  # fmt: skip
-    """Which candidates ``[B, M]`` survive a minimum ``distance`` (in the
-    units of ``position``), the higher ``priority`` first, as scipy's
-    greedy rule: a candidate within ``distance`` of a kept, higher one is
-    dropped. Done in rounds that keep every candidate no better undecided
-    one is near and drop their neighbours: the same choice as the greedy
-    walk (ties go to the later candidate, as in scipy)."""
+def _neighbours(t: torch.Tensor, k: int, fill) -> torch.Tensor:
+    """``[B, M, 2k]``: each entry's k neighbours on each side along the last
+    axis (``fill`` past the row's ends), itself left out."""
+    pad = torch.full((*t.shape[:-1], k), fill, dtype=t.dtype, device=t.device)
+    w = torch.cat([pad, t, pad], dim=-1).unfold(-1, 2 * k + 1, 1)
+    return torch.cat([w[..., :k], w[..., k + 1 :]], dim=-1)
+
+
+def select_by_distance(position: torch.Tensor, priority: torch.Tensor, valid: torch.Tensor,
+                       distance: float) -> torch.Tensor:  # fmt: skip
+    """Which candidates ``[B, M]`` survive a minimum ``distance``, the
+    higher ``priority`` first, as scipy's greedy rule: a candidate closer
+    than ``distance`` to a kept, higher one is dropped. Ties go to the
+    later candidate (along M), as in scipy.
+
+    ``position`` is each candidate's sample index, integers distinct within
+    a row, and ``distance`` is in samples; both callers (``LocalMaxima``,
+    ``MatchedFilter``) give positions in the compacted row, so a distance
+    counts valid samples. Within a distance d a candidate then has at most
+    ⌈d⌉ − 1 others on each side, so each is compared with that many
+    neighbours in position order: memory ``O(B·M·d)``. The choice is made
+    in rounds that keep every candidate no better undecided one is near and
+    drop their neighbours, the same choice as the greedy walk. Until
+    2026-11-11 every pair was compared, ``[M, M]`` per row whatever the
+    ``max_elements`` budget (now gone) said: one row of 25,000 candidates
+    took 9.5 GB, where it now takes under 10 MB."""
+    if position.is_floating_point():
+        raise TypeError("select_by_distance takes integer sample positions")
     b, m = position.shape
-    keep = torch.zeros_like(valid)
-    if m == 0:
-        return keep
-    rows = max(1, max_elements // max(m * m, 1))
-    pos = position.to(torch.float64)
-    for a in range(0, b, rows):
-        p, pr, v = pos[a : a + rows], priority[a : a + rows], valid[a : a + rows]
-        near = (p.unsqueeze(-1) - p.unsqueeze(-2)).abs() < distance
-        near &= v.unsqueeze(-1) & v.unsqueeze(-2)
-        near &= ~torch.eye(m, dtype=torch.bool).unsqueeze(0)
-        j_idx = torch.arange(m).view(1, 1, m)
-        i_idx = torch.arange(m).view(1, m, 1)
-        # A tie goes to the later candidate, as scipy's walk over a stable
-        # ascending sort of the priorities, from its end, takes it first.
-        better = (pr.unsqueeze(-2) > pr.unsqueeze(-1)) | ((pr.unsqueeze(-2) == pr.unsqueeze(-1)) & (j_idx > i_idx))
-        rivals = near & better  # [r, i, j]: j is near i and better
-        undecided = v.clone()
-        kept = torch.zeros_like(v)
-        while undecided.any():
-            blocked = (rivals & undecided.unsqueeze(-2)).any(dim=-1)
-            win = undecided & ~blocked
-            kept |= win
-            removed = win | (near & win.unsqueeze(-2)).any(dim=-1)
-            undecided &= ~removed
-        keep[a : a + rows] = kept
-    return keep
+    k = max(int(math.ceil(distance)) - 1, 0)
+    if m == 0 or k == 0:
+        return valid.clone()
+    big = torch.iinfo(torch.int64).max
+    order = torch.argsort(torch.where(valid, position.to(torch.int64), big), dim=-1, stable=True)
+    pos = torch.gather(position.to(torch.int64), -1, order)
+    pr = torch.gather(priority, -1, order)
+    v = torch.gather(valid, -1, order)
+    # Neighbours in position order: j near i, and j better than i (a tie to
+    # the later candidate, as scipy's walk over a stable ascending sort of
+    # the priorities, from its end, takes it first).
+    near = (_neighbours(v, k, False) & v.unsqueeze(-1)
+            & ((_neighbours(pos, k, 0) - pos.unsqueeze(-1)).abs() < distance))  # fmt: skip
+    pr_j, at_j = _neighbours(pr, k, float("-inf")), _neighbours(order, k, -1)
+    better = (pr_j > pr.unsqueeze(-1)) | ((pr_j == pr.unsqueeze(-1)) & (at_j > order.unsqueeze(-1)))
+    rivals = near & better
+    undecided = v.clone()
+    kept = torch.zeros_like(v)
+    while undecided.any():
+        blocked = (rivals & _neighbours(undecided, k, False)).any(dim=-1)
+        win = undecided & ~blocked
+        kept |= win
+        removed = win | (near & _neighbours(win, k, False)).any(dim=-1)
+        undecided &= ~removed
+    return torch.zeros_like(valid).scatter(-1, order, kept)
 
 
 def _pass(value: torch.Tensor, bound) -> torch.Tensor:
@@ -223,6 +248,7 @@ class LocalMaxima(Stage):
     min_snr: float | None = None
     kind: ClassVar[str] = "detect"
     name: ClassVar[str] = "local_maxima"
+    version: ClassVar[int] = 2  # 2026-11-11: widths at rel_height 0 as scipy's
 
     def __call__(self, trace: Trace) -> Candidates:
         y, count = trace.y, trace.count
@@ -264,9 +290,11 @@ class LocalMaxima(Stage):
 def _template(kind: str, sigma: float, truncate: float = 4.0) -> torch.Tensor:
     h = max(int(math.ceil(truncate * sigma)), 1)
     u = torch.arange(-h, h + 1, dtype=torch.float64) / sigma
+    # Zero mean whole and unit norm; MatchedFilter makes it zero-mean again
+    # over the samples each window holds.
     if kind == "gaussian":
         k = torch.exp(-0.5 * u * u)
-        k = k - k.mean()  # zero mean: a flat baseline gives no response
+        k = k - k.mean()
     elif kind == "ricker":
         k = (1.0 - u * u) * torch.exp(-0.5 * u * u)
         k = k - k.mean()
@@ -278,13 +306,21 @@ def _template(kind: str, sigma: float, truncate: float = 4.0) -> torch.Tensor:
 @register
 @dataclass(frozen=True)
 class MatchedFilter(Stage):
-    """Correlation with a zero-mean template at each width in ``widths``
+    """Correlation with a peak template at each width in ``widths``
     (template sigmas, in samples), each response over its row's noise (the
     MAD of the response); a peak is a local maximum of the best response at
     or above ``threshold``, kept apart by ``distance`` samples (default the
     best template's sigma, the taller first). The score is that response;
     ``extras['template_sigma']`` the template that gave it, and the
-    detector's own extent is the apex ± 2 of its sigma."""
+    detector's own extent is the apex ± 2 of its sigma.
+
+    At each sample the template is made zero-mean over the samples its
+    window actually holds (a row's edge or a missing sample truncates it),
+    ``Σ k·w·y − (Σ k·w)(Σ w·y)/Σ w``, and scaled by its energy over them, so
+    a constant gives no response anywhere. A row with no noise (a response
+    MAD of 0) scores nothing. Until 2026-11-11 the template was zero-mean
+    only whole, so a truncated one answered a constant, and a MAD of 0 was
+    divided by 1e-300: an all-ones row gave two peaks scored 1e300."""
 
     widths: tuple[float, ...] = (2.0,)
     template: str = "gaussian"
@@ -292,25 +328,40 @@ class MatchedFilter(Stage):
     distance: float | None = None
     kind: ClassVar[str] = "detect"
     name: ClassVar[str] = "matched_filter"
+    version: ClassVar[int] = 2
 
     def __call__(self, trace: Trace) -> Candidates:
         y, valid = trace.y, trace.valid
         b, n = y.shape
         w = valid.to(torch.float64).reshape(b, 1, n)
-        v = torch.where(valid, y - trace.baseline_or_zero(), torch.zeros_like(y)).to(torch.float64).reshape(b, 1, n)
+        v = torch.where(valid, y - trace.baseline_or_zero(), torch.full_like(y, float("nan"))).to(torch.float64)
+        # The response is unchanged by an offset; taking the row's median
+        # out first makes a constant row exactly zero, with no rounding.
+        v = v - torch.nanmedian(v, dim=-1, keepdim=True).values
+        v = torch.where(valid, v, torch.zeros_like(v)).reshape(b, 1, n)
         best = torch.full((b, n), float("-inf"), dtype=torch.float64)
         sigma_at = torch.zeros((b, n), dtype=torch.float64)
         for sigma in self.widths:
             k = _template(self.template, float(sigma))
             h = k.numel() // 2
-            r = F.conv1d(v, k.view(1, 1, -1), padding=h)
-            energy = F.conv1d(w, (k * k).view(1, 1, -1), padding=h)
-            r = torch.where(energy > 0, r / energy.clamp(min=1e-300).sqrt(), torch.zeros_like(r)).reshape(b, n)
-            r = torch.where(valid, r, torch.full_like(r, float("nan")))
+
+            def corr(signal, kernel):
+                return F.conv1d(signal, kernel.view(1, 1, -1), padding=h).reshape(b, n)
+
+            count, k_sum = corr(w, torch.ones_like(k)), corr(w, k)
+            n_safe = count.clamp(min=1.0)
+            r = corr(v, k) - k_sum * corr(v, torch.ones_like(k)) / n_safe
+            energy = corr(w, k * k) - k_sum * k_sum / n_safe
+            # A window whose samples leave the template (near) constant has
+            # nothing to correlate: no response there.
+            usable = valid & (count > 1) & (energy > 1e-9 * corr(w, k * k))
+            r = torch.where(usable, r / torch.where(usable, energy, torch.ones_like(energy)).sqrt(),
+                            torch.full_like(r, float("nan")))  # fmt: skip
             med = torch.nanmedian(r, dim=-1, keepdim=True).values
             mad = torch.nanmedian((r - med).abs(), dim=-1, keepdim=True).values * MAD_TO_SIGMA
-            z = (r - med) / mad.clamp(min=1e-300)
-            z = torch.where(valid, z, torch.full_like(z, float("-inf")))
+            noisy = mad > 0
+            z = (r - med) / torch.where(noisy, mad, torch.ones_like(mad))
+            z = torch.where(usable & noisy, z, torch.full_like(z, float("-inf")))
             better = z > best
             best = torch.where(better, z, best)
             sigma_at = torch.where(better, torch.full_like(sigma_at, float(sigma)), sigma_at)
@@ -339,7 +390,11 @@ class RobustZ(Stage):
     noise``, with the picker's baseline and noise, or a rolling median over
     ``window`` samples and the residual's MAD; a peak is a run with z above
     ``k_low`` that reaches ``k`` and lasts ``min_length`` samples. Its apex is
-    the run's highest sample, its extent the run, its score the apex's z."""
+    the run's highest sample, its extent the run, its score the apex's z.
+    A baseline or noise it estimated itself is handed back on the
+    candidates, so that the picker measures the peaks above the baseline
+    they were detected on (until 2026-11-11 the measures took a baseline of
+    0, and an offset of 100 took a peak's width from 7 to 147)."""
 
     k: float = 3.0
     k_low: float = 1.0
@@ -352,14 +407,17 @@ class RobustZ(Stage):
         y, valid = trace.y, trace.valid
         b, n = y.shape
         base = trace.baseline
+        own_base = own_noise = None
         if base is None:
-            base = rolling_quantile(y, self.window if self.window % 2 else self.window + 1, 0.5, valid=valid)
+            base = own_base = rolling_quantile(y, self.window if self.window % 2 else self.window + 1, 0.5,
+                                               valid=valid).to(torch.float64)  # fmt: skip
         resid = torch.where(valid, y - base, torch.full_like(y, float("nan")))
         if trace.noise is not None:
             sigma = trace.noise if trace.noise.dim() == 2 else trace.noise.unsqueeze(-1)
         else:
             med = torch.nanmedian(resid, dim=-1, keepdim=True).values
             sigma = torch.nanmedian((resid - med).abs(), dim=-1, keepdim=True).values * MAD_TO_SIGMA
+            own_noise = sigma.squeeze(-1)
         z = torch.where(valid, resid / sigma.clamp(min=1e-300), torch.full_like(resid, float("-inf")))
         above = valid & (z > self.k_low)
         prev = F.pad(above, (1, 0), value=False)[:, :-1]
@@ -368,7 +426,8 @@ class RobustZ(Stage):
         n_runs = int(run.max()) if run.numel() else 0
         if n_runs == 0:
             e = torch.empty((b, 0), dtype=torch.int64)
-            return Candidates(apex=e, score=e.to(torch.float64), valid=e.to(torch.bool), left=e, right=e)
+            return Candidates(apex=e, score=e.to(torch.float64), valid=e.to(torch.bool), left=e, right=e,
+                              baseline=own_base, noise=own_noise)  # fmt: skip
         key = (torch.arange(b).unsqueeze(-1) * (n_runs + 1) + run).reshape(-1)
         size = b * (n_runs + 1)
         zf = torch.where(above, z, torch.full_like(z, float("-inf"))).reshape(-1)
@@ -386,4 +445,4 @@ class RobustZ(Stage):
         ok = (top >= self.k) & ((last - first + 1) >= self.min_length) & (apex < n)
         return Candidates(apex=torch.where(ok, apex, -1), score=torch.where(ok, top, torch.full_like(top, float("-inf"))),
                           valid=ok, left=torch.where(ok, first, -1), right=torch.where(ok, last, -1),
-                          extras={"z": top})  # fmt: skip
+                          extras={"z": top}, baseline=own_base, noise=own_noise)  # fmt: skip

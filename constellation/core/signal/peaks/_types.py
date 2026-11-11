@@ -21,13 +21,15 @@ __all__ = ["Trace", "Candidates", "Peaks"]
 class Trace:
     """Rows of a batch, compacted (module docstring): values ``y`` (after
     smoothing), their axis ``x`` (float64), validity, each row's count of
-    valid samples, and what preprocessing measured: a ``baseline`` per
-    sample and a ``noise`` sigma per row or per sample (None where no stage
-    gave one). Padding values are NaN."""
+    samples, and what preprocessing measured: a ``baseline`` per sample and
+    a ``noise`` sigma per row or per sample (None where no stage gave one).
+    Padding values are NaN. A detection trace's valid samples are the first
+    ``count`` of its row; a boundary trace keeps the detection trace's
+    samples and count, and its ``valid`` can have holes among them."""
 
     y: torch.Tensor  # [B, N] float64
     x: torch.Tensor  # [B, N] float64
-    valid: torch.Tensor  # [B, N] bool, a prefix of each row
+    valid: torch.Tensor  # [B, N] bool, a prefix of each row (holes in a boundary trace)
     count: torch.Tensor  # [B] int64
     baseline: torch.Tensor | None = None  # [B, N]
     noise: torch.Tensor | None = None  # [B] or [B, N]
@@ -54,7 +56,10 @@ class Candidates:
     """A detector's peaks, ``[B, M]`` in compacted positions: the apex, a
     score (higher is a better peak; what it measures is the detector's), and
     the detector's own boundaries where it has them (``-1`` none). ``extras``
-    holds anything else a detector measures, ``[B, M]`` each."""
+    holds anything else a detector measures, ``[B, M]`` each. ``baseline``
+    (``[B, N]``) and ``noise`` (``[B]`` or ``[B, N]``) are what a detector
+    estimated for itself where the trace gave it none, for the picker to
+    measure the peaks with."""
 
     apex: torch.Tensor  # int64, -1 padding
     score: torch.Tensor  # float64
@@ -62,6 +67,8 @@ class Candidates:
     left: torch.Tensor | None = None
     right: torch.Tensor | None = None
     extras: dict[str, torch.Tensor] = field(default_factory=dict)
+    baseline: torch.Tensor | None = None
+    noise: torch.Tensor | None = None
 
     @property
     def m(self) -> int:
@@ -75,7 +82,7 @@ class Candidates:
 
         return Candidates(
             apex=g(self.apex), score=g(self.score), valid=g(self.valid), left=g(self.left), right=g(self.right),
-            extras={k: g(v) for k, v in self.extras.items()},
+            extras={k: g(v) for k, v in self.extras.items()}, baseline=self.baseline, noise=self.noise,
         )  # fmt: skip
 
 

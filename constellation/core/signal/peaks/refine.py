@@ -6,8 +6,9 @@ fitted shape parameters:
 
 - :class:`NoRefine`: the apex sample's x.
 - :class:`Parabolic`: the vertex of the parabola through the apex and its
-  two neighbours (of their logarithms with ``log``, which is exact for a
-  Gaussian), within half a sample of the apex, mapped to x.
+  two neighbours as points (x, y) (of their logarithms with ``log``, which
+  is exact for a Gaussian on any spacing), within half a sample of the
+  apex.
 - :class:`ShapeFit`: a peak shape fitted to each peak's extent at once
   (``core.signal.peak_fit``), its apex position and parameters.
 """
@@ -26,13 +27,16 @@ __all__ = ["NoRefine", "Parabolic", "ShapeFit", "x_at"]
 
 
 def x_at(x: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
-    """x at fractional compacted positions, linear between samples."""
+    """x at fractional compacted positions, linear between samples; at a
+    whole position, that sample's x, whatever its neighbour holds. Until
+    2026-11-11 a whole position read its right neighbour through ``0 ·
+    x``, so a row's last sample, beside NaN padding, had x NaN."""
     n = x.shape[-1]
     lo = torch.floor(position).clamp(0, max(n - 1, 0)).to(torch.int64)
     hi = (lo + 1).clamp(max=max(n - 1, 0))
     frac = (position - lo.to(position.dtype)).clamp(0, 1)
     xl, xh = torch.gather(x, -1, lo), torch.gather(x, -1, hi)
-    return torch.where(hi > lo, xl + frac * (xh - xl), xl)
+    return torch.where((hi > lo) & (frac > 0), xl + frac * (xh - xl), xl)
 
 
 @register
@@ -50,28 +54,42 @@ class NoRefine(Stage):
 @register
 @dataclass(frozen=True)
 class Parabolic(Stage):
-    """The parabola's vertex through the apex and its neighbours."""
+    """The vertex of the parabola through the apex and its neighbours, as
+    (x, y) points (of log y with ``log``: exact for a Gaussian on any
+    spacing), kept within half a sample of the apex (between the midpoints
+    to its neighbours); the apex's x where the three are not concave.
+    Until 2026-11-11 the parabola assumed equal spacing, so a Gaussian
+    centred at 1.3 sampled at x = 0, 1, 4 refined to 0.68."""
 
     log: bool = False
     kind: ClassVar[str] = "refine"
     name: ClassVar[str] = "parabolic"
+    version: ClassVar[int] = 2
 
     def __call__(self, trace: Trace, apex, left, right, valid):
-        y = trace.y
+        y, x = trace.y, trace.x
         n = y.shape[-1]
         p = apex.clamp(min=0)
-        a = torch.gather(y, -1, (p - 1).clamp(min=0))
-        b = torch.gather(y, -1, p)
-        c = torch.gather(y, -1, (p + 1).clamp(max=n - 1))
+        before, after = (p - 1).clamp(min=0), (p + 1).clamp(max=n - 1)
+        y0, y1, y2 = (torch.gather(y, -1, i) for i in (before, p, after))
+        x0, x1, x2 = (torch.gather(x, -1, i) for i in (before, p, after))
         inner = (p > 0) & (p < (trace.count - 1).unsqueeze(-1))
         if self.log:
-            positive = (a > 0) & (b > 0) & (c > 0)
+            positive = (y0 > 0) & (y1 > 0) & (y2 > 0)
             inner &= positive
-            a, b, c = (torch.log(torch.where(positive, v, torch.ones_like(v))) for v in (a, b, c))
-        denom = a - 2 * b + c
-        shift = torch.where(inner & (denom < 0), 0.5 * (a - c) / torch.where(denom < 0, denom, -torch.ones_like(denom)),
-                            torch.zeros_like(b)).clamp(-0.5, 0.5)  # fmt: skip
-        return x_at(trace.x, p.to(torch.float64) + shift), None
+            y0, y1, y2 = (torch.log(torch.where(positive, v, torch.ones_like(v))) for v in (y0, y1, y2))
+        # About the apex, d0 < 0 < d2 and the chords' slopes s0, s2: the
+        # curvature is (s0 − s2)/(d0 − d2), concave where s0 > s2, and the
+        # vertex is d0/2 − s0·(d0 − d2)/(2(s0 − s2)) from x1.
+        d0, d2 = x0 - x1, x2 - x1
+        inner &= (d0 < 0) & (d2 > 0)
+        one = torch.ones_like(d0)
+        s0 = (y0 - y1) / torch.where(inner, d0, -one)
+        s2 = (y2 - y1) / torch.where(inner, d2, one)
+        concave = inner & (s0 > s2)
+        t = 0.5 * d0 - s0 * (d0 - d2) / (2.0 * torch.where(concave, s0 - s2, one))
+        vertex = torch.minimum(torch.maximum(x1 + t, 0.5 * (x0 + x1)), 0.5 * (x1 + x2))
+        return torch.where(concave, vertex, x1), None
 
 
 @register
@@ -85,6 +103,7 @@ class ShapeFit(Stage):
     max_iter: int = 50
     kind: ClassVar[str] = "refine"
     name: ClassVar[str] = "shape_fit"
+    version: ClassVar[int] = 2  # 2026-11-11: scale-free damping and stopping in the fit
 
     def __call__(self, trace: Trace, apex, left, right, valid):
         from constellation.core.signal.peak_fit import fit_peaks

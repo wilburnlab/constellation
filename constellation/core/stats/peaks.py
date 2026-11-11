@@ -415,15 +415,25 @@ class GaussianPeak(PeakShape):
         t_hi: float | torch.Tensor | None = None,
         n_points: int = 500,
     ) -> torch.Tensor:
+        """Area over ``[t_lo, t_hi]`` through the Gaussian CDF, a missing
+        limit ``∓inf``; differentiable in the parameters and the limits.
+        An infinite limit's CDF (0 or 1) is set before any arithmetic with
+        the parameters, as :func:`emg_cdf` does. Until 2026-11-11
+        ``(±inf − t_apex)/σ`` was formed first, so with one limit missing
+        the value was right and the gradient in ``log_sigma`` NaN."""
         # Closed form when no limits are given: ∫ N_max·exp(-½z²) dt = N_max·σ·√(2π)
         if t_lo is None and t_hi is None:
             return self.N_max * self.sigma * _SQRT2PI
-        # Bounded integral via the Gaussian CDF; a missing limit is ∓inf.
         lo, hi = _limits(t_lo, t_hi)
         sigma = self.sigma
-        cdf_hi = _normal_cdf((hi - self.t_apex) / sigma)
-        cdf_lo = _normal_cdf((lo - self.t_apex) / sigma)
-        return self.N_max * sigma * _SQRT2PI * (cdf_hi - cdf_lo)
+
+        def cdf(t: torch.Tensor) -> torch.Tensor:
+            finite = torch.isfinite(t)
+            z = (torch.where(finite, t, torch.zeros_like(t)) - self.t_apex) / sigma
+            limit = torch.where(t > 0, torch.ones_like(z), torch.zeros_like(z))
+            return torch.where(finite, _normal_cdf(z), limit)
+
+        return self.N_max * sigma * _SQRT2PI * (cdf(hi) - cdf(lo))
 
     def bounds(self, n_sigma: float = 4.0) -> tuple[torch.Tensor, torch.Tensor]:
         sigma = self.sigma

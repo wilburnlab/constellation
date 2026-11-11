@@ -73,3 +73,42 @@ def test_masked_residuals_do_not_count_and_rows_do_not_couple() -> None:
     assert torch.allclose(masked.params, clean.params, atol=1e-8)
     alone = batched_least_squares(lambda q, rows: residual(q, rows + 7)[:, 5:], torch.tensor(p0)[7:8])
     assert torch.allclose(alone.params[0], clean.params[7], atol=1e-8)
+
+
+def test_a_fit_does_not_depend_on_the_units_of_its_intensities() -> None:
+    """An exact EMG at heights 1e-6, 1 and 1e6 gives the same shape. Until
+    2026-11-11 the damping carried the Jacobian's scale twice and the step
+    test was dominated by the amplitude, so at 1e6 the fit stopped,
+    "converged", at sigma 2.44 and tau 1.83."""
+    from constellation.core.stats.peaks import PEAK_FORMS
+
+    form = PEAK_FORMS["emg"]
+    t = torch.linspace(0, 60, 121, dtype=torch.float64).expand(3, 121)
+    truth = torch.tensor([[1e-6, 25.0, 2.1, 3.0], [1.0, 25.0, 2.1, 3.0], [1e6, 25.0, 2.1, 3.0]], dtype=torch.float64)
+    y = form.evaluate(t, truth)
+    ok = torch.ones_like(y, dtype=torch.bool)
+    lower, upper = form.bounds(t, y, ok)
+    start = torch.minimum(torch.maximum(form.initial(t, y, ok), lower), upper)
+    out = batched_least_squares(lambda q, rows: form.evaluate(t[rows], q) - y[rows], start, lower=lower, upper=upper)
+    assert out.converged.all()
+    torch.testing.assert_close(out.params[:, 1:], truth[:, 1:], rtol=1e-8, atol=0.0)
+    torch.testing.assert_close(out.params[:, 0] / truth[:, 0], torch.ones(3, dtype=torch.float64), rtol=1e-8, atol=0.0)
+
+
+def test_an_undefined_residual_is_never_a_perfect_fit() -> None:
+    """``log(p)`` is undefined at p = -1: that row fails (status -2, its
+    parameters as started, cost and covariance NaN) and the row beside it
+    fits. A trial step into p < 0 is refused, not taken as zero residuals.
+    Until 2026-11-11 NaN residuals were zeros, so both were "perfect fits"
+    (the second at p = -59)."""
+    target = torch.log(torch.tensor([[2.0], [2.0], [0.01]], dtype=torch.float64))
+
+    def residual(q, rows):
+        return torch.log(q) - target[rows]
+
+    out = batched_least_squares(residual, torch.tensor([[-1.0], [1.0], [10.0]], dtype=torch.float64))
+    assert out.status.tolist()[0] == -2 and not out.converged[0]
+    assert out.params[0].item() == -1.0 and torch.isnan(out.cost[0]) and torch.isnan(out.covariance[0]).all()
+    assert out.converged[1:].all()
+    torch.testing.assert_close(out.params[1:, 0], torch.tensor([2.0, 0.01], dtype=torch.float64), rtol=1e-10, atol=0.0)
+    assert (out.cost[1:] < 1e-20).all()

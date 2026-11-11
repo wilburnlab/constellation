@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import torch
 
-__all__ = ["Compacted", "compact", "expand"]
+__all__ = ["Compacted", "compact", "expand", "valid_neighbours"]
 
 
 @dataclass(frozen=True)
@@ -65,6 +65,17 @@ def expand(compacted: Compacted, values: torch.Tensor, fill: float | int | bool)
     return out.scatter(-1, compacted.order, kept)
 
 
+def valid_neighbours(valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(at_or_before, at_or_after)``, each ``[..., N]``: the nearest valid
+    position at or before each position (``-1`` for none) and at or after
+    it (``N`` for none). For rows with holes in their validity."""
+    n = valid.shape[-1]
+    idx = torch.arange(n, device=valid.device).expand_as(valid)
+    before = torch.cummax(torch.where(valid, idx, torch.full_like(idx, -1)), dim=-1).values
+    after = torch.where(valid, idx, torch.full_like(idx, n)).flip(-1).cummin(dim=-1).values.flip(-1)
+    return before, after
+
+
 # ── range queries ─────────────────────────────────────────────────────
 
 
@@ -77,8 +88,10 @@ class RangeTable:
     minimum over a range with the position it is at (a prominence base).
 
     Built from compacted values ``y [..., N]`` and each row's count of valid
-    samples; padding never answers a search. ``levels[l][..., i]`` holds
-    the max (min) of ``y[i : i + 2**l]``. Memory ``O(B N log N)``.
+    samples; padding never answers a search, nor does a sample ``valid``
+    (if given) leaves out, a hole: a search passes it, as a minimum or a
+    maximum ignores it. ``levels[l][..., i]`` holds the max (min) of
+    ``y[i : i + 2**l]``. Memory ``O(B N log N)``.
     """
 
     lo: tuple[torch.Tensor, ...]  # range minima per level
@@ -92,10 +105,12 @@ class RangeTable:
         return int(self.lo[0].shape[-1])
 
     @classmethod
-    def build(cls, y: torch.Tensor, count: torch.Tensor) -> RangeTable:
+    def build(cls, y: torch.Tensor, count: torch.Tensor, valid: torch.Tensor | None = None) -> RangeTable:
         n = y.shape[-1]
         idx = torch.arange(n, device=y.device).expand_as(y)
         inside = idx < count.unsqueeze(-1)
+        if valid is not None:
+            inside = inside & valid.bool()
         lo0 = torch.where(inside, y, torch.full_like(y, float("inf")))
         hi0 = torch.where(inside, y, torch.full_like(y, float("-inf")))
         lo, hi, at_r, at_l = [lo0], [hi0], [idx], [idx]

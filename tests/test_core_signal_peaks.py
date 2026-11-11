@@ -178,3 +178,244 @@ def test_a_picker_is_named_by_its_stages_and_rebuilt_from_them() -> None:
     assert make_stage("boundaries", "valley") == Valley()
     with pytest.raises(KeyError, match="available"):
         make_stage("detect", "cwt_ridges")
+
+
+# ── Codex review of 2026-11-11 ─────────────────────────────────────────
+
+
+def test_padding_does_not_move_a_boundary_on_the_last_sample() -> None:
+    """A boundary on a row's last valid sample is that sample's x. Until
+    2026-11-11 NaN padding after it made ``right_x`` NaN (the next sample
+    read through 0 · NaN)."""
+    y = torch.tensor([[0, 1, 4, 1, 0.0]], dtype=torch.float64)
+    picker = PeakPicker(detect=LocalMaxima(), boundaries=Valley())
+    padded = picker(torch.cat([y, torch.full((1, 3), float("nan"), dtype=torch.float64)], dim=-1))
+    assert padded.left_x[0, 0].item() == 0.0 and padded.right_x[0, 0].item() == 4.0
+    assert padded.right_x[0, 0].item() == picker(y).right_x[0, 0].item()
+
+
+def _score_and_intensity(n: int = 60):
+    x = torch.arange(n, dtype=torch.float64)
+    score = torch.exp(-0.5 * ((x - 30) / 2) ** 2)
+    intensity = 100 * torch.exp(-0.5 * ((x - 30) / 4) ** 2)
+    return x, score[None], intensity[None]
+
+
+@pytest.mark.parametrize("bounds", [Valley(), WalkOut(), Fraction(0.01), DetectorBounds()])
+def test_a_boundary_trace_hole_is_never_an_apex_or_an_endpoint(bounds) -> None:
+    """Holes in the boundary trace (``boundary_valid`` false, or NaN) are
+    passed over: a walk stops before one, a search or a minimum ignores it.
+    Until 2026-11-11 a walk ended on a hole and a search stopped at one."""
+    x, score, intensity = _score_and_intensity()
+    holes = [17, 22, 30, 38, 43]  # a fraction's crossings, the flanks, the apex
+    bv = torch.ones_like(score, dtype=torch.bool)
+    bv[0, holes[:-1]] = False
+    intensity = intensity.clone()
+    intensity[0, holes[-1]] = float("nan")
+    picker = PeakPicker(detect=LocalMaxima(prominence=0.5), boundaries=bounds, recenter=2)
+    p = picker(score, x=x, boundary_trace=intensity, boundary_valid=bv)
+    assert int(p.n[0]) == 1 and p.apex[0, 0].item() == 30
+    for field in (p.boundary_apex, p.left, p.right):
+        assert field[0, 0].item() not in holes and field[0, 0].item() >= 0
+    assert p.boundary_apex[0, 0].item() in (29, 31)
+    if not isinstance(bounds, WalkOut):  # which stops at the apex's hole
+        # The area joins the samples on either side of a hole.
+        assert p.area[0, 0].item() == pytest.approx(100 * 4 * np.sqrt(2 * np.pi), rel=0.05)
+
+
+def test_a_walk_stops_before_a_hole_and_a_fraction_passes_it() -> None:
+    x, score, intensity = _score_and_intensity()
+    bv = torch.ones_like(score, dtype=torch.bool)
+    bv[0, [17, 22, 38, 43]] = False
+    p = PeakPicker(detect=LocalMaxima(prominence=0.5), boundaries=WalkOut())(score, x=x, boundary_trace=intensity,
+                                                                              boundary_valid=bv)  # fmt: skip
+    assert (p.left[0, 0].item(), p.right[0, 0].item()) == (23, 37)
+    p = PeakPicker(detect=LocalMaxima(prominence=0.5), boundaries=Fraction(0.01))(score, x=x, boundary_trace=intensity,
+                                                                                   boundary_valid=bv)  # fmt: skip
+    assert (p.left[0, 0].item(), p.right[0, 0].item()) == (16, 44)
+
+
+def test_a_peak_with_no_boundary_sample_near_keeps_only_what_detection_gave_it() -> None:
+    x, score, intensity = _score_and_intensity()
+    picker = PeakPicker(detect=LocalMaxima(prominence=0.5), boundaries=WalkOut(), recenter=2)
+    for bv in (torch.zeros_like(score, dtype=torch.bool), (x < 20) | (x > 40)):
+        p = picker(score, x=x, boundary_trace=intensity, boundary_valid=bv.reshape(1, -1))
+        assert int(p.n[0]) == 1 and p.apex[0, 0].item() == 30
+        assert p.height[0, 0].item() == 1.0 and np.isfinite(p.prominence[0, 0].item())
+        assert (p.boundary_apex[0, 0].item(), p.left[0, 0].item(), p.right[0, 0].item()) == (-1, -1, -1)
+        for field in (p.width, p.area, p.asymmetry, p.jaggedness, p.left_x, p.right_x):
+            assert torch.isnan(field[0, 0])
+
+
+def test_a_boundary_trace_hole_at_the_half_height_crossing_is_interpolated_across() -> None:
+    x, score, intensity = _score_and_intensity()
+    bv = torch.ones_like(score, dtype=torch.bool)
+    bv[0, [26, 34]] = False  # the samples just inside each half-height crossing
+    picker = PeakPicker(detect=LocalMaxima(prominence=0.5), boundaries=Fraction(0.01))
+    whole = picker(score, x=x, boundary_trace=intensity)
+    holed = picker(score, x=x, boundary_trace=intensity, boundary_valid=bv)
+    assert whole.width[0, 0].item() == pytest.approx(2.3548 * 4, rel=0.01)
+    assert holed.width[0, 0].item() == pytest.approx(whole.width[0, 0].item(), rel=0.01)
+
+
+@pytest.mark.parametrize("template", ["gaussian", "ricker"])
+def test_the_matched_filter_finds_nothing_on_a_constant(template) -> None:
+    """Until 2026-11-11 a template truncated at the row's edge answered a
+    constant, and a response MAD of 0 made it two peaks scored 1e300."""
+    ones = torch.ones(2, 100, dtype=torch.float64)
+    valid = torch.ones_like(ones, dtype=torch.bool)
+    valid[1, [3, 4, 50, 51, 52, 97]] = False
+    p = PeakPicker(detect=MatchedFilter(widths=(2.0, 4.0), template=template))(ones, valid=valid)
+    assert int(p.n.sum()) == 0
+
+
+@pytest.mark.parametrize("template", ["gaussian", "ricker"])
+def test_the_matched_filter_finds_a_bump_on_an_offset_once(template) -> None:
+    g = np.random.default_rng(11)
+    x = np.arange(200.0)
+    y = 1000.0 + 10 * np.exp(-0.5 * ((x - 120) / 3) ** 2) + g.normal(scale=0.2, size=200)
+    picker = PeakPicker(detect=MatchedFilter(widths=(3.0,), template=template, threshold=5.0), max_peaks=8)
+    p = picker(torch.tensor(y)[None])
+    assert int(p.n[0]) == 1 and abs(p.apex[0, 0].item() - 120) <= 1
+    shifted = picker(torch.tensor(y - 1000.0)[None])
+    assert torch.equal(shifted.apex, p.apex)
+
+
+def test_fraction_bounds_are_found_above_a_sloping_baseline() -> None:
+    """Until 2026-11-11 the raw trace was compared with a level from the
+    apex's baseline alone: under an exact sloping baseline a Gaussian's
+    bounds went from [42, 58] to [43, 100]."""
+    n = 101
+    x = torch.arange(n, dtype=torch.float64)
+    peak = 100 * torch.exp(-0.5 * ((x - 50) / 3) ** 2)
+    cand = LocalMaxima()(_trace(peak[None].numpy(), np.array([n])))
+    flat = Fraction(0.05)(_trace(peak[None].numpy(), np.array([n])), cand, torch.tensor([[50]]))
+    for slope in (0.5, -0.5):
+        base = 20 + slope * x
+        tr = Trace(y=(peak + base)[None], x=x[None], valid=torch.ones(1, n, dtype=torch.bool), count=torch.tensor([n]),
+                   baseline=base[None])  # fmt: skip
+        got = Fraction(0.05)(tr, cand, torch.tensor([[50]]))
+        assert [t.item() for t in got] == [t.item() for t in flat] == [42, 58]
+
+
+def test_parabolic_refinement_is_exact_for_a_gaussian_on_an_irregular_axis() -> None:
+    """Until 2026-11-11 the parabola assumed equal spacing: a Gaussian
+    centred at 1.3 sampled at x = 0, 1, 4 refined to 0.68."""
+    xi = torch.tensor([[0.0, 1.0, 4.0]], dtype=torch.float64)
+    tr = Trace(y=torch.exp(-0.5 * ((xi - 1.3) / 1.0) ** 2), x=xi, valid=torch.ones(1, 3, dtype=torch.bool),
+               count=torch.tensor([3]))  # fmt: skip
+    assert Parabolic(log=True)(tr, torch.tensor([[1]]), None, None, None)[0].item() == pytest.approx(1.3, abs=1e-12)
+    # On an equally spaced axis, the three-point formula as before.
+    g = np.random.default_rng(4)
+    y = g.uniform(0.1, 1.0, size=(50, 40))
+    h, x0 = g.uniform(0.5, 2.0, size=(50, 1)), g.uniform(-5, 5, size=(50, 1))
+    x = x0 + h * np.arange(40)
+    apex = torch.tensor(g.integers(0, 40, size=(50, 3)))
+    for log in (False, True):
+        tr = Trace(y=torch.tensor(y), x=torch.tensor(x), valid=torch.ones(50, 40, dtype=torch.bool),
+                   count=torch.full((50,), 40))  # fmt: skip
+        got = Parabolic(log=log)(tr, apex, None, None, None)[0].numpy()
+        v = np.log(y) if log else y
+        i = apex.numpy()
+        a = np.take_along_axis(v, np.clip(i - 1, 0, 39), 1)
+        b = np.take_along_axis(v, i, 1)
+        c = np.take_along_axis(v, np.clip(i + 1, 0, 39), 1)
+        denom = a - 2 * b + c
+        inner = (i > 0) & (i < 39) & (denom < 0)
+        shift = np.where(inner, 0.5 * (a - c) / np.where(denom < 0, denom, -1.0), 0.0).clip(-0.5, 0.5)
+        np.testing.assert_allclose(got, x0 + h * (i + shift), rtol=1e-12, atol=1e-12)
+
+
+def _select_by_distance_all_pairs(position, priority, valid, distance):
+    """The implementation before 2026-11-11, every pair compared: the
+    reference the banded one must equal."""
+    m = position.shape[-1]
+    p = position.to(torch.float64)
+    near = (p.unsqueeze(-1) - p.unsqueeze(-2)).abs() < distance
+    near &= valid.unsqueeze(-1) & valid.unsqueeze(-2)
+    near &= ~torch.eye(m, dtype=torch.bool).unsqueeze(0)
+    j_idx, i_idx = torch.arange(m).view(1, 1, m), torch.arange(m).view(1, m, 1)
+    pr = priority
+    better = (pr.unsqueeze(-2) > pr.unsqueeze(-1)) | ((pr.unsqueeze(-2) == pr.unsqueeze(-1)) & (j_idx > i_idx))
+    rivals = near & better
+    undecided, kept = valid.clone(), torch.zeros_like(valid)
+    while undecided.any():
+        win = undecided & ~(rivals & undecided.unsqueeze(-2)).any(dim=-1)
+        kept |= win
+        undecided &= ~(win | (near & win.unsqueeze(-2)).any(dim=-1))
+    return kept
+
+
+@pytest.mark.parametrize("distance", [1.0, 1.5, 2.0, 3.0, 4.7, 9.0])
+def test_distance_suppression_is_the_all_pairs_choice(distance) -> None:
+    from constellation.core.signal.peaks.detect import select_by_distance
+
+    g = torch.Generator().manual_seed(int(distance * 10))
+    b, n, m = 20, 300, 60
+    pos = torch.stack([torch.randperm(n, generator=g)[:m] for _ in range(b)])  # distinct, unsorted
+    prio = torch.randint(0, 6, (b, m), generator=g).to(torch.float64)  # many ties
+    valid = torch.rand(b, m, generator=g) > 0.2
+    want = _select_by_distance_all_pairs(pos, prio, valid, distance)
+    assert torch.equal(select_by_distance(pos, prio, valid, distance), want)
+
+
+def test_distance_suppression_of_25000_candidates_in_a_row_stays_small() -> None:
+    """Until 2026-11-11 one row's candidates were compared pairwise: 25,000
+    of them made [M, M] intermediates of 5 GB each."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    code = (
+        "import resource, torch\n"
+        "from constellation.core.signal.peaks.detect import select_by_distance\n"
+        "m = 25000\n"
+        "pos = (torch.arange(m) * 2 + 1).unsqueeze(0)\n"
+        "prio = torch.rand(1, m, generator=torch.Generator().manual_seed(0), dtype=torch.float64)\n"
+        "before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+        "keep = select_by_distance(pos, prio, torch.ones(1, m, dtype=torch.bool), 4)\n"
+        "after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+        "print(int(keep.sum()), (after - before) // 1024)\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1], capture_output=True,
+                         text=True, timeout=300, check=True)  # fmt: skip
+    kept, grown_mb = (int(v) for v in out.stdout.split())
+    assert 0 < kept < 25000 and grown_mb < 200
+
+
+def test_robust_z_measures_its_peaks_above_its_own_baseline() -> None:
+    """Until 2026-11-11 RobustZ detected above its rolling median but the
+    picker measured above 0: an offset of 100 took a peak's width from 7 to
+    147 and its area from 91 to 14,777."""
+    g = np.random.default_rng(0)
+    x = np.arange(200.0)
+    y = 10 * np.exp(-0.5 * ((x - 100) / 3) ** 2) + g.normal(scale=0.3, size=200)
+    picker = PeakPicker(detect=RobustZ(k=5, k_low=2, window=41), boundaries=DetectorBounds())
+    low, high = picker(torch.tensor(y)[None]), picker(torch.tensor(y + 100.0)[None])
+    assert int(low.n[0]) == 1 and torch.equal(low.apex, high.apex)
+    assert low.width[0, 0].item() == pytest.approx(2.3548 * 3, rel=0.15)
+    for field in ("width", "area", "snr", "asymmetry"):
+        assert getattr(high, field)[0, 0].item() == pytest.approx(getattr(low, field)[0, 0].item(), rel=1e-9)
+
+
+@pytest.mark.parametrize("rel_height", [0.0, 0.5, 1.0])
+def test_plateau_widths_are_scipys_at_every_relative_height(rel_height) -> None:
+    """scipy's walk starts at the peak, so at ``rel_height`` 0 a flat top
+    has width 0; until 2026-11-11 it started beside the peak (width 2 for
+    ``[0, 1, 1, 1, 0]``)."""
+    import warnings
+
+    g = np.random.default_rng(9)
+    rows = [np.array([0, 1, 1, 1, 0, 0.0]), np.array([0, 2, 2, 1, 3, 3, 3, 0.0])]
+    rows += [g.integers(0, 4, size=40).astype(np.float64) for _ in range(6)]
+    for y in rows:
+        n = y.size
+        c = LocalMaxima(rel_height=rel_height)(_trace(y[None], np.array([n])))
+        peaks = np.sort(c.apex[0][c.valid[0]].numpy())
+        order = np.argsort(c.apex[0][c.valid[0]].numpy())
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            w, _, left_ip, right_ip = peak_widths(y, peaks, rel_height=rel_height)
+        np.testing.assert_allclose(c.extras["width_samples"][0][c.valid[0]].numpy()[order], w)
+        np.testing.assert_allclose(c.extras["left_ip"][0][c.valid[0]].numpy()[order], left_ip)
+        np.testing.assert_allclose(c.extras["right_ip"][0][c.valid[0]].numpy()[order], right_ip)

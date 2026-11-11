@@ -11,7 +11,20 @@ With ``boundary_trace`` (on the same axis), detection runs on ``y`` and
 the extent and shape on the boundary trace: a peak found in one trace (a
 similarity score along time, a derivative) and measured in another (the
 intensity it scores). The apex moves to the boundary trace's highest
-sample within ``recenter`` samples before the boundaries are walked.
+valid sample within ``recenter`` samples before the boundaries are walked.
+The boundary trace keeps the detection trace's samples, holes where it has
+no value (``boundary_valid`` false, or not finite), and every rule and
+measure passes over them (``boundaries``, ``measures``); a peak with no
+valid boundary sample that near keeps what detection gave it, and has no
+boundary apex, extent, width, area, asymmetry or jaggedness (``-1`` /
+NaN). Until 2026-11-11 the recentring could land on a hole, and a
+boundary trace with no valid sample still gave every peak an extent.
+
+With no baseline or noise stage of its own, the picker measures with the
+baseline and noise the detector estimated (``Candidates.baseline`` /
+``.noise``), on the detection trace and on the boundary trace when it is
+the same one: until 2026-11-11 RobustZ found peaks above its rolling
+median and the widths and areas were taken above 0.
 
 ``identity()`` names every stage and parameter, ``key()`` digests it (the
 ``core.stages`` key), and ``from_identity`` rebuilds the picker: a result
@@ -20,7 +33,7 @@ records how its peaks were found, as a peak list records its centroider.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -35,8 +48,10 @@ from constellation.core.signal.peaks.stages import Stage, stage_from_identity
 
 __all__ = ["PeakPicker"]
 
-#: Bump when what a picker computes around its stages changes.
-PICKER_VERSION = 1
+#: Bump when what a picker computes around its stages changes. 2
+#: (2026-11-11): a boundary trace's holes, the detector's baseline, and a
+#: last sample's x beside padding.
+PICKER_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -110,14 +125,22 @@ class PeakPicker:
         count = c.count
         vc = c.valid
         det = self._prepare(c.gather(y2, float("nan")), c.gather(x2, float("nan")), vc, count)
-        if boundary_trace is None:
-            bnd = det
-        else:
+        if boundary_trace is not None:
+            # The detection trace's samples, holes where the boundary trace
+            # has no value.
             b2 = boundary_trace.reshape(-1, n).to(torch.float64)
-            bok = ok if boundary_valid is None else ok & boundary_valid.reshape(-1, n).bool()
+            bok = ok & torch.isfinite(b2)
+            if boundary_valid is not None:
+                bok &= boundary_valid.reshape(-1, n).bool()
             bvalues = torch.where(bok, b2, torch.full_like(b2, float("nan")))
             bnd = self._prepare(c.gather(bvalues, float("nan")), det.x, vc & c.gather(bok, False), count)
         cand: Candidates = self.detect(det)
+        if self.baseline is None and cand.baseline is not None:
+            det = replace(det, baseline=cand.baseline.to(torch.float64))
+        if self.noise is None and cand.noise is not None:
+            det = replace(det, noise=cand.noise.to(torch.float64))
+        if boundary_trace is None:
+            bnd = det
         # The best max_peaks by score.
         m = min(self.max_peaks, cand.m)
         score = torch.where(cand.valid, cand.score, torch.full_like(cand.score, float("-inf")))
@@ -126,11 +149,13 @@ class PeakPicker:
             cand = cand.take(order)
         apex = torch.where(cand.valid, cand.apex, -1)
         boundary_apex = apex if boundary_trace is None else _recenter(bnd, apex, self.recenter)
-        left, right = self.boundaries(bnd, cand, boundary_apex.clamp(min=0))
-        left = torch.where(cand.valid, left, -1)
-        right = torch.where(cand.valid, right, -1)
+        # The rules bound only the peaks they have an apex for.
+        bounded = cand.valid & (boundary_apex >= 0)
+        left, right = self.boundaries(bnd, replace(cand, valid=bounded), boundary_apex.clamp(min=0))
+        left = torch.where(bounded, left, -1)
+        right = torch.where(bounded, right, -1)
         measures = measure(det, bnd, apex, boundary_apex, left, right, cand.valid)
-        apex_x, components = self.refine(det, apex.clamp(min=0), left.clamp(min=0), right.clamp(min=0), cand.valid)
+        apex_x, components = self.refine(det, apex.clamp(min=0), left.clamp(min=0), right.clamp(min=0), bounded)
 
         def back(i):  # compacted → the caller's positions
             return torch.where(cand.valid, c.position(i), torch.full_like(i, -1)).reshape(*lead, m)
@@ -146,8 +171,8 @@ class PeakPicker:
             boundary_apex=back(boundary_apex),
             left=back(left),
             right=back(right),
-            left_x=shaped(torch.where(cand.valid, x_at(det.x, left.clamp(min=0).to(torch.float64)), nan)),
-            right_x=shaped(torch.where(cand.valid, x_at(det.x, right.clamp(min=0).to(torch.float64)), nan)),
+            left_x=shaped(torch.where(bounded, x_at(det.x, left.clamp(min=0).to(torch.float64)), nan)),
+            right_x=shaped(torch.where(bounded, x_at(det.x, right.clamp(min=0).to(torch.float64)), nan)),
             left_base=back(measures["left_base"]),
             right_base=back(measures["right_base"]),
             height=shaped(measures["height"]),
@@ -165,15 +190,17 @@ class PeakPicker:
 
 
 def _recenter(trace: Trace, apex: torch.Tensor, reach: int) -> torch.Tensor:
-    """Each apex moved to the trace's highest valid sample within ``reach``."""
-    if reach <= 0:
-        return apex
+    """Each apex moved to the trace's highest valid sample within ``reach``
+    (``-1`` where the trace has none that near)."""
     b, n = trace.y.shape
-    y = torch.where(trace.valid, trace.y, torch.full_like(trace.y, float("-inf")))
-    padded = F.pad(y, (reach, reach), value=float("-inf"))
-    windows = padded.unfold(-1, 2 * reach + 1, 1)  # [B, N, 2r+1]
     p = apex.clamp(min=0)
-    around = torch.gather(windows, 1, p.unsqueeze(-1).expand(*p.shape, 2 * reach + 1))
-    best = torch.argmax(around, dim=-1) - reach
-    moved = (p + best).clamp(0, n - 1)
-    return torch.where(apex >= 0, moved, apex)
+    if reach <= 0:
+        return torch.where((apex >= 0) & torch.gather(trace.valid, -1, p), apex, torch.full_like(apex, -1))
+    y = torch.where(trace.valid, trace.y, torch.full_like(trace.y, float("-inf")))
+    width = 2 * reach + 1
+    windows = F.pad(y, (reach, reach), value=float("-inf")).unfold(-1, width, 1)  # [B, N, 2r+1]
+    present = F.pad(trace.valid, (reach, reach), value=False).unfold(-1, width, 1)
+    around = torch.gather(windows, 1, p.unsqueeze(-1).expand(*p.shape, width))
+    any_valid = torch.gather(present, 1, p.unsqueeze(-1).expand(*p.shape, width)).any(-1)
+    moved = (p + torch.argmax(around, dim=-1) - reach).clamp(0, n - 1)
+    return torch.where((apex >= 0) & any_valid, moved, torch.full_like(apex, -1))

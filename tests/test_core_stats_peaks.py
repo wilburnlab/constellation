@@ -100,6 +100,34 @@ def test_gaussian_peak_integrate_bounded():
     assert math.isclose(one_sigma / full, 0.6826895, abs_tol=1e-5)
 
 
+@pytest.mark.parametrize(("t_lo", "t_hi"), [(None, 3.0), (1.0, None)])
+def test_a_one_sided_gaussian_area_has_finite_gradients(t_lo, t_hi) -> None:
+    """A missing limit is ∓inf; until 2026-11-11 ``(±inf − t_apex)/σ`` was
+    formed before the CDF and the gradient in ``log_sigma`` was NaN."""
+    from torch.func import functional_call
+
+    p = GaussianPeak(N_max=2.0, t_apex=2.0, sigma=1.5)
+
+    class Area(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.p = p
+
+        def forward(self) -> torch.Tensor:
+            return self.p.integrate(t_lo, t_hi)
+
+    def area(log_n, t_apex, log_sigma):
+        return functional_call(Area(), {"p.log_N_max": log_n, "p.t_apex": t_apex, "p.log_sigma": log_sigma}, ())
+
+    inputs = tuple(v.detach().clone().requires_grad_(True) for v in (p.log_N_max, p.t_apex, p.log_sigma))
+    assert torch.autograd.gradcheck(area, inputs)
+    far = GaussianPeak(N_max=2.0, t_apex=2.0, sigma=1.5)
+    far.integrate(-1e3 if t_lo is None else t_lo, 1e3 if t_hi is None else t_hi).backward()
+    p.integrate(t_lo, t_hi).backward()
+    for name, value in p.named_parameters():
+        assert value.grad.item() == pytest.approx(dict(far.named_parameters())[name].grad.item(), rel=1e-12)
+
+
 def test_gaussian_peak_bounds():
     p = GaussianPeak(N_max=1.0, t_apex=10.0, sigma=2.0)
     lo, hi = p.bounds(n_sigma=3.0)
