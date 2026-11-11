@@ -114,10 +114,6 @@ def test_a_labelled_envelope_is_the_natural_atoms_envelope_moved(mode):
         ("PEPC[UNIMOD:4]K", {"C": 26, "N": 7}),  # nothing labelled
         ("<13C>PEPC[UNIMOD:4]K", {"C": 2, "N": 7}),  # the global label alone: the chain's C
         ("PEPC[UNIMOD:4]K[UNIMOD:259]", {"C": 20, "N": 5}),  # SILAC alone
-        ("<13C>PEPC[UNIMOD:4]K[UNIMOD:259]", {"C": 2, "N": 5}),  # both: lysine's C once, CAM's C natural
-        ("<13C><[UNIMOD:259]@K>PEPC[UNIMOD:4]K", {"C": 2, "N": 5}),  # SILAC as a fixed modification
-        ("<13C><15N>PEPC[UNIMOD:4]K[UNIMOD:259]", {"C": 2, "N": 1}),
-        ("<15N>PEPC[UNIMOD:4]K[UNIMOD:188]", {"C": 20, "N": 1}),  # label and substitution of other elements
         ("<13C>[UNIMOD:737]-PEPC[UNIMOD:4]K[UNIMOD:737]", {"C": 18, "N": 9}),  # TMT's heavy atoms are not the chain's
     ],
 )
@@ -151,3 +147,28 @@ def test_an_atom_a_label_and_a_heavy_modification_both_fix_counts_once(text, nat
     many_masses, many_shares = neutral_envelopes([parse_proforma("LVNELTEFAK"), pf], n_peaks=4)
     assert np.array_equal(many_masses[1], masses.numpy())
     np.testing.assert_allclose(many_shares[1], shares.numpy(), atol=1e-6)
+
+
+@pytest.mark.parametrize("modseq", ["<13C>PEPK[UNIMOD:259]", "<15N>PEPK[UNIMOD:259]", "<13C>PEPK[UNIMOD:864]",
+                                    "<13C>PEPK[Label:13C(6)15N(2)]", "<13C><[UNIMOD:259]@K>PEPC[UNIMOD:4]K",
+                                    "<15N>PEPC[UNIMOD:4]K[UNIMOD:188]"])
+def test_a_global_label_with_a_heavy_residue_label_is_refused(modseq) -> None:
+    """``<13C>`` with 13C6 lysine shifted the lysine's carbons twice, and a
+    combined label (SILAC + GlyGly) cannot say which heavy atoms are the
+    residue's: refused, not computed (2026-11-11)."""
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.core.sequence.protein import peptide_composition, peptide_mass, peptide_masses
+
+    pf = parse_proforma(modseq)
+    for fn in (peptide_mass, peptide_composition, lambda p: peptide_masses([p])):
+        with pytest.raises(ValueError, match="global isotope label"):
+            fn(pf)
+
+
+def test_a_global_label_with_tmt_or_silac_alone_still_computes() -> None:
+    from constellation.core.sequence.proforma import parse_proforma
+    from constellation.core.sequence.protein import peptide_mass
+
+    assert peptide_mass(parse_proforma("<13C>PEPK[UNIMOD:737]")) > 0  # TMT's heavy atoms are its own
+    assert peptide_mass(parse_proforma("PEPK[UNIMOD:259]")) > 0
+    assert peptide_mass(parse_proforma("<13C>PEPK")) > 0

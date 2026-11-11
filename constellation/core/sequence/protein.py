@@ -1252,13 +1252,43 @@ def _residue_matrix() -> tuple[np.ndarray, np.ndarray]:
     return _RESIDUE_COMPOSITIONS, _H2O_COUNTS
 
 
-def _check_peptidoform(peptidoform: Peptidoform, what: str) -> None:
+def _check_peptidoform(peptidoform: Peptidoform, what: str, vocab: ModVocab = UNIMOD) -> None:
     if isinstance(peptidoform, MultiPeptidoform):
         plural = "compositions" if what == "composition" else "masses"
         raise NotImplementedError(
             f"joint multi-chain {what} is not yet supported; iterate "
             f"peptidoform.chains for per-chain {plural}"
         )
+    if getattr(peptidoform, "global_isotopes", ()):
+        _refuse_label_with_heavy_modification(peptidoform, vocab)
+
+
+def _refuse_label_with_heavy_modification(peptidoform: Peptidoform, vocab: ModVocab) -> None:
+    """A global isotope label with a modification that makes the residue's
+    own atoms heavy is refused: an isotopic substitution (SILAC,
+    ``Modification.is_isotopic_substitution``) or a combination of one with
+    another modification (UNIMOD's ``Label:...+GG``, ``Label:...+Acetyl``,
+    ...). Which atoms the label covers and which the modification makes
+    heavy is not settled there: ``<13C>`` with 13C6 lysine shifted the
+    lysine's carbons twice in the mass, and a combined modification's
+    formula does not say which of its heavy atoms are the residue's (review
+    of 2026-11-11). Isotope labelling with SILAC is not in use yet; the
+    search space refuses the combination too. A modification whose heavy
+    atoms are its own added atoms (TMT) is fine: a label never covers them."""
+    fixed = (modref for modref, _ in getattr(peptidoform, "fixed_mods", ()))
+    for modref in (*_walk_modrefs(peptidoform), *fixed):
+        if modref.cv == "INFO" or modref.formula is not None or (modref.accession is None and modref.name is None):
+            continue
+        try:
+            mod = vocab.get(_modref_lookup_key(modref))
+        except KeyError:
+            continue  # the walk refuses an unknown key itself
+        if mod.heavy_atoms and (mod.is_isotopic_substitution or any(a.startswith("Label:") for a in mod.aliases)):
+            raise ValueError(
+                f"a global isotope label ({', '.join(peptidoform.global_isotopes)}) with {mod.id} "
+                f"({mod.aliases[0] if mod.aliases else mod.name}), which makes the residue's own atoms heavy, "
+                "is not supported: both would claim the same atoms"
+            )
 
 
 def _batched(
@@ -1284,7 +1314,7 @@ def _batched(
     n = len(peptidoforms)
     seqs: list[str] = []
     for pf in peptidoforms:
-        _check_peptidoform(pf, what)
+        _check_peptidoform(pf, what, vocab)
         seqs.append(pf.sequence)
     residue_comp, h2o = _residue_matrix()
     joined = "".join(seqs)
