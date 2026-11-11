@@ -28,8 +28,10 @@ KL of the spectrum summed over its extent, the picker's measures, its
 retention times and apex scan, its ions and mass error. The best by the
 picker's score is ``chosen``; a query with no candidate still gets one
 row, with null scores, so that the number of targets and of decoys scored
-is known. ``candidate_fragments`` holds the chosen candidate's per-channel
-intensities, for quantities.
+is known: also one with no scan to score (its RT interval outside the run,
+its precursor in no isolation window) or no channel. ``candidate_fragments``
+holds the chosen candidate's per-channel intensities as measured, for
+quantities, whether the library models the channel or not.
 
 It runs as a sweep reducer (:class:`KlScorer`, ``zero_fills``), best on
 the precursor-major layout; :func:`score_acquisition` compiles the queries,
@@ -145,8 +147,24 @@ class KlScorer:
         q, n_s, n_c = d.shape
         p = d.abundance.to(torch.float64)
         model = d.channel_valid & torch.isfinite(p) & (p > 0)
+        # Per query, taken by query row: through the candidate axis, whose
+        # width is the chunk's, a query with no candidate counted 0 alone
+        # and its true count beside one with a candidate (Codex review).
+        n_channels = model.sum(-1).numpy()
+        if n_s == 0 or n_c == 0:
+            # No query of the chunk has a scan (its RT interval outside the
+            # run, its precursor in no isolation window), or none has a
+            # channel (all removed by the channel settings): none has a
+            # candidate, and each gets its row. One such query among others
+            # has no valid slot or channel, so no peak, on the path below.
+            return self._rows(batch, d, np.zeros((q, 0), bool), {}, n_channels), CANDIDATE_FRAGMENT_TABLE.empty_table()
+        # What was measured, modelled or not: each channel's intensity where
+        # its cell was acquired (the fragments' quantities). The KL and the
+        # consensus take only the channels the library models (``o``).
+        observed = torch.nan_to_num(d.observed(), nan=0.0)
+        measured = torch.where(d.acquired & d.slot_valid.unsqueeze(-1), observed, torch.zeros_like(observed))
         kept = d.acquired & model.unsqueeze(1) & d.slot_valid.unsqueeze(-1)
-        o = torch.where(kept, torch.nan_to_num(d.observed(), nan=0.0), torch.zeros_like(p.unsqueeze(1).expand(q, n_s, n_c)))
+        o = torch.where(kept, measured, torch.zeros_like(measured))
         lib = torch.where(model, p, torch.zeros_like(p)).unsqueeze(1).expand(q, n_s, n_c)
 
         def kl_at(h: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -220,17 +238,46 @@ class KlScorer:
         ppm = torch.where(total > 0, (torch.nan_to_num(err) * weight).sum(-1) / total.clamp(min=1e-300),
                           torch.full_like(total, float("nan")))  # fmt: skip
 
-        return self._rows(batch, d, peaks, kl, kl0, kl_smooth, kl_ext, n_obs, coeluting, ppm, o, model, inside)
-
-    def _rows(self, batch, d, peaks, kl, kl0, kl_smooth, kl_ext, n_obs, coeluting, ppm, o, model, inside):
-        plan = batch.plan
-        q, m = peaks.valid.shape
-        local = d.queries
-        targets = plan.targets
-        take = pa.array(local)
+        # The KL features at the KL trace's own apex; the mass error and the
+        # fragments' intensities at the intensity consensus's.
+        features = {
+            # The score is the KL on the picker's smoothed trace at the apex:
+            # on the GPF bench it separated EncyclopeDIA's identifications
+            # from decoys better than the raw KL there in every setting (AUC
+            # 0.825 against 0.797 without an RT window, 0.874 against 0.867
+            # with one).
+            "score": -kl_smooth,
+            "detector_score": peaks.score,
+            "kl_apex": torch.gather(kl, 1, apex),
+            "kl_apex_h0": torch.gather(kl0, 1, apex),
+            "kl_apex_smoothed": kl_smooth,
+            "kl_integrated": kl_ext,
+            "rt_apex": torch.gather(torch.nan_to_num(d.rt, nan=float("nan")), 1, b_apex),
+            "rt_left": peaks.left_x,
+            "rt_right": peaks.right_x,
+            "apex_scan": torch.gather(d.scan, 1, b_apex),
+            "rt_kl_apex": peaks.apex_x,
+            "kl_apex_scan": torch.gather(d.scan, 1, apex),
+            "height": peaks.height,
+            "prominence": peaks.prominence,
+            "snr": peaks.snr,
+            "width": peaks.width,
+            "area": peaks.area,
+            "n_observed": torch.gather(n_obs, 1, apex),
+            "n_coeluting": coeluting,
+            "ms2_ppm": ppm,
+        }
         valid = peaks.valid.numpy()
+        return (self._rows(batch, d, valid, features, n_channels),
+                self._fragments(batch, d, valid, b_apex, inside, measured, model))  # fmt: skip
+
+    def _rows(self, batch, d, valid: np.ndarray, features: dict[str, torch.Tensor], n_channels: np.ndarray) -> pa.Table:
+        """The chunk's rows of :data:`CANDIDATE_TABLE`: one per candidate
+        (``valid [Q, M]``, measured by ``features``, each ``[Q, M]``), and
+        one, rank -1 with its measures null, for a query with none.
+        ``n_channels [Q]`` is per query."""
+        plan, targets, local = batch.plan, batch.plan.targets, d.queries
         n_cand = valid.sum(-1)
-        # One row per candidate, and one (no candidate) for a query with none.
         qi, ri = np.nonzero(valid)
         none = np.flatnonzero(n_cand == 0)
         rows_q = np.concatenate([qi, none])
@@ -238,101 +285,63 @@ class KlScorer:
         has = np.concatenate([np.ones(qi.size, bool), np.zeros(none.size, bool)])
         by = np.lexsort((rows_m, rows_q))
         rows_q, rows_m, has = rows_q[by], rows_m[by], has[by]
+        at = pa.array(local[rows_q])
 
-        def cand(t: torch.Tensor, dtype=np.float64):
-            if t.shape[-1] == 0:  # no query of the chunk has a candidate
-                return np.full(rows_q.size, np.nan if np.dtype(dtype).kind == "f" else 0, dtype)
-            return t.numpy()[rows_q, rows_m].astype(dtype)
-
-        def nullable(values: np.ndarray, typ=pa.float64()):
-            if values.dtype.kind == "f":
+        def measure(name: str) -> pa.Array:
+            typ = CANDIDATE_TABLE.field(name).type
+            if not has.any():  # no query of the chunk has a candidate: ``features`` may be [Q, 0], or none
+                return pa.nulls(rows_q.size, typ)
+            values = features[name].numpy()[rows_q, rows_m]
+            if pa.types.is_floating(typ):
+                values = values.astype(np.float64)
                 return pa.array(values, typ, mask=~has | np.isnan(values))
-            return pa.array(values, typ, mask=~has)
+            return pa.array(values.astype(np.int64), typ, mask=~has)
 
-        apex = peaks.apex.clamp(min=0)
-        b_apex = peaks.boundary_apex.clamp(min=0)
-        # The KL features at the KL trace's own apex; the mass error and the
-        # fragments' intensities at the intensity consensus's.
-        kl_apex = torch.gather(kl, 1, apex)
-        kl_apex0 = torch.gather(kl0, 1, apex)
-        n_obs_apex = torch.gather(n_obs, 1, apex)
-        kl_scan = torch.gather(d.scan, 1, apex)
-        scan_apex = torch.gather(d.scan, 1, b_apex)
-        rt_elution = torch.gather(torch.nan_to_num(d.rt, nan=float("nan")), 1, b_apex)
-        detector_score = peaks.score
-        # The score is the KL on the picker's smoothed trace at the apex: on
-        # the GPF bench it separated EncyclopeDIA's identifications from
-        # decoys better than the raw KL there in every setting (AUC 0.825
-        # against 0.797 without an RT window, 0.874 against 0.867 with one).
-        score = -kl_smooth
-        n_model = model.sum(-1, keepdim=True).expand(q, m)
-        rt_library = targets.column("rt_library").take(take).to_numpy(zero_copy_only=False).astype(np.float64)
+        rt_library = targets.column("rt_library").take(at).to_numpy(zero_copy_only=False).astype(np.float64)
         col = {
             "acquisition_id": pa.array(np.full(rows_q.size, self.acquisition_id, np.int64)),
             "query": pa.array(d.global_queries[rows_q].astype(np.int64)),
-            "target_id": targets.column("target_id").take(take).take(pa.array(rows_q)),
-            "precursor_id": targets.column("precursor_id").take(take).take(pa.array(rows_q)),
-            "peptide_id": targets.column("peptide_id").take(take).take(pa.array(rows_q)),
-            "modified_sequence": targets.column("modified_sequence").take(take).take(pa.array(rows_q)),
+            **{name: targets.column(name).take(at)
+               for name in ("target_id", "precursor_id", "peptide_id", "modified_sequence", "is_decoy", "decoy_set")},
             "precursor_charge": pa.array(plan.precursor_charge[local][rows_q].astype(np.int8)),
-            "is_decoy": targets.column("is_decoy").take(take).take(pa.array(rows_q)),
-            "decoy_set": targets.column("decoy_set").take(take).take(pa.array(rows_q)),
             "pass": pa.array(np.full(rows_q.size, self.pass_, np.int8)),
             "role": pa.array([self.role] * rows_q.size, pa.string()),
             "rank": pa.array(np.where(has, rows_m, -1).astype(np.int32)),
             "chosen": pa.array((rows_m == 0)),
             "n_candidates": pa.array(n_cand[rows_q].astype(np.int32)),
-            "score": nullable(cand(score)),
-            "detector_score": nullable(cand(detector_score)),
-            "kl_apex": nullable(cand(kl_apex)),
-            "kl_apex_h0": nullable(cand(kl_apex0)),
-            "kl_apex_smoothed": nullable(cand(kl_smooth)),
-            "kl_integrated": nullable(cand(kl_ext)),
-            "rt_apex": nullable(cand(rt_elution)),
-            "rt_left": nullable(cand(peaks.left_x)),
-            "rt_right": nullable(cand(peaks.right_x)),
-            "apex_scan": nullable(cand(scan_apex, np.int64), pa.int64()),
-            "rt_kl_apex": nullable(cand(peaks.apex_x)),
-            "kl_apex_scan": nullable(cand(kl_scan, np.int64), pa.int64()),
-            "rt_library": pa.array(rt_library[rows_q], pa.float64(), mask=np.isnan(rt_library[rows_q])),
-            "height": nullable(cand(peaks.height)),
-            "prominence": nullable(cand(peaks.prominence)),
-            "snr": nullable(cand(peaks.snr)),
-            "width": nullable(cand(peaks.width)),
-            "area": nullable(cand(peaks.area)),
-            "n_channels": pa.array(cand(n_model, np.int64).astype(np.int32)),
-            "n_observed": nullable(cand(n_obs_apex, np.int64).astype(np.int32), pa.int32()),
-            "n_coeluting": nullable(cand(coeluting, np.int64).astype(np.int32), pa.int32()),
-            "ms2_ppm": nullable(cand(ppm)),
-        }
-        candidates = pa.table(col, schema=CANDIDATE_TABLE)
+            "rt_library": pa.array(rt_library, pa.float64(), mask=np.isnan(rt_library)),
+            "n_channels": pa.array(n_channels[rows_q].astype(np.int32)),
+        }  # fmt: skip
+        return pa.table({f.name: col[f.name] if f.name in col else measure(f.name) for f in CANDIDATE_TABLE},
+                        schema=CANDIDATE_TABLE)  # fmt: skip
 
-        # The chosen candidate's fragments: intensity at its apex and summed over its extent.
-        chosen = np.flatnonzero(valid[:, 0]) if m else np.empty(0, np.int64)
-        if chosen.size:
-            at = b_apex[chosen, 0]
-            apex_int = o[chosen, at]  # [k, C]
-            ext = torch.einsum("ks,ksc->kc", inside[chosen, 0].to(torch.float64), o[chosen])
-            fq, fc = np.nonzero((d.channel_valid[chosen]).numpy())
-            fq_full = chosen[fq]
-            fragments = pa.table({
-                "acquisition_id": pa.array(np.full(fq.size, self.acquisition_id, np.int64)),
-                "query": pa.array(d.global_queries[fq_full].astype(np.int64)),
-                "target_id": targets.column("target_id").take(take).take(pa.array(fq_full)),
-                "channel": pa.array(fc.astype(np.int32)),
-                "mz_theoretical": pa.array(d.mz.numpy()[fq_full, fc]),
-                "ion_type": pa.array(d.ion_type.numpy()[fq_full, fc].astype(np.int8)),
-                "position": pa.array(d.position.numpy()[fq_full, fc].astype(np.int32)),
-                "fragment_charge": pa.array(d.fragment_charge.numpy()[fq_full, fc].astype(np.int32)),
-                "abundance": pa.array(d.abundance.numpy()[fq_full, fc].astype(np.float32),
-                                      mask=~np.isfinite(d.abundance.numpy()[fq_full, fc])),
-                "modelled": pa.array(model.numpy()[fq_full, fc]),
-                "intensity_apex": pa.array(apex_int.numpy()[fq, fc]),
-                "intensity_summed": pa.array(ext.numpy()[fq, fc]),
-            }, schema=CANDIDATE_FRAGMENT_TABLE)  # fmt: skip
-        else:
-            fragments = CANDIDATE_FRAGMENT_TABLE.empty_table()
-        return candidates, fragments
+    def _fragments(self, batch, d, valid, b_apex, inside, measured, model) -> pa.Table:
+        """The chosen candidate's channels (:data:`CANDIDATE_FRAGMENT_TABLE`):
+        each one's measured intensity at its apex and summed over its
+        extent, whether the library models the channel or not."""
+        chosen = np.flatnonzero(valid[:, 0]) if valid.shape[1] else np.empty(0, np.int64)
+        if not chosen.size:
+            return CANDIDATE_FRAGMENT_TABLE.empty_table()
+        at = b_apex[chosen, 0]
+        apex_int = measured[chosen, at]  # [k, C]
+        ext = torch.einsum("ks,ksc->kc", inside[chosen, 0].to(torch.float64), measured[chosen])
+        fq, fc = np.nonzero((d.channel_valid[chosen]).numpy())
+        fq_full = chosen[fq]
+        abundance = d.abundance.numpy()[fq_full, fc]
+        return pa.table({
+            "acquisition_id": pa.array(np.full(fq.size, self.acquisition_id, np.int64)),
+            "query": pa.array(d.global_queries[fq_full].astype(np.int64)),
+            "target_id": batch.plan.targets.column("target_id").take(pa.array(d.queries[fq_full])),
+            "channel": pa.array(fc.astype(np.int32)),
+            "mz_theoretical": pa.array(d.mz.numpy()[fq_full, fc]),
+            "ion_type": pa.array(d.ion_type.numpy()[fq_full, fc].astype(np.int8)),
+            "position": pa.array(d.position.numpy()[fq_full, fc].astype(np.int32)),
+            "fragment_charge": pa.array(d.fragment_charge.numpy()[fq_full, fc].astype(np.int32)),
+            "abundance": pa.array(abundance.astype(np.float32), mask=~np.isfinite(abundance)),
+            "modelled": pa.array(model.numpy()[fq_full, fc]),
+            "intensity_apex": pa.array(apex_int.numpy()[fq, fc]),
+            "intensity_summed": pa.array(ext.numpy()[fq, fc]),
+        }, schema=CANDIDATE_FRAGMENT_TABLE)  # fmt: skip
 
 
 def score_acquisition(

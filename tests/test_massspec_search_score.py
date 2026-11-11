@@ -108,7 +108,8 @@ def _channels() -> ChannelSettings:
 
 def _score(bundle, targets, shares, **kw):
     settings = kw.pop("settings", ScorerSettings())
-    return score_acquisition(bundle, targets, fragment_abundance=shares, tolerance=_TOL, channels=_channels(),
+    channels = kw.pop("channels", _channels())
+    return score_acquisition(bundle, targets, fragment_abundance=shares, tolerance=_TOL, channels=channels,
                              settings=settings, **kw)  # fmt: skip
 
 
@@ -219,3 +220,108 @@ def test_the_chosen_rows_do_not_depend_on_how_the_sweep_is_cut(planted, tmp_path
         assert got.column("apex_scan").equals(base.column("apex_scan")), kw
         a, b = np.asarray(got.column("score").to_pylist(), float), np.asarray(base.column("score").to_pylist(), float)
         np.testing.assert_allclose(a, b, rtol=1e-6, equal_nan=True)
+
+
+# ── what the scorer cannot score still gets its row (Codex review) ────
+
+#: The candidate table's columns measured per candidate: null on a query's
+#: no-candidate row.
+_MEASURES = ("score", "detector_score", "kl_apex", "kl_apex_h0", "kl_apex_smoothed", "kl_integrated", "rt_apex",
+             "rt_left", "rt_right", "apex_scan", "rt_kl_apex", "kl_apex_scan", "height", "prominence", "snr", "width",
+             "area", "n_observed", "n_coeluting", "ms2_ppm")  # fmt: skip
+
+
+def _row(targets: pa.Table, of: int, **changes) -> dict:
+    """Target ``of``'s row, with ``changes``."""
+    row = targets.filter(pc.equal(targets.column("target_id"), of)).to_pylist()[0]
+    return {**row, **changes}
+
+
+def _unscorable(case: str, targets: pa.Table) -> tuple[dict, ChannelSettings, int]:
+    """A target the planted run cannot score, the channels it is compiled
+    with and how many of its channels the library models."""
+    if case == "rt_outside_the_run":  # the run is 0-180 s
+        return _row(targets, 1000, target_id=2001, rt_start=1000.0, rt_end=1100.0), _channels(), 10
+    if case == "precursor_in_no_window":  # 6+ is 194.8 Th, below the windows' 350-1250
+        return _row(targets, 1000, target_id=2002, precursor_charge=6, precursor_mz=None), _channels(), 10
+    # WW's ions (b1 187, y1 205 Th) are all below the m/z the channels start at.
+    target = _row(targets, 1000, target_id=2003, modified_sequence="WW", precursor_charge=1, precursor_mz=None,
+                  precursor_id=7777)  # fmt: skip
+    return target, ChannelSettings(top_fragments=10, max_fragment_charge=2, min_fragment_mz=300.0), 0
+
+
+@pytest.mark.parametrize("layout", ["precursor_major", "scan_major"])
+@pytest.mark.parametrize("case", ["rt_outside_the_run", "precursor_in_no_window", "no_channels"])
+def test_a_target_with_no_scan_or_no_channel_gets_its_no_candidate_row(planted, case, layout):
+    """Codex review of the scorer: a chunk whose dense view had no scan slot
+    or no channel raised (a reshape in the picker, an empty ``amax``)
+    instead of giving each query its row. Alone, such a target is that
+    chunk; beside a target that scores, it is a query without slots or
+    channels in a chunk of others."""
+    run, bundle, targets, shares = planted
+    target, channels, modelled = _unscorable(case, targets)
+    for rows in ([target], [_row(targets, 1000), target]):
+        t = _score(bundle, pa.Table.from_pylist(rows, schema=XIC_TARGET_TABLE), shares, channels=channels,
+                   layout=layout).table("candidates")  # fmt: skip
+        mine = t.filter(pc.equal(t.column("target_id"), target["target_id"])).to_pylist()
+        assert len(mine) == 1, (case, len(rows))
+        r = mine[0]
+        assert (r["rank"], r["chosen"], r["n_candidates"], r["n_channels"]) == (-1, True, 0, modelled)
+        assert all(r[k] is None for k in _MEASURES), [k for k in _MEASURES if r[k] is not None]
+        if len(rows) == 2:  # the other target is scored as it is alone
+            other = t.filter(pc.and_(pc.equal(t.column("target_id"), 1000), t.column("chosen"))).to_pylist()[0]
+            assert other["n_candidates"] >= 1 and other["score"] is not None
+
+
+def test_a_querys_channel_count_does_not_depend_on_its_batch(planted):
+    """Codex review: ``n_channels`` was taken through the candidate axis,
+    whose width is the chunk's, so a target with no candidate counted 0
+    modelled channels alone and its true 10 beside a target with one."""
+    run, bundle, targets, shares = planted
+    late = _row(targets, 1000, target_id=2004, rt_start=150.0, rt_end=180.0)  # scans, but nothing elutes there
+    alone = _score(bundle, pa.Table.from_pylist([late], schema=XIC_TARGET_TABLE), shares).table("candidates")
+    assert alone.num_rows == 1 and alone.column("n_candidates")[0].as_py() == 0
+    both = _score(bundle, pa.Table.from_pylist([_row(targets, 1000), late], schema=XIC_TARGET_TABLE), shares)
+    t = both.table("candidates")
+    assert pc.max(t.column("n_candidates")).as_py() >= 1  # the other target has a candidate
+    beside = t.filter(pc.equal(t.column("target_id"), 2004))
+    assert alone.column("n_channels").to_pylist() == beside.column("n_channels").to_pylist() == [10]
+
+
+@dataclass(frozen=True)
+class _PartlyModelled(PlantedShares):
+    """Planted shares with the ions at ``unmodelled`` m/z not modelled (NaN):
+    a library that predicts nothing for them."""
+
+    unmodelled: tuple[float, ...] = ()
+
+    def abundance(self, ions) -> np.ndarray:
+        out = super().abundance(ions)
+        for mz in self.unmodelled:
+            out[np.abs(ions.mz - mz) < 1e-6] = np.nan
+        return out
+
+
+def test_a_measured_fragment_the_library_does_not_model_keeps_its_intensity(planted):
+    """Codex review: ``candidate_fragments`` took its intensities from the
+    observation masked for the KL, which keeps only modelled channels, so a
+    fragment the run measured and the library has no value for was written
+    with zero intensity. Its quantities are the run's, modelled or not."""
+    run, bundle, targets, shares = planted
+    p = run.planted[0]
+    strongest = float(p["frag_mz"][np.argmax(p["frag_ab"])])
+    target = pa.Table.from_pylist([_row(targets, 1000)], schema=XIC_TARGET_TABLE)
+    channels = ChannelSettings(max_fragment_charge=2)  # every ion: top-N ranks an unmodelled one last
+    out = {}
+    for name, source in (("modelled", shares), ("unmodelled", _PartlyModelled(shares.planted, unmodelled=(strongest,)))):
+        result = _score(bundle, target, source, channels=channels)
+        c = result.table("candidates")
+        f = result.table("candidate_fragments")
+        ion = f.filter(pc.less(pc.abs(pc.subtract(f.column("mz_theoretical"), strongest)), 1e-6)).to_pylist()
+        assert len(ion) == 1
+        out[name] = (c.filter(c.column("chosen")).select(["apex_scan", "rt_left", "rt_right"]).to_pylist(), ion[0])
+    (where, unmodelled), (where_m, modelled) = out["unmodelled"], out["modelled"]
+    assert where == where_m  # the same apex and extent, so the same cells
+    assert not unmodelled["modelled"] and unmodelled["abundance"] is None and modelled["modelled"]
+    assert unmodelled["intensity_apex"] == modelled["intensity_apex"] > 0
+    assert unmodelled["intensity_summed"] == modelled["intensity_summed"] > unmodelled["intensity_apex"]

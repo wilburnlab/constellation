@@ -1269,13 +1269,17 @@ def _batched(
     for_mass: bool,
     labelled: bool = False,
     heavy: np.ndarray | None = None,
+    substituted: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[float], np.ndarray | None]:
     """(N, E) int64 compositions; per peptidoform, the mass the composition
     does not carry (``mass_override`` corrections and bare mass deltas),
     accumulated in the scalar code's order; and with ``labelled``, the
     (N, E) atoms a global isotope label covers (:func:`labelled_compositions`).
     ``heavy``, an (N, E) int64 array of zeros, is filled in the same walk
-    with the heavy atoms modifications name (:func:`heavy_atom_compositions`)."""
+    with the heavy atoms modifications name (:func:`heavy_atom_compositions`),
+    and ``substituted`` (with ``heavy``) with those of them that are the
+    residue's own atoms: the heavy atoms of isotopic substitutions
+    (``Modification.is_isotopic_substitution``: SILAC), part of the chain."""
     what = "mass" if for_mass else "composition"
     n = len(peptidoforms)
     seqs: list[str] = []
@@ -1301,15 +1305,15 @@ def _batched(
     # global isotope label covers, less what modifications take off it.
     chain = comp.copy() if labelled else None
 
-    resolved: dict[ModRef, tuple[np.ndarray, float, np.ndarray | None]] = {}
+    resolved: dict[ModRef, tuple[np.ndarray, float, np.ndarray | None, bool]] = {}
     extra = [0.0] * n
 
-    def resolve(modref: ModRef) -> tuple[np.ndarray, float, np.ndarray | None]:
+    def resolve(modref: ModRef) -> tuple[np.ndarray, float, np.ndarray | None, bool]:
         hit = resolved.get(modref)
         if hit is None:
             d_comp, d_mass = _modref_contribution(modref, vocab, monoisotopic=monoisotopic)
-            atoms = _modref_heavy_atoms(modref, vocab) if heavy is not None else None
-            hit = resolved[modref] = (d_comp.counts.numpy(), d_mass, atoms)  # int32 view
+            atoms, own = _modref_heavy_atoms(modref, vocab) if heavy is not None else (None, False)
+            hit = resolved[modref] = (d_comp.counts.numpy(), d_mass, atoms, own)  # int32 view
         return hit
 
     for i, pf in enumerate(peptidoforms):
@@ -1327,15 +1331,17 @@ def _batched(
                     "mods, but peptide_composition needs a UNIMOD/name/formula "
                     "payload to determine element counts"
                 )
-            d_comp, d_mass, h = resolve(modref)
+            d_comp, d_mass, h, own = resolve(modref)
             row += d_comp
             acc += d_mass
             if chain is not None:
                 chain[i] += np.minimum(d_comp, 0)
             if h is not None:
                 heavy[i] += h  # type: ignore[index]
+                if own and substituted is not None:
+                    substituted[i] += h
         for modref, locations in pf.fixed_mods:
-            d_comp, d_mass, h = resolve(modref)
+            d_comp, d_mass, h, own = resolve(modref)
             for loc in locations:
                 count = _count_fixed_mod_locations(pf.sequence, loc, pf)
                 if count:
@@ -1345,24 +1351,29 @@ def _batched(
                         chain[i] += np.minimum(d_comp, 0) * count
                     if h is not None:
                         heavy[i] += h * count
+                        if own and substituted is not None:
+                            substituted[i] += h * count
         extra[i] = acc
     return comp, extra, chain
 
 
-def _modref_heavy_atoms(modref: ModRef, vocab: ModVocab) -> np.ndarray | None:
+def _modref_heavy_atoms(modref: ModRef, vocab: ModVocab) -> tuple[np.ndarray | None, bool]:
     """The heavy atoms a modification names (``Modification.heavy_atoms``),
     counted under each light element, those it adds only; None for none (a
-    formula, a mass, a modification without heavy atoms)."""
+    formula, a mass, a modification without heavy atoms). And whether they
+    are the residue's own atoms made heavy (an isotopic substitution: SILAC)
+    rather than atoms the modification adds (TMT's)."""
     if modref.cv == "INFO" or modref.formula is not None or (modref.accession is None and modref.name is None):
-        return None
-    atoms = vocab.get(_modref_lookup_key(modref)).heavy_atoms
+        return None, False
+    mod = vocab.get(_modref_lookup_key(modref))
+    atoms = mod.heavy_atoms
     if not atoms:
-        return None
+        return None, False
     out = np.zeros(len(ELEMENTS), dtype=np.int64)
     for label, count in atoms.items():
         if int(count) > 0:
             out[ELEMENTS.index(parse_isotope_label(label)[1])] += int(count)
-    return out if out.any() else None
+    return (out, mod.is_isotopic_substitution) if out.any() else (None, False)
 
 
 @requires_canonical
@@ -1444,23 +1455,33 @@ def natural_abundance_compositions(
 ) -> torch.Tensor:
     """The atoms of each peptidoform whose isotopes follow natural
     abundance: an ``(N, E)`` int32 tensor, its composition
-    (:func:`peptide_compositions`, same rules and errors) less the atoms a
-    global label covers (:func:`labelled_compositions`) and the heavy atoms
-    its modifications name (:func:`heavy_atom_compositions`), which are one
-    isotope each. What an isotope envelope distributes; the others carry
-    only mass. Clamped at zero, where a label also covers a heavy
-    modification's atoms (which then count twice). One walk of the
-    modifications for all three."""
+    (:func:`peptide_compositions`, same rules and errors) less the atoms
+    that are one isotope each, each atom once: those a global label covers
+    (:func:`labelled_compositions`, the chain's atoms of its element) and
+    the heavy atoms its modifications name (:func:`heavy_atom_compositions`)
+    that the label does not cover. What an isotope envelope distributes;
+    the others carry only mass. One walk of the modifications for all.
+
+    An isotopic substitution's heavy atoms (SILAC's) are its residue's own,
+    so of an element a global label names they are among the chain's atoms
+    the label covers already; the heavy atoms a modification adds (TMT's)
+    are not. Until 2026-11-11 a substitution's atoms of a labelled element
+    were taken off twice, and the clamp at zero took the deficit from atoms
+    that are natural: ``<13C>`` with SILAC lysine lost carbamidomethyl's two
+    carbons (Codex review of the scorer). The clamp stays for a substitution
+    placed on a residue that lacks the atoms it names."""
     labelled = any(getattr(pf, "global_isotopes", ()) for pf in peptidoforms)
     heavy = np.zeros((len(peptidoforms), len(ELEMENTS)), dtype=np.int64)
-    comp, _, chain = _batched(peptidoforms, vocab, monoisotopic=True, for_mass=False, labelled=labelled, heavy=heavy)
+    substituted = np.zeros_like(heavy) if labelled else None
+    comp, _, chain = _batched(peptidoforms, vocab, monoisotopic=True, for_mass=False, labelled=labelled, heavy=heavy,
+                              substituted=substituted)  # fmt: skip
     fixed = heavy
     if labelled:
-        assert chain is not None
+        assert chain is not None and substituted is not None
         for i, pf in enumerate(peptidoforms):
-            for label in pf.global_isotopes:
-                e = ELEMENTS.index(parse_isotope_label(label)[1])
-                fixed[i, e] += chain[i, e]
+            for e in {ELEMENTS.index(parse_isotope_label(label)[1]) for label in pf.global_isotopes}:
+                # The chain's atoms of e, of which a substitution's are in ``heavy`` already.
+                fixed[i, e] += chain[i, e] - substituted[i, e]
     return torch.from_numpy(np.maximum(comp - fixed, 0).astype(np.int32))
 
 
