@@ -50,7 +50,7 @@ from constellation.massspec.sweep.claims import Claims, claims_table, find_claim
 from constellation.massspec.sweep.evidence import Evidence, EvidenceGate, count_evidence, decide
 from constellation.massspec.sweep.kernel import match_group
 from constellation.massspec.sweep.queries import QueryPlan
-from constellation.massspec.sweep.reduce import Ledger, Matches, QueryBatch, Reducer, eligible_counts
+from constellation.massspec.sweep.reduce import Ledger, Matches, QueryBatch, Reducer, eligible_counts, gaps_from_windows
 from constellation.massspec.sweep.rules import AllWithin, MatchRule, Nearest
 from constellation.massspec.sweep.schemas import SWEEP_EVIDENCE_TABLE, SWEEP_POINT_CLAIM_TABLE
 from constellation.massspec.sweep.schedule import (
@@ -232,7 +232,8 @@ def _f64(col: pa.ChunkedArray) -> np.ndarray:
 
 
 #: Scan metadata the ledger carries beyond its own columns, when a bundle has them.
-_SCAN_CONTEXT = ("tic", "iit", "scan_window_lower", "scan_window_upper", "precursor_scan", "faims_cv", "peak_count")
+_SCAN_CONTEXT = ("tic", "iit", "scan_window_lower", "scan_window_upper", "precursor_scan", "faims_cv", "peak_count",
+                 "intensity_floor", "centroider", "scan_windows", "filter_string")
 
 
 def _refuse_several_voltages(where: str, cv: np.ndarray | None) -> None:
@@ -253,22 +254,6 @@ def _refuse_several_voltages(where: str, cv: np.ndarray | None) -> None:
         )
 
 
-def _refuse_multiplexed(bundle: Path, path: Path) -> None:
-    """A run with multiplexed isolation (MSX: several precursors isolated
-    for one scan) is refused: a scan's window is one isolation pair, so the
-    reader keeps its first reaction's, and the queries in its others would
-    never be matched there (review of 2026-11-09, A4)."""
-    if "filter_string" not in pq.read_schema(path).names:
-        return
-    filters = pq.read_table(path, columns=["filter_string"]).column("filter_string")
-    msx = pc.fill_null(pc.match_substring_regex(filters, r"(^|\s)msx(\s|$)"), False)
-    if pc.any(msx).as_py():
-        raise ValueError(
-            f"{bundle} has {pc.sum(msx).as_py():,} multiplexed (MSX) scans, each isolating several precursors; "
-            f"the sweep holds one isolation window a scan, so they cannot be swept yet"
-        )
-
-
 def _scan_metadata(bundle: Path, window: tuple[int, int] | None = None) -> Ledger:
     """The bundle's scans as a ledger, with no points counted yet; a scan
     outside ``window`` (the half-open scan range a sweep reads) is marked
@@ -282,10 +267,24 @@ def _scan_metadata(bundle: Path, window: tuple[int, int] | None = None) -> Ledge
         return _f64(t.column(name).cast(pa.float64()).fill_null(np.nan)) if name in context else None
 
     cv = opt("faims_cv")
-    _refuse_several_voltages(str(bundle), cv)
-    _refuse_multiplexed(bundle, path)
+    from constellation.massspec.acquisition_structure import impute_injection_times, refuse_unsupported
+
+    # The one test the browser and the .dia export use too (review A13).
+    refuse_unsupported(t, f"{bundle} cannot be swept")
     scan = t.column("scan").to_numpy().astype(np.int64)
     level = t.column("level").to_numpy().astype(np.int8)
+    tic, iit = opt("tic"), opt("iit")
+    imputed = None
+    if iit is not None and tic is not None:
+        iit, imputed = impute_injection_times(level, iit, tic)
+    floor = opt("intensity_floor")
+    centroider, vocabulary = None, ()
+    if "centroider" in context:
+        made = t.column("centroider")
+        vocabulary = tuple(sorted(v for v in pc.unique(made).to_pylist() if v is not None))
+        code = {v: i for i, v in enumerate(vocabulary)}
+        centroider = np.array([code.get(v, -1) if v is not None else -1 for v in made.to_pylist()], np.int16)
+    gaps = gaps_from_windows(t.column("scan_windows").to_pylist()) if "scan_windows" in context else (None, None, None)
     ledger = Ledger(
         scan=scan,
         level=level,
@@ -293,14 +292,21 @@ def _scan_metadata(bundle: Path, window: tuple[int, int] | None = None) -> Ledge
         lower=_f64(t.column("isolation_lower")),
         upper=_f64(t.column("isolation_upper")),
         n_points=np.zeros(n, dtype=np.int64),
-        tic=opt("tic"),
-        iit=opt("iit"),
+        tic=tic,
+        iit=iit,
         scan_lower=opt("scan_window_lower"),
         scan_upper=opt("scan_window_upper"),
         parent=_parent_rows(scan, level, opt("precursor_scan"), cv),
         peak_count=(t.column("peak_count").cast(pa.int64()).fill_null(-1).to_numpy().astype(np.int64)
                     if "peak_count" in context else None),
         read=None if window is None else (scan >= window[0]) & (scan < window[1]),
+        iit_imputed=imputed,
+        floor=floor,
+        centroider=centroider,
+        centroiders=vocabulary,
+        gap_offsets=gaps[0],
+        gap_lower=gaps[1],
+        gap_upper=gaps[2],
     )
     return ledger
 
@@ -350,8 +356,20 @@ def _bundle_blocks(
             )
         counts = np.diff(b.offsets)
         meta.n_points[at] = counts
+        _fill_floors(meta, at, b.offsets, b.columns["intensity"])
         yield _make_block(meta, at, b.scan, b.offsets, b.columns["mz"], b.columns["intensity"],
                           ragged_arange(np.zeros(b.n_scans, np.int64), counts), axis, levels)  # fmt: skip
+
+
+def _fill_floors(meta: Ledger, at: np.ndarray, offsets: np.ndarray, intensity: np.ndarray) -> None:
+    """Each whole scan's lowest intensity, for scans whose bundle recorded
+    none (``Ledger.fill_floor``)."""
+    counts = np.diff(offsets)
+    has = counts > 0
+    if not has.any() or not (meta.floor_source[at[has]] == 0).any():
+        return
+    lowest = np.minimum.reduceat(np.asarray(intensity, np.float64), offsets[:-1][has])
+    meta.fill_floor(at[has], lowest)
 
 
 def _make_block(meta: Ledger, at: np.ndarray, scan: np.ndarray, offsets: np.ndarray, mz: np.ndarray,
@@ -423,6 +441,8 @@ def _table_blocks(table: pa.Table, block_rows: int, levels: Sequence[int]) -> tu
         n_points=np.diff(offsets),
         parent=parent,
     )
+    if starts.size:
+        ledger.fill_floor(np.arange(starts.size), np.minimum.reduceat(_f64(t.column("intensity")), starts))
     mz = _f64(t.column("mz"))
     intensity = _f64(t.column("intensity"))
     point_index = ragged_arange(np.zeros(starts.size, np.int64), np.diff(offsets))
@@ -1204,7 +1224,20 @@ def _read_ledger(path: Path) -> Ledger:
         scan_upper=_f64(t.column("scan_window_upper").fill_null(np.nan)),
         peak_count=t.column("peak_count").fill_null(-1).to_numpy().astype(np.int64),
         read=t.column("read").to_numpy(zero_copy_only=False).astype(bool),
+        iit_imputed=t.column("iit_imputed").to_numpy(zero_copy_only=False).astype(bool),
+        floor=_f64(t.column("intensity_floor").fill_null(np.nan)),
+        floor_source=t.column("floor_source").to_numpy().astype(np.int8),
     )
+    made = t.column("centroider")
+    vocabulary = tuple(sorted(v for v in pc.unique(made).to_pylist() if v is not None))
+    codes = np.full(t.num_rows, -1, np.int16)
+    if vocabulary:
+        index = {v: i for i, v in enumerate(vocabulary)}
+        codes = np.array([index.get(v, -1) if v is not None else -1 for v in made.to_pylist()], np.int16)
+    gaps = gaps_from_windows(t.column("scan_windows").to_pylist())
+    for name, value in (("centroider", codes), ("centroiders", vocabulary), ("gap_offsets", gaps[0]),
+                        ("gap_lower", gaps[1]), ("gap_upper", gaps[2])):  # fmt: skip
+        object.__setattr__(ledger, name, value)
     parent = t.column("parent_scan").fill_null(-1).to_numpy().astype(np.int64)
     rows = ledger.scan_rows(parent)
     object.__setattr__(ledger, "parent", np.where(parent >= 0, rows, -1).astype(np.int64))
@@ -1338,11 +1371,14 @@ def _map_stream(
         _write(pa.table({"query": pa.array(at.astype(np.int32)), "n": pa.array(shared[at])}),
                w / "shared" / _shard_name(index))  # fmt: skip
     seen = meta.n_points > 0
+    found = seen & (meta.floor_source == 2)
     _write(
         pa.table(
             {
                 "scan": pa.array(meta.scan[seen].astype(np.int32)),
                 "n_points": pa.array(meta.n_points[seen].astype(np.int32)),
+                # A floor the map found, where the bundle records none.
+                "floor": pa.array(meta.floor[seen], mask=~found[seen]),
             }
         ),
         w / "scans" / _shard_name(index),
@@ -1629,9 +1665,11 @@ def _on_disk_stages(executor, bundle, plan, settings, reducers, work: Path, prog
         _map_stream(work, 0, plan, meta, blocks, settings, pending=held)
     for f in sorted((work / "scans").glob("shard-*.parquet")):
         t = pq.read_table(f)
-        ledger.n_points[ledger.rows_of(t.column("scan").to_numpy().astype(np.int64))] = t.column(
-            "n_points"
-        ).to_numpy()
+        rows = ledger.rows_of(t.column("scan").to_numpy().astype(np.int64))
+        ledger.n_points[rows] = t.column("n_points").to_numpy()
+        found = pc.is_valid(t.column("floor")).to_numpy(zero_copy_only=False)
+        if found.any():
+            ledger.fill_floor(rows[found], t.column("floor").to_numpy(zero_copy_only=False)[found])
     _write(ledger.table(), work / "scans.parquet")
     counts = np.zeros(plan.n_queries, dtype=np.int64)
     for f in sorted((work / "matches").glob("shard-*.parquet")):

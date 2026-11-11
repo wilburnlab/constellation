@@ -335,7 +335,11 @@ def _read_fragment_level(layout: PrecursorMajor, plan: QueryPlan, ledger: Ledger
     scan = t.column("scan").to_numpy().astype(np.int64)
     starts = np.flatnonzero(np.r_[True, scan[1:] != scan[:-1]])
     point = np.arange(scan.size, dtype=np.int64) - np.repeat(starts, np.diff(np.r_[starts, scan.size]))
-    return scan, t.column("mz").to_numpy(), t.column("intensity").to_numpy(), point
+    intensity = t.column("intensity").to_numpy()
+    # A fragment scan is read whole: its lowest point is its floor, where
+    # the bundle records none (MS1 is read in m/z slices, so has none here).
+    ledger.fill_floor(ledger.rows_of(scan[starts]), np.minimum.reduceat(intensity.astype(np.float64), starts))
+    return scan, t.column("mz").to_numpy(), intensity, point
 
 
 def _ms1_intervals(plan: QueryPlan, settings, axis) -> np.ndarray:

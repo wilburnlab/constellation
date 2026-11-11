@@ -810,7 +810,14 @@ def test_the_ledger_carries_each_scans_tic_and_injection_time(tmp_path):
     by_scan = {s["scan"]: s for s in scans}
     assert ledger.tic.tolist() == [by_scan[int(x)]["tic"] for x in ledger.scan]
     want = [by_scan[int(x)]["iit"] for x in ledger.scan]
-    assert [None if np.isnan(v) else v for v in ledger.iit.tolist()] == want
+    # A recorded time is kept; one not recorded is estimated from the TIC
+    # and flagged (impute_injection_times, review 2026-11-10 S4).
+    # A level that records none (MS1 here) has nothing to estimate from.
+    kept = [None if (np.isnan(v) or imputed) else v for v, imputed in zip(ledger.iit.tolist(), ledger.iit_imputed)]
+    assert kept == want
+    recorded_ms2 = np.array([w is None for w in want]) & (ledger.level == 2)
+    assert (ledger.iit_imputed == recorded_ms2).all() and recorded_ms2.any()
+    assert np.isfinite(ledger.iit[ledger.level == 2]).all() and np.isnan(ledger.iit[ledger.level == 1]).all()
     assert ledger.table().column("tic").to_pylist() == ledger.tic.tolist()
     table_run = sweep(open_peaks(bundle).to_table(), plan, SweepSettings(tolerances={1: (20.0, "ppm")}))
     assert np.isnan(table_run.scans.tic).all()  # a table of points records none

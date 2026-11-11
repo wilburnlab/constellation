@@ -102,7 +102,10 @@ register_schema("MSPeakTable", MS_PEAK_TABLE)
 # v4: spectrum_type / centroider (additive); peak_count is the number of
 #   peaks the bundle holds for the scan (v3 Thermo bundles held the
 #   instrument's packet count there); agc_ps_mode is signed.
-SCAN_METADATA_SCHEMA_VERSION: int = 4
+# v5 (2026-11-11, additive): intensity_floor (the scan's lowest stored
+#   intensity) and scan_windows (every range of a scan acquired over
+#   several).
+SCAN_METADATA_SCHEMA_VERSION: int = 5
 
 
 # Mirrors Cartographer's SCAN_METADATA_SCHEMA v5 column-for-column with
@@ -121,6 +124,11 @@ SCAN_METADATA_TABLE: pa.Schema = pa.schema(
         pa.field("base_peak_mz", pa.float64(), nullable=True),
         pa.field("base_peak_intensity", pa.float64(), nullable=True),
         pa.field("peak_count", pa.uint32(), nullable=True),
+        # The lowest intensity among the scan's stored peaks: below it, a
+        # peak list keeps nothing, so a channel with no peak there was at
+        # most this (what makes it depends on `centroider`). Null for a scan
+        # with no peaks and in bundles written before v5.
+        pa.field("intensity_floor", pa.float64(), nullable=True),
         # How the scan's peaks were made. `spectrum_type` is what the
         # peaks are: `centroid` or `profile` points. `centroider` names
         # what centroided them: `instrument` (acquired as centroids, or
@@ -150,6 +158,15 @@ SCAN_METADATA_TABLE: pa.Schema = pa.schema(
         # inside filter_string. Null in bundles written before v3.
         pa.field("scan_window_lower", pa.float64(), nullable=True),
         pa.field("scan_window_upper", pa.float64(), nullable=True),
+        # A scan acquired over several ranges (a filter string such as
+        # `[200.0-700.0, 800.0-1500.0]`): each of them, the columns above
+        # being their envelope. Null for a scan of one range, and in bundles
+        # written before v5 (which recorded none for such a scan).
+        pa.field(
+            "scan_windows",
+            pa.list_(pa.struct([pa.field("lower", pa.float64()), pa.field("upper", pa.float64())])),
+            nullable=True,
+        ),
         pa.field("precursor_scan", pa.float64(), nullable=True),
         pa.field("precursor_mz", pa.float64(), nullable=True),
         pa.field("precursor_charge", pa.int8(), nullable=True),

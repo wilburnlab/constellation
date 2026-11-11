@@ -49,6 +49,9 @@ import pyarrow as pa
 from constellation.core.io.readers import RawReader, ReadResult, register_reader
 from constellation.massspec.io.encyclopedia._codec import decode_f4, decode_f8
 
+#: The ``.dia`` formats this reader reads (module docstring).
+SUPPORTED_VERSIONS = frozenset({"0.5.0", "0.8.0"})
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Arrow schemas — one shape for both format generations.
@@ -172,6 +175,15 @@ class DiaFile:
         self.metadata: dict[str, Any] = dict(
             self._con.execute("SELECT Key, Value FROM metadata")
         )
+        version = self.metadata.get("version")
+        if version is not None and str(version) not in SUPPORTED_VERSIONS:
+            # 0.3.0 / 0.4.0 failed deep inside a read with a raw sqlite
+            # error (review A14).
+            self._con.close()
+            raise ValueError(
+                f"{self.path} is a .dia of format {version}; this reader reads "
+                f"{', '.join(sorted(SUPPORTED_VERSIONS))} (EncyclopeDIA 2.12.30 and 6.x)"
+            )
         self.fractions: tuple[tuple[int, str], ...] = (
             tuple(
                 (int(f), str(n))

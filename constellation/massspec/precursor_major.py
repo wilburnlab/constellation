@@ -143,7 +143,14 @@ class PrecursorMajorWriter:
             scan = peaks.column("scan").to_numpy()
             if self._last_scan is not None and scan[0] == self._last_scan:
                 other = scan != self._last_scan
-                k = int(np.argmax(other)) if other.any() else scan.size
+                if not other.any():
+                    # The whole batch is the scan held last, which may go on
+                    # past it: hold it and write out where the scan ends.
+                    # Until 2026-11-11 the flush came here, splitting a scan
+                    # spanning three batches (review A8).
+                    self._hold(peaks)
+                    return
+                k = int(np.argmax(other))
                 self._hold(peaks.slice(0, k))
                 peaks = peaks.slice(k)
             self._flush(final=False)

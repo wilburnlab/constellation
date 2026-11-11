@@ -283,12 +283,12 @@ def _load_bundle(path: Path) -> _Bundle:
         raise ValueError(
             f"{path} has MS levels {sorted(levels)}; a .dia holds MS1 and MS2 only"
         )
-    cvs = [v for v in pc.unique(scans.column("faims_cv")).to_pylist() if v is not None]
-    if len(cvs) > 1:
-        raise ValueError(
-            f"{path} is a multi-CV FAIMS run ({sorted(cvs)} V); a .dia has no "
-            f"compensation-voltage dimension. Split it by CV first."
-        )
+    # Multi-CV FAIMS (a .dia has no compensation-voltage dimension) and
+    # multiplexed isolation (a .dia scan has one window; MSX passed until
+    # 2026-11-11, review A13), by the one test the sweep uses.
+    from constellation.massspec.acquisition_structure import refuse_unsupported
+
+    refuse_unsupported(scans, f"{path} cannot be written as a .dia")
     return _Bundle(
         path=path,
         source_path=source_path,

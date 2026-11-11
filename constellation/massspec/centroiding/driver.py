@@ -35,6 +35,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from constellation.core import stages
+from constellation.core.io.schemas import cast_to_schema
 from constellation.massspec.bundle import (
     BUNDLE_SCHEMA_VERSION,
     MANIFEST_FILENAME,
@@ -48,6 +49,7 @@ from constellation.massspec.bundle import (
 )
 from constellation.massspec.centroiding.apex import pick_apex
 from constellation.massspec.precursor_major import PRECURSOR_MAJOR_DIR, build_precursor_major
+from constellation.massspec.schemas import SCAN_METADATA_TABLE
 
 SCAN_METADATA_FILENAME = "scan_metadata.parquet"
 ACQUISITION_METADATA_FILENAME = "acquisition_metadata.parquet"
@@ -115,8 +117,9 @@ def _make_part(
     chosen: np.ndarray | None,
     rt_bin_width_s: float,
 ) -> pa.Table:
-    """One part of the list; returns ``scan``, ``peak_count``, ``spectrum_type``
-    and ``centroider`` for the scans it held."""
+    """One part of the list; returns ``scan``, ``peak_count``,
+    ``intensity_floor``, ``spectrum_type`` and ``centroider`` for the scans
+    it held."""
     pick = ALGORITHMS[algorithm].pick
     final = Path(target)
     tmp = final.with_name(f".{final.name}.tmp")
@@ -129,6 +132,7 @@ def _make_part(
 
     out_scan: list[int] = []
     out_count: list[int] = []
+    out_floor: list[float | None] = []
     out_type: list[str] = []
     out_made: list[str | None] = []
 
@@ -170,6 +174,7 @@ def _make_part(
                 kind = "centroid"
             out_scan.append(number)
             out_count.append(int(peaks[0].size))
+            out_floor.append(float(np.min(peaks[1])) if peaks[1].size else None)
             out_type.append(kind)
             out_made.append(made)
             pending_numbers.append(number)
@@ -202,6 +207,7 @@ def _make_part(
         {
             "scan": pa.array(out_scan, pa.int32()),
             "peak_count": pa.array(out_count, pa.uint32()),
+            "intensity_floor": pa.array(out_floor, pa.float64()),
             "spectrum_type": pa.array(out_type, pa.string()),
             "centroider": pa.array(out_made, pa.string()),
         }
@@ -282,10 +288,14 @@ def centroid_bundle(
         if made is not None and made.num_rows:
             order = {int(n): i for i, n in enumerate(made.column("scan").to_pylist())}
             rows = [order.get(int(n)) for n in scan_table.column("scan").to_pylist()]
-            for column in ("peak_count", "spectrum_type", "centroider"):
+            if "intensity_floor" not in table.column_names:  # a source written before v5
+                table = cast_to_schema(table, SCAN_METADATA_TABLE)
+            for column in ("peak_count", "intensity_floor", "spectrum_type", "centroider"):
                 values = made.column(column).take(pa.array(rows, pa.int64()))
                 if column == "peak_count":
                     values = values.fill_null(0)
+                elif column == "intensity_floor":
+                    pass  # a scan with no peaks has no floor
                 else:
                     # A scan with no rows in the source has no points either way.
                     values = pc.coalesce(

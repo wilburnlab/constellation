@@ -43,7 +43,32 @@ from constellation.massspec.sweep.schemas import (
 if TYPE_CHECKING:
     from constellation.massspec.sweep.engine import SweepSettings
 
-__all__ = ["Cells", "Ledger", "Matches", "QueryBatch", "Reducer", "QuerySummaryReducer"]
+__all__ = ["Cells", "Ledger", "Matches", "QueryBatch", "Reducer", "QuerySummaryReducer",
+           "FLOOR_NONE", "FLOOR_RECORDED", "FLOOR_MAP", "gaps_from_windows"]
+
+#: Where a scan's floor came from (``Ledger.floor_source``).
+FLOOR_NONE, FLOOR_RECORDED, FLOOR_MAP = 0, 1, 2
+
+
+def gaps_from_windows(windows: list) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
+    """``Ledger`` gaps (offsets, lower, upper) from each scan's list of
+    ``(lower, upper)`` ranges (None, or a list of one, for a scan of one
+    range): None offsets when no scan has several."""
+    if not any(w is not None and len(w) > 1 for w in windows):
+        return None, np.empty(0), np.empty(0)
+    offsets = [0]
+    lower: list[float] = []
+    upper: list[float] = []
+    for w in windows:
+        if w is not None and len(w) > 1:
+            ranges = sorted((float(r["lower"] if isinstance(r, dict) else r[0]),
+                             float(r["upper"] if isinstance(r, dict) else r[1])) for r in w)  # fmt: skip
+            for (_, hi), (lo, _) in zip(ranges[:-1], ranges[1:]):
+                if lo > hi:
+                    lower.append(hi)
+                    upper.append(lo)
+        offsets.append(len(lower))
+    return np.asarray(offsets, np.int64), np.asarray(lower, np.float64), np.asarray(upper, np.float64)
 
 
 @dataclass(frozen=True)
@@ -75,6 +100,25 @@ class Ledger:
     #: zeros on its queries' axes; one not read is no slot (review V3).
     peak_count: np.ndarray | None = None
     read: np.ndarray | None = None
+    #: Which injection times were estimated, not recorded
+    #: (``acquisition_structure.impute_injection_times``).
+    iit_imputed: np.ndarray | None = None
+    #: Each scan's lowest stored intensity (NaN unknown), and where it came
+    #: from: :data:`FLOOR_NONE`, :data:`FLOOR_RECORDED` (scan metadata's
+    #: ``intensity_floor``) or :data:`FLOOR_MAP` (found by the map in the
+    #: points it read whole).
+    floor: np.ndarray | None = None
+    floor_source: np.ndarray | None = None
+    #: What made each scan's peaks, as a code into ``centroiders`` (-1 not
+    #: recorded): scan metadata's ``centroider``.
+    centroider: np.ndarray | None = None
+    centroiders: tuple[str, ...] = ()
+    #: The gaps of scans acquired over several ranges, ragged: scan ``i``'s
+    #: gaps are ``gap_lower/upper[gap_offsets[i]:gap_offsets[i + 1]]``, open
+    #: intervals between its ranges (None when no scan has several).
+    gap_offsets: np.ndarray | None = None
+    gap_lower: np.ndarray | None = None
+    gap_upper: np.ndarray | None = None
     #: Built on first use: each level's WindowIndex (eligibility is
     #: decided on it at every call, so it is built once, not regrouped).
     _cache: dict = field(default_factory=dict, compare=False, repr=False)
@@ -89,6 +133,50 @@ class Ledger:
             object.__setattr__(self, "peak_count", np.full(self.scan.size, -1, np.int64))
         if self.read is None:
             object.__setattr__(self, "read", np.ones(self.scan.size, bool))
+        if self.iit_imputed is None:
+            object.__setattr__(self, "iit_imputed", np.zeros(self.scan.size, bool))
+        if self.floor is None:
+            object.__setattr__(self, "floor", np.full(self.scan.size, np.nan))
+        if self.floor_source is None:
+            source = np.where(np.isnan(self.floor), FLOOR_NONE, FLOOR_RECORDED).astype(np.int8)
+            object.__setattr__(self, "floor_source", source)
+        if self.centroider is None:
+            object.__setattr__(self, "centroider", np.full(self.scan.size, -1, np.int16))
+
+    @property
+    def range_known(self) -> np.ndarray:
+        """Whether each scan records the m/z range it acquired (one that
+        does not counts as having acquired every m/z)."""
+        return ~(np.isnan(self.scan_lower) | np.isnan(self.scan_upper))
+
+    def fill_floor(self, rows: np.ndarray, floor: np.ndarray) -> None:
+        """Floors the map found (``FLOOR_MAP``) for scans with none recorded."""
+        rows = np.asarray(rows, np.int64)
+        todo = self.floor_source[rows] == FLOOR_NONE
+        self.floor[rows[todo]] = np.asarray(floor, np.float64)[todo]
+        self.floor_source[rows[todo]] = FLOOR_MAP
+
+    def in_gap(self, rows: np.ndarray, mz: np.ndarray) -> np.ndarray:
+        """Whether each m/z falls between two of its scan's (``rows``)
+        acquired ranges: never measured, though inside the envelope."""
+        rows = np.asarray(rows, np.int64)
+        mz = np.asarray(mz, np.float64)
+        out = np.zeros(mz.shape, bool)
+        if self.gap_offsets is None or mz.size == 0:
+            return out
+        flat_rows = np.broadcast_to(rows, mz.shape).reshape(-1)
+        flat_mz = mz.reshape(-1)
+        count = self.gap_offsets[flat_rows + 1] - self.gap_offsets[flat_rows]
+        has = np.flatnonzero(count > 0)
+        if has.size == 0:
+            return out
+        n = count[has]
+        element = np.repeat(has, n)
+        gap = np.repeat(self.gap_offsets[flat_rows[has]], n) + ragged_arange(np.zeros(has.size, np.int64), n)
+        inside = (flat_mz[element] > self.gap_lower[gap]) & (flat_mz[element] < self.gap_upper[gap])
+        hit = np.zeros(flat_mz.size, bool)
+        np.logical_or.at(hit, element[inside], True)
+        return hit.reshape(mz.shape)
 
     @property
     def present(self) -> np.ndarray:
@@ -168,16 +256,44 @@ class Ledger:
                 "parent_scan": pa.array(parent.astype(np.int32), mask=parent < 0),
                 "peak_count": pa.array(self.peak_count.astype(np.int64), mask=self.peak_count < 0),
                 "read": pa.array(self.read.astype(bool)),
+                "iit_imputed": pa.array(self.iit_imputed.astype(bool)),
+                "intensity_floor": pa.array(self.floor, mask=np.isnan(self.floor)),
+                "floor_source": pa.array(self.floor_source.astype(np.int8)),
+                "centroider": pa.array(
+                    [self.centroiders[c] if c >= 0 else None for c in self.centroider.tolist()], pa.string()
+                ),
+                "scan_windows": self._windows_column(),
             },
             schema=SWEEP_SCAN_TABLE,
         )
 
+    def _windows_column(self) -> pa.Array:
+        """Each scan's ranges when it has several (null otherwise), from its
+        envelope and gaps."""
+        windows_type = SWEEP_SCAN_TABLE.field("scan_windows").type
+        if self.gap_offsets is None:
+            return pa.nulls(self.n, windows_type)
+        out = []
+        for i in range(self.n):
+            a, b = int(self.gap_offsets[i]), int(self.gap_offsets[i + 1])
+            if a == b:
+                out.append(None)
+                continue
+            edges = [self.scan_lower[i], *np.ravel(np.stack([self.gap_lower[a:b], self.gap_upper[a:b]], 1)),
+                     self.scan_upper[i]]  # fmt: skip
+            out.append([{"lower": float(lo), "upper": float(hi)} for lo, hi in zip(edges[0::2], edges[1::2])])
+        return pa.array(out, windows_type)
+
     def acquired(self, rows: np.ndarray, mz: np.ndarray) -> np.ndarray:
         """Whether each m/z lies inside its scan's (ledger ``rows``)
-        acquired range, inclusive; a scan with no recorded range counts as
-        having acquired everything."""
+        acquired range, inclusive, and not between two of its ranges; a
+        scan with no recorded range counts as having acquired everything
+        (:attr:`range_known` says which do)."""
         lo, hi = self.scan_lower[rows], self.scan_upper[rows]
-        return ~((mz < lo) | (mz > hi))
+        inside = ~((mz < lo) | (mz > hi))
+        if self.gap_offsets is not None:
+            inside &= ~self.in_gap(rows, mz)
+        return inside
 
 
 _MATCH_FIELDS = ("query", "level", "scan", "channel", "point_index", "mz", "intensity", "n_points")

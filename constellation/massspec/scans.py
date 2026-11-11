@@ -30,6 +30,7 @@ Retention times are seconds throughout, as in the bundle.
 from __future__ import annotations
 
 import logging
+import warnings
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,7 @@ from constellation.massspec.acquisition_structure import (
     AcquisitionType,
     infer_acquisition_structure,
     parent_scans,
+    unsupported,
 )
 from constellation.massspec.bundle import (
     BUNDLE_KINDS,
@@ -218,19 +220,28 @@ def scan_table(
     for name in wanted:
         if name not in available:
             table = table.append_column(name, pa.nulls(table.num_rows, pa.float64()))
-    if levels is not None:
-        table = table.filter(pc.is_in(table.column("level"), pa.array(list(levels), pa.int8())))
     table = table.sort_by("scan")
 
     level = table.column("level").to_numpy(zero_copy_only=False).astype(np.int64)
     window = _window_ids(table, level)
+    # Derived over every level, then filtered: filtering first left an MS2
+    # scan of ``levels=[2]`` no MS1 scan to be the parent of (review A12).
     parent = _parent_scans(table, level)
+    reasons = unsupported(pq.read_table(path, columns=[c for c in ("faims_cv", "filter_string") if c in available]))
+    if reasons:
+        # The browser shows such a run, but no parent can be trusted in it
+        # (the sweep and the .dia export refuse it; review A13).
+        warnings.warn(f"{Path(bundle_dir).name}: " + "; and ".join(reasons) + ": parent scans are not given",
+                      stacklevel=2)  # fmt: skip
+        parent = pa.nulls(table.num_rows, pa.int32())
     keep = [c for c in dict.fromkeys(columns) if c in table.column_names]
     for required in ("scan", "level", "rt"):
         if required not in keep:
             keep.insert(0, required)
-    out = table.select(keep)
-    return out.append_column("window", window).append_column("parent_scan", parent)
+    out = table.select(keep).append_column("window", window).append_column("parent_scan", parent)
+    if levels is not None:
+        out = out.filter(pc.is_in(out.column("level"), pa.array(list(levels), pa.int8())))
+    return out
 
 
 def _window_ids(table: pa.Table, level: np.ndarray) -> pa.Array:

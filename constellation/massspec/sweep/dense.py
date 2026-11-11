@@ -103,6 +103,15 @@ class Dense:
     iit: torch.Tensor
     window: torch.Tensor  # the slot's isolation window (the ledger's window index), -1 padding
     parent_row: torch.Tensor  # the ledger row of the slot's parent scan, -1 none
+    #: [Q, S]: whether the slot's injection time was estimated from its TIC
+    #: (``Ledger.iit_imputed``); its scan's lowest stored intensity (NaN
+    #: unknown; ``Ledger.floor``), and what made its peaks, a code into
+    #: ``centroiders`` (-1 not recorded); and whether the scan records the
+    #: m/z range it acquired (where not, every channel counts as acquired).
+    iit_imputed: torch.Tensor
+    floor: torch.Tensor
+    centroider: torch.Tensor
+    range_known: torch.Tensor
     #: [Q, S, C] int32: the matched point's position in its scan's stored
     #: order (``Matches.point_index``), -1 where nothing matched or a rule
     #: aggregated several points (``sum``). Two channels holding one point,
@@ -125,6 +134,8 @@ class Dense:
     #: Whether each ledger row can be a slot (``Ledger.present``: to tell an
     #: unread parent scan).
     _ledger_present: np.ndarray | None = field(default=None, repr=False, compare=False)
+    #: The names ``centroider`` codes index.
+    centroiders: tuple[str, ...] = ()
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -360,6 +371,12 @@ def dense_view(batch: QueryBatch, level: int, *, queries: np.ndarray | None = No
     np.logical_not(acquired, out=acquired)
     acquired &= valid[:, :, None]
     acquired &= c_valid[:, None, :]
+    if scans.gap_offsets is not None:
+        # A scan of several ranges did not acquire between them.
+        gapped = valid & (np.diff(scans.gap_offsets)[at] > 0)
+        qi, si = np.nonzero(gapped)
+        if qi.size:
+            acquired[qi, si] &= ~scans.in_gap(row[qi, si][:, None], mz[qi])
     acquired |= matched
 
     def t(a: np.ndarray, dtype_: torch.dtype | None = None) -> torch.Tensor:
@@ -382,6 +399,10 @@ def dense_view(batch: QueryBatch, level: int, *, queries: np.ndarray | None = No
         iit=t(per_slot(scans.iit, np.nan, np.float64)),
         window=t(per_slot(window_of_row, -1, np.int64)),
         parent_row=t(parent),
+        iit_imputed=t(per_slot(scans.iit_imputed, False, bool)),
+        floor=t(per_slot(scans.floor, np.nan, np.float64)),
+        centroider=t(per_slot(scans.centroider.astype(np.int64), -1, np.int64)),
+        range_known=t(per_slot(scans.range_known, False, bool)),
         point_index=t(point),
         channel_valid=t(c_valid),
         mz=t(mz),
@@ -389,6 +410,7 @@ def dense_view(batch: QueryBatch, level: int, *, queries: np.ndarray | None = No
         **{name: t(per_channel(getattr(channels, name), pad, np.int64)) for name, pad in _CHANNEL_COLUMNS.items()},
         overlap_group=t(_overlap_groups(mz, c_valid, batch.settings.tolerance(level))),
         _ledger_present=scans.present,
+        centroiders=scans.centroiders,
     )
 
 
