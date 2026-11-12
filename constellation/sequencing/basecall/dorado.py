@@ -222,6 +222,58 @@ class RunHandle:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Resuming an interrupted basecall
+# ──────────────────────────────────────────────────────────────────────
+
+
+def partial_path(output: Path) -> Path:
+    """Where an interrupted run's reads are kept while it is resumed."""
+    output = Path(output)
+    return output.with_name(output.name + ".partial")
+
+
+def clear_partial(output: Path) -> None:
+    """Delete ``<output>.partial`` after a run that resumed from it exits 0.
+
+    Dorado writes every read of the resume file into the new output, so a
+    finished output holds all of the partial's reads and the partial is
+    only a second copy (often hundreds of GB).
+    """
+    partial_path(output).unlink(missing_ok=True)
+
+
+def _non_empty(path: Path) -> bool:
+    return path.exists() and path.stat().st_size > 0
+
+
+def _resume_source(output: Path, partial: Path) -> Path | None:
+    """Put the file to resume from at ``partial`` and return it, or None.
+
+    Dorado's ``--resume-from`` writes every read of the resume file into
+    the new output before it basecalls anything (``process_resume_file``
+    → ``copy_completed_reads`` in its ``basecaller.cpp``), and calls every
+    read the resume file lacks. So when both files exist (an earlier
+    resume was itself interrupted), the larger one holds the most finished
+    reads: a smaller output is an unfinished copy of the partial, and a
+    larger one finished the copy and went on to new reads. Choosing wrong
+    costs basecalling time, never reads.
+
+    The partial used to be overwritten with whatever the output held, so
+    a resume killed while still copying replaced days of reads with a few
+    bytes; and a partial with no output beside it was ignored and the run
+    started again from zero.
+    """
+    if _non_empty(output) and (
+        not _non_empty(partial) or output.stat().st_size > partial.stat().st_size
+    ):
+        output.replace(partial)
+        return partial
+    if _non_empty(partial):
+        return partial
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────────────
 
@@ -296,12 +348,31 @@ class DoradoRunner:
         Output is BAM (Dorado's default, written to stdout → ``output``).
         ``modified_bases`` defaults to the model's declared mods. When
         ``emit_moves`` is set, the ``mv`` tag is written (move-table-aware
-        ``dorado polish`` models need it). ``resume`` restarts a partial
-        run via ``--resume-from`` (the partial output is moved aside
-        first). Dorado reads POD5 directly — we do not decode POD5
-        ourselves.
+        ``dorado polish`` models need it). Dorado reads POD5 directly — we
+        do not decode POD5 ourselves.
+
+        ``resume`` continues an interrupted run with ``--resume-from``
+        from ``<output>.partial`` (see :func:`_resume_source` for which
+        file that is). Without ``resume``, a non-empty ``<output>.partial``
+        raises ``FileExistsError`` rather than being silently left behind
+        by a fresh run. Callers delete the partial with
+        :func:`clear_partial` once the run exits 0.
         """
         output = Path(output)
+        # Resolve before touching any file: a missing or too-old Dorado
+        # used to raise only after the output had been moved to the
+        # partial, and the next --resume then found no output and started
+        # from zero.
+        resolve_dorado()
+        partial = partial_path(output)
+        resume_from: Path | None = None
+        if resume:
+            resume_from = _resume_source(output, partial)
+        elif _non_empty(partial):
+            raise FileExistsError(
+                f"{partial} holds the reads of an interrupted run; pass "
+                f"--resume to continue it, or remove it to start over"
+            )
         dev = device if device is not None else self.device
         argv: list[str] = ["basecaller"]
         if dev:
@@ -309,10 +380,8 @@ class DoradoRunner:
         mods = tuple(modified_bases) if modified_bases else tuple(model.mods)
         if emit_moves:
             argv += ["--emit-moves"]
-        if resume and output.exists() and output.stat().st_size > 0:
-            partial = output.with_name(output.name + ".partial")
-            output.replace(partial)
-            argv += ["--resume-from", str(partial)]
+        if resume_from is not None:
+            argv += ["--resume-from", str(resume_from)]
         argv += [*self.extra_args, model.model_name(), *(str(p) for p in pod5_paths)]
         # `--modified-bases` takes a space-separated list and reads every
         # token up to the next option, so placed before the positionals it
@@ -444,4 +513,6 @@ __all__ = [
     "RunHandle",
     "RunStatus",
     "DoradoProgressEvent",
+    "partial_path",
+    "clear_partial",
 ]

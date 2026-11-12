@@ -4871,7 +4871,9 @@ def _build_basecall_parser(subs) -> None:
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--detach", action="store_true", help="Fork dorado + write a PID file, return immediately")
     p.add_argument("--follow", action="store_true", help="Attach to a detached run in --output-dir and stream progress")
-    p.add_argument("--resume", action="store_true")
+    p.add_argument("--resume", action="store_true",
+                   help="Continue an interrupted run: Dorado's --resume-from on the "
+                        "output's reads, kept as <output>.partial until the run succeeds")
     p.add_argument("--progress", action="store_true")
     p.add_argument("--dorado-extra", default=None, help="shlex-split extra args appended to dorado")
     p.set_defaults(func=_cmd_basecall)
@@ -5003,7 +5005,12 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
     import sys
     from pathlib import Path
 
-    from constellation.sequencing.basecall.dorado import DoradoRunner, RunHandle
+    from constellation.sequencing.basecall.dorado import (
+        DoradoRunner,
+        RunHandle,
+        clear_partial,
+    )
+    from constellation.sequencing.basecall.dorado_run import DoradoVersionError
     from constellation.sequencing.basecall.models import DoradoModel
 
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -5028,6 +5035,10 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
             print(event.raw, file=sys.stderr)
         rc = handle.wait()
         print(f"basecall {'completed' if rc == 0 else 'failed'} (rc={rc})", file=sys.stderr)
+        if rc == 0:
+            # The finished output holds every read of a partial it resumed
+            # from; the partial is only a second copy now.
+            clear_partial(handle.output_path)
         return 0 if rc == 0 else 1
 
     if not args.pod5 or not args.model:
@@ -5065,19 +5076,25 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
                 emit_moves=args.emit_moves,
                 resume=args.resume, detach=args.detach,
             )
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, FileExistsError, DoradoVersionError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     if args.detach:
         print(f"detached: pid={handle.pid}  pid_file={handle.pid_file}", file=sys.stderr)
-        print(f"follow with: constellation basecall --follow --output-dir {output_dir}", file=sys.stderr)
+        # --follow looks for the PID file beside the output, so name the
+        # output when it is not the default one under --output-dir.
+        follow = f"constellation basecall --follow --output-dir {output_dir}"
+        if args.output:
+            follow += f" --output {output}"
+        print(f"follow with: {follow}", file=sys.stderr)
         return 0
     if args.progress:
         for event in handle.tail_progress():
             print(event.raw, file=sys.stderr)
     rc = handle.wait()
     if rc == 0:
+        clear_partial(output)
         print(f"basecalled → {output}", file=sys.stderr)
         return 0
     print(f"dorado basecaller failed (rc={rc}); see {handle.stderr_log}", file=sys.stderr)

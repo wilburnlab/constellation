@@ -134,6 +134,98 @@ def test_basecaller_resume_moves_partial(tmp_path: Path, mock_dorado):
     assert (tmp_path / "calls.bam.partial").exists()
 
 
+def test_resume_that_dies_while_copying_keeps_the_partial(
+    tmp_path: Path, mock_dorado, monkeypatch
+):
+    # A resume killed while Dorado was still copying the partial's reads
+    # left a few bytes in the output; the next resume moved those bytes
+    # over the partial and days of reads were gone.
+    model = DoradoModel.parse("sup@v5.0.0")
+    out = tmp_path / "calls.bam"
+    partial = tmp_path / "calls.bam.partial"
+    out.write_bytes(b"R" * 19_000)  # the first run, killed
+    runner = DoradoRunner(device="cpu")
+
+    monkeypatch.setenv("MOCK_FAIL_ON", "--resume-from")
+    monkeypatch.setenv("MOCK_PARTIAL_BYTES", "3")
+    assert runner.basecaller(model, [tmp_path / "r.pod5"], out, resume=True).wait() == 1
+    assert partial.read_bytes() == b"R" * 19_000
+    assert out.stat().st_size == 3
+
+    monkeypatch.delenv("MOCK_FAIL_ON")
+    assert runner.basecaller(model, [tmp_path / "r.pod5"], out, resume=True).wait() == 0
+    _, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert options["--resume-from"] == [str(partial)]
+    assert partial.read_bytes() == b"R" * 19_000
+    # the stub writes the resume file's reads first, as Dorado does
+    assert out.read_bytes() == b"R" * 19_000 + b"MOCKBAM"
+
+
+def test_resume_takes_an_output_larger_than_the_partial(tmp_path: Path, mock_dorado):
+    # An interrupted resume that had finished copying and gone on to new
+    # reads holds more than the partial it started from.
+    model = DoradoModel.parse("sup@v5.0.0")
+    out = tmp_path / "calls.bam"
+    partial = tmp_path / "calls.bam.partial"
+    partial.write_bytes(b"P" * 100)
+    out.write_bytes(b"P" * 100 + b"N" * 400)
+    DoradoRunner(device="cpu").basecaller(
+        model, [tmp_path / "r.pod5"], out, resume=True
+    ).wait()
+    assert partial.read_bytes() == b"P" * 100 + b"N" * 400
+    assert out.read_bytes().startswith(b"P" * 100 + b"N" * 400)
+
+
+@pytest.mark.parametrize("output_state", ["missing", "empty"])
+def test_resume_from_a_partial_with_no_output(
+    tmp_path: Path, mock_dorado, output_state: str
+):
+    # A partial with no output beside it was ignored, and the run started
+    # again from zero.
+    model = DoradoModel.parse("sup@v5.0.0")
+    out = tmp_path / "calls.bam"
+    partial = tmp_path / "calls.bam.partial"
+    partial.write_bytes(b"P" * 50)
+    if output_state == "empty":
+        out.write_bytes(b"")
+    DoradoRunner(device="cpu").basecaller(
+        model, [tmp_path / "r.pod5"], out, resume=True
+    ).wait()
+    _, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert options["--resume-from"] == [str(partial)]
+    assert out.read_bytes() == b"P" * 50 + b"MOCKBAM"
+
+
+def test_unusable_dorado_leaves_the_output_where_it_was(tmp_path: Path, monkeypatch):
+    # The output used to be moved to the partial before Dorado was
+    # resolved; a too-old (or missing) Dorado then left nothing at the
+    # output, and the next --resume started from zero.
+    from constellation.sequencing.basecall.dorado_run import DoradoVersionError
+
+    install(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOCK_DORADO_VERSION", "1.4.0")
+    out = tmp_path / "calls.bam"
+    out.write_bytes(b"R" * 19_000)
+    with pytest.raises(DoradoVersionError):
+        DoradoRunner(device="cpu").basecaller(
+            DoradoModel.parse("sup@v5.0.0"), [tmp_path / "r.pod5"], out, resume=True
+        )
+    assert out.read_bytes() == b"R" * 19_000
+    assert not (tmp_path / "calls.bam.partial").exists()
+
+
+def test_fresh_run_refuses_to_orphan_a_partial(tmp_path: Path, mock_dorado):
+    partial = tmp_path / "calls.bam.partial"
+    partial.write_bytes(b"P" * 50)
+    with pytest.raises(FileExistsError, match="--resume"):
+        DoradoRunner(device="cpu").basecaller(
+            DoradoModel.parse("sup@v5.0.0"), [tmp_path / "r.pod5"],
+            tmp_path / "calls.bam", resume=False,
+        )
+    assert mock_dorado.calls() == []
+    assert partial.read_bytes() == b"P" * 50
+
+
 def test_resolve_dorado_rejects_pre_2_0(tmp_path: Path, monkeypatch):
     # A dorado that reports a pre-2.0.0 version must be refused — the
     # pipeline carries no backwards compatibility for older Dorado.

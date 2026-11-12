@@ -178,3 +178,46 @@ def test_cli_basecall_modified_bases_without_emit_moves(tmp_path: Path, mocks, m
         "dna_r10.4.1_e8.2_400bps_sup@v5.0.0", str(tmp_path / "r.pod5"),
     ]
     assert options["--modified-bases"] == ["5mCG_5hmCG"]
+
+
+def test_cli_basecall_resume_clears_the_partial_once_done(tmp_path: Path, mocks, monkeypatch):
+    stub = install(tmp_path, monkeypatch)
+    out_dir = tmp_path / "bc"
+    out_dir.mkdir()
+    (out_dir / "calls.bam").write_bytes(b"R" * 100)  # an interrupted run
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup@v5.0.0",
+        "--output-dir", str(out_dir), "--device", "cpu", "--resume",
+    ])
+    assert rc == 0
+    _, _, options = parse_dorado_argv(stub.argv())
+    assert options["--resume-from"] == [str(out_dir / "calls.bam.partial")]
+    assert (out_dir / "calls.bam").read_bytes() == b"R" * 100 + b"MOCKBAM"
+    assert not (out_dir / "calls.bam.partial").exists()
+
+
+def test_cli_basecall_too_old_dorado_is_an_error_not_a_traceback(
+    tmp_path: Path, mocks, monkeypatch, capsys
+):
+    install(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOCK_DORADO_VERSION", "1.4.0")
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup@v5.0.0",
+        "--output-dir", str(tmp_path / "bc"), "--device", "cpu",
+    ])
+    assert rc == 1
+    assert "too old" in capsys.readouterr().err
+
+
+def test_cli_basecall_without_resume_refuses_a_partial(tmp_path: Path, mocks, monkeypatch, capsys):
+    stub = install(tmp_path, monkeypatch)
+    out_dir = tmp_path / "bc"
+    out_dir.mkdir()
+    (out_dir / "calls.bam.partial").write_bytes(b"P" * 100)
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup@v5.0.0",
+        "--output-dir", str(out_dir), "--device", "cpu",
+    ])
+    assert rc == 1
+    assert "--resume" in capsys.readouterr().err
+    assert stub.calls() == []
