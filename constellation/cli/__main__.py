@@ -4873,7 +4873,9 @@ def _build_basecall_parser(subs) -> None:
                    help="Comma list of Dorado modification codes, e.g. 5mCG_5hmCG or "
                         "6mA,5mC_5hmC (Dorado checks them against the model); or name "
                         "them in a --model variant, not both")
-    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--device", default=None,
+                   help="Dorado device, e.g. cuda:0, cuda:all, cpu or metal "
+                        "(default: Dorado's own auto, its GPUs, else the CPU)")
     p.add_argument("--duplex", action="store_true")
     p.add_argument("--emit-moves", action=argparse.BooleanOptionalAction, default=True,
                    help="Emit the `mv` move-table tag (required for move-aware `dorado polish`; on by default)")
@@ -4916,7 +4918,9 @@ def _build_genome_parser(subs) -> None:
                      help="Comma list of Dorado modification codes, e.g. 5mCG_5hmCG or "
                         "6mA,5mC_5hmC (Dorado checks them against the model); or name "
                         "them in a --model variant, not both")
-    pa_.add_argument("--device", default="cuda:0")
+    pa_.add_argument("--device", default=None,
+                     help="Dorado device, e.g. cuda:0, cuda:all, cpu or metal "
+                          "(default: Dorado's own auto, its GPUs, else the CPU)")
     pa_.add_argument("--duplex", action="store_true")
     pa_.add_argument("--emit-moves", action=argparse.BooleanOptionalAction, default=True,
                      help="Emit the `mv` move-table tag during inline basecalling "
@@ -4977,7 +4981,9 @@ def _build_genome_parser(subs) -> None:
     pp.add_argument("--polish-rounds", type=int, default=1)
     pp.add_argument("--output-dir", required=True)
     pp.add_argument("--threads", type=int, default=8)
-    pp.add_argument("--device", default="cuda:0")
+    pp.add_argument("--device", default=None,
+                    help="Dorado device, e.g. cuda:0, cuda:all, cpu or metal "
+                         "(default: Dorado's own auto, its GPUs, else the CPU)")
     pp.add_argument("--dorado-polish-extra", default=None)
     pp.add_argument("--busco-lineage", default=None)
     pp.add_argument("--no-report", action="store_true")

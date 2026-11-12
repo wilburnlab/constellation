@@ -285,11 +285,13 @@ class DoradoRunner:
     Resolved at call time via ``constellation.thirdparty.find('dorado')``;
     raises ``FileNotFoundError`` if Dorado isn't installed. Each
     subcommand method returns a :class:`RunHandle`; callers choose block /
-    follow / detach. Default ``device='cuda:0'`` matches the lab's typical
-    GPU configuration; CPU-only hosts pass ``device='cpu'``.
+    follow / detach. ``device=None`` (the default) passes no ``--device``,
+    so Dorado's own ``auto`` applies: the GPUs it finds, else the CPU. A
+    fixed ``cuda:0`` default had held a multi-day basecall to one GPU of a
+    multi-GPU node, and failed outright on a Mac.
     """
 
-    device: str = "cuda:0"
+    device: str | None = None
     threads: int = 8
     extra_args: tuple[str, ...] = ()
 

@@ -36,7 +36,7 @@ class PolishRunner:
 
     rounds: int = 1
     threads: int = 8
-    device: str = "cuda:0"
+    device: str | None = None  # None: Dorado's own `auto` (all GPUs, else CPU)
     dorado_polish_extra: tuple[str, ...] = field(default_factory=tuple)
 
     def run(

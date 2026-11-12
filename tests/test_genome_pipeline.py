@@ -348,6 +348,19 @@ def test_pod5_without_resume_refuses_to_orphan_a_partial(tmp_path: Path, pod5_mo
 # ── review findings on #92 ─────────────────────────────────────────────
 
 
+def test_pod5_without_a_device_records_dorados_auto(tmp_path: Path, pod5_mocks) -> None:
+    stub, (fc0, _fc1, _fc2) = pod5_mocks
+    out = tmp_path / "asm"
+    run_assembly_pipeline(
+        output_dir=out, pod5=[fc0], basecall_model="sup", threads=1, emit_report=False
+    )
+    _, _, options = parse_dorado_argv(stub.argv())
+    assert "--device" not in options
+    m = read_manifest_dir(out)
+    assert m.device == "auto"
+    assert m.parameters["device"] == "auto"
+
+
 def test_pod5_model_goes_to_dorado_as_written(tmp_path: Path, pod5_mocks) -> None:
     """``--model sup@v5.0.0`` is Dorado's own variant syntax.
 

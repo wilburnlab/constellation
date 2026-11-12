@@ -254,3 +254,14 @@ def test_cli_basecall_modifications_twice_is_a_usage_error(tmp_path: Path, mocks
     ])
     assert rc == 2
     assert "one place" in capsys.readouterr().err
+
+
+def test_cli_basecall_leaves_the_device_to_dorado(tmp_path: Path, mocks, monkeypatch):
+    stub = install(tmp_path, monkeypatch)
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup",
+        "--output-dir", str(tmp_path / "bc"),
+    ])
+    assert rc == 0
+    _, _, options = parse_dorado_argv(stub.argv())
+    assert "--device" not in options

@@ -249,7 +249,7 @@ def run_assembly_pipeline(
     # silently ignored them — unlike top-level `basecall`, which wires
     # them into DoradoRunner.
     dorado_extra: tuple[str, ...] = (),
-    device: str = "cuda:0",
+    device: str | None = None,
     duplex: bool = False,
     emit_moves: bool = True,
     read_group: str = DEFAULT_UNIFIED_RG,
@@ -569,7 +569,7 @@ def run_assembly_pipeline(
             "threads": threads,
             "hifiasm_mode": hifiasm_mode,
             "reads_compression": reads_compression,
-            "device": device if input_mode == "pod5" else None,
+            "device": (device or "auto") if input_mode == "pod5" else None,
             "duplex": duplex,
             "emit_moves": emit_moves if input_mode == "pod5" else None,
         },
@@ -577,7 +577,8 @@ def run_assembly_pipeline(
         outputs=outputs,
         basecall_model=basecall_model,
         modified_bases=list(modified_bases) or None,
-        device=device if input_mode == "pod5" else None,
+        # "auto": no --device was passed, so Dorado chose (all GPUs, else CPU).
+        device=(device or "auto") if input_mode == "pod5" else None,
         basecaller_model_ds=model_ds,
         scaffold_reference_handle=scaffold_reference_handle,
         scaffold_reference_path=scaffold_reference_path,

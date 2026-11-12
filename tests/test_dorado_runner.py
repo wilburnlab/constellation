@@ -331,3 +331,32 @@ def test_doctor_and_resolver_share_one_floor():
 
     spec = next(s for s in registered() if s.name == "dorado")
     assert spec.min_version == DORADO_MIN_VERSION == "2.1.2"
+
+
+# ── the device is Dorado's to choose ──────────────────────────────────
+
+
+@pytest.mark.parametrize("verb", ["basecaller", "duplex", "polish"])
+def test_no_device_given_leaves_it_to_dorado(tmp_path: Path, mock_dorado, verb: str):
+    # A fixed cuda:0 default held a multi-day basecall to one GPU of a
+    # multi-GPU node; with no --device Dorado's own `auto` uses them all.
+    runner = DoradoRunner()
+    out = tmp_path / "out"
+    if verb == "polish":
+        runner.polish(tmp_path / "aligned.bam", tmp_path / "draft.fa", out).wait()
+    else:
+        getattr(runner, verb)(
+            DoradoModel.parse("sup"), [tmp_path / "r.pod5"], out
+        ).wait()
+    seen, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert seen == verb
+    assert "--device" not in options
+
+
+def test_a_device_given_is_passed(tmp_path: Path, mock_dorado):
+    DoradoRunner().basecaller(
+        DoradoModel.parse("sup"), [tmp_path / "r.pod5"], tmp_path / "out",
+        device="cuda:all",
+    ).wait()
+    _, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert options["--device"] == ["cuda:all"]
