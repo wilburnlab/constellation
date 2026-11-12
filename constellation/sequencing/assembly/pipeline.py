@@ -286,6 +286,14 @@ def run_assembly_pipeline(
 
     if bool(reads) == bool(pod5):
         raise ValueError("provide exactly one of `reads` (BAM/SAM) or `pod5`")
+    if pod5 and duplex and polish_rounds > 0:
+        # Refused up front: dorado polish has not taken duplex data since
+        # Dorado 1.0.1, and this used to fail only at the polish stage,
+        # after days of basecalling and the assembly.
+        raise ValueError(
+            "dorado polish does not support duplex reads (Dorado >= 1.0.1); "
+            "basecall simplex to polish, or drop --polish-rounds"
+        )
 
     stage_stats: dict[str, pa.Table] = {}
     stages: dict[str, dict] = {}

@@ -265,3 +265,39 @@ def test_cli_basecall_leaves_the_device_to_dorado(tmp_path: Path, mocks, monkeyp
     assert rc == 0
     _, _, options = parse_dorado_argv(stub.argv())
     assert "--device" not in options
+
+
+def test_cli_assemble_duplex_with_polish_is_refused_before_basecalling(
+    tmp_path: Path, mocks, monkeypatch, capsys
+):
+    # dorado polish takes no duplex reads; this used to fail only at the
+    # polish stage, after days of basecalling and the assembly.
+    stub = install(tmp_path, monkeypatch)
+    rc = main([
+        "genome", "assemble", "--pod5", str(tmp_path / "fc1.pod5"), "--model", "sup",
+        "--duplex", "--polish-rounds", "1", "--output-dir", str(tmp_path / "out"),
+        "--threads", "1", "--no-report",
+    ])
+    assert rc == 1
+    assert "duplex" in capsys.readouterr().err
+    assert stub.calls() == []
+
+
+def test_cli_genome_polish_failure_is_an_error_not_a_traceback(
+    tmp_path: Path, mocks, monkeypatch, capsys
+):
+    b1 = tmp_path / "fc1.bam"
+    _bam(b1, "RGA")
+    out = tmp_path / "out"
+    assert main([
+        "genome", "assemble", "--reads", str(b1), "--output-dir", str(out),
+        "--threads", "1", "--no-report",
+    ]) == 0
+    install(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOCK_FAIL_ON", "draft.fasta")  # dorado dies in round 1
+    rc = main([
+        "genome", "polish", "--assembly-dir", str(out), "--reads", str(b1),
+        "--output-dir", str(tmp_path / "polished"), "--no-report",
+    ])
+    assert rc == 1
+    assert "refusing" in capsys.readouterr().err

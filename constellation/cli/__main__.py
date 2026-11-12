@@ -4977,7 +4977,8 @@ def _build_genome_parser(subs) -> None:
     pp = gsubs.add_parser("polish", help="Dorado-polish an existing assemble output dir")
     pp.add_argument("--assembly-dir", required=True)
     pp.add_argument("--reads", nargs="+", default=None,
-                    help="Harmonized reads BAM (default: harmonized_bam from the manifest)")
+                    help="Harmonized reads BAM, or several Dorado BAMs to harmonize "
+                         "here (default: harmonized_bam from the manifest)")
     pp.add_argument("--polish-rounds", type=int, default=1)
     pp.add_argument("--output-dir", required=True)
     pp.add_argument("--threads", type=int, default=8)
@@ -4985,6 +4986,10 @@ def _build_genome_parser(subs) -> None:
                     help="Dorado device, e.g. cuda:0, cuda:all, cpu or metal "
                          "(default: Dorado's own auto, its GPUs, else the CPU)")
     pp.add_argument("--dorado-polish-extra", default=None)
+    pp.add_argument("--allow-multi-model", action="store_true",
+                    help="With several --reads, skip the single-basecaller-model "
+                         "guard; the merged reads then name no model, so pass one "
+                         "to dorado polish (--dorado-polish-extra '--model-override M')")
     pp.add_argument("--busco-lineage", default=None)
     pp.add_argument("--no-report", action="store_true")
     pp.add_argument("--progress", action="store_true")
@@ -5375,13 +5380,14 @@ def _cmd_genome_polish(args: argparse.Namespace) -> int:
         polished = PolishRunner(
             rounds=args.polish_rounds, threads=args.threads, device=args.device,
             dorado_polish_extra=_shlex_tuple(args.dorado_polish_extra),
+            allow_multi_model=args.allow_multi_model,
         ).run(
             working,
             reads,
             output_dir / "polish",
             progress_cb=_stage_progress_cb(args),
         )
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if args.busco_lineage:
