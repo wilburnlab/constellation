@@ -21,15 +21,15 @@ import shlex
 import subprocess
 from pathlib import Path
 
+from constellation.thirdparty.dorado import MINIMUM_VERSION
 from constellation.thirdparty.registry import ToolNotFoundError, find, version_ge
 
 
-# Constellation's genome pipeline targets Dorado 2.0.0+ exclusively: the
-# `dorado polish` secondary-analysis CLI and the 26.01 output spec the
-# pipeline is built against landed in the 1.x→2.0 line, and we deliberately
-# carry NO compatibility shims for older Dorado — an older binary is refused
-# rather than allowed to silently produce wrong results.
-DORADO_MIN_VERSION = "2.0.0"
+# The floor is declared once, on the ToolSpec, so `constellation doctor`
+# and this resolver agree (see thirdparty.dorado for why it is 2.1.2). We
+# deliberately carry NO compatibility shims for older Dorado — an older
+# binary is refused rather than allowed to produce different results.
+DORADO_MIN_VERSION = MINIMUM_VERSION
 
 
 class DoradoVersionError(RuntimeError):
@@ -47,8 +47,8 @@ def resolve_dorado() -> Path:
     """Resolve the dorado binary, enforcing ``DORADO_MIN_VERSION``.
 
     Raises ``FileNotFoundError`` if dorado isn't installed, or
-    ``DoradoVersionError`` if the resolved binary is older than 2.0.0
-    (when its version can be probed).
+    ``DoradoVersionError`` if the resolved binary is older than
+    ``DORADO_MIN_VERSION`` (when its version can be probed).
     """
     try:
         handle = find("dorado")

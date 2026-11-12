@@ -226,29 +226,31 @@ def test_fresh_run_refuses_to_orphan_a_partial(tmp_path: Path, mock_dorado):
     assert partial.read_bytes() == b"P" * 50
 
 
-def test_resolve_dorado_rejects_pre_2_0(tmp_path: Path, monkeypatch):
-    # A dorado that reports a pre-2.0.0 version must be refused — the
-    # pipeline carries no backwards compatibility for older Dorado.
+@pytest.mark.parametrize("version", ["1.4.0", "2.0.0", "2.1.1"])
+def test_resolve_dorado_rejects_below_the_floor(tmp_path: Path, monkeypatch, version: str):
+    # Below 2.1.2 the SUP v5+ and HAC v6 models do not give the same reads
+    # twice, so an older Dorado is refused rather than run.
     from constellation.sequencing.basecall.dorado_run import (
         DoradoVersionError,
         resolve_dorado,
     )
 
-    home = tmp_path / "old_dorado"
-    (home / "bin").mkdir(parents=True)
-    stub = home / "bin" / "dorado"
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
-        'case "${1:-}" in --version) echo "dorado 1.4.0+old"; exit 0 ;; *) exit 0 ;; esac\n'
-    )
-    stub.chmod(0o755)
-    monkeypatch.setenv("CONSTELLATION_DORADO_HOME", str(home))
+    install(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOCK_DORADO_VERSION", version)
     with pytest.raises(DoradoVersionError, match="too old"):
         resolve_dorado()
 
 
-def test_resolve_dorado_accepts_2_0(tmp_path: Path, mock_dorado):
-    # The mock reports 2.0.0+mock → resolves without raising.
+def test_resolve_dorado_accepts_the_floor(tmp_path: Path, mock_dorado):
+    # The mock reports 2.1.2+mock → resolves without raising.
     from constellation.sequencing.basecall.dorado_run import resolve_dorado
 
     assert resolve_dorado().name == "dorado"
+
+
+def test_doctor_and_resolver_share_one_floor():
+    from constellation.sequencing.basecall.dorado_run import DORADO_MIN_VERSION
+    from constellation.thirdparty.registry import registered
+
+    spec = next(s for s in registered() if s.name == "dorado")
+    assert spec.min_version == DORADO_MIN_VERSION == "2.1.2"

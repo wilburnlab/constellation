@@ -474,7 +474,8 @@ class DoradoRunner:
     ) -> RunHandle:
         """Run ``dorado polish <aligned_bam> <draft_fasta>`` → consensus FASTA.
 
-        Validated against dorado 2.0.0: positional order is
+        Validated against dorado 2.0.0 (no polish flag changed through
+        2.1.2, per its changelog): positional order is
         ``in_aln_bam in_draft_fastx``, consensus goes to stdout when no
         ``-o`` is given, and ``-x/--device`` selects the compute device.
         ``aligned_bam`` must be reads aligned to ``draft_fasta`` with

@@ -29,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_VERSION = "2.0.0"
+DEFAULT_VERSION = "2.1.2"
 
 STUB = r"""#!/usr/bin/env bash
 verb="${1:-}"
