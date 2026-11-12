@@ -9,7 +9,9 @@ a run asked Dorado for and what happens to its files when Dorado dies:
 - ``$MOCK_BAM_SRC``: a file to write as the basecalled output (a real BAM
   when a later stage reads its header), instead of ``MOCKBAM``;
 - ``$MOCK_FAIL_ON``: when any argv token contains it, write
-  ``$MOCK_PARTIAL_BYTES`` bytes and exit 1, as a run killed part-way would;
+  ``$MOCK_PARTIAL_BYTES`` bytes (or the file ``$MOCK_PARTIAL_SRC``, when a
+  later run must read it as a BAM) and exit 1, as a run killed part-way
+  would;
 - ``$MOCK_DORADO_VERSION``: what ``dorado --version`` reports.
 
 ``--resume-from FILE`` is honoured the way Dorado honours it: the resume
@@ -39,7 +41,8 @@ if [[ -n "${MOCK_CALLS_FILE:-}" ]]; then printf '%s\n' "$*" >> "${MOCK_CALLS_FIL
 if [[ -n "${MOCK_FAIL_ON:-}" ]]; then
   for a in "$@"; do
     if [[ "$a" == *"${MOCK_FAIL_ON}"* ]]; then
-      head -c "${MOCK_PARTIAL_BYTES:-0}" /dev/zero | tr '\0' 'P'
+      if [[ -n "${MOCK_PARTIAL_SRC:-}" ]]; then cat "${MOCK_PARTIAL_SRC}";
+      else head -c "${MOCK_PARTIAL_BYTES:-0}" /dev/zero | tr '\0' 'P'; fi
       echo "[error] mock failure" >&2
       exit 1
     fi

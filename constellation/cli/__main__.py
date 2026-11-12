@@ -5186,7 +5186,7 @@ def _cmd_genome_assemble(args: argparse.Namespace) -> int:
             emit_report=not args.no_report,
             progress_cb=cb,
         )
-    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+    except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"assembly complete → {output_dir}", file=sys.stderr)

@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from _dorado_stub import install, parse_dorado_argv
+
 from constellation.sequencing.assembly.manifest import read_manifest_dir
 from constellation.sequencing.assembly.pipeline import run_assembly_pipeline
 
@@ -222,6 +224,125 @@ def test_pipeline_no_keep_intermediates_deletes_fastq(tmp_path: Path, mocks):
     )
     assert not (out / "reads" / "reads.fastq.gz").exists()  # cleaned up
     assert (out / "assembly" / "assembly").is_dir()  # but assembly survived
+
+
+# ── basecalling from POD5, flow cell by flow cell ────────────────────
+
+
+@pytest.fixture
+def pod5_mocks(tmp_path: Path, mocks, monkeypatch):
+    """The shared Dorado stub writing a real BAM, and three POD5 inputs."""
+    stub = install(tmp_path, monkeypatch)
+    called = tmp_path / "called.bam"
+    _write_bam(called, "RGX", "dna_r10.4.1_e8.2_400bps_sup@v5.0.0")
+    monkeypatch.setenv("MOCK_BAM_SRC", str(called))
+    monkeypatch.setenv("MOCK_PARTIAL_SRC", str(called))
+    sources = []
+    for name in ("fc0", "fc1", "fc2"):
+        source = tmp_path / f"{name}.pod5"
+        source.write_bytes(name.encode())
+        sources.append(source)
+    return stub, sources
+
+
+def _assemble_pod5(out: Path, pod5: list[Path], **kw) -> Path:
+    kw.setdefault("basecall_model", "sup@v5.0.0")
+    return run_assembly_pipeline(
+        output_dir=out, pod5=pod5, device="cpu", threads=1, emit_report=False, **kw
+    )
+
+
+def _basecalls(stub) -> list[str]:
+    return [c for c in stub.calls() if c.startswith("basecaller")]
+
+
+def test_pod5_resume_continues_only_the_interrupted_flow_cell(
+    tmp_path: Path, pod5_mocks, monkeypatch
+):
+    # The stage had one marker, written after the last flow cell and
+    # deleted before each; an interrupted run re-basecalled every flow
+    # cell from zero, and never resumed the one it was killed in.
+    stub, (fc0, fc1, _fc2) = pod5_mocks
+    out = tmp_path / "asm"
+    monkeypatch.setenv("MOCK_FAIL_ON", "fc1.pod5")
+    with pytest.raises(RuntimeError, match="fc1.pod5"):
+        _assemble_pod5(out, [fc0, fc1])
+    assert len(_basecalls(stub)) == 2
+
+    monkeypatch.delenv("MOCK_FAIL_ON")
+    _assemble_pod5(out, [fc0, fc1], resume=True)
+    calls = _basecalls(stub)
+    assert len(calls) == 3  # flow cell 0 was not basecalled again
+    _, positionals, options = parse_dorado_argv(stub.argv())
+    assert positionals[-1] == str(fc1)
+    bam = out / "basecall" / "flowcell_001.bam"
+    assert options["--resume-from"] == [f"{bam}.partial"]
+    assert not Path(f"{bam}.partial").exists()  # cleared once finished
+    assert (out / "basecall" / "flowcell_001.bam.done").exists()
+    assert (out / "assembly" / "assembly").is_dir()
+
+
+def test_pod5_added_flow_cell_is_the_only_one_basecalled(tmp_path: Path, pod5_mocks):
+    stub, (fc0, fc1, fc2) = pod5_mocks
+    out = tmp_path / "asm"
+    _assemble_pod5(out, [fc0, fc1])
+    assert len(_basecalls(stub)) == 2
+    _assemble_pod5(out, [fc0, fc1, fc2], resume=True)
+    calls = _basecalls(stub)
+    assert len(calls) == 3
+    assert calls[-1].endswith(str(fc2))
+
+
+def test_pod5_changed_model_basecalls_afresh(tmp_path: Path, pod5_mocks, monkeypatch):
+    stub, (fc0, fc1, _fc2) = pod5_mocks
+    out = tmp_path / "asm"
+    monkeypatch.setenv("MOCK_FAIL_ON", "fc1.pod5")
+    with pytest.raises(RuntimeError):
+        _assemble_pod5(out, [fc0, fc1])
+    monkeypatch.delenv("MOCK_FAIL_ON")
+    _assemble_pod5(out, [fc0, fc1], resume=True, basecall_model="hac@v5.0.0")
+    calls = _basecalls(stub)
+    assert len(calls) == 4  # both flow cells again
+    assert not any("--resume-from" in c for c in calls[2:])
+
+
+def test_pod5_basecall_from_before_the_markers_starts_afresh(tmp_path: Path, pod5_mocks):
+    # A directory written before per-flow-cell markers says nothing about
+    # which settings made its BAM, so it is not resumed from.
+    stub, (fc0, _fc1, _fc2) = pod5_mocks
+    out = tmp_path / "asm"
+    (out / "basecall").mkdir(parents=True)
+    (out / "basecall" / "flowcell_000.bam").write_bytes(b"from an older run")
+    _assemble_pod5(out, [fc0], resume=True)
+    calls = _basecalls(stub)
+    assert len(calls) == 1
+    assert "--resume-from" not in calls[0]
+    called = Path(tmp_path / "called.bam").read_bytes()
+    assert (out / "basecall" / "flowcell_000.bam").read_bytes() == called
+
+
+def test_pod5_finished_stage_from_before_the_markers_is_reused(
+    tmp_path: Path, pod5_mocks
+):
+    stub, (fc0, fc1, _fc2) = pod5_mocks
+    out = tmp_path / "asm"
+    _assemble_pod5(out, [fc0, fc1])
+    for marker in (out / "basecall").glob("*.done"):
+        marker.unlink()
+    _assemble_pod5(out, [fc0, fc1], resume=True)
+    assert len(_basecalls(stub)) == 2
+
+
+def test_pod5_without_resume_refuses_to_orphan_a_partial(tmp_path: Path, pod5_mocks):
+    stub, (fc0, _fc1, _fc2) = pod5_mocks
+    out = tmp_path / "asm"
+    partial = out / "basecall" / "flowcell_000.bam.partial"
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"P" * 100)
+    with pytest.raises(FileExistsError, match="--resume"):
+        _assemble_pod5(out, [fc0])
+    assert partial.read_bytes() == b"P" * 100
+    assert _basecalls(stub) == []
 
 
 # ── review findings on #92 ─────────────────────────────────────────────
