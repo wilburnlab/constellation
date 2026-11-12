@@ -336,6 +336,9 @@ def run_assembly_pipeline(
         input_mode = "pod5"
         input_files = [str(p) for p in pod5]
         model = DoradoModel.parse(basecall_model)
+        # Modifications named twice are refused here, before any flow
+        # cell's files are touched, not when the first one launches.
+        model.arguments(tuple(modified_bases))
         basecall_dir = output_dir / "basecall"
         bam_inputs: list[Path] = []
         runner = DoradoRunner(
@@ -396,7 +399,10 @@ def run_assembly_pipeline(
                     q.unlink()
             _emit(progress_cb, "stage_start", "basecall", str(source))
             if duplex:
-                handle = runner.duplex(model, [source], out_bam, device=device)
+                handle = runner.duplex(
+                    model, [source], out_bam,
+                    modified_bases=modified_bases, device=device,
+                )
             else:
                 handle = runner.basecaller(
                     model, [source], out_bam,

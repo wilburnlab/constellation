@@ -38,25 +38,29 @@ def test_basecaller_foreground(tmp_path: Path, mock_dorado):
     verb, positionals, options = parse_dorado_argv(mock_dorado.argv())
     assert verb == "basecaller"
     assert options["--device"] == ["cpu"]
-    assert positionals == [model.model_name(), str(tmp_path / "r.pod5")]
+    assert positionals == ["sup@v5.0.0", str(tmp_path / "r.pod5")]
 
 
-def test_basecaller_modified_bases_from_model(tmp_path: Path, mock_dorado):
+def test_basecaller_modified_bases_after_the_positionals(tmp_path: Path, mock_dorado):
     # `--modified-bases` reads a list up to the next option. Before the
     # positionals, with no `--emit-moves` after it (the library default),
     # it took the model and the POD5 path as modification codes and Dorado
     # was left with no model at all.
-    model = DoradoModel.parse("hac@v4.3+5mC,5hmC")
+    # (A full model name takes its modifications as --modified-bases; a
+    # variant takes them inside the model argument.)
+    model = DoradoModel.parse("dna_r10.4.1_e8.2_400bps_sup@v5.0.0")
     out = tmp_path / "calls.bam"
     pod5 = [tmp_path / "a.pod5", tmp_path / "b.pod5"]
-    DoradoRunner(device="cpu").basecaller(model, pod5, out).wait()
+    DoradoRunner(device="cpu").basecaller(
+        model, pod5, out, modified_bases=("6mA", "5mC_5hmC")
+    ).wait()
     _, positionals, options = parse_dorado_argv(mock_dorado.argv())
-    assert positionals == [model.model_name(), *(str(p) for p in pod5)]
-    assert options["--modified-bases"] == ["5mC", "5hmC"]
+    assert positionals == ["dna_r10.4.1_e8.2_400bps_sup@v5.0.0", *(str(p) for p in pod5)]
+    assert options["--modified-bases"] == ["6mA", "5mC_5hmC"]
 
 
 def test_basecaller_modified_bases_after_extra_args(tmp_path: Path, mock_dorado):
-    model = DoradoModel.parse("sup@v5.0.0")
+    model = DoradoModel.parse("dna_r10.4.1_e8.2_400bps_sup@v5.0.0")
     out = tmp_path / "calls.bam"
     DoradoRunner(
         device="cpu", extra_args=("--models-directory", str(tmp_path / "m"))
@@ -65,7 +69,7 @@ def test_basecaller_modified_bases_after_extra_args(tmp_path: Path, mock_dorado)
         modified_bases=("5mCG_5hmCG",), emit_moves=True,
     ).wait()
     _, positionals, options = parse_dorado_argv(mock_dorado.argv())
-    assert positionals == [model.model_name(), str(tmp_path / "r.pod5")]
+    assert positionals == ["dna_r10.4.1_e8.2_400bps_sup@v5.0.0", str(tmp_path / "r.pod5")]
     assert options["--modified-bases"] == ["5mCG_5hmCG"]
     assert "--emit-moves" in options
     assert options["--models-directory"] == [str(tmp_path / "m")]
@@ -116,10 +120,83 @@ def test_aligner_and_summary(tmp_path: Path, mock_dorado):
 
 
 def test_fetch_model_returns_dir(tmp_path: Path, mock_dorado):
-    model = DoradoModel.parse("sup@v5.0.0")
+    model = DoradoModel.parse("dna_r10.4.1_e8.2_400bps_sup@v5.0.0")
     models_dir = tmp_path / "models"
     resolved = DoradoRunner().fetch_model(model, models_dir=models_dir)
-    assert resolved == models_dir / model.model_name()
+    assert resolved == models_dir / "dna_r10.4.1_e8.2_400bps_sup@v5.0.0"
+    _, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert options["--model"] == ["dna_r10.4.1_e8.2_400bps_sup@v5.0.0"]
+
+
+def test_fetch_model_refuses_a_variant(tmp_path: Path, mock_dorado):
+    # A variant names no single model until Dorado reads a POD5's chemistry.
+    with pytest.raises(ValueError, match="full model name"):
+        DoradoRunner().fetch_model(DoradoModel.parse("sup@v5.0.0"), tmp_path / "m")
+    assert mock_dorado.calls() == []
+
+
+def test_fetch_model_returns_a_model_directory(tmp_path: Path, mock_dorado):
+    directory = tmp_path / "dna_r10.4.1_e8.2_400bps_sup@v5.0.0"
+    directory.mkdir()
+    model = DoradoModel.parse(str(directory))
+    assert DoradoRunner().fetch_model(model) == directory
+
+
+# ── Dorado's model argument, passed through ───────────────────────────
+
+
+@pytest.mark.parametrize(
+    "spec, mods, expected_model, expected_option",
+    [
+        # Dorado's own syntax goes through untouched: no chemistry written
+        # in, so RNA004 and 4 kHz data get the model their POD5 calls for.
+        ("sup", (), "sup", None),
+        ("hac@v4.3", (), "hac@v4.3", None),
+        ("sup@latest,5mCG_5hmCG@v1", (), "sup@latest,5mCG_5hmCG@v1", None),
+        # --modified-bases on a variant: inside the variant, as Dorado's
+        # docs write it.
+        ("hac@v5.0.0", ("5mCG_5hmCG",), "hac@v5.0.0,5mCG_5hmCG", None),
+        ("sup", ("6mA", "5mC_5hmC"), "sup,6mA,5mC_5hmC", None),
+        # ... on a full name: after the positionals.
+        ("dna_r10.4.1_e8.2_400bps_sup@v5.0.0", ("5mCG_5hmCG",), "dna_r10.4.1_e8.2_400bps_sup@v5.0.0", ["5mCG_5hmCG"]),
+    ],
+)
+def test_basecaller_passes_the_model_through(
+    tmp_path: Path, mock_dorado, spec, mods, expected_model, expected_option
+):
+    DoradoRunner().basecaller(
+        DoradoModel.parse(spec), [tmp_path / "r.pod5"], tmp_path / "calls.bam",
+        modified_bases=mods,
+    ).wait()
+    _, positionals, options = parse_dorado_argv(mock_dorado.argv())
+    assert positionals == [expected_model, str(tmp_path / "r.pod5")]
+    assert options.get("--modified-bases") == expected_option
+
+
+def test_modifications_named_twice_are_refused_before_dorado_runs(
+    tmp_path: Path, mock_dorado
+):
+    # Dorado refuses a variant's modifications beside --modified-bases.
+    out = tmp_path / "calls.bam"
+    out.write_bytes(b"R" * 100)
+    with pytest.raises(ValueError, match="one place"):
+        DoradoRunner().basecaller(
+            DoradoModel.parse("sup,5mCG_5hmCG"), [tmp_path / "r.pod5"], out,
+            modified_bases=("6mA",), resume=True,
+        )
+    assert mock_dorado.calls() == []
+    assert out.read_bytes() == b"R" * 100  # nothing moved
+
+
+def test_duplex_carries_modifications(tmp_path: Path, mock_dorado):
+    # duplex dropped modified_bases without a word.
+    DoradoRunner().duplex(
+        DoradoModel.parse("sup"), [tmp_path / "r.pod5"], tmp_path / "calls.bam",
+        modified_bases=("5mCG_5hmCG",),
+    ).wait()
+    verb, positionals, _ = parse_dorado_argv(mock_dorado.argv())
+    assert verb == "duplex"
+    assert positionals == ["sup,5mCG_5hmCG", str(tmp_path / "r.pod5")]
 
 
 def test_basecaller_resume_moves_partial(tmp_path: Path, mock_dorado):

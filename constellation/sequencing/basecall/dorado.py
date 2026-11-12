@@ -346,10 +346,11 @@ class DoradoRunner:
         """Run ``dorado basecaller`` on the given POD5 inputs → BAM.
 
         Output is BAM (Dorado's default, written to stdout → ``output``).
-        ``modified_bases`` defaults to the model's declared mods. When
-        ``emit_moves`` is set, the ``mv`` tag is written (move-table-aware
-        ``dorado polish`` models need it). Dorado reads POD5 directly — we
-        do not decode POD5 ourselves.
+        ``model`` goes to Dorado as written; ``modified_bases`` are added
+        to it as :meth:`DoradoModel.arguments` says. When ``emit_moves``
+        is set, the ``mv`` tag is written (move-table-aware ``dorado
+        polish`` models need it). Dorado reads POD5 directly — we do not
+        decode POD5 ourselves.
 
         ``resume`` continues an interrupted run with ``--resume-from``
         from ``<output>.partial`` (see :func:`_resume_source` for which
@@ -359,6 +360,7 @@ class DoradoRunner:
         :func:`clear_partial` once the run exits 0.
         """
         output = Path(output)
+        model_arg, trailing = model.arguments(tuple(modified_bases))
         # Resolve before touching any file: a missing or too-old Dorado
         # used to raise only after the output had been moved to the
         # partial, and the next --resume then found no output and started
@@ -377,18 +379,15 @@ class DoradoRunner:
         argv: list[str] = ["basecaller"]
         if dev:
             argv += ["--device", dev]
-        mods = tuple(modified_bases) if modified_bases else tuple(model.mods)
         if emit_moves:
             argv += ["--emit-moves"]
         if resume_from is not None:
             argv += ["--resume-from", str(resume_from)]
-        argv += [*self.extra_args, model.model_name(), *(str(p) for p in pod5_paths)]
-        # `--modified-bases` takes a space-separated list and reads every
-        # token up to the next option, so placed before the positionals it
-        # swallowed the model and the POD5 paths as modification codes.
-        # Last, as ONT's docs write it, it has nothing after it to take.
-        if mods:
-            argv += ["--modified-bases", *mods]
+        # `--modified-bases` (in `trailing`) reads every token up to the
+        # next option, so placed before the positionals it swallowed the
+        # model and the POD5 paths as modification codes. Last, as ONT's
+        # docs write it, it has nothing after it to take.
+        argv += [*self.extra_args, model_arg, *(str(p) for p in pod5_paths), *trailing]
         return self._launch(argv, output=output, stage="basecaller", detach=detach)
 
     def duplex(
@@ -397,16 +396,23 @@ class DoradoRunner:
         pod5_paths: list[Path],
         output: Path,
         *,
+        modified_bases: tuple[str, ...] = (),
         device: str | None = None,
         detach: bool = False,
     ) -> RunHandle:
         """Run ``dorado duplex`` (paired-strand basecalling for Q30+
-        consensus reads where complement strands are available)."""
+        consensus reads where complement strands are available).
+
+        Takes the same model forms and modifications as :meth:`basecaller`
+        (it used to drop ``modified_bases`` without a word). Dorado's
+        duplex has no ``--emit-moves`` and no resume path.
+        """
+        model_arg, trailing = model.arguments(tuple(modified_bases))
         dev = device if device is not None else self.device
         argv: list[str] = ["duplex"]
         if dev:
             argv += ["--device", dev]
-        argv += [*self.extra_args, model.model_name(), *(str(p) for p in pod5_paths)]
+        argv += [*self.extra_args, model_arg, *(str(p) for p in pod5_paths), *trailing]
         return self._launch(argv, output=Path(output), stage="duplex", detach=detach)
 
     def aligner(
@@ -498,15 +504,30 @@ class DoradoRunner:
     def fetch_model(
         self, model: DoradoModel, models_dir: Path | None = None
     ) -> Path:
-        """Run ``dorado download --model <name>`` and return the resolved
-        model directory."""
-        argv = ["download", "--model", model.model_name()]
+        """Run ``dorado download --model <name>`` and return the model's
+        directory.
+
+        Takes a full model name; a model directory is returned as it is. A
+        variant names no single model until Dorado has read a POD5's
+        chemistry, so it is refused here: name the model in full, or let
+        ``dorado basecaller`` fetch the variant (``--models-directory``
+        keeps what it fetches).
+        """
+        if model.kind == "path":
+            return Path(model.spec)
+        if model.kind == "variant":
+            raise ValueError(
+                f"{model.spec!r} is a model variant, which Dorado resolves "
+                "against a POD5's chemistry; give the full model name (e.g. "
+                "dna_r10.4.1_e8.2_400bps_sup@v5.2.0) to download it"
+            )
+        argv = ["download", "--model", model.spec]
         if models_dir is not None:
             Path(models_dir).mkdir(parents=True, exist_ok=True)
             argv += ["--models-directory", str(models_dir)]
         subprocess.run([str(resolve_dorado()), *argv], check=True)
         base = Path(models_dir) if models_dir is not None else Path.cwd()
-        return base / model.model_name()
+        return base / model.spec
 
 
 __all__ = [

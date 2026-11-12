@@ -6,10 +6,10 @@ Subcommand methods (``basecaller``, ``duplex``, ``aligner``, ``demux``,
 ``summary``) all return :class:`RunHandle` objects rather than blocking,
 so 3–4-day basecalls support detached execution / re-attach / resume.
 
-``DoradoModel`` is the typed abstraction over Dorado's model identifier
-strings (``"dna_r10.4.1_e8.2_sup@v5.0.0"``). Lab shorthand
-(``"sup@v5.0+5mC,5hmC"``) parses to the canonical form via
-:meth:`DoradoModel.parse`.
+``DoradoModel`` is Dorado's model argument, checked by
+:meth:`DoradoModel.parse` and passed through as written: a variant
+(``"sup"``, ``"hac@v5.0.0,5mCG_5hmCG"``), a full model name
+(``"dna_r10.4.1_e8.2_400bps_sup@v5.2.0"``) or a model directory.
 
 License: Dorado is distributed under the Oxford Nanopore Technologies
 PLC. Public License Version 1.0 — Research Purposes only.

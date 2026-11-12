@@ -348,19 +348,34 @@ def test_pod5_without_resume_refuses_to_orphan_a_partial(tmp_path: Path, pod5_mo
 # ── review findings on #92 ─────────────────────────────────────────────
 
 
-def test_default_shorthand_expands_to_a_canonical_model_name() -> None:
-    """R10.4.1 identifiers carry the translocation speed.
+def test_pod5_model_goes_to_dorado_as_written(tmp_path: Path, pod5_mocks) -> None:
+    """``--model sup@v5.0.0`` is Dorado's own variant syntax.
 
-    Without it the advertised `sup@v5.0.0` shorthand named a model that
-    does not exist; the same header form is what this package's own @RG
-    parser documents and tests against.
+    It used to be expanded to a full DNA R10.4.1 400 bps name, so Dorado
+    could not pick the model the POD5's chemistry calls for.
     """
-    from constellation.sequencing.basecall.models import DoradoModel
+    stub, (fc0, _fc1, _fc2) = pod5_mocks
+    _assemble_pod5(tmp_path / "asm", [fc0], modified_bases=("5mCG_5hmCG",))
+    _, positionals, options = parse_dorado_argv(stub.argv())
+    assert positionals == ["sup@v5.0.0,5mCG_5hmCG", str(fc0)]
+    assert "--modified-bases" not in options
 
-    assert (
-        DoradoModel.parse("sup@v5.0.0").model_name()
-        == "dna_r10.4.1_e8.2_400bps_sup@v5.0.0"
-    )
+
+def test_pod5_modifications_named_twice_refused_before_any_flow_cell(
+    tmp_path: Path, pod5_mocks
+) -> None:
+    stub, (fc0, _fc1, _fc2) = pod5_mocks
+    out = tmp_path / "asm"
+    (out / "basecall").mkdir(parents=True)
+    leftover = out / "basecall" / "flowcell_000.bam"
+    leftover.write_bytes(b"from another run")
+    with pytest.raises(ValueError, match="one place"):
+        _assemble_pod5(
+            out, [fc0], basecall_model="sup,6mA", modified_bases=("5mCG_5hmCG",),
+            resume=True,
+        )
+    assert leftover.read_bytes() == b"from another run"
+    assert stub.calls() == []
 
 
 def test_stage_key_tracks_parameters_and_chains() -> None:

@@ -166,9 +166,11 @@ def test_cli_basecall_modified_bases_without_emit_moves(tmp_path: Path, mocks, m
     # `--emit-moves` on (the default) the list happened to end at that
     # flag; `--no-emit-moves` removed it, and the model and POD5 path were
     # read as modification codes.
+    # (A full model name, which takes its modifications as the option.)
     stub = install(tmp_path, monkeypatch)
     rc = main([
-        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup@v5.0.0",
+        "basecall", "--pod5", str(tmp_path / "r.pod5"),
+        "--model", "dna_r10.4.1_e8.2_400bps_sup@v5.0.0",
         "--modified-bases", "5mCG_5hmCG", "--no-emit-moves",
         "--output-dir", str(tmp_path / "bc"), "--device", "cpu",
     ])
@@ -221,3 +223,34 @@ def test_cli_basecall_without_resume_refuses_a_partial(tmp_path: Path, mocks, mo
     assert rc == 1
     assert "--resume" in capsys.readouterr().err
     assert stub.calls() == []
+
+
+def test_cli_basecall_variant_takes_modified_bases_inside(tmp_path: Path, mocks, monkeypatch):
+    stub = install(tmp_path, monkeypatch)
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "hac",
+        "--modified-bases", "6mA,5mC_5hmC", "--output-dir", str(tmp_path / "bc"),
+        "--duplex",
+    ])
+    assert rc == 0
+    verb, positionals, options = parse_dorado_argv(stub.argv())
+    assert verb == "duplex"
+    assert positionals == ["hac,6mA,5mC_5hmC", str(tmp_path / "r.pod5")]
+
+
+def test_cli_basecall_old_shorthand_names_its_replacement(tmp_path: Path, mocks, capsys):
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "hac@v4.3+5mC,5hmC",
+        "--output-dir", str(tmp_path / "bc"),
+    ])
+    assert rc == 2
+    assert "hac@v4.3.0,5mC_5hmC" in capsys.readouterr().err
+
+
+def test_cli_basecall_modifications_twice_is_a_usage_error(tmp_path: Path, mocks, capsys):
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup,6mA",
+        "--modified-bases", "5mCG_5hmCG", "--output-dir", str(tmp_path / "bc"),
+    ])
+    assert rc == 2
+    assert "one place" in capsys.readouterr().err

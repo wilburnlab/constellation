@@ -4862,8 +4862,17 @@ def _build_basecall_parser(subs) -> None:
     p.add_argument("--pod5", nargs="+", help="POD5 file(s) or directory")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--output", default=None, help="Output BAM (default <output-dir>/calls.bam)")
-    p.add_argument("--model", default=None, help="Dorado model shorthand, e.g. sup@v5.0.0 or hac@v4.3+5mC,5hmC")
-    p.add_argument("--modified-bases", default=None, help="Comma list overriding the model's mods")
+    p.add_argument("--model", default=None,
+                   help="Dorado model, passed as written: a variant such as sup, hac@v5.0.0 or "
+                        "sup@latest,5mCG_5hmCG (Dorado picks the chemistry from the "
+                        "POD5), a full model name such as "
+                        "dna_r10.4.1_e8.2_400bps_sup@v5.2.0, or a model directory. "
+                        "Dorado downloads models at run time; on an offline node keep "
+                        "them with --dorado-extra '--models-directory DIR'")
+    p.add_argument("--modified-bases", default=None,
+                   help="Comma list of Dorado modification codes, e.g. 5mCG_5hmCG or "
+                        "6mA,5mC_5hmC (Dorado checks them against the model); or name "
+                        "them in a --model variant, not both")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--duplex", action="store_true")
     p.add_argument("--emit-moves", action=argparse.BooleanOptionalAction, default=True,
@@ -4896,8 +4905,17 @@ def _build_genome_parser(subs) -> None:
     src.add_argument("--reads", nargs="+", help="Dorado BAM/SAM file(s) or dir (multi-flow-cell)")
     src.add_argument("--pod5", nargs="+", help="POD5 file(s)/dir → basecalled inline (requires --model)")
     pa_.add_argument("--output-dir", required=True)
-    pa_.add_argument("--model", default=None, help="Dorado model shorthand (required with --pod5)")
-    pa_.add_argument("--modified-bases", default=None)
+    pa_.add_argument("--model", default=None,
+                     help="Required with --pod5. " + "Dorado model, passed as written: a variant such as sup, hac@v5.0.0 or "
+                        "sup@latest,5mCG_5hmCG (Dorado picks the chemistry from the "
+                        "POD5), a full model name such as "
+                        "dna_r10.4.1_e8.2_400bps_sup@v5.2.0, or a model directory. "
+                        "Dorado downloads models at run time; on an offline node keep "
+                        "them with --dorado-extra '--models-directory DIR'")
+    pa_.add_argument("--modified-bases", default=None,
+                     help="Comma list of Dorado modification codes, e.g. 5mCG_5hmCG or "
+                        "6mA,5mC_5hmC (Dorado checks them against the model); or name "
+                        "them in a --model variant, not both")
     pa_.add_argument("--device", default="cuda:0")
     pa_.add_argument("--duplex", action="store_true")
     pa_.add_argument("--emit-moves", action=argparse.BooleanOptionalAction, default=True,
@@ -5068,7 +5086,10 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 2
-            handle = runner.duplex(model, pod5, output, device=args.device, detach=args.detach)
+            handle = runner.duplex(
+                model, pod5, output,
+                modified_bases=mods, device=args.device, detach=args.detach,
+            )
         else:
             handle = runner.basecaller(
                 model, pod5, output,
@@ -5076,6 +5097,9 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
                 emit_moves=args.emit_moves,
                 resume=args.resume, detach=args.detach,
             )
+    except ValueError as exc:  # modifications given in two places
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except (FileNotFoundError, FileExistsError, DoradoVersionError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
