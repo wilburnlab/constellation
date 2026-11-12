@@ -14,41 +14,17 @@ from pathlib import Path
 
 import pytest
 
+from _dorado_stub import install, parse_dorado_argv
+
 from constellation.sequencing.basecall.dorado import DoradoRunner, RunHandle, RunStatus
 from constellation.sequencing.basecall.models import DoradoModel
-
-_STUB = r"""#!/usr/bin/env bash
-verb="${1:-}"
-case "$verb" in
-  --version) echo "dorado 2.0.0+mock"; exit 0 ;;
-  download) exit 0 ;;
-esac
-if [[ -n "${MOCK_ARGV_FILE:-}" ]]; then
-  printf '%s\n' "$*" > "${MOCK_ARGV_FILE}"
-fi
-case "$verb" in
-  basecaller|duplex) printf 'MOCKBAM'; echo "[info] basecalling 50% done" >&2; exit 0 ;;
-  aligner) printf 'MOCKALN'; exit 0 ;;
-  summary) printf 'read_id\tn\nr1\t1\n'; exit 0 ;;
-  demux) exit 0 ;;
-  *) printf 'MOCKOUT'; exit 0 ;;
-esac
-"""
 
 
 @pytest.fixture
 def mock_dorado(tmp_path: Path, monkeypatch):
     if shutil.which("bash") is None:  # pragma: no cover
         pytest.skip("bash not available for the mock binary")
-    home = tmp_path / "dorado_home"
-    (home / "bin").mkdir(parents=True)
-    stub = home / "bin" / "dorado"
-    stub.write_text(_STUB)
-    stub.chmod(0o755)
-    monkeypatch.setenv("CONSTELLATION_DORADO_HOME", str(home))
-    argv_file = tmp_path / "argv.txt"
-    monkeypatch.setenv("MOCK_ARGV_FILE", str(argv_file))
-    return argv_file
+    return install(tmp_path, monkeypatch)
 
 
 def test_basecaller_foreground(tmp_path: Path, mock_dorado):
@@ -59,18 +35,40 @@ def test_basecaller_foreground(tmp_path: Path, mock_dorado):
     assert handle.poll() == RunStatus.COMPLETED
     assert out.read_bytes().startswith(b"MOCKBAM")
     assert handle.stderr_log.exists()
-    argv = mock_dorado.read_text()
-    assert "basecaller" in argv
-    assert "--device cpu" in argv
-    assert model.model_name() in argv
+    verb, positionals, options = parse_dorado_argv(mock_dorado.argv())
+    assert verb == "basecaller"
+    assert options["--device"] == ["cpu"]
+    assert positionals == [model.model_name(), str(tmp_path / "r.pod5")]
 
 
 def test_basecaller_modified_bases_from_model(tmp_path: Path, mock_dorado):
+    # `--modified-bases` reads a list up to the next option. Before the
+    # positionals, with no `--emit-moves` after it (the library default),
+    # it took the model and the POD5 path as modification codes and Dorado
+    # was left with no model at all.
     model = DoradoModel.parse("hac@v4.3+5mC,5hmC")
     out = tmp_path / "calls.bam"
-    DoradoRunner(device="cpu").basecaller(model, [tmp_path / "r.pod5"], out).wait()
-    argv = mock_dorado.read_text()
-    assert "--modified-bases 5mC 5hmC" in argv
+    pod5 = [tmp_path / "a.pod5", tmp_path / "b.pod5"]
+    DoradoRunner(device="cpu").basecaller(model, pod5, out).wait()
+    _, positionals, options = parse_dorado_argv(mock_dorado.argv())
+    assert positionals == [model.model_name(), *(str(p) for p in pod5)]
+    assert options["--modified-bases"] == ["5mC", "5hmC"]
+
+
+def test_basecaller_modified_bases_after_extra_args(tmp_path: Path, mock_dorado):
+    model = DoradoModel.parse("sup@v5.0.0")
+    out = tmp_path / "calls.bam"
+    DoradoRunner(
+        device="cpu", extra_args=("--models-directory", str(tmp_path / "m"))
+    ).basecaller(
+        model, [tmp_path / "r.pod5"], out,
+        modified_bases=("5mCG_5hmCG",), emit_moves=True,
+    ).wait()
+    _, positionals, options = parse_dorado_argv(mock_dorado.argv())
+    assert positionals == [model.model_name(), str(tmp_path / "r.pod5")]
+    assert options["--modified-bases"] == ["5mCG_5hmCG"]
+    assert "--emit-moves" in options
+    assert options["--models-directory"] == [str(tmp_path / "m")]
 
 
 def test_basecaller_emit_moves_flag(tmp_path: Path, mock_dorado):
@@ -79,7 +77,8 @@ def test_basecaller_emit_moves_flag(tmp_path: Path, mock_dorado):
     DoradoRunner(device="cpu").basecaller(
         model, [tmp_path / "r.pod5"], out, emit_moves=True
     ).wait()
-    assert "--emit-moves" in mock_dorado.read_text()
+    _, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert "--emit-moves" in options
 
 
 def test_basecaller_detach_and_attach(tmp_path: Path, mock_dorado):
@@ -130,8 +129,8 @@ def test_basecaller_resume_moves_partial(tmp_path: Path, mock_dorado):
     DoradoRunner(device="cpu").basecaller(
         model, [tmp_path / "r.pod5"], out, resume=True
     ).wait()
-    argv = mock_dorado.read_text()
-    assert "--resume-from" in argv
+    _, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert options["--resume-from"] == [str(tmp_path / "calls.bam.partial")]
     assert (tmp_path / "calls.bam.partial").exists()
 
 

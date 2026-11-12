@@ -307,8 +307,6 @@ class DoradoRunner:
         if dev:
             argv += ["--device", dev]
         mods = tuple(modified_bases) if modified_bases else tuple(model.mods)
-        if mods:
-            argv += ["--modified-bases", *mods]
         if emit_moves:
             argv += ["--emit-moves"]
         if resume and output.exists() and output.stat().st_size > 0:
@@ -316,6 +314,12 @@ class DoradoRunner:
             output.replace(partial)
             argv += ["--resume-from", str(partial)]
         argv += [*self.extra_args, model.model_name(), *(str(p) for p in pod5_paths)]
+        # `--modified-bases` takes a space-separated list and reads every
+        # token up to the next option, so placed before the positionals it
+        # swallowed the model and the POD5 paths as modification codes.
+        # Last, as ONT's docs write it, it has nothing after it to take.
+        if mods:
+            argv += ["--modified-bases", *mods]
         return self._launch(argv, output=output, stage="basecaller", detach=detach)
 
     def duplex(

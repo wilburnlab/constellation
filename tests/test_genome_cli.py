@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from _dorado_stub import install, parse_dorado_argv
+
 from constellation.cli.__main__ import main
 
 pytest.importorskip("pysam")
@@ -157,3 +159,22 @@ def test_cli_basecall_no_emit_moves_opts_out(tmp_path: Path, mocks, monkeypatch)
     ])
     assert rc == 0
     assert "--emit-moves" not in argv_file.read_text()
+
+
+def test_cli_basecall_modified_bases_without_emit_moves(tmp_path: Path, mocks, monkeypatch):
+    # `--modified-bases` reads a list up to the next option. With
+    # `--emit-moves` on (the default) the list happened to end at that
+    # flag; `--no-emit-moves` removed it, and the model and POD5 path were
+    # read as modification codes.
+    stub = install(tmp_path, monkeypatch)
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup@v5.0.0",
+        "--modified-bases", "5mCG_5hmCG", "--no-emit-moves",
+        "--output-dir", str(tmp_path / "bc"), "--device", "cpu",
+    ])
+    assert rc == 0
+    _, positionals, options = parse_dorado_argv(stub.argv())
+    assert positionals == [
+        "dna_r10.4.1_e8.2_400bps_sup@v5.0.0", str(tmp_path / "r.pod5"),
+    ]
+    assert options["--modified-bases"] == ["5mCG_5hmCG"]
