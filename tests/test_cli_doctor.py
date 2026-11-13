@@ -50,3 +50,26 @@ def test_doctor_reports_a_too_old_tool(capsys, monkeypatch, tmp_path):
     assert "too old" in row
     assert "6.5.15" in row and "needs >= 6.9.23" in row
     assert rc == 1
+
+
+def test_doctor_reports_a_dorado_below_the_floor(capsys, monkeypatch, tmp_path):
+    """Dorado declares its floor too, so doctor stops calling 2.0.0 ``ok``."""
+    from constellation.cli import __main__ as cli_main
+    from constellation.thirdparty.registry import ToolHandle
+
+    real_try_find = cli_main.try_find
+
+    def _try_find(name):
+        if name != "dorado":
+            return real_try_find(name)
+        spec = next(s for s in cli_main.registered() if s.name == "dorado")
+        return ToolHandle(spec, tmp_path / "bin" / "dorado", "env", "2.0.0")
+
+    monkeypatch.setattr(cli_main, "try_find", _try_find)
+    rc = main(["doctor"])
+    row = next(
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("dorado")
+    )
+    assert "too old" in row
+    assert "needs >= 2.1.2" in row
+    assert rc == 1

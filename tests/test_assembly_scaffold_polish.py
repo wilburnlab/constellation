@@ -39,7 +39,7 @@ printf '>chr1_RagTag\nACGTACGTNNNNTTTTGGGG\n' > "$out/ragtag.scaffold.fasta"
 _DORADO_STUB = r"""#!/usr/bin/env bash
 verb="${1:-}"
 case "$verb" in
-  --version) echo "dorado 2.0.0+mock"; exit 0 ;;
+  --version) echo "dorado 2.1.2+mock"; exit 0 ;;
   aligner) printf 'MOCKALN'; exit 0 ;;
   polish) draft="${@: -1}"; cat "$draft"; exit 0 ;;
   *) exit 0 ;;
@@ -170,3 +170,94 @@ def test_polish_two_rounds_accumulate(tmp_path: Path, monkeypatch):
     )
     assert polished.contigs.to_pylist()[0]["polish_rounds"] == 2
     assert (tmp_path / "polish" / "round_2" / "consensus.fasta").exists()
+
+
+# ── several read BAMs: one basecaller model, carried to the @RG ───────
+
+
+def _model_bam(path: Path, rg_id: str, model: str | None) -> Path:
+    pysam = pytest.importorskip("pysam")
+    rg = {"ID": rg_id, "PL": "ONT"}
+    if model is not None:
+        rg["DS"] = f"basecall_model={model}"
+    header = {"HD": {"VN": "1.6", "SO": "unsorted"}, "RG": [rg]}
+    with pysam.AlignmentFile(str(path), "wb", header=header) as fh:
+        seg = pysam.AlignedSegment(fh.header)
+        seg.query_name = f"{rg_id}_r0"
+        seg.query_sequence = "ACGTACGT"
+        seg.flag = 4
+        seg.query_qualities = pysam.qualitystring_to_array("IIIIIIII")
+        seg.set_tag("RG", rg_id)
+        fh.write(seg)
+    return path
+
+
+@pytest.fixture
+def harmonized(tmp_path: Path, monkeypatch):
+    """Record what polish asks harmonize_read_group for (samtools is not
+    needed to see that), and stand in for its output."""
+    from constellation.sequencing.basecall import readgroup
+
+    _install_stub(
+        tmp_path / "dorado_home", "bin/dorado", _DORADO_STUB, monkeypatch,
+        "CONSTELLATION_DORADO_HOME",
+    )
+    _install_stub(
+        tmp_path / "samtools_home", "bin/samtools", _SAMTOOLS_STUB, monkeypatch,
+        "CONSTELLATION_SAMTOOLS_HOME",
+    )
+    calls: list[dict] = []
+
+    def fake(in_bams, out_bam, **kw):
+        calls.append({"in_bams": list(in_bams), **kw})
+        Path(out_bam).write_bytes(b"")
+        return Path(out_bam)
+
+    monkeypatch.setattr(readgroup, "harmonize_read_group", fake)
+    return calls
+
+
+_SUP = "dna_r10.4.1_e8.2_400bps_sup@v5.0.0"
+_HAC = "dna_r10.4.1_e8.2_400bps_hac@v5.0.0"
+
+
+def test_polish_carries_the_reads_model_onto_the_harmonized_rg(
+    tmp_path: Path, harmonized
+):
+    # The merged @RG had no DS:basecall_model, which is where dorado
+    # polish reads its model from.
+    a = _model_bam(tmp_path / "a.bam", "RGA", _SUP)
+    b = _model_bam(tmp_path / "b.bam", "RGB", _SUP)
+    PolishRunner(rounds=1).run(_draft_assembly(), [a, b], tmp_path / "polish")
+    assert len(harmonized) == 1
+    assert harmonized[0]["model_ds"] == _SUP
+
+
+def test_polish_refuses_reads_of_different_models(tmp_path: Path, harmonized):
+    a = _model_bam(tmp_path / "a.bam", "RGA", _SUP)
+    b = _model_bam(tmp_path / "b.bam", "RGB", _HAC)
+    with pytest.raises(ValueError, match="--allow-multi-model"):
+        PolishRunner(rounds=1).run(_draft_assembly(), [a, b], tmp_path / "polish")
+    assert harmonized == []
+
+
+def test_polish_allow_multi_model_names_no_model(tmp_path: Path, harmonized):
+    a = _model_bam(tmp_path / "a.bam", "RGA", _SUP)
+    b = _model_bam(tmp_path / "b.bam", "RGB", _HAC)
+    PolishRunner(rounds=1, allow_multi_model=True).run(
+        _draft_assembly(), [a, b], tmp_path / "polish"
+    )
+    assert harmonized[0]["model_ds"] is None
+
+
+def test_polish_allow_multi_model_with_untagged_reads_names_no_model(
+    tmp_path: Path, harmonized
+):
+    # One tagged BAM and one that names no model returned the tagged one's
+    # model, so every merged read claimed it.
+    a = _model_bam(tmp_path / "a.bam", "RGA", _SUP)
+    b = _model_bam(tmp_path / "b.bam", "RGB", None)
+    PolishRunner(rounds=1, allow_multi_model=True).run(
+        _draft_assembly(), [a, b], tmp_path / "polish"
+    )
+    assert harmonized[0]["model_ds"] is None

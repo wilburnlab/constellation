@@ -20,10 +20,11 @@ independently accept ONT's terms. See the upstream LICENCE.txt:
 https://github.com/nanoporetech/dorado/blob/master/LICENCE.txt
 
 Pinned at the latest stable Dorado (``DORADO_VERSION``); bump as ONT
-releases new model-supporting versions. The genome pipeline requires
-Dorado **>= 2.0.0** — its CLI was runtime-validated against 2.0.0 and the
-resolver (``basecall.dorado_run.resolve_dorado``) refuses anything older;
-there is deliberately no pre-2.0 compatibility shim.
+releases new model-supporting versions. Constellation requires Dorado
+**>= ``MINIMUM_VERSION``** (2.1.2): the resolver
+(``basecall.dorado_run.resolve_dorado``) refuses anything older and
+``constellation doctor`` reports it as too old. There is deliberately no
+compatibility shim for older releases.
 """
 
 from __future__ import annotations
@@ -35,9 +36,17 @@ from pathlib import Path
 from constellation.thirdparty.registry import ToolSpec, register
 
 
-# Pinned version. Update as needed; the lab's only constraint is that
-# the installed Dorado supports the latest released models.
-DORADO_VERSION = "2.0.0"
+# Pinned version: what scripts/install-dorado.sh installs. Update as
+# needed; the lab's only constraint is that the installed Dorado supports
+# the latest released models.
+DORADO_VERSION = "2.1.2"
+
+# The oldest Dorado anything here will run. 2.1.1 and 2.1.2 fixed
+# non-deterministic calls from the SUP v5+ and HAC v6.0.0 models, so below
+# 2.1.2 the same POD5 and model need not give the same reads; 2.0.1 fixed
+# duplex with HAC v6.0.0 and a v6 HAC crash on hosts without a GPU. None
+# of the flags Constellation passes changed between 2.0.0 and 2.1.2.
+MINIMUM_VERSION = "2.1.2"
 
 
 def _probe_version(path: Path) -> str | None:
@@ -68,8 +77,9 @@ register(
         path_bin="dorado",              # primary discovery via $PATH (conda)
         install_script="scripts/install-dorado.sh",
         version_probe=_probe_version,
+        min_version=MINIMUM_VERSION,
     )
 )
 
 
-__all__ = ["DORADO_VERSION"]
+__all__ = ["DORADO_VERSION", "MINIMUM_VERSION"]

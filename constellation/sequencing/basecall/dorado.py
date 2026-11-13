@@ -102,6 +102,11 @@ class RunHandle:
     Foreground runs hold the live ``Popen`` (in ``extras['_proc']``);
     detached / attached runs track liveness via the PID + an exit-code
     sentinel file (``extras['exit_file']``).
+
+    A foreground run that consumed a file (``extras['remove_on_success']``,
+    a resumed basecall's partial) removes it once ``wait`` sees exit 0. A
+    detached run's own shell does that, so an attached handle never
+    removes anything.
     """
 
     pid: int
@@ -149,7 +154,11 @@ class RunHandle:
         """Block until the subprocess exits. Returns its exit code."""
         proc = self.extras.get("_proc")
         if proc is not None:
-            return proc.wait(timeout=timeout)
+            rc = proc.wait(timeout=timeout)
+            consumed = self.extras.pop("remove_on_success", None)
+            if rc == 0 and consumed is not None:
+                Path(consumed).unlink(missing_ok=True)
+            return rc
         exit_file = self.extras.get("exit_file")
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
@@ -222,6 +231,64 @@ class RunHandle:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Resuming an interrupted basecall
+# ──────────────────────────────────────────────────────────────────────
+
+
+def partial_path(output: Path) -> Path:
+    """Where an interrupted run's reads are kept while it is resumed."""
+    output = Path(output)
+    return output.with_name(output.name + ".partial")
+
+
+def _non_empty(path: Path) -> bool:
+    return path.exists() and path.stat().st_size > 0
+
+
+def _refuse_partial(output: Path, remedy: str) -> None:
+    """Refuse to start a run that would leave ``<output>.partial`` behind.
+
+    A partial holds the reads of an interrupted simplex basecall. A run
+    that does not resume from it rewrites the output beside it, so the
+    partial is orphaned, and a later ``--resume`` would weigh it against
+    an output of another run.
+    """
+    partial = partial_path(output)
+    if _non_empty(partial):
+        raise FileExistsError(
+            f"{partial} holds the reads of an interrupted simplex basecall; "
+            f"{remedy}, or remove it to start over"
+        )
+
+
+def _resume_source(output: Path, partial: Path) -> Path | None:
+    """Put the file to resume from at ``partial`` and return it, or None.
+
+    Dorado's ``--resume-from`` writes every read of the resume file into
+    the new output before it basecalls anything (``process_resume_file``
+    → ``copy_completed_reads`` in its ``basecaller.cpp``), and calls every
+    read the resume file lacks. So when both files exist (an earlier
+    resume was itself interrupted), the larger one holds the most finished
+    reads: a smaller output is an unfinished copy of the partial, and a
+    larger one finished the copy and went on to new reads. Choosing wrong
+    costs basecalling time, never reads.
+
+    The partial used to be overwritten with whatever the output held, so
+    a resume killed while still copying replaced days of reads with a few
+    bytes; and a partial with no output beside it was ignored and the run
+    started again from zero.
+    """
+    if _non_empty(output) and (
+        not _non_empty(partial) or output.stat().st_size > partial.stat().st_size
+    ):
+        output.replace(partial)
+        return partial
+    if _non_empty(partial):
+        return partial
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Runner
 # ──────────────────────────────────────────────────────────────────────
 
@@ -233,11 +300,13 @@ class DoradoRunner:
     Resolved at call time via ``constellation.thirdparty.find('dorado')``;
     raises ``FileNotFoundError`` if Dorado isn't installed. Each
     subcommand method returns a :class:`RunHandle`; callers choose block /
-    follow / detach. Default ``device='cuda:0'`` matches the lab's typical
-    GPU configuration; CPU-only hosts pass ``device='cpu'``.
+    follow / detach. ``device=None`` (the default) passes no ``--device``,
+    so Dorado's own ``auto`` applies: the GPUs it finds, else the CPU. A
+    fixed ``cuda:0`` default had held a multi-day basecall to one GPU of a
+    multi-GPU node, and failed outright on a Mac.
     """
 
-    device: str = "cuda:0"
+    device: str | None = None
     threads: int = 8
     extra_args: tuple[str, ...] = ()
 
@@ -249,6 +318,7 @@ class DoradoRunner:
         output: Path,
         stage: str,
         detach: bool,
+        remove_on_success: Path | None = None,
     ) -> RunHandle:
         output = Path(output)
         log_dir = output.parent
@@ -262,7 +332,16 @@ class DoradoRunner:
             detach=detach,
             pid_file=pid_file if detach else None,
             started_at=started,
+            remove_on_success=remove_on_success,
         )
+        extras: dict[str, Any] = {
+            "_proc": proc,
+            "exit_file": str(exit_file) if exit_file else None,
+            "stage": stage,
+            "detached": detach,
+        }
+        if remove_on_success is not None and not detach:
+            extras["remove_on_success"] = str(remove_on_success)
         return RunHandle(
             pid=pid,
             pid_file=pid_file,
@@ -270,12 +349,7 @@ class DoradoRunner:
             stdout_log=output,
             stderr_log=stderr_log,
             started_at=started,
-            extras={
-                "_proc": proc,
-                "exit_file": str(exit_file) if exit_file else None,
-                "stage": stage,
-                "detached": detach,
-            },
+            extras=extras,
         )
 
     # ── verbs ───────────────────────────────────────────────────────
@@ -294,29 +368,53 @@ class DoradoRunner:
         """Run ``dorado basecaller`` on the given POD5 inputs → BAM.
 
         Output is BAM (Dorado's default, written to stdout → ``output``).
-        ``modified_bases`` defaults to the model's declared mods. When
-        ``emit_moves`` is set, the ``mv`` tag is written (move-table-aware
-        ``dorado polish`` models need it). ``resume`` restarts a partial
-        run via ``--resume-from`` (the partial output is moved aside
-        first). Dorado reads POD5 directly — we do not decode POD5
-        ourselves.
+        ``model`` goes to Dorado as written; ``modified_bases`` are added
+        to it as :meth:`DoradoModel.arguments` says. When ``emit_moves``
+        is set, the ``mv`` tag is written (move-table-aware ``dorado
+        polish`` models need it). Dorado reads POD5 directly — we do not
+        decode POD5 ourselves.
+
+        ``resume`` continues an interrupted run with ``--resume-from``
+        from ``<output>.partial`` (see :func:`_resume_source` for which
+        file that is), and the run removes the partial once Dorado exits 0
+        (the output then holds every read of it): a foreground run in
+        :meth:`RunHandle.wait`, a detached one itself. Only the run that
+        resumed from it removes it — a caller clearing ``<output>.partial``
+        after any run that exited 0 deleted a partial another run had left
+        there. Without ``resume``, a non-empty ``<output>.partial`` raises
+        ``FileExistsError`` rather than being silently left behind by a
+        fresh run.
         """
         output = Path(output)
+        model_arg, trailing = model.arguments(tuple(modified_bases))
+        # Resolve before touching any file: a missing or too-old Dorado
+        # used to raise only after the output had been moved to the
+        # partial, and the next --resume then found no output and started
+        # from zero.
+        resolve_dorado()
+        partial = partial_path(output)
+        resume_from: Path | None = None
+        if resume:
+            resume_from = _resume_source(output, partial)
+        else:
+            _refuse_partial(output, "pass --resume to continue it")
         dev = device if device is not None else self.device
         argv: list[str] = ["basecaller"]
         if dev:
             argv += ["--device", dev]
-        mods = tuple(modified_bases) if modified_bases else tuple(model.mods)
-        if mods:
-            argv += ["--modified-bases", *mods]
         if emit_moves:
             argv += ["--emit-moves"]
-        if resume and output.exists() and output.stat().st_size > 0:
-            partial = output.with_name(output.name + ".partial")
-            output.replace(partial)
-            argv += ["--resume-from", str(partial)]
-        argv += [*self.extra_args, model.model_name(), *(str(p) for p in pod5_paths)]
-        return self._launch(argv, output=output, stage="basecaller", detach=detach)
+        if resume_from is not None:
+            argv += ["--resume-from", str(resume_from)]
+        # `--modified-bases` (in `trailing`) reads every token up to the
+        # next option, so placed before the positionals it swallowed the
+        # model and the POD5 paths as modification codes. Last, as ONT's
+        # docs write it, it has nothing after it to take.
+        argv += [*self.extra_args, model_arg, *(str(p) for p in pod5_paths), *trailing]
+        return self._launch(
+            argv, output=output, stage="basecaller", detach=detach,
+            remove_on_success=resume_from,
+        )
 
     def duplex(
         self,
@@ -324,16 +422,28 @@ class DoradoRunner:
         pod5_paths: list[Path],
         output: Path,
         *,
+        modified_bases: tuple[str, ...] = (),
         device: str | None = None,
         detach: bool = False,
     ) -> RunHandle:
         """Run ``dorado duplex`` (paired-strand basecalling for Q30+
-        consensus reads where complement strands are available)."""
+        consensus reads where complement strands are available).
+
+        Takes the same model forms and modifications as :meth:`basecaller`
+        (it used to drop ``modified_bases`` without a word). Dorado's
+        duplex has no ``--emit-moves`` and no resume path, so a non-empty
+        ``<output>.partial`` (a simplex run's reads) raises
+        ``FileExistsError``, as it does for a fresh simplex run.
+        """
+        model_arg, trailing = model.arguments(tuple(modified_bases))
+        _refuse_partial(
+            Path(output), "continue it with a simplex basecall and --resume"
+        )
         dev = device if device is not None else self.device
         argv: list[str] = ["duplex"]
         if dev:
             argv += ["--device", dev]
-        argv += [*self.extra_args, model.model_name(), *(str(p) for p in pod5_paths)]
+        argv += [*self.extra_args, model_arg, *(str(p) for p in pod5_paths), *trailing]
         return self._launch(argv, output=Path(output), stage="duplex", detach=detach)
 
     def aligner(
@@ -401,7 +511,8 @@ class DoradoRunner:
     ) -> RunHandle:
         """Run ``dorado polish <aligned_bam> <draft_fasta>`` → consensus FASTA.
 
-        Validated against dorado 2.0.0: positional order is
+        Validated against dorado 2.0.0 (no polish flag changed through
+        2.1.2, per its changelog): positional order is
         ``in_aln_bam in_draft_fastx``, consensus goes to stdout when no
         ``-o`` is given, and ``-x/--device`` selects the compute device.
         ``aligned_bam`` must be reads aligned to ``draft_fasta`` with
@@ -424,15 +535,30 @@ class DoradoRunner:
     def fetch_model(
         self, model: DoradoModel, models_dir: Path | None = None
     ) -> Path:
-        """Run ``dorado download --model <name>`` and return the resolved
-        model directory."""
-        argv = ["download", "--model", model.model_name()]
+        """Run ``dorado download --model <name>`` and return the model's
+        directory.
+
+        Takes a full model name; a model directory is returned as it is. A
+        variant names no single model until Dorado has read a POD5's
+        chemistry, so it is refused here: name the model in full, or let
+        ``dorado basecaller`` fetch the variant (``--models-directory``
+        keeps what it fetches).
+        """
+        if model.kind == "path":
+            return Path(model.spec)
+        if model.kind == "variant":
+            raise ValueError(
+                f"{model.spec!r} is a model variant, which Dorado resolves "
+                "against a POD5's chemistry; give the full model name (e.g. "
+                "dna_r10.4.1_e8.2_400bps_sup@v5.2.0) to download it"
+            )
+        argv = ["download", "--model", model.spec]
         if models_dir is not None:
             Path(models_dir).mkdir(parents=True, exist_ok=True)
             argv += ["--models-directory", str(models_dir)]
         subprocess.run([str(resolve_dorado()), *argv], check=True)
         base = Path(models_dir) if models_dir is not None else Path.cwd()
-        return base / model.model_name()
+        return base / model.spec
 
 
 __all__ = [
@@ -440,4 +566,5 @@ __all__ = [
     "RunHandle",
     "RunStatus",
     "DoradoProgressEvent",
+    "partial_path",
 ]

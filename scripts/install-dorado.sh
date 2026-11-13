@@ -17,29 +17,31 @@
 # Usage:
 #   bash scripts/install-dorado.sh
 #   bash scripts/install-dorado.sh --force
-#   bash scripts/install-dorado.sh --version 2.1.0   # a newer 2.x (>= 2.0.0 required)
+#   bash scripts/install-dorado.sh --version 2.2.0   # a newer release (>= 2.1.2 required)
 #   bash scripts/install-dorado.sh --checksum <SHA256>
 #   CONSTELLATION_ACCEPT_DORADO_LICENSE=1 bash scripts/install-dorado.sh  # non-interactive
 #
 # Wrapper code is Apache-2.0 (Constellation); Dorado itself is ONT's.
 set -euo pipefail
 
-VERSION="2.0.0"   # latest stable (May 2026); v6.0 models + mature `dorado polish`
-PINNED_VERSION="2.0.0"
-# Per-platform SHA256 of the ONT CDN tarballs for PINNED_VERSION. The ONT CDN
-# artifacts are byte-stable, so these are reliable integrity pins. linux-x64
-# verified 2026-06-09; arm64 / osx-arm64 are placeholders — pass --checksum
-# to verify those (or fill them in once verified). For any other --version,
-# pass --checksum.
+VERSION="2.1.2"   # latest stable (Aug 2026); deterministic SUP v5 / HAC v6 calls
+PINNED_VERSION="2.1.2"
+# The oldest release Constellation runs (thirdparty/dorado.py MINIMUM_VERSION):
+# below 2.1.2 the SUP v5+ and HAC v6 models do not give the same reads twice.
+MIN_VERSION="2.1.2"
+# Per-platform SHA256 of the ONT CDN artifacts for PINNED_VERSION. ONT
+# publishes no checksums; these were computed from the CDN downloads on
+# 2026-11-12, and the artifacts are byte-stable, so they pin what was
+# fetched then. For any other --version, pass --checksum.
 # Portable case mapping rather than `declare -A`: associative arrays need
 # Bash 4+, and macOS ships Bash 3.2. This script advertises Darwin-arm64,
 # and `declare -A` runs before argument parsing — so on a stock Mac even
 # `--help` exited here.
 pinned_sha_for() {
     case "$1" in
-        linux-x64)   printf '%s' "311c4be8fe5177ee2ffe08e2b6ae08bd7f4f1c11caf273e6161562bd9ba48b49" ;;
-        linux-arm64) printf '%s' "REPLACE_WITH_VERIFIED_SHA256" ;;
-        osx-arm64)   printf '%s' "REPLACE_WITH_VERIFIED_SHA256" ;;
+        linux-x64)   printf '%s' "f4ed83acfb75cf07ffe8a0fc78e26828fc911fcfc8177920be6104e1d0e02485" ;;
+        linux-arm64) printf '%s' "260eddee12868e8b541fadaf51729061edb5534b8632be2df3d4d7125afea3c5" ;;
+        osx-arm64)   printf '%s' "6cdca387dbce5574d022d3759f1f5c4f8491a08877f051e3d3430b8402ef4780" ;;
         *)           printf '%s' "" ;;
     esac
 }
@@ -78,21 +80,21 @@ USAGE
     esac
 done
 
-# Hard floor: constellation targets Dorado 2.0.0+ exclusively — the pipeline
-# is built against the 2.x `polish`/`aligner` CLI + 26.01 output spec and
-# carries NO pre-2.0 backwards compatibility. Refuse anything older.
-if [[ "$(printf '%s\n%s\n' "2.0.0" "${VERSION}" | sort -V | head -n1)" != "2.0.0" ]]; then
-    echo "error: dorado ${VERSION} < 2.0.0 — constellation requires >= 2.0.0." >&2
+# Hard floor: Constellation carries NO compatibility with older Dorado, and
+# the resolver refuses anything below MIN_VERSION, so don't install it.
+if [[ "$(printf '%s\n%s\n' "${MIN_VERSION}" "${VERSION}" | sort -V | head -n1)" != "${MIN_VERSION}" ]]; then
+    echo "error: dorado ${VERSION} < ${MIN_VERSION} — constellation requires >= ${MIN_VERSION}." >&2
     exit 2
 fi
 
-# Platform → ONT CDN artifact suffix.
+# Platform → ONT CDN artifact suffix. ONT ships the macOS build as a .zip
+# (its .tar.gz URL answers 403), the Linux builds as .tar.gz.
 os="$(uname -s)"
 arch="$(uname -m)"
 case "${os}-${arch}" in
-    Linux-x86_64)  PLATFORM="linux-x64" ;;
-    Linux-aarch64) PLATFORM="linux-arm64" ;;
-    Darwin-arm64)  PLATFORM="osx-arm64" ;;
+    Linux-x86_64)  PLATFORM="linux-x64";   EXT="tar.gz" ;;
+    Linux-aarch64) PLATFORM="linux-arm64"; EXT="tar.gz" ;;
+    Darwin-arm64)  PLATFORM="osx-arm64";   EXT="zip" ;;
     *)
         echo "error: unsupported platform ${os}-${arch}" >&2
         echo "  Dorado ships linux-x64 / linux-arm64 / osx-arm64 — see" >&2
@@ -135,7 +137,7 @@ if [[ -x "${BIN_PATH}" && ${force} -eq 0 ]]; then
     echo "dorado ${VERSION} already installed at ${BIN_PATH}"
 else
     mkdir -p "${TARGET_DIR}"
-    TARBALL="dorado-${VERSION}-${PLATFORM}.tar.gz"
+    TARBALL="dorado-${VERSION}-${PLATFORM}.${EXT}"
     URL="https://cdn.oxfordnanoportal.com/software/analysis/${TARBALL}"
     work_tar="${TARGET_DIR}/${TARBALL}.part"
     echo "downloading dorado ${VERSION} (${PLATFORM}) from ${URL}"
@@ -160,7 +162,12 @@ else
         echo "  pass --checksum <SHA> (from ONT) to enable verification." >&2
     else
         echo "verifying sha256..."
-        actual_sha="$(sha256sum "${work_tar}" | awk '{print $1}')"
+        # macOS ships `shasum -a 256`, not coreutils' sha256sum.
+        if command -v sha256sum >/dev/null 2>&1; then
+            actual_sha="$(sha256sum "${work_tar}" | awk '{print $1}')"
+        else
+            actual_sha="$(shasum -a 256 "${work_tar}" | awk '{print $1}')"
+        fi
         if [[ "${actual_sha}" != "${EXPECTED_SHA}" ]]; then
             echo "error: sha256 mismatch for ${work_tar}" >&2
             echo "  expected: ${EXPECTED_SHA}" >&2
@@ -170,9 +177,29 @@ else
         fi
     fi
 
-    # Tarball lays out as ./dorado-<ver>-<platform>/{bin,lib}. Strip the
+    # Both archives lay out as dorado-<ver>-<platform>/{bin,lib}. Strip the
     # top level so we land at <version>/bin/dorado directly.
-    tar -xzf "${work_tar}" -C "${TARGET_DIR}" --strip-components=1
+    if [[ "${EXT}" == "zip" ]]; then
+        if ! command -v unzip >/dev/null 2>&1; then
+            echo "error: unzip is needed to unpack ${TARBALL}" >&2
+            exit 1
+        fi
+        # unzip has no --strip-components: unpack beside, then move up.
+        unpack="${TARGET_DIR}/.unpack.$$"
+        rm -rf "${unpack}"
+        mkdir -p "${unpack}"
+        unzip -q "${work_tar}" -d "${unpack}"
+        top="${unpack}/dorado-${VERSION}-${PLATFORM}"
+        if [[ ! -d "${top}" ]]; then
+            echo "error: ${TARBALL} has no top-level dorado-${VERSION}-${PLATFORM}/" >&2
+            exit 1
+        fi
+        cp -R "${top}/." "${TARGET_DIR}/"
+        rm -rf "${unpack}"
+        chmod +x "${BIN_PATH}"
+    else
+        tar -xzf "${work_tar}" -C "${TARGET_DIR}" --strip-components=1
+    fi
     rm -f "${work_tar}"
 fi
 

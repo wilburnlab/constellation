@@ -31,13 +31,18 @@ class PolishRunner:
     """Polish a draft ``Assembly`` with ``dorado aligner`` + ``dorado polish``.
 
     ``run(assembly, read_paths, output_dir, rounds=N)`` runs N rounds; the
-    reads are the single-``@RG`` harmonized BAM (``read_paths[0]``).
+    reads are the single-``@RG`` harmonized BAM (``read_paths[0]``), or
+    several Dorado BAMs harmonized here first. ``allow_multi_model`` lets
+    those name different basecaller models (or none); the harmonized BAM
+    then names no model, and ``dorado polish`` needs one given to it
+    (``--model-override`` through ``dorado_polish_extra``).
     """
 
     rounds: int = 1
     threads: int = 8
-    device: str = "cuda:0"
+    device: str | None = None  # None: Dorado's own `auto` (all GPUs, else CPU)
     dorado_polish_extra: tuple[str, ...] = field(default_factory=tuple)
+    allow_multi_model: bool = False
 
     def run(
         self,
@@ -68,15 +73,25 @@ class PolishRunner:
             # first silently dropped every other flow cell from alignment
             # and consensus, materially cutting coverage and biasing the
             # polished assembly. Harmonize them into one model-tagged @RG,
-            # exactly as the assemble pipeline does — dorado polish
-            # rejects multi-model BAMs, so this is also what it needs.
+            # exactly as the assemble pipeline does: check that they name
+            # one basecaller model, and carry it onto the unified @RG.
+            # Harmonizing without the model wrote an @RG with no
+            # DS:basecall_model, which is where dorado polish reads its
+            # model from, and merged reads of different models unchecked.
             from constellation.sequencing.basecall.readgroup import (
                 harmonize_read_group,
+                read_basecaller_models,
+                validate_single_model,
             )
 
+            paths = [Path(p) for p in read_paths]
+            model_ds = validate_single_model(
+                read_basecaller_models(paths), allow_multi=self.allow_multi_model
+            )
             reads_bam = harmonize_read_group(
-                [Path(p) for p in read_paths],
+                paths,
                 output_dir / "harmonized.bam",
+                model_ds=model_ds,
                 threads=self.threads,
             )
 

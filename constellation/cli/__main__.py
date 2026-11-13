@@ -4862,16 +4862,29 @@ def _build_basecall_parser(subs) -> None:
     p.add_argument("--pod5", nargs="+", help="POD5 file(s) or directory")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--output", default=None, help="Output BAM (default <output-dir>/calls.bam)")
-    p.add_argument("--model", default=None, help="Dorado model shorthand, e.g. sup@v5.0.0 or hac@v4.3+5mC,5hmC")
-    p.add_argument("--modified-bases", default=None, help="Comma list overriding the model's mods")
-    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--model", default=None,
+                   help="Dorado model, passed as written: a variant such as sup, hac@v5.0.0 or "
+                        "sup@latest,5mCG_5hmCG (Dorado picks the chemistry from the "
+                        "POD5), a full model name such as "
+                        "dna_r10.4.1_e8.2_400bps_sup@v5.2.0, or a model directory. "
+                        "Dorado downloads models at run time; on an offline node keep "
+                        "them with --dorado-extra '--models-directory DIR'")
+    p.add_argument("--modified-bases", default=None,
+                   help="Comma list of Dorado modification codes, e.g. 5mCG_5hmCG or "
+                        "6mA,5mC_5hmC (Dorado checks them against the model); or name "
+                        "them in a --model variant, not both")
+    p.add_argument("--device", default=None,
+                   help="Dorado device, e.g. cuda:0, cuda:all, cpu or metal "
+                        "(default: Dorado's own auto, its GPUs, else the CPU)")
     p.add_argument("--duplex", action="store_true")
     p.add_argument("--emit-moves", action=argparse.BooleanOptionalAction, default=True,
                    help="Emit the `mv` move-table tag (required for move-aware `dorado polish`; on by default)")
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--detach", action="store_true", help="Fork dorado + write a PID file, return immediately")
     p.add_argument("--follow", action="store_true", help="Attach to a detached run in --output-dir and stream progress")
-    p.add_argument("--resume", action="store_true")
+    p.add_argument("--resume", action="store_true",
+                   help="Continue an interrupted run: Dorado's --resume-from on the "
+                        "output's reads, kept as <output>.partial until the run succeeds")
     p.add_argument("--progress", action="store_true")
     p.add_argument("--dorado-extra", default=None, help="shlex-split extra args appended to dorado")
     p.set_defaults(func=_cmd_basecall)
@@ -4894,9 +4907,20 @@ def _build_genome_parser(subs) -> None:
     src.add_argument("--reads", nargs="+", help="Dorado BAM/SAM file(s) or dir (multi-flow-cell)")
     src.add_argument("--pod5", nargs="+", help="POD5 file(s)/dir → basecalled inline (requires --model)")
     pa_.add_argument("--output-dir", required=True)
-    pa_.add_argument("--model", default=None, help="Dorado model shorthand (required with --pod5)")
-    pa_.add_argument("--modified-bases", default=None)
-    pa_.add_argument("--device", default="cuda:0")
+    pa_.add_argument("--model", default=None,
+                     help="Required with --pod5. " + "Dorado model, passed as written: a variant such as sup, hac@v5.0.0 or "
+                        "sup@latest,5mCG_5hmCG (Dorado picks the chemistry from the "
+                        "POD5), a full model name such as "
+                        "dna_r10.4.1_e8.2_400bps_sup@v5.2.0, or a model directory. "
+                        "Dorado downloads models at run time; on an offline node keep "
+                        "them with --dorado-extra '--models-directory DIR'")
+    pa_.add_argument("--modified-bases", default=None,
+                     help="Comma list of Dorado modification codes, e.g. 5mCG_5hmCG or "
+                        "6mA,5mC_5hmC (Dorado checks them against the model); or name "
+                        "them in a --model variant, not both")
+    pa_.add_argument("--device", default=None,
+                     help="Dorado device, e.g. cuda:0, cuda:all, cpu or metal "
+                          "(default: Dorado's own auto, its GPUs, else the CPU)")
     pa_.add_argument("--duplex", action="store_true")
     pa_.add_argument("--emit-moves", action=argparse.BooleanOptionalAction, default=True,
                      help="Emit the `mv` move-table tag during inline basecalling "
@@ -4953,12 +4977,19 @@ def _build_genome_parser(subs) -> None:
     pp = gsubs.add_parser("polish", help="Dorado-polish an existing assemble output dir")
     pp.add_argument("--assembly-dir", required=True)
     pp.add_argument("--reads", nargs="+", default=None,
-                    help="Harmonized reads BAM (default: harmonized_bam from the manifest)")
+                    help="Harmonized reads BAM, or several Dorado BAMs to harmonize "
+                         "here (default: harmonized_bam from the manifest)")
     pp.add_argument("--polish-rounds", type=int, default=1)
     pp.add_argument("--output-dir", required=True)
     pp.add_argument("--threads", type=int, default=8)
-    pp.add_argument("--device", default="cuda:0")
+    pp.add_argument("--device", default=None,
+                    help="Dorado device, e.g. cuda:0, cuda:all, cpu or metal "
+                         "(default: Dorado's own auto, its GPUs, else the CPU)")
     pp.add_argument("--dorado-polish-extra", default=None)
+    pp.add_argument("--allow-multi-model", action="store_true",
+                    help="With several --reads, skip the single-basecaller-model "
+                         "guard; the merged reads then name no model, so pass one "
+                         "to dorado polish (--dorado-polish-extra '--model-override M')")
     pp.add_argument("--busco-lineage", default=None)
     pp.add_argument("--no-report", action="store_true")
     pp.add_argument("--progress", action="store_true")
@@ -5004,6 +5035,7 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from constellation.sequencing.basecall.dorado import DoradoRunner, RunHandle
+    from constellation.sequencing.basecall.dorado_run import DoradoVersionError
     from constellation.sequencing.basecall.models import DoradoModel
 
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -5028,6 +5060,10 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
             print(event.raw, file=sys.stderr)
         rc = handle.wait()
         print(f"basecall {'completed' if rc == 0 else 'failed'} (rc={rc})", file=sys.stderr)
+        # Nothing is removed here: a detached run that resumed from a
+        # partial removes it itself. An exit code left behind can be an
+        # earlier run's, and clearing the partial on it deleted the reads
+        # a later, failed run had kept there.
         return 0 if rc == 0 else 1
 
     if not args.pod5 or not args.model:
@@ -5057,7 +5093,10 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 2
-            handle = runner.duplex(model, pod5, output, device=args.device, detach=args.detach)
+            handle = runner.duplex(
+                model, pod5, output,
+                modified_bases=mods, device=args.device, detach=args.detach,
+            )
         else:
             handle = runner.basecaller(
                 model, pod5, output,
@@ -5065,18 +5104,26 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
                 emit_moves=args.emit_moves,
                 resume=args.resume, detach=args.detach,
             )
-    except FileNotFoundError as exc:
+    except ValueError as exc:  # modifications given in two places
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except (FileNotFoundError, FileExistsError, DoradoVersionError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     if args.detach:
         print(f"detached: pid={handle.pid}  pid_file={handle.pid_file}", file=sys.stderr)
-        print(f"follow with: constellation basecall --follow --output-dir {output_dir}", file=sys.stderr)
+        # --follow looks for the PID file beside the output, so name the
+        # output when it is not the default one under --output-dir.
+        follow = f"constellation basecall --follow --output-dir {output_dir}"
+        if args.output:
+            follow += f" --output {output}"
+        print(f"follow with: {follow}", file=sys.stderr)
         return 0
     if args.progress:
         for event in handle.tail_progress():
             print(event.raw, file=sys.stderr)
-    rc = handle.wait()
+    rc = handle.wait()  # a run that resumed from the partial removes it on exit 0
     if rc == 0:
         print(f"basecalled → {output}", file=sys.stderr)
         return 0
@@ -5169,7 +5216,7 @@ def _cmd_genome_assemble(args: argparse.Namespace) -> int:
             emit_report=not args.no_report,
             progress_cb=cb,
         )
-    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+    except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"assembly complete → {output_dir}", file=sys.stderr)
@@ -5328,13 +5375,14 @@ def _cmd_genome_polish(args: argparse.Namespace) -> int:
         polished = PolishRunner(
             rounds=args.polish_rounds, threads=args.threads, device=args.device,
             dorado_polish_extra=_shlex_tuple(args.dorado_polish_extra),
+            allow_multi_model=args.allow_multi_model,
         ).run(
             working,
             reads,
             output_dir / "polish",
             progress_cb=_stage_progress_cb(args),
         )
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if args.busco_lineage:

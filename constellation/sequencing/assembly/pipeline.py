@@ -37,8 +37,11 @@ from constellation.sequencing.assembly.manifest import write_assembly_manifest
 from constellation.sequencing.assembly.polish import PolishRunner
 from constellation.sequencing.assembly.ragtag import RagTagRunner
 from constellation.sequencing.assembly.stats import apply_busco
-from constellation.sequencing.basecall.dorado import DoradoRunner
-from constellation.sequencing.basecall.dorado_run import dorado_version
+from constellation.sequencing.basecall.dorado import (
+    DoradoRunner,
+    partial_path,
+)
+from constellation.sequencing.basecall.dorado_run import dorado_version, resolve_dorado
 from constellation.sequencing.basecall.models import DoradoModel
 from constellation.sequencing.basecall.readgroup import (
     DEFAULT_UNIFIED_RG,
@@ -96,7 +99,7 @@ def _input_identity(paths: "list[Path] | tuple[Path, ...]") -> list[str]:
     return out
 
 
-def _done(stage_dir: Path, key: str | None = None) -> bool:
+def _done(stage_dir: Path, key: str | None = None, *, marker: str = "_SUCCESS") -> bool:
     """True iff the stage completed AND its recorded key still matches.
 
     Reuse used to hinge on _SUCCESS alone, so a rerun with different
@@ -105,20 +108,21 @@ def _done(stage_dir: Path, key: str | None = None) -> bool:
     was rewritten with the NEW parameters — `--polish-rounds 1` changed
     to `2` reused the one-round result and recorded two. A marker with no
     key (or a stale one) is treated as a miss, which re-runs rather than
-    trusting output of unknown provenance.
+    trusting output of unknown provenance. ``marker`` names a marker other
+    than the stage's own (the basecall stage keeps one per flow cell).
     """
-    marker = stage_dir / "_SUCCESS"
-    if not marker.exists():
+    path = stage_dir / marker
+    if not path.exists():
         return False
     if key is None:
         return True
     try:
-        return marker.read_text().strip() == key
+        return path.read_text().strip() == key
     except OSError:
         return False
 
 
-def _invalidate(stage_dir: Path) -> None:
+def _invalidate(stage_dir: Path, *, marker: str = "_SUCCESS") -> None:
     """Drop a stage's success marker before its outputs are rewritten.
 
     Without this an interrupted refresh left configuration A's marker
@@ -126,12 +130,14 @@ def _invalidate(stage_dir: Path) -> None:
     --resume accepted it. The marker must never outlive the outputs it
     describes, so it is removed first and only re-created on success.
     """
-    (stage_dir / "_SUCCESS").unlink(missing_ok=True)
+    (stage_dir / marker).unlink(missing_ok=True)
 
 
-def _mark_done(stage_dir: Path, key: str | None = None) -> None:
+def _mark_done(
+    stage_dir: Path, key: str | None = None, *, marker: str = "_SUCCESS"
+) -> None:
     stage_dir.mkdir(parents=True, exist_ok=True)
-    (stage_dir / "_SUCCESS").write_text("" if key is None else key)
+    (stage_dir / marker).write_text("" if key is None else key)
 
 
 # Map the user-facing --reads-compression vocabulary to the codec understood
@@ -242,7 +248,7 @@ def run_assembly_pipeline(
     # silently ignored them — unlike top-level `basecall`, which wires
     # them into DoradoRunner.
     dorado_extra: tuple[str, ...] = (),
-    device: str = "cuda:0",
+    device: str | None = None,
     duplex: bool = False,
     emit_moves: bool = True,
     read_group: str = DEFAULT_UNIFIED_RG,
@@ -279,6 +285,14 @@ def run_assembly_pipeline(
 
     if bool(reads) == bool(pod5):
         raise ValueError("provide exactly one of `reads` (BAM/SAM) or `pod5`")
+    if pod5 and duplex and polish_rounds > 0:
+        # Refused up front: dorado polish has not taken duplex data since
+        # Dorado 1.0.1, and this used to fail only at the polish stage,
+        # after days of basecalling and the assembly.
+        raise ValueError(
+            "dorado polish does not support duplex reads (Dorado >= 1.0.1); "
+            "basecall simplex to polish, or drop --polish-rounds"
+        )
 
     stage_stats: dict[str, pa.Table] = {}
     stages: dict[str, dict] = {}
@@ -329,38 +343,101 @@ def run_assembly_pipeline(
         input_mode = "pod5"
         input_files = [str(p) for p in pod5]
         model = DoradoModel.parse(basecall_model)
+        # Modifications named twice are refused here, before any flow
+        # cell's files are touched, not when the first one launches.
+        model.arguments(tuple(modified_bases))
         basecall_dir = output_dir / "basecall"
         bam_inputs: list[Path] = []
         runner = DoradoRunner(
             device=device, threads=threads, extra_args=tuple(dorado_extra)
         )
         # Each --pod5 argument is one flow cell → its own basecall BAM
-        # (a directory of .pod5 is passed whole to dorado).
+        # (a directory of .pod5 is passed whole to dorado). Each flow cell
+        # is resumable on its own: a basecall takes days, and the stage
+        # had one marker written after the last flow cell, deleted before
+        # each, so an interrupted run re-basecalled every flow cell from
+        # zero and never resumed the one it was killed in.
+        flowcells = []
         for i, source in enumerate(Path(p) for p in pod5):
-            out_bam = basecall_dir / f"flowcell_{i:03d}.bam"
-            if resume and out_bam.exists() and _done(basecall_dir, k_basecall):
+            # Keyed by this flow cell's input alone, so adding a flow cell
+            # leaves the finished ones finished.
+            k_flowcell = _stage_key(
+                pod5=_input_identity([source]),
+                model=basecall_model,
+                mods=sorted(modified_bases),
+                extra=list(dorado_extra),
+                duplex=duplex,
+                emit_moves=emit_moves,
+            )
+            flowcells.append((source, basecall_dir / f"flowcell_{i:03d}.bam", k_flowcell))
+        if resume and _done(basecall_dir, k_basecall):
+            # A finished stage from before per-flow-cell markers has only
+            # the stage's marker; carry it onto each flow cell's own, which
+            # is what says a flow cell is finished from here on.
+            for _, out_bam, k_flowcell in flowcells:
+                if out_bam.exists():
+                    _mark_done(basecall_dir, k_flowcell, marker=f"{out_bam.name}.done")
+        dorado_resolved = False
+        for source, out_bam, k_flowcell in flowcells:
+            done = f"{out_bam.name}.done"
+            started = f"{out_bam.name}.started"
+            if resume and out_bam.exists() and _done(basecall_dir, k_flowcell, marker=done):
                 bam_inputs.append(out_bam)
                 continue
-            _invalidate(basecall_dir)
+            if not dorado_resolved:
+                # Resolved before any flow cell's files are removed or its
+                # markers dropped: a missing or too-old Dorado was found
+                # only at launch, after the BAM and partial below were gone.
+                resolve_dorado()
+                # The stage marker says every flow cell finished; it is
+                # written again once they all have. Kept while one was
+                # rebuilt, a rebuild that failed left an incomplete BAM
+                # under a marker the next --resume took for finished.
+                _invalidate(basecall_dir)
+                dorado_resolved = True
+            _invalidate(basecall_dir, marker=done)
+            # Continue an interrupted basecall only when it was started
+            # with these same settings (`.started` holds its key). Under
+            # --resume, anything else is a run of another configuration or
+            # of unknown provenance: remove it rather than resume from it.
+            # Without --resume nothing is removed here; the runner refuses
+            # to start over a partial it would otherwise orphan. Duplex has
+            # no resume path.
+            continuing = (
+                bool(resume)
+                and not duplex
+                and _done(basecall_dir, k_flowcell, marker=started)
+            )
+            if resume and not continuing:
+                stale = [q for q in (out_bam, partial_path(out_bam)) if q.exists()]
+                if stale:
+                    _emit(
+                        progress_cb, "stage_progress", "basecall",
+                        f"{out_bam.name}: not resumable with these settings; "
+                        "removing " + ", ".join(q.name for q in stale),
+                    )
+                for q in stale:
+                    q.unlink()
             _emit(progress_cb, "stage_start", "basecall", str(source))
             if duplex:
-                handle = runner.duplex(model, [source], out_bam, device=device)
+                handle = runner.duplex(
+                    model, [source], out_bam,
+                    modified_bases=modified_bases, device=device,
+                )
             else:
-                # `resume` is passed explicitly. DoradoRunner.basecaller
-                # defaults it to True, so omitting it made a FRESH run —
-                # or one whose key just changed — resume from a partial
-                # BAM produced under different parameters. Only resume
-                # when the caller asked to AND the stage key still
-                # matches; otherwise start clean.
                 handle = runner.basecaller(
                     model, [source], out_bam,
                     modified_bases=modified_bases, device=device,
                     emit_moves=emit_moves,
-                    resume=bool(resume) and _done(basecall_dir, k_basecall),
+                    resume=continuing,
                 )
+            # Written once Dorado is running: a launch the runner refused
+            # must not re-label files left by other settings as these.
+            _mark_done(basecall_dir, k_flowcell, marker=started)
             rc = handle.wait()
             if rc != 0:
                 raise RuntimeError(f"dorado basecaller failed (rc={rc}) for {source}")
+            _mark_done(basecall_dir, k_flowcell, marker=done)
             bam_inputs.append(out_bam)
         _mark_done(basecall_dir, k_basecall)
         _emit(progress_cb, "stage_done", "basecall", f"{len(bam_inputs)} BAM(s)")
@@ -512,7 +589,7 @@ def run_assembly_pipeline(
             "threads": threads,
             "hifiasm_mode": hifiasm_mode,
             "reads_compression": reads_compression,
-            "device": device if input_mode == "pod5" else None,
+            "device": (device or "auto") if input_mode == "pod5" else None,
             "duplex": duplex,
             "emit_moves": emit_moves if input_mode == "pod5" else None,
         },
@@ -520,7 +597,8 @@ def run_assembly_pipeline(
         outputs=outputs,
         basecall_model=basecall_model,
         modified_bases=list(modified_bases) or None,
-        device=device if input_mode == "pod5" else None,
+        # "auto": no --device was passed, so Dorado chose (all GPUs, else CPU).
+        device=(device or "auto") if input_mode == "pod5" else None,
         basecaller_model_ds=model_ds,
         scaffold_reference_handle=scaffold_reference_handle,
         scaffold_reference_path=scaffold_reference_path,

@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from _dorado_stub import install, parse_dorado_argv
+
 from constellation.cli.__main__ import main
 
 pytest.importorskip("pysam")
@@ -14,7 +16,7 @@ pytest.importorskip("matplotlib")
 
 _DORADO = r"""#!/usr/bin/env bash
 case "${1:-}" in
-  --version) echo "dorado 2.0.0+mock"; exit 0 ;;
+  --version) echo "dorado 2.1.2+mock"; exit 0 ;;
   basecaller|duplex)
     [[ -n "${MOCK_ARGV_FILE:-}" ]] && printf '%s\n' "$*" > "${MOCK_ARGV_FILE}"
     printf 'MOCKBAM'; echo "[info] 50%% done" >&2; exit 0 ;;
@@ -157,3 +159,189 @@ def test_cli_basecall_no_emit_moves_opts_out(tmp_path: Path, mocks, monkeypatch)
     ])
     assert rc == 0
     assert "--emit-moves" not in argv_file.read_text()
+
+
+def test_cli_basecall_modified_bases_without_emit_moves(tmp_path: Path, mocks, monkeypatch):
+    # `--modified-bases` reads a list up to the next option. With
+    # `--emit-moves` on (the default) the list happened to end at that
+    # flag; `--no-emit-moves` removed it, and the model and POD5 path were
+    # read as modification codes.
+    # (A full model name, which takes its modifications as the option.)
+    stub = install(tmp_path, monkeypatch)
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"),
+        "--model", "dna_r10.4.1_e8.2_400bps_sup@v5.0.0",
+        "--modified-bases", "5mCG_5hmCG", "--no-emit-moves",
+        "--output-dir", str(tmp_path / "bc"), "--device", "cpu",
+    ])
+    assert rc == 0
+    _, positionals, options = parse_dorado_argv(stub.argv())
+    assert positionals == [
+        "dna_r10.4.1_e8.2_400bps_sup@v5.0.0", str(tmp_path / "r.pod5"),
+    ]
+    assert options["--modified-bases"] == ["5mCG_5hmCG"]
+
+
+def test_cli_basecall_resume_clears_the_partial_once_done(tmp_path: Path, mocks, monkeypatch):
+    stub = install(tmp_path, monkeypatch)
+    out_dir = tmp_path / "bc"
+    out_dir.mkdir()
+    (out_dir / "calls.bam").write_bytes(b"R" * 100)  # an interrupted run
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup@v5.0.0",
+        "--output-dir", str(out_dir), "--device", "cpu", "--resume",
+    ])
+    assert rc == 0
+    _, _, options = parse_dorado_argv(stub.argv())
+    assert options["--resume-from"] == [str(out_dir / "calls.bam.partial")]
+    assert (out_dir / "calls.bam").read_bytes() == b"R" * 100 + b"MOCKBAM"
+    assert not (out_dir / "calls.bam.partial").exists()
+
+
+def test_cli_basecall_too_old_dorado_is_an_error_not_a_traceback(
+    tmp_path: Path, mocks, monkeypatch, capsys
+):
+    install(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOCK_DORADO_VERSION", "1.4.0")
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup@v5.0.0",
+        "--output-dir", str(tmp_path / "bc"), "--device", "cpu",
+    ])
+    assert rc == 1
+    assert "too old" in capsys.readouterr().err
+
+
+def test_cli_basecall_without_resume_refuses_a_partial(tmp_path: Path, mocks, monkeypatch, capsys):
+    stub = install(tmp_path, monkeypatch)
+    out_dir = tmp_path / "bc"
+    out_dir.mkdir()
+    (out_dir / "calls.bam.partial").write_bytes(b"P" * 100)
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup@v5.0.0",
+        "--output-dir", str(out_dir), "--device", "cpu",
+    ])
+    assert rc == 1
+    assert "--resume" in capsys.readouterr().err
+    assert stub.calls() == []
+
+
+def test_cli_basecall_variant_takes_modified_bases_inside(tmp_path: Path, mocks, monkeypatch):
+    stub = install(tmp_path, monkeypatch)
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "hac",
+        "--modified-bases", "6mA,5mC_5hmC", "--output-dir", str(tmp_path / "bc"),
+        "--duplex",
+    ])
+    assert rc == 0
+    verb, positionals, options = parse_dorado_argv(stub.argv())
+    assert verb == "duplex"
+    assert positionals == ["hac,6mA,5mC_5hmC", str(tmp_path / "r.pod5")]
+
+
+def test_cli_basecall_old_shorthand_names_its_replacement(tmp_path: Path, mocks, capsys):
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "hac@v4.3+5mC,5hmC",
+        "--output-dir", str(tmp_path / "bc"),
+    ])
+    assert rc == 2
+    assert "hac@v4.3.0,5mC_5hmC" in capsys.readouterr().err
+
+
+def test_cli_basecall_modifications_twice_is_a_usage_error(tmp_path: Path, mocks, capsys):
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup,6mA",
+        "--modified-bases", "5mCG_5hmCG", "--output-dir", str(tmp_path / "bc"),
+    ])
+    assert rc == 2
+    assert "one place" in capsys.readouterr().err
+
+
+def test_cli_basecall_leaves_the_device_to_dorado(tmp_path: Path, mocks, monkeypatch):
+    stub = install(tmp_path, monkeypatch)
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup",
+        "--output-dir", str(tmp_path / "bc"),
+    ])
+    assert rc == 0
+    _, _, options = parse_dorado_argv(stub.argv())
+    assert "--device" not in options
+
+
+def test_cli_assemble_duplex_with_polish_is_refused_before_basecalling(
+    tmp_path: Path, mocks, monkeypatch, capsys
+):
+    # dorado polish takes no duplex reads; this used to fail only at the
+    # polish stage, after days of basecalling and the assembly.
+    stub = install(tmp_path, monkeypatch)
+    rc = main([
+        "genome", "assemble", "--pod5", str(tmp_path / "fc1.pod5"), "--model", "sup",
+        "--duplex", "--polish-rounds", "1", "--output-dir", str(tmp_path / "out"),
+        "--threads", "1", "--no-report",
+    ])
+    assert rc == 1
+    assert "duplex" in capsys.readouterr().err
+    assert stub.calls() == []
+
+
+def test_cli_genome_polish_failure_is_an_error_not_a_traceback(
+    tmp_path: Path, mocks, monkeypatch, capsys
+):
+    b1 = tmp_path / "fc1.bam"
+    _bam(b1, "RGA")
+    out = tmp_path / "out"
+    assert main([
+        "genome", "assemble", "--reads", str(b1), "--output-dir", str(out),
+        "--threads", "1", "--no-report",
+    ]) == 0
+    install(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOCK_FAIL_ON", "draft.fasta")  # dorado dies in round 1
+    rc = main([
+        "genome", "polish", "--assembly-dir", str(out), "--reads", str(b1),
+        "--output-dir", str(tmp_path / "polished"), "--no-report",
+    ])
+    assert rc == 1
+    assert "refusing" in capsys.readouterr().err
+
+
+# ── review of #112: only the run that resumed from a partial removes it ──
+
+
+def test_cli_basecall_follow_never_removes_a_partial(tmp_path: Path, mocks, monkeypatch):
+    # A finished detached run leaves its PID and exit files behind. A later
+    # foreground --resume that fails keeps its reads in the partial; --follow
+    # then read the old run's exit code and deleted them.
+    from constellation.sequencing.basecall.dorado import RunHandle
+
+    install(tmp_path, monkeypatch)
+    out_dir = tmp_path / "bc"
+    base = [
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup",
+        "--output-dir", str(out_dir), "--device", "cpu",
+    ]
+    assert main([*base, "--detach"]) == 0
+    assert RunHandle.attach(out_dir / "calls.bam.dorado.basecaller.pid").wait(timeout=15) == 0
+
+    monkeypatch.setenv("MOCK_FAIL_ON", "--resume-from")
+    assert main([*base, "--resume"]) == 1
+    partial = out_dir / "calls.bam.partial"
+    assert partial.read_bytes() == b"MOCKBAM"
+
+    assert main(["basecall", "--follow", "--output-dir", str(out_dir)]) == 0
+    assert partial.read_bytes() == b"MOCKBAM"
+
+
+def test_cli_basecall_duplex_refuses_a_partial(tmp_path: Path, mocks, monkeypatch, capsys):
+    # The saved simplex reads were deleted once the duplex run exited 0.
+    stub = install(tmp_path, monkeypatch)
+    out_dir = tmp_path / "bc"
+    out_dir.mkdir()
+    partial = out_dir / "calls.bam.partial"
+    partial.write_bytes(b"R" * 100)
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup",
+        "--output-dir", str(out_dir), "--duplex",
+    ])
+    assert rc == 1
+    assert "simplex" in capsys.readouterr().err
+    assert stub.calls() == []
+    assert partial.read_bytes() == b"R" * 100

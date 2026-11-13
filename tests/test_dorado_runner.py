@@ -14,41 +14,17 @@ from pathlib import Path
 
 import pytest
 
+from _dorado_stub import install, parse_dorado_argv
+
 from constellation.sequencing.basecall.dorado import DoradoRunner, RunHandle, RunStatus
 from constellation.sequencing.basecall.models import DoradoModel
-
-_STUB = r"""#!/usr/bin/env bash
-verb="${1:-}"
-case "$verb" in
-  --version) echo "dorado 2.0.0+mock"; exit 0 ;;
-  download) exit 0 ;;
-esac
-if [[ -n "${MOCK_ARGV_FILE:-}" ]]; then
-  printf '%s\n' "$*" > "${MOCK_ARGV_FILE}"
-fi
-case "$verb" in
-  basecaller|duplex) printf 'MOCKBAM'; echo "[info] basecalling 50% done" >&2; exit 0 ;;
-  aligner) printf 'MOCKALN'; exit 0 ;;
-  summary) printf 'read_id\tn\nr1\t1\n'; exit 0 ;;
-  demux) exit 0 ;;
-  *) printf 'MOCKOUT'; exit 0 ;;
-esac
-"""
 
 
 @pytest.fixture
 def mock_dorado(tmp_path: Path, monkeypatch):
     if shutil.which("bash") is None:  # pragma: no cover
         pytest.skip("bash not available for the mock binary")
-    home = tmp_path / "dorado_home"
-    (home / "bin").mkdir(parents=True)
-    stub = home / "bin" / "dorado"
-    stub.write_text(_STUB)
-    stub.chmod(0o755)
-    monkeypatch.setenv("CONSTELLATION_DORADO_HOME", str(home))
-    argv_file = tmp_path / "argv.txt"
-    monkeypatch.setenv("MOCK_ARGV_FILE", str(argv_file))
-    return argv_file
+    return install(tmp_path, monkeypatch)
 
 
 def test_basecaller_foreground(tmp_path: Path, mock_dorado):
@@ -59,18 +35,44 @@ def test_basecaller_foreground(tmp_path: Path, mock_dorado):
     assert handle.poll() == RunStatus.COMPLETED
     assert out.read_bytes().startswith(b"MOCKBAM")
     assert handle.stderr_log.exists()
-    argv = mock_dorado.read_text()
-    assert "basecaller" in argv
-    assert "--device cpu" in argv
-    assert model.model_name() in argv
+    verb, positionals, options = parse_dorado_argv(mock_dorado.argv())
+    assert verb == "basecaller"
+    assert options["--device"] == ["cpu"]
+    assert positionals == ["sup@v5.0.0", str(tmp_path / "r.pod5")]
 
 
-def test_basecaller_modified_bases_from_model(tmp_path: Path, mock_dorado):
-    model = DoradoModel.parse("hac@v4.3+5mC,5hmC")
+def test_basecaller_modified_bases_after_the_positionals(tmp_path: Path, mock_dorado):
+    # `--modified-bases` reads a list up to the next option. Before the
+    # positionals, with no `--emit-moves` after it (the library default),
+    # it took the model and the POD5 path as modification codes and Dorado
+    # was left with no model at all.
+    # (A full model name takes its modifications as --modified-bases; a
+    # variant takes them inside the model argument.)
+    model = DoradoModel.parse("dna_r10.4.1_e8.2_400bps_sup@v5.0.0")
     out = tmp_path / "calls.bam"
-    DoradoRunner(device="cpu").basecaller(model, [tmp_path / "r.pod5"], out).wait()
-    argv = mock_dorado.read_text()
-    assert "--modified-bases 5mC 5hmC" in argv
+    pod5 = [tmp_path / "a.pod5", tmp_path / "b.pod5"]
+    DoradoRunner(device="cpu").basecaller(
+        model, pod5, out, modified_bases=("6mA", "5mC_5hmC")
+    ).wait()
+    _, positionals, options = parse_dorado_argv(mock_dorado.argv())
+    assert positionals == ["dna_r10.4.1_e8.2_400bps_sup@v5.0.0", *(str(p) for p in pod5)]
+    assert options["--modified-bases"] == ["6mA", "5mC_5hmC"]
+
+
+def test_basecaller_modified_bases_after_extra_args(tmp_path: Path, mock_dorado):
+    model = DoradoModel.parse("dna_r10.4.1_e8.2_400bps_sup@v5.0.0")
+    out = tmp_path / "calls.bam"
+    DoradoRunner(
+        device="cpu", extra_args=("--models-directory", str(tmp_path / "m"))
+    ).basecaller(
+        model, [tmp_path / "r.pod5"], out,
+        modified_bases=("5mCG_5hmCG",), emit_moves=True,
+    ).wait()
+    _, positionals, options = parse_dorado_argv(mock_dorado.argv())
+    assert positionals == ["dna_r10.4.1_e8.2_400bps_sup@v5.0.0", str(tmp_path / "r.pod5")]
+    assert options["--modified-bases"] == ["5mCG_5hmCG"]
+    assert "--emit-moves" in options
+    assert options["--models-directory"] == [str(tmp_path / "m")]
 
 
 def test_basecaller_emit_moves_flag(tmp_path: Path, mock_dorado):
@@ -79,7 +81,8 @@ def test_basecaller_emit_moves_flag(tmp_path: Path, mock_dorado):
     DoradoRunner(device="cpu").basecaller(
         model, [tmp_path / "r.pod5"], out, emit_moves=True
     ).wait()
-    assert "--emit-moves" in mock_dorado.read_text()
+    _, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert "--emit-moves" in options
 
 
 def test_basecaller_detach_and_attach(tmp_path: Path, mock_dorado):
@@ -117,10 +120,83 @@ def test_aligner_and_summary(tmp_path: Path, mock_dorado):
 
 
 def test_fetch_model_returns_dir(tmp_path: Path, mock_dorado):
-    model = DoradoModel.parse("sup@v5.0.0")
+    model = DoradoModel.parse("dna_r10.4.1_e8.2_400bps_sup@v5.0.0")
     models_dir = tmp_path / "models"
     resolved = DoradoRunner().fetch_model(model, models_dir=models_dir)
-    assert resolved == models_dir / model.model_name()
+    assert resolved == models_dir / "dna_r10.4.1_e8.2_400bps_sup@v5.0.0"
+    _, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert options["--model"] == ["dna_r10.4.1_e8.2_400bps_sup@v5.0.0"]
+
+
+def test_fetch_model_refuses_a_variant(tmp_path: Path, mock_dorado):
+    # A variant names no single model until Dorado reads a POD5's chemistry.
+    with pytest.raises(ValueError, match="full model name"):
+        DoradoRunner().fetch_model(DoradoModel.parse("sup@v5.0.0"), tmp_path / "m")
+    assert mock_dorado.calls() == []
+
+
+def test_fetch_model_returns_a_model_directory(tmp_path: Path, mock_dorado):
+    directory = tmp_path / "dna_r10.4.1_e8.2_400bps_sup@v5.0.0"
+    directory.mkdir()
+    model = DoradoModel.parse(str(directory))
+    assert DoradoRunner().fetch_model(model) == directory
+
+
+# ── Dorado's model argument, passed through ───────────────────────────
+
+
+@pytest.mark.parametrize(
+    "spec, mods, expected_model, expected_option",
+    [
+        # Dorado's own syntax goes through untouched: no chemistry written
+        # in, so RNA004 and 4 kHz data get the model their POD5 calls for.
+        ("sup", (), "sup", None),
+        ("hac@v4.3", (), "hac@v4.3", None),
+        ("sup@latest,5mCG_5hmCG@v1", (), "sup@latest,5mCG_5hmCG@v1", None),
+        # --modified-bases on a variant: inside the variant, as Dorado's
+        # docs write it.
+        ("hac@v5.0.0", ("5mCG_5hmCG",), "hac@v5.0.0,5mCG_5hmCG", None),
+        ("sup", ("6mA", "5mC_5hmC"), "sup,6mA,5mC_5hmC", None),
+        # ... on a full name: after the positionals.
+        ("dna_r10.4.1_e8.2_400bps_sup@v5.0.0", ("5mCG_5hmCG",), "dna_r10.4.1_e8.2_400bps_sup@v5.0.0", ["5mCG_5hmCG"]),
+    ],
+)
+def test_basecaller_passes_the_model_through(
+    tmp_path: Path, mock_dorado, spec, mods, expected_model, expected_option
+):
+    DoradoRunner().basecaller(
+        DoradoModel.parse(spec), [tmp_path / "r.pod5"], tmp_path / "calls.bam",
+        modified_bases=mods,
+    ).wait()
+    _, positionals, options = parse_dorado_argv(mock_dorado.argv())
+    assert positionals == [expected_model, str(tmp_path / "r.pod5")]
+    assert options.get("--modified-bases") == expected_option
+
+
+def test_modifications_named_twice_are_refused_before_dorado_runs(
+    tmp_path: Path, mock_dorado
+):
+    # Dorado refuses a variant's modifications beside --modified-bases.
+    out = tmp_path / "calls.bam"
+    out.write_bytes(b"R" * 100)
+    with pytest.raises(ValueError, match="one place"):
+        DoradoRunner().basecaller(
+            DoradoModel.parse("sup,5mCG_5hmCG"), [tmp_path / "r.pod5"], out,
+            modified_bases=("6mA",), resume=True,
+        )
+    assert mock_dorado.calls() == []
+    assert out.read_bytes() == b"R" * 100  # nothing moved
+
+
+def test_duplex_carries_modifications(tmp_path: Path, mock_dorado):
+    # duplex dropped modified_bases without a word.
+    DoradoRunner().duplex(
+        DoradoModel.parse("sup"), [tmp_path / "r.pod5"], tmp_path / "calls.bam",
+        modified_bases=("5mCG_5hmCG",),
+    ).wait()
+    verb, positionals, _ = parse_dorado_argv(mock_dorado.argv())
+    assert verb == "duplex"
+    assert positionals == ["sup,5mCG_5hmCG", str(tmp_path / "r.pod5")]
 
 
 def test_basecaller_resume_moves_partial(tmp_path: Path, mock_dorado):
@@ -130,34 +206,208 @@ def test_basecaller_resume_moves_partial(tmp_path: Path, mock_dorado):
     DoradoRunner(device="cpu").basecaller(
         model, [tmp_path / "r.pod5"], out, resume=True
     ).wait()
-    argv = mock_dorado.read_text()
-    assert "--resume-from" in argv
-    assert (tmp_path / "calls.bam.partial").exists()
+    _, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert options["--resume-from"] == [str(tmp_path / "calls.bam.partial")]
+    assert out.read_bytes() == b"PARTIAL" + b"MOCKBAM"
 
 
-def test_resolve_dorado_rejects_pre_2_0(tmp_path: Path, monkeypatch):
-    # A dorado that reports a pre-2.0.0 version must be refused — the
-    # pipeline carries no backwards compatibility for older Dorado.
+def test_resume_that_dies_while_copying_keeps_the_partial(
+    tmp_path: Path, mock_dorado, monkeypatch
+):
+    # A resume killed while Dorado was still copying the partial's reads
+    # left a few bytes in the output; the next resume moved those bytes
+    # over the partial and days of reads were gone.
+    model = DoradoModel.parse("sup@v5.0.0")
+    out = tmp_path / "calls.bam"
+    partial = tmp_path / "calls.bam.partial"
+    out.write_bytes(b"R" * 19_000)  # the first run, killed
+    runner = DoradoRunner(device="cpu")
+
+    monkeypatch.setenv("MOCK_FAIL_ON", "--resume-from")
+    monkeypatch.setenv("MOCK_PARTIAL_BYTES", "3")
+    assert runner.basecaller(model, [tmp_path / "r.pod5"], out, resume=True).wait() == 1
+    assert partial.read_bytes() == b"R" * 19_000
+    assert out.stat().st_size == 3
+
+    monkeypatch.delenv("MOCK_FAIL_ON")
+    assert runner.basecaller(model, [tmp_path / "r.pod5"], out, resume=True).wait() == 0
+    _, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert options["--resume-from"] == [str(partial)]
+    # the stub writes the resume file's reads first, as Dorado does
+    assert out.read_bytes() == b"R" * 19_000 + b"MOCKBAM"
+    assert not partial.exists()  # the finished run holds them now
+
+
+def test_resume_takes_an_output_larger_than_the_partial(tmp_path: Path, mock_dorado):
+    # An interrupted resume that had finished copying and gone on to new
+    # reads holds more than the partial it started from.
+    model = DoradoModel.parse("sup@v5.0.0")
+    out = tmp_path / "calls.bam"
+    partial = tmp_path / "calls.bam.partial"
+    partial.write_bytes(b"P" * 100)
+    out.write_bytes(b"P" * 100 + b"N" * 400)
+    DoradoRunner(device="cpu").basecaller(
+        model, [tmp_path / "r.pod5"], out, resume=True
+    ).wait()
+    assert out.read_bytes() == b"P" * 100 + b"N" * 400 + b"MOCKBAM"
+
+
+@pytest.mark.parametrize("output_state", ["missing", "empty"])
+def test_resume_from_a_partial_with_no_output(
+    tmp_path: Path, mock_dorado, output_state: str
+):
+    # A partial with no output beside it was ignored, and the run started
+    # again from zero.
+    model = DoradoModel.parse("sup@v5.0.0")
+    out = tmp_path / "calls.bam"
+    partial = tmp_path / "calls.bam.partial"
+    partial.write_bytes(b"P" * 50)
+    if output_state == "empty":
+        out.write_bytes(b"")
+    DoradoRunner(device="cpu").basecaller(
+        model, [tmp_path / "r.pod5"], out, resume=True
+    ).wait()
+    _, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert options["--resume-from"] == [str(partial)]
+    assert out.read_bytes() == b"P" * 50 + b"MOCKBAM"
+
+
+def test_unusable_dorado_leaves_the_output_where_it_was(tmp_path: Path, monkeypatch):
+    # The output used to be moved to the partial before Dorado was
+    # resolved; a too-old (or missing) Dorado then left nothing at the
+    # output, and the next --resume started from zero.
+    from constellation.sequencing.basecall.dorado_run import DoradoVersionError
+
+    install(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOCK_DORADO_VERSION", "1.4.0")
+    out = tmp_path / "calls.bam"
+    out.write_bytes(b"R" * 19_000)
+    with pytest.raises(DoradoVersionError):
+        DoradoRunner(device="cpu").basecaller(
+            DoradoModel.parse("sup@v5.0.0"), [tmp_path / "r.pod5"], out, resume=True
+        )
+    assert out.read_bytes() == b"R" * 19_000
+    assert not (tmp_path / "calls.bam.partial").exists()
+
+
+def test_fresh_run_refuses_to_orphan_a_partial(tmp_path: Path, mock_dorado):
+    partial = tmp_path / "calls.bam.partial"
+    partial.write_bytes(b"P" * 50)
+    with pytest.raises(FileExistsError, match="--resume"):
+        DoradoRunner(device="cpu").basecaller(
+            DoradoModel.parse("sup@v5.0.0"), [tmp_path / "r.pod5"],
+            tmp_path / "calls.bam", resume=False,
+        )
+    assert mock_dorado.calls() == []
+    assert partial.read_bytes() == b"P" * 50
+
+
+@pytest.mark.parametrize("version", ["1.4.0", "2.0.0", "2.1.1"])
+def test_resolve_dorado_rejects_below_the_floor(tmp_path: Path, monkeypatch, version: str):
+    # Below 2.1.2 the SUP v5+ and HAC v6 models do not give the same reads
+    # twice, so an older Dorado is refused rather than run.
     from constellation.sequencing.basecall.dorado_run import (
         DoradoVersionError,
         resolve_dorado,
     )
 
-    home = tmp_path / "old_dorado"
-    (home / "bin").mkdir(parents=True)
-    stub = home / "bin" / "dorado"
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
-        'case "${1:-}" in --version) echo "dorado 1.4.0+old"; exit 0 ;; *) exit 0 ;; esac\n'
-    )
-    stub.chmod(0o755)
-    monkeypatch.setenv("CONSTELLATION_DORADO_HOME", str(home))
+    install(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOCK_DORADO_VERSION", version)
     with pytest.raises(DoradoVersionError, match="too old"):
         resolve_dorado()
 
 
-def test_resolve_dorado_accepts_2_0(tmp_path: Path, mock_dorado):
-    # The mock reports 2.0.0+mock → resolves without raising.
+def test_resolve_dorado_accepts_the_floor(tmp_path: Path, mock_dorado):
+    # The mock reports 2.1.2+mock → resolves without raising.
     from constellation.sequencing.basecall.dorado_run import resolve_dorado
 
     assert resolve_dorado().name == "dorado"
+
+
+def test_doctor_and_resolver_share_one_floor():
+    from constellation.sequencing.basecall.dorado_run import DORADO_MIN_VERSION
+    from constellation.thirdparty.registry import registered
+
+    spec = next(s for s in registered() if s.name == "dorado")
+    assert spec.min_version == DORADO_MIN_VERSION == "2.1.2"
+
+
+# ── the device is Dorado's to choose ──────────────────────────────────
+
+
+@pytest.mark.parametrize("verb", ["basecaller", "duplex", "polish"])
+def test_no_device_given_leaves_it_to_dorado(tmp_path: Path, mock_dorado, verb: str):
+    # A fixed cuda:0 default held a multi-day basecall to one GPU of a
+    # multi-GPU node; with no --device Dorado's own `auto` uses them all.
+    runner = DoradoRunner()
+    out = tmp_path / "out"
+    if verb == "polish":
+        runner.polish(tmp_path / "aligned.bam", tmp_path / "draft.fa", out).wait()
+    else:
+        getattr(runner, verb)(
+            DoradoModel.parse("sup"), [tmp_path / "r.pod5"], out
+        ).wait()
+    seen, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert seen == verb
+    assert "--device" not in options
+
+
+def test_a_device_given_is_passed(tmp_path: Path, mock_dorado):
+    DoradoRunner().basecaller(
+        DoradoModel.parse("sup"), [tmp_path / "r.pod5"], tmp_path / "out",
+        device="cuda:all",
+    ).wait()
+    _, _, options = parse_dorado_argv(mock_dorado.argv())
+    assert options["--device"] == ["cuda:all"]
+
+
+# ── a run removes the partial it resumed from, and no other ──────────
+
+
+def test_resumed_run_removes_its_partial_once_it_exits_0(tmp_path: Path, mock_dorado):
+    # The output holds every read of the partial once the run exits 0, so
+    # the run that consumed the partial removes it, not whoever looks at
+    # the run afterwards.
+    out = tmp_path / "calls.bam"
+    out.write_bytes(b"R" * 100)
+    handle = DoradoRunner(device="cpu").basecaller(
+        DoradoModel.parse("sup"), [tmp_path / "r.pod5"], out, resume=True
+    )
+    assert handle.wait() == 0
+    assert not (tmp_path / "calls.bam.partial").exists()
+    assert out.read_bytes() == b"R" * 100 + b"MOCKBAM"
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_detached_resumed_run_removes_its_own_partial(
+    tmp_path: Path, mock_dorado, monkeypatch, fails: bool
+):
+    # A detached run has nobody waiting on it, so the run itself removes
+    # the partial, before its exit code is written; a run that fails
+    # keeps it.
+    if fails:
+        monkeypatch.setenv("MOCK_FAIL_ON", "--resume-from")
+    out = tmp_path / "calls.bam"
+    out.write_bytes(b"R" * 100)
+    handle = DoradoRunner(device="cpu").basecaller(
+        DoradoModel.parse("sup"), [tmp_path / "r.pod5"], out, resume=True, detach=True
+    )
+    assert handle.wait(timeout=15) == (1 if fails else 0)
+    partial = tmp_path / "calls.bam.partial"
+    assert partial.exists() == fails
+    if fails:
+        assert partial.read_bytes() == b"R" * 100
+
+
+def test_duplex_refuses_to_orphan_a_partial(tmp_path: Path, mock_dorado):
+    # Duplex neither resumes from a partial nor used to check for one, so
+    # a duplex run into the same output left the simplex reads behind (and
+    # its caller then deleted them as if it had consumed them).
+    partial = tmp_path / "calls.bam.partial"
+    partial.write_bytes(b"P" * 50)
+    with pytest.raises(FileExistsError, match="simplex"):
+        DoradoRunner(device="cpu").duplex(
+            DoradoModel.parse("sup"), [tmp_path / "r.pod5"], tmp_path / "calls.bam"
+        )
+    assert mock_dorado.calls() == []
+    assert partial.read_bytes() == b"P" * 50
