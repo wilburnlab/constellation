@@ -102,6 +102,11 @@ class RunHandle:
     Foreground runs hold the live ``Popen`` (in ``extras['_proc']``);
     detached / attached runs track liveness via the PID + an exit-code
     sentinel file (``extras['exit_file']``).
+
+    A foreground run that consumed a file (``extras['remove_on_success']``,
+    a resumed basecall's partial) removes it once ``wait`` sees exit 0. A
+    detached run's own shell does that, so an attached handle never
+    removes anything.
     """
 
     pid: int
@@ -149,7 +154,11 @@ class RunHandle:
         """Block until the subprocess exits. Returns its exit code."""
         proc = self.extras.get("_proc")
         if proc is not None:
-            return proc.wait(timeout=timeout)
+            rc = proc.wait(timeout=timeout)
+            consumed = self.extras.pop("remove_on_success", None)
+            if rc == 0 and consumed is not None:
+                Path(consumed).unlink(missing_ok=True)
+            return rc
         exit_file = self.extras.get("exit_file")
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
@@ -232,18 +241,24 @@ def partial_path(output: Path) -> Path:
     return output.with_name(output.name + ".partial")
 
 
-def clear_partial(output: Path) -> None:
-    """Delete ``<output>.partial`` after a run that resumed from it exits 0.
-
-    Dorado writes every read of the resume file into the new output, so a
-    finished output holds all of the partial's reads and the partial is
-    only a second copy (often hundreds of GB).
-    """
-    partial_path(output).unlink(missing_ok=True)
-
-
 def _non_empty(path: Path) -> bool:
     return path.exists() and path.stat().st_size > 0
+
+
+def _refuse_partial(output: Path, remedy: str) -> None:
+    """Refuse to start a run that would leave ``<output>.partial`` behind.
+
+    A partial holds the reads of an interrupted simplex basecall. A run
+    that does not resume from it rewrites the output beside it, so the
+    partial is orphaned, and a later ``--resume`` would weigh it against
+    an output of another run.
+    """
+    partial = partial_path(output)
+    if _non_empty(partial):
+        raise FileExistsError(
+            f"{partial} holds the reads of an interrupted simplex basecall; "
+            f"{remedy}, or remove it to start over"
+        )
 
 
 def _resume_source(output: Path, partial: Path) -> Path | None:
@@ -303,6 +318,7 @@ class DoradoRunner:
         output: Path,
         stage: str,
         detach: bool,
+        remove_on_success: Path | None = None,
     ) -> RunHandle:
         output = Path(output)
         log_dir = output.parent
@@ -316,7 +332,16 @@ class DoradoRunner:
             detach=detach,
             pid_file=pid_file if detach else None,
             started_at=started,
+            remove_on_success=remove_on_success,
         )
+        extras: dict[str, Any] = {
+            "_proc": proc,
+            "exit_file": str(exit_file) if exit_file else None,
+            "stage": stage,
+            "detached": detach,
+        }
+        if remove_on_success is not None and not detach:
+            extras["remove_on_success"] = str(remove_on_success)
         return RunHandle(
             pid=pid,
             pid_file=pid_file,
@@ -324,12 +349,7 @@ class DoradoRunner:
             stdout_log=output,
             stderr_log=stderr_log,
             started_at=started,
-            extras={
-                "_proc": proc,
-                "exit_file": str(exit_file) if exit_file else None,
-                "stage": stage,
-                "detached": detach,
-            },
+            extras=extras,
         )
 
     # ── verbs ───────────────────────────────────────────────────────
@@ -356,10 +376,14 @@ class DoradoRunner:
 
         ``resume`` continues an interrupted run with ``--resume-from``
         from ``<output>.partial`` (see :func:`_resume_source` for which
-        file that is). Without ``resume``, a non-empty ``<output>.partial``
-        raises ``FileExistsError`` rather than being silently left behind
-        by a fresh run. Callers delete the partial with
-        :func:`clear_partial` once the run exits 0.
+        file that is), and the run removes the partial once Dorado exits 0
+        (the output then holds every read of it): a foreground run in
+        :meth:`RunHandle.wait`, a detached one itself. Only the run that
+        resumed from it removes it — a caller clearing ``<output>.partial``
+        after any run that exited 0 deleted a partial another run had left
+        there. Without ``resume``, a non-empty ``<output>.partial`` raises
+        ``FileExistsError`` rather than being silently left behind by a
+        fresh run.
         """
         output = Path(output)
         model_arg, trailing = model.arguments(tuple(modified_bases))
@@ -372,11 +396,8 @@ class DoradoRunner:
         resume_from: Path | None = None
         if resume:
             resume_from = _resume_source(output, partial)
-        elif _non_empty(partial):
-            raise FileExistsError(
-                f"{partial} holds the reads of an interrupted run; pass "
-                f"--resume to continue it, or remove it to start over"
-            )
+        else:
+            _refuse_partial(output, "pass --resume to continue it")
         dev = device if device is not None else self.device
         argv: list[str] = ["basecaller"]
         if dev:
@@ -390,7 +411,10 @@ class DoradoRunner:
         # model and the POD5 paths as modification codes. Last, as ONT's
         # docs write it, it has nothing after it to take.
         argv += [*self.extra_args, model_arg, *(str(p) for p in pod5_paths), *trailing]
-        return self._launch(argv, output=output, stage="basecaller", detach=detach)
+        return self._launch(
+            argv, output=output, stage="basecaller", detach=detach,
+            remove_on_success=resume_from,
+        )
 
     def duplex(
         self,
@@ -407,9 +431,14 @@ class DoradoRunner:
 
         Takes the same model forms and modifications as :meth:`basecaller`
         (it used to drop ``modified_bases`` without a word). Dorado's
-        duplex has no ``--emit-moves`` and no resume path.
+        duplex has no ``--emit-moves`` and no resume path, so a non-empty
+        ``<output>.partial`` (a simplex run's reads) raises
+        ``FileExistsError``, as it does for a fresh simplex run.
         """
         model_arg, trailing = model.arguments(tuple(modified_bases))
+        _refuse_partial(
+            Path(output), "continue it with a simplex basecall and --resume"
+        )
         dev = device if device is not None else self.device
         argv: list[str] = ["duplex"]
         if dev:
@@ -538,5 +567,4 @@ __all__ = [
     "RunStatus",
     "DoradoProgressEvent",
     "partial_path",
-    "clear_partial",
 ]

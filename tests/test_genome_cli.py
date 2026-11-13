@@ -301,3 +301,47 @@ def test_cli_genome_polish_failure_is_an_error_not_a_traceback(
     ])
     assert rc == 1
     assert "refusing" in capsys.readouterr().err
+
+
+# ── review of #112: only the run that resumed from a partial removes it ──
+
+
+def test_cli_basecall_follow_never_removes_a_partial(tmp_path: Path, mocks, monkeypatch):
+    # A finished detached run leaves its PID and exit files behind. A later
+    # foreground --resume that fails keeps its reads in the partial; --follow
+    # then read the old run's exit code and deleted them.
+    from constellation.sequencing.basecall.dorado import RunHandle
+
+    install(tmp_path, monkeypatch)
+    out_dir = tmp_path / "bc"
+    base = [
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup",
+        "--output-dir", str(out_dir), "--device", "cpu",
+    ]
+    assert main([*base, "--detach"]) == 0
+    assert RunHandle.attach(out_dir / "calls.bam.dorado.basecaller.pid").wait(timeout=15) == 0
+
+    monkeypatch.setenv("MOCK_FAIL_ON", "--resume-from")
+    assert main([*base, "--resume"]) == 1
+    partial = out_dir / "calls.bam.partial"
+    assert partial.read_bytes() == b"MOCKBAM"
+
+    assert main(["basecall", "--follow", "--output-dir", str(out_dir)]) == 0
+    assert partial.read_bytes() == b"MOCKBAM"
+
+
+def test_cli_basecall_duplex_refuses_a_partial(tmp_path: Path, mocks, monkeypatch, capsys):
+    # The saved simplex reads were deleted once the duplex run exited 0.
+    stub = install(tmp_path, monkeypatch)
+    out_dir = tmp_path / "bc"
+    out_dir.mkdir()
+    partial = out_dir / "calls.bam.partial"
+    partial.write_bytes(b"R" * 100)
+    rc = main([
+        "basecall", "--pod5", str(tmp_path / "r.pod5"), "--model", "sup",
+        "--output-dir", str(out_dir), "--duplex",
+    ])
+    assert rc == 1
+    assert "simplex" in capsys.readouterr().err
+    assert stub.calls() == []
+    assert partial.read_bytes() == b"R" * 100

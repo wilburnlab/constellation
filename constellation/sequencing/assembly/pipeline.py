@@ -39,10 +39,9 @@ from constellation.sequencing.assembly.ragtag import RagTagRunner
 from constellation.sequencing.assembly.stats import apply_busco
 from constellation.sequencing.basecall.dorado import (
     DoradoRunner,
-    clear_partial,
     partial_path,
 )
-from constellation.sequencing.basecall.dorado_run import dorado_version
+from constellation.sequencing.basecall.dorado_run import dorado_version, resolve_dorado
 from constellation.sequencing.basecall.models import DoradoModel
 from constellation.sequencing.basecall.readgroup import (
     DEFAULT_UNIFIED_RG,
@@ -358,11 +357,8 @@ def run_assembly_pipeline(
         # had one marker written after the last flow cell, deleted before
         # each, so an interrupted run re-basecalled every flow cell from
         # zero and never resumed the one it was killed in.
-        stage_done = bool(resume) and _done(basecall_dir, k_basecall)
-        if not stage_done:
-            _invalidate(basecall_dir)
+        flowcells = []
         for i, source in enumerate(Path(p) for p in pod5):
-            out_bam = basecall_dir / f"flowcell_{i:03d}.bam"
             # Keyed by this flow cell's input alone, so adding a flow cell
             # leaves the finished ones finished.
             k_flowcell = _stage_key(
@@ -373,15 +369,32 @@ def run_assembly_pipeline(
                 duplex=duplex,
                 emit_moves=emit_moves,
             )
+            flowcells.append((source, basecall_dir / f"flowcell_{i:03d}.bam", k_flowcell))
+        if resume and _done(basecall_dir, k_basecall):
+            # A finished stage from before per-flow-cell markers has only
+            # the stage's marker; carry it onto each flow cell's own, which
+            # is what says a flow cell is finished from here on.
+            for _, out_bam, k_flowcell in flowcells:
+                if out_bam.exists():
+                    _mark_done(basecall_dir, k_flowcell, marker=f"{out_bam.name}.done")
+        dorado_resolved = False
+        for source, out_bam, k_flowcell in flowcells:
             done = f"{out_bam.name}.done"
             started = f"{out_bam.name}.started"
-            if (
-                resume
-                and out_bam.exists()
-                and (stage_done or _done(basecall_dir, k_flowcell, marker=done))
-            ):
+            if resume and out_bam.exists() and _done(basecall_dir, k_flowcell, marker=done):
                 bam_inputs.append(out_bam)
                 continue
+            if not dorado_resolved:
+                # Resolved before any flow cell's files are removed or its
+                # markers dropped: a missing or too-old Dorado was found
+                # only at launch, after the BAM and partial below were gone.
+                resolve_dorado()
+                # The stage marker says every flow cell finished; it is
+                # written again once they all have. Kept while one was
+                # rebuilt, a rebuild that failed left an incomplete BAM
+                # under a marker the next --resume took for finished.
+                _invalidate(basecall_dir)
+                dorado_resolved = True
             _invalidate(basecall_dir, marker=done)
             # Continue an interrupted basecall only when it was started
             # with these same settings (`.started` holds its key). Under
@@ -425,7 +438,6 @@ def run_assembly_pipeline(
             if rc != 0:
                 raise RuntimeError(f"dorado basecaller failed (rc={rc}) for {source}")
             _mark_done(basecall_dir, k_flowcell, marker=done)
-            clear_partial(out_bam)
             bam_inputs.append(out_bam)
         _mark_done(basecall_dir, k_basecall)
         _emit(progress_cb, "stage_done", "basecall", f"{len(bam_inputs)} BAM(s)")

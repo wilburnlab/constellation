@@ -85,6 +85,7 @@ def spawn_dorado(
     pid_file: Path | None = None,
     started_at: float = 0.0,
     env: dict[str, str] | None = None,
+    remove_on_success: Path | None = None,
 ) -> tuple[int, subprocess.Popen | None, Path | None]:
     """Spawn ``dorado <argv>`` with stdout→``output_path``, stderr→log.
 
@@ -92,6 +93,12 @@ def spawn_dorado(
     mode the live ``Popen`` is returned (caller drives ``wait``/``poll``
     on it); in ``detach`` mode the process is decoupled, a PID file +
     exit-code sentinel are written, and the ``Popen`` is ``None``.
+
+    ``remove_on_success`` is a file the run consumed (a resumed basecall's
+    partial). A detached run removes it itself when Dorado exits 0, before
+    the exit code is written; nothing that attaches later does, since an
+    exit code left behind may belong to an earlier run than the file. A
+    foreground run's :class:`RunHandle` removes it in ``wait``.
     """
     output_path = Path(output_path)
     stderr_log = Path(stderr_log)
@@ -111,10 +118,15 @@ def spawn_dorado(
 
     exit_file = _exit_file_for(pid_file, output_path)
     exit_file.unlink(missing_ok=True)
+    remove = (
+        f"if [ \"$rc\" -eq 0 ]; then rm -f -- {shlex.quote(str(remove_on_success))}; fi; "
+        if remove_on_success is not None
+        else ""
+    )
     wrapper = (
         f"{shlex.join(full)} > {shlex.quote(str(output_path))} "
-        f"2> {shlex.quote(str(stderr_log))}; "
-        f"echo $? > {shlex.quote(str(exit_file))}"
+        f"2> {shlex.quote(str(stderr_log))}; rc=$?; "
+        f"{remove}echo \"$rc\" > {shlex.quote(str(exit_file))}"
     )
     proc = subprocess.Popen(
         ["bash", "-c", wrapper],

@@ -5034,11 +5034,7 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
     import sys
     from pathlib import Path
 
-    from constellation.sequencing.basecall.dorado import (
-        DoradoRunner,
-        RunHandle,
-        clear_partial,
-    )
+    from constellation.sequencing.basecall.dorado import DoradoRunner, RunHandle
     from constellation.sequencing.basecall.dorado_run import DoradoVersionError
     from constellation.sequencing.basecall.models import DoradoModel
 
@@ -5064,10 +5060,10 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
             print(event.raw, file=sys.stderr)
         rc = handle.wait()
         print(f"basecall {'completed' if rc == 0 else 'failed'} (rc={rc})", file=sys.stderr)
-        if rc == 0:
-            # The finished output holds every read of a partial it resumed
-            # from; the partial is only a second copy now.
-            clear_partial(handle.output_path)
+        # Nothing is removed here: a detached run that resumed from a
+        # partial removes it itself. An exit code left behind can be an
+        # earlier run's, and clearing the partial on it deleted the reads
+        # a later, failed run had kept there.
         return 0 if rc == 0 else 1
 
     if not args.pod5 or not args.model:
@@ -5127,9 +5123,8 @@ def _cmd_basecall(args: argparse.Namespace) -> int:
     if args.progress:
         for event in handle.tail_progress():
             print(event.raw, file=sys.stderr)
-    rc = handle.wait()
+    rc = handle.wait()  # a run that resumed from the partial removes it on exit 0
     if rc == 0:
-        clear_partial(output)
         print(f"basecalled → {output}", file=sys.stderr)
         return 0
     print(f"dorado basecaller failed (rc={rc}); see {handle.stderr_log}", file=sys.stderr)

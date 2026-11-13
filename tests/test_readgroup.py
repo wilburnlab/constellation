@@ -75,6 +75,16 @@ def test_validate_multiple_models_allow_override():
     assert validate_single_model(models, allow_multi=True) is None
 
 
+def test_validate_allow_multi_with_an_untagged_input_names_no_model():
+    """A tagged input beside an untagged one is a mix, not agreement.
+
+    With --allow-multi-model it returned the tagged input's model, which
+    was then stamped on the untagged input's reads too.
+    """
+    models = {Path("a.bam"): {"m1"}, Path("b.bam"): set()}
+    assert validate_single_model(models, allow_multi=True) is None
+
+
 # ── integration: harmonize (needs samtools + pysam) ──────────────────
 
 

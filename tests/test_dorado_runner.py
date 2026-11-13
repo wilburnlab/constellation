@@ -208,7 +208,7 @@ def test_basecaller_resume_moves_partial(tmp_path: Path, mock_dorado):
     ).wait()
     _, _, options = parse_dorado_argv(mock_dorado.argv())
     assert options["--resume-from"] == [str(tmp_path / "calls.bam.partial")]
-    assert (tmp_path / "calls.bam.partial").exists()
+    assert out.read_bytes() == b"PARTIAL" + b"MOCKBAM"
 
 
 def test_resume_that_dies_while_copying_keeps_the_partial(
@@ -233,9 +233,9 @@ def test_resume_that_dies_while_copying_keeps_the_partial(
     assert runner.basecaller(model, [tmp_path / "r.pod5"], out, resume=True).wait() == 0
     _, _, options = parse_dorado_argv(mock_dorado.argv())
     assert options["--resume-from"] == [str(partial)]
-    assert partial.read_bytes() == b"R" * 19_000
     # the stub writes the resume file's reads first, as Dorado does
     assert out.read_bytes() == b"R" * 19_000 + b"MOCKBAM"
+    assert not partial.exists()  # the finished run holds them now
 
 
 def test_resume_takes_an_output_larger_than_the_partial(tmp_path: Path, mock_dorado):
@@ -249,8 +249,7 @@ def test_resume_takes_an_output_larger_than_the_partial(tmp_path: Path, mock_dor
     DoradoRunner(device="cpu").basecaller(
         model, [tmp_path / "r.pod5"], out, resume=True
     ).wait()
-    assert partial.read_bytes() == b"P" * 100 + b"N" * 400
-    assert out.read_bytes().startswith(b"P" * 100 + b"N" * 400)
+    assert out.read_bytes() == b"P" * 100 + b"N" * 400 + b"MOCKBAM"
 
 
 @pytest.mark.parametrize("output_state", ["missing", "empty"])
@@ -360,3 +359,55 @@ def test_a_device_given_is_passed(tmp_path: Path, mock_dorado):
     ).wait()
     _, _, options = parse_dorado_argv(mock_dorado.argv())
     assert options["--device"] == ["cuda:all"]
+
+
+# ── a run removes the partial it resumed from, and no other ──────────
+
+
+def test_resumed_run_removes_its_partial_once_it_exits_0(tmp_path: Path, mock_dorado):
+    # The output holds every read of the partial once the run exits 0, so
+    # the run that consumed the partial removes it, not whoever looks at
+    # the run afterwards.
+    out = tmp_path / "calls.bam"
+    out.write_bytes(b"R" * 100)
+    handle = DoradoRunner(device="cpu").basecaller(
+        DoradoModel.parse("sup"), [tmp_path / "r.pod5"], out, resume=True
+    )
+    assert handle.wait() == 0
+    assert not (tmp_path / "calls.bam.partial").exists()
+    assert out.read_bytes() == b"R" * 100 + b"MOCKBAM"
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_detached_resumed_run_removes_its_own_partial(
+    tmp_path: Path, mock_dorado, monkeypatch, fails: bool
+):
+    # A detached run has nobody waiting on it, so the run itself removes
+    # the partial, before its exit code is written; a run that fails
+    # keeps it.
+    if fails:
+        monkeypatch.setenv("MOCK_FAIL_ON", "--resume-from")
+    out = tmp_path / "calls.bam"
+    out.write_bytes(b"R" * 100)
+    handle = DoradoRunner(device="cpu").basecaller(
+        DoradoModel.parse("sup"), [tmp_path / "r.pod5"], out, resume=True, detach=True
+    )
+    assert handle.wait(timeout=15) == (1 if fails else 0)
+    partial = tmp_path / "calls.bam.partial"
+    assert partial.exists() == fails
+    if fails:
+        assert partial.read_bytes() == b"R" * 100
+
+
+def test_duplex_refuses_to_orphan_a_partial(tmp_path: Path, mock_dorado):
+    # Duplex neither resumes from a partial nor used to check for one, so
+    # a duplex run into the same output left the simplex reads behind (and
+    # its caller then deleted them as if it had consumed them).
+    partial = tmp_path / "calls.bam.partial"
+    partial.write_bytes(b"P" * 50)
+    with pytest.raises(FileExistsError, match="simplex"):
+        DoradoRunner(device="cpu").duplex(
+            DoradoModel.parse("sup"), [tmp_path / "r.pod5"], tmp_path / "calls.bam"
+        )
+    assert mock_dorado.calls() == []
+    assert partial.read_bytes() == b"P" * 50

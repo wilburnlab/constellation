@@ -175,12 +175,12 @@ def test_polish_two_rounds_accumulate(tmp_path: Path, monkeypatch):
 # ── several read BAMs: one basecaller model, carried to the @RG ───────
 
 
-def _model_bam(path: Path, rg_id: str, model: str) -> Path:
+def _model_bam(path: Path, rg_id: str, model: str | None) -> Path:
     pysam = pytest.importorskip("pysam")
-    header = {
-        "HD": {"VN": "1.6", "SO": "unsorted"},
-        "RG": [{"ID": rg_id, "DS": f"basecall_model={model}", "PL": "ONT"}],
-    }
+    rg = {"ID": rg_id, "PL": "ONT"}
+    if model is not None:
+        rg["DS"] = f"basecall_model={model}"
+    header = {"HD": {"VN": "1.6", "SO": "unsorted"}, "RG": [rg]}
     with pysam.AlignmentFile(str(path), "wb", header=header) as fh:
         seg = pysam.AlignedSegment(fh.header)
         seg.query_name = f"{rg_id}_r0"
@@ -244,6 +244,19 @@ def test_polish_refuses_reads_of_different_models(tmp_path: Path, harmonized):
 def test_polish_allow_multi_model_names_no_model(tmp_path: Path, harmonized):
     a = _model_bam(tmp_path / "a.bam", "RGA", _SUP)
     b = _model_bam(tmp_path / "b.bam", "RGB", _HAC)
+    PolishRunner(rounds=1, allow_multi_model=True).run(
+        _draft_assembly(), [a, b], tmp_path / "polish"
+    )
+    assert harmonized[0]["model_ds"] is None
+
+
+def test_polish_allow_multi_model_with_untagged_reads_names_no_model(
+    tmp_path: Path, harmonized
+):
+    # One tagged BAM and one that names no model returned the tagged one's
+    # model, so every merged read claimed it.
+    a = _model_bam(tmp_path / "a.bam", "RGA", _SUP)
+    b = _model_bam(tmp_path / "b.bam", "RGB", None)
     PolishRunner(rounds=1, allow_multi_model=True).run(
         _draft_assembly(), [a, b], tmp_path / "polish"
     )

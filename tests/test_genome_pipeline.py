@@ -345,6 +345,74 @@ def test_pod5_without_resume_refuses_to_orphan_a_partial(tmp_path: Path, pod5_mo
     assert _basecalls(stub) == []
 
 
+def test_pod5_duplex_refuses_to_orphan_a_partial(tmp_path: Path, pod5_mocks):
+    stub, (fc0, _fc1, _fc2) = pod5_mocks
+    out = tmp_path / "asm"
+    partial = out / "basecall" / "flowcell_000.bam.partial"
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"P" * 100)
+    with pytest.raises(FileExistsError, match="simplex"):
+        _assemble_pod5(out, [fc0], duplex=True)
+    assert partial.read_bytes() == b"P" * 100
+    assert stub.calls() == []
+
+
+def test_pod5_rebuilt_flow_cell_that_fails_is_not_taken_for_finished(
+    tmp_path: Path, pod5_mocks, monkeypatch
+):
+    # Rebuilding a missing flow cell kept the stage's marker, so when the
+    # rebuild failed the next --resume took its incomplete BAM as finished.
+    stub, (fc0, fc1, _fc2) = pod5_mocks
+    out = tmp_path / "asm"
+    _assemble_pod5(out, [fc0, fc1])
+    (out / "basecall" / "flowcell_000.bam").unlink()
+    monkeypatch.setenv("MOCK_FAIL_ON", "fc0.pod5")
+    with pytest.raises(RuntimeError, match="fc0.pod5"):
+        _assemble_pod5(out, [fc0, fc1], resume=True)
+    assert not (out / "basecall" / "_SUCCESS").exists()
+
+    monkeypatch.delenv("MOCK_FAIL_ON")
+    before = len(_basecalls(stub))
+    _assemble_pod5(out, [fc0, fc1], resume=True)
+    calls = _basecalls(stub)
+    assert len(calls) == before + 1  # flow cell 0 again, flow cell 1 reused
+    assert calls[-1].endswith(str(fc0))
+    assert (out / "basecall" / "_SUCCESS").exists()
+
+
+def test_pod5_unusable_dorado_leaves_every_flow_cell_as_it_was(
+    tmp_path: Path, pod5_mocks, monkeypatch
+):
+    # Under --resume with changed settings a flow cell's BAM and partial
+    # were removed before Dorado was resolved; a too-old Dorado then failed
+    # with both gone, and a finished flow cell had lost its marker.
+    from constellation.sequencing.basecall.dorado_run import DoradoVersionError
+
+    stub, (fc0, fc1, _fc2) = pod5_mocks
+    out = tmp_path / "asm"
+    monkeypatch.setenv("MOCK_FAIL_ON", "fc1.pod5")
+    with pytest.raises(RuntimeError):
+        _assemble_pod5(out, [fc0, fc1])
+    monkeypatch.delenv("MOCK_FAIL_ON")
+    basecall = out / "basecall"
+    kept = {q.name: q.read_bytes() for q in basecall.iterdir()}
+
+    monkeypatch.setenv("MOCK_DORADO_VERSION", "2.0.0")
+    with pytest.raises(DoradoVersionError):
+        _assemble_pod5(out, [fc0, fc1], resume=True, basecall_model="hac@v5.0.0")
+    assert {q.name: q.read_bytes() for q in basecall.iterdir()} == kept
+
+    # Back to the first settings, with a usable Dorado: flow cell 0 is
+    # still finished and flow cell 1 continues from its own reads.
+    monkeypatch.delenv("MOCK_DORADO_VERSION")
+    _assemble_pod5(out, [fc0, fc1], resume=True)
+    calls = _basecalls(stub)
+    assert len(calls) == 3
+    _, positionals, options = parse_dorado_argv(stub.argv())
+    assert positionals[-1] == str(fc1)
+    assert options["--resume-from"] == [f"{basecall / 'flowcell_001.bam'}.partial"]
+
+
 # ── review findings on #92 ─────────────────────────────────────────────
 
 
@@ -451,8 +519,9 @@ def test_missing_model_metadata_is_rejected(tmp_path) -> None:
     models = {Path("a.bam"): {"dna_r10.4.1_e8.2_400bps_sup@v5.0.0"}, Path("b.bam"): set()}
     with pytest.raises(ValueError, match="declare no basecaller model"):
         validate_single_model(models)
-    # --allow-multi-model is the documented override.
-    assert validate_single_model(models, allow_multi=True) is not None
+    # --allow-multi-model is the documented override: it harmonizes, and
+    # the merged reads name no model rather than the tagged input's.
+    assert validate_single_model(models, allow_multi=True) is None
     # And no models anywhere is still the documented None.
     assert validate_single_model({Path("a.bam"): set()}) is None
 

@@ -95,8 +95,8 @@ def validate_single_model(
     Returns the one model string, or ``None`` when NO input named a model
     (harmonization still proceeds — but ``dorado polish`` will need a
     model supplied another way). When SOME inputs name a model and others
-    do not, that is a mismatch, not agreement, and raises unless
-    ``allow_multi``. Raises ``ValueError`` naming the
+    do not, that is a mismatch, not agreement: it raises, or with
+    ``allow_multi`` returns ``None``. Raises ``ValueError`` naming the
     divergent models + their files when more than one distinct model is
     present and ``allow_multi`` is false. With ``allow_multi`` and a
     genuine mix, returns ``None`` rather than choosing one — the unified
@@ -112,7 +112,12 @@ def validate_single_model(
     # declared one, and `dorado polish` would then apply that model to
     # them without any mismatch to detect.
     silent = sorted(str(path) for path, ms in models.items() if not ms)
-    if silent and not allow_multi:
+    if silent and allow_multi:
+        # A mix of known and unknown provenance, like a mix of models,
+        # names no model: returning the tagged inputs' model claimed it
+        # for the untagged inputs' reads too.
+        return None
+    if silent:
         raise ValueError(
             "these inputs declare no basecaller model in their @RG "
             "headers, so the model of the others cannot be assumed for "
