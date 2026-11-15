@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 
 import numpy as np
 import pyarrow as pa
@@ -163,6 +164,12 @@ def _p(**kw):
     return EmParams(**base)
 
 
+needs_minimap2 = pytest.mark.skipif(
+    shutil.which("minimap2") is None, reason="minimap2 not on $PATH"
+)
+
+
+@needs_minimap2
 def test_a_legacy_seed_dir_is_validated_against_its_manifest(corpus, tmp_path):
     """This release changed ORF seeding's effective floor from 60 to 30.
 
@@ -180,6 +187,7 @@ def test_a_legacy_seed_dir_is_validated_against_its_manifest(corpus, tmp_path):
     assert run_em(corpus, out, params=_p(min_aa_length=60), resume=True)
 
 
+@needs_minimap2
 def test_an_unverifiable_legacy_seed_dir_is_refused(corpus, tmp_path):
     """No stamp and no manifest means nothing records what produced it."""
     out = tmp_path / "em"

@@ -25,7 +25,9 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
     run_em,
 )
 
-pytestmark = pytest.mark.skipif(
+#: Per test, not per module: the native E-step and em-kmer seeding need no
+#: minimap2, and a module-level skip hid those tests wherever it is absent.
+needs_minimap2 = pytest.mark.skipif(
     shutil.which("minimap2") is None, reason="minimap2 not on $PATH"
 )
 
@@ -120,6 +122,7 @@ def _params(**kw):
     return EmParams(**base)
 
 
+@needs_minimap2
 def test_a_round_completes_and_leaves_addressable_outputs(corpus_dir, tmp_path):
     out = tmp_path / "em"
     results = run_em(corpus_dir, out, params=_params(rounds=1))
@@ -143,6 +146,7 @@ def test_a_round_completes_and_leaves_addressable_outputs(corpus_dir, tmp_path):
     assert (out / "churn.tsv").exists()
 
 
+@needs_minimap2
 def test_every_read_is_accounted_for(corpus_dir, tmp_path):
     """Assigned + unassigned must equal the reads minimap2 reported on."""
     results = run_em(corpus_dir, tmp_path / "em", params=_params(rounds=1))
@@ -151,6 +155,7 @@ def test_every_read_is_accounted_for(corpus_dir, tmp_path):
     assert st["n_assigned"] > 0
 
 
+@needs_minimap2
 def test_templates_that_recruited_nothing_do_not_carry_forward(corpus_dir, tmp_path):
     """The only way a template disappears — and it is a consequence, not a gate."""
     out = tmp_path / "em"
@@ -163,6 +168,7 @@ def test_templates_that_recruited_nothing_do_not_carry_forward(corpus_dir, tmp_p
     assert (out / "rounds" / "r01" / "lineage.parquet").exists()
 
 
+@needs_minimap2
 def test_resume_skips_a_completed_round(corpus_dir, tmp_path):
     out = tmp_path / "em"
     run_em(corpus_dir, out, params=_params(rounds=1))
@@ -177,6 +183,7 @@ def test_resume_skips_a_completed_round(corpus_dir, tmp_path):
     assert {p.name for p in (rd / "assignments").glob("part-*.parquet")} == before
 
 
+@needs_minimap2
 def test_the_corpus_is_not_rewritten_on_resume(corpus_dir, tmp_path):
     out = tmp_path / "em"
     run_em(corpus_dir, out, params=_params(rounds=1))
@@ -190,6 +197,7 @@ def test_an_empty_corpus_is_not_a_crash(tmp_path):
     assert run_em(demux, tmp_path / "em", params=_params(min_aa_length=200)) == []
 
 
+@needs_minimap2
 def test_round_one_dissolves_self_capture_without_a_prune(tmp_path):
     """The claim the whole round-1 ranking rests on.
 
@@ -218,6 +226,7 @@ def test_round_one_dissolves_self_capture_without_a_prune(tmp_path):
     assert results[1].n_templates < results[0].n_templates / 5
 
 
+@needs_minimap2
 def test_the_loop_converges_and_keeps_genes_apart(tmp_path):
     """Churn falls to zero and no cluster mixes two transcripts."""
     rng = np.random.default_rng(7)
@@ -253,6 +262,7 @@ def test_the_loop_converges_and_keeps_genes_apart(tmp_path):
     assert dominant / total >= 0.99, "a cluster must not mix two transcripts"
 
 
+@needs_minimap2
 def test_the_two_pass_estep_converges_and_keeps_genes_apart(tmp_path):
     """The same panel under --estep-aligner edlib, through a real worker pool.
 
@@ -473,6 +483,7 @@ def test_the_loop_runs_natively_with_no_minimap2_anywhere(tmp_path, monkeypatch)
     assert (minis / "minimizers.arrow").stat().st_mtime_ns == before
 
 
+@needs_minimap2
 def test_the_user_facing_outputs_are_written_in_the_shared_shapes(corpus_dir, tmp_path):
     """Every existing consumer reads these; none may need a clusterer branch."""
     import pyarrow as pa_
@@ -512,6 +523,7 @@ def test_the_user_facing_outputs_are_written_in_the_shared_shapes(corpus_dir, tm
         assert rs.count("representative") == 1, cid
 
 
+@needs_minimap2
 def test_the_diagnostics_report_is_emitted_and_reads_the_real_artifacts(
     corpus_dir, tmp_path
 ):
@@ -538,6 +550,7 @@ def test_the_diagnostics_report_is_emitted_and_reads_the_real_artifacts(
     assert build_em_report(out).exists()
 
 
+@needs_minimap2
 def test_a_saturated_candidate_pool_is_flagged(corpus_dir, tmp_path):
     """-N is a correctness parameter; truncation must be loud, not logged."""
     from constellation.sequencing.transcriptome.cluster.denovo.em.diagnostics import (
@@ -555,6 +568,7 @@ def test_a_saturated_candidate_pool_is_flagged(corpus_dir, tmp_path):
 # ── review regressions ────────────────────────────────────────────────
 
 
+@needs_minimap2
 def test_a_read_minimap2_never_reports_is_still_accounted_for(tmp_path):
     """No PAF line means no row — the read vanished from the rejection rate.
 
@@ -588,6 +602,7 @@ def test_a_read_minimap2_never_reports_is_still_accounted_for(tmp_path):
     assert row.column("template_id").to_pylist() == [-1]
 
 
+@needs_minimap2
 def test_a_truncated_template_file_falls_back_to_the_finished_round(tmp_path):
     """An interrupted write must not be trusted just because the file exists."""
     corpus = _write_demux(
@@ -616,6 +631,7 @@ def test_a_truncated_template_file_falls_back_to_the_finished_round(tmp_path):
     assert results, "resume must recover rather than raise"
 
 
+@needs_minimap2
 def test_resume_keeps_the_churn_history_and_measures_the_resumed_round(tmp_path):
     """Otherwise churn.tsv holds only this invocation and round 2 reports none."""
     corpus_rows = []
@@ -639,6 +655,7 @@ def test_resume_keeps_the_churn_history_and_measures_the_resumed_round(tmp_path)
     assert r2["churn"], "the resumed round has a previous round to compare to"
 
 
+@needs_minimap2
 def test_a_completed_run_is_a_readable_stage(tmp_path):
     """Without a manifest the viz layer cannot attach the directory at all."""
     from constellation.sequencing.transcriptome.manifest import read_manifest_dir
@@ -662,6 +679,7 @@ def test_a_completed_run_is_a_readable_stage(tmp_path):
     assert manifest.parameters["mode"] == "em"
 
 
+@needs_minimap2
 def test_the_report_shows_the_metric_the_stopping_rule_reads(corpus_dir, tmp_path):
     """A broken section renders as a note, so it must be asserted, not eyeballed."""
     out = tmp_path / "em"
@@ -675,6 +693,7 @@ def test_the_report_shows_the_metric_the_stopping_rule_reads(corpus_dir, tmp_pat
         assert col in header
 
 
+@needs_minimap2
 def test_a_retried_estep_does_not_inherit_the_dead_attempt_s_shards(tmp_path):
     """Shards are numbered from zero and the reader globs the directory.
 
@@ -717,6 +736,7 @@ def pa_ds_table(directory: Path) -> pa.Table:
     return pa_ds.dataset(sorted(Path(directory).glob("part-*.parquet"))).to_table()
 
 
+@needs_minimap2
 def test_a_round_is_not_marked_done_until_its_lineage_is_on_disk(tmp_path, monkeypatch):
     """`_SUCCESS` means "everything the next round needs is written".
 
@@ -750,6 +770,7 @@ def test_a_round_is_not_marked_done_until_its_lineage_is_on_disk(tmp_path, monke
     )
 
 
+@needs_minimap2
 def test_a_half_written_lineage_is_replaced_rather_than_trusted(tmp_path):
     """A parquet file is only readable once its footer lands.
 
@@ -833,6 +854,7 @@ def _kmer_params(**kw):
     return _params(**base)
 
 
+@needs_minimap2
 def test_the_kmer_seeder_produces_far_fewer_round_one_templates(corpus_dir, tmp_path):
     """The whole point: one template per read CLUSTER, not per distinct ORF.
 
@@ -849,6 +871,7 @@ def test_the_kmer_seeder_produces_far_fewer_round_one_templates(corpus_dir, tmp_
     assert kmer[0].n_templates == 2
 
 
+@needs_minimap2
 def test_the_kmer_seed_stage_is_addressable_and_stamped(corpus_dir, tmp_path):
     out = tmp_path / "em"
     run_em(corpus_dir, out, params=_kmer_params(rounds=1))
@@ -866,6 +889,7 @@ def test_the_kmer_seed_stage_is_addressable_and_stamped(corpus_dir, tmp_path):
     assert stats["n_reads"] == stats["n_reads_in_templates"]
 
 
+@needs_minimap2
 def test_the_seeding_mode_reaches_the_manifest(corpus_dir, tmp_path):
     out = tmp_path / "em"
     run_em(corpus_dir, out, params=_kmer_params(rounds=1))
@@ -878,6 +902,7 @@ def test_the_seeding_mode_reaches_the_manifest(corpus_dir, tmp_path):
     assert params["mode"] == "em"
 
 
+@needs_minimap2
 def test_a_resume_across_a_changed_seeder_is_refused(corpus_dir, tmp_path):
     """Reusing seed/templates.parquet under a different seeder is silent-wrong.
 
@@ -891,6 +916,7 @@ def test_a_resume_across_a_changed_seeder_is_refused(corpus_dir, tmp_path):
         run_em(corpus_dir, out, params=_kmer_params(rounds=1), resume=True)
 
 
+@needs_minimap2
 def test_a_resume_across_a_changed_seed_gate_is_refused(corpus_dir, tmp_path):
     out = tmp_path / "em"
     run_em(corpus_dir, out, params=_kmer_params(rounds=1))
@@ -904,6 +930,7 @@ def test_a_resume_across_a_changed_seed_gate_is_refused(corpus_dir, tmp_path):
         )
 
 
+@needs_minimap2
 def test_an_unchanged_seed_stage_resumes(corpus_dir, tmp_path):
     out = tmp_path / "em"
     first = run_em(corpus_dir, out, params=_kmer_params(rounds=1))
@@ -911,6 +938,7 @@ def test_an_unchanged_seed_stage_resumes(corpus_dir, tmp_path):
     assert again[0].n_templates == first[0].n_templates
 
 
+@needs_minimap2
 def test_a_pre_stamp_seed_dir_cannot_be_resumed_as_kmer(corpus_dir, tmp_path):
     """Output dirs from before this change hold ORF templates, unlabelled."""
     out = tmp_path / "em"
@@ -1044,6 +1072,7 @@ def _templates_of(out, r):
     )
 
 
+@needs_minimap2
 def test_the_worker_count_does_not_change_the_template_ids(tmp_path):
     """Nodes are written one shard per M-step unit, and the units are a
     bin-packing over the worker count — so concatenated they stood in an
@@ -1087,6 +1116,7 @@ def test_the_worker_count_does_not_change_the_template_ids(tmp_path):
     assert len(flat[1]) > 16
 
 
+@needs_minimap2
 def test_report_only_writes_edges_and_merges_nothing(tmp_path, monkeypatch):
     """Report-only: the twin is an edge in the graph, and still a template."""
     _twin_first_node(monkeypatch, sibling=False)
@@ -1123,6 +1153,7 @@ def test_report_only_writes_edges_and_merges_nothing(tmp_path, monkeypatch):
     )
 
 
+@needs_minimap2
 def test_an_exact_twin_is_merged_by_default(tmp_path, monkeypatch):
     _twin_first_node(monkeypatch, sibling=False)
     out = tmp_path / "em"
@@ -1144,6 +1175,7 @@ def test_an_exact_twin_is_merged_by_default(tmp_path, monkeypatch):
     assert len(seqs) == len(set(seqs)), "the twin reached round 2"
 
 
+@needs_minimap2
 def test_the_final_output_merges_twins_and_keeps_every_read(tmp_path, monkeypatch):
     """A final node whose reads the M-step split across an identical twin."""
     corpus = _panel(tmp_path)
@@ -1178,6 +1210,7 @@ def test_the_final_output_merges_twins_and_keeps_every_read(tmp_path, monkeypatc
     assert all(a != b for a, b in zip(src, dst))
 
 
+@needs_minimap2
 def test_split_siblings_are_not_merged_unless_asked(tmp_path, monkeypatch):
     """Two nodes of one parent that differ only in extent are what an M-step
     split on a start mode leaves behind. Merging them back is the limit
@@ -1206,6 +1239,7 @@ def test_split_siblings_are_not_merged_unless_asked(tmp_path, monkeypatch):
     assert merged.column("delta_5p").to_pylist() == [12]
 
 
+@needs_minimap2
 def test_a_round_killed_after_its_graph_finds_it_on_disk(tmp_path, monkeypatch):
     """Killed after the graph and before the marker. The round has no marker,
     so the resume runs it again from its E-step — to the same nodes, and so
@@ -1247,6 +1281,7 @@ def test_a_round_killed_after_its_graph_finds_it_on_disk(tmp_path, monkeypatch):
     assert 1 not in built, "round 1's graph was on disk and was built again"
 
 
+@needs_minimap2
 def test_an_extended_run_merges_exactly_as_an_uninterrupted_one(tmp_path, monkeypatch):
     """A finished round has no successor: the resume REBUILDS one from the
     round's node shards, through the same refine-and-merge path. Two rounds
@@ -1291,6 +1326,7 @@ def test_an_extended_run_merges_exactly_as_an_uninterrupted_one(tmp_path, monkey
     )
 
 
+@needs_minimap2
 def test_a_rebuilt_round_replaces_the_lineage_it_found(tmp_path, monkeypatch):
     """A round refined by something that did not merge — an older version,
     here — has a lineage on disk that opens perfectly well. Rebuilt with
@@ -1324,6 +1360,7 @@ def test_a_rebuilt_round_replaces_the_lineage_it_found(tmp_path, monkeypatch):
     assert len(seqs) == len(set(seqs))
 
 
+@needs_minimap2
 def test_a_graph_left_by_an_earlier_run_does_not_outlive_the_graph_being_off(tmp_path):
     corpus = _panel(tmp_path)
     out = tmp_path / "em"
@@ -1343,6 +1380,7 @@ def test_a_graph_left_by_an_earlier_run_does_not_outlive_the_graph_being_off(tmp
     assert "template graph disabled" in report and "| r1 |" not in report
 
 
+@needs_minimap2
 def test_template_graph_off_runs_no_alignment_at_all(tmp_path, monkeypatch):
     """The escape hatch: nothing after the M-step, not a quieter something."""
     from constellation.sequencing.transcriptome.cluster.denovo.em import (
@@ -1369,6 +1407,7 @@ def test_template_graph_off_runs_no_alignment_at_all(tmp_path, monkeypatch):
     assert "template graph disabled" in report
 
 
+@needs_minimap2
 def test_template_graph_final_relates_only_the_last_round(tmp_path):
     out = tmp_path / "em"
     run_em(
@@ -1381,6 +1420,7 @@ def test_template_graph_final_relates_only_the_last_round(tmp_path):
     assert (out / "cluster_edges.parquet").exists()
 
 
+@needs_minimap2
 def test_an_extended_run_has_one_final_round(tmp_path):
     """Every invocation finalises its own last round. When the run is
     extended that round gets a successor, and its final record must go."""
@@ -1400,6 +1440,7 @@ def test_an_extended_run_has_one_final_round(tmp_path):
     assert section_template_graph(out).body.count("Final output") == 1
 
 
+@needs_minimap2
 def test_merge_may_start_after_the_finished_rounds(tmp_path, monkeypatch):
     """The natural experiment: a finished report-only run, extended with
     merge on. Its recorded rounds did not merge, so merging "from round 1"
