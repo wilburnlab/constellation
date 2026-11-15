@@ -276,6 +276,49 @@ def _annotate_orf(node: RefinedTemplate, min_aa_length: int) -> RefinedTemplate:
     return node
 
 
+def pooled_node_with_consensus(
+    frame: str,
+    members: list[MemberSpec],
+    *,
+    template_id: int = 0,
+    haplotype_id: int = 0,
+    min_aa_length: int = 30,
+    fold_insertions: bool = True,
+    min_insertion_support: float = 2.0,
+    min_extension_support: float | None = 3.0,
+) -> tuple[RefinedTemplate | None, ConsensusResult | None]:
+    """:func:`pooled_node`, also returning the consensus it was cut from —
+    what a replay of a final-merge rebuild shows reads against."""
+    if not members:
+        return None, None
+    cres = frame_consensus(
+        frame,
+        members,
+        frame_weight=0.0,
+        fold_insertions=fold_insertions,
+        min_insertion_support=min_insertion_support,
+        min_extension_support=min_extension_support,
+    )
+    lo, hi = _support_span(cres)
+    if hi <= lo:
+        return None, cres
+    w = float(sum(m.weight for m in members))
+    node = RefinedTemplate(
+        parent_template_id=template_id,
+        haplotype_id=haplotype_id,
+        consensus=cres.consensus[lo:hi],
+        n_reads=int(round(w)),
+        node_weight=w,
+        n_inserted_columns=cres.n_inserted_columns,
+        n_extended_5p=cres.n_extended_5p,
+        n_extended_3p=cres.n_extended_3p,
+        n_trimmed_5p=lo,
+        n_trimmed_3p=len(cres.consensus) - hi,
+        member_ids=np.arange(len(members), dtype=np.int64),
+    )
+    return _annotate_orf(node, min_aa_length), cres
+
+
 def pooled_node(
     frame: str,
     members: list[MemberSpec],
@@ -296,34 +339,17 @@ def pooled_node(
     cover, extended where enough of them reach past it — with its ORF called
     on that. ``None`` when nothing was covered.
     """
-    if not members:
-        return None
-    cres = frame_consensus(
+    node, _ = pooled_node_with_consensus(
         frame,
         members,
-        frame_weight=0.0,
+        template_id=template_id,
+        haplotype_id=haplotype_id,
+        min_aa_length=min_aa_length,
         fold_insertions=fold_insertions,
         min_insertion_support=min_insertion_support,
         min_extension_support=min_extension_support,
     )
-    lo, hi = _support_span(cres)
-    if hi <= lo:
-        return None
-    w = float(sum(m.weight for m in members))
-    node = RefinedTemplate(
-        parent_template_id=template_id,
-        haplotype_id=haplotype_id,
-        consensus=cres.consensus[lo:hi],
-        n_reads=int(round(w)),
-        node_weight=w,
-        n_inserted_columns=cres.n_inserted_columns,
-        n_extended_5p=cres.n_extended_5p,
-        n_extended_3p=cres.n_extended_3p,
-        n_trimmed_5p=lo,
-        n_trimmed_3p=len(cres.consensus) - hi,
-        member_ids=np.arange(len(members), dtype=np.int64),
-    )
-    return _annotate_orf(node, min_aa_length)
+    return node
 
 
 def refine_template_with_internals(
@@ -591,6 +617,7 @@ __all__ = [
     "KernelInternals",
     "RefinedTemplate",
     "pooled_node",
+    "pooled_node_with_consensus",
     "refine_template",
     "refine_template_with_internals",
     "specs_from_assignments",

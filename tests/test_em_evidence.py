@@ -846,3 +846,218 @@ def test_without_a_final_merge_the_clusters_are_the_nodes_in_order(tmp_path):
     assert m.column("node_template_id").to_pylist() == [
         template_id_for(2, i) for i in range(m.num_rows)
     ]
+
+
+# ── P1.7: replay, the support tables and the read API (F1 dense, F4) ──
+
+
+def test_every_template_of_every_round_replays_as_the_run(runs):
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+
+    for out in runs.values():
+        for r in R.finished_rounds(out):
+            loc = R.assignment_locator(out / "rounds" / f"r{r:02d}")
+            ids = R.mstep_record(out, r, "templates").column("template_id").to_pylist()
+            assert ids
+            for tid in ids:
+                rep = R.replay_template(out, r, tid, locator=loc)
+                assert rep.verified, (out.name, r, tid, rep.mismatch)
+                assert rep.params_source == "round"
+
+
+def test_every_final_cluster_replays_rebuilt_or_not(runs):
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+
+    out = runs[1]
+    kinds = set()
+    for cid in R.cluster_nodes(out).column("cluster_id").to_pylist():
+        rep = R.replay_cluster(out, cid)
+        assert rep.verified, (cid, rep.mismatch)
+        kinds.add(rep.kind)
+    assert kinds == {"node", "rebuilt"}
+
+
+def test_a_replay_that_is_not_the_run_says_so(runs, split_template_id):
+    """Run the kernel under parameters that cannot split, and the check
+    must notice — a replay is only worth showing if it is the run."""
+    from dataclasses import replace
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+    from constellation.sequencing.transcriptome.cluster.denovo.em.replay import (
+        ReplayError,
+        round_params,
+    )
+
+    out = runs[1]
+    params, _em, _src = round_params(out, 1)
+    rep = R.replay_template(
+        out, 1, split_template_id, params=replace(params, min_node_reads=1000.0)
+    )
+    assert not rep.verified and rep.params_source == "explicit"
+    with pytest.raises(ReplayError, match="does not match"):
+        R.replay_template(
+            out,
+            1,
+            split_template_id,
+            params=replace(params, min_node_reads=1000.0),
+            strict=True,
+        )
+
+
+def test_a_run_from_before_the_records_still_replays(runs, tmp_path):
+    """No params.json, no cluster_nodes.parquet, no M-step record: the
+    manifest's parameters and the merge's own files are enough. Without the
+    manifest too, explicit parameters are."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.replay import (
+        ReplayError,
+    )
+
+    old = tmp_path / "old"
+    shutil.copytree(runs[1], old)
+    (old / "cluster_nodes.parquet").unlink()
+    for rd in _rounds(old):
+        (rd / "params.json").unlink()
+        for key in ("templates", "disagreements", "columns", "covariance", "reads"):
+            shutil.rmtree(rd / "mstep" / key, ignore_errors=True)
+        record = _json(rd / "round.json")
+        record.pop("mstep", None)
+        (rd / "round.json").write_text(json.dumps(record))
+    for cid in R.cluster_nodes(old).column("cluster_id").to_pylist():
+        rep = R.replay_cluster(old, cid)
+        assert rep.verified, (cid, rep.mismatch)
+    rep = R.replay_template(old, 1, int(R.nodes(old, 1).column("parent_template_id")[0].as_py()))
+    assert rep.verified and rep.params_source == "manifest"
+
+    (old / "manifest.json").unlink()
+    tid = int(R.nodes(old, 1).column("parent_template_id")[0].as_py())
+    with pytest.raises(ReplayError, match="params"):
+        R.replay_template(old, 1, tid)
+    assert R.replay_template(old, 1, tid, params=MStepParams()).verified
+
+
+def test_the_locator_meets_rows_in_the_order_the_m_step_did(runs, tmp_path):
+    """Across several shards: the sorted glob concatenated, then a stable
+    sort on template_row — sort_assignments_by_template's order."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        sort_assignments_by_template,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.replay import (
+        assignment_locator,
+    )
+
+    rd = tmp_path / "r01"
+    (rd / "assignments").mkdir(parents=True)
+    table = _assignments_of(_rounds(runs[1])[0])
+    cuts = [0, 37, 71, table.num_rows]
+    for i in range(3):
+        pq.write_table(
+            table.slice(cuts[i], cuts[i + 1] - cuts[i]),
+            rd / "assignments" / f"part-{i:05d}.parquet",
+        )
+    srt, _ = sort_assignments_by_template(table)
+    loc = assignment_locator(rd)
+    by_locator = table.take(pa.array(loc.order)).column("read_row").to_pylist()
+    assert by_locator == srt.column("read_row").to_pylist()
+
+
+def test_departures_rebuild_every_sampled_read_exactly(runs, split_template_id):
+    """The support view's encoding is lossless against the M-step's own
+    projection: the reference across each read's span, with its departures,
+    is the read's allele at every PWM column."""
+    from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
+        member_alleles,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+
+    rep = R.replay_template(runs[1], 1, split_template_id)
+    st = R.support_tables(rep, space="frame")
+    pooled = rep.result.internals.pooled
+    want = member_alleles(pooled, np.arange(pooled.plan.n_columns))
+    ref = np.where(np.asarray(pooled.winner) == 5, -2, np.asarray(pooled.winner))
+    reads = st.reads.to_pylist()
+    deps = st.departures.to_pylist()
+    member_of_idx = {}
+    for k, pos in enumerate(rep.result.member_pos.tolist()):
+        member_of_idx[pos] = k
+    got = np.full(want.shape, -1, dtype=np.int64)
+    for r in reads:
+        if not r["sampled"]:
+            continue
+        k = member_of_idx[r["idx"]]
+        got[k, r["span_lo"] : r["span_hi"]] = ref[r["span_lo"] : r["span_hi"]]
+    for d in deps:
+        got[member_of_idx[d["read_idx"]], d["col"]] = d["allele"]
+    assert np.array_equal(got, want.astype(np.int64))
+    # The split is visible: the minor haplotype's reads depart at the sites.
+    minor = {r["idx"] for r in reads if r["node"] == 1}
+    at = {}
+    for d in deps:
+        if d["read_idx"] in minor:
+            at[d["col"]] = at.get(d["col"], 0) + 1
+    assert sum(1 for n in at.values() if n >= 10) >= 3
+
+
+def test_the_consensus_space_carries_the_node_and_its_arcs(runs, split_template_id):
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+
+    rep = R.replay_template(runs[1], 1, split_template_id)
+    node1 = [n for n in rep.result.nodes if n.haplotype_id == 1][0]
+    st = R.support_tables(rep, node=1)
+    assert st.consensus == node1.consensus and st.n_columns == len(node1.consensus)
+    assert st.reads.num_rows == 12 and set(st.reads.column("node").to_pylist()) == {1}
+    assert st.columns.num_rows == len(node1.consensus)
+    assert st.arcs.num_rows >= 3
+    assert all(0 <= c < st.n_columns for c in st.arcs.column("u_col").to_pylist())
+    # Against its own consensus a node's reads depart only by error.
+    per_read = st.reads.column("n_departures").to_numpy()
+    assert np.median(per_read) < 0.03 * len(node1.consensus)
+
+
+def test_reads_beyond_the_member_cap_are_listed_unsampled(tmp_path):
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+    )
+
+    out = tmp_path / "em"
+    run_em(
+        three_gene_panel(tmp_path),
+        out,
+        params=evidence_params(rounds=1, mstep=MStepParams(max_members_per_template=10)),
+        report=False,
+    )
+    t = R.mstep_record(out, 1, "templates")
+    big = t.filter(pa.compute.greater(t.column("n_assigned"), 10)).to_pylist()[0]
+    rep = R.replay_template(out, 1, big["template_id"])
+    assert rep.verified
+    st = R.support_tables(rep)
+    sampled = st.reads.column("sampled").to_pylist()
+    assert sum(sampled) == 10 and len(sampled) == big["n_assigned"]
+    unsampled = st.reads.filter(pa.compute.invert(st.reads.column("sampled")))
+    assert unsampled.column("span_lo").null_count == unsampled.num_rows
+
+
+def test_the_read_api_answers_the_bench_s_first_questions(runs):
+    """Where did gene C's reads go, round by round — the question every
+    investigation started with."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+
+    out = runs[3]
+    info = R.run_info(out)
+    assert info["finished"] and info["has_compact_evidence"] and info["n_reads"] == 110
+    assert R.round_summaries(out).num_rows == len(info["rounds"])
+    clusters = R.clusters(out)
+    assert "node_template_id" in clusters.column_names
+    ids = [f"gC_minor_r{i:02d}" for i in range(12)]
+    rows = R.read_rows_for_ids(out, ids)
+    assert sorted(rows.column("read_id").to_pylist()) == ids
+    hist = R.read_history(out, rows.column("read_row").to_numpy())
+    assert set(hist.column("round").to_pylist()) == set(info["rounds"])
+    found = R.find_clusters(out, ids[0])
+    assert found.num_rows == 1
+    assert R.find_clusters(out, str(found.column("cluster_id")[0].as_py())).num_rows >= 1
+    assert R.lineage(out).num_rows > 0

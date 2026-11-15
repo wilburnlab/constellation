@@ -149,6 +149,63 @@ def rebuild_one(
     the pool here, and a survivor made only of such reads kept the
     consensus the merge was supposed to replace (review of 91e7c69).
     """
+    members, _rows, n_skipped, fraction = rebuild_members(
+        consensus,
+        read_rows,
+        template_id=template_id,
+        corpus_path=corpus_path,
+        params=params,
+        identity_floor=identity_floor,
+        quality_scale=quality_scale,
+    )
+    node = pooled_node(
+        consensus,
+        members,
+        template_id=int(template_id),
+        min_aa_length=params.min_aa_length,
+        fold_insertions=params.fold_insertions,
+        min_insertion_support=params.min_insertion_support,
+        min_extension_support=params.min_extension_support,
+    )
+    if node is None:
+        return row, None, n_skipped, fraction
+    return (
+        row,
+        {
+            "consensus": node.consensus,
+            "protein": node.protein,
+            "orf_start": int(node.orf_start),
+            "orf_end": int(node.orf_end),
+            "n_inserted_columns": int(node.n_inserted_columns),
+            "n_extended_5p": int(node.n_extended_5p),
+            "n_extended_3p": int(node.n_extended_3p),
+            "n_trimmed_5p": int(node.n_trimmed_5p),
+            "n_trimmed_3p": int(node.n_trimmed_3p),
+            "n_members_used": len(members),
+            "subsample_fraction": float(fraction),
+        },
+        n_skipped,
+        fraction,
+    )
+
+
+def rebuild_members(
+    consensus: str,
+    read_rows: np.ndarray,
+    *,
+    template_id: int,
+    corpus_path: str,
+    params: MStepParams,
+    identity_floor: float,
+    quality_scale: float | None = None,
+) -> tuple[list[MemberSpec], np.ndarray, int, float]:
+    """The pooled reads of a survivor, aligned to its consensus.
+
+    Returns ``(members, sampled_rows, n_skipped, fraction)``: the members
+    that placed, the corpus rows considered (after the member cap — a
+    member's ``member_id`` indexes them), how many did not place, and the
+    sampled fraction. :func:`rebuild_one` and replay share it.
+    """
     reads = _reads(corpus_path)
     rows = np.asarray(read_rows, dtype=np.int64)
     fraction = 1.0
@@ -186,35 +243,7 @@ def rebuild_one(
                 member_id=i,
             )
         )
-    node = pooled_node(
-        consensus,
-        members,
-        template_id=int(template_id),
-        min_aa_length=params.min_aa_length,
-        fold_insertions=params.fold_insertions,
-        min_insertion_support=params.min_insertion_support,
-        min_extension_support=params.min_extension_support,
-    )
-    if node is None:
-        return row, None, n_skipped, fraction
-    return (
-        row,
-        {
-            "consensus": node.consensus,
-            "protein": node.protein,
-            "orf_start": int(node.orf_start),
-            "orf_end": int(node.orf_end),
-            "n_inserted_columns": int(node.n_inserted_columns),
-            "n_extended_5p": int(node.n_extended_5p),
-            "n_extended_3p": int(node.n_extended_3p),
-            "n_trimmed_5p": int(node.n_trimmed_5p),
-            "n_trimmed_3p": int(node.n_trimmed_3p),
-            "n_members_used": len(members),
-            "subsample_fraction": float(fraction),
-        },
-        n_skipped,
-        fraction,
-    )
+    return members, rows, n_skipped, fraction
 
 
 def _pair_key(parent: np.ndarray, hap: np.ndarray) -> np.ndarray:
