@@ -771,3 +771,78 @@ def test_the_split_haplotypes_are_each_other_s_runner_up(runs):
         assert row["runner_up_logl_gap"] is not None
     gaps = [r["runner_up_logl_gap"] for r in gene_c.to_pylist()]
     assert sum(g > 0 for g in gaps) / len(gaps) > 0.9
+
+
+# ── P1.6: a final cluster joined to its history; content ids (F3, F8) ──
+
+
+def test_every_cluster_names_the_round_node_it_is(runs):
+    from constellation.core.ids import content_id
+    from constellation.sequencing.transcriptome.cluster.denovo.em.refine import (
+        template_id_for,
+    )
+
+    out = runs[1]
+    rd = _rounds(out)[-1]
+    clusters = pq.read_table(out / "clusters.parquet")
+    nodes_map = pq.read_table(out / "cluster_nodes.parquet")
+    assert nodes_map.column("cluster_id").to_pylist() == clusters.column(
+        "cluster_id"
+    ).to_pylist()
+
+    round_nodes = _nodes(rd)
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        in_node_order,
+    )
+
+    round_nodes = in_node_order(round_nodes)
+    key_row = {
+        (p, h): i
+        for i, (p, h) in enumerate(
+            zip(
+                round_nodes.column("parent_template_id").to_pylist(),
+                round_nodes.column("haplotype_id").to_pylist(),
+            )
+        )
+    }
+    final = _json(rd / "final.json")
+    merged = pq.read_table(rd / "merged_final.parquet")
+    absorbed = set(merged.column("absorbed_template_id").to_pylist())
+    seen_nodes = set()
+    for row, cluster in zip(nodes_map.to_pylist(), clusters.to_pylist()):
+        node_row = key_row[(row["parent_template_id"], row["haplotype_id"])]
+        assert row["node_template_id"] == template_id_for(row["round"] + 1, node_row)
+        assert row["node_template_id"] not in absorbed
+        seen_nodes.add(row["node_template_id"])
+        assert row["consensus_content_id"] == content_id(cluster["consensus_sequence"])
+        if cluster["predicted_protein"]:
+            assert row["protein_content_id"] == content_id(cluster["predicted_protein"])
+        if not row["rebuilt"]:
+            # Not rebuilt: the cluster IS the node — its consensus is the node's.
+            node_cons = round_nodes.column("consensus")[node_row].as_py()
+            assert cluster["consensus_sequence"] == node_cons
+    # Every node the merge kept is exactly one cluster; the absorbed are none.
+    assert len(seen_nodes) == clusters.num_rows
+    assert sum(nodes_map.column("rebuilt").to_pylist()) == final["n_rebuilt"]
+    total_absorbed = sum(nodes_map.column("n_absorbed").to_pylist())
+    assert total_absorbed == merged.num_rows == final["n_merged"]
+
+
+def test_without_a_final_merge_the_clusters_are_the_nodes_in_order(tmp_path):
+    out = tmp_path / "em"
+    run_em(
+        three_gene_panel(tmp_path),
+        out,
+        params=evidence_params(rounds=1, merge=False),
+        report=False,
+    )
+    m = pq.read_table(out / "cluster_nodes.parquet")
+    assert not any(m.column("rebuilt").to_pylist())
+    assert set(m.column("n_absorbed").to_pylist()) == {0}
+    from constellation.sequencing.transcriptome.cluster.denovo.em.refine import (
+        template_id_for,
+    )
+
+    assert m.column("node_template_id").to_pylist() == [
+        template_id_for(2, i) for i in range(m.num_rows)
+    ]

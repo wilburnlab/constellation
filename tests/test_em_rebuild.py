@@ -231,7 +231,7 @@ def test_only_the_rows_asked_for_are_rewritten_and_a_failure_is_counted(tmp_path
         + [(12, 0, 10 + i) for i in range(3)]
     )
     said = []
-    out, counts = rebuild_survivors(
+    out, counts, rebuilt_rows = rebuild_survivors(
         nodes,
         membership,
         np.array([0, 2]),
@@ -248,6 +248,7 @@ def test_only_the_rows_asked_for_are_rewritten_and_a_failure_is_counted(tmp_path
         "n_rebuild_reads_skipped": 3,
     }
     assert out.schema.equals(nodes.schema)
+    assert rebuilt_rows.tolist() == [0], "row 2 placed no read and kept its own"
     assert out.column("consensus").to_pylist()[1] == b, "not asked for: untouched"
     assert (
         out.column("consensus").to_pylist()[2] == nodes.column("consensus")[2].as_py()
@@ -258,7 +259,7 @@ def test_only_the_rows_asked_for_are_rewritten_and_a_failure_is_counted(tmp_path
     assert out.column("n_reads").to_pylist() == [6, 4, 3], "the merge's counts stand"
     assert said and "rebuilt 1" in said[0] and "1 kept their own" in said[0]
 
-    same, none = rebuild_survivors(
+    same, none, no_rows = rebuild_survivors(
         nodes,
         membership,
         np.array([], dtype=np.int64),
@@ -266,4 +267,4 @@ def test_only_the_rows_asked_for_are_rewritten_and_a_failure_is_counted(tmp_path
         params=MStepParams(),
         identity_floor=0.97,
     )
-    assert same is nodes and none["n_rebuilt"] == 0
+    assert same is nodes and none["n_rebuilt"] == 0 and no_rows.size == 0

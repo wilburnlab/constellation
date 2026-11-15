@@ -28,6 +28,7 @@ import pyarrow.parquet as pq
 
 # Aliased: the writers below take a ``write_fasta`` flag.
 from constellation.core.io.fasta import write_fasta as _write_fasta
+from constellation.core.io.schemas import register_schema
 from constellation.sequencing.schemas.transcriptome import (
     CLUSTER_MEMBERSHIP_TABLE,
     TRANSCRIPT_CLUSTER_TABLE,
@@ -42,6 +43,113 @@ LEGACY_CLUSTER_MODES = {"genome-guided": "genome", "de-novo": "kmer"}
 MODE_EM = "em"
 
 CLUSTER_EDGES = "cluster_edges.parquet"
+
+#: Which round node each final cluster is, and what it is made of.
+CLUSTER_NODES = "cluster_nodes.parquet"
+
+#: ``clusters.parquet`` numbers clusters by their row among the nodes the
+#: final merge kept, which is the order of nothing outside this run; this is
+#: the join from a cluster back to the round that emitted it — and through
+#: that round's lineage, to its whole history — and the content-derived ids
+#: that let two runs, or a transcript and a peptide, name the same sequence.
+EM_CLUSTER_NODE_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("cluster_id", pa.int64(), nullable=False),
+        # The round whose M-step emitted the node (the run's last round).
+        pa.field("round", pa.int32(), nullable=False),
+        # The node's key in that round's mstep/nodes and node_membership.
+        pa.field("parent_template_id", pa.int64(), nullable=False),
+        pa.field("haplotype_id", pa.int32(), nullable=False),
+        # template_id_for(round + 1, node row): the id the node carries in
+        # the round's graph/edges.parquet and merged_final.parquet.
+        pa.field("node_template_id", pa.int64(), nullable=False),
+        # The final merge absorbed others into it and its consensus was
+        # rebuilt from the pooled reads, so it is no node's consensus.
+        pa.field("rebuilt", pa.bool_(), nullable=False),
+        pa.field("n_absorbed", pa.int32(), nullable=False),
+        pa.field("absorbed_node_template_ids", pa.list_(pa.int64()), nullable=False),
+        # core.ids.content_id of the consensus and of the protein: attributes,
+        # not keys — byte-identical twins share one. Null protein: no ORF.
+        pa.field("consensus_content_id", pa.int64(), nullable=False),
+        pa.field("protein_content_id", pa.int64(), nullable=True),
+    ],
+    metadata={b"schema_name": b"EmClusterNodeTable"},
+)
+register_schema("EmClusterNodeTable", EM_CLUSTER_NODE_TABLE)
+
+
+def cluster_node_table(
+    nodes: pa.Table,
+    *,
+    round_index: int,
+    keep_rows: np.ndarray | None = None,
+    rebuilt_rows: np.ndarray | None = None,
+    merged: pa.Table | None = None,
+) -> pa.Table:
+    """:data:`EM_CLUSTER_NODE_TABLE` for the final clusters.
+
+    ``nodes`` are the final clusters' rows (``cluster_id`` = row);
+    ``keep_rows`` the rows of the last round's node table they came from
+    (identity when nothing was merged or there was no graph);
+    ``rebuilt_rows`` the clusters the final merge rebuilt; ``merged`` the
+    final merge's ``MERGED_TABLE``.
+    """
+    from constellation.core.ids import content_ids
+    from constellation.sequencing.transcriptome.cluster.denovo.em.refine import (
+        template_id_for,
+    )
+
+    n = nodes.num_rows
+    if n == 0:
+        return EM_CLUSTER_NODE_TABLE.empty_table()
+    keep = (
+        np.arange(n, dtype=np.int64)
+        if keep_rows is None
+        else np.asarray(keep_rows, dtype=np.int64)
+    )
+    if keep.size != n:
+        raise ValueError(
+            f"{keep.size} kept node rows for {n} clusters: the final merge's "
+            "record does not describe these clusters"
+        )
+    node_id = np.asarray(template_id_for(int(round_index) + 1, keep), dtype=np.int64)
+    absorbed: dict[int, list[int]] = {}
+    if merged is not None and merged.num_rows:
+        for a, surv in zip(
+            merged.column("absorbed_template_id").to_pylist(),
+            merged.column("survivor_template_id").to_pylist(),
+        ):
+            absorbed.setdefault(int(surv), []).append(int(a))
+    lists = [sorted(absorbed.get(int(i), [])) for i in node_id.tolist()]
+    rebuilt = np.zeros(n, dtype=bool)
+    if rebuilt_rows is not None and len(rebuilt_rows):
+        rebuilt[np.asarray(rebuilt_rows, dtype=np.int64)] = True
+    proteins = [p or None for p in nodes.column("protein").to_pylist()]
+    return pa.table(
+        {
+            "cluster_id": pa.array(np.arange(n, dtype=np.int64)),
+            "round": pa.array(np.full(n, int(round_index), np.int32)),
+            "parent_template_id": nodes.column("parent_template_id").cast(pa.int64()),
+            "haplotype_id": nodes.column("haplotype_id").cast(pa.int32()),
+            "node_template_id": pa.array(node_id),
+            "rebuilt": pa.array(rebuilt),
+            "n_absorbed": pa.array(np.array([len(x) for x in lists], np.int32)),
+            "absorbed_node_template_ids": pa.array(lists, pa.list_(pa.int64())),
+            "consensus_content_id": content_ids(
+                nodes.column("consensus").to_pylist()
+            ),
+            "protein_content_id": content_ids(proteins),
+        },
+        schema=EM_CLUSTER_NODE_TABLE,
+    )
+
+
+def write_cluster_nodes(output_dir: Path, table: pa.Table) -> Path:
+    path = Path(output_dir) / CLUSTER_NODES
+    tmp = path.with_name(path.name + ".tmp")
+    pq.write_table(table, tmp)
+    tmp.replace(path)
+    return path
 
 
 def build_cluster_tables(

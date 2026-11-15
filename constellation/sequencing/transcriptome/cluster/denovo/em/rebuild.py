@@ -270,7 +270,7 @@ def rebuild_survivors(
     quality_scale: float | None = None,
     threads: int = 1,
     log=None,
-) -> tuple[pa.Table, dict]:
+) -> tuple[pa.Table, dict, np.ndarray]:
     """Rebuild the consensus of the nodes at ``rows`` from their membership.
 
     ``nodes`` and ``membership`` are the final merge's outputs — the
@@ -280,7 +280,9 @@ def rebuild_survivors(
     (no read could be placed, or the rebuild raised; the survivor's own
     consensus stands), ``n_rebuild_errors`` (the part of the failures that
     raised) and ``n_rebuild_reads_skipped``. ``identity_floor`` and ``quality_scale``
-    are the run's admission rule, whole — see :func:`rebuild_one`.
+    are the run's admission rule, whole — see :func:`rebuild_one`. The third
+    value is the rows actually rebuilt (ascending), what the final clusters'
+    ``rebuilt`` flag records.
     """
     rows = np.asarray(rows, dtype=np.int64)
     counts = {
@@ -289,8 +291,9 @@ def rebuild_survivors(
         "n_rebuild_errors": 0,
         "n_rebuild_reads_skipped": 0,
     }
+    none = np.empty(0, dtype=np.int64)
     if rows.shape[0] == 0 or nodes.num_rows == 0:
-        return nodes, counts
+        return nodes, counts, none
     say = log or (lambda _m: None)
     read_rows = _read_rows_of(nodes, membership, rows)
     template_id = nodes.column("parent_template_id").to_numpy(zero_copy_only=False)
@@ -358,7 +361,7 @@ def rebuild_survivors(
         )
     )
     if not results:
-        return nodes, counts
+        return nodes, counts, none
 
     # Replace by mask rather than through a Python list of every row's
     # value: the table is every final node, and only a few thousand of them
@@ -380,7 +383,7 @@ def rebuild_survivors(
             name,
             pc.replace_with_mask(column, pa.array(mask), values),
         )
-    return out.cast(nodes.schema), counts
+    return out.cast(nodes.schema), counts, rebuilt_rows
 
 
 __all__ = ["REBUILT_COLUMNS", "align_to_survivor", "rebuild_one", "rebuild_survivors"]

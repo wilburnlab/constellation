@@ -70,6 +70,8 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.graph import (
 from constellation.sequencing.transcriptome.cluster.denovo.em.outputs import (
     CLUSTER_EDGES,
     build_cluster_tables,
+    cluster_node_table,
+    write_cluster_nodes,
     write_cluster_edges,
     write_em_manifest,
     write_em_outputs,
@@ -597,6 +599,23 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
             identity_threshold=params.p_floor,
         )
         paths = write_em_outputs(output_dir, clusters, membership, sample_id)
+        merged_path = final_rd / "merged_final.parquet"
+        paths["cluster_nodes"] = write_cluster_nodes(
+            output_dir,
+            cluster_node_table(
+                final_nodes,
+                round_index=results[-1].round_index,
+                keep_rows=final.get("keep_rows"),
+                rebuilt_rows=final.get("rebuilt_rows"),
+                # Only this run's: a graph that was off or failed writes no
+                # merged_final, and one from an earlier invocation may sit there.
+                merged=(
+                    pq.read_table(merged_path)
+                    if final.get("merge_applied") and merged_path.exists()
+                    else None
+                ),
+            ),
+        )
         counts = _cluster_edges(
             output_dir, final, clusters, paths, log, rd=final_rd, params=params
         )
@@ -1661,7 +1680,7 @@ def _final_graph_and_merge(
             if corpus_path is None:
                 final["rebuild"] = "skipped: no corpus"
             else:
-                nodes, counts = rebuild_survivors(
+                nodes, counts, rebuilt_rows = rebuild_survivors(
                     nodes,
                     membership,
                     grew,
@@ -1674,6 +1693,7 @@ def _final_graph_and_merge(
                 )
                 final["rebuild"] = "ok"
                 final.update(counts)
+                final["rebuilt_rows"] = rebuilt_rows
                 if counts["n_rebuilt"]:
                     # The graph the merge read measured consensus sequences
                     # the rebuild has just replaced. What the export needs
@@ -1802,7 +1822,7 @@ def _write_final_record(rd: Path, final: dict, n_clusters: int, counts: dict) ->
     record = {
         k: v
         for k, v in final.items()
-        if k not in ("edges_path", "keep_rows", "export_graph")
+        if k not in ("edges_path", "keep_rows", "export_graph", "rebuilt_rows")
     }
     record["n_clusters"] = int(n_clusters)
     record.update({k: int(v) for k, v in counts.items()})
