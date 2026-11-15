@@ -147,6 +147,18 @@ class MStepParams:
     min_extension_support: float | None = 3.0
     fold_insertions: bool = True
     max_members_per_template: int = 20_000
+    # Kernel knobs that were `refine_template`'s own defaults until they had
+    # to be recorded: a replay of one template has to run the kernel exactly
+    # as the round did, and a default nobody wrote down is a parameter only
+    # the code of that day knows. Values unchanged.
+    #: Window of the local uncovered fraction (`columns.column_stats`).
+    local_window: int = 200
+    #: Span endpoints within this many nt are one boundary, support-ranked.
+    boundary_tolerance: int = 10
+    #: Σkᵢ² the co-occurrence pass may spend before dropping low-effect columns.
+    max_cooccurrence_budget: float = 2e8
+    #: Reads that must carry an interior insertion for it to get a column.
+    min_insertion_support: float = 2.0
 
     def kernel_kwargs(self) -> dict[str, Any]:
         return {
@@ -164,6 +176,10 @@ class MStepParams:
             "eps_floor": self.eps_floor,
             "min_extension_support": self.min_extension_support,
             "fold_insertions": self.fold_insertions,
+            "local_window": self.local_window,
+            "boundary_tolerance": self.boundary_tolerance,
+            "max_cooccurrence_budget": self.max_cooccurrence_budget,
+            "min_insertion_support": self.min_insertion_support,
         }
 
 

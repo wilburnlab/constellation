@@ -192,6 +192,7 @@ def rebuild_one(
         template_id=int(template_id),
         min_aa_length=params.min_aa_length,
         fold_insertions=params.fold_insertions,
+        min_insertion_support=params.min_insertion_support,
         min_extension_support=params.min_extension_support,
     )
     if node is None:

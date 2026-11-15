@@ -158,3 +158,78 @@ GOLDEN: dict[int, dict[str, str]] = {
 def test_the_runs_match_the_golden_digests(runs):
     for rounds, out in runs.items():
         assert run_digests(out) == GOLDEN[rounds], f"{rounds}-round run changed"
+
+
+# ── P1.1: what a round runs under is on disk before it runs ───────────
+
+
+def test_every_round_records_its_parameters(runs):
+    from dataclasses import asdict
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
+        corpus_digest,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        ROUND_PARAMS_VERSION,
+    )
+
+    out = runs[3]
+    want = json.loads(json.dumps(asdict(evidence_params(rounds=3)), default=str))
+    for rd in _rounds(out):
+        rec = _json(rd / "params.json")
+        assert rec["version"] == ROUND_PARAMS_VERSION
+        assert rec["params"] == want
+        # The kernel's own former defaults are recorded with the rest.
+        for knob in (
+            "local_window",
+            "boundary_tolerance",
+            "max_cooccurrence_budget",
+            "min_insertion_support",
+        ):
+            assert knob in rec["params"]["mstep"]
+        assert rec["error_model"]["refit"] is False
+        assert rec["libraries"]["numpy"]
+        assert rec["corpus_digest"] == corpus_digest(out / "corpus" / "reads.arrow")
+
+
+def test_a_round_that_dies_still_says_what_it_ran_under(tmp_path, monkeypatch):
+    """The point of writing it first: manifest.json only appears at the end."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import rounds
+
+    def boom(*a, **k):
+        raise RuntimeError("killed in the M-step")
+
+    monkeypatch.setattr(rounds, "_run_mstep", boom)
+    out = tmp_path / "em"
+    with pytest.raises(RuntimeError, match="killed"):
+        run_em(three_gene_panel(tmp_path), out, params=evidence_params(rounds=1))
+    rd = out / "rounds" / "r01"
+    assert (rd / "params.json").exists()
+    assert not (rd / "_SUCCESS").exists()
+    assert not (out / "manifest.json").exists()
+
+
+def test_the_kernel_knobs_reach_refine_template():
+    import inspect
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        refine_template,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+    )
+
+    kwargs = MStepParams().kernel_kwargs()
+    accepted = set(inspect.signature(refine_template).parameters)
+    assert set(kwargs) <= accepted
+    # Same values the kernel used to default to: recording them changed nothing.
+    defaults = {
+        k: v.default for k, v in inspect.signature(refine_template).parameters.items()
+    }
+    for knob in (
+        "local_window",
+        "boundary_tolerance",
+        "max_cooccurrence_budget",
+        "min_insertion_support",
+    ):
+        assert kwargs[knob] == defaults[knob]

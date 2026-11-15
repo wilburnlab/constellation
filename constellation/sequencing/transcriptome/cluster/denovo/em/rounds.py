@@ -478,9 +478,14 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
     final_nodes: pa.Table | None = None
     final_assignments: pa.Table | None = None
     final_membership: pa.Table | None = None
+    params_record = _round_params_record(params, _cached_corpus_digest(corpus))
     for r in range(start, start + params.rounds):
         rd = rounds_dir / f"r{r:02d}"
         rd.mkdir(parents=True, exist_ok=True)
+        # Before any work: what this round is about to be produced under,
+        # readable while it runs and after it dies (manifest.json is written
+        # only at the end of a run, and only for the last invocation).
+        _write_json(rd / ROUND_PARAMS, params_record)
         t0 = time.time()
 
         tdir = rd / "templates"
@@ -1168,6 +1173,74 @@ def _read_assignments(directory: Path) -> pa.Table:
     if not files:
         return EM_ASSIGNMENT_TABLE.empty_table()
     return pa_ds.dataset(files, schema=EM_ASSIGNMENT_TABLE).to_table()
+
+
+#: Per round, written when the round starts: the parameters it runs under.
+ROUND_PARAMS = "params.json"
+
+#: What :data:`ROUND_PARAMS` holds; bumped when a field changes meaning.
+ROUND_PARAMS_VERSION = 1
+
+#: Libraries whose behaviour a replay depends on. numpy's
+#: ``Generator.choice`` (the M-step's member subsample) is not promised
+#: stable across releases, and the kernels are numpy / edlib throughout.
+_RECORDED_LIBRARIES = ("numpy", "scipy", "pyarrow", "edlib")
+
+
+def _round_params_record(params: EmParams, corpus_digest: str) -> dict:
+    """``rNN/params.json``: everything a later replay of one of this round's
+    templates needs to run the M-step exactly as the round did."""
+    from importlib import metadata
+
+    import constellation
+    from constellation.sequencing.transcriptome.cluster.denovo.variants import (
+        ErrorModel,
+    )
+
+    def _version(name: str) -> str | None:
+        try:
+            return metadata.version(name)
+        except metadata.PackageNotFoundError:
+            return None
+
+    return {
+        "version": ROUND_PARAMS_VERSION,
+        "params": asdict(params),
+        # The model every stage of every round uses: the loop never passes
+        # one, so this is ErrorModel()'s defaults. A per-round refit is
+        # wanted and deliberately deferred until clustering quality can be
+        # assessed (the M-step's disagreement statistics are its substrate).
+        "error_model": {"refit": False, **asdict(ErrorModel())},
+        "corpus_digest": corpus_digest,
+        "constellation": constellation.__version__,
+        "libraries": {name: _version(name) for name in _RECORDED_LIBRARIES},
+    }
+
+
+def _cached_corpus_digest(corpus) -> str:
+    """:func:`~.corpus.corpus_digest`, cached beside the corpus.
+
+    One pass over the whole corpus, so it is done once and kept under the
+    file's size and modification time; a corpus rebuilt in place misses the
+    cache and is digested afresh.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
+        corpus_digest,
+    )
+
+    path = Path(corpus.arrow_path)
+    st = path.stat()
+    key = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    cache = path.parent / "digest.json"
+    try:
+        record = json.loads(cache.read_text())
+        if record.get("key") == key:
+            return str(record["corpus_digest"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    digest = corpus_digest(path)
+    _write_json(cache, {"key": key, "corpus_digest": digest})
+    return digest
 
 
 def _write_json(path: Path, payload: dict) -> None:
