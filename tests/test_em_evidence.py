@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sys
 from collections import Counter
 from pathlib import Path
@@ -233,3 +234,116 @@ def test_the_kernel_knobs_reach_refine_template():
         "min_insertion_support",
     ):
         assert kwargs[knob] == defaults[knob]
+
+
+# ── P1.2: a round's M-step shards are the ones it recorded (F12) ──────
+
+
+def _templates_table(out: Path, r: int) -> pa.Table:
+    path = out / "rounds" / f"r{r:02d}" / "templates" / "templates.arrow"
+    with pa.memory_map(str(path), "r") as mm:
+        return pa.ipc.open_file(mm).read_all()
+
+
+def _plant_stale_shards(rd: Path, index: int = 7) -> None:
+    """What an earlier attempt with more units leaves behind: shards past the
+    ones the round wrote, holding nodes the round does not have."""
+    for key in ("nodes", "node_membership"):
+        d = rd / "mstep" / key
+        shutil.copy(d / "part-00000.parquet", d / f"part-{index:05d}.parquet")
+
+
+#: Without the merge: a stale shard is a copy of nodes the round has, and the
+#: merge would collapse the copies as byte-identical twins, hiding exactly
+#: the duplication these tests look for. Under --no-merge a duplicate node
+#: is a duplicate template.
+_NO_MERGE = dict(merge=False)
+
+
+@pytest.fixture(scope="module")
+def uninterrupted_two_rounds(tmp_path_factory):
+    base = tmp_path_factory.mktemp("em_two")
+    out = base / "em"
+    run_em(
+        three_gene_panel(base),
+        out,
+        params=evidence_params(rounds=2, **_NO_MERGE),
+        report=False,
+    )
+    return out
+
+
+def test_an_extended_run_ignores_shards_an_earlier_attempt_left(
+    tmp_path, uninterrupted_two_rounds
+):
+    """Extending a finished run rebuilds the last round's successor from its
+    node shards — it always does, a final round never writes them — and that
+    used to glob the directory, turning stale shards into duplicate
+    templates."""
+    out = tmp_path / "em"
+    demux = three_gene_panel(tmp_path)
+    params = evidence_params(rounds=1, **_NO_MERGE)
+    run_em(demux, out, params=params, report=False)
+    _plant_stale_shards(out / "rounds" / "r01")
+    run_em(demux, out, params=params, resume=True, report=False)
+
+    got = _templates_table(out, 2)
+    want = _templates_table(uninterrupted_two_rounds, 2)
+    assert got.column("sequence").to_pylist() == want.column("sequence").to_pylist()
+
+
+def test_a_legacy_round_without_the_record_reads_the_prefix_it_wrote(
+    tmp_path, uninterrupted_two_rounds
+):
+    """A round from before the record has only n_nodes: its shards are the
+    prefix whose unique nodes add up to it."""
+    out = tmp_path / "em"
+    demux = three_gene_panel(tmp_path)
+    params = evidence_params(rounds=1, **_NO_MERGE)
+    run_em(demux, out, params=params, report=False)
+    rd = out / "rounds" / "r01"
+    record = _json(rd / "round.json")
+    record.pop("mstep", None)
+    (rd / "round.json").write_text(json.dumps(record))
+    _plant_stale_shards(rd)
+    run_em(demux, out, params=params, resume=True, report=False)
+
+    got = _templates_table(out, 2)
+    want = _templates_table(uninterrupted_two_rounds, 2)
+    assert got.column("sequence").to_pylist() == want.column("sequence").to_pylist()
+
+
+def test_shards_no_prefix_explains_are_refused_not_guessed(tmp_path):
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        StaleShardsError,
+        read_round_nodes,
+    )
+
+    out = tmp_path / "em"
+    run_em(three_gene_panel(tmp_path), out, params=evidence_params(rounds=1), report=False)
+    rd = out / "rounds" / "r01"
+    assert read_round_nodes(rd).num_rows == _json(rd / "round.json")["n_nodes"]
+
+    record = _json(rd / "round.json")
+    record.pop("mstep")
+    record["n_nodes"] = int(record["n_nodes"]) + 1  # matches no prefix
+    (rd / "round.json").write_text(json.dumps(record))
+    with pytest.raises(StaleShardsError, match="no prefix"):
+        read_round_nodes(rd)
+
+
+def test_a_rerun_round_clears_what_its_dead_attempt_wrote(tmp_path):
+    """The M-step clears mstep/ before writing, so a round re-run after a
+    crash never sits beside the dead attempt's extra shards."""
+    out = tmp_path / "em"
+    demux = three_gene_panel(tmp_path)
+    run_em(demux, out, params=evidence_params(rounds=1), report=False)
+    rd = out / "rounds" / "r01"
+    _plant_stale_shards(rd, index=9)
+    (rd / "_SUCCESS").unlink()  # the round died after its M-step
+    run_em(demux, out, params=evidence_params(rounds=1), resume=True, report=False)
+    assert (rd / "_SUCCESS").exists()
+    for key in ("nodes", "node_membership"):
+        assert not (rd / "mstep" / key / "part-00009.parquet").exists()
+    n_units = _json(rd / "round.json")["mstep"]["n_units"]
+    assert len(list((rd / "mstep" / "nodes").glob("part-*.parquet"))) == n_units

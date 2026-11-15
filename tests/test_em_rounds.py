@@ -986,7 +986,9 @@ def _twin_first_node(monkeypatch, *, sibling: bool, trim_5p: int = 0):
     real = rounds_mod._run_mstep
 
     def _with_twin(r, rd, store, corpus, assignments, params, log):
-        nodes, membership = real(r, rd, store, corpus, assignments, params, log)
+        nodes, membership, _units = real(
+            r, rd, store, corpus, assignments, params, log
+        )
         pid = int(nodes.column("parent_template_id")[0].as_py())
         hap = int(nodes.column("haplotype_id")[0].as_py())
         if sibling:
@@ -1047,7 +1049,8 @@ def _twin_first_node(monkeypatch, *, sibling: bool, trim_5p: int = 0):
             for old in shard_dir.glob("part-*.parquet"):
                 old.unlink()
             pq.write_table(table, shard_dir / "part-00000.parquet")
-        return nodes, membership
+        # One shard per key now, so one unit is what round.json must record.
+        return nodes, membership, 1
 
     monkeypatch.setattr(rounds_mod, "_run_mstep", _with_twin)
 

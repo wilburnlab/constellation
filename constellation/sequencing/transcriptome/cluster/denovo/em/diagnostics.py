@@ -60,6 +60,22 @@ def _round_json(d: Path) -> dict:
     return json.loads(path.read_text()) if path.exists() else {}
 
 
+def _round_nodes(d: Path, columns: list[str] | None = None) -> pa.Table | None:
+    """A finished round's M-step nodes, through :mod:`.round_io` — never a
+    glob, which reads shards an earlier attempt with more units left behind.
+    ``None`` when the shards on disk are not the round's; a report never
+    raises over that."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        StaleShardsError,
+        read_round_nodes,
+    )
+
+    try:
+        return read_round_nodes(d, columns=columns)
+    except StaleShardsError:
+        return None
+
+
 def _table(directory: Path, pattern: str = "part-*.parquet") -> pa.Table | None:
     files = sorted(Path(directory).glob(pattern))
     if not files:
@@ -289,7 +305,7 @@ def section_reference_drift(em_dir: Path) -> ReportSection:
     """Reference and ORF length per round — the ledger #42 instrumentation."""
     rows = []
     for r, d in _rounds(em_dir):
-        nodes = _table(d / "mstep" / "nodes")
+        nodes = _round_nodes(d)
         if nodes is None or nodes.num_rows == 0:
             continue
         cons_len = pc.utf8_length(nodes.column("consensus")).to_numpy(
@@ -399,10 +415,10 @@ def _resplit_survivors(rd: Path, next_rd: Path | None) -> int | None:
     survivors = pq.read_table(merged, columns=["survivor_template_id"]).column(0)
     if len(survivors) == 0:
         return 0
-    files = sorted((next_rd / "mstep" / "nodes").glob("part-*.parquet"))
-    if not files:
+    nodes = _round_nodes(next_rd, columns=["parent_template_id"])
+    if nodes is None or nodes.num_rows == 0:
         return None
-    parents = pa_ds.dataset(files).to_table(columns=["parent_template_id"]).column(0)
+    parents = nodes.column(0)
     ids, counts = np.unique(
         parents.to_numpy(zero_copy_only=False), return_counts=True
     )

@@ -88,6 +88,9 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import 
 from constellation.sequencing.transcriptome.cluster.denovo.em.rebuild import (
     rebuild_survivors,
 )
+from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+    read_round_nodes,
+)
 from constellation.sequencing.transcriptome.cluster.denovo.em.seed import (
     extract_seed_orfs,
 )
@@ -390,6 +393,9 @@ class RoundResult:
     n_nodes: int
     churn: dict[str, float]
     seconds: dict[str, float]
+    #: What the M-step wrote: ``n_units`` (which of ``mstep/<key>/`` shards
+    #: are this round's — see :mod:`.round_io`) and ``n_membership_rows``.
+    mstep: dict[str, Any] = field(default_factory=dict)
 
 
 def run_em(
@@ -677,7 +683,7 @@ def _one_round(
     if prev_assignments is not None:
         estep_stats["n_newly_lost"] = _newly_lost(prev_assignments, assignments)
     t1 = time.time()
-    nodes, node_membership = _run_mstep(
+    nodes, node_membership, n_units = _run_mstep(
         r, rd, store, corpus, assignments, params, log
     )
     t_mstep = time.time() - t1
@@ -696,6 +702,10 @@ def _one_round(
         n_nodes=int(nodes.num_rows),
         churn=churn,
         seconds={"estep": round(t_estep, 1), "mstep": round(t_mstep, 1)},
+        mstep={
+            "n_units": int(n_units),
+            "n_membership_rows": int(node_membership.num_rows),
+        },
     )
     (rd / "round.json").write_text(json.dumps(asdict(result), indent=2, default=str))
     return result, assignments, nodes, node_membership
@@ -1111,10 +1121,22 @@ def _write_seed_stage(seed_dir: Path, params: EmParams, stats: dict) -> None:
 
 
 def _run_mstep(r, rd, store, corpus, assignments, params, log):
+    """Run one round's M-step; return ``(nodes, membership, n_units)``.
+
+    ``mstep/`` is cleared first — before the early return too — because
+    ``run_batched`` never clears its output and writes one shard per unit,
+    so an earlier attempt with more units leaves shards a later reader that
+    globs the directory would take for this round's (:mod:`.round_io`).
+    """
     out = rd / "mstep"
+    shutil.rmtree(out, ignore_errors=True)
     srt, starts = sort_assignments_by_template(assignments)
     if srt.num_rows == 0:
-        return REFINED_NODE_TABLE.empty_table(), NODE_MEMBERSHIP_TABLE.empty_table()
+        return (
+            REFINED_NODE_TABLE.empty_table(),
+            NODE_MEMBERSHIP_TABLE.empty_table(),
+            0,
+        )
 
     bounds = np.concatenate([starts, [srt.num_rows]])
     tr = srt.column("template_row").to_numpy(zero_copy_only=False)
@@ -1165,7 +1187,7 @@ def _run_mstep(r, rd, store, corpus, assignments, params, log):
         if mem_shards
         else NODE_MEMBERSHIP_TABLE.empty_table()
     )
-    return nodes, membership
+    return nodes, membership, len(units)
 
 
 def _read_assignments(directory: Path) -> pa.Table:
@@ -1864,13 +1886,11 @@ def _resume_point(rounds_dir: Path, resume: bool, log, params: EmParams | None =
     if not nodes_dir.exists() or not store_path.exists():
         return 1, None, None, []
     log(f"resuming after round {last} (rebuilding its successor's templates)")
+    # Through round_io, never a glob: shards an earlier attempt with more
+    # units left behind would otherwise become duplicate templates.
+    nodes = read_round_nodes(rd)
     store = TemplateStore.open(store_path)
     try:
-        nodes = in_node_order(
-            pa_ds.dataset(
-                sorted(nodes_dir.glob("part-*.parquet")), schema=REFINED_NODE_TABLE
-            ).to_table()
-        )
         refined = _refine_and_merge(
             rd, nodes, store, last, params or EmParams(), log
         )
@@ -1932,6 +1952,7 @@ def _read_history(rounds_dir: Path, done: list[int]) -> list[RoundResult]:
                 n_nodes=int(j.get("n_nodes", 0)),
                 churn=j.get("churn", {}),
                 seconds=j.get("seconds", {}),
+                mstep=j.get("mstep", {}),
             )
         )
     return out
