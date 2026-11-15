@@ -413,6 +413,67 @@ __all__ = [
 ]
 
 
+def rank_by_score(
+    admitted: np.ndarray,
+    template_idx: np.ndarray,
+    group_ptr: np.ndarray,
+    *,
+    score: np.ndarray,
+) -> np.ndarray:
+    """Per group, the admitted hit with the best ``score`` (ties: template).
+
+    Not an assignment rule: the runner-up's fallback where the round's rule
+    scored only a shortlist (minimap2's round 2+, whose likelihood is
+    computed inside the AS window alone).
+    """
+    n_groups = group_ptr.size - 1
+    if n_groups <= 0 or admitted.size == 0:
+        return np.full(max(n_groups, 0), UNASSIGNED, dtype=np.int64)
+    grp, _ = _group_of_hit(group_ptr)
+    order = np.lexsort(
+        (template_idx, -np.asarray(score, dtype=np.float64), ~admitted, grp)
+    )
+    best = _first_per_group(order, grp, n_groups)
+    return np.where(admitted[best], best, UNASSIGNED)
+
+
+def runner_up(
+    rank,
+    winner: np.ndarray,
+    admitted: np.ndarray,
+    template_idx: np.ndarray,
+    group_ptr: np.ndarray,
+    **kwargs,
+) -> np.ndarray:
+    """Per group, the slot ``rank`` would have chosen had the winner's
+    template not been a candidate at all — every hit on it masked out.
+
+    One definition under every rule: the same ranker with the same inputs,
+    minus the winner. Under the likelihood rule's abundance escape that is
+    not necessarily the argmax the escape overrode — the escape is re-run
+    too, against the new argmax — and that is what the column means.
+    ``UNASSIGNED`` where the read had no winner or no other admitted
+    template. ``rank`` may return a tuple (the likelihood rule's
+    ``(winner, logl_delta)``); its first element is taken.
+    """
+    n_groups = group_ptr.size - 1
+    if n_groups <= 0 or admitted.size == 0:
+        return np.full(max(n_groups, 0), UNASSIGNED, dtype=np.int64)
+    grp, _ = _group_of_hit(group_ptr)
+    template_idx = np.asarray(template_idx)
+    winner = np.asarray(winner, dtype=np.int64)
+    has = winner != UNASSIGNED
+    win_t = np.full(n_groups, -1, dtype=np.int64)
+    win_t[has] = template_idx[winner[has]]
+    rival = np.asarray(admitted, dtype=bool) & ~(
+        has[grp] & (template_idx == win_t[grp])
+    )
+    second = rank(rival, template_idx, group_ptr, **kwargs)
+    if isinstance(second, tuple):
+        second = second[0]
+    return np.where(has, second, UNASSIGNED)
+
+
 def rank_round1_identity(
     admitted: np.ndarray,
     template_idx: np.ndarray,

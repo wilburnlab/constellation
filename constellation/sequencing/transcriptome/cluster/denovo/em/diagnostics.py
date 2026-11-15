@@ -283,10 +283,28 @@ def section_assignment_rule(em_dir: Path) -> ReportSection:
     delta = assigned.column("logl_delta").to_numpy(zero_copy_only=False)
     overridden = np.nansum(delta > 0) if delta.size else 0
 
+    if "runner_up_template_id" in assigned.column_names:
+        # A read with no other admitted TEMPLATE is uncontested. Counting
+        # admitted hits instead counted a second minimap2 hit on the winner's
+        # own template as a contender.
+        runner = assigned.column("runner_up_template_id")
+        uncontested = runner.null_count / n
+        uncontested_how = "no runner-up template"
+        contested = _contested_fraction(assigned)
+    else:
+        uncontested = float((n_adm == 1).mean())
+        uncontested_how = "`n_admitted == 1`; this round predates the runner-up"
+        contested = None
     body = (
         f"Round {r}, {n:,} assigned reads.\n\n"
-        f"- uncontested (`n_admitted == 1`): **{(n_adm == 1).mean():.2%}**\n"
-        f"- median admitted candidates: **{int(np.median(n_adm))}**\n"
+        f"- uncontested ({uncontested_how}): **{uncontested:.2%}**\n"
+        + (
+            f"- contested — the runner-up's identity within the read's own "
+            f"noise band of the winner's: **{contested:.2%}**\n"
+            if contested is not None
+            else ""
+        )
+        + f"- median admitted candidates: **{int(np.median(n_adm))}**\n"
         f"- p90 admitted candidates: **{int(np.percentile(n_adm, 90))}**\n"
         f"- winner is not the argmax: **{overridden / n:.2%}** "
         "(the abundance escape; every one is inside `--near-tie-delta-logl` "
@@ -299,6 +317,25 @@ def section_assignment_rule(em_dir: Path) -> ReportSection:
             "(target ≤5%); it is meant to be rare and decisive"
         )
     return ReportSection(title="Assignment rule", body=body, flags=flags)
+
+
+def _contested_fraction(
+    assigned: pa.Table, *, z: float = 2.0, error_rate: float = 0.01
+) -> float:
+    """Reads whose runner-up is within the winner's own identity noise band,
+    ``z·sqrt(L·e(1−e))/L`` over the aligned length — the band round 1's
+    identity rule treats as a tie."""
+    ident = assigned.column("identity").to_numpy(zero_copy_only=False).astype(float)
+    rival = assigned.column("runner_up_identity").to_numpy(zero_copy_only=False).astype(
+        float
+    )
+    length = np.maximum(
+        assigned.column("aligned_len").to_numpy(zero_copy_only=False).astype(float), 1.0
+    )
+    width = z * np.sqrt(length * error_rate * (1.0 - error_rate)) / length
+    with np.errstate(invalid="ignore"):
+        close = np.isfinite(rival) & np.isfinite(ident) & (ident - rival <= width)
+    return float(close.mean()) if close.size else 0.0
 
 
 def section_reference_drift(em_dir: Path) -> ReportSection:

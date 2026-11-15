@@ -48,8 +48,19 @@ EM_ASSIGNMENT_TABLE: pa.Schema = pa.schema(
         pa.field("template_row", pa.int32(), nullable=False),
         pa.field("round", pa.int32(), nullable=False),
         pa.field("weight", pa.float32(), nullable=False),
+        # The winner's alignment score (minimap2's AS, or the map-ont score
+        # recomputed from the edlib CIGAR under the two-pass aligners).
         pa.field("as_score", pa.int32(), nullable=False),
+        # The winner's SHORTFALL from the best admitted score — 0 whenever
+        # the winner has the best score, which is not a margin to anything:
+        # it is non-zero only when the rule chose on something else
+        # (replication in round 1, the likelihood after). The margin to the
+        # runner-up is the runner_up_* columns.
         pa.field("as_delta", pa.int32(), nullable=False),
+        # Rounds 2+: the winner's log-likelihood over the differing positions,
+        # and its shortfall from the best admitted one — 0 on the argmax,
+        # positive only when the abundance escape chose the winner. Null in
+        # round 1 and for an unassigned read.
         pa.field("logl", pa.float32(), nullable=True),
         pa.field("logl_delta", pa.float32(), nullable=True),
         pa.field("n_hits", pa.int32(), nullable=False),
@@ -90,6 +101,21 @@ EM_ASSIGNMENT_TABLE: pa.Schema = pa.schema(
         pa.field("identity", pa.float32(), nullable=True),
         pa.field("aligned_len", pa.int32(), nullable=True),
         pa.field("unassigned_reason", pa.string(), nullable=True),
+        # Who came second: the template the round's own rule would have
+        # chosen had the winner's template not been a candidate at all (the
+        # same ranker, every hit on the winner masked out; scheduler.
+        # runner_up). Null when the read was unassigned, had no other
+        # admitted template, or the rule never looked further — the edlib /
+        # native lazy round-1 walk stops at its first admitted hit. Under
+        # minimap2's round 2+ the likelihood exists only inside the AS
+        # shortlist; with no rival there, the best other admitted template
+        # by AS is taken and the logl gap is null.
+        pa.field("runner_up_template_id", pa.int64(), nullable=True),
+        pa.field("runner_up_identity", pa.float32(), nullable=True),
+        # logl(winner) - logl(runner-up), nats; rounds 2+ only. Negative
+        # when the abundance escape chose the winner over a better-scoring
+        # rival.
+        pa.field("runner_up_logl_gap", pa.float32(), nullable=True),
     ],
     metadata={b"schema_name": b"EmAssignmentTable"},
 )
@@ -251,12 +277,12 @@ def assign_block(
 
     logl = np.full(hb.read_row.size, -np.inf, dtype=np.float64)
     logl_delta = np.full(hb.read_row.size, np.inf, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ident_h = np.where(hb.aln_len > 0, hb.n_match / np.maximum(hb.aln_len, 1), 0.0)
+    # Whether the runner-up was ranked by the likelihood (and so has a gap).
+    by_logl = np.zeros(n_groups, dtype=bool)
 
     if round_index <= 1 and round1_rule == "identity_band":
-        with np.errstate(divide="ignore", invalid="ignore"):
-            ident_h = np.where(
-                hb.aln_len > 0, hb.n_match / np.maximum(hb.aln_len, 1), 0.0
-            )
         # The read's own length, decoded once per read (PAF repeats it on
         # every line). The aligned length is NOT a stand-in for it here:
         # minimap2's hit is local, so a 300-nt hit on a 300-nt template
@@ -264,10 +290,7 @@ def assign_block(
         # template that explains all of it (review of 91e7c69). The two-pass
         # reducer already ranks on the true length.
         read_len_g = hb.int_fields(ptr[:-1], ("q_len",))["q_len"]
-        winner = sched.rank_round1_identity(
-            admitted,
-            hb.template_row,
-            ptr,
+        kw = dict(
             identity=ident_h,
             span=hb.aln_len,
             orf_replication=store.orf_replication,
@@ -277,13 +300,18 @@ def assign_block(
             z=near_tie_z,
             error_rate=error_rate,
         )
+        winner = sched.rank_round1_identity(admitted, hb.template_row, ptr, **kw)
+        runner = sched.runner_up(
+            sched.rank_round1_identity, winner, admitted, hb.template_row, ptr, **kw
+        )
     elif round_index <= 1:
-        winner = sched.rank_round1(
-            admitted,
-            hb.template_row,
-            ptr,
+        kw = dict(
             orf_replication=store.orf_replication,
             seed_read_quality=store.seed_read_quality,
+        )
+        winner = sched.rank_round1(admitted, hb.template_row, ptr, **kw)
+        runner = sched.runner_up(
+            sched.rank_round1, winner, admitted, hb.template_row, ptr, **kw
         )
     else:
         # AS shortlists; the likelihood decides. Confining the CIGAR decode to
@@ -312,10 +340,7 @@ def assign_block(
                 model=error_model,
             )
         read_len_h = hb.aln_len.astype(np.float64)
-        winner, logl_delta = sched.rank_likelihood(
-            short,
-            hb.template_row,
-            ptr,
+        kw = dict(
             logl=logl,
             support=store.node_weight,
             read_len=read_len_h,
@@ -323,9 +348,35 @@ def assign_block(
             delta_logl=delta_logl,
             support_ratio=support_ratio,
         )
+        winner, logl_delta = sched.rank_likelihood(short, hb.template_row, ptr, **kw)
+        runner = sched.runner_up(
+            sched.rank_likelihood, winner, short, hb.template_row, ptr, **kw
+        )
+        # The likelihood exists only inside the AS window: with no rival
+        # there, the best other admitted template by AS, with no logl gap.
+        by_logl = runner != sched.UNASSIGNED
+        by_as = sched.runner_up(
+            sched.rank_by_score,
+            winner,
+            admitted,
+            hb.template_row,
+            ptr,
+            score=hb.as_score,
+        )
+        runner = np.where(by_logl, runner, by_as)
 
     has = winner != sched.UNASSIGNED
     slot = np.where(has, winner, 0)
+    runner_cols = _runner_up_columns(
+        runner,
+        slot=slot,
+        has=has,
+        by_logl=by_logl,
+        template_row=hb.template_row,
+        identity=ident_h,
+        logl=logl,
+        store=store,
+    )
 
     # as_delta against the group's best ADMITTED score, for continuity with
     # the bench diagnostics.
@@ -362,16 +413,8 @@ def assign_block(
             pa.array(np.where(has, 1.0, 0.0).astype(np.float32)),
             pa.array(np.where(has, hb.as_score[slot], 0).astype(np.int32)),
             pa.array(np.where(has, best_as - hb.as_score[slot], 0).astype(np.int32)),
-            pa.array(
-                np.where(has & np.isfinite(logl[slot]), logl[slot], np.nan).astype(
-                    np.float32
-                )
-            ),
-            pa.array(
-                np.where(
-                    has & np.isfinite(logl_delta[slot]), logl_delta[slot], np.nan
-                ).astype(np.float32)
-            ),
+            _nullable_f32(logl[slot], has),
+            _nullable_f32(logl_delta[slot], has),
             pa.array(sizes.astype(np.int32)),
             pa.array(n_admitted.astype(np.int32)),
             pa.array(sizes >= int(minimap2_n) + 1),
@@ -391,9 +434,49 @@ def assign_block(
             ident_arr,
             len_arr,
             reason_arr,
+            *runner_cols,
         ],
         schema=EM_ASSIGNMENT_TABLE,
     )
+
+
+def _nullable_f32(values: np.ndarray, valid: np.ndarray) -> pa.Array:
+    """Null, not NaN, where there is no value: a log-likelihood is absent in
+    round 1 and for an unassigned read, which is not a number that failed."""
+    values = np.asarray(values, dtype=np.float64)
+    ok = np.asarray(valid, dtype=bool) & np.isfinite(values)
+    return pa.array(np.where(ok, values, 0.0).astype(np.float32), mask=~ok)
+
+
+def _runner_up_columns(
+    runner: np.ndarray,
+    *,
+    slot: np.ndarray,
+    has: np.ndarray,
+    by_logl: np.ndarray,
+    template_row: np.ndarray,
+    identity: np.ndarray,
+    logl: np.ndarray,
+    store,
+) -> list[pa.Array]:
+    """``runner_up_template_id`` / ``_identity`` / ``_logl_gap`` per read."""
+    ok = (runner != sched.UNASSIGNED) & has
+    r = np.where(ok, runner, 0)
+    if template_row.size:
+        tid = np.asarray(store.template_id, dtype=np.int64)[template_row[r]]
+        ident = np.asarray(identity, dtype=np.float64)[r]
+        gap = np.asarray(logl, dtype=np.float64)[slot] - np.asarray(
+            logl, dtype=np.float64
+        )[r]
+    else:
+        tid = np.zeros(r.size, dtype=np.int64)
+        ident = gap = np.zeros(r.size, dtype=np.float64)
+    gap_ok = ok & np.asarray(by_logl, dtype=bool) & np.isfinite(gap)
+    return [
+        pa.array(np.where(ok, tid, 0).astype(np.int64), mask=~ok),
+        pa.array(np.where(ok, ident, 0.0).astype(np.float32), mask=~ok),
+        pa.array(np.where(gap_ok, gap, 0.0).astype(np.float32), mask=~gap_ok),
+    ]
 
 
 _SHORTLIST_FIELDS = ("q_start", "q_end", "t_start", "t_end")
@@ -563,6 +646,10 @@ def assign_block_edlib(
     logl = np.full(m, -np.inf, dtype=np.float64)
     logl_delta = np.full(m, np.inf, dtype=np.float64)
     winner = np.full(n_groups, sched.UNASSIGNED, dtype=np.int64)
+    # The lazy round-1 walk stops at its first admitted hit, so it never
+    # learns who came second: its runner-up stays null.
+    runner = np.full(n_groups, sched.UNASSIGNED, dtype=np.int64)
+    by_logl = np.zeros(n_groups, dtype=bool)
 
     if lazy_round1:
         quality = np.asarray(store.seed_read_quality, dtype=np.float64)[t_row]
@@ -588,10 +675,7 @@ def assign_block_edlib(
         admitted = _admitted()
         with np.errstate(divide="ignore", invalid="ignore"):
             ident = np.where(aln_len > 0, n_match / np.maximum(aln_len, 1), 0.0)
-        winner = sched.rank_round1_identity(
-            admitted,
-            t_row,
-            sub_ptr,
+        kw = dict(
             identity=ident,
             span=aln_len,
             orf_replication=store.orf_replication,
@@ -600,6 +684,10 @@ def assign_block_edlib(
             template_len=store.lengths().astype(np.float64),
             z=near_tie_z,
             error_rate=error_rate,
+        )
+        winner = sched.rank_round1_identity(admitted, t_row, sub_ptr, **kw)
+        runner = sched.runner_up(
+            sched.rank_round1_identity, winner, admitted, t_row, sub_ptr, **kw
         )
     else:
         for i in range(m):
@@ -617,10 +705,7 @@ def assign_block_edlib(
                 store=store,
                 model=error_model,
             )
-        winner, logl_delta = sched.rank_likelihood(
-            admitted,
-            t_row,
-            sub_ptr,
+        kw = dict(
             logl=logl,
             support=store.node_weight,
             read_len=aln_len.astype(np.float64),
@@ -628,9 +713,26 @@ def assign_block_edlib(
             delta_logl=delta_logl,
             support_ratio=support_ratio,
         )
+        winner, logl_delta = sched.rank_likelihood(admitted, t_row, sub_ptr, **kw)
+        runner = sched.runner_up(
+            sched.rank_likelihood, winner, admitted, t_row, sub_ptr, **kw
+        )
+        by_logl = runner != sched.UNASSIGNED
 
     has = winner != sched.UNASSIGNED
     slot = np.where(has, winner, 0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ident_all = np.where(aln_len > 0, n_match / np.maximum(aln_len, 1), 0.0)
+    runner_cols = _runner_up_columns(
+        runner,
+        slot=slot,
+        has=has,
+        by_logl=by_logl,
+        template_row=t_row,
+        identity=ident_all,
+        logl=logl,
+        store=store,
+    )
     n_admitted = (
         np.add.reduceat(admitted.astype(np.int64), sub_ptr[:-1])
         if m
@@ -680,16 +782,8 @@ def assign_block_edlib(
             pa.array(np.where(has, 1.0, 0.0).astype(np.float32)),
             pa.array(_w(score).astype(np.int32)),
             pa.array(np.where(has, best_score - _w(score), 0).astype(np.int32)),
-            pa.array(
-                np.where(has & np.isfinite(_w(logl)), _w(logl), np.nan).astype(
-                    np.float32
-                )
-            ),
-            pa.array(
-                np.where(
-                    has & np.isfinite(_w(logl_delta)), _w(logl_delta), np.nan
-                ).astype(np.float32)
-            ),
+            _nullable_f32(_w(logl), has),
+            _nullable_f32(_w(logl_delta), has),
             pa.array(sizes.astype(np.int32)),
             pa.array(n_admitted.astype(np.int32)),
             pa.array(np.asarray(cap_col, dtype=bool)),
@@ -707,6 +801,7 @@ def assign_block_edlib(
             ident_arr,
             len_arr,
             reason_arr,
+            *runner_cols,
         ],
         schema=EM_ASSIGNMENT_TABLE,
     )
@@ -1155,8 +1250,8 @@ def _unassigned_batch(
             pa.array(np.zeros(n, dtype=np.float32)),
             zero32,
             zero32,
-            pa.array(np.full(n, np.nan, dtype=np.float32)),
-            pa.array(np.full(n, np.nan, dtype=np.float32)),
+            pa.nulls(n, pa.float32()),
+            pa.nulls(n, pa.float32()),
             zero32,
             zero32,
             pa.array(np.zeros(n, dtype=bool)),
@@ -1174,6 +1269,9 @@ def _unassigned_batch(
             pa.nulls(n, pa.float32()),
             pa.nulls(n, pa.int32()),
             pa.array([reason] * n, pa.string()),
+            pa.nulls(n, pa.int64()),
+            pa.nulls(n, pa.float32()),
+            pa.nulls(n, pa.float32()),
         ],
         schema=EM_ASSIGNMENT_TABLE,
     )

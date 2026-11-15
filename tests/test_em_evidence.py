@@ -752,3 +752,22 @@ def test_evidence_that_raises_never_changes_a_node(tmp_path, monkeypatch):
     assert set(t.column("status").to_pylist()) == {"ok"}
     assert set(t.column("evidence_status").to_pylist()) == {"failed"}
     assert run_digests(out) == GOLDEN[1]
+
+
+# ── P1.5: who came second (F6) ────────────────────────────────────────
+
+
+def test_the_split_haplotypes_are_each_other_s_runner_up(runs):
+    """Round 2 under the native E-step: gene C's two templates are its two
+    haplotypes, so each read's runner-up is the other, three substitutions
+    of likelihood behind."""
+    rd = _rounds(runs[3])[1]
+    a = _assignments_of(rd)
+    gene_c = a.filter(pa.compute.starts_with(a.column("read_id"), "gC_"))
+    winners = set(gene_c.column("template_id").to_pylist())
+    assert len(winners) == 2, "gene C sits on its two haplotype templates"
+    for row in gene_c.to_pylist():
+        assert row["runner_up_template_id"] in winners - {row["template_id"]}
+        assert row["runner_up_logl_gap"] is not None
+    gaps = [r["runner_up_logl_gap"] for r in gene_c.to_pylist()]
+    assert sum(g > 0 for g in gaps) / len(gaps) > 0.9
