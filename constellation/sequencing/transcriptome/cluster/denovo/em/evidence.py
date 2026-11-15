@@ -237,12 +237,21 @@ def evidence_keys(evidence: str) -> tuple[str, ...]:
     raise ValueError(f"unknown evidence mode {evidence!r}")
 
 
+_EMPTY_COMPACT: dict[str, pa.Table] | None = None
+
+
 def empty_compact() -> dict[str, pa.Table]:
-    return {
-        "columns": MSTEP_COLUMN_TABLE.empty_table(),
-        "covariance": MSTEP_COVARIANCE_TABLE.empty_table(),
-        "reads": MSTEP_READ_TABLE.empty_table(),
-    }
+    """The three compact tables, empty. Built once: Arrow tables are
+    immutable, and building them per template cost ~0.4 ms each time —
+    1.7 s over 4,000 templates, minutes a round at full scale."""
+    global _EMPTY_COMPACT
+    if _EMPTY_COMPACT is None:
+        _EMPTY_COMPACT = {
+            "columns": MSTEP_COLUMN_TABLE.empty_table(),
+            "covariance": MSTEP_COVARIANCE_TABLE.empty_table(),
+            "reads": MSTEP_READ_TABLE.empty_table(),
+        }
+    return dict(_EMPTY_COMPACT)
 
 
 def _phi_log_odds(n11, n1x, nx1, n):
