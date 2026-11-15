@@ -198,6 +198,40 @@ def read_round_disagreements(rd: Path) -> pa.Table | None:
     )
 
 
+def read_round_columns(rd: Path) -> pa.Table | None:
+    """Candidate columns of the round's templates (compact evidence)."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+        MSTEP_COLUMN_TABLE,
+    )
+
+    return read_round_table(
+        rd, "columns", MSTEP_COLUMN_TABLE, ["template_id", "frame_col"]
+    )
+
+
+def read_round_covariance(rd: Path) -> pa.Table | None:
+    """Significant covariance edges of the round's templates."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+        MSTEP_COVARIANCE_TABLE,
+    )
+
+    return read_round_table(
+        rd,
+        "covariance",
+        MSTEP_COVARIANCE_TABLE,
+        ["template_id", "u_frame_col", "v_frame_col"],
+    )
+
+
+def read_round_reads(rd: Path) -> pa.Table | None:
+    """Per-read margins of the round's split templates."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+        MSTEP_READ_TABLE,
+    )
+
+    return read_round_table(rd, "reads", MSTEP_READ_TABLE, ["template_id", "read_row"])
+
+
 def read_round_membership(rd: Path) -> pa.Table:
     """A finished round's per-node read membership, in membership order."""
     rd = Path(rd)
@@ -221,9 +255,12 @@ __all__ = [
     "MSTEP_DIR",
     "NODES_KEY",
     "StaleShardsError",
+    "read_round_columns",
+    "read_round_covariance",
     "read_round_disagreements",
     "read_round_membership",
     "read_round_nodes",
+    "read_round_reads",
     "read_round_table",
     "read_round_templates",
     "round_mstep_shards",

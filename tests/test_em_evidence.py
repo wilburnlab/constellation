@@ -607,3 +607,148 @@ def test_a_rebuild_that_raises_is_counted_and_the_outputs_still_written(
     assert final["n_rebuild_failed"] >= final["n_rebuild_errors"]
     assert final["n_rebuilt"] == 0
     assert sum(pq.read_table(out / "clusters.parquet").column("n_reads").to_pylist()) == 110
+
+
+# ── P1.4: the compact evidence (F1, F7) ───────────────────────────────
+
+
+def _for_template(table: pa.Table, template_id: int) -> pa.Table:
+    return table.filter(pa.compute.equal(table.column("template_id"), template_id))
+
+
+def test_the_split_s_columns_edges_and_reads_are_on_disk(runs, split_template_id):
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        read_round_columns,
+        read_round_covariance,
+        read_round_reads,
+    )
+
+    rd = _rounds(runs[1])[0]
+    cols = _for_template(read_round_columns(rd), split_template_id)
+    kept = cols.filter(pa.compute.field("kept"))
+    # The three UTR sites, at the 12/36 minor fraction the fixture planted.
+    assert kept.num_rows == 3
+    assert all(abs(f - 12 / 36) < 0.05 for f in kept.column("minor_frac").to_pylist())
+    assert len(set(kept.column("signature").to_pylist())) == 1
+    # Substitutions: template columns, not insertion columns (-1).
+    assert min(kept.column("template_col").to_pylist()) >= 0
+
+    cov = _for_template(read_round_covariance(rd), split_template_id)
+    pairs = cov.filter(pa.compute.invert(pa.compute.field("self_edge")))
+    assert pairs.num_rows == 3, "every pair of the three sites"
+    assert min(pairs.column("phi").to_pylist()) > 0.9, "perfectly linked"
+    assert all(abs(n - 12) < 1.5 for n in pairs.column("n11").to_pylist())
+
+    reads = _for_template(read_round_reads(rd), split_template_id)
+    assert reads.num_rows == 36
+    assert sorted(Counter(reads.column("haplotype_id").to_pylist()).values()) == [12, 24]
+    assert all(reads.column("sampled").to_pylist())
+    margins = reads.column("margin").to_pylist()
+    assert min(margins) > 0, "every read clearly on its side of a 3-site split"
+    assert _json(rd / "round.json")["mstep"]["evidence_bytes"] > 0
+
+
+def test_the_evidence_is_what_the_shared_code_path_computes(runs, split_template_id):
+    """The stored rows equal the in-memory evidence, and the stored 2x2s are
+    the read states' own co-observation counts."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import covariance as cv
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        refine_one_template,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        read_round_columns,
+        read_round_covariance,
+    )
+
+    out = runs[1]
+    rd = _rounds(out)[0]
+    mine, reads, store, row, params = _replay_inputs(out, rd, split_template_id)
+    try:
+        res = refine_one_template(
+            mine, reads, store, row, params, round_index=1, evidence="full",
+            on_error="raise",
+        )
+    finally:
+        reads.close()
+        store.close()
+    assert res.evidence["columns"].equals(
+        _for_template(read_round_columns(rd), split_template_id)
+    )
+    stored = _for_template(read_round_covariance(rd), split_template_id)
+    assert res.evidence["covariance"].sort_by(
+        [("u_frame_col", "ascending"), ("v_frame_col", "ascending")]
+    ).equals(stored)
+
+    internals = res.internals
+    x = cv.dense_states(internals.states, np.arange(internals.states.n_candidates))
+    w = np.asarray(internals.states.weight)
+    for e in stored.filter(pa.compute.invert(pa.compute.field("self_edge"))).to_pylist():
+        u, v = e["u"], e["v"]
+        both = (x[:, u] != cv.UNOBSERVED) & (x[:, v] != cv.UNOBSERVED)
+        nm_u = both & (x[:, u] != cv.MAJOR)
+        nm_v = both & (x[:, v] != cv.MAJOR)
+        assert e["n"] == pytest.approx(w[both].sum())
+        assert e["n1x"] == pytest.approx(w[nm_u].sum())
+        assert e["nx1"] == pytest.approx(w[nm_v].sum())
+        assert e["n11"] == pytest.approx(w[nm_u & nm_v].sum())
+
+
+def _evidence_tables(out: Path) -> dict[str, pa.Table]:
+    from constellation.sequencing.transcriptome.cluster.denovo.em import round_io
+
+    tabs = {}
+    for rd in _rounds(out):
+        for name in ("templates", "disagreements", "columns", "covariance", "reads"):
+            t = getattr(round_io, f"read_round_{name}")(rd)
+            tabs[f"{rd.name}/{name}"] = t
+    return tabs
+
+
+def test_the_evidence_does_not_depend_on_the_worker_count(runs, tmp_path):
+    out = tmp_path / "em"
+    run_em(
+        three_gene_panel(tmp_path),
+        out,
+        params=evidence_params(rounds=1, threads=2, mstep_workers=2),
+        report=False,
+    )
+    one, two = _evidence_tables(runs[1]), _evidence_tables(out)
+    assert one.keys() == two.keys()
+    for key in one:
+        assert one[key].equals(two[key]), key
+
+
+def test_no_compact_evidence_keeps_the_accounting_and_changes_no_node(tmp_path):
+    from constellation.sequencing.transcriptome.cluster.denovo.em import round_io
+
+    out = tmp_path / "em"
+    run_em(
+        three_gene_panel(tmp_path),
+        out,
+        params=evidence_params(rounds=1, mstep_evidence="none"),
+        report=False,
+    )
+    rd = _rounds(out)[0]
+    assert round_io.read_round_templates(rd).num_rows > 0
+    assert round_io.read_round_disagreements(rd).num_rows > 0
+    for name in ("columns", "covariance", "reads"):
+        assert getattr(round_io, f"read_round_{name}")(rd) is None
+    assert set(round_io.read_round_templates(rd).column("evidence_status").to_pylist()) == {
+        "none"
+    }
+    assert run_digests(out) == GOLDEN[1]
+
+
+def test_evidence_that_raises_never_changes_a_node(tmp_path, monkeypatch):
+    from constellation.sequencing.transcriptome.cluster.denovo.em import evidence
+
+    def boom(**k):
+        raise RuntimeError("injected evidence failure")
+
+    monkeypatch.setattr(evidence, "compact_evidence", boom)
+    out = tmp_path / "em"
+    run_em(three_gene_panel(tmp_path), out, params=evidence_params(rounds=1), report=False)
+    t = _templates_record(_rounds(out)[0])
+    assert set(t.column("status").to_pylist()) == {"ok"}
+    assert set(t.column("evidence_status").to_pylist()) == {"failed"}
+    assert run_digests(out) == GOLDEN[1]

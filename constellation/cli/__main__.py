@@ -1681,6 +1681,17 @@ def _build_transcriptome_parser(subs) -> None:
         "M-step's critical path.",
     )
     p_cluster.add_argument(
+        "--mstep-evidence",
+        choices=["compact", "none"],
+        default=None,
+        help="em: what the M-step keeps beyond its nodes (default compact). "
+        "Every template's record and its disagreement statistics are always "
+        "written; compact adds each template's candidate columns, its "
+        "significant covariance edges with their 2x2 counts, and per-read "
+        "margins of the templates that split — the evidence the transcriptome "
+        "browser reads. Report-only: changes no node.",
+    )
+    p_cluster.add_argument(
         "--mstep-workers",
         type=int,
         default=0,
@@ -3804,6 +3815,11 @@ def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
             "nothing — only the --mode em-* E-step admits on a floor",
         ),
         (
+            "--mstep-evidence",
+            getattr(args, "mstep_evidence", None) is not None and not em,
+            "nothing — only the --mode em-* M-step keeps evidence",
+        ),
+        (
             "--estep-probes-per-read",
             args.estep_probes_per_read is not None
             and not (em and args.estep_aligner == "native"),
@@ -4031,6 +4047,11 @@ def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
             32
             if args.estep_probes_per_read is None
             else int(args.estep_probes_per_read)
+        ),
+        mstep_evidence=(
+            "compact"
+            if getattr(args, "mstep_evidence", None) is None
+            else str(args.mstep_evidence)
         ),
         p_floor_quality_scale=(
             None

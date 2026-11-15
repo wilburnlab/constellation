@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
 import pyarrow as pa
 
 from constellation.core.io.schemas import register_schema
@@ -126,8 +127,264 @@ MSTEP_DISAGREEMENT_TABLE: pa.Schema = pa.schema(
 )
 register_schema("EmMStepDisagreementTable", MSTEP_DISAGREEMENT_TABLE)
 
+# ── compact evidence (``--mstep-evidence compact``, the default) ──────
+
+#: One row per candidate column: what the column showed, why it was a
+#: candidate, and what the covariance pass made of it. Columns are PWM
+#: (frame) columns of the template's pooled plan; ``template_col`` is -1 on
+#: an insertion or extension column, which the template does not have.
+MSTEP_COLUMN_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("round", pa.int32(), nullable=False),
+        pa.field("template_id", pa.int64(), nullable=False),
+        pa.field("candidate", pa.int32(), nullable=False),
+        pa.field("frame_col", pa.int32(), nullable=False),
+        pa.field("template_col", pa.int32(), nullable=False),
+        # columns.ROUTE_* bits: 1 allelic, 2 coverage.
+        pa.field("route", pa.int8(), nullable=False),
+        # Admitted columns this representative stands for (exact run collapse).
+        pa.field("run_len", pa.int32(), nullable=False),
+        # 0-3 = ACGT, 4 = gap.
+        pa.field("major", pa.int8(), nullable=False),
+        pa.field("minor", pa.int8(), nullable=False),
+        pa.field("depth", pa.float64(), nullable=False),
+        pa.field("base_cov", pa.float64(), nullable=False),
+        pa.field("minor_frac", pa.float64(), nullable=False),
+        pa.field("uncov_frac", pa.float64(), nullable=False),
+        pa.field("hp_run", pa.int32(), nullable=False),
+        # The context-conditional null used for this column, after the floor.
+        pa.field("eps", pa.float64(), nullable=False),
+        pa.field("effect", pa.float64(), nullable=False),
+        # Allelic route only; 1.0 elsewhere.
+        pa.field("p_value", pa.float64(), nullable=False),
+        pa.field("boundary_mass", pa.float64(), nullable=False),
+        pa.field("boundary_expected", pa.float64(), nullable=False),
+        # A significant covariance edge touches it.
+        pa.field("kept", pa.bool_(), nullable=False),
+        # False when the co-occurrence budget dropped it from the pass.
+        pa.field("budget_kept", pa.bool_(), nullable=False),
+        # Index of the signature (quasi-clique) it belongs to, -1 for none.
+        pa.field("signature", pa.int32(), nullable=False),
+    ],
+    metadata={b"schema_name": b"EmMStepColumnTable"},
+)
+register_schema("EmMStepColumnTable", MSTEP_COLUMN_TABLE)
+
+#: One row per SIGNIFICANT covariance edge, with the 2x2 it was tested on
+#: (weighted counts) and its effect size, so an arc can be drawn by effect
+#: rather than by a p-value that grows with depth. A self-edge is a collapsed
+#: coverage run judged on its delimiting boundary mass: no table, null counts.
+MSTEP_COVARIANCE_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("round", pa.int32(), nullable=False),
+        pa.field("template_id", pa.int64(), nullable=False),
+        pa.field("u", pa.int32(), nullable=False),
+        pa.field("v", pa.int32(), nullable=False),
+        pa.field("u_frame_col", pa.int32(), nullable=False),
+        pa.field("v_frame_col", pa.int32(), nullable=False),
+        pa.field("self_edge", pa.bool_(), nullable=False),
+        pa.field("n11", pa.float64(), nullable=True),
+        pa.field("n1x", pa.float64(), nullable=True),
+        pa.field("nx1", pa.float64(), nullable=True),
+        pa.field("n", pa.float64(), nullable=True),
+        # Phi coefficient of the 2x2, signed: + co-occurring, - exclusive.
+        pa.field("phi", pa.float64(), nullable=True),
+        # Haldane-corrected log odds ratio.
+        pa.field("log_odds", pa.float64(), nullable=True),
+        pa.field("p_value", pa.float64(), nullable=False),
+    ],
+    metadata={b"schema_name": b"EmMStepCovarianceTable"},
+)
+register_schema("EmMStepCovarianceTable", MSTEP_COVARIANCE_TABLE)
+
+#: How sure the split was about each read — written only for templates whose
+#: covariance produced a signature with at least two patterns, i.e. where
+#: there was a choice to be sure of. Every other read's margin is null by
+#: definition, and the table stays small.
+MSTEP_READ_TABLE: pa.Schema = pa.schema(
+    [
+        pa.field("round", pa.int32(), nullable=False),
+        pa.field("template_id", pa.int64(), nullable=False),
+        pa.field("read_row", pa.int32(), nullable=False),
+        pa.field("haplotype_id", pa.int32(), nullable=False),
+        # Voted in the PWM (False: beyond max_members_per_template, given to
+        # the major node without evidence of its own).
+        pa.field("sampled", pa.bool_(), nullable=False),
+        # Its tuple of patterns was too light to be a node and was sent to
+        # the nearest surviving one; null for an unsampled read.
+        pa.field("folded", pa.bool_(), nullable=True),
+        # Smallest best-minus-second-best log-likelihood over the template's
+        # multi-pattern signatures (nats); null for an unsampled read.
+        pa.field("margin", pa.float32(), nullable=True),
+    ],
+    metadata={b"schema_name": b"EmMStepReadTable"},
+)
+register_schema("EmMStepReadTable", MSTEP_READ_TABLE)
+
 #: Output keys of the M-step worker that are always written.
 ACCOUNTING_KEYS: tuple[str, ...] = ("templates", "disagreements")
+#: ...and the compact evidence's.
+COMPACT_KEYS: tuple[str, ...] = ("columns", "covariance", "reads")
+EVIDENCE_MODES: tuple[str, ...] = ("compact", "none")
+
+
+def evidence_keys(evidence: str) -> tuple[str, ...]:
+    """The M-step output keys a run under ``--mstep-evidence`` writes."""
+    if evidence == "none":
+        return ACCOUNTING_KEYS
+    if evidence in ("compact", "full"):
+        return (*ACCOUNTING_KEYS, *COMPACT_KEYS)
+    raise ValueError(f"unknown evidence mode {evidence!r}")
+
+
+def empty_compact() -> dict[str, pa.Table]:
+    return {
+        "columns": MSTEP_COLUMN_TABLE.empty_table(),
+        "covariance": MSTEP_COVARIANCE_TABLE.empty_table(),
+        "reads": MSTEP_READ_TABLE.empty_table(),
+    }
+
+
+def _phi_log_odds(n11, n1x, nx1, n):
+    n10 = n1x - n11
+    n01 = nx1 - n11
+    n00 = n - n1x - nx1 + n11
+    with np.errstate(invalid="ignore", divide="ignore"):
+        den = np.sqrt(n1x * (n - n1x) * nx1 * (n - nx1))
+        phi = np.where(den > 0, (n11 * n00 - n10 * n01) / den, np.nan)
+        lor = np.log(((n11 + 0.5) * (n00 + 0.5)) / ((n10 + 0.5) * (n01 + 0.5)))
+    return phi, lor
+
+
+def _nullable(values: np.ndarray, kind) -> pa.Array:
+    values = np.asarray(values, dtype=np.float64)
+    return pa.array(values, type=kind, mask=~np.isfinite(values))
+
+
+def compact_evidence(
+    *,
+    round_index: int,
+    template_id: int,
+    internals,
+    read_row: np.ndarray,
+    haplotype_of_read: np.ndarray,
+    member_pos: np.ndarray,
+) -> dict[str, pa.Table]:
+    """One template's compact evidence, as small tables, from the kernel's
+    working state. Copies, never writes into it: the same arrays built the
+    nodes, which exist by now."""
+    cand = internals.cand
+    stats = internals.stats
+    pooled = internals.pooled
+    graph = internals.graph
+    v = int(np.asarray(cand.columns).size)
+    out = empty_compact()
+    if v == 0:
+        return out
+    cols = np.asarray(cand.columns, dtype=np.int64)
+    tof = np.asarray(pooled.template_of_frame, dtype=np.int64)
+    signature = np.full(v, -1, dtype=np.int32)
+    for k, members in enumerate(internals.signatures):
+        signature[np.asarray(members, dtype=np.int64)] = k
+    keep = (
+        np.asarray(graph.keep, dtype=bool) if graph is not None else np.zeros(v, bool)
+    )
+    budget = (
+        np.asarray(graph.budget_kept, dtype=bool)
+        if graph is not None and graph.budget_kept is not None
+        else np.ones(v, bool)
+    )
+    out["columns"] = pa.table(
+        {
+            "round": pa.array(np.full(v, round_index, np.int32)),
+            "template_id": pa.array(np.full(v, template_id, np.int64)),
+            "candidate": pa.array(np.arange(v, dtype=np.int32)),
+            "frame_col": pa.array(cols.astype(np.int32)),
+            "template_col": pa.array(tof[cols].astype(np.int32)),
+            "route": pa.array(np.asarray(cand.route).astype(np.int8)),
+            "run_len": pa.array(np.asarray(cand.run_len).astype(np.int32)),
+            "major": pa.array(np.asarray(stats.major)[cols].astype(np.int8)),
+            "minor": pa.array(np.asarray(stats.minor)[cols].astype(np.int8)),
+            "depth": pa.array(np.asarray(stats.depth, np.float64)[cols]),
+            "base_cov": pa.array(np.asarray(stats.base_cov, np.float64)[cols]),
+            "minor_frac": pa.array(np.asarray(stats.minor_frac, np.float64)[cols]),
+            "uncov_frac": pa.array(np.asarray(stats.uncov_frac, np.float64)[cols]),
+            "hp_run": pa.array(np.asarray(stats.hp_run)[cols].astype(np.int32)),
+            "eps": pa.array(np.asarray(cand.eps, np.float64)),
+            "effect": pa.array(np.asarray(cand.effect, np.float64)),
+            "p_value": pa.array(np.asarray(cand.p_value, np.float64)),
+            "boundary_mass": pa.array(np.asarray(cand.boundary_mass, np.float64)),
+            "boundary_expected": pa.array(
+                np.asarray(cand.boundary_expected, np.float64)
+            ),
+            "kept": pa.array(keep),
+            "budget_kept": pa.array(budget),
+            "signature": pa.array(signature),
+        },
+        schema=MSTEP_COLUMN_TABLE,
+    )
+    if graph is not None and len(graph.edges):
+        edges = np.asarray(graph.edges, dtype=np.int64)
+        e = edges.shape[0]
+        u, w = edges[:, 0], edges[:, 1]
+        counts = [
+            np.asarray(a, dtype=np.float64) if np.asarray(a).size == e
+            else np.full(e, np.nan)
+            for a in (graph.edge_n11, graph.edge_n1x, graph.edge_nx1, graph.edge_n)
+        ]
+        phi, lor = _phi_log_odds(*counts)
+        out["covariance"] = pa.table(
+            {
+                "round": pa.array(np.full(e, round_index, np.int32)),
+                "template_id": pa.array(np.full(e, template_id, np.int64)),
+                "u": pa.array(u.astype(np.int32)),
+                "v": pa.array(w.astype(np.int32)),
+                "u_frame_col": pa.array(cols[u].astype(np.int32)),
+                "v_frame_col": pa.array(cols[w].astype(np.int32)),
+                "self_edge": pa.array(u == w),
+                "n11": _nullable(counts[0], pa.float64()),
+                "n1x": _nullable(counts[1], pa.float64()),
+                "nx1": _nullable(counts[2], pa.float64()),
+                "n": _nullable(counts[3], pa.float64()),
+                "phi": _nullable(phi, pa.float64()),
+                "log_odds": _nullable(lor, pa.float64()),
+                "p_value": pa.array(np.asarray(graph.p_value, np.float64)),
+            },
+            schema=MSTEP_COVARIANCE_TABLE,
+        )
+    multi = [a for a in internals.assignments if np.asarray(a.patterns).shape[0] >= 2]
+    if multi:
+        m = int(np.asarray(member_pos).size)
+        margin_m = np.min(
+            np.stack([np.asarray(a.margin, np.float64) for a in multi], axis=0), axis=0
+        )
+        if internals.tuple_of_member is not None and internals.surviving_tuples is not None:
+            folded_m = ~np.isin(
+                np.asarray(internals.tuple_of_member), np.asarray(internals.surviving_tuples)
+            )
+        else:
+            folded_m = np.zeros(m, dtype=bool)
+        n = int(np.asarray(read_row).size)
+        margin = np.full(n, np.nan)
+        folded = np.zeros(n, dtype=bool)
+        sampled = np.zeros(n, dtype=bool)
+        pos = np.asarray(member_pos, dtype=np.int64)
+        margin[pos] = margin_m
+        folded[pos] = folded_m
+        sampled[pos] = True
+        out["reads"] = pa.table(
+            {
+                "round": pa.array(np.full(n, round_index, np.int32)),
+                "template_id": pa.array(np.full(n, template_id, np.int64)),
+                "read_row": pa.array(np.asarray(read_row).astype(np.int32)),
+                "haplotype_id": pa.array(np.asarray(haplotype_of_read).astype(np.int32)),
+                "sampled": pa.array(sampled),
+                "folded": pa.array(folded, mask=~sampled),
+                "margin": pa.array(margin.astype(np.float32), mask=~sampled),
+            },
+            schema=MSTEP_READ_TABLE,
+        )
+    return out
 
 #: Bounded so a pathological message cannot bloat the table.
 _MAX_ERROR_MESSAGE = 500
@@ -199,6 +456,14 @@ def disagreement_table(records: list[TemplateRecord]) -> pa.Table:
 
 __all__ = [
     "ACCOUNTING_KEYS",
+    "COMPACT_KEYS",
+    "EVIDENCE_MODES",
+    "MSTEP_COLUMN_TABLE",
+    "MSTEP_COVARIANCE_TABLE",
+    "MSTEP_READ_TABLE",
+    "compact_evidence",
+    "empty_compact",
+    "evidence_keys",
     "EVIDENCE_FAILED",
     "EVIDENCE_NONE",
     "EVIDENCE_OK",

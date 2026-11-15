@@ -238,8 +238,19 @@ class EmParams:
     mstep_workers: int = 0
     units_per_worker: int = 16
     mstep: MStepParams = field(default_factory=MStepParams)
+    #: What the M-step keeps beyond its nodes (em/evidence.py). The per-
+    #: template record and disagreement statistics are always written;
+    #: "compact" adds candidate columns, significant covariance edges with
+    #: their 2x2 counts, and per-read margins of split templates. Report-
+    #: only: it changes no node, so it is not a resume commitment.
+    mstep_evidence: Literal["compact", "none"] = "compact"
 
     def __post_init__(self) -> None:
+        if self.mstep_evidence not in ("compact", "none"):
+            raise ValueError(
+                f"mstep_evidence must be 'compact' or 'none', got "
+                f"{self.mstep_evidence!r}"
+            )
         if self.estep_aligner not in ("minimap2", "edlib", "native"):
             raise ValueError(f"unknown estep_aligner {self.estep_aligner!r}")
         if self.estep_shortlist_k < 1:
@@ -1170,13 +1181,14 @@ def _run_mstep(r, rd, store, corpus, assignments, params, log):
         mstep_worker,
         iter_unit_batches(srt, units),
         output_dir=out,
-        output_keys=mstep_output_keys(),
+        output_keys=mstep_output_keys(params.mstep_evidence),
         n_workers=max(int(workers), 1),
         worker_kwargs={
             "corpus_path": str(corpus.arrow_path),
             "templates_path": str(rd / "templates" / TEMPLATES_ARROW),
             "round_index": r,
             "params": params.mstep,
+            "evidence": params.mstep_evidence,
         },
         stage_label=f"mstep-r{r}",
         total=len(units),
@@ -1204,7 +1216,18 @@ def _run_mstep(r, rd, store, corpus, assignments, params, log):
         if tmpl_shards
         else None
     )
-    return nodes, membership, {"n_units": len(units), **_template_counters(templates)}
+    evidence_bytes = sum(
+        path.stat().st_size
+        for key in mstep_output_keys(params.mstep_evidence)[2:]
+        for path in outputs[key].shard_paths
+    )
+    return nodes, membership, {
+        "n_units": len(units),
+        **_template_counters(templates),
+        # On disk beyond the nodes and membership: what --mstep-evidence
+        # costs, so its default can be judged on real data.
+        "evidence_bytes": int(evidence_bytes),
+    }
 
 
 def _template_counters(templates: pa.Table | None) -> dict[str, int]:

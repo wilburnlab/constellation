@@ -386,10 +386,10 @@ def _templates(path: str):
 #: these and what a worker returns, so both sides read this one function.
 def mstep_output_keys(evidence: str = "none") -> tuple[str, ...]:
     from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
-        ACCOUNTING_KEYS,
+        evidence_keys,
     )
 
-    return ("nodes", "node_membership", *ACCOUNTING_KEYS)
+    return ("nodes", "node_membership", *evidence_keys(evidence))
 
 
 @dataclass(slots=True)
@@ -411,6 +411,9 @@ class TemplateResult:
     member_pos: np.ndarray
     record: object  # evidence.TemplateRecord
     internals: object | None = None
+    #: The compact evidence tables (``columns`` / ``covariance`` / ``reads``),
+    #: when asked for.
+    evidence: dict | None = None
 
 
 def _template_node(frame: str, template_id: int, n_members: int, min_aa_length: int):
@@ -489,12 +492,15 @@ def refine_one_template(
     node and a record; ``'raise'`` (tests, replay) lets it propagate.
     """
     from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+        EVIDENCE_FAILED,
         EVIDENCE_NONE,
         EVIDENCE_OK,
         KERNEL_COUNTERS,
         STATUS_NO_MEMBERS,
         STATUS_OK,
         TemplateRecord,
+        compact_evidence,
+        empty_compact,
     )
     from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
         refine_template_with_internals,
@@ -574,11 +580,32 @@ def refine_one_template(
         for node in nodes
     ]
 
-    if evidence != "none" and internals is not None:
-        record.evidence_status = EVIDENCE_OK
-    else:
-        record.evidence_status = EVIDENCE_NONE
-    if evidence == "none":
+    # Evidence comes last and in its own try: the nodes above exist whatever
+    # happens here, so collecting evidence can never turn a good template
+    # into a fallback or change what it emitted.
+    tables = None
+    record.evidence_status = EVIDENCE_NONE
+    if evidence != "none":
+        tables = empty_compact()
+        if internals is not None:
+            try:
+                tables = compact_evidence(
+                    round_index=int(round_index),
+                    template_id=template_id,
+                    internals=internals,
+                    read_row=all_read_row,
+                    haplotype_of_read=hap_of_row,
+                    member_pos=member_pos,
+                )
+                record.evidence_status = EVIDENCE_OK
+            except Exception as exc:  # noqa: BLE001 — evidence never sinks a node
+                if on_error == "raise":
+                    raise
+                record.evidence_status = EVIDENCE_FAILED
+                if record.error_message is None:
+                    record.record_error(exc)
+                tables = empty_compact()
+    if evidence != "full":
         internals = None
     return TemplateResult(
         node_rows=node_rows,
@@ -589,6 +616,7 @@ def refine_one_template(
         member_pos=member_pos,
         record=record,
         internals=internals,
+        evidence=tables,
     )
 
 
@@ -614,7 +642,9 @@ def mstep_worker(
     calls (consensus / columns / covariance) are numpy-only by design.
     """
     from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+        COMPACT_KEYS,
         disagreement_table,
+        empty_compact,
         template_table,
     )
 
@@ -627,6 +657,7 @@ def mstep_worker(
             "node_membership": NODE_MEMBERSHIP_TABLE.empty_table(),
             "templates": template_table([]),
             "disagreements": disagreement_table([]),
+            **empty_compact(),
         }
         return {k: out[k] for k in keys}
 
@@ -640,6 +671,7 @@ def mstep_worker(
     mem_read: list[np.ndarray] = []
     mem_weight: list[np.ndarray] = []
     records = []
+    pieces: dict[str, list[pa.Table]] = {k: [] for k in COMPACT_KEYS}
     for i in range(starts.size):
         lo, hi = int(bounds[i]), int(bounds[i + 1])
         result = refine_one_template(
@@ -659,6 +691,10 @@ def mstep_worker(
         mem_read.append(result.read_row)
         mem_weight.append(np.ones(n, dtype=np.float32))
         records.append(result.record)
+        if result.evidence:
+            for k in COMPACT_KEYS:
+                if result.evidence[k].num_rows:
+                    pieces[k].append(result.evidence[k])
 
     out = {
         "nodes": _rows_to_nodes(rows),
@@ -668,6 +704,9 @@ def mstep_worker(
         "templates": template_table(records),
         "disagreements": disagreement_table(records),
     }
+    empty = empty_compact()
+    for k in COMPACT_KEYS:
+        out[k] = pa.concat_tables(pieces[k]) if pieces[k] else empty[k]
     return {k: out[k] for k in keys}
 
 

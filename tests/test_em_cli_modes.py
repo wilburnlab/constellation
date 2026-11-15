@@ -250,6 +250,8 @@ def test_unbounded_overhangs_are_spellable():
         ("em-kmer --template-graph final", "--merge-from-round", "2"),
         # The coverage route is the em M-step's.
         ("kmer", "--coverage-route", ""),
+        # So is the evidence it keeps.
+        ("kmer", "--mstep-evidence", "none"),
     ],
 )
 def test_a_flag_this_mode_ignores_is_an_error(mode, flag, value):
@@ -663,3 +665,8 @@ def test_graph_parameters_have_no_effect_with_the_graph_off():
     with pytest.raises(ValueError, match="graph parameters have no effect"):
         EmParams(template_graph="off", merge=False, graph=GraphParams(chunk_rows=1_000))
     assert EmParams(template_graph="off", merge=False).graph == GraphParams()
+
+
+def test_the_mstep_keeps_compact_evidence_unless_told_not_to():
+    assert _resolved().mstep_evidence == "compact"
+    assert _resolved("--mstep-evidence", "none").mstep_evidence == "none"
