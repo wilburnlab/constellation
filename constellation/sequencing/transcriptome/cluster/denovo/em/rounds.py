@@ -81,9 +81,16 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import 
     in_membership_order,
     in_node_order,
     iter_unit_batches,
+    mstep_output_keys,
     mstep_worker,
     plan_mstep_units,
     sort_assignments_by_template,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+    MSTEP_TEMPLATE_TABLE,
+    STATUS_FALLBACK_POOLED,
+    STATUS_FALLBACK_TEMPLATE,
+    STATUSES,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.rebuild import (
     rebuild_survivors,
@@ -683,10 +690,11 @@ def _one_round(
     if prev_assignments is not None:
         estep_stats["n_newly_lost"] = _newly_lost(prev_assignments, assignments)
     t1 = time.time()
-    nodes, node_membership, n_units = _run_mstep(
+    nodes, node_membership, mstep_block = _run_mstep(
         r, rd, store, corpus, assignments, params, log
     )
     t_mstep = time.time() - t1
+    mstep_block.update(_read_invariant(assignments, nodes, node_membership, r, log))
 
     churn = (
         rf.measure_churn(
@@ -702,10 +710,7 @@ def _one_round(
         n_nodes=int(nodes.num_rows),
         churn=churn,
         seconds={"estep": round(t_estep, 1), "mstep": round(t_mstep, 1)},
-        mstep={
-            "n_units": int(n_units),
-            "n_membership_rows": int(node_membership.num_rows),
-        },
+        mstep=mstep_block,
     )
     (rd / "round.json").write_text(json.dumps(asdict(result), indent=2, default=str))
     return result, assignments, nodes, node_membership
@@ -1121,7 +1126,11 @@ def _write_seed_stage(seed_dir: Path, params: EmParams, stats: dict) -> None:
 
 
 def _run_mstep(r, rd, store, corpus, assignments, params, log):
-    """Run one round's M-step; return ``(nodes, membership, n_units)``.
+    """Run one round's M-step; return ``(nodes, membership, mstep_block)``.
+
+    ``mstep_block`` goes into ``round.json``: ``n_units`` (which shards are
+    the round's, :mod:`.round_io`) and the per-template accounting summed
+    from the ``templates`` table (:mod:`.evidence`).
 
     ``mstep/`` is cleared first — before the early return too — because
     ``run_batched`` never clears its output and writes one shard per unit,
@@ -1135,7 +1144,7 @@ def _run_mstep(r, rd, store, corpus, assignments, params, log):
         return (
             REFINED_NODE_TABLE.empty_table(),
             NODE_MEMBERSHIP_TABLE.empty_table(),
-            0,
+            {"n_units": 0, **_template_counters(None)},
         )
 
     bounds = np.concatenate([starts, [srt.num_rows]])
@@ -1161,7 +1170,7 @@ def _run_mstep(r, rd, store, corpus, assignments, params, log):
         mstep_worker,
         iter_unit_batches(srt, units),
         output_dir=out,
-        output_keys=("nodes", "node_membership"),
+        output_keys=mstep_output_keys(),
         n_workers=max(int(workers), 1),
         worker_kwargs={
             "corpus_path": str(corpus.arrow_path),
@@ -1187,7 +1196,64 @@ def _run_mstep(r, rd, store, corpus, assignments, params, log):
         if mem_shards
         else NODE_MEMBERSHIP_TABLE.empty_table()
     )
-    return nodes, membership, len(units)
+    tmpl_shards = outputs["templates"].shard_paths
+    templates = (
+        pa_ds.dataset(tmpl_shards, schema=MSTEP_TEMPLATE_TABLE).to_table(
+            columns=["status", "n_nodes_emitted"]
+        )
+        if tmpl_shards
+        else None
+    )
+    return nodes, membership, {"n_units": len(units), **_template_counters(templates)}
+
+
+def _template_counters(templates: pa.Table | None) -> dict[str, int]:
+    """What the round's M-step did, template by template, summed."""
+    out = {
+        "n_templates": 0,
+        "n_split": 0,
+        **{f"n_{status}": 0 for status in STATUSES},
+    }
+    if templates is None or templates.num_rows == 0:
+        out["n_failed"] = 0
+        return out
+    status = templates.column("status").to_numpy(zero_copy_only=False)
+    emitted = templates.column("n_nodes_emitted").to_numpy(zero_copy_only=False)
+    out["n_templates"] = int(templates.num_rows)
+    out["n_split"] = int((emitted > 1).sum())
+    for name in STATUSES:
+        out[f"n_{name}"] = int((status == name).sum())
+    # The kernel raised: whatever the fallback produced, it was not a split.
+    out["n_failed"] = out[f"n_{STATUS_FALLBACK_POOLED}"] + out[
+        f"n_{STATUS_FALLBACK_TEMPLATE}"
+    ]
+    return out
+
+
+def _read_invariant(assignments, nodes, membership, r, log) -> dict[str, int]:
+    """Every assigned read is in exactly one node: the invariant quant reads.
+
+    Recorded every round and warned about loudly when broken, because the
+    way it used to break — a template whose M-step raised emitted nothing —
+    was silent.
+    """
+    tr = assignments.column("template_row").to_numpy(zero_copy_only=False)
+    n_assigned = int((tr >= 0).sum())
+    n_in_nodes = int(
+        nodes.column("n_reads").to_numpy(zero_copy_only=False).sum()
+    ) if nodes.num_rows else 0
+    block = {
+        "n_reads_assigned": n_assigned,
+        "n_reads_in_nodes": n_in_nodes,
+        "n_membership_rows": int(membership.num_rows),
+    }
+    if n_in_nodes != n_assigned or membership.num_rows != n_assigned:
+        log(
+            f"WARNING round {r}: {n_assigned:,} reads were assigned but the "
+            f"M-step's nodes hold {n_in_nodes:,} ({membership.num_rows:,} "
+            f"membership rows) — reads were lost or double-counted"
+        )
+    return block
 
 
 def _read_assignments(directory: Path) -> pa.Table:

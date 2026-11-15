@@ -244,6 +244,7 @@ def test_only_the_rows_asked_for_are_rewritten_and_a_failure_is_counted(tmp_path
     assert counts == {
         "n_rebuilt": 1,
         "n_rebuild_failed": 1,
+        "n_rebuild_errors": 0,
         "n_rebuild_reads_skipped": 3,
     }
     assert out.schema.equals(nodes.schema)

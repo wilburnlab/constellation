@@ -245,6 +245,20 @@ def _read_rows_of(
     return [sorted_row[a:b] for a, b in zip(lo.tolist(), hi.tolist())]
 
 
+def _rebuild_one_or_error(row, consensus, read_rows, **kwargs):
+    """:func:`rebuild_one`, with a failure returned rather than raised.
+
+    A rebuild that raises leaves the survivor as one whose reads could not
+    be placed does: its own consensus stands. Raised, it used to take the
+    whole final stage down with it — after every round had finished.
+    Module-level so it pickles by name.
+    """
+    try:
+        return (*rebuild_one(row, consensus, read_rows, **kwargs), None)
+    except Exception as exc:  # noqa: BLE001 — counted, and the survivor kept
+        return row, None, 0, 1.0, f"{type(exc).__name__}: {exc}"[:500]
+
+
 def rebuild_survivors(
     nodes: pa.Table,
     membership: pa.Table,
@@ -263,12 +277,18 @@ def rebuild_survivors(
     absorbed nodes gone and their membership re-keyed to the survivors — and
     ``rows`` the survivors that absorbed something. Returns the node table
     with those rows rewritten, and counts: ``n_rebuilt``, ``n_rebuild_failed``
-    (no read could be placed; the survivor's own consensus stands) and
-    ``n_rebuild_reads_skipped``. ``identity_floor`` and ``quality_scale``
+    (no read could be placed, or the rebuild raised; the survivor's own
+    consensus stands), ``n_rebuild_errors`` (the part of the failures that
+    raised) and ``n_rebuild_reads_skipped``. ``identity_floor`` and ``quality_scale``
     are the run's admission rule, whole — see :func:`rebuild_one`.
     """
     rows = np.asarray(rows, dtype=np.int64)
-    counts = {"n_rebuilt": 0, "n_rebuild_failed": 0, "n_rebuild_reads_skipped": 0}
+    counts = {
+        "n_rebuilt": 0,
+        "n_rebuild_failed": 0,
+        "n_rebuild_errors": 0,
+        "n_rebuild_reads_skipped": 0,
+    }
     if rows.shape[0] == 0 or nodes.num_rows == 0:
         return nodes, counts
     say = log or (lambda _m: None)
@@ -289,8 +309,12 @@ def rebuild_survivors(
     results: dict[int, dict] = {}
 
     def take(outcome) -> None:
-        row, rebuilt, n_skipped, _fraction = outcome
+        row, rebuilt, n_skipped, _fraction, error = outcome
         counts["n_rebuild_reads_skipped"] += int(n_skipped)
+        if error is not None:
+            counts["n_rebuild_errors"] += 1
+            if counts["n_rebuild_errors"] == 1:
+                say(f"final output: rebuilding survivor row {row} raised: {error}")
         if rebuilt is None:
             counts["n_rebuild_failed"] += 1
         else:
@@ -300,7 +324,7 @@ def rebuild_survivors(
     workers = max(1, min(int(threads), len(tasks)))
     if workers == 1:
         for row, seq, member_rows, tid in tasks:
-            take(rebuild_one(row, seq, member_rows, template_id=tid, **kwargs))
+            take(_rebuild_one_or_error(row, seq, member_rows, template_id=tid, **kwargs))
     else:
         ctx = mp.get_context("fork")
         with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
@@ -309,7 +333,7 @@ def rebuild_survivors(
                 for row, seq, member_rows, tid in tasks:
                     flying.append(
                         pool.submit(
-                            rebuild_one,
+                            _rebuild_one_or_error,
                             row,
                             seq,
                             member_rows,

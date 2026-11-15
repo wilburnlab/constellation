@@ -186,11 +186,23 @@ class MStepParams:
 def specs_from_assignment_slice(
     rows: pa.Table, reads, *, max_members: int = 20_000, seed: int = 0
 ) -> tuple[list[MemberSpec], np.ndarray, float]:
+    """PWM members for one template: :func:`member_specs` without the slice
+    positions."""
+    members, read_row, fraction, _ = member_specs(
+        rows, reads, max_members=max_members, seed=seed
+    )
+    return members, read_row, fraction
+
+
+def member_specs(
+    rows: pa.Table, reads, *, max_members: int = 20_000, seed: int = 0
+) -> tuple[list[MemberSpec], np.ndarray, float, np.ndarray]:
     """PWM members for one template.
 
-    Returns ``(members, read_row, subsample_fraction)`` — the read rows run
-    parallel to ``members`` so a node's ``member_ids`` can be turned back into
-    reads.
+    Returns ``(members, read_row, subsample_fraction, slice_pos)`` — the read
+    rows and the members' positions in ``rows`` run parallel to ``members``,
+    so a node's ``member_ids`` can be turned back into reads, and into the
+    slice's own rows without a lookup keyed on read rows.
 
     Replaces the dict-per-assignment-row + ``dict[read_id, str]`` form. The
     caller passes this template's contiguous slice of the sorted assignment
@@ -203,13 +215,16 @@ def specs_from_assignment_slice(
     """
     empty = np.empty(0, dtype=np.int64)
     if rows.num_rows == 0:
-        return [], empty, 1.0
+        return [], empty, 1.0, empty
 
     keep = pc.is_valid(rows.column("cigar"))
     keep = pc.and_(keep, pc.not_equal(pc.binary_length(rows.column("cigar")), 0))
+    pos = np.flatnonzero(
+        pc.fill_null(keep, False).to_numpy(zero_copy_only=False)
+    ).astype(np.int64)
     rows = rows.filter(keep)
     if rows.num_rows == 0:
-        return [], empty, 1.0
+        return [], empty, 1.0, empty
 
     weight = rows.column("weight").to_numpy(zero_copy_only=False).astype(np.float64)
     fraction = 1.0
@@ -230,6 +245,7 @@ def specs_from_assignment_slice(
         fraction = max_members / rows.num_rows
         rows = rows.take(pa.array(order))
         weight = weight[order]
+        pos = pos[order]
 
     read_row = rows.column("read_row").to_numpy(zero_copy_only=False).astype(np.int64)
     seqs = reads.take_sequences(read_row)
@@ -248,7 +264,7 @@ def specs_from_assignment_slice(
             member_id=i,
         )
         for i in range(rows.num_rows)
-    ], read_row, fraction
+    ], read_row, fraction, pos
 
 
 def plan_mstep_units(
@@ -364,6 +380,218 @@ def _templates(path: str):
     return _OPEN[key]
 
 
+#: The M-step worker's output keys. ``nodes`` / ``node_membership`` are the
+#: round; ``templates`` / ``disagreements`` are its accounting, always
+#: written (:mod:`.evidence`). ``run_batched`` raises on any mismatch between
+#: these and what a worker returns, so both sides read this one function.
+def mstep_output_keys(evidence: str = "none") -> tuple[str, ...]:
+    from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+        ACCOUNTING_KEYS,
+    )
+
+    return ("nodes", "node_membership", *ACCOUNTING_KEYS)
+
+
+@dataclass(slots=True)
+class TemplateResult:
+    """Everything one template's M-step produced.
+
+    ``read_row`` / ``haplotype_of_read`` cover EVERY read assigned to the
+    template, in slice order, sampled into the PWM or not; ``member_pos``
+    are the sampled members' positions in that order. ``internals`` is the
+    kernel's working state, kept only when evidence was asked for and the
+    kernel ran (status ``ok``).
+    """
+
+    node_rows: list[tuple]
+    nodes: list
+    parent_template_id: int
+    read_row: np.ndarray
+    haplotype_of_read: np.ndarray
+    member_pos: np.ndarray
+    record: object  # evidence.TemplateRecord
+    internals: object | None = None
+
+
+def _template_node(frame: str, template_id: int, n_members: int, min_aa_length: int):
+    """The template carried forward as it is — the last fallback."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        RefinedTemplate,
+        _annotate_orf,
+    )
+
+    node = RefinedTemplate(
+        parent_template_id=int(template_id),
+        haplotype_id=0,
+        consensus=frame,
+        n_reads=0,
+        node_weight=0.0,
+        member_ids=np.arange(n_members, dtype=np.int64),
+    )
+    return _annotate_orf(node, min_aa_length)
+
+
+def _fallback_nodes(frame, members, template_id, params) -> tuple[list, str]:
+    """When the kernel raised: one pooled node, else the template itself.
+
+    Never no node. A template that emits nothing loses every read it was
+    assigned — they are in the round's assignments and in no node's
+    membership, so in the final round they vanished from the clusters and
+    from quant, and nothing counted them (review F5).
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+        STATUS_FALLBACK_POOLED,
+        STATUS_FALLBACK_TEMPLATE,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        pooled_node,
+    )
+
+    try:
+        node = pooled_node(
+            frame,
+            members,
+            template_id=int(template_id),
+            min_aa_length=params.min_aa_length,
+            fold_insertions=params.fold_insertions,
+            min_insertion_support=params.min_insertion_support,
+            min_extension_support=params.min_extension_support,
+        )
+    except Exception:  # noqa: BLE001 — the template itself is what is left
+        node = None
+    if node is not None:
+        return [node], STATUS_FALLBACK_POOLED
+    node = _template_node(frame, template_id, len(members), params.min_aa_length)
+    return [node], STATUS_FALLBACK_TEMPLATE
+
+
+def refine_one_template(
+    rows: pa.Table,
+    reads,
+    store,
+    row: int,
+    params: "MStepParams",
+    *,
+    round_index: int,
+    error_model=None,
+    evidence: str = "none",
+    on_error: str = "record",
+) -> TemplateResult:
+    """One template's M-step, from its assignment slice to its rows.
+
+    The worker body, so that it is the only one: :func:`mstep_worker` runs
+    it for every template of a unit and :mod:`.replay` runs it for one, and
+    a replay therefore cannot drift from the run it re-creates. ``rows`` is
+    the template's contiguous slice of the template-sorted assignment table
+    (only :data:`MSTEP_WORKER_COLUMNS` are read).
+
+    ``on_error='record'`` (the loop) turns a kernel failure into a fallback
+    node and a record; ``'raise'`` (tests, replay) lets it propagate.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+        EVIDENCE_NONE,
+        EVIDENCE_OK,
+        KERNEL_COUNTERS,
+        STATUS_NO_MEMBERS,
+        STATUS_OK,
+        TemplateRecord,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
+        refine_template_with_internals,
+    )
+
+    if on_error not in ("record", "raise"):
+        raise ValueError(f"on_error must be 'record' or 'raise', got {on_error!r}")
+    template_id = int(store.template_id[row])
+    frame = store.sequence(row)
+    all_read_row = (
+        rows.column("read_row").to_numpy(zero_copy_only=False).astype(np.int64)
+    )
+    members, _member_rows, fraction, member_pos = member_specs(
+        rows,
+        reads,
+        max_members=params.max_members_per_template,
+        seed=template_id,
+    )
+    record = TemplateRecord(
+        round=int(round_index),
+        template_id=template_id,
+        template_row=int(row),
+        n_assigned=int(rows.num_rows),
+        n_members_used=len(members),
+        subsample_fraction=float(fraction),
+    )
+    internals = None
+    if not members:
+        # Every assigned read lacked an alignment. Before this record the
+        # template was skipped and its reads left the round unrecorded.
+        record.status = STATUS_NO_MEMBERS
+        nodes = [_template_node(frame, template_id, 0, params.min_aa_length)]
+    else:
+        try:
+            nodes, internals = refine_template_with_internals(
+                frame,
+                members,
+                template_id=template_id,
+                n_assigned=float(sum(m.weight for m in members)),
+                error_model=error_model,
+                **params.kernel_kwargs(),
+            )
+            if not nodes:
+                raise RuntimeError("the M-step kernel emitted no node")
+            record.status = STATUS_OK
+            stats = nodes[0].stats or {}
+            record.counters = {k: stats.get(k) for k in KERNEL_COUNTERS}
+            record.disagreements = dict(stats.get("disagreements") or {})
+        except Exception as exc:  # noqa: BLE001 — one template never kills a unit
+            if on_error == "raise":
+                raise
+            record.record_error(exc)
+            nodes, record.status = _fallback_nodes(frame, members, template_id, params)
+            internals = None
+    record.n_nodes_emitted = len(nodes)
+
+    # Every read assigned to this template, not just the ones sampled into
+    # the PWM. The cap bounds what the CONSENSUS is built from; it must not
+    # bound what the cluster CONTAINS: emitting only sampled reads made
+    # exported counts and quantification report the cap.
+    hap_ids = np.array([n.haplotype_id for n in nodes], dtype=np.int32)
+    node_of_member = np.zeros(len(members), dtype=np.int64)
+    for h, node in enumerate(nodes):
+        node_of_member[np.asarray(node.member_ids, dtype=np.int64)] = h
+    # The sample is uniform, so the unsampled tail is exchangeable with it;
+    # there is no per-read evidence to place those reads on a minor node.
+    # They go to the major one (nodes are emitted mass-descending), which is
+    # the approximation the cap buys and is recorded as such.
+    hap_of_row = np.full(all_read_row.size, nodes[0].haplotype_id, dtype=np.int32)
+    if member_pos.size:
+        hap_of_row[member_pos] = hap_ids[node_of_member]
+    counts = np.bincount(hap_of_row, minlength=int(hap_ids.max()) + 1)
+    node_rows = [
+        _node_row(
+            node, row, round_index, len(members), fraction, int(counts[node.haplotype_id])
+        )
+        for node in nodes
+    ]
+
+    if evidence != "none" and internals is not None:
+        record.evidence_status = EVIDENCE_OK
+    else:
+        record.evidence_status = EVIDENCE_NONE
+    if evidence == "none":
+        internals = None
+    return TemplateResult(
+        node_rows=node_rows,
+        nodes=nodes,
+        parent_template_id=template_id,
+        read_row=all_read_row,
+        haplotype_of_read=hap_of_row,
+        member_pos=member_pos,
+        record=record,
+        internals=internals,
+    )
+
+
 def mstep_worker(
     batch: pa.Table,
     *,
@@ -372,6 +600,7 @@ def mstep_worker(
     round_index: int,
     params: "MStepParams",
     error_model=None,
+    evidence: str = "none",
 ) -> dict[str, pa.Table]:
     """Refine every template in one unit. Module-level, so it pickles by name.
 
@@ -384,17 +613,22 @@ def mstep_worker(
     deadlocks on OpenMP — a silent hang, not an exception. The kernels this
     calls (consensus / columns / covariance) are numpy-only by design.
     """
-    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import (
-        refine_template,
+    from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+        disagreement_table,
+        template_table,
     )
 
     reads = _reads(corpus_path)
     store = _templates(templates_path)
+    keys = mstep_output_keys(evidence)
     if batch.num_rows == 0:
-        return {
+        out = {
             "nodes": REFINED_NODE_TABLE.empty_table(),
             "node_membership": NODE_MEMBERSHIP_TABLE.empty_table(),
+            "templates": template_table([]),
+            "disagreements": disagreement_table([]),
         }
+        return {k: out[k] for k in keys}
 
     tr = batch.column("template_row").to_numpy(zero_copy_only=False)
     starts = np.flatnonzero(np.concatenate([[True], tr[1:] != tr[:-1]]))
@@ -405,81 +639,36 @@ def mstep_worker(
     mem_hap: list[np.ndarray] = []
     mem_read: list[np.ndarray] = []
     mem_weight: list[np.ndarray] = []
+    records = []
     for i in range(starts.size):
         lo, hi = int(bounds[i]), int(bounds[i + 1])
-        row = int(tr[lo])
-        members, member_read_row, fraction = specs_from_assignment_slice(
+        result = refine_one_template(
             batch.slice(lo, hi - lo),
             reads,
-            max_members=params.max_members_per_template,
-            seed=int(store.template_id[row]),
+            store,
+            int(tr[lo]),
+            params,
+            round_index=round_index,
+            error_model=error_model,
+            evidence=evidence,
         )
-        if not members:
-            continue
-        try:
-            nodes = refine_template(
-                store.sequence(row),
-                members,
-                template_id=int(store.template_id[row]),
-                n_assigned=float(sum(m.weight for m in members)),
-                error_model=error_model,
-                **params.kernel_kwargs(),
-            )
-        except Exception:  # noqa: BLE001 — one bad template must not kill a unit
-            continue
-        # Every read assigned to this template, not just the ones sampled into
-        # the PWM. The cap bounds what the CONSENSUS is built from; it must not
-        # bound what the cluster CONTAINS. Emitting only sampled reads made
-        # exported counts and quantification report the cap — 20 reads capped
-        # at 5 exported as 5 — and scaling node_weight did not repair it,
-        # because both are counted from membership rows.
-        all_read_row = (
-            batch.slice(lo, hi - lo)
-            .column("read_row")
-            .to_numpy(zero_copy_only=False)
-            .astype(np.int64)
-        )
-        node_of_member = np.zeros(len(members), dtype=np.int32)
-        for h, node in enumerate(nodes):
-            node_of_member[np.asarray(node.member_ids, dtype=np.int64)] = h
+        rows.extend(result.node_rows)
+        n = result.read_row.size
+        mem_parent.append(np.full(n, result.parent_template_id, np.int64))
+        mem_hap.append(result.haplotype_of_read)
+        mem_read.append(result.read_row)
+        mem_weight.append(np.ones(n, dtype=np.float32))
+        records.append(result.record)
 
-        # The sample is uniform, so the unsampled tail is exchangeable with it;
-        # there is no per-read evidence to place those reads on a minor node.
-        # They go to the major one (nodes are emitted mass-descending), which
-        # is the approximation the cap buys and is recorded as such.
-        sampled = np.zeros(all_read_row.size, dtype=bool)
-        pos_of_row = {int(r): k for k, r in enumerate(all_read_row)}
-        take_pos = np.array(
-            [pos_of_row[int(r)] for r in member_read_row], dtype=np.int64
-        )
-        sampled[take_pos] = True
-        hap_of_row = np.zeros(all_read_row.size, dtype=np.int32)
-        hap_of_row[take_pos] = np.array(
-            [nodes[int(h)].haplotype_id for h in node_of_member], dtype=np.int32
-        )
-        hap_of_row[~sampled] = nodes[0].haplotype_id
-
-        counts = np.bincount(
-            hap_of_row, minlength=max(n.haplotype_id for n in nodes) + 1
-        )
-        for node in nodes:
-            n_reads = int(counts[node.haplotype_id])
-            rows.append(
-                _node_row(node, row, round_index, len(members), fraction, n_reads)
-            )
-        mem_parent.append(
-            np.full(all_read_row.size, nodes[0].parent_template_id, np.int64)
-        )
-        mem_hap.append(hap_of_row)
-        mem_read.append(all_read_row)
-        mem_weight.append(np.ones(all_read_row.size, dtype=np.float32))
-
-    return {
+    out = {
         "nodes": _rows_to_nodes(rows),
         "node_membership": _rows_to_membership(
             round_index, mem_parent, mem_hap, mem_read, mem_weight
         ),
+        "templates": template_table(records),
+        "disagreements": disagreement_table(records),
     }
+    return {k: out[k] for k in keys}
 
 
 def in_node_order(nodes: pa.Table) -> pa.Table:
@@ -638,6 +827,10 @@ def iter_unit_batches(
 
 __all__ = [
     "MSTEP_WORKER_COLUMNS",
+    "TemplateResult",
+    "member_specs",
+    "mstep_output_keys",
+    "refine_one_template",
     "NODE_MEMBERSHIP_TABLE",
     "REFINED_NODE_TABLE",
     "MStepParams",

@@ -119,6 +119,33 @@ class RefinedTemplate:
     stats: dict = field(default_factory=dict, repr=False)
 
 
+@dataclass(slots=True)
+class KernelInternals:
+    """What :func:`refine_template_with_internals` computed on the way to its
+    nodes, held by reference for a caller that keeps evidence (the M-step's
+    evidence tables, and replay). Nothing here is read to make the nodes, so
+    collecting it cannot change them; a caller must copy before it sorts or
+    writes into any of these arrays.
+
+    ``children[k]`` is ``(haplotype_id, ConsensusResult, lo, hi)`` for node
+    ``k`` in emission order: the node's consensus is ``cres.consensus[lo:hi]``
+    on the pooled column plan, so one frame axis serves every sibling.
+    """
+
+    pooled: ConsensusResult
+    stats: object  # columns.ColumnStats
+    cand: object  # columns.CandidateSet
+    states: object | None = None  # covariance.ReadStates
+    graph: object | None = None  # covariance.CovarianceGraph
+    signatures: list = field(default_factory=list)
+    assignments: list = field(default_factory=list)  # covariance.Assignment
+    #: (M,) the observed state-tuple of each member before small tuples fold.
+    tuple_of_member: np.ndarray | None = None
+    #: The tuples that survived as nodes (indices into the tuple space).
+    surviving_tuples: np.ndarray | None = None
+    children: list = field(default_factory=list)
+
+
 def specs_from_assignments(
     rows,
     read_seq: dict[str, str],
@@ -299,7 +326,7 @@ def pooled_node(
     return _annotate_orf(node, min_aa_length)
 
 
-def refine_template(
+def refine_template_with_internals(
     frame: str,
     members: list[MemberSpec],
     *,
@@ -324,15 +351,14 @@ def refine_template(
     fold_insertions: bool = True,
     min_insertion_support: float = 2.0,
     min_extension_support: float | None = 3.0,
-) -> list[RefinedTemplate]:
-    """Refine one template into its state-tuple nodes.
+) -> tuple[list[RefinedTemplate], KernelInternals | None]:
+    """:func:`refine_template`, also returning what it computed on the way.
 
-    Every annealing knob is an explicit per-round argument so the round loop
-    in the bench driver can schedule them; there is no ``**kwargs`` for one to
-    hide in.
+    The one implementation of the M-step kernel: the round loop and replay
+    both run it, so a replay cannot drift from the run it re-creates.
     """
     if not members:
-        return []
+        return [], None
     model = error_model or ErrorModel()
     pooled = frame_consensus(
         frame,
@@ -362,6 +388,7 @@ def refine_template(
         max_columns=max_candidate_columns,
         coverage_route=coverage_route,
     )
+    internals = KernelInternals(pooled=pooled, stats=stats, cand=cand)
 
     diag: dict = {
         "n_reads": total_reads,
@@ -400,6 +427,10 @@ def refine_template(
             )
             for s in signatures
         ]
+        internals.states = states
+        internals.graph = graph
+        internals.signatures = signatures
+        internals.assignments = assignments
     diag["n_signatures"] = len(signatures)
 
     declared = (
@@ -429,6 +460,7 @@ def refine_template(
         )
         lo, hi = _support_span(cres)
         consensus = cres.consensus[lo:hi]
+        internals.children.append((hid, cres, lo, hi))
         # Declared columns are PWM columns; each child reports them in its own
         # consensus coordinates and drops the ones it has no base for (a
         # minority insertion exists for the node that carries it and nowhere
@@ -462,7 +494,7 @@ def refine_template(
 
     if not assignments:
         diag["n_nodes"] = 1
-        return [_node(0, np.arange(len(members)), "")]
+        return [_node(0, np.arange(len(members)), "")], internals
 
     # One node per observed state-tuple. Not per signature: two independent
     # signatures give up to four templates, and two marginals would each count
@@ -483,6 +515,8 @@ def refine_template(
     )
     diag["n_nodes"] = int(surv.shape[0])
     diag["n_tuples_observed"] = int(keys.shape[0])
+    internals.tuple_of_member = inverse
+    internals.surviving_tuples = surv
 
     pats = _tuple_patterns(assignments, keys[surv])
     order = np.argsort(-new_mass, kind="stable")
@@ -490,12 +524,74 @@ def refine_template(
     for hid, t in enumerate(order.tolist()):
         allele = "".join(_ALLELE_CHAR(int(v)) for v in pats[t])
         out.append(_node(hid, np.flatnonzero(labels == t), allele))
-    return out
+    return out, internals
+
+
+def refine_template(
+    frame: str,
+    members: list[MemberSpec],
+    *,
+    template_id: int = 0,
+    n_assigned: float | None = None,
+    error_model: ErrorModel | None = None,
+    overdispersion: float = 0.01,
+    eps_floor: float = 0.0,
+    f_min: float = 0.02,
+    a_min: float = 3.0,
+    q_candidate: float = 0.01,
+    q_edge: float = 0.01,
+    gamma: float = 0.6,
+    local_window: int = 200,
+    boundary_tolerance: int = 10,
+    max_candidate_columns: int = 512,
+    max_cooccurrence_budget: float = 2e8,
+    max_nodes: int = 8,
+    min_node_reads: float = 2.0,
+    min_aa_length: int = 30,
+    coverage_route: bool = True,
+    fold_insertions: bool = True,
+    min_insertion_support: float = 2.0,
+    min_extension_support: float | None = 3.0,
+) -> list[RefinedTemplate]:
+    """Refine one template into its state-tuple nodes.
+
+    Every annealing knob is an explicit per-round argument so the round loop
+    can schedule them; there is no ``**kwargs`` for one to hide in. The
+    kernel is :func:`refine_template_with_internals`.
+    """
+    nodes, _ = refine_template_with_internals(
+        frame,
+        members,
+        template_id=template_id,
+        n_assigned=n_assigned,
+        error_model=error_model,
+        overdispersion=overdispersion,
+        eps_floor=eps_floor,
+        f_min=f_min,
+        a_min=a_min,
+        q_candidate=q_candidate,
+        q_edge=q_edge,
+        gamma=gamma,
+        local_window=local_window,
+        boundary_tolerance=boundary_tolerance,
+        max_candidate_columns=max_candidate_columns,
+        max_cooccurrence_budget=max_cooccurrence_budget,
+        max_nodes=max_nodes,
+        min_node_reads=min_node_reads,
+        min_aa_length=min_aa_length,
+        coverage_route=coverage_route,
+        fold_insertions=fold_insertions,
+        min_insertion_support=min_insertion_support,
+        min_extension_support=min_extension_support,
+    )
+    return nodes
 
 
 __all__ = [
+    "KernelInternals",
     "RefinedTemplate",
     "pooled_node",
     "refine_template",
+    "refine_template_with_internals",
     "specs_from_assignments",
 ]

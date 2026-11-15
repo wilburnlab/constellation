@@ -155,6 +155,49 @@ def read_round_nodes(rd: Path, columns: list[str] | None = None) -> pa.Table:
     return table.select(columns) if columns else table
 
 
+def read_round_table(
+    rd: Path, key: str, schema: pa.Schema, sort_by: list[str]
+) -> pa.Table | None:
+    """One of the round's other M-step tables (:mod:`.evidence`), sorted.
+
+    ``None`` when the round predates the table: its directory never existed,
+    which is not the same as an empty table.
+    """
+    rd = Path(rd)
+    if not (rd / MSTEP_DIR / key).exists():
+        return None
+    shards = round_mstep_shards(rd, key)
+    if not shards:
+        return schema.empty_table()
+    table = pa_ds.dataset(shards, schema=schema).to_table()
+    if table.num_rows:
+        table = table.sort_by([(c, "ascending") for c in sort_by])
+    return table
+
+
+def read_round_templates(rd: Path) -> pa.Table | None:
+    """The round's per-template M-step record, by ``template_id``."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+        MSTEP_TEMPLATE_TABLE,
+    )
+
+    return read_round_table(rd, "templates", MSTEP_TEMPLATE_TABLE, ["template_id"])
+
+
+def read_round_disagreements(rd: Path) -> pa.Table | None:
+    """The round's per-template disagreement statistics."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+        MSTEP_DISAGREEMENT_TABLE,
+    )
+
+    return read_round_table(
+        rd,
+        "disagreements",
+        MSTEP_DISAGREEMENT_TABLE,
+        ["template_id", "class_code", "run_len"],
+    )
+
+
 def read_round_membership(rd: Path) -> pa.Table:
     """A finished round's per-node read membership, in membership order."""
     rd = Path(rd)
@@ -178,8 +221,11 @@ __all__ = [
     "MSTEP_DIR",
     "NODES_KEY",
     "StaleShardsError",
+    "read_round_disagreements",
     "read_round_membership",
     "read_round_nodes",
+    "read_round_table",
+    "read_round_templates",
     "round_mstep_shards",
     "round_record",
 ]

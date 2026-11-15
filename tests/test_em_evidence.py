@@ -21,7 +21,9 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
+import pyarrow.compute  # noqa: F401  (pa.compute)
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
@@ -347,3 +349,261 @@ def test_a_rerun_round_clears_what_its_dead_attempt_wrote(tmp_path):
         assert not (rd / "mstep" / key / "part-00009.parquet").exists()
     n_units = _json(rd / "round.json")["mstep"]["n_units"]
     assert len(list((rd / "mstep" / "nodes").glob("part-*.parquet"))) == n_units
+
+
+# ── P1.3: every template the M-step touched is recorded (F2, F5) ──────
+
+
+def _assignments_of(rd: Path) -> pa.Table:
+    from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
+        EM_ASSIGNMENT_TABLE,
+    )
+
+    files = sorted((rd / "assignments").glob("part-*.parquet"))
+    return pa_ds.dataset(files, schema=EM_ASSIGNMENT_TABLE).to_table()
+
+
+def _templates_record(rd: Path) -> pa.Table:
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        read_round_templates,
+    )
+
+    t = read_round_templates(rd)
+    assert t is not None, f"{rd.name} has no mstep/templates"
+    return t
+
+
+def _split_template(rd: Path) -> dict:
+    t = _templates_record(rd).to_pylist()
+    split = [row for row in t if row["n_nodes_emitted"] >= 2]
+    assert split, "no template split"
+    return split[0]
+
+
+def test_every_template_with_reads_is_recorded_and_no_read_is_lost(runs):
+    for rd in _rounds(runs[3]):
+        t = _templates_record(rd)
+        a = _assignments_of(rd)
+        live = a.filter(pa.compute.greater_equal(a.column("template_row"), 0))
+        assert t.num_rows == len(set(live.column("template_row").to_pylist()))
+        assert sum(t.column("n_assigned").to_pylist()) == live.num_rows
+        assert set(t.column("status").to_pylist()) == {"ok"}
+        block = _json(rd / "round.json")["mstep"]
+        assert block["n_reads_assigned"] == block["n_reads_in_nodes"] == live.num_rows
+        assert block["n_failed"] == 0 and block["n_templates"] == t.num_rows
+
+
+def test_the_split_is_visible_in_the_record(runs):
+    """The counters refine_template built "so that the method returned one
+    template is visible rather than inferred" — now actually on disk."""
+    rd = _rounds(runs[1])[0]
+    split = _split_template(rd)
+    assert split["n_nodes"] == split["n_nodes_emitted"] == 2
+    assert split["n_significant_edges"] >= 1 and split["n_signatures"] >= 1
+    assert split["n_candidates"] >= 3, "the three UTR sites are candidates"
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        read_round_disagreements,
+    )
+
+    d = read_round_disagreements(rd)
+    assert d is not None and d.num_rows > 0
+    assert set(d.column("class_code").to_pylist()) <= {0, 1, 2}
+
+
+def _replay_inputs(out: Path, rd: Path, template_id: int):
+    """The template's slice, corpus, store and parameters, as the run had
+    them — the inputs replay will use."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
+        ReadStore,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+        sort_assignments_by_template,
+    )
+    from constellation.sequencing.transcriptome.cluster.denovo.em.templates import (
+        TemplateStore,
+    )
+
+    store = TemplateStore.open(rd / "templates" / "templates.arrow")
+    row = int(np.flatnonzero(np.asarray(store.template_id) == template_id)[0])
+    srt, _ = sort_assignments_by_template(_assignments_of(rd))
+    mine = srt.filter(pa.compute.equal(srt.column("template_row"), row))
+    reads = ReadStore.open(out / "corpus" / "reads.arrow")
+    params = MStepParams(**_json(rd / "params.json")["params"]["mstep"])
+    return mine, reads, store, row, params
+
+
+def test_the_record_is_what_the_shared_code_path_produces(runs):
+    """refine_one_template is the worker body; called directly on the
+    round's own inputs it reproduces the round's record and nodes."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        refine_one_template,
+    )
+
+    out = runs[1]
+    rd = _rounds(out)[0]
+    split = _split_template(rd)
+    mine, reads, store, row, params = _replay_inputs(out, rd, split["template_id"])
+    try:
+        res = refine_one_template(
+            mine, reads, store, row, params, round_index=1, on_error="raise"
+        )
+    finally:
+        reads.close()
+        store.close()
+    for name in ("n_assigned", "n_members_used", "status", "n_nodes_emitted"):
+        assert getattr(res.record, name) == split[name]
+    for name, value in res.record.counters.items():
+        assert split[name] == value, name
+    nodes = _nodes(rd).filter(
+        pa.compute.equal(_nodes(rd).column("parent_template_id"), split["template_id"])
+    )
+    assert sorted(r[4] for r in res.node_rows) == sorted(
+        nodes.column("consensus").to_pylist()
+    )
+
+
+@pytest.fixture(scope="module")
+def split_template_id(runs) -> int:
+    return int(_split_template(_rounds(runs[1])[0])["template_id"])
+
+
+def _fail_on(monkeypatch, template_id: int, *, pooled_too: bool = False):
+    from constellation.sequencing.transcriptome.cluster.denovo.em import mstep
+
+    real = mstep.refine_template_with_internals
+
+    def flaky(frame, members, *, template_id: int = 0, **kw):
+        if template_id == target:
+            raise RuntimeError("injected kernel failure")
+        return real(frame, members, template_id=template_id, **kw)
+
+    target = template_id
+    monkeypatch.setattr(mstep, "refine_template_with_internals", flaky)
+    if pooled_too:
+        def no_pool(*a, **k):
+            raise RuntimeError("injected pooled failure")
+
+        monkeypatch.setattr(mstep, "pooled_node", no_pool)
+
+
+def test_a_template_whose_kernel_raises_keeps_its_reads(
+    tmp_path, monkeypatch, split_template_id
+):
+    """It used to be skipped: no node, no membership, so its reads were in
+    the round's assignments and in no cluster, and nothing counted them."""
+    _fail_on(monkeypatch, split_template_id)
+    out = tmp_path / "em"
+    run_em(three_gene_panel(tmp_path), out, params=evidence_params(rounds=1))
+    rd = out / "rounds" / "r01"
+    rec = {r["template_id"]: r for r in _templates_record(rd).to_pylist()}[
+        split_template_id
+    ]
+    assert rec["status"] == "fallback_pooled"
+    assert rec["error_type"] == "RuntimeError" and "injected" in rec["error_message"]
+    assert rec["n_nodes_emitted"] == 1
+    block = _json(rd / "round.json")["mstep"]
+    assert block["n_failed"] == 1
+    assert block["n_reads_assigned"] == block["n_reads_in_nodes"] == 110
+    clusters = pq.read_table(out / "clusters.parquet")
+    assert sum(clusters.column("n_reads").to_pylist()) == 110
+    report = (out / "diagnostics" / "report.md").read_text()
+    assert "the M-step raised on 1 template" in report
+
+
+def test_when_the_pooled_consensus_fails_too_the_template_carries_forward(
+    tmp_path, monkeypatch, split_template_id
+):
+    _fail_on(monkeypatch, split_template_id, pooled_too=True)
+    out = tmp_path / "em"
+    run_em(three_gene_panel(tmp_path), out, params=evidence_params(rounds=1))
+    rd = out / "rounds" / "r01"
+    rec = {r["template_id"]: r for r in _templates_record(rd).to_pylist()}[
+        split_template_id
+    ]
+    assert rec["status"] == "fallback_template"
+    nodes = _nodes(rd)
+    mine = nodes.filter(pa.compute.equal(nodes.column("parent_template_id"), split_template_id))
+    from constellation.sequencing.transcriptome.cluster.denovo.em.templates import (
+        TemplateStore,
+    )
+
+    store = TemplateStore.open(rd / "templates" / "templates.arrow")
+    try:
+        row = int(np.flatnonzero(np.asarray(store.template_id) == split_template_id)[0])
+        assert mine.column("consensus").to_pylist() == [store.sequence(row)]
+    finally:
+        store.close()
+    assert sum(pq.read_table(out / "clusters.parquet").column("n_reads").to_pylist()) == 110
+
+
+class _Store:
+    def __init__(self, seq: str, template_id: int):
+        self.template_id = np.array([template_id], dtype=np.int64)
+        self._seq = seq
+
+    def sequence(self, row: int) -> str:
+        return self._seq
+
+
+class _Reads:
+    def __init__(self, seqs):
+        self._seqs = list(seqs)
+
+    def take_sequences(self, rows):
+        return [self._seqs[int(r)] for r in rows]
+
+
+def test_a_template_none_of_whose_reads_aligned_keeps_them():
+    """Every CIGAR null: there is nothing to build a consensus from, and the
+    template used to be skipped with its reads."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
+        MStepParams,
+        refine_one_template,
+    )
+
+    frame = "ATG" + "GCT" * 40 + "TAA"
+    rows = pa.table(
+        {
+            "template_row": pa.array([0, 0, 0], pa.int32()),
+            "read_row": pa.array([4, 7, 9], pa.int32()),
+            "cigar": pa.array([None, "", None], pa.large_string()),
+            "t_start": pa.array([0, 0, 0], pa.int32()),
+            "q_start": pa.array([0, 0, 0], pa.int32()),
+            "weight": pa.array([1.0, 1.0, 1.0], pa.float32()),
+        }
+    )
+    res = refine_one_template(
+        rows,
+        _Reads([frame] * 10),
+        _Store(frame, 42),
+        0,
+        MStepParams(),
+        round_index=1,
+        on_error="raise",
+    )
+    assert res.record.status == "no_members"
+    assert len(res.nodes) == 1 and res.nodes[0].consensus == frame
+    assert res.read_row.tolist() == [4, 7, 9]
+    assert res.haplotype_of_read.tolist() == [0, 0, 0]
+    assert [r[5] for r in res.node_rows] == [3]  # n_reads
+
+
+def test_a_rebuild_that_raises_is_counted_and_the_outputs_still_written(
+    tmp_path, monkeypatch
+):
+    """A surviving fallback node can fail again in the final rebuild; that
+    used to take the whole final stage down after every round finished."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import rebuild
+
+    def boom(*a, **k):
+        raise RuntimeError("injected rebuild failure")
+
+    monkeypatch.setattr(rebuild, "rebuild_one", boom)
+    out = tmp_path / "em"
+    run_em(three_gene_panel(tmp_path), out, params=evidence_params(rounds=1))
+    final = _json(_rounds(out)[-1] / "final.json")
+    assert final["n_rebuild_errors"] >= 1
+    assert final["n_rebuild_failed"] >= final["n_rebuild_errors"]
+    assert final["n_rebuilt"] == 0
+    assert sum(pq.read_table(out / "clusters.parquet").column("n_reads").to_pylist()) == 110

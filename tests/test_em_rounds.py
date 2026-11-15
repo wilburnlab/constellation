@@ -986,7 +986,7 @@ def _twin_first_node(monkeypatch, *, sibling: bool, trim_5p: int = 0):
     real = rounds_mod._run_mstep
 
     def _with_twin(r, rd, store, corpus, assignments, params, log):
-        nodes, membership, _units = real(
+        nodes, membership, block = real(
             r, rd, store, corpus, assignments, params, log
         )
         pid = int(nodes.column("parent_template_id")[0].as_py())
@@ -1044,13 +1044,19 @@ def _twin_first_node(monkeypatch, *, sibling: bool, trim_5p: int = 0):
             twin = put(twin, "consensus", [seq], pa.large_string())
         nodes = pa.concat_tables([first, nodes.slice(1), twin]).cast(nodes.schema)
 
+        # Rewritten as the round's own shards: every row in the first, the
+        # rest empty, so the unit count round.json records still names them
+        # all (the templates/disagreements shards are the real ones).
         for sub, table in (("nodes", nodes), ("node_membership", membership)):
             shard_dir = rd / "mstep" / sub
             for old in shard_dir.glob("part-*.parquet"):
                 old.unlink()
             pq.write_table(table, shard_dir / "part-00000.parquet")
-        # One shard per key now, so one unit is what round.json must record.
-        return nodes, membership, 1
+            for i in range(1, int(block["n_units"])):
+                pq.write_table(
+                    table.schema.empty_table(), shard_dir / f"part-{i:05d}.parquet"
+                )
+        return nodes, membership, block
 
     monkeypatch.setattr(rounds_mod, "_run_mstep", _with_twin)
 
