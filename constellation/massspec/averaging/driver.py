@@ -15,10 +15,13 @@ point is placed on it by index: nothing is interpolated or re-binned. A point
 that does not land on the grid is counted and reported, never merged into a
 neighbour.
 
-The first scan of each group is left out by default. It is the first fill of
-that kind of scan, before the AGC has any history (on a Stellar infusion series
-every scan of the first cycle ran at the injection-time ceiling); the summary
-reports its injection time beside the rest, so the choice can be checked.
+Every scan is averaged by default. ``skip_first`` can leave out the first scans
+of each group, the first fills of that kind of scan before the AGC has any
+history: on one Stellar infusion series every scan of the first cycle ran at
+the injection-time ceiling, but on another the first scans filled exactly like
+the rest, and with ~100 replicates one scan barely moves the mean. The summary
+reports the injection time of any skipped scans beside the rest, so the choice
+can be checked.
 
 Intensities are the instrument's, which are normalised by injection time, so the
 mean of scans with different fills is a mean of rates, not of ion counts. Spray
@@ -45,6 +48,7 @@ import json
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -203,11 +207,78 @@ def _grids(bundle: Path, row_of: np.ndarray, group: np.ndarray, n_groups: int):
     return np.where(seen, lo, np.nan), step, n_points
 
 
+def _run_name(source: Path, manifest: dict) -> str:
+    return Path(str(manifest.get("source_file") or source.name).replace("\\", "/").rsplit("/", 1)[-1]).stem
+
+
+def averaged_path(profile_bundle: Path | str, parent: Path | str | None = None) -> Path:
+    """Where :func:`average_bundle` writes by default: ``<run>.average`` in
+    ``parent``, or beside the profile bundle when ``parent`` is None."""
+    source = Path(profile_bundle)
+    run = _run_name(source, read_bundle_manifest(source))
+    return (Path(parent) if parent is not None else source.parent) / f"{run}.{SUFFIX}"
+
+
+def find_profile_bundles(directory: Path | str) -> list[Path]:
+    """The run profile bundles directly inside ``directory`` (not recursive),
+    sorted by name. Peak bundles and bundles made from another bundle (an
+    earlier ``.average``) are not runs to average and are left out."""
+    found = []
+    for child in sorted(Path(directory).iterdir(), key=lambda p: p.name):
+        if not (child / "manifest.json").is_file():
+            continue
+        try:
+            if is_profile_bundle(child) and not read_bundle_manifest(child).get("derived_from"):
+                found.append(child)
+        except Exception:  # an unreadable manifest is not a run we can average
+            continue
+    return found
+
+
+@dataclass(frozen=True)
+class AverageResult:
+    """One run of :func:`average_directory`: ``status`` is ``ok``,
+    ``skipped`` (already averaged; ``force`` remakes it) or ``error``."""
+
+    bundle: Path
+    status: str
+    output: Path | None
+    detail: str = ""
+
+
+def average_directory(
+    directory: Path | str,
+    *,
+    output_parent: Path | str | None = None,
+    skip_first: int = 0,
+    force: bool = False,
+) -> list[AverageResult]:
+    """Average every run profile bundle directly inside ``directory`` (see
+    :func:`find_profile_bundles`), each to ``<run>.average`` in
+    ``output_parent`` (default: beside its source). A run that is already
+    averaged is skipped unless ``force``; a run that fails is reported and the
+    rest carry on."""
+    if skip_first < 0:
+        raise ValueError(f"skip_first must be 0 or more, got {skip_first}")
+    results = []
+    for bundle in find_profile_bundles(directory):
+        try:
+            out = averaged_path(bundle, output_parent)
+            if out.exists() and any(out.iterdir()) and not force:
+                results.append(AverageResult(bundle, "skipped", out, "already averaged"))
+                continue
+            made = average_bundle(bundle, output_dir=out, skip_first=skip_first, force=force)
+            results.append(AverageResult(bundle, "ok", made))
+        except Exception as exc:  # one bad run must not stop the rest
+            results.append(AverageResult(bundle, "error", None, f"{type(exc).__name__}: {exc}"))
+    return results
+
+
 def average_bundle(
     profile_bundle: Path | str,
     *,
     output_dir: Path | str | None = None,
-    skip_first: int = 1,
+    skip_first: int = 0,
     force: bool = False,
 ) -> Path:
     """Average ``profile_bundle`` into one spectrum per kind of scan; returns
@@ -215,7 +286,7 @@ def average_bundle(
     ``output_dir`` says otherwise.
 
     ``skip_first`` leaves out the first that many scans of each group (the
-    AGC's first fills); 0 keeps every scan.
+    AGC's first fills); the default, 0, keeps every scan.
     """
     source = Path(profile_bundle)
     manifest = read_bundle_manifest(source)
@@ -226,8 +297,7 @@ def average_bundle(
         )
     if skip_first < 0:
         raise ValueError(f"skip_first must be 0 or more, got {skip_first}")
-    run = Path(str(manifest.get("source_file") or source.name).replace("\\", "/").rsplit("/", 1)[-1]).stem
-    out = Path(output_dir) if output_dir is not None else source.parent / f"{run}.{SUFFIX}"
+    out = Path(output_dir) if output_dir is not None else averaged_path(source)
     if out.resolve() == source.resolve():
         raise ValueError("the averaged bundle cannot replace its source")
     if out.exists() and any(out.iterdir()):

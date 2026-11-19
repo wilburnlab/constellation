@@ -4,7 +4,7 @@ Synthetic ground truth: five cycles of one MS1 (positive), one MS1 (negative,
 same range) and three activations x two isolation windows of MS2. Every
 replicate of a point is a known value plus a known deviation (-3, -1, +1, +3
 over cycles 2-5), so the mean and standard deviation are exact; the first
-cycle is garbage that must be left out, m/z carries sub-step jitter, and the
+cycle is garbage (an AGC first fill) that ``skip_first=1`` must leave out, m/z carries sub-step jitter, and the
 points are written in small row groups across two parts so scans straddle
 both.
 """
@@ -19,7 +19,14 @@ import pyarrow.parquet as pq
 import pytest
 from _massspec_fixtures import write_bundle, write_bundle_manifest
 
-from constellation.massspec.averaging import POINTS_DIR, SUMMARY_FILENAME, average_bundle, group_scans
+from constellation.massspec.averaging import (
+    POINTS_DIR,
+    SUMMARY_FILENAME,
+    average_bundle,
+    average_directory,
+    find_profile_bundles,
+    group_scans,
+)
 from constellation.massspec.bundle import read_bundle_manifest
 from constellation.massspec.scans import spectrum
 
@@ -83,7 +90,7 @@ def _out(out):
 
 class TestAverageBundle:
     def test_one_spectrum_per_kind_of_scan_in_order_of_appearance(self, profile, tmp_path):
-        out = average_bundle(profile)
+        out = average_bundle(profile, skip_first=1)
         assert out == tmp_path / "run.average"
         _, _, meta, summary = _out(out)
         assert len(meta) == 8  # MS1 + and -, 3 activations x 2 windows
@@ -96,7 +103,7 @@ class TestAverageBundle:
         assert all(s["n_scans"] == 4 and s["n_skipped"] == 1 for s in summary)
 
     def test_mean_and_sd_are_the_planted_values_on_the_grid(self, profile):
-        points, extra, meta, _ = _out(average_bundle(profile))
+        points, extra, meta, _ = _out(average_bundle(profile, skip_first=1))
         for m in meta:
             at = points["scan"] == m["scan"]
             if m["level"] == 1:
@@ -113,7 +120,7 @@ class TestAverageBundle:
         assert np.array_equal(points["mz"], extra["mz"]) and np.array_equal(points["scan"], extra["scan"])
 
     def test_the_first_fill_is_reported_beside_the_rest(self, profile):
-        _, _, meta, summary = _out(average_bundle(profile))
+        _, _, meta, summary = _out(average_bundle(profile, skip_first=1))
         for m, s in zip(meta, summary):
             want = 5.0 if m["level"] == 1 else 2.0
             assert s["iit_median_ms"] == pytest.approx(want) and m["iit"] == pytest.approx(want)
@@ -121,14 +128,16 @@ class TestAverageBundle:
             # read from a jittered scan: +/-1e-4 m/z over ~300 points
             assert s["grid_step_mz"] == pytest.approx(STEP1 if m["level"] == 1 else STEP2, abs=2e-6)
 
-    def test_skip_first_zero_keeps_every_scan(self, profile, tmp_path):
-        points, extra, _, summary = _out(average_bundle(profile, output_dir=tmp_path / "all", skip_first=0))
+    def test_by_default_every_scan_is_kept(self, profile, tmp_path):
+        out = average_bundle(profile, output_dir=tmp_path / "all")
+        assert read_bundle_manifest(out)["derived_from"]["parameters"]["skip_first"] == 0
+        points, extra, _, summary = _out(out)
         assert all(s["n_scans"] == 5 and s["n_skipped"] == 0 for s in summary)
         assert set(extra["n_scans"].tolist()) == {5}
         assert points["intensity"][points["scan"] == 1] == pytest.approx(1000.0 + 1e9 / 5, rel=1e-9)
 
     def test_it_is_a_profile_bundle_any_command_reads(self, profile):
-        out = average_bundle(profile)
+        out = average_bundle(profile, skip_first=1)
         manifest = read_bundle_manifest(out)
         assert manifest["kind"] == "thermo_profile" and manifest["source_sha256"] == "abc"
         assert manifest["derived_from"]["name"] == "average"
@@ -155,7 +164,7 @@ class TestAverageBundle:
         _, extra, meta, summary = _out(out)
         last = meta[-1]["scan"]
         assert summary[-1]["n_points_incomplete"] == 1
-        assert sorted(set(extra["n_scans"][extra["scan"] == last].tolist())) == [3, 4]
+        assert sorted(set(extra["n_scans"][extra["scan"] == last].tolist())) == [4, 5]  # every scan kept by default
 
     def test_an_existing_bundle_is_refused_unless_forced(self, profile):
         average_bundle(profile)
@@ -192,6 +201,62 @@ class TestAverageBundle:
         assert not (tmp_path / "out").exists()
 
 
+@pytest.fixture
+def run_dir(tmp_path):
+    """A converted directory: two runs' profile bundles, one run's peak bundle,
+    an Orbitrap profile that must fail, and an unrelated folder."""
+    d = tmp_path / "data"
+    d.mkdir()
+    for run in ("b_run", "a_run"):
+        write_bundle_manifest(write_bundle(d, f"{run}.profile", _scans(), profile=True), run=run)
+    write_bundle_manifest(write_bundle(d, "a_run", _scans()[:3]))  # the centroided peak bundle
+    orbi = _scans()
+    for s in orbi:
+        s["analyzer"] = "FTMS"
+    write_bundle_manifest(write_bundle(d, "orbi.profile", orbi, profile=True), run="orbi")
+    (d / "notes").mkdir()
+    return d
+
+
+class TestAverageDirectory:
+    def test_only_run_profile_bundles_are_found(self, run_dir):
+        names = [b.name for b in find_profile_bundles(run_dir)]
+        assert names == ["a_run.profile", "b_run.profile", "orbi.profile"]
+        average_bundle(run_dir / "a_run.profile")
+        # the new a_run.average is a profile bundle too, but made from a run: not found
+        assert [b.name for b in find_profile_bundles(run_dir)] == names
+
+    def test_every_run_is_averaged_and_one_failure_does_not_stop_the_rest(self, run_dir):
+        results = average_directory(run_dir)
+        assert [(r.bundle.name, r.status) for r in results] == [
+            ("a_run.profile", "ok"), ("b_run.profile", "ok"), ("orbi.profile", "error"),
+        ]
+        assert "FTMS" in results[2].detail and not (run_dir / "orbi.average").exists()
+        for run in ("a_run", "b_run"):
+            summary = pq.read_table(run_dir / f"{run}.average" / SUMMARY_FILENAME).to_pylist()
+            assert len(summary) == 8 and all(s["n_scans"] == 5 for s in summary)
+
+    def test_averaged_runs_are_skipped_unless_forced(self, run_dir):
+        average_directory(run_dir)
+        stamp = (run_dir / "a_run.average" / "manifest.json").stat().st_mtime_ns
+        again = average_directory(run_dir)
+        assert [r.status for r in again[:2]] == ["skipped", "skipped"]
+        assert (run_dir / "a_run.average" / "manifest.json").stat().st_mtime_ns == stamp
+        assert [r.status for r in average_directory(run_dir, force=True)[:2]] == ["ok", "ok"]
+
+    def test_output_parent_and_skip_first_reach_every_run(self, run_dir, tmp_path):
+        results = average_directory(run_dir, output_parent=tmp_path / "out", skip_first=1)
+        assert results[0].output == tmp_path / "out" / "a_run.average"
+        summary = pq.read_table(tmp_path / "out" / "b_run.average" / SUMMARY_FILENAME).to_pylist()
+        assert all(s["n_scans"] == 4 and s["n_skipped"] == 1 for s in summary)
+        assert not (run_dir / "a_run.average").exists()
+
+    def test_a_negative_skip_first_is_refused_before_anything_is_written(self, run_dir):
+        with pytest.raises(ValueError, match="skip_first"):
+            average_directory(run_dir, skip_first=-1)
+        assert not list(run_dir.glob("*.average"))
+
+
 def test_scans_are_grouped_by_what_was_acquired(profile) -> None:
     table = pq.read_table(profile / "scan_metadata.parquet")
     group, n = group_scans(table)
@@ -221,7 +286,29 @@ class TestCommand:
         assert args.func(args) == 2
 
     def test_skip_first_and_output_dir_reach_the_driver(self, profile, tmp_path):
-        args = self._parse(str(profile), "--skip-first", "0", "-o", str(tmp_path / "elsewhere"))
+        assert self._parse(str(profile)).skip_first == 0
+        args = self._parse(str(profile), "--skip-first", "1", "-o", str(tmp_path / "elsewhere"))
         assert args.func(args) == 0
         summary = pq.read_table(tmp_path / "elsewhere" / SUMMARY_FILENAME).to_pylist()
-        assert all(s["n_scans"] == 5 for s in summary)
+        assert all(s["n_scans"] == 4 and s["n_skipped"] == 1 for s in summary)
+
+    def test_a_directory_averages_every_run_and_reports_failures(self, run_dir, capsys):
+        args = self._parse(str(run_dir))
+        assert args.func(args) == 5  # orbi.profile failed
+        assert (run_dir / "a_run.average" / "manifest.json").is_file()
+        assert (run_dir / "b_run.average" / "manifest.json").is_file()
+        err = capsys.readouterr().err
+        assert "2 averaged, 0 skipped, 1 failed" in err
+
+    def test_a_directory_rerun_skips_what_is_done(self, tmp_path, capsys):
+        d = tmp_path / "ok"
+        d.mkdir()
+        write_bundle_manifest(write_bundle(d, "r.profile", _scans(), profile=True), run="r")
+        assert self._parse(str(d)).func(self._parse(str(d))) == 0
+        assert self._parse(str(d)).func(self._parse(str(d))) == 0
+        assert "0 averaged, 1 skipped, 0 failed" in capsys.readouterr().err
+
+    def test_a_directory_with_nothing_to_average_is_a_usage_error(self, tmp_path):
+        (tmp_path / "empty").mkdir()
+        args = self._parse(str(tmp_path / "empty"))
+        assert args.func(args) == 2
