@@ -36,6 +36,7 @@ def test_all_four_subcommands_register() -> None:
     assert set(ms_subs.choices) == {
         "convert",
         "centroid",
+        "average",
         "mz-axis",
         "precursor-major",
         "search",
@@ -242,6 +243,7 @@ def test_dashboard_introspector_sees_all_subcommands() -> None:
     assert sub_names == {
         "convert",
         "centroid",
+        "average",
         "mz-axis",
         "precursor-major",
         "search",

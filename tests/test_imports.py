@@ -70,6 +70,8 @@ import constellation.massspec.rt.pairs
 import constellation.massspec.scans
 import constellation.massspec.bundle
 import constellation.massspec.bundle_summary
+import constellation.massspec.averaging
+import constellation.massspec.averaging.driver
 import constellation.massspec.centroiding
 import constellation.massspec.centroiding.apex
 import constellation.massspec.centroiding.driver

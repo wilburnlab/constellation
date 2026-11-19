@@ -258,7 +258,13 @@ def centroid_bundle(
         )
     parameters = dict(parameters or {})
     name = peak_list_key(chosen_algorithm, parameters)
-    run = Path(str(manifest.get("source_file") or source.name).replace("\\", "/").rsplit("/", 1)[-1]).stem
+    # A bundle derived from the run's profile (an average) names its list
+    # after itself, so its list does not land on the profile's.
+    run = (
+        source.name
+        if manifest.get("derived_from")
+        else Path(str(manifest.get("source_file") or source.name).replace("\\", "/").rsplit("/", 1)[-1]).stem
+    )
     out = Path(output_dir) if output_dir is not None else source.parent / f"{run}.{name}"
     if out.exists() and any(out.iterdir()):
         if not force:
