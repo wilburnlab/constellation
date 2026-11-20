@@ -19,15 +19,21 @@
 // tables; a newer request makes an older one's reply be dropped.
 
 import { tableFromIPC } from 'apache-arrow';
-import { fetchJson } from '../../engine/arrow_client';
 import { createCanvasLayer, type CanvasLayer } from '../../engine/canvas_layer';
 import { buildGridSvg, downloadSvg, layerSvg, type ExportCell } from '../../engine/export';
+import { zoomAbout, type IntervalLimits } from '../../engine/interval';
 import { attachPanZoom2D, type View2D } from '../../engine/pan_zoom';
-import { drawMatrix, matrixGlyphCost, matrixLod, type MatrixViewport } from '../../engine/matrix/draw';
+import {
+  DEFAULT_MATRIX_STYLE,
+  drawMatrix,
+  matrixGlyphCost,
+  matrixLod,
+  type MatrixViewport,
+} from '../../engine/matrix/draw';
 import { indexMatrix, type MatrixIndex } from '../../engine/matrix/model';
 import { canvasSink, svgSink } from '../../engine/matrix/sinks';
 import { clear, svgEl } from '../../engine/svg_layer';
-import { arcGeometry, drawArcs } from './arcs';
+import { ARC_NEGATIVE, ARC_POSITIVE, arcGeometry, drawArcs } from './arcs';
 import {
   SupportData,
   defaultOrder,
@@ -44,6 +50,7 @@ import {
   SupportMeta,
   SupportTarget,
   routeName,
+  templateLabel,
 } from './types';
 
 export const SIDE_W = 100;
@@ -71,6 +78,10 @@ const SIDE_COLS = [
   { key: 'excess', label: '×err', title: 'departures over those expected at 1.2% error' },
 ] as const;
 const SIDE_COL_W = 16;
+/** Rows at least this tall when a view opens, so each read is a row. */
+const OPEN_PX_PER_ROW = 2;
+/** Rows this tall are read letter by letter. */
+const READABLE_PX_PER_ROW = 12;
 
 export interface SupportViewOptions {
   host: HTMLElement;
@@ -111,6 +122,7 @@ export class SupportView {
   private readonly tooltip: HTMLDivElement;
   private readonly loading: HTMLDivElement;
   private readonly foot: HTMLDivElement;
+  private readonly summary: HTMLDivElement;
   private readonly layer: CanvasLayer;
   private readonly detachPanZoom: () => void;
   private readonly resizeObs: ResizeObserver | null = null;
@@ -159,6 +171,40 @@ export class SupportView {
     this.saveBtn = this.button('Save SVG', 'vector where under 50,000 glyphs, else an image of the matrix');
     bar.append(this.title, this.nodeSel, this.spaceSel, this.compareBtn, this.resetBtn, this.saveBtn);
 
+    // What is shown, in a sentence; then how to move around it.
+    this.summary = document.createElement('div');
+    this.summary.className = 'tx-summary';
+    const viewbar = document.createElement('div');
+    viewbar.className = 'tx-viewbar';
+    const group = (label: string, buttons: Array<[string, string, () => void]>) => {
+      const g = document.createElement('span');
+      g.className = 'tx-field';
+      g.append(label);
+      for (const [text, title, act] of buttons) {
+        const b = this.button(text, title);
+        b.addEventListener('click', act);
+        g.appendChild(b);
+      }
+      return g;
+    };
+    const hint = document.createElement('span');
+    hint.className = 'tx-hint';
+    hint.textContent = 'wheel: zoom along the transcript · shift + wheel: zoom reads · drag: pan · double-click: everything';
+    viewbar.append(
+      group('Reads', [
+        ['−', 'show more reads (shorter rows)', () => this.zoom('y', 1.5)],
+        ['+', 'show fewer reads (taller rows)', () => this.zoom('y', 1 / 1.5)],
+        ['All', 'every read in the height of the view', () => this.fitRows(true)],
+        ['Readable', `rows ${READABLE_PX_PER_ROW} px tall: letters once columns are wide enough`, () => this.readableRows()],
+      ]),
+      group('Columns', [
+        ['−', 'zoom out along the transcript', () => this.zoom('x', 1.5)],
+        ['+', 'zoom in along the transcript', () => this.zoom('x', 1 / 1.5)],
+        ['Whole', 'the whole length', () => this.fitColumns()],
+      ]),
+      hint,
+    );
+
     this.body = document.createElement('div');
     this.body.className = 'tx-body';
     this.body.style.gridTemplateColumns = `${SIDE_W}px 1fr`;
@@ -178,7 +224,7 @@ export class SupportView {
 
     this.foot = document.createElement('div');
     this.foot.className = 'tx-foot';
-    this.root.append(bar, this.body, this.foot);
+    this.root.append(bar, this.summary, viewbar, this.body, this.legend(), this.foot);
     opts.host.appendChild(this.root);
 
     this.layer = createCanvasLayer(this.matrixHost, (ctx, s) => this.paint(ctx, s.widthPx, s.heightPx));
@@ -216,8 +262,8 @@ export class SupportView {
         this.view = v;
         this.scheduleRender();
       },
-      limitsX: () => ({ min: 0, max: this.nCols(), minSpan: Math.min(this.nCols(), 4) || 1 }),
-      limitsY: () => ({ min: 0, max: Math.max(1, this.order.length), minSpan: Math.min(this.order.length, 3) || 1 }),
+      limitsX: () => this.limitsX(),
+      limitsY: () => this.limitsY(),
       onHover: (at) => this.hover(at),
       ignore: (t) => t instanceof Element && t.closest('.tx-arc, button, select, input') !== null,
     });
@@ -258,7 +304,7 @@ export class SupportView {
   describeTarget(): string {
     const t = this.target;
     if (!t) return '';
-    return t.kind === 'cluster' ? `cluster ${t.clusterId}` : `template ${t.templateId} (round ${t.round})`;
+    return t.kind === 'cluster' ? `cluster ${t.clusterId}` : templateLabel(t.templateId);
   }
 
   private async load(): Promise<void> {
@@ -266,7 +312,17 @@ export class SupportView {
     const gen = ++this.generation;
     this.startProgress();
     try {
-      const meta = await fetchJson<SupportMeta>(this.url());
+      const response = await fetch(this.url());
+      if (!response.ok) {
+        let detail = response.statusText;
+        try {
+          detail = String((await response.json()).detail ?? detail);
+        } catch {
+          /* not JSON */
+        }
+        throw new Error(detail);
+      }
+      const meta = (await response.json()) as SupportMeta;
       if (gen !== this.generation) return;
       const tables = await Promise.all(
         SUPPORT_TABLES.map(async (name) => {
@@ -365,8 +421,50 @@ export class SupportView {
     return this.shownCols[lo] === c ? lo : -1;
   }
 
+  private limitsX(): IntervalLimits {
+    return { min: 0, max: Math.max(1, this.nCols()), minSpan: Math.min(this.nCols(), 4) || 1 };
+  }
+
+  private limitsY(): IntervalLimits {
+    return { min: 0, max: Math.max(1, this.order.length), minSpan: Math.min(this.order.length, 3) || 1 };
+  }
+
+  private heightPx(): number {
+    return this.matrixHost.clientHeight || this.size.h || FALLBACK.h;
+  }
+
+  /** The whole length, and every read if each still gets
+   *  {@link OPEN_PX_PER_ROW} pixels — else the first reads at that height. */
   private fit(): void {
-    this.view = { x: [0, Math.max(1, this.nCols())], y: [0, Math.max(1, this.order.length)] };
+    this.view = { x: [0, Math.max(1, this.nCols())], y: this.view.y };
+    this.fitRows(this.order.length * OPEN_PX_PER_ROW <= this.heightPx(), false);
+  }
+
+  private fitRows(all: boolean, draw = true): void {
+    const n = Math.max(1, this.order.length);
+    const span = all ? n : Math.max(1, Math.min(n, this.heightPx() / OPEN_PX_PER_ROW));
+    this.view = { x: this.view.x, y: [0, span] };
+    if (draw) this.renderNow();
+  }
+
+  private fitColumns(): void {
+    this.view = { x: [0, Math.max(1, this.nCols())], y: this.view.y };
+    this.renderNow();
+  }
+
+  private readableRows(): void {
+    const span = Math.max(1, this.heightPx() / READABLE_PX_PER_ROW);
+    const y0 = Math.min(this.view.y[0], Math.max(0, this.order.length - span));
+    this.view = { x: this.view.x, y: [y0, Math.min(this.order.length, y0 + span)] };
+    this.renderNow();
+  }
+
+  /** Zoom one axis about the middle of the view (> 1 zooms out). */
+  private zoom(axis: 'x' | 'y', factor: number): void {
+    if (!this.data) return;
+    const limits = axis === 'x' ? this.limitsX() : this.limitsY();
+    this.view = { ...this.view, [axis]: zoomAbout(this.view[axis], factor, 0.5, limits) };
+    this.renderNow();
   }
 
   private resetOrder(): void {
@@ -407,6 +505,91 @@ export class SupportView {
     this.compareBtn.disabled = meta.kind === 'rebuilt' || (meta.nodes?.length ?? 0) < 2;
     this.compareBtn.classList.toggle('active', this.compare);
     this.compareBtn.textContent = this.compare ? 'All columns' : 'Compare nodes';
+    this.summary.textContent = this.describeView();
+  }
+
+  /** What is on screen, in a sentence or two. */
+  describeView(): string {
+    const data = this.data;
+    if (!data) return '';
+    const m = data.meta;
+    const n = (v: number) => v.toLocaleString('en-US');
+    const reads = data.reads.n;
+    const tmpl =
+      m.template_id !== null && m.template_id !== undefined
+        ? templateLabel(m.template_id)
+        : this.target?.kind === 'template'
+          ? templateLabel(this.target.templateId)
+          : 'its template';
+    const nodes = m.nodes ?? [];
+    const split =
+      nodes.length > 1
+        ? `, which the M-step split into ${nodes.length} nodes (${nodes.map((x) => n(x.n_reads)).join(' · ')} reads)`
+        : '';
+    let candidates = 0;
+    for (let i = 0; i < data.columns.n; i += 1) candidates += data.columns.candidate[i];
+    let what: string;
+    if (m.kind === 'rebuilt') {
+      what =
+        `Cluster ${m.cluster_id} was made by the final merge: its ${n(reads)} reads ` +
+        `(${n(m.n_absorbed_reads)} of them from the nodes it absorbed) re-aligned to the survivor's consensus ` +
+        `(${n(m.n_columns)} nt), one read per row`;
+    } else if (this.compare) {
+      what = `The ${n(reads)} reads of ${tmpl}${split}, at the ${n(this.nCols())} columns where the nodes' consensus sequences differ`;
+    } else if (m.reference === 'pooled') {
+      what =
+        `All ${n(reads)} reads of ${tmpl}${split}, one per row, against the consensus of all of them ` +
+        'pooled: a split shows as blocks of reads that differ together';
+    } else if (m.kind === 'node' || m.kind === 'merged') {
+      what =
+        `Cluster ${m.cluster_id} is node ${m.haplotype_id} of ${tmpl}${split}. ` +
+        `Its ${n(reads)} reads, one per row, against node ${m.reference}'s consensus (${n(m.n_columns)} nt)`;
+    } else {
+      what = `Node ${m.reference} of ${tmpl}${split}: its ${n(reads)} reads, one per row, against its consensus`;
+    }
+    const arcs = data.arcs.n;
+    return (
+      `${what}. Grey: the read agrees with that consensus; colour: it differs. ` +
+      `${n(candidates)} candidate column${candidates === 1 ? '' : 's'} (ticks under the minor-allele track)` +
+      (arcs ? `, ${n(arcs)} covariance arc${arcs === 1 ? '' : 's'} between them (click one to sort the reads by it).` : '.')
+    );
+  }
+
+  private legend(): HTMLDivElement {
+    const box = document.createElement('div');
+    box.className = 'tx-legend';
+    const swatch = (colour: string, label: string, title = '') => {
+      const s = document.createElement('span');
+      s.className = 'tx-swatch';
+      s.title = title;
+      const c = document.createElement('i');
+      c.style.background = colour;
+      s.append(c, label);
+      return s;
+    };
+    const style = DEFAULT_MATRIX_STYLE;
+    box.append(
+      swatch(style.span, 'agrees'),
+      ...['A', 'C', 'G', 'T'].map((b, i) => swatch(style.allele[i], b, `the read has ${b} where the consensus differs`)),
+      swatch(style.allele[4], 'gap', 'the read lacks a base the consensus has'),
+      swatch(style.allele[5], 'N', 'an ambiguous base: no evidence'),
+      swatch(style.insertion, 'insertion', 'bases the read has between two columns'),
+      swatch(ARC_POSITIVE, 'arc: differ together', 'φ > 0: reads that differ at one column differ at the other'),
+      swatch(ARC_NEGATIVE, 'arc: exclusive', 'φ < 0: reads differ at one column or the other, not both'),
+    );
+    const side = document.createElement('span');
+    side.className = 'tx-legend-side';
+    side.textContent =
+      'per read: sample · identity to the template · Dorado quality · how surely the M-step placed it · departures over what 1.2% error expects (brighter = higher)';
+    box.appendChild(side);
+    const samples = Object.entries(this.opts.samples);
+    if (samples.length) {
+      const sl = document.createElement('span');
+      sl.className = 'tx-legend-samples';
+      samples.forEach(([id, name]) => sl.appendChild(swatch(SAMPLE_COLOURS[Math.abs(Number(id)) % SAMPLE_COLOURS.length], name)));
+      box.appendChild(sl);
+    }
+    return box;
   }
 
   // ── drawing ───────────────────────────────────────────────────────
@@ -480,6 +663,14 @@ export class SupportView {
       const label = svgEl('text', { x: 4, y: Math.max(0, y) + 11, fill: '#edecee', 'font-size': 10 });
       label.textContent = `node ${node[this.order[i]]}`;
       svg.appendChild(label);
+    }
+    // Where the shown reads are among all of them.
+    const n = this.order.length;
+    const [y0, y1] = this.view.y;
+    if (n > 0 && (y0 > 0.5 || y1 < n - 0.5)) {
+      const x = this.size.w - 6;
+      svg.appendChild(svgEl('rect', { x, y: 0, width: 5, height: this.size.h, fill: '#edecee', 'fill-opacity': 0.12, rx: 2 }));
+      svg.appendChild(svgEl('rect', { x, y: (y0 / n) * this.size.h, width: 5, height: Math.max(3, ((y1 - y0) / n) * this.size.h), fill: '#a277ff', 'fill-opacity': 0.8, rx: 2 }));
     }
     if (this.pair) {
       const ppc = this.pxPerCol();
@@ -729,8 +920,7 @@ export class SupportView {
     const m = data.meta;
     const lod = matrixLod(this.viewport());
     const parts = [
-      m.kind === 'template' ? `template ${m.template_id}` : `${m.kind} cluster ${m.cluster_id}`,
-      `round ${m.round}`,
+      m.kind === 'template' ? templateLabel(m.template_id ?? 0) : `${m.kind} cluster ${m.cluster_id} (round ${m.round})`,
       `reference ${m.reference === 'pooled' ? 'pooled consensus' : `node ${m.reference}`}`,
       `${data.reads.n.toLocaleString('en-US')} reads (${m.n_sampled.toLocaleString('en-US')} voted in the PWM${m.n_absorbed_reads ? `, ${m.n_absorbed_reads} merged in` : ''})`,
       `${this.nCols().toLocaleString('en-US')} columns${this.compare ? ' where the nodes differ' : ''}`,

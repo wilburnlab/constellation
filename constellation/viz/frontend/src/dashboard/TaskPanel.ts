@@ -87,6 +87,22 @@ export class TaskPanel {
   private mountCommandForm(command: CommandSchema): void {
     if (!this.host) return;
     this.setTitle(command.path.join(' '));
+    if (isUnknownBrowser(command)) {
+      // A browser this dashboard build has no descriptor for: run as a
+      // command it would start a second server in a terminal. Say why.
+      const note = document.createElement('div');
+      note.className = 'task-notice';
+      note.style.padding = '16px';
+      note.style.color = 'var(--warn, #ffca85)';
+      note.textContent =
+        `\`constellation ${command.path.join(' ')}\` is a browser this dashboard's frontend ` +
+        'bundle predates, so it cannot open here. Rebuild the frontend ' +
+        '(python -m constellation.viz.frontend.build, or constellation viz install-frontend) ' +
+        'and reload the page.';
+      this.host.appendChild(note);
+      this.active = { destroy: () => note.remove() };
+      return;
+    }
     const form = new CommandForm({
       command,
       state: this.state,
@@ -271,6 +287,16 @@ export class TaskPanel {
       },
     };
   }
+}
+
+/** A `viz` subcommand that serves a browser (it takes `--no-browser`)
+ *  but has no descriptor in this build — a server newer than its bundle. */
+export function isUnknownBrowser(command: CommandSchema): boolean {
+  return (
+    command.path[0] === 'viz' &&
+    findVizDescriptor(command.path) === null &&
+    command.arguments.some((a) => a.option_strings.includes('--no-browser'))
+  );
 }
 
 /** Resolve a sidebar `command:open` event into a TaskInit. Compute

@@ -119,6 +119,15 @@
   padding: 16px;
   text-align: center;
 }
+.tx-browser .tx-summary { padding: 4px 8px; color: var(--fg); line-height: 1.35; border-bottom: 1px solid var(--border); }
+.tx-browser .tx-viewbar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+.tx-browser .tx-viewbar .tx-btn { min-width: 1.8em; }
+.tx-browser .tx-hint { color: var(--fg-mute); }
+.tx-browser .tx-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; padding: 3px 8px; border-top: 1px solid var(--border); color: var(--fg-dim); font-size: 11px; }
+.tx-browser .tx-swatch { display: inline-flex; align-items: center; gap: 3px; }
+.tx-browser .tx-swatch i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.tx-browser .tx-legend-side { color: var(--fg-mute); }
+.tx-browser .tx-legend-samples { display: inline-flex; flex-wrap: wrap; gap: 2px 8px; }
 .tx-browser .tx-foot { padding: 4px 8px; border-top: 1px solid var(--border); color: var(--fg-dim); background: var(--bg-elev); }
 .tx-browser .tx-ok { color: var(--ok); }
 .tx-browser .tx-bad { color: var(--danger); }

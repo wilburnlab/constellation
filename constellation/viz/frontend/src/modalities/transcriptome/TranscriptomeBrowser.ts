@@ -6,7 +6,7 @@
 import { fetchJson } from '../../engine/arrow_client';
 import { NodePicker, type ClusterRow } from './NodePicker';
 import { SupportView } from './SupportView';
-import type { ClusterDetail, RunInfo } from './types';
+import { type ClusterDetail, type RunInfo, TEMPLATE_ROUND_UNIT, templateIdOf, templateLabel, templateRound } from './types';
 import './tx.css';
 
 export interface TranscriptomeBrowserOptions {
@@ -23,8 +23,11 @@ export function parseInitial(hash: string): TranscriptomeBrowserOptions['initial
   const params = new URLSearchParams(hash.replace(/^#/, ''));
   const cluster = params.get('cluster');
   if (cluster !== null && /^\d+$/.test(cluster)) return { cluster: Number(cluster) };
-  const template = params.get('template')?.match(/^(\d+):(\d+)$/);
-  if (template) return { template: { round: Number(template[1]), templateId: Number(template[2]) } };
+  const template = params.get('template')?.match(/^(\d+):#?(\d+)$/);
+  if (template) {
+    const round = Number(template[1]);
+    return { template: { round, templateId: parseTemplate(round, template[2])! } };
+  }
   return undefined;
 }
 
@@ -35,11 +38,27 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: 
   return e;
 }
 
+/** A template typed by a person: its number within the round (`1234`,
+ *  `#1234`) or its full id, `(round << 40) | number`. Null if neither. */
+export function parseTemplate(round: number, text: string): number | null {
+  const m = text.trim().match(/^#?(\d+)$/);
+  if (!m) return null;
+  const v = Number(m[1]);
+  return v >= TEMPLATE_ROUND_UNIT ? v : templateIdOf(round, v);
+}
+
+const TEMPLATE_HELP =
+  'A template is the sequence a round aligned reads to: in round 1 a seed read, ' +
+  'later the consensus of a node of the round before. Its M-step builds one or more ' +
+  'nodes from the reads aligned to it (several when it splits), and the last round’s ' +
+  'nodes, after the final merge, are the clusters. Give its number within the round ' +
+  '(as shown with a cluster: “round 12 · template #1234”) or its full id.';
+
 export class TranscriptomeBrowser {
   readonly root: HTMLDivElement;
   private readonly opts: TranscriptomeBrowserOptions;
   private readonly runSel: HTMLSelectElement;
-  private readonly roundInput: HTMLInputElement;
+  private readonly roundSel: HTMLSelectElement;
   private readonly templateInput: HTMLInputElement;
   private readonly openTemplate: HTMLButtonElement;
   private readonly left: HTMLDivElement;
@@ -59,15 +78,16 @@ export class TranscriptomeBrowser {
     bar.appendChild(el('span', 'tx-brand', 'Transcriptome'));
     this.runSel = el('select', 'tx-select');
     this.runSel.title = 'EM run';
-    this.roundInput = el('input', 'tx-input tx-num');
-    this.roundInput.type = 'number';
-    this.roundInput.min = '1';
-    this.roundInput.placeholder = 'round';
+    this.roundSel = el('select', 'tx-select tx-round');
+    this.roundSel.title = 'a round the run finished';
     this.templateInput = el('input', 'tx-input tx-tid');
-    this.templateInput.placeholder = 'template id';
-    this.openTemplate = el('button', 'tx-btn', 'Open template');
+    this.templateInput.placeholder = 'template #';
+    this.templateInput.title = TEMPLATE_HELP;
+    this.openTemplate = el('button', 'tx-btn', 'Open');
+    this.openTemplate.title = TEMPLATE_HELP;
     const tpl = el('span', 'tx-field');
-    tpl.append(this.roundInput, this.templateInput, this.openTemplate);
+    tpl.title = TEMPLATE_HELP;
+    tpl.append('Template of', this.roundSel, this.templateInput, this.openTemplate);
     this.message = el('div', 'tx-message');
     bar.append(this.runSel, tpl, this.message);
     const main = el('div', 'tx-main');
@@ -82,11 +102,23 @@ export class TranscriptomeBrowser {
       const run = this.runs.find((r) => r.key === this.runSel.value);
       if (run) this.selectRun(run);
     });
-    this.openTemplate.addEventListener('click', () => {
-      const round = Number(this.roundInput.value);
-      const tid = Number(this.templateInput.value);
-      if (!this.support || !Number.isFinite(round) || !Number.isFinite(tid) || !this.templateInput.value) return;
-      void this.support.show({ kind: 'template', round, templateId: tid }, 'pooled');
+    const open = () => {
+      let round = Number(this.roundSel.value);
+      const id = parseTemplate(round, this.templateInput.value);
+      if (!this.support || id === null) {
+        this.message.textContent = 'a template is its number within the round (e.g. 1234) or its full id';
+        return;
+      }
+      if (id >= TEMPLATE_ROUND_UNIT && templateRound(id) !== round) {
+        // A full id names its own round.
+        round = templateRound(id);
+        if (this.run?.rounds.includes(round)) this.roundSel.value = String(round);
+      }
+      void this.support.show({ kind: 'template', round, templateId: id }, 'pooled');
+    };
+    this.openTemplate.addEventListener('click', open);
+    this.templateInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') open();
     });
   }
 
@@ -119,7 +151,12 @@ export class TranscriptomeBrowser {
     this.support?.dispose();
     this.left.innerHTML = '';
     this.detail.innerHTML = '';
-    this.roundInput.value = String(run.rounds.at(-1) ?? 1);
+    this.roundSel.innerHTML = '';
+    for (const r of [...run.rounds].reverse()) {
+      const o = el('option', undefined, `round ${r}`);
+      o.value = String(r);
+      this.roundSel.appendChild(o);
+    }
     this.support = new SupportView({ host: this.right, base: this.base, samples: run.samples });
     this.message.textContent = `${run.n_reads.toLocaleString('en-US')} reads · rounds ${run.rounds.join(', ') || '—'}`;
     if (!run.finished) {
@@ -166,7 +203,10 @@ export class TranscriptomeBrowser {
       ['reads', d.n_reads.toLocaleString('en-US')],
       ['length', `${d.length.toLocaleString('en-US')} nt`],
       ['protein', d.protein_length ? `${d.protein_length} aa` : '—'],
-      ['round node', d.round !== null ? `r${d.round} · template ${d.parent_template_id} · node ${d.haplotype_id}` : '—'],
+      [
+        'made by',
+        d.parent_template_id !== null ? `node ${d.haplotype_id} of ${templateLabel(d.parent_template_id)}` : '—',
+      ],
       [
         'final merge',
         d.n_absorbed ? `absorbed ${d.n_absorbed}${d.rebuilt ? ', rebuilt' : ', rebuild failed'}` : '—',

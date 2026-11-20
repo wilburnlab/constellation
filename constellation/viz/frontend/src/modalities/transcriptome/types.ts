@@ -93,3 +93,24 @@ export function routeName(route: number): string {
   if (route === 1) return 'allelic';
   return '—';
 }
+
+/** A template id is `(round << 40) | row`: the round whose E-step aligned
+ *  reads to it, and its row among that round's templates. */
+export const TEMPLATE_ROUND_UNIT = 2 ** 40;
+
+export function templateRound(id: number): number {
+  return Math.floor(id / TEMPLATE_ROUND_UNIT);
+}
+
+export function templateRow(id: number): number {
+  return id % TEMPLATE_ROUND_UNIT;
+}
+
+export function templateIdOf(round: number, row: number): number {
+  return round * TEMPLATE_ROUND_UNIT + row;
+}
+
+/** "round 12 · template #1234" — what a person can read of an id. */
+export function templateLabel(id: number): string {
+  return `round ${templateRound(id)} · template #${templateRow(id)}`;
+}

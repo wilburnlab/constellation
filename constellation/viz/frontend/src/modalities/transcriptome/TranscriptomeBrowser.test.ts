@@ -1,7 +1,7 @@
 import { Bool, Int32, Int64, Table, tableToIPC, vectorFromArray } from 'apache-arrow';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { supportMeta, supportTables } from './__fixtures__/support';
-import { TranscriptomeBrowser, parseInitial } from './TranscriptomeBrowser';
+import { TranscriptomeBrowser, parseInitial, parseTemplate } from './TranscriptomeBrowser';
 import type { SupportView } from './SupportView';
 import type { RunInfo, SupportMeta } from './types';
 
@@ -141,6 +141,7 @@ describe('TranscriptomeBrowser', () => {
   it('opens what its URL names', async () => {
     expect(parseInitial('#cluster=42')).toEqual({ cluster: 42 });
     expect(parseInitial('#template=12:13194139969773')).toEqual({ template: { round: 12, templateId: 13194139969773 } });
+    expect(parseInitial('#template=12:#1234')).toEqual({ template: { round: 12, templateId: 12 * 2 ** 40 + 1234 } });
     expect(parseInitial('#nothing')).toBeUndefined();
     browser = new TranscriptomeBrowser({ host, sessionId: SID, initial: { template: { round: 1, templateId: 7 } } });
     await browser.mount();
@@ -215,14 +216,42 @@ describe('TranscriptomeBrowser', () => {
     expect(host.querySelector('.tx-foot')!.textContent).toContain('✗ not the run: columns: minor_frac differs');
   });
 
-  it('opens a template of any round by id', async () => {
+  it('opens a template by its number within a round the run finished', async () => {
     await open();
-    (host.querySelector('.tx-round, .tx-num') as HTMLInputElement).value = '1';
-    (host.querySelector('.tx-tid') as HTMLInputElement).value = '7';
-    (Array.from(host.querySelectorAll('.tx-top .tx-btn')).find((b) => b.textContent === 'Open template') as HTMLButtonElement).click();
+    const rounds = Array.from(host.querySelectorAll('.tx-round option')).map((o) => (o as HTMLOptionElement).value);
+    expect(rounds).toEqual(['1']); // only the rounds the run has
+    (host.querySelector('.tx-tid') as HTMLInputElement).value = '#7';
+    (Array.from(host.querySelectorAll('.tx-top .tx-btn')).find((b) => b.textContent === 'Open') as HTMLButtonElement).click();
     await flush();
-    expect(server.urls.some((u) => u.includes('/rounds/1/templates/7/support?node=pooled&space=consensus'))).toBe(true);
-    expect(host.querySelector('.tx-title')!.textContent).toBe('template 7 (round 1)');
+    const id = 2 ** 40 + 7;
+    expect(server.urls.some((u) => u.includes(`/rounds/1/templates/${id}/support?node=pooled&space=consensus`))).toBe(true);
+    expect(host.querySelector('.tx-title')!.textContent).toBe('round 1 · template #7');
+    expect(parseTemplate(12, '13194139969773')).toBe(13194139969773);
+    expect(parseTemplate(12, '1234')).toBe(12 * 2 ** 40 + 1234);
+    expect(parseTemplate(12, 'x')).toBeNull();
+  });
+
+  it('says what is shown, how to move, and what the colours mean', async () => {
+    await open();
+    const summary = host.querySelector('.tx-summary')!.textContent!;
+    expect(summary).toContain('Cluster 42 is node 0 of round 0 · template #7');
+    expect(summary).toContain('split into 2 nodes (4 · 2 reads)');
+    expect(summary).toContain('2 candidate columns');
+    expect(host.querySelector('.tx-hint')!.textContent).toContain('shift + wheel: zoom reads');
+    expect(host.querySelector('.tx-legend')!.textContent).toContain('arc: differ together');
+    expect(host.querySelector('.tx-legend')!.textContent).toContain('testis_b');
+  });
+
+  it('zooms the reads from its buttons', async () => {
+    const support = await open();
+    const view = () => (support as unknown as { view: { y: [number, number] } }).view.y;
+    expect(view()).toEqual([0, 6]);
+    const btn = (label: string, n = 0) =>
+      Array.from(host.querySelectorAll('.tx-viewbar .tx-btn')).filter((b) => b.textContent === label)[n] as HTMLButtonElement;
+    btn('+').click();
+    expect(view()[1] - view()[0]).toBeCloseTo(4);
+    btn('All').click();
+    expect(view()).toEqual([0, 6]);
   });
 
   it('exports the view as one SVG, the small matrix as vectors', async () => {
