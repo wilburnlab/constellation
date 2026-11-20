@@ -544,7 +544,29 @@ One commit per phase on `feat/em-evidence`:
 | P1.7 | Verified replay, the support tables, the read API (`em/results.py`), `scripts/bench-em-replay.py` |
 | P1.8 | Documentation |
 
-Replay verified every template and cluster of a run made by the code of `a633080`, before any of these records existed. **For PR2:** replay is not instant — 20,000 reads × 2 kb take 76 s plus 13 s to read every allele, at 3.8 GB (`scripts/bench-em-replay.py`) — so the support view needs an on-disk replay cache per session, a progress indicator, and one replay at a time; the opt-in full dump (D1) is the way to precompute the templates a session will open. Real-data checks are the PI's: the evidence tables' sizes, the fallback rate, and the share of templates that verify, on the downloaded dataset.
+Replay verified every template and cluster of a run made by the code of `a633080`, before any of these records existed.
+
+**On the Nov2026 mouse testis run** (9.4M reads, 1,672,894 clusters, ledger #78), the OSC QA replayed 240 clusters and 45 templates, and all verified. It found three defects, fixed in PR1:
+- **(a)** support tables refused a rebuilt survivor that was not its parent's node 0;
+- **(b)** verification did not cover the compact evidence;
+- **(c)** every call read the whole round, about 15 s even for a one-read cluster.
+
+**Replay now goes through a per-round index** (`replay.index_round`). The index is built once per round, in 4 s and 1.1 GB. Each replay then reads the one M-step unit that holds its template.
+
+**The same 240 clusters and 15 round-12 templates, replayed on the workstation from ext4** (all verified, the compact evidence included):
+
+| Stratum | Median replay | Slowest replay | Median on OSC before |
+|---|---|---|---|
+| 1-read clusters | 0.17 s | 4 s | 15 s |
+| 1,000+ reads | 3.9 s | 47 s (21k reads, compute-bound) | 20 s |
+| Rebuilt survivors | 0.16 s | 3.3 s | — |
+
+- The slowest replays come from cold shard reads and the largest templates.
+- Building the support tables takes at most 3.3 s.
+- The process peaked at 4 GB.
+- Floating-point evidence recomputed on another machine agrees to about 5e-13 relative. It is compared within `replay.FLOAT_RTOL` (1e-9); nodes, membership and counts are compared exactly.
+
+**For PR2:** keep the index per session. One replay at a time, with a progress indicator for templates over about 1,000 reads, is enough. An on-disk replay cache is an optimisation for the largest templates, not a requirement. The opt-in full dump (D1) remains the way to precompute those.
 
 ## 14. WebGL: the trade-offs (decided at PR4's first step)
 

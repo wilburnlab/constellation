@@ -174,15 +174,25 @@ class RoundIndex:
     def nodes_at(self, rows) -> pa.Table:
         """The stored node rows at node-order positions ``rows``, in order."""
         rows = np.asarray(rows, dtype=np.int64)
+        position = np.arange(rows.size, dtype=np.int64)
         pieces = []
         for unit in np.unique(self.node_unit[rows]).tolist():
-            here = rows[self.node_unit[rows] == unit]
+            here = self.node_unit[rows] == unit
             pieces.append(
-                (here, self.unit_table("nodes", unit).take(pa.array(self.node_local[here])))
+                (
+                    position[here],
+                    self.unit_table("nodes", unit).take(
+                        pa.array(self.node_local[rows[here]])
+                    ),
+                )
             )
         if not pieces:
             return self.unit_table("nodes", 0).slice(0, 0)
-        order = np.argsort(np.concatenate([h for h, _ in pieces]), kind="stable")
+        # Back to the order asked for — by position in ``rows``, never by the
+        # row numbers themselves: a rebuilt survivor's group is [survivor,
+        # absorbed...], and an absorbed node of a lower row must not take
+        # the survivor's place at the head of it.
+        order = np.argsort(np.concatenate([p for p, _ in pieces]), kind="stable")
         table = pa.concat_tables([t for _, t in pieces])
         return table.take(pa.array(order))
 
@@ -441,16 +451,37 @@ def _library_warnings(rd: Path) -> list[str]:
     return out
 
 
-def _same(a, b) -> bool:
-    """Equality for values read back from Parquet: NaN equals NaN."""
+#: Relative tolerance for a floating-point value a replay recomputes. Nodes,
+#: membership, counts and strings are compared exactly; a p-value or φ
+#: computed on another machine or library build can differ in its last bits
+#: (on the Nov2026 run, OSC against the workstation: 4.6e-13 relative) with no
+#: decision differing — and a decision that differed would show in the nodes
+#: or the membership, which are exact.
+FLOAT_RTOL = 1e-9
+
+
+def _same(a, b, drift: list[float]) -> bool:
+    """Equality for values read back from Parquet: NaN equals NaN, and floats
+    within :data:`FLOAT_RTOL` (the largest relative difference accepted is
+    kept in ``drift[0]``)."""
     if isinstance(a, float) and isinstance(b, float):
-        return a == b or (math.isnan(a) and math.isnan(b))
+        if a == b or (math.isnan(a) and math.isnan(b)):
+            return True
+        if not (math.isfinite(a) and math.isfinite(b)):
+            return False
+        rel = abs(a - b) / max(abs(a), abs(b))
+        if rel <= FLOAT_RTOL or abs(a - b) <= 1e-300:
+            drift[0] = max(drift[0], rel)
+            return True
+        return False
     if isinstance(a, list) and isinstance(b, list):
-        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+        return len(a) == len(b) and all(_same(x, y, drift) for x, y in zip(a, b))
     return a == b
 
 
-def _rows_differ(stored: pa.Table, mine: pa.Table, sort: list[str]) -> str | None:
+def _rows_differ(
+    stored: pa.Table, mine: pa.Table, sort: list[str], drift: list[float]
+) -> str | None:
     """Why two tables of one template's rows differ, or None."""
     if stored.num_rows != mine.num_rows:
         return f"{mine.num_rows} rows replayed, {stored.num_rows} stored"
@@ -459,7 +490,7 @@ def _rows_differ(stored: pa.Table, mine: pa.Table, sort: list[str]) -> str | Non
     m_rows = mine.sort_by(keys).to_pylist() if mine.num_rows else []
     for s_row, m_row in zip(s_rows, m_rows):
         for name, value in s_row.items():
-            if name in m_row and not _same(value, m_row[name]):
+            if name in m_row and not _same(value, m_row[name], drift):
                 return f"{name} differs"
     return None
 
@@ -473,11 +504,14 @@ def _verify_template(index: RoundIndex, rep: TemplateReplay) -> list[str]:
     )
 
     out: list[str] = []
+    drift = [0.0]
     tid = rep.template_id
     rows = index.node_rows_of(tid)
     stored = index.nodes_at(rows)
     mine = _rows_to_nodes(rep.result.node_rows)
-    why = _rows_differ(stored.select(mine.column_names), mine, ["haplotype_id"])
+    why = _rows_differ(
+        stored.select(mine.column_names), mine, ["haplotype_id"], drift
+    )
     if why:
         out.append(f"nodes: {why}")
     units = np.unique(index.node_unit[rows]).tolist() if rows.size else []
@@ -522,9 +556,14 @@ def _verify_template(index: RoundIndex, rep: TemplateReplay) -> list[str]:
         if table is None or key not in evidence:
             continue
         stored_ev = table.filter(pc.equal(table.column("template_id"), tid))
-        why = _rows_differ(stored_ev, evidence[key], sort)
+        why = _rows_differ(stored_ev, evidence[key], sort, drift)
         if why:
             out.append(f"{key}: {why}")
+    if drift[0] > 0:
+        rep.warnings.append(
+            f"floating-point values agree to {drift[0]:.1e} relative, not bit "
+            "for bit (another machine or library build)"
+        )
     return out
 
 

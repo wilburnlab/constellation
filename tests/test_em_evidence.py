@@ -1112,6 +1112,58 @@ def test_verification_covers_the_compact_evidence(runs, tmp_path, split_template
     assert any(m.startswith("columns: minor_frac") for m in rep.mismatch)
 
 
+def test_round_index_returns_nodes_in_the_order_asked(runs):
+    """A rebuilt survivor's group is [survivor, absorbed...] and its head is
+    read as the survivor; returning the rows sorted put an absorbed node of
+    a lower row there (every rebuilt cluster of the Nov2026 run whose
+    survivor out-rowed what it absorbed failed to verify)."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.replay import (
+        index_round,
+    )
+
+    index = index_round(runs[1] / "rounds" / "r01")
+    n = index.node_parent.size
+    assert n >= 3
+    asked = np.array([n - 1, 0, n // 2], dtype=np.int64)
+    got = index.nodes_at(asked)
+    assert got.column("parent_template_id").to_pylist() == index.node_parent[
+        asked
+    ].tolist()
+    assert got.column("haplotype_id").to_pylist() == index.node_hap[asked].tolist()
+
+
+def test_verification_accepts_floats_from_another_machine(
+    runs, tmp_path, split_template_id
+):
+    """A p-value recomputed on another machine or library build can differ in
+    its last bits with no decision differing (OSC against the workstation on
+    the Nov2026 run: 4.6e-13 relative). That verifies, and says so."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+    from constellation.sequencing.transcriptome.cluster.denovo.em.replay import (
+        index_round,
+    )
+
+    out = tmp_path / "copy"
+    shutil.copytree(runs[1], out)
+    rd = out / "rounds" / "r01"
+    index = index_round(rd)
+    unit = int(index.node_unit[index.node_rows_of(split_template_id)[0]])
+    path = index.shards["columns"][unit]
+    table = pq.read_table(path)
+    mine = pa.compute.equal(table.column("template_id"), split_template_id)
+    p = table.column("p_value").to_numpy(zero_copy_only=False).copy()
+    rows = np.flatnonzero(mine.to_numpy(zero_copy_only=False) & (p > 0))
+    assert rows.size
+    p[rows] *= 1 + 5e-13
+    pq.write_table(
+        table.set_column(table.schema.get_field_index("p_value"), "p_value", pa.array(p)),
+        path,
+    )
+    rep = R.replay_template(out, 1, split_template_id)
+    assert rep.verified, rep.mismatch
+    assert any("not bit for bit" in w for w in rep.warnings)
+
+
 def test_replay_reads_one_unit_not_the_round(runs, monkeypatch):
     """(c) A replay reads the shards of the unit that refined its template,
     never the round's whole node or membership table, and indexes a round
