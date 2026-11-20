@@ -659,9 +659,25 @@ def merge_nodes(
         origin=origin,
         prefer=prefer,
     )
+    out, membership, n_absorbed = apply_survivors(nodes, node_membership, survivor)
+    return out, membership, n_absorbed, survivor
+
+
+def apply_survivors(
+    nodes: pa.Table, node_membership: pa.Table | None, survivor: np.ndarray
+) -> tuple[pa.Table, pa.Table | None, int]:
+    """Collapse ``nodes`` onto ``survivor`` (each input row's surviving row;
+    its own for a node that survives): absorbed rows dropped, their counts
+    summed into the survivor's, their membership re-keyed to it. Returns
+    ``(nodes, membership, n_absorbed)``. :func:`merge_nodes` chooses the
+    survivors; the final stage applies a corrected choice through this too.
+    """
+    survivor = np.asarray(survivor, dtype=np.int64)
+    n = nodes.num_rows
+    unmerged = np.arange(n, dtype=np.int64)
     absorbed = survivor != unmerged
     if not absorbed.any():
-        return nodes, node_membership, 0, unmerged
+        return nodes, node_membership, 0
 
     pid = nodes.column("parent_template_id").to_numpy(zero_copy_only=False)
     hap = nodes.column("haplotype_id").to_numpy(zero_copy_only=False)
@@ -705,7 +721,7 @@ def merge_nodes(
     out = out.cast(nodes.schema)
     if membership is not None and membership.num_rows:
         membership = membership.cast(node_membership.schema)
-    return out, membership, int(absorbed.sum()), survivor
+    return out, membership, int(absorbed.sum())
 
 
 __all__ = [
@@ -714,6 +730,7 @@ __all__ = [
     "Prefer",
     "RefineResult",
     "apply_merge",
+    "apply_survivors",
     "claim_order",
     "measure_churn",
     "merge_nodes",

@@ -488,3 +488,41 @@ def test_removing_the_floor_is_monotone():
     short = "GGCACT" + "ATG" + "GCT" * 4 + "TAA" + "CCTAGG"
     assert best_sense_orf(short, min_aa_length=60) is None
     assert best_sense_orf(short, min_aa_length=1) is not None
+
+
+def test_a_node_s_ends_are_its_reads_median_ends() -> None:
+    """2026-11-20: a node keeps from its reads' median start to their median
+    end. Four full-length reads among six starting 25 nt in (or ending 20
+    nt early) made the union node as long as the four; the median node is
+    the extent most of its reads share."""
+    import random
+
+    from constellation.sequencing.transcriptome.cluster.denovo.consensus import MemberSpec
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep import pooled_node
+
+    rng = random.Random(5)
+    frame = "".join(rng.choice("ACGT") for _ in range(400))
+    full = [MemberSpec(frame, 1.0, "400=", False, 0, 0, i) for i in range(4)]
+    late = [MemberSpec(frame[25:], 1.0, "375=", False, 25, 0, 4 + i) for i in range(6)]
+    early = [MemberSpec(frame[:380], 1.0, "380=", False, 0, 0, 4 + i) for i in range(6)]
+    assert pooled_node(frame, full + late, node_extent="union").consensus == frame
+    median = pooled_node(frame, full + late, node_extent="median")
+    assert median.consensus == frame[25:] and median.n_trimmed_5p == 25
+    assert pooled_node(frame, full + early, node_extent="union").consensus == frame
+    assert pooled_node(frame, full + early, node_extent="median").consensus == frame[:380]
+    # A majority of full-length reads keeps the full extent either way.
+    assert pooled_node(frame, full + late[:3], node_extent="median").consensus == frame
+    with pytest.raises(ValueError):
+        pooled_node(frame, full, node_extent="longest")
+
+
+def test_a_run_recorded_before_node_extent_replays_as_union() -> None:
+    import dataclasses
+
+    from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import MStepParams
+    from constellation.sequencing.transcriptome.cluster.denovo.em.replay import _mstep_params
+
+    old = {k: v for k, v in dataclasses.asdict(MStepParams()).items() if k != "node_extent"}
+    assert _mstep_params(old, MStepParams).node_extent == "union"
+    assert MStepParams().node_extent == "median"
+    assert _mstep_params(dataclasses.asdict(MStepParams()), MStepParams).node_extent == "median"

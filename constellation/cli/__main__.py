@@ -1425,6 +1425,21 @@ def _build_transcriptome_parser(subs) -> None:
         "somewhere. This is the pipeline's only absolute quality gate.",
     )
     p_cluster.add_argument(
+        "--end-tolerance",
+        type=_end_tolerance_arg,
+        default=None,
+        metavar="NT|none",
+        help="em: how far (nt) each end of a read may lie from its template's "
+        "for the read to join it (default 30). The EM removes sequencing "
+        "error only: a shorter or longer molecule (template-switching "
+        "artefact, another start or cleavage site, degradation) is a "
+        "relation between templates, answered after clustering by the "
+        "graph's `contained` edges. Also bounds --mode em-kmer's seed "
+        "overhangs (unless given), the final rebuild and the graph's "
+        "`equivalent` relation. 'none' turns the rule off (node ends still "
+        "follow their reads' medians, MStepParams.node_extent).",
+    )
+    p_cluster.add_argument(
         "--minimap2-n",
         type=int,
         default=500,
@@ -3822,6 +3837,11 @@ def _reject_inapplicable(args, mode: str, seeding: str) -> str | None:
             "nothing — only the --mode em-* E-step admits on a floor",
         ),
         (
+            "--end-tolerance",
+            getattr(args, "end_tolerance", None) is not None and not em,
+            "nothing — only the --mode em-* loop matches extents",
+        ),
+        (
             "--mstep-evidence",
             getattr(args, "mstep_evidence", None) is not None and not em,
             "nothing — only the --mode em-* M-step keeps evidence",
@@ -4017,6 +4037,24 @@ def _cmd_transcriptome_cluster_em(
     return 0
 
 
+def _end_tolerance_arg(text: str) -> int | str:
+    """``--end-tolerance``: a count of nucleotides, or ``none``."""
+    if text.strip().lower() == "none":
+        return "none"
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("--end-tolerance must be >= 0 or 'none'")
+    return value
+
+
+def _end_tolerance_kwargs(args) -> dict:
+    """``end_tolerance`` for EmParams: absent keeps its default."""
+    value = getattr(args, "end_tolerance", None)
+    if value is None:
+        return {}
+    return {"end_tolerance": None if value == "none" else int(value)}
+
+
 def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
     """`EmParams` from the parsed flags, every `None` resolved for this mode.
 
@@ -4027,8 +4065,6 @@ def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
         DEFAULT_MAX_CLUSTER_READ_FRAC,
         DEFAULT_MIN_CHAIN_CLUSTER_READS,
         DEFAULT_SEED_IDENTITY,
-        DEFAULT_SEED_MAX_3P,
-        DEFAULT_SEED_MAX_5P,
     )
 
     return EmParams(
@@ -4036,6 +4072,7 @@ def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
         rounds=int(args.rounds),
         stop_frac_changed=float(args.stop_frac_changed),
         p_floor=float(args.p_floor),
+        **_end_tolerance_kwargs(args),
         minimap2_n=int(args.minimap2_n),
         index_batch_size=str(args.index_batch_size),
         estep_aligner=str(args.estep_aligner),
@@ -4123,15 +4160,12 @@ def _em_params(args, seeding, EmParams, GraphParams, MStepParams):  # noqa: N803
         seed_identity=(
             DEFAULT_SEED_IDENTITY if args.identity is None else float(args.identity)
         ),
+        # Unset: the end tolerance (EmParams resolves it).
         seed_max_5p_overhang=(
-            DEFAULT_SEED_MAX_5P
-            if args.max_5p_overhang is None
-            else int(args.max_5p_overhang)
+            None if args.max_5p_overhang is None else int(args.max_5p_overhang)
         ),
         seed_max_3p_overhang=(
-            DEFAULT_SEED_MAX_3P
-            if args.max_3p_overhang is None
-            else int(args.max_3p_overhang)
+            None if args.max_3p_overhang is None else int(args.max_3p_overhang)
         ),
         seed_grouping=str(args.seed_grouping),
         min_shared=int(args.min_shared),

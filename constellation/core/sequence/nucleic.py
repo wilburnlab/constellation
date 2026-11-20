@@ -24,11 +24,13 @@ and termination).
 
 from __future__ import annotations
 
+import functools
 import json
 from dataclasses import dataclass
 from importlib import resources
 from typing import Literal
 
+import numpy as np
 import regex
 import torch
 
@@ -211,6 +213,53 @@ STANDARD: CodonTable = CODON_TABLES[1]
 # ──────────────────────────────────────────────────────────────────────
 
 
+#: ``str.translate`` table deleting canonical bases: what is left of a
+#: sequence is its non-canonical characters.
+_DELETE_ACGT = {ord(b): None for b in "ACGT"}
+#: Code point -> base code (A 0, C 1, G 2, T 3; anything else 4), for code
+#: points below 128.
+_BASE_CODE = np.full(128, 4, dtype=np.int16)
+for _i, _b in enumerate("ACGT"):
+    _BASE_CODE[ord(_b)] = _i
+del _i, _b
+_CANONICAL_CODONS = [a + b + c for a in "ACGT" for b in "ACGT" for c in "ACGT"]
+#: Per codon table: its 64 residues as bytes, indexed 16a + 4b + c. Keyed by
+#: ``id`` and holding the table, so an id is never reused while cached.
+_RESIDUE_BYTES: dict[int, tuple["CodonTable", np.ndarray]] = {}
+
+
+#: Byte -> base code, for ASCII text.
+_BASE_CODE_BYTE = np.full(256, 4, dtype=np.int16)
+_BASE_CODE_BYTE[:128] = _BASE_CODE
+
+
+def _base_codes(s: str) -> np.ndarray:
+    """Each character of ``s`` as a base code (A 0, C 1, G 2, T 3, other 4)."""
+    if s.isascii():
+        return _BASE_CODE_BYTE[np.frombuffer(s.encode("ascii"), dtype=np.uint8)]
+    cp = np.frombuffer(s.encode("utf-32-le"), dtype="<u4")
+    return np.where(cp < 128, _BASE_CODE[np.minimum(cp, 127)], 4).astype(np.int16)
+
+
+def _residue_bytes(codon_table: "CodonTable") -> np.ndarray:
+    got = _RESIDUE_BYTES.get(id(codon_table))
+    if got is None or got[0] is not codon_table:
+        lut = np.frombuffer(
+            "".join(codon_table.forward.get(c, "X") for c in _CANONICAL_CODONS).encode("ascii"),
+            dtype=np.uint8,
+        ).copy()
+        got = _RESIDUE_BYTES[id(codon_table)] = (codon_table, lut)
+    return got[1]
+
+
+def _translate_canonical(s: str, codon_table: "CodonTable") -> str:
+    """``s`` (canonical bases only, a whole number of codons) translated."""
+    codes = np.frombuffer(s.encode("ascii"), dtype=np.uint8)
+    b = _BASE_CODE[codes].reshape(-1, 3)
+    idx = b[:, 0] * 16 + b[:, 1] * 4 + b[:, 2]
+    return _residue_bytes(codon_table)[idx].tobytes().decode("ascii")
+
+
 @degenerate_ok
 def translate(
     seq: str,
@@ -255,6 +304,19 @@ def translate(
             s = s + "N" * (3 - rem)
         else:  # discard
             s = s[: len(s) - rem]
+
+    if s and not s.translate(_DELETE_ACGT):
+        # Every base canonical: one table lookup per codon, in arrays.
+        # Exactly what the loop below gives (`expand_degenerate`'s fast
+        # path is `forward.get(codon, "X")`).
+        prot = _translate_canonical(s, codon_table)
+        if treat_first_codon_as_start and s[:3] in codon_table.starts:
+            prot = "M" + prot[1:]
+        if to_stop:
+            stop = prot.find("*")
+            if stop >= 0:
+                prot = prot[:stop]
+        return prot
 
     out: list[str] = []
     n = len(s)
@@ -402,6 +464,95 @@ def best_orf(
     return max(orfs, key=lambda o: o.length)
 
 
+#: A codon's class in :func:`longest_orf`: inside an ORF, a start, a stop,
+#: or a codon holding a non-canonical base (code 64).
+_CODON_INNER, _CODON_START, _CODON_STOP, _CODON_BAD = 0, 1, 2, 3
+
+
+@functools.lru_cache(maxsize=32)
+def _codon_classes(starts: frozenset[str], stops: frozenset[str]) -> np.ndarray:
+    """Codon code (16a + 4b + c; 64 for a non-canonical codon) -> class."""
+    lut = np.full(65, _CODON_INNER, dtype=np.uint8)
+    lut[64] = _CODON_BAD
+    for codons, cls in ((starts, _CODON_START), (stops, _CODON_STOP)):
+        for c in codons:
+            c = c.upper().replace("U", "T")
+            if len(c) == 3 and all(b in "ACGT" for b in c):
+                lut["ACGT".index(c[0]) * 16 + "ACGT".index(c[1]) * 4 + "ACGT".index(c[2])] = cls
+    return lut
+
+
+def longest_orf(
+    seq: str,
+    *,
+    codon_table: CodonTable = STANDARD,
+    min_aa_length: int = 30,
+) -> Orf | None:
+    """The longest forward-strand ORF of at least ``min_aa_length``
+    residues, or None: a start codon of ``codon_table``, then codons of
+    canonical bases up to the first in-frame stop, the stop included.
+
+    Ties go to the earliest start. Exactly what enumerating
+    :func:`find_orfs`' matches, dropping those with an internal stop and
+    keeping the longest per stop would give, in one pass over the codons:
+    a start is an ORF's iff the first in-frame codon after it that is a
+    stop or holds a non-canonical base is a stop at least
+    ``min_aa_length`` codons on, and of the starts sharing a stop the
+    earliest is the longest. ``seq`` is read upper-cased with U as T.
+    """
+    s = seq.upper().replace("U", "T")
+    n = len(s)
+    if n < 3 * (min_aa_length + 1):
+        return None
+    codes = _base_codes(s)
+    # The codon starting at every position, classified once; a frame is
+    # every third of them.
+    bad = codes >= 4
+    cod = codes[:-2] * 16 + codes[1:-1] * 4 + codes[2:]
+    cod[bad[:-2] | bad[1:-1] | bad[2:]] = 64
+    cls = _codon_classes(codon_table.starts, codon_table.stops)[cod]
+    best: tuple[int, int, int] | None = None  # (length, start, end)
+    for frame in range(3):
+        k = cls[frame::3]
+        if k.size <= min_aa_length:
+            continue
+        barrier = np.flatnonzero(k >= _CODON_STOP)
+        starts = np.flatnonzero(k == _CODON_START)
+        if starts.size == 0 or barrier.size == 0:
+            continue
+        at = np.searchsorted(barrier, starts, side="right")
+        has = at < barrier.size
+        i = starts[has]
+        j = barrier[at[has]]
+        ok = (k[j] == _CODON_STOP) & (j - i >= min_aa_length)
+        i, j = i[ok], j[ok]
+        if i.size == 0:
+            continue
+        # Starts are ascending, so the first start of each stop is its
+        # earliest; the longest of those is the frame's best, earliest first.
+        first = np.ones(i.size, dtype=bool)
+        first[1:] = j[1:] != j[:-1]
+        i, j = i[first], j[first]
+        lengths = j - i
+        w = int(np.argmax(lengths))  # the first maximum: the earliest start
+        cand = (int(lengths[w]), frame + 3 * int(i[w]), frame + 3 * int(j[w]) + 3)
+        if best is None or cand[0] > best[0] or (cand[0] == best[0] and cand[1] < best[1]):
+            best = cand
+    if best is None:
+        return None
+    length, start, end = best
+    nt = s[start:end]
+    return Orf(
+        nucleotide=nt,
+        protein=translate(nt[:-3], codon_table=codon_table, partial="discard"),
+        start=start,
+        end=end,
+        strand="+",
+        length=length,
+        transl_table=codon_table.transl_table,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # GC content
 # ──────────────────────────────────────────────────────────────────────
@@ -477,5 +628,6 @@ __all__ = [
     "Orf",
     "find_orfs",
     "best_orf",
+    "longest_orf",
     "gc_content",
 ]

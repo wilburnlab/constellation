@@ -182,6 +182,69 @@ def placed_enough(
     return placed >= need
 
 
+#: How far, in nt, each end of a read may lie from its template's end (PI,
+#: 2026-11-20). The EM's only task is removing sequencing error: a template
+#: is a representative transcript, and a read joins it only when the two
+#: have the same extent. A shorter or longer molecule — library preparation
+#: (the template-switching oligo priming inside a transcript), biology
+#: (another start or cleavage site) or degradation, which the read alone
+#: cannot tell apart — is a relation between templates, answered after
+#: clustering by the graph's `contained` edges. One value for both ends and
+#: for every stage that asks (seeding, the E-step, the final rebuild, the
+#: graph's `equivalent` relation).
+DEFAULT_END_TOLERANCE = 30
+
+
+def extent_ok(q_start, q_end, q_len, t_start, t_end, t_len, *, tolerance):
+    """Whether an alignment says read and template have the same extent:
+    at each end, neither the read's unaligned overhang nor the template's
+    uncovered stretch exceeds ``tolerance``. Symmetric — a read longer than
+    its template is as different a molecule as a shorter one. Scalars or
+    arrays; ``tolerance=None`` admits everything."""
+    q_start = np.asarray(q_start)
+    if tolerance is None:
+        return np.ones(q_start.shape, dtype=bool)
+    tol = int(tolerance)
+    return (
+        (q_start <= tol)
+        & (np.asarray(q_len) - np.asarray(q_end) <= tol)
+        & (np.asarray(t_start) <= tol)
+        & (np.asarray(t_len) - np.asarray(t_end) <= tol)
+    )
+
+
+#: An approximate placement is given this much room past the tolerance
+#: before a candidate is set aside unaligned: a chain's ends and the native
+#: join's median diagonal drift with the indels between them.
+EXTENT_SLACK_MIN = 32
+EXTENT_SLACK_FRAC = 0.05
+
+
+def extent_plausible(q_start, q_end, q_len, t_start, t_end, t_len, *, tolerance):
+    """Before aligning: whether an approximate placement (a chain, or the
+    native join's diagonal) could still end within ``tolerance`` at both
+    ends. Its 5' offset is ``|t_start - q_start|`` and its 3' offset the
+    difference of the two unplaced tails; each may exceed ``tolerance`` by
+    ``max(EXTENT_SLACK_MIN, EXTENT_SLACK_FRAC × shorter length)``. A
+    candidate that fails cannot be admitted, so dropping it before the
+    shortlist only keeps a family of longer templates from crowding out the
+    one that matches. ``tolerance=None`` keeps everything."""
+    q_start = np.asarray(q_start, dtype=np.int64)
+    if tolerance is None:
+        return np.ones(q_start.shape, dtype=bool)
+    q_len = np.asarray(q_len, dtype=np.int64)
+    t_len = np.asarray(t_len, dtype=np.int64)
+    off5 = np.abs(np.asarray(t_start, dtype=np.int64) - q_start)
+    off3 = np.abs(
+        (t_len - np.asarray(t_end, dtype=np.int64))
+        - (q_len - np.asarray(q_end, dtype=np.int64))
+    )
+    room = int(tolerance) + np.maximum(
+        EXTENT_SLACK_MIN, (EXTENT_SLACK_FRAC * np.minimum(q_len, t_len)).astype(np.int64)
+    )
+    return (off5 <= room) & (off3 <= room)
+
+
 def _length_key(template_len: np.ndarray, read_len: np.ndarray) -> np.ndarray:
     """``|log(template_len / read_len)|`` — smaller is a better length match.
 
@@ -347,8 +410,13 @@ def shortlist_by_chain(
     k: int,
     frac: float,
     support: np.ndarray | None = None,
+    allowed: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The two-pass E-step's shortlist: which hits get base-aligned at all.
+
+    ``allowed`` (one bool per hit) takes hits out before anything else: they
+    neither set their read's best score nor take a place (the extent
+    pre-filter, :func:`extent_plausible`).
 
     Keeps a hit iff its chaining score is ≥ ``frac`` × its read's best **and**
     it is among the read's top ``k`` by chaining score, ties broken by
@@ -383,8 +451,13 @@ def shortlist_by_chain(
             np.zeros(max(n_groups, 0), np.int64),
         )
     grp, sizes = _group_of_hit(group_ptr)
+    if allowed is not None:
+        allowed = np.asarray(allowed, dtype=bool)
+        s1 = np.where(allowed, s1, -np.inf)
     best = np.maximum.reduceat(s1, group_ptr[:-1])
     eligible = s1 >= float(frac) * np.repeat(best, sizes)
+    if allowed is not None:
+        eligible &= allowed
     support_h = (
         np.zeros(s1.size, dtype=np.float64)
         if support is None
@@ -405,6 +478,9 @@ __all__ = [
     "admit_candidates",
     "floor_per_read",
     "placed_enough",
+    "DEFAULT_END_TOLERANCE",
+    "extent_ok",
+    "extent_plausible",
     "rank_likelihood",
     "rank_round1",
     "rank_round1_identity",

@@ -24,7 +24,7 @@ from typing import Iterable
 
 import pyarrow as pa
 
-from constellation.core.sequence.nucleic import STANDARD, CodonTable, find_orfs
+from constellation.core.sequence.nucleic import STANDARD, CodonTable, longest_orf
 from constellation.sequencing.transcriptome.demux.classify import ReadStatus
 from constellation.sequencing.transcriptome.demux.demux import ReadDemuxResult
 
@@ -101,14 +101,12 @@ def predict_orfs(
 
     Returns an ``ORF_TABLE``-shaped Arrow table.
 
-    Note on internal stops. constellation's
-    :func:`core.sequence.nucleic.find_orfs` regex allows in-frame stop
-    codons inside the matched ORF (the lazy ``{30,}?`` quantifier
-    doesn't exclude stops in the bulk). NanoporeAnalysis filters those
-    post-translation by requiring ``protein.count(".") == 1`` (exactly
-    the trailing stop). We replicate that filter here: any ORF whose
-    translated protein contains an internal ``*`` is rejected, and we
-    pick the longest survivor across all candidate ORFs.
+    Note on internal stops. NanoporeAnalysis enumerates every ORF regex
+    match, whose lazy quantifier lets in-frame stops into the bulk, and keeps
+    only those with exactly the trailing stop (``protein.count(".") == 1``),
+    then the longest per stop and the longest overall.
+    :func:`core.sequence.nucleic.longest_orf` gives exactly that ORF in one
+    pass over the codons.
     """
     rows: list[dict[str, object]] = []
     for r in demux_results:
@@ -127,37 +125,17 @@ def predict_orfs(
         transcript = r.chosen_sequence[ts:te]
         if len(transcript) < min_aa_length * 3:
             continue
-        # We must filter internal-stop ORFs BEFORE constellation's
-        # ``longest_per_stop`` grouping, because that grouping picks
-        # the longest ORF per (frame, end) regardless of internal
-        # stops — a long dirty ORF would mask a short clean one
-        # ending at the same stop. So enumerate all candidates first.
-        all_orfs = find_orfs(
-            transcript,
-            codon_table=codon_table,
-            min_aa_length=min_aa_length,
-            both_strands=False,
-            longest_per_stop=False,
+        # The longest ORF without an internal stop, ties to the earliest
+        # start (NanoporeAnalysis parity: protein.count('.') == 1, then the
+        # longest per stop, then the longest overall). One pass over the
+        # codons; until 2026-11-20 this enumerated every `find_orfs` match,
+        # translated each, and filtered — the same answer, much slower
+        # (`tests/test_orf_one_pass.py` keeps that form as the reference).
+        orf = longest_orf(
+            transcript, codon_table=codon_table, min_aa_length=min_aa_length
         )
-        # Filter to ORFs with NO internal stops (NanoporeAnalysis-
-        # parity: protein.count('.') == 1 in their convention; for us
-        # the trailing stop is already stripped via translate's
-        # ``[:-3]``, so a clean ORF has no '*' in its protein).
-        clean_orfs = [o for o in all_orfs if "*" not in o.protein]
-        if not clean_orfs:
+        if orf is None:
             continue
-        # Per-stop longest (replicates NA's
-        # ``longest_orfs[(strand, end)] = max-by-Protein_length``).
-        # When multiple clean ORFs share the same stop position,
-        # earliest-start wins (longest protein).
-        per_stop_best: dict[tuple[str, int], object] = {}
-        for o in clean_orfs:
-            key = (o.strand, o.end)
-            prior = per_stop_best.get(key)
-            if prior is None or o.length > prior.length:  # type: ignore[attr-defined]
-                per_stop_best[key] = o
-        # Overall longest survivor.
-        orf = max(per_stop_best.values(), key=lambda o: o.length)  # type: ignore[arg-type]
         rows.append(
             {
                 "read_id": r.read_id,

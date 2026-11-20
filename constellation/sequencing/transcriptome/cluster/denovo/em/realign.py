@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from itertools import accumulate
 
 from constellation.sequencing.align.pairwise import pairwise_align
 
@@ -218,6 +219,66 @@ def _merge(ops: list[tuple[int, str]]) -> list[tuple[int, str]]:
     return out
 
 
+# ── the steps as `align_finalist` runs them ───────────────────────────
+#
+# `align_finalist` runs once per shortlisted (read, template) pair — tens of
+# millions a round — and a third of its time was Python walking the CIGAR
+# about seven times. The forms below give exactly the results of the list
+# functions above (which stay, as the reference tests/test_em_realign.py
+# compares against) in fewer passes: the pieces are merged only where they
+# meet (edlib's runs are merged already), the score trim takes its prefix
+# and suffix minima from `accumulate`, and the statistics reuse the trim's
+# per-op contributions. (Arrays were measured slower: at ~100 ops a CIGAR,
+# numpy's per-call cost exceeds the loops it replaces.)
+
+
+def _join_runs(*pieces: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Concatenate run lists that are each already merged (adjacent runs
+    differ, none empty), merging only where two pieces meet."""
+    out: list[tuple[int, str]] = []
+    for piece in pieces:
+        if not piece:
+            continue
+        if out and out[-1][1] == piece[0][1]:
+            out[-1] = (out[-1][0] + piece[0][0], piece[0][1])
+            out.extend(piece[1:])
+        else:
+            out.extend(piece)
+    return out
+
+
+def _consumed(ops: list[tuple[int, str]]) -> tuple[int, int]:
+    q = t = 0
+    for n, op in ops:
+        if op != "D":
+            q += n
+        if op != "I":
+            t += n
+    return q, t
+
+
+def _trim_and_score(
+    ops: list[tuple[int, str]],
+) -> tuple[list[tuple[int, str]], int, int, int, int, int]:
+    """:func:`score_trim`, also returning the kept ops' map-ont score."""
+    vals = [
+        _A * n if op == "=" else (-_B * n if op == "X" else -min(_O + n * _E, _O2 + n * _E2))
+        for n, op in ops
+    ]
+    pre = list(accumulate(vals))
+    low = min(pre)
+    cut_f = pre.index(low) + 1 if low < 0 else 0
+    cut_b = len(vals)
+    if cut_f < len(vals):
+        suf = list(accumulate(reversed(vals[cut_f:])))
+        low = min(suf)
+        if low < 0:
+            cut_b = len(vals) - 1 - suf.index(low)
+    qf, tf = _consumed(ops[:cut_f])
+    qb, tb = _consumed(ops[cut_b:])
+    return ops[cut_f:cut_b], qf, tf, qb, tb, sum(vals[cut_f:cut_b])
+
+
 def align_finalist(
     read: str,
     template: str,
@@ -267,13 +328,19 @@ def align_finalist(
 
     left, lq, lt = _extend(read[:qa][::-1], template[:ta][::-1])
     right, rq, rt = _extend(read[qb:], template[tb:])
-    ops = _merge([*reversed(left), *core, *right])
-    ops, fq, ft, bq, bt = score_trim(ops)
+    ops = _join_runs(left[::-1], core, right)
     if not ops:
         return None
-    n_match, aln_len, score = cigar_stats(ops)
+    ops, fq, ft, bq, bt, score = _trim_and_score(ops)
+    if not ops:
+        return None
+    n_match = aln_len = 0
+    for n, op in ops:
+        aln_len += n
+        if op == "=":
+            n_match += n
     return Finalist(
-        cigar="".join(f"{n}{op}" for n, op in ops),
+        cigar="".join([f"{n}{op}" for n, op in ops]),
         q_start=qa - lq + fq,
         q_end=qb + rq - bq,
         t_start=ta - lt + ft,

@@ -155,3 +155,77 @@ def test_anchor_trim_and_score_trim():
         (1, "X"),
         (40, "="),
     ]
+
+
+def _align_finalist_reference(read, template, *, q_start, q_end, t_start, t_end,
+                              pad=20, k_anchor=5):
+    """`align_finalist` as it was before 2026-11-20: the list functions,
+    composed in full (merge everywhere, score trim, then statistics)."""
+    from constellation.sequencing.align.pairwise import pairwise_align
+    from constellation.sequencing.transcriptome.cluster.denovo.em import realign as R
+
+    q_len, t_len = len(read), len(template)
+    if q_len == 0 or t_len == 0:
+        return None
+    lo = max(0, (q_start - t_start) - pad)
+    hi = min(q_len, (q_end + (t_len - t_end)) + pad)
+    if hi <= lo:
+        return None
+    res = pairwise_align(read[lo:hi], template, mode="infix", return_cigar=True)
+    core, q_front, t_front, q_back, t_back = R.anchor_trim(R._parse(res.cigar), k_anchor=k_anchor)
+    if not core:
+        return None
+    qa, ta = lo + q_front, res.ref_start + t_front
+    qb, tb = hi - q_back, res.ref_end - t_back
+    left, lq, lt = R._extend(read[:qa][::-1], template[:ta][::-1])
+    right, rq, rt = R._extend(read[qb:], template[tb:])
+    ops = R._merge([*reversed(left), *core, *right])
+    ops, fq, ft, bq, bt = R.score_trim(ops)
+    if not ops:
+        return None
+    n_match, aln_len, score = R.cigar_stats(ops)
+    return R.Finalist(
+        cigar="".join(f"{n}{op}" for n, op in ops),
+        q_start=qa - lq + fq, q_end=qb + rq - bq,
+        t_start=ta - lt + ft, t_end=tb + rt - bt,
+        n_match=n_match, aln_len=aln_len, score=score,
+    )
+
+
+def test_align_finalist_is_its_list_form() -> None:
+    """The fewer-pass `align_finalist` gives exactly the composed list
+    functions' result: contained, overhanging and junk-ended reads, gappy
+    chains, unrelated pairs."""
+    rng = random.Random(20261120)
+
+    def mutate(s: str, rate: float) -> str:
+        out = []
+        for b in s:
+            r = rng.random()
+            if r < rate / 3:
+                continue
+            if r < 2 * rate / 3:
+                out.append(b + rng.choice("ACGT"))
+            elif r < rate:
+                out.append(rng.choice([c for c in "ACGT" if c != b]))
+            else:
+                out.append(b)
+        return "".join(out)
+
+    n_aligned = 0
+    for k in range(1500):
+        t = _rand(rng.randint(60, 2500), rng)
+        lo = rng.randint(0, max(0, len(t) // 3))
+        hi = len(t) - rng.randint(0, max(0, len(t) // 3))
+        body = mutate(t[lo:hi], rng.choice([0.0, 0.01, 0.03, 0.08]))
+        junk5 = _rand(rng.choice([0, 0, 5, 40]), rng)
+        junk3 = _rand(rng.choice([0, 0, 5, 40]), rng)
+        read = junk5 + body if k % 7 else _rand(rng.randint(50, 800), rng)
+        read = read + junk3
+        kw = dict(q_start=len(junk5), q_end=len(read) - len(junk3),
+                  t_start=lo, t_end=hi, pad=rng.choice([0, 20, 60]),
+                  k_anchor=rng.choice([3, 5, 11]))
+        want = _align_finalist_reference(read, t, **kw)
+        assert align_finalist(read, t, **kw) == want, (k, kw)
+        n_aligned += want is not None
+    assert n_aligned > 1000

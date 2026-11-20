@@ -448,11 +448,19 @@ def iter_hit_blocks(
 
     Re-decoding cost is at most one read's hits per block boundary.
     """
-    tail = b""
+    # Pipe chunks are gathered in a list and joined once a block's worth has
+    # arrived: `tail = tail + raw` copied the whole growing tail on every
+    # chunk, quadratic up to the 128 MB block (review #15). The tail seen at
+    # each cut is the same bytes, so the blocks are too.
+    parts: list[bytes] = []
+    size = 0
     for raw in chunks:
-        tail = tail + raw if tail else raw
-        if len(tail) < block_bytes:
+        parts.append(raw)
+        size += len(raw)
+        if size < block_bytes:
             continue
+        tail = parts[0] if len(parts) == 1 else b"".join(parts)
+        parts = [tail]
         cut = tail.rfind(b"\n") + 1
         if cut == 0:
             continue
@@ -464,6 +472,8 @@ def iter_hit_blocks(
         if keep is not None:
             yield keep
         tail = block[carry_from:] + rest
+        parts, size = ([tail] if tail else []), len(tail)
+    tail = b"".join(parts)
     if tail:
         cut = tail.rfind(b"\n") + 1
         if cut:
@@ -483,11 +493,15 @@ def iter_group_blocks(
     scan them itself. The cut is found on raw ``q_name`` bytes of the last
     few lines, so it is independent of which hits a scan would drop.
     """
-    tail = b""
+    parts: list[bytes] = []  # see iter_hit_blocks
+    size = 0
     for raw in chunks:
-        tail = tail + raw if tail else raw
-        if len(tail) < block_bytes:
+        parts.append(raw)
+        size += len(raw)
+        if size < block_bytes:
             continue
+        tail = parts[0] if len(parts) == 1 else b"".join(parts)
+        parts = [tail]
         cut = tail.rfind(b"\n") + 1
         if cut == 0:
             continue
@@ -496,6 +510,8 @@ def iter_group_blocks(
             continue  # one read's hits fill the block; wait for more bytes
         yield tail[:group_start]
         tail = tail[group_start:]
+        parts, size = ([tail] if tail else []), len(tail)
+    tail = b"".join(parts)
     if tail:
         cut = tail.rfind(b"\n") + 1
         if cut:

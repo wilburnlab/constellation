@@ -715,6 +715,40 @@ def dense_states(states: ReadStates, columns: np.ndarray) -> np.ndarray:
     ``UNOBSERVED``."""
     cols = np.asarray(columns, dtype=np.int64)
     s = cols.shape[0]
+    x = np.full((states.n_members, s), MAJOR, dtype=np.int8)
+    covered = (cols[None, :] >= states.obs_lo[:, None]) & (
+        cols[None, :] < states.obs_hi[:, None]
+    )
+    x[~covered & ~states.is_coverage[cols][None, :]] = UNOBSERVED
+    v = np.asarray(states.v, dtype=np.int64)
+    if v.shape[0] == 0 or s == 0:
+        return x
+    owner = np.repeat(
+        np.arange(states.n_members, dtype=np.int64), np.diff(np.asarray(states.ptr))
+    )
+    # Column of each entry: a repeated column value maps to its LAST index,
+    # as a dict built over the columns in order does.
+    order = np.argsort(cols, kind="stable")
+    sc = cols[order]
+    at = np.searchsorted(sc, v, side="right") - 1
+    hit = at >= 0
+    hit[hit] = sc[at[hit]] == v[hit]
+    i, j = owner[hit], order[at[hit]]
+    st = np.asarray(states.state)[hit]
+    # Entries are written in order, so a repeated (member, column) keeps its
+    # last; numpy does not promise an order for repeated fancy assignment.
+    key = i * s + j
+    _, last = np.unique(key[::-1], return_index=True)
+    keep = key.shape[0] - 1 - last
+    x[i[keep], j[keep]] = st[keep]
+    return x
+
+
+def _dense_states_loop(states: ReadStates, columns: np.ndarray) -> np.ndarray:
+    """:func:`dense_states` as it was written first, entry by entry: the
+    reference its vectorized form is tested against."""
+    cols = np.asarray(columns, dtype=np.int64)
+    s = cols.shape[0]
     pos = {int(c): j for j, c in enumerate(cols)}
     x = np.full((states.n_members, s), MAJOR, dtype=np.int8)
     covered = (cols[None, :] >= states.obs_lo[:, None]) & (
@@ -878,7 +912,37 @@ def resolve_signature(
 
 
 def _reestimate(x, observed, labels, w, patterns):
-    """Weighted per-column majority over each pattern's own members."""
+    """Weighted per-column majority over each pattern's own members.
+
+    One weighted ``bincount`` over (pattern, column, state) for every
+    pattern and column at once. Each bin's weights are summed in row order,
+    as the per-(pattern, column) loop summed them (`_reestimate_loop`, the
+    reference), so the votes and their argmax are bit for bit the same.
+    """
+    out = patterns.copy()
+    n_states = int(max(int(x.max()) + 1, UNCOVERED + 1))
+    n_pat, n_col = patterns.shape
+    if n_pat == 0 or n_col == 0:
+        return out
+    lab = np.asarray(labels, dtype=np.int64)
+    ok = observed & ((lab >= 0) & (lab < n_pat))[:, None]
+    r, c = np.nonzero(ok)  # row-major: each bin's entries in row order
+    if r.shape[0] == 0:
+        return out
+    cell = lab[r] * n_col + c
+    votes = np.bincount(
+        cell * n_states + x[r, c].astype(np.int64),
+        weights=np.asarray(w, dtype=np.float64)[r],
+        minlength=n_pat * n_col * n_states,
+    ).reshape(n_pat, n_col, n_states)
+    seen = np.bincount(cell, minlength=n_pat * n_col).reshape(n_pat, n_col) > 0
+    out[seen] = np.argmax(votes, axis=2).astype(np.int8)[seen]
+    return out
+
+
+def _reestimate_loop(x, observed, labels, w, patterns):
+    """:func:`_reestimate` per pattern and column, as it was written first:
+    the reference its vectorized form is tested against."""
     out = patterns.copy()
     n_states = int(max(int(x.max()) + 1, UNCOVERED + 1))
     for j in range(patterns.shape[0]):

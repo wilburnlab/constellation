@@ -21,7 +21,7 @@ import functools
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 
-from constellation.core.sequence.nucleic import STANDARD, CodonTable, translate
+from constellation.core.sequence.nucleic import STANDARD, CodonTable, longest_orf
 
 
 ORF_CODON_TABLE: CodonTable = CodonTable(
@@ -37,7 +37,8 @@ ORF_CODON_TABLE: CodonTable = CodonTable(
 def orf_regex(min_aa_length: int):
     import regex
 
-    # ATG start … ≥ min_aa_length codons … stop. Compiled once per length
+    # The regular expression ORF calling used before `longest_orf`, kept
+    # for comparison. ATG start … ≥ min_aa_length codons … stop. Compiled once per length
     # (vs once per call inside find_orfs — at 10M+ clusters that recompile
     # dominated the per-cluster cost).
     return regex.compile(
@@ -62,27 +63,20 @@ def best_sense_orf(seq: str, *, min_aa_length: int = 30):
 
     ``start``/``end`` are 0-based half-open offsets into ``seq``; the interval
     spans the start codon through the stop codon inclusive, so its length is
-    always a multiple of 3 (which the fold stage's length rules rely on).
+    always a multiple of 3 (which the fold stage's length rules rely on). Ties
+    go to the earliest start.
+
+    One pass over the codons (``core.sequence.nucleic.longest_orf``); until
+    2026-11-20 every ATG's match of :func:`orf_regex` was translated in full
+    and the stop-free ones kept, which gives the same answer about ten times
+    slower (``tests/test_orf_one_pass.py`` keeps that form as the reference).
     """
     if len(seq) < min_aa_length * 3 or is_low_complexity(seq):
         return None
-    s = seq.upper().replace("U", "T")
-    pat = orf_regex(min_aa_length)
-    # Best (longest) internal-stop-free protein per (frame, stop position).
-    best: dict[tuple[int, int], tuple] = {}
-    for m in pat.finditer(s, overlapped=True):
-        nt = s[m.start() : m.end()]
-        prot = translate(nt[:-3], codon_table=ORF_CODON_TABLE, partial="discard")
-        if "*" in prot or len(prot) < min_aa_length:
-            continue
-        key = (m.start() % 3, m.end())
-        prior = best.get(key)
-        if prior is None or len(prot) > len(prior[0]):
-            best[key] = (prot, m.start(), m.end())
-    if not best:
+    orf = longest_orf(seq, codon_table=ORF_CODON_TABLE, min_aa_length=min_aa_length)
+    if orf is None:
         return None
-    prot, st, en = max(best.values(), key=lambda x: len(x[0]))
-    return prot, int(st), int(en)
+    return orf.protein, int(orf.start), int(orf.end)
 
 
 # ── ORF prediction over many sequences (fork pool) ────────────────────

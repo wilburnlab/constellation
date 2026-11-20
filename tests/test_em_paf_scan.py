@@ -220,3 +220,44 @@ def test_int_fields_on_a_subset_picks_the_right_rows():
     assert got["t_start"].tolist() == [101, 104, 105]
     assert got["n_match"].tolist() == [901, 904, 905]
     assert hb.cigars(sel).to_pylist() == ["100=1X99="] * 3
+
+
+def test_group_blocks_are_the_concatenating_form_s() -> None:
+    """Gathering pipe chunks in a list cuts exactly the blocks that
+    re-concatenating the tail on every chunk cut (2026-11-20)."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.paf_scan import (
+        _last_group_start,
+        iter_group_blocks,
+    )
+
+    def reference(chunks, block_bytes):
+        tail = b""
+        for raw in chunks:
+            tail = tail + raw if tail else raw
+            if len(tail) < block_bytes:
+                continue
+            cut = tail.rfind(b"\n") + 1
+            if cut == 0:
+                continue
+            g = _last_group_start(tail, cut)
+            if g == 0:
+                continue
+            yield tail[:g]
+            tail = tail[g:]
+        if tail:
+            cut = tail.rfind(b"\n") + 1
+            if cut:
+                yield tail[:cut]
+
+    rng = np.random.default_rng(23)
+    lines = []
+    for q in range(300):
+        for _ in range(int(rng.integers(1, 9))):
+            lines.append(f"{q}\t1000\t0\t900\t+\t{int(rng.integers(0, 50))}\t1200\t5\t905\t880\t900\t60\n")
+    data = "".join(lines).encode()
+    for chunk in (7, 64, 1000, 4096, len(data)):
+        chunks = [data[i : i + chunk] for i in range(0, len(data), chunk)]
+        for block in (37, 500, 5000, 1 << 20):
+            assert list(iter_group_blocks(chunks, block_bytes=block)) == list(
+                reference(chunks, block)
+            ), (chunk, block)

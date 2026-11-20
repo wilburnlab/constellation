@@ -159,6 +159,10 @@ class MStepParams:
     max_cooccurrence_budget: float = 2e8
     #: Reads that must carry an interior insertion for it to get a column.
     min_insertion_support: float = 2.0
+    #: A node's ends (`mstep.NODE_EXTENTS`): "median" of its reads' ends
+    #: (2026-11-20), or "union", every column any read covers (before). A
+    #: run recorded before the field replays as "union".
+    node_extent: str = "median"
 
     def kernel_kwargs(self) -> dict[str, Any]:
         return {
@@ -180,6 +184,7 @@ class MStepParams:
             "boundary_tolerance": self.boundary_tolerance,
             "max_cooccurrence_budget": self.max_cooccurrence_budget,
             "min_insertion_support": self.min_insertion_support,
+            "node_extent": self.node_extent,
         }
 
 
@@ -459,6 +464,7 @@ def _fallback_nodes(frame, members, template_id, params) -> tuple[list, str]:
             fold_insertions=params.fold_insertions,
             min_insertion_support=params.min_insertion_support,
             min_extension_support=params.min_extension_support,
+            node_extent=params.node_extent,
         )
     except Exception:  # noqa: BLE001 — the template itself is what is left
         node = None
