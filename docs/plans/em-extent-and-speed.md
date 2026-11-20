@@ -70,15 +70,37 @@ The whole exact part, every digest identical: **em-kmer 38.1 → 29.7 s (−22%)
 | P3.4 | **Split children reuse the pool's projections** (16,561 → 14,952 on em-orf). Projecting every member at once with arrays was measured slower and dropped | A4 |
 | P3.5 | **Tier B:** covariance `_reestimate` (one weighted `bincount`) and `dense_states` (no per-entry dict); a block's `sample_id` / `dorado_quality` taken chunk-locally instead of copying the whole column (#14); the PAF tail gathered in a list, not re-concatenated per chunk (#15); the final outputs' read ids, representatives and roles in Arrow (#17). Seeding verify proved edlib-bound. With P3.4: em-kmer 29.7 s, em-orf 49.7 s | B |
 
-### Extent (changes results; new golden digests)
+### Extent (changes results)
 
-| Phase | What |
+| Phase | What landed |
 |---|---|
-| P3.6 | **`EmParams.end_tolerance` (30)** in every E-step reducer (minimap2, edlib, native):<br>• a read is admitted only with both ends within tolerance;<br>• refusals are `unassigned_reason = 'extent'`;<br>• candidates whose implied placement is already out of tolerance are dropped before the shortlist;<br>• the final rebuild admits the same way;<br>• the rule is stamped in `estep.json`, so an older run is refused on resume, not continued under another rule. |
-| P3.7 | **Node ends** = median member start and end (`MStepParams.node_extent`: `median`, the new default; `union`, the old). Recorded in `params.json`, so replaying an older run still verifies. |
-| P3.8 | **New templates from unmatched reads:** the reads a round leaves without a template of their extent are seeded (the run's own seeder, over those reads alone) into templates for the next round. Seeding's overhangs default to the tolerance. |
-| P3.9 | **The graph's `equivalent` tolerance and the merge** read the same value. |
-| P3.10 | **Tests and docs:**<br>• a gene with full-length, strand-invasion and short-3′-UTR reads ends as three clusters joined by `contained` edges;<br>• every assignment of every fixture run lies within tolerance;<br>• the golden digests are re-captured;<br>• `sequencing/CLAUDE.md` is corrected where it argued for 5′-truncated recruitment. |
+| P3.6 | **`EmParams.end_tolerance` (30; `--end-tolerance`, `none` off)** in every E-step reducer (minimap2, edlib, native):<br>• a read is admitted only with both ends within the tolerance (`scheduler.extent_ok`), read overhang and uncovered template alike;<br>• the two-pass reducers set extent-implausible candidates aside before the shortlist (`extent_plausible`, the tolerance plus `max(32, 5%)` of slack for a placement's drift); a read with no plausible candidate keeps its best one;<br>• refusals are `unassigned_reason = 'extent'`;<br>• the final rebuild admits the same way; replay reads the tolerance a run recorded (none before);<br>• em-kmer's seed overhangs and the graph's `equivalent` tolerance follow it unless set (the planned P3.9);<br>• stamped in `estep.json`: an older run is refused on resume. |
+| P3.7 | **Node ends** = lower weighted median of the reads' starts to upper weighted median of their ends, inside the covered span (`MStepParams.node_extent`: `median`, the new default; `union`, the old). A run recorded without the field replays as `union`; the span is kept on the `ConsensusResult` for the support tables. |
+| P3.8 | **New templates from unmatched reads:** after each round's refine and merge, the reads refused for extent are grouped by the kmer seeder under the run's seeding gate, one elected per group, as templates of the next round (`seed` lineage rows; counts in `refine.json` and the report's rounds table). The live loop and the resume rebuild share the path. Reads refused in the last round stay unassigned. |
+| P3.9 | **Tests and docs:** `tests/test_em_extent.py` (full-length, 5′-UTR-truncated and short-3′ reads of one gene: three clusters related by `contained` 5p/3p edges under ORF seeding, where they share a seed; every assignment within the tolerance and no mixed cluster under either seeder; mixed again with the rule off); the three-gene golden digests are unchanged, since its reads are full length; `sequencing/CLAUDE.md` and the root notes corrected. |
+
+**On the bench corpus** (4,997 reads, a quarter of them 5′-truncated at random positions and 15% at sharp internal starts; 3 rounds, native E-step, one thread):
+
+| | Clusters (≥ 2 reads) | Reads in clusters | E-step / round | Wall |
+|---|---|---|---|---|
+| em-kmer, before | 94 (93) | 4,997 | 2.6–3.8 s | 29.7 s |
+| em-kmer, extent rule | 1,465 (237) | 4,994 | ~40 s | 230.7 s |
+| em-orf, before | 146 (125) | 4,997 | 2.9–15.8 s | 49.7 s |
+| em-orf, extent rule | 623 (357) | 4,994 | 13.5–20.2 s | 73.6 s |
+
+The extent rule keeps nearly every read (990 refused reads reseeded in em-kmer's round 1, 51 in em-orf's) and turns each truncation class into its own cluster. That is the intent, and here mostly singletons, since this corpus truncates at random.
+
+It also costs time:
+- **E-step.** A read that met one candidate (about one template per gene) meets ~120 and aligns ~15.
+- **Template graph.** It now relates many overlapping extents of one gene: `_infix` takes 63 s in em-kmer.
+
+A tighter pre-filter slack (16 nt + 1% instead of 32 nt + 5%) cut the alignments by a third, but changed the result (1,449 clusters against 1,465), so the conservative slack stays until real data says otherwise.
+
+**Validation is the PI's.** The bench corpus and the fixtures are synthetic. What decides the defaults on real data:
+- the share of reads reseeded per round, and whether reseeded templates consolidate;
+- the cluster count against the estimate (2.31M extent classes against 1.67M clusters on the Nov2026 run's round 12);
+- whether template ends land on annotated start sites;
+- E-step time with the pre-filter.
 
 ## Not in this PR
 

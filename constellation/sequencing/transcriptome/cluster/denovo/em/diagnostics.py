@@ -102,22 +102,26 @@ def section_convergence(em_dir: Path) -> ReportSection:
                 churn.get("frac_unsettled"),
                 churn.get("n_gained"),
                 churn.get("n_lost"),
+                est.get("n_extent"),
+                _refine_json(d).get("n_reseeded_reads"),
+                _refine_json(d).get("n_reseeded_templates"),
             )
         )
     if not rows:
         return ReportSection(title="Convergence", body="_no completed rounds_")
 
     lines = [
-        "| round | templates | nodes | assigned | unassigned | churn (lineage) "
-        "| gained | lost | **unsettled** |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| round | templates | nodes | assigned | unassigned | of no extent "
+        "| reseeded (templates) | churn (lineage) | gained | lost | **unsettled** |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for r, nt, nn, na, nu, _ch, chl, uns, gain, lost in rows:
+    for r, nt, nn, na, nu, _ch, chl, uns, gain, lost, ext, rs, rst in rows:
         f = lambda v: "—" if v is None else f"{v:.4f}"  # noqa: E731
         i = lambda v: "—" if v is None else f"{v:,}"  # noqa: E731
+        reseed = "—" if rs is None else f"{rs:,} ({i(rst)})"
         lines.append(
-            f"| {r} | {nt:,} | {nn:,} | {na:,} | {nu:,} | {f(chl)} "
-            f"| {i(gain)} | {i(lost)} | **{f(uns)}** |"
+            f"| {r} | {nt:,} | {nn:,} | {na:,} | {nu:,} | {i(ext)} | {reseed} "
+            f"| {f(chl)} | {i(gain)} | {i(lost)} | **{f(uns)}** |"
         )
 
     last = rows[-1]
@@ -134,9 +138,19 @@ def section_convergence(em_dir: Path) -> ReportSection:
         "gains plus losses, over reads assigned in *either* round. Lineage "
         "churn alone is measured only over reads assigned in **both**, so "
         "losing half the assignments scores zero as long as the survivors keep "
-        "their lineage."
+        "their lineage.\n\n"
+        "**of no extent**: reads refused by every template for their ends "
+        "(`unassigned_reason = 'extent'`, `--end-tolerance`); **reseeded**: "
+        "those grouped into templates of their own for the next round."
     )
     return ReportSection(title="Convergence", body=body, flags=flags)
+
+
+def _refine_json(d: Path) -> dict:
+    try:
+        return json.loads((d / "refine.json").read_text())
+    except (OSError, ValueError):
+        return {}
 
 
 def section_seeding(em_dir: Path) -> ReportSection:

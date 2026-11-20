@@ -145,7 +145,8 @@ class EmParams:
     #: relation between templates, answered after clustering). The same
     #: value bounds the kmer seeder's overhangs, the final rebuild and,
     #: unless set apart, the graph's `equivalent` relation. ``None`` turns
-    #: the rule off (the loop before 2026-11-20).
+    #: the rule off (as before 2026-11-20); node ends are a separate setting,
+    #: ``MStepParams.node_extent`` ("median" unless set to "union").
     end_tolerance: int | None = DEFAULT_END_TOLERANCE
     minimap2_n: int = 500
     index_batch_size: str = "16G"

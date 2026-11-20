@@ -902,7 +902,10 @@ def test_the_seeding_mode_reaches_the_manifest(corpus_dir, tmp_path):
     manifest = json.loads((out / "manifest.json").read_text())
     params = manifest["parameters"]
     assert params["seeding"] == "kmer"
-    assert params["seed_max_3p_overhang"] == 100
+    # Unset, the seed overhangs follow the end tolerance (100 at 3' before
+    # 2026-11-20, with the 5' end unbounded).
+    assert params["end_tolerance"] == 30
+    assert params["seed_max_5p_overhang"] == params["seed_max_3p_overhang"] == 30
     # The mode COLUMN stays "em": the mechanism is the EM loop, the seeder is
     # a parameter of it, and widening the column would touch every consumer.
     assert params["mode"] == "em"

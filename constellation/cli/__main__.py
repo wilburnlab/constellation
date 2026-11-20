@@ -1436,7 +1436,8 @@ def _build_transcriptome_parser(subs) -> None:
         "relation between templates, answered after clustering by the "
         "graph's `contained` edges. Also bounds --mode em-kmer's seed "
         "overhangs (unless given), the final rebuild and the graph's "
-        "`equivalent` relation. 'none' turns the rule off.",
+        "`equivalent` relation. 'none' turns the rule off (node ends still "
+        "follow their reads' medians, MStepParams.node_extent).",
     )
     p_cluster.add_argument(
         "--minimap2-n",
