@@ -39,6 +39,8 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
     read_round_templates,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.support import (
+    node_differences,
+    replay_summary,
     support_tables,
 )
 
@@ -264,32 +266,91 @@ def read_history(run_dir: Path, read_rows) -> pa.Table:
     return pa.Table.from_pylist(out).sort_by([("read_row", "ascending"), ("round", "ascending")])
 
 
-def find_clusters(run_dir: Path, query: str, *, limit: int = 200) -> pa.Table:
-    """Clusters matching ``query``: a cluster id, a content id, a protein
-    substring (≥ 4 residues), or a read id (the cluster that holds it)."""
+def cluster_index(run_dir: Path) -> pa.Table:
+    """One narrow row per final cluster — its size, lengths, round node and
+    content ids, and no sequence.
+
+    ``clusters.parquet`` holds every consensus (~2.7 GB at 9.4M reads), so
+    a listing that read it to sort a million clusters by size would read the
+    sequences to find their lengths. Here the sequence columns are streamed
+    a batch at a time, kept only as lengths, and joined to
+    ``cluster_nodes.parquet`` (or its derivation for an older run).
+    """
     run_dir = Path(run_dir)
-    table = clusters(run_dir)
+    pf = pq.ParquetFile(run_dir / "clusters.parquet")
+    base = pf.read(
+        columns=["cluster_id", "n_reads", "n_unique_sequences", "orf_start", "orf_end"]
+    )
+    lengths, protein = [], []
+    for batch in pf.iter_batches(
+        columns=["consensus_sequence", "predicted_protein"], batch_size=65_536
+    ):
+        lengths.append(pc.binary_length(batch.column(0)).cast(pa.int32()))
+        protein.append(
+            pc.fill_null(pc.binary_length(batch.column(1)), 0).cast(pa.int32())
+        )
+    table = base.append_column(
+        "length", pa.chunked_array(lengths, pa.int32())
+    ).append_column("protein_length", pa.chunked_array(protein, pa.int32()))
+    try:
+        nodes = cluster_node_map(run_dir)
+    except ReplayError:
+        return table
+    keep = [
+        "cluster_id",
+        "round",
+        "parent_template_id",
+        "haplotype_id",
+        "node_template_id",
+        "rebuilt",
+        "n_absorbed",
+        "consensus_content_id",
+        "protein_content_id",
+    ]
+    nodes = nodes.select([c for c in keep if c in nodes.column_names])
+    return (
+        table.join(nodes, "cluster_id", join_type="left outer")
+        .sort_by("cluster_id")
+        .combine_chunks()
+    )
+
+
+def find_clusters(
+    run_dir: Path, query: str, *, limit: int = 200, index: pa.Table | None = None
+) -> pa.Table:
+    """Clusters matching ``query``, as :func:`cluster_index` rows: a cluster
+    id or a content id, a protein substring (>= 4 upper-case residues), or a
+    read id (the cluster that holds it). Each reads only the columns it
+    searches; pass ``index`` to reuse one already built."""
+    run_dir = Path(run_dir)
+    table = cluster_index(run_dir) if index is None else index
     q = query.strip()
+    ids = table.column("cluster_id").to_numpy(zero_copy_only=False)
     hits = np.zeros(table.num_rows, dtype=bool)
     if q.isdigit():
         n = int(q)
-        hits |= table.column("cluster_id").to_numpy(zero_copy_only=False) == n
+        hits |= ids == n
         for name in ("consensus_content_id", "protein_content_id"):
             if name in table.column_names:
                 hits |= pc.fill_null(pc.equal(table.column(name), n), False).to_numpy(
                     zero_copy_only=False
                 )
+    found: list[np.ndarray] = []
     if len(q) >= 4 and q.isalpha() and q.upper() == q:
-        hits |= pc.fill_null(
-            pc.match_substring(table.column("predicted_protein"), q), False
-        ).to_numpy(zero_copy_only=False)
-    member = pq.read_table(run_dir / "cluster_membership.parquet", columns=["cluster_id", "read_id"])
-    rid = member.filter(pc.equal(member.column("read_id"), q))
-    if rid.num_rows:
-        hits |= np.isin(
-            table.column("cluster_id").to_numpy(zero_copy_only=False),
-            rid.column("cluster_id").to_numpy(zero_copy_only=False),
+        prot = pq.read_table(
+            run_dir / "clusters.parquet", columns=["cluster_id", "predicted_protein"]
         )
+        match = pc.fill_null(pc.match_substring(prot.column("predicted_protein"), q), False)
+        found.append(prot.column("cluster_id").filter(match).to_numpy(zero_copy_only=False))
+    member = pq.read_table(
+        run_dir / "cluster_membership.parquet",
+        columns=["cluster_id"],
+        filters=[("read_id", "==", q)],
+    )
+    if member.num_rows:
+        found.append(member.column("cluster_id").to_numpy(zero_copy_only=False))
+    if found:
+        hits |= np.isin(ids, np.concatenate(found))
     return table.filter(pa.array(hits)).slice(0, limit)
 
 
@@ -297,6 +358,7 @@ __all__ = [
     "ReplayError",
     "assignment_locator",
     "assignments",
+    "cluster_index",
     "cluster_node_map",
     "cluster_nodes",
     "clusters",
@@ -305,10 +367,12 @@ __all__ = [
     "lineage",
     "mstep_record",
     "node_membership",
+    "node_differences",
     "nodes",
     "read_history",
     "read_rows_for_ids",
     "replay_cluster",
+    "replay_summary",
     "replay_template",
     "round_summaries",
     "run_info",

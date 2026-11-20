@@ -335,6 +335,10 @@ import constellation.viz.tracks
 import constellation.viz.tracks.base
 import constellation.viz.modalities
 import constellation.viz.modalities.genome
+import constellation.viz.modalities.transcriptome
+import constellation.viz.modalities.transcriptome.cache
+import constellation.viz.modalities.transcriptome.requests
+import constellation.viz.modalities.transcriptome.session
 import constellation.viz.modalities.genome.tracks
 import constellation.viz.modalities.genome.tracks.coverage_histogram
 import constellation.viz.modalities.genome.tracks.gene_annotation

@@ -523,8 +523,8 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 def _doctor_frontend_rows() -> list[tuple[str, str, str, str]]:
     """Probe ``constellation/viz/static/<entry>/`` for installed bundles.
 
-    Iterates over every known entry (``genome``, ``dashboard``) and
-    surfaces one row per entry. Reads `bundle.json` via
+    One row per entry: every entry the frontend source knows
+    (``index.<entry>.html``) and every one installed under ``static/``. Reads `bundle.json` via
     `constellation.viz.install.read_bundle_metadata` — a stdlib-only
     helper, so this runs even without the `[viz]` extras installed.
     """
@@ -532,9 +532,14 @@ def _doctor_frontend_rows() -> list[tuple[str, str, str, str]]:
 
     from constellation.viz.install import read_bundle_metadata
 
+    from constellation.viz.frontend.build import known_entries
+
     static_root = Path(__file__).resolve().parents[1] / "viz" / "static"
+    installed = (
+        {p.name for p in static_root.iterdir() if p.is_dir()} if static_root.is_dir() else set()
+    )
     rows: list[tuple[str, str, str, str]] = []
-    for entry in ("genome", "dashboard"):
+    for entry in sorted(set(known_entries()) | installed):
         entry_dir = static_root / entry
         metadata = read_bundle_metadata(entry_dir)
         # Vite's HTML output is named after the source file

@@ -625,13 +625,127 @@ def support_tables(replay, *, node: int | None = None, space: str = "consensus")
     )
 
 
+DIFFERENCES_SCHEMA = pa.schema(
+    [
+        pa.field("frame_col", pa.int32(), nullable=False),
+        pa.field("haplotype_id", pa.int32(), nullable=False),
+        # 0-3 ACGT, 4 gap, 5 N: the node's consensus at the column.
+        pa.field("allele", pa.int8(), nullable=False),
+    ]
+)
+
+
+def _template_of(replay):
+    if isinstance(replay, TemplateReplay):
+        return replay
+    if isinstance(replay, ClusterReplay) and replay.kind in ("node", "merged"):
+        return replay.template
+    return None
+
+
+def replay_summary(replay) -> dict:
+    """What a replay is, for a header: kind, round, template, the nodes with
+    their read counts, how many reads voted in the PWM, and the verdict."""
+    tmpl = _template_of(replay)
+    out: dict = {
+        "kind": "template" if isinstance(replay, TemplateReplay) else replay.kind,
+        "round": int(replay.round),
+        "verified": bool(replay.verified),
+        "mismatch": list(replay.mismatch),
+        "warnings": list(replay.warnings),
+    }
+    if isinstance(replay, ClusterReplay):
+        out["cluster_id"] = int(replay.cluster_id)
+        out["haplotype_id"] = int(replay.haplotype_id)
+        out["node_template_id"] = int(replay.node_template_id)
+    if tmpl is not None:
+        res = tmpl.result
+        hap = np.asarray(res.haplotype_of_read, dtype=np.int64)
+        ids, counts = np.unique(hap, return_counts=True) if hap.size else ([], [])
+        out.update(
+            template_id=int(tmpl.template_id),
+            params_source=tmpl.params_source,
+            n_reads=int(hap.size),
+            n_sampled=int(np.asarray(res.member_pos).size),
+            nodes=[
+                {"haplotype_id": int(i), "n_reads": int(c)} for i, c in zip(ids, counts)
+            ],
+            status=getattr(res.record, "status", None),
+        )
+        absorbed = (
+            replay.absorbed_read_row
+            if isinstance(replay, ClusterReplay) and replay.kind == "merged"
+            else None
+        )
+        out["n_absorbed_reads"] = int(absorbed.size) if absorbed is not None else 0
+    elif isinstance(replay, ClusterReplay):  # rebuilt
+        pool = np.asarray(replay.pool_read_row, dtype=np.int64)
+        out.update(
+            template_id=None,
+            n_reads=int(pool.size),
+            n_sampled=int(np.asarray(replay.member_read_row).size),
+            nodes=[{"haplotype_id": int(replay.haplotype_id), "n_reads": int(pool.size)}],
+            n_absorbed_reads=int(
+                np.sum(
+                    np.asarray(replay.pool_node_template_id, dtype=np.int64)
+                    != int(replay.node_template_id)
+                )
+            )
+            if replay.pool_node_template_id is not None
+            else 0,
+        )
+    return out
+
+
+def node_differences(replay) -> pa.Table:
+    """The frame columns where a template's nodes' consensus sequences
+    differ, one row per node covering such a column — what a comparison of
+    two siblings is restricted to. Empty for a single node or a rebuilt
+    survivor (whose replay has one)."""
+    tmpl = _template_of(replay)
+    internals = tmpl.result.internals if tmpl is not None else None
+    if internals is None or len(internals.children) < 2:
+        return DIFFERENCES_SCHEMA.empty_table()
+    n = int(internals.pooled.plan.n_columns)
+    per_node = []
+    for hid, child, lo, hi in internals.children:
+        winner = np.asarray(child.winner, dtype=np.int64)
+        cons = np.asarray(child.cons_of_frame, dtype=np.int64)
+        carried = (cons >= lo) & (cons < hi)
+        allele = np.full(n, -1, dtype=np.int64)
+        if carried.any():
+            first, last = np.flatnonzero(carried)[[0, -1]]
+            allele[first : last + 1] = 4  # inside its span: a gap unless carried
+            allele[carried] = winner[carried]
+        per_node.append((int(hid), allele))
+    stack = np.stack([a for _h, a in per_node])
+    covered = stack >= 0
+    lo_val = np.where(covered, stack, 99).min(axis=0)
+    hi_val = np.where(covered, stack, -1).max(axis=0)
+    cols = np.flatnonzero((covered.sum(axis=0) >= 2) & (lo_val != hi_val))
+    rows = [
+        (int(c), hid, int(a[c])) for c in cols for hid, a in per_node if a[c] >= 0
+    ]
+    return pa.table(
+        {
+            "frame_col": pa.array([r[0] for r in rows], pa.int32()),
+            "haplotype_id": pa.array([r[1] for r in rows], pa.int32()),
+            "allele": pa.array([r[2] for r in rows], pa.int8()),
+        },
+        schema=DIFFERENCES_SCHEMA,
+    )
+
+
 __all__ = [
     "ARCS_SCHEMA",
     "COLUMNS_SCHEMA",
     "DEPARTURES_SCHEMA",
+    "DIFFERENCES_SCHEMA",
     "INSERTIONS_SCHEMA",
     "READS_SCHEMA",
     "SPACES",
     "SupportTables",
+    "node_differences",
+    "replay_summary",
     "support_tables",
 ]
