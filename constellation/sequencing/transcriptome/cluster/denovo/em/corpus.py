@@ -125,6 +125,15 @@ class ReadStore:
     def dorado_quality(self) -> np.ndarray:
         return self.table.column("dorado_quality").to_numpy(zero_copy_only=False)
 
+    def take_column(self, name: str, rows: np.ndarray) -> np.ndarray:
+        """Column ``name`` at ``rows`` (``sample_id``, ``dorado_quality``, …),
+        touching only the chunks the rows fall in. The ``sample_id`` /
+        ``dorado_quality`` properties copy the whole column, which per E-step
+        block was ~75 MB at 9.4M reads to read a block's worth of rows."""
+        return chunked_take(self.table.column(name), rows, self.chunk_starts).to_numpy(
+            zero_copy_only=False
+        )
+
     def lengths(self) -> np.ndarray:
         """Window length per row, without decoding any sequence."""
         return pc.utf8_length(self.sequence).to_numpy(zero_copy_only=False)

@@ -216,6 +216,27 @@ def _identity_columns(
     return ident_arr, len_arr, reason_arr
 
 
+def _column_rows(reads, name: str, rows: np.ndarray) -> np.ndarray:
+    """``getattr(reads, name)[rows]``: from a corpus, only those rows'
+    chunks (``ReadStore.take_column``; the property copies the whole
+    column); from a hand-built store, its array."""
+    if getattr(reads, "take_column", None) is not None:
+        return reads.take_column(name, np.asarray(rows, dtype=np.int64))
+    return np.asarray(getattr(reads, name))[rows]
+
+
+def _sample_ids(reads, rows: np.ndarray) -> pa.Array:
+    """The reads' sample ids, or nulls for a store without any."""
+    n = int(np.asarray(rows).shape[0])
+    if getattr(reads, "take_column", None) is not None:
+        has = reads.n_reads > 0
+    else:
+        has = np.asarray(reads.sample_id).size > 0
+    if not has:
+        return pa.nulls(n, pa.int64())
+    return pa.array(_column_rows(reads, "sample_id", rows).astype(np.int64))
+
+
 def _hit_floor(
     reads,
     read_of_group: np.ndarray,
@@ -232,7 +253,7 @@ def _hit_floor(
     if quality_scale is None:
         return float(p_floor), None
     grp_floor = sched.floor_per_read(
-        np.asarray(reads.dorado_quality, dtype=np.float64)[read_of_group],
+        np.asarray(_column_rows(reads, "dorado_quality", read_of_group), dtype=np.float64),
         p_floor=p_floor,
         quality_scale=quality_scale,
     )
@@ -446,9 +467,7 @@ def assign_block(
             pa.array(np.where(has, fields["t_start"], 0).astype(np.int32)),
             pa.array(np.where(has, fields["t_end"], 0).astype(np.int32)),
             cig,
-            pa.array(reads.sample_id[read_of_group].astype(np.int64))
-            if reads.sample_id.size
-            else pa.nulls(n_groups, pa.int64()),
+            _sample_ids(reads, read_of_group),
             pa.nulls(n_groups, pa.int32()),
             pa.nulls(n_groups, pa.bool_()),
             ident_arr,
@@ -813,9 +832,7 @@ def assign_block_edlib(
             pa.array(_w(t_start).astype(np.int32)),
             pa.array(_w(t_end).astype(np.int32)),
             pa.array(win_cig, pa.large_string()),
-            pa.array(reads.sample_id[read_of_group].astype(np.int64))
-            if reads.sample_id.size
-            else pa.nulls(n_groups, pa.int64()),
+            _sample_ids(reads, read_of_group),
             pa.array(np.where(has, chain[sel[slot]] if m else 0, 0).astype(np.int32)),
             pa.array(truncated.astype(bool)),
             ident_arr,
@@ -1281,9 +1298,7 @@ def _unassigned_batch(
             zero32,
             zero32,
             pa.nulls(n, pa.large_string()),
-            pa.array(reads.sample_id[rows].astype(np.int64))
-            if reads.sample_id.size
-            else pa.nulls(n, pa.int64()),
+            _sample_ids(reads, rows),
             pa.nulls(n, pa.int32()),
             pa.nulls(n, pa.bool_()),
             pa.nulls(n, pa.float32()),

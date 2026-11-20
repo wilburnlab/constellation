@@ -59,14 +59,16 @@ The exact items come first, while the golden digests can still show them bit-ide
 
 ### Exact (golden digests unchanged; each with an equivalence test against the code it replaces)
 
+The whole exact part, every digest identical: **em-kmer 38.1 → 29.7 s (−22%), em-orf 128.4 → 49.7 s (−61%)**.
+
 | Phase | What | Review item |
 |---|---|---|
 | P3.0 | `scripts/bench-em-loop.py`, and the baseline above | — |
 | P3.1 | **The ORF finder:** one pass over the codons (`core.sequence.nucleic.longest_orf`) for `best_sense_orf` and demux's ORF calling, and a canonical fast path in `translate`. Seeding's finder is 12.8× faster (3.50 → 0.27 ms a transcript), demux's 7.2×. Whole loop: em-kmer 38.1 → 33.0 s, em-orf 128.4 → 78.1 s, digests identical | A1, A2 |
-| P3.2 | **The finalist alignment** as arrays: one CIGAR parse, then the anchor trim, extension merge, score trim and statistics without per-op Python | A3 |
-| P3.3 | **The native candidate join's expansion and window scoring** | new |
-| P3.4 | **Projection:** every member of a template projected at once, and split children reusing the pooled projections | A4 |
-| P3.5 | **Tier B, by measured share:** seeding verify, covariance `_reestimate` / `dense_states`, corpus columns cached per process, the PAF tail, structured-dtype sorts, the final outputs | B |
+| P3.2 | **The finalist alignment** in fewer passes over its CIGAR: pieces merged only where they meet, the score trim's minima from `accumulate`, the statistics from the trim's contributions. Python share 0.29 → 0.22 s per 2,000 finalists; the rest is edlib. Arrays (the review's proposal) were measured twice as slow at ~100 ops a CIGAR | A3 |
+| P3.3 | **The native join** sorts its expanded rows on one packed int64 key instead of a four-key `lexsort`: a 16M-row sub-chunk 10–27 → ~4 s. With P3.2: em-kmer 33.0 → 30.2 s, em-orf 78.1 → 58.0 s | new |
+| P3.4 | **Split children reuse the pool's projections** (16,561 → 14,952 on em-orf). Projecting every member at once with arrays was measured slower and dropped | A4 |
+| P3.5 | **Tier B:** covariance `_reestimate` (one weighted `bincount`) and `dense_states` (no per-entry dict); a block's `sample_id` / `dorado_quality` taken chunk-locally instead of copying the whole column (#14); the PAF tail gathered in a list, not re-concatenated per chunk (#15); the final outputs' read ids, representatives and roles in Arrow (#17). Seeding verify proved edlib-bound. With P3.4: em-kmer 29.7 s, em-orf 49.7 s | B |
 
 ### Extent (changes results; new golden digests)
 
