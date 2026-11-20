@@ -83,14 +83,21 @@ _MIN_PLACED_FRACTION = MIN_PLACED_FRACTION
 
 
 def align_to_survivor(
-    read: str, consensus: str, *, identity_floor: float, end_tolerance: int | None = None
+    read: str,
+    consensus: str,
+    *,
+    identity_floor: float,
+    end_tolerance: int | None = None,
+    why: list | None = None,
 ):
     """``(cigar, t_start, q_start)`` of ``read`` on ``consensus``, or ``None``
     below the floor, placed over less than half of the shorter of the two,
     or not placed at all. The E-step's aligner, run with no chain to guide
     it: the whole read is placed infix, anchor-trimmed, extended at both
     ends and score-trimmed, exactly as a shortlisted read is in a
-    ``--estep-aligner edlib`` round."""
+    ``--estep-aligner edlib`` round. ``why`` (a list) is given ``"extent"``
+    when the read placed within the floor but its ends are not within
+    ``end_tolerance`` of the survivor's."""
     hit = align_finalist(
         read,
         consensus,
@@ -124,6 +131,8 @@ def align_to_survivor(
         len(consensus),
         tolerance=end_tolerance,
     ):
+        if why is not None:
+            why.append("extent")
         return None
     return hit.cigar, int(hit.t_start), int(hit.q_start)
 
@@ -151,6 +160,7 @@ def rebuild_one(
     identity_floor: float,
     quality_scale: float | None = None,
     end_tolerance: int | None = None,
+    refused_out: list | None = None,
 ) -> tuple[int, dict | None, int, float]:
     """One survivor. Returns ``(row, rebuilt or None, n_skipped, fraction)``.
 
@@ -174,6 +184,7 @@ def rebuild_one(
         identity_floor=identity_floor,
         quality_scale=quality_scale,
         end_tolerance=end_tolerance,
+        refused_out=refused_out,
     )
     node = pooled_node(
         consensus,
@@ -217,6 +228,7 @@ def rebuild_members(
     identity_floor: float,
     quality_scale: float | None = None,
     end_tolerance: int | None = None,
+    refused_out: list | None = None,
 ) -> tuple[list[MemberSpec], np.ndarray, int, float]:
     """The pooled reads of a survivor, aligned to its consensus.
 
@@ -224,6 +236,8 @@ def rebuild_members(
     that placed, the corpus rows considered (after the member cap — a
     member's ``member_id`` indexes them), how many did not place, and the
     sampled fraction. :func:`rebuild_one` and replay share it.
+    ``refused_out`` (a list) is given the corpus rows refused for their
+    extent alone, which the final merge reads to undo an absorption.
     """
     reads = _reads(corpus_path)
     rows = np.asarray(read_rows, dtype=np.int64)
@@ -246,11 +260,18 @@ def rebuild_members(
     members: list[MemberSpec] = []
     n_skipped = 0
     for i, seq in enumerate(reads.take_sequences(rows)):
+        why: list = []
         placed = align_to_survivor(
-            seq, consensus, identity_floor=float(floors[i]), end_tolerance=end_tolerance
+            seq,
+            consensus,
+            identity_floor=float(floors[i]),
+            end_tolerance=end_tolerance,
+            why=why,
         )
         if placed is None:
             n_skipped += 1
+            if why and refused_out is not None:
+                refused_out.append(int(rows[i]))
             continue
         cigar, t_start, q_start = placed
         members.append(
@@ -303,10 +324,15 @@ def _rebuild_one_or_error(row, consensus, read_rows, **kwargs):
     whole final stage down with it — after every round had finished.
     Module-level so it pickles by name.
     """
+    refused: list = []
     try:
-        return (*rebuild_one(row, consensus, read_rows, **kwargs), None)
+        return (
+            *rebuild_one(row, consensus, read_rows, refused_out=refused, **kwargs),
+            None,
+            np.asarray(refused, dtype=np.int64),
+        )
     except Exception as exc:  # noqa: BLE001 — counted, and the survivor kept
-        return row, None, 0, 1.0, f"{type(exc).__name__}: {exc}"[:500]
+        return row, None, 0, 1.0, f"{type(exc).__name__}: {exc}"[:500], np.empty(0, np.int64)
 
 
 def rebuild_survivors(
@@ -319,6 +345,7 @@ def rebuild_survivors(
     identity_floor: float,
     quality_scale: float | None = None,
     end_tolerance: int | None = None,
+    refused_out: dict | None = None,
     threads: int = 1,
     log=None,
 ) -> tuple[pa.Table, dict, np.ndarray]:
@@ -333,7 +360,8 @@ def rebuild_survivors(
     raised) and ``n_rebuild_reads_skipped``. ``identity_floor`` and ``quality_scale``
     are the run's admission rule, whole — see :func:`rebuild_one`. The third
     value is the rows actually rebuilt (ascending), what the final clusters'
-    ``rebuilt`` flag records.
+    ``rebuilt`` flag records. ``refused_out`` (a dict) is given, per row,
+    the corpus rows its rebuild refused for their extent alone.
     """
     rows = np.asarray(rows, dtype=np.int64)
     counts = {
@@ -364,7 +392,9 @@ def rebuild_survivors(
     results: dict[int, dict] = {}
 
     def take(outcome) -> None:
-        row, rebuilt, n_skipped, _fraction, error = outcome
+        row, rebuilt, n_skipped, _fraction, error, refused = outcome
+        if refused_out is not None and refused.size:
+            refused_out[int(row)] = refused
         counts["n_rebuild_reads_skipped"] += int(n_skipped)
         if error is not None:
             counts["n_rebuild_errors"] += 1

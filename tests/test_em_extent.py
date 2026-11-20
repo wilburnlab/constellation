@@ -186,3 +186,62 @@ def test_the_rule_off_mixes_them_again(tmp_path) -> None:
     for row in mem:
         by_cluster.setdefault(row["cluster_id"], set()).add(_population(row["read_id"]))
     assert any(len(p) > 1 for p in by_cluster.values())
+
+
+# ── Codex, 2026-11-20 ─────────────────────────────────────────────────
+
+
+def test_the_reseeding_guard_judges_a_cluster_against_the_corpus() -> None:
+    """10,000 identical refused reads in a 50,000-read corpus are 20% of the
+    corpus, not "100%" of the subset reseeding hands the seeder."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.seed_kmer import (
+        ChainedClusterError,
+        seed_by_kmer_clustering,
+    )
+
+    rng = np.random.default_rng(3)
+    seq = "".join(rng.choice(list("ACGT"), size=600))
+    n = 400
+    sub = pa.table({
+        "read_id": pa.array([f"r{i}" for i in range(n)]),
+        "sequence": pa.array([seq] * n, pa.large_string()),
+        "sample_id": pa.array(np.zeros(n, np.int64)),
+        "dorado_quality": pa.array(np.full(n, 25.0, np.float32)),
+    })
+    kw = dict(max_cluster_read_frac=0.25, min_chain_cluster_reads=100, threads=1)
+    with pytest.raises(ChainedClusterError):
+        seed_by_kmer_clustering(sub, **kw)
+    result = seed_by_kmer_clustering(sub, corpus_reads=n * 5, **kw)
+    assert result.templates.num_rows == 1
+
+
+def test_reseeding_resolves_an_orf_only_representative_policy() -> None:
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rounds import (
+        reseed_representative,
+    )
+
+    assert reseed_representative(_params("orf", seed_representative="most-5p-flank")) == (
+        "longest-above-quality"
+    )
+    assert reseed_representative(_params("orf", seed_representative="median-length")) == (
+        "median-length"
+    )
+
+
+def test_a_merge_tolerance_is_checked_against_the_inherited_graph_tolerance() -> None:
+    p = EmParams(end_tolerance=60, merge_tol_5p=50)
+    assert p.graph.tol_5p == 60 and p.merge_predicate().tol_5p == 50
+    with pytest.raises(ValueError):
+        EmParams(end_tolerance=60, merge_tol_5p=70)
+
+
+def test_em_orf_with_most_5p_flank_reseeds(tmp_path) -> None:
+    """The ORF-only policy runs round 1 and then reseeds without crashing."""
+    out = tmp_path / "em"
+    run_em(_panel(tmp_path), out,
+           params=_params("orf", rounds=2, seed_representative="most-5p-flank"), report=False)
+    import json
+
+    ref = json.loads((out / "rounds" / "r01" / "refine.json").read_text())
+    assert ref["n_reseeded_reads"] > 0
+    assert ref["reseed_representative"] == "longest-above-quality"

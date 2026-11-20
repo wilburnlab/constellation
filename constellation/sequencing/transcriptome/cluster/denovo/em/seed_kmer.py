@@ -171,6 +171,7 @@ def seed_by_kmer_clustering(
     min_chain_cluster_reads: int = DEFAULT_MIN_CHAIN_CLUSTER_READS,
     threads: int = 1,
     progress: Callable[[str], None] | None = None,
+    corpus_reads: int | None = None,
 ) -> KmerSeedResult:
     """Cluster the reads by kmer similarity; elect one template per cluster.
 
@@ -182,6 +183,10 @@ def seed_by_kmer_clustering(
     ``max_cluster_read_frac`` of the reads *and* at least
     ``min_chain_cluster_reads`` of them (0 disables either half); anything
     above 1% of a corpus that large is warned about regardless.
+    ``corpus_reads`` is what that fraction is OF when ``reads`` is a subset
+    of a corpus (the EM's reseeding of the reads no template's extent
+    fits): a cluster is judged against the corpus, not the subset, in which
+    10,000 identical reads would be "100%".
     """
     log = progress or (lambda _m: None)
     # Resolve the policy first: an unknown or ORF-dependent name should fail in
@@ -289,7 +294,7 @@ def seed_by_kmer_clustering(
 
     # ── the chaining guard (counts READS, not uniques) ────────────────
     largest = int(cluster_reads.max()) if cluster_reads.size else 0
-    largest_frac = largest / float(n_reads)
+    largest_frac = largest / float(max(n_reads, int(corpus_reads or 0)))
     stats["n_clusters_raw"] = n_clusters_raw
     stats["largest_cluster_reads"] = largest
     stats["largest_cluster_read_frac"] = round(largest_frac, 6)

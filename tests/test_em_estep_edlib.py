@@ -495,3 +495,21 @@ def test_the_final_rebuild_holds_reads_to_the_same_extent() -> None:
     assert align_to_survivor(TRUE[150:], TRUE, identity_floor=0.97) is not None
     assert align_to_survivor(TRUE[150:], TRUE, identity_floor=0.97, end_tolerance=30) is None
     assert align_to_survivor(TRUE[10:595], TRUE, identity_floor=0.97, end_tolerance=30)
+
+
+def test_a_poor_plausible_candidate_does_not_hide_the_extent_refusal() -> None:
+    """Codex, 2026-11-20: an exact 450-nt fragment of a 600-nt template is
+    unassigned for `extent`; adding a 450-nt candidate below the floor made
+    it `below_floor`, and reseeding (which reads `extent`) passed it over."""
+    short = TRUE[150:]
+    poor = _mutant(short, range(0, 450, 12))  # ~92% identity: below the floor
+    full_hit = _row_at(0, 0, s1=440, q_len=450, q_start=5, q_end=445,
+                       t_len=600, t_start=155, t_end=595)
+    poor_hit = _row_at(0, 1, s1=300, q_len=450, q_start=5, q_end=445,
+                       t_len=450, t_start=5, t_end=445)
+    batch, _ = assign_block_edlib(
+        _block([full_hit, poor_hit]), store=_store([TRUE, poor]), reads=_Reads([short]),
+        round_index=2, end_tolerance=30,
+    )
+    row = batch.to_pylist()[0]
+    assert row["template_id"] == -1 and row["unassigned_reason"] == "extent"

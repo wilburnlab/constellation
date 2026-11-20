@@ -1507,3 +1507,32 @@ def test_a_run_that_relates_only_its_final_round_says_so_before_it_gets_there(
     _done(rd)
     body = section_template_graph(tmp_path / "run").body
     assert "final round only" in body and "disabled" not in body
+
+
+def test_an_absorbed_node_whose_reads_its_survivor_refuses_stays_apart(tmp_path):
+    """Codex, 2026-11-20: the final merge of a 450-nt node and a 430-nt node
+    (5' 20 nt short: `equivalent`) kept the 430's nine 410-nt reads in the
+    450's cluster though the rebuild refused them — their ends are 40 nt
+    from the survivor's. Under the extent rule such a node is never
+    absorbed: it stays its own cluster, with its reads and consensus."""
+    rng = random.Random(41)
+    a = _rnd(rng, 450)
+    b = a[20:]
+    nodes = _nodes([(10, 0, 0, a, 12), (11, 1, 0, b, 9)])
+    corpus = _corpus(
+        tmp_path, nodes, mutate=lambda _rng, seq: seq if len(seq) == 450 else seq[20:]
+    )
+    out, mem, final = _final_graph_and_merge(
+        _rd(tmp_path), nodes, _membership(nodes), 1,
+        EmParams(threads=1, merge=True), _log, corpus_path=corpus,
+    )
+    assert final["n_merge_undone_extent"] == 1 and final["n_merged"] == 0
+    assert out.column("consensus").to_pylist() == [a, b]
+    owner = dict(zip(mem.column("read_row").to_pylist(), mem.column("parent_template_id").to_pylist()))
+    assert {owner[r] for r in range(12, 21)} == {11} and {owner[r] for r in range(12)} == {10}
+    # Without the rule (as before 2026-11-20) the two merge and B's reads go with A.
+    out, mem, final = _final_graph_and_merge(
+        _rd(tmp_path / "off"), nodes, _membership(nodes), 1,
+        EmParams(threads=1, merge=True, end_tolerance=None), _log, corpus_path=corpus,
+    )
+    assert final["n_merged"] == 1 and out.num_rows == 1

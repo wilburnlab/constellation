@@ -357,6 +357,26 @@ class EmParams:
                         f"{f.name} has no effect under template_graph='off': "
                         f"there is no graph for it to define `mergeable` on"
                     )
+        # One tolerance: the graph's `equivalent` relation follows the end
+        # tolerance unless its own was set —
+        # resolved before the merge tolerances are checked against it.
+        default_graph = GraphParams()
+        if (
+            self.end_tolerance is not None
+            and self.template_graph != "off"
+            and self.graph.tol_5p == default_graph.tol_5p
+            and self.graph.tol_3p == default_graph.tol_3p
+            and int(self.end_tolerance) != default_graph.tol_5p
+        ):
+            object.__setattr__(
+                self,
+                "graph",
+                dataclasses.replace(
+                    self.graph,
+                    tol_5p=int(self.end_tolerance),
+                    tol_3p=int(self.end_tolerance),
+                ),
+            )
         for name, limit in (
             ("merge_tol_5p", self.graph.tol_5p),
             ("merge_tol_3p", self.graph.tol_3p),
@@ -407,25 +427,6 @@ class EmParams:
                 self,
                 "graph",
                 dataclasses.replace(self.graph, min_budget=int(self.merge_max_edits)),
-            )
-        # One tolerance: the graph's `equivalent` relation follows the end
-        # tolerance unless its own was set.
-        default_graph = GraphParams()
-        if (
-            self.end_tolerance is not None
-            and self.template_graph != "off"
-            and self.graph.tol_5p == default_graph.tol_5p
-            and self.graph.tol_3p == default_graph.tol_3p
-            and int(self.end_tolerance) != default_graph.tol_5p
-        ):
-            object.__setattr__(
-                self,
-                "graph",
-                dataclasses.replace(
-                    self.graph,
-                    tol_5p=int(self.end_tolerance),
-                    tol_3p=int(self.end_tolerance),
-                ),
             )
 
     def round1_rule(self) -> str:
@@ -1710,6 +1711,20 @@ def _refine_and_merge(rd: Path, nodes, store, r: int, params: EmParams, log, rea
     return refined
 
 
+def reseed_representative(params: EmParams) -> str:
+    """The representative policy reseeding elects with: the run's own, unless
+    it needs an ORF the kmer seeder never predicts (``most-5p-flank``, an
+    em-orf policy), in which case the kmer default, ``longest-above-quality``.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.elect import (
+        ORF_DEPENDENT_POLICIES,
+    )
+
+    if params.seed_representative in ORF_DEPENDENT_POLICIES:
+        return "longest-above-quality"
+    return params.seed_representative
+
+
 def _reseed_unmatched(rd: Path, refined, nodes, reads, r: int, params: EmParams, log):
     """Templates for the reads round ``r`` found no template of their extent
     for (``unassigned_reason == 'extent'``), added to the next round's.
@@ -1753,8 +1768,11 @@ def _reseed_unmatched(rd: Path, refined, nodes, reads, r: int, params: EmParams,
         }
     )
     log(f"round {r}: seeding templates for {rows.size:,} reads of no template's extent")
-    try:
-        result = seed_by_kmer_clustering(
+    representative = reseed_representative(params)
+    record["reseed_representative"] = representative
+
+    def _seed(grouping: str):
+        return seed_by_kmer_clustering(
             sub,
             identity=params.seed_identity,
             max_5p_overhang=params.seed_max_5p_overhang,
@@ -1764,18 +1782,25 @@ def _reseed_unmatched(rd: Path, refined, nodes, reads, r: int, params: EmParams,
             minimizers_per_seq=params.minimizers_per_seq,
             min_shared=params.min_shared,
             diag_span_max=params.diag_span_max,
-            grouping=params.seed_grouping,
+            grouping=grouping,
             min_seed_reads=1,
-            representative=params.seed_representative,
+            representative=representative,
             max_cluster_read_frac=params.max_cluster_read_frac,
             min_chain_cluster_reads=params.min_chain_cluster_reads,
             threads=params.threads,
             progress=None,
+            # The guard's fraction is of the corpus, not of this subset.
+            corpus_reads=int(reads.n_reads),
         )
+
+    try:
+        result = _seed(params.seed_grouping)
     except ChainedClusterError as exc:
-        record["reseed_error"] = str(exc)
-        log(f"round {r}: seeding the reads of no template's extent failed: {exc}")
-        return refined, record
+        # The reads still need templates: radius-1 greedy grouping cannot
+        # chain, so it is the fallback rather than dropping them.
+        record["reseed_chained"] = str(exc)
+        log(f"round {r}: reseeding chained ({exc}); grouping greedily instead")
+        result = _seed("greedy")
     t = result.templates
     if t.num_rows == 0:
         return refined, record
@@ -1836,6 +1861,51 @@ def _merge_counts(merged: pa.Table, pairs: dict, graph: _NodeGraph) -> dict:
     }
 
 
+#: Rebuild passes the final merge may make while undoing absorptions whose
+#: reads the rebuilt survivor refused for their extent. Each pass can only
+#: undo; a pass that undoes nothing ends it.
+_MAX_UNDO_PASSES = 4
+
+
+def _absorptions_to_undo(
+    nodes: pa.Table,
+    membership: pa.Table,
+    survivor: np.ndarray,
+    keep: np.ndarray,
+    refused: dict,
+) -> np.ndarray:
+    """The absorbed node rows (of the merge's INPUT) some read of which its
+    survivor's rebuild refused for extent (``refused``: merged-table row ->
+    corpus rows). Ascending."""
+    if not refused or membership is None or membership.num_rows == 0:
+        return np.empty(0, dtype=np.int64)
+    read = np.concatenate([np.asarray(v, dtype=np.int64) for v in refused.values()])
+    by = np.concatenate(
+        [np.full(len(v), int(keep[int(j)]), dtype=np.int64) for j, v in refused.items()]
+    )
+    pid = nodes.column("parent_template_id").to_numpy(zero_copy_only=False)
+    hap = nodes.column("haplotype_id").to_numpy(zero_copy_only=False).astype(np.int64)
+    m_row = membership.column("read_row").to_numpy(zero_copy_only=False).astype(np.int64)
+    pick = np.isin(m_row, read)
+    if not pick.any():
+        return np.empty(0, dtype=np.int64)
+    m_key = rf._pair_key(
+        membership.column("parent_template_id").to_numpy(zero_copy_only=False)[pick],
+        membership.column("haplotype_id").to_numpy(zero_copy_only=False)[pick].astype(np.int64),
+    )
+    n_key = rf._pair_key(pid, hap)
+    order = np.argsort(n_key)
+    at = np.clip(np.searchsorted(n_key[order], m_key), 0, len(order) - 1)
+    found = n_key[order][at] == m_key
+    node_of_read = dict(zip(m_row[pick][found].tolist(), order[at][found].tolist()))
+    undo = set()
+    for row, surv in zip(read.tolist(), by.tolist()):
+        node = node_of_read.get(row)
+        if node is not None and node != surv and int(survivor[node]) == surv:
+            undo.add(node)
+    return np.array(sorted(undo), dtype=np.int64)
+
+
 def _final_graph_and_merge(
     rd: Path,
     nodes,
@@ -1890,6 +1960,9 @@ def _final_graph_and_merge(
     if params.merge:
         pred = params.merge_predicate()
         pairs = _mergeable(graph, params, exact_only=False)
+        # The merge's inputs, kept: an absorption the rebuild undoes is
+        # re-applied from them.
+        pre_nodes, pre_membership = nodes, membership
         nodes, membership, n_merged, survivor = rf.merge_nodes(
             nodes,
             membership,
@@ -1926,18 +1999,65 @@ def _final_graph_and_merge(
             if corpus_path is None:
                 final["rebuild"] = "skipped: no corpus"
             else:
-                nodes, counts, rebuilt_rows = rebuild_survivors(
-                    nodes,
-                    membership,
-                    grew,
-                    str(corpus_path),
-                    params=params.mstep,
-                    identity_floor=params.p_floor,
-                    quality_scale=params.p_floor_quality_scale,
-                    end_tolerance=params.end_tolerance,
-                    threads=params.threads,
-                    log=log,
-                )
+                n_undone = 0
+                for _pass in range(_MAX_UNDO_PASSES):
+                    refused: dict = {}
+                    rebuilt_nodes, counts, rebuilt_rows = rebuild_survivors(
+                        nodes,
+                        membership,
+                        grew,
+                        str(corpus_path),
+                        params=params.mstep,
+                        identity_floor=params.p_floor,
+                        quality_scale=params.p_floor_quality_scale,
+                        end_tolerance=params.end_tolerance,
+                        threads=params.threads,
+                        log=log,
+                        refused_out=refused,
+                    )
+                    undo = _absorptions_to_undo(
+                        pre_nodes, pre_membership, survivor, keep, refused
+                    )
+                    # The last pass keeps what it rebuilt: undoing after it
+                    # would leave nodes rebuilt for another grouping.
+                    if undo.size == 0 or _pass == _MAX_UNDO_PASSES - 1:
+                        break
+                    # A node some of whose reads the survivor's rebuilt
+                    # consensus refused for their extent was never of the
+                    # survivor's extent: it stays a cluster of its own, with
+                    # its reads and consensus, and the survivor is rebuilt
+                    # from what is left. Whole nodes, so membership, counts
+                    # and the merge record agree.
+                    n_undone += int(undo.size)
+                    survivor = survivor.copy()
+                    survivor[undo] = undo
+                    nodes, membership, n_merged = rf.apply_survivors(
+                        pre_nodes, pre_membership, survivor
+                    )
+                    merged = rf.merged_table(
+                        graph.ids,
+                        survivor,
+                        pairs["src_row"],
+                        pairs["dst_row"],
+                        pairs["off_5p"],
+                        pairs["off_3p"],
+                        graph.n_reads,
+                        round_index=r + 1,
+                    )
+                    keep = np.flatnonzero(survivor == np.arange(survivor.shape[0]))
+                    absorbed_into = np.bincount(survivor, minlength=survivor.shape[0])[keep]
+                    grew = np.flatnonzero(absorbed_into > 1)
+                    final.update(
+                        n_merged=int(n_merged),
+                        n_merged_kin=_merge_counts(merged, pairs, graph)["n_merged_kin"],
+                    )
+                nodes = rebuilt_nodes
+                final["n_merge_undone_extent"] = n_undone
+                if n_undone and log:
+                    log(
+                        f"final output: {n_undone:,} absorbed node(s) kept apart, "
+                        f"their reads refused by the survivor for their extent"
+                    )
                 final["rebuild"] = "ok"
                 final.update(counts)
                 final["rebuilt_rows"] = rebuilt_rows

@@ -179,9 +179,9 @@ def _identity_columns(
     enough of the pair to count (every one, where no guard applies). An
     unassigned read's identity is the best among alignments that COUNTED.
     ``extent_refused`` marks hits that cleared the floor with an end beyond
-    the tolerance, ``extent_cut`` (one per group) reads whose every
-    candidate the extent pre-filter set aside: either makes an unassigned
-    read's reason ``extent``.
+    the tolerance, ``extent_cut`` (one per group) reads some candidate of
+    which the extent pre-filter set aside: either makes an unassigned read's
+    reason ``extent``, ahead of what its other candidates failed on.
     """
     n_groups = group_ptr.size - 1
     sizes = np.diff(group_ptr)
@@ -654,8 +654,16 @@ def assign_block_edlib(
             np.asarray(store.lengths(), dtype=np.int64)[hb.template_row],
             tolerance=end_tolerance,
         )
-        extent_cut = np.add.reduceat(allowed.astype(np.int64), ptr[:-1]) == 0
-        if extent_cut.any():
+        # Per read: some candidate was set aside for its extent. A read left
+        # unassigned with one is a read of no template's extent, whatever its
+        # other candidates failed on (a plausible one below the floor must
+        # not hide the template it matched at another length) — that is
+        # what reseeding reads.
+        extent_cut = (
+            np.add.reduceat((~allowed).astype(np.int64), ptr[:-1]) > 0
+        )
+        no_plausible = np.add.reduceat(allowed.astype(np.int64), ptr[:-1]) == 0
+        if no_plausible.any():
             # A read with no plausible candidate keeps its best by chain
             # score (one alignment, which settles it): every stage after
             # this one assumes each read keeps a hit, and the reason it
@@ -663,7 +671,7 @@ def assign_block_edlib(
             grp_h = np.repeat(np.arange(n_groups), sizes)
             order = np.lexsort((np.arange(len(hb)), -np.asarray(chain, dtype=np.float64), grp_h))
             first = order[ptr[:-1]]
-            allowed[first[extent_cut]] = True
+            allowed[first[no_plausible]] = True
     keep, chain_rank, n_eligible = sched.shortlist_by_chain(
         chain,
         ptr,

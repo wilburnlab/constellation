@@ -79,6 +79,13 @@ The whole exact part, every digest identical: **em-kmer 38.1 → 29.7 s (−22%)
 | P3.8 | **New templates from unmatched reads:** after each round's refine and merge, the reads refused for extent are grouped by the kmer seeder under the run's seeding gate, one elected per group, as templates of the next round (`seed` lineage rows; counts in `refine.json` and the report's rounds table). The live loop and the resume rebuild share the path. Reads refused in the last round stay unassigned. |
 | P3.9 | **Tests and docs:** `tests/test_em_extent.py` (full-length, 5′-UTR-truncated and short-3′ reads of one gene: three clusters related by `contained` 5p/3p edges under ORF seeding, where they share a seed; every assignment within the tolerance and no mixed cluster under either seeder; mixed again with the rule off); the three-gene golden digests are unchanged, since its reads are full length; `sequencing/CLAUDE.md` and the root notes corrected. |
 
+**Review (Codex, 2026-11-20).** Five findings, all fixed, each with a test that fails on the code before:
+- A plausible candidate below the floor hid a read's extent refusal (it became `below_floor`, which reseeding skips). An unassigned read is now `extent` whenever any candidate was set aside or refused for extent.
+- The reseeding chain guard measured a cluster against the refused subset. It now measures against the corpus, and a chained reseed falls back to greedy grouping.
+- The final merge kept reads in a survivor whose rebuild refused them for extent. Such an absorbed node is now kept apart whole, and the survivor is rebuilt without it.
+- `--seed-representative most-5p-flank` (em-orf) crashed reseeding. It now reseeds with `longest-above-quality`.
+- Merge tolerances were checked before the graph inherited the end tolerance. The order is now the other way round.
+
 **On the bench corpus** (4,997 reads, a quarter of them 5′-truncated at random positions and 15% at sharp internal starts; 3 rounds, native E-step, one thread):
 
 | | Clusters (≥ 2 reads) | Reads in clusters | E-step / round | Wall |
