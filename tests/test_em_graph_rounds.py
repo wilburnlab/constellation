@@ -1169,7 +1169,10 @@ def test_cluster_edges_describe_the_clusters_that_were_written(tmp_path):
 
     nodes, corpus, long = _stale_edge_case(tmp_path)
     rd = _rd(tmp_path)
-    params = EmParams(threads=1, merge=True)
+    # Reads 40 nt past their node's consensus exist only without the extent
+    # rule (since 2026-11-20 they are refused, 40 > 30); this is about
+    # relating what a rebuild wrote, so it runs with the rule off.
+    params = EmParams(threads=1, merge=True, end_tolerance=None)
     out_nodes, _, final = _final_graph_and_merge(
         rd, nodes, _membership(nodes), 1, params, _log, corpus_path=corpus
     )
@@ -1245,7 +1248,7 @@ def test_a_failure_relating_the_final_clusters_writes_no_stale_edges(
 
     nodes, corpus, _ = _stale_edge_case(tmp_path)
     rd = _rd(tmp_path)
-    params = EmParams(threads=1, merge=True)
+    params = EmParams(threads=1, merge=True, end_tolerance=None)  # see above
     out_nodes, _, final = _final_graph_and_merge(
         rd, nodes, _membership(nodes), 1, params, _log, corpus_path=corpus
     )

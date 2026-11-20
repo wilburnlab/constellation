@@ -397,3 +397,101 @@ def test_identity_band_round1_records_the_runner_up():
     row = batch.to_pylist()[0]
     assert row["template_row"] == 0 and row["runner_up_template_id"] == 101
     assert row["runner_up_logl_gap"] is None
+
+
+# ── extent (2026-11-20: a read joins a template only at its extent) ───
+
+
+def _row_at(q, t, *, s1, q_len, q_start, q_end, t_len, t_start, t_end):
+    return (
+        f"{q}\t{q_len}\t{q_start}\t{q_end}\t+\t{t}\t{t_len}\t{t_start}\t"
+        f"{t_end}\t{q_len // 2}\t{q_len}\t0\ttp:A:S\tcm:i:50\ts1:i:{s1}\t"
+        f"dv:f:0.01\trl:i:0"
+    )
+
+
+@pytest.mark.parametrize("round_index", [1, 2])
+def test_a_5p_truncated_read_joins_the_template_of_its_extent(round_index) -> None:
+    """A read starting 150 nt into a transcript joins the template of that
+    extent, never the full-length one, though both contain it exactly; with
+    only the full-length one it is unassigned, for `extent`."""
+    short = TRUE[150:]
+    reads = _Reads([short])
+    full_hit = _row_at(0, 0, s1=440, q_len=450, q_start=5, q_end=445,
+                       t_len=600, t_start=155, t_end=595)
+    short_hit = _row_at(0, 1, s1=440, q_len=450, q_start=5, q_end=445,
+                        t_len=450, t_start=5, t_end=445)
+    store = _store([TRUE, short], weight=[50.0, 1.0])
+    batch, _ = assign_block_edlib(
+        _block([full_hit, short_hit]), store=store, reads=reads,
+        round_index=round_index, end_tolerance=30, round1_rule="identity_band",
+    )
+    assert batch.to_pylist()[0]["template_row"] == 1
+    # The full-length template alone: refused, for its extent.
+    batch, _ = assign_block_edlib(
+        _block([full_hit]), store=_store([TRUE]), reads=reads,
+        round_index=round_index, end_tolerance=30, round1_rule="identity_band",
+    )
+    row = batch.to_pylist()[0]
+    assert row["template_id"] == -1 and row["unassigned_reason"] == "extent"
+    # Without the rule (the loop before 2026-11-20) it is taken.
+    batch, _ = assign_block_edlib(
+        _block([full_hit]), store=_store([TRUE]), reads=reads,
+        round_index=round_index, end_tolerance=None, round1_rule="identity_band",
+    )
+    assert batch.to_pylist()[0]["template_row"] == 0
+
+
+def test_extent_is_symmetric_and_has_a_tolerance() -> None:
+    """A read longer than its template is refused as a shorter one is; ends
+    within the tolerance are the same extent."""
+    store = _store([TRUE[100:]])
+    batch, _ = assign_block_edlib(
+        _block([_row_at(0, 0, s1=490, q_len=600, q_start=105, q_end=595,
+                        t_len=500, t_start=5, t_end=495)]),
+        store=store, reads=_Reads([TRUE]), round_index=2, end_tolerance=30,
+    )
+    assert batch.to_pylist()[0]["unassigned_reason"] == "extent"
+    near = TRUE[20:590]
+    batch, _ = assign_block_edlib(
+        _block([_row_at(0, 0, s1=560, q_len=570, q_start=5, q_end=565,
+                        t_len=600, t_start=25, t_end=585)]),
+        store=_store([TRUE]), reads=_Reads([near]), round_index=2, end_tolerance=30,
+    )
+    row = batch.to_pylist()[0]
+    assert row["template_row"] == 0
+    assert (row["t_start"], 600 - row["t_end"]) == (20, 10)
+
+
+def test_extent_rule_pieces() -> None:
+    from constellation.sequencing.transcriptome.cluster.denovo.em import scheduler as sched
+
+    ok = sched.extent_ok(
+        np.array([0, 31, 0, 0, 0]), np.array([100, 100, 100, 100, 69]), 100,
+        np.array([30, 0, 31, 0, 0]), np.array([100, 100, 100, 69, 100]), 100,
+        tolerance=30,
+    )
+    assert ok.tolist() == [True, False, False, False, False]
+    assert sched.extent_ok(0, 1, 100, 50, 51, 100, tolerance=None).all()
+    # Room past the tolerance for an approximate placement's drift.
+    plaus = sched.extent_plausible(
+        np.array([0, 0]), np.array([1000, 1000]), 1000,
+        np.array([60, 90]), np.array([1000, 1000]), 1000, tolerance=30,
+    )
+    assert plaus.tolist() == [True, False]
+    # The shortlist drops hits that are not allowed, best score included.
+    keep, _rank, n_elig = sched.shortlist_by_chain(
+        np.array([100, 90, 50]), np.array([0, 3]), k=5, frac=0.8,
+        allowed=np.array([False, True, True]),
+    )
+    assert keep.tolist() == [False, True, False] and n_elig.tolist() == [1]
+
+
+def test_the_final_rebuild_holds_reads_to_the_same_extent() -> None:
+    from constellation.sequencing.transcriptome.cluster.denovo.em.rebuild import (
+        align_to_survivor,
+    )
+
+    assert align_to_survivor(TRUE[150:], TRUE, identity_floor=0.97) is not None
+    assert align_to_survivor(TRUE[150:], TRUE, identity_floor=0.97, end_tolerance=30) is None
+    assert align_to_survivor(TRUE[10:595], TRUE, identity_floor=0.97, end_tolerance=30)

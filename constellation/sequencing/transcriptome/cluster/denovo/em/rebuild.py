@@ -49,6 +49,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.realign import (
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
     MIN_PLACED_FRACTION,
+    extent_ok,
     floor_per_read,
     placed_enough,
 )
@@ -81,7 +82,9 @@ _IN_FLIGHT = 4
 _MIN_PLACED_FRACTION = MIN_PLACED_FRACTION
 
 
-def align_to_survivor(read: str, consensus: str, *, identity_floor: float):
+def align_to_survivor(
+    read: str, consensus: str, *, identity_floor: float, end_tolerance: int | None = None
+):
     """``(cigar, t_start, q_start)`` of ``read`` on ``consensus``, or ``None``
     below the floor, placed over less than half of the shorter of the two,
     or not placed at all. The E-step's aligner, run with no chain to guide
@@ -110,6 +113,18 @@ def align_to_survivor(read: str, consensus: str, *, identity_floor: float):
         fraction=_MIN_PLACED_FRACTION,
     ):
         return None
+    # The E-step's extent rule: a read of another extent was never one of
+    # the survivor's reads (`scheduler.extent_ok`).
+    if not extent_ok(
+        hit.q_start,
+        hit.q_end,
+        len(read),
+        hit.t_start,
+        hit.t_end,
+        len(consensus),
+        tolerance=end_tolerance,
+    ):
+        return None
     return hit.cigar, int(hit.t_start), int(hit.q_start)
 
 
@@ -135,6 +150,7 @@ def rebuild_one(
     params: MStepParams,
     identity_floor: float,
     quality_scale: float | None = None,
+    end_tolerance: int | None = None,
 ) -> tuple[int, dict | None, int, float]:
     """One survivor. Returns ``(row, rebuilt or None, n_skipped, fraction)``.
 
@@ -157,6 +173,7 @@ def rebuild_one(
         params=params,
         identity_floor=identity_floor,
         quality_scale=quality_scale,
+        end_tolerance=end_tolerance,
     )
     node = pooled_node(
         consensus,
@@ -198,6 +215,7 @@ def rebuild_members(
     params: MStepParams,
     identity_floor: float,
     quality_scale: float | None = None,
+    end_tolerance: int | None = None,
 ) -> tuple[list[MemberSpec], np.ndarray, int, float]:
     """The pooled reads of a survivor, aligned to its consensus.
 
@@ -227,7 +245,9 @@ def rebuild_members(
     members: list[MemberSpec] = []
     n_skipped = 0
     for i, seq in enumerate(reads.take_sequences(rows)):
-        placed = align_to_survivor(seq, consensus, identity_floor=float(floors[i]))
+        placed = align_to_survivor(
+            seq, consensus, identity_floor=float(floors[i]), end_tolerance=end_tolerance
+        )
         if placed is None:
             n_skipped += 1
             continue
@@ -297,6 +317,7 @@ def rebuild_survivors(
     params: MStepParams,
     identity_floor: float,
     quality_scale: float | None = None,
+    end_tolerance: int | None = None,
     threads: int = 1,
     log=None,
 ) -> tuple[pa.Table, dict, np.ndarray]:
@@ -332,6 +353,7 @@ def rebuild_survivors(
         "params": params,
         "identity_floor": float(identity_floor),
         "quality_scale": quality_scale,
+        "end_tolerance": end_tolerance,
     }
     tasks = [
         (int(r), consensus[int(r)].as_py(), read_rows[i], int(template_id[r]))

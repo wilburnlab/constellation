@@ -103,6 +103,9 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
     read_round_membership,
     read_round_nodes,
 )
+from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
+    DEFAULT_END_TOLERANCE,
+)
 from constellation.sequencing.transcriptome.cluster.denovo.em.seed import (
     extract_seed_orfs,
 )
@@ -134,6 +137,14 @@ class EmParams:
     stop_frac_changed: float = 0.005
     # The pool (A1) — a correctness parameter, not a cost one.
     p_floor: float = 0.97
+    #: How far (nt) each end of a read may lie from its template's end for
+    #: the read to join it (`scheduler.extent_ok`; PI, 2026-11-20: the EM
+    #: removes sequencing error only, and a molecule of another extent is a
+    #: relation between templates, answered after clustering). The same
+    #: value bounds the kmer seeder's overhangs, the final rebuild and,
+    #: unless set apart, the graph's `equivalent` relation. ``None`` turns
+    #: the rule off (the loop before 2026-11-20).
+    end_tolerance: int | None = DEFAULT_END_TOLERANCE
     minimap2_n: int = 500
     index_batch_size: str = "16G"
     # The E-step's base aligner. "minimap2" is the single pass (`-c` on every
@@ -230,8 +241,9 @@ class EmParams:
     minimizers_per_seq: int | None = 50
     # kmer seeding only — the read-level gate and grouping.
     seed_identity: float = DEFAULT_SEED_IDENTITY
-    seed_max_5p_overhang: int = DEFAULT_SEED_MAX_5P
-    seed_max_3p_overhang: int = DEFAULT_SEED_MAX_3P
+    #: ``None``: the end tolerance (or, with it off, 5' unbounded / 3' 100).
+    seed_max_5p_overhang: int | None = None
+    seed_max_3p_overhang: int | None = None
     seed_grouping: str = "components"
     min_shared: int = 2
     diag_span_max: int = 20
@@ -251,6 +263,24 @@ class EmParams:
     mstep_evidence: Literal["compact", "none"] = "compact"
 
     def __post_init__(self) -> None:
+        if self.end_tolerance is not None and (
+            isinstance(self.end_tolerance, bool)
+            or not isinstance(self.end_tolerance, int)
+            or self.end_tolerance < 0
+        ):
+            raise ValueError(
+                f"end_tolerance must be an int >= 0 or None, got {self.end_tolerance!r}"
+            )
+        for name, fallback in (
+            ("seed_max_5p_overhang", DEFAULT_SEED_MAX_5P),
+            ("seed_max_3p_overhang", DEFAULT_SEED_MAX_3P),
+        ):
+            if getattr(self, name) is None:
+                object.__setattr__(
+                    self,
+                    name,
+                    int(self.end_tolerance) if self.end_tolerance is not None else fallback,
+                )
         if self.mstep_evidence not in ("compact", "none"):
             raise ValueError(
                 f"mstep_evidence must be 'compact' or 'none', got "
@@ -374,6 +404,25 @@ class EmParams:
                 self,
                 "graph",
                 dataclasses.replace(self.graph, min_budget=int(self.merge_max_edits)),
+            )
+        # One tolerance: the graph's `equivalent` relation follows the end
+        # tolerance unless its own was set.
+        default_graph = GraphParams()
+        if (
+            self.end_tolerance is not None
+            and self.template_graph != "off"
+            and self.graph.tol_5p == default_graph.tol_5p
+            and self.graph.tol_3p == default_graph.tol_3p
+            and int(self.end_tolerance) != default_graph.tol_5p
+        ):
+            object.__setattr__(
+                self,
+                "graph",
+                dataclasses.replace(
+                    self.graph,
+                    tol_5p=int(self.end_tolerance),
+                    tol_3p=int(self.end_tolerance),
+                ),
             )
 
     def round1_rule(self) -> str:
@@ -768,6 +817,7 @@ def _one_round(
             round1_rule=params.round1_rule(),
             near_tie_z=params.near_tie_z,
             error_rate=params.read_error_rate,
+            end_tolerance=params.end_tolerance,
         )
     else:
         estep_stats = run_em_estep(
@@ -787,6 +837,7 @@ def _one_round(
             near_tie_z=params.near_tie_z,
             error_rate=params.read_error_rate,
             round1_rule=params.round1_rule(),
+            end_tolerance=params.end_tolerance,
             progress=log,
             **_estep_aligner_kwargs(params, rd, corpus),
         )
@@ -886,6 +937,7 @@ def _check_estep_stamp(rounds_dir: Path, params: EmParams, resume: bool) -> None
         "estep_aligner": params.estep_aligner,
         "p_floor_quality_scale": params.p_floor_quality_scale,
         "round1_rule": params.round1_rule(),
+        "end_tolerance": params.end_tolerance,
     }
     if params.estep_aligner in ("edlib", "native"):
         # The shortlist is what the ranking sees; a changed size mid-run
@@ -919,6 +971,9 @@ def _check_estep_stamp(rounds_dir: Path, params: EmParams, resume: bool) -> None
             "estep_aligner": "minimap2",
             "p_floor_quality_scale": None,
             "round1_rule": "replication",
+            # Before 2026-11-20 nothing compared a read's extent with its
+            # template's.
+            "end_tolerance": None,
             "estep_shortlist_k": 16,
             "estep_shortlist_frac": 0.8,
             "two_pass_rules": 1,
@@ -1770,6 +1825,7 @@ def _final_graph_and_merge(
                     params=params.mstep,
                     identity_floor=params.p_floor,
                     quality_scale=params.p_floor_quality_scale,
+                    end_tolerance=params.end_tolerance,
                     threads=params.threads,
                     log=log,
                 )

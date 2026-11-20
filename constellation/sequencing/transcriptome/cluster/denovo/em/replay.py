@@ -882,6 +882,8 @@ def _replay_rebuilt(run_dir: Path, row: dict, is_ours, params, index: RoundIndex
         params=mparams,
         identity_floor=float(em.get("p_floor", 0.97)),
         quality_scale=em.get("p_floor_quality_scale"),
+        # A run from before the extent rule recorded none: it had no rule.
+        end_tolerance=em.get("end_tolerance"),
     )
     node, cres = pooled_node_with_consensus(
         consensus,

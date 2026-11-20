@@ -127,6 +127,11 @@ UNASSIGNED_REASONS = (
     "below_floor",
     "no_alignment",
     "short_placement",
+    # Some template was close enough in sequence, none in extent: every
+    # candidate was set aside unaligned by the extent pre-filter, or aligned
+    # within the floor with an end beyond `end_tolerance`. Such a read seeds a
+    # template of its own the next round.
+    "extent",
 )
 
 
@@ -163,6 +168,8 @@ def _identity_columns(
     group_ptr: np.ndarray,
     attempted: np.ndarray | None = None,
     placed: np.ndarray | None = None,
+    extent_refused: np.ndarray | None = None,
+    extent_cut: np.ndarray | None = None,
 ) -> tuple[pa.Array, pa.Array, pa.Array]:
     """``(identity, aligned_len, unassigned_reason)`` for one block.
 
@@ -171,6 +178,10 @@ def _identity_columns(
     for a single-pass aligner); ``placed`` marks alignments that cover
     enough of the pair to count (every one, where no guard applies). An
     unassigned read's identity is the best among alignments that COUNTED.
+    ``extent_refused`` marks hits that cleared the floor with an end beyond
+    the tolerance, ``extent_cut`` (one per group) reads whose every
+    candidate the extent pre-filter set aside: either makes an unassigned
+    read's reason ``extent``.
     """
     n_groups = group_ptr.size - 1
     sizes = np.diff(group_ptr)
@@ -201,14 +212,24 @@ def _identity_columns(
     )
     win_len = aln_len[slot] if aln_len.size else np.zeros(n_groups, dtype=np.int64)
     len_arr = pa.array(win_len.astype(np.int32), mask=~has)
+    by_extent = np.zeros(n_groups, dtype=bool)
+    if extent_refused is not None and extent_refused.size:
+        n_ext = np.add.reduceat(extent_refused.astype(np.int64), group_ptr[:-1])
+        by_extent |= (sizes > 0) & (n_ext > 0)
+    if extent_cut is not None:
+        by_extent |= np.asarray(extent_cut, dtype=bool)
     # Indices into UNASSIGNED_REASONS.
     reason = np.where(
         has,
         -1,
         np.where(
-            n_counted > 0,
-            1,
-            np.where(n_produced > 0, 3, np.where(n_tried > 0, 2, 0)),
+            by_extent,
+            4,
+            np.where(
+                n_counted > 0,
+                1,
+                np.where(n_produced > 0, 3, np.where(n_tried > 0, 2, 0)),
+            ),
         ),
     )
     lookup = np.array([None, *UNASSIGNED_REASONS], dtype=object)
@@ -291,8 +312,12 @@ def assign_block(
     keep_cigars: bool = True,
     p_floor_quality_scale: float | None = None,
     round1_rule: str = "replication",
+    end_tolerance: int | None = None,
 ) -> pa.RecordBatch:
     """Reduce one :class:`HitBlock` to one assignment row per read.
+
+    ``end_tolerance`` admits a hit only when read and template have the
+    same extent (:func:`.scheduler.extent_ok`); ``None`` does not ask.
 
     ``round1_rule`` is the seeder's property: ``"replication"`` (em-orf —
     identity among single-read seeds is self-capture bait) or
@@ -315,6 +340,18 @@ def assign_block(
     admitted, n_admitted = sched.admit_candidates(
         hb.n_match, hb.aln_len, ptr, p_floor=hit_floor
     )
+    extent_refused = None
+    if end_tolerance is not None and len(hb):
+        f = hb.int_fields(np.arange(len(hb)), _WINNER_FIELDS)
+        same = sched.extent_ok(
+            f["q_start"], f["q_end"], f["q_len"], f["t_start"], f["t_end"], f["t_len"],
+            tolerance=end_tolerance,
+        )
+        extent_refused = admitted & ~same
+        admitted = admitted & same
+        n_admitted = np.where(
+            sizes > 0, np.add.reduceat(admitted.astype(np.int64), ptr[:-1]), 0
+        )
 
     logl = np.full(hb.read_row.size, -np.inf, dtype=np.float64)
     logl_delta = np.full(hb.read_row.size, np.inf, dtype=np.float64)
@@ -437,7 +474,12 @@ def assign_block(
     t_id = np.where(has, store.template_id[hb.template_row[slot]], -1).astype(np.int64)
 
     ident_arr, len_arr, reason_arr = _identity_columns(
-        has, slot, np.asarray(hb.n_match), np.asarray(hb.aln_len), ptr
+        has,
+        slot,
+        np.asarray(hb.n_match),
+        np.asarray(hb.aln_len),
+        ptr,
+        extent_refused=extent_refused,
     )
     return pa.RecordBatch.from_arrays(
         [
@@ -543,6 +585,7 @@ def assign_block_edlib(
     round1_rule: str = "replication",
     near_tie_z: float = 2.0,
     error_rate: float = 0.01,
+    end_tolerance: int | None = None,
     min_placed_fraction: float = sched.MIN_PLACED_FRACTION,
     **_ignored,
 ) -> tuple[pa.RecordBatch, int]:
@@ -594,12 +637,40 @@ def assign_block_edlib(
         if hb.chain_score is not None
         else np.zeros(len(hb), dtype=np.int64)
     )
+    read_seqs = reads.take_sequences(read_of_group)
+    # The extent pre-filter: a candidate whose approximate placement already
+    # ends beyond the tolerance cannot be admitted, so it is set aside before
+    # the shortlist, where a family of longer templates would otherwise
+    # crowd out the one that matches.
+    allowed = extent_cut = None
+    if end_tolerance is not None:
+        f = hb.int_fields(np.arange(len(hb)), _SHORTLIST_FIELDS)
+        allowed = sched.extent_plausible(
+            f["q_start"],
+            f["q_end"],
+            _reads_len(read_seqs, np.arange(n_groups))[np.repeat(np.arange(n_groups), sizes)],
+            f["t_start"],
+            f["t_end"],
+            np.asarray(store.lengths(), dtype=np.int64)[hb.template_row],
+            tolerance=end_tolerance,
+        )
+        extent_cut = np.add.reduceat(allowed.astype(np.int64), ptr[:-1]) == 0
+        if extent_cut.any():
+            # A read with no plausible candidate keeps its best by chain
+            # score (one alignment, which settles it): every stage after
+            # this one assumes each read keeps a hit, and the reason it
+            # reports is `extent` whatever that alignment finds.
+            grp_h = np.repeat(np.arange(n_groups), sizes)
+            order = np.lexsort((np.arange(len(hb)), -np.asarray(chain, dtype=np.float64), grp_h))
+            first = order[ptr[:-1]]
+            allowed[first[extent_cut]] = True
     keep, chain_rank, n_eligible = sched.shortlist_by_chain(
         chain,
         ptr,
         k=shortlist_k,
         frac=shortlist_frac,
         support=np.asarray(store.node_weight, dtype=np.float64)[hb.template_row],
+        allowed=allowed,
     )
     is_lazy = lazy_round1(round_index, round1_rule)
     if is_lazy:
@@ -609,7 +680,7 @@ def assign_block_edlib(
         # cut, 28 surviving templates against minimap2's 13). Every hit
         # stays a candidate; `shortlist_k` bounds the ALIGNMENT ATTEMPTS of
         # the lazy walk instead, which usually stops at the first.
-        keep = np.ones(len(hb), dtype=bool)
+        keep = np.ones(len(hb), dtype=bool) if allowed is None else allowed.copy()
     sel = np.flatnonzero(keep)  # hit order is preserved, so groups stay contiguous
     sub_sizes = np.add.reduceat(keep.astype(np.int64), ptr[:-1])
     sub_ptr = np.concatenate([[0], np.cumsum(sub_sizes)]).astype(np.int64)
@@ -628,7 +699,6 @@ def assign_block_edlib(
     t_end = np.zeros(m, dtype=np.int64)
     cigars: list[str | None] = [None] * m
 
-    read_seqs = reads.take_sequences(read_of_group)
     tmpl_cache: dict[int, str] = {}
     # One len() per READ, gathered per hit: round 1's lazy walk keeps every
     # hit, and a Python call per hit there is tens of millions a block.
@@ -677,10 +747,19 @@ def assign_block_edlib(
             fraction=min_placed_fraction,
         )
 
-    def _admitted() -> np.ndarray:
+    def _same_extent() -> np.ndarray:
+        return sched.extent_ok(
+            q_start, q_end, read_len_h, t_start, t_end, t_len_h, tolerance=end_tolerance
+        )
+
+    def _cleared() -> np.ndarray:
+        """Aligned, placed and within the floor: admitted but for extent."""
         with np.errstate(divide="ignore", invalid="ignore"):
             ident = np.where(aln_len > 0, n_match / np.maximum(aln_len, 1), 0.0)
         return aligned & (aln_len > 0) & _placed() & (ident >= sub_floor)
+
+    def _admitted() -> np.ndarray:
+        return _cleared() & _same_extent()
 
     logl = np.full(m, -np.inf, dtype=np.float64)
     logl_delta = np.full(m, np.inf, dtype=np.float64)
@@ -808,7 +887,15 @@ def assign_block_edlib(
         return np.where(has, a[slot] if m else 0, 0)
 
     ident_arr, len_arr, reason_arr = _identity_columns(
-        has, slot, n_match, aln_len, sub_ptr, attempted=aligned, placed=_placed()
+        has,
+        slot,
+        n_match,
+        aln_len,
+        sub_ptr,
+        attempted=aligned,
+        placed=_placed(),
+        extent_refused=_cleared() & ~_same_extent() if end_tolerance is not None else None,
+        extent_cut=extent_cut,
     )
     cap_col = cap_hit if cap_hit is not None else sizes >= int(minimap2_n) + 1
     batch = pa.RecordBatch.from_arrays(
