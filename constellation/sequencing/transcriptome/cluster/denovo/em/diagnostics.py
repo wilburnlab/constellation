@@ -60,6 +60,22 @@ def _round_json(d: Path) -> dict:
     return json.loads(path.read_text()) if path.exists() else {}
 
 
+def _round_nodes(d: Path, columns: list[str] | None = None) -> pa.Table | None:
+    """A finished round's M-step nodes, through :mod:`.round_io` — never a
+    glob, which reads shards an earlier attempt with more units left behind.
+    ``None`` when the shards on disk are not the round's; a report never
+    raises over that."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        StaleShardsError,
+        read_round_nodes,
+    )
+
+    try:
+        return read_round_nodes(d, columns=columns)
+    except StaleShardsError:
+        return None
+
+
 def _table(directory: Path, pattern: str = "part-*.parquet") -> pa.Table | None:
     files = sorted(Path(directory).glob(pattern))
     if not files:
@@ -267,10 +283,48 @@ def section_assignment_rule(em_dir: Path) -> ReportSection:
     delta = assigned.column("logl_delta").to_numpy(zero_copy_only=False)
     overridden = np.nansum(delta > 0) if delta.size else 0
 
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        round_runner_up_measured,
+    )
+
+    measured = round_runner_up_measured(d)
+    if "runner_up_template_id" in assigned.column_names and not measured:
+        # The lazy round-1 walk stops at its first admitted template, so it
+        # never learns who came second: every runner-up is null, and reading
+        # null as "no rival" reported the whole round uncontested.
+        uncontested = None
+        uncontested_how = (
+            "unknown — this round's rule (round 1's lazy walk under ORF "
+            "seeding, --estep-aligner edlib / native) stops at the first "
+            "admitted template and never measures a runner-up"
+        )
+        contested = None
+    elif "runner_up_template_id" in assigned.column_names:
+        # A read with no other admitted TEMPLATE is uncontested. Counting
+        # admitted hits instead counted a second minimap2 hit on the winner's
+        # own template as a contender.
+        runner = assigned.column("runner_up_template_id")
+        uncontested = runner.null_count / n
+        uncontested_how = "no runner-up template"
+        contested = _contested_fraction(assigned)
+    else:
+        uncontested = float((n_adm == 1).mean())
+        uncontested_how = "`n_admitted == 1`; this round predates the runner-up"
+        contested = None
     body = (
         f"Round {r}, {n:,} assigned reads.\n\n"
-        f"- uncontested (`n_admitted == 1`): **{(n_adm == 1).mean():.2%}**\n"
-        f"- median admitted candidates: **{int(np.median(n_adm))}**\n"
+        + (
+            f"- uncontested ({uncontested_how}): **{uncontested:.2%}**\n"
+            if uncontested is not None
+            else f"- contested / uncontested: **{uncontested_how}**\n"
+        )
+        + (
+            f"- contested — the runner-up's identity within the read's own "
+            f"noise band of the winner's: **{contested:.2%}**\n"
+            if contested is not None
+            else ""
+        )
+        + f"- median admitted candidates: **{int(np.median(n_adm))}**\n"
         f"- p90 admitted candidates: **{int(np.percentile(n_adm, 90))}**\n"
         f"- winner is not the argmax: **{overridden / n:.2%}** "
         "(the abundance escape; every one is inside `--near-tie-delta-logl` "
@@ -285,11 +339,30 @@ def section_assignment_rule(em_dir: Path) -> ReportSection:
     return ReportSection(title="Assignment rule", body=body, flags=flags)
 
 
+def _contested_fraction(
+    assigned: pa.Table, *, z: float = 2.0, error_rate: float = 0.01
+) -> float:
+    """Reads whose runner-up is within the winner's own identity noise band,
+    ``z·sqrt(L·e(1−e))/L`` over the aligned length — the band round 1's
+    identity rule treats as a tie."""
+    ident = assigned.column("identity").to_numpy(zero_copy_only=False).astype(float)
+    rival = assigned.column("runner_up_identity").to_numpy(zero_copy_only=False).astype(
+        float
+    )
+    length = np.maximum(
+        assigned.column("aligned_len").to_numpy(zero_copy_only=False).astype(float), 1.0
+    )
+    width = z * np.sqrt(length * error_rate * (1.0 - error_rate)) / length
+    with np.errstate(invalid="ignore"):
+        close = np.isfinite(rival) & np.isfinite(ident) & (ident - rival <= width)
+    return float(close.mean()) if close.size else 0.0
+
+
 def section_reference_drift(em_dir: Path) -> ReportSection:
     """Reference and ORF length per round — the ledger #42 instrumentation."""
     rows = []
     for r, d in _rounds(em_dir):
-        nodes = _table(d / "mstep" / "nodes")
+        nodes = _round_nodes(d)
         if nodes is None or nodes.num_rows == 0:
             continue
         cons_len = pc.utf8_length(nodes.column("consensus")).to_numpy(
@@ -399,10 +472,10 @@ def _resplit_survivors(rd: Path, next_rd: Path | None) -> int | None:
     survivors = pq.read_table(merged, columns=["survivor_template_id"]).column(0)
     if len(survivors) == 0:
         return 0
-    files = sorted((next_rd / "mstep" / "nodes").glob("part-*.parquet"))
-    if not files:
+    nodes = _round_nodes(next_rd, columns=["parent_template_id"])
+    if nodes is None or nodes.num_rows == 0:
         return None
-    parents = pa_ds.dataset(files).to_table(columns=["parent_template_id"]).column(0)
+    parents = nodes.column(0)
     ids, counts = np.unique(
         parents.to_numpy(zero_copy_only=False), return_counts=True
     )
@@ -611,6 +684,129 @@ def section_template_graph(em_dir: Path) -> ReportSection:
     return ReportSection(title=title, body="\n\n".join(parts), flags=flags)
 
 
+def section_mstep(em_dir: Path) -> ReportSection:
+    """What the M-step did to each template, round by round.
+
+    Reads ``round.json``'s ``mstep`` block and the per-template record
+    (``mstep/templates``). A template whose kernel raised is carried by a
+    fallback node rather than dropped, and is FLAGGED: before the record a
+    failure was silent and its reads left the round. A failure that recurs on
+    the same lineage round after round comes from the data, not from chance.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        StaleShardsError,
+        read_round_templates,
+    )
+
+    rows, flags = [], []
+    prev_failed: set[int] = set()
+    prev_dir: Path | None = None
+    for r, d in _rounds(em_dir):
+        block = _round_json(d).get("mstep") or {}
+        try:
+            t = read_round_templates(d)
+        except StaleShardsError:
+            t = None
+        if not block and t is None:
+            prev_failed, prev_dir = set(), d
+            continue
+        cand = sig = None
+        failed_ids: set[int] = set()
+        if t is not None and t.num_rows:
+            status = t.column("status").to_numpy(zero_copy_only=False)
+            ids = t.column("template_id").to_numpy(zero_copy_only=False)
+            failed_ids = set(
+                ids[
+                    np.isin(status, ["fallback_pooled", "fallback_template"])
+                ].tolist()
+            )
+            nc = t.column("n_candidates").drop_null().to_numpy(zero_copy_only=False)
+            ns = t.column("n_significant_edges").drop_null().to_numpy(
+                zero_copy_only=False
+            )
+            cand = nc[nc > 0]
+            sig = ns[ns > 0]
+        n_failed = int(block.get("n_failed", len(failed_ids)))
+        assigned = block.get("n_reads_assigned")
+        in_nodes = block.get("n_reads_in_nodes")
+        rows.append(
+            (
+                r,
+                block.get("n_templates", t.num_rows if t is not None else 0),
+                block.get("n_split", 0),
+                n_failed,
+                block.get("n_no_members", 0),
+                assigned,
+                in_nodes,
+                _q(cand),
+                _q(sig),
+            )
+        )
+        if n_failed:
+            flags.append(
+                f"round {r}: the M-step raised on {n_failed:,} template(s); "
+                "each was carried by a fallback node (see mstep/templates "
+                "for the error)"
+            )
+        if assigned is not None and in_nodes is not None and assigned != in_nodes:
+            flags.append(
+                f"round {r}: {assigned:,} reads assigned but {in_nodes:,} in "
+                "the M-step's nodes — reads were lost or double-counted"
+            )
+        if failed_ids and prev_failed and prev_dir is not None:
+            recurring = _failed_again(prev_dir, prev_failed, failed_ids)
+            if recurring:
+                flags.append(
+                    f"round {r}: {recurring:,} failing template(s) descend "
+                    "from one that failed the round before — a failure that "
+                    "comes from the data"
+                )
+        prev_failed, prev_dir = failed_ids, d
+    if not rows:
+        return ReportSection(title="M-step", body="_no M-step record_")
+    lines = [
+        "| round | templates | split | failed | no members | reads assigned "
+        "| in nodes | candidates (p50/p90) | significant edges (p50/p90) |",
+        "|---:|---:|---:|---:|---:|---:|---:|---|---|",
+    ]
+    for r, n, split, failed, nomem, assigned, in_nodes, cand, sig in rows:
+        lines.append(
+            f"| {r} | {_fmt(n)} | {_fmt(split)} | {_fmt(failed)} | {_fmt(nomem)} "
+            f"| {_fmt(assigned)} | {_fmt(in_nodes)} | {cand} | {sig} |"
+        )
+    body = "\n".join(lines) + (
+        "\n\nCandidates and edges are over the templates that had any. "
+        "*Failed* templates kept their reads in a fallback node — the pooled "
+        "consensus with no split, or the template itself — rather than "
+        "leaving the round."
+    )
+    return ReportSection(title="M-step", body=body, flags=flags)
+
+
+def _fmt(v) -> str:
+    return f"{v:,}" if isinstance(v, (int, np.integer)) else "—"
+
+
+def _q(values: np.ndarray | None) -> str:
+    if values is None or values.size == 0:
+        return "—"
+    return f"{int(np.percentile(values, 50)):,} / {int(np.percentile(values, 90)):,}"
+
+
+def _failed_again(prev_dir: Path, prev_failed: set[int], failed: set[int]) -> int:
+    """How many of ``failed`` descend (by lineage) from ``prev_failed``."""
+    path = prev_dir / "lineage.parquet"
+    if not path.exists():
+        return 0
+    lin = pq.read_table(path, columns=["child_template_id", "parent_template_id"])
+    child = lin.column("child_template_id").to_numpy(zero_copy_only=False)
+    parent = lin.column("parent_template_id").to_numpy(zero_copy_only=False)
+    hit = np.isin(child, np.fromiter(failed, np.int64)) & np.isin(
+        parent, np.fromiter(prev_failed, np.int64)
+    )
+    return int(np.unique(child[hit]).size)
+
+
 def build_em_report(em_dir: Path) -> Path:
     """Assemble the EM diagnostics report under ``diagnostics/report.md``."""
     from constellation.sequencing._render import render_report
@@ -625,6 +821,7 @@ def build_em_report(em_dir: Path) -> Path:
         section_candidate_pool,
         section_template_graph,
         section_assignment_rule,
+        section_mstep,
         section_reference_drift,
         section_cluster_sizes,
     ):

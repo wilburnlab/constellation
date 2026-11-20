@@ -350,3 +350,50 @@ def test_driver_accounts_for_reads_minimap2_never_reported(tmp_path):
     assert tid[-1] == -1
     # Every reported read found its source template.
     assert tid[:-1] == [0 if q % 2 == 0 else 1 for q in range(reads.n_reads - 1)]
+
+
+# ── who came second under the two-pass aligners (and so under native) ─
+
+
+def test_round2_two_pass_runner_up_and_its_gap():
+    store = _store([_mutant(TRUE, [10, 200, 400]), TRUE])
+    reads = _Reads([TRUE])
+    batch, _ = assign_block_edlib(
+        _block([_row(0, 0, s1=905), _row(0, 1, s1=900)]),
+        store=store,
+        reads=reads,
+        round_index=2,
+    )
+    row = batch.to_pylist()[0]
+    assert row["template_row"] == 1 and row["runner_up_template_id"] == 100
+    assert row["runner_up_identity"] == pytest.approx(597 / 600, abs=1e-3)
+    assert row["runner_up_logl_gap"] > 0, "three substitutions of evidence"
+
+
+def test_the_lazy_round1_walk_never_learns_who_came_second():
+    store = _store([TRUE, TRUE], replication=[1, 50])
+    reads = _Reads([_mutant(TRUE, [100, 300])])
+    batch, _ = assign_block_edlib(
+        _block([_row(0, 0, s1=900), _row(0, 1, s1=880)]),
+        store=store,
+        reads=reads,
+        round_index=1,
+    )
+    row = batch.to_pylist()[0]
+    assert row["template_row"] == 1
+    assert row["runner_up_template_id"] is None
+
+
+def test_identity_band_round1_records_the_runner_up():
+    store = _store([TRUE, _mutant(TRUE, [10, 200, 400, 500])], replication=[1, 1])
+    reads = _Reads([TRUE])
+    batch, _ = assign_block_edlib(
+        _block([_row(0, 0, s1=900), _row(0, 1, s1=880)]),
+        store=store,
+        reads=reads,
+        round_index=1,
+        round1_rule="identity_band",
+    )
+    row = batch.to_pylist()[0]
+    assert row["template_row"] == 0 and row["runner_up_template_id"] == 101
+    assert row["runner_up_logl_gap"] is None

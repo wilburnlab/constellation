@@ -563,6 +563,36 @@ def plan_columns(
     )
 
 
+def _covers_mask(junctions: np.ndarray, proj: ProjectedMember, n_template: int) -> np.ndarray:
+    """:func:`_covers_junction` over an array of junctions."""
+    j = np.asarray(junctions, dtype=np.int64)
+    interior = (j > 0) & (j < n_template) & (proj.frame_start < j) & (j < proj.frame_end)
+    head = (j <= 0) & (proj.frame_start == 0)
+    tail = (j >= n_template) & (j > 0) & (proj.frame_end == n_template)
+    return interior | head | tail
+
+
+def _covered_junctions(
+    active: np.ndarray, proj: ProjectedMember, n_template: int
+) -> np.ndarray:
+    """The ``active`` junctions :func:`_covers_junction` says ``proj``
+    covers, ascending — the same rule, applied to the whole array."""
+    j = np.asarray(active, dtype=np.int64)
+    return j[_covers_mask(j, proj, n_template)]
+
+
+def _block_columns(starts: np.ndarray, widths: np.ndarray) -> np.ndarray:
+    """``concat(arange(s, s + w) for s, w in zip(starts, widths))``."""
+    widths = np.asarray(widths, dtype=np.int64)
+    total = int(widths.sum())
+    if total == 0:
+        return np.empty(0, dtype=np.int64)
+    offsets = np.arange(total, dtype=np.int64) - np.repeat(
+        np.cumsum(widths) - widths, widths
+    )
+    return np.repeat(np.asarray(starts, dtype=np.int64), widths) + offsets
+
+
 def _scatter_expanded(
     plan: ColumnPlan,
     frame_codes: np.ndarray,
@@ -603,10 +633,23 @@ def _scatter_expanded(
         # votes gap, so a block column's depth is the covering depth and its
         # minor-allele fraction is the fraction of covering reads that insert.
         filled = {j: c for j, c in _member_events(proj, codes, plan.n_template)}
-        for j in active:
-            j = int(j)
-            if not _covers_junction(proj, j, plan.n_template):
-                continue  # no evidence about this junction — no vote
+        covered = _covered_junctions(active, proj, plan.n_template)
+        # The blocks the member covers and does not fill — nearly all of them
+        # — vote gap across their whole width, in one call per member rather
+        # than one per (member, block): at 600 reads x 530 blocks that loop
+        # was 11 of an 18 s M-step. Each column takes at most one vote per
+        # member and members still vote in order, so every column's sum is
+        # accumulated in the same order as before: the PWM is bit-identical.
+        if filled:
+            is_filled = np.isin(covered, np.fromiter(filled, dtype=np.int64))
+            empty_j = covered[~is_filled]
+            filled_j = covered[is_filled]
+        else:
+            empty_j = covered
+            filled_j = covered[:0]
+        if empty_j.size:
+            _add_gaps(_block_columns(b_start[empty_j], b_width[empty_j]), w)
+        for j in filled_j.tolist():
             wdt = int(b_width[j])
             c = filled.get(j)
             k = 0 if c is None else min(int(c.size), wdt)
@@ -946,10 +989,22 @@ def _member_row(row, proj, codes, plan, t_idx, t_want, b_idx, j_of, o_of) -> Non
 
     if b_idx.shape[0]:
         events = dict(_member_events(proj, codes, plan.n_template))
-        for k in b_idx:
+        jj = j_of[b_idx]
+        # No evidence about a junction it does not cover: those stay -1.
+        cov = _covers_mask(jj, proj, plan.n_template)
+        with_bases = [j for j, c in events.items() if c is not None and c.size]
+        inserts = (
+            np.isin(jj, np.asarray(with_bases, dtype=np.int64))
+            if with_bases
+            else np.zeros(jj.shape[0], dtype=bool)
+        )
+        # A covered block the member inserts nothing into is gap throughout —
+        # nearly every block, set in one step rather than one Python
+        # iteration per (member, block column). Each column is written once,
+        # so the row is identical to the per-column walk's.
+        row[b_idx[cov & ~inserts]] = 4
+        for k in b_idx[cov & inserts]:
             j = int(j_of[k])
-            if not _covers_junction(proj, j, plan.n_template):
-                continue  # no evidence about this junction
             w = int(plan.block_width[j])
             o = int(o_of[k])
             c = events.get(j)

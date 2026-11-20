@@ -517,3 +517,77 @@ def test_a_sliver_is_not_the_identity_an_unassigned_read_reports():
     )
     assert ident.to_pylist() == [pytest.approx(1.0), pytest.approx(1.0), None]
     assert reason.to_pylist() == ["below_floor", "below_floor", "no_alignment"]
+
+
+# ── who came second (runner_up_*) ─────────────────────────────────────
+
+
+def test_round1_records_the_template_replication_would_have_chosen_next():
+    seq = "ACGTACGTAC" * 20
+    store = _store([seq, seq], replication=[1, 500])
+    hb = scan_paf_block(
+        _paf(
+            [
+                _row(0, 0, n_match=200, aln_len=200, as_score=400, cigar="200="),
+                _row(0, 1, n_match=196, aln_len=200, as_score=376, cigar="98=1X101="),
+            ]
+        ),
+        n_templates=2,
+    )
+    row = assign_block(hb, store=store, reads=_Reads(["r0"]), round_index=1).to_pylist()[0]
+    assert row["template_id"] == 101
+    assert row["runner_up_template_id"] == 100
+    assert row["runner_up_identity"] == pytest.approx(1.0)
+    assert row["runner_up_logl_gap"] is None, "round 1 ranks on no likelihood"
+    assert row["logl"] is None and row["logl_delta"] is None, "null, not NaN"
+
+
+def test_a_read_with_one_template_has_no_runner_up():
+    seq = "ACGT" * 50
+    store = _store([seq])
+    hb = scan_paf_block(
+        _paf([_row(0, 0, n_match=200, aln_len=200, as_score=400, cigar="200=")]),
+        n_templates=1,
+    )
+    row = assign_block(hb, store=store, reads=_Reads(["r0"]), round_index=1).to_pylist()[0]
+    assert row["template_id"] == 100
+    assert row["runner_up_template_id"] is None and row["runner_up_identity"] is None
+
+
+def test_round2_runner_up_carries_the_likelihood_gap():
+    seq = "ACGTACGTAC" * 20
+    store = _store([seq, seq])
+    hb = scan_paf_block(
+        _paf(
+            [
+                _row(0, 0, n_match=200, aln_len=200, as_score=400, cigar="200="),
+                _row(0, 1, n_match=199, aln_len=200, as_score=398, cigar="99=1X100="),
+            ]
+        ),
+        n_templates=2,
+    )
+    row = assign_block(hb, store=store, reads=_Reads(["r0"]), round_index=2).to_pylist()[0]
+    assert row["template_id"] == 100
+    assert row["runner_up_template_id"] == 101
+    assert row["runner_up_logl_gap"] is not None and row["runner_up_logl_gap"] > 0
+
+
+def test_round2_falls_back_to_the_best_score_outside_the_likelihood_window():
+    """minimap2's round 2+ scores the likelihood only inside the AS window;
+    an admitted template outside it is still the runner-up, with no gap."""
+    seq = "ACGTACGTAC" * 20
+    store = _store([seq, seq])
+    hb = scan_paf_block(
+        _paf(
+            [
+                _row(0, 0, n_match=200, aln_len=200, as_score=400, cigar="200="),
+                _row(0, 1, n_match=195, aln_len=200, as_score=300, cigar="95=5X100="),
+            ]
+        ),
+        n_templates=2,
+    )
+    row = assign_block(hb, store=store, reads=_Reads(["r0"]), round_index=2).to_pylist()[0]
+    assert row["template_id"] == 100
+    assert row["runner_up_template_id"] == 101
+    assert row["runner_up_identity"] == pytest.approx(0.975)
+    assert row["runner_up_logl_gap"] is None

@@ -106,7 +106,14 @@ def _quantiles(values: np.ndarray, qs=(0, 10, 50, 90, 99, 100)) -> str:
 
 
 def _load(round_dir: Path, limit: int | None, seed: int):
-    shards = sorted((round_dir / "mstep" / "nodes").glob("part-*.parquet"))
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        NODES_KEY,
+        round_mstep_shards,
+    )
+
+    # The round's own shards, never a glob (an earlier attempt with more
+    # units leaves extra ones behind; em/round_io.py).
+    shards = round_mstep_shards(round_dir, NODES_KEY)
     if not shards:
         raise SystemExit(
             f"{round_dir} has no mstep/nodes/part-*.parquet — pass one round "

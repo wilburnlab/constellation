@@ -57,6 +57,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.em import refine as r
 from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
     EM_ASSIGNMENT_TABLE,
     run_em_estep,
+    runner_up_measured,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
     ReadStore,
@@ -70,6 +71,8 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.graph import (
 from constellation.sequencing.transcriptome.cluster.denovo.em.outputs import (
     CLUSTER_EDGES,
     build_cluster_tables,
+    cluster_node_table,
+    write_cluster_nodes,
     write_cluster_edges,
     write_em_manifest,
     write_em_outputs,
@@ -81,12 +84,24 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import 
     in_membership_order,
     in_node_order,
     iter_unit_batches,
+    mstep_output_keys,
     mstep_worker,
     plan_mstep_units,
     sort_assignments_by_template,
 )
+from constellation.sequencing.transcriptome.cluster.denovo.em.evidence import (
+    MSTEP_TEMPLATE_TABLE,
+    STATUS_FALLBACK_POOLED,
+    STATUS_FALLBACK_TEMPLATE,
+    STATUSES,
+)
 from constellation.sequencing.transcriptome.cluster.denovo.em.rebuild import (
     rebuild_survivors,
+)
+from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+    FINAL_PARAMS,
+    read_round_membership,
+    read_round_nodes,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.seed import (
     extract_seed_orfs,
@@ -228,8 +243,19 @@ class EmParams:
     mstep_workers: int = 0
     units_per_worker: int = 16
     mstep: MStepParams = field(default_factory=MStepParams)
+    #: What the M-step keeps beyond its nodes (em/evidence.py). The per-
+    #: template record and disagreement statistics are always written;
+    #: "compact" adds candidate columns, significant covariance edges with
+    #: their 2x2 counts, and per-read margins of split templates. Report-
+    #: only: it changes no node, so it is not a resume commitment.
+    mstep_evidence: Literal["compact", "none"] = "compact"
 
     def __post_init__(self) -> None:
+        if self.mstep_evidence not in ("compact", "none"):
+            raise ValueError(
+                f"mstep_evidence must be 'compact' or 'none', got "
+                f"{self.mstep_evidence!r}"
+            )
         if self.estep_aligner not in ("minimap2", "edlib", "native"):
             raise ValueError(f"unknown estep_aligner {self.estep_aligner!r}")
         if self.estep_shortlist_k < 1:
@@ -390,6 +416,9 @@ class RoundResult:
     n_nodes: int
     churn: dict[str, float]
     seconds: dict[str, float]
+    #: What the M-step wrote: ``n_units`` (which of ``mstep/<key>/`` shards
+    #: are this round's — see :mod:`.round_io`) and ``n_membership_rows``.
+    mstep: dict[str, Any] = field(default_factory=dict)
 
 
 def run_em(
@@ -442,6 +471,26 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
     _check_estep_stamp(rounds_dir, params, resume)
     _check_merge_state(rounds_dir, params, resume)
 
+    if resume and params.rounds == 0:
+        # Finalize only: every round the run owes is done, the final stage
+        # (graph, merge, rebuild, outputs) is not — it died or raised. Run that
+        # stage from the last finished round exactly as the loop would have
+        # after it. `_resume_point` would instead refine that round into a
+        # successor nobody asked for (and write its lineage), and the empty
+        # loop then wrote no clusters at all.
+        state = _last_round_state(rounds_dir)
+        if state is None:
+            raise ValueError(
+                "--resume --rounds 0 finalizes a run from its last finished "
+                f"round, and {rounds_dir} has none"
+            )
+        history, last, final_nodes, final_assignments, final_membership = state
+        log(f"finalizing from round {last.round_index} (--resume --rounds 0)")
+        return _finish(
+            corpus, reads, output_dir, demux_dir, params, report, log, rounds_dir,
+            history, [last], final_nodes, final_assignments, final_membership,
+        )
+
     # The native E-step's read sketch: once per run, in the parent, before
     # any pool has forked — the sketch is torch and a forked child must
     # never be. Cached under its (kmer, window, corpus) stamp, so a resume
@@ -478,9 +527,14 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
     final_nodes: pa.Table | None = None
     final_assignments: pa.Table | None = None
     final_membership: pa.Table | None = None
+    params_record = _round_params_record(params, _cached_corpus_digest(corpus))
     for r in range(start, start + params.rounds):
         rd = rounds_dir / f"r{r:02d}"
         rd.mkdir(parents=True, exist_ok=True)
+        # Before any work: what this round is about to be produced under,
+        # readable while it runs and after it dies (manifest.json is written
+        # only at the end of a run, and only for the last invocation).
+        _write_json(rd / ROUND_PARAMS, params_record)
         t0 = time.time()
 
         tdir = rd / "templates"
@@ -548,9 +602,61 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
         finally:
             store.close()
 
+    return _finish(
+        corpus, reads, output_dir, demux_dir, params, report, log, rounds_dir,
+        history, results, final_nodes, final_assignments, final_membership,
+    )
+
+
+def _last_round_state(rounds_dir: Path):
+    """``(history, last, nodes, assignments, membership)`` of the last round
+    with a ``_SUCCESS``, read back as the loop holds them after that round;
+    ``None`` if no round finished. ``history`` is every earlier round."""
+    if not rounds_dir.exists():
+        return None
+    done = sorted(
+        int(d.name[1:])
+        for d in rounds_dir.glob("r*")
+        if d.name[1:].isdigit() and (d / _SUCCESS).exists()
+    )
+    if not done:
+        return None
+    history = _read_history(rounds_dir, done)
+    if not history or history[-1].round_index != done[-1]:
+        return None
+    rd = rounds_dir / f"r{done[-1]:02d}"
+    return (
+        history[:-1],
+        history[-1],
+        read_round_nodes(rd),
+        _read_assignments(rd / "assignments"),
+        read_round_membership(rd),
+    )
+
+
+def _finish(
+    corpus, reads, output_dir, demux_dir, params, report, log, rounds_dir,
+    history, results, final_nodes, final_assignments, final_membership,
+) -> list[RoundResult]:
+    """The final stage — graph, merge, rebuild, outputs, manifest, report.
+
+    After the loop's last round, or on its own for a run whose rounds all
+    finished but whose final stage did not (``--resume --rounds 0``,
+    :func:`_last_round_state`). ``results[-1]`` is the last round.
+    """
     _write_summary(output_dir, history + results)
     if final_nodes is not None and final_assignments is not None:
         final_rd = rounds_dir / f"r{results[-1].round_index:02d}"
+        # Before any work, as each round's own params.json: what the final
+        # merge and rebuild run under. `--resume --rounds 0` finalizes under
+        # the invoking command's parameters, which need not be the last
+        # round's, and a rebuilt survivor replayed under the round's would
+        # re-create other evidence and still verify (a member cap of 10 at
+        # finalization replayed with all 34 reads).
+        _write_json(
+            final_rd / FINAL_PARAMS,
+            _round_params_record(params, _cached_corpus_digest(corpus)),
+        )
         final_nodes, final_membership, final = _final_graph_and_merge(
             final_rd,
             final_nodes,
@@ -568,6 +674,23 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
             identity_threshold=params.p_floor,
         )
         paths = write_em_outputs(output_dir, clusters, membership, sample_id)
+        merged_path = final_rd / "merged_final.parquet"
+        paths["cluster_nodes"] = write_cluster_nodes(
+            output_dir,
+            cluster_node_table(
+                final_nodes,
+                round_index=results[-1].round_index,
+                keep_rows=final.get("keep_rows"),
+                rebuilt_rows=final.get("rebuilt_rows"),
+                # Only this run's: a graph that was off or failed writes no
+                # merged_final, and one from an earlier invocation may sit there.
+                merged=(
+                    pq.read_table(merged_path)
+                    if final.get("merge_applied") and merged_path.exists()
+                    else None
+                ),
+            ),
+        )
         counts = _cluster_edges(
             output_dir, final, clusters, paths, log, rd=final_rd, params=params
         )
@@ -582,7 +705,9 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
             stages={
                 "n_input_reads": int(corpus.stats.get("n_input", corpus.n_reads)),
                 "n_reads": int(corpus.n_reads),
-                "n_rounds": len(results),
+                # The run's rounds, not this invocation's: a resumed run
+                # used to report only the rounds it ran itself.
+                "n_rounds": len(history) + len(results),
                 "n_clusters": int(clusters.num_rows),
                 "n_membership_rows": int(membership.num_rows),
                 "converged": bool(
@@ -667,15 +792,21 @@ def _one_round(
         )
     t_estep = time.time() - t0
     _warn_on_saturation(estep_stats, params, log)
+    # Whether a null runner-up means "no rival" or "never looked": the lazy
+    # round-1 walk stops at its first admitted template.
+    estep_stats["runner_up_measured"] = runner_up_measured(
+        r, estep_aligner=params.estep_aligner, round1_rule=params.round1_rule()
+    )
 
     assignments = _read_assignments(rd / "assignments")
     if prev_assignments is not None:
         estep_stats["n_newly_lost"] = _newly_lost(prev_assignments, assignments)
     t1 = time.time()
-    nodes, node_membership = _run_mstep(
+    nodes, node_membership, mstep_block = _run_mstep(
         r, rd, store, corpus, assignments, params, log
     )
     t_mstep = time.time() - t1
+    mstep_block.update(_read_invariant(assignments, nodes, node_membership, r, log))
 
     churn = (
         rf.measure_churn(
@@ -691,6 +822,7 @@ def _one_round(
         n_nodes=int(nodes.num_rows),
         churn=churn,
         seconds={"estep": round(t_estep, 1), "mstep": round(t_mstep, 1)},
+        mstep=mstep_block,
     )
     (rd / "round.json").write_text(json.dumps(asdict(result), indent=2, default=str))
     return result, assignments, nodes, node_membership
@@ -1106,10 +1238,26 @@ def _write_seed_stage(seed_dir: Path, params: EmParams, stats: dict) -> None:
 
 
 def _run_mstep(r, rd, store, corpus, assignments, params, log):
+    """Run one round's M-step; return ``(nodes, membership, mstep_block)``.
+
+    ``mstep_block`` goes into ``round.json``: ``n_units`` (which shards are
+    the round's, :mod:`.round_io`) and the per-template accounting summed
+    from the ``templates`` table (:mod:`.evidence`).
+
+    ``mstep/`` is cleared first — before the early return too — because
+    ``run_batched`` never clears its output and writes one shard per unit,
+    so an earlier attempt with more units leaves shards a later reader that
+    globs the directory would take for this round's (:mod:`.round_io`).
+    """
     out = rd / "mstep"
+    shutil.rmtree(out, ignore_errors=True)
     srt, starts = sort_assignments_by_template(assignments)
     if srt.num_rows == 0:
-        return REFINED_NODE_TABLE.empty_table(), NODE_MEMBERSHIP_TABLE.empty_table()
+        return (
+            REFINED_NODE_TABLE.empty_table(),
+            NODE_MEMBERSHIP_TABLE.empty_table(),
+            {"n_units": 0, **_template_counters(None)},
+        )
 
     bounds = np.concatenate([starts, [srt.num_rows]])
     tr = srt.column("template_row").to_numpy(zero_copy_only=False)
@@ -1134,13 +1282,14 @@ def _run_mstep(r, rd, store, corpus, assignments, params, log):
         mstep_worker,
         iter_unit_batches(srt, units),
         output_dir=out,
-        output_keys=("nodes", "node_membership"),
+        output_keys=mstep_output_keys(params.mstep_evidence),
         n_workers=max(int(workers), 1),
         worker_kwargs={
             "corpus_path": str(corpus.arrow_path),
             "templates_path": str(rd / "templates" / TEMPLATES_ARROW),
             "round_index": r,
             "params": params.mstep,
+            "evidence": params.mstep_evidence,
         },
         stage_label=f"mstep-r{r}",
         total=len(units),
@@ -1160,7 +1309,75 @@ def _run_mstep(r, rd, store, corpus, assignments, params, log):
         if mem_shards
         else NODE_MEMBERSHIP_TABLE.empty_table()
     )
-    return nodes, membership
+    tmpl_shards = outputs["templates"].shard_paths
+    templates = (
+        pa_ds.dataset(tmpl_shards, schema=MSTEP_TEMPLATE_TABLE).to_table(
+            columns=["status", "n_nodes_emitted"]
+        )
+        if tmpl_shards
+        else None
+    )
+    evidence_bytes = sum(
+        path.stat().st_size
+        for key in mstep_output_keys(params.mstep_evidence)[2:]
+        for path in outputs[key].shard_paths
+    )
+    return nodes, membership, {
+        "n_units": len(units),
+        **_template_counters(templates),
+        # On disk beyond the nodes and membership: what --mstep-evidence
+        # costs, so its default can be judged on real data.
+        "evidence_bytes": int(evidence_bytes),
+    }
+
+
+def _template_counters(templates: pa.Table | None) -> dict[str, int]:
+    """What the round's M-step did, template by template, summed."""
+    out = {
+        "n_templates": 0,
+        "n_split": 0,
+        **{f"n_{status}": 0 for status in STATUSES},
+    }
+    if templates is None or templates.num_rows == 0:
+        out["n_failed"] = 0
+        return out
+    status = templates.column("status").to_numpy(zero_copy_only=False)
+    emitted = templates.column("n_nodes_emitted").to_numpy(zero_copy_only=False)
+    out["n_templates"] = int(templates.num_rows)
+    out["n_split"] = int((emitted > 1).sum())
+    for name in STATUSES:
+        out[f"n_{name}"] = int((status == name).sum())
+    # The kernel raised: whatever the fallback produced, it was not a split.
+    out["n_failed"] = out[f"n_{STATUS_FALLBACK_POOLED}"] + out[
+        f"n_{STATUS_FALLBACK_TEMPLATE}"
+    ]
+    return out
+
+
+def _read_invariant(assignments, nodes, membership, r, log) -> dict[str, int]:
+    """Every assigned read is in exactly one node: the invariant quant reads.
+
+    Recorded every round and warned about loudly when broken, because the
+    way it used to break — a template whose M-step raised emitted nothing —
+    was silent.
+    """
+    tr = assignments.column("template_row").to_numpy(zero_copy_only=False)
+    n_assigned = int((tr >= 0).sum())
+    n_in_nodes = int(
+        nodes.column("n_reads").to_numpy(zero_copy_only=False).sum()
+    ) if nodes.num_rows else 0
+    block = {
+        "n_reads_assigned": n_assigned,
+        "n_reads_in_nodes": n_in_nodes,
+        "n_membership_rows": int(membership.num_rows),
+    }
+    if n_in_nodes != n_assigned or membership.num_rows != n_assigned:
+        log(
+            f"WARNING round {r}: {n_assigned:,} reads were assigned but the "
+            f"M-step's nodes hold {n_in_nodes:,} ({membership.num_rows:,} "
+            f"membership rows) — reads were lost or double-counted"
+        )
+    return block
 
 
 def _read_assignments(directory: Path) -> pa.Table:
@@ -1168,6 +1385,74 @@ def _read_assignments(directory: Path) -> pa.Table:
     if not files:
         return EM_ASSIGNMENT_TABLE.empty_table()
     return pa_ds.dataset(files, schema=EM_ASSIGNMENT_TABLE).to_table()
+
+
+#: Per round, written when the round starts: the parameters it runs under.
+ROUND_PARAMS = "params.json"
+
+#: What :data:`ROUND_PARAMS` holds; bumped when a field changes meaning.
+ROUND_PARAMS_VERSION = 1
+
+#: Libraries whose behaviour a replay depends on. numpy's
+#: ``Generator.choice`` (the M-step's member subsample) is not promised
+#: stable across releases, and the kernels are numpy / edlib throughout.
+_RECORDED_LIBRARIES = ("numpy", "scipy", "pyarrow", "edlib")
+
+
+def _round_params_record(params: EmParams, corpus_digest: str) -> dict:
+    """``rNN/params.json``: everything a later replay of one of this round's
+    templates needs to run the M-step exactly as the round did."""
+    from importlib import metadata
+
+    import constellation
+    from constellation.sequencing.transcriptome.cluster.denovo.variants import (
+        ErrorModel,
+    )
+
+    def _version(name: str) -> str | None:
+        try:
+            return metadata.version(name)
+        except metadata.PackageNotFoundError:
+            return None
+
+    return {
+        "version": ROUND_PARAMS_VERSION,
+        "params": asdict(params),
+        # The model every stage of every round uses: the loop never passes
+        # one, so this is ErrorModel()'s defaults. A per-round refit is
+        # wanted and deliberately deferred until clustering quality can be
+        # assessed (the M-step's disagreement statistics are its substrate).
+        "error_model": {"refit": False, **asdict(ErrorModel())},
+        "corpus_digest": corpus_digest,
+        "constellation": constellation.__version__,
+        "libraries": {name: _version(name) for name in _RECORDED_LIBRARIES},
+    }
+
+
+def _cached_corpus_digest(corpus) -> str:
+    """:func:`~.corpus.corpus_digest`, cached beside the corpus.
+
+    One pass over the whole corpus, so it is done once and kept under the
+    file's size and modification time; a corpus rebuilt in place misses the
+    cache and is digested afresh.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
+        corpus_digest,
+    )
+
+    path = Path(corpus.arrow_path)
+    st = path.stat()
+    key = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    cache = path.parent / "digest.json"
+    try:
+        record = json.loads(cache.read_text())
+        if record.get("key") == key:
+            return str(record["corpus_digest"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    digest = corpus_digest(path)
+    _write_json(cache, {"key": key, "corpus_digest": digest})
+    return digest
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -1356,7 +1641,7 @@ def _refine_and_merge(rd: Path, nodes, store, r: int, params: EmParams, log):
     # merged is a file a re-run that merges nothing leaves behind.
     _write_table(rd / "merged.parquet", merged)
     # This round has a successor now, so it is no longer anybody's final one.
-    for stale in ("final.json", "merged_final.parquet"):
+    for stale in ("final.json", "merged_final.parquet", FINAL_PARAMS):
         (rd / stale).unlink(missing_ok=True)
     shutil.rmtree(rd / _FINAL_GRAPH, ignore_errors=True)
     _write_json(rd / "refine.json", record)
@@ -1477,7 +1762,7 @@ def _final_graph_and_merge(
             if corpus_path is None:
                 final["rebuild"] = "skipped: no corpus"
             else:
-                nodes, counts = rebuild_survivors(
+                nodes, counts, rebuilt_rows = rebuild_survivors(
                     nodes,
                     membership,
                     grew,
@@ -1490,6 +1775,7 @@ def _final_graph_and_merge(
                 )
                 final["rebuild"] = "ok"
                 final.update(counts)
+                final["rebuilt_rows"] = rebuilt_rows
                 if counts["n_rebuilt"]:
                     # The graph the merge read measured consensus sequences
                     # the rebuild has just replaced. What the export needs
@@ -1618,7 +1904,7 @@ def _write_final_record(rd: Path, final: dict, n_clusters: int, counts: dict) ->
     record = {
         k: v
         for k, v in final.items()
-        if k not in ("edges_path", "keep_rows", "export_graph")
+        if k not in ("edges_path", "keep_rows", "export_graph", "rebuilt_rows")
     }
     record["n_clusters"] = int(n_clusters)
     record.update({k: int(v) for k, v in counts.items()})
@@ -1791,13 +2077,11 @@ def _resume_point(rounds_dir: Path, resume: bool, log, params: EmParams | None =
     if not nodes_dir.exists() or not store_path.exists():
         return 1, None, None, []
     log(f"resuming after round {last} (rebuilding its successor's templates)")
+    # Through round_io, never a glob: shards an earlier attempt with more
+    # units left behind would otherwise become duplicate templates.
+    nodes = read_round_nodes(rd)
     store = TemplateStore.open(store_path)
     try:
-        nodes = in_node_order(
-            pa_ds.dataset(
-                sorted(nodes_dir.glob("part-*.parquet")), schema=REFINED_NODE_TABLE
-            ).to_table()
-        )
         refined = _refine_and_merge(
             rd, nodes, store, last, params or EmParams(), log
         )
@@ -1859,6 +2143,7 @@ def _read_history(rounds_dir: Path, done: list[int]) -> list[RoundResult]:
                 n_nodes=int(j.get("n_nodes", 0)),
                 churn=j.get("churn", {}),
                 seconds=j.get("seconds", {}),
+                mstep=j.get("mstep", {}),
             )
         )
     return out
