@@ -1061,3 +1061,78 @@ def test_the_read_api_answers_the_bench_s_first_questions(runs):
     assert found.num_rows == 1
     assert R.find_clusters(out, str(found.column("cluster_id")[0].as_py())).num_rows >= 1
     assert R.lineage(out).num_rows > 0
+
+
+# ── ledger #78 (a)–(c): what the Nov2026 run found in replay ──────────
+
+
+def test_a_rebuilt_survivor_that_was_not_node_0_has_support_tables(runs):
+    """(a) The rebuilt consensus is the survivor's and carries its haplotype
+    id; a survivor need not have been its parent's node 0."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+
+    out = runs[1]
+    nodes = R.cluster_nodes(out)
+    cid = nodes.filter(pa.compute.field("rebuilt")).column("cluster_id")[0].as_py()
+    rep = R.replay_cluster(out, cid)
+    assert rep.kind == "rebuilt" and rep.verified
+    rep.haplotype_id = 3  # as if the survivor had been its parent's node 3
+    st = R.support_tables(rep)
+    assert st.reference == "3"
+    assert set(st.reads.column("node").to_pylist()) == {3}
+    assert st.reads.num_rows == rep.pool_read_row.size
+
+
+def test_verification_covers_the_compact_evidence(runs, tmp_path, split_template_id):
+    """(b) A replay certifies what the support view draws: the stored
+    columns, covariance and margins, not only the nodes they led to."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+    from constellation.sequencing.transcriptome.cluster.denovo.em.replay import (
+        index_round,
+    )
+
+    out = tmp_path / "copy"
+    shutil.copytree(runs[1], out)
+    rd = out / "rounds" / "r01"
+    index = index_round(rd)
+    unit = int(index.node_unit[index.node_rows_of(split_template_id)[0]])
+    path = index.shards["columns"][unit]
+    table = pq.read_table(path)
+    mine = pa.compute.equal(table.column("template_id"), split_template_id)
+    frac = table.column("minor_frac").to_numpy().copy()
+    frac[np.flatnonzero(mine.to_numpy(zero_copy_only=False))[0]] += 0.25
+    pq.write_table(
+        table.set_column(
+            table.schema.get_field_index("minor_frac"), "minor_frac", pa.array(frac)
+        ),
+        path,
+    )
+    rep = R.replay_template(out, 1, split_template_id)
+    assert not rep.verified
+    assert any(m.startswith("columns: minor_frac") for m in rep.mismatch)
+
+
+def test_replay_reads_one_unit_not_the_round(runs, monkeypatch):
+    """(c) A replay reads the shards of the unit that refined its template,
+    never the round's whole node or membership table, and indexes a round
+    once."""
+    from constellation.sequencing.transcriptome.cluster.denovo.em import replay
+    from constellation.sequencing.transcriptome.cluster.denovo.em import results as R
+    from constellation.sequencing.transcriptome.cluster.denovo.em import round_io
+
+    def whole_round(*a, **k):
+        raise AssertionError("replay read a whole round table")
+
+    monkeypatch.setattr(round_io, "read_round_nodes", whole_round)
+    monkeypatch.setattr(round_io, "read_round_membership", whole_round)
+    built = []
+    real = replay.assignment_locator
+    monkeypatch.setattr(
+        replay, "assignment_locator", lambda rd: built.append(rd) or real(rd)
+    )
+    replay._INDEX_CACHE.clear()
+    out = runs[1]
+    cids = R.cluster_nodes(out).column("cluster_id").to_pylist()
+    for cid in cids:
+        assert R.replay_cluster(out, cid).verified
+    assert len(built) == 1, "the round was indexed once and reused"

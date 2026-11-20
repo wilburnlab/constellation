@@ -197,11 +197,15 @@ def _source(replay) -> _Source:
         pool = np.asarray(replay.pool_read_row, dtype=np.int64)
         order = np.argsort(pool, kind="stable")
         pos = order[np.searchsorted(pool[order], replay.member_read_row)]
+        # The rebuilt consensus is the SURVIVOR's, and carries its haplotype
+        # id: a survivor need not have been its parent's node 0, and asking
+        # for node 0 of it raised "no node 1" (Nov2026 run, ledger #78a).
+        hid = int(replay.haplotype_id)
         return _Source(
             pooled=replay.pooled,
-            children=[(0, replay.pooled, lo, hi)],
+            children=[(hid, replay.pooled, lo, hi)],
             read_row=pool,
-            node_of_read=np.zeros(pool.size, dtype=np.int64),
+            node_of_read=np.full(pool.size, hid, dtype=np.int64),
             member_pos=pos.astype(np.int64),
             read_ids=replay.read_ids,
             quality=np.asarray(replay.dorado_quality, dtype=np.float64),

@@ -27,6 +27,9 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -127,6 +130,134 @@ def _read_rows(loc: AssignmentLocator, global_rows: np.ndarray) -> pa.Table:
     return pa.concat_tables(pieces, promote_options="default").combine_chunks()
 
 
+# ── where a round's M-step rows are ───────────────────────────────────
+
+
+@dataclass(frozen=True)
+class RoundIndex:
+    """Where everything a round stored about one template is, built once.
+
+    A replay used to read the round's whole node table (at 9.4M reads, 1.67M
+    rows and ~2.7 GB of consensus), every membership row and every
+    assignment shard to check one template: ~15 s a call on OSC even for a
+    single-read cluster, 28–44 s from ext4 here. But the M-step writes each
+    unit's nodes, membership, record and compact evidence as shards of ONE
+    index, so a template's rows all sit in the shards of the unit that
+    refined it. This keeps, for every node in node order (``(parent_
+    template_id, haplotype_id)``, the order next-round template ids and
+    ``merged_final``'s ids are assigned in), its unit and its row there —
+    two integer columns read once — and the assignment locator.
+    """
+
+    round_dir: Path
+    assignments: AssignmentLocator
+    #: Each M-step table's shards, by key; None where the round predates it.
+    shards: dict
+    #: Every node, in node order: its key, its unit (shard index), its row.
+    node_parent: np.ndarray
+    node_hap: np.ndarray
+    node_unit: np.ndarray
+    node_local: np.ndarray
+
+    def node_rows_of(self, template_id: int) -> np.ndarray:
+        """Node-order rows of ``template_id``'s nodes (contiguous)."""
+        lo = int(np.searchsorted(self.node_parent, int(template_id), side="left"))
+        hi = int(np.searchsorted(self.node_parent, int(template_id), side="right"))
+        return np.arange(lo, hi, dtype=np.int64)
+
+    def unit_table(self, key: str, unit: int) -> pa.Table | None:
+        paths = self.shards.get(key)
+        if paths is None:
+            return None
+        return pq.read_table(paths[int(unit)])
+
+    def nodes_at(self, rows) -> pa.Table:
+        """The stored node rows at node-order positions ``rows``, in order."""
+        rows = np.asarray(rows, dtype=np.int64)
+        pieces = []
+        for unit in np.unique(self.node_unit[rows]).tolist():
+            here = rows[self.node_unit[rows] == unit]
+            pieces.append(
+                (here, self.unit_table("nodes", unit).take(pa.array(self.node_local[here])))
+            )
+        if not pieces:
+            return self.unit_table("nodes", 0).slice(0, 0)
+        order = np.argsort(np.concatenate([h for h, _ in pieces]), kind="stable")
+        table = pa.concat_tables([t for _, t in pieces])
+        return table.take(pa.array(order))
+
+
+_INDEX_CACHE: "OrderedDict[tuple, RoundIndex]" = OrderedDict()
+_INDEX_LOCK = threading.Lock()
+_INDEX_CACHE_SIZE = 2
+
+
+def index_round(round_dir: Path) -> RoundIndex:
+    """The :class:`RoundIndex` of a finished round, cached (two rounds).
+
+    Keyed on the round's ``round.json`` (rewritten whenever the round is), so
+    a round re-run in place is indexed afresh.
+    """
+    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+        MEMBERSHIP_KEY,
+        MSTEP_DIR,
+        NODES_KEY,
+        StaleShardsError,
+        round_mstep_shards,
+        round_record,
+    )
+
+    rd = Path(round_dir)
+    stamp = rd / "round.json"
+    key = (str(rd.resolve()), stamp.stat().st_mtime_ns if stamp.exists() else 0)
+    with _INDEX_LOCK:
+        if key in _INDEX_CACHE:
+            _INDEX_CACHE.move_to_end(key)
+            return _INDEX_CACHE[key]
+    shards: dict = {}
+    for k in (NODES_KEY, MEMBERSHIP_KEY, "templates", "disagreements", "columns", "covariance", "reads"):
+        if (rd / MSTEP_DIR / k).exists():
+            shards[k] = round_mstep_shards(rd, k)
+        else:
+            shards[k] = None
+    if not shards.get(NODES_KEY):
+        raise ReplayError(f"{rd.name}: no M-step nodes to index")
+    parents, haps, units, locals_ = [], [], [], []
+    for u, path in enumerate(shards[NODES_KEY]):
+        t = pq.read_table(path, columns=["parent_template_id", "haplotype_id"])
+        n = t.num_rows
+        parents.append(t.column(0).to_numpy(zero_copy_only=False).astype(np.int64))
+        haps.append(t.column(1).to_numpy(zero_copy_only=False).astype(np.int64))
+        units.append(np.full(n, u, dtype=np.int32))
+        locals_.append(np.arange(n, dtype=np.int64))
+    parent = np.concatenate(parents)
+    hap = np.concatenate(haps)
+    order = np.lexsort((hap, parent))
+    parent, hap = parent[order], hap[order]
+    if parent.size > 1 and np.any((np.diff(parent) == 0) & (np.diff(hap) == 0)):
+        raise StaleShardsError(f"{rd.name}: duplicate (parent, haplotype) nodes")
+    want = round_record(rd).get("n_nodes")
+    if want is not None and parent.size != int(want):
+        raise StaleShardsError(
+            f"{rd.name}: {parent.size} node rows on disk, round.json records {want}"
+        )
+    index = RoundIndex(
+        round_dir=rd,
+        assignments=assignment_locator(rd),
+        shards=shards,
+        node_parent=parent,
+        node_hap=hap,
+        node_unit=np.concatenate(units)[order],
+        node_local=np.concatenate(locals_)[order],
+    )
+    with _INDEX_LOCK:
+        _INDEX_CACHE[key] = index
+        _INDEX_CACHE.move_to_end(key)
+        while len(_INDEX_CACHE) > _INDEX_CACHE_SIZE:
+            _INDEX_CACHE.popitem(last=False)
+    return index
+
+
 # ── what a round ran under ────────────────────────────────────────────
 
 
@@ -199,14 +330,16 @@ def replay_template(
     *,
     params=None,
     locator: AssignmentLocator | None = None,
+    index: RoundIndex | None = None,
     strict: bool = False,
 ) -> TemplateReplay:
     """Re-run the M-step of ``template_id`` in round ``round_index``.
 
-    ``params`` (an ``MStepParams``) overrides what the run recorded;
-    ``locator`` is the round's :func:`assignment_locator`, to reuse across
-    replays of one round. ``strict`` raises when the replay does not match
-    what the round stored instead of returning ``verified=False``.
+    ``params`` (an ``MStepParams``) overrides what the run recorded. The
+    round's :class:`RoundIndex` is built on first use and cached; ``index``
+    (or, for the assignment rows alone, ``locator``) may be passed instead.
+    ``strict`` raises when the replay does not match what the round stored
+    instead of returning ``verified=False``.
     """
     from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
         ReadStore,
@@ -227,6 +360,7 @@ def replay_template(
         params, _em, source = round_params(run_dir, round_index)
     else:
         source = "explicit"
+    index = index or index_round(rd)
     store = TemplateStore.open(rd / "templates" / "templates.arrow")
     reads = ReadStore.open(run_dir / "corpus" / "reads.arrow")
     try:
@@ -234,7 +368,7 @@ def replay_template(
         if hit.size == 0:
             raise ReplayError(f"{rd.name} has no template {template_id}")
         row = int(hit[0])
-        loc = locator or assignment_locator(rd)
+        loc = locator or index.assignments
         rows = _read_rows(loc, loc.rows_of(row))
         if rows.num_rows == 0:
             raise ReplayError(
@@ -279,7 +413,7 @@ def replay_template(
         dorado_quality=quality,
         warnings=warnings,
     )
-    out.mismatch = _verify_template(rd, out)
+    out.mismatch = _verify_template(index, out)
     out.verified = not out.mismatch
     if strict and out.mismatch:
         raise ReplayError(
@@ -307,37 +441,54 @@ def _library_warnings(rd: Path) -> list[str]:
     return out
 
 
-def _verify_template(rd: Path, rep: TemplateReplay) -> list[str]:
-    """What differs between the replay and what the round stored."""
+def _same(a, b) -> bool:
+    """Equality for values read back from Parquet: NaN equals NaN."""
+    if isinstance(a, float) and isinstance(b, float):
+        return a == b or (math.isnan(a) and math.isnan(b))
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _rows_differ(stored: pa.Table, mine: pa.Table, sort: list[str]) -> str | None:
+    """Why two tables of one template's rows differ, or None."""
+    if stored.num_rows != mine.num_rows:
+        return f"{mine.num_rows} rows replayed, {stored.num_rows} stored"
+    keys = [(c, "ascending") for c in sort]
+    s_rows = stored.sort_by(keys).to_pylist() if stored.num_rows else []
+    m_rows = mine.sort_by(keys).to_pylist() if mine.num_rows else []
+    for s_row, m_row in zip(s_rows, m_rows):
+        for name, value in s_row.items():
+            if name in m_row and not _same(value, m_row[name]):
+                return f"{name} differs"
+    return None
+
+
+def _verify_template(index: RoundIndex, rep: TemplateReplay) -> list[str]:
+    """What differs between the replay and what the round stored: every node
+    row, every read's node, the template's record and its compact evidence —
+    each read from the one unit's shards that hold this template."""
     from constellation.sequencing.transcriptome.cluster.denovo.em.mstep_pool import (
         _rows_to_nodes,
-    )
-    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
-        read_round_membership,
-        read_round_nodes,
-        read_round_templates,
     )
 
     out: list[str] = []
     tid = rep.template_id
-    stored = read_round_nodes(rd)
-    stored = stored.filter(pc.equal(stored.column("parent_template_id"), tid))
+    rows = index.node_rows_of(tid)
+    stored = index.nodes_at(rows)
     mine = _rows_to_nodes(rep.result.node_rows)
-    s_rows = sorted(stored.to_pylist(), key=lambda r: r["haplotype_id"])
-    m_rows = sorted(mine.to_pylist(), key=lambda r: r["haplotype_id"])
-    if len(s_rows) != len(m_rows):
-        out.append(f"{len(m_rows)} nodes replayed, {len(s_rows)} stored")
-    for s, m in zip(s_rows, m_rows):
-        for name in s:
-            if s[name] != m.get(name):
-                out.append(f"node {s['haplotype_id']}: {name} differs")
-    mem = read_round_membership(rd)
+    why = _rows_differ(stored.select(mine.column_names), mine, ["haplotype_id"])
+    if why:
+        out.append(f"nodes: {why}")
+    units = np.unique(index.node_unit[rows]).tolist() if rows.size else []
+    if len(units) != 1:
+        out.append(f"template {tid}'s nodes are in {len(units)} units, not one")
+        return out
+    unit = units[0]
+    mem = index.unit_table("node_membership", unit)
     mem = mem.filter(pc.equal(mem.column("parent_template_id"), tid))
     stored_hap = dict(
-        zip(
-            mem.column("read_row").to_pylist(),
-            mem.column("haplotype_id").to_pylist(),
-        )
+        zip(mem.column("read_row").to_pylist(), mem.column("haplotype_id").to_pylist())
     )
     mine_hap = dict(
         zip(rep.result.read_row.tolist(), rep.result.haplotype_of_read.tolist())
@@ -345,7 +496,7 @@ def _verify_template(rd: Path, rep: TemplateReplay) -> list[str]:
     if stored_hap != mine_hap:
         moved = sum(stored_hap.get(k) != v for k, v in mine_hap.items())
         out.append(f"{moved} read(s) on a different node than stored")
-    tmpl = read_round_templates(rd)
+    tmpl = index.unit_table("templates", unit)
     if tmpl is not None:
         rec = tmpl.filter(pc.equal(tmpl.column("template_id"), tid)).to_pylist()
         if rec:
@@ -357,10 +508,46 @@ def _verify_template(rd: Path, rep: TemplateReplay) -> list[str]:
             for name, value in got.counters.items():
                 if rec.get(name) != value:
                     out.append(f"record {name} differs")
+    # The compact evidence the round wrote for this template — what the
+    # browser's arcs and column shading come from — must be what the replay
+    # computes, not only the nodes it led to.
+    sorts = {
+        "columns": ["frame_col"],
+        "covariance": ["u_frame_col", "v_frame_col"],
+        "reads": ["read_row"],
+    }
+    evidence = rep.result.evidence or {}
+    for key, sort in sorts.items():
+        table = index.unit_table(key, unit)
+        if table is None or key not in evidence:
+            continue
+        stored_ev = table.filter(pc.equal(table.column("template_id"), tid))
+        why = _rows_differ(stored_ev, evidence[key], sort)
+        if why:
+            out.append(f"{key}: {why}")
     return out
 
 
 # ── one final cluster ─────────────────────────────────────────────────
+
+
+_TABLE_CACHE: "OrderedDict[tuple, pa.Table]" = OrderedDict()
+
+
+def _read_cached(path: Path) -> pa.Table:
+    """A small whole-file table, kept while the file is unchanged (two)."""
+    st = Path(path).stat()
+    key = (str(Path(path).resolve()), st.st_mtime_ns, st.st_size)
+    with _INDEX_LOCK:
+        if key in _TABLE_CACHE:
+            _TABLE_CACHE.move_to_end(key)
+            return _TABLE_CACHE[key]
+    table = pq.read_table(path)
+    with _INDEX_LOCK:
+        _TABLE_CACHE[key] = table
+        while len(_TABLE_CACHE) > 2:
+            _TABLE_CACHE.popitem(last=False)
+    return table
 
 
 def cluster_node_map(run_dir: Path) -> pa.Table:
@@ -379,7 +566,7 @@ def cluster_node_map(run_dir: Path) -> pa.Table:
     run_dir = Path(run_dir)
     path = run_dir / "cluster_nodes.parquet"
     if path.exists():
-        return pq.read_table(path)
+        return _read_cached(path)
     done = sorted(
         int(d.name[1:])
         for d in (run_dir / "rounds").glob("r*")
@@ -439,19 +626,25 @@ def replay_cluster(
     *,
     params=None,
     locator: AssignmentLocator | None = None,
+    index: RoundIndex | None = None,
     strict: bool = False,
 ) -> ClusterReplay:
-    """Re-create the evidence behind final cluster ``cluster_id``."""
+    """Re-create the evidence behind final cluster ``cluster_id``.
+
+    The replayed consensus is checked against the cluster's: by the content
+    id ``cluster_nodes.parquet`` records (no read of ``clusters.parquet``,
+    whose consensus column is ~2.7 GB at 9.4M reads), or for a run from
+    before that file, by the consensus itself.
+    """
     run_dir = Path(run_dir)
     cmap = cluster_node_map(run_dir)
     hit = cmap.filter(pc.equal(cmap.column("cluster_id"), int(cluster_id))).to_pylist()
     if not hit:
         raise ReplayError(f"no cluster {cluster_id}")
     row = hit[0]
-    clusters = pq.read_table(run_dir / "clusters.parquet")
-    want = clusters.filter(
-        pc.equal(clusters.column("cluster_id"), int(cluster_id))
-    ).to_pylist()[0]["consensus_sequence"]
+    is_ours = _cluster_check(run_dir, int(cluster_id), row)
+    rd = run_dir / "rounds" / f"r{int(row['round']):02d}"
+    index = index or index_round(rd)
     if not row["rebuilt"]:
         rep = replay_template(
             run_dir,
@@ -459,12 +652,13 @@ def replay_cluster(
             row["parent_template_id"],
             params=params,
             locator=locator,
+            index=index,
         )
         node = [n for n in rep.result.nodes if n.haplotype_id == row["haplotype_id"]]
         mismatch = list(rep.mismatch)
         if not node:
             mismatch.append(f"no node {row['haplotype_id']} replayed")
-        elif node[0].consensus != want:
+        elif not is_ours(node[0].consensus):
             mismatch.append("the node's consensus is not the cluster's")
         out = ClusterReplay(
             run_dir=run_dir,
@@ -477,14 +671,32 @@ def replay_cluster(
             warnings=list(rep.warnings),
         )
     else:
-        out = _replay_rebuilt(run_dir, row, want, params)
+        out = _replay_rebuilt(run_dir, row, is_ours, params, index)
     out.verified = not out.mismatch
     if strict and out.mismatch:
         raise ReplayError(f"replay of cluster {cluster_id}: {out.mismatch[:3]}")
     return out
 
 
-def _replay_rebuilt(run_dir: Path, row: dict, want: str, params) -> ClusterReplay:
+def _cluster_check(run_dir: Path, cluster_id: int, row: dict):
+    """A predicate: is this consensus the cluster's?"""
+    if (run_dir / "cluster_nodes.parquet").exists() and row.get(
+        "consensus_content_id"
+    ) is not None:
+        from constellation.core.ids import content_id
+
+        want_id = int(row["consensus_content_id"])
+        return lambda consensus: content_id(consensus) == want_id
+    table = pq.read_table(
+        run_dir / "clusters.parquet",
+        columns=["cluster_id", "consensus_sequence"],
+        filters=[("cluster_id", "==", cluster_id)],
+    )
+    want = table.column("consensus_sequence")[0].as_py() if table.num_rows else None
+    return lambda consensus: consensus == want
+
+
+def _replay_rebuilt(run_dir: Path, row: dict, is_ours, params, index: RoundIndex):
     """A final-merge survivor: its pooled reads, aligned to its node's
     consensus and re-consensused, through the rebuild's own code."""
     from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
@@ -496,41 +708,41 @@ def _replay_rebuilt(run_dir: Path, row: dict, want: str, params) -> ClusterRepla
     from constellation.sequencing.transcriptome.cluster.denovo.em.rebuild import (
         rebuild_members,
     )
-    from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
-        read_round_membership,
-        read_round_nodes,
-    )
 
     r = int(row["round"])
     rd = run_dir / "rounds" / f"r{r:02d}"
     mparams, em, source = round_params(run_dir, r)
     if params is not None:
         mparams, source = params, "explicit"
-    nodes = read_round_nodes(rd)
     mask = (1 << 40) - 1
     survivor_row = int(row["node_template_id"]) & mask
-    consensus = nodes.column("consensus")[survivor_row].as_py()
-    group_rows = [survivor_row] + [int(i) & mask for i in row["absorbed_node_template_ids"]]
-    keys = {
-        (
-            nodes.column("parent_template_id")[g].as_py(),
-            nodes.column("haplotype_id")[g].as_py(),
+    group_rows = np.asarray(
+        [survivor_row] + [int(i) & mask for i in row["absorbed_node_template_ids"]],
+        dtype=np.int64,
+    )
+    group = index.nodes_at(group_rows)
+    consensus = group.column("consensus")[0].as_py()
+    survivor_parent = int(group.column("parent_template_id")[0].as_py())
+    # Every pooled read, in membership order — (parent, haplotype, read_row)
+    # — the order the rebuild pooled them in (rebuild._read_rows_of after the
+    # merge re-keyed the absorbed rows onto the survivor, stable-sorted).
+    parts = []
+    for g in group_rows.tolist():
+        mem = index.unit_table("node_membership", int(index.node_unit[g]))
+        sel = pc.and_(
+            pc.equal(mem.column("parent_template_id"), int(index.node_parent[g])),
+            pc.equal(mem.column("haplotype_id"), int(index.node_hap[g])),
         )
-        for g in group_rows
-    }
-    mem = read_round_membership(rd)
-    pid = mem.column("parent_template_id").to_pylist()
-    hap = mem.column("haplotype_id").to_pylist()
-    sel = np.array([(p, h) in keys for p, h in zip(pid, hap)], dtype=bool)
-    # Membership order — (parent, haplotype, read_row) — is the order the
-    # rebuild pooled them in (rebuild._read_rows_of after the merge re-keyed
-    # the absorbed rows onto the survivor, stable-sorted).
-    pool = mem.column("read_row").to_numpy(zero_copy_only=False)[sel].astype(np.int64)
+        parts.append(mem.filter(sel).select(["parent_template_id", "haplotype_id", "read_row"]))
+    pooled_rows = pa.concat_tables(parts).sort_by(
+        [("parent_template_id", "ascending"), ("haplotype_id", "ascending"), ("read_row", "ascending")]
+    )
+    pool = pooled_rows.column("read_row").to_numpy(zero_copy_only=False).astype(np.int64)
     em = em or {}
     members, sampled_rows, _skipped, _fraction = rebuild_members(
         consensus,
         pool,
-        template_id=int(nodes.column("parent_template_id")[survivor_row].as_py()),
+        template_id=survivor_parent,
         corpus_path=str(run_dir / "corpus" / "reads.arrow"),
         params=mparams,
         identity_floor=float(em.get("p_floor", 0.97)),
@@ -539,7 +751,7 @@ def _replay_rebuilt(run_dir: Path, row: dict, want: str, params) -> ClusterRepla
     node, cres = pooled_node_with_consensus(
         consensus,
         members,
-        template_id=int(nodes.column("parent_template_id")[survivor_row].as_py()),
+        template_id=survivor_parent,
         min_aa_length=mparams.min_aa_length,
         fold_insertions=mparams.fold_insertions,
         min_insertion_support=mparams.min_insertion_support,
@@ -548,7 +760,7 @@ def _replay_rebuilt(run_dir: Path, row: dict, want: str, params) -> ClusterRepla
     mismatch = []
     if node is None:
         mismatch.append("the rebuild placed no read")
-    elif node.consensus != want:
+    elif not is_ours(node.consensus):
         mismatch.append("the rebuilt consensus is not the cluster's")
     member_rows = np.asarray(
         [sampled_rows[m.member_id] for m in members], dtype=np.int64
@@ -585,6 +797,7 @@ def _replay_rebuilt(run_dir: Path, row: dict, want: str, params) -> ClusterRepla
 
 __all__ = [
     "AssignmentLocator",
+    "RoundIndex",
     "ClusterReplay",
     "ReplayError",
     "TemplateReplay",
@@ -592,5 +805,6 @@ __all__ = [
     "cluster_node_map",
     "replay_cluster",
     "replay_template",
+    "index_round",
     "round_params",
 ]
