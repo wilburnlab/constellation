@@ -1397,7 +1397,9 @@ def _build_transcriptome_parser(subs) -> None:
         "--rounds",
         type=int,
         default=6,
-        help="em: EM rounds to run. On --resume this is how many MORE. At "
+        help="em: EM rounds to run. On --resume this is how many MORE, and "
+        "--resume --rounds 0 runs only the final stage (graph, merge, "
+        "rebuild, outputs) from the last finished round. At "
         "9.4M reads the templates stopped changing at round 6 (reference "
         "length, ORF length and fidelity flat from 6 to 12).",
     )

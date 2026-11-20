@@ -222,8 +222,8 @@ def build_cluster_tables(
             "identity_threshold": pa.array(
                 np.full(n, identity_threshold, dtype=np.float32)
             ),
-            "consensus_sequence": nodes.column("consensus").cast(pa.string()),
-            "predicted_protein": nodes.column("protein").cast(pa.string()),
+            "consensus_sequence": _as_string(nodes.column("consensus")),
+            "predicted_protein": _as_string(nodes.column("protein")),
             "orf_start": nodes.column("orf_start"),
             "orf_end": nodes.column("orf_end"),
             # Seeding is forward-strand only: windows are adapter-oriented,
@@ -259,6 +259,58 @@ def _pack_node_key(parent: np.ndarray, hap: np.ndarray) -> np.ndarray:
     return (np.asarray(parent, dtype=np.int64) << np.int64(16)) | np.asarray(
         hap, dtype=np.int64
     )
+
+
+#: Character bytes one ``pa.string()`` chunk may hold: its offsets are int32,
+#: so 2 GiB is the ceiling. A MiB of headroom below it.
+_STRING_CHUNK_BYTES = (1 << 31) - (1 << 20)
+
+
+def _as_string(column) -> pa.ChunkedArray:
+    """``large_string`` → ``string``, cut into chunks a 32-bit offset can address.
+
+    The nodes carry their sequences as ``large_string``; the cluster table's
+    schema says ``string``. A plain ``cast`` converts chunk by chunk, so one
+    chunk of more than 2 GiB of characters cannot be cast at all — and the
+    final rebuild combines the consensus column into a single chunk. At 9.4M
+    reads and ~1.67M final nodes (~2.7 GB of consensus) that ended a 12-round
+    run in its last step ("Failed casting from large_string to string: input
+    array too large", 2026-11-18).
+
+    Cutting is not enough on its own: a zero-copy slice keeps its parent's
+    ABSOLUTE offsets, and the cast refuses any slice whose offsets pass 2³¹,
+    however few characters it holds (measured, pyarrow 22: of a 2.24 GB chunk
+    the first slice casts, the second does not). Such a piece is rebased by
+    ``concat_arrays`` — one copy of at most a chunk — before it is cast.
+    """
+    chunks = column.chunks if isinstance(column, pa.ChunkedArray) else [column]
+    out: list[pa.Array] = []
+    for chunk in chunks:
+        if not pa.types.is_large_string(chunk.type):
+            out.append(chunk.cast(pa.string()))
+            continue
+        n = len(chunk)
+        # The chunk's own offsets, as a slice of a larger array sees them.
+        offsets = np.frombuffer(chunk.buffers()[1], dtype=np.int64)[
+            chunk.offset : chunk.offset + n + 1
+        ]
+        start = 0
+        while start < n:
+            # The furthest row whose characters still fit after `start`; at
+            # least one row, so a single string over the limit fails in the
+            # cast with Arrow's own message rather than looping here.
+            stop = int(
+                np.searchsorted(
+                    offsets, offsets[start] + _STRING_CHUNK_BYTES, side="right"
+                )
+            ) - 1
+            stop = min(max(stop, start + 1), n)
+            piece = chunk.slice(start, stop - start)
+            if int(offsets[stop]) > _STRING_CHUNK_BYTES:
+                piece = pa.concat_arrays([piece])  # offsets rebased to 0
+            out.append(piece.cast(pa.string()))
+            start = stop
+    return pa.chunked_array(out, type=pa.string())
 
 
 def _read_facts(assignments: pa.Table, read_row: np.ndarray):

@@ -98,6 +98,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.rebuild import (
     rebuild_survivors,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.round_io import (
+    read_round_membership,
     read_round_nodes,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.seed import (
@@ -468,6 +469,26 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
     _check_estep_stamp(rounds_dir, params, resume)
     _check_merge_state(rounds_dir, params, resume)
 
+    if resume and params.rounds == 0:
+        # Finalize only: every round the run owes is done, the final stage
+        # (graph, merge, rebuild, outputs) is not — it died or raised. Run that
+        # stage from the last finished round exactly as the loop would have
+        # after it. `_resume_point` would instead refine that round into a
+        # successor nobody asked for (and write its lineage), and the empty
+        # loop then wrote no clusters at all.
+        state = _last_round_state(rounds_dir)
+        if state is None:
+            raise ValueError(
+                "--resume --rounds 0 finalizes a run from its last finished "
+                f"round, and {rounds_dir} has none"
+            )
+        history, last, final_nodes, final_assignments, final_membership = state
+        log(f"finalizing from round {last.round_index} (--resume --rounds 0)")
+        return _finish(
+            corpus, reads, output_dir, demux_dir, params, report, log, rounds_dir,
+            history, [last], final_nodes, final_assignments, final_membership,
+        )
+
     # The native E-step's read sketch: once per run, in the parent, before
     # any pool has forked — the sketch is torch and a forked child must
     # never be. Cached under its (kmer, window, corpus) stamp, so a resume
@@ -579,6 +600,48 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
         finally:
             store.close()
 
+    return _finish(
+        corpus, reads, output_dir, demux_dir, params, report, log, rounds_dir,
+        history, results, final_nodes, final_assignments, final_membership,
+    )
+
+
+def _last_round_state(rounds_dir: Path):
+    """``(history, last, nodes, assignments, membership)`` of the last round
+    with a ``_SUCCESS``, read back as the loop holds them after that round;
+    ``None`` if no round finished. ``history`` is every earlier round."""
+    if not rounds_dir.exists():
+        return None
+    done = sorted(
+        int(d.name[1:])
+        for d in rounds_dir.glob("r*")
+        if d.name[1:].isdigit() and (d / _SUCCESS).exists()
+    )
+    if not done:
+        return None
+    history = _read_history(rounds_dir, done)
+    if not history or history[-1].round_index != done[-1]:
+        return None
+    rd = rounds_dir / f"r{done[-1]:02d}"
+    return (
+        history[:-1],
+        history[-1],
+        read_round_nodes(rd),
+        _read_assignments(rd / "assignments"),
+        read_round_membership(rd),
+    )
+
+
+def _finish(
+    corpus, reads, output_dir, demux_dir, params, report, log, rounds_dir,
+    history, results, final_nodes, final_assignments, final_membership,
+) -> list[RoundResult]:
+    """The final stage — graph, merge, rebuild, outputs, manifest, report.
+
+    After the loop's last round, or on its own for a run whose rounds all
+    finished but whose final stage did not (``--resume --rounds 0``,
+    :func:`_last_round_state`). ``results[-1]`` is the last round.
+    """
     _write_summary(output_dir, history + results)
     if final_nodes is not None and final_assignments is not None:
         final_rd = rounds_dir / f"r{results[-1].round_index:02d}"
@@ -630,7 +693,9 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
             stages={
                 "n_input_reads": int(corpus.stats.get("n_input", corpus.n_reads)),
                 "n_reads": int(corpus.n_reads),
-                "n_rounds": len(results),
+                # The run's rounds, not this invocation's: a resumed run
+                # used to report only the rounds it ran itself.
+                "n_rounds": len(history) + len(results),
                 "n_clusters": int(clusters.num_rows),
                 "n_membership_rows": int(membership.num_rows),
                 "converged": bool(
