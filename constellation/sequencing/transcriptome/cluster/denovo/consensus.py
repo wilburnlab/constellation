@@ -736,6 +736,8 @@ def frame_consensus(
     max_insertion_block: int | None = None,
     template_of_frame: np.ndarray | None = None,
     plan: "ColumnPlan | None" = None,
+    projections: Sequence[tuple[ProjectedMember, float]] | None = None,
+    member_codes: Sequence[np.ndarray] | None = None,
     **retired,
 ) -> ConsensusResult:
     """Build the abundance-weighted consensus for one cluster.
@@ -765,6 +767,11 @@ def frame_consensus(
     keeps the PWM column sums equal to raw read multiplicity, which
     ``variants.py`` relies on as its binomial ``n``.
 
+    Pass ``projections`` and ``member_codes`` (one per member, as a
+    :class:`ConsensusResult` keeps them) to reuse projections already made of
+    these members: a split child's reads were projected onto the same frame
+    for the pooled consensus.
+
     Unknown keywords **raise**. This used to be a silent ``**_legacy`` sink,
     which is how ``--consensus-max-passes`` survived as a user-facing flag
     that did nothing for a whole release after the pre-planned column space
@@ -776,23 +783,28 @@ def frame_consensus(
         _reject_retired_kwargs(retired)
     n_template = len(frame_seq)
     frame_codes = base_codes(frame_seq).astype(np.int64)
-    codes_of = [base_codes(m.member_seq) for m in members]
-
-    projections: list[tuple[ProjectedMember, float]] = []
-    for spec, codes in zip(members, codes_of):
-        fstart, mstart = _offsets(spec)
-        projections.append(
-            (
-                project_member_events(
-                    parse_cigar(spec.cigar),
-                    codes,
-                    frame_is_query=spec.centroid_is_query,
-                    frame_start=fstart,
-                    member_start=mstart,
-                ),
-                float(spec.weight),
+    if projections is not None:
+        if member_codes is None or not (len(projections) == len(member_codes) == len(members)):
+            raise ValueError("projections and member_codes need one entry per member")
+        codes_of = list(member_codes)
+        projections = list(projections)
+    else:
+        codes_of = [base_codes(m.member_seq) for m in members]
+        projections = []
+        for spec, codes in zip(members, codes_of):
+            fstart, mstart = _offsets(spec)
+            projections.append(
+                (
+                    project_member_events(
+                        parse_cigar(spec.cigar),
+                        codes,
+                        frame_is_query=spec.centroid_is_query,
+                        frame_start=fstart,
+                        member_start=mstart,
+                    ),
+                    float(spec.weight),
+                )
             )
-        )
 
     plan = plan if plan is not None else (
         plan_columns(

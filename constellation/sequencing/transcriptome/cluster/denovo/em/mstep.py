@@ -482,6 +482,9 @@ def refine_template_with_internals(
                 fold_insertions=fold_insertions,
                 min_insertion_support=min_insertion_support,
                 min_extension_support=min_extension_support,
+                # Its reads were projected onto this frame for the pool.
+                projections=[pooled.projections[int(i)] for i in idx],
+                member_codes=[pooled.member_codes[int(i)] for i in idx],
             )
         )
         lo, hi = _support_span(cres)

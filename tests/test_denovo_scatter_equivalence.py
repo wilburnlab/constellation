@@ -245,3 +245,29 @@ def test_member_alleles_is_unchanged_by_the_vectorised_blocks(seed, ins_rate):
         assert np.array_equal(
             member_alleles(cres, cols), _reference_member_alleles(cres, cols)
         )
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_a_child_from_reused_projections_is_the_child_from_scratch(seed) -> None:
+    """A split child built on the pooled plan from the pool's projections of
+    its reads equals the child that projects them itself."""
+    template, members = _members(seed, 40, 900, 0.01)
+    pooled = frame_consensus(template, members, frame_weight=0.0)
+    idx = np.random.default_rng(seed).choice(len(members), size=17, replace=False)
+    hap = [members[int(i)] for i in idx]
+    scratch = frame_consensus(template, hap, frame_weight=0.0, plan=pooled.plan)
+    reused = frame_consensus(
+        template,
+        hap,
+        frame_weight=0.0,
+        plan=pooled.plan,
+        projections=[pooled.projections[int(i)] for i in idx],
+        member_codes=[pooled.member_codes[int(i)] for i in idx],
+    )
+    assert reused.consensus == scratch.consensus
+    assert np.array_equal(reused.pwm, scratch.pwm)
+    assert np.array_equal(reused.winner, scratch.winner)
+    assert reused.alignments == scratch.alignments
+    with pytest.raises(ValueError):
+        frame_consensus(template, hap, plan=pooled.plan, projections=pooled.projections[:3],
+                        member_codes=pooled.member_codes[:3])
