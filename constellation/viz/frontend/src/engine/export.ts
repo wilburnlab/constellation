@@ -257,3 +257,63 @@ export function estimateGlyphCount(panels: HTMLElement[]): number {
   }
   return total;
 }
+
+// ── canvas layers ─────────────────────────────────────────────────────
+//
+// A view drawn on a canvas (engine/canvas_layer.ts) exports by the rule
+// the viz layer writes down for every raster: re-render what is visible as
+// vectors when it is under a glyph budget, otherwise embed the canvas as
+// an image and say so in the file. A layer reports what a vector redraw
+// would cost, so the choice is made before anything is drawn.
+
+/** Above this many rects and glyphs, a layer exports as an image. */
+export const EXPORT_GLYPH_BUDGET = 50_000;
+
+export interface LayerExport {
+  widthPx: number;
+  heightPx: number;
+  /** Rects and glyphs a vector redraw would emit. */
+  glyphs: number;
+  /** Draw the layer as vectors into `g`. */
+  vector(g: SVGGElement): void;
+  /** The layer as a PNG data URL (e.g. `canvas.toDataURL()`), or null. */
+  raster(): string | null;
+}
+
+export interface LayerSvg {
+  svg: SVGSVGElement;
+  vector: boolean;
+}
+
+/** One canvas layer as a standalone `<svg>` — a cell for
+ *  {@link buildGridSvg}. */
+export function layerSvg(layer: LayerExport, budget: number = EXPORT_GLYPH_BUDGET): LayerSvg {
+  const svg = document.createElementNS(SVG_NS, 'svg') as SVGSVGElement;
+  svg.setAttribute('width', String(layer.widthPx));
+  svg.setAttribute('height', String(layer.heightPx));
+  if (layer.glyphs <= budget) {
+    const g = document.createElementNS(SVG_NS, 'g') as SVGGElement;
+    layer.vector(g);
+    svg.appendChild(g);
+    return { svg, vector: true };
+  }
+  const desc = document.createElementNS(SVG_NS, 'desc');
+  desc.textContent =
+    `Raster: this layer would be ${layer.glyphs.toLocaleString('en-US')} vector glyphs, over ` +
+    `the ${budget.toLocaleString('en-US')} budget for a vector export; embedded as an image ` +
+    `of what the screen showed. Zoom in to export it as vectors.`;
+  svg.appendChild(desc);
+  const href = layer.raster();
+  if (href) {
+    const img = document.createElementNS(SVG_NS, 'image');
+    img.setAttribute('x', '0');
+    img.setAttribute('y', '0');
+    // CSS pixels, whatever the canvas's backing resolution.
+    img.setAttribute('width', String(layer.widthPx));
+    img.setAttribute('height', String(layer.heightPx));
+    img.setAttribute('href', href);
+    img.setAttribute('preserveAspectRatio', 'none');
+    svg.appendChild(img);
+  }
+  return { svg, vector: false };
+}

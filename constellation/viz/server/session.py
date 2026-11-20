@@ -29,7 +29,13 @@ from typing import Any, Protocol
 
 
 class SourceLike(Protocol):
-    """One data source attached to a session (an output directory)."""
+    """One data source attached to a session (an output directory).
+
+    A source whose modality reads more than ``path`` / ``kind`` / ``label``
+    from its entry may also define ``to_entry() -> dict``, the entry that
+    reopens it; the source add / remove endpoints rebuild a session from
+    those, so its own fields survive (the transcriptome browser's
+    ``demux_dir``)."""
 
     path: Path
     kind: str

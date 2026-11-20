@@ -1,0 +1,134 @@
+/* Transcriptome browser chrome, scoped under .tx-browser so the widget
+ * looks the same standalone and in a dashboard panel. Palette variables
+ * come from the page. */
+
+/* The hidden attribute must win over the display rules below. */
+.tx-browser [hidden] { display: none !important; }
+
+.tx-browser {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 12px;
+}
+.tx-browser .tx-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  padding: 6px 8px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+}
+.tx-browser .tx-brand { font-weight: 600; color: var(--accent); }
+.tx-browser .tx-title { font-weight: 600; }
+.tx-browser .tx-field { display: inline-flex; align-items: center; gap: 4px; color: var(--fg-dim); }
+.tx-browser .tx-message { color: var(--fg-dim); }
+.tx-browser select,
+.tx-browser .tx-btn,
+.tx-browser .tx-input {
+  background: var(--bg-elev2, var(--bg));
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font: inherit;
+}
+.tx-browser .tx-btn { cursor: pointer; }
+.tx-browser .tx-btn:hover:not(:disabled) { border-color: var(--accent); }
+.tx-browser .tx-btn:disabled { opacity: 0.45; cursor: default; }
+.tx-browser .tx-btn.active { background: var(--accent-soft); border-color: var(--accent); }
+.tx-browser .tx-num { width: 5em; }
+.tx-browser .tx-tid { width: 11em; }
+
+.tx-browser .tx-main { display: flex; flex: 1; min-height: 0; }
+.tx-browser .tx-left {
+  width: 300px;
+  min-width: 220px;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  min-height: 0;
+}
+.tx-browser .tx-right { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+
+.tx-browser .tx-picker { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.tx-browser .tx-picker-controls { display: flex; flex-wrap: wrap; gap: 4px; padding: 6px; }
+.tx-browser .tx-picker-search { flex: 1 1 100%; }
+.tx-browser .tx-picker-min { width: 4em; }
+.tx-browser .tx-picker-status { padding: 0 8px 4px; color: var(--fg-dim); }
+.tx-browser .tx-picker-scroll { flex: 1; overflow: auto; min-height: 0; }
+.tx-browser .tx-picker-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.tx-browser .tx-picker-table th { position: sticky; top: 0; background: var(--bg-elev); color: var(--fg-dim); font-weight: normal; text-align: right; padding: 2px 6px; }
+.tx-browser .tx-picker-table td { text-align: right; padding: 1px 6px; border-bottom: 1px solid var(--border); }
+.tx-browser .tx-picker-table tbody tr { cursor: pointer; }
+.tx-browser .tx-picker-table tbody tr:hover { background: var(--bg-elev2); }
+.tx-browser .tx-picker-table tbody tr.selected { background: var(--accent-soft); }
+.tx-browser .tx-picker-more { margin: 6px; }
+
+.tx-browser .tx-detail { border-top: 1px solid var(--border); padding: 8px; max-height: 45%; overflow: auto; }
+.tx-browser .tx-detail-title { font-weight: 600; margin-bottom: 4px; }
+.tx-browser .tx-facts { display: grid; grid-template-columns: auto 1fr; gap: 1px 8px; margin: 0 0 6px; }
+.tx-browser .tx-facts dt { color: var(--fg-dim); }
+.tx-browser .tx-facts dd { margin: 0; overflow-wrap: anywhere; }
+.tx-browser .tx-samples { margin: 6px 0; }
+.tx-browser .tx-sample { display: grid; grid-template-columns: 7em 1fr 4em; align-items: center; gap: 4px; }
+.tx-browser .tx-sample-name { color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tx-browser .tx-sample-bar { height: 8px; background: var(--accent); border-radius: 2px; }
+.tx-browser .tx-sample-n { text-align: right; font-variant-numeric: tabular-nums; }
+.tx-browser .tx-protein { font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; color: var(--fg-dim); }
+
+.tx-browser .tx-support { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.tx-browser .tx-body {
+  position: relative;
+  display: grid;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  cursor: grab;
+}
+.tx-browser .tx-body:active { cursor: grabbing; }
+.tx-browser .tx-matrix { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+.tx-browser .tx-tracks { overflow: visible; }
+.tx-browser .tx-arc { cursor: pointer; }
+.tx-browser .tx-arc:hover { stroke-width: 3; stroke-opacity: 1; }
+.tx-browser .tx-tooltip {
+  position: absolute;
+  z-index: 5;
+  pointer-events: none;
+  background: var(--bg-elev2);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 11px;
+  max-width: 360px;
+  white-space: nowrap;
+}
+.tx-browser .tx-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(21, 20, 27, 0.75);
+  color: var(--fg-dim);
+  z-index: 4;
+  padding: 16px;
+  text-align: center;
+}
+.tx-browser .tx-summary { padding: 4px 8px; color: var(--fg); line-height: 1.35; border-bottom: 1px solid var(--border); }
+.tx-browser .tx-viewbar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+.tx-browser .tx-viewbar .tx-btn { min-width: 1.8em; }
+.tx-browser .tx-hint { color: var(--fg-mute); }
+.tx-browser .tx-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; padding: 3px 8px; border-top: 1px solid var(--border); color: var(--fg-dim); font-size: 11px; }
+.tx-browser .tx-swatch { display: inline-flex; align-items: center; gap: 3px; }
+.tx-browser .tx-swatch i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.tx-browser .tx-legend-side { color: var(--fg-mute); }
+.tx-browser .tx-legend-samples { display: inline-flex; flex-wrap: wrap; gap: 2px 8px; }
+.tx-browser .tx-foot { padding: 4px 8px; border-top: 1px solid var(--border); color: var(--fg-dim); background: var(--bg-elev); }
+.tx-browser .tx-ok { color: var(--ok); }
+.tx-browser .tx-bad { color: var(--danger); }
+.tx-browser .tx-warn { color: var(--warn); cursor: help; }
