@@ -325,6 +325,9 @@ def final_params(run_dir: Path, round_index: int):
 
 def _mstep_params(d: dict, cls):
     known = {f.name for f in dataclasses.fields(cls)}
+    if "node_extent" in known and "node_extent" not in d:
+        # Recorded before 2026-11-20: a node was every column its reads covered.
+        d = {**d, "node_extent": "union"}
     unknown = sorted(set(d) - known)
     if unknown:
         raise ReplayError(
@@ -893,6 +896,7 @@ def _replay_rebuilt(run_dir: Path, row: dict, is_ours, params, index: RoundIndex
         fold_insertions=mparams.fold_insertions,
         min_insertion_support=mparams.min_insertion_support,
         min_extension_support=mparams.min_extension_support,
+        node_extent=mparams.node_extent,
     )
     mismatch = []
     if node is None:

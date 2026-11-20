@@ -183,6 +183,7 @@ def rebuild_one(
         fold_insertions=params.fold_insertions,
         min_insertion_support=params.min_insertion_support,
         min_extension_support=params.min_extension_support,
+        node_extent=params.node_extent,
     )
     if node is None:
         return row, None, n_skipped, fraction

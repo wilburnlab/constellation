@@ -261,7 +261,8 @@ def _source(replay) -> _Source:
 
         if replay.pooled is None:
             raise ReplayError(f"cluster {replay.cluster_id}: the rebuild placed no read")
-        lo, hi = _support_span(replay.pooled)
+        # The span the rebuild cut its node to (its run's node extent).
+        lo, hi = replay.pooled.node_span or _support_span(replay.pooled)
         pool = np.asarray(replay.pool_read_row, dtype=np.int64)
         order = np.argsort(pool, kind="stable")
         pos = order[np.searchsorted(pool[order], replay.member_read_row)]

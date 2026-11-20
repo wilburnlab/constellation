@@ -73,6 +73,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.consensus import (
     MemberSpec,
     frame_consensus,
     member_allele_events,
+    member_spans,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.orf import best_sense_orf
 from constellation.sequencing.transcriptome.cluster.denovo.em import covariance as cv
@@ -225,6 +226,52 @@ def _support_span(cres: ConsensusResult) -> tuple[int, int]:
     return lo, hi
 
 
+#: What a node's ends are (``MStepParams.node_extent``). ``"median"``
+#: (2026-11-20): the median start and median end of its own reads — under
+#: the E-step's extent rule its reads all end within the tolerance of the
+#: template's ends, and the median follows their mode, so a template's ends
+#: settle on the start and cleavage sites its reads share. ``"union"``: every
+#: column any one of its reads covers, as before, which made a template as
+#: long as the longest of its reads and most of its reads shorter than it.
+NODE_EXTENTS = ("median", "union")
+
+
+def _weighted_median(values: np.ndarray, weights: np.ndarray, *, upper: bool) -> int:
+    """The lower (or upper) weighted median of integer ``values``."""
+    order = np.argsort(values, kind="stable")
+    cum = np.cumsum(weights[order])
+    half = cum[-1] / 2.0
+    at = np.searchsorted(cum, half, side="right" if upper else "left")
+    return int(values[order][min(int(at), order.shape[0] - 1)])
+
+
+def _node_span(cres: ConsensusResult, node_extent: str = "union") -> tuple[int, int]:
+    """``[lo, hi)`` of ``cres.consensus`` a node keeps, per ``node_extent``.
+
+    ``"median"`` keeps from the lower weighted median of its reads' starts
+    to the upper weighted median of their ends (in PWM columns, then the
+    consensus bases inside), within the covered span; a node whose reads
+    give no span keeps the covered span.
+    """
+    if node_extent not in NODE_EXTENTS:
+        raise ValueError(f"node_extent must be one of {NODE_EXTENTS}, got {node_extent!r}")
+    lo, hi = _support_span(cres)
+    if node_extent == "union" or hi <= lo or not len(cres.members):
+        return lo, hi
+    span_lo, span_hi = member_spans(cres)
+    w = np.array([float(m.weight) for m in cres.members], dtype=np.float64)
+    ok = (span_hi > span_lo) & (w > 0)
+    if not ok.any():
+        return lo, hi
+    start = _weighted_median(span_lo[ok], w[ok], upper=False)
+    end = _weighted_median(span_hi[ok], w[ok], upper=True)
+    f = np.asarray(cres.frame_of_cons)
+    m_lo = int(np.searchsorted(f, start, side="left"))
+    m_hi = int(np.searchsorted(f, end, side="left"))
+    n_lo, n_hi = max(lo, m_lo), min(hi, m_hi)
+    return (n_lo, n_hi) if n_hi > n_lo else (lo, hi)
+
+
 def _tuple_patterns(assignments, tuples: np.ndarray) -> np.ndarray:
     """``(T, ΣS)`` concatenated pattern vector for each distinct state-tuple."""
     if not assignments:
@@ -286,6 +333,7 @@ def pooled_node_with_consensus(
     fold_insertions: bool = True,
     min_insertion_support: float = 2.0,
     min_extension_support: float | None = 3.0,
+    node_extent: str = "union",
 ) -> tuple[RefinedTemplate | None, ConsensusResult | None]:
     """:func:`pooled_node`, also returning the consensus it was cut from —
     what a replay of a final-merge rebuild shows reads against."""
@@ -299,7 +347,8 @@ def pooled_node_with_consensus(
         min_insertion_support=min_insertion_support,
         min_extension_support=min_extension_support,
     )
-    lo, hi = _support_span(cres)
+    lo, hi = _node_span(cres, node_extent)
+    cres.node_span = (lo, hi)
     if hi <= lo:
         return None, cres
     w = float(sum(m.weight for m in members))
@@ -329,6 +378,7 @@ def pooled_node(
     fold_insertions: bool = True,
     min_insertion_support: float = 2.0,
     min_extension_support: float | None = 3.0,
+    node_extent: str = "union",
 ) -> RefinedTemplate | None:
     """One node from every member, with no split: the consensus step alone.
 
@@ -348,6 +398,7 @@ def pooled_node(
         fold_insertions=fold_insertions,
         min_insertion_support=min_insertion_support,
         min_extension_support=min_extension_support,
+        node_extent=node_extent,
     )
     return node
 
@@ -377,6 +428,7 @@ def refine_template_with_internals(
     fold_insertions: bool = True,
     min_insertion_support: float = 2.0,
     min_extension_support: float | None = 3.0,
+    node_extent: str = "union",
 ) -> tuple[list[RefinedTemplate], KernelInternals | None]:
     """:func:`refine_template`, also returning what it computed on the way.
 
@@ -487,7 +539,8 @@ def refine_template_with_internals(
                 member_codes=[pooled.member_codes[int(i)] for i in idx],
             )
         )
-        lo, hi = _support_span(cres)
+        lo, hi = _node_span(cres, node_extent)
+        cres.node_span = (lo, hi)
         consensus = cres.consensus[lo:hi]
         internals.children.append((hid, cres, lo, hi))
         # Declared columns are PWM columns; each child reports them in its own
@@ -581,6 +634,7 @@ def refine_template(
     fold_insertions: bool = True,
     min_insertion_support: float = 2.0,
     min_extension_support: float | None = 3.0,
+    node_extent: str = "union",
 ) -> list[RefinedTemplate]:
     """Refine one template into its state-tuple nodes.
 
@@ -612,6 +666,7 @@ def refine_template(
         fold_insertions=fold_insertions,
         min_insertion_support=min_insertion_support,
         min_extension_support=min_extension_support,
+        node_extent=node_extent,
     )
     return nodes
 

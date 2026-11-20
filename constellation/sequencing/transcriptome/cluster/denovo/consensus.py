@@ -206,6 +206,9 @@ class ConsensusResult:
     # Columns the plan *created*; the n_* counters above report how many
     # survived the argmax into the consensus.
     n_columns_planned: int = 0
+    #: ``[lo, hi)`` of ``consensus`` a node was cut to, set by the M-step's
+    #: node constructors (``em.mstep._node_span``); None until then.
+    node_span: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if self.frame_of_cons is None:
