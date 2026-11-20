@@ -26,6 +26,9 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.scheduler import (
     rank_round1,
     shortlist_for_likelihood,
 )
+from constellation.sequencing.transcriptome.cluster.denovo.em import (  # noqa: E402
+    scheduler as sched,
+)
 
 
 def _ptr(*sizes: int) -> np.ndarray:
@@ -398,3 +401,74 @@ def test_placement_is_measured_on_the_shorter_sequence_and_the_smaller_span():
     assert ok.tolist() == [False, True, True, False, True]
     assert bool(sched.placed_enough(0, 1, 0, 1, 600, 600, fraction=0.0))
     assert sched.MIN_PLACED_FRACTION == 0.5
+
+
+# ── the runner-up: the rule re-run without the winner ─────────────────
+
+
+def test_the_runner_up_is_the_rule_re_run_without_the_winner():
+    # One read, three templates, all admitted: replication 1 / 500 / 50.
+    admitted = np.array([True, True, True])
+    tmpl = np.array([0, 1, 2])
+    ptr = np.array([0, 3])
+    kw = dict(
+        orf_replication=np.array([1, 500, 50]),
+        seed_read_quality=np.array([20.0, 20.0, 20.0]),
+    )
+    winner = sched.rank_round1(admitted, tmpl, ptr, **kw)
+    assert tmpl[winner[0]] == 1
+    second = sched.runner_up(sched.rank_round1, winner, admitted, tmpl, ptr, **kw)
+    assert tmpl[second[0]] == 2
+
+
+def test_a_second_hit_on_the_winner_s_template_is_not_the_runner_up():
+    admitted = np.array([True, True, True])
+    tmpl = np.array([1, 1, 0])
+    ptr = np.array([0, 3])
+    kw = dict(
+        orf_replication=np.array([1, 500]),
+        seed_read_quality=np.array([20.0, 20.0]),
+    )
+    winner = sched.rank_round1(admitted, tmpl, ptr, **kw)
+    second = sched.runner_up(sched.rank_round1, winner, admitted, tmpl, ptr, **kw)
+    assert tmpl[winner[0]] == 1 and tmpl[second[0]] == 0
+
+
+def test_no_rival_and_no_winner_both_mean_no_runner_up():
+    # Read 0: one admitted template. Read 1: nothing admitted.
+    admitted = np.array([True, False, False])
+    tmpl = np.array([0, 0, 1])
+    ptr = np.array([0, 1, 3])
+    kw = dict(orf_replication=np.array([5, 5]), seed_read_quality=np.array([20.0, 20.0]))
+    winner = sched.rank_round1(admitted, tmpl, ptr, **kw)
+    second = sched.runner_up(sched.rank_round1, winner, admitted, tmpl, ptr, **kw)
+    assert second.tolist() == [sched.UNASSIGNED, sched.UNASSIGNED]
+
+
+def test_under_the_abundance_escape_the_runner_up_is_what_the_rule_says():
+    """The escape hands the read to an abundant near-tie (template 1); re-run
+    without it, the argmax (template 0) wins — and its logl is HIGHER than
+    the winner's, which is what makes the gap negative."""
+    admitted = np.array([True, True])
+    tmpl = np.array([0, 1])
+    ptr = np.array([0, 2])
+    kw = dict(
+        logl=np.array([-10.0, -12.0]),
+        support=np.array([1.0, 100.0]),
+        read_len=np.array([600.0, 600.0]),
+        template_len=np.array([600.0, 600.0]),
+    )
+    winner, _ = sched.rank_likelihood(admitted, tmpl, ptr, **kw)
+    assert tmpl[winner[0]] == 1, "the escape fired"
+    second = sched.runner_up(sched.rank_likelihood, winner, admitted, tmpl, ptr, **kw)
+    assert tmpl[second[0]] == 0
+    gap = kw["logl"][winner[0]] - kw["logl"][second[0]]
+    assert gap < 0
+
+
+def test_rank_by_score_takes_the_best_admitted_score():
+    admitted = np.array([True, False, True])
+    tmpl = np.array([0, 1, 2])
+    ptr = np.array([0, 3])
+    best = sched.rank_by_score(admitted, tmpl, ptr, score=np.array([10, 99, 30]))
+    assert tmpl[best[0]] == 2

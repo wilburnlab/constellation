@@ -149,6 +149,63 @@ def rebuild_one(
     the pool here, and a survivor made only of such reads kept the
     consensus the merge was supposed to replace (review of 91e7c69).
     """
+    members, _rows, n_skipped, fraction = rebuild_members(
+        consensus,
+        read_rows,
+        template_id=template_id,
+        corpus_path=corpus_path,
+        params=params,
+        identity_floor=identity_floor,
+        quality_scale=quality_scale,
+    )
+    node = pooled_node(
+        consensus,
+        members,
+        template_id=int(template_id),
+        min_aa_length=params.min_aa_length,
+        fold_insertions=params.fold_insertions,
+        min_insertion_support=params.min_insertion_support,
+        min_extension_support=params.min_extension_support,
+    )
+    if node is None:
+        return row, None, n_skipped, fraction
+    return (
+        row,
+        {
+            "consensus": node.consensus,
+            "protein": node.protein,
+            "orf_start": int(node.orf_start),
+            "orf_end": int(node.orf_end),
+            "n_inserted_columns": int(node.n_inserted_columns),
+            "n_extended_5p": int(node.n_extended_5p),
+            "n_extended_3p": int(node.n_extended_3p),
+            "n_trimmed_5p": int(node.n_trimmed_5p),
+            "n_trimmed_3p": int(node.n_trimmed_3p),
+            "n_members_used": len(members),
+            "subsample_fraction": float(fraction),
+        },
+        n_skipped,
+        fraction,
+    )
+
+
+def rebuild_members(
+    consensus: str,
+    read_rows: np.ndarray,
+    *,
+    template_id: int,
+    corpus_path: str,
+    params: MStepParams,
+    identity_floor: float,
+    quality_scale: float | None = None,
+) -> tuple[list[MemberSpec], np.ndarray, int, float]:
+    """The pooled reads of a survivor, aligned to its consensus.
+
+    Returns ``(members, sampled_rows, n_skipped, fraction)``: the members
+    that placed, the corpus rows considered (after the member cap — a
+    member's ``member_id`` indexes them), how many did not place, and the
+    sampled fraction. :func:`rebuild_one` and replay share it.
+    """
     reads = _reads(corpus_path)
     rows = np.asarray(read_rows, dtype=np.int64)
     fraction = 1.0
@@ -186,34 +243,7 @@ def rebuild_one(
                 member_id=i,
             )
         )
-    node = pooled_node(
-        consensus,
-        members,
-        template_id=int(template_id),
-        min_aa_length=params.min_aa_length,
-        fold_insertions=params.fold_insertions,
-        min_extension_support=params.min_extension_support,
-    )
-    if node is None:
-        return row, None, n_skipped, fraction
-    return (
-        row,
-        {
-            "consensus": node.consensus,
-            "protein": node.protein,
-            "orf_start": int(node.orf_start),
-            "orf_end": int(node.orf_end),
-            "n_inserted_columns": int(node.n_inserted_columns),
-            "n_extended_5p": int(node.n_extended_5p),
-            "n_extended_3p": int(node.n_extended_3p),
-            "n_trimmed_5p": int(node.n_trimmed_5p),
-            "n_trimmed_3p": int(node.n_trimmed_3p),
-            "n_members_used": len(members),
-            "subsample_fraction": float(fraction),
-        },
-        n_skipped,
-        fraction,
-    )
+    return members, rows, n_skipped, fraction
 
 
 def _pair_key(parent: np.ndarray, hap: np.ndarray) -> np.ndarray:
@@ -244,6 +274,20 @@ def _read_rows_of(
     return [sorted_row[a:b] for a, b in zip(lo.tolist(), hi.tolist())]
 
 
+def _rebuild_one_or_error(row, consensus, read_rows, **kwargs):
+    """:func:`rebuild_one`, with a failure returned rather than raised.
+
+    A rebuild that raises leaves the survivor as one whose reads could not
+    be placed does: its own consensus stands. Raised, it used to take the
+    whole final stage down with it — after every round had finished.
+    Module-level so it pickles by name.
+    """
+    try:
+        return (*rebuild_one(row, consensus, read_rows, **kwargs), None)
+    except Exception as exc:  # noqa: BLE001 — counted, and the survivor kept
+        return row, None, 0, 1.0, f"{type(exc).__name__}: {exc}"[:500]
+
+
 def rebuild_survivors(
     nodes: pa.Table,
     membership: pa.Table,
@@ -255,21 +299,30 @@ def rebuild_survivors(
     quality_scale: float | None = None,
     threads: int = 1,
     log=None,
-) -> tuple[pa.Table, dict]:
+) -> tuple[pa.Table, dict, np.ndarray]:
     """Rebuild the consensus of the nodes at ``rows`` from their membership.
 
     ``nodes`` and ``membership`` are the final merge's outputs — the
     absorbed nodes gone and their membership re-keyed to the survivors — and
     ``rows`` the survivors that absorbed something. Returns the node table
     with those rows rewritten, and counts: ``n_rebuilt``, ``n_rebuild_failed``
-    (no read could be placed; the survivor's own consensus stands) and
-    ``n_rebuild_reads_skipped``. ``identity_floor`` and ``quality_scale``
-    are the run's admission rule, whole — see :func:`rebuild_one`.
+    (no read could be placed, or the rebuild raised; the survivor's own
+    consensus stands), ``n_rebuild_errors`` (the part of the failures that
+    raised) and ``n_rebuild_reads_skipped``. ``identity_floor`` and ``quality_scale``
+    are the run's admission rule, whole — see :func:`rebuild_one`. The third
+    value is the rows actually rebuilt (ascending), what the final clusters'
+    ``rebuilt`` flag records.
     """
     rows = np.asarray(rows, dtype=np.int64)
-    counts = {"n_rebuilt": 0, "n_rebuild_failed": 0, "n_rebuild_reads_skipped": 0}
+    counts = {
+        "n_rebuilt": 0,
+        "n_rebuild_failed": 0,
+        "n_rebuild_errors": 0,
+        "n_rebuild_reads_skipped": 0,
+    }
+    none = np.empty(0, dtype=np.int64)
     if rows.shape[0] == 0 or nodes.num_rows == 0:
-        return nodes, counts
+        return nodes, counts, none
     say = log or (lambda _m: None)
     read_rows = _read_rows_of(nodes, membership, rows)
     template_id = nodes.column("parent_template_id").to_numpy(zero_copy_only=False)
@@ -288,8 +341,12 @@ def rebuild_survivors(
     results: dict[int, dict] = {}
 
     def take(outcome) -> None:
-        row, rebuilt, n_skipped, _fraction = outcome
+        row, rebuilt, n_skipped, _fraction, error = outcome
         counts["n_rebuild_reads_skipped"] += int(n_skipped)
+        if error is not None:
+            counts["n_rebuild_errors"] += 1
+            if counts["n_rebuild_errors"] == 1:
+                say(f"final output: rebuilding survivor row {row} raised: {error}")
         if rebuilt is None:
             counts["n_rebuild_failed"] += 1
         else:
@@ -299,7 +356,7 @@ def rebuild_survivors(
     workers = max(1, min(int(threads), len(tasks)))
     if workers == 1:
         for row, seq, member_rows, tid in tasks:
-            take(rebuild_one(row, seq, member_rows, template_id=tid, **kwargs))
+            take(_rebuild_one_or_error(row, seq, member_rows, template_id=tid, **kwargs))
     else:
         ctx = mp.get_context("fork")
         with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
@@ -308,7 +365,7 @@ def rebuild_survivors(
                 for row, seq, member_rows, tid in tasks:
                     flying.append(
                         pool.submit(
-                            rebuild_one,
+                            _rebuild_one_or_error,
                             row,
                             seq,
                             member_rows,
@@ -333,7 +390,7 @@ def rebuild_survivors(
         )
     )
     if not results:
-        return nodes, counts
+        return nodes, counts, none
 
     # Replace by mask rather than through a Python list of every row's
     # value: the table is every final node, and only a few thousand of them
@@ -355,7 +412,7 @@ def rebuild_survivors(
             name,
             pc.replace_with_mask(column, pa.array(mask), values),
         )
-    return out.cast(nodes.schema), counts
+    return out.cast(nodes.schema), counts, rebuilt_rows
 
 
 __all__ = ["REBUILT_COLUMNS", "align_to_survivor", "rebuild_one", "rebuild_survivors"]

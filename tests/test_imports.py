@@ -22,6 +22,7 @@ import constellation.core.io.fasta
 import constellation.core.io.readers
 import constellation.core.io.schemas
 import constellation.core.io.text
+import constellation.core.ids
 import constellation.core.progress
 import constellation.core.manifests
 import constellation.core.stages

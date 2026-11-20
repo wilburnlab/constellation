@@ -61,6 +61,9 @@ def _assignments(rows):
             "identity": pa.nulls(n, pa.float32()),
             "aligned_len": pa.nulls(n, pa.int32()),
             "unassigned_reason": pa.nulls(n, pa.string()),
+            "runner_up_template_id": pa.nulls(n, pa.int64()),
+            "runner_up_identity": pa.nulls(n, pa.float32()),
+            "runner_up_logl_gap": pa.nulls(n, pa.float32()),
         },
         schema=EM_ASSIGNMENT_TABLE,
     )

@@ -272,6 +272,9 @@ def _assignments_for(read_rows, template_id, *, samples=None):
             "identity": pa.nulls(n, pa.float32()),
             "aligned_len": pa.nulls(n, pa.int32()),
             "unassigned_reason": pa.nulls(n, pa.string()),
+            "runner_up_template_id": pa.nulls(n, pa.int64()),
+            "runner_up_identity": pa.nulls(n, pa.float32()),
+            "runner_up_logl_gap": pa.nulls(n, pa.float32()),
         },
         schema=EM_ASSIGNMENT_TABLE,
     )
@@ -488,6 +491,9 @@ def test_a_capped_template_still_reports_all_of_its_reads():
             "identity": pa_.nulls(n, pa_.float32()),
             "aligned_len": pa_.nulls(n, pa_.int32()),
             "unassigned_reason": pa_.nulls(n, pa_.string()),
+            "runner_up_template_id": pa_.nulls(n, pa_.int64()),
+            "runner_up_identity": pa_.nulls(n, pa_.float32()),
+            "runner_up_logl_gap": pa_.nulls(n, pa_.float32()),
         },
         schema=EM_ASSIGNMENT_TABLE,
     )

@@ -40,7 +40,7 @@ measured:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -98,6 +98,18 @@ class CovarianceGraph:
     n_significant: int
     n_columns_dropped: int  # lowest-effect columns dropped to fit the budget
     sum_k2: int  # Sigma k_i^2 actually spent by the co-occurrence pass
+    # The 2x2 each significant edge was tested on, edge-aligned and weighted:
+    # co-observed non-major at both (n11), non-major at u (n1x) and at v
+    # (nx1) among reads observing both, and those reads' weight (n). NaN on a
+    # self-edge, which is judged on boundary mass, not a table. Kept for the
+    # M-step's evidence: a p-value conflates depth with association, and
+    # these are what an effect size is computed from.
+    edge_n11: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    edge_n1x: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    edge_nx1: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    edge_n: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    # (V,) False where the budget dropped the column from the pass.
+    budget_kept: np.ndarray | None = None
 
 
 def read_states(events, cand: CandidateSet, weight: np.ndarray) -> ReadStates:
@@ -563,12 +575,22 @@ def covariance_graph(
             n_significant=0,
             n_columns_dropped=n_budget_dropped,
             sum_k2=sum_k2,
+            budget_kept=column_mask.copy(),
         )
     p = pvals[t_idx]
     sig, q_cut = benjamini_hochberg(p, q_edge)
     hit = t_idx[sig]
     keep[eu[hit]] = True
     keep[ev[hit]] = True
+    # Pair tables, edge-aligned: candidate edges 0..n_pair-1 are the seen
+    # pairs, the rest self-edges with no table.
+    n_pair = int(uu.size)
+    pair = hit < n_pair
+    counts = []
+    for full in (k11, n1x, nx1, n_obs):
+        col = np.full(hit.size, np.nan, dtype=np.float64)
+        col[pair] = np.asarray(full[seen], dtype=np.float64)[hit[pair]]
+        counts.append(col)
     return CovarianceGraph(
         edges=np.stack([eu[hit], ev[hit]], axis=1),
         p_value=p[sig],
@@ -579,6 +601,11 @@ def covariance_graph(
         n_significant=int(hit.size),
         n_columns_dropped=n_budget_dropped,
         sum_k2=sum_k2,
+        edge_n11=counts[0],
+        edge_n1x=counts[1],
+        edge_nx1=counts[2],
+        edge_n=counts[3],
+        budget_kept=column_mask.copy(),
     )
 
 
