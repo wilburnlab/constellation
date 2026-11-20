@@ -61,6 +61,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.assign import (
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.corpus import (
     ReadStore,
+    chunked_take,
     write_corpus,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.fold import fold_orfs
@@ -115,6 +116,7 @@ from constellation.sequencing.transcriptome.cluster.denovo.em.seed_kmer import (
     DEFAULT_SEED_IDENTITY,
     DEFAULT_SEED_MAX_3P,
     DEFAULT_SEED_MAX_5P,
+    ChainedClusterError,
     seed_by_kmer_clustering,
 )
 from constellation.sequencing.transcriptome.cluster.denovo.em.templates import (
@@ -557,7 +559,7 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
         )
 
     start, templates_table, prev_assignments, history = _resume_point(
-        rounds_dir, resume, log, params
+        rounds_dir, resume, log, params, reads=reads
     )
 
     if templates_table is None:
@@ -627,7 +629,7 @@ def _loop(corpus, reads, output_dir, demux_dir, params, resume, report, log) -> 
             # be complete and was not.
             refined = (
                 None if (last_round or converged)
-                else _refine_and_merge(rd, nodes, store, r, params, log)
+                else _refine_and_merge(rd, nodes, store, r, params, log, reads=reads)
             )
             if refined is not None:
                 _write_lineage(rd, refined.lineage)
@@ -1635,7 +1637,7 @@ def _mergeable(graph: _NodeGraph, params: EmParams, *, exact_only: bool) -> dict
     )
 
 
-def _refine_and_merge(rd: Path, nodes, store, r: int, params: EmParams, log):
+def _refine_and_merge(rd: Path, nodes, store, r: int, params: EmParams, log, reads=None):
     """Next templates from this round's nodes; merged, if the run merges.
 
     One path for the live loop and the resume rebuild, so a resumed round
@@ -1690,6 +1692,8 @@ def _refine_and_merge(rd: Path, nodes, store, r: int, params: EmParams, log):
                 **_merge_counts(merged, pairs, graph),
             )
     record["n_merged"] = int(refined.n_merged)
+    refined, reseed = _reseed_unmatched(rd, refined, nodes, reads, r, params, log)
+    record.update(reseed)
     record["n_templates_after"] = int(refined.templates.num_rows)
 
     # Always written, empty or not: a file that is only there when something
@@ -1703,6 +1707,110 @@ def _refine_and_merge(rd: Path, nodes, store, r: int, params: EmParams, log):
     if refined.n_merged and log:
         log(f"round {r}: merged {refined.n_merged:,} templates")
     return refined
+
+
+def _reseed_unmatched(rd: Path, refined, nodes, reads, r: int, params: EmParams, log):
+    """Templates for the reads round ``r`` found no template of their extent
+    for (``unassigned_reason == 'extent'``), added to the next round's.
+
+    The E-step's extent rule refuses a read every template whose ends are
+    not within ``end_tolerance`` of its own, so a 5'-truncated molecule with
+    no template of its length would leave the output for being a different
+    length (PI, 2026-11-20: such a read seeds a template of its own). The
+    reads are grouped by the kmer seeder under the run's own seeding gate —
+    its overhangs follow the tolerance — and one is elected per group, so
+    near-identical molecules share a template instead of each capturing
+    itself. They take rows after the nodes', ids ``(r + 1) << 40 | row``,
+    and a ``seed`` lineage row with no parent. Returns ``(refined, record)``.
+    """
+    import dataclasses as _dc
+
+    import pyarrow.dataset as ds
+
+    record: dict[str, Any] = {"n_reseeded_reads": 0, "n_reseeded_templates": 0}
+    adir = rd / "assignments"
+    if params.end_tolerance is None or reads is None or not adir.exists():
+        return refined, record
+    parts = sorted(adir.glob("part-*.parquet"))
+    if not parts:
+        return refined, record
+    hit = (
+        ds.dataset(parts)
+        .to_table(
+            columns=["read_row"], filter=pc.field("unassigned_reason") == "extent"
+        )
+        .column("read_row")
+        .to_numpy(zero_copy_only=False)
+    )
+    rows = np.unique(hit.astype(np.int64))
+    if rows.size == 0:
+        return refined, record
+    sub = pa.table(
+        {
+            name: chunked_take(reads.table.column(name), rows, reads.chunk_starts)
+            for name in reads.table.column_names
+        }
+    )
+    log(f"round {r}: seeding templates for {rows.size:,} reads of no template's extent")
+    try:
+        result = seed_by_kmer_clustering(
+            sub,
+            identity=params.seed_identity,
+            max_5p_overhang=params.seed_max_5p_overhang,
+            max_3p_overhang=params.seed_max_3p_overhang,
+            kmer=params.kmer,
+            window=params.window,
+            minimizers_per_seq=params.minimizers_per_seq,
+            min_shared=params.min_shared,
+            diag_span_max=params.diag_span_max,
+            grouping=params.seed_grouping,
+            min_seed_reads=1,
+            representative=params.seed_representative,
+            max_cluster_read_frac=params.max_cluster_read_frac,
+            min_chain_cluster_reads=params.min_chain_cluster_reads,
+            threads=params.threads,
+            progress=None,
+        )
+    except ChainedClusterError as exc:
+        record["reseed_error"] = str(exc)
+        log(f"round {r}: seeding the reads of no template's extent failed: {exc}")
+        return refined, record
+    t = result.templates
+    if t.num_rows == 0:
+        return refined, record
+    first = int(nodes.num_rows)  # rows after every node's, so ids never collide
+    ids = rf.template_id_for(r + 1, first + np.arange(t.num_rows))
+    local = t.column("seed_read_row").to_numpy(zero_copy_only=False).astype(np.int64)
+    t = t.set_column(
+        t.schema.get_field_index("template_id"), "template_id", pa.array(ids)
+    ).set_column(
+        t.schema.get_field_index("seed_read_row"),
+        "seed_read_row",
+        pa.array(np.where(local >= 0, rows[np.maximum(local, 0)], -1).astype(np.int32)),
+    )
+    size = t.column("orf_replication").to_numpy(zero_copy_only=False).astype(float)
+    lineage = pa.table(
+        {
+            "round": pa.array(np.full(t.num_rows, r + 1, dtype=np.int32)),
+            "child_template_id": pa.array(ids),
+            "parent_template_id": pa.array(np.full(t.num_rows, -1, dtype=np.int64)),
+            "rule": pa.array(["seed"] * t.num_rows, pa.string()),
+            "n_reads": pa.array(size),
+        },
+        schema=rf.LINEAGE_TABLE,
+    )
+    record.update(n_reseeded_reads=int(rows.size), n_reseeded_templates=int(t.num_rows))
+    return (
+        _dc.replace(
+            refined,
+            templates=pa.concat_tables(
+                [refined.templates, t.select(refined.templates.column_names).cast(refined.templates.schema)]
+            ),
+            lineage=pa.concat_tables([refined.lineage, lineage]),
+            n_children=int(refined.n_children) + int(t.num_rows),
+        ),
+        record,
+    )
 
 
 def _merge_counts(merged: pa.Table, pairs: dict, graph: _NodeGraph) -> dict:
@@ -2095,7 +2203,9 @@ def _read_lineage(rd: Path) -> pa.Table:
     return pq.read_table(path) if path.exists() else rf.LINEAGE_TABLE.empty_table()
 
 
-def _resume_point(rounds_dir: Path, resume: bool, log, params: EmParams | None = None):
+def _resume_point(
+    rounds_dir: Path, resume: bool, log, params: EmParams | None = None, reads=None
+):
     """Start after the last round with a ``_SUCCESS``; rebuild its successor.
 
     Returns ``(start_round, templates, prev_assignments, history)``. The last
@@ -2139,7 +2249,7 @@ def _resume_point(rounds_dir: Path, resume: bool, log, params: EmParams | None =
     store = TemplateStore.open(store_path)
     try:
         refined = _refine_and_merge(
-            rd, nodes, store, last, params or EmParams(), log
+            rd, nodes, store, last, params or EmParams(), log, reads=reads
         )
         # Persist the rebuilt lineage too: the resumed round's churn needs it
         # to tell a split from a genuine switch, and rebuilding it without
