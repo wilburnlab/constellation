@@ -228,28 +228,41 @@ def test_a_rebuilt_cluster_names_what_its_reads_came_from(client, run_dir) -> No
     assert absorbed.num_rows == meta["n_absorbed_reads"]
 
 
-def test_six_requests_for_one_view_are_one_replay(client, run_dir) -> None:
+def test_six_requests_for_one_view_are_one_replay(run_dir) -> None:
     """The browser asks for a summary and five tables at once; the replay
-    and the tables are made once (single flight), and kept."""
-    sid = _open(client, run_dir)
-    nodes = _cluster_nodes(run_dir)
-    cid = nodes.column("cluster_id")[0].as_py()
-    base = f"{_base(sid, run_dir)}/clusters/{cid}/support"
-    replays, supports = cache.REPLAYS.computed, cache.SUPPORT.computed
-    import concurrent.futures as cf
+    and the tables are made once (single flight), and kept. Sent together on
+    one event loop, as a browser's are (a TestClient shared across threads
+    is not safe to use so)."""
+    import httpx
 
-    with cf.ThreadPoolExecutor(6) as pool:
-        urls = [base] + [f"{base}/{t}" for t in TABLES[:5]]
-        codes = list(pool.map(lambda u: client.get(u).status_code, urls))
-    assert codes == [200] * 6
-    assert cache.REPLAYS.computed - replays == 1
-    assert cache.SUPPORT.computed - supports == 1
-    client.get(f"{base}/arcs")
-    assert cache.SUPPORT.computed - supports == 1
-    # Another space of the same cluster reuses the replay.
-    client.get(base, params={"space": "frame"})
-    assert cache.REPLAYS.computed - replays == 1
-    assert cache.SUPPORT.computed - supports == 2
+    cache.clear_all()
+    app = create_app({})
+
+    async def go() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            opened = await c.post(
+                "/api/sessions/open",
+                json={"modality": "transcriptome", "sources": [{"path": str(run_dir)}]},
+            )
+            sid = opened.json()["session_id"]
+            cid = _cluster_nodes(run_dir).column("cluster_id")[0].as_py()
+            base = f"{_base(sid, run_dir)}/clusters/{cid}/support"
+            replays, supports = cache.REPLAYS.computed, cache.SUPPORT.computed
+            urls = [base] + [f"{base}/{t}" for t in TABLES[:5]]
+            got = await asyncio.gather(*[c.get(u) for u in urls])
+            assert [r.status_code for r in got] == [200] * 6
+            assert cache.REPLAYS.computed - replays == 1
+            assert cache.SUPPORT.computed - supports == 1
+            await c.get(f"{base}/arcs")
+            assert cache.SUPPORT.computed - supports == 1
+            # Another space of the same cluster reuses the replay.
+            await c.get(base, params={"space": "frame"})
+            assert cache.REPLAYS.computed - replays == 1
+            assert cache.SUPPORT.computed - supports == 2
+
+    asyncio.run(go())
 
 
 def test_what_is_not_there_is_404(client, run_dir) -> None:
