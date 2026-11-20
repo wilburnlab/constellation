@@ -568,6 +568,30 @@ Replay verified every template and cluster of a run made by the code of `a633080
 
 **For PR2:** keep the index per session. One replay at a time, with a progress indicator for templates over about 1,000 reads, is enough. An on-disk replay cache is an optimisation for the largest templates, not a requirement. The opt-in full dump (D1) remains the way to precompute those.
 
+## 13b. PR2: the support view (built)
+
+One commit per phase on `feat/viz-transcriptome-support`:
+
+| Phase | What landed |
+|---|---|
+| P2.1 | `attachPanZoom2D`: x and y zoomed apart; shift + wheel zooms y, read before any horizontal delta (Chrome sends it as `deltaX`); ctrl + wheel both; a drag pans both; 2-D click slop |
+| P2.2 | `engine/canvas_layer.ts` (HiDPI canvas under an SVG overlay); `engine/matrix/` (spans + sparse departures, the 3 x 3 level-of-detail table, binning, a canvas and an SVG sink); `export.ts::layerSvg`, the vector-under-budget-else-image rule |
+| P2.3 | The `transcriptome` modality's server: sessions of EM runs, a page of a run's cluster index, a cluster's detail, the support summary and six tables for a cluster or any template, single-flight replay on a one-worker executor; `em.results.cluster_index`, a projected `find_clusters`, `support.replay_summary` / `node_differences`; `viz transcriptome --run DIR [--demux-dir DIR]` |
+| P2.4 | The browser: cluster list and detail, the support view (tracks, per-read columns, the canvas matrix, hover, arc sorting, Compare, Save SVG), `#cluster=` / `#template=` links, the dashboard descriptor |
+| P2.5 | Documentation |
+
+**On the Nov2026 run** (9.4M reads, 1,672,894 clusters):
+- **Cluster index:** 12–23 s and 128 MB, built once a server.
+- **A page of clusters:** instant after that.
+- **Search:** about 2 s.
+- **A support view:** 7 s for a 319-read template. For a 38,123-read cluster (its 20,000-read sample), 65 s and 630 KB of departures.
+
+Template 13194139534009 of round 12 (four nodes, 33 significant edges) shows in Compare as four lengths of one C homopolymer over nine frame columns.
+
+**Of the acceptance cases,** two were checked on screen against this run: a split shown as blocks in pattern order, and a node comparison at the columns where the nodes differ. The single-bad-read template is still for the PI to find and check; the per-read excess column is what should mark the read.
+
+**Deferred** (the viz notes list them): colour-by, the unsampled tail, round stepping, the noise-conformity plot, filtering arcs by signature.
+
 ## 14. WebGL: the trade-offs (decided at PR4's first step)
 
 Only the star map needs it — 10⁵–10⁶ points, edges, picking, animation. The support view is Canvas2D (its level-of-detail table bounds what is drawn per frame), so nothing before PR4 waits on this.
